@@ -237,8 +237,9 @@ pub enum HandshakeError {
 	// ---------------- Key agreement / CMS KARI ----------------
 	#[error("ECDH operation failed")]
 	EcdhFailed,
-	#[error("KDF operation failed")]
-	KdfError,
+	#[error("KDF operation failed: {0}")]
+	#[from]
+	KdfError(crate::crypto::kdf::KdfError),
 	#[error("Invalid key size: expected {expected}, got {received}")]
 	InvalidKeySize { expected: usize, received: usize },
 	#[error("Ciphertext too short: {received} bytes (minimum {minimum} required)")]
@@ -283,15 +284,10 @@ pub enum HandshakeError {
 	#[from]
 	SecretUnavailable(crate::crypto::secret::SecretError),
 
-	// ---------------- Generic octet string length (server_random/client_random etc.) ----------------
-	#[error("Invalid OCTET STRING length: {0}")]
-	InvalidOctetStringLength(&'static str),
-}
-
-impl From<crate::crypto::kdf::KdfError> for HandshakeError {
-	fn from(_: crate::crypto::kdf::KdfError) -> Self {
-		HandshakeError::KeyDerivationFailed(crate::crypto::aead::Error)
-	}
+	/// Cryptographic key or nonce material had the wrong length
+	#[error("Invalid key material length: {0}")]
+	#[from]
+	InvalidKeyMaterialLength(crypto_common::InvalidLength),
 }
 
 /// Narrows [`TightBeamError`](crate::error::TightBeamError) into [`HandshakeError`];
@@ -336,11 +332,5 @@ impl From<HandshakeError> for crate::cms::builder::Error {
 			HandshakeError::SpkiError(e) => crate::cms::builder::Error::PublicKey(e),
 			other => crate::cms::builder::Error::Builder(other.to_string()),
 		}
-	}
-}
-
-impl From<crypto_common::InvalidLength> for HandshakeError {
-	fn from(_: crypto_common::InvalidLength) -> Self {
-		HandshakeError::KeyDerivationFailed(crate::crypto::aead::Error)
 	}
 }

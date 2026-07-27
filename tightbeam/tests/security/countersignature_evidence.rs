@@ -31,9 +31,30 @@
 
 #![cfg(all(feature = "transport-multiplex", feature = "testing"))]
 
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const MISSING_COUNTERSIGNATURE_FAILS_CLOSED: Urn<'static> =
+	Urn::new("test", "event:countersignature-evidence/missing-countersignature-fails-closed");
+pub(crate) const NO_OUTCOME_BEFORE_CONCLUSION: Urn<'static> =
+	Urn::new("test", "event:countersignature-evidence/no-outcome-before-conclusion");
+pub(crate) const OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE: Urn<'static> = Urn::new(
+	"test",
+	"event:countersignature-evidence/outcome-records-missing-countersignature",
+);
+pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
+	Urn::new("test", "event:countersignature-evidence/session-never-activates");
+pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
+	Urn::new("test", "event:countersignature-evidence/settle-never-fired");
+pub(crate) const STRIPPED_FINISHED_STILL_AUTHENTICATES: Urn<'static> =
+	Urn::new("test", "event:countersignature-evidence/stripped-finished-still-authenticates");
+pub(crate) const TAMPERED_CIPHERTEXT_REJECTED: Urn<'static> =
+	Urn::new("test", "event:countersignature-evidence/tampered-ciphertext-rejected");
+
 #[cfg(feature = "transport-ecies")]
 mod ecies {
 	use std::sync::Arc;
+
+	use super::{NO_OUTCOME_BEFORE_CONCLUSION, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED};
 
 	use tightbeam::asn1::OctetString;
 	use tightbeam::crypto::ecies::Secp256k1EciesMessage;
@@ -69,9 +90,9 @@ mod ecies {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				(tampered_ciphertext_rejected, exactly!(1), equals!(true)),
-				(settle_never_fired, exactly!(1), equals!(true)),
-				(no_outcome_before_conclusion, exactly!(1), equals!(true))
+				(TAMPERED_CIPHERTEXT_REJECTED, exactly!(1), equals!(true)),
+				(SETTLE_NEVER_FIRED, exactly!(1), equals!(true)),
+				(NO_OUTCOME_BEFORE_CONCLUSION, exactly!(1), equals!(true))
 			]
 		}
 	}
@@ -125,12 +146,12 @@ mod ecies {
 
 				let kex_result = server.process_client_key_exchange(&tampered).await;
 				trace.event_with(
-					CountersignatureTamperSpec::tampered_ciphertext_rejected,
+					TAMPERED_CIPHERTEXT_REJECTED,
 					&[],
 					kex_result.is_err(),
 				)?;
 				trace.event_with(
-					CountersignatureTamperSpec::settle_never_fired,
+					SETTLE_NEVER_FIRED,
 					&[],
 					authorizer.settle_calls() == 0,
 				)?;
@@ -139,7 +160,7 @@ mod ecies {
 				// verdict, so the observer records nothing.
 				let outcomes = observer.recorded();
 				trace.event_with(
-					CountersignatureTamperSpec::no_outcome_before_conclusion,
+					NO_OUTCOME_BEFORE_CONCLUSION,
 					&[],
 					outcomes.is_empty(),
 				)?;
@@ -153,6 +174,11 @@ mod ecies {
 #[cfg(feature = "transport-cms")]
 mod cms {
 	use std::sync::Arc;
+
+	use super::{
+		MISSING_COUNTERSIGNATURE_FAILS_CLOSED, OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE, SESSION_NEVER_ACTIVATES,
+		STRIPPED_FINISHED_STILL_AUTHENTICATES,
+	};
 
 	use tightbeam::cms::signed_data::SignedData;
 	use tightbeam::der::{Decode, Encode};
@@ -205,10 +231,10 @@ mod cms {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				(stripped_finished_still_authenticates, exactly!(1), equals!(true)),
-				(missing_countersignature_fails_closed, exactly!(1), equals!(true)),
-				(outcome_records_missing_countersignature, exactly!(1), equals!(true)),
-				(session_never_activates, exactly!(1), equals!(true))
+				(STRIPPED_FINISHED_STILL_AUTHENTICATES, exactly!(1), equals!(true)),
+				(MISSING_COUNTERSIGNATURE_FAILS_CLOSED, exactly!(1), equals!(true)),
+				(OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE, exactly!(1), equals!(true)),
+				(SESSION_NEVER_ACTIVATES, exactly!(1), equals!(true))
 			]
 		}
 	}
@@ -240,7 +266,7 @@ mod cms {
 
 				let finished_accepted = server.process_client_finished(&stripped).is_ok();
 				trace.event_with(
-					CountersignatureMissingSpec::stripped_finished_still_authenticates,
+					STRIPPED_FINISHED_STILL_AUTHENTICATES,
 					&[],
 					finished_accepted,
 				)?;
@@ -248,7 +274,7 @@ mod cms {
 				let ack = server.process_receipt_ack(&stripped).await;
 				let ack_refused = matches!(ack, Err(HandshakeError::CountersignatureMissing));
 				trace.event_with(
-					CountersignatureMissingSpec::missing_countersignature_fails_closed,
+					MISSING_COUNTERSIGNATURE_FAILS_CLOSED,
 					&[],
 					ack_refused,
 				)?;
@@ -259,14 +285,14 @@ mod cms {
 					&& outcomes[0].countersignature.is_none()
 					&& outcomes[0].ancillary_response.is_none();
 				trace.event_with(
-					CountersignatureMissingSpec::outcome_records_missing_countersignature,
+					OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE,
 					&[],
 					missing_recorded,
 				)?;
 
 				let activation = server.complete();
 				let activation_refused = matches!(activation, Err(HandshakeError::CountersignatureMissing));
-				trace.event_with(CountersignatureMissingSpec::session_never_activates, &[], activation_refused)?;
+				trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 
 				Ok::<(), TightBeamError>(())
 			}

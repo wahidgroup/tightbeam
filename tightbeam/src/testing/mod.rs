@@ -3,6 +3,17 @@
 //! Aggregates submodules and provides demo macro usage to surface
 //! compilation errors early when introducing new declarative APIs.
 
+// Test-fixture surface: constructors take fixed, valid-by-construction
+// inputs, and a fixture that cannot build must abort the test run with
+// a stated invariant (`expect`).
+#![allow(
+	clippy::expect_used,
+	clippy::panic,
+	clippy::unreachable,
+	clippy::todo,
+	clippy::unimplemented
+)]
+
 pub mod assertions;
 pub mod config;
 pub mod env;
@@ -48,6 +59,9 @@ pub use fmea::{FailureMode, FmeaConfig, FmeaReport, SeverityScale};
 mod tests {
 	use crate::exactly;
 	use crate::testing::TBSpec;
+	use crate::utils::urn::Urn;
+
+	const MESSAGE_RECEIVED: Urn<'static> = Urn::new("test", "event:demo/message-received");
 
 	crate::tb_assert_spec! {
 		pub DemoSpec,
@@ -55,7 +69,7 @@ mod tests {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				(MessageReceived, exactly!(1))
+				(MESSAGE_RECEIVED, exactly!(1))
 			]
 		}
 	}

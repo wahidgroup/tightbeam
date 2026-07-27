@@ -15,13 +15,13 @@ use std::sync::Arc;
 use core::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering};
 
 use crate::colony::common::current_timestamp_ms;
-use crate::policy::{GatePolicy, TransitStatus};
+use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::utils::BasisPoints;
 use crate::Frame;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use std::collections::HashMap;
+	pub use std::collections::{HashMap, HashSet};
 	pub use std::sync::Mutex;
 
 	pub use crate::colony::common::ClusterCommand;
@@ -391,7 +391,7 @@ impl ClusterSecurityGate {
 
 #[cfg(feature = "x509")]
 impl GatePolicy for ClusterSecurityGate {
-	fn evaluate(&self, frame: &Frame) -> TransitStatus {
+	fn evaluate(&self, frame: &Frame, _session: &SessionContext) -> TransitStatus {
 		if !self.circuit_breaker.allow_request() {
 			return TransitStatus::PermissionDenied;
 		}
@@ -422,6 +422,7 @@ impl GatePolicy for ClusterSecurityGate {
 		if !self.replay_guard.is_fresh(command.issued_at_ms, now) {
 			return TransitStatus::PermissionDenied;
 		}
+
 		// Signer identifier keys the replay partition; an unencodable
 		// identifier cannot be attributed, so it fails closed.
 		let Ok(signer_id) = signer_info.sid.to_der() else {
@@ -440,15 +441,15 @@ impl GatePolicy for ClusterSecurityGate {
 	}
 }
 
-/// Gate policy enforcing hive capacity limits (backpressure)
+/// Gate policy enforcing hive capacity limits (backpressure).
 ///
 /// Returns `TransitStatus::ResourceExhausted` when utilization exceeds threshold,
 /// signaling to the cluster that it should route work elsewhere or queue.
 ///
-/// The gate itself grants no exemptions: any bypass keyed on
-/// frame-controlled data (e.g. message priority) is attacker-selectable.
-/// Callers that must keep specific traffic flowing under load (heartbeats)
-/// exempt it explicitly *after* authentication.
+/// The gate itself grants no exemptions: any bypass keyed on frame-controlled
+/// data (e.g. message priority) is attacker-selectable. Callers that must keep
+/// specific traffic flowing under load (heartbeats) exempt it explicitly
+/// *after* authentication.
 pub struct BackpressureGate {
 	/// Current aggregate utilization (basis points as u16)
 	utilization: Arc<AtomicU16>,
@@ -473,13 +474,84 @@ impl BackpressureGate {
 }
 
 impl GatePolicy for BackpressureGate {
-	fn evaluate(&self, _frame: &Frame) -> TransitStatus {
+	fn evaluate(&self, _frame: &Frame, _session: &SessionContext) -> TransitStatus {
 		let current = self.utilization.load(Ordering::Relaxed);
 		if current >= self.threshold.get() {
 			TransitStatus::ResourceExhausted
 		} else {
 			TransitStatus::Ok
 		}
+	}
+}
+
+// ============================================================================
+// Peer List Gate
+// ============================================================================
+
+/// Membership mode of a [`PeerListGate`].
+#[cfg(feature = "x509")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerListMode {
+	/// White list: only listed peer keys are admitted.
+	Allow,
+	/// Black list: listed peer keys are refused.
+	Deny,
+}
+
+/// Session-identity black/white list.
+///
+/// Keys on the DER-encoded `SubjectPublicKeyInfo` of the connection's
+/// mutually-authenticated peer certificate, not the frame signer which is an
+/// application-level concern. An empty session context answers as an absent
+/// peer, so allow lists fail closed (`Unauthenticated`) and deny lists admit.
+#[cfg(feature = "x509")]
+#[derive(Clone)]
+pub struct PeerListGate {
+	keys: HashSet<Vec<u8>>,
+	mode: PeerListMode,
+}
+
+#[cfg(feature = "x509")]
+impl PeerListGate {
+	/// White list admitting only these peer public keys (SPKI DER).
+	pub fn allow<I, K>(keys: I) -> Self
+	where
+		I: IntoIterator<Item = K>,
+		K: Into<Vec<u8>>,
+	{
+		Self { keys: keys.into_iter().map(Into::into).collect(), mode: PeerListMode::Allow }
+	}
+
+	/// Black list refusing these peer public keys (SPKI DER).
+	pub fn deny<I, K>(keys: I) -> Self
+	where
+		I: IntoIterator<Item = K>,
+		K: Into<Vec<u8>>,
+	{
+		Self { keys: keys.into_iter().map(Into::into).collect(), mode: PeerListMode::Deny }
+	}
+
+	/// The verdict for one peer identity.
+	///
+	/// A certified peer with an absent key means the SPKI failed to
+	/// encode locally; refused as [`TransitStatus::Internal`] in both
+	/// modes so the fault cannot slip past a deny list.
+	fn admit(&self, has_certificate: bool, peer_key: Option<&[u8]>) -> TransitStatus {
+		match (self.mode, peer_key) {
+			(_, None) if has_certificate => TransitStatus::Internal,
+			(PeerListMode::Allow, Some(key)) if self.keys.contains(key) => TransitStatus::Ok,
+			(PeerListMode::Allow, Some(_)) => TransitStatus::PermissionDenied,
+			(PeerListMode::Allow, None) => TransitStatus::Unauthenticated,
+			(PeerListMode::Deny, Some(key)) if self.keys.contains(key) => TransitStatus::PermissionDenied,
+			(PeerListMode::Deny, _) => TransitStatus::Ok,
+		}
+	}
+}
+
+#[cfg(feature = "x509")]
+impl GatePolicy for PeerListGate {
+	fn evaluate(&self, _message: &Frame, session: &SessionContext) -> TransitStatus {
+		self.admit(session.peer_certificate().is_some(), session.peer_public_key())
 	}
 }
 
@@ -565,9 +637,8 @@ mod tests {
 	#[test]
 	fn replay_guard_saturated_signer_does_not_block_others() {
 		let guard = ReplayGuard::new(30_000);
-		for i in 0..REPLAY_GUARD_CAPACITY {
-			assert!(guard.check_and_insert(b"signer-1", &i.to_be_bytes(), 1_000));
-		}
+		let seeded = (0..REPLAY_GUARD_CAPACITY).all(|i| guard.check_and_insert(b"signer-1", &i.to_be_bytes(), 1_000));
+		assert!(seeded);
 		assert!(!guard.check_and_insert(b"signer-1", b"sig-overflow", 1_000));
 		assert!(guard.check_and_insert(b"signer-2", b"sig-a", 1_000));
 	}
@@ -620,7 +691,10 @@ mod tests {
 		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
 
 		let frame = work_frame(Some(crate::MessagePriority::NetworkControl))?;
-		assert_eq!(GatePolicy::evaluate(&gate, &frame), TransitStatus::ResourceExhausted);
+		assert_eq!(
+			GatePolicy::evaluate(&gate, &frame, &SessionContext::default()),
+			TransitStatus::ResourceExhausted
+		);
 
 		Ok(())
 	}
@@ -631,7 +705,62 @@ mod tests {
 		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
 
 		let frame = work_frame(None)?;
-		assert_eq!(GatePolicy::evaluate(&gate, &frame), TransitStatus::Ok);
+		assert_eq!(
+			GatePolicy::evaluate(&gate, &frame, &SessionContext::default()),
+			TransitStatus::Ok
+		);
+
+		Ok(())
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn peer_allow_list_admits_listed_key_only() {
+		let gate = PeerListGate::allow([b"key-a".to_vec()]);
+		assert_eq!(gate.admit(true, Some(b"key-a")), TransitStatus::Ok);
+		assert_eq!(gate.admit(true, Some(b"key-b")), TransitStatus::PermissionDenied);
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn peer_allow_list_fails_closed_without_identity() {
+		let gate = PeerListGate::allow([b"key-a".to_vec()]);
+		assert_eq!(gate.admit(false, None), TransitStatus::Unauthenticated);
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn peer_deny_list_refuses_listed_key_only() {
+		let gate = PeerListGate::deny([b"key-a".to_vec()]);
+		assert_eq!(gate.admit(true, Some(b"key-a")), TransitStatus::PermissionDenied);
+		assert_eq!(gate.admit(true, Some(b"key-b")), TransitStatus::Ok);
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn peer_deny_list_admits_absent_identity() {
+		let gate = PeerListGate::deny([b"key-a".to_vec()]);
+		assert_eq!(gate.admit(false, None), TransitStatus::Ok);
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn peer_list_refuses_certified_peer_without_spki() {
+		let allow = PeerListGate::allow([b"key-a".to_vec()]);
+		let deny = PeerListGate::deny([b"key-a".to_vec()]);
+		assert_eq!(allow.admit(true, None), TransitStatus::Internal);
+		assert_eq!(deny.admit(true, None), TransitStatus::Internal);
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn peer_list_empty_context_answers_as_absent_peer() -> Result<(), crate::TightBeamError> {
+		let frame = work_frame(None)?;
+		let empty = SessionContext::default();
+		let allow = PeerListGate::allow([b"key-a".to_vec()]);
+		let deny = PeerListGate::deny([b"key-a".to_vec()]);
+		assert_eq!(GatePolicy::evaluate(&allow, &frame, &empty), TransitStatus::Unauthenticated);
+		assert_eq!(GatePolicy::evaluate(&deny, &frame, &empty), TransitStatus::Ok);
 
 		Ok(())
 	}

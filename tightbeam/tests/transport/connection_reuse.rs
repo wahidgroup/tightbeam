@@ -17,6 +17,12 @@
 
 use std::sync::Arc;
 
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const CLIENT_CONNECT: Urn<'static> = Urn::new("test", "event:connection-reuse/client-connect");
+pub(crate) const RECEIVE_RESPONSE: Urn<'static> = Urn::new("test", "event:connection-reuse/receive-response");
+pub(crate) const SEND_MESSAGE: Urn<'static> = Urn::new("test", "event:connection-reuse/send-message");
+
 use tightbeam::{
 	colony::servlet::ServletConf,
 	compose,
@@ -120,17 +126,17 @@ fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError
 tb_process_spec! {
 	pub ConnectionReuseProcess,
 	events {
-		observable { "client_connect", "send_message", "receive_response" }
+		observable { CLIENT_CONNECT, SEND_MESSAGE, RECEIVE_RESPONSE }
 		hidden { }
 	}
 	states {
-		Init => { "client_connect" => Connected },
-		Connected => { "send_message" => Sent1 },
-		Sent1 => { "receive_response" => Received1 },
-		Received1 => { "send_message" => Sent2 },
-		Sent2 => { "receive_response" => Received2 },
-		Received2 => { "send_message" => Sent3 },
-		Sent3 => { "receive_response" => Complete }
+		Init => { CLIENT_CONNECT => Connected },
+		Connected => { SEND_MESSAGE => Sent1 },
+		Sent1 => { RECEIVE_RESPONSE => Received1 },
+		Received1 => { SEND_MESSAGE => Sent2 },
+		Sent2 => { RECEIVE_RESPONSE => Received2 },
+		Received2 => { SEND_MESSAGE => Sent3 },
+		Sent3 => { RECEIVE_RESPONSE => Complete }
 	}
 	terminal { Complete }
 }
@@ -141,9 +147,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(client_connect, exactly!(1)),
-			(send_message, exactly!(3)),
-			(receive_response, exactly!(3))
+			(CLIENT_CONNECT, exactly!(1)),
+			(SEND_MESSAGE, exactly!(3)),
+			(RECEIVE_RESPONSE, exactly!(3))
 		]
 	}
 }
@@ -169,13 +175,13 @@ tb_scenario! {
 			let servlet_task = EchoServlet::start(Arc::new(trace.share()), None).await?;
 			let addr = servlet_task.addr;
 
-			trace.event(ConnectionReuseSpec::client_connect)?;
+			trace.event(CLIENT_CONNECT)?;
 
 			// Send 3 messages using the same client (connection keep-alive)
 			let client_builder = ClientBuilder::<TokioListener>::builder().build();
 			let mut client = client_builder.connect(addr).await?;
 			for i in 1..=3 {
-				trace.event(ConnectionReuseSpec::send_message)?;
+				trace.event(SEND_MESSAGE)?;
 
 				let msg = compose! {
 					V0: id: format!("msg{}", i).as_bytes(),
@@ -183,7 +189,7 @@ tb_scenario! {
 				}?;
 
 				if client.emit(msg, None).await?.is_some() {
-					trace.event(ConnectionReuseSpec::receive_response)?;
+					trace.event(RECEIVE_RESPONSE)?;
 				}
 			}
 
@@ -225,7 +231,7 @@ tb_scenario! {
 			let servlet_task = TlsEchoServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
 			let addr = servlet_task.addr;
 
-			trace.event(ConnectionReuseSpec::client_connect)?;
+			trace.event(CLIENT_CONNECT)?;
 
 			// Configure client with TLS credentials
 			let builder = ClientBuilder::<TokioListener>::builder()
@@ -236,7 +242,7 @@ tb_scenario! {
 
 			// Send 3 messages using the same TLS client (no re-handshake, session reuse)
 			for i in 1..=3 {
-				trace.event(ConnectionReuseSpec::send_message)?;
+				trace.event(SEND_MESSAGE)?;
 
 				let msg = compose! {
 					V0: id: format!("tls-msg{}", i).as_bytes(),
@@ -244,7 +250,7 @@ tb_scenario! {
 				}?;
 
 				if client.emit(msg, None).await?.is_some() {
-					trace.event(ConnectionReuseSpec::receive_response)?;
+					trace.event(RECEIVE_RESPONSE)?;
 				}
 			}
 

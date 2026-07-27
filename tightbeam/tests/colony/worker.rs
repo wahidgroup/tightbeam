@@ -1,11 +1,16 @@
 //! Integration test for Worker environment syntax in tb_scenario!
 
 use std::sync::Arc;
+
 use tightbeam::colony::worker::Worker;
 use tightbeam::der::Sequence;
 use tightbeam::testing::{ScenarioConf, WorkerEnv};
+use tightbeam::utils::urn::Urn;
 use tightbeam::Beamable;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, worker};
+
+pub(crate) const RELAY_START: Urn<'static> = Urn::new("test", "event:worker/relay-start");
+pub(crate) const RELAY_SUCCESS: Urn<'static> = Urn::new("test", "event:worker/relay-success");
 
 // Test message types
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
@@ -52,16 +57,16 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(relay_start, exactly!(1)),
-			(relay_success, exactly!(1), equals!("DEFAULT_PONG"))
+			(RELAY_START, exactly!(1)),
+			(RELAY_SUCCESS, exactly!(1), equals!("DEFAULT_PONG"))
 		]
 	},
 	V(2,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(relay_start, exactly!(1)),
-			(relay_success, exactly!(1), equals!("CUSTOM_RESPONSE"))
+			(RELAY_START, exactly!(1)),
+			(RELAY_SUCCESS, exactly!(1), equals!("CUSTOM_RESPONSE"))
 		]
 	},
 }
@@ -76,7 +81,7 @@ tb_scenario! {
 			})
 		},
 		stimulus: |WorkerEnv { trace, worker, .. }| async move {
-			trace.event_with(WorkerSpec::relay_start, &[], ())?;
+			trace.event_with(RELAY_START, &[], ())?;
 
 			let ping_msg = PingMessage {
 				content: "PING".to_string(),
@@ -85,7 +90,7 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
-				trace.event_with(WorkerSpec::relay_success, &[], resp.result)?;
+				trace.event_with(RELAY_SUCCESS, &[], resp.result)?;
 			}
 
 			Ok(())
@@ -101,7 +106,7 @@ tb_scenario! {
 	environment Worker {
 	setup: |_env| DefaultWorker::new(()),
 	stimulus: |WorkerEnv { trace, worker, .. }| async move {
-		trace.event_with(WorkerSpec::relay_start, &[], ())?;
+		trace.event_with(RELAY_START, &[], ())?;
 
 		let ping_msg = PingMessage {
 			content: "PING".to_string(),
@@ -110,7 +115,7 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
-				trace.event_with(WorkerSpec::relay_success, &[], resp.result)?;
+				trace.event_with(RELAY_SUCCESS, &[], resp.result)?;
 			}
 
 			Ok(())

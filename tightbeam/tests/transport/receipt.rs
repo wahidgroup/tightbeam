@@ -1,20 +1,4 @@
 //! Dual-signed session receipt integration tests.
-//!
-//! Drives budget-bearing mutual-auth ECIES handshakes over TCP and verifies:
-//!
-//! - Round trip: both endpoints retain the same dual-signed receipt with
-//!   the negotiated budgets, credit unit, challenge, and answer
-//! - Third-party verification: both signatures verify from the receipt
-//!   body and the certificates alone. Tampering with the body, either
-//!   signature, or the settlement answer fails
-//! - Settle rejection: the authorizer's refusal aborts the handshake
-//!   with its application code and no receipt is retained
-//! - Abandoned settlement: the client approver's refusal aborts before
-//!   the countersignature and the server session never activates
-//! - Fail-closed matrix: a challenge without an approver, and budgets
-//!   without mutual authentication on either side, abort the handshake
-//! - Session outcomes: the observer receives activation and refusal
-//!   verdicts with the full evidence
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -22,7 +6,8 @@
 	feature = "transport-multiplex",
 	feature = "tcp",
 	feature = "tokio",
-	feature = "testing"
+	feature = "testing",
+	feature = "instrument"
 ))]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,6 +24,7 @@ use tightbeam::oids::RECEIPT_ANSWER;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::MUX_APPLICATION_CODE_FLOOR;
 use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
@@ -49,11 +35,51 @@ use tightbeam::transport::handshake::receipt::{
 };
 use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
-use tightbeam::transport::{EncryptedMessageIO, MessageIO, TransportError};
+use tightbeam::transport::{EncryptedMessageIO, MessageIO, TransportError, X509ClientConfig};
 use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::attr::Attribute;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
+
+use tightbeam::instrumentation::events;
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const ANSWER_BOUND: Urn<'static> = Urn::new("test", "event:receipt/answer-bound");
+pub(crate) const BOTH_SIGNATURES_VERIFY_OFFLINE: Urn<'static> =
+	Urn::new("test", "event:receipt/both-signatures-verify-offline");
+pub(crate) const CHALLENGE_BOUND: Urn<'static> = Urn::new("test", "event:receipt/challenge-bound");
+pub(crate) const CLIENT_COMPLETES_OPTIMISTICALLY: Urn<'static> =
+	Urn::new("test", "event:receipt/client-completes-optimistically");
+pub(crate) const CLIENT_FAILS_CLOSED_UNSUPPORTED: Urn<'static> =
+	Urn::new("test", "event:receipt/client-fails-closed-unsupported");
+pub(crate) const CLIENT_REFUSES_WITH_CODE: Urn<'static> = Urn::new("test", "event:receipt/client-refuses-with-code");
+pub(crate) const CLIENT_RETAINS_RECEIPT: Urn<'static> = Urn::new("test", "event:receipt/client-retains-receipt");
+pub(crate) const CLIENT_SESSION_DEAD_ON_FIRST_USE: Urn<'static> =
+	Urn::new("test", "event:receipt/client-session-dead-on-first-use");
+pub(crate) const EMPTY_ANSWER_STORED_AS_ABSENT: Urn<'static> =
+	Urn::new("test", "event:receipt/empty-answer-stored-as-absent");
+pub(crate) const ENDPOINTS_RETAIN_IDENTICAL_RECEIPTS: Urn<'static> =
+	Urn::new("test", "event:receipt/endpoints-retain-identical-receipts");
+pub(crate) const IDENTITYLESS_CLIENT_NEVER_CONSULTS_APPROVER: Urn<'static> =
+	Urn::new("test", "event:receipt/identityless-client-never-consults-approver");
+pub(crate) const IDENTITYLESS_CLIENT_REFUSES_TO_COUNTERSIGN: Urn<'static> =
+	Urn::new("test", "event:receipt/identityless-client-refuses-to-countersign");
+pub(crate) const RECEIPTS_IDENTICAL: Urn<'static> = Urn::new("test", "event:receipt/receipts-identical");
+pub(crate) const RECEIPT_MATCHES_NEGOTIATION: Urn<'static> =
+	Urn::new("test", "event:receipt/receipt-matches-negotiation");
+pub(crate) const REFUSAL_OUTCOME_RECORDED: Urn<'static> = Urn::new("test", "event:receipt/refusal-outcome-recorded");
+pub(crate) const REFUSED_RECEIPT_VERIFIES_OFFLINE: Urn<'static> =
+	Urn::new("test", "event:receipt/refused-receipt-verifies-offline");
+pub(crate) const SERVER_NEVER_ACTIVATES: Urn<'static> = Urn::new("test", "event:receipt/server-never-activates");
+pub(crate) const SERVER_REFUSES_TO_ISSUE_UNVERIFIABLE_RECEIPT: Urn<'static> =
+	Urn::new("test", "event:receipt/server-refuses-to-issue-unverifiable-receipt");
+pub(crate) const SERVER_REJECTS_WITH_CODE: Urn<'static> = Urn::new("test", "event:receipt/server-rejects-with-code");
+pub(crate) const SERVER_RETAINS_RECEIPT: Urn<'static> = Urn::new("test", "event:receipt/server-retains-receipt");
+pub(crate) const SINGLE_OUTCOME_RECORDED: Urn<'static> = Urn::new("test", "event:receipt/single-outcome-recorded");
+pub(crate) const TAMPERED_ARTIFACT_FAILS_VERIFICATION: Urn<'static> =
+	Urn::new("test", "event:receipt/tampered-artifact-fails-verification");
+pub(crate) const VERDICT_ACTIVATED_WITH_EVIDENCE: Urn<'static> =
+	Urn::new("test", "event:receipt/verdict-activated-with-evidence");
 
 use crate::common::security::{
 	expectation_failure, ClientMaterials, GrantingAuthorizer, PayingApprover as AnsweringApprover, RecordingObserver,
@@ -95,7 +121,6 @@ fn with_budget_approver(client: TcpTransport<TokioStream>, approver: Arc<PayingA
 	with_budget_offer(client).with_receipt_approver(approver as Arc<dyn ReceiptApprover>)
 }
 
-/// Grants the requested budgets with a settlement challenge attached.
 /// Settlement succeeds only for the expected answer.
 struct ChallengingAuthorizer {
 	challenge: OctetString,
@@ -140,9 +165,7 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 	}
 }
 
-/// Approves receipts by answering the challenge with the canned
-/// response, or refuses with the configured code. Counts every
-/// consultation so a scenario can prove the hook never fired.
+/// Counts consultations so scenarios can prove the hook never fired.
 struct PayingApprover {
 	response: OctetString,
 	refusal: Option<u32>,
@@ -187,28 +210,24 @@ impl ReceiptApprover for PayingApprover {
 	}
 }
 
-/// Establish a settled budget-bearing session: challenge issued,
-/// answered, countersigned, and settled. The observer, when given,
-/// receives the server's session outcome.
 async fn establish_settled_session_observed(
 	observer: Option<Arc<dyn SessionObserver>>,
+	trace: &TraceCollector,
 ) -> Result<MutualTransports, TightBeamError> {
 	let hooks = MutualSessionHooks {
 		authorizer: Some(Arc::new(ChallengingAuthorizer::new(true)?)),
 		approver: Some(Arc::new(PayingApprover::paying()?)),
 		observer,
+		trace: Some(trace.share()),
 	};
 
 	establish_mutual_transports(budget_offer(), server_offer(), hooks).await
 }
 
-/// Establish a settled budget-bearing session without observation.
-async fn establish_settled_session() -> Result<MutualTransports, TightBeamError> {
-	establish_settled_session_observed(None).await
+async fn establish_settled_session(trace: &TraceCollector) -> Result<MutualTransports, TightBeamError> {
+	establish_settled_session_observed(None, trace).await
 }
 
-/// SEC1 verifying key from a certificate's SPKI, as a third party
-/// holding only the certificate would extract it.
 fn verifying_key_from(certificate: &Certificate) -> Result<Secp256k1VerifyingKey, TightBeamError> {
 	let sec1 = certificate
 		.tbs_certificate
@@ -220,10 +239,7 @@ fn verifying_key_from(certificate: &Certificate) -> Result<Secp256k1VerifyingKey
 		.map_err(|_| expectation_failure("certificate must carry a valid SEC1 public key"))
 }
 
-/// Verify the artifact exactly as a third party would: reconstructed
-/// from the `SignedData` alone, keys extracted from the two
-/// certificates, checked through the library's canonical
-/// [`StoredReceipt::verify`] entry point.
+/// Third-party verify via [`StoredReceipt::verify`].
 fn third_party_verifies(
 	artifact: &SignedData,
 	server_certificate: &Certificate,
@@ -239,15 +255,12 @@ fn third_party_verifies(
 	Ok(verdict.is_ok())
 }
 
-/// Return `octets` with the first byte flipped.
 fn flipped(octets: &OctetString) -> Result<OctetString, TightBeamError> {
 	let mut bytes = octets.as_bytes().to_vec();
 	bytes[0] ^= 0x01;
 	Ok(OctetString::new(bytes)?)
 }
 
-/// Decode, mutate, and re-embed the receipt body carried as the
-/// artifact's `eContent`.
 fn tamper_body(
 	artifact: &mut SignedData,
 	mutate: fn(&mut SessionReceipt) -> Result<(), TightBeamError>,
@@ -269,9 +282,6 @@ fn tamper_body(
 	Ok(())
 }
 
-/// Replace one role's `SignerInfo` with a mutated copy. The pristine
-/// artifact is validated through the public [`StoredReceipt`] view to
-/// locate the role's signer.
 fn tamper_signer(
 	artifact: &mut SignedData,
 	role: ReceiptRole,
@@ -299,8 +309,6 @@ fn flip_signature(signer: &mut SignerInfo) -> Result<(), TightBeamError> {
 	Ok(())
 }
 
-/// Swap (or strip, with `None`) the settlement answer bound by a client
-/// `SignerInfo`'s signed attributes.
 fn set_answer_attr(signer: &mut SignerInfo, answer: Option<&'static [u8]>) -> Result<(), TightBeamError> {
 	let attrs = signer
 		.signed_attrs
@@ -323,11 +331,9 @@ fn set_answer_attr(signer: &mut SignerInfo, answer: Option<&'static [u8]>) -> Re
 	Ok(())
 }
 
-/// Mutation applied to a pristine receipt artifact before re-verification.
 type Tamper = fn(&mut SignedData) -> Result<(), TightBeamError>;
 
-/// Every part of the dual-signed artifact a forger could touch: the
-/// signed body fields, either signature, and the countersigned answer.
+/// Tamper cases: body, signatures, settlement answer.
 const TAMPER_CASES: &[(&str, Tamper)] = &[
 	("budget drift in the signed body", |artifact| {
 		tamper_body(artifact, |receipt| {
@@ -369,31 +375,31 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(client_retains_receipt, exactly!(1), equals!(true)),
-			(server_retains_receipt, exactly!(1), equals!(true)),
-			(receipts_identical, exactly!(1), equals!(true)),
-			(receipt_matches_negotiation, exactly!(1), equals!(true)),
-			(challenge_bound, exactly!(1), equals!(true)),
-			(answer_bound, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(2)),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
+			(events::SESSION_RECEIPT_REFUSED, exactly!(0)),
+			(CLIENT_RETAINS_RECEIPT, exactly!(1), equals!(true)),
+			(SERVER_RETAINS_RECEIPT, exactly!(1), equals!(true)),
+			(RECEIPTS_IDENTICAL, exactly!(1), equals!(true)),
+			(RECEIPT_MATCHES_NEGOTIATION, exactly!(1), equals!(true)),
+			(CHALLENGE_BOUND, exactly!(1), equals!(true)),
+			(ANSWER_BOUND, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A budget-bearing mutual-auth handshake with a settlement challenge
-// completes with the same dual-signed receipt on both endpoints, bound
-// to the negotiated budgets, credit unit, challenge, and answer.
 tb_scenario! {
 	name: receipt_round_trip_dual_signed,
 	spec: ReceiptRoundTripSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let session = establish_settled_session().await?;
+			let session = establish_settled_session(&trace).await?;
 
 			let client_receipt = session.client.session_receipt();
 			let server_receipt = session.server.session_receipt();
-			trace.event_with(ReceiptRoundTripSpec::client_retains_receipt, &[], client_receipt.is_some())?;
-			trace.event_with(ReceiptRoundTripSpec::server_retains_receipt, &[], server_receipt.is_some())?;
-			trace.event_with(ReceiptRoundTripSpec::receipts_identical, &[], client_receipt == server_receipt)?;
+			trace.event_with(CLIENT_RETAINS_RECEIPT, &[], client_receipt.is_some())?;
+			trace.event_with(SERVER_RETAINS_RECEIPT, &[], server_receipt.is_some())?;
+			trace.event_with(RECEIPTS_IDENTICAL, &[], client_receipt == server_receipt)?;
 
 			let stored = client_receipt.ok_or_else(|| expectation_failure("client must retain the receipt"))?;
 			let settings = session
@@ -403,12 +409,12 @@ tb_scenario! {
 
 			let is_budget_matched = stored.receipt().budgets == REQUEST;
 			let is_credit_unit_matched = stored.receipt().credit_unit == settings.credit_unit;
-			trace.event_with(ReceiptRoundTripSpec::receipt_matches_negotiation, &[], is_budget_matched && is_credit_unit_matched)?;
+			trace.event_with(RECEIPT_MATCHES_NEGOTIATION, &[], is_budget_matched && is_credit_unit_matched)?;
 
 			let challenge = stored.receipt().ancillary.as_ref().map(OctetString::as_bytes);
 			let answer = stored.ancillary_response().map(OctetString::as_bytes);
-			trace.event_with(ReceiptRoundTripSpec::challenge_bound, &[], challenge == Some(CHALLENGE))?;
-			trace.event_with(ReceiptRoundTripSpec::answer_bound, &[], answer == Some(RESPONSE))?;
+			trace.event_with(CHALLENGE_BOUND, &[], challenge == Some(CHALLENGE))?;
+			trace.event_with(ANSWER_BOUND, &[], answer == Some(RESPONSE))?;
 
 			Ok(())
 		}
@@ -421,17 +427,15 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(empty_answer_stored_as_absent, exactly!(1), equals!(true)),
-			(endpoints_retain_identical_receipts, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(2)),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
+			(EMPTY_ANSWER_STORED_AS_ABSENT, exactly!(1), equals!(true)),
+			(ENDPOINTS_RETAIN_IDENTICAL_RECEIPTS, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// An approver answering with zero bytes countersigns exactly what an
-// unanswering approver would: the digest appends the raw answer bytes,
-// so the two are cryptographically indistinguishable. Both endpoints
-// therefore canonicalize the empty answer to absent and retain the
-// same artifact.
+// Empty answer digest-identical to absent; both endpoints canonicalize to absent.
 tb_scenario! {
 	name: receipt_empty_answer_normalized,
 	spec: ReceiptEmptyAnswerSpec,
@@ -441,15 +445,16 @@ tb_scenario! {
 				authorizer: Some(Arc::new(GrantingAuthorizer::challenge_free())),
 				approver: Some(Arc::new(AnsweringApprover::answering(b"")?)),
 				observer: None,
+				trace: Some(trace.share()),
 			};
 			let session = establish_mutual_transports(budget_offer(), server_offer(), hooks).await?;
 
 			let client_receipt = session.client.session_receipt();
 			let server_receipt = session.server.session_receipt();
 			let stored_absent = client_receipt.is_some_and(|stored| stored.ancillary_response().is_none());
-			trace.event_with(ReceiptEmptyAnswerSpec::empty_answer_stored_as_absent, &[], stored_absent)?;
+			trace.event_with(EMPTY_ANSWER_STORED_AS_ABSENT, &[], stored_absent)?;
 			trace.event_with(
-				ReceiptEmptyAnswerSpec::endpoints_retain_identical_receipts,
+				ENDPOINTS_RETAIN_IDENTICAL_RECEIPTS,
 				&[],
 				client_receipt == server_receipt,
 			)?;
@@ -465,22 +470,18 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(both_signatures_verify_offline, exactly!(1), equals!(true)),
-			(tampered_artifact_fails_verification, exactly!(7), equals!(true))
+			(BOTH_SIGNATURES_VERIFY_OFFLINE, exactly!(1), equals!(true)),
+			(TAMPERED_ARTIFACT_FAILS_VERIFICATION, exactly!(7), equals!(true))
 		]
 	}
 }
 
-// The stored receipt is a self-contained artifact: given only the two
-// certificates, both signatures verify through the library's canonical
-// entry point. Tampering with the signed body, either signature, or
-// the countersigned settlement answer breaks it.
 tb_scenario! {
 	name: receipt_third_party_verifiable,
 	spec: ReceiptThirdPartySpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let session = establish_settled_session().await?;
+			let session = establish_settled_session(&trace).await?;
 			let stored = session
 				.client
 				.session_receipt()
@@ -488,7 +489,7 @@ tb_scenario! {
 
 			let artifact = stored.artifact();
 			let pristine_verifies = third_party_verifies(artifact, &session.server_certificate, &session.client_certificate)?;
-			trace.event_with(ReceiptThirdPartySpec::both_signatures_verify_offline, &[], pristine_verifies)?;
+			trace.event_with(BOTH_SIGNATURES_VERIFY_OFFLINE, &[], pristine_verifies)?;
 
 			for (forgery, tamper) in TAMPER_CASES {
 				let mut tampered = stored.artifact().to_owned();
@@ -497,7 +498,7 @@ tb_scenario! {
 				let forgery_verifies =
 					third_party_verifies(&tampered, &session.server_certificate, &session.client_certificate)?;
 				trace.event_with(
-					ReceiptThirdPartySpec::tampered_artifact_fails_verification,
+					TAMPERED_ARTIFACT_FAILS_VERIFICATION,
 					vec![*forgery],
 					!forgery_verifies,
 				)?;
@@ -514,17 +515,17 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(server_rejects_with_code, exactly!(1), equals!(true)),
-			(client_completes_optimistically, exactly!(1), equals!(true)),
-			(client_session_dead_on_first_use, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
+			(events::SESSION_RECEIPT_REFUSED, exactly!(1)),
+			(SERVER_REJECTS_WITH_CODE, exactly!(1), equals!(true)),
+			(CLIENT_COMPLETES_OPTIMISTICALLY, exactly!(1), equals!(true)),
+			(CLIENT_SESSION_DEAD_ON_FIRST_USE, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// The authorizer's settle refusal aborts the handshake after the
-// countersignature: the server surfaces the application code and never
-// retains a receipt. ECIES completes client-side on the key exchange
-// send, so the client observes the rejection on its first read.
+// ECIES completes client-side on key exchange send; rejection surfaces on first read.
 tb_scenario! {
 	name: receipt_settle_rejection_fails_closed,
 	spec: ReceiptSettleRejectionSpec,
@@ -534,11 +535,13 @@ tb_scenario! {
 			let client_materials = ClientMaterials::generate();
 			let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
 
+			let server_trace = trace.share();
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
 					.with_mux_offer(Some(server_offer()))
-					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(false)?));
+					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(false)?))
+					.with_trace(server_trace);
 
 				serve_one_handshake_message(&mut transport).await?;
 				serve_one_handshake_message(&mut transport).await?;
@@ -546,7 +549,7 @@ tb_scenario! {
 			});
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
-			client = with_budget_approver(client, Arc::new(PayingApprover::paying()?));
+			client = with_budget_approver(client, Arc::new(PayingApprover::paying()?)).with_trace(trace.share());
 			let client_result = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -556,19 +559,18 @@ tb_scenario! {
 					HandshakeError::SettlementRejected { code: SETTLE_REFUSAL_CODE }
 				)))
 			);
-			trace.event_with(ReceiptSettleRejectionSpec::server_rejects_with_code, &[], server_rejected)?;
+			trace.event_with(SERVER_REJECTS_WITH_CODE, &[], server_rejected)?;
 
-			// The client completed optimistically. The dead session
-			// surfaces on the first read against the aborted server.
+			// Client completed optimistically; dead session on first read.
 			trace.event_with(
-				ReceiptSettleRejectionSpec::client_completes_optimistically,
+				CLIENT_COMPLETES_OPTIMISTICALLY,
 				&[],
 				client_result.is_ok(),
 			)?;
 
 			let first_read = client.read_envelope().await;
 			trace.event_with(
-				ReceiptSettleRejectionSpec::client_session_dead_on_first_use,
+				CLIENT_SESSION_DEAD_ON_FIRST_USE,
 				&[],
 				first_read.is_err(),
 			)?;
@@ -584,15 +586,15 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(client_refuses_with_code, exactly!(1), equals!(true)),
-			(server_never_activates, exactly!(1), equals!(true))
+			(events::SESSION_RECEIPT_REFUSED, exactly!(1)),
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(0)),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(0)),
+			(CLIENT_REFUSES_WITH_CODE, exactly!(1), equals!(true)),
+			(SERVER_NEVER_ACTIVATES, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// The client approver walks away from the challenge: the handshake
-// aborts before the countersignature ever exists and the server's
-// budget-bearing session never activates.
 tb_scenario! {
 	name: receipt_abandoned_settlement_never_activates,
 	spec: ReceiptAbandonedSettlementSpec,
@@ -602,11 +604,13 @@ tb_scenario! {
 			let client_materials = ClientMaterials::generate();
 			let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
 
+			let server_trace = trace.share();
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
 					.with_mux_offer(Some(server_offer()))
-					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(true)?));
+					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(true)?))
+					.with_trace(server_trace);
 
 				serve_one_handshake_message(&mut transport).await?;
 				serve_one_handshake_message(&mut transport).await?;
@@ -614,7 +618,8 @@ tb_scenario! {
 			});
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
-			client = with_budget_approver(client, Arc::new(PayingApprover::refusing(APPROVAL_REFUSAL_CODE)?));
+			client = with_budget_approver(client, Arc::new(PayingApprover::refusing(APPROVAL_REFUSAL_CODE)?))
+				.with_trace(trace.share());
 			let client_result = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -624,9 +629,9 @@ tb_scenario! {
 					code: APPROVAL_REFUSAL_CODE,
 				}))
 			);
-			trace.event_with(ReceiptAbandonedSettlementSpec::client_refuses_with_code, &[], client_refused)?;
+			trace.event_with(CLIENT_REFUSES_WITH_CODE, &[], client_refused)?;
 			trace.event_with(
-				ReceiptAbandonedSettlementSpec::server_never_activates,
+				SERVER_NEVER_ACTIVATES,
 				&[],
 				server_result.is_err(),
 			)?;
@@ -642,25 +647,24 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(single_outcome_recorded, exactly!(1), equals!(true)),
-			(verdict_activated_with_evidence, exactly!(1), equals!(true))
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(2)),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
+			(SINGLE_OUTCOME_RECORDED, exactly!(1), equals!(true)),
+			(VERDICT_ACTIVATED_WITH_EVIDENCE, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A settled budget-bearing session hands the observer exactly one
-// outcome: verdict Activated, carrying the same dual-signed artifact
-// the endpoints retained plus the client identity of record.
 tb_scenario! {
 	name: receipt_outcome_recorded_on_activation,
 	spec: ReceiptOutcomeActivatedSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let observer = Arc::new(RecordingObserver::default());
-			let session = establish_settled_session_observed(Some(Arc::clone(&observer) as Arc<dyn SessionObserver>)).await?;
+			let session = establish_settled_session_observed(Some(Arc::clone(&observer) as Arc<dyn SessionObserver>), &trace).await?;
 
 			let outcomes = observer.recorded();
-			trace.event_with(ReceiptOutcomeActivatedSpec::single_outcome_recorded, &[], outcomes.len() == 1)?;
+			trace.event_with(SINGLE_OUTCOME_RECORDED, &[], outcomes.len() == 1)?;
 
 			let stored = session
 				.server
@@ -674,7 +678,7 @@ tb_scenario! {
 					&& outcome.ancillary_response.as_ref() == stored.ancillary_response()
 					&& outcome.client_certificate.as_deref() == Some(session.client_certificate.as_ref())
 			});
-			trace.event_with(ReceiptOutcomeActivatedSpec::verdict_activated_with_evidence, &[], matches_stored)?;
+			trace.event_with(VERDICT_ACTIVATED_WITH_EVIDENCE, &[], matches_stored)?;
 
 			Ok(())
 		}
@@ -687,16 +691,16 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(refusal_outcome_recorded, exactly!(1), equals!(true)),
-			(refused_receipt_verifies_offline, exactly!(1), equals!(true))
+			(events::SESSION_RECEIPT_REFUSED, exactly!(1)),
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
+			(REFUSAL_OUTCOME_RECORDED, exactly!(1), equals!(true)),
+			(REFUSED_RECEIPT_VERIFIES_OFFLINE, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A settle refusal aborts the handshake, but the countersigned receipt
-// is the strongest evidence of the disputed agreement: the observer
-// receives it with the refusal code, and both signatures still verify
-// offline from the certificates alone.
+// Refused countersignature remains third-party verifiable evidence.
 tb_scenario! {
 	name: receipt_outcome_preserves_refused_evidence,
 	spec: ReceiptOutcomeRefusedSpec,
@@ -708,12 +712,14 @@ tb_scenario! {
 
 			let observer = Arc::new(RecordingObserver::default());
 			let server_observer = Arc::clone(&observer);
+			let server_trace = trace.share();
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
 					.with_mux_offer(Some(server_offer()))
 					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(false)?))
-					.with_session_observer(server_observer as Arc<dyn SessionObserver>);
+					.with_session_observer(server_observer as Arc<dyn SessionObserver>)
+					.with_trace(server_trace);
 
 				serve_one_handshake_message(&mut transport).await?;
 				serve_one_handshake_message(&mut transport).await?;
@@ -721,7 +727,7 @@ tb_scenario! {
 			});
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
-			client = with_budget_approver(client, Arc::new(PayingApprover::paying()?));
+			client = with_budget_approver(client, Arc::new(PayingApprover::paying()?)).with_trace(trace.share());
 			let _ = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -735,18 +741,15 @@ tb_scenario! {
 					outcome.verdict == SessionVerdict::SettlementRejected { code: SETTLE_REFUSAL_CODE }
 						&& outcome.client_certificate.as_deref() == Some(client_materials.certificate.as_ref())
 				});
-			trace.event_with(ReceiptOutcomeRefusedSpec::refusal_outcome_recorded, &[], refusal_recorded)?;
+			trace.event_with(REFUSAL_OUTCOME_RECORDED, &[], refusal_recorded)?;
 
-			// The refused countersigned receipt remains third-party
-			// verifiable evidence, reconstructed from the outcome's
-			// dual-signed artifact alone.
 			let evidence = outcomes
 				.first()
 				.filter(|outcome| outcome.countersignature.is_some())
 				.map(|outcome| outcome.artifact.to_owned())
 				.ok_or_else(|| expectation_failure("refusal outcome must carry the countersignature"))?;
 			trace.event_with(
-				ReceiptOutcomeRefusedSpec::refused_receipt_verifies_offline,
+				REFUSED_RECEIPT_VERIFIES_OFFLINE,
 				&[],
 				third_party_verifies(&evidence, &materials.certificate, &client_materials.certificate)?,
 			)?;
@@ -762,15 +765,16 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(client_fails_closed_unsupported, exactly!(1), equals!(true)),
-			(server_never_activates, exactly!(1), equals!(true))
+			(events::SESSION_RECEIPT_REFUSED, exactly!(1)),
+			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(0)),
+			(events::SESSION_RECEIPT_SETTLED, exactly!(0)),
+			(CLIENT_FAILS_CLOSED_UNSUPPORTED, exactly!(1), equals!(true)),
+			(SERVER_NEVER_ACTIVATES, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A challenge-bearing receipt arriving at a client with no configured
-// approver must fail closed with the reserved unsupported code: silence
-// is never consent to a settlement demand.
+// Silence is never consent to a settlement demand.
 tb_scenario! {
 	name: receipt_challenge_without_approver_fails_closed,
 	spec: ReceiptNoApproverSpec,
@@ -792,7 +796,7 @@ tb_scenario! {
 			});
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
-			client = with_budget_offer(client);
+			client = with_budget_offer(client).with_trace(trace.share());
 			let client_result = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -802,8 +806,8 @@ tb_scenario! {
 					code: SETTLEMENT_UNSUPPORTED_CODE,
 				}))
 			);
-			trace.event_with(ReceiptNoApproverSpec::client_fails_closed_unsupported, &[], client_failed_closed)?;
-			trace.event_with(ReceiptNoApproverSpec::server_never_activates, &[], server_result.is_err())?;
+			trace.event_with(CLIENT_FAILS_CLOSED_UNSUPPORTED, &[], client_failed_closed)?;
+			trace.event_with(SERVER_NEVER_ACTIVATES, &[], server_result.is_err())?;
 
 			Ok(())
 		}
@@ -816,17 +820,14 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(server_refuses_to_issue_unverifiable_receipt, exactly!(1), equals!(true)),
-			(identityless_client_refuses_to_countersign, exactly!(1), equals!(true)),
-			(identityless_client_never_consults_approver, exactly!(1), equals!(true))
+			(SERVER_REFUSES_TO_ISSUE_UNVERIFIABLE_RECEIPT, exactly!(1), equals!(true)),
+			(IDENTITYLESS_CLIENT_REFUSES_TO_COUNTERSIGN, exactly!(1), equals!(true)),
+			(IDENTITYLESS_CLIENT_NEVER_CONSULTS_APPROVER, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// Budgets without mutual authentication fail closed on both sides: a
-// server with no client validators cannot verify any countersignature
-// and refuses to issue a receipt at all, and an identity-less client
-// offered a receipt has nothing to countersign with and aborts.
+// Budgets without mutual auth: server cannot verify countersignature; client cannot countersign.
 tb_scenario! {
 	name: receipt_budgets_require_mutual_auth,
 	spec: ReceiptMutualAuthSpec,
@@ -835,7 +836,7 @@ tb_scenario! {
 			let materials = ServerMaterials::generate();
 			let client_materials = ClientMaterials::generate();
 
-			// Server side: no client validators, authorizer grants budgets.
+			// Server: no client validators.
 			let (listener, addr) = bind_encrypted_listener(&materials).await?;
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
@@ -859,13 +860,12 @@ tb_scenario! {
 				)))
 			);
 			trace.event_with(
-				ReceiptMutualAuthSpec::server_refuses_to_issue_unverifiable_receipt,
+				SERVER_REFUSES_TO_ISSUE_UNVERIFIABLE_RECEIPT,
 				&[],
 				server_refused,
 			)?;
 
-			// Client side: server issues a receipt (validators present),
-			// but the pinned client carries no identity to countersign with.
+			// Client: pinned, no identity to countersign with.
 			let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
@@ -893,16 +893,14 @@ tb_scenario! {
 				Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired))
 			);
 			trace.event_with(
-				ReceiptMutualAuthSpec::identityless_client_refuses_to_countersign,
+				IDENTITYLESS_CLIENT_REFUSES_TO_COUNTERSIGN,
 				&[],
 				client_refused,
 			)?;
 
-			// Approval can spend an irreversible settlement answer, so
-			// the identity check must run first: the approver was never
-			// consulted for a session that could not countersign.
+			// Identity check before approver: settlement answer is irreversible.
 			trace.event_with(
-				ReceiptMutualAuthSpec::identityless_client_never_consults_approver,
+				IDENTITYLESS_CLIENT_NEVER_CONSULTS_APPROVER,
 				&[],
 				approver.approve_calls() == 0,
 			)?;

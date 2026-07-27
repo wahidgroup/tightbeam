@@ -1,4 +1,4 @@
-//! GoAway drain, rekey headroom, cancel budget, and connection teardown.
+//! Mux lifecycle: GoAway, rekey headroom, cancel budget, teardown.
 
 use std::sync::Arc;
 
@@ -9,13 +9,39 @@ use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, ScenarioConf, SetupEnv};
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
 use tightbeam::{Frame, TightBeamError};
 
-use crate::transport::support::{await_ok, join_task};
+use crate::common::security::expectation_failure;
+use crate::transport::support::{await_ok, join_task, mux_frame};
 
 use super::common::*;
+
+use tightbeam::instrumentation::events;
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const EMIT_FAILS_CONNECTION_CLOSED: Urn<'static> =
+	Urn::new("test", "event:lifecycle/emit-fails-connection-closed");
+pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> = Urn::new("test", "event:lifecycle/inflight-drains-to-echo");
+pub(crate) const LATE_EMIT_REFUSED_DRAINING: Urn<'static> =
+	Urn::new("test", "event:lifecycle/late-emit-refused-draining");
+pub(crate) const OFFENDER_ANSWERED_WITH_GOAWAY: Urn<'static> =
+	Urn::new("test", "event:lifecycle/offender-answered-with-goaway");
+pub(crate) const PEER_REASON_SURFACES_ON_HANDLE: Urn<'static> =
+	Urn::new("test", "event:lifecycle/peer-reason-surfaces-on-handle");
+pub(crate) const PENDING_FAILS_CONNECTION_CLOSED: Urn<'static> =
+	Urn::new("test", "event:lifecycle/pending-fails-connection-closed");
+pub(crate) const REKEY_CASE_HOLDS: Urn<'static> = Urn::new("test", "event:lifecycle/rekey-case-holds");
+pub(crate) const RESPONDER_POLICY_REJECTION: Urn<'static> =
+	Urn::new("test", "event:lifecycle/responder-policy-rejection");
+pub(crate) const SHUTDOWN_WITH_ADVERTISES_REASON: Urn<'static> =
+	Urn::new("test", "event:lifecycle/shutdown-with-advertises-reason");
+pub(crate) const STREAM_ABOVE_WATERMARK_DRAINING: Urn<'static> =
+	Urn::new("test", "event:lifecycle/stream-above-watermark-draining");
+pub(crate) const STREAM_AT_WATERMARK_ECHOED: Urn<'static> =
+	Urn::new("test", "event:lifecycle/stream-at-watermark-echoed");
 
 tb_assert_spec! {
 	pub MuxGoAwayDrainSpec,
@@ -23,9 +49,12 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(late_emit_refused_draining, exactly!(1), equals!(true)),
-			(inflight_drains_to_echo, exactly!(1), equals!(true))
-		]
+			(events::MUX_GOAWAY_SENT, exactly!(1)),
+			(events::MUX_EMIT_DRAINING, exactly!(1)),
+			(events::MUX_GOAWAY_RECV, exactly!(1)),
+			(INFLIGHT_DRAINS_TO_ECHO, exactly!(1), equals!(true))
+		],
+		events: [events::MUX_GOAWAY_SENT, events::MUX_EMIT_DRAINING]
 	}
 }
 
@@ -33,20 +62,21 @@ tb_process_spec! {
 	pub MuxGoAwayDrainProcess,
 	events {
 		observable {
-			MuxGoAwayDrainSpec::late_emit_refused_draining,
-			MuxGoAwayDrainSpec::inflight_drains_to_echo
+			events::MUX_GOAWAY_SENT,
+			events::MUX_EMIT_DRAINING,
+			INFLIGHT_DRAINS_TO_ECHO
 		}
 		hidden { }
 	}
 	states {
-		Idle => { MuxGoAwayDrainSpec::late_emit_refused_draining => LateRefused },
-		LateRefused => { MuxGoAwayDrainSpec::inflight_drains_to_echo => Done },
+		Idle => { events::MUX_GOAWAY_SENT => GoAwaySent },
+		GoAwaySent => { events::MUX_EMIT_DRAINING => LateRefused },
+		LateRefused => { INFLIGHT_DRAINS_TO_ECHO => Done },
 		Done => { }
 	}
 	terminal { Done }
 }
 
-// Shutdown GoAway drains in-flight work and rejects new streams as Draining.
 tb_scenario! {
 	name: mux_goaway_drains_and_rejects_new,
 	config: ScenarioConf::builder()
@@ -56,10 +86,10 @@ tb_scenario! {
 	environment ServiceClient {
 		context: GatedMuxContext::generate(),
 		server: |env| async move {
-			start_mux_server(&env.context.materials, 4, gated_echo(Arc::clone(&env.context))).await
+			start_mux_server(&env.context.materials, 4, gated_echo(Arc::clone(&env.context)), env.trace).await
 		},
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let client = connect_mux_client(addr, &ctx.materials, 4).await?;
+			let client = connect_mux_client(addr, &ctx.materials, 4, trace.share()).await?;
 
 			let frame_inflight = mux_frame("mux-inflight");
 			let inflight_task = spawn_emit(client.handle(), frame_inflight.to_owned());
@@ -68,13 +98,14 @@ tb_scenario! {
 
 			let shutdown_future = kick_shutdown(client.handle()).await;
 			let late = client.handle().emit_on_stream(&mux_frame("mux-late")).await;
-
-			trace.event_with(MuxGoAwayDrainSpec::late_emit_refused_draining, &[], is_draining(&late))?;
+			if !is_draining(&late) {
+				return Err(expectation_failure("late emit must refuse while draining"));
+			}
 
 			ctx.release.notify_one();
 
 			let echoed = await_ok(inflight_task, "in-flight emit task must not panic").await?;
-			trace.event_with(MuxGoAwayDrainSpec::inflight_drains_to_echo, &[], is_echo(echoed, &frame_inflight))?;
+			trace.event_with(INFLIGHT_DRAINS_TO_ECHO, &[], is_echo(echoed, &frame_inflight))?;
 
 			shutdown_future.await?;
 			Ok(())
@@ -82,10 +113,8 @@ tb_scenario! {
 	}
 }
 
-/// Drain a fresh link via `shutdown_with(reason)` and observe the
-/// GoAway on the raw server half.
-async fn run_shutdown_with_case(reason: GoAwayReason) -> Result<bool, TightBeamError> {
-	let mut link = establish_client_mux_server_raw(4).await?;
+async fn run_shutdown_with_case(reason: GoAwayReason, trace: TraceCollector) -> Result<bool, TightBeamError> {
+	let mut link = establish_client_mux_server_raw(4, trace).await?;
 
 	link.client.handle.shutdown_with(reason).await?;
 
@@ -99,21 +128,20 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(shutdown_with_advertises_reason, exactly!(2), equals!(true))
+			(events::MUX_GOAWAY_SENT, exactly!(2)),
+			(SHUTDOWN_WITH_ADVERTISES_REASON, exactly!(2), equals!(true))
 		]
 	}
 }
 
-// `shutdown_with` advertises the caller's reason in the GoAway,
-// including application-defined codes.
 tb_scenario! {
 	name: mux_shutdown_with_advertises_reason,
 	spec: MuxShutdownReasonSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			for reason in [GoAwayReason::EnhanceYourCalm, GoAwayReason::Application(0x1000)] {
-				let advertised = run_shutdown_with_case(reason).await?;
-				trace.event_with(MuxShutdownReasonSpec::shutdown_with_advertises_reason, &[], advertised)?;
+				let advertised = run_shutdown_with_case(reason, trace.share()).await?;
+				trace.event_with(SHUTDOWN_WITH_ADVERTISES_REASON, &[], advertised)?;
 			}
 
 			Ok(())
@@ -121,11 +149,8 @@ tb_scenario! {
 	}
 }
 
-/// Answer an in-flight emit with GoAway(reason) from the raw server
-/// half. The failed emit sequences the read: once it resolves, the
-/// handle has recorded the peer's reason.
-async fn run_peer_reason_case(reason: GoAwayReason) -> Result<bool, TightBeamError> {
-	let mut link = establish_client_mux_server_raw(4).await?;
+async fn run_peer_reason_case(reason: GoAwayReason, trace: TraceCollector) -> Result<bool, TightBeamError> {
+	let mut link = establish_client_mux_server_raw(4, trace).await?;
 
 	let emit_task = spawn_emit(&link.client.handle, mux_frame("mux-peer-reason"));
 	let _stream_id = read_muxed_request_id(&mut link.server_reader).await?;
@@ -145,21 +170,20 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(peer_reason_surfaces_on_handle, exactly!(2), equals!(true))
+			(events::MUX_GOAWAY_RECV, exactly!(2)),
+			(PEER_REASON_SURFACES_ON_HANDLE, exactly!(2), equals!(true))
 		]
 	}
 }
 
-// A peer GoAway drains pending streams and its reason surfaces through
-// `goaway_reason` for reconnect policy.
 tb_scenario! {
 	name: mux_peer_goaway_reason_surfaces_on_handle,
 	spec: MuxPeerReasonSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			for reason in [GoAwayReason::EnhanceYourCalm, GoAwayReason::Application(0x2000)] {
-				let surfaced = run_peer_reason_case(reason).await?;
-				trace.event_with(MuxPeerReasonSpec::peer_reason_surfaces_on_handle, &[], surfaced)?;
+				let surfaced = run_peer_reason_case(reason, trace.share()).await?;
+				trace.event_with(PEER_REASON_SURFACES_ON_HANDLE, &[], surfaced)?;
 			}
 
 			Ok(())
@@ -167,13 +191,13 @@ tb_scenario! {
 	}
 }
 
-/// Drive one rekey case over raw client halves against a muxed server.
-async fn run_rekey_case(case: RekeyCase) -> Result<bool, TightBeamError> {
+async fn run_rekey_case(case: RekeyCase, trace: TraceCollector) -> Result<bool, TightBeamError> {
 	let responses_before_goaway = case.responses_before_goaway();
 	let mut link = establish_server_mux_client_raw(
 		case.server_local_cap,
 		case.server_peer_cap,
-		MuxEndpointConfig { rekey_limit: Some(case.rekey_limit), cancel_budget: None, grantor: None },
+		MuxEndpointConfig { rekey_limit: Some(case.rekey_limit), ..MuxEndpointConfig::default() },
+		trace,
 	)
 	.await?;
 	let _server_serve = spawn_immediate_echo(link.responder);
@@ -203,13 +227,14 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(rekey_case_holds, exactly!(4), equals!(true))
+			(events::MUX_GOAWAY_SENT, exactly!(4)),
+			(events::MUX_EMIT_DRAINING, exactly!(4)),
+			(REKEY_CASE_HOLDS, exactly!(4), equals!(true))
 		]
 	}
 }
 
-// Table of rekey drain headroom points:
-// `2 * (local_cap + peer_cap) + 1` vs record limit.
+// Headroom: `2 * (local_cap + peer_cap) + 1` vs record limit.
 tb_scenario! {
 	name: mux_rekey_headroom_table,
 	spec: MuxRekeyHeadroomSpec,
@@ -221,8 +246,8 @@ tb_scenario! {
 				RekeyCase { server_local_cap: 4, server_peer_cap: 2, rekey_limit: 14 },
 				RekeyCase { server_local_cap: 4, server_peer_cap: 2, rekey_limit: 15 },
 			] {
-				let holds = run_rekey_case(case).await?;
-				trace.event_with(MuxRekeyHeadroomSpec::rekey_case_holds, &[], holds)?;
+				let holds = run_rekey_case(case, trace.share()).await?;
+				trace.event_with(REKEY_CASE_HOLDS, &[], holds)?;
 			}
 
 			Ok(())
@@ -236,8 +261,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(goaway_enhance_your_calm, exactly!(1), equals!(true)),
-			(responder_policy_rejection, exactly!(1), equals!(true))
+			(events::MUX_CANCEL_BUDGET, exactly!(1)),
+			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::EnhanceYourCalm))),
+			(RESPONDER_POLICY_REJECTION, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -246,20 +272,21 @@ tb_process_spec! {
 	pub MuxCancelBudgetProcess,
 	events {
 		observable {
-			MuxCancelBudgetSpec::goaway_enhance_your_calm,
-			MuxCancelBudgetSpec::responder_policy_rejection
+			events::MUX_CANCEL_BUDGET,
+			events::MUX_GOAWAY_SENT,
+			RESPONDER_POLICY_REJECTION
 		}
 		hidden { }
 	}
 	states {
-		Idle => { MuxCancelBudgetSpec::goaway_enhance_your_calm => GoAwaySeen },
-		GoAwaySeen => { MuxCancelBudgetSpec::responder_policy_rejection => Done },
+		Idle => { events::MUX_CANCEL_BUDGET => Tripped },
+		Tripped => { events::MUX_GOAWAY_SENT => GoAwaySeen },
+		GoAwaySeen => { RESPONDER_POLICY_REJECTION => Done },
 		Done => { }
 	}
 	terminal { Done }
 }
 
-// Budget N: N aborting cancels OK. N+1 yields GoAway(EnhanceYourCalm) and PolicyRejection.
 tb_scenario! {
 	name: mux_cancel_budget_boundary,
 	config: ScenarioConf::builder()
@@ -272,19 +299,14 @@ tb_scenario! {
 			let link = establish_server_mux_client_raw(
 				8,
 				8,
-				MuxEndpointConfig { rekey_limit: None, cancel_budget: Some(cancel_budget), grantor: None },
+				MuxEndpointConfig { cancel_budget: Some(cancel_budget), ..MuxEndpointConfig::default() },
+				trace.share(),
 			)
 			.await?;
 
-			let outcome =
+			let rejected =
 				run_cancel_abuse(link.client_reader, link.client_writer, link.responder, cancel_budget).await?;
-
-			record_cancel_abuse(
-				&trace,
-				&outcome,
-				MuxCancelBudgetSpec::goaway_enhance_your_calm,
-				MuxCancelBudgetSpec::responder_policy_rejection,
-			)?;
+			trace.event_with(RESPONDER_POLICY_REJECTION, &[], rejected)?;
 
 			Ok(())
 		}
@@ -297,20 +319,21 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(stream_above_watermark_draining, exactly!(1), equals!(true)),
-			(stream_at_watermark_echoed, exactly!(1), equals!(true)),
-			(late_emit_refused_draining, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_RECV, exactly!(1), equals!(u32::from(GoAwayReason::Shutdown))),
+			(events::MUX_EMIT_DRAINING, exactly!(1)),
+			(STREAM_ABOVE_WATERMARK_DRAINING, exactly!(1), equals!(true)),
+			(STREAM_AT_WATERMARK_ECHOED, exactly!(1), equals!(true)),
+			(LATE_EMIT_REFUSED_DRAINING, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// Peer GoAway: keep ≤ watermark, fail pending above as Draining.
 tb_scenario! {
 	name: mux_peer_goaway_fails_pending_above,
 	spec: MuxPeerGoAwaySpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let mut link = establish_client_mux_server_raw(4).await?;
+			let mut link = establish_client_mux_server_raw(4, trace.share()).await?;
 
 			let frame_kept = mux_frame("mux-kept");
 			let kept_id = client_stream_id(0);
@@ -334,15 +357,15 @@ tb_scenario! {
 			write_goaway(&mut link.server_writer, kept_id, GoAwayReason::Shutdown).await?;
 
 			let dropped = join_task(dropped_task, "dropped emit task must not panic").await?;
-			trace.event_with(MuxPeerGoAwaySpec::stream_above_watermark_draining, &[], is_draining(&dropped))?;
+			trace.event_with(STREAM_ABOVE_WATERMARK_DRAINING, &[], is_draining(&dropped))?;
 
 			write_muxed_echo(&mut link.server_writer, kept_id, &kept_message).await?;
 
 			let kept = await_ok(kept_task, "kept emit task must not panic").await?;
-			trace.event_with(MuxPeerGoAwaySpec::stream_at_watermark_echoed, &[], is_echo(kept, &frame_kept))?;
+			trace.event_with(STREAM_AT_WATERMARK_ECHOED, &[], is_echo(kept, &frame_kept))?;
 
 			let late = link.client.handle.emit_on_stream(&mux_frame("mux-after-peer-goaway")).await;
-			trace.event_with(MuxPeerGoAwaySpec::late_emit_refused_draining, &[], is_draining(&late))?;
+			trace.event_with(LATE_EMIT_REFUSED_DRAINING, &[], is_draining(&late))?;
 
 			Ok(())
 		}
@@ -355,19 +378,19 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(goaway_protocol_error, exactly!(1), equals!(true)),
-			(pending_fails_connection_closed, exactly!(1), equals!(true))
+			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
+			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::ProtocolError))),
+			(PENDING_FAILS_CONNECTION_CLOSED, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// Non-mux envelope on mux peer: GoAway(ProtocolError) + pending ConnectionClosed.
 tb_scenario! {
 	name: mux_protocol_violation_goaway_and_pending_fail,
 	spec: MuxProtocolViolationSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let mut link = establish_client_mux_server_raw(4).await?;
+			let mut link = establish_client_mux_server_raw(4, trace.share()).await?;
 
 			let inflight_task = spawn_emit(&link.client.handle, mux_frame("mux-proto-down"));
 			let _ = expect_muxed_request(
@@ -382,15 +405,14 @@ tb_scenario! {
 				.await?;
 
 			let goaway = link.server_reader.read_envelope().await?;
-			trace.event_with(
-				MuxProtocolViolationSpec::goaway_protocol_error,
-				&[],
+			assert!(
 				is_goaway(&goaway, GoAwayReason::ProtocolError, Some(0)),
-			)?;
+				"protocol violation must answer GoAway(ProtocolError) at watermark 0"
+			);
 
 			let failed = join_task(inflight_task, "in-flight emit task must not panic").await?;
 			trace.event_with(
-				MuxProtocolViolationSpec::pending_fails_connection_closed,
+				PENDING_FAILS_CONNECTION_CLOSED,
 				&[],
 				is_connection_closed(&failed),
 			)?;
@@ -400,8 +422,7 @@ tb_scenario! {
 	}
 }
 
-/// Frame claiming a V2+ field (priority) on a V0 frame: decodes fine
-/// but must fail version validation at the mux router.
+/// V0 frame with V2-only field: mux router must reject.
 fn version_incompatible_frame_der() -> Result<Vec<u8>, TightBeamError> {
 	let mut metadata = Metadata::default();
 	metadata.priority = Some(MessagePriority::Standard);
@@ -418,10 +439,11 @@ fn version_incompatible_frame_der() -> Result<Vec<u8>, TightBeamError> {
 	Ok(der)
 }
 
-/// Each offender gets a fresh mux server so one violation cannot mask
-/// the next.
-async fn violation_answered_with_goaway(offender: TransportEnvelope) -> Result<bool, TightBeamError> {
-	let mut link = establish_server_mux_client_raw(4, 4, MuxEndpointConfig::default()).await?;
+async fn violation_answered_with_goaway(
+	offender: TransportEnvelope,
+	trace: TraceCollector,
+) -> Result<bool, TightBeamError> {
+	let mut link = establish_server_mux_client_raw(4, 4, MuxEndpointConfig::default(), trace).await?;
 	let _server_serve = spawn_immediate_echo(link.responder);
 
 	link.client_writer.write_envelope(offender).await?;
@@ -437,13 +459,12 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(offender_answered_with_goaway, exactly!(4), equals!(true))
+			(events::MUX_PROTOCOL_ERROR, exactly!(4)),
+			(OFFENDER_ANSWERED_WITH_GOAWAY, exactly!(4), equals!(true))
 		]
 	}
 }
 
-// Every encodable stream-grammar violation must be answered with
-// GoAway(ProtocolError).
 tb_scenario! {
 	name: mux_stream_grammar_violations_rejected,
 	spec: MuxGrammarViolationSpec,
@@ -462,8 +483,8 @@ tb_scenario! {
 			];
 
 			for offender in offenders {
-				let rejected = violation_answered_with_goaway(offender).await?;
-				trace.event_with(MuxGrammarViolationSpec::offender_answered_with_goaway, &[], rejected)?;
+				let rejected = violation_answered_with_goaway(offender, trace.share()).await?;
+				trace.event_with(OFFENDER_ANSWERED_WITH_GOAWAY, &[], rejected)?;
 			}
 
 			Ok(())
@@ -477,18 +498,17 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(emit_fails_connection_closed, exactly!(1), equals!(true))
+			(EMIT_FAILS_CONNECTION_CLOSED, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// Peer close mid-emit surfaces ConnectionClosed after reader EOF.
 tb_scenario! {
 	name: mux_connection_drop_mid_emit,
 	spec: MuxConnectionDropSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let mut link = establish_client_mux_server_raw(4).await?;
+			let mut link = establish_client_mux_server_raw(4, trace.share()).await?;
 
 			let emit_task = spawn_emit(&link.client.handle, mux_frame("mux-drop"));
 			let _ = expect_muxed_request(
@@ -503,7 +523,7 @@ tb_scenario! {
 
 			let failed = join_task(emit_task, "emit task must not panic").await?;
 			trace.event_with(
-				MuxConnectionDropSpec::emit_fails_connection_closed,
+				EMIT_FAILS_CONNECTION_CLOSED,
 				&[],
 				is_connection_closed(&failed),
 			)?;

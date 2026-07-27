@@ -10,6 +10,7 @@
 
 #![cfg(all(feature = "transport", feature = "x509", feature = "aead", feature = "tokio"))]
 
+#[cfg(feature = "transport-ecies")]
 use std::sync::Arc;
 
 use tightbeam::{
@@ -21,31 +22,38 @@ use tightbeam::{
 	exactly, tb_assert_spec, tb_scenario,
 	testing::SetupEnv,
 	trace::TraceCollector,
-	transport::handshake::{negotiation::SecurityOffer, ClientHandshakeProtocol, ServerHandshakeProtocol},
+	transport::handshake::{ClientHandshakeProtocol, ServerHandshakeProtocol},
 	TightBeamError,
 };
 
 #[cfg(feature = "transport-ecies")]
 use tightbeam::{
 	crypto::ecies::Secp256k1EciesMessage,
+	transport::handshake::negotiation::SecurityOffer,
 	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer},
 };
 
 #[cfg(feature = "transport-cms")]
-use tightbeam::{
-	crypto::key::{Secp256k1KeyProvider, SigningKeyProvider},
-	crypto::sign::ecdsa::Secp256k1SigningKey,
-	random::OsRng,
-	testing::utils::create_test_certificate,
-	transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer},
-};
+use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 
 use crate::common::security::{default_security_profile, expectation_failure, ServerMaterials};
 
 #[cfg(feature = "transport-cms")]
-use crate::common::security::pinning_trust_store;
+use crate::common::security::cms_handshake_pair;
 #[cfg(feature = "transport-ecies")]
 use crate::common::security::pinning_validator;
+
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const LOOPBACK_CMS_COMPLETE: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-complete");
+pub(crate) const LOOPBACK_CMS_PROFILE_AGREED: Urn<'static> =
+	Urn::new("test", "event:loopback/loopback-cms-profile-agreed");
+pub(crate) const LOOPBACK_CMS_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-roundtrip");
+pub(crate) const LOOPBACK_CMS_UNIQUE_KEYS: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-unique-keys");
+pub(crate) const LOOPBACK_ECIES_COMPLETE: Urn<'static> = Urn::new("test", "event:loopback/loopback-ecies-complete");
+pub(crate) const LOOPBACK_ECIES_PROFILE_AGREED: Urn<'static> =
+	Urn::new("test", "event:loopback/loopback-ecies-profile-agreed");
+pub(crate) const LOOPBACK_ECIES_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:loopback/loopback-ecies-roundtrip");
 
 /// Number of CMS loopback passes (0 when the feature is disabled).
 const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;
@@ -61,13 +69,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(loopback_ecies_complete, exactly!(ECIES_RUNS), equals!(true)),
-			(loopback_ecies_roundtrip, exactly!(ECIES_RUNS), equals!(true)),
-			(loopback_ecies_profile_agreed, exactly!(ECIES_RUNS), equals!(true)),
-			(loopback_cms_complete, exactly!(CMS_RUNS), equals!(true)),
-			(loopback_cms_roundtrip, exactly!(CMS_RUNS), equals!(true)),
-			(loopback_cms_profile_agreed, exactly!(CMS_RUNS), equals!(true)),
-			(loopback_cms_unique_keys, exactly!(CMS_RUNS), equals!(true))
+			(LOOPBACK_ECIES_COMPLETE, exactly!(ECIES_RUNS), equals!(true)),
+			(LOOPBACK_ECIES_ROUNDTRIP, exactly!(ECIES_RUNS), equals!(true)),
+			(LOOPBACK_ECIES_PROFILE_AGREED, exactly!(ECIES_RUNS), equals!(true)),
+			(LOOPBACK_CMS_COMPLETE, exactly!(CMS_RUNS), equals!(true)),
+			(LOOPBACK_CMS_ROUNDTRIP, exactly!(CMS_RUNS), equals!(true)),
+			(LOOPBACK_CMS_PROFILE_AGREED, exactly!(CMS_RUNS), equals!(true)),
+			(LOOPBACK_CMS_UNIQUE_KEYS, exactly!(CMS_RUNS), equals!(true))
 		]
 	}
 }
@@ -93,6 +101,7 @@ tb_scenario! {
 	}
 }
 
+#[cfg(feature = "transport-ecies")]
 fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
 	SecurityOffer::new(vec![profile])
 }
@@ -124,7 +133,7 @@ async fn emit_session_ready<C, S>(
 	server: &mut S,
 	profile: SecurityProfileDesc,
 	trace: &TraceCollector,
-	events: (&'static str, &'static str, &'static str),
+	events: (Urn<'static>, Urn<'static>, Urn<'static>),
 ) -> Result<(), TightBeamError>
 where
 	C: ClientHandshakeProtocol,
@@ -190,11 +199,7 @@ async fn ecies_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> 
 	let no_reply = server.handle_request(&client_kex).await?;
 	require_terminal(no_reply, "ECIES server must not reply to ClientKeyExchange")?;
 
-	let events = (
-		"loopback_ecies_complete",
-		"loopback_ecies_roundtrip",
-		"loopback_ecies_profile_agreed",
-	);
+	let events = (LOOPBACK_ECIES_COMPLETE, LOOPBACK_ECIES_ROUNDTRIP, LOOPBACK_ECIES_PROFILE_AGREED);
 	emit_session_ready(&mut client, &mut server, profile, trace, events).await
 }
 
@@ -211,30 +216,9 @@ fn build_cms_pair(
 	TightBeamError,
 > {
 	let profile = default_security_profile();
-	let offer = security_offer(profile);
-	let trust_store = pinning_trust_store(&materials.certificate)?;
+	let pair = cms_handshake_pair(materials, vec![profile], vec![profile], None)?;
 
-	let client_key = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let client_cert = create_test_certificate(&client_key);
-	let signing_key = Secp256k1SigningKey::from(client_key);
-	let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-
-	let server_certificate = Arc::clone(&materials.certificate);
-	let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
-		DefaultCryptoProvider::default(),
-		client_provider,
-		server_certificate,
-	)
-	.with_security_offer(offer)
-	.with_trust_store(trust_store);
-
-	let key_provider = Arc::clone(&materials.key_provider);
-	let profiles = vec![profile];
-	let mut server =
-		CmsHandshakeServer::<DefaultCryptoProvider>::new(key_provider, None).with_supported_profiles(profiles);
-	server.set_client_certificate(client_cert)?;
-
-	Ok((client, server))
+	Ok((pair.client, pair.server))
 }
 
 /// Clone the session key held by a CMS client after `start`.
@@ -269,8 +253,8 @@ async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Re
 
 	// Confidentiality (CWE-311): the CMS backend transports the session key
 	// wrapped inside the KeyExchange EnvelopedData, so the raw key MUST NOT
-	// appear anywhere in the cleartext wire bytes. This is the CMS analogue of
-	// the ECIES `confidentiality` threat test, exercised on the real
+	// appear anywhere in the cleartext wire bytes. This is the CMS analogue
+	// of the ECIES `confidentiality` threat test, exercised on the real
 	// random-key path (not the fixture's constant test key).
 	let session_key = session_key_bytes(&client, "CMS client must hold a session key after start")?;
 	if contains_window(&key_exchange, &session_key) {
@@ -288,7 +272,7 @@ async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Re
 	let no_reply = server.handle_request(&client_finished).await?;
 	require_terminal(no_reply, "CMS server must not reply to ClientFinished")?;
 
-	let events = ("loopback_cms_complete", "loopback_cms_roundtrip", "loopback_cms_profile_agreed");
+	let events = (LOOPBACK_CMS_COMPLETE, LOOPBACK_CMS_ROUNDTRIP, LOOPBACK_CMS_PROFILE_AGREED);
 	emit_session_ready(&mut client, &mut server, profile, trace, events).await
 }
 
@@ -306,7 +290,7 @@ async fn cms_unique_session_keys(trace: &TraceCollector, materials: &ServerMater
 
 	let unique_keys =
 		key_a.as_slice() != ZERO_KEY.as_slice() && key_b.as_slice() != ZERO_KEY.as_slice() && key_a != key_b;
-	trace.event_with(HandshakeLoopbackSpec::loopback_cms_unique_keys, &[], unique_keys)?;
+	trace.event_with(LOOPBACK_CMS_UNIQUE_KEYS, &[], unique_keys)?;
 
 	Ok(())
 }

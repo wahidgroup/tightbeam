@@ -1,15 +1,4 @@
 //! Split transport integration tests.
-//!
-//! Drives an ECIES handshake over TCP, splits both endpoints into
-//! exclusive read/write halves, and verifies:
-//!
-//! - Encrypted request/response traffic flows through the split halves in
-//!   both directions (directional keys, counter nonces)
-//! - Splitting before handshake completion fails closed
-//! - A writer at its AEAD record limit fails closed with `RekeyRequired`
-//!   (RFC 8446 § 5.5 analog) instead of reusing the key
-//! - A reader facing a counter past its record limit fails closed with
-//!   `RekeyRequired` (peer overran the volume bound) instead of decrypting
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -18,6 +7,8 @@
 	feature = "tokio",
 	feature = "testing"
 ))]
+
+use tokio::net::TcpStream;
 
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::exactly;
@@ -29,11 +20,21 @@ use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStrea
 use tightbeam::transport::{
 	EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError, TransportFailure,
 };
+use tightbeam::utils::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
-use tokio::net::TcpStream;
 
 use super::support::{accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split};
 use crate::common::security::{expectation_failure, ServerMaterials};
+
+pub(crate) const FIRST_RECORD_ARRIVES: Urn<'static> = Urn::new("test", "event:split/first-record-arrives");
+pub(crate) const FRAME_ECHOED: Urn<'static> = Urn::new("test", "event:split/frame-echoed");
+pub(crate) const INTO_SPLIT_REPORTS_INVALID_STATE: Urn<'static> =
+	Urn::new("test", "event:split/into-split-reports-invalid-state");
+pub(crate) const SECOND_RECORD_STILL_ARRIVES: Urn<'static> =
+	Urn::new("test", "event:split/second-record-still-arrives");
+pub(crate) const SECOND_WRITE_DEMANDS_REKEY: Urn<'static> = Urn::new("test", "event:split/second-write-demands-rekey");
+pub(crate) const STATUS_OK: Urn<'static> = Urn::new("test", "event:split/status-ok");
+pub(crate) const THRESHOLD_REACHES_ZERO: Urn<'static> = Urn::new("test", "event:split/threshold-reaches-zero");
 
 fn request_frame() -> Frame {
 	create_v0_tightbeam(None, None)
@@ -49,13 +50,12 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(status_ok, exactly!(1), equals!(true)),
-			(frame_echoed, exactly!(1), equals!(true))
+			(STATUS_OK, exactly!(1), equals!(true)),
+			(FRAME_ECHOED, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// Full ECIES handshake, split on both ends, encrypted echo roundtrip.
 tb_scenario! {
 	name: split_encrypted_roundtrip,
 	spec: SplitEncryptedRoundtripSpec,
@@ -97,11 +97,11 @@ tb_scenario! {
 			await_ok(server_handle, "server task must not panic").await?;
 
 			trace.event_with(
-				SplitEncryptedRoundtripSpec::status_ok,
+				STATUS_OK,
 				&[],
 				package.status() == TransitStatus::Ok,
 			)?;
-			trace.event_with(SplitEncryptedRoundtripSpec::frame_echoed, &[], echoed == sent)?;
+			trace.event_with(FRAME_ECHOED, &[], echoed == sent)?;
 			Ok(())
 		}
 	}
@@ -113,26 +113,27 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(into_split_reports_invalid_state, exactly!(1), equals!(true))
+			(INTO_SPLIT_REPORTS_INVALID_STATE, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// Splitting an un-handshaken transport must fail closed.
 tb_scenario! {
 	name: split_rejects_pre_handshake,
 	spec: SplitRejectsPreHandshakeSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
-			let addr = listener.local_addr()?;
-			let stream = TcpStream::connect(addr).await?;
-			let transport: TcpTransport<TokioStream> = TcpTransport::from(TokioStream::from(stream));
+			let listen_addr = listener.local_addr()?;
+			let client_stream = TcpStream::connect(listen_addr).await?;
+			let tokio_stream = TokioStream::from(client_stream);
+			let transport: TcpTransport<TokioStream> = TcpTransport::from(tokio_stream);
 
+			let into_split = transport.into_split();
 			trace.event_with(
-				SplitRejectsPreHandshakeSpec::into_split_reports_invalid_state,
+				INTO_SPLIT_REPORTS_INVALID_STATE,
 				&[],
-				matches!(transport.into_split(), Err(TransportError::InvalidState)),
+				matches!(into_split, Err(TransportError::InvalidState)),
 			)?;
 			Ok(())
 		}
@@ -145,13 +146,12 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(second_write_demands_rekey, exactly!(1), equals!(true))
+			(SECOND_WRITE_DEMANDS_REKEY, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A lock-step writer at its record limit must fail closed with
-// `RekeyRequired` (RFC 8446 § 5.5 analog), never reuse the key.
+// RFC 9846 § 5.5 analog: fail closed with RekeyRequired, never reuse key.
 tb_scenario! {
 	name: split_write_rekey_limit_fails_closed,
 	spec: SplitWriteRekeyLimitSpec,
@@ -173,17 +173,17 @@ tb_scenario! {
 			});
 
 			let (_reader, writer) = connect_handshaken_split(addr, &materials.certificate).await?;
-			let mut writer = writer.with_rekey_limit(1);
 
+			let mut writer = writer.with_rekey_limit(1);
 			writer.write_envelope(request_envelope()).await?;
 
-			// Limit spent. Second write must demand rekey before any bytes leave.
+			// Limit spent; second write must fail before bytes leave.
 			let limited = writer.write_envelope(request_envelope()).await;
 
 			await_ok(server_handle, "server task must not panic").await?;
 
 			trace.event_with(
-				SplitWriteRekeyLimitSpec::second_write_demands_rekey,
+				SECOND_WRITE_DEMANDS_REKEY,
 				&[],
 				matches!(limited, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired))),
 			)?;
@@ -198,17 +198,16 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(first_record_arrives, exactly!(1), equals!(true)),
-			(second_record_demands_rekey, exactly!(1), equals!(true))
+			(FIRST_RECORD_ARRIVES, exactly!(1), equals!(true)),
+			(THRESHOLD_REACHES_ZERO, exactly!(1), equals!(true)),
+			(SECOND_RECORD_STILL_ARRIVES, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A reader facing a counter past its record limit must fail closed with
-// `RekeyRequired` (peer overran the AES-GCM volume bound), surfacing it as
-// `OperationFailed(RekeyRequired)` rather than a generic `InvalidMessage`.
+// Reader limit is renewal threshold, not refusal bound (AES-GCM volume bound refuses).
 tb_scenario! {
-	name: split_read_rekey_limit_fails_closed,
+	name: split_read_rekey_threshold_never_refuses,
 	spec: SplitReadRekeyLimitSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
@@ -229,24 +228,25 @@ tb_scenario! {
 
 			let within_limit = reader.read_envelope().await?;
 			trace.event_with(
-				SplitReadRekeyLimitSpec::first_record_arrives,
+				FIRST_RECORD_ARRIVES,
 				&[],
 				matches!(within_limit, TransportEnvelope::Request(_)),
 			)?;
+			trace.event_with(
+				THRESHOLD_REACHES_ZERO,
+				&[],
+				reader.remaining_records() == 0,
+			)?;
 
-			// Peer's second record carries a counter at the clamped limit:
-			// reader must demand rekey instead of decrypting.
-			let over_limit = reader.read_envelope().await;
+			// Counter past threshold: reader still decrypts.
+			let past_threshold = reader.read_envelope().await;
 
 			await_ok(server_handle, "server task must not panic").await?;
 
 			trace.event_with(
-				SplitReadRekeyLimitSpec::second_record_demands_rekey,
+				SECOND_RECORD_STILL_ARRIVES,
 				&[],
-				matches!(
-					over_limit,
-					Err(TransportError::OperationFailed(TransportFailure::RekeyRequired))
-				),
+				matches!(past_threshold, Ok(TransportEnvelope::Request(_))),
 			)?;
 			Ok(())
 		}

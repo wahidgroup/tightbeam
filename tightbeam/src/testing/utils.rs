@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::asn1::{
 	AlgorithmIdentifier, AlgorithmIdentifierOwned, DigestInfo, EncryptedContentInfo, Frame, ObjectIdentifier,
@@ -149,8 +150,8 @@ pub fn create_v0_tightbeam(content: Option<&str>, id: Option<&str>) -> Frame {
 	let message = create_test_message(content);
 
 	#[cfg(feature = "std")]
-	let order = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	let order = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
 		.expect("Time went backwards")
 		.as_secs();
 

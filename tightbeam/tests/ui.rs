@@ -1,3 +1,6 @@
+// Raw `unwrap()` is banned crate-wide; see `tests/suite.rs`.
+#![deny(clippy::unwrap_used)]
+
 #[test]
 fn compile_fail_algorithm_mismatch() {
 	let t = trybuild::TestCases::new();

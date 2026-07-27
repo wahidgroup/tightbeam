@@ -1,4 +1,8 @@
+use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec};
+
+pub(crate) const NEWER_KEY: Urn<'static> = Urn::new("test", "event:assert-spec-version-order/newer-key");
+pub(crate) const OLDER_KEY: Urn<'static> = Urn::new("test", "event:assert-spec-version-order/older-key");
 
 // Version blocks out of ascending order: the key constants would generate
 // from V(1,0,0) (last in source) while `latest()` runs V(2,0,0). This must
@@ -9,14 +13,14 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(newer_key, exactly!(1))
+			(NEWER_KEY, exactly!(1))
 		]
 	},
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(older_key, exactly!(1))
+			(OLDER_KEY, exactly!(1))
 		]
 	}
 }

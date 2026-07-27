@@ -9,13 +9,15 @@ pub mod scaling;
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 #[cfg(not(feature = "std"))]
 use alloc::{sync::Arc, vec::Vec};
 
 #[cfg(feature = "std")]
 use std::sync::Arc;
-
-use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "std")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
 use crate::utils::BasisPoints;
@@ -294,8 +296,8 @@ impl MessageRouter for TypeBasedRouter {
 /// Always backed by the system clock: `colony` implies `std`, so no
 /// fallback stub exists.
 pub fn current_timestamp_ms() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
 		.map(|d| d.as_millis() as u64)
 		.unwrap_or(0)
 }

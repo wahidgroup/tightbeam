@@ -53,7 +53,7 @@ trait AeadOps: Send + Sync {
 	/// Decrypt ciphertext with the given nonce.
 	fn decrypt_bytes(&self, nonce: &[u8], ciphertext: &[u8]) -> CoreResult<Vec<u8>, aead::Error>;
 
-	/// Get the nonce size for this cipher.
+	/// Nonce length in bytes required by this AEAD.
 	fn nonce_size(&self) -> usize;
 }
 
@@ -214,7 +214,7 @@ pub trait Decryptor {
 	/// Algorithm binding: [`RuntimeAead`] rejects a `content_enc_alg.oid`
 	/// that differs from its negotiated OID. Bare RustCrypto `Aead` decrypt
 	/// impls have no stored OID to compare against; encrypt-side binding is
-	/// enforced by concrete [`Encryptor`] impls (cipher type → canonical OID).
+	/// enforced by concrete [`Encryptor`] impls (cipher type -> canonical OID).
 	///
 	/// The plaintext is returned as a [`SecretSlice`] so it zeroizes on drop.
 	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>>;
@@ -353,13 +353,13 @@ fn build_counter_nonce(value: u64, nonce_len: usize) -> TbResult<Vec<u8>> {
 /// deterministic construction is exempt from the 2^32 invocation cap that
 /// NIST SP 800-38D § 8.3 places on random IVs.
 ///
-/// The operative bound is the record limit (RFC 8446 § 5.5: AES-GCM
-/// keeps its authenticated-encryption safety margin for about 2^24.5
-/// full-size records per key. RFC 9846 makes acting before the limit a
-/// MUST). TightBeam has no in-band key update, so encryption fails closed
-/// with [`TightBeamError::RekeyRequired`] at
-/// [`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT)
-/// and the session must be reestablished for fresh directional keys.
+/// The operative bound is the record limit (RFC 9846 § 5.5: AES-GCM keeps its
+/// authenticated-encryption safety margin for about 2^24.5 full-size records
+/// per key. RFC 9846 makes acting before the limit a MUST). Encryption fails
+/// closed with [`TightBeamError::RekeyRequired`] at
+/// [`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT):
+/// receipt-bearing multiplexed sessions renew keys in band before the limit,
+/// while every other session must be reestablished for fresh directional keys.
 pub struct SendCipher {
 	aead: RuntimeAead,
 	counter: AtomicU64,
@@ -373,9 +373,18 @@ impl SendCipher {
 	}
 
 	/// Override the record limit at which encryption demands a rekey.
+	///
+	/// Clamped to
+	/// [`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT):
+	/// the AES-GCM bound (RFC 9846 § 5.5) is MUST that no configuration may raise.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
-		self.rekey_limit = limit;
+		self.rekey_limit = limit.min(DEFAULT_REKEY_RECORD_LIMIT);
 		self
+	}
+
+	/// Record limit this cipher halts at.
+	pub fn rekey_limit(&self) -> u64 {
+		self.rekey_limit
 	}
 
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
@@ -391,11 +400,9 @@ impl SendCipher {
 	/// Encrypt data under the next counter nonce.
 	///
 	/// # Errors
-	/// - `RekeyRequired`: record limit reached. Reestablish the session for
-	///   fresh keys (RFC 8446 § 5.5)
+	/// - `RekeyRequired`: Limit reached. Reestablish the session for fresh keys
 	/// - `NonceExhausted`: the 64-bit counter space is spent
-	/// - `InvalidNonceLength`: the cipher nonce is too small to carry the
-	///   64-bit counter
+	/// - `InvalidNonceLength`: the cipher nonce is too small to carry the counter
 	pub fn encrypt_next(
 		&self,
 		data: impl AsRef<[u8]>,
@@ -407,6 +414,7 @@ impl SendCipher {
 			if value >= self.rekey_limit {
 				return None;
 			}
+
 			value.checked_add(1)
 		};
 		let reserved = self
@@ -416,6 +424,7 @@ impl SendCipher {
 				if spent == u64::MAX {
 					return TightBeamError::NonceExhausted;
 				}
+
 				TightBeamError::RekeyRequired
 			})?;
 
@@ -435,16 +444,17 @@ impl SendCipher {
 /// The peer's [`SendCipher`] emits counter nonces in order over an ordered
 /// transport, so the next message must carry exactly the next counter. Any
 /// other value is a replay, reorder, or deletion and is rejected. Matching
-/// the receiver-side sequence discipline of RFC 8446 § 5.3: an active
+/// the receiver-side sequence discipline of RFC 9846 § 5.3: an active
 /// attacker excising an envelope from the stream desynchronizes the counter
 /// and is detected on the very next message (CWE-345).
 ///
-/// The receive direction enforces the same record limit as the send
-/// direction: an honest peer halts its [`SendCipher`] at
+/// The receive direction enforces the AES-GCM per-key volume bound: an
+/// honest peer halts or renews its [`SendCipher`] at
 /// [`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT),
-/// so a counter at or past the limit means the peer ignored the AES-GCM
-/// volume bound (RFC 8446 § 5.5) and decryption fails closed with
-/// [`TightBeamError::RekeyRequired`].
+/// so a counter at or past that bound means the peer ignored the record
+/// limit (RFC 9846 § 5.5) and decryption fails closed with
+/// [`TightBeamError::RekeyRequired`]. The configurable rekey limit is a
+/// renewal-trigger threshold only and never refuses records under the bound.
 pub struct RecvCipher {
 	aead: RuntimeAead,
 	/// Exact counter value the next message must carry.
@@ -462,16 +472,34 @@ impl RecvCipher {
 		}
 	}
 
-	/// Override the record limit at which decryption demands a rekey.
-	/// MUST be at least the peer's send limit or legitimate records near
-	/// the limit are refused.
+	/// Override the record threshold `remaining_records` counts down
+	/// from, driving receive-direction renewal and drain triggers.
+	///
+	/// Trigger policy: decryption refuses records at the AES-GCM volume bound
+	/// ([`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT))
+	/// regardless of this value, so a threshold below the peer's send
+	/// limit can never refuse legitimate records.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		self.rekey_limit = limit;
 		self
 	}
 
+	/// Renewal-trigger threshold `remaining_records` counts down from.
+	pub fn rekey_limit(&self) -> u64 {
+		self.rekey_limit
+	}
+
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
 		self.aead.algorithm_oid()
+	}
+
+	/// Records still readable under the renewal-trigger threshold.
+	///
+	/// Tracks the peer's send counter on the ordered channel, so a rekey
+	/// initiator can watch the receive direction without any wire addition.
+	pub fn remaining_records(&self) -> u64 {
+		let expected = self.expected_counter.load(Ordering::Relaxed);
+		self.rekey_limit.saturating_sub(expected)
 	}
 }
 
@@ -480,9 +508,11 @@ impl Decryptor for RecvCipher {
 		let (nonce_bytes, _) = extract_nonce_and_ciphertext(info, self.aead.nonce_size())?;
 		let counter = parse_counter_nonce(nonce_bytes)?;
 
-		// Fail closed once the peer exceeds the per-key volume bound: an
-		// honest sender halts its own cipher before this counter exists.
-		if counter >= self.rekey_limit {
+		// Fail closed once the counter passes the AES-GCM per-key volume
+		// bound (RFC 9846 § 5.5): an honest sender halts or renews its
+		// cipher before this counter exists. The configurable rekey
+		// limit is a renewal-trigger threshold, not a refusal bound.
+		if counter >= DEFAULT_REKEY_RECORD_LIMIT {
 			return Err(TightBeamError::RekeyRequired);
 		}
 
@@ -509,9 +539,8 @@ impl Decryptor for RecvCipher {
 /// Role-mapped directional session keys produced by handshake completion.
 ///
 /// The handshake derives one client-to-server and one server-to-client key
-/// (RFC 8446 § 7.3 precedent). Each endpoint sends on its own direction
-/// and receives on the peer's, so counter nonces never collide across
-/// directions.
+/// (RFC 9846 § 7.3 precedent). Each endpoint sends on its own direction and
+/// receives on the peer's, so counter nonces never collide across directions.
 pub struct SessionKeys {
 	send: SendCipher,
 	recv: RecvCipher,
@@ -570,7 +599,8 @@ mod tests {
 	}
 
 	fn encrypted_info() -> EncryptedContentInfo {
-		Encryptor::<Aes256GcmOid>::encrypt_content(&test_cipher(), PLAINTEXT, NONCE, None).unwrap()
+		Encryptor::<Aes256GcmOid>::encrypt_content(&test_cipher(), PLAINTEXT, NONCE, None)
+			.expect("fixture encryption with a fixed key and nonce")
 	}
 
 	fn stamped_oid<C, A>(cipher: &A) -> ObjectIdentifier
@@ -578,7 +608,8 @@ mod tests {
 		C: AssociatedOid,
 		A: Encryptor<C>,
 	{
-		let info = Encryptor::<C>::encrypt_content(cipher, PLAINTEXT, NONCE, None).unwrap();
+		let info = Encryptor::<C>::encrypt_content(cipher, PLAINTEXT, NONCE, None)
+			.expect("fixture encryption with a fixed key and nonce");
 		info.content_enc_alg.oid
 	}
 
@@ -595,15 +626,16 @@ mod tests {
 
 	/// Re-encode the algorithm parameters with a nonce of the given length.
 	fn with_nonce_len(mut info: EncryptedContentInfo, len: usize) -> EncryptedContentInfo {
-		let nonce = OctetString::new(vec![0x24; len]).unwrap();
-		info.content_enc_alg.parameters = Some(Any::encode_from(&nonce).unwrap());
+		let nonce = OctetString::new(vec![0x24; len]).expect("fixture nonce fits an OCTET STRING");
+		info.content_enc_alg.parameters = Some(Any::encode_from(&nonce).expect("fixture nonce re-encodes as DER"));
 		info
 	}
 
 	#[test]
-	fn decrypt_content_round_trips() {
-		let plaintext = test_cipher().decrypt_content(&encrypted_info()).unwrap();
-		assert!(plaintext.with(|p| p == PLAINTEXT).unwrap());
+	fn decrypt_content_round_trips() -> TbResult<()> {
+		let plaintext = test_cipher().decrypt_content(&encrypted_info())?;
+		assert!(plaintext.with(|p| p == PLAINTEXT)?);
+		Ok(())
 	}
 
 	#[test]
@@ -633,31 +665,35 @@ mod tests {
 	}
 
 	#[test]
-	fn runtime_aead_round_trips() {
+	fn runtime_aead_round_trips() -> TbResult<()> {
 		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
-		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None).unwrap();
-		let plaintext = runtime.decrypt_content(&info).unwrap();
-		assert!(plaintext.with(|p| p == PLAINTEXT).unwrap());
+		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
+
+		let plaintext = runtime.decrypt_content(&info)?;
+		assert!(plaintext.with(|p| p == PLAINTEXT)?);
+		Ok(())
 	}
 
 	#[test]
-	fn runtime_aead_rejects_algorithm_oid_mismatch() {
+	fn runtime_aead_rejects_algorithm_oid_mismatch() -> TbResult<()> {
 		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
-		let mut info = runtime.encrypt_content(PLAINTEXT, NONCE, None).unwrap();
+		let mut info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
 		info.content_enc_alg.oid = AES_128_GCM;
 
 		let result = runtime.decrypt_content(&info);
 		assert!(matches!(result, Err(TightBeamError::UnexpectedAlgorithm(_))));
+		Ok(())
 	}
 
 	#[test]
-	fn runtime_aead_rejects_wire_nonce_length() {
+	fn runtime_aead_rejects_wire_nonce_length() -> TbResult<()> {
 		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
-		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None).unwrap();
+		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
 		let info = with_nonce_len(info, 8);
 
 		let result = runtime.decrypt_content(&info);
 		assert!(matches!(result, Err(TightBeamError::InvalidNonceLength(_))));
+		Ok(())
 	}
 
 	fn test_runtime() -> RuntimeAead {
@@ -767,16 +803,34 @@ mod tests {
 	}
 
 	#[test]
-	fn recv_cipher_fails_closed_at_rekey_limit() -> TbResult<()> {
+	fn send_cipher_clamps_rekey_limit_to_volume_bound() {
+		let sender = SendCipher::new(test_runtime()).with_rekey_limit(u64::MAX);
+		assert_eq!(sender.rekey_limit(), DEFAULT_REKEY_RECORD_LIMIT);
+	}
+
+	#[test]
+	fn recv_cipher_threshold_never_refuses_records() -> TbResult<()> {
 		let sender = SendCipher::new(test_runtime());
 		let first = sender.encrypt_next(PLAINTEXT, None)?;
 		let second = sender.encrypt_next(PLAINTEXT, None)?;
 
 		let receiver = RecvCipher::new(test_runtime()).with_rekey_limit(1);
 		receiver.decrypt_content(&first)?;
+		assert_eq!(receiver.remaining_records(), 0);
 
-		let over_limit = receiver.decrypt_content(&second);
-		assert!(matches!(over_limit, Err(TightBeamError::RekeyRequired)));
+		receiver.decrypt_content(&second)?;
+		Ok(())
+	}
+
+	#[test]
+	fn recv_cipher_fails_closed_at_volume_bound() -> TbResult<()> {
+		let runtime = test_runtime();
+		let nonce = build_counter_nonce(DEFAULT_REKEY_RECORD_LIMIT, runtime.nonce_size())?;
+		let over_bound = runtime.encrypt_content(PLAINTEXT, &nonce, None)?;
+
+		let receiver = RecvCipher::new(test_runtime());
+		let refused = receiver.decrypt_content(&over_bound);
+		assert!(matches!(refused, Err(TightBeamError::RekeyRequired)));
 		Ok(())
 	}
 

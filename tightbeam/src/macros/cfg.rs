@@ -1,6 +1,6 @@
 //! Feature-delegation helpers for the `client!`/`server!` macros.
 //!
-//! `#[cfg(feature = "…")]` written inside a `macro_rules!` body is evaluated
+//! `#[cfg(feature = "...")]` written inside a `macro_rules!` body is evaluated
 //! in the crate that *invokes* the macro, not in the crate that *defines* it.
 
 #[cfg(feature = "std")]

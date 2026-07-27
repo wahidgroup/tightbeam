@@ -39,11 +39,15 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::HandshakeError;
+use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::common::security::{
 	cms_mutual_budget_pair, CmsSessionHooks, GrantingAuthorizer, PayingApprover, ServerMaterials,
 };
+
+pub(crate) const COMPLETE_FAILS_WITHOUT_SETTLEMENT: Urn<'static> =
+	Urn::new("test", "event:receipt-activation/complete-fails-without-settlement");
 
 const CHALLENGE: &[u8] = b"activation-invoice";
 const RESPONSE: &[u8] = b"activation-preimage";
@@ -55,7 +59,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(complete_fails_without_settlement, exactly!(1), equals!(true))
+			(COMPLETE_FAILS_WITHOUT_SETTLEMENT, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -93,7 +97,7 @@ tb_scenario! {
 			let complete_result = server.complete();
 			let activation_refused = matches!(complete_result, Err(HandshakeError::CountersignatureMissing));
 			trace.event_with(
-				ReceiptActivationSpec::complete_fails_without_settlement,
+				COMPLETE_FAILS_WITHOUT_SETTLEMENT,
 				&[],
 				activation_refused,
 			)?;

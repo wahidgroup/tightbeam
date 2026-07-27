@@ -35,11 +35,7 @@ use tightbeam::{
 };
 
 #[cfg(feature = "transport-cms")]
-use tightbeam::{
-	crypto::key::{Secp256k1KeyProvider, SigningKeyProvider},
-	testing::utils::{create_test_certificate, create_test_signing_key},
-	transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer},
-};
+use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 
 // ============================================================================
 // AES-128 Crypto Provider for Downgrade Attack Testing
@@ -180,9 +176,11 @@ pub trait HandshakeProtocol: Send {
 // Shared fixtures live in the crate-wide `common` module so threat suites do
 // not depend on one another's helpers.
 pub use crate::common::security::{
-	default_security_profile, expectation_failure, pinning_trust_store, pinning_validator, weak_security_profile,
-	ServerMaterials,
+	default_security_profile, expectation_failure, pinning_validator, weak_security_profile, ServerMaterials,
 };
+
+#[cfg(feature = "transport-cms")]
+use crate::common::security::cms_handshake_pair;
 
 // ============================================================================
 // Backend Kind
@@ -228,6 +226,7 @@ impl HandshakeBackendKind {
 // ============================================================================
 
 use tightbeam::trace::TraceCollector;
+use tightbeam::utils::urn::Urn;
 
 /// Harness that can spawn handshake sessions across all enabled backends.
 ///
@@ -247,23 +246,17 @@ impl Default for SecurityThreatHarness {
 
 impl SecurityThreatHarness {
 	/// Hidden CSP event: a handshake session is about to be constructed.
-	#[allow(non_upper_case_globals)]
-	pub const harness_spawn_session: &'static str = "harness_spawn_session";
+	pub const HARNESS_SPAWN_SESSION: Urn<'static> = Urn::new("test", "event:security-harness/spawn-session");
 	/// Hidden CSP event: ECIES backend selected for the session.
-	#[allow(non_upper_case_globals)]
-	pub const harness_spawn_ecies: &'static str = "harness_spawn_ecies";
+	pub const HARNESS_SPAWN_ECIES: Urn<'static> = Urn::new("test", "event:security-harness/spawn-ecies");
 	/// Hidden CSP event: CMS backend selected for the session.
-	#[allow(non_upper_case_globals)]
-	pub const harness_spawn_cms: &'static str = "harness_spawn_cms";
+	pub const HARNESS_SPAWN_CMS: Urn<'static> = Urn::new("test", "event:security-harness/spawn-cms");
 	/// Hidden CSP event: weak-cipher spawn path entered.
-	#[allow(non_upper_case_globals)]
-	pub const harness_spawn_weak: &'static str = "harness_spawn_weak";
+	pub const HARNESS_SPAWN_WEAK: Urn<'static> = Urn::new("test", "event:security-harness/spawn-weak");
 	/// Hidden CSP event: weak ECIES backend selected.
-	#[allow(non_upper_case_globals)]
-	pub const harness_spawn_ecies_weak: &'static str = "harness_spawn_ecies_weak";
+	pub const HARNESS_SPAWN_ECIES_WEAK: Urn<'static> = Urn::new("test", "event:security-harness/spawn-ecies-weak");
 	/// Hidden CSP event: weak CMS backend selected.
-	#[allow(non_upper_case_globals)]
-	pub const harness_spawn_cms_weak: &'static str = "harness_spawn_cms_weak";
+	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = Urn::new("test", "event:security-harness/spawn-cms-weak");
 
 	/// Create a harness with a trace collector for internal event emission.
 	pub fn with_trace(trace: Arc<TraceCollector>) -> Self {
@@ -276,7 +269,7 @@ impl SecurityThreatHarness {
 	}
 
 	/// Emit a hidden event if trace is configured.
-	fn emit(&self, event: &'static str) -> Result<(), TightBeamError> {
+	fn emit(&self, event: Urn<'static>) -> Result<(), TightBeamError> {
 		if let Some(ref trace) = self.trace {
 			trace.event(event)?;
 		}
@@ -301,15 +294,15 @@ impl SecurityThreatHarness {
 		client_profiles: Vec<SecurityProfileDesc>,
 		server_profiles: Vec<SecurityProfileDesc>,
 	) -> Box<dyn HandshakeProtocol> {
-		self.emit(Self::harness_spawn_session).ok();
+		self.emit(Self::HARNESS_SPAWN_SESSION).ok();
 		match kind {
 			HandshakeBackendKind::Ecies => {
-				self.emit(Self::harness_spawn_ecies).ok();
+				self.emit(Self::HARNESS_SPAWN_ECIES).ok();
 				Box::new(EciesSession::with_profiles(&self.materials, client_profiles, server_profiles))
 			}
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
-				self.emit(Self::harness_spawn_cms).ok();
+				self.emit(Self::HARNESS_SPAWN_CMS).ok();
 				Box::new(CmsSession::with_profiles(
 					&self.materials,
 					client_profiles,
@@ -325,15 +318,15 @@ impl SecurityThreatHarness {
 	/// This uses `Aes128CryptoProvider` which actually uses AES-128 at the cipher level,
 	/// not just in the profile descriptor OIDs.
 	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
-		self.emit(Self::harness_spawn_weak).ok();
+		self.emit(Self::HARNESS_SPAWN_WEAK).ok();
 		match kind {
 			HandshakeBackendKind::Ecies => {
-				self.emit(Self::harness_spawn_ecies_weak).ok();
+				self.emit(Self::HARNESS_SPAWN_ECIES_WEAK).ok();
 				Box::new(Aes128EciesSession::new(&self.materials))
 			}
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
-				self.emit(Self::harness_spawn_cms_weak).ok();
+				self.emit(Self::HARNESS_SPAWN_CMS_WEAK).ok();
 				// CMS with AES-128 would require Aes128CmsSession - use default for now.
 				// Weak profiles fail the default floor, so opt out explicitly.
 				Box::new(CmsSession::with_profiles(
@@ -757,34 +750,15 @@ impl CmsSession {
 		server_profiles: Vec<SecurityProfileDesc>,
 		strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	) -> Self {
-		// Create client credentials
-		let client_key = create_test_signing_key();
-		let client_cert = Arc::new(create_test_certificate(&client_key));
-		let client_key = Secp256k1SigningKey::from(client_key);
-		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
+		let pair = cms_handshake_pair(materials, client_profiles, server_profiles, None)
+			.expect("CMS pair fixture builds from generated materials");
 
-		// Use internal transcript computation for proper replay detection
-		let trust_store =
-			pinning_trust_store(&materials.certificate).expect("trust store builds from server certificate");
-		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
-			DefaultCryptoProvider::default(),
-			client_provider,
-			Arc::clone(&materials.certificate),
-		)
-		.with_security_offer(SecurityOffer::new(client_profiles))
-		.with_trust_store(trust_store);
-
-		let server_key_provider = Arc::clone(&materials.key_provider);
-		let mut server = CmsHandshakeServer::<DefaultCryptoProvider>::new(server_key_provider, None)
-			.with_supported_profiles(server_profiles);
+		let mut server = pair.server;
 		if let Some(policy) = strength_policy {
 			server = server.with_strength_policy(policy);
 		}
 
-		// Set client certificate on server for mutual auth
-		server.set_client_certificate((*client_cert).to_owned()).ok();
-
-		Self { client, server }
+		Self { client: pair.client, server }
 	}
 }
 

@@ -19,9 +19,9 @@ fn union_alphabets(builder: ProcessBuilder, p: &Process, q: &Process) -> Process
 		.observable
 		.iter()
 		.chain(&q.observable)
-		.fold(builder, |b, event| b.add_observable(event.0));
+		.fold(builder, |b, event| b.add_observable(event));
 
-	p.hidden.iter().chain(&q.hidden).fold(builder, |b, event| b.add_hidden(event.0))
+	p.hidden.iter().chain(&q.hidden).fold(builder, |b, event| b.add_hidden(event))
 }
 
 /// Copy every state of `process` into the builder through `map_state`
@@ -64,7 +64,7 @@ where
 					.map(move |target| (map_state(state), map_event(action.event), map_state(&target)))
 			})
 		})
-		.fold(builder, |b, (from, event, to)| b.add_transition(from, event.0, to))
+		.fold(builder, |b, (from, event, to)| b.add_transition(from, event, to))
 }
 
 /// Prefixed copies of both operands: states, alphabets, transitions, and
@@ -95,7 +95,7 @@ fn fan_out_initial(builder: ProcessBuilder, process: &Process, from: State, pref
 				.into_iter()
 				.map(move |target| (action.event, State::prefixed(&target, prefix)))
 		})
-		.fold(builder, |b, (event, target)| b.add_transition(from, event.0, target))
+		.fold(builder, |b, (event, target)| b.add_transition(from, event, target))
 }
 
 impl Process {
@@ -116,15 +116,15 @@ impl Process {
 			.observable
 			.iter()
 			.filter(|e| !hidden_events.contains(e))
-			.fold(builder, |b, event| b.add_observable(event.0));
+			.fold(builder, |b, event| b.add_observable(event));
 
 		let builder = self
 			.observable
 			.iter()
 			.filter(|e| hidden_events.contains(e))
-			.fold(builder, |b, event| b.add_hidden(event.0));
+			.fold(builder, |b, event| b.add_hidden(event));
 
-		let builder = self.hidden.iter().fold(builder, |b, event| b.add_hidden(event.0));
+		let builder = self.hidden.iter().fold(builder, |b, event| b.add_hidden(event));
 		let builder = copy_transitions(builder, self, |state| *state, |event| event);
 
 		Ok(builder.build()?)
@@ -147,12 +147,10 @@ impl Process {
 			.map(|event| *mapping.get(event).unwrap_or(event))
 			.collect();
 
-		let builder = observable_events
-			.into_iter()
-			.fold(builder, |b, event| b.add_observable(event.0));
+		let builder = observable_events.into_iter().fold(builder, |b, event| b.add_observable(event));
 
 		let hidden_events: Vec<Event> = self.hidden.iter().map(|event| *mapping.get(event).unwrap_or(event)).collect();
-		let builder = hidden_events.into_iter().fold(builder, |b, event| b.add_hidden(event.0));
+		let builder = hidden_events.into_iter().fold(builder, |b, event| b.add_hidden(event));
 		let builder = copy_transitions(builder, self, |state| *state, |event| *mapping.get(&event).unwrap_or(&event));
 
 		Ok(builder.build()?)
@@ -179,8 +177,8 @@ impl Process {
 		let builder = copy_transitions(builder, q, |state| State::prefixed(state, "Q"), |event| event);
 
 		let q_initial_renamed = State::prefixed(&q.initial, "Q");
-		let builder = p.terminal.iter().fold(builder.add_hidden("tau_seq"), |b, p_terminal| {
-			b.add_transition(*p_terminal, "tau_seq", q_initial_renamed)
+		let builder = p.terminal.iter().fold(builder.add_hidden(Event("tau_seq")), |b, p_terminal| {
+			b.add_transition(*p_terminal, Event("tau_seq"), q_initial_renamed)
 		});
 
 		let builder = copy_terminals(builder, q, |state| State::prefixed(state, "Q"));
@@ -217,13 +215,13 @@ impl Process {
 		let builder = Process::builder(name)
 			.initial_state(choice_initial)
 			.add_state(choice_initial)
-			.add_hidden("tau_choice_p")
-			.add_hidden("tau_choice_q");
+			.add_hidden(Event("tau_choice_p"))
+			.add_hidden(Event("tau_choice_q"));
 
 		let builder = prefixed_operands(builder, p, q);
 		let builder = builder
-			.add_transition(choice_initial, "tau_choice_p", State::prefixed(&p.initial, "P"))
-			.add_transition(choice_initial, "tau_choice_q", State::prefixed(&q.initial, "Q"))
+			.add_transition(choice_initial, Event("tau_choice_p"), State::prefixed(&p.initial, "P"))
+			.add_transition(choice_initial, Event("tau_choice_q"), State::prefixed(&q.initial, "Q"))
 			.add_choice(choice_initial);
 
 		Ok(builder.build()?)
@@ -257,6 +255,7 @@ mod tests {
 				None,
 			));
 		}
+
 		trace
 	}
 
@@ -266,10 +265,10 @@ mod tests {
 			.add_state(State("s0"))
 			.add_state(State("s1"))
 			.add_state(State("s2"))
-			.add_observable("a")
-			.add_observable("b")
-			.add_transition(State("s0"), "a", State("s1"))
-			.add_transition(State("s1"), "b", State("s2"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_transition(State("s0"), Event("a"), State("s1"))
+			.add_transition(State("s1"), Event("b"), State("s2"))
 			.add_terminal(State("s2"))
 			.build()
 			.expect("Failed to build process")
@@ -284,7 +283,6 @@ mod tests {
 		assert!(result.hidden.contains(&Event("a")));
 		assert!(!result.observable.contains(&Event("a")));
 		assert!(result.observable.contains(&Event("b")));
-
 		Ok(())
 	}
 
@@ -321,7 +319,6 @@ mod tests {
 		let result = Process::external_choice(&p, &q)?;
 		assert!(result.name.contains("[]"));
 		assert!(result.states.len() >= 3);
-
 		Ok(())
 	}
 
@@ -345,7 +342,6 @@ mod tests {
 
 		let result = composed.validate_trace(&trace_of(&["a", "b"]));
 		assert!(result.valid);
-
 		Ok(())
 	}
 
@@ -357,7 +353,6 @@ mod tests {
 
 		let result = composed.validate_trace(&trace_of(&["a", "b", "a", "b"]));
 		assert!(result.valid);
-
 		Ok(())
 	}
 }

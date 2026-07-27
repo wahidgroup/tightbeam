@@ -3,10 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::constraints::{TimingConstraint, TimingConstraints};
-use super::deadline::Deadline;
-use super::path::extract_paths;
-use super::violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 use crate::der::Sequence;
 use crate::instrumentation::{events, TbEvent};
 use crate::testing::error::TestingError;
@@ -14,6 +10,11 @@ use crate::testing::specs::csp::{Event, Process};
 use crate::trace::ConsumedTrace;
 use crate::utils::jitter::{JitterCalculator, MinMaxJitter};
 use crate::utils::statistics::{DefaultStatisticalAnalyzer, Percentile, StatisticalAnalyzer};
+
+use super::constraints::{TimingConstraint, TimingConstraints};
+use super::deadline::Deadline;
+use super::path::extract_paths;
+use super::violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 
 /// Timing verification result (DER-encodable core)
 #[derive(Debug, Default, Clone, PartialEq, Eq, Sequence)]
@@ -988,12 +989,12 @@ mod tests {
 		Process::builder("test")
 			.initial_state(State("s0"))
 			.add_terminal(State("s2"))
-			.add_observable("start")
-			.add_observable("process")
-			.add_observable("end")
-			.add_transition(State("s0"), "start", State("s1"))
-			.add_transition(State("s1"), "process", State("s2"))
-			.add_transition(State("s2"), "end", State("s2"))
+			.add_observable(Event("start"))
+			.add_observable(Event("process"))
+			.add_observable(Event("end"))
+			.add_transition(State("s0"), Event("start"), State("s1"))
+			.add_transition(State("s1"), Event("process"), State("s2"))
+			.add_transition(State("s2"), Event("end"), State("s2"))
 			.build()
 	}
 

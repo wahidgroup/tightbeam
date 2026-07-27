@@ -42,6 +42,16 @@ use tightbeam::x509::Certificate;
 
 use crate::common::security::pinning_validator;
 
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const CLIENT_HELLO_SENT: Urn<'static> = Urn::new("test", "event:negotiation/client-hello-sent");
+pub(crate) const CLIENT_KEX_SENT: Urn<'static> = Urn::new("test", "event:negotiation/client-kex-sent");
+pub(crate) const HANDSHAKE_COMPLETE: Urn<'static> = Urn::new("test", "event:negotiation/handshake-complete");
+pub(crate) const HANDSHAKE_START: Urn<'static> = Urn::new("test", "event:negotiation/handshake-start");
+pub(crate) const PROFILE_VERIFIED: Urn<'static> = Urn::new("test", "event:negotiation/profile-verified");
+pub(crate) const SERVER_HELLO_RECEIVED: Urn<'static> = Urn::new("test", "event:negotiation/server-hello-received");
+pub(crate) const SERVER_KEX_RECEIVED: Urn<'static> = Urn::new("test", "event:negotiation/server-kex-received");
+
 /// Stronger profile: AES-256-GCM with SHA3-512. Selected when both sides
 /// offer it, because AES-128 fails the default 256-bit strength floor.
 #[derive(Debug, Default, Clone, Copy)]
@@ -133,13 +143,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(handshake_start, exactly!(1)),
-			(client_hello_sent, exactly!(1)),
-			(server_hello_received, exactly!(1)),
-			(client_kex_sent, exactly!(1)),
-			(server_kex_received, exactly!(1)),
-			(handshake_complete, exactly!(1)),
-			(profile_verified, exactly!(1))
+			(HANDSHAKE_START, exactly!(1)),
+			(CLIENT_HELLO_SENT, exactly!(1)),
+			(SERVER_HELLO_RECEIVED, exactly!(1)),
+			(CLIENT_KEX_SENT, exactly!(1)),
+			(SERVER_KEX_RECEIVED, exactly!(1)),
+			(HANDSHAKE_COMPLETE, exactly!(1)),
+			(PROFILE_VERIFIED, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -149,7 +159,7 @@ tb_scenario! {
 	spec: ProfileNegotiationSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			trace.event(ProfileNegotiationSpec::handshake_start)?;
+			trace.event(HANDSHAKE_START)?;
 
 			let preferred = preferred_profile();
 			let fallback = fallback_profile();
@@ -172,28 +182,25 @@ tb_scenario! {
 			)
 			.with_supported_profiles(server_profiles);
 
-			trace.event(ProfileNegotiationSpec::client_hello_sent)?;
-
 			let client_hello = client.build_client_hello()?;
-			trace.event(ProfileNegotiationSpec::server_hello_received)?;
+			trace.event(CLIENT_HELLO_SENT)?;
 
 			let server_handshake = server.process_client_hello(&client_hello).await?;
-			trace.event(ProfileNegotiationSpec::client_kex_sent)?;
+			trace.event(SERVER_HELLO_RECEIVED)?;
 
 			let client_kex = client.process_server_handshake(&server_handshake).await?;
-			trace.event(ProfileNegotiationSpec::server_kex_received)?;
-			server.process_client_key_exchange(&client_kex).await?;
+			trace.event(CLIENT_KEX_SENT)?;
 
-			trace.event(ProfileNegotiationSpec::handshake_complete)?;
+			server.process_client_key_exchange(&client_kex).await?;
+			trace.event(SERVER_KEX_RECEIVED)?;
 
 			let _client_cipher = client.complete()?;
 			let _server_cipher = server.complete()?;
+			trace.event(HANDSHAKE_COMPLETE)?;
 
 			let server_selected = server.selected_profile() == Some(preferred);
 			let client_selected = client.selected_profile() == Some(preferred);
-			if server_selected && client_selected {
-				trace.event(ProfileNegotiationSpec::profile_verified)?;
-			}
+			trace.event_with(PROFILE_VERIFIED, &[], server_selected && client_selected)?;
 
 			Ok(())
 		}

@@ -150,14 +150,14 @@ fn to_snake_case(type_name: &str) -> String {
 	result
 }
 
-/// Create a tightbeam instrumentation event URN
+/// Create a tightbeam job event URN
 ///
-/// Format: `urn:tightbeam:instrumentation:event/<job_name>_<suffix>`
+/// Format: `urn:tightbeam:event:job/<job-name>-<suffix>`
 #[cfg(any(test, feature = "testing"))]
 fn make_event_urn(job_name: &str, suffix: &str) -> Urn<'static> {
 	Urn {
 		nid: Cow::Borrowed("tightbeam"),
-		nss: Cow::Owned(format!("instrumentation:event/{}_{}", job_name, suffix)),
+		nss: Cow::Owned(format!("event:job/{}-{}", job_name.replace('_', "-"), suffix)),
 	}
 }
 
@@ -353,15 +353,15 @@ mod tests {
 	fn test_make_event_urn() {
 		assert_eq!(
 			make_event_urn("create_handshake_request", "start").to_string(),
-			"urn:tightbeam:instrumentation:event/create_handshake_request_start"
+			"urn:tightbeam:event:job/create-handshake-request-start"
 		);
 		assert_eq!(
 			make_event_urn("validate_config", "success").to_string(),
-			"urn:tightbeam:instrumentation:event/validate_config_success"
+			"urn:tightbeam:event:job/validate-config-success"
 		);
 		assert_eq!(
 			make_event_urn("send_request", "error").to_string(),
-			"urn:tightbeam:instrumentation:event/send_request_error"
+			"urn:tightbeam:event:job/send-request-error"
 		);
 	}
 

@@ -317,7 +317,7 @@ macro_rules! cluster {
 		$crate::server! {
 			protocol $protocol: $listener,
 			policies: { with_mux_offer: [ __mux_offer.to_owned() ] },
-			handle: move |frame: $crate::Frame| {
+			handle: move |frame: $crate::Frame, session: $crate::policy::SessionContext| {
 				let registry = ::std::sync::Arc::clone(&$registry);
 				let servlet_registry = ::std::sync::Arc::clone(&$servlet_registry);
 				let config = ::std::sync::Arc::clone(&$config);
@@ -325,7 +325,7 @@ macro_rules! cluster {
 				let _trace = ::std::sync::Arc::clone(&$trace);
 				let _replay_guard = ::core::clone::Clone::clone(&$replay_guard);
 				async move {
-					$crate::cluster!(@handle_gateway_request frame, registry, servlet_registry, config, pool, _replay_guard)
+					$crate::cluster!(@handle_gateway_request frame, session, registry, servlet_registry, config, pool, _replay_guard)
 				}
 			}
 		}
@@ -337,11 +337,12 @@ macro_rules! cluster {
 	};
 
 	// Handle gateway requests (registration + work)
-	(@handle_gateway_request $frame:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $replay_guard:ident) => {{
+	(@handle_gateway_request $frame:ident, $session:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $replay_guard:ident) => {{
 		// Gate policies run before ANY decoding: an unevaluated policy
-		// list is indistinguishable from an open gateway.
+		// list is indistinguishable from an open gateway. Each gate sees
+		// the connection's authenticated peer context.
 		for policy in $config.policies.iter() {
-			let status = $crate::policy::GatePolicy::evaluate(policy.as_ref(), &$frame);
+			let status = $crate::policy::GatePolicy::evaluate(policy.as_ref(), &$frame, &$session);
 			if status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@reply $frame,
 					$crate::colony::cluster::ClusterWorkResponse::err(status)

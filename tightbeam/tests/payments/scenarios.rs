@@ -41,16 +41,20 @@ use tightbeam::{
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 	},
-	utils::compose,
+	utils::{compose, urn::Urn},
 	TightBeamError, Version,
 };
+
+use crate::common::x509::create_test_cert_with_key;
 
 use super::cluster::PaymentGatewayCluster;
 use super::currency::MonetaryAmount;
 use super::hives::PaymentProcessorHive;
 use super::messages::{CreditTransferTransaction, PaymentIdentification, PaymentStatusCode, TransactionStatus};
 use super::servlets::AuthorizationServlet;
-use crate::common::x509::create_test_cert_with_key;
+
+pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> = Urn::new("test", "event:scenarios/authorization-approved");
+pub(crate) const WORK_COMPLETED: Urn<'static> = Urn::new("test", "event:scenarios/work-completed");
 
 // ============================================================================
 // Shared Test Certificates (lazily initialized)
@@ -165,7 +169,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(work_completed, at_least!(1))
+			(WORK_COMPLETED, at_least!(1))
 		]
 	}
 }
@@ -228,14 +232,14 @@ tb_scenario! {
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
 
 			// Mark test completion
-			trace.event(PaymentGatewaySpec::work_completed)?;
+			trace.event(WORK_COMPLETED)?;
 
 			// Verify routing succeeded
 			if work_response.status == TransitStatus::Ok {
 				if let Some(payload) = work_response.payload {
 					let status: TransactionStatus = decode(&payload)?;
 					let is_approved = matches!(status.status, PaymentStatusCode::AcceptedCustomerProfile);
-					trace.event_with("authorization_approved", &[] as &[&str], is_approved)?;
+					trace.event_with(AUTHORIZATION_APPROVED, &[] as &[&str], is_approved)?;
 				}
 			}
 

@@ -148,7 +148,7 @@ impl SeverityScale {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::specs::csp::{Process, State};
+	use crate::testing::specs::csp::{Event, Process, State};
 
 	fn create_fault(state: &str) -> InjectedFaultRecord {
 		InjectedFaultRecord {
@@ -177,7 +177,7 @@ mod tests {
 
 			let mut observables = std::collections::HashSet::new();
 			$(
-				observables.insert($event);
+				observables.insert(Event($event));
 			)*
 
 			for observable in observables {
@@ -189,10 +189,10 @@ mod tests {
 			)*
 
 			$(
-				builder = builder.add_transition(State($from), $event, State($to));
+				builder = builder.add_transition(State($from), Event($event), State($to));
 			)*
 
-			builder.build().unwrap()
+			builder.build().expect("fixture state machine builds")
 		}};
 	}
 
@@ -284,7 +284,7 @@ mod tests {
 	#[test]
 	fn test_severity_unknown_state() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("SimpleProcess")
-			.add_observable("event")
+			.add_observable(Event("event"))
 			.initial_state(State("Known"))
 			.build()?;
 

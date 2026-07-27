@@ -19,7 +19,7 @@
 //!   <https://cwe.mitre.org/data/definitions/300.html>
 //! - CAPEC-94: Adversary in the Middle (AiTM)
 //!   <https://capec.mitre.org/data/definitions/94.html>
-//! - RFC 8446 (TLS 1.3) §4.4.3: transcript-bound CertificateVerify/Finished
+//! - RFC 9846 (TLS 1.3) §4.4.3: transcript-bound CertificateVerify/Finished
 
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ use tightbeam::{
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::HandshakeError,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
@@ -36,16 +37,21 @@ use crate::security::common::{
 	BACKEND_COUNT_U32,
 };
 
+pub(crate) const MITM_CAPTURE_HANDSHAKE: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-capture-handshake");
+pub(crate) const MITM_INJECT_TAMPERED: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-inject-tampered");
+pub(crate) const MITM_TAMPERING_DETECTED: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-tampering-detected");
+pub(crate) const MITM_TAMPER_MESSAGE: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-tamper-message");
+
 tb_assert_spec! {
 	pub MitmAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(mitm_capture_handshake, exactly!(BACKEND_COUNT_U32)),
-			(mitm_tamper_message, exactly!(BACKEND_COUNT_U32)),
-			(mitm_inject_tampered, exactly!(BACKEND_COUNT_U32)),
-			(mitm_tampering_detected, exactly!(BACKEND_COUNT_U32))
+			(MITM_CAPTURE_HANDSHAKE, exactly!(BACKEND_COUNT_U32)),
+			(MITM_TAMPER_MESSAGE, exactly!(BACKEND_COUNT_U32)),
+			(MITM_INJECT_TAMPERED, exactly!(BACKEND_COUNT_U32)),
+			(MITM_TAMPERING_DETECTED, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -55,31 +61,31 @@ tb_process_spec! {
 	events {
 		observable {
 
-			MitmAttackSpec::mitm_capture_handshake,
-			MitmAttackSpec::mitm_tamper_message,
-			MitmAttackSpec::mitm_inject_tampered,
-			MitmAttackSpec::mitm_tampering_detected,
-			SecurityThreatHarness::harness_spawn_session,
-			SecurityThreatHarness::harness_spawn_ecies,
-			SecurityThreatHarness::harness_spawn_cms
+			MITM_CAPTURE_HANDSHAKE,
+			MITM_TAMPER_MESSAGE,
+			MITM_INJECT_TAMPERED,
+			MITM_TAMPERING_DETECTED,
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS
 		}
 		hidden { }
 	}
 	states {
-		Idle => { SecurityThreatHarness::harness_spawn_session => SpawningCapture },
+		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningCapture },
 		SpawningCapture => {
-			SecurityThreatHarness::harness_spawn_ecies => CaptureReady,
-			SecurityThreatHarness::harness_spawn_cms => CaptureReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => CaptureReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => CaptureReady
 		},
-		CaptureReady => { MitmAttackSpec::mitm_capture_handshake => Captured },
-		Captured => { MitmAttackSpec::mitm_tamper_message => Tampered },
-		Tampered => { SecurityThreatHarness::harness_spawn_session => SpawningAttack },
+		CaptureReady => { MITM_CAPTURE_HANDSHAKE => Captured },
+		Captured => { MITM_TAMPER_MESSAGE => Tampered },
+		Tampered => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
 		SpawningAttack => {
-			SecurityThreatHarness::harness_spawn_ecies => AttackReady,
-			SecurityThreatHarness::harness_spawn_cms => AttackReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => AttackReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackReady
 		},
-		AttackReady => { MitmAttackSpec::mitm_inject_tampered => Injected },
-		Injected => { MitmAttackSpec::mitm_tampering_detected => Idle }
+		AttackReady => { MITM_INJECT_TAMPERED => Injected },
+		Injected => { MITM_TAMPERING_DETECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "MITM attack: message tampering detection via transcript signatures" }
@@ -109,7 +115,7 @@ job! {
 			let mut session = harness.spawn(kind);
 			let captured = session.capture_full().await?;
 
-			trace.event(MitmAttackSpec::mitm_capture_handshake)?;
+			trace.event(MITM_CAPTURE_HANDSHAKE)?;
 
 			// ========================================
 			// Step 2: Find a server-to-client message to tamper
@@ -130,13 +136,13 @@ job! {
 				return Err(expectation_failure("tampering did not modify payload"));
 			}
 
-			trace.event(MitmAttackSpec::mitm_tamper_message)?;
+			trace.event(MITM_TAMPER_MESSAGE)?;
 
 			// ========================================
 			// Step 3: Inject tampered message into fresh session
 			// ========================================
 			let mut attack_session = harness.spawn(kind);
-			trace.event(MitmAttackSpec::mitm_inject_tampered)?;
+			trace.event(MITM_INJECT_TAMPERED)?;
 
 			// Inject the tampered message at the same step
 			match attack_session.inject_at_step(target.step, &tampered_payload).await? {
@@ -149,7 +155,7 @@ job! {
 						"MITM tampering must fail signature/transcript verification, not DER parsing (got {handshake_err:?})"
 					);
 
-					trace.event(MitmAttackSpec::mitm_tampering_detected)?;
+					trace.event(MITM_TAMPERING_DETECTED)?;
 				}
 				InjectionOutcome::Accepted => {
 					// Should not happen - tampered message should be rejected

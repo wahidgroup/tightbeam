@@ -5,8 +5,8 @@
 
 use tightbeam::{der::Sequence, worker, Beamable, TightBeamError};
 
+use crate::dtn::events::MISSION_CONTROL_RECEIVE_ACK;
 use crate::dtn::messages::CommandAck;
-use crate::dtn::ultimate::DtnEventCountSpec;
 
 /// Command ACK handler request
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -23,7 +23,7 @@ pub struct CommandAckHandlerResponse {
 worker! {
 	name: CommandAckHandlerWorker<CommandAckHandlerRequest, Result<CommandAckHandlerResponse, TightBeamError>>,
 	handle: |request, trace| async move {
-		trace.event(DtnEventCountSpec::mission_control_receive_ack)?;
+		trace.event(MISSION_CONTROL_RECEIVE_ACK)?;
 
 		// In a more complex system, we might verify this matches a pending
 		// command but for this simple system, we just acknowledge the command.

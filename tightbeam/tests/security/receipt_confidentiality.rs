@@ -37,11 +37,23 @@ use tightbeam::transport::handshake::negotiation::{
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
 use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::common::security::{
 	cms_mutual_budget_pair, contains_window, CmsSessionHooks, PayingApprover, ServerMaterials,
 };
+
+pub(crate) const RECEIPTS_MATCH_ACROSS_ENDPOINTS: Urn<'static> =
+	Urn::new("test", "event:receipt-confidentiality/receipts-match-across-endpoints");
+pub(crate) const RESPONSE_CONFIDENTIAL_ON_WIRE: Urn<'static> =
+	Urn::new("test", "event:receipt-confidentiality/response-confidential-on-wire");
+pub(crate) const SERVER_RECOVERS_PLAINTEXT_ANSWER: Urn<'static> =
+	Urn::new("test", "event:receipt-confidentiality/server-recovers-plaintext-answer");
+pub(crate) const SETTLED_SESSION_ACTIVATES: Urn<'static> =
+	Urn::new("test", "event:receipt-confidentiality/settled-session-activates");
+pub(crate) const SETTLED_WITH_PLAINTEXT_ONCE: Urn<'static> =
+	Urn::new("test", "event:receipt-confidentiality/settled-with-plaintext-once");
 
 const CHALLENGE: &[u8] = b"cms-conf-invoice";
 const RESPONSE: &[u8] = b"cms-conf-preimage";
@@ -89,11 +101,11 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(response_confidential_on_wire, exactly!(1), equals!(true)),
-			(settled_with_plaintext_once, exactly!(1), equals!(true)),
-			(server_recovers_plaintext_answer, exactly!(1), equals!(true)),
-			(receipts_match_across_endpoints, exactly!(1), equals!(true)),
-			(settled_session_activates, exactly!(1), equals!(true))
+			(RESPONSE_CONFIDENTIAL_ON_WIRE, exactly!(1), equals!(true)),
+			(SETTLED_WITH_PLAINTEXT_ONCE, exactly!(1), equals!(true)),
+			(SERVER_RECOVERS_PLAINTEXT_ANSWER, exactly!(1), equals!(true)),
+			(RECEIPTS_MATCH_ACROSS_ENDPOINTS, exactly!(1), equals!(true)),
+			(SETTLED_SESSION_ACTIVATES, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -138,7 +150,7 @@ tb_scenario! {
 			// to the server certificate.
 			let response_leaked = contains_window(&client_finished, RESPONSE);
 			trace.event_with(
-				ReceiptConfidentialitySpec::response_confidential_on_wire,
+				RESPONSE_CONFIDENTIAL_ON_WIRE,
 				&[],
 				!response_leaked,
 			)?;
@@ -147,7 +159,7 @@ tb_scenario! {
 			// plaintext (the settle hook refuses anything else).
 			let settle_calls = authorizer.settle_calls.load(Ordering::SeqCst);
 			trace.event_with(
-				ReceiptConfidentialitySpec::settled_with_plaintext_once,
+				SETTLED_WITH_PLAINTEXT_ONCE,
 				&[],
 				settle_calls == 1,
 			)?;
@@ -160,20 +172,20 @@ tb_scenario! {
 			let answer_recovered =
 				server_receipt.is_some_and(|stored| stored.ancillary_response() == Some(&expected_answer));
 			trace.event_with(
-				ReceiptConfidentialitySpec::server_recovers_plaintext_answer,
+				SERVER_RECOVERS_PLAINTEXT_ANSWER,
 				&[],
 				answer_recovered,
 			)?;
 
 			let receipts_match = client_receipt.is_some() && client_receipt == server_receipt;
 			trace.event_with(
-				ReceiptConfidentialitySpec::receipts_match_across_endpoints,
+				RECEIPTS_MATCH_ACROSS_ENDPOINTS,
 				&[],
 				receipts_match,
 			)?;
 
 			let activated = server.complete().is_ok();
-			trace.event_with(ReceiptConfidentialitySpec::settled_session_activates, &[], activated)?;
+			trace.event_with(SETTLED_SESSION_ACTIVATES, &[], activated)?;
 
 			Ok::<(), TightBeamError>(())
 		}

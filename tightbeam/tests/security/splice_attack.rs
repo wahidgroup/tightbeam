@@ -55,10 +55,13 @@ use tightbeam::{
 	transport::handshake::{
 		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
 	},
+	utils::urn::Urn,
 	TightBeamError,
 };
 
 use crate::common::security::{default_security_profile, expectation_failure, pinning_validator, ServerMaterials};
+
+pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> = Urn::new("test", "event:splice-attack/spliced-kex-rejected");
 
 /// Attacker's-eye view of the DER key-exchange plaintext: the two
 /// leading OCTET STRINGs are all a splice needs (the trailing receipt
@@ -75,7 +78,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(spliced_kex_rejected, exactly!(1u32))
+			(SPLICED_KEX_REJECTED, exactly!(1u32))
 		]
 	}
 }
@@ -83,11 +86,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SpliceAttackProcess,
 	events {
-		observable { SpliceAttackSpec::spliced_kex_rejected }
+		observable { SPLICED_KEX_REJECTED }
 		hidden { }
 	}
 	states {
-		Idle => { SpliceAttackSpec::spliced_kex_rejected => Done },
+		Idle => { SPLICED_KEX_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -181,7 +184,7 @@ job! {
 
 		match server.process_client_key_exchange(&spliced_der).await {
 			Err(_) => {
-				trace.event(SpliceAttackSpec::spliced_kex_rejected)?;
+				trace.event(SPLICED_KEX_REJECTED)?;
 			}
 			Ok(_) => return Err(expectation_failure("server accepted a spliced key exchange under victim identity")),
 		}

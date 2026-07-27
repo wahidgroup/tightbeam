@@ -30,7 +30,7 @@
 //!   <https://cwe.mitre.org/data/definitions/300.html>
 //! - CAPEC-220: Client-Server Protocol Manipulation
 //!   <https://capec.mitre.org/data/definitions/220.html>
-//! - RFC 8446 (TLS 1.3) §4.1.3: downgrade protection (analogous control)
+//! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection (analogous control)
 
 use std::sync::Arc;
 
@@ -46,12 +46,18 @@ use tightbeam::{
 		server::EciesHandshakeServer,
 		ClientHello, ServerHandshake,
 	},
+	utils::urn::Urn,
 	TightBeamError,
 };
 
 use crate::common::security::{
 	expectation_failure, pinning_validator, strong_security_profile, weak_security_profile, ServerMaterials,
 };
+
+pub(crate) const STRIPPED_OFFER_REJECTED: Urn<'static> =
+	Urn::new("test", "event:transcript-binding/stripped-offer-rejected");
+pub(crate) const TAMPERED_ACCEPT_REJECTED: Urn<'static> =
+	Urn::new("test", "event:transcript-binding/tampered-accept-rejected");
 
 type EciesClient = EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>;
 type EciesServer = EciesHandshakeServer<DefaultCryptoProvider>;
@@ -62,8 +68,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(tampered_accept_rejected, exactly!(1u32)),
-			(stripped_offer_rejected, exactly!(1u32))
+			(TAMPERED_ACCEPT_REJECTED, exactly!(1u32)),
+			(STRIPPED_OFFER_REJECTED, exactly!(1u32))
 		]
 	}
 }
@@ -71,12 +77,12 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub TranscriptBindingProcess,
 	events {
-		observable { TranscriptBindingSpec::tampered_accept_rejected, TranscriptBindingSpec::stripped_offer_rejected }
+		observable { TAMPERED_ACCEPT_REJECTED, STRIPPED_OFFER_REJECTED }
 		hidden { }
 	}
 	states {
-		Idle => { TranscriptBindingSpec::tampered_accept_rejected => AcceptBound },
-		AcceptBound => { TranscriptBindingSpec::stripped_offer_rejected => Done },
+		Idle => { TAMPERED_ACCEPT_REJECTED => AcceptBound },
+		AcceptBound => { STRIPPED_OFFER_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -121,7 +127,7 @@ fn strong_weak_pair(
 async fn expect_client_reject<E>(
 	result: Result<Vec<u8>, E>,
 	trace: &TraceCollector,
-	event: &'static str,
+	event: Urn<'static>,
 	on_accept: &'static str,
 ) -> Result<(), TightBeamError> {
 	match result {
@@ -157,7 +163,7 @@ job! {
 		expect_client_reject(
 			client.process_server_handshake(&tampered).await,
 			&trace,
-			TranscriptBindingSpec::tampered_accept_rejected,
+			TAMPERED_ACCEPT_REJECTED,
 			"client accepted a tampered, unauthenticated security_accept",
 		)
 		.await?;
@@ -180,7 +186,7 @@ job! {
 		expect_client_reject(
 			client.process_server_handshake(&server_handshake_der).await,
 			&trace,
-			TranscriptBindingSpec::stripped_offer_rejected,
+			STRIPPED_OFFER_REJECTED,
 			"client accepted a signature over a rewritten ClientHello",
 		)
 		.await?;

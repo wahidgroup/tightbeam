@@ -19,7 +19,7 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EnvelopedData, OriginatorIdentifierOrKey, RecipientInfo};
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
-use crate::crypto::aead::{aes_kw, Decryptor, KeyInit, SessionKeys};
+use crate::crypto::aead::{Decryptor, KeyInit, SessionKeys};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
@@ -37,8 +37,9 @@ use crate::oids::{self, DATA};
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::spki::EncodePublicKey;
 use crate::transport::handshake::attributes;
+use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::kari::{derive_kek, key_wrap_key_size, unwrap_with_kek, wrap_with_kek};
+use crate::transport::handshake::kari::{derive_kek, key_wrap_key_size, unwrap_and_verify_with_kek};
 use crate::transport::handshake::negotiation::{
 	authorize_transport, server_mux_settings, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept,
 	TransportAccept, TransportAuthorizer, TransportOffer,
@@ -52,7 +53,7 @@ use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
 use crate::transport::handshake::ServerHandshakeProtocol;
-use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
+use crate::transport::handshake::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::Certificate;
@@ -92,6 +93,7 @@ where
 	session_receipt: Option<SessionReceipt>,
 	receipt_artifact: Option<SignedData>,
 	stored_receipt: Option<StoredReceipt>,
+	epoch_materials: Option<EpochMaterials>,
 	mux_settings: Option<MuxSettings>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	invariants: HandshakeInvariant,
@@ -137,6 +139,7 @@ where
 			session_receipt: None,
 			receipt_artifact: None,
 			stored_receipt: None,
+			epoch_materials: None,
 			mux_settings: None,
 			client_validators,
 			invariants: { HandshakeInvariant::default() },
@@ -284,7 +287,7 @@ where
 	/// Process the client's TransportOffer attribute, if present.
 	///
 	/// Multiplexing activates only when the client offered it AND it is
-	/// locally enabled. Otherwise the connection stays lock-step. The
+	/// locally enabled. Otherwise the connection stays single-flight. The
 	/// authorizer (when configured) decides the budget grant.
 	async fn process_transport_offer(&mut self, unprotected_attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		let offer = unprotected_attrs.and_then(|attrs| {
@@ -414,17 +417,15 @@ where
 		let key_size = key_wrap_key_size::<P>()?;
 		let kek = derive_kek::<P>(&shared_secret, ukm.as_bytes(), TIGHTBEAM_KARI_KDF_INFO, key_size)?;
 
-		// Unwrap CEK
-		let wrapped_key = kari.recipient_enc_keys[0].enc_key.as_bytes();
-		let cek = unwrap_with_kek(&provider, kek.as_slice(), wrapped_key)?;
-
-		// Re-wrap for constant-time validation (KEK is zeroized on drop).
-		let rewrapped = wrap_with_kek(&provider, kek.as_slice(), &cek)?;
-		let valid = rewrapped.as_slice() == wrapped_key;
-
-		if !valid {
-			return Err(HandshakeError::AesKeyWrap(aes_kw::Error::IntegrityCheckFailed));
-		}
+		// Unwrap CEK. `recipient_enc_keys` is an unauthenticated DER
+		// SEQUENCE OF that decodes empty; index only after a length check.
+		let wrapped_key = kari
+			.recipient_enc_keys
+			.first()
+			.ok_or(HandshakeError::InvalidClientKeyExchange)?
+			.enc_key
+			.as_bytes();
+		let cek = unwrap_and_verify_with_kek(&provider, kek.as_slice(), wrapped_key)?;
 
 		// Open the encrypted content under the unwrapped CEK
 		let cipher = P::AeadCipher::new_from_slice(&cek).map_err(|_| HandshakeError::InvalidKeySize {
@@ -982,13 +983,24 @@ where
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
-			let transcript = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
-			let ciphers = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, transcript))??;
+			let transcript = *self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
+			let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript))?;
+			let ciphers = directional?;
 
-			// 4. Transition to complete
+			// 4. Derive the epoch-0 rekey materials alongside the traffic
+			// keys, from the same inputs: an in-band renewal later chains
+			// from this secret without touching the handshake again. CMS
+			// salts key derivation with the transcript hash, so it doubles
+			// as the epoch salt here.
+			let epoch_derived =
+				cek.with(|input_key| derive_epoch_materials::<P>(input_key, &transcript, transcript))?;
+			let materials = epoch_derived?;
+			self.epoch_materials = Some(materials);
+
+			// 5. Transition to complete
 			self.state.transition(ServerHandshakeState::Completed)?;
 
-			// 5. Role-map the directional ciphers with the negotiated OID
+			// 6. Role-map the directional ciphers with the negotiated OID
 			Ok(SessionKeys::for_server(
 				ciphers.client_to_server,
 				ciphers.server_to_client,
@@ -1001,11 +1013,6 @@ where
 		self.state.state().is_completed()
 	}
 
-	#[cfg(feature = "x509")]
-	fn peer_certificate(&self) -> Option<&Certificate> {
-		self.validated_client_cert.as_ref().map(|arc| arc.as_ref())
-	}
-
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
@@ -1016,6 +1023,16 @@ where
 
 	fn session_receipt(&self) -> Option<&StoredReceipt> {
 		self.stored_receipt.as_ref()
+	}
+
+	#[cfg(feature = "x509")]
+	fn peer_certificate(&self) -> Option<&Certificate> {
+		self.validated_client_cert.as_ref().map(|arc| arc.as_ref())
+	}
+
+	#[cfg(feature = "aead")]
+	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
+		self.epoch_materials.take()
 	}
 }
 

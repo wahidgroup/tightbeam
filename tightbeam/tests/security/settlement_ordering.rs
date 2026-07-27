@@ -67,7 +67,14 @@ use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, Tr
 use tightbeam::transport::handshake::{
 	client::EciesHandshakeClient, server::EciesHandshakeServer, ClientKeyExchange, HandshakeError,
 };
+use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
+
+pub(crate) const CORRUPTED_KEY_EXCHANGE_REJECTED: Urn<'static> =
+	Urn::new("test", "event:settlement-ordering/corrupted-key-exchange-rejected");
+pub(crate) const RESPONSE_CONFIDENTIAL_ON_WIRE: Urn<'static> =
+	Urn::new("test", "event:settlement-ordering/response-confidential-on-wire");
+pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> = Urn::new("test", "event:settlement-ordering/settle-never-fired");
 
 use crate::common::security::{
 	contains_window, default_security_profile, expectation_failure, pinning_validator, PayingApprover, ServerMaterials,
@@ -84,9 +91,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(response_confidential_on_wire, exactly!(1), equals!(true)),
-			(corrupted_key_exchange_rejected, exactly!(1), equals!(true)),
-			(settle_never_fired, exactly!(1), equals!(true))
+			(RESPONSE_CONFIDENTIAL_ON_WIRE, exactly!(1), equals!(true)),
+			(CORRUPTED_KEY_EXCHANGE_REJECTED, exactly!(1), equals!(true)),
+			(SETTLE_NEVER_FIRED, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -137,7 +144,7 @@ tb_scenario! {
 			// exchange wire bytes.
 			let response_leaked = contains_window(&client_kex_der, RESPONSE);
 			trace.event_with(
-				SettlementOrderingSpec::response_confidential_on_wire,
+				RESPONSE_CONFIDENTIAL_ON_WIRE,
 				&[],
 				!response_leaked,
 			)?;
@@ -159,9 +166,9 @@ tb_scenario! {
 			let corrupted = kex.to_der()?;
 			let kex_result = server.process_client_key_exchange(&corrupted).await;
 			let rejected = matches!(kex_result, Err(HandshakeError::SignatureError(_)));
-			trace.event_with(SettlementOrderingSpec::corrupted_key_exchange_rejected, &[], rejected)?;
+			trace.event_with(CORRUPTED_KEY_EXCHANGE_REJECTED, &[], rejected)?;
 
-			trace.event_with(SettlementOrderingSpec::settle_never_fired, &[], authorizer.settle_calls() == 0)?;
+			trace.event_with(SETTLE_NEVER_FIRED, &[], authorizer.settle_calls() == 0)?;
 
 			Ok::<(), TightBeamError>(())
 		}

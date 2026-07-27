@@ -8,9 +8,9 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{compose, decode, servlet, Beamable, Sequence};
 
+use super::events;
 use super::r#move::ChessMove;
 use super::state::ChessGameState;
-use super::ChessAssertSpec;
 
 // ============================================================================
 // MATCH MANAGER
@@ -36,7 +36,7 @@ impl ChessMatchManager {
 		let mut game_state = match self.game_state.lock() {
 			Ok(gs) => gs,
 			Err(_) => {
-				trace.event(ChessAssertSpec::server_state_lock_poisoned)?;
+				trace.event(events::SERVER_STATE_LOCK_POISONED)?;
 				return Err(TightBeamError::LockPoisoned);
 			}
 		};
@@ -44,7 +44,7 @@ impl ChessMatchManager {
 		let mut last_order = match self.last_order.lock() {
 			Ok(lo) => lo,
 			Err(_) => {
-				trace.event(ChessAssertSpec::server_state_lock_poisoned)?;
+				trace.event(events::SERVER_STATE_LOCK_POISONED)?;
 				return Err(TightBeamError::LockPoisoned);
 			}
 		};
@@ -53,9 +53,10 @@ impl ChessMatchManager {
 		if move_count == 1 && *last_order > 1 {
 			// New game started - reset server's authoritative board state
 			*game_state = ChessGameState::new();
-			trace.event("server_game_ended")?;
-			trace.event("server_game_restarted")?;
+			trace.event(events::SERVER_GAME_ENDED)?;
+			trace.event(events::SERVER_GAME_RESTARTED)?;
 		}
+
 		*last_order = move_count;
 
 		// Determine whose turn it is based on the updated last_order
@@ -71,11 +72,11 @@ impl ChessMatchManager {
 		};
 
 		if !game_state.is_move_valid(&client_move, is_white_turn) {
-			trace.event("server_move_invalid")?;
+			trace.event(events::SERVER_MOVE_INVALID)?;
 			return Err(TightBeamError::LockPoisoned);
 		}
 
-		trace.event("server_move_validated")?;
+		trace.event(events::SERVER_MOVE_VALIDATED)?;
 
 		// Emit piece kind event for client move
 		if let Some(kind) = game_state.piece_kind_at(move_req.from_row, move_req.from_col) {
@@ -88,7 +89,6 @@ impl ChessMatchManager {
 		// Compute valid moves once and reuse for checkmate/stalemate checks
 		let is_server_turn = !is_white_turn;
 		let valid_moves = game_state.to_valid_moves(is_server_turn);
-
 		let game_status: GameStatusCode = if valid_moves.is_empty() {
 			game_state.determine_game_status(is_server_turn)
 		} else {
@@ -104,7 +104,7 @@ impl ChessMatchManager {
 			// Make the server move (track captures)
 			game_state.apply_move(&server_move);
 
-			trace.event("server_move_generated")?;
+			trace.event(events::SERVER_MOVE_GENERATED)?;
 
 			// Emit piece kind event for server move
 			if let Some(kind) = game_state.piece_kind_at(server_move.from_row, server_move.from_col) {
@@ -116,7 +116,7 @@ impl ChessMatchManager {
 		};
 
 		if matches!(game_status, GameStatusCode::Checkmate | GameStatusCode::Stalemate) {
-			trace.event("server_game_ended")?;
+			trace.event(events::SERVER_GAME_ENDED)?;
 		}
 
 		Ok(game_status)
@@ -192,18 +192,18 @@ servlet! {
 		let message_id = message.metadata.id.clone();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {
-			trace.event(ChessAssertSpec::server_response_emitted)?;
+			trace.event(events::SERVER_RESPONSE_EMITTED)?;
 			Ok(Some(create_invalid_move_response(id, order)?))
 		};
 
-		trace.event(ChessAssertSpec::server_move_received)?;
+		trace.event(events::SERVER_MOVE_RECEIVED)?;
 
 		// Decode ChessMoveRequest from message
 		let move_req: ChessMoveRequest = match decode(&message.message) {
 			Ok(req) => req,
 			Err(_) => {
 				// Invalid message format - return invalid move response
-				trace.event(ChessAssertSpec::server_decode_failure)?;
+				trace.event(events::SERVER_DECODE_FAILURE)?;
 				return invalid_move(Arc::clone(trace), message_id, message.metadata.order);
 			}
 		};
@@ -228,7 +228,8 @@ servlet! {
 
 		// Return response with game status and updated board state
 		let response = ChessMoveResponse { game_status };
-		trace.event(ChessAssertSpec::server_response_emitted)?;
+
+		trace.event(events::SERVER_RESPONSE_EMITTED)?;
 
 		Ok(Some(compose! {
 			V0: id: message_id,

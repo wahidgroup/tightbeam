@@ -12,7 +12,22 @@
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
+use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+
+const COMPILATION_CHECK: Urn<'static> = Urn::new("fuzz", "event:verification/compilation-check");
+const WORKSPACE_HAS_AFL: Urn<'static> = Urn::new("fuzz", "event:verification/workspace-has-afl");
+const PACKAGE_ENABLES_AFL: Urn<'static> = Urn::new("fuzz", "event:verification/package-enables-afl");
+const IJON_FEATURE_ENABLED: Urn<'static> = Urn::new("fuzz", "event:verification/ijon-feature-enabled");
+const BINARY_HAS_IJON_MAX: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-ijon-max");
+const BINARY_HAS_IJON_SET: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-ijon-set");
+const BINARY_HAS_IJON_HASHINT: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-ijon-hashint");
+const BINARY_HAS_IJON_MAP_SIZE: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-ijon-map-size");
+const BINARY_HAS_AFL_RUNTIME: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-afl-runtime");
+const COVERAGE_SCORE: Urn<'static> = Urn::new("fuzz", "event:verification/coverage-score");
+const TRACK_STATE_STABLE: Urn<'static> = Urn::new("fuzz", "event:verification/track-state-stable");
+const FUZZ_ADVANCES_COVERAGE: Urn<'static> = Urn::new("fuzz", "event:verification/fuzz-advances-coverage");
+const VERIFICATION_COMPLETE: Urn<'static> = Urn::new("fuzz", "event:verification/verification-complete");
 
 // ============================================================================
 // ASSERTION SPEC - Defines Expected Event Sequences
@@ -28,19 +43,19 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(compilation_check, exactly!(1)),
-			(workspace_has_afl, exactly!(1), equals!(true)),
-			(package_enables_afl, exactly!(1), equals!(true)),
-			(ijon_feature_enabled, exactly!(1), equals!(true)),
-			(binary_has_ijon_max, exactly!(1), equals!(true)),
-			(binary_has_ijon_set, exactly!(1), equals!(true)),
-			(binary_has_ijon_hashint, exactly!(1), equals!(true)),
-			(binary_has_ijon_map_size, exactly!(1), equals!(true)),
-			(binary_has_afl_runtime, exactly!(1), equals!(true)),
-			(coverage_score, exactly!(1), equals!(true)),
-			(track_state_stable, exactly!(1), equals!(true)),
-			(fuzz_advances_coverage, exactly!(1), equals!(true)),
-			(verification_complete, exactly!(1)),
+			(COMPILATION_CHECK, exactly!(1)),
+			(WORKSPACE_HAS_AFL, exactly!(1), equals!(true)),
+			(PACKAGE_ENABLES_AFL, exactly!(1), equals!(true)),
+			(IJON_FEATURE_ENABLED, exactly!(1), equals!(true)),
+			(BINARY_HAS_IJON_MAX, exactly!(1), equals!(true)),
+			(BINARY_HAS_IJON_SET, exactly!(1), equals!(true)),
+			(BINARY_HAS_IJON_HASHINT, exactly!(1), equals!(true)),
+			(BINARY_HAS_IJON_MAP_SIZE, exactly!(1), equals!(true)),
+			(BINARY_HAS_AFL_RUNTIME, exactly!(1), equals!(true)),
+			(COVERAGE_SCORE, exactly!(1), equals!(true)),
+			(TRACK_STATE_STABLE, exactly!(1), equals!(true)),
+			(FUZZ_ADVANCES_COVERAGE, exactly!(1), equals!(true)),
+			(VERIFICATION_COMPLETE, exactly!(1)),
 		]
 	},
 }
@@ -69,42 +84,42 @@ tb_process_spec! {
 	pub VerificationProcess,
 	events {
 		observable {
-			"compilation_check",
-			"workspace_has_afl",
-			"package_enables_afl",
-			"ijon_feature_enabled",
-			"binary_has_ijon_max",
-			"binary_has_ijon_set",
-			"binary_has_ijon_hashint",
-			"binary_has_ijon_map_size",
-			"binary_has_afl_runtime",
-			"coverage_score",
-			"track_state_stable",
-			"fuzz_advances_coverage",
-			"verification_complete"
+			COMPILATION_CHECK,
+			WORKSPACE_HAS_AFL,
+			PACKAGE_ENABLES_AFL,
+			IJON_FEATURE_ENABLED,
+			BINARY_HAS_IJON_MAX,
+			BINARY_HAS_IJON_SET,
+			BINARY_HAS_IJON_HASHINT,
+			BINARY_HAS_IJON_MAP_SIZE,
+			BINARY_HAS_AFL_RUNTIME,
+			COVERAGE_SCORE,
+			TRACK_STATE_STABLE,
+			FUZZ_ADVANCES_COVERAGE,
+			VERIFICATION_COMPLETE
 		}
 		hidden { }
 	}
 
 	states {
-		Initial => { "compilation_check" => Compiled },
+		Initial => { COMPILATION_CHECK => Compiled },
 		Compiled => {
-			"workspace_has_afl"        => WorkspaceConfigured,
-			"package_enables_afl"      => WorkspaceConfigured
+			WORKSPACE_HAS_AFL         => WorkspaceConfigured,
+			PACKAGE_ENABLES_AFL       => WorkspaceConfigured
 		},
-		WorkspaceConfigured => { "ijon_feature_enabled" => FeaturesOk },
+		WorkspaceConfigured => { IJON_FEATURE_ENABLED => FeaturesOk },
 		FeaturesOk => {
-			"binary_has_ijon_max"      => BinaryVerified,
-			"binary_has_ijon_set"      => BinaryVerified,
-			"binary_has_ijon_hashint"  => BinaryVerified,
-			"binary_has_ijon_map_size" => BinaryVerified
+			BINARY_HAS_IJON_MAX       => BinaryVerified,
+			BINARY_HAS_IJON_SET       => BinaryVerified,
+			BINARY_HAS_IJON_HASHINT   => BinaryVerified,
+			BINARY_HAS_IJON_MAP_SIZE  => BinaryVerified
 		},
 		BinaryVerified => {
-			"coverage_score"           => OracleVerified,
-			"track_state_stable"       => OracleVerified,
-			"fuzz_advances_coverage"   => OracleVerified
+			COVERAGE_SCORE            => OracleVerified,
+			TRACK_STATE_STABLE        => OracleVerified,
+			FUZZ_ADVANCES_COVERAGE    => OracleVerified
 		},
-		OracleVerified => { "verification_complete" => FullyVerified }
+		OracleVerified => { VERIFICATION_COMPLETE => FullyVerified }
 	}
 
 	terminal { FullyVerified }
@@ -127,7 +142,7 @@ tb_scenario! {
 			use std::path::Path;
 
 			// Proof 1: Compilation succeeded (executing proves it compiled)
-			trace.event(VerificationSpec::compilation_check)?;
+			trace.event(COMPILATION_CHECK)?;
 
 			// Proof 2: AFL Dependency Configuration - Check actual Cargo.toml files
 			let workspace_cargo = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -135,21 +150,24 @@ tb_scenario! {
 				.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No grandparent directory"))?
 				.join("Cargo.toml");
 			let cargo_content = fs::read_to_string(&workspace_cargo)?;
-			trace.event_with(VerificationSpec::workspace_has_afl, &[], cargo_content.contains("afl"))?;
+
+			trace.event_with(WORKSPACE_HAS_AFL, &[], cargo_content.contains("afl"))?;
 
 			let package_cargo = Path::new(env!("CARGO_MANIFEST_DIR"))
 				.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No parent directory"))?
 				.join("Cargo.toml");
 			let pkg_content = fs::read_to_string(&package_cargo)?;
 			let enables_afl = pkg_content.contains("testing-fuzz") && pkg_content.contains("dep:afl");
-			trace.event_with(VerificationSpec::package_enables_afl, &[], enables_afl)?;
+
+			trace.event_with(PACKAGE_ENABLES_AFL, &[], enables_afl)?;
 
 			// Proof 3: Feature Flags - Actually check if IJON feature is active
 			#[cfg(feature = "testing-fuzz-ijon")]
 			let ijon_enabled = true;
 			#[cfg(not(feature = "testing-fuzz-ijon"))]
 			let ijon_enabled = false;
-			trace.event_with(VerificationSpec::ijon_feature_enabled, &[], ijon_enabled)?;
+
+			trace.event_with(IJON_FEATURE_ENABLED, &[], ijon_enabled)?;
 
 			// Proof 4: Binary Symbol Analysis - Check actual binary for IJON symbols
 			let current_exe = std::env::current_exe()?;
@@ -163,27 +181,30 @@ tb_scenario! {
 			let has_ijon_hashint = symbols.contains("ijon_hashint") || symbols.contains("ijon_hashstack");
 			let has_ijon_map_size = symbols.contains("__afl_ijon_map_size") || symbols.contains("__afl_ijon_enabled");
 			let has_afl_runtime = symbols.contains("__afl_area_ptr") || symbols.contains("__afl_prev_loc");
-			trace.event_with(VerificationSpec::binary_has_ijon_max, &[], has_ijon_max)?;
-			trace.event_with(VerificationSpec::binary_has_ijon_set, &[], has_ijon_set)?;
-			trace.event_with(VerificationSpec::binary_has_ijon_hashint, &[], has_ijon_hashint)?;
-			trace.event_with(VerificationSpec::binary_has_ijon_map_size, &[], has_ijon_map_size)?;
-			trace.event_with(VerificationSpec::binary_has_afl_runtime, &[], has_afl_runtime)?;
+			trace.event_with(BINARY_HAS_IJON_MAX, &[], has_ijon_max)?;
+			trace.event_with(BINARY_HAS_IJON_SET, &[], has_ijon_set)?;
+			trace.event_with(BINARY_HAS_IJON_HASHINT, &[], has_ijon_hashint)?;
+			trace.event_with(BINARY_HAS_IJON_MAP_SIZE, &[], has_ijon_map_size)?;
+			trace.event_with(BINARY_HAS_AFL_RUNTIME, &[], has_afl_runtime)?;
 
 			// Proof 5: Oracle Methods - Test actual oracle functionality
 			let oracle = trace.oracle();
 			let coverage = oracle.coverage_score();
-			trace.event_with(VerificationSpec::coverage_score, &[], coverage > 0)?;
+
+			trace.event_with(COVERAGE_SCORE, &[], coverage > 0)?;
 
 			let state_hash1 = oracle.track_state();
 			let state_hash2 = oracle.track_state();
-			trace.event_with(VerificationSpec::track_state_stable, &[], state_hash1 == state_hash2)?;
+
+			trace.event_with(TRACK_STATE_STABLE, &[], state_hash1 == state_hash2)?;
 
 			oracle.fuzz_from_bytes()?;
 			let coverage_after = oracle.coverage_score();
-			trace.event_with(VerificationSpec::fuzz_advances_coverage, &[], coverage_after >= coverage)?;
+
+			trace.event_with(FUZZ_ADVANCES_COVERAGE, &[], coverage_after >= coverage)?;
 
 			// Complete
-			trace.event(VerificationSpec::verification_complete)?;
+			trace.event(VERIFICATION_COMPLETE)?;
 
 			Ok(())
 		}

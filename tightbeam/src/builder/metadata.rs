@@ -205,6 +205,11 @@ mod tests {
 	use super::*;
 	use crate::testing::create_test_hash_info;
 
+	/// Fixture 2x2 zero matrix for builder chains.
+	fn fixture_matrix() -> MatrixDyn {
+		MatrixDyn::try_from(2u8).expect("2 is a valid matrix dimension")
+	}
+
 	macro_rules! test_metadata_builder {
 		($test_name:ident, $version:expr, $builder:expr) => {
 			#[test]
@@ -279,18 +284,13 @@ mod tests {
 			.with_integrity_info(create_test_hash_info())
 			.with_priority(MessagePriority::LowLatency)
 			.with_lifetime(3600)
-			.with_matrix(MatrixDyn::try_from(2u8).unwrap())
+			.with_matrix(fixture_matrix())
 	);
 
 	#[test]
 	fn test_metadata_builder_missing_required_fields() {
 		let result = MetadataBuilder::from(Version::V0).with_id("test-id").build();
-
-		assert!(result.is_err());
-		assert!(matches!(
-			result.unwrap_err(),
-			BuildError::InvalidMetadata(MetadataError::MissingOrder)
-		));
+		assert!(matches!(result, Err(BuildError::InvalidMetadata(MetadataError::MissingOrder))));
 	}
 
 	mod errors {

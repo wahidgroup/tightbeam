@@ -4,16 +4,29 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, SetupEnv};
 use tightbeam::transport::envelopes::{MuxEnvelope, MuxPingPackage};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError};
+use tightbeam::utils::urn::Urn;
 use tightbeam::Frame;
 
-use crate::transport::support::{await_ok, bind_encrypted_listener};
+use crate::transport::support::{await_ok, bind_encrypted_listener, mux_frame, mux_offer, record_spawned_event};
 
 use super::common::*;
+
+pub(crate) const CLIENT_PING_ACKED: Urn<'static> = Urn::new("test", "event:ping/client-ping-acked");
+pub(crate) const FOLLOWUP_ECHOES_AFTER_STRAY_ACK: Urn<'static> =
+	Urn::new("test", "event:ping/followup-echoes-after-stray-ack");
+pub(crate) const HANDLER_SAW_ONLY_STREAM: Urn<'static> = Urn::new("test", "event:ping/handler-saw-only-stream");
+pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> = Urn::new("test", "event:ping/inflight-drains-to-echo");
+pub(crate) const PING_REFUSED_DRAINING: Urn<'static> = Urn::new("test", "event:ping/ping-refused-draining");
+pub(crate) const PROBE_ANSWERED_WITH_MATCHING_ACK: Urn<'static> =
+	Urn::new("test", "event:ping/probe-answered-with-matching-ack");
+pub(crate) const SERVER_PING_ACKED: Urn<'static> = Urn::new("test", "event:ping/server-ping-acked");
+pub(crate) const STREAM_ECHOES_AFTER_PINGS: Urn<'static> = Urn::new("test", "event:ping/stream-echoes-after-pings");
 
 tb_assert_spec! {
 	pub MuxPingRoundtripSpec,
@@ -21,10 +34,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(client_ping_acked, exactly!(1), equals!(true)),
-			(server_ping_acked, exactly!(1), equals!(true)),
-			(stream_echoes_after_pings, exactly!(1), equals!(true)),
-			(handler_saw_only_stream, exactly!(1), equals!(true))
+			(CLIENT_PING_ACKED, exactly!(1), equals!(true)),
+			(SERVER_PING_ACKED, exactly!(1), equals!(true)),
+			(STREAM_ECHOES_AFTER_PINGS, exactly!(1), equals!(true)),
+			(HANDLER_SAW_ONLY_STREAM, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -40,7 +53,7 @@ tb_scenario! {
 		server: |SetupEnv { trace, context: ping }| async move {
 			let (listener, addr) = bind_encrypted_listener(&ping.materials).await?;
 			let task = tokio::spawn(async move {
-				let Ok((server, responder)) = accept_mux_server(listener, mux_offer(4)).await else {
+				let Ok((server, responder)) = accept_mux_server(listener, mux_offer(4), trace.share()).await else {
 					return;
 				};
 
@@ -49,28 +62,28 @@ tb_scenario! {
 					ping_ctx.handler_calls.fetch_add(1, Ordering::SeqCst);
 					core::future::ready(echo_response(&frame))
 				};
+
 				let _serve = tokio::spawn(responder.serve(handler));
 
 				let acked = server.handle.ping().await.is_ok();
-				trace
-					.event_with(MuxPingRoundtripSpec::server_ping_acked, &[], acked)
-					.expect("server_ping_acked must record");
+				record_spawned_event(&trace, SERVER_PING_ACKED, acked);
+
 				ping.server_ping_done.notify_one();
 			});
 			Ok((task, addr))
 		},
 		client: |ClientEnv { trace, context: ping, addr }| async move {
-			let client = connect_mux_client(addr, &ping.materials, 4).await?;
-			trace.event_with(MuxPingRoundtripSpec::client_ping_acked, &[], client.handle().ping().await.is_ok())?;
+			let client = connect_mux_client(addr, &ping.materials, 4, trace.share()).await?;
+			trace.event_with(CLIENT_PING_ACKED, &[], client.handle().ping().await.is_ok())?;
 
 			ping.server_ping_done.notified().await;
 
 			let frame = mux_frame("mux-ping-alive");
 			let echoed = client.handle().emit_on_stream(&frame).await?;
-			trace.event_with(MuxPingRoundtripSpec::stream_echoes_after_pings, &[], is_echo(echoed, &frame))?;
+			trace.event_with(STREAM_ECHOES_AFTER_PINGS, &[], is_echo(echoed, &frame))?;
 
 			trace.event_with(
-				MuxPingRoundtripSpec::handler_saw_only_stream,
+				HANDLER_SAW_ONLY_STREAM,
 				&[],
 				ping.handler_calls.load(Ordering::SeqCst) == 1,
 			)?;
@@ -86,8 +99,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(probe_answered_with_matching_ack, exactly!(1), equals!(true)),
-			(followup_echoes_after_stray_ack, exactly!(1), equals!(true))
+			(PROBE_ANSWERED_WITH_MATCHING_ACK, exactly!(1), equals!(true)),
+			(FOLLOWUP_ECHOES_AFTER_STRAY_ACK, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -99,7 +112,7 @@ tb_scenario! {
 	spec: MuxPingWireAckSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let mut link = establish_client_mux_server_raw(4).await?;
+			let mut link = establish_client_mux_server_raw(4, trace.share()).await?;
 
 			let probe = MuxPingPackage::new(false, 42);
 			link.server_writer.write_envelope(probe.into()).await?;
@@ -110,13 +123,13 @@ tb_scenario! {
 				TransportEnvelope::Mux(MuxEnvelope::Ping(package)) if package.ack() && package.opaque() == 42
 			);
 
-			trace.event_with(MuxPingWireAckSpec::probe_answered_with_matching_ack, &[], ack_ok)?;
+			trace.event_with(PROBE_ANSWERED_WITH_MATCHING_ACK, &[], ack_ok)?;
 
 			let stray_ack = MuxPingPackage::new(true, 999);
 			link.server_writer.write_envelope(stray_ack.into()).await?;
 
 			let followup_echoed = raw_echo_roundtrip(&mut link, &mux_frame("mux-ping-follow-up")).await?;
-			trace.event_with(MuxPingWireAckSpec::followup_echoes_after_stray_ack, &[], followup_echoed)?;
+			trace.event_with(FOLLOWUP_ECHOES_AFTER_STRAY_ACK, &[], followup_echoed)?;
 
 			Ok(())
 		}
@@ -129,8 +142,11 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(ping_refused_draining, exactly!(1), equals!(true)),
-			(inflight_drains_to_echo, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_SENT, exactly!(1)),
+			(events::MUX_EMIT_DRAINING, exactly!(1)),
+			(events::MUX_GOAWAY_RECV, exactly!(1)),
+			(PING_REFUSED_DRAINING, exactly!(1), equals!(true)),
+			(INFLIGHT_DRAINS_TO_ECHO, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -143,10 +159,10 @@ tb_scenario! {
 	environment ServiceClient {
 		context: GatedMuxContext::generate(),
 		server: |env| async move {
-			start_mux_server(&env.context.materials, 4, gated_echo(Arc::clone(&env.context))).await
+			start_mux_server(&env.context.materials, 4, gated_echo(Arc::clone(&env.context)), env.trace).await
 		},
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
-			let client = connect_mux_client(addr, &ctx.materials, 4).await?;
+			let client = connect_mux_client(addr, &ctx.materials, 4, trace.share()).await?;
 
 			let frame_inflight = mux_frame("mux-ping-inflight");
 			let inflight_task = spawn_emit(client.handle(), frame_inflight.to_owned());
@@ -155,7 +171,7 @@ tb_scenario! {
 			let shutdown_future = kick_shutdown(client.handle()).await;
 			let refused = client.handle().ping().await;
 			trace.event_with(
-				MuxPingDrainingSpec::ping_refused_draining,
+				PING_REFUSED_DRAINING,
 				&[],
 				matches!(refused, Err(TransportError::Draining)),
 			)?;
@@ -163,7 +179,7 @@ tb_scenario! {
 			ctx.release.notify_one();
 
 			let echoed = await_ok(inflight_task, "in-flight emit task must not panic").await?;
-			trace.event_with(MuxPingDrainingSpec::inflight_drains_to_echo, &[], is_echo(echoed, &frame_inflight))?;
+			trace.event_with(INFLIGHT_DRAINS_TO_ECHO, &[], is_echo(echoed, &frame_inflight))?;
 
 			shutdown_future.await?;
 			Ok(())

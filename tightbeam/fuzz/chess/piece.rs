@@ -1,3 +1,7 @@
+use tightbeam::utils::urn::Urn;
+
+use super::events;
+
 /// Chess piece representation
 ///
 /// Pieces are stored as u8 in the board (0-12):
@@ -115,15 +119,15 @@ impl PieceKind {
 		}
 	}
 
-	/// Get the event label for this piece kind
-	pub fn as_kind_label(&self) -> &'static str {
+	/// Get the event URN for this piece kind
+	pub fn as_kind_event(&self) -> Urn<'static> {
 		match self {
-			PieceKind::Pawn => "pawn_move",
-			PieceKind::Rook => "rook_move",
-			PieceKind::Knight => "knight_move",
-			PieceKind::Bishop => "bishop_move",
-			PieceKind::Queen => "queen_move",
-			PieceKind::King => "king_move",
+			PieceKind::Pawn => events::PAWN_MOVE,
+			PieceKind::Rook => events::ROOK_MOVE,
+			PieceKind::Knight => events::KNIGHT_MOVE,
+			PieceKind::Bishop => events::BISHOP_MOVE,
+			PieceKind::Queen => events::QUEEN_MOVE,
+			PieceKind::King => events::KING_MOVE,
 		}
 	}
 }
@@ -169,8 +173,8 @@ impl Piece {
 		}
 	}
 
-	/// Get the event label for this piece
-	pub fn as_kind_label(&self) -> &'static str {
-		self.kind.as_kind_label()
+	/// Get the event URN for this piece
+	pub fn as_kind_event(&self) -> Urn<'static> {
+		self.kind.as_kind_event()
 	}
 }

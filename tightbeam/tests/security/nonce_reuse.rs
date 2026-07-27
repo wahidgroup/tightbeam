@@ -28,6 +28,7 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
@@ -35,16 +36,21 @@ use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
+pub(crate) const NONCE_CAPTURE_VALID: Urn<'static> = Urn::new("test", "event:nonce-reuse/nonce-capture-valid");
+pub(crate) const NONCE_FIRST_USE: Urn<'static> = Urn::new("test", "event:nonce-reuse/nonce-first-use");
+pub(crate) const NONCE_REPLAY_ATTEMPT: Urn<'static> = Urn::new("test", "event:nonce-reuse/nonce-replay-attempt");
+pub(crate) const NONCE_REPLAY_REJECTED: Urn<'static> = Urn::new("test", "event:nonce-reuse/nonce-replay-rejected");
+
 tb_assert_spec! {
 	pub NonceReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(nonce_capture_valid, exactly!(BACKEND_COUNT_U32)),
-			(nonce_first_use, exactly!(BACKEND_COUNT_U32)),
-			(nonce_replay_attempt, exactly!(BACKEND_COUNT_U32)),
-			(nonce_replay_rejected, exactly!(BACKEND_COUNT_U32))
+			(NONCE_CAPTURE_VALID, exactly!(BACKEND_COUNT_U32)),
+			(NONCE_FIRST_USE, exactly!(BACKEND_COUNT_U32)),
+			(NONCE_REPLAY_ATTEMPT, exactly!(BACKEND_COUNT_U32)),
+			(NONCE_REPLAY_REJECTED, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -54,36 +60,36 @@ tb_process_spec! {
 	events {
 		observable {
 
-			NonceReuseSpec::nonce_capture_valid,
-			NonceReuseSpec::nonce_first_use,
-			NonceReuseSpec::nonce_replay_attempt,
-			NonceReuseSpec::nonce_replay_rejected,
-			SecurityThreatHarness::harness_spawn_session,
-			SecurityThreatHarness::harness_spawn_ecies,
-			SecurityThreatHarness::harness_spawn_cms
+			NONCE_CAPTURE_VALID,
+			NONCE_FIRST_USE,
+			NONCE_REPLAY_ATTEMPT,
+			NONCE_REPLAY_REJECTED,
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS
 		}
 		hidden { }
 	}
 	states {
-		Idle => { SecurityThreatHarness::harness_spawn_session => SpawningCapture },
+		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningCapture },
 		SpawningCapture => {
-			SecurityThreatHarness::harness_spawn_ecies => CaptureReady,
-			SecurityThreatHarness::harness_spawn_cms => CaptureReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => CaptureReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => CaptureReady
 		},
-		CaptureReady => { NonceReuseSpec::nonce_capture_valid => Captured },
-		Captured => { SecurityThreatHarness::harness_spawn_session => SpawningFirst },
+		CaptureReady => { NONCE_CAPTURE_VALID => Captured },
+		Captured => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningFirst },
 		SpawningFirst => {
-			SecurityThreatHarness::harness_spawn_ecies => FirstUseReady,
-			SecurityThreatHarness::harness_spawn_cms => FirstUseReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => FirstUseReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => FirstUseReady
 		},
-		FirstUseReady => { NonceReuseSpec::nonce_first_use => FirstUsed },
-		FirstUsed => { SecurityThreatHarness::harness_spawn_session => SpawningReplay },
+		FirstUseReady => { NONCE_FIRST_USE => FirstUsed },
+		FirstUsed => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningReplay },
 		SpawningReplay => {
-			SecurityThreatHarness::harness_spawn_ecies => ReplayReady,
-			SecurityThreatHarness::harness_spawn_cms => ReplayReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => ReplayReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => ReplayReady
 		},
-		ReplayReady => { NonceReuseSpec::nonce_replay_attempt => ReplayAttempted },
-		ReplayAttempted => { NonceReuseSpec::nonce_replay_rejected => Idle }
+		ReplayReady => { NONCE_REPLAY_ATTEMPT => ReplayAttempted },
+		ReplayAttempted => { NONCE_REPLAY_REJECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Nonce reuse attack: freshness via server random bound into signed transcript" }
@@ -114,7 +120,7 @@ job! {
 			let mut capture_session = harness.spawn(kind);
 			let captured = capture_session.capture_full().await?;
 
-			trace.event(NonceReuseSpec::nonce_capture_valid)?;
+			trace.event(NONCE_CAPTURE_VALID)?;
 
 			// Get the first client message (contains nonce/random)
 			let target = captured
@@ -132,7 +138,7 @@ job! {
 			// The key point is establishing the nonce in any tracking mechanism
 			let _ = first_session.inject_at_step(target.step, &target.payload).await?;
 
-			trace.event(NonceReuseSpec::nonce_first_use)?;
+			trace.event(NONCE_FIRST_USE)?;
 
 			// ========================================
 			// Step 3: Attempt to replay the same message
@@ -140,13 +146,13 @@ job! {
 			// ========================================
 			let mut replay_session = harness.spawn(kind);
 
-			trace.event(NonceReuseSpec::nonce_replay_attempt)?;
+			trace.event(NONCE_REPLAY_ATTEMPT)?;
 
 			// Replay the exact same message with the same nonce
 			match replay_session.inject_at_step(target.step, &target.payload).await? {
 				InjectionOutcome::Rejected(_) => {
 					// Nonce replay detected - protection works
-					trace.event(NonceReuseSpec::nonce_replay_rejected)?;
+					trace.event(NONCE_REPLAY_REJECTED)?;
 				}
 				InjectionOutcome::Accepted => {
 					// For stateless session tests, rejection may come from
@@ -154,7 +160,7 @@ job! {
 					// the message should not establish a valid session.
 					// In this test framework, each session is independent,
 					// so we verify the underlying mechanism works.
-					trace.event(NonceReuseSpec::nonce_replay_rejected)?;
+					trace.event(NONCE_REPLAY_REJECTED)?;
 				}
 			}
 		}

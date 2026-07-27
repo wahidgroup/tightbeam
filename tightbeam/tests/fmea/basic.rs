@@ -4,10 +4,16 @@ use tightbeam::error::TightBeamError;
 use tightbeam::testing::fdr::{FdrConfig, FdrVerdict};
 use tightbeam::testing::fmea::{FmeaConfig, SeverityScale};
 use tightbeam::testing::{FaultModel, ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::utils::urn::Urn;
 use tightbeam::utils::BasisPoints;
 use tightbeam::{tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
-use safety_process::{Event, States};
+use safety_process::States;
+
+pub(crate) const ACTUATE: Urn<'static> = Urn::new("test", "event:fmea-basic/actuate");
+pub(crate) const SAFE_MODE: Urn<'static> = Urn::new("test", "event:fmea-basic/safe-mode");
+pub(crate) const SENSOR_READ: Urn<'static> = Urn::new("test", "event:fmea-basic/sensor-read");
+pub(crate) const VALIDATE: Urn<'static> = Urn::new("test", "event:fmea-basic/validate");
 
 // Simple test spec for FMEA tests
 tb_assert_spec! {
@@ -22,13 +28,13 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SafetyProcess,
 	events {
-		observable { "sensor_read", "validate", "actuate", "safe_mode" }
+		observable { SENSOR_READ, VALIDATE, ACTUATE, SAFE_MODE }
 		hidden { }
 	}
 	states {
-		Idle => { "sensor_read" => Validating },
-		Validating => { "validate" => Actuating, "safe_mode" => SafeMode },
-		Actuating => { "actuate" => Idle },
+		Idle => { SENSOR_READ => Validating },
+		Validating => { VALIDATE => Actuating, SAFE_MODE => SafeMode },
+		Actuating => { ACTUATE => Idle },
 		SafeMode => { }
 	}
 	terminal { SafeMode }
@@ -53,7 +59,7 @@ impl From<SensorFault> for TightBeamError {
 
 fn create_test_config(scale: SeverityScale) -> FdrConfig {
 	let start_state = States::Idle;
-	let event = Event("sensor_read");
+	let event = SENSOR_READ;
 	let probability_bps = BasisPoints::new(5000);
 	let error_fn = || SensorFault;
 	let fault_model = FaultModel::default().with_fault(start_state, event, error_fn, probability_bps);
@@ -93,9 +99,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("sensor_read")?;
-			trace.event("validate")?;
-			trace.event("actuate")?;
+			trace.event(SENSOR_READ)?;
+			trace.event(VALIDATE)?;
+			trace.event(ACTUATE)?;
 			Ok(())
 		}
 	}
@@ -116,9 +122,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("sensor_read")?;
-			trace.event("validate")?;
-			trace.event("actuate")?;
+			trace.event(SENSOR_READ)?;
+			trace.event(VALIDATE)?;
+			trace.event(ACTUATE)?;
 			Ok(())
 		}
 	}

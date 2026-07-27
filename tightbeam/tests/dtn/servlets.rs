@@ -28,6 +28,13 @@ use tightbeam::{
 use crate::dtn::{
 	chain_processor::{ChainProcessor, ProcessResult},
 	clock::mission_time_ms,
+	events::{
+		EARTH_RELAY_FORWARD_ACK_TO_MC, EARTH_RELAY_FORWARD_TELEMETRY_TO_MC, EARTH_RELAY_FORWARD_TO_MARS,
+		EARTH_RELAY_RECEIVE_ACK_FROM_MARS, EARTH_RELAY_RECEIVE_FROM_MC, EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS,
+		MARS_RELAY_FORWARD_ACK_TO_EARTH, MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH, MARS_RELAY_FORWARD_TO_ROVER,
+		MARS_RELAY_RECEIVE_ACK_FROM_ROVER, MARS_RELAY_RECEIVE_FROM_EARTH, MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER,
+		ROVER_SEND_ACK,
+	},
 	fault_manager::FaultManager,
 	frame_builder::FrameBuilderHelper,
 	jobs::{
@@ -35,7 +42,7 @@ use crate::dtn::{
 		PrepareGapRecoveryBuild,
 	},
 	messages::{EarthCommand, FrameResponse, RelayMessage},
-	ultimate::DtnEventCountSpec,
+	ultimate::{gap_recovery_event, GapRecoveryStep},
 	workers::{
 		command_ack_handler::{CommandAckHandlerRequest, CommandAckHandlerWorker},
 		frame_request_handler::{FrameRequestAction, FrameRequestHandlerRequest, FrameRequestHandlerWorker},
@@ -108,7 +115,7 @@ trait DtnNode {
 		upstream_addr: TightBeamSocketAddr,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
-		trace.event(format!("{}_gap_detected", self.node_name()))?;
+		trace.event(gap_recovery_event(self.node_name(), GapRecoveryStep::GapDetected))?;
 
 		let ctx = Arc::new(GapRecoveryContext {
 			chain_processor: Arc::clone(self.chain_processor()),
@@ -126,7 +133,7 @@ trait DtnNode {
 			.and_then(FinalizeChainOutgoing::run)
 			.run()?;
 
-		trace.event(format!("{}_send_frame_request", self.node_name()))?;
+		trace.event(gap_recovery_event(self.node_name(), GapRecoveryStep::SendFrameRequest))?;
 
 		EmitFrameToNetwork::run((frame, upstream_addr, ctx)).await?;
 		Ok(())
@@ -434,8 +441,8 @@ servlet! {
 							// Regular message - route based on source
 							if from_mission_control {
 								// Forward to Mars Relay using cached client
-								trace.event(DtnEventCountSpec::earth_relay_receive_from_mc)?;
-								trace.event(DtnEventCountSpec::earth_relay_forward_to_mars)?;
+								trace.event(EARTH_RELAY_RECEIVE_FROM_MC)?;
+								trace.event(EARTH_RELAY_FORWARD_TO_MARS)?;
 
 								config.send_frame(
 									&config.mars_relay_pool,
@@ -450,11 +457,11 @@ servlet! {
 								// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
 								let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
 								if is_telemetry {
-									trace.event(DtnEventCountSpec::earth_relay_receive_telemetry_from_mars)?;
-									trace.event(DtnEventCountSpec::earth_relay_forward_telemetry_to_mc)?;
+									trace.event(EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS)?;
+									trace.event(EARTH_RELAY_FORWARD_TELEMETRY_TO_MC)?;
 								} else {
-									trace.event(DtnEventCountSpec::earth_relay_receive_ack_from_mars)?;
-									trace.event(DtnEventCountSpec::earth_relay_forward_ack_to_mc)?;
+									trace.event(EARTH_RELAY_RECEIVE_ACK_FROM_MARS)?;
+									trace.event(EARTH_RELAY_FORWARD_ACK_TO_MC)?;
 								}
 
 								// Get Mission Control address (wait if not set yet)
@@ -647,11 +654,11 @@ servlet! {
 					// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
 					let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
 					if is_telemetry {
-						trace.event(DtnEventCountSpec::mars_relay_receive_telemetry_from_rover)?;
-						trace.event(DtnEventCountSpec::mars_relay_forward_telemetry_to_earth)?;
+						trace.event(MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER)?;
+						trace.event(MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH)?;
 					} else {
-						trace.event(DtnEventCountSpec::mars_relay_receive_ack_from_rover)?;
-						trace.event(DtnEventCountSpec::mars_relay_forward_ack_to_earth)?;
+						trace.event(MARS_RELAY_RECEIVE_ACK_FROM_ROVER)?;
+						trace.event(MARS_RELAY_FORWARD_ACK_TO_EARTH)?;
 					}
 
 					// Get Earth Relay address (wait if not set yet)
@@ -669,8 +676,8 @@ servlet! {
 					Ok(Some(stateless_ack))
 				} else {
 					// Forward to Rover using cached client
-					trace.event(DtnEventCountSpec::mars_relay_receive_from_earth)?;
-					trace.event(DtnEventCountSpec::mars_relay_forward_to_rover)?;
+					trace.event(MARS_RELAY_RECEIVE_FROM_EARTH)?;
+					trace.event(MARS_RELAY_FORWARD_TO_ROVER)?;
 
 					let response = config.send_frame(&config.rover_pool, config.rover_addr, frame).await?;
 					if let Some(ack_frame) = response {
@@ -678,8 +685,8 @@ servlet! {
 						config.chain_processor.process_incoming(&ack_frame)?;
 
 						// Emit trace event for receiving ACK from Rover (stateful ACK for command)
-						trace.event(DtnEventCountSpec::mars_relay_receive_ack_from_rover)?;
-						trace.event(DtnEventCountSpec::mars_relay_forward_ack_to_earth)?;
+						trace.event(MARS_RELAY_RECEIVE_ACK_FROM_ROVER)?;
+						trace.event(MARS_RELAY_FORWARD_ACK_TO_EARTH)?;
 
 						// Forward ACK to Earth Relay using cached client
 						let earth_addr = wait_for_address(&config.earth_relay_addr).await?;
@@ -826,7 +833,7 @@ servlet! {
 					&config.shared_cipher,
 				)?;
 
-				trace.event(DtnEventCountSpec::rover_send_ack)?;
+				trace.event(ROVER_SEND_ACK)?;
 
 				Ok(Some(ack_frame))
 			},

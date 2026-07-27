@@ -3,6 +3,8 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+#[cfg(all(not(feature = "std"), feature = "transport-policy"))]
+use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(all(
@@ -15,7 +17,7 @@ use std::sync::Arc;
 
 use crate::asn1::Frame;
 use crate::der::Encode;
-use crate::policy::{GatePolicy, TransitStatus};
+use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelope};
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
@@ -57,6 +59,62 @@ mod policy {
 
 #[cfg(feature = "transport-policy")]
 use policy::*;
+
+#[cfg(all(feature = "transport-policy", feature = "instrument"))]
+use crate::instrumentation::events;
+#[cfg(all(feature = "transport-policy", feature = "instrument"))]
+use crate::trace::TraceCollector;
+
+/// Source of the connection audit trail for access-gate verdicts.
+///
+/// Every plane that evaluates a collector gate implements this (the TCP
+/// transports, the mux handle) so [`gate_inbound_frame`] can record the
+/// verdict wherever the gate runs.
+#[cfg(feature = "transport-policy")]
+pub trait GateAudit {
+	/// The connection audit trail, when instrumentation is attached.
+	#[cfg(feature = "instrument")]
+	fn audit_trace(&self) -> Option<&TraceCollector>;
+}
+
+/// Gate one inbound frame with the session's authenticated context and
+/// record the verdict into the connection audit trail (`GATE_ACCEPT` /
+/// `GATE_REJECT`).
+///
+/// The only gate-verdict emission point: the mux responder and the
+/// cleartext and encrypted single-flight collectors all route through
+/// here, so access decisions are observable evidence on every plane.
+///
+/// A gate returning [`TransitStatus::Unknown`] is a local bug, not a
+/// verdict: it is normalized to [`TransitStatus::Internal`] so the peer
+/// sees a server fault and the audit trail records a reject.
+#[cfg(feature = "transport-policy")]
+pub(crate) fn gate_inbound_frame<G, A>(gate: &G, audit: &A, frame: &Frame, session: &SessionContext) -> TransitStatus
+where
+	G: GatePolicy + ?Sized,
+	A: GateAudit + ?Sized,
+{
+	let status = match gate.evaluate(frame, session) {
+		TransitStatus::Unknown => TransitStatus::Internal,
+		verdict => verdict,
+	};
+
+	#[cfg(feature = "instrument")]
+	if let Some(trace) = audit.audit_trace() {
+		let event = if status == TransitStatus::Ok {
+			events::GATE_ACCEPT
+		} else {
+			events::GATE_REJECT
+		};
+
+		// Verdict evidence: the status names why, the peer SPKI names who.
+		trace.emit_event_with_evidence(event, status.as_str(), session.peer_public_key());
+	}
+	#[cfg(not(feature = "instrument"))]
+	let _ = audit;
+
+	status
+}
 
 /// Trait for transports that support custom response handlers
 pub trait ResponseHandler {
@@ -106,6 +164,27 @@ impl From<Frame> for Letter {
 	}
 }
 
+/// One restart-policy evaluation over a failed send: `Ok` carries the
+/// frame to resend, `Err` the terminal error. Errors without a frame
+/// cannot retry and pass through unchanged.
+#[cfg(feature = "transport-policy")]
+fn evaluate_retry<P>(policy: &P, error: TransportError, attempt: usize) -> Result<Box<Frame>, TransportError>
+where
+	P: RestartPolicy + ?Sized,
+{
+	match error {
+		TransportError::MessageNotSent(boxed_frame, ref failure) => {
+			// Pass the box to policy (no unboxing, single allocation)
+			match policy.evaluate(boxed_frame, failure, attempt) {
+				RetryAction::Retry(_) if attempt == usize::MAX => Err(TransportError::MaxRetriesExceeded),
+				RetryAction::Retry(retry_boxed_frame) => Ok(retry_boxed_frame),
+				RetryAction::NoRetry => Err(TransportError::OperationFailed(*failure)),
+			}
+		}
+		other_error => Err(other_error),
+	}
+}
+
 /// Base emitter functionality
 #[cfg(feature = "transport-policy")]
 pub trait MessageEmitter: MessageIO {
@@ -139,8 +218,11 @@ pub trait MessageEmitter: MessageIO {
 		let mut current_attempt = attempt.unwrap_or(0);
 
 		loop {
-			// Evaluate gate policy before sending
-			let status = self.to_emitter_gate_policy_ref().evaluate(letter.try_peek()?);
+			// Evaluate gate policy before sending. Emitter gates are
+			// client-side and connection-context-free: the empty context.
+			let status = self
+				.to_emitter_gate_policy_ref()
+				.evaluate(letter.try_peek()?, &SessionContext::default());
 			if status != TransitStatus::Ok {
 				return Err(TransportError::from(status));
 			}
@@ -152,31 +234,11 @@ pub trait MessageEmitter: MessageIO {
 			let (status, response, original_message) = match self.perform_send_receive(message_to_send).await {
 				Ok(result) => result,
 				Err(e) => {
-					// Error during send - check if we can extract frame and failure for retry
-					match e {
-						TransportError::MessageNotSent(boxed_frame, ref failure) => {
-							// Pass the box to policy (no unboxing, single allocation)
-							let action = self.to_restart_policy_ref().evaluate(boxed_frame, failure, current_attempt);
-							match action {
-								RetryAction::Retry(retry_boxed_frame) => {
-									if current_attempt == usize::MAX {
-										return Err(TransportError::MaxRetriesExceeded);
-									}
-									// Unbox to put back into Letter
-									letter.try_return_to_sender(*retry_boxed_frame)?;
-									current_attempt += 1;
-									continue;
-								}
-								RetryAction::NoRetry => {
-									return Err(TransportError::OperationFailed(*failure));
-								}
-							}
-						}
-						other_error => {
-							// Non-retriable error (doesn't have a frame)
-							return Err(other_error);
-						}
-					}
+					let frame = evaluate_retry(self.to_restart_policy_ref(), e, current_attempt)?;
+					// Unbox to put back into Letter
+					letter.try_return_to_sender(*frame)?;
+					current_attempt += 1;
+					continue;
 				}
 			};
 
@@ -189,7 +251,7 @@ pub trait MessageEmitter: MessageIO {
 						Err(error) => Err(error),
 					}
 				} else {
-					return Err(<TransportError as From<TransitStatus>>::from(status));
+					return Err(TransportError::from(status));
 				}
 			} else {
 				match &response {
@@ -200,26 +262,11 @@ pub trait MessageEmitter: MessageIO {
 
 			// Evaluate retry policy only on error
 			match result {
-				Err(TransportError::MessageNotSent(boxed_frame, ref failure)) => {
-					let action = self.to_restart_policy_ref().evaluate(boxed_frame, failure, current_attempt);
-					match action {
-						RetryAction::Retry(retry_boxed_frame) => {
-							if current_attempt == usize::MAX {
-								return Err(TransportError::MaxRetriesExceeded);
-							}
-							// Unbox to put back into Letter
-							letter.try_return_to_sender(*retry_boxed_frame)?;
-							current_attempt += 1;
-							continue;
-						}
-						RetryAction::NoRetry => {
-							return Err(TransportError::OperationFailed(*failure));
-						}
-					}
-				}
-				Err(other_error) => {
-					// Non-retriable error (doesn't have a frame)
-					return Err(other_error);
+				Err(error) => {
+					let frame = evaluate_retry(self.to_restart_policy_ref(), error, current_attempt)?;
+					// Unbox to put back into Letter
+					letter.try_return_to_sender(*frame)?;
+					current_attempt += 1;
 				}
 				Ok(_) => {
 					return Ok(response);
@@ -275,8 +322,8 @@ pub trait MessageEmitter: MessageIO {
 	}
 }
 
-/// Extract the application request frame from a lock-step envelope.
-fn lockstep_request_frame(envelope: TransportEnvelope) -> TransportResult<Arc<Frame>> {
+/// Extract the application request frame from a single-flight envelope.
+fn single_flight_frame(envelope: TransportEnvelope) -> TransportResult<Arc<Frame>> {
 	match envelope {
 		TransportEnvelope::Request(msg) => Ok(msg.message),
 		TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
@@ -287,9 +334,31 @@ fn lockstep_request_frame(envelope: TransportEnvelope) -> TransportResult<Arc<Fr
 	}
 }
 
+/// Write a single-flight response envelope, shared by both
+/// `MessageCollector` cfg twins. With `x509` the response wraps in a
+/// [`WireEnvelope`] for protocol compatibility.
+async fn send_single_flight_response<T>(
+	transport: &mut T,
+	status: TransitStatus,
+	message: Option<Frame>,
+) -> TransportResult<()>
+where
+	T: MessageIO + ?Sized,
+{
+	let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
+	let response_envelope = TransportEnvelope::from(response_pkg);
+
+	#[cfg(feature = "x509")]
+	let response_bytes = WireEnvelope::Cleartext(response_envelope).to_der()?;
+	#[cfg(not(feature = "x509"))]
+	let response_bytes = T::encode_envelope(&response_envelope)?;
+
+	transport.write_envelope(&response_bytes).await
+}
+
 /// Message collector trait - receives TightBeam messages
 #[cfg(feature = "transport-policy")]
-pub trait MessageCollector: MessageIO {
+pub trait MessageCollector: MessageIO + GateAudit {
 	type CollectorGate: GatePolicy + ?Sized;
 
 	/// Get the collector gate policy instance
@@ -301,16 +370,8 @@ pub trait MessageCollector: MessageIO {
 	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
 		// Read and decode the envelope (can be overridden for encryption)
 		let decoded_envelope = self.read_decoded_envelope().await?;
-		let request = lockstep_request_frame(decoded_envelope)?;
-
-		// Evaluate gate policy
-		let status = self.collector_gate().evaluate(&request);
-		if status == TransitStatus::Unknown {
-			// Invalid status from gate
-			return Err(TransportError::InvalidReply);
-		}
-
-		Ok((request, status))
+		// Cleartext connections authenticate nothing: empty context.
+		gate_collected_envelope(self, decoded_envelope, &SessionContext::default())
 	}
 
 	/// Try to collect next message without blocking on closed connections
@@ -325,39 +386,15 @@ pub trait MessageCollector: MessageIO {
 			None => return Ok(None), // Connection closed gracefully
 		};
 
-		let request = lockstep_request_frame(decoded_envelope)?;
-
-		// Evaluate gate policy
-		let status = self.collector_gate().evaluate(&request);
-		if status == TransitStatus::Unknown {
-			// Invalid status from gate
-			return Err(TransportError::InvalidReply);
-		}
-
-		Ok(Some((request, status)))
+		// Cleartext connections authenticate nothing: empty context.
+		let gated = gate_collected_envelope(self, decoded_envelope, &SessionContext::default())?;
+		Ok(Some(gated))
 	}
 
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
-		let response_envelope = TransportEnvelope::from(response_pkg);
-
-		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
-		#[cfg(feature = "x509")]
-		{
-			let wire_envelope = WireEnvelope::Cleartext(response_envelope);
-			let wire_bytes = wire_envelope.to_der()?;
-			self.write_envelope(&wire_bytes).await?;
-		}
-
-		#[cfg(not(feature = "x509"))]
-		{
-			let response_bytes = Self::encode_envelope(&response_envelope)?;
-			self.write_envelope(&response_bytes).await?;
-		}
-
-		Ok(())
+		send_single_flight_response(self, status, message).await
 	}
 
 	/// Handle incoming request: collect message, process it, and send response
@@ -403,7 +440,10 @@ pub trait MessageCollector: MessageIO {
 		loop {
 			match collect_step(self).await? {
 				CollectStep::Handshake(handshake_bytes) => self.perform_server_handshake(&handshake_bytes).await?,
-				CollectStep::Envelope(envelope) => return gate_collected_envelope(self.collector_gate(), envelope),
+				CollectStep::Envelope(envelope) => {
+					let session = SessionContext::capture(self);
+					return gate_collected_envelope(self, envelope, &session);
+				}
 			}
 		}
 	}
@@ -430,7 +470,10 @@ pub trait MessageCollector: MessageIO {
 		loop {
 			match collect_step(self).await? {
 				CollectStep::Handshake(handshake_bytes) => self.perform_server_handshake(&handshake_bytes).await?,
-				CollectStep::Envelope(envelope) => return gate_collected_envelope(self.collector_gate(), envelope),
+				CollectStep::Envelope(envelope) => {
+					let session = SessionContext::capture(self);
+					return gate_collected_envelope(self, envelope, &session);
+				}
 			}
 		}
 	}
@@ -526,21 +569,20 @@ where
 	}
 }
 
-/// Extract the application request from a collected envelope and gate it.
-#[cfg(all(
-	feature = "transport-policy",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-fn gate_collected_envelope<G>(gate: &G, envelope: TransportEnvelope) -> TransportResult<(Arc<Frame>, TransitStatus)>
+/// Extract the application request from a collected envelope and gate it
+/// with the session's peer context, recording the verdict through
+/// [`gate_inbound_frame`].
+#[cfg(feature = "transport-policy")]
+fn gate_collected_envelope<T>(
+	transport: &T,
+	envelope: TransportEnvelope,
+	session: &SessionContext,
+) -> TransportResult<(Arc<Frame>, TransitStatus)>
 where
-	G: GatePolicy + ?Sized,
+	T: MessageCollector + ?Sized,
 {
-	let request = lockstep_request_frame(envelope)?;
-
-	let status = gate.evaluate(&request);
-	if status == TransitStatus::Unknown {
-		return Err(TransportError::InvalidReply);
-	}
+	let request = single_flight_frame(envelope)?;
+	let status = gate_inbound_frame(transport.collector_gate(), transport, &request, session);
 
 	Ok((request, status))
 }
@@ -551,19 +593,8 @@ pub trait MessageCollector: MessageIO {
 	/// Returns the message (status is always Ok without policies)
 	#[allow(async_fn_in_trait)]
 	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
-		// Read the envelope
 		let request_envelope = self.read_decoded_envelope().await?;
-		// Extract message from request
-		let request = match request_envelope {
-			TransportEnvelope::Request(msg) => msg.message,
-			TransportEnvelope::Response(_) => {
-				return Err(TransportError::InvalidMessage);
-			}
-			#[cfg(any(feature = "x509", feature = "transport-multiplex"))]
-			_ => {
-				return Err(TransportError::InvalidMessage);
-			}
-		};
+		let request = single_flight_frame(request_envelope)?;
 
 		Ok((request, TransitStatus::Ok))
 	}
@@ -580,41 +611,14 @@ pub trait MessageCollector: MessageIO {
 			None => return Ok(None), // Connection closed gracefully
 		};
 
-		// Extract message from request
-		let request = match request_envelope {
-			TransportEnvelope::Request(msg) => msg.message,
-			TransportEnvelope::Response(_) => {
-				return Err(TransportError::InvalidMessage);
-			}
-			#[cfg(any(feature = "x509", feature = "transport-multiplex"))]
-			_ => {
-				return Err(TransportError::InvalidMessage);
-			}
-		};
-
+		let request = single_flight_frame(request_envelope)?;
 		Ok(Some((request, TransitStatus::Ok)))
 	}
 
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
-		let response_envelope = TransportEnvelope::from(response_pkg);
-
-		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
-		#[cfg(feature = "x509")]
-		{
-			let wire_envelope = WireEnvelope::Cleartext(response_envelope);
-			let wire_bytes = wire_envelope.to_der()?;
-			self.write_envelope(&wire_bytes).await?;
-		}
-
-		#[cfg(not(feature = "x509"))]
-		{
-			self.write_envelope(&response_envelope.to_der()?).await?;
-		}
-
-		Ok(())
+		send_single_flight_response(self, status, message).await
 	}
 
 	/// Handle incoming request: collect message, process it, and send response
@@ -655,3 +659,47 @@ pub trait Transport: MessageEmitter + MessageCollector {}
 
 #[cfg(not(feature = "transport-policy"))]
 impl<T> Transport for T where T: MessageEmitter + MessageCollector {}
+
+#[cfg(all(test, feature = "transport-policy", feature = "instrument", feature = "testing"))]
+mod tests {
+	use super::*;
+	use crate::instrumentation::events;
+	use crate::policy::GatePolicy;
+	use crate::testing::create_v0_tightbeam;
+	use crate::trace::TraceCollector;
+	use crate::TightBeamError;
+
+	struct DenyGate;
+
+	impl GatePolicy for DenyGate {
+		fn evaluate(&self, _: &Frame, _: &SessionContext) -> TransitStatus {
+			TransitStatus::PermissionDenied
+		}
+	}
+
+	struct AuditProbe(TraceCollector);
+
+	impl GateAudit for AuditProbe {
+		fn audit_trace(&self) -> Option<&TraceCollector> {
+			Some(&self.0)
+		}
+	}
+
+	#[test]
+	fn gate_verdict_records_reason_and_time() -> Result<(), TightBeamError> {
+		let audit = AuditProbe(TraceCollector::new());
+		let frame = create_v0_tightbeam(Some("gated"), None);
+
+		let status = gate_inbound_frame(&DenyGate, &audit, &frame, &SessionContext::default());
+		assert_eq!(status, TransitStatus::PermissionDenied);
+
+		let recorded = audit.0.drain_events();
+		let reject = recorded
+			.iter()
+			.find(|event| event.urn == events::GATE_REJECT)
+			.ok_or(TightBeamError::MissingResponse)?;
+		assert_eq!(reject.label.as_deref(), Some("PermissionDenied"));
+		assert!(reject.timestamp_ns.is_some());
+		Ok(())
+	}
+}

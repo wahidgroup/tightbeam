@@ -91,6 +91,22 @@
 //! built on ASN.1 DER encoding.
 
 #![deny(unsafe_code)]
+// Zero-panic: raw `unwrap()` is banned everywhere, tests included. Test
+// helpers state their invariant through `expect`, test cases propagate
+// with `?`. The remaining panic paths are banned in production code, while
+// tests are exempt, and the `testing` fixture surface carries its own
+// scoped allowance (see `src/testing/mod.rs`).
+#![deny(clippy::unwrap_used)]
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::expect_used,
+		clippy::panic,
+		clippy::unreachable,
+		clippy::todo,
+		clippy::unimplemented
+	)
+)]
 #![cfg_attr(test, allow(clippy::clone_on_ref_ptr))]
 #![cfg_attr(not(feature = "std"), no_std)]
 

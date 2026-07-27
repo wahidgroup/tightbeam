@@ -295,24 +295,86 @@ mod receipt_fixtures {
 ))]
 pub use receipt_fixtures::*;
 
+/// Baseline mutually authenticated CMS pair shared by the loopback,
+/// receipt, and security threat suites: each layers its own offers,
+/// hooks, or policies on top instead of re-wiring the identities.
+#[cfg(feature = "transport-cms")]
+mod cms_pair {
+	use std::sync::Arc;
+
+	use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+	use tightbeam::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
+	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use tightbeam::crypto::x509::policy::CertificateValidation;
+	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::transport::handshake::negotiation::SecurityOffer;
+	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
+	use tightbeam::x509::Certificate;
+	use tightbeam::TightBeamError;
+
+	use super::{pinning_trust_store, random_signing_key, ServerMaterials};
+
+	/// Mutually authenticated CMS client/server pair over the fixture
+	/// server identity, plus the fresh client certificate the server
+	/// validates (for suites that also present it client-side).
+	pub struct CmsHandshakePair {
+		pub client: CmsHandshakeClient<DefaultCryptoProvider>,
+		pub server: CmsHandshakeServer<DefaultCryptoProvider>,
+		pub client_certificate: Arc<Certificate>,
+	}
+
+	/// Build the pair: the client offers `client_profiles` and pins the
+	/// server certificate; the server supports `server_profiles`, runs
+	/// `validators` against the fresh client certificate, and holds that
+	/// certificate for mutual authentication.
+	pub fn cms_handshake_pair(
+		materials: &ServerMaterials,
+		client_profiles: Vec<SecurityProfileDesc>,
+		server_profiles: Vec<SecurityProfileDesc>,
+		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	) -> Result<CmsHandshakePair, TightBeamError> {
+		let client_signing = random_signing_key();
+		let client_certificate = Arc::new(create_test_certificate(&client_signing));
+		let signing_key = Secp256k1SigningKey::from(client_signing);
+		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let trust_store = pinning_trust_store(&materials.certificate)?;
+
+		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
+			DefaultCryptoProvider::default(),
+			client_provider,
+			Arc::clone(&materials.certificate),
+		)
+		.with_security_offer(SecurityOffer::new(client_profiles))
+		.with_trust_store(trust_store);
+
+		let mut server =
+			CmsHandshakeServer::<DefaultCryptoProvider>::new(Arc::clone(&materials.key_provider), validators)
+				.with_supported_profiles(server_profiles);
+		server.set_client_certificate((*client_certificate).to_owned())?;
+
+		Ok(CmsHandshakePair { client, server, client_certificate })
+	}
+}
+
+// Consumers (loopback, receipt fixtures, security threats) sit behind
+// wider feature gates, so lean combos compile the fixture unused.
+#[allow(unused_imports)]
+#[cfg(feature = "transport-cms")]
+pub use cms_pair::*;
+
 /// Manual-drive CMS client/server pair fixture for receipt scenarios.
 #[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
 mod cms_fixtures {
 	use std::sync::Arc;
 
-	use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 	use tightbeam::crypto::profiles::DefaultCryptoProvider;
-	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use tightbeam::testing::utils::{create_test_certificate, create_test_signing_key};
-	use tightbeam::transport::handshake::negotiation::{
-		MuxBudgets, SecurityOffer, TransportAuthorizer, TransportOffer,
-	};
+	use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportAuthorizer, TransportOffer};
 	use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 	use tightbeam::TightBeamError;
 
-	use super::{default_security_profile, pinning_trust_store, ServerMaterials};
+	use super::{cms_handshake_pair, default_security_profile, ServerMaterials};
 
 	/// Hooks installed on a [`cms_mutual_budget_pair`] fixture.
 	#[derive(Default)]
@@ -338,41 +400,25 @@ mod cms_fixtures {
 	) -> Result<CmsSessionPair, TightBeamError> {
 		let profile = default_security_profile();
 		let offer = TransportOffer::mux(4).with_budgets(request);
+		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
 
-		let client_signing = create_test_signing_key();
-		let client_cert = Arc::new(create_test_certificate(&client_signing));
-		let signing_key = Secp256k1SigningKey::from(client_signing);
-		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-		let trust_store = pinning_trust_store(&materials.certificate)?;
+		let pair = cms_handshake_pair(materials, vec![profile], vec![profile], Some(validators))?;
 
-		let mut client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
-			DefaultCryptoProvider::default(),
-			client_provider,
-			Arc::clone(&materials.certificate),
-		)
-		.with_security_offer(SecurityOffer::new(vec![profile]))
-		.with_trust_store(trust_store)
-		.with_client_certificate(Arc::clone(&client_cert))
-		.with_transport_offer(offer.to_owned());
-
+		let mut client = pair
+			.client
+			.with_client_certificate(Arc::clone(&pair.client_certificate))
+			.with_transport_offer(offer.to_owned());
 		if let Some(approver) = hooks.approver {
 			client = client.with_receipt_approver(approver);
 		}
 
-		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
-		let mut server =
-			CmsHandshakeServer::<DefaultCryptoProvider>::new(Arc::clone(&materials.key_provider), Some(validators))
-				.with_supported_profiles(vec![profile])
-				.with_transport_config(offer);
-
+		let mut server = pair.server.with_transport_config(offer);
 		if let Some(authorizer) = hooks.authorizer {
 			server = server.with_transport_authorizer(authorizer);
 		}
 		if let Some(observer) = hooks.observer {
 			server = server.with_session_observer(observer);
 		}
-
-		server.set_client_certificate((*client_cert).to_owned())?;
 
 		Ok(CmsSessionPair { client, server })
 	}

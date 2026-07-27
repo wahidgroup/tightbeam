@@ -93,7 +93,6 @@ impl LivelockChecker {
 
 		// Find SCCs using Tarjan's algorithm
 		let sccs = Self::tarjan_scc(&hidden_graph, process.initial);
-
 		// Check if any SCC has size > 1 and is reachable only via hidden events
 		sccs.into_iter()
 			.find(|scc| scc.len() > 1 && Self::is_hidden_cycle(scc, &hidden_graph, process))
@@ -294,15 +293,15 @@ impl From<NonDeterminismError> for CompositionError {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::specs::csp::{Process, State};
+	use crate::testing::specs::csp::{Event, Process, State};
 
 	fn deadlock_process() -> Process {
 		Process::builder("Deadlock")
 			.initial_state(State("s0"))
 			.add_state(State("s0"))
 			.add_state(State("s1"))
-			.add_observable("a")
-			.add_transition(State("s0"), "a", State("s1"))
+			.add_observable(Event("a"))
+			.add_transition(State("s0"), Event("a"), State("s1"))
 			.build()
 			.expect("Failed to build process")
 	}
@@ -312,8 +311,8 @@ mod tests {
 			.initial_state(State("s0"))
 			.add_state(State("s0"))
 			.add_state(State("s1"))
-			.add_observable("a")
-			.add_transition(State("s0"), "a", State("s1"))
+			.add_observable(Event("a"))
+			.add_transition(State("s0"), Event("a"), State("s1"))
 			.add_terminal(State("s1"))
 			.build()
 			.expect("Failed to build process")
@@ -324,8 +323,8 @@ mod tests {
 			.initial_state(State("s0"))
 			.add_state(State("s0"))
 			.add_state(State("s1"))
-			.add_observable("a")
-			.add_transition(State("s0"), "a", State("s1"))
+			.add_observable(Event("a"))
+			.add_transition(State("s0"), Event("a"), State("s1"))
 			.add_terminal(State("s1"))
 			.build()
 			.expect("Failed to build process")

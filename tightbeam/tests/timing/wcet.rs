@@ -14,18 +14,22 @@ use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
 use tightbeam::trace::TraceConfig;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet, TightBeamError};
 
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const PROCESS: Urn<'static> = Urn::new("test", "event:wcet/process");
+
 tb_process_spec! {
 	pub SimpleWcetProcess,
 	events {
-		observable { "process" }
+		observable { PROCESS }
 		hidden { }
 	}
 	states {
-		S0 => { "process" => S1 }
+		S0 => { PROCESS => S1 }
 	}
 	terminal { S1 }
 	timing {
-		wcet: { "process" => wcet!(Duration::from_millis(10)) }
+		wcet: { PROCESS => wcet!(Duration::from_millis(10)) }
 	}
 }
 
@@ -35,7 +39,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(process, exactly!(1))
+			(PROCESS, exactly!(1))
 		]
 	},
 }
@@ -86,7 +90,6 @@ tb_scenario! {
 
 				// Verify timing constraints against trace
 				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
-
 				// Verify no violations (within constraint: 5ms < 10ms)
 				assert!(timing_result.passed, "Timing verification should pass for duration within constraint. Violations: {:?}", timing_result.wcet_violations);
 				assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected");
@@ -98,7 +101,7 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Emit timing event with duration within WCET constraint (5ms < 10ms)
-			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(5_000_000));
+			trace.event(PROCESS)?.with_timing(Duration::from_nanos(5_000_000));
 			Ok(())
 		}
 	}
@@ -131,7 +134,6 @@ tb_scenario! {
 
 				// Verify timing constraints against trace
 				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
-
 				// Verify no violations (at limit: 10ms == 10ms, should pass)
 				assert!(timing_result.passed, "Timing verification should pass for duration at constraint limit");
 				assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected at limit");
@@ -142,7 +144,7 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(10_000_000));
+			trace.event(PROCESS)?.with_timing(Duration::from_nanos(10_000_000));
 			Ok(())
 		}
 	}
@@ -172,12 +174,14 @@ tb_scenario! {
 					.timing_constraints
 					.as_ref()
 					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
+
 				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
 				assert!(!timing_result.passed, "Timing verification should fail for duration exceeding constraint. Result: {timing_result:?}");
 				assert!(!timing_result.wcet_violations.is_empty(), "WCET violations should be detected");
 				assert_eq!(timing_result.wcet_violations.len(), 1, "Exactly one WCET violation expected");
+
 				let violation = &timing_result.wcet_violations[0];
-				assert_eq!(violation.event.0, "process");
+				assert_eq!(violation.event.0, PROCESS.to_string());
 				assert_eq!(violation.wcet_ns, 10_000_000);
 				assert_eq!(violation.observed_ns, 15_000_000);
 				Ok(())
@@ -187,7 +191,7 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(15_000_000));
+			trace.event(PROCESS)?.with_timing(Duration::from_nanos(15_000_000));
 			Ok(())
 		}
 	}

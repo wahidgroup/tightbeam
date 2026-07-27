@@ -160,6 +160,14 @@ mod tests {
 		use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 		use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
 
+		/// Unwrap the KARI variant a [`TightBeamKariBuilder`] must produce.
+		fn open_kari(recipient_info: RecipientInfo) -> KeyAgreeRecipientInfo {
+			match recipient_info {
+				RecipientInfo::Kari(kari) => kari,
+				other => panic!("builder must produce a Kari recipient, got {other:?}"),
+			}
+		}
+
 		#[test]
 		fn test_full_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 			// Generate sender and recipient key-pairs
@@ -200,13 +208,8 @@ mod tests {
 				.with_ukm(ukm)
 				.with_key_enc_alg(key_enc_alg);
 
-			let recipient_info = builder.build(&original_cek).map_err(|e| format!("build failed: {e:?}"))?;
-
-			// Extract KARI from RecipientInfo
-			let kari = match recipient_info {
-				RecipientInfo::Kari(k) => k,
-				_ => panic!("Expected Kari variant"),
-			};
+			let recipient_info = builder.build(&original_cek).map_err(HandshakeError::CmsBuilderError)?;
+			let kari = open_kari(recipient_info);
 
 			// RECIPIENT SIDE: Process KARI
 			let recipient = TightBeamKariRecipient::with_defaults(recipient_key);
@@ -254,12 +257,8 @@ mod tests {
 				.with_ukm(ukm)
 				.with_key_enc_alg(key_enc_alg);
 
-			let recipient_info = builder.build(&original_cek).map_err(|e| format!("build failed: {e:?}"))?;
-
-			let kari = match recipient_info {
-				RecipientInfo::Kari(k) => k,
-				_ => panic!("Expected Kari variant"),
-			};
+			let recipient_info = builder.build(&original_cek).map_err(HandshakeError::CmsBuilderError)?;
+			let kari = open_kari(recipient_info);
 
 			// Try to process with wrong recipient key - should fail
 			let wrong_recipient = TightBeamKariRecipient::with_defaults(wrong_recipient_key);

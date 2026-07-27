@@ -1,13 +1,34 @@
 #[macro_export]
 macro_rules! policy {
 	() => {};
+	(GatePolicy: $name:ident | $frame:ident, $session:ident | { $($body:tt)* } $($rest:tt)*) => {
+		#[derive(Default)]
+		pub struct $name;
+
+		impl $crate::policy::GatePolicy for $name {
+			#[allow(unused_variables)]
+			fn evaluate(
+				&self,
+				$frame: &$crate::Frame,
+				$session: &$crate::policy::SessionContext,
+			) -> $crate::policy::TransitStatus {
+				$($body)*
+			}
+		}
+
+		$crate::policy! { $($rest)* }
+	};
 	(GatePolicy: $name:ident | $arg:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
 		pub struct $name;
 
 		impl $crate::policy::GatePolicy for $name {
 			#[allow(unused_variables)]
-			fn evaluate(&self, $arg: &$crate::Frame) -> $crate::policy::TransitStatus {
+			fn evaluate(
+				&self,
+				$arg: &$crate::Frame,
+				_session: &$crate::policy::SessionContext,
+			) -> $crate::policy::TransitStatus {
 				$($body)*
 			}
 		}
@@ -20,7 +41,11 @@ macro_rules! policy {
 
 		impl $crate::policy::GatePolicy for $name {
 			#[allow(unused_variables)]
-			fn evaluate(&self, frame: &$crate::Frame) -> $crate::policy::TransitStatus {
+			fn evaluate(
+				&self,
+				frame: &$crate::Frame,
+				_session: &$crate::policy::SessionContext,
+			) -> $crate::policy::TransitStatus {
 				$($body)*
 			}
 		}
@@ -112,7 +137,7 @@ mod tests {
 	#![allow(unused_variables)]
 
 	use crate::der::Sequence;
-	use crate::policy::{GatePolicy, ReceptorPolicy, TransitStatus};
+	use crate::policy::{GatePolicy, ReceptorPolicy, SessionContext, TransitStatus};
 	use crate::transport::policy::RetryAction;
 	use crate::Beamable;
 
@@ -129,6 +154,15 @@ mod tests {
 		}
 		GatePolicy: TestGateAccept |_frame| {
 			TransitStatus::Ok
+		}
+		// Session-aware arm: identity gates key on the connection's
+		// authenticated peer context.
+		GatePolicy: TestGateSessionAware |_frame, session| {
+			if session.peer_certificate().is_some() {
+				TransitStatus::Ok
+			} else {
+				TransitStatus::Unauthenticated
+			}
 		}
 		// Implicit-argument arms: macro hygiene hides the generated binding
 		// from the caller's body, so these arms serve input-independent
@@ -157,19 +191,29 @@ mod tests {
 		}
 	}
 
-	#[allow(dead_code)]
-	impl TestGateAccept {}
-
-	#[allow(dead_code)]
-	impl TestRestart {}
-
 	#[test]
 	fn test_gate_policy() -> Result<(), crate::TightBeamError> {
-		let gate = TestGateBusy;
 		let frame = compose! {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
-		assert_eq!(gate.evaluate(&frame), TransitStatus::ResourceExhausted);
+		assert_eq!(
+			TestGateBusy.evaluate(&frame, &SessionContext::default()),
+			TransitStatus::ResourceExhausted
+		);
+		assert_eq!(TestGateAccept.evaluate(&frame, &SessionContext::default()), TransitStatus::Ok);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_session_aware_gate_arm() -> Result<(), crate::TightBeamError> {
+		let frame = compose! {
+			V0: id: b"test", message: DummyMessage { value: 42 }
+		}?;
+		assert_eq!(
+			TestGateSessionAware.evaluate(&frame, &SessionContext::default()),
+			TransitStatus::Unauthenticated
+		);
 
 		Ok(())
 	}
@@ -186,7 +230,10 @@ mod tests {
 		let frame = compose! {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
-		assert_eq!(TestGateImplicitArg.evaluate(&frame), TransitStatus::Ok);
+		assert_eq!(
+			TestGateImplicitArg.evaluate(&frame, &SessionContext::default()),
+			TransitStatus::Ok
+		);
 		assert_eq!(TestReceptorImplicitArg.evaluate(&DummyMessage { value: 42 }), TransitStatus::Ok);
 
 		Ok(())

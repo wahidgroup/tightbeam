@@ -26,12 +26,17 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
 use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
+
+pub(crate) const DOS_GENERATE_OVERSIZED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-generate-oversized");
+pub(crate) const DOS_INJECT_OVERSIZED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-inject-oversized");
+pub(crate) const DOS_OVERSIZED_REJECTED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-oversized-rejected");
 
 /// Maximum handshake message size (16 KiB) as defined in transport layer.
 const HANDSHAKE_MAX_SIZE: usize = 16 * 1024;
@@ -42,9 +47,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(dos_generate_oversized, exactly!(BACKEND_COUNT_U32)),
-			(dos_inject_oversized, exactly!(BACKEND_COUNT_U32)),
-			(dos_oversized_rejected, exactly!(BACKEND_COUNT_U32))
+			(DOS_GENERATE_OVERSIZED, exactly!(BACKEND_COUNT_U32)),
+			(DOS_INJECT_OVERSIZED, exactly!(BACKEND_COUNT_U32)),
+			(DOS_OVERSIZED_REJECTED, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -54,24 +59,24 @@ tb_process_spec! {
 	events {
 		observable {
 
-			DosAttackSpec::dos_generate_oversized,
-			DosAttackSpec::dos_inject_oversized,
-			DosAttackSpec::dos_oversized_rejected,
-			SecurityThreatHarness::harness_spawn_session,
-			SecurityThreatHarness::harness_spawn_ecies,
-			SecurityThreatHarness::harness_spawn_cms
+			DOS_GENERATE_OVERSIZED,
+			DOS_INJECT_OVERSIZED,
+			DOS_OVERSIZED_REJECTED,
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS
 		}
 		hidden { }
 	}
 	states {
-		Idle => { DosAttackSpec::dos_generate_oversized => OversizedReady },
-		OversizedReady => { SecurityThreatHarness::harness_spawn_session => Spawning },
+		Idle => { DOS_GENERATE_OVERSIZED => OversizedReady },
+		OversizedReady => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
 		Spawning => {
-			SecurityThreatHarness::harness_spawn_ecies => SessionReady,
-			SecurityThreatHarness::harness_spawn_cms => SessionReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => SessionReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => SessionReady
 		},
-		SessionReady => { DosAttackSpec::dos_inject_oversized => Injected },
-		Injected => { DosAttackSpec::dos_oversized_rejected => Idle }
+		SessionReady => { DOS_INJECT_OVERSIZED => Injected },
+		Injected => { DOS_OVERSIZED_REJECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "DoS attack: oversized handshake message rejection" }
@@ -102,21 +107,21 @@ job! {
 			// Create a message that exceeds the 16 KiB limit
 			let oversized_payload = vec![0xDE; HANDSHAKE_MAX_SIZE + 1];
 
-			trace.event(DosAttackSpec::dos_generate_oversized)?;
+			trace.event(DOS_GENERATE_OVERSIZED)?;
 
 			// ========================================
 			// Step 2: Attempt to inject oversized message
 			// ========================================
 			let mut session = harness.spawn(kind);
 
-			trace.event(DosAttackSpec::dos_inject_oversized)?;
+			trace.event(DOS_INJECT_OVERSIZED)?;
 
 			// Inject at step 0 (ClientHello for ECIES, KeyExchange for CMS)
 			// The oversized message should be rejected
 			match session.inject_at_step(0, &oversized_payload).await? {
 				InjectionOutcome::Rejected(_) => {
 					// Oversized message rejected - DoS protection works
-					trace.event(DosAttackSpec::dos_oversized_rejected)?;
+					trace.event(DOS_OVERSIZED_REJECTED)?;
 				}
 				InjectionOutcome::Accepted => {
 					// Should not happen - oversized message should be rejected

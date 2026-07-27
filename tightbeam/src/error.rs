@@ -356,7 +356,7 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("AEAD counter nonce space exhausted"))]
 	NonceExhausted,
 
-	/// Send-direction AEAD record limit reached (RFC 8446 § 5.5)
+	/// Send-direction AEAD record limit reached (RFC 9846 § 5.5)
 	#[cfg(feature = "aead")]
 	#[cfg_attr(
 		feature = "derive",

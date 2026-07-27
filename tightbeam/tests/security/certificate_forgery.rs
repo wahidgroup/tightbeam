@@ -31,10 +31,17 @@ use tightbeam::{
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer},
+	utils::urn::Urn,
 	TightBeamError,
 };
 
 use crate::security::common::{default_security_profile, expectation_failure, ServerMaterials};
+
+pub(crate) const CERT_REJECT_ALL_REJECTED: Urn<'static> =
+	Urn::new("test", "event:certificate-forgery/cert-reject-all-rejected");
+pub(crate) const CERT_VALID_ACCEPTED: Urn<'static> = Urn::new("test", "event:certificate-forgery/cert-valid-accepted");
+pub(crate) const CERT_WRONG_KEY_REJECTED: Urn<'static> =
+	Urn::new("test", "event:certificate-forgery/cert-wrong-key-rejected");
 
 /// A validator that always rejects certificates (for testing rejection path).
 #[derive(Debug, Clone, Copy)]
@@ -87,9 +94,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(cert_valid_accepted, exactly!(1u32)),
-			(cert_wrong_key_rejected, exactly!(1u32)),
-			(cert_reject_all_rejected, exactly!(1u32))
+			(CERT_VALID_ACCEPTED, exactly!(1u32)),
+			(CERT_WRONG_KEY_REJECTED, exactly!(1u32)),
+			(CERT_REJECT_ALL_REJECTED, exactly!(1u32))
 		]
 	}
 }
@@ -98,16 +105,16 @@ tb_process_spec! {
 	pub CertificateForgeryProcess,
 	events {
 		observable {
-			CertificateForgerySpec::cert_valid_accepted,
-			CertificateForgerySpec::cert_wrong_key_rejected,
-			CertificateForgerySpec::cert_reject_all_rejected
+			CERT_VALID_ACCEPTED,
+			CERT_WRONG_KEY_REJECTED,
+			CERT_REJECT_ALL_REJECTED
 		}
 		hidden { }
 	}
 	states {
-		Idle => { CertificateForgerySpec::cert_valid_accepted => ValidDone },
-		ValidDone => { CertificateForgerySpec::cert_wrong_key_rejected => WrongKeyDone },
-		WrongKeyDone => { CertificateForgerySpec::cert_reject_all_rejected => Complete },
+		Idle => { CERT_VALID_ACCEPTED => ValidDone },
+		ValidDone => { CERT_WRONG_KEY_REJECTED => WrongKeyDone },
+		WrongKeyDone => { CERT_REJECT_ALL_REJECTED => Complete },
 		Complete => { }
 	}
 	terminal { Complete }
@@ -161,7 +168,7 @@ job! {
 			let _server_result = server.process_client_key_exchange(&client_kex).await;
 
 			// If we got here without error, the valid certificate was accepted
-			trace.event(CertificateForgerySpec::cert_valid_accepted)?;
+			trace.event(CERT_VALID_ACCEPTED)?;
 		}
 
 		// ========================================
@@ -189,7 +196,7 @@ job! {
 			match client.process_server_handshake(&server_handshake).await {
 				Err(_) => {
 					// Expected - certificate rejected due to wrong public key
-					trace.event(CertificateForgerySpec::cert_wrong_key_rejected)?;
+					trace.event(CERT_WRONG_KEY_REJECTED)?;
 				}
 				Ok(_) => {
 					return Err(expectation_failure("certificate with wrong pinned key should be rejected"));
@@ -221,7 +228,7 @@ job! {
 			match client.process_server_handshake(&server_handshake).await {
 				Err(_) => {
 					// Expected - all certificates rejected
-					trace.event(CertificateForgerySpec::cert_reject_all_rejected)?;
+					trace.event(CERT_REJECT_ALL_REJECTED)?;
 				}
 				Ok(_) => {
 					return Err(expectation_failure("RejectAll validator should reject all certificates"));

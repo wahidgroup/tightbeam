@@ -35,6 +35,7 @@ use crate::transport::handshake::attributes::{
 	transport_accept_transcript_bytes,
 };
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
+use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	client_mux_settings, MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
@@ -48,7 +49,9 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
 use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
-use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
+use crate::transport::handshake::{
+	Arc, ClientHandshakeProtocol, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization,
+};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::zeroize::Zeroizing;
@@ -84,6 +87,7 @@ where
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	pending_receipt: Option<(SessionReceipt, SignedData)>,
 	stored_receipt: Option<StoredReceipt>,
+	epoch_materials: Option<EpochMaterials>,
 	invariants: HandshakeInvariant,
 }
 
@@ -159,6 +163,7 @@ where
 			receipt_approver: None,
 			pending_receipt: None,
 			stored_receipt: None,
+			epoch_materials: None,
 			invariants: HandshakeInvariant::default(),
 		}
 	}
@@ -651,6 +656,11 @@ where
 		self.stored_receipt.as_ref()
 	}
 
+	/// Server peer identity: pinned certificate or chain leaf used for encryption.
+	pub fn peer_certificate(&self) -> Option<&Certificate> {
+		self.server_leaf().ok()
+	}
+
 	/// Validate state and certificate for key exchange.
 	fn validate_key_exchange_prerequisites(&self) -> Result<(), HandshakeError> {
 		// Accept both Init (fresh) or HelloSent (if future hello phase added)
@@ -943,15 +953,22 @@ where
 			let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
-			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+			let transcript = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 			// 3. Derive directional session keys as P::AeadCipher
-			let ciphers = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript_hash))??;
+			let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript))?;
+			let ciphers = directional?;
 
-			// 4. Transition to complete
+			// 4. Seed epoch materials for post-handshake renewal
+			let epoch_derived =
+				cek.with(|input_key| derive_epoch_materials::<P>(input_key, &transcript, transcript))?;
+			let materials = epoch_derived?;
+			self.epoch_materials = Some(materials);
+
+			// 5. Transition to complete
 			self.state.transition(ClientHandshakeState::Completed)?;
 
-			// 5. Role-map the directional ciphers with the negotiated OID
+			// 6. Role-map the directional ciphers with the negotiated OID
 			Ok(SessionKeys::for_client(
 				ciphers.client_to_server,
 				ciphers.server_to_client,
@@ -974,6 +991,16 @@ where
 
 	fn session_receipt(&self) -> Option<&StoredReceipt> {
 		self.stored_receipt.as_ref()
+	}
+
+	#[cfg(feature = "x509")]
+	fn peer_certificate(&self) -> Option<&Certificate> {
+		CmsHandshakeClient::peer_certificate(self)
+	}
+
+	#[cfg(feature = "aead")]
+	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
+		self.epoch_materials.take()
 	}
 }
 

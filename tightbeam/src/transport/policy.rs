@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 #[cfg(feature = "std")]
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::policy::{GatePolicy, ReceptorPolicy};
 use crate::transport::error::TransportFailure;
@@ -31,12 +31,20 @@ where
 
 	/// Configure emitter gate policy.
 	///
+	/// Repeated calls accumulate into a [`crate::policy::GateChain`]:
+	/// gates evaluate in configuration order and the first non-`Ok`
+	/// verdict decides.
+	///
 	/// Default: no-op (policy ignored if transport doesn't support it).
 	fn with_emitter_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
 		self
 	}
 
 	/// Configure collector gate policy.
+	///
+	/// Repeated calls accumulate into a [`crate::policy::GateChain`]:
+	/// gates evaluate in configuration order and the first non-`Ok`
+	/// verdict decides.
 	///
 	/// Default: no-op (policy ignored if transport doesn't support it).
 	fn with_collector_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
@@ -111,7 +119,7 @@ pub struct DecorrelatedJitter;
 impl JitterStrategy for DecorrelatedJitter {
 	fn apply(&self, base_delay: u64) -> u64 {
 		let seed = SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
+			.duration_since(UNIX_EPOCH)
 			.map(|d| d.as_nanos() as u64)
 			// Use base_delay as fallback to ensure non-zero range
 			.unwrap_or(base_delay);
@@ -141,8 +149,12 @@ impl RestartPolicy for NoRestart {
 /// The delay doubles with each attempt: scale_factor * 2^attempt milliseconds.
 #[cfg(feature = "std")]
 pub struct RestartExponentialBackoff {
+	/// Attempts after which the policy answers [`RetryAction::NoRetry`].
 	pub max_attempts: usize,
+	/// Base delay in milliseconds, doubled per attempt.
 	pub scale_factor: u64,
+	/// Randomization applied to each computed delay; `None` retries on
+	/// the exact schedule.
 	pub jitter: Option<Box<dyn JitterStrategy>>,
 }
 
@@ -167,9 +179,14 @@ impl Default for RestartExponentialBackoff {
 /// milliseconds.
 #[cfg(feature = "std")]
 pub struct RestartLinearBackoff {
+	/// Attempts after which the policy answers [`RetryAction::NoRetry`].
 	pub max_attempts: usize,
+	/// Delay increment per attempt, in milliseconds.
 	pub interval_ms: u64,
+	/// Multiplier applied to the linear delay.
 	pub scale_factor: u64,
+	/// Randomization applied to each computed delay; `None` retries on
+	/// the exact schedule.
 	pub jitter: Option<Box<dyn JitterStrategy>>,
 }
 

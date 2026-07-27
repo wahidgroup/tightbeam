@@ -16,7 +16,20 @@ use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
 use tightbeam::testing::{ScenarioConf, SetupEnv};
 use tightbeam::utils;
+use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
+
+pub(crate) const CONFIDENTIALITY: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/confidentiality");
+pub(crate) const INTEGRITY: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/integrity");
+pub(crate) const INTEGRITY_OK: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/integrity-ok");
+pub(crate) const LIFETIME: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/lifetime");
+pub(crate) const MATRIX: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/matrix");
+pub(crate) const NONREPUDIATION: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/nonrepudiation");
+pub(crate) const PREVIOUS_FRAME: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/previous-frame");
+pub(crate) const PRIORITY: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/priority");
+pub(crate) const ROUNDTRIP_OK: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/roundtrip-ok");
+pub(crate) const SIG_VALID: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/sig-valid");
+pub(crate) const VERSION: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/version");
 
 /// Simple test message
 #[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
@@ -145,15 +158,15 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v0"],
 		assertions: [
-			(roundtrip_ok, exactly!(1), equals!(true)),
-			(nonrepudiation, exactly!(1), equals!(IsNone)),
-			(integrity, exactly!(1), equals!(IsNone)),
-			(confidentiality, exactly!(1), equals!(IsNone)),
-			(priority, exactly!(1), equals!(IsNone)),
-			(lifetime, exactly!(1), equals!(IsNone)),
-			(previous_frame, exactly!(1), equals!(IsNone)),
-			(matrix, exactly!(1), equals!(IsNone)),
-			(version, exactly!(1), equals!(tb::Version::V0))
+			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
+			(NONREPUDIATION, exactly!(1), equals!(IsNone)),
+			(INTEGRITY, exactly!(1), equals!(IsNone)),
+			(CONFIDENTIALITY, exactly!(1), equals!(IsNone)),
+			(PRIORITY, exactly!(1), equals!(IsNone)),
+			(LIFETIME, exactly!(1), equals!(IsNone)),
+			(PREVIOUS_FRAME, exactly!(1), equals!(IsNone)),
+			(MATRIX, exactly!(1), equals!(IsNone)),
+			(VERSION, exactly!(1), equals!(tb::Version::V0))
 		]
 	},
 	V(1,0,0): {
@@ -161,15 +174,15 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v1"],
 		assertions: [
-			(roundtrip_ok, exactly!(1), equals!(true)),
-			(sig_valid, exactly!(1), equals!(true)),
-			(integrity_ok, exactly!(1), equals!(true)),
-			(confidentiality, exactly!(1), equals!(IsSome)),
-			(priority, exactly!(1), equals!(IsNone)),
-			(lifetime, exactly!(1), equals!(IsNone)),
-			(previous_frame, exactly!(1), equals!(IsNone)),
-			(matrix, exactly!(1), equals!(IsNone)),
-			(version, exactly!(1), equals!(tb::Version::V1))
+			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
+			(SIG_VALID, exactly!(1), equals!(true)),
+			(INTEGRITY_OK, exactly!(1), equals!(true)),
+			(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
+			(PRIORITY, exactly!(1), equals!(IsNone)),
+			(LIFETIME, exactly!(1), equals!(IsNone)),
+			(PREVIOUS_FRAME, exactly!(1), equals!(IsNone)),
+			(MATRIX, exactly!(1), equals!(IsNone)),
+			(VERSION, exactly!(1), equals!(tb::Version::V1))
 		]
 	},
 	V(2,0,0): {
@@ -177,15 +190,15 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v2"],
 		assertions: [
-			(roundtrip_ok, exactly!(1), equals!(true)),
-			(sig_valid, exactly!(1), equals!(true)),
-			(integrity_ok, exactly!(1), equals!(true)),
-			(confidentiality, exactly!(1), equals!(IsSome)),
-			(priority, exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
-			(lifetime, exactly!(1), equals!(Some(3_600u64))),
-			(previous_frame, exactly!(1), equals!(IsSome)),
-			(matrix, exactly!(1), equals!(IsNone)),
-			(version, exactly!(1), equals!(tb::Version::V2))
+			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
+			(SIG_VALID, exactly!(1), equals!(true)),
+			(INTEGRITY_OK, exactly!(1), equals!(true)),
+			(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
+			(PRIORITY, exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
+			(LIFETIME, exactly!(1), equals!(Some(3_600u64))),
+			(PREVIOUS_FRAME, exactly!(1), equals!(IsSome)),
+			(MATRIX, exactly!(1), equals!(IsNone)),
+			(VERSION, exactly!(1), equals!(tb::Version::V2))
 		]
 	},
 	V(3,0,0): {
@@ -193,15 +206,15 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v3"],
 		assertions: [
-			(roundtrip_ok, exactly!(1), equals!(true)),
-			(sig_valid, exactly!(1), equals!(true)),
-			(integrity_ok, exactly!(1), equals!(true)),
-			(confidentiality, exactly!(1), equals!(IsSome)),
-			(priority, exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
-			(lifetime, exactly!(1), equals!(Some(3_600u64))),
-			(previous_frame, exactly!(1), equals!(IsSome)),
-			(matrix, exactly!(1), equals!(IsSome)),
-			(version, exactly!(1), equals!(tb::Version::V3))
+			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
+			(SIG_VALID, exactly!(1), equals!(true)),
+			(INTEGRITY_OK, exactly!(1), equals!(true)),
+			(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
+			(PRIORITY, exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
+			(LIFETIME, exactly!(1), equals!(Some(3_600u64))),
+			(PREVIOUS_FRAME, exactly!(1), equals!(IsSome)),
+			(MATRIX, exactly!(1), equals!(IsSome)),
+			(VERSION, exactly!(1), equals!(tb::Version::V3))
 		]
 	}
 }
@@ -230,54 +243,54 @@ tb_scenario! {
 
 			// Roundtrip checks
 			let v0_roundtrip: TestMessage = tightbeam::decode(&v0_frame.message)?;
-			trace.event_with(VersionSpec::roundtrip_ok, &["v0"], v0_roundtrip == message)?;
+			trace.event_with(ROUNDTRIP_OK, &["v0"], v0_roundtrip == message)?;
 
 			// V1+ signature checks (before decrypt, which consumes the frame)
-			trace.event_with(VersionSpec::sig_valid, &["v1"], v1_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
-			trace.event_with(VersionSpec::sig_valid, &["v2"], v2_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
-			trace.event_with(VersionSpec::sig_valid, &["v3"], v3_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
+			trace.event_with(SIG_VALID, &["v1"], v1_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
+			trace.event_with(SIG_VALID, &["v2"], v2_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
+			trace.event_with(SIG_VALID, &["v3"], v3_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
 
 			// V1+ integrity checks (before decrypt)
 			let v1_integrity = v1_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
 			let v2_integrity = v2_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
 			let v3_integrity = v3_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
-			trace.event_with(VersionSpec::integrity_ok, &["v1"], v1_integrity.value_cmp(&message_hash).is_ok())?;
-			trace.event_with(VersionSpec::integrity_ok, &["v2"], v2_integrity.value_cmp(&message_hash).is_ok())?;
-			trace.event_with(VersionSpec::integrity_ok, &["v3"], v3_integrity.value_cmp(&message_hash).is_ok())?;
+			trace.event_with(INTEGRITY_OK, &["v1"], v1_integrity.value_cmp(&message_hash).is_ok())?;
+			trace.event_with(INTEGRITY_OK, &["v2"], v2_integrity.value_cmp(&message_hash).is_ok())?;
+			trace.event_with(INTEGRITY_OK, &["v3"], v3_integrity.value_cmp(&message_hash).is_ok())?;
 
 			// Frame-level fields (before decrypt)
-			trace.event_with("nonrepudiation", &["v0"], Presence::of_option(&v0_frame.nonrepudiation))?;
-			trace.event_with("nonrepudiation", &["v1", "v2", "v3"], Presence::of_option(&v1_frame.nonrepudiation))?;
-			trace.event_with("integrity", &["v0"], Presence::of_option(&v0_frame.integrity))?;
-			trace.event_with("integrity", &["v1", "v2", "v3"], Presence::of_option(&v1_frame.integrity))?;
+			trace.event_with(NONREPUDIATION, &["v0"], Presence::of_option(&v0_frame.nonrepudiation))?;
+			trace.event_with(NONREPUDIATION, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.nonrepudiation))?;
+			trace.event_with(INTEGRITY, &["v0"], Presence::of_option(&v0_frame.integrity))?;
+			trace.event_with(INTEGRITY, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.integrity))?;
 
 			// Metadata fields (before decrypt)
-			trace.event_with(VersionSpec::confidentiality, &["v0"], Presence::of_option(&v0_frame.metadata.confidentiality))?;
-			trace.event_with(VersionSpec::confidentiality, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.metadata.confidentiality))?;
-			trace.event_with(VersionSpec::priority, &["v0", "v1"], v0_frame.metadata.priority)?;
-			trace.event_with(VersionSpec::priority, &["v2"], v2_frame.metadata.priority)?;
-			trace.event_with(VersionSpec::priority, &["v3"], v3_frame.metadata.priority)?;
-			trace.event_with(VersionSpec::lifetime, &["v0", "v1"], v0_frame.metadata.lifetime)?;
-			trace.event_with(VersionSpec::lifetime, &["v2"], v2_frame.metadata.lifetime)?;
-			trace.event_with(VersionSpec::lifetime, &["v3"], v3_frame.metadata.lifetime)?;
-			trace.event_with(VersionSpec::previous_frame, &["v0", "v1"], Presence::of_option(&v0_frame.metadata.previous_frame))?;
-			trace.event_with(VersionSpec::previous_frame, &["v2", "v3"], Presence::of_option(&v2_frame.metadata.previous_frame))?;
-			trace.event_with(VersionSpec::matrix, &["v0", "v1", "v2"], Presence::of_option(&v0_frame.metadata.matrix))?;
-			trace.event_with(VersionSpec::matrix, &["v3"], Presence::of_option(&v3_frame.metadata.matrix))?;
+			trace.event_with(CONFIDENTIALITY, &["v0"], Presence::of_option(&v0_frame.metadata.confidentiality))?;
+			trace.event_with(CONFIDENTIALITY, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.metadata.confidentiality))?;
+			trace.event_with(PRIORITY, &["v0", "v1"], v0_frame.metadata.priority)?;
+			trace.event_with(PRIORITY, &["v2"], v2_frame.metadata.priority)?;
+			trace.event_with(PRIORITY, &["v3"], v3_frame.metadata.priority)?;
+			trace.event_with(LIFETIME, &["v0", "v1"], v0_frame.metadata.lifetime)?;
+			trace.event_with(LIFETIME, &["v2"], v2_frame.metadata.lifetime)?;
+			trace.event_with(LIFETIME, &["v3"], v3_frame.metadata.lifetime)?;
+			trace.event_with(PREVIOUS_FRAME, &["v0", "v1"], Presence::of_option(&v0_frame.metadata.previous_frame))?;
+			trace.event_with(PREVIOUS_FRAME, &["v2", "v3"], Presence::of_option(&v2_frame.metadata.previous_frame))?;
+			trace.event_with(MATRIX, &["v0", "v1", "v2"], Presence::of_option(&v0_frame.metadata.matrix))?;
+			trace.event_with(MATRIX, &["v3"], Presence::of_option(&v3_frame.metadata.matrix))?;
 
 			// Version checks - each version is unique (before decrypt)
-			trace.event_with(VersionSpec::version, &["v0"], v0_frame.version)?;
-			trace.event_with(VersionSpec::version, &["v1"], v1_frame.version)?;
-			trace.event_with(VersionSpec::version, &["v2"], v2_frame.version)?;
-			trace.event_with(VersionSpec::version, &["v3"], v3_frame.version)?;
+			trace.event_with(VERSION, &["v0"], v0_frame.version)?;
+			trace.event_with(VERSION, &["v1"], v1_frame.version)?;
+			trace.event_with(VERSION, &["v2"], v2_frame.version)?;
+			trace.event_with(VERSION, &["v3"], v3_frame.version)?;
 
 			// Decrypt (consumes frames, so must be last)
 			let v1_roundtrip = v1_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
 			let v2_roundtrip = v2_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
 			let v3_roundtrip = v3_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
-			trace.event_with(VersionSpec::roundtrip_ok, &["v1"], v1_roundtrip == message)?;
-			trace.event_with(VersionSpec::roundtrip_ok, &["v2"], v2_roundtrip == message)?;
-			trace.event_with(VersionSpec::roundtrip_ok, &["v3"], v3_roundtrip == message)?;
+			trace.event_with(ROUNDTRIP_OK, &["v1"], v1_roundtrip == message)?;
+			trace.event_with(ROUNDTRIP_OK, &["v2"], v2_roundtrip == message)?;
+			trace.event_with(ROUNDTRIP_OK, &["v3"], v3_roundtrip == message)?;
 
 			Ok(())
 		}

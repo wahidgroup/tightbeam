@@ -10,9 +10,16 @@ use std::sync::{Arc, Mutex};
 use sha3::Sha3_256;
 use tightbeam::asn1::DigestInfo;
 use tightbeam::trace::TraceCollector;
+use tightbeam::utils::urn::Urn;
 use tightbeam::{utils, Frame, TightBeamError};
 
 use super::messages::TransactionStatus;
+
+pub(crate) const CHAIN_BROKEN: Urn<'static> = Urn::new("test", "event:harness/chain-broken");
+pub(crate) const CHAIN_VALID: Urn<'static> = Urn::new("test", "event:harness/chain-valid");
+pub(crate) const DEDUP_CACHE_HIT: Urn<'static> = Urn::new("test", "event:harness/dedup-cache-hit");
+pub(crate) const DEDUP_KEPT: Urn<'static> = Urn::new("test", "event:harness/dedup-kept");
+pub(crate) const DEDUP_SKIPPED: Urn<'static> = Urn::new("test", "event:harness/dedup-skipped");
 
 // ============================================================================
 // Constants
@@ -71,9 +78,9 @@ impl DedupBook {
 
 		let inserted = guard.insert(key);
 		if inserted {
-			self.trace.event_with("dedup_kept", &[PAYMENT_TAG], true)?;
+			self.trace.event_with(DEDUP_KEPT, &[PAYMENT_TAG], true)?;
 		} else {
-			self.trace.event_with("dedup_skipped", &[PAYMENT_TAG], true)?;
+			self.trace.event_with(DEDUP_SKIPPED, &[PAYMENT_TAG], true)?;
 		}
 
 		Ok(inserted)
@@ -146,14 +153,14 @@ impl ChainState {
 		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata.order > prev);
 		let valid = prev_ok && order_ok;
 		if valid {
-			self.trace.event_with("chain_valid", &[PAYMENT_TAG], true)?;
+			self.trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
 
 			guard.last_order = Some(frame.metadata.order);
 
 			let digest = utils::digest::<Sha3_256>(&frame.message)?;
 			guard.last_digest = Some(digest);
 		} else {
-			self.trace.event_with("chain_broken", &[PAYMENT_TAG], true)?;
+			self.trace.event_with(CHAIN_BROKEN, &[PAYMENT_TAG], true)?;
 		}
 
 		Ok(valid)
@@ -222,7 +229,7 @@ impl PaymentHarness {
 	pub fn check_dedup_cache(&self, frame: &Frame) -> Result<Option<TransactionStatus>, TightBeamError> {
 		if !self.handle(frame)? {
 			if let Some(cached) = self.dedup.get_cached(frame) {
-				self.trace.event_with("dedup_cache_hit", &[PAYMENT_TAG], true)?;
+				self.trace.event_with(DEDUP_CACHE_HIT, &[PAYMENT_TAG], true)?;
 				return Ok(Some(cached));
 			}
 		}

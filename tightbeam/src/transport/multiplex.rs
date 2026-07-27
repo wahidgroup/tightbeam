@@ -20,26 +20,37 @@
 //! - [`MuxResponder`]: serves peer-initiated streams with a caller-supplied
 //!   handler, enforcing the advertised concurrency cap.
 //!
-//! Stream ID rules follow [RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1)/[§ 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2): odd IDs are
-//! client-initiated, even IDs server-initiated, ID 0 is reserved and never
-//! allocated, and each endpoint allocates strictly monotonically. Per-stream
-//! timeouts compose externally: wrap the emit future in a timeout and the
-//! drop guard cancels the stream on expiry.
+//! Stream ID rules follow:
+//! - [RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1)
+//! - [RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)
+//! - Odd IDs are client-initiated, even IDs server-initiated
+//! - ID 0 is reserved and never allocated
+//! - Each endpoint allocates strictly monotonically
+//!
+//! Per-stream timeouts compose externally: wrap the emit future in a timeout
+//! and the drop guard cancels the stream on expiry.
 
 use core::future::Future;
 
-#[cfg(feature = "transport-policy")]
-use crate::policy::GatePolicy;
 use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::Frame;
 
+#[cfg(feature = "transport-policy")]
+use crate::policy::GatePolicy;
+#[cfg(feature = "transport-policy")]
+use crate::policy::SessionContext;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::receipt::StoredReceipt;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::rekey::RekeyDriver;
+
 /// Stream identifier within one multiplexed connection.
 ///
-/// Odd IDs are client-initiated, even IDs server-initiated, and ID 0 is
-/// reserved ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1)).
+/// Odd IDs are client-initiated, even IDs are server-initiated, and ID 0 is reserved
+/// ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub u32);
 
@@ -146,12 +157,23 @@ pub trait MultiplexedProtocol {
 /// negotiation (split envelope halves plus spawned drivers): advertising
 /// anywhere else would negotiate a capability the endpoint cannot honor.
 pub trait MuxCapable: Sized {
-	/// Set the local mux advertisement. `None` advertises nothing.
+	/// Local mux advertisement. `None` advertises nothing.
 	fn with_mux_offer(self, offer: Option<TransportOffer>) -> Self;
 
 	/// Negotiated multiplexing settings from a completed handshake.
 	/// `None` means the connection is single-flight.
 	fn negotiated_mux(&self) -> Option<MuxSettings>;
+}
+
+/// In-band rekey wiring harvested from a completed receipt-bearing
+/// handshake: the role-fixed exchange half plus the epoch-0 dual-signed
+/// receipt it rotates (unmetered sessions carry none and keep the
+/// GoAway drain). Opaque: built by the transport, consumed by
+/// [`MuxTransport::with_rekey`].
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub struct MuxRekeyContext {
+	pub(crate) driver: RekeyDriver,
+	pub(crate) receipt: StoredReceipt,
 }
 
 /// Client-side mux connection setup.
@@ -167,6 +189,13 @@ pub trait MuxConnector: MuxCapable {
 	/// Drive the client handshake to completion. Does nothing on transports
 	/// without encryption material, which then never negotiate mux.
 	fn complete_client_handshake(&mut self) -> impl Future<Output = TransportResult<()>> + MaybeSend;
+
+	/// Detach the client half of the in-band rekey wiring from a completed
+	/// handshake. `Ok(None)` on sessions without a receipt-bearing epoch.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
+		Ok(None)
+	}
 
 	/// Split into envelope halves for the mux drivers.
 	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)>;
@@ -193,6 +222,20 @@ pub trait MuxAcceptor: MuxCapable {
 	/// MUST be served single-flight.
 	fn negotiate_mux(&mut self) -> impl Future<Output = TransportResult<Option<MuxSettings>>> + MaybeSend;
 
+	/// Detach the server half of the in-band rekey wiring from a
+	/// completed handshake. `Ok(None)` on sessions without a
+	/// receipt-bearing epoch.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
+		Ok(None)
+	}
+
+	/// Authenticated peer context of the completed handshake,
+	/// snapshotted before the transport splits. Empty by default.
+	fn session_context(&self) -> SessionContext {
+		SessionContext::default()
+	}
+
 	/// Consume the transport into its collector gate plus envelope halves.
 	/// Consuming means no placeholder gate ever sits inside a live
 	/// collector: the gate moves to the mux responder, the transport
@@ -209,9 +252,9 @@ mod router {
 	use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 	use futures::channel::{mpsc, oneshot};
-	use futures::future::{select, AbortHandle, Abortable, Aborted, Either};
+	use futures::future::{ready, select, AbortHandle, Abortable, Aborted, Either};
 	use futures::stream::FuturesUnordered;
-	use futures::{pin_mut, SinkExt, Stream, StreamExt};
+	use futures::{pin_mut, SinkExt, Stream};
 
 	use super::{MultiplexedProtocol, MuxRole, StreamId};
 	use crate::constants::{DEFAULT_MUX_CANCEL_BUDGET, DEFAULT_MUX_STREAM_CREDIT};
@@ -227,6 +270,42 @@ mod router {
 	use crate::transport::{TransportError, TransportResult};
 	use crate::utils::marker::MaybeSend;
 	use crate::Frame;
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	use super::MuxRekeyContext;
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	use crate::constants::{DEFAULT_REKEY_MIN_SPEND_RECORDS, DEFAULT_REKEY_RENEWAL_ALLOWANCE};
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	use crate::crypto::aead::{RecvCipher, SendCipher};
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	use crate::transport::envelopes::{
+		MuxRekeyAckPackage, MuxRekeyDonePackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage,
+		MUX_APPLICATION_CODE_FLOOR,
+	};
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	use crate::transport::handshake::receipt::StoredReceipt;
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	use crate::transport::handshake::HandshakeError;
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	use crate::transport::rekey::{ClientRekeyExchange, EpochInstall, RekeyDriver, ServerAckOutcome};
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	use futures::lock::Mutex as FuturesMutex;
+
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	use crate::constants::DEFAULT_REKEY_DEADLINE_SECS;
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	use core::time::Duration;
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+	use std::time::Instant;
+
+	#[cfg(feature = "instrument")]
+	use crate::instrumentation::events;
+	#[cfg(feature = "instrument")]
+	use crate::trace::TraceCollector;
+	#[cfg(feature = "transport-policy")]
+	use crate::transport::GateAudit;
+	#[cfg(feature = "instrument")]
+	use crate::utils::urn::Urn;
 
 	fn cap_as_usize(cap: u32) -> usize {
 		usize::try_from(cap).unwrap_or(usize::MAX)
@@ -270,37 +349,12 @@ mod router {
 			.saturating_add(remainder.div_ceil(unit))
 	}
 
-	/// Static records the writer must reserve so a graceful drain can finish
-	/// after the GoAway fires
-	/// ([RFC 8446 § 5.5](https://datatracker.ietf.org/doc/html/rfc8446#section-5.5) analog).
-	///
-	/// At the moment the limit check trips, the connection can still owe:
-	/// - envelopes already queued outbound, at most the channel capacity of
-	///   `local_cap + peer_cap`
-	/// - response trailers to in-flight peer streams, at most `peer_cap`
-	/// - drop-guard cancels for pending local streams, at most `local_cap`
-	/// - the GoAway itself, exactly 1
-	///
-	/// Total: `2 * (local_cap + peer_cap) + 1`. Chunked frames add a
-	/// dynamic term on top: every registered-but-unflushed chunk is one
-	/// more owed record, tracked live in [`MuxState::unsent_chunks`] and
-	/// added by the writer at each limit check. A hostile peer that keeps
-	/// opening streams after the GoAway draws refusal cancels beyond any
-	/// bound and only exhausts the cipher of its own dying connection.
-	fn drain_headroom(settings: &MuxSettings) -> u64 {
-		u64::from(settings.local_initiated_cap)
-			.saturating_add(u64::from(settings.peer_initiated_cap))
-			.saturating_mul(2)
-			.saturating_add(1)
-	}
-
-	/// Credits reserved out of the outbound session budget so owed traffic
-	/// can flush during a budget drain: the static record headroom priced at
-	/// the worst-case per-chunk debit.
-	fn budget_drain_headroom(settings: &MuxSettings) -> u64 {
-		let chunk_size = cap_as_usize(settings.send_chunk_size);
-		let per_chunk = payload_credits(chunk_size, chunk_size, settings.credit_unit);
-		drain_headroom(settings).saturating_mul(per_chunk)
+	/// Send records at which a renewal opens: the dynamic drain floor
+	/// plus fixed slack so the exchange legs land before the drain
+	/// threshold would trip ([`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]).
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn renewal_floor(drain_floor: u64) -> u64 {
+		drain_floor.saturating_add(DEFAULT_REKEY_RENEWAL_ALLOWANCE)
 	}
 
 	/// Outcome delivered to a pending stream's oneshot slot.
@@ -315,7 +369,33 @@ mod router {
 
 	enum Outbound {
 		Envelope(TransportEnvelope),
+		/// Write the envelope, then switch the send direction to the new
+		/// epoch cipher (client `RekeyAck` / server `RekeyDone` boundary,
+		/// [RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)
+		/// per-direction key-switch analog).
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		EnvelopeThenInstall(TransportEnvelope, Box<SendCipher>),
+		/// Budget-watermark renewal trigger from a handle: the writer
+		/// opens the exchange (deduplicated by [`RekeyPhase`]).
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		StartRenewal,
 		Close,
+	}
+
+	/// Client-side renewal state (key-switch boundaries). Server
+	/// endpoints and sessions without rekey materials stay `Idle` forever.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	enum RekeyPhase {
+		/// No renewal in flight
+		Idle,
+		/// `RekeyRequest` written; awaiting the server's response
+		AwaitingResponse,
+		/// Response verified; new c2s admissions park while owed chunks
+		/// flush ahead of the `RekeyAck`
+		FlushingAck,
+		/// `RekeyAck` written (send cipher switched); c2s parked until
+		/// `RekeyDone` activates the fresh epoch budget
+		AwaitingDone,
 	}
 
 	/// Exclusive outbound handle for `SinkExt::send` / `try_send`.
@@ -401,6 +481,19 @@ mod router {
 		drain_wakers: Vec<Waker>,
 		/// Wakers parked on stream-slot headroom (cap full)
 		slot_wakers: Vec<Waker>,
+		/// In-band renewal state. Only a client with rekey materials
+		/// ever leaves `Idle`
+		rekey: RekeyPhase,
+		/// Renewal in flight with send records down to the drain
+		/// headroom: data chunks park until the fresh cipher installs
+		rekey_hard_floor: bool,
+		/// Whether this endpoint can open renewals (client role with
+		/// rekey materials attached)
+		rekey_client: bool,
+		/// Wakers parked on renewal transitions: admissions waiting out
+		/// a renewal, chunks on the hard floor, and the writer waiting
+		/// for owed chunks to quiesce ahead of the `RekeyAck`
+		rekey_wakers: Vec<Waker>,
 	}
 
 	impl MuxState {
@@ -412,8 +505,17 @@ mod router {
 			wake_all(&mut self.slot_wakers);
 		}
 
+		fn wake_rekey_waiters(&mut self) {
+			wake_all(&mut self.rekey_wakers);
+		}
+
+		/// A GoAway in either direction puts the connection in drain.
+		fn is_draining(&self) -> bool {
+			self.goaway_sent.is_some() || self.goaway_received.is_some()
+		}
+
 		fn reject_if_draining(&self) -> TransportResult<()> {
-			if self.goaway_sent.is_some() || self.goaway_received.is_some() {
+			if self.is_draining() {
 				return Err(TransportError::Draining);
 			}
 
@@ -423,6 +525,7 @@ mod router {
 
 	struct MuxShared {
 		role: MuxRole,
+		state: Mutex<MuxState>,
 		local_cap: u32,
 		/// Largest chunk payload this endpoint may send (peer-advertised)
 		send_chunk_size: usize,
@@ -432,9 +535,20 @@ mod router {
 		/// (peer-advertised)
 		initial_send_credit: u64,
 		/// Credits reserved so owed traffic can flush during a budget
-		/// drain. See [`budget_drain_headroom`]
+		/// drain. See [`MuxSettings::send_budget_reserve`]
 		budget_drain_headroom: u64,
-		state: Mutex<MuxState>,
+		/// Negotiated outbound budget, restored at each epoch boundary
+		/// (credit-match invariant: epoch receipt budgets equal the
+		/// initial terms)
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		initial_send_budget: Option<u64>,
+		/// Current epoch's dual-signed receipt; renewal rotates it
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		session_receipt: Mutex<Option<Arc<StoredReceipt>>>,
+		/// Connection collector inherited from the split halves;
+		/// control-plane events land here (see [`super::labels`]).
+		#[cfg(feature = "instrument")]
+		trace: Option<TraceCollector>,
 	}
 
 	impl MuxShared {
@@ -445,7 +559,13 @@ mod router {
 				send_chunk_size: cap_as_usize(settings.send_chunk_size).max(1),
 				credit_unit: settings.credit_unit.max(1),
 				initial_send_credit: settings.initial_send_credit.max(1),
-				budget_drain_headroom: budget_drain_headroom(settings),
+				budget_drain_headroom: settings.send_budget_reserve(),
+				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				initial_send_budget: settings.send_budget,
+				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				session_receipt: Mutex::new(None),
+				#[cfg(feature = "instrument")]
+				trace: None,
 				state: Mutex::new(MuxState {
 					next_stream_id: Some(role.first_local_stream_id()),
 					last_peer_stream_id: 0,
@@ -460,6 +580,10 @@ mod router {
 					goaway_reason: None,
 					drain_wakers: Vec::new(),
 					slot_wakers: Vec::new(),
+					rekey: RekeyPhase::Idle,
+					rekey_hard_floor: false,
+					rekey_client: false,
+					rekey_wakers: Vec::new(),
 				}),
 			}
 		}
@@ -477,6 +601,15 @@ mod router {
 				for waker in stream.credit_wakers {
 					waker.wake();
 				}
+				Self::wake_on_quiesce(state);
+			}
+		}
+
+		/// Wake the writer once owed chunks quiesce while it holds a
+		/// `RekeyAck` back (the ack trails every old-epoch chunk).
+		fn wake_on_quiesce(state: &mut MuxState) {
+			if state.unsent_chunks == 0 && state.rekey == RekeyPhase::FlushingAck {
+				state.wake_rekey_waiters();
 			}
 		}
 
@@ -503,12 +636,11 @@ mod router {
 			Self::drop_send_stream(&mut state, stream_id);
 		}
 
-		/// Resolve once the peer's grant admits the stream's next chunk,
-		/// consuming one unit of credit. Fails once the ledger is gone:
-		/// the stream resolved underneath the sender (cancel, response,
-		/// or connection failure) and the outcome channel has the truth.
-		fn poll_send_chunk(&self, stream_id: u32, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
-			let mut state = self.lock();
+		/// Consume one unit of stream credit under the lock, or park.
+		/// Fails once the ledger is gone: the stream resolved underneath
+		/// the sender (cancel, response, or connection failure) and the
+		/// outcome channel has the truth.
+		fn take_chunk_credit(state: &mut MuxState, stream_id: u32, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
 			let Some(stream) = state.send_streams.get_mut(&stream_id) else {
 				return Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)));
 			};
@@ -520,8 +652,54 @@ mod router {
 			stream.sent = stream.sent.saturating_add(1);
 			stream.unsent = stream.unsent.saturating_sub(1);
 			state.unsent_chunks = state.unsent_chunks.saturating_sub(1);
+			Self::wake_on_quiesce(state);
 
 			Poll::Ready(Ok(()))
+		}
+
+		/// Resolve once the peer's grant admits the stream's next chunk,
+		/// consuming one unit of credit.
+		#[cfg(test)]
+		fn poll_send_chunk(&self, stream_id: u32, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
+			let mut state = self.lock();
+			Self::take_chunk_credit(&mut state, stream_id, cx)
+		}
+
+		/// Consume one unit of stream credit and enqueue the chunk's
+		/// envelope in one critical section, so no data envelope can
+		/// slip into the queue behind a rekey `RekeyAck` boundary
+		/// (strict park). The caller MUST have reserved queue
+		/// capacity via `poll_ready` on `outbound` first.
+		///
+		/// Chunks additionally park on the rekey hard floor: send
+		/// records at the drain headroom with a renewal in flight are
+		/// reserved for control and the exchange legs.
+		fn poll_send_enqueue(
+			&self,
+			stream_id: u32,
+			outbound: &mut mpsc::Sender<Outbound>,
+			envelope: &mut Option<TransportEnvelope>,
+			cx: &mut Context<'_>,
+		) -> Poll<TransportResult<()>> {
+			let mut state = self.lock();
+			if state.rekey_hard_floor {
+				park_waker(&mut state.rekey_wakers, cx);
+				return Poll::Pending;
+			}
+
+			match Self::take_chunk_credit(&mut state, stream_id, cx) {
+				Poll::Ready(Ok(())) => {}
+				other => return other,
+			}
+
+			let Some(envelope) = envelope.take() else {
+				return Poll::Ready(Err(TransportError::ConnectionClosed));
+			};
+			let enqueued = outbound
+				.start_send(Outbound::Envelope(envelope))
+				.map_err(|_| TransportError::ConnectionClosed);
+
+			Poll::Ready(enqueued)
 		}
 
 		/// Apply a peer credit grant (idempotent, monotonic: only a limit
@@ -543,13 +721,17 @@ mod router {
 			}
 		}
 
-		/// Debit `credits` from the outbound session budget.
+		/// Debit `credits` from the budget in `state`.
 		///
 		/// `reserved` spends into the drain reserve. Non-reserved debits
 		/// fail fast once the spendable balance above the reserve cannot
 		/// cover them, keeping the reserve intact for the drain.
-		fn debit_send_budget(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
-			let mut state = self.lock();
+		fn debit_budget(
+			state: &mut MuxState,
+			headroom: u64,
+			credits: u64,
+			reserved: bool,
+		) -> TransportResult<BudgetStanding> {
 			let Some(balance) = state.send_budget else {
 				return Ok(BudgetStanding::Healthy);
 			};
@@ -557,7 +739,7 @@ mod router {
 			let spendable = if reserved {
 				balance
 			} else {
-				balance.saturating_sub(self.budget_drain_headroom)
+				balance.saturating_sub(headroom)
 			};
 			if credits > spendable {
 				return Err(TransportError::OperationFailed(TransportFailure::BudgetExhausted));
@@ -566,11 +748,48 @@ mod router {
 			let remaining = balance.saturating_sub(credits);
 			state.send_budget = Some(remaining);
 
-			if remaining <= self.budget_drain_headroom {
+			if remaining <= headroom {
 				return Ok(BudgetStanding::Exhausting);
 			}
 
 			Ok(BudgetStanding::Healthy)
+		}
+
+		/// Debit `credits` from the outbound session budget (test seam
+		/// over [`Self::debit_budget`]; production paths wait out
+		/// renewals via [`Self::admit_debit`]).
+		#[cfg(test)]
+		fn debit_send_budget(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
+			let mut state = self.lock();
+			Self::debit_budget(&mut state, self.budget_drain_headroom, credits, reserved)
+		}
+
+		/// Debit the outbound session budget once no renewal is in flight.
+		///
+		/// Client admissions park across a renewal so every debit
+		/// belongs unambiguously to one epoch: budgets reset at
+		/// `RekeyDone` and a debit issued mid-renewal could otherwise
+		/// straddle the boundary. Draining connections skip
+		/// the park: the renewal is dead and owed traffic must flush.
+		fn poll_admit_debit(
+			&self,
+			credits: u64,
+			reserved: bool,
+			cx: &mut Context<'_>,
+		) -> Poll<TransportResult<BudgetStanding>> {
+			let mut state = self.lock();
+			let draining = state.is_draining();
+			if state.rekey_client && state.rekey != RekeyPhase::Idle && !draining {
+				park_waker(&mut state.rekey_wakers, cx);
+				return Poll::Pending;
+			}
+
+			Poll::Ready(Self::debit_budget(&mut state, self.budget_drain_headroom, credits, reserved))
+		}
+
+		/// Debit the outbound budget, waiting out any in-flight renewal.
+		async fn admit_debit(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
+			poll_fn(|cx| self.poll_admit_debit(credits, reserved, cx)).await
 		}
 
 		/// Chunks registered but not yet flushed, across all streams.
@@ -578,11 +797,125 @@ mod router {
 			self.lock().unsent_chunks
 		}
 
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn rekey_phase(&self) -> RekeyPhase {
+			self.lock().rekey
+		}
+
+		/// Whether this endpoint may open a renewal right now: client
+		/// role with rekey materials, no renewal in flight, no GoAway.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn renewal_ready(&self) -> bool {
+			let state = self.lock();
+			let draining = state.is_draining();
+
+			state.rekey_client && state.rekey == RekeyPhase::Idle && !draining
+		}
+
+		/// Park new c2s admissions while owed chunks flush ahead of the
+		/// `RekeyAck` (client, on a verified `RekeyResponse`).
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn begin_ack_flush(&self) {
+			let mut state = self.lock();
+			state.rekey = RekeyPhase::FlushingAck;
+			// Owed chunks may already be quiescent: give the writer its
+			// wake now rather than waiting for a ledger transition
+			Self::wake_on_quiesce(&mut state);
+		}
+
+		/// Send cipher active after Ack; lifts the hard-floor park.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn mark_ack_written(&self) {
+			let mut state = self.lock();
+			state.rekey = RekeyPhase::AwaitingDone;
+			state.rekey_hard_floor = false;
+			state.wake_rekey_waiters();
+		}
+
+		/// Close the renewal (fresh epoch active, or the attempt died):
+		/// admissions resume, hard floor lifts, parked tasks wake.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn finish_renewal(&self) {
+			let mut state = self.lock();
+			state.rekey = RekeyPhase::Idle;
+			state.rekey_hard_floor = false;
+			state.wake_rekey_waiters();
+		}
+
+		/// Park data chunks: send records are down to the drain
+		/// headroom while a renewal is in flight, and what remains is
+		/// reserved for control and the exchange legs.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn park_hard_floor(&self) {
+			self.lock().rekey_hard_floor = true;
+		}
+
+		/// Restore the outbound budget to the negotiated terms at the
+		/// `RekeyDone` boundary (credit-match invariant keeps the epoch
+		/// receipt's terms equal to the initial ones).
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn reset_send_budget(&self) {
+			self.lock().send_budget = self.initial_send_budget;
+		}
+
+		/// Publish the completed epoch receipt to handle accessors.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn rotate_receipt(&self, receipt: StoredReceipt) {
+			let mut slot = self.session_receipt.lock().unwrap_or_else(PoisonError::into_inner);
+			*slot = Some(Arc::new(receipt));
+		}
+
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
+			let slot = self.session_receipt.lock().unwrap_or_else(PoisonError::into_inner);
+			slot.as_ref().map(Arc::clone)
+		}
+
+		/// Dual-write a control-plane event: core kind URN into the
+		/// instrument log, plus the stable label for spec assertions and
+		/// CSP alphabets.
+		#[cfg(feature = "instrument")]
+		fn emit_event(&self, event: Urn<'static>) {
+			let Some(trace) = self.trace.as_ref() else {
+				return;
+			};
+
+			trace.emit_event(event);
+		}
+
+		/// Record a GoAway control event: the reason name labels why and
+		/// its wire code rides as the assertable value.
+		#[cfg(feature = "instrument")]
+		fn emit_goaway_event(&self, event: Urn<'static>, reason: GoAwayReason) {
+			let Some(trace) = self.trace.as_ref() else {
+				return;
+			};
+
+			trace.emit_event_with_value(event, reason.as_str(), u32::from(reason));
+		}
+
+		fn reject_admission(&self) -> TransportResult<()> {
+			match self.lock().reject_if_draining() {
+				Ok(()) => Ok(()),
+				Err(err) => {
+					#[cfg(feature = "instrument")]
+					self.emit_event(events::MUX_EMIT_DRAINING);
+
+					Err(err)
+				}
+			}
+		}
+
 		/// Allocate the next stream ID and register its response slot.
 		fn allocate(&self, sender: oneshot::Sender<StreamOutcome>) -> TransportResult<u32> {
+			self.reject_admission()?;
 			let mut state = self.lock();
-			state.reject_if_draining()?;
 			if state.pending.len() >= cap_as_usize(self.local_cap) {
+				drop(state);
+
+				#[cfg(feature = "instrument")]
+				self.emit_event(events::MUX_STREAMS_EXHAUSTED);
+
 				return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
 			}
 
@@ -618,10 +951,10 @@ mod router {
 		/// Register a locally-initiated ping and return its correlation
 		/// value. Refused while draining: a peer that honors the GoAway
 		/// contract reserves its remaining records for owed stream
-		/// traffic and never acks (see [`drain_headroom`]).
+		/// traffic and never acks (see [`MuxSettings::drain_reserve_records`]).
 		fn allocate_ping(&self, sender: oneshot::Sender<()>) -> TransportResult<u64> {
+			self.reject_admission()?;
 			let mut state = self.lock();
-			state.reject_if_draining()?;
 
 			let opaque = state.next_ping_opaque;
 			state.next_ping_opaque = opaque.wrapping_add(1);
@@ -648,6 +981,9 @@ mod router {
 
 		/// Drop every pending slot on connection failure. Receivers observe
 		/// cancellation. Producers parked on credit observe ledger removal.
+		/// Any in-flight renewal is dead: parked admissions resume to
+		/// meet the failure instead of waiting for a `RekeyDone` that
+		/// will never arrive.
 		fn fail_all_pending(&self) {
 			let mut state = self.lock();
 			state.pending.clear();
@@ -660,30 +996,39 @@ mod router {
 			}
 
 			state.unsent_chunks = 0;
+			state.rekey = RekeyPhase::Idle;
+			state.rekey_hard_floor = false;
 			state.wake_drain_waiters();
 			state.wake_slot_waiters();
+			state.wake_rekey_waiters();
 		}
 
 		/// Resolve pending streams above `last_stream_id` as draining
 		/// (peer GoAway: it will never process them). Records the peer's
 		/// reason for [`MuxShared::goaway_reason`].
 		fn fail_pending_above(&self, last_stream_id: u32, reason: GoAwayReason) {
-			let mut state = self.lock();
+			{
+				let mut state = self.lock();
 
-			state.goaway_received = Some(last_stream_id);
-			state.goaway_reason = Some(reason);
+				state.goaway_received = Some(last_stream_id);
+				state.goaway_reason = Some(reason);
 
-			if let Some(first_dropped) = last_stream_id.checked_add(1) {
-				for (_, sender) in state.pending.split_off(&first_dropped) {
-					let _ = sender.send(StreamOutcome::Draining);
+				if let Some(first_dropped) = last_stream_id.checked_add(1) {
+					for (_, sender) in state.pending.split_off(&first_dropped) {
+						let _ = sender.send(StreamOutcome::Draining);
+					}
 				}
+
+				state.wake_drain_waiters();
+				state.wake_slot_waiters();
+				state.wake_rekey_waiters();
 			}
 
-			state.wake_drain_waiters();
-			state.wake_slot_waiters();
+			#[cfg(feature = "instrument")]
+			self.emit_goaway_event(events::MUX_GOAWAY_RECV, reason);
 		}
 
-		/// Halt the allocator and record the GoAway watermark. Returns the
+		/// Halt the allocator and record the GoAway watermark.
 		/// `last_stream_id` to advertise, or `None` if already shutting down.
 		fn begin_shutdown(&self) -> Option<u32> {
 			let mut state = self.lock();
@@ -693,6 +1038,7 @@ mod router {
 
 			state.goaway_sent = Some(state.last_peer_stream_id);
 			state.wake_slot_waiters();
+			state.wake_rekey_waiters();
 			Some(state.last_peer_stream_id)
 		}
 
@@ -746,7 +1092,7 @@ mod router {
 		fn poll_stream_slot(&self, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
 			let mut state = self.lock();
 
-			let goaway = state.goaway_sent.is_some() || state.goaway_received.is_some();
+			let goaway = state.is_draining();
 			let id_space_dead = state.next_stream_id.is_none();
 			if goaway || id_space_dead {
 				return Poll::Ready(Err(TransportError::Draining));
@@ -776,20 +1122,23 @@ mod router {
 		}
 	}
 
-	/// Resolves once the peer's grant admits the stream's next chunk,
-	/// consuming one unit of stream credit. Fails once the stream's
+	/// Send one credit-gated data chunk: reserve a writer-queue slot,
+	/// then take the stream credit and enqueue in one critical section
+	/// (see [`MuxShared::poll_send_enqueue`]). Fails once the stream's
 	/// ledger is gone (cancelled, resolved, or connection failure).
-	struct SendPermit<'a> {
-		shared: &'a MuxShared,
+	async fn send_data_envelope(
+		shared: &MuxShared,
+		outbound: &mut mpsc::Sender<Outbound>,
 		stream_id: u32,
-	}
-
-	impl Future for SendPermit<'_> {
-		type Output = TransportResult<()>;
-
-		fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
-			self.shared.poll_send_chunk(self.stream_id, cx)
+		envelope: TransportEnvelope,
+	) -> TransportResult<()> {
+		let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
+		if ready.is_err() {
+			return Err(TransportError::ConnectionClosed);
 		}
+
+		let mut slot = Some(envelope);
+		poll_fn(|cx| shared.poll_send_enqueue(stream_id, outbound, &mut slot, cx)).await
 	}
 
 	/// Receiver-side stream credit policy: decides when to raise a
@@ -859,6 +1208,10 @@ mod router {
 	/// `None` when shutdown already began.
 	fn goaway_package(shared: &MuxShared, reason: GoAwayReason) -> Option<GoAwayPackage> {
 		let last_peer = shared.begin_shutdown()?;
+
+		#[cfg(feature = "instrument")]
+		shared.emit_goaway_event(events::MUX_GOAWAY_SENT, reason);
+
 		Some(GoAwayPackage::new(last_peer, reason))
 	}
 
@@ -880,6 +1233,46 @@ mod router {
 			.map_err(|_| TransportError::ConnectionClosed)?;
 
 		Ok(())
+	}
+
+	/// GoAway reason for a settlement or approval refusal: application
+	/// codes (at or above [`MUX_APPLICATION_CODE_FLOOR`]) pass through,
+	/// everything else is a settlement failure.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn refusal_reason(code: u32) -> GoAwayReason {
+		if code >= MUX_APPLICATION_CODE_FLOOR {
+			return GoAwayReason::Application(code);
+		}
+
+		GoAwayReason::SettlementFailed
+	}
+
+	/// Open a renewal exactly once: readiness check and phase
+	/// transition happen while holding the exchange, so concurrent
+	/// triggers (record watermark, budget watermark, receive-direction
+	/// counter) collapse to a single `RekeyRequest`. A contended exchange
+	/// means a renewal is already being processed, which makes opening moot.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn open_renewal(
+		shared: &MuxShared,
+		exchange: &FuturesMutex<Box<dyn ClientRekeyExchange>>,
+	) -> Option<TransportEnvelope> {
+		let mut guard = exchange.try_lock()?;
+		let mut state = shared.lock();
+		let draining = state.is_draining();
+		if state.rekey != RekeyPhase::Idle || draining {
+			return None;
+		}
+
+		let request = guard.start_renewal().ok()?;
+		state.rekey = RekeyPhase::AwaitingResponse;
+		drop(state);
+
+		#[cfg(feature = "instrument")]
+		shared.emit_event(events::MUX_REKEY_REQUESTED);
+
+		let envelope = TransportEnvelope::from(request);
+		Some(envelope)
 	}
 
 	/// Resolves once the pending table drains (all in-flight local streams
@@ -998,6 +1391,17 @@ mod router {
 		outbound: mpsc::Sender<Outbound>,
 	}
 
+	// Audit source for gate verdicts on the mux plane: the responder
+	// gates frames through `gate_inbound_frame`, which records the
+	// verdict into this connection's collector.
+	#[cfg(feature = "transport-policy")]
+	impl GateAudit for MuxHandle {
+		#[cfg(feature = "instrument")]
+		fn audit_trace(&self) -> Option<&TraceCollector> {
+			self.shared.trace.as_ref()
+		}
+	}
+
 	impl MuxHandle {
 		/// Send a request on a freshly allocated stream and await its
 		/// response. Frames beyond the peer's advertised chunk size are
@@ -1023,9 +1427,21 @@ mod router {
 
 			let (sender, receiver) = oneshot::channel();
 			let stream_id = self.shared.allocate(sender)?;
-			let standing = match self.shared.debit_send_budget(credits, false) {
+
+			// Armed before the admission await: dropping the emit while
+			// it waits out a renewal must free the slot like any other
+			// in-flight abandonment
+			let mut guard = CancelOnDrop {
+				shared: Arc::clone(&self.shared),
+				outbound: outbound_handle(&self.outbound),
+				stream_id,
+				armed: true,
+			};
+
+			let standing = match self.shared.admit_debit(credits, false).await {
 				Ok(standing) => standing,
 				Err(err) => {
+					guard.disarm();
 					self.shared.remove_pending(stream_id);
 					return Err(err);
 				}
@@ -1033,13 +1449,6 @@ mod router {
 
 			let chunk_records = chunk_records(payload.len(), self.shared.send_chunk_size);
 			self.shared.register_send_stream(stream_id, chunk_records);
-
-			let mut guard = CancelOnDrop {
-				shared: Arc::clone(&self.shared),
-				outbound: outbound_handle(&self.outbound),
-				stream_id,
-				armed: true,
-			};
 
 			match self.send_request_chunks(stream_id, &payload, chunk_records).await {
 				Ok(()) => {}
@@ -1050,7 +1459,7 @@ mod router {
 			}
 
 			if matches!(standing, BudgetStanding::Exhausting) {
-				drain_with_reason(&self.shared, &self.outbound, GoAwayReason::BudgetExhausted).await?;
+				self.renew_or_drain().await?;
 			}
 
 			let outcome = receiver.await;
@@ -1066,6 +1475,20 @@ mod router {
 			}
 		}
 
+		/// On a budget at the drain reserve, renew in band when possible;
+		/// otherwise GoAway drain (no rekey materials).
+		async fn renew_or_drain(&self) -> TransportResult<()> {
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			if self.shared.renewal_ready() {
+				// A full queue drops the trigger: the budget stays at
+				// the reserve, so the next debit re-fires it
+				let _ = outbound_handle(&self.outbound).try_send(Outbound::StartRenewal);
+				return Ok(());
+			}
+
+			drain_with_reason(&self.shared, &self.outbound, GoAwayReason::BudgetExhausted).await
+		}
+
 		/// Segment a request payload into the initiator grammar, one
 		/// credit-gated chunk per record. `total` is the registered
 		/// chunk count: sender and ledger share one figure by
@@ -1077,23 +1500,16 @@ mod router {
 			let mut sent: u64 = 0;
 
 			let first = chunks.next().unwrap_or(&[]);
-			SendPermit { shared: &self.shared, stream_id }.await?;
-
 			sent += 1;
 			let open = MuxOpenPackage::new(stream_id, sent == total, first)?;
-			outbound
-				.send(Outbound::Envelope(open.into()))
-				.await
-				.map_err(|_| TransportError::ConnectionClosed)?;
+			let open_envelope = TransportEnvelope::from(open);
+			send_data_envelope(&self.shared, &mut outbound, stream_id, open_envelope).await?;
 
 			for chunk in chunks {
-				SendPermit { shared: &self.shared, stream_id }.await?;
 				sent += 1;
 				let data = MuxDataPackage::new(stream_id, sent == total, chunk)?;
-				outbound
-					.send(Outbound::Envelope(data.into()))
-					.await
-					.map_err(|_| TransportError::ConnectionClosed)?;
+				let data_envelope = TransportEnvelope::from(data);
+				send_data_envelope(&self.shared, &mut outbound, stream_id, data_envelope).await?;
 			}
 
 			Ok(())
@@ -1129,6 +1545,14 @@ mod router {
 		/// `ProtocolError` points at a bug rather than a transient fault.
 		pub fn goaway_reason(&self) -> Option<GoAwayReason> {
 			self.shared.goaway_reason()
+		}
+
+		/// Current epoch's dual-signed session receipt, rotated in
+		/// place by each completed in-band renewal. `None` on sessions
+		/// without receipt-bearing rekey materials.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		pub fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
+			self.shared.session_receipt()
 		}
 
 		/// Resolve once a locally-initiated stream would be admitted:
@@ -1217,6 +1641,18 @@ mod router {
 		}
 	}
 
+	/// One unit of writer work, resolved by [`MuxWriterDriver::poll_step`].
+	enum WriterStep {
+		Command(Outbound),
+		/// Owed c2s chunks quiesced: the held `RekeyAck` may go out
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		WriteAck,
+		/// The renewal deadline elapsed: drain the connection
+		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+		RenewalExpired,
+		Closed,
+	}
+
 	/// Writer driver: single serialization point for the connection.
 	///
 	/// Drains the outbound queue and writes each envelope through the
@@ -1230,8 +1666,26 @@ mod router {
 		commands: mpsc::Receiver<Outbound>,
 		shared: Arc<MuxShared>,
 		/// Records reserved for draining before the send cipher halts.
-		/// See [`drain_headroom`] for the bound derivation.
+		/// See [`MuxSettings::drain_reserve_records`] for the bound derivation.
 		drain_headroom: u64,
+		/// Client half of the rekey exchange, shared with the reader
+		/// driver. The writer only ever `try_lock`s it, for the
+		/// synchronous [`ClientRekeyExchange::start_renewal`]
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		exchange: Option<Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>>,
+		/// `RekeyAck` held back until owed c2s chunks quiesce, with the
+		/// fresh send cipher it switches to (the ack must trail every
+		/// old-epoch data chunk on the wire)
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		pending_ack: Option<(TransportEnvelope, Box<SendCipher>)>,
+		/// When the in-flight renewal was first observed, for the
+		/// deadline that bounds a stalled exchange
+		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+		renewal_started: Option<Instant>,
+		/// Time budget for one renewal exchange before the connection
+		/// drains (default [`DEFAULT_REKEY_DEADLINE_SECS`])
+		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+		renewal_deadline: Duration,
 	}
 
 	impl<W> MuxWriterDriver<W>
@@ -1240,34 +1694,187 @@ mod router {
 	{
 		/// Run the driver until shutdown or write failure.
 		pub async fn drive(mut self) -> TransportResult<()> {
-			while let Some(command) = self.commands.next().await {
-				match command {
-					Outbound::Envelope(envelope) => {
+			loop {
+				match self.next_step().await {
+					WriterStep::Command(Outbound::Envelope(envelope)) => {
 						self.writer.write_envelope(envelope).await?;
 						self.enforce_rekey_limit().await?;
 					}
-					Outbound::Close => break,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					WriterStep::Command(Outbound::EnvelopeThenInstall(envelope, cipher)) => {
+						self.handle_install(envelope, cipher).await?;
+					}
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					WriterStep::Command(Outbound::StartRenewal) => self.try_open_renewal().await?,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					WriterStep::WriteAck => self.write_pending_ack().await?,
+					#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+					WriterStep::RenewalExpired => self.fail_renewal().await?,
+					WriterStep::Command(Outbound::Close) | WriterStep::Closed => break,
 				}
 			}
 
 			Ok(())
 		}
 
-		/// [RFC 8446 § 5.5](https://datatracker.ietf.org/doc/html/rfc8446#section-5.5)
-		/// analog: when the send cipher nears its record limit, drain the
-		/// connection via GoAway while enough records remain to answer
-		/// in-flight peer streams and flush every registered-but-unsent chunk.
-		/// The caller then reestablishes the session for fresh keys.
+		/// Next unit of work. With a renewal in flight and a timer
+		/// available, the wait is bounded by the renewal deadline so a
+		/// peer that never answers cannot park the connection forever.
+		async fn next_step(&mut self) -> WriterStep {
+			#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+			if let Some(deadline) = self.renewal_deadline() {
+				let timeout = deadline.into();
+				let wait = poll_fn(|cx| self.poll_step(cx));
+				let step = tokio::time::timeout_at(timeout, wait).await;
+				return step.unwrap_or(WriterStep::RenewalExpired);
+			}
+
+			poll_fn(|cx| self.poll_step(cx)).await
+		}
+
+		/// Queued commands first; once the queue is momentarily empty,
+		/// a held `RekeyAck` goes out if owed chunks have quiesced.
+		/// The ordering guarantees every data envelope enqueued before
+		/// the quiesce point precedes the ack on the wire.
+		fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<WriterStep> {
+			match Pin::new(&mut self.commands).poll_next(cx) {
+				Poll::Ready(Some(command)) => return Poll::Ready(WriterStep::Command(command)),
+				Poll::Ready(None) => return Poll::Ready(WriterStep::Closed),
+				Poll::Pending => {}
+			}
+
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			if self.pending_ack.is_some() {
+				let mut state = self.shared.lock();
+				if state.unsent_chunks == 0 {
+					return Poll::Ready(WriterStep::WriteAck);
+				}
+
+				park_waker(&mut state.rekey_wakers, cx);
+			}
+
+			Poll::Pending
+		}
+
+		/// Deadline of the in-flight renewal, stamped on first
+		/// observation and cleared when the exchange concludes.
+		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+		fn renewal_deadline(&mut self) -> Option<Instant> {
+			if self.exchange.is_none() || self.shared.rekey_phase() == RekeyPhase::Idle {
+				self.renewal_started = None;
+				return None;
+			}
+
+			let started = *self.renewal_started.get_or_insert_with(Instant::now);
+			Some(started + self.renewal_deadline)
+		}
+
+		/// Write the key-switch marker and install the fresh send
+		/// cipher at the exact wire boundary. The server's `RekeyDone`
+		/// writes immediately; the client's `RekeyAck` waits out owed
+		/// c2s chunks first.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		async fn handle_install(
+			&mut self,
+			envelope: TransportEnvelope,
+			cipher: Box<SendCipher>,
+		) -> TransportResult<()> {
+			if self.shared.role == MuxRole::Client {
+				self.pending_ack = Some((envelope, cipher));
+				return Ok(());
+			}
+
+			self.writer.write_envelope(envelope).await?;
+			self.writer.install_send_cipher(*cipher)
+		}
+
+		/// Owed chunks quiesced: the `RekeyAck` goes out and the send
+		/// direction switches to the fresh epoch cipher (counter reset
+		/// with the fresh key, NIST SP 800-38D § 8.2.1).
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		async fn write_pending_ack(&mut self) -> TransportResult<()> {
+			let Some((envelope, cipher)) = self.pending_ack.take() else {
+				return Ok(());
+			};
+
+			self.writer.write_envelope(envelope).await?;
+			self.writer.install_send_cipher(*cipher)?;
+			self.shared.mark_ack_written();
+
+			Ok(())
+		}
+
+		/// Open a renewal if none is in flight (handle-side budget
+		/// trigger; the phase check deduplicates concurrent triggers).
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		async fn try_open_renewal(&mut self) -> TransportResult<()> {
+			let Some(exchange) = self.exchange.as_ref() else {
+				return Ok(());
+			};
+			let Some(request) = open_renewal(&self.shared, exchange) else {
+				return Ok(());
+			};
+
+			self.writer.write_envelope(request).await
+		}
+
+		/// Renewal deadline elapsed: drain via GoAway and wake parked
+		/// admissions/chunks so owed traffic can flush.
+		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+		async fn fail_renewal(&mut self) -> TransportResult<()> {
+			self.pending_ack = None;
+			self.renewal_started = None;
+
+			if let Some(package) = goaway_package(&self.shared, GoAwayReason::Shutdown) {
+				let envelope = TransportEnvelope::from(package);
+				self.writer.write_envelope(envelope).await?;
+			}
+			self.shared.finish_renewal();
+
+			Ok(())
+		}
+
+		/// [RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5)
+		/// analog: act before the send cipher reaches its record limit.
+		///
+		/// A client with rekey materials opens an in-band renewal at a
+		/// headroom above the drain threshold
+		/// ([`DEFAULT_REKEY_RENEWAL_ALLOWANCE`] records of slack for
+		/// the exchange legs). Sessions without rekey materials drain
+		/// via GoAway while enough records remain to answer in-flight
+		/// peer streams and flush registered-but-unsent chunks, then the
+		/// caller reestablishes the session. A renewal still in flight
+		/// at the drain threshold parks data on the hard floor.
 		async fn enforce_rekey_limit(&mut self) -> TransportResult<()> {
-			let headroom = self.drain_headroom.saturating_add(self.shared.unsent_chunks());
-			if self.writer.remaining_records() > headroom {
+			let drain_floor = self.drain_headroom.saturating_add(self.shared.unsent_chunks());
+			let remaining = self.writer.remaining_records();
+
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+			if let Some(exchange) = self.exchange.as_ref() {
+				if remaining > renewal_floor(drain_floor) {
+					return Ok(());
+				}
+				if let Some(request) = open_renewal(&self.shared, exchange) {
+					return self.writer.write_envelope(request).await;
+				}
+				if remaining > drain_floor {
+					return Ok(());
+				}
+				if self.shared.rekey_phase() != RekeyPhase::Idle {
+					self.shared.park_hard_floor();
+					return Ok(());
+				}
+			}
+
+			if remaining > drain_floor {
 				return Ok(());
 			}
 
 			// Bypass the command queue: at the record ceiling the queue
 			// may already be full of owed stream traffic.
 			if let Some(package) = goaway_package(&self.shared, GoAwayReason::Shutdown) {
-				self.writer.write_envelope(package.into()).await?;
+				let envelope = TransportEnvelope::from(package);
+				self.writer.write_envelope(envelope).await?;
 			}
 
 			Ok(())
@@ -1338,18 +1945,46 @@ mod router {
 		peer_reassembly: HashMap<u32, RecvStream>,
 		/// Reassembly of responses to locally-initiated streams
 		local_reassembly: HashMap<u32, RecvStream>,
-		/// Control envelopes buffered while the writer queue is full so
+		/// Control commands buffered while the writer queue is full so
 		/// the read loop never parks
 		/// ([RFC 9113 § 5.2.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2)).
-		/// Bounded: grants coalesce per stream, ping acks are capped
-		pending_control: VecDeque<TransportEnvelope>,
+		/// Bounded: grants coalesce per stream, ping acks are capped,
+		/// rekey legs are one-in-flight
+		pending_control: VecDeque<Outbound>,
+		/// Role-fixed rekey exchange; `None` keeps every rekey leg an
+		/// unsolicited protocol violation
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		rekey: Option<RekeyDriver>,
+		/// Client epoch state held between the `RekeyAck` and the
+		/// server's `RekeyDone`: the receive cipher installs and the
+		/// receipt rotates only at the `RekeyDone` boundary
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		pending_install: Option<PendingDone>,
+		/// Negotiated inbound budget, restored at each epoch boundary
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		initial_recv_budget: Option<u64>,
+		/// Receive-direction records left at which the client opens a
+		/// renewal (tracks the peer's send counter)
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		renewal_floor: u64,
+		/// Receive-direction records left at the last epoch install,
+		/// for the server's minimum-spend flood bound
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		epoch_recv_baseline: u64,
+	}
+
+	/// Client epoch state parked between `RekeyAck` and `RekeyDone`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	struct PendingDone {
+		recv_cipher: RecvCipher,
+		receipt: StoredReceipt,
 	}
 
 	/// Drain buffered control into the writer queue. Cancellation-safe:
-	/// an envelope leaves the buffer only after its slot is reserved.
+	/// a command leaves the buffer only after its slot is reserved.
 	async fn flush_control(
 		outbound: &mut mpsc::Sender<Outbound>,
-		pending: &mut VecDeque<TransportEnvelope>,
+		pending: &mut VecDeque<Outbound>,
 	) -> TransportResult<()> {
 		while !pending.is_empty() {
 			let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
@@ -1357,29 +1992,28 @@ mod router {
 				return Err(TransportError::ConnectionClosed);
 			}
 
-			let Some(envelope) = pending.pop_front() else {
+			let Some(command) = pending.pop_front() else {
 				return Ok(());
 			};
 
-			outbound
-				.start_send(Outbound::Envelope(envelope))
-				.map_err(|_| TransportError::ConnectionClosed)?;
+			outbound.start_send(command).map_err(|_| TransportError::ConnectionClosed)?;
 		}
 
 		Ok(())
 	}
 
-	/// Whether `envelope` is a buffered credit grant for `stream_id`.
-	fn is_credit_grant_for(envelope: &TransportEnvelope, stream_id: u32) -> bool {
+	/// Whether `command` is a buffered credit grant for `stream_id`.
+	fn is_credit_grant_for(command: &Outbound, stream_id: u32) -> bool {
 		matches!(
-			envelope,
-			TransportEnvelope::Mux(MuxEnvelope::Credit(package)) if package.stream_id() == stream_id
+			command,
+			Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package)))
+				if package.stream_id() == stream_id
 		)
 	}
 
-	/// Whether `envelope` is a buffered ping ack.
-	fn is_ping_ack(envelope: &TransportEnvelope) -> bool {
-		matches!(envelope, TransportEnvelope::Mux(MuxEnvelope::Ping(_)))
+	/// Whether `command` is a buffered ping ack.
+	fn is_ping_ack(command: &Outbound) -> bool {
+		matches!(command, Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Ping(_))))
 	}
 
 	impl<R> MuxReaderDriver<R>
@@ -1418,8 +2052,224 @@ mod router {
 						// are no longer coming: drop their partial buffers
 						self.local_reassembly.retain(|id, _| self.shared.is_pending(*id));
 					}
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					MuxEnvelope::RekeyRequest(package) => self.route_rekey_request(package).await?,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					MuxEnvelope::RekeyResponse(package) => self.route_rekey_response(package).await?,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					MuxEnvelope::RekeyAck(package) => self.route_rekey_ack(package).await?,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					MuxEnvelope::RekeyDone(package) => self.route_rekey_done(package)?,
+					// No rekey exchange can be driven on this build:
+					// any rekey leg is unsolicited and fails closed.
+					#[cfg(not(any(feature = "transport-cms", feature = "transport-ecies")))]
+					MuxEnvelope::RekeyRequest(_)
+					| MuxEnvelope::RekeyResponse(_)
+					| MuxEnvelope::RekeyAck(_)
+					| MuxEnvelope::RekeyDone(_) => return Err(self.protocol_violation()),
+				}
+
+				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				self.watch_recv_records()?;
+			}
+		}
+
+		/// Receive-direction renewal trigger: the client's receive
+		/// counter tracks the server's send counter on the ordered
+		/// channel, so approaching the record limit here opens a
+		/// renewal without any wire addition.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn watch_recv_records(&mut self) -> TransportResult<()> {
+			if self.reader.remaining_records() > self.renewal_floor {
+				return Ok(());
+			}
+			let Some(RekeyDriver::Client(exchange)) = self.rekey.as_ref() else {
+				return Ok(());
+			};
+			let Some(request) = open_renewal(&self.shared, exchange) else {
+				return Ok(());
+			};
+
+			self.queue_control(request)
+		}
+
+		/// Drain gracefully on a settlement or approval refusal,
+		/// preserving the connection long enough for owed traffic and
+		/// the recorded evidence to survive the disagreement.
+		///
+		/// Runs on the read loop, so the GoAway buffers through
+		/// [`Self::queue_command`] rather than awaiting a full outbound
+		/// queue (RFC 9113 §5.2: reads must continue under write
+		/// backpressure or mutually saturated peers deadlock).
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn drain_refused(&mut self, code: u32) -> TransportResult<()> {
+			#[cfg(feature = "instrument")]
+			self.shared.emit_event(events::MUX_REKEY_REFUSED);
+
+			let Some(package) = goaway_package(&self.shared, refusal_reason(code)) else {
+				return Ok(());
+			};
+
+			self.queue_control(package.into())
+		}
+
+		/// Server leg: issue the epoch receipt for a renewal request.
+		///
+		/// Rekey-flood bound (CWE-400): a request while an exchange is
+		/// in flight, or before the peer spent
+		/// [`DEFAULT_REKEY_MIN_SPEND_RECORDS`] records since the last
+		/// install, is a protocol violation.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		async fn route_rekey_request(&mut self, package: MuxRekeyRequestPackage) -> TransportResult<()> {
+			let spent = self.epoch_recv_baseline.saturating_sub(self.reader.remaining_records());
+			let issued = {
+				let Some(RekeyDriver::Server(exchange)) = self.rekey.as_mut() else {
+					return Err(self.protocol_violation());
+				};
+				if exchange.exchange_in_flight() || spent < DEFAULT_REKEY_MIN_SPEND_RECORDS {
+					None
+				} else {
+					Some(exchange.process_request(&package).await)
+				}
+			};
+
+			match issued {
+				Some(Ok(response)) => {
+					#[cfg(feature = "instrument")]
+					self.shared.emit_event(events::MUX_REKEY_RECEIPT_ISSUED);
+
+					let envelope = TransportEnvelope::from(response);
+					self.queue_control(envelope)
+				}
+				Some(Err(HandshakeError::SettlementRejected { code })) => self.drain_refused(code),
+				Some(Err(_)) => {
+					#[cfg(feature = "instrument")]
+					self.shared.emit_event(events::MUX_REKEY_VERIFY_FAILED);
+
+					Err(self.protocol_violation())
+				}
+				None => Err(self.protocol_violation()),
+			}
+		}
+
+		/// Client leg: verify and countersign the epoch receipt, park
+		/// new c2s admissions, and hand the `RekeyAck` plus fresh send
+		/// cipher to the writer (which holds it until owed chunks
+		/// quiesce). The receive-side install waits for `RekeyDone`.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		async fn route_rekey_response(&mut self, package: MuxRekeyResponsePackage) -> TransportResult<()> {
+			if self.shared.rekey_phase() != RekeyPhase::AwaitingResponse {
+				return Err(self.protocol_violation());
+			}
+			let Some(RekeyDriver::Client(exchange)) = self.rekey.as_ref() else {
+				return Err(self.protocol_violation());
+			};
+
+			let exchange = Arc::clone(exchange);
+			let mut guard = exchange.lock().await;
+			let processed = guard.process_response(package).await;
+
+			drop(guard);
+
+			match processed {
+				Ok((ack, install)) => {
+					#[cfg(feature = "instrument")]
+					self.shared.emit_event(events::MUX_REKEY_RECEIPT_COUNTERSIGNED);
+
+					let EpochInstall { send_cipher, recv_cipher, receipt, epoch: _ } = install;
+
+					self.pending_install = Some(PendingDone { recv_cipher, receipt });
+					// Park before the ack is queued: no admission can
+					// debit the old epoch once the ack is in motion
+					self.shared.begin_ack_flush();
+
+					let ack_envelope = TransportEnvelope::from(ack);
+					let install = Outbound::EnvelopeThenInstall(ack_envelope, Box::new(send_cipher));
+					self.queue_command(install)
+				}
+				Err(HandshakeError::ApprovalRefused { code }) => {
+					self.shared.finish_renewal();
+					self.drain_refused(code)
+				}
+				Err(_) => {
+					#[cfg(feature = "instrument")]
+					self.shared.emit_event(events::MUX_REKEY_VERIFY_FAILED);
+
+					Err(self.protocol_violation())
 				}
 			}
+		}
+
+		/// Server leg: settle the countersignature and switch epochs.
+		///
+		/// The receive cipher installs even on a settlement refusal:
+		/// the client switched its send direction at the `RekeyAck`
+		/// boundary, so the refusal's GoAway drain must stay
+		/// decryptable. A rejected settlement drains instead of
+		/// resetting budgets.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		async fn route_rekey_ack(&mut self, package: MuxRekeyAckPackage) -> TransportResult<()> {
+			let settled = {
+				let Some(RekeyDriver::Server(exchange)) = self.rekey.as_mut() else {
+					return Err(self.protocol_violation());
+				};
+				exchange.process_ack(package).await
+			};
+			let Ok(outcome) = settled else {
+				#[cfg(feature = "instrument")]
+				self.shared.emit_event(events::MUX_REKEY_VERIFY_FAILED);
+
+				return Err(self.protocol_violation());
+			};
+
+			let ServerAckOutcome { install, rejection } = outcome;
+			let EpochInstall { send_cipher, recv_cipher, receipt, epoch: _ } = install;
+			self.reader.install_recv_cipher(recv_cipher)?;
+			self.epoch_recv_baseline = self.reader.remaining_records();
+
+			if let Some(code) = rejection {
+				return self.drain_refused(code);
+			}
+
+			// Budget boundary at `RekeyDone`: the strict c2s park
+			// guarantees nothing is in flight across the inbound reset,
+			// and every post-reset outbound debit queues behind the
+			// `RekeyDone` about to be enqueued
+			self.recv_budget = self.initial_recv_budget;
+			self.shared.reset_send_budget();
+			self.shared.rotate_receipt(receipt);
+
+			#[cfg(feature = "instrument")]
+			self.shared.emit_event(events::MUX_REKEY_RENEWED);
+
+			let done_package = MuxRekeyDonePackage::default();
+			let done_envelope = TransportEnvelope::from(done_package);
+			let install = Outbound::EnvelopeThenInstall(done_envelope, Box::new(send_cipher));
+			self.queue_command(install)
+		}
+
+		/// Client leg: `RekeyDone` activates the new epoch - receive
+		/// cipher installs, budgets reset, the receipt rotates, and
+		/// parked admissions resume.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn route_rekey_done(&mut self, _package: MuxRekeyDonePackage) -> TransportResult<()> {
+			if self.shared.rekey_phase() != RekeyPhase::AwaitingDone {
+				return Err(self.protocol_violation());
+			}
+			let Some(PendingDone { recv_cipher, receipt }) = self.pending_install.take() else {
+				return Err(self.protocol_violation());
+			};
+
+			self.reader.install_recv_cipher(recv_cipher)?;
+			self.recv_budget = self.initial_recv_budget;
+			self.shared.reset_send_budget();
+			self.shared.rotate_receipt(receipt);
+			self.shared.finish_renewal();
+
+			#[cfg(feature = "instrument")]
+			self.shared.emit_event(events::MUX_REKEY_RENEWED);
+
+			Ok(())
 		}
 
 		/// Enforce the advertised chunk ceiling and debit the inbound
@@ -1463,24 +2313,28 @@ mod router {
 			}
 		}
 
-		/// Hand a control envelope to the writer, buffering on a full
+		/// Hand a control command to the writer, buffering on a full
 		/// queue instead of parking the read loop.
-		fn queue_control(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
+		fn queue_command(&mut self, command: Outbound) -> TransportResult<()> {
 			if !self.pending_control.is_empty() {
-				self.pending_control.push_back(envelope);
+				self.pending_control.push_back(command);
 				return Ok(());
 			}
 
-			match self.outbound.try_send(Outbound::Envelope(envelope)) {
+			match self.outbound.try_send(command) {
 				Ok(()) => Ok(()),
 				Err(refused) if refused.is_full() => {
-					if let Outbound::Envelope(envelope) = refused.into_inner() {
-						self.pending_control.push_back(envelope);
-					}
+					self.pending_control.push_back(refused.into_inner());
 					Ok(())
 				}
 				Err(_) => Err(TransportError::ConnectionClosed),
 			}
+		}
+
+		/// Hand a control envelope to the writer, buffering on a full
+		/// queue instead of parking the read loop.
+		fn queue_control(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
+			self.queue_command(Outbound::Envelope(envelope))
 		}
 
 		/// Queue a credit grant, superseding any buffered grant for the
@@ -1614,6 +2468,9 @@ mod router {
 		/// Refuse an open past our GoAway watermark. The chunk still
 		/// crossed the wire under the sender's ledgers, so debit inbound.
 		fn reject_draining_open(&mut self, stream_id: u32, package: MuxOpenPackage) -> TransportResult<()> {
+			#[cfg(feature = "instrument")]
+			self.shared.emit_event(events::MUX_OPEN_DRAINING);
+
 			self.charge_inbound_chunk(package.payload())?;
 			self.refuse_stream(stream_id);
 
@@ -1622,11 +2479,13 @@ mod router {
 
 		async fn route_data(&mut self, package: MuxDataPackage) -> TransportResult<()> {
 			let stream_id = package.stream_id();
+
 			// The chunker never emits an empty chunk: empty payloads travel
 			// only in trailers
 			if package.payload().is_empty() {
 				return Err(self.protocol_violation());
 			}
+
 			if self.shared.role.peer().initiates(stream_id) {
 				return self.route_request_data(package).await;
 			}
@@ -1761,9 +2620,9 @@ mod router {
 				return Ok(());
 			}
 
-			// After our GoAway the writer's remaining records are reserved
-			// for owed stream traffic (see `drain_headroom`), so peer
-			// probes draw no acks. Combined with the capped ack backlog
+			// After our GoAway the writer's remaining records are reserved for
+			// owed stream traffic (see `MuxSettings::drain_reserve_records`),
+			// so peer probes draw no acks. Combined with the capped ack backlog
 			// this bounds what a ping flood can extract (CVE-2019-9512).
 			if self.shared.shutdown_begun() {
 				return Ok(());
@@ -1778,6 +2637,12 @@ mod router {
 		}
 
 		fn protocol_violation(&mut self) -> TransportError {
+			#[cfg(feature = "instrument")]
+			self.shared.emit_event(events::MUX_PROTOCOL_ERROR);
+			#[cfg(feature = "instrument")]
+			self.shared
+				.emit_goaway_event(events::MUX_GOAWAY_SENT, GoAwayReason::ProtocolError);
+
 			let package = GoAwayPackage::new(self.shared.last_peer_stream_id(), GoAwayReason::ProtocolError);
 			let _ = self.outbound.try_send(Outbound::Envelope(package.into()));
 
@@ -1849,7 +2714,7 @@ mod router {
 		};
 
 		let credits = payload_credits(payload.len(), shared.send_chunk_size, shared.credit_unit);
-		match shared.debit_send_budget(credits, true) {
+		match shared.admit_debit(credits, true).await {
 			Ok(BudgetStanding::Healthy) => {}
 			Ok(BudgetStanding::Exhausting) => {
 				drain_with_reason(shared, outbound, GoAwayReason::BudgetExhausted).await?;
@@ -1877,13 +2742,6 @@ mod router {
 
 		let mut sent: u64 = 0;
 		for chunk in payload.chunks(chunk_size) {
-			match (SendPermit { shared, stream_id }).await {
-				Ok(()) => {}
-				// Ledger removed mid-send: the peer cancelled the stream
-				// and the receiver will discard what already went out
-				Err(_) => return Ok(()),
-			}
-
 			sent += 1;
 
 			let envelope = if sent == total {
@@ -1891,9 +2749,15 @@ mod router {
 			} else {
 				TransportEnvelope::from(MuxDataPackage::new(stream_id, false, chunk)?)
 			};
-			if outbound.send(Outbound::Envelope(envelope)).await.is_err() {
-				shared.finish_send_stream(stream_id);
-				return Err(TransportError::ConnectionClosed);
+			match send_data_envelope(shared, &mut outbound, stream_id, envelope).await {
+				Ok(()) => {}
+				// Ledger removed mid-send: the peer cancelled the stream
+				// and the receiver will discard what already went out
+				Err(TransportError::OperationFailed(TransportFailure::Cancelled)) => return Ok(()),
+				Err(err) => {
+					shared.finish_send_stream(stream_id);
+					return Err(err);
+				}
 			}
 		}
 
@@ -1951,7 +2815,7 @@ mod router {
 							handle.abort();
 
 							if self.cancel_budget == 0 {
-								return Err(self.refuse_cancel_abuse(last_stream_id).await);
+								return Err(self.refuse_cancel_abuse(last_stream_id));
 							}
 
 							self.cancel_budget -= 1;
@@ -1960,17 +2824,21 @@ mod router {
 					ResponderEvent::Request(stream_id, frame) => {
 						last_stream_id = stream_id;
 
-						if in_flight.len() >= cap_as_usize(self.peer_cap) {
-							let refusal = ResponsePackage::new(TransitStatus::ResourceExhausted, None);
-							send_response(&self.shared, &self.outbound, stream_id, refusal).await?;
-							continue;
-						}
+						// A request at the concurrency cap resolves to an
+						// immediate refusal. Both outcomes ship as tasks so
+						// the event loop never parks on a full outbound queue.
+						let at_cap = in_flight.len() >= cap_as_usize(self.peer_cap);
+						let work = if at_cap {
+							Either::Right(ready(ResponsePackage::new(TransitStatus::ResourceExhausted, None)))
+						} else {
+							Either::Left(handler(frame))
+						};
 
 						let (handle, registration) = AbortHandle::new_pair();
+						if !at_cap {
+							in_flight.insert(stream_id, handle);
+						}
 
-						in_flight.insert(stream_id, handle);
-
-						let work = handler(frame);
 						let shared = Arc::clone(&self.shared);
 						let outbound = outbound_handle(&self.outbound);
 						let task = async move {
@@ -1979,6 +2847,7 @@ mod router {
 
 							(stream_id, result)
 						};
+
 						tasks.push(Abortable::new(task, registration));
 					}
 					ResponderEvent::Finished(stream_id, result) => {
@@ -1991,9 +2860,18 @@ mod router {
 
 		/// CVE-2023-44487 hardening: too many cancels of in-flight
 		/// handlers ends the connection with a best-effort GoAway.
-		async fn refuse_cancel_abuse(&mut self, last_stream_id: u32) -> TransportError {
+		/// `try_send` keeps the courtesy notice from parking the
+		/// responder on a full outbound queue: the connection is being
+		/// torn down either way.
+		fn refuse_cancel_abuse(&mut self, last_stream_id: u32) -> TransportError {
+			#[cfg(feature = "instrument")]
+			self.shared.emit_event(events::MUX_CANCEL_BUDGET);
+			#[cfg(feature = "instrument")]
+			self.shared
+				.emit_goaway_event(events::MUX_GOAWAY_SENT, GoAwayReason::EnhanceYourCalm);
+
 			let package = GoAwayPackage::new(last_stream_id, GoAwayReason::EnhanceYourCalm);
-			let _ = self.outbound.send(Outbound::Envelope(package.into())).await;
+			let _ = self.outbound.try_send(Outbound::Envelope(package.into()));
 
 			TransportError::OperationFailed(TransportFailure::PolicyRejection)
 		}
@@ -2034,8 +2912,19 @@ mod router {
 			let (outbound_sender, outbound_receiver) = mpsc::channel(outbound_capacity);
 			let (inbound_sender, inbound_receiver) = mpsc::channel(inbound_capacity);
 
-			let shared = Arc::new(MuxShared::new(role, &settings));
-			let drain_headroom = drain_headroom(&settings);
+			// Seam instrumentation inherits the connection collector the
+			// halves carried across the split; no separate injection.
+			#[cfg(not(feature = "instrument"))]
+			let shared = MuxShared::new(role, &settings);
+			#[cfg(feature = "instrument")]
+			let shared = {
+				let mut shared = MuxShared::new(role, &settings);
+				shared.trace = reader.trace().or_else(|| writer.trace());
+				shared
+			};
+
+			let shared = Arc::new(shared);
+			let drain_headroom = settings.drain_reserve_records();
 
 			Self {
 				handle: MuxHandle { shared: Arc::clone(&shared), outbound: outbound_handle(&outbound_sender) },
@@ -2052,12 +2941,30 @@ mod router {
 					peer_reassembly: HashMap::new(),
 					local_reassembly: HashMap::new(),
 					pending_control: VecDeque::new(),
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					rekey: None,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					pending_install: None,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					initial_recv_budget: settings.recv_budget,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					renewal_floor: renewal_floor(drain_headroom),
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					epoch_recv_baseline: 0,
 				},
 				writer: MuxWriterDriver {
 					writer,
 					commands: outbound_receiver,
 					shared: Arc::clone(&shared),
 					drain_headroom,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					exchange: None,
+					#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+					pending_ack: None,
+					#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+					renewal_started: None,
+					#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+					renewal_deadline: Duration::from_secs(DEFAULT_REKEY_DEADLINE_SECS),
 				},
 				responder: MuxResponder {
 					inbound: inbound_receiver,
@@ -2067,6 +2974,50 @@ mod router {
 					cancel_budget: DEFAULT_MUX_CANCEL_BUDGET,
 				},
 			}
+		}
+
+		/// Attach in-band rekey (receipt-bearing sessions only).
+		/// Seeds the handle receipt accessor from the handshake artifact;
+		/// each completed renewal overwrites it.
+		///
+		/// The client half of the exchange is shared between the reader
+		/// (drives the legs), the writer (record-watermark trigger),
+		/// and the budget trigger. The server half lives in the reader
+		/// alone.
+		///
+		/// # Renewal deadline
+		///
+		/// The renewal deadline (`with_renewal_deadline`, tokio-only)
+		/// bounds how long a peer that never answers a renewal can park
+		/// this endpoint's data at the hard floor. Builds without tokio
+		/// have no timer here: the embedding application MUST bound
+		/// parked emits itself by wrapping emit futures in its own
+		/// timeout (a cancelled emit frees its stream slot).
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[must_use]
+		pub fn with_rekey(mut self, context: MuxRekeyContext) -> Self {
+			let MuxRekeyContext { driver, receipt } = context;
+			self.reader.shared.rotate_receipt(receipt);
+			self.reader.epoch_recv_baseline = self.reader.reader.remaining_records();
+
+			if let RekeyDriver::Client(exchange) = &driver {
+				self.writer.exchange = Some(Arc::clone(exchange));
+				let mut state = self.reader.shared.lock();
+				state.rekey_client = true;
+			}
+			self.reader.rekey = Some(driver);
+
+			self
+		}
+
+		/// Override the time budget for one in-band renewal exchange
+		/// (default [`DEFAULT_REKEY_DEADLINE_SECS`]). Expiry drains the
+		/// connection on the GoAway path.
+		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+		#[must_use]
+		pub fn with_renewal_deadline(mut self, deadline: Duration) -> Self {
+			self.writer.renewal_deadline = deadline;
+			self
 		}
 
 		/// Override the peer cancel budget (CVE-2023-44487 hardening).
@@ -2346,12 +3297,6 @@ mod router {
 		}
 
 		#[test]
-		fn test_drain_headroom_covers_queue_responses_cancels_goaway() {
-			let settings = MuxSettings { local_initiated_cap: 3, peer_initiated_cap: 5, ..MuxSettings::symmetric(1) };
-			assert_eq!(drain_headroom(&settings), 17);
-		}
-
-		#[test]
 		fn test_ping_allocates_monotonic_opaque() {
 			let shared = shared(MuxRole::Client, 8);
 			allocate_ping_ids(&shared, &[0, 1, 2]);
@@ -2536,15 +3481,6 @@ mod router {
 		}
 
 		#[test]
-		fn test_budget_drain_headroom_prices_records() {
-			assert_eq!(budget_drain_headroom(&budget_settings(0)), 5);
-
-			let mut coarse = budget_settings(0);
-			coarse.credit_unit = 512;
-			assert_eq!(budget_drain_headroom(&coarse), 10);
-		}
-
-		#[test]
 		fn test_send_chunk_parks_at_limit_and_resumes_on_grant() {
 			let shared = shared_with_settings(MuxRole::Client, metered_settings(1, None));
 			shared.register_send_stream(1, 2);
@@ -2578,7 +3514,6 @@ mod router {
 		fn test_credit_grants_are_monotonic() {
 			let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
 			shared.register_send_stream(1, 4);
-
 			// A grant at or below the current limit changes nothing
 			shared.apply_credit_grant(1, 1);
 
@@ -2632,6 +3567,67 @@ mod router {
 		fn test_unmetered_budget_never_exhausts() {
 			let shared = shared_with_settings(MuxRole::Client, metered_settings(1, None));
 			assert!(matches!(shared.debit_send_budget(u64::MAX, false), Ok(BudgetStanding::Healthy)));
+		}
+
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[test]
+		fn test_renewal_floor_adds_exchange_allowance() {
+			assert_eq!(renewal_floor(0), DEFAULT_REKEY_RENEWAL_ALLOWANCE);
+
+			let drain_floor = MuxSettings::symmetric(4).drain_reserve_records();
+			assert_eq!(renewal_floor(drain_floor), drain_floor + DEFAULT_REKEY_RENEWAL_ALLOWANCE);
+			assert_eq!(renewal_floor(u64::MAX), u64::MAX);
+		}
+
+		/// Put a client-side shared state into an in-flight renewal.
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		fn begin_client_renewal(shared: &MuxShared) {
+			let mut state = shared.lock();
+			state.rekey_client = true;
+			state.rekey = RekeyPhase::AwaitingResponse;
+		}
+
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[test]
+		fn test_admissions_park_across_renewal_and_resume() {
+			let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
+			begin_client_renewal(&shared);
+
+			let (flag, waker) = FlagWake::pair();
+			let mut parked_cx = Context::from_waker(&waker);
+			let parked = shared.poll_admit_debit(1, false, &mut parked_cx);
+			assert!(matches!(parked, Poll::Pending));
+
+			shared.finish_renewal();
+			assert!(flag.woken());
+
+			let mut cx = noop_cx();
+			let admitted = shared.poll_admit_debit(1, false, &mut cx);
+			assert!(matches!(admitted, Poll::Ready(Ok(BudgetStanding::Healthy))));
+		}
+
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		#[test]
+		fn test_hard_floor_parks_chunks_until_ack_writes() {
+			let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
+			shared.register_send_stream(1, 1);
+			begin_client_renewal(&shared);
+			shared.park_hard_floor();
+
+			let (mut outbound, _outbound_rx) = mpsc::channel(4);
+			let ping = MuxPingPackage::new(false, 0);
+			let mut slot = Some(TransportEnvelope::from(ping));
+			let (flag, waker) = FlagWake::pair();
+			let mut parked_cx = Context::from_waker(&waker);
+			let parked = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut parked_cx);
+			assert!(matches!(parked, Poll::Pending));
+
+			shared.mark_ack_written();
+			assert!(flag.woken());
+
+			let mut cx = noop_cx();
+			let enqueued = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut cx);
+			assert!(matches!(enqueued, Poll::Ready(Ok(()))));
 		}
 
 		#[test]
@@ -2730,6 +3726,16 @@ mod router {
 				peer_reassembly: HashMap::new(),
 				local_reassembly: HashMap::new(),
 				pending_control: VecDeque::new(),
+				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				rekey: None,
+				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				pending_install: None,
+				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				initial_recv_budget: None,
+				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				renewal_floor: 0,
+				#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				epoch_recv_baseline: 0,
 			};
 
 			ReaderFixture { driver, outbound: outbound_receiver, _inbound: inbound_receiver, delivered }
@@ -2745,13 +3751,18 @@ mod router {
 			}
 		}
 
+		/// Fixture open package for stream 1 carrying a four-byte payload.
+		fn open_package() -> MuxOpenPackage {
+			MuxOpenPackage::new(1, false, vec![0u8; 4]).expect("fixture payload fits an open package")
+		}
+
 		// The h2 deadlock lesson ([RFC 9113 § 5.2.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2)): a full outbound
 		// queue must never park the read loop, or two mutually parked
 		// endpoints deadlock. Credit grants and ping acks buffer locally
 		// instead.
 		#[test]
 		fn test_reader_reads_while_outbound_queue_full() {
-			let open = MuxOpenPackage::new(1, false, vec![0u8; 4]).unwrap();
+			let open = open_package();
 			let probe = MuxPingPackage::new(false, 7);
 			let fixture = reader_with_full_queue(vec![open.into(), probe.into()]);
 			let delivered = Arc::clone(&fixture.delivered);
@@ -2764,7 +3775,7 @@ mod router {
 
 		#[test]
 		fn test_buffered_control_flushes_as_capacity_returns() {
-			let open = MuxOpenPackage::new(1, false, vec![0u8; 4]).unwrap();
+			let open = open_package();
 			let probe = MuxPingPackage::new(false, 7);
 			let mut fixture = reader_with_full_queue(vec![open.into(), probe.into()]);
 
@@ -2797,27 +3808,29 @@ mod router {
 		}
 
 		#[test]
-		fn test_buffered_credit_grants_coalesce_per_stream() {
+		fn test_buffered_credit_grants_coalesce_per_stream() -> TransportResult<()> {
 			let mut fixture = reader_with_full_queue(Vec::new());
-			fixture.driver.queue_credit(1, 2).unwrap();
-			fixture.driver.queue_credit(3, 2).unwrap();
-			fixture.driver.queue_credit(1, 4).unwrap();
+			fixture.driver.queue_credit(1, 2)?;
+			fixture.driver.queue_credit(3, 2)?;
+			fixture.driver.queue_credit(1, 4)?;
 
 			let buffered: Vec<_> = fixture.driver.pending_control.iter().collect();
 			assert_eq!(buffered.len(), 2);
 			assert!(is_credit_grant_for(buffered[0], 3));
 			assert!(matches!(
 				buffered[1],
-				TransportEnvelope::Mux(MuxEnvelope::Credit(package))
+				Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package)))
 					if package.stream_id() == 1 && package.limit() == 4
 			));
+
+			Ok(())
 		}
 
 		#[test]
-		fn test_ping_ack_backlog_is_capped() {
+		fn test_ping_ack_backlog_is_capped() -> TransportResult<()> {
 			let mut fixture = reader_with_full_queue(Vec::new());
 			for opaque in 0..8 {
-				fixture.driver.queue_ping_ack(MuxPingPackage::new(true, opaque)).unwrap();
+				fixture.driver.queue_ping_ack(MuxPingPackage::new(true, opaque))?;
 			}
 
 			let buffered_acks = fixture
@@ -2827,6 +3840,8 @@ mod router {
 				.filter(|envelope| is_ping_ack(envelope))
 				.count();
 			assert_eq!(buffered_acks, MAX_PENDING_PING_ACKS);
+
+			Ok(())
 		}
 	}
 }
@@ -2835,5 +3850,3 @@ mod router {
 pub use router::{
 	BufferedGrantor, CreditGrantor, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver,
 };
-
-pub use super::envelopes::GoAwayReason;

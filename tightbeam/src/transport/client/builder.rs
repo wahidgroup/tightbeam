@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use core::marker::PhantomData;
 use core::time::Duration;
 
 #[cfg(not(feature = "std"))]
@@ -14,7 +15,7 @@ use crate::transport::error::TransportFailure;
 use crate::transport::{MessageCollector, Protocol, TransportResult};
 
 #[cfg(feature = "policy")]
-use crate::policy::{GatePolicy, TransitStatus};
+use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 #[cfg(feature = "std")]
 use crate::transport::ConnectionBuilder;
 #[cfg(feature = "transport-policy")]
@@ -75,8 +76,8 @@ impl RestartPolicy for DynRestart {
 
 pub struct DynGate(pub Arc<dyn GatePolicy + Send + Sync>);
 impl GatePolicy for DynGate {
-	fn evaluate(&self, message: &Frame) -> TransitStatus {
-		self.0.evaluate(message)
+	fn evaluate(&self, message: &Frame, session: &SessionContext) -> TransitStatus {
+		self.0.evaluate(message, session)
 	}
 }
 
@@ -145,7 +146,7 @@ pub struct ClientBuilder<P: Protocol, C: CryptoProvider + 'static = DefaultCrypt
 	server_certificate_chain: Option<Arc<[Certificate]>>,
 	#[cfg(feature = "x509")]
 	handshake_protocol: Option<HandshakeProtocolKind>,
-	_ph: core::marker::PhantomData<(P, C)>,
+	_ph: PhantomData<(P, C)>,
 }
 
 impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
@@ -162,7 +163,7 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 			server_certificate_chain: None,
 			#[cfg(feature = "x509")]
 			handshake_protocol: None,
-			_ph: core::marker::PhantomData,
+			_ph: PhantomData,
 		}
 	}
 
@@ -247,7 +248,6 @@ where
 		if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
 			let cert = Arc::new(cert);
 			let key = Arc::new(key);
-
 			transport = transport.with_client_identity(cert, key);
 		}
 		if let Some(chain) = self.server_certificate_chain {
@@ -317,7 +317,7 @@ where
 }
 
 impl GatePolicy for Arc<dyn GatePolicy + Send + Sync> {
-	fn evaluate(&self, message: &Frame) -> TransitStatus {
-		(**self).evaluate(message)
+	fn evaluate(&self, message: &Frame, session: &SessionContext) -> TransitStatus {
+		(**self).evaluate(message, session)
 	}
 }

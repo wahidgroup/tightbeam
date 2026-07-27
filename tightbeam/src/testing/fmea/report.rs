@@ -217,7 +217,7 @@ fn analyze_effects(fault: &InjectedFaultRecord, process: &Process) -> Vec<String
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::specs::csp::{Process, State};
+	use crate::testing::specs::csp::{Event, Process, State};
 
 	// Test fixtures and helpers
 	fn create_fault(state: &str, event: &str) -> InjectedFaultRecord {
@@ -283,12 +283,12 @@ mod tests {
 	#[test]
 	fn test_analyze_effects_terminal_state_reachable() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("TestProcess")
-			.add_observable("start")
-			.add_observable("finish")
+			.add_observable(Event("start"))
+			.add_observable(Event("finish"))
 			.initial_state(State("Init"))
 			.add_terminal(State("Success"))
-			.add_transition(State("Init"), "start", State("Running"))
-			.add_transition(State("Running"), "finish", State("Success"))
+			.add_transition(State("Init"), Event("start"), State("Running"))
+			.add_transition(State("Running"), Event("finish"), State("Success"))
 			.build()?;
 
 		let effects = analyze_effects(&create_fault("Init", "start"), &process);
@@ -300,9 +300,9 @@ mod tests {
 	#[test]
 	fn test_analyze_effects_deadlock_detection() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("DeadlockProcess")
-			.add_observable("start")
+			.add_observable(Event("start"))
 			.initial_state(State("Init"))
-			.add_transition(State("Init"), "start", State("Blocked"))
+			.add_transition(State("Init"), Event("start"), State("Blocked"))
 			.build()?;
 
 		let effects = analyze_effects(&create_fault("Init", "start"), &process);
@@ -314,13 +314,13 @@ mod tests {
 	#[test]
 	fn test_analyze_effects_state_space_restriction() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("RestrictedProcess")
-			.add_observable("to_a")
-			.add_observable("to_b")
-			.add_observable("to_c")
+			.add_observable(Event("to_a"))
+			.add_observable(Event("to_b"))
+			.add_observable(Event("to_c"))
 			.initial_state(State("Init"))
-			.add_transition(State("Init"), "to_a", State("A"))
-			.add_transition(State("A"), "to_b", State("B"))
-			.add_transition(State("B"), "to_c", State("C"))
+			.add_transition(State("Init"), Event("to_a"), State("A"))
+			.add_transition(State("A"), Event("to_b"), State("B"))
+			.add_transition(State("B"), Event("to_c"), State("C"))
 			.build()?;
 
 		let effects = analyze_effects(&create_fault("A", "to_b"), &process);
@@ -332,7 +332,7 @@ mod tests {
 	#[test]
 	fn test_analyze_effects_unknown_state() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("SimpleProcess")
-			.add_observable("event")
+			.add_observable(Event("event"))
 			.initial_state(State("Known"))
 			.build()?;
 
@@ -346,12 +346,12 @@ mod tests {
 	#[test]
 	fn test_analyze_effects_default_message() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("NormalProcess")
-			.add_observable("event1")
-			.add_observable("event2")
+			.add_observable(Event("event1"))
+			.add_observable(Event("event2"))
 			.initial_state(State("S1"))
-			.add_transition(State("S1"), "event1", State("S2"))
-			.add_transition(State("S2"), "event2", State("S3"))
-			.add_transition(State("S3"), "event1", State("S1"))
+			.add_transition(State("S1"), Event("event1"), State("S2"))
+			.add_transition(State("S2"), Event("event2"), State("S3"))
+			.add_transition(State("S3"), Event("event1"), State("S1"))
 			.build()?;
 
 		let effects = analyze_effects(&create_fault("S1", "event1"), &process);

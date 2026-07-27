@@ -308,6 +308,45 @@ impl MuxSettings {
 			recv_budget: None,
 		}
 	}
+
+	/// Static records this endpoint reserves so a graceful drain can
+	/// finish after the GoAway fires
+	/// ([RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5)).
+	///
+	/// At the moment a limit check trips, the connection can still owe:
+	/// - envelopes already queued outbound, at most the channel capacity
+	/// - response trailers to in-flight peer streams, at most `peer_cap`
+	/// - drop-guard cancels for pending local streams, at most `local_cap`
+	/// - the GoAway itself, exactly 1
+	///
+	/// Total: `2 * (local_cap + peer_cap) + 1`. A hostile peer that keeps
+	/// opening streams after the GoAway draws refusal cancels beyond any
+	/// bound and only exhausts the cipher of its own dying connection.
+	pub fn drain_reserve_records(&self) -> u64 {
+		u64::from(self.local_initiated_cap)
+			.saturating_add(u64::from(self.peer_initiated_cap))
+			.saturating_mul(2)
+			.saturating_add(1)
+	}
+
+	/// Credits reserved out of the outbound session budget for the drain
+	/// reserve: [`Self::drain_reserve_records`] priced at the worst-case
+	/// per-chunk debit (`ceil(send_chunk_size / credit_unit)`).
+	pub fn send_budget_reserve(&self) -> u64 {
+		let chunk = u64::from(self.send_chunk_size.max(1));
+		let unit = u64::from(self.credit_unit.max(1));
+		self.drain_reserve_records().saturating_mul(chunk.div_ceil(unit))
+	}
+
+	/// Credits spendable on application data before the budget watermark
+	/// opens an in-band renewal (or drains an unrenewable session via
+	/// GoAway). `None` when the session is unmetered. This is the figure
+	/// a metering embedder should size invoices against: the granted
+	/// budget minus [`Self::send_budget_reserve`].
+	pub fn usable_send_budget(&self) -> Option<u64> {
+		let budget = self.send_budget?;
+		Some(budget.saturating_sub(self.send_budget_reserve()))
+	}
 }
 
 /// Clamp a wire-advertised concurrent-stream cap to
@@ -506,6 +545,30 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 
 			Ok(())
 		})
+	}
+
+	/// Issue the settlement challenge for an in-band epoch-renewal
+	/// receipt, given the session's initial receipt body.
+	///
+	/// The epoch receipt inherits the initial budgets and credit unit
+	/// (the credit-match invariant); only the challenge may vary.
+	/// [`TransportAuthorizer::settle`] is then called on the renewed
+	/// receipt exactly as at the handshake.
+	///
+	/// # Default
+	///
+	/// Challenge-free renewal: the epoch receipt carries no ancillary
+	/// and settles trivially under the default `settle`.
+	///
+	/// # Errors
+	///
+	/// [`AuthorizationRefusal`] refuses the renewal with its application
+	/// code; the session falls back to the drain path.
+	fn challenge_renewal<'a>(
+		&'a self,
+		_prior: &'a SessionReceipt,
+	) -> MaybeSendFuture<'a, Result<Option<OctetString>, AuthorizationRefusal>> {
+		Box::pin(async move { Ok(None) })
 	}
 }
 
@@ -871,8 +934,7 @@ pub(crate) fn select_profile(
 	Err(NegotiationError::NoMutualProfile)
 }
 
-// Exercises the mux negotiation helpers, which only exist when a
-// transport flavor is enabled.
+// Exercises mux negotiation helpers when a transport flavor is enabled.
 #[cfg(all(test, any(feature = "transport-cms", feature = "transport-ecies")))]
 mod tests {
 	use core::error::Error;
@@ -909,6 +971,42 @@ mod tests {
 		let offer = SecurityOffer::single(profile);
 		assert_eq!(offer.profiles.len(), 1);
 		assert_eq!(offer.profiles[0], profile);
+	}
+
+	/// Caps 1/1, chunk 1024, unit 1024: the drain reserve is 5 records
+	/// priced at 1 credit each.
+	fn reserve_settings() -> MuxSettings {
+		let mut settings = MuxSettings::symmetric(1);
+		settings.send_chunk_size = 1024;
+		settings.credit_unit = 1024;
+		settings
+	}
+
+	#[test]
+	fn test_drain_reserve_covers_responses_cancels_goaway() {
+		let settings = MuxSettings { local_initiated_cap: 3, peer_initiated_cap: 5, ..MuxSettings::symmetric(1) };
+		assert_eq!(settings.drain_reserve_records(), 17);
+	}
+
+	#[test]
+	fn test_send_budget_reserve_prices_records() {
+		let mut settings = reserve_settings();
+		assert_eq!(settings.send_budget_reserve(), 5);
+
+		settings.credit_unit = 512;
+		assert_eq!(settings.send_budget_reserve(), 10);
+	}
+
+	#[test]
+	fn test_usable_send_budget_subtracts_reserve() {
+		let mut settings = reserve_settings();
+		assert_eq!(settings.usable_send_budget(), None);
+
+		settings.send_budget = Some(10);
+		assert_eq!(settings.usable_send_budget(), Some(5));
+
+		settings.send_budget = Some(3);
+		assert_eq!(settings.usable_send_budget(), Some(0));
 	}
 
 	#[test]

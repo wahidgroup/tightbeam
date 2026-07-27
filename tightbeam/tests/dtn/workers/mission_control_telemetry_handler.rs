@@ -8,9 +8,9 @@ use std::sync::{Arc, RwLock};
 use tightbeam::{asn1::MessagePriority, der::Sequence, worker, Beamable, TightBeamError};
 
 use crate::dtn::{
+	events::{MISSION_CONTROL_ANALYZE_TELEMETRY, MISSION_CONTROL_RECEIVE_TELEMETRY, MISSION_CONTROL_SEND_COMMAND},
 	messages::{RoverCommand, RoverTelemetry},
 	servlets::MissionState,
-	ultimate::DtnEventCountSpec,
 };
 
 /// Telemetry handler request
@@ -41,8 +41,8 @@ worker! {
 		max_commands: u64,
 	},
 	handle: |request, trace, config| async move {
-		trace.event(DtnEventCountSpec::mission_control_receive_telemetry)?;
-		trace.event(DtnEventCountSpec::mission_control_analyze_telemetry)?;
+		trace.event(MISSION_CONTROL_RECEIVE_TELEMETRY)?;
+		trace.event(MISSION_CONTROL_ANALYZE_TELEMETRY)?;
 
 		// Increment telemetry counter
 		let telemetry_count = {
@@ -68,7 +68,7 @@ worker! {
 				MessagePriority::Standard
 			};
 
-			trace.event(DtnEventCountSpec::mission_control_send_command)?;
+			trace.event(MISSION_CONTROL_SEND_COMMAND)?;
 
 			Ok(TelemetryHandlerResponse {
 				should_send_command: true,

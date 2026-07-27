@@ -23,6 +23,7 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
@@ -30,6 +31,11 @@ use crate::security::common::{
 	expectation_failure, extract_ecies_ciphertext, extract_ephemeral_pubkey, Direction, HandshakeBackendKind,
 	SecurityThreatHarness,
 };
+
+pub(crate) const FS_ALL_EPHEMERAL_UNIQUE: Urn<'static> =
+	Urn::new("test", "event:forward-secrecy/fs-all-ephemeral-unique");
+pub(crate) const FS_CAPTURE_HANDSHAKE: Urn<'static> = Urn::new("test", "event:forward-secrecy/fs-capture-handshake");
+pub(crate) const FS_EXTRACT_EPHEMERAL: Urn<'static> = Urn::new("test", "event:forward-secrecy/fs-extract-ephemeral");
 
 /// Number of handshakes to perform for forward secrecy verification.
 const HANDSHAKE_COUNT: usize = 5;
@@ -40,9 +46,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(fs_capture_handshake, exactly!(HANDSHAKE_COUNT as u32)),
-			(fs_extract_ephemeral, exactly!(HANDSHAKE_COUNT as u32)),
-			(fs_all_ephemeral_unique, exactly!(1u32))
+			(FS_CAPTURE_HANDSHAKE, exactly!(HANDSHAKE_COUNT as u32)),
+			(FS_EXTRACT_EPHEMERAL, exactly!(HANDSHAKE_COUNT as u32)),
+			(FS_ALL_EPHEMERAL_UNIQUE, exactly!(1u32))
 		]
 	}
 }
@@ -52,22 +58,22 @@ tb_process_spec! {
 	events {
 		observable {
 
-			ForwardSecrecySpec::fs_capture_handshake,
-			ForwardSecrecySpec::fs_extract_ephemeral,
-			ForwardSecrecySpec::fs_all_ephemeral_unique,
-			SecurityThreatHarness::harness_spawn_session,
-			SecurityThreatHarness::harness_spawn_ecies
+			FS_CAPTURE_HANDSHAKE,
+			FS_EXTRACT_EPHEMERAL,
+			FS_ALL_EPHEMERAL_UNIQUE,
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES
 		}
 		hidden { }
 	}
 	states {
-		Idle => { SecurityThreatHarness::harness_spawn_session => Spawning },
-		Spawning => { SecurityThreatHarness::harness_spawn_ecies => SessionReady },
-		SessionReady => { ForwardSecrecySpec::fs_capture_handshake => Captured },
-		Captured => { ForwardSecrecySpec::fs_extract_ephemeral => Extracted },
+		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
+		Spawning => { SecurityThreatHarness::HARNESS_SPAWN_ECIES => SessionReady },
+		SessionReady => { FS_CAPTURE_HANDSHAKE => Captured },
+		Captured => { FS_EXTRACT_EPHEMERAL => Extracted },
 		Extracted => {
-			SecurityThreatHarness::harness_spawn_session => Spawning,
-			ForwardSecrecySpec::fs_all_ephemeral_unique => Complete
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning,
+			FS_ALL_EPHEMERAL_UNIQUE => Complete
 		},
 		Complete => { }
 	}
@@ -102,7 +108,7 @@ job! {
 			let mut session = harness.spawn(kind);
 			let captured = session.capture_full().await?;
 
-			trace.event(ForwardSecrecySpec::fs_capture_handshake)?;
+			trace.event(FS_CAPTURE_HANDSHAKE)?;
 
 			// Extract ECIES ciphertext from ClientKeyExchange (step 2)
 			let client_kex = captured
@@ -117,7 +123,7 @@ job! {
 
 			ephemeral_keys.push(ephemeral_pubkey);
 
-			trace.event(ForwardSecrecySpec::fs_extract_ephemeral)?;
+			trace.event(FS_EXTRACT_EPHEMERAL)?;
 		}
 
 		// ========================================
@@ -146,7 +152,7 @@ job! {
 			}
 		}
 
-		trace.event(ForwardSecrecySpec::fs_all_ephemeral_unique)?;
+		trace.event(FS_ALL_EPHEMERAL_UNIQUE)?;
 
 		Ok(())
 	}

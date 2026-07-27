@@ -6,7 +6,13 @@ use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::prelude::*;
 use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
+
+pub(crate) const DER_NONEMPTY: Urn<'static> = Urn::new("test", "event:frame-der/der-nonempty");
+pub(crate) const MATRIX_PRESENT: Urn<'static> = Urn::new("test", "event:frame-der/matrix-present");
+pub(crate) const ROUNDTRIP_OK: Urn<'static> = Urn::new("test", "event:frame-der/roundtrip-ok");
+pub(crate) const VERSION: Urn<'static> = Urn::new("test", "event:frame-der/version");
 
 #[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
 #[derive(Clone, Debug, PartialEq, Sequence)]
@@ -105,10 +111,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(der_nonempty, exactly!(1), equals!(true)),
-			(roundtrip_ok, exactly!(1), equals!(true)),
-			(matrix_present, exactly!(1), equals!(true)),
-			(version, exactly!(1), equals!(tb::Version::V3))
+			(DER_NONEMPTY, exactly!(1), equals!(true)),
+			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
+			(MATRIX_PRESENT, exactly!(1), equals!(true)),
+			(VERSION, exactly!(1), equals!(tb::Version::V3))
 		]
 	}
 }
@@ -127,10 +133,10 @@ tb_scenario! {
 			let der_bytes = tightbeam::encode(&frame)?;
 			let decoded: tightbeam::Frame = tightbeam::decode(&der_bytes)?;
 
-			trace.event_with(FrameDerSpec::der_nonempty, &[], !der_bytes.is_empty())?;
-			trace.event_with(FrameDerSpec::roundtrip_ok, &[], decoded == frame)?;
-			trace.event_with(FrameDerSpec::matrix_present, &[], frame.metadata.matrix.is_some())?;
-			trace.event_with(FrameDerSpec::version, &[], frame.version)?;
+			trace.event_with(DER_NONEMPTY, &[], !der_bytes.is_empty())?;
+			trace.event_with(ROUNDTRIP_OK, &[], decoded == frame)?;
+			trace.event_with(MATRIX_PRESENT, &[], frame.metadata.matrix.is_some())?;
+			trace.event_with(VERSION, &[], frame.version)?;
 
 			Ok(())
 		}

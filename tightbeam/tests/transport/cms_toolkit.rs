@@ -43,6 +43,20 @@ use tightbeam::transport::handshake::{kari_unwrap, kari_wrap, HandshakeAttribute
 use tightbeam::x509::name::Name;
 use tightbeam::x509::serial_number::SerialNumber;
 
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const ATTRIBUTE_EXTRACTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/attribute-extracted");
+pub(crate) const CEK_RECOVERED: Urn<'static> = Urn::new("test", "event:cms-toolkit/cek-recovered");
+pub(crate) const CEK_WRAPPED: Urn<'static> = Urn::new("test", "event:cms-toolkit/cek-wrapped");
+pub(crate) const CONTENT_RECOVERED: Urn<'static> = Urn::new("test", "event:cms-toolkit/content-recovered");
+pub(crate) const CONTENT_SIGNED: Urn<'static> = Urn::new("test", "event:cms-toolkit/content-signed");
+pub(crate) const ENVELOPE_SEALED: Urn<'static> = Urn::new("test", "event:cms-toolkit/envelope-sealed");
+pub(crate) const FOREIGN_KEY_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/foreign-key-rejected");
+pub(crate) const SIGNATURE_VERIFIED: Urn<'static> = Urn::new("test", "event:cms-toolkit/signature-verified");
+pub(crate) const TAMPER_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/tamper-rejected");
+pub(crate) const WIRE_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:cms-toolkit/wire-roundtrip");
+pub(crate) const WRONG_KEY_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/wrong-key-rejected");
+
 /// OID for the test-only unprotected attribute carried through the envelope.
 const TOOLKIT_ATTR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1");
 
@@ -64,10 +78,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(cek_wrapped, exactly!(1)),
-			(cek_recovered, exactly!(1)),
-			(wrong_key_rejected, exactly!(1)),
-			(tamper_rejected, exactly!(1))
+			(CEK_WRAPPED, exactly!(1)),
+			(CEK_RECOVERED, exactly!(1)),
+			(WRONG_KEY_REJECTED, exactly!(1)),
+			(TAMPER_REJECTED, exactly!(1))
 		]
 	}
 }
@@ -86,19 +100,19 @@ tb_scenario! {
 
 			let wrapped = kari_wrap(&provider, &sender, &recipient.public_key(), &ukm, TIGHTBEAM_KARI_KDF_INFO, &cek)?;
 			assert_ne!(wrapped.as_slice(), cek.as_slice(), "wrapped CEK must not expose the plaintext CEK");
-			trace.event(KariCekSpec::cek_wrapped)?;
+			trace.event(CEK_WRAPPED)?;
 
 			let unwrapped =
 				kari_unwrap(&provider, &recipient, &sender.public_key(), &ukm, TIGHTBEAM_KARI_KDF_INFO, &wrapped)?;
 			assert_eq!(unwrapped.as_slice(), cek.as_slice(), "recipient must recover the exact CEK");
 
-			trace.event(KariCekSpec::cek_recovered)?;
+			trace.event(CEK_RECOVERED)?;
 
 			let wrong =
 				kari_unwrap(&provider, &intruder, &sender.public_key(), &ukm, TIGHTBEAM_KARI_KDF_INFO, &wrapped);
 			assert!(wrong.is_err(), "a foreign recipient key must fail the unwrap integrity check");
 
-			trace.event(KariCekSpec::wrong_key_rejected)?;
+			trace.event(WRONG_KEY_REJECTED)?;
 
 			let mut tampered = wrapped;
 			tampered[0] ^= 0x01;
@@ -106,7 +120,7 @@ tb_scenario! {
 				kari_unwrap(&provider, &recipient, &sender.public_key(), &ukm, TIGHTBEAM_KARI_KDF_INFO, &tampered);
 			assert!(forged.is_err(), "a tampered wrapped CEK must fail the unwrap integrity check");
 
-			trace.event(KariCekSpec::tamper_rejected)?;
+			trace.event(TAMPER_REJECTED)?;
 
 			Ok(())
 		}
@@ -123,10 +137,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(envelope_sealed, exactly!(1)),
-			(wire_roundtrip, exactly!(1)),
-			(content_recovered, exactly!(1)),
-			(attribute_extracted, exactly!(1))
+			(ENVELOPE_SEALED, exactly!(1)),
+			(WIRE_ROUNDTRIP, exactly!(1)),
+			(CONTENT_RECOVERED, exactly!(1)),
+			(ATTRIBUTE_EXTRACTED, exactly!(1))
 		]
 	}
 }
@@ -157,19 +171,19 @@ tb_scenario! {
 				.with_unprotected_attr(attr)
 				.build(plaintext, None, None)?;
 
-			trace.event(EnvelopeRoundTripSpec::envelope_sealed)?;
+			trace.event(ENVELOPE_SEALED)?;
 
 			// Wire fidelity: the recipient works from re-decoded DER only.
 			let envelope = EnvelopedData::from_der(&envelope.to_der()?)?;
 
-			trace.event(EnvelopeRoundTripSpec::wire_roundtrip)?;
+			trace.event(WIRE_ROUNDTRIP)?;
 
 			let kari = TightBeamKariRecipient::with_defaults(recipient);
 			let processor = TightBeamEnvelopedDataProcessor::with_defaults(kari);
 			let recovered = processor.process(&envelope)?.to_insecure()?;
 			assert_eq!(&recovered[..], plaintext.as_slice(), "recipient must recover the sealed plaintext");
 
-			trace.event(EnvelopeRoundTripSpec::content_recovered)?;
+			trace.event(CONTENT_RECOVERED)?;
 
 			let attrs = processor.extract_unprotected_attributes(&envelope);
 			assert!(
@@ -177,7 +191,7 @@ tb_scenario! {
 				"the unprotected attribute must survive the wire roundtrip"
 			);
 
-			trace.event(EnvelopeRoundTripSpec::attribute_extracted)?;
+			trace.event(ATTRIBUTE_EXTRACTED)?;
 
 			Ok(())
 		}
@@ -194,9 +208,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(content_signed, exactly!(1)),
-			(signature_verified, exactly!(1)),
-			(foreign_key_rejected, exactly!(1))
+			(CONTENT_SIGNED, exactly!(1)),
+			(SIGNATURE_VERIFIED, exactly!(1)),
+			(FOREIGN_KEY_REJECTED, exactly!(1))
 		]
 	}
 }
@@ -216,7 +230,7 @@ tb_scenario! {
 			let content = b"cms toolkit transcript commitment";
 			let signed = builder.build(content)?;
 
-			trace.event(SignedContentSpec::content_signed)?;
+			trace.event(CONTENT_SIGNED)?;
 
 			let verifier = EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_signing_key(
 				&signing_key,
@@ -224,7 +238,7 @@ tb_scenario! {
 			let verified = TightBeamSignedDataProcessor::new(verifier).process(&signed, &HASH_SHA3_256)?;
 			assert_eq!(verified.as_slice(), content.as_slice(), "verifier must return the exact signed content");
 
-			trace.event(SignedContentSpec::signature_verified)?;
+			trace.event(SIGNATURE_VERIFIED)?;
 
 			let foreign_key = Secp256k1SigningKey::random(&mut OsRng);
 			let foreign_verifier =
@@ -235,7 +249,7 @@ tb_scenario! {
 			let rejected = TightBeamSignedDataProcessor::new(foreign_verifier).process(&signed, &HASH_SHA3_256);
 			assert!(rejected.is_err(), "a verifier bound to a different key must reject the signature");
 
-			trace.event(SignedContentSpec::foreign_key_rejected)?;
+			trace.event(FOREIGN_KEY_REJECTED)?;
 
 			Ok(())
 		}

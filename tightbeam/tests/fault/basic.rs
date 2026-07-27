@@ -15,11 +15,20 @@
 
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::utils::urn::Urn;
 use tightbeam::utils::BasisPoints;
 use tightbeam::TightBeamError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
-use fault_tolerant_process::{Event, States};
+use fault_tolerant_process::States;
+
+pub(crate) const FAILURE: Urn<'static> = Urn::new("test", "event:fault-basic/failure");
+pub(crate) const FALLBACK: Urn<'static> = Urn::new("test", "event:fault-basic/fallback");
+pub(crate) const INTERNAL_RETRY: Urn<'static> = Urn::new("test", "event:fault-basic/internal-retry");
+pub(crate) const REQUEST: Urn<'static> = Urn::new("test", "event:fault-basic/request");
+pub(crate) const RESPONSE: Urn<'static> = Urn::new("test", "event:fault-basic/response");
+pub(crate) const RETRY: Urn<'static> = Urn::new("test", "event:fault-basic/retry");
+pub(crate) const SUCCESS: Urn<'static> = Urn::new("test", "event:fault-basic/success");
 
 // ============================================================================
 // ACADEMIC DEMONSTRATION: State-based fault injection with formal verification
@@ -31,34 +40,36 @@ tb_process_spec! {
 	/// Reference: Cristian (1991) - "Understanding fault-tolerant distributed systems"
 	pub FaultTolerantProcess,
 	events {
-		observable { "request", "response", "retry", "fallback", "success", "failure" }
-		hidden { "internal_retry" }
+		observable { REQUEST, RESPONSE, RETRY, FALLBACK, SUCCESS, FAILURE }
+		hidden { INTERNAL_RETRY }
 	}
 	states {
 		Idle => {
-			"request" => Sending
+			REQUEST => Sending
 		},
 		Sending => {
-			"response" => Success,
-			"retry" => Retrying,
-			"fallback" => Fallback
+			RESPONSE => Success,
+			RETRY => Retrying,
+			FALLBACK => Fallback
 		},
 		Retrying => {
-			"internal_retry" => Sending,
-			"fallback" => Fallback
+			INTERNAL_RETRY => Sending,
+			FALLBACK => Fallback
 		},
 		Success => {
-			"success" => Idle
+			SUCCESS => Idle
 		},
 		Fallback => {
-			"failure" => Idle
+			FAILURE => Idle
 		}
 	}
 }
 
 // Generate type-safe enums for fault injection
-// Note: Automatic generation would require complex deduplication logic for states that appear
-// as both source and destination. Manual generation gives explicit control.
+//
+// Note: Automatic generation would require complex deduplication logic for
+// states that appear as both source and destination. Manual generation gives
+// explicit control.
 tb_gen_process_types!(FaultTolerantProcess, Idle, Sending, Retrying, Success, Fallback);
 
 // ============================================================================
@@ -130,9 +141,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(request, at_least!(1)),
-			(response, at_least!(0)),
-			(retry, at_least!(0))
+			(REQUEST, at_least!(1)),
+			(RESPONSE, at_least!(0)),
+			(RETRY, at_least!(0))
 		]
 	}
 }
@@ -140,7 +151,7 @@ tb_assert_spec! {
 fn build_deterministic_config() -> FdrConfig {
 	let fault_model = FaultModel::from(InjectionStrategy::Deterministic).with_fault(
 		States::Sending,
-		Event("response"),
+		RESPONSE,
 		|| NetworkTimeoutError { duration_ms: 3000, attempt: 1 },
 		BasisPoints::new(10000), // 100% - always inject (deterministic)
 	);
@@ -180,7 +191,7 @@ tb_scenario! {
 				// Verify all injections at the same point
 				for fault in &verdict.faults_injected {
 					assert_eq!(fault.csp_state, "FaultTolerantProcess.Sending");
-					assert_eq!(fault.event_label, "response");
+					assert_eq!(fault.event_label, RESPONSE.to_string());
 					assert_eq!(fault.probability_bps, 10000);
 				}
 
@@ -194,9 +205,9 @@ tb_scenario! {
 	.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(DeterministicSpec::request)?;
-			trace.event(DeterministicSpec::response)?;
-			trace.event(CoverageSpec::success)?;
+			trace.event(REQUEST)?;
+			trace.event(RESPONSE)?;
+			trace.event(SUCCESS)?;
 			Ok(())
 		}
 	}
@@ -212,8 +223,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(request, at_least!(1)),
-			(response, at_least!(0))
+			(REQUEST, at_least!(1)),
+			(RESPONSE, at_least!(0))
 		]
 	}
 }
@@ -224,7 +235,7 @@ fn build_probabilistic_config() -> FdrConfig {
 	// Network timeout rate: ~1-5% in distributed systems
 	let fault_model = FaultModel::from(InjectionStrategy::Random).with_fault(
 		States::Sending,
-		Event("response"),
+		RESPONSE,
 		|| NetworkTimeoutError { duration_ms: 5000, attempt: 1 },
 		BasisPoints::new(500), // 5% probability (realistic network timeout rate)
 	);
@@ -277,9 +288,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(ProbabilisticSpec::request)?;
-			trace.event(ProbabilisticSpec::response)?;
-			trace.event(CoverageSpec::success)?;
+			trace.event(REQUEST)?;
+			trace.event(RESPONSE)?;
+			trace.event(SUCCESS)?;
 			Ok(())
 		}
 	}
@@ -295,9 +306,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(request, at_least!(1)),
-			(retry, at_least!(0)),
-			(fallback, at_least!(0))
+			(REQUEST, at_least!(1)),
+			(RETRY, at_least!(0)),
+			(FALLBACK, at_least!(0))
 		]
 	}
 }
@@ -308,19 +319,19 @@ fn build_multi_fault_config() -> FdrConfig {
 	let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
 		.with_fault(
 			States::Sending,
-			Event("response"),
+			RESPONSE,
 			|| NetworkTimeoutError { duration_ms: 3000, attempt: 1 },
 			BasisPoints::new(5000), // 50% - transient failure
 		)
 		.with_fault(
 			States::Sending,
-			Event("retry"),
+			RETRY,
 			|| MessageCorruptionError { corrupted_bytes: 42 },
 			BasisPoints::new(3000), // 30% - permanent failure
 		)
 		.with_fault(
 			States::Retrying,
-			Event("internal_retry"),
+			INTERNAL_RETRY,
 			|| ResourceExhaustionError { resource: "memory" },
 			BasisPoints::new(2000), // 20% - system failure
 		);
@@ -369,9 +380,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(MultiFaultSpec::request)?;
-			trace.event(ProbabilisticSpec::response)?;
-			trace.event(CoverageSpec::success)?;
+			trace.event(REQUEST)?;
+			trace.event(RESPONSE)?;
+			trace.event(SUCCESS)?;
 			Ok(())
 		}
 	}
@@ -387,12 +398,12 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(request, exactly!(1)),
-			(response, at_least!(0)),
-			(retry, at_least!(0)),
-			(fallback, at_least!(0)),
-			(success, at_least!(0)),
-			(failure, at_least!(0))
+			(REQUEST, exactly!(1)),
+			(RESPONSE, at_least!(0)),
+			(RETRY, at_least!(0)),
+			(FALLBACK, at_least!(0)),
+			(SUCCESS, at_least!(0)),
+			(FAILURE, at_least!(0))
 		]
 	}
 }
@@ -402,31 +413,31 @@ fn build_coverage_config() -> FdrConfig {
 	let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
 		.with_fault(
 			States::Idle,
-			Event("request"),
+			REQUEST,
 			|| NetworkTimeoutError { duration_ms: 100, attempt: 1 },
 			BasisPoints::new(2000),
 		)
 		.with_fault(
 			States::Sending,
-			Event("response"),
+			RESPONSE,
 			|| NetworkTimeoutError { duration_ms: 200, attempt: 1 },
 			BasisPoints::new(2000),
 		)
 		.with_fault(
 			States::Sending,
-			Event("retry"),
+			RETRY,
 			|| MessageCorruptionError { corrupted_bytes: 10 },
 			BasisPoints::new(2000),
 		)
 		.with_fault(
 			States::Retrying,
-			Event("internal_retry"),
+			INTERNAL_RETRY,
 			|| ResourceExhaustionError { resource: "cpu" },
 			BasisPoints::new(2000),
 		)
 		.with_fault(
 			States::Sending,
-			Event("fallback"),
+			FALLBACK,
 			|| ResourceExhaustionError { resource: "disk" },
 			BasisPoints::new(2000),
 		);
@@ -486,9 +497,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(CoverageSpec::request)?;
-			trace.event(CoverageSpec::response)?;
-			trace.event(CoverageSpec::success)?;
+			trace.event(REQUEST)?;
+			trace.event(RESPONSE)?;
+			trace.event(SUCCESS)?;
 			Ok(())
 		}
 	}

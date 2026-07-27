@@ -1,4 +1,4 @@
-//! Chunking, stream credit, session budgets, flow violations, authorizers.
+//! Mux chunking, credit, budgets, flow violations, authorizers.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -7,25 +7,62 @@ use tokio::time::timeout;
 
 use tightbeam::der::Decode;
 use tightbeam::exactly;
+use tightbeam::instrumentation::events;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{GoAwayReason, MuxCreditPackage, MuxDataPackage, MuxEnvelope, MuxOpenPackage};
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, NegotiationError};
 use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::transport::{
 	EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure,
 };
+use tightbeam::utils::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
 
 use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{
 	await_ok, bind_encrypted_listener, bind_encrypted_listener_with_timeout, connect_pinned_client,
-	establish_mutual_transports, join_task, serve_one_handshake_message, MutualSessionHooks,
+	establish_mutual_transports, join_task, mux_frame, mux_offer, serve_one_handshake_message, MutualSessionHooks,
 };
 
 use super::common::*;
+
+pub(crate) const BUDGET_OVERRUN_ANSWERED_WITH_GOAWAY: Urn<'static> =
+	Urn::new("test", "event:credit/budget-overrun-answered-with-goaway");
+pub(crate) const CHUNKED_TRANSFER_SURVIVES_DRAIN: Urn<'static> =
+	Urn::new("test", "event:credit/chunked-transfer-survives-drain");
+pub(crate) const CLIENT_FAILS_CLOSED: Urn<'static> = Urn::new("test", "event:credit/client-fails-closed");
+pub(crate) const CLIENT_VIEWS_REDUCED_GRANT: Urn<'static> = Urn::new("test", "event:credit/client-views-reduced-grant");
+pub(crate) const CONTROL_STILL_FLOWS: Urn<'static> = Urn::new("test", "event:credit/control-still-flows");
+pub(crate) const CREDIT_OVERRUN_ANSWERED_WITH_GOAWAY: Urn<'static> =
+	Urn::new("test", "event:credit/credit-overrun-answered-with-goaway");
+pub(crate) const DRAIN_COMPLETES_CLEAN: Urn<'static> = Urn::new("test", "event:credit/drain-completes-clean");
+pub(crate) const DRAIN_REASON_SURFACES: Urn<'static> = Urn::new("test", "event:credit/drain-reason-surfaces");
+pub(crate) const EXHAUSTING_EMIT_STILL_ECHOES: Urn<'static> =
+	Urn::new("test", "event:credit/exhausting-emit-still-echoes");
+pub(crate) const FIRST_LARGE_FRAME_ECHOED: Urn<'static> = Urn::new("test", "event:credit/first-large-frame-echoed");
+pub(crate) const OPEN_CHUNK_SPENDS_INITIAL_CREDIT: Urn<'static> =
+	Urn::new("test", "event:credit/open-chunk-spends-initial-credit");
+pub(crate) const OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY: Urn<'static> =
+	Urn::new("test", "event:credit/oversize-chunk-answered-with-goaway");
+pub(crate) const PEER_OBSERVES_BUDGET_EXHAUSTED: Urn<'static> =
+	Urn::new("test", "event:credit/peer-observes-budget-exhausted");
+pub(crate) const REASSEMBLY_FLOOD_ANSWERED_WITH_GOAWAY: Urn<'static> =
+	Urn::new("test", "event:credit/reassembly-flood-answered-with-goaway");
+pub(crate) const SECOND_LARGE_FRAME_ECHOED: Urn<'static> = Urn::new("test", "event:credit/second-large-frame-echoed");
+pub(crate) const SENDER_STALLS_AT_INITIAL_CREDIT: Urn<'static> =
+	Urn::new("test", "event:credit/sender-stalls-at-initial-credit");
+pub(crate) const SERVER_BOUNDS_HUNG_AUTHORIZER: Urn<'static> =
+	Urn::new("test", "event:credit/server-bounds-hung-authorizer");
+pub(crate) const SERVER_REFUSES_WITH_CODE: Urn<'static> = Urn::new("test", "event:credit/server-refuses-with-code");
+pub(crate) const SERVER_VIEWS_REDUCED_GRANT: Urn<'static> = Urn::new("test", "event:credit/server-views-reduced-grant");
+pub(crate) const STALLED_STREAM_STILL_ECHOES: Urn<'static> =
+	Urn::new("test", "event:credit/stalled-stream-still-echoes");
+pub(crate) const TRANSFER_RESUMES_ON_GRANT: Urn<'static> = Urn::new("test", "event:credit/transfer-resumes-on-grant");
+pub(crate) const ZERO_BUDGET_EMIT_REFUSED: Urn<'static> = Urn::new("test", "event:credit/zero-budget-emit-refused");
 
 tb_assert_spec! {
 	pub MuxChunkedRoundtripSpec,
@@ -33,20 +70,19 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(first_large_frame_echoed, exactly!(1), equals!(true)),
-			(second_large_frame_echoed, exactly!(1), equals!(true))
+			(FIRST_LARGE_FRAME_ECHOED, exactly!(1), equals!(true)),
+			(SECOND_LARGE_FRAME_ECHOED, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// Frames beyond the negotiated chunk size segment into Open/Data
-// series, reassemble on the peer, and echo back chunked.
 tb_scenario! {
 	name: mux_chunked_large_frames_roundtrip_and_interleave,
 	spec: MuxChunkedRoundtripSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let pair = establish_echo_pair(chunked_offer(4), chunked_offer(4), MuxEndpointConfig::default()).await?;
+			let pair = establish_echo_pair(chunked_offer(4), chunked_offer(4), MuxEndpointConfig::default(), trace.share())
+				.await?;
 			let first = large_mux_frame("mux-chunked-first");
 			let second = large_mux_frame("mux-chunked-second");
 			let (first_echo, second_echo) = tokio::join!(
@@ -55,12 +91,12 @@ tb_scenario! {
 			);
 
 			trace.event_with(
-				MuxChunkedRoundtripSpec::first_large_frame_echoed,
+				FIRST_LARGE_FRAME_ECHOED,
 				&[],
 				is_echo(first_echo?, &first),
 			)?;
 			trace.event_with(
-				MuxChunkedRoundtripSpec::second_large_frame_echoed,
+				SECOND_LARGE_FRAME_ECHOED,
 				&[],
 				is_echo(second_echo?, &second),
 			)?;
@@ -76,10 +112,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(open_chunk_spends_initial_credit, exactly!(1), equals!(true)),
-			(sender_stalls_at_initial_credit, exactly!(1), equals!(true)),
-			(transfer_resumes_on_grant, exactly!(1), equals!(true)),
-			(stalled_stream_still_echoes, exactly!(1), equals!(true))
+			(OPEN_CHUNK_SPENDS_INITIAL_CREDIT, exactly!(1), equals!(true)),
+			(SENDER_STALLS_AT_INITIAL_CREDIT, exactly!(1), equals!(true)),
+			(TRANSFER_RESUMES_ON_GRANT, exactly!(1), equals!(true)),
+			(STALLED_STREAM_STILL_ECHOES, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -88,26 +124,23 @@ tb_process_spec! {
 	pub MuxCreditStallProcess,
 	events {
 		observable {
-			MuxCreditStallSpec::open_chunk_spends_initial_credit,
-			MuxCreditStallSpec::sender_stalls_at_initial_credit,
-			MuxCreditStallSpec::transfer_resumes_on_grant,
-			MuxCreditStallSpec::stalled_stream_still_echoes
+			OPEN_CHUNK_SPENDS_INITIAL_CREDIT,
+			SENDER_STALLS_AT_INITIAL_CREDIT,
+			TRANSFER_RESUMES_ON_GRANT,
+			STALLED_STREAM_STILL_ECHOES
 		}
 		hidden { }
 	}
 	states {
-		Idle => { MuxCreditStallSpec::open_chunk_spends_initial_credit => Opened },
-		Opened => { MuxCreditStallSpec::sender_stalls_at_initial_credit => Stalled },
-		Stalled => { MuxCreditStallSpec::transfer_resumes_on_grant => Resumed },
-		Resumed => { MuxCreditStallSpec::stalled_stream_still_echoes => Done },
+		Idle => { OPEN_CHUNK_SPENDS_INITIAL_CREDIT => Opened },
+		Opened => { SENDER_STALLS_AT_INITIAL_CREDIT => Stalled },
+		Stalled => { TRANSFER_RESUMES_ON_GRANT => Resumed },
+		Resumed => { STALLED_STREAM_STILL_ECHOES => Done },
 		Done => { }
 	}
 	terminal { Done }
 }
 
-// With one chunk of initial credit, the sender parks after the Open
-// chunk until the receiver grants more, then the transfer resumes
-// and completes.
 tb_scenario! {
 	name: mux_stream_credit_stall_and_resume,
 	config: ScenarioConf::builder()
@@ -117,7 +150,8 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let server_offer = chunked_offer(4).with_initial_stream_credit(1);
-			let mut link = establish_client_mux_server_raw_with(chunked_offer(4), server_offer).await?;
+			let mut link =
+				establish_client_mux_server_raw_with(chunked_offer(4), server_offer, trace.share()).await?;
 
 			let frame = large_mux_frame("mux-credit-stall");
 			let emit_task = spawn_emit(&link.client.handle, frame.to_owned());
@@ -132,12 +166,12 @@ tb_scenario! {
 				_ => (Vec::new(), false),
 			};
 
-			trace.event_with(MuxCreditStallSpec::open_chunk_spends_initial_credit, &[], open_ok)?;
+			trace.event_with(OPEN_CHUNK_SPENDS_INITIAL_CREDIT, &[], open_ok)?;
 
 			let stalled = timeout(Duration::from_millis(200), link.server_reader.read_envelope())
 				.await
 				.is_err();
-			trace.event_with(MuxCreditStallSpec::sender_stalls_at_initial_credit, &[], stalled)?;
+			trace.event_with(SENDER_STALLS_AT_INITIAL_CREDIT, &[], stalled)?;
 
 			let grant = MuxCreditPackage::new(client_stream_id(0), 64);
 			link.server_writer.write_envelope(grant.into()).await?;
@@ -149,8 +183,8 @@ tb_scenario! {
 			write_muxed_echo(&mut link.server_writer, client_stream_id(0), &Arc::new(ack.to_owned())).await?;
 
 			let resolved = await_ok(emit_task, "stalled emit task must not panic").await?;
-			trace.event_with(MuxCreditStallSpec::transfer_resumes_on_grant, &[], received == frame)?;
-			trace.event_with(MuxCreditStallSpec::stalled_stream_still_echoes, &[], is_echo(resolved, &ack))?;
+			trace.event_with(TRANSFER_RESUMES_ON_GRANT, &[], received == frame)?;
+			trace.event_with(STALLED_STREAM_STILL_ECHOES, &[], is_echo(resolved, &ack))?;
 
 			Ok(())
 		}
@@ -163,9 +197,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(zero_budget_emit_refused, exactly!(1), equals!(true)),
-			(control_still_flows, exactly!(1), equals!(true)),
-			(drain_completes_clean, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_SENT, exactly!(1)),
+			(ZERO_BUDGET_EMIT_REFUSED, exactly!(1), equals!(true)),
+			(CONTROL_STILL_FLOWS, exactly!(1), equals!(true)),
+			(DRAIN_COMPLETES_CLEAN, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -174,24 +209,22 @@ tb_process_spec! {
 	pub MuxZeroBudgetProcess,
 	events {
 		observable {
-			MuxZeroBudgetSpec::zero_budget_emit_refused,
-			MuxZeroBudgetSpec::control_still_flows,
-			MuxZeroBudgetSpec::drain_completes_clean
+			ZERO_BUDGET_EMIT_REFUSED,
+			CONTROL_STILL_FLOWS,
+			DRAIN_COMPLETES_CLEAN
 		}
 		hidden { }
 	}
 	states {
-		Idle => { MuxZeroBudgetSpec::zero_budget_emit_refused => DataRefused },
-		DataRefused => { MuxZeroBudgetSpec::control_still_flows => ControlOk },
-		ControlOk => { MuxZeroBudgetSpec::drain_completes_clean => Done },
+		Idle => { ZERO_BUDGET_EMIT_REFUSED => DataRefused },
+		DataRefused => { CONTROL_STILL_FLOWS => ControlOk },
+		ControlOk => { DRAIN_COMPLETES_CLEAN => Done },
 		Done => { }
 	}
 	terminal { Done }
 }
 
-// A zero-credit grant meters the session shut: data emits fail fast
-// with the typed budget error while control (ping, shutdown drain)
-// keeps working.
+// Zero budget: data emits fail fast; ping/shutdown still work.
 tb_scenario! {
 	name: mux_zero_budget_refuses_data_drains_clean,
 	config: ScenarioConf::builder()
@@ -206,19 +239,19 @@ tb_scenario! {
 			let hooks = MutualSessionHooks::default();
 			let session = establish_mutual_transports(client_offer, server_offer, hooks).await?;
 			let config = MuxEndpointConfig::default();
-			let pair = spawn_echo_pair(session.client, session.server, config)?;
+			let pair = spawn_echo_pair(session.client, session.server, config, trace.share())?;
 
 			let refused = pair.client.handle.emit_on_stream(&mux_frame("mux-zero-budget")).await;
-			trace.event_with(MuxZeroBudgetSpec::zero_budget_emit_refused, &[], is_budget_exhausted(&refused))?;
+			trace.event_with(ZERO_BUDGET_EMIT_REFUSED, &[], is_budget_exhausted(&refused))?;
 
 			trace.event_with(
-				MuxZeroBudgetSpec::control_still_flows,
+				CONTROL_STILL_FLOWS,
 				&[],
 				pair.client.handle.ping().await.is_ok(),
 			)?;
 
 			let drained = pair.client.handle.shutdown().await;
-			trace.event_with(MuxZeroBudgetSpec::drain_completes_clean, &[], drained.is_ok())?;
+			trace.event_with(DRAIN_COMPLETES_CLEAN, &[], drained.is_ok())?;
 
 			Ok(())
 		}
@@ -231,18 +264,16 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(exhausting_emit_still_echoes, exactly!(1), equals!(true)),
-			(late_emit_draining, exactly!(1), equals!(true)),
-			(peer_observes_budget_exhausted, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_SENT, exactly!(1)),
+			(events::MUX_EMIT_DRAINING, exactly!(1)),
+			(events::MUX_GOAWAY_RECV, exactly!(1)),
+			(EXHAUSTING_EMIT_STILL_ECHOES, exactly!(1), equals!(true)),
+			(PEER_OBSERVES_BUDGET_EXHAUSTED, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// The emit that drops the balance to the drain reserve triggers
-// GoAway(BudgetExhausted): the in-flight stream still resolves, later
-// emits are refused as Draining, and the peer surfaces the reason.
-// Caps 1/1 with 1 KiB chunk and unit make the reserve exactly 5
-// credits, so a 6-credit grant exhausts on the first emit.
+// Caps 1/1, 1 KiB chunk: reserve = 5 credits; grant 6 exhausts on first emit.
 tb_scenario! {
 	name: mux_budget_exhaustion_drains,
 	spec: MuxBudgetExhaustionSpec,
@@ -254,21 +285,21 @@ tb_scenario! {
 			let hooks = MutualSessionHooks::default();
 			let session = establish_mutual_transports(client_offer, server_offer, hooks).await?;
 			let config = MuxEndpointConfig::default();
-			let pair = spawn_echo_pair(session.client, session.server, config)?;
+			let pair = spawn_echo_pair(session.client, session.server, config, trace.share())?;
 
 			let frame = mux_frame("mux-budget-last");
 			let echoed = pair.client.handle.emit_on_stream(&frame).await?;
 			trace.event_with(
-				MuxBudgetExhaustionSpec::exhausting_emit_still_echoes,
+				EXHAUSTING_EMIT_STILL_ECHOES,
 				&[],
 				is_echo(echoed, &frame),
 			)?;
 
-			let late = pair.client.handle.emit_on_stream(&mux_frame("mux-budget-late")).await;
-			trace.event_with(MuxBudgetExhaustionSpec::late_emit_draining, &[], is_draining(&late))?;
+			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			let _late = pair.client.handle.emit_on_stream(&mux_frame("mux-budget-late")).await;
 
 			trace.event_with(
-				MuxBudgetExhaustionSpec::peer_observes_budget_exhausted,
+				PEER_OBSERVES_BUDGET_EXHAUSTED,
 				&[],
 				await_goaway_reason(&pair.server.handle, GoAwayReason::BudgetExhausted).await,
 			)?;
@@ -278,8 +309,6 @@ tb_scenario! {
 	}
 }
 
-/// Write `envelopes` on a raw client against an immediate-echo server;
-/// true when the peer answers with GoAway(ProtocolError).
 async fn protocol_error_goaway_after(
 	link: ServerMuxClientRaw,
 	envelopes: Vec<TransportEnvelope>,
@@ -295,12 +324,11 @@ async fn protocol_error_goaway_after(
 	Ok(goaway)
 }
 
-// 2 KiB open exceeds the 1 KiB advertised chunk ceiling.
-async fn oversize_chunk_rejected() -> Result<bool, TightBeamError> {
+async fn oversize_chunk_rejected(trace: TraceCollector) -> Result<bool, TightBeamError> {
 	let client_offer = chunked_offer(4);
 	let server_offer = chunked_offer(4);
 	let config = MuxEndpointConfig::default();
-	let link = establish_server_mux_client_raw_with(client_offer, server_offer, config).await?;
+	let link = establish_server_mux_client_raw_with(client_offer, server_offer, config, trace).await?;
 
 	let oversize = MuxOpenPackage::new(1, true, vec![0u8; 2048])?;
 	let envelopes = vec![oversize.into()];
@@ -308,13 +336,12 @@ async fn oversize_chunk_rejected() -> Result<bool, TightBeamError> {
 	protocol_error_goaway_after(link, envelopes).await
 }
 
-// Second chunk after the one-chunk initial window, with a grantor that
-// never replenishes.
-async fn credit_overrun_rejected() -> Result<bool, TightBeamError> {
+async fn credit_overrun_rejected(trace: TraceCollector) -> Result<bool, TightBeamError> {
 	let client_offer = chunked_offer(4);
 	let server_offer = chunked_offer(4).with_initial_stream_credit(1);
-	let config = MuxEndpointConfig { rekey_limit: None, cancel_budget: None, grantor: Some(Arc::new(NeverGrant)) };
-	let link = establish_server_mux_client_raw_with(client_offer, server_offer, config).await?;
+	let grantor = Arc::new(NeverGrant);
+	let config = MuxEndpointConfig { grantor: Some(grantor), ..MuxEndpointConfig::default() };
+	let link = establish_server_mux_client_raw_with(client_offer, server_offer, config, trace).await?;
 
 	let chunk = vec![0u8; 1024];
 	let open = MuxOpenPackage::new(1, false, chunk.to_owned())?;
@@ -324,13 +351,12 @@ async fn credit_overrun_rejected() -> Result<bool, TightBeamError> {
 	protocol_error_goaway_after(link, envelopes).await
 }
 
-// Cap is 4 peer-initiated streams; five concurrent partial opens is
-// one over ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)).
-async fn reassembly_flood_rejected() -> Result<bool, TightBeamError> {
+// Five partial opens exceeds cap 4 ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)).
+async fn reassembly_flood_rejected(trace: TraceCollector) -> Result<bool, TightBeamError> {
 	let client_offer = chunked_offer(4);
 	let server_offer = chunked_offer(4);
 	let config = MuxEndpointConfig::default();
-	let link = establish_server_mux_client_raw_with(client_offer, server_offer, config).await?;
+	let link = establish_server_mux_client_raw_with(client_offer, server_offer, config, trace).await?;
 
 	let partial = vec![0u8; 16];
 	let envelopes = vec![
@@ -344,15 +370,14 @@ async fn reassembly_flood_rejected() -> Result<bool, TightBeamError> {
 	protocol_error_goaway_after(link, envelopes).await
 }
 
-// One-credit inbound budget: first request spends it, second overruns.
-async fn budget_overrun_rejected() -> Result<bool, TightBeamError> {
+async fn budget_overrun_rejected(trace: TraceCollector) -> Result<bool, TightBeamError> {
 	let budgets = MuxBudgets { client_to_server: 1, server_to_client: 4096 };
 	let client_offer = chunked_offer(4).with_budgets(budgets);
 	let server_offer = chunked_offer(4).with_budgets(budgets);
 	let hooks = MutualSessionHooks::default();
 	let session = establish_mutual_transports(client_offer, server_offer, hooks).await?;
 	let config = MuxEndpointConfig::default();
-	let link = split_server_mux_client_raw(session.client, session.server, config)?;
+	let link = split_server_mux_client_raw(session.client, session.server, config, trace)?;
 
 	let first = muxed_request_envelope(1, mux_frame("mux-budget-first"))?;
 	let over = muxed_request_envelope(3, mux_frame("mux-budget-over"))?;
@@ -367,33 +392,31 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(oversize_chunk_answered_with_goaway, exactly!(1), equals!(true)),
-			(credit_overrun_answered_with_goaway, exactly!(1), equals!(true)),
-			(reassembly_flood_answered_with_goaway, exactly!(1), equals!(true)),
-			(budget_overrun_answered_with_goaway, exactly!(1), equals!(true))
+			(events::MUX_PROTOCOL_ERROR, exactly!(4)),
+			(OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true)),
+			(CREDIT_OVERRUN_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true)),
+			(REASSEMBLY_FLOOD_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true)),
+			(BUDGET_OVERRUN_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// Flow-control violations (chunk ceiling, stream credit, reassembly
-// flood, session budget) are protocol violations answered with
-// GoAway(ProtocolError), each on a fresh connection.
 tb_scenario! {
 	name: mux_flow_control_violations_rejected,
 	spec: MuxFlowViolationSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let oversize = oversize_chunk_rejected().await?;
-			trace.event_with(MuxFlowViolationSpec::oversize_chunk_answered_with_goaway, &[], oversize)?;
+			let oversize = oversize_chunk_rejected(trace.share()).await?;
+			trace.event_with(OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY, &[], oversize)?;
 
-			let credit = credit_overrun_rejected().await?;
-			trace.event_with(MuxFlowViolationSpec::credit_overrun_answered_with_goaway, &[], credit)?;
+			let credit = credit_overrun_rejected(trace.share()).await?;
+			trace.event_with(CREDIT_OVERRUN_ANSWERED_WITH_GOAWAY, &[], credit)?;
 
-			let flood = reassembly_flood_rejected().await?;
-			trace.event_with(MuxFlowViolationSpec::reassembly_flood_answered_with_goaway, &[], flood)?;
+			let flood = reassembly_flood_rejected(trace.share()).await?;
+			trace.event_with(REASSEMBLY_FLOOD_ANSWERED_WITH_GOAWAY, &[], flood)?;
 
-			let budget = budget_overrun_rejected().await?;
-			trace.event_with(MuxFlowViolationSpec::budget_overrun_answered_with_goaway, &[], budget)?;
+			let budget = budget_overrun_rejected(trace.share()).await?;
+			trace.event_with(BUDGET_OVERRUN_ANSWERED_WITH_GOAWAY, &[], budget)?;
 
 			Ok(())
 		}
@@ -406,15 +429,12 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(client_views_reduced_grant, exactly!(1), equals!(true)),
-			(server_views_reduced_grant, exactly!(1), equals!(true))
+			(CLIENT_VIEWS_REDUCED_GRANT, exactly!(1), equals!(true)),
+			(SERVER_VIEWS_REDUCED_GRANT, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A server-side TransportAuthorizer replaces the local-config grant:
-// the halved budgets land in the signed accept and both endpoints
-// derive the same reduced directional views.
 tb_scenario! {
 	name: mux_authorizer_reduced_grant_both_sides,
 	spec: MuxAuthorizerSpec,
@@ -436,12 +456,12 @@ tb_scenario! {
 				.ok_or_else(|| expectation_failure("server must negotiate multiplexing"))?;
 
 			trace.event_with(
-				MuxAuthorizerSpec::client_views_reduced_grant,
+				CLIENT_VIEWS_REDUCED_GRANT,
 				&[],
 				client_settings.send_budget == Some(5) && client_settings.recv_budget == Some(5),
 			)?;
 			trace.event_with(
-				MuxAuthorizerSpec::server_views_reduced_grant,
+				SERVER_VIEWS_REDUCED_GRANT,
 				&[],
 				server_settings.send_budget == Some(5) && server_settings.recv_budget == Some(5),
 			)?;
@@ -457,15 +477,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(server_refuses_with_code, exactly!(1), equals!(true)),
-			(client_fails_closed, exactly!(1), equals!(true))
+			(SERVER_REFUSES_WITH_CODE, exactly!(1), equals!(true)),
+			(CLIENT_FAILS_CLOSED, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A refusing TransportAuthorizer aborts the handshake before the
-// accept enters the transcript: the server surfaces the application
-// refusal code and the client never completes a session.
+// Refusal before accept enters transcript: fail closed both sides.
 tb_scenario! {
 	name: mux_authorizer_refusal_fails_closed,
 	spec: MuxAuthorizerRefusalSpec,
@@ -492,7 +510,7 @@ tb_scenario! {
 			let client_result = client.perform_client_handshake().await;
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
 			trace.event_with(
-				MuxAuthorizerRefusalSpec::server_refuses_with_code,
+				SERVER_REFUSES_WITH_CODE,
 				&[],
 				matches!(
 					server_result,
@@ -503,7 +521,7 @@ tb_scenario! {
 					)))
 				),
 			)?;
-			trace.event_with(MuxAuthorizerRefusalSpec::client_fails_closed, &[], client_result.is_err())?;
+			trace.event_with(CLIENT_FAILS_CLOSED, &[], client_result.is_err())?;
 
 			Ok(())
 		}
@@ -516,15 +534,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(server_bounds_hung_authorizer, exactly!(1), equals!(true)),
-			(client_fails_closed, exactly!(1), equals!(true))
+			(SERVER_BOUNDS_HUNG_AUTHORIZER, exactly!(1), equals!(true)),
+			(CLIENT_FAILS_CLOSED, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A hung TransportAuthorizer must not park pre-authentication
-// handshake state forever: the handshake deadline bounds processing
-// hooks and the server surfaces DeadlineExceeded.
+// Hung authorizer: handshake deadline -> DeadlineExceeded.
 tb_scenario! {
 	name: mux_hung_authorizer_bounded_by_handshake_deadline,
 	spec: MuxAuthorizerDeadlineSpec,
@@ -555,7 +571,7 @@ tb_scenario! {
 				.await
 				.map_err(|_| expectation_failure("hung authorizer must not stall the server past the deadline"))??;
 			trace.event_with(
-				MuxAuthorizerDeadlineSpec::server_bounds_hung_authorizer,
+				SERVER_BOUNDS_HUNG_AUTHORIZER,
 				&[],
 				matches!(
 					server_result,
@@ -569,7 +585,7 @@ tb_scenario! {
 			let client_result = timeout(Duration::from_secs(5), client_join)
 				.await
 				.map_err(|_| expectation_failure("client must fail closed once the server abandons the handshake"))??;
-			trace.event_with(MuxAuthorizerDeadlineSpec::client_fails_closed, &[], client_result.is_err())?;
+			trace.event_with(CLIENT_FAILS_CLOSED, &[], client_result.is_err())?;
 
 			Ok(())
 		}
@@ -582,47 +598,40 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(chunked_transfer_survives_drain, exactly!(1), equals!(true)),
-			(drain_reason_surfaces, exactly!(1), equals!(true)),
-			(late_emit_draining, exactly!(1), equals!(true))
+			(events::MUX_GOAWAY_SENT, exactly!(1)),
+			(events::MUX_GOAWAY_RECV, exactly!(1)),
+			(events::MUX_EMIT_DRAINING, exactly!(1)),
+			(CHUNKED_TRANSFER_SURVIVES_DRAIN, exactly!(1), equals!(true)),
+			(DRAIN_REASON_SURFACES, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// The rekey record limit trips while the server writes its chunked echo:
-// the dynamic headroom lets the owed response flush inside the drain.
-//
-// Record math at 15 chunks per direction (payload ~15.3 KiB, chunk
-// 1024): the batched default grantor stays silent for 15 inbound
-// chunks under its 64-chunk window, so the server's only records
-// are the 15 response records. The static reserve is 5 (caps 1/1).
-// limit ≤ 15 + 5 guarantees the trip even after every unsent chunk
-// drains, and limit ≥ 15 + 1 leaves records for the full response
-// plus the GoAway when the trip fires on the first response record.
+// limit=18: 15 response records + reserve 5 (caps 1/1, chunk 1024); headroom for GoAway.
 tb_scenario! {
 	name: mux_rekey_drain_with_inflight_chunked_transfer,
 	spec: MuxRekeyChunkedDrainSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let config = MuxEndpointConfig { rekey_limit: Some(18), cancel_budget: None, grantor: None };
-			let pair = establish_echo_pair(chunked_offer(1), chunked_offer(1), config).await?;
+			let config = MuxEndpointConfig { rekey_limit: Some(18), ..MuxEndpointConfig::default() };
+			let pair = establish_echo_pair(chunked_offer(1), chunked_offer(1), config, trace.share()).await?;
 
 			let frame = large_mux_frame("mux-rekey-chunked");
 			let echoed = pair.client.handle.emit_on_stream(&frame).await?;
 			trace.event_with(
-				MuxRekeyChunkedDrainSpec::chunked_transfer_survives_drain,
+				CHUNKED_TRANSFER_SURVIVES_DRAIN,
 				&[],
 				is_echo(echoed, &frame),
 			)?;
 
 			trace.event_with(
-				MuxRekeyChunkedDrainSpec::drain_reason_surfaces,
+				DRAIN_REASON_SURFACES,
 				&[],
 				await_goaway_reason(&pair.client.handle, GoAwayReason::Shutdown).await,
 			)?;
 
-			let late = pair.client.handle.emit_on_stream(&mux_frame("mux-rekey-late")).await;
-			trace.event_with(MuxRekeyChunkedDrainSpec::late_emit_draining, &[], is_draining(&late))?;
+			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			let _late = pair.client.handle.emit_on_stream(&mux_frame("mux-rekey-late")).await;
 
 			Ok(())
 		}

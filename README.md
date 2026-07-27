@@ -1292,9 +1292,11 @@ Policies control message flow without modifying transport logic:
 
 ```rust
 pub trait GatePolicy: Send + Sync {
-	fn evaluate(&self, frame: &Frame) -> TransitStatus;
+	fn evaluate(&self, frame: &Frame, session: &SessionContext) -> TransitStatus;
 }
 ```
+
+Every evaluation carries the connection's `SessionContext`: identity-blind gates ignore it, identity gates key on it. Sites without authenticated facts, such as cleartext connections, client-side emit paths, in-process evaluation, pass the empty (default) context, whose accessors all answer `None`.
 
 **ReceptorPolicy Trait:**
 
@@ -1368,14 +1370,14 @@ pub enum RetryAction {
 **GatePolicy - Frame-Level Filtering:**
 
 ```rust
-use tightbeam::policy::{GatePolicy, TransitStatus};
+use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
 
 // Accept only messages with specific ID patterns
 #[derive(Default)]
 struct IdPatternGate;
 
 impl GatePolicy for IdPatternGate {
-	fn evaluate(&self, frame: &Frame) -> TransitStatus {
+	fn evaluate(&self, frame: &Frame, _session: &SessionContext) -> TransitStatus {
 		if frame.metadata.id.starts_with(b"api-") {
 			TransitStatus::Ok
 		} else {
@@ -1383,6 +1385,20 @@ impl GatePolicy for IdPatternGate {
 		}
 	}
 }
+```
+
+**GatePolicy - Session-Identity Filtering:**
+
+```rust
+use tightbeam::colony::hive::PeerListGate;
+
+// Bar these public keys (SPKI DER) at the door; the gate matches the
+// session's mutually-authenticated peer certificate, not frame signers.
+let doorman = PeerListGate::deny([banned_spki_der]);
+
+// Or admit only listed keys; sessions without an authenticated peer
+// fail closed (Unauthenticated).
+let doorman = PeerListGate::allow([member_spki_der]);
 ```
 
 **ReceptorPolicy - Message-Level Filtering:**
@@ -1435,6 +1451,16 @@ tightbeam::policy! {
 		}
 	}
 
+	// Two-argument arm: session-aware gates receive the connection's
+	// authenticated peer context.
+	GatePolicy: MutualAuthOnly |frame, session| {
+		if session.peer_certificate().is_some() {
+			TransitStatus::Ok
+		} else {
+			TransitStatus::Unauthenticated
+		}
+	}
+
 	ReceptorPolicy<RequestMessage>: OnlyPingMessages |message| {
 		if message.content == "PING" {
 			TransitStatus::Ok
@@ -1480,7 +1506,7 @@ tightbeam implements two handshake protocols for mutual authentication and sessi
 - **Mutual Authentication**: Both parties prove identity via certificates
 - **Perfect Forward Secrecy**: Ephemeral ECDH ([NIST SP 800-56A][nist-800-56a]) keys ensure past sessions remain secure if long-term keys are compromised
 - **Replay Protection**: Nonces prevent replay attacks
-- **Downgrade Prevention**: Transcript hash covers all handshake messages including profile negotiation ([RFC 8446 §4.1.3][rfc8446-4.1.3], analogous)
+- **Downgrade Prevention**: Transcript hash covers all handshake messages including profile negotiation ([RFC 9846 §4.1.3][rfc9846-4.1.3], analogous)
 - **Confidentiality**: Session keys derived via HKDF protect all subsequent messages
 
 #### 8.5.2 Specification: Handshake Flow and State Management
@@ -1821,7 +1847,6 @@ Client                              Server
 - Offer and accept also carry the flow-control values (`chunk_payload_size`, `credit_unit`, `initial_stream_credit`), with the same directional semantics: the sender of the struct advertises what it will receive. The accept fixes `credit_unit` for both directions
 - The offer MAY request per-direction session budgets (`requested_budgets`) and attach an opaque `authorization` token. The accept answers with `granted_budgets`. Grants are opt-in server-side: without a local budget ceiling or an authorizer verdict, nothing is granted. A server-side `TransportAuthorizer` MAY refuse the session (`AuthorizationRefused`). See [§8.6.2](#862-specification-stream-rules-envelopes-and-runtime)
 - The client MUST fail closed on every grant diverging from its request: a granted budget without a request (`UnsolicitedTransportAccept`), a grant beyond `MAX_MUX_SESSION_BUDGET` (`BudgetBeyondCap`), a grant beyond the request (`BudgetBeyondRequest`), and a grant withheld against a request (`BudgetGrantWithheld`). Grants at or below the request activate metering and the receipt exchange
-- Both endpoints MUST derive their `MuxSettings` views from the same clamped wire values so enforcement stays lock-step
 
 See [§8.6 Multiplexing](#86-multiplexing) for stream identifier rules, envelope types, and runtime assembly.
 
@@ -1893,6 +1918,7 @@ tightbeam's mux is an application-layer stream router over the existing envelope
 - **Fair Sharing**: Mandatory chunking bounds record size. Per-stream credit windows bound reassembly memory and keep one stream from monopolizing the shared writer
 - **Metered Sessions**: Optional handshake-granted per-direction budgets bound the volume an encrypted session may spend before renewal
 - **Accountable Sessions**: Budget-bearing sessions produce a dual-signed `SessionReceipt` binding transcript, budgets, and settlement terms under both identities, verifiable by a third party from the certificates alone
+- **Epoch Renewal**: Budget-bearing sessions renew keys, counters, budgets, and receipts in band before the cipher record limit ([RFC 9846 §5.5][rfc9846-5.5])
 - **Graceful Drain**: GoAway completes in-flight streams at or below a specified threshold rejecting newer ones
 - **Abuse Resistance**: A rapid reset (CVE-2023-44487) exhausts a cancel budget receiving GoAway(`EnhanceYourCalm`)
 
@@ -1933,17 +1959,21 @@ Streams in `Open`, `HalfClosedLocal`, or `HalfClosedRemote` count toward the pee
 
 Each endpoint MUST enforce the cap it advertised against peer-initiated streams and MUST respect the cap its peer advertised when allocating locally. Exhausting the local-initiated cap MUST return `ResourceExhausted` without allocating a stream. Advertised caps MUST be clamped to `MAX_MUX_STREAM_CAP` (1024) when deriving settings so an absurd wire advertisement cannot inflate bookkeeping bounds (CWE-770).
 
-**Envelope Types** (`TransportEnvelope` context tag 4 nests the `MuxEnvelope` CHOICE, inner context tags 0-6):
+**Envelope Types** (`TransportEnvelope` context tag 4 nests the `MuxEnvelope` CHOICE, inner context tags 0-10):
 
-| Variant  | Role                                                                                                           |
-| -------- | -------------------------------------------------------------------------------------------------------------- |
-| `Open`   | Open a stream and carry its first payload chunk inline (`stream_id`, `last`, `payload`)                        |
-| `Data`   | Continuation chunk on an open stream, either direction (`stream_id`, `last`, `payload`)                        |
-| `End`    | Responder trailer: `status` plus the final payload chunk inline                                                |
-| `Credit` | Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA analog, [RFC 9000 §4.1][rfc9000-4.1]) |
-| `Cancel` | Abort a single in-flight stream without tearing down the connection                                            |
-| `GoAway` | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected              |
-| `Ping`   | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                                |
+| Variant         | Role                                                                                                           |
+| --------------- | -------------------------------------------------------------------------------------------------------------- |
+| `Open`          | Open a stream and carry its first payload chunk inline (`stream_id`, `last`, `payload`)                        |
+| `Data`          | Continuation chunk on an open stream, either direction (`stream_id`, `last`, `payload`)                        |
+| `End`           | Responder trailer: `status` plus the final payload chunk inline                                                |
+| `Credit`        | Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA analog, [RFC 9000 §4.1][rfc9000-4.1]) |
+| `Cancel`        | Abort a single in-flight stream without tearing down the connection                                            |
+| `GoAway`        | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected              |
+| `Ping`          | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                                |
+| `RekeyRequest`  | Client opens an epoch renewal: fresh nonce ([RFC 9846 §4.7.3][rfc9846-4.7.3] update-request analog)            |
+| `RekeyResponse` | Server answers: its nonce plus the server-signed epoch receipt                                                 |
+| `RekeyAck`      | Client accepts: its countersignature. Marks the client-to-server key switch                                    |
+| `RekeyDone`     | Server confirms settlement. Marks the server-to-client key switch                                              |
 
 **Stream Grammar** (unified: a unary request is a degenerate stream, [RFC 9113 §8.1][rfc9113-8.1] analog):
 
@@ -1968,6 +1998,17 @@ either:     Cancel(code)  Credit(limit)
 - The server's `TransportAuthorizer::settle` accepts or refuses the answer. The session MUST NOT activate before it accepts. Every step fails closed, and budgets REQUIRE mutual authentication
 - A server-side `SessionObserver` records every concluded outcome, including refused and forged acknowledgements. It never vetoes
 - Both endpoints retain the completed artifact (`session_receipt()`). The settlement answer is application truth: never parsed, never price-checked, never persisted. The receipt makes the agreement non-repudiable, not correct
+
+**Epoch Renewal (Rekey)** (budget-bearing sessions only): renew AEAD epoch in band instead of draining at a watermark. Client opens `RekeyRequest` / `RekeyResponse` / `RekeyAck`, then server `RekeyDone`, when send budget hits drain reserve or send records approach the rekey limit (MUST rekey before limit, [RFC 9846 §5.5][rfc9846-5.5]), with `DEFAULT_REKEY_RENEWAL_ALLOWANCE` slack.
+
+- Fresh keys derive via `kdf_chain` from the retained epoch secret and both exchanged nonces. The prior secret is zeroized once its successor exists ([RFC 9846 §7.2][rfc9846-7.2])
+- Each direction switches keys at its marker on the ordered AEAD channel ([RFC 9846 §4.7.3][rfc9846-4.7.3] per-direction precedent): client-to-server at the `RekeyAck` record, server-to-client at the `RekeyDone` record. Record counters reset only with the fresh keys ([NIST SP 800-38D][nist-800-38d] §8.2.1)
+- Budgets reset to the negotiated terms at `RekeyDone`. The epoch receipt MUST carry the same credit terms as the initial one (credit-match invariant, absolute-limits analog [RFC 9000 §4.1][rfc9000-4.1]): a renewal never renegotiates
+- Every epoch produces a fresh dual-signed receipt chained to its predecessor by transcript hash, third-party verifiable from the original certificates. `session_receipt()` rotates to the current epoch's artifact
+- The authorizer MAY attach a settlement challenge to the renewal (`TransportAuthorizer::challenge_renewal`). The client's `ReceiptApprover` answers inside the encrypted `RekeyAck`, and `settle` accepts or refuses, exactly as at the handshake
+- Failures fail closed into a graceful drain: settlement or approval refusal drains with the refusal's code, a stalled exchange drains at the renewal deadline (default `DEFAULT_REKEY_DEADLINE_SECS`, override via `MuxTransport::with_renewal_deadline`), and a premature (below the minimum-spend floor) or duplicate `RekeyRequest` is a protocol violation: GoAway(`ProtocolError`)
+- A renewal still in flight at the drain threshold parks data chunks on the hard floor (control and the exchange legs keep the remaining records) and resumes them on the fresh cipher
+- Sessions without rekey materials (receiptless or cleartext) drain via GoAway near the watermark; caller re-establishes
 
 **Reason Code Space** (open u32, HTTP/2 error-code and QUIC application-close precedent: [RFC 9113 §7][rfc9113-7], [RFC 9000 §20.2][rfc9000-20.2]): codes below `MUX_APPLICATION_CODE_FLOOR` (0x1000) are reserved for the TightBeam protocol. Applications own the rest. Unknown codes decode to `Application(code)` and MUST NOT kill the connection.
 
@@ -2013,7 +2054,7 @@ Client (MuxHandle)                         Server (MuxResponder)
 - A non-mux peer MUST reject muxed envelopes as invalid
 - A mux peer that receives a non-mux application envelope (plain `Request`/`Response` where muxed traffic is required) MUST send GoAway(`ProtocolError`) and fail pending streams
 - Cancels that abort in-flight handlers draw on a per-connection budget (`DEFAULT_MUX_CANCEL_BUDGET` = 1024). Exhaustion MUST end the connection with GoAway(`EnhanceYourCalm`). Override via `MuxTransport::with_cancel_budget`
-- Near the AEAD send-record limit ([RFC 8446 §5.5][rfc8446-5.5]), the writer MUST begin a graceful drain via GoAway while `2 * (local_cap + peer_cap) + 1` records plus every registered-but-unsent chunk remain, so queued chunked responses, cancels, and the GoAway itself still fit under the cipher limit
+- Near the AEAD send-record limit ([RFC 9846 §5.5][rfc9846-5.5]), a rekey-capable session opens an in-band epoch renewal (see Epoch Renewal above). Otherwise the writer MUST begin a graceful drain via GoAway while `2 * (local_cap + peer_cap) + 1` records plus every registered-but-unsent chunk remain, so queued chunked responses, cancels, and the GoAway itself still fit under the cipher limit
 
 **Runtime Architecture:**
 
@@ -2204,6 +2245,18 @@ let server_handle = server! {
 - The sync (`std`-thread) serving path never multiplexes. Mux drivers need an async executor
 - Serving mux requires `transport-multiplex` (plus `x509`, `tokio`, `transport-policy`). A server built without it never advertises and keeps serving single-flight peers
 
+```rust
+let server_handle = server! {
+	protocol TokioListener: listener,
+	policies: { with_mux_offer: [Some(offer)], with_transport_authorizer: [authorizer] },
+	handle: move |frame: Frame, session: SessionContext| async move {
+		let certificate = session.peer_certificate();  // mutual-auth client identity
+		let receipt = session.session_receipt();       // dual-signed budget receipt
+		Ok(Some(frame))
+	}
+};
+```
+
 **Pooling with `PoolConfig::mux_offer`:**
 
 ```rust
@@ -2217,6 +2270,24 @@ let response = client.emit(frame, None).await?;
 ```
 
 With an offer configured, `connect` shares ONE multiplexed connection per destination. Every caller leases a clone of the same `MuxHandle` and `emit` opens a fresh stream. `PooledClient::conn()` (the exclusive-connection accessor) answers `ResourceExhausted` on a mux lease. `emit` is the transport-agnostic call.
+
+**Metered pooled sessions** - budgets on the offer, settlement hooks on the pool:
+
+```rust
+let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+	.with_config(PoolConfig { mux_offer: Some(offer.with_budgets(budgets)), ..Default::default() })
+	.with_trust_store(trust_store)
+	.with_client_identity(client_cert, client_key)?  // budgets REQUIRE mutual auth
+	.with_receipt_approver(approver)                 // answers settlement challenges
+	.build());
+
+let lease = pool.connect(server_addr).await?;
+let receipt = lease.session_receipt();  // Option<Arc<StoredReceipt>>
+```
+
+- `ConnectionPoolBuilder::with_receipt_approver` forwards the approver to every dialed transport (handshake and epoch renewal). Without one, pooled clients fail closed on challenge-bearing receipts
+- `PooledClient::session_receipt()` exposes the connection dual-signed receipt shared across leases; epoch renewal rotates in place. Exclusive leases and receiptless sessions return `None`
+- Size invoices with the public watermark math on `MuxSettings`: `usable_send_budget()` answers the credits spendable on application data before the budget watermark opens an in-band renewal (`send_budget` minus `send_budget_reserve()`, the credits reserved so owed traffic can flush during a drain)
 
 **Fallback semantics** (automatic, per connection):
 
@@ -2264,6 +2335,18 @@ client.emit(frame, None).await?;
 ### 8.8 Audit
 
 The tightbeam transport layer and handshake protocols have not yet been independently audited. We welcome help in this area.
+
+#### 8.8.1 Audit Trail Deployment Requirements
+
+Access and session verdicts (`GATE_ACCEPT`/`GATE_REJECT` with the refusing status and the peer SPKI hash, `SESSION_CERT_REJECTED`, receipt events) are recorded only when the deployment opts in. Deployments with audit obligations (e.g. ISO 27001 A.8.15, NIST 800-53 AU-2) MUST:
+
+1. Enable the `instrument` feature and attach a `TraceCollector` to every transport that terminates connections (`with_trace`).
+2. Enable `enable_payloads` in the instrumentation configuration if peer identity (SPKI SHA3-256) must appear on gate verdicts.
+3. Provide a durable `EventSink`: the default sink is a bounded in-memory buffer and drops the oldest events under pressure. Sequence-number gaps in exported evidence reveal where truncation occurred.
+
+Event timestamps are nanoseconds relative to the collector's trace clock;
+the clock's wall-clock origin is recorded once per collector
+(`TRACE_CLOCK_ORIGIN`) so absolute times are reconstructible offline.
 
 ## 9. Network Theory
 
@@ -5338,9 +5421,9 @@ tb_scenario! {
 - [RFC 6960][rfc6960]: X.509 Internet Public Key Infrastructure Online Certificate Status Protocol (OCSP)
 - [RFC 7322][rfc7322]: RFC Style Guide
 - [RFC 7748][rfc7748]: Elliptic Curves for Security
-- [RFC 8446][rfc8446]: The Transport Layer Security (TLS) Protocol Version 1.3
 - [RFC 8622][rfc8622]: A Lower-Effort Per-Hop Behavior (LE PHB) for Differentiated Services
 - [RFC 9113][rfc9113]: HTTP/2
+- [RFC 9846][rfc9846]: The Transport Layer Security (TLS) Protocol Version 1.3 (obsoletes RFC 8446)
 - [RFC 9901][rfc9901]: Selective Disclosure for JSON Web Tokens (SD-JWT)
 - [RFC Editor Style Guide][rfc-style-guide]: Web Portion of the Style Guide
 
@@ -5416,9 +5499,6 @@ The workspace consists of the following components:
 [rfc8032]: https://datatracker.ietf.org/doc/html/rfc8032
 [rfc8141]: https://datatracker.ietf.org/doc/html/rfc8141
 [rfc8439]: https://datatracker.ietf.org/doc/html/rfc8439
-[rfc8446]: https://datatracker.ietf.org/doc/html/rfc8446
-[rfc8446-4.1.3]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
-[rfc8446-5.5]: https://datatracker.ietf.org/doc/html/rfc8446#section-5.5
 [rfc8622]: https://datatracker.ietf.org/doc/html/rfc8622
 [rfc9000]: https://datatracker.ietf.org/doc/html/rfc9000
 [rfc9000-4.1]: https://datatracker.ietf.org/doc/html/rfc9000#section-4.1
@@ -5430,6 +5510,11 @@ The workspace consists of the following components:
 [rfc9113-5.2.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2
 [rfc9113-7]: https://datatracker.ietf.org/doc/html/rfc9113#section-7
 [rfc9113-8.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-8.1
+[rfc9846]: https://datatracker.ietf.org/doc/html/rfc9846
+[rfc9846-4.1.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.1.3
+[rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
+[rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
+[rfc9846-7.2]: https://datatracker.ietf.org/doc/html/rfc9846#section-7.2
 [rfc9901]: https://datatracker.ietf.org/doc/html/rfc9901
 [itu-x680]: https://www.itu.int/rec/T-REC-X.680
 [itu-x690]: https://www.itu.int/rec/T-REC-X.690
@@ -5440,6 +5525,7 @@ The workspace consists of the following components:
 [fips186-5]: https://csrc.nist.gov/pubs/fips/186-5/final
 [fips197]: https://csrc.nist.gov/publications/detail/fips/197/final
 [fips202]: https://csrc.nist.gov/publications/detail/fips/202/final
+[nist-800-38d]: https://csrc.nist.gov/publications/detail/sp/800-38d/final
 [nist-800-56a]: https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final
 [nist-800-57]: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final
 [iso-18013-5]: https://www.iso.org/standard/69084.html

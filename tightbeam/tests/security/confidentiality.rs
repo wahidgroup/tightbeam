@@ -28,6 +28,7 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
@@ -36,17 +37,28 @@ use crate::security::common::{
 	Direction, HandshakeBackendKind, SecurityThreatHarness,
 };
 
+pub(crate) const CONF_CAPTURE_HANDSHAKE: Urn<'static> =
+	Urn::new("test", "event:confidentiality/conf-capture-handshake");
+pub(crate) const CONF_CIPHERTEXTS_DIFFER: Urn<'static> =
+	Urn::new("test", "event:confidentiality/conf-ciphertexts-differ");
+pub(crate) const CONF_DECRYPT_CORRECT_KEY: Urn<'static> =
+	Urn::new("test", "event:confidentiality/conf-decrypt-correct-key");
+pub(crate) const CONF_DECRYPT_WRONG_KEY_FAILS: Urn<'static> =
+	Urn::new("test", "event:confidentiality/conf-decrypt-wrong-key-fails");
+pub(crate) const CONF_EXTRACT_CIPHERTEXT: Urn<'static> =
+	Urn::new("test", "event:confidentiality/conf-extract-ciphertext");
+
 tb_assert_spec! {
 	pub ConfidentialitySpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(conf_capture_handshake, exactly!(1u32)),
-			(conf_extract_ciphertext, exactly!(1u32)),
-			(conf_decrypt_correct_key, exactly!(1u32)),
-			(conf_decrypt_wrong_key_fails, exactly!(1u32)),
-			(conf_ciphertexts_differ, exactly!(1u32))
+			(CONF_CAPTURE_HANDSHAKE, exactly!(1u32)),
+			(CONF_EXTRACT_CIPHERTEXT, exactly!(1u32)),
+			(CONF_DECRYPT_CORRECT_KEY, exactly!(1u32)),
+			(CONF_DECRYPT_WRONG_KEY_FAILS, exactly!(1u32)),
+			(CONF_CIPHERTEXTS_DIFFER, exactly!(1u32))
 		]
 	}
 }
@@ -55,27 +67,27 @@ tb_process_spec! {
 	pub ConfidentialityProcess,
 	events {
 		observable {
-			ConfidentialitySpec::conf_capture_handshake,
-			ConfidentialitySpec::conf_extract_ciphertext,
-			ConfidentialitySpec::conf_decrypt_correct_key,
-			ConfidentialitySpec::conf_decrypt_wrong_key_fails,
-			ConfidentialitySpec::conf_ciphertexts_differ,
-			SecurityThreatHarness::harness_spawn_session,
-			SecurityThreatHarness::harness_spawn_ecies
+			CONF_CAPTURE_HANDSHAKE,
+			CONF_EXTRACT_CIPHERTEXT,
+			CONF_DECRYPT_CORRECT_KEY,
+			CONF_DECRYPT_WRONG_KEY_FAILS,
+			CONF_CIPHERTEXTS_DIFFER,
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES
 		}
 		hidden { }
 	}
 	states {
-		Idle => { SecurityThreatHarness::harness_spawn_session => Spawning },
-		Spawning => { SecurityThreatHarness::harness_spawn_ecies => SessionReady },
+		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
+		Spawning => { SecurityThreatHarness::HARNESS_SPAWN_ECIES => SessionReady },
 		SessionReady => {
-			ConfidentialitySpec::conf_capture_handshake => Captured,
-			ConfidentialitySpec::conf_ciphertexts_differ => Idle
+			CONF_CAPTURE_HANDSHAKE => Captured,
+			CONF_CIPHERTEXTS_DIFFER => Idle
 		},
-		Captured => { ConfidentialitySpec::conf_extract_ciphertext => Extracted },
-		Extracted => { ConfidentialitySpec::conf_decrypt_correct_key => CorrectKeyVerified },
-		CorrectKeyVerified => { ConfidentialitySpec::conf_decrypt_wrong_key_fails => WrongKeyVerified },
-		WrongKeyVerified => { SecurityThreatHarness::harness_spawn_session => Spawning }
+		Captured => { CONF_EXTRACT_CIPHERTEXT => Extracted },
+		Extracted => { CONF_DECRYPT_CORRECT_KEY => CorrectKeyVerified },
+		CorrectKeyVerified => { CONF_DECRYPT_WRONG_KEY_FAILS => WrongKeyVerified },
+		WrongKeyVerified => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning }
 	}
 	terminal { Idle }
 	annotations { description: "Confidentiality: ECIES encryption verification via manual decryption" }
@@ -110,7 +122,7 @@ job! {
 		let mut session = harness.spawn(kind);
 		let captured = session.capture_full().await?;
 
-		trace.event(ConfidentialitySpec::conf_capture_handshake)?;
+		trace.event(CONF_CAPTURE_HANDSHAKE)?;
 
 		// ========================================
 		// Step 2: Extract ECIES ciphertext from ClientKeyExchange (step 2)
@@ -129,7 +141,7 @@ job! {
 			return Err(expectation_failure("ciphertext too short to be valid ECIES"));
 		}
 
-		trace.event(ConfidentialitySpec::conf_extract_ciphertext)?;
+		trace.event(CONF_EXTRACT_CIPHERTEXT)?;
 
 		// ========================================
 		// Step 3: Decrypt with CORRECT key - proves encryption works
@@ -145,7 +157,7 @@ job! {
 					return Err(expectation_failure("decrypted plaintext is not the 70-byte DER payload"));
 				}
 
-				trace.event(ConfidentialitySpec::conf_decrypt_correct_key)?;
+				trace.event(CONF_DECRYPT_CORRECT_KEY)?;
 			}
 			DecryptionResult::Failed => {
 				return Err(expectation_failure("decryption with correct key failed"));
@@ -159,7 +171,7 @@ job! {
 		match try_decrypt_ecies(&ciphertext, &wrong_key, None) {
 			DecryptionResult::Failed => {
 				// Expected - wrong key cannot decrypt
-				trace.event(ConfidentialitySpec::conf_decrypt_wrong_key_fails)?;
+				trace.event(CONF_DECRYPT_WRONG_KEY_FAILS)?;
 			}
 			DecryptionResult::Success { .. } => {
 				return Err(expectation_failure("decryption with wrong key should fail"));
@@ -185,7 +197,7 @@ job! {
 			return Err(expectation_failure("ciphertexts are identical across handshakes"));
 		}
 
-		trace.event(ConfidentialitySpec::conf_ciphertexts_differ)?;
+		trace.event(CONF_CIPHERTEXTS_DIFFER)?;
 
 		Ok(())
 	}

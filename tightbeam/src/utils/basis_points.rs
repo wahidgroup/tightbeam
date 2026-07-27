@@ -86,8 +86,8 @@ impl BasisPoints {
 	/// ```
 	/// use tightbeam::utils::BasisPoints;
 	///
-	/// const VALID: BasisPoints = BasisPoints::new(5000);  // ✓ OK
-	/// // const INVALID: BasisPoints = BasisPoints::new(10001);  // ✗ Compile error
+	/// const VALID: BasisPoints = BasisPoints::new(5000);       // OK
+	/// // const INVALID: BasisPoints = BasisPoints::new(10001); // Compile error
 	/// ```
 	pub const fn new(value: u16) -> Self {
 		assert!(value <= 10000, "BasisPoints must be 0-10000");

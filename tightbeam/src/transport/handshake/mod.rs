@@ -167,9 +167,28 @@ pub mod kari;
 #[cfg(feature = "transport-cms")]
 pub mod processors;
 
-pub use common::{DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
+pub use common::{
+	DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation,
+};
 pub use error::HandshakeError;
 pub(crate) use utils::aes_256_gcm_algorithm;
+
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+mod mux {
+	pub(crate) use super::common::derive_directional_from_oid;
+	pub(crate) use super::utils::{
+		compute_transcript_digest, extract_verifying_key_from_cert, octet_string_to_32_byte_array,
+	};
+}
+
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub(crate) use mux::*;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub use attributes::HandshakeAttribute;
@@ -188,10 +207,7 @@ use core::result::Result as CoreResult;
 use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
-use crate::cms::signed_data::SignedData;
-#[cfg(feature = "transport-ecies")]
-use crate::cms::signed_data::SignerInfo;
-use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
+use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
 use crate::crypto::aead::SessionKeys;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
@@ -205,76 +221,67 @@ use crate::transport::handshake::negotiation::{
 	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
 use crate::transport::handshake::receipt::StoredReceipt;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::Beamable;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::aead::KeyInit;
-#[cfg(feature = "transport-ecies")]
-use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+mod transport {
+	pub use crate::crypto::aead::KeyInit;
+	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+	pub use crate::crypto::sign::Verifier;
+	pub use crate::transport::handshake::negotiation::TransportAuthorizer;
+	pub use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
+}
+
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-#[cfg(feature = "transport-ecies")]
-use crate::crypto::sign::SignatureEncoding;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::sign::Verifier;
+use transport::*;
+
 #[cfg(feature = "transport-cms")]
-use crate::crypto::x509::store::CertificateTrust;
+mod cms {
+	pub use crate::crypto::x509::store::CertificateTrust;
+	pub use crate::spki::EncodePublicKey;
+	pub use crate::transport::handshake::server::CmsHandshakeServer;
+}
+
 #[cfg(feature = "transport-cms")]
-use crate::spki::EncodePublicKey;
+use cms::*;
+
 #[cfg(feature = "transport-ecies")]
-use crate::transport::handshake::client::EciesHandshakeClient;
+mod ecies {
+	pub use crate::cms::signed_data::SignerInfo;
+	pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+	pub use crate::crypto::sign::SignatureEncoding;
+	pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
+	pub use crate::transport::handshake::server::EciesHandshakeServer;
+}
+
 #[cfg(feature = "transport-ecies")]
-use crate::transport::handshake::client::ExtractVerifyingKey;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::negotiation::TransportAuthorizer;
-#[cfg(feature = "transport-cms")]
-use crate::transport::handshake::server::CmsHandshakeServer;
-#[cfg(feature = "transport-ecies")]
-use crate::transport::handshake::server::EciesHandshakeServer;
+use ecies::*;
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::time::Instant;
 
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
-use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 #[cfg(feature = "x509")]
-use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
+mod x509 {
+	#[cfg(feature = "secp256k1")]
+	pub use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	pub use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
+	pub use crate::x509::Certificate;
+}
 
 #[cfg(feature = "x509")]
-use crate::x509::Certificate;
-
-// ============================================================================
-// Server key abstraction for handshake (sign + decrypt)
-// ============================================================================
+use x509::*;
 
 /// Server-side key operations for handshake protocols.
 ///
-/// This trait provides a factory interface for creating protocol-specific handshake
-/// orchestrators. Each implementation encapsulates a signing key and creates concrete
-/// servers that borrow the key, ensuring zero-copy key management and proper encapsulation.
-///
-/// The encapsulated design ensures that private key material is never exposed through
-/// the trait interface - orchestrators borrow the key from their factory.
+/// This trait provides a factory interface for creating protocol-specific
+/// handshake orchestrators. Each implementation encapsulates a signing key
+/// and creates concrete servers that borrow the key, ensuring zero-copy key
+/// management and proper encapsulation.
 #[cfg(feature = "x509")]
 pub trait ServerHandshakeKey: Send + Sync {
-	/// Create an ECIES server handshake orchestrator.
-	///
-	/// The orchestrator borrows the encapsulated signing key, ensuring zero-copy
-	/// key management and proper encapsulation.
-	///
-	/// # Parameters
-	/// - `server_cert`: The server's certificate to send to client
-	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption
-	/// - `supported_profiles`: Security profiles for negotiation
-	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
-	///
-	/// # Returns
-	/// An ECIES server handshake orchestrator that borrows the encapsulated key
+	/// ECIES server orchestrator borrowing the encapsulated signing key.
 	fn create_ecies_server(
 		&self,
 		server_cert: Arc<Certificate>,
@@ -283,19 +290,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Result<BoxedServerHandshake>;
 
-	/// Create an ECIES client handshake orchestrator.
-	///
-	/// The orchestrator borrows the encapsulated signing key for mutual authentication,
-	/// ensuring zero-copy key management.
-	///
-	/// # Parameters
-	/// - `server_cert`: Optional server certificate to validate
-	/// - `client_cert`: Optional client certificate for mutual auth
-	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption
-	/// - `validator`: Optional certificate validator for server certificate
-	///
-	/// # Returns
-	/// An ECIES client handshake orchestrator that borrows the encapsulated key
+	/// ECIES client orchestrator borrowing the encapsulated signing key.
 	fn create_ecies_client(
 		&self,
 		server_cert: Option<Arc<Certificate>>,
@@ -435,19 +430,18 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		Self { provider, _phantom: PhantomData }
 	}
 
-	/// Create an ECIES server handshake orchestrator using the encapsulated key provider.
-	///
-	/// The orchestrator uses the key provider for cryptographic operations,
-	/// ensuring proper encapsulation and enabling HSM/KMS integration.
-	///
-	/// # Parameters
-	/// - `server_cert`: The server's certificate to send to client
-	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption
-	/// - `supported_profiles`: Security profiles for negotiation
-	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
-	///
-	/// # Returns
-	/// A boxed ECIES server handshake orchestrator that uses the encapsulated key provider
+	/// Shared handle to the encapsulated signing provider, for
+	/// post-handshake signers (in-band epoch renewals). The key
+	/// material itself stays behind the provider abstraction.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
+	pub(crate) fn signing_provider(&self) -> Arc<dyn SigningKeyProvider> {
+		Arc::clone(&self.provider)
+	}
+
+	/// ECIES server orchestrator via the encapsulated key provider.
 	#[cfg(feature = "transport-ecies")]
 	#[allow(clippy::too_many_arguments)]
 	pub fn create_ecies_server(
@@ -486,19 +480,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		Ok(Box::new(server))
 	}
 
-	/// Create an ECIES client handshake orchestrator using the encapsulated key provider.
-	///
-	/// The orchestrator uses the key provider for cryptographic operations,
-	/// ensuring proper encapsulation and enabling HSM/KMS integration.
-	///
-	/// # Parameters
-	/// - `server_cert`: Optional server certificate to validate
-	/// - `client_cert`: Optional client certificate for mutual auth
-	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption
-	/// - `validator`: Optional certificate validator for server certificate
-	///
-	/// # Returns
-	/// An ECIES client handshake orchestrator that uses the encapsulated key provider
+	/// ECIES client orchestrator via the encapsulated key provider.
 	#[cfg(feature = "transport-ecies")]
 	pub fn create_ecies_client<M>(
 		&self,
@@ -537,13 +519,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		Ok(Box::new(client))
 	}
 
-	/// Create a CMS client handshake orchestrator using the encapsulated key provider.
-	///
-	/// The orchestrator uses the key provider for cryptographic operations,
-	/// ensuring proper encapsulation and enabling HSM/KMS integration.
-	///
-	/// # Returns
-	/// A CMS client handshake orchestrator that uses the encapsulated key provider
+	/// CMS client orchestrator via the encapsulated key provider (HSM/KMS-safe).
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_client(&self, config: CmsClientConfig) -> Result<BoxedClientHandshake>
 	where
@@ -583,16 +559,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		Ok(Box::new(client))
 	}
 
-	/// Create a CMS server handshake orchestrator using the encapsulated key provider.
-	///
-	/// The orchestrator uses the key provider for cryptographic operations,
-	/// ensuring proper encapsulation and enabling HSM/KMS integration.
-	///
-	/// # Parameters
-	/// - `client_validators`: Optional validators for client certificate authentication
-	///
-	/// # Returns
-	/// A CMS server handshake orchestrator that uses the encapsulated key provider
+	/// CMS server orchestrator via the encapsulated key provider (HSM/KMS-safe).
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_server(
 		&self,
@@ -630,9 +597,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	}
 }
 
-// ============================================================================
-// TCP Handshake State Machine
-// ============================================================================
 /// State tracking for TCP connection handshake process with optional timeout tracking.
 /// This is distinct from the protocol-level HandshakeState in state.rs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -658,9 +622,6 @@ pub enum TcpHandshakeState {
 	Complete,
 }
 
-// ============================================================================
-// Alert codes for CMS-based handshake abort signaling
-// ============================================================================
 #[derive(Enumerated, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HandshakeAlert {
@@ -678,10 +639,6 @@ pub enum HandshakeAlert {
 	// never shipped. Do not reuse. The next alert takes 7 so archived
 	// captures never decode a stale meaning
 }
-
-// ============================================================================
-// Handshake Protocol Abstraction
-// ============================================================================
 
 /// Client-side handshake protocol trait.
 ///
@@ -719,29 +676,33 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 	#[cfg(feature = "aead")]
 	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<SessionKeys, Self::Error>>;
 
-	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
 
-	/// Get the negotiated security profile.
-	///
-	/// Returns `Some(SecurityProfileDesc)` containing the negotiated algorithm OIDs
-	/// after successful profile negotiation during handshake. Returns `None` if
-	/// negotiation has not occurred yet.
+	/// Negotiated algorithm OIDs after profile negotiation; `None` before accept.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
 
-	/// Get the negotiated multiplexing settings.
-	///
-	/// Returns `Some(MuxSettings)` only when both sides negotiated
-	/// multiplexing during the handshake. `None` means lock-step.
+	/// Multiplexing settings when both sides negotiated mux; else single-flight.
 	fn negotiated_mux(&self) -> Option<MuxSettings> {
 		None
 	}
 
-	/// Get the dual-signed session receipt.
-	///
-	/// Returns `Some(StoredReceipt)` only after a budget-bearing
-	/// handshake completed with both signatures in place.
+	/// Dual-signed receipt after a budget-bearing handshake with both signatures.
 	fn session_receipt(&self) -> Option<&StoredReceipt> {
+		None
+	}
+
+	/// Validated peer certificate (client: server); `None` before validation.
+	#[cfg(feature = "x509")]
+	fn peer_certificate(&self) -> Option<&Certificate> {
+		None
+	}
+
+	/// Take the epoch-0 rekey materials produced at completion.
+	///
+	/// `None` before completion, after the materials were already
+	/// taken, or when the orchestrator retains no epoch state.
+	#[cfg(feature = "aead")]
+	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
 		None
 	}
 }
@@ -779,40 +740,32 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 	#[cfg(feature = "aead")]
 	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<SessionKeys, Self::Error>>;
 
-	/// Check if the handshake is complete.
+	/// Returns true if the handshake is complete.
 	fn is_complete(&self) -> bool;
 
-	/// Get the validated peer certificate from mutual authentication.
-	///
-	/// Returns `Some(Certificate)` if the client provided a certificate during the handshake
-	/// and it was successfully validated. Returns `None` if no client certificate was provided
-	/// or mutual authentication was not configured.
-	///
-	/// The peer certificate represents the authenticated identity of the client and should
-	/// be treated as immutable for the lifetime of the connection.
+	/// Negotiated algorithm OIDs after profile negotiation; `None` before accept.
+	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
+
+	/// Validated client certificate from mutual authentication; immutable for the connection.
 	#[cfg(feature = "x509")]
 	fn peer_certificate(&self) -> Option<&Certificate>;
 
-	/// Get the negotiated security profile.
-	///
-	/// Returns `Some(SecurityProfileDesc)` containing the negotiated algorithm OIDs
-	/// after successful profile negotiation during handshake. Returns `None` if
-	/// negotiation has not occurred yet.
-	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
-
-	/// Get the negotiated multiplexing settings.
-	///
-	/// Returns `Some(MuxSettings)` only when both sides negotiated
-	/// multiplexing during the handshake. `None` means lock-step.
+	/// Multiplexing settings when both sides negotiated mux; else single-flight.
 	fn negotiated_mux(&self) -> Option<MuxSettings> {
 		None
 	}
 
-	/// Get the dual-signed session receipt.
-	///
-	/// Returns `Some(StoredReceipt)` only after a budget-bearing
-	/// handshake completed with both signatures in place.
+	/// Dual-signed receipt after a budget-bearing handshake with both signatures.
 	fn session_receipt(&self) -> Option<&StoredReceipt> {
+		None
+	}
+
+	/// Take the epoch-0 rekey materials produced at completion.
+	///
+	/// `None` before completion, after the materials were already
+	/// taken, or when the orchestrator retains no epoch state.
+	#[cfg(feature = "aead")]
+	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
 		None
 	}
 }
@@ -841,10 +794,6 @@ pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = Handshak
 #[cfg(target_arch = "wasm32")]
 pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + 'static>;
 
-// ============================================================================
-// Protocol Selection Enums
-// ============================================================================
-
 /// Specifies which handshake protocol to use (ECIES or CMS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HandshakeProtocolKind {
@@ -861,12 +810,10 @@ pub enum HandshakeProtocolKind {
 	Cms,
 }
 
-// ============================================================================
-// TLS-like ECIES + Server Randomness Protocol Structures
-// ============================================================================
-
+/// Opening handshake message from the client, bound into the transcript.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientHello {
+	/// 32-byte anti-replay nonce mixed into the key derivation.
 	pub client_random: OctetString,
 	#[asn1(optional = "true")]
 	pub security_offer: Option<SecurityOffer>,
@@ -876,11 +823,17 @@ pub struct ClientHello {
 	pub transport_offer: Option<TransportOffer>,
 }
 
+/// Server response to a [`ClientHello`], bound into the transcript.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ServerHandshake {
+	/// Server identity certificate the client validates against its
+	/// trust store.
 	#[cfg(feature = "x509")]
 	pub certificate: Certificate,
+	/// 32-byte anti-replay nonce mixed into the key derivation.
 	pub server_random: OctetString,
+	/// Server signature over the transcript so far, proving possession
+	/// of the certificate's private key.
 	pub signature: OctetString,
 	#[asn1(optional = "true")]
 	pub security_accept: Option<SecurityAccept>,
@@ -920,8 +873,11 @@ pub(crate) struct EciesSessionPayload {
 	pub receipt_ack: Option<SignerInfo>,
 }
 
+/// Final client handshake message carrying the encrypted key material.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientKeyExchange {
+	/// Key-exchange payload encrypted to the server: the ECIES session
+	/// payload or a CMS `EnvelopedData`, per the negotiated protocol.
 	pub encrypted_data: OctetString,
 	/// Optional client certificate for mutual authentication.
 	/// Included when server indicates client_cert in ServerHandshake.
@@ -935,11 +891,6 @@ pub struct ClientKeyExchange {
 	pub client_signature: Option<OctetString>,
 }
 
-// ============================================================================
-// TryFrom conversions for ECIES <-> CMS types
-// ============================================================================
-
-/// Helper function to convert any encodable type to SignedData (opaque wrapper)
 fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 	let message_der = message.to_der()?;
 	let octet_string = OctetString::new(message_der)?;
@@ -956,7 +907,6 @@ fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 	})
 }
 
-/// Helper function to extract any decodable type from SignedData
 fn signed_data_to_decodable<T: for<'a> Decode<'a>>(signed_data: &SignedData) -> Result<T> {
 	let econtent_any = signed_data
 		.encap_content_info
@@ -964,7 +914,6 @@ fn signed_data_to_decodable<T: for<'a> Decode<'a>>(signed_data: &SignedData) -> 
 		.as_ref()
 		.ok_or(HandshakeError::InvalidServerKeyExchange)?;
 
-	// econtent_any.value() gives us the raw DER bytes of the OctetString
 	let octet_string_der = econtent_any.value();
 	let octet_string = OctetString::from_der(octet_string_der)?;
 	Ok(T::from_der(octet_string.as_bytes())?)
@@ -1006,14 +955,12 @@ impl TryFrom<&SignedData> for ServerHandshake {
 	}
 }
 
-/// Helper function to build unprotected attributes for ClientKeyExchange
 #[cfg(feature = "x509")]
 fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x509_cert::attr::Attributes>> {
 	let mut attrs = Vec::new();
 
 	if let Some(cert) = &kex.client_certificate {
 		let cert_der = cert.to_der()?;
-		// Wrap certificate DER in OCTET STRING since certs are SEQUENCE internally
 		let cert_octet = OctetString::new(cert_der)?;
 		let cert_der_wrapped = cert_octet.to_der()?;
 		let cert_any = Any::new(Tag::OctetString, cert_der_wrapped)?;
@@ -1023,7 +970,6 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 	}
 
 	if let Some(sig) = &kex.client_signature {
-		// Signature is already an OCTET STRING
 		let sig_der = sig.to_der()?;
 		let sig_any = Any::new(Tag::OctetString, sig_der)?;
 		let sig_values = SetOfVec::try_from(vec![AttributeValue::from(sig_any)])?;
@@ -1049,7 +995,6 @@ fn first_octet_string(attr: &Attribute) -> Result<Option<OctetString>> {
 		.map_err(Into::into)
 }
 
-/// Helper function to parse unprotected attributes from EnvelopedData
 #[cfg(feature = "x509")]
 fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<ClientKeyExchangeAttrs> {
 	let mut parsed = ClientKeyExchangeAttrs::default();
@@ -1085,7 +1030,6 @@ impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 	type Error = HandshakeError;
 
 	fn try_from(kex: &ClientKeyExchange) -> CoreResult<Self, Self::Error> {
-		// Build unprotected attributes for client certificate and signature
 		#[cfg(feature = "x509")]
 		let unprotected_attrs = build_client_key_exchange_attrs(kex)?;
 
@@ -1118,8 +1062,6 @@ impl TryFrom<&EnvelopedData> for ClientKeyExchange {
 			.ok_or(HandshakeError::InvalidClientKeyExchange)?
 			.as_bytes();
 
-		// Extract client certificate, signatures, and settlement answer
-		// from unprotected_attrs
 		#[cfg(feature = "x509")]
 		let attrs = parse_client_key_exchange_attrs(enveloped_data)?;
 

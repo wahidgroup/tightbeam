@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 #[cfg(feature = "std")]
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
 use crate::der::oid::ObjectIdentifier;
@@ -614,7 +614,7 @@ impl<T: Message> FrameBuilder<T> {
 	#[cfg(feature = "std")]
 	fn ensure_order_set(mut metadata_builder: MetadataBuilder) -> Result<MetadataBuilder> {
 		if !metadata_builder.has_order() {
-			match SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+			match SystemTime::now().duration_since(UNIX_EPOCH) {
 				Ok(duration) => {
 					metadata_builder = metadata_builder.with_order(duration.as_secs());
 				}
@@ -1013,9 +1013,7 @@ mod tests {
 					$message_integrity,
 					$frame_integrity,
 				);
-				assert!(result.is_ok());
-
-				let frame = result.unwrap();
+				let frame = result?;
 
 				// Test 3: Verify README semantics - MUST fields -> Frame fields MUST be present
 				// README line 363: MUST_BE_NON_REPUDIABLE=true -> Frame MUST include nonrepudiation field
@@ -1236,7 +1234,7 @@ mod tests {
 		macro_rules! message_trait_test {
 			($test:ident, $name:expr, $confidential:tt, $nonrepudiable:tt, $message_integrity:tt, $frame_integrity:tt, $version:ident) => {
 				#[test]
-				fn $test() {
+				fn $test() -> Result<()> {
 					let (_, cipher) = create_test_cipher_key();
 					let signing_key = create_test_signing_key();
 
@@ -1251,6 +1249,8 @@ mod tests {
 						&cipher,
 						&signing_key
 					);
+
+					Ok(())
 				}
 			};
 		}

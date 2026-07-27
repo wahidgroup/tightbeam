@@ -44,10 +44,16 @@ use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportOffer};
+use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
 
 use crate::common::security::expectation_failure;
 use crate::transport::support::{establish_mutual_transports, MutualSessionHooks};
+
+pub(crate) const RECEIPT_BUDGETS_WITHIN_CEILING: Urn<'static> =
+	Urn::new("test", "event:receipt-integrity/receipt-budgets-within-ceiling");
+pub(crate) const RECEIPT_MATCHES_ENFORCED_BUDGET: Urn<'static> =
+	Urn::new("test", "event:receipt-integrity/receipt-matches-enforced-budget");
 
 /// Client request that overshoots the enforcement ceiling in both
 /// directions, so a faithful receipt must reflect the clamp.
@@ -62,8 +68,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(receipt_budgets_within_ceiling, exactly!(1), equals!(true)),
-			(receipt_matches_enforced_budget, exactly!(1), equals!(true))
+			(RECEIPT_BUDGETS_WITHIN_CEILING, exactly!(1), equals!(true)),
+			(RECEIPT_MATCHES_ENFORCED_BUDGET, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -93,13 +99,13 @@ tb_scenario! {
 			let is_client_to_server_within_ceiling = stored.receipt().budgets.client_to_server <= MAX_MUX_SESSION_BUDGET;
 			let is_server_to_client_within_ceiling = stored.receipt().budgets.server_to_client <= MAX_MUX_SESSION_BUDGET;
 
-			trace.event_with(ReceiptBudgetClampSpec::receipt_budgets_within_ceiling, &[], is_client_to_server_within_ceiling && is_server_to_client_within_ceiling)?;
+			trace.event_with(RECEIPT_BUDGETS_WITHIN_CEILING, &[], is_client_to_server_within_ceiling && is_server_to_client_within_ceiling)?;
 
 			// The client's send budget is the client-to-server direction;
 			// its receive budget is the server-to-client direction.
 			let is_budget_matched = Some(stored.receipt().budgets.client_to_server) == settings.send_budget
 				&& Some(stored.receipt().budgets.server_to_client) == settings.recv_budget;
-			trace.event_with(ReceiptBudgetClampSpec::receipt_matches_enforced_budget, &[], is_budget_matched)?;
+			trace.event_with(RECEIPT_MATCHES_ENFORCED_BUDGET, &[], is_budget_matched)?;
 
 			Ok::<(), TightBeamError>(())
 		}

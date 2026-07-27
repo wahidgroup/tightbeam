@@ -1,6 +1,7 @@
 //! Simple servlet test for ServletConf pattern with workers
 
 use std::sync::Arc;
+
 use tightbeam::{
 	colony::servlet::ServletConf,
 	compose,
@@ -14,12 +15,24 @@ use tightbeam::{
 	decode,
 	der::Sequence,
 	exactly,
-	policy::{GatePolicy, TransitStatus},
+	policy::{GatePolicy, SessionContext, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
 	testing::{create_test_signing_key, ClientEnv, ServletEnv, SetupEnv},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
+	utils::urn::Urn,
 	worker, Beamable, Frame, TightBeamError,
 };
+
+pub(crate) const DOUBLER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/doubler-process");
+pub(crate) const SECURE_FRAME_CLEARTEXT: Urn<'static> = Urn::new("test", "event:servlet/secure-frame-cleartext");
+pub(crate) const SECURE_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/secure-receive");
+pub(crate) const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/servlet-receive");
+pub(crate) const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:servlet/servlet-respond");
+pub(crate) const SQUARER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/squarer-process");
+pub(crate) const VERIFY_DOUBLED: Urn<'static> = Urn::new("test", "event:servlet/verify-doubled");
+pub(crate) const VERIFY_FINAL_RESULT: Urn<'static> = Urn::new("test", "event:servlet/verify-final-result");
+pub(crate) const VERIFY_SECURE_DOUBLED: Urn<'static> = Urn::new("test", "event:servlet/verify-secure-doubled");
+pub(crate) const VERIFY_SQUARED: Urn<'static> = Urn::new("test", "event:servlet/verify-squared");
 
 // ============================================================================
 // Messages
@@ -45,7 +58,7 @@ pub struct CalcResponse {
 worker! {
 	name: DoublerWorker<CalcRequest, Result<u32, TightBeamError>>,
 	handle: |input, trace| async move {
-		trace.event(CalcServletSpec::doubler_process)?;
+		trace.event(DOUBLER_PROCESS)?;
 		Ok(input.value * 2)
 	}
 }
@@ -57,7 +70,7 @@ worker! {
 		add_offset: u32,
 	},
 	handle: |input, trace, config| async move {
-		trace.event(CalcServletSpec::squarer_process)?;
+		trace.event(SQUARER_PROCESS)?;
 		Ok(input.value * input.value + config.add_offset)
 	}
 }
@@ -82,7 +95,7 @@ servlet! {
 		let trace = ctx.trace();
 		let config: &CalcServletConf = ctx.env_config()?;
 
-		trace.event(CalcServletSpec::servlet_receive)?;
+		trace.event(SERVLET_RECEIVE)?;
 
 		// Process with both workers in parallel via context
 		let request_arc = Arc::new(request);
@@ -98,7 +111,7 @@ servlet! {
 		let sum = doubled + squared;
 		let final_result = sum * config.final_multiplier;
 
-		trace.event(CalcServletSpec::servlet_respond)?;
+		trace.event(SERVLET_RESPOND)?;
 
 		Ok(Some(compose! {
 			V0: id: b"calc-response-id",
@@ -117,13 +130,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(servlet_receive, exactly!(1)),
-			(doubler_process, exactly!(1)),
-			(squarer_process, exactly!(1)),
-			(servlet_respond, exactly!(1)),
-			(verify_doubled, exactly!(1), equals!(10u32)),
-			(verify_squared, exactly!(1), equals!(35u32)),
-			(verify_final_result, exactly!(1), equals!(135u32))
+			(SERVLET_RECEIVE, exactly!(1)),
+			(DOUBLER_PROCESS, exactly!(1)),
+			(SQUARER_PROCESS, exactly!(1)),
+			(SERVLET_RESPOND, exactly!(1)),
+			(VERIFY_DOUBLED, exactly!(1), equals!(10u32)),
+			(VERIFY_SQUARED, exactly!(1), equals!(35u32)),
+			(VERIFY_FINAL_RESULT, exactly!(1), equals!(135u32))
 		]
 	}
 }
@@ -166,9 +179,9 @@ tb_scenario! {
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			trace.event_with(CalcServletSpec::verify_doubled, &[], response.doubled)?;
-			trace.event_with(CalcServletSpec::verify_squared, &[], response.squared)?;
-			trace.event_with(CalcServletSpec::verify_final_result, &[], response.final_result)?;
+			trace.event_with(VERIFY_DOUBLED, &[], response.doubled)?;
+			trace.event_with(VERIFY_SQUARED, &[], response.squared)?;
+			trace.event_with(VERIFY_FINAL_RESULT, &[], response.final_result)?;
 
 			Ok(())
 		}
@@ -191,7 +204,7 @@ struct SignatureGate {
 }
 
 impl GatePolicy for SignatureGate {
-	fn evaluate(&self, frame: &Frame) -> TransitStatus {
+	fn evaluate(&self, frame: &Frame, _session: &SessionContext) -> TransitStatus {
 		if frame.verify::<Secp256k1Signature, Sha3_256>(&self.verifying_key).is_ok() {
 			TransitStatus::Ok
 		} else {
@@ -209,8 +222,8 @@ servlet! {
 	protocol: TokioListener,
 	handle: |request, frame, ctx| async move {
 		let trace = ctx.trace();
-		trace.event(SecureCalcServletSpec::secure_receive)?;
-		trace.event_with(SecureCalcServletSpec::secure_frame_cleartext,
+		trace.event(SECURE_RECEIVE)?;
+		trace.event_with(SECURE_FRAME_CLEARTEXT,
 			&[],
 			u32::from(frame.metadata.confidentiality.is_none() && frame.metadata.compactness.is_none()),
 		)?;
@@ -229,9 +242,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(secure_receive, exactly!(1)),
-			(secure_frame_cleartext, exactly!(1), equals!(1u32)),
-			(verify_secure_doubled, exactly!(1), equals!(14u32))
+			(SECURE_RECEIVE, exactly!(1)),
+			(SECURE_FRAME_CLEARTEXT, exactly!(1), equals!(1u32)),
+			(VERIFY_SECURE_DOUBLED, exactly!(1), equals!(14u32))
 		]
 	}
 }
@@ -277,7 +290,7 @@ tb_scenario! {
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			trace.event_with(SecureCalcServletSpec::verify_secure_doubled, &[], response.doubled)?;
+			trace.event_with(VERIFY_SECURE_DOUBLED, &[], response.doubled)?;
 
 			Ok(())
 		}

@@ -8,6 +8,16 @@
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const EATS: Urn<'static> = Urn::new("test", "event:diners/eats");
+pub(crate) const GETS_UP: Urn<'static> = Urn::new("test", "event:diners/gets-up");
+pub(crate) const PICKS_LEFT: Urn<'static> = Urn::new("test", "event:diners/picks-left");
+pub(crate) const PICKS_RIGHT: Urn<'static> = Urn::new("test", "event:diners/picks-right");
+pub(crate) const PUTS_DOWN_LEFT: Urn<'static> = Urn::new("test", "event:diners/puts-down-left");
+pub(crate) const PUTS_DOWN_RIGHT: Urn<'static> = Urn::new("test", "event:diners/puts-down-right");
+pub(crate) const SITS: Urn<'static> = Urn::new("test", "event:diners/sits");
+pub(crate) const THINKS: Urn<'static> = Urn::new("test", "event:diners/thinks");
 
 fn build_fdr_config(
 	specs: Vec<Process>,
@@ -40,89 +50,89 @@ tightbeam::tb_process_spec! {
 	/// Events: thinks, sits, picks_left, picks_right, eats, puts_down_left, puts_down_right, gets_up
 	pub DiningPhilosophers,
 	events {
-		observable { "thinks", "sits", "picks_left", "picks_right", "eats", "puts_down_left", "puts_down_right", "gets_up" }
+		observable { THINKS, SITS, PICKS_LEFT, PICKS_RIGHT, EATS, PUTS_DOWN_LEFT, PUTS_DOWN_RIGHT, GETS_UP }
 		hidden { }
 	}
 	states {
 		// Initial: both idle
-		BothIdle => { "thinks" => P1Thinking_P2Idle, "thinks" => P1Idle_P2Thinking },
+		BothIdle => { THINKS => P1Thinking_P2Idle, THINKS => P1Idle_P2Thinking },
 
 		// P1 thinking, P2 idle
-		P1Thinking_P2Idle => { "sits" => P1Sitting_P2Idle, "thinks" => BothThinking },
-		P1Sitting_P2Idle => { "picks_left" => P1HasLeft_P2Idle, "thinks" => P1Sitting_P2Thinking },
-		P1HasLeft_P2Idle => { "picks_right" => P1HasBoth_P2Idle, "thinks" => P1HasLeft_P2Thinking, "sits" => P1HasLeft_P2Sitting },
-		P1HasBoth_P2Idle => { "eats" => P1Eating_P2Idle },
-		P1Eating_P2Idle => { "puts_down_left" => P1HasRight_P2Idle },
-		P1HasRight_P2Idle => { "puts_down_right" => P1Finished_P2Idle },
-		P1Finished_P2Idle => { "gets_up" => P1Idle_P2Idle, "thinks" => P1Finished_P2Thinking },
-		P1Idle_P2Idle => { "thinks" => BothIdle },
+		P1Thinking_P2Idle => { SITS => P1Sitting_P2Idle, THINKS => BothThinking },
+		P1Sitting_P2Idle => { PICKS_LEFT => P1HasLeft_P2Idle, THINKS => P1Sitting_P2Thinking },
+		P1HasLeft_P2Idle => { PICKS_RIGHT => P1HasBoth_P2Idle, THINKS => P1HasLeft_P2Thinking, SITS => P1HasLeft_P2Sitting },
+		P1HasBoth_P2Idle => { EATS => P1Eating_P2Idle },
+		P1Eating_P2Idle => { PUTS_DOWN_LEFT => P1HasRight_P2Idle },
+		P1HasRight_P2Idle => { PUTS_DOWN_RIGHT => P1Finished_P2Idle },
+		P1Finished_P2Idle => { GETS_UP => P1Idle_P2Idle, THINKS => P1Finished_P2Thinking },
+		P1Idle_P2Idle => { THINKS => BothIdle },
 
 		// P1 idle, P2 thinking
-		P1Idle_P2Thinking => { "sits" => P1Idle_P2Sitting, "thinks" => BothThinking },
-		P1Idle_P2Sitting => { "picks_left" => P1Idle_P2HasLeft, "thinks" => P1Thinking_P2Sitting },
-		P1Idle_P2HasLeft => { "picks_right" => P1Idle_P2HasBoth, "thinks" => P1Thinking_P2HasLeft, "sits" => P1Sitting_P2HasLeft },
-		P1Idle_P2HasBoth => { "eats" => P1Idle_P2Eating },
-		P1Idle_P2Eating => { "puts_down_left" => P1Idle_P2HasRight },
-		P1Idle_P2HasRight => { "puts_down_right" => P1Idle_P2Finished },
-		P1Idle_P2Finished => { "gets_up" => P1Idle_P2Idle, "thinks" => P1Thinking_P2Finished },
+		P1Idle_P2Thinking => { SITS => P1Idle_P2Sitting, THINKS => BothThinking },
+		P1Idle_P2Sitting => { PICKS_LEFT => P1Idle_P2HasLeft, THINKS => P1Thinking_P2Sitting },
+		P1Idle_P2HasLeft => { PICKS_RIGHT => P1Idle_P2HasBoth, THINKS => P1Thinking_P2HasLeft, SITS => P1Sitting_P2HasLeft },
+		P1Idle_P2HasBoth => { EATS => P1Idle_P2Eating },
+		P1Idle_P2Eating => { PUTS_DOWN_LEFT => P1Idle_P2HasRight },
+		P1Idle_P2HasRight => { PUTS_DOWN_RIGHT => P1Idle_P2Finished },
+		P1Idle_P2Finished => { GETS_UP => P1Idle_P2Idle, THINKS => P1Thinking_P2Finished },
 
 		// Both thinking
-		BothThinking => { "sits" => P1Sitting_P2Thinking, "sits" => P1Thinking_P2Sitting },
+		BothThinking => { SITS => P1Sitting_P2Thinking, SITS => P1Thinking_P2Sitting },
 
 		// P1 sitting, P2 thinking
-		P1Sitting_P2Thinking => { "picks_left" => P1HasLeft_P2Thinking, "sits" => BothSitting },
-		P1HasLeft_P2Thinking => { "picks_right" => P1HasBoth_P2Thinking, "sits" => P1HasLeft_P2Sitting },
-		P1HasBoth_P2Thinking => { "eats" => P1Eating_P2Thinking },
-		P1Eating_P2Thinking => { "puts_down_left" => P1HasRight_P2Thinking },
-		P1HasRight_P2Thinking => { "puts_down_right" => P1Finished_P2Thinking },
-		P1Finished_P2Thinking => { "gets_up" => P1Idle_P2Thinking, "sits" => P1Finished_P2Sitting },
+		P1Sitting_P2Thinking => { PICKS_LEFT => P1HasLeft_P2Thinking, SITS => BothSitting },
+		P1HasLeft_P2Thinking => { PICKS_RIGHT => P1HasBoth_P2Thinking, SITS => P1HasLeft_P2Sitting },
+		P1HasBoth_P2Thinking => { EATS => P1Eating_P2Thinking },
+		P1Eating_P2Thinking => { PUTS_DOWN_LEFT => P1HasRight_P2Thinking },
+		P1HasRight_P2Thinking => { PUTS_DOWN_RIGHT => P1Finished_P2Thinking },
+		P1Finished_P2Thinking => { GETS_UP => P1Idle_P2Thinking, SITS => P1Finished_P2Sitting },
 
 		// P1 thinking, P2 sitting
-		P1Thinking_P2Sitting => { "picks_left" => P1Thinking_P2HasLeft, "sits" => BothSitting },
-		P1Thinking_P2HasLeft => { "picks_right" => P1Thinking_P2HasBoth, "sits" => P1Sitting_P2HasLeft },
-		P1Thinking_P2HasBoth => { "eats" => P1Thinking_P2Eating },
-		P1Thinking_P2Eating => { "puts_down_left" => P1Thinking_P2HasRight },
-		P1Thinking_P2HasRight => { "puts_down_right" => P1Thinking_P2Finished },
-		P1Thinking_P2Finished => { "gets_up" => P1Thinking_P2Idle, "sits" => P1Sitting_P2Finished },
+		P1Thinking_P2Sitting => { PICKS_LEFT => P1Thinking_P2HasLeft, SITS => BothSitting },
+		P1Thinking_P2HasLeft => { PICKS_RIGHT => P1Thinking_P2HasBoth, SITS => P1Sitting_P2HasLeft },
+		P1Thinking_P2HasBoth => { EATS => P1Thinking_P2Eating },
+		P1Thinking_P2Eating => { PUTS_DOWN_LEFT => P1Thinking_P2HasRight },
+		P1Thinking_P2HasRight => { PUTS_DOWN_RIGHT => P1Thinking_P2Finished },
+		P1Thinking_P2Finished => { GETS_UP => P1Thinking_P2Idle, SITS => P1Sitting_P2Finished },
 
 		// Both sitting - can both pick left (deadlock possible)
-		BothSitting => { "picks_left" => P1HasLeft_P2Sitting, "picks_left" => P1Sitting_P2HasLeft },
+		BothSitting => { PICKS_LEFT => P1HasLeft_P2Sitting, PICKS_LEFT => P1Sitting_P2HasLeft },
 
 		// P1 has left, P2 sitting - P2 can pick left (leading to deadlock) or P1 can pick right
-		P1HasLeft_P2Sitting => { "picks_left" => Deadlock, "picks_right" => P1HasBoth_P2Sitting },
-		P1HasBoth_P2Sitting => { "eats" => P1Eating_P2Sitting },
-		P1Eating_P2Sitting => { "puts_down_left" => P1HasRight_P2Sitting },
-		P1HasRight_P2Sitting => { "puts_down_right" => P1Finished_P2Sitting },
-		P1Finished_P2Sitting => { "gets_up" => P1Idle_P2Sitting },
+		P1HasLeft_P2Sitting => { PICKS_LEFT => Deadlock, PICKS_RIGHT => P1HasBoth_P2Sitting },
+		P1HasBoth_P2Sitting => { EATS => P1Eating_P2Sitting },
+		P1Eating_P2Sitting => { PUTS_DOWN_LEFT => P1HasRight_P2Sitting },
+		P1HasRight_P2Sitting => { PUTS_DOWN_RIGHT => P1Finished_P2Sitting },
+		P1Finished_P2Sitting => { GETS_UP => P1Idle_P2Sitting },
 
 		// P1 sitting, P2 has left - P1 can pick left (leading to deadlock) or P2 can pick right
-		P1Sitting_P2HasLeft => { "picks_left" => Deadlock, "picks_right" => P1Sitting_P2HasBoth },
+		P1Sitting_P2HasLeft => { PICKS_LEFT => Deadlock, PICKS_RIGHT => P1Sitting_P2HasBoth },
 
 		// Deadlock: both have left fork - neither can pick right fork
 		Deadlock => {}, // Terminal deadlock state - no transitions available
-		P1Sitting_P2HasBoth => { "eats" => P1Sitting_P2Eating },
-		P1Sitting_P2Eating => { "puts_down_left" => P1Sitting_P2HasRight },
-		P1Sitting_P2HasRight => { "puts_down_right" => P1Sitting_P2Finished },
-		P1Sitting_P2Finished => { "gets_up" => P1Sitting_P2Idle },
+		P1Sitting_P2HasBoth => { EATS => P1Sitting_P2Eating },
+		P1Sitting_P2Eating => { PUTS_DOWN_LEFT => P1Sitting_P2HasRight },
+		P1Sitting_P2HasRight => { PUTS_DOWN_RIGHT => P1Sitting_P2Finished },
+		P1Sitting_P2Finished => { GETS_UP => P1Sitting_P2Idle },
 
 		// P1 has left, P2 has left - deadlock (both need right fork, but it's the same fork)
 		P1HasLeft_P2HasLeft => {}, // Terminal deadlock state
 
 		// P1 has left, P2 thinking - P2 can sit and pick left (deadlock) or P1 can pick right
-		P1HasLeft_P2Thinking => { "picks_right" => P1HasBoth_P2Thinking, "sits" => P1HasLeft_P2Sitting },
+		P1HasLeft_P2Thinking => { PICKS_RIGHT => P1HasBoth_P2Thinking, SITS => P1HasLeft_P2Sitting },
 
 		// P1 thinking, P2 has left - P1 can sit and pick left (deadlock) or P2 can pick right
-		P1Thinking_P2HasLeft => { "picks_right" => P1Thinking_P2HasBoth, "sits" => P1Sitting_P2HasLeft },
+		P1Thinking_P2HasLeft => { PICKS_RIGHT => P1Thinking_P2HasBoth, SITS => P1Sitting_P2HasLeft },
 
 		// P1 finished, P2 sitting (merge with earlier definition)
 		// P1Finished_P2Sitting already defined above, adding transitions here
-		// Note: This state transition is already covered by P1Finished_P2Sitting => { "gets_up" => P1Idle_P2Sitting }
-		P1Finished_P2HasLeft => { "picks_right" => P1Finished_P2HasBoth },
-		P1Finished_P2HasBoth => { "eats" => P1Finished_P2Eating },
-		P1Finished_P2Eating => { "puts_down_left" => P1Finished_P2HasRight },
-		P1Finished_P2HasRight => { "puts_down_right" => P1Finished_P2Finished },
-		P1Finished_P2Finished => { "gets_up" => P1Finished_P2Idle, "gets_up" => P1Idle_P2Finished },
-		P1Finished_P2Idle => { "thinks" => BothIdle },
+		// Note: This state transition is already covered by P1Finished_P2Sitting => { GETS_UP => P1Idle_P2Sitting }
+		P1Finished_P2HasLeft => { PICKS_RIGHT => P1Finished_P2HasBoth },
+		P1Finished_P2HasBoth => { EATS => P1Finished_P2Eating },
+		P1Finished_P2Eating => { PUTS_DOWN_LEFT => P1Finished_P2HasRight },
+		P1Finished_P2HasRight => { PUTS_DOWN_RIGHT => P1Finished_P2Finished },
+		P1Finished_P2Finished => { GETS_UP => P1Finished_P2Idle, GETS_UP => P1Idle_P2Finished },
+		P1Finished_P2Idle => { THINKS => BothIdle },
 	}
 	terminal { BothIdle, Deadlock, P1HasLeft_P2HasLeft, P1Finished_P2Finished }
 	annotations { description: "Dining philosophers (2 philosophers, deadlock-prone) - models fork sharing constraint" }
@@ -136,74 +146,74 @@ tightbeam::tb_process_spec! {
 	/// This prevents the deadlock scenario where both pick their left fork.
 	pub DeadlockFreePhilosophers,
 	events {
-		observable { "thinks", "sits", "picks_left", "picks_right", "eats", "puts_down_left", "puts_down_right", "gets_up" }
+		observable { THINKS, SITS, PICKS_LEFT, PICKS_RIGHT, EATS, PUTS_DOWN_LEFT, PUTS_DOWN_RIGHT, GETS_UP }
 		hidden { }
 	}
 	states {
 		// Initial: both idle
-		BothIdleDF => { "thinks" => P1Thinking_P2IdleDF, "thinks" => P1Idle_P2ThinkingDF },
+		BothIdleDF => { THINKS => P1Thinking_P2IdleDF, THINKS => P1Idle_P2ThinkingDF },
 
 		// P1 thinking, P2 idle - P1 can sit (butler allows)
-		P1Thinking_P2IdleDF => { "sits" => P1Sitting_P2IdleDF, "thinks" => BothThinkingDF },
-		P1Sitting_P2IdleDF => { "picks_left" => P1HasLeft_P2IdleDF, "thinks" => P1Sitting_P2ThinkingDF },
-		P1HasLeft_P2IdleDF => { "picks_right" => P1HasBoth_P2IdleDF, "thinks" => P1HasLeft_P2ThinkingDF },
-		P1HasBoth_P2IdleDF => { "eats" => P1Eating_P2IdleDF },
-		P1Eating_P2IdleDF => { "puts_down_left" => P1HasRight_P2IdleDF },
-		P1HasRight_P2IdleDF => { "puts_down_right" => P1Finished_P2IdleDF },
-		P1Finished_P2IdleDF => { "gets_up" => P1Idle_P2IdleDF, "thinks" => P1Finished_P2ThinkingDF },
+		P1Thinking_P2IdleDF => { SITS => P1Sitting_P2IdleDF, THINKS => BothThinkingDF },
+		P1Sitting_P2IdleDF => { PICKS_LEFT => P1HasLeft_P2IdleDF, THINKS => P1Sitting_P2ThinkingDF },
+		P1HasLeft_P2IdleDF => { PICKS_RIGHT => P1HasBoth_P2IdleDF, THINKS => P1HasLeft_P2ThinkingDF },
+		P1HasBoth_P2IdleDF => { EATS => P1Eating_P2IdleDF },
+		P1Eating_P2IdleDF => { PUTS_DOWN_LEFT => P1HasRight_P2IdleDF },
+		P1HasRight_P2IdleDF => { PUTS_DOWN_RIGHT => P1Finished_P2IdleDF },
+		P1Finished_P2IdleDF => { GETS_UP => P1Idle_P2IdleDF, THINKS => P1Finished_P2ThinkingDF },
 		// P1 idle, P2 idle - either can think (both are idle, no constraints)
-		P1Idle_P2IdleDF => { "thinks" => BothIdleDF, "thinks" => P1Idle_P2ThinkingDF },
+		P1Idle_P2IdleDF => { THINKS => BothIdleDF, THINKS => P1Idle_P2ThinkingDF },
 
 		// P1 idle, P2 thinking - P2 can sit (butler allows, P1 not sitting)
-		P1Idle_P2ThinkingDF => { "sits" => P1Idle_P2SittingDF, "thinks" => BothThinkingDF },
-		P1Idle_P2SittingDF => { "picks_left" => P1Idle_P2HasLeftDF, "thinks" => P1Thinking_P2SittingDF },
-		P1Idle_P2HasLeftDF => { "picks_right" => P1Idle_P2HasBothDF, "thinks" => P1Thinking_P2HasLeftDF },
-		P1Idle_P2HasBothDF => { "eats" => P1Idle_P2EatingDF },
-		P1Idle_P2EatingDF => { "puts_down_left" => P1Idle_P2HasRightDF },
-		P1Idle_P2HasRightDF => { "puts_down_right" => P1Idle_P2FinishedDF },
-		P1Idle_P2FinishedDF => { "gets_up" => P1Idle_P2IdleDF, "thinks" => P1Thinking_P2FinishedDF },
+		P1Idle_P2ThinkingDF => { SITS => P1Idle_P2SittingDF, THINKS => BothThinkingDF },
+		P1Idle_P2SittingDF => { PICKS_LEFT => P1Idle_P2HasLeftDF, THINKS => P1Thinking_P2SittingDF },
+		P1Idle_P2HasLeftDF => { PICKS_RIGHT => P1Idle_P2HasBothDF, THINKS => P1Thinking_P2HasLeftDF },
+		P1Idle_P2HasBothDF => { EATS => P1Idle_P2EatingDF },
+		P1Idle_P2EatingDF => { PUTS_DOWN_LEFT => P1Idle_P2HasRightDF },
+		P1Idle_P2HasRightDF => { PUTS_DOWN_RIGHT => P1Idle_P2FinishedDF },
+		P1Idle_P2FinishedDF => { GETS_UP => P1Idle_P2IdleDF, THINKS => P1Thinking_P2FinishedDF },
 
 		// Both thinking - only one can sit (butler constraint)
-		BothThinkingDF => { "sits" => P1Sitting_P2ThinkingDF, "sits" => P1Thinking_P2SittingDF },
+		BothThinkingDF => { SITS => P1Sitting_P2ThinkingDF, SITS => P1Thinking_P2SittingDF },
 
 		// P1 sitting, P2 thinking - P2 CANNOT sit (butler prevents both sitting)
 		// P2 can think but cannot sit while P1 is sitting
-		P1Sitting_P2ThinkingDF => { "picks_left" => P1HasLeft_P2ThinkingDF, "thinks" => P1Sitting_P2IdleDF },
-		P1Sitting_P2IdleDF => { "thinks" => P1Sitting_P2ThinkingDF },
-		P1HasLeft_P2ThinkingDF => { "picks_right" => P1HasBoth_P2ThinkingDF },
-		P1HasBoth_P2ThinkingDF => { "eats" => P1Eating_P2ThinkingDF },
-		P1Eating_P2ThinkingDF => { "puts_down_left" => P1HasRight_P2ThinkingDF },
-		P1HasRight_P2ThinkingDF => { "puts_down_right" => P1Finished_P2ThinkingDF },
-		P1Finished_P2ThinkingDF => { "gets_up" => P1Idle_P2ThinkingDF },
+		P1Sitting_P2ThinkingDF => { PICKS_LEFT => P1HasLeft_P2ThinkingDF, THINKS => P1Sitting_P2IdleDF },
+		P1Sitting_P2IdleDF => { THINKS => P1Sitting_P2ThinkingDF },
+		P1HasLeft_P2ThinkingDF => { PICKS_RIGHT => P1HasBoth_P2ThinkingDF },
+		P1HasBoth_P2ThinkingDF => { EATS => P1Eating_P2ThinkingDF },
+		P1Eating_P2ThinkingDF => { PUTS_DOWN_LEFT => P1HasRight_P2ThinkingDF },
+		P1HasRight_P2ThinkingDF => { PUTS_DOWN_RIGHT => P1Finished_P2ThinkingDF },
+		P1Finished_P2ThinkingDF => { GETS_UP => P1Idle_P2ThinkingDF },
 
 		// P1 thinking, P2 sitting - P1 CANNOT sit (butler prevents both sitting)
 		// P1 can think but cannot sit while P2 is sitting
-		P1Thinking_P2SittingDF => { "picks_left" => P1Thinking_P2HasLeftDF, "thinks" => P1Idle_P2SittingDF },
-		P1Idle_P2SittingDF => { "thinks" => P1Thinking_P2SittingDF },
-		P1Thinking_P2HasLeftDF => { "picks_right" => P1Thinking_P2HasBothDF },
-		P1Thinking_P2HasBothDF => { "eats" => P1Thinking_P2EatingDF },
-		P1Thinking_P2EatingDF => { "puts_down_left" => P1Thinking_P2HasRightDF },
-		P1Thinking_P2HasRightDF => { "puts_down_right" => P1Thinking_P2FinishedDF },
-		P1Thinking_P2FinishedDF => { "gets_up" => P1Thinking_P2IdleDF },
+		P1Thinking_P2SittingDF => { PICKS_LEFT => P1Thinking_P2HasLeftDF, THINKS => P1Idle_P2SittingDF },
+		P1Idle_P2SittingDF => { THINKS => P1Thinking_P2SittingDF },
+		P1Thinking_P2HasLeftDF => { PICKS_RIGHT => P1Thinking_P2HasBothDF },
+		P1Thinking_P2HasBothDF => { EATS => P1Thinking_P2EatingDF },
+		P1Thinking_P2EatingDF => { PUTS_DOWN_LEFT => P1Thinking_P2HasRightDF },
+		P1Thinking_P2HasRightDF => { PUTS_DOWN_RIGHT => P1Thinking_P2FinishedDF },
+		P1Thinking_P2FinishedDF => { GETS_UP => P1Thinking_P2IdleDF },
 
 		// P1 finished, P2 thinking - P2 can now sit (P1 not sitting)
-		P1Finished_P2ThinkingDF => { "sits" => P1Finished_P2SittingDF },
-		P1Finished_P2SittingDF => { "picks_left" => P1Finished_P2HasLeftDF },
-		P1Finished_P2HasLeftDF => { "picks_right" => P1Finished_P2HasBothDF },
-		P1Finished_P2HasBothDF => { "eats" => P1Finished_P2EatingDF },
-		P1Finished_P2EatingDF => { "puts_down_left" => P1Finished_P2HasRightDF },
-		P1Finished_P2HasRightDF => { "puts_down_right" => P1Finished_P2FinishedDF },
-		P1Finished_P2FinishedDF => { "gets_up" => P1Finished_P2IdleDF, "gets_up" => P1Idle_P2FinishedDF },
-		P1Finished_P2IdleDF => { "thinks" => BothIdleDF },
+		P1Finished_P2ThinkingDF => { SITS => P1Finished_P2SittingDF },
+		P1Finished_P2SittingDF => { PICKS_LEFT => P1Finished_P2HasLeftDF },
+		P1Finished_P2HasLeftDF => { PICKS_RIGHT => P1Finished_P2HasBothDF },
+		P1Finished_P2HasBothDF => { EATS => P1Finished_P2EatingDF },
+		P1Finished_P2EatingDF => { PUTS_DOWN_LEFT => P1Finished_P2HasRightDF },
+		P1Finished_P2HasRightDF => { PUTS_DOWN_RIGHT => P1Finished_P2FinishedDF },
+		P1Finished_P2FinishedDF => { GETS_UP => P1Finished_P2IdleDF, GETS_UP => P1Idle_P2FinishedDF },
+		P1Finished_P2IdleDF => { THINKS => BothIdleDF },
 
 		// P1 thinking, P2 finished - P1 can now sit (P2 not sitting)
-		P1Thinking_P2FinishedDF => { "sits" => P1Sitting_P2FinishedDF },
-		P1Sitting_P2FinishedDF => { "picks_left" => P1HasLeft_P2FinishedDF },
-		P1HasLeft_P2FinishedDF => { "picks_right" => P1HasBoth_P2FinishedDF },
-		P1HasBoth_P2FinishedDF => { "eats" => P1Eating_P2FinishedDF },
-		P1Eating_P2FinishedDF => { "puts_down_left" => P1HasRight_P2FinishedDF },
-		P1HasRight_P2FinishedDF => { "puts_down_right" => P1Finished_P2FinishedDF },
-		P1Idle_P2FinishedDF => { "thinks" => BothIdleDF },
+		P1Thinking_P2FinishedDF => { SITS => P1Sitting_P2FinishedDF },
+		P1Sitting_P2FinishedDF => { PICKS_LEFT => P1HasLeft_P2FinishedDF },
+		P1HasLeft_P2FinishedDF => { PICKS_RIGHT => P1HasBoth_P2FinishedDF },
+		P1HasBoth_P2FinishedDF => { EATS => P1Eating_P2FinishedDF },
+		P1Eating_P2FinishedDF => { PUTS_DOWN_LEFT => P1HasRight_P2FinishedDF },
+		P1HasRight_P2FinishedDF => { PUTS_DOWN_RIGHT => P1Finished_P2FinishedDF },
+		P1Idle_P2FinishedDF => { THINKS => BothIdleDF },
 	}
 	terminal { BothIdleDF, P1Finished_P2FinishedDF }
 	annotations { description: "Deadlock-free dining philosophers (butler ensures mutual exclusion - only one can sit at a time)" }
@@ -218,14 +228,14 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(thinks, tightbeam::exactly!(1)),
-			(sits, tightbeam::exactly!(1)),
-			(picks_left, tightbeam::exactly!(1)),
-			(picks_right, tightbeam::exactly!(1)),
-			(eats, tightbeam::exactly!(1)),
-			(puts_down_left, tightbeam::exactly!(1)),
-			(puts_down_right, tightbeam::exactly!(1)),
-			(gets_up, tightbeam::exactly!(1))
+			(THINKS, tightbeam::exactly!(1)),
+			(SITS, tightbeam::exactly!(1)),
+			(PICKS_LEFT, tightbeam::exactly!(1)),
+			(PICKS_RIGHT, tightbeam::exactly!(1)),
+			(EATS, tightbeam::exactly!(1)),
+			(PUTS_DOWN_LEFT, tightbeam::exactly!(1)),
+			(PUTS_DOWN_RIGHT, tightbeam::exactly!(1)),
+			(GETS_UP, tightbeam::exactly!(1))
 		]
 	},
 }
@@ -246,14 +256,14 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Valid trace: one philosopher completes full cycle
-			trace.event(ValidPhilosopherSpec::thinks)?;
-			trace.event(ValidPhilosopherSpec::sits)?;
-			trace.event(ValidPhilosopherSpec::picks_left)?;
-			trace.event(ValidPhilosopherSpec::picks_right)?;
-			trace.event(ValidPhilosopherSpec::eats)?;
-			trace.event(ValidPhilosopherSpec::puts_down_left)?;
-			trace.event(ValidPhilosopherSpec::puts_down_right)?;
-			trace.event(ValidPhilosopherSpec::gets_up)?;
+			trace.event(THINKS)?;
+			trace.event(SITS)?;
+			trace.event(PICKS_LEFT)?;
+			trace.event(PICKS_RIGHT)?;
+			trace.event(EATS)?;
+			trace.event(PUTS_DOWN_LEFT)?;
+			trace.event(PUTS_DOWN_RIGHT)?;
+			trace.event(GETS_UP)?;
 			Ok(())
 		}
 	}
@@ -269,9 +279,9 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(thinks, tightbeam::exactly!(2)),
-			(sits, tightbeam::exactly!(2)),
-			(picks_left, tightbeam::exactly!(2))
+			(THINKS, tightbeam::exactly!(2)),
+			(SITS, tightbeam::exactly!(2)),
+			(PICKS_LEFT, tightbeam::exactly!(2))
 		]
 	},
 }
@@ -292,12 +302,12 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Trace: Philosopher 1 picks left, Philosopher 2 picks left (deadlock)
-			trace.event(DeadlockPhilosopherSpec::thinks)?;
-			trace.event(DeadlockPhilosopherSpec::sits)?;
-			trace.event(DeadlockPhilosopherSpec::picks_left)?;
-			trace.event(DeadlockPhilosopherSpec::thinks)?;
-			trace.event(DeadlockPhilosopherSpec::sits)?;
-			trace.event(DeadlockPhilosopherSpec::picks_left)?;
+			trace.event(THINKS)?;
+			trace.event(SITS)?;
+			trace.event(PICKS_LEFT)?;
+			trace.event(THINKS)?;
+			trace.event(SITS)?;
+			trace.event(PICKS_LEFT)?;
 			Ok(())
 		}
 	}
@@ -312,14 +322,14 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(thinks, tightbeam::exactly!(2)),
-			(sits, tightbeam::exactly!(2)),
-			(picks_left, tightbeam::exactly!(2)),
-			(picks_right, tightbeam::exactly!(2)),
-			(eats, tightbeam::exactly!(2)),
-			(puts_down_left, tightbeam::exactly!(2)),
-			(puts_down_right, tightbeam::exactly!(2)),
-			(gets_up, tightbeam::exactly!(2))
+			(THINKS, tightbeam::exactly!(2)),
+			(SITS, tightbeam::exactly!(2)),
+			(PICKS_LEFT, tightbeam::exactly!(2)),
+			(PICKS_RIGHT, tightbeam::exactly!(2)),
+			(EATS, tightbeam::exactly!(2)),
+			(PUTS_DOWN_LEFT, tightbeam::exactly!(2)),
+			(PUTS_DOWN_RIGHT, tightbeam::exactly!(2)),
+			(GETS_UP, tightbeam::exactly!(2))
 		]
 	},
 }
@@ -342,23 +352,23 @@ tightbeam::tb_scenario! {
 			// Valid deadlock-free trace: P1 completes cycle, then P2 completes cycle
 			// (butler ensures they don't sit simultaneously)
 			// P1 cycle
-			trace.event(DeadlockFreePhilosopherSpec::thinks)?;
-			trace.event(DeadlockFreePhilosopherSpec::sits)?;
-			trace.event(DeadlockFreePhilosopherSpec::picks_left)?;
-			trace.event(DeadlockFreePhilosopherSpec::picks_right)?;
-			trace.event(DeadlockFreePhilosopherSpec::eats)?;
-			trace.event(DeadlockFreePhilosopherSpec::puts_down_left)?;
-			trace.event(DeadlockFreePhilosopherSpec::puts_down_right)?;
-			trace.event(DeadlockFreePhilosopherSpec::gets_up)?;
+			trace.event(THINKS)?;
+			trace.event(SITS)?;
+			trace.event(PICKS_LEFT)?;
+			trace.event(PICKS_RIGHT)?;
+			trace.event(EATS)?;
+			trace.event(PUTS_DOWN_LEFT)?;
+			trace.event(PUTS_DOWN_RIGHT)?;
+			trace.event(GETS_UP)?;
 			// P2 cycle
-			trace.event(DeadlockFreePhilosopherSpec::thinks)?;
-			trace.event(DeadlockFreePhilosopherSpec::sits)?;
-			trace.event(DeadlockFreePhilosopherSpec::picks_left)?;
-			trace.event(DeadlockFreePhilosopherSpec::picks_right)?;
-			trace.event(DeadlockFreePhilosopherSpec::eats)?;
-			trace.event(DeadlockFreePhilosopherSpec::puts_down_left)?;
-			trace.event(DeadlockFreePhilosopherSpec::puts_down_right)?;
-			trace.event(DeadlockFreePhilosopherSpec::gets_up)?;
+			trace.event(THINKS)?;
+			trace.event(SITS)?;
+			trace.event(PICKS_LEFT)?;
+			trace.event(PICKS_RIGHT)?;
+			trace.event(EATS)?;
+			trace.event(PUTS_DOWN_LEFT)?;
+			trace.event(PUTS_DOWN_RIGHT)?;
+			trace.event(GETS_UP)?;
 			Ok(())
 		}
 	}
@@ -385,12 +395,12 @@ tightbeam::tb_scenario! {
 		exec: |SetupEnv { trace, .. }| {
 			// Trace: Philosopher 1 picks left, Philosopher 2 picks left (deadlock)
 			// This should NOT refine DeadlockFreePhilosophers (butler prevents both sitting)
-			trace.event(DeadlockPhilosopherSpec::thinks)?;
-			trace.event(DeadlockPhilosopherSpec::sits)?;
-			trace.event(DeadlockPhilosopherSpec::picks_left)?;
-			trace.event(DeadlockPhilosopherSpec::thinks)?;
-			trace.event(DeadlockPhilosopherSpec::sits)?;
-			trace.event(DeadlockPhilosopherSpec::picks_left)?;
+			trace.event(THINKS)?;
+			trace.event(SITS)?;
+			trace.event(PICKS_LEFT)?;
+			trace.event(THINKS)?;
+			trace.event(SITS)?;
+			trace.event(PICKS_LEFT)?;
 			Ok(())
 		}
 	}

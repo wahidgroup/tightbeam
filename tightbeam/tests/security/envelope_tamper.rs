@@ -14,7 +14,7 @@
 //!    discipline.
 //!
 //! ## Expected control
-//! Exact-next counter nonces (RFC 8446 § 5.3 analog) MUST fail closed:
+//! Exact-next counter nonces (RFC 9846 § 5.3 analog) MUST fail closed:
 //! deleting an envelope desynchronizes the counter and surfaces
 //! `TamperDetected` on the very next message. Replaying an envelope is
 //! rejected after the original consumes its counter.
@@ -22,7 +22,7 @@
 //! ## References
 //! - CWE-345: Insufficient Verification of Data Authenticity
 //!   <https://cwe.mitre.org/data/definitions/345.html>
-//! - RFC 8446 (TLS 1.3) §5.3: per-record nonce construction / sequencing
+//! - RFC 9846 (TLS 1.3) §5.3: per-record nonce construction / sequencing
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -34,6 +34,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::net::{TcpListener, TcpStream};
+
 use tightbeam::exactly;
 use tightbeam::job;
 use tightbeam::tb_assert_spec;
@@ -42,17 +44,21 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::config::ScenarioConf;
 use tightbeam::testing::{create_v0_tightbeam, SetupEnv};
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::tcp::r#async::{
-	AsyncReadStream, AsyncWriteStream, SplittableStream, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader,
-};
+use tightbeam::transport::protocols::{AsyncReadStream, AsyncWriteStream, SplittableStream};
+use tightbeam::transport::tcp::r#async::{TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader};
 use tightbeam::transport::{
 	EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure, TransportWriter,
 };
+use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
-use tokio::net::{TcpListener, TcpStream};
 
 use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split};
+
+pub(crate) const DELETED_ENVELOPE_DETECTED: Urn<'static> =
+	Urn::new("test", "event:envelope-tamper/deleted-envelope-detected");
+pub(crate) const REPLAYED_ENVELOPE_DETECTED: Urn<'static> =
+	Urn::new("test", "event:envelope-tamper/replayed-envelope-detected");
 
 /// ECIES sends exactly two cleartext client frames (ClientHello,
 /// ClientKeyExchange), so the first encrypted envelope is frame 3.
@@ -68,7 +74,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(deleted_envelope_detected, exactly!(1u32))
+			(DELETED_ENVELOPE_DETECTED, exactly!(1u32))
 		]
 	}
 }
@@ -76,11 +82,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub EnvelopeDeleteProcess,
 	events {
-		observable { EnvelopeDeleteSpec::deleted_envelope_detected }
+		observable { DELETED_ENVELOPE_DETECTED }
 		hidden { }
 	}
 	states {
-		Idle => { EnvelopeDeleteSpec::deleted_envelope_detected => Done },
+		Idle => { DELETED_ENVELOPE_DETECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -116,7 +122,7 @@ job! {
 			));
 		}
 
-		trace.event(EnvelopeDeleteSpec::deleted_envelope_detected)?;
+		trace.event(DELETED_ENVELOPE_DETECTED)?;
 
 		Ok(())
 	}
@@ -132,7 +138,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(replayed_envelope_detected, exactly!(1u32))
+			(REPLAYED_ENVELOPE_DETECTED, exactly!(1u32))
 		]
 	}
 }
@@ -140,11 +146,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub EnvelopeReplayProcess,
 	events {
-		observable { EnvelopeReplaySpec::replayed_envelope_detected }
+		observable { REPLAYED_ENVELOPE_DETECTED }
 		hidden { }
 	}
 	states {
-		Idle => { EnvelopeReplaySpec::replayed_envelope_detected => Done },
+		Idle => { REPLAYED_ENVELOPE_DETECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -183,7 +189,7 @@ job! {
 			));
 		}
 
-		trace.event(EnvelopeReplaySpec::replayed_envelope_detected)?;
+		trace.event(REPLAYED_ENVELOPE_DETECTED)?;
 
 		Ok(())
 	}
@@ -266,7 +272,8 @@ async fn write_plain_requests(
 	count: usize,
 ) -> Result<(), TightBeamError> {
 	for _ in 0..count {
-		let request = TransportEnvelope::new_request(create_v0_tightbeam(None, None));
+		let frame = create_v0_tightbeam(None, None);
+		let request = TransportEnvelope::new_request(frame);
 		writer.write_envelope(request).await?;
 	}
 	Ok(())

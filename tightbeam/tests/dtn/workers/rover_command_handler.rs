@@ -8,9 +8,12 @@ use std::sync::{Arc, RwLock};
 use tightbeam::{der::Sequence, worker, Beamable, TightBeamError};
 
 use crate::dtn::{
+	events::{
+		ROVER_COMMAND_COMPLETE, ROVER_EXECUTE_COLLECT_SAMPLE, ROVER_EXECUTE_COMMAND, ROVER_EXECUTE_PROBE_LOCATION,
+		ROVER_EXECUTE_STANDBY, ROVER_EXECUTE_TAKE_PHOTO, ROVER_RECEIVE_COMMAND,
+	},
 	messages::{EarthCommand, RoverCommand},
 	servlets::MissionState,
-	ultimate::DtnEventCountSpec,
 };
 
 /// Rover command handler request (the full command message)
@@ -33,28 +36,28 @@ worker! {
 		mission_state: Arc<RwLock<MissionState>>,
 	},
 	handle: |request, trace, config| async move {
-		trace.event(DtnEventCountSpec::rover_receive_command)?;
-		trace.event(DtnEventCountSpec::rover_execute_command)?;
+		trace.event(ROVER_RECEIVE_COMMAND)?;
+		trace.event(ROVER_EXECUTE_COMMAND)?;
 
 		// Execute command based on type (parameters are in request.command.parameters if needed)
 		let rover_command = RoverCommand::try_from(request.command.command_type)?;
 
 		match rover_command {
 			RoverCommand::CollectSample { .. } => {
-				trace.event("rover_execute_collect_sample")?;
+				trace.event(ROVER_EXECUTE_COLLECT_SAMPLE)?;
 			}
 			RoverCommand::ProbeLocation { .. } => {
-				trace.event("rover_execute_probe_location")?;
+				trace.event(ROVER_EXECUTE_PROBE_LOCATION)?;
 			}
 			RoverCommand::TakePhoto { .. } => {
-				trace.event("rover_execute_take_photo")?;
+				trace.event(ROVER_EXECUTE_TAKE_PHOTO)?;
 			}
 			RoverCommand::Standby => {
-				trace.event("rover_execute_standby")?;
+				trace.event(ROVER_EXECUTE_STANDBY)?;
 			}
 		}
 
-		trace.event(DtnEventCountSpec::rover_command_complete)?;
+		trace.event(ROVER_COMMAND_COMPLETE)?;
 
 		// Update mission state
 		{

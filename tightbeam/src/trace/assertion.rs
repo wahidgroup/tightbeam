@@ -16,23 +16,13 @@ pub enum AssertionLabel {
 
 #[cfg(any(test, feature = "testing"))]
 impl AssertionLabel {
-	/// Check if this label matches another, supporting tightbeam URN shorthand.
+	/// Check if this label matches another by exact URN identity.
 	///
-	/// Returns true if:
-	/// - Labels are exactly equal, OR
-	/// - `self` (recorded) ends with `/{other}` (shorthand)
-	///
-	/// This allows specs to use shorthand like `"create_frame_start"` to match
-	/// recorded URNs like `"urn:tightbeam:instrumentation:event/create_frame_start"`.
+	/// Both recorded events and spec assertions carry full URN renderings
+	/// (`urn:<nid>:<nss>`), so no shorthand or suffix matching applies:
+	/// identical strings are the only match.
 	pub fn matches(&self, other: &AssertionLabel) -> bool {
-		if self == other {
-			return true;
-		}
-
-		// Try shorthand matching: recorded ends with /{expected}
-		let (Self::Custom(recorded), Self::Custom(expected)) = (self, other);
-		let pattern = ["/", expected.as_ref()].concat();
-		recorded.ends_with(&pattern)
+		self == other
 	}
 }
 

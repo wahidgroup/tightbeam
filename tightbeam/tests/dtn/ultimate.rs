@@ -56,10 +56,75 @@ use tightbeam::{
 	transport::{
 		tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient, PoolConfig,
 	},
+	utils::urn::Urn,
 	wcet,
 };
 
+use crate::dtn::events::*;
 use crate::dtn::messages::RoverInstrument;
+
+/// Gap-recovery steps shared by servlets and workers.
+///
+/// Dynamic `node_name` call sites resolve through this enum onto the URN
+/// inventory above, keeping event identity URN-only.
+#[derive(Clone, Copy)]
+pub(crate) enum GapRecoveryStep {
+	GapDetected,
+	SendFrameRequest,
+	ReceiveFrameRequest,
+	SendFrameResponse,
+	ReceiveFrameResponse,
+	CascadeFrameRequest,
+}
+
+/// Resolve the URN for a gap-recovery step on the named DTN node.
+pub(crate) fn gap_recovery_event(node: impl AsRef<str>, step: GapRecoveryStep) -> Urn<'static> {
+	let index = match node.as_ref() {
+		"mission_control" => 0,
+		"earth_relay" => 1,
+		"mars_relay" => 2,
+		_ => 3,
+	};
+	let table = match step {
+		GapRecoveryStep::GapDetected => [
+			MISSION_CONTROL_GAP_DETECTED,
+			EARTH_RELAY_GAP_DETECTED,
+			MARS_RELAY_GAP_DETECTED,
+			ROVER_GAP_DETECTED,
+		],
+		GapRecoveryStep::SendFrameRequest => [
+			MISSION_CONTROL_SEND_FRAME_REQUEST,
+			EARTH_RELAY_SEND_FRAME_REQUEST,
+			MARS_RELAY_SEND_FRAME_REQUEST,
+			ROVER_SEND_FRAME_REQUEST,
+		],
+		GapRecoveryStep::ReceiveFrameRequest => [
+			MISSION_CONTROL_RECEIVE_FRAME_REQUEST,
+			EARTH_RELAY_RECEIVE_FRAME_REQUEST,
+			MARS_RELAY_RECEIVE_FRAME_REQUEST,
+			ROVER_RECEIVE_FRAME_REQUEST,
+		],
+		GapRecoveryStep::SendFrameResponse => [
+			MISSION_CONTROL_SEND_FRAME_RESPONSE,
+			EARTH_RELAY_SEND_FRAME_RESPONSE,
+			MARS_RELAY_SEND_FRAME_RESPONSE,
+			ROVER_SEND_FRAME_RESPONSE,
+		],
+		GapRecoveryStep::ReceiveFrameResponse => [
+			MISSION_CONTROL_RECEIVE_FRAME_RESPONSE,
+			EARTH_RELAY_RECEIVE_FRAME_RESPONSE,
+			MARS_RELAY_RECEIVE_FRAME_RESPONSE,
+			ROVER_RECEIVE_FRAME_RESPONSE,
+		],
+		GapRecoveryStep::CascadeFrameRequest => [
+			MISSION_CONTROL_CASCADE_FRAME_REQUEST,
+			EARTH_RELAY_CASCADE_FRAME_REQUEST,
+			MARS_RELAY_CASCADE_FRAME_REQUEST,
+			ROVER_CASCADE_FRAME_REQUEST,
+		],
+	};
+	table[index].clone()
+}
 use crate::dtn::{
 	certs::{EARTH_RELAY_PINNING, MARS_RELAY_PINNING, MISSION_CONTROL_PINNING, ROVER_PINNING},
 	messages::RelayMessage,
@@ -228,49 +293,49 @@ tb_process_spec! {
 	pub DtnTelemetryFlow,
 	events {
 		observable {
-			"rover_send_telemetry",
-			"mars_relay_receive_telemetry_from_rover",
-			"mars_relay_forward_telemetry_to_earth",
-			"earth_relay_receive_telemetry_from_mars",
-			"earth_relay_forward_telemetry_to_mc",
-			"mission_control_receive_telemetry",
-			"mission_control_analyze_telemetry"
+			ROVER_SEND_TELEMETRY,
+			MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER,
+			MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH,
+			EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS,
+			EARTH_RELAY_FORWARD_TELEMETRY_TO_MC,
+			MISSION_CONTROL_RECEIVE_TELEMETRY,
+			MISSION_CONTROL_ANALYZE_TELEMETRY
 		}
 		hidden { }
 	}
 	states {
 		TelemetryIdle => {
-			"rover_send_telemetry" => TelemetryMarsRelayReceive
+			ROVER_SEND_TELEMETRY => TelemetryMarsRelayReceive
 		},
 		TelemetryMarsRelayReceive => {
-			"mars_relay_receive_telemetry_from_rover" => TelemetryMarsRelayForward
+			MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER => TelemetryMarsRelayForward
 		},
 		TelemetryMarsRelayForward => {
-			"mars_relay_forward_telemetry_to_earth" => TelemetryEarthRelayReceive
+			MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH => TelemetryEarthRelayReceive
 		},
 		TelemetryEarthRelayReceive => {
-			"earth_relay_receive_telemetry_from_mars" => TelemetryEarthRelayForward
+			EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS => TelemetryEarthRelayForward
 		},
 		TelemetryEarthRelayForward => {
-			"earth_relay_forward_telemetry_to_mc" => TelemetryMissionControlReceive
+			EARTH_RELAY_FORWARD_TELEMETRY_TO_MC => TelemetryMissionControlReceive
 		},
 		TelemetryMissionControlReceive => {
-			"mission_control_receive_telemetry" => TelemetryMissionControlAnalyze
+			MISSION_CONTROL_RECEIVE_TELEMETRY => TelemetryMissionControlAnalyze
 		},
 		TelemetryMissionControlAnalyze => {
-			"mission_control_analyze_telemetry" => TelemetryIdle
+			MISSION_CONTROL_ANALYZE_TELEMETRY => TelemetryIdle
 		}
 	}
 	terminal { TelemetryIdle }
 	timing {
 		wcet: {
-			"rover_send_telemetry" => wcet!(Duration::from_millis(100)),
-			"mars_relay_receive_telemetry_from_rover" => wcet!(Duration::from_millis(50)),
-			"mars_relay_forward_telemetry_to_earth" => wcet!(Duration::from_millis(50)),
-			"earth_relay_receive_telemetry_from_mars" => wcet!(Duration::from_millis(50)),
-			"earth_relay_forward_telemetry_to_mc" => wcet!(Duration::from_millis(50)),
-			"mission_control_receive_telemetry" => wcet!(Duration::from_millis(50)),
-			"mission_control_analyze_telemetry" => wcet!(Duration::from_millis(200))
+			ROVER_SEND_TELEMETRY => wcet!(Duration::from_millis(100)),
+			MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER => wcet!(Duration::from_millis(50)),
+			MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH => wcet!(Duration::from_millis(50)),
+			EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS => wcet!(Duration::from_millis(50)),
+			EARTH_RELAY_FORWARD_TELEMETRY_TO_MC => wcet!(Duration::from_millis(50)),
+			MISSION_CONTROL_RECEIVE_TELEMETRY => wcet!(Duration::from_millis(50)),
+			MISSION_CONTROL_ANALYZE_TELEMETRY => wcet!(Duration::from_millis(200))
 		}
 	}
 }
@@ -280,90 +345,90 @@ tb_process_spec! {
 	pub DtnCommandFlow,
 	events {
 		observable {
-			"mission_control_send_command",
-			"earth_relay_receive_from_mc",
-			"earth_relay_forward_to_mars",
-			"mars_relay_receive_from_earth",
-			"mars_relay_forward_to_rover",
-			"rover_receive_command",
-			"rover_execute_command",
-			"rover_execute_collect_sample",
-			"rover_execute_probe_location",
-			"rover_execute_take_photo",
-			"rover_execute_standby",
-			"rover_command_complete",
-			"rover_send_ack",
-			"mars_relay_receive_ack_from_rover",
-			"mars_relay_forward_ack_to_earth",
-			"earth_relay_receive_ack_from_mars",
-			"earth_relay_forward_ack_to_mc",
-			"mission_control_receive_ack"
+			MISSION_CONTROL_SEND_COMMAND,
+			EARTH_RELAY_RECEIVE_FROM_MC,
+			EARTH_RELAY_FORWARD_TO_MARS,
+			MARS_RELAY_RECEIVE_FROM_EARTH,
+			MARS_RELAY_FORWARD_TO_ROVER,
+			ROVER_RECEIVE_COMMAND,
+			ROVER_EXECUTE_COMMAND,
+			ROVER_EXECUTE_COLLECT_SAMPLE,
+			ROVER_EXECUTE_PROBE_LOCATION,
+			ROVER_EXECUTE_TAKE_PHOTO,
+			ROVER_EXECUTE_STANDBY,
+			ROVER_COMMAND_COMPLETE,
+			ROVER_SEND_ACK,
+			MARS_RELAY_RECEIVE_ACK_FROM_ROVER,
+			MARS_RELAY_FORWARD_ACK_TO_EARTH,
+			EARTH_RELAY_RECEIVE_ACK_FROM_MARS,
+			EARTH_RELAY_FORWARD_ACK_TO_MC,
+			MISSION_CONTROL_RECEIVE_ACK
 		}
 		hidden { }
 	}
 	states {
 		CommandIdle => {
-			"mission_control_send_command" => CommandEarthRelayReceive
+			MISSION_CONTROL_SEND_COMMAND => CommandEarthRelayReceive
 		},
 		CommandEarthRelayReceive => {
-			"earth_relay_receive_from_mc" => CommandEarthRelayForward
+			EARTH_RELAY_RECEIVE_FROM_MC => CommandEarthRelayForward
 		},
 		CommandEarthRelayForward => {
-			"earth_relay_forward_to_mars" => CommandMarsRelayReceive
+			EARTH_RELAY_FORWARD_TO_MARS => CommandMarsRelayReceive
 		},
 		CommandMarsRelayReceive => {
-			"mars_relay_receive_from_earth" => CommandMarsRelayForward
+			MARS_RELAY_RECEIVE_FROM_EARTH => CommandMarsRelayForward
 		},
 		CommandMarsRelayForward => {
-			"mars_relay_forward_to_rover" => CommandRoverReceive
+			MARS_RELAY_FORWARD_TO_ROVER => CommandRoverReceive
 		},
 		CommandRoverReceive => {
-			"rover_receive_command" => CommandExecuting
+			ROVER_RECEIVE_COMMAND => CommandExecuting
 		},
 		CommandExecuting => {
-			"rover_execute_command" => CommandExecuted
+			ROVER_EXECUTE_COMMAND => CommandExecuted
 		},
 		CommandExecuted => {
-			"rover_execute_collect_sample" => CommandSpecificExecute,
-			"rover_execute_probe_location" => CommandSpecificExecute,
-			"rover_execute_take_photo" => CommandSpecificExecute,
-			"rover_execute_standby" => CommandSpecificExecute,
-			"rover_command_complete" => CommandAckSend
+			ROVER_EXECUTE_COLLECT_SAMPLE => CommandSpecificExecute,
+			ROVER_EXECUTE_PROBE_LOCATION => CommandSpecificExecute,
+			ROVER_EXECUTE_TAKE_PHOTO => CommandSpecificExecute,
+			ROVER_EXECUTE_STANDBY => CommandSpecificExecute,
+			ROVER_COMMAND_COMPLETE => CommandAckSend
 		},
 		CommandSpecificExecute => {
-			"rover_command_complete" => CommandAckSend
+			ROVER_COMMAND_COMPLETE => CommandAckSend
 		},
 		CommandAckSend => {
-			"rover_send_ack" => AckMarsRelayReceive
+			ROVER_SEND_ACK => AckMarsRelayReceive
 		},
 		AckMarsRelayReceive => {
-			"mars_relay_receive_ack_from_rover" => AckMarsRelayForward
+			MARS_RELAY_RECEIVE_ACK_FROM_ROVER => AckMarsRelayForward
 		},
 		AckMarsRelayForward => {
-			"mars_relay_forward_ack_to_earth" => AckEarthRelayReceive
+			MARS_RELAY_FORWARD_ACK_TO_EARTH => AckEarthRelayReceive
 		},
 		AckEarthRelayReceive => {
-			"earth_relay_receive_ack_from_mars" => AckEarthRelayForward
+			EARTH_RELAY_RECEIVE_ACK_FROM_MARS => AckEarthRelayForward
 		},
 		AckEarthRelayForward => {
-			"earth_relay_forward_ack_to_mc" => AckMissionControlReceive
+			EARTH_RELAY_FORWARD_ACK_TO_MC => AckMissionControlReceive
 		},
 		AckMissionControlReceive => {
-			"mission_control_receive_ack" => CommandIdle
+			MISSION_CONTROL_RECEIVE_ACK => CommandIdle
 		}
 	}
 	terminal { CommandIdle }
 	timing {
 		wcet: {
-			"mission_control_send_command" => wcet!(Duration::from_millis(50)),
-			"earth_relay_receive_from_mc" => wcet!(Duration::from_millis(50)),
-			"earth_relay_forward_to_mars" => wcet!(Duration::from_millis(50)),
-			"mars_relay_receive_from_earth" => wcet!(Duration::from_millis(50)),
-			"mars_relay_forward_to_rover" => wcet!(Duration::from_millis(50)),
-			"rover_receive_command" => wcet!(Duration::from_millis(50)),
-			"rover_execute_command" => wcet!(Duration::from_millis(500)),
-			"rover_command_complete" => wcet!(Duration::from_millis(100)),
-			"rover_send_ack" => wcet!(Duration::from_millis(50))
+			MISSION_CONTROL_SEND_COMMAND => wcet!(Duration::from_millis(50)),
+			EARTH_RELAY_RECEIVE_FROM_MC => wcet!(Duration::from_millis(50)),
+			EARTH_RELAY_FORWARD_TO_MARS => wcet!(Duration::from_millis(50)),
+			MARS_RELAY_RECEIVE_FROM_EARTH => wcet!(Duration::from_millis(50)),
+			MARS_RELAY_FORWARD_TO_ROVER => wcet!(Duration::from_millis(50)),
+			ROVER_RECEIVE_COMMAND => wcet!(Duration::from_millis(50)),
+			ROVER_EXECUTE_COMMAND => wcet!(Duration::from_millis(500)),
+			ROVER_COMMAND_COMPLETE => wcet!(Duration::from_millis(100)),
+			ROVER_SEND_ACK => wcet!(Duration::from_millis(50))
 		}
 	}
 }
@@ -373,27 +438,27 @@ tb_process_spec! {
 	pub DtnMissionLifecycle,
 	events {
 		observable {
-			"mission_start",
-			"fault_low_power_detected",
-			"comms_halted",
-			"fault_cleared",
-			"mission_complete"
+			MISSION_START,
+			FAULT_LOW_POWER_DETECTED,
+			COMMS_HALTED,
+			FAULT_CLEARED,
+			MISSION_COMPLETE
 		}
 		hidden { }
 	}
 	states {
 		LifecycleStart => {
-			"mission_start" => LifecycleActive
+			MISSION_START => LifecycleActive
 		},
 		LifecycleActive => {
-			"fault_low_power_detected" => LifecycleFault,
-			"mission_complete" => LifecycleEnd
+			FAULT_LOW_POWER_DETECTED => LifecycleFault,
+			MISSION_COMPLETE => LifecycleEnd
 		},
 		LifecycleFault => {
-			"comms_halted" => LifecycleRecharging
+			COMMS_HALTED => LifecycleRecharging
 		},
 		LifecycleRecharging => {
-			"fault_cleared" => LifecycleActive
+			FAULT_CLEARED => LifecycleActive
 		},
 		LifecycleEnd => { }
 	}
@@ -444,67 +509,67 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			// Lifecycle
-			(mission_start, exactly!(1)),
-			(mission_complete, exactly!(1)),
+			(MISSION_START, exactly!(1)),
+			(MISSION_COMPLETE, exactly!(1)),
 
 			// Mission Control events
-			(mission_control_send_command, exactly!(6)),
-			(mission_control_receive_ack, exactly!(6)),
-			(mission_control_receive_telemetry, exactly!(6)),
-			(mission_control_analyze_telemetry, exactly!(6)),
+			(MISSION_CONTROL_SEND_COMMAND, exactly!(6)),
+			(MISSION_CONTROL_RECEIVE_ACK, exactly!(6)),
+			(MISSION_CONTROL_RECEIVE_TELEMETRY, exactly!(6)),
+			(MISSION_CONTROL_ANALYZE_TELEMETRY, exactly!(6)),
 
 			// Mission Control gap recovery
-			(mission_control_gap_detected, at_most!(0)),
-			(mission_control_send_frame_request, at_most!(0)),
-			(mission_control_receive_frame_request, at_most!(0)),
-			(mission_control_send_frame_response, at_most!(0)),
-			(mission_control_receive_frame_response, at_most!(0)),
+			(MISSION_CONTROL_GAP_DETECTED, at_most!(0)),
+			(MISSION_CONTROL_SEND_FRAME_REQUEST, at_most!(0)),
+			(MISSION_CONTROL_RECEIVE_FRAME_REQUEST, at_most!(0)),
+			(MISSION_CONTROL_SEND_FRAME_RESPONSE, at_most!(0)),
+			(MISSION_CONTROL_RECEIVE_FRAME_RESPONSE, at_most!(0)),
 
 			// Earth Relay events
-			(earth_relay_receive_from_mc, exactly!(6)),
-			(earth_relay_forward_to_mars, exactly!(6)),
-			(earth_relay_receive_telemetry_from_mars, exactly!(6)),
-			(earth_relay_receive_ack_from_mars, exactly!(6)),
-			(earth_relay_forward_telemetry_to_mc, exactly!(6)),
-			(earth_relay_forward_ack_to_mc, exactly!(6)),
+			(EARTH_RELAY_RECEIVE_FROM_MC, exactly!(6)),
+			(EARTH_RELAY_FORWARD_TO_MARS, exactly!(6)),
+			(EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS, exactly!(6)),
+			(EARTH_RELAY_RECEIVE_ACK_FROM_MARS, exactly!(6)),
+			(EARTH_RELAY_FORWARD_TELEMETRY_TO_MC, exactly!(6)),
+			(EARTH_RELAY_FORWARD_ACK_TO_MC, exactly!(6)),
 
 			// Earth Relay gap recovery
-			(earth_relay_gap_detected, at_most!(0)),
-			(earth_relay_send_frame_request, at_most!(0)),
-			(earth_relay_receive_frame_request, at_most!(0)),
-			(earth_relay_send_frame_response, at_most!(0)),
-			(earth_relay_receive_frame_response, at_most!(0)),
-			(earth_relay_cascade_frame_request, at_most!(0)),
+			(EARTH_RELAY_GAP_DETECTED, at_most!(0)),
+			(EARTH_RELAY_SEND_FRAME_REQUEST, at_most!(0)),
+			(EARTH_RELAY_RECEIVE_FRAME_REQUEST, at_most!(0)),
+			(EARTH_RELAY_SEND_FRAME_RESPONSE, at_most!(0)),
+			(EARTH_RELAY_RECEIVE_FRAME_RESPONSE, at_most!(0)),
+			(EARTH_RELAY_CASCADE_FRAME_REQUEST, at_most!(0)),
 
 			// Mars Relay events
-			(mars_relay_receive_from_earth, exactly!(6)),
-			(mars_relay_forward_to_rover, exactly!(6)),
-			(mars_relay_receive_telemetry_from_rover, exactly!(6)),
-			(mars_relay_receive_ack_from_rover, exactly!(6)),
-			(mars_relay_forward_telemetry_to_earth, exactly!(6)),
-			(mars_relay_forward_ack_to_earth, exactly!(6)),
+			(MARS_RELAY_RECEIVE_FROM_EARTH, exactly!(6)),
+			(MARS_RELAY_FORWARD_TO_ROVER, exactly!(6)),
+			(MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER, exactly!(6)),
+			(MARS_RELAY_RECEIVE_ACK_FROM_ROVER, exactly!(6)),
+			(MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH, exactly!(6)),
+			(MARS_RELAY_FORWARD_ACK_TO_EARTH, exactly!(6)),
 
 			// Mars Relay gap recovery
-			(mars_relay_gap_detected, at_most!(0)),
-			(mars_relay_send_frame_request, at_most!(0)),
-			(mars_relay_receive_frame_request, at_most!(0)),
-			(mars_relay_send_frame_response, at_most!(0)),
-			(mars_relay_receive_frame_response, at_most!(0)),
-			(mars_relay_cascade_frame_request, at_most!(0)),
+			(MARS_RELAY_GAP_DETECTED, at_most!(0)),
+			(MARS_RELAY_SEND_FRAME_REQUEST, at_most!(0)),
+			(MARS_RELAY_RECEIVE_FRAME_REQUEST, at_most!(0)),
+			(MARS_RELAY_SEND_FRAME_RESPONSE, at_most!(0)),
+			(MARS_RELAY_RECEIVE_FRAME_RESPONSE, at_most!(0)),
+			(MARS_RELAY_CASCADE_FRAME_REQUEST, at_most!(0)),
 
 			// Rover events
-			(rover_receive_command, exactly!(6)),
-			(rover_execute_command, exactly!(6)),
-			(rover_command_complete, exactly!(6)),
-			(rover_send_ack, exactly!(6)),
-			(rover_send_telemetry, exactly!(6)),
+			(ROVER_RECEIVE_COMMAND, exactly!(6)),
+			(ROVER_EXECUTE_COMMAND, exactly!(6)),
+			(ROVER_COMMAND_COMPLETE, exactly!(6)),
+			(ROVER_SEND_ACK, exactly!(6)),
+			(ROVER_SEND_TELEMETRY, exactly!(6)),
 
 			// Rover gap recovery
-			(rover_gap_detected, at_most!(0)),
-			(rover_send_frame_request, at_most!(0)),
-			(rover_receive_frame_request, at_most!(0)),
-			(rover_send_frame_response, at_most!(0)),
-			(rover_receive_frame_response, at_most!(0))
+			(ROVER_GAP_DETECTED, at_most!(0)),
+			(ROVER_SEND_FRAME_REQUEST, at_most!(0)),
+			(ROVER_RECEIVE_FRAME_REQUEST, at_most!(0)),
+			(ROVER_SEND_FRAME_RESPONSE, at_most!(0)),
+			(ROVER_RECEIVE_FRAME_RESPONSE, at_most!(0))
 		]
 	}
 }
@@ -530,7 +595,7 @@ async fn send_telemetry_to_mars_relay(
 	let battery = fault_manager.battery_percent()?;
 	let fault_matrix_snapshot = fault_manager.fault_matrix()?;
 
-	trace.event(DtnEventCountSpec::rover_send_telemetry)?;
+	trace.event(ROVER_SEND_TELEMETRY)?;
 
 	let telemetry = RoverTelemetry::new(instrument, data, mission_time_ms(), battery, -20);
 	let (next_order, previous_digest) = rover_processor.prepare_outgoing()?;
@@ -585,8 +650,8 @@ async fn run_mission_loop(
 		let battery_update = fault_manager.update_battery_state()?;
 		match battery_update {
 			BatteryUpdate::LowPowerDetected(_battery) => {
-				trace.event("fault_low_power_detected")?;
-				trace.event("comms_halted")?;
+				trace.event(FAULT_LOW_POWER_DETECTED)?;
+				trace.event(COMMS_HALTED)?;
 
 				advance_clock(delays::ROVER_RECHARGE_MS);
 
@@ -595,7 +660,7 @@ async fn run_mission_loop(
 					fault_manager.reenergize_battery()?;
 				}
 
-				trace.event("fault_cleared")?;
+				trace.event(FAULT_CLEARED)?;
 			}
 			BatteryUpdate::FaultCleared(_battery) => {
 				// Fault cleared
@@ -1022,7 +1087,7 @@ tb_scenario! {
 			// ================================================================
 
 			init_mission_clock();
-			trace.event(DtnEventCountSpec::mission_start)?;
+			trace.event(MISSION_START)?;
 
 			// ================================================================
 			// 6. SEND INITIAL COMMAND FROM MISSION CONTROL
@@ -1033,7 +1098,7 @@ tb_scenario! {
 				let (next_order, previous_digest) = mc_processor.prepare_outgoing()?;
 				let command = EarthCommand::new(initial_cmd, MessagePriority::Standard, mission_time_ms());
 
-				trace.event(DtnEventCountSpec::mission_control_send_command)?;
+				trace.event(MISSION_CONTROL_SEND_COMMAND)?;
 
 				let command_frame = mc_frame_builder.build_relay_command_frame(
 					command,
@@ -1098,7 +1163,7 @@ tb_scenario! {
 				&shared_mission_state,
 			).await?;
 
-			trace.event(DtnEventCountSpec::mission_complete)?;
+			trace.event(MISSION_COMPLETE)?;
 
 			Ok(())
 		}

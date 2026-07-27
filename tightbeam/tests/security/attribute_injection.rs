@@ -41,8 +41,16 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::HandshakeError;
+use tightbeam::utils::urn::Urn;
 use tightbeam::x509::attr::Attribute;
 use tightbeam::TightBeamError;
+
+pub(crate) const DUPLICATE_ATTRIBUTE_FAILS_CLOSED: Urn<'static> =
+	Urn::new("test", "event:attribute-injection/duplicate-attribute-fails-closed");
+pub(crate) const INJECTION_INVISIBLE_TO_SIGNATURES: Urn<'static> =
+	Urn::new("test", "event:attribute-injection/injection-invisible-to-signatures");
+pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
+	Urn::new("test", "event:attribute-injection/session-never-activates");
 
 use crate::common::security::{
 	cms_mutual_budget_pair, expectation_failure, CmsSessionHooks, GrantingAuthorizer, ServerMaterials,
@@ -84,9 +92,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(injection_invisible_to_signatures, exactly!(1), equals!(true)),
-			(duplicate_attribute_fails_closed, exactly!(1), equals!(true)),
-			(session_never_activates, exactly!(1), equals!(true))
+			(INJECTION_INVISIBLE_TO_SIGNATURES, exactly!(1), equals!(true)),
+			(DUPLICATE_ATTRIBUTE_FAILS_CLOSED, exactly!(1), equals!(true)),
+			(SESSION_NEVER_ACTIVATES, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -122,7 +130,7 @@ tb_scenario! {
 			// tampered Finished still authenticates.
 			let finished_accepted = server.process_client_finished(&tampered).is_ok();
 			trace.event_with(
-				AttributeInjectionSpec::injection_invisible_to_signatures,
+				INJECTION_INVISIBLE_TO_SIGNATURES,
 				&[],
 				finished_accepted,
 			)?;
@@ -131,14 +139,14 @@ tb_scenario! {
 			let ack = server.process_receipt_ack(&tampered).await;
 			let duplicate_rejected = matches!(ack, Err(HandshakeError::DuplicateAttribute));
 			trace.event_with(
-				AttributeInjectionSpec::duplicate_attribute_fails_closed,
+				DUPLICATE_ATTRIBUTE_FAILS_CLOSED,
 				&[],
 				duplicate_rejected,
 			)?;
 
 			let activation = server.complete();
 			let activation_refused = matches!(activation, Err(HandshakeError::CountersignatureMissing));
-			trace.event_with(AttributeInjectionSpec::session_never_activates, &[], activation_refused)?;
+			trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 
 			Ok::<(), TightBeamError>(())
 		}

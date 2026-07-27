@@ -518,7 +518,7 @@ macro_rules! hive {
 		$crate::server! {
 			protocol $protocol: $listener,
 			policies: { with_mux_offer: [ $mux_offer.to_owned() ] },
-			handle: move |frame: $crate::Frame| {
+			handle: move |frame: $crate::Frame, session: $crate::policy::SessionContext| {
 				let servlets = ::std::sync::Arc::clone(&$servlets);
 				let trace = ::std::sync::Arc::clone(&$trace);
 				let utilization = ::std::sync::Arc::clone(&$utilization);
@@ -537,6 +537,7 @@ macro_rules! hive {
 					hive!(
 						@handle_command $protocol,
 						frame,
+						session,
 						servlets,
 						trace,
 						utilization,
@@ -560,6 +561,7 @@ macro_rules! hive {
 
 	(@handle_command $protocol:path,
 		$frame:ident,
+		$session:ident,
 		$servlets:ident,
 		$trace:ident,
 		$utilization:ident,
@@ -592,7 +594,7 @@ macro_rules! hive {
 						::std::sync::Arc::clone(store),
 						::std::sync::Arc::clone(&$replay_guard),
 					);
-					$crate::policy::GatePolicy::evaluate(&gate, &$frame)
+					$crate::policy::GatePolicy::evaluate(&gate, &$frame, &$session)
 				}
 				None => $crate::policy::TransitStatus::PermissionDenied,
 			};
@@ -636,7 +638,7 @@ macro_rules! hive {
 				::std::sync::Arc::clone(&$utilization),
 				$bp_threshold
 			);
-			if $crate::policy::GatePolicy::evaluate(&bp_gate, &$frame) == $crate::policy::TransitStatus::ResourceExhausted {
+			if $crate::policy::GatePolicy::evaluate(&bp_gate, &$frame, &$session) == $crate::policy::TransitStatus::ResourceExhausted {
 				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
 					$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::ResourceExhausted)
 				));

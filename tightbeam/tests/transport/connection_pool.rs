@@ -14,7 +14,8 @@
 	feature = "builder",
 	feature = "testing",
 	feature = "colony",
-	feature = "hex"
+	feature = "hex",
+	feature = "instrument"
 ))]
 
 use std::{
@@ -28,9 +29,12 @@ use std::{
 use tightbeam::{
 	colony::servlet::ServletConf,
 	der::Sequence,
-	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,
+	exactly,
+	instrumentation::events,
+	servlet, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{create_v0_tightbeam, trace::TraceCollector, SetupEnv},
 	transport::{tcp::r#async::TokioListener, ConnectionBuilder, ConnectionPool, PoolConfig},
+	utils::urn::Urn,
 	Beamable,
 };
 
@@ -50,6 +54,14 @@ use tightbeam::{
 	error::TightBeamError,
 	hex,
 };
+
+pub(crate) const ACQUIRE_CLIENT: Urn<'static> = Urn::new("test", "event:connection-pool/acquire-client");
+pub(crate) const MESSAGE_COUNT: Urn<'static> = Urn::new("test", "event:connection-pool/message-count");
+pub(crate) const POOL_CREATE: Urn<'static> = Urn::new("test", "event:connection-pool/pool-create");
+pub(crate) const RECEIVE_RESPONSE: Urn<'static> = Urn::new("test", "event:connection-pool/receive-response");
+pub(crate) const SEND_MESSAGE: Urn<'static> = Urn::new("test", "event:connection-pool/send-message");
+pub(crate) const SERVLET1_COUNT: Urn<'static> = Urn::new("test", "event:connection-pool/servlet1-count");
+pub(crate) const SERVLET2_COUNT: Urn<'static> = Urn::new("test", "event:connection-pool/servlet2-count");
 
 // ============================================================================
 // Test Message Types
@@ -127,23 +139,23 @@ fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError
 tb_process_spec! {
 	pub PoolReuseProcess,
 	events {
-		observable { "pool_create", "acquire_client", "send_message", "receive_response", "release_client" }
+		observable { POOL_CREATE, ACQUIRE_CLIENT, SEND_MESSAGE, RECEIVE_RESPONSE, events::POOL_RELEASED }
 		hidden { }
 	}
 	states {
-		Init => { "pool_create" => PoolReady },
-		PoolReady => { "acquire_client" => Acquired1 },
-		Acquired1 => { "send_message" => Sent1 },
-		Sent1 => { "receive_response" => Received1 },
-		Received1 => { "release_client" => Released1 },
-		Released1 => { "acquire_client" => Acquired2 },
-		Acquired2 => { "send_message" => Sent2 },
-		Sent2 => { "receive_response" => Received2 },
-		Received2 => { "release_client" => Released2 },
-		Released2 => { "acquire_client" => Acquired3 },
-		Acquired3 => { "send_message" => Sent3 },
-		Sent3 => { "receive_response" => Received3 },
-		Received3 => { "release_client" => Complete }
+		Init => { POOL_CREATE => PoolReady },
+		PoolReady => { ACQUIRE_CLIENT => Acquired1 },
+		Acquired1 => { SEND_MESSAGE => Sent1 },
+		Sent1 => { RECEIVE_RESPONSE => Received1 },
+		Received1 => { events::POOL_RELEASED => Released1 },
+		Released1 => { ACQUIRE_CLIENT => Acquired2 },
+		Acquired2 => { SEND_MESSAGE => Sent2 },
+		Sent2 => { RECEIVE_RESPONSE => Received2 },
+		Received2 => { events::POOL_RELEASED => Released2 },
+		Released2 => { ACQUIRE_CLIENT => Acquired3 },
+		Acquired3 => { SEND_MESSAGE => Sent3 },
+		Sent3 => { RECEIVE_RESPONSE => Received3 },
+		Received3 => { events::POOL_RELEASED => Complete }
 	}
 	terminal { Complete }
 }
@@ -154,12 +166,15 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(pool_create, exactly!(1)),
-			(acquire_client, exactly!(3)),
-			(send_message, exactly!(3)),
-			(receive_response, exactly!(3)),
-			(release_client, exactly!(3)),
-			(message_count, exactly!(1), equals!(3u64))
+			(POOL_CREATE, exactly!(1)),
+			(ACQUIRE_CLIENT, exactly!(3)),
+			(SEND_MESSAGE, exactly!(3)),
+			(RECEIVE_RESPONSE, exactly!(3)),
+			(events::POOL_RELEASED, exactly!(3)),
+			(events::POOL_DIAL, exactly!(1)),
+			(events::POOL_REUSE_READY, exactly!(2)),
+			(events::POOL_EXHAUSTED, exactly!(0)),
+			(MESSAGE_COUNT, exactly!(1), equals!(3u64))
 		]
 	}
 }
@@ -170,13 +185,16 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(pool_create, exactly!(1)),
-			(acquire_client, exactly!(3)),
-			(send_message, exactly!(3)),
-			(receive_response, exactly!(3)),
-			(release_client, exactly!(3)),
-			(servlet1_count, exactly!(1), equals!(2u64)),
-			(servlet2_count, exactly!(1), equals!(1u64))
+			(POOL_CREATE, exactly!(1)),
+			(ACQUIRE_CLIENT, exactly!(3)),
+			(SEND_MESSAGE, exactly!(3)),
+			(RECEIVE_RESPONSE, exactly!(3)),
+			(events::POOL_RELEASED, exactly!(3)),
+			(events::POOL_DIAL, exactly!(2)),
+			(events::POOL_REUSE_READY, exactly!(1)),
+			(events::POOL_EXHAUSTED, exactly!(0)),
+			(SERVLET1_COUNT, exactly!(1), equals!(2u64)),
+			(SERVLET2_COUNT, exactly!(1), equals!(1u64))
 		]
 	}
 }
@@ -267,7 +285,7 @@ tb_scenario! {
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
 			let server_addr = servlet.addr();
 
-			trace.event(PoolReuseSpec::pool_create)?;
+			trace.event(POOL_CREATE)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -275,25 +293,24 @@ tb_scenario! {
 					.with_trust_store(make_server_trust_store()?)
 					.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 					.with_timeout(Duration::from_millis(1000))
+					.with_trace(trace.share())
 					.build(),
 			);
 
 			for i in 1..=3 {
-				trace.event(PoolReuseSpec::acquire_client)?;
+				trace.event(ACQUIRE_CLIENT)?;
 
 				let mut client = pool.connect(server_addr).await?;
 
-				trace.event(PoolReuseSpec::send_message)?;
+				trace.event(SEND_MESSAGE)?;
 
 				let msg = create_v0_tightbeam(Some(&format!("test{i}")), None);
 				let reply = client.conn()?.emit(msg, None).await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
-				trace.event(PoolReuseSpec::receive_response)?;
-
-				trace.event(PoolReuseSpec::release_client)?;
+				trace.event(RECEIVE_RESPONSE)?;
 			}
 
-			trace.event_with(PoolReuseSpec::message_count, &[], message_count.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(MESSAGE_COUNT, &[], message_count.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}
@@ -381,31 +398,30 @@ tb_scenario! {
 			let addr1 = servlet1.addr();
 			let addr2 = servlet2.addr();
 
-			trace.event(PoolIsolationSpec::pool_create)?;
+			trace.event(POOL_CREATE)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
 					.with_trust_store(make_server_trust_store()?)
 					.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+					.with_trace(trace.share())
 					.build(),
 			);
 
 			for (addr, name) in [(addr1, "addr1-test"), (addr2, "addr2-test"), (addr1, "addr1-test2")] {
-				trace.event(PoolIsolationSpec::acquire_client)?;
+				trace.event(ACQUIRE_CLIENT)?;
 
 				let mut client = pool.connect(addr).await?;
 
-				trace.event(PoolIsolationSpec::send_message)?;
+				trace.event(SEND_MESSAGE)?;
 
 				let reply = client.conn()?.emit(create_v0_tightbeam(Some(name), None), None).await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
-				trace.event(PoolIsolationSpec::receive_response)?;
-
-				trace.event(PoolIsolationSpec::release_client)?;
+				trace.event(RECEIVE_RESPONSE)?;
 			}
 
-			trace.event_with(PoolIsolationSpec::servlet1_count, &[], count1.load(Ordering::SeqCst) as u64)?;
-			trace.event_with(PoolIsolationSpec::servlet2_count, &[], count2.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(SERVLET1_COUNT, &[], count1.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(SERVLET2_COUNT, &[], count2.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}
@@ -433,21 +449,22 @@ tb_scenario! {
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
 			let server_addr = servlet.addr();
 
-			trace.event(PoolReuseSpec::pool_create)?;
+			trace.event(POOL_CREATE)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
 					.with_trust_store(make_server_trust_store()?)
 					.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+					.with_trace(trace.share())
 					.build(),
 			);
 
 			for _ in 0..3 {
-				trace.event(PoolReuseSpec::acquire_client)?;
+				trace.event(ACQUIRE_CLIENT)?;
 
 				let mut client = pool.connect(server_addr).await?;
 
-				trace.event(PoolReuseSpec::send_message)?;
+				trace.event(SEND_MESSAGE)?;
 
 				let reply = client
 					.conn()?
@@ -455,11 +472,10 @@ tb_scenario! {
 					.await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
 
-				trace.event(PoolReuseSpec::receive_response)?;
-				trace.event(PoolReuseSpec::release_client)?;
+				trace.event(RECEIVE_RESPONSE)?;
 			}
 
-			trace.event_with(PoolReuseSpec::message_count, &[], message_count.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(MESSAGE_COUNT, &[], message_count.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}

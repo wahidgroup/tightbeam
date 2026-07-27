@@ -30,8 +30,10 @@ use crate::oids::{
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAttribute {
+	/// OID naming the attribute (RFC 5652 § 5.3 `attrType`).
 	pub attr_type: ObjectIdentifier,
-	pub attr_values: Vec<Any>, // MUST contain exactly one value under profile
+	/// Attribute values; the profile requires exactly one element.
+	pub attr_values: Vec<Any>,
 }
 
 // Provide ordering for canonical DER SET OF encoding. Order by attr_type OID bytes,
@@ -391,8 +393,8 @@ mod tests {
 		let a2 = a1.to_owned();
 		let attrs = vec![a1, a2];
 		assert!(matches!(
-			find(&attrs, &HANDSHAKE_SECURITY_OFFER).unwrap_err(),
-			HandshakeError::DuplicateAttribute
+			find(&attrs, &HANDSHAKE_SECURITY_OFFER),
+			Err(HandshakeError::DuplicateAttribute)
 		));
 		Ok(())
 	}
@@ -402,8 +404,8 @@ mod tests {
 		let only = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, mk_octet(&[0x22u8; 32])?)?;
 		let attrs = vec![only];
 		assert!(matches!(
-			find(&attrs, &HANDSHAKE_SECURITY_ACCEPT).unwrap_err(),
-			HandshakeError::MissingAttribute
+			find(&attrs, &HANDSHAKE_SECURITY_ACCEPT),
+			Err(HandshakeError::MissingAttribute)
 		));
 		Ok(())
 	}
@@ -412,7 +414,7 @@ mod tests {
 	fn invalid_attribute_arity() -> Result<(), der::Error> {
 		let any = mk_octet(&[0x33u8; 32])?;
 		let attr = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![any.to_owned(), any] };
-		assert!(matches!(attr.value().unwrap_err(), HandshakeError::InvalidAttributeArity));
+		assert!(matches!(attr.value(), Err(HandshakeError::InvalidAttributeArity)));
 		Ok(())
 	}
 
@@ -431,10 +433,7 @@ mod tests {
 		}
 
 		let unknown = mk_alert_attr(&[0x07])?;
-		assert!(matches!(
-			extract_alert_x509(&unknown).unwrap_err(),
-			HandshakeError::UnknownAlertCode(7)
-		));
+		assert!(matches!(extract_alert_x509(&unknown), Err(HandshakeError::UnknownAlertCode(7))));
 		Ok(())
 	}
 
@@ -442,17 +441,11 @@ mod tests {
 	fn alert_integer_out_of_range_rejected() -> Result<(), der::Error> {
 		// Three-byte INTEGER exceeds the u16 decode domain outright.
 		let wide = mk_alert_attr(&[0x01, 0x02, 0x03])?;
-		assert!(matches!(
-			extract_alert_x509(&wide).unwrap_err(),
-			HandshakeError::IntegerOutOfRange
-		));
+		assert!(matches!(extract_alert_x509(&wide), Err(HandshakeError::IntegerOutOfRange)));
 
 		// 0x0101 = 257. Truncating to u8 would alias alert code 1 (AuthRequired).
 		let above = mk_alert_attr(&[0x01, 0x01])?;
-		assert!(matches!(
-			extract_alert_x509(&above).unwrap_err(),
-			HandshakeError::IntegerOutOfRange
-		));
+		assert!(matches!(extract_alert_x509(&above), Err(HandshakeError::IntegerOutOfRange)));
 		Ok(())
 	}
 

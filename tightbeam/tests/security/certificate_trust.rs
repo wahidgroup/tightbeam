@@ -28,10 +28,14 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
 use crate::common::security::{deterministic_signing_key, expectation_failure, random_signing_key, test_certificate};
+
+pub(crate) const UNTRUSTED_CERT_REJECTED: Urn<'static> =
+	Urn::new("test", "event:certificate-trust/untrusted-cert-rejected");
 
 tb_assert_spec! {
 	pub CertificateTrustSpec,
@@ -39,7 +43,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(untrusted_cert_rejected, exactly!(1u32))
+			(UNTRUSTED_CERT_REJECTED, exactly!(1u32))
 		]
 	}
 }
@@ -47,11 +51,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub CertificateTrustProcess,
 	events {
-		observable { CertificateTrustSpec::untrusted_cert_rejected }
+		observable { UNTRUSTED_CERT_REJECTED }
 		hidden { }
 	}
 	states {
-		Idle => { CertificateTrustSpec::untrusted_cert_rejected => Done },
+		Idle => { UNTRUSTED_CERT_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -81,7 +85,7 @@ job! {
 		let validator = DirectTrustValidator::default().with_trust_chain(vec![trusted_cert]);
 		match validator.evaluate(&attacker_cert) {
 			Err(_) => {
-				trace.event(CertificateTrustSpec::untrusted_cert_rejected)?;
+				trace.event(UNTRUSTED_CERT_REJECTED)?;
 			}
 			Ok(()) => return Err(expectation_failure("certificate outside the trust chain was accepted")),
 		}

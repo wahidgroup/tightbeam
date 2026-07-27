@@ -5,34 +5,39 @@ use core::time::Duration;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
+
+pub(crate) const TASK1: Urn<'static> = Urn::new("test", "event:edf-basic/task1");
+pub(crate) const TASK2: Urn<'static> = Urn::new("test", "event:edf-basic/task2");
+pub(crate) const TASK3: Urn<'static> = Urn::new("test", "event:edf-basic/task3");
 
 // Define a real-time process with EDF scheduling
 tb_process_spec! {
 	pub EdfSchedulableProcess,
 	events {
-		observable { "task1", "task2", "task3" }
+		observable { TASK1, TASK2, TASK3 }
 		hidden { }
 	}
 	states {
-		S0 => { "task1" => S1 },
-		S1 => { "task2" => S2 },
-		S2 => { "task3" => S3 }
+		S0 => { TASK1 => S1 },
+		S1 => { TASK2 => S2 },
+		S2 => { TASK3 => S3 }
 	}
 	terminal { S3 }
 	timing {
 		wcet: {
-			"task1" => wcet!(Duration::from_millis(3)),
-			"task2" => wcet!(Duration::from_millis(5)),
-			"task3" => wcet!(Duration::from_millis(2))
+			TASK1 => wcet!(Duration::from_millis(3)),
+			TASK2 => wcet!(Duration::from_millis(5)),
+			TASK3 => wcet!(Duration::from_millis(2))
 		}
 	}
 	schedulability {
 		scheduler: EarliestDeadlineFirst,
 		periods: {
-			"task1" => Duration::from_millis(10),
-			"task2" => Duration::from_millis(20),
-			"task3" => Duration::from_millis(30)
+			TASK1 => Duration::from_millis(10),
+			TASK2 => Duration::from_millis(20),
+			TASK3 => Duration::from_millis(30)
 		}
 	}
 }
@@ -47,9 +52,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(task1, exactly!(1)),
-			(task2, exactly!(1)),
-			(task3, exactly!(1))
+			(TASK1, exactly!(1)),
+			(TASK2, exactly!(1)),
+			(TASK3, exactly!(1))
 		]
 	}
 }
@@ -71,9 +76,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(EdfAssertSpec::task1)?;
-			trace.event(EdfAssertSpec::task2)?;
-			trace.event(EdfAssertSpec::task3)?;
+			trace.event(TASK1)?;
+			trace.event(TASK2)?;
+			trace.event(TASK3)?;
 			Ok(())
 		}
 	}

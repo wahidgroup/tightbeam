@@ -34,6 +34,7 @@ use crate::crypto::sign::{PrehashVerifier, SignatureEncoding};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
+use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	authorize_transport, server_mux_settings, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept,
@@ -46,18 +47,19 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::{
-	clear_session_randoms, compute_client_auth_digest, compute_transcript_digest, extract_verifying_key_from_cert,
+	clear_session_randoms, compute_client_auth_digest, compute_ecies_transcript_hash, extract_verifying_key_from_cert,
 	octet_string_to_32_byte_array, validate_state,
 };
 use crate::transport::handshake::{
 	ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake, ServerHandshakeProtocol,
 };
 use crate::transport::handshake::{
-	DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation,
+	DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation,
 };
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
+use crate::ZeroizingBytes;
 
 /// Server-side ECIES handshake orchestrator.
 ///
@@ -92,6 +94,7 @@ where
 	session_receipt: Option<SessionReceipt>,
 	receipt_artifact: Option<SignedData>,
 	stored_receipt: Option<StoredReceipt>,
+	epoch_materials: Option<EpochMaterials>,
 	_phantom: PhantomData<P>,
 	invariants: HandshakeInvariant,
 }
@@ -148,10 +151,12 @@ where
 			session_receipt: None,
 			receipt_artifact: None,
 			stored_receipt: None,
-			_phantom: PhantomData,
+			epoch_materials: None,
 			invariants: HandshakeInvariant::default(),
+			_phantom: PhantomData,
 		}
 	}
+
 	/// Set the server's supported security profiles for negotiation.
 	/// Server must have at least one supported profile configured.
 	#[must_use]
@@ -255,7 +260,7 @@ where
 			Some(accept) => accept.to_der()?,
 			None => Vec::new(),
 		};
-		let transcript_digest = self.compute_transcript_hash(
+		let transcript_digest = compute_ecies_transcript_hash::<P::Digest>(
 			client_hello_der,
 			&server_random,
 			spki_bytes,
@@ -394,13 +399,23 @@ where
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 
-		let session_ciphers = self.derive_directional_aead(base_session_key, salt.as_slice())?;
+		let salt_bytes = salt.as_slice();
+		let session_ciphers = self.derive_directional_aead(base_session_key, salt_bytes)?;
 		self.invariants.derive_aead_once()?;
 
-		// 4. Transition to complete state
+		// 4. Derive the epoch-0 rekey materials alongside the traffic
+		// keys, from the same inputs plus the transcript hash: an in-band
+		// renewal later chains from this secret without touching the
+		// handshake again
+		if let Some(transcript_hash) = self.transcript_hash {
+			let materials = derive_epoch_materials::<P>(base_session_key, salt_bytes, transcript_hash)?;
+			self.epoch_materials = Some(materials);
+		}
+
+		// 5. Transition to complete state
 		self.state.transition(ServerHandshakeState::Completed)?;
 
-		// 5. Clear sensitive data
+		// 6. Clear sensitive data
 		self.clear_sensitive_data();
 
 		Ok(session_ciphers)
@@ -428,26 +443,6 @@ where
 	}
 
 	// Helper methods
-
-	fn compute_transcript_hash(
-		&self,
-		client_hello: &[u8],
-		server_random: &[u8; 32],
-		spki_bytes: &[u8],
-		accept_der: &[u8],
-		transport_accept_der: &[u8],
-	) -> Result<[u8; 32], HandshakeError> {
-		let mut data = Vec::with_capacity(
-			client_hello.len() + 32 + spki_bytes.len() + accept_der.len() + transport_accept_der.len(),
-		);
-		data.extend_from_slice(client_hello);
-		data.extend_from_slice(server_random);
-		data.extend_from_slice(spki_bytes);
-		data.extend_from_slice(accept_der);
-		data.extend_from_slice(transport_accept_der);
-
-		compute_transcript_digest::<P::Digest>(&data)
-	}
 
 	fn validate_expected_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
 		validate_state(self.state.state(), expected)
@@ -487,7 +482,6 @@ where
 			// Dual ownership by design: this copy is DER-encoded onto
 			// the wire and dropped; the retained artifact absorbs the
 			// client SignerInfo at settlement.
-			// TODO: Determine how to handle this clone.
 			session_receipt: self.receipt_artifact.clone(),
 		};
 
@@ -498,7 +492,7 @@ where
 		ClientKeyExchange::from_der(der_bytes).map_err(Into::into)
 	}
 
-	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, HandshakeError> {
+	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<ZeroizingBytes, HandshakeError> {
 		// Parse the ECIES message using the negotiated curve's wire format.
 		let (ephemeral_pubkey, ciphertext_bytes) = {
 			let encrypted_message = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_bytes)?;
@@ -529,7 +523,8 @@ where
 		let ciphertext_with_tag = &ciphertext_bytes[nonce_size..];
 
 		// Build the negotiated cipher from the derived key material.
-		let cipher = <P::AeadCipher as KeyInit>::new_from_slice(&k_enc[..key_size])
+		let key_material = &k_enc[..key_size];
+		let cipher = P::AeadCipher::new_from_slice(key_material)
 			.map_err(|_| HandshakeError::InvalidKeySize { expected: key_size, received: k_enc.len() })?;
 
 		let payload = match self.aad_domain_tag {
@@ -782,6 +777,22 @@ where
 		})
 	}
 
+	fn is_complete(&self) -> bool {
+		self.is_complete()
+	}
+
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+		self.selected_profile
+	}
+
+	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		self.mux_settings
+	}
+
+	fn session_receipt(&self) -> Option<&StoredReceipt> {
+		self.stored_receipt.as_ref()
+	}
+
 	#[cfg(feature = "aead")]
 	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
 		Box::pin(async move {
@@ -801,25 +812,14 @@ where
 		})
 	}
 
-	fn is_complete(&self) -> bool {
-		self.is_complete()
-	}
-
 	#[cfg(feature = "x509")]
 	fn peer_certificate(&self) -> Option<&Certificate> {
 		self.validated_client_cert.as_ref().map(|arc| arc.as_ref())
 	}
 
-	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
-		self.selected_profile
-	}
-
-	fn negotiated_mux(&self) -> Option<MuxSettings> {
-		self.mux_settings
-	}
-
-	fn session_receipt(&self) -> Option<&StoredReceipt> {
-		self.stored_receipt.as_ref()
+	#[cfg(feature = "aead")]
+	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
+		self.epoch_materials.take()
 	}
 }
 
@@ -1055,7 +1055,7 @@ mod tests {
 	}
 
 	/// Transport negotiation modes: mux activates only when offered AND
-	/// locally enabled. Every other combination stays lock-step.
+	/// locally enabled. Every other combination stays single-flight.
 	#[tokio::test]
 	async fn test_transport_negotiation() -> Result<(), Box<dyn Error>> {
 		// Offered and locally enabled: negotiated with directional caps
@@ -1078,7 +1078,7 @@ mod tests {
 			));
 		}
 
-		// Offered but not locally enabled: lock-step
+		// Offered but not locally enabled: single-flight
 		{
 			let mut server = TestEciesServerBuilder::new().build()?;
 			let client_hello_der =
@@ -1090,7 +1090,7 @@ mod tests {
 			assert_eq!(server.mux_settings, None);
 		}
 
-		// Locally enabled but not offered: lock-step
+		// Locally enabled but not offered: single-flight
 		{
 			let mut server = TestEciesServerBuilder::new()
 				.build()?

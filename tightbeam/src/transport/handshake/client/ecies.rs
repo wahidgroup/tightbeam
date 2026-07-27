@@ -9,9 +9,8 @@ use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 
 use core::marker::PhantomData;
 
-use crate::utils::marker::MaybeSendFuture;
-
 use crate::asn1::OctetString;
+use crate::cms::signed_data::{SignedData, SignerInfo};
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{KeyInit, SessionKeys};
 use crate::crypto::ecies::EciesEphemeral;
@@ -27,9 +26,7 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::{extract_verifying_key_bytes, validate_certificate_expiry};
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
-use crate::zeroize::{Zeroize, Zeroizing};
-
-use crate::cms::signed_data::{SignedData, SignerInfo};
+use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{client_mux_settings, MuxSettings, SecurityOffer, TransportOffer};
 use crate::transport::handshake::receipt::{
@@ -40,13 +37,15 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
 use crate::transport::handshake::utils::{
-	compute_client_auth_digest, compute_transcript_digest, octet_string_to_32_byte_array, validate_state,
+	compute_client_auth_digest, compute_ecies_transcript_hash, octet_string_to_32_byte_array, validate_state,
 };
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake,
 };
-use crate::transport::handshake::{DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization};
+use crate::transport::handshake::{DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization};
+use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
+use crate::zeroize::{Zeroize, Zeroizing};
 
 /// Client-side ECIES handshake orchestrator.
 ///
@@ -59,8 +58,8 @@ where
 {
 	state: ClientStateMachine,
 	client_random: Option<[u8; 32]>,
-	/// Exact DER bytes of the sent `ClientHello`, bound into the transcript so a
-	/// MITM cannot rewrite the offer undetected (CWE-757).
+	/// Exact DER bytes of the sent `ClientHello`, bound into the transcript
+	/// so a MITM cannot rewrite the offer undetected (CWE-757).
 	client_hello: Option<Vec<u8>>,
 	base_session_key: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
@@ -75,6 +74,10 @@ where
 	client_key_provider: Option<Arc<dyn SigningKeyProvider>>,
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	stored_receipt: Option<StoredReceipt>,
+	epoch_materials: Option<EpochMaterials>,
+	/// Server certificate validated against the trust store, retained
+	/// as the peer identity for post-handshake epoch renewals.
+	server_certificate: Option<Certificate>,
 	_phantom_provider: PhantomData<P>,
 	_phantom_message: PhantomData<M>,
 	invariants: HandshakeInvariant,
@@ -122,6 +125,8 @@ where
 			client_key_provider: None,
 			receipt_approver: None,
 			stored_receipt: None,
+			epoch_materials: None,
+			server_certificate: None,
 			invariants: HandshakeInvariant::default(),
 			_phantom_provider: PhantomData,
 			_phantom_message: PhantomData,
@@ -156,6 +161,8 @@ where
 			client_key_provider,
 			receipt_approver: None,
 			stored_receipt: None,
+			epoch_materials: None,
+			server_certificate: None,
 			invariants: HandshakeInvariant::default(),
 			_phantom_provider: PhantomData,
 			_phantom_message: PhantomData,
@@ -194,7 +201,7 @@ where
 	}
 
 	/// Set the transport capability offer (multiplexing).
-	/// If not set, the connection stays lock-step.
+	/// If not set, the connection stays single-flight.
 	#[must_use]
 	pub fn with_transport_offer(mut self, offer: TransportOffer) -> Self {
 		self.transport_offer = Some(offer);
@@ -266,9 +273,15 @@ where
 			None => Vec::new(),
 		};
 
-		let transcript_digest =
-			self.compute_transcript_hash(client_hello, &server_random, spki_bytes, &accept_der, &transport_accept_der)?;
+		let transcript_digest = compute_ecies_transcript_hash::<P::Digest>(
+			client_hello,
+			&server_random,
+			spki_bytes,
+			&accept_der,
+			&transport_accept_der,
+		)?;
 		self.transcript_hash = Some(transcript_digest);
+
 		// Invariant: transcript becomes immutable after hash computed
 		self.invariants.lock_transcript()?;
 
@@ -369,7 +382,10 @@ where
 			client_signature,
 		};
 
-		// 12. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
+		// 12. Retain the validated server certificate for post-handshake renewals
+		self.server_certificate = Some(server_handshake.certificate);
+
+		// 13. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex.to_der()?)
@@ -501,14 +517,14 @@ where
 			return Err(HandshakeError::MutualAuthRequired);
 		}
 
-		let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+		let key_provider: &Arc<dyn SigningKeyProvider> =
+			self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 
 		// Approve the receipt and answer its challenge (fail-closed
 		// without an approver).
 		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), &receipt).await?;
-		let response_bytes = response.as_ref().map(OctetString::as_bytes);
-		let countersignature =
-			countersign_receipt::<P::Digest>(&receipt, response_bytes, key_provider.as_ref()).await?;
+		let answer = response.as_ref().map(OctetString::as_bytes);
+		let countersignature = countersign_receipt::<P::Digest>(&receipt, answer, key_provider.as_ref()).await?;
 
 		Ok(Some((artifact, countersignature)))
 	}
@@ -562,15 +578,23 @@ where
 		let mut salt = Zeroizing::new([0u8; 64]);
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
-		let session_ciphers = self.derive_directional_aead(base_key, salt.as_slice())?;
+
+		let salt_bytes = salt.as_slice();
+		let session_ciphers = self.derive_directional_aead(base_key, salt_bytes)?;
 
 		// Invariant: AEAD key derivation occurs exactly once after transcript locked
 		self.invariants.derive_aead_once()?;
 
-		// 3. Transition to complete
+		// 3. Seed epoch materials for post-handshake renewal
+		if let Some(transcript_hash) = self.transcript_hash {
+			let materials = derive_epoch_materials::<P>(base_key, salt_bytes, transcript_hash)?;
+			self.epoch_materials = Some(materials);
+		}
+
+		// 4. Transition to complete
 		self.state.transition(ClientHandshakeState::Completed)?;
 
-		// 4. Clear sensitive data in place (Option impl zeroes payload, then None)
+		// 5. Clear sensitive data in place (Option impl zeroes payload, then None)
 		self.base_session_key.zeroize();
 		self.client_random.zeroize();
 		self.server_random.zeroize();
@@ -604,30 +628,20 @@ where
 		self.stored_receipt.as_ref()
 	}
 
+	/// Take the epoch materials seeded at handshake completion.
+	pub fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
+		self.epoch_materials.take()
+	}
+
+	/// Validated server certificate retained for post-handshake epoch renewals.
+	pub fn peer_certificate(&self) -> Option<&Certificate> {
+		self.server_certificate.as_ref()
+	}
+
 	// Helper methods
 
 	fn extract_verifying_key(&self, cert: &Certificate) -> Result<P::VerifyingKey, HandshakeError> {
 		P::VerifyingKey::extract_from_certificate(cert)
-	}
-
-	fn compute_transcript_hash(
-		&self,
-		client_hello: &[u8],
-		server_random: &[u8; 32],
-		spki_bytes: &[u8],
-		accept_der: &[u8],
-		transport_accept_der: &[u8],
-	) -> Result<[u8; 32], HandshakeError> {
-		let mut data = Vec::with_capacity(
-			client_hello.len() + 32 + spki_bytes.len() + accept_der.len() + transport_accept_der.len(),
-		);
-		data.extend_from_slice(client_hello);
-		data.extend_from_slice(server_random);
-		data.extend_from_slice(spki_bytes);
-		data.extend_from_slice(accept_der);
-		data.extend_from_slice(transport_accept_der);
-
-		compute_transcript_digest::<P::Digest>(&data)
 	}
 
 	fn verify_server_signature(
@@ -675,7 +689,8 @@ where
 				.raw_bytes(),
 		)?;
 
-		// TODO decouple OsRng
+		// Ephemeral ECIES randomness comes straight from the OS CSPRNG;
+		// the provider abstraction covers KDF/AEAD, not entropy.
 		let encrypted_message = encrypt::<_, _, _, M, P::Kdf, P::AeadCipher>(
 			&recipient_pubkey,
 			plaintext.as_slice(),
@@ -769,6 +784,16 @@ where
 
 	fn session_receipt(&self) -> Option<&StoredReceipt> {
 		EciesHandshakeClient::session_receipt(self)
+	}
+
+	#[cfg(feature = "x509")]
+	fn peer_certificate(&self) -> Option<&Certificate> {
+		EciesHandshakeClient::peer_certificate(self)
+	}
+
+	#[cfg(feature = "aead")]
+	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
+		EciesHandshakeClient::take_epoch_materials(self)
 	}
 }
 

@@ -11,11 +11,19 @@ pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 ///
 /// Distinct info labels yield independent directional keys from the same
 /// input key material (RFC 5869 domain separation), the same property
-/// TLS 1.3 obtains from per-direction traffic secrets (RFC 8446, 7.1).
+/// TLS 1.3 obtains from per-direction traffic secrets (RFC 9846, 7.1).
 pub const TIGHTBEAM_C2S_KDF_INFO: &[u8] = b"tb/session/kdf/c2s/v1";
 
 /// KDF info string for the server-to-client session key (HKDF)
 pub const TIGHTBEAM_S2C_KDF_INFO: &[u8] = b"tb/session/kdf/s2c/v1";
+
+/// KDF info string for the epoch secret retained for in-band rekeying
+///
+/// Key separation from the traffic keys: the raw handshake secret keeps
+/// its zeroize-at-complete lifecycle while the epoch chain rotates
+/// independently (RFC 9846, § 7.2 requires deleting `secret_N` once
+/// `secret_N+1` is derived).
+pub const TIGHTBEAM_EPOCH_KDF_INFO: &[u8] = b"tb/session/kdf/epoch/v1";
 
 /// KDF info string for CMS KARI (Key Agreement Recipient Info) KEK derivation
 pub const TIGHTBEAM_KARI_KDF_INFO: &[u8] = b"tb/kari/kdf/v1";
@@ -76,11 +84,49 @@ pub const AES_GCM_TAG_SIZE: usize = 16;
 
 /// AEAD record limit per directional key before a rekey is required (2^24)
 ///
-/// [RFC 8446 § 5.5](https://datatracker.ietf.org/doc/html/rfc8446#section-5.5)
-/// bounds AES-GCM near 2^24.5 records per key. No in-band key update:
-/// senders fail closed with `RekeyRequired` (mux drains via GoAway first),
-/// receivers refuse counters past the limit. Override via `with_rekey_limit`.
+/// [RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5)
+/// bounds AES-GCM near 2^24.5 records per key. Senders fail closed with
+/// `RekeyRequired` at their configured limit (receipt-bearing mux
+/// sessions renew in band first, others drain via GoAway), and receivers
+/// refuse counters past this constant volume bound. `with_rekey_limit`
+/// overrides the renewal/drain trigger threshold, never the receive-side
+/// refusal bound.
 pub const DEFAULT_REKEY_RECORD_LIMIT: u64 = 1 << 24;
+
+/// Slack above the mux drain headroom before an in-band renewal opens
+///
+/// Gives the three-leg exchange (request, ack, control) room to finish
+/// before the hard floor parks data; otherwise data parks until install
+/// or the renewal deadline triggers GoAway drain.
+pub const DEFAULT_REKEY_RENEWAL_ALLOWANCE: u64 = 64;
+
+/// Minimum records a server must have received since the last epoch
+/// install before it accepts another `RekeyRequest`
+///
+/// Rekey-flood bound (CWE-400): together with the one-exchange-in-flight
+/// rule this caps how often a client can force the server through
+/// signing and settlement work, the same shape as RFC 9846's limit on
+/// unanswered KeyUpdate messages. Violation is a protocol error.
+pub const DEFAULT_REKEY_MIN_SPEND_RECORDS: u64 = 4;
+
+/// Seconds a rekey initiator waits for the exchange to complete before
+/// draining the connection
+///
+/// Bounds the c2s data park (Ack-to-Done window plus the hard floor)
+/// so a peer that never answers cannot stall the session indefinitely:
+/// expiry converges on the existing GoAway drain path.
+pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
+
+// ============================================================================
+// Serving Constants
+// ============================================================================
+
+/// Concurrent-connection cap for the `server!` async accept loop
+///
+/// Accepting stops while this many connection tasks are alive, so a
+/// connection flood queues in the listener backlog instead of pinning
+/// unbounded tasks and file descriptors (CWE-400).
+pub const DEFAULT_MAX_SERVER_CONNECTIONS: usize = 1024;
 
 // ============================================================================
 // Testing & Verification Constants

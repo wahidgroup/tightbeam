@@ -10,7 +10,11 @@ use tightbeam::{
 	worker, Beamable, Frame, TightBeamError,
 };
 
-use crate::dtn::{chain_processor::ChainProcessor, messages::FrameRequest};
+use crate::dtn::{
+	chain_processor::ChainProcessor,
+	messages::FrameRequest,
+	ultimate::{gap_recovery_event, GapRecoveryStep},
+};
 
 /// Frame request handler request
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -47,7 +51,7 @@ worker! {
 		can_cascade: bool,
 	},
 	handle: |request, trace, config| async move {
-		trace.event(format!("{}_receive_frame_request", request.node_name))?;
+		trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::ReceiveFrameRequest))?;
 
 		// Check if we have the requested frames
 		let missing_frames = config.chain_processor.request_missing_frames(
@@ -57,14 +61,14 @@ worker! {
 
 		if !missing_frames.is_empty() {
 			// We have frames - respond
-			trace.event(format!("{}_send_frame_response", request.node_name))?;
+			trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::SendFrameResponse))?;
 			Ok(FrameRequestHandlerResponse {
 				action: FrameRequestAction::Respond(0),
 				missing_frames,
 			})
 		} else if config.can_cascade {
 			// We don't have frames - cascade upstream
-			trace.event(format!("{}_cascade_frame_request", request.node_name))?;
+			trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::CascadeFrameRequest))?;
 			Ok(FrameRequestHandlerResponse {
 				action: FrameRequestAction::Cascade(0),
 				missing_frames: vec![],

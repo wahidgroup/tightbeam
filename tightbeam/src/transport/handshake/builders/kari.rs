@@ -221,18 +221,9 @@ where
 		self.validate()?;
 
 		// 1-3. Perform ECDH + HKDF + AES Key Wrap via centralized core
-		let sender_priv = self
-			.sender_priv
-			.as_ref()
-			.ok_or_else(|| CmsBuilderError::Builder("sender_priv not set".into()))?;
-		let recipient_pub = self
-			.recipient_pub
-			.as_ref()
-			.ok_or_else(|| CmsBuilderError::Builder("recipient_pub not set".into()))?;
-		let ukm = self
-			.ukm
-			.as_ref()
-			.ok_or_else(|| CmsBuilderError::Builder("ukm not set".into()))?;
+		let sender_priv = self.sender_priv.as_ref().ok_or(KariBuilderError::MissingSenderPrivateKey)?;
+		let recipient_pub = self.recipient_pub.as_ref().ok_or(KariBuilderError::MissingRecipientPublicKey)?;
+		let ukm = self.ukm.as_ref().ok_or(KariBuilderError::MissingUkm)?;
 		let encrypted_key_bytes = kari_wrap(
 			&self.provider,
 			sender_priv,
@@ -247,10 +238,7 @@ where
 
 		// 5. Build RecipientEncryptedKey
 		let rek = RecipientEncryptedKey {
-			rid: self
-				.recipient_rid
-				.take()
-				.ok_or_else(|| CmsBuilderError::Builder("recipient_rid not set".into()))?,
+			rid: self.recipient_rid.take().ok_or(KariBuilderError::MissingRecipientIdentifier)?,
 			enc_key: encrypted_key,
 		};
 
@@ -262,10 +250,7 @@ where
 			version: CmsVersion::V3,
 			originator,
 			ukm: self.ukm.take(),
-			key_enc_alg: self
-				.key_enc_alg
-				.take()
-				.ok_or_else(|| CmsBuilderError::Builder("key_enc_alg not set".into()))?,
+			key_enc_alg: self.key_enc_alg.take().ok_or(KariBuilderError::MissingKeyEncryptionAlgorithm)?,
 			recipient_enc_keys: vec![rek],
 		};
 
@@ -304,11 +289,9 @@ mod tests {
 	#[test]
 	fn test_validation() {
 		let builder = TightBeamKariBuilder::<DefaultCryptoProvider>::default();
-
 		// Should fail validation with all None fields
 		let result = builder.validate();
-		assert!(result.is_err());
-		assert!(matches!(result.unwrap_err(), KariBuilderError::MissingSenderPrivateKey));
+		assert!(matches!(result, Err(KariBuilderError::MissingSenderPrivateKey)));
 	}
 
 	#[test]
@@ -353,8 +336,7 @@ mod tests {
 		// Verify it has the right algorithm OID (EC public key)
 		assert_eq!(orig_key.algorithm.oid, ObjectIdentifier::new_unwrap("1.2.840.10045.2.1"));
 		// Verify UKM is present
-		assert!(kari.ukm.is_some());
-		assert_eq!(kari.ukm.as_ref().unwrap().as_bytes().len(), 64);
+		assert!(matches!(kari.ukm.as_ref(), Some(ukm) if ukm.as_bytes().len() == 64));
 		// Verify key encryption algorithm
 		assert_eq!(kari.key_enc_alg.oid, ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"));
 		// Verify encrypted key is present and longer than CEK (due to RFC 3394 wrapping)

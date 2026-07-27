@@ -113,19 +113,19 @@ impl Process {
 	) -> Result<Process, CompositionError> {
 		let builder = p.observable.iter().fold(
 			Process::builder(name).initial_state(State::product(p.initial, q.initial)),
-			|b, event| b.add_observable(event.0),
+			|b, event| b.add_observable(event),
 		);
-		let builder = p.hidden.iter().fold(builder, |b, event| b.add_hidden(event.0));
+		let builder = p.hidden.iter().fold(builder, |b, event| b.add_hidden(event));
 		let builder = q
 			.observable
 			.iter()
 			.filter(|event| !p.observable.contains(event) && !p.hidden.contains(event))
-			.fold(builder, |b, event| b.add_observable(event.0));
+			.fold(builder, |b, event| b.add_observable(event));
 		let builder = q
 			.hidden
 			.iter()
 			.filter(|event| !p.observable.contains(event) && !p.hidden.contains(event))
-			.fold(builder, |b, event| b.add_hidden(event.0));
+			.fold(builder, |b, event| b.add_hidden(event));
 
 		// Collect all transitions into a vec to avoid complex nested closures
 		let mut all_transitions = Vec::new();
@@ -163,7 +163,7 @@ impl Process {
 		}
 
 		let builder = all_transitions.into_iter().fold(builder, |b, (state, event, target)| {
-			b.add_state(state).add_state(target).add_transition(state, event.0, target)
+			b.add_state(state).add_state(target).add_transition(state, event, target)
 		});
 
 		let builder = p
@@ -193,9 +193,9 @@ mod tests {
 			.initial_state(State("p0"))
 			.add_state(State("p0"))
 			.add_state(State("p1"))
-			.add_observable("a")
-			.add_observable("b")
-			.add_transition(State("p0"), "a", State("p1"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_transition(State("p0"), Event("a"), State("p1"))
 			.add_terminal(State("p1"))
 			.build()
 			.expect("Failed to build process P")
@@ -206,9 +206,9 @@ mod tests {
 			.initial_state(State("q0"))
 			.add_state(State("q0"))
 			.add_state(State("q1"))
-			.add_observable("b")
-			.add_observable("c")
-			.add_transition(State("q0"), "b", State("q1"))
+			.add_observable(Event("b"))
+			.add_observable(Event("c"))
+			.add_transition(State("q0"), Event("b"), State("q1"))
 			.add_terminal(State("q1"))
 			.build()
 			.expect("Failed to build process Q")
@@ -222,7 +222,6 @@ mod tests {
 		let composed = Process::synchronized_parallel(&p, &q)?;
 		assert_eq!(composed.name, "(P || Q)");
 		assert!(composed.states.len() >= 2);
-
 		Ok(())
 	}
 
@@ -234,7 +233,6 @@ mod tests {
 		let composed = Process::interleaved_parallel(&p, &q)?;
 		assert_eq!(composed.name, "(P ||| Q)");
 		assert!(composed.states.len() >= 2);
-
 		Ok(())
 	}
 
@@ -247,7 +245,6 @@ mod tests {
 		let composed = Process::interface_parallel(&p, &q, sync_alphabet)?;
 		assert_eq!(composed.name, "(P [|A|] Q)");
 		assert!(composed.states.len() >= 2);
-
 		Ok(())
 	}
 
@@ -268,25 +265,24 @@ mod tests {
 	fn parallel_composition_preserves_hidden_alphabet() -> Result<(), Box<dyn core::error::Error>> {
 		let p = Process::builder("P")
 			.initial_state(State("p0"))
-			.add_observable("a")
-			.add_hidden("tau_p")
-			.add_transition(State("p0"), "tau_p", State("p1"))
-			.add_transition(State("p1"), "a", State("p2"))
+			.add_observable(Event("a"))
+			.add_hidden(Event("tau_p"))
+			.add_transition(State("p0"), Event("tau_p"), State("p1"))
+			.add_transition(State("p1"), Event("a"), State("p2"))
 			.add_terminal(State("p2"))
 			.build()?;
 		let q = Process::builder("Q")
 			.initial_state(State("q0"))
-			.add_observable("b")
-			.add_hidden("tau_q")
-			.add_transition(State("q0"), "tau_q", State("q1"))
-			.add_transition(State("q1"), "b", State("q2"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("tau_q"))
+			.add_transition(State("q0"), Event("tau_q"), State("q1"))
+			.add_transition(State("q1"), Event("b"), State("q2"))
 			.add_terminal(State("q2"))
 			.build()?;
 
 		let synchronized = Process::synchronized_parallel(&p, &q)?;
 		let interleaved = Process::interleaved_parallel(&p, &q)?;
 		let interface = Process::interface_parallel(&p, &q, HashSet::new())?;
-
 		for composed in [synchronized, interleaved, interface] {
 			assert!(composed.hidden.contains(&Event("tau_p")));
 			assert!(composed.hidden.contains(&Event("tau_q")));
