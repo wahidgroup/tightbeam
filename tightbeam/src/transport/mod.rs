@@ -55,10 +55,10 @@ pub use builders::{EnvelopeBuilder, EnvelopeLimits};
 pub use client::GenericClient;
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
-pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO, Pingable};
+pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO};
 pub use messaging::{MessageCollector, ResponseHandler, Transport};
 pub use protocols::{
-	AsyncListenerTrait, EncryptedProtocol, Mycelial, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
+	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
 	X509ClientConfig,
 };
 

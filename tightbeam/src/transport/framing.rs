@@ -12,6 +12,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use core::mem;
+#[cfg(feature = "std")]
+use std::io::ErrorKind;
+
+use crate::transport::error::TransportError;
 
 /// Shape of a DER length field, classified from its first octet.
 pub(crate) enum LengthForm {
@@ -61,6 +65,35 @@ pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<u
 	}
 
 	Some(length)
+}
+
+/// Classify a byte-read failure at a frame boundary.
+///
+/// EOF before the first byte of a frame is the peer hanging up cleanly
+/// between messages: [`TransportError::ConnectionClosed`], which
+/// `try_read_decoded_envelope` maps to `Ok(None)`. Everything else passes
+/// through unchanged.
+pub(crate) fn classify_boundary_error(error: TransportError) -> TransportError {
+	#[cfg(feature = "std")]
+	if matches!(&error, TransportError::IoError(io) if io.kind() == ErrorKind::UnexpectedEof) {
+		return TransportError::ConnectionClosed;
+	}
+
+	error
+}
+
+/// Classify a byte-read failure inside a frame.
+///
+/// EOF after the frame started is a truncated message, never a clean
+/// close: [`TransportError::InvalidMessage`]. Everything else passes
+/// through unchanged.
+pub(crate) fn classify_truncation_error(error: TransportError) -> TransportError {
+	match &error {
+		TransportError::ConnectionClosed => TransportError::InvalidMessage,
+		#[cfg(feature = "std")]
+		TransportError::IoError(io) if io.kind() == ErrorKind::UnexpectedEof => TransportError::InvalidMessage,
+		_ => error,
+	}
 }
 
 /// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
@@ -116,6 +149,34 @@ mod tests {
 		}
 		for &(first, count) in LENGTH_FORM_LONG_CASES {
 			assert!(matches!(LengthForm::from(first), LengthForm::Long(len) if len == count));
+		}
+	}
+
+	#[cfg(feature = "std")]
+	#[test]
+	fn boundary_classification_maps_eof_to_clean_close() {
+		let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
+		assert!(matches!(classify_boundary_error(eof), TransportError::ConnectionClosed));
+
+		let reset = TransportError::IoError(ErrorKind::ConnectionReset.into());
+		assert!(matches!(classify_boundary_error(reset), TransportError::IoError(_)));
+	}
+
+	#[test]
+	fn truncation_classification_maps_eof_to_invalid_message() {
+		assert!(matches!(
+			classify_truncation_error(TransportError::ConnectionClosed),
+			TransportError::InvalidMessage
+		));
+		assert!(matches!(
+			classify_truncation_error(TransportError::ConnectionFailed),
+			TransportError::ConnectionFailed
+		));
+
+		#[cfg(feature = "std")]
+		{
+			let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
+			assert!(matches!(classify_truncation_error(eof), TransportError::InvalidMessage));
 		}
 	}
 

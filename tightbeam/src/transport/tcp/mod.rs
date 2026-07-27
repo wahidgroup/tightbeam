@@ -28,7 +28,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(feature = "std")]
 use crate::transport::TightBeamAddress;
 #[cfg(feature = "tcp")]
-use crate::transport::{tcp::sync::TcpTransport, Mycelial, Protocol, ProtocolStream};
+use crate::transport::{tcp::sync::TcpTransport, Protocol, ProtocolStream};
 
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub mod r#async;
@@ -79,23 +79,9 @@ impl Protocol for TcpListener {
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
 		TcpTransport::from(stream)
 	}
-
-	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
-		Ok(TightBeamSocketAddr(self.local_addr()?))
-	}
 }
 
 // The EncryptedProtocol impl for sync TCP lives on the wrapper in sync.rs
-
-#[cfg(all(feature = "std", feature = "tcp"))]
-impl Mycelial for TcpListener {
-	async fn try_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let addr = "0.0.0.0:0"
-			.parse::<TightBeamSocketAddr>()
-			.map_err(|e| IoError::new(ErrorKind::InvalidInput, e))?;
-		<TcpListener as Protocol>::bind(addr).await
-	}
-}
 
 #[cfg(all(feature = "std", feature = "tcp"))]
 impl TcpListenerTrait for TcpListener {
@@ -506,13 +492,18 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
+		// Without x509 there is no encryption-aware override, so the
+		// default single-flight collector applies; the gate items only
+		// exist under transport-policy.
+		#[cfg(not(all(feature = "x509", feature = "transport-policy")))]
 		impl<S: $stream_trait> $crate::transport::MessageCollector for $transport<S>
 		where
 			TransportError: From<S::Error>,
 		{
+			#[cfg(feature = "transport-policy")]
 			type CollectorGate = dyn GatePolicy;
 
+			#[cfg(feature = "transport-policy")]
 			fn collector_gate(&self) -> &Self::CollectorGate {
 				&self.collector_gate
 			}
@@ -533,12 +524,6 @@ macro_rules! impl_tcp_common {
 
 		#[cfg(not(feature = "transport-policy"))]
 		impl<S: $stream_trait> $crate::transport::MessageEmitter for $transport<S>
-		where
-			TransportError: From<S::Error>
-		{}
-
-		#[cfg(not(feature = "transport-policy"))]
-		impl<S: $stream_trait> $crate::transport::MessageCollector for $transport<S>
 		where
 			TransportError: From<S::Error>
 		{}

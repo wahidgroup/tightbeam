@@ -1,4 +1,5 @@
 use core::time::Duration;
+#[cfg(feature = "tokio")]
 use std::io::Error as IoError;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ mod tokio_rt {
 
 	pub use crate::transport::protocols::PersistentConnection;
 	pub use crate::transport::tcp::TightBeamSocketAddr;
-	pub use crate::transport::{AsyncListenerTrait, Mycelial, Protocol};
+	pub use crate::transport::{AsyncListenerTrait, Protocol};
 	pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
 	pub use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 	pub use tokio::net::{TcpListener, TcpStream};
@@ -38,8 +39,8 @@ use crate::transport::protocols::{
 use crate::transport::tcp::HANDSHAKE_MAX_WIRE;
 use crate::transport::ResponsePackage;
 use crate::transport::{
-	EnvelopeBuilder, EnvelopeLimits, MessageCollector, MessageEmitter, MessageIO, Pingable, TransportError,
-	TransportResult, WireMode,
+	EnvelopeBuilder, EnvelopeLimits, MessageCollector, MessageEmitter, MessageIO, TransportError, TransportResult,
+	WireMode,
 };
 use crate::Frame;
 use crate::TightBeamError;
@@ -306,10 +307,6 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TokioListener<P> {
 
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
 		TcpTransport::from(stream)
-	}
-
-	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
-		Ok(TightBeamSocketAddr(self.local_addr()?))
 	}
 }
 
@@ -909,30 +906,6 @@ impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
 		}
 
 		Ok((transport, TightBeamSocketAddr(peer_addr)))
-	}
-}
-
-#[cfg(feature = "tokio")]
-impl<P: CryptoProvider + Send + Sync> Mycelial for TokioListener<P> {
-	async fn try_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let addr = "0.0.0.0:0"
-			.parse::<TightBeamSocketAddr>()
-			.map_err(|e| IoError::new(ErrorKind::InvalidInput, e))?;
-		<TokioListener<P> as Protocol>::bind(addr).await
-	}
-}
-
-impl<S: AsyncProtocolStream> Pingable for TcpTransport<S>
-where
-	TransportError: From<S::Error>,
-	TransportError: From<IoError>,
-{
-	fn ping(&mut self) -> TransportResult<()> {
-		if self.stream.is_alive() {
-			Ok(())
-		} else {
-			Err(TransportError::ConnectionClosed)
-		}
 	}
 }
 

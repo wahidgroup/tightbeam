@@ -21,7 +21,9 @@ use crate::transport::error::TransportError;
 #[cfg(all(feature = "x509", feature = "instrument"))]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
-use crate::transport::framing::{parse_der_length, reconstruct_der_encoding, LengthForm};
+use crate::transport::framing::{
+	classify_boundary_error, classify_truncation_error, parse_der_length, reconstruct_der_encoding, LengthForm,
+};
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::TransportResult;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
@@ -83,9 +85,6 @@ pub trait Protocol {
 
 	/// Create transport from stream
 	fn create_transport(stream: Self::Stream) -> Self::Transport;
-
-	/// Bound address for this listener/endpoint.
-	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error>;
 }
 
 #[cfg(feature = "x509")]
@@ -135,13 +134,6 @@ pub trait X509ClientConfig: Sized {
 	/// (handshake, mux plane) by the transport.
 	#[cfg(feature = "instrument")]
 	fn with_trace(self, trace: TraceCollector) -> Self;
-}
-
-/// This protocol can operate as a mycelial network (ie. TCP SocketAddress)
-pub trait Mycelial: Protocol {
-	fn try_available_connect(
-		&self,
-	) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
 }
 
 /// Async listener trait
@@ -280,18 +272,29 @@ async fn read_der_frame<R>(stream: &mut R, max_len: Option<usize>) -> TransportR
 where
 	R: AsyncByteRead + ?Sized,
 {
+	// EOF before the tag is the peer closing between frames; EOF anywhere
+	// after it is a truncated frame.
 	let mut tag = [0u8; 1];
-	stream.read_exact(&mut tag).await.map_err(Into::into)?;
+	stream
+		.read_exact(&mut tag)
+		.await
+		.map_err(|e| classify_boundary_error(e.into()))?;
 
 	let mut length_first = [0u8; 1];
-	stream.read_exact(&mut length_first).await.map_err(Into::into)?;
+	stream
+		.read_exact(&mut length_first)
+		.await
+		.map_err(|e| classify_truncation_error(e.into()))?;
 
 	let (length_octets, content_length) = match LengthForm::from(length_first[0]) {
 		LengthForm::Short(length) => (Vec::new(), length),
 		LengthForm::Long(octet_count) => {
 			let mut length_octets = vec![0u8; octet_count];
 
-			stream.read_exact(&mut length_octets).await.map_err(Into::into)?;
+			stream
+				.read_exact(&mut length_octets)
+				.await
+				.map_err(|e| classify_truncation_error(e.into()))?;
 
 			let length = parse_der_length(length_first[0], &length_octets).ok_or(TransportError::InvalidMessage)?;
 			(length_octets, length)
@@ -305,7 +308,10 @@ where
 	}
 
 	let mut content = vec![0u8; content_length];
-	stream.read_exact(&mut content).await.map_err(Into::into)?;
+	stream
+		.read_exact(&mut content)
+		.await
+		.map_err(|e| classify_truncation_error(e.into()))?;
 
 	Ok(reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content))
 }
@@ -353,11 +359,14 @@ pub trait PersistentConnection: Protocol {
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
+	use std::io::{Error as IoError, ErrorKind};
+
 	use super::*;
 
 	/// Byte-level fixture replaying a scripted wire image; implements
 	/// only the byte traits, so every frame below is recovered by the
-	/// blanket impls.
+	/// blanket impls. Exhaustion surfaces as `UnexpectedEof`, matching
+	/// real byte transports.
 	struct ScriptedBytes {
 		data: Vec<u8>,
 		pos: usize,
@@ -375,7 +384,10 @@ mod tests {
 
 		async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
 			let end = self.pos + buf.len();
-			let chunk = self.data.get(self.pos..end).ok_or(TransportError::ConnectionClosed)?;
+			let chunk = self
+				.data
+				.get(self.pos..end)
+				.ok_or_else(|| TransportError::IoError(IoError::from(ErrorKind::UnexpectedEof)))?;
 			buf.copy_from_slice(chunk);
 			self.pos = end;
 			Ok(())
@@ -436,11 +448,30 @@ mod tests {
 
 	#[tokio::test]
 	async fn blanket_rejects_over_cap_before_reading_content() {
-		// Header only: reading content would surface ConnectionClosed,
-		// so InvalidMessage proves the cap fired before allocation.
 		let mut stream = ScriptedBytes::new(&[0x30, 0x82, 0x01, 0x00]);
 
 		let result = AsyncProtocolStream::read_frame(&mut stream, Some(64)).await;
+		assert!(matches!(result, Err(TransportError::InvalidMessage)));
+		// Only the header was consumed: the cap fired before any content
+		// allocation or read.
+		assert_eq!(stream.pos, 4);
+	}
+
+	#[tokio::test]
+	async fn boundary_eof_maps_to_connection_closed() {
+		let mut stream = ScriptedBytes::new(&[]);
+
+		let result = AsyncProtocolStream::read_frame(&mut stream, None).await;
+		assert!(matches!(result, Err(TransportError::ConnectionClosed)));
+	}
+
+	#[tokio::test]
+	async fn truncated_frame_maps_to_invalid_message() {
+		// Frame promises three content bytes, delivers one: EOF mid-frame
+		// is truncation, not a clean close.
+		let mut stream = ScriptedBytes::new(&[0x30, 0x03, 0x01]);
+
+		let result = AsyncProtocolStream::read_frame(&mut stream, None).await;
 		assert!(matches!(result, Err(TransportError::InvalidMessage)));
 	}
 

@@ -1276,12 +1276,6 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 }
 
-/// Trait for checking transport connectivity
-pub trait Pingable {
-	/// Ping the transport layer to check connectivity
-	fn ping(&mut self) -> TransportResult<()>;
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;

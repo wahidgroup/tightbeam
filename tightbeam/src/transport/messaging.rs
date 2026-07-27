@@ -356,16 +356,39 @@ where
 	transport.write_envelope(&response_bytes).await
 }
 
-/// Message collector trait - receives TightBeam messages
+/// Everything a message collector must already be.
+///
+/// Exists because supertraits cannot be feature-gated inline: with
+/// `transport-policy` every collector must also expose an audit trail
+/// ([`GateAudit`]) for gate-verdict recording. The blanket impl satisfies
+/// the requirement automatically; implementers never name this trait.
 #[cfg(feature = "transport-policy")]
-pub trait MessageCollector: MessageIO + GateAudit {
+pub trait CollectorRequirements: MessageIO + GateAudit {}
+
+#[cfg(feature = "transport-policy")]
+impl<T: MessageIO + GateAudit> CollectorRequirements for T {}
+
+/// Everything a message collector must already be (no audit trail
+/// requirement without `transport-policy`).
+#[cfg(not(feature = "transport-policy"))]
+pub trait CollectorRequirements: MessageIO {}
+
+#[cfg(not(feature = "transport-policy"))]
+impl<T: MessageIO> CollectorRequirements for T {}
+
+/// Message collector trait - receives TightBeam messages
+pub trait MessageCollector: CollectorRequirements {
+	/// Gate policy consulted for every collected message.
+	#[cfg(feature = "transport-policy")]
 	type CollectorGate: GatePolicy + ?Sized;
 
 	/// Get the collector gate policy instance
+	#[cfg(feature = "transport-policy")]
 	fn collector_gate(&self) -> &Self::CollectorGate;
 
 	/// Read and validate a message without sending a response
 	/// Returns the message and the gate evaluation status
+	#[cfg(feature = "transport-policy")]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
 		// Read and decode the envelope (can be overridden for encryption)
@@ -374,10 +397,22 @@ pub trait MessageCollector: MessageIO + GateAudit {
 		gate_collected_envelope(self, decoded_envelope, &SessionContext::default())
 	}
 
+	/// Read and validate a message without sending a response
+	/// Returns the message (status is always Ok without policies)
+	#[cfg(not(feature = "transport-policy"))]
+	#[allow(async_fn_in_trait)]
+	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
+		let request_envelope = self.read_decoded_envelope().await?;
+		let request = single_flight_frame(request_envelope)?;
+
+		Ok((request, TransitStatus::Ok))
+	}
+
 	/// Try to collect next message without blocking on closed connections
 	///
 	/// Returns Ok(None) if connection closed gracefully (EOF).
 	/// Returns Err if connection failed unexpectedly.
+	#[cfg(feature = "transport-policy")]
 	#[allow(async_fn_in_trait)]
 	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
 		// Try to read envelope (returns None on graceful close)
@@ -389,6 +424,23 @@ pub trait MessageCollector: MessageIO + GateAudit {
 		// Cleartext connections authenticate nothing: empty context.
 		let gated = gate_collected_envelope(self, decoded_envelope, &SessionContext::default())?;
 		Ok(Some(gated))
+	}
+
+	/// Try to collect next message without blocking on closed connections
+	///
+	/// Returns Ok(None) if connection closed gracefully (EOF).
+	/// Returns Err if connection failed unexpectedly.
+	#[cfg(not(feature = "transport-policy"))]
+	#[allow(async_fn_in_trait)]
+	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
+		// Try to read envelope (returns None on graceful close)
+		let request_envelope = match self.try_read_decoded_envelope().await? {
+			Some(envelope) => envelope,
+			None => return Ok(None), // Connection closed gracefully
+		};
+
+		let request = single_flight_frame(request_envelope)?;
+		Ok(Some((request, TransitStatus::Ok)))
 	}
 
 	/// Send a response for a previously collected message
@@ -423,7 +475,7 @@ pub trait MessageCollector: MessageIO + GateAudit {
 	}
 
 	/// X509-enabled collect_message with encryption and handshake support
-	#[cfg(feature = "transport-ecies")]
+	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
@@ -453,7 +505,11 @@ pub trait MessageCollector: MessageIO + GateAudit {
 	///
 	/// Trait where-clauses do not elaborate to callers, so the method is
 	/// declared per feature combination with that build's predicate set.
-	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
+	#[cfg(all(
+		feature = "transport-policy",
+		not(feature = "transport-ecies"),
+		feature = "transport-cms"
+	))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
@@ -587,77 +643,9 @@ where
 	Ok((request, status))
 }
 
-#[cfg(not(feature = "transport-policy"))]
-pub trait MessageCollector: MessageIO {
-	/// Read and validate a message without sending a response
-	/// Returns the message (status is always Ok without policies)
-	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
-		let request_envelope = self.read_decoded_envelope().await?;
-		let request = single_flight_frame(request_envelope)?;
-
-		Ok((request, TransitStatus::Ok))
-	}
-
-	/// Try to collect next message without blocking on closed connections
-	///
-	/// Returns Ok(None) if connection closed gracefully (EOF).
-	/// Returns Err if connection failed unexpectedly.
-	#[allow(async_fn_in_trait)]
-	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
-		// Try to read envelope (returns None on graceful close)
-		let request_envelope = match self.try_read_decoded_envelope().await? {
-			Some(envelope) => envelope,
-			None => return Ok(None), // Connection closed gracefully
-		};
-
-		let request = single_flight_frame(request_envelope)?;
-		Ok(Some((request, TransitStatus::Ok)))
-	}
-
-	/// Send a response for a previously collected message
-	#[allow(async_fn_in_trait)]
-	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		send_single_flight_response(self, status, message).await
-	}
-
-	/// Handle incoming request: collect message, process it, and send response
-	#[allow(async_fn_in_trait)]
-	async fn handle_request(&mut self) -> TransportResult<()> {
-		let (request, status) = match self.collect_message().await {
-			Ok(result) => result,
-			#[cfg(feature = "x509")]
-			Err(TransportError::MissingEncryption) => {
-				// Client sent unencrypted message when encryption required
-				self.send_response(TransitStatus::PermissionDenied, None).await?;
-				return Ok(());
-			}
-			Err(e) => return Err(e),
-		};
-
-		let message = if status == TransitStatus::Ok {
-			// If the gate accepted it, handle the message
-			self.handle_message(request)
-		} else {
-			// If not accepted, no response message
-			None
-		};
-
-		self.send_response(status, message).await
-	}
-}
-
 /// Bidirectional transport combines emitter and collector
-#[cfg(feature = "transport-policy")]
 pub trait Transport: MessageEmitter + MessageCollector {}
 
-#[cfg(feature = "transport-policy")]
-impl<T> Transport for T where T: MessageEmitter + MessageCollector {}
-
-#[cfg(not(feature = "transport-policy"))]
-pub trait Transport: MessageEmitter + MessageCollector {}
-
-#[cfg(not(feature = "transport-policy"))]
 impl<T> Transport for T where T: MessageEmitter + MessageCollector {}
 
 #[cfg(all(test, feature = "transport-policy", feature = "instrument", feature = "testing"))]

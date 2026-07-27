@@ -23,7 +23,9 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
-use crate::transport::framing::{parse_der_length, reconstruct_der_encoding, LengthForm};
+use crate::transport::framing::{
+	classify_boundary_error, classify_truncation_error, parse_der_length, reconstruct_der_encoding, LengthForm,
+};
 use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
 use crate::transport::handshake::{
@@ -32,8 +34,8 @@ use crate::transport::handshake::{
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr, HANDSHAKE_MAX_WIRE};
 use crate::transport::{
-	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageEmitter, MessageIO, Pingable, Protocol,
-	ResponsePackage, TransportEncryptionConfig, TransportResult,
+	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageEmitter, MessageIO, Protocol, ResponsePackage,
+	TransportEncryptionConfig, TransportResult,
 };
 use crate::x509::Certificate;
 use crate::Frame;
@@ -55,16 +57,6 @@ mod policy {
 
 #[cfg(feature = "transport-policy")]
 use policy::*;
-
-impl<S: ProtocolStream> Pingable for TcpTransport<S>
-where
-	TransportError: From<S::Error>,
-{
-	fn ping(&mut self) -> TransportResult<()> {
-		// Try to write zero bytes to check if the connection is alive
-		self.stream.write_all(&[]).map_err(|e| e.into())
-	}
-}
 
 // Generates the TcpTransport struct definition and common implementations
 crate::impl_tcp_common!(TcpTransport, ProtocolStream);
@@ -126,14 +118,20 @@ where
 			#[cfg(feature = "std")]
 			self.arm_read_deadline(deadline)?;
 
+			// EOF before the tag is the peer closing between frames; EOF
+			// anywhere after it is a truncated frame.
 			let mut tag_byte = [0u8; 1];
-			self.stream.read_exact(&mut tag_byte)?;
+			self.stream
+				.read_exact(&mut tag_byte)
+				.map_err(|e| classify_boundary_error(e.into()))?;
 
 			#[cfg(feature = "std")]
 			self.arm_read_deadline(deadline)?;
 
 			let mut length_first = [0u8; 1];
-			self.stream.read_exact(&mut length_first)?;
+			self.stream
+				.read_exact(&mut length_first)
+				.map_err(|e| classify_truncation_error(e.into()))?;
 
 			let (length_octets, content_length) = match LengthForm::from(length_first[0]) {
 				LengthForm::Short(length) => (vec![], length),
@@ -143,7 +141,9 @@ where
 					#[cfg(feature = "std")]
 					self.arm_read_deadline(deadline)?;
 
-					self.stream.read_exact(&mut length_octets)?;
+					self.stream
+						.read_exact(&mut length_octets)
+						.map_err(|e| classify_truncation_error(e.into()))?;
 
 					let length =
 						parse_der_length(length_first[0], &length_octets).ok_or(TransportError::InvalidMessage)?;
@@ -186,15 +186,21 @@ where
 						self.arm_read_deadline(deadline)?;
 
 						let end = usize::min(filled + slice_len, content_length);
-						self.stream.read_exact(&mut content[filled..end])?;
+						self.stream
+							.read_exact(&mut content[filled..end])
+							.map_err(|e| classify_truncation_error(e.into()))?;
 						filled = end;
 					}
 				} else {
-					self.stream.read_exact(&mut content)?;
+					self.stream
+						.read_exact(&mut content)
+						.map_err(|e| classify_truncation_error(e.into()))?;
 				}
 			}
 			#[cfg(not(feature = "std"))]
-			self.stream.read_exact(&mut content)?;
+			self.stream
+				.read_exact(&mut content)
+				.map_err(|e| classify_truncation_error(e.into()))?;
 
 			let buffer = reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
 			Ok(buffer)
@@ -372,10 +378,6 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<NetTcpListener, P
 
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
 		TcpTransport::from(stream)
-	}
-
-	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
-		Ok(TightBeamSocketAddr(self.listener.local_addr()?))
 	}
 }
 
