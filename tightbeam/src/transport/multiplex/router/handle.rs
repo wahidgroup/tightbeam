@@ -19,7 +19,7 @@ use crate::transport::envelopes::{
 	GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxPingPackage, ResponsePackage, TransportEnvelope,
 };
 use crate::transport::error::TransportFailure;
-use crate::transport::multiplex::{MultiplexedProtocol, StreamId};
+use crate::transport::multiplex::{MultiplexedProtocol, StreamId, StreamingProtocol};
 use crate::transport::{TransportError, TransportResult};
 use crate::utils::marker::MaybeSend;
 use crate::Frame;
@@ -447,6 +447,18 @@ impl MultiplexedProtocol for MuxHandle {
 
 	fn close_stream(&self, stream_id: StreamId) {
 		MuxHandle::close_stream(self, stream_id);
+	}
+}
+
+impl StreamingProtocol for MuxHandle {
+	fn open_stream(
+		&self,
+	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
+		MuxHandle::open_stream(self)
+	}
+
+	fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
+		MuxHandle::open_duplex(self)
 	}
 }
 

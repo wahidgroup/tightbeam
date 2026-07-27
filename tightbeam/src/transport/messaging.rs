@@ -116,17 +116,6 @@ where
 	status
 }
 
-/// Trait for transports that support custom response handlers
-pub trait ResponseHandler {
-	/// Set a handler that processes incoming messages and generates responses
-	fn with_handler<F>(self, handler: F) -> Self
-	where
-		F: Fn(Frame) -> Option<Frame> + Send + Sync + 'static;
-
-	/// Get the current handler if one is set
-	fn handler(&self) -> Option<&(dyn Fn(Frame) -> Option<Frame> + Send + Sync)>;
-}
-
 #[cfg(feature = "transport-policy")]
 #[derive(Debug)]
 /// Helper that represents a physical letter being routed through retries.
@@ -289,10 +278,10 @@ pub trait MessageEmitter: MessageIO {
 		let envelope = TransportEnvelope::Request(RequestPackage { message });
 
 		// Send the envelope
-		self.write_envelope(&envelope.to_der()?).await?;
+		self.write_envelope_bytes(&envelope.to_der()?).await?;
 
 		// Receive response
-		let response_bytes = self.read_envelope().await?;
+		let response_bytes = self.read_envelope_bytes().await?;
 		let response_envelope = Self::decode_envelope(&response_bytes)?;
 
 		// Parse response
@@ -353,7 +342,7 @@ where
 	#[cfg(not(feature = "x509"))]
 	let response_bytes = T::encode_envelope(&response_envelope)?;
 
-	transport.write_envelope(&response_bytes).await
+	transport.write_envelope_bytes(&response_bytes).await
 }
 
 /// Everything a message collector must already be.
@@ -449,31 +438,6 @@ pub trait MessageCollector: CollectorRequirements {
 		send_single_flight_response(self, status, message).await
 	}
 
-	/// Handle incoming request: collect message, process it, and send response
-	#[allow(async_fn_in_trait)]
-	async fn handle_request(&mut self) -> TransportResult<()> {
-		let (request, status) = match self.collect_message().await {
-			Ok(result) => result,
-			#[cfg(feature = "x509")]
-			Err(TransportError::MissingEncryption) => {
-				// Client sent unencrypted message when encryption required
-				self.send_response(TransitStatus::PermissionDenied, None).await?;
-				return Ok(());
-			}
-			Err(e) => return Err(e),
-		};
-
-		let message = if status == TransitStatus::Ok {
-			// If the gate accepted it, handle the message
-			self.handle_message(request)
-		} else {
-			// If not accepted, no response message
-			None
-		};
-
-		self.send_response(status, message).await
-	}
-
 	/// X509-enabled collect_message with encryption and handshake support
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
@@ -561,7 +525,7 @@ where
 {
 	// Read wire envelope
 	// Enforce size ceilings
-	let wire_bytes = transport.read_envelope().await?;
+	let wire_bytes = transport.read_envelope_bytes().await?;
 	let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 	match &wire_envelope {
 		WireEnvelope::Cleartext(_) => {

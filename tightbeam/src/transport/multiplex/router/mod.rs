@@ -25,3 +25,6 @@ pub use responder::MuxResponder;
 pub use sink::{ReplySink, RequestSink};
 pub use transport::MuxTransport;
 pub use writer::MuxWriterDriver;
+
+#[cfg(feature = "tokio")]
+pub use transport::SpawnedMux;

@@ -337,8 +337,6 @@ mod tests {
 		Ok(())
 	}
 
-	// The Stream view mirrors chunk(): Ok items, then fused None
-	// after the clean end.
 	#[test]
 	fn test_stream_body_stream_impl_yields_then_fuses() {
 		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);

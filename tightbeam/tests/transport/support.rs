@@ -16,8 +16,6 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "transport-multiplex")]
-use tightbeam::transport::handshake::receipt::StoredReceipt;
-#[cfg(feature = "transport-multiplex")]
 use tokio::time::{sleep, timeout};
 
 use tightbeam::crypto::hash::Sha3_256;
@@ -25,6 +23,7 @@ use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::der::{Decode, Encode};
+use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::create_v0_tightbeam;
 use tightbeam::trace::TraceCollector;
@@ -34,12 +33,16 @@ use tightbeam::transport::handshake::{HandshakeKeyManager, TcpHandshakeState};
 use tightbeam::transport::state::EncryptedProtocolState;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
-	EncryptedMessageIO, EncryptedProtocol, MessageIO, TransportEncryptionConfig, WireEnvelope, X509ClientConfig,
+	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO, TransportEncryptionConfig, TransportError,
+	WireEnvelope, X509ClientConfig,
 };
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
 use tightbeam::Frame;
 use tightbeam::TightBeamError;
+
+#[cfg(feature = "transport-multiplex")]
+use tightbeam::transport::handshake::receipt::StoredReceipt;
 
 use crate::common::security::{expectation_failure, pinning_validator, ClientMaterials, ServerMaterials};
 
@@ -60,6 +63,18 @@ where
 	.await;
 
 	rotated.ok()
+}
+
+/// Serve one single-flight request by echoing the accepted frame back,
+/// answering with the gate's status.
+pub async fn respond_echo<T: MessageCollector>(mut transport: T) -> Result<(), TransportError> {
+	let (request, status) = transport.collect_message().await?;
+	let message = match status {
+		TransitStatus::Ok => Some(Arc::try_unwrap(request).unwrap_or_else(|shared| (*shared).clone())),
+		_ => None,
+	};
+
+	transport.send_response(status, message).await
 }
 
 /// A small labeled frame for multiplexed exchanges.
@@ -130,6 +145,7 @@ pub async fn bind_mutual_listener(
 	let certificate = Certificate::clone(&materials.certificate);
 	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
 	let validators = vec![pinning_validator(client_certificate)];
+
 	let config = TransportEncryptionConfig::new(certificate, key_manager).with_client_validators(validators);
 	bind_with_config(config).await
 }
@@ -219,7 +235,7 @@ pub async fn establish_mutual_transports(
 }
 
 pub async fn serve_one_handshake_message(transport: &mut TcpTransport<TokioStream>) -> Result<(), TightBeamError> {
-	let wire_bytes = transport.read_envelope().await?;
+	let wire_bytes = transport.read_envelope_bytes().await?;
 	let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 	let envelope = match wire_envelope {
 		WireEnvelope::Cleartext(envelope) => envelope,

@@ -56,7 +56,7 @@ pub use client::GenericClient;
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO};
-pub use messaging::{MessageCollector, ResponseHandler, Transport};
+pub use messaging::{MessageCollector, Transport};
 pub use protocols::{
 	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
 	X509ClientConfig,

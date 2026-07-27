@@ -17,17 +17,14 @@ use crate::transport::envelopes::ResponsePackage;
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::messaging::gate_inbound_frame;
-use crate::transport::multiplex::{MuxAcceptor, MuxHandle, MuxRekeyContext, MuxResponder, MuxRole, MuxTransport};
+use crate::transport::multiplex::{
+	MuxAcceptor, MuxHandle, MuxRekeyContext, MuxResponder, MuxRole, MuxTransport, ReplySink, SpawnedMux, StreamBody,
+};
 use crate::transport::TransportResult;
 use crate::{Frame, TightBeamError};
 
-/// Assemble the mux plane over split halves and spawn both drivers.
-///
-/// Driver failures resolve pending streams through the shared state
-/// (`fail_all_pending`), so the tasks themselves are fire-and-forget. The
-/// returned handle is the reader driver's: it finishes when the connection
-/// dies, so holders use it as the connection's liveness witness. The writer
-/// driver ends on its own when the connection does.
+/// Assemble the mux plane over split halves and spawn both drivers
+/// through [`MuxTransport::spawn`].
 pub(crate) fn drive_mux<R, W>(
 	reader: R,
 	writer: W,
@@ -48,15 +45,7 @@ where
 		mux = mux.with_rekey(context);
 	}
 
-	let (handle, reader_driver, writer_driver, responder) = mux.into_parts();
-	let reader_task = rt::spawn(async move {
-		let _ = reader_driver.drive().await;
-	});
-
-	rt::spawn(async move {
-		let _ = writer_driver.drive().await;
-	});
-
+	let SpawnedMux { handle, responder, reader_task } = mux.spawn();
 	(handle, responder, reader_task)
 }
 
@@ -115,6 +104,90 @@ where
 					// the peer can tell it apart from an accepted empty reply
 					// and so the failure is attributable, not laundered to Ok.
 					Err(_) => ResponsePackage::new(TransitStatus::Internal, None),
+				}
+			}
+		})
+		.await
+}
+
+/// Serve a mux-negotiated connection with streamed request bodies.
+///
+/// Frame gates cannot apply: dispatch happens before the body has
+/// arrived, so there is no frame to evaluate. Identity-based policy
+/// moves into the handler, which receives the connection's
+/// [`SessionContext`] (pre-split peer identity plus the live session
+/// receipt). Handler failures answer `TransitStatus::Internal`.
+///
+/// # Errors
+/// - `InvalidState` / `OperationFailed(EncryptorUnavailable)`: no handshake
+/// - Terminal responder failures (see [`MuxResponder::serve_streaming`])
+pub async fn serve_streaming_mux<T, H, Fut>(
+	mut transport: T,
+	settings: MuxSettings,
+	handler: H,
+	cancel_budget: Option<u32>,
+) -> TransportResult<()>
+where
+	T: MuxAcceptor,
+	H: Fn(StreamBody, SessionContext) -> Fut + Send + Sync + 'static,
+	Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + Send,
+{
+	let rekey = transport.take_rekey()?;
+	let snapshot = transport.session_context();
+	let (reader, writer) = transport.into_envelope_halves()?;
+	let (handle, responder, _reader_task) = drive_mux(reader, writer, MuxRole::Server, settings, cancel_budget, rekey);
+
+	let handler = Arc::new(handler);
+
+	responder
+		.serve_streaming(move |body: StreamBody| {
+			let session = snapshot.with_live_receipt(handle.session_receipt());
+			let handler = Arc::clone(&handler);
+			async move {
+				match handler(body, session).await {
+					Ok(message) => ResponsePackage::new(TransitStatus::Ok, message),
+					Err(_) => ResponsePackage::new(TransitStatus::Internal, None),
+				}
+			}
+		})
+		.await
+}
+
+/// Serve a mux-negotiated connection with duplex streams.
+///
+/// Frame gates cannot apply (see [`serve_streaming_mux`]); the handler
+/// receives the connection's [`SessionContext`] for identity-based
+/// policy.
+///
+/// # Errors
+/// - `InvalidState` / `OperationFailed(EncryptorUnavailable)`: no handshake
+/// - Terminal responder failures (see [`MuxResponder::serve_duplex`])
+pub async fn serve_duplex_mux<T, H, Fut>(
+	mut transport: T,
+	settings: MuxSettings,
+	handler: H,
+	cancel_budget: Option<u32>,
+) -> TransportResult<()>
+where
+	T: MuxAcceptor,
+	H: Fn(StreamBody, ReplySink, SessionContext) -> Fut + Send + Sync + 'static,
+	Fut: Future<Output = Result<(), TightBeamError>> + Send,
+{
+	let rekey = transport.take_rekey()?;
+	let snapshot = transport.session_context();
+	let (reader, writer) = transport.into_envelope_halves()?;
+	let (handle, responder, _reader_task) = drive_mux(reader, writer, MuxRole::Server, settings, cancel_budget, rekey);
+
+	let handler = Arc::new(handler);
+
+	responder
+		.serve_duplex(move |body: StreamBody, sink: ReplySink| {
+			let session = snapshot.with_live_receipt(handle.session_receipt());
+			let handler = Arc::clone(&handler);
+			async move {
+				match handler(body, sink, session).await {
+					Ok(()) => TransitStatus::Ok,
+					Err(_) => TransitStatus::Internal,
 				}
 			}
 		})

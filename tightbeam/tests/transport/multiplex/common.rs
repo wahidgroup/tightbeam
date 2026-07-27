@@ -21,7 +21,7 @@ use tightbeam::transport::handshake::negotiation::{
 };
 use tightbeam::transport::multiplex::{
 	CreditGrantor, MuxAcceptor, MuxConnector, MuxHandle, MuxResponder, MuxRole, MuxTransport, ReplySink, RequestSink,
-	StreamBody, StreamId,
+	SpawnedMux, StreamBody, StreamId,
 };
 use tightbeam::transport::tcp::r#async::{
 	TcpTransport, TokioListener, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader, TransportWriter,
@@ -95,8 +95,7 @@ pub(super) async fn establish_transports(
 
 pub(super) struct MuxEndpoint {
 	pub(super) handle: MuxHandle,
-	pub(super) _reader_task: ServeTask,
-	pub(super) _writer_task: ServeTask,
+	pub(super) _reader_task: JoinHandle<()>,
 }
 
 /// Per-endpoint limits for hardening scenarios.
@@ -122,12 +121,8 @@ where
 		mux = mux.with_cancel_budget(budget);
 	}
 
-	let (handle, reader_driver, writer_driver, responder) = mux.into_parts();
-	let endpoint = MuxEndpoint {
-		handle,
-		_reader_task: tokio::spawn(reader_driver.drive()),
-		_writer_task: tokio::spawn(writer_driver.drive()),
-	};
+	let SpawnedMux { handle, responder, reader_task } = mux.spawn();
+	let endpoint = MuxEndpoint { handle, _reader_task: reader_task };
 
 	(endpoint, responder)
 }

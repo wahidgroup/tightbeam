@@ -29,7 +29,6 @@ use crate::encode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{TransportEnvelope, WireEnvelope, WireMode};
 use crate::transport::error::TransportError;
-use crate::transport::messaging::ResponseHandler;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::TightBeamError;
@@ -336,14 +335,14 @@ pub trait EnvelopeSink: MaybeSend {
 }
 
 /// Base I/O operations for message transport
-pub trait MessageIO: ResponseHandler {
+pub trait MessageIO {
 	/// Read raw DER-encoded bytes from the transport
 	#[allow(async_fn_in_trait)]
-	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>>;
+	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>>;
 
 	/// Write raw DER-encoded bytes to the transport
 	#[allow(async_fn_in_trait)]
-	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()>;
+	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()>;
 
 	/// Decode envelope from DER bytes
 	fn decode_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
@@ -359,7 +358,7 @@ pub trait MessageIO: ResponseHandler {
 	/// This can be overridden by EncryptedMessageIO to handle WireEnvelope parsing
 	#[allow(async_fn_in_trait)]
 	async fn read_decoded_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let bytes = self.read_envelope().await?;
+		let bytes = self.read_envelope_bytes().await?;
 		Self::decode_envelope(&bytes)
 	}
 
@@ -385,13 +384,6 @@ pub trait MessageIO: ResponseHandler {
 			Err(e) => Err(e),
 		}
 	}
-
-	/// Send a response back to the sender
-	///
-	fn handle_message(&self, message: Arc<Frame>) -> Option<Frame> {
-		let frame = Arc::try_unwrap(message).unwrap_or_else(|arc| (*arc).clone());
-		self.handler().and_then(|handler| handler(frame))
-	}
 }
 
 #[cfg(feature = "x509")]
@@ -402,7 +394,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	where
 		Self: EncryptedProtocolState,
 	{
-		let wire_bytes = self.read_envelope().await?;
+		let wire_bytes = self.read_envelope_bytes().await?;
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 		match wire_envelope {
 			WireEnvelope::Cleartext(transport_envelope) => {
@@ -439,7 +431,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		};
 
 		let wire_bytes = wire_envelope.to_der()?;
-		self.write_envelope(&wire_bytes).await
+		self.write_envelope_bytes(&wire_bytes).await
 	}
 
 	/// Wrap a message in a TransportEnvelope
@@ -656,7 +648,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let initial_envelope = TransportEnvelope::SignedData(signed_data);
 
 		let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
-		self.write_envelope(&wire_envelope.to_der()?).await?;
+		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
 		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -669,7 +661,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 
 		// Step 2: Receive server response
-		let response_wire_bytes = self.read_envelope().await?;
+		let response_wire_bytes = self.read_envelope_bytes().await?;
 		if response_wire_bytes.len() > HANDSHAKE_MAX_WIRE {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -704,7 +696,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
 
 		let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
-		self.write_envelope(&wire_envelope.to_der()?).await?;
+		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Step 5: Complete handshake and role-map the directional session keys
 		let ciphers = client.complete()?;
@@ -827,7 +819,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		let initial_envelope = kind.wrap_client_start(&initial_message)?;
 		let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
-		self.write_envelope(&wire_envelope.to_der()?).await?;
+		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
 		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -840,7 +832,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 
 		// Step 2: Receive server response
-		let response_wire_bytes = self.read_envelope().await?;
+		let response_wire_bytes = self.read_envelope_bytes().await?;
 		if response_wire_bytes.len() > HANDSHAKE_MAX_WIRE {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -871,7 +863,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 			let msg_envelope = kind.wrap_client_followup(&msg_bytes)?;
 			let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
-			self.write_envelope(&wire_envelope.to_der()?).await?;
+			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 		}
 
 		// Step 5: Complete handshake and get the directional session keys
@@ -1060,7 +1052,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 			let server_envelope = kind.wrap_server_response(&response)?;
 			let wire_envelope = WireEnvelope::Cleartext(server_envelope);
-			self.write_envelope(&wire_envelope.to_der()?).await?;
+			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 			// Set server awaiting state with timeout tracking
 			#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -1241,10 +1233,10 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Wrap and encrypt message
 		let wire_envelope = self.wrap_and_encrypt_message(message).await?;
 		let wire_bytes = wire_envelope.to_der()?;
-		self.write_envelope(&wire_bytes).await?;
+		self.write_envelope_bytes(&wire_bytes).await?;
 
 		// Read and decrypt response
-		let response_bytes = self.read_envelope().await?;
+		let response_bytes = self.read_envelope_bytes().await?;
 		let response_envelope = self.decrypt_response(response_bytes).await?;
 
 		// Parse response
@@ -1281,7 +1273,6 @@ mod tests {
 	use super::*;
 	use crate::asn1::{MessagePriority, Metadata};
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
-	use crate::transport::ResponseHandler as TransportResponseHandler;
 	use crate::Version;
 
 	fn frame_with_priority(version: Version) -> Frame {
@@ -1294,25 +1285,12 @@ mod tests {
 	/// Minimal `MessageIO` probe so ingress goes through `decode_envelope`.
 	struct DecodeProbe;
 
-	impl TransportResponseHandler for DecodeProbe {
-		fn with_handler<F>(self, _handler: F) -> Self
-		where
-			F: Fn(Frame) -> Option<Frame> + Send + Sync + 'static,
-		{
-			self
-		}
-
-		fn handler(&self) -> Option<&(dyn Fn(Frame) -> Option<Frame> + Send + Sync)> {
-			None
-		}
-	}
-
 	impl MessageIO for DecodeProbe {
-		async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
+		async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 			Err(TransportError::ConnectionClosed)
 		}
 
-		async fn write_envelope(&mut self, _buffer: &[u8]) -> TransportResult<()> {
+		async fn write_envelope_bytes(&mut self, _buffer: &[u8]) -> TransportResult<()> {
 			Ok(())
 		}
 	}

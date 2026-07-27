@@ -75,7 +75,7 @@ pub mod emit {
 /// Message collection and processing
 pub mod collect {
 	#[cfg(feature = "transport")]
-	pub use crate::transport::{MessageCollector, ResponseHandler};
+	pub use crate::transport::MessageCollector;
 
 	#[cfg(feature = "transport-policy")]
 	pub use crate::transport::policy::{self, PolicyConf};

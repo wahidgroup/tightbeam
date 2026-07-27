@@ -38,6 +38,9 @@
 //! Per-stream timeouts compose externally: wrap the emit future in a timeout
 //! and the drop guard cancels the stream on expiry.
 
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+mod router;
+
 use core::future::Future;
 
 use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
@@ -55,12 +58,20 @@ use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::rekey::RekeyDriver;
 
+#[cfg(all(feature = "x509", feature = "tokio"))]
+pub use router::SpawnedMux;
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+pub use router::{
+	BufferedGrantor, CreditGrantor, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver, ReplySink,
+	RequestSink, StreamBody,
+};
+
 /// Stream identifier within one multiplexed connection.
 ///
 /// Odd IDs are client-initiated, even IDs are server-initiated, and ID 0 is reserved
 /// ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StreamId(pub u32);
+pub struct StreamId(u32);
 
 impl StreamId {
 	/// Wrap a raw stream ID.
@@ -218,7 +229,6 @@ pub type GatedHalves<T> = (
 
 /// Server-side counterpart of [`MuxConnector`]: negotiate multiplexing
 /// while accepting, then hand the connection to the mux plane.
-#[cfg(feature = "transport-policy")]
 pub trait MuxAcceptor: MuxCapable {
 	/// Envelope read half after splitting.
 	type EnvelopeReader: EnvelopeSource + MaybeSend + 'static;
@@ -240,6 +250,7 @@ pub trait MuxAcceptor: MuxCapable {
 
 	/// Authenticated peer context of the completed handshake,
 	/// snapshotted before the transport splits. Empty by default.
+	#[cfg(feature = "transport-policy")]
 	fn session_context(&self) -> SessionContext {
 		SessionContext::default()
 	}
@@ -248,14 +259,29 @@ pub trait MuxAcceptor: MuxCapable {
 	/// Consuming means no placeholder gate ever sits inside a live
 	/// collector: the gate moves to the mux responder, the transport
 	/// ceases to exist.
+	#[cfg(feature = "transport-policy")]
 	fn into_gated_halves(self) -> TransportResult<GatedHalves<Self>>;
+
+	/// Consume the transport into raw envelope halves for the mux
+	/// drivers, without the policy plane.
+	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)>;
 }
 
+/// Streaming extension of [`MultiplexedProtocol`]: chunked request
+/// bodies and duplex replies over individual mux streams.
+///
+/// Segregated from the base trait so unary callers never see streaming
+/// machinery, and because the concrete sink/body types live in the
+/// router plane.
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
-mod router;
+pub trait StreamingProtocol: MultiplexedProtocol {
+	/// Open a streamed request: push chunks through the sink, then await
+	/// the unary response. Dropping either side cancels the stream.
+	fn open_stream(
+		&self,
+	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)>;
 
-#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
-pub use router::{
-	BufferedGrantor, CreditGrantor, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver, ReplySink,
-	RequestSink, StreamBody,
-};
+	/// Open a duplex stream: push request chunks through the sink while
+	/// the peer's reply arrives incrementally through the body.
+	fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)>;
+}

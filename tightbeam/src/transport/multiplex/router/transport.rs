@@ -24,6 +24,9 @@ use crate::transport::rekey::RekeyDriver;
 #[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
 use core::time::Duration;
 
+#[cfg(feature = "tokio")]
+use crate::runtime::rt;
+
 /// Multiplexed transport assembled from split envelope halves and
 /// [`MuxSettings`].
 pub struct MuxTransport<R, W>
@@ -117,8 +120,7 @@ where
 
 	/// Override the time budget for one in-band renewal exchange
 	/// (default [`DEFAULT_REKEY_DEADLINE_SECS`](crate::constants::DEFAULT_REKEY_DEADLINE_SECS)).
-	/// Expiry drains the
-	/// connection on the GoAway path.
+	/// Expiry drains the connection on the GoAway path.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
 	#[must_use]
 	pub fn with_renewal_deadline(mut self, deadline: Duration) -> Self {
@@ -133,8 +135,7 @@ where
 	}
 
 	/// Override the receiver-side stream credit policy (default:
-	/// [`BufferedGrantor`] with a
-	/// [`DEFAULT_MUX_STREAM_CREDIT`]-chunk window).
+	/// [`BufferedGrantor`] with a [`DEFAULT_MUX_STREAM_CREDIT`]-chunk window).
 	#[must_use]
 	pub fn with_credit_grantor(mut self, grantor: Arc<dyn CreditGrantor>) -> Self {
 		self.reader.set_grantor(grantor);
@@ -147,9 +148,49 @@ where
 		self.handle.clone()
 	}
 
-	/// Decompose into the handle, the two drivers to spawn, and
-	/// the responder.
+	/// Decompose into the handle, the two drivers, and the responder.
 	pub fn into_parts(self) -> (MuxHandle, MuxReaderDriver<R>, MuxWriterDriver<W>, MuxResponder) {
 		(self.handle, self.reader, self.writer, self.responder)
 	}
+}
+
+#[cfg(feature = "tokio")]
+impl<R, W> MuxTransport<R, W>
+where
+	R: EnvelopeSource + Send + 'static,
+	W: EnvelopeSink + Send + 'static,
+{
+	/// Spawn both drivers on the runtime and hand back the live plane.
+	///
+	/// Driver failures resolve pending streams through the shared state
+	/// (`fail_all_pending`), so the tasks are fire-and-forget: the
+	/// reader task doubles as the connection's liveness witness
+	/// ([`SpawnedMux::reader_task`]), the writer task ends on its own
+	/// when the connection dies.
+	pub fn spawn(self) -> SpawnedMux {
+		let (handle, reader_driver, writer_driver, responder) = self.into_parts();
+		let reader_task = rt::spawn(async move {
+			let _ = reader_driver.drive().await;
+		});
+
+		rt::spawn(async move {
+			let _ = writer_driver.drive().await;
+		});
+
+		SpawnedMux { handle, responder, reader_task }
+	}
+}
+
+/// A running mux plane: both drivers spawned, ready to emit and serve.
+///
+/// Produced by [`MuxTransport::spawn`].
+#[cfg(feature = "tokio")]
+pub struct SpawnedMux {
+	/// Client-side handle for emitting on streams.
+	pub handle: MuxHandle,
+	/// Server-side dispatcher for peer-initiated streams.
+	pub responder: MuxResponder,
+	/// The reader driver's task: finishes when the connection dies, so
+	/// holders use it as the connection's liveness witness.
+	pub reader_task: rt::JoinHandle,
 }
