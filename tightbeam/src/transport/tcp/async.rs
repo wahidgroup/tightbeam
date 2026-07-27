@@ -49,6 +49,12 @@ use crate::TightBeamError;
 use crate::trace::TraceCollector;
 #[cfg(feature = "tokio")]
 use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::utils::marker::MaybeSend;
 
 /// Fallback envelope read cap when no explicit limit is configured.
 const DEFAULT_MAX_ENVELOPE: usize = 512 * 1024;
@@ -372,7 +378,7 @@ where
 ))]
 mod mux {
 	pub(crate) use crate::transport::io::take_rekey_context;
-	pub use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxRekeyContext, MuxRole};
+	pub use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxRekeyContext, MuxRole, MuxTransport};
 
 	#[cfg(feature = "transport-policy")]
 	pub(crate) use crate::transport::messaging::{collect_step, CollectStep};
@@ -406,6 +412,57 @@ where
 	}
 }
 
+/// Multiplexed plane assembled by [`TcpTransport::into_mux`].
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub type SplitMuxTransport<S> = MuxTransport<
+	TransportReader<<S as SplittableStream>::ReadHalf>,
+	TransportWriter<<S as SplittableStream>::WriteHalf>,
+>;
+
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+impl<S> TcpTransport<S>
+where
+	S: SplittableStream,
+	TransportError: From<S::Error>,
+{
+	/// Consume a handshaken transport into its multiplexed plane:
+	/// negotiated settings drive the assembly, in-band rekey wiring
+	/// attaches when the session carries a dual-signed receipt, and
+	/// the halves split for the mux drivers.
+	///
+	/// Role-fixed: callers pass the endpoint role they are assembling.
+	/// Unlike the [`MuxConnector`] / `MuxAcceptor` pool traits, this
+	/// works for either role without the policy plane, so WebSocket
+	/// transports (native and wasm) assemble the same way.
+	///
+	/// # Errors
+	/// - `InvalidState`: the peer did not negotiate multiplexing, or
+	///   the handshake has not completed
+	/// - rekey harvest / split failures from the underlying transport
+	pub fn into_mux(mut self, role: MuxRole) -> TransportResult<SplitMuxTransport<S>> {
+		let Some(settings) = self.negotiated_mux() else {
+			return Err(TransportError::InvalidState);
+		};
+		let rekey = take_rekey_context(&mut self, role)?;
+		let (reader, writer) = self.into_split()?;
+
+		let mut mux = MuxTransport::new(reader, writer, role, settings);
+		if let Some(context) = rekey {
+			mux = mux.with_rekey(context);
+		}
+
+		Ok(mux)
+	}
+}
+
 #[cfg(all(
 	feature = "x509",
 	feature = "transport-multiplex",
@@ -432,8 +489,8 @@ where
 impl<S> MuxConnector for TcpTransport<S>
 where
 	S: SplittableStream,
-	S::ReadHalf: Send + 'static,
-	S::WriteHalf: Send + 'static,
+	S::ReadHalf: MaybeSend + 'static,
+	S::WriteHalf: MaybeSend + 'static,
 	TransportError: From<S::Error>,
 {
 	type EnvelopeReader = TransportReader<S::ReadHalf>;
@@ -461,8 +518,8 @@ where
 impl<S> MuxAcceptor for TcpTransport<S>
 where
 	S: SplittableStream,
-	S::ReadHalf: Send + 'static,
-	S::WriteHalf: Send + 'static,
+	S::ReadHalf: MaybeSend + 'static,
+	S::WriteHalf: MaybeSend + 'static,
 	TransportError: From<S::Error>,
 {
 	type EnvelopeReader = TransportReader<S::ReadHalf>;

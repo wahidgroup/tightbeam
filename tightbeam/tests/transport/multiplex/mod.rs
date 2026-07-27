@@ -36,4 +36,7 @@ mod credit;
 #[cfg(feature = "transport-multiplex")]
 mod rekey;
 
+#[cfg(feature = "transport-multiplex")]
+mod streaming;
+
 mod wire;

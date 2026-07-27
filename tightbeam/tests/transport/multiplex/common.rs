@@ -2,10 +2,10 @@
 
 use core::future::{poll_fn, Future};
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
@@ -20,7 +20,8 @@ use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, MuxSettings, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::multiplex::{
-	CreditGrantor, MuxAcceptor, MuxConnector, MuxHandle, MuxResponder, MuxRole, MuxTransport, StreamId,
+	CreditGrantor, MuxAcceptor, MuxConnector, MuxHandle, MuxResponder, MuxRole, MuxTransport, ReplySink, RequestSink,
+	StreamBody, StreamId,
 };
 use tightbeam::transport::tcp::r#async::{
 	TcpTransport, TokioListener, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader, TransportWriter,
@@ -47,6 +48,7 @@ pub(super) type SplitWriter = TransportWriter<TokioWriteHalf>;
 pub(super) type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
 pub(super) type ServeTask = JoinHandle<Result<(), TransportError>>;
 pub(super) type HandlerFuture = Pin<Box<dyn Future<Output = ResponsePackage> + Send>>;
+pub(super) type StatusFuture = Pin<Box<dyn Future<Output = TransitStatus> + Send>>;
 
 pub(super) fn large_mux_frame(label: &str) -> Frame {
 	let padding = "x".repeat(5000);
@@ -393,6 +395,96 @@ pub(super) async fn establish_echo_pair(
 
 pub(super) fn echo_response(frame: &Arc<Frame>) -> ResponsePackage {
 	ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(frame)))
+}
+
+/// Terminal outcome of a fully drained [`StreamBody`].
+pub(super) struct DrainedBody {
+	/// Every chunk's bytes, in arrival order.
+	pub(super) bytes: Vec<u8>,
+	/// Chunks consumed before the terminal event.
+	pub(super) chunks: usize,
+	/// The failure that ended the body, `None` on a clean end.
+	pub(super) failure: Option<TransportError>,
+}
+
+/// Drain a stream body to its terminal outcome, collecting chunks.
+pub(super) async fn drain_body(body: &mut StreamBody) -> DrainedBody {
+	let mut bytes = Vec::new();
+	let mut chunks = 0usize;
+	loop {
+		match body.chunk().await {
+			Ok(Some(chunk)) => {
+				chunks += 1;
+				bytes.extend_from_slice(&chunk);
+			}
+			Ok(None) => return DrainedBody { bytes, chunks, failure: None },
+			Err(err) => return DrainedBody { bytes, chunks, failure: Some(err) },
+		}
+	}
+}
+
+/// Whether a counting handler observed a chunked (multi-record) body.
+pub(super) fn saw_multiple_chunks(counter: &AtomicUsize) -> bool {
+	counter.load(Ordering::SeqCst) > 1
+}
+
+/// Echo of a body reassembled from streamed chunks.
+pub(super) fn echo_reassembled(buffer: &[u8]) -> ResponsePackage {
+	match Frame::from_der(buffer) {
+		Ok(frame) => ResponsePackage::new(TransitStatus::Ok, Some(frame)),
+		Err(_) => ResponsePackage::new(TransitStatus::InvalidArgument, None),
+	}
+}
+
+/// Streaming echo handler: consumes the body chunk by chunk, counts
+/// arrivals, then echoes the reassembled frame.
+pub(super) fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody) -> HandlerFuture {
+	move |mut body| {
+		let counter = Arc::clone(&chunks_seen);
+		Box::pin(async move {
+			let drained = drain_body(&mut body).await;
+
+			counter.fetch_add(drained.chunks, Ordering::SeqCst);
+
+			if drained.failure.is_some() {
+				return ResponsePackage::new(TransitStatus::Cancelled, None);
+			}
+
+			echo_reassembled(&drained.bytes)
+		})
+	}
+}
+
+/// Push a payload through a request sink as two chunks, then close:
+/// the smallest sequence exercising the held-back `last` framing.
+pub(super) async fn push_split(mut sink: RequestSink, payload: &[u8]) -> Result<(), TransportError> {
+	let middle = payload.len() / 2;
+	sink.push(&payload[..middle]).await?;
+	sink.push(&payload[middle..]).await?;
+
+	sink.close().await
+}
+
+/// Duplex echo handler: streams every request chunk straight back,
+/// counting arrivals, and ends the reply with the trailer status.
+pub(super) fn duplex_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody, ReplySink) -> StatusFuture {
+	move |mut body, mut reply| {
+		let counter = Arc::clone(&chunks_seen);
+		Box::pin(async move {
+			loop {
+				match body.chunk().await {
+					Ok(Some(chunk)) => {
+						counter.fetch_add(1, Ordering::SeqCst);
+						if reply.push(&chunk).await.is_err() {
+							return TransitStatus::Cancelled;
+						}
+					}
+					Ok(None) => return TransitStatus::Ok,
+					Err(_) => return TransitStatus::Cancelled,
+				}
+			}
+		})
+	}
 }
 
 pub(super) fn gated_echo_handler(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {

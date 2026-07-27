@@ -1,7 +1,9 @@
 //! Cleartext mux parity: interleaved echo, cancel budget, chunked credit.
 
+use core::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
@@ -176,6 +178,57 @@ tb_scenario! {
 			let frame = large_mux_frame("mux-cleartext-chunked");
 			let echoed = client_end.handle.emit_on_stream(&frame).await?;
 			trace.event_with(CLEARTEXT_CHUNKED_ECHO, &[], is_echo(echoed, &frame))?;
+
+			Ok(())
+		}
+	}
+}
+
+pub(crate) const CLEARTEXT_STREAMING_ECHO: Urn<'static> = Urn::new("test", "event:cleartext/cleartext-streaming-echo");
+pub(crate) const CLEARTEXT_STREAMING_CHUNKED: Urn<'static> =
+	Urn::new("test", "event:cleartext/cleartext-streaming-chunked");
+
+tb_assert_spec! {
+	pub MuxCleartextStreamingSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(CLEARTEXT_STREAMING_ECHO, exactly!(1), equals!(true)),
+			(CLEARTEXT_STREAMING_CHUNKED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// Streaming on cleartext links (the ws-style embedding): open_stream
+// pushes against serve_streaming with only chunking and stream credit
+// in play.
+tb_scenario! {
+	name: mux_cleartext_streaming_echo,
+	spec: MuxCleartextStreamingSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let (client, server) = establish_cleartext_transports().await?;
+			let mut settings = MuxSettings::symmetric(4);
+			settings.send_chunk_size = 1024;
+			settings.recv_chunk_size = 1024;
+
+			let (client_end, _client_responder) =
+				spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None, trace.share())?;
+			let (_server_end, server_responder) =
+				spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None, trace.share())?;
+
+			let chunks_seen = Arc::new(AtomicUsize::new(0));
+			let _serve = tokio::spawn(server_responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
+
+			let frame = large_mux_frame("mux-cleartext-streaming");
+			let payload = frame.to_der()?;
+			let (sink, response) = client_end.handle.open_stream()?;
+			push_split(sink, &payload).await?;
+
+			let echoed = response.await?;
+			trace.event_with(CLEARTEXT_STREAMING_ECHO, &[], is_echo(echoed, &frame))?;
+			trace.event_with(CLEARTEXT_STREAMING_CHUNKED, &[], saw_multiple_chunks(&chunks_seen))?;
 
 			Ok(())
 		}
