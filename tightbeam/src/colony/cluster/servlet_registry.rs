@@ -132,6 +132,12 @@ impl ServletEntry {
 		}
 	}
 
+	/// Set how this entry is reached, consuming and returning self
+	pub fn with_route_kind(mut self, route_kind: RouteKind) -> Self {
+		self.route_kind = route_kind;
+		self
+	}
+
 	/// Check if this entry should be abandoned (too many failures)
 	pub fn is_abandoned(&self) -> bool {
 		self.trial_count.load(Ordering::Relaxed) >= self.abandonment_limit
@@ -438,13 +444,53 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
+	/// Live entries for a servlet type owned by this gateway's own hives
+	///
+	/// Work selection stays local until forwarding lands: a learned peer
+	/// route must never receive a bare work frame meant for a servlet.
+	pub fn local_entries_for_type(&self, servlet_type: &[u8]) -> Result<Vec<ServletEntry>, ClusterError> {
+		let entries = self.entries_for_type(servlet_type)?;
+		let local = entries
+			.into_iter()
+			.filter(|entry| entry.route_kind == RouteKind::Local)
+			.collect();
+
+		Ok(local)
+	}
+
+	/// Whether a peer slate keyed by `gateway_id` would touch local routes
+	///
+	/// Peer installs replace only prior Peer state. A local servlet at the
+	/// same address key, or a local hive owning the same hive-index key,
+	/// means the advertisement would clobber routes another trust plane
+	/// installed, so the caller refuses it.
+	pub fn peer_key_conflicts_local(&self, gateway_id: &[u8]) -> Result<bool, ClusterError> {
+		let entries = self.entries.read()?;
+		let address_taken = entries
+			.get(gateway_id)
+			.is_some_and(|entry| entry.route_kind == RouteKind::Local);
+		if address_taken {
+			return Ok(true);
+		}
+
+		let hive_idx = self.hive_index.read()?;
+		let Some(addresses) = hive_idx.get(gateway_id) else {
+			return Ok(false);
+		};
+
+		let hive_taken = addresses.iter().any(|addr| {
+			entries
+				.get(addr.as_ref())
+				.is_some_and(|entry| entry.route_kind == RouteKind::Local)
+		});
+
+		Ok(hive_taken)
+	}
+
 	/// Live entries reached through a peer gateway (`RouteKind::Peer`)
 	///
-	/// Abandoned trails are excluded, mirroring [`entries_for_type`]: an
-	/// isolated peer nest is unreachable, so it is neither advertised nor
-	/// re-flooded.
-	///
-	/// [`entries_for_type`]: Self::entries_for_type
+	/// Abandoned trails are excluded: an isolated peer nest is
+	/// unreachable, so it is neither advertised nor re-flooded.
 	pub fn peer_servlets(&self) -> Result<Vec<ServletEntry>, ClusterError> {
 		let entries = self.entries.read()?;
 		let result = entries
@@ -572,6 +618,11 @@ mod tests {
 		)
 	}
 
+	/// Create a named test entry routed through a peer gateway
+	fn peer_entry(addr: &[u8], servlet_type: &[u8], hive: &[u8]) -> ServletEntry {
+		named_entry(addr, servlet_type, hive).with_route_kind(RouteKind::Peer)
+	}
+
 	// =========================================================================
 	// ServletEntry Tests - Data-Driven
 	// =========================================================================
@@ -661,9 +712,7 @@ mod tests {
 		let empty = registry.peer_servlets().ok().unwrap_or_default();
 		assert!(empty.is_empty());
 
-		let mut peer = named_entry(b"peer-gw", b"calc", b"peer-colony");
-		peer.route_kind = RouteKind::Peer;
-		registry.add(peer).ok();
+		registry.add(peer_entry(b"peer-gw", b"calc", b"peer-colony")).ok();
 
 		let peers = registry.peer_servlets().ok().unwrap_or_default();
 		assert_eq!(peers.len(), 1);
@@ -676,8 +725,7 @@ mod tests {
 		let config = PheromoneConf { abandonment_limit: limit, ..Default::default() };
 		let registry = ServletRegistry::new(config);
 
-		let mut peer = named_entry(b"peer-gw", b"calc", b"peer-colony");
-		peer.route_kind = RouteKind::Peer;
+		let mut peer = peer_entry(b"peer-gw", b"calc", b"peer-colony");
 		peer.abandonment_limit = limit;
 		registry.add(peer).ok();
 
@@ -687,6 +735,44 @@ mod tests {
 
 		let peers = registry.peer_servlets().ok().unwrap_or_default();
 		assert!(peers.is_empty());
+	}
+
+	#[test]
+	fn local_entries_for_type_excludes_peer_routes() {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"local", b"calc", b"hive1")).ok();
+		registry.add(peer_entry(b"peer-gw", b"calc", b"peer-colony")).ok();
+
+		let local = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
+		assert_eq!(local.len(), 1);
+		assert_eq!(local[0].address.as_ref(), b"local");
+	}
+
+	#[test]
+	fn local_entries_for_type_empty_when_only_peer_routes() {
+		let registry = ServletRegistry::default();
+		registry.add(peer_entry(b"peer-gw", b"calc", b"peer-colony")).ok();
+
+		let local = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
+		assert!(local.is_empty());
+	}
+
+	#[test]
+	fn peer_key_conflicts_only_with_local_routes() {
+		// (seeded entry, probe key, expected conflict)
+		let cases: &[(ServletEntry, &[u8], bool)] = &[
+			(named_entry(b"gw", b"calc", b"hive1"), b"gw", true),
+			(named_entry(b"addr1", b"calc", b"gw"), b"gw", true),
+			(peer_entry(b"gw", b"calc", b"gw"), b"gw", false),
+			(peer_entry(b"gw", b"calc", b"gw"), b"unseen", false),
+		];
+
+		for (entry, probe, expected) in cases {
+			let registry = ServletRegistry::default();
+			registry.add(entry.clone()).ok();
+
+			assert_eq!(registry.peer_key_conflicts_local(probe).ok(), Some(*expected));
+		}
 	}
 
 	#[test]

@@ -69,6 +69,9 @@ pub enum ClusterRequest {
 	/// Client work submission [context 2]
 	#[asn1(context_specific = "2", constructed = "true")]
 	Work(ClusterWorkRequest),
+	/// Peer gateway advertising exported servlet types [context 3]
+	#[asn1(context_specific = "3", constructed = "true")]
+	AdvertisePeer(PeerAdvertisement),
 }
 
 // =============================================================================
@@ -123,6 +126,34 @@ pub struct ServletAddressUpdate {
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ServletAddressUpdateResponse {
 	/// Status of the update (Ok = success)
+	pub status: TransitStatus,
+}
+
+// =============================================================================
+// Peer Federation Messages
+// =============================================================================
+
+/// A peer gateway advertising the servlet types its colony exports.
+///
+/// Sent gateway-to-gateway so a receiving colony can learn which types a
+/// peer serves and forward work there. Carries only type URNs (never
+/// instance addresses): the peer is reached at `gateway_addr`, which
+/// resolves the whole peer colony rather than a single servlet.
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct PeerAdvertisement {
+	/// Issue time in unix milliseconds. Binds the signed frame to a
+	/// freshness window so captured advertisements cannot be replayed (CWE-294)
+	pub issued_at_ms: u64,
+	/// Address peers dial to reach the advertising gateway
+	pub gateway_addr: Vec<u8>,
+	/// Servlet type URNs the advertising colony exports
+	pub advertised_types: Vec<Urn<'static>>,
+}
+
+/// Response to a peer advertisement
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct PeerAdvertisementResponse {
+	/// Status of the advertisement (Ok = installed)
 	pub status: TransitStatus,
 }
 
@@ -475,6 +506,15 @@ mod tests {
 		round_trip(ClusterRequest::Work(ClusterWorkRequest {
 			servlet_type: ping_type(),
 			payload: vec![0x02, 0x01, 0x2A],
+		}))
+	}
+
+	#[test]
+	fn cluster_request_advertise_peer_round_trips() -> Result<()> {
+		round_trip(ClusterRequest::AdvertisePeer(PeerAdvertisement {
+			issued_at_ms: 1_000,
+			gateway_addr: b"127.0.0.1:9000".to_vec(),
+			advertised_types: vec![ping_type()],
 		}))
 	}
 

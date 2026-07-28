@@ -29,8 +29,8 @@ use tightbeam::{
 			HeartbeatConf,
 		},
 		common::{
-			current_timestamp_ms, servlet_instance, ColonyNamespace, InstanceMetrics, LoadBalancer, RoundRobin,
-			StochasticForager,
+			current_timestamp_ms, servlet_instance, type_canonical_bytes, ColonyNamespace, InstanceMetrics,
+			LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin, StochasticForager,
 		},
 		hive::{
 			Hive, HiveConf, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
@@ -81,6 +81,10 @@ pub(crate) const TOPOLOGY_REGISTER_STATUS: Urn<'static> = Urn::new("test", "even
 pub(crate) const TOPOLOGY_ADD_STATUS: Urn<'static> = Urn::new("test", "event:cluster/topology-add-status");
 pub(crate) const TOPOLOGY_ROUTE_STATUS: Urn<'static> = Urn::new("test", "event:cluster/topology-route-status");
 pub(crate) const MULTI_REGISTER_STATUS: Urn<'static> = Urn::new("test", "event:cluster/multi-register-status");
+pub(crate) const PEER_ADVERTISE_SENT: Urn<'static> = Urn::new("test", "event:cluster/peer-advertise-sent");
+
+/// Address the simulated peer gateway advertises itself at.
+pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
 
 // ============================================================================
 // Shared Test Certificates
@@ -106,6 +110,7 @@ fn cluster_tls_config_with_trust(
 		validators: vec![],
 		client_validators: vec![],
 		hive_trust,
+		peer_trust: None,
 	}
 }
 
@@ -246,6 +251,21 @@ fn servlet_info_mismatched(servlet_name: &str, urn_addr: &[u8], route_addr: &[u8
 		servlet_id: servlet_instance(&servlet_urn(servlet_name), String::from_utf8_lossy(urn_addr).as_ref()),
 		address: route_addr.to_vec(),
 	}
+}
+
+/// Poll until the gateway has learned peer types or attempts exhaust.
+/// Branching lives here, not in scenarios.
+async fn wait_for_peer_types(cluster: &ClusterGateway, attempts: u32, interval: Duration) -> Vec<Vec<u8>> {
+	for _ in 0..attempts {
+		let types = cluster.peer_servlets();
+		if !types.is_empty() {
+			return types;
+		}
+
+		tokio::time::sleep(interval).await;
+	}
+
+	cluster.peer_servlets()
 }
 
 /// Poll until the registry is empty or attempts exhaust. Branching lives here, not in scenarios.
@@ -508,6 +528,277 @@ tb_scenario! {
 
 			cluster.stop();
 
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Peer Federation (advertisement control plane)
+// ============================================================================
+
+/// Gateway conf that accepts peer advertisements: `peer_trust` anchors the
+/// advertising gateway's certificate. No `peers` set, so this gateway
+/// only receives.
+fn peering_cluster_conf(certs: &ClusterTestCerts) -> ClusterConf {
+	let tls = ClusterTlsConfig { peer_trust: Some(Arc::clone(&certs.trust)), ..cluster_tls_config(certs) };
+	ClusterConf::new(tls)
+}
+
+/// Gateway conf that advertises to `peer` on a fast beat. The slate is
+/// never configured: each beat snapshots the hive registry.
+fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: String) -> ClusterConf {
+	let mut conf = ClusterConf::new(cluster_tls_config(certs));
+	conf.peers = vec![peer];
+	conf.advertise_interval = Some(Duration::from_millis(100));
+	conf
+}
+
+/// Send one signed advertisement of `types` from a peer at `gateway_addr`
+/// and return the decoded response status.
+async fn advertise_peer(
+	trace: &TraceCollector,
+	certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+	gateway_addr: &[u8],
+	types: Vec<Urn<'static>>,
+) -> Result<TransitStatus, TightBeamError> {
+	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
+		issued_at_ms: current_timestamp_ms(),
+		gateway_addr: gateway_addr.to_vec(),
+		advertised_types: types,
+	});
+	let frame = signed_control_frame(certs, b"peer-advertise", request).await?;
+
+	let mut client = connect_cluster(certs, cluster.addr()).await?;
+	trace.event(PEER_ADVERTISE_SENT)?;
+
+	let response_frame = emit_frame(&mut client, frame).await?;
+	let response: PeerAdvertisementResponse = decode(&response_frame.message)?;
+	Ok(response.status)
+}
+
+/// Advertise a one-type ping slate from the simulated peer gateway and
+/// assert it installed: the shared preamble for every scenario exercising
+/// behavior after a peer route exists.
+async fn install_ping_peer(
+	trace: &TraceCollector,
+	certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+) -> Result<(), TightBeamError> {
+	let status = advertise_peer(trace, certs, cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")]).await?;
+	assert_eq!(status, TransitStatus::Ok, "trusted advertisement must install");
+	Ok(())
+}
+
+tb_assert_spec! {
+	pub ClusterPeerAdvertisedSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1))
+		]
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerRefusedSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1))
+		]
+	}
+}
+
+// A trusted peer advertisement installs peer routes: the advertised type
+// surfaces in `peer_servlets` (learned), never in `available_servlets`
+// (local hives only). No forwarding happens in this stage.
+tb_scenario! {
+	name: cluster_accepts_peer_advertisement,
+	spec: ClusterPeerAdvertisedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			install_ping_peer(&trace, &certs, &cluster).await?;
+
+			let peers = cluster.peer_servlets();
+			assert_eq!(peers.len(), 1, "one advertised type installs one peer route");
+			assert_eq!(peers[0], type_canonical_bytes(&servlet_urn("ping")), "peer route keyed by type");
+			assert!(cluster.available_servlets().is_empty(), "a peer is not a local hive");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+// Federation is default-off: a gateway without `peer_trust` refuses every
+// advertisement fail-closed, installing no peer routes.
+tb_scenario! {
+	name: cluster_refuses_advertisement_without_peer_trust,
+	spec: ClusterPeerRefusedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, routing_cluster_conf(&certs, None)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let status = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")]).await?;
+			assert_eq!(status, TransitStatus::PermissionDenied, "peer_trust=None must refuse federation");
+			assert!(cluster.peer_servlets().is_empty(), "refused advertisement installs no routes");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+// Nestmate recognition: an advertised type from a foreign realm fails the
+// structural CHC half and is refused even under a valid peer certificate.
+tb_scenario! {
+	name: cluster_refuses_foreign_realm_advertisement,
+	spec: ClusterPeerRefusedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let foreign_ns =
+				ColonyNamespace::new("tightbeam", "other-realm").map_err(|_| TightBeamError::MissingResponse)?;
+			let foreign = foreign_ns.servlet("ping").map_err(|_| TightBeamError::MissingResponse)?;
+
+			let status = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![foreign]).await?;
+			assert_eq!(status, TransitStatus::PermissionDenied, "foreign realm fails nestmate recognition");
+			assert!(cluster.peer_servlets().is_empty(), "foreign advertisement installs no routes");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerWorkLocalOnlySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(1))
+		]
+	}
+}
+
+// Work selection stays local: a type reachable only through a peer route
+// is Unavailable to clients, because a bare work frame must never be
+// dialed at a peer gateway as though it were a servlet.
+tb_scenario! {
+	name: cluster_work_ignores_peer_routes,
+	spec: ClusterPeerWorkLocalOnlySpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			install_ping_peer(&trace, &certs, &cluster).await?;
+
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+			trace.event(WORK_SENT)?;
+
+			let work_response = emit_ping_work(&mut client, b"peer-only-work").await?;
+			assert_eq!(work_response.status, TransitStatus::Unavailable, "peer routes must not serve work yet");
+			assert!(work_response.payload.is_none(), "unroutable work must not carry a payload");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerSlateShrinkSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(2)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(2))
+		]
+	}
+}
+
+// Reconciliation is by replacement: a later advertisement carrying an
+// empty slate retires every route the peer previously advertised.
+tb_scenario! {
+	name: cluster_empty_advertisement_clears_peer_routes,
+	spec: ClusterPeerSlateShrinkSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			install_ping_peer(&trace, &certs, &cluster).await?;
+			assert_eq!(cluster.peer_servlets().len(), 1, "first slate carries one type");
+
+			let cleared = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![]).await?;
+			assert_eq!(cleared, TransitStatus::Ok, "empty slate is a valid reconciliation");
+			assert!(cluster.peer_servlets().is_empty(), "empty slate retires the prior routes");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerBeatSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1))
+		]
+	}
+}
+
+// The advertised slate is registry truth, not configuration: a hive that
+// registers AFTER both gateways are up surfaces at the peer within a
+// beat, with no operator involvement.
+tb_scenario! {
+	name: cluster_beat_advertises_registered_hive_types,
+	spec: ClusterPeerBeatSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let receiver = start_cluster(&trace, peering_cluster_conf(&certs)).await?;
+			let receiver_addr = receiver.addr();
+			let advertiser = start_cluster(&trace, advertising_cluster_conf(&certs, receiver_addr.to_string())).await?;
+
+			let registered = hive.register_with_cluster(advertiser.addr()).await?;
+			assert_eq!(registered.status, TransitStatus::Ok, "hive must join the advertising colony");
+
+			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			assert_eq!(learned.len(), 1, "beat must carry the newly registered type");
+			assert_eq!(learned[0], type_canonical_bytes(&servlet_urn("ping")), "peer route keyed by type");
+
+			advertiser.stop();
+			receiver.stop();
+			hive.stop();
 			Ok(())
 		}
 	}
@@ -777,6 +1068,7 @@ tb_scenario! {
 				validators: vec![],
 				client_validators: vec![],
 				hive_trust: None,
+				peer_trust: None,
 			};
 			start_cluster(&trace, ClusterConf::new(tls)).await
 		},

@@ -49,6 +49,10 @@ pub enum UrnValidationError {
 		error("Invalid NID characters: must be alphanumeric and hyphens only")
 	)]
 	InvalidNidCharacters,
+
+	/// String is not of the form `urn:<nid>:<nss>`
+	#[cfg_attr(feature = "derive", error("Invalid URN syntax: expected urn:<nid>:<nss>"))]
+	InvalidUrnSyntax,
 }
 
 #[cfg(not(feature = "derive"))]
@@ -71,6 +75,7 @@ impl fmt::Display for UrnValidationError {
 			Self::InvalidNidCharacters => {
 				write!(f, "Invalid NID characters: must be alphanumeric and hyphens only")
 			}
+			Self::InvalidUrnSyntax => write!(f, "Invalid URN syntax: expected urn:<nid>:<nss>"),
 		}
 	}
 }

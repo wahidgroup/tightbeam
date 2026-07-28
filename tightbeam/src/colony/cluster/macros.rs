@@ -71,6 +71,7 @@ macro_rules! cluster {
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			evaporation_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
+			advertise_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
 			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 		}
@@ -240,6 +241,22 @@ macro_rules! cluster {
 					})
 				};
 
+				// Anti-entropy advertise beat: re-announce exported types to
+				// every peer gateway each interval. Peer registries are soft
+				// state, exactly like hive registration; signing needs the
+				// key store, so the beat only exists with x509.
+				#[cfg(feature = "x509")]
+				let advertise_handle = {
+					let registry = ::std::sync::Arc::clone(&registry);
+					let config = ::std::sync::Arc::clone(&config);
+					let pool = ::std::sync::Arc::clone(&pool);
+					let gateway_addr: Vec<u8> = addr.clone().into();
+
+					Some($crate::cluster!(@build_advertise_task $protocol, registry, pool, config, gateway_addr, $digest))
+				};
+				#[cfg(not(feature = "x509"))]
+				let advertise_handle = ::std::option::Option::None;
+
 				Ok(Self {
 					registry,
 					servlet_registry,
@@ -248,6 +265,7 @@ macro_rules! cluster {
 					server_handle: Some(server_handle),
 					heartbeat_handle: Some(heartbeat_handle),
 					evaporation_handle: Some(evaporation_handle),
+					advertise_handle,
 					addr,
 					trace,
 				})
@@ -283,6 +301,9 @@ macro_rules! cluster {
 			}
 
 			fn stop(mut self) {
+				if let Some(handle) = self.advertise_handle.take() {
+					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
+				}
 				if let Some(handle) = self.evaporation_handle.take() {
 					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
 				}
@@ -383,6 +404,23 @@ macro_rules! cluster {
 		};
 		#[cfg(not(feature = "x509"))]
 		let verify_hive_origin = || $crate::policy::TransitStatus::Ok;
+
+		// Peer-origin control frames (advertisements) verify against a
+		// SEPARATE trust anchor, `tls.peer_trust`: a hive certificate must
+		// not forge a peer advertisement and vice versa. A gateway without
+		// a peer trust store has federation disabled and refuses (CWE-306).
+		#[cfg(feature = "x509")]
+		let verify_peer_origin = || match $config.tls.peer_trust.as_ref() {
+			Some(trust) => match $crate::colony::hive::verify_frame_signature(trust.as_ref(), &$frame) {
+				$crate::colony::hive::TrustVerification::Verified => $crate::policy::TransitStatus::Ok,
+				$crate::colony::hive::TrustVerification::MissingSignature => $crate::policy::TransitStatus::Unauthenticated,
+				_ => $crate::policy::TransitStatus::PermissionDenied,
+			},
+			None => $crate::policy::TransitStatus::PermissionDenied,
+		};
+
+		#[cfg(not(feature = "x509"))]
+		let verify_peer_origin = || $crate::policy::TransitStatus::Ok;
 
 		// Signed control frames must additionally be fresh and unseen: a
 		// captured registration or address update carries a valid signature,
@@ -707,7 +745,7 @@ macro_rules! cluster {
 			}
 
 			let type_key = $crate::colony::common::canonical_bytes(&request.servlet_type);
-			let entries = match $servlet_registry.entries_for_type(&type_key) {
+			let entries = match $servlet_registry.local_entries_for_type(&type_key) {
 				Ok(e) if !e.is_empty() => e,
 				_ => {
 					let _ = $trace.event($crate::instrumentation::events::CLUSTER_WORK_UNAVAILABLE);
@@ -772,6 +810,92 @@ macro_rules! cluster {
 				}
 			}
 		}
+
+		$crate::colony::common::ClusterRequest::AdvertisePeer(advertisement) => {
+			let origin_status = verify_peer_origin();
+			if origin_status != $crate::policy::TransitStatus::Ok {
+				let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
+				return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse {
+					status: origin_status,
+				});
+			}
+
+			let freshness_status = verify_control_freshness(advertisement.issued_at_ms);
+			if freshness_status != $crate::policy::TransitStatus::Ok {
+				let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
+				return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse {
+					status: freshness_status,
+				});
+			}
+
+			// Nestmate recognition (structural CHC half): every advertised
+			// identity must be a bare servlet type URN in this gateway's
+			// realm/NID. A foreign authority or realm is refused before any
+			// route installs. The count is bounded fail-closed (CWE-770).
+			let gateway_addr_valid = !advertisement.gateway_addr.is_empty()
+				&& core::str::from_utf8(&advertisement.gateway_addr).is_ok();
+			let types_valid = advertisement.advertised_types.iter().all(|urn| matches!(
+				$config.namespace.validate(urn),
+				Ok($crate::colony::common::ColonyResource::Servlet { instance: ::std::option::Option::None, .. })
+			));
+
+			let within_cap = advertisement.advertised_types.len() <= $crate::constants::MAX_ADVERTISED_TYPES;
+
+			// A peer slate replaces only prior Peer state: a gateway_addr
+			// that collides with a local servlet address or local hive key
+			// would let a trusted peer clobber routes the hive trust plane
+			// installed, so it is refused (CWE-284).
+			let no_local_conflict = matches!(
+				$servlet_registry.peer_key_conflicts_local(&advertisement.gateway_addr),
+				Ok(false)
+			);
+
+			if !gateway_addr_valid || !types_valid || !within_cap || !no_local_conflict {
+				let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
+				return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse {
+					status: $crate::policy::TransitStatus::PermissionDenied,
+				});
+			}
+
+			// Peer routes live only in the servlet registry, keyed and
+			// reconciled by the peer gateway address: the advertisement
+			// REPLACES any prior slate for this peer. Each type resolves
+			// to the peer gateway (the forward target), tagged Peer so
+			// work selection can tell it from a local servlet.
+			let gateway_id: ::std::sync::Arc<[u8]> = advertisement.gateway_addr.as_slice().into();
+			let _ = $servlet_registry.remove_by_hive(&gateway_id);
+			let installed = advertisement.advertised_types.iter().try_for_each(|urn| {
+				let entry = $crate::colony::cluster::ServletEntry::new(
+					::std::sync::Arc::clone(&gateway_id),
+					::std::sync::Arc::from($crate::colony::common::type_canonical_bytes(urn).as_slice()),
+					::std::sync::Arc::clone(&gateway_id),
+					$config.pheromone.initial_pheromone,
+					$config.pheromone.abandonment_limit,
+				).with_route_kind($crate::colony::cluster::RouteKind::Peer);
+				$servlet_registry.add(entry)
+			});
+
+			let status = match installed {
+				Ok(()) => {
+					let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISED);
+					$crate::policy::TransitStatus::Ok
+				}
+				Err(_) => {
+					let _ = $servlet_registry.remove_by_hive(&gateway_id);
+					// Release the replay record so the peer can resend the
+					// same signed advertisement after the failure clears.
+					#[cfg(feature = "x509")]
+					if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
+						$replay_guard.forget(signer_info.signature.as_bytes());
+					}
+
+					let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
+					$crate::policy::TransitStatus::PermissionDenied
+				}
+			};
+
+			return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse { status });
+		}
 		}
 	}};
 
@@ -815,6 +939,9 @@ macro_rules! cluster {
 	(@impl_drop $cluster_name:ident) => {
 		impl Drop for $cluster_name {
 			fn drop(&mut self) {
+				if let Some(handle) = self.advertise_handle.take() {
+					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
+				}
 				if let Some(handle) = self.evaporation_handle.take() {
 					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
 				}
@@ -868,6 +995,80 @@ macro_rules! cluster {
 			cmd_response.heartbeat.ok_or($crate::colony::cluster::ClusterError::MalformedResponse)
 		}.await
 	};
+
+	// Helper: Send one signed advertisement of the exported type slate to one
+	// peer gateway. Signs with the gateway key. Only invoked under x509: `tls`
+	// access here is expansion-checked, never reached without the feature.
+	(@send_advertisement_async $pool:expr, $config:expr, $peer_addr:expr, $gateway_addr:expr, $types:expr, $digest:path) => {
+		async {
+			use $crate::builder::TypeBuilder;
+
+			let request = $crate::colony::common::ClusterRequest::AdvertisePeer(
+				$crate::colony::common::PeerAdvertisement {
+					issued_at_ms: $crate::colony::common::current_timestamp_ms(),
+					gateway_addr: $gateway_addr,
+					advertised_types: $types,
+				}
+			);
+
+			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
+				.with_id(b"peer-advertise")
+				.with_message(request)
+				.with_priority($crate::MessagePriority::NetworkControl)
+				.with_witness_hasher::<$digest>()
+				.build()?;
+
+			let signed_frame = frame
+				.sign_with_provider::<$digest, _>($config.tls.key.as_ref())
+				.await?;
+
+			let mut client = $pool.connect($peer_addr).await?;
+
+			let response = client.emit(signed_frame, None).await?
+				.ok_or($crate::colony::cluster::ClusterError::NoResponse)?;
+
+			let decoded: $crate::colony::common::PeerAdvertisementResponse =
+				$crate::decode(&response.message)?;
+			Ok::<_, $crate::colony::cluster::ClusterError>(decoded.status)
+		}.await
+	};
+
+	// Helper: Build the advertise beat task. Inert unless an interval and
+	// peers are configured. Each tick snapshots the hive registry: the
+	// slate is point-in-time truth, so types appear as hives register and
+	// disappear as they leave. An empty slate is still sent.
+	(@build_advertise_task $protocol:path, $registry:expr, $pool:expr, $config:expr, $gateway_addr:expr, $digest:path) => {{
+		let registry = $registry;
+		let pool = $pool;
+		let config = $config;
+		let gateway_addr = $gateway_addr;
+
+		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
+			let Some(interval) = config.advertise_interval else { return };
+			if config.peers.is_empty() {
+				return;
+			}
+
+			loop {
+				$crate::colony::servlet::servlet_runtime::rt::sleep(interval).await;
+
+				let slate: Vec<$crate::utils::urn::Urn<'static>> = registry
+					.to_available_servlets()
+					.unwrap_or_default()
+					.iter()
+					.filter_map(|bytes| core::str::from_utf8(bytes).ok())
+					.filter_map(|canonical| canonical.parse().ok())
+					.collect();
+
+				for peer in config.peers.iter() {
+					let Ok(peer_addr) = peer.parse() else { continue };
+					let _ = $crate::cluster!(
+						@send_advertisement_async pool, config, peer_addr, gateway_addr.clone(), slate.clone(), $digest
+					);
+				}
+			}
+		})
+	}};
 
 	// Helper: Process heartbeat result - updates registry based on success/failure
 	(@process_heartbeat_result $registry:expr, $servlet_registry:expr, $hive_addr:expr, $result:expr, $max_failures:expr, $config:expr, $trace:expr) => {

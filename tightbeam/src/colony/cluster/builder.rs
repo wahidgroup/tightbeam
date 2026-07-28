@@ -3,14 +3,13 @@
 use core::time::Duration;
 use std::sync::Arc;
 
-use crate::policy::GatePolicy;
-use crate::transport::client::pool::PoolConfig;
-
 use super::{
 	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf, DEFAULT_HEARTBEAT_INTERVAL_SECS,
 	DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
 use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
+use crate::policy::GatePolicy;
+use crate::transport::client::pool::PoolConfig;
 
 // ============================================================================
 // HeartbeatConfBuilder
@@ -102,6 +101,8 @@ pub struct ClusterConfBuilder {
 	pool_config: PoolConfig,
 	control_freshness_window_ms: u64,
 	bind_addr: Option<String>,
+	peers: Vec<String>,
+	advertise_interval: Option<Duration>,
 	tls: ClusterTlsConfig,
 }
 
@@ -118,6 +119,8 @@ impl ClusterConf {
 			pool_config: PoolConfig::default(),
 			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			bind_addr: None,
+			peers: Vec::new(),
+			advertise_interval: None,
 			tls,
 		}
 	}
@@ -174,6 +177,18 @@ impl ClusterConfBuilder {
 		self
 	}
 
+	/// Set the peer gateways this gateway advertises its exported types to
+	pub fn with_peers(mut self, peers: impl IntoIterator<Item = String>) -> Self {
+		self.peers = peers.into_iter().collect();
+		self
+	}
+
+	/// Set the re-advertise beat cadence (enables the advertise beat)
+	pub fn with_advertise_interval(mut self, interval: Duration) -> Self {
+		self.advertise_interval = Some(interval);
+		self
+	}
+
 	/// Build the ClusterConf
 	pub fn build(self) -> ClusterConf {
 		ClusterConf {
@@ -185,6 +200,8 @@ impl ClusterConfBuilder {
 			pool_config: self.pool_config,
 			control_freshness_window_ms: self.control_freshness_window_ms,
 			bind_addr: self.bind_addr,
+			peers: self.peers,
+			advertise_interval: self.advertise_interval,
 			tls: self.tls,
 		}
 	}
