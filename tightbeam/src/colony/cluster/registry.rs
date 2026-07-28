@@ -1,6 +1,6 @@
 //! Hive registry for managing registered hives and servlet type indexing
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -88,12 +88,16 @@ impl HiveRegistry {
 			}
 		}
 
-		// Index by servlet TYPE: instance URNs collapse onto their type key
-		// so work routed by type finds every instance-bearing hive.
+		// Index by servlet TYPE: instance URNs collapse onto their type
+		// key so work routed by type finds every instance-bearing hive.
+		let mut seen = HashSet::new();
 		let servlet_types: Arc<[SharedId]> = request
 			.servlet_addresses
 			.iter()
-			.map(|info| Arc::from(type_canonical_bytes(&info.servlet_id).as_slice()))
+			.filter_map(|info| {
+				let type_key: SharedId = Arc::from(type_canonical_bytes(&info.servlet_id).as_slice());
+				seen.insert(Arc::clone(&type_key)).then_some(type_key)
+			})
 			.collect();
 
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
@@ -296,6 +300,24 @@ mod tests {
 				})
 				.collect(),
 		}
+	}
+
+	fn type_key(name: &str) -> Vec<u8> {
+		let namespace = ColonyNamespace::default();
+		let urn = namespace.servlet(name).expect("test names satisfy the mint grammar");
+		type_canonical_bytes(&urn)
+	}
+
+	#[test]
+	fn register_deduplicates_type_index() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::default();
+		registry.register(request(b"hive1", &["ping", "ping"]))?;
+
+		let hives = registry.hives_for_type(&type_key("ping"))?;
+		assert_eq!(hives.len(), 1);
+		assert_eq!(hives[0].servlet_types.len(), 1);
+
+		Ok(())
 	}
 
 	/// (ttl, expected_evicted_len, expected_remaining_len)
