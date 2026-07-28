@@ -148,8 +148,14 @@ pub(super) fn cancel_error(reason: CancelReason) -> TransportError {
 }
 
 /// Resolve a locally-initiated stream as cancelled and notify the
-/// peer (best-effort): the local teardown shared by every abandoned
-/// send path (drop guards, abandoned sinks, explicit close).
+/// peer: the local teardown shared by every abandoned send path
+/// (drop guards, abandoned sinks, explicit close).
+///
+/// The wire cancel travels on a fresh sender clone, whose guaranteed
+/// slot (channel capacity = buffer + senders) admits it even when the
+/// queue is otherwise full. The only unreachable case is a
+/// disconnected queue, where the writer - and the connection - are
+/// already gone.
 pub(super) fn enqueue_stream_cancel(shared: &MuxShared, outbound: &mpsc::Sender<Outbound>, stream_id: u32) {
 	if let Some(mut forwarder) = shared.take_duplex(stream_id) {
 		let _ = forwarder.forward(BodyEvent::Failed(cancel_error(CancelReason::Cancelled)));
@@ -1144,6 +1150,8 @@ mod tests {
 	use super::super::testing::{noop_cx, poll_chunk};
 	use super::*;
 
+	use crate::transport::envelopes::MuxEnvelope;
+
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	use crate::transport::envelopes::MuxPingPackage;
 
@@ -1738,6 +1746,33 @@ mod tests {
 		let mut cx = noop_cx();
 		let enqueued = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut cx);
 		assert!(matches!(enqueued, Poll::Ready(Ok(()))));
+	}
+
+	// A wire cancel enqueued while the queue is saturated still
+	// travels: the teardown clone's guaranteed slot (channel capacity
+	// = buffer + senders) admits it past a full buffer.
+	#[test]
+	fn test_stream_cancel_survives_saturated_queue() {
+		let shared = shared(MuxRole::Client, 2);
+		allocate_ids(&shared, &[1]);
+
+		let (outbound, mut wire) = mpsc::channel(0);
+		let mut filler = outbound_handle(&outbound);
+		while filler.try_send(Outbound::Close).is_ok() {}
+
+		enqueue_stream_cancel(&shared, &outbound, 1);
+
+		let mut saw_cancel = false;
+		while let Ok(command) = wire.try_recv() {
+			if matches!(
+				&command,
+				Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Cancel(package)))
+					if package.stream_id() == 1
+			) {
+				saw_cancel = true;
+			}
+		}
+		assert!(saw_cancel);
 	}
 
 	// A peer GoAway disowns duplex replies above its watermark:

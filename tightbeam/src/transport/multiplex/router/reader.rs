@@ -912,7 +912,7 @@ where
 		let event = InboundEvent::StreamOpen(stream_id, kind, body);
 		if self.inbound.send(event).await.is_err() {
 			self.peer_bodies.remove(&stream_id);
-			self.refuse_stream(stream_id);
+			self.refuse_stream(stream_id)?;
 		}
 
 		Ok(())
@@ -925,7 +925,7 @@ where
 		self.shared.emit_event(events::MUX_OPEN_DRAINING);
 
 		self.charge_inbound_chunk(package.payload())?;
-		self.refuse_stream(stream_id);
+		self.refuse_stream(stream_id)?;
 
 		Ok(())
 	}
@@ -1087,7 +1087,7 @@ where
 		let event = InboundEvent::Request(stream_id, Arc::new(frame));
 		if self.inbound.send(event).await.is_err() {
 			// No responder is serving this connection
-			self.refuse_stream(stream_id);
+			self.refuse_stream(stream_id)?;
 		}
 
 		Ok(())
@@ -1140,9 +1140,12 @@ where
 		self.queue_ping_ack(MuxPingPackage::new(true, package.opaque()))
 	}
 
-	fn refuse_stream(&mut self, stream_id: u32) {
+	/// Refuse a peer-initiated stream with a `Rejected` cancel. Rides
+	/// the control buffer: a refusal lost to a full writer queue would
+	/// leave the peer's stream pending forever.
+	fn refuse_stream(&mut self, stream_id: u32) -> TransportResult<()> {
 		let package = MuxCancelPackage::new(stream_id, CancelReason::Rejected);
-		let _ = self.outbound.try_send(Outbound::Envelope(package.into()));
+		self.queue_control(package.into())
 	}
 
 	fn protocol_violation(&mut self) -> TransportError {
@@ -1271,6 +1274,23 @@ mod tests {
 
 		let outcome = driver.as_mut().poll(&mut cx);
 		assert!(matches!(outcome, Poll::Ready(Err(TransportError::InvalidMessage))));
+		Ok(())
+	}
+
+	// A refusal cancel drawn while the writer queue is full buffers
+	// in the control queue instead of vanishing: a lost refusal
+	// leaves the peer's stream pending forever.
+	#[test]
+	fn test_refusal_cancel_buffers_when_queue_full() -> TransportResult<()> {
+		let mut fixture = reader_with_full_queue(vec![]);
+
+		fixture.driver.refuse_stream(1)?;
+
+		assert!(matches!(
+			fixture.driver.pending_control.front(),
+			Some(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Cancel(package))))
+				if package.stream_id() == 1
+		));
 		Ok(())
 	}
 

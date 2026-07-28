@@ -39,7 +39,7 @@ use tightbeam::transport::handshake::negotiation::{
 use tightbeam::transport::handshake::receipt::SessionReceipt;
 use tightbeam::transport::multiplex::{MuxAcceptor, MuxRole, MuxTransport, ReplySink, StreamBody};
 use tightbeam::transport::policy::PolicyConf;
-use tightbeam::transport::serve::{serve_duplex_mux, serve_streaming_mux};
+use tightbeam::transport::serve::MuxService;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	ClientBuilder, ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, ResponsePackage, TransportError,
@@ -104,8 +104,12 @@ pub(crate) const SECOND_CONNECTION_DIALED: Urn<'static> = Urn::new("test", "even
 pub(crate) const SECOND_LEASE_ECHOES: Urn<'static> = Urn::new("test", "event:pool-mux/second-lease-echoes");
 pub(crate) const POOLED_DUPLEX_ECHOES_CHUNKS: Urn<'static> =
 	Urn::new("test", "event:pool-mux/pooled-duplex-echoes-chunks");
+pub(crate) const POOLED_MIXED_KINDS_SHARE_ONE_CONNECTION: Urn<'static> =
+	Urn::new("test", "event:pool-mux/pooled-mixed-kinds-share-one-connection");
 pub(crate) const POOLED_STREAM_RESPONSE_REPORTS_LENGTH: Urn<'static> =
 	Urn::new("test", "event:pool-mux/pooled-stream-response-reports-length");
+pub(crate) const UNSERVED_KIND_ANSWERS_UNIMPLEMENTED: Urn<'static> =
+	Urn::new("test", "event:pool-mux/unserved-kind-answers-unimplemented");
 pub(crate) const SINGLE_FLIGHT_ECHO_ON_MUX_SERVER: Urn<'static> =
 	Urn::new("test", "event:pool-mux/single-flight-echo-on-mux-server");
 
@@ -132,60 +136,83 @@ async fn start_echo_server(
 	Ok((handle, addr))
 }
 
-/// Accept loop serving each mux-negotiated connection through
-/// [`serve_streaming_mux`]: the handler answers with the collected
-/// body length as a frame label.
-async fn start_streaming_length_server(
+/// Serve every accepted connection with `service` through the `server!`
+/// service form: mux takeover routes all stream kinds, non-mux peers get
+/// the single-flight unary loop.
+async fn start_service_server<S>(
 	materials: &ServerMaterials,
-) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
+	service: S,
+) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError>
+where
+	S: MuxService,
+{
 	let (listener, addr) = bind_pool_listener(materials).await?;
-	let acceptor = tokio::spawn(async move {
-		while let Ok((transport, _peer)) = listener.accept().await {
-			tokio::spawn(async move {
-				let mut transport = transport.with_mux_offer(Some(mux_offer(8)));
-				let settings = match transport.negotiate_mux().await {
-					Ok(Some(settings)) => settings,
-					_ => return,
-				};
-				let handler = |body: StreamBody, _session: SessionContext| async move {
-					let bytes = body.into_bytes().await?;
-					Ok(Some(mux_frame(&bytes.len().to_string())))
-				};
-				let _ = serve_streaming_mux(transport, settings, handler, None).await;
-			});
-		}
-	});
+	let acceptor = server! {
+		protocol TokioListener: listener,
+		policies: { with_mux_offer: [ Some(mux_offer(8)) ] },
+		service: service
+	};
 
 	Ok((acceptor, addr))
 }
 
-/// Accept loop serving each mux-negotiated connection through
-/// [`serve_duplex_mux`]: the handler echoes every request chunk back
-/// through the reply sink.
-async fn start_duplex_echo_server(
-	materials: &ServerMaterials,
-) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError> {
-	let (listener, addr) = bind_pool_listener(materials).await?;
-	let acceptor = tokio::spawn(async move {
-		while let Ok((transport, _peer)) = listener.accept().await {
-			tokio::spawn(async move {
-				let mut transport = transport.with_mux_offer(Some(mux_offer(8)));
-				let settings = match transport.negotiate_mux().await {
-					Ok(Some(settings)) => settings,
-					_ => return,
-				};
-				let handler = |mut body: StreamBody, mut sink: ReplySink, _session: SessionContext| async move {
-					while let Some(chunk) = body.chunk().await? {
-						sink.push(&chunk).await?;
-					}
-					Ok(())
-				};
-				let _ = serve_duplex_mux(transport, settings, handler, None).await;
-			});
-		}
-	});
+/// Streaming-only service: answers with the collected body length as
+/// a frame label. Unary and duplex kinds refuse with `Unimplemented`
+/// through the [`MuxService`] defaults.
+#[derive(Clone)]
+struct LengthService;
 
-	Ok((acceptor, addr))
+impl MuxService for LengthService {
+	async fn streaming(&self, body: StreamBody, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+		let bytes = body.into_bytes().await?;
+		Ok(Some(mux_frame(&bytes.len().to_string())))
+	}
+}
+
+/// Duplex-only service: echoes every request chunk back through the reply sink.
+#[derive(Clone)]
+struct DuplexEchoService;
+
+impl MuxService for DuplexEchoService {
+	async fn duplex(
+		&self,
+		mut body: StreamBody,
+		mut reply: ReplySink,
+		_session: SessionContext,
+	) -> Result<(), TightBeamError> {
+		while let Some(chunk) = body.chunk().await? {
+			reply.push(&chunk).await?;
+		}
+		Ok(())
+	}
+}
+
+/// Full-service handler: unary echoes the frame, streaming reports
+/// the collected length, duplex echoes chunk by chunk.
+#[derive(Clone)]
+struct MixedService;
+
+impl MuxService for MixedService {
+	async fn unary(&self, frame: Frame, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+		Ok(Some(frame))
+	}
+
+	async fn streaming(&self, body: StreamBody, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+		let bytes = body.into_bytes().await?;
+		Ok(Some(mux_frame(&bytes.len().to_string())))
+	}
+
+	async fn duplex(
+		&self,
+		mut body: StreamBody,
+		mut reply: ReplySink,
+		_session: SessionContext,
+	) -> Result<(), TightBeamError> {
+		while let Some(chunk) = body.chunk().await? {
+			reply.push(&chunk).await?;
+		}
+		Ok(())
+	}
 }
 
 fn mux_pool_with_idle_timeout(
@@ -275,13 +302,13 @@ tb_assert_spec! {
 }
 
 // Streaming reaches through the orchestration layer: pooled lease opens
-// the stream, `serve_streaming_mux` collects and answers.
+// the stream, the streaming-only service collects and answers.
 tb_scenario! {
 	name: pooled_open_stream_reaches_streaming_server,
 	spec: PooledStreamSpec,
 	environment ServiceClient {
 		context: ServerMaterials::generate(),
-		server: |env| async move { start_streaming_length_server(&env.context).await },
+		server: |env| async move { start_service_server(&env.context, LengthService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
 			let lease = pool.connect(addr).await?;
@@ -314,13 +341,13 @@ tb_assert_spec! {
 }
 
 // Duplex reaches through the orchestration layer: pooled lease opens
-// the duplex, `serve_duplex_mux` echoes chunk by chunk.
+// the duplex, the duplex-only service echoes chunk by chunk.
 tb_scenario! {
 	name: pooled_open_duplex_echoes_through_serve_wrapper,
 	spec: PooledDuplexSpec,
 	environment ServiceClient {
 		context: ServerMaterials::generate(),
-		server: |env| async move { start_duplex_echo_server(&env.context).await },
+		server: |env| async move { start_service_server(&env.context, DuplexEchoService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
 			let lease = pool.connect(addr).await?;
@@ -338,6 +365,123 @@ tb_scenario! {
 				first.as_deref() == Some(b"ping".as_ref())
 					&& second.as_deref() == Some(b"pong".as_ref())
 					&& terminal.is_none(),
+			)?;
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub PooledMixedKindsSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::POOL_DIAL, exactly!(1)),
+			(POOLED_MIXED_KINDS_SHARE_ONE_CONNECTION, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// The point of stream kinds: unary, streaming, and duplex interactions run
+// concurrently on one pooled connection against one service.
+tb_scenario! {
+	name: pooled_mixed_kinds_share_one_connection,
+	spec: PooledMixedKindsSpec,
+	environment ServiceClient {
+		context: ServerMaterials::generate(),
+		server: |env| async move { start_service_server(&env.context, MixedService).await },
+		client: |ClientEnv { trace, context: materials, addr }| async move {
+			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			// Leases are exclusive per in-flight interaction; one pooled
+			// connection carries all three.
+			let mut unary_lease = pool.connect(addr).await?;
+			let stream_lease = pool.connect(addr).await?;
+			let duplex_lease = pool.connect(addr).await?;
+
+			let (mut stream_sink, stream_response) = stream_lease.open_stream()?;
+			let (mut duplex_sink, mut duplex_body) = duplex_lease.open_duplex()?;
+			let unary_frame = mux_frame("mixed-unary");
+
+			let streaming = async move {
+				stream_sink.push(b"abcd").await?;
+				stream_sink.close_with(b"efgh").await?;
+				stream_response.await
+			};
+			let duplex = async move {
+				duplex_sink.push(b"ping").await?;
+				let echoed = duplex_body.chunk().await?;
+				duplex_sink.close().await?;
+				let terminal = duplex_body.chunk().await?;
+				Ok::<_, TransportError>((echoed, terminal))
+			};
+
+			let (unary_reply, stream_reply, duplex_reply) =
+				tokio::join!(unary_lease.emit(unary_frame.to_owned(), None), streaming, duplex);
+
+			let (echoed, terminal) = duplex_reply?;
+			trace.event_with(
+				POOLED_MIXED_KINDS_SHARE_ONE_CONNECTION,
+				&[],
+				unary_reply? == Some(unary_frame)
+					&& stream_reply?.map(|frame| frame.message.to_owned())
+						== Some(mux_frame("8").message.to_owned())
+					&& echoed.as_deref() == Some(b"ping".as_ref())
+					&& terminal.is_none(),
+			)?;
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub UnservedKindSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(UNSERVED_KIND_ANSWERS_UNIMPLEMENTED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A kind the service does not implement refuses its stream with
+// `Unimplemented` while leaving the connection serving other streams.
+tb_scenario! {
+	name: unserved_kind_answers_unimplemented,
+	spec: UnservedKindSpec,
+	environment ServiceClient {
+		context: ServerMaterials::generate(),
+		server: |env| async move { start_service_server(&env.context, LengthService).await },
+		client: |ClientEnv { trace, context: materials, addr }| async move {
+			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let mut lease = pool.connect(addr).await?;
+
+			// Duplex against the streaming-only service: the trailer
+			// carries the refusal into the reply body.
+			let (duplex_sink, mut duplex_body) = lease.open_duplex()?;
+			duplex_sink.close().await?;
+			let duplex_refused = matches!(
+				duplex_body.chunk().await,
+				Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
+			);
+
+			// Unary against the same service: the response future
+			// surfaces the refusal, and the connection still serves
+			// the streaming kind afterwards.
+			let unary_refused = matches!(
+				lease.emit(mux_frame("unserved"), None).await,
+				Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
+			);
+
+			let (sink, response) = lease.open_stream()?;
+			sink.close_with(b"abcd").await?;
+
+			let served = response.await?.map(|frame| frame.message.to_owned()) == Some(mux_frame("4").message.to_owned());
+			trace.event_with(
+				UNSERVED_KIND_ANSWERS_UNIMPLEMENTED,
+				&[],
+				duplex_refused && unary_refused && served,
 			)?;
 			Ok(())
 		}

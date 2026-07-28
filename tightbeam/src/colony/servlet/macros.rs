@@ -64,7 +64,9 @@ macro_rules! __servlet_structs {
 	};
 }
 
-// Helper macro: Generate server creation logic (with or without collector gates)
+// Helper macro: Assemble the ServletHandlers service from the handler
+// arms and hand the listener to the library accept loop. Every arm is
+// optional; absent kinds refuse with `Unimplemented`.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __servlet_create_server {
@@ -73,112 +75,52 @@ macro_rules! __servlet_create_server {
 		$listener:ident,
 		$collector_gates:ident,
 		$mux_offer:ident,
-		$servlet_context:ident,
-		$trace_handle:ident,
-		$frame:ident,
-		$ctx:ident,
-		$handler_body:block
-	) => {
-		if $collector_gates.is_empty() {
-			$crate::server! {
-				protocol $protocol: $listener,
-				policies: { with_mux_offer: [ $mux_offer.to_owned() ] },
-				handle: move |frame_in| {
-					let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
-					async move {
-						let $frame = frame_in;
-						let $ctx = &*ctx_clone;
-						$handler_body
-					}
-				}
-			}
-		} else {
-			use $crate::transport::policy::PolicyConf;
-			$crate::colony::servlet::servlet_runtime::rt::spawn({
-				use $crate::transport::MessageCollector;
-				async move {
-					loop {
-						match $listener.accept().await {
-							Ok((mut transport, _addr)) => {
-								for gate in &$collector_gates {
-									transport = transport.with_collector_gate(::std::sync::Arc::clone(gate));
-								}
+		$servlet_context:ident
+		$(, handle: |$frame:ident, $ctx:ident| $handler_body:block)?
+		$(, stream: |$sbody:ident, $sctx:ident| $stream_body:block)?
+		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| $duplex_body:block)?
+	) => {{
+		let __service = $crate::colony::servlet::ServletHandlers::default()
+			$(
+				.on_unary(move |__frame_in: $crate::Frame, __ctx: ::std::sync::Arc<$crate::colony::servlet::ServletContext>| async move {
+					let $frame = __frame_in;
+					let $ctx = &*__ctx;
+					let __response: ::core::result::Result<
+						::core::option::Option<$crate::Frame>,
+						$crate::TightBeamError,
+					> = $handler_body;
+					__response
+				})
+			)?
+			$(
+				.on_streaming(move |__body_in: $crate::transport::multiplex::StreamBody, __ctx: ::std::sync::Arc<$crate::colony::servlet::ServletContext>| async move {
+					let $sbody = __body_in;
+					let $sctx = &*__ctx;
+					let __response: ::core::result::Result<
+						::core::option::Option<$crate::Frame>,
+						$crate::TightBeamError,
+					> = $stream_body;
+					__response
+				})
+			)?
+			$(
+				.on_duplex(move |__body_in: $crate::transport::multiplex::StreamBody, __reply_in: $crate::transport::multiplex::ReplySink, __ctx: ::std::sync::Arc<$crate::colony::servlet::ServletContext>| async move {
+					let $dbody = __body_in;
+					let $dreply = __reply_in;
+					let $dctx = &*__ctx;
+					let __response: ::core::result::Result<(), $crate::TightBeamError> = $duplex_body;
+					__response
+				})
+			)?;
 
-								transport = transport.with_mux_offer($mux_offer.to_owned());
-
-								let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
-								$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
-									let mut transport = transport;
-									// Servlet handlers are context-blind: the
-									// session context the takeover supplies is
-									// dropped.
-									let __servlet_mux_handler = {
-										let __ctx = ::std::sync::Arc::clone(&ctx_clone);
-										::std::sync::Arc::new(
-											move |frame_in: $crate::Frame, _session: $crate::policy::SessionContext| {
-												let __ctx = ::std::sync::Arc::clone(&__ctx);
-												async move {
-													let $frame = frame_in;
-													let $ctx = &*__ctx;
-													let __response: ::core::result::Result<
-														::core::option::Option<$crate::Frame>,
-														$crate::TightBeamError,
-													> = $handler_body;
-													__response
-												}
-											},
-										)
-									};
-									let mut __servlet_error_tx =
-										$crate::macros::server::server_runtime::rt::empty_error_channel();
-									let mut __servlet_ok_tx =
-										$crate::macros::server::server_runtime::rt::empty_ok_channel();
-									$crate::__tightbeam_server_mux_takeover!(
-										transport,
-										__servlet_mux_handler,
-										__servlet_error_tx,
-										__servlet_ok_tx
-									);
-									loop {
-										let (frame_arc, status) = match transport.collect_message().await {
-											Ok(result) => result,
-											Err(_err) => break,
-										};
-
-										let frame_owned = ::std::sync::Arc::try_unwrap(frame_arc)
-											.unwrap_or_else(|arc| arc.as_ref().clone());
-										let response = if status == $crate::policy::TransitStatus::Ok {
-											let ctx_for_handler = ::std::sync::Arc::clone(&ctx_clone);
-											let result: Result<Option<$crate::Frame>, $crate::TightBeamError> =
-												async move {
-													let $frame = frame_owned;
-													let $ctx = &*ctx_for_handler;
-													$handler_body
-												}
-												.await;
-
-											match result {
-												Ok(opt) => opt,
-												Err(_) => None,
-											}
-										} else {
-											None
-										};
-
-										match transport.send_response(status, response).await {
-											Ok(()) => continue,
-											Err(_err) => break,
-										}
-									}
-								});
-							}
-							Err(_err) => break,
-						}
-					}
-				}
-			})
-		}
-	};
+		$crate::colony::servlet::serve_servlet(
+			$listener,
+			$collector_gates,
+			$mux_offer,
+			__service,
+			::std::sync::Arc::clone(&$servlet_context),
+		)
+	}};
 }
 
 // Helper macro: Generate the start_impl method with all server setup logic
@@ -189,10 +131,10 @@ macro_rules! __servlet_start_impl {
 		$servlet_name:ident,
 		$protocol:path,
 		$input:ty,
-		$env_config:ty,
-		$frame:ident,
-		$ctx:ident,
-		$handler_body:block
+		$env_config:ty
+		$(, handle: |$frame:ident, $ctx:ident| $handler_body:block)?
+		$(, stream: |$sbody:ident, $sctx:ident| $stream_body:block)?
+		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| $duplex_body:block)?
 	) => {
 		$crate::paste::paste! {
 			async fn start_impl(
@@ -251,11 +193,10 @@ macro_rules! __servlet_start_impl {
 					listener,
 					collector_gates,
 					mux_offer,
-					servlet_context,
-					trace_handle,
-					$frame,
-					$ctx,
-					$handler_body
+					servlet_context
+					$(, handle: |$frame, $ctx| $handler_body)?
+					$(, stream: |$sbody, $sctx| $stream_body)?
+					$(, duplex: |$dbody, $dreply, $dctx| $duplex_body)?
 				);
 
 				Ok(Self {
@@ -366,20 +307,62 @@ macro_rules! __servlet_box_impl {
 
 /// Servlet macro for creating containerized tightbeam applications.
 ///
-/// Two handler forms:
+/// Every handler arm is optional (at least one is required); kinds
+/// without an arm refuse with `Unimplemented`, so a streaming-only
+/// servlet declares just `stream:`.
+///
+/// Two unary handler forms:
 ///
 /// - `handle: |msg, frame, ctx|` -- typed delivery (default). Encrypted or
 ///   compressed bodies are normalized in place via the decryptor/inflator.
 /// - `handle: raw |frame, ctx|` -- opt-out for servlets that own the frame
 ///   lifecycle themselves.
+///
+/// Two streaming arms, served over negotiated multiplexed connections:
+///
+/// - `stream: |body, ctx| async move { ... }` -- consume a streamed request
+///   body ([`StreamBody`](crate::transport::multiplex::StreamBody)), answer
+///   with an optional unary reply frame.
+/// - `duplex: |body, reply, ctx| async move { ... }` -- consume request
+///   chunks while pushing reply chunks through the
+///   [`ReplySink`](crate::transport::multiplex::ReplySink).
+///
+/// The macro is sugar over
+/// [`ServletService`](crate::colony::servlet::ServletService) +
+/// [`serve_servlet`](crate::colony::servlet::serve_servlet): implement the
+/// trait directly for full control without the macro.
 #[macro_export]
 macro_rules! servlet {
+	// NO HANDLER ARMS: refuse at compile time, a servlet answering
+	// nothing is a declaration error.
+	(
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
+		protocol: $protocol:path $(,)?
+	) => {
+		::core::compile_error!(
+			"servlet! requires at least one handler arm (`handle:`, `stream:`, or `duplex:`)"
+		);
+	};
+
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
+		protocol: $protocol:path $(,)?
+	) => {
+		::core::compile_error!(
+			"servlet! requires at least one handler arm (`handle:`, `stream:`, or `duplex:`)"
+		);
+	};
 	// PUBLIC SERVLET, TYPED DELIVERY
 	(
 		$(#[$meta:meta])*
 		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path,
 		handle: |$msg:ident, $frame:ident, $ctx:ident| async move $handler_body:block
+		$(, stream: |$sbody:ident, $sctx:ident| async move $stream_body:block)?
+		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| async move $duplex_body:block)?
+		$(,)?
 	) => {
 		$crate::servlet! {
 			$(#[$meta])*
@@ -391,6 +374,8 @@ macro_rules! servlet {
 				let $msg: $input = $crate::decode(&$frame.message)?;
 				$handler_body
 			}
+			$(, stream: |$sbody, $sctx| async move $stream_body)?
+			$(, duplex: |$dbody, $dreply, $dctx| async move $duplex_body)?
 		}
 	};
 
@@ -400,6 +385,9 @@ macro_rules! servlet {
 		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path,
 		handle: |$msg:ident, $frame:ident, $ctx:ident| async move $handler_body:block
+		$(, stream: |$sbody:ident, $sctx:ident| async move $stream_body:block)?
+		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| async move $duplex_body:block)?
+		$(,)?
 	) => {
 		$crate::servlet! {
 			$(#[$meta])*
@@ -411,15 +399,20 @@ macro_rules! servlet {
 				let $msg: $input = $crate::decode(&$frame.message)?;
 				$handler_body
 			}
+			$(, stream: |$sbody, $sctx| async move $stream_body)?
+			$(, duplex: |$dbody, $dreply, $dctx| async move $duplex_body)?
 		}
 	};
 
-	// PUBLIC SERVLET, RAW FRAME
+	// PUBLIC SERVLET, RAW FRAME (unary arm optional)
 	(
 		$(#[$meta:meta])*
 		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
-		protocol: $protocol:path,
-		handle: raw |$frame:ident, $ctx:ident| async move $handler_body:block
+		protocol: $protocol:path
+		$(, handle: raw |$frame:ident, $ctx:ident| async move $handler_body:block)?
+		$(, stream: |$sbody:ident, $sctx:ident| async move $stream_body:block)?
+		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| async move $duplex_body:block)?
+		$(,)?
 	) => {
 		$crate::paste::paste! {
 			$(#[$meta])*
@@ -427,9 +420,10 @@ macro_rules! servlet {
 
 			impl $servlet_name {
 				$crate::__servlet_start_impl!(
-					$servlet_name, $protocol, $input, $env_config,
-					$frame, $ctx,
-					$handler_body
+					$servlet_name, $protocol, $input, $env_config
+					$(, handle: |$frame, $ctx| $handler_body)?
+					$(, stream: |$sbody, $sctx| $stream_body)?
+					$(, duplex: |$dbody, $dreply, $dctx| $duplex_body)?
 				);
 			}
 
@@ -440,12 +434,15 @@ macro_rules! servlet {
 		}
 	};
 
-	// PRIVATE SERVLET, RAW FRAME
+	// PRIVATE SERVLET, RAW FRAME (unary arm optional)
 	(
 		$(#[$meta:meta])*
 		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
-		protocol: $protocol:path,
-		handle: raw |$frame:ident, $ctx:ident| async move $handler_body:block
+		protocol: $protocol:path
+		$(, handle: raw |$frame:ident, $ctx:ident| async move $handler_body:block)?
+		$(, stream: |$sbody:ident, $sctx:ident| async move $stream_body:block)?
+		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| async move $duplex_body:block)?
+		$(,)?
 	) => {
 		$crate::paste::paste! {
 			$(#[$meta])*
@@ -453,9 +450,10 @@ macro_rules! servlet {
 
 			impl $servlet_name {
 				$crate::__servlet_start_impl!(
-					$servlet_name, $protocol, $input, $env_config,
-					$frame, $ctx,
-					$handler_body
+					$servlet_name, $protocol, $input, $env_config
+					$(, handle: |$frame, $ctx| $handler_body)?
+					$(, stream: |$sbody, $sctx| $stream_body)?
+					$(, duplex: |$dbody, $dreply, $dctx| $duplex_body)?
 				);
 			}
 

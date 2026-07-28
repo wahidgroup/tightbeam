@@ -34,9 +34,9 @@ macro_rules! hive {
 
 			/// Intra-hive communication context
 			struct [<$hive_name Context>] {
-				/// Map of servlet keys to addresses (type + "_" + addr -> addr)
+				/// Map of canonical instance-URN bytes to addresses
 				servlet_addresses: ::std::sync::Arc<::std::sync::RwLock<::std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
-				/// Type index for O(1) lookup (type_name -> first address)
+				/// Type index for O(1) lookup (canonical type-URN bytes -> first address)
 				type_index: ::std::sync::Arc<::std::sync::RwLock<::std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
 				/// Connection pool for calling sibling servlets
 				pool: ::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>,
@@ -50,9 +50,9 @@ macro_rules! hive {
 			$($vis)* struct $hive_name {
 				/// Registered servlets via ServletRegistry
 				servlets: ::std::sync::Arc<$crate::colony::hive::HashMapRegistry>,
-				/// Spawner functions for auto-scaling (type name -> spawner)
+				/// Spawner functions for auto-scaling (type URN -> spawner)
 				spawners: ::std::sync::Arc<
-					::std::collections::HashMap<&'static str, $crate::colony::hive::SpawnerFn>
+					::std::collections::HashMap<$crate::utils::urn::Urn<'static>, $crate::colony::hive::SpawnerFn>
 				>,
 				/// Hive configuration
 				config: $crate::colony::hive::HiveConf,
@@ -99,39 +99,73 @@ macro_rules! hive {
 						nonrepudiation: None,
 					}
 				}
+
+				/// O(1) servlet-type to address resolution via type_index
+				fn resolve_addr(
+					&self,
+					servlet_type: &$crate::utils::urn::Urn<'_>,
+				) -> Result<<$protocol as $crate::transport::Protocol>::Address, $crate::TightBeamError> {
+					let route_err = || $crate::TightBeamError::RouterError(
+						$crate::router::RouterError::UnknownRoute
+					);
+
+					let type_idx = self.type_index.read()
+						.map_err(|_| $crate::TightBeamError::LockPoisoned)?;
+
+					let addr_bytes = type_idx.get(&$crate::colony::common::canonical_bytes(servlet_type))
+						.cloned()
+						.ok_or_else(route_err)?;
+
+					let addr_str = String::from_utf8(addr_bytes)
+						.map_err(|_| route_err())?;
+					addr_str.parse().map_err(|_| route_err())
+				}
 			}
 
 			impl $crate::colony::hive::HiveContext for [<$hive_name Context>] {
-				fn call<'a>(&'a self, servlet_type: &'a [u8], request: Vec<u8>) -> $crate::colony::hive::CallFuture<'a> {
+				fn call<'a>(&'a self, servlet_type: &'a $crate::utils::urn::Urn<'a>, request: Vec<u8>) -> $crate::colony::hive::CallFuture<'a> {
 					Box::pin(async move {
 						use $crate::transport::client::pool::ConnectionBuilder;
 
-						let route_err = || $crate::TightBeamError::RouterError(
-							$crate::router::RouterError::UnknownRoute
-						);
+						let addr = self.resolve_addr(servlet_type)?;
 
-						// O(1) lookup by type using type_index
-						let addr: <$protocol as $crate::transport::Protocol>::Address = {
-							let type_idx = self.type_index.read()
-								.map_err(|_| $crate::TightBeamError::LockPoisoned)?;
-
-							let addr_bytes = type_idx.get(servlet_type)
-								.cloned()
-								.ok_or_else(route_err)?;
-
-							// Parse address bytes as string for SocketAddr parsing
-							let addr_str = String::from_utf8(addr_bytes)
-								.map_err(|_| route_err())?;
-							addr_str.parse().map_err(|_| route_err())?
-						};
-
-						// Connect and send
 						let mut pooled_conn = (&self.pool).connect(addr).await?;
 						let frame = Self::build_frame(b"hive-call", request);
 
 						pooled_conn.emit(frame, None).await?
 							.map(|mut r| core::mem::take(&mut r.message))
 							.ok_or($crate::TightBeamError::MissingResponse)
+					})
+				}
+
+				fn open_stream<'a>(&'a self, servlet_type: &'a $crate::utils::urn::Urn<'a>) -> $crate::colony::hive::StreamOpenFuture<'a> {
+					Box::pin(async move {
+						use $crate::transport::client::pool::ConnectionBuilder;
+
+						let addr = self.resolve_addr(servlet_type)?;
+						let pooled_conn = (&self.pool).connect(addr).await?;
+						let (sink, response) = pooled_conn.open_stream()?;
+
+						// The lease returns to the pool here; the sink and
+						// response live on the shared mux plane independently.
+						// Reply shape matches `call`: message bytes out.
+						let response: $crate::colony::hive::StreamResponseFuture =
+							Box::pin(async move {
+								response.await?
+									.map(|mut r| core::mem::take(&mut r.message))
+									.ok_or($crate::TightBeamError::MissingResponse)
+							});
+						Ok((sink, response))
+					})
+				}
+
+				fn open_duplex<'a>(&'a self, servlet_type: &'a $crate::utils::urn::Urn<'a>) -> $crate::colony::hive::DuplexOpenFuture<'a> {
+					Box::pin(async move {
+						use $crate::transport::client::pool::ConnectionBuilder;
+
+						let addr = self.resolve_addr(servlet_type)?;
+						let pooled_conn = (&self.pool).connect(addr).await?;
+						Ok(pooled_conn.open_duplex()?)
 					})
 				}
 			}
@@ -152,26 +186,32 @@ macro_rules! hive {
 
 					let config = config.unwrap_or_default();
 
-					// Create connection pool for intra-hive calls
 					let pool_config = $crate::transport::client::pool::PoolConfig {
 						idle_timeout: config.servlet_pool_idle_timeout,
 						max_connections: config.servlet_pool_size,
 						mux_offer: config.mux_offer.to_owned(),
 					};
-					let servlet_pool = ::std::sync::Arc::new(
-						$crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
-							.with_config(pool_config)
-							.build()
-					);
+					let pool_builder = $crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
+						.with_config(pool_config);
 
-					// Create empty hive context (will be populated in establish)
+					// Intra-hive calls validate servlet certificates against
+					// the hive trust store.
+					#[cfg(feature = "x509")]
+					let pool_builder = match config.trust_store.as_ref() {
+						Some(store) => pool_builder.with_trust_store(::std::sync::Arc::clone(store)),
+						None => pool_builder,
+					};
+
+					let servlet_pool = ::std::sync::Arc::new(pool_builder.build());
+
+					// Empty until establish() installs the servlet addresses
 					let hive_context = ::std::sync::Arc::new([<$hive_name Context>] {
 						servlet_addresses: ::std::sync::Arc::new(::std::sync::RwLock::new(::std::collections::HashMap::new())),
 						type_index: ::std::sync::Arc::new(::std::sync::RwLock::new(::std::collections::HashMap::new())),
 						pool: ::std::sync::Arc::clone(&servlet_pool),
 					});
 
-					// Default bind address (will be updated in establish)
+					// Placeholder until establish() binds the control server
 					let addr = <$protocol as $crate::transport::Protocol>::default_bind_address()?;
 
 					Ok(Self {
@@ -193,7 +233,7 @@ macro_rules! hive {
 
 				fn register<S, F, Fut>(
 					&mut self,
-					name: &'static str,
+					servlet_type: $crate::utils::urn::Urn<'static>,
 					servlet: S,
 					spawner: F,
 				) -> Result<(), $crate::TightBeamError>
@@ -206,7 +246,20 @@ macro_rules! hive {
 						return Err($crate::TightBeamError::AlreadyEstablished);
 					}
 
-					// Wrap spawner to return Box<dyn ServletBox>
+					// The type URN must belong to this hive's namespace and
+					// carry no instance tail: registration under a foreign
+					// authority or realm is refused before anything reaches
+					// a cluster.
+					match self.config.namespace.validate(&servlet_type)? {
+						$crate::colony::common::ColonyResource::Servlet { instance: None, .. } => {}
+						_ => return Err($crate::TightBeamError::UrnValidationError(
+							$crate::utils::urn::UrnValidationError::InvalidFormat {
+								field: "resource-id",
+								pattern: None,
+							}
+						)),
+					}
+
 					let spawner_boxed: $crate::colony::hive::SpawnerFn = ::std::sync::Arc::new(move |trace| {
 						let fut = spawner(trace);
 						Box::pin(async move {
@@ -215,13 +268,19 @@ macro_rules! hive {
 						}) as ::core::pin::Pin<Box<dyn ::core::future::Future<Output = Result<Box<dyn $crate::colony::hive::ServletBox>, $crate::TightBeamError>> + Send>>
 					});
 
+					// Registry keys are canonical instance-URN bytes: the
+					// type URN with this instance's locator as the tail.
+					let key = $crate::colony::common::canonical_bytes(
+						&hive!(@instance_urn servlet_type, servlet.addr_bytes())?
+					);
+
 					let registration = $crate::colony::hive::ServletRegistration {
 						servlet: Box::new(servlet),
 						spawner: spawner_boxed,
-						servlet_type: name,
+						servlet_type,
 					};
 
-					self.servlets.insert(name.as_bytes().to_vec(), registration)?;
+					self.servlets.insert(key, registration)?;
 					Ok(())
 				}
 
@@ -267,31 +326,28 @@ macro_rules! hive {
 
 					self.addr = addr;
 
-					// Build spawner map from registrations (keyed by &'static str)
-					let mut spawners_map: ::std::collections::HashMap<&'static str, $crate::colony::hive::SpawnerFn> =
+					let mut spawners_map: ::std::collections::HashMap<$crate::utils::urn::Urn<'static>, $crate::colony::hive::SpawnerFn> =
 						::std::collections::HashMap::new();
 					self.servlets.for_each(|_key, reg| {
-						spawners_map.insert(reg.servlet_type, ::std::sync::Arc::clone(&reg.spawner));
+						spawners_map.insert(reg.servlet_type.clone(), ::std::sync::Arc::clone(&reg.spawner));
 					});
 					self.spawners = ::std::sync::Arc::new(spawners_map);
 
-					// Populate hive context with servlet addresses
 					{
 						let mut addrs = self.hive_context.servlet_addresses.write()
 							.map_err(|_| $crate::TightBeamError::LockPoisoned)?;
 						let mut type_idx = self.hive_context.type_index.write()
 							.map_err(|_| $crate::TightBeamError::LockPoisoned)?;
 
-						self.servlets.for_each(|name, reg| {
+						self.servlets.for_each(|key, reg| {
 							let addr_bytes = reg.servlet.addr_bytes();
-							addrs.insert(name.clone(), addr_bytes.clone());
+							addrs.insert(key.clone(), addr_bytes.clone());
 							// First registration per type wins for O(1) lookup
-							let type_key = reg.servlet_type.as_bytes().to_vec();
+							let type_key = $crate::colony::common::canonical_bytes(&reg.servlet_type);
 							type_idx.entry(type_key).or_insert(addr_bytes);
 						});
 					}
 
-					// Clone values for control server
 					let servlets_for_server = ::std::sync::Arc::clone(&self.servlets);
 					let trace_for_server = ::std::sync::Arc::clone(&self.trace);
 					let utilization_for_server = ::std::sync::Arc::clone(&self.utilization);
@@ -348,11 +404,15 @@ macro_rules! hive {
 					Ok(())
 				}
 
+				fn context(&self) -> ::std::sync::Arc<dyn $crate::colony::hive::HiveContext> {
+					::std::sync::Arc::clone(&self.hive_context) as ::std::sync::Arc<dyn $crate::colony::hive::HiveContext>
+				}
+
 				fn addr(&self) -> Self::Address {
 					self.addr
 				}
 
-				fn servlet_addresses(&self) -> Vec<(&'static str, Vec<u8>)> {
+				fn servlet_addresses(&self) -> Vec<($crate::utils::urn::Urn<'static>, Vec<u8>)> {
 					self.servlets.addresses()
 				}
 
@@ -380,13 +440,17 @@ macro_rules! hive {
 				) -> Result<$crate::colony::hive::RegisterHiveResponse, $crate::TightBeamError> {
 					use $crate::transport::MessageEmitter;
 
-					// Build servlet info list
+					// Announced identities are instance URNs; non-UTF-8
+					// locators cannot occur past register()
 					let mut servlet_info_list: Vec<$crate::colony::hive::ServletInfo> = Vec::new();
-					self.servlets.for_each(|name, reg| {
-						servlet_info_list.push($crate::colony::hive::ServletInfo {
-							servlet_id: name.clone(),
-							address: reg.servlet.addr_bytes(),
-						});
+					self.servlets.for_each(|_key, reg| {
+						let address = reg.servlet.addr_bytes();
+						if let Ok(servlet_id) = hive!(@instance_urn reg.servlet_type, address.clone()) {
+							servlet_info_list.push($crate::colony::hive::ServletInfo {
+								servlet_id,
+								address,
+							});
+						}
 					});
 
 					let request = $crate::colony::common::ClusterRequest::RegisterHive(
@@ -398,7 +462,6 @@ macro_rules! hive {
 						}
 					);
 
-					// Connect to cluster
 					let stream = <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await?;
 					let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
 
@@ -430,7 +493,6 @@ macro_rules! hive {
 					let response_frame = transport.emit(frame, None).await?
 						.ok_or($crate::TightBeamError::MissingResponse)?;
 
-					// Store cluster address
 					if let Ok(mut addr) = self.cluster_addr.write() {
 						*addr = Some(cluster_addr);
 					}
@@ -439,7 +501,6 @@ macro_rules! hive {
 				}
 
 				async fn drain(&self) -> Result<(), $crate::TightBeamError> {
-					// Set draining state
 					{
 						let mut guard = self.draining_since.write()
 							.map_err(|_| $crate::TightBeamError::LockPoisoned)?;
@@ -645,7 +706,6 @@ macro_rules! hive {
 			}
 		}
 
-		// Parse and handle command
 		if let Ok(cmd) = $crate::decode::<$crate::colony::common::ClusterCommand>(&$frame.message) {
 			if cmd.heartbeat.is_some() {
 				let util = current_util();
@@ -681,28 +741,35 @@ macro_rules! hive {
 		#[cfg(not(feature = "x509"))]
 		let forget_replay = || {};
 
-		// Spawn request
+		// Spawn request (keyed by type URN)
 		if let Some(spawn) = $request.spawn {
-			let type_bytes = &spawn.servlet_type;
-			let type_str = core::str::from_utf8(type_bytes).unwrap_or("");
-
-			if let Some((&static_type, spawner)) = $spawners.iter().find(|(k, _)| **k == type_str) {
-				match spawner(::std::sync::Arc::clone(&$trace)).await {
+			if let Some(spawner) = $spawners.get(&spawn.servlet_type) {
+				let spawned = spawner(::std::sync::Arc::clone(&$trace)).await;
+				let keyed = match spawned {
 					Ok(new_servlet) => {
+						hive!(@instance_urn spawn.servlet_type, new_servlet.addr_bytes())
+							.map(|instance| (new_servlet, instance))
+					}
+					Err(e) => Err(e),
+				};
+
+				match keyed {
+					Ok((new_servlet, instance)) => {
 						let addr_bytes = new_servlet.addr_bytes();
-						let key_bytes = [static_type.as_bytes(), b"_", &addr_bytes].concat();
+						let key_bytes = $crate::colony::common::canonical_bytes(&instance);
+						let type_key = $crate::colony::common::canonical_bytes(&spawn.servlet_type);
 
 						let registration = $crate::colony::hive::ServletRegistration {
 							servlet: new_servlet,
 							spawner: ::std::sync::Arc::clone(spawner),
-							servlet_type: static_type,
+							servlet_type: spawn.servlet_type.clone(),
 						};
 
-						hive!(@add_to_context $hive_context, key_bytes.clone(), addr_bytes.clone(), type_bytes);
-						let _ = $servlets.insert(key_bytes.clone(), registration);
+						hive!(@add_to_context $hive_context, key_bytes.clone(), addr_bytes.clone(), &type_key);
+						let _ = $servlets.insert(key_bytes, registration);
 
 						return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-							$crate::colony::hive::HiveManagementResponse::spawn_ok(addr_bytes, key_bytes)
+							$crate::colony::hive::HiveManagementResponse::spawn_ok(addr_bytes, instance)
 						));
 					}
 					Err(_) => {
@@ -722,38 +789,34 @@ macro_rules! hive {
 			}
 		}
 
-		// List request
+		// List request (identities are instance URNs)
 		if $request.list.is_some() {
 			let mut list: Vec<$crate::colony::common::ServletInfo> = Vec::new();
-			$servlets.for_each(|name, reg| {
-				list.push($crate::colony::common::ServletInfo {
-					servlet_id: name.clone(),
-					address: reg.servlet.addr_bytes(),
-				});
+			$servlets.for_each(|_key, reg| {
+				let address = reg.servlet.addr_bytes();
+				if let Ok(servlet_id) = hive!(@instance_urn reg.servlet_type, address.clone()) {
+					list.push($crate::colony::common::ServletInfo { servlet_id, address });
+				}
 			});
 			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
 				$crate::colony::hive::HiveManagementResponse::list_ok(list)
 			));
 		}
 
-		// Stop request
+		// Stop request (instance URN IS the registry key)
 		if let Some(stop) = $request.stop {
-			let id_bytes = &stop.servlet_id;
-			let key_to_remove = $servlets.keys()
-				.into_iter()
-				.find(|k| k.as_slice() == id_bytes.as_slice());
+			let id_bytes = $crate::colony::common::canonical_bytes(&stop.servlet_id);
 
-			if let Some(key) = key_to_remove {
-				if let Some(reg) = $servlets.remove(&key) {
-					let removed_type = reg.servlet_type.as_bytes();
-					let removed_addr = reg.servlet.addr_bytes();
-					reg.servlet.stop_boxed();
-					hive!(@remove_from_context $hive_context, key, removed_type, removed_addr);
+			if let Some(reg) = $servlets.remove(&id_bytes) {
+				let removed_type_urn = reg.servlet_type.clone();
+				let removed_type = $crate::colony::common::canonical_bytes(&removed_type_urn);
+				let removed_addr = reg.servlet.addr_bytes();
+				reg.servlet.stop_boxed();
+				hive!(@remove_from_context $hive_context, id_bytes, &removed_type_urn, &removed_type, removed_addr);
 
-					return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-						$crate::colony::hive::HiveManagementResponse::stop_ok()
-					));
-				}
+				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+					$crate::colony::hive::HiveManagementResponse::stop_ok()
+				));
 			}
 
 			forget_replay();
@@ -788,8 +851,16 @@ macro_rules! hive {
 		let utilization_map = $utilization_map;
 		let cluster_addr = $cluster_addr;
 		let hive_context = $hive_context;
-		let hive_addr: Vec<u8> = $hive_addr.into();
 		let config = $config;
+		// Hive identity URN for scaling updates, minted once from the
+		// control address. Locators are Display-formatted so this is
+		// always Some; an address that cannot mint an exact identity
+		// (non-UTF-8 or empty) disables cluster notification rather
+		// than announcing a corrupted one.
+		let hive_addr: Vec<u8> = $hive_addr.into();
+		let hive_urn = String::from_utf8(hive_addr)
+			.ok()
+			.and_then(|addr| config.namespace.hive(addr).ok());
 
 		#[cfg(feature = "x509")]
 		let hive_tls_for_notify = config.hive_tls.as_ref().map(::std::sync::Arc::clone);
@@ -811,11 +882,11 @@ macro_rules! hive {
 				let mut hive_total_util = 0u64;
 				let mut hive_total_count = 0usize;
 
-				for (&servlet_type, spawner) in spawners.iter() {
-					let type_bytes = servlet_type.as_bytes();
-					let type_key = type_bytes.to_vec();
+				for (servlet_type, spawner) in spawners.iter() {
+					let type_key = $crate::colony::common::canonical_bytes(servlet_type);
+					let type_prefix = $crate::colony::common::type_prefix_bytes(servlet_type);
 					let scale_conf = config.servlet_overrides
-						.get(type_bytes)
+						.get(servlet_type)
 						.copied()
 						.unwrap_or(config.default_scale);
 
@@ -824,7 +895,7 @@ macro_rules! hive {
 					let mut util_sum = 0u64;
 					{
 						let util_guard = utilization_map.lock();
-						servlets.for_each_by_type(type_bytes, |key, reg| {
+						servlets.for_each_by_type(&type_prefix, |key, reg| {
 							count += 1;
 							util_sum += reg.servlet.utilization()
 								.map(|bp| bp.get() as u64)
@@ -839,7 +910,7 @@ macro_rules! hive {
 					let util_bps = $crate::colony::common::aggregate_utilization(util_sum, count);
 
 					let metrics = $crate::colony::common::ScalingMetrics {
-						servlet_type: type_key.clone(),
+						servlet_type: servlet_type.clone(),
 						utilization: util_bps,
 						current_instances: count,
 						config: scale_conf,
@@ -848,7 +919,7 @@ macro_rules! hive {
 					match $crate::colony::common::ScalingDecision::evaluate(&metrics) {
 						$crate::colony::common::ScalingDecision::ScaleUp => {
 							// Check cooldown
-							if last_scale_up.get(type_bytes)
+							if last_scale_up.get(&type_key)
 								.is_some_and(|t| t.elapsed() < scale_conf.scale_up_cooldown)
 							{
 								continue;
@@ -859,32 +930,37 @@ macro_rules! hive {
 							};
 
 							let addr_bytes = new_servlet.addr_bytes();
-							let key_bytes = [type_bytes, b"_", &addr_bytes].concat();
+							let Ok(instance) = hive!(@instance_urn servlet_type, addr_bytes.clone()) else {
+								continue;
+							};
+							let key_bytes = $crate::colony::common::canonical_bytes(&instance);
 
-							hive!(@add_to_context hive_context, key_bytes.clone(), addr_bytes.clone(), type_bytes);
+							hive!(@add_to_context hive_context, key_bytes.clone(), addr_bytes.clone(), &type_key);
 
-							hive!(@notify_cluster $protocol, ::std::sync::Arc::clone(&cluster_addr), hive_addr.clone(),
-								$crate::colony::hive::ServletInfo {
-									servlet_id: type_key.clone(),
-									address: addr_bytes,
-								},
-								true,
-								::std::sync::Arc::clone(&config.cluster_notify_retry),
-								hive_tls_for_notify,
-								trust_store_for_notify
-							);
+							if let Some(hive_urn) = hive_urn.as_ref() {
+								hive!(@notify_cluster $protocol, ::std::sync::Arc::clone(&cluster_addr), hive_urn.clone(),
+									$crate::colony::hive::ServletInfo {
+										servlet_id: instance,
+										address: addr_bytes,
+									},
+									true,
+									::std::sync::Arc::clone(&config.cluster_notify_retry),
+									hive_tls_for_notify,
+									trust_store_for_notify
+								);
+							}
 
 							let registration = $crate::colony::hive::ServletRegistration {
 								servlet: new_servlet,
 								spawner: ::std::sync::Arc::clone(spawner),
-								servlet_type,
+								servlet_type: servlet_type.clone(),
 							};
 							let _ = servlets.insert(key_bytes, registration);
 							last_scale_up.insert(type_key.clone(), std::time::Instant::now());
 						}
 						$crate::colony::common::ScalingDecision::ScaleDown => {
 							// Check cooldown
-							if last_scale_down.get(type_bytes)
+							if last_scale_down.get(&type_key)
 								.is_some_and(|t| t.elapsed() < scale_conf.scale_down_cooldown)
 							{
 								continue;
@@ -895,7 +971,7 @@ macro_rules! hive {
 						// is arbitrary, not the oldest.
 						let Some(key) = servlets.keys()
 							.into_iter()
-							.filter(|k| k.starts_with(type_bytes))
+							.filter(|k| k.starts_with(&type_prefix))
 							.last()
 						else {
 							continue;
@@ -907,18 +983,23 @@ macro_rules! hive {
 
 							let addr = reg.servlet.addr_bytes();
 							reg.servlet.stop_boxed();
-							hive!(@remove_from_context hive_context, key, type_bytes, addr.clone());
+							hive!(@remove_from_context hive_context, key, servlet_type, &type_key, addr.clone());
 
-							hive!(@notify_cluster $protocol, ::std::sync::Arc::clone(&cluster_addr), hive_addr.clone(),
-								$crate::colony::hive::ServletInfo {
-									servlet_id: type_key.clone(),
-									address: addr,
-								},
-								false,
-								::std::sync::Arc::clone(&config.cluster_notify_retry),
-								hive_tls_for_notify,
-								trust_store_for_notify
-							);
+							let Ok(instance) = hive!(@instance_urn servlet_type, addr.clone()) else {
+								continue;
+							};
+							if let Some(hive_urn) = hive_urn.as_ref() {
+								hive!(@notify_cluster $protocol, ::std::sync::Arc::clone(&cluster_addr), hive_urn.clone(),
+									$crate::colony::hive::ServletInfo {
+										servlet_id: instance,
+										address: addr,
+									},
+									false,
+									::std::sync::Arc::clone(&config.cluster_notify_retry),
+									hive_tls_for_notify,
+									trust_store_for_notify
+								);
+							}
 
 							last_scale_down.insert(type_key.clone(), std::time::Instant::now());
 						}
@@ -930,6 +1011,24 @@ macro_rules! hive {
 				utilization.store(aggregate.get(), ::core::sync::atomic::Ordering::Relaxed);
 			}
 		})
+	}};
+
+	// ==========================================================================
+	// URN Helpers
+	// ==========================================================================
+
+	// Instance URN for a servlet: its type URN with the locator as tail.
+	// Locators are Display-formatted addresses, so non-UTF-8 bytes are a
+	// caller error surfaced as URN validation failure.
+	(@instance_urn $type_urn:expr, $addr_bytes:expr) => {{
+		String::from_utf8($addr_bytes)
+			.map_err(|_| $crate::TightBeamError::UrnValidationError(
+				$crate::utils::urn::UrnValidationError::InvalidFormat {
+					field: "resource-id",
+					pattern: None,
+				}
+			))
+			.map(|addr| $crate::colony::common::servlet_instance(&$type_urn, addr))
 	}};
 
 	// ==========================================================================
@@ -946,17 +1045,19 @@ macro_rules! hive {
 		}
 	}};
 
-	// Remove servlet from context and update type index
-	(@remove_from_context $ctx:expr, $key:expr, $type_bytes:expr, $removed_addr:expr) => {{
+	// Remove servlet from context and update type index. $type_urn is
+	// the removed registration's type URN.
+	(@remove_from_context $ctx:expr, $key:expr, $type_urn:expr, $type_bytes:expr, $removed_addr:expr) => {{
 		if let Ok(mut addrs) = $ctx.servlet_addresses.write() {
 			addrs.remove(&$key);
 		}
 		if let Ok(mut type_idx) = $ctx.type_index.write() {
 			// Only update if this was the indexed address
 			if type_idx.get($type_bytes) == Some(&$removed_addr) {
+				let type_prefix = $crate::colony::common::type_prefix_bytes($type_urn);
 				if let Ok(addrs) = $ctx.servlet_addresses.read() {
 					let replacement = addrs.iter()
-						.find(|(k, _)| k.starts_with($type_bytes))
+						.find(|(k, _)| k.starts_with(&type_prefix))
 						.map(|(_, a)| a.clone());
 					match replacement {
 						Some(new_addr) => { type_idx.insert($type_bytes.to_vec(), new_addr); }
@@ -971,9 +1072,9 @@ macro_rules! hive {
 	// Cluster Notification
 	// ==========================================================================
 
-	(@notify_cluster $protocol:path, $cluster_addr:expr, $hive_addr:expr, $servlet_info:expr, $is_added:expr, $retry_policy:expr, $hive_tls:ident, $trust_store:ident) => {{
+	(@notify_cluster $protocol:path, $cluster_addr:expr, $hive_urn:expr, $servlet_info:expr, $is_added:expr, $retry_policy:expr, $hive_tls:ident, $trust_store:ident) => {{
 		let cluster_addr_arc = $cluster_addr;
-		let hive_id = $hive_addr;
+		let hive_id = $hive_urn;
 		let servlet_info = $servlet_info;
 		let is_added = $is_added;
 		let retry_policy = $retry_policy;
@@ -1009,7 +1110,7 @@ macro_rules! hive {
 						issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 						hive_id,
 						added: vec![],
-						removed: vec![servlet_info.address],
+						removed: vec![servlet_info.servlet_id],
 					}
 				)
 			};

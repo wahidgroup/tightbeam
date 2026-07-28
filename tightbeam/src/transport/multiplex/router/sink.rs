@@ -7,11 +7,12 @@ use std::sync::Arc;
 
 use futures::channel::mpsc;
 
+use super::body::ForwardedStream;
 use super::flow::{chunk_records, payload_credits};
 use super::outbound::Outbound;
-use super::shared::{enqueue_stream_cancel, BudgetStanding, MuxShared};
+use super::shared::{enqueue_stream_cancel, BudgetStanding, MuxShared, OpenRequest, StreamReservation};
 use super::writer::{drain_with_reason, renew_or_drain};
-use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxStreamKind, TransportEnvelope};
+use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::{TransportError, TransportResult};
 
 /// Send one credit-gated data chunk: reserve a writer-queue slot,
@@ -33,6 +34,24 @@ pub(super) async fn send_data_envelope(
 	poll_fn(|cx| shared.poll_send_enqueue(stream_id, outbound, &mut slot, cx)).await
 }
 
+/// Send a stream's Open record through the atomic open (see
+/// [`MuxShared::poll_open_enqueue`]): reserve a writer-queue slot,
+/// then assign the stream ID and enqueue in one critical section so
+/// Opens hit the wire in ID order.
+pub(super) async fn send_open_envelope(
+	shared: &MuxShared,
+	outbound: &mut mpsc::Sender<Outbound>,
+	reservation: &mut StreamReservation,
+	request: &mut OpenRequest<'_>,
+) -> TransportResult<u32> {
+	let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
+	if ready.is_err() {
+		return Err(TransportError::ConnectionClosed);
+	}
+
+	poll_fn(|cx| shared.poll_open_enqueue(reservation, request, outbound, cx)).await
+}
+
 /// Meter one pushed payload: debit the session budget and account
 /// the payload's records on the stream's sender ledger. The one
 /// budget rule both streaming sinks share.
@@ -49,33 +68,50 @@ async fn debit_push(
 	Ok(standing)
 }
 
+/// Wire state of a streamed request: a held cap slot until the
+/// first record goes out, the assigned stream ID afterwards.
+enum SinkStream {
+	/// No Open sent yet: the reservation holds the cap slot and the
+	/// forwarder (duplex only) waits for the assigned ID.
+	Reserved {
+		reservation: StreamReservation,
+		duplex: Option<ForwardedStream>,
+	},
+	Opened(u32),
+}
+
 /// Producer half of a streamed request: pushes chunks on a
 /// locally-initiated stream, closed by flagging the final chunk
 /// `last` (see [`MuxHandle::open_stream`] and [`MuxHandle::open_duplex`]).
 ///
 /// Pushes reach the wire eagerly, so a duplex conversation can await
 /// reply chunks between pushes. [`close_with`](RequestSink::close_with)
-/// carries a known final chunk on the `last` record for free;
-/// [`close`](RequestSink::close) spends one extra empty record when the
-/// end is only known after the fact. Dropping the sink without closing
-/// cancels the stream.
+/// carries a known final chunk on the `last` record for free.
 pub struct RequestSink {
-	stream_id: u32,
+	stream: SinkStream,
 	kind: MuxStreamKind,
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
-	opened: bool,
 	closed: bool,
 }
 
 impl RequestSink {
+	/// Sink over a reserved (unopened) stream. `duplex` carries the
+	/// reply forwarder to register once the ID exists.
 	pub(super) fn new(
-		stream_id: u32,
+		reservation: StreamReservation,
 		kind: MuxStreamKind,
 		shared: Arc<MuxShared>,
 		outbound: mpsc::Sender<Outbound>,
+		duplex: Option<ForwardedStream>,
 	) -> Self {
-		Self { stream_id, kind, shared, outbound, opened: false, closed: false }
+		Self {
+			stream: SinkStream::Reserved { reservation, duplex },
+			kind,
+			shared,
+			outbound,
+			closed: false,
+		}
 	}
 
 	/// Stream one request chunk to the peer, splitting to the peer's
@@ -111,10 +147,18 @@ impl RequestSink {
 	/// # Errors
 	/// Same set as [`push`](Self::push).
 	pub async fn close(mut self) -> TransportResult<()> {
-		self.closed = true;
 		// The empty trailer is still one credit-gated record
-		self.shared.add_send_records(self.stream_id, 1);
-		self.send_chunk(&[], true).await
+		if let SinkStream::Opened(stream_id) = self.stream {
+			self.shared.add_send_records(stream_id, 1);
+		}
+
+		// The sink counts as closed only once the trailer reached
+		// the writer queue: a failed or abandoned close still owes
+		// the stream a cancel, which Drop settles.
+		self.send_chunk(&[], true, 1).await?;
+		self.closed = true;
+
+		Ok(())
 	}
 
 	/// Stream the final request chunk with the `last` flag set,
@@ -129,21 +173,33 @@ impl RequestSink {
 			return self.close().await;
 		}
 
+		// Closed only after the flagged chunk reached the writer
+		// queue (see close): failure keeps Drop's cancel armed.
+		self.send_payload(payload, true).await?;
 		self.closed = true;
-		self.send_payload(payload, true).await
+
+		Ok(())
 	}
 
 	/// Meter and send one payload, split to the peer's advertised
 	/// receive size, flagging the final wire chunk `last` when this
 	/// payload closes the body.
 	async fn send_payload(&mut self, payload: &[u8], closes: bool) -> TransportResult<()> {
-		let standing = debit_push(&self.shared, self.stream_id, payload.len(), false).await?;
+		let credits = payload_credits(payload.len(), self.shared.send_chunk_size, self.shared.credit_unit);
+		let standing = self.shared.admit_debit(credits, false).await?;
+
+		// The open seeds the ledger with the payload's records; an
+		// already-open stream extends it push by push
+		let records = chunk_records(payload.len(), self.shared.send_chunk_size);
+		if let SinkStream::Opened(stream_id) = self.stream {
+			self.shared.add_send_records(stream_id, records);
+		}
 
 		let chunk_size = self.shared.send_chunk_size;
 		let mut chunks = payload.chunks(chunk_size).peekable();
 		while let Some(chunk) = chunks.next() {
 			let last = closes && chunks.peek().is_none();
-			self.send_chunk(chunk, last).await?;
+			self.send_chunk(chunk, last, records).await?;
 		}
 
 		if matches!(standing, BudgetStanding::Exhausting) {
@@ -154,17 +210,22 @@ impl RequestSink {
 	}
 
 	/// One wire record: the first chunk travels as the stream's
-	/// `Open`, every later chunk as `Data`.
-	async fn send_chunk(&mut self, chunk: &[u8], last: bool) -> TransportResult<()> {
-		let envelope = if self.opened {
-			TransportEnvelope::from(MuxDataPackage::new(self.stream_id, last, chunk)?)
-		} else {
-			TransportEnvelope::from(MuxOpenPackage::new(self.stream_id, last, self.kind, chunk)?)
-		};
+	/// `Open` through the atomic open, every later chunk as `Data`.
+	async fn send_chunk(&mut self, chunk: &[u8], last: bool, records: u64) -> TransportResult<()> {
+		match &mut self.stream {
+			SinkStream::Reserved { reservation, duplex } => {
+				let mut request = OpenRequest { kind: self.kind, last, payload: chunk, records, duplex: duplex.take() };
+				let stream_id = send_open_envelope(&self.shared, &mut self.outbound, reservation, &mut request).await?;
 
-		self.opened = true;
-
-		send_data_envelope(&self.shared, &mut self.outbound, self.stream_id, envelope).await
+				self.stream = SinkStream::Opened(stream_id);
+				Ok(())
+			}
+			SinkStream::Opened(stream_id) => {
+				let stream_id = *stream_id;
+				let envelope = TransportEnvelope::from(MuxDataPackage::new(stream_id, last, chunk)?);
+				send_data_envelope(&self.shared, &mut self.outbound, stream_id, envelope).await
+			}
+		}
 	}
 }
 
@@ -174,7 +235,11 @@ impl Drop for RequestSink {
 			return;
 		}
 
-		enqueue_stream_cancel(&self.shared, &self.outbound, self.stream_id);
+		// Unopened: the reservation's own drop releases the cap slot
+		// and resolves the caller locally.
+		if let SinkStream::Opened(stream_id) = self.stream {
+			enqueue_stream_cancel(&self.shared, &self.outbound, stream_id);
+		}
 	}
 }
 
@@ -199,8 +264,7 @@ impl ReplySink {
 	}
 
 	/// Stream one reply chunk to the peer, splitting to the peer's
-	/// advertised receive size. Empty pushes send nothing (the wire
-	/// carries no empty data records).
+	/// advertised receive size. Empty pushes send nothing.
 	///
 	/// # Errors
 	/// - `OperationFailed(Cancelled)`: peer cancelled the stream
@@ -241,16 +305,21 @@ mod tests {
 	use super::*;
 	use crate::transport::envelopes::{CancelReason, MuxEnvelope};
 
-	/// Registered request sink on stream 1 of a fresh client, with
-	/// the outbound queue's receiving end.
-	fn sink_fixture() -> (Arc<MuxShared>, RequestSink, mpsc::Receiver<Outbound>) {
+	/// Reserved (unopened) request sink on a fresh client, with the
+	/// outbound queue's receiving end and the response receiver.
+	fn sink_fixture() -> (
+		Arc<MuxShared>,
+		RequestSink,
+		mpsc::Receiver<Outbound>,
+		oneshot::Receiver<StreamOutcome>,
+	) {
 		let shared = client_shared();
 		let (outbound, sent) = mpsc::channel(8);
+		let (sender, receiver) = oneshot::channel();
+		let reservation = shared.reserve_stream_slot(sender).expect("fresh connection has stream slots");
 
-		shared.register_send_stream(1, 0);
-
-		let sink = RequestSink::new(1, MuxStreamKind::Streaming, Arc::clone(&shared), outbound);
-		(shared, sink, sent)
+		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, Arc::clone(&shared), outbound, None);
+		(shared, sink, sent, receiver)
 	}
 
 	// Pushes reach the wire eagerly; the bare close carries the
@@ -258,7 +327,7 @@ mod tests {
 	// travel as Open(!last), Data(!last), Data(last, empty).
 	#[test]
 	fn test_request_sink_pushes_eagerly_and_closes_with_empty_trailer() {
-		let (_shared, mut sink, mut sent) = sink_fixture();
+		let (_shared, mut sink, mut sent, _outcome) = sink_fixture();
 
 		assert!(matches!(poll_now(sink.push([1u8, 1])), Poll::Ready(Ok(()))));
 		assert!(matches!(
@@ -286,7 +355,7 @@ mod tests {
 	// trailer follows it.
 	#[test]
 	fn test_request_sink_close_with_flags_final_chunk() {
-		let (_shared, mut sink, mut sent) = sink_fixture();
+		let (_shared, mut sink, mut sent, _outcome) = sink_fixture();
 
 		assert!(matches!(poll_now(sink.push([1u8, 1])), Poll::Ready(Ok(()))));
 		assert!(matches!(poll_now(sink.close_with([2u8, 2])), Poll::Ready(Ok(()))));
@@ -304,37 +373,89 @@ mod tests {
 		assert!(sent.try_recv().is_err());
 	}
 
+	// An opened sink abandoned without close still owes the peer a
+	// cancel: its Open is on the wire.
 	#[test]
-	fn test_request_sink_drop_cancels_stream() {
-		let shared = client_shared();
-		let (outbound, mut sent) = mpsc::channel(8);
-		let (sender, mut receiver) = oneshot::channel();
-		let stream_id = shared.allocate(sender).expect("fresh connection has stream slots");
+	fn test_request_sink_drop_after_open_cancels_stream() {
+		let (_shared, mut sink, mut sent, mut receiver) = sink_fixture();
 
-		shared.register_send_stream(stream_id, 0);
+		let pushed = poll_now(sink.push([1u8]));
+		assert!(matches!(pushed, Poll::Ready(Ok(()))));
 
-		drop(RequestSink::new(
-			stream_id,
-			MuxStreamKind::Streaming,
-			Arc::clone(&shared),
-			outbound,
+		let open = sent.try_recv();
+		assert!(matches!(
+			open,
+			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(_))))
 		));
+
+		drop(sink);
 
 		let outcome = receiver.try_recv();
 		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
+
+		let cancel = sent.try_recv();
 		assert!(matches!(
-			sent.try_recv(),
+			cancel,
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Cancel(package))))
-				if package.stream_id() == stream_id
+				if package.stream_id() == 1
 		));
+	}
+
+	// A sink dropped before any push never reached the wire: the
+	// reservation resolves the caller locally and releases the cap
+	// slot without a wire cancel.
+	#[test]
+	fn test_request_sink_drop_unopened_releases_reservation_silently() {
+		let (shared, sink, mut sent, mut receiver) = sink_fixture();
+
+		drop(sink);
+
+		let outcome = receiver.try_recv();
+		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
+		assert!(sent.try_recv().is_err());
+		assert!(shared.has_stream_headroom());
+	}
+
+	// A close that fails to reach the wire still owes the peer a
+	// cancel: Drop must tear the stream down (resolving the caller's
+	// outcome), not treat the failed close as complete.
+	#[test]
+	fn test_request_sink_failed_close_still_cancels_stream() {
+		let (_shared, mut sink, sent, mut receiver) = sink_fixture();
+
+		let pushed = poll_now(sink.push([1u8]));
+		assert!(matches!(pushed, Poll::Ready(Ok(()))));
+		drop(sent);
+
+		let closed = poll_now(sink.close());
+		assert!(matches!(closed, Poll::Ready(Err(TransportError::ConnectionClosed))));
+
+		let outcome = receiver.try_recv();
+		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
+	}
+
+	// Same contract for the flagged-final-chunk close.
+	#[test]
+	fn test_request_sink_failed_close_with_still_cancels_stream() {
+		let (_shared, mut sink, sent, mut receiver) = sink_fixture();
+
+		let pushed = poll_now(sink.push([1u8]));
+		assert!(matches!(pushed, Poll::Ready(Ok(()))));
+
+		drop(sent);
+
+		let closed = poll_now(sink.close_with([2u8, 2]));
+		assert!(matches!(closed, Poll::Ready(Err(TransportError::ConnectionClosed))));
+
+		let outcome = receiver.try_recv();
+		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
 	}
 
 	// An empty request body still travels: close without a push
 	// sends the stream's Open with the last flag and no payload.
 	#[test]
 	fn test_request_sink_close_without_push_sends_empty_last_open() {
-		let (_shared, sink, mut sent) = sink_fixture();
-
+		let (_shared, sink, mut sent, _outcome) = sink_fixture();
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
 			sent.try_recv(),

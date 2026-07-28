@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::utils::BasisPoints;
 
 use super::error::ClusterError;
-use crate::colony::common::RegisterHiveRequest;
+use crate::colony::common::{type_canonical_bytes, RegisterHiveRequest};
 
 /// Shared byte slice for hive and servlet identifiers
 pub type SharedId = Arc<[u8]>;
@@ -88,10 +88,12 @@ impl HiveRegistry {
 			}
 		}
 
+		// Index by servlet TYPE: instance URNs collapse onto their type key
+		// so work routed by type finds every instance-bearing hive.
 		let servlet_types: Arc<[SharedId]> = request
 			.servlet_addresses
 			.iter()
-			.map(|info| Arc::from(info.servlet_id.as_slice()))
+			.map(|info| Arc::from(type_canonical_bytes(&info.servlet_id).as_slice()))
 			.collect();
 
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
@@ -277,16 +279,21 @@ impl Default for HiveRegistry {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::colony::common::ColonyNamespace;
 	use crate::colony::hive::ServletInfo;
 
-	fn request(addr: &[u8], servlets: &[&[u8]]) -> RegisterHiveRequest {
+	fn request(addr: &[u8], servlets: &[&str]) -> RegisterHiveRequest {
+		let namespace = ColonyNamespace::default();
 		RegisterHiveRequest {
 			issued_at_ms: 0,
 			hive_addr: addr.to_vec(),
 			metadata: None,
 			servlet_addresses: servlets
 				.iter()
-				.map(|s| ServletInfo { servlet_id: s.to_vec(), address: addr.to_vec() })
+				.map(|s| ServletInfo {
+					servlet_id: namespace.servlet(s).expect("test names satisfy the mint grammar"),
+					address: addr.to_vec(),
+				})
 				.collect(),
 		}
 	}
@@ -298,7 +305,7 @@ mod tests {
 	fn evict_stale_behavior() -> Result<(), ClusterError> {
 		for &(ttl, evicted_len, remaining_len) in EVICT_STALE_CASES {
 			let registry = HiveRegistry::new(ttl);
-			registry.register(request(b"hive1", &[b"ping"]))?;
+			registry.register(request(b"hive1", &["ping"]))?;
 
 			std::thread::sleep(Duration::from_millis(1));
 
@@ -350,9 +357,9 @@ mod tests {
 	fn register_with_signer_rejects_cross_signer_hijack() -> Result<(), ClusterError> {
 		for case in signer_rebind_cases() {
 			let registry = HiveRegistry::new(Duration::from_secs(3600));
-			registry.register_with_signer(request(b"hive1", &[b"ping"]), case.first.map(Arc::from))?;
+			registry.register_with_signer(request(b"hive1", &["ping"]), case.first.map(Arc::from))?;
 
-			let result = registry.register_with_signer(request(b"hive1", &[b"ping"]), case.second.map(Arc::from));
+			let result = registry.register_with_signer(request(b"hive1", &["ping"]), case.second.map(Arc::from));
 			assert_eq!(result.is_ok(), case.expect_ok);
 			if !case.expect_ok {
 				assert!(matches!(result, Err(ClusterError::SignerMismatch)));

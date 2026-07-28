@@ -26,7 +26,6 @@ use crate::transport::framing::{
 };
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::TransportResult;
-#[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::utils::marker::MaybeSend;
 
 #[cfg(feature = "x509")]
@@ -138,8 +137,9 @@ pub trait X509ClientConfig: Sized {
 
 /// Async listener trait
 pub trait AsyncListenerTrait: Protocol + Send {
-	#[allow(async_fn_in_trait)]
-	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error>;
+	/// Accept one connection. The future is held across task spawns by
+	/// generic accept loops (e.g. servlet serving).
+	fn accept(&self) -> impl Future<Output = Result<(Self::Transport, Self::Address), Self::Error>> + MaybeSend;
 }
 
 /// Read-half capability of a frame-oriented async byte transport.

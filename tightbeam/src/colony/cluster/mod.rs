@@ -24,11 +24,9 @@ pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use servlet_registry::{PheromoneConf, ServletEntry, ServletRegistry};
 
 use core::future::Future;
-use core::marker::PhantomData;
 use core::time::Duration;
 use std::sync::Arc;
 
-use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::key::SigningKeyProvider;
 use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
@@ -38,8 +36,7 @@ use crate::transport::{Protocol, TightBeamAddress};
 #[cfg(feature = "x509")]
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
 
-use super::common::LeastLoaded;
-use super::hive::LoadBalancer;
+use super::common::{ColonyNamespace, LoadBalancer};
 
 // =============================================================================
 // Configuration
@@ -180,11 +177,16 @@ impl core::fmt::Debug for ClusterTlsConfig {
 /// and cryptographic signing for cluster -> hive communication.
 ///
 /// # Type Parameters
-/// - `L`: Load balancing strategy (default: `LeastLoaded`)
-/// - `D`: Digest algorithm for frame integrity and signing (default: `Sha3_256`)
-pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
+/// The balancer is stored as `Arc<dyn LoadBalancer>` so any strategy is
+/// pluggable at runtime, defaulting to
+/// [`StochasticForager`](crate::colony::common::StochasticForager).
+pub struct ClusterConf {
+	/// Naming scope inbound resource URNs are validated against.
+	/// Registrations, address updates, and work requests carrying a
+	/// foreign authority or realm are refused at the gateway.
+	pub namespace: ColonyNamespace,
 	/// Load balancing strategy for distributing work across hives
-	pub load_balancer: L,
+	pub load_balancer: Arc<dyn LoadBalancer>,
 	/// Heartbeat configuration
 	pub heartbeat: HeartbeatConf,
 	/// Pheromone configuration for bio-inspired routing
@@ -200,8 +202,6 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
-	/// Phantom data for digest type
-	pub(crate) _digest: PhantomData<D>,
 }
 
 #[cfg(feature = "x509")]
@@ -213,9 +213,10 @@ impl ClusterConf {
 }
 
 #[cfg(feature = "x509")]
-impl<L: LoadBalancer, D: Digest> core::fmt::Debug for ClusterConf<L, D> {
+impl core::fmt::Debug for ClusterConf {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterConfig")
+			.field("namespace", &self.namespace)
 			.field("heartbeat", &self.heartbeat)
 			.field("pheromone", &self.pheromone)
 			.field("policies", &format!("[{} policies]", self.policies.len()))
@@ -303,7 +304,7 @@ pub trait Cluster: Sized + Send + Sync {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::common::RegisterHiveRequest;
+	use crate::colony::common::{canonical_bytes, ColonyNamespace, RegisterHiveRequest};
 	use crate::colony::hive::ServletInfo;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -330,28 +331,32 @@ mod tests {
 		HiveRegistry::new(Duration::from_secs(15))
 	}
 
-	fn request(addr: &[u8], servlets: &[&[u8]]) -> RegisterHiveRequest {
+	fn servlet_urn(name: &str) -> crate::utils::urn::Urn<'static> {
+		ColonyNamespace::default()
+			.servlet(name)
+			.expect("test names satisfy the mint grammar")
+	}
+
+	fn type_key(name: &str) -> Vec<u8> {
+		canonical_bytes(&servlet_urn(name))
+	}
+
+	fn request(addr: &[u8], servlets: &[&str]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
 			issued_at_ms: 0,
 			hive_addr: addr.to_vec(),
 			metadata: None,
 			servlet_addresses: servlets
 				.iter()
-				.map(|s| ServletInfo { servlet_id: s.to_vec(), address: addr.to_vec() })
+				.map(|s| ServletInfo { servlet_id: servlet_urn(s), address: addr.to_vec() })
 				.collect(),
 		}
 	}
 
-	fn request_with_meta(addr: &[u8], servlets: &[&[u8]], meta: &[u8]) -> RegisterHiveRequest {
-		RegisterHiveRequest {
-			issued_at_ms: 0,
-			hive_addr: addr.to_vec(),
-			metadata: Some(meta.to_vec()),
-			servlet_addresses: servlets
-				.iter()
-				.map(|s| ServletInfo { servlet_id: s.to_vec(), address: addr.to_vec() })
-				.collect(),
-		}
+	fn request_with_meta(addr: &[u8], servlets: &[&str], meta: &[u8]) -> RegisterHiveRequest {
+		let mut request = request(addr, servlets);
+		request.metadata = Some(meta.to_vec());
+		request
 	}
 
 	// =========================================================================
@@ -391,15 +396,18 @@ mod tests {
 	#[test]
 	fn registry_register_and_lookup() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &[b"ping", b"calc"]))?;
+		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]))?;
 
 		// Registered types found
-		assert_eq!(registry.hives_for_type(b"ping")?.len(), 1);
-		assert_eq!(registry.hives_for_type(b"calc")?.len(), 1);
-		assert_eq!(registry.hives_for_type(b"ping")?[0].address.as_ref(), b"127.0.0.1:8080");
+		assert_eq!(registry.hives_for_type(&type_key("ping"))?.len(), 1);
+		assert_eq!(registry.hives_for_type(&type_key("calc"))?.len(), 1);
+		assert_eq!(
+			registry.hives_for_type(&type_key("ping"))?[0].address.as_ref(),
+			b"127.0.0.1:8080"
+		);
 
 		// Unknown type not found
-		assert!(registry.hives_for_type(b"unknown")?.is_empty());
+		assert!(registry.hives_for_type(&type_key("unknown"))?.is_empty());
 
 		Ok(())
 	}
@@ -407,12 +415,12 @@ mod tests {
 	#[test]
 	fn registry_unregister() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &[b"ping"]))?;
+		registry.register(request(b"127.0.0.1:8080", &["ping"]))?;
 
 		assert_eq!(registry.len()?, 1);
 		assert!(registry.unregister(b"127.0.0.1:8080")?.is_some());
 		assert_eq!(registry.len()?, 0);
-		assert!(registry.hives_for_type(b"ping")?.is_empty());
+		assert!(registry.hives_for_type(&type_key("ping"))?.is_empty());
 
 		Ok(())
 	}
@@ -420,10 +428,10 @@ mod tests {
 	#[test]
 	fn registry_update_utilization() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &[b"ping"]))?;
+		registry.register(request(b"127.0.0.1:8080", &["ping"]))?;
 
 		assert!(registry.update_utilization(b"127.0.0.1:8080", BasisPoints::new(5000))?);
-		assert_eq!(registry.hives_for_type(b"ping")?[0].utilization.get(), 5000);
+		assert_eq!(registry.hives_for_type(&type_key("ping"))?[0].utilization.get(), 5000);
 
 		Ok(())
 	}
@@ -431,8 +439,8 @@ mod tests {
 	#[test]
 	fn registry_available_servlets_deduplicated() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &[b"ping", b"calc"]))?;
-		registry.register(request(b"hive2", &[b"ping", b"worker"]))?;
+		registry.register(request(b"hive1", &["ping", "calc"]))?;
+		registry.register(request(b"hive2", &["ping", "worker"]))?;
 
 		// ping, calc, worker - ping deduplicated
 		assert_eq!(registry.to_available_servlets()?.len(), 3);
@@ -443,10 +451,10 @@ mod tests {
 	#[test]
 	fn registry_multiple_hives_same_type() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &[b"ping"]))?;
-		registry.register(request(b"hive2", &[b"ping"]))?;
+		registry.register(request(b"hive1", &["ping"]))?;
+		registry.register(request(b"hive2", &["ping"]))?;
 
-		assert_eq!(registry.hives_for_type(b"ping")?.len(), 2);
+		assert_eq!(registry.hives_for_type(&type_key("ping"))?.len(), 2);
 
 		Ok(())
 	}
@@ -454,8 +462,8 @@ mod tests {
 	#[test]
 	fn registry_all_hives() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &[b"ping"]))?;
-		registry.register(request_with_meta(b"hive2", &[b"calc"], b"metadata"))?;
+		registry.register(request(b"hive1", &["ping"]))?;
+		registry.register(request_with_meta(b"hive2", &["calc"], b"metadata"))?;
 
 		let all = registry.all_hives()?;
 		assert_eq!(all.len(), 2);

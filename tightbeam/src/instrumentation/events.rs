@@ -113,3 +113,17 @@ pub const SESSION_HANDSHAKE_COMPLETE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "ev
 pub const SESSION_RECEIPT_SETTLED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:session/receipt-settled");
 pub const SESSION_RECEIPT_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:session/receipt-refused");
 pub const SESSION_CERT_REJECTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:session/cert-rejected");
+
+// Cluster gateway lifecycle: every accept/refuse decision the gateway
+// makes fires exactly one event, so audits and scenario specs observe
+// what the cluster did rather than re-deriving it from responses.
+pub const CLUSTER_GATE_BLOCKED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gate-blocked");
+pub const CLUSTER_HIVE_REGISTERED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/hive-registered");
+pub const CLUSTER_REGISTER_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/register-refused");
+pub const CLUSTER_UPDATE_ACCEPTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/update-accepted");
+pub const CLUSTER_UPDATE_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/update-refused");
+pub const CLUSTER_WORK_ROUTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-routed");
+pub const CLUSTER_WORK_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-refused");
+pub const CLUSTER_WORK_UNAVAILABLE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-unavailable");
+pub const CLUSTER_WORK_FAILED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-failed");
+pub const CLUSTER_HIVE_EVICTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/hive-evicted");

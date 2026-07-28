@@ -127,7 +127,7 @@ where
 }
 
 /// The refusal behind every [`MuxService`] default.
-fn unimplemented_error() -> TightBeamError {
+pub(crate) fn unimplemented_error() -> TightBeamError {
 	TransportError::from(TransitStatus::Unimplemented).into()
 }
 

@@ -5,15 +5,20 @@
 use core::time::Duration;
 use std::sync::Arc;
 
+use sha3::Sha3_256;
 use tightbeam::{
 	cert,
 	crypto::{
+		policy::Secp256k1Policy,
 		profiles::DefaultCryptoProvider,
 		sign::{
 			ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey},
 			Sha3Signer,
 		},
-		x509::policy::CertificateValidation,
+		x509::{
+			policy::CertificateValidation,
+			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+		},
 	},
 	error::Result,
 	prelude::{collect::TokioListener, *},
@@ -53,6 +58,29 @@ pub fn create_server_config(
 ) -> TransportEncryptionConfig<DefaultCryptoProvider> {
 	let key_manager = key_provider.into();
 	TransportEncryptionConfig::new(cert, key_manager).with_client_validators(validators)
+}
+
+/// Self-signed gateway materials shared by colony transport tests: one
+/// certificate serves as identity and trust anchor for cluster, hive,
+/// and servlet endpoints alike.
+pub struct GatewayCerts {
+	pub cert: Certificate,
+	pub key: Secp256k1SigningKey,
+	pub trust: Arc<dyn CertificateTrust>,
+}
+
+impl GatewayCerts {
+	/// Generate a fresh self-signed gateway identity for `subject`.
+	pub fn generate(subject: &str) -> Self {
+		let (cert, key) = create_test_cert_with_key(subject, 365).expect("Failed to create gateway cert");
+		let trust: Arc<dyn CertificateTrust> = Arc::new(
+			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_chain(vec![cert.to_owned()])
+				.expect("Failed to build trust")
+				.build(),
+		);
+		Self { cert, key, trust }
+	}
 }
 
 /// Extract Common Name (CN) from certificate subject
@@ -117,11 +145,10 @@ impl MutualAuthServer {
 		}
 
 		let server_config = create_server_config(server_cert, server_key, client_validators);
-		let bind_addr = TightBeamSocketAddr(
-			"127.0.0.1:0"
-				.parse()
-				.map_err(|e| TightBeamError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?,
-		);
+		let socket_addr = "127.0.0.1:0"
+			.parse()
+			.map_err(|e| TightBeamError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+		let bind_addr = TightBeamSocketAddr(socket_addr);
 		let (listener, addr) = TokioListener::bind_with(bind_addr, server_config).await?;
 		let (tx, rx) = tokio::sync::mpsc::channel(8);
 

@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
+use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::Beamable;
 
@@ -23,8 +24,8 @@ use crate::Beamable;
 /// `servlet_type` and forwards `payload` to the selected hive.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ClusterWorkRequest {
-	/// Target servlet type (e.g., b"ping_servlet")
-	pub servlet_type: Vec<u8>,
+	/// Target servlet type URN (e.g., `urn:tightbeam::servlet:ping`)
+	pub servlet_type: Urn<'static>,
 	/// Raw message payload (encoded inner message)
 	pub payload: Vec<u8>,
 }
@@ -96,8 +97,8 @@ pub struct RegisterHiveRequest {
 pub struct RegisterHiveResponse {
 	/// The status of the registration request
 	pub status: TransitStatus,
-	/// Optional cluster-assigned hive ID
-	pub hive_id: Option<Vec<u8>>,
+	/// Cluster-assigned hive identity URN (e.g., `urn:tightbeam::hive:10.0.0.5:9000`)
+	pub hive_id: Option<Urn<'static>>,
 }
 
 /// Notification from hive to cluster about servlet address changes
@@ -109,12 +110,13 @@ pub struct ServletAddressUpdate {
 	/// Issue time in unix milliseconds. Binds the signed frame to a
 	/// freshness window so captured updates cannot be replayed (CWE-294)
 	pub issued_at_ms: u64,
-	/// Hive identifier (matches hive_addr from registration)
-	pub hive_id: Vec<u8>,
+	/// Hive identity URN (matches the identity assigned at registration)
+	pub hive_id: Urn<'static>,
 	/// Newly spawned servlet addresses
 	pub added: Vec<ServletInfo>,
-	/// Removed servlet network addresses.
-	pub removed: Vec<Vec<u8>>,
+	/// Removed servlet instance URNs. Instance identities travel in
+	/// both directions of an update, matching `added`.
+	pub removed: Vec<Urn<'static>>,
 }
 
 /// Response to servlet address update notification
@@ -134,8 +136,8 @@ pub struct ServletAddressUpdateResponse {
 /// it to morph into a specific servlet configuration.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ActivateServletRequest {
-	/// The identifier of the servlet to activate
-	pub servlet_id: Vec<u8>,
+	/// Instance URN of the servlet to activate
+	pub servlet_id: Urn<'static>,
 	/// Optional configuration data for the servlet
 	pub config: Option<Vec<u8>>,
 }
@@ -170,8 +172,8 @@ impl ActivateServletResponse {
 /// Servlet information entry
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ServletInfo {
-	/// The servlet instance ID
-	pub servlet_id: Vec<u8>,
+	/// Servlet instance URN (type URN with a `/{addr}` tail)
+	pub servlet_id: Urn<'static>,
 	/// The servlet's address
 	pub address: Vec<u8>,
 }
@@ -200,8 +202,8 @@ pub struct HiveManagementRequest {
 /// Parameters for spawning a new servlet
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct SpawnServletParams {
-	/// The type of servlet to spawn (e.g., "worker_servlet")
-	pub servlet_type: Vec<u8>,
+	/// Type URN of the servlet to spawn (e.g., `urn:tightbeam::servlet:worker`)
+	pub servlet_type: Urn<'static>,
 	/// Optional configuration data for the servlet
 	pub config: Option<Vec<u8>>,
 }
@@ -216,8 +218,8 @@ pub struct ListServletsParams {
 /// Parameters for stopping a servlet
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct StopServletParams {
-	/// The ID of the servlet instance to stop
-	pub servlet_id: Vec<u8>,
+	/// Instance URN of the servlet to stop
+	pub servlet_id: Urn<'static>,
 }
 
 /// Hive management response message
@@ -244,8 +246,8 @@ pub struct SpawnServletResult {
 	pub status: TransitStatus,
 	/// The address of the newly spawned servlet (if successful)
 	pub servlet_address: Option<Vec<u8>>,
-	/// The identifier of the servlet instance (e.g., "worker_servlet_127.0.0.1:8080")
-	pub servlet_id: Option<Vec<u8>>,
+	/// Instance URN of the spawned servlet (e.g., `urn:tightbeam::servlet:worker/127.0.0.1:8080`)
+	pub servlet_id: Option<Urn<'static>>,
 }
 
 /// Result of listing servlets
@@ -267,7 +269,7 @@ pub struct StopServletResult {
 impl HiveManagementResponse {
 	/// Create a spawn success response
 	#[inline]
-	pub fn spawn_ok(address: Vec<u8>, servlet_id: Vec<u8>) -> Self {
+	pub fn spawn_ok(address: Vec<u8>, servlet_id: Urn<'static>) -> Self {
 		Self {
 			spawn: Some(SpawnServletResult {
 				status: TransitStatus::Ok,
@@ -423,6 +425,7 @@ impl ClusterCommandResponse {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::colony::common::{servlet_instance, ColonyNamespace};
 	use crate::error::Result;
 
 	fn round_trip(original: ClusterRequest) -> Result<()> {
@@ -432,12 +435,27 @@ mod tests {
 		Ok(())
 	}
 
+	fn ping_type() -> crate::utils::urn::Urn<'static> {
+		ColonyNamespace::default()
+			.servlet("ping")
+			.expect("test names satisfy the mint grammar")
+	}
+
+	fn hive_id() -> crate::utils::urn::Urn<'static> {
+		ColonyNamespace::default()
+			.hive("127.0.0.1:9000")
+			.expect("test locators satisfy the mint grammar")
+	}
+
 	#[test]
 	fn cluster_request_register_hive_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::RegisterHive(RegisterHiveRequest {
 			issued_at_ms: 1_000,
 			hive_addr: b"127.0.0.1:9000".to_vec(),
-			servlet_addresses: vec![ServletInfo { servlet_id: b"ping".to_vec(), address: b"127.0.0.1:9001".to_vec() }],
+			servlet_addresses: vec![ServletInfo {
+				servlet_id: servlet_instance(&ping_type(), "127.0.0.1:9001"),
+				address: b"127.0.0.1:9001".to_vec(),
+			}],
 			metadata: None,
 		}))
 	}
@@ -446,23 +464,23 @@ mod tests {
 	fn cluster_request_servlet_address_update_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
 			issued_at_ms: 1_000,
-			hive_id: b"127.0.0.1:9000".to_vec(),
+			hive_id: hive_id(),
 			added: vec![],
-			removed: vec![b"127.0.0.1:9100".to_vec()],
+			removed: vec![servlet_instance(&ping_type(), "127.0.0.1:9100")],
 		}))
 	}
 
 	#[test]
 	fn cluster_request_work_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::Work(ClusterWorkRequest {
-			servlet_type: b"ping".to_vec(),
+			servlet_type: ping_type(),
 			payload: vec![0x02, 0x01, 0x2A],
 		}))
 	}
 
 	#[test]
 	fn bare_inner_type_rejected_without_envelope_tag() -> Result<()> {
-		let bare = crate::encode(&ClusterWorkRequest { servlet_type: b"ping".to_vec(), payload: vec![] })?;
+		let bare = crate::encode(&ClusterWorkRequest { servlet_type: ping_type(), payload: vec![] })?;
 
 		let decoded = crate::decode::<ClusterRequest>(&bare);
 		assert!(decoded.is_err());

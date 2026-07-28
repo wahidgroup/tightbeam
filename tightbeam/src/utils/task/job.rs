@@ -190,13 +190,17 @@ mod tests {
 	use crate::Frame;
 
 	#[cfg(feature = "colony")]
+	use crate::colony::common::{servlet_instance, ColonyNamespace};
+	#[cfg(feature = "colony")]
 	use crate::colony::hive::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
+	#[cfg(feature = "colony")]
+	use crate::utils::urn::Urn;
 
 	// Sync job with tuple input - implements Job trait
 	#[cfg(feature = "colony")]
 	job! {
 		name: SpawnServletJob,
-		fn run((servlet_type, config): (Vec<u8>, Option<Vec<u8>>)) -> Result<Frame> {
+		fn run((servlet_type, config): (Urn<'static>, Option<Vec<u8>>)) -> Result<Frame> {
 			compose! {
 				V0: id: "spawn-req",
 					message: HiveManagementRequest {
@@ -231,7 +235,7 @@ mod tests {
 	#[cfg(feature = "colony")]
 	job! {
 		name: StopServletJob,
-		fn run((servlet_id,): (Vec<u8>,)) -> Result<Frame> {
+		fn run((servlet_id,): (Urn<'static>,)) -> Result<Frame> {
 			compose! {
 				V0: id: "stop-req",
 					message: HiveManagementRequest {
@@ -257,9 +261,21 @@ mod tests {
 	}
 
 	#[cfg(feature = "colony")]
+	fn worker_type() -> crate::utils::urn::Urn<'static> {
+		ColonyNamespace::default()
+			.servlet("worker")
+			.expect("test names satisfy the mint grammar")
+	}
+
+	#[cfg(feature = "colony")]
+	fn worker_instance() -> crate::utils::urn::Urn<'static> {
+		servlet_instance(&worker_type(), "127.0.0.1:8080")
+	}
+
+	#[cfg(feature = "colony")]
 	test_job! {
 		name: test_spawn_servlet_job,
-		job: SpawnServletJob::run((b"worker_servlet".to_vec(), None)),
+		job: SpawnServletJob::run((worker_type(), None)),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata.id, b"spawn-req");
@@ -268,7 +284,7 @@ mod tests {
 			let Some(spawn) = request.spawn.as_ref() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
-			assert_eq!(spawn.servlet_type, b"worker_servlet");
+			assert_eq!(spawn.servlet_type, worker_type());
 			Ok(())
 		}
 	}
@@ -290,7 +306,7 @@ mod tests {
 	#[cfg(feature = "colony")]
 	test_job! {
 		name: test_stop_servlet_job,
-		job: StopServletJob::run((b"worker_servlet_127.0.0.1:8080".to_vec(),)),
+		job: StopServletJob::run((worker_instance(),)),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata.id, b"stop-req");
@@ -299,7 +315,7 @@ mod tests {
 			let Some(stop) = request.stop.as_ref() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
-			assert_eq!(stop.servlet_id, b"worker_servlet_127.0.0.1:8080");
+			assert_eq!(stop.servlet_id, worker_instance());
 			Ok(())
 		}
 	}

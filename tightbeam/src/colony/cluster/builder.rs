@@ -1,10 +1,8 @@
 //! Builder patterns for cluster configuration
 
-use core::marker::PhantomData;
 use core::time::Duration;
 use std::sync::Arc;
 
-use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
 
@@ -12,8 +10,7 @@ use super::{
 	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf, DEFAULT_HEARTBEAT_INTERVAL_SECS,
 	DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
-use crate::colony::common::LeastLoaded;
-use crate::colony::hive::LoadBalancer;
+use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
 
 // ============================================================================
 // HeartbeatConfBuilder
@@ -96,15 +93,15 @@ impl HeartbeatConfBuilder {
 
 /// Builder for ClusterConf
 #[cfg(feature = "x509")]
-pub struct ClusterConfBuilder<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
-	load_balancer: L,
+pub struct ClusterConfBuilder {
+	namespace: ColonyNamespace,
+	load_balancer: Arc<dyn LoadBalancer>,
 	heartbeat: HeartbeatConf,
 	pheromone: PheromoneConf,
 	policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pool_config: PoolConfig,
 	control_freshness_window_ms: u64,
 	tls: ClusterTlsConfig,
-	_digest: PhantomData<D>,
 }
 
 #[cfg(feature = "x509")]
@@ -112,20 +109,20 @@ impl ClusterConf {
 	/// Create a builder for ClusterConf
 	pub fn builder(tls: ClusterTlsConfig) -> ClusterConfBuilder {
 		ClusterConfBuilder {
-			load_balancer: LeastLoaded,
+			namespace: ColonyNamespace::default(),
+			load_balancer: Arc::new(StochasticForager::default()),
 			heartbeat: HeartbeatConf::default(),
 			pheromone: PheromoneConf::default(),
 			policies: Vec::new(),
 			pool_config: PoolConfig::default(),
 			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			tls,
-			_digest: PhantomData,
 		}
 	}
 }
 
 #[cfg(feature = "x509")]
-impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
+impl ClusterConfBuilder {
 	/// Set the heartbeat configuration
 	pub fn with_heartbeat_config(mut self, config: HeartbeatConf) -> Self {
 		self.heartbeat = config;
@@ -138,18 +135,16 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 		self
 	}
 
-	/// Set the load balancer strategy
-	pub fn with_load_balancer<L2: LoadBalancer>(self, load_balancer: L2) -> ClusterConfBuilder<L2, D> {
-		ClusterConfBuilder {
-			load_balancer,
-			heartbeat: self.heartbeat,
-			pheromone: self.pheromone,
-			policies: self.policies,
-			pool_config: self.pool_config,
-			control_freshness_window_ms: self.control_freshness_window_ms,
-			tls: self.tls,
-			_digest: PhantomData,
-		}
+	/// Set the naming scope inbound resource URNs are validated against
+	pub fn with_namespace(mut self, namespace: ColonyNamespace) -> Self {
+		self.namespace = namespace;
+		self
+	}
+
+	/// Set the load balancer strategy (defaults to [`StochasticForager`])
+	pub fn with_load_balancer(mut self, load_balancer: impl LoadBalancer + 'static) -> Self {
+		self.load_balancer = Arc::new(load_balancer);
+		self
 	}
 
 	/// Add a gate policy
@@ -171,8 +166,9 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 	}
 
 	/// Build the ClusterConf
-	pub fn build(self) -> ClusterConf<L, D> {
+	pub fn build(self) -> ClusterConf {
 		ClusterConf {
+			namespace: self.namespace,
 			load_balancer: self.load_balancer,
 			heartbeat: self.heartbeat,
 			pheromone: self.pheromone,
@@ -180,7 +176,6 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 			pool_config: self.pool_config,
 			control_freshness_window_ms: self.control_freshness_window_ms,
 			tls: self.tls,
-			_digest: PhantomData,
 		}
 	}
 }

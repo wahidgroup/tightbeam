@@ -9,11 +9,11 @@ pub mod gates;
 // Re-export common types used by hives
 pub use crate::colony::common::{
 	ActivateServletRequest, ActivateServletResponse, ClusterCommand, ClusterCommandResponse, ClusterStatus,
-	HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse, InstanceMetrics, LeastLoaded,
-	ListServletsParams, ListServletsResult, LoadBalancer, MessageRouter, MessageValidator, PowerOfTwoChoices,
-	RegisterHiveRequest, RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletAddressUpdate,
+	ColonyNamespace, ColonyResource, HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse,
+	InstanceMetrics, ListServletsParams, ListServletsResult, LoadBalancer, PowerOfTwoChoices, RegisterHiveRequest,
+	RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletAddressUpdate,
 	ServletAddressUpdateResponse, ServletInfo, ServletScaleConf, SpawnServletParams, SpawnServletResult,
-	StopServletParams, StopServletResult, TypeBasedRouter,
+	StochasticForager, StopServletParams, StopServletResult,
 };
 
 // Re-export submodule types
@@ -44,8 +44,11 @@ use core::time::Duration;
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
 use crate::trace::TraceCollector;
 use crate::transport::handshake::negotiation::TransportOffer;
+use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
+use crate::transport::serve::unimplemented_error;
 use crate::transport::Protocol;
+use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
@@ -114,8 +117,8 @@ pub struct ServletRegistration {
 	pub servlet: Box<dyn ServletBox>,
 	/// Function to spawn additional instances of this servlet type
 	pub spawner: SpawnerFn,
-	/// The servlet type name (e.g., "auth", "capture")
-	pub servlet_type: &'static str,
+	/// The servlet type URN (e.g., `urn:tightbeam::servlet:auth`)
+	pub servlet_type: Urn<'static>,
 }
 
 // =============================================================================
@@ -134,12 +137,6 @@ pub trait ServletRegistry: Send + Sync {
 	/// Remove and return a servlet registration.
 	fn remove(&self, key: &[u8]) -> Option<ServletRegistration>;
 
-	/// Get a reference to a servlet registration (requires interior mutability pattern).
-	/// Returns the registration if found, via a callback to avoid lifetime issues.
-	fn with_get<F, R>(&self, key: &[u8], f: F) -> Option<R>
-	where
-		F: FnOnce(&ServletRegistration) -> R;
-
 	/// Iterate over all registrations via callback.
 	fn for_each<F>(&self, f: F)
 	where
@@ -153,12 +150,8 @@ pub trait ServletRegistry: Send + Sync {
 	/// Count of registered servlets.
 	fn count(&self) -> usize;
 
-	/// Get all servlet addresses as (type_name, address) pairs.
-	fn addresses(&self) -> Vec<(&'static str, Vec<u8>)>;
-
-	/// Find a spawner's static type name by matching prefix.
-	/// Returns the &'static str servlet_type if found.
-	fn find_type_by_prefix(&self, prefix: &[u8]) -> Option<&'static str>;
+	/// Get all servlet addresses as (type URN, address) pairs.
+	fn addresses(&self) -> Vec<(Urn<'static>, Vec<u8>)>;
 
 	/// Drain all registrations and return them.
 	/// Used during shutdown to stop all servlets.
@@ -192,14 +185,6 @@ impl ServletRegistry for HashMapRegistry {
 		self.inner.lock().ok()?.remove(key)
 	}
 
-	fn with_get<F, R>(&self, key: &[u8], f: F) -> Option<R>
-	where
-		F: FnOnce(&ServletRegistration) -> R,
-	{
-		let guard = self.inner.lock().ok()?;
-		guard.get(key).map(f)
-	}
-
 	fn for_each<F>(&self, mut f: F)
 	where
 		F: FnMut(&Vec<u8>, &ServletRegistration),
@@ -222,20 +207,16 @@ impl ServletRegistry for HashMapRegistry {
 		self.inner.lock().map(|g| g.len()).unwrap_or(0)
 	}
 
-	fn addresses(&self) -> Vec<(&'static str, Vec<u8>)> {
+	fn addresses(&self) -> Vec<(Urn<'static>, Vec<u8>)> {
 		self.inner
 			.lock()
-			.map(|guard| guard.values().map(|reg| (reg.servlet_type, reg.servlet.addr_bytes())).collect())
+			.map(|guard| {
+				guard
+					.values()
+					.map(|reg| (reg.servlet_type.clone(), reg.servlet.addr_bytes()))
+					.collect()
+			})
 			.unwrap_or_default()
-	}
-
-	fn find_type_by_prefix(&self, prefix: &[u8]) -> Option<&'static str> {
-		self.inner.lock().ok().and_then(|guard| {
-			guard
-				.iter()
-				.find(|(k, _)| k.starts_with(prefix))
-				.map(|(_, reg)| reg.servlet_type)
-		})
 	}
 
 	fn drain_all(&self) -> Vec<(Vec<u8>, ServletRegistration)> {
@@ -268,9 +249,10 @@ impl ServletRegistry for HashMapRegistry {
 /// // 2. Create hive
 /// let mut hive = PaymentHive::new(Some(hive_conf))?;
 ///
-/// // 3. Register with spawners for auto-scaling
-/// hive.register("auth", auth, |t| AuthServlet::start(t, Some(auth_conf.clone())))?;
-/// hive.register("capture", capture, |t| CaptureServlet::start(t, None))?;
+/// // 3. Register with spawners for auto-scaling (types named by URN)
+/// let ns = ColonyNamespace::default();
+/// hive.register(ns.servlet("auth")?, auth, |t| AuthServlet::start(t, Some(auth_conf.clone())))?;
+/// hive.register(ns.servlet("capture")?, capture, |t| CaptureServlet::start(t, None))?;
 ///
 /// // 4. Establish (starts control server + scaling task)
 /// hive.establish(trace).await?;
@@ -297,7 +279,8 @@ pub trait Hive: Sized + Send + Sync {
 	/// additional instances, it calls the spawner with a trace collector.
 	///
 	/// # Arguments
-	/// * `name` - Unique name for this servlet type (used for intra-hive routing)
+	/// * `servlet_type` - Type URN for this servlet (used for intra-hive and
+	///   cluster routing); mint it with [`ColonyNamespace::servlet`]
 	/// * `servlet` - An already-started servlet instance
 	/// * `spawner` - Function to spawn additional instances of this servlet type
 	///
@@ -305,7 +288,7 @@ pub trait Hive: Sized + Send + Sync {
 	/// * `S` - The servlet type (must implement `ServletBox`)
 	/// * `F` - The spawner function type
 	/// * `Fut` - The future returned by the spawner
-	fn register<S, F, Fut>(&mut self, name: &'static str, servlet: S, spawner: F) -> Result<(), TightBeamError>
+	fn register<S, F, Fut>(&mut self, servlet_type: Urn<'static>, servlet: S, spawner: F) -> Result<(), TightBeamError>
 	where
 		S: ServletBox + 'static,
 		F: Fn(Arc<TraceCollector>) -> Fut + Send + Sync + 'static,
@@ -321,13 +304,24 @@ pub trait Hive: Sized + Send + Sync {
 	/// * `trace` - Trace collector for hive-level events
 	fn establish(&mut self, trace: Arc<TraceCollector>) -> impl Future<Output = Result<(), TightBeamError>> + Send;
 
+	/// Shared intra-hive communication context.
+	///
+	/// Created at `new` and populated with servlet addresses at
+	/// `establish`; the same `Arc` is live-updated as servlets scale.
+	/// Hand it to
+	/// [`ServletConfBuilder::with_hive_context`](crate::colony::servlet::ServletConfBuilder::with_hive_context)
+	/// so servlet handlers can reach siblings, or use it directly for
+	/// [`HiveContext::call`], [`HiveContext::open_stream`], and
+	/// [`HiveContext::open_duplex`].
+	fn context(&self) -> Arc<dyn HiveContext>;
+
 	/// Get the hive's control server address.
 	fn addr(&self) -> Self::Address;
 
 	/// Get addresses of all registered servlets.
 	///
-	/// Returns a list of (servlet_name, address_bytes) pairs.
-	fn servlet_addresses(&self) -> Vec<(&'static str, Vec<u8>)>;
+	/// Returns a list of (type URN, address_bytes) pairs.
+	fn servlet_addresses(&self) -> Vec<(Urn<'static>, Vec<u8>)>;
 
 	/// Stop the hive, control server, scaling task, and all registered servlets.
 	fn stop(self);
@@ -394,6 +388,22 @@ impl core::fmt::Debug for HiveTlsConfig {
 /// Type alias for async call result
 pub type CallFuture<'a> = Pin<Box<dyn core::future::Future<Output = Result<Vec<u8>, TightBeamError>> + Send + 'a>>;
 
+/// Unary reply future of a streamed intra-hive call: resolves once the
+/// sibling servlet answers the stream's trailer. Yields the reply's
+/// message bytes, the same shape as [`HiveContext::call`]; a servlet
+/// answering with no frame is `MissingResponse`.
+pub type StreamResponseFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, TightBeamError>> + Send>>;
+
+/// Future resolving to a streamed intra-hive call's producer half: the
+/// [`RequestSink`] plus the [`StreamResponseFuture`] for the reply.
+pub type StreamOpenFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<(RequestSink, StreamResponseFuture), TightBeamError>> + Send + 'a>>;
+
+/// Future resolving to a duplex intra-hive call's two halves: the
+/// [`RequestSink`] for pushing and the [`StreamBody`] carrying the reply.
+pub type DuplexOpenFuture<'a> =
+	Pin<Box<dyn Future<Output = Result<(RequestSink, StreamBody), TightBeamError>> + Send + 'a>>;
+
 /// Context for intra-hive servlet communication.
 ///
 /// This trait enables servlets within the same hive to call each other
@@ -406,20 +416,43 @@ pub type CallFuture<'a> = Pin<Box<dyn core::future::Future<Output = Result<Vec<u
 /// ```ignore
 /// // In a servlet handler:
 /// if let Some(ctx) = config.hive_context() {
-///     let decrypted = ctx.call(b"keymanager", encrypt_request).await?;
+///     let decrypted = ctx.call(&KEYMANAGER_URN, encrypt_request).await?;
 /// }
 /// ```
 pub trait HiveContext: Send + Sync {
-	/// Call a sibling servlet by type ID and get a response.
+	/// Call a sibling servlet by type URN and get a response.
 	///
 	/// # Arguments
-	/// * `servlet_type` - The type identifier of the target servlet (e.g., b"keymanager")
+	/// * `servlet_type` - Type URN of the target servlet (e.g.,
+	///   `urn:tightbeam::servlet:keymanager`)
 	/// * `request` - The serialized request message
 	///
 	/// # Returns
 	/// * `Ok(Vec<u8>)` - The serialized response from the target servlet
 	/// * `Err(TightBeamError)` - If the servlet is not found or the call fails
-	fn call<'a>(&'a self, servlet_type: &'a [u8], request: Vec<u8>) -> CallFuture<'a>;
+	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, request: Vec<u8>) -> CallFuture<'a>;
+
+	/// Open a request stream to a sibling servlet: push chunks through the
+	/// [`RequestSink`], then await the returned response future for the
+	/// servlet's unary reply. Requires a multiplex-negotiated connection.
+	///
+	/// Default refuses with `Unimplemented` so context implementations
+	/// without a mux-capable pool stay valid.
+	fn open_stream<'a>(&'a self, servlet_type: &'a Urn<'a>) -> StreamOpenFuture<'a> {
+		let _ = servlet_type;
+		Box::pin(async { Err(unimplemented_error()) })
+	}
+
+	/// Open a duplex stream to a sibling servlet: push request chunks
+	/// through the [`RequestSink`] while the servlet's reply chunks arrive
+	/// on the [`StreamBody`]. Requires a multiplex-negotiated connection.
+	///
+	/// Default refuses with `Unimplemented` so context implementations
+	/// without a mux-capable pool stay valid.
+	fn open_duplex<'a>(&'a self, servlet_type: &'a Urn<'a>) -> DuplexOpenFuture<'a> {
+		let _ = servlet_type;
+		Box::pin(async { Err(unimplemented_error()) })
+	}
 }
 
 /// Type-safe call with automatic encode/decode.
@@ -432,7 +465,7 @@ pub trait HiveContext: Send + Sync {
 /// of [`HiveContext`], allowing it to be used as `Arc<dyn HiveContext>`.
 pub fn call_typed<'a, Req, Resp>(
 	ctx: &'a (dyn HiveContext + Sync),
-	servlet_type: &'a [u8],
+	servlet_type: &'a Urn<'a>,
 	request: &Req,
 ) -> Pin<Box<dyn Future<Output = Result<Resp, TightBeamError>> + Send + 'a>>
 where
@@ -453,18 +486,19 @@ where
 
 /// Configuration for hives
 ///
-/// Generic over load balancing and message routing strategies.
-/// Defaults to `LeastLoaded` for load balancing and `TypeBasedRouter` for routing.
+/// A hive resolves each servlet type to a single instance address, so it
+/// carries no balancer: instance selection across a type's replicas is the
+/// cluster gateway's job. See [`ClusterConf`](crate::colony::cluster::ClusterConf).
 #[derive(Clone)]
-pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedRouter> {
-	/// Load balancing strategy for distributing work
-	pub load_balancer: L,
-	/// Message routing strategy for type-based dispatch
-	pub router: R,
+pub struct HiveConf {
+	/// Naming scope resource URNs are validated against. Registrations
+	/// carrying a foreign authority or realm are refused at
+	/// [`Hive::register`], before anything reaches a cluster.
+	pub namespace: ColonyNamespace,
 	/// Default scaling config for all servlet types
 	pub default_scale: ServletScaleConf,
-	/// Per-type overrides (keyed by servlet type name)
-	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
+	/// Per-type overrides (keyed by servlet type URN)
+	pub servlet_overrides: HashMap<Urn<'static>, ServletScaleConf>,
 	/// Cooldown between scaling decisions (default: 5 seconds)
 	pub cooldown: Duration,
 	/// Queue capacity per servlet for utilization calculation (default: 100)
@@ -491,9 +525,12 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 	/// Default: exponential backoff with 3 attempts, 500ms base delay.
 	#[cfg(feature = "std")]
 	pub cluster_notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
-	/// Trust store for certificate-based cluster command authentication.
-	/// Required for receiving authenticated ClusterCommand messages.
-	/// If None, all cluster commands will be rejected.
+	/// Trust store for certificate-based cluster command authentication
+	/// and for validating servlet certificates on intra-hive pool
+	/// connections. Required for receiving authenticated ClusterCommand
+	/// messages (if None, all cluster commands are rejected) and for
+	/// [`HiveContext`] calls to encrypted servlets (clients fail closed
+	/// without a trust anchor).
 	#[cfg(feature = "x509")]
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 	/// TLS configuration for spawned servlets (default: None = plain transport)
@@ -506,11 +543,10 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 	pub mux_offer: Option<TransportOffer>,
 }
 
-impl<L: LoadBalancer + core::fmt::Debug, R: MessageRouter + core::fmt::Debug> core::fmt::Debug for HiveConf<L, R> {
+impl core::fmt::Debug for HiveConf {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		let mut d = f.debug_struct("HiveConf");
-		d.field("load_balancer", &self.load_balancer)
-			.field("router", &self.router)
+		d.field("namespace", &self.namespace)
 			.field("default_scale", &self.default_scale)
 			.field("servlet_overrides", &self.servlet_overrides)
 			.field("cooldown", &self.cooldown)
@@ -536,8 +572,7 @@ impl<L: LoadBalancer + core::fmt::Debug, R: MessageRouter + core::fmt::Debug> co
 impl Default for HiveConf {
 	fn default() -> Self {
 		Self {
-			load_balancer: LeastLoaded,
-			router: TypeBasedRouter,
+			namespace: ColonyNamespace::default(),
 			default_scale: ServletScaleConf::default(),
 			servlet_overrides: HashMap::new(),
 			cooldown: Duration::from_secs(5),

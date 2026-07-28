@@ -20,6 +20,7 @@ use tightbeam::{
 	builder::TypeBuilder,
 	colony::{
 		cluster::{Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		common::ColonyNamespace,
 		hive::{Hive, HiveConf, HiveTlsConfig},
 		servlet::ServletConf,
 	},
@@ -55,6 +56,13 @@ use super::servlets::AuthorizationServlet;
 
 pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> = Urn::new("test", "event:scenarios/authorization-approved");
 pub(crate) const WORK_COMPLETED: Urn<'static> = Urn::new("test", "event:scenarios/work-completed");
+
+/// Type URN the payment scenario registers and targets.
+fn authorization_urn() -> Urn<'static> {
+	ColonyNamespace::default()
+		.servlet("authorization")
+		.expect("test names satisfy the mint grammar")
+}
 
 // ============================================================================
 // Shared Test Certificates (lazily initialized)
@@ -203,7 +211,7 @@ tb_scenario! {
 				mux_offer: Some(TransportOffer::mux(8)),
 				..hive_tls_config(&certs)
 			}))?;
-			hive.register("authorization", servlet, |t| AuthorizationServlet::start(t, None))?;
+			hive.register(authorization_urn(), servlet, |t| AuthorizationServlet::start(t, None))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 
 			// Register hive with cluster
@@ -212,7 +220,7 @@ tb_scenario! {
 			// Create authorization transaction
 			let transaction = create_auth_transaction(b"E2E-001", MonetaryAmount::new(10000, *b"USD"));
 			let work_request = ClusterRequest::Work(ClusterWorkRequest {
-				servlet_type: b"authorization".to_vec(),
+				servlet_type: authorization_urn(),
 				payload: encode(&transaction)?,
 			});
 

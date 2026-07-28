@@ -335,14 +335,16 @@ pub trait EnvelopeSink: MaybeSend {
 }
 
 /// Base I/O operations for message transport
+///
+/// The read/write futures carry an explicit send bound so generic serving
+/// code (accept loops, single-flight serving) can hold them across task
+/// spawns; on wasm targets the bound is vacuous.
 pub trait MessageIO {
 	/// Read raw DER-encoded bytes from the transport
-	#[allow(async_fn_in_trait)]
-	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>>;
+	fn read_envelope_bytes(&mut self) -> impl Future<Output = TransportResult<Vec<u8>>> + MaybeSend;
 
 	/// Write raw DER-encoded bytes to the transport
-	#[allow(async_fn_in_trait)]
-	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()>;
+	fn write_envelope_bytes(&mut self, buffer: &[u8]) -> impl Future<Output = TransportResult<()>> + MaybeSend;
 
 	/// Decode envelope from DER bytes
 	fn decode_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
@@ -356,10 +358,14 @@ pub trait MessageIO {
 
 	/// Read and decode a transport envelope
 	/// This can be overridden by EncryptedMessageIO to handle WireEnvelope parsing
-	#[allow(async_fn_in_trait)]
-	async fn read_decoded_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let bytes = self.read_envelope_bytes().await?;
-		Self::decode_envelope(&bytes)
+	fn read_decoded_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			let bytes = self.read_envelope_bytes().await?;
+			Self::decode_envelope(&bytes)
+		}
 	}
 
 	/// Try to read next envelope, distinguishing graceful close from errors
@@ -376,12 +382,18 @@ pub trait MessageIO {
 	/// relies on protocol-specific implementations to detect EOF conditions (e.g.,
 	/// `UnexpectedEof` for TCP). Protocols should override to map their EOF errors
 	/// to `Ok(None)`.
-	#[allow(async_fn_in_trait)]
-	async fn try_read_decoded_envelope(&mut self) -> TransportResult<Option<TransportEnvelope>> {
-		match self.read_decoded_envelope().await {
-			Ok(envelope) => Ok(Some(envelope)),
-			Err(TransportError::ConnectionClosed) => Ok(None),
-			Err(e) => Err(e),
+	fn try_read_decoded_envelope(
+		&mut self,
+	) -> impl Future<Output = TransportResult<Option<TransportEnvelope>>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			match self.read_decoded_envelope().await {
+				Ok(envelope) => Ok(Some(envelope)),
+				Err(TransportError::ConnectionClosed) => Ok(None),
+				Err(e) => Err(e),
+			}
 		}
 	}
 }

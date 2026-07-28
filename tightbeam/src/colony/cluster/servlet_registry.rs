@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use super::error::ClusterError;
 use super::SharedId;
+use crate::colony::common::MAX_PHEROMONE;
 use crate::utils::BasisPoints;
 
 // ============================================================================
@@ -29,7 +30,6 @@ pub const DEFAULT_EVAPORATION_RATE_BPS: u16 = 1000; // 10% per interval
 pub const DEFAULT_EVAPORATION_INTERVAL_SECS: u64 = 30;
 pub const DEFAULT_INITIAL_PHEROMONE: u64 = 5000; // 50% of max
 pub const DEFAULT_ABANDONMENT_LIMIT: u32 = 5;
-pub const MAX_PHEROMONE: u64 = 10000; // 100% (basis points)
 
 /// Configuration for pheromone-based servlet tracking
 #[derive(Debug, Clone)]

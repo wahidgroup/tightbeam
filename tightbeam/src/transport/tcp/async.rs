@@ -352,6 +352,20 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TokioListener<P> {
 #[cfg(feature = "x509")]
 impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
+where
+	TransportError: From<S::Error>,
+{
+	/// Report whether the underlying stream still appears connected.
+	///
+	/// The liveness hook external protocols need to implement
+	/// [`PersistentConnection`](crate::transport::PersistentConnection)
+	/// for pooled connections; the stream itself is not exposed.
+	pub fn is_alive(&self) -> bool {
+		AsyncProtocolStream::is_alive(&self.stream)
+	}
+}
+
 #[cfg(feature = "x509")]
 impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
 where
@@ -947,27 +961,21 @@ where
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
+	/// Delegates to the inherent accept so both entry points install the
+	/// full listener state.
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
-		let (stream, peer_addr) = self.listener.accept().await?;
-		let tokio_stream = TokioStream::from(stream);
-		let mut transport = Self::create_transport(tokio_stream);
-
 		#[cfg(feature = "x509")]
-		if let Some(ref cert) = self.certificate {
-			transport.server_identity = Some(Arc::clone(cert));
+		{
+			let (transport, peer_addr) = TokioListener::<P>::accept(self).await?;
+			Ok((transport, TightBeamSocketAddr(peer_addr)))
 		}
 
-		#[cfg(feature = "x509")]
-		if let Some(ref signatory) = self.key_manager {
-			transport.key_manager = Some(Arc::clone(signatory));
+		#[cfg(not(feature = "x509"))]
+		{
+			let (stream, peer_addr) = TokioListener::<P>::accept(self).await?;
+			let transport = Self::create_transport(stream);
+			Ok((transport, TightBeamSocketAddr(peer_addr)))
 		}
-
-		#[cfg(feature = "x509")]
-		if let Some(timeout) = self.handshake_timeout {
-			transport.handshake_timeout = timeout;
-		}
-
-		Ok((transport, TightBeamSocketAddr(peer_addr)))
 	}
 }
 
@@ -1151,7 +1159,7 @@ where
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		AsyncProtocolStream::is_alive(&transport.stream)
+		transport.is_alive()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {
@@ -1189,7 +1197,7 @@ mod tests {
 	#[cfg(feature = "x509")]
 	async fn respond_with<T, F>(transport: &mut T, reply: F) -> TransportResult<()>
 	where
-		T: MessageCollector,
+		T: MessageCollector + Send,
 		F: Fn(Frame) -> Option<Frame>,
 	{
 		let (request, status) = transport.collect_message().await?;

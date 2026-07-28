@@ -21,17 +21,26 @@ use crate::colony::hive::HiveContext;
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::colony::worker::Worker;
 use crate::colony::worker::WorkerMetadata;
+use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
 use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::GatePolicy;
+use crate::policy::SessionContext;
 use crate::router::RouterError;
 use crate::trace::TraceCollector;
 use crate::transport::handshake::negotiation::TransportOffer;
+use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
+use crate::transport::policy::PolicyConf;
+use crate::transport::serve::{unimplemented_error, MuxService};
+use crate::transport::AsyncListenerTrait;
 use crate::transport::Protocol;
 use crate::transport::TightBeamAddress;
 use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
+
+use tokio::sync::Semaphore;
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -498,7 +507,11 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Add x509 configuration for encrypted transport
+	/// Add x509 configuration for encrypted transport.
+	///
+	/// A non-empty `validators` list enables mutual authentication: the
+	/// handshake demands a client certificate and every validator must
+	/// accept it. An empty list means no client authentication.
 	pub fn with_certificate(
 		mut self,
 		cert: CertificateSpec,
@@ -507,9 +520,13 @@ where
 	) -> Result<Self, TightBeamError> {
 		let certificate = Certificate::try_from(cert)?;
 		let key_manager: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
-		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+		let mut encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
 
-		self.x509_config = Some(encryption_config.with_client_validators(validators));
+		if !validators.is_empty() {
+			encryption_config = encryption_config.with_client_validators(validators);
+		}
+
+		self.x509_config = Some(encryption_config);
 		Ok(self)
 	}
 
@@ -720,4 +737,244 @@ pub trait Servlet<I> {
 	fn utilization(&self) -> Option<BasisPoints> {
 		None
 	}
+}
+
+/// The interactions one servlet answers, one method per stream kind.
+///
+/// The servlet analog of [`MuxService`]: every method receives the
+/// servlet's runtime context (workers, env config, decryptor/inflator,
+/// hive link) instead of the transport session, because servlet handlers
+/// are context-blind by design. Unimplemented kinds refuse with
+/// `Unimplemented`, so a unary-only servlet is one method.
+///
+/// `servlet!` builds an implementation from its handler arms via
+/// [`ServletHandlers`]; implementing this trait directly and starting the
+/// accept loop with [`serve_servlet`] is the macro-free path.
+pub trait ServletService: Send + Sync + 'static {
+	/// Answer one unary request frame.
+	///
+	/// # Errors
+	/// The failure closes the stream with its mapped status.
+	fn unary(
+		&self,
+		frame: Frame,
+		ctx: Arc<ServletContext>,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		let _ = (frame, ctx);
+		async { Err(unimplemented_error()) }
+	}
+
+	/// Consume a streamed request body and answer with an optional
+	/// unary reply frame.
+	///
+	/// # Errors
+	/// The failure closes the stream with its mapped status.
+	fn streaming(
+		&self,
+		body: StreamBody,
+		ctx: Arc<ServletContext>,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		let _ = (body, ctx);
+		async { Err(unimplemented_error()) }
+	}
+
+	/// Consume request chunks while pushing reply chunks (full duplex
+	/// on one stream).
+	///
+	/// # Errors
+	/// The failure closes the stream with its mapped status.
+	fn duplex(
+		&self,
+		body: StreamBody,
+		reply: ReplySink,
+		ctx: Arc<ServletContext>,
+	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
+		let _ = (body, reply, ctx);
+		async { Err(unimplemented_error()) }
+	}
+}
+
+/// Boxed handler future for the closure-built [`ServletHandlers`] service.
+pub type ServletFuture<T> = Pin<Box<dyn Future<Output = Result<T, TightBeamError>> + Send>>;
+
+type UnaryHandler = Box<dyn Fn(Frame, Arc<ServletContext>) -> ServletFuture<Option<Frame>> + Send + Sync>;
+type StreamingHandler = Box<dyn Fn(StreamBody, Arc<ServletContext>) -> ServletFuture<Option<Frame>> + Send + Sync>;
+type DuplexHandler = Box<dyn Fn(StreamBody, ReplySink, Arc<ServletContext>) -> ServletFuture<()> + Send + Sync>;
+
+/// Closure-built [`ServletService`]: each interaction kind is an optional
+/// handler, absent kinds refuse with `Unimplemented`. This is what the
+/// `servlet!` handler arms assemble; hand-written services implement
+/// [`ServletService`] directly instead.
+#[derive(Default)]
+pub struct ServletHandlers {
+	unary: Option<UnaryHandler>,
+	streaming: Option<StreamingHandler>,
+	duplex: Option<DuplexHandler>,
+}
+
+impl ServletHandlers {
+	/// Answer unary requests with `handler`.
+	pub fn on_unary<F, Fut>(mut self, handler: F) -> Self
+	where
+		F: Fn(Frame, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + Send + 'static,
+	{
+		self.unary = Some(Box::new(move |frame, ctx| Box::pin(handler(frame, ctx))));
+		self
+	}
+
+	/// Consume streamed request bodies with `handler`.
+	pub fn on_streaming<F, Fut>(mut self, handler: F) -> Self
+	where
+		F: Fn(StreamBody, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + Send + 'static,
+	{
+		self.streaming = Some(Box::new(move |body, ctx| Box::pin(handler(body, ctx))));
+		self
+	}
+
+	/// Serve duplex streams with `handler`.
+	pub fn on_duplex<F, Fut>(mut self, handler: F) -> Self
+	where
+		F: Fn(StreamBody, ReplySink, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<(), TightBeamError>> + Send + 'static,
+	{
+		self.duplex = Some(Box::new(move |body, reply, ctx| Box::pin(handler(body, reply, ctx))));
+		self
+	}
+}
+
+impl ServletService for ServletHandlers {
+	fn unary(
+		&self,
+		frame: Frame,
+		ctx: Arc<ServletContext>,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		match self.unary.as_ref() {
+			Some(handler) => handler(frame, ctx),
+			None => Box::pin(async { Err(unimplemented_error()) }) as ServletFuture<_>,
+		}
+	}
+
+	fn streaming(
+		&self,
+		body: StreamBody,
+		ctx: Arc<ServletContext>,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		match self.streaming.as_ref() {
+			Some(handler) => handler(body, ctx),
+			None => Box::pin(async { Err(unimplemented_error()) }) as ServletFuture<_>,
+		}
+	}
+
+	fn duplex(
+		&self,
+		body: StreamBody,
+		reply: ReplySink,
+		ctx: Arc<ServletContext>,
+	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
+		match self.duplex.as_ref() {
+			Some(handler) => handler(body, reply, ctx),
+			None => Box::pin(async { Err(unimplemented_error()) }) as ServletFuture<_>,
+		}
+	}
+}
+
+/// [`MuxService`] adapter binding a [`ServletService`] to its runtime
+/// context.
+///
+/// Boundary: the transport [`SessionContext`] is intentionally dropped
+/// here. Peer identity is a transport concern that the servlet layer
+/// already enforces through gates before dispatch reaches a handler;
+/// servlet handlers receive the [`ServletContext`] (config, hive
+/// channel) instead. A handler that needs session facts belongs at the
+/// [`MuxService`] layer, not behind a servlet.
+struct ContextService<S> {
+	service: Arc<S>,
+	ctx: Arc<ServletContext>,
+}
+
+impl<S: ServletService> MuxService for ContextService<S> {
+	fn unary(
+		&self,
+		frame: Frame,
+		_session: SessionContext,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		let service = Arc::clone(&self.service);
+		let ctx = Arc::clone(&self.ctx);
+		async move { service.unary(frame, ctx).await }
+	}
+
+	fn streaming(
+		&self,
+		body: StreamBody,
+		_session: SessionContext,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		let service = Arc::clone(&self.service);
+		let ctx = Arc::clone(&self.ctx);
+		async move { service.streaming(body, ctx).await }
+	}
+
+	fn duplex(
+		&self,
+		body: StreamBody,
+		reply: ReplySink,
+		_session: SessionContext,
+	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
+		let service = Arc::clone(&self.service);
+		let ctx = Arc::clone(&self.ctx);
+		async move { service.duplex(body, reply, ctx).await }
+	}
+}
+
+/// Run a servlet's accept loop: apply collector gates and the mux offer to
+/// every accepted connection, then serve it with `service`.Returns the
+/// loop's task handle; aborting it stops the servlet.
+///
+/// Generic over the listener ([`AsyncListenerTrait`]), so any protocol's
+/// listener serves identically. This is the accept loop behind `servlet!`
+/// and the macro-free entry point for hand-written [`ServletService`]s.
+pub fn serve_servlet<L, S>(
+	listener: L,
+	gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	mux_offer: Option<TransportOffer>,
+	service: S,
+	ctx: Arc<ServletContext>,
+) -> rt::JoinHandle
+where
+	L: AsyncListenerTrait + Sync + 'static,
+	L::Transport: AcceptedConnection + PolicyConf + MuxCapable + 'static,
+	S: ServletService,
+{
+	let service = Arc::new(ContextService { service: Arc::new(service), ctx });
+	rt::spawn(async move {
+		// Accepting pauses while this many connection tasks are alive
+		// (CWE-400): a connection flood queues in the listener backlog
+		// instead of pinning unbounded tasks.
+		let permits = Arc::new(Semaphore::new(DEFAULT_MAX_SERVER_CONNECTIONS));
+		loop {
+			let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+				// Unreachable in practice: the semaphore is never closed.
+				break;
+			};
+			match listener.accept().await {
+				Ok((mut transport, _addr)) => {
+					for gate in &gates {
+						transport = transport.with_collector_gate(Arc::clone(gate));
+					}
+
+					transport = transport.with_mux_offer(mux_offer.clone());
+
+					let service = Arc::clone(&service);
+					rt::spawn(async move {
+						// The permit lives as long as the connection task,
+						// releasing its accept slot on any exit path.
+						let _permit = permit;
+						serve_connection_service(transport, service, None, None).await;
+					});
+				}
+				Err(_err) => break,
+			}
+		}
+	})
 }

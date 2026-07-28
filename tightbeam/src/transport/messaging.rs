@@ -15,6 +15,8 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+use core::future::Future;
+
 use crate::asn1::Frame;
 use crate::der::Encode;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
@@ -22,6 +24,7 @@ use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelo
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
 use crate::transport::TransportResult;
+use crate::utils::marker::MaybeSend;
 
 #[cfg(all(
 	feature = "transport-policy",
@@ -332,7 +335,7 @@ async fn send_single_flight_response<T>(
 	message: Option<Frame>,
 ) -> TransportResult<()>
 where
-	T: MessageIO + ?Sized,
+	T: MessageIO + MaybeSend + ?Sized,
 {
 	let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 	let response_envelope = TransportEnvelope::from(response_pkg);
@@ -378,23 +381,32 @@ pub trait MessageCollector: CollectorRequirements {
 	/// Read and validate a message without sending a response
 	/// Returns the message and the gate evaluation status
 	#[cfg(feature = "transport-policy")]
-	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
-		// Read and decode the envelope (can be overridden for encryption)
-		let decoded_envelope = self.read_decoded_envelope().await?;
-		// Cleartext connections authenticate nothing: empty context.
-		gate_collected_envelope(self, decoded_envelope, &SessionContext::default())
+	fn collect_message(&mut self) -> impl Future<Output = TransportResult<(Arc<Frame>, TransitStatus)>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			// Read and decode the envelope (can be overridden for encryption)
+			let decoded_envelope = self.read_decoded_envelope().await?;
+			// Cleartext connections authenticate nothing: empty context.
+			let session = SessionContext::default();
+			gate_collected_envelope(self, decoded_envelope, &session)
+		}
 	}
 
 	/// Read and validate a message without sending a response
 	/// Returns the message (status is always Ok without policies)
 	#[cfg(not(feature = "transport-policy"))]
-	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
-		let request_envelope = self.read_decoded_envelope().await?;
-		let request = single_flight_frame(request_envelope)?;
+	fn collect_message(&mut self) -> impl Future<Output = TransportResult<(Arc<Frame>, TransitStatus)>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			let request_envelope = self.read_decoded_envelope().await?;
+			let request = single_flight_frame(request_envelope)?;
 
-		Ok((request, TransitStatus::Ok))
+			Ok((request, TransitStatus::Ok))
+		}
 	}
 
 	/// Try to collect next message without blocking on closed connections
@@ -402,17 +414,24 @@ pub trait MessageCollector: CollectorRequirements {
 	/// Returns Ok(None) if connection closed gracefully (EOF).
 	/// Returns Err if connection failed unexpectedly.
 	#[cfg(feature = "transport-policy")]
-	#[allow(async_fn_in_trait)]
-	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
-		// Try to read envelope (returns None on graceful close)
-		let decoded_envelope = match self.try_read_decoded_envelope().await? {
-			Some(envelope) => envelope,
-			None => return Ok(None), // Connection closed gracefully
-		};
+	fn try_collect_message(
+		&mut self,
+	) -> impl Future<Output = TransportResult<Option<(Arc<Frame>, TransitStatus)>>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			// Try to read envelope (returns None on graceful close)
+			let decoded_envelope = match self.try_read_decoded_envelope().await? {
+				Some(envelope) => envelope,
+				None => return Ok(None), // Connection closed gracefully
+			};
 
-		// Cleartext connections authenticate nothing: empty context.
-		let gated = gate_collected_envelope(self, decoded_envelope, &SessionContext::default())?;
-		Ok(Some(gated))
+			// Cleartext connections authenticate nothing: empty context.
+			let session = SessionContext::default();
+			let gated = gate_collected_envelope(self, decoded_envelope, &session)?;
+			Ok(Some(gated))
+		}
 	}
 
 	/// Try to collect next message without blocking on closed connections
@@ -420,22 +439,34 @@ pub trait MessageCollector: CollectorRequirements {
 	/// Returns Ok(None) if connection closed gracefully (EOF).
 	/// Returns Err if connection failed unexpectedly.
 	#[cfg(not(feature = "transport-policy"))]
-	#[allow(async_fn_in_trait)]
-	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
-		// Try to read envelope (returns None on graceful close)
-		let request_envelope = match self.try_read_decoded_envelope().await? {
-			Some(envelope) => envelope,
-			None => return Ok(None), // Connection closed gracefully
-		};
+	fn try_collect_message(
+		&mut self,
+	) -> impl Future<Output = TransportResult<Option<(Arc<Frame>, TransitStatus)>>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			// Try to read envelope (returns None on graceful close)
+			let request_envelope = match self.try_read_decoded_envelope().await? {
+				Some(envelope) => envelope,
+				None => return Ok(None), // Connection closed gracefully
+			};
 
-		let request = single_flight_frame(request_envelope)?;
-		Ok(Some((request, TransitStatus::Ok)))
+			let request = single_flight_frame(request_envelope)?;
+			Ok(Some((request, TransitStatus::Ok)))
+		}
 	}
 
 	/// Send a response for a previously collected message
-	#[allow(async_fn_in_trait)]
-	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		send_single_flight_response(self, status, message).await
+	fn send_response(
+		&mut self,
+		status: TransitStatus,
+		message: Option<Frame>,
+	) -> impl Future<Output = TransportResult<()>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		send_single_flight_response(self, status, message)
 	}
 
 	/// X509-enabled collect_message with encryption and handshake support
