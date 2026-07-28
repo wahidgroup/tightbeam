@@ -137,6 +137,11 @@ impl ServletEntry {
 		self.trial_count.load(Ordering::Relaxed) >= self.abandonment_limit
 	}
 
+	/// Whether the entry is selectable for routing (not abandoned)
+	pub fn is_live(&self) -> bool {
+		!self.is_abandoned()
+	}
+
 	/// Get current pheromone level
 	pub fn pheromone_level(&self) -> u64 {
 		self.pheromone.load(Ordering::Relaxed)
@@ -427,18 +432,25 @@ impl ServletRegistry {
 		let result: Vec<ServletEntry> = addresses
 			.iter()
 			.filter_map(|addr| entries.get(addr.as_ref()).cloned())
-			.filter(|e| !e.is_abandoned())
+			.filter(|e| e.is_live())
 			.collect();
 
 		Ok(result)
 	}
 
-	/// Entries reached through a peer gateway (`RouteKind::Peer`)
+	/// Live entries reached through a peer gateway (`RouteKind::Peer`)
+	///
+	/// Abandoned trails are excluded, mirroring [`entries_for_type`]: an
+	/// isolated peer nest is unreachable, so it is neither advertised nor
+	/// re-flooded.
+	///
+	/// [`entries_for_type`]: Self::entries_for_type
 	pub fn peer_servlets(&self) -> Result<Vec<ServletEntry>, ClusterError> {
 		let entries = self.entries.read()?;
 		let result = entries
 			.values()
 			.filter(|entry| entry.route_kind == RouteKind::Peer)
+			.filter(|entry| entry.is_live())
 			.cloned()
 			.collect();
 
@@ -656,6 +668,25 @@ mod tests {
 		let peers = registry.peer_servlets().ok().unwrap_or_default();
 		assert_eq!(peers.len(), 1);
 		assert_eq!(peers[0].address.as_ref(), b"peer-gw");
+	}
+
+	#[test]
+	fn peer_servlets_excludes_abandoned() {
+		let limit = 2;
+		let config = PheromoneConf { abandonment_limit: limit, ..Default::default() };
+		let registry = ServletRegistry::new(config);
+
+		let mut peer = named_entry(b"peer-gw", b"calc", b"peer-colony");
+		peer.route_kind = RouteKind::Peer;
+		peer.abandonment_limit = limit;
+		registry.add(peer).ok();
+
+		for _ in 0..limit {
+			registry.weaken(b"peer-gw").ok();
+		}
+
+		let peers = registry.peer_servlets().ok().unwrap_or_default();
+		assert!(peers.is_empty());
 	}
 
 	#[test]
