@@ -462,18 +462,20 @@ macro_rules! hive {
 						@register_once $protocol, self.servlets, self.addr, cluster_addr, self.config
 					).await?;
 
-					// Remember the gateway so scaling updates and the
-					// re-registration beat fan out to it. Addresses are
-					// deduplicated by their byte form: `TightBeamAddress`
-					// guarantees `Into<Vec<u8>>`, not `PartialEq`.
-					if let Ok(mut addrs) = self.cluster_addrs.write() {
-						let incoming: Vec<u8> = cluster_addr.clone().into();
-						let known = addrs.iter().any(|addr| {
-							let bytes: Vec<u8> = addr.clone().into();
-							bytes == incoming
-						});
-						if !known {
-							addrs.push(cluster_addr);
+					// Remember the gateway only after acceptance. A refused
+					// registration must not enqueue the peer: the
+					// anti-entropy beat and scaling fan-out would keep
+					// calling a gateway that already rejected this hive.
+					if response.status == $crate::policy::TransitStatus::Ok {
+						if let Ok(mut addrs) = self.cluster_addrs.write() {
+							let incoming: Vec<u8> = cluster_addr.clone().into();
+							let known = addrs.iter().any(|addr| {
+								let bytes: Vec<u8> = addr.clone().into();
+								bytes == incoming
+							});
+							if !known {
+								addrs.push(cluster_addr);
+							}
 						}
 					}
 
@@ -839,21 +841,20 @@ macro_rules! hive {
 		let utilization_map = $utilization_map;
 		let cluster_addrs = $cluster_addrs;
 		let hive_context = $hive_context;
-		let config = $config;
+		let config = ::std::sync::Arc::new($config);
 		// Hive identity URN for scaling updates, minted once from the
 		// control address. Locators are Display-formatted so this is
 		// always Some; an address that cannot mint an exact identity
 		// (non-UTF-8 or empty) disables cluster notification rather
 		// than announcing a corrupted one.
-		let hive_addr: Vec<u8> = $hive_addr.into();
-		let hive_urn = String::from_utf8(hive_addr)
-			.ok()
-			.and_then(|addr| config.namespace.hive(addr).ok());
-
-		#[cfg(feature = "x509")]
-		let hive_tls_for_notify = config.hive_tls.as_ref().map(::std::sync::Arc::clone);
-		#[cfg(feature = "x509")]
-		let trust_store_for_notify = config.trust_store.as_ref().map(::std::sync::Arc::clone);
+		let hive_addr = $hive_addr;
+		let hive_urn = {
+			let bytes: Vec<u8> = hive_addr.into();
+			String::from_utf8(bytes)
+				.ok()
+				.and_then(|addr| config.namespace.hive(addr).ok())
+				.map(::std::sync::Arc::new)
+		};
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			let mut last_scale_up: std::collections::HashMap<Vec<u8>, std::time::Instant> = std::collections::HashMap::new();
@@ -861,6 +862,14 @@ macro_rules! hive {
 
 			loop {
 				hive!(@sleep config.cooldown);
+
+				// Without a mintable hive identity, local add/remove is
+				// refused when any gateway is remembered: those peers
+				// cannot be notified and would keep stale routes.
+				let scale_blocked = hive_urn.is_none() && match cluster_addrs.read() {
+					Ok(guard) => !guard.is_empty(),
+					Err(_) => true,
+				};
 
 				// Scaling decisions are per type, but the shared utilization
 				// atomic feeds backpressure and heartbeats for the WHOLE
@@ -906,6 +915,10 @@ macro_rules! hive {
 
 					match $crate::colony::common::ScalingDecision::evaluate(&metrics) {
 						$crate::colony::common::ScalingDecision::ScaleUp => {
+							if scale_blocked {
+								continue;
+							}
+
 							// Check cooldown
 							if last_scale_up.get(&type_key)
 								.is_some_and(|t| t.elapsed() < scale_conf.scale_up_cooldown)
@@ -927,15 +940,17 @@ macro_rules! hive {
 							hive!(@add_to_context hive_context, key_bytes.clone(), addr_bytes.clone(), &type_key);
 
 							if let Some(hive_urn) = hive_urn.as_ref() {
-								hive!(@notify_cluster $protocol, ::std::sync::Arc::clone(&cluster_addrs), hive_urn.clone(),
+								hive!(@notify_cluster $protocol,
+									::std::sync::Arc::clone(&servlets),
+									::std::sync::Arc::clone(&cluster_addrs),
+									hive_addr,
+									::std::sync::Arc::clone(hive_urn),
 									$crate::colony::hive::ServletInfo {
 										servlet_id: instance,
 										address: addr_bytes,
 									},
 									true,
-									::std::sync::Arc::clone(&config.cluster_notify_retry),
-									hive_tls_for_notify,
-									trust_store_for_notify
+									::std::sync::Arc::clone(&config),
 								);
 							}
 
@@ -944,10 +959,15 @@ macro_rules! hive {
 								spawner: ::std::sync::Arc::clone(spawner),
 								servlet_type: servlet_type.clone(),
 							};
+
 							let _ = servlets.insert(key_bytes, registration);
 							last_scale_up.insert(type_key.clone(), std::time::Instant::now());
 						}
 						$crate::colony::common::ScalingDecision::ScaleDown => {
+							if scale_blocked {
+								continue;
+							}
+
 							// Check cooldown
 							if last_scale_down.get(&type_key)
 								.is_some_and(|t| t.elapsed() < scale_conf.scale_down_cooldown)
@@ -978,15 +998,17 @@ macro_rules! hive {
 								continue;
 							};
 							if let Some(hive_urn) = hive_urn.as_ref() {
-								hive!(@notify_cluster $protocol, ::std::sync::Arc::clone(&cluster_addrs), hive_urn.clone(),
+								hive!(@notify_cluster $protocol,
+									::std::sync::Arc::clone(&servlets),
+									::std::sync::Arc::clone(&cluster_addrs),
+									hive_addr,
+									::std::sync::Arc::clone(hive_urn),
 									$crate::colony::hive::ServletInfo {
 										servlet_id: instance,
 										address: addr,
 									},
 									false,
-									::std::sync::Arc::clone(&config.cluster_notify_retry),
-									hive_tls_for_notify,
-									trust_store_for_notify
+									::std::sync::Arc::clone(&config),
 								);
 							}
 
@@ -1174,17 +1196,14 @@ macro_rules! hive {
 	// Cluster Notification
 	// ==========================================================================
 
-	(@notify_cluster $protocol:path, $cluster_addrs:expr, $hive_urn:expr, $servlet_info:expr, $is_added:expr, $retry_policy:expr, $hive_tls:ident, $trust_store:ident) => {{
+	(@notify_cluster $protocol:path, $servlets:expr, $cluster_addrs:expr, $hive_addr:expr, $hive_urn:expr, $servlet_info:expr, $is_added:expr, $config:expr $(,)?) => {{
+		let servlets = $servlets;
 		let cluster_addrs_arc = $cluster_addrs;
+		let hive_addr = $hive_addr;
 		let hive_id = $hive_urn;
 		let servlet_info = $servlet_info;
 		let is_added = $is_added;
-		let retry_policy = $retry_policy;
-
-		#[cfg(feature = "x509")]
-		let hive_tls = $hive_tls.as_ref().map(::std::sync::Arc::clone);
-		#[cfg(feature = "x509")]
-		let trust_store = $trust_store.as_ref().map(::std::sync::Arc::clone);
+		let config = $config;
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			use $crate::transport::policy::CoreRetryPolicy;
@@ -1203,7 +1222,7 @@ macro_rules! hive {
 				$crate::colony::common::ClusterRequest::ServletAddressUpdate(
 					$crate::colony::hive::ServletAddressUpdate {
 						issued_at_ms: $crate::colony::common::current_timestamp_ms(),
-						hive_id,
+						hive_id: (*hive_id).clone(),
 						added: vec![servlet_info],
 						removed: vec![],
 					}
@@ -1212,12 +1231,17 @@ macro_rules! hive {
 				$crate::colony::common::ClusterRequest::ServletAddressUpdate(
 					$crate::colony::hive::ServletAddressUpdate {
 						issued_at_ms: $crate::colony::common::current_timestamp_ms(),
-						hive_id,
+						hive_id: (*hive_id).clone(),
 						added: vec![],
 						removed: vec![servlet_info.servlet_id],
 					}
 				)
 			};
+
+			#[cfg(feature = "x509")]
+			let hive_tls = config.hive_tls.as_ref().map(::std::sync::Arc::clone);
+			#[cfg(feature = "x509")]
+			let trust_store = config.trust_store.as_ref().map(::std::sync::Arc::clone);
 
 			let frame_result: Result<$crate::Frame, $crate::TightBeamError> = async {
 				Ok(hive!(@control_frame b"scaling-update", update, hive_tls))
@@ -1243,8 +1267,11 @@ macro_rules! hive {
 				None => None,
 			};
 
+			let retry_policy = ::std::sync::Arc::clone(&config.cluster_notify_retry);
 			let max_attempts = retry_policy.max_attempts();
-			for gateway in gateways {
+			let mut any_failed = false;
+			for gateway in gateways.iter().copied() {
+				let mut accepted = false;
 				for attempt in 0..=max_attempts {
 					let stream = match <$protocol as $crate::transport::Protocol>::connect(gateway).await {
 						Ok(s) => s,
@@ -1273,11 +1300,41 @@ macro_rules! hive {
 					}
 
 					use $crate::transport::MessageEmitter;
-					if transport.emit(frame.clone(), None).await.is_ok() {
-						break;
+					// Transport Ok is not acceptance: decode the body and
+					// require TransitStatus::Ok (same rule as registration).
+					// Clone is not in the hot path here
+					match transport.emit(frame.clone(), None).await {
+						Ok(Some(response)) => {
+							match $crate::decode::<$crate::colony::hive::ServletAddressUpdateResponse>(
+								&response.message,
+							) {
+								Ok(body) if body.status == $crate::policy::TransitStatus::Ok => {
+									accepted = true;
+									break;
+								}
+								_ => {
+									hive!(@retry_delay attempt, max_attempts, retry_policy);
+								}
+							}
+						}
+						Ok(None) | Err(_) => {
+							hive!(@retry_delay attempt, max_attempts, retry_policy);
+						}
 					}
+				}
+				if !accepted {
+					any_failed = true;
+				}
+			}
 
-					hive!(@retry_delay attempt, max_attempts, retry_policy);
+			// Soft-state reconcile: any gateway that exhausted retries leaves
+			// the fleet divergent until the next beat. Push the full slate
+			// to every remembered peer immediately.
+			if any_failed {
+				for gateway in gateways {
+					let _ = hive!(
+						@register_once $protocol, servlets, hive_addr, gateway, config
+					).await;
 				}
 			}
 		});

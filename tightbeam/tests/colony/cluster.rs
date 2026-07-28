@@ -694,6 +694,58 @@ tb_scenario! {
 	}
 }
 
+tb_assert_spec! {
+	pub ClusterRefusedRegNotQueuedSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(REGISTRATION_SENT, exactly!(1)),
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(events::HIVE_REREGISTERED, exactly!(0))
+		]
+	}
+}
+
+// A refused RegisterHiveResponse must not enqueue the gateway: the
+// anti-entropy beat would otherwise keep calling a peer that already
+// rejected the hive, and scaling updates would fan out there too.
+tb_scenario! {
+	name: cluster_refused_registration_does_not_queue_gateway,
+	spec: ClusterRefusedRegNotQueuedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, ClusterConf::new(cluster_tls_config(&certs))).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let cluster_addr = cluster.addr();
+			let hive_conf = HiveConf {
+				trust_store: Some(Arc::clone(&certs.trust)),
+				reregister_interval: Some(Duration::from_millis(50)),
+				..Default::default()
+			};
+
+			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
+			hive.establish(Arc::new(trace.share())).await?;
+
+			trace.event(REGISTRATION_SENT)?;
+
+			let response = hive.register_with_cluster(cluster_addr).await?;
+			assert_register_status(&response, TransitStatus::Unauthenticated, 0, &cluster);
+
+			// Several anti-entropy intervals: a queued gateway would emit
+			// HIVE_REREGISTERED; an unqueued one stays silent.
+			tokio::time::sleep(Duration::from_millis(250)).await;
+
+			hive.stop();
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
 // ============================================================================
 // Missing Trust Store Fails Closed
 // ============================================================================
