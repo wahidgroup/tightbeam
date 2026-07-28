@@ -430,14 +430,19 @@ macro_rules! cluster {
 				});
 			}
 
-			// Every announced identity must be a servlet URN in this
-			// gateway's namespace: foreign authorities and realms are
-			// refused before anything is installed (structural isolation).
+			// Every announced identity must be an instance-narrowed
+			// servlet URN in this gateway's namespace whose locator
+			// bytes equal the route address: routes key by address,
+			// removes key by URN locator, so a mismatch creates
+			// unremovable ghost routes (CWE-639).
 			let urns_valid = request.servlet_addresses.iter().all(|info| {
-				matches!(
-					$config.namespace.validate(&info.servlet_id),
-					Ok($crate::colony::common::ColonyResource::Servlet { .. })
-				)
+				match $config.namespace.validate(&info.servlet_id) {
+					Ok($crate::colony::common::ColonyResource::Servlet {
+						instance: ::std::option::Option::Some(locator),
+						..
+					}) => locator.as_bytes() == info.address.as_slice(),
+					_ => false,
+				}
 			});
 			if !urns_valid {
 				let _ = $trace.event($crate::instrumentation::events::CLUSTER_REGISTER_REFUSED);
@@ -568,16 +573,21 @@ macro_rules! cluster {
 			}
 
 			// The claimed identity must be a hive URN in this gateway's
-			// namespace; the registry key is the locator it was minted from.
-			// Added identities must be servlet URNs in the same namespace.
-			// Removed identities must be instance-narrowed servlet URNs:
-			// the registry unroutes by the locator in the instance tail.
+			// namespace - the registry key is the locator it was minted from.
+			// Added identities must be instance-narrowed servlet URNs
+			// whose locator equals the route address (same alignment
+			// rule as registration). Removed identities must be
+			// instance-narrowed servlet URNs: the registry unroutes by
+			// the locator in the instance tail.
 			let claimed_hive = $config.namespace.validate(&update.hive_id);
 			let added_valid = update.added.iter().all(|info| {
-				matches!(
-					$config.namespace.validate(&info.servlet_id),
-					Ok($crate::colony::common::ColonyResource::Servlet { .. })
-				)
+				match $config.namespace.validate(&info.servlet_id) {
+					Ok($crate::colony::common::ColonyResource::Servlet {
+						instance: ::std::option::Option::Some(locator),
+						..
+					}) => locator.as_bytes() == info.address.as_slice(),
+					_ => false,
+				}
 			});
 			let removed_locators: ::std::option::Option<Vec<&[u8]>> = update
 				.removed

@@ -1077,7 +1077,8 @@ impl MuxShared {
 	}
 
 	pub(super) fn has_pending_streams(&self) -> bool {
-		!self.lock().pending.is_empty()
+		let state = self.lock();
+		!state.pending.is_empty() || state.reserved > 0
 	}
 
 	pub(super) fn is_pending(&self, stream_id: u32) -> bool {
@@ -1530,6 +1531,21 @@ mod tests {
 
 		assert!(shared.has_pending_streams());
 		assert!(shared.remove_pending(1).is_some());
+		assert!(!shared.has_pending_streams());
+	}
+
+	// A reserved slot (open_stream before first push) must pin the
+	// connection against idle prune the same way a pending ID does.
+	#[test]
+	fn test_reserved_slot_counts_as_pending() {
+		let shared = shared(MuxRole::Client, 8);
+		assert!(!shared.has_pending_streams());
+
+		let reservation = shared.reserve_stream_slot(slot());
+		assert!(reservation.is_ok());
+		assert!(shared.has_pending_streams());
+
+		drop(reservation);
 		assert!(!shared.has_pending_streams());
 	}
 

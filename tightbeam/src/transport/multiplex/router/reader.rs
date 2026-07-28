@@ -88,18 +88,28 @@ struct RecvStream {
 	received: u64,
 	/// Absolute cumulative chunk limit granted to the sender
 	limit: u64,
+	/// Hard byte ceiling on `buffer` (credit grants cannot raise this)
+	max_bytes: usize,
 }
 
 impl RecvStream {
 	fn new(limit: u64) -> Self {
-		Self { buffer: Vec::new(), received: 0, limit }
+		Self::with_ceiling(limit, crate::constants::MAX_MUX_REASSEMBLY_BYTES)
+	}
+
+	fn with_ceiling(limit: u64, max_bytes: usize) -> Self {
+		Self { buffer: Vec::new(), received: 0, limit, max_bytes }
 	}
 
 	/// Account one accepted chunk against the granted limit and
-	/// buffer it. `false` means the sender overran its credit.
+	/// buffer it. `false` means the sender overran its credit or the
+	/// hard reassembly byte ceiling.
 	fn accept_chunk(&mut self, payload: &[u8]) -> bool {
 		self.received = self.received.saturating_add(1);
 		if self.received > self.limit {
+			return false;
+		}
+		if self.buffer.len().saturating_add(payload.len()) > self.max_bytes {
 			return false;
 		}
 
@@ -726,6 +736,12 @@ where
 	/// Consult the grantor and queue a credit grant when it raises
 	/// the stream's limit.
 	fn maybe_grant(&mut self, stream_id: u32, stream: &mut RecvStream) -> TransportResult<()> {
+		// No further grants once the byte ceiling is full: raising the
+		// chunk window cannot admit more payload past max_bytes.
+		if stream.buffer.len() >= stream.max_bytes {
+			return Ok(());
+		}
+
 		let granted = self.grantor.replenish(StreamId::new(stream_id), stream.received, stream.limit);
 		let Some(new_limit) = granted else {
 			return Ok(());
@@ -1178,6 +1194,30 @@ mod tests {
 		assert!(stream.accept_chunk(b"cd"));
 		assert!(!stream.accept_chunk(b"ef"));
 		assert_eq!(stream.buffer.as_slice(), b"abcd");
+	}
+
+	// Unary reassembly must refuse past a hard byte ceiling even when
+	// the grantor keeps raising the chunk limit (CWE-770).
+	#[test]
+	fn test_recv_stream_rejects_past_reassembly_ceiling() {
+		let ceiling = 256usize;
+		let mut stream = RecvStream::with_ceiling(1, ceiling);
+		let chunk = [0u8; 64];
+		let mut accepted = 0usize;
+		loop {
+			if stream.received >= stream.limit {
+				stream.limit = stream.received.saturating_add(1);
+			}
+			if !stream.accept_chunk(&chunk) {
+				break;
+			}
+
+			accepted = accepted.saturating_add(1);
+			assert!(accepted.saturating_mul(chunk.len()) <= ceiling);
+		}
+
+		assert!(stream.buffer.len() <= ceiling);
+		assert!(accepted > 0);
 	}
 
 	/// Source scripted with a fixed sequence, then pending forever.

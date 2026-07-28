@@ -228,12 +228,9 @@ impl ForwardedStream {
 	/// Forward a body event. A full channel is unreachable for a
 	/// conforming peer (grants are clamped to channel capacity), so
 	/// overflow reports as a failure like a disconnect. A dropped
-	/// body only discards data: consumed credit stays consumed.
+	/// (Closed) body is also failure: consumed credit stays consumed.
 	pub(super) fn forward(&mut self, event: BodyEvent) -> bool {
-		match self.events.try_send(event) {
-			Ok(()) => true,
-			Err(refused) => !refused.is_full(),
-		}
+		self.events.try_send(event).is_ok()
 	}
 
 	/// Account and forward one payload chunk: `false` on a credit
@@ -311,6 +308,15 @@ mod tests {
 		let (_body, mut forwarder, _notes) = body_fixture(7, 1);
 		assert!(forwarder.accept_chunk());
 		assert!(!forwarder.accept_chunk());
+	}
+
+	// A dropped body closes the channel: forward must report failure,
+	// not treat Closed like success (credit would keep draining).
+	#[test]
+	fn test_forward_reports_failure_when_body_dropped() {
+		let (body, mut forwarder, _notes) = body_fixture(7, 4);
+		drop(body);
+		assert!(!forwarder.forward(BodyEvent::Chunk(vec![1])));
 	}
 
 	#[test]

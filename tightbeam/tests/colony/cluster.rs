@@ -240,6 +240,14 @@ fn servlet_info(servlet_name: &str, address: &[u8]) -> ServletInfo {
 	}
 }
 
+/// ServletInfo whose instance locator disagrees with the route address.
+fn servlet_info_mismatched(servlet_name: &str, urn_addr: &[u8], route_addr: &[u8]) -> ServletInfo {
+	ServletInfo {
+		servlet_id: servlet_instance(&servlet_urn(servlet_name), String::from_utf8_lossy(urn_addr).as_ref()),
+		address: route_addr.to_vec(),
+	}
+}
+
 /// Poll until the registry is empty or attempts exhaust. Branching lives here, not in scenarios.
 async fn wait_for_empty_registry(cluster: &ClusterGateway, attempts: u32, interval: Duration) -> bool {
 	for _ in 0..attempts {
@@ -736,6 +744,88 @@ tb_scenario! {
 			let response_frame = emit_frame(&mut client, signed).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_register_status(&response, TransitStatus::PermissionDenied, 0, &cluster);
+
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Servlet URN locator must match route address
+// ============================================================================
+
+tb_assert_spec! {
+	pub ClusterServletLocatorAlignSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_UPDATE_REFUSED, exactly!(1))
+		]
+	}
+}
+
+// Register and update must refuse ServletInfo whose instance locator
+// disagrees with the announced address: routes key by address, remove
+// by URN locator (CWE-639 ghost / orphan routes).
+tb_scenario! {
+	name: cluster_rejects_mismatched_servlet_locator,
+	spec: ClusterServletLocatorAlignSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, ClusterConf::new(cluster_tls_config(&certs))).await
+		},
+		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+			let cluster_addr = cluster.addr();
+			let mut client = connect_cluster(&certs, cluster_addr).await?;
+			let hive_addr = b"127.0.0.1:65100";
+
+			let mismatch = servlet_info_mismatched("ping", b"127.0.0.1:65101", b"127.0.0.1:65199");
+			let refused_reg = signed_control_frame(
+				&certs,
+				b"misalign-reg",
+				ClusterRequest::RegisterHive(RegisterHiveRequest {
+					issued_at_ms: current_timestamp_ms(),
+					hive_addr: hive_addr.to_vec(),
+					servlet_addresses: vec![mismatch],
+					metadata: None,
+				}),
+			)
+			.await?;
+
+			let response_frame = emit_frame(&mut client, refused_reg).await?;
+			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			assert_register_status(&response, TransitStatus::PermissionDenied, 0, &cluster);
+
+			// Clean registration, then a mismatched add must refuse.
+			let ok_reg = signed_control_frame(
+				&certs,
+				b"align-reg",
+				registration_request(current_timestamp_ms(), hive_addr),
+			)
+			.await?;
+			let response_frame = emit_frame(&mut client, ok_reg).await?;
+			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			assert_register_status(&response, TransitStatus::Ok, 1, &cluster);
+
+			let bad_add = servlet_address_update(
+				hive_addr,
+				vec![servlet_info_mismatched("ping", b"127.0.0.1:65102", b"127.0.0.1:65198")],
+				vec![],
+			);
+			let refused_update = signed_control_frame(&certs, b"misalign-update", bad_add).await?;
+			let response_frame = emit_frame(&mut client, refused_update).await?;
+			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			assert_eq!(
+				response.status,
+				TransitStatus::PermissionDenied,
+				"mismatched servlet locator on update must be refused"
+			);
 
 			cluster.stop();
 
