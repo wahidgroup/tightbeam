@@ -939,6 +939,17 @@ macro_rules! hive {
 
 							hive!(@add_to_context hive_context, key_bytes.clone(), addr_bytes.clone(), &type_key);
 
+							let registration = $crate::colony::hive::ServletRegistration {
+								servlet: new_servlet,
+								spawner: ::std::sync::Arc::clone(spawner),
+								servlet_type: servlet_type.clone(),
+							};
+
+							// Register before announcing: the notify task's
+							// failure-path full-slate reconcile reads the
+							// registry, so the new servlet must be visible.
+							let _ = servlets.insert(key_bytes, registration);
+
 							if let Some(hive_urn) = hive_urn.as_ref() {
 								hive!(@notify_cluster $protocol,
 									::std::sync::Arc::clone(&servlets),
@@ -954,13 +965,6 @@ macro_rules! hive {
 								);
 							}
 
-							let registration = $crate::colony::hive::ServletRegistration {
-								servlet: new_servlet,
-								spawner: ::std::sync::Arc::clone(spawner),
-								servlet_type: servlet_type.clone(),
-							};
-
-							let _ = servlets.insert(key_bytes, registration);
 							last_scale_up.insert(type_key.clone(), std::time::Instant::now());
 						}
 						$crate::colony::common::ScalingDecision::ScaleDown => {
