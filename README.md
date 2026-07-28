@@ -1292,11 +1292,11 @@ Policies control message flow without modifying transport logic:
 
 ```rust
 pub trait GatePolicy: Send + Sync {
-	fn evaluate(&self, frame: &Frame, session: &SessionContext) -> TransitStatus;
+	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus;
 }
 ```
 
-Every evaluation carries the connection's `SessionContext`: identity-blind gates ignore it, identity gates key on it. Sites without authenticated facts, such as cleartext connections, client-side emit paths, in-process evaluation, pass the empty (default) context, whose accessors all answer `None`.
+Every evaluation carries the connection's `SessionContext`: identity-blind gates ignore it, identity gates key on it. Sites without authenticated facts, such as cleartext connections, client-side emit paths, in-process evaluation, pass the empty (default) context, whose accessors all answer `None`. `frame` is `None` for mux streaming and duplex opens that have no request frame at dispatch. Session and capacity gates still run; optional integrity gates skip (`Ok`); auth that needs a signed or intact frame fails closed. Streaming authz belongs on session facts (mutual TLS, peer lists), not frame-content rules alone.
 
 **ReceptorPolicy Trait:**
 
@@ -1443,7 +1443,12 @@ let restart = RestartExponentialBackoff::new(4, 1000, None);
 
 ```rust
 tightbeam::policy! {
+	// Frame-content gate: fail closed when no request frame exists
+	// (mux streaming / duplex). Pair with a session gate for stream opens.
 	GatePolicy: OnlyApiMessages |frame| {
+		let Some(frame) = frame else {
+			return TransitStatus::PermissionDenied;
+		};
 		if frame.metadata.id.starts_with(b"api-") {
 			TransitStatus::Ok
 		} else {
@@ -1451,9 +1456,8 @@ tightbeam::policy! {
 		}
 	}
 
-	// Two-argument arm: session-aware gates receive the connection's
-	// authenticated peer context.
-	GatePolicy: MutualAuthOnly |frame, session| {
+	// Session-aware arm: streaming and duplex opens key on peer identity.
+	GatePolicy: MutualAuthOnly |_frame, session| {
 		if session.peer_certificate().is_some() {
 			TransitStatus::Ok
 		} else {

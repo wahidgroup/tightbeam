@@ -58,6 +58,10 @@ pub enum ClusterError {
 	#[error("Servlet not owned by hive")]
 	ServletNotOwned,
 
+	/// Servlet address update named a remove locator that is not registered
+	#[error("Servlet address not found")]
+	ServletNotFound,
+
 	/// Re-registration presented a signer that does not match the bound hive signer
 	#[error("Signer does not match hive binding")]
 	SignerMismatch,

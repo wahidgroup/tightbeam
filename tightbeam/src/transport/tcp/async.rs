@@ -1588,7 +1588,7 @@ mod tests {
 		}
 
 		impl GatePolicy for BusyFirstGate {
-			fn evaluate(&self, _msg: &Frame, _session: &SessionContext) -> TransitStatus {
+			fn evaluate(&self, _msg: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
 				if self.first.swap(false, Ordering::SeqCst) {
 					TransitStatus::ResourceExhausted
 				} else {

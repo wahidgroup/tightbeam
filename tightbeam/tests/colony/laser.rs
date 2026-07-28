@@ -13,10 +13,12 @@
 	feature = "signature"
 ))]
 
+use core::time::Duration;
 use std::sync::Arc;
 
 use tightbeam::der::Sequence;
 use tightbeam::{
+	at_least,
 	builder::TypeBuilder,
 	cluster,
 	colony::{
@@ -45,6 +47,7 @@ use tightbeam::{
 };
 
 use crate::common::laser::{LaserAddr, LaserListener};
+use crate::common::security::expectation_failure;
 use crate::common::x509::GatewayCerts;
 
 pub(crate) const LASER_WORK_SENT: Urn<'static> = Urn::new("test", "event:laser/work-sent");
@@ -52,6 +55,12 @@ pub(crate) const LASER_WORK_STATUS: Urn<'static> = Urn::new("test", "event:laser
 pub(crate) const LASER_WORK_ECHOED: Urn<'static> = Urn::new("test", "event:laser/work-echoed");
 pub(crate) const LASER_SERVER_STREAM_REPORTS_LENGTH: Urn<'static> =
 	Urn::new("test", "event:laser/server-stream-reports-length");
+pub(crate) const LASER_ROUTE_BEFORE_RESTART: Urn<'static> = Urn::new("test", "event:laser/route-before-restart");
+pub(crate) const LASER_ROUTE_AFTER_RESTART: Urn<'static> = Urn::new("test", "event:laser/route-after-restart");
+
+/// Stable airspace slot the restart scenario rebinds; far above the
+/// slots `LaserAddr::ANY` assigns sequentially.
+const RESTART_GATEWAY_ADDR: &str = "laser://9901";
 
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct BeamRequest {
@@ -136,16 +145,59 @@ fn laser_servlet_conf(certs: &GatewayCerts) -> Result<ServletConf<LaserListener,
 		.build())
 }
 
-async fn start_laser_hive(trace: TraceCollector, certs: Arc<GatewayCerts>) -> Result<LaserHive, TightBeamError> {
+async fn start_laser_hive(
+	trace: TraceCollector,
+	certs: Arc<GatewayCerts>,
+	conf: HiveConf,
+) -> Result<LaserHive, TightBeamError> {
 	let config = Some(laser_servlet_conf(&certs)?);
 	let trace = Arc::new(trace.share());
 	let servlet = LaserServlet::start(Arc::clone(&trace), config).await?;
 
-	let conf = laser_hive_conf(&certs);
 	let mut hive = LaserHive::new(Some(conf))?;
 	hive.register(beam_urn(), servlet, |t| LaserServlet::start(t, None))?;
 	hive.establish(trace).await?;
 	Ok(hive)
+}
+
+/// Emit one beam work request through a gateway and decode the response.
+async fn emit_beam_work(certs: &GatewayCerts, addr: LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
+	let work_request = ClusterRequest::Work(ClusterWorkRequest {
+		servlet_type: beam_urn(),
+		payload: encode(&BeamRequest { value: 21 })?,
+	});
+
+	let frame = frame_compose(Version::V0)
+		.with_id(b"laser-work")
+		.with_order(0)
+		.with_message(work_request)
+		.build()?;
+
+	let mut client = ClientBuilder::<LaserListener>::builder()
+		.with_trust_store(Arc::clone(&certs.trust))
+		.build()
+		.connect(addr)
+		.await?;
+
+	let response_frame: Frame = client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
+	decode(&response_frame.message)
+}
+
+/// Poll a gateway until it routes work: a freshly restarted gateway has
+/// an empty registry until the hive's anti-entropy beat re-registers.
+/// Branching lives here, not in scenarios.
+async fn wait_for_routed(certs: &GatewayCerts, addr: LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
+	for _ in 0..50 {
+		if let Ok(response) = emit_beam_work(certs, addr).await {
+			if response.status == TransitStatus::Ok {
+				return Ok(response);
+			}
+		}
+
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+
+	Err(expectation_failure("gateway never routed work after restart"))
 }
 
 /// Streaming-only service for the lone `server!` proof: answers with the
@@ -214,8 +266,8 @@ tb_scenario! {
 			let (mut sink, response) = lease.open_stream()?;
 			sink.push(b"lase").await?;
 			sink.close_with(b"beam").await?;
-			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
 
+			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
 			let decoded: BeamResponse = decode(&reply.message)?;
 			let value = decoded.doubled == 8;
 			trace.event_with(LASER_SERVER_STREAM_REPORTS_LENGTH, &[], value)?;
@@ -252,43 +304,78 @@ tb_scenario! {
 			let config = laser_cluster_conf(&certs);
 			LaserCluster::start(trace, config).await
 		},
-		hives: |SetupEnv { trace, context: certs }| vec![start_laser_hive(trace, certs)],
+		hives: |SetupEnv { trace, context: certs }| {
+			let conf = laser_hive_conf(&certs);
+			vec![start_laser_hive(trace, certs, conf)]
+		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			trace.event(LASER_WORK_SENT)?;
 
-			let work_request = ClusterRequest::Work(ClusterWorkRequest {
-				servlet_type: beam_urn(),
-				payload: encode(&BeamRequest { value: 21 })?,
-			});
-
-			let frame = frame_compose(Version::V0)
-				.with_id(b"laser-work")
-				.with_order(0)
-				.with_message(work_request)
-				.build()?;
-
-			let mut client = ClientBuilder::<LaserListener>::builder()
-				.with_trust_store(Arc::clone(&certs.trust))
-				.build()
-				.connect(cluster.addr())
-				.await?;
-
-			let response_frame: Frame = client
-				.emit(frame, None)
-				.await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
-			let value = work_response.status;
-			trace.event_with(LASER_WORK_STATUS, &[], value)?;
+			let work_response = emit_beam_work(&certs, cluster.addr()).await?;
+			trace.event_with(LASER_WORK_STATUS, &[], work_response.status)?;
 
 			if let Some(payload) = work_response.payload {
 				let beam_response: BeamResponse = decode(&payload)?;
-				let value = beam_response.doubled;
-				trace.event_with(LASER_WORK_ECHOED, &[], value)?;
+				trace.event_with(LASER_WORK_ECHOED, &[], beam_response.doubled)?;
 			}
 
 			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub LaserGatewayRestartSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(LASER_ROUTE_BEFORE_RESTART, exactly!(1), equals!(TransitStatus::Ok)),
+			(LASER_ROUTE_AFTER_RESTART, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::HIVE_REREGISTERED, at_least!(1)),
+			(events::CLUSTER_HIVE_REGISTERED, at_least!(2), equals!(1u64)),
+			(events::CLUSTER_WORK_ROUTED, at_least!(2))
+		]
+	}
+}
+
+// The gateway registry is soft state: a replacement gateway starts empty
+// on the same stable address, the hive's anti-entropy beat re-registers
+// within one interval, and work routes again -- no operator, no consensus,
+// no persistence.
+tb_scenario! {
+	name: cluster_recovers_hive_after_gateway_restart,
+	spec: LaserGatewayRestartSpec,
+	environment Cluster {
+		context: laser_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let trace = Arc::new(trace.share());
+			let mut config = laser_cluster_conf(&certs);
+			config.bind_addr = Some(RESTART_GATEWAY_ADDR.into());
+			LaserCluster::start(trace, config).await
+		},
+		hives: |SetupEnv { trace, context: certs }| {
+			let mut conf = laser_hive_conf(&certs);
+			conf.reregister_interval = Some(Duration::from_millis(100));
+			vec![start_laser_hive(trace, certs, conf)]
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let before = emit_beam_work(&certs, cluster.addr()).await?;
+			trace.event_with(LASER_ROUTE_BEFORE_RESTART, &[], before.status)?;
+
+			cluster.stop();
+
+			let replacement = {
+				let mut config = laser_cluster_conf(&certs);
+				config.bind_addr = Some(RESTART_GATEWAY_ADDR.into());
+				LaserCluster::start(Arc::new(trace.share()), config).await?
+			};
+
+			let after = wait_for_routed(&certs, replacement.addr()).await?;
+			trace.event_with(LASER_ROUTE_AFTER_RESTART, &[], after.status)?;
+
+			replacement.stop();
 			Ok(())
 		}
 	}

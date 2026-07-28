@@ -101,6 +101,7 @@ pub struct ClusterConfBuilder {
 	policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pool_config: PoolConfig,
 	control_freshness_window_ms: u64,
+	bind_addr: Option<String>,
 	tls: ClusterTlsConfig,
 }
 
@@ -116,6 +117,7 @@ impl ClusterConf {
 			policies: Vec::new(),
 			pool_config: PoolConfig::default(),
 			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
+			bind_addr: None,
 			tls,
 		}
 	}
@@ -165,6 +167,13 @@ impl ClusterConfBuilder {
 		self
 	}
 
+	/// Bind the gateway to a stable address instead of the protocol
+	/// default, so hives can re-register through gateway restarts
+	pub fn with_bind_addr(mut self, addr: impl Into<String>) -> Self {
+		self.bind_addr = Some(addr.into());
+		self
+	}
+
 	/// Build the ClusterConf
 	pub fn build(self) -> ClusterConf {
 		ClusterConf {
@@ -175,6 +184,7 @@ impl ClusterConfBuilder {
 			policies: self.policies,
 			pool_config: self.pool_config,
 			control_freshness_window_ms: self.control_freshness_window_ms,
+			bind_addr: self.bind_addr,
 			tls: self.tls,
 		}
 	}

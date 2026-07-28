@@ -114,6 +114,11 @@ pub const SESSION_RECEIPT_SETTLED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event
 pub const SESSION_RECEIPT_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:session/receipt-refused");
 pub const SESSION_CERT_REJECTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:session/cert-rejected");
 
+// Hive lifecycle: the anti-entropy beat re-announces the hive's servlet
+// slate to every registered gateway; the event value is the gateway's
+// response status (`Unavailable` when the gateway was unreachable).
+pub const HIVE_REREGISTERED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:hive/reregistered");
+
 // Cluster gateway lifecycle: every accept/refuse decision the gateway
 // makes fires exactly one event, so audits and scenario specs observe
 // what the cluster did rather than re-deriving it from responses.

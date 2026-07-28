@@ -18,7 +18,7 @@ use crate::transport::envelopes::ResponsePackage;
 use crate::transport::error::TransportError;
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
-use crate::transport::messaging::gate_inbound_frame;
+use crate::transport::messaging::gate_inbound;
 use crate::transport::multiplex::{
 	MuxAcceptor, MuxDispatch, MuxHandle, MuxRekeyContext, MuxResponder, MuxRole, MuxTransport, ReplySink, SpawnedMux,
 	StreamBody,
@@ -80,7 +80,8 @@ pub trait MuxService: Send + Sync + 'static {
 	}
 
 	/// Consume a streamed request body and answer with an optional
-	/// unary reply frame.
+	/// unary reply frame. The collector gate has already run at
+	/// dispatch with no request frame (`None`); see [`GatePolicy`].
 	///
 	/// # Errors
 	/// The failure closes the stream with its mapped status (see
@@ -95,7 +96,8 @@ pub trait MuxService: Send + Sync + 'static {
 	}
 
 	/// Consume request chunks while pushing reply chunks (full duplex
-	/// on one stream). Frame gates cannot apply.
+	/// on one stream). The collector gate has already run at dispatch
+	/// with no request frame (`None`); see [`GatePolicy`].
 	///
 	/// # Errors
 	/// The failure closes the stream with a mapped status (see [`serve_mux`]).
@@ -173,7 +175,7 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 		// Gates are synchronous: evaluate and audit at dispatch, so
 		// only the service and its inputs enter the task.
 		let session = self.session();
-		let status = gate_inbound_frame(self.gate.as_ref(), &self.handle, &frame, &session);
+		let status = gate_inbound(self.gate.as_ref(), &self.handle, Some(frame.as_ref()), &session);
 		let service = Arc::clone(&self.service);
 		async move {
 			if status != TransitStatus::Ok {
@@ -187,14 +189,26 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 
 	fn streaming(&self, body: StreamBody) -> impl Future<Output = ResponsePackage> + MaybeSend {
 		let session = self.session();
+		let status = gate_inbound(self.gate.as_ref(), &self.handle, None, &session);
 		let service = Arc::clone(&self.service);
-		async move { respond(service.streaming(body, session).await) }
+		async move {
+			if status != TransitStatus::Ok {
+				return ResponsePackage::new(status, None);
+			}
+
+			respond(service.streaming(body, session).await)
+		}
 	}
 
 	fn duplex(&self, body: StreamBody, reply: ReplySink) -> impl Future<Output = TransitStatus> + MaybeSend {
 		let session = self.session();
+		let status = gate_inbound(self.gate.as_ref(), &self.handle, None, &session);
 		let service = Arc::clone(&self.service);
 		async move {
+			if status != TransitStatus::Ok {
+				return status;
+			}
+
 			match service.duplex(body, reply, session).await {
 				Ok(()) => TransitStatus::Ok,
 				Err(error) => failure_status(&error),
@@ -208,8 +222,9 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 /// Consumes the transport into gated halves, spawns both drivers, and runs
 /// the responder with `service` routed by each stream's kind: unary frames
 /// pass the transport's collector gate before reaching [`MuxService::unary`],
-/// streaming and duplex bodies reach their methods as they arrive. Service
-/// failures close their stream with the failure's mapped status.
+/// and streaming / duplex streams evaluate the same gate with no request
+/// frame (`None`) before their methods run. Service failures close their
+/// stream with the failure's mapped status.
 ///
 /// - `cancel_budget` overrides CVE-2023-44487 cancel-abuse default when set.
 ///

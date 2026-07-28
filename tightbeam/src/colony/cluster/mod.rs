@@ -199,6 +199,10 @@ pub struct ClusterConf {
 	/// (registration, address updates); stale or replayed frames inside
 	/// the window are rejected (CWE-294)
 	pub control_freshness_window_ms: u64,
+	/// Gateway bind address, parsed via the protocol address's `FromStr`.
+	/// `None` binds the protocol default. A stable address lets hives
+	/// re-register through gateway restarts without reconfiguration.
+	pub bind_addr: Option<String>,
 	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
@@ -222,6 +226,7 @@ impl core::fmt::Debug for ClusterConf {
 			.field("policies", &format!("[{} policies]", self.policies.len()))
 			.field("pool_config", &self.pool_config)
 			.field("control_freshness_window_ms", &self.control_freshness_window_ms)
+			.field("bind_addr", &self.bind_addr)
 			.field("tls", &self.tls)
 			.finish()
 	}

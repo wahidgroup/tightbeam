@@ -71,7 +71,7 @@ use crate::trace::TraceCollector;
 /// Source of the connection audit trail for access-gate verdicts.
 ///
 /// Every plane that evaluates a collector gate implements this (the TCP
-/// transports, the mux handle) so [`gate_inbound_frame`] can record the
+/// transports, the mux handle) so [`gate_inbound`] can record the
 /// verdict wherever the gate runs.
 #[cfg(feature = "transport-policy")]
 pub trait GateAudit {
@@ -80,7 +80,7 @@ pub trait GateAudit {
 	fn audit_trace(&self) -> Option<&TraceCollector>;
 }
 
-/// Gate one inbound frame with the session's authenticated context and
+/// Gate one inbound request with the session's authenticated context and
 /// record the verdict into the connection audit trail (`GATE_ACCEPT` /
 /// `GATE_REJECT`).
 ///
@@ -88,11 +88,14 @@ pub trait GateAudit {
 /// cleartext and encrypted single-flight collectors all route through
 /// here, so access decisions are observable evidence on every plane.
 ///
+/// `frame` is [`None`] for mux streaming / duplex opens that have no
+/// request frame at dispatch; session-scoped gates still evaluate.
+///
 /// A gate returning [`TransitStatus::Unknown`] is a local bug, not a
 /// verdict: it is normalized to [`TransitStatus::Internal`] so the peer
 /// sees a server fault and the audit trail records a reject.
 #[cfg(feature = "transport-policy")]
-pub(crate) fn gate_inbound_frame<G, A>(gate: &G, audit: &A, frame: &Frame, session: &SessionContext) -> TransitStatus
+pub(crate) fn gate_inbound<G, A>(gate: &G, audit: &A, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus
 where
 	G: GatePolicy + ?Sized,
 	A: GateAudit + ?Sized,
@@ -214,7 +217,7 @@ pub trait MessageEmitter: MessageIO {
 			// client-side and connection-context-free: the empty context.
 			let status = self
 				.to_emitter_gate_policy_ref()
-				.evaluate(letter.try_peek()?, &SessionContext::default());
+				.evaluate(Some(letter.try_peek()?), &SessionContext::default());
 			if status != TransitStatus::Ok {
 				return Err(TransportError::from(status));
 			}
@@ -622,7 +625,7 @@ where
 
 /// Extract the application request from a collected envelope and gate it
 /// with the session's peer context, recording the verdict through
-/// [`gate_inbound_frame`].
+/// [`gate_inbound`].
 #[cfg(feature = "transport-policy")]
 fn gate_collected_envelope<T>(
 	transport: &T,
@@ -633,7 +636,7 @@ where
 	T: MessageCollector + ?Sized,
 {
 	let request = single_flight_frame(envelope)?;
-	let status = gate_inbound_frame(transport.collector_gate(), transport, &request, session);
+	let status = gate_inbound(transport.collector_gate(), transport, Some(request.as_ref()), session);
 
 	Ok((request, status))
 }
@@ -655,7 +658,7 @@ mod tests {
 	struct DenyGate;
 
 	impl GatePolicy for DenyGate {
-		fn evaluate(&self, _: &Frame, _: &SessionContext) -> TransitStatus {
+		fn evaluate(&self, _: Option<&Frame>, _: &SessionContext) -> TransitStatus {
 			TransitStatus::PermissionDenied
 		}
 	}
@@ -673,7 +676,7 @@ mod tests {
 		let audit = AuditProbe(TraceCollector::new());
 		let frame = create_v0_tightbeam(Some("gated"), None);
 
-		let status = gate_inbound_frame(&DenyGate, &audit, &frame, &SessionContext::default());
+		let status = gate_inbound(&DenyGate, &audit, Some(&frame), &SessionContext::default());
 		assert_eq!(status, TransitStatus::PermissionDenied);
 
 		let recorded = audit.0.drain_events();

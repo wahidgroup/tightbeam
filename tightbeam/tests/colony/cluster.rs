@@ -54,7 +54,7 @@ use tightbeam::{
 	instrumentation::events,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	servlet, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ClusterEnv, ScenarioConf, SetupEnv},
+	testing::{ClusterEnv, HiveEnv, ScenarioConf, SetupEnv},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
@@ -80,6 +80,7 @@ pub(crate) const BALANCER_OFFERED: Urn<'static> = Urn::new("test", "event:cluste
 pub(crate) const TOPOLOGY_REGISTER_STATUS: Urn<'static> = Urn::new("test", "event:cluster/topology-register-status");
 pub(crate) const TOPOLOGY_ADD_STATUS: Urn<'static> = Urn::new("test", "event:cluster/topology-add-status");
 pub(crate) const TOPOLOGY_ROUTE_STATUS: Urn<'static> = Urn::new("test", "event:cluster/topology-route-status");
+pub(crate) const MULTI_REGISTER_STATUS: Urn<'static> = Urn::new("test", "event:cluster/multi-register-status");
 
 // ============================================================================
 // Shared Test Certificates
@@ -405,6 +406,51 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
+	pub ClusterMultiGatewaySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(MULTI_REGISTER_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
+			(WORK_SENT, exactly!(2)),
+			(WORK_ECHOED, exactly!(2), equals!(42u64)),
+			(events::CLUSTER_HIVE_REGISTERED, at_least!(2), equals!(1u64)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(2))
+		]
+	}
+}
+
+// One hive, two independent gateways: registration fans out, each gateway
+// converges on its own registry (both count exactly this one hive), and
+// each routes work to the same servlet slate. Gateway redundancy needs no
+// consensus -- every registry is soft state the hive keeps fresh.
+tb_scenario! {
+	name: cluster_hive_serves_two_gateways,
+	spec: ClusterMultiGatewaySpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, Some(TransportOffer::mux(8))),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let first = start_cluster(&trace, routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await?;
+			let second = start_cluster(&trace, routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await?;
+
+			let registered = hive.register_with_cluster(first.addr()).await?;
+			trace.event_with(MULTI_REGISTER_STATUS, &[], registered.status)?;
+			let registered = hive.register_with_cluster(second.addr()).await?;
+			trace.event_with(MULTI_REGISTER_STATUS, &[], registered.status)?;
+
+			record_ping_echo(&trace, &certs, &first).await?;
+			record_ping_echo(&trace, &certs, &second).await?;
+
+			first.stop();
+			second.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
 	pub ClusterInstanceWorkSpec,
 	V(1,0,0): {
 		mode: Accept,
@@ -525,7 +571,7 @@ tb_scenario! {
 struct RejectAllPolicy;
 
 impl GatePolicy for RejectAllPolicy {
-	fn evaluate(&self, _message: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, _message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
 		TransitStatus::PermissionDenied
 	}
 }

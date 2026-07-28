@@ -541,6 +541,11 @@ pub struct HiveConf {
 	/// servlet multiplex only when the servlet also advertises via
 	/// [`ServletConfBuilder::with_mux_offer`](crate::colony::servlet::ServletConfBuilder::with_mux_offer)
 	pub mux_offer: Option<TransportOffer>,
+	/// Anti-entropy re-registration beat (default: 5s; `None` disables).
+	///
+	/// Every interval the hive re-announces its full servlet slate,
+	/// freshly signed, to every gateway it has registered with..
+	pub reregister_interval: Option<Duration>,
 }
 
 impl core::fmt::Debug for HiveConf {
@@ -565,6 +570,7 @@ impl core::fmt::Debug for HiveConf {
 		d.field("trust_store", &self.trust_store.as_ref().map(|_| "<CertificateTrust>"));
 		#[cfg(feature = "x509")]
 		d.field("hive_tls", &self.hive_tls);
+		d.field("reregister_interval", &self.reregister_interval);
 		d.finish()
 	}
 }
@@ -596,6 +602,7 @@ impl Default for HiveConf {
 			#[cfg(feature = "x509")]
 			hive_tls: None,
 			mux_offer: None,
+			reregister_interval: Some(Duration::from_secs(5)),
 		}
 	}
 }

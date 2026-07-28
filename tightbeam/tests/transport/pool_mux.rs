@@ -81,11 +81,19 @@ pub(crate) const GATE_LIST_FIRST_REFUSAL_WINS: Urn<'static> =
 	Urn::new("test", "event:pool-mux/gate-list-first-refusal-wins");
 pub(crate) const GATE_STATUS_SURFACES_TO_CLIENT: Urn<'static> =
 	Urn::new("test", "event:pool-mux/gate-status-surfaces-to-client");
+pub(crate) const GATE_STREAM_STATUS_SURFACES_TO_CLIENT: Urn<'static> =
+	Urn::new("test", "event:pool-mux/gate-stream-status-surfaces-to-client");
+pub(crate) const GATE_DUPLEX_STATUS_SURFACES_TO_CLIENT: Urn<'static> =
+	Urn::new("test", "event:pool-mux/gate-duplex-status-surfaces-to-client");
 pub(crate) const GATE_UNKNOWN_ANSWERS_INTERNAL: Urn<'static> =
 	Urn::new("test", "event:pool-mux/gate-unknown-answers-internal");
 pub(crate) const HANDLER_FAILURE_SURFACES_INTERNAL: Urn<'static> =
 	Urn::new("test", "event:pool-mux/handler-failure-surfaces-internal");
 pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = Urn::new("test", "event:pool-mux/handler-never-invoked");
+pub(crate) const STREAM_HANDLER_NEVER_INVOKED: Urn<'static> =
+	Urn::new("test", "event:pool-mux/stream-handler-never-invoked");
+pub(crate) const DUPLEX_HANDLER_NEVER_INVOKED: Urn<'static> =
+	Urn::new("test", "event:pool-mux/duplex-handler-never-invoked");
 pub(crate) const HANDLER_RECOVERS_AFTER_FAILURE: Urn<'static> =
 	Urn::new("test", "event:pool-mux/handler-recovers-after-failure");
 pub(crate) const HELD_EMIT_COMPLETES_AFTER_RELEASE: Urn<'static> =
@@ -150,6 +158,32 @@ where
 	let acceptor = server! {
 		protocol TokioListener: listener,
 		policies: { with_mux_offer: [ Some(mux_offer(8)) ] },
+		service: service
+	};
+
+	Ok((acceptor, addr))
+}
+
+async fn start_gated_service_server<S, G>(
+	materials: &ServerMaterials,
+	trace: TraceCollector,
+	service: S,
+	gate: G,
+) -> Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError>
+where
+	S: MuxService,
+	G: GatePolicy + Clone + 'static,
+{
+	let (listener, addr) = bind_pool_listener(materials).await?;
+	// Accept-loop re-applies policies per connection: share/clone must
+	// stay as expressions so each accept gets a fresh value.
+	let acceptor = server! {
+		protocol TokioListener: listener,
+		policies: {
+			with_trace: [ trace.share() ],
+			with_mux_offer: [ Some(mux_offer(8)) ],
+			with_collector_gate: [ gate.clone() ]
+		},
 		service: service
 	};
 
@@ -1037,11 +1071,44 @@ impl GateContext {
 	}
 }
 
+/// Streaming service that records whether the handler body ran.
+struct ProbeLengthService {
+	gate: Arc<GateContext>,
+}
+
+impl MuxService for ProbeLengthService {
+	async fn streaming(&self, body: StreamBody, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+		self.gate.handler_invoked.store(true, Ordering::SeqCst);
+		let bytes = body.into_bytes().await?;
+		Ok(Some(mux_frame(&bytes.len().to_string())))
+	}
+}
+
+/// Duplex service that records whether the handler body ran.
+struct ProbeDuplexService {
+	gate: Arc<GateContext>,
+}
+
+impl MuxService for ProbeDuplexService {
+	async fn duplex(
+		&self,
+		mut body: StreamBody,
+		mut reply: ReplySink,
+		_session: SessionContext,
+	) -> Result<(), TightBeamError> {
+		self.gate.handler_invoked.store(true, Ordering::SeqCst);
+		while let Some(chunk) = body.chunk().await? {
+			reply.push(&chunk).await?;
+		}
+		Ok(())
+	}
+}
+
 #[derive(Clone)]
 struct ForbidAllGate;
 
 impl GatePolicy for ForbidAllGate {
-	fn evaluate(&self, _message: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, _message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
 		TransitStatus::PermissionDenied
 	}
 }
@@ -1051,7 +1118,7 @@ impl GatePolicy for ForbidAllGate {
 struct UnknownGate;
 
 impl GatePolicy for UnknownGate {
-	fn evaluate(&self, _message: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, _message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
 		TransitStatus::Unknown
 	}
 }
@@ -1107,6 +1174,104 @@ tb_scenario! {
 			)?;
 
 			trace.event_with(HANDLER_NEVER_INVOKED, &[], !ctx.handler_invoked.load(Ordering::SeqCst))?;
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub MuxStreamGateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::POOL_DIAL, exactly!(1)),
+			(events::GATE_REJECT, exactly!(1)),
+			(GATE_STREAM_STATUS_SURFACES_TO_CLIENT, exactly!(1), equals!(true)),
+			(STREAM_HANDLER_NEVER_INVOKED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// Collector gates must refuse streaming before the service body runs,
+// matching unary dispatch.
+tb_scenario! {
+	name: mux_serve_gate_rejects_streaming_without_handler,
+	spec: MuxStreamGateSpec,
+	environment ServiceClient {
+		context: GateContext::generate(),
+		server: |SetupEnv { context: ctx, trace }| async move {
+			let service = ProbeLengthService { gate: Arc::clone(&ctx) };
+			start_gated_service_server(&ctx.materials, trace.share(), service, ForbidAllGate).await
+		},
+		client: |ClientEnv { trace, context: ctx, addr }| async move {
+			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), 1, &trace)?;
+			let lease = pool.connect(addr).await?;
+
+			let (sink, response) = lease.open_stream()?;
+			sink.close_with(b"gated-stream").await?;
+
+			let outcome = response.await;
+			trace.event_with(
+				GATE_STREAM_STATUS_SURFACES_TO_CLIENT,
+				&[],
+				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))),
+			)?;
+
+			trace.event_with(
+				STREAM_HANDLER_NEVER_INVOKED,
+				&[],
+				!ctx.handler_invoked.load(Ordering::SeqCst),
+			)?;
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub MuxDuplexGateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::POOL_DIAL, exactly!(1)),
+			(events::GATE_REJECT, exactly!(1)),
+			(GATE_DUPLEX_STATUS_SURFACES_TO_CLIENT, exactly!(1), equals!(true)),
+			(DUPLEX_HANDLER_NEVER_INVOKED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// Collector gates must refuse duplex before the service body runs,
+// matching unary dispatch.
+tb_scenario! {
+	name: mux_serve_gate_rejects_duplex_without_handler,
+	spec: MuxDuplexGateSpec,
+	environment ServiceClient {
+		context: GateContext::generate(),
+		server: |SetupEnv { context: ctx, trace }| async move {
+			let service = ProbeDuplexService { gate: Arc::clone(&ctx) };
+			start_gated_service_server(&ctx.materials, trace.share(), service, ForbidAllGate).await
+		},
+		client: |ClientEnv { trace, context: ctx, addr }| async move {
+			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), 1, &trace)?;
+			let lease = pool.connect(addr).await?;
+
+			let (sink, mut body) = lease.open_duplex()?;
+			sink.close().await?;
+
+			let outcome = body.chunk().await;
+			trace.event_with(
+				GATE_DUPLEX_STATUS_SURFACES_TO_CLIENT,
+				&[],
+				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))),
+			)?;
+
+			trace.event_with(
+				DUPLEX_HANDLER_NEVER_INVOKED,
+				&[],
+				!ctx.handler_invoked.load(Ordering::SeqCst),
+			)?;
 			Ok(())
 		}
 	}

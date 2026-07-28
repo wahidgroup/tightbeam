@@ -12,7 +12,7 @@ use tightbeam::{
 			current_timestamp_ms, servlet_instance, ClusterCommand, ClusterCommandResponse, ClusterStatus,
 			ColonyNamespace, HeartbeatParams, HiveManagementRequest, SpawnServletParams, StopServletParams,
 		},
-		hive::{Hive, HiveConf, HiveTlsConfig},
+		hive::{Hive, HiveConf, HiveTlsConfig, ServletBox},
 	},
 	compose,
 	crypto::{
@@ -60,7 +60,9 @@ pub(crate) const OPEN_BREAKER_HEARTBEAT_SHAPE: Urn<'static> =
 pub(crate) const RETRY_SPAWN_ACCEPTED: Urn<'static> = Urn::new("test", "event:hive/retry-spawn-accepted");
 pub(crate) const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:hive/servlet-receive");
 pub(crate) const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:hive/servlet-respond");
+pub(crate) const SERVLET_STOPPED: Urn<'static> = Urn::new("test", "event:hive/servlet-stopped");
 pub(crate) const SIGNED_HEARTBEAT_ACCEPTED: Urn<'static> = Urn::new("test", "event:hive/signed-heartbeat-accepted");
+pub(crate) const SPAWN_NON_UTF8_FORBIDDEN: Urn<'static> = Urn::new("test", "event:hive/spawn-non-utf8-forbidden");
 pub(crate) const UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
 	Urn::new("test", "event:hive/unsigned-heartbeat-heartbeat-shape");
 pub(crate) const UNSIGNED_MANAGE_MANAGE_SHAPE: Urn<'static> =
@@ -560,6 +562,79 @@ tb_scenario! {
 
 			let second = emit_command(&mut client, replay).await?;
 			trace.event_with(RETRY_SPAWN_ACCEPTED, &[], manage_spawn_shape_status(&second)?)?;
+
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Probe servlet with a caller-chosen locator. Seed uses UTF-8 so
+/// `register` succeeds; spawn uses non-UTF-8 so instance URN minting
+/// fails. Only the spawn probe emits [`SERVLET_STOPPED`] on teardown.
+struct LocatorStopProbe {
+	trace: TraceCollector,
+	addr: Vec<u8>,
+	report_stop: bool,
+}
+
+impl ServletBox for LocatorStopProbe {
+	fn addr_bytes(&self) -> Vec<u8> {
+		self.addr.clone()
+	}
+
+	fn stop_boxed(self: Box<Self>) {
+		if self.report_stop {
+			let _ = self.trace.event(SERVLET_STOPPED);
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub HiveSpawnNonUtf8Spec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(SPAWN_NON_UTF8_FORBIDDEN, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(SERVLET_STOPPED, exactly!(1))
+		]
+	}
+}
+
+// A manage spawn whose locator is not UTF-8 must refuse registration and
+// still tear the orphaned servlet down through `stop_boxed`.
+tb_scenario! {
+	name: hive_manage_spawn_non_utf8_stops_orphan,
+	spec: HiveSpawnNonUtf8Spec,
+	environment Hive {
+		context: trusted_signer("CN=Hive Spawn NonUtf8"),
+		start: |SetupEnv { trace, context: signer }| async move {
+			let seed = LocatorStopProbe {
+				trace: trace.share(),
+				addr: b"127.0.0.1:0".to_vec(),
+				report_stop: false,
+			};
+
+			let trust_store = pinning_trust_store(&signer.certificate)?;
+			let conf = HiveConf { trust_store: Some(trust_store), ..Default::default() };
+			let mut hive = HiveX509Test::new(Some(conf))?;
+			hive.register(servlet_urn("orphan"), seed, |t| async move {
+				Ok(LocatorStopProbe {
+					trace: t.share(),
+					addr: vec![0xff, 0xfe, 0xfd],
+					report_stop: true,
+				})
+			})?;
+
+			hive.establish(Arc::new(trace.share())).await?;
+			Ok(hive)
+		},
+		client: |HiveEnv { trace, context: signer, hive }| async move {
+			let mut client = connect_hive(&hive).await?;
+			let signed = signed_spawn_frame(&signer.provider, b"spawn-orphan", "orphan").await?;
+			let response = emit_command(&mut client, signed).await?;
+			trace.event_with(SPAWN_NON_UTF8_FORBIDDEN, &[], manage_spawn_shape_status(&response)?)?;
 
 			hive.stop();
 			Ok(())

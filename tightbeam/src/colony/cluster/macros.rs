@@ -95,7 +95,12 @@ macro_rules! cluster {
 
 				// The gateway always serves TLS when x509 is enabled;
 				// an empty client_validators list means server-auth only
-				let bind_addr = <$protocol>::default_bind_address()?;
+				let bind_addr = match config.bind_addr.as_deref() {
+					Some(raw) => raw
+						.parse()
+						.map_err(|_| $crate::transport::TransportError::InvalidMessage)?,
+					None => <$protocol>::default_bind_address()?,
+				};
 
 				#[cfg(feature = "x509")]
 				let (listener, addr) = {
@@ -337,7 +342,11 @@ macro_rules! cluster {
 		// list is indistinguishable from an open gateway. Each gate sees
 		// the connection's authenticated peer context.
 		for policy in $config.policies.iter() {
-			let status = $crate::policy::GatePolicy::evaluate(policy.as_ref(), &$frame, &$session);
+			let status = $crate::policy::GatePolicy::evaluate(
+				policy.as_ref(),
+				::core::option::Option::Some(&$frame),
+				&$session,
+			);
 			if status != $crate::policy::TransitStatus::Ok {
 				let _ = $trace.event($crate::instrumentation::events::CLUSTER_GATE_BLOCKED);
 				return $crate::cluster!(@reply $frame,
@@ -483,7 +492,11 @@ macro_rules! cluster {
 			// partial install leaves the hive believing it is routable
 			// while the cluster's tables are incomplete. A route failure
 			// rolls the hive entry back so no half-registered state lingers.
+			//
+			// The announced slate REPLACES any prior rows for this hive:
+			// re-registration is the reconciliation primitive.
 			let registered = $registry.register_with_signer(request, signer_id).and_then(|()| {
+				let _ = $servlet_registry.remove_by_hive(&hive_addr);
 				servlet_info
 					.iter()
 					.try_for_each(|(servlet_type, servlet_addr)| {

@@ -373,7 +373,16 @@ impl ServletRegistry {
 		for addr in removed {
 			match self.remove(addr) {
 				Ok(Some(entry)) => removed_entries.push(entry),
-				Ok(None) => {}
+				Ok(None) => {
+					for entry in removed_entries {
+						let _ = self.add(entry);
+					}
+					for applied in &applied_addrs {
+						let _ = self.remove(applied);
+					}
+
+					return Err(ClusterError::ServletNotFound);
+				}
 				Err(err) => {
 					for entry in removed_entries {
 						let _ = self.add(entry);
@@ -680,6 +689,7 @@ mod tests {
 		const VICTIM: &[&[u8]] = &[b"victim"];
 		const OLD: &[&[u8]] = &[b"old"];
 		const NEW: &[&[u8]] = &[b"new"];
+		const MISSING: &[&[u8]] = &[b"ghost"];
 
 		vec![
 			ApplyAddressUpdateCase {
@@ -697,6 +707,16 @@ mod tests {
 				remove: OLD,
 				expect_ok: true,
 				expected_addrs: NEW,
+			},
+			// A remove naming an absent locator must refuse: Ok(None) must
+			// not report success while the seeded route stays routed.
+			ApplyAddressUpdateCase {
+				seed: (b"victim", b"calc", b"hive-a"),
+				caller_hive: b"hive-a",
+				add: None,
+				remove: MISSING,
+				expect_ok: false,
+				expected_addrs: VICTIM,
 			},
 		]
 	}

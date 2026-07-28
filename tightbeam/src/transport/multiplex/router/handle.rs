@@ -142,7 +142,7 @@ pub struct MuxHandle {
 }
 
 // Audit source for gate verdicts on the mux plane: the responder
-// gates frames through `gate_inbound_frame`, which records the
+// gates requests through `gate_inbound`, which records the
 // verdict into this connection's collector.
 #[cfg(feature = "transport-policy")]
 impl GateAudit for MuxHandle {
