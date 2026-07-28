@@ -261,6 +261,19 @@ macro_rules! cluster {
 				self.registry.to_available_servlets().unwrap_or_default()
 			}
 
+			fn peer_servlets(&self) -> Vec<Vec<u8>> {
+				let mut types: Vec<Vec<u8>> = self
+					.servlet_registry
+					.peer_servlets()
+					.unwrap_or_default()
+					.into_iter()
+					.map(|entry| entry.servlet_type.to_vec())
+					.collect();
+				types.sort_unstable();
+				types.dedup();
+				types
+			}
+
 			fn hive_count(&self) -> usize {
 				self.registry.len().unwrap_or(0)
 			}

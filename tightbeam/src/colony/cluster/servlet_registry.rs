@@ -70,6 +70,19 @@ impl Default for PheromoneConf {
 // Servlet Entry
 // ============================================================================
 
+/// How the load balancer reaches an entry.
+///
+/// `Local` resolves to a servlet this gateway owns. `Peer` resolves to
+/// a peer gateway that owns the servlet, reached by forwarding. Both
+/// share the same pheromone trail machinery, so locality preference is
+/// emergent rather than configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteKind {
+	#[default]
+	Local,
+	Peer,
+}
+
 /// A servlet instance tracked with pheromone-based scoring
 ///
 /// Combines ACO pheromone trails with ABC trial-based abandonment
@@ -82,6 +95,8 @@ pub struct ServletEntry {
 	pub servlet_type: SharedId,
 	/// Parent hive that owns this servlet
 	pub hive_id: SharedId,
+	/// Whether the entry resolves locally or through a peer gateway
+	pub route_kind: RouteKind,
 
 	// ACO fields
 	/// Current pheromone level (0-10000 basis points)
@@ -109,6 +124,7 @@ impl ServletEntry {
 			address,
 			servlet_type,
 			hive_id,
+			route_kind: RouteKind::default(),
 			pheromone: AtomicU64::new(initial_pheromone),
 			last_reinforced: Instant::now(),
 			trial_count: AtomicU32::new(0),
@@ -174,6 +190,7 @@ impl Clone for ServletEntry {
 			address: Arc::clone(&self.address),
 			servlet_type: Arc::clone(&self.servlet_type),
 			hive_id: Arc::clone(&self.hive_id),
+			route_kind: self.route_kind,
 			pheromone: AtomicU64::new(self.pheromone.load(Ordering::Relaxed)),
 			last_reinforced: self.last_reinforced,
 			trial_count: AtomicU32::new(self.trial_count.load(Ordering::Relaxed)),
@@ -416,6 +433,18 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
+	/// Entries reached through a peer gateway (`RouteKind::Peer`)
+	pub fn peer_servlets(&self) -> Result<Vec<ServletEntry>, ClusterError> {
+		let entries = self.entries.read()?;
+		let result = entries
+			.values()
+			.filter(|entry| entry.route_kind == RouteKind::Peer)
+			.cloned()
+			.collect();
+
+		Ok(result)
+	}
+
 	/// Reinforce pheromone for a servlet on success
 	pub fn reinforce(&self, address: &[u8], quality: u64) -> Result<bool, ClusterError> {
 		let entries = self.entries.read()?;
@@ -605,6 +634,29 @@ mod tests {
 	// =========================================================================
 	// ServletRegistry Tests
 	// =========================================================================
+
+	#[test]
+	fn entry_route_kind_defaults_local() {
+		let entry = named_entry(b"addr1", b"calculator", b"hive1");
+		assert_eq!(entry.route_kind, RouteKind::Local);
+	}
+
+	#[test]
+	fn peer_servlets_filters_by_route_kind() {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"local", b"calc", b"hive1")).ok();
+
+		let empty = registry.peer_servlets().ok().unwrap_or_default();
+		assert!(empty.is_empty());
+
+		let mut peer = named_entry(b"peer-gw", b"calc", b"peer-colony");
+		peer.route_kind = RouteKind::Peer;
+		registry.add(peer).ok();
+
+		let peers = registry.peer_servlets().ok().unwrap_or_default();
+		assert_eq!(peers.len(), 1);
+		assert_eq!(peers[0].address.as_ref(), b"peer-gw");
+	}
 
 	#[test]
 	fn registry_add_and_lookup() {
