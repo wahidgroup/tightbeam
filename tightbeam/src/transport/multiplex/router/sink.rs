@@ -11,7 +11,7 @@ use super::flow::{chunk_records, payload_credits};
 use super::outbound::Outbound;
 use super::shared::{enqueue_stream_cancel, BudgetStanding, MuxShared};
 use super::writer::{drain_with_reason, renew_or_drain};
-use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, TransportEnvelope};
+use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::{TransportError, TransportResult};
 
 /// Send one credit-gated data chunk: reserve a writer-queue slot,
@@ -61,6 +61,7 @@ async fn debit_push(
 /// cancels the stream.
 pub struct RequestSink {
 	stream_id: u32,
+	kind: MuxStreamKind,
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
 	opened: bool,
@@ -68,8 +69,13 @@ pub struct RequestSink {
 }
 
 impl RequestSink {
-	pub(super) fn new(stream_id: u32, shared: Arc<MuxShared>, outbound: mpsc::Sender<Outbound>) -> Self {
-		Self { stream_id, shared, outbound, opened: false, closed: false }
+	pub(super) fn new(
+		stream_id: u32,
+		kind: MuxStreamKind,
+		shared: Arc<MuxShared>,
+		outbound: mpsc::Sender<Outbound>,
+	) -> Self {
+		Self { stream_id, kind, shared, outbound, opened: false, closed: false }
 	}
 
 	/// Stream one request chunk to the peer, splitting to the peer's
@@ -153,7 +159,7 @@ impl RequestSink {
 		let envelope = if self.opened {
 			TransportEnvelope::from(MuxDataPackage::new(self.stream_id, last, chunk)?)
 		} else {
-			TransportEnvelope::from(MuxOpenPackage::new(self.stream_id, last, chunk)?)
+			TransportEnvelope::from(MuxOpenPackage::new(self.stream_id, last, self.kind, chunk)?)
 		};
 
 		self.opened = true;
@@ -243,7 +249,7 @@ mod tests {
 
 		shared.register_send_stream(1, 0);
 
-		let sink = RequestSink::new(1, Arc::clone(&shared), outbound);
+		let sink = RequestSink::new(1, MuxStreamKind::Streaming, Arc::clone(&shared), outbound);
 		(shared, sink, sent)
 	}
 
@@ -304,9 +310,15 @@ mod tests {
 		let (outbound, mut sent) = mpsc::channel(8);
 		let (sender, mut receiver) = oneshot::channel();
 		let stream_id = shared.allocate(sender).expect("fresh connection has stream slots");
+
 		shared.register_send_stream(stream_id, 0);
 
-		drop(RequestSink::new(stream_id, Arc::clone(&shared), outbound));
+		drop(RequestSink::new(
+			stream_id,
+			MuxStreamKind::Streaming,
+			Arc::clone(&shared),
+			outbound,
+		));
 
 		let outcome = receiver.try_recv();
 		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));

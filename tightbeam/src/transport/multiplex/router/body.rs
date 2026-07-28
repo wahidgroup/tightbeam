@@ -4,12 +4,14 @@
 use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use std::sync::Arc;
 
 use futures::channel::mpsc;
 use futures::Stream;
 
 use super::handle::CancelOnDrop;
-use crate::der::{Decode, Encode};
+use super::shared::OpenSlot;
+use crate::der::Decode;
 use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
 
@@ -48,7 +50,9 @@ pub(super) struct DrainNote {
 /// a duplex reply body before its terminal event cancels the
 /// stream, releasing the cap slot on both endpoints.
 pub struct StreamBody {
-	stream_id: u32,
+	/// The stream's identity: assigned from birth on peer-initiated
+	/// bodies, assigned at first push on locally-opened duplex replies
+	slot: Arc<OpenSlot>,
 	events: mpsc::Receiver<BodyEvent>,
 	drained: mpsc::UnboundedSender<DrainNote>,
 	consumed: u64,
@@ -115,11 +119,12 @@ impl StreamBody {
 			Poll::Pending => Poll::Pending,
 			Poll::Ready(Some(BodyEvent::Chunk(chunk))) => {
 				self.consumed = self.consumed.saturating_add(1);
-				// A dropped reader means the connection is going
-				// down; the next poll surfaces the closure.
-				let _ = self
-					.drained
-					.unbounded_send(DrainNote { stream_id: self.stream_id, consumed: self.consumed });
+				// A chunk implies the stream opened, so the slot is
+				// assigned. A dropped reader means the connection is
+				// going down; the next poll surfaces the closure.
+				if let Some(stream_id) = self.slot.get() {
+					let _ = self.drained.unbounded_send(DrainNote { stream_id, consumed: self.consumed });
+				}
 				Poll::Ready(Ok(Some(chunk)))
 			}
 			Poll::Ready(Some(BodyEvent::End)) => {
@@ -171,29 +176,16 @@ impl Stream for StreamBody {
 /// the reader clamps streaming grants to `consumed + window`, so a
 /// conforming peer can never overrun the channel.
 pub(super) fn stream_body(
-	stream_id: u32,
+	slot: Arc<OpenSlot>,
 	window: u64,
 	drained: mpsc::UnboundedSender<DrainNote>,
 ) -> (StreamBody, ForwardedStream) {
 	let capacity = usize::try_from(window).unwrap_or(usize::MAX).saturating_add(1);
 	let (events, receiver) = mpsc::channel(capacity);
 
-	let body = StreamBody { stream_id, events: receiver, drained, consumed: 0, finished: false, guard: None };
+	let body = StreamBody { slot, events: receiver, drained, consumed: 0, finished: false, guard: None };
 	let forwarder = ForwardedStream { events, received: 0, limit: window, window };
 	(body, forwarder)
-}
-
-/// Adapt a frame that reassembled before streaming dispatch engaged
-/// into a one-chunk body (its drain reports go nowhere: the credit
-/// for a dispatched frame is already settled).
-pub(super) fn body_from_frame(stream_id: u32, frame: &Frame) -> TransportResult<StreamBody> {
-	let payload = frame.to_der()?;
-	let (drained, _) = mpsc::unbounded();
-	let (mut events, receiver) = mpsc::channel(2);
-	let _ = events.try_send(BodyEvent::Chunk(payload));
-	let _ = events.try_send(BodyEvent::End);
-
-	Ok(StreamBody { stream_id, events: receiver, drained, consumed: 0, finished: false, guard: None })
 }
 
 /// Reader-side ledger of a streaming request: chunks forward into
@@ -273,6 +265,7 @@ mod tests {
 
 	use super::super::testing::{body_fixture, noop_cx, poll_chunk, poll_now};
 	use super::*;
+	use crate::der::Encode;
 	use crate::testing::create_v0_tightbeam;
 
 	#[test]
@@ -318,23 +311,6 @@ mod tests {
 		let (_body, mut forwarder, _notes) = body_fixture(7, 1);
 		assert!(forwarder.accept_chunk());
 		assert!(!forwarder.accept_chunk());
-	}
-
-	// The dispatch-switch race fallback: a frame that reassembled
-	// before streaming dispatch engaged adapts into a body that
-	// yields the whole payload as one chunk, then a clean end.
-	#[test]
-	fn test_body_from_frame_yields_one_chunk_then_end() -> TransportResult<()> {
-		let frame = create_v0_tightbeam(Some("adapted"), None);
-		let payload = frame.to_der()?;
-
-		let mut body = body_from_frame(9, &frame)?;
-
-		let first = poll_chunk(&mut body);
-		assert!(matches!(first, Poll::Ready(Ok(Some(chunk))) if chunk == payload));
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
-
-		Ok(())
 	}
 
 	#[test]

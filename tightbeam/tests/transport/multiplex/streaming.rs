@@ -1,7 +1,7 @@
 //! Streaming consumer API: chunk-level dispatch over the unified
 //! stream wire.
 
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -36,22 +36,6 @@ async fn streaming_endpoints(
 	let (_, responder) = spawn_mux_endpoint(server.with_trace(trace.share()), MuxRole::Server)?;
 
 	Ok((client_end, responder))
-}
-
-pub(crate) const STREAMING_ECHO_MATCHES: Urn<'static> = Urn::new("test", "event:streaming/echo-matches");
-pub(crate) const STREAMING_HANDLER_SAW_MULTIPLE_CHUNKS: Urn<'static> =
-	Urn::new("test", "event:streaming/handler-saw-multiple-chunks");
-
-tb_assert_spec! {
-	pub MuxStreamingRoundtripSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Ok,
-		assertions: [
-			(STREAMING_ECHO_MATCHES, exactly!(1), equals!(true)),
-			(STREAMING_HANDLER_SAW_MULTIPLE_CHUNKS, exactly!(1), equals!(true))
-		]
-	}
 }
 
 pub(crate) const OPEN_STREAM_ECHO_MATCHES: Urn<'static> = Urn::new("test", "event:streaming/open-stream-echo-matches");
@@ -134,56 +118,74 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const DUPLEX_ECHO_MATCHES: Urn<'static> = Urn::new("test", "event:streaming/duplex-echo-matches");
-pub(crate) const DUPLEX_HANDLER_STREAMED_CHUNKS: Urn<'static> =
-	Urn::new("test", "event:streaming/duplex-handler-streamed-chunks");
+pub(crate) const UNARY_KIND_REFUSED_BY_STREAMING_SERVER: Urn<'static> =
+	Urn::new("test", "event:streaming/unary-kind-refused-by-streaming-server");
+pub(crate) const UNARY_KIND_REFUSED_BY_DUPLEX_SERVER: Urn<'static> =
+	Urn::new("test", "event:streaming/unary-kind-refused-by-duplex-server");
+
+/// Whether a unary-kind emit is refused with `Unimplemented`.
+async fn emit_refused_unimplemented(endpoint: &MuxEndpoint, label: &str) -> bool {
+	matches!(
+		endpoint.handle.emit_on_stream(&large_mux_frame(label)).await,
+		Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
+	)
+}
 
 tb_assert_spec! {
-	pub MuxDuplexEchoSpec,
+	pub MuxUnaryKindVsDuplexSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(DUPLEX_ECHO_MATCHES, exactly!(1), equals!(true)),
-			(DUPLEX_HANDLER_STREAMED_CHUNKS, exactly!(1), equals!(true))
+			(UNARY_KIND_REFUSED_BY_DUPLEX_SERVER, exactly!(1), equals!(true))
 		]
 	}
 }
 
+// Kind dispatch is strict: a unary-kind stream against a duplex-only
+// responder refuses with `Unimplemented` and never enters the handler.
 tb_scenario! {
-	name: mux_duplex_handler_streams_reply_chunks,
-	spec: MuxDuplexEchoSpec,
+	name: mux_unary_kind_refused_by_duplex_server,
+	spec: MuxUnaryKindVsDuplexSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let (client_end, responder) = streaming_endpoints(&trace, chunked_offer(4)).await?;
 			let chunks_streamed = Arc::new(AtomicUsize::new(0));
 			let _serve = tokio::spawn(responder.serve_duplex(duplex_echo_handler(Arc::clone(&chunks_streamed))));
 
-			let frame = large_mux_frame("mux-duplex-echo");
-			let echoed = client_end.handle.emit_on_stream(&frame).await?;
-
-			trace.event_with(DUPLEX_ECHO_MATCHES, &[], is_echo(echoed, &frame))?;
-			trace.event_with(DUPLEX_HANDLER_STREAMED_CHUNKS, &[], saw_multiple_chunks(&chunks_streamed))?;
+			let refused = emit_refused_unimplemented(&client_end, "mux-unary-vs-duplex").await;
+			let untouched = chunks_streamed.load(Ordering::Relaxed) == 0;
+			trace.event_with(UNARY_KIND_REFUSED_BY_DUPLEX_SERVER, &[], refused && untouched)?;
 
 			Ok(())
 		}
 	}
 }
 
+tb_assert_spec! {
+	pub MuxUnaryKindVsStreamingSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(UNARY_KIND_REFUSED_BY_STREAMING_SERVER, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// Same strictness against a streaming-only responder.
 tb_scenario! {
-	name: mux_streaming_handler_consumes_chunks_incrementally,
-	spec: MuxStreamingRoundtripSpec,
+	name: mux_unary_kind_refused_by_streaming_server,
+	spec: MuxUnaryKindVsStreamingSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let (client_end, responder) = streaming_endpoints(&trace, chunked_offer(4)).await?;
 			let chunks_seen = Arc::new(AtomicUsize::new(0));
 			let _serve = tokio::spawn(responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
 
-			let frame = large_mux_frame("mux-streaming-echo");
-			let echoed = client_end.handle.emit_on_stream(&frame).await?;
-
-			trace.event_with(STREAMING_ECHO_MATCHES, &[], is_echo(echoed, &frame))?;
-			trace.event_with(STREAMING_HANDLER_SAW_MULTIPLE_CHUNKS, &[], saw_multiple_chunks(&chunks_seen))?;
+			let refused = emit_refused_unimplemented(&client_end, "mux-unary-vs-streaming").await;
+			let untouched = chunks_seen.load(Ordering::Relaxed) == 0;
+			trace.event_with(UNARY_KIND_REFUSED_BY_STREAMING_SERVER, &[], refused && untouched)?;
 
 			Ok(())
 		}

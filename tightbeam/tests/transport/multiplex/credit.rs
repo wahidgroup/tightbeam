@@ -13,7 +13,9 @@ use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{ScenarioConf, SetupEnv};
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::envelopes::{GoAwayReason, MuxCreditPackage, MuxDataPackage, MuxEnvelope, MuxOpenPackage};
+use tightbeam::transport::envelopes::{
+	GoAwayReason, MuxCreditPackage, MuxDataPackage, MuxEnvelope, MuxOpenPackage, MuxStreamKind,
+};
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, NegotiationError};
 use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::transport::{
@@ -330,7 +332,7 @@ async fn oversize_chunk_rejected(trace: TraceCollector) -> Result<bool, TightBea
 	let config = MuxEndpointConfig::default();
 	let link = establish_server_mux_client_raw_with(client_offer, server_offer, config, trace).await?;
 
-	let oversize = MuxOpenPackage::new(1, true, vec![0u8; 2048])?;
+	let oversize = MuxOpenPackage::new(1, true, MuxStreamKind::Unary, vec![0u8; 2048])?;
 	let envelopes = vec![oversize.into()];
 
 	protocol_error_goaway_after(link, envelopes).await
@@ -344,7 +346,7 @@ async fn credit_overrun_rejected(trace: TraceCollector) -> Result<bool, TightBea
 	let link = establish_server_mux_client_raw_with(client_offer, server_offer, config, trace).await?;
 
 	let chunk = vec![0u8; 1024];
-	let open = MuxOpenPackage::new(1, false, chunk.to_owned())?;
+	let open = MuxOpenPackage::new(1, false, MuxStreamKind::Unary, chunk.to_owned())?;
 	let overrun = MuxDataPackage::new(1, false, chunk)?;
 	let envelopes = vec![open.into(), overrun.into()];
 
@@ -360,11 +362,11 @@ async fn reassembly_flood_rejected(trace: TraceCollector) -> Result<bool, TightB
 
 	let partial = vec![0u8; 16];
 	let envelopes = vec![
-		MuxOpenPackage::new(client_stream_id(0), false, partial.to_owned())?.into(),
-		MuxOpenPackage::new(client_stream_id(1), false, partial.to_owned())?.into(),
-		MuxOpenPackage::new(client_stream_id(2), false, partial.to_owned())?.into(),
-		MuxOpenPackage::new(client_stream_id(3), false, partial.to_owned())?.into(),
-		MuxOpenPackage::new(client_stream_id(4), false, partial)?.into(),
+		MuxOpenPackage::new(client_stream_id(0), false, MuxStreamKind::Unary, partial.to_owned())?.into(),
+		MuxOpenPackage::new(client_stream_id(1), false, MuxStreamKind::Unary, partial.to_owned())?.into(),
+		MuxOpenPackage::new(client_stream_id(2), false, MuxStreamKind::Unary, partial.to_owned())?.into(),
+		MuxOpenPackage::new(client_stream_id(3), false, MuxStreamKind::Unary, partial.to_owned())?.into(),
+		MuxOpenPackage::new(client_stream_id(4), false, MuxStreamKind::Unary, partial)?.into(),
 	];
 
 	protocol_error_goaway_after(link, envelopes).await

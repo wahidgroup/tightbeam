@@ -13,13 +13,13 @@ use futures::{pin_mut, SinkExt, StreamExt};
 use super::body::{stream_body, BodyEvent, DrainNote, ForwardedStream, StreamBody};
 use super::flow::{cap_as_usize, payload_credits, BufferedGrantor, CreditGrantor};
 use super::outbound::Outbound;
-use super::shared::{cancel_error, MuxShared, PeerStream, StreamOutcome};
+use super::shared::{cancel_error, MuxShared, OpenSlot, PeerStream, StreamOutcome};
 use super::writer::{goaway_best_effort, goaway_package};
 use crate::der::Decode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{
 	CancelReason, GoAwayReason, MuxCancelPackage, MuxCreditPackage, MuxDataPackage, MuxEndPackage, MuxEnvelope,
-	MuxOpenPackage, MuxPingPackage, ResponsePackage, TransportEnvelope,
+	MuxOpenPackage, MuxPingPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
 };
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::io::EnvelopeSource;
@@ -59,9 +59,11 @@ const MAX_PENDING_PING_ACKS: usize = 4;
 
 /// Peer-initiated event routed from the reader to the responder.
 pub(super) enum InboundEvent {
+	/// Unary-kind stream reassembled into its message frame
 	Request(u32, Arc<Frame>),
-	/// Streaming dispatch: the body forwards chunks as they arrive
-	StreamOpen(u32, StreamBody),
+	/// Streaming or duplex kind: the body forwards chunks as they
+	/// arrive; the kind fixes the reply shape
+	StreamOpen(u32, MuxStreamKind, StreamBody),
 	Cancel(u32),
 }
 
@@ -828,13 +830,19 @@ where
 		}
 	}
 
-	/// Accept a peer open: dispatch whole-frame opens, otherwise park
-	/// the first chunk under the peer-initiated reassembly cap.
+	/// Accept a peer open, routed by the kind the initiating call
+	/// stamped on the record: unary streams reassemble into one frame,
+	/// streaming and duplex kinds forward chunks as they arrive.
 	async fn accept_peer_open(&mut self, stream_id: u32, package: MuxOpenPackage) -> TransportResult<()> {
-		if self.shared.streams_dispatch_chunks() {
-			return self.accept_streaming_open(stream_id, package).await;
+		match package.kind() {
+			MuxStreamKind::Unary => self.accept_unary_open(stream_id, package).await,
+			MuxStreamKind::Streaming | MuxStreamKind::Duplex => self.accept_streaming_open(stream_id, package).await,
 		}
+	}
 
+	/// Accept a unary-kind open: dispatch whole-frame opens, otherwise
+	/// park the first chunk under the peer-initiated reassembly cap.
+	async fn accept_unary_open(&mut self, stream_id: u32, package: MuxOpenPackage) -> TransportResult<()> {
 		self.charge_inbound_chunk(package.payload())?;
 		if package.last() {
 			// Whole frame in one chunk: the credit floor of one admits
@@ -845,7 +853,7 @@ where
 		// A conforming sender keeps its in-flight opens under the cap
 		// it was advertised, so one more partial stream is a
 		// violation, not backpressure
-		if self.peer_reassembly.len() >= cap_as_usize(self.peer_cap) {
+		if self.live_peer_streams() >= cap_as_usize(self.peer_cap) {
 			return Err(self.protocol_violation());
 		}
 
@@ -856,7 +864,13 @@ where
 		Ok(())
 	}
 
-	/// Accept a peer open in streaming dispatch: chunks forward to
+	/// Streams currently held open by the peer, across both
+	/// consumption paths (mixed kinds share one flood bound).
+	fn live_peer_streams(&self) -> usize {
+		self.peer_bodies.len().saturating_add(self.peer_reassembly.len())
+	}
+
+	/// Accept a streaming- or duplex-kind open: chunks forward to
 	/// the handler's [`StreamBody`] as they arrive, no reassembly.
 	/// The initial grant window doubles as the body channel bound;
 	/// further grants follow consumer drain (see
@@ -865,12 +879,15 @@ where
 		self.charge_inbound_chunk(package.payload())?;
 
 		// Same partial-open flood bound as unary reassembly
-		let live = self.peer_bodies.len().saturating_add(self.peer_reassembly.len());
-		if !package.last() && live >= cap_as_usize(self.peer_cap) {
+		if !package.last() && self.live_peer_streams() >= cap_as_usize(self.peer_cap) {
 			return Err(self.protocol_violation());
 		}
 
-		let (body, mut forwarder) = stream_body(stream_id, self.initial_recv_credit, self.drain_feedback.clone());
+		let (body, mut forwarder) = stream_body(
+			OpenSlot::assigned(stream_id),
+			self.initial_recv_credit,
+			self.drain_feedback.clone(),
+		);
 		if !forwarder.accept_and_forward(package.payload()) {
 			return Err(self.protocol_violation());
 		}
@@ -881,13 +898,18 @@ where
 			self.peer_bodies.insert(stream_id, forwarder);
 		}
 
-		self.dispatch_stream_open(stream_id, body).await
+		self.dispatch_stream_open(stream_id, package.kind(), body).await
 	}
 
 	/// Hand a fresh streaming body to the responder, refusing the
 	/// stream when no responder serves this connection.
-	async fn dispatch_stream_open(&mut self, stream_id: u32, body: StreamBody) -> TransportResult<()> {
-		let event = InboundEvent::StreamOpen(stream_id, body);
+	async fn dispatch_stream_open(
+		&mut self,
+		stream_id: u32,
+		kind: MuxStreamKind,
+		body: StreamBody,
+	) -> TransportResult<()> {
+		let event = InboundEvent::StreamOpen(stream_id, kind, body);
 		if self.inbound.send(event).await.is_err() {
 			self.peer_bodies.remove(&stream_id);
 			self.refuse_stream(stream_id);
@@ -1230,9 +1252,9 @@ mod tests {
 		}
 	}
 
-	/// Fixture open package for stream 1 carrying a four-byte payload.
+	/// Fixture unary open package for stream 1 carrying a four-byte payload.
 	fn open_package() -> MuxOpenPackage {
-		MuxOpenPackage::new(1, false, vec![0u8; 4]).expect("fixture payload fits an open package")
+		MuxOpenPackage::new(1, false, MuxStreamKind::Unary, vec![0u8; 4]).expect("fixture payload fits an open package")
 	}
 
 	// Empty payloads are trailer-only grammar: an empty data record
@@ -1384,18 +1406,21 @@ mod tests {
 
 	#[test]
 	fn test_streaming_open_forwards_chunks_without_reassembly() {
-		let open = MuxOpenPackage::new(1, false, vec![1u8; 4]).expect("fixture open fits a package");
+		let open =
+			MuxOpenPackage::new(1, false, MuxStreamKind::Streaming, vec![1u8; 4]).expect("fixture open fits a package");
 		let data = MuxDataPackage::new(1, true, vec![2u8; 4]).expect("fixture chunk fits a package");
 		let mut fixture = reader_with_full_queue(vec![open.into(), data.into()]);
-		fixture.driver.shared.enable_streaming_dispatch();
 
 		let mut driver = Box::pin(fixture.driver.drive());
 		poll_times(&mut driver, 8);
 		drop(driver);
 
 		let dispatched = fixture.inbound.try_recv();
-		assert!(matches!(dispatched, Ok(InboundEvent::StreamOpen(1, _))));
-		let Ok(InboundEvent::StreamOpen(_, mut body)) = dispatched else {
+		assert!(matches!(
+			dispatched,
+			Ok(InboundEvent::StreamOpen(1, MuxStreamKind::Streaming, _))
+		));
+		let Ok(InboundEvent::StreamOpen(_, _, mut body)) = dispatched else {
 			return;
 		};
 

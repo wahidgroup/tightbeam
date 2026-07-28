@@ -7,7 +7,7 @@ use std::sync::Arc;
 use futures::channel::mpsc;
 
 use super::body::{stream_body, DrainNote, ForwardedStream, StreamBody};
-use super::shared::MuxShared;
+use super::shared::{MuxShared, OpenSlot};
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::multiplex::MuxRole;
 use crate::transport::TransportResult;
@@ -32,7 +32,7 @@ pub(super) fn body_fixture(
 	window: u64,
 ) -> (StreamBody, ForwardedStream, mpsc::UnboundedReceiver<DrainNote>) {
 	let (feedback, notes) = mpsc::unbounded();
-	let (body, forwarder) = stream_body(stream_id, window, feedback);
+	let (body, forwarder) = stream_body(OpenSlot::assigned(stream_id), window, feedback);
 
 	(body, forwarder, notes)
 }

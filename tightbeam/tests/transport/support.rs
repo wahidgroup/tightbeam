@@ -67,7 +67,7 @@ where
 
 /// Serve one single-flight request by echoing the accepted frame back,
 /// answering with the gate's status.
-pub async fn respond_echo<T: MessageCollector>(mut transport: T) -> Result<(), TransportError> {
+pub async fn respond_echo<T: MessageCollector + Send>(mut transport: T) -> Result<(), TransportError> {
 	let (request, status) = transport.collect_message().await?;
 	let message = match status {
 		TransitStatus::Ok => Some(Arc::try_unwrap(request).unwrap_or_else(|shared| (*shared).clone())),

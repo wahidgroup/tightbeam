@@ -3,7 +3,7 @@
 #[cfg(feature = "transport-multiplex")]
 mod with_multiplex {
 	use tightbeam::der::Encode;
-	use tightbeam::transport::envelopes::MuxOpenPackage;
+	use tightbeam::transport::envelopes::{MuxOpenPackage, MuxStreamKind};
 	use tightbeam::transport::TransportEnvelope;
 	use tightbeam::TightBeamError;
 
@@ -11,7 +11,7 @@ mod with_multiplex {
 	/// non-mux rejection test rejects the same bytes a mux build emits.
 	#[test]
 	fn mux_open_wire_literal_matches_encoder() -> Result<(), TightBeamError> {
-		let open_package = MuxOpenPackage::new(1, true, Vec::new())?;
+		let open_package = MuxOpenPackage::new(1, true, MuxStreamKind::Unary, Vec::new())?;
 		let envelope = TransportEnvelope::from(open_package);
 
 		let encoded = envelope.to_der()?;

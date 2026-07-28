@@ -10,16 +10,19 @@ use futures::SinkExt;
 use super::body::{stream_body, DrainNote, StreamBody};
 use super::flow::{chunk_records, payload_credits};
 use super::outbound::{outbound_handle, Outbound};
-use super::shared::{cancel_error, enqueue_stream_cancel, BudgetStanding, MuxShared, StreamOutcome};
-use super::sink::{send_data_envelope, RequestSink};
+use super::shared::{
+	cancel_error, enqueue_stream_cancel, BudgetStanding, MuxShared, OpenRequest, OpenSlot, StreamOutcome,
+	StreamReservation,
+};
+use super::sink::{send_data_envelope, send_open_envelope, RequestSink};
 use super::writer::{drain_with_reason, renew_or_drain};
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{
-	GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxPingPackage, ResponsePackage, TransportEnvelope,
+	GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
 };
 use crate::transport::error::TransportFailure;
-use crate::transport::multiplex::{MultiplexedProtocol, StreamId, StreamingProtocol};
+use crate::transport::multiplex::{MultiplexedProtocol, StreamingProtocol};
 use crate::transport::{TransportError, TransportResult};
 use crate::utils::marker::MaybeSend;
 use crate::Frame;
@@ -35,20 +38,24 @@ use crate::transport::GateAudit;
 /// Cancels the stream if the owning emit future is dropped before its
 /// response arrives: frees the cap slot and notifies the peer (best-effort,
 /// [RFC 9113 § 6.4](https://datatracker.ietf.org/doc/html/rfc9113#section-6.4)).
+///
+/// The stream's ID is read through its [`OpenSlot`] at drop time: a
+/// guard dropped before the Open ever went out stands down on its
+/// own (nothing on the wire, the reservation releases the cap slot).
 pub(super) struct CancelOnDrop {
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
-	stream_id: u32,
+	slot: Arc<OpenSlot>,
 	armed: bool,
 }
 
 impl CancelOnDrop {
-	/// Armed guard over a freshly allocated stream.
-	fn new(shared: &Arc<MuxShared>, outbound: &mpsc::Sender<Outbound>, stream_id: u32) -> Self {
+	/// Armed guard over a stream identified by `slot`.
+	fn new(shared: &Arc<MuxShared>, outbound: &mpsc::Sender<Outbound>, slot: Arc<OpenSlot>) -> Self {
 		Self {
 			shared: Arc::clone(shared),
 			outbound: outbound_handle(outbound),
-			stream_id,
+			slot,
 			armed: true,
 		}
 	}
@@ -64,7 +71,9 @@ impl Drop for CancelOnDrop {
 			return;
 		}
 
-		enqueue_stream_cancel(&self.shared, &self.outbound, self.stream_id);
+		if let Some(stream_id) = self.slot.get() {
+			enqueue_stream_cancel(&self.shared, &self.outbound, stream_id);
+		}
 	}
 }
 
@@ -171,32 +180,24 @@ impl MuxHandle {
 	/// - `Draining`: GoAway sent or received. No new streams
 	/// - `ConnectionClosed`: connection failed before the response
 	pub async fn emit_on_stream(&self, frame: &Frame) -> TransportResult<Option<Frame>> {
-		// Encode before allocating so an encoding failure never burns
-		// a stream ID or queues a cancel for a stream the peer never saw.
+		// Encode before reserving so an encoding failure never burns
+		// a cap slot or queues work for a stream the peer never saw.
 		let payload = frame.to_der()?;
 		let credits = payload_credits(payload.len(), self.shared.send_chunk_size, self.shared.credit_unit);
 
 		let (sender, receiver) = oneshot::channel();
-		let stream_id = self.shared.allocate(sender)?;
+		// The reservation holds the cap slot until the Open goes out
+		// and releases it if this future is dropped waiting out a
+		// renewal: no ID exists yet, so nothing needs cancelling
+		let mut reservation = self.shared.reserve_stream_slot(sender)?;
+		let slot = reservation.slot();
 
-		// Armed before the admission await: dropping the emit while
-		// it waits out a renewal must free the slot like any other
-		// in-flight abandonment
-		let mut guard = CancelOnDrop::new(&self.shared, &self.outbound, stream_id);
+		let standing = self.shared.admit_debit(credits, false).await?;
 
-		let standing = match self.shared.admit_debit(credits, false).await {
-			Ok(standing) => standing,
-			Err(err) => {
-				guard.disarm();
-				self.shared.remove_pending(stream_id);
-				return Err(err);
-			}
-		};
+		let total = chunk_records(payload.len(), self.shared.send_chunk_size);
+		let mut guard = CancelOnDrop::new(&self.shared, &self.outbound, Arc::clone(&slot));
 
-		let chunk_records = chunk_records(payload.len(), self.shared.send_chunk_size);
-		self.shared.register_send_stream(stream_id, chunk_records);
-
-		match self.send_request_chunks(stream_id, &payload, chunk_records).await {
+		match self.send_request_chunks(&mut reservation, &payload, total).await {
 			Ok(()) => {}
 			// Ledger removed mid-send: the stream resolved underneath
 			// the sender and the outcome channel carries the truth
@@ -211,7 +212,9 @@ impl MuxHandle {
 		let outcome = receiver.await;
 
 		guard.disarm();
-		self.shared.finish_send_stream(stream_id);
+		if let Some(stream_id) = slot.get() {
+			self.shared.finish_send_stream(stream_id);
+		}
 
 		resolve_outcome(outcome)
 	}
@@ -232,21 +235,27 @@ impl MuxHandle {
 		&self,
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
 		let (sender, receiver) = oneshot::channel();
-		let stream_id = self.shared.allocate(sender)?;
+		let reservation = self.shared.reserve_stream_slot(sender)?;
+		let slot = reservation.slot();
 
-		// Streamed requests learn their length push by push
-		self.shared.register_send_stream(stream_id, 0);
-
-		let sink: RequestSink = RequestSink::new(stream_id, Arc::clone(&self.shared), outbound_handle(&self.outbound));
+		let sink = RequestSink::new(
+			reservation,
+			MuxStreamKind::Streaming,
+			Arc::clone(&self.shared),
+			outbound_handle(&self.outbound),
+			None,
+		);
 
 		let shared = Arc::clone(&self.shared);
 		let outbound = outbound_handle(&self.outbound);
 		let response = async move {
-			let mut guard = CancelOnDrop::new(&shared, &outbound, stream_id);
+			let mut guard = CancelOnDrop::new(&shared, &outbound, Arc::clone(&slot));
 			let outcome = receiver.await;
 
 			guard.disarm();
-			shared.finish_send_stream(stream_id);
+			if let Some(stream_id) = slot.get() {
+				shared.finish_send_stream(stream_id);
+			}
 
 			resolve_outcome(outcome)
 		};
@@ -277,57 +286,69 @@ impl MuxHandle {
 	/// - `Draining`: GoAway sent or received. No new streams
 	pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
 		let (sender, receiver) = oneshot::channel();
-		let stream_id = self.shared.allocate(sender)?;
+		let reservation = self.shared.reserve_stream_slot(sender)?;
+		let slot = reservation.slot();
 
 		// The reply travels through the body, not the outcome slot:
 		// the pending entry only holds the stream's cap slot
 		drop(receiver);
 
-		// Streamed requests learn their length push by push
-		self.shared.register_send_stream(stream_id, 0);
-
+		// The forwarder rides the reservation into the sink and
+		// registers under the assigned ID at first push, before the
+		// Open can reach the peer
 		let (mut body, forwarder) =
-			stream_body(stream_id, self.shared.initial_recv_credit, self.drain_feedback.clone());
+			stream_body(Arc::clone(&slot), self.shared.initial_recv_credit, self.drain_feedback.clone());
 
 		// An abandoned reply must reclaim its cap slot: without the
 		// guard, a closed-sink duplex stream has no cancel path and
 		// the slot stays pinned until the peer's trailer
-		body.arm_guard(CancelOnDrop::new(&self.shared, &self.outbound, stream_id));
+		body.arm_guard(CancelOnDrop::new(&self.shared, &self.outbound, slot));
 
-		self.shared.insert_duplex(stream_id, forwarder);
-
-		let sink = RequestSink::new(stream_id, Arc::clone(&self.shared), outbound_handle(&self.outbound));
+		let sink = RequestSink::new(
+			reservation,
+			MuxStreamKind::Duplex,
+			Arc::clone(&self.shared),
+			outbound_handle(&self.outbound),
+			Some(forwarder),
+		);
 		Ok((sink, body))
 	}
 
 	/// Segment a request payload into the initiator grammar, one
-	/// credit-gated chunk per record. `total` is the registered
-	/// chunk count: sender and ledger share one figure by  construction.
-	async fn send_request_chunks(&self, stream_id: u32, payload: &[u8], total: u64) -> TransportResult<()> {
+	/// credit-gated chunk per record. The first chunk travels through
+	/// the atomic open (assigning the stream ID and seeding the
+	/// ledger with `total` records), the rest as `Data`.
+	async fn send_request_chunks(
+		&self,
+		reservation: &mut StreamReservation,
+		payload: &[u8],
+		total: u64,
+	) -> TransportResult<()> {
 		let chunk_size = self.shared.send_chunk_size;
 		let mut outbound = outbound_handle(&self.outbound);
 		let mut chunks = payload.chunks(chunk_size);
 		let mut sent: u64 = 0;
-
 		let first = chunks.next().unwrap_or(&[]);
-		sent += 1;
-		let open = MuxOpenPackage::new(stream_id, sent == total, first)?;
-		let open_envelope = TransportEnvelope::from(open);
-		send_data_envelope(&self.shared, &mut outbound, stream_id, open_envelope).await?;
 
+		sent += 1;
+		let mut request = OpenRequest {
+			kind: MuxStreamKind::Unary,
+			last: sent == total,
+			payload: first,
+			records: total,
+			duplex: None,
+		};
+
+		let stream_id = send_open_envelope(&self.shared, &mut outbound, reservation, &mut request).await?;
 		for chunk in chunks {
 			sent += 1;
+
 			let data = MuxDataPackage::new(stream_id, sent == total, chunk)?;
 			let data_envelope = TransportEnvelope::from(data);
 			send_data_envelope(&self.shared, &mut outbound, stream_id, data_envelope).await?;
 		}
 
 		Ok(())
-	}
-
-	/// Cancel a locally-initiated in-flight stream (best-effort).
-	pub fn close_stream(&self, stream_id: StreamId) {
-		enqueue_stream_cancel(&self.shared, &self.outbound, stream_id.value());
 	}
 
 	/// Whether a new locally-initiated stream would be admitted now: cap
@@ -443,10 +464,6 @@ impl MultiplexedProtocol for MuxHandle {
 
 	fn emit_on_stream(&self, frame: &Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend {
 		MuxHandle::emit_on_stream(self, frame)
-	}
-
-	fn close_stream(&self, stream_id: StreamId) {
-		MuxHandle::close_stream(self, stream_id);
 	}
 }
 

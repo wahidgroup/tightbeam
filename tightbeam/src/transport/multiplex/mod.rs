@@ -21,12 +21,11 @@
 //!   handler, enforcing the advertised concurrency cap.
 //!
 //! Streaming layers over the same wire: [`MuxHandle::open_stream`] and
-//! [`MuxHandle::open_duplex`] push request chunks through a
-//! [`RequestSink`], while [`MuxResponder::serve_streaming`] and
-//! [`MuxResponder::serve_duplex`] hand each peer stream to its handler
-//! as an incremental [`StreamBody`] (with a [`ReplySink`] for duplex
-//! replies). Consumption-driven credit grants provide end-to-end
-//! backpressure so budgets, cancels, and rekey apply unchanged.
+//! [`MuxHandle::open_duplex`] push request chunks through a [`RequestSink`].
+//! Each initiating call stamps its interaction kind on the stream's Open
+//! record ([`MuxStreamKind`](crate::transport::envelopes::MuxStreamKind)),
+//! and [`MuxResponder::serve_with`] routes every peer stream to the matching
+//! [`MuxDispatch`] method.
 //!
 //! Stream ID rules follow:
 //! - [RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1)
@@ -62,8 +61,8 @@ use crate::transport::rekey::RekeyDriver;
 pub use router::SpawnedMux;
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
 pub use router::{
-	BufferedGrantor, CreditGrantor, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver, ReplySink,
-	RequestSink, StreamBody,
+	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport,
+	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
 };
 
 /// Stream identifier within one multiplexed connection.
@@ -151,23 +150,20 @@ impl MuxRole {
 
 /// Concurrent request/response streams over one connection.
 ///
-/// Cap, allocate, and cancel contracts match [`MuxHandle`]. This trait
-/// exists so the pool and other callers stay generic over the concrete
-/// handle type.
+/// Cap and cancel contracts match [`MuxHandle`]. This trait exists so
+/// the pool and other callers stay generic over the concrete handle
+/// type. Cancellation is by drop: abandoning the emit future cancels
+/// its stream, so no ID-keyed cancel surface exists.
 pub trait MultiplexedProtocol {
 	/// Peer-advertised cap on concurrent locally-initiated streams
 	/// (HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` analog).
 	fn max_concurrent_streams(&self) -> u32;
 
-	/// Allocate a stream, send `frame`, await the correlated response.
+	/// Open a stream, send `frame`, await the correlated response.
 	///
 	/// Dropping the future before it resolves cancels the stream and frees
 	/// its concurrency slot.
 	fn emit_on_stream(&self, frame: &Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend;
-
-	/// Best-effort cancel of a locally-initiated in-flight stream: frees
-	/// the slot and notifies the peer without blocking.
-	fn close_stream(&self, stream_id: StreamId);
 }
 
 /// Mux capability advertisement, bound into the handshake transcript.

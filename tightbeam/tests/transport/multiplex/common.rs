@@ -14,7 +14,7 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{
 	CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxEndPackage, MuxEnvelope, MuxOpenPackage,
-	MUX_APPLICATION_CODE_FLOOR,
+	MuxStreamKind, MUX_APPLICATION_CODE_FLOOR,
 };
 use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, MuxSettings, TransportAuthorizer, TransportOffer,
@@ -637,7 +637,7 @@ pub(super) async fn expect_muxed_request(
 
 pub(super) fn muxed_request_envelope(stream_id: u32, frame: Frame) -> Result<TransportEnvelope, TightBeamError> {
 	let payload = frame.to_der()?;
-	Ok(MuxOpenPackage::new(stream_id, true, payload)?.into())
+	Ok(MuxOpenPackage::new(stream_id, true, MuxStreamKind::Unary, payload)?.into())
 }
 
 pub(super) async fn write_muxed_request<W: EnvelopeSink>(

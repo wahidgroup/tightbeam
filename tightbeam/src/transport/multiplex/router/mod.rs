@@ -21,7 +21,7 @@ pub use body::StreamBody;
 pub use flow::{BufferedGrantor, CreditGrantor};
 pub use handle::MuxHandle;
 pub use reader::MuxReaderDriver;
-pub use responder::MuxResponder;
+pub use responder::{MuxDispatch, MuxResponder};
 pub use sink::{ReplySink, RequestSink};
 pub use transport::MuxTransport;
 pub use writer::MuxWriterDriver;

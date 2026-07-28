@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::channel::mpsc;
-use futures::future::{ready, AbortHandle, Abortable, Aborted, Either, Ready};
+use futures::future::{ready, AbortHandle, Abortable, Aborted, Either};
 use futures::stream::FuturesUnordered;
 use futures::{SinkExt, Stream};
 
-use super::body::{body_from_frame, StreamBody};
+use super::body::StreamBody;
 use super::flow::{cap_as_usize, chunk_records, payload_credits};
 use super::outbound::{outbound_handle, Outbound};
 use super::reader::InboundEvent;
@@ -22,10 +22,12 @@ use super::writer::{drain_with_reason, goaway_best_effort};
 use crate::constants::DEFAULT_MUX_CANCEL_BUDGET;
 use crate::der::Encode;
 use crate::policy::TransitStatus;
-use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxEndPackage, ResponsePackage, TransportEnvelope};
+use crate::transport::envelopes::{
+	GoAwayReason, MuxDataPackage, MuxEndPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
+};
 use crate::transport::error::TransportFailure;
 use crate::transport::{TransportError, TransportResult};
-use crate::utils::marker::MaybeSend;
+use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
@@ -41,12 +43,43 @@ enum ResponderEvent {
 	Closed,
 }
 
-/// Peer stream work handed to a serve dispatcher: a reassembled
-/// frame (unary dispatch) or an incremental body (streaming
-/// dispatch).
+/// Peer stream work handed to the serve dispatcher: a reassembled
+/// frame (unary kind) or an incremental body carrying the kind the
+/// initiator stamped on the stream.
 enum StreamWork {
 	Frame(Arc<Frame>),
-	Body(StreamBody),
+	Body(MuxStreamKind, StreamBody),
+}
+
+/// Kind-routed handler set for one connection's peer streams.
+///
+/// The initiating call stamps each stream's kind on its Open record
+/// ([`MuxStreamKind`]) and the responder routes it to the matching
+/// method here. Every default answers [`TransitStatus::Unimplemented`],
+/// so a kind the service does not serve refuses its stream without
+/// touching the connection.
+pub trait MuxDispatch {
+	/// Answer one unary request with its terminal response.
+	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		let _ = frame;
+		ready(ResponsePackage::new(TransitStatus::Unimplemented, None))
+	}
+
+	/// Consume a streamed request body and answer with the terminal
+	/// response. Consuming chunks replenishes the peer's stream
+	/// credit, so a slow handler parks the sender (end-to-end backpressure).
+	fn streaming(&self, body: StreamBody) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		let _ = body;
+		ready(ResponsePackage::new(TransitStatus::Unimplemented, None))
+	}
+
+	/// Consume request chunks while pushing reply chunks (full
+	/// duplex on one stream). The returned status closes the stream
+	/// as its `End` trailer.
+	fn duplex(&self, body: StreamBody, reply: ReplySink) -> impl Future<Output = TransitStatus> + MaybeSend {
+		let _ = (body, reply);
+		ready(TransitStatus::Unimplemented)
+	}
 }
 
 async fn next_responder_event<Fut>(
@@ -71,8 +104,8 @@ where
 				Poll::Ready(Some(InboundEvent::Request(stream_id, frame))) => {
 					return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Frame(frame)));
 				}
-				Poll::Ready(Some(InboundEvent::StreamOpen(stream_id, body))) => {
-					return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Body(body)));
+				Poll::Ready(Some(InboundEvent::StreamOpen(stream_id, kind, body))) => {
+					return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Body(kind, body)));
 				}
 				Poll::Ready(Some(InboundEvent::Cancel(stream_id))) => {
 					return Poll::Ready(ResponderEvent::Cancelled(stream_id));
@@ -87,15 +120,6 @@ where
 	.await
 }
 
-/// Adapt dispatched stream work into a body: an open that
-/// reassembled before dispatch switched becomes a one-chunk body.
-fn adapt_stream_work(stream_id: u32, work: StreamWork) -> TransportResult<StreamBody> {
-	match work {
-		StreamWork::Body(body) => Ok(body),
-		StreamWork::Frame(frame) => body_from_frame(stream_id, &frame),
-	}
-}
-
 /// Record a responder answering [`TransitStatus::Internal`] from a
 /// local inconsistency, so the peer-observed status has a local
 /// investigation trail.
@@ -106,12 +130,90 @@ fn note_internal_error(shared: &MuxShared) {
 	let _ = shared;
 }
 
-/// Refusal for a dispatch inconsistency: record the internal error
-/// and answer [`TransitStatus::Internal`].
-fn internal_response(shared: &MuxShared) -> Ready<ResponsePackage> {
-	note_internal_error(shared);
+/// [`MuxDispatch`] over a unary closure: serves only unary-kind
+/// streams, refusing the rest through the trait defaults.
+struct UnaryFn<H>(H);
 
-	ready(ResponsePackage::new(TransitStatus::Internal, None))
+impl<H, Fut> MuxDispatch for UnaryFn<H>
+where
+	H: Fn(Arc<Frame>) -> Fut,
+	Fut: Future<Output = ResponsePackage> + MaybeSend,
+{
+	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		(self.0)(frame)
+	}
+}
+
+/// [`MuxDispatch`] over a streaming closure: serves only
+/// streaming-kind streams, refusing the rest through the trait
+/// defaults.
+struct StreamingFn<H>(H);
+
+impl<H, Fut> MuxDispatch for StreamingFn<H>
+where
+	H: Fn(StreamBody) -> Fut,
+	Fut: Future<Output = ResponsePackage> + MaybeSend,
+{
+	fn streaming(&self, body: StreamBody) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		(self.0)(body)
+	}
+}
+
+/// [`MuxDispatch`] over a duplex closure: serves only duplex-kind
+/// streams, refusing the rest through the trait defaults.
+struct DuplexFn<H>(H);
+
+impl<H, Fut> MuxDispatch for DuplexFn<H>
+where
+	H: Fn(StreamBody, ReplySink) -> Fut,
+	Fut: Future<Output = TransitStatus> + MaybeSend,
+{
+	fn duplex(&self, body: StreamBody, reply: ReplySink) -> impl Future<Output = TransitStatus> + MaybeSend {
+		(self.0)(body, reply)
+	}
+}
+
+/// Box a dispatch method's future: erasing the `impl Future` opaque
+/// type sidesteps rustc's over-strict `Send` proof for futures that
+/// borrow from an `Arc` they live beside
+/// ([rust-lang/rust#100013](https://github.com/rust-lang/rust/issues/100013)).
+fn boxed<'a, T>(future: impl Future<Output = T> + MaybeSend + 'a) -> MaybeSendFuture<'a, T> {
+	Box::pin(future)
+}
+
+/// One peer stream's full lifecycle: route the work to the
+/// [`MuxDispatch`] method matching its kind, then send the stream's
+/// terminal record (response or trailer).
+async fn dispatch_stream<D: MuxDispatch>(
+	shared: Arc<MuxShared>,
+	outbound: mpsc::Sender<Outbound>,
+	dispatch: Arc<D>,
+	stream_id: u32,
+	work: StreamWork,
+) -> TransportResult<()> {
+	match work {
+		StreamWork::Frame(frame) => {
+			let response = boxed(dispatch.unary(frame)).await;
+			send_response(&shared, &outbound, stream_id, response).await
+		}
+		StreamWork::Body(MuxStreamKind::Streaming, body) => {
+			let response = boxed(dispatch.streaming(body)).await;
+			send_response(&shared, &outbound, stream_id, response).await
+		}
+		StreamWork::Body(MuxStreamKind::Duplex, body) => {
+			let reply = ReplySink::new(stream_id, Arc::clone(&shared), outbound_handle(&outbound));
+			let status = boxed(dispatch.duplex(body, reply)).await;
+			send_end_trailer(&shared, &outbound, stream_id, status).await
+		}
+		// Unreachable by construction: the reader reassembles
+		// unary-kind streams into frames. Answered safely rather
+		// than asserted.
+		StreamWork::Body(MuxStreamKind::Unary, _) => {
+			note_internal_error(&shared);
+			let refusal = ResponsePackage::new(TransitStatus::Internal, None);
+			send_response(&shared, &outbound, stream_id, refusal).await
+		}
+	}
 }
 
 /// Task tail shared by the response-bearing dispatchers: await the
@@ -253,75 +355,77 @@ impl MuxResponder {
 		self.cancel_budget = budget;
 	}
 
-	/// Run the responder until the connection ends, dispatching each
-	/// reassembled frame to `handler`.
+	/// Run the responder until the connection ends, routing each peer
+	/// stream to the `dispatch` method matching the kind the
+	/// initiating call stamped on it.
+	///
+	/// Unary-kind streams arrive reassembled into their frame. Streaming and
+	/// duplex kinds arrive as incremental [`StreamBody`] chunks whose
+	/// consumption replenishes the peer's stream credit (end-to-end
+	/// backpressure). Flow control, budgets, and the cancel machinery are
+	/// identical across kinds: every interaction is metered and paid.
 	///
 	/// # Errors
 	/// - `ConnectionClosed`: writer driver gone
 	/// - `OperationFailed(PolicyRejection)`: peer exhausted the cancel
 	///   budget. A [`GoAwayReason::EnhanceYourCalm`] was sent
+	pub async fn serve_with<D>(self, dispatch: D) -> TransportResult<()>
+	where
+		D: MuxDispatch + MaybeSend + MaybeSync + 'static,
+	{
+		let shared = Arc::clone(&self.shared);
+		let outbound = outbound_handle(&self.outbound);
+		let dispatch = Arc::new(dispatch);
+		self.dispatch_streams(move |stream_id, work| {
+			dispatch_stream(
+				Arc::clone(&shared),
+				outbound_handle(&outbound),
+				Arc::clone(&dispatch),
+				stream_id,
+				work,
+			)
+		})
+		.await
+	}
+
+	/// Run the responder until the connection ends, dispatching each
+	/// unary-kind frame to `handler`. Sugar on [`serve_with`](Self::serve_with)
+	/// over a unary-only service: streaming and duplex streams answer
+	/// [`TransitStatus::Unimplemented`].
+	///
+	/// # Errors
+	/// [`serve_with`](Self::serve_with)'s set.
 	pub async fn serve<H, Fut>(self, handler: H) -> TransportResult<()>
 	where
-		H: Fn(Arc<Frame>) -> Fut,
+		H: Fn(Arc<Frame>) -> Fut + MaybeSend + MaybeSync + 'static,
 		Fut: Future<Output = ResponsePackage> + MaybeSend,
 	{
-		let shared = Arc::clone(&self.shared);
-		let outbound = outbound_handle(&self.outbound);
-		self.dispatch_streams(move |stream_id, work| {
-			let response = match work {
-				StreamWork::Frame(frame) => Either::Left(handler(frame)),
-				// Unreachable by construction: unary dispatch never
-				// creates bodies. Answered safely rather than asserted.
-				StreamWork::Body(_) => Either::Right(internal_response(&shared)),
-			};
-
-			respond_task(&shared, &outbound, stream_id, response)
-		})
-		.await
+		self.serve_with(UnaryFn(handler)).await
 	}
 
 	/// Run the responder until the connection ends, dispatching each
-	/// peer stream to `handler` as an incremental [`StreamBody`].
-	///
-	/// Chunks reach the handler as they arrive instead of
-	/// reassembling first; consuming them replenishes the peer's
-	/// stream credit, so a slow handler parks the sender
-	/// (end-to-end backpressure). Flow control, budgets, and the
-	/// cancel machinery are identical to [`serve`](Self::serve):
-	/// streaming is automatically metered and paid.
+	/// streaming-kind stream to `handler` as an incremental
+	/// [`StreamBody`]. Sugar for [`serve_with`](Self::serve_with)
+	/// over a streaming-only service: unary and duplex streams
+	/// answer [`TransitStatus::Unimplemented`].
 	///
 	/// # Errors
-	/// - `ConnectionClosed`: writer driver gone
-	/// - `OperationFailed(PolicyRejection)`: peer exhausted the cancel
-	///   budget. A [`GoAwayReason::EnhanceYourCalm`] was sent
+	/// [`serve_with`](Self::serve_with)'s set.
 	pub async fn serve_streaming<H, Fut>(self, handler: H) -> TransportResult<()>
 	where
-		H: Fn(StreamBody) -> Fut,
+		H: Fn(StreamBody) -> Fut + MaybeSend + MaybeSync + 'static,
 		Fut: Future<Output = ResponsePackage> + MaybeSend,
 	{
-		self.shared.enable_streaming_dispatch();
-		let shared = Arc::clone(&self.shared);
-		let outbound = outbound_handle(&self.outbound);
-		self.dispatch_streams(move |stream_id, work| {
-			let response = match adapt_stream_work(stream_id, work) {
-				Ok(body) => Either::Left(handler(body)),
-				Err(_) => Either::Right(internal_response(&shared)),
-			};
-
-			respond_task(&shared, &outbound, stream_id, response)
-		})
-		.await
+		self.serve_with(StreamingFn(handler)).await
 	}
 
 	/// Run the responder until the connection ends, dispatching each
-	/// peer stream to `handler` as an incremental [`StreamBody`]
-	/// paired with a [`ReplySink`] for streaming the reply.
+	/// duplex-kind stream to `handler` as an incremental [`StreamBody`]
+	/// paired with a [`ReplySink`] for streaming the reply. The handler's
+	/// returned [`TransitStatus`] closes the stream as its `End` trailer.
 	///
-	/// The handler consumes request chunks and pushes reply chunks
-	/// concurrently (full duplex on one stream); its returned
-	/// [`TransitStatus`] closes the stream as the `End` trailer.
-	/// Flow control, budgets, and the cancel machinery are identical
-	/// to [`serve`](Self::serve) in both directions.
+	/// Sugar for [`serve_with`](Self::serve_with) over a duplex-only service:
+	/// unary and streaming streams answers [`TransitStatus::Unimplemented`].
 	///
 	/// Request chunks arrive as the initiator pushes them (see
 	/// [`RequestSink::push`]), so a conversational handler may reply
@@ -330,36 +434,13 @@ impl MuxResponder {
 	/// its end before returning the trailer status.
 	///
 	/// # Errors
-	/// - `ConnectionClosed`: writer driver gone
-	/// - `OperationFailed(PolicyRejection)`: peer exhausted the cancel
-	///   budget. A [`GoAwayReason::EnhanceYourCalm`] was sent
+	/// - [`serve_with`](Self::serve_with)'s set.
 	pub async fn serve_duplex<H, Fut>(self, handler: H) -> TransportResult<()>
 	where
-		H: Fn(StreamBody, ReplySink) -> Fut,
+		H: Fn(StreamBody, ReplySink) -> Fut + MaybeSend + MaybeSync + 'static,
 		Fut: Future<Output = TransitStatus> + MaybeSend,
 	{
-		self.shared.enable_streaming_dispatch();
-		let shared = Arc::clone(&self.shared);
-		let outbound = outbound_handle(&self.outbound);
-		self.dispatch_streams(move |stream_id, work| {
-			let status = match adapt_stream_work(stream_id, work) {
-				Ok(body) => {
-					let sink = ReplySink::new(stream_id, Arc::clone(&shared), outbound_handle(&outbound));
-					Either::Left(handler(body, sink))
-				}
-				Err(_) => {
-					note_internal_error(&shared);
-					Either::Right(ready(TransitStatus::Internal))
-				}
-			};
-			let shared = Arc::clone(&shared);
-			let outbound = outbound_handle(&outbound);
-			async move {
-				let status = status.await;
-				send_end_trailer(&shared, &outbound, stream_id, status).await
-			}
-		})
-		.await
+		self.serve_with(DuplexFn(handler)).await
 	}
 
 	/// Shared responder loop: one dispatcher call per peer stream,

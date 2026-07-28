@@ -3,7 +3,7 @@
 
 use core::future::{poll_fn, Future};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use core::task::{Context, Poll, Waker};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -13,7 +13,9 @@ use futures::channel::{mpsc, oneshot};
 use super::body::{BodyEvent, ForwardedStream};
 use super::flow::cap_as_usize;
 use super::outbound::{outbound_handle, Outbound};
-use crate::transport::envelopes::{CancelReason, GoAwayReason, MuxCancelPackage, ResponsePackage, TransportEnvelope};
+use crate::transport::envelopes::{
+	CancelReason, GoAwayReason, MuxCancelPackage, MuxOpenPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
+};
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::multiplex::MuxRole;
@@ -38,6 +40,90 @@ fn wake_all(wakers: &mut Vec<Waker>) {
 /// Register `cx`'s waker. Waker clone is a refcount bump, not a data copy.
 pub(super) fn park_waker(waiters: &mut Vec<Waker>, cx: &Context<'_>) {
 	waiters.push(cx.waker().clone());
+}
+
+/// Identity of a locally-initiated stream whose ID is assigned at
+/// first send (atomic open): vacant until the Open record enqueues,
+/// the assigned ID afterwards. Stream IDs start at 1 (client) or 2
+/// (server), so zero unambiguously means "not opened yet".
+///
+/// Shared between the parts that outlive the open (sinks, response
+/// futures, reply bodies, cancel guards) so each can act on the real
+/// ID once it exists and stand down when it never did.
+pub(super) struct OpenSlot(AtomicU32);
+
+impl OpenSlot {
+	const VACANT: u32 = 0;
+
+	fn vacant() -> Arc<Self> {
+		Arc::new(Self(AtomicU32::new(Self::VACANT)))
+	}
+
+	/// Slot for a stream whose ID is already known (peer-initiated
+	/// bodies, replies): assigned from birth.
+	pub(super) fn assigned(stream_id: u32) -> Arc<Self> {
+		Arc::new(Self(AtomicU32::new(stream_id)))
+	}
+
+	fn assign(&self, stream_id: u32) {
+		self.0.store(stream_id, AtomicOrdering::Release);
+	}
+
+	pub(super) fn get(&self) -> Option<u32> {
+		match self.0.load(AtomicOrdering::Acquire) {
+			Self::VACANT => None,
+			stream_id => Some(stream_id),
+		}
+	}
+}
+
+/// A cap slot held for a stream that has not sent its Open record
+/// yet. The stream ID is assigned inside [`MuxShared::poll_open_enqueue`],
+/// in the same critical section that enqueues the Open, so Opens hit
+/// the wire in strictly increasing ID order
+/// ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1))
+/// no matter how initiations interleave.
+///
+/// Dropping an unopened reservation releases the cap slot and resolves the
+/// response future as locally cancelled. Once opened, the pending table owns
+/// the stream's lifecycle and the drop is a no-op.
+pub(super) struct StreamReservation {
+	shared: Arc<MuxShared>,
+	sender: Option<oneshot::Sender<StreamOutcome>>,
+	slot: Arc<OpenSlot>,
+}
+
+impl StreamReservation {
+	/// Handle to the stream's late-assigned identity (refcount bump).
+	pub(super) fn slot(&self) -> Arc<OpenSlot> {
+		Arc::clone(&self.slot)
+	}
+}
+
+impl Drop for StreamReservation {
+	fn drop(&mut self) {
+		let Some(sender) = self.sender.take() else {
+			return;
+		};
+
+		let _ = sender.send(StreamOutcome::Cancelled(CancelReason::Cancelled));
+		let mut state = self.shared.lock();
+		state.reserved = state.reserved.saturating_sub(1);
+		state.wake_slot_waiters();
+	}
+}
+
+/// One stream's Open record, handed to
+/// [`MuxShared::poll_open_enqueue`]. `records` seeds the sender
+/// ledger (the payload's chunk count, or the whole message's for a
+/// unary emit); `duplex` carries the reply forwarder to register
+/// under the assigned ID before the Open can reach the peer.
+pub(super) struct OpenRequest<'a> {
+	pub(super) kind: MuxStreamKind,
+	pub(super) last: bool,
+	pub(super) payload: &'a [u8],
+	pub(super) records: u64,
+	pub(super) duplex: Option<ForwardedStream>,
 }
 
 /// Outcome delivered to a pending stream's oneshot slot.
@@ -131,9 +217,14 @@ struct MuxState {
 	next_stream_id: Option<u32>,
 	/// Highest peer-initiated stream ID seen (0 = none yet)
 	last_peer_stream_id: u32,
-	/// Open locally-initiated streams awaiting their response. The map
-	/// size is the cap-relevant open-stream count
+	/// Open locally-initiated streams awaiting their response.
+	/// Together with `reserved` this is the cap-relevant
+	/// open-stream count
 	pending: BTreeMap<u32, oneshot::Sender<StreamOutcome>>,
+	/// Cap slots held by initiations that have not sent their Open
+	/// record yet (see [`StreamReservation`]): IDs are assigned at
+	/// first send so Opens hit the wire in ID order
+	reserved: usize,
 	/// Next correlation value for a locally-initiated ping
 	next_ping_opaque: u64,
 	/// Local pings awaiting their ack, keyed by correlation value
@@ -190,6 +281,12 @@ impl MuxState {
 		self.goaway_sent.is_some() || self.goaway_received.is_some()
 	}
 
+	/// Cap-relevant open-stream count: streams awaiting their
+	/// response plus reservations that have not opened yet.
+	fn open_load(&self) -> usize {
+		self.pending.len().saturating_add(self.reserved)
+	}
+
 	fn reject_if_draining(&self) -> TransportResult<()> {
 		if self.is_draining() {
 			return Err(TransportError::Draining);
@@ -213,6 +310,11 @@ pub(super) struct MuxShared {
 	/// Initial per-stream chunk limit granted to the peer (local
 	/// receive window; duplex reply bodies size from it)
 	pub(super) initial_recv_credit: u64,
+	/// Connection collector inherited from the split halves;
+	/// control-plane events land here
+	/// (see [`crate::instrumentation::events`]).
+	#[cfg(feature = "instrument")]
+	pub(super) trace: Option<TraceCollector>,
 	/// Reply forwarders for locally-initiated duplex streams,
 	/// registered by
 	/// [`MuxHandle::open_duplex`](super::handle::MuxHandle::open_duplex)
@@ -236,18 +338,6 @@ pub(super) struct MuxShared {
 	/// Current epoch's dual-signed receipt; renewal rotates it
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	session_receipt: Mutex<Option<Arc<StoredReceipt>>>,
-	/// Connection collector inherited from the split halves;
-	/// control-plane events land here
-	/// (see [`crate::instrumentation::events`]).
-	#[cfg(feature = "instrument")]
-	pub(super) trace: Option<TraceCollector>,
-	/// Peer-initiated streams dispatch as
-	/// [`StreamBody`](super::body::StreamBody) chunks instead of
-	/// reassembled frames. Set once by
-	/// [`MuxResponder::serve_streaming`](super::responder::MuxResponder::serve_streaming);
-	/// opens routed before the responder starts fall back to unary
-	/// dispatch, which the streaming serve loop adapts.
-	streaming_dispatch: AtomicBool,
 }
 
 impl MuxShared {
@@ -267,11 +357,11 @@ impl MuxShared {
 			session_receipt: Mutex::new(None),
 			#[cfg(feature = "instrument")]
 			trace: None,
-			streaming_dispatch: AtomicBool::new(false),
 			state: Mutex::new(MuxState {
 				next_stream_id: Some(role.first_local_stream_id()),
 				last_peer_stream_id: 0,
 				pending: BTreeMap::new(),
+				reserved: 0,
 				next_ping_opaque: 0,
 				pending_pings: BTreeMap::new(),
 				send_streams: HashMap::new(),
@@ -303,15 +393,6 @@ impl MuxShared {
 	/// Future resolving once the pending table drains (refcount bump).
 	pub(super) fn drain_pending(self: &Arc<Self>) -> DrainPending {
 		DrainPending { shared: Arc::clone(self) }
-	}
-
-	/// Switch peer-initiated opens to chunk-level dispatch.
-	pub(super) fn enable_streaming_dispatch(&self) {
-		self.streaming_dispatch.store(true, AtomicOrdering::Release);
-	}
-
-	pub(super) fn streams_dispatch_chunks(&self) -> bool {
-		self.streaming_dispatch.load(AtomicOrdering::Acquire)
 	}
 
 	fn duplex_lock(&self) -> MutexGuard<'_, HashMap<u32, ForwardedStream>> {
@@ -740,11 +821,21 @@ impl MuxShared {
 		}
 	}
 
-	/// Allocate the next stream ID and register its response slot.
-	pub(super) fn allocate(&self, sender: oneshot::Sender<StreamOutcome>) -> TransportResult<u32> {
+	/// Reserve a cap slot for a locally-initiated stream without
+	/// assigning its ID: the ID is assigned when the Open record
+	/// enqueues (see [`Self::poll_open_enqueue`]), so it always
+	/// matches wire order. Admission (draining, cap, ID space) is
+	/// checked here, at the caller-visible initiation point.
+	pub(super) fn reserve_stream_slot(
+		self: &Arc<Self>,
+		sender: oneshot::Sender<StreamOutcome>,
+	) -> TransportResult<StreamReservation> {
 		self.reject_admission()?;
 		let mut state = self.lock();
-		if state.pending.len() >= cap_as_usize(self.local_cap) {
+		if state.next_stream_id.is_none() {
+			return Err(TransportError::Draining);
+		}
+		if state.open_load() >= cap_as_usize(self.local_cap) {
 			drop(state);
 
 			#[cfg(feature = "instrument")]
@@ -753,11 +844,79 @@ impl MuxShared {
 			return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
 		}
 
-		let stream_id = state.next_stream_id.ok_or(TransportError::Draining)?;
-		state.next_stream_id = stream_id.checked_add(2);
-		state.pending.insert(stream_id, sender);
+		state.reserved = state.reserved.saturating_add(1);
+		drop(state);
 
-		Ok(stream_id)
+		Ok(StreamReservation { shared: Arc::clone(self), sender: Some(sender), slot: OpenSlot::vacant() })
+	}
+
+	/// Atomic open: assign the next stream ID and enqueue the
+	/// stream's Open record in one critical section, so Opens hit
+	/// the wire in strictly increasing ID order no matter how
+	/// concurrent initiations interleave. The caller MUST have
+	/// reserved queue capacity via `poll_ready` on `outbound` first.
+	///
+	/// Every precondition (rekey hard floor) is checked before the
+	/// ID is consumed, so a `Pending` never burns an ID or a wire
+	/// slot. The fresh ledger's initial credit is at least one, so
+	/// the Open's own credit debit can never park after assignment.
+	pub(super) fn poll_open_enqueue(
+		&self,
+		reservation: &mut StreamReservation,
+		request: &mut OpenRequest<'_>,
+		outbound: &mut mpsc::Sender<Outbound>,
+		cx: &mut Context<'_>,
+	) -> Poll<TransportResult<u32>> {
+		let mut state = self.lock();
+		if state.rekey_hard_floor {
+			park_waker(&mut state.rekey_wakers, cx);
+			return Poll::Pending;
+		}
+
+		let Some(stream_id) = state.next_stream_id else {
+			return Poll::Ready(Err(TransportError::Draining));
+		};
+		let Some(sender) = reservation.sender.take() else {
+			// Unreachable by construction: a reservation opens once.
+			return Poll::Ready(Err(TransportError::InvalidState));
+		};
+
+		state.next_stream_id = stream_id.checked_add(2);
+		state.reserved = state.reserved.saturating_sub(1);
+		state.pending.insert(stream_id, sender);
+		reservation.slot.assign(stream_id);
+
+		// Seed the ledger, then take the Open's own credit: the
+		// initial grant floor of one admits it without parking.
+		state.unsent_chunks = state.unsent_chunks.saturating_add(request.records);
+		state.send_streams.insert(
+			stream_id,
+			SendStream {
+				sent: 0,
+				limit: self.initial_send_credit,
+				unsent: request.records,
+				credit_wakers: Vec::new(),
+			},
+		);
+		if let Poll::Ready(Err(err)) = Self::take_chunk_credit(&mut state, stream_id, cx) {
+			return Poll::Ready(Err(err));
+		}
+
+		// Registered before the Open can reach the peer, so a reply
+		// chunk always finds its forwarder.
+		if let Some(forwarder) = request.duplex.take() {
+			self.insert_duplex(stream_id, forwarder);
+		}
+
+		let package = match MuxOpenPackage::new(stream_id, request.last, request.kind, request.payload) {
+			Ok(package) => package,
+			Err(err) => return Poll::Ready(Err(TransportError::DerError(err))),
+		};
+		let enqueued = outbound
+			.start_send(Outbound::Envelope(package.into()))
+			.map_err(|_| TransportError::ConnectionClosed);
+
+		Poll::Ready(enqueued.map(|()| stream_id))
 	}
 
 	pub(super) fn remove_pending(&self, stream_id: u32) -> Option<oneshot::Sender<StreamOutcome>> {
@@ -904,7 +1063,7 @@ impl MuxShared {
 
 	pub(super) fn has_stream_headroom(&self) -> bool {
 		let state = self.lock();
-		let under_cap = state.pending.len() < cap_as_usize(self.local_cap);
+		let under_cap = state.open_load() < cap_as_usize(self.local_cap);
 		let id_space_live = state.next_stream_id.is_some();
 		let no_goaway = state.goaway_sent.is_none() && state.goaway_received.is_none();
 
@@ -934,7 +1093,7 @@ impl MuxShared {
 			return Poll::Ready(Err(TransportError::Draining));
 		}
 
-		if state.pending.len() < cap_as_usize(self.local_cap) {
+		if state.open_load() < cap_as_usize(self.local_cap) {
 			return Poll::Ready(Ok(()));
 		}
 
@@ -988,12 +1147,12 @@ mod tests {
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	use crate::transport::envelopes::MuxPingPackage;
 
-	fn shared(role: MuxRole, local_cap: u32) -> MuxShared {
-		MuxShared::new(role, &MuxSettings::symmetric(local_cap))
+	fn shared(role: MuxRole, local_cap: u32) -> Arc<MuxShared> {
+		Arc::new(MuxShared::new(role, &MuxSettings::symmetric(local_cap)))
 	}
 
-	fn shared_with_settings(role: MuxRole, settings: MuxSettings) -> MuxShared {
-		MuxShared::new(role, &settings)
+	fn shared_with_settings(role: MuxRole, settings: MuxSettings) -> Arc<MuxShared> {
+		Arc::new(MuxShared::new(role, &settings))
 	}
 
 	fn slot() -> oneshot::Sender<StreamOutcome> {
@@ -1004,9 +1163,23 @@ mod tests {
 		oneshot::channel().0
 	}
 
-	fn allocate_ids(shared: &MuxShared, ids: &[u32]) {
+	/// Open one stream through the production path: reserve, then
+	/// atomically assign its ID and enqueue its Open record.
+	fn open_one(shared: &Arc<MuxShared>) -> TransportResult<u32> {
+		let mut reservation = shared.reserve_stream_slot(slot())?;
+		let (mut outbound, _wire) = mpsc::channel(4);
+		let mut request =
+			OpenRequest { kind: MuxStreamKind::Unary, last: true, payload: &[], records: 1, duplex: None };
+		let mut cx = noop_cx();
+		match shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx) {
+			Poll::Ready(result) => result,
+			Poll::Pending => Err(TransportError::ConnectionClosed),
+		}
+	}
+
+	fn allocate_ids(shared: &Arc<MuxShared>, ids: &[u32]) {
 		for &id in ids {
-			assert!(matches!(shared.allocate(slot()), Ok(got) if got == id));
+			assert!(matches!(open_one(shared), Ok(got) if got == id));
 		}
 	}
 
@@ -1038,7 +1211,7 @@ mod tests {
 		LocalShutdown { cap: u32 },
 	}
 
-	fn prepare_headroom(setup: HeadroomSetup) -> MuxShared {
+	fn prepare_headroom(setup: HeadroomSetup) -> Arc<MuxShared> {
 		match setup {
 			HeadroomSetup::Fresh { cap } => shared(MuxRole::Client, cap),
 			HeadroomSetup::AtCap { cap } => {
@@ -1060,7 +1233,7 @@ mod tests {
 		LocalShutdown,
 	}
 
-	fn prepare_goaway(setup: GoAwaySetup) -> MuxShared {
+	fn prepare_goaway(setup: GoAwaySetup) -> Arc<MuxShared> {
 		let shared = shared(MuxRole::Client, 2);
 		match setup {
 			GoAwaySetup::Live => {}
@@ -1087,7 +1260,7 @@ mod tests {
 		Draining,
 	}
 
-	fn prepare_slot(setup: SlotSetup) -> MuxShared {
+	fn prepare_slot(setup: SlotSetup) -> Arc<MuxShared> {
 		let shared = shared(MuxRole::Client, 1);
 		match setup {
 			SlotSetup::ReadyWithHeadroom => {}
@@ -1160,7 +1333,7 @@ mod tests {
 		let shared = shared(MuxRole::Client, 2);
 		allocate_ids(&shared, &[1, 3]);
 		assert!(matches!(
-			shared.allocate(slot()),
+			open_one(&shared),
 			Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
 		));
 	}
@@ -1173,11 +1346,59 @@ mod tests {
 		allocate_ids(&shared, &[3]);
 	}
 
+	// The heart of the atomic open: whichever initiation sends its
+	// Open first takes the lower ID, regardless of reservation
+	// order, so Opens hit the wire in strictly increasing ID order.
+	#[test]
+	fn test_ids_follow_open_order_not_reservation_order() {
+		let shared = shared(MuxRole::Client, 4);
+		let early = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
+
+		assert!(matches!(open_one(&shared), Ok(1)));
+
+		drop(early);
+		assert!(matches!(open_one(&shared), Ok(3)));
+	}
+
+	#[test]
+	fn test_reservation_holds_cap_slot_until_dropped() {
+		let shared = shared(MuxRole::Client, 1);
+		let held = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
+
+		assert!(matches!(
+			open_one(&shared),
+			Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
+		));
+
+		drop(held);
+		assert!(matches!(open_one(&shared), Ok(1)));
+	}
+
+	// An open parked on the rekey hard floor consumes nothing: the
+	// same reservation opens once the floor lifts.
+	#[test]
+	fn test_open_parked_on_rekey_floor_keeps_reservation() {
+		let shared = shared(MuxRole::Client, 4);
+		let mut reservation = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
+		let (mut outbound, _wire) = mpsc::channel(4);
+		let mut request =
+			OpenRequest { kind: MuxStreamKind::Unary, last: true, payload: &[], records: 1, duplex: None };
+		let mut cx = noop_cx();
+
+		shared.lock().rekey_hard_floor = true;
+		let parked = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
+		assert!(matches!(parked, Poll::Pending));
+
+		shared.lock().rekey_hard_floor = false;
+		let opened = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
+		assert!(matches!(opened, Poll::Ready(Ok(1))));
+	}
+
 	#[test]
 	fn test_allocation_halts_after_shutdown() {
 		let shared = shared(MuxRole::Client, 8);
 		assert!(matches!(shared.begin_shutdown(), Some(0)));
-		assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
+		assert!(matches!(open_one(&shared), Err(TransportError::Draining)));
 		assert!(shared.begin_shutdown().is_none());
 	}
 
@@ -1185,7 +1406,7 @@ mod tests {
 	fn test_allocation_halts_after_peer_goaway() {
 		let shared = shared(MuxRole::Client, 8);
 		shared.fail_pending_above(0, GoAwayReason::Shutdown);
-		assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
+		assert!(matches!(open_one(&shared), Err(TransportError::Draining)));
 	}
 
 	#[test]
@@ -1193,7 +1414,7 @@ mod tests {
 		let shared = shared(MuxRole::Client, 8);
 		shared.lock().next_stream_id = Some(u32::MAX);
 		allocate_ids(&shared, &[u32::MAX]);
-		assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
+		assert!(matches!(open_one(&shared), Err(TransportError::Draining)));
 	}
 
 	#[test]
@@ -1525,8 +1746,8 @@ mod tests {
 	fn test_fail_duplex_above_fails_disowned_replies() {
 		let shared = shared(MuxRole::Client, 4);
 		let (feedback, _notes) = mpsc::unbounded();
-		let (mut kept, below) = stream_body(1, 4, feedback.clone());
-		let (mut disowned, above) = stream_body(3, 4, feedback);
+		let (mut kept, below) = stream_body(OpenSlot::assigned(1), 4, feedback.clone());
+		let (mut disowned, above) = stream_body(OpenSlot::assigned(3), 4, feedback);
 		shared.insert_duplex(1, below);
 		shared.insert_duplex(3, above);
 

@@ -28,6 +28,7 @@ mod multiplex {
 	pub use crate::cms::signed_data::SignedData;
 	pub use crate::cms::signed_data::SignerInfo;
 	pub use crate::der::asn1::OctetString;
+	pub use crate::der::Enumerated;
 	pub use crate::der::Sequence;
 	pub use crate::der::{DecodeValue, FixedTag, Header};
 }
@@ -305,28 +306,76 @@ macro_rules! mux_chunk_package {
 	};
 }
 
+/// Interaction shape of a mux stream, stamped on the Open record by
+/// the initiating call. It tells the responder whether the body
+/// reassembles into one [`Frame`] and which reply shape the initiator
+/// awaits, so dispatch needs no heuristics.
 #[cfg(feature = "transport-multiplex")]
-mux_chunk_package! {
-	/// Open a stream and carry its first payload chunk inline.
-	///
-	/// One unified stream grammar
-	/// ([RFC 9113 § 8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1)
-	/// analog, request = stream):
-	///
-	/// ```text
-	/// initiator:  Open(last?)   Data(...)*  Data(last)
-	/// responder:  Data(...)*    End(status, payload?)
-	/// either:     Cancel(code)  Credit(limit)
-	/// ```
-	///
-	/// A unary request whose frame fits one chunk is a single
-	/// `Open(last = true)` record. Chunks concatenate in arrival order into
-	/// the message frame DER. The ordered AEAD channel with strict counter
-	/// sequencing already proves order and completeness, so chunks carry no
-	/// sequence numbers. Stream correlation metadata travels inside the
-	/// encrypted envelope payload.
-	MuxOpenPackage,
-	last: "Whether this is the initiator's final chunk on the stream"
+#[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MuxStreamKind {
+	/// Body reassembles into one frame; the reply is a unary `End`.
+	#[default]
+	Unary = 0,
+	/// Body is consumed incrementally; the reply is a unary `End`.
+	Streaming = 1,
+	/// Body is consumed incrementally; the reply streams back as
+	/// `Data*` records ahead of the closing trailer.
+	Duplex = 2,
+}
+
+/// Open a stream and carry its first payload chunk inline.
+///
+/// One unified stream grammar
+/// ([RFC 9113 § 8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1)
+/// analog, request = stream):
+///
+/// ```text
+/// initiator:  Open(kind, last?)  Data(...)*  Data(last)
+/// responder:  Data(...)*         End(status, payload?)
+/// either:     Cancel(code)       Credit(limit)
+/// ```
+///
+/// A unary request whose frame fits one chunk is a single `Open(last = true)`
+/// record. Chunks concatenate in arrival order into the message frame DER.
+/// The ordered AEAD channel with strict counter sequencing already proves
+/// order and completeness, so chunks carry no sequence numbers. Stream
+/// correlation metadata travels inside the encrypted envelope payload.
+#[cfg(feature = "transport-multiplex")]
+#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+pub struct MuxOpenPackage {
+	pub(crate) stream_id: u32,
+	pub(crate) last: bool,
+	pub(crate) kind: MuxStreamKind,
+	pub(crate) payload: OctetString,
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl MuxOpenPackage {
+	/// # Errors
+	/// `payload` longer than the DER length cap
+	pub fn new(stream_id: u32, last: bool, kind: MuxStreamKind, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
+		let payload = OctetString::new(payload)?;
+		Ok(Self { stream_id, last, kind, payload })
+	}
+
+	pub fn stream_id(&self) -> u32 {
+		self.stream_id
+	}
+
+	/// Whether this is the initiator's final chunk on the stream
+	pub fn last(&self) -> bool {
+		self.last
+	}
+
+	/// Interaction shape the initiating call stamped on the stream.
+	pub fn kind(&self) -> MuxStreamKind {
+		self.kind
+	}
+
+	pub fn payload(&self) -> &[u8] {
+		self.payload.as_bytes()
+	}
 }
 
 #[cfg(feature = "transport-multiplex")]
@@ -892,10 +941,26 @@ mod tests {
 	#[test]
 	fn test_mux_open_package_encode_decode() -> Result<(), Box<dyn Error>> {
 		assert_round_trip([
-			MuxOpenPackage::new(1, true, frame_payload("open-unary")?)?,
-			MuxOpenPackage::new(3, false, frame_payload("open-chunked")?)?,
-			MuxOpenPackage::new(u32::MAX, false, Vec::new())?,
+			MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("open-unary")?)?,
+			MuxOpenPackage::new(3, false, MuxStreamKind::Streaming, frame_payload("open-chunked")?)?,
+			MuxOpenPackage::new(5, false, MuxStreamKind::Duplex, frame_payload("open-duplex")?)?,
+			MuxOpenPackage::new(u32::MAX, false, MuxStreamKind::Unary, Vec::new())?,
 		])
+	}
+
+	// The kind is the dispatch discriminator: every variant must
+	// survive the wire unchanged.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_open_package_kind_round_trips_every_variant() -> Result<(), Box<dyn Error>> {
+		let kinds = [MuxStreamKind::Unary, MuxStreamKind::Streaming, MuxStreamKind::Duplex];
+		for kind in kinds {
+			let package = MuxOpenPackage::new(7, false, kind, vec![1u8; 4])?;
+			let decoded = MuxOpenPackage::from_der(&package.to_der()?)?;
+			assert_eq!(decoded.kind(), kind);
+		}
+
+		Ok(())
 	}
 
 	#[cfg(feature = "transport-multiplex")]
@@ -1121,7 +1186,7 @@ mod tests {
 	#[test]
 	fn test_mux_envelope_variants_round_trip() -> Result<(), Box<dyn Error>> {
 		assert_round_trip([
-			TransportEnvelope::from(MuxOpenPackage::new(1, true, frame_payload("mux-open")?)?),
+			TransportEnvelope::from(MuxOpenPackage::new(1, true, MuxStreamKind::Unary, frame_payload("mux-open")?)?),
 			TransportEnvelope::from(MuxDataPackage::new(1, false, vec![0xEF; 16])?),
 			TransportEnvelope::from(MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("mux-end")?)?),
 			TransportEnvelope::from(MuxCreditPackage::new(1, 128)),
