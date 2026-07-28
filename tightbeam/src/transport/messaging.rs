@@ -15,6 +15,8 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+use core::future::Future;
+
 use crate::asn1::Frame;
 use crate::der::Encode;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
@@ -22,6 +24,7 @@ use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelo
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
 use crate::transport::TransportResult;
+use crate::utils::marker::MaybeSend;
 
 #[cfg(all(
 	feature = "transport-policy",
@@ -68,7 +71,7 @@ use crate::trace::TraceCollector;
 /// Source of the connection audit trail for access-gate verdicts.
 ///
 /// Every plane that evaluates a collector gate implements this (the TCP
-/// transports, the mux handle) so [`gate_inbound_frame`] can record the
+/// transports, the mux handle) so [`gate_inbound`] can record the
 /// verdict wherever the gate runs.
 #[cfg(feature = "transport-policy")]
 pub trait GateAudit {
@@ -77,7 +80,7 @@ pub trait GateAudit {
 	fn audit_trace(&self) -> Option<&TraceCollector>;
 }
 
-/// Gate one inbound frame with the session's authenticated context and
+/// Gate one inbound request with the session's authenticated context and
 /// record the verdict into the connection audit trail (`GATE_ACCEPT` /
 /// `GATE_REJECT`).
 ///
@@ -85,11 +88,14 @@ pub trait GateAudit {
 /// cleartext and encrypted single-flight collectors all route through
 /// here, so access decisions are observable evidence on every plane.
 ///
+/// `frame` is [`None`] for mux streaming / duplex opens that have no
+/// request frame at dispatch; session-scoped gates still evaluate.
+///
 /// A gate returning [`TransitStatus::Unknown`] is a local bug, not a
 /// verdict: it is normalized to [`TransitStatus::Internal`] so the peer
 /// sees a server fault and the audit trail records a reject.
 #[cfg(feature = "transport-policy")]
-pub(crate) fn gate_inbound_frame<G, A>(gate: &G, audit: &A, frame: &Frame, session: &SessionContext) -> TransitStatus
+pub(crate) fn gate_inbound<G, A>(gate: &G, audit: &A, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus
 where
 	G: GatePolicy + ?Sized,
 	A: GateAudit + ?Sized,
@@ -114,17 +120,6 @@ where
 	let _ = audit;
 
 	status
-}
-
-/// Trait for transports that support custom response handlers
-pub trait ResponseHandler {
-	/// Set a handler that processes incoming messages and generates responses
-	fn with_handler<F>(self, handler: F) -> Self
-	where
-		F: Fn(Frame) -> Option<Frame> + Send + Sync + 'static;
-
-	/// Get the current handler if one is set
-	fn handler(&self) -> Option<&(dyn Fn(Frame) -> Option<Frame> + Send + Sync)>;
 }
 
 #[cfg(feature = "transport-policy")]
@@ -222,7 +217,7 @@ pub trait MessageEmitter: MessageIO {
 			// client-side and connection-context-free: the empty context.
 			let status = self
 				.to_emitter_gate_policy_ref()
-				.evaluate(letter.try_peek()?, &SessionContext::default());
+				.evaluate(Some(letter.try_peek()?), &SessionContext::default());
 			if status != TransitStatus::Ok {
 				return Err(TransportError::from(status));
 			}
@@ -289,10 +284,10 @@ pub trait MessageEmitter: MessageIO {
 		let envelope = TransportEnvelope::Request(RequestPackage { message });
 
 		// Send the envelope
-		self.write_envelope(&envelope.to_der()?).await?;
+		self.write_envelope_bytes(&envelope.to_der()?).await?;
 
 		// Receive response
-		let response_bytes = self.read_envelope().await?;
+		let response_bytes = self.read_envelope_bytes().await?;
 		let response_envelope = Self::decode_envelope(&response_bytes)?;
 
 		// Parse response
@@ -343,7 +338,7 @@ async fn send_single_flight_response<T>(
 	message: Option<Frame>,
 ) -> TransportResult<()>
 where
-	T: MessageIO + ?Sized,
+	T: MessageIO + MaybeSend + ?Sized,
 {
 	let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 	let response_envelope = TransportEnvelope::from(response_pkg);
@@ -353,7 +348,7 @@ where
 	#[cfg(not(feature = "x509"))]
 	let response_bytes = T::encode_envelope(&response_envelope)?;
 
-	transport.write_envelope(&response_bytes).await
+	transport.write_envelope_bytes(&response_bytes).await
 }
 
 /// Everything a message collector must already be.
@@ -389,23 +384,32 @@ pub trait MessageCollector: CollectorRequirements {
 	/// Read and validate a message without sending a response
 	/// Returns the message and the gate evaluation status
 	#[cfg(feature = "transport-policy")]
-	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
-		// Read and decode the envelope (can be overridden for encryption)
-		let decoded_envelope = self.read_decoded_envelope().await?;
-		// Cleartext connections authenticate nothing: empty context.
-		gate_collected_envelope(self, decoded_envelope, &SessionContext::default())
+	fn collect_message(&mut self) -> impl Future<Output = TransportResult<(Arc<Frame>, TransitStatus)>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			// Read and decode the envelope (can be overridden for encryption)
+			let decoded_envelope = self.read_decoded_envelope().await?;
+			// Cleartext connections authenticate nothing: empty context.
+			let session = SessionContext::default();
+			gate_collected_envelope(self, decoded_envelope, &session)
+		}
 	}
 
 	/// Read and validate a message without sending a response
 	/// Returns the message (status is always Ok without policies)
 	#[cfg(not(feature = "transport-policy"))]
-	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
-		let request_envelope = self.read_decoded_envelope().await?;
-		let request = single_flight_frame(request_envelope)?;
+	fn collect_message(&mut self) -> impl Future<Output = TransportResult<(Arc<Frame>, TransitStatus)>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			let request_envelope = self.read_decoded_envelope().await?;
+			let request = single_flight_frame(request_envelope)?;
 
-		Ok((request, TransitStatus::Ok))
+			Ok((request, TransitStatus::Ok))
+		}
 	}
 
 	/// Try to collect next message without blocking on closed connections
@@ -413,17 +417,24 @@ pub trait MessageCollector: CollectorRequirements {
 	/// Returns Ok(None) if connection closed gracefully (EOF).
 	/// Returns Err if connection failed unexpectedly.
 	#[cfg(feature = "transport-policy")]
-	#[allow(async_fn_in_trait)]
-	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
-		// Try to read envelope (returns None on graceful close)
-		let decoded_envelope = match self.try_read_decoded_envelope().await? {
-			Some(envelope) => envelope,
-			None => return Ok(None), // Connection closed gracefully
-		};
+	fn try_collect_message(
+		&mut self,
+	) -> impl Future<Output = TransportResult<Option<(Arc<Frame>, TransitStatus)>>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			// Try to read envelope (returns None on graceful close)
+			let decoded_envelope = match self.try_read_decoded_envelope().await? {
+				Some(envelope) => envelope,
+				None => return Ok(None), // Connection closed gracefully
+			};
 
-		// Cleartext connections authenticate nothing: empty context.
-		let gated = gate_collected_envelope(self, decoded_envelope, &SessionContext::default())?;
-		Ok(Some(gated))
+			// Cleartext connections authenticate nothing: empty context.
+			let session = SessionContext::default();
+			let gated = gate_collected_envelope(self, decoded_envelope, &session)?;
+			Ok(Some(gated))
+		}
 	}
 
 	/// Try to collect next message without blocking on closed connections
@@ -431,47 +442,34 @@ pub trait MessageCollector: CollectorRequirements {
 	/// Returns Ok(None) if connection closed gracefully (EOF).
 	/// Returns Err if connection failed unexpectedly.
 	#[cfg(not(feature = "transport-policy"))]
-	#[allow(async_fn_in_trait)]
-	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
-		// Try to read envelope (returns None on graceful close)
-		let request_envelope = match self.try_read_decoded_envelope().await? {
-			Some(envelope) => envelope,
-			None => return Ok(None), // Connection closed gracefully
-		};
+	fn try_collect_message(
+		&mut self,
+	) -> impl Future<Output = TransportResult<Option<(Arc<Frame>, TransitStatus)>>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			// Try to read envelope (returns None on graceful close)
+			let request_envelope = match self.try_read_decoded_envelope().await? {
+				Some(envelope) => envelope,
+				None => return Ok(None), // Connection closed gracefully
+			};
 
-		let request = single_flight_frame(request_envelope)?;
-		Ok(Some((request, TransitStatus::Ok)))
+			let request = single_flight_frame(request_envelope)?;
+			Ok(Some((request, TransitStatus::Ok)))
+		}
 	}
 
 	/// Send a response for a previously collected message
-	#[allow(async_fn_in_trait)]
-	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		send_single_flight_response(self, status, message).await
-	}
-
-	/// Handle incoming request: collect message, process it, and send response
-	#[allow(async_fn_in_trait)]
-	async fn handle_request(&mut self) -> TransportResult<()> {
-		let (request, status) = match self.collect_message().await {
-			Ok(result) => result,
-			#[cfg(feature = "x509")]
-			Err(TransportError::MissingEncryption) => {
-				// Client sent unencrypted message when encryption required
-				self.send_response(TransitStatus::PermissionDenied, None).await?;
-				return Ok(());
-			}
-			Err(e) => return Err(e),
-		};
-
-		let message = if status == TransitStatus::Ok {
-			// If the gate accepted it, handle the message
-			self.handle_message(request)
-		} else {
-			// If not accepted, no response message
-			None
-		};
-
-		self.send_response(status, message).await
+	fn send_response(
+		&mut self,
+		status: TransitStatus,
+		message: Option<Frame>,
+	) -> impl Future<Output = TransportResult<()>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		send_single_flight_response(self, status, message)
 	}
 
 	/// X509-enabled collect_message with encryption and handshake support
@@ -561,7 +559,7 @@ where
 {
 	// Read wire envelope
 	// Enforce size ceilings
-	let wire_bytes = transport.read_envelope().await?;
+	let wire_bytes = transport.read_envelope_bytes().await?;
 	let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 	match &wire_envelope {
 		WireEnvelope::Cleartext(_) => {
@@ -627,7 +625,7 @@ where
 
 /// Extract the application request from a collected envelope and gate it
 /// with the session's peer context, recording the verdict through
-/// [`gate_inbound_frame`].
+/// [`gate_inbound`].
 #[cfg(feature = "transport-policy")]
 fn gate_collected_envelope<T>(
 	transport: &T,
@@ -638,7 +636,7 @@ where
 	T: MessageCollector + ?Sized,
 {
 	let request = single_flight_frame(envelope)?;
-	let status = gate_inbound_frame(transport.collector_gate(), transport, &request, session);
+	let status = gate_inbound(transport.collector_gate(), transport, Some(request.as_ref()), session);
 
 	Ok((request, status))
 }
@@ -660,7 +658,7 @@ mod tests {
 	struct DenyGate;
 
 	impl GatePolicy for DenyGate {
-		fn evaluate(&self, _: &Frame, _: &SessionContext) -> TransitStatus {
+		fn evaluate(&self, _: Option<&Frame>, _: &SessionContext) -> TransitStatus {
 			TransitStatus::PermissionDenied
 		}
 	}
@@ -678,7 +676,7 @@ mod tests {
 		let audit = AuditProbe(TraceCollector::new());
 		let frame = create_v0_tightbeam(Some("gated"), None);
 
-		let status = gate_inbound_frame(&DenyGate, &audit, &frame, &SessionContext::default());
+		let status = gate_inbound(&DenyGate, &audit, Some(&frame), &SessionContext::default());
 		assert_eq!(status, TransitStatus::PermissionDenied);
 
 		let recorded = audit.0.drain_events();

@@ -8,6 +8,7 @@ use tightbeam::at_least;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 use tightbeam::der::asn1::OctetString;
+use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
@@ -338,6 +339,70 @@ tb_assert_spec! {
 			(TRAFFIC_STRADDLES_KEY_SWITCH, exactly!(1), equals!(true)),
 			(EPOCH_RECEIPT_ROTATES, exactly!(1), equals!(true))
 		]
+	}
+}
+
+pub(crate) const STREAMED_TRAFFIC_STRADDLES_KEY_SWITCH: Urn<'static> =
+	Urn::new("test", "event:rekey/streamed-traffic-straddles-key-switch");
+pub(crate) const STREAMING_EPOCH_RECEIPT_ROTATES: Urn<'static> =
+	Urn::new("test", "event:rekey/streaming-epoch-receipt-rotates");
+
+tb_assert_spec! {
+	pub MuxRekeyStreamingRenewalSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::MUX_REKEY_REQUESTED, at_least!(1)),
+			(events::MUX_REKEY_RENEWED, at_least!(2)),
+			(STREAMED_TRAFFIC_STRADDLES_KEY_SWITCH, exactly!(1), equals!(true)),
+			(STREAMING_EPOCH_RECEIPT_ROTATES, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// Same record watermark as the chunked-traffic renewal, but every
+// request travels through open_stream against serve_streaming: the
+// sink's per-push records and the drain-driven grants must both cross
+// the epoch switch intact.
+tb_scenario! {
+	name: mux_rekey_renewal_survives_streaming_traffic,
+	spec: MuxRekeyStreamingRenewalSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let client_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
+			let server_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
+			let session = establish_mutual_transports(client_offer, server_offer, MutualSessionHooks::default()).await?;
+			let handshake_receipt = session.client.session_receipt();
+			let initial = handshake_receipt.map(|receipt| receipt.to_owned());
+
+			let client_config = MuxEndpointConfig { rekey_limit: Some(100), ..rekey_config() };
+			let client_transport = session.client.with_trace(trace.share());
+			let (client_end, _) = spawn_mux_endpoint_with(client_transport, MuxRole::Client, client_config)?;
+			let server_transport = session.server.with_trace(trace.share());
+			let (_, responder) = spawn_mux_endpoint_with(server_transport, MuxRole::Server, rekey_config())?;
+
+			let chunks_seen = Arc::new(AtomicUsize::new(0));
+			let _serve = tokio::spawn(responder.serve_streaming(streaming_echo_handler(Arc::clone(&chunks_seen))));
+
+			let mut all_echoed = true;
+			for index in 0..20 {
+				let frame = large_mux_frame(&format!("rekey-streaming-{index}"));
+				let payload = frame.to_der()?;
+				let (sink, response) = client_end.handle.open_stream()?;
+				push_split(sink, &payload).await?;
+
+				let echoed = response.await?;
+				all_echoed = all_echoed && is_echo(echoed, &frame);
+			}
+
+			trace.event_with(STREAMED_TRAFFIC_STRADDLES_KEY_SWITCH, &[], all_echoed)?;
+
+			let rotated = await_rotation(&client_end.handle, initial.as_ref()).await;
+			trace.event_with(STREAMING_EPOCH_RECEIPT_ROTATES, &[], rotated.is_some())?;
+
+			Ok(())
+		}
 	}
 }
 

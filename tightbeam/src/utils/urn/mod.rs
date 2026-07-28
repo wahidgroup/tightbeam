@@ -73,7 +73,7 @@ pub use builders::{UrnBuilder, UrnSpecBuilder};
 pub use error::UrnValidationError;
 pub use spec::{UrnComponents, UrnSpec};
 
-use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
+use crate::der::{DecodeValue, EncodeValue, FixedTag, Tag};
 
 /// RFC 8141 compliant URN structure
 ///
@@ -175,10 +175,8 @@ impl<'a> fmt::Display for Urn<'a> {
 }
 
 // DER serialization: Urn is encoded as a UTF8String containing "urn:nid:nss"
-impl<'a> Tagged for Urn<'a> {
-	fn tag(&self) -> Tag {
-		Tag::Utf8String
-	}
+impl<'a> FixedTag for Urn<'a> {
+	const TAG: Tag = Tag::Utf8String;
 }
 
 impl<'a> EncodeValue for Urn<'a> {
@@ -198,7 +196,10 @@ impl<'a> EncodeValue for Urn<'a> {
 	}
 }
 
-impl<'a> DecodeValue<'a> for Urn<'a> {
+// Decoding always produces owned data, so the decoded URN is `'static`
+// regardless of the reader's lifetime. This is what lets derived
+// `Sequence` types carry `Urn<'static>` fields directly.
+impl<'a> DecodeValue<'a> for Urn<'static> {
 	fn decode_value<R: crate::der::Reader<'a>>(
 		reader: &mut R,
 		_header: crate::der::Header,
@@ -221,13 +222,6 @@ impl<'a> DecodeValue<'a> for Urn<'a> {
 
 		// Create owned Cow for static lifetime
 		Ok(Urn { nid: Cow::Owned(nid.to_string()), nss: Cow::Owned(nss.to_string()) })
-	}
-}
-
-impl<'a> Decode<'a> for Urn<'a> {
-	fn decode<R: crate::der::Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
-		let header = reader.peek_header()?;
-		Self::decode_value(reader, header)
 	}
 }
 

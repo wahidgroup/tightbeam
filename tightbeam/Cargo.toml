@@ -149,6 +149,7 @@ colony = [
 	"transport",
 	"transport-ecies",
 	"transport-multiplex",
+	"transport-policy",
 	"x509",
 	"signature",
 	"digest",

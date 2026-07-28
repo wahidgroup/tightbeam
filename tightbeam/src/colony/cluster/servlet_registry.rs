@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use super::error::ClusterError;
 use super::SharedId;
+use crate::colony::common::MAX_PHEROMONE;
 use crate::utils::BasisPoints;
 
 // ============================================================================
@@ -29,7 +30,6 @@ pub const DEFAULT_EVAPORATION_RATE_BPS: u16 = 1000; // 10% per interval
 pub const DEFAULT_EVAPORATION_INTERVAL_SECS: u64 = 30;
 pub const DEFAULT_INITIAL_PHEROMONE: u64 = 5000; // 50% of max
 pub const DEFAULT_ABANDONMENT_LIMIT: u32 = 5;
-pub const MAX_PHEROMONE: u64 = 10000; // 100% (basis points)
 
 /// Configuration for pheromone-based servlet tracking
 #[derive(Debug, Clone)]
@@ -373,7 +373,16 @@ impl ServletRegistry {
 		for addr in removed {
 			match self.remove(addr) {
 				Ok(Some(entry)) => removed_entries.push(entry),
-				Ok(None) => {}
+				Ok(None) => {
+					for entry in removed_entries {
+						let _ = self.add(entry);
+					}
+					for applied in &applied_addrs {
+						let _ = self.remove(applied);
+					}
+
+					return Err(ClusterError::ServletNotFound);
+				}
 				Err(err) => {
 					for entry in removed_entries {
 						let _ = self.add(entry);
@@ -680,6 +689,7 @@ mod tests {
 		const VICTIM: &[&[u8]] = &[b"victim"];
 		const OLD: &[&[u8]] = &[b"old"];
 		const NEW: &[&[u8]] = &[b"new"];
+		const MISSING: &[&[u8]] = &[b"ghost"];
 
 		vec![
 			ApplyAddressUpdateCase {
@@ -697,6 +707,16 @@ mod tests {
 				remove: OLD,
 				expect_ok: true,
 				expected_addrs: NEW,
+			},
+			// A remove naming an absent locator must refuse: Ok(None) must
+			// not report success while the seeded route stays routed.
+			ApplyAddressUpdateCase {
+				seed: (b"victim", b"calc", b"hive-a"),
+				caller_hive: b"hive-a",
+				add: None,
+				remove: MISSING,
+				expect_ok: false,
+				expected_addrs: VICTIM,
 			},
 		]
 	}

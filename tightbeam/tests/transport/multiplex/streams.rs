@@ -13,13 +13,13 @@ use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, ScenarioConf, SetupEnv};
 use tightbeam::transport::envelopes::MuxEnvelope;
-use tightbeam::transport::{EnvelopeSource, MessageCollector, ResponseHandler, TransportEnvelope};
+use tightbeam::transport::{EnvelopeSource, TransportEnvelope};
 use tightbeam::utils::urn::Urn;
 use tightbeam::Frame;
 
 use crate::common::security::ServerMaterials;
 use crate::transport::support::{
-	await_ok, bind_encrypted_listener, join_task, mux_frame, mux_offer, record_spawned_event,
+	await_ok, bind_encrypted_listener, join_task, mux_frame, mux_offer, record_spawned_event, respond_echo,
 };
 
 use super::common::*;
@@ -209,10 +209,7 @@ tb_scenario! {
 				client.negotiated_mux().is_none(),
 			)?;
 
-			let server_task = tokio::spawn(async move {
-				let mut transport = server.with_handler(Some);
-				transport.handle_request().await
-			});
+			let server_task = tokio::spawn(respond_echo(server));
 
 			let (_reader, mut writer) = client.into_split()?;
 			write_muxed_request(&mut writer, 1, mux_frame("mux-rogue")).await?;

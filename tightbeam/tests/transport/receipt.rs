@@ -568,7 +568,7 @@ tb_scenario! {
 				client_result.is_ok(),
 			)?;
 
-			let first_read = client.read_envelope().await;
+			let first_read = client.read_envelope_bytes().await;
 			trace.event_with(
 				CLIENT_SESSION_DEAD_ON_FIRST_USE,
 				&[],

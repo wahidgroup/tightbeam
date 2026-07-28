@@ -204,7 +204,11 @@ struct SignatureGate {
 }
 
 impl GatePolicy for SignatureGate {
-	fn evaluate(&self, frame: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+		let Some(frame) = frame else {
+			return TransitStatus::PermissionDenied;
+		};
+
 		if frame.verify::<Secp256k1Signature, Sha3_256>(&self.verifying_key).is_ok() {
 			TransitStatus::Ok
 		} else {

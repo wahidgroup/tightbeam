@@ -49,6 +49,12 @@ use crate::TightBeamError;
 use crate::trace::TraceCollector;
 #[cfg(feature = "tokio")]
 use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::utils::marker::MaybeSend;
 
 /// Fallback envelope read cap when no explicit limit is configured.
 const DEFAULT_MAX_ENVELOPE: usize = 512 * 1024;
@@ -346,6 +352,20 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TokioListener<P> {
 #[cfg(feature = "x509")]
 impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
+where
+	TransportError: From<S::Error>,
+{
+	/// Report whether the underlying stream still appears connected.
+	///
+	/// The liveness hook external protocols need to implement
+	/// [`PersistentConnection`](crate::transport::PersistentConnection)
+	/// for pooled connections; the stream itself is not exposed.
+	pub fn is_alive(&self) -> bool {
+		AsyncProtocolStream::is_alive(&self.stream)
+	}
+}
+
 #[cfg(feature = "x509")]
 impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
 where
@@ -372,7 +392,7 @@ where
 ))]
 mod mux {
 	pub(crate) use crate::transport::io::take_rekey_context;
-	pub use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxRekeyContext, MuxRole};
+	pub use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxRekeyContext, MuxRole, MuxTransport};
 
 	#[cfg(feature = "transport-policy")]
 	pub(crate) use crate::transport::messaging::{collect_step, CollectStep};
@@ -406,6 +426,57 @@ where
 	}
 }
 
+/// Multiplexed plane assembled by [`TcpTransport::into_mux`].
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub type SplitMuxTransport<S> = MuxTransport<
+	TransportReader<<S as SplittableStream>::ReadHalf>,
+	TransportWriter<<S as SplittableStream>::WriteHalf>,
+>;
+
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+impl<S> TcpTransport<S>
+where
+	S: SplittableStream,
+	TransportError: From<S::Error>,
+{
+	/// Consume a handshaken transport into its multiplexed plane:
+	/// negotiated settings drive the assembly, in-band rekey wiring
+	/// attaches when the session carries a dual-signed receipt, and
+	/// the halves split for the mux drivers.
+	///
+	/// Role-fixed: callers pass the endpoint role they are assembling.
+	/// Unlike the [`MuxConnector`] / `MuxAcceptor` pool traits, this
+	/// works for either role without the policy plane, so WebSocket
+	/// transports (native and wasm) assemble the same way.
+	///
+	/// # Errors
+	/// - `InvalidState`: the peer did not negotiate multiplexing, or
+	///   the handshake has not completed
+	/// - rekey harvest / split failures from the underlying transport
+	pub fn into_mux(mut self, role: MuxRole) -> TransportResult<SplitMuxTransport<S>> {
+		let Some(settings) = self.negotiated_mux() else {
+			return Err(TransportError::InvalidState);
+		};
+		let rekey = take_rekey_context(&mut self, role)?;
+		let (reader, writer) = self.into_split()?;
+
+		let mut mux = MuxTransport::new(reader, writer, role, settings);
+		if let Some(context) = rekey {
+			mux = mux.with_rekey(context);
+		}
+
+		Ok(mux)
+	}
+}
+
 #[cfg(all(
 	feature = "x509",
 	feature = "transport-multiplex",
@@ -432,8 +503,8 @@ where
 impl<S> MuxConnector for TcpTransport<S>
 where
 	S: SplittableStream,
-	S::ReadHalf: Send + 'static,
-	S::WriteHalf: Send + 'static,
+	S::ReadHalf: MaybeSend + 'static,
+	S::WriteHalf: MaybeSend + 'static,
 	TransportError: From<S::Error>,
 {
 	type EnvelopeReader = TransportReader<S::ReadHalf>;
@@ -454,15 +525,14 @@ where
 
 #[cfg(all(
 	feature = "x509",
-	feature = "transport-policy",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 impl<S> MuxAcceptor for TcpTransport<S>
 where
 	S: SplittableStream,
-	S::ReadHalf: Send + 'static,
-	S::WriteHalf: Send + 'static,
+	S::ReadHalf: MaybeSend + 'static,
+	S::WriteHalf: MaybeSend + 'static,
 	TransportError: From<S::Error>,
 {
 	type EnvelopeReader = TransportReader<S::ReadHalf>;
@@ -491,14 +561,20 @@ where
 		take_rekey_context(self, MuxRole::Server)
 	}
 
+	#[cfg(feature = "transport-policy")]
 	fn session_context(&self) -> SessionContext {
 		SessionContext::capture(self)
 	}
 
+	#[cfg(feature = "transport-policy")]
 	fn into_gated_halves(mut self) -> TransportResult<GatedHalves<Self>> {
 		let gate = Box::new(core::mem::take(&mut self.collector_gate));
 		let halves = self.into_split()?;
 		Ok((gate, halves))
+	}
+
+	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)> {
+		self.into_split()
 	}
 }
 
@@ -885,27 +961,21 @@ where
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
+	/// Delegates to the inherent accept so both entry points install the
+	/// full listener state.
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
-		let (stream, peer_addr) = self.listener.accept().await?;
-		let tokio_stream = TokioStream::from(stream);
-		let mut transport = Self::create_transport(tokio_stream);
-
 		#[cfg(feature = "x509")]
-		if let Some(ref cert) = self.certificate {
-			transport.server_identity = Some(Arc::clone(cert));
+		{
+			let (transport, peer_addr) = TokioListener::<P>::accept(self).await?;
+			Ok((transport, TightBeamSocketAddr(peer_addr)))
 		}
 
-		#[cfg(feature = "x509")]
-		if let Some(ref signatory) = self.key_manager {
-			transport.key_manager = Some(Arc::clone(signatory));
+		#[cfg(not(feature = "x509"))]
+		{
+			let (stream, peer_addr) = TokioListener::<P>::accept(self).await?;
+			let transport = Self::create_transport(stream);
+			Ok((transport, TightBeamSocketAddr(peer_addr)))
 		}
-
-		#[cfg(feature = "x509")]
-		if let Some(timeout) = self.handshake_timeout {
-			transport.handshake_timeout = timeout;
-		}
-
-		Ok((transport, TightBeamSocketAddr(peer_addr)))
 	}
 }
 
@@ -916,7 +986,7 @@ impl<S: AsyncProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
-	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
+	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 		#[cfg(feature = "x509")]
 		let max_len = if self.is_handshake_pending() {
 			Some(HANDSHAKE_MAX_WIRE)
@@ -990,7 +1060,7 @@ where
 		}
 	}
 
-	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()> {
+	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		#[cfg(all(feature = "tokio", feature = "transport-policy"))]
 		if let Some(dur) = self.operation_timeout {
 			timeout(dur, self.stream.write_frame(buffer)).await??;
@@ -1038,7 +1108,7 @@ where
 		let wire_envelope = builder.build()?;
 		let wire_bytes = wire_envelope.to_der()?;
 
-		self.write_envelope(&wire_bytes).await?;
+		self.write_envelope_bytes(&wire_bytes).await?;
 		Ok(())
 	}
 }
@@ -1089,7 +1159,7 @@ where
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		AsyncProtocolStream::is_alive(&transport.stream)
+		transport.is_alive()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {
@@ -1120,9 +1190,25 @@ mod tests {
 	use crate::testing::*;
 	use crate::transport::handshake::{HandshakeError, HandshakeKeyManager, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
-	use crate::transport::{
-		MessageCollector, MessageEmitter, ResponseHandler, TransportEncryptionConfig, X509ClientConfig,
-	};
+	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig, X509ClientConfig};
+
+	/// Serve one single-flight request: collect, apply `reply` to an
+	/// accepted frame, answer with the gate's status.
+	#[cfg(feature = "x509")]
+	async fn respond_with<T, F>(transport: &mut T, reply: F) -> TransportResult<()>
+	where
+		T: MessageCollector + Send,
+		F: Fn(Frame) -> Option<Frame>,
+	{
+		let (request, status) = transport.collect_message().await?;
+		let frame = Arc::try_unwrap(request).unwrap_or_else(|shared| (*shared).clone());
+		let message = match status {
+			crate::policy::TransitStatus::Ok => reply(frame),
+			_ => None,
+		};
+
+		transport.send_response(status, message).await
+	}
 
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	use crate::policy::{SessionContext, TransitStatus};
@@ -1270,13 +1356,12 @@ mod tests {
 		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
 		let response_frame = expected_response.to_owned();
 		let server_handle = tokio::spawn(async move {
-			let (transport, _peer) = listener.accept().await?;
-			let handler = Box::new(move |msg: Frame| {
+			let (mut transport, _peer) = listener.accept().await?;
+			respond_with(&mut transport, move |msg: Frame| {
 				let _ = received_tx.try_send(msg);
 				Some(response_frame.to_owned())
-			});
-			let mut transport = transport.with_handler(handler);
-			transport.handle_request().await
+			})
+			.await
 		});
 
 		let mut transport = tcp_transport_from(client_stream);
@@ -1345,7 +1430,7 @@ mod tests {
 	) -> tokio::task::JoinHandle<TransportResult<()>> {
 		tokio::spawn(async move {
 			let (mut transport, _peer) = listener.accept().await?;
-			transport.handle_request().await
+			respond_with(&mut transport, |_| None).await
 		})
 	}
 
@@ -1417,12 +1502,11 @@ mod tests {
 			let (mut transport, _peer) = listener.accept().await?;
 			transport.handshake_protocol_kind = HandshakeProtocolKind::Cms;
 
-			let handler = Box::new(move |msg: Frame| {
+			respond_with(&mut transport, move |msg: Frame| {
 				let _ = received_tx.try_send(msg);
 				Some(response_frame.to_owned())
-			});
-			let mut transport = transport.with_handler(handler);
-			transport.handle_request().await
+			})
+			.await
 		});
 
 		let client_key = SigningKey::from_bytes(&[2u8; 32].into()).map_err(|_| TransportError::InvalidState)?;
@@ -1504,7 +1588,7 @@ mod tests {
 		}
 
 		impl GatePolicy for BusyFirstGate {
-			fn evaluate(&self, _msg: &Frame, _session: &SessionContext) -> TransitStatus {
+			fn evaluate(&self, _msg: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
 				if self.first.swap(false, Ordering::SeqCst) {
 					TransitStatus::ResourceExhausted
 				} else {
@@ -1520,16 +1604,16 @@ mod tests {
 		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(2);
 		let server_handle = tokio::spawn(async move {
 			let (transport, _peer) = listener.accept().await?;
-			let handler = Box::new(move |msg: Frame| {
+			let echo = move |msg: Frame| {
 				let _ = received_tx.try_send(msg.to_owned());
 				Some(msg)
-			});
+			};
 
 			let gate = BusyFirstGate::new();
-			let mut transport = transport.with_collector_gate(gate).with_handler(handler);
+			let mut transport = transport.with_collector_gate(gate);
 
-			transport.handle_request().await?;
-			transport.handle_request().await
+			respond_with(&mut transport, &echo).await?;
+			respond_with(&mut transport, &echo).await
 		});
 
 		let trust_store = trust_store_for(cert)?;

@@ -9,7 +9,7 @@ macro_rules! policy {
 			#[allow(unused_variables)]
 			fn evaluate(
 				&self,
-				$frame: &$crate::Frame,
+				$frame: ::core::option::Option<&$crate::Frame>,
 				$session: &$crate::policy::SessionContext,
 			) -> $crate::policy::TransitStatus {
 				$($body)*
@@ -26,7 +26,7 @@ macro_rules! policy {
 			#[allow(unused_variables)]
 			fn evaluate(
 				&self,
-				$arg: &$crate::Frame,
+				$arg: ::core::option::Option<&$crate::Frame>,
 				_session: &$crate::policy::SessionContext,
 			) -> $crate::policy::TransitStatus {
 				$($body)*
@@ -43,7 +43,7 @@ macro_rules! policy {
 			#[allow(unused_variables)]
 			fn evaluate(
 				&self,
-				frame: &$crate::Frame,
+				frame: ::core::option::Option<&$crate::Frame>,
 				_session: &$crate::policy::SessionContext,
 			) -> $crate::policy::TransitStatus {
 				$($body)*
@@ -197,10 +197,13 @@ mod tests {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
 		assert_eq!(
-			TestGateBusy.evaluate(&frame, &SessionContext::default()),
+			TestGateBusy.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::ResourceExhausted
 		);
-		assert_eq!(TestGateAccept.evaluate(&frame, &SessionContext::default()), TransitStatus::Ok);
+		assert_eq!(
+			TestGateAccept.evaluate(Some(&frame), &SessionContext::default()),
+			TransitStatus::Ok
+		);
 
 		Ok(())
 	}
@@ -211,7 +214,7 @@ mod tests {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
 		assert_eq!(
-			TestGateSessionAware.evaluate(&frame, &SessionContext::default()),
+			TestGateSessionAware.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::Unauthenticated
 		);
 
@@ -231,7 +234,7 @@ mod tests {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
 		assert_eq!(
-			TestGateImplicitArg.evaluate(&frame, &SessionContext::default()),
+			TestGateImplicitArg.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::Ok
 		);
 		assert_eq!(TestReceptorImplicitArg.evaluate(&DummyMessage { value: 42 }), TransitStatus::Ok);

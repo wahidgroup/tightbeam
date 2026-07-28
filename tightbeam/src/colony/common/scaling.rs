@@ -4,6 +4,7 @@
 
 use core::time::Duration;
 
+use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 
 /// Default scale-up cooldown (30 seconds)
@@ -51,8 +52,8 @@ impl Default for ServletScaleConf {
 /// Input message to the scaling worker
 #[derive(Debug, Clone)]
 pub struct ScalingMetrics {
-	/// Servlet type being evaluated
-	pub servlet_type: Vec<u8>,
+	/// Type URN of the servlet being evaluated
+	pub servlet_type: Urn<'static>,
 	/// Current utilization in basis points (0-10000)
 	pub utilization: BasisPoints,
 	/// Current instance count

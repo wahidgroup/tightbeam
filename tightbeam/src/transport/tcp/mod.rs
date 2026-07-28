@@ -179,7 +179,6 @@ macro_rules! impl_tcp_common {
 			P: $crate::crypto::profiles::CryptoProvider = $crate::crypto::profiles::DefaultCryptoProvider,
 		> {
 			pub(crate) stream: S,
-			pub(crate) handler: Option<Box<dyn Fn($crate::Frame) -> Option<$crate::Frame> + Send + Sync>>,
 			#[cfg(feature = "transport-policy")]
 			pub(crate) restart_policy: Box<dyn $crate::transport::policy::RestartPolicy>,
 			#[cfg(feature = "transport-policy")]
@@ -247,7 +246,6 @@ macro_rules! impl_tcp_common {
 			fn from(stream: S) -> Self {
 				Self {
 					stream,
-					handler: None,
 					#[cfg(feature = "transport-policy")]
 					restart_policy: Box::new($crate::transport::policy::NoRestart),
 					#[cfg(feature = "transport-policy")]
@@ -323,23 +321,6 @@ macro_rules! impl_tcp_common {
 			/// attached.
 			pub fn trace(&self) -> Option<$crate::trace::TraceCollector> {
 				self.trace.as_ref().map($crate::trace::TraceCollector::share)
-			}
-		}
-
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::ResponseHandler for $transport<S, P>
-		where
-			TransportError: From<S::Error>,
-		{
-			fn with_handler<F>(mut self, handler: F) -> Self
-			where
-				F: Fn($crate::Frame) -> Option<$crate::Frame> + Send + Sync + 'static,
-			{
-				self.handler = Some(Box::new(handler));
-				self
-			}
-
-			fn handler(&self) -> Option<&(dyn Fn($crate::Frame) -> Option<$crate::Frame> + Send + Sync)> {
-				self.handler.as_ref().map(|h| h.as_ref())
 			}
 		}
 

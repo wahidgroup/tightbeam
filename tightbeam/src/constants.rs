@@ -272,7 +272,8 @@ pub const DEFAULT_MUX_CREDIT_UNIT: u32 = 1024;
 /// The initial window bounds receive-side reassembly memory per stream
 /// (`window * chunk size`). An absurd advertisement cannot inflate that
 /// bound (CWE-770). Grants may raise a live stream's absolute limit past
-/// the initial window as reassembly drains.
+/// the initial window while bytes remain under
+/// [`MAX_MUX_REASSEMBLY_BYTES`].
 pub const MAX_MUX_STREAM_CREDIT: u64 = 4096;
 
 /// Default initial per-stream chunk credit window
@@ -302,3 +303,10 @@ pub const MAX_MUX_SESSION_BUDGET: u64 = DEFAULT_REKEY_RECORD_LIMIT / 2;
 /// a decompression bomb (CWE-409). Override per inflator via
 /// `ZstdCompression::with_max_output`.
 pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
+
+/// Hard ceiling on unary mux reassembly buffer bytes per stream
+///
+/// Credit grants may raise the chunk window, but accepted payload bytes
+/// must never exceed this bound (CWE-770). Aligns with
+/// [`DEFAULT_MAX_DECOMPRESSED_LEN`].
+pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;

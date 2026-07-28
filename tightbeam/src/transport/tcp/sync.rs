@@ -96,7 +96,7 @@ impl<S: ProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
-	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
+	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 		let handshake_pending = self.is_handshake_pending();
 
 		// Absolute deadline for the whole envelope read. Every stage below
@@ -214,7 +214,7 @@ where
 		result
 	}
 
-	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()> {
+	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		#[cfg(feature = "std")]
 		if let Some(timeout) = self.operation_timeout {
 			self.stream.set_timeout(Some(timeout))?;
@@ -265,7 +265,7 @@ where
 
 		let wire_envelope = builder.build()?;
 		let wire_bytes = wire_envelope.to_der()?;
-		self.write_envelope(&wire_bytes).await
+		self.write_envelope_bytes(&wire_bytes).await
 	}
 }
 
@@ -479,6 +479,14 @@ mod tests {
 	use crate::testing::*;
 	use crate::transport::policy::PolicyConf;
 
+	/// Serve one single-flight request with an empty reply, answering
+	/// with the gate's status.
+	#[cfg(not(feature = "x509"))]
+	async fn respond_none<T: MessageCollector>(transport: &mut T) -> TransportResult<()> {
+		let (_request, status) = transport.collect_message().await?;
+		transport.send_response(status, None).await
+	}
+
 	#[cfg(not(feature = "x509"))]
 	#[tokio::test]
 	async fn test_tcp_transport_emit_collect() -> TransportResult<()> {
@@ -493,7 +501,7 @@ mod tests {
 			let mut transport = server.accept()?;
 
 			let rt = tokio::runtime::Runtime::new()?;
-			rt.block_on(transport.handle_request())?;
+			rt.block_on(respond_none(&mut transport))?;
 			Ok(())
 		});
 
@@ -530,7 +538,7 @@ mod tests {
 
 			let rt = tokio::runtime::Runtime::new()?;
 			let started = Instant::now();
-			let result = rt.block_on(transport.read_envelope());
+			let result = rt.block_on(transport.read_envelope_bytes());
 			Ok((result, started.elapsed()))
 		});
 
@@ -577,7 +585,7 @@ mod tests {
 		}
 
 		impl GatePolicy for BusyFirstGate {
-			fn evaluate(&self, _msg: &Frame, _session: &SessionContext) -> TransitStatus {
+			fn evaluate(&self, _msg: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
 				if self.first.swap(false, Ordering::SeqCst) {
 					TransitStatus::ResourceExhausted
 				} else {
@@ -597,10 +605,8 @@ mod tests {
 			let mut transport = server.accept()?.with_collector_gate(BusyFirstGate::new());
 
 			let rt = tokio::runtime::Runtime::new()?;
-
-			rt.block_on(transport.handle_request()).ok();
-
-			rt.block_on(transport.handle_request())?;
+			rt.block_on(respond_none(&mut transport)).ok();
+			rt.block_on(respond_none(&mut transport))?;
 			Ok(())
 		});
 

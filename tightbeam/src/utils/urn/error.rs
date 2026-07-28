@@ -31,6 +31,10 @@ pub enum UrnValidationError {
 	#[cfg_attr(feature = "derive", error("NID does not match spec"))]
 	NidMismatch,
 
+	/// Realm segment does not match the namespace's realm
+	#[cfg_attr(feature = "derive", error("Realm does not match namespace"))]
+	RealmMismatch,
+
 	/// NID length is invalid (must be 2-32 characters)
 	#[cfg_attr(feature = "derive", error("Invalid NID length: must be 2-32 characters"))]
 	InvalidNidLength,
@@ -61,6 +65,7 @@ impl fmt::Display for UrnValidationError {
 			}
 			Self::ForbiddenFieldPresent(field) => write!(f, "Forbidden field present: {field}"),
 			Self::NidMismatch => write!(f, "NID does not match spec"),
+			Self::RealmMismatch => write!(f, "Realm does not match namespace"),
 			Self::InvalidNidLength => write!(f, "Invalid NID length: must be 2-32 characters"),
 			Self::InvalidNidStart => write!(f, "Invalid NID: must start with a letter"),
 			Self::InvalidNidCharacters => {

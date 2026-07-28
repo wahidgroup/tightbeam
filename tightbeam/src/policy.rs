@@ -173,8 +173,20 @@ impl SessionContext {
 /// connection's [`SessionContext`]: identity-blind gates ignore it,
 /// identity gates (black/white lists, receipt checks) key on it. Sites
 /// without authenticated facts pass the empty context.
+///
+/// `message` is [`None`] when the stream kind has no request frame at dispatch
+/// (mux streaming / duplex). Choose the `None` verdict by gate class:
+/// - Session / capacity gates (peer lists, backpressure): ignore the
+///   frame and key on `session` or shared state.
+/// - Optional integrity (e.g. [`FrameIntegrityGate`]): return
+///   [`TransitStatus::Ok`] when no frame exists.
+/// - Auth that requires a signed or intact frame: fail closed with
+///   [`TransitStatus::Unauthenticated`] or [`TransitStatus::PermissionDenied`].
+///
+/// Streaming authz belongs on session facts (mutual TLS, peer lists).
+/// Frame-content rules alone do not protect stream opens.
 pub trait GatePolicy: Send + Sync {
-	fn evaluate(&self, message: &Frame, session: &SessionContext) -> TransitStatus;
+	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus;
 }
 
 /// Policy trait a user implements to decide message acceptance.
@@ -227,7 +239,7 @@ where
 pub struct AcceptAllGate;
 
 impl GatePolicy for AcceptAllGate {
-	fn evaluate(&self, _: &Frame, _: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, _: Option<&Frame>, _: &SessionContext) -> TransitStatus {
 		TransitStatus::Ok
 	}
 }
@@ -254,7 +266,7 @@ impl GateChain {
 }
 
 impl GatePolicy for GateChain {
-	fn evaluate(&self, message: &Frame, session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		self.gates
 			.iter()
 			.map(|gate| gate.evaluate(message, session))
@@ -285,7 +297,12 @@ impl<D> GatePolicy for FrameIntegrityGate<D>
 where
 	D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
 {
-	fn evaluate(&self, message: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+		// Optional integrity: no request frame means nothing to check.
+		let Some(message) = message else {
+			return TransitStatus::Ok;
+		};
+
 		match message.verify_frame_integrity::<D>() {
 			Ok(true) => TransitStatus::Ok,
 			_ => TransitStatus::PermissionDenied,
@@ -301,7 +318,7 @@ where
 #[derive(Debug, Clone)]
 pub struct GateMiddleware<G: GatePolicy, F>
 where
-	F: Fn(&Frame, &TransitStatus) + Send + Sync,
+	F: Fn(Option<&Frame>, &TransitStatus) + Send + Sync,
 {
 	inner: G,
 	observer: F,
@@ -309,7 +326,7 @@ where
 
 impl<G: GatePolicy, F> GateMiddleware<G, F>
 where
-	F: Fn(&Frame, &TransitStatus) + Send + Sync,
+	F: Fn(Option<&Frame>, &TransitStatus) + Send + Sync,
 {
 	/// Create a new middleware wrapper around a gate policy.
 	///
@@ -323,9 +340,9 @@ where
 
 impl<G: GatePolicy, F> GatePolicy for GateMiddleware<G, F>
 where
-	F: Fn(&Frame, &TransitStatus) + Send + Sync,
+	F: Fn(Option<&Frame>, &TransitStatus) + Send + Sync,
 {
-	fn evaluate(&self, message: &Frame, session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		let status = self.inner.evaluate(message, session);
 
 		// Observe the evaluation (transparent)
@@ -347,7 +364,7 @@ mod tests {
 	struct StaticGate(TransitStatus);
 
 	impl GatePolicy for StaticGate {
-		fn evaluate(&self, _: &Frame, _: &SessionContext) -> TransitStatus {
+		fn evaluate(&self, _: Option<&Frame>, _: &SessionContext) -> TransitStatus {
 			self.0
 		}
 	}
@@ -355,7 +372,7 @@ mod tests {
 	struct ProbeGate(Arc<AtomicBool>);
 
 	impl GatePolicy for ProbeGate {
-		fn evaluate(&self, _: &Frame, _: &SessionContext) -> TransitStatus {
+		fn evaluate(&self, _: Option<&Frame>, _: &SessionContext) -> TransitStatus {
 			self.0.store(true, Ordering::SeqCst);
 			TransitStatus::Ok
 		}
@@ -365,7 +382,7 @@ mod tests {
 	fn empty_chain_accepts() {
 		let chain = GateChain::default();
 		assert!(matches!(
-			chain.evaluate(&create_frame_with_frame_integrity(), &SessionContext::default()),
+			chain.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default()),
 			TransitStatus::Ok
 		));
 	}
@@ -377,7 +394,7 @@ mod tests {
 			.with(StaticGate(TransitStatus::ResourceExhausted))
 			.with(StaticGate(TransitStatus::PermissionDenied));
 		assert!(matches!(
-			chain.evaluate(&create_frame_with_frame_integrity(), &SessionContext::default()),
+			chain.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default()),
 			TransitStatus::ResourceExhausted
 		));
 	}
@@ -389,7 +406,7 @@ mod tests {
 			.with(StaticGate(TransitStatus::PermissionDenied))
 			.with(ProbeGate(Arc::clone(&evaluated)));
 
-		let _ = chain.evaluate(&create_frame_with_frame_integrity(), &SessionContext::default());
+		let _ = chain.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default());
 		assert!(!evaluated.load(Ordering::SeqCst));
 	}
 
@@ -397,7 +414,7 @@ mod tests {
 	fn accepts_intact_frame() {
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
 		assert!(matches!(
-			gate.evaluate(&create_frame_with_frame_integrity(), &SessionContext::default()),
+			gate.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default()),
 			TransitStatus::Ok
 		));
 	}
@@ -409,7 +426,7 @@ mod tests {
 
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
 		assert!(matches!(
-			gate.evaluate(&frame, &SessionContext::default()),
+			gate.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::PermissionDenied
 		));
 	}
@@ -421,9 +438,15 @@ mod tests {
 
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
 		assert!(matches!(
-			gate.evaluate(&frame, &SessionContext::default()),
+			gate.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::PermissionDenied
 		));
 		Ok(())
+	}
+
+	#[test]
+	fn session_path_skips_frame_integrity() {
+		let gate = FrameIntegrityGate::<Sha3_256>::default();
+		assert!(matches!(gate.evaluate(None, &SessionContext::default()), TransitStatus::Ok));
 	}
 }

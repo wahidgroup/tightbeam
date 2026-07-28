@@ -1292,11 +1292,11 @@ Policies control message flow without modifying transport logic:
 
 ```rust
 pub trait GatePolicy: Send + Sync {
-	fn evaluate(&self, frame: &Frame, session: &SessionContext) -> TransitStatus;
+	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus;
 }
 ```
 
-Every evaluation carries the connection's `SessionContext`: identity-blind gates ignore it, identity gates key on it. Sites without authenticated facts, such as cleartext connections, client-side emit paths, in-process evaluation, pass the empty (default) context, whose accessors all answer `None`.
+Every evaluation carries the connection's `SessionContext`: identity-blind gates ignore it, identity gates key on it. Sites without authenticated facts, such as cleartext connections, client-side emit paths, in-process evaluation, pass the empty (default) context, whose accessors all answer `None`. `frame` is `None` for mux streaming and duplex opens that have no request frame at dispatch. Session and capacity gates still run; optional integrity gates skip (`Ok`); auth that needs a signed or intact frame fails closed. Streaming authz belongs on session facts (mutual TLS, peer lists), not frame-content rules alone.
 
 **ReceptorPolicy Trait:**
 
@@ -1443,7 +1443,12 @@ let restart = RestartExponentialBackoff::new(4, 1000, None);
 
 ```rust
 tightbeam::policy! {
+	// Frame-content gate: fail closed when no request frame exists
+	// (mux streaming / duplex). Pair with a session gate for stream opens.
 	GatePolicy: OnlyApiMessages |frame| {
+		let Some(frame) = frame else {
+			return TransitStatus::PermissionDenied;
+		};
 		if frame.metadata.id.starts_with(b"api-") {
 			TransitStatus::Ok
 		} else {
@@ -1451,9 +1456,8 @@ tightbeam::policy! {
 		}
 	}
 
-	// Two-argument arm: session-aware gates receive the connection's
-	// authenticated peer context.
-	GatePolicy: MutualAuthOnly |frame, session| {
+	// Session-aware arm: streaming and duplex opens key on peer identity.
+	GatePolicy: MutualAuthOnly |_frame, session| {
 		if session.peer_certificate().is_some() {
 			TransitStatus::Ok
 		} else {
@@ -2795,11 +2799,9 @@ let hive_conf = HiveConf {
 };
 ```
 
-##### Load Balancing and Routing
+##### Load Balancing
 
-When a hive manages multiple servlet instances of the same type (for scaling), it uses a `LoadBalancer` to select which instance handles each request. The default `LeastLoaded` strategy routes to the instance with lowest utilization.
-
-The `MessageRouter` determines which servlet type handles a given message. The default `TypeBasedRouter` uses the message's type information for routing.
+A hive resolves each servlet type to a single instance address, so it carries no balancer. Selecting among a type's replicas is the cluster gateway's job: see [Cluster load balancing](#load-balancing-1). Within a hive, message-to-type dispatch is derived directly from the message type.
 
 ##### TLS Configuration
 
@@ -2823,9 +2825,7 @@ When `hive_tls` is set, the hive control server binds with TLS and outbound cont
 ##### HiveConf Reference
 
 ```rust
-pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedRouter> {
-	pub load_balancer: L,
-	pub router: R,
+pub struct HiveConf {
 	pub default_scale: ServletScaleConf,
 	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
 	pub cooldown: Duration,                         // Default: 5s
@@ -2973,7 +2973,7 @@ The `on_heartbeat` callback enables monitoring and metrics collection:
 
 ##### Load Balancing
 
-When multiple hives support the same servlet type, the cluster uses a `LoadBalancer` to select one. The default is `LeastLoaded`, which routes to the hive with the lowest reported utilization. Other strategies include `RoundRobin` and `PowerOfTwoChoices`. Custom strategies can be created by implementing the `LoadBalancer` trait.
+When multiple instances support the same servlet type, the cluster uses a `LoadBalancer` to select one. The default `StochasticForager` is a pheromone-based swarm strategy: it draws each instance with probability proportional to its trail strength, keeps an exploration floor so no instance is starved, and applies termite-style repellency so no instance is monopolized. Alternative strategies (`RoundRobin`, `PowerOfTwoChoices`) and any custom `LoadBalancer` are pluggable via `ClusterConf::builder(..).with_load_balancer(..)`.
 
 ##### Work Request Flow
 
@@ -3005,9 +3005,10 @@ match response.status {
 ##### ClusterConf Reference
 
 ```rust
-pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
-	/// Load balancing strategy for distributing work across hives
-	pub load_balancer: L,
+pub struct ClusterConf {
+	/// Load balancing strategy for distributing work across instances
+	/// (defaults to `StochasticForager`; pluggable via the builder)
+	pub load_balancer: Arc<dyn LoadBalancer>,
 	/// Heartbeat configuration
 	pub heartbeat: HeartbeatConf,
 	/// Pheromone configuration for bio-inspired routing

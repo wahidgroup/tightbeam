@@ -21,3 +21,11 @@ pub mod x509;
 	feature = "transport"
 ))]
 pub mod security;
+
+#[cfg(all(
+	feature = "x509",
+	feature = "secp256k1",
+	feature = "signature",
+	feature = "tokio"
+))]
+pub mod laser;

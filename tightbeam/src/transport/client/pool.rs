@@ -68,12 +68,14 @@ macro_rules! pooled_mux {
 }
 
 pooled_mux! {
+	use core::future::Future;
 	use core::sync::atomic::AtomicU64;
 	use std::sync::{Mutex, PoisonError};
 
 	use crate::runtime::rt;
+	use crate::utils::marker::MaybeSend;
 	use crate::transport::handshake::receipt::StoredReceipt;
-	use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxHandle, MuxRole};
+	use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxHandle, MuxRole, RequestSink, StreamBody};
 	use crate::transport::serve::drive_mux;
 }
 
@@ -1030,9 +1032,38 @@ pooled_mux! {
 			}
 		}
 
+		/// Open a streamed request on the shared mux connection: push
+		/// chunks through the sink, then await the unary response.
+		///
+		/// The stream counts as pending on the connection, so the pruner
+		/// keeps the entry alive while it is in flight.
+		///
+		/// # Errors
+		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		pub fn open_stream(
+			&self,
+		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
+			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
+			lease.stamp();
+
+			lease.handle.open_stream()
+		}
+
+		/// Open a duplex stream on the shared mux connection: push request
+		/// chunks through the sink while the peer's reply arrives
+		/// incrementally through the body.
+		///
+		/// # Errors
+		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
+			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
+			lease.stamp();
+
+			lease.handle.open_duplex()
+		}
+
 		/// Cap-exhaustion failover: move the lease through the acquisition
-		/// funnel (pooled headroom before a fresh dial) and retry there
-		/// once.
+		/// funnel (pooled headroom before a fresh dial) and retry there once.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 			let offer = match &self.pool.config.mux_offer {
 				Some(offer) => offer.to_owned(),

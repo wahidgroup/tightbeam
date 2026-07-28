@@ -391,10 +391,14 @@ impl ClusterSecurityGate {
 
 #[cfg(feature = "x509")]
 impl GatePolicy for ClusterSecurityGate {
-	fn evaluate(&self, frame: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
 		if !self.circuit_breaker.allow_request() {
 			return TransitStatus::PermissionDenied;
 		}
+
+		let Some(frame) = frame else {
+			return TransitStatus::Unauthenticated;
+		};
 
 		let Some(signer_info) = frame.nonrepudiation.as_ref() else {
 			return TransitStatus::Unauthenticated;
@@ -474,7 +478,7 @@ impl BackpressureGate {
 }
 
 impl GatePolicy for BackpressureGate {
-	fn evaluate(&self, _frame: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, _frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
 		let current = self.utilization.load(Ordering::Relaxed);
 		if current >= self.threshold.get() {
 			TransitStatus::ResourceExhausted
@@ -550,7 +554,7 @@ impl PeerListGate {
 
 #[cfg(feature = "x509")]
 impl GatePolicy for PeerListGate {
-	fn evaluate(&self, _message: &Frame, session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, _message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		self.admit(session.peer_certificate().is_some(), session.peer_public_key())
 	}
 }
@@ -692,7 +696,7 @@ mod tests {
 
 		let frame = work_frame(Some(crate::MessagePriority::NetworkControl))?;
 		assert_eq!(
-			GatePolicy::evaluate(&gate, &frame, &SessionContext::default()),
+			GatePolicy::evaluate(&gate, Some(&frame), &SessionContext::default()),
 			TransitStatus::ResourceExhausted
 		);
 
@@ -706,7 +710,7 @@ mod tests {
 
 		let frame = work_frame(None)?;
 		assert_eq!(
-			GatePolicy::evaluate(&gate, &frame, &SessionContext::default()),
+			GatePolicy::evaluate(&gate, Some(&frame), &SessionContext::default()),
 			TransitStatus::Ok
 		);
 
@@ -759,8 +763,11 @@ mod tests {
 		let empty = SessionContext::default();
 		let allow = PeerListGate::allow([b"key-a".to_vec()]);
 		let deny = PeerListGate::deny([b"key-a".to_vec()]);
-		assert_eq!(GatePolicy::evaluate(&allow, &frame, &empty), TransitStatus::Unauthenticated);
-		assert_eq!(GatePolicy::evaluate(&deny, &frame, &empty), TransitStatus::Ok);
+		assert_eq!(
+			GatePolicy::evaluate(&allow, Some(&frame), &empty),
+			TransitStatus::Unauthenticated
+		);
+		assert_eq!(GatePolicy::evaluate(&deny, Some(&frame), &empty), TransitStatus::Ok);
 
 		Ok(())
 	}

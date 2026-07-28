@@ -76,7 +76,7 @@ impl RestartPolicy for DynRestart {
 
 pub struct DynGate(pub Arc<dyn GatePolicy + Send + Sync>);
 impl GatePolicy for DynGate {
-	fn evaluate(&self, message: &Frame, session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		self.0.evaluate(message, session)
 	}
 }
@@ -317,7 +317,7 @@ where
 }
 
 impl GatePolicy for Arc<dyn GatePolicy + Send + Sync> {
-	fn evaluate(&self, message: &Frame, session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		(**self).evaluate(message, session)
 	}
 }

@@ -10,7 +10,7 @@ use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, ScenarioConf, SetupEnv};
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage};
+use tightbeam::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxStreamKind};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
 use tightbeam::{Frame, TightBeamError};
 
@@ -475,11 +475,11 @@ tb_scenario! {
 				// Continuation chunk for a stream that was never opened
 				MuxDataPackage::new(1, true, chunk)?.into(),
 				// Open whose payload is not a frame
-				MuxOpenPackage::new(1, true, vec![0xDE, 0xAD])?.into(),
+				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, vec![0xDE, 0xAD])?.into(),
 				// Open without a message (requests must carry one)
-				MuxOpenPackage::new(1, true, Vec::new())?.into(),
+				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, Vec::new())?.into(),
 				// Open whose frame claims fields its version forbids
-				MuxOpenPackage::new(1, true, version_incompatible_frame_der()?)?.into(),
+				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, version_incompatible_frame_der()?)?.into(),
 			];
 
 			for offender in offenders {

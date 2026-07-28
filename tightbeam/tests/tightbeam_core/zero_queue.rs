@@ -286,7 +286,11 @@ impl AdaptiveGate {
 }
 
 impl GatePolicy for AdaptiveGate {
-	fn evaluate(&self, frame: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+		let Some(frame) = frame else {
+			return TransitStatus::Ok;
+		};
+
 		// Throttle Standard-or-lower priority frames on first encounter
 		// Subsequent attempts (same order) will be accepted
 		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Standard);
