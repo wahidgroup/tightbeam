@@ -26,7 +26,7 @@ pub mod peer;
 pub use builder::{ClusterConfBuilder, HeartbeatConfBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
-pub use servlet_registry::{PeerRouteInfo, PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
+pub use servlet_registry::{PeerCaps, PeerRouteInfo, PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
 
 use core::future::Future;
 use core::time::Duration;

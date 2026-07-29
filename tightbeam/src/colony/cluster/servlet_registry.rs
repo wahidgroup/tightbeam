@@ -17,8 +17,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use super::error::ClusterError;
+use super::peer::AdmittedPeerAd;
 use super::SharedId;
 use crate::colony::common::MAX_PHEROMONE;
+use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES};
 use crate::utils::BasisPoints;
 
 // ============================================================================
@@ -63,6 +65,24 @@ impl Default for PheromoneConf {
 			reinforcement_boost: DEFAULT_REINFORCEMENT_BOOST,
 			weakening_penalty: DEFAULT_WEAKENING_PENALTY,
 		}
+	}
+}
+
+/// Storage caps for peer-learned routes (CWE-770)
+///
+/// A named pair so gateway and route limits cannot be transposed at a
+/// callsite: two adjacent `usize` arguments would swap silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCaps {
+	/// Max distinct peer gateways holding installed slates
+	pub max_gateways: usize,
+	/// Max total stored peer routes across all gateways
+	pub max_routes: usize,
+}
+
+impl Default for PeerCaps {
+	fn default() -> Self {
+		Self { max_gateways: MAX_PEER_GATEWAYS, max_routes: MAX_PEER_ROUTES }
 	}
 }
 
@@ -461,12 +481,13 @@ impl ServletRegistry {
 	/// prior slate, so a caller never observes a mixed one. Every entry
 	/// must carry `hive_id` as its hive, or the prune misses it.
 	/// Serialized by `reconcile_gate`.
-	pub fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
+	#[cfg(test)]
+	fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
 		let _gate = self.reconcile_gate.lock()?;
 		self.reconcile_slate(hive_id, entries)
 	}
 
-	/// Ungated [`Self::reconcile_by_hive`] body; callers hold `reconcile_gate`
+	/// Ungated reconcile body; callers hold `reconcile_gate`
 	fn reconcile_slate(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
 		let prior: Vec<ServletEntry> = {
 			let addresses: Vec<SharedId> = {
@@ -521,31 +542,25 @@ impl ServletRegistry {
 		}
 	}
 
-	/// Accept a peer slate under one install lock (conflict + caps + reconcile)
+	/// Accept an admitted peer slate under one install lock (conflict + caps + reconcile)
 	///
-	/// Callers MUST run wire checks ([`super::peer::peer_advertisement_wire_ok`])
-	/// before building `slate`. This method owns registry policy so concurrent
-	/// ads cannot pass caps then both install. Fail-closed: internal errors
-	/// propagate and the caller refuses the advertisement.
-	pub fn reconcile_peer_slate(
-		&self,
-		hive_id: &[u8],
-		dial_addr: &[u8],
-		slate: Vec<ServletEntry>,
-		max_gateways: usize,
-		max_routes: usize,
-	) -> Result<(), ClusterError> {
+	/// Taking [`AdmittedPeerAd`] makes unvalidated slates unrepresentable:
+	/// wire checks and signer keying already ran at construction. This
+	/// method owns registry policy so concurrent ads cannot pass caps then
+	/// both install. Fail-closed: internal errors propagate and the caller
+	/// refuses the advertisement.
+	pub fn reconcile_peer_slate(&self, ad: AdmittedPeerAd, caps: PeerCaps) -> Result<(), ClusterError> {
 		let _gate = self.reconcile_gate.lock()?;
 
-		if self.peer_key_conflicts_local(hive_id)? || self.peer_dial_conflicts_local(dial_addr)? {
+		if self.peer_key_conflicts_local(&ad.peer_hive_id)? || self.peer_dial_conflicts_local(&ad.dial_addr)? {
 			return Err(ClusterError::PeerSlateConflict);
 		}
 
-		if self.peer_slate_exceeds_caps(hive_id, slate.len(), max_gateways, max_routes)? {
+		if self.peer_slate_exceeds_caps(&ad.peer_hive_id, ad.slate.len(), caps.max_gateways, caps.max_routes)? {
 			return Err(ClusterError::PeerCapExceeded);
 		}
 
-		self.reconcile_slate(hive_id, slate)
+		self.reconcile_slate(&ad.peer_hive_id, ad.slate)
 	}
 
 	/// Remove all entries belonging to a hive
@@ -693,7 +708,7 @@ impl ServletRegistry {
 	/// same address key, or a local hive owning the same hive-index key,
 	/// means the advertisement would clobber routes another trust plane
 	/// installed, so the caller refuses it.
-	pub fn peer_key_conflicts_local(&self, hive_id: &[u8]) -> Result<bool, ClusterError> {
+	fn peer_key_conflicts_local(&self, hive_id: &[u8]) -> Result<bool, ClusterError> {
 		let entries = self.entries.read()?;
 		let address_taken = entries.get(hive_id).is_some_and(|entry| entry.route_kind() == RouteKind::Local);
 		if address_taken {
@@ -718,7 +733,7 @@ impl ServletRegistry {
 	///
 	/// An unverified claimed gateway that matches a local servlet would
 	/// let forwarded work reflect into the hive trust plane (CWE-918).
-	pub fn peer_dial_conflicts_local(&self, dial_addr: &[u8]) -> Result<bool, ClusterError> {
+	fn peer_dial_conflicts_local(&self, dial_addr: &[u8]) -> Result<bool, ClusterError> {
 		let entries = self.entries.read()?;
 		let conflict = entries
 			.values()
@@ -733,7 +748,7 @@ impl ServletRegistry {
 	/// this hive's prior slate size so a re-advertise does not double-count.
 	/// Abandoned entries count too: they hold registry storage until pruned,
 	/// so excluding them would let stored routes exceed the cap.
-	pub fn peer_slate_exceeds_caps(
+	fn peer_slate_exceeds_caps(
 		&self,
 		hive_id: &[u8],
 		new_slate_len: usize,
@@ -1221,13 +1236,20 @@ mod tests {
 		assert_eq!(registry.peer_slate_exceeds_caps(b"fp1", 0, 1, 1).ok(), Some(false));
 	}
 
+	fn admitted(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>) -> AdmittedPeerAd {
+		AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial_addr: Arc::from(dial), slate }
+	}
+
 	#[test]
 	fn reconcile_peer_slate_refuses_over_gateway_cap() {
 		let registry = ServletRegistry::default();
-		let first = registry.reconcile_peer_slate(b"fp1", b"127.0.0.1:9000", vec![peer_entry(b"a", b"fp1")], 1, 1024);
+		let caps = PeerCaps { max_gateways: 1, ..Default::default() };
+		let first_ad = admitted(b"fp1", b"127.0.0.1:9000", vec![peer_entry(b"a", b"fp1")]);
+		let first = registry.reconcile_peer_slate(first_ad, caps);
 		assert!(matches!(first, Ok(())));
 
-		let second = registry.reconcile_peer_slate(b"fp2", b"127.0.0.1:9001", vec![peer_entry(b"a", b"fp2")], 1, 1024);
+		let second_ad = admitted(b"fp2", b"127.0.0.1:9001", vec![peer_entry(b"a", b"fp2")]);
+		let second = registry.reconcile_peer_slate(second_ad, caps);
 		assert!(matches!(second, Err(ClusterError::PeerCapExceeded)));
 		assert_eq!(registry.peer_entries().ok().unwrap_or_default().len(), 1);
 	}

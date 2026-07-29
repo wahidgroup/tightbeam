@@ -9,9 +9,7 @@
 
 ## Status
 
-> Warning: This project is under active development. Public APIs and file formats MAY change WITHOUT notice. Additionally, not all feature combinations are currently supported. Currently, `no_std` and WASM support is limited.
-
-**Security Disclaimer:** A SECURITY AUDIT HAS NOT BEEN CONDUCTED. USE AT YOUR OWN RISK.
+This project is under active development. Public APIs and file formats MAY change without notice. Not all feature combinations are supported. `no_std` and WASM support is limited. No security audit has been conducted. Use this software at your own risk.
 
 ## Copyright Notice
 
@@ -19,9 +17,9 @@ Copyright (C) Tanveer Wahid, WahidGroup, LLC (2025). All Rights Reserved.
 
 ## Abstract
 
-tightbeam is a Layer-5 messaging framework using Abstract Syntax Notation One (ASN.1) with Distinguished Encoding Rules (DER) for serialization, paired with versioned metadata structures for high-fidelity information transmission.
+tightbeam is a Layer-5 messaging framework. Frames use Abstract Syntax Notation One (ASN.1) with Distinguished Encoding Rules (DER). Versioned metadata carries protocol control data beside the application message.
 
-> Zero-Copy, Zero-Panic, no_std-Ready
+Hot paths aim for zero-copy operation where the design allows it. Production paths avoid panic for ordinary error cases. Core protocol types target `no_std` environments; see Status for current limits.
 
 ## Table of Contents
 
@@ -191,88 +189,76 @@ tightbeam is a Layer-5 messaging framework using Abstract Syntax Notation One (A
 
 ## 1. Introduction
 
-tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Its philosophy is predicated upon a return to first order principles.
+tightbeam defines a structured, versioned messaging protocol. Information fidelity stays in the open interval **I(t) ∈ (0,1)** for all time t in the operating lifetime T. Protocol choices keep Frames inside that bound.
 
 ### 1.1 Information Fidelity Constraint
 
-tightbeam's design is based on the principle that information transmission maintains bounded fidelity: **I(t) ∈ (0,1)** for all time t.
+tightbeam treats information transmission as bounded for every time t:
 
-This means:
+**I(t) ∈ (0,1)**
 
-- Information fidelity is never perfect (< 1) due to physical and encoding limits
-- Information content is never absent (> 0) in valid frames
-- All protocol decisions ensure frames carry bounded information content
+- I(t) is never 1. Fidelity is never perfect because physical and encoding limits remain.
+- I(t) is never 0 for a valid Frame. A valid Frame always carries information content.
+- Protocol decisions MUST keep Frames inside these bounds.
 
-The I(t) constraint informs all protocol design decisions.
+Later sections apply this constraint to framing, integrity, and state structures such as `Matrix`.
 
 ### 1.2 Requirements Language
 
-The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119][rfc2119].
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119][rfc2119] and [RFC 8174][rfc8174].
 
 ### 1.3 Document Conventions
 
-This document adheres to the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322] for structure and editorial style:
+This document follows the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322] for structure and editorial style. Prose uses short full sentences and active voice. Prefer bullets or short paragraphs by default. Use a table only when readers must compare parallel rows. Project terms and software names override generic wording.
 
-- **Section pattern**: Normative sections progress through concept -> specification -> implementation -> testing.
-- **Requirements language**: Key words are interpreted per [RFC 2119][rfc2119] (see [§1.2 Requirements Language](#12-requirements-language)).
-- **Terminology**: Project terms are defined once in [§2 Terminology](#2-terminology) and used consistently thereafter.
-- **Citations**: External standards are cited by name and linked on their first mention within a section. Full references are recorded in [§14 References](#14-references). Every entry there is cited at least once in the text, and every in-text citation resolves to an entry there.
+- **Section pattern**: Normative sections progress through concept, specification, implementation, then testing.
+- **Requirements language**: Key words follow [§1.2 Requirements Language](#12-requirements-language).
+- **Terminology**: Project terms are defined once in [§2 Terminology](#2-terminology) and used consistently after that.
+- **Citations**: External standards are cited by name and linked on first mention in a section. Full entries live in [§14 References](#14-references). Every reference entry is cited at least once. Every in-text citation resolves to an entry there.
 
 ## 2. Terminology
 
-The following project terms MUST be used consistently:
+The following project terms MUST be used consistently. This list holds identity nouns only. Design properties are indexed in [§3.1 Information Theory Properties](#31-information-theory-properties). Security and state terms such as Message Integrity (MI), Frame Integrity (FI), Matrix, `previous_frame`, and Nonrepudiation are defined in [§5.7](#57-semantic-constraints) and [§5.8](#58-what-is-the-matrix).
 
-- [tightbeam](https://docs.rs/tightbeam-rs/latest): The project name. Lowercase as tightbeam.
-- [Frame](#42-frame-structure): A versioned snapshot (state) at time t.
-- [Message](#53-message-structure): A typed application payload serialized within a Frame.
-- [Metadata](#43-metadata-specification): Per-message metadata as defined by the protocol.
-- [Version](#41-version-evolution): The protocol version identifier.
+- [tightbeam](https://docs.rs/tightbeam-rs/latest): The project name. Write it in lowercase as tightbeam.
+- [Frame](#42-frame-structure): A versioned snapshot at time t.
+- [Message](#53-message-structure): A typed application payload carried inside a Frame.
+- [Metadata](#43-metadata-specification): Protocol control fields carried with a Frame.
+- [Version](#41-version-evolution): The protocol generation identifier (`V0` through `V3`).
 - [TIP](tips/tip-0001.md): tightbeam Improvement Proposal.
-- [Information Theory Properties](#31-information-theory-properties)
 
 ## 3. Architecture
 
 ### 3.1 Information Theory Properties
 
-tightbeam implements high-fidelity information transmission through the following bounds:
+tightbeam keeps Frames inside the fidelity bound **I(t) ∈ (0,1)** through the following design properties. This section is a property index. It does not redefine the nouns in [§2 Terminology](#2-terminology). Each entry links to the normative rules.
 
-- **STRUCTURE**: Perfect encoding via ASN.1 DER
-- **FRAME**: Incremental versioning system
-- **IDEMPOTENCE**: Unique message identification
-- **ORDER**: Temporal sequencing via 64-bit integers
-- **COMPACTNESS**: Enforceable compression
-- **INTEGRITY**: Message digest validation
-- **CONFIDENTIALITY**: Cipher-based encryption
-- **PRIORITY**: 7-level priority system
-- **LIFETIME**: 64-bit TTL values
-- **STATE**: Previous message chaining
-- **MATRIX**: N×N matrix-encoded control flags
-- **NONREPUDIATION**: Cryptographic signatures
+- **STRUCTURE**: ASN.1 DER gives a single canonical encoding for equal values ([§5.5 Encoding Rules](#55-encoding-rules)).
+- **IDEMPOTENCE**: Each Frame carries a unique `id` for message identification ([§4.1 Version Evolution](#41-version-evolution)).
+- **ORDER**: Each Frame carries a monotonic `order` value ([§5.7.1 Message Ordering](#571-message-ordering)).
+- **COMPACTNESS**: A Frame MAY carry enforceable compression via `compactness` ([§5.7.2 Compression Requirements](#572-compression-requirements)).
+- **INTEGRITY**: Message Integrity (MI) and Frame Integrity (FI) bind body and envelope ([§5.7.3 Integrity Semantics](#573-integrity-semantics-order-of-operations)).
+- **CONFIDENTIALITY**: A Frame MAY protect the body with AEAD encryption ([§5.7.3](#573-integrity-semantics-order-of-operations)).
+- **PRIORITY**: A Frame MAY carry one of six `MessagePriority` levels ([§5.1 Enumerated Types](#51-enumerated-types)).
+- **LIFETIME**: A Frame MAY carry a 64-bit TTL in `lifetime` ([§4.3 Metadata Specification](#43-metadata-specification)).
+- **STATE**: Previous Frame chaining links snapshots across time ([§5.7.4 Previous Frame Chaining](#574-previous-frame-chaining)).
+- **MATRIX**: Matrix carries dense application control state ([§5.8 What is the Matrix?](#58-what-is-the-matrix)).
+- **NONREPUDIATION**: A signature MAY bind the signed Frame fields ([§5.7.5 Nonrepudiation Coverage and Binding](#575-nonrepudiation-coverage-and-binding)).
 
 ## 4. Protocol Specification
 
 ### 4.1 Version Evolution
 
-- VERSION 0
-  - REQUIRED: Message identification (idempotence)
-  - REQUIRED: Temporal ordering (64-bit integer)
-  - OPTIONAL: Compression (enforceable compactness)
+Each protocol version inherits the required features of the prior version. A higher version MAY add optional features. Receivers that implement version N MUST accept Frames that use only features defined for version N or earlier, when those features remain valid for the negotiated version.
 
-- VERSION 1
-  - Inherits: All V0 features
-  - OPTIONAL: Message integrity (digest)
-  - OPTIONAL: Confidentiality (cipher)
-  - OPTIONAL: Non-repudiation (signature)
+| Version | Required features                                          | Optional features                                                     |
+| ------- | ---------------------------------------------------------- | --------------------------------------------------------------------- |
+| V0      | Message identification (`id`); temporal ordering (`order`) | Compression (`compactness`)                                           |
+| V1      | All V0 required features                                   | Message Integrity (MI); confidentiality; Nonrepudiation               |
+| V2      | All V1 required features                                   | Priority (`MessagePriority`); lifetime (TTL); Previous Frame chaining |
+| V3      | All V2 required features                                   | Matrix control                                                        |
 
-- VERSION 2
-  - Inherits: All V1 features
-  - OPTIONAL: Priority levels (6-level enumeration)
-  - OPTIONAL: Message lifetime (64-bit TTL)
-  - OPTIONAL: State chaining (previous message integrity)
-
-- VERSION 3
-  - Inherits: All V2 features
-  - OPTIONAL: Matrix control (NxN matrix flags)
+Concrete field requirements and forbidden fields are stated in [§5.6 Version-Specific Constraints](#56-version-specific-constraints). Semantic rules for integrity, chaining, and signatures are stated in [§5.7 Semantic Constraints](#57-semantic-constraints).
 
 ### 4.2 Frame Structure
 
@@ -548,28 +534,18 @@ enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
 
 ### 5.6 Version-Specific Constraints
 
-#### Version 0 (V0)
+This section states which Frame and Metadata fields each version MUST, MAY, or MUST NOT carry. Feature intent is summarized in [§4.1 Version Evolution](#41-version-evolution).
 
-- REQUIRED: `id`, `order`, `message`
-- OPTIONAL: `compactness`
-- FORBIDDEN: All V1+ and V2+ specific fields
+| Version | Required fields          | Optional fields                                                                              | Forbidden                        |
+| ------- | ------------------------ | -------------------------------------------------------------------------------------------- | -------------------------------- |
+| V0      | `id`, `order`, `message` | `compactness`                                                                                | Fields introduced in V1 or later |
+| V1      | All V0 required fields   | `Metadata.integrity` (MI); `confidentiality`; `Frame.nonrepudiation`; `Frame.integrity` (FI) | Fields introduced in V2 or later |
+| V2      | All V1 required fields   | `priority`; `lifetime`; `previous_frame`                                                     | Fields introduced in V3 or later |
+| V3      | All V2 required fields   | `matrix`                                                                                     | None beyond the ASN.1 schema     |
 
-#### Version 1 (V1)
+A version that inherits prior requirements MUST satisfy every required field of those prior versions. Absent optional fields MUST NOT be encoded (DER). Encoders MUST NOT emit a field that is forbidden for the Frame version in use. Decoders MUST reject Frames that carry forbidden fields for the declared version.
 
-- INHERITS: All V0 requirements
-- OPTIONAL: `integrity`, `confidentiality`, `nonrepudiation`
-- FORBIDDEN: All V2+ specific fields
-
-#### Version 2 (V2)
-
-- INHERITS: All V1 requirements
-- OPTIONAL: `priority`, `lifetime`, `previous_frame`
-- FORBIDDEN: All V3+ specific fields
-
-#### Version 3 (V3)
-
-- INHERITS: All V2 requirements
-- OPTIONAL: `matrix`
+> Note: `Metadata.integrity` is Message Integrity (MI). `Frame.integrity` is Frame Integrity (FI). Both MAY appear from V1 onward. See [§5.7.3](#573-integrity-semantics-order-of-operations).
 
 ### 5.7 Semantic Constraints
 
@@ -592,29 +568,21 @@ This section states normative rules for ordering, compression, integrity, chaini
 
 Message Integrity (MI) and Frame Integrity (FI) bind different byte ranges. Receivers MUST apply each check to the correct coverage.
 
-| Term | Coverage | Binding rule |
-| --- | --- | --- |
-| Message Integrity (MI) | Message payload bytes | When `Metadata.integrity` is present, MI MUST bind the message body. |
-| Frame Integrity (FI) | DER-canonical `version` + `metadata` | FI MUST exclude `message`. FI MUST bind the frame envelope around the body. |
+| Term                   | Coverage                             | Binding rule                                                                |
+| ---------------------- | ------------------------------------ | --------------------------------------------------------------------------- |
+| Message Integrity (MI) | Message payload bytes                | When `Metadata.integrity` is present, MI MUST bind the message body.        |
+| Frame Integrity (FI)   | DER-canonical `version` + `metadata` | FI MUST exclude `message`. FI MUST bind the frame envelope around the body. |
 
-| Property | Rule |
-| --- | --- |
-| FI alone | FI MUST NOT prove message-content correctness. FI proves only that `version` and `metadata` are intact. |
-| MI | MI MUST prove message-content correctness. |
-| FI witnesses MI | MI lives in metadata. FI commits to the frame that contains that metadata. |
-| Authenticated FI | When FI is authenticated (for example by nonrepudiation or consensus), tampering with MI MUST fail authenticated FI validation. |
-| Sufficiency | Receivers SHOULD treat the pair (valid MI, authenticated FI) as enough evidence that both frame and message are intact. |
-| Unsigned FI | An in-band, unsigned FI MUST NOT be trusted against an active attacker who changes both MI and FI. |
+- FI alone MUST NOT prove message-content correctness. FI proves only that `version` and `metadata` are intact.
+- MI MUST prove message-content correctness.
+- MI lives in metadata. FI commits to the frame that contains that metadata, so FI witnesses MI.
+- When FI is authenticated (for example by nonrepudiation or consensus), tampering with MI MUST fail authenticated FI validation.
+- Receivers SHOULD treat the pair (valid MI, authenticated FI) as enough evidence that both frame and message are intact.
+- An in-band, unsigned FI MUST NOT be trusted against an active attacker who changes both MI and FI.
 
 ##### Optional Hiding Commitment (Salt)
 
-By default, MI is the bare digest `H(message)`. That digest is binding. It is not hiding.
-
-| Risk | Why it matters |
-| --- | --- |
-| Cleartext digest | `Metadata.integrity` carries the digest in the clear. |
-| Low-entropy body | An attacker who sees the digest MAY brute-force candidate preimages. |
-| Encryption alone | Encrypting the body does not remove that digest-guessing risk. |
+By default, MI is the bare digest `H(message)`. That digest is binding. It is not hiding. The digest travels in cleartext metadata. If the body has low entropy, an attacker who sees the digest MAY brute-force candidate preimages. Encrypting the body does not remove that risk by itself.
 
 An application MAY store a hiding commitment in the same `Metadata.integrity` field. The commitment salts the body with a secret, high-entropy blinding value.
 
@@ -622,26 +590,23 @@ An application MAY store a hiding commitment in the same `Metadata.integrity` fi
 
 `H(len(salt) || salt || DER(message))`
 
-| Detail | Rule |
-| --- | --- |
-| Length prefix | `len(salt)` is an 8-byte big-endian integer. |
-| Collision control | Distinct `(salt, message)` pairs cannot collide under concatenation ambiguity. |
-| Empty salt | An empty salt is treated as the plain digest `H(message)`. |
-| API | Use `Opening::prove` and `Opening::verify`. |
-| Disclosure | Disclosing `(salt, message)` proves the committed content in constant time. |
-| Prior art | Same salted-hash disclose-then-verify pattern as SD-JWT ([RFC 9901][rfc9901]) and ISO mdoc ([ISO/IEC 18013-5][iso-18013-5]). |
+- `len(salt)` is an 8-byte big-endian integer.
+- Distinct `(salt, message)` pairs cannot collide under concatenation ambiguity.
+- An empty salt is treated as the plain digest `H(message)`.
+- Callers use `Opening::prove` and `Opening::verify`.
+- Disclosing `(salt, message)` proves the committed content in constant time.
+- The pattern matches the salted-hash disclose-then-verify construction in SD-JWT ([RFC 9901][rfc9901]) and ISO mdoc ([ISO/IEC 18013-5][iso-18013-5]).
 
 **Salt ownership**
 
-The salt is not a tightbeam responsibility.
+The salt is not a tightbeam responsibility. tightbeam does not generate, encrypt, store, or transmit the salt.
 
-| Concern | Owner |
-| --- | --- |
-| Generate salt entropy | Caller MUST provide it. |
-| Encrypt, store, or transmit salt on the wire | tightbeam does not do this. |
-| Retain the opening | Caller MUST decide where it lives. |
-| Control disclosure | Caller MUST control it. |
-| Self-contained opening envelope | Caller MUST define it when needed. |
+| Concern                 | Owner                              |
+| ----------------------- | ---------------------------------- |
+| Salt entropy            | Caller MUST provide it.            |
+| Opening retention       | Caller MUST decide where it lives. |
+| Disclosure              | Caller MUST control it.            |
+| Self-contained envelope | Caller MUST define it when needed. |
 
 One example of a caller-defined envelope is a credential that carries an encrypted salt beside the body for later selective disclosure.
 
@@ -675,13 +640,11 @@ where
 	T: CheckAeadOid<C>;
 ```
 
-| Guarantee | Meaning |
-| --- | --- |
-| Type-level AEAD | Non-AEAD ciphers cannot be selected. The compiler rejects them. |
-| Cipher-OID binding | `Encryptor<C>` exists only for canonically matched cipher and OID pairs. The wire algorithm identifier cannot diverge from the cipher, even when the message type has no security profile. |
-| Ciphertext authentication | AEAD tags prove that ciphertext was not modified. Examples include AES-GCM ([FIPS 197][fips197]) and ChaCha20-Poly1305 ([RFC 8439][rfc8439]). |
-| MI over plaintext | MI proves that decrypted plaintext matches the original message content. |
-| Layered checks | AEAD protects ciphertext. MI proves plaintext. FI witnesses MI in metadata. Signatures cover the frame. |
+- Non-AEAD ciphers cannot be selected. The compiler rejects them.
+- `Encryptor<C>` exists only for canonically matched cipher and OID pairs. The wire algorithm identifier cannot diverge from the cipher, even when the message type has no security profile.
+- AEAD tags prove that ciphertext was not modified. Examples include AES-GCM ([FIPS 197][fips197]) and ChaCha20-Poly1305 ([RFC 8439][rfc8439]).
+- MI proves that decrypted plaintext matches the original message content.
+- AEAD protects ciphertext. MI proves plaintext. FI witnesses MI in metadata. Signatures cover the frame.
 
 When AEAD is enforced, the construction is cryptographically equivalent to Encrypt-then-MAC for ciphertext authenticity. An attacker cannot modify the ciphertext without failing AEAD authentication. An attacker cannot modify MI without breaking authenticated FI when signing is present. An attacker cannot decrypt without the key.
 
@@ -689,34 +652,19 @@ When AEAD is enforced, the construction is cryptographically equivalent to Encry
 
 The `previous_frame` field links Frames through a cryptographic hash chain. Each digest commits to prior history by transitive hashing.
 
-| Property | Meaning |
-| --- | --- |
-| Causal ordering | A Frame carries proof of its position in the sequence. |
-| Tamper detection | A change to an earlier Frame breaks every later digest that depends on it. |
-| Replay protection | Receivers can detect out-of-sequence or duplicate Frames. |
-| Fork detection | Two Frames that share one `previous_frame` digest indicate a branch. |
-| Stateless verification | Ancestry can be checked without storing the entire chain. |
+- **Causal ordering**: A Frame carries proof of its position in the sequence.
+- **Tamper detection**: A change to an earlier Frame breaks every later digest that depends on it.
+- **Replay protection**: Receivers can detect out-of-sequence or duplicate Frames.
+- **Fork detection**: Two Frames that share one `previous_frame` digest indicate a branch.
+- **Stateless verification**: Ancestry can be checked without storing the entire chain.
 
 Implementations MAY retain Frame or message bytes so they can reconstruct the chain back to a chosen root.
 
 #### 5.7.5 Nonrepudiation Coverage and Binding
 
-When `nonrepudiation` is present, the signature MUST cover the canonical DER encoding of the Frame fields except the `nonrepudiation` field itself.
+When `nonrepudiation` is present, the signature MUST cover the canonical DER encoding of the Frame fields except the `nonrepudiation` field itself. The covered fields are `version`, `metadata` (including MI when present), `message`, and `integrity` (FI) when FI is present.
 
-| Covered field | Notes |
-| --- | --- |
-| `version` | Always covered. |
-| `metadata` | Includes MI when MI is present. |
-| `message` | Covered as carried on the wire. |
-| `integrity` (FI) | Covered when FI is present. |
-
-Any change to `version`, `metadata` (including MI), `message`, or FI invalidates the signature. The resulting binding is transitive:
-
-| Layer | Binds |
-| --- | --- |
-| Signature | Frame envelope, including FI when present |
-| FI | Metadata envelope, including MI when present |
-| MI | Message body |
+Any change to those fields invalidates the signature. The resulting binding is transitive: the signature binds the frame envelope (including FI when present), FI binds the metadata envelope (including MI when present), and MI binds the message body.
 
 **Figure: nonrepudiation binding**
 
@@ -739,32 +687,21 @@ When MI, FI, AEAD encryption, and signatures are all enabled, senders and receiv
 
 **Sender operations (in order):**
 
-| Step | Action | Store |
-| --- | --- | --- |
-| 1 | Compute MI over the plaintext message. | `DigestInfo` in `Metadata` |
-| 2 | Optionally compress the plaintext message. | `CompressedData` in `Metadata` |
-| 3 | Encrypt with an AEAD cipher to produce authenticated ciphertext. | `EncryptedContentInfo` in `Metadata`; ciphertext in `Frame.message` |
-| 4 | Compute FI over the envelope (`Version` + `Metadata` that contains MI). | `DigestInfo` in `Frame` |
-| 5 | Sign the complete frame (`Version` + `Metadata` + ciphertext + FI). | `SignerInfo` in `Frame` |
+1. Compute MI over the plaintext message. Store `DigestInfo` in `Metadata`.
+2. Optionally compress the plaintext message. Store `CompressedData` in `Metadata`.
+3. Encrypt with an AEAD cipher to produce authenticated ciphertext. Store `EncryptedContentInfo` in `Metadata` and the ciphertext in `Frame.message`.
+4. Compute FI over the envelope (`Version` + `Metadata` that contains MI). Store `DigestInfo` in `Frame`.
+5. Sign the complete frame (`Version` + `Metadata` + ciphertext + FI). Store `SignerInfo` in `Frame`.
 
 **Receiver verification (in order):**
 
-| Step | Action |
-| --- | --- |
-| 1 | Verify the signature over the complete Frame and message bytes in scope. |
-| 2 | Verify FI over the envelope (`Version` + `Metadata`). |
-| 3 | Verify the AEAD authentication tag on the ciphertext. |
-| 4 | Decrypt the ciphertext to recover plaintext. |
-| 5 | Verify that MI matches the decrypted plaintext. |
+1. Verify the signature over the complete Frame and message bytes in scope.
+2. Verify FI over the envelope (`Version` + `Metadata`).
+3. Verify the AEAD authentication tag on the ciphertext.
+4. Decrypt the ciphertext to recover plaintext.
+5. Verify that MI matches the decrypted plaintext.
 
-| Layer | Protects |
-| --- | --- |
-| AEAD | Ciphertext authenticity |
-| FI | Envelope integrity, including MI in metadata |
-| MI | Plaintext correctness after decryption |
-| Signature | Nonrepudiation over the signed frame |
-
-Tampering at any layer MUST cause verification to fail. That failure gives end-to-end integrity and authenticity for the enabled features.
+AEAD protects ciphertext authenticity. FI protects envelope integrity, including MI in metadata. MI proves plaintext correctness after decryption. The signature provides nonrepudiation over the signed frame. Tampering at any layer MUST cause verification to fail.
 
 ### 5.8 What is the Matrix?
 
@@ -774,12 +711,10 @@ The `Matrix` type carries compact application state inside a Frame. It is an **n
 
 Applications use the matrix when they need dense, version-tolerant control state on the wire.
 
-| Goal | Description |
-| --- | --- |
-| Dense state | A matrix holds up to 255x255 cell values in the range 0-255. The maximum encoded size is about 63.5 KB. |
-| Evolution | Newer senders MAY set cells that older receivers do not understand. Receivers SHOULD ignore those cells. |
-| Fidelity | Deterministic DER encoding and length checks keep invalid grids off the wire. |
-| Causal modeling | Applications MAY combine the matrix with `previous_frame` to bind successive state snapshots. |
+- A matrix holds up to 255x255 cell values in the range 0-255. The maximum encoded size is about 63.5 KB.
+- Newer senders MAY set cells that older receivers do not understand. Receivers SHOULD ignore those cells.
+- Deterministic DER encoding and length checks keep invalid grids off the wire.
+- Applications MAY combine the matrix with `previous_frame` to bind successive state snapshots.
 
 The matrix does not replace the message payload. It carries structured control or status data that benefits from a fixed grid layout.
 
@@ -793,12 +728,12 @@ Under a uniform distribution, the maximum entropy of a full matrix is:
 
 A sparse application that uses only **k** cells has lower entropy. In that case the used set contributes about **8k** bits when the unused cells are treated as fixed.
 
-| Symbol | Meaning | Range |
-| --- | --- | --- |
-| **n** | Grid size (number of rows and columns) | 1-255 |
-| **r** | Row index | 0 .. n-1 |
-| **c** | Column index | 0 .. n-1 |
-| **M[r,c]** | Cell value defined by the application | 0-255 |
+| Symbol     | Meaning                                | Range    |
+| ---------- | -------------------------------------- | -------- |
+| **n**      | Grid size (number of rows and columns) | 1-255    |
+| **r**      | Row index                              | 0 .. n-1 |
+| **c**      | Column index                           | 0 .. n-1 |
+| **M[r,c]** | Cell value defined by the application  | 0-255    |
 
 **Figure: 2x2 game-state example**
 
@@ -824,14 +759,12 @@ Matrix ::= SEQUENCE {
 }
 ```
 
-| Property | Rule |
-| --- | --- |
-| Layout | Cells are stored in row-major order. The octet index of cell (r,c) is **r * n + c**. |
-| Length | The length of `data` MUST equal **n²**. |
-| Maximum size | When **n = 255**, `data` contains 65,025 bytes (about 63.5 KB). |
-| State space | There are **256^(n²)** distinct matrices of size n. |
-| Entropy | For a uniform full matrix, **H = 8n²** bits. |
-| Complexity | Encoding and decoding take O(n²) time. Length validation takes O(1) time. |
+- Cells are stored in row-major order. The octet index of cell (r,c) is **r \* n + c**.
+- The length of `data` MUST equal **n²**.
+- When **n = 255**, `data` contains 65,025 bytes (about 63.5 KB).
+- There are **256^(n²)** distinct matrices of size n.
+- For a uniform full matrix, **H = 8n²** bits.
+- Encoding and decoding take O(n²) time. Length validation takes O(1) time.
 
 #### 5.8.4 Usage Rules
 
@@ -881,14 +814,12 @@ A diagonal layout supports up to 255 distinct flags. Applications MAY extend the
 
 Applications MAY combine the matrix with the `previous_frame` field to track state across Frames. In this model, each Frame is a snapshot. The `previous_frame` digest binds the current Frame to an earlier Frame. When verification succeeds, the linked snapshots form a directed acyclic graph (DAG) of state.
 
-A useful mathematical view treats the sequence as a Markov chain. The matrix **M_t** at time t depends on **M_{t-1}**. The cryptographic digest in `previous_frame` supplies the causal link between those snapshots.
+A useful mathematical view treats the sequence as a Markov chain. The matrix **M_t** at time t depends on **M\_{t-1}**. The cryptographic digest in `previous_frame` supplies the causal link between those snapshots.
 
-| Term | Meaning |
-| --- | --- |
-| Snapshot | The matrix **M_t** carried by the Frame at time t. Its entropy is at most **8n²** bits. |
-| Causal link | A verified `previous_frame` digest that binds Frame t to Frame t-1. |
-| Transition | A change in one or more cells from **M_{t-1}** to **M_t**. |
-| Branch | Two or more Frames that share the same `previous_frame` digest but carry different matrices **M_t**. |
+- **Snapshot**: The matrix **M_t** carried by the Frame at time t. Its entropy is at most **8n²** bits.
+- **Causal link**: A verified `previous_frame` digest that binds Frame t to Frame t-1.
+- **Transition**: A change in one or more cells from **M\_{t-1}** to **M_t**.
+- **Branch**: Two or more Frames that share the same `previous_frame` digest but carry different matrices **M_t**.
 
 **Figure: causal chain of matrix snapshots**
 
@@ -904,9 +835,9 @@ Frame t   (M_t)
 Frame t+1 (M_{t+1})
 ```
 
-Applications MAY define a transition model **P(M_t | M_{t-1})**. The model may capture deterministic application logic, noise, or both. Application-level fidelity MAY be expressed with mutual information, for example:
+Applications MAY define a transition model **P(M*t | M*{t-1})**. The model may capture deterministic application logic, noise, or both. Application-level fidelity MAY be expressed with mutual information, for example:
 
-**I(t) = I(M_t; M_{t-1}) / H(M_t) ∈ (0,1)**.
+**I(t) = I(M*t; M*{t-1}) / H(M_t) ∈ (0,1)**.
 
 That ratio is application-defined. Protocol integrity still depends on digest verification and on the matrix encoding rules in [§5.8.4](#584-usage-rules). Partial recovery of earlier state remains an application concern when some cells are unused or unknown.
 
@@ -5499,6 +5430,7 @@ tb_scenario! {
 - [RFC 5869][rfc5869]: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
 - [RFC 8032][rfc8032]: Edwards-Curve Digital Signature Algorithm (EdDSA)
 - [RFC 8141][rfc8141]: Uniform Resource Names (URNs)
+- [RFC 8174][rfc8174]: Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words
 - [RFC 8439][rfc8439]: ChaCha20 and Poly1305 for IETF Protocols
 - [SECG SEC 1][secg-sec1]: Elliptic Curve Cryptography (Standards for Efficient Cryptography)
 
@@ -5597,6 +5529,7 @@ The workspace consists of the following components:
 [rfc8017-9.2]: https://datatracker.ietf.org/doc/html/rfc8017#section-9.2
 [rfc8032]: https://datatracker.ietf.org/doc/html/rfc8032
 [rfc8141]: https://datatracker.ietf.org/doc/html/rfc8141
+[rfc8174]: https://datatracker.ietf.org/doc/html/rfc8174
 [rfc8439]: https://datatracker.ietf.org/doc/html/rfc8439
 [rfc8622]: https://datatracker.ietf.org/doc/html/rfc8622
 [rfc9000]: https://datatracker.ietf.org/doc/html/rfc9000

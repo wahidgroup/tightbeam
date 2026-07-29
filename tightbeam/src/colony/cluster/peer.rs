@@ -1,37 +1,92 @@
-//! Peer-advertisement helpers shared by the cluster gateway macro
+//! Peer-advertisement admission for the cluster gateway macro
 //!
-//! Keeps fingerprint keying, dial-addr checks, and slate construction out
-//! of the `cluster!` expansion so AdvertisePeer stays wiring-only.
+//! [`AdmittedPeerAd`] is the only path from a wire advertisement to a
+//! reconcilable slate: construction runs signer resolution and wire
+//! checks, so the identity, dial address, and slate of one verified
+//! advertisement travel as a single value.
 
 use core::str::FromStr;
 use std::sync::Arc;
 
-use super::{ServletEntry, SharedId};
-use crate::colony::common::{is_bare_servlet_type, type_canonical_bytes, ColonyNamespace};
+use super::{ClusterConf, ServletEntry, SharedId};
+use crate::colony::common::{is_bare_servlet_type, type_canonical_bytes, ColonyNamespace, PeerAdvertisement};
 use crate::constants::MAX_ADVERTISED_TYPES;
 use crate::policy::TransitStatus;
 use crate::transport::tcp::TightBeamSocketAddr;
 use crate::utils::urn::Urn;
+use crate::Frame;
 
 #[cfg(feature = "x509")]
 use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
-#[cfg(feature = "x509")]
-use crate::Frame;
+
+/// Peer advertisement that passed signer resolution and wire checks
+///
+/// Construction via [`AdmittedPeerAd::admit`] is the only public path,
+/// so the registry can never receive an unvalidated slate and the
+/// signer identity cannot be transposed with the claimed dial address.
+pub struct AdmittedPeerAd {
+	/// Signer cert fingerprint (or claimed address without x509)
+	pub(super) peer_hive_id: SharedId,
+	/// Claimed gateway socket the slate dials through
+	pub(super) dial_addr: SharedId,
+	/// Peer-routed entries keyed by `peer_hive_id NUL type`
+	pub(super) slate: Vec<ServletEntry>,
+}
+
+impl AdmittedPeerAd {
+	/// Admit a wire advertisement, failing closed with the refusal status
+	///
+	/// Runs signer resolution (slates key by cert fingerprint, never the
+	/// claimed `gateway_addr`) and wire checks. Caps and local-route
+	/// conflicts are registry policy, checked under the reconcile gate in
+	/// [`super::ServletRegistry::reconcile_peer_slate`].
+	pub fn admit(frame: &Frame, ad: &PeerAdvertisement, conf: &ClusterConf) -> Result<Self, TransitStatus> {
+		let dial_addr: SharedId = Arc::from(ad.gateway_addr.as_slice());
+
+		#[cfg(feature = "x509")]
+		let peer_hive_id =
+			peer_signer_hive_id(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
+
+		// Without x509 there is no signer fingerprint to bind: the
+		// claimed address is the only available slate key.
+		#[cfg(not(feature = "x509"))]
+		let peer_hive_id = {
+			let _ = frame;
+			Arc::clone(&dial_addr)
+		};
+
+		peer_advertisement_wire_ok(
+			&ad.gateway_addr,
+			&ad.advertised_types,
+			&conf.namespace,
+			conf.peer_dial_allowlist.as_deref(),
+		)?;
+
+		let slate = build_peer_slate(
+			&peer_hive_id,
+			Arc::clone(&dial_addr),
+			&ad.advertised_types,
+			conf.pheromone.initial_pheromone,
+			conf.pheromone.abandonment_limit,
+		);
+
+		Ok(Self { peer_hive_id, dial_addr, slate })
+	}
+}
 
 /// Whether a claimed peer gateway address is safe dial data
 ///
 /// Refuses empty, non-UTF-8, NUL-bearing, or non-parseable sockets: the
 /// dial path parses UTF-8 sockets, and NUL would corrupt composite route keys.
-#[doc(hidden)]
 #[must_use]
-pub fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
+fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
 	let nonempty = !gateway_addr.is_empty();
 	let no_nul = !gateway_addr.contains(&0);
 	let Ok(addr) = core::str::from_utf8(gateway_addr) else {
 		return false;
 	};
-	let parseable = TightBeamSocketAddr::from_str(addr).is_ok();
 
+	let parseable = TightBeamSocketAddr::from_str(addr).is_ok();
 	nonempty && no_nul && parseable
 }
 
@@ -39,32 +94,27 @@ pub fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
 ///
 /// `None` allowlist accepts any address that already passed
 /// [`peer_gateway_addr_valid`].
-#[doc(hidden)]
 #[must_use]
-pub fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool {
+fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool {
 	let Some(allowed) = allowlist else {
 		return true;
 	};
 	let Ok(addr) = core::str::from_utf8(gateway_addr) else {
 		return false;
 	};
+
 	let matched = allowed.iter().any(|entry| entry.as_str() == addr);
 	matched
 }
 
 /// Whether every advertised type is a bare servlet URN in `namespace`
-#[doc(hidden)]
 #[must_use]
-pub fn advertised_types_are_nestmate(namespace: &ColonyNamespace, types: &[Urn<'static>]) -> bool {
+fn advertised_types_are_nestmate(namespace: &ColonyNamespace, types: &[Urn<'static>]) -> bool {
 	types.iter().all(|urn| is_bare_servlet_type(namespace, urn))
 }
 
 /// Wire-level advertisement checks (no registry lock)
-///
-/// Caps and local-route conflicts are checked inside
-/// [`super::ServletRegistry::reconcile_peer_slate`] under one install lock.
-#[doc(hidden)]
-pub fn peer_advertisement_wire_ok(
+fn peer_advertisement_wire_ok(
 	gateway_addr: &[u8],
 	types: &[Urn<'static>],
 	namespace: &ColonyNamespace,
@@ -87,9 +137,8 @@ pub fn peer_advertisement_wire_ok(
 /// Peer slates reconcile by cert fingerprint, not claimed `gateway_addr`.
 /// Missing trust, signer, or fingerprint computation fails closed.
 #[cfg(feature = "x509")]
-#[doc(hidden)]
 #[must_use]
-pub fn peer_signer_hive_id(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
+fn peer_signer_hive_id(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
 	let trust = trust?;
 	let signer_info = frame.nonrepudiation.as_ref()?;
 	let cert = trust.find_by_signer_info(signer_info)?;
@@ -98,27 +147,17 @@ pub fn peer_signer_hive_id(trust: Option<&dyn CertificateTrust>, frame: &Frame) 
 	Some(Arc::from(fingerprint.as_slice()))
 }
 
-/// Without x509 there is no signer fingerprint.
-#[cfg(not(feature = "x509"))]
-#[doc(hidden)]
-#[must_use]
-pub fn peer_signer_hive_id_from_gateway(gateway_addr: &[u8]) -> SharedId {
-	Arc::from(gateway_addr)
-}
-
 /// Build a Peer-routed slate keyed by `peer_hive_id` NUL type
 ///
-/// `dial_addr` is the claimed gateway socket stored on every entry.
-#[doc(hidden)]
+/// `dial` is the claimed gateway socket stored on every entry.
 #[must_use]
-pub fn build_peer_slate(
+fn build_peer_slate(
 	peer_hive_id: &SharedId,
-	dial_addr: &[u8],
+	dial: SharedId,
 	types: &[Urn<'static>],
 	initial_pheromone: u64,
 	abandonment_limit: u32,
 ) -> Vec<ServletEntry> {
-	let dial: SharedId = Arc::from(dial_addr);
 	types
 		.iter()
 		.map(|urn| {
@@ -183,7 +222,7 @@ mod tests {
 	#[test]
 	fn build_peer_slate_keys_by_hive_and_sets_dial() {
 		let hive: SharedId = Arc::from([1u8; 32].as_slice());
-		let slate = build_peer_slate(&hive, b"127.0.0.1:9000", &[ping_type()], 5000, 5);
+		let slate = build_peer_slate(&hive, Arc::from(b"127.0.0.1:9000".as_slice()), &[ping_type()], 5000, 5);
 		assert_eq!(slate.len(), 1);
 		assert_eq!(slate[0].route_kind(), RouteKind::Peer);
 		assert_eq!(slate[0].dial_target().as_ref(), b"127.0.0.1:9000");

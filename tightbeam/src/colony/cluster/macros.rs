@@ -130,13 +130,12 @@ macro_rules! cluster {
 					$crate::colony::cluster::ServletRegistry::new(config.pheromone.clone())
 				);
 
-				let (pool, peer_pool) = $crate::colony::cluster::outbound::build_cluster_pools::<$protocol>(
+				let pools = $crate::colony::cluster::outbound::build_cluster_pools::<$protocol>(
 					config.pool_config.clone(),
-					config.tls.certificate.clone(),
-					::std::sync::Arc::clone(&config.tls.key),
-					config.tls.hive_trust.as_ref().map(::std::sync::Arc::clone),
-					config.tls.peer_trust.as_ref().map(::std::sync::Arc::clone),
+					&config.tls,
 				)?;
+				let pool = pools.hive;
+				let peer_pool = pools.peer;
 
 				let registry_for_server = ::std::sync::Arc::clone(&registry);
 				let servlet_registry_for_server = ::std::sync::Arc::clone(&servlet_registry);
@@ -880,46 +879,22 @@ macro_rules! cluster {
 				$crate::cluster!(@refuse_peer_ad $frame, $trace, freshness_status);
 			}
 
-			// Peer slates key by signer fingerprint; gateway_addr is dial data.
-			#[cfg(feature = "x509")]
-			let peer_hive_id = $crate::colony::cluster::peer::peer_signer_hive_id(
-				$config.tls.peer_trust.as_deref(),
+			// Signer resolution + wire checks live in `admit`: the
+			// signer key and claimed dial address cannot be transposed.
+			let admitted = match $crate::colony::cluster::peer::AdmittedPeerAd::admit(
 				&$frame,
-			);
-			#[cfg(not(feature = "x509"))]
-			let peer_hive_id = ::core::option::Option::Some(
-				$crate::colony::cluster::peer::peer_signer_hive_id_from_gateway(&advertisement.gateway_addr),
-			);
-
-			let Some(peer_hive_id) = peer_hive_id else {
-				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard,
-					$crate::policy::TransitStatus::PermissionDenied);
+				&advertisement,
+				&$config,
+			) {
+				::core::result::Result::Ok(admitted) => admitted,
+				::core::result::Result::Err(status) => {
+					return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard, status);
+				}
 			};
 
-			let allowlist = $config.peer_dial_allowlist.as_deref();
-			if let Err(status) = $crate::colony::cluster::peer::peer_advertisement_wire_ok(
-				&advertisement.gateway_addr,
-				&advertisement.advertised_types,
-				&$config.namespace,
-				allowlist,
-			) {
-				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard, status);
-			}
-
-			let slate = $crate::colony::cluster::peer::build_peer_slate(
-				&peer_hive_id,
-				&advertisement.gateway_addr,
-				&advertisement.advertised_types,
-				$config.pheromone.initial_pheromone,
-				$config.pheromone.abandonment_limit,
-			);
-
 			if let Err(error) = $servlet_registry.reconcile_peer_slate(
-				&peer_hive_id,
-				&advertisement.gateway_addr,
-				slate,
-				$crate::constants::MAX_PEER_GATEWAYS,
-				$crate::constants::MAX_PEER_ROUTES,
+				admitted,
+				$crate::colony::cluster::PeerCaps::default(),
 			) {
 				let status = match error {
 					$crate::colony::cluster::ClusterError::PeerSlateConflict
