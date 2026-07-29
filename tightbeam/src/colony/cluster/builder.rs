@@ -3,6 +3,8 @@
 use core::time::Duration;
 use std::sync::Arc;
 
+#[cfg(feature = "x509")]
+use super::GossipConf;
 use super::{
 	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf, DEFAULT_HEARTBEAT_INTERVAL_SECS,
 	DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
@@ -104,6 +106,7 @@ pub struct ClusterConfBuilder {
 	peers: Vec<String>,
 	advertise_interval: Option<Duration>,
 	peer_dial_allowlist: Option<Vec<String>>,
+	gossip: GossipConf,
 	tls: ClusterTlsConfig,
 }
 
@@ -123,6 +126,7 @@ impl ClusterConf {
 			peers: Vec::new(),
 			advertise_interval: None,
 			peer_dial_allowlist: None,
+			gossip: GossipConf::default(),
 			tls,
 		}
 	}
@@ -197,6 +201,13 @@ impl ClusterConfBuilder {
 		self
 	}
 
+	/// Set the gossip subsystem configuration (freshness/ttl/retention +
+	/// journal); defaults to [`GossipConf::default`]
+	pub fn with_gossip_config(mut self, config: GossipConf) -> Self {
+		self.gossip = config;
+		self
+	}
+
 	/// Build the ClusterConf
 	pub fn build(self) -> ClusterConf {
 		ClusterConf {
@@ -211,6 +222,7 @@ impl ClusterConfBuilder {
 			peers: self.peers,
 			advertise_interval: self.advertise_interval,
 			peer_dial_allowlist: self.peer_dial_allowlist,
+			gossip: self.gossip,
 			tls: self.tls,
 		}
 	}

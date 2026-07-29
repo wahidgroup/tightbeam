@@ -93,6 +93,10 @@ pub enum ClusterRequest {
 	/// Peer gateway advertising exported servlet types [context 3]
 	#[asn1(context_specific = "3", constructed = "true")]
 	AdvertisePeer(PeerAdvertisement),
+	/// Relayed gossip rumor from a peer gateway [context 4]
+	#[cfg(feature = "x509")]
+	#[asn1(context_specific = "4", constructed = "true")]
+	Gossip(GossipEnvelope),
 }
 
 // =============================================================================
