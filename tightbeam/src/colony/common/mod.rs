@@ -26,8 +26,8 @@ use crate::utils::BasisPoints;
 pub use messages::*;
 pub use scaling::*;
 pub use urn::{
-	canonical_bytes, servlet_instance, type_canonical_bytes, type_prefix_bytes, ColonyNamespace, ColonyResource,
-	COLONY_NID,
+	canonical_bytes, is_bare_servlet_type, servlet_instance, type_canonical_bytes, type_prefix_bytes, ColonyNamespace,
+	ColonyResource, COLONY_NID,
 };
 
 // ============================================================================

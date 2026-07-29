@@ -204,6 +204,12 @@ pub fn servlet_instance(servlet_type: &Urn<'_>, addr: impl AsRef<str>) -> Urn<'s
 	}
 }
 
+/// Whether `urn` is a bare servlet type in `namespace` (no instance tail)
+#[must_use]
+pub fn is_bare_servlet_type(namespace: &ColonyNamespace, urn: &Urn<'_>) -> bool {
+	matches!(namespace.validate(urn), Ok(ColonyResource::Servlet { instance: None, .. }))
+}
+
 /// Canonical bytes of a URN: its display form (`urn:nid:nss`).
 ///
 /// Registries key by this form so lookups agree across processes

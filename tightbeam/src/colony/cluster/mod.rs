@@ -17,11 +17,16 @@ pub mod macros;
 pub mod registry;
 pub mod servlet_registry;
 
+#[doc(hidden)]
+pub mod outbound;
+#[doc(hidden)]
+pub mod peer;
+
 // Re-export submodule types
 pub use builder::{ClusterConfBuilder, HeartbeatConfBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
-pub use servlet_registry::{PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
+pub use servlet_registry::{PeerRouteInfo, PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
 
 use core::future::Future;
 use core::time::Duration;
@@ -219,6 +224,9 @@ pub struct ClusterConf {
 	pub peers: Vec<String>,
 	/// Re-advertise beat cadence. `None` disables the advertise beat.
 	pub advertise_interval: Option<Duration>,
+	/// When `Some`, inbound peer ads may only claim dial addresses in this
+	/// list (exact string match). `None` accepts any parseable socket.
+	pub peer_dial_allowlist: Option<Vec<String>>,
 	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
@@ -245,6 +253,7 @@ impl core::fmt::Debug for ClusterConf {
 			.field("bind_addr", &self.bind_addr)
 			.field("peers", &self.peers)
 			.field("advertise_interval", &self.advertise_interval)
+			.field("peer_dial_allowlist", &self.peer_dial_allowlist)
 			.field("tls", &self.tls)
 			.finish()
 	}
@@ -286,6 +295,9 @@ pub trait Cluster: Sized + Send + Sync {
 
 	/// Get servlet types reachable through peer gateways (learned, not local)
 	fn peer_servlets(&self) -> Vec<Vec<u8>>;
+
+	/// Learned peer routes with dial and peer identity for operators
+	fn peer_routes(&self) -> Vec<PeerRouteInfo>;
 
 	/// Get the number of registered hives
 	fn hive_count(&self) -> usize;
@@ -396,6 +408,7 @@ mod tests {
 		assert_eq!(config.heartbeat.interval, Duration::from_secs(5));
 		assert_eq!(config.heartbeat.timeout, Duration::from_secs(15));
 		assert!(config.policies.is_empty());
+		assert!(config.peer_dial_allowlist.is_none());
 	}
 
 	// =========================================================================

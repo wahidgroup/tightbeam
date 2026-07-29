@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use sha3::Sha3_256;
 use tightbeam::der::Sequence;
 use tightbeam::{
-	at_least,
+	at_least, at_most,
 	builder::TypeBuilder,
 	cluster,
 	colony::{
@@ -83,6 +83,7 @@ pub(crate) const TOPOLOGY_ROUTE_STATUS: Urn<'static> = Urn::new("test", "event:c
 pub(crate) const MULTI_REGISTER_STATUS: Urn<'static> = Urn::new("test", "event:cluster/multi-register-status");
 pub(crate) const PEER_ADVERTISE_SENT: Urn<'static> = Urn::new("test", "event:cluster/peer-advertise-sent");
 pub(crate) const PEER_AD_STATUS: Urn<'static> = Urn::new("test", "event:cluster/peer-ad-status");
+pub(crate) const PEER_ROUTES_AFTER: Urn<'static> = Urn::new("test", "event:cluster/peer-routes-after");
 pub(crate) const PEER_ROUTES_AFTER_INSTALLS: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-routes-after-installs");
 pub(crate) const PEER_ROUTES_AFTER_WITHDRAWAL: Urn<'static> =
@@ -509,10 +510,10 @@ tb_scenario! {
 		},
 		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, None)],
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			let work_request = ClusterRequest::Work(ClusterWorkRequest {
-				servlet_type: servlet_instance(&servlet_urn("ping"), "127.0.0.1:9999"),
-				payload: encode(&PingRequest { value: 21 })?,
-			});
+			let work_request = ClusterRequest::Work(ClusterWorkRequest::new(
+				servlet_instance(&servlet_urn("ping"), "127.0.0.1:9999"),
+				encode(&PingRequest { value: 21 })?,
+			));
 
 			let frame = frame_compose(Version::V0)
 				.with_id(b"instance-work")
@@ -548,8 +549,30 @@ tb_scenario! {
 /// advertising gateway's certificate. No `peers` set, so this gateway
 /// only receives.
 fn peering_cluster_conf(certs: &ClusterTestCerts) -> ClusterConf {
-	let tls = ClusterTlsConfig { peer_trust: Some(Arc::clone(&certs.trust)), ..cluster_tls_config(certs) };
+	peering_cluster_conf_with_trust(certs, Arc::clone(&certs.trust))
+}
+
+/// Like [`peering_cluster_conf`] but with an explicit peer trust store
+/// (used when more than one peer identity must verify).
+fn peering_cluster_conf_with_trust(certs: &ClusterTestCerts, peer_trust: Arc<dyn CertificateTrust>) -> ClusterConf {
+	let tls = ClusterTlsConfig { peer_trust: Some(peer_trust), ..cluster_tls_config(certs) };
 	ClusterConf::new(tls)
+}
+
+/// Importer that trusts peers only on the peer plane (hive_trust empty).
+fn peering_peer_trust_only(certs: &ClusterTestCerts) -> ClusterConf {
+	let tls = ClusterTlsConfig {
+		hive_trust: None,
+		peer_trust: Some(Arc::clone(&certs.trust)),
+		..cluster_tls_config(certs)
+	};
+	ClusterConf::new(tls)
+}
+
+fn peering_with_dial_allowlist(certs: &ClusterTestCerts, allowlist: Vec<String>) -> ClusterConf {
+	let mut conf = peering_cluster_conf(certs);
+	conf.peer_dial_allowlist = Some(allowlist);
+	conf
 }
 
 /// Gateway conf that advertises to `peer` on a fast beat. The slate is
@@ -565,7 +588,7 @@ fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: String) -> ClusterCo
 /// signed by `signer`, and return the decoded response status.
 async fn advertise_peer_signed(
 	trace: &TraceCollector,
-	certs: &ClusterTestCerts,
+	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
 	cluster: &ClusterGateway,
 	gateway_addr: &[u8],
@@ -578,12 +601,13 @@ async fn advertise_peer_signed(
 	});
 
 	let frame = signed_control_frame_with(signer, b"peer-advertise", request).await?;
-	send_advertisement_frame(trace, certs, cluster, frame).await
+	send_advertisement_frame(trace, connect_certs, cluster, frame).await
 }
 
 /// Emit an already-signed advertisement frame and decode the status:
 /// lets replay scenarios resend a byte-identical frame. Every decoded
-/// status lands on the trace as `PEER_AD_STATUS` for spec verification.
+/// status lands on the trace as `PEER_AD_STATUS`, and the surviving
+/// peer-route count as `PEER_ROUTES_AFTER`, for spec verification.
 async fn send_advertisement_frame(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
@@ -596,6 +620,8 @@ async fn send_advertisement_frame(
 	let response_frame = emit_frame(&mut client, frame).await?;
 	let response: PeerAdvertisementResponse = decode(&response_frame.message)?;
 	trace.event_with(PEER_AD_STATUS, &[], response.status)?;
+	trace.event_with(PEER_ROUTES_AFTER, &[], cluster.peer_servlets().len() as u64)?;
+
 	Ok(response.status)
 }
 
@@ -633,6 +659,17 @@ tb_assert_spec! {
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1))
 		]
+	},
+	// 1.1.0: the wire outcome joins the contract so accepting scenarios
+	// prove the peer saw Ok, not merely that the install event fired.
+	V(1,1,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok))
+		]
 	}
 }
 
@@ -645,6 +682,56 @@ tb_assert_spec! {
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1))
 		]
+	},
+	// 1.1.0: refusal contract pins the wire status AND the security
+	// property refuse => zero installed peer routes.
+	V(1,1,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// Claimed dial outside the optional allowlist is refused before install.
+tb_scenario! {
+	name: cluster_refuses_peer_dial_outside_allowlist,
+	spec: ClusterPeerRefusedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_with_dial_allowlist(&certs, vec![String::from("10.0.0.1:9000")])).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")]).await?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+// Allowlisted dial installs normally.
+tb_scenario! {
+	name: cluster_accepts_peer_dial_on_allowlist,
+	spec: ClusterPeerAdvertisedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let allowed = String::from_utf8_lossy(PEER_GATEWAY_ADDR).into_owned();
+			start_cluster(&trace, peering_with_dial_allowlist(&certs, vec![allowed])).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			install_ping_peer(&trace, &certs, &cluster).await?;
+			assert_eq!(cluster.peer_servlets().len(), 1, "allowlisted dial must install");
+
+			cluster.stop();
+			Ok(())
+		}
 	}
 }
 
@@ -667,6 +754,12 @@ tb_scenario! {
 			assert_eq!(peers[0], type_canonical_bytes(&servlet_urn("ping")), "peer route keyed by type");
 			assert!(cluster.available_servlets().is_empty(), "a peer is not a local hive");
 
+			let routes = cluster.peer_routes();
+			assert_eq!(routes.len(), 1, "peer_routes exposes the learned dial path");
+			assert_eq!(routes[0].servlet_type, type_canonical_bytes(&servlet_urn("ping")));
+			assert_eq!(routes[0].dial_addr, PEER_GATEWAY_ADDR);
+			assert!(!routes[0].peer_id.is_empty(), "peer_id is the signer fingerprint");
+
 			cluster.stop();
 			Ok(())
 		}
@@ -685,8 +778,7 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let slate = vec![servlet_urn("ping"), servlet_urn("echo")];
-			let status = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, slate).await?;
-			assert_eq!(status, TransitStatus::Ok, "trusted advertisement must install");
+			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, slate).await?;
 
 			let mut peers = cluster.peer_servlets();
 			peers.sort_unstable();
@@ -795,9 +887,7 @@ tb_scenario! {
 			start_cluster(&trace, routing_cluster_conf(&certs, None)).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			let status = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")]).await?;
-			assert_eq!(status, TransitStatus::PermissionDenied, "peer_trust=None must refuse federation");
-			assert!(cluster.peer_servlets().is_empty(), "refused advertisement installs no routes");
+			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")]).await?;
 
 			cluster.stop();
 			Ok(())
@@ -820,9 +910,7 @@ tb_scenario! {
 				ColonyNamespace::new("tightbeam", "other-realm").map_err(|_| TightBeamError::MissingResponse)?;
 			let foreign = foreign_ns.servlet("ping").map_err(|_| TightBeamError::MissingResponse)?;
 
-			let status = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![foreign]).await?;
-			assert_eq!(status, TransitStatus::PermissionDenied, "foreign realm fails nestmate recognition");
-			assert!(cluster.peer_servlets().is_empty(), "foreign advertisement installs no routes");
+			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![foreign]).await?;
 
 			cluster.stop();
 			Ok(())
@@ -895,7 +983,7 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
-	pub ClusterPeerWorkLocalOnlySpec,
+	pub ClusterPeerForwardLoopGuardSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
@@ -908,12 +996,11 @@ tb_assert_spec! {
 	}
 }
 
-// Work selection stays local: a type reachable only through a peer route
-// is Unavailable to clients, because a bare work frame must never be
-// dialed at a peer gateway as though it were a servlet.
+// Already-forwarded work never re-forwards: peer-only types stay
+// Unavailable under the one-hop loop guard.
 tb_scenario! {
-	name: cluster_work_ignores_peer_routes,
-	spec: ClusterPeerWorkLocalOnlySpec,
+	name: cluster_refuses_reforward_of_peer_work,
+	spec: ClusterPeerForwardLoopGuardSpec,
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
@@ -925,11 +1012,216 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let work_response = emit_ping_work(&mut client, b"peer-only-work").await?;
-			assert_eq!(work_response.status, TransitStatus::Unavailable, "peer routes must not serve work yet");
-			assert!(work_response.payload.is_none(), "unroutable work must not carry a payload");
+			let work_response = emit_forwarded_ping_work(&mut client, b"reforward-guard").await?;
+			assert_eq!(
+				work_response.status,
+				TransitStatus::Unavailable,
+				"forwarded work must not select peer routes"
+			);
+			assert!(work_response.payload.is_none(), "loop-guard refusal must not carry a payload");
 
 			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerForwardEchoSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(2)),
+			(WORK_ECHOED, exactly!(1), equals!(42u64))
+		]
+	}
+}
+
+// Unary cross-cluster forward: ping lives only on B; client asks A; A
+// wraps Work{forwarded:true}, B serves locally, echo returns.
+tb_scenario! {
+	name: cluster_forwards_work_to_peer_gateway,
+	spec: ClusterPeerForwardEchoSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let receiver = start_cluster(&trace, peering_cluster_conf(&certs)).await?;
+			let receiver_addr = receiver.addr();
+			let advertiser =
+				start_cluster(&trace, advertising_cluster_conf(&certs, receiver_addr.to_string())).await?;
+
+			let registered = hive.register_with_cluster(advertiser.addr()).await?;
+			assert_eq!(registered.status, TransitStatus::Ok, "hive must join the exporting colony");
+
+			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			assert_eq!(learned.len(), 1, "importer must learn the peer type before work");
+
+			trace.event(WORK_SENT)?;
+
+			let mut client = connect_cluster(&certs, receiver.addr()).await?;
+			let work_response = emit_ping_work(&mut client, b"forward-echo").await?;
+			assert_eq!(work_response.status, TransitStatus::Ok, "forwarded work must succeed");
+
+			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
+			let ping_response: PingResponse = decode(&payload)?;
+			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+
+			advertiser.stop();
+			receiver.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+// Peer hops dial on peer_trust: importer with hive_trust=None still forwards
+// when the peer gateway cert is anchored only in peer_trust.
+tb_scenario! {
+	name: cluster_forwards_on_peer_trust_plane,
+	spec: ClusterPeerForwardEchoSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let receiver = start_cluster(&trace, peering_peer_trust_only(&certs)).await?;
+			let receiver_addr = receiver.addr();
+			let advertiser =
+				start_cluster(&trace, advertising_cluster_conf(&certs, receiver_addr.to_string())).await?;
+
+			let registered = hive.register_with_cluster(advertiser.addr()).await?;
+			assert_eq!(registered.status, TransitStatus::Ok, "hive must join the exporting colony");
+
+			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			assert_eq!(learned.len(), 1, "importer must learn the peer type before work");
+
+			trace.event(WORK_SENT)?;
+
+			let mut client = connect_cluster(&certs, receiver.addr()).await?;
+			let work_response = emit_ping_work(&mut client, b"peer-plane").await?;
+			assert_eq!(work_response.status, TransitStatus::Ok, "peer_pool dial must succeed");
+
+			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
+			let ping_response: PingResponse = decode(&payload)?;
+			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+
+			advertiser.stop();
+			receiver.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+// Claimed gateway_addr that matches a local servlet address is refused.
+tb_scenario! {
+	name: cluster_refuses_peer_dial_colliding_local_servlet,
+	spec: ClusterPeerRefusedSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let cluster = start_cluster(&trace, peering_cluster_conf(&certs)).await?;
+			let registered = hive.register_with_cluster(cluster.addr()).await?;
+			assert_eq!(registered.status, TransitStatus::Ok, "local hive must register");
+
+			let hive_addr = hive.addr().to_string().into_bytes();
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+			let update = emit_servlet_update(
+				&mut client,
+				&certs.key,
+				b"collide-local",
+				servlet_address_update(&hive_addr, vec![servlet_info("ping", PEER_GATEWAY_ADDR)], vec![]),
+			)
+			.await?;
+			assert_eq!(update.status, TransitStatus::Ok, "local servlet locator must land");
+
+			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("echo")]).await?;
+
+			cluster.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerLocalitySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(WORK_SENT, exactly!(36)),
+			(events::CLUSTER_WORK_FORWARDED, at_most!(6)),
+			(WORK_ECHOED, exactly!(36), equals!(42u64))
+		]
+	}
+}
+
+// Local and peer both serve ping: warm local trails first, then admit the
+// peer route. Seeded forager keeps the roulette stream reproducible so the
+// reinforced local trail claims most later work on-colony.
+tb_scenario! {
+	name: cluster_locality_prefers_local_over_peer,
+	spec: ClusterPeerLocalitySpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let mut local_conf = peering_cluster_conf(&certs);
+			local_conf.load_balancer = Arc::new(StochasticForager::with_seed(0x7F0));
+			let local_gateway = start_cluster(&trace, local_conf).await?;
+
+			let registered_local = hive.register_with_cluster(local_gateway.addr()).await?;
+			assert_eq!(registered_local.status, TransitStatus::Ok, "local hive must join importer");
+
+			for i in 0..12u8 {
+				trace.event(WORK_SENT)?;
+
+				let mut client = connect_cluster(&certs, local_gateway.addr()).await?;
+				let id = [b'w', b'a', b'r', i];
+
+				let work_response = emit_ping_work(&mut client, &id).await?;
+				assert_eq!(work_response.status, TransitStatus::Ok, "warmup work must succeed");
+
+				let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
+				let ping_response: PingResponse = decode(&payload)?;
+				trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+			}
+
+			let config = advertising_cluster_conf(&certs, local_gateway.addr().to_string());
+			let peer_gateway = start_cluster(&trace, config).await?;
+			let peer_hive = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			let registered_peer = peer_hive.register_with_cluster(peer_gateway.addr()).await?;
+			assert_eq!(registered_peer.status, TransitStatus::Ok, "peer hive must join exporter");
+
+			let learned = wait_for_peer_types(&local_gateway, 50, Duration::from_millis(100)).await;
+			assert_eq!(learned.len(), 1, "importer must learn the peer type");
+
+			for i in 0..24u8 {
+				trace.event(WORK_SENT)?;
+				let mut client = connect_cluster(&certs, local_gateway.addr()).await?;
+				let id = [b'l', b'o', b'c', i];
+
+				let work_response = emit_ping_work(&mut client, &id).await?;
+				assert_eq!(work_response.status, TransitStatus::Ok, "locality work must succeed");
+
+				let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
+				let ping_response: PingResponse = decode(&payload)?;
+				trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+			}
+
+			peer_hive.stop();
+			peer_gateway.stop();
+			local_gateway.stop();
+			hive.stop();
 			Ok(())
 		}
 	}
@@ -1313,10 +1605,10 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let cluster_addr = cluster.addr();
 
-			let work_request = ClusterRequest::Work(ClusterWorkRequest {
-				servlet_type: servlet_urn("ping"),
-				payload: encode(&PingRequest { value: 21 })?,
-			});
+			let work_request = ClusterRequest::Work(ClusterWorkRequest::new(
+				servlet_urn("ping"),
+				encode(&PingRequest { value: 21 })?,
+			));
 
 			let frame = frame_compose(Version::V0)
 				.with_id(b"policy-test")
@@ -2033,10 +2325,28 @@ async fn emit_ping_work(
 	client: &mut GenericClient<TokioListener>,
 	id: &[u8],
 ) -> Result<ClusterWorkResponse, TightBeamError> {
-	let work_request = ClusterRequest::Work(ClusterWorkRequest {
-		servlet_type: servlet_urn("ping"),
-		payload: encode(&PingRequest { value: 21 })?,
-	});
+	let work_request = ClusterRequest::Work(ClusterWorkRequest::new(
+		servlet_urn("ping"),
+		encode(&PingRequest { value: 21 })?,
+	));
+
+	let frame = frame_compose(Version::V0)
+		.with_id(id)
+		.with_order(0)
+		.with_message(work_request)
+		.build()?;
+
+	decode(&emit_frame(client, frame).await?.message)
+}
+
+/// Ping work already marked forwarded (loop-guard probe).
+async fn emit_forwarded_ping_work(
+	client: &mut GenericClient<TokioListener>,
+	id: &[u8],
+) -> Result<ClusterWorkResponse, TightBeamError> {
+	let work_request = ClusterRequest::Work(
+		ClusterWorkRequest::new(servlet_urn("ping"), encode(&PingRequest { value: 21 })?).into_forwarded(),
+	);
 
 	let frame = frame_compose(Version::V0)
 		.with_id(id)

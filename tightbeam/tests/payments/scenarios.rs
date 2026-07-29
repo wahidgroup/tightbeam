@@ -220,10 +220,8 @@ tb_scenario! {
 
 			// Create authorization transaction
 			let transaction = create_auth_transaction(b"E2E-001", MonetaryAmount::new(10000, *b"USD"));
-			let work_request = ClusterRequest::Work(ClusterWorkRequest {
-				servlet_type: authorization_urn(),
-				payload: encode(&transaction)?,
-			});
+			let work_request =
+				ClusterRequest::Work(ClusterWorkRequest::new(authorization_urn(), encode(&transaction)?));
 
 			let frame = compose(Version::V0)
 				.with_id(b"payment-auth")

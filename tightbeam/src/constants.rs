@@ -318,3 +318,14 @@ pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;
 /// before it installs unbounded peer routes, the same control-message
 /// flood bound gossip meshes apply to their advertisement path (CWE-770).
 pub const MAX_ADVERTISED_TYPES: usize = 256;
+
+/// Ceiling on distinct peer gateways tracked in one servlet registry
+///
+/// Per-advertisement type caps alone leave trusted-peer registry growth
+/// unbounded across many signers (CWE-770).
+pub const MAX_PEER_GATEWAYS: usize = 64;
+
+/// Ceiling on total live peer routes tracked in one servlet registry
+///
+/// Bounds aggregate Peer entries across all peer gateways (CWE-770).
+pub const MAX_PEER_ROUTES: usize = 1024;

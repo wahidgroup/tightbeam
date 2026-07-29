@@ -163,10 +163,7 @@ async fn start_laser_hive(
 
 /// Emit one beam work request through a gateway and decode the response.
 async fn emit_beam_work(certs: &GatewayCerts, addr: LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
-	let work_request = ClusterRequest::Work(ClusterWorkRequest {
-		servlet_type: beam_urn(),
-		payload: encode(&BeamRequest { value: 21 })?,
-	});
+	let work_request = ClusterRequest::Work(ClusterWorkRequest::new(beam_urn(), encode(&BeamRequest { value: 21 })?));
 
 	let frame = frame_compose(Version::V0)
 		.with_id(b"laser-work")
