@@ -247,13 +247,14 @@ macro_rules! cluster {
 				// key store, so the beat only exists with x509.
 				#[cfg(feature = "x509")]
 				let advertise_handle = {
-					let registry = ::std::sync::Arc::clone(&registry);
+					let servlet_registry = ::std::sync::Arc::clone(&servlet_registry);
 					let config = ::std::sync::Arc::clone(&config);
 
 					// Federation crosses trust planes: a peer gateway's TLS
 					// identity is anchored in `peer_trust`, not `hive_trust`,
 					// so the beat dials on its own peer-plane pool. Without
 					// `peer_trust` the hive pool is the only plane available.
+					//
 					// TODO(zero-copy): `ConnectionBuilder::with_client_identity`
 					// and `with_config` take `CertificateSpec`/`PoolConfig` by
 					// value, forcing clones here and in the hive pool build
@@ -277,7 +278,7 @@ macro_rules! cluster {
 					};
 					let gateway_addr: Vec<u8> = addr.clone().into();
 
-					Some($crate::cluster!(@build_advertise_task $protocol, registry, advertise_pool, config, gateway_addr, $digest))
+					Some($crate::cluster!(@build_advertise_task $protocol, servlet_registry, advertise_pool, config, gateway_addr, $digest))
 				};
 				#[cfg(not(feature = "x509"))]
 				let advertise_handle = ::std::option::Option::None;
@@ -1101,11 +1102,11 @@ macro_rules! cluster {
 	};
 
 	// Helper: Build the advertise beat task. Inert unless an interval and
-	// peers are configured. Each tick snapshots the hive registry: the
-	// slate is point-in-time truth, so types appear as hives register and
-	// disappear as they leave. An empty slate is still sent.
-	(@build_advertise_task $protocol:path, $registry:expr, $pool:expr, $config:expr, $gateway_addr:expr, $digest:path) => {{
-		let registry = $registry;
+	// peers are configured. Each tick advertises the servlet registry's
+	// live local routes, capped at MAX_ADVERTISED_TYPES.
+	// An empty slate is still sent.
+	(@build_advertise_task $protocol:path, $servlet_registry:expr, $pool:expr, $config:expr, $gateway_addr:expr, $digest:path) => {{
+		let servlet_registry = $servlet_registry;
 		let pool = $pool;
 		let config = $config;
 		let gateway_addr = $gateway_addr;
@@ -1119,12 +1120,13 @@ macro_rules! cluster {
 			loop {
 				$crate::colony::servlet::servlet_runtime::rt::sleep(interval).await;
 
-				let slate: Vec<$crate::utils::urn::Urn<'static>> = registry
-					.to_available_servlets()
+				let slate: Vec<$crate::utils::urn::Urn<'static>> = servlet_registry
+					.local_servlets()
 					.unwrap_or_default()
 					.iter()
 					.filter_map(|bytes| core::str::from_utf8(bytes).ok())
 					.filter_map(|canonical| canonical.parse().ok())
+					.take($crate::constants::MAX_ADVERTISED_TYPES)
 					.collect();
 
 				for peer in config.peers.iter() {

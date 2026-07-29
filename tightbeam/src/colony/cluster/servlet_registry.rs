@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use super::error::ClusterError;
@@ -225,6 +225,10 @@ pub struct ServletRegistry {
 	type_index: RwLock<HashMap<SharedId, Vec<SharedId>>>,
 	/// Reverse index: hive_id -> Vec<address>
 	hive_index: RwLock<HashMap<SharedId, Vec<SharedId>>>,
+	/// Serializes whole-slate reconciliation: reconcile spans several
+	/// individually locked operations, and interleaved reconciles for one
+	/// hive would prune each other's fresh installs (TOCTOU).
+	reconcile_gate: Mutex<()>,
 	/// Configuration
 	config: PheromoneConf,
 }
@@ -236,6 +240,7 @@ impl ServletRegistry {
 			entries: RwLock::new(HashMap::new()),
 			type_index: RwLock::new(HashMap::new()),
 			hive_index: RwLock::new(HashMap::new()),
+			reconcile_gate: Mutex::new(()),
 			config,
 		}
 	}
@@ -346,7 +351,10 @@ impl ServletRegistry {
 	/// before the first add. Any mid-flight failure rolls back to the
 	/// prior slate, so a caller never observes a mixed one. Every entry
 	/// must carry `hive_id` as its hive, or the prune misses it.
+	/// Serialized by `reconcile_gate`.
 	pub fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
+		let _gate = self.reconcile_gate.lock()?;
+
 		let prior: Vec<ServletEntry> = {
 			let addresses: Vec<SharedId> = {
 				let hive_idx = self.hive_index.read()?;
@@ -517,6 +525,25 @@ impl ServletRegistry {
 			.collect();
 
 		Ok(local)
+	}
+
+	/// Distinct servlet types owned by this gateway's own hives, sorted
+	///
+	/// Route truth for the advertise beat: unlike the hive registry's
+	/// registration-time servlet index, this sees address updates and
+	/// eviction.
+	pub fn local_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
+		let entries = self.entries.read()?;
+		let mut types: Vec<SharedId> = entries
+			.values()
+			.filter(|entry| entry.route_kind == RouteKind::Local)
+			.filter(|entry| entry.is_live())
+			.map(|entry| Arc::clone(&entry.servlet_type))
+			.collect();
+		types.sort_unstable();
+		types.dedup();
+
+		Ok(types)
 	}
 
 	/// Whether a peer slate keyed by `gateway_id` would touch local routes
@@ -816,6 +843,69 @@ mod tests {
 
 		let local = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
 		assert!(local.is_empty());
+	}
+
+	// Non-empty slates install before they prune, so a serialized
+	// registry is never observably empty once seeded. An empty sighting
+	// or a final count other than one proves interleaved reconciles
+	// pruned each other's fresh installs.
+	#[test]
+	fn reconcile_by_hive_serializes_concurrent_slates() {
+		use core::sync::atomic::{AtomicBool, Ordering};
+
+		let registry = ServletRegistry::default();
+		registry
+			.reconcile_by_hive(b"gw", vec![peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw")])
+			.ok();
+
+		let saw_empty = AtomicBool::new(false);
+		std::thread::scope(|scope| {
+			scope.spawn(|| {
+				for _ in 0..2000 {
+					let slate = vec![peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw")];
+					registry.reconcile_by_hive(b"gw", slate).ok();
+				}
+			});
+			scope.spawn(|| {
+				for _ in 0..2000 {
+					let slate = vec![peer_entry(b"gw\0urn:t:b", b"urn:t:b", b"gw")];
+					registry.reconcile_by_hive(b"gw", slate).ok();
+				}
+			});
+			scope.spawn(|| {
+				for _ in 0..20000 {
+					let empty = registry.peer_servlets().ok().unwrap_or_default().is_empty();
+					saw_empty.fetch_or(empty, Ordering::Relaxed);
+				}
+			});
+		});
+
+		assert!(!saw_empty.load(Ordering::Relaxed));
+		assert_eq!(registry.peer_servlets().ok().unwrap_or_default().len(), 1);
+	}
+
+	#[test]
+	fn local_servlets_dedups_and_excludes_peer_routes() {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"a1", b"calc", b"hive1")).ok();
+		registry.add(named_entry(b"a2", b"calc", b"hive1")).ok();
+		registry.add(named_entry(b"a3", b"echo", b"hive1")).ok();
+		registry.add(peer_entry(b"gw\0urn:t:x", b"urn:t:x", b"gw")).ok();
+
+		let types = registry.local_servlets().ok().unwrap_or_default();
+		assert_eq!(types.len(), 2);
+	}
+
+	#[test]
+	fn local_servlets_tracks_adds_and_removes() {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"a1", b"calc", b"hive1")).ok();
+		registry.add(named_entry(b"a2", b"echo", b"hive1")).ok();
+		registry.remove(b"a2").ok();
+
+		let types = registry.local_servlets().ok().unwrap_or_default();
+		assert_eq!(types.len(), 1);
+		assert_eq!(types[0].as_ref(), b"calc");
 	}
 
 	#[test]

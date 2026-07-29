@@ -39,7 +39,7 @@ use tightbeam::{
 		servlet::ServletConf,
 	},
 	compose,
-	constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
+	constants::{DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, MAX_ADVERTISED_TYPES},
 	crypto::{
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
@@ -1007,6 +1007,114 @@ tb_scenario! {
 			advertiser.stop();
 			receiver.stop();
 			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterBeatUpdatedSlateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64))
+		]
+	}
+}
+
+// The advertised slate is route truth, not registration history: a type
+// that joins through a servlet address update surfaces at the peer on
+// the next beat, exactly like a registration-time type.
+tb_scenario! {
+	name: cluster_beat_slate_tracks_servlet_updates,
+	spec: ClusterBeatUpdatedSlateSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster: receiver }| async move {
+			let advertiser =
+				start_cluster(&trace, advertising_cluster_conf(&certs, receiver.addr().to_string())).await?;
+
+			let hive_addr = b"127.0.0.1:65041".as_slice();
+			let mut client = connect_cluster(&certs, advertiser.addr()).await?;
+			register_signed_hive(&mut client, &certs.key, b"reg-beat-update", hive_addr).await?;
+			emit_servlet_update(
+				&mut client,
+				&certs.key,
+				b"add-beat-echo",
+				servlet_address_update(hive_addr, vec![servlet_info("echo", b"127.0.0.1:65042")], vec![]),
+			)
+			.await?;
+
+			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
+
+			advertiser.stop();
+			receiver.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterBeatCapSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(MAX_ADVERTISED_TYPES as u64))
+		]
+	}
+}
+
+// The beat honors the receiver's advertisement cap: a colony exporting
+// more types than MAX_ADVERTISED_TYPES advertises a deterministic capped
+// subset instead of an oversized slate every receiver refuses, which
+// would silently wedge federation.
+tb_scenario! {
+	name: cluster_beat_bounds_slate_to_advertised_cap,
+	spec: ClusterBeatCapSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster: receiver }| async move {
+			let advertiser =
+				start_cluster(&trace, advertising_cluster_conf(&certs, receiver.addr().to_string())).await?;
+
+			let hive_addr = b"127.0.0.1:65043".as_slice();
+			let mut client = connect_cluster(&certs, advertiser.addr()).await?;
+			register_signed_hive(&mut client, &certs.key, b"reg-beat-cap", hive_addr).await?;
+
+			let over_cap: Vec<ServletInfo> = (0..=MAX_ADVERTISED_TYPES)
+				.map(|i| {
+					let addr = format!("127.0.0.1:{}", 20000 + i);
+					servlet_info(&format!("t{i}"), addr.as_bytes())
+				})
+				.collect();
+			emit_servlet_update(
+				&mut client,
+				&certs.key,
+				b"add-beat-cap",
+				servlet_address_update(hive_addr, over_cap, vec![]),
+			)
+			.await?;
+
+			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
+
+			advertiser.stop();
+			receiver.stop();
 			Ok(())
 		}
 	}
