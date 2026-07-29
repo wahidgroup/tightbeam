@@ -14,15 +14,23 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use digest::consts::U32;
+use digest::OutputSizeUser;
+
 use super::ClusterError;
 use crate::colony::common::{canonical_bytes, is_bare_servlet_type, ColonyNamespace, GossipEnvelope};
 use crate::constants::{
-	DEFAULT_GOSSIP_RETENTION_MS, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES,
+	DEFAULT_GOSSIP_RETENTION_MS, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL,
 };
-use crate::crypto::hash::{Digest, Sha3_256};
+use crate::crypto::hash::Digest;
 use crate::policy::TransitStatus;
 
-/// Fixed 32-byte content digest of a gossip rumor (Sha3-256 output).
+/// Fixed 32-byte content digest of a gossip rumor
+///
+/// The hash algorithm is the deployment's crypto profile digest (defaulting
+/// to Sha3-256), constrained to a 256-bit output. It is a cluster-wide
+/// invariant: deduplication and anti-entropy reconciliation require every
+/// gateway to derive the identical digest for the same rumor.
 pub type GossipDigest = [u8; 32];
 
 /// Whether a recorded rumor is newly seen or a suppressed duplicate.
@@ -41,10 +49,16 @@ pub enum Admission {
 /// times are distinct rumors because `issued_at_ms` participates. Each
 /// variable-length field is prefixed with its length so distinct
 /// target-and-payload splits cannot collide onto one digest (CWE-694).
+///
+/// The digest algorithm `D` is the deployment crypto profile digest and is
+/// a cluster-wide invariant; a per-gateway choice would break dedup.
 #[must_use]
-pub fn gossip_digest(envelope: &GossipEnvelope) -> GossipDigest {
+pub fn gossip_digest<D>(envelope: &GossipEnvelope) -> GossipDigest
+where
+	D: Digest + OutputSizeUser<OutputSize = U32>,
+{
 	let target_bytes = canonical_bytes(&envelope.target);
-	let mut hasher = Sha3_256::new();
+	let mut hasher = D::new();
 	hasher.update(envelope.issued_at_ms.to_be_bytes());
 	hasher.update((target_bytes.len() as u64).to_be_bytes());
 	hasher.update(&target_bytes);
@@ -71,21 +85,29 @@ pub struct AdmittedGossip {
 impl AdmittedGossip {
 	/// Admit a wire envelope, failing closed with the refusal status
 	///
-	/// Refuses an oversized payload, a rumor outside the freshness window,
-	/// or a target that is not a bare servlet type in `namespace`.
-	pub fn admit(
+	/// Refuses an oversized payload, a time-to-live above [`MAX_GOSSIP_TTL`],
+	/// a rumor outside the freshness window, or a target that is not a bare
+	/// servlet type in `namespace`. The time-to-live cap is enforced here,
+	/// the trust boundary, so a hostile signer cannot request a wider flood
+	/// radius by bypassing the publish-time clamp (CWE-770). The digest
+	/// algorithm `D` matches the deployment crypto profile.
+	pub fn admit<D>(
 		envelope: &GossipEnvelope,
 		namespace: &ColonyNamespace,
 		seen_ttl_ms: u64,
 		now_ms: u64,
-	) -> Result<Self, TransitStatus> {
+	) -> Result<Self, TransitStatus>
+	where
+		D: Digest + OutputSizeUser<OutputSize = U32>,
+	{
 		let within_payload = envelope.payload.len() <= MAX_GOSSIP_PAYLOAD_BYTES;
+		let within_ttl = envelope.ttl <= MAX_GOSSIP_TTL;
 		let fresh = now_ms.abs_diff(envelope.issued_at_ms) <= seen_ttl_ms;
 		let target_bare = is_bare_servlet_type(namespace, &envelope.target);
 
-		if within_payload && fresh && target_bare {
+		if within_payload && within_ttl && fresh && target_bare {
 			let type_key = canonical_bytes(&envelope.target);
-			let digest = gossip_digest(envelope);
+			let digest = gossip_digest::<D>(envelope);
 
 			let admitted = Self { digest, type_key };
 			Ok(admitted)
@@ -128,14 +150,17 @@ pub trait GossipJournal: Send + Sync {
 		now_ms: u64,
 	) -> Result<Admission, ClusterError>;
 
-	/// Digests currently retained, summarized to a peer during reconciliation.
-	fn held_digests(&self) -> Result<Vec<GossipDigest>, ClusterError>;
+	/// Digests still within the retention window, summarized to a peer
+	/// during reconciliation. Entries older than the window are excluded.
+	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError>;
 
-	/// Retained envelopes for the digests a peer reported missing.
-	fn fetch(&self, wanted: &[GossipDigest]) -> Result<Vec<GossipEnvelope>, ClusterError>;
+	/// Retained envelopes for the digests a peer reported missing, excluding
+	/// any that have aged out of the retention window.
+	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<GossipEnvelope>, ClusterError>;
 
-	/// Retained rumors not yet delivered to a local instance (retry set).
-	fn pending_local(&self) -> Result<Vec<GossipEnvelope>, ClusterError>;
+	/// Retained rumors not yet delivered to a local instance (retry set),
+	/// excluding any that have aged out of the retention window.
+	fn pending_local(&self, now_ms: u64) -> Result<Vec<GossipEnvelope>, ClusterError>;
 
 	/// Confirm a local delivery so the rumor stops being retried.
 	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError>;
@@ -154,8 +179,9 @@ struct JournalEntry {
 /// Dedup is global on the content digest, so a rumor re-signed by a relaying
 /// gateway is still recognized. The per-signer capacity bounds how many
 /// distinct rumors one signer may hold, so a signer minting digests cannot
-/// evict rumors recorded for other signers. Retention prunes on write in
-/// both clock directions, tolerating a backward clock step.
+/// evict rumors recorded for other signers. Retention prunes on every read
+/// and write in both clock directions, tolerating a backward clock step, so
+/// an aged-out rumor is never returned even during a quiet period.
 pub struct MemoryGossipJournal {
 	entries: Mutex<HashMap<GossipDigest, JournalEntry>>,
 	retention_ms: u64,
@@ -175,6 +201,12 @@ impl MemoryGossipJournal {
 	pub fn with_limits(retention_ms: u64, capacity: usize, per_signer_capacity: usize) -> Self {
 		Self { entries: Mutex::new(HashMap::new()), retention_ms, capacity, per_signer_capacity }
 	}
+
+	/// Drop entries whose age exceeds the retention window in either clock
+	/// direction. The single pruning rule keeps reads and writes consistent.
+	fn prune(entries: &mut HashMap<GossipDigest, JournalEntry>, retention_ms: u64, now_ms: u64) {
+		entries.retain(|_, entry| now_ms.abs_diff(entry.recorded_ms) <= retention_ms);
+	}
 }
 
 impl Default for MemoryGossipJournal {
@@ -192,7 +224,7 @@ impl GossipJournal for MemoryGossipJournal {
 		now_ms: u64,
 	) -> Result<Admission, ClusterError> {
 		let mut entries = self.entries.lock()?;
-		entries.retain(|_, entry| now_ms.abs_diff(entry.recorded_ms) <= self.retention_ms);
+		Self::prune(&mut entries, self.retention_ms, now_ms);
 
 		if entries.contains_key(&digest) {
 			return Ok(Admission::Duplicate);
@@ -217,14 +249,18 @@ impl GossipJournal for MemoryGossipJournal {
 		}
 	}
 
-	fn held_digests(&self) -> Result<Vec<GossipDigest>, ClusterError> {
-		let entries = self.entries.lock()?;
+	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
+		let mut entries = self.entries.lock()?;
+		Self::prune(&mut entries, self.retention_ms, now_ms);
 		let digests = entries.keys().copied().collect();
+
 		Ok(digests)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest]) -> Result<Vec<GossipEnvelope>, ClusterError> {
-		let entries = self.entries.lock()?;
+	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<GossipEnvelope>, ClusterError> {
+		let mut entries = self.entries.lock()?;
+		Self::prune(&mut entries, self.retention_ms, now_ms);
+
 		let found = wanted
 			.iter()
 			.filter_map(|digest| entries.get(digest))
@@ -234,13 +270,16 @@ impl GossipJournal for MemoryGossipJournal {
 		Ok(found)
 	}
 
-	fn pending_local(&self) -> Result<Vec<GossipEnvelope>, ClusterError> {
-		let entries = self.entries.lock()?;
+	fn pending_local(&self, now_ms: u64) -> Result<Vec<GossipEnvelope>, ClusterError> {
+		let mut entries = self.entries.lock()?;
+		Self::prune(&mut entries, self.retention_ms, now_ms);
+
 		let pending = entries
 			.values()
 			.filter(|entry| !entry.delivered_local)
 			.map(|entry| entry.envelope.clone())
 			.collect();
+
 		Ok(pending)
 	}
 
@@ -258,9 +297,14 @@ impl GossipJournal for MemoryGossipJournal {
 mod tests {
 	use super::*;
 	use crate::colony::common::servlet_instance;
+	use crate::crypto::hash::Sha3_256;
 
 	fn nestmate_ns() -> ColonyNamespace {
 		ColonyNamespace::default()
+	}
+
+	fn digest(envelope: &GossipEnvelope) -> GossipDigest {
+		gossip_digest::<Sha3_256>(envelope)
 	}
 
 	fn ping_target() -> crate::utils::urn::Urn<'static> {
@@ -274,14 +318,14 @@ mod tests {
 	#[test]
 	fn digest_is_deterministic() {
 		let rumor = envelope(1_000, 4, vec![1, 2, 3]);
-		assert_eq!(gossip_digest(&rumor), gossip_digest(&rumor));
+		assert_eq!(digest(&rumor), digest(&rumor));
 	}
 
 	#[test]
 	fn digest_ignores_ttl() {
 		let low = envelope(1_000, 1, vec![1, 2, 3]);
 		let high = envelope(1_000, 8, vec![1, 2, 3]);
-		assert_eq!(gossip_digest(&low), gossip_digest(&high));
+		assert_eq!(digest(&low), digest(&high));
 	}
 
 	#[test]
@@ -289,8 +333,8 @@ mod tests {
 		let base = envelope(1_000, 4, vec![1, 2, 3]);
 		let other_payload = envelope(1_000, 4, vec![9, 9, 9]);
 		let other_time = envelope(2_000, 4, vec![1, 2, 3]);
-		assert_ne!(gossip_digest(&base), gossip_digest(&other_payload));
-		assert_ne!(gossip_digest(&base), gossip_digest(&other_time));
+		assert_ne!(digest(&base), digest(&other_payload));
+		assert_ne!(digest(&base), digest(&other_time));
 	}
 
 	#[test]
@@ -299,28 +343,35 @@ mod tests {
 		let pin = nestmate_ns().servlet("pin").expect("static servlet name");
 		let longer_target = GossipEnvelope { issued_at_ms: 1_000, target: ping, ttl: 4, payload: b"data".to_vec() };
 		let shorter_target = GossipEnvelope { issued_at_ms: 1_000, target: pin, ttl: 4, payload: b"gdata".to_vec() };
-		assert_ne!(gossip_digest(&longer_target), gossip_digest(&shorter_target));
+		assert_ne!(digest(&longer_target), digest(&shorter_target));
 	}
 
 	#[test]
 	fn admit_accepts_valid_rumor() {
 		let rumor = envelope(1_000, 4, vec![1, 2, 3]);
-		let admitted = AdmittedGossip::admit(&rumor, &nestmate_ns(), 30_000, 1_000).expect("valid rumor");
+		let admitted = AdmittedGossip::admit::<Sha3_256>(&rumor, &nestmate_ns(), 30_000, 1_000).expect("valid rumor");
 		assert_eq!(admitted.type_key(), canonical_bytes(&ping_target()).as_slice());
-		assert_eq!(admitted.digest(), gossip_digest(&rumor));
+		assert_eq!(admitted.digest(), digest(&rumor));
 	}
 
 	#[test]
 	fn admit_refuses_oversized_payload() {
 		let rumor = envelope(1_000, 4, vec![0u8; MAX_GOSSIP_PAYLOAD_BYTES + 1]);
-		let status = AdmittedGossip::admit(&rumor, &nestmate_ns(), 30_000, 1_000);
+		let status = AdmittedGossip::admit::<Sha3_256>(&rumor, &nestmate_ns(), 30_000, 1_000);
+		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
+	}
+
+	#[test]
+	fn admit_refuses_excessive_ttl() {
+		let rumor = envelope(1_000, MAX_GOSSIP_TTL + 1, vec![1, 2, 3]);
+		let status = AdmittedGossip::admit::<Sha3_256>(&rumor, &nestmate_ns(), 30_000, 1_000);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
 	#[test]
 	fn admit_refuses_stale_rumor() {
 		let rumor = envelope(1_000, 4, vec![1, 2, 3]);
-		let status = AdmittedGossip::admit(&rumor, &nestmate_ns(), 30_000, 100_000);
+		let status = AdmittedGossip::admit::<Sha3_256>(&rumor, &nestmate_ns(), 30_000, 100_000);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
@@ -328,7 +379,7 @@ mod tests {
 	fn admit_refuses_instance_target() {
 		let instance = servlet_instance(&ping_target(), "127.0.0.1:9000");
 		let rumor = GossipEnvelope { issued_at_ms: 1_000, target: instance, ttl: 4, payload: vec![1] };
-		let status = AdmittedGossip::admit(&rumor, &nestmate_ns(), 30_000, 1_000);
+		let status = AdmittedGossip::admit::<Sha3_256>(&rumor, &nestmate_ns(), 30_000, 1_000);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
@@ -336,7 +387,7 @@ mod tests {
 	fn record_dedups_same_digest() {
 		let journal = MemoryGossipJournal::default();
 		let rumor = envelope(1_000, 4, vec![1, 2, 3]);
-		let digest = gossip_digest(&rumor);
+		let digest = digest(&rumor);
 
 		let first = journal.record(b"signer-a", digest, &rumor, 1_000).expect("first record");
 		let second = journal.record(b"signer-a", digest, &rumor, 1_000).expect("second record");
@@ -349,10 +400,10 @@ mod tests {
 		let journal = MemoryGossipJournal::with_limits(30_000, 1, 8);
 		let first = envelope(1_000, 4, vec![1]);
 		let second = envelope(1_000, 4, vec![2]);
-		journal
-			.record(b"signer-a", gossip_digest(&first), &first, 1_000)
-			.expect("first fits");
-		let overflow = journal.record(b"signer-a", gossip_digest(&second), &second, 1_000);
+
+		journal.record(b"signer-a", digest(&first), &first, 1_000).expect("first fits");
+
+		let overflow = journal.record(b"signer-a", digest(&second), &second, 1_000);
 		assert!(matches!(overflow, Err(ClusterError::GossipJournalAtCapacity)));
 	}
 
@@ -364,12 +415,12 @@ mod tests {
 		let other = envelope(1_000, 4, vec![3]);
 
 		journal
-			.record(b"signer-a", gossip_digest(&first), &first, 1_000)
+			.record(b"signer-a", digest(&first), &first, 1_000)
 			.expect("first signer fits");
 
-		let over = journal.record(b"signer-a", gossip_digest(&second), &second, 1_000);
+		let over = journal.record(b"signer-a", digest(&second), &second, 1_000);
 		let other_signer = journal
-			.record(b"signer-b", gossip_digest(&other), &other, 1_000)
+			.record(b"signer-b", digest(&other), &other, 1_000)
 			.expect("other signer fits");
 		assert!(matches!(over, Err(ClusterError::GossipJournalAtCapacity)));
 		assert_eq!(other_signer, Admission::New);
@@ -379,13 +430,13 @@ mod tests {
 	fn pending_local_clears_on_ack() {
 		let journal = MemoryGossipJournal::default();
 		let rumor = envelope(1_000, 4, vec![1, 2, 3]);
-		let digest = gossip_digest(&rumor);
+		let digest = digest(&rumor);
 
 		journal.record(b"signer-a", digest, &rumor, 1_000).expect("record");
-		let before = journal.pending_local().expect("pending before ack");
+		let before = journal.pending_local(1_000).expect("pending before ack");
 		journal.ack_local(&digest).expect("ack");
 
-		let after = journal.pending_local().expect("pending after ack");
+		let after = journal.pending_local(1_000).expect("pending after ack");
 		assert_eq!(before.len(), 1);
 		assert_eq!(after.len(), 0);
 	}
@@ -395,14 +446,12 @@ mod tests {
 		let journal = MemoryGossipJournal::default();
 		let first = envelope(1_000, 4, vec![1]);
 		let second = envelope(1_000, 4, vec![2]);
-		let first_digest = gossip_digest(&first);
+		let first_digest = digest(&first);
 
 		journal.record(b"signer-a", first_digest, &first, 1_000).expect("first");
-		journal
-			.record(b"signer-a", gossip_digest(&second), &second, 1_000)
-			.expect("second");
+		journal.record(b"signer-a", digest(&second), &second, 1_000).expect("second");
 
-		let fetched = journal.fetch(&[first_digest]).expect("fetch");
+		let fetched = journal.fetch(&[first_digest], 1_000).expect("fetch");
 		assert_eq!(fetched, vec![first]);
 	}
 
@@ -412,14 +461,26 @@ mod tests {
 		let early = envelope(1_000, 4, vec![1]);
 		let late = envelope(1_000, 4, vec![2]);
 
-		journal
-			.record(b"signer-a", gossip_digest(&early), &early, 0)
-			.expect("early record");
-		journal
-			.record(b"signer-a", gossip_digest(&late), &late, 200)
-			.expect("late record");
+		journal.record(b"signer-a", digest(&early), &early, 0).expect("early record");
+		journal.record(b"signer-a", digest(&late), &late, 200).expect("late record");
 
-		let held = journal.held_digests().expect("held");
-		assert_eq!(held, vec![gossip_digest(&late)]);
+		let held = journal.held_digests(200).expect("held");
+		assert_eq!(held, vec![digest(&late)]);
+	}
+
+	#[test]
+	fn reads_prune_expired_entries_without_a_write() {
+		let journal = MemoryGossipJournal::with_limits(100, 8, 8);
+		let rumor = envelope(1_000, 4, vec![1]);
+		let rumor_digest = digest(&rumor);
+
+		journal.record(b"signer-a", rumor_digest, &rumor, 0).expect("record");
+
+		let held = journal.held_digests(1_000).expect("held past window");
+		let fetched = journal.fetch(&[rumor_digest], 1_000).expect("fetch past window");
+		let pending = journal.pending_local(1_000).expect("pending past window");
+		assert_eq!(held.len(), 0);
+		assert_eq!(fetched.len(), 0);
+		assert_eq!(pending.len(), 0);
 	}
 }
