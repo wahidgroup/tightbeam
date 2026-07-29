@@ -65,7 +65,7 @@ use tightbeam::{
 	Beamable, Frame, TightBeamError, Version,
 };
 
-use crate::common::x509::GatewayCerts;
+use crate::common::x509::{combined_trust, GatewayCerts};
 
 // Client-side markers only: facts the gateway cannot observe (the client
 // reached its send, a probe fired). Gateway decisions are asserted through
@@ -82,6 +82,13 @@ pub(crate) const TOPOLOGY_ADD_STATUS: Urn<'static> = Urn::new("test", "event:clu
 pub(crate) const TOPOLOGY_ROUTE_STATUS: Urn<'static> = Urn::new("test", "event:cluster/topology-route-status");
 pub(crate) const MULTI_REGISTER_STATUS: Urn<'static> = Urn::new("test", "event:cluster/multi-register-status");
 pub(crate) const PEER_ADVERTISE_SENT: Urn<'static> = Urn::new("test", "event:cluster/peer-advertise-sent");
+pub(crate) const PEER_AD_STATUS: Urn<'static> = Urn::new("test", "event:cluster/peer-ad-status");
+pub(crate) const PEER_ROUTES_AFTER_INSTALLS: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-routes-after-installs");
+pub(crate) const PEER_ROUTES_AFTER_WITHDRAWAL: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-routes-after-withdrawal");
+pub(crate) const PEER_PING_LIVE_AFTER_WITHDRAWAL: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-ping-live-after-withdrawal");
 
 /// Address the simulated peer gateway advertises itself at.
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
@@ -554,11 +561,12 @@ fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: String) -> ClusterCo
 	conf
 }
 
-/// Send one signed advertisement of `types` from a peer at `gateway_addr`
-/// and return the decoded response status.
-async fn advertise_peer(
+/// Send one signed advertisement of `types` from a peer at `gateway_addr`,
+/// signed by `signer`, and return the decoded response status.
+async fn advertise_peer_signed(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
+	signer: &Secp256k1SigningKey,
 	cluster: &ClusterGateway,
 	gateway_addr: &[u8],
 	types: Vec<Urn<'static>>,
@@ -568,14 +576,39 @@ async fn advertise_peer(
 		gateway_addr: gateway_addr.to_vec(),
 		advertised_types: types,
 	});
-	let frame = signed_control_frame(certs, b"peer-advertise", request).await?;
 
+	let frame = signed_control_frame_with(signer, b"peer-advertise", request).await?;
+	send_advertisement_frame(trace, certs, cluster, frame).await
+}
+
+/// Emit an already-signed advertisement frame and decode the status:
+/// lets replay scenarios resend a byte-identical frame. Every decoded
+/// status lands on the trace as `PEER_AD_STATUS` for spec verification.
+async fn send_advertisement_frame(
+	trace: &TraceCollector,
+	certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+	frame: Frame,
+) -> Result<TransitStatus, TightBeamError> {
 	let mut client = connect_cluster(certs, cluster.addr()).await?;
 	trace.event(PEER_ADVERTISE_SENT)?;
 
 	let response_frame = emit_frame(&mut client, frame).await?;
 	let response: PeerAdvertisementResponse = decode(&response_frame.message)?;
+	trace.event_with(PEER_AD_STATUS, &[], response.status)?;
 	Ok(response.status)
+}
+
+/// Send one signed advertisement of `types` from a peer at `gateway_addr`
+/// and return the decoded response status.
+async fn advertise_peer(
+	trace: &TraceCollector,
+	certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+	gateway_addr: &[u8],
+	types: Vec<Urn<'static>>,
+) -> Result<TransitStatus, TightBeamError> {
+	advertise_peer_signed(trace, certs, &certs.key, cluster, gateway_addr, types).await
 }
 
 /// Advertise a one-type ping slate from the simulated peer gateway and
@@ -671,6 +704,86 @@ tb_scenario! {
 	}
 }
 
+/// Receiver identity plus a second, independently trusted peer signer.
+struct PeerPairCerts {
+	gateway: GatewayCerts,
+	peer_b: (Certificate, Secp256k1SigningKey),
+	peer_trust: Arc<dyn CertificateTrust>,
+}
+
+fn peer_pair_certs() -> PeerPairCerts {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::utils::create_test_certificate;
+
+	let gateway = cluster_certs();
+	let raw_b = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let cert_b = create_test_certificate(&raw_b);
+	let key_b = Secp256k1SigningKey::from(raw_b);
+	let peer_trust = combined_trust(&[&gateway.cert, &cert_b]);
+
+	PeerPairCerts { gateway, peer_b: (cert_b, key_b), peer_trust }
+}
+
+/// Receiver conf anchoring both pair identities in `peer_trust`.
+fn peering_pair_conf(certs: &PeerPairCerts) -> ClusterConf {
+	let tls = ClusterTlsConfig {
+		peer_trust: Some(Arc::clone(&certs.peer_trust)),
+		..cluster_tls_config(&certs.gateway)
+	};
+	ClusterConf::new(tls)
+}
+
+tb_assert_spec! {
+	pub ClusterPeerSignerKeyedSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(3)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(3)),
+			(PEER_AD_STATUS, exactly!(3), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(2u64)),
+			(PEER_ROUTES_AFTER_WITHDRAWAL, exactly!(1), equals!(1u64)),
+			(PEER_PING_LIVE_AFTER_WITHDRAWAL, exactly!(1), equals!(1u64))
+		]
+	}
+}
+
+// Slates belong to the authenticated signer, not the claimed gateway
+// address: two trusted peers advertising under the same address keep
+// independent slates (two routes after both install), and one peer's
+// withdrawal only evicts its own routes (ping survives echo's exit).
+tb_scenario! {
+	name: cluster_peer_slates_keyed_by_signer,
+	spec: ClusterPeerSignerKeyedSpec,
+	environment Cluster {
+		context: peer_pair_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_pair_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let gateway = &certs.gateway;
+			advertise_peer_signed(&trace, gateway, &gateway.key, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")])
+				.await?;
+			advertise_peer_signed(&trace, gateway, &certs.peer_b.1, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("echo")])
+				.await?;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets().len() as u64)?;
+
+			advertise_peer_signed(&trace, gateway, &certs.peer_b.1, &cluster, PEER_GATEWAY_ADDR, vec![]).await?;
+			let survivors = cluster.peer_servlets();
+			trace.event_with(PEER_ROUTES_AFTER_WITHDRAWAL, &[], survivors.len() as u64)?;
+			trace.event_with(
+				PEER_PING_LIVE_AFTER_WITHDRAWAL,
+				&[],
+				u64::from(survivors.contains(&type_canonical_bytes(&servlet_urn("ping")))),
+			)?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
 // Federation is default-off: a gateway without `peer_trust` refuses every
 // advertisement fail-closed, installing no peer routes.
 tb_scenario! {
@@ -710,6 +823,70 @@ tb_scenario! {
 			let status = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![foreign]).await?;
 			assert_eq!(status, TransitStatus::PermissionDenied, "foreign realm fails nestmate recognition");
 			assert!(cluster.peer_servlets().is_empty(), "foreign advertisement installs no routes");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerReplayReleasedSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(2)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64))
+		]
+	}
+}
+
+// A refusal is not a penalty box: an advertisement refused on local state
+// (address conflict) releases its replay record, so the peer can resend
+// the byte-identical signed frame once the conflict clears and install.
+tb_scenario! {
+	name: cluster_advertisement_retryable_after_refusal,
+	spec: ClusterPeerReplayReleasedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let hive_addr = b"127.0.0.1:65031".as_slice();
+			let locator = String::from_utf8_lossy(PEER_GATEWAY_ADDR);
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+			register_signed_hive(&mut client, &certs.key, b"reg-conflict", hive_addr).await?;
+			emit_servlet_update(
+				&mut client,
+				&certs.key,
+				b"add-conflict",
+				servlet_address_update(hive_addr, vec![servlet_info("ping", PEER_GATEWAY_ADDR)], vec![]),
+			)
+			.await?;
+
+			let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
+				issued_at_ms: current_timestamp_ms(),
+				gateway_addr: PEER_GATEWAY_ADDR.to_vec(),
+				advertised_types: vec![servlet_urn("ping")],
+			});
+
+			let frame = signed_control_frame(&certs, b"peer-advertise", request).await?;
+
+			send_advertisement_frame(&trace, &certs, &cluster, frame.to_owned()).await?;
+			emit_servlet_update(
+				&mut client,
+				&certs.key,
+				b"del-conflict",
+				servlet_address_update(hive_addr, vec![], vec![servlet_instance(&servlet_urn("ping"), locator.as_ref())]),
+			)
+			.await?;
+
+			send_advertisement_frame(&trace, &certs, &cluster, frame).await?;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets().len() as u64)?;
 
 			cluster.stop();
 			Ok(())
@@ -826,6 +1003,102 @@ tb_scenario! {
 			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
 			assert_eq!(learned.len(), 1, "beat must carry the newly registered type");
 			assert_eq!(learned[0], type_canonical_bytes(&servlet_urn("ping")), "peer route keyed by type");
+
+			advertiser.stop();
+			receiver.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Exporter (advertiser + hive) identity on one trust plane, receiver on
+/// another: only `peer_trust` can validate the receiver's TLS identity,
+/// so the advertise beat must dial on the peer plane, never the hive one.
+struct SplitPlaneCerts {
+	exporter: ClusterTestCerts,
+	receiver: (Certificate, Secp256k1SigningKey),
+	receiver_trust: Arc<dyn CertificateTrust>,
+}
+
+fn split_plane_certs() -> SplitPlaneCerts {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::utils::create_test_certificate;
+
+	let exporter = cluster_certs();
+	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let receiver_cert = create_test_certificate(&raw);
+	let receiver_key = Secp256k1SigningKey::from(raw);
+	let receiver_trust = combined_trust(&[&receiver_cert]);
+	SplitPlaneCerts { exporter, receiver: (receiver_cert, receiver_key), receiver_trust }
+}
+
+fn share_certs(certs: &ClusterTestCerts) -> Arc<ClusterTestCerts> {
+	Arc::new(GatewayCerts {
+		cert: certs.cert.to_owned(),
+		key: certs.key.to_owned(),
+		trust: Arc::clone(&certs.trust),
+	})
+}
+
+/// Receiver with its own identity: `peer_trust` anchors the exporter's
+/// certificate so its signed advertisements verify.
+fn receiving_peer_conf(certs: &SplitPlaneCerts) -> ClusterConf {
+	ClusterConf::new(ClusterTlsConfig {
+		certificate: CertificateSpec::Built(Box::new(certs.receiver.0.to_owned())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.receiver.1.to_owned())),
+		validators: vec![],
+		client_validators: vec![],
+		hive_trust: Some(Arc::clone(&certs.exporter.trust)),
+		peer_trust: Some(Arc::clone(&certs.exporter.trust)),
+	})
+}
+
+/// Advertiser whose hive plane cannot validate the receiver: only
+/// `peer_trust` anchors the receiver's identity.
+fn cross_plane_advertising_conf(certs: &SplitPlaneCerts, peer: String) -> ClusterConf {
+	let tls = ClusterTlsConfig {
+		peer_trust: Some(Arc::clone(&certs.receiver_trust)),
+		..cluster_tls_config(&certs.exporter)
+	};
+
+	let mut conf = ClusterConf::new(tls);
+	conf.peers = vec![peer];
+	conf.advertise_interval = Some(Duration::from_millis(100));
+	conf
+}
+
+tb_assert_spec! {
+	pub ClusterPeerPlaneBeatSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, at_least!(1), equals!(1u64)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64))
+		]
+	}
+}
+
+// Federation crosses trust planes: the receiver's TLS identity is only
+// anchored in the advertiser's `peer_trust`, so the beat must dial on the
+// peer plane. A beat riding the hive-trust pool never connects.
+tb_scenario! {
+	name: cluster_beat_dials_on_peer_trust_plane,
+	spec: ClusterPeerPlaneBeatSpec,
+	environment Hive {
+		context: split_plane_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, share_certs(&certs.exporter), None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let receiver = start_cluster(&trace, receiving_peer_conf(&certs)).await?;
+			let receiver_addr = receiver.addr().to_string();
+			let advertiser = start_cluster(&trace, cross_plane_advertising_conf(&certs, receiver_addr)).await?;
+
+			hive.register_with_cluster(advertiser.addr()).await?;
+
+			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			advertiser.stop();
 			receiver.stop();

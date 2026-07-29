@@ -249,10 +249,35 @@ macro_rules! cluster {
 				let advertise_handle = {
 					let registry = ::std::sync::Arc::clone(&registry);
 					let config = ::std::sync::Arc::clone(&config);
-					let pool = ::std::sync::Arc::clone(&pool);
+
+					// Federation crosses trust planes: a peer gateway's TLS
+					// identity is anchored in `peer_trust`, not `hive_trust`,
+					// so the beat dials on its own peer-plane pool. Without
+					// `peer_trust` the hive pool is the only plane available.
+					// TODO(zero-copy): `ConnectionBuilder::with_client_identity`
+					// and `with_config` take `CertificateSpec`/`PoolConfig` by
+					// value, forcing clones here and in the hive pool build
+					// above. Rework the trait to borrow or take `Arc` so pool
+					// construction is zero-copy.
+					let advertise_pool = match config.tls.peer_trust {
+						Some(ref trust) => {
+							use $crate::transport::client::pool::ConnectionBuilder;
+							::std::sync::Arc::new(
+								$crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
+									.with_config(config.pool_config.clone())
+									.with_client_identity(
+										config.tls.certificate.clone(),
+										::std::sync::Arc::clone(&config.tls.key),
+									)?
+									.with_trust_store(::std::sync::Arc::clone(trust))
+									.build(),
+							)
+						}
+						None => ::std::sync::Arc::clone(&pool),
+					};
 					let gateway_addr: Vec<u8> = addr.clone().into();
 
-					Some($crate::cluster!(@build_advertise_task $protocol, registry, pool, config, gateway_addr, $digest))
+					Some($crate::cluster!(@build_advertise_task $protocol, registry, advertise_pool, config, gateway_addr, $digest))
 				};
 				#[cfg(not(feature = "x509"))]
 				let advertise_handle = ::std::option::Option::None;
@@ -828,6 +853,33 @@ macro_rules! cluster {
 				});
 			}
 
+			// Slate ownership binds to the AUTHENTICATED signer certificate,
+			// never the claimed gateway_addr: any trusted peer could
+			// otherwise claim another peer's address and clobber or withdraw
+			// that peer's slate (CWE-290).
+			#[cfg(feature = "x509")]
+			let peer_hive_id: ::std::option::Option<Vec<u8>> =
+				$frame.nonrepudiation.as_ref().and_then(|signer_info| {
+					$config.tls.peer_trust.as_ref().and_then(|trust| {
+						trust.find_by_signer_info(signer_info).and_then(|cert| {
+							$crate::crypto::x509::store::CertificateTrustStore::to_fingerprint(cert)
+								.ok()
+								.map(|fingerprint| fingerprint.to_vec())
+						})
+					})
+				});
+
+			// Without x509 there is no signer identity to bind: the claimed
+			// address is the only available slate key.
+			#[cfg(not(feature = "x509"))]
+			let peer_hive_id: ::std::option::Option<Vec<u8>> =
+				::std::option::Option::Some(advertisement.gateway_addr.to_vec());
+
+			let ::std::option::Option::Some(peer_hive_id) = peer_hive_id else {
+				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard,
+					$crate::policy::TransitStatus::PermissionDenied);
+			};
+
 			// Nestmate recognition (structural CHC half): every advertised
 			// identity must be a bare servlet type URN in this gateway's
 			// realm/NID. A foreign authority or realm is refused before any
@@ -843,28 +895,29 @@ macro_rules! cluster {
 
 			let within_cap = advertisement.advertised_types.len() <= $crate::constants::MAX_ADVERTISED_TYPES;
 
-			// A peer slate replaces only prior Peer state: a gateway_addr
-			// that collides with a local servlet address or local hive key
-			// would let a trusted peer clobber routes the hive trust plane
-			// installed, so it is refused (CWE-284).
+			// A peer slate replaces only prior Peer state: a gateway_addr or
+			// signer fingerprint that collides with a local servlet address
+			// or local hive key would let a trusted peer clobber routes the
+			// hive trust plane installed, so it is refused (CWE-284).
 			let no_local_conflict = matches!(
 				$servlet_registry.peer_key_conflicts_local(&advertisement.gateway_addr),
+				Ok(false)
+			) && matches!(
+				$servlet_registry.peer_key_conflicts_local(&peer_hive_id),
 				Ok(false)
 			);
 
 			if !gateway_addr_valid || !types_valid || !within_cap || !no_local_conflict {
-				let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
-				return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse {
-					status: $crate::policy::TransitStatus::PermissionDenied,
-				});
+				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard,
+					$crate::policy::TransitStatus::PermissionDenied);
 			}
 
 			// Peer routes live only in the servlet registry, reconciled by
-			// the peer gateway address as the hive key. Entries are keyed
-			// by a per-type route key (gateway NUL type) because the entry
-			// map is one-entry-per-address: keying every type by the bare
-			// gateway address would keep only the last type in the slate.
-			let gateway_id: ::std::sync::Arc<[u8]> = advertisement.gateway_addr.as_slice().into();
+			// the signer identity as the hive key. Entries are keyed by a
+			// per-type route key (signer NUL type) because the entry map is
+			// one-entry-per-address: keying every type by the bare signer
+			// identity would keep only the last type in the slate.
+			let gateway_id: ::std::sync::Arc<[u8]> = peer_hive_id.as_slice().into();
 			let slate: Vec<$crate::colony::cluster::ServletEntry> = advertisement
 				.advertised_types
 				.iter()
@@ -885,29 +938,32 @@ macro_rules! cluster {
 				})
 				.collect();
 
-			let status = match $servlet_registry.reconcile_by_hive(&gateway_id, slate) {
-				Ok(()) => {
-					let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISED);
-					$crate::policy::TransitStatus::Ok
-				}
-				Err(_) => {
-					// Release the replay record so the peer can resend the
-					// same signed advertisement after the failure clears.
-					// The prior slate survives: reconcile installs before
-					// it prunes, so a failure never wipes the peer's routes.
-					#[cfg(feature = "x509")]
-					if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
-						$replay_guard.forget(signer_info.signature.as_bytes());
-					}
+			if $servlet_registry.reconcile_by_hive(&gateway_id, slate).is_err() {
+				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard,
+					$crate::policy::TransitStatus::PermissionDenied);
+			}
 
-					let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
-					$crate::policy::TransitStatus::PermissionDenied
-				}
-			};
-
-			return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse { status });
+			let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISED);
+			return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse {
+				status: $crate::policy::TransitStatus::Ok,
+			});
 		}
 		}
+	}};
+
+	// Helper: refuse a peer advertisement whose replay record already
+	// exists. The refusal is deterministic on local state, so the record
+	// is released: the peer must be able to resend the same signed frame
+	// once that state clears (CWE-772). Refusals BEFORE the freshness
+	// check reply plain instead: no record exists yet, or the record IS
+	// the protection being enforced.
+	(@refuse_peer_ad $frame:ident, $trace:ident, $replay_guard:ident, $status:expr) => {{
+		#[cfg(feature = "x509")]
+		if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
+			$replay_guard.forget(signer_info.signature.as_bytes());
+		}
+		let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
+		$crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse { status: $status })
 	}};
 
 	// Helper: Forward work to a servlet

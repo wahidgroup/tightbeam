@@ -339,18 +339,32 @@ impl ServletRegistry {
 		Ok(entry)
 	}
 
-	/// Replace one hive's slate with `entries`, keeping it routable throughout.
+	/// Replace one hive's slate with `entries`, all-or-nothing.
 	///
 	/// Installs the new entries first, then prunes the hive's addresses
-	/// absent, from the new slate. A mid-install failure leaves the prior
-	/// slate intact rather than wiped: remove-then-add would drop every
-	/// route before the first add. Every entry must carry `hive_id` as its
-	/// hive, or the prune misses it.
+	/// absent from the new slate: remove-then-add would drop every route
+	/// before the first add. Any mid-flight failure rolls back to the
+	/// prior slate, so a caller never observes a mixed one. Every entry
+	/// must carry `hive_id` as its hive, or the prune misses it.
 	pub fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
+		let prior: Vec<ServletEntry> = {
+			let addresses: Vec<SharedId> = {
+				let hive_idx = self.hive_index.read()?;
+				hive_idx.get(hive_id).cloned().unwrap_or_default()
+			};
+			let map = self.entries.read()?;
+			addresses.iter().filter_map(|addr| map.get(addr.as_ref()).cloned()).collect()
+		};
+
 		let mut fresh: Vec<SharedId> = Vec::with_capacity(entries.len());
 		for entry in entries {
-			fresh.push(Arc::clone(&entry.address));
-			self.add(entry)?;
+			let addr = Arc::clone(&entry.address);
+			if let Err(err) = self.add(entry) {
+				self.restore_slate(&fresh, &prior);
+				return Err(err);
+			}
+
+			fresh.push(addr);
 		}
 
 		let stale: Vec<SharedId> = {
@@ -365,10 +379,25 @@ impl ServletRegistry {
 		};
 
 		for addr in &stale {
-			self.remove(addr)?;
+			if let Err(err) = self.remove(addr) {
+				self.restore_slate(&fresh, &prior);
+				return Err(err);
+			}
 		}
 
 		Ok(())
+	}
+
+	/// Best-effort rollback for a failed reconcile: retire the fresh
+	/// installs, then re-add the prior slate (covering entries the fresh
+	/// installs displaced and any already-pruned stale routes).
+	fn restore_slate(&self, fresh: &[SharedId], prior: &[ServletEntry]) {
+		for addr in fresh {
+			let _ = self.remove(addr);
+		}
+		for entry in prior {
+			let _ = self.add(entry.clone());
+		}
 	}
 
 	/// Remove all entries belonging to a hive
