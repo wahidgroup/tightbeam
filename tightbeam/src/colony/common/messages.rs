@@ -97,6 +97,10 @@ pub enum ClusterRequest {
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "4", constructed = "true")]
 	Gossip(GossipEnvelope),
+	/// Origin gossip rumor from a local publisher [context 5]
+	#[cfg(feature = "x509")]
+	#[asn1(context_specific = "5", constructed = "true")]
+	PublishGossip(GossipEnvelope),
 }
 
 // =============================================================================
@@ -569,6 +573,28 @@ mod tests {
 			issued_at_ms: 1_000,
 			gateway_addr: b"127.0.0.1:9000".to_vec(),
 			advertised_types: vec![ping_type()],
+		}))
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn cluster_request_gossip_round_trips() -> Result<()> {
+		round_trip(ClusterRequest::Gossip(GossipEnvelope {
+			issued_at_ms: 1_000,
+			target: ping_type(),
+			ttl: 3,
+			payload: vec![0x02, 0x01, 0x2A],
+		}))
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn cluster_request_publish_gossip_round_trips() -> Result<()> {
+		round_trip(ClusterRequest::PublishGossip(GossipEnvelope {
+			issued_at_ms: 1_000,
+			target: ping_type(),
+			ttl: 3,
+			payload: vec![0x02, 0x01, 0x2A],
 		}))
 	}
 
