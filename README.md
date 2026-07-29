@@ -912,13 +912,15 @@ END
 
 ## 6. Security Model
 
+This section describes how tightbeam selects and enforces cryptographic algorithms. A `SecurityProfile` declares algorithm OIDs at compile time. Provider traits supply the operations that realize those algorithms at run time. Message-level requirements are specified in [§6.4](#64-message-level-security-requirements).
+
 ### 6.1 SecurityProfile Trait Architecture
 
-tightbeam uses a trait-based security profile system that separates compile-time algorithm constraints from runtime protocol behavior.
+A `SecurityProfile` is a compile-time metadata type. It declares which algorithm identifiers (OIDs) a message type or component MAY use. It does not perform cryptographic operations by itself. Runtime work is supplied through provider traits that compose into `CryptoProvider` ([§6.5](#65-cryptoprovider-system)).
 
 #### Design Principles
 
-The `SecurityProfile` trait defines a pure metadata layer that declares algorithm identifiers (OIDs) for cryptographic operations:
+The `SecurityProfile` trait associates OID types with digest, AEAD, signature, curve, and KEM roles. An optional key-wrap OID MAY be set as a constant:
 
 ```rust
 pub trait SecurityProfile {
@@ -934,19 +936,19 @@ pub trait SecurityProfile {
 
 #### Role-Based Provider Traits
 
-tightbeam separates cryptographic concerns through specialized provider traits:
+tightbeam splits cryptographic work across specialized provider traits. A component depends only on the providers it needs.
 
-- **`DigestProvider`**: Hash/digest operations (SHA-256 ([FIPS 180-4][fips180-4]), SHA3-256 ([FIPS 202][fips202]), etc.)
-- **`AeadProvider`**: Authenticated encryption (AES-GCM variants)
-- **`SigningProvider`**: Signature generation and verification (ECDSA ([FIPS 186-5][fips186-5]), Ed25519 ([RFC 8032][rfc8032]))
-- **`KdfProvider`**: Key derivation functions (HKDF, [RFC 5869][rfc5869])
-- **`CurveProvider`**: Elliptic curve operations (secp256k1, P-384 ([RFC 5480][rfc5480]), X25519 ([RFC 7748][rfc7748]))
+- **`DigestProvider`**: Hash and digest operations. Examples include SHA-256 ([FIPS 180-4][fips180-4]) and SHA3-256 ([FIPS 202][fips202]).
+- **`AeadProvider`**: Authenticated encryption. Examples include AES-GCM variants.
+- **`SigningProvider`**: Signature generation and verification. Examples include ECDSA ([FIPS 186-5][fips186-5]) and Ed25519 ([RFC 8032][rfc8032]).
+- **`KdfProvider`**: Key derivation. Examples include HKDF ([RFC 5869][rfc5869]).
+- **`CurveProvider`**: Elliptic-curve operations. Examples include secp256k1, P-384 ([RFC 5480][rfc5480]), and X25519 ([RFC 7748][rfc7748]).
 
-These traits compose into `CryptoProvider`, allowing components to specify only the cryptographic capabilities they require rather than depending on the full provider.
+These traits compose into `CryptoProvider`. Full composition rules are in [§6.5 CryptoProvider System](#65-cryptoprovider-system).
 
 ### 6.2 Security Profile Types
 
-Applications implement the `SecurityProfile` trait to define their own cryptographic algorithm constraints:
+An application implements `SecurityProfile` to fix the algorithm set for a security context. Different message types MAY use different profile types.
 
 #### Implementing Custom Profiles
 
@@ -967,7 +969,7 @@ impl SecurityProfile for MyAppProfile {
 
 #### Built-in Default Profile
 
-tightbeam provides `TightbeamProfile` as a reference implementation and default:
+`TightbeamProfile` is the built-in default and reference profile:
 
 ```rust
 pub struct TightbeamProfile;
@@ -983,18 +985,18 @@ impl SecurityProfile for TightbeamProfile {
 }
 ```
 
-Applications can define multiple profiles for different security contexts (e.g., `HighSecurityProfile`, `LegacyProfile`, `QuantumResistantProfile`) and use them with different message types.
+> Note: Applications MAY define additional profiles for other contexts. Examples include a high-assurance profile, a legacy-interop profile, or a post-quantum profile. Bind each profile to the message types that require it ([§6.4](#64-message-level-security-requirements)).
 
 ### 6.3 Numeric Security Levels
 
-Numeric security levels are a convenience shorthand:
+Numeric security levels are a shorthand for common `Message` requirement flags. They do not replace a typed `SecurityProfile`.
 
-- Level 1 or 2 -> Sets `confidential + nonrepudiable + min_version = V1`
-- Does NOT enable algorithm OID validation (use type-based profiles for that)
+- Level 1 or level 2 sets confidential and nonrepudiable requirements and sets `min_version` to `V1`.
+- Numeric levels do **not** enable algorithm OID validation. Use a type-based `SecurityProfile` for OID checks ([§6.4](#64-message-level-security-requirements)).
 
 ### 6.4 Message-Level Security Requirements
 
-tightbeam supports run-time security profile enforcement at the message type level through the `Message` trait and compile-time security enforcement at the message composition level:
+The `Message` trait attaches security requirements to a message type. Composition paths enforce those requirements at compile time when a typed profile is active. Frame validation checks the resulting shape at run time.
 
 ```rust
 pub trait Message: /* trait bounds */ {
@@ -1012,38 +1014,36 @@ pub trait Message: /* trait bounds */ {
 
 #### Profile-Based Algorithm Constraints
 
-**HAS_PROFILE**: Controls whether the message type enforces algorithm constraints
+`HAS_PROFILE` selects whether the message type enforces algorithm OID matching.
 
-- When `false` (default): Message uses `TightbeamProfile` but does not enforce algorithm OID matching
-- When `true`: FrameBuilder validates that all cryptographic operations use algorithms from the message's `Profile` type
+- When `HAS_PROFILE` is `false` (default), the associated `Profile` defaults to `TightbeamProfile`. Composition does not require OID matching against that profile.
+- When `HAS_PROFILE` is `true`, `FrameBuilder` and `compose!` require cryptographic operations to use algorithms from `Message::Profile`.
 
-**Profile Type**: Specifies which `SecurityProfile` implementation constrains algorithm selection
+The associated `Profile` type MAY be any type that implements `SecurityProfile`. It defaults to `TightbeamProfile` when the application does not set another type. OID validation runs at compile time only when `HAS_PROFILE` is `true`.
 
-- Defaults to `TightbeamProfile` if not specified
-- Can be set to any type implementing `SecurityProfile`
-- Affects compile-time validation when `HAS_PROFILE = true`
+When `HAS_PROFILE` is `true`, the following matches are required at compile time:
 
-**Algorithm Validation**: When `HAS_PROFILE = true`, the following validations occur at compile time:
+- Digest algorithms MUST match `<Profile::DigestOid as AssociatedOid>::OID`.
+- AEAD ciphers MUST match `<Profile::AeadOid as AssociatedOid>::OID`.
+- Signature algorithms MUST match `<Profile::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID`.
 
-- Digest algorithms must match `<Profile::DigestOid as AssociatedOid>::OID`
-- AEAD ciphers must match `<Profile::AeadOid as AssociatedOid>::OID`
-- Signature algorithms must match `<Profile::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID`
-
-This ensures that message types with specific security profiles can only be composed with compatible cryptographic algorithms.
+A message type with a typed profile therefore composes only with compatible algorithms.
 
 #### Security Requirement Semantics
 
-- When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
-- When a message type specifies `MUST_BE_CONFIDENTIAL = true`, the Frame's metadata MUST include a `confidentiality` field
-- When a message type specifies `MUST_BE_COMPRESSED = true`, the Frame's metadata `compactness` field MUST NOT be `none`
-- When a message type specifies `MUST_BE_PRIORITIZED = true`, the Frame's metadata MUST include a `priority` field (V2+ only)
-- The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
+- When `MUST_BE_NON_REPUDIABLE` is `true`, the Frame MUST include `nonrepudiation`.
+- When `MUST_BE_CONFIDENTIAL` is `true`, `Metadata` MUST include `confidentiality`.
+- When `MUST_BE_COMPRESSED` is `true`, `Metadata.compactness` MUST be present (not absent).
+- When `MUST_BE_PRIORITIZED` is `true`, `Metadata` MUST include `priority`. This requirement applies only for V2 and later.
+- When `MUST_HAVE_MESSAGE_INTEGRITY` is `true`, `Metadata.integrity` (MI) MUST be present.
+- When `MUST_HAVE_FRAME_INTEGRITY` is `true`, `Frame.integrity` (FI) MUST be present.
+- `Frame.version` MUST be greater than or equal to `Message::MIN_VERSION`.
 
 #### Profile Validation in FrameBuilder
 
-When composing frames with `FrameBuilder`, profile constraints are enforced at compile time if the message type has `HAS_PROFILE = true`:
+When `HAS_PROFILE` is `true`, `FrameBuilder` and `compose!` enforce profile constraints at compile time.
 
-**Using the `compose!` Macro:**
+**Using the `compose!` macro:**
 
 ```rust
 // Example: Message with custom profile
@@ -1062,7 +1062,7 @@ let frame = compose! {
 }?;
 ```
 
-**Using FrameBuilder Directly:**
+**Using FrameBuilder directly:**
 
 ```rust
 // FrameBuilder validates algorithm OIDs match MyAppProfile
@@ -1076,29 +1076,26 @@ let frame = compose::<SecureMessage>(Version::V1)
 	.build()?;
 ```
 
-> Note: All tightbeam macros are entirely optional and contain underlying functionality and traits for direct/manual implementation.
+> Note: tightbeam macros are optional. The same behavior is available through the underlying builders and traits for direct use.
 
-**Validation Rules**:
+**Validation rules** (when `HAS_PROFILE` is `true`):
 
-- `with_message_hasher::<D>(salt)` validates `D::OID == Profile::DigestOid::OID`
-- `with_witness_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
-- `with_aead::<C, _>()` validates `C::OID == Profile::AeadOid::OID`
-  - `Encryptor<C>` bound additionally binds the cipher type to its canonical OID regardless of profile
-- `with_signer::<S, _>()` validates `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`
+- `with_message_hasher::<D>(salt)` requires `D::OID == Profile::DigestOid::OID`.
+- `with_witness_hasher::<D>()` requires `D::OID == Profile::DigestOid::OID`.
+- `with_aead::<C, _>()` requires `C::OID == Profile::AeadOid::OID`. The `Encryptor<C>` bound also ties the cipher type to its canonical OID, even when no typed profile is active.
+- `with_signer::<S, _>()` requires `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`.
 
-**Error Handling**: Algorithm mismatches return `TightBeamError::UnexpectedAlgorithmForProfile` with expected and received OIDs for debugging.
+An algorithm mismatch returns `TightBeamError::UnexpectedAlgorithmForProfile`. The error carries the expected OID and the received OID.
 
 #### Implementation Enforcement
 
-These requirements are enforced at:
-
-- **Compile Time**: Type system prevents composition of messages that do not meet requirements
-- **Runtime Validation**: Frame validation ensures expected frame shape to meet requirements
-- **Profile Compliance**: Security profiles can reference message types with specific requirements
+- **Compile time**: The type system rejects compositions that violate the active profile or requirement flags.
+- **Run time**: Frame validation checks that the Frame shape matches the message requirements.
+- **Profile binding**: A `SecurityProfile` type is attached through `Message::Profile` and the `#[beam(profile(...))]` attributes below.
 
 #### Derive Macro Usage
 
-The `#[derive(Beamable)]` macro implements the `Message` trait with these attributes:
+`#[derive(Beamable)]` implements `Message`. Security and profile attributes set the trait constants and associated type.
 
 **Security attributes:**
 
@@ -1109,8 +1106,8 @@ The `#[derive(Beamable)]` macro implements the `Message` trait with these attrib
 
 **Profile attributes:**
 
-- `#[beam(profile = 1)]` or `#[beam(profile = 2)]` - Numeric levels (sets confidential + nonrepudiable, no OID validation)
-- `#[beam(profile(TypeName))]` - Type-based profile (enables compile-time OID validation)
+- `#[beam(profile = 1)]` or `#[beam(profile = 2)]`: numeric levels. These set confidential and nonrepudiable requirements. They do not enable OID validation ([§6.3](#63-numeric-security-levels)).
+- `#[beam(profile(TypeName))]`: typed profile. This sets `HAS_PROFILE` and enables compile-time OID validation.
 
 #### Example Message Types
 
@@ -1128,7 +1125,7 @@ struct HighSecurityTransfer { /* fields */ }
 
 ### 6.5 CryptoProvider System
 
-The `CryptoProvider` trait composes role-based provider traits to bind concrete cryptographic implementations to `SecurityProfile` metadata:
+`CryptoProvider` composes the role-based provider traits from [§6.1](#61-securityprofile-trait-architecture). It binds concrete cryptographic implementations to a `SecurityProfile`. A provider type is a zero-sized `Copy + Default` value.
 
 ```rust
 pub trait CryptoProvider:
@@ -1145,33 +1142,41 @@ pub trait CryptoProvider:
 }
 ```
 
-**DefaultCryptoProvider**: Reference implementation combining:
+`DefaultCryptoProvider` is the reference provider. It uses:
 
-- **Digest**: SHA3-256 (Keccak-based hash)
-- **AEAD**: AES-256-GCM (authenticated encryption)
-- **Signature**: secp256k1 ECDSA (Bitcoin/Ethereum curve)
-- **KDF**: HKDF-SHA3-256 (key derivation)
-- **Curve**: secp256k1 (elliptic curve operations)
+- **Digest**: SHA3-256
+- **AEAD**: AES-256-GCM
+- **Signature**: secp256k1 ECDSA
+- **KDF**: HKDF-SHA3-256
+- **Curve**: secp256k1
+
+Its associated profile is `TightbeamProfile` ([§6.2](#62-security-profile-types)).
 
 ### 6.6 Cryptographic Requirements
 
-- Integrity MUST use cryptographically secure hash functions
-- Confidentiality MUST use authenticated encryption (AEAD)
-- Non-repudiation MUST use digital signatures with secure key pairs
+- Integrity digests MUST use a cryptographically secure hash function ([§5.7.3](#573-integrity-semantics-order-of-operations)).
+- Confidentiality MUST use authenticated encryption (AEAD) ([§5.7.3](#573-integrity-semantics-order-of-operations)).
+- Nonrepudiation MUST use digital signatures with securely generated key pairs ([§5.7.5](#575-nonrepudiation-coverage-and-binding)).
 
 ### 6.7 Version Security
 
-- V0: No security features
-- V1: Optional integrity and confidentiality support
-- V2: Enhanced with priority, lifetime, and state chaining
-- V3: Enhanced with matrix controls
+Security-related Frame features are version-gated. Full field rules are in [§4.1](#41-version-evolution) and [§5.6](#56-version-specific-constraints).
+
+- **V0**: No optional security fields. Identification and ordering only.
+- **V1**: MAY include MI, FI, confidentiality, and Nonrepudiation.
+- **V2**: Adds optional priority, lifetime, and `previous_frame` chaining.
+- **V3**: Adds optional Matrix control state.
+
+A receiver MUST reject security fields that are forbidden for the declared Frame version ([§5.6](#56-version-specific-constraints)).
 
 ### 6.8 ASN.1 Security Considerations
 
-- DER encoding prevents ambiguous parsing attacks
-- Context-specific tags prevent field confusion
-- Explicit versioning prevents downgrade attacks
-- Optional field handling prevents injection attacks
+ASN.1 DER encoding supports several security properties of the wire format:
+
+- DER is canonical. Equal values produce one encoding, which reduces ambiguous-parsing attacks ([ITU-T X.690][itu-x690]).
+- Context-specific tags distinguish optional fields and reduce field-confusion risk.
+- Explicit `Version` values support refusal of unsupported or downgraded Frames.
+- Absent optional fields MUST NOT be encoded. That rule reduces injection of unexpected OPTIONAL elements ([§5.5](#55-encoding-rules)).
 
 ## 7. Implementation
 

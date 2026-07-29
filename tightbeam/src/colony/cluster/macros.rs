@@ -995,15 +995,18 @@ macro_rules! cluster {
 			})
 			.collect();
 
+		// A New rumor is already recorded for dedup and reflood. Local
+		// delivery is confirmed separately: only a rumor actually delivered
+		// to a local instance is acked and reported CLUSTER_GOSSIP_ACCEPTED.
 		if let ::core::option::Option::Some(selected_idx) = $config.load_balancer.select(&metrics) {
 			let dial_addr = ::std::sync::Arc::clone(entries[selected_idx].dial_target());
 			let payload = envelope.payload.clone();
 			if let ::core::result::Result::Ok(_response) = $crate::cluster!(@forward_work $pool, dial_addr, payload) {
 				let _ = $config.gossip.journal.ack_local(&admitted.digest());
+				let _ = $trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_ACCEPTED);
 			}
 		}
 
-		let _ = $trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_ACCEPTED);
 		return $crate::cluster!(@reply $frame, $crate::colony::common::GossipResponse {
 			status: $crate::policy::TransitStatus::Ok,
 		});

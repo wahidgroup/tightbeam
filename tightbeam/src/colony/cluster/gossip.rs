@@ -217,22 +217,16 @@ impl Default for MemoryGossipJournal {
 	}
 }
 
-/// Gossip subsystem configuration
-///
-/// Groups the rumor freshness window, origin time-to-live, anti-entropy
-/// retention window, and the pluggable [`GossipJournal`] into one unit, the
-/// same shape as the heartbeat and pheromone configurations.
+/// Gossip subsystem configuration: freshness window, origin time-to-live,
+/// and the pluggable [`GossipJournal`].
 pub struct GossipConf {
-	/// Freshness window a relayed rumor's `issued_at_ms` must fall within;
-	/// also the recovered-to-immune duration. Must exceed flood traversal.
+	/// Freshness window a relayed rumor's `issued_at_ms` must fall within.
 	pub seen_ttl: Duration,
 	/// Time-to-live an origin publish starts a rumor with, clamped to
 	/// [`MAX_GOSSIP_TTL`]. Bounds the hop radius of one flood.
 	pub ttl: u8,
-	/// Anti-entropy retention window; must be greater than or equal to
-	/// `seen_ttl`.
-	pub retention: Duration,
 	/// Dedup and retention store backing gossip delivery and anti-entropy.
+	/// The journal owns its own retention window.
 	pub journal: Arc<dyn GossipJournal>,
 }
 
@@ -241,7 +235,6 @@ impl Default for GossipConf {
 		Self {
 			seen_ttl: Duration::from_millis(DEFAULT_GOSSIP_SEEN_TTL_MS),
 			ttl: DEFAULT_GOSSIP_TTL,
-			retention: Duration::from_millis(DEFAULT_GOSSIP_RETENTION_MS),
 			journal: Arc::new(MemoryGossipJournal::default()),
 		}
 	}
@@ -252,7 +245,6 @@ impl core::fmt::Debug for GossipConf {
 		f.debug_struct("GossipConf")
 			.field("seen_ttl", &self.seen_ttl)
 			.field("ttl", &self.ttl)
-			.field("retention", &self.retention)
 			.field("journal", &"<dyn GossipJournal>")
 			.finish()
 	}
