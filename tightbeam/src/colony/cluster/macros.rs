@@ -245,12 +245,7 @@ macro_rules! cluster {
 				// key store, so the beat only exists with x509.
 				#[cfg(feature = "x509")]
 				let advertise_handle = {
-					// Prefer the peer trust plane when present; exporters that
-					// only dial peers under hive_trust keep the hive pool.
-					let advertise_pool = peer_pool
-						.as_ref()
-						.map(::std::sync::Arc::clone)
-						.unwrap_or_else(|| ::std::sync::Arc::clone(&pool));
+					let advertise_pool = $crate::cluster!(@peer_dial_pool peer_pool, pool);
 					let servlet_registry = ::std::sync::Arc::clone(&servlet_registry);
 					let config = ::std::sync::Arc::clone(&config);
 					let gateway_addr: Vec<u8> = addr.clone().into();
@@ -1037,21 +1032,30 @@ macro_rules! cluster {
 		// A gateway with no peers skips the task entirely: the reflood
 		// signature is the costly step and would fan out to nobody.
 		if envelope.ttl > 0 && !$config.peers.is_empty() {
-			if let ::core::option::Option::Some(peer_pool) = $peer_pool.as_ref() {
-				let peer_pool = ::std::sync::Arc::clone(peer_pool);
-				let config = ::std::sync::Arc::clone(&$config);
-				let reflood_envelope = envelope.clone();
-				let next_ttl = envelope.ttl - 1;
-				let _ = $crate::colony::servlet::servlet_runtime::rt::spawn(
-					$crate::cluster!(@reflood_gossip peer_pool, config, reflood_envelope, next_ttl, $digest)
-				);
-			}
+			let reflood_pool = $crate::cluster!(@peer_dial_pool $peer_pool, $pool);
+			let config = ::std::sync::Arc::clone(&$config);
+			let reflood_envelope = envelope.clone();
+			let next_ttl = envelope.ttl - 1;
+			let _ = $crate::colony::servlet::servlet_runtime::rt::spawn(
+				$crate::cluster!(@reflood_gossip reflood_pool, config, reflood_envelope, next_ttl, $digest)
+			);
 		}
 
 		return $crate::cluster!(@reply $frame, $crate::colony::common::GossipResponse {
 			status: $crate::policy::TransitStatus::Ok,
 		});
 	}};
+
+	// Select the pool for dialing peer gateways: prefer the peer trust
+	// plane when present. Gateways that only dial peers under hive_trust
+	// keep the hive pool. The advertise beat and the gossip reflood share
+	// this preference so both planes reach configured peers identically.
+	(@peer_dial_pool $peer_pool:expr, $pool:expr) => {
+		$peer_pool
+			.as_ref()
+			.map(::std::sync::Arc::clone)
+			.unwrap_or_else(|| ::std::sync::Arc::clone(&$pool))
+	};
 
 	// Reflood one rumor to every configured peer. Expands to a future for
 	// `rt::spawn`. The frame is built and signed once (signing is the costly

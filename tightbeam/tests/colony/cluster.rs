@@ -3149,6 +3149,63 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
+	pub ClusterGossipHiveTrustOnlySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// Hive-trust-only propagation: A configures a peer but no peer_trust, so
+// it builds no peer pool. The reflood falls back to the hive pool, the
+// same preference the advertise beat applies, and the rumor still reaches
+// B, which verifies A's relay on its own peer plane. The publish starts
+// at ttl 1, so each cluster delivers exactly once and B refloods nowhere.
+tb_scenario! {
+	name: cluster_gossip_refloods_under_hive_trust_only,
+	spec: ClusterGossipHiveTrustOnlySpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
+			let gateway_b = start_cluster(&trace, conf_b).await?;
+			let (mut conf_a, journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
+
+			conf_a.tls.peer_trust = None;
+
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			let hive_b = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			hive.register_with_cluster(gateway_a.addr()).await?;
+			hive_b.register_with_cluster(gateway_b.addr()).await?;
+
+			let publish = ClusterRequest::PublishGossip(ping_rumor(1, encode(&PingRequest { value: 21 })?));
+			let frame = signed_control_frame(&certs, b"hive-only-rumor", publish).await?;
+			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+
+			let journals = [journal_a, journal_b];
+			let converged = wait_for_gossip_converged(&journals, 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			gateway_a.stop();
+			gateway_b.stop();
+			hive_b.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
 	pub ClusterGossipTtlClampSpec,
 	V(1,0,0): {
 		mode: Accept,
