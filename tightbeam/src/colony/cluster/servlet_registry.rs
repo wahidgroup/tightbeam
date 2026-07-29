@@ -339,6 +339,38 @@ impl ServletRegistry {
 		Ok(entry)
 	}
 
+	/// Replace one hive's slate with `entries`, keeping it routable throughout.
+	///
+	/// Installs the new entries first, then prunes the hive's addresses
+	/// absent, from the new slate. A mid-install failure leaves the prior
+	/// slate intact rather than wiped: remove-then-add would drop every
+	/// route before the first add. Every entry must carry `hive_id` as its
+	/// hive, or the prune misses it.
+	pub fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
+		let mut fresh: Vec<SharedId> = Vec::with_capacity(entries.len());
+		for entry in entries {
+			fresh.push(Arc::clone(&entry.address));
+			self.add(entry)?;
+		}
+
+		let stale: Vec<SharedId> = {
+			let hive_idx = self.hive_index.read()?;
+			hive_idx
+				.get(hive_id)
+				.cloned()
+				.unwrap_or_default()
+				.into_iter()
+				.filter(|addr| !fresh.iter().any(|kept| kept.as_ref() == addr.as_ref()))
+				.collect()
+		};
+
+		for addr in &stale {
+			self.remove(addr)?;
+		}
+
+		Ok(())
+	}
+
 	/// Remove all entries belonging to a hive
 	pub fn remove_by_hive(&self, hive_id: &[u8]) -> Result<Vec<ServletEntry>, ClusterError> {
 		let addresses: Vec<SharedId> = {
@@ -755,6 +787,50 @@ mod tests {
 
 		let local = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
 		assert!(local.is_empty());
+	}
+
+	#[test]
+	fn reconcile_by_hive_installs_multi_type_slate() {
+		let registry = ServletRegistry::default();
+		let slate = vec![
+			peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw"),
+			peer_entry(b"gw\0urn:t:b", b"urn:t:b", b"gw"),
+		];
+
+		registry.reconcile_by_hive(b"gw", slate).ok();
+
+		let peers = registry.peer_servlets().ok().unwrap_or_default();
+		assert_eq!(peers.len(), 2);
+	}
+
+	#[test]
+	fn reconcile_by_hive_prunes_stale_routes() {
+		let registry = ServletRegistry::default();
+		let full = vec![
+			peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw"),
+			peer_entry(b"gw\0urn:t:b", b"urn:t:b", b"gw"),
+		];
+
+		registry.reconcile_by_hive(b"gw", full).ok();
+		let shrunk = vec![peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw")];
+		registry.reconcile_by_hive(b"gw", shrunk).ok();
+
+		let peers = registry.peer_servlets().ok().unwrap_or_default();
+		assert_eq!(peers.len(), 1);
+		assert_eq!(peers[0].servlet_type.as_ref(), b"urn:t:a");
+	}
+
+	#[test]
+	fn reconcile_by_hive_leaves_other_hives_untouched() {
+		let registry = ServletRegistry::default();
+		let peer = peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw");
+		registry.add(named_entry(b"local", b"urn:t:a", b"hive1")).ok();
+		registry.reconcile_by_hive(b"gw", vec![peer]).ok();
+		registry.reconcile_by_hive(b"gw", vec![]).ok();
+
+		let locals = registry.local_entries_for_type(b"urn:t:a").ok().unwrap_or_default();
+		assert_eq!(locals.len(), 1);
+		assert!(registry.peer_servlets().ok().unwrap_or_default().is_empty());
 	}
 
 	#[test]

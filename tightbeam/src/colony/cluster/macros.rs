@@ -832,8 +832,10 @@ macro_rules! cluster {
 			// identity must be a bare servlet type URN in this gateway's
 			// realm/NID. A foreign authority or realm is refused before any
 			// route installs. The count is bounded fail-closed (CWE-770).
-			let gateway_addr_valid = !advertisement.gateway_addr.is_empty()
-				&& core::str::from_utf8(&advertisement.gateway_addr).is_ok();
+			let gateway_addr_nonempty = !advertisement.gateway_addr.is_empty();
+			let gateway_addr_utf8 = core::str::from_utf8(&advertisement.gateway_addr).is_ok();
+			let gateway_addr_no_nul = !advertisement.gateway_addr.contains(&0);
+			let gateway_addr_valid = gateway_addr_nonempty && gateway_addr_utf8 && gateway_addr_no_nul;
 			let types_valid = advertisement.advertised_types.iter().all(|urn| matches!(
 				$config.namespace.validate(urn),
 				Ok($crate::colony::common::ColonyResource::Servlet { instance: ::std::option::Option::None, .. })
@@ -857,33 +859,42 @@ macro_rules! cluster {
 				});
 			}
 
-			// Peer routes live only in the servlet registry, keyed and
-			// reconciled by the peer gateway address: the advertisement
-			// REPLACES any prior slate for this peer. Each type resolves
-			// to the peer gateway (the forward target), tagged Peer so
-			// work selection can tell it from a local servlet.
+			// Peer routes live only in the servlet registry, reconciled by
+			// the peer gateway address as the hive key. Entries are keyed
+			// by a per-type route key (gateway NUL type) because the entry
+			// map is one-entry-per-address: keying every type by the bare
+			// gateway address would keep only the last type in the slate.
 			let gateway_id: ::std::sync::Arc<[u8]> = advertisement.gateway_addr.as_slice().into();
-			let _ = $servlet_registry.remove_by_hive(&gateway_id);
-			let installed = advertisement.advertised_types.iter().try_for_each(|urn| {
-				let entry = $crate::colony::cluster::ServletEntry::new(
-					::std::sync::Arc::clone(&gateway_id),
-					::std::sync::Arc::from($crate::colony::common::type_canonical_bytes(urn).as_slice()),
-					::std::sync::Arc::clone(&gateway_id),
-					$config.pheromone.initial_pheromone,
-					$config.pheromone.abandonment_limit,
-				).with_route_kind($crate::colony::cluster::RouteKind::Peer);
-				$servlet_registry.add(entry)
-			});
+			let slate: Vec<$crate::colony::cluster::ServletEntry> = advertisement
+				.advertised_types
+				.iter()
+				.map(|urn| {
+					let type_bytes = $crate::colony::common::type_canonical_bytes(urn);
+					let mut route_key = Vec::with_capacity(gateway_id.len() + 1 + type_bytes.len());
+					route_key.extend_from_slice(&gateway_id);
+					route_key.push(0);
+					route_key.extend_from_slice(&type_bytes);
 
-			let status = match installed {
+					$crate::colony::cluster::ServletEntry::new(
+						::std::sync::Arc::from(route_key.as_slice()),
+						::std::sync::Arc::from(type_bytes.as_slice()),
+						::std::sync::Arc::clone(&gateway_id),
+						$config.pheromone.initial_pheromone,
+						$config.pheromone.abandonment_limit,
+					).with_route_kind($crate::colony::cluster::RouteKind::Peer)
+				})
+				.collect();
+
+			let status = match $servlet_registry.reconcile_by_hive(&gateway_id, slate) {
 				Ok(()) => {
 					let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISED);
 					$crate::policy::TransitStatus::Ok
 				}
 				Err(_) => {
-					let _ = $servlet_registry.remove_by_hive(&gateway_id);
 					// Release the replay record so the peer can resend the
 					// same signed advertisement after the failure clears.
+					// The prior slate survives: reconcile installs before
+					// it prunes, so a failure never wipes the peer's routes.
 					#[cfg(feature = "x509")]
 					if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
 						$replay_guard.forget(signer_info.signature.as_bytes());

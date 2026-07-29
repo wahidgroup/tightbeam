@@ -640,6 +640,37 @@ tb_scenario! {
 	}
 }
 
+// A slate is not one type: every advertised type installs its own peer
+// route, so a two-type advertisement surfaces both types.
+tb_scenario! {
+	name: cluster_multi_type_advertisement_installs_all,
+	spec: ClusterPeerAdvertisedSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let slate = vec![servlet_urn("ping"), servlet_urn("echo")];
+			let status = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, slate).await?;
+			assert_eq!(status, TransitStatus::Ok, "trusted advertisement must install");
+
+			let mut peers = cluster.peer_servlets();
+			peers.sort_unstable();
+
+			let ping_canonical = type_canonical_bytes(&servlet_urn("ping"));
+			let echo_canonical = type_canonical_bytes(&servlet_urn("echo"));
+			let mut expected = vec![ping_canonical, echo_canonical];
+			expected.sort_unstable();
+
+			assert_eq!(peers, expected, "every advertised type installs a route, not only the last");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
 // Federation is default-off: a gateway without `peer_trust` refuses every
 // advertisement fail-closed, installing no peer routes.
 tb_scenario! {
