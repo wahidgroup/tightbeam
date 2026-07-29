@@ -935,14 +935,22 @@ macro_rules! cluster {
 
 		// An origin rumor from a local publisher verifies on the hive trust
 		// plane, like a registration: a peer certificate must not inject
-		// origin gossip. It then enters the same pipeline; the reflood
-		// re-signs peer-plane, so downstream sees an ordinary relay.
+		// origin gossip. It then enters the same pipeline.
 		#[cfg(feature = "x509")]
-		$crate::colony::common::ClusterRequest::PublishGossip(envelope) => {
+		$crate::colony::common::ClusterRequest::PublishGossip(mut envelope) => {
 			let origin_status = verify_hive_origin();
 			if origin_status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@refuse_gossip $frame, $trace, origin_status);
 			}
+
+			// The wire ttl is the publisher's request. The origin gateway
+			// caps it at the operator's configured hop radius (itself
+			// bounded by the protocol cap) while honoring a smaller
+			// request, such as ttl 0 for local-only delivery. The digest
+			// excludes ttl, so the clamp does not change the rumor's identity.
+			envelope.ttl = envelope
+				.ttl
+				.min($config.gossip.ttl.min($crate::constants::MAX_GOSSIP_TTL));
 
 			$crate::cluster!(@gossip_pipeline
 				$frame, $servlet_registry, $config, $pool, $peer_pool, $trace, $digest, envelope);
