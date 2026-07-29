@@ -22,11 +22,18 @@ pub mod outbound;
 #[doc(hidden)]
 pub mod peer;
 
+#[cfg(feature = "x509")]
+#[doc(hidden)]
+pub mod gossip;
+
 // Re-export submodule types
 pub use builder::{ClusterConfBuilder, HeartbeatConfBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use servlet_registry::{PeerCaps, PeerRouteInfo, PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
+
+#[cfg(feature = "x509")]
+pub use gossip::{Admission, AdmittedGossip, GossipDigest, GossipJournal, MemoryGossipJournal};
 
 use core::future::Future;
 use core::time::Duration;

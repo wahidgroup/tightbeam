@@ -94,6 +94,12 @@ pub(crate) const PEER_PING_LIVE_AFTER_WITHDRAWAL: Urn<'static> =
 /// Address the simulated peer gateway advertises itself at.
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
 
+/// Failed forwards a peer trail tolerates before abandonment in the
+/// infection-containment scenarios. Kept small so the gate stays fast;
+/// the containment specs assert exactly this many `CLUSTER_WORK_FAILED`
+/// before selection drops the peer.
+const CONTAINMENT_ABANDON_LIMIT: u32 = 3;
+
 // ============================================================================
 // Shared Test Certificates
 // ============================================================================
@@ -572,6 +578,15 @@ fn peering_peer_trust_only(certs: &ClusterTestCerts) -> ClusterConf {
 fn peering_with_dial_allowlist(certs: &ClusterTestCerts, allowlist: Vec<String>) -> ClusterConf {
 	let mut conf = peering_cluster_conf(certs);
 	conf.peer_dial_allowlist = Some(allowlist);
+	conf
+}
+
+/// Importer conf whose peer trails abandon after a few failed forwards.
+/// The limit is small so containment scenarios stay fast; the specs pin
+/// [`CONTAINMENT_ABANDON_LIMIT`] failures before routing stops.
+fn containment_cluster_conf(certs: &ClusterTestCerts) -> ClusterConf {
+	let mut conf = peering_cluster_conf(certs);
+	conf.pheromone.abandonment_limit = CONTAINMENT_ABANDON_LIMIT;
 	conf
 }
 
@@ -1144,6 +1159,111 @@ tb_scenario! {
 			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("echo")]).await?;
 
 			cluster.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+// WORK_SENT = CONTAINMENT_ABANDON_LIMIT failing forwards + 1 probe after
+// abandonment; CLUSTER_WORK_FAILED = CONTAINMENT_ABANDON_LIMIT.
+tb_assert_spec! {
+	pub ClusterPeerContainmentSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(WORK_SENT, exactly!(4)),
+			(events::CLUSTER_WORK_FAILED, exactly!(3)),
+			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(1))
+		]
+	}
+}
+
+// Infection containment: a peer route to a gateway that never answers is
+// weakened on each failed forward and, past the abandonment limit, drops
+// out of selection so the peer-only type reports Unavailable with no
+// further forward attempt.
+tb_scenario! {
+	name: cluster_abandons_failing_peer_trail,
+	spec: ClusterPeerContainmentSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, containment_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			install_ping_peer(&trace, &certs, &cluster).await?;
+
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+
+			// Each forward reaches the dead peer and weakens the trail.
+			for i in 0..CONTAINMENT_ABANDON_LIMIT {
+				trace.event(WORK_SENT)?;
+				let id = [b'f', i as u8];
+				let _ = emit_ping_work(&mut client, &id).await?;
+			}
+
+			// Trail abandoned: selection drops it, so the peer-only type
+			// is Unavailable and no further forward is attempted.
+			trace.event(WORK_SENT)?;
+			let _ = emit_ping_work(&mut client, b"gone").await?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerIsolationSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(WORK_SENT, exactly!(4)),
+			(events::CLUSTER_WORK_FAILED, exactly!(3)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(1)),
+			(WORK_ECHOED, exactly!(1), equals!(42u64))
+		]
+	}
+}
+
+// Containment isolates only the bad nest: after the dead peer trail is
+// abandoned, a local ping hive joins and serves the same type, so work
+// keeps flowing on-colony while the peer stays dropped.
+tb_scenario! {
+	name: cluster_isolates_abandoned_peer_and_serves_local,
+	spec: ClusterPeerIsolationSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let importer = start_cluster(&trace, containment_cluster_conf(&certs)).await?;
+
+			install_ping_peer(&trace, &certs, &importer).await?;
+
+			let mut client = connect_cluster(&certs, importer.addr()).await?;
+
+			// Fail the peer trail into abandonment before any local route.
+			for i in 0..CONTAINMENT_ABANDON_LIMIT {
+				trace.event(WORK_SENT)?;
+				let id = [b'x', i as u8];
+				let _ = emit_ping_work(&mut client, &id).await?;
+			}
+
+			// Heal the colony: a local ping hive joins after the bad nest
+			// is abandoned, leaving one live route for the type.
+			hive.register_with_cluster(importer.addr()).await?;
+
+			trace.event(WORK_SENT)?;
+			let work_response = emit_ping_work(&mut client, b"local").await?;
+			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
+			let ping_response: PingResponse = decode(&payload)?;
+			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+
+			importer.stop();
 			hive.stop();
 			Ok(())
 		}

@@ -329,3 +329,50 @@ pub const MAX_PEER_GATEWAYS: usize = 64;
 ///
 /// Bounds aggregate Peer entries across all peer gateways (CWE-770).
 pub const MAX_PEER_ROUTES: usize = 1024;
+
+/// Ceiling on the payload bytes carried in one gossip envelope
+///
+/// A gossip rumor floods the peer graph, so an oversized payload amplifies
+/// across every edge. Bounding the payload fail-closes the amplification
+/// dose before the rumor is recorded or forwarded again (CWE-770).
+pub const MAX_GOSSIP_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// Ceiling on the initial time-to-live an origin gossip may request
+///
+/// The time-to-live is the hop radius of a flood. Capping it bounds the
+/// basic reproduction number of a single rumor regardless of the value a
+/// publisher requests (CWE-770).
+pub const MAX_GOSSIP_TTL: u8 = 8;
+
+/// Ceiling on distinct gossip rumors retained in one in-memory journal
+///
+/// The journal retains recent rumors for deduplication and anti-entropy
+/// reconciliation. Bounding the count keeps memory finite under a flood,
+/// failing closed once the ceiling is reached (CWE-770).
+pub const MAX_GOSSIP_LOG: usize = 4096;
+
+/// Ceiling on gossip rumors retained per signer in one in-memory journal
+///
+/// Partitioning the journal per signer means one signer minting distinct
+/// digests cannot evict rumors recorded for other signers (CWE-770).
+pub const MAX_GOSSIP_LOG_PER_SIGNER: usize = 256;
+
+/// Default gossip deduplication window in milliseconds
+///
+/// A rumor whose digest was recorded within this window is treated as
+/// already seen (the recovered/immune state of the epidemic model). The
+/// window must exceed the time a flood takes to traverse the peer graph so
+/// late duplicates are still suppressed.
+pub const DEFAULT_GOSSIP_SEEN_TTL_MS: u64 = 120_000;
+
+/// Default gossip retention window in milliseconds
+///
+/// Anti-entropy reconciliation can only repair a rumor that a peer still
+/// retains. Retention must be at least as long as the deduplication window
+/// so a node returning within the window can be repaired.
+pub const DEFAULT_GOSSIP_RETENTION_MS: u64 = 120_000;
+
+/// Default initial time-to-live an origin gossip requests
+///
+/// Bounded above by [`MAX_GOSSIP_TTL`].
+pub const DEFAULT_GOSSIP_TTL: u8 = 8;

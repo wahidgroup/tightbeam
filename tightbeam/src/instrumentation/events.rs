@@ -136,3 +136,6 @@ pub const CLUSTER_HIVE_EVICTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cl
 pub const CLUSTER_PEER_ADVERTISED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-advertised");
 pub const CLUSTER_PEER_ADVERTISE_REFUSED: Urn<'static> =
 	Urn::new(TIGHTBEAM_NID, "event:cluster/peer-advertise-refused");
+pub const CLUSTER_GOSSIP_ACCEPTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-accepted");
+pub const CLUSTER_GOSSIP_DUPLICATE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-duplicate");
+pub const CLUSTER_GOSSIP_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-refused");
