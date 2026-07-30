@@ -27,11 +27,19 @@ pub(crate) fn decode_octets<'a, R: Reader<'a>>(reader: &mut R) -> Result<Vec<u8>
 }
 
 /// Decode an optional `OCTET STRING` into owned bytes.
+///
+/// Gated on `colony` with its only consumers, the colony message codecs,
+/// so minimal builds carry no dead helper.
+#[cfg(feature = "colony")]
 pub(crate) fn decode_octets_opt<'a, R: Reader<'a>>(reader: &mut R) -> Result<Option<Vec<u8>>> {
 	Ok(Option::<OctetString>::decode(reader)?.map(OctetString::into_bytes))
 }
 
 /// Decode a `SEQUENCE OF OCTET STRING` into owned byte vectors.
+///
+/// Gated on `colony` with its only consumers, the colony message codecs,
+/// so minimal builds carry no dead helper.
+#[cfg(feature = "colony")]
 pub(crate) fn decode_octets_seq<'a, R: Reader<'a>>(reader: &mut R) -> Result<Vec<Vec<u8>>> {
 	Ok(Vec::<OctetString>::decode(reader)?
 		.into_iter()
@@ -45,11 +53,19 @@ pub(crate) fn octets_ref(bytes: &[u8]) -> Result<OctetStringRef<'_>> {
 }
 
 /// Borrow optional bytes as an encodable `OCTET STRING OPTIONAL`.
+///
+/// Gated on `colony` with its only consumers, the colony message codecs,
+/// so minimal builds carry no dead helper.
+#[cfg(feature = "colony")]
 pub(crate) fn octets_opt_ref(bytes: &Option<Vec<u8>>) -> Result<Option<OctetStringRef<'_>>> {
 	bytes.as_deref().map(OctetStringRef::new).transpose()
 }
 
 /// Borrow byte vectors as an encodable `SEQUENCE OF OCTET STRING`.
+///
+/// Gated on `colony` with its only consumers, the colony message codecs,
+/// so minimal builds carry no dead helper.
+#[cfg(feature = "colony")]
 pub(crate) fn octets_seq_refs(list: &[Vec<u8>]) -> Result<Vec<OctetStringRef<'_>>> {
 	list.iter().map(|bytes| OctetStringRef::new(bytes)).collect()
 }
@@ -140,7 +156,9 @@ macro_rules! wire_sequence {
 
 pub(crate) use wire_sequence;
 
-#[cfg(test)]
+// The probe exercises every field kind, including the `colony`-gated
+// optional and sequence helpers, so the tests share that gate.
+#[cfg(all(test, feature = "colony"))]
 mod tests {
 	use super::*;
 	use crate::der::{Encode, TagNumber};

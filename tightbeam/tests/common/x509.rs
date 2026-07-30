@@ -24,8 +24,9 @@ use tightbeam::{
 	prelude::{collect::TokioListener, *},
 	server,
 	spki::SubjectPublicKeyInfoOwned,
-	testing::create_test_signing_key,
+	testing::{create_test_certificate_with_uri_sans, create_test_signing_key},
 	transport::{handshake::HandshakeKeyManager, EncryptedProtocol, TransportEncryptionConfig},
+	utils::urn::Urn,
 	x509::Certificate,
 	Frame, TightBeamError,
 };
@@ -79,6 +80,18 @@ impl GatewayCerts {
 				.expect("Failed to build trust")
 				.build(),
 		);
+		Self { cert, key, trust }
+	}
+
+	/// Generate a colony-member gateway identity: the certificate carries
+	/// `colony_urn` as a URI Subject Alternative Name (RFC 5280 §4.2.1.6)
+	/// with an empty subject, so membership provably binds to the SAN
+	/// alone. Colony membership gates gossip and peer federation.
+	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
+		let raw = create_test_signing_key();
+		let cert = create_test_certificate_with_uri_sans(&raw, &[&colony_urn.to_string()]);
+		let key = Secp256k1SigningKey::from(raw);
+		let trust = combined_trust(&[&cert]);
 		Self { cert, key, trust }
 	}
 }

@@ -33,7 +33,13 @@ pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use servlet_registry::{PeerCaps, PeerRouteInfo, PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
 
 #[cfg(feature = "x509")]
-pub use gossip::{Admission, AdmittedGossip, GossipConf, GossipDigest, GossipJournal, MemoryGossipJournal};
+pub use gossip::{
+	gossip_digest, gossip_fresh, gossip_want, signer_attribution, wanted_digests, Admission, AdmittedGossip,
+	GossipAdmission, GossipConf, GossipDigest, GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
+};
+
+#[cfg(feature = "x509")]
+pub use peer::{cert_colony_urn, frame_colony_urn, frame_signer_cert, peer_signer_fingerprint};
 
 use core::future::Future;
 use core::time::Duration;
@@ -44,6 +50,8 @@ use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
 use crate::transport::{Protocol, TightBeamAddress};
+#[cfg(feature = "x509")]
+use crate::utils::urn::Urn;
 
 #[cfg(feature = "x509")]
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
@@ -237,6 +245,18 @@ pub struct ClusterConf {
 	/// Gossip subsystem configuration (freshness/ttl/retention + journal)
 	#[cfg(feature = "x509")]
 	pub gossip: GossipConf,
+	/// Colony URN from the gateway certificate's URI Subject Alternative
+	/// Name, derived once at config build by
+	/// [`cert_colony_urn`](crate::colony::cluster::cert_colony_urn).
+	/// `None` means this gateway is not a colony member: gossip publish,
+	/// relay, and reconciliation are refused, peer advertisements are
+	/// refused, and the advertise beat skips gossip reconciliation. Work
+	/// forwarding and hive registration never require membership.
+	///
+	/// Private so membership cannot drift from the certificate: the
+	/// builder derives it and [`ClusterConf::colony_urn`] reads it.
+	#[cfg(feature = "x509")]
+	colony_urn: Option<Urn<'static>>,
 	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
@@ -247,6 +267,15 @@ impl ClusterConf {
 	/// Create a new cluster configuration with TLS config
 	pub fn new(tls: ClusterTlsConfig) -> Self {
 		Self::builder(tls).build()
+	}
+
+	/// Colony URN from the gateway certificate's URI SAN
+	///
+	/// `None` means this gateway is not a colony member. Derived once
+	/// by the builder from the certificate; read-only afterwards.
+	#[must_use]
+	pub fn colony_urn(&self) -> Option<&Urn<'static>> {
+		self.colony_urn.as_ref()
 	}
 }
 
@@ -265,6 +294,7 @@ impl core::fmt::Debug for ClusterConf {
 			.field("advertise_interval", &self.advertise_interval)
 			.field("peer_dial_allowlist", &self.peer_dial_allowlist)
 			.field("gossip", &self.gossip)
+			.field("colony_urn", &self.colony_urn)
 			.field("tls", &self.tls)
 			.finish()
 	}
@@ -321,11 +351,14 @@ pub trait Cluster: Sized + Send + Sync {
 
 	/// Wait for the cluster to finish
 	fn join(self) -> impl Future<Output = Result<(), crate::colony::servlet::servlet_runtime::rt::JoinError>> + Send;
+}
 
-	// =========================================================================
-	// Heartbeat Methods
-	// =========================================================================
-
+/// Heartbeat surface of a cluster gateway
+///
+/// Split from [`Cluster`] so a consumer that only routes work never
+/// depends on health-monitoring internals (interface segregation).
+/// The `cluster!` macro implements both traits for every gateway.
+pub trait ClusterHeartbeat: Cluster {
 	/// Access the hive registry
 	fn registry(&self) -> &Arc<HiveRegistry>;
 
@@ -393,7 +426,6 @@ mod tests {
 
 	fn request(addr: &[u8], servlets: &[&str]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
-			issued_at_ms: 0,
 			hive_addr: addr.to_vec(),
 			metadata: None,
 			servlet_addresses: servlets

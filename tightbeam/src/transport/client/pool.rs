@@ -965,6 +965,21 @@ where
 	pub fn conn(&mut self) -> TransportResult<&mut GenericClient<P>> {
 		self.client.as_mut().ok_or(TransportError::InvalidState)
 	}
+
+	/// Validated TLS peer certificate pinned by this connection's handshake
+	///
+	/// `None` on a multiplexed lease or before mutual authentication
+	/// completes. A caller that gates policy on peer identity MUST fail
+	/// closed on `None`.
+	#[cfg(feature = "x509")]
+	pub fn peer_certificate(&self) -> Option<&Certificate>
+	where
+		P::Transport: crate::transport::state::EncryptedProtocolState,
+	{
+		use crate::transport::state::EncryptedProtocolState;
+
+		self.client.as_ref()?.transport().to_peer_certificate_ref()
+	}
 }
 
 #[cfg(all(

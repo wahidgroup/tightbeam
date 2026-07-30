@@ -185,6 +185,12 @@ impl FromStr for Urn<'static> {
 		let (nid, nss) = rest.split_once(':').ok_or(UrnValidationError::InvalidUrnSyntax)?;
 		Self::validate_nid(nid)?;
 
+		// RFC 8141 §2 requires at least one NSS character: "urn:nid:"
+		// names nothing and would collide with every empty-NSS parse.
+		if nss.is_empty() {
+			return Err(UrnValidationError::InvalidUrnSyntax);
+		}
+
 		Ok(Urn { nid: Cow::Owned(nid.to_string()), nss: Cow::Owned(nss.to_string()) })
 	}
 }
@@ -282,7 +288,7 @@ mod tests {
 
 	#[test]
 	fn test_urn_from_str_rejects_malformed() {
-		let cases: &[&str] = &["", "urn:", "urn:onlynid", "no-prefix:nid:nss", "urn:1bad:nss"];
+		let cases: &[&str] = &["", "urn:", "urn:onlynid", "urn:nid:", "no-prefix:nid:nss", "urn:1bad:nss"];
 		for input in cases {
 			assert!(input.parse::<Urn<'static>>().is_err());
 		}

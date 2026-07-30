@@ -139,3 +139,5 @@ pub const CLUSTER_PEER_ADVERTISE_REFUSED: Urn<'static> =
 pub const CLUSTER_GOSSIP_ACCEPTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-accepted");
 pub const CLUSTER_GOSSIP_DUPLICATE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-duplicate");
 pub const CLUSTER_GOSSIP_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-refused");
+pub const CLUSTER_GOSSIP_RELAY_WEAKENED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-relay-weakened");
+pub const CLUSTER_GOSSIP_DROP_SIGNAL: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-drop-signal");

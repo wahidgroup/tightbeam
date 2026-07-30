@@ -832,6 +832,45 @@ impl ServletRegistry {
 		}
 	}
 
+	/// Weaken every live Peer route advertised by one peer identity
+	///
+	/// Misbehavior scoring for the gossip plane: a peer that relays
+	/// invalid gossip is weakened across all of its `peer_id NUL type`
+	/// trails, since the misbehavior is the peer's, not one route's.
+	/// Returns the number of entries weakened.
+	pub fn weaken_peer(&self, peer_id: &[u8]) -> Result<usize, ClusterError> {
+		let entries = self.entries.read()?;
+		let weakened = entries
+			.values()
+			.filter(|entry| entry.route_kind() == RouteKind::Peer)
+			.filter(|entry| entry.is_live())
+			.filter(|entry| entry.owner_id().as_ref() == peer_id)
+			.map(ServletEntry::weaken)
+			.count();
+
+		Ok(weakened)
+	}
+
+	/// Weaken every live Peer route dialed through one gateway address
+	///
+	/// Misbehavior scoring for anti-entropy, where the peer is known by
+	/// the address this gateway reconciles with rather than by a signer
+	/// fingerprint: reconciliation replies are unsigned, and the peer
+	/// pool's pinned trust authenticates the endpoint at that address.
+	/// Returns the number of entries weakened.
+	pub fn weaken_peer_by_dial(&self, dial_addr: &[u8]) -> Result<usize, ClusterError> {
+		let entries = self.entries.read()?;
+		let weakened = entries
+			.values()
+			.filter(|entry| entry.route_kind() == RouteKind::Peer)
+			.filter(|entry| entry.is_live())
+			.filter(|entry| entry.dial_target().as_ref() == dial_addr)
+			.map(ServletEntry::weaken)
+			.count();
+
+		Ok(weakened)
+	}
+
 	/// Apply evaporation to all entries
 	pub fn evaporate(&self) -> Result<(), ClusterError> {
 		let entries = self.entries.read()?;
@@ -1340,6 +1379,97 @@ mod tests {
 
 		assert!(matches!(registry.remove_abandoned().ok(), Some(1)));
 		assert!(matches!(registry.len().ok(), Some(0)));
+	}
+
+	#[test]
+	fn weaken_peer_targets_all_routes_of_one_peer() -> Result<(), ClusterError> {
+		let registry = ServletRegistry::default();
+		registry.add(peer_entry(b"urn:t:a", b"fp-a"))?;
+		registry.add(peer_entry(b"urn:t:b", b"fp-a"))?;
+		registry.add(peer_entry(b"urn:t:a", b"fp-b"))?;
+
+		let weakened = registry.weaken_peer(b"fp-a")?;
+
+		assert_eq!(weakened, 2);
+		Ok(())
+	}
+
+	#[test]
+	fn weaken_peer_skips_local_routes() -> Result<(), ClusterError> {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"addr", b"urn:t:a", b"hive-a"))?;
+
+		let weakened = registry.weaken_peer(b"hive-a")?;
+
+		assert_eq!(weakened, 0);
+		Ok(())
+	}
+
+	/// Create a peer-routed test entry with a specific abandonment limit
+	fn peer_entry_limit(servlet_type: &[u8], peer_id: &[u8], limit: u32) -> ServletEntry {
+		ServletEntry::peer(
+			Arc::from(peer_id),
+			Arc::from(servlet_type),
+			Arc::from(b"127.0.0.1:9000".as_slice()),
+			DEFAULT_INITIAL_PHEROMONE,
+			limit,
+		)
+	}
+
+	#[test]
+	fn weaken_peer_abandons_after_limit_leaving_others_live() -> Result<(), ClusterError> {
+		let limit = 2;
+		let registry = ServletRegistry::default();
+		registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", limit))?;
+		registry.add(peer_entry_limit(b"urn:t:a", b"fp-b", limit))?;
+
+		for _ in 0..limit {
+			registry.weaken_peer(b"fp-a")?;
+		}
+
+		let live = registry.peer_entries()?;
+		assert_eq!(live.len(), 1);
+		assert_eq!(live[0].owner_id().as_ref(), b"fp-b");
+		Ok(())
+	}
+
+	#[test]
+	fn weaken_peer_skips_already_abandoned_routes() -> Result<(), ClusterError> {
+		let limit = 2;
+		let registry = ServletRegistry::default();
+		registry.add(peer_entry_limit(b"urn:t:a", b"fp-a", limit))?;
+
+		for _ in 0..limit {
+			registry.weaken_peer(b"fp-a")?;
+		}
+
+		let weakened = registry.weaken_peer(b"fp-a")?;
+		assert_eq!(weakened, 0);
+		Ok(())
+	}
+
+	#[test]
+	fn weaken_peer_by_dial_targets_matching_gateway() -> Result<(), ClusterError> {
+		let registry = ServletRegistry::default();
+		registry.add(peer_entry_dial(b"urn:t:a", b"fp-a", b"127.0.0.1:9100"))?;
+		registry.add(peer_entry_dial(b"urn:t:b", b"fp-a", b"127.0.0.1:9100"))?;
+		registry.add(peer_entry_dial(b"urn:t:a", b"fp-b", b"127.0.0.1:9200"))?;
+
+		let weakened = registry.weaken_peer_by_dial(b"127.0.0.1:9100")?;
+
+		assert_eq!(weakened, 2);
+		Ok(())
+	}
+
+	#[test]
+	fn weaken_peer_by_dial_ignores_unknown_gateway() -> Result<(), ClusterError> {
+		let registry = ServletRegistry::default();
+		registry.add(peer_entry_dial(b"urn:t:a", b"fp-a", b"127.0.0.1:9100"))?;
+
+		let weakened = registry.weaken_peer_by_dial(b"127.0.0.1:9999")?;
+
+		assert_eq!(weakened, 0);
+		Ok(())
 	}
 
 	struct ApplyAddressUpdateCase {
