@@ -83,6 +83,19 @@ impl GatewayCerts {
 	}
 }
 
+/// Trust store anchoring several independent identities at once (multi-peer
+/// federation tests).
+pub fn combined_trust(certs: &[&Certificate]) -> Arc<dyn CertificateTrust> {
+	let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
+	for cert in certs {
+		builder = builder
+			.with_certificate((*cert).to_owned())
+			.expect("Failed to anchor combined trust");
+	}
+
+	Arc::new(builder.build())
+}
+
 /// Extract Common Name (CN) from certificate subject
 ///
 /// Returns the first CN found in the certificate subject RDN sequence.

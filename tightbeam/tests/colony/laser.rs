@@ -107,6 +107,7 @@ fn laser_cluster_conf(certs: &GatewayCerts) -> ClusterConf {
 		validators: vec![],
 		client_validators: vec![],
 		hive_trust: Some(Arc::clone(&certs.trust)),
+		peer_trust: None,
 	};
 
 	let mut conf = ClusterConf::new(tls);

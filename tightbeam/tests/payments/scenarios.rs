@@ -112,6 +112,7 @@ fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
 		validators: vec![],
 		client_validators: vec![],
 		hive_trust: Some(Arc::clone(&certs.hive_trust)),
+		peer_trust: None,
 	}
 }
 

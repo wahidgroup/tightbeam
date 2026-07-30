@@ -143,6 +143,11 @@ pub struct ClusterTlsConfig {
 	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
 	/// Trust store for validating hive/servlet server certificates (outbound connections)
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
+	/// Trust anchor for peer-gateway advertisements and relayed gossip.
+	/// A separate authority from `hive_trust`: peer certificates cannot
+	/// register as hives, hive certificates cannot forge peer ads. `None`
+	/// disables inbound federation (advertisements are refused).
+	pub peer_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 }
 
 #[cfg(feature = "x509")]
@@ -154,6 +159,7 @@ impl Clone for ClusterTlsConfig {
 			validators: self.validators.iter().map(Arc::clone).collect(),
 			client_validators: self.client_validators.iter().map(Arc::clone).collect(),
 			hive_trust: self.hive_trust.as_ref().map(Arc::clone),
+			peer_trust: self.peer_trust.as_ref().map(Arc::clone),
 		}
 	}
 }
@@ -167,6 +173,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.field("client_validators", &format!("[{} validators]", self.client_validators.len()))
 			.field("hive_trust", &self.hive_trust.as_ref().map(|_| "Some(<TrustStore>)"))
+			.field("peer_trust", &self.peer_trust.as_ref().map(|_| "Some(<TrustStore>)"))
 			.finish()
 	}
 }
@@ -203,6 +210,15 @@ pub struct ClusterConf {
 	/// `None` binds the protocol default. A stable address lets hives
 	/// re-register through gateway restarts without reconfiguration.
 	pub bind_addr: Option<String>,
+	/// Peer gateway addresses this gateway dials to advertise its exported
+	/// types. A dial-list, not an identity gate: a partial or asymmetric peer
+	/// graph is expected. Empty disables outbound advertisement.
+	///
+	/// The advertised slate is never configured: each beat snapshots the hive
+	/// registry, so peers learn exactly the types this colony serves right now.
+	pub peers: Vec<String>,
+	/// Re-advertise beat cadence. `None` disables the advertise beat.
+	pub advertise_interval: Option<Duration>,
 	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
@@ -227,6 +243,8 @@ impl core::fmt::Debug for ClusterConf {
 			.field("pool_config", &self.pool_config)
 			.field("control_freshness_window_ms", &self.control_freshness_window_ms)
 			.field("bind_addr", &self.bind_addr)
+			.field("peers", &self.peers)
+			.field("advertise_interval", &self.advertise_interval)
 			.field("tls", &self.tls)
 			.finish()
 	}
@@ -332,6 +350,7 @@ mod tests {
 			validators: Vec::new(),
 			client_validators: Vec::new(),
 			hive_trust: None,
+			peer_trust: None,
 		}
 	}
 

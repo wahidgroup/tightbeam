@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use super::error::ClusterError;
@@ -132,6 +132,12 @@ impl ServletEntry {
 		}
 	}
 
+	/// Set how this entry is reached, consuming and returning self
+	pub fn with_route_kind(mut self, route_kind: RouteKind) -> Self {
+		self.route_kind = route_kind;
+		self
+	}
+
 	/// Check if this entry should be abandoned (too many failures)
 	pub fn is_abandoned(&self) -> bool {
 		self.trial_count.load(Ordering::Relaxed) >= self.abandonment_limit
@@ -219,6 +225,10 @@ pub struct ServletRegistry {
 	type_index: RwLock<HashMap<SharedId, Vec<SharedId>>>,
 	/// Reverse index: hive_id -> Vec<address>
 	hive_index: RwLock<HashMap<SharedId, Vec<SharedId>>>,
+	/// Serializes whole-slate reconciliation: reconcile spans several
+	/// individually locked operations, and interleaved reconciles for one
+	/// hive would prune each other's fresh installs (TOCTOU).
+	reconcile_gate: Mutex<()>,
 	/// Configuration
 	config: PheromoneConf,
 }
@@ -230,6 +240,7 @@ impl ServletRegistry {
 			entries: RwLock::new(HashMap::new()),
 			type_index: RwLock::new(HashMap::new()),
 			hive_index: RwLock::new(HashMap::new()),
+			reconcile_gate: Mutex::new(()),
 			config,
 		}
 	}
@@ -331,6 +342,70 @@ impl ServletRegistry {
 		}
 
 		Ok(entry)
+	}
+
+	/// Replace one hive's slate with `entries`, all-or-nothing.
+	///
+	/// Installs the new entries first, then prunes the hive's addresses
+	/// absent from the new slate: remove-then-add would drop every route
+	/// before the first add. Any mid-flight failure rolls back to the
+	/// prior slate, so a caller never observes a mixed one. Every entry
+	/// must carry `hive_id` as its hive, or the prune misses it.
+	/// Serialized by `reconcile_gate`.
+	pub fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
+		let _gate = self.reconcile_gate.lock()?;
+
+		let prior: Vec<ServletEntry> = {
+			let addresses: Vec<SharedId> = {
+				let hive_idx = self.hive_index.read()?;
+				hive_idx.get(hive_id).cloned().unwrap_or_default()
+			};
+			let map = self.entries.read()?;
+			addresses.iter().filter_map(|addr| map.get(addr.as_ref()).cloned()).collect()
+		};
+
+		let mut fresh: Vec<SharedId> = Vec::with_capacity(entries.len());
+		for entry in entries {
+			let addr = Arc::clone(&entry.address);
+			if let Err(err) = self.add(entry) {
+				self.restore_slate(&fresh, &prior);
+				return Err(err);
+			}
+
+			fresh.push(addr);
+		}
+
+		let stale: Vec<SharedId> = {
+			let hive_idx = self.hive_index.read()?;
+			hive_idx
+				.get(hive_id)
+				.cloned()
+				.unwrap_or_default()
+				.into_iter()
+				.filter(|addr| !fresh.iter().any(|kept| kept.as_ref() == addr.as_ref()))
+				.collect()
+		};
+
+		for addr in &stale {
+			if let Err(err) = self.remove(addr) {
+				self.restore_slate(&fresh, &prior);
+				return Err(err);
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Best-effort rollback for a failed reconcile: retire the fresh
+	/// installs, then re-add the prior slate (covering entries the fresh
+	/// installs displaced and any already-pruned stale routes).
+	fn restore_slate(&self, fresh: &[SharedId], prior: &[ServletEntry]) {
+		for addr in fresh {
+			let _ = self.remove(addr);
+		}
+		for entry in prior {
+			let _ = self.add(entry.clone());
+		}
 	}
 
 	/// Remove all entries belonging to a hive
@@ -438,13 +513,72 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
+	/// Live entries for a servlet type owned by this gateway's own hives
+	///
+	/// Work selection stays local until forwarding lands: a learned peer
+	/// route must never receive a bare work frame meant for a servlet.
+	pub fn local_entries_for_type(&self, servlet_type: &[u8]) -> Result<Vec<ServletEntry>, ClusterError> {
+		let entries = self.entries_for_type(servlet_type)?;
+		let local = entries
+			.into_iter()
+			.filter(|entry| entry.route_kind == RouteKind::Local)
+			.collect();
+
+		Ok(local)
+	}
+
+	/// Distinct servlet types owned by this gateway's own hives, sorted
+	///
+	/// Route truth for the advertise beat: unlike the hive registry's
+	/// registration-time servlet index, this sees address updates and
+	/// eviction.
+	pub fn local_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
+		let entries = self.entries.read()?;
+		let mut types: Vec<SharedId> = entries
+			.values()
+			.filter(|entry| entry.route_kind == RouteKind::Local)
+			.filter(|entry| entry.is_live())
+			.map(|entry| Arc::clone(&entry.servlet_type))
+			.collect();
+		types.sort_unstable();
+		types.dedup();
+
+		Ok(types)
+	}
+
+	/// Whether a peer slate keyed by `gateway_id` would touch local routes
+	///
+	/// Peer installs replace only prior Peer state. A local servlet at the
+	/// same address key, or a local hive owning the same hive-index key,
+	/// means the advertisement would clobber routes another trust plane
+	/// installed, so the caller refuses it.
+	pub fn peer_key_conflicts_local(&self, gateway_id: &[u8]) -> Result<bool, ClusterError> {
+		let entries = self.entries.read()?;
+		let address_taken = entries
+			.get(gateway_id)
+			.is_some_and(|entry| entry.route_kind == RouteKind::Local);
+		if address_taken {
+			return Ok(true);
+		}
+
+		let hive_idx = self.hive_index.read()?;
+		let Some(addresses) = hive_idx.get(gateway_id) else {
+			return Ok(false);
+		};
+
+		let hive_taken = addresses.iter().any(|addr| {
+			entries
+				.get(addr.as_ref())
+				.is_some_and(|entry| entry.route_kind == RouteKind::Local)
+		});
+
+		Ok(hive_taken)
+	}
+
 	/// Live entries reached through a peer gateway (`RouteKind::Peer`)
 	///
-	/// Abandoned trails are excluded, mirroring [`entries_for_type`]: an
-	/// isolated peer nest is unreachable, so it is neither advertised nor
-	/// re-flooded.
-	///
-	/// [`entries_for_type`]: Self::entries_for_type
+	/// Abandoned trails are excluded: an isolated peer nest is
+	/// unreachable, so it is neither advertised nor re-flooded.
 	pub fn peer_servlets(&self) -> Result<Vec<ServletEntry>, ClusterError> {
 		let entries = self.entries.read()?;
 		let result = entries
@@ -572,6 +706,11 @@ mod tests {
 		)
 	}
 
+	/// Create a named test entry routed through a peer gateway
+	fn peer_entry(addr: &[u8], servlet_type: &[u8], hive: &[u8]) -> ServletEntry {
+		named_entry(addr, servlet_type, hive).with_route_kind(RouteKind::Peer)
+	}
+
 	// =========================================================================
 	// ServletEntry Tests - Data-Driven
 	// =========================================================================
@@ -661,9 +800,7 @@ mod tests {
 		let empty = registry.peer_servlets().ok().unwrap_or_default();
 		assert!(empty.is_empty());
 
-		let mut peer = named_entry(b"peer-gw", b"calc", b"peer-colony");
-		peer.route_kind = RouteKind::Peer;
-		registry.add(peer).ok();
+		registry.add(peer_entry(b"peer-gw", b"calc", b"peer-colony")).ok();
 
 		let peers = registry.peer_servlets().ok().unwrap_or_default();
 		assert_eq!(peers.len(), 1);
@@ -676,8 +813,7 @@ mod tests {
 		let config = PheromoneConf { abandonment_limit: limit, ..Default::default() };
 		let registry = ServletRegistry::new(config);
 
-		let mut peer = named_entry(b"peer-gw", b"calc", b"peer-colony");
-		peer.route_kind = RouteKind::Peer;
+		let mut peer = peer_entry(b"peer-gw", b"calc", b"peer-colony");
 		peer.abandonment_limit = limit;
 		registry.add(peer).ok();
 
@@ -687,6 +823,151 @@ mod tests {
 
 		let peers = registry.peer_servlets().ok().unwrap_or_default();
 		assert!(peers.is_empty());
+	}
+
+	#[test]
+	fn local_entries_for_type_excludes_peer_routes() {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"local", b"calc", b"hive1")).ok();
+		registry.add(peer_entry(b"peer-gw", b"calc", b"peer-colony")).ok();
+
+		let local = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
+		assert_eq!(local.len(), 1);
+		assert_eq!(local[0].address.as_ref(), b"local");
+	}
+
+	#[test]
+	fn local_entries_for_type_empty_when_only_peer_routes() {
+		let registry = ServletRegistry::default();
+		registry.add(peer_entry(b"peer-gw", b"calc", b"peer-colony")).ok();
+
+		let local = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
+		assert!(local.is_empty());
+	}
+
+	// Non-empty slates install before they prune, so a serialized
+	// registry is never observably empty once seeded. An empty sighting
+	// or a final count other than one proves interleaved reconciles
+	// pruned each other's fresh installs.
+	#[test]
+	fn reconcile_by_hive_serializes_concurrent_slates() {
+		use core::sync::atomic::{AtomicBool, Ordering};
+
+		let registry = ServletRegistry::default();
+		registry
+			.reconcile_by_hive(b"gw", vec![peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw")])
+			.ok();
+
+		let saw_empty = AtomicBool::new(false);
+		std::thread::scope(|scope| {
+			scope.spawn(|| {
+				for _ in 0..2000 {
+					let slate = vec![peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw")];
+					registry.reconcile_by_hive(b"gw", slate).ok();
+				}
+			});
+			scope.spawn(|| {
+				for _ in 0..2000 {
+					let slate = vec![peer_entry(b"gw\0urn:t:b", b"urn:t:b", b"gw")];
+					registry.reconcile_by_hive(b"gw", slate).ok();
+				}
+			});
+			scope.spawn(|| {
+				for _ in 0..20000 {
+					let empty = registry.peer_servlets().ok().unwrap_or_default().is_empty();
+					saw_empty.fetch_or(empty, Ordering::Relaxed);
+				}
+			});
+		});
+
+		assert!(!saw_empty.load(Ordering::Relaxed));
+		assert_eq!(registry.peer_servlets().ok().unwrap_or_default().len(), 1);
+	}
+
+	#[test]
+	fn local_servlets_dedups_and_excludes_peer_routes() {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"a1", b"calc", b"hive1")).ok();
+		registry.add(named_entry(b"a2", b"calc", b"hive1")).ok();
+		registry.add(named_entry(b"a3", b"echo", b"hive1")).ok();
+		registry.add(peer_entry(b"gw\0urn:t:x", b"urn:t:x", b"gw")).ok();
+
+		let types = registry.local_servlets().ok().unwrap_or_default();
+		assert_eq!(types.len(), 2);
+	}
+
+	#[test]
+	fn local_servlets_tracks_adds_and_removes() {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"a1", b"calc", b"hive1")).ok();
+		registry.add(named_entry(b"a2", b"echo", b"hive1")).ok();
+		registry.remove(b"a2").ok();
+
+		let types = registry.local_servlets().ok().unwrap_or_default();
+		assert_eq!(types.len(), 1);
+		assert_eq!(types[0].as_ref(), b"calc");
+	}
+
+	#[test]
+	fn reconcile_by_hive_installs_multi_type_slate() {
+		let registry = ServletRegistry::default();
+		let slate = vec![
+			peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw"),
+			peer_entry(b"gw\0urn:t:b", b"urn:t:b", b"gw"),
+		];
+
+		registry.reconcile_by_hive(b"gw", slate).ok();
+
+		let peers = registry.peer_servlets().ok().unwrap_or_default();
+		assert_eq!(peers.len(), 2);
+	}
+
+	#[test]
+	fn reconcile_by_hive_prunes_stale_routes() {
+		let registry = ServletRegistry::default();
+		let full = vec![
+			peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw"),
+			peer_entry(b"gw\0urn:t:b", b"urn:t:b", b"gw"),
+		];
+
+		registry.reconcile_by_hive(b"gw", full).ok();
+		let shrunk = vec![peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw")];
+		registry.reconcile_by_hive(b"gw", shrunk).ok();
+
+		let peers = registry.peer_servlets().ok().unwrap_or_default();
+		assert_eq!(peers.len(), 1);
+		assert_eq!(peers[0].servlet_type.as_ref(), b"urn:t:a");
+	}
+
+	#[test]
+	fn reconcile_by_hive_leaves_other_hives_untouched() {
+		let registry = ServletRegistry::default();
+		let peer = peer_entry(b"gw\0urn:t:a", b"urn:t:a", b"gw");
+		registry.add(named_entry(b"local", b"urn:t:a", b"hive1")).ok();
+		registry.reconcile_by_hive(b"gw", vec![peer]).ok();
+		registry.reconcile_by_hive(b"gw", vec![]).ok();
+
+		let locals = registry.local_entries_for_type(b"urn:t:a").ok().unwrap_or_default();
+		assert_eq!(locals.len(), 1);
+		assert!(registry.peer_servlets().ok().unwrap_or_default().is_empty());
+	}
+
+	#[test]
+	fn peer_key_conflicts_only_with_local_routes() {
+		// (seeded entry, probe key, expected conflict)
+		let cases: &[(ServletEntry, &[u8], bool)] = &[
+			(named_entry(b"gw", b"calc", b"hive1"), b"gw", true),
+			(named_entry(b"addr1", b"calc", b"gw"), b"gw", true),
+			(peer_entry(b"gw", b"calc", b"gw"), b"gw", false),
+			(peer_entry(b"gw", b"calc", b"gw"), b"unseen", false),
+		];
+
+		for (entry, probe, expected) in cases {
+			let registry = ServletRegistry::default();
+			registry.add(entry.clone()).ok();
+
+			assert_eq!(registry.peer_key_conflicts_local(probe).ok(), Some(*expected));
+		}
 	}
 
 	#[test]

@@ -59,6 +59,7 @@ use alloc::{
 use std::borrow::Cow;
 
 use core::fmt;
+use core::str::FromStr;
 
 #[macro_use]
 mod macros;
@@ -174,6 +175,20 @@ impl<'a> fmt::Display for Urn<'a> {
 	}
 }
 
+// Parsing always produces owned data: the input string may not outlive
+// the URN, so both components are copied into `'static` Cows.
+impl FromStr for Urn<'static> {
+	type Err = UrnValidationError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let rest = s.strip_prefix("urn:").ok_or(UrnValidationError::InvalidUrnSyntax)?;
+		let (nid, nss) = rest.split_once(':').ok_or(UrnValidationError::InvalidUrnSyntax)?;
+		Self::validate_nid(nid)?;
+
+		Ok(Urn { nid: Cow::Owned(nid.to_string()), nss: Cow::Owned(nss.to_string()) })
+	}
+}
+
 // DER serialization: Urn is encoded as a UTF8String containing "urn:nid:nss"
 impl<'a> FixedTag for Urn<'a> {
 	const TAG: Tag = Tag::Utf8String;
@@ -204,24 +219,9 @@ impl<'a> DecodeValue<'a> for Urn<'static> {
 		reader: &mut R,
 		_header: crate::der::Header,
 	) -> crate::der::Result<Self> {
-		// Decode as String (requires allocation) then parse
-		// DER decoding inherently needs allocation for owned data
+		let tag = Tag::Utf8String;
 		let utf8_str = String::decode_value(reader, _header)?;
-		let urn_str = utf8_str.as_str();
-
-		// Parse "urn:nid:nss" format without additional allocations
-		if !urn_str.starts_with("urn:") {
-			return Err(crate::der::ErrorKind::Value { tag: Tag::Utf8String }.into());
-		}
-
-		let rest = &urn_str[4..]; // Skip "urn:"
-		let colon_pos = rest.find(':').ok_or(crate::der::ErrorKind::Value { tag: Tag::Utf8String })?;
-
-		let nid = &rest[..colon_pos];
-		let nss = &rest[colon_pos + 1..];
-
-		// Create owned Cow for static lifetime
-		Ok(Urn { nid: Cow::Owned(nid.to_string()), nss: Cow::Owned(nss.to_string()) })
+		utf8_str.parse().map_err(|_| crate::der::ErrorKind::Value { tag }.into())
 	}
 }
 
@@ -254,6 +254,37 @@ mod tests {
 		let invalid_chars: &[&str] = &["ab_cd", "ab.cd"];
 		for nid in invalid_chars {
 			assert!(Urn::validate_nid(nid).is_err());
+		}
+	}
+
+	#[test]
+	fn test_urn_from_str_round_trips_display() -> Result<(), UrnValidationError> {
+		// (input, nid, nss)
+		let cases: &[(&str, &str, &str)] = &[
+			("urn:tightbeam:servlet:prod:ping", "tightbeam", "servlet:prod:ping"),
+			(
+				"urn:test:event:cluster/peer-advertised",
+				"test",
+				"event:cluster/peer-advertised",
+			),
+			("urn:my-ns:a", "my-ns", "a"),
+		];
+
+		for (input, nid, nss) in cases {
+			let urn: Urn<'static> = input.parse()?;
+			assert_eq!(urn.nid, *nid);
+			assert_eq!(urn.nss, *nss);
+			assert_eq!(urn.to_string(), *input);
+		}
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_urn_from_str_rejects_malformed() {
+		let cases: &[&str] = &["", "urn:", "urn:onlynid", "no-prefix:nid:nss", "urn:1bad:nss"];
+		for input in cases {
+			assert!(input.parse::<Urn<'static>>().is_err());
 		}
 	}
 

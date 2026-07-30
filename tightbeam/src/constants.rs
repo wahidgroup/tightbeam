@@ -310,3 +310,11 @@ pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 /// must never exceed this bound (CWE-770). Aligns with
 /// [`DEFAULT_MAX_DECOMPRESSED_LEN`].
 pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;
+
+/// Ceiling on servlet types carried in one peer advertisement
+///
+/// A peer gateway advertisement enumerates the servlet types its colony
+/// exports. Bounding the count fail-closes an oversized advertisement
+/// before it installs unbounded peer routes, the same control-message
+/// flood bound gossip meshes apply to their advertisement path (CWE-770).
+pub const MAX_ADVERTISED_TYPES: usize = 256;

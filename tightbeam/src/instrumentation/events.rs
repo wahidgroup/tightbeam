@@ -132,3 +132,6 @@ pub const CLUSTER_WORK_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cl
 pub const CLUSTER_WORK_UNAVAILABLE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-unavailable");
 pub const CLUSTER_WORK_FAILED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-failed");
 pub const CLUSTER_HIVE_EVICTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/hive-evicted");
+pub const CLUSTER_PEER_ADVERTISED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-advertised");
+pub const CLUSTER_PEER_ADVERTISE_REFUSED: Urn<'static> =
+	Urn::new(TIGHTBEAM_NID, "event:cluster/peer-advertise-refused");
