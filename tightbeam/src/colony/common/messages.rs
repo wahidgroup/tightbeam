@@ -178,6 +178,35 @@ pub struct PeerAdvertisementResponse {
 	pub status: TransitStatus,
 }
 
+/// A gossip rumor flooded gateway-to-gateway across the peer graph.
+///
+/// Gossip carries application content addressed to a servlet type rather
+/// than to a hive. A receiving gateway delivers the payload to one local
+/// instance of `target` and, while `ttl` remains, forwards the rumor to its
+/// own peers with `ttl` decremented. The deduplication digest is recomputed
+/// from `issued_at_ms`, `target`, and `payload` at each hop, so it is stable
+/// across relays and never travels on the wire.
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct GossipEnvelope {
+	/// Issue time in unix milliseconds. Binds the rumor to a freshness
+	/// window so captured gossip cannot be replayed outside it (CWE-294).
+	pub issued_at_ms: u64,
+	/// Servlet type URN the rumor is delivered to on each colony.
+	pub target: Urn<'static>,
+	/// Remaining hop radius. A gateway forwards only while this is above
+	/// zero, decrementing it on each relay.
+	pub ttl: u8,
+	/// Opaque application payload delivered to the target servlet.
+	pub payload: Vec<u8>,
+}
+
+/// Response to a gossip rumor
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct GossipResponse {
+	/// Status of the rumor (Ok = accepted, delivered, and considered for reflood)
+	pub status: TransitStatus,
+}
+
 // =============================================================================
 // Servlet Activation Messages
 // =============================================================================

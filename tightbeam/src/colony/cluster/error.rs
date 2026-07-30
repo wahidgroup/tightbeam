@@ -73,6 +73,14 @@ pub enum ClusterError {
 	/// Peer slate would exceed gateway or route caps
 	#[error("Peer slate exceeds caps")]
 	PeerCapExceeded,
+
+	/// Gossip journal refused a record because a capacity bound was reached
+	#[error("Gossip journal at capacity")]
+	GossipJournalAtCapacity,
+
+	/// Gossip journal backend could not service the request
+	#[error("Gossip journal unavailable")]
+	GossipJournalUnavailable,
 }
 
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {
