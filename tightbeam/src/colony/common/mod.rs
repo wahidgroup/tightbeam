@@ -1,7 +1,5 @@
-//! Common types shared across colony modules
-//!
-//! Contains load balancing strategies, pheromone metrics, and scaling
-//! configuration used by both cluster and hive components.
+//! Shared colony types: load balancers, pheromone metrics, control-plane
+//! helpers, and scaling utilities used by cluster and hive.
 
 pub mod messages;
 pub mod scaling;
@@ -34,65 +32,64 @@ pub use urn::{
 // Load Balancing
 // ============================================================================
 
-/// Pheromone signal a servlet instance carries into one balancing round.
+/// Pheromone signal one servlet instance carries into a balancing round.
 ///
-/// `pheromone` is the stigmergic trail strength (0-[`MAX_PHEROMONE`]): the
-/// registry raises it on a successful forward and lowers it on failure or
-/// evaporation, so a higher value means a stronger recent record. Balancers
-/// read it as the sole selection signal; `instance_key` is opaque identity
-/// (canonical instance-URN bytes) they never interpret.
+/// - `pheromone`: stigmergic trail strength in `0..=`[`MAX_PHEROMONE`].
+///   The registry raises it on a successful forward and lowers it on
+///   failure or evaporation. Balancers use it as the sole selection signal.
+/// - `instance_key`: opaque identity (canonical instance-URN bytes).
+///   Balancers MUST NOT interpret these bytes.
 #[derive(Debug, Clone)]
 pub struct InstanceMetrics {
 	/// Opaque instance handle for the balancing round.
 	pub instance_key: Vec<u8>,
-	/// Stigmergic trail strength (0-[`MAX_PHEROMONE`]); higher is stronger.
+	/// Stigmergic trail strength (`0..=`[`MAX_PHEROMONE`]); higher is stronger.
 	pub pheromone: u64,
 }
 
-/// Upper bound of the pheromone scale (basis points). Single source of
-/// truth for the registry cap and the balancers that read the signal.
+/// Upper bound of the pheromone scale, in basis points.
+///
+/// Shared by the registry cap and every balancer that reads the signal.
 pub const MAX_PHEROMONE: u64 = 10_000;
 
-/// Default exploration floor for [`StochasticForager`]: the baseline weight
-/// every live instance keeps regardless of pheromone, so a cold instance is
-/// never starved to zero probability. Mirrors the threshold-band response of
-/// real foragers, which cannot discriminate fine trail concentrations (see
-/// [`StochasticForager`] sources).
+/// Default [`StochasticForager`] exploration floor.
+///
+/// Baseline weight every live instance keeps so a cold instance is never
+/// starved to zero probability. See [`StochasticForager`] sources.
 const DEFAULT_EXPLORATION_FLOOR: u64 = MAX_PHEROMONE / 20;
 
-/// Default repellency threshold for [`StochasticForager`]: the trail strength
-/// past which extra pheromone stops attracting and begins to repel, capping
-/// any single instance's pull. Mirrors termite trail pheromone turning
-/// repellent at high concentration (see [`StochasticForager`] sources).
+/// Default [`StochasticForager`] repellency threshold.
+///
+/// Trail strength past which extra pheromone stops attracting and begins
+/// to repel. See [`StochasticForager`] sources.
 const DEFAULT_REPELLENCY_THRESHOLD: u64 = (MAX_PHEROMONE * 4) / 5;
 
-/// Instance-selection strategy for distributing work across instances of
-/// one servlet type.
+/// Strategy that selects one instance among candidates of a servlet type.
 ///
-/// Object-safe so a [`ClusterConfig`](crate::colony::cluster::ClusterConfig)
-/// carries any strategy as `Arc<dyn LoadBalancer>`, defaulting to
-/// [`StochasticForager`] the way crypto config defaults to a provider.
+/// Object-safe so [`ClusterConfig`](crate::colony::cluster::ClusterConfig)
+/// can hold `Arc<dyn LoadBalancer>`. The default strategy is
+/// [`StochasticForager`].
 pub trait LoadBalancer: Send + Sync {
-	/// Choose an index into `candidates`, or `None` when it is empty.
+	/// Choose an index into `candidates`, or `None` when the slice is empty.
 	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize>;
 }
 
-/// Gamma-stepped sequence so each balancer starts on a distinct SplitMix64
-/// stream even when constructed within the same millisecond.
+/// Gamma-stepped sequence so each balancer gets a distinct SplitMix64 stream.
 static BALANCER_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Seed drawn from the shared sequence, decorrelated from clock time so
-/// balancers built in the same instant still diverge.
+/// Build the next balancer seed from the sequence XOR the clock.
+///
+/// Balancers constructed in the same instant still diverge.
 fn fresh_seed() -> u64 {
 	let sequence = BALANCER_SEED_SEQUENCE.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed);
 	sequence ^ current_timestamp_ms()
 }
 
-/// Advance SplitMix64 state atomically and return the mixed output
+/// Advance SplitMix64 state and return the mixed output.
 ///
-/// Reference implementation: Vigna, `splitmix64.c` (2015); see
-/// [`SPLITMIX64_GAMMA`]. The single `fetch_add` claims a unique state value
-/// per call, so concurrent callers never observe the same draw.
+/// Reference: Vigna, `splitmix64.c` (2015); see [`SPLITMIX64_GAMMA`].
+/// One `fetch_add` claims a unique state, so concurrent callers never
+/// share a draw.
 fn splitmix64_next(state: &AtomicU64) -> u64 {
 	let mut z = state
 		.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed)
@@ -112,21 +109,19 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 ///
 /// # Behavior
 ///
-/// - **Exploitation**: higher pheromone (a stronger recent record) raises an
-///   instance's draw probability.
-/// - **Exploration**: the exploration floor keeps every live instance
-///   reachable, so a cold instance is never starved to zero probability.
+/// - **Exploitation**: higher pheromone raises an instance's draw probability.
+/// - **Exploration**: the exploration floor keeps every live instance reachable.
 /// - **Repellency**: past the repellency threshold, additional pheromone
-///   *lowers* the draw weight, stopping any instance from monopolizing the
-///   wheel.
+///   *lowers* the draw weight, stopping any instance from monopolizing the wheel.
 ///
 /// # Configuration
 ///
-/// The floor and threshold default to [`DEFAULT_EXPLORATION_FLOOR`] and
-/// [`DEFAULT_REPELLENCY_THRESHOLD`]; override them with
-/// [`with_exploration_floor`](Self::with_exploration_floor) and
-/// [`with_repellency_threshold`](Self::with_repellency_threshold), and pin
-/// the RNG stream with [`with_seed`](Self::with_seed):
+/// - [`DEFAULT_EXPLORATION_FLOOR`]: the floor is the baseline weight every
+///   live instance keeps regardless of pheromone.
+/// - [`DEFAULT_REPELLENCY_THRESHOLD`]: the threshold is the pheromone value
+///   past which additional pheromone stops attracting and begins to repel.
+///
+/// # Example
 ///
 /// ```
 /// # use tightbeam::colony::common::StochasticForager;
@@ -163,31 +158,32 @@ impl Default for StochasticForager {
 }
 
 impl StochasticForager {
-	/// Construct with a fixed RNG seed for reproducible selection streams
-	/// (tests assert distribution over a known stream); other knobs keep
-	/// their defaults and can be overridden by chaining.
+	/// Build with a fixed RNG seed for reproducible selection streams.
+	///
+	/// Other knobs keep their defaults; chain setters to override them.
 	pub fn with_seed(seed: u64) -> Self {
 		Self { rng: Arc::new(AtomicU64::new(seed)), ..Self::default() }
 	}
 
-	/// Override the exploration floor (default
-	/// [`DEFAULT_EXPLORATION_FLOOR`]); a higher value spreads more, a lower
-	/// value exploits stronger trails harder.
+	/// Set the exploration floor (default [`DEFAULT_EXPLORATION_FLOOR`]).
+	///
+	/// A higher floor spreads more. A lower floor exploits strong trails harder.
 	pub fn with_exploration_floor(mut self, floor: u64) -> Self {
 		self.exploration_floor = floor;
 		self
 	}
 
-	/// Override the repellency threshold (default
-	/// [`DEFAULT_REPELLENCY_THRESHOLD`]); trails above it lose pull.
+	/// Set the repellency threshold (default [`DEFAULT_REPELLENCY_THRESHOLD`]).
+	///
+	/// Trails above the threshold lose pull.
 	pub fn with_repellency_threshold(mut self, threshold: u64) -> Self {
 		self.repellency_threshold = threshold;
 		self
 	}
 
-	/// Weight an instance contributes to the roulette wheel: the exploration
-	/// floor plus its pheromone, with the pheromone term declining once it
-	/// crosses the repellency threshold.
+	/// Roulette-wheel weight: exploration floor plus attractive pheromone.
+	///
+	/// The pheromone term declines once it crosses the repellency threshold.
 	fn forage_weight(&self, pheromone: u64) -> u64 {
 		let attractive = if pheromone <= self.repellency_threshold {
 			pheromone
@@ -208,9 +204,8 @@ impl LoadBalancer for StochasticForager {
 				let total: u64 = candidates.iter().map(|c| self.forage_weight(c.pheromone)).sum();
 				let raw = splitmix64_next(&self.rng);
 
-				// A zero-floor config with no live trail leaves every weight
-				// at zero; fall back to a uniform draw rather than dividing
-				// by zero.
+				// Zero floor and dead trails: every weight is zero. Draw
+				// uniformly instead of dividing by zero.
 				if total == 0 {
 					return Some((raw as usize) % last_plus_one);
 				}
@@ -230,8 +225,10 @@ impl LoadBalancer for StochasticForager {
 }
 
 /// Power of Two Choices: probe two distinct random instances and keep the
-/// stronger trail. Spreads concurrent routers across the pool while still
-/// favoring stronger instances.
+/// stronger trail.
+///
+/// - Spreads concurrent routers across the pool.
+/// - Still favors instances with a stronger pheromone trail.
 ///
 /// # Sources
 ///
@@ -256,9 +253,8 @@ impl LoadBalancer for PowerOfTwoChoices {
 			1 => Some(0),
 			2 => Some(usize::from(candidates[1].pheromone > candidates[0].pheromone)),
 			n => {
-				// One draw yields 64 bits; the halves index a uniformly
-				// distinct pair: second is drawn from [0, n-1) and shifted
-				// past first, so (first, second) covers all ordered pairs.
+				// Split one 64-bit draw into a uniformly distinct pair:
+				// second is drawn from [0, n-1) and shifted past first.
 				let draw = splitmix64_next(&self.rng);
 				let first = ((draw >> 32) as usize) % n;
 				let offset = ((draw & u64::from(u32::MAX)) as usize) % (n - 1);
@@ -274,8 +270,7 @@ impl LoadBalancer for PowerOfTwoChoices {
 	}
 }
 
-/// Round-robin: cycle through instances regardless of trail strength.
-/// Deterministic even spread, ignoring the pheromone signal.
+/// Round-robin: cycle instances in order and ignore pheromone.
 #[derive(Debug, Clone, Default)]
 pub struct RoundRobin {
 	counter: Arc<AtomicU64>,
@@ -293,13 +288,12 @@ impl LoadBalancer for RoundRobin {
 }
 
 // ============================================================================
-// Timestamp Helper
+// Timestamp
 // ============================================================================
 
-/// Get current timestamp in milliseconds since UNIX epoch
+/// Current time in milliseconds since the UNIX epoch.
 ///
-/// Always backed by the system clock: `colony` implies `std`, so no
-/// fallback stub exists.
+/// Uses the system clock (`colony` implies `std`).
 pub fn current_timestamp_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -308,16 +302,17 @@ pub fn current_timestamp_ms() -> u64 {
 }
 
 // ============================================================================
-// Utilization Aggregation
+// Utilization
 // ============================================================================
 
-/// Mean utilization across all servlet instances of a hive
+/// Mean utilization across a hive's servlet instances, in basis points.
 ///
-/// `total_utilization` is the sum of per-instance basis points and
-/// `instance_count` the number of instances summed. A hive with zero
-/// instances reports [`BasisPoints::MAX`]: it cannot absorb work, so
-/// backpressure and heartbeats must signal saturation (per-type scaling
-/// still sees the zero count and spawns).
+/// - `total_utilization`: sum of per-instance basis points.
+/// - `instance_count`: number of instances in that sum.
+///
+/// A hive with zero instances returns [`BasisPoints::MAX`] so backpressure
+/// and heartbeats report saturation. Per-type scaling still sees the zero
+/// count and can spawn.
 pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> BasisPoints {
 	match instance_count {
 		0 => BasisPoints::MAX,
@@ -326,13 +321,10 @@ pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> B
 }
 
 // ============================================================================
-// Control-Plane Reply Frames
+// Control-Plane Replies
 // ============================================================================
 
-/// Build a V0 response frame echoing a request id
-///
-/// Single implementation behind the `hive!` and `cluster!` `@reply`
-/// macro arms.
+/// Build a V0 response frame that echoes the request id.
 pub fn reply_frame<M: crate::Message>(
 	id: impl AsRef<[u8]>,
 	message: M,
@@ -348,10 +340,10 @@ pub fn reply_frame<M: crate::Message>(
 	Ok(Some(frame))
 }
 
-/// Build a V2 response frame with an explicit priority
+/// Build a V2 response frame with an explicit priority.
 ///
-/// Used for heartbeat replies, which carry `NetworkControl` priority so
-/// monitoring stays distinguishable from work traffic.
+/// Heartbeat replies use `NetworkControl` so monitoring stays distinct
+/// from work traffic.
 pub fn reply_frame_with_priority<M: crate::Message>(
 	id: impl AsRef<[u8]>,
 	priority: crate::MessagePriority,
@@ -367,6 +359,28 @@ pub fn reply_frame_with_priority<M: crate::Message>(
 		.build()?;
 
 	Ok(Some(frame))
+}
+
+// ============================================================================
+// Task Lifecycle
+// ============================================================================
+
+/// Take an optional join handle and abort it when present.
+///
+/// Shared by servlet, hive, and cluster `stop` / `Drop` paths.
+#[cfg(feature = "std")]
+pub fn take_and_abort(handle: &mut Option<crate::runtime::rt::JoinHandle>) {
+	if let Some(handle) = handle.take() {
+		crate::runtime::rt::abort(&handle);
+	}
+}
+
+/// Abort every owned join handle in `handles`.
+#[cfg(feature = "std")]
+pub fn abort_all(handles: impl IntoIterator<Item = crate::runtime::rt::JoinHandle>) {
+	for handle in handles {
+		crate::runtime::rt::abort(&handle);
+	}
 }
 
 #[cfg(test)]

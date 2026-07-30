@@ -88,8 +88,8 @@ Hot paths aim for zero-copy operation where the design allows it. Production pat
      - 8.5.3. [Implementation: CMS-Based Handshake Protocol](#853-implementation-cms-based-handshake-protocol)
      - 8.5.4. [Implementation: ECIES-Based Handshake Protocol](#854-implementation-ecies-based-handshake-protocol)
      - 8.5.5. [Security Profile Negotiation](#855-security-profile-negotiation)
-     - 8.5.6. [Negotiation & Failure Modes](#856-negotiation--failure-modes)
-     - 8.5.7. [Threat to Control Mapping](#857-threat-to-control-mapping)
+     - 8.5.6. [Negotiation and Failure Modes](#856-negotiation-and-failure-modes)
+     - 8.5.7. [Threat-to-Control Mapping](#857-threat-to-control-mapping)
    - 8.6. [Multiplexing](#86-multiplexing)
      - 8.6.1. [Concept: Concurrent Streams Over One Connection](#861-concept-concurrent-streams-over-one-connection)
      - 8.6.2. [Specification: Stream Rules, Envelopes, and Runtime](#862-specification-stream-rules-envelopes-and-runtime)
@@ -3434,6 +3434,7 @@ let filter = LogFilter::new(LogLevel::Warning)
 #### Integration
 
 ```rust
+use tightbeam::instrumentation::events;
 use tightbeam::trace::{TraceConfig, logging::*};
 
 let backend = Box::new(StdoutBackend);
@@ -3445,10 +3446,10 @@ let trace: TraceCollector = TraceConfig::builder()
 	.with_logger(config)
 	.build();
 
-trace.event("msg")?.with_log_level(LogLevel::Error).emit();
+trace.event(events::ERROR)?.with_log_level(LogLevel::Error).emit();
 ```
 
-> Note: The event emit may be elided as events are emitted on drop.
+> Note: The event emit may be elided; events are emitted on drop.
 
 ## 11. Misc
 
@@ -3496,32 +3497,23 @@ fn build_customer_urn() -> Result<(), UrnValidationError> {
 
 **Module**: `tightbeam::utils::task`
 
-The `job!` macro implements the **Command Pattern** for encapsulating executable units of work as zero-sized types (ZST). Jobs provide a lightweight abstraction for reusable, composable, and testable logic without runtime overhead.
-
-**Imports**:
+The `job!` macro wraps a unit of work as a zero-sized type (ZST) with a static `run` method. Sync jobs implement `Job`. Async jobs implement `AsyncJob`.
 
 ```rust
-// Macros are exported at crate root
 use tightbeam::job;
-
-// Traits and types are in utils::task
 use tightbeam::utils::task::{Job, AsyncJob, Pipeline, join};
 ```
 
-**Key Properties**:
+Properties:
 
-- **Zero-Cost**: Generates a ZST struct with a single static method
-- **Namespace Organization**: Groups related functionality under a type name
-- **Composable**: Jobs can be passed as types and invoked uniformly
-- **Testable**: Stateless functions are easy to test in isolation
-- **Protocol Independence**: Works with both sync and async execution contexts
+- Zero-cost ZST with one static `run`
+- Named type for composition and tests
+- Sync or async, protocol-independent
 
-**Design Rationale**: Jobs serve as a fundamental behavioral unit in tightbeam, analogous to functions-as-objects in object-oriented design. They provide a consistent interface for executable commands across different contexts.
-
-**Syntax**:
+**Syntax:**
 
 ```rust
-// Async job with tuple input (implements AsyncJob trait)
+// Async job with tuple input (implements AsyncJob)
 job! {
 	name: JobName,
 	async fn run((param1, param2): (Type1, Type2)) -> ReturnType {
@@ -3529,7 +3521,7 @@ job! {
 	}
 }
 
-// Sync job with tuple input (implements Job trait)
+// Sync job with tuple input (implements Job)
 job! {
 	name: JobName,
 	fn run((param1, param2): (Type1, Type2)) -> ReturnType {
@@ -3537,7 +3529,7 @@ job! {
 	}
 }
 
-// No-parameter job (implements Job/AsyncJob with Input = ())
+// No-parameter job (Input = ())
 job! {
 	name: NoParamJob,
 	fn run() -> ReturnType {
@@ -3546,19 +3538,15 @@ job! {
 }
 ```
 
-**Traits**:
-
-The `job!` macro automatically implements marker traits for job handling:
+**Traits** (implemented by `job!`):
 
 ```rust
-/// Synchronous job trait
 pub trait Job {
 	type Input;
 	type Output;
 	fn run(input: Self::Input) -> Self::Output;
 }
 
-/// Asynchronous job trait
 pub trait AsyncJob {
 	type Input;
 	type Output;
@@ -3566,50 +3554,35 @@ pub trait AsyncJob {
 }
 ```
 
+Call sites pass a single `Input` value (often a tuple): `AddNumbers::run((1, 2))`.
+
 #### 11.1.3 Job Pipelines
 
 **Module**: `tightbeam::utils::task`
 
-The `Pipeline` trait extends Rust's `Result<T, E>` with job composition capabilities, making Result itself a pipeline. This design enables seamless integration between jobs and standard Rust code with zero learning curve.
-
-**Imports**:
+`Result<T, E>` implements `Pipeline`. Jobs that return `Result` chain with familiar `and_then`, `map`, and `or_else`. Closures that return `Result` are pipelines too.
 
 ```rust
-use tightbeam::job;  // Macro for creating jobs
-use tightbeam::utils::task::{Pipeline, join};
+use tightbeam::job;
+use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
 ```
 
-**Core Concept**: If you know how to use `Result`, you already know how to use pipelines.
-
-**Design Principles**:
-
-1. **Result is a Pipeline** - `Result<T, E>` implements `Pipeline` directly
-2. **Organic Integration** - Mix jobs with standard Result methods seamlessly
-3. **Minimal Learning Curve** - Uses familiar Result methods (`and_then`, `map`, `or_else`)
-4. **Optional Trace** - Use `PipelineBuilder` for automatic trace event emission
-5. **Idiomatic Rust** - Follows Result/Future conventions
-
-**Basic Usage - Jobs as Pipelines**:
+**Basic usage:**
 
 ```rust
-use tightbeam::utils::task::Pipeline;
-
-// Jobs return Results, which are pipelines
-let frame = CreateHandshakeRequest::run(client_id, nonce)
-	.map(|req| req.with_timestamp(now()))             // Core Result::map
-	.and_then(|req| ValidateRequest::run(req))        // Job
-	.map_err(|e| TightBeamError::ValidationFailed(e)) // Core Result::map_err
-	.and_then(|req| SendRequest::run(req))            // Another job
-	.run()?;                                          // Execute the pipeline
+let frame = CreateHandshakeRequest::run((client_id, nonce))
+	.map(|req| req.with_timestamp(now()))
+	.and_then(|req| ValidateRequest::run(req))
+	.map_err(|e| TightBeamError::ValidationFailed(e))
+	.and_then(|req| SendRequest::run(req))
+	.run()?;
 ```
 
-**Mixed Composition**:
+**Mixed composition** (start from any `Result`):
 
 ```rust
-// Start from existing Result
 let config: Result<Config, Error> = parse_config_file(path);
 
-// Chain jobs onto it organically
 config
 	.and_then(|cfg| ValidateConfig::run(cfg))
 	.and_then(|cfg| SaveConfig::run(cfg))
@@ -3618,90 +3591,83 @@ config
 	.run()?;
 ```
 
-**Parallel Execution with `join()`**:
+**Parallel execution with `join()`:**
 
 ```rust
-use tightbeam::utils::task::join;
-
-// Both return Results, both implement Pipeline
 let (encrypted, signed) = join(
 	EncryptPayload::run(payload),
 	SignPayload::run(payload)
 ).run()?;
 
-// Use results
-SendRequest::run(encrypted, signed)?;
+SendRequest::run((encrypted, signed))?;
 ```
 
-**Fallback Handling**:
+**Error recovery** (`Pipeline` exposes `or_else`, not `or`):
 
 ```rust
-// Fallback to alternative on error
 let frame = SendRequest::run(request)
-	.or(|| UseCachedResponse::run())  // Try fallback on error
-	.or_else(|e| HandleError::run(e)) // Error recovery
+	.or_else(|_| UseCachedResponse::run())
+	.or_else(|e| HandleError::run(e))
 	.run()?;
 ```
 
-**Automatic Trace with `PipelineBuilder`**:
+**Automatic trace with `PipelineBuilder`:**
 
-When you need trace event emission, use `PipelineBuilder` to create a traced pipeline. Job names are automatically converted to snake_case URN events:
+`PipelineBuilder` (feature `testing`) attaches a `TraceCollector`. Each traced `and_then` emits job lifecycle URNs:
+
+```
+urn:tightbeam:event:job/<job-name>-<start|success|error>
+```
+
+Job names are derived from the closure type (`Type::run` path), converted to snake_case, then hyphenated in the NSS (for example `CreateHandshakeRequest` becomes `create-handshake-request`).
 
 ```rust
-use tightbeam::utils::task::PipelineBuilder;
-
-// Create pipeline with trace context
 PipelineBuilder::new(trace)
 	.start((client_id, nonce))
-	// Auto-emits: urn:tightbeam:instrumentation:event/create_handshake_request_start
-	//             urn:tightbeam:instrumentation:event/create_handshake_request_success
-	.and_then(|(id, n)| CreateHandshakeRequest::run(id, n))
-	.map(|req| req.validate())  // No trace event (standard map)
-	// Auto-emits: urn:tightbeam:instrumentation:event/validate_request_*
+	// Auto-emits: urn:tightbeam:event:job/create-handshake-request-start
+	//             urn:tightbeam:event:job/create-handshake-request-success
+	.and_then(|(id, n)| CreateHandshakeRequest::run((id, n)))
+	.map(|req| req.validate()) // no job URN (plain map)
 	.and_then(|req| ValidateRequest::run(req))
-	// Auto-emits: urn:tightbeam:instrumentation:event/send_request_*
 	.and_then(|req| SendRequest::run(req))
 	.run()?;
 ```
 
-**Testing Integration**:
+**Testing integration:**
 
-Pipelines work seamlessly with `tb_scenario!`:
+Assert the full job URNs (exact string match; see [§10.2](#102-event-kind-taxonomy)):
 
 ```rust
-// L1: Assertion specification
 tb_assert_spec! {
 	pub PipelineSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			// Shorthand labels match full URNs
-			(create_handshake_request_start, exactly!(1)),
-			(create_handshake_request_success, exactly!(1)),
-			(validate_request_start, exactly!(1)),
-			(validate_request_success, exactly!(1))
+			("urn:tightbeam:event:job/create-handshake-request-start", exactly!(1)),
+			("urn:tightbeam:event:job/create-handshake-request-success", exactly!(1)),
+			("urn:tightbeam:event:job/validate-request-start", exactly!(1)),
+			("urn:tightbeam:event:job/validate-request-success", exactly!(1))
 		]
 	}
 }
 
-// L2: CSP process specification
 tb_process_spec! {
 	pub PipelineProcess,
 	events {
 		observable {
-			"create_handshake_request_start",
-			"create_handshake_request_success",
-			"validate_request_start",
-			"validate_request_success"
+			"urn:tightbeam:event:job/create-handshake-request-start",
+			"urn:tightbeam:event:job/create-handshake-request-success",
+			"urn:tightbeam:event:job/validate-request-start",
+			"urn:tightbeam:event:job/validate-request-success"
 		}
 		hidden {}
 	}
 	states {
-		Idle     => { "create_handshake_request_start" => Creating },
-		Creating => { "create_handshake_request_success" => Validating },
-		Validating => { "validate_request_start" => ValidatingRun },
-		ValidatingRun => { "validate_request_success" => Done },
+		Idle => { "urn:tightbeam:event:job/create-handshake-request-start" => Creating },
+		Creating => { "urn:tightbeam:event:job/create-handshake-request-success" => Validating },
+		Validating => { "urn:tightbeam:event:job/validate-request-start" => ValidatingRun },
+		ValidatingRun => { "urn:tightbeam:event:job/validate-request-success" => Done },
 		Done => {}
 	}
 	terminal { Done }
@@ -3715,10 +3681,9 @@ tb_scenario! {
 		.build(),
 	environment Pipeline {
 		exec: |pipeline| {
-			let input = ("test-001".to_string(), "nonce".to_string());
 			pipeline
-				.start(input)
-				.and_then(|x| CreateHandshakeRequest::run(x, nonce))
+				.start(("test-001".to_string(), "nonce".to_string()))
+				.and_then(|input| CreateHandshakeRequest::run(input))
 				.map(|req| req.with_metadata())
 				.and_then(|req| ValidateRequest::run(req))
 				.run()
@@ -3727,32 +3692,23 @@ tb_scenario! {
 }
 ```
 
-**Complete Example**:
+**Complete example:**
 
 ```rust
 use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
 
-// Mix everything: jobs, Results, parallel execution, fallbacks, trace
 let session_id = PipelineBuilder::new(trace)
 	.start(client_id)
-	// Job with auto-trace
-	.and_then(|id| CreateHandshakeRequest::run(id, nonce))
-	// Standard Result operation
+	.and_then(|id| CreateHandshakeRequest::run((id, nonce)))
 	.map(|req| req.add_timestamp(now()))
-	// Parallel execution
 	.and_then(|req| {
 		let encrypted = EncryptPayload::run(payload);
 		let signed = SignPayload::run(payload);
-
 		join(encrypted, signed).map(|(e, s)| (req, e, s))
 	})
-	// Send request
 	.and_then(|(req, enc, sig)| SendRequest::run((req, enc, sig)))
-	// Fallback on error
-	.or(|| UseCachedResponse::run())
-	// Error recovery
+	.or_else(|_| UseCachedResponse::run())
 	.or_else(|e| HandleError::run(e))
-	// Extract result
 	.and_then(|resp| ExtractSessionId::run(resp))
 	.run()?;
 ```

@@ -1,12 +1,11 @@
-//! Servlet framework for containerized tightbeam applications
-//!
-//! Servlets provide a way to create self-contained, policy-driven message
-//! processing applications that can be easily deployed and tested.
+//! Servlet framework: policy-gated accept loops that dispatch unary,
+//! streaming, and duplex handlers with shared workers and env config.
 
 pub mod macros;
+pub mod runtime;
 pub mod tracking;
 
-// Re-export tracking types
+pub use runtime::ServletRuntime;
 pub use tracking::{LatencyTracker, ServletMetrics, UtilizationReporter};
 
 use core::convert::TryFrom;
@@ -55,15 +54,15 @@ mod x509 {
 #[cfg(feature = "x509")]
 use x509::*;
 
-/// Re-export unified runtime primitives
+/// Runtime task primitives used by servlet accept loops.
 pub mod servlet_runtime {
 	pub use crate::runtime::rt;
 }
 
-/// Type alias for boxed worker start future
+/// Boxed future returned by [`WorkerBox::start_boxed`].
 pub type WorkerBoxStartFuture = Pin<Box<dyn Future<Output = Result<Box<dyn WorkerBox>, TightBeamError>> + Send>>;
 
-/// Trait for type-erased worker lifecycle management
+/// Type-erased worker lifecycle for servlet-owned worker maps.
 pub trait WorkerBox: Send + Sync + core::any::Any {
 	fn start_boxed(self: Box<Self>, trace: Arc<TraceCollector>) -> WorkerBoxStartFuture;
 }
@@ -77,21 +76,18 @@ impl<W: Worker + 'static> WorkerBox for W {
 	}
 }
 
-// Downcast helper
 impl dyn WorkerBox {
 	pub fn downcast_ref<W: 'static>(&self) -> Option<&W> {
 		(self as &dyn core::any::Any).downcast_ref()
 	}
 }
 
-// =============================================================================
+// ============================================================================
 // Servlet Context
-// =============================================================================
+// ============================================================================
 
-/// Unified context for servlet handlers.
-///
-/// Provides access to trace collection, environment configuration, workers,
-/// and hive context for intra-hive communication.
+/// Handler context: trace, env config, workers, optional hive link, and
+/// message-body decryptor/inflator.
 pub struct ServletContext {
 	trace: Arc<TraceCollector>,
 	env_config: Arc<dyn Any + Send + Sync>,
@@ -102,7 +98,7 @@ pub struct ServletContext {
 }
 
 impl ServletContext {
-	/// Create a new servlet context
+	/// Build a context without message-body crypto or compression.
 	pub fn new(
 		trace: Arc<TraceCollector>,
 		env_config: Arc<dyn Any + Send + Sync>,
@@ -119,53 +115,51 @@ impl ServletContext {
 		}
 	}
 
-	/// Attach the decryptor used for frame-level (message body) decryption
+	/// Attach the frame-body decryptor used by typed delivery.
 	#[must_use]
 	pub fn with_message_decryptor(mut self, decryptor: Option<Arc<dyn Decryptor + Send + Sync>>) -> Self {
 		self.message_decryptor = decryptor;
 		self
 	}
 
-	/// Attach the inflator used for message body decompression
+	/// Attach the frame-body inflator used by typed delivery.
 	#[must_use]
 	pub fn with_message_inflator(mut self, inflator: Option<Arc<dyn Inflator + Send + Sync>>) -> Self {
 		self.message_inflator = inflator;
 		self
 	}
 
-	/// Get the frame-level message decryptor, when configured
+	/// Frame-body decryptor, when configured.
 	pub fn message_decryptor(&self) -> Option<&dyn Decryptor> {
 		self.message_decryptor.as_deref().map(|decryptor| decryptor as &dyn Decryptor)
 	}
 
-	/// Get the message body inflator, when configured
+	/// Frame-body inflator, when configured.
 	pub fn message_inflator(&self) -> Option<&dyn Inflator> {
 		self.message_inflator.as_deref().map(|inflator| inflator as &dyn Inflator)
 	}
 
-	/// Get the trace collector
+	/// Trace collector for this servlet.
 	pub fn trace(&self) -> &Arc<TraceCollector> {
 		&self.trace
 	}
 
-	/// Get the environment configuration (downcasted to the specific type)
+	/// Environment configuration downcast to `T`.
 	pub fn env_config<T: 'static>(&self) -> Result<&T, TightBeamError> {
 		self.env_config.downcast_ref().ok_or(TightBeamError::MissingConfiguration)
 	}
 
-	/// Get the hive context for intra-hive servlet communication
+	/// Intra-hive communication handle, when this servlet runs inside a hive.
 	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
 		self.hive_context.as_ref()
 	}
 
-	/// Get a worker by name (downcasted to the specific type)
+	/// Worker registered under `name`, downcast to `W`.
 	pub fn worker<W: 'static>(&self, name: &str) -> Option<&W> {
 		self.workers.get(name)?.downcast_ref()
 	}
 
-	/// Relay a message to a worker by type name
-	///
-	/// This finds the worker by its registered name and calls its relay method.
+	/// Relay `input` to the worker named by [`WorkerMetadata`].
 	pub async fn relay<W>(&self, input: Arc<W::Input>) -> Result<W::Output, TightBeamError>
 	where
 		W: Worker + WorkerMetadata + 'static,
@@ -178,18 +172,15 @@ impl ServletContext {
 
 /// Normalize a frame to cleartext before typed delivery.
 ///
-/// Applies the servlet's configured message-body capabilities in place,
-/// fail-closed: an encrypted body without a configured decryptor and a
-/// compressed body without a configured inflator are rejected before any
-/// decode attempt. On success the frame is cleartext and its body can be
-/// decoded as the servlet's declared input type.
+/// Fail-closed and in place: encrypted bodies without a decryptor, and
+/// compressed bodies without an inflator, are rejected before decode.
+/// On success the body is cleartext for the servlet's declared input type.
 ///
 /// # Errors
 ///
-/// - [`RouterError::ConfidentialFrame`] -- encrypted body, no decryptor.
-/// - [`RouterError::CompressedFrame`] -- compressed body, no inflator.
-/// - Decryption or decompression errors from the configured
-///   implementations.
+/// - [`RouterError::ConfidentialFrame`]: encrypted body, no decryptor.
+/// - [`RouterError::CompressedFrame`]: compressed body, no inflator.
+/// - Decryption or decompression errors from the configured implementations.
 pub fn prepare_typed_frame(frame: &mut Frame, ctx: &ServletContext) -> Result<(), TightBeamError> {
 	if frame.metadata.confidentiality.is_some() {
 		let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
@@ -206,11 +197,11 @@ pub fn prepare_typed_frame(frame: &mut Frame, ctx: &ServletContext) -> Result<()
 	Ok(())
 }
 
-// =============================================================================
+// ============================================================================
 // Servlet Configuration
-// =============================================================================
+// ============================================================================
 
-/// Configuration for a servlet, containing x509, application config, and workers
+/// Servlet bind and handler configuration (includes transport encryption).
 #[cfg(feature = "x509")]
 pub struct ServletConfig<P, M, C: CryptoProvider = DefaultCryptoProvider>
 where
@@ -230,7 +221,7 @@ where
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 }
 
-/// Configuration for a servlet, containing application config and workers
+/// Servlet bind and handler configuration (cleartext transport).
 #[cfg(not(feature = "x509"))]
 pub struct ServletConfig<P, M>
 where
@@ -248,7 +239,7 @@ where
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 }
 
-/// Builder for ServletConfig
+/// Builder for [`ServletConfig`] with transport encryption.
 #[cfg(feature = "x509")]
 pub struct ServletConfigBuilder<P, M, C: CryptoProvider = DefaultCryptoProvider>
 where
@@ -266,7 +257,7 @@ where
 	_phantom: PhantomData<(P, M, C)>,
 }
 
-/// Builder for ServletConfig
+/// Builder for [`ServletConfig`] without transport encryption.
 #[cfg(not(feature = "x509"))]
 pub struct ServletConfigBuilder<P, M>
 where
@@ -290,64 +281,84 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Create a new ServletConfig builder
+	/// Start a [`ServletConfigBuilder`].
 	pub fn builder() -> ServletConfigBuilder<P, M, C> {
 		ServletConfigBuilder::default()
 	}
 
-	/// Get a worker by name (downcasted to the specific type)
+	/// Worker registered under `name`, downcast to `W`.
 	pub fn worker<W: 'static>(&self, name: &str) -> Option<&W> {
 		self.workers.get(name)?.downcast_ref()
 	}
 
-	/// Get the x509 configuration
+	/// Transport encryption config, when set.
 	pub fn to_encryption_config_ref(&self) -> Option<&TransportEncryptionConfig<C>> {
 		self.x509_config.as_ref()
 	}
 
-	/// Get the servlet application config (downcasted to the specific type)
+	/// Application env config downcast to `Cfg`.
 	pub fn to_env_config_ref<Cfg: 'static>(&self) -> Option<&Arc<Cfg>> {
 		self.servlet_config.as_ref()?.downcast_ref()
 	}
 
-	/// Get servlet config
+	/// Type-erased application env config.
 	pub fn to_servlet_conf_ref(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
 		self.servlet_config.as_ref()
 	}
 
-	/// Get workers map
+	/// Consume and return the worker map.
 	pub fn to_workers(self) -> HashMap<String, Box<dyn WorkerBox>> {
 		self.workers
 	}
 
-	/// Get collector gates
+	/// Consume and return collector gates.
 	pub fn to_collector_gates(self) -> Vec<Arc<dyn GatePolicy + Send + Sync>> {
 		self.collector_gates
 	}
 
-	/// Get collector gates by reference
+	/// Collector gates by reference.
 	pub fn collector_gates_ref(&self) -> &[Arc<dyn GatePolicy + Send + Sync>] {
 		&self.collector_gates
 	}
 
-	/// Get the hive context for intra-hive servlet communication
+	/// Intra-hive communication handle, when set.
 	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
 		self.hive_context.as_ref()
 	}
 
-	/// Get the frame-level message decryptor, when configured
+	/// Frame-body decryptor clone, when configured.
 	pub fn to_message_decryptor(&self) -> Option<Arc<dyn Decryptor + Send + Sync>> {
 		self.message_decryptor.as_ref().map(Arc::clone)
 	}
 
-	/// Get the message body inflator, when configured
+	/// Frame-body inflator clone, when configured.
 	pub fn to_message_inflator(&self) -> Option<Arc<dyn Inflator + Send + Sync>> {
 		self.message_inflator.as_ref().map(Arc::clone)
 	}
 
-	/// Get the multiplexing advertisement for accepted connections
+	/// Multiplexing advertisement applied to accepted connections.
 	pub fn mux_offer(&self) -> Option<TransportOffer> {
 		self.mux_offer.to_owned()
+	}
+
+	/// Take encryption config for bind without cloning key material.
+	pub(crate) fn take_encryption_config(&mut self) -> Option<TransportEncryptionConfig<C>> {
+		self.x509_config.take()
+	}
+
+	/// Consume into the parts [`ServletRuntime`] needs after bind.
+	pub(crate) fn into_runtime_parts(self) -> Result<runtime::ServletRuntimeParts, TightBeamError> {
+		let env_config = self.servlet_config.ok_or(TightBeamError::MissingConfiguration)?;
+		let parts = runtime::ServletRuntimeParts {
+			env_config,
+			collector_gates: self.collector_gates,
+			mux_offer: self.mux_offer,
+			hive_context: self.hive_context,
+			message_decryptor: self.message_decryptor,
+			message_inflator: self.message_inflator,
+			workers: self.workers,
+		};
+		Ok(parts)
 	}
 }
 
@@ -357,59 +368,74 @@ where
 	P: Protocol,
 	M: Message,
 {
-	/// Create a new ServletConfig builder
+	/// Start a [`ServletConfigBuilder`].
 	pub fn builder() -> ServletConfigBuilder<P, M> {
 		ServletConfigBuilder::default()
 	}
 
-	/// Get a worker by name (downcasted to the specific type)
+	/// Worker registered under `name`, downcast to `W`.
 	pub fn worker<W: 'static>(&self, name: &str) -> Option<&W> {
 		self.workers.get(name)?.downcast_ref()
 	}
 
-	/// Get the servlet application config (downcasted to the specific type)
+	/// Application env config downcast to `Cfg`.
 	pub fn to_env_config_ref<Cfg: 'static>(&self) -> Option<&Arc<Cfg>> {
 		self.servlet_config.as_ref()?.downcast_ref()
 	}
 
-	/// Get servlet config
+	/// Type-erased application env config.
 	pub fn to_servlet_conf_ref(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
 		self.servlet_config.as_ref()
 	}
 
-	/// Get workers map
+	/// Consume and return the worker map.
 	pub fn to_workers(self) -> HashMap<String, Box<dyn WorkerBox>> {
 		self.workers
 	}
 
-	/// Get collector gates
+	/// Consume and return collector gates.
 	pub fn to_collector_gates(self) -> Vec<Arc<dyn GatePolicy + Send + Sync>> {
 		self.collector_gates
 	}
 
-	/// Get collector gates by reference
+	/// Collector gates by reference.
 	pub fn collector_gates_ref(&self) -> &[Arc<dyn GatePolicy + Send + Sync>] {
 		&self.collector_gates
 	}
 
-	/// Get the hive context for intra-hive servlet communication
+	/// Intra-hive communication handle, when set.
 	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
 		self.hive_context.as_ref()
 	}
 
-	/// Get the frame-level message decryptor, when configured
+	/// Frame-body decryptor clone, when configured.
 	pub fn to_message_decryptor(&self) -> Option<Arc<dyn Decryptor + Send + Sync>> {
 		self.message_decryptor.as_ref().map(Arc::clone)
 	}
 
-	/// Get the message body inflator, when configured
+	/// Frame-body inflator clone, when configured.
 	pub fn to_message_inflator(&self) -> Option<Arc<dyn Inflator + Send + Sync>> {
 		self.message_inflator.as_ref().map(Arc::clone)
 	}
 
-	/// Get the multiplexing advertisement for accepted connections
+	/// Multiplexing advertisement applied to accepted connections.
 	pub fn mux_offer(&self) -> Option<TransportOffer> {
 		self.mux_offer.to_owned()
+	}
+
+	/// Consume into the parts [`ServletRuntime`] needs after bind.
+	pub(crate) fn into_runtime_parts(self) -> Result<runtime::ServletRuntimeParts, TightBeamError> {
+		let env_config = self.servlet_config.ok_or(TightBeamError::MissingConfiguration)?;
+		let parts = runtime::ServletRuntimeParts {
+			env_config,
+			collector_gates: self.collector_gates,
+			mux_offer: self.mux_offer,
+			hive_context: self.hive_context,
+			message_decryptor: self.message_decryptor,
+			message_inflator: self.message_inflator,
+			workers: self.workers,
+		};
+		Ok(parts)
 	}
 }
 
@@ -507,11 +533,10 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Add x509 configuration for encrypted transport.
+	/// Enable encrypted transport with the given server certificate.
 	///
-	/// A non-empty `validators` list enables mutual authentication: the
-	/// handshake demands a client certificate and every validator must
-	/// accept it. An empty list means no client authentication.
+	/// - Non-empty `validators`: mutual auth; every validator must accept the client cert.
+	/// - Empty `validators`: no client authentication.
 	pub fn with_certificate(
 		mut self,
 		cert: CertificateSpec,
@@ -530,23 +555,24 @@ where
 		Ok(self)
 	}
 
-	/// Advertise multiplexing on accepted connections. Requires an
-	/// encrypted transport: the offer is bound into the handshake
-	/// transcript, so cleartext servlets never negotiate it
+	/// Advertise multiplexing on accepted connections.
+	///
+	/// Requires encrypted transport: the offer is bound into the handshake
+	/// transcript, so cleartext servlets never negotiate it.
 	#[must_use]
 	pub fn with_mux_offer(mut self, offer: Option<TransportOffer>) -> Self {
 		self.mux_offer = offer;
 		self
 	}
 
-	/// Add servlet application configuration
+	/// Set the application env config.
 	#[must_use]
 	pub fn with_config<Cfg: Send + Sync + 'static>(mut self, config: Arc<Cfg>) -> Self {
 		self.servlet_config = Some(config);
 		self
 	}
 
-	/// Add a worker using its WorkerMetadata name
+	/// Register a worker under its [`WorkerMetadata`] name.
 	pub fn with_worker<W>(mut self, worker: W) -> Self
 	where
 		W: Worker + WorkerMetadata + 'static,
@@ -556,7 +582,7 @@ where
 		self
 	}
 
-	/// Add a collector gate policy
+	/// Append a collector gate policy.
 	pub fn with_collector_gate<G>(mut self, gate: G) -> Self
 	where
 		G: GatePolicy + Send + Sync + 'static,
@@ -566,14 +592,14 @@ where
 		self
 	}
 
-	/// Add hive context for intra-hive servlet communication
+	/// Attach the hive context for intra-hive calls.
 	#[must_use]
 	pub fn with_hive_context(mut self, ctx: Arc<dyn HiveContext>) -> Self {
 		self.hive_context = Some(ctx);
 		self
 	}
 
-	/// Add a decryptor so typed handlers can receive encrypted frames
+	/// Enable typed delivery of encrypted frame bodies.
 	pub fn with_message_decryptor<D>(mut self, decryptor: D) -> Self
 	where
 		D: Decryptor + Send + Sync + 'static,
@@ -583,7 +609,7 @@ where
 		self
 	}
 
-	/// Add an inflator so typed handlers can receive compressed frames
+	/// Enable typed delivery of compressed frame bodies.
 	pub fn with_message_inflator<I>(mut self, inflator: I) -> Self
 	where
 		I: Inflator + Send + Sync + 'static,
@@ -593,7 +619,7 @@ where
 		self
 	}
 
-	/// Build the final ServletConfig
+	/// Finish the builder into a [`ServletConfig`].
 	pub fn build(self) -> ServletConfig<P, M, C> {
 		ServletConfig {
 			_protocol: PhantomData,
@@ -617,23 +643,24 @@ where
 	P: Protocol,
 	M: Message,
 {
-	/// Advertise multiplexing on accepted connections. Requires an
-	/// encrypted transport: the offer is bound into the handshake
-	/// transcript, so cleartext servlets never negotiate it
+	/// Advertise multiplexing on accepted connections.
+	///
+	/// Requires encrypted transport: the offer is bound into the handshake
+	/// transcript, so cleartext servlets never negotiate it.
 	#[must_use]
 	pub fn with_mux_offer(mut self, offer: Option<TransportOffer>) -> Self {
 		self.mux_offer = offer;
 		self
 	}
 
-	/// Add servlet application configuration
+	/// Set the application env config.
 	#[must_use]
 	pub fn with_config<Cfg: Send + Sync + 'static>(mut self, config: Arc<Cfg>) -> Self {
 		self.servlet_config = Some(config);
 		self
 	}
 
-	/// Add a worker using its WorkerMetadata name
+	/// Register a worker under its [`WorkerMetadata`] name.
 	pub fn with_worker<W>(mut self, worker: W) -> Self
 	where
 		W: Worker + WorkerMetadata + 'static,
@@ -643,7 +670,7 @@ where
 		self
 	}
 
-	/// Add a collector gate policy
+	/// Append a collector gate policy.
 	pub fn with_collector_gate<G>(mut self, gate: G) -> Self
 	where
 		G: GatePolicy + Send + Sync + 'static,
@@ -653,14 +680,14 @@ where
 		self
 	}
 
-	/// Add hive context for intra-hive servlet communication
+	/// Attach the hive context for intra-hive calls.
 	#[must_use]
 	pub fn with_hive_context(mut self, ctx: Arc<dyn HiveContext>) -> Self {
 		self.hive_context = Some(ctx);
 		self
 	}
 
-	/// Add a decryptor so typed handlers can receive encrypted frames
+	/// Enable typed delivery of encrypted frame bodies.
 	pub fn with_message_decryptor<D>(mut self, decryptor: D) -> Self
 	where
 		D: Decryptor + Send + Sync + 'static,
@@ -670,7 +697,7 @@ where
 		self
 	}
 
-	/// Add an inflator so typed handlers can receive compressed frames
+	/// Enable typed delivery of compressed frame bodies.
 	pub fn with_message_inflator<I>(mut self, inflator: I) -> Self
 	where
 		I: Inflator + Send + Sync + 'static,
@@ -680,7 +707,7 @@ where
 		self
 	}
 
-	/// Build the final ServletConfig
+	/// Finish the builder into a [`ServletConfig`].
 	pub fn build(self) -> ServletConfig<P, M> {
 		ServletConfig {
 			_protocol: PhantomData,
@@ -696,22 +723,18 @@ where
 	}
 }
 
-/// Trait for servlet implementations
+/// Lifecycle interface for servlets produced by `servlet!` (and equivalents).
 ///
-/// Provides a common interface for all servlets created with the `servlet!`
-/// macro. Servlets are containerized applications that process TightBeam
-/// messages.
-///
-/// The servlet is generic over the input message type `I` that it processes.
-/// All workers in a servlet must share the same input type.
+/// Generic over input message type `I`. Workers attached to a servlet share
+/// that same input type.
 pub trait Servlet<I> {
-	/// Configuration type for this servlet (use ServletConfig)
+	/// Configuration type (typically [`ServletConfig`]).
 	type Conf;
 
-	/// Address type for this servlet (protocol-specific)
+	/// Protocol-specific listen address.
 	type Address: TightBeamAddress;
 
-	/// Start the servlet with configuration
+	/// Bind, start workers, and spawn the accept loop.
 	fn start(
 		trace: Arc<TraceCollector>,
 		config: Option<Self::Conf>,
@@ -719,42 +742,38 @@ pub trait Servlet<I> {
 	where
 		Self: Sized;
 
-	/// Get the local address the servlet is bound to
+	/// Bound listen address.
 	fn addr(&self) -> Self::Address;
 
-	/// Stop the servlet gracefully
+	/// Abort the accept loop.
 	fn stop(self);
 
-	/// Wait for the servlet to finish
+	/// Wait for the accept loop to finish.
 	fn join(self) -> impl Future<Output = Result<(), rt::JoinError>> + Send;
 
-	/// Report current utilization as basis points (0-10000)
+	/// Utilization in basis points (`0..=10000`) for hive balancing.
 	///
-	/// Used by hives for load balancing and auto-scaling decisions.
-	/// Returns `None` by default, indicating no metrics are available.
-	/// Servlets can override this to report actual utilization
-	/// (e.g., using `LatencyTracker`).
+	/// Default `None` means no metrics. Override (for example with
+	/// [`LatencyTracker`]) when the hive should read load.
 	fn utilization(&self) -> Option<BasisPoints> {
 		None
 	}
 }
 
-/// The interactions one servlet answers, one method per stream kind.
+/// One method per stream kind; servlet analogue of [`MuxService`].
 ///
-/// The servlet equivalent of [`MuxService`]: every method receives the
-/// servlet's runtime context (workers, env config, decryptor/inflator,
-/// hive link) instead of the transport session, because servlet handlers
-/// are context-blind by design. Unimplemented kinds refuse with
-/// `Unimplemented`, so a unary-only servlet is one method.
+/// Handlers receive [`ServletContext`] (workers, env, decryptor/inflator,
+/// hive link), not the transport [`SessionContext`]. Absent kinds refuse
+/// with `Unimplemented`.
 ///
-/// `servlet!` builds an implementation from its handler arms via
-/// [`ServletHandlers`]; implementing this trait directly and starting the
-/// accept loop with [`serve_servlet`] is the macro-free path.
+/// - `servlet!` builds this via [`ServletHandlers`].
+/// - Macro-free path: implement the trait and call [`serve_servlet`].
 pub trait ServletService: Send + Sync + 'static {
 	/// Answer one unary request frame.
 	///
 	/// # Errors
-	/// The failure closes the stream with its mapped status.
+	///
+	/// Failure closes the stream with its mapped status.
 	fn unary(
 		&self,
 		frame: Frame,
@@ -764,11 +783,11 @@ pub trait ServletService: Send + Sync + 'static {
 		async { Err(unimplemented_error()) }
 	}
 
-	/// Consume a streamed request body and answer with an optional
-	/// unary reply frame.
+	/// Consume a streamed request body; optional unary reply frame.
 	///
 	/// # Errors
-	/// The failure closes the stream with its mapped status.
+	///
+	/// Failure closes the stream with its mapped status.
 	fn streaming(
 		&self,
 		body: StreamBody,
@@ -778,11 +797,11 @@ pub trait ServletService: Send + Sync + 'static {
 		async { Err(unimplemented_error()) }
 	}
 
-	/// Consume request chunks while pushing reply chunks (full duplex
-	/// on one stream).
+	/// Full duplex on one stream: request chunks in, reply chunks out.
 	///
 	/// # Errors
-	/// The failure closes the stream with its mapped status.
+	///
+	/// Failure closes the stream with its mapped status.
 	fn duplex(
 		&self,
 		body: StreamBody,
@@ -794,16 +813,16 @@ pub trait ServletService: Send + Sync + 'static {
 	}
 }
 
-/// Boxed handler future for the closure-built [`ServletHandlers`] service.
+/// Boxed handler future used by [`ServletHandlers`].
 pub type ServletFuture<T> = Pin<Box<dyn Future<Output = Result<T, TightBeamError>> + Send>>;
 
 type UnaryHandler = Box<dyn Fn(Frame, Arc<ServletContext>) -> ServletFuture<Option<Frame>> + Send + Sync>;
 type StreamingHandler = Box<dyn Fn(StreamBody, Arc<ServletContext>) -> ServletFuture<Option<Frame>> + Send + Sync>;
 type DuplexHandler = Box<dyn Fn(StreamBody, ReplySink, Arc<ServletContext>) -> ServletFuture<()> + Send + Sync>;
 
-/// Closure-built [`ServletService`]: each interaction kind is an optional
-/// handler, absent kinds refuse with `Unimplemented`. This is what the
-/// `servlet!` handler arms assemble; hand-written services implement
+/// Closure-built [`ServletService`]. Absent kinds refuse with `Unimplemented`.
+///
+/// Assembled by `servlet!` handler arms. Hand-written services implement
 /// [`ServletService`] directly instead.
 #[derive(Default)]
 pub struct ServletHandlers {
@@ -813,7 +832,7 @@ pub struct ServletHandlers {
 }
 
 impl ServletHandlers {
-	/// Answer unary requests with `handler`.
+	/// Install the unary handler.
 	pub fn on_unary<F, Fut>(mut self, handler: F) -> Self
 	where
 		F: Fn(Frame, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
@@ -823,7 +842,7 @@ impl ServletHandlers {
 		self
 	}
 
-	/// Consume streamed request bodies with `handler`.
+	/// Install the streaming handler.
 	pub fn on_streaming<F, Fut>(mut self, handler: F) -> Self
 	where
 		F: Fn(StreamBody, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
@@ -833,7 +852,7 @@ impl ServletHandlers {
 		self
 	}
 
-	/// Serve duplex streams with `handler`.
+	/// Install the duplex handler.
 	pub fn on_duplex<F, Fut>(mut self, handler: F) -> Self
 	where
 		F: Fn(StreamBody, ReplySink, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
@@ -880,15 +899,11 @@ impl ServletService for ServletHandlers {
 	}
 }
 
-/// [`MuxService`] adapter binding a [`ServletService`] to its runtime
-/// context.
+/// [`MuxService`] adapter that binds a [`ServletService`] to its context.
 ///
-/// Boundary: the transport [`SessionContext`] is intentionally dropped
-/// here. Peer identity is a transport concern that the servlet layer
-/// already enforces through gates before dispatch reaches a handler;
-/// servlet handlers receive the [`ServletContext`] (config, hive
-/// channel) instead. A handler that needs session facts belongs at the
-/// [`MuxService`] layer, not behind a servlet.
+/// Drops transport [`SessionContext`] at this boundary. Peer identity is
+/// enforced by collector gates before dispatch; handlers see
+/// [`ServletContext`] only. Session-aware logic belongs on [`MuxService`].
 struct ContextService<S> {
 	service: Arc<S>,
 	ctx: Arc<ServletContext>,
@@ -927,13 +942,11 @@ impl<S: ServletService> MuxService for ContextService<S> {
 	}
 }
 
-/// Run a servlet's accept loop: apply collector gates and the mux offer to
-/// every accepted connection, then serve it with `service`.Returns the
-/// loop's task handle; aborting it stops the servlet.
+/// Accept-loop task: apply collector gates and mux offer, then serve.
 ///
-/// Generic over the listener ([`AsyncListenerTrait`]), so any protocol's
-/// listener serves identically. This is the accept loop behind `servlet!`
-/// and the macro-free entry point for hand-written [`ServletService`]s.
+/// - Returns the loop [`rt::JoinHandle`]; aborting it stops the servlet.
+/// - Generic over [`AsyncListenerTrait`] so every protocol shares one path.
+/// - Called by [`ServletRuntime::start`] after bind and context setup.
 pub fn serve_servlet<L, S>(
 	listener: L,
 	gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
@@ -948,13 +961,12 @@ where
 {
 	let service = Arc::new(ContextService { service: Arc::new(service), ctx });
 	rt::spawn(async move {
-		// Accepting pauses while this many connection tasks are alive
-		// (CWE-400): a connection flood queues in the listener backlog
-		// instead of pinning unbounded tasks.
+		// Cap concurrent connection tasks (CWE-400). Excess accepts wait
+		// in the listener backlog instead of spawning unbounded work.
 		let permits = Arc::new(Semaphore::new(DEFAULT_MAX_SERVER_CONNECTIONS));
 		loop {
 			let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-				// Unreachable in practice: the semaphore is never closed.
+				// Semaphore is never closed; acquire fails only if it were.
 				break;
 			};
 			match listener.accept().await {
@@ -967,8 +979,7 @@ where
 
 					let service = Arc::clone(&service);
 					rt::spawn(async move {
-						// The permit lives as long as the connection task,
-						// releasing its accept slot on any exit path.
+						// Hold the permit for the connection task lifetime.
 						let _permit = permit;
 						serve_connection_service(transport, service, None, None).await;
 					});
