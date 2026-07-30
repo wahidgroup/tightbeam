@@ -245,12 +245,7 @@ macro_rules! cluster {
 				// key store, so the beat only exists with x509.
 				#[cfg(feature = "x509")]
 				let advertise_handle = {
-					// Prefer the peer trust plane when present; exporters that
-					// only dial peers under hive_trust keep the hive pool.
-					let advertise_pool = peer_pool
-						.as_ref()
-						.map(::std::sync::Arc::clone)
-						.unwrap_or_else(|| ::std::sync::Arc::clone(&pool));
+					let advertise_pool = $crate::cluster!(@peer_dial_pool peer_pool, pool);
 					let servlet_registry = ::std::sync::Arc::clone(&servlet_registry);
 					let config = ::std::sync::Arc::clone(&config);
 					let gateway_addr: Vec<u8> = addr.clone().into();
@@ -930,14 +925,37 @@ macro_rules! cluster {
 			// subsumed by that window plus journal digest dedup, so the
 			// relay takes no replay record here.
 			$crate::cluster!(@gossip_pipeline
-				$frame, $servlet_registry, $config, $pool, $trace, $digest, envelope);
+				$frame, $servlet_registry, $config, $pool, $peer_pool, $trace, $digest, envelope);
+		}
+
+		// An origin rumor from a local publisher verifies on the hive trust
+		// plane, like a registration: a peer certificate must not inject
+		// origin gossip. It then enters the same pipeline.
+		#[cfg(feature = "x509")]
+		$crate::colony::common::ClusterRequest::PublishGossip(mut envelope) => {
+			let origin_status = verify_hive_origin();
+			if origin_status != $crate::policy::TransitStatus::Ok {
+				return $crate::cluster!(@refuse_gossip $frame, $trace, origin_status);
+			}
+
+			// The wire ttl is the publisher's request. The origin gateway
+			// caps it at the operator's configured hop radius (itself
+			// bounded by the protocol cap) while honoring a smaller
+			// request, such as ttl 0 for local-only delivery. The digest
+			// excludes ttl, so the clamp does not change the rumor's identity.
+			envelope.ttl = envelope
+				.ttl
+				.min($config.gossip.ttl.min($crate::constants::MAX_GOSSIP_TTL));
+
+			$crate::cluster!(@gossip_pipeline
+				$frame, $servlet_registry, $config, $pool, $peer_pool, $trace, $digest, envelope);
 		}
 		}
 	}};
 
 	// Shared gossip pipeline: admit, dedup via the journal, and deliver once
 	// to a local instance of the target type. A duplicate is dropped.
-	(@gossip_pipeline $frame:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident, $digest:path, $envelope:expr) => {{
+	(@gossip_pipeline $frame:ident, $servlet_registry:ident, $config:ident, $pool:ident, $peer_pool:ident, $trace:ident, $digest:path, $envelope:expr) => {{
 		let envelope = $envelope;
 
 		let admitted = match $crate::colony::cluster::AdmittedGossip::admit::<$digest>(
@@ -1007,10 +1025,90 @@ macro_rules! cluster {
 			}
 		}
 
+		// Reflood a still-live rumor to the peer graph on a detached task so
+		// the reply is not blocked on the flood cascade. Loop-freedom holds
+		// without skipping the sender: the sender drops the echo as a
+		// duplicate, and the digest plus decremented ttl bound propagation.
+		// A gateway with no peers skips the task entirely: the reflood
+		// signature is the costly step and would fan out to nobody.
+		if envelope.ttl > 0 && !$config.peers.is_empty() {
+			let reflood_pool = $crate::cluster!(@peer_dial_pool $peer_pool, $pool);
+			let config = ::std::sync::Arc::clone(&$config);
+			let reflood_envelope = envelope.clone();
+			let next_ttl = envelope.ttl - 1;
+			let _ = $crate::colony::servlet::servlet_runtime::rt::spawn(
+				$crate::cluster!(@reflood_gossip reflood_pool, config, reflood_envelope, next_ttl, $digest)
+			);
+		}
+
 		return $crate::cluster!(@reply $frame, $crate::colony::common::GossipResponse {
 			status: $crate::policy::TransitStatus::Ok,
 		});
 	}};
+
+	// Select the pool for dialing peer gateways: prefer the peer trust
+	// plane when present. Gateways that only dial peers under hive_trust
+	// keep the hive pool. The advertise beat and the gossip reflood share
+	// this preference so both planes reach configured peers identically.
+	(@peer_dial_pool $peer_pool:expr, $pool:expr) => {
+		$peer_pool
+			.as_ref()
+			.map(::std::sync::Arc::clone)
+			.unwrap_or_else(|| ::std::sync::Arc::clone(&$pool))
+	};
+
+	// Reflood one rumor to every configured peer. Expands to a future for
+	// `rt::spawn`. The frame is built and signed once (signing is the costly
+	// step) and the identical signed frame is fanned out concurrently over
+	// the pooled peer connections, so a wide peer list costs one signature
+	// and one round of mux streams.
+	(@reflood_gossip $peer_pool:expr, $config:expr, $envelope:expr, $ttl:expr, $digest:path) => {
+		async move {
+			use $crate::builder::TypeBuilder;
+
+			let request = $crate::colony::common::ClusterRequest::Gossip(
+				$crate::colony::common::GossipEnvelope {
+					issued_at_ms: $envelope.issued_at_ms,
+					target: $envelope.target,
+					ttl: $ttl,
+					payload: $envelope.payload,
+				}
+			);
+
+			let frame = match $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
+				.with_id(b"gossip-reflood")
+				.with_message(request)
+				.with_priority($crate::MessagePriority::NetworkControl)
+				.with_witness_hasher::<$digest>()
+				.build()
+			{
+				::core::result::Result::Ok(frame) => frame,
+				::core::result::Result::Err(_) => return,
+			};
+
+			let signed_frame = match frame.sign_with_provider::<$digest, _>($config.tls.key.as_ref()).await {
+				::core::result::Result::Ok(signed) => signed,
+				::core::result::Result::Err(_) => return,
+			};
+
+			let mut fanout = ::tokio::task::JoinSet::new();
+			for peer in $config.peers.iter() {
+				let ::core::result::Result::Ok(peer_addr) = peer.parse() else {
+					continue;
+				};
+
+				let peer_pool = ::std::sync::Arc::clone(&$peer_pool);
+				let frame = signed_frame.clone();
+				fanout.spawn(async move {
+					if let ::core::result::Result::Ok(mut client) = peer_pool.connect(peer_addr).await {
+						let _ = client.emit(frame, None).await;
+					}
+				});
+			}
+
+			while fanout.join_next().await.is_some() {}
+		}
+	};
 
 	// Gossip refuse: fire the refused event and build the reply. Gossip
 	// takes no replay record (seen-ttl plus journal digest dedup subsume
@@ -1031,6 +1129,7 @@ macro_rules! cluster {
 		if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
 			$replay_guard.forget(signer_info.signature.as_bytes());
 		}
+
 		let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
 		$crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse { status: $status })
 	}};

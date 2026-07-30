@@ -26,11 +26,12 @@ use tightbeam::{
 	colony::{
 		cluster::{
 			Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse,
-			HeartbeatConf,
+			GossipConf, GossipJournal, HeartbeatConf, MemoryGossipJournal,
 		},
 		common::{
-			current_timestamp_ms, servlet_instance, type_canonical_bytes, ColonyNamespace, InstanceMetrics,
-			LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin, StochasticForager,
+			current_timestamp_ms, servlet_instance, type_canonical_bytes, ColonyNamespace, GossipEnvelope,
+			GossipResponse, InstanceMetrics, LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin,
+			StochasticForager,
 		},
 		hive::{
 			Hive, HiveConf, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
@@ -39,7 +40,7 @@ use tightbeam::{
 		servlet::ServletConf,
 	},
 	compose,
-	constants::{DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, MAX_ADVERTISED_TYPES},
+	constants::{DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, MAX_ADVERTISED_TYPES, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL},
 	crypto::{
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
@@ -58,7 +59,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
-		GenericClient,
+		ConnectionPool, GenericClient, PoolConfig,
 	},
 	utils::compose as frame_compose,
 	utils::urn::Urn,
@@ -90,6 +91,21 @@ pub(crate) const PEER_ROUTES_AFTER_WITHDRAWAL: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-routes-after-withdrawal");
 pub(crate) const PEER_PING_LIVE_AFTER_WITHDRAWAL: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-ping-live-after-withdrawal");
+pub(crate) const GOSSIP_PUBLISH_STATUS: Urn<'static> = Urn::new("test", "event:cluster/gossip-publish-status");
+pub(crate) const GOSSIP_CONVERGED: Urn<'static> = Urn::new("test", "event:cluster/gossip-converged");
+pub(crate) const GOSSIP_CLAMP_LEAKED: Urn<'static> = Urn::new("test", "event:cluster/gossip-clamp-leaked");
+pub(crate) const WORK_STATUS: Urn<'static> = Urn::new("test", "event:cluster/work-status");
+pub(crate) const WORK_PAYLOAD: Urn<'static> = Urn::new("test", "event:cluster/work-payload");
+pub(crate) const REGISTER_STATUS: Urn<'static> = Urn::new("test", "event:cluster/register-status");
+pub(crate) const REGISTRY_HIVES: Urn<'static> = Urn::new("test", "event:cluster/registry-hives");
+pub(crate) const REGISTER_ASSIGNED_ID: Urn<'static> = Urn::new("test", "event:cluster/register-assigned-id");
+pub(crate) const REGISTRY_EMPTIED: Urn<'static> = Urn::new("test", "event:cluster/registry-emptied");
+pub(crate) const LOCAL_SERVLETS_AFTER_INSTALLS: Urn<'static> =
+	Urn::new("test", "event:cluster/local-servlets-after-installs");
+pub(crate) const PEER_ROUTE_EXPOSED: Urn<'static> = Urn::new("test", "event:cluster/peer-route-exposed");
+pub(crate) const PEER_SLATE_MATCHES: Urn<'static> = Urn::new("test", "event:cluster/peer-slate-matches");
+pub(crate) const PEER_PING_TYPE_LEARNED: Urn<'static> = Urn::new("test", "event:cluster/peer-ping-type-learned");
+pub(crate) const BALANCER_SPREAD: Urn<'static> = Urn::new("test", "event:cluster/balancer-spread");
 
 /// Address the simulated peer gateway advertises itself at.
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
@@ -184,17 +200,27 @@ async fn emit_frame(client: &mut GenericClient<TokioListener>, frame: Frame) -> 
 	client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)
 }
 
-fn assert_register_status(
+/// Record a registration outcome on the trace: the wire status as
+/// `REGISTER_STATUS`, the registry size as `REGISTRY_HIVES`, and whether
+/// a hive id was assigned as `REGISTER_ASSIGNED_ID`. The specs pin the
+/// expected values, so scenarios need no inline checks.
+fn record_register_response(
+	trace: &TraceCollector,
 	response: &RegisterHiveResponse,
-	status: TransitStatus,
-	hive_count: usize,
 	cluster: &ClusterGateway,
-) {
-	assert_eq!(response.status, status);
-	assert_eq!(cluster.hive_count(), hive_count);
-	if status != TransitStatus::Ok {
-		assert!(response.hive_id.is_none(), "rejected registration must not assign a hive id");
-	}
+) -> Result<(), TightBeamError> {
+	trace.event_with(REGISTER_STATUS, &[], response.status)?;
+	trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count() as u64)?;
+	trace.event_with(REGISTER_ASSIGNED_ID, &[], u64::from(response.hive_id.is_some()))?;
+	Ok(())
+}
+
+/// Record a work outcome on the trace: the wire status as `WORK_STATUS`
+/// and payload presence as `WORK_PAYLOAD`, for spec verification.
+fn record_work_status(trace: &TraceCollector, response: &ClusterWorkResponse) -> Result<(), TightBeamError> {
+	trace.event_with(WORK_STATUS, &[], response.status)?;
+	trace.event_with(WORK_PAYLOAD, &[], u64::from(response.payload.is_some()))?;
+	Ok(())
 }
 
 async fn signed_control_frame_with(
@@ -478,6 +504,7 @@ tb_scenario! {
 
 			let registered = hive.register_with_cluster(first.addr()).await?;
 			trace.event_with(MULTI_REGISTER_STATUS, &[], registered.status)?;
+
 			let registered = hive.register_with_cluster(second.addr()).await?;
 			trace.event_with(MULTI_REGISTER_STATUS, &[], registered.status)?;
 
@@ -499,7 +526,9 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
-			(events::CLUSTER_WORK_REFUSED, exactly!(1))
+			(events::CLUSTER_WORK_REFUSED, exactly!(1)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
 		]
 	}
 }
@@ -533,12 +562,7 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, frame).await?;
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
-			assert_eq!(
-				work_response.status,
-				TransitStatus::PermissionDenied,
-				"instance-addressed work must not bypass the load balancer"
-			);
-			assert!(work_response.payload.is_none(), "refused work must not carry a payload");
+			record_work_status(&trace, &work_response)?;
 
 			cluster.stop();
 
@@ -600,7 +624,8 @@ fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: String) -> ClusterCo
 }
 
 /// Send one signed advertisement of `types` from a peer at `gateway_addr`,
-/// signed by `signer`, and return the decoded response status.
+/// signed by `signer`. The decoded status lands on the trace for spec
+/// verification.
 async fn advertise_peer_signed(
 	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
@@ -608,7 +633,7 @@ async fn advertise_peer_signed(
 	cluster: &ClusterGateway,
 	gateway_addr: &[u8],
 	types: Vec<Urn<'static>>,
-) -> Result<TransitStatus, TightBeamError> {
+) -> Result<(), TightBeamError> {
 	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
 		issued_at_ms: current_timestamp_ms(),
 		gateway_addr: gateway_addr.to_vec(),
@@ -619,16 +644,16 @@ async fn advertise_peer_signed(
 	send_advertisement_frame(trace, connect_certs, cluster, frame).await
 }
 
-/// Emit an already-signed advertisement frame and decode the status:
-/// lets replay scenarios resend a byte-identical frame. Every decoded
-/// status lands on the trace as `PEER_AD_STATUS`, and the surviving
-/// peer-route count as `PEER_ROUTES_AFTER`, for spec verification.
+/// Emit an already-signed advertisement frame: lets replay scenarios
+/// resend a byte-identical frame. Every decoded status lands on the
+/// trace as `PEER_AD_STATUS`, and the surviving peer-route count as
+/// `PEER_ROUTES_AFTER`, for spec verification.
 async fn send_advertisement_frame(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
 	frame: Frame,
-) -> Result<TransitStatus, TightBeamError> {
+) -> Result<(), TightBeamError> {
 	let mut client = connect_cluster(certs, cluster.addr()).await?;
 	trace.event(PEER_ADVERTISE_SENT)?;
 
@@ -637,32 +662,29 @@ async fn send_advertisement_frame(
 	trace.event_with(PEER_AD_STATUS, &[], response.status)?;
 	trace.event_with(PEER_ROUTES_AFTER, &[], cluster.peer_servlets().len() as u64)?;
 
-	Ok(response.status)
+	Ok(())
 }
 
-/// Send one signed advertisement of `types` from a peer at `gateway_addr`
-/// and return the decoded response status.
+/// Send one signed advertisement of `types` from a peer at `gateway_addr`.
 async fn advertise_peer(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
 	gateway_addr: &[u8],
 	types: Vec<Urn<'static>>,
-) -> Result<TransitStatus, TightBeamError> {
+) -> Result<(), TightBeamError> {
 	advertise_peer_signed(trace, certs, &certs.key, cluster, gateway_addr, types).await
 }
 
-/// Advertise a one-type ping slate from the simulated peer gateway and
-/// assert it installed: the shared preamble for every scenario exercising
-/// behavior after a peer route exists.
+/// Advertise a one-type ping slate from the simulated peer gateway: the
+/// shared preamble for every scenario exercising behavior after a peer
+/// route exists. The specs assert `PEER_AD_STATUS` proved the install.
 async fn install_ping_peer(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
 ) -> Result<(), TightBeamError> {
-	let status = advertise_peer(trace, certs, cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")]).await?;
-	assert_eq!(status, TransitStatus::Ok, "trusted advertisement must install");
-	Ok(())
+	advertise_peer(trace, certs, cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("ping")]).await
 }
 
 tb_assert_spec! {
@@ -684,6 +706,18 @@ tb_assert_spec! {
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok))
+		]
+	},
+	// 1.2.0: the surviving route count joins the contract: one advertised
+	// type must leave exactly one installed peer route.
+	V(1,2,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64))
 		]
 	}
 }
@@ -742,11 +776,26 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			install_ping_peer(&trace, &certs, &cluster).await?;
-			assert_eq!(cluster.peer_servlets().len(), 1, "allowlisted dial must install");
 
 			cluster.stop();
 			Ok(())
 		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPeerRouteIntrospectionSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
+			(LOCAL_SERVLETS_AFTER_INSTALLS, exactly!(1), equals!(0u64)),
+			(PEER_ROUTE_EXPOSED, exactly!(1), equals!(1u64))
+		]
 	}
 }
 
@@ -755,7 +804,7 @@ tb_scenario! {
 // (local hives only). No forwarding happens in this stage.
 tb_scenario! {
 	name: cluster_accepts_peer_advertisement,
-	spec: ClusterPeerAdvertisedSpec,
+	spec: ClusterPeerRouteIntrospectionSpec,
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
@@ -764,16 +813,19 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			install_ping_peer(&trace, &certs, &cluster).await?;
 
-			let peers = cluster.peer_servlets();
-			assert_eq!(peers.len(), 1, "one advertised type installs one peer route");
-			assert_eq!(peers[0], type_canonical_bytes(&servlet_urn("ping")), "peer route keyed by type");
-			assert!(cluster.available_servlets().is_empty(), "a peer is not a local hive");
+			trace.event_with(LOCAL_SERVLETS_AFTER_INSTALLS, &[], cluster.available_servlets().len() as u64)?;
 
+			// One learned route keyed by the advertised type, exposing the
+			// claimed dial path and the signer fingerprint.
+			let ping_canonical = type_canonical_bytes(&servlet_urn("ping"));
 			let routes = cluster.peer_routes();
-			assert_eq!(routes.len(), 1, "peer_routes exposes the learned dial path");
-			assert_eq!(routes[0].servlet_type, type_canonical_bytes(&servlet_urn("ping")));
-			assert_eq!(routes[0].dial_addr, PEER_GATEWAY_ADDR);
-			assert!(!routes[0].peer_id.is_empty(), "peer_id is the signer fingerprint");
+			let exposed = routes.len() == 1
+				&& routes.first().is_some_and(|route| {
+					route.servlet_type == ping_canonical
+						&& route.dial_addr == PEER_GATEWAY_ADDR && !route.peer_id.is_empty()
+				});
+
+			trace.event_with(PEER_ROUTE_EXPOSED, &[], u64::from(exposed))?;
 
 			cluster.stop();
 			Ok(())
@@ -781,11 +833,26 @@ tb_scenario! {
 	}
 }
 
+tb_assert_spec! {
+	pub ClusterPeerMultiTypeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(2u64)),
+			(PEER_SLATE_MATCHES, exactly!(1), equals!(1u64))
+		]
+	}
+}
+
 // A slate is not one type: every advertised type installs its own peer
 // route, so a two-type advertisement surfaces both types.
 tb_scenario! {
 	name: cluster_multi_type_advertisement_installs_all,
-	spec: ClusterPeerAdvertisedSpec,
+	spec: ClusterPeerMultiTypeSpec,
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
@@ -798,12 +865,13 @@ tb_scenario! {
 			let mut peers = cluster.peer_servlets();
 			peers.sort_unstable();
 
-			let ping_canonical = type_canonical_bytes(&servlet_urn("ping"));
-			let echo_canonical = type_canonical_bytes(&servlet_urn("echo"));
-			let mut expected = vec![ping_canonical, echo_canonical];
+			let mut expected = vec![
+				type_canonical_bytes(&servlet_urn("ping")),
+				type_canonical_bytes(&servlet_urn("echo")),
+			];
 			expected.sort_unstable();
 
-			assert_eq!(peers, expected, "every advertised type installs a route, not only the last");
+			trace.event_with(PEER_SLATE_MATCHES, &[], u64::from(peers == expected))?;
 
 			cluster.stop();
 			Ok(())
@@ -874,9 +942,11 @@ tb_scenario! {
 				.await?;
 			advertise_peer_signed(&trace, gateway, &certs.peer_b.1, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("echo")])
 				.await?;
+
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets().len() as u64)?;
 
 			advertise_peer_signed(&trace, gateway, &certs.peer_b.1, &cluster, PEER_GATEWAY_ADDR, vec![]).await?;
+
 			let survivors = cluster.peer_servlets();
 			trace.event_with(PEER_ROUTES_AFTER_WITHDRAWAL, &[], survivors.len() as u64)?;
 			trace.event_with(
@@ -947,12 +1017,35 @@ tb_assert_spec! {
 	}
 }
 
+// Retry ordering: the conflicted advertisement is refused before the
+// byte-identical resend installs. Counting alone cannot prove the
+// refusal preceded the install.
+tb_process_spec! {
+	pub ClusterAdRetryProcess,
+	events {
+		observable {
+			events::CLUSTER_PEER_ADVERTISE_REFUSED,
+			events::CLUSTER_PEER_ADVERTISED
+		}
+		hidden { }
+	}
+	states {
+		Idle => { events::CLUSTER_PEER_ADVERTISE_REFUSED => ConflictRefused },
+		ConflictRefused => { events::CLUSTER_PEER_ADVERTISED => Installed },
+		Installed => { }
+	}
+	terminal { Installed }
+}
+
 // A refusal is not a penalty box: an advertisement refused on local state
 // (address conflict) releases its replay record, so the peer can resend
 // the byte-identical signed frame once the conflict clears and install.
 tb_scenario! {
 	name: cluster_advertisement_retryable_after_refusal,
-	spec: ClusterPeerReplayReleasedSpec,
+	config: ScenarioConf::builder()
+		.with_spec(ClusterPeerReplayReleasedSpec::latest())
+		.with_csp(ClusterAdRetryProcess)
+		.build(),
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
@@ -962,6 +1055,7 @@ tb_scenario! {
 			let hive_addr = b"127.0.0.1:65031".as_slice();
 			let locator = String::from_utf8_lossy(PEER_GATEWAY_ADDR);
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+
 			register_signed_hive(&mut client, &certs.key, b"reg-conflict", hive_addr).await?;
 			emit_servlet_update(
 				&mut client,
@@ -1005,8 +1099,11 @@ tb_assert_spec! {
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(WORK_SENT, exactly!(1)),
-			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(1))
+			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(1)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
 		]
 	}
 }
@@ -1028,12 +1125,7 @@ tb_scenario! {
 			trace.event(WORK_SENT)?;
 
 			let work_response = emit_forwarded_ping_work(&mut client, b"reforward-guard").await?;
-			assert_eq!(
-				work_response.status,
-				TransitStatus::Unavailable,
-				"forwarded work must not select peer routes"
-			);
-			assert!(work_response.payload.is_none(), "loop-guard refusal must not carry a payload");
+			record_work_status(&trace, &work_response)?;
 
 			cluster.stop();
 			Ok(())
@@ -1049,6 +1141,7 @@ tb_assert_spec! {
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
 			(WORK_SENT, exactly!(1)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(2)),
@@ -1068,22 +1161,20 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let receiver = start_cluster(&trace, peering_cluster_conf(&certs)).await?;
 			let receiver_addr = receiver.addr();
-			let advertiser =
-				start_cluster(&trace, advertising_cluster_conf(&certs, receiver_addr.to_string())).await?;
+			let config = advertising_cluster_conf(&certs, receiver_addr.to_string());
+			let advertiser = start_cluster(&trace, config).await?;
 
-			let registered = hive.register_with_cluster(advertiser.addr()).await?;
-			assert_eq!(registered.status, TransitStatus::Ok, "hive must join the exporting colony");
+			hive.register_with_cluster(advertiser.addr()).await?;
 
 			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
-			assert_eq!(learned.len(), 1, "importer must learn the peer type before work");
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			trace.event(WORK_SENT)?;
 
 			let mut client = connect_cluster(&certs, receiver.addr()).await?;
 			let work_response = emit_ping_work(&mut client, b"forward-echo").await?;
-			assert_eq!(work_response.status, TransitStatus::Ok, "forwarded work must succeed");
-
 			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
+
 			let ping_response: PingResponse = decode(&payload)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
@@ -1106,21 +1197,18 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let receiver = start_cluster(&trace, peering_peer_trust_only(&certs)).await?;
 			let receiver_addr = receiver.addr();
-			let advertiser =
-				start_cluster(&trace, advertising_cluster_conf(&certs, receiver_addr.to_string())).await?;
+			let config = advertising_cluster_conf(&certs, receiver_addr.to_string());
+			let advertiser = start_cluster(&trace, config).await?;
 
-			let registered = hive.register_with_cluster(advertiser.addr()).await?;
-			assert_eq!(registered.status, TransitStatus::Ok, "hive must join the exporting colony");
+			hive.register_with_cluster(advertiser.addr()).await?;
 
 			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
-			assert_eq!(learned.len(), 1, "importer must learn the peer type before work");
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			trace.event(WORK_SENT)?;
 
 			let mut client = connect_cluster(&certs, receiver.addr()).await?;
 			let work_response = emit_ping_work(&mut client, b"peer-plane").await?;
-			assert_eq!(work_response.status, TransitStatus::Ok, "peer_pool dial must succeed");
-
 			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
 			let ping_response: PingResponse = decode(&payload)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
@@ -1133,28 +1221,42 @@ tb_scenario! {
 	}
 }
 
+tb_assert_spec! {
+	pub ClusterPeerCollideSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
+			(PEER_ADVERTISE_SENT, exactly!(1)),
+			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
 // Claimed gateway_addr that matches a local servlet address is refused.
 tb_scenario! {
 	name: cluster_refuses_peer_dial_colliding_local_servlet,
-	spec: ClusterPeerRefusedSpec,
+	spec: ClusterPeerCollideSpec,
 	environment Hive {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let cluster = start_cluster(&trace, peering_cluster_conf(&certs)).await?;
-			let registered = hive.register_with_cluster(cluster.addr()).await?;
-			assert_eq!(registered.status, TransitStatus::Ok, "local hive must register");
+			hive.register_with_cluster(cluster.addr()).await?;
 
 			let hive_addr = hive.addr().to_string().into_bytes();
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
-			let update = emit_servlet_update(
+			emit_servlet_update(
 				&mut client,
 				&certs.key,
 				b"collide-local",
 				servlet_address_update(&hive_addr, vec![servlet_info("ping", PEER_GATEWAY_ADDR)], vec![]),
 			)
 			.await?;
-			assert_eq!(update.status, TransitStatus::Ok, "local servlet locator must land");
 
 			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("echo")]).await?;
 
@@ -1173,11 +1275,36 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(WORK_SENT, exactly!(4)),
 			(events::CLUSTER_WORK_FAILED, exactly!(3)),
 			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(1))
 		]
 	}
+}
+
+// Abandonment ordering: unavailability must follow exactly
+// CONTAINMENT_ABANDON_LIMIT failed forwards on the installed route.
+// Counting cannot prove the trail failed before selection dropped it.
+tb_process_spec! {
+	pub ClusterContainmentProcess,
+	events {
+		observable {
+			events::CLUSTER_PEER_ADVERTISED,
+			events::CLUSTER_WORK_FAILED,
+			events::CLUSTER_WORK_UNAVAILABLE
+		}
+		hidden { }
+	}
+	states {
+		Idle => { events::CLUSTER_PEER_ADVERTISED => Installed },
+		Installed => { events::CLUSTER_WORK_FAILED => FailedOnce },
+		FailedOnce => { events::CLUSTER_WORK_FAILED => FailedTwice },
+		FailedTwice => { events::CLUSTER_WORK_FAILED => Abandoned },
+		Abandoned => { events::CLUSTER_WORK_UNAVAILABLE => Contained },
+		Contained => { }
+	}
+	terminal { Contained }
 }
 
 // Infection containment: a peer route to a gateway that never answers is
@@ -1186,7 +1313,10 @@ tb_assert_spec! {
 // further forward attempt.
 tb_scenario! {
 	name: cluster_abandons_failing_peer_trail,
-	spec: ClusterPeerContainmentSpec,
+	config: ScenarioConf::builder()
+		.with_spec(ClusterPeerContainmentSpec::latest())
+		.with_csp(ClusterContainmentProcess)
+		.build(),
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
@@ -1221,6 +1351,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(WORK_SENT, exactly!(4)),
 			(events::CLUSTER_WORK_FAILED, exactly!(3)),
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
@@ -1230,12 +1361,41 @@ tb_assert_spec! {
 	}
 }
 
+// Healing ordering: the local hive joins only after the dead trail has
+// absorbed its full failure budget, and the successful route follows the
+// join. Counting cannot prove work failed before the colony healed.
+tb_process_spec! {
+	pub ClusterIsolationProcess,
+	events {
+		observable {
+			events::CLUSTER_PEER_ADVERTISED,
+			events::CLUSTER_WORK_FAILED,
+			events::CLUSTER_HIVE_REGISTERED,
+			events::CLUSTER_WORK_ROUTED
+		}
+		hidden { }
+	}
+	states {
+		Idle => { events::CLUSTER_PEER_ADVERTISED => Installed },
+		Installed => { events::CLUSTER_WORK_FAILED => FailedOnce },
+		FailedOnce => { events::CLUSTER_WORK_FAILED => FailedTwice },
+		FailedTwice => { events::CLUSTER_WORK_FAILED => Abandoned },
+		Abandoned => { events::CLUSTER_HIVE_REGISTERED => Healed },
+		Healed => { events::CLUSTER_WORK_ROUTED => Served },
+		Served => { }
+	}
+	terminal { Served }
+}
+
 // Containment isolates only the bad nest: after the dead peer trail is
 // abandoned, a local ping hive joins and serves the same type, so work
 // keeps flowing on-colony while the peer stays dropped.
 tb_scenario! {
 	name: cluster_isolates_abandoned_peer_and_serves_local,
-	spec: ClusterPeerIsolationSpec,
+	config: ScenarioConf::builder()
+		.with_spec(ClusterPeerIsolationSpec::latest())
+		.with_csp(ClusterIsolationProcess)
+		.build(),
 	environment Hive {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
@@ -1278,6 +1438,7 @@ tb_assert_spec! {
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
 			(WORK_SENT, exactly!(36)),
 			(events::CLUSTER_WORK_FORWARDED, at_most!(6)),
 			(WORK_ECHOED, exactly!(36), equals!(42u64))
@@ -1299,8 +1460,7 @@ tb_scenario! {
 			local_conf.load_balancer = Arc::new(StochasticForager::with_seed(0x7F0));
 			let local_gateway = start_cluster(&trace, local_conf).await?;
 
-			let registered_local = hive.register_with_cluster(local_gateway.addr()).await?;
-			assert_eq!(registered_local.status, TransitStatus::Ok, "local hive must join importer");
+			hive.register_with_cluster(local_gateway.addr()).await?;
 
 			for i in 0..12u8 {
 				trace.event(WORK_SENT)?;
@@ -1309,8 +1469,6 @@ tb_scenario! {
 				let id = [b'w', b'a', b'r', i];
 
 				let work_response = emit_ping_work(&mut client, &id).await?;
-				assert_eq!(work_response.status, TransitStatus::Ok, "warmup work must succeed");
-
 				let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
 				let ping_response: PingResponse = decode(&payload)?;
 				trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
@@ -1319,11 +1477,10 @@ tb_scenario! {
 			let config = advertising_cluster_conf(&certs, local_gateway.addr().to_string());
 			let peer_gateway = start_cluster(&trace, config).await?;
 			let peer_hive = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
-			let registered_peer = peer_hive.register_with_cluster(peer_gateway.addr()).await?;
-			assert_eq!(registered_peer.status, TransitStatus::Ok, "peer hive must join exporter");
+			peer_hive.register_with_cluster(peer_gateway.addr()).await?;
 
 			let learned = wait_for_peer_types(&local_gateway, 50, Duration::from_millis(100)).await;
-			assert_eq!(learned.len(), 1, "importer must learn the peer type");
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			for i in 0..24u8 {
 				trace.event(WORK_SENT)?;
@@ -1331,8 +1488,6 @@ tb_scenario! {
 				let id = [b'l', b'o', b'c', i];
 
 				let work_response = emit_ping_work(&mut client, &id).await?;
-				assert_eq!(work_response.status, TransitStatus::Ok, "locality work must succeed");
-
 				let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
 				let ping_response: PingResponse = decode(&payload)?;
 				trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
@@ -1354,7 +1509,10 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(2)),
-			(events::CLUSTER_PEER_ADVERTISED, exactly!(2))
+			(events::CLUSTER_PEER_ADVERTISED, exactly!(2)),
+			(PEER_AD_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
+			(PEER_ROUTES_AFTER_WITHDRAWAL, exactly!(1), equals!(0u64))
 		]
 	}
 }
@@ -1371,11 +1529,10 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			install_ping_peer(&trace, &certs, &cluster).await?;
-			assert_eq!(cluster.peer_servlets().len(), 1, "first slate carries one type");
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets().len() as u64)?;
 
-			let cleared = advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![]).await?;
-			assert_eq!(cleared, TransitStatus::Ok, "empty slate is a valid reconciliation");
-			assert!(cluster.peer_servlets().is_empty(), "empty slate retires the prior routes");
+			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![]).await?;
+			trace.event_with(PEER_ROUTES_AFTER_WITHDRAWAL, &[], cluster.peer_servlets().len() as u64)?;
 
 			cluster.stop();
 			Ok(())
@@ -1390,7 +1547,9 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(events::CLUSTER_PEER_ADVERTISED, at_least!(1))
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
+			(PEER_PING_TYPE_LEARNED, exactly!(1), equals!(1u64))
 		]
 	}
 }
@@ -1409,12 +1568,14 @@ tb_scenario! {
 			let receiver_addr = receiver.addr();
 			let advertiser = start_cluster(&trace, advertising_cluster_conf(&certs, receiver_addr.to_string())).await?;
 
-			let registered = hive.register_with_cluster(advertiser.addr()).await?;
-			assert_eq!(registered.status, TransitStatus::Ok, "hive must join the advertising colony");
+			hive.register_with_cluster(advertiser.addr()).await?;
 
 			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
-			assert_eq!(learned.len(), 1, "beat must carry the newly registered type");
-			assert_eq!(learned[0], type_canonical_bytes(&servlet_urn("ping")), "peer route keyed by type");
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
+
+			let ping_canonical = type_canonical_bytes(&servlet_urn("ping"));
+			let keyed = learned.first().is_some_and(|learned_type| *learned_type == ping_canonical);
+			trace.event_with(PEER_PING_TYPE_LEARNED, &[], u64::from(keyed))?;
 
 			advertiser.stop();
 			receiver.stop();
@@ -1450,9 +1611,9 @@ tb_scenario! {
 			start_cluster(&trace, peering_cluster_conf(&certs)).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster: receiver }| async move {
-			let advertiser =
-				start_cluster(&trace, advertising_cluster_conf(&certs, receiver.addr().to_string())).await?;
 
+			let config = advertising_cluster_conf(&certs, receiver.addr().to_string());
+			let advertiser = start_cluster(&trace, config).await?;
 			let hive_addr = b"127.0.0.1:65041".as_slice();
 			let mut client = connect_cluster(&certs, advertiser.addr()).await?;
 			register_signed_hive(&mut client, &certs.key, b"reg-beat-update", hive_addr).await?;
@@ -1501,8 +1662,8 @@ tb_scenario! {
 			start_cluster(&trace, peering_cluster_conf(&certs)).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster: receiver }| async move {
-			let advertiser =
-				start_cluster(&trace, advertising_cluster_conf(&certs, receiver.addr().to_string())).await?;
+			let config = advertising_cluster_conf(&certs, receiver.addr().to_string());
+			let advertiser = start_cluster(&trace, config).await?;
 
 			let hive_addr = b"127.0.0.1:65043".as_slice();
 			let mut client = connect_cluster(&certs, advertiser.addr()).await?;
@@ -1706,7 +1867,9 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
-			(events::CLUSTER_GATE_BLOCKED, exactly!(1))
+			(events::CLUSTER_GATE_BLOCKED, exactly!(1)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(WORK_PAYLOAD, exactly!(1), equals!(0u64))
 		]
 	}
 }
@@ -1742,12 +1905,7 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, frame).await?;
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
-			assert_eq!(
-				work_response.status,
-				TransitStatus::PermissionDenied,
-				"gate policy must reject the request before decoding"
-			);
-			assert!(work_response.payload.is_none(), "rejected request must not carry a payload");
+			record_work_status(&trace, &work_response)?;
 
 			cluster.stop();
 
@@ -1767,7 +1925,10 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
-			(events::CLUSTER_REGISTER_REFUSED, exactly!(1))
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Unauthenticated)),
+			(REGISTRY_HIVES, exactly!(1), equals!(0u64)),
+			(REGISTER_ASSIGNED_ID, exactly!(1), equals!(0u64))
 		]
 	}
 }
@@ -1778,7 +1939,7 @@ tb_scenario! {
 	environment Cluster {
 		context: cluster_certs(),
 		// Registration itself is under test, so no `hives:` key.
-		// The client drives it and asserts the rejection.
+		// The client drives it; the spec asserts the rejection.
 		start: |SetupEnv { trace, context: certs }| async move {
 			// Cluster requires signed hive-origin frames (hive_trust set)
 			start_cluster(&trace, ClusterConf::new(cluster_tls_config(&certs))).await
@@ -1799,7 +1960,7 @@ tb_scenario! {
 			trace.event(REGISTRATION_SENT)?;
 
 			let response = hive.register_with_cluster(cluster_addr).await?;
-			assert_register_status(&response, TransitStatus::Unauthenticated, 0, &cluster);
+			record_register_response(&trace, &response, &cluster)?;
 
 			hive.stop();
 			cluster.stop();
@@ -1817,7 +1978,10 @@ tb_assert_spec! {
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
-			(events::HIVE_REREGISTERED, exactly!(0))
+			(events::HIVE_REREGISTERED, exactly!(0)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Unauthenticated)),
+			(REGISTRY_HIVES, exactly!(1), equals!(0u64)),
+			(REGISTER_ASSIGNED_ID, exactly!(1), equals!(0u64))
 		]
 	}
 }
@@ -1847,7 +2011,7 @@ tb_scenario! {
 			trace.event(REGISTRATION_SENT)?;
 
 			let response = hive.register_with_cluster(cluster_addr).await?;
-			assert_register_status(&response, TransitStatus::Unauthenticated, 0, &cluster);
+			record_register_response(&trace, &response, &cluster)?;
 
 			// Several anti-entropy intervals: a queued gateway would emit
 			// HIVE_REREGISTERED; an unqueued one stays silent.
@@ -1872,7 +2036,10 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
-			(events::CLUSTER_REGISTER_REFUSED, exactly!(1))
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(REGISTRY_HIVES, exactly!(1), equals!(0u64)),
+			(REGISTER_ASSIGNED_ID, exactly!(1), equals!(0u64))
 		]
 	}
 }
@@ -1911,7 +2078,7 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, signed).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_register_status(&response, TransitStatus::PermissionDenied, 0, &cluster);
+			record_register_response(&trace, &response, &cluster)?;
 
 			cluster.stop();
 
@@ -1937,12 +2104,37 @@ tb_assert_spec! {
 	}
 }
 
+// Alignment ordering: the mismatched registration is refused before the
+// clean one lands, and the mismatched update is refused only after the
+// hive registered. Counting cannot prove which registration was refused.
+tb_process_spec! {
+	pub ClusterLocatorAlignProcess,
+	events {
+		observable {
+			events::CLUSTER_REGISTER_REFUSED,
+			events::CLUSTER_HIVE_REGISTERED,
+			events::CLUSTER_UPDATE_REFUSED
+		}
+		hidden { }
+	}
+	states {
+		Idle => { events::CLUSTER_REGISTER_REFUSED => MisalignRefused },
+		MisalignRefused => { events::CLUSTER_HIVE_REGISTERED => Registered },
+		Registered => { events::CLUSTER_UPDATE_REFUSED => UpdateRefused },
+		UpdateRefused => { }
+	}
+	terminal { UpdateRefused }
+}
+
 // Register and update must refuse ServletInfo whose instance locator
 // disagrees with the announced address: routes key by address, remove
 // by URN locator (CWE-639 ghost / orphan routes).
 tb_scenario! {
 	name: cluster_rejects_mismatched_servlet_locator,
-	spec: ClusterServletLocatorAlignSpec,
+	config: ScenarioConf::builder()
+		.with_spec(ClusterServletLocatorAlignSpec::latest())
+		.with_csp(ClusterLocatorAlignProcess)
+		.build(),
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
@@ -1967,8 +2159,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, refused_reg).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_register_status(&response, TransitStatus::PermissionDenied, 0, &cluster);
+			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
 			// Clean registration, then a mismatched add must refuse.
 			let ok_reg = signed_control_frame(
@@ -1978,8 +2169,7 @@ tb_scenario! {
 			)
 			.await?;
 			let response_frame = emit_frame(&mut client, ok_reg).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_register_status(&response, TransitStatus::Ok, 1, &cluster);
+			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
 			let bad_add = servlet_address_update(
 				hive_addr,
@@ -1988,12 +2178,7 @@ tb_scenario! {
 			);
 			let refused_update = signed_control_frame(&certs, b"misalign-update", bad_add).await?;
 			let response_frame = emit_frame(&mut client, refused_update).await?;
-			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
-			assert_eq!(
-				response.status,
-				TransitStatus::PermissionDenied,
-				"mismatched servlet locator on update must be refused"
-			);
+			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
 
 			cluster.stop();
 
@@ -2071,13 +2256,11 @@ tb_scenario! {
 			let replayed = fresh.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_register_status(&response, TransitStatus::Ok, 1, &cluster);
+			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
 			// Byte-identical resend carries an already-seen signature
 			let response_frame = emit_frame(&mut client, replayed).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_eq!(response.status, TransitStatus::PermissionDenied, "replayed registration must be rejected");
+			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
 			// Valid signature but issued outside the freshness window
 			let stale_ts = current_timestamp_ms() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
@@ -2089,8 +2272,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, stale).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_eq!(response.status, TransitStatus::PermissionDenied, "stale registration must be rejected");
+			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
 			// Same enforcement on servlet address updates
 			let update = servlet_address_update(
@@ -2102,12 +2284,10 @@ tb_scenario! {
 			let replayed_update = fresh_update.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh_update).await?;
-			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
-			assert_eq!(response.status, TransitStatus::Ok, "fresh signed update must be accepted");
+			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
 
 			let response_frame = emit_frame(&mut client, replayed_update).await?;
-			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
-			assert_eq!(response.status, TransitStatus::PermissionDenied, "replayed update must be rejected");
+			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
 
 			cluster.stop();
 
@@ -2127,7 +2307,11 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(REJECTED_HEARTBEAT_DECODED, exactly!(1)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(REGISTRY_HIVES, exactly!(1), equals!(1u64)),
+			(REGISTER_ASSIGNED_ID, exactly!(1), equals!(1u64)),
+			(REGISTRY_EMPTIED, exactly!(1), equals!(1u64)),
+			(REJECTED_HEARTBEAT_DECODED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_HIVE_EVICTED, exactly!(1))
 		]
 	}
@@ -2156,7 +2340,7 @@ tb_process_spec! {
 
 /// Heartbeat-eviction fixture. The heartbeat callback (set in `start`)
 /// records whether a decoded rejected heartbeat was observed. The client
-/// asserts that flag after eviction.
+/// surfaces that flag as a valued event the spec pins after eviction.
 struct HeartbeatRejectionContext {
 	certs: ClusterTestCerts,
 	rejected_decoded: AtomicBool,
@@ -2215,21 +2399,15 @@ tb_scenario! {
 			let mut client = connect_cluster(certs, cluster_addr).await?;
 			let response_frame = emit_frame(&mut client, registration).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_register_status(&response, TransitStatus::Ok, 1, &cluster);
+			record_register_response(&trace, &response, &cluster)?;
 
 			// Heartbeats run every 100ms with max_failures = 1: the first
 			// PermissionDenied heartbeat must evict the hive
-			assert!(
-				wait_for_empty_registry(&cluster, 50, Duration::from_millis(100)).await,
-				"hive with rejected heartbeats must be evicted"
-			);
+			let emptied = wait_for_empty_registry(&cluster, 50, Duration::from_millis(100)).await;
+			trace.event_with(REGISTRY_EMPTIED, &[], u64::from(emptied))?;
 
-			assert!(
-				rejection.rejected_decoded.load(Ordering::SeqCst),
-				"hive must answer with a decodable rejected heartbeat"
-			);
-
-			trace.event(REJECTED_HEARTBEAT_DECODED)?;
+			let decoded = rejection.rejected_decoded.load(Ordering::SeqCst);
+			trace.event_with(REJECTED_HEARTBEAT_DECODED, &[], u64::from(decoded))?;
 
 			hive.stop();
 			cluster.stop();
@@ -2300,15 +2478,43 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2)),
+			(REGISTER_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
+			(REGISTRY_HIVES, exactly!(1), equals!(2u64)),
 			(events::CLUSTER_UPDATE_REFUSED, exactly!(1)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1))
 		]
 	}
 }
 
+// Tamper ordering: the cross-hive poison update is refused before the
+// owner's update lands. Counting cannot prove the refusal hit the
+// poison rather than the owner's own update.
+tb_process_spec! {
+	pub ClusterCrossUpdateProcess,
+	events {
+		observable {
+			events::CLUSTER_HIVE_REGISTERED,
+			events::CLUSTER_UPDATE_REFUSED,
+			events::CLUSTER_UPDATE_ACCEPTED
+		}
+		hidden { }
+	}
+	states {
+		Idle => { events::CLUSTER_HIVE_REGISTERED => OneRegistered },
+		OneRegistered => { events::CLUSTER_HIVE_REGISTERED => TwoRegistered },
+		TwoRegistered => { events::CLUSTER_UPDATE_REFUSED => CrossRefused },
+		CrossRefused => { events::CLUSTER_UPDATE_ACCEPTED => OwnerLanded },
+		OwnerLanded => { }
+	}
+	terminal { OwnerLanded }
+}
+
 tb_scenario! {
 	name: cluster_rejects_cross_hive_servlet_address_update,
-	spec: ClusterCrossHiveUpdateSpec,
+	config: ScenarioConf::builder()
+		.with_spec(ClusterCrossHiveUpdateSpec::latest())
+		.with_csp(ClusterCrossUpdateProcess)
+		.build(),
 	environment Cluster {
 		context: dual_hive_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
@@ -2318,7 +2524,7 @@ tb_scenario! {
 			)))
 			.await
 		},
-		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let cluster_addr = cluster.addr();
 			let mut client = connect_cluster(&certs.gateway, cluster_addr).await?;
 
@@ -2327,28 +2533,25 @@ tb_scenario! {
 
 			let response_a = register_signed_hive(&mut client, &certs.hive_a.1, b"reg-a", hive_a_addr).await?;
 			let response_b = register_signed_hive(&mut client, &certs.hive_b.1, b"reg-b", hive_b_addr).await?;
-			assert_eq!(response_a.status, TransitStatus::Ok);
-			assert_eq!(response_b.status, TransitStatus::Ok);
-			assert_eq!(cluster.hive_count(), 2);
+			trace.event_with(REGISTER_STATUS, &[], response_a.status)?;
+			trace.event_with(REGISTER_STATUS, &[], response_b.status)?;
+			trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count() as u64)?;
 
 			let update_cases = [
 				(
 					&certs.hive_b.1,
 					b"cross-update".as_slice(),
 					servlet_address_update(hive_a_addr, vec![servlet_info("poison", b"127.0.0.1:65099")], vec![]),
-					TransitStatus::PermissionDenied,
 				),
 				(
 					&certs.hive_a.1,
 					b"owner-update".as_slice(),
 					servlet_address_update(hive_a_addr, vec![servlet_info("ping", b"127.0.0.1:65012")], vec![]),
-					TransitStatus::Ok,
 				),
 			];
 
-			for (key, id, request, expected) in update_cases {
-				let response = emit_servlet_update(&mut client, key, id, request).await?;
-				assert_eq!(response.status, expected);
+			for (key, id, request) in update_cases {
+				emit_servlet_update(&mut client, key, id, request).await?;
 			}
 
 			cluster.stop();
@@ -2365,6 +2568,7 @@ tb_assert_spec! {
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(REGISTRY_HIVES, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1))
 		]
 	}
@@ -2406,29 +2610,27 @@ tb_scenario! {
 			)))
 			.await
 		},
-		client: |ClusterEnv { context: certs, cluster, .. }| async move {
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let mut client = connect_cluster(&certs.gateway, cluster.addr()).await?;
 
 			let hive_a_addr = b"127.0.0.1:65020".as_slice();
 
-			let owner = register_signed_hive(&mut client, &certs.hive_a.1, b"owner-reg", hive_a_addr).await?;
-			assert_eq!(owner.status, TransitStatus::Ok);
-			assert_eq!(cluster.hive_count(), 1);
+			register_signed_hive(&mut client, &certs.hive_a.1, b"owner-reg", hive_a_addr).await?;
+			register_signed_hive(&mut client, &certs.hive_b.1, b"hijack-reg", hive_a_addr).await?;
 
-			let hijack = register_signed_hive(&mut client, &certs.hive_b.1, b"hijack-reg", hive_a_addr).await?;
-			assert_eq!(hijack.status, TransitStatus::PermissionDenied);
-			assert_eq!(cluster.hive_count(), 1);
+			// The registry after the refused hijack still holds exactly
+			// the owner: the failed takeover must not disturb the binding.
+			trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count() as u64)?;
 
 			// The owner's update still lands: the failed hijack must not
 			// have disturbed the signer binding.
-			let owned = emit_servlet_update(
+			emit_servlet_update(
 				&mut client,
 				&certs.hive_a.1,
 				b"owner-still-bound",
 				servlet_address_update(hive_a_addr, vec![servlet_info("ping", b"127.0.0.1:65021")], vec![]),
 			)
 			.await?;
-			assert_eq!(owned.status, TransitStatus::Ok);
 
 			cluster.stop();
 			Ok(())
@@ -2550,34 +2752,23 @@ tb_scenario! {
 
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
-			let registered = register_signed_hive(&mut client, &certs.key, b"removal-reg", hive_addr).await?;
-			assert_eq!(registered.status, TransitStatus::Ok);
+			register_signed_hive(&mut client, &certs.key, b"removal-reg", hive_addr).await?;
 
 			let added = vec![servlet_info("ping", servlet_addr.as_bytes())];
-			let removed = vec![];
-			let request = servlet_address_update(hive_addr, added, removed);
-			let added = emit_servlet_update(&mut client, &certs.key, b"removal-add", request).await?;
-			assert_eq!(added.status, TransitStatus::Ok);
+			let request = servlet_address_update(hive_addr, added, vec![]);
+			emit_servlet_update(&mut client, &certs.key, b"removal-add", request).await?;
 
-			let routed = emit_ping_work(&mut client, b"pre-removal-work").await?;
-			assert_eq!(routed.status, TransitStatus::Ok, "work must route while the instance is registered");
+			emit_ping_work(&mut client, b"pre-removal-work").await?;
 
 			let removed = vec![foreign_realm_instance(&servlet_addr)];
 			let request = servlet_address_update(hive_addr, vec![], removed);
-			let foreign = emit_servlet_update(&mut client, &certs.key, b"removal-foreign", request).await?;
-			assert_eq!(foreign.status, TransitStatus::PermissionDenied, "foreign-realm removals must be refused");
+			emit_servlet_update(&mut client, &certs.key, b"removal-foreign", request).await?;
 
 			let removed = vec![servlet_instance(&servlet_urn("ping"), &servlet_addr)];
 			let request = servlet_address_update(hive_addr, vec![], removed);
-			let removed = emit_servlet_update(&mut client, &certs.key, b"removal-remove", request).await?;
-			assert_eq!(removed.status, TransitStatus::Ok, "owner removal of its instance must be accepted");
+			emit_servlet_update(&mut client, &certs.key, b"removal-remove", request).await?;
 
-			let unrouted = emit_ping_work(&mut client, b"post-removal-work").await?;
-			assert_eq!(
-				unrouted.status,
-				TransitStatus::Unavailable,
-				"work for a fully removed type must be unavailable"
-			);
+			emit_ping_work(&mut client, b"post-removal-work").await?;
 
 			servlet.stop();
 			cluster.stop();
@@ -2591,9 +2782,8 @@ tb_scenario! {
 // ============================================================================
 
 /// Shared fixture for the topology scenarios: gateway certs plus the
-/// selection set the [`RecordingBalancer`] populates so a scenario can
-/// assert the spread ("both indices seen" is set semantics the assertion
-/// spec language cannot express).
+/// selection set the [`RecordingBalancer`] populates. The scenario
+/// reduces the set to a `BALANCER_SPREAD` boolean event the spec pins.
 struct TopologyCtx {
 	certs: Arc<GatewayCerts>,
 	selected: Arc<Mutex<HashSet<usize>>>,
@@ -2688,11 +2878,11 @@ async fn drive_topology_routes(
 	Ok(())
 }
 
-/// Drive `routes` requests and assert the strategy selected both
-/// instances. Shared by every topology scenario so they differ only in
-/// strategy and volume; the offer widths travel as `BALANCER_OFFERED`
-/// events the spec value-asserts.
-async fn assert_topology_spread(
+/// Drive `routes` requests and record whether the strategy selected both
+/// instances as `BALANCER_SPREAD`. Shared by every topology scenario so
+/// they differ only in strategy and volume; the offer widths travel as
+/// `BALANCER_OFFERED` events the spec value-asserts.
+async fn record_topology_spread(
 	trace: &TraceCollector,
 	ctx: &TopologyCtx,
 	cluster: &ClusterGateway,
@@ -2700,11 +2890,8 @@ async fn assert_topology_spread(
 ) -> Result<(), TightBeamError> {
 	drive_topology_routes(trace, ctx, cluster, routes).await?;
 
-	assert_eq!(
-		ctx.selected_indices(),
-		HashSet::from([0usize, 1usize]),
-		"strategy must spread work across both instances"
-	);
+	let spread = ctx.selected_indices() == HashSet::from([0usize, 1usize]);
+	trace.event_with(BALANCER_SPREAD, &[], u64::from(spread))?;
 
 	Ok(())
 }
@@ -2719,6 +2906,7 @@ tb_assert_spec! {
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
 			(events::CLUSTER_WORK_ROUTED, at_least!(4)),
 			(BALANCER_OFFERED, at_least!(4), equals!(2u64)),
+			(BALANCER_SPREAD, exactly!(1), equals!(1u64)),
 			(TOPOLOGY_REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(TOPOLOGY_ADD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(TOPOLOGY_ROUTE_STATUS, at_least!(4), equals!(TransitStatus::Ok))
@@ -2739,7 +2927,7 @@ tb_scenario! {
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			assert_topology_spread(&trace, &ctx, &cluster, 4).await?;
+			record_topology_spread(&trace, &ctx, &cluster, 4).await?;
 			cluster.stop();
 			Ok(())
 		}
@@ -2760,7 +2948,414 @@ tb_scenario! {
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			assert_topology_spread(&trace, &ctx, &cluster, 12).await?;
+			record_topology_spread(&trace, &ctx, &cluster, 12).await?;
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Gossip Flood (rumor plane)
+// ============================================================================
+
+/// Peering conf that refloods to `peers`, returning the journal handle so
+/// scenarios can poll flood convergence through the public journal trait.
+fn gossip_cluster_conf(certs: &ClusterTestCerts, peers: Vec<String>) -> (ClusterConf, Arc<MemoryGossipJournal>) {
+	let journal = Arc::new(MemoryGossipJournal::default());
+	let mut conf = peering_cluster_conf(certs);
+	conf.peers = peers;
+	conf.gossip = GossipConf { journal: Arc::clone(&journal) as Arc<dyn GossipJournal>, ..Default::default() };
+	(conf, journal)
+}
+
+/// Rumor envelope for the ping type, issued now.
+fn ping_rumor(ttl: u8, payload: Vec<u8>) -> GossipEnvelope {
+	GossipEnvelope { issued_at_ms: current_timestamp_ms(), target: servlet_urn("ping"), ttl, payload }
+}
+
+/// Emit one signed gossip frame and record the decoded status on the
+/// trace as `GOSSIP_PUBLISH_STATUS`.
+async fn send_gossip_frame(
+	trace: &TraceCollector,
+	connect_certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+	frame: Frame,
+) -> Result<(), TightBeamError> {
+	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
+	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message)?;
+	trace.event_with(GOSSIP_PUBLISH_STATUS, &[], response.status)?;
+	Ok(())
+}
+
+/// One convergence probe over the public journal interface: every journal
+/// holds exactly `held` rumors and none awaits local delivery.
+fn gossip_converged(journals: &[Arc<MemoryGossipJournal>], held: usize) -> bool {
+	let now = current_timestamp_ms();
+	journals.iter().all(|journal| {
+		let held_now = journal.held_digests(now).is_ok_and(|digests| digests.len() == held);
+		let none_pending = journal.pending_local(now).is_ok_and(|rumors| rumors.is_empty());
+		held_now && none_pending
+	})
+}
+
+/// Poll until every journal converged or attempts exhaust. Refloods run
+/// detached from the publish reply, so convergence is only observable by
+/// polling. Branching lives here, not in scenarios.
+async fn wait_for_gossip_converged(
+	journals: &[Arc<MemoryGossipJournal>],
+	held: usize,
+	attempts: u32,
+	interval: Duration,
+) -> bool {
+	for _ in 0..attempts {
+		if gossip_converged(journals, held) {
+			return true;
+		}
+
+		tokio::time::sleep(interval).await;
+	}
+
+	gossip_converged(journals, held)
+}
+
+tb_assert_spec! {
+	pub ClusterGossipFloodSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(3), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
+			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(1)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// Fan-out flood: A refloods to B and C, and every cluster delivers the
+// rumor to its local ping servlet exactly once (ACCEPTED = 3). A second
+// publish of the byte-identical rumor is absorbed as exactly one
+// DUPLICATE, still answered Ok, and delivered nowhere a second time. The
+// duplicate fires before its reply, so the count needs no polling.
+tb_scenario! {
+	name: cluster_gossip_floods_every_cluster_once,
+	spec: ClusterGossipFloodSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
+			let gateway_c = start_cluster(&trace, conf_c).await?;
+
+			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
+			let gateway_b = start_cluster(&trace, conf_b).await?;
+
+			let peers_a = vec![gateway_b.addr().to_string(), gateway_c.addr().to_string()];
+			let (conf_a, journal_a) = gossip_cluster_conf(&certs, peers_a);
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			let hive_b = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			let hive_c = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			hive.register_with_cluster(gateway_a.addr()).await?;
+			hive_b.register_with_cluster(gateway_b.addr()).await?;
+			hive_c.register_with_cluster(gateway_c.addr()).await?;
+
+			let rumor = ping_rumor(4, encode(&PingRequest { value: 21 })?);
+			let publish = ClusterRequest::PublishGossip(rumor.clone());
+			let frame = signed_control_frame(&certs, b"flood-rumor", publish).await?;
+			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+
+			let journals = [journal_a, journal_b, journal_c];
+			let converged = wait_for_gossip_converged(&journals, 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			let republish = ClusterRequest::PublishGossip(rumor);
+			let frame = signed_control_frame(&certs, b"flood-rumor-again", republish).await?;
+			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+
+			gateway_a.stop();
+			gateway_b.stop();
+			gateway_c.stop();
+			hive_b.stop();
+			hive_c.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipChainSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(3), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// Partial topology A -> B -> C: A is not peered to C, so the rumor only
+// reaches C through B's reflood. The publish starts at ttl 2 and arrives
+// at C with ttl 0, so the hop budget is exactly consumed and the chain
+// still delivers once per cluster with no duplicate.
+tb_scenario! {
+	name: cluster_gossip_relays_across_partial_topology,
+	spec: ClusterGossipChainSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
+			let gateway_c = start_cluster(&trace, conf_c).await?;
+
+			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![gateway_c.addr().to_string()]);
+			let gateway_b = start_cluster(&trace, conf_b).await?;
+
+			let (conf_a, journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			let hive_b = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			let hive_c = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			hive.register_with_cluster(gateway_a.addr()).await?;
+			hive_b.register_with_cluster(gateway_b.addr()).await?;
+			hive_c.register_with_cluster(gateway_c.addr()).await?;
+
+			let publish = ClusterRequest::PublishGossip(ping_rumor(2, encode(&PingRequest { value: 21 })?));
+			let frame = signed_control_frame(&certs, b"chain-rumor", publish).await?;
+			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+
+			let journals = [journal_a, journal_b, journal_c];
+			let converged = wait_for_gossip_converged(&journals, 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			gateway_a.stop();
+			gateway_b.stop();
+			gateway_c.stop();
+			hive_b.stop();
+			hive_c.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipHiveTrustOnlySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// Hive-trust-only propagation: A configures a peer but no peer_trust, so
+// it builds no peer pool. The reflood falls back to the hive pool, the
+// same preference the advertise beat applies, and the rumor still reaches
+// B, which verifies A's relay on its own peer plane. The publish starts
+// at ttl 1, so each cluster delivers exactly once and B refloods nowhere.
+tb_scenario! {
+	name: cluster_gossip_refloods_under_hive_trust_only,
+	spec: ClusterGossipHiveTrustOnlySpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
+			let gateway_b = start_cluster(&trace, conf_b).await?;
+			let (mut conf_a, journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
+
+			conf_a.tls.peer_trust = None;
+
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			let hive_b = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			hive.register_with_cluster(gateway_a.addr()).await?;
+			hive_b.register_with_cluster(gateway_b.addr()).await?;
+
+			let publish = ClusterRequest::PublishGossip(ping_rumor(1, encode(&PingRequest { value: 21 })?));
+			let frame = signed_control_frame(&certs, b"hive-only-rumor", publish).await?;
+			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+
+			let journals = [journal_a, journal_b];
+			let converged = wait_for_gossip_converged(&journals, 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			gateway_a.stop();
+			gateway_b.stop();
+			hive_b.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipTtlClampSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(GOSSIP_CLAMP_LEAKED, exactly!(1), equals!(0u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// The operator's configured gossip ttl caps the hop radius an origin
+// publish may request: with ttl 0 configured, a publish requesting the
+// protocol maximum is clamped, delivered locally, and never refloods to
+// the configured peer. A leaked reflood would raise ACCEPTED past one.
+tb_scenario! {
+	name: cluster_gossip_origin_clamps_configured_ttl,
+	spec: ClusterGossipTtlClampSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let (conf_b, journal_b) = gossip_cluster_conf(&certs, vec![]);
+			let gateway_b = start_cluster(&trace, conf_b).await?;
+
+			let (mut conf_a, journal_a) = gossip_cluster_conf(&certs, vec![gateway_b.addr().to_string()]);
+			conf_a.gossip.ttl = 0;
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			let hive_b = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			hive.register_with_cluster(gateway_a.addr()).await?;
+			hive_b.register_with_cluster(gateway_b.addr()).await?;
+
+			let ping_request = encode(&PingRequest { value: 21 })?;
+			let publish = ClusterRequest::PublishGossip(ping_rumor(MAX_GOSSIP_TTL, ping_request));
+			let frame = signed_control_frame(&certs, b"clamped-rumor", publish).await?;
+			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+
+			let converged = wait_for_gossip_converged(&[journal_a], 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			// A leaked reflood would land within this window. Correct
+			// clamping leaves B's journal empty for the whole wait.
+			let leaked = wait_for_gossip_converged(&[journal_b], 1, 3, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CLAMP_LEAKED, &[], u64::from(leaked))?;
+
+			gateway_a.stop();
+			gateway_b.stop();
+			hive_b.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Fixture for the plane-separation scenario: the gateway's own certs
+/// anchor the hive plane, a distinct random identity anchors the peer
+/// plane. [`GatewayCerts::generate`] cannot serve here because every
+/// generated cert shares the fixed test signing key, so two "identities"
+/// would verify interchangeably.
+struct GossipPlaneCtx {
+	gateway: ClusterTestCerts,
+	peer_key: Secp256k1SigningKey,
+	peer_trust: Arc<dyn CertificateTrust>,
+}
+
+fn gossip_plane_ctx() -> GossipPlaneCtx {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::utils::create_test_certificate;
+
+	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let peer_cert = create_test_certificate(&raw);
+	let peer_key = Secp256k1SigningKey::from(raw);
+	let peer_trust: Arc<dyn CertificateTrust> = Arc::new(
+		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			.with_certificate(peer_cert)
+			.expect("peer trust")
+			.build(),
+	);
+
+	GossipPlaneCtx { gateway: cluster_certs(), peer_key, peer_trust }
+}
+
+tb_assert_spec! {
+	pub ClusterGossipPlaneSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(GOSSIP_PUBLISH_STATUS, exactly!(3), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(3)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
+		]
+	}
+}
+
+// Trust-plane separation and admission bounds: a hive-plane signer must
+// not relay peer gossip, a peer-plane signer must not publish origin
+// gossip, and an oversized rumor is refused at admission even on the
+// correct plane. Nothing is delivered or recorded for reflood.
+tb_scenario! {
+	name: cluster_gossip_refuses_wrong_plane_and_oversized,
+	spec: ClusterGossipPlaneSpec,
+	environment Cluster {
+		context: gossip_plane_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			// The oversized rumor exceeds a single-flight envelope, so the
+			// gateway offers mux: the frame must chunk across the link to
+			// reach gossip admission at all.
+			let mut conf = peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust));
+			conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+			let relay = ClusterRequest::Gossip(ping_rumor(2, encode(&PingRequest { value: 21 })?));
+			let frame = signed_control_frame_with(&ctx.gateway.key, b"cross-plane-relay", relay).await?;
+			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
+
+			let publish = ClusterRequest::PublishGossip(ping_rumor(2, encode(&PingRequest { value: 21 })?));
+			let frame = signed_control_frame_with(&ctx.peer_key, b"cross-plane-publish", publish).await?;
+			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
+
+			// A rumor past the gossip bound exceeds what one single-flight
+			// envelope carries, so it rides a pooled mux link (the same
+			// chunked path reflood uses) to reach admission, where the
+			// payload bound refuses it on the correct plane.
+			let pool_config = PoolConfig {
+				mux_offer: Some(TransportOffer::mux(8)),
+				..Default::default()
+			};
+			let pool = Arc::new(
+				ConnectionPool::<TokioListener>::builder()
+					.with_config(pool_config)
+					.with_trust_store(Arc::clone(&ctx.gateway.trust))
+					.with_trace(trace.share())
+					.build(),
+			);
+			let mut mux_client = pool.connect(cluster.addr()).await?;
+
+			let oversized = ClusterRequest::PublishGossip(ping_rumor(2, vec![0u8; MAX_GOSSIP_PAYLOAD_BYTES + 1]));
+			let frame = signed_control_frame_with(&ctx.gateway.key, b"oversized-rumor", oversized).await?;
+			let reply = mux_client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
+			let response: GossipResponse = decode(&reply.message)?;
+			trace.event_with(GOSSIP_PUBLISH_STATUS, &[], response.status)?;
+
 			cluster.stop();
 			Ok(())
 		}

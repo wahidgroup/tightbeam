@@ -231,7 +231,7 @@ The following project terms MUST be used consistently. This list holds identity 
 
 ### 3.1 Information Theory Properties
 
-tightbeam keeps Frames inside the fidelity bound **I(t) ∈ (0,1)** through the following design properties. This section is a property index. It does not redefine the nouns in [§2 Terminology](#2-terminology). Each entry links to the normative rules.
+tightbeam keeps Frames inside the fidelity bound **I(t) ∈ (0,1)** through the following design properties. The list is a property index, not a second glossary. Nouns stay in [§2 Terminology](#2-terminology). Each entry links to the normative rules.
 
 - **STRUCTURE**: ASN.1 DER gives a single canonical encoding for equal values ([§5.5 Encoding Rules](#55-encoding-rules)).
 - **IDEMPOTENCE**: Each Frame carries a unique `id` for message identification ([§4.1 Version Evolution](#41-version-evolution)).
@@ -251,30 +251,35 @@ tightbeam keeps Frames inside the fidelity bound **I(t) ∈ (0,1)** through the 
 
 Each protocol version inherits the required features of the prior version. A higher version MAY add optional features. Receivers that implement version N MUST accept Frames that use only features defined for version N or earlier, when those features remain valid for the negotiated version.
 
-| Version | Required features                                          | Optional features                                                     |
-| ------- | ---------------------------------------------------------- | --------------------------------------------------------------------- |
-| V0      | Message identification (`id`); temporal ordering (`order`) | Compression (`compactness`)                                           |
-| V1      | All V0 required features                                   | Message Integrity (MI); confidentiality; Nonrepudiation               |
-| V2      | All V1 required features                                   | Priority (`MessagePriority`); lifetime (TTL); Previous Frame chaining |
-| V3      | All V2 required features                                   | Matrix control                                                        |
+| Version | Required features                                          | Optional features                                                             |
+| ------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| V0      | Message identification (`id`); temporal ordering (`order`) | Compression (`compactness`)                                                   |
+| V1      | All V0 required features                                   | Message Integrity (MI); Frame Integrity (FI); confidentiality; Nonrepudiation |
+| V2      | All V1 required features                                   | Priority (`MessagePriority`); lifetime (TTL); Previous Frame chaining         |
+| V3      | All V2 required features                                   | Matrix control                                                                |
 
 Concrete field requirements and forbidden fields are stated in [§5.6 Version-Specific Constraints](#56-version-specific-constraints). Semantic rules for integrity, chaining, and signatures are stated in [§5.7 Semantic Constraints](#57-semantic-constraints).
 
 ### 4.2 Frame Structure
 
-All versions MUST include:
+Every Frame MUST carry these elements:
 
-- Identifier
-- Frame Version
-- Order
-- Message payload (bytecode)
+- Frame `Version`
+- Identifier (`Metadata.id`)
+- Order (`Metadata.order`)
+- Message payload (`Frame.message`)
 
-All versions MAY include:
+A Frame MAY also carry:
 
-- Frame integrity (digest of envelope: version + metadata - excludes message)
-- Non-repudiation (cryptographic signature)
+- Message Integrity (MI) in `Metadata.integrity` ([§5.7.3](#573-integrity-semantics-order-of-operations))
+- Frame Integrity (FI) in `Frame.integrity`: digest over `version` and `metadata`; MUST exclude `message` ([§5.7.3](#573-integrity-semantics-order-of-operations))
+- Nonrepudiation in `Frame.nonrepudiation` ([§5.7.5](#575-nonrepudiation-coverage-and-binding))
+
+Which optional fields a version MAY emit is stated in [§5.6](#56-version-specific-constraints). The Rust shapes follow in [§4.3](#43-metadata-specification) and [§4.4](#44-frame-encapsulation).
 
 ### 4.3 Metadata Specification
+
+`Metadata` holds identity, order, and optional control fields. Version gates for each field are in [§5.6](#56-version-specific-constraints).
 
 ```rust
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
@@ -311,7 +316,11 @@ pub struct Metadata {
 }
 ```
 
+> Note: `Metadata.integrity` is Message Integrity (MI). `Frame.integrity` is Frame Integrity (FI). Both MAY appear from V1 onward. Same type name, different coverage. See [§5.7.3](#573-integrity-semantics-order-of-operations).
+
 ### 4.4 Frame Encapsulation
+
+`Frame` is the top-level envelope. It carries `version`, `metadata`, `message`, and optional FI and Nonrepudiation fields.
 
 ```rust
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
@@ -332,7 +341,7 @@ pub struct Frame {
 
 ## 5. ASN.1 Formal Specification
 
-This section provides the complete ASN.1 definitions for all tightbeam protocol structures. All structures use the ASN.1 notation defined in [ITU-T X.680][itu-x680] and are encoded using Distinguished Encoding Rules (DER).
+ASN.1 types for the tightbeam wire format use [ITU-T X.680][itu-x680] notation and Distinguished Encoding Rules (DER) per [ITU-T X.690][itu-x690]. Semantic constraints are in [§5.6](#56-version-specific-constraints) through [§5.8](#58-what-is-the-matrix). The assembled module is in [§5.9](#59-complete-asn1-module).
 
 ### 5.1 Enumerated Types
 
@@ -347,9 +356,11 @@ Version ::= ENUMERATED {
 }
 ```
 
-> `Version` enumerates the protocol generation carried by every frame. See [§4.1 Version Evolution](#41-version-evolution) for the negotiation and backward-compatibility rules governing each value. The zero-indexed named version field follows the established ASN.1 idiom of X.509 ([RFC 5280][rfc5280], `Version ::= INTEGER { v1(0), v2(1), v3(2) }`) and CMS ([RFC 5652][rfc5652], `CMSVersion`). Like the latter, tightbeam numbers `vN` as integer `N`.
+`Version` names the protocol generation on every Frame. Feature and field rules per value are in [§4.1](#41-version-evolution) and [§5.6](#56-version-specific-constraints).
 
-#### Message Priority Levels ([RFC 2474][rfc2474] - DiffServ)
+The named, zero-based form follows the ASN.1 idiom used by X.509 ([RFC 5280][rfc5280], `Version ::= INTEGER { v1(0), v2(1), v3(2) }`) and CMS ([RFC 5652][rfc5652], `CMSVersion`). tightbeam numbers `vN` as integer `N`, matching CMS.
+
+#### Message Priority Levels ([RFC 2474][rfc2474] DiffServ)
 
 ```asn1
 MessagePriority ::= ENUMERATED {
@@ -362,13 +373,15 @@ MessagePriority ::= ENUMERATED {
 }
 ```
 
-> Priority levels are anchored to the IETF Differentiated Services (DiffServ) architecture, mapping each level to a Per-Hop Behavior (PHB) or service class defined in [RFC 2474][rfc2474] (DS field / Class Selectors), [RFC 4594][rfc4594] (service classes), [RFC 3246][rfc3246] (Expedited Forwarding), and [RFC 8622][rfc8622] (Lower-Effort). Ordering is DSCP-faithful: a higher value denotes higher priority. A secondary mapping to ITU-T X.400/X.420 ([ITU-T X.400][itu-x400], [ITU-T X.420][itu-x420]) message importance (low/normal/high) is retained for message-handling interoperability.
+There are six priority levels. Each level maps to a DiffServ Per-Hop Behavior (PHB) or service class in [RFC 2474][rfc2474], [RFC 4594][rfc4594], [RFC 3246][rfc3246], and [RFC 8622][rfc8622]. A higher numeric value means higher priority.
+
+A secondary mapping to ITU-T X.400/X.420 message importance (low, normal, high) remains available for message-handling interoperability ([ITU-T X.400][itu-x400], [ITU-T X.420][itu-x420]).
 
 ### 5.2 Cryptographic Structures
 
-tightbeam uses standard CMS (Cryptographic Message Syntax) structures from [RFC 5652][rfc5652] and PKCS standards for cryptographic operations.
+tightbeam reuses CMS and PKCS structures for digests, encryption, signatures, and compression ([RFC 5652][rfc5652], [RFC 3447][rfc3447], [RFC 3274][rfc3274]).
 
-#### Digest Information ([RFC 3447][rfc3447] - PKCS #1)
+#### Digest Information ([RFC 3447][rfc3447] PKCS #1)
 
 From RFC 3447 Section 9.2:
 
@@ -379,9 +392,9 @@ DigestInfo ::= SEQUENCE {
 }
 ```
 
-> Used in `Metadata.integrity`, `Metadata.previous_frame`, and `Frame.integrity` fields.
+> Note: `DigestInfo` is reused in three roles: Message Integrity (`Metadata.integrity`), Frame Integrity (`Frame.integrity`), and Previous Frame chaining (`previous_frame`). The type is the same. The covered bytes differ. The `previous_frame` digest is not FI.
 
-#### Encrypted Content Information ([RFC 5652][rfc5652] - CMS)
+#### Encrypted Content Information ([RFC 5652][rfc5652] CMS)
 
 From RFC 5652 Section 6.1:
 
@@ -393,9 +406,9 @@ EncryptedContentInfo ::= SEQUENCE {
 }
 ```
 
-> Used in `Metadata.confidentiality` field for message-level encryption.
+> Note: Used in `Metadata.confidentiality` for body encryption.
 
-#### Signer Information ([RFC 5652][rfc5652] - CMS)
+#### Signer Information ([RFC 5652][rfc5652] CMS)
 
 From RFC 5652 Section 5.3:
 
@@ -411,9 +424,9 @@ SignerInfo ::= SEQUENCE {
 }
 ```
 
-> Used in `Frame.nonrepudiation` field for digital signatures.
+> Note: Used in `Frame.nonrepudiation` for Nonrepudiation signatures.
 
-#### Compressed Data ([RFC 3274][rfc3274] - CMS)
+#### Compressed Data ([RFC 3274][rfc3274] CMS)
 
 From RFC 3274 Section 2:
 
@@ -425,7 +438,7 @@ CompressedData ::= SEQUENCE {
 }
 ```
 
-> Used in `Metadata.compactness` field for message compression.
+> Note: Used in `Metadata.compactness` for compression. Compression rules are in [§5.7.2](#572-compression-requirements).
 
 #### Matrix (tightbeam-specific)
 
@@ -436,9 +449,11 @@ Matrix ::= SEQUENCE {
 }
 ```
 
-> Used in `Metadata.matrix` field for NxN matrix control flags. See [§5.8 What is the Matrix?](#58-what-is-the-matrix) for more details.
+> Note: Used in `Metadata.matrix`. Full Matrix rules are in [§5.8 What is the Matrix?](#58-what-is-the-matrix).
 
 ### 5.3 Message Structure
+
+These ASN.1 shapes match the Rust types in [§4.3](#43-metadata-specification) and [§4.4](#44-frame-encapsulation).
 
 #### Metadata Structure
 
@@ -450,13 +465,13 @@ Metadata ::= SEQUENCE {
 	compactness      CompressedData OPTIONAL,
 
 	-- V1+ fields (context-specific tags)
-	integrity        [0] DigestInfo OPTIONAL,
+	integrity        [0] DigestInfo OPTIONAL,           -- Message Integrity (MI)
 	confidentiality  [1] EncryptedContentInfo OPTIONAL,
 
 	-- V2+ fields (context-specific tags)
 	priority         [2] MessagePriority OPTIONAL,
 	lifetime         [3] INTEGER OPTIONAL,
-	previous_frame   [4] DigestInfo OPTIONAL,
+	previous_frame   [4] DigestInfo OPTIONAL,           -- prior Frame digest; not FI
 
 	-- V3+ fields (context-specific tags)
 	matrix           [5] Matrix OPTIONAL
@@ -470,16 +485,16 @@ Frame ::= SEQUENCE {
 	version         Version,
 	metadata        Metadata,
 	message         OCTET STRING,
-	integrity       [0] DigestInfo OPTIONAL,
+	integrity       [0] DigestInfo OPTIONAL,            -- Frame Integrity (FI)
 	nonrepudiation  [1] SignerInfo OPTIONAL
 }
 ```
 
 ### 5.4 External Dependencies
 
-The protocol relies on standard ASN.1 structures from established RFCs.
+The protocol imports standard algorithm and identifier types from CMS and related RFCs.
 
-#### Algorithm Identifier ([RFC 5652][rfc5652] - CMS)
+#### Algorithm Identifier ([RFC 5652][rfc5652] CMS)
 
 From RFC 5652 Section 10.1.2:
 
@@ -490,9 +505,9 @@ AlgorithmIdentifier ::= SEQUENCE {
 }
 ```
 
-> Implemented via the [spki](https://crates.io/crates/spki) crate.
+> Note: The Rust implementation uses the [spki](https://crates.io/crates/spki) crate for this type.
 
-#### Compression Algorithm Identifiers ([RFC 3274][rfc3274] - CMS)
+#### Compression Algorithm Identifiers ([RFC 3274][rfc3274] CMS)
 
 From RFC 3274 Section 2:
 
@@ -503,13 +518,14 @@ CompressionAlgorithmIdentifier ::= AlgorithmIdentifier
 id-alg-zlibCompress OBJECT IDENTIFIER ::= { iso(1) member-body(2)
 	us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) alg(3) 8 }
 
--- tightbeam also supports zstd compression
-id-alg-zstdCompress OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 50274 1 1 }
+-- tightbeam zstd compression (Wahid Group PEN; no S/MIME registry OID yet)
+id-alg-zstdCompress OBJECT IDENTIFIER ::= { iso(1) org(3) dod(6) internet(1)
+	private(4) enterprise(1) wahidGroup(64586) algorithms(2) zstd(1) }
 ```
 
-> Implemented via the [cms](https://crates.io/crates/cms) crate.
+> Note: The numeric form is `1.3.6.1.4.1.64586.2.1`. The Rust implementation uses the [cms](https://crates.io/crates/cms) crate for CMS compression containers.
 
-#### Hash and Signature Algorithms ([RFC 5246][rfc5246] - TLS)
+#### Hash and Signature Algorithms ([RFC 5246][rfc5246] TLS)
 
 From RFC 5246 Section 7.4.1.4.1 (informative):
 
@@ -523,18 +539,18 @@ enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
 	SignatureAlgorithm;
 ```
 
-> Note: tightbeam implementations SHOULD use SHA-256 or stronger hash algorithms and SHOULD NOT use MD5 or SHA-1 for new deployments.
+> Note: Implementations SHOULD use SHA-256 or a stronger hash. Implementations SHOULD NOT use MD5 or SHA-1 for new deployments.
 
 ### 5.5 Encoding Rules
 
-- **Encoding**: Distinguished Encoding Rules (DER) as specified in [ITU-T X.690][itu-x690]
-- **Byte Order**: Network byte order (big-endian) for multi-byte integers
-- **String Encoding**: UTF-8 for textual content, raw bytes for binary data
-- **Optional Fields**: Absent optional fields MUST NOT be encoded (DER requirement)
+- Encoders MUST use DER as specified in [ITU-T X.690][itu-x690].
+- Multi-byte integers use network byte order (big-endian).
+- Textual content uses UTF-8. Binary fields use raw octets.
+- Absent optional fields MUST NOT be encoded.
 
 ### 5.6 Version-Specific Constraints
 
-This section states which Frame and Metadata fields each version MUST, MAY, or MUST NOT carry. Feature intent is summarized in [§4.1 Version Evolution](#41-version-evolution).
+Each protocol version has required, optional, and forbidden Frame and Metadata fields. Feature intent is summarized in [§4.1 Version Evolution](#41-version-evolution).
 
 | Version | Required fields          | Optional fields                                                                              | Forbidden                        |
 | ------- | ------------------------ | -------------------------------------------------------------------------------------------- | -------------------------------- |
@@ -545,11 +561,9 @@ This section states which Frame and Metadata fields each version MUST, MAY, or M
 
 A version that inherits prior requirements MUST satisfy every required field of those prior versions. Absent optional fields MUST NOT be encoded (DER). Encoders MUST NOT emit a field that is forbidden for the Frame version in use. Decoders MUST reject Frames that carry forbidden fields for the declared version.
 
-> Note: `Metadata.integrity` is Message Integrity (MI). `Frame.integrity` is Frame Integrity (FI). Both MAY appear from V1 onward. See [§5.7.3](#573-integrity-semantics-order-of-operations).
-
 ### 5.7 Semantic Constraints
 
-This section states normative rules for ordering, compression, integrity, chaining, and nonrepudiation. The goals are unambiguous validation semantics and clear data-retention choices.
+The following rules cover ordering, compression, integrity, chaining, and Nonrepudiation. They fix validation semantics and data-retention choices.
 
 #### 5.7.1 Message Ordering
 
@@ -847,6 +861,8 @@ The matrix provides a bounded **n x n** octet grid for application state. DER en
 
 ### 5.9 Complete ASN.1 Module
 
+The following module collects the types from this section into one ASN.1 module for reference.
+
 ```asn1
 tightbeam-Protocol-V2 DEFINITIONS EXPLICIT TAGS ::= BEGIN
 
@@ -869,15 +885,14 @@ Version ::= ENUMERATED {
 	v3(3)
 }
 
--- Message priority enumeration
+-- Message priority enumeration (DiffServ; see §5.1)
 MessagePriority ::= ENUMERATED {
-	critical(0),
-	top(1),
-	high(2),
-	normal(3),
-	low(4),
-	bulk(5),
-	heartbeat(6)
+	lowEffort(0),
+	standard(1),
+	highThroughput(2),
+	lowLatency(3),
+	expedited(4),
+	networkControl(5)
 }
 
 -- tightbeam-specific matrix structure
@@ -891,11 +906,11 @@ Metadata ::= SEQUENCE {
 	id               OCTET STRING,
 	order            INTEGER,
 	compactness      CompressedData OPTIONAL,
-	integrity        [0] DigestInfo OPTIONAL,
+	integrity        [0] DigestInfo OPTIONAL,           -- Message Integrity (MI)
 	confidentiality  [1] EncryptedContentInfo OPTIONAL,
 	priority         [2] MessagePriority OPTIONAL,
 	lifetime         [3] INTEGER OPTIONAL,
-	previous_frame   [4] DigestInfo OPTIONAL,
+	previous_frame   [4] DigestInfo OPTIONAL,           -- prior Frame digest; not FI
 	matrix           [5] Matrix OPTIONAL
 }
 
@@ -903,7 +918,7 @@ Frame ::= SEQUENCE {
 	version         Version,
 	metadata        Metadata,
 	message         OCTET STRING,
-	integrity       [0] DigestInfo OPTIONAL,
+	integrity       [0] DigestInfo OPTIONAL,            -- Frame Integrity (FI)
 	nonrepudiation  [1] SignerInfo OPTIONAL
 }
 
@@ -912,7 +927,7 @@ END
 
 ## 6. Security Model
 
-This section describes how tightbeam selects and enforces cryptographic algorithms. A `SecurityProfile` declares algorithm OIDs at compile time. Provider traits supply the operations that realize those algorithms at run time. Message-level requirements are specified in [§6.4](#64-message-level-security-requirements).
+A `SecurityProfile` declares algorithm OIDs at compile time. Provider traits supply the operations that realize those algorithms at run time. Message-level requirements are specified in [§6.4](#64-message-level-security-requirements).
 
 ### 6.1 SecurityProfile Trait Architecture
 
@@ -1180,54 +1195,56 @@ ASN.1 DER encoding supports several security properties of the wire format:
 
 ## 7. Implementation
 
+Minimum implementation requirements follow. Protocol field rules live in [§4](#4-protocol-specification) and [§5](#5-asn1-formal-specification). Security enforcement details live in [§6](#6-security-model). Transport mechanics live in [§8](#8-transport-layer).
+
 ### 7.1 Requirements
 
-Implementations MUST minimally provide:
+An implementation MUST provide at least the following:
 
-- Memory safety AND ownership guarantees (Rust)
-- Abstract Syntax Notation One (ASN.1) DER encoding/decoding
-- Frame and Metadata exactly as specified in ASN.1
-- Message-level security requirement enforcement
-- Frame composition and verification
-- Cryptographic abstraction for confidentiality, integrity and non-repudiation
-- Protocol abstraction for transport layer
+- Memory safety and ownership guarantees (Rust)
+- ASN.1 DER encoding and decoding ([ITU-T X.690][itu-x690])
+- `Frame` and `Metadata` shapes that match the ASN.1 module ([§5.9](#59-complete-asn1-module))
+- Enforcement of message-level security requirements ([§6.4](#64-message-level-security-requirements))
+- Frame composition and verification ([§5.7](#57-semantic-constraints))
+- Cryptographic abstraction for confidentiality, integrity, and Nonrepudiation ([§6.5](#65-cryptoprovider-system))
+- A transport abstraction that can run over more than one byte-moving protocol ([§7.2](#72-transport-layer), [§8](#8-transport-layer))
 
 ### 7.1.1 Message Security Enforcement
 
-Implementations MUST enforce message-level security requirements through:
+Implementations MUST enforce `Message` security requirements at compile time and at run time ([§6.4](#64-message-level-security-requirements)).
 
 #### Compile-Time Validation
 
-- Type system integration to prevent unsafe message composition
-- Trait-based constraints that enforce security requirements at build time
-- Version compatibility checking during message type definition
+- The type system MUST reject unsafe message composition when requirement flags or a typed `SecurityProfile` are active.
+- Trait bounds MUST enforce security requirements at build time.
+- Message type definitions MUST check version compatibility against `MIN_VERSION`.
 
 #### Runtime Validation
 
-- Frame validation against message type requirements during encoding/decoding
-- Graceful error handling for requirement violations
+- Frame encode and decode paths MUST validate the Frame shape against the message type requirements.
+- Requirement violations MUST surface as errors. Implementations MUST NOT panic for ordinary validation failures.
 
 ### 7.2 Transport Layer
 
-tightbeam MUST operate over ANY transport protocol. The TCP transport layer is built-in and provides both synchronous and asynchronous support.
+tightbeam MUST be usable over any transport that can carry opaque byte frames. The crate includes a TCP transport with synchronous and asynchronous APIs. Full transport architecture, policies, handshakes, multiplexing, and pooling are specified in [§8 Transport Layer](#8-transport-layer).
 
 ### 7.3 Cryptographic Key Management
 
-tightbeam accepts standard key formats (X.509 certificates, raw key material, CMS structures) and delegates key lifecycle management ([NIST SP 800-57][nist-800-57]) to applications:
+tightbeam accepts standard key material and delegates key lifecycle management to the application ([NIST SP 800-57][nist-800-57]).
 
-- **Key Formats**: X.509 certificates, raw keys, CMS structures
-- **Handshake Protocols**: CMS-based and ECIES-based handshakes for session establishment
-- **Application Responsibilities**: Key generation, storage, rotation, certificate validation, revocation checking ([RFC 6960][rfc6960])
+- **Accepted formats**: X.509 certificates, raw key material, and CMS structures.
+- **Session establishment**: CMS-based and ECIES-based handshakes ([§8.5](#85-handshake-protocols)).
+- **Application duties**: key generation, storage, rotation, certificate validation, and revocation checking ([RFC 6960][rfc6960]).
 
 #### Trust Stores
 
-The `CertificateTrust` trait provides certificate chain verification and trust anchor management. Trust stores are used for:
+The `CertificateTrust` trait verifies certificate chains and manages trust anchors. Implementations use a trust store to:
 
-- Verifying peer certificates during connection establishment
-- Validating certificate chains (root -> intermediate -> leaf)
-- Looking up signer certificates for frame signature verification
+- Verify peer certificates during connection establishment
+- Validate a chain from trust anchor through intermediates to the leaf
+- Look up signer certificates when verifying Frame Nonrepudiation
 
-**Building a Trust Store:**
+**Building a trust store:**
 
 ```rust
 let cert = Certificate::try_from(CERT_PEM)?;
@@ -1236,7 +1253,7 @@ let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
     .build();
 ```
 
-**Adding Certificate Chains:**
+**Adding a certificate chain:**
 
 ```rust
 let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
@@ -3140,7 +3157,7 @@ How you wish to model your colonies is beyond the scope of this document. Howeve
 
 ## 10. Instrumentation
 
-This section normatively specifies the tightbeam instrumentation subsystem. Instrumentation produces a semantic event sequence consumed by verification logic. Tests MUST NOT assert against instrumentation events procedurally--inspecting or branching on individual events at runtime. Instead, tests MUST declare expectations as a spec, and verification MUST treat the finalized event stream as the authoritative ground truth for a single execution.
+Instrumentation produces a semantic event sequence for verification logic. Tests MUST NOT assert against instrumentation events procedurally by inspecting or branching on individual events at runtime. Tests MUST declare expectations as a spec. Verification MUST treat the finalized event stream as the authoritative ground truth for a single execution.
 
 Feature Gating:
 
@@ -4152,7 +4169,7 @@ Composition properties (`deadlock_free`, `livelock_free`, `deterministic`) are c
 
 #### 12.4.1 Concept
 
-Refinement checking provides multi-seed exploration for trace and failures refinement verification. Formal definitions of traces, failures, and divergences are given in §12.1.1 and §12.5. This section focuses on configuration and verdict structure. Based on the Failures-Divergences Refinement (FDR) methodology from CSP theory. Enabled with `testing-fdr` feature flag.
+Refinement checking provides multi-seed exploration for trace and failures refinement verification. Formal definitions of traces, failures, and divergences are in §12.1.1 and §12.5. Configuration and verdict structure follow. The method is Failures-Divergences Refinement (FDR) from CSP theory. Enable it with the `testing-fdr` feature flag.
 
 **Verification Properties**:
 
@@ -5076,7 +5093,7 @@ The following table summarizes capabilities available across the testing layers:
 
 ### 12.10 Standards Compliance Mapping
 
-This section maps tightbeam's verification capabilities to common high-assurance standards and regulations. The framework provides native support for many certification requirements, though final certification evidence and process compliance remain the responsibility of the integrator.
+The following mapping relates tightbeam verification features to common high-assurance standards and regulations. The framework supports many certification requirements. Final certification evidence and process compliance remain the integrator's responsibility.
 
 #### 12.10.1 DO-178C DAL A / ISO 26262 ASIL-D
 
@@ -5229,7 +5246,7 @@ The following table summarizes tightbeam's native support for high-assurance sta
 
 ## 13. End-to-End Examples
 
-This section contains complete, runnable examples demonstrating usage patterns.
+The following examples are complete and runnable.
 
 ### 13.1 Complete Client-Server Application
 
