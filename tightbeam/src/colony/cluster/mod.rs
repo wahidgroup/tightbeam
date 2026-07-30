@@ -33,7 +33,7 @@ pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use servlet_registry::{PeerCaps, PeerRouteInfo, PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
 
 #[cfg(feature = "x509")]
-pub use gossip::{Admission, AdmittedGossip, GossipDigest, GossipJournal, MemoryGossipJournal};
+pub use gossip::{Admission, AdmittedGossip, GossipConf, GossipDigest, GossipJournal, MemoryGossipJournal};
 
 use core::future::Future;
 use core::time::Duration;
@@ -234,6 +234,9 @@ pub struct ClusterConf {
 	/// When `Some`, inbound peer ads may only claim dial addresses in this
 	/// list (exact string match). `None` accepts any parseable socket.
 	pub peer_dial_allowlist: Option<Vec<String>>,
+	/// Gossip subsystem configuration (freshness/ttl/retention + journal)
+	#[cfg(feature = "x509")]
+	pub gossip: GossipConf,
 	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
@@ -261,6 +264,7 @@ impl core::fmt::Debug for ClusterConf {
 			.field("peers", &self.peers)
 			.field("advertise_interval", &self.advertise_interval)
 			.field("peer_dial_allowlist", &self.peer_dial_allowlist)
+			.field("gossip", &self.gossip)
 			.field("tls", &self.tls)
 			.finish()
 	}

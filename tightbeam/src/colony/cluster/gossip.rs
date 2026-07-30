@@ -11,8 +11,9 @@
 //! in-memory default whose per-signer partitioning stops one signer from
 //! evicting rumors recorded for others.
 
+use core::time::Duration;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use digest::consts::U32;
 use digest::OutputSizeUser;
@@ -20,7 +21,8 @@ use digest::OutputSizeUser;
 use super::ClusterError;
 use crate::colony::common::{canonical_bytes, is_bare_servlet_type, ColonyNamespace, GossipEnvelope};
 use crate::constants::{
-	DEFAULT_GOSSIP_RETENTION_MS, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL,
+	DEFAULT_GOSSIP_RETENTION_MS, DEFAULT_GOSSIP_SEEN_TTL_MS, DEFAULT_GOSSIP_TTL, MAX_GOSSIP_LOG,
+	MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL,
 };
 use crate::crypto::hash::Digest;
 use crate::policy::TransitStatus;
@@ -212,6 +214,39 @@ impl MemoryGossipJournal {
 impl Default for MemoryGossipJournal {
 	fn default() -> Self {
 		Self::new(DEFAULT_GOSSIP_RETENTION_MS)
+	}
+}
+
+/// Gossip subsystem configuration: freshness window, origin time-to-live,
+/// and the pluggable [`GossipJournal`].
+pub struct GossipConf {
+	/// Freshness window a relayed rumor's `issued_at_ms` must fall within.
+	pub seen_ttl: Duration,
+	/// Time-to-live an origin publish starts a rumor with, clamped to
+	/// [`MAX_GOSSIP_TTL`]. Bounds the hop radius of one flood.
+	pub ttl: u8,
+	/// Dedup and retention store backing gossip delivery and anti-entropy.
+	/// The journal owns its own retention window.
+	pub journal: Arc<dyn GossipJournal>,
+}
+
+impl Default for GossipConf {
+	fn default() -> Self {
+		Self {
+			seen_ttl: Duration::from_millis(DEFAULT_GOSSIP_SEEN_TTL_MS),
+			ttl: DEFAULT_GOSSIP_TTL,
+			journal: Arc::new(MemoryGossipJournal::default()),
+		}
+	}
+}
+
+impl core::fmt::Debug for GossipConf {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("GossipConf")
+			.field("seen_ttl", &self.seen_ttl)
+			.field("ttl", &self.ttl)
+			.field("journal", &"<dyn GossipJournal>")
+			.finish()
 	}
 }
 
