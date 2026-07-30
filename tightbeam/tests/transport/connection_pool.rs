@@ -176,6 +176,24 @@ tb_assert_spec! {
 			(events::POOL_EXHAUSTED, exactly!(0)),
 			(MESSAGE_COUNT, exactly!(1), equals!(3u64))
 		]
+	},
+	// 1.1.0: the round-trip outcome joins the contract: every response
+	// event must carry proof that the pooled emit returned a reply, so
+	// the spec verifies delivery instead of an inline assert.
+	V(1,1,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(POOL_CREATE, exactly!(1)),
+			(ACQUIRE_CLIENT, exactly!(3)),
+			(SEND_MESSAGE, exactly!(3)),
+			(RECEIVE_RESPONSE, exactly!(3), equals!(1u64)),
+			(events::POOL_RELEASED, exactly!(3)),
+			(events::POOL_DIAL, exactly!(1)),
+			(events::POOL_REUSE_READY, exactly!(2)),
+			(events::POOL_EXHAUSTED, exactly!(0)),
+			(MESSAGE_COUNT, exactly!(1), equals!(3u64))
+		]
 	}
 }
 
@@ -189,6 +207,25 @@ tb_assert_spec! {
 			(ACQUIRE_CLIENT, exactly!(3)),
 			(SEND_MESSAGE, exactly!(3)),
 			(RECEIVE_RESPONSE, exactly!(3)),
+			(events::POOL_RELEASED, exactly!(3)),
+			(events::POOL_DIAL, exactly!(2)),
+			(events::POOL_REUSE_READY, exactly!(1)),
+			(events::POOL_EXHAUSTED, exactly!(0)),
+			(SERVLET1_COUNT, exactly!(1), equals!(2u64)),
+			(SERVLET2_COUNT, exactly!(1), equals!(1u64))
+		]
+	},
+	// 1.1.0: the round-trip outcome joins the contract: every response
+	// event must carry proof that the pooled emit returned a reply, so
+	// the spec verifies delivery instead of an inline assert.
+	V(1,1,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(POOL_CREATE, exactly!(1)),
+			(ACQUIRE_CLIENT, exactly!(3)),
+			(SEND_MESSAGE, exactly!(3)),
+			(RECEIVE_RESPONSE, exactly!(3), equals!(1u64)),
 			(events::POOL_RELEASED, exactly!(3)),
 			(events::POOL_DIAL, exactly!(2)),
 			(events::POOL_REUSE_READY, exactly!(1)),
@@ -306,8 +343,7 @@ tb_scenario! {
 
 				let msg = create_v0_tightbeam(Some(&format!("test{i}")), None);
 				let reply = client.conn()?.emit(msg, None).await?;
-				assert!(reply.is_some(), "pooled emit must round-trip");
-				trace.event(RECEIVE_RESPONSE)?;
+				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;
 			}
 
 			trace.event_with(MESSAGE_COUNT, &[], message_count.load(Ordering::SeqCst) as u64)?;
@@ -374,6 +410,60 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 	Ok(())
 }
 
+// Single-flight envelope bound.
+// Content near the default encrypted ceiling (256 KiB) round-trips.
+// Content past it is refused locally with typed `SizeExceeded` (CWE-400).
+// The refusal must not be a connection reset from the server's fail-before-read path.
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-policy",
+	feature = "secp256k1",
+	feature = "signature",
+	feature = "sha3",
+	feature = "aead"
+))]
+#[tokio::test]
+async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::error::Error>> {
+	use tightbeam::transport::error::{TransportError, TransportFailure};
+
+	let count = Arc::new(AtomicUsize::new(0));
+	let servlet = start_pool_echo_servlet(Arc::clone(&count)).await?;
+	let addr = servlet.addr();
+
+	let pool = Arc::new(
+		ConnectionPool::<TokioListener>::builder()
+			.with_trust_store(make_server_trust_store()?)
+			.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+			.with_timeout(Duration::from_millis(3000))
+			.build(),
+	);
+
+	let under_cap = "x".repeat(260_000);
+	let msg = create_v0_tightbeam(Some(&under_cap), None);
+	let mut client = pool.connect(addr).await?;
+	let reply = client.conn()?.emit(msg, None).await;
+	assert!(
+		matches!(reply, Ok(Some(_))),
+		"content under the encrypted envelope ceiling must round-trip"
+	);
+
+	drop(client);
+
+	// The builder refuses with `MessageNotSent(frame, SizeExceeded)`.
+	// The retry layer strips the frame once the restart policy declines.
+	// The public emit surface therefore reports `OperationFailed(SizeExceeded)`.
+	let over_cap = "x".repeat(263_000);
+	let msg = create_v0_tightbeam(Some(&over_cap), None);
+	let mut client = pool.connect(addr).await?;
+	let refusal = client.conn()?.emit(msg, None).await;
+	assert!(
+		matches!(refusal, Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))),
+		"content past the encrypted envelope ceiling must fail locally with a typed SizeExceeded, got {refusal:?}"
+	);
+
+	Ok(())
+}
+
 // ============================================================================
 // Scenario: Pool Per-Destination Isolation
 // ============================================================================
@@ -416,8 +506,8 @@ tb_scenario! {
 				trace.event(SEND_MESSAGE)?;
 
 				let reply = client.conn()?.emit(create_v0_tightbeam(Some(name), None), None).await?;
-				assert!(reply.is_some(), "pooled emit must round-trip");
-				trace.event(RECEIVE_RESPONSE)?;
+
+				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;
 			}
 
 			trace.event_with(SERVLET1_COUNT, &[], count1.load(Ordering::SeqCst) as u64)?;
@@ -470,9 +560,8 @@ tb_scenario! {
 					.conn()?
 					.emit(create_v0_tightbeam(Some("concurrent-test"), None), None)
 					.await?;
-				assert!(reply.is_some(), "pooled emit must round-trip");
 
-				trace.event(RECEIVE_RESPONSE)?;
+				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;
 			}
 
 			trace.event_with(MESSAGE_COUNT, &[], message_count.load(Ordering::SeqCst) as u64)?;

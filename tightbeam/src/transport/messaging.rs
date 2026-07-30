@@ -565,14 +565,14 @@ where
 		WireEnvelope::Cleartext(_) => {
 			if let Some(max) = transport.to_max_cleartext_envelope() {
 				if wire_bytes.len() > max {
-					return Err(TransportError::InvalidMessage);
+					return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 				}
 			}
 		}
 		WireEnvelope::Encrypted(_) => {
 			if let Some(max) = transport.to_max_encrypted_envelope() {
 				if wire_bytes.len() > max {
-					return Err(TransportError::InvalidMessage);
+					return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 				}
 			}
 		}

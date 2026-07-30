@@ -17,6 +17,9 @@ pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 #[cfg(feature = "x509")]
 pub use crate::x509::ext::pkix::{HashAlgorithm, SignatureAlgorithm};
 
+use crate::der::TagNumber;
+use crate::wire::wire_sequence;
+
 /// Protocol version determines metadata structure and features
 ///
 /// ASN.1 Definition:
@@ -122,38 +125,43 @@ pub struct Asn1Matrix {
 ///     matrix           [5] Matrix OPTIONAL
 /// }
 /// ```
-#[derive(der::Sequence, Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Metadata {
 	// Core fields (V0+)
 	pub id: Vec<u8>,
 	pub order: u64,
-	#[asn1(optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub compactness: Option<CompressedData>,
 
 	// V1+ fields
-	#[asn1(context_specific = "0", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub integrity: Option<DigestInfo>,
-	#[asn1(context_specific = "1", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub confidentiality: Option<EncryptedContentInfo>,
 
 	// V2+ fields
-	#[asn1(context_specific = "2", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub priority: Option<MessagePriority>,
-	#[asn1(context_specific = "3", optional = "true")]
 	pub lifetime: Option<u64>,
-	#[asn1(context_specific = "4", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub previous_frame: Option<DigestInfo>,
 
 	// V3+ fields
-	#[asn1(context_specific = "5", optional = "true")]
 	pub matrix: Option<Asn1Matrix>,
 }
+
+wire_sequence!(Metadata {
+	id: octets,
+	order: plain,
+	compactness: plain,
+	integrity: ctx(TagNumber::N0),
+	confidentiality: ctx(TagNumber::N1),
+	priority: ctx(TagNumber::N2),
+	lifetime: ctx(TagNumber::N3),
+	previous_frame: ctx(TagNumber::N4),
+	matrix: ctx(TagNumber::N5),
+});
 
 /// Core TightBeam message structure
 /// The version field explicitly determines which metadata variant to use
@@ -169,17 +177,23 @@ pub struct Metadata {
 ///     nonrepudiation [1] SignerInfo OPTIONAL
 /// }
 /// ```
-#[derive(der::Sequence, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Frame {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub version: Version,
 	pub metadata: Metadata,
 	pub message: Vec<u8>,
-	#[asn1(context_specific = "0", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub integrity: Option<DigestInfo>,
-	#[asn1(context_specific = "1", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub nonrepudiation: Option<SignerInfo>,
 }
+
+wire_sequence!(Frame {
+	version: plain,
+	metadata: plain,
+	message: octets,
+	integrity: ctx(TagNumber::N0),
+	nonrepudiation: ctx(TagNumber::N1),
+});

@@ -1,6 +1,6 @@
 use crate::asn1::{Frame, Version};
 #[cfg(feature = "signature")]
-use crate::der::asn1::ContextSpecificRef;
+use crate::der::asn1::{ContextSpecificRef, OctetStringRef};
 #[cfg(any(feature = "digest", feature = "signature"))]
 use crate::der::{Encode, EncodeValue, FixedTag, Length, Tag, Writer};
 #[cfg(feature = "signature")]
@@ -42,10 +42,12 @@ impl EncodeValue for FrameIntegrityScaffold<'_> {
 }
 
 /// To-be-signed view of a [`Frame`]: the first four fields, with
-/// `nonrepudiation` excluded by construction. Borrows the frame and reuses
-/// each field's derived encoder so the TBS bytes cannot drift from the DER
-/// encoding `#[derive(der::Sequence)]` produces for [`Frame`] -- the same
-/// envelope-drift defense as [`FrameIntegrityScaffold`].
+/// `nonrepudiation` excluded by construction.
+///
+/// Borrows the frame and reuses each field's encoder.
+/// TBS bytes cannot drift from the DER encoding `wire_sequence!` produces for [`Frame`].
+/// This is the same envelope-drift defense as [`FrameIntegrityScaffold`].
+/// The message field MUST encode as an `OCTET STRING` to match the frame's wire form.
 #[cfg(feature = "signature")]
 pub(crate) struct TbsScaffold<'a> {
 	pub(crate) version: &'a Version,
@@ -71,7 +73,7 @@ impl FixedTag for TbsScaffold<'_> {
 impl EncodeValue for TbsScaffold<'_> {
 	fn value_len(&self) -> crate::der::Result<Length> {
 		let mut len = (self.version.encoded_len()? + self.metadata.encoded_len()?)?;
-		len = (len + self.message.encoded_len()?)?;
+		len = (len + OctetStringRef::new(self.message)?.encoded_len()?)?;
 
 		if let Some(integrity) = self.integrity {
 			len = (len + Self::tagged_integrity(integrity).encoded_len()?)?;
@@ -83,7 +85,7 @@ impl EncodeValue for TbsScaffold<'_> {
 	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
 		self.version.encode(encoder)?;
 		self.metadata.encode(encoder)?;
-		self.message.encode(encoder)?;
+		OctetStringRef::new(self.message)?.encode(encoder)?;
 
 		if let Some(integrity) = self.integrity {
 			Self::tagged_integrity(integrity).encode(encoder)?;

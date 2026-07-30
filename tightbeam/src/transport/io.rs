@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::asn1::Frame;
+use crate::constants::DEFAULT_MAX_ENCRYPTED_ENVELOPE;
 use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
@@ -454,12 +455,18 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Wrap and encrypt a message, returning WireEnvelope
 	/// Protocol-agnostic default implementation
+	///
+	/// Defaults the encrypted ceiling to [`DEFAULT_MAX_ENCRYPTED_ENVELOPE`]
+	/// when the endpoint carries no explicit limit.
+	/// An oversized request then fails locally with typed `SizeExceeded`.
+	/// That returns the frame instead of a peer connection reset.
 	#[allow(async_fn_in_trait)]
 	async fn wrap_and_encrypt_message(&mut self, message: Frame) -> TransportResult<WireEnvelope>
 	where
 		Self: EncryptedProtocolState,
 	{
-		let limits = EnvelopeLimits::from_pair(self.to_max_cleartext_envelope(), self.to_max_encrypted_envelope());
+		let max_encrypted = self.to_max_encrypted_envelope().unwrap_or(DEFAULT_MAX_ENCRYPTED_ENVELOPE);
+		let limits = EnvelopeLimits::from_pair(self.to_max_cleartext_envelope(), Some(max_encrypted));
 		let mut builder = limits.apply(EnvelopeBuilder::request(message));
 
 		if self.to_handshake_state() == TcpHandshakeState::Complete {

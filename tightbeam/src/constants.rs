@@ -295,6 +295,24 @@ pub const DEFAULT_MUX_STREAM_CREDIT: u64 = 64;
 /// backstop either way.
 pub const MAX_MUX_SESSION_BUDGET: u64 = DEFAULT_REKEY_RECORD_LIMIT / 2;
 
+/// Default ceiling in bytes for a cleartext envelope on the wire (128 KiB)
+///
+/// Applied by [`TransportEncryptionConfig`] when no explicit limit is configured.
+/// Cleartext envelopes exist only during handshake and unencrypted deployments.
+/// The bound is therefore half the encrypted ceiling.
+///
+/// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
+pub const DEFAULT_MAX_CLEARTEXT_ENVELOPE: usize = 128 * 1024;
+
+/// Default ceiling in bytes for an encrypted envelope on the wire (256 KiB)
+///
+/// A server refuses a frame whose declared content length exceeds this ceiling.
+/// It refuses before reading the content so allocation cannot be forced (CWE-400).
+/// The refusal closes the connection. The sender sees a reset, not a typed error.
+/// Clients therefore preflight outgoing encrypted envelopes against this ceiling.
+/// When no explicit limit is set, the client fails locally with typed `SizeExceeded`.
+pub const DEFAULT_MAX_ENCRYPTED_ENVELOPE: usize = 256 * 1024;
+
 /// Default ceiling for decompressed message bodies (16 MiB)
 ///
 /// Compressed frame bodies arrive under the transport's envelope ceiling,

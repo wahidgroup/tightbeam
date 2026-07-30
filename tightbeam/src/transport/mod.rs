@@ -95,7 +95,7 @@ mod x509 {
 #[cfg(feature = "x509")]
 use x509::*;
 
-use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
+use crate::constants::{DEFAULT_MAX_CLEARTEXT_ENVELOPE, DEFAULT_MAX_ENCRYPTED_ENVELOPE, TIGHTBEAM_AAD_DOMAIN_TAG};
 use crate::transport::handshake::HandshakeKeyManager;
 
 #[cfg(feature = "x509")]
@@ -126,8 +126,8 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 			key_manager,
 			client_validators: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
-			max_cleartext_envelope: 128 * 1024,
-			max_encrypted_envelope: 256 * 1024,
+			max_cleartext_envelope: DEFAULT_MAX_CLEARTEXT_ENVELOPE,
+			max_encrypted_envelope: DEFAULT_MAX_ENCRYPTED_ENVELOPE,
 			handshake_timeout: Duration::from_secs(10),
 		}
 	}

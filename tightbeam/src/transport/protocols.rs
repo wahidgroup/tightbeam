@@ -16,7 +16,7 @@ use std::sync::Arc;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use core::mem;
 
-use crate::transport::error::TransportError;
+use crate::transport::error::{TransportError, TransportFailure};
 
 #[cfg(all(feature = "x509", feature = "instrument"))]
 use crate::trace::TraceCollector;
@@ -303,7 +303,9 @@ where
 
 	if let Some(max) = max_len {
 		if content_length > max {
-			return Err(TransportError::InvalidMessage);
+			// Refuse before allocating or reading the content (CWE-400).
+			// The typed failure distinguishes an oversized frame from a malformed one.
+			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 		}
 	}
 
@@ -330,7 +332,7 @@ pub(crate) fn enforce_frame_cap(buffer: &[u8], max_len: Option<usize>) -> Transp
 	};
 
 	if buffer.len() > max.saturating_add(DER_HEADER_MAX) {
-		return Err(TransportError::InvalidMessage);
+		return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 	}
 
 	Ok(())
@@ -451,7 +453,10 @@ mod tests {
 		let mut stream = ScriptedBytes::new(&[0x30, 0x82, 0x01, 0x00]);
 
 		let result = AsyncProtocolStream::read_frame(&mut stream, Some(64)).await;
-		assert!(matches!(result, Err(TransportError::InvalidMessage)));
+		assert!(matches!(
+			result,
+			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
+		));
 		// Only the header was consumed: the cap fired before any content
 		// allocation or read.
 		assert_eq!(stream.pos, 4);
@@ -490,7 +495,7 @@ mod tests {
 
 		assert!(matches!(
 			enforce_frame_cap(&oversized, Some(64)),
-			Err(TransportError::InvalidMessage)
+			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
 		));
 		assert!(enforce_frame_cap(&oversized, None).is_ok());
 		assert!(enforce_frame_cap(&[0u8; 8], Some(64)).is_ok());
