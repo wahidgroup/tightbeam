@@ -4211,8 +4211,8 @@ tb_assert_spec! {
 		assertions: [
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
-			(GOSSIP_RELAY_STATUS, exactly!(2), equals!(TransitStatus::PermissionDenied)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(2)),
+			(GOSSIP_RELAY_STATUS, exactly!(3), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(3)),
 			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
 			(GOSSIP_ROUTES_AFTER_SCORING, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
@@ -4220,12 +4220,14 @@ tb_assert_spec! {
 	}
 }
 
-// Colony-membership refusal is policy, not misbehavior. A trusted peer
-// from a different colony federates work routes (the advertisement
-// installs), yet its relay of a foreign-origin rumor is refused
-// PermissionDenied, and so is a relay from a trusted peer with no colony
-// SAN. Neither refusal weakens the advertised route: the abandonment
-// limit is 1, so a single weaken would evict it, and the route survives.
+// Colony equality on the relay peer is policy, not misbehavior. A trusted
+// peer from a different colony federates work routes (the advertisement
+// installs), yet every gossip relay it drives is refused
+// PermissionDenied: a same-colony origin rumor forwarded by that peer,
+// a foreign-origin rumor, and a relay from a trusted peer with no colony
+// SAN. None of those refusals weaken the advertised route: the
+// abandonment limit is 1, so a single weaken would evict it, and the
+// route survives.
 tb_scenario! {
 	name: cluster_gossip_refuses_foreign_colony_without_weakening,
 	spec: ClusterGossipForeignColonySpec,
@@ -4246,6 +4248,19 @@ tb_scenario! {
 				vec![servlet_urn("ping")],
 			)
 			.await?;
+
+			// Same-colony origin, foreign-colony relay: the peer check
+			// alone must refuse. Without colony equality on the outer
+			// frame, this path would admit, journal, deliver, and reflood.
+			let same_colony = mint_origin_rumor(
+				&ctx.gateway.key,
+				b"same-colony-inner",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+			)
+			.await?;
+			let frame =
+				signed_relay_gossip(&ctx.foreign_key, b"foreign-relay-same", same_colony, 0).await?;
+			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
 
 			let foreign = mint_origin_rumor(
 				&ctx.foreign_key,

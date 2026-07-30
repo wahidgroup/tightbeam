@@ -944,21 +944,23 @@ macro_rules! cluster {
 				return $crate::cluster!(@refuse_gossip $frame, $trace, origin_status);
 			}
 
-			// Gossip is a colony operation: this gateway and the relaying
-			// peer must both carry a valid colony URN SAN. A membership
-			// refusal is policy, not relay misbehavior, so no trail is
-			// weakened.
+			// Gossip flood is colony-scoped (CWE-668): this gateway and
+			// the relaying peer must prove the SAME colony URN. A peer
+			// from another federated colony may advertise work routes,
+			// but MUST NOT drive admission, journaling, delivery, or
+			// reflood of a same-colony origin rumor. Matches the
+			// ReconcileGossip equality gate. A mismatch is policy, not
+			// relay misbehavior, so no trail is weakened.
 			let ::core::option::Option::Some(local_colony) = $config.colony_urn() else {
 				return $crate::cluster!(@refuse_gossip $frame, $trace,
 					$crate::policy::TransitStatus::PermissionDenied);
 			};
-			if $crate::colony::cluster::frame_colony_urn(
+			let peer_colony = $crate::colony::cluster::frame_colony_urn(
 				&$config.namespace,
 				$config.tls.peer_trust.as_deref(),
 				&$frame,
-			)
-			.is_none()
-			{
+			);
+			if peer_colony.as_ref() != ::core::option::Option::Some(local_colony) {
 				return $crate::cluster!(@refuse_gossip $frame, $trace,
 					$crate::policy::TransitStatus::PermissionDenied);
 			}
