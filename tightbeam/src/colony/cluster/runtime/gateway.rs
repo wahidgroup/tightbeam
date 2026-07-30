@@ -2,7 +2,7 @@ use core::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::colony::cluster::outbound::build_cluster_pools;
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayReplayGuard};
+use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::dispatch::handle_gateway_request;
 use crate::colony::cluster::runtime::gossip_tasks::{build_advertise_task, peer_dial_pool};
 use crate::colony::cluster::runtime::heartbeat::{send_heartbeat_async, spawn_evaporation_loop, spawn_heartbeat_loop};
@@ -159,13 +159,15 @@ where
 
 		let server_handle = spawn_gateway_server::<P, D>(
 			listener,
-			Arc::clone(&registry),
-			Arc::clone(&servlet_registry),
-			Arc::clone(&config),
-			Arc::clone(&pool),
-			peer_pool.as_ref().map(Arc::clone),
-			Arc::clone(&trace),
-			replay_guard_for_server,
+			GatewayRuntimeCtx {
+				registry: Arc::clone(&registry),
+				servlet_registry: Arc::clone(&servlet_registry),
+				config: Arc::clone(&config),
+				pool: Arc::clone(&pool),
+				peer_pool: peer_pool.as_ref().map(Arc::clone),
+				trace: Arc::clone(&trace),
+				replay_guard: replay_guard_for_server,
+			},
 		);
 
 		let heartbeat_handle = spawn_heartbeat_loop::<P, D>(
@@ -312,16 +314,7 @@ where
 }
 
 /// Spawn the gateway accept loop that dispatches [`handle_gateway_request`].
-pub fn spawn_gateway_server<P, D>(
-	listener: P::Listener,
-	registry: Arc<HiveRegistry>,
-	servlet_registry: Arc<ServletRegistry>,
-	config: Arc<ClusterConfig>,
-	pool: Arc<ClusterPool<P>>,
-	peer_pool: Option<Arc<ClusterPool<P>>>,
-	trace: Arc<TraceCollector>,
-	replay_guard: GatewayReplayGuard,
-) -> rt::JoinHandle
+pub(crate) fn spawn_gateway_server<P, D>(listener: P::Listener, ctx: GatewayRuntimeCtx<P>) -> rt::JoinHandle
 where
 	P: Protocol
 		+ PersistentConnection
@@ -343,29 +336,10 @@ where
 		+ 'static,
 	D: ClusterDigest,
 {
-	let mux_offer = config.pool_config.mux_offer.to_owned();
+	let mux_offer = ctx.config.pool_config.mux_offer.to_owned();
 	let handler = into_shared_session_handler(move |frame: Frame, session| {
-		let registry = Arc::clone(&registry);
-		let servlet_registry = Arc::clone(&servlet_registry);
-		let config = Arc::clone(&config);
-		let pool = Arc::clone(&pool);
-		let peer_pool = peer_pool.as_ref().map(Arc::clone);
-		let trace = Arc::clone(&trace);
-		let replay_guard = replay_guard.clone();
-		async move {
-			handle_gateway_request::<P, D>(
-				frame,
-				session,
-				registry,
-				servlet_registry,
-				config,
-				pool,
-				peer_pool,
-				trace,
-				replay_guard,
-			)
-			.await
-		}
+		let ctx = ctx.clone();
+		async move { handle_gateway_request::<P, D>(frame, session, ctx).await }
 	});
 
 	rt::spawn(async move {

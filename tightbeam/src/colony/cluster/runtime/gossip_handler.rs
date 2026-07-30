@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use crate::colony::cluster::peer::AdmittedPeerAd;
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayReplayGuard};
-use crate::colony::cluster::runtime::gossip_tasks::{gossip_pipeline, weaken_invalid_relay, GossipOrigin};
+use crate::colony::cluster::runtime::gossip_tasks::{
+	gossip_pipeline, weaken_invalid_relay, GossipOrigin, GossipPipelineCtx,
+};
 use crate::colony::cluster::runtime::refuse::{
 	refuse_gossip, refuse_peer_ad, refuse_peer_ad_release, refuse_reconcile,
 };
@@ -30,9 +32,9 @@ use crate::TightBeamError;
 use crate::Version;
 
 #[cfg(feature = "x509")]
-use crate::builder::TypeBuilder;
-#[cfg(feature = "x509")]
 use crate::builder::frame::FrameBuilder;
+#[cfg(feature = "x509")]
+use crate::builder::TypeBuilder;
 #[cfg(feature = "x509")]
 use crate::colony::cluster::{frame_colony_urn, gossip_want};
 
@@ -157,11 +159,7 @@ where
 	gossip_pipeline::<P, D>(
 		GossipOrigin::Relay,
 		frame,
-		servlet_registry,
-		config,
-		pool,
-		peer_pool,
-		trace,
+		GossipPipelineCtx { servlet_registry, config, pool, peer_pool, trace },
 		rumor,
 		hop_ttl,
 	)
@@ -235,11 +233,7 @@ where
 	gossip_pipeline::<P, D>(
 		GossipOrigin::Origin,
 		frame,
-		servlet_registry,
-		config,
-		pool,
-		peer_pool,
-		trace,
+		GossipPipelineCtx { servlet_registry, config, pool, peer_pool, trace },
 		rumor,
 		hop_ttl,
 	)

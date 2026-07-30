@@ -203,7 +203,7 @@ where
 			Some(peer_pool) => match crate::encode(&crate::colony::common::ClusterRequest::Work(
 				crate::colony::common::ClusterWorkRequest::new(servlet_type, payload).into_forwarded(),
 			)) {
-				Ok(envelope) => forward_work(&peer_pool, dial_addr, envelope).await,
+				Ok(envelope) => forward_work(peer_pool, dial_addr, envelope).await,
 				Err(error) => Err(crate::colony::cluster::ClusterError::from(error)),
 			},
 			None => Err(crate::colony::cluster::ClusterError::ConnectFailed),
@@ -216,10 +216,10 @@ where
 		Ok(response_payload) => match route_kind {
 			crate::colony::cluster::RouteKind::Local => {
 				work_trail_ok(&servlet_registry, &route_key, &config, &trace);
-				return reply_frame(
+				reply_frame(
 					frame.metadata.id.clone(),
 					crate::colony::cluster::ClusterWorkResponse::ok(response_payload),
-				);
+				)
 			}
 			crate::colony::cluster::RouteKind::Peer => {
 				// Peer gateways reply with ClusterWorkResponse; unwrap
@@ -233,18 +233,16 @@ where
 							work_trail_weaken(&servlet_registry, &route_key, &config, &trace);
 						}
 
-						return reply_frame(frame.metadata.id.clone(), peer_response);
+						reply_frame(frame.metadata.id.clone(), peer_response)
 					}
-					Err(_) => {
-						return work_trail_fail(
-							&servlet_registry,
-							&route_key,
-							&config,
-							&trace,
-							&frame,
-							crate::policy::TransitStatus::Unavailable,
-						);
-					}
+					Err(_) => work_trail_fail(
+						&servlet_registry,
+						&route_key,
+						&config,
+						&trace,
+						&frame,
+						crate::policy::TransitStatus::Unavailable,
+					),
 				}
 			}
 		},
@@ -259,7 +257,7 @@ where
 				}
 				_ => crate::policy::TransitStatus::Unavailable,
 			};
-			return work_trail_fail(&servlet_registry, &route_key, &config, &trace, &frame, status);
+			work_trail_fail(&servlet_registry, &route_key, &config, &trace, &frame, status)
 		}
 	}
 }

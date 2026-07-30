@@ -2531,7 +2531,7 @@ pub enum CalcRequest {
 }
 ```
 
-> Note: It is preferrable to implement a strict separation of concerns between servlets. Each servlet should handle only one message type. Abusing Choice types to group unrelated message types is poor form.
+> Note: It is preferable to implement a strict separation of concerns between servlets. Each servlet should handle only one message type. Abusing Choice types to group unrelated message types is poor form.
 
 ##### Gate Policies
 

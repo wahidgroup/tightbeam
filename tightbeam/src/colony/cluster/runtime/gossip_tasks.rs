@@ -137,10 +137,7 @@ pub(crate) async fn gossip_deliver_local<P>(
 		}
 		Some(ingress) => {
 			let type_key = canonical_bytes(ingress);
-			let entries = match servlet_registry.local_entries_for_type(&type_key) {
-				Ok(entries) => entries,
-				Err(_) => Vec::new(),
-			};
+			let entries = servlet_registry.local_entries_for_type(&type_key).unwrap_or_default();
 
 			let metrics: Vec<InstanceMetrics> = entries
 				.iter()
@@ -389,16 +386,22 @@ where
 	Ok(())
 }
 
+/// Shared state for one gossip pipeline invocation.
+#[cfg(feature = "x509")]
+pub(crate) struct GossipPipelineCtx<P: Protocol> {
+	pub(crate) servlet_registry: Arc<ServletRegistry>,
+	pub(crate) config: Arc<ClusterConfig>,
+	pub(crate) pool: Arc<ClusterPool<P>>,
+	pub(crate) peer_pool: Option<Arc<ClusterPool<P>>>,
+	pub(crate) trace: Arc<TraceCollector>,
+}
+
 /// Admit, rate-limit, journal, deliver locally, and optionally reflood one rumor.
 #[cfg(feature = "x509")]
 pub(crate) async fn gossip_pipeline<P, D>(
 	origin: GossipOrigin,
 	frame: Frame,
-	servlet_registry: Arc<ServletRegistry>,
-	config: Arc<ClusterConfig>,
-	pool: Arc<ClusterPool<P>>,
-	peer_pool: Option<Arc<ClusterPool<P>>>,
-	trace: Arc<TraceCollector>,
+	ctx: GossipPipelineCtx<P>,
 	rumor: Frame,
 	hop_ttl: u64,
 ) -> Result<Option<Frame>, TightBeamError>
@@ -421,6 +424,8 @@ where
 		+ 'static,
 	D: ClusterDigest,
 {
+	let GossipPipelineCtx { servlet_registry, config, pool, peer_pool, trace } = ctx;
+
 	let admitted = match AdmittedGossip::admit::<D>(
 		&rumor,
 		hop_ttl,
@@ -501,7 +506,7 @@ where
 		let config = Arc::clone(&config);
 		let reflood_rumor = rumor.clone();
 		let next_ttl = hop_ttl - 1;
-		let _ = rt::spawn(reflood_gossip::<P, D>(reflood_pool, config, reflood_rumor, next_ttl));
+		drop(rt::spawn(reflood_gossip::<P, D>(reflood_pool, config, reflood_rumor, next_ttl)));
 	}
 
 	reply_frame(frame.metadata.id.clone(), GossipResponse { status: TransitStatus::Ok })

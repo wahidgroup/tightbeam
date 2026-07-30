@@ -286,42 +286,39 @@ where
 	}
 
 	/// Protocol-specific send/receive with handshake and timeout
-	fn perform_send_receive(
+	async fn perform_send_receive(
 		&mut self,
 		message: Frame,
-	) -> impl core::future::Future<Output = TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>>
-	       + crate::utils::marker::MaybeSend {
-		async {
-			self.ensure_handshake_complete().await?;
+	) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)> {
+		self.ensure_handshake_complete().await?;
 
-			#[cfg(feature = "std")]
-			{
-				let timeout_duration = self.operation_timeout;
-				if let Some(duration) = timeout_duration {
-					self.stream.set_timeout(Some(duration))?;
-				}
+		#[cfg(feature = "std")]
+		{
+			let timeout_duration = self.operation_timeout;
+			if let Some(duration) = timeout_duration {
+				self.stream.set_timeout(Some(duration))?;
+			}
 
-				let result = self.perform_emit_cycle(message).await;
+			let result = self.perform_emit_cycle(message).await;
 
-				if timeout_duration.is_some() {
-					let _ = self.stream.set_timeout(None);
-				}
+			if timeout_duration.is_some() {
+				let _ = self.stream.set_timeout(None);
+			}
 
-				result.map_err(|e| {
-					if let TransportError::IoError(io_err) = &e {
-						if io_err.kind() == ErrorKind::TimedOut {
-							return TransportError::OperationFailed(TransportFailure::DeadlineExceeded);
-						}
+			result.map_err(|e| {
+				if let TransportError::IoError(io_err) = &e {
+					if io_err.kind() == ErrorKind::TimedOut {
+						return TransportError::OperationFailed(TransportFailure::DeadlineExceeded);
 					}
+				}
 
-					e
-				})
-			}
+				e
+			})
+		}
 
-			#[cfg(not(feature = "std"))]
-			{
-				self.perform_emit_cycle(message).await
-			}
+		#[cfg(not(feature = "std"))]
+		{
+			self.perform_emit_cycle(message).await
 		}
 	}
 }

@@ -178,7 +178,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 /// Peer-federation dial list, advertise beat, and inbound dial allowlist.
 ///
 /// Trust anchors stay on [`ClusterTlsConfig::peer_trust`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PeerConfig {
 	/// Peer gateway addresses dialed to advertise exported types.
 	/// Dial list, not an identity gate; partial or asymmetric graphs are
@@ -192,12 +192,6 @@ pub struct PeerConfig {
 	/// When `Some`, inbound peer ads may only claim dial addresses in this
 	/// list (exact string match). `None` accepts any parseable socket.
 	pub peer_dial_allowlist: Option<Vec<String>>,
-}
-
-impl Default for PeerConfig {
-	fn default() -> Self {
-		Self { peers: Vec::new(), advertise_interval: None, peer_dial_allowlist: None }
-	}
 }
 
 /// Runtime configuration for a cluster gateway.

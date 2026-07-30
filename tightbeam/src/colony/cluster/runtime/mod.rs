@@ -15,7 +15,6 @@ mod registration;
 mod verify;
 mod work;
 
-pub use gateway::spawn_gateway_server;
 pub use gateway::ClusterGateway;
 pub use gossip_tasks::{build_advertise_task, peer_dial_pool};
 pub use heartbeat::{parse_hive_addr, process_heartbeat_result, send_heartbeat_async};

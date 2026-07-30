@@ -11,7 +11,7 @@ use crate::colony::hive::ReplayGuard;
 
 pub(crate) fn gossip_refused_event(frame: &Frame, trace: &TraceCollector) {
 	if let core::result::Result::Ok(event) = trace.event(crate::instrumentation::events::CLUSTER_GOSSIP_REFUSED) {
-		match crate::colony::cluster::signer_attribution(&frame) {
+		match crate::colony::cluster::signer_attribution(frame) {
 			core::option::Option::Some(signer) => event.with_payload(&signer).emit(),
 			core::option::Option::None => event.emit(),
 		}

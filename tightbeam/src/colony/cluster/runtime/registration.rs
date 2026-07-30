@@ -62,10 +62,7 @@ pub(crate) async fn handle_register(
 		let _ = trace.event(CLUSTER_REGISTER_REFUSED);
 		return reply_frame(
 			frame.metadata.id.clone(),
-			RegisterHiveResponse {
-				status: TransitStatus::PermissionDenied,
-				hive_id: None,
-			},
+			RegisterHiveResponse { status: TransitStatus::PermissionDenied, hive_id: None },
 		);
 	}
 
@@ -77,17 +74,15 @@ pub(crate) async fn handle_register(
 		let _ = trace.event(CLUSTER_REGISTER_REFUSED);
 		return reply_frame(
 			frame.metadata.id.clone(),
-			RegisterHiveResponse {
-				status: TransitStatus::PermissionDenied,
-				hive_id: None,
-			},
+			RegisterHiveResponse { status: TransitStatus::PermissionDenied, hive_id: None },
 		);
 	};
 
 	let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
 
 	// Work routes by type bytes; strip instance tails.
-	let servlet_info: Vec<(Arc<[u8]>, Arc<[u8]>)> = request
+	type ServletTypeAddr = (Arc<[u8]>, Arc<[u8]>);
+	let servlet_info: Vec<ServletTypeAddr> = request
 		.servlet_addresses
 		.iter()
 		.map(|info| {
@@ -132,10 +127,7 @@ pub(crate) async fn handle_register(
 			let hive_count = registry.len().unwrap_or_default() as u64;
 			let _ = trace.event_with(CLUSTER_HIVE_REGISTERED, &[], hive_count);
 
-			RegisterHiveResponse {
-				status: TransitStatus::Ok,
-				hive_id: Some(hive_identity),
-			}
+			RegisterHiveResponse { status: TransitStatus::Ok, hive_id: Some(hive_identity) }
 		}
 		Err(_) => {
 			// Forget replay so a legitimate retry of the same signed frame can proceed.
@@ -145,10 +137,7 @@ pub(crate) async fn handle_register(
 			}
 
 			let _ = trace.event(CLUSTER_REGISTER_REFUSED);
-			RegisterHiveResponse {
-				status: TransitStatus::PermissionDenied,
-				hive_id: None,
-			}
+			RegisterHiveResponse { status: TransitStatus::PermissionDenied, hive_id: None }
 		}
 	};
 
@@ -208,9 +197,7 @@ pub(crate) async fn handle_address_update(
 			let _ = trace.event(CLUSTER_UPDATE_REFUSED);
 			return reply_frame(
 				frame.metadata.id.clone(),
-				ServletAddressUpdateResponse {
-					status: TransitStatus::PermissionDenied,
-				},
+				ServletAddressUpdateResponse { status: TransitStatus::PermissionDenied },
 			);
 		}
 	};
@@ -233,9 +220,7 @@ pub(crate) async fn handle_address_update(
 			let _ = trace.event(CLUSTER_UPDATE_REFUSED);
 			return reply_frame(
 				frame.metadata.id.clone(),
-				ServletAddressUpdateResponse {
-					status: TransitStatus::PermissionDenied,
-				},
+				ServletAddressUpdateResponse { status: TransitStatus::PermissionDenied },
 			);
 		}
 	}
