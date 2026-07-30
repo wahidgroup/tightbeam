@@ -17,7 +17,17 @@ use crate::utils::urn::Urn;
 use crate::Frame;
 
 #[cfg(feature = "x509")]
+use crate::colony::common::ColonyResource;
+#[cfg(feature = "x509")]
 use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
+#[cfg(feature = "x509")]
+use crate::crypto::x509::utils::certificate_extension;
+#[cfg(feature = "x509")]
+use crate::crypto::x509::Certificate;
+#[cfg(feature = "x509")]
+use crate::x509::ext::pkix::name::GeneralName;
+#[cfg(feature = "x509")]
+use crate::x509::ext::pkix::SubjectAltName;
 
 /// Peer advertisement that passed signer resolution and wire checks
 ///
@@ -37,15 +47,21 @@ impl AdmittedPeerAd {
 	/// Admit a wire advertisement, failing closed with the refusal status
 	///
 	/// Runs signer resolution (slates key by cert fingerprint, never the
-	/// claimed `gateway_addr`) and wire checks. Caps and local-route
-	/// conflicts are registry policy, checked under the reconcile gate in
+	/// claimed `gateway_addr`), the colony-membership gate (both this
+	/// gateway's certificate and the signer's must carry a valid colony
+	/// URN SAN), and wire checks. Caps and local-route conflicts are
+	/// registry policy, checked under the reconcile gate in
 	/// [`super::ServletRegistry::reconcile_peer_slate`].
 	pub fn admit(frame: &Frame, ad: &PeerAdvertisement, conf: &ClusterConf) -> Result<Self, TransitStatus> {
 		let dial_addr: SharedId = Arc::from(ad.gateway_addr.as_slice());
 
+		// The signer certificate resolves exactly once; the slate key
+		// (fingerprint) and the membership gate both derive from it.
 		#[cfg(feature = "x509")]
-		let peer_hive_id =
-			peer_signer_hive_id(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
+		let signer_cert = frame_signer_cert(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
+
+		#[cfg(feature = "x509")]
+		let peer_hive_id = cert_fingerprint_id(signer_cert).ok_or(TransitStatus::PermissionDenied)?;
 
 		// Without x509 there is no signer fingerprint to bind: the
 		// claimed address is the only available slate key.
@@ -54,6 +70,20 @@ impl AdmittedPeerAd {
 			let _ = frame;
 			Arc::clone(&dial_addr)
 		};
+
+		// Federation is a colony operation: both this gateway and the
+		// advertising peer must carry a valid colony URN SAN. A cert
+		// without one still serves general transport and work, never
+		// membership. Without x509 there is no certificate to carry
+		// membership, so no gate applies.
+		#[cfg(feature = "x509")]
+		{
+			let local_member = conf.colony_urn().is_some();
+			let peer_member = cert_colony_urn(&conf.namespace, signer_cert).is_some();
+			if !(local_member && peer_member) {
+				return Err(TransitStatus::PermissionDenied);
+			}
+		}
 
 		peer_advertisement_wire_ok(
 			&ad.gateway_addr,
@@ -132,19 +162,98 @@ fn peer_advertisement_wire_ok(
 	}
 }
 
-/// Resolve the peer hive key from the advertising signer's certificate
+/// Resolve a frame's signer certificate on the given trust plane
 ///
-/// Peer slates reconcile by cert fingerprint, not claimed `gateway_addr`.
-/// Missing trust, signer, or fingerprint computation fails closed.
+/// The single resolution point for every signer-derived fact: the
+/// fingerprint and the colony membership both start from this lookup,
+/// so a caller needing both resolves the certificate once. Missing
+/// trust, signer, or certificate fails closed with `None`.
 #[cfg(feature = "x509")]
 #[must_use]
-fn peer_signer_hive_id(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
+pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Frame) -> Option<&'t Certificate> {
 	let trust = trust?;
 	let signer_info = frame.nonrepudiation.as_ref()?;
-	let cert = trust.find_by_signer_info(signer_info)?;
+
+	trust.find_by_signer_info(signer_info)
+}
+
+/// Certificate fingerprint as a shared slate/attribution identifier
+///
+/// A fingerprint that fails to compute cannot key a slate or attribute
+/// misbehavior, so it fails closed with `None`.
+#[cfg(feature = "x509")]
+#[must_use]
+fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
 	let fingerprint = CertificateTrustStore::to_fingerprint(cert).ok()?;
 
 	Some(Arc::from(fingerprint.as_slice()))
+}
+
+/// Resolve a frame's peer identity from the signer's certificate
+///
+/// Peer slates reconcile by cert fingerprint, not claimed `gateway_addr`,
+/// and misbehavior scoring attributes by the same fingerprint. Missing
+/// trust, signer, or fingerprint computation fails closed with `None`.
+#[cfg(feature = "x509")]
+#[must_use]
+pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
+	let cert = frame_signer_cert(trust, frame)?;
+
+	cert_fingerprint_id(cert)
+}
+
+/// Colony URN from the certificate's URI Subject Alternative Name
+///
+/// Colony membership binds to the URI SAN (RFC 5280 §4.2.1.6), never
+/// the subject: the Subject DN stays operator-owned and is never
+/// interpreted. Non-URI SAN entries and URIs that do not validate as a
+/// colony URN in `namespace` are ignored, not errors. Returns `None`
+/// when the extension is absent or malformed, when no entry validates,
+/// or when more than one distinct colony URN is present: an ambiguous
+/// identity fails closed (CWE-706).
+#[cfg(feature = "x509")]
+#[must_use]
+pub fn cert_colony_urn(namespace: &ColonyNamespace, cert: &Certificate) -> Option<Urn<'static>> {
+	let san: SubjectAltName = certificate_extension(cert).ok()??;
+
+	let mut colony: Option<Urn<'static>> = None;
+	for entry in &san.0 {
+		let GeneralName::UniformResourceIdentifier(uri) = entry else {
+			continue;
+		};
+		let Ok(urn) = uri.as_str().parse::<Urn<'static>>() else {
+			continue;
+		};
+		if !matches!(namespace.validate(&urn), Ok(ColonyResource::Colony { .. })) {
+			continue;
+		}
+
+		match colony.as_ref() {
+			Some(existing) if *existing == urn => {}
+			Some(_) => return None,
+			None => colony = Some(urn),
+		}
+	}
+
+	colony
+}
+
+/// Colony URN of a frame's signer, resolved on the given trust plane
+///
+/// Membership travels in the signer's certificate, never in frame
+/// bytes: unsigned scope bytes would be weaker than the certificate
+/// binding (CWE-345). Missing trust, signer, or certificate fails
+/// closed with `None`.
+#[cfg(feature = "x509")]
+#[must_use]
+pub fn frame_colony_urn(
+	namespace: &ColonyNamespace,
+	trust: Option<&dyn CertificateTrust>,
+	frame: &Frame,
+) -> Option<Urn<'static>> {
+	let cert = frame_signer_cert(trust, frame)?;
+
+	cert_colony_urn(namespace, cert)
 }
 
 /// Build a Peer-routed slate keyed by `peer_hive_id` NUL type
@@ -244,5 +353,67 @@ mod tests {
 		let allow = [String::from("10.0.0.1:9000")];
 		let status = peer_advertisement_wire_ok(b"127.0.0.1:9000", &[ping_type()], &ns, Some(&allow));
 		assert_eq!(status, Err(TransitStatus::PermissionDenied));
+	}
+
+	#[cfg(all(feature = "x509", feature = "secp256k1", feature = "signature"))]
+	mod colony_urn {
+		use super::*;
+		use crate::testing::utils::{
+			create_test_certificate, create_test_certificate_with_uri_sans, create_test_signing_key,
+		};
+
+		fn main_colony() -> Urn<'static> {
+			nestmate_ns().colony("main").expect("static colony name")
+		}
+
+		#[test]
+		fn cert_colony_urn_extracts_a_valid_san() {
+			let key = create_test_signing_key();
+			let cert = create_test_certificate_with_uri_sans(&key, &[&main_colony().to_string()]);
+			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), Some(main_colony()));
+		}
+
+		#[test]
+		fn cert_colony_urn_ignores_non_colony_entries() {
+			let key = create_test_signing_key();
+			let servlet = ping_type().to_string();
+			let cert = create_test_certificate_with_uri_sans(
+				&key,
+				&[&servlet, "https://example.test", &main_colony().to_string()],
+			);
+			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), Some(main_colony()));
+		}
+
+		#[test]
+		fn cert_colony_urn_tolerates_duplicate_identical_entries() {
+			let key = create_test_signing_key();
+			let urn = main_colony().to_string();
+			let cert = create_test_certificate_with_uri_sans(&key, &[&urn, &urn]);
+			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), Some(main_colony()));
+		}
+
+		#[test]
+		fn cert_colony_urn_fails_closed_on_ambiguity() {
+			let key = create_test_signing_key();
+			let other = nestmate_ns().colony("other").expect("static colony name");
+			let cert = create_test_certificate_with_uri_sans(&key, &[&main_colony().to_string(), &other.to_string()]);
+			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), None);
+		}
+
+		#[test]
+		fn cert_colony_urn_is_none_without_san() {
+			let key = create_test_signing_key();
+			let cert = create_test_certificate(&key);
+			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), None);
+		}
+
+		#[test]
+		fn cert_colony_urn_is_none_for_foreign_namespace() {
+			let key = create_test_signing_key();
+			let foreign = ColonyNamespace::new("acme", "").unwrap_or_default();
+			let urn = foreign.colony("main").expect("static colony name");
+			let cert = create_test_certificate_with_uri_sans(&key, &[&urn.to_string()]);
+			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), None);
+		}
 	}
 }

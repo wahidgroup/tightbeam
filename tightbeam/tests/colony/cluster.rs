@@ -12,7 +12,7 @@
 	feature = "signature"
 ))]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -25,13 +25,14 @@ use tightbeam::{
 	cluster,
 	colony::{
 		cluster::{
-			Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse,
-			GossipConf, GossipJournal, HeartbeatConf, MemoryGossipJournal,
+			Admission, Cluster, ClusterConf, ClusterError, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest,
+			ClusterWorkResponse, GossipAdmission, GossipConf, GossipDigest, GossipJournal, HeartbeatConf,
+			MemoryGossipJournal, TokenBucketAdmission,
 		},
 		common::{
-			current_timestamp_ms, servlet_instance, type_canonical_bytes, ColonyNamespace, GossipEnvelope,
-			GossipResponse, InstanceMetrics, LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin,
-			StochasticForager,
+			current_timestamp_ms, servlet_instance, type_canonical_bytes, ColonyNamespace, GossipReconciliation,
+			GossipResponse, GossipRumor, GossipWant, InstanceMetrics, LoadBalancer, PeerAdvertisement,
+			PeerAdvertisementResponse, RoundRobin, StochasticForager,
 		},
 		hive::{
 			Hive, HiveConf, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
@@ -40,7 +41,10 @@ use tightbeam::{
 		servlet::ServletConf,
 	},
 	compose,
-	constants::{DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, MAX_ADVERTISED_TYPES, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL},
+	constants::{
+		DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, DEFAULT_GOSSIP_RETENTION_MS, MAX_ADVERTISED_TYPES,
+		MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL,
+	},
 	crypto::{
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
@@ -106,6 +110,24 @@ pub(crate) const PEER_ROUTE_EXPOSED: Urn<'static> = Urn::new("test", "event:clus
 pub(crate) const PEER_SLATE_MATCHES: Urn<'static> = Urn::new("test", "event:cluster/peer-slate-matches");
 pub(crate) const PEER_PING_TYPE_LEARNED: Urn<'static> = Urn::new("test", "event:cluster/peer-ping-type-learned");
 pub(crate) const BALANCER_SPREAD: Urn<'static> = Urn::new("test", "event:cluster/balancer-spread");
+pub(crate) const GOSSIP_PENDING_BEFORE_REGISTER: Urn<'static> =
+	Urn::new("test", "event:cluster/gossip-pending-before-register");
+pub(crate) const JOURNAL_RECORDS: Urn<'static> = Urn::new("test", "event:cluster/journal-records");
+pub(crate) const JOURNAL_ACKS: Urn<'static> = Urn::new("test", "event:cluster/journal-acks");
+pub(crate) const GOSSIP_LIMITED_STATUS: Urn<'static> = Urn::new("test", "event:cluster/gossip-limited-status");
+pub(crate) const GOSSIP_RELAY_STATUS: Urn<'static> = Urn::new("test", "event:cluster/gossip-relay-status");
+pub(crate) const GOSSIP_ROUTES_AFTER_SCORING: Urn<'static> =
+	Urn::new("test", "event:cluster/gossip-routes-after-scoring");
+pub(crate) const GOSSIP_GREY_HOLE_CONTAINED: Urn<'static> =
+	Urn::new("test", "event:cluster/gossip-grey-hole-contained");
+pub(crate) const GOSSIP_RECONCILE_MEMBER_WANT: Urn<'static> =
+	Urn::new("test", "event:cluster/gossip-reconcile-member-want");
+pub(crate) const GOSSIP_RECONCILE_FOREIGN_WANT: Urn<'static> =
+	Urn::new("test", "event:cluster/gossip-reconcile-foreign-want");
+pub(crate) const GOSSIP_RECONCILE_STRANGER_WANT: Urn<'static> =
+	Urn::new("test", "event:cluster/gossip-reconcile-stranger-want");
+pub(crate) const GOSSIP_HELD_NO_INGRESS: Urn<'static> = Urn::new("test", "event:cluster/gossip-held-no-ingress");
+pub(crate) const GOSSIP_PENDING_NO_INGRESS: Urn<'static> = Urn::new("test", "event:cluster/gossip-pending-no-ingress");
 
 /// Address the simulated peer gateway advertises itself at.
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
@@ -122,8 +144,14 @@ const CONTAINMENT_ABANDON_LIMIT: u32 = 3;
 
 type ClusterTestCerts = GatewayCerts;
 
+/// Colony every member gateway in these tests belongs to. Membership
+/// travels as a URI SAN on the gateway certificate, never the subject.
+fn test_colony_urn() -> Urn<'static> {
+	colony_ns().colony("main").expect("static colony name")
+}
+
 fn cluster_certs() -> ClusterTestCerts {
-	GatewayCerts::generate("CN=Cluster Gateway")
+	GatewayCerts::generate_colony(&test_colony_urn())
 }
 
 // ============================================================================
@@ -223,19 +251,28 @@ fn record_work_status(trace: &TraceCollector, response: &ClusterWorkResponse) ->
 	Ok(())
 }
 
-async fn signed_control_frame_with(
+async fn signed_control_frame_with_order(
 	key: &Secp256k1SigningKey,
 	id: &[u8],
 	request: ClusterRequest,
+	order: u64,
 ) -> Result<Frame, TightBeamError> {
 	let unsigned = frame_compose(Version::V0)
 		.with_id(id)
-		.with_order(0)
+		.with_order(order)
 		.with_message(request)
 		.build()?;
 
 	let provider = Secp256k1KeyProvider::from(key.to_owned());
 	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+}
+
+async fn signed_control_frame_with(
+	key: &Secp256k1SigningKey,
+	id: &[u8],
+	request: ClusterRequest,
+) -> Result<Frame, TightBeamError> {
+	signed_control_frame_with_order(key, id, request, current_timestamp_ms()).await
 }
 
 async fn signed_control_frame(
@@ -260,9 +297,8 @@ fn servlet_urn(name: &str) -> Urn<'static> {
 	colony_ns().servlet(name).expect("test names satisfy the mint grammar")
 }
 
-fn registration_request(issued_at_ms: u64, hive_addr: &[u8]) -> ClusterRequest {
+fn registration_request(hive_addr: &[u8]) -> ClusterRequest {
 	ClusterRequest::RegisterHive(RegisterHiveRequest {
-		issued_at_ms,
 		hive_addr: hive_addr.to_vec(),
 		servlet_addresses: vec![],
 		metadata: None,
@@ -270,12 +306,7 @@ fn registration_request(issued_at_ms: u64, hive_addr: &[u8]) -> ClusterRequest {
 }
 
 fn servlet_address_update(hive_addr: &[u8], added: Vec<ServletInfo>, removed: Vec<Urn<'static>>) -> ClusterRequest {
-	ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
-		issued_at_ms: current_timestamp_ms(),
-		hive_id: hive_urn(hive_addr),
-		added,
-		removed,
-	})
+	ClusterRequest::ServletAddressUpdate(ServletAddressUpdate { hive_id: hive_urn(hive_addr), added, removed })
 }
 
 fn servlet_info(servlet_name: &str, address: &[u8]) -> ServletInfo {
@@ -306,6 +337,21 @@ async fn wait_for_peer_types(cluster: &ClusterGateway, attempts: u32, interval: 
 	}
 
 	cluster.peer_servlets()
+}
+
+/// Poll until the gateway exposes no live peer routes or attempts exhaust.
+/// Abandonment happens on the advertise beat's cadence, so it is only
+/// observable by polling. Branching lives here, not in scenarios.
+async fn wait_for_no_peer_routes(cluster: &ClusterGateway, attempts: u32, interval: Duration) -> bool {
+	for _ in 0..attempts {
+		if cluster.peer_routes().is_empty() {
+			return true;
+		}
+
+		tokio::time::sleep(interval).await;
+	}
+
+	cluster.peer_routes().is_empty()
 }
 
 /// Poll until the registry is empty or attempts exhaust. Branching lives here, not in scenarios.
@@ -635,7 +681,6 @@ async fn advertise_peer_signed(
 	types: Vec<Urn<'static>>,
 ) -> Result<(), TightBeamError> {
 	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
-		issued_at_ms: current_timestamp_ms(),
 		gateway_addr: gateway_addr.to_vec(),
 		advertised_types: types,
 	});
@@ -888,11 +933,11 @@ struct PeerPairCerts {
 
 fn peer_pair_certs() -> PeerPairCerts {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::testing::utils::create_test_certificate_with_uri_sans;
 
 	let gateway = cluster_certs();
 	let raw_b = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let cert_b = create_test_certificate(&raw_b);
+	let cert_b = create_test_certificate_with_uri_sans(&raw_b, &[&test_colony_urn().to_string()]);
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let peer_trust = combined_trust(&[&gateway.cert, &cert_b]);
 
@@ -1066,7 +1111,6 @@ tb_scenario! {
 			.await?;
 
 			let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
-				issued_at_ms: current_timestamp_ms(),
 				gateway_addr: PEER_GATEWAY_ADDR.to_vec(),
 				advertised_types: vec![servlet_urn("ping")],
 			});
@@ -1704,11 +1748,11 @@ struct SplitPlaneCerts {
 
 fn split_plane_certs() -> SplitPlaneCerts {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::testing::utils::create_test_certificate_with_uri_sans;
 
 	let exporter = cluster_certs();
 	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let receiver_cert = create_test_certificate(&raw);
+	let receiver_cert = create_test_certificate_with_uri_sans(&raw, &[&test_colony_urn().to_string()]);
 	let receiver_key = Secp256k1SigningKey::from(raw);
 	let receiver_trust = combined_trust(&[&receiver_cert]);
 	SplitPlaneCerts { exporter, receiver: (receiver_cert, receiver_key), receiver_trust }
@@ -2070,7 +2114,7 @@ tb_scenario! {
 			let signed = signed_control_frame(
 				&certs,
 				b"no-trust-reg",
-				registration_request(current_timestamp_ms(), b"127.0.0.1:65000"),
+				registration_request(b"127.0.0.1:65000"),
 			)
 			.await?;
 
@@ -2150,7 +2194,6 @@ tb_scenario! {
 				&certs,
 				b"misalign-reg",
 				ClusterRequest::RegisterHive(RegisterHiveRequest {
-					issued_at_ms: current_timestamp_ms(),
 					hive_addr: hive_addr.to_vec(),
 					servlet_addresses: vec![mismatch],
 					metadata: None,
@@ -2165,7 +2208,7 @@ tb_scenario! {
 			let ok_reg = signed_control_frame(
 				&certs,
 				b"align-reg",
-				registration_request(current_timestamp_ms(), hive_addr),
+				registration_request(hive_addr),
 			)
 			.await?;
 			let response_frame = emit_frame(&mut client, ok_reg).await?;
@@ -2250,7 +2293,7 @@ tb_scenario! {
 			let fresh = signed_control_frame(
 				&certs,
 				b"replay-reg",
-				registration_request(current_timestamp_ms(), b"127.0.0.1:65000"),
+				registration_request(b"127.0.0.1:65000"),
 			)
 			.await?;
 			let replayed = fresh.to_owned();
@@ -2262,12 +2305,13 @@ tb_scenario! {
 			let response_frame = emit_frame(&mut client, replayed).await?;
 			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
-			// Valid signature but issued outside the freshness window
+			// Valid signature but order outside the freshness window
 			let stale_ts = current_timestamp_ms() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
-			let stale = signed_control_frame(
-				&certs,
+			let stale = signed_control_frame_with_order(
+				&certs.key,
 				b"stale-reg",
-				registration_request(stale_ts, b"127.0.0.1:65000"),
+				registration_request(b"127.0.0.1:65000"),
+				stale_ts,
 			)
 			.await?;
 
@@ -2392,7 +2436,7 @@ tb_scenario! {
 			let registration = signed_control_frame(
 				certs,
 				b"hb-reject-reg",
-				registration_request(current_timestamp_ms(), &hive_addr_bytes),
+				registration_request(&hive_addr_bytes),
 			)
 			.await?;
 
@@ -2457,7 +2501,7 @@ async fn register_signed_hive(
 	id: &[u8],
 	addr: &[u8],
 ) -> Result<RegisterHiveResponse, TightBeamError> {
-	let frame = signed_control_frame_with(key, id, registration_request(current_timestamp_ms(), addr)).await?;
+	let frame = signed_control_frame_with(key, id, registration_request(addr)).await?;
 	decode(&emit_frame(client, frame).await?.message)
 }
 
@@ -2965,13 +3009,68 @@ fn gossip_cluster_conf(certs: &ClusterTestCerts, peers: Vec<String>) -> (Cluster
 	let journal = Arc::new(MemoryGossipJournal::default());
 	let mut conf = peering_cluster_conf(certs);
 	conf.peers = peers;
-	conf.gossip = GossipConf { journal: Arc::clone(&journal) as Arc<dyn GossipJournal>, ..Default::default() };
+	conf.gossip = GossipConf {
+		journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
+		ingress: Some(servlet_urn("ping")),
+		..Default::default()
+	};
 	(conf, journal)
 }
 
-/// Rumor envelope for the ping type, issued now.
-fn ping_rumor(ttl: u8, payload: Vec<u8>) -> GossipEnvelope {
-	GossipEnvelope { issued_at_ms: current_timestamp_ms(), target: servlet_urn("ping"), ttl, payload }
+/// Payload-only rumor body. The rumor names no destination: flood scope
+/// is the origin certificate's colony URN and local delivery is the
+/// receiving gateway's ingress policy. Hop radius rides the outer
+/// frame's `metadata.lifetime`, never the body.
+fn rumor_body(payload: Vec<u8>) -> GossipRumor {
+	GossipRumor { payload }
+}
+
+/// Sign a [`PublishGossip`] control frame with issue-time order and hop radius.
+async fn signed_publish_gossip(
+	key: &Secp256k1SigningKey,
+	id: &[u8],
+	body: GossipRumor,
+	hop_ttl: u64,
+) -> Result<Frame, TightBeamError> {
+	let unsigned = frame_compose(Version::V2)
+		.with_id(id)
+		.with_order(current_timestamp_ms())
+		.with_lifetime(hop_ttl)
+		.with_message(ClusterRequest::PublishGossip(body))
+		.build()?;
+
+	let provider = Secp256k1KeyProvider::from(key.to_owned());
+	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+}
+
+/// Mint an origin-signed rumor [`Frame`] (the nested gossip content).
+async fn mint_origin_rumor(key: &Secp256k1SigningKey, id: &[u8], body: GossipRumor) -> Result<Frame, TightBeamError> {
+	let unsigned = frame_compose(Version::V2)
+		.with_id(id)
+		.with_order(current_timestamp_ms())
+		.with_message(body)
+		.build()?;
+
+	let provider = Secp256k1KeyProvider::from(key.to_owned());
+	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+}
+
+/// Sign a [`Gossip`] relay frame carrying a verbatim origin rumor.
+async fn signed_relay_gossip(
+	key: &Secp256k1SigningKey,
+	id: &[u8],
+	rumor: Frame,
+	hop_ttl: u64,
+) -> Result<Frame, TightBeamError> {
+	let unsigned = frame_compose(Version::V2)
+		.with_id(id)
+		.with_order(current_timestamp_ms())
+		.with_lifetime(hop_ttl)
+		.with_message(ClusterRequest::Gossip(Box::new(rumor)))
+		.build()?;
+
+	let provider = Secp256k1KeyProvider::from(key.to_owned());
+	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
 }
 
 /// Emit one signed gossip frame and record the decoded status on the
@@ -2982,9 +3081,52 @@ async fn send_gossip_frame(
 	cluster: &ClusterGateway,
 	frame: Frame,
 ) -> Result<(), TightBeamError> {
+	send_gossip_frame_as(trace, connect_certs, cluster, frame, GOSSIP_PUBLISH_STATUS).await
+}
+
+/// Emit one signed gossip frame and record the decoded status under the
+/// given marker, so one scenario can distinguish per-publish outcomes.
+async fn send_gossip_frame_as(
+	trace: &TraceCollector,
+	connect_certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+	frame: Frame,
+	marker: Urn<'static>,
+) -> Result<(), TightBeamError> {
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
 	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message)?;
-	trace.event_with(GOSSIP_PUBLISH_STATUS, &[], response.status)?;
+	trace.event_with(marker, &[], response.status)?;
+	Ok(())
+}
+
+/// Sign a [`ReconcileGossip`] control frame listing the sender's held digests.
+async fn signed_reconcile_gossip(
+	key: &Secp256k1SigningKey,
+	id: &[u8],
+	held: Vec<Vec<u8>>,
+) -> Result<Frame, TightBeamError> {
+	let unsigned = frame_compose(Version::V2)
+		.with_id(id)
+		.with_order(current_timestamp_ms())
+		.with_message(ClusterRequest::ReconcileGossip(GossipReconciliation { held }))
+		.build()?;
+
+	let provider = Secp256k1KeyProvider::from(key.to_owned());
+	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+}
+
+/// Emit one signed reconcile frame and record the want-list size under
+/// the given marker. A refused reconciliation answers an empty want.
+async fn send_reconcile_frame_as(
+	trace: &TraceCollector,
+	connect_certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+	frame: Frame,
+	marker: Urn<'static>,
+) -> Result<(), TightBeamError> {
+	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
+	let response: GossipWant = decode(&emit_frame(&mut client, frame).await?.message)?;
+	trace.event_with(marker, &[], response.want.len() as u64)?;
 	Ok(())
 }
 
@@ -3017,6 +3159,32 @@ async fn wait_for_gossip_converged(
 	}
 
 	gossip_converged(journals, held)
+}
+
+/// Poll until the journal holds exactly `count` rumors awaiting local delivery.
+/// Attempts exhaust if the count never matches.
+/// A rumor accepted before the ingress servlet registers stays pending for beat retry.
+/// Branching lives here, not in scenarios.
+async fn wait_for_pending_local(
+	journal: &Arc<MemoryGossipJournal>,
+	count: usize,
+	attempts: u32,
+	interval: Duration,
+) -> bool {
+	for _ in 0..attempts {
+		let pending = journal
+			.pending_local(current_timestamp_ms())
+			.is_ok_and(|rumors| rumors.len() == count);
+		if pending {
+			return true;
+		}
+
+		tokio::time::sleep(interval).await;
+	}
+
+	journal
+		.pending_local(current_timestamp_ms())
+		.is_ok_and(|rumors| rumors.len() == count)
 }
 
 tb_assert_spec! {
@@ -3063,17 +3231,22 @@ tb_scenario! {
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
-			let rumor = ping_rumor(4, encode(&PingRequest { value: 21 })?);
-			let publish = ClusterRequest::PublishGossip(rumor.clone());
-			let frame = signed_control_frame(&certs, b"flood-rumor", publish).await?;
-			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+			// One signed publish frame is resent byte-identical so the origin
+			// gateway re-mints the same rumor (same id, order, body) and the
+			// journal absorbs the second as a Duplicate.
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"flood-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				4,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway_a, frame.clone()).await?;
 
 			let journals = [journal_a, journal_b, journal_c];
 			let converged = wait_for_gossip_converged(&journals, 1, 50, Duration::from_millis(100)).await;
 			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
 
-			let republish = ClusterRequest::PublishGossip(rumor);
-			let frame = signed_control_frame(&certs, b"flood-rumor-again", republish).await?;
 			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
 
 			gateway_a.stop();
@@ -3129,8 +3302,13 @@ tb_scenario! {
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
-			let publish = ClusterRequest::PublishGossip(ping_rumor(2, encode(&PingRequest { value: 21 })?));
-			let frame = signed_control_frame(&certs, b"chain-rumor", publish).await?;
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"chain-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				2,
+			)
+			.await?;
 			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
 
 			let journals = [journal_a, journal_b, journal_c];
@@ -3188,8 +3366,13 @@ tb_scenario! {
 			hive.register_with_cluster(gateway_a.addr()).await?;
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 
-			let publish = ClusterRequest::PublishGossip(ping_rumor(1, encode(&PingRequest { value: 21 })?));
-			let frame = signed_control_frame(&certs, b"hive-only-rumor", publish).await?;
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"hive-only-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				1,
+			)
+			.await?;
 			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
 
 			let journals = [journal_a, journal_b];
@@ -3244,9 +3427,13 @@ tb_scenario! {
 			hive.register_with_cluster(gateway_a.addr()).await?;
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 
-			let ping_request = encode(&PingRequest { value: 21 })?;
-			let publish = ClusterRequest::PublishGossip(ping_rumor(MAX_GOSSIP_TTL, ping_request));
-			let frame = signed_control_frame(&certs, b"clamped-rumor", publish).await?;
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"clamped-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				u64::from(MAX_GOSSIP_TTL),
+			)
+			.await?;
 			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
 
 			let converged = wait_for_gossip_converged(&[journal_a], 1, 50, Duration::from_millis(100)).await;
@@ -3325,12 +3512,24 @@ tb_scenario! {
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			let relay = ClusterRequest::Gossip(ping_rumor(2, encode(&PingRequest { value: 21 })?));
-			let frame = signed_control_frame_with(&ctx.gateway.key, b"cross-plane-relay", relay).await?;
+			// Outer frame signed on the hive plane; peer trust refuses it
+			// before the nested rumor is examined.
+			let dummy = mint_origin_rumor(
+				&ctx.gateway.key,
+				b"cross-plane-inner",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+			)
+			.await?;
+			let frame = signed_relay_gossip(&ctx.gateway.key, b"cross-plane-relay", dummy, 2).await?;
 			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
 
-			let publish = ClusterRequest::PublishGossip(ping_rumor(2, encode(&PingRequest { value: 21 })?));
-			let frame = signed_control_frame_with(&ctx.peer_key, b"cross-plane-publish", publish).await?;
+			let frame = signed_publish_gossip(
+				&ctx.peer_key,
+				b"cross-plane-publish",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				2,
+			)
+			.await?;
 			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
 
 			// A rumor past the gossip bound exceeds what one single-flight
@@ -3350,11 +3549,803 @@ tb_scenario! {
 			);
 			let mut mux_client = pool.connect(cluster.addr()).await?;
 
-			let oversized = ClusterRequest::PublishGossip(ping_rumor(2, vec![0u8; MAX_GOSSIP_PAYLOAD_BYTES + 1]));
-			let frame = signed_control_frame_with(&ctx.gateway.key, b"oversized-rumor", oversized).await?;
+			let frame = signed_publish_gossip(
+				&ctx.gateway.key,
+				b"oversized-rumor",
+				rumor_body(vec![0u8; MAX_GOSSIP_PAYLOAD_BYTES + 1]),
+				2,
+			)
+			.await?;
 			let reply = mux_client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: GossipResponse = decode(&reply.message)?;
 			trace.event_with(GOSSIP_PUBLISH_STATUS, &[], response.status)?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipReconcileRepairSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// Anti-entropy repair over the beat.
+// Publisher F starts the rumor at ttl 0 so it never floods.
+// Receiver R learns the rumor only when F's beat reconciles digests and pushes it.
+tb_scenario! {
+	name: cluster_gossip_repairs_missing_peer_over_beat,
+	spec: ClusterGossipReconcileRepairSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let (conf_r, journal_r) = gossip_cluster_conf(&certs, vec![]);
+			let gateway_r = start_cluster(&trace, conf_r).await?;
+			let hive_r = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+
+			let (mut conf_f, journal_f) = gossip_cluster_conf(&certs, vec![gateway_r.addr().to_string()]);
+			conf_f.advertise_interval = Some(Duration::from_millis(100));
+			let gateway_f = start_cluster(&trace, conf_f).await?;
+
+			hive_r.register_with_cluster(gateway_r.addr()).await?;
+			hive.register_with_cluster(gateway_f.addr()).await?;
+
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"repair-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway_f, frame).await?;
+
+			let converged = wait_for_gossip_converged(&[journal_f, journal_r], 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			gateway_f.stop();
+			gateway_r.stop();
+			hive_r.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipRetrySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_PENDING_BEFORE_REGISTER, exactly!(1), equals!(1u64)),
+			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// Local-delivery retry on the beat.
+// The rumor reaches R before R's ping servlet registers, so it stays pending.
+// After registration, R's beat delivers from the pending set and acks.
+// R has no peers: the beat runs solely for pending_local retry.
+tb_scenario! {
+	name: cluster_gossip_retries_pending_local_delivery,
+	spec: ClusterGossipRetrySpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let (mut conf_r, journal_r) = gossip_cluster_conf(&certs, vec![]);
+			conf_r.advertise_interval = Some(Duration::from_millis(100));
+			let gateway_r = start_cluster(&trace, conf_r).await?;
+
+			let (conf_f, journal_f) = gossip_cluster_conf(&certs, vec![gateway_r.addr().to_string()]);
+			let gateway_f = start_cluster(&trace, conf_f).await?;
+
+			hive.register_with_cluster(gateway_f.addr()).await?;
+
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"retry-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				1,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway_f, frame).await?;
+
+			let pending = wait_for_pending_local(&journal_r, 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_PENDING_BEFORE_REGISTER, &[], u64::from(pending))?;
+
+			let hive_r = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			hive_r.register_with_cluster(gateway_r.addr()).await?;
+
+			let converged = wait_for_gossip_converged(&[journal_f, journal_r], 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			gateway_f.stop();
+			gateway_r.stop();
+			hive_r.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Counting [`GossipJournal`] wrapping the in-memory default.
+/// Counters show the gateway records and acks through the injected trait object.
+/// A durable backend swaps in the same way.
+#[derive(Default)]
+struct CountingJournal {
+	inner: MemoryGossipJournal,
+	records: AtomicU64,
+	acks: AtomicU64,
+}
+
+impl GossipJournal for CountingJournal {
+	fn record(
+		&self,
+		signer: &[u8],
+		digest: GossipDigest,
+		rumor: &Frame,
+		now_ms: u64,
+	) -> Result<Admission, ClusterError> {
+		self.records.fetch_add(1, Ordering::SeqCst);
+		self.inner.record(signer, digest, rumor, now_ms)
+	}
+
+	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
+		self.inner.held_digests(now_ms)
+	}
+
+	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.fetch(wanted, now_ms)
+	}
+
+	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.pending_local(now_ms)
+	}
+
+	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
+		self.acks.fetch_add(1, Ordering::SeqCst);
+		self.inner.ack_local(digest)
+	}
+
+	fn retention_ms(&self) -> u64 {
+		self.inner.retention_ms()
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipJournalSeamSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1)),
+			(JOURNAL_RECORDS, exactly!(1), equals!(1u64)),
+			(JOURNAL_ACKS, exactly!(1), equals!(1u64))
+		]
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipRateLimitSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_LIMITED_STATUS, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0))
+		]
+	}
+}
+
+// Per-signer rate admission at the pipeline chokepoint.
+// A one-token bucket with a slow refill admits the first publish and
+// refuses the second with ResourceExhausted before it is recorded.
+tb_scenario! {
+	name: cluster_gossip_rate_limits_signer,
+	spec: ClusterGossipRateLimitSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let mut conf = peering_cluster_conf(&certs);
+			conf.gossip = GossipConf {
+				admission: Arc::new(TokenBucketAdmission::new(1, Duration::from_secs(3_600)))
+					as Arc<dyn GossipAdmission>,
+				ingress: Some(servlet_urn("ping")),
+				..Default::default()
+			};
+			let gateway = start_cluster(&trace, conf).await?;
+			hive.register_with_cluster(gateway.addr()).await?;
+
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"rate-rumor-1",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"rate-rumor-2",
+				rumor_body(encode(&PingRequest { value: 22 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_LIMITED_STATUS).await?;
+
+			gateway.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+// The gateway drives an injected journal through the trait alone.
+// One origin publish records once and acks once on local delivery.
+// Counts are final when the publish returns because record and ack precede the reply.
+tb_scenario! {
+	name: cluster_gossip_uses_injected_journal,
+	spec: ClusterGossipJournalSeamSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let journal = Arc::new(CountingJournal::default());
+			let mut conf = peering_cluster_conf(&certs);
+			conf.gossip = GossipConf {
+				journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
+				ingress: Some(servlet_urn("ping")),
+				..Default::default()
+			};
+			let gateway = start_cluster(&trace, conf).await?;
+			hive.register_with_cluster(gateway.addr()).await?;
+
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"seam-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+
+			trace.event_with(JOURNAL_RECORDS, &[], journal.records.load(Ordering::SeqCst))?;
+			trace.event_with(JOURNAL_ACKS, &[], journal.acks.load(Ordering::SeqCst))?;
+
+			gateway.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipInvalidRelaySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
+			(GOSSIP_RELAY_STATUS, exactly!(4), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(4)),
+			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(3)),
+			(GOSSIP_ROUTES_AFTER_SCORING, exactly!(1), equals!(0u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(1))
+		]
+	}
+}
+
+// Invalid-relay scoring: a trusted peer that relays rumors refused at
+// admission (here an over-TTL flood request) weakens its own advertised
+// work routes, one trial per refusal, until the trail is abandoned and
+// `peer_routes` no longer exposes it. The weakening stops with the trail
+// (the fourth refusal scores nothing), and an honest relay from the same
+// signer still delivers: flooding is untouched by work-route abandonment.
+tb_scenario! {
+	name: cluster_gossip_abandons_invalid_relay_routes,
+	spec: ClusterGossipInvalidRelaySpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let mut conf = containment_cluster_conf(&certs);
+			conf.gossip.ingress = Some(servlet_urn("ping"));
+			let gateway = start_cluster(&trace, conf).await?;
+			hive.register_with_cluster(gateway.addr()).await?;
+			install_ping_peer(&trace, &certs, &gateway).await?;
+
+			// One more relay than the abandonment budget: the last refusal
+			// must find the trail already abandoned and weaken nothing.
+			// Each relay carries a valid origin-signed rumor so the refusal
+			// is the over-radius hop lifetime, not an unverifiable origin.
+			for i in 0..=CONTAINMENT_ABANDON_LIMIT {
+				let rumor_id = [b'r', i as u8];
+				let rumor = mint_origin_rumor(
+					&certs.key,
+					&rumor_id,
+					rumor_body(encode(&PingRequest { value: i })?),
+				)
+				.await?;
+				let id = [b'b', b'a', b'd', i as u8];
+				let frame = signed_relay_gossip(
+					&certs.key,
+					&id,
+					rumor,
+					u64::from(MAX_GOSSIP_TTL) + 1,
+				)
+				.await?;
+				send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_RELAY_STATUS).await?;
+			}
+
+			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], gateway.peer_routes().len() as u64)?;
+
+			let honest = mint_origin_rumor(
+				&certs.key,
+				b"honest-inner",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+			)
+			.await?;
+			let frame = signed_relay_gossip(&certs.key, b"honest-relay", honest, 0).await?;
+			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+
+			gateway.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Grey-hole [`GossipJournal`]: every rumor is recorded as new and
+/// retained nowhere, so the gateway acknowledges each push with `Ok` and
+/// then re-wants the same digest on every reconciliation round.
+#[derive(Default)]
+struct AmnesiacJournal;
+
+impl GossipJournal for AmnesiacJournal {
+	fn record(
+		&self,
+		_signer: &[u8],
+		_digest: GossipDigest,
+		_rumor: &Frame,
+		_now_ms: u64,
+	) -> Result<Admission, ClusterError> {
+		Ok(Admission::New)
+	}
+
+	fn held_digests(&self, _now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
+		Ok(Vec::new())
+	}
+
+	fn fetch(&self, _wanted: &[GossipDigest], _now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+		Ok(Vec::new())
+	}
+
+	fn pending_local(&self, _now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+		Ok(Vec::new())
+	}
+
+	fn ack_local(&self, _digest: &GossipDigest) -> Result<(), ClusterError> {
+		Ok(())
+	}
+
+	// The grey hole CLAIMS the default retention while retaining nothing:
+	// a misbehaving journal lies, and the start-time seen-ttl clamp only
+	// defends against honest misconfiguration.
+	fn retention_ms(&self) -> u64 {
+		DEFAULT_GOSSIP_RETENTION_MS
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipGreyHoleSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_CONVERGED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_DROP_SIGNAL, at_least!(3)),
+			(GOSSIP_GREY_HOLE_CONTAINED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2))
+		]
+	}
+}
+
+// Grey-hole containment over the beat: B acknowledges every repair push
+// with `Ok` and retains nothing, so each reconciliation round re-wants a
+// digest A already saw acknowledged. A's beat reads the reappearance as a
+// drop signal, weakens B's advertised work route once per round, and
+// abandons it past the limit while the rumor still converges to honest C
+// through the same beat. Flooding to B keeps running off the static peer
+// list; only work routing drops the grey hole.
+tb_scenario! {
+	name: cluster_gossip_abandons_grey_hole_peer,
+	spec: ClusterGossipGreyHoleSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let (conf_c, journal_c) = gossip_cluster_conf(&certs, vec![]);
+			let gateway_c = start_cluster(&trace, conf_c).await?;
+			let hive_c = start_ping_hive(trace.share(), Arc::clone(&certs), None).await?;
+			hive_c.register_with_cluster(gateway_c.addr()).await?;
+
+			let mut conf_b = peering_cluster_conf(&certs);
+			conf_b.gossip = GossipConf {
+				journal: Arc::new(AmnesiacJournal) as Arc<dyn GossipJournal>,
+				..Default::default()
+			};
+			let gateway_b = start_cluster(&trace, conf_b).await?;
+
+			let peers_a = vec![gateway_b.addr().to_string(), gateway_c.addr().to_string()];
+			let (mut conf_a, journal_a) = gossip_cluster_conf(&certs, peers_a);
+			conf_a.advertise_interval = Some(Duration::from_millis(100));
+			conf_a.pheromone.abandonment_limit = CONTAINMENT_ABANDON_LIMIT;
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+			hive.register_with_cluster(gateway_a.addr()).await?;
+
+			// Give the drop signals a trail to weaken: B advertises a ping
+			// route dialed at the same address A reconciles with.
+			let dial = gateway_b.addr().to_string();
+			advertise_peer(&trace, &certs, &gateway_a, dial.as_bytes(), vec![servlet_urn("ping")]).await?;
+
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"grey-hole-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
+
+			// Honest convergence first: A holds its own publish and C is
+			// repaired over the beat. B never converges by design.
+			let converged =
+				wait_for_gossip_converged(&[journal_a, journal_c], 1, 50, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			let contained = wait_for_no_peer_routes(&gateway_a, 100, Duration::from_millis(100)).await;
+			trace.event_with(GOSSIP_GREY_HOLE_CONTAINED, &[], u64::from(contained))?;
+
+			gateway_a.stop();
+			gateway_b.stop();
+			gateway_c.stop();
+			hive_c.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipTamperedRelaySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
+			(GOSSIP_RELAY_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
+		]
+	}
+}
+
+// Tampered-relay scoring: a trusted peer that forwards an origin-signed
+// rumor whose content it altered breaks the origin signature. The gateway
+// refuses PermissionDenied and weakens the relay's advertised routes,
+// because an honest relay verifies before forwarding.
+tb_scenario! {
+	name: cluster_gossip_weakens_tampered_relay,
+	spec: ClusterGossipTamperedRelaySpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, containment_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			install_ping_peer(&trace, &certs, &cluster).await?;
+
+			let mut rumor = mint_origin_rumor(
+				&certs.key,
+				b"tamper-inner",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+			)
+			.await?;
+			rumor.message = encode(&rumor_body(encode(&PingRequest { value: 99 })?))?;
+
+			let frame = signed_relay_gossip(&certs.key, b"tamper-relay", rumor, 0).await?;
+			send_gossip_frame_as(&trace, &certs, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Fixture for colony-membership refusals: the gateway belongs to colony
+/// "main", one trusted peer identity carries a different colony URN SAN,
+/// and another carries no SAN at all. Both use random keys so the three
+/// identities never share a subject key id (see [`gossip_plane_ctx`]).
+struct ForeignColonyCtx {
+	gateway: ClusterTestCerts,
+	foreign_key: Secp256k1SigningKey,
+	stranger_key: Secp256k1SigningKey,
+	peer_trust: Arc<dyn CertificateTrust>,
+}
+
+fn foreign_colony_ctx() -> ForeignColonyCtx {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::utils::{create_test_certificate, create_test_certificate_with_uri_sans};
+
+	let gateway = cluster_certs();
+	let foreign_urn = colony_ns().colony("other").expect("static colony name");
+	let raw_foreign = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let foreign_cert = create_test_certificate_with_uri_sans(&raw_foreign, &[&foreign_urn.to_string()]);
+	let raw_stranger = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let stranger_cert = create_test_certificate(&raw_stranger);
+	let peer_trust = combined_trust(&[&gateway.cert, &foreign_cert, &stranger_cert]);
+
+	ForeignColonyCtx {
+		gateway,
+		foreign_key: Secp256k1SigningKey::from(raw_foreign),
+		stranger_key: Secp256k1SigningKey::from(raw_stranger),
+		peer_trust,
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipForeignColonySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
+			(GOSSIP_RELAY_STATUS, exactly!(2), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
+			(GOSSIP_ROUTES_AFTER_SCORING, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
+		]
+	}
+}
+
+// Colony-membership refusal is policy, not misbehavior. A trusted peer
+// from a different colony federates work routes (the advertisement
+// installs), yet its relay of a foreign-origin rumor is refused
+// PermissionDenied, and so is a relay from a trusted peer with no colony
+// SAN. Neither refusal weakens the advertised route: the abandonment
+// limit is 1, so a single weaken would evict it, and the route survives.
+tb_scenario! {
+	name: cluster_gossip_refuses_foreign_colony_without_weakening,
+	spec: ClusterGossipForeignColonySpec,
+	environment Cluster {
+		context: foreign_colony_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			let mut conf = peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust));
+			conf.pheromone.abandonment_limit = 1;
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+			advertise_peer_signed(
+				&trace,
+				&ctx.gateway,
+				&ctx.foreign_key,
+				&cluster,
+				PEER_GATEWAY_ADDR,
+				vec![servlet_urn("ping")],
+			)
+			.await?;
+
+			let foreign = mint_origin_rumor(
+				&ctx.foreign_key,
+				b"foreign-inner",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+			)
+			.await?;
+			let frame = signed_relay_gossip(&ctx.foreign_key, b"foreign-relay", foreign, 0).await?;
+			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+
+			let stranger = mint_origin_rumor(
+				&ctx.stranger_key,
+				b"stranger-inner",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+			)
+			.await?;
+			let frame = signed_relay_gossip(&ctx.stranger_key, b"stranger-relay", stranger, 0).await?;
+			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+
+			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], cluster.peer_routes().len() as u64)?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipNonMemberSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0))
+		]
+	}
+}
+
+// A gateway whose own certificate carries no colony URN SAN is not a
+// colony member: it refuses origin publishes PermissionDenied even from
+// a trusted hive-plane signer, because it cannot scope the flood.
+tb_scenario! {
+	name: cluster_gossip_non_member_gateway_refuses_publish,
+	spec: ClusterGossipNonMemberSpec,
+	environment Cluster {
+		context: GatewayCerts::generate("CN=Non-Member Gateway"),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let frame = signed_publish_gossip(
+				&certs.key,
+				b"non-member-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &cluster, frame).await?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipReconcileMembershipSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(GOSSIP_RECONCILE_MEMBER_WANT, exactly!(1), equals!(1u64)),
+			(GOSSIP_RECONCILE_FOREIGN_WANT, exactly!(1), equals!(1u64)),
+			(GOSSIP_RECONCILE_STRANGER_WANT, exactly!(1), equals!(0u64)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1))
+		]
+	}
+}
+
+// Reconciliation is gated on colony MEMBERSHIP, not colony equality:
+// a same-colony member and a foreign-colony member both receive the
+// full want-list for a digest this gateway lacks, while a trusted peer
+// with no colony SAN is refused with an empty want and fires exactly
+// the one REFUSED event. Rumor content never rides reconciliation, so
+// the foreign exchange leaks digests only; the later push of a foreign
+// rumor is what the relay equality gate refuses.
+tb_scenario! {
+	name: cluster_gossip_reconcile_requires_membership_only,
+	spec: ClusterGossipReconcileMembershipSpec,
+	environment Cluster {
+		context: foreign_colony_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			let conf = peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust));
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+			let held = vec![vec![0xABu8; 32]];
+
+			let frame = signed_reconcile_gossip(&ctx.gateway.key, b"member-reconcile", held.clone()).await?;
+			send_reconcile_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RECONCILE_MEMBER_WANT).await?;
+
+			let frame = signed_reconcile_gossip(&ctx.foreign_key, b"foreign-reconcile", held.clone()).await?;
+			send_reconcile_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RECONCILE_FOREIGN_WANT).await?;
+
+			let frame = signed_reconcile_gossip(&ctx.stranger_key, b"stranger-reconcile", held).await?;
+			send_reconcile_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RECONCILE_STRANGER_WANT).await?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Fixture for the ingress-None delivery policy: the scenario needs the
+/// journal handle to observe retention and the retry set from outside.
+struct IngressNoneCtx {
+	certs: ClusterTestCerts,
+	journal: Arc<MemoryGossipJournal>,
+}
+
+fn ingress_none_ctx() -> IngressNoneCtx {
+	IngressNoneCtx { certs: cluster_certs(), journal: Arc::new(MemoryGossipJournal::default()) }
+}
+
+tb_assert_spec! {
+	pub ClusterGossipIngressNoneSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0)),
+			(GOSSIP_HELD_NO_INGRESS, exactly!(1), equals!(1u64)),
+			(GOSSIP_PENDING_NO_INGRESS, exactly!(1), equals!(1u64))
+		]
+	}
+}
+
+// With no configured ingress the gateway journals and refloods only:
+// the publish is answered Ok and retained (held = 1), the record is
+// acked immediately so it never enters the pending retry set, and no
+// local delivery is reported (ACCEPTED = 0). The journal settles before
+// the publish reply returns, so the probes need no polling.
+tb_scenario! {
+	name: cluster_gossip_ingress_none_acks_on_record,
+	spec: ClusterGossipIngressNoneSpec,
+	environment Cluster {
+		context: ingress_none_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			let mut conf = peering_cluster_conf(&ctx.certs);
+			conf.gossip = GossipConf {
+				journal: Arc::clone(&ctx.journal) as Arc<dyn GossipJournal>,
+				ingress: None,
+				..Default::default()
+			};
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+			let frame = signed_publish_gossip(
+				&ctx.certs.key,
+				b"ingress-none-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &ctx.certs, &cluster, frame).await?;
+
+			let now = current_timestamp_ms();
+			let held_one = ctx.journal.held_digests(now).is_ok_and(|digests| digests.len() == 1);
+			let none_pending = ctx.journal.pending_local(now).is_ok_and(|rumors| rumors.is_empty());
+			trace.event_with(GOSSIP_HELD_NO_INGRESS, &[], u64::from(held_one))?;
+			trace.event_with(GOSSIP_PENDING_NO_INGRESS, &[], u64::from(none_pending))?;
 
 			cluster.stop();
 			Ok(())

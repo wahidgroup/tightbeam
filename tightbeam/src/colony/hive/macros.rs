@@ -1109,7 +1109,6 @@ macro_rules! hive {
 
 			let request = $crate::colony::common::ClusterRequest::RegisterHive(
 				$crate::colony::hive::RegisterHiveRequest {
-					issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 					hive_addr: $hive_addr.into(),
 					servlet_addresses: servlet_info_list,
 					metadata: Some(b"hive".to_vec()),
@@ -1225,7 +1224,6 @@ macro_rules! hive {
 			let update = if is_added {
 				$crate::colony::common::ClusterRequest::ServletAddressUpdate(
 					$crate::colony::hive::ServletAddressUpdate {
-						issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 						hive_id: (*hive_id).clone(),
 						added: vec![servlet_info],
 						removed: vec![],
@@ -1234,7 +1232,6 @@ macro_rules! hive {
 			} else {
 				$crate::colony::common::ClusterRequest::ServletAddressUpdate(
 					$crate::colony::hive::ServletAddressUpdate {
-						issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 						hive_id: (*hive_id).clone(),
 						added: vec![],
 						removed: vec![servlet_info.servlet_id],
@@ -1366,12 +1363,15 @@ macro_rules! hive {
 	(@control_frame $id:expr, $message:expr, $hive_tls:ident) => {{
 		use $crate::builder::TypeBuilder;
 
+		// `metadata.order` is the control freshness binding (CWE-294).
+		let order = $crate::colony::common::current_timestamp_ms();
+
 		#[cfg(feature = "x509")]
 		let frame = match $hive_tls.as_ref() {
 			Some(hive_tls) => {
 				let unsigned = $crate::utils::compose($crate::Version::V0)
 					.with_id($id)
-					.with_order(0)
+					.with_order(order)
 					.with_message($message)
 					.build()?;
 				unsigned
@@ -1380,7 +1380,7 @@ macro_rules! hive {
 			}
 			None => $crate::utils::compose($crate::Version::V0)
 				.with_id($id)
-				.with_order(0)
+				.with_order(order)
 				.with_message($message)
 				.build()?,
 		};
@@ -1388,7 +1388,7 @@ macro_rules! hive {
 		#[cfg(not(feature = "x509"))]
 		let frame = $crate::utils::compose($crate::Version::V0)
 			.with_id($id)
-			.with_order(0)
+			.with_order(order)
 			.with_message($message)
 			.build()?;
 

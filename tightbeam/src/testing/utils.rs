@@ -208,13 +208,14 @@ use signing::*;
 mod cert {
 	pub use crate::crypto::sign::ecdsa::{Secp256k1, Signature};
 	pub use crate::crypto::sign::sign_canonical;
-	pub use crate::der::asn1::{BitString, PrintableString, SetOfVec, UtcTime};
+	pub use crate::der::asn1::{BitString, Ia5String, PrintableString, SetOfVec, UtcTime};
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::der::{Any, Decode, Encode};
 	pub use crate::error::Result as TbResult;
 	pub use crate::spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
 	pub use crate::x509::attr::AttributeTypeAndValue;
-	pub use crate::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
+	pub use crate::x509::ext::pkix::name::GeneralName;
+	pub use crate::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::x509::ext::Extension;
 	pub use crate::x509::name::{RdnSequence, RelativeDistinguishedName};
 	pub use crate::x509::serial_number::SerialNumber;
@@ -249,6 +250,34 @@ fn test_signature_algorithm() -> AlgorithmIdentifierOwned {
 
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub fn create_test_certificate(signing_key: &SigningKey) -> Certificate {
+	test_certificate_with_extensions(signing_key, None)
+}
+
+/// [`create_test_certificate`] variant carrying each of `uris` as a URI
+/// Subject Alternative Name entry (RFC 5280 §4.2.1.6).
+///
+/// The subject stays empty: identity claims such as colony membership
+/// bind to the SAN, never the subject. With an empty subject the SAN
+/// MUST be critical (RFC 5280 §4.2.1.6), which [`test_extension`]
+/// already provides.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub fn create_test_certificate_with_uri_sans(signing_key: &SigningKey, uris: &[&str]) -> Certificate {
+	let names = uris
+		.iter()
+		.map(|uri| {
+			let uri = Ia5String::new(uri).expect("test URIs are IA5 text");
+			GeneralName::UniformResourceIdentifier(uri)
+		})
+		.collect();
+	let san = SubjectAltName(names);
+
+	test_certificate_with_extensions(signing_key, Some(vec![test_extension(&san)]))
+}
+
+/// Shared body of the placeholder-signed test certificate fixtures:
+/// empty subject and issuer, fixed serial, caller-chosen extensions.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option<Vec<Extension>>) -> Certificate {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key
 		.to_public_key_der()
@@ -271,7 +300,7 @@ pub fn create_test_certificate(signing_key: &SigningKey) -> Certificate {
 		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
-		extensions: None,
+		extensions,
 	};
 
 	Certificate { tbs_certificate, signature_algorithm: algorithm, signature }

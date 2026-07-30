@@ -255,7 +255,7 @@ pub const REPLAY_GUARD_CAPACITY: usize = 1024;
 
 /// Bounded freshness and replay window for signed cluster commands
 ///
-/// A command is accepted when its `issued_at_ms` lies within
+/// A command is accepted when its `Frame.metadata.order` lies within
 /// `window_ms` of the hive clock (either direction, tolerating skew)
 /// AND its signature has not already been seen inside the window.
 /// Signatures are tracked per signer so one signer saturating its
@@ -278,9 +278,9 @@ impl ReplayGuard {
 		Self { seen: Mutex::new(HashMap::new()), window_ms }
 	}
 
-	/// Whether `issued_at_ms` is within the freshness window of `now_ms`
-	pub fn is_fresh(&self, issued_at_ms: u64, now_ms: u64) -> bool {
-		now_ms.abs_diff(issued_at_ms) <= self.window_ms
+	/// Whether `order_ms` (`Frame.metadata.order`) is within the freshness window of `now_ms`
+	pub fn is_fresh(&self, order_ms: u64, now_ms: u64) -> bool {
+		now_ms.abs_diff(order_ms) <= self.window_ms
 	}
 
 	/// Record `signature` for `signer` if unseen within the window
@@ -352,7 +352,7 @@ impl ReplayGuard {
 /// 3. Verify frame integrity present (else `Unauthenticated`, not counted)
 /// 4. Look up signer certificate in trust store (unknown signer: `PermissionDenied`, not counted)
 /// 5. Verify signature using certificate's public key (invalid: `PermissionDenied`, **counted**)
-/// 6. Decode the command and check `issued_at_ms` freshness (stale: `PermissionDenied`, not counted)
+/// 6. Check `Frame.metadata.order` freshness (stale: `PermissionDenied`, not counted)
 /// 7. Reject signatures already seen inside the window (replay: `PermissionDenied`, not counted)
 /// 8. On success: record success (resets breaker)
 ///
@@ -418,12 +418,17 @@ impl GatePolicy for ClusterSecurityGate {
 			TrustVerification::Verified => {}
 		}
 
-		let Ok(command) = crate::decode::<ClusterCommand>(&frame.message) else {
+		// Shape gate only; the decoded value is discarded and the command
+		// dispatcher decodes again. Running the decode HERE, before the
+		// freshness and replay steps, keeps a signed-but-malformed frame
+		// from ever taking a replay-guard record or consuming partition
+		// capacity (CWE-770).
+		let Ok(_command) = crate::decode::<ClusterCommand>(&frame.message) else {
 			return TransitStatus::PermissionDenied;
 		};
 
 		let now = current_timestamp_ms();
-		if !self.replay_guard.is_fresh(command.issued_at_ms, now) {
+		if !self.replay_guard.is_fresh(frame.metadata.order, now) {
 			return TransitStatus::PermissionDenied;
 		}
 

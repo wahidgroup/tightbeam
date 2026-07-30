@@ -516,9 +516,9 @@ pub struct HiveConf {
 	/// Drain timeout before force-stop (default: 30s)
 	pub drain_timeout: Duration,
 	/// Freshness window for signed cluster commands in milliseconds
-	/// (default: 30_000). Commands with `issued_at_ms` outside this
-	/// window of the hive clock, or whose signature was already seen
-	/// inside it, are rejected. See [`ReplayGuard`].
+	/// (default: 30_000). Commands whose `Frame.metadata.order` lies
+	/// outside this window of the hive clock, or whose signature was
+	/// already seen inside it, are rejected. See [`ReplayGuard`].
 	#[cfg(feature = "x509")]
 	pub command_freshness_window_ms: u64,
 	/// Retry policy for cluster notifications (scaling events).

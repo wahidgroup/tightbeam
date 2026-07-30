@@ -184,28 +184,32 @@ tb_scenario! {
 // Gate Reply Shapes - fixtures
 // ============================================================================
 
-/// Fresh heartbeat command (unique `issued_at_ms` per call site via clock).
-fn heartbeat_command(issued_at_ms: u64) -> ClusterCommand {
+/// Fresh heartbeat command body (freshness binds to `Frame.metadata.order`).
+fn heartbeat_command() -> ClusterCommand {
 	ClusterCommand {
-		issued_at_ms,
 		heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
 		manage: None,
 	}
 }
 
 /// Command frame with integrity witness (unsigned until the caller signs it).
-fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError> {
+/// `metadata.order` is the freshness binding (CWE-294).
+fn command_frame_with_order(id: &[u8], cmd: ClusterCommand, order: u64) -> Result<Frame, TightBeamError> {
 	FrameBuilder::from(Version::V1)
 		.with_id(id)
+		.with_order(order)
 		.with_message(cmd)
 		.with_witness_hasher::<Sha3_256>()
 		.build()
 }
 
+fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError> {
+	command_frame_with_order(id, cmd, current_timestamp_ms())
+}
+
 /// Manage command with a stop request (unique id per call site).
 fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 	let manage_cmd = ClusterCommand {
-		issued_at_ms: current_timestamp_ms(),
 		heartbeat: None,
 		manage: Some(HiveManagementRequest {
 			spawn: None,
@@ -220,7 +224,6 @@ fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 /// Manage command with a spawn request.
 fn spawn_command_frame(id: &[u8], servlet_type: &str) -> Result<Frame, TightBeamError> {
 	let manage_cmd = ClusterCommand {
-		issued_at_ms: current_timestamp_ms(),
 		heartbeat: None,
 		manage: Some(HiveManagementRequest {
 			spawn: Some(SpawnServletParams { servlet_type: servlet_urn(servlet_type), config: None }),
@@ -322,7 +325,7 @@ fn manage_spawn_shape_status(response: &ClusterCommandResponse) -> Result<Transi
 }
 
 async fn signed_heartbeat_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
-	command_frame(id, heartbeat_command(current_timestamp_ms()))?
+	command_frame(id, heartbeat_command())?
 		.sign_with_provider::<Sha3_256, _>(provider)
 		.await
 }
@@ -392,7 +395,7 @@ tb_scenario! {
 			let mut client = connect_hive(&hive).await?;
 
 			// Unsigned heartbeat: heartbeat CHOICE, no capacity data pre-auth
-			let unsigned_heartbeat = command_frame(b"hb-unsigned", heartbeat_command(current_timestamp_ms()))?;
+			let unsigned_heartbeat = command_frame(b"hb-unsigned", heartbeat_command())?;
 			let response = emit_command(&mut client, unsigned_heartbeat).await?;
 			trace.event_with(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(&response, true)?)?;
 
@@ -418,10 +421,11 @@ tb_scenario! {
 			// signature transplanted from a different frame is the one failure
 			// class the breaker counts.
 			let now = current_timestamp_ms();
-			let donor_heartbeat = command_frame(b"hb-donor", heartbeat_command(now))?;
+			let donor_heartbeat = command_frame_with_order(b"hb-donor", heartbeat_command(), now)?;
 			let donor = donor_heartbeat.sign_with_provider::<Sha3_256, _>(&signer.provider).await?;
 
-			let mut forged = command_frame(b"hb-forged", heartbeat_command(now.saturating_add(1)))?;
+			let mut forged =
+				command_frame_with_order(b"hb-forged", heartbeat_command(), now.saturating_add(1))?;
 			forged.nonrepudiation = donor.nonrepudiation.to_owned();
 
 			let response = emit_command(&mut client, forged).await?;

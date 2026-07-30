@@ -26,7 +26,7 @@ mod std_imports {
 	pub use crate::crypto::hash::Digest;
 	pub use crate::crypto::hash::Sha3_256;
 	pub use crate::crypto::policy::VerificationPolicy;
-	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
+	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::crypto::x509::name::Name;
 	pub use crate::crypto::x509::utils::{certificate_extension, ensure_signature_algorithm_consistency};
 	pub use crate::der::oid::AssociatedOid;
@@ -224,9 +224,16 @@ pub trait TrustBuilder: Sized {
 /// §6.1.3(f) applies the same rule during path validation:
 /// <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>.
 ///
-/// Processed by this validator: `basicConstraints` (§4.2.1.9) and `keyUsage`
-/// (§4.2.1.3). Any other critical extension -- including `nameConstraints`
-/// and `policyConstraints`, which are not implemented -- fails closed.
+/// Processed by this validator: `basicConstraints` (§4.2.1.9), `keyUsage`
+/// (§4.2.1.3), and `subjectAltName` (§4.2.1.6), which colony membership
+/// consumes as the URI SAN colony URN and which MUST be critical when the
+/// subject DN is empty (§4.1.2.6). Any other critical extension --
+/// including `nameConstraints` and `policyConstraints`, which are not
+/// implemented -- fails closed.
+///
+/// This validator performs no name-based endpoint verification. If one
+/// is ever added, it MUST match against the SAN contents, because a SAN
+/// accepted here is otherwise only consumed for colony membership.
 #[cfg(feature = "std")]
 fn ensure_critical_extensions_processed(cert: &Certificate) -> Result<(), CertificateValidationError> {
 	let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
@@ -234,7 +241,9 @@ fn ensure_critical_extensions_processed(cert: &Certificate) -> Result<(), Certif
 	};
 
 	for extension in extensions {
-		let processed = extension.extn_id == BasicConstraints::OID || extension.extn_id == KeyUsage::OID;
+		let processed = extension.extn_id == BasicConstraints::OID
+			|| extension.extn_id == KeyUsage::OID
+			|| extension.extn_id == SubjectAltName::OID;
 		if extension.critical && !processed {
 			return Err(CertificateValidationError::UnprocessedCriticalExtension(extension.extn_id));
 		}
@@ -947,6 +956,16 @@ mod tests {
 	fn accepts_processed_critical_extensions() {
 		let mut cert = create_test_certificate(&create_test_signing_key());
 		cert.tbs_certificate.extensions = Some(ca_extensions(true, true, None));
+
+		assert!(ensure_critical_extensions_processed(&cert).is_ok());
+	}
+
+	#[test]
+	fn accepts_critical_subject_alt_name() {
+		// subjectAltName (2.5.29.17) is processed for colony membership and
+		// MUST be critical when the subject DN is empty (RFC 5280 §4.1.2.6).
+		let mut cert = create_test_certificate(&create_test_signing_key());
+		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.17", true)]);
 
 		assert!(ensure_critical_extensions_processed(&cert).is_ok());
 	}

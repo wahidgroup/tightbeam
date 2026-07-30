@@ -4,14 +4,18 @@ use core::time::Duration;
 use std::sync::Arc;
 
 #[cfg(feature = "x509")]
-use super::GossipConf;
+use super::{cert_colony_urn, GossipAdmission, GossipConf};
 use super::{
 	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf, DEFAULT_HEARTBEAT_INTERVAL_SECS,
 	DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
 use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
+#[cfg(feature = "x509")]
+use crate::crypto::x509::Certificate;
 use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
+#[cfg(feature = "x509")]
+use crate::utils::urn::Urn;
 
 // ============================================================================
 // HeartbeatConfBuilder
@@ -208,8 +212,31 @@ impl ClusterConfBuilder {
 		self
 	}
 
+	/// Set the per-signer gossip rate admission.
+	/// Defaults to the token bucket in [`GossipConf::default`].
+	pub fn with_gossip_admission(mut self, admission: Arc<dyn GossipAdmission>) -> Self {
+		self.gossip.admission = admission;
+		self
+	}
+
+	/// Deliver admitted rumors to local instances of this servlet type.
+	/// Defaults to `None`: the gateway journals and refloods only.
+	pub fn with_gossip_ingress(mut self, ingress: Urn<'static>) -> Self {
+		self.gossip.ingress = Some(ingress);
+		self
+	}
+
 	/// Build the ClusterConf
 	pub fn build(self) -> ClusterConf {
+		// Colony membership is derived from the certificate exactly once:
+		// the colony URN binds to the cert's URI SAN, and every per-frame
+		// membership check compares against this cached value. A cert
+		// that fails to decode or carries no valid colony URN leaves the
+		// gateway a non-member, fail closed.
+		let colony_urn = Certificate::try_from(self.tls.certificate.clone())
+			.ok()
+			.and_then(|cert| cert_colony_urn(&self.namespace, &cert));
+
 		ClusterConf {
 			namespace: self.namespace,
 			load_balancer: self.load_balancer,
@@ -223,6 +250,7 @@ impl ClusterConfBuilder {
 			advertise_interval: self.advertise_interval,
 			peer_dial_allowlist: self.peer_dial_allowlist,
 			gossip: self.gossip,
+			colony_urn,
 			tls: self.tls,
 		}
 	}

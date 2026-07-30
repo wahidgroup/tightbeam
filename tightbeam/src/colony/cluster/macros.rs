@@ -93,6 +93,23 @@ macro_rules! cluster {
 			) -> Result<Self, $crate::TightBeamError> {
 				use $crate::transport::Protocol;
 
+				// The admission freshness window MUST NOT outlive journal
+				// retention: a rumor older than retention has no digest
+				// left to deduplicate against, so a wider window would
+				// re-admit a replayed rumor as new (CWE-294). Clamped
+				// here, where the config becomes immutable, so mutation
+				// after the builder cannot widen the window.
+				#[cfg(feature = "x509")]
+				let config = {
+					let mut config = config;
+					let retention =
+						::core::time::Duration::from_millis(config.gossip.journal.retention_ms());
+					if config.gossip.seen_ttl > retention {
+						config.gossip.seen_ttl = retention;
+					}
+					config
+				};
+
 				let config = ::std::sync::Arc::new(config);
 
 				// The gateway always serves TLS when x509 is enabled;
@@ -246,12 +263,14 @@ macro_rules! cluster {
 				#[cfg(feature = "x509")]
 				let advertise_handle = {
 					let advertise_pool = $crate::cluster!(@peer_dial_pool peer_pool, pool);
+					let local_pool = ::std::sync::Arc::clone(&pool);
 					let servlet_registry = ::std::sync::Arc::clone(&servlet_registry);
 					let config = ::std::sync::Arc::clone(&config);
+					let trace = ::std::sync::Arc::clone(&trace);
 					let gateway_addr: Vec<u8> = addr.clone().into();
 
 					::core::option::Option::Some($crate::cluster!(
-						@build_advertise_task $protocol, servlet_registry, advertise_pool, config, gateway_addr, $digest
+						@build_advertise_task $protocol, servlet_registry, advertise_pool, local_pool, config, gateway_addr, trace, $digest
 					))
 				};
 				#[cfg(not(feature = "x509"))]
@@ -333,10 +352,9 @@ macro_rules! cluster {
 				}
 			}
 
-			// =====================================================================
-			// Heartbeat Methods
-			// =====================================================================
+		}
 
+		impl $crate::colony::cluster::ClusterHeartbeat for $cluster_name {
 			fn registry(&self) -> &::std::sync::Arc<$crate::colony::cluster::HiveRegistry> {
 				&self.registry
 			}
@@ -436,10 +454,13 @@ macro_rules! cluster {
 		// Signed control frames must additionally be fresh and unseen: a
 		// captured registration or address update carries a valid signature,
 		// so signature verification alone cannot stop replay (CWE-294).
+		// Freshness binds to `metadata.order` (unix milliseconds), not a
+		// body timestamp: the order field is already covered by the
+		// nonrepudiation signature (§5.7.5).
 		#[cfg(feature = "x509")]
-		let verify_control_freshness = |issued_at_ms: u64| {
+		let verify_control_freshness = || {
 			let now = $crate::colony::common::current_timestamp_ms();
-			if !$replay_guard.is_fresh(issued_at_ms, now) {
+			if !$replay_guard.is_fresh($frame.metadata.order, now) {
 				return $crate::policy::TransitStatus::PermissionDenied;
 			}
 
@@ -459,7 +480,7 @@ macro_rules! cluster {
 			$crate::policy::TransitStatus::Ok
 		};
 		#[cfg(not(feature = "x509"))]
-		let verify_control_freshness = |_issued_at_ms: u64| $crate::policy::TransitStatus::Ok;
+		let verify_control_freshness = || $crate::policy::TransitStatus::Ok;
 
 		// Single decode of the CHOICE envelope: the tag discriminates
 		// the request type. Undecodable input is rejected fail-closed.
@@ -483,7 +504,7 @@ macro_rules! cluster {
 				});
 			}
 
-			let freshness_status = verify_control_freshness(request.issued_at_ms);
+			let freshness_status = verify_control_freshness();
 			if freshness_status != $crate::policy::TransitStatus::Ok {
 				let _ = $trace.event($crate::instrumentation::events::CLUSTER_REGISTER_REFUSED);
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::RegisterHiveResponse {
@@ -626,7 +647,7 @@ macro_rules! cluster {
 				});
 			}
 
-			let freshness_status = verify_control_freshness(update.issued_at_ms);
+			let freshness_status = verify_control_freshness();
 			if freshness_status != $crate::policy::TransitStatus::Ok {
 				let _ = $trace.event($crate::instrumentation::events::CLUSTER_UPDATE_REFUSED);
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
@@ -870,7 +891,7 @@ macro_rules! cluster {
 				$crate::cluster!(@refuse_peer_ad $frame, $trace, origin_status);
 			}
 
-			let freshness_status = verify_control_freshness(advertisement.issued_at_ms);
+			let freshness_status = verify_control_freshness();
 			if freshness_status != $crate::policy::TransitStatus::Ok {
 				$crate::cluster!(@refuse_peer_ad $frame, $trace, freshness_status);
 			}
@@ -908,64 +929,238 @@ macro_rules! cluster {
 			});
 		}
 
-		// A relayed rumor verifies on the peer trust plane, exactly like an
-		// advertisement: a hive certificate must not forge a peer relay. It
-		// then enters the shared gossip pipeline (dedup + one local delivery).
+		// A relayed rumor arrives as a complete origin-signed frame inside
+		// an outer relay frame. The OUTER frame verifies on the peer trust
+		// plane, exactly like an advertisement: a hive certificate must not
+		// forge a peer relay. The INNER rumor frame then verifies its own
+		// origin signature on the same plane, so a relay that tampered with
+		// the rumor content is caught here and scored, before the shared
+		// gossip pipeline (dedup + one local delivery) runs.
 		#[cfg(feature = "x509")]
-		$crate::colony::common::ClusterRequest::Gossip(envelope) => {
+		$crate::colony::common::ClusterRequest::Gossip(rumor) => {
+			let rumor = *rumor;
 			let origin_status = verify_peer_origin();
 			if origin_status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@refuse_gossip $frame, $trace, origin_status);
 			}
 
+			// Gossip is a colony operation: this gateway and the relaying
+			// peer must both carry a valid colony URN SAN. A membership
+			// refusal is policy, not relay misbehavior, so no trail is
+			// weakened.
+			let ::core::option::Option::Some(local_colony) = $config.colony_urn() else {
+				return $crate::cluster!(@refuse_gossip $frame, $trace,
+					$crate::policy::TransitStatus::PermissionDenied);
+			};
+			if $crate::colony::cluster::frame_colony_urn(
+				&$config.namespace,
+				$config.tls.peer_trust.as_deref(),
+				&$frame,
+			)
+			.is_none()
+			{
+				return $crate::cluster!(@refuse_gossip $frame, $trace,
+					$crate::policy::TransitStatus::PermissionDenied);
+			}
+
+			// The remaining hop radius rides the outer relay frame's
+			// `metadata.lifetime`, which the relay rebuilt and re-signed,
+			// so it is hop-authenticated. An honest relay always sets it;
+			// a missing lifetime is relay misbehavior and is scored.
+			let hop_ttl = match $frame.metadata.lifetime {
+				::core::option::Option::Some(hop_ttl) => hop_ttl,
+				::core::option::Option::None => {
+					$crate::cluster!(@weaken_invalid_relay relay, $frame, $servlet_registry, $config, $trace);
+					return $crate::cluster!(@refuse_gossip $frame, $trace,
+						$crate::policy::TransitStatus::PermissionDenied);
+				}
+			};
+
+			// The rumor's own signature proves the origin gateway on the
+			// peer trust plane and covers its id, issue time, and payload
+			// (§5.7.5). An honest relay verified before forwarding,
+			// so an unverifiable rumor is relay misbehavior and is scored.
+			let rumor_status = match $config.tls.peer_trust.as_ref() {
+				::core::option::Option::Some(trust) => {
+					match $crate::colony::hive::verify_frame_signature(trust.as_ref(), &rumor) {
+						$crate::colony::hive::TrustVerification::Verified => $crate::policy::TransitStatus::Ok,
+						$crate::colony::hive::TrustVerification::MissingSignature => {
+							$crate::policy::TransitStatus::Unauthenticated
+						}
+						_ => $crate::policy::TransitStatus::PermissionDenied,
+					}
+				}
+				::core::option::Option::None => $crate::policy::TransitStatus::PermissionDenied,
+			};
+			if rumor_status != $crate::policy::TransitStatus::Ok {
+				$crate::cluster!(@weaken_invalid_relay relay, $frame, $servlet_registry, $config, $trace);
+				return $crate::cluster!(@refuse_gossip $frame, $trace, rumor_status);
+			}
+
+			// Flood scope: a rumor admits only into the origin's own
+			// colony. The compare binds the full colony URN from the
+			// origin certificate resolved on the peer trust plane; rumor
+			// bytes carry no scope, because unsigned scope bytes would be
+			// weaker than the certificate binding (CWE-345). A foreign or
+			// missing colony URN is a policy refusal, never scored.
+			let origin_colony = $crate::colony::cluster::frame_colony_urn(
+				&$config.namespace,
+				$config.tls.peer_trust.as_deref(),
+				&rumor,
+			);
+			if origin_colony.as_ref() != ::core::option::Option::Some(local_colony) {
+				return $crate::cluster!(@refuse_gossip $frame, $trace,
+					$crate::policy::TransitStatus::PermissionDenied);
+			}
+
 			// Gossip freshness is the seen-ttl window checked in `admit`
-			// against the hop-invariant origin timestamp, not the shorter
-			// control window: a rumor relayed across several hops is
-			// legitimately older than a one-shot control frame. Replay is
-			// subsumed by that window plus journal digest dedup, so the
+			// against the rumor's hop-invariant signed issue time, not the
+			// shorter control window: a rumor relayed across several hops
+			// is legitimately older than a one-shot control frame. Replay
+			// is subsumed by that window plus journal digest dedup, so the
 			// relay takes no replay record here.
-			$crate::cluster!(@gossip_pipeline
-				$frame, $servlet_registry, $config, $pool, $peer_pool, $trace, $digest, envelope);
+			$crate::cluster!(@gossip_pipeline relay,
+				$frame, $servlet_registry, $config, $pool, $peer_pool, $trace, $digest, rumor, hop_ttl);
 		}
 
 		// An origin rumor from a local publisher verifies on the hive trust
 		// plane, like a registration: a peer certificate must not inject
-		// origin gossip. It then enters the same pipeline.
+		// origin gossip. This gateway is the FIRST GATEWAY that accepted
+		// the publish: it mints the rumor frame and signs it with its
+		// cluster key, so every gateway on the peer trust plane can verify
+		// the origin end to end.
 		#[cfg(feature = "x509")]
-		$crate::colony::common::ClusterRequest::PublishGossip(mut envelope) => {
+		$crate::colony::common::ClusterRequest::PublishGossip(body) => {
 			let origin_status = verify_hive_origin();
 			if origin_status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@refuse_gossip $frame, $trace, origin_status);
 			}
 
-			// The wire ttl is the publisher's request. The origin gateway
-			// caps it at the operator's configured hop radius (itself
-			// bounded by the protocol cap) while honoring a smaller
-			// request, such as ttl 0 for local-only delivery. The digest
-			// excludes ttl, so the clamp does not change the rumor's identity.
-			envelope.ttl = envelope
-				.ttl
-				.min($config.gossip.ttl.min($crate::constants::MAX_GOSSIP_TTL));
+			// Publishing starts a colony flood, so the accepting gateway
+			// itself must be a colony member: the rumor it mints is
+			// scoped by the colony URN in its own certificate, which
+			// every receiving gateway resolves and compares.
+			if $config.colony_urn().is_none() {
+				return $crate::cluster!(@refuse_gossip $frame, $trace,
+					$crate::policy::TransitStatus::PermissionDenied);
+			}
 
-			$crate::cluster!(@gossip_pipeline
-				$frame, $servlet_registry, $config, $pool, $peer_pool, $trace, $digest, envelope);
+			// The publish frame's `metadata.lifetime` is the publisher's
+			// requested hop radius; absent, the operator default applies.
+			// The origin gateway caps it at the operator's configured
+			// radius (itself bounded by the protocol cap) while honoring a
+			// smaller request, such as 0 for local-only delivery. The hop
+			// radius lives outside the rumor, so the clamp does not change
+			// the rumor's identity.
+			let radius_cap = u64::from($config.gossip.ttl.min($crate::constants::MAX_GOSSIP_TTL));
+			let hop_ttl = $frame.metadata.lifetime.unwrap_or(radius_cap).min(radius_cap);
+
+			// The rumor's id and issue-time order are copied from the
+			// publish frame, so a replayed publish re-mints a bit-identical
+			// rumor whose digest dedups as a journal Duplicate rather than
+			// minting a fresh deliverable rumor (CWE-294).
+			let rumor = {
+				use $crate::builder::TypeBuilder;
+				$crate::builder::frame::FrameBuilder::from($crate::Version::V2)
+					.with_id(&$frame.metadata.id)
+					.with_order($frame.metadata.order)
+					.with_message(body)
+					.with_witness_hasher::<$digest>()
+					.build()
+			};
+			let rumor = match rumor {
+				::core::result::Result::Ok(rumor) => rumor,
+				::core::result::Result::Err(_) => {
+					return $crate::cluster!(@refuse_gossip $frame, $trace,
+						$crate::policy::TransitStatus::Unavailable);
+				}
+			};
+			let rumor = match rumor.sign_with_provider::<$digest, _>($config.tls.key.as_ref()).await {
+				::core::result::Result::Ok(rumor) => rumor,
+				::core::result::Result::Err(_) => {
+					return $crate::cluster!(@refuse_gossip $frame, $trace,
+						$crate::policy::TransitStatus::Unavailable);
+				}
+			};
+
+			$crate::cluster!(@gossip_pipeline origin,
+				$frame, $servlet_registry, $config, $pool, $peer_pool, $trace, $digest, rumor, hop_ttl);
+		}
+
+		// A reconciliation summary verifies on the peer trust plane, like an
+		// advertisement. Admission is the peer-plane signature plus the control
+		// freshness window. Digests only travel here; rumor content does not.
+		// The reply lists digests this gateway lacks so the peer can push them.
+		#[cfg(feature = "x509")]
+		$crate::colony::common::ClusterRequest::ReconcileGossip(reconciliation) => {
+			let origin_status = verify_peer_origin();
+			if origin_status != $crate::policy::TransitStatus::Ok {
+				$crate::cluster!(@refuse_reconcile $frame, $trace);
+			}
+
+			// Reconciliation exchanges colony gossip state, so both this
+			// gateway and the requesting peer must be colony members.
+			// Checked before freshness so a policy refusal never takes a
+			// replay record (CWE-772).
+			if $config.colony_urn().is_none()
+				|| $crate::colony::cluster::frame_colony_urn(
+					&$config.namespace,
+					$config.tls.peer_trust.as_deref(),
+					&$frame,
+				)
+				.is_none()
+			{
+				$crate::cluster!(@refuse_reconcile $frame, $trace);
+			}
+
+			let freshness_status = verify_control_freshness();
+			if freshness_status != $crate::policy::TransitStatus::Ok {
+				$crate::cluster!(@refuse_reconcile $frame, $trace);
+			}
+
+			// Digest lists share the journal capacity bound so a peer cannot
+			// force an unbounded set-difference work unit (CWE-770).
+			if reconciliation.held.len() > $crate::constants::MAX_GOSSIP_LOG {
+				$crate::cluster!(@refuse_reconcile $frame, $trace);
+			}
+
+			// A journal read failure yields an empty want.
+			// Repair defers to a later beat instead of refusing the peer.
+			let want = match $config.gossip.journal.held_digests(
+				$crate::colony::common::current_timestamp_ms(),
+			) {
+				::core::result::Result::Ok(held) => {
+					$crate::colony::cluster::gossip_want(&reconciliation.held, &held)
+				}
+				::core::result::Result::Err(_) => ::std::vec::Vec::new(),
+			};
+
+			return $crate::cluster!(@reply $frame, $crate::colony::common::GossipWant { want });
 		}
 		}
 	}};
 
 	// Shared gossip pipeline: admit, dedup via the journal, and deliver once
-	// to a local instance of the target type. A duplicate is dropped.
-	(@gossip_pipeline $frame:ident, $servlet_registry:ident, $config:ident, $pool:ident, $peer_pool:ident, $trace:ident, $digest:path, $envelope:expr) => {{
-		let envelope = $envelope;
+	// through the operator's ingress policy. A duplicate is dropped.
+	// `$rumor` is the origin-signed rumor frame (already verified on the
+	// relay path); `$ttl` is the remaining hop radius from the OUTER frame.
+	// The `$origin` marker is `relay` for peer-relayed rumors and `origin`
+	// for local publishes: only a relay scores its sender on admit failure.
+	(@gossip_pipeline $origin:tt, $frame:ident, $servlet_registry:ident, $config:ident, $pool:ident, $peer_pool:ident, $trace:ident, $digest:path, $rumor:expr, $ttl:expr) => {{
+		let rumor = $rumor;
+		let hop_ttl = $ttl;
 
 		let admitted = match $crate::colony::cluster::AdmittedGossip::admit::<$digest>(
-			&envelope,
-			&$config.namespace,
+			&rumor,
+			hop_ttl,
 			$config.gossip.seen_ttl.as_millis() as u64,
 			$crate::colony::common::current_timestamp_ms(),
 		) {
 			::core::result::Result::Ok(admitted) => admitted,
-			::core::result::Result::Err(status) => return $crate::cluster!(@refuse_gossip $frame, $trace, status),
+			::core::result::Result::Err(status) => {
+				$crate::cluster!(@weaken_invalid_relay $origin, $frame, $servlet_registry, $config, $trace);
+				return $crate::cluster!(@refuse_gossip $frame, $trace, status);
+			}
 		};
 
 		// The signer keys the journal partition. An unsigned or unencodable
@@ -985,7 +1180,23 @@ macro_rules! cluster {
 		};
 
 		let now = $crate::colony::common::current_timestamp_ms();
-		match $config.gossip.journal.record(&signer_id, admitted.digest(), &envelope, now) {
+
+		// Per-signer rate admission runs before the journal records or refloods.
+		// An over-limit signer cannot grow retained state or amplify traffic (CWE-770).
+		// An admission backend fault refuses the rumor rather than admitting it.
+		match $config.gossip.admission.allow(&signer_id, now) {
+			::core::result::Result::Ok(true) => {}
+			::core::result::Result::Ok(false) => {
+				return $crate::cluster!(@refuse_gossip $frame, $trace,
+					$crate::policy::TransitStatus::ResourceExhausted)
+			}
+			::core::result::Result::Err(_) => {
+				return $crate::cluster!(@refuse_gossip $frame, $trace,
+					$crate::policy::TransitStatus::Unavailable)
+			}
+		}
+
+		match $config.gossip.journal.record(&signer_id, admitted.digest(), &rumor, now) {
 			::core::result::Result::Ok($crate::colony::cluster::Admission::Duplicate) => {
 				let _ = $trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_DUPLICATE);
 				return $crate::cluster!(@reply $frame, $crate::colony::common::GossipResponse {
@@ -999,51 +1210,75 @@ macro_rules! cluster {
 			}
 		}
 
-		let type_key = admitted.type_key().to_vec();
-		let entries = match $servlet_registry.local_entries_for_type(&type_key) {
-			::core::result::Result::Ok(entries) => entries,
-			::core::result::Result::Err(_) => ::std::vec::Vec::new(),
-		};
-
-		let metrics: ::std::vec::Vec<$crate::colony::common::InstanceMetrics> = entries
-			.iter()
-			.map(|entry| $crate::colony::common::InstanceMetrics {
-				instance_key: entry.route_key().to_vec(),
-				pheromone: entry.pheromone_level(),
-			})
-			.collect();
-
-		// A New rumor is already recorded for dedup and reflood. Local
-		// delivery is confirmed separately: only a rumor actually delivered
-		// to a local instance is acked and reported CLUSTER_GOSSIP_ACCEPTED.
-		if let ::core::option::Option::Some(selected_idx) = $config.load_balancer.select(&metrics) {
-			let dial_addr = ::std::sync::Arc::clone(entries[selected_idx].dial_target());
-			let payload = envelope.payload.clone();
-			if let ::core::result::Result::Ok(_response) = $crate::cluster!(@forward_work $pool, dial_addr, payload) {
-				let _ = $config.gossip.journal.ack_local(&admitted.digest());
-				let _ = $trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_ACCEPTED);
-			}
-		}
+		// A New rumor is already recorded for dedup and reflood.
+		// Local delivery is confirmed separately.
+		// Only a delivered rumor is acked and reported as CLUSTER_GOSSIP_ACCEPTED.
+		$crate::cluster!(@gossip_deliver_local
+			$servlet_registry, $config, $pool, $trace,
+			admitted.payload().to_vec(), admitted.digest());
 
 		// Reflood a still-live rumor to the peer graph on a detached task so
-		// the reply is not blocked on the flood cascade. Loop-freedom holds
-		// without skipping the sender: the sender drops the echo as a
-		// duplicate, and the digest plus decremented ttl bound propagation.
-		// A gateway with no peers skips the task entirely: the reflood
-		// signature is the costly step and would fan out to nobody.
-		if envelope.ttl > 0 && !$config.peers.is_empty() {
+		// the reply is not blocked on the flood cascade. The rumor bytes are
+		// forwarded verbatim; only the outer hop frame is rebuilt with the
+		// decremented radius. Loop-freedom holds without skipping the
+		// sender: the sender drops the echo as a duplicate, and the digest
+		// plus decremented radius bound propagation. A gateway with no
+		// peers skips the task entirely: the reflood signature is the
+		// costly step and would fan out to nobody.
+		if hop_ttl > 0 && !$config.peers.is_empty() {
 			let reflood_pool = $crate::cluster!(@peer_dial_pool $peer_pool, $pool);
 			let config = ::std::sync::Arc::clone(&$config);
-			let reflood_envelope = envelope.clone();
-			let next_ttl = envelope.ttl - 1;
+			let reflood_rumor = rumor.clone();
+			let next_ttl = hop_ttl - 1;
 			let _ = $crate::colony::servlet::servlet_runtime::rt::spawn(
-				$crate::cluster!(@reflood_gossip reflood_pool, config, reflood_envelope, next_ttl, $digest)
+				$crate::cluster!(@reflood_gossip reflood_pool, config, reflood_rumor, next_ttl, $digest)
 			);
 		}
 
 		return $crate::cluster!(@reply $frame, $crate::colony::common::GossipResponse {
 			status: $crate::policy::TransitStatus::Ok,
 		});
+	}};
+
+	// Deliver one recorded rumor to a load-balanced local instance of the
+	// operator's configured ingress type. Ack the journal only after that
+	// hop succeeds. The inbound pipeline and the beat retry share this
+	// step. Delivery is receiving-gateway policy, never rumor content: no
+	// configured ingress means journal-and-reflood only, so the record is
+	// acked immediately and never enters the pending retry set. With an
+	// ingress, a rumor with no reachable instance stays pending for a
+	// later beat.
+	(@gossip_deliver_local $servlet_registry:expr, $config:expr, $pool:expr, $trace:expr, $payload:expr, $digest_value:expr) => {{
+		match $config.gossip.ingress.as_ref() {
+			::core::option::Option::None => {
+				let _ = $config.gossip.journal.ack_local(&$digest_value);
+			}
+			::core::option::Option::Some(ingress) => {
+				let type_key = $crate::colony::common::canonical_bytes(ingress);
+				let entries = match $servlet_registry.local_entries_for_type(&type_key) {
+					::core::result::Result::Ok(entries) => entries,
+					::core::result::Result::Err(_) => ::std::vec::Vec::new(),
+				};
+
+				let metrics: ::std::vec::Vec<$crate::colony::common::InstanceMetrics> = entries
+					.iter()
+					.map(|entry| $crate::colony::common::InstanceMetrics {
+						instance_key: entry.route_key().to_vec(),
+						pheromone: entry.pheromone_level(),
+					})
+					.collect();
+
+				if let ::core::option::Option::Some(selected_idx) = $config.load_balancer.select(&metrics) {
+					let dial_addr = ::std::sync::Arc::clone(entries[selected_idx].dial_target());
+					if let ::core::result::Result::Ok(_response) =
+						$crate::cluster!(@forward_work $pool, dial_addr, $payload)
+					{
+						let _ = $config.gossip.journal.ack_local(&$digest_value);
+						let _ = $trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_ACCEPTED);
+					}
+				}
+			}
+		}
 	}};
 
 	// Select the pool for dialing peer gateways: prefer the peer trust
@@ -1058,27 +1293,23 @@ macro_rules! cluster {
 	};
 
 	// Reflood one rumor to every configured peer. Expands to a future for
-	// `rt::spawn`. The frame is built and signed once (signing is the costly
-	// step) and the identical signed frame is fanned out concurrently over
-	// the pooled peer connections, so a wide peer list costs one signature
-	// and one round of mux streams.
-	(@reflood_gossip $peer_pool:expr, $config:expr, $envelope:expr, $ttl:expr, $digest:path) => {
+	// `rt::spawn`. The rumor travels verbatim inside a fresh outer hop
+	// frame whose `metadata.lifetime` carries the decremented radius. The
+	// outer frame is built and signed once (signing is the costly step)
+	// and the identical signed frame is fanned out concurrently over the
+	// pooled peer connections, so a wide peer list costs one signature and
+	// one round of mux streams.
+	(@reflood_gossip $peer_pool:expr, $config:expr, $rumor:expr, $ttl:expr, $digest:path) => {
 		async move {
 			use $crate::builder::TypeBuilder;
 
-			let request = $crate::colony::common::ClusterRequest::Gossip(
-				$crate::colony::common::GossipEnvelope {
-					issued_at_ms: $envelope.issued_at_ms,
-					target: $envelope.target,
-					ttl: $ttl,
-					payload: $envelope.payload,
-				}
-			);
+			let request = $crate::colony::common::ClusterRequest::Gossip(::std::boxed::Box::new($rumor));
 
 			let frame = match $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
 				.with_id(b"gossip-reflood")
 				.with_message(request)
 				.with_priority($crate::MessagePriority::NetworkControl)
+				.with_lifetime($ttl)
 				.with_witness_hasher::<$digest>()
 				.build()
 			{
@@ -1110,12 +1341,70 @@ macro_rules! cluster {
 		}
 	};
 
+	// Invalid-relay scoring: a trusted peer that relayed a rumor this
+	// gateway refuses has misbehaved. That covers a missing hop radius, a
+	// rumor whose origin signature does not verify (the relay forwarded
+	// tampered or forged content it should itself have refused), and any
+	// admission failure (an oversized, over-radius, stale, or undecodable
+	// rumor passed ITS admission unchecked). Every live route the relay
+	// advertised is weakened by one trial. Attribution is the signer
+	// fingerprint, which `verify_peer_origin` already proved before these
+	// checks ran. Rate-limit, journal-capacity, and colony-membership
+	// refusals never reach this arm: those refusals reflect local
+	// policy, not peer misbehavior.
+	(@weaken_invalid_relay relay, $frame:ident, $servlet_registry:ident, $config:ident, $trace:ident) => {{
+		#[cfg(feature = "x509")]
+		if let ::core::option::Option::Some(peer_id) =
+			$crate::colony::cluster::peer_signer_fingerprint($config.tls.peer_trust.as_deref(), &$frame)
+		{
+			if let ::core::result::Result::Ok(weakened) = $servlet_registry.weaken_peer(&peer_id) {
+				if weakened > 0 {
+					// The weaken event carries the verified relay
+					// fingerprint so the audit record names which peer
+					// was scored, not only that scoring happened.
+					if let ::core::result::Result::Ok(event) =
+						$trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_RELAY_WEAKENED)
+					{
+						event.with_payload(peer_id.as_ref()).emit();
+					}
+				}
+			}
+		}
+	}};
+
+	// Origin variant: a locally published rumor has no relaying peer to
+	// score, so admission failure refuses without touching any trail.
+	(@weaken_invalid_relay origin, $frame:ident, $servlet_registry:ident, $config:ident, $trace:ident) => {{}};
+
 	// Gossip refuse: fire the refused event and build the reply. Gossip
 	// takes no replay record (seen-ttl plus journal digest dedup subsume
 	// replay), so there is nothing to release. Callers prefix `return`.
 	(@refuse_gossip $frame:ident, $trace:expr, $status:expr) => {{
-		let _ = $trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_REFUSED);
+		$crate::cluster!(@gossip_refused_event $frame, $trace);
 		$crate::cluster!(@reply $frame, $crate::colony::common::GossipResponse { status: $status })
+	}};
+
+	// Refuse reconciliation with an empty want set.
+	// The peer treats the round as a well-formed no-op rather than a decode failure.
+	(@refuse_reconcile $frame:ident, $trace:expr) => {{
+		$crate::cluster!(@gossip_refused_event $frame, $trace);
+		return $crate::cluster!(@reply $frame, $crate::colony::common::GossipWant {
+			want: ::std::vec::Vec::new(),
+		});
+	}};
+
+	// Fire the refused event with the CLAIMED signer attached as evidence:
+	// most refusals fire because the claim does not resolve or verify, so
+	// the claim is the only attribution the audit record can carry.
+	(@gossip_refused_event $frame:ident, $trace:expr) => {{
+		if let ::core::result::Result::Ok(event) =
+			$trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_REFUSED)
+		{
+			match $crate::colony::cluster::signer_attribution(&$frame) {
+				::core::option::Option::Some(signer) => event.with_payload(&signer).emit(),
+				::core::option::Option::None => event.emit(),
+			}
+		}
 	}};
 
 	// Helper: refuse a peer advertisement whose replay record already
@@ -1228,7 +1517,6 @@ macro_rules! cluster {
 			use $crate::builder::TypeBuilder;
 
 			let cmd = $crate::colony::common::ClusterCommand {
-				issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 				heartbeat: Some($crate::colony::common::HeartbeatParams {
 					cluster_status: $crate::colony::common::ClusterStatus::Healthy,
 				}),
@@ -1237,8 +1525,10 @@ macro_rules! cluster {
 
 			// Priority is a V2+ metadata field. Composing it on V1 fails at
 			// build time and every heartbeat would count as a send failure.
+			// `metadata.order` is the command freshness binding (CWE-294).
 			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
 				.with_id(b"heartbeat")
+				.with_order($crate::colony::common::current_timestamp_ms())
 				.with_message(cmd)
 				.with_priority($crate::MessagePriority::NetworkControl)
 				.with_witness_hasher::<$digest>()
@@ -1268,7 +1558,6 @@ macro_rules! cluster {
 
 			let request = $crate::colony::common::ClusterRequest::AdvertisePeer(
 				$crate::colony::common::PeerAdvertisement {
-					issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 					gateway_addr: $gateway_addr,
 					advertised_types: $types,
 				}
@@ -1276,6 +1565,7 @@ macro_rules! cluster {
 
 			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
 				.with_id(b"peer-advertise")
+				.with_order($crate::colony::common::current_timestamp_ms())
 				.with_message(request)
 				.with_priority($crate::MessagePriority::NetworkControl)
 				.with_witness_hasher::<$digest>()
@@ -1296,24 +1586,197 @@ macro_rules! cluster {
 		}.await
 	};
 
-	// Helper: Build the advertise beat task. Inert unless an interval and
-	// peers are configured. Each tick advertises the servlet registry's
-	// live local routes, capped at MAX_ADVERTISED_TYPES.
-	// An empty slate is still sent.
-	(@build_advertise_task $protocol:path, $servlet_registry:expr, $pool:expr, $config:expr, $gateway_addr:expr, $digest:path) => {{
+	// Run one anti-entropy reconciliation round against one peer.
+	// This gateway advertises retained digests. The peer answers with digests it lacks.
+	// Missing rumors are fetched and pushed back as `Gossip` frames.
+	//
+	// `$acked` is this peer's push ledger: digests the peer previously
+	// acknowledged with `Ok`. A previously acknowledged digest reappearing
+	// in the peer's want set means the peer accepted the rumor and then
+	// dropped it (grey hole), so the round weakens every route dialed
+	// through that peer once and fires the drop-signal event. Attribution
+	// is by dial address because reconciliation replies are unsigned; the
+	// peer pool's pinned trust authenticates the endpoint at that address.
+	(@reconcile_gossip_async $pool:expr, $config:expr, $peer_addr:expr, $servlet_registry:expr, $trace:expr, $acked:expr, $peer_bytes:expr, $digest:path) => {
+		async {
+			use $crate::builder::TypeBuilder;
+
+			let now = $crate::colony::common::current_timestamp_ms();
+			let held: ::std::vec::Vec<::std::vec::Vec<u8>> = $config
+				.gossip
+				.journal
+				.held_digests(now)?
+				.iter()
+				.map(|digest| digest.to_vec())
+				.collect();
+
+			let request = $crate::colony::common::ClusterRequest::ReconcileGossip(
+				$crate::colony::common::GossipReconciliation { held }
+			);
+
+			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
+				.with_id(b"gossip-reconcile")
+				.with_order(now)
+				.with_message(request)
+				.with_priority($crate::MessagePriority::NetworkControl)
+				.with_witness_hasher::<$digest>()
+				.build()?;
+
+			let signed_frame = frame
+				.sign_with_provider::<$digest, _>($config.tls.key.as_ref())
+				.await?;
+
+			let mut client = $pool.connect($peer_addr).await?;
+
+			let response = client.emit(signed_frame, None).await?
+				.ok_or($crate::colony::cluster::ClusterError::NoResponse)?;
+
+			let reply: $crate::colony::common::GossipWant =
+				$crate::decode(&response.message)?;
+
+			// A peer want-list above the journal bound is policy abuse, not
+			// a repair signal: drop the round rather than allocate work.
+			if reply.want.len() > $crate::constants::MAX_GOSSIP_LOG {
+				return Ok::<_, $crate::colony::cluster::ClusterError>(());
+			}
+
+			let wanted = $crate::colony::cluster::wanted_digests(&reply.want);
+
+			// Grey-hole check: a digest this peer already acknowledged with
+			// `Ok` cannot legitimately be wanted again while retention holds,
+			// so its reappearance is a drop signal. One weaken per round
+			// regardless of how many digests reappeared: consecutive
+			// dropping rounds accumulate trials toward abandonment, while a
+			// transient loss (peer restart) costs at most one trial and
+			// heals on the next clean round.
+			let acked = $acked;
+			let dropped = wanted.iter().any(|digest| acked.contains(digest));
+			if dropped {
+				let _ = $servlet_registry.weaken_peer_by_dial($peer_bytes);
+				let _ = $trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_DROP_SIGNAL);
+			}
+			for digest in &wanted {
+				acked.remove(digest);
+			}
+
+			let now = $crate::colony::common::current_timestamp_ms();
+			let seen_ttl_ms = $config.gossip.seen_ttl.as_millis() as u64;
+			let missing = $config.gossip.journal.fetch(&wanted, now)?;
+
+			// Push each retained rumor verbatim inside a fresh outer frame,
+			// so the origin signature survives anti-entropy repair intact.
+			// Only rumors whose signed issue time is still inside the
+			// freshness window are pushed. The outer `lifetime` is 0: a
+			// repair push is pure delivery to one peer, never a reflood.
+			// The peer admits each through the same path as a live relay.
+			let admissible = missing.into_iter().filter(|rumor| {
+				$crate::colony::cluster::gossip_fresh(rumor.metadata.order, seen_ttl_ms, now)
+			});
+
+			for rumor in admissible {
+				let ::core::result::Result::Ok(pushed_digest) =
+					$crate::colony::cluster::gossip_digest::<$digest>(&rumor)
+				else {
+					continue;
+				};
+				let push = $crate::colony::common::ClusterRequest::Gossip(::std::boxed::Box::new(rumor));
+
+				let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
+					.with_id(b"gossip-repair")
+					.with_message(push)
+					.with_priority($crate::MessagePriority::NetworkControl)
+					.with_lifetime(0)
+					.with_witness_hasher::<$digest>()
+					.build()?;
+
+				let signed = frame
+					.sign_with_provider::<$digest, _>($config.tls.key.as_ref())
+					.await?;
+
+				// Record the digest only on an explicit `Ok`: a refused or
+				// unanswered push proves nothing about later retention, so
+				// it must not arm the grey-hole check.
+				if let ::core::option::Option::Some(push_reply) = client.emit(signed, None).await? {
+					let decoded: ::core::result::Result<$crate::colony::common::GossipResponse, _> =
+						$crate::decode(&push_reply.message);
+					if let ::core::result::Result::Ok(gossip_reply) = decoded {
+						if ::core::matches!(gossip_reply.status, $crate::policy::TransitStatus::Ok) {
+							acked.insert(pushed_digest);
+						}
+					}
+				}
+			}
+
+			Ok::<_, $crate::colony::cluster::ClusterError>(())
+		}.await
+	};
+
+	// Build the advertise beat task. Inert unless an interval is configured.
+	// Each tick retries local delivery of any rumor still pending.
+	// When peers are configured, the same beat advertises live local routes
+	// (capped at MAX_ADVERTISED_TYPES) and reconciles gossip with each peer.
+	// An empty slate is still sent. Local retry does not require peers: a
+	// lone gateway still delivers rumors that arrived before its ingress
+	// servlet registered.
+	//
+	// Two pools are threaded. `$pool` dials peer gateways on the peer trust plane when present.
+	// `$local_pool` is the hive pool used for local servlet delivery retries.
+	(@build_advertise_task $protocol:path, $servlet_registry:expr, $pool:expr, $local_pool:expr, $config:expr, $gateway_addr:expr, $trace:expr, $digest:path) => {{
 		let servlet_registry = $servlet_registry;
 		let pool = $pool;
+		let local_pool = $local_pool;
 		let config = $config;
 		let gateway_addr = $gateway_addr;
+		let trace = $trace;
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			let Some(interval) = config.advertise_interval else { return };
-			if config.peers.is_empty() {
-				return;
-			}
+
+			// Per-peer push ledger for grey-hole detection: digests each
+			// peer acknowledged with `Ok` during anti-entropy repair. Loop
+			// local because only this task reads or writes it. Growth is
+			// bounded by journal capacity times the static peer list, so
+			// no unbounded resource is consumed (CWE-770).
+			let mut push_ledger: ::std::collections::HashMap<
+				::std::string::String,
+				::std::collections::HashSet<$crate::colony::cluster::GossipDigest>,
+			> = ::std::collections::HashMap::new();
 
 			loop {
 				$crate::colony::servlet::servlet_runtime::rt::sleep(interval).await;
+
+				// Retry local delivery for journaled rumors not yet delivered.
+				// A common case is a rumor that arrived before the ingress servlet registered.
+				// A delivered rumor is acked and stops being retried.
+				if let ::core::result::Result::Ok(pending) = config
+					.gossip
+					.journal
+					.pending_local($crate::colony::common::current_timestamp_ms())
+				{
+					// A journal only records rumors that passed admission,
+					// so a body or digest failure here means the backend
+					// returned something it never admitted; the entry is
+					// skipped rather than delivered unvalidated.
+					for rumor in pending {
+						let ::core::result::Result::Ok(body) =
+							$crate::decode::<$crate::colony::common::GossipRumor>(&rumor.message)
+						else {
+							continue;
+						};
+						let ::core::result::Result::Ok(digest) =
+							$crate::colony::cluster::gossip_digest::<$digest>(&rumor)
+						else {
+							continue;
+						};
+						$crate::cluster!(@gossip_deliver_local
+							servlet_registry, config, local_pool, trace,
+							body.payload, digest);
+					}
+				}
+
+				if config.peers.is_empty() {
+					continue;
+				}
 
 				let slate: Vec<$crate::utils::urn::Urn<'static>> = servlet_registry
 					.local_servlets()
@@ -1329,6 +1792,17 @@ macro_rules! cluster {
 					let _ = $crate::cluster!(
 						@send_advertisement_async pool, config, peer_addr, gateway_addr.clone(), slate.clone(), $digest
 					);
+					// Anti-entropy backstop on the same beat.
+					// Repair any rumor this peer is missing so flooding gaps do not persist.
+					// Reconciliation is a colony operation: a non-member
+					// gateway skips it, as its requests would be refused.
+					if config.colony_urn().is_some() {
+						let acked = push_ledger.entry(peer.clone()).or_default();
+						let _ = $crate::cluster!(
+							@reconcile_gossip_async pool, config, peer_addr,
+							servlet_registry, trace, acked, peer.as_bytes(), $digest
+						);
+					}
 				}
 			}
 		})

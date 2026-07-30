@@ -8,7 +8,7 @@
 //! urn:{nid}:{realm}:{resource-type}:{resource-id}
 //!      │      │          │              │
 //!      │      │          │              └ name; `/` separates an instance tail
-//!      │      │          └ fixed vocabulary: servlet | hive
+//!      │      │          └ fixed vocabulary: servlet | hive | colony
 //!      │      └ deployment segment, MAY be empty
 //!      └ naming authority, default "tightbeam"
 //! ```
@@ -19,6 +19,7 @@
 //! urn:tightbeam:prod-us:servlet:beam                 servlet type
 //! urn:tightbeam:prod-us:servlet:beam/10.0.0.5:9100   servlet instance
 //! urn:tightbeam:prod-us:hive:10.0.0.5:9000           hive identity
+//! urn:tightbeam:prod-us:colony:main                  colony membership
 //! urn:acme::servlet:beam                             custom authority, no realm
 //! ```
 //!
@@ -48,6 +49,7 @@ pub const COLONY_NID: &str = "tightbeam";
 
 const SERVLET_SEGMENT: &str = "servlet";
 const HIVE_SEGMENT: &str = "hive";
+const COLONY_SEGMENT: &str = "colony";
 
 /// Naming scope for a colony deployment: authority (NID) plus an
 /// optional realm segment. All resource URNs for the deployment are
@@ -78,6 +80,12 @@ pub enum ColonyResource<'a> {
 	Hive {
 		/// The registration locator the identity was minted from.
 		addr: &'a str,
+	},
+	/// A colony membership identity, carried in a certificate's URI
+	/// Subject Alternative Name (RFC 5280 §4.2.1.6).
+	Colony {
+		/// Colony name.
+		name: &'a str,
 	},
 }
 
@@ -111,6 +119,30 @@ impl ColonyNamespace {
 	/// same reason validation refuses an empty `resource-id`.
 	pub fn servlet(&self, name: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let name = name.as_ref();
+		Self::validate_single_segment_name(name)?;
+
+		Ok(self.mint(SERVLET_SEGMENT, name))
+	}
+
+	/// Mint the URN naming a colony.
+	///
+	/// A colony URN travels in a certificate's URI Subject Alternative
+	/// Name (RFC 5280 §4.2.1.6) and asserts colony membership for
+	/// gossip and peer federation. The refusal rules match
+	/// [`ColonyNamespace::servlet`]: a name with `/` or `:` would
+	/// reparse as a different resource, and an empty name cannot name
+	/// anything.
+	pub fn colony(&self, name: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
+		let name = name.as_ref();
+		Self::validate_single_segment_name(name)?;
+
+		Ok(self.mint(COLONY_SEGMENT, name))
+	}
+
+	/// Refuse a `resource-id` that is empty or carries a grammar
+	/// delimiter, so a minted URN always validates back as the same
+	/// resource.
+	fn validate_single_segment_name(name: &str) -> Result<(), UrnValidationError> {
 		if name.is_empty() {
 			return Err(UrnValidationError::RequiredFieldMissing("resource-id"));
 		}
@@ -118,7 +150,7 @@ impl ColonyNamespace {
 			return Err(UrnValidationError::InvalidFormat { field: "resource-id", pattern: None });
 		}
 
-		Ok(self.mint(SERVLET_SEGMENT, name))
+		Ok(())
 	}
 
 	/// Mint the URN identifying a hive by its registration locator.
@@ -189,6 +221,12 @@ impl ColonyNamespace {
 				Ok(ColonyResource::Servlet { name, instance })
 			}
 			HIVE_SEGMENT => Ok(ColonyResource::Hive { addr: id }),
+			// A colony name is one segment: a `/` or extra `:` cannot
+			// come from `colony`, so such an id names nothing mintable.
+			COLONY_SEGMENT => {
+				Self::validate_single_segment_name(id)?;
+				Ok(ColonyResource::Colony { name: id })
+			}
 			_ => Err(UrnValidationError::InvalidFormat { field: "resource-type", pattern: None }),
 		}
 	}
@@ -257,6 +295,10 @@ mod tests {
 		namespace.hive(addr).expect("test locators satisfy the mint grammar")
 	}
 
+	fn colony(namespace: &ColonyNamespace, name: &str) -> Urn<'static> {
+		namespace.colony(name).expect("test names satisfy the mint grammar")
+	}
+
 	#[test]
 	fn minted_urns_round_trip_through_validate() {
 		let prod = prod();
@@ -281,10 +323,22 @@ mod tests {
 				ColonyResource::Hive { addr: "10.0.0.5:9000" },
 			),
 			(
+				&prod,
+				colony(&prod, "main"),
+				"urn:tightbeam:prod-us:colony:main",
+				ColonyResource::Colony { name: "main" },
+			),
+			(
 				&bare,
 				servlet(&bare, "beam"),
 				"urn:tightbeam::servlet:beam",
 				ColonyResource::Servlet { name: "beam", instance: None },
+			),
+			(
+				&bare,
+				colony(&bare, "main"),
+				"urn:tightbeam::colony:main",
+				ColonyResource::Colony { name: "main" },
 			),
 		];
 		for (namespace, urn, display, resource) in cases {
@@ -314,6 +368,14 @@ mod tests {
 			(
 				servlet_instance(&servlet(&namespace, "beam"), ""),
 				UrnValidationError::RequiredFieldMissing("instance"),
+			),
+			(
+				Urn::new("tightbeam", "prod-us:colony:main/tail"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
+			(
+				Urn::new("tightbeam", "prod-us:colony:main:extra"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
 			),
 		];
 		for (urn, error) in cases {
@@ -377,6 +439,15 @@ mod tests {
 				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
 			),
 			(namespace.hive(""), UrnValidationError::RequiredFieldMissing("resource-id")),
+			(namespace.colony(""), UrnValidationError::RequiredFieldMissing("resource-id")),
+			(
+				namespace.colony("main/tail"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
+			(
+				namespace.colony("main:extra"),
+				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
+			),
 		];
 		for (minted, error) in cases {
 			assert_eq!(minted.err(), Some(error));

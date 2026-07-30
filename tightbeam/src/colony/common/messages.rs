@@ -8,10 +8,13 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "x509")]
+use crate::asn1::Frame;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
 use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
+use crate::wire::wire_sequence;
 use crate::Beamable;
 
 // =============================================================================
@@ -22,7 +25,7 @@ use crate::Beamable;
 ///
 /// Clients send this to the cluster gateway. The gateway selects a local
 /// servlet or peer gateway by `servlet_type`, then delivers `payload`.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ClusterWorkRequest {
 	/// Target servlet type URN (e.g., `urn:tightbeam::servlet:ping`)
 	pub servlet_type: Urn<'static>,
@@ -35,6 +38,8 @@ pub struct ClusterWorkRequest {
 	/// An inbound `true` is served locally only and never re-forwarded.
 	pub forwarded: bool,
 }
+
+wire_sequence!(ClusterWorkRequest { servlet_type: plain, payload: octets, forwarded: plain });
 
 impl ClusterWorkRequest {
 	/// Origin work from a client (`forwarded = false`)
@@ -52,13 +57,15 @@ impl ClusterWorkRequest {
 }
 
 /// Work response from cluster
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ClusterWorkResponse {
 	/// Status of the routing/execution
 	pub status: TransitStatus,
 	/// Response payload from servlet (if successful)
 	pub payload: Option<Vec<u8>>,
 }
+
+wire_sequence!(ClusterWorkResponse { status: plain, payload: octets_opt });
 
 impl ClusterWorkResponse {
 	/// Create a successful response with payload
@@ -93,14 +100,21 @@ pub enum ClusterRequest {
 	/// Peer gateway advertising exported servlet types [context 3]
 	#[asn1(context_specific = "3", constructed = "true")]
 	AdvertisePeer(PeerAdvertisement),
-	/// Relayed gossip rumor from a peer gateway [context 4]
+	/// Relayed origin-signed rumor frame from a peer gateway [context 4]
+	///
+	/// Boxed because a nested [`Frame`] is far larger than the other
+	/// variants; the wire encoding is unchanged.
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "4", constructed = "true")]
-	Gossip(GossipEnvelope),
+	Gossip(Box<Frame>),
 	/// Origin gossip rumor from a local publisher [context 5]
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "5", constructed = "true")]
-	PublishGossip(GossipEnvelope),
+	PublishGossip(GossipRumor),
+	/// Anti-entropy digest summary from a peer gateway [context 6]
+	#[cfg(feature = "x509")]
+	#[asn1(context_specific = "6", constructed = "true")]
+	ReconcileGossip(GossipReconciliation),
 }
 
 // =============================================================================
@@ -111,11 +125,8 @@ pub enum ClusterRequest {
 ///
 /// This message is sent from a hive to a cluster controller to announce
 /// its availability and capabilities, including actual servlet addresses.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct RegisterHiveRequest {
-	/// Issue time in unix milliseconds. Binds the signed frame to a
-	/// freshness window so captured registrations cannot be replayed (CWE-294)
-	pub issued_at_ms: u64,
 	/// The address where this hive can be reached (for heartbeats)
 	pub hive_addr: Vec<u8>,
 	/// Servlet type-to-address mappings for direct routing
@@ -123,6 +134,8 @@ pub struct RegisterHiveRequest {
 	/// Optional metadata about the hive
 	pub metadata: Option<Vec<u8>>,
 }
+
+wire_sequence!(RegisterHiveRequest { hive_addr: octets, servlet_addresses: plain, metadata: octets_opt });
 
 /// Response message for hive registration
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
@@ -139,9 +152,6 @@ pub struct RegisterHiveResponse {
 /// Enables push-based cluster registry updates.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ServletAddressUpdate {
-	/// Issue time in unix milliseconds. Binds the signed frame to a
-	/// freshness window so captured updates cannot be replayed (CWE-294)
-	pub issued_at_ms: u64,
 	/// Hive identity URN (matches the identity assigned at registration)
 	pub hive_id: Urn<'static>,
 	/// Newly spawned servlet addresses
@@ -168,16 +178,15 @@ pub struct ServletAddressUpdateResponse {
 /// peer serves and forward work there. Carries only type URNs (never
 /// instance addresses): the peer is reached at `gateway_addr`, which
 /// resolves the whole peer colony rather than a single servlet.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerAdvertisement {
-	/// Issue time in unix milliseconds. Binds the signed frame to a
-	/// freshness window so captured advertisements cannot be replayed (CWE-294)
-	pub issued_at_ms: u64,
 	/// Address peers dial to reach the advertising gateway
 	pub gateway_addr: Vec<u8>,
 	/// Servlet type URNs the advertising colony exports
 	pub advertised_types: Vec<Urn<'static>>,
 }
+
+wire_sequence!(PeerAdvertisement { gateway_addr: octets, advertised_types: plain });
 
 /// Response to a peer advertisement
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
@@ -186,27 +195,34 @@ pub struct PeerAdvertisementResponse {
 	pub status: TransitStatus,
 }
 
-/// A gossip rumor flooded gateway-to-gateway across the peer graph.
+/// The signed content of one gossip rumor: its opaque payload.
 ///
-/// Gossip carries application content addressed to a servlet type rather
-/// than to a hive. A receiving gateway delivers the payload to one local
-/// instance of `target` and, while `ttl` remains, forwards the rumor to its
-/// own peers with `ttl` decremented. The deduplication digest is recomputed
-/// from `issued_at_ms`, `target`, and `payload` at each hop, so it is stable
-/// across relays and never travels on the wire.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
-pub struct GossipEnvelope {
-	/// Issue time in unix milliseconds. Binds the rumor to a freshness
-	/// window so captured gossip cannot be replayed outside it (CWE-294).
-	pub issued_at_ms: u64,
-	/// Servlet type URN the rumor is delivered to on each colony.
-	pub target: Urn<'static>,
-	/// Remaining hop radius. A gateway forwards only while this is above
-	/// zero, decrementing it on each relay.
-	pub ttl: u8,
-	/// Opaque application payload delivered to the target servlet.
+/// This one structure serves both gossip roles. A publisher sends it as
+/// [`ClusterRequest::PublishGossip`] to request a flood. The accepting
+/// origin gateway then embeds the identical DER bytes as the `message` of
+/// a rumor [`Frame`] it signs with its cluster key, so the payload is
+/// bound under the origin signature at every later hop (see §5.7.5:
+/// the signature covers version, metadata, and message).
+///
+/// The rumor names no destination. Flood scope is colony membership,
+/// carried in the origin certificate's colony URN SAN and never in rumor
+/// bytes: unsigned scope bytes would be weaker than the certificate
+/// binding (CWE-345). Local delivery is receiving-gateway policy, the
+/// optional gossip ingress servlet type.
+///
+/// The rumor frame's `metadata.id` is the rumor identity and its
+/// `metadata.order` is the issue time in unix milliseconds (§5.7.1 permits
+/// a time-based order), both copied from the publish frame. Hop state such
+/// as the remaining flood radius MUST stay outside the rumor frame: it
+/// travels in the `metadata.lifetime` of the outer relay frame, which each
+/// relay rebuilds and re-signs.
+#[derive(Debug, Beamable, Clone, PartialEq)]
+pub struct GossipRumor {
+	/// Opaque application payload delivered through the ingress policy.
 	pub payload: Vec<u8>,
 }
+
+wire_sequence!(GossipRumor { payload: octets });
 
 /// Response to a gossip rumor
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
@@ -214,6 +230,29 @@ pub struct GossipResponse {
 	/// Status of the rumor (Ok = accepted, delivered, and considered for reflood)
 	pub status: TransitStatus,
 }
+
+/// Summary of rumors a gateway retains, sent so a peer can pull missing ones.
+///
+/// This is the anti-entropy backstop to best-effort flooding.
+/// Reconciliation is a set difference over content digests.
+/// There is no cursor or ordering.
+/// A receiver refuses a wrong-length entry rather than treating it as a digest (CWE-20).
+#[derive(Debug, Beamable, Clone, PartialEq)]
+pub struct GossipReconciliation {
+	/// Content digests the sender currently retains.
+	pub held: Vec<Vec<u8>>,
+}
+
+wire_sequence!(GossipReconciliation { held: octets_seq });
+
+/// Reply to a [`GossipReconciliation`]: digests the peer lacks and wants as `Gossip` rumors.
+#[derive(Debug, Beamable, Clone, PartialEq)]
+pub struct GossipWant {
+	/// Content digests the replier lacks and is requesting.
+	pub want: Vec<Vec<u8>>,
+}
+
+wire_sequence!(GossipWant { want: octets_seq });
 
 // =============================================================================
 // Servlet Activation Messages
@@ -223,7 +262,7 @@ pub struct GossipResponse {
 ///
 /// This message is sent from a cluster controller to a hive to instruct
 /// it to morph into a specific servlet configuration.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ActivateServletRequest {
 	/// Instance URN of the servlet to activate
 	pub servlet_id: Urn<'static>,
@@ -231,14 +270,18 @@ pub struct ActivateServletRequest {
 	pub config: Option<Vec<u8>>,
 }
 
+wire_sequence!(ActivateServletRequest { servlet_id: plain, config: octets_opt });
+
 /// Response message for servlet activation
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ActivateServletResponse {
 	/// The status of the activation request
 	pub status: TransitStatus,
 	/// The address of the activated servlet (if successful)
 	pub servlet_address: Option<Vec<u8>>,
 }
+
+wire_sequence!(ActivateServletResponse { status: plain, servlet_address: octets_opt });
 
 impl ActivateServletResponse {
 	/// Create a successful activation response
@@ -259,13 +302,15 @@ impl ActivateServletResponse {
 // =============================================================================
 
 /// Servlet information entry
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ServletInfo {
 	/// Servlet instance URN (type URN with a `/{addr}` tail)
 	pub servlet_id: Urn<'static>,
 	/// The servlet's address
 	pub address: Vec<u8>,
 }
+
+wire_sequence!(ServletInfo { servlet_id: plain, address: octets });
 
 // =============================================================================
 // Hive Management Messages
@@ -289,7 +334,7 @@ pub struct HiveManagementRequest {
 }
 
 /// Parameters for spawning a new servlet
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct SpawnServletParams {
 	/// Type URN of the servlet to spawn (e.g., `urn:tightbeam::servlet:worker`)
 	pub servlet_type: Urn<'static>,
@@ -297,12 +342,16 @@ pub struct SpawnServletParams {
 	pub config: Option<Vec<u8>>,
 }
 
+wire_sequence!(SpawnServletParams { servlet_type: plain, config: octets_opt });
+
 /// Parameters for listing servlets
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ListServletsParams {
 	/// Optional filter (reserved for future use)
 	pub filter: Option<Vec<u8>>,
 }
+
+wire_sequence!(ListServletsParams { filter: octets_opt });
 
 /// Parameters for stopping a servlet
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
@@ -329,7 +378,7 @@ pub struct HiveManagementResponse {
 }
 
 /// Result of spawning a servlet
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+#[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct SpawnServletResult {
 	/// The status of the spawn request
 	pub status: TransitStatus,
@@ -338,6 +387,8 @@ pub struct SpawnServletResult {
 	/// Instance URN of the spawned servlet (e.g., `urn:tightbeam::servlet:worker/127.0.0.1:8080`)
 	pub servlet_id: Option<Urn<'static>>,
 }
+
+wire_sequence!(SpawnServletResult { status: plain, servlet_address: octets_opt, servlet_id: plain });
 
 /// Result of listing servlets
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
@@ -436,15 +487,12 @@ pub enum ClusterStatus {
 ///
 /// **Security**: Requires nonrepudiation signature and frame integrity.
 /// Frames without proper authentication will be rejected and may trigger
-/// the circuit breaker. `issued_at_ms` binds the signature to a point in
-/// time: hives reject commands outside their freshness window and replays
-/// of already-seen signatures within it (CWE-294).
+/// the circuit breaker. Freshness binds to `Frame.metadata.order` (unix
+/// milliseconds): hives reject commands outside their freshness window
+/// and replays of already-seen signatures within it (CWE-294).
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 #[beam(frame_integrity)]
 pub struct ClusterCommand {
-	/// Issue time in milliseconds since UNIX epoch (freshness binding)
-	pub issued_at_ms: u64,
-
 	/// Heartbeat request [context 0]
 	#[asn1(context_specific = "0", optional = "true")]
 	pub heartbeat: Option<HeartbeatParams>,
@@ -539,7 +587,6 @@ mod tests {
 	#[test]
 	fn cluster_request_register_hive_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::RegisterHive(RegisterHiveRequest {
-			issued_at_ms: 1_000,
 			hive_addr: b"127.0.0.1:9000".to_vec(),
 			servlet_addresses: vec![ServletInfo {
 				servlet_id: servlet_instance(&ping_type(), "127.0.0.1:9001"),
@@ -552,7 +599,6 @@ mod tests {
 	#[test]
 	fn cluster_request_servlet_address_update_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
-			issued_at_ms: 1_000,
 			hive_id: hive_id(),
 			added: vec![],
 			removed: vec![servlet_instance(&ping_type(), "127.0.0.1:9100")],
@@ -570,7 +616,6 @@ mod tests {
 	#[test]
 	fn cluster_request_advertise_peer_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::AdvertisePeer(PeerAdvertisement {
-			issued_at_ms: 1_000,
 			gateway_addr: b"127.0.0.1:9000".to_vec(),
 			advertised_types: vec![ping_type()],
 		}))
@@ -579,23 +624,46 @@ mod tests {
 	#[cfg(feature = "x509")]
 	#[test]
 	fn cluster_request_gossip_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::Gossip(GossipEnvelope {
-			issued_at_ms: 1_000,
-			target: ping_type(),
-			ttl: 3,
-			payload: vec![0x02, 0x01, 0x2A],
-		}))
+		let rumor_body = GossipRumor { payload: vec![0x02, 0x01, 0x2A] };
+		let rumor = Frame {
+			version: crate::asn1::Version::V0,
+			metadata: crate::asn1::Metadata {
+				id: b"rumor-1".to_vec(),
+				order: 1_000,
+				compactness: None,
+				integrity: None,
+				confidentiality: None,
+				priority: None,
+				lifetime: None,
+				previous_frame: None,
+				matrix: None,
+			},
+			message: crate::encode(&rumor_body)?,
+			integrity: None,
+			nonrepudiation: None,
+		};
+
+		round_trip(ClusterRequest::Gossip(Box::new(rumor)))
 	}
 
 	#[cfg(feature = "x509")]
 	#[test]
 	fn cluster_request_publish_gossip_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::PublishGossip(GossipEnvelope {
-			issued_at_ms: 1_000,
-			target: ping_type(),
-			ttl: 3,
-			payload: vec![0x02, 0x01, 0x2A],
+		round_trip(ClusterRequest::PublishGossip(GossipRumor { payload: vec![0x02, 0x01, 0x2A] }))
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn cluster_request_reconcile_gossip_round_trips() -> Result<()> {
+		round_trip(ClusterRequest::ReconcileGossip(GossipReconciliation {
+			held: vec![vec![0xAAu8; 32], vec![0xBBu8; 32]],
 		}))
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn cluster_request_reconcile_gossip_empty_round_trips() -> Result<()> {
+		round_trip(ClusterRequest::ReconcileGossip(GossipReconciliation { held: vec![] }))
 	}
 
 	#[test]

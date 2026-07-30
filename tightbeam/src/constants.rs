@@ -211,11 +211,11 @@ pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 
 /// Default freshness window for signed cluster commands (30 seconds)
 ///
-/// A hive accepts a signed `ClusterCommand` only when its `issued_at_ms`
-/// is within this many milliseconds of the hive's own clock (both
-/// directions, tolerating skew), and its signature has not been seen
-/// before inside the window. Bounds the replay surface of captured
-/// commands (CWE-294).
+/// A hive accepts a signed `ClusterCommand` only when its
+/// `Frame.metadata.order` is within this many milliseconds of the hive's
+/// own clock (both directions, tolerating skew), and its signature has
+/// not been seen before inside the window. Bounds the replay surface of
+/// captured commands (CWE-294).
 pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
 
 /// Default per-connection budget of peer cancels that abort in-flight
@@ -394,3 +394,21 @@ pub const DEFAULT_GOSSIP_RETENTION_MS: u64 = 120_000;
 ///
 /// Bounded above by [`MAX_GOSSIP_TTL`].
 pub const DEFAULT_GOSSIP_TTL: u8 = 8;
+
+/// Default token-bucket burst one gossip signer may spend at once
+///
+/// Rate admission bounds how many rumors one signer can push in a burst.
+/// That caps amplification one authenticated identity can trigger (CWE-770).
+pub const DEFAULT_GOSSIP_RATE_BURST: u32 = 128;
+
+/// Default interval that restores one token to a signer's gossip bucket
+///
+/// Together with [`DEFAULT_GOSSIP_RATE_BURST`] this sets the sustained
+/// per-signer publish rate a gateway admits (four rumors per second by default).
+pub const DEFAULT_GOSSIP_RATE_REFILL_MS: u64 = 250;
+
+/// Ceiling on distinct signers tracked by one in-memory admission store
+///
+/// Bounding tracked signers keeps memory finite when many identities publish.
+/// Admission fails closed once the ceiling is reached (CWE-770).
+pub const MAX_GOSSIP_RATE_SIGNERS: usize = 4096;
