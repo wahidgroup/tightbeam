@@ -73,13 +73,17 @@ where
 /// Digests advertised by a peer that this gateway does not retain.
 ///
 /// Reconciliation is a set difference over content digests.
+/// A digest repeated in the advertisement appears once in the want list,
+/// so a peer cannot inflate the reply by repeating itself (CWE-770).
 #[must_use]
 pub fn gossip_want(advertised: &[Vec<u8>], held: &[GossipDigest]) -> Vec<Vec<u8>> {
 	let local: HashSet<&[u8]> = held.iter().map(|digest| digest.as_slice()).collect();
+	let mut unique: HashSet<&[u8]> = HashSet::new();
 
 	advertised
 		.iter()
 		.filter(|digest| !local.contains(digest.as_slice()))
+		.filter(|digest| unique.insert(digest.as_slice()))
 		.cloned()
 		.collect()
 }
@@ -87,10 +91,15 @@ pub fn gossip_want(advertised: &[Vec<u8>], held: &[GossipDigest]) -> Vec<Vec<u8>
 /// Digests from a peer want-list that decode to a fixed 32-byte digest.
 ///
 /// Wrong-length entries cannot be retained digests and are dropped (CWE-20).
+/// Duplicate entries collapse to one: a peer repeating a digest MUST NOT
+/// multiply the repair pushes it is served (CWE-770).
 #[must_use]
 pub fn wanted_digests(want: &[Vec<u8>]) -> Vec<GossipDigest> {
+	let mut unique: HashSet<GossipDigest> = HashSet::new();
+
 	want.iter()
 		.filter_map(|bytes| GossipDigest::try_from(bytes.as_slice()).ok())
+		.filter(|digest| unique.insert(*digest))
 		.collect()
 }
 
@@ -689,6 +698,24 @@ mod tests {
 
 		let decoded = wanted_digests(&want);
 		assert_eq!(decoded, vec![good]);
+	}
+
+	#[test]
+	fn wanted_digests_collapses_duplicates() {
+		let good = digest(&rumor(1_000, vec![1]));
+		let want = vec![good.to_vec(), good.to_vec(), good.to_vec()];
+
+		let decoded = wanted_digests(&want);
+		assert_eq!(decoded, vec![good]);
+	}
+
+	#[test]
+	fn want_collapses_repeated_advertisements() {
+		let missing = digest(&rumor(1_000, vec![2]));
+		let advertised = vec![missing.to_vec(), missing.to_vec(), missing.to_vec()];
+
+		let want = gossip_want(&advertised, &[]);
+		assert_eq!(want, vec![missing.to_vec()]);
 	}
 
 	#[test]

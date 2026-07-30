@@ -16,17 +16,19 @@ use std::sync::Arc;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use core::mem;
 
-use crate::transport::error::{TransportError, TransportFailure};
+use crate::transport::error::TransportError;
+use crate::utils::marker::MaybeSend;
 
 #[cfg(all(feature = "x509", feature = "instrument"))]
 use crate::trace::TraceCollector;
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+use crate::transport::error::TransportFailure;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::framing::{
 	classify_boundary_error, classify_truncation_error, parse_der_length, reconstruct_der_encoding, LengthForm,
 };
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::TransportResult;
-use crate::utils::marker::MaybeSend;
 
 #[cfg(feature = "x509")]
 mod x509 {

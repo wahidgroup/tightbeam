@@ -1098,18 +1098,18 @@ macro_rules! cluster {
 				$crate::cluster!(@refuse_reconcile $frame, $trace);
 			}
 
-			// Reconciliation exchanges colony gossip state, so both this
-			// gateway and the requesting peer must be colony members.
-			// Checked before freshness so a policy refusal never takes a
-			// replay record (CWE-772).
-			if $config.colony_urn().is_none()
-				|| $crate::colony::cluster::frame_colony_urn(
-					&$config.namespace,
-					$config.tls.peer_trust.as_deref(),
-					&$frame,
-				)
-				.is_none()
-			{
+			// Reconciliation exchanges colony gossip state: the want list
+			// names local rumors and the follow-up repair push carries
+			// rumor bytes. The requester's certificate must prove the SAME
+			// colony as this gateway, or colony-scoped state leaks across
+			// the federation boundary (CWE-668). Checked before freshness
+			// so a policy refusal never takes a replay record (CWE-772).
+			let requester_colony = $crate::colony::cluster::frame_colony_urn(
+				&$config.namespace,
+				$config.tls.peer_trust.as_deref(),
+				&$frame,
+			);
+			if $config.colony_urn().is_none() || requester_colony.as_ref() != $config.colony_urn() {
 				$crate::cluster!(@refuse_reconcile $frame, $trace);
 			}
 
@@ -1610,6 +1610,21 @@ macro_rules! cluster {
 				.map(|digest| digest.to_vec())
 				.collect();
 
+			let mut client = $pool.connect($peer_addr).await?;
+
+			// Colony scope gate (CWE-668): reconciliation carries colony
+			// gossip state in both directions, held digests out and rumor
+			// bytes on the repair push. The dialed endpoint's handshake
+			// certificate must prove the same colony as this gateway
+			// before any state flows. `None` fails closed: no validated
+			// peer certificate means no reconciliation round.
+			let peer_colony = client
+				.peer_certificate()
+				.and_then(|cert| $crate::colony::cluster::cert_colony_urn(&$config.namespace, cert));
+			if peer_colony.as_ref() != $config.colony_urn() {
+				return Ok::<_, $crate::colony::cluster::ClusterError>(());
+			}
+
 			let request = $crate::colony::common::ClusterRequest::ReconcileGossip(
 				$crate::colony::common::GossipReconciliation { held }
 			);
@@ -1625,8 +1640,6 @@ macro_rules! cluster {
 			let signed_frame = frame
 				.sign_with_provider::<$digest, _>($config.tls.key.as_ref())
 				.await?;
-
-			let mut client = $pool.connect($peer_addr).await?;
 
 			let response = client.emit(signed_frame, None).await?
 				.ok_or($crate::colony::cluster::ClusterError::NoResponse)?;

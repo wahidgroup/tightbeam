@@ -4240,29 +4240,28 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
-	pub ClusterGossipReconcileMembershipSpec,
+	pub ClusterGossipReconcileSameColonySpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
 			(GOSSIP_RECONCILE_MEMBER_WANT, exactly!(1), equals!(1u64)),
-			(GOSSIP_RECONCILE_FOREIGN_WANT, exactly!(1), equals!(1u64)),
+			(GOSSIP_RECONCILE_FOREIGN_WANT, exactly!(1), equals!(0u64)),
 			(GOSSIP_RECONCILE_STRANGER_WANT, exactly!(1), equals!(0u64)),
-			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1))
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(2))
 		]
 	}
 }
 
-// Reconciliation is gated on colony MEMBERSHIP, not colony equality:
-// a same-colony member and a foreign-colony member both receive the
-// full want-list for a digest this gateway lacks, while a trusted peer
-// with no colony SAN is refused with an empty want and fires exactly
-// the one REFUSED event. Rumor content never rides reconciliation, so
-// the foreign exchange leaks digests only; the later push of a foreign
-// rumor is what the relay equality gate refuses.
+// Reconciliation is gated on colony EQUALITY, matching the flood scope:
+// a want list names local rumor state and the follow-up repair push
+// carries rumor bytes, so only a same-colony member receives the
+// want-list for a digest this gateway lacks. A foreign-colony member
+// and a trusted peer with no colony SAN are both refused with an empty
+// want, each firing one REFUSED event.
 tb_scenario! {
-	name: cluster_gossip_reconcile_requires_membership_only,
-	spec: ClusterGossipReconcileMembershipSpec,
+	name: cluster_gossip_reconcile_requires_same_colony,
+	spec: ClusterGossipReconcileSameColonySpec,
 	environment Cluster {
 		context: foreign_colony_ctx(),
 		start: |SetupEnv { trace, context: ctx }| async move {
