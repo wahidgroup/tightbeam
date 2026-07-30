@@ -135,6 +135,7 @@ pub mod matrix;
 pub mod oids;
 pub mod prelude;
 pub mod utils;
+mod wire;
 
 #[cfg(feature = "builder")]
 pub mod builder;

@@ -51,7 +51,9 @@ pub(super) type HandlerFuture = Pin<Box<dyn Future<Output = ResponsePackage> + S
 pub(super) type StatusFuture = Pin<Box<dyn Future<Output = TransitStatus> + Send>>;
 
 pub(super) fn large_mux_frame(label: &str) -> Frame {
-	let padding = "x".repeat(5000);
+	// Sized so the encoded frame spans roughly fifteen 1024-byte chunks,
+	// enough to cross the rekey record limits the drain scenarios configure.
+	let padding = "x".repeat(15000);
 	mux_frame(&format!("{label}-{padding}"))
 }
 
