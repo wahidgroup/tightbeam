@@ -153,9 +153,10 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 	}
 
 	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager<C>) {
-		let certificate = Arc::new(cert);
-		let key = Arc::new(key);
+		self.set_shared_client_identity(Arc::new(cert), Arc::new(key));
+	}
 
+	fn set_shared_client_identity(&mut self, certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) {
 		self.client_identity = Some(ClientIdentity { certificate, key });
 	}
 
@@ -264,6 +265,17 @@ impl<P: Protocol, C: CryptoProvider> ConnectionPoolBuilder<P, C> {
 	#[cfg(feature = "x509")]
 	pub fn with_receipt_approver(mut self, approver: Arc<dyn ReceiptApprover>) -> Self {
 		self.tls.set_receipt_approver(approver);
+		self
+	}
+
+	/// Install a pre-shared client identity (zero extra cert materialization)
+	#[cfg(feature = "x509")]
+	pub fn with_shared_client_identity(
+		mut self,
+		certificate: Arc<Certificate>,
+		key: Arc<HandshakeKeyManager<C>>,
+	) -> Self {
+		self.tls.set_shared_client_identity(certificate, key);
 		self
 	}
 }

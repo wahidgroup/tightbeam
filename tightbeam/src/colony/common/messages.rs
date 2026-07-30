@@ -20,14 +20,35 @@ use crate::Beamable;
 
 /// Work request envelope for cluster routing
 ///
-/// Clients send this to the cluster gateway. The cluster routes based on
-/// `servlet_type` and forwards `payload` to the selected hive.
+/// Clients send this to the cluster gateway. The gateway selects a local
+/// servlet or peer gateway by `servlet_type`, then delivers `payload`.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ClusterWorkRequest {
 	/// Target servlet type URN (e.g., `urn:tightbeam::servlet:ping`)
 	pub servlet_type: Urn<'static>,
 	/// Raw message payload (encoded inner message)
 	pub payload: Vec<u8>,
+	/// Whether a peer gateway already forwarded this work once
+	///
+	/// Client origin is `false` ([`ClusterWorkRequest::new`]). A gateway
+	/// that selects a Peer route sets this when re-emitting to the peer.
+	/// An inbound `true` is served locally only and never re-forwarded.
+	pub forwarded: bool,
+}
+
+impl ClusterWorkRequest {
+	/// Origin work from a client (`forwarded = false`)
+	#[must_use]
+	pub fn new(servlet_type: Urn<'static>, payload: Vec<u8>) -> Self {
+		Self { servlet_type, payload, forwarded: false }
+	}
+
+	/// Mark this request as already forwarded (loop-guard probe / peer hop)
+	#[must_use]
+	pub fn into_forwarded(mut self) -> Self {
+		self.forwarded = true;
+		self
+	}
 }
 
 /// Work response from cluster
@@ -503,10 +524,10 @@ mod tests {
 
 	#[test]
 	fn cluster_request_work_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::Work(ClusterWorkRequest {
-			servlet_type: ping_type(),
-			payload: vec![0x02, 0x01, 0x2A],
-		}))
+		round_trip(ClusterRequest::Work(ClusterWorkRequest::new(
+			ping_type(),
+			vec![0x02, 0x01, 0x2A],
+		)))
 	}
 
 	#[test]
@@ -520,8 +541,7 @@ mod tests {
 
 	#[test]
 	fn bare_inner_type_rejected_without_envelope_tag() -> Result<()> {
-		let bare = crate::encode(&ClusterWorkRequest { servlet_type: ping_type(), payload: vec![] })?;
-
+		let bare = crate::encode(&ClusterWorkRequest::new(ping_type(), vec![]))?;
 		let decoded = crate::decode::<ClusterRequest>(&bare);
 		assert!(decoded.is_err());
 		Ok(())

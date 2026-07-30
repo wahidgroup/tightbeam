@@ -68,6 +68,7 @@ macro_rules! cluster {
 			servlet_registry: ::std::sync::Arc<$crate::colony::cluster::ServletRegistry>,
 			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
 			pool: ::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>,
+			peer_pool: ::core::option::Option<::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>>,
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			evaporation_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
@@ -129,23 +130,18 @@ macro_rules! cluster {
 					$crate::colony::cluster::ServletRegistry::new(config.pheromone.clone())
 				);
 
-				let pool = {
-					use $crate::transport::client::pool::ConnectionBuilder;
-					let mut builder = $crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
-						.with_config(config.pool_config.clone())
-						.with_client_identity(config.tls.certificate.clone(), ::std::sync::Arc::clone(&config.tls.key))?;
-
-					if let Some(ref trust) = config.tls.hive_trust {
-						builder = builder.with_trust_store(::std::sync::Arc::clone(trust));
-					}
-
-					::std::sync::Arc::new(builder.build())
-				};
+				let pools = $crate::colony::cluster::outbound::build_cluster_pools::<$protocol>(
+					config.pool_config.clone(),
+					&config.tls,
+				)?;
+				let pool = pools.hive;
+				let peer_pool = pools.peer;
 
 				let registry_for_server = ::std::sync::Arc::clone(&registry);
 				let servlet_registry_for_server = ::std::sync::Arc::clone(&servlet_registry);
 				let config_for_server = ::std::sync::Arc::clone(&config);
 				let pool_for_server = ::std::sync::Arc::clone(&pool);
+				let peer_pool_for_server = peer_pool.as_ref().map(::std::sync::Arc::clone);
 				let trace_for_server = ::std::sync::Arc::clone(&trace);
 
 				// Freshness window + replay set for signed hive control frames
@@ -165,6 +161,7 @@ macro_rules! cluster {
 					servlet_registry_for_server,
 					config_for_server,
 					pool_for_server,
+					peer_pool_for_server,
 					trace_for_server,
 					replay_guard_for_server
 				);
@@ -247,38 +244,19 @@ macro_rules! cluster {
 				// key store, so the beat only exists with x509.
 				#[cfg(feature = "x509")]
 				let advertise_handle = {
+					// Prefer the peer trust plane when present; exporters that
+					// only dial peers under hive_trust keep the hive pool.
+					let advertise_pool = peer_pool
+						.as_ref()
+						.map(::std::sync::Arc::clone)
+						.unwrap_or_else(|| ::std::sync::Arc::clone(&pool));
 					let servlet_registry = ::std::sync::Arc::clone(&servlet_registry);
 					let config = ::std::sync::Arc::clone(&config);
-
-					// Federation crosses trust planes: a peer gateway's TLS
-					// identity is anchored in `peer_trust`, not `hive_trust`,
-					// so the beat dials on its own peer-plane pool. Without
-					// `peer_trust` the hive pool is the only plane available.
-					//
-					// TODO(zero-copy): `ConnectionBuilder::with_client_identity`
-					// and `with_config` take `CertificateSpec`/`PoolConfig` by
-					// value, forcing clones here and in the hive pool build
-					// above. Rework the trait to borrow or take `Arc` so pool
-					// construction is zero-copy.
-					let advertise_pool = match config.tls.peer_trust {
-						Some(ref trust) => {
-							use $crate::transport::client::pool::ConnectionBuilder;
-							::std::sync::Arc::new(
-								$crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
-									.with_config(config.pool_config.clone())
-									.with_client_identity(
-										config.tls.certificate.clone(),
-										::std::sync::Arc::clone(&config.tls.key),
-									)?
-									.with_trust_store(::std::sync::Arc::clone(trust))
-									.build(),
-							)
-						}
-						None => ::std::sync::Arc::clone(&pool),
-					};
 					let gateway_addr: Vec<u8> = addr.clone().into();
 
-					Some($crate::cluster!(@build_advertise_task $protocol, servlet_registry, advertise_pool, config, gateway_addr, $digest))
+					::core::option::Option::Some($crate::cluster!(
+						@build_advertise_task $protocol, servlet_registry, advertise_pool, config, gateway_addr, $digest
+					))
 				};
 				#[cfg(not(feature = "x509"))]
 				let advertise_handle = ::std::option::Option::None;
@@ -288,6 +266,7 @@ macro_rules! cluster {
 					servlet_registry,
 					config,
 					pool,
+					peer_pool,
 					server_handle: Some(server_handle),
 					heartbeat_handle: Some(heartbeat_handle),
 					evaporation_handle: Some(evaporation_handle),
@@ -308,14 +287,23 @@ macro_rules! cluster {
 			fn peer_servlets(&self) -> Vec<Vec<u8>> {
 				let mut types: Vec<Vec<u8>> = self
 					.servlet_registry
-					.peer_servlets()
+					.peer_entries()
 					.unwrap_or_default()
 					.into_iter()
-					.map(|entry| entry.servlet_type.to_vec())
+					.map(|entry| entry.servlet_type().to_vec())
 					.collect();
 				types.sort_unstable();
 				types.dedup();
 				types
+			}
+
+			fn peer_routes(&self) -> Vec<$crate::colony::cluster::PeerRouteInfo> {
+				self.servlet_registry
+					.peer_entries()
+					.unwrap_or_default()
+					.into_iter()
+					.filter_map(|entry| entry.peer_route_info())
+					.collect()
 			}
 
 			fn hive_count(&self) -> usize {
@@ -371,7 +359,7 @@ macro_rules! cluster {
 	};
 
 	// Build gateway server
-	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident, $replay_guard:ident) => {{
+	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $peer_pool:ident, $trace:ident, $replay_guard:ident) => {{
 		// Must be copied out before the handler closure captures the config.
 		let __mux_offer = $config.pool_config.mux_offer.to_owned();
 		$crate::server! {
@@ -382,10 +370,11 @@ macro_rules! cluster {
 				let servlet_registry = ::std::sync::Arc::clone(&$servlet_registry);
 				let config = ::std::sync::Arc::clone(&$config);
 				let pool = ::std::sync::Arc::clone(&$pool);
+				let peer_pool = $peer_pool.as_ref().map(::std::sync::Arc::clone);
 				let trace = ::std::sync::Arc::clone(&$trace);
 				let _replay_guard = ::core::clone::Clone::clone(&$replay_guard);
 				async move {
-					$crate::cluster!(@handle_gateway_request frame, session, registry, servlet_registry, config, pool, trace, _replay_guard)
+					$crate::cluster!(@handle_gateway_request frame, session, registry, servlet_registry, config, pool, peer_pool, trace, _replay_guard)
 				}
 			}
 		}
@@ -397,7 +386,7 @@ macro_rules! cluster {
 	};
 
 	// Handle gateway requests (registration + work)
-	(@handle_gateway_request $frame:ident, $session:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident, $replay_guard:ident) => {{
+	(@handle_gateway_request $frame:ident, $session:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $peer_pool:ident, $trace:ident, $replay_guard:ident) => {{
 		// Gate policies run before ANY decoding: an unevaluated policy
 		// list is indistinguishable from an open gateway. Each gate sees
 		// the connection's authenticated peer context.
@@ -760,10 +749,7 @@ macro_rules! cluster {
 			// A work target must be a servlet URN in this gateway's
 			// namespace; foreign authorities and realms are refused
 			// before the registry is consulted.
-			if !matches!(
-				$config.namespace.validate(&request.servlet_type),
-				Ok($crate::colony::common::ColonyResource::Servlet { instance: None, .. })
-			) {
+			if !$crate::colony::common::is_bare_servlet_type(&$config.namespace, &request.servlet_type) {
 				let _ = $trace.event($crate::instrumentation::events::CLUSTER_WORK_REFUSED);
 				return $crate::cluster!(@reply $frame,
 					$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::PermissionDenied)
@@ -771,7 +757,19 @@ macro_rules! cluster {
 			}
 
 			let type_key = $crate::colony::common::canonical_bytes(&request.servlet_type);
-			let entries = match $servlet_registry.local_entries_for_type(&type_key) {
+			let forwarded = request.forwarded;
+			let servlet_type = request.servlet_type;
+			let payload = request.payload;
+
+			// One-hop loop guard: already-forwarded work selects Local only.
+			// Origin work selects Local and Peer so pheromone can prefer
+			// nearby nests while still failing over across the colony.
+			let entries = if forwarded {
+				$servlet_registry.local_entries_for_type(&type_key)
+			} else {
+				$servlet_registry.entries_for_type(&type_key)
+			};
+			let entries = match entries {
 				Ok(e) if !e.is_empty() => e,
 				_ => {
 					let _ = $trace.event($crate::instrumentation::events::CLUSTER_WORK_UNAVAILABLE);
@@ -783,12 +781,9 @@ macro_rules! cluster {
 
 			let metrics: Vec<$crate::colony::common::InstanceMetrics> = entries
 				.iter()
-				.map(|e| {
-					use core::sync::atomic::Ordering;
-					$crate::colony::common::InstanceMetrics {
-						instance_key: e.address.to_vec(),
-						pheromone: e.pheromone.load(Ordering::Relaxed),
-					}
+				.map(|e| $crate::colony::common::InstanceMetrics {
+					instance_key: e.route_key().to_vec(),
+					pheromone: e.pheromone_level(),
 				})
 				.collect();
 
@@ -803,24 +798,62 @@ macro_rules! cluster {
 			};
 
 			let selected_entry = &entries[selected_idx];
-			let selected_addr = ::std::sync::Arc::clone(&selected_entry.address);
+			let route_key = ::std::sync::Arc::clone(selected_entry.route_key());
+			let dial_addr = ::std::sync::Arc::clone(selected_entry.dial_target());
+			let route_kind = selected_entry.route_kind();
 
-			let forward_result = $crate::cluster!(@forward_work $pool, selected_addr, request.payload);
+			// Local hops carry bare app payload on the hive trust plane.
+			// Peer hops re-enter the peer gateway as Work{forwarded:true}
+			// on the peer trust plane.
+			let forward_result = match route_kind {
+				$crate::colony::cluster::RouteKind::Local => {
+					$crate::cluster!(@forward_work $pool, dial_addr, payload)
+				}
+				$crate::colony::cluster::RouteKind::Peer => {
+					match $peer_pool.as_ref() {
+						Some(peer_pool) => match $crate::encode(&$crate::colony::common::ClusterRequest::Work(
+							$crate::colony::common::ClusterWorkRequest::new(servlet_type, payload).into_forwarded(),
+						)) {
+							Ok(envelope) => $crate::cluster!(@forward_work peer_pool, dial_addr, envelope),
+							Err(error) => Err($crate::colony::cluster::ClusterError::from(error)),
+						},
+						None => Err($crate::colony::cluster::ClusterError::ConnectFailed),
+					}
+				}
+			};
 
 			// Pheromone feedback: the outcome steers future selection
 			// toward instances that answer and away from ones that fail
 			match forward_result {
-				Ok(response_payload) => {
-					let _ = $servlet_registry.reinforce(&selected_entry.address, $config.pheromone.reinforcement_boost);
-					let _ = $trace.event($crate::instrumentation::events::CLUSTER_WORK_ROUTED);
-					return $crate::cluster!(@reply $frame,
-						$crate::colony::cluster::ClusterWorkResponse::ok(response_payload)
-					);
-				}
-				Err(error) => {
-					let _ = $servlet_registry.weaken_with_penalty(&selected_entry.address, $config.pheromone.weakening_penalty);
-					let _ = $trace.event($crate::instrumentation::events::CLUSTER_WORK_FAILED);
+				Ok(response_payload) => match route_kind {
+					$crate::colony::cluster::RouteKind::Local => {
+						$crate::cluster!(@work_trail_ok $servlet_registry, &route_key, $config, $trace);
+						return $crate::cluster!(@reply $frame,
+							$crate::colony::cluster::ClusterWorkResponse::ok(response_payload)
+						);
+					}
+					$crate::colony::cluster::RouteKind::Peer => {
+						// Peer gateways reply with ClusterWorkResponse; unwrap
+						// and relay so the client sees one envelope.
+						match $crate::decode::<$crate::colony::cluster::ClusterWorkResponse>(&response_payload) {
+							Ok(peer_response) => {
+								let _ = $trace.event($crate::instrumentation::events::CLUSTER_WORK_FORWARDED);
+								if peer_response.status == $crate::policy::TransitStatus::Ok {
+									$crate::cluster!(@work_trail_ok $servlet_registry, &route_key, $config, $trace);
+								} else {
+									$crate::cluster!(@work_trail_weaken $servlet_registry, &route_key, $config, $trace);
+								}
 
+								return $crate::cluster!(@reply $frame, peer_response);
+							}
+							Err(_) => {
+								$crate::cluster!(@work_trail_fail $servlet_registry, &route_key, $config, $trace,
+									$frame, $crate::policy::TransitStatus::Unavailable);
+							}
+						}
+					}
+				},
+				Err(error) => {
 					// A servlet refusal relays verbatim so the caller keeps
 					// its retryability contract.
 					let status = match error {
@@ -830,9 +863,7 @@ macro_rules! cluster {
 							.unwrap_or($crate::policy::TransitStatus::Unavailable),
 						_ => $crate::policy::TransitStatus::Unavailable,
 					};
-					return $crate::cluster!(@reply $frame,
-						$crate::colony::cluster::ClusterWorkResponse::err(status)
-					);
+					$crate::cluster!(@work_trail_fail $servlet_registry, &route_key, $config, $trace, $frame, status);
 				}
 			}
 		}
@@ -840,108 +871,39 @@ macro_rules! cluster {
 		$crate::colony::common::ClusterRequest::AdvertisePeer(advertisement) => {
 			let origin_status = verify_peer_origin();
 			if origin_status != $crate::policy::TransitStatus::Ok {
-				let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
-				return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse {
-					status: origin_status,
-				});
+				$crate::cluster!(@refuse_peer_ad $frame, $trace, origin_status);
 			}
 
 			let freshness_status = verify_control_freshness(advertisement.issued_at_ms);
 			if freshness_status != $crate::policy::TransitStatus::Ok {
-				let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
-				return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse {
-					status: freshness_status,
-				});
+				$crate::cluster!(@refuse_peer_ad $frame, $trace, freshness_status);
 			}
 
-			// Slate ownership binds to the AUTHENTICATED signer certificate,
-			// never the claimed gateway_addr: any trusted peer could
-			// otherwise claim another peer's address and clobber or withdraw
-			// that peer's slate (CWE-290).
-			#[cfg(feature = "x509")]
-			let peer_hive_id: ::std::option::Option<Vec<u8>> =
-				$frame.nonrepudiation.as_ref().and_then(|signer_info| {
-					$config.tls.peer_trust.as_ref().and_then(|trust| {
-						trust.find_by_signer_info(signer_info).and_then(|cert| {
-							$crate::crypto::x509::store::CertificateTrustStore::to_fingerprint(cert)
-								.ok()
-								.map(|fingerprint| fingerprint.to_vec())
-						})
-					})
-				});
-
-			// Without x509 there is no signer identity to bind: the claimed
-			// address is the only available slate key.
-			#[cfg(not(feature = "x509"))]
-			let peer_hive_id: ::std::option::Option<Vec<u8>> =
-				::std::option::Option::Some(advertisement.gateway_addr.to_vec());
-
-			let ::std::option::Option::Some(peer_hive_id) = peer_hive_id else {
-				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard,
-					$crate::policy::TransitStatus::PermissionDenied);
+			// Signer resolution + wire checks live in `admit`: the
+			// signer key and claimed dial address cannot be transposed.
+			let admitted = match $crate::colony::cluster::peer::AdmittedPeerAd::admit(
+				&$frame,
+				&advertisement,
+				&$config,
+			) {
+				::core::result::Result::Ok(admitted) => admitted,
+				::core::result::Result::Err(status) => {
+					return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard, status);
+				}
 			};
 
-			// Nestmate recognition (structural CHC half): every advertised
-			// identity must be a bare servlet type URN in this gateway's
-			// realm/NID. A foreign authority or realm is refused before any
-			// route installs. The count is bounded fail-closed (CWE-770).
-			let gateway_addr_nonempty = !advertisement.gateway_addr.is_empty();
-			let gateway_addr_utf8 = core::str::from_utf8(&advertisement.gateway_addr).is_ok();
-			let gateway_addr_no_nul = !advertisement.gateway_addr.contains(&0);
-			let gateway_addr_valid = gateway_addr_nonempty && gateway_addr_utf8 && gateway_addr_no_nul;
-			let types_valid = advertisement.advertised_types.iter().all(|urn| matches!(
-				$config.namespace.validate(urn),
-				Ok($crate::colony::common::ColonyResource::Servlet { instance: ::std::option::Option::None, .. })
-			));
-
-			let within_cap = advertisement.advertised_types.len() <= $crate::constants::MAX_ADVERTISED_TYPES;
-
-			// A peer slate replaces only prior Peer state: a gateway_addr or
-			// signer fingerprint that collides with a local servlet address
-			// or local hive key would let a trusted peer clobber routes the
-			// hive trust plane installed, so it is refused (CWE-284).
-			let no_local_conflict = matches!(
-				$servlet_registry.peer_key_conflicts_local(&advertisement.gateway_addr),
-				Ok(false)
-			) && matches!(
-				$servlet_registry.peer_key_conflicts_local(&peer_hive_id),
-				Ok(false)
-			);
-
-			if !gateway_addr_valid || !types_valid || !within_cap || !no_local_conflict {
-				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard,
-					$crate::policy::TransitStatus::PermissionDenied);
-			}
-
-			// Peer routes live only in the servlet registry, reconciled by
-			// the signer identity as the hive key. Entries are keyed by a
-			// per-type route key (signer NUL type) because the entry map is
-			// one-entry-per-address: keying every type by the bare signer
-			// identity would keep only the last type in the slate.
-			let gateway_id: ::std::sync::Arc<[u8]> = peer_hive_id.as_slice().into();
-			let slate: Vec<$crate::colony::cluster::ServletEntry> = advertisement
-				.advertised_types
-				.iter()
-				.map(|urn| {
-					let type_bytes = $crate::colony::common::type_canonical_bytes(urn);
-					let mut route_key = Vec::with_capacity(gateway_id.len() + 1 + type_bytes.len());
-					route_key.extend_from_slice(&gateway_id);
-					route_key.push(0);
-					route_key.extend_from_slice(&type_bytes);
-
-					$crate::colony::cluster::ServletEntry::new(
-						::std::sync::Arc::from(route_key.as_slice()),
-						::std::sync::Arc::from(type_bytes.as_slice()),
-						::std::sync::Arc::clone(&gateway_id),
-						$config.pheromone.initial_pheromone,
-						$config.pheromone.abandonment_limit,
-					).with_route_kind($crate::colony::cluster::RouteKind::Peer)
-				})
-				.collect();
-
-			if $servlet_registry.reconcile_by_hive(&gateway_id, slate).is_err() {
-				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard,
-					$crate::policy::TransitStatus::PermissionDenied);
+			if let Err(error) = $servlet_registry.reconcile_peer_slate(
+				admitted,
+				$crate::colony::cluster::PeerCaps::default(),
+			) {
+				let status = match error {
+					$crate::colony::cluster::ClusterError::PeerSlateConflict
+					| $crate::colony::cluster::ClusterError::PeerCapExceeded => {
+						$crate::policy::TransitStatus::PermissionDenied
+					}
+					_ => $crate::policy::TransitStatus::Unavailable,
+				};
+				return $crate::cluster!(@refuse_peer_ad $frame, $trace, $replay_guard, status);
 			}
 
 			let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISED);
@@ -956,8 +918,8 @@ macro_rules! cluster {
 	// exists. The refusal is deterministic on local state, so the record
 	// is released: the peer must be able to resend the same signed frame
 	// once that state clears (CWE-772). Refusals BEFORE the freshness
-	// check reply plain instead: no record exists yet, or the record IS
-	// the protection being enforced.
+	// check use the plain arm instead: no record exists yet, or the
+	// record IS the protection being enforced.
 	(@refuse_peer_ad $frame:ident, $trace:ident, $replay_guard:ident, $status:expr) => {{
 		#[cfg(feature = "x509")]
 		if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
@@ -965,6 +927,34 @@ macro_rules! cluster {
 		}
 		let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
 		$crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse { status: $status })
+	}};
+
+	// Peer advertisement refuse: fire event and reply with status
+	(@refuse_peer_ad $frame:ident, $trace:expr, $status:expr) => {{
+		let _ = $trace.event($crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
+		return $crate::cluster!(@reply $frame, $crate::colony::common::PeerAdvertisementResponse {
+			status: $status,
+		});
+	}};
+
+	// Work trail: reinforce + routed event (no return)
+	(@work_trail_ok $servlet_registry:expr, $route_key:expr, $config:expr, $trace:expr) => {{
+		let _ = $servlet_registry.reinforce($route_key, $config.pheromone.reinforcement_boost);
+		let _ = $trace.event($crate::instrumentation::events::CLUSTER_WORK_ROUTED);
+	}};
+
+	// Work trail: weaken + failed event (no return)
+	(@work_trail_weaken $servlet_registry:expr, $route_key:expr, $config:expr, $trace:expr) => {{
+		let _ = $servlet_registry.weaken_with_penalty($route_key, $config.pheromone.weakening_penalty);
+		let _ = $trace.event($crate::instrumentation::events::CLUSTER_WORK_FAILED);
+	}};
+
+	// Work trail: weaken + failed + error reply
+	(@work_trail_fail $servlet_registry:expr, $route_key:expr, $config:expr, $trace:expr, $frame:ident, $status:expr) => {{
+		$crate::cluster!(@work_trail_weaken $servlet_registry, $route_key, $config, $trace);
+		return $crate::cluster!(@reply $frame,
+			$crate::colony::cluster::ClusterWorkResponse::err($status)
+		);
 	}};
 
 	// Helper: Forward work to a servlet

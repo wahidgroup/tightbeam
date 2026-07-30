@@ -65,6 +65,14 @@ pub enum ClusterError {
 	/// Re-registration presented a signer that does not match the bound hive signer
 	#[error("Signer does not match hive binding")]
 	SignerMismatch,
+
+	/// Peer slate key or dial address collides with local routes
+	#[error("Peer slate conflicts with local routes")]
+	PeerSlateConflict,
+
+	/// Peer slate would exceed gateway or route caps
+	#[error("Peer slate exceeds caps")]
+	PeerCapExceeded,
 }
 
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {

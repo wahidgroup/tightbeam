@@ -103,6 +103,7 @@ pub struct ClusterConfBuilder {
 	bind_addr: Option<String>,
 	peers: Vec<String>,
 	advertise_interval: Option<Duration>,
+	peer_dial_allowlist: Option<Vec<String>>,
 	tls: ClusterTlsConfig,
 }
 
@@ -121,6 +122,7 @@ impl ClusterConf {
 			bind_addr: None,
 			peers: Vec::new(),
 			advertise_interval: None,
+			peer_dial_allowlist: None,
 			tls,
 		}
 	}
@@ -189,6 +191,12 @@ impl ClusterConfBuilder {
 		self
 	}
 
+	/// Restrict claimed peer dial addresses to this exact-match allowlist
+	pub fn with_peer_dial_allowlist(mut self, allowlist: impl IntoIterator<Item = String>) -> Self {
+		self.peer_dial_allowlist = Some(allowlist.into_iter().collect());
+		self
+	}
+
 	/// Build the ClusterConf
 	pub fn build(self) -> ClusterConf {
 		ClusterConf {
@@ -202,6 +210,7 @@ impl ClusterConfBuilder {
 			bind_addr: self.bind_addr,
 			peers: self.peers,
 			advertise_interval: self.advertise_interval,
+			peer_dial_allowlist: self.peer_dial_allowlist,
 			tls: self.tls,
 		}
 	}
