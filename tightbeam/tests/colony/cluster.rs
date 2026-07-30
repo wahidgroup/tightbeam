@@ -3710,6 +3710,10 @@ impl GossipJournal for CountingJournal {
 		self.inner.record(signer, digest, rumor, now_ms)
 	}
 
+	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
+		self.inner.seen(digest, now_ms)
+	}
+
 	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
 		self.inner.held_digests(now_ms)
 	}
@@ -3800,6 +3804,70 @@ tb_scenario! {
 			)
 			.await?;
 			send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_LIMITED_STATUS).await?;
+
+			gateway.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipDuplicateFreeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(4), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(2)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(2)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(0))
+		]
+	}
+}
+
+// Duplicates do not spend rate tokens. A two-token bucket with a slow
+// refill admits rumor A, absorbs two byte-identical echoes of A for
+// free, and still has the token to admit rumor B. If duplicates were
+// charged, the echoes would drain the bucket and B would be refused
+// with ResourceExhausted (relay echo traffic is normal, not abuse).
+tb_scenario! {
+	name: cluster_gossip_duplicates_spend_no_tokens,
+	spec: ClusterGossipDuplicateFreeSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let mut conf = peering_cluster_conf(&certs);
+			conf.gossip = GossipConf {
+				admission: Arc::new(TokenBucketAdmission::new(2, Duration::from_secs(3_600)))
+					as Arc<dyn GossipAdmission>,
+				ingress: Some(servlet_urn("ping")),
+				..Default::default()
+			};
+			let gateway = start_cluster(&trace, conf).await?;
+			hive.register_with_cluster(gateway.addr()).await?;
+
+			let first = signed_publish_gossip(
+				&certs.key,
+				b"dup-rumor-1",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway, first.clone()).await?;
+			send_gossip_frame(&trace, &certs, &gateway, first.clone()).await?;
+			send_gossip_frame(&trace, &certs, &gateway, first).await?;
+
+			let second = signed_publish_gossip(
+				&certs.key,
+				b"dup-rumor-2",
+				rumor_body(encode(&PingRequest { value: 22 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway, second).await?;
 
 			gateway.stop();
 			hive.stop();
@@ -3941,6 +4009,12 @@ impl GossipJournal for AmnesiacJournal {
 		_now_ms: u64,
 	) -> Result<Admission, ClusterError> {
 		Ok(Admission::New)
+	}
+
+	// Retaining nothing, the grey hole never reports a digest as seen,
+	// so every repair push reaches record and is re-acknowledged.
+	fn seen(&self, _digest: &GossipDigest, _now_ms: u64) -> Result<bool, ClusterError> {
+		Ok(false)
 	}
 
 	fn held_digests(&self, _now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
@@ -4192,6 +4266,101 @@ tb_scenario! {
 			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
 
 			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], cluster.peer_routes().len() as u64)?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Fixture for origin-budget keying: one origin identity and two relay
+/// identities, all members of the gateway's colony. Every identity uses
+/// a random key so no two share a subject key id (see
+/// [`gossip_plane_ctx`]).
+struct RelayFanoutCtx {
+	gateway: ClusterTestCerts,
+	origin_key: Secp256k1SigningKey,
+	relay_a_key: Secp256k1SigningKey,
+	relay_b_key: Secp256k1SigningKey,
+	peer_trust: Arc<dyn CertificateTrust>,
+}
+
+fn relay_fanout_ctx() -> RelayFanoutCtx {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::utils::create_test_certificate_with_uri_sans;
+
+	let gateway = cluster_certs();
+	let member_urn = test_colony_urn().to_string();
+	let raw_origin = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let origin_cert = create_test_certificate_with_uri_sans(&raw_origin, &[&member_urn]);
+	let raw_relay_a = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let relay_a_cert = create_test_certificate_with_uri_sans(&raw_relay_a, &[&member_urn]);
+	let raw_relay_b = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let relay_b_cert = create_test_certificate_with_uri_sans(&raw_relay_b, &[&member_urn]);
+	let peer_trust = combined_trust(&[&gateway.cert, &origin_cert, &relay_a_cert, &relay_b_cert]);
+
+	RelayFanoutCtx {
+		gateway,
+		origin_key: Secp256k1SigningKey::from(raw_origin),
+		relay_a_key: Secp256k1SigningKey::from(raw_relay_a),
+		relay_b_key: Secp256k1SigningKey::from(raw_relay_b),
+		peer_trust,
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipOriginBudgetSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(GOSSIP_RELAY_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(GOSSIP_LIMITED_STATUS, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
+			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
+			(events::CLUSTER_GOSSIP_RELAY_WEAKENED, exactly!(0)),
+			(events::CLUSTER_GOSSIP_DUPLICATE, exactly!(0))
+		]
+	}
+}
+
+// Rate admission keys on the rumor's origin, not the relaying peer. A
+// one-token bucket admits the origin's first rumor via relay A, then
+// refuses the same origin's second rumor via relay B with
+// ResourceExhausted: fanning one origin's flood through many relays
+// grants no extra budget. The refusal is local policy, so relay B's
+// routes are never weakened.
+tb_scenario! {
+	name: cluster_gossip_relays_share_origin_budget,
+	spec: ClusterGossipOriginBudgetSpec,
+	environment Cluster {
+		context: relay_fanout_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			let mut conf = peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust));
+			conf.gossip = GossipConf {
+				admission: Arc::new(TokenBucketAdmission::new(1, Duration::from_secs(3_600)))
+					as Arc<dyn GossipAdmission>,
+				..Default::default()
+			};
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
+			let first = mint_origin_rumor(
+				&ctx.origin_key,
+				b"budget-rumor-1",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+			)
+			.await?;
+			let frame = signed_relay_gossip(&ctx.relay_a_key, b"budget-relay-1", first, 0).await?;
+			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+
+			let second = mint_origin_rumor(
+				&ctx.origin_key,
+				b"budget-rumor-2",
+				rumor_body(encode(&PingRequest { value: 22 })?),
+			)
+			.await?;
+			let frame = signed_relay_gossip(&ctx.relay_b_key, b"budget-relay-2", second, 0).await?;
+			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_LIMITED_STATUS).await?;
 
 			cluster.stop();
 			Ok(())

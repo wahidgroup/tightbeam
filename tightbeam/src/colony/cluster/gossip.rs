@@ -302,6 +302,15 @@ pub trait GossipJournal: Send + Sync {
 		now_ms: u64,
 	) -> Result<Admission, ClusterError>;
 
+	/// Report whether a digest is already retained, without recording it
+	///
+	/// The gateway probes this before rate admission so a duplicate rumor
+	/// does not spend a signer's token: relay echoes are normal traffic
+	/// and MUST NOT drain the bucket. The probe is advisory only.
+	/// [`GossipJournal::record`] remains the single atomic dedup step, so
+	/// a duplicate that races past the probe is still absorbed there.
+	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError>;
+
 	/// Digests still within the retention window, summarized to a peer
 	/// during reconciliation. Entries older than the window are excluded.
 	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError>;
@@ -456,6 +465,13 @@ impl GossipJournal for MemoryGossipJournal {
 		}
 	}
 
+	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
+		let mut entries = self.entries.lock()?;
+		Self::prune(&mut entries, self.retention_ms, now_ms);
+
+		Ok(entries.contains_key(digest))
+	}
+
 	fn retention_ms(&self) -> u64 {
 		self.retention_ms
 	}
@@ -607,6 +623,22 @@ mod tests {
 		let second = journal.record(b"signer-a", digest, &frame, 1_000)?;
 		assert_eq!(first, Admission::New);
 		assert_eq!(second, Admission::Duplicate);
+		Ok(())
+	}
+
+	#[test]
+	fn seen_tracks_retention_window() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::new(30_000);
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		let before = journal.seen(&digest, 1_000)?;
+		journal.record(b"signer-a", digest, &frame, 1_000)?;
+		let after = journal.seen(&digest, 1_000)?;
+		let expired = journal.seen(&digest, 90_000)?;
+		assert!(!before);
+		assert!(after);
+		assert!(!expired);
 		Ok(())
 	}
 

@@ -1163,9 +1163,15 @@ macro_rules! cluster {
 			}
 		};
 
-		// The signer keys the journal partition. An unsigned or unencodable
-		// signer cannot be attributed, so its rumor is refused.
-		let signer_id = match $frame.nonrepudiation.as_ref() {
+		// Rate admission and the journal partition key on the identity
+		// whose signature this handler verified: the local publisher on a
+		// publish, the rumor's origin gateway on a relay. Keying a relayed
+		// rumor on the relaying peer would grant the origin a fresh budget
+		// at every relay, so one origin could exceed its limits by fanning
+		// the same flood through many gateways (CWE-770). An unsigned or
+		// unencodable signer cannot be attributed, so its rumor is refused.
+		let attributed = $crate::cluster!(@gossip_attribution $origin, $frame, rumor);
+		let signer_id = match attributed.nonrepudiation.as_ref() {
 			::core::option::Option::Some(signer_info) => match $crate::der::Encode::to_der(&signer_info.sid) {
 				::core::result::Result::Ok(signer_id) => signer_id,
 				::core::result::Result::Err(_) => {
@@ -1180,6 +1186,25 @@ macro_rules! cluster {
 		};
 
 		let now = $crate::colony::common::current_timestamp_ms();
+
+		// Relay echoes are normal traffic: the reflood does not skip the
+		// sender, so every flooded rumor comes back at least once. A known
+		// duplicate is dropped before rate admission so echoes cannot drain
+		// a signer's bucket. The probe is advisory; the journal record
+		// below stays the atomic dedup step for a racing duplicate.
+		match $config.gossip.journal.seen(&admitted.digest(), now) {
+			::core::result::Result::Ok(true) => {
+				let _ = $trace.event($crate::instrumentation::events::CLUSTER_GOSSIP_DUPLICATE);
+				return $crate::cluster!(@reply $frame, $crate::colony::common::GossipResponse {
+					status: $crate::policy::TransitStatus::Ok,
+				});
+			}
+			::core::result::Result::Ok(false) => {}
+			::core::result::Result::Err(_) => {
+				return $crate::cluster!(@refuse_gossip $frame, $trace,
+					$crate::policy::TransitStatus::Unavailable)
+			}
+		}
 
 		// Per-signer rate admission runs before the journal records or refloods.
 		// An over-limit signer cannot grow retained state or amplify traffic (CWE-770).
@@ -1375,6 +1400,18 @@ macro_rules! cluster {
 	// Origin variant: a locally published rumor has no relaying peer to
 	// score, so admission failure refuses without touching any trail.
 	(@weaken_invalid_relay origin, $frame:ident, $servlet_registry:ident, $config:ident, $trace:ident) => {{}};
+
+	// Frame carrying the signature that attributes a rumor for rate
+	// admission and the journal partition. A publish is attributed to the
+	// outer frame's hive-plane publisher; a relay is attributed to the
+	// nested rumor's origin gateway, whose signature the relay arm
+	// verified. The relaying peer's own signature never keys the budget.
+	(@gossip_attribution origin, $frame:ident, $rumor:ident) => {
+		&$frame
+	};
+	(@gossip_attribution relay, $frame:ident, $rumor:ident) => {
+		&$rumor
+	};
 
 	// Gossip refuse: fire the refused event and build the reply. Gossip
 	// takes no replay record (seen-ttl plus journal digest dedup subsume
