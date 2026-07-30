@@ -21,7 +21,7 @@ pub mod servlet_registry;
 pub use builder::{ClusterConfBuilder, HeartbeatConfBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
-pub use servlet_registry::{PheromoneConf, ServletEntry, ServletRegistry};
+pub use servlet_registry::{PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
 
 use core::future::Future;
 use core::time::Duration;
@@ -265,6 +265,9 @@ pub trait Cluster: Sized + Send + Sync {
 
 	/// Get available servlet types (from registered hives)
 	fn available_servlets(&self) -> Vec<Vec<u8>>;
+
+	/// Get servlet types reachable through peer gateways (learned, not local)
+	fn peer_servlets(&self) -> Vec<Vec<u8>>;
 
 	/// Get the number of registered hives
 	fn hive_count(&self) -> usize;
