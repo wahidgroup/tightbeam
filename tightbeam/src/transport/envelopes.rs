@@ -153,7 +153,7 @@ impl<'a> Decode<'a> for ResponsePackage {
 pub const MUX_APPLICATION_CODE_FLOOR: u32 = 0x1000;
 
 /// Reason a single stream was cancelled
-/// ([RFC 9113 § 6.4](https://datatracker.ietf.org/doc/html/rfc9113#section-6.4) analog).
+/// ([RFC 9113 § 6.4](https://datatracker.ietf.org/doc/html/rfc9113#section-6.4)).
 ///
 /// Open u32 code space: TB-reserved codes decode to named variants,
 /// everything else round-trips through [`CancelReason::Application`] so
@@ -199,7 +199,7 @@ impl From<u32> for CancelReason {
 }
 
 /// Reason the connection is shutting down
-/// ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8) analog).
+/// ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8)).
 ///
 /// Same open u32 code space rules as [`CancelReason`].
 #[cfg(feature = "transport-multiplex")]
@@ -212,7 +212,7 @@ pub enum GoAwayReason {
 	ProtocolError,
 	/// Peer exceeded the cancel budget
 	/// ([RFC 9113 § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
-	/// ENHANCE_YOUR_CALM analog, CVE-2023-44487 hardening)
+	/// ENHANCE_YOUR_CALM, CVE-2023-44487 hardening)
 	EnhanceYourCalm,
 	/// Session budget spent down to the drain headroom: the epoch's
 	/// negotiated data volume is exhausted and the sender is draining
@@ -327,8 +327,7 @@ pub enum MuxStreamKind {
 /// Open a stream and carry its first payload chunk inline.
 ///
 /// One unified stream grammar
-/// ([RFC 9113 § 8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1)
-/// analog, request = stream):
+/// ([RFC 9113 § 8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1)):
 ///
 /// ```text
 /// initiator:  Open(kind, last?)  Data(...)*  Data(last)
@@ -424,7 +423,7 @@ impl MuxEndPackage {
 	}
 }
 
-/// Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA analog,
+/// Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA,
 /// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
 ///
 /// `limit` is the total chunk count the sender may have emitted on the
@@ -476,7 +475,7 @@ impl MuxCancelPackage {
 }
 
 /// Connection-level liveness probe
-/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7) analog).
+/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)).
 ///
 /// `opaque` is an initiator-chosen correlation value echoed unchanged in
 /// the ack. Pings never allocate a stream and never reach the application
@@ -531,7 +530,7 @@ impl GoAwayPackage {
 
 /// First leg, client -> server: client randomness opening an epoch renewal
 /// ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)
-/// analog with an explicit three-leg exchange).
+/// with an explicit three-leg exchange).
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct MuxRekeyRequestPackage {

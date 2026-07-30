@@ -11,7 +11,7 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ClientEnv, ScenarioConf, SetupEnv};
+use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv};
 use tightbeam::transport::envelopes::MuxEnvelope;
 use tightbeam::transport::{EnvelopeSource, TransportEnvelope};
 use tightbeam::utils::urn::Urn;
@@ -141,7 +141,7 @@ tb_process_spec! {
 // held slot frees.
 tb_scenario! {
 	name: mux_cap_exhaustion,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MuxCapExhaustionSpec::latest())
 		.with_csp(MuxCapExhaustionProcess)
 		.build(),
@@ -258,7 +258,7 @@ tb_process_spec! {
 // Drop unresolved emit: frees cap slot and aborts the server handler.
 tb_scenario! {
 	name: mux_cancel_frees_slot_and_aborts_handler,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MuxCancelAbortSpec::latest())
 		.with_csp(MuxCancelAbortProcess)
 		.build(),
@@ -326,7 +326,7 @@ tb_process_spec! {
 // Stale response after cancel is discarded. Later streams stay healthy.
 tb_scenario! {
 	name: mux_cancel_response_race_discarded,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MuxCancelRaceSpec::latest())
 		.with_csp(MuxCancelRaceProcess)
 		.build(),

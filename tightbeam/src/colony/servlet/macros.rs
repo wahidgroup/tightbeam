@@ -139,7 +139,7 @@ macro_rules! __servlet_start_impl {
 		$crate::paste::paste! {
 			async fn start_impl(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-				servlet_conf: $crate::colony::servlet::ServletConf<$protocol, $input>,
+				servlet_conf: $crate::colony::servlet::ServletConfig<$protocol, $input>,
 			) -> Result<Self, $crate::TightBeamError> {
 				let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()?;
 
@@ -220,7 +220,7 @@ macro_rules! __servlet_impl_methods {
 			#[allow(dead_code)]
 			$vis async fn start(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-				config: Option<$crate::colony::servlet::ServletConf<$protocol, $input>>,
+				config: Option<$crate::colony::servlet::ServletConfig<$protocol, $input>>,
 			) -> Result<Self, $crate::TightBeamError> {
 				<Self as $crate::colony::servlet::Servlet<$input>>::start(trace, config).await
 			}
@@ -236,7 +236,7 @@ macro_rules! __servlet_impl_methods {
 macro_rules! __servlet_trait_impl {
 	($servlet_name:ident, $protocol:path, $input:ty) => {
 		impl $crate::colony::servlet::Servlet<$input> for $servlet_name {
-			type Conf = $crate::colony::servlet::ServletConf<$protocol, $input>;
+			type Conf = $crate::colony::servlet::ServletConfig<$protocol, $input>;
 			type Address = <$protocol as $crate::transport::Protocol>::Address;
 
 			async fn start(

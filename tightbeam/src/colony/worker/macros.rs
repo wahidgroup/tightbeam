@@ -81,7 +81,7 @@ macro_rules! worker {
 
 	// Single dispatch arm: `$(...),*` policy repetition matches the empty
 	// list, and the trait impl receives its `Config` type resolved here
-	// (`[<$worker_name Conf>]` for `config`, `()` for `no_config`).
+	// (`[<$worker_name Config>]` for `config`, `()` for `no_config`).
 	(@generate $worker_name:ident, $input:ty, $output:ty, [$($queue:expr)?],
 		config,
 		{ $($cfg_field:ident: $cfg_ty:ty,)* },
@@ -97,7 +97,7 @@ macro_rules! worker {
 		);
 		$crate::worker!(@impl_new $worker_name, config, { $($cfg_field: $cfg_ty,)* });
 		$crate::paste::paste! {
-			$crate::worker!(@impl_worker_trait $worker_name, $input, $output, [<$worker_name Conf>]);
+			$crate::worker!(@impl_worker_trait $worker_name, $input, $output, [<$worker_name Config>]);
 		}
 		$crate::worker!(@drop_impl $worker_name);
 	};
@@ -136,12 +136,12 @@ macro_rules! worker {
 				sender: Option<$crate::colony::worker::worker_runtime::rt::QueueSender<$crate::colony::worker::WorkerRequest<$input, $output>>>,
 				join: Option<$crate::colony::worker::worker_runtime::rt::JoinHandle>,
 				queue: usize,
-				config: ::std::sync::Arc<[<$worker_name Conf>]>,
+				config: ::std::sync::Arc<[<$worker_name Config>]>,
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			}
 
 			#[derive(Clone)]
-			pub struct [<$worker_name Conf>] {
+			pub struct [<$worker_name Config>] {
 				$(pub $cfg_field: $cfg_ty,)*
 			}
 		}
@@ -216,7 +216,7 @@ macro_rules! worker {
 	(@impl_new $worker_name:ident, config, { $($cfg_field:ident: $cfg_ty:ty,)* }) => {
 		$crate::paste::paste! {
 			impl $worker_name {
-				pub fn new(config: [<$worker_name Conf>]) -> Self {
+				pub fn new(config: [<$worker_name Config>]) -> Self {
 					Self {
 						sender: None,
 						join: None,

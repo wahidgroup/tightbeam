@@ -151,7 +151,7 @@ tb_assert_spec! {
 	}
 }
 
-// RFC 9846 § 5.5 analog: fail closed with RekeyRequired, never reuse key.
+// RFC 9846 § 5.5: fail closed with RekeyRequired, never reuse key.
 tb_scenario! {
 	name: split_write_rekey_limit_fails_closed,
 	spec: SplitWriteRekeyLimitSpec,

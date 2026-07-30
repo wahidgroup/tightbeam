@@ -12,7 +12,7 @@ pub use crate::colony::common::{
 	ColonyNamespace, ColonyResource, HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse,
 	InstanceMetrics, ListServletsParams, ListServletsResult, LoadBalancer, PowerOfTwoChoices, RegisterHiveRequest,
 	RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletAddressUpdate,
-	ServletAddressUpdateResponse, ServletInfo, ServletScaleConf, SpawnServletParams, SpawnServletResult,
+	ServletAddressUpdateResponse, ServletInfo, ServletScaleConfig, SpawnServletParams, SpawnServletResult,
 	StochasticForager, StopServletParams, StopServletResult,
 };
 
@@ -271,7 +271,7 @@ pub trait Hive: Sized + Send + Sync {
 	///
 	/// The hive is created but not yet established. Call `register()` to add
 	/// servlets, then `establish()` to start the hive.
-	fn new(config: Option<HiveConf>) -> Result<Self, TightBeamError>;
+	fn new(config: Option<HiveConfig>) -> Result<Self, TightBeamError>;
 
 	/// Register an already-started servlet with the hive.
 	///
@@ -309,7 +309,7 @@ pub trait Hive: Sized + Send + Sync {
 	/// Created at `new` and populated with servlet addresses at
 	/// `establish`; the same `Arc` is live-updated as servlets scale.
 	/// Hand it to
-	/// [`ServletConfBuilder::with_hive_context`](crate::colony::servlet::ServletConfBuilder::with_hive_context)
+	/// [`ServletConfigBuilder::with_hive_context`](crate::colony::servlet::ServletConfigBuilder::with_hive_context)
 	/// so servlet handlers can reach siblings, or use it directly for
 	/// [`HiveContext::call`], [`HiveContext::open_stream`], and
 	/// [`HiveContext::open_duplex`].
@@ -359,7 +359,7 @@ pub trait Hive: Sized + Send + Sync {
 /// TLS configuration for hive servlets
 ///
 /// Contains certificate, key, and validators for encrypted transport.
-/// Wrapped in `Arc` when stored in `HiveConf` because validators are trait objects.
+/// Wrapped in `Arc` when stored in `HiveConfig` because validators are trait objects.
 #[cfg(feature = "x509")]
 pub struct HiveTlsConfig {
 	/// Server certificate specification
@@ -488,17 +488,17 @@ where
 ///
 /// A hive resolves each servlet type to a single instance address, so it
 /// carries no balancer: instance selection across a type's replicas is the
-/// cluster gateway's job. See [`ClusterConf`](crate::colony::cluster::ClusterConf).
+/// cluster gateway's job. See [`ClusterConfig`](crate::colony::cluster::ClusterConfig).
 #[derive(Clone)]
-pub struct HiveConf {
+pub struct HiveConfig {
 	/// Naming scope resource URNs are validated against. Registrations
 	/// carrying a foreign authority or realm are refused at
 	/// [`Hive::register`], before anything reaches a cluster.
 	pub namespace: ColonyNamespace,
 	/// Default scaling config for all servlet types
-	pub default_scale: ServletScaleConf,
+	pub default_scale: ServletScaleConfig,
 	/// Per-type overrides (keyed by servlet type URN)
-	pub servlet_overrides: HashMap<Urn<'static>, ServletScaleConf>,
+	pub servlet_overrides: HashMap<Urn<'static>, ServletScaleConfig>,
 	/// Cooldown between scaling decisions (default: 5 seconds)
 	pub cooldown: Duration,
 	/// Queue capacity per servlet for utilization calculation (default: 100)
@@ -539,7 +539,7 @@ pub struct HiveConf {
 	/// Multiplexing advertisement for the servlet pool and the control
 	/// server (default: `None` = single-flight). Pool connections to a
 	/// servlet multiplex only when the servlet also advertises via
-	/// [`ServletConfBuilder::with_mux_offer`](crate::colony::servlet::ServletConfBuilder::with_mux_offer)
+	/// [`ServletConfigBuilder::with_mux_offer`](crate::colony::servlet::ServletConfigBuilder::with_mux_offer)
 	pub mux_offer: Option<TransportOffer>,
 	/// Anti-entropy re-registration beat (default: 5s; `None` disables).
 	///
@@ -548,9 +548,9 @@ pub struct HiveConf {
 	pub reregister_interval: Option<Duration>,
 }
 
-impl core::fmt::Debug for HiveConf {
+impl core::fmt::Debug for HiveConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		let mut d = f.debug_struct("HiveConf");
+		let mut d = f.debug_struct("HiveConfig");
 		d.field("namespace", &self.namespace)
 			.field("default_scale", &self.default_scale)
 			.field("servlet_overrides", &self.servlet_overrides)
@@ -575,11 +575,11 @@ impl core::fmt::Debug for HiveConf {
 	}
 }
 
-impl Default for HiveConf {
+impl Default for HiveConfig {
 	fn default() -> Self {
 		Self {
 			namespace: ColonyNamespace::default(),
-			default_scale: ServletScaleConf::default(),
+			default_scale: ServletScaleConfig::default(),
 			servlet_overrides: HashMap::new(),
 			cooldown: Duration::from_secs(5),
 			queue_capacity: 100,

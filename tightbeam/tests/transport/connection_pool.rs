@@ -27,7 +27,7 @@ use std::{
 };
 
 use tightbeam::{
-	colony::servlet::ServletConf,
+	colony::servlet::ServletConfig,
 	der::Sequence,
 	exactly,
 	instrumentation::events,
@@ -248,7 +248,7 @@ tb_assert_spec! {
 	feature = "sha3",
 	feature = "aead"
 ))]
-pub struct PoolEchoServletConf {
+pub struct PoolEchoServletConfig {
 	message_count: Arc<AtomicUsize>,
 }
 
@@ -261,10 +261,10 @@ pub struct PoolEchoServletConf {
 	feature = "aead"
 ))]
 servlet! {
-	PoolEchoServlet<TestMessage, EnvConfig = PoolEchoServletConf>,
+	PoolEchoServlet<TestMessage, EnvConfig = PoolEchoServletConfig>,
 	protocol: TokioListener,
 	handle: |_msg, frame, ctx| async move {
-		let config: &PoolEchoServletConf = ctx.env_config()?;
+		let config: &PoolEchoServletConfig = ctx.env_config()?;
 		config.message_count.fetch_add(1, Ordering::SeqCst);
 		Ok(Some(frame))
 	}
@@ -278,14 +278,14 @@ servlet! {
 	feature = "sha3",
 	feature = "aead"
 ))]
-fn pool_echo_conf(message_count: Arc<AtomicUsize>) -> Result<ServletConf<TokioListener, TestMessage>, TightBeamError> {
-	Ok(ServletConf::<TokioListener, TestMessage>::builder()
+fn pool_echo_conf(message_count: Arc<AtomicUsize>) -> Result<ServletConfig<TokioListener, TestMessage>, TightBeamError> {
+	Ok(ServletConfig::<TokioListener, TestMessage>::builder()
 		.with_certificate(
 			SERVER_CERT,
 			SERVER_KEY.to_provider::<Secp256k1>()?,
 			vec![Arc::new(CLIENT_PINNING)],
 		)?
-		.with_config(Arc::new(PoolEchoServletConf { message_count }))
+		.with_config(Arc::new(PoolEchoServletConfig { message_count }))
 		.build())
 }
 

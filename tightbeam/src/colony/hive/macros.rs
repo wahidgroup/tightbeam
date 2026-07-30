@@ -55,7 +55,7 @@ macro_rules! hive {
 					::std::collections::HashMap<$crate::utils::urn::Urn<'static>, $crate::colony::hive::SpawnerFn>
 				>,
 				/// Hive configuration
-				config: $crate::colony::hive::HiveConf,
+				config: $crate::colony::hive::HiveConfig,
 				/// Trace collector for hive-level events
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 				/// Control server handle (for cluster commands)
@@ -184,7 +184,7 @@ macro_rules! hive {
 				type Protocol = $protocol;
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
-				fn new(config: Option<$crate::colony::hive::HiveConf>) -> Result<Self, $crate::TightBeamError> {
+				fn new(config: Option<$crate::colony::hive::HiveConfig>) -> Result<Self, $crate::TightBeamError> {
 					use $crate::transport::client::pool::ConnectionBuilder;
 
 					let config = config.unwrap_or_default();

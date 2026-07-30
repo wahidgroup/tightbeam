@@ -388,7 +388,7 @@ impl Default for MemoryGossipJournal {
 /// Gossip subsystem configuration: freshness window, origin time-to-live,
 /// the local ingress policy, and the pluggable [`GossipJournal`] and
 /// [`GossipAdmission`].
-pub struct GossipConf {
+pub struct GossipConfig {
 	/// Freshness window a rumor's issue time (its `metadata.order`) must fall within.
 	pub seen_ttl: Duration,
 	/// Time-to-live an origin publish starts a rumor with, clamped to
@@ -407,7 +407,7 @@ pub struct GossipConf {
 	pub admission: Arc<dyn GossipAdmission>,
 }
 
-impl Default for GossipConf {
+impl Default for GossipConfig {
 	fn default() -> Self {
 		Self {
 			seen_ttl: Duration::from_millis(DEFAULT_GOSSIP_SEEN_TTL_MS),
@@ -419,9 +419,9 @@ impl Default for GossipConf {
 	}
 }
 
-impl core::fmt::Debug for GossipConf {
+impl core::fmt::Debug for GossipConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		f.debug_struct("GossipConf")
+		f.debug_struct("GossipConfig")
 			.field("seen_ttl", &self.seen_ttl)
 			.field("ttl", &self.ttl)
 			.field("ingress", &self.ingress)

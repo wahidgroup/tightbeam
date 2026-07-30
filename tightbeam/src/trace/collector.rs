@@ -335,7 +335,7 @@ impl Default for SinkHandle {
 }
 
 /// Monotonic trace clock: event timestamps count nanoseconds since the
-/// collector's construction. The construction wall-clock is recorded once
+/// collector's construction. The construction time origin is recorded once
 /// (`TRACE_CLOCK_ORIGIN`) so absolute times are reconstructible without a
 /// per-event syscall.
 ///
@@ -721,7 +721,7 @@ impl TraceCollector {
 		self.emit_with_payload(event_urn, label.as_ref(), None);
 	}
 
-	/// Record the trace clock's wall-clock origin once per collector, so
+	/// Record the trace clock's time origin once per collector, so
 	/// relative `timestamp_ns` values reconstruct to absolute times.
 	#[cfg(feature = "instrument")]
 	fn record_clock_origin(&self) {

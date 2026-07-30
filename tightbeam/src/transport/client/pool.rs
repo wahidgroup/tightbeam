@@ -40,7 +40,7 @@ use x509::*;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
-	pub use crate::transport::policy::PolicyConf;
+	pub use crate::transport::policy::PolicyConfig;
 	pub use crate::transport::MessageEmitter;
 	pub use crate::Frame;
 }
@@ -175,7 +175,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
 	where
 		Pro: Protocol,
-		Pro::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C>,
+		Pro::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
 	{
 		let mut configured = transport;
 		if let Some(store) = &self.trust_store {
@@ -588,7 +588,7 @@ where
 	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
 	where
 		P: PersistentConnection + Send + Sync,
-		P::Transport: MessageEmitter + MessageCollector + PolicyConf + Send + Sync,
+		P::Transport: MessageEmitter + MessageCollector + PolicyConfig + Send + Sync,
 	{
 		if let Some(client) = self.try_take_ready_client(&addr)? {
 			return Ok(self.wrap_client(client, addr));
@@ -613,7 +613,7 @@ where
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport:
-			MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C> + Send + Sync,
+			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
 		if let Some(client) = self.try_take_ready_client(&addr)? {
 			return Ok(self.wrap_client(client, addr));
@@ -655,7 +655,7 @@ where
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport:
-			MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C> + Send + Sync,
+			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
 		self.connect_single_flight(addr).await
 	}
@@ -663,7 +663,7 @@ where
 	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, C>>>
 	where
 		P: PersistentConnection + Send + Sync,
-		P::Transport: MessageEmitter + MessageCollector + PolicyConf + Send + Sync,
+		P::Transport: MessageEmitter + MessageCollector + PolicyConfig + Send + Sync,
 	{
 		let maybe_client = self.try_take_ready_client(addr)?;
 		Ok(maybe_client.map(|client| self.wrap_client(client, addr.clone())))
@@ -687,7 +687,7 @@ pooled_mux! {
 		P::Address: Hash + Eq + Clone + Send + Sync,
 		P::Transport: MessageEmitter
 			+ MessageCollector
-			+ PolicyConf
+			+ PolicyConfig
 			+ X509ClientConfig<CryptoProvider = C>
 			+ MuxConnector
 			+ Send
@@ -1011,7 +1011,7 @@ pooled_mux! {
 		P::Address: Hash + Eq + Clone + Send + Sync,
 		P::Transport: MessageEmitter
 			+ MessageCollector
-			+ PolicyConf
+			+ PolicyConfig
 			+ X509ClientConfig<CryptoProvider = C>
 			+ MuxConnector
 			+ Send

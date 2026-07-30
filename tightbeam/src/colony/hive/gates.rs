@@ -462,7 +462,7 @@ impl GatePolicy for ClusterSecurityGate {
 pub struct BackpressureGate {
 	/// Current aggregate utilization (basis points as u16)
 	utilization: Arc<AtomicU16>,
-	/// Threshold above which to reject (from HiveConf)
+	/// Threshold above which to reject (from HiveConfig)
 	threshold: BasisPoints,
 }
 

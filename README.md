@@ -1263,55 +1263,45 @@ let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
 
 ## 8. Transport Layer
 
+The transport layer moves Frame bytes between endpoints. It establishes connections, applies security policies, and manages session cryptographic state. Policy details are in [§8.4](#84-transport-policies). Handshakes are in [§8.5](#85-handshake-protocols). Multiplexing and pooling are in [§8.6](#86-multiplexing) and [§8.7](#87-connection-pooling).
+
 ### 8.1 Transport Architecture
 
-The tightbeam transport layer provides a pluggable framework for moving bytes between endpoints while enforcing security policies. The transport layer is responsible for the following:
-
-- Establishing connections
-- Sending and receiving messages
-- Enforcing security policies
-- Managing transmission cryptographic state
+Transport behavior is split across traits so applications can plug in a byte protocol without rewriting policy or crypto code.
 
 #### 8.1.1 Design Principles
 
-The transport layer uses trait-based architecture:
-
-- **Protocol**: Bind/connect operations
-- **MessageIO**: Frame serialization and wire protocol
-- **MessageEmitter/MessageCollector**: Policy enforcement (gate, retry)
-- **EncryptedProtocol/EncryptedMessageIO**: Encryption support
+- Bind and connect live on protocol traits. Frame read and write live on I/O traits.
+- Gate and retry policies attach to emitter and collector wrappers. They do not rewrite the byte protocol.
+- Encryption extends the same trait family. Cleartext and encrypted paths share the Frame API.
 
 #### 8.1.2 Core Transport Traits
 
-**Trait hierarchy:**
-
-- `Protocol`: Bind/connect operations
-- `MessageIO`: Read/write envelopes
-- `MessageCollector`: Server-side with policies
-- `MessageEmitter`: Client-side with policies and retry
-- `EncryptedProtocol`: Adds certificate-based binding
-- `EncryptedMessageIO`: Adds encryption/decryption
+- `Protocol`: bind and connect operations
+- `MessageIO`: read and write wire envelopes
+- `MessageCollector`: server-side receive path with policies
+- `MessageEmitter`: client-side send path with policies and retry
+- `EncryptedProtocol`: certificate-based bind and connect
+- `EncryptedMessageIO`: encrypt and decrypt envelopes on the wire
 
 ### 8.2 Wire Format
 
-Messages use ASN.1 DER encoding with two-tier envelopes:
+Frames use ASN.1 DER with two envelope layers:
 
-- **WireEnvelope**: Cleartext or encrypted outer layer
-- **TransportEnvelope**: Request/Response/EnvelopedData/SignedData inner layer. With `transport-multiplex`, also a single `Mux` arm (ASN.1 context tag 4) nesting the `MuxEnvelope` CHOICE (Open/Data/End/Credit/Cancel/GoAway/Ping, inner context tags 0-6)
+- **`WireEnvelope`**: Outer cleartext or encrypted container
+- **`TransportEnvelope`**: Inner request, response, CMS, or mux payload
 
-Stream correlation metadata for multiplexed envelopes travels inside the `TransportEnvelope` payload. When the outer `WireEnvelope` is encrypted, that metadata does not appear in cleartext on the wire.
+With the `transport-multiplex` feature, `TransportEnvelope` includes a `Mux` arm (ASN.1 context tag 4). That arm nests a `MuxEnvelope` CHOICE with Open, Data, End, Credit, Cancel, GoAway, and Ping (inner context tags 0 through 6). Multiplex stream correlation metadata travels inside the `TransportEnvelope` payload. When `WireEnvelope` is encrypted, that metadata is not cleartext on the wire.
 
-DER tag-length-value encoding provides inherent framing. Default size limits:
+DER tag-length-value encoding supplies framing. Default size limits:
 
-- **128 KB** for cleartext envelopes (configurable via `TransportEncryptionConfig`)
-- **256 KB** for encrypted envelopes (configurable via `TransportEncryptionConfig`)
-- **16 KB** for handshake messages (hard limit to prevent DoS attacks)
+- Cleartext envelopes: 128 KB (configurable through `TransportEncryptionConfig`)
+- Encrypted envelopes: 256 KB (configurable through `TransportEncryptionConfig`)
+- Handshake messages: 16 KB hard limit (DoS bound)
 
 ### 8.3 TCP Transport
 
-TCP transport bridges byte streams with message-oriented Frame API using DER length-prefixed envelopes. Supports both `std::net` (sync) and `tokio` (async).
-
-**Example:**
+The TCP transport maps a byte stream to the Frame API with DER length-prefixed envelopes. It supports `std::net` (synchronous) and `tokio` (asynchronous).
 
 ```rust
 use std::net::TcpListener;
@@ -1331,15 +1321,15 @@ server! {
 
 #### 8.4.1 Concept
 
-Policies control message flow without modifying transport logic:
+Policies control message flow. They do not rewrite the byte transport.
 
-- **GatePolicy**: Accept/reject messages (rate limiting, authentication)
-- **RestartPolicy**: Retry behavior with backoff strategies (exponential, linear)
-- **ReceptorPolicy**: Type-safe application-level filtering
+- **`GatePolicy`**: Accept or reject a Frame (rate limits, authentication, session checks)
+- **`RestartPolicy`**: Decide retry after failure (linear or exponential backoff)
+- **`ReceptorPolicy`**: Filter a decoded application `Message` by type
 
 #### 8.4.2 Specification
 
-**GatePolicy Trait:**
+**GatePolicy trait:**
 
 ```rust
 pub trait GatePolicy: Send + Sync {
@@ -1347,9 +1337,11 @@ pub trait GatePolicy: Send + Sync {
 }
 ```
 
-Every evaluation carries the connection's `SessionContext`: identity-blind gates ignore it, identity gates key on it. Sites without authenticated facts, such as cleartext connections, client-side emit paths, in-process evaluation, pass the empty (default) context, whose accessors all answer `None`. `frame` is `None` for mux streaming and duplex opens that have no request frame at dispatch. Session and capacity gates still run; optional integrity gates skip (`Ok`); auth that needs a signed or intact frame fails closed. Streaming authz belongs on session facts (mutual TLS, peer lists), not frame-content rules alone.
+Every evaluation receives the connection `SessionContext`. Identity-blind gates ignore it. Identity gates key on it. Cleartext connections, client emit paths, and in-process evaluation pass the default empty context. Accessors on that context all return `None`.
 
-**ReceptorPolicy Trait:**
+`frame` is `None` for mux streaming and duplex opens that have no request Frame at dispatch. Session and capacity gates still run. Optional integrity gates that need a Frame SHOULD return `Ok` when `frame` is `None`. Auth that needs a signed or intact Frame MUST fail closed. Stream authorization SHOULD use session facts (mutual TLS, peer lists), not Frame-content rules alone.
+
+**ReceptorPolicy trait:**
 
 ```rust
 pub trait ReceptorPolicy<T: Message>: Send + Sync {
@@ -1357,7 +1349,7 @@ pub trait ReceptorPolicy<T: Message>: Send + Sync {
 }
 ```
 
-**RestartPolicy Trait:**
+**RestartPolicy trait:**
 
 ```rust
 pub trait RestartPolicy: Send + Sync {
@@ -1378,7 +1370,7 @@ pub trait RestartPolicy: Send + Sync {
 }
 ```
 
-**TransitStatus:**
+**TransitStatus** (gRPC `google.rpc.Code` registry):
 
 ```rust
 // The gRPC canonical status registry (google.rpc.Code)
@@ -1418,7 +1410,7 @@ pub enum RetryAction {
 
 #### 8.4.3 Implementation
 
-**GatePolicy - Frame-Level Filtering:**
+**GatePolicy (Frame-level filtering):**
 
 ```rust
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
@@ -1428,7 +1420,10 @@ use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
 struct IdPatternGate;
 
 impl GatePolicy for IdPatternGate {
-	fn evaluate(&self, frame: &Frame, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+		let Some(frame) = frame else {
+			return TransitStatus::PermissionDenied;
+		};
 		if frame.metadata.id.starts_with(b"api-") {
 			TransitStatus::Ok
 		} else {
@@ -1438,7 +1433,7 @@ impl GatePolicy for IdPatternGate {
 }
 ```
 
-**GatePolicy - Session-Identity Filtering:**
+**GatePolicy (session-identity filtering):**
 
 ```rust
 use tightbeam::colony::hive::PeerListGate;
@@ -1452,7 +1447,7 @@ let doorman = PeerListGate::deny([banned_spki_der]);
 let doorman = PeerListGate::allow([member_spki_der]);
 ```
 
-**ReceptorPolicy - Message-Level Filtering:**
+**ReceptorPolicy (message-level filtering):**
 
 ```rust
 use tightbeam::policy::ReceptorPolicy;
@@ -1478,7 +1473,7 @@ impl ReceptorPolicy<RequestMessage> for PriorityGate {
 }
 ```
 
-**RestartPolicy - Retry Strategies:**
+**RestartPolicy (retry strategies):**
 
 ```rust
 use tightbeam::transport::policy::{RestartLinearBackoff, RestartExponentialBackoff};
@@ -1490,7 +1485,7 @@ let restart = RestartLinearBackoff::new(3, 1000, 1, None);
 let restart = RestartExponentialBackoff::new(4, 1000, None);
 ```
 
-**Policy Macro:**
+**`policy!` macro:**
 
 ```rust
 tightbeam::policy! {
@@ -1534,7 +1529,7 @@ tightbeam::policy! {
 }
 ```
 
-**Composing Policies:**
+**Composing policies:**
 
 ```rust
 // Client-side with policies
@@ -1551,22 +1546,22 @@ let mut client = builder.connect(addr).await?;
 
 #### 8.5.1 Concept: Security Goals and Protocol Selection
 
-tightbeam implements two handshake protocols for mutual authentication and session key establishment:
+Two handshake protocols establish mutual authentication and a session key:
 
-- **CMS-Based**: Full PKI with X.509 certificates, certificate validation chains, [RFC 5652][rfc5652] compliance
-- **ECIES-Based**: Lightweight alternative with minimal overhead
+- **CMS-based**: Full PKI with X.509 certificates and [RFC 5652][rfc5652] CMS structures
+- **ECIES-based**: Lighter wire form with less CMS nesting
 
-**Security Goals:**
+Security goals for both:
 
-- **Mutual Authentication**: Both parties prove identity via certificates
-- **Perfect Forward Secrecy**: Ephemeral ECDH ([NIST SP 800-56A][nist-800-56a]) keys ensure past sessions remain secure if long-term keys are compromised
-- **Replay Protection**: Nonces prevent replay attacks
-- **Downgrade Prevention**: Transcript hash covers all handshake messages including profile negotiation ([RFC 9846 §4.1.3][rfc9846-4.1.3], analogous)
-- **Confidentiality**: Session keys derived via HKDF protect all subsequent messages
+- **Mutual authentication**: Each party proves identity with certificates
+- **Perfect forward secrecy**: Ephemeral ECDH ([NIST SP 800-56A][nist-800-56a]) protects past sessions if long-term keys leak later
+- **Replay protection**: Nonces block replayed handshake messages
+- **Downgrade prevention**: The transcript hash covers handshake messages, including profile negotiation ([RFC 9846 §4.1.3][rfc9846-4.1.3])
+- **Confidentiality**: HKDF-derived session keys protect later messages
 
 #### 8.5.2 Specification: Handshake Flow and State Management
 
-**Three-Phase Exchange:**
+**Three-phase exchange:**
 
 ```
 Phase 1: Client -> Server
@@ -1595,46 +1590,40 @@ Phase 3: Client -> Server
 └─────────────────────────────────────────────────────────┘
 ```
 
-**State Machines:**
+**State machines** (diagram form):
 
-Client States:
+Client:
 
 ```
 Init -> HelloSent -> KeyExchangeSent -> ServerFinishedReceived -> ClientFinishedSent -> Completed
 ```
 
-Server States:
+Server:
 
 ```
 Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> Completed
 ```
 
-**Transcript Hash:**
+**Transcript hash:**
 
 ```
 transcript = ClientHello || ServerHandshake || ClientKeyExchange
 transcript_hash = SHA3-256(transcript)
 ```
 
-The transcript hash binds all handshake messages together, preventing:
-
-- Message reordering
-- Profile downgrade attacks
-- Man-in-the-middle modifications
+The transcript hash binds the handshake messages. It blocks reordering, profile downgrade, and undetected man-in-the-middle edits of the transcript.
 
 #### 8.5.3 Implementation: CMS-Based Handshake Protocol
 
-**Overview:**
+CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
 
-Uses RFC 5652 Cryptographic Message Syntax with:
+- **`EnvelopedData`**: ECDH, HKDF, and AES key wrap for the session key
+- **`SignedData`**: Transcript signatures for authentication
+- **`KeyAgreeRecipientInfo` (KARI)**: Ephemeral-static ECDH key agreement
 
-- **EnvelopedData**: ECDH + HKDF + AES Key Wrap for session key encryption
-- **SignedData**: Transcript signatures for authentication
-- **KeyAgreeRecipientInfo (KARI)**: Ephemeral-static ECDH key agreement
+**Mutual authentication flow:**
 
-**Mutual Authentication Flow:**
-
-For mutual authentication, client includes certificate and signs transcript in `ClientKeyExchange`:
+For mutual authentication, the client includes a certificate and signs the transcript in `ClientKeyExchange`:
 
 ```
 Client Side - Building ClientKeyExchange:
@@ -1682,20 +1671,18 @@ Server Side - Verifying Client Authentication:
 
 #### 8.5.4 Implementation: ECIES-Based Handshake Protocol
 
-**Overview:**
+ECIES (Elliptic Curve Integrated Encryption Scheme) is the lighter handshake path. It encapsulates the session key without nested CMS `EnvelopedData` / `SignedData` containers.
 
-Lightweight alternative using ECIES (Elliptic Curve Integrated Encryption Scheme) for key encapsulation. Compact structures without ASN.1 EnvelopedData/SignedData overhead requiring minimal wire format complexity.
+Differences from CMS:
 
-**Key Differences from CMS:**
+- Raw ECIES encryption instead of nested CMS `EnvelopedData`
+- Flatter ASN.1 structures instead of multi-level CMS nesting
+- Same security goals: mutual authentication, forward secrecy, replay protection
+- Both paths use ASN.1 DER. ECIES avoids [RFC 5652][rfc5652] container complexity
 
-- **Simplified Structure**: Raw ECIES encryption instead of nested CMS EnvelopedData
-- **Reduced Overhead**: Flat ASN.1 structures instead of multi-level CMS nesting
-- **Same Security Goals**: Mutual authentication, forward secrecy, replay protection
-- **Compatible Encoding**: Both use ASN.1 DER, but ECIES avoids RFC 5652 complexity
+**Mutual authentication flow:**
 
-**Mutual Authentication Flow:**
-
-For mutual authentication, client includes certificate and signs transcript in ClientKeyExchange:
+For mutual authentication, the client includes a certificate and signs the transcript in `ClientKeyExchange`:
 
 ```
 Client Side - Building ClientKeyExchange:
@@ -1762,14 +1749,14 @@ Server Side - Verifying Client Authentication:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**ECIES Encryption Details:**
+**ECIES encryption details:**
 
-ECIES (Elliptic Curve Integrated Encryption Scheme) combines:
+ECIES combines:
 
-- **ECDH**: Ephemeral-static key agreement for shared secret derivation
-- **KDF**: HKDF-SHA3-256 for deriving encryption and MAC keys from shared secret
-- **AEAD**: AES-256-GCM for authenticated encryption of session key
-- **Ephemeral Keys**: Fresh ephemeral key pair per encryption operation
+- **ECDH**: Ephemeral-static key agreement for the shared secret
+- **KDF**: HKDF-SHA3-256 for encryption and MAC keys from that secret
+- **AEAD**: AES-256-GCM for authenticated encryption of the session key
+- **Ephemeral keys**: A fresh ephemeral key pair per encryption
 
 ```
 ECIES-Encrypt(plaintext, recipient_pub_key):
@@ -1798,40 +1785,34 @@ ECIES-Encrypt(plaintext, recipient_pub_key):
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Wire Format Comparison:**
+**Wire format comparison:**
 
-| Feature                | CMS-Based                     | ECIES-Based                            |
-| ---------------------- | ----------------------------- | -------------------------------------- |
-| Envelope Structure     | RFC 5652 nested structures    | Simplified ASN.1 structures            |
-| Key Agreement          | KARI (KeyAgreeRecipientInfo)  | Raw ECIES with DER encoding            |
-| Session Key Encryption | EnvelopedData + AES-KW        | ECIES + AES-GCM                        |
-| Signatures             | SignedData structure          | Raw signatures in ASN.1                |
-| Size Overhead          | ~400-600 bytes                | ~200-300 bytes                         |
-| Parsing Complexity     | Multi-level ASN.1 nesting     | Flat ASN.1 structures                  |
-| Standards Compliance   | RFC 5652, [RFC 5753][rfc5753] | [SECG SEC 1][secg-sec1] + custom ASN.1 |
+| Feature                | CMS-based                      | ECIES-based                            |
+| ---------------------- | ------------------------------ | -------------------------------------- |
+| Envelope structure     | RFC 5652 nested structures     | Simplified ASN.1 structures            |
+| Key agreement          | KARI (`KeyAgreeRecipientInfo`) | Raw ECIES with DER encoding            |
+| Session key encryption | `EnvelopedData` + AES-KW       | ECIES + AES-GCM                        |
+| Signatures             | `SignedData` structure         | Raw signatures in ASN.1                |
+| Size overhead          | about 400-600 bytes            | about 200-300 bytes                    |
+| Parsing complexity     | Multi-level ASN.1 nesting      | Flat ASN.1 structures                  |
+| Standards              | RFC 5652, [RFC 5753][rfc5753]  | [SECG SEC 1][secg-sec1] + custom ASN.1 |
 
-**Performance Characteristics:**
+**Performance characteristics** (relative to CMS on the same curves and algorithms):
 
-- **Handshake Time**: 20-30% faster than CMS (reduced parsing overhead)
-- **Memory Usage**: 30-40% lower than CMS (no ASN.1 intermediate structures)
-- **Wire Size**: 40-50% smaller than CMS (compact binary encoding)
-- **CPU Usage**: Similar cryptographic operations (same curves and algorithms)
+- Handshake time: about 20-30% faster (less parsing)
+- Memory use: about 30-40% lower (fewer ASN.1 intermediate structures)
+- Wire size: about 40-50% smaller
+- CPU for crypto primitives: similar
 
-**Security Equivalence:**
+**Security equivalence:**
 
-Both protocols provide identical security properties:
-
-- ✓ Mutual authentication via certificates
-- ✓ Perfect forward secrecy via ephemeral ECDH
-- ✓ Replay protection via nonces
-- ✓ Transcript integrity via signatures
-- ✓ Confidentiality via AEAD encryption
+Both protocols target the same properties: mutual authentication, forward secrecy via ephemeral ECDH, replay protection via nonces, transcript integrity via signatures, and confidentiality via AEAD.
 
 #### 8.5.5 Security Profile Negotiation
 
-Both CMS and ECIES handshake protocols support cryptographic algorithm negotiation through `SecurityProfile` descriptors:
+CMS and ECIES handshakes both negotiate algorithms through `SecurityProfile` descriptors.
 
-**Negotiation Process:**
+**Negotiation process:**
 
 ```
 Client                              Server
@@ -1859,18 +1840,18 @@ Client                              Server
   └═══════════════════════════════════┘
 ```
 
-**Profile Validation:**
+**Profile validation:**
 
-- Server MUST select from client's offered profiles
-- Server MUST NOT select unsupported algorithms
-- Client MUST verify selected profile was in its offer
-- Transcript signature covers the negotiation to prevent downgrade attacks
+- The server MUST select a profile from the client's offer.
+- The server MUST NOT select unsupported algorithms.
+- The client MUST verify that the selected profile was in its offer.
+- The transcript signature MUST cover the negotiation so a peer cannot downgrade algorithms unnoticed.
 
-**Transport Capability Negotiation:**
+**Transport capability negotiation:**
 
-CMS and ECIES handshakes MAY also negotiate multiplexing via `TransportOffer` / `TransportAccept`. These structures travel in the opening handshake messages and are bound into the same transcript that covers security-profile negotiation, so a peer cannot silently enable or disable multiplexing after authentication.
+CMS and ECIES handshakes MAY also negotiate multiplexing with `TransportOffer` / `TransportAccept`. Those structures travel in the opening handshake messages. They bind into the same transcript as security-profile negotiation. A peer cannot silently enable or disable multiplexing after authentication.
 
-**Negotiation Process:**
+**Transport negotiation process:**
 
 ```
 Client                              Server
@@ -1892,22 +1873,22 @@ Client                              Server
   └═══════════════════════════════════┘
 ```
 
-**Transport Validation:**
+**Transport validation:**
 
-- Each side advertises how many streams its peer MAY concurrently initiate (`max_peer_initiated_streams`), matching [RFC 9113 §5.1.2][rfc9113-5.1.2] directional semantics
-- Multiplexing MUST activate only when both sides offered it. If either side omits the offer, the connection remains single-flight
-- Caps are directional: there is no symmetric min-collapse of the two advertisements
-- Both endpoints MUST clamp each advertised cap to `MAX_MUX_STREAM_CAP` (1024) when deriving `MuxSettings`
-- A peer that accepts multiplexing without a matching local offer MUST fail closed (`UnsolicitedTransportAccept`)
-- Offer and accept also carry the flow-control values (`chunk_payload_size`, `credit_unit`, `initial_stream_credit`), with the same directional semantics: the sender of the struct advertises what it will receive. The accept fixes `credit_unit` for both directions
-- The offer MAY request per-direction session budgets (`requested_budgets`) and attach an opaque `authorization` token. The accept answers with `granted_budgets`. Grants are opt-in server-side: without a local budget ceiling or an authorizer verdict, nothing is granted. A server-side `TransportAuthorizer` MAY refuse the session (`AuthorizationRefused`). See [§8.6.2](#862-specification-stream-rules-envelopes-and-runtime)
-- The client MUST fail closed on every grant diverging from its request: a granted budget without a request (`UnsolicitedTransportAccept`), a grant beyond `MAX_MUX_SESSION_BUDGET` (`BudgetBeyondCap`), a grant beyond the request (`BudgetBeyondRequest`), and a grant withheld against a request (`BudgetGrantWithheld`). Grants at or below the request activate metering and the receipt exchange
+- Each side advertises how many streams its peer MAY initiate at once (`max_peer_initiated_streams`), matching [RFC 9113 §5.1.2][rfc9113-5.1.2] directional semantics.
+- Multiplexing MUST activate only when both sides offered it. If either side omits the offer, the connection stays single-flight.
+- Caps are directional. There is no symmetric min-collapse of the two advertisements.
+- Both endpoints MUST clamp each advertised cap to `MAX_MUX_STREAM_CAP` (1024) when deriving `MuxSettings`.
+- A peer that accepts multiplexing without a matching local offer MUST fail closed (`UnsolicitedTransportAccept`).
+- Offer and accept also carry flow-control values (`chunk_payload_size`, `credit_unit`, `initial_stream_credit`) with the same directional rule: the sender advertises what it will receive. Accept fixes `credit_unit` for both directions.
+- The offer MAY request per-direction session budgets (`requested_budgets`) and MAY attach an opaque `authorization` token. Accept answers with `granted_budgets`. Grants are opt-in on the server. Without a local budget ceiling or an authorizer verdict, nothing is granted. A server-side `TransportAuthorizer` MAY refuse the session (`AuthorizationRefused`). See [§8.6.2](#862-specification-stream-rules-envelopes-and-runtime).
+- The client MUST fail closed on every grant that diverges from its request: a grant without a request (`UnsolicitedTransportAccept`), a grant beyond `MAX_MUX_SESSION_BUDGET` (`BudgetBeyondCap`), a grant beyond the request (`BudgetBeyondRequest`), or a grant withheld against a request (`BudgetGrantWithheld`). Grants at or below the request activate metering and the receipt exchange.
 
-See [§8.6 Multiplexing](#86-multiplexing) for stream identifier rules, envelope types, and runtime assembly.
+Stream identifier rules, envelope types, and runtime assembly are in [§8.6 Multiplexing](#86-multiplexing).
 
-#### 8.5.6 Negotiation & Failure Modes
+#### 8.5.6 Negotiation and Failure Modes
 
-**Profile Negotiation:**
+**Profile negotiation:**
 
 ```rust
 // Client offers supported profiles
@@ -1924,7 +1905,7 @@ let security_accept = SecurityAccept {
 };
 ```
 
-**Failure Modes:**
+**Failure modes:**
 
 | Error                         | Cause                                              | Recovery            |
 | ----------------------------- | -------------------------------------------------- | ------------------- |
@@ -1937,7 +1918,7 @@ let security_accept = SecurityAccept {
 | `InvalidState`                | Out-of-order message                               | Reset state machine |
 | `DecryptionFailed`            | Wrong key or corrupted data                        | Abort handshake     |
 
-#### 8.5.7 Threat to Control Mapping
+#### 8.5.7 Threat-to-Control Mapping
 
 | Threat                     | Control                                     | Implementation                                                                                                                                                                                                    |
 | -------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1951,53 +1932,53 @@ let security_accept = SecurityAccept {
 | **Stream Cap Inflation**   | Clamp + ResourceExhausted                   | Caps clamped to `MAX_MUX_STREAM_CAP`. Local exhaustion returns `ResourceExhausted`                                                                                                                                |
 | **Reassembly Exhaustion**  | Chunk + credit + cap clamps                 | Chunk size clamped to `MIN..=MAX_MUX_CHUNK_SIZE`, stream credit to `MAX_MUX_STREAM_CREDIT`. Per-stream reassembly memory bounded by granted credit and concurrent partial streams by the advertised cap (CWE-770) |
 | **Flow-Control Overrun**   | Receiver-side duplicate accounting          | Oversize chunks, credit overruns, and session-budget overspends each answered with GoAway(`ProtocolError`)                                                                                                        |
-| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7] analog)                                     |
-| **Certificate Forgery**    | X.509 chain validation                      | Verify root of trust Note: Application responsibility                                                                                                                                                             |
+| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7])                                            |
+| **Certificate Forgery**    | X.509 chain validation                      | Verify against a configured root of trust (application responsibility)                                                                                                                                            |
 | **Nonce Reuse**            | Monotonic counter + XOR                     | Per-message nonce derived from seed XOR counter                                                                                                                                                                   |
 
 ### 8.6 Multiplexing
 
 #### 8.6.1 Concept: Concurrent Streams Over One Connection
 
-A multiplexer (mux) provides concurrent request/response streams over a single connection, analogous to [RFC 9113][rfc9113] HTTP/2 streams. Without mux, each `emit`/`collect` pair on a transport is single-flight: a slow peer response stalls every subsequent request on that connection. With mux, independent streams interleave on the wire so one delayed response does not block siblings.
+A multiplexer (mux) runs concurrent request/response streams on one connection. The model follows [RFC 9113][rfc9113] HTTP/2 streams. Without mux, each `emit`/`collect` pair is single-flight. A slow peer response then stalls later requests on that connection. With mux, independent streams interleave on the wire. One delayed response does not block siblings.
 
-tightbeam's mux is an application-layer stream router over the existing envelope transport. It does not replace a protocol (eg. TCP), or the handshake but rather, it sits above split envelope halves after session establishment.
+Mux is an application-layer stream router over the envelope transport. It does not replace TCP or the handshake. It sits above split envelope halves after session establishment.
 
 > Requires the `transport-multiplex` feature.
 
-**Design Goals:**
+**Design goals:**
 
-- **Concurrency**: Multiple outstanding request/response pairs per connection without head-of-line blocking
+- **Concurrency**: Many outstanding request/response pairs per connection without head-of-line blocking
 - **Correlation**: Stream identifiers travel inside the `TransportEnvelope` payload
-- **Fair Limits**: Directional concurrency caps negotiated per connection and clamped
-- **Fair Sharing**: Mandatory chunking bounds record size. Per-stream credit windows bound reassembly memory and keep one stream from monopolizing the shared writer
-- **Metered Sessions**: Optional handshake-granted per-direction budgets bound the volume an encrypted session may spend before renewal
-- **Accountable Sessions**: Budget-bearing sessions produce a dual-signed `SessionReceipt` binding transcript, budgets, and settlement terms under both identities, verifiable by a third party from the certificates alone
-- **Epoch Renewal**: Budget-bearing sessions renew keys, counters, budgets, and receipts in band before the cipher record limit ([RFC 9846 §5.5][rfc9846-5.5])
-- **Graceful Drain**: GoAway completes in-flight streams at or below a specified threshold rejecting newer ones
-- **Abuse Resistance**: A rapid reset (CVE-2023-44487) exhausts a cancel budget receiving GoAway(`EnhanceYourCalm`)
+- **Fair limits**: Directional concurrency caps are negotiated per connection and clamped
+- **Fair sharing**: Mandatory chunking bounds record size. Per-stream credit windows bound reassembly memory. One stream cannot monopolize the shared writer
+- **Metered sessions**: Optional handshake-granted per-direction budgets bound encrypted-session volume before renewal
+- **Accountable sessions**: Budget-bearing sessions produce a dual-signed `SessionReceipt`. The receipt binds transcript, budgets, and settlement terms under both identities. A third party verifies it from the certificates alone
+- **Epoch renewal**: Budget-bearing sessions renew keys, counters, budgets, and receipts in band before the cipher record limit ([RFC 9846 §5.5][rfc9846-5.5])
+- **Graceful drain**: `GoAway` completes in-flight streams at or below a threshold and rejects newer ones
+- **Abuse resistance**: Rapid reset (CVE-2023-44487) exhausts a cancel budget and draws GoAway(`EnhanceYourCalm`)
 
-**Assembly Modes:**
+**Assembly modes:**
 
 | Mode      | Session                                                | Settings source                                                 | Split API                | Security properties                                                 |
 | --------- | ------------------------------------------------------ | --------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------- |
 | Encrypted | CMS or ECIES handshake with matching `TransportOffer`s | `negotiated_mux()`                                              | `into_split()`           | Handshake authentication + AEAD as configured for the session       |
 | Cleartext | None (handshake MUST NOT have started)                 | Out-of-band `MuxSettings::symmetric(cap)`. Both ends MUST agree | `into_split_cleartext()` | NONE: no confidentiality, integrity, replay, or deletion protection |
 
-Cleartext mux exists for controlled environments and tests. It MUST NOT be treated as a substitute for an encrypted session on a hostile network.
+Cleartext mux is for controlled environments and tests. It MUST NOT replace an encrypted session on a hostile network.
 
 #### 8.6.2 Specification: Stream Rules, Envelopes, and Runtime
 
-**Stream Identifiers** ([RFC 9113 §5.1.1][rfc9113-5.1.1]/[§5.1.2][rfc9113-5.1.2] analog):
+**Stream identifiers** ([RFC 9113 §5.1.1][rfc9113-5.1.1]/[§5.1.2][rfc9113-5.1.2]):
 
-Stream IDs uniquely identify a logical stream within one physical connection:
+Stream IDs identify one logical stream on one physical connection:
 
-- Client-initiated streams use odd IDs. Server-initiated streams use even IDs
-- Stream ID 0 is reserved and MUST NOT be allocated
-- Each endpoint MUST allocate locally-initiated IDs strictly monotonically
-- `MuxRole::Client` is the handshake initiator (odd IDs); `MuxRole::Server` is the responder (even IDs). The role passed to `MuxTransport::new` MUST match the endpoint's connection role
+- Client-initiated streams use odd IDs. Server-initiated streams use even IDs.
+- Stream ID 0 is reserved and MUST NOT be allocated.
+- Each endpoint MUST allocate locally-initiated IDs strictly monotonically.
+- `MuxRole::Client` is the handshake initiator (odd IDs). `MuxRole::Server` is the responder (even IDs). The role passed to `MuxTransport::new` MUST match the endpoint's connection role.
 
-**Stream States:**
+**Stream states:**
 
 ```
 Idle -> Open -> HalfClosedLocal / HalfClosedRemote -> Closed
@@ -2005,32 +1986,32 @@ Idle -> Open -> HalfClosedLocal / HalfClosedRemote -> Closed
 
 Streams in `Open`, `HalfClosedLocal`, or `HalfClosedRemote` count toward the peer-advertised concurrency cap. `Idle` and `Closed` do not ([RFC 9113 §5.1.2][rfc9113-5.1.2]).
 
-**Concurrency Caps:**
+**Concurrency caps:**
 
 `MuxSettings` carries two directional values:
 
 - `local_initiated_cap`: how many streams this endpoint may initiate (the value the peer advertised)
 - `peer_initiated_cap`: how many streams the peer may initiate (the value this endpoint advertised)
 
-Each endpoint MUST enforce the cap it advertised against peer-initiated streams and MUST respect the cap its peer advertised when allocating locally. Exhausting the local-initiated cap MUST return `ResourceExhausted` without allocating a stream. Advertised caps MUST be clamped to `MAX_MUX_STREAM_CAP` (1024) when deriving settings so an absurd wire advertisement cannot inflate bookkeeping bounds (CWE-770).
+Each endpoint MUST enforce the cap it advertised against peer-initiated streams. It MUST respect the peer-advertised cap when allocating locally. Exhausting the local-initiated cap MUST return `ResourceExhausted` without allocating a stream. Advertised caps MUST be clamped to `MAX_MUX_STREAM_CAP` (1024) when deriving settings. An absurd wire advertisement MUST NOT inflate bookkeeping bounds (CWE-770).
 
-**Envelope Types** (`TransportEnvelope` context tag 4 nests the `MuxEnvelope` CHOICE, inner context tags 0-10):
+**Envelope types** (`TransportEnvelope` context tag 4 nests the `MuxEnvelope` CHOICE, inner context tags 0-10):
 
-| Variant         | Role                                                                                                           |
-| --------------- | -------------------------------------------------------------------------------------------------------------- |
-| `Open`          | Open a stream and carry its first payload chunk inline (`stream_id`, `last`, `payload`)                        |
-| `Data`          | Continuation chunk on an open stream, either direction (`stream_id`, `last`, `payload`)                        |
-| `End`           | Responder trailer: `status` plus the final payload chunk inline                                                |
-| `Credit`        | Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA analog, [RFC 9000 §4.1][rfc9000-4.1]) |
-| `Cancel`        | Abort a single in-flight stream without tearing down the connection                                            |
-| `GoAway`        | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected              |
-| `Ping`          | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                                |
-| `RekeyRequest`  | Client opens an epoch renewal: fresh nonce ([RFC 9846 §4.7.3][rfc9846-4.7.3] update-request analog)            |
-| `RekeyResponse` | Server answers: its nonce plus the server-signed epoch receipt                                                 |
-| `RekeyAck`      | Client accepts: its countersignature. Marks the client-to-server key switch                                    |
-| `RekeyDone`     | Server confirms settlement. Marks the server-to-client key switch                                              |
+| Variant         | Role                                                                                                    |
+| --------------- | ------------------------------------------------------------------------------------------------------- |
+| `Open`          | Open a stream and carry its first payload chunk inline (`stream_id`, `last`, `payload`)                 |
+| `Data`          | Continuation chunk on an open stream, either direction (`stream_id`, `last`, `payload`)                 |
+| `End`           | Responder trailer: `status` plus the final payload chunk inline                                         |
+| `Credit`        | Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA, [RFC 9000 §4.1][rfc9000-4.1]) |
+| `Cancel`        | Abort a single in-flight stream without tearing down the connection                                     |
+| `GoAway`        | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected       |
+| `Ping`          | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                         |
+| `RekeyRequest`  | Client opens an epoch renewal: fresh nonce ([RFC 9846 §4.7.3][rfc9846-4.7.3] update-request)            |
+| `RekeyResponse` | Server answers: its nonce plus the server-signed epoch receipt                                          |
+| `RekeyAck`      | Client accepts: its countersignature. Marks the client-to-server key switch                             |
+| `RekeyDone`     | Server confirms settlement. Marks the server-to-client key switch                                       |
 
-**Stream Grammar** (unified: a unary request is a degenerate stream, [RFC 9113 §8.1][rfc9113-8.1] analog):
+**Stream grammar** (unified: a unary request is a degenerate stream, [RFC 9113 §8.1][rfc9113-8.1]):
 
 ```
 initiator:  Open(last?)   Data(...)*  Data(last)
@@ -2038,36 +2019,36 @@ responder:  Data(...)*    End(status, payload?)
 either:     Cancel(code)  Credit(limit)
 ```
 
-**Chunking** (mandatory, no opt-out): every message segments at the peer-advertised `chunk_payload_size` (1-64 KiB, default 16 KiB, [RFC 9113 §4.2][rfc9113-4.2] analog) and reassembles in arrival order. The ordered AEAD channel already proves order and completeness, so chunks carry no sequence numbers. An oversize chunk is a protocol violation: GoAway(`ProtocolError`). A unary message still travels in one record.
+**Chunking** (mandatory, no opt-out): Every message segments at the peer-advertised `chunk_payload_size` (1-64 KiB, default 16 KiB, [RFC 9113 §4.2][rfc9113-4.2]). Reassembly follows arrival order. The ordered AEAD channel already proves order and completeness. Chunks carry no sequence numbers. An oversize chunk is a protocol violation: GoAway(`ProtocolError`). A unary message still travels in one record.
 
-**Stream Credit** (per-stream flow control, QUIC MAX_STREAM_DATA analog, [RFC 9000 §4.1][rfc9000-4.1]): receivers grant inbound streams a chunk allowance (default 64) and replenish it with `Credit` grants. A sender out of credit parks. Control envelopes bypass the gate and the reader never blocks on the writer, so saturated endpoints cannot deadlock ([RFC 9113 §5.2.2][rfc9113-5.2.2]). Credit and concurrency-cap overruns are protocol violations, bounding reassembly memory (CWE-770). Grant policy is pluggable via `CreditGrantor`.
+**Stream credit** (per-stream flow control, QUIC MAX_STREAM_DATA-like, [RFC 9000 §4.1][rfc9000-4.1]): Receivers grant inbound streams a chunk allowance (default 64). They replenish it with `Credit` grants. A sender out of credit parks. Control envelopes bypass the gate. The reader never blocks on the writer, so saturated endpoints cannot deadlock ([RFC 9113 §5.2.2][rfc9113-5.2.2]). Credit and concurrency-cap overruns are protocol violations. Those rules bound reassembly memory (CWE-770). Grant policy is pluggable via `CreditGrantor`.
 
-**Session Budgets** (optional metering, encrypted sessions only): the handshake MAY grant each direction a spendable volume, transcript-bound so it cannot be forged. Data chunks debit `ceil(payload_len / credit_unit)`. Control is free. Budgets never grow within an epoch: exhaustion fails the emit fast (`BudgetExhausted`) and drains the connection gracefully. Both sides run the accounting, so an inbound overspend is a protocol violation. No budgets (and always under cleartext mux) means unmetered.
+**Session budgets** (optional metering, encrypted sessions only): The handshake MAY grant each direction a spendable volume. The grant is transcript-bound so peers cannot forge it. Data chunks debit `ceil(payload_len / credit_unit)`. Control is free. Budgets never grow within an epoch. Exhaustion fails the emit fast (`BudgetExhausted`) and drains the connection gracefully. Both sides run the accounting. An inbound overspend is a protocol violation. No budgets, and always under cleartext mux, means unmetered.
 
-**Session Authorization** (server hook between offer and accept): the offer MAY carry an opaque `authorization` token, never parsed by TightBeam. A `TransportAuthorizer` decides the budgets to grant, MAY attach a settlement challenge, or refuses the session (`AuthorizationRefused { code }`). It fires pre-authentication: keep it cheap and rate-limit upstream.
+**Session authorization** (server hook between offer and accept): The offer MAY carry an opaque `authorization` token. tightbeam never parses that token. A `TransportAuthorizer` decides the budgets to grant. It MAY attach a settlement challenge. It MAY refuse the session (`AuthorizationRefused { code }`). The hook fires before authentication. Keep it cheap and rate-limit it upstream.
 
-**Session Receipts** (budget-bearing sessions only): every metered session produces a CMS `SignedData` artifact ([RFC 5652 §5][rfc5652-5]) whose `eContent` is the `SessionReceipt` body binding the handshake transcript (as a self-describing `DigestInfo`, [RFC 8017 §9.2][rfc8017-9.2]), budgets, and settlement terms, with one role-tagged `SignerInfo` per peer. A third party holding the two certificates verifies the agreement from the stored artifact alone.
+**Session receipts** (budget-bearing sessions only): Every metered session produces a CMS `SignedData` artifact ([RFC 5652 §5][rfc5652-5]). Its `eContent` is the `SessionReceipt` body. That body binds the handshake transcript (as a self-describing `DigestInfo`, [RFC 8017 §9.2][rfc8017-9.2]), budgets, and settlement terms. Each peer contributes one role-tagged `SignerInfo`. A third party that holds the two certificates verifies the agreement from the stored artifact alone.
 
-- The server signs. The client validates against the negotiated session, answers the challenge via its `ReceiptApprover`, and countersigns: its `SignerInfo`'s signed attributes ([RFC 5652 §11][rfc5652-11]) bind the answer and the role, so neither can be swapped or spliced (CWE-347)
-- The client's `SignerInfo` travels only encrypted to the server (inside the ECIES key-exchange payload, or an `EnvelopedData` [RFC 5652 §6][rfc5652-6] attribute on the CMS Finished): the settlement answer is a bearer secret and never travels on the cleartext wire
-- The server's `TransportAuthorizer::settle` accepts or refuses the answer. The session MUST NOT activate before it accepts. Every step fails closed, and budgets REQUIRE mutual authentication
-- A server-side `SessionObserver` records every concluded outcome, including refused and forged acknowledgements. It never vetoes
-- Both endpoints retain the completed artifact (`session_receipt()`). The settlement answer is application truth: never parsed, never price-checked, never persisted. The receipt makes the agreement non-repudiable, not correct
+- The server signs first. The client validates against the negotiated session. The client answers the challenge via its `ReceiptApprover` and countersigns. Its `SignerInfo` signed attributes ([RFC 5652 §11][rfc5652-11]) bind the answer and the role. Neither answer nor role can be swapped or spliced (CWE-347).
+- The client's `SignerInfo` travels only encrypted to the server (inside the ECIES key-exchange payload, or an `EnvelopedData` [RFC 5652 §6][rfc5652-6] attribute on the CMS Finished). The settlement answer is a bearer secret. It MUST NOT travel on the cleartext wire.
+- The server's `TransportAuthorizer::settle` accepts or refuses the answer. The session MUST NOT activate before it accepts. Every step fails closed. Budgets REQUIRE mutual authentication.
+- A server-side `SessionObserver` records every concluded outcome, including refused and forged acknowledgements. It never vetoes.
+- Both endpoints retain the completed artifact (`session_receipt()`). The settlement answer is application truth: never parsed, never price-checked, never persisted. The receipt makes the agreement non-repudiable. It does not prove the answer is correct.
 
-**Epoch Renewal (Rekey)** (budget-bearing sessions only): renew AEAD epoch in band instead of draining at a watermark. Client opens `RekeyRequest` / `RekeyResponse` / `RekeyAck`, then server `RekeyDone`, when send budget hits drain reserve or send records approach the rekey limit (MUST rekey before limit, [RFC 9846 §5.5][rfc9846-5.5]), with `DEFAULT_REKEY_RENEWAL_ALLOWANCE` slack.
+**Epoch renewal (rekey)** (budget-bearing sessions only): Renew the AEAD epoch in band instead of draining at a watermark. The client opens `RekeyRequest` / `RekeyResponse` / `RekeyAck`. The server finishes with `RekeyDone`. Renewal starts when send budget hits the drain reserve, or when send records approach the rekey limit. Endpoints MUST rekey before that limit ([RFC 9846 §5.5][rfc9846-5.5]), with `DEFAULT_REKEY_RENEWAL_ALLOWANCE` slack.
 
-- Fresh keys derive via `kdf_chain` from the retained epoch secret and both exchanged nonces. The prior secret is zeroized once its successor exists ([RFC 9846 §7.2][rfc9846-7.2])
-- Each direction switches keys at its marker on the ordered AEAD channel ([RFC 9846 §4.7.3][rfc9846-4.7.3] per-direction precedent): client-to-server at the `RekeyAck` record, server-to-client at the `RekeyDone` record. Record counters reset only with the fresh keys ([NIST SP 800-38D][nist-800-38d] §8.2.1)
-- Budgets reset to the negotiated terms at `RekeyDone`. The epoch receipt MUST carry the same credit terms as the initial one (credit-match invariant, absolute-limits analog [RFC 9000 §4.1][rfc9000-4.1]): a renewal never renegotiates
-- Every epoch produces a fresh dual-signed receipt chained to its predecessor by transcript hash, third-party verifiable from the original certificates. `session_receipt()` rotates to the current epoch's artifact
-- The authorizer MAY attach a settlement challenge to the renewal (`TransportAuthorizer::challenge_renewal`). The client's `ReceiptApprover` answers inside the encrypted `RekeyAck`, and `settle` accepts or refuses, exactly as at the handshake
-- Failures fail closed into a graceful drain: settlement or approval refusal drains with the refusal's code, a stalled exchange drains at the renewal deadline (default `DEFAULT_REKEY_DEADLINE_SECS`, override via `MuxTransport::with_renewal_deadline`), and a premature (below the minimum-spend floor) or duplicate `RekeyRequest` is a protocol violation: GoAway(`ProtocolError`)
-- A renewal still in flight at the drain threshold parks data chunks on the hard floor (control and the exchange legs keep the remaining records) and resumes them on the fresh cipher
-- Sessions without rekey materials (receiptless or cleartext) drain via GoAway near the watermark; caller re-establishes
+- Fresh keys derive via `kdf_chain` from the retained epoch secret and both exchanged nonces. The prior secret is zeroized once its successor exists ([RFC 9846 §7.2][rfc9846-7.2]).
+- Each direction switches keys at its marker on the ordered AEAD channel ([RFC 9846 §4.7.3][rfc9846-4.7.3] per-direction precedent). Client-to-server switches at the `RekeyAck` record. Server-to-client switches at the `RekeyDone` record. Record counters reset only with the fresh keys ([NIST SP 800-38D][nist-800-38d] §8.2.1).
+- Budgets reset to the negotiated terms at `RekeyDone`. The epoch receipt MUST carry the same credit terms as the initial one (credit-match invariant, absolute-limits [RFC 9000 §4.1][rfc9000-4.1]-like). A renewal never renegotiates.
+- Every epoch produces a fresh dual-signed receipt chained to its predecessor by transcript hash. A third party verifies it from the original certificates. `session_receipt()` rotates to the current epoch's artifact.
+- The authorizer MAY attach a settlement challenge to the renewal (`TransportAuthorizer::challenge_renewal`). The client's `ReceiptApprover` answers inside the encrypted `RekeyAck`. `settle` accepts or refuses, as at the handshake.
+- Failures fail closed into a graceful drain. Settlement or approval refusal drains with the refusal's code. A stalled exchange drains at the renewal deadline (default `DEFAULT_REKEY_DEADLINE_SECS`, override via `MuxTransport::with_renewal_deadline`). A premature (below the minimum-spend floor) or duplicate `RekeyRequest` is a protocol violation: GoAway(`ProtocolError`).
+- A renewal still in flight at the drain threshold parks data chunks on the hard floor. Control and the exchange legs keep the remaining records. Parked chunks resume on the fresh cipher.
+- Sessions without rekey materials (receiptless or cleartext) drain via GoAway near the watermark. The caller re-establishes.
 
-**Reason Code Space** (open u32, HTTP/2 error-code and QUIC application-close precedent: [RFC 9113 §7][rfc9113-7], [RFC 9000 §20.2][rfc9000-20.2]): codes below `MUX_APPLICATION_CODE_FLOOR` (0x1000) are reserved for the TightBeam protocol. Applications own the rest. Unknown codes decode to `Application(code)` and MUST NOT kill the connection.
+**Reason code space** (open u32, HTTP/2 error-code and QUIC application-close precedent: [RFC 9113 §7][rfc9113-7], [RFC 9000 §20.2][rfc9000-20.2]): Codes below `MUX_APPLICATION_CODE_FLOOR` (0x1000) are reserved for the tightbeam protocol. Applications own the rest. Unknown codes decode to `Application(code)` and MUST NOT kill the connection.
 
-**Cancel Reasons:**
+**Cancel reasons:**
 
 | Reason              | Code    | Meaning                                               |
 | ------------------- | ------- | ----------------------------------------------------- |
@@ -2076,7 +2057,7 @@ either:     Cancel(code)  Credit(limit)
 | `Rejected`          | 2       | Responder refused to process the stream               |
 | `Application(code)` | 0x1000+ | Application-defined                                   |
 
-**GoAway Reasons:**
+**GoAway reasons:**
 
 | Reason              | Code    | Meaning                                                                  |
 | ------------------- | ------- | ------------------------------------------------------------------------ |
@@ -2087,7 +2068,7 @@ either:     Cancel(code)  Credit(limit)
 | `SettlementFailed`  | 4       | Settlement instrument revoked or failed (reserved for session receipts)  |
 | `Application(code)` | 0x1000+ | Application-defined                                                      |
 
-**Request/Response Flow:**
+**Request/response flow:**
 
 ```
 Client (MuxHandle)                         Server (MuxResponder)
@@ -2102,16 +2083,16 @@ Client (MuxHandle)                         Server (MuxResponder)
   │◄─ End { stream_id=3, ... } ───────────────── │
 ```
 
-**Lifecycle Rules:**
+**Lifecycle rules:**
 
-- Dropping an in-flight `emit_on_stream` future MUST cancel the stream: remove the pending entry, free the cap slot, and best-effort send `MuxCancel`
-- Per-stream timeouts compose externally: wrap the emit future in the caller's timer. Expiry cancels via the drop guard
-- A non-mux peer MUST reject muxed envelopes as invalid
-- A mux peer that receives a non-mux application envelope (plain `Request`/`Response` where muxed traffic is required) MUST send GoAway(`ProtocolError`) and fail pending streams
-- Cancels that abort in-flight handlers draw on a per-connection budget (`DEFAULT_MUX_CANCEL_BUDGET` = 1024). Exhaustion MUST end the connection with GoAway(`EnhanceYourCalm`). Override via `MuxTransport::with_cancel_budget`
-- Near the AEAD send-record limit ([RFC 9846 §5.5][rfc9846-5.5]), a rekey-capable session opens an in-band epoch renewal (see Epoch Renewal above). Otherwise the writer MUST begin a graceful drain via GoAway while `2 * (local_cap + peer_cap) + 1` records plus every registered-but-unsent chunk remain, so queued chunked responses, cancels, and the GoAway itself still fit under the cipher limit
+- Dropping an in-flight `emit_on_stream` future MUST cancel the stream: remove the pending entry, free the cap slot, and best-effort send `MuxCancel`.
+- Per-stream timeouts compose externally. Wrap the emit future in the caller's timer. Expiry cancels via the drop guard.
+- A non-mux peer MUST reject muxed envelopes as invalid.
+- A mux peer that receives a non-mux application envelope (plain `Request`/`Response` where muxed traffic is required) MUST send GoAway(`ProtocolError`) and fail pending streams.
+- Cancels that abort in-flight handlers draw on a per-connection budget (`DEFAULT_MUX_CANCEL_BUDGET` = 1024). Exhaustion MUST end the connection with GoAway(`EnhanceYourCalm`). Override via `MuxTransport::with_cancel_budget`.
+- Near the AEAD send-record limit ([RFC 9846 §5.5][rfc9846-5.5]), a rekey-capable session opens an in-band epoch renewal (see Epoch renewal above). Otherwise the writer MUST begin a graceful drain via GoAway while `2 * (local_cap + peer_cap) + 1` records plus every registered-but-unsent chunk remain. Queued chunked responses, cancels, and the GoAway itself must still fit under the cipher limit.
 
-**Runtime Architecture:**
+**Runtime architecture:**
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -2136,12 +2117,12 @@ Client (MuxHandle)                         Server (MuxResponder)
         (encrypt or cleartext write)  (decrypt or cleartext read)
 ```
 
-- **MuxWriterDriver**: Single serialization point for the connection. Drains the outbound queue and writes each envelope through the send half. Spawn `drive()` on the caller's executor.
-- **MuxReaderDriver**: Reads envelopes from the receive half, routes responses to pending stream slots, and forwards peer-initiated requests to the responder. Unknown response IDs are discarded (cancel/response races are benign).
-- **MuxHandle**: Cloneable client handle. Allocates stream IDs, registers pending slots, and awaits correlated responses.
+- **MuxWriterDriver**: Single serialization point for the connection. It drains the outbound queue and writes each envelope through the send half. Spawn `drive()` on the caller's executor.
+- **MuxReaderDriver**: Reads envelopes from the receive half. It routes responses to pending stream slots and forwards peer-initiated requests to the responder. Unknown response IDs are discarded. Cancel/response races are benign.
+- **MuxHandle**: Cloneable client handle. It allocates stream IDs, registers pending slots, and awaits correlated responses.
 - **MuxResponder**: Serves peer-initiated streams with a caller-supplied handler. Handlers for distinct streams run concurrently. Cap exhaustion answers with `TransitStatus::ResourceExhausted`.
 
-**MultiplexedProtocol Trait:**
+**MultiplexedProtocol trait:**
 
 ```rust
 pub trait MultiplexedProtocol {
@@ -2161,11 +2142,9 @@ pub trait MultiplexedProtocol {
 
 #### 8.6.3 Implementation: Assembling MuxTransport
 
-**Overview:**
+After the transport is ready (handshake complete for encrypted mux, or a never-handshaken socket for cleartext), split it into exclusive read/write halves. Build `MuxTransport` with the endpoint role and settings. Decompose into four parts the application MUST keep running: handle, reader driver, writer driver, and responder.
 
-After the transport is ready (handshake complete for encrypted mux, or a never-handshaken socket for cleartext), split it into exclusive read/write halves, build `MuxTransport` with the endpoint role and settings, then decompose into four parts the application MUST keep running: handle, reader driver, writer driver, and responder.
-
-**Encrypted Path:**
+**Encrypted path:**
 
 Both sides MUST configure multiplexing before the handshake so the offer is transcript-bound:
 
@@ -2212,11 +2191,11 @@ let response = handle.emit_on_stream(&frame).await?;
 handle.shutdown().await?;
 ```
 
-`MuxHandle::shutdown` sends GoAway(`Shutdown`), halts new stream allocation, waits for the pending table to drain, then closes the writer driver. A drain deadline composes by wrapping `shutdown()` in the caller's timer. Per-stream timeouts compose the same way around `emit_on_stream`. Override the cancel budget with `MuxTransport::with_cancel_budget` when the default (`DEFAULT_MUX_CANCEL_BUDGET`) is wrong for the deployment.
+`MuxHandle::shutdown` sends GoAway(`Shutdown`). It halts new stream allocation, waits for the pending table to drain, then closes the writer driver. A drain deadline composes by wrapping `shutdown()` in the caller's timer. Per-stream timeouts compose the same way around `emit_on_stream`. Override the cancel budget with `MuxTransport::with_cancel_budget` when the default (`DEFAULT_MUX_CANCEL_BUDGET`) is wrong for the deployment.
 
-**Cleartext Path:**
+**Cleartext path:**
 
-Use only when both endpoints intentionally forgo the handshake. Settings are not negotiated. Divergent caps cause asymmetric refuse/accept behavior. `into_split_cleartext` requires a never-handshaken transport with no server identity or key manager configured.
+Use cleartext only when both endpoints intentionally forgo the handshake. Settings are not negotiated. Divergent caps cause asymmetric refuse/accept behavior. `into_split_cleartext` requires a never-handshaken transport with no server identity or key manager configured.
 
 ```rust
 use tightbeam::transport::handshake::negotiation::MuxSettings;
@@ -2229,13 +2208,13 @@ let mux = MuxTransport::new(reader, writer, MuxRole::Client, settings);
 let (handle, reader_drv, writer_drv, responder) = mux.into_parts();
 ```
 
-**Server Role:**
+**Server role:**
 
-The accepting endpoint uses `MuxRole::Server` with the same assembly sequence. Either role may call `emit_on_stream` (server-initiated streams use even IDs) and either role may `serve` peer-initiated requests.
+The accepting endpoint uses `MuxRole::Server` with the same assembly sequence. Either role may call `emit_on_stream` (server-initiated streams use even IDs). Either role may `serve` peer-initiated requests.
 
 #### 8.6.4 Testing
 
-Multiplexed services are tested with `environment ServiceClient`. The `server:` closure starts a `server!` accept loop advertising `with_mux_offer`. The `client:` closure drives a mux-offering `ConnectionPool` against the bound address. Peers that decline the offer fall back to single-flight, so the same scenario shape covers both paths.
+Test multiplexed services with `environment ServiceClient`. The `server:` closure starts a `server!` accept loop advertising `with_mux_offer`. The `client:` closure drives a mux-offering `ConnectionPool` against the bound address. Peers that decline the offer fall back to single-flight. The same scenario shape covers both paths.
 
 ```rust
 tb_assert_spec! {
@@ -2281,7 +2260,7 @@ tb_scenario! {
 
 #### 8.6.5 Serving and Pooling
 
-`server!` and `ConnectionPool` assemble and drive the mux plane internally: one handler and one `emit` call serve both multiplexed and single-flight peers. Manual assembly remains available for custom setups.
+`server!` and `ConnectionPool` assemble and drive the mux plane internally. One handler and one `emit` call serve both multiplexed and single-flight peers. Manual assembly remains available for custom setups.
 
 **Serving with `server!`:**
 
@@ -2295,10 +2274,10 @@ let server_handle = server! {
 };
 ```
 
-- `with_mux_offer` takes an `Option<TransportOffer>`. `None` advertises nothing
-- `servlet!`, `hive!`, and `cluster!` servers inherit the branch through their `server!` delegation. `HiveConf::mux_offer` and `ClusterConf::pool_config.mux_offer` carry the advertisement to their listeners and pools
-- The sync (`std`-thread) serving path never multiplexes. Mux drivers need an async executor
-- Serving mux requires `transport-multiplex` (plus `x509`, `tokio`, `transport-policy`). A server built without it never advertises and keeps serving single-flight peers
+- `with_mux_offer` takes an `Option<TransportOffer>`. `None` advertises nothing.
+- `servlet!`, `hive!`, and `cluster!` servers inherit the branch through their `server!` delegation. `HiveConfig::mux_offer` and `ClusterConfig::pool_config.mux_offer` carry the advertisement to their listeners and pools.
+- The sync (`std`-thread) serving path never multiplexes. Mux drivers need an async executor.
+- Serving mux requires `transport-multiplex` (plus `x509`, `tokio`, `transport-policy`). A server built without it never advertises and keeps serving single-flight peers.
 
 ```rust
 let server_handle = server! {
@@ -2324,9 +2303,9 @@ let mut client = pool.connect(server_addr).await?;
 let response = client.emit(frame, None).await?;
 ```
 
-With an offer configured, `connect` shares ONE multiplexed connection per destination. Every caller leases a clone of the same `MuxHandle` and `emit` opens a fresh stream. `PooledClient::conn()` (the exclusive-connection accessor) answers `ResourceExhausted` on a mux lease. `emit` is the transport-agnostic call.
+With an offer configured, `connect` shares one multiplexed connection per destination. Every caller leases a clone of the same `MuxHandle`. `emit` opens a fresh stream. `PooledClient::conn()` (the exclusive-connection accessor) answers `ResourceExhausted` on a mux lease. `emit` is the transport-agnostic call.
 
-**Metered pooled sessions** - budgets on the offer, settlement hooks on the pool:
+**Metered pooled sessions** (budgets on the offer, settlement hooks on the pool):
 
 ```rust
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
@@ -2340,9 +2319,9 @@ let lease = pool.connect(server_addr).await?;
 let receipt = lease.session_receipt();  // Option<Arc<StoredReceipt>>
 ```
 
-- `ConnectionPoolBuilder::with_receipt_approver` forwards the approver to every dialed transport (handshake and epoch renewal). Without one, pooled clients fail closed on challenge-bearing receipts
-- `PooledClient::session_receipt()` exposes the connection dual-signed receipt shared across leases; epoch renewal rotates in place. Exclusive leases and receiptless sessions return `None`
-- Size invoices with the public watermark math on `MuxSettings`: `usable_send_budget()` answers the credits spendable on application data before the budget watermark opens an in-band renewal (`send_budget` minus `send_budget_reserve()`, the credits reserved so owed traffic can flush during a drain)
+- `ConnectionPoolBuilder::with_receipt_approver` forwards the approver to every dialed transport (handshake and epoch renewal). Without one, pooled clients fail closed on challenge-bearing receipts.
+- `PooledClient::session_receipt()` exposes the connection dual-signed receipt shared across leases. Epoch renewal rotates that receipt in place. Exclusive leases and receiptless sessions return `None`.
+- Size invoices with the public watermark math on `MuxSettings`. `usable_send_budget()` returns credits spendable on application data before the budget watermark opens an in-band renewal. That value is `send_budget` minus `send_budget_reserve()` (credits reserved so owed traffic can flush during a drain).
 
 **Fallback semantics** (automatic, per connection):
 
@@ -2355,15 +2334,15 @@ let receipt = lease.session_receipt();  // Option<Arc<StoredReceipt>>
 
 **Mux connection lifecycle in the pool:**
 
-- Stream-cap exhaustion (`ResourceExhausted`): `emit` opens an additional mux connection to the same destination (bounded by `max_connections`) and retries there once
-- `ConnectionClosed`, or `Draining` from a rekey GoAway: the entry is evicted and the failure reported. The next `connect` re-establishes with fresh keys
-- Dead entries (driver ended) are pruned on the next `connect`. Multiple live entries round-robin
+- Stream-cap exhaustion (`ResourceExhausted`): `emit` opens an additional mux connection to the same destination (bounded by `max_connections`) and retries there once.
+- `ConnectionClosed`, or `Draining` from a rekey GoAway: the entry is evicted and the failure is reported. The next `connect` re-establishes with fresh keys.
+- Dead entries (driver ended) are pruned on the next `connect`. Multiple live entries round-robin.
 
 ### 8.7 Connection Pooling
 
-Connection pooling enables efficient connection reuse across multiple requests. `ConnectionPool` uses a builder pattern where the pool is configured once via `.builder()`, then `.connect()` retrieves connections from the pool.
+`ConnectionPool` reuses connections across requests. Configure the pool once with `.builder()`. Call `.connect()` to retrieve a connection.
 
-**Example**:
+**Example:**
 
 ```rust
 // Create shared pool with configuration (once per application)
@@ -2381,46 +2360,47 @@ client.emit(frame, None).await?;
 // Connection automatically returned to pool on drop
 ```
 
-**Configuration**:
+**Configuration:**
 
 - `PoolConfig::max_connections`: Max connections per destination (default: 64)
 - `PoolConfig::idle_timeout`: Optional connection expiration (default: None)
-- `PoolConfig::mux_offer`: Optional multiplexing advertisement. See [8.6.5](#865-serving-and-pooling) (default: None)
+- `PoolConfig::mux_offer`: Optional multiplexing advertisement. See [§8.6.5](#865-serving-and-pooling) (default: None)
 
 ### 8.8 Audit
 
-The tightbeam transport layer and handshake protocols have not yet been independently audited. We welcome help in this area.
+The tightbeam transport layer and handshake protocols have not yet been independently audited. Help in this area is welcome.
 
 #### 8.8.1 Audit Trail Deployment Requirements
 
-Access and session verdicts (`GATE_ACCEPT`/`GATE_REJECT` with the refusing status and the peer SPKI hash, `SESSION_CERT_REJECTED`, receipt events) are recorded only when the deployment opts in. Deployments with audit obligations (e.g. ISO 27001 A.8.15, NIST 800-53 AU-2) MUST:
+Access and session verdicts (`GATE_ACCEPT`/`GATE_REJECT` with the refusing status and the peer SPKI hash, `SESSION_CERT_REJECTED`, receipt events) are recorded only when the deployment opts in. Deployments with audit obligations (for example ISO 27001 A.8.15, NIST 800-53 AU-2) MUST:
 
 1. Enable the `instrument` feature and attach a `TraceCollector` to every transport that terminates connections (`with_trace`).
 2. Enable `enable_payloads` in the instrumentation configuration if peer identity (SPKI SHA3-256) must appear on gate verdicts.
-3. Provide a durable `EventSink`: the default sink is a bounded in-memory buffer and drops the oldest events under pressure. Sequence-number gaps in exported evidence reveal where truncation occurred.
+3. Provide a durable `EventSink`. The default sink is a bounded in-memory buffer. It drops the oldest events under pressure. Sequence-number gaps in exported evidence reveal where truncation occurred.
 
-Event timestamps are nanoseconds relative to the collector's trace clock;
-the clock's wall-clock origin is recorded once per collector
-(`TRACE_CLOCK_ORIGIN`) so absolute times are reconstructible offline.
+Event timestamps are nanoseconds since collector construction. Once per collector, `TRACE_CLOCK_ORIGIN` records that construction time as Unix-epoch nanoseconds. Offline tools can map relative timestamps to absolute times.
 
 ## 9. Network Theory
 
 ### 9.1 Network Architecture
 
-- Egress/Ingress policy management
-- Retry and Egress client policy
-- Service orchestration via Colony Monodomy/Polydomy patterns
+Colony networks combine:
+
+- Egress and ingress policy management
+- Retry and egress client policy
+- Service orchestration via Colony Monodomy and Polydomy patterns
+- Peer federation and colony gossip between gateways (see [§9.3.4](#934-c-clusters))
 
 ### 9.2 Efficient Exchange-Interconnect-Compute
 
-The Efficient Exchange-Interconnect-Compute or EEIC is a software development paradigm inspired by the entomological world. As threads and tunnels underpin the basics of processing and communication, we can start at these base levels and develop from here. The goal of EEIC is to operate on these base layers across any transmission protocol:
+Efficient Exchange-Interconnect-Compute (EEIC) is a software paradigm inspired by the entomological world. Threads and tunnels are the base of processing and communication. EEIC builds from those layers across any transmission protocol:
 
-- thread-thread.
-- thread-protocol-thread.
+- thread-thread
+- thread-protocol-thread
 
 ### 9.3 Components
 
-There are four main components to EEIC:
+EEIC has four main components:
 
 - [Workers](#931-e-workers) - Efficient processing units
 - [Servlets](#932-e-servlets) - Exchange endpoints
@@ -2431,7 +2411,7 @@ Think of workers as ants, servlets as ant hills, and clusters as ant colonies. I
 
 #### 9.3.1 E: Workers
 
-Workers are the smallest unit of computation in the EEIC--the "ants" that do the actual work. They exist because of a fundamental insight: most business logic does not need network context. A function that doubles a number does not care whether the input came from TCP, UDP, or an in-memory channel. By isolating this logic into workers, we gain:
+Workers are the smallest unit of computation in the EEIC--the "ants" that do the actual work. Most business logic does not need network context. A function that doubles a number does not care whether the input came from TCP, UDP, or an in-memory channel. Isolating that logic into workers gives:
 
 - **Parallelism**: Multiple workers can process messages concurrently
 - **Fault Isolation**: A failing worker does not crash the servlet
@@ -2448,7 +2428,7 @@ Workers are intentionally constrained:
 
 These constraints enable the parallelism and fault isolation that make EEIC effective. Workers do not coordinate with each other--they just transform input to output.
 
-> Note: It is highly discouraged to workaround the Frame limitation by passing the Frame in a message parameter--you should do something else.
+> Note: Do not work around the Frame limitation by stuffing a Frame into a message parameter. Handle Frame concerns at the servlet boundary instead.
 
 ##### The `worker!` Macro
 
@@ -2497,7 +2477,7 @@ tb_scenario! {
 	spec: PingPongSpec,
 	environment Worker {
 		setup: |_env| {
-			PingPongWorker::new(PingPongWorkerConf {
+			PingPongWorker::new(PingPongWorkerConfig {
 				response: "pong",
 			})
 		},
@@ -2519,11 +2499,11 @@ The `environment Worker` syntax provides:
 - `setup`: Creates the worker builder from a `SetupEnv` (sync)
 - `stimulus`: Drives the started worker through `WorkerEnv` via `relay()` and records trace events
 
-Ident assertion keys generate constants on the spec type (`PingPongSpec::worker_called`). Event sites and assertions share that definition. The `spec:` key is shorthand for a `ScenarioConf` with that spec's latest version.
+Ident assertion keys generate constants on the spec type (`PingPongSpec::worker_called`). Event sites and assertions share that definition. The `spec:` key is shorthand for a `ScenarioConfig` with that spec's latest version.
 
 #### 9.3.2 E: Servlets
 
-Servlets are the network endpoints of the EEIC--the "anthills" where messages arrive and are processed. While workers handle pure business logic, servlets handle the protocol layer: accepting connections, decoding frames, dispatching to workers, and sending responses.
+Servlets are the network endpoints of the EEIC--the "anthills" where messages arrive and are processed. Workers own pure business logic. Servlets own the protocol layer: accept connections, decode frames, dispatch to workers, and send responses.
 
 ##### Architecture
 
@@ -2551,6 +2531,8 @@ pub enum CalcRequest {
 }
 ```
 
+> Note: It is preferrable to implement a strict separation of concerns between servlets. Each servlet should handle only one message type. Abusing Choice types to group unrelated message types is poor form.
+
 ##### Gate Policies
 
 Servlets can apply gate policies to filter or validate incoming messages before processing:
@@ -2577,7 +2559,7 @@ servlet! {
 
 ```rust
 #[derive(Clone)]
-pub struct PingPongServletConf {
+pub struct PingPongServletConfig {
 	pub service_name: String,
 }
 ```
@@ -2586,12 +2568,12 @@ pub struct PingPongServletConf {
 
 ```rust
 tightbeam::servlet! {
-	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConf>,
+	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConfig>,
 	protocol: TokioListener,
 	handle: |frame, ctx| async move {
 		// Access context members
 		let trace = ctx.trace();
-		let config: &PingPongServletConf = ctx.env_config()?;
+		let config: &PingPongServletConfig = ctx.env_config()?;
 		trace.event_with("request_received", &[], config.service_name.clone())?;
 
 		// Handler receives Frame, not decoded message
@@ -2625,18 +2607,18 @@ tightbeam::servlet! {
 }
 ```
 
-**Step 3**: Configure workers via `ServletConf` when starting the servlet:
+**Step 3**: Configure workers via `ServletConfig` when starting the servlet:
 
 ```rust
 // Create workers (use ::new, not .start - servlet auto-starts them)
 let ping_pong_worker = PingPongWorker::new(());
-let lucky_number_worker = LuckyNumberDeterminer::new(LuckyNumberDeterminerConf {
+let lucky_number_worker = LuckyNumberDeterminer::new(LuckyNumberDeterminerConfig {
 	lotto_number: 42,
 });
 
 // Build servlet configuration
-let servlet_conf = ServletConf::<TokioListener, RequestMessage>::builder()
-	.with_config(Arc::new(PingPongServletConf { service_name: "ping-pong".to_string() }))
+let servlet_conf = ServletConfig::<TokioListener, RequestMessage>::builder()
+	.with_config(Arc::new(PingPongServletConfig { service_name: "ping-pong".to_string() }))
 	.with_worker(ping_pong_worker)
 	.with_worker(lucky_number_worker)
 	.build();
@@ -2652,7 +2634,7 @@ Workers follow a two-phase lifecycle:
 1. **Creation** (`::new(config)` or `::default()`) - Creates the worker in an unstarted state
 2. **Starting** (`.start(trace)`) - Spawns the worker's async task loop with a trace collector
 
-When workers are added to a servlet via `ServletConf::builder().with_worker(worker)`:
+When workers are added to a servlet via `ServletConfig::builder().with_worker(worker)`:
 
 - The servlet automatically calls `.start(trace)` on each worker during servlet startup
 - Workers inherit the servlet's trace collector for instrumentation
@@ -2705,11 +2687,11 @@ tb_scenario! {
 	name: test_calc_servlet,
 	spec: CalcServletSpec,
 	environment Servlet {
-		context: CalcServletConf { multiplier: 2 },
+		context: CalcServletConfig { multiplier: 2 },
 		start: |env| async move {
 			let worker = DoublerWorker::new(());
 
-			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
 				.with_config(env.context)
 				.with_worker(worker)
 				.build();
@@ -2748,23 +2730,23 @@ The `environment Servlet` syntax provides:
 
 #### 9.3.3 I: Hives
 
-Hives are the intermediary layer between clusters and servlets. While a servlet handles a single message type on a single listener, a hive can manage multiple servlets and coordinate with a cluster for work distribution. Think of hives as "ant nests" that house multiple specialized workers (servlets).
+Hives sit between clusters and servlets. A servlet handles one message type on one listener. A hive can manage multiple servlets and coordinate with a cluster for work distribution. Think of hives as "ant nests" that house specialized workers (servlets).
 
 ##### Operating Modes
 
-Hives support two distinct operating modes:
+Hives support two operating modes:
 
-**Single-Servlet Mode** allows a hive to "morph" between different servlet types dynamically. The cluster sends an `ActivateServletRequest`, and the hive stops its current servlet and starts the requested one. This is useful for dynamic workload reallocation--a hive can switch from handling "analysis" requests to "calculation" requests based on cluster demand.
+**Single-Servlet Mode** lets a hive "morph" between servlet types. The cluster sends an `ActivateServletRequest`. The hive stops its current servlet and starts the requested one. That supports dynamic workload reallocation--for example switching from "analysis" to "calculation" based on cluster demand.
 
-**Multi-Servlet Mode** enables a hive to run all its registered servlets simultaneously, each on a different port. This requires a "mycelial" protocol (like TCP) that supports multiple endpoints. Call `establish_hive()` to spawn all servlets, then register with a cluster to advertise all available capabilities.
+**Multi-Servlet Mode** runs all registered servlets at once, each on a different port. That requires a "mycelial" protocol (like TCP) which supports multiple endpoints. Call `establish_hive()` to spawn all servlets, then register with a cluster to advertise capabilities.
 
-The mode is determined by the protocol's capabilities. On mycelial protocols, you typically want multi-servlet mode for maximum throughput.
+The protocol's capabilities select the mode. On mycelial protocols, multi-servlet mode usually gives the best throughput.
 
 ##### Mycelial Protocols
 
-The term "mycelial" refers to protocols that can spawn multiple endpoints from a single base address--like how fungal mycelium branches from a central point. TCP is mycelial because a single host address (e.g., `192.168.1.100`) can bind multiple ports (`SocketAddress`). This allows a hive to spawn servlets on ports 8001, 8002, 8003, etc., each handling different message types.
+"Mycelial" means a protocol can spawn multiple endpoints from one base address--like fungal mycelium branching from a central point. TCP is mycelial: one host address (for example `192.168.1.100`) can bind multiple ports (`SocketAddress`). A hive can then spawn servlets on ports 8001, 8002, 8003, and so on, each handling a different message type.
 
-Non-mycelial protocols (like in-memory channels) are limited to single-servlet mode.
+Non-mycelial protocols (like in-memory channels) stay in single-servlet mode.
 
 ##### The `hive!` Macro
 
@@ -2802,7 +2784,7 @@ A typical hive lifecycle with cluster integration:
 
 ```rust
 // 1. Start the hive
-let mut hive = MyHive::start(trace, Some(HiveConf::default())).await?;
+let mut hive = MyHive::start(trace, Some(HiveConfig::default())).await?;
 
 // 2. Establish multi-servlet mode (spawns all servlets on separate ports)
 hive.establish_hive().await?;
@@ -2818,10 +2800,10 @@ hive.stop();
 
 ##### Cluster Trust
 
-For hives to accept commands from a cluster (heartbeats, management requests), they must trust the cluster's certificate. Configure this via `HiveConf.trust_store`:
+For hives to accept commands from a cluster (heartbeats, management requests), they must trust the cluster's certificate. Configure this via `HiveConfig.trust_store`:
 
 ```rust
-let hive_conf = HiveConf {
+let hive_conf = HiveConfig {
 	trust_store: Some(Arc::new(cluster_trust_store)),
 	..Default::default()
 };
@@ -2839,10 +2821,10 @@ Hives include built-in resilience mechanisms:
 
 **Circuit Breaker**: After consecutive failures (default: 3), the circuit opens and the hive temporarily stops accepting work, allowing time for recovery before resuming.
 
-These are configured via `HiveConf`:
+These are configured via `HiveConfig`:
 
 ```rust
-let hive_conf = HiveConf {
+let hive_conf = HiveConfig {
 	backpressure_threshold: BasisPoints::new(8000),  // 80%
 	circuit_breaker_threshold: 5,                    // Open after 5 failures
 	circuit_breaker_cooldown_ms: 60_000,             // 1 minute cooldown
@@ -2865,7 +2847,7 @@ let tls_config = Arc::new(HiveTlsConfig {
 	validators: vec![],  // Optional: validate client certificates
 });
 
-let hive_conf = HiveConf {
+let hive_conf = HiveConfig {
 	hive_tls: Some(tls_config),
 	..Default::default()
 };
@@ -2873,12 +2855,15 @@ let hive_conf = HiveConf {
 
 When `hive_tls` is set, the hive control server binds with TLS and outbound control frames (registration, scaling updates) are signed with the hive key. Cluster gateways reject control frames they cannot verify against `hive_trust`, so hives participating in a cluster require a signing identity.
 
-##### HiveConf Reference
+##### HiveConfig Reference
 
 ```rust
-pub struct HiveConf {
-	pub default_scale: ServletScaleConf,
-	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
+pub struct HiveConfig {
+	/// Naming scope for resource URNs (foreign authority/realm refused at register)
+	pub namespace: ColonyNamespace,
+	pub default_scale: ServletScaleConfig,
+	/// Per-type overrides keyed by servlet type URN
+	pub servlet_overrides: HashMap<Urn<'static>, ServletScaleConfig>,
 	pub cooldown: Duration,                         // Default: 5s
 	pub queue_capacity: u32,                        // Default: 100
 	pub backpressure_threshold: BasisPoints,        // Default: 9000 (90%)
@@ -2891,6 +2876,10 @@ pub struct HiveConf {
 	pub cluster_notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+	/// Multiplexing offer for servlet pool + control server (default: None = single-flight)
+	pub mux_offer: Option<TransportOffer>,
+	/// Anti-entropy re-registration beat (default: 5s; None disables)
+	pub reregister_interval: Option<Duration>,
 }
 ```
 
@@ -2907,7 +2896,7 @@ tb_scenario! {
 		context: trusted_signer("CN=Hive Backpressure Cluster"),
 		// Returns the established hive
 		start: |SetupEnv { context: signer, .. }| async move {
-			start_trusted_hive(&signer, HiveConf {
+			start_trusted_hive(&signer, HiveConfig {
 				backpressure_threshold: BasisPoints::default(),
 				..Default::default()
 			}).await
@@ -2939,17 +2928,21 @@ Cluster-hive communication (registration, heartbeats, routing) is covered under 
 
 #### 9.3.4 C: Clusters
 
-Clusters are the "ant colonies" of the EEIC--centralized gateways that coordinate distributed hives. While hives manage individual servlets, clusters provide the higher-level orchestration: routing work requests to the right hive, monitoring hive health, and balancing load across the swarm.
+Clusters are the "ant colonies" of the EEIC--centralized gateways that coordinate distributed hives. Hives manage individual servlets. Clusters own higher-level orchestration: route work, monitor hive health, balance load, federate with peer gateways, and flood colony gossip across the swarm.
 
 ##### Architecture
 
-A cluster operates as a gateway server with three primary responsibilities:
+A cluster operates as a gateway server with five primary responsibilities:
 
-1. **Hive Registry**: Maintains a dynamic registry of connected hives and their available servlet types. Hives register themselves on startup, announcing which servlet types they can handle.
+1. **Hive Registry**: Maintains a dynamic registry of connected hives and their available servlet types. Hives register on startup and announce which servlet types they can handle.
 
-2. **Work Routing**: Receives `ClusterWorkRequest` messages from external clients, looks up which hives support the requested servlet type, selects one via load balancing, and forwards the request.
+2. **Work Routing**: Receives `ClusterWorkRequest` messages from external clients (or peer gateways), looks up Local and Peer routes for the servlet type, selects one via load balancing, and forwards the request.
 
-3. **Health Monitoring**: Periodically sends heartbeats to all registered hives. Unresponsive hives are evicted after consecutive failures, ensuring clients are never routed to dead endpoints.
+3. **Health Monitoring**: Periodically sends heartbeats to registered hives. Unresponsive hives are evicted after consecutive failures so clients are not routed to dead endpoints.
+
+4. **Peer Federation**: Optionally advertises local servlet types to peer gateways and installs soft-state Peer routes from their advertisements. Work can then hop one step to a peer colony that exports the type.
+
+5. **Colony Gossip**: Optionally floods origin-signed rumors across colony member gateways, with journal deduplication and anti-entropy repair.
 
 ##### The `cluster!` Macro
 
@@ -2975,12 +2968,12 @@ cluster! {
 Runtime configuration is supplied to `Cluster::start`:
 
 ```rust
-let cluster = MyCluster::start(trace, ClusterConf::new(tls)).await?;
+let cluster = MyCluster::start(trace, ClusterConfig::new(tls)).await?;
 ```
 
 ##### Mutual TLS
 
-Clusters require TLS configuration for secure communication with hives. The cluster acts as a TLS client when connecting to hives, presenting its certificate for mutual authentication. This ensures both parties can verify identity before exchanging work.
+Clusters require TLS configuration for secure communication with hives and, when federating, with peer gateways. The cluster acts as a TLS client when connecting outbound, presenting its certificate for mutual authentication.
 
 ```rust
 let tls = ClusterTlsConfig {
@@ -2988,13 +2981,53 @@ let tls = ClusterTlsConfig {
 	key: Arc::new(Secp256k1KeyProvider::from(key)),
 	validators: vec![],         // Optional: validators for hive certificates
 	client_validators: vec![],  // Non-empty: gateway requires client certs (mTLS)
-	hive_trust: Some(trust),    // Trust store for verifying signed hive control frames
+	hive_trust: Some(hive_trust),  // Hive-plane: registration, address updates, PublishGossip
+	peer_trust: Some(peer_trust),  // Peer-plane: AdvertisePeer, relayed Gossip, ReconcileGossip
 };
 ```
 
+The two trust stores are separate planes and MUST NOT cross:
+
+- **`hive_trust`**: Validates hive-origin control frames (registration, servlet address updates) and origin gossip publish (`PublishGossip`). Missing signatures reply `TransitStatus::Unauthenticated`. Failed verification replies `TransitStatus::PermissionDenied`. `None` fails closed for those frames.
+- **`peer_trust`**: Validates peer advertisements and relayed gossip. `None` disables inbound federation (peer ads and relayed gossip are refused). Hive certificates cannot forge peer ads; peer certificates cannot publish origin gossip.
+
 For hives to trust cluster commands (like heartbeats), they must have the cluster's certificate in their trust store. See [Trust Stores](#trust-stores) for details.
 
-The gateway requires `hive_trust` for hive-origin control frames (registration, servlet address updates): registration replies carry `TransitStatus::Unauthenticated` for missing signatures and `TransitStatus::PermissionDenied` for signatures that fail verification. Leaving `hive_trust` as `None` fails closed -- all control frames are rejected with `TransitStatus::PermissionDenied`.
+##### Colony Membership
+
+Federation and gossip are colony operations. Membership is the colony URN in the gateway certificate's URI Subject Alternative Name, validated against `ClusterConfig::namespace` and exposed read-only as `ClusterConfig::colony_urn()`. Ambiguous or missing SAN entries leave the gateway a non-member.
+
+- Non-members still register hives and route work.
+- Non-members refuse peer advertisements, gossip publish, gossip relay, and gossip reconciliation.
+- The advertise beat skips gossip repair when the local gateway is not a member.
+
+Flood scope is that certificate binding. Rumor bytes never carry a destination colony.
+
+##### Peer Federation
+
+Peer federation lets gateways learn which servlet types neighboring colonies export and forward work one hop. Think of it as trail-sharing between nests: each gateway re-advertises what its local hives currently serve.
+
+Configure outbound advertisement with a dial list and beat cadence:
+
+```rust
+let conf = ClusterConfig::builder(tls)
+	.with_peers([peer_addr.to_string()])
+	.with_advertise_interval(Duration::from_secs(5))
+	// Optional: only accept peer ads that claim dial addresses in this list
+	.with_peer_dial_allowlist([peer_addr.to_string()])
+	.build();
+```
+
+Behavior:
+
+1. Each advertise beat snapshots the **local hive registry** (never a static configured slate) and dials peers with a signed `AdvertisePeer` (`PeerAdvertisement`).
+2. The receiver admits on the peer trust plane: signature, freshness, colony membership on both sides, parseable dial address, optional allowlist, and namespace-scoped servlet types.
+3. Installed routes are soft-state and keyed by the peer's signer certificate fingerprint. The claimed `gateway_addr` is the dial target. An empty advertisement clears that peer's routes.
+4. The load balancer selects among Local and Peer trails together. Locality emerges from pheromone strength rather than a hard preference flag.
+5. A peer hop re-emits `ClusterWorkRequest` with `forwarded: true`. An inbound forwarded request is local-only--a one-hop loop guard so peer graphs cannot bounce work forever.
+6. Peer dials prefer the peer connection pool when `peer_trust` is set. Peer failures weaken trails and can abandon a grey-hole peer while local routes keep serving.
+
+`peers` is a dial list, not an identity mesh. Partial or asymmetric peer graphs are expected.
 
 ##### Heartbeat Mechanism
 
@@ -3003,10 +3036,10 @@ Clusters continuously monitor hive health through heartbeats. Each heartbeat is 
 - **Liveness Detection**: Hives that fail to respond are marked unhealthy and eventually evicted from the registry.
 - **Load Metrics**: Utilization data informs the load balancer, enabling smarter routing decisions.
 
-Configure heartbeat behavior via `HeartbeatConf`:
+Configure heartbeat behavior via `HeartbeatConfig`:
 
 ```rust
-let heartbeat_conf = HeartbeatConf::builder()
+let heartbeat_conf = HeartbeatConfig::builder()
 	.with_interval(Duration::from_secs(5))   // Check every 5 seconds
 	.with_timeout(Duration::from_secs(15))   // Response deadline
 	.with_max_failures(3)                    // Evict after 3 failures
@@ -3024,25 +3057,52 @@ The `on_heartbeat` callback enables monitoring and metrics collection:
 
 ##### Load Balancing
 
-When multiple instances support the same servlet type, the cluster uses a `LoadBalancer` to select one. The default `StochasticForager` is a pheromone-based swarm strategy: it draws each instance with probability proportional to its trail strength, keeps an exploration floor so no instance is starved, and applies termite-style repellency so no instance is monopolized. Alternative strategies (`RoundRobin`, `PowerOfTwoChoices`) and any custom `LoadBalancer` are pluggable via `ClusterConf::builder(..).with_load_balancer(..)`.
+When multiple instances support the same servlet type, the cluster uses a `LoadBalancer` to select one among Local hive routes and Peer gateway routes. The default `StochasticForager` is a pheromone-based swarm strategy: it draws each instance with probability proportional to its trail strength, keeps an exploration floor so no instance is starved, and applies termite-style repellency so no instance is monopolized. Alternative strategies (`RoundRobin`, `PowerOfTwoChoices`) and any custom `LoadBalancer` are pluggable via `ClusterConfig::builder(..).with_load_balancer(..)`.
+
+##### Colony Gossip
+
+Colony gossip floods origin-signed rumors across member gateways--the pheromone broadcast of the swarm. A publisher asks the local gateway to mint a rumor; peers relay and repair until hop budget or freshness expires.
+
+```rust
+let conf = ClusterConfig::builder(tls)
+	.with_peers([peer_addr.to_string()])
+	.with_advertise_interval(Duration::from_secs(5))
+	.with_gossip_ingress(servlet_type_urn) // optional local delivery target
+	.with_gossip_config(GossipConfig {
+		ttl: 4, // hop radius cap (clamped to MAX_GOSSIP_TTL)
+		..GossipConfig::default()
+	})
+	.build();
+```
+
+Flow:
+
+1. **Publish**: A hive-plane signed `PublishGossip` carries `GossipRumor { payload }`. The accepting origin gateway must be a colony member. It mints an origin-signed rumor Frame (id and issue time from the publish frame) and starts the flood.
+2. **Relay**: Peers carry `ClusterRequest::Gossip` with an outer relay Frame. Hop radius lives only in the outer `metadata.lifetime`. The inner rumor stays byte-identical under the origin signature. Relays verify on the peer trust plane; the origin colony URN MUST equal the local gateway's colony URN.
+3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice.
+4. **Local ingress**: `GossipConfig.ingress` names a servlet type on the receiving gateway. `None` means journal and reflood only (immediate local ack).
+5. **Reflood**: Remaining hop TTL and a non-empty `peers` list continue the flood.
+6. **Reconcile**: `ReconcileGossip` exchanges held digests; the peer answers with `GossipWant`. The advertise beat also runs anti-entropy repair and pending-local retry.
+
+Misbehavior on tampered or lifetime-missing relays weakens peer trails. A foreign-colony refuse does not.
 
 ##### Work Request Flow
 
 Clients interact with clusters through work request messages:
 
 1. Client sends `ClusterWorkRequest` with `servlet_type` and encoded `payload`
-2. Cluster looks up hives supporting that servlet type
-3. Load balancer selects a hive
-4. Cluster forwards the payload to the selected hive
-5. Hive processes and returns response
-6. Cluster wraps response in `ClusterWorkResponse` and returns to client
+2. Cluster looks up Local and Peer routes for that servlet type
+3. Load balancer selects an instance (hive or peer gateway)
+4. Cluster forwards the payload--directly to a local hive, or one hop to a peer with `forwarded: true`
+5. The serving hive processes and returns a response
+6. Cluster wraps the response in `ClusterWorkResponse` and returns it to the client
 
 ```rust
-// Client sends:
-let request = ClusterWorkRequest {
-	servlet_type: b"calculator".to_vec(),
-	payload: encode(&CalcRequest { value: 42 })?,
-};
+// Client sends (forwarded defaults to false):
+let request = ClusterWorkRequest::new(
+	servlet_type_urn, // e.g. urn:tightbeam::servlet:calculator
+	encode(&CalcRequest { value: 42 })?,
+);
 
 // Client receives:
 let response: ClusterWorkResponse = decode(&frame.message)?;
@@ -3053,24 +3113,49 @@ match response.status {
 }
 ```
 
-##### ClusterConf Reference
+##### ClusterConfig Reference
 
 ```rust
-pub struct ClusterConf {
-	/// Load balancing strategy for distributing work across instances
-	/// (defaults to `StochasticForager`; pluggable via the builder)
+pub struct PeerConfig {
+	/// Peer dial list for advertise/gossip reflood (empty = no outbound federation)
+	pub peers: Vec<String>,
+	/// Re-advertise beat cadence (`None` disables the beat)
+	pub advertise_interval: Option<Duration>,
+	/// Optional exact-match allowlist for claimed peer dial addresses
+	pub peer_dial_allowlist: Option<Vec<String>>,
+}
+
+pub struct ClusterConfig {
+	// --- Identity and local gateway ---
+	/// Naming scope for inbound resource URNs (authority/realm gate)
+	pub namespace: ColonyNamespace,
+	/// Optional stable gateway bind address
+	pub bind_addr: Option<String>,
+	/// Freshness/replay window for signed hive control frames (ms)
+	pub control_freshness_window_ms: u64,
+	/// TLS configuration, including `hive_trust` and `peer_trust`
+	pub tls: ClusterTlsConfig,
+
+	// --- Work routing ---
+	/// Load balancing strategy (defaults to `StochasticForager`)
 	pub load_balancer: Arc<dyn LoadBalancer>,
-	/// Heartbeat configuration
-	pub heartbeat: HeartbeatConf,
-	/// Pheromone configuration for bio-inspired routing
-	pub pheromone: PheromoneConf,
+	pub heartbeat: HeartbeatConfig,
+	pub pheromone: PheromoneConfig,
 	/// Gate policies evaluated on every gateway frame before decoding
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	/// Connection pool configuration for hive connections
+	/// Connection pool configuration for hive (and peer) connections
 	pub pool_config: PoolConfig,
-	/// TLS configuration for cluster -> hive connections
-	pub tls: ClusterTlsConfig,
+
+	// --- Peer federation ---
+	pub peer: PeerConfig,
+
+	// --- Colony gossip ---
+	/// Gossip freshness, hop TTL, ingress URN, journal, and admission
+	pub gossip: GossipConfig,
 }
+
+// Colony URN is derived from the gateway cert URI SAN at build time.
+// Read it with ClusterConfig::colony_urn(); it is not a settable field.
 ```
 
 ##### Cluster Testing
@@ -3099,7 +3184,7 @@ tb_scenario! {
 		// Shared as Arc<C> with every closure
 		context: ClusterTestCerts::generate(),
 		start: |SetupEnv { context: certs, .. }| async move {
-			let mut conf = ClusterConf::new(cluster_tls_config(&certs));
+			let mut conf = ClusterConfig::new(cluster_tls_config(&certs));
 			// Both offers set: client -> cluster and cluster -> hive run multiplexed
 			conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
 			ClusterGateway::start(Arc::new(TraceCollector::new()), conf).await
@@ -3108,7 +3193,7 @@ tb_scenario! {
 		// Omit when driving registration from the client.
 		hives: |SetupEnv { context: certs, .. }| vec![async move {
 			let servlet = PingServlet::start(Arc::new(TraceCollector::new()), None).await?;
-			let mut hive = TestHive::new(Some(HiveConf {
+			let mut hive = TestHive::new(Some(HiveConfig {
 				mux_offer: Some(TransportOffer::mux(8)),
 				..hive_tls_config(&certs)
 			}))?;
@@ -3120,10 +3205,10 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			trace.event(ClusterRoutingSpec::work_sent)?;
 
-			let request = ClusterWorkRequest {
-				servlet_type: b"ping".to_vec(),
-				payload: encode(&PingRequest { value: 21 })?,
-			};
+			let request = ClusterWorkRequest::new(
+				ping_type(), // urn:tightbeam::servlet:ping
+				encode(&PingRequest { value: 21 })?,
+			);
 
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			let response_frame = client.emit(compose! {
@@ -3149,7 +3234,9 @@ The `environment Cluster` syntax provides:
 - `hives` (OPTIONAL): Returns hive futures from a `SetupEnv`. Each is awaited and registered with the cluster
 - `client`: Owns the cluster through `ClusterEnv`, builds connections from the context, asserts registry state, and stops the cluster
 
-Adversarial registration scenarios (unsigned, replayed, stale, hijacked) omit `hives:` and drive registration from the client, asserting the rejection and the registry count on the owned instance. See `tests/colony/cluster.rs`.
+Adversarial registration scenarios (unsigned, replayed, stale, hijacked) omit `hives:` and drive registration from the client, asserting the rejection and the registry count on the owned instance.
+
+Peer federation and gossip use the same `environment Cluster` shape with peer trust, dial lists, and signed `AdvertisePeer` / `PublishGossip` frames from the client. See `tests/colony/cluster/` (`registration.rs`, `routing.rs`, `topology.rs`, `peering.rs`, `gossip.rs`).
 
 ##### Conclusion
 
@@ -3157,72 +3244,80 @@ How you wish to model your colonies is beyond the scope of this document. Howeve
 
 ## 10. Instrumentation
 
-Instrumentation produces a semantic event sequence for verification logic. Tests MUST NOT assert against instrumentation events procedurally by inspecting or branching on individual events at runtime. Tests MUST declare expectations as a spec. Verification MUST treat the finalized event stream as the authoritative ground truth for a single execution.
+Instrumentation produces a semantic event sequence for verification and audit. Tests MUST NOT assert against instrumentation events by inspecting or branching on individual events at runtime. Tests MUST declare expectations as a spec. Verification MUST treat the finalized event stream as the authoritative truth for a single execution.
 
-Feature Gating:
+Feature gating:
 
-- Instrumentation can be enabled only by the standalone crate feature `instrument`.
+- Instrumentation is enabled only by the crate feature `instrument`.
 - `TraceCollector` (`tightbeam::trace`) requires `std` and MUST NOT require the `testing` feature.
 
 ### 10.1 Objectives
 
 - Emission MUST be amortized O(1) per event.
 - Ordering MUST be strictly increasing by sequence number per trace.
-- Evidence artifacts MUST be deterministic and hash‑stable given identical executions.
-- Detail level MUST be feature‑gated to avoid unnecessary overhead.
-- Payload handling MUST preserve privacy (hash or summarize. Never emit secret raw bytes).
+- Evidence artifacts MUST be deterministic and hash-stable for identical executions.
+- Detail level MUST be feature-gated to avoid unnecessary overhead.
+- Payload handling MUST preserve privacy (hash or summarize).
 
 ### 10.2 Event Kind Taxonomy
 
-Each event MUST have one kind from a closed, feature‑gated set:
+Each emitted event carries a kind URN from the closed inventory in `tightbeam::instrumentation::events`. Format:
 
-- External: `gate_accept`, `gate_reject`, `request_recv`, `response_send`
-- Assertion: `assert_label`, `assert_payload`
-- Internal (hidden): `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`
-- Process (requires `testing-csp`): `process_transition`, `process_hidden`
-- Exploration (requires `testing-fdr`): `seed_start`, `seed_end`, `state_expand`, `state_prune`, `divergence_detect`, `refusal_snapshot`, `enabled_set_sample`
-- Meta: `start`, `end`, `warn`, `error`
+```
+urn:tightbeam:event:<domain>/<event-name>
+```
 
-Hidden/internal events MUST use the internal category.
+Domains (illustrative; full constants live in that module):
 
-Instrumentation events are also identified by **URNs** defined in `tightbeam::utils::urn::specs::TightbeamUrnSpec`. The `TightbeamUrnSpec` format `urn:tightbeam:instrumentation:<resource_type>/<resource_id>` provides stable names for traces, events, seeds, and verdicts, and is used by the instrumentation subsystem to label evidence artifacts.
+- **Core / meta**: `core/start`, `core/end`, `core/warn`, `core/error`, `trace/clock-origin`
+- **External**: `gate/accept`, `gate/reject`, `transport/request-recv`, `transport/response-send`
+- **Connection**: `connection/accepted`, `connection/closed`, `connection/stale`, `connection/reconnected`
+- **Assertion**: `assert/label`, `assert/payload`
+- **Internal** (detail-gated): `handler/enter`, `handler/exit`, `crypto/step`, `compress/step`, `route/step`, `policy/eval`
+- **Process** (requires `testing-csp`): `process/transition`, `process/hidden`
+- **Exploration** (requires `testing-fdr`): `fdr/seed-start`, `fdr/seed-end`, `fdr/state-expand`, `fdr/state-prune`, `fdr/divergence-detect`, `fdr/refusal-snapshot`, `fdr/enabled-set-sample`
+- **Mux / pool / session**: `mux/*`, `pool/*`, `session/*` (handshake, receipts, rekey, drain)
+- **Colony**: `hive/reregistered`, `cluster/hive-registered`, `cluster/work-routed`, `cluster/work-forwarded`, `cluster/peer-advertised`, `cluster/gossip-accepted`, `cluster/gossip-refused`, and related accept/refuse pairs
 
-**Shorthand Event Matching**: In `tb_assert_spec!` and `tb_process_spec!`, you can use shorthand labels instead of full URNs. The shorthand `"foo"` matches any event containing `instrumentation:event/foo`, such as `urn:tightbeam:instrumentation:event/foo` or `urn:custom:instrumentation:event/foo`.
+Hidden/internal detail MUST stay behind `enable_internal_detail` (and related sampling flags). Control-plane accept/refuse events (gates, cluster, gossip) fire when the subsystem decides, independent of that detail flag.
+
+> Note: `TightbeamUrnSpec` (`urn:tightbeam:instrumentation:<resource_type>/<resource_id>`) is a separate helper for application/test labeling. Production control-plane events use the `event:<domain>/<name>` inventory above. See [§11.1.1](#1111-urns).
+
+Assertion matching compares full URN strings for equality. Specs and emit sites MUST share the same rendered URN (or the same `events::*` constant).
 
 ### 10.3 Event Structure
 
-Conceptual fixed layout (names illustrative):
+Runtime shape is `TbEvent`:
 
 ```
-trace_id | seq | kind | label? | payload? | phase? | dur_ns? | flags | extras
+seq | urn | label? | payload_hash? | duration_ns? | timestamp_ns? | flags | extras?
 ```
 
 Requirements:
 
-- `trace_id` MUST uniquely identify the execution instance.
-- `seq` MUST start at 0 and increment by 1 for each emitted event.
-- `kind` MUST be a valid taxonomy member.
-- `label` MUST be present for assertion and labeled process events. Otherwise absent.
-- `payload` MAY be present only if the label is declared payload‑capable.
-- `phase` SHOULD map to one of: Gate, Handler, Assertion, Response, Crypto, Compression, Routing, Policy, Process, Exploration.
-- `dur_ns` MAY appear on exit or boundary events and MUST represent a monotonic duration in nanoseconds.
-- `flags` MUST represent a bitset (e.g. ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
-- `extras` MAY supply fixed numeric slots and a bounded byte sketch for extended metrics (e.g. enabled set cardinality).
+- `seq` MUST start at 0 and increment by 1 for each emitted event on a collector.
+- `urn` MUST be a member of the event inventory (or an application URN the deployment treats as first-class).
+- `label` MAY carry a human-readable or numeric annotation (for example the Unix-epoch nanoseconds on `TRACE_CLOCK_ORIGIN`).
+- `payload_hash` MAY be present only when payloads are enabled and the emit site captures one.
+- `duration_ns` MAY appear on exit or boundary events and MUST be a monotonic span length in nanoseconds.
+- `timestamp_ns` MAY appear as nanoseconds since collector construction. `TRACE_CLOCK_ORIGIN` records the construction time once as Unix-epoch nanoseconds so absolute times are reconstructible offline (see [§8.8.1](#881-audit-trail-deployment-requirements)).
+- `flags` MUST be a bitset (for example ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
+- `extras` MAY carry a bounded byte sketch for extended metrics.
 
 ### 10.4 Payload Representation
 
 Runtime values captured under `assert_payload` MUST be transformed before emission:
 
-- Algorithm: SHA3‑256 digest over canonical byte representation.
-- Representation: First 32 bytes (full SHA3‑256 output) MUST be stored. NO truncation below 32 bytes.
-- Literal integers MAY be emitted directly as 64‑bit unsigned values IF NOT sensitive.
+- Algorithm: SHA3-256 digest over the canonical byte representation.
+- Representation: The full 32-byte SHA3-256 output MUST be stored. Truncation below 32 bytes is forbidden.
+- Literal integers MAY be emitted directly as 64-bit unsigned values if they are not sensitive.
 - Structured values SHOULD emit a static schema tag plus digest.
 
 > Warning: Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
 
 ### 10.5 Configuration
 
-Instrumentation behavior MUST be controlled by a configuration object (conceptual fields). Configuration existence itself is gated by `instrument`:
+Instrumentation behavior MUST be controlled by `TbInstrumentationConfig` (gated by `instrument`):
 
 ```rust
 TbInstrumentationConfig {
@@ -3236,7 +3331,7 @@ TbInstrumentationConfig {
 }
 ```
 
-Defaults (instrument only):
+Defaults (`instrument` only):
 
 - `enable_payloads = false`
 - `enable_internal_detail = false`
@@ -3246,65 +3341,61 @@ Defaults (instrument only):
 - `record_durations = false`
 - `max_events = 1024`
 
-Layer Interaction (informative): Enabling testing layers does NOT alter these defaults. Tests MAY explicitly override fields per scenario.
+Enabling testing layers does not change these defaults. Tests MAY override fields per scenario.
 
-If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, emit a single `warn` event, and drop subsequent events.
+Every emitted `TbEvent` goes to exactly one `EventSink`. When no sink is configured, the collector uses `BoundedMemorySink` sized by `max_events`. If that bound is exceeded, the implementation MUST set an OVERFLOW condition, emit a single `core/warn` event, and drop subsequent events. Sequence gaps in exported evidence reveal truncation (see [§8.8.1](#881-audit-trail-deployment-requirements)).
 
 ### 10.6 Evidence Artifact Format
 
-For every finalized trace an artifact MUST be producible in a canonical binary form (ASN.1 DER).
+For every finalized trace an artifact MUST be producible as ASN.1 DER (`EvidenceArtifact`).
 
-Canonical ASN.1 DER Schema (conceptual):
+Wire shape:
 
 ```
 EvidenceArtifact ::= SEQUENCE {
-	specHash   OCTET STRING,               -- SHA3-256(spec definition)
-	traceId    INTEGER,                    -- Unique per execution
-	seed       INTEGER OPTIONAL,           -- Exploration seed (testing-fdr only)
-	outcome    ENUMERATED { acceptResponse(0), acceptNoResponse(1), reject(2), error(3) },
-	metrics    SEQUENCE {
-		countEvents   INTEGER,
-		durationNs    INTEGER OPTIONAL,
-		overflow      BOOLEAN OPTIONAL
-	},
-	events     SEQUENCE OF Event
+	specHash      OCTET STRING,           -- SHA3-256(spec definition)
+	traceHash     OCTET STRING,           -- SHA3-256 over canonical event bytes
+	evidenceHash  OCTET STRING,           -- SHA3-256(specHash || traceHash)
+	events        SEQUENCE OF TbEvent,
+	overflow      BOOLEAN                 -- true if the collector dropped events
 }
 
-Event ::= SEQUENCE {
-	i           INTEGER,                   -- sequence number
-	k           ENUMERATED { start(0), end(1), warn(2), error(3), gate_accept(4), gate_reject(5), request_recv(6), response_send(7), assert_label(8), assert_payload(9), handler_enter(10), handler_exit(11), crypto_step(12), compress_step(13), route_step(14), policy_eval(15), process_transition(16), process_hidden(17), seed_start(18), seed_end(19), state_expand(20), state_prune(21), divergence_detect(22), refusal_snapshot(23), enabled_set_sample(24) },
-	l           UTF8String OPTIONAL,       -- label
-	payloadHash OCTET STRING OPTIONAL,     -- SHA3-256(payload canonical bytes) if captured
-	durationNs  INTEGER OPTIONAL,          -- monotonic duration for boundary/exit events
-	flags       BIT STRING OPTIONAL,       -- ASSERT_FAIL | HIDDEN | DIVERGENCE | OVERFLOW ...
-	extras      OCTET STRING OPTIONAL      -- bounded auxiliary metrics sketch
+TbEvent ::= SEQUENCE {
+	seq           INTEGER,
+	urn           URN,                    -- event kind
+	label         [0] UTF8String OPTIONAL,
+	payloadHash   [1] OCTET STRING OPTIONAL,  -- 32 bytes when present
+	durationNs    [2] INTEGER OPTIONAL,
+	timestampNs   [3] INTEGER OPTIONAL,
+	flags         INTEGER,
+	extras        [4] OCTET STRING OPTIONAL
 }
 ```
 
-Binary Serialization Requirements:
+Binary serialization requirements:
 
 - DER MUST omit absent OPTIONAL fields.
 - Field ordering MUST follow the schema strictly.
-- BIT STRING unused bits MUST be zero.
+- Optional fields use explicit context tags so adjacent optionals of the same universal type stay unambiguous.
 - `payloadHash` MUST be 32 bytes when present (SHA3-256).
 
-Artifact Integrity:
+Artifact integrity:
 
-- `trace_hash` MUST be SHA3-256 over the DER encoding of the Events sequence ONLY (excluding surrounding fields).
-- `evidence_hash` SHOULD be SHA3-256(specHash || trace_hash) where `||` denotes raw byte concatenation.
+- `trace_hash` MUST be SHA3-256 over a canonical byte encoding of the event list (sequence numbers, URN strings, labels, payload hashes, flags, durations, timestamps, and extras)--not a free-form dump of surrounding artifact fields.
+- `evidence_hash` MUST be SHA3-256(`specHash` || `traceHash`) where `||` is raw byte concatenation.
 
 Privacy:
 
-- Raw payload bytes MUST NOT appear. Only hashed representation or numeric scalar (non-sensitive) values MAY be represented.
+- Raw payload bytes MUST NOT appear. Only hashed representation or non-sensitive numeric scalars MAY be represented.
 
 ### 10.7 Failure Handling
 
-- Emission errors MUST NOT panic. They MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
-- Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
+- Emission errors MUST NOT panic. They MUST degrade gracefully (for example drop the event and set OVERFLOW).
+- Verification MUST treat missing expected instrumentation events as spec violations (for example an absent assertion label).
 
 ### 10.8 Logging Subsystem
 
-Implements [RFC 5424][rfc5424]-compliant logging with trait-based backends.
+The logging subsystem implements [RFC 5424][rfc5424]-compliant logging with trait-based backends.
 
 #### RFC 5424 Severity Levels
 
@@ -3363,7 +3454,7 @@ trace.event("msg")?.with_log_level(LogLevel::Error).emit();
 
 ### 11.1 Utilities
 
-tightbeam provides a small `utils` module family for cross-cutting concerns.
+The `utils` module family covers cross-cutting concerns.
 
 #### 11.1.1 URNs
 
@@ -3373,15 +3464,16 @@ The URN subsystem provides:
 
 - `Urn<'a>`: [RFC 8141][rfc8141]-compliant `urn:<nid>:<nss>` representation.
 - `UrnBuilder`: a fluent builder for constructing and validating URNs from either a raw NID/NSS or structured components.
-- `UrnSpec` / `UrnValidationError`: traits and error types for namespace‑specific validation logic.
-- `tightbeam::utils::urn::specs::TightbeamUrnSpec`: a built‑in spec for instrumentation URNs of the form `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
+- `UrnSpec` / `UrnValidationError`: traits and error types for namespace-specific validation logic.
+- `tightbeam::utils::urn::specs::TightbeamUrnSpec`: a built-in spec for application/test instrumentation labels of the form `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
+- Control-plane event URNs (`urn:tightbeam:event:<domain>/<name>`) live in `tightbeam::instrumentation::events` (see [§10.2](#102-event-kind-taxonomy)).
 
 `TightbeamUrnSpec` constrains:
 
-- **`resource_type`**: one of `trace`, `event`, `seed`, `verdict` (case‑insensitive, normalized to lowercase), and
-- **`resource_id`**: an application‑defined identifier that must match an alphanumeric‑with‑hyphen pattern.
+- **`resource_type`**: one of `trace`, `event`, `seed`, `verdict` (case-insensitive, normalized to lowercase)
+- **`resource_id`**: an application-defined identifier that must match an alphanumeric-with-hyphen pattern
 
-These URNs can be used by applications to name any kind of resource in a stable, parseable way. Internally, they are also used by the instrumentation subsystem (§10) to tag traces, events, seeds, and verdicts with globally unique identifiers for evidence artifacts and external analysis.
+Applications MAY use these URNs to name resources in a stable, parseable way. They are distinct from the control-plane event inventory in [§10.2](#102-event-kind-taxonomy).
 
 **Example: Building a custom application URN**
 
@@ -3617,7 +3709,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_pipeline_workflow,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(PipelineSpec::latest())
 		.with_csp(PipelineProcess)
 		.build(),
@@ -3945,7 +4037,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_all_versions,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_specs(vec![VersionSpec::get(0, 0, 0), VersionSpec::get(1, 0, 0)])
 		.build(),
 	environment Bare {
@@ -4148,7 +4240,7 @@ tb_compose_spec! {
 // Use the composed process in a scenario
 tb_scenario! {
 	name: test_request_with_retry,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(ClientServerSpec::latest())
 		.with_csp(RequestWithRetry)
 		.build(),
@@ -4257,7 +4349,7 @@ tb_assert_spec! {
 // Test with refinement checking
 tb_scenario! {
 	name: test_simple_refinement,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(SimpleSpec::latest())
 		.with_fdr(FdrConfig {
 			seeds: 4,
@@ -4607,7 +4699,7 @@ The `tb_scenario!` macro is the unified entry point for all testing layers, exec
 tb_scenario! {
 	name: test_function_name,        // OPTIONAL: creates standalone #[test] function NOTE: Do NOT use with `fuzz: afl`
 	spec: AssertSpecType,            // Layer 1 assertion spec (latest version). Use config: for anything more
-	config: ScenarioConf::builder()  // Full configuration (alternative to spec:)
+	config: ScenarioConfig::builder()  // Full configuration (alternative to spec:)
 		.with_spec(AssertSpecType::latest())          // Layer 1 assertion spec
 		.with_csp(ProcessSpecType)                    // OPTIONAL: Layer 2 CSP model (requires testing-csp)
 		.with_fdr(FdrConfig { ... })                  // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
@@ -4622,7 +4714,7 @@ tb_scenario! {
 }
 ```
 
-Exactly one of `spec:` or `config:` configures the scenario. `spec:` expands to a `ScenarioConf` with that AssertSpec's latest version. `config:` accepts a full `ScenarioConf` expression.
+Exactly one of `spec:` or `config:` configures the scenario. `spec:` expands to a `ScenarioConfig` with that AssertSpec's latest version. `config:` accepts a full `ScenarioConfig` expression.
 
 Every closure receives one environment struct from `tightbeam::testing::env`. Setup-phase closures take `SetupEnv { trace, context }`. Later phases extend that shape: `ClientEnv` adds `addr`, and `ClusterEnv` / `HiveEnv` / `ServletEnv` / `WorkerEnv` add the owned instance. The conventional parameter name is `env`. Destructure the struct in the closure pattern when field aliases read better.
 
@@ -4663,7 +4755,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_bare_environment,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(BareSpec::latest())
 		.with_csp(BareProcess)
 		.build(),
@@ -4727,7 +4819,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_client_server_all_layers,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(ClientServerSpec::latest())
 		.with_csp(ClientServerProcess)
 		.with_fdr(FdrConfig {
@@ -4820,7 +4912,7 @@ This test verifies:
 
 Hooks provide optional callbacks that can observe and override test outcomes:
 
-- Configured via `.with_hooks(TestHooks { on_pass: Some(...), on_fail: Some(...) })` in the `ScenarioConf` builder.
+- Configured via `.with_hooks(TestHooks { on_pass: Some(...), on_fail: Some(...) })` in the `ScenarioConfig` builder.
 - Each hook is a closure wrapped in `Arc`, of type `Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>` for `on_pass` and `Arc<dyn Fn(&HookContext, &SpecViolation) -> Result<(), TightBeamError> + Send + Sync>` for `on_fail`.
 - `Ok(())` means the hook accepts the outcome and the test passes.
 - `Err(e)` means the hook rejects the outcome and the test fails
@@ -4844,7 +4936,7 @@ tightbeam integrates [AFL.rs](https://github.com/rust-fuzz/afl.rs), a Rust port 
 ```rust
 tb_scenario! {
 	fuzz: afl,                        // ← AFL fuzzing mode
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MySpec::latest())
 		.with_csp(MyProcess)          // ← oracle for valid state navigation
 		.build(),
@@ -4916,7 +5008,7 @@ tb_process_spec! {
 // Note: AFL fuzz targets generate `fn main()` - do NOT include `name:` parameter
 tb_scenario! {
 	fuzz: afl,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(SimpleFuzzSpec::latest())
 		.with_csp(SimpleFuzzProc)
 		.build(),
@@ -5291,7 +5383,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_ping_pong_worker,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(PingPongWorkerSpec::latest())
 		.with_csp(PingPongWorkerProcess)
 		.build(),
@@ -5372,7 +5464,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_servlet_with_workers,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(PingPongSpec::latest())
 		.with_csp(PingPongProcess)
 		.build(),

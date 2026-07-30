@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tightbeam::colony::worker::Worker;
 use tightbeam::der::Sequence;
-use tightbeam::testing::{ScenarioConf, WorkerEnv};
+use tightbeam::testing::{ScenarioConfig, WorkerEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::Beamable;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, worker};
@@ -76,7 +76,7 @@ tb_scenario! {
 	spec: WorkerSpec,
 	environment Worker {
 		setup: |_env| {
-			ConfigurableWorker::new(ConfigurableWorkerConf {
+			ConfigurableWorker::new(ConfigurableWorkerConfig {
 				response: "CUSTOM_RESPONSE".to_string(),
 			})
 		},
@@ -100,7 +100,7 @@ tb_scenario! {
 
 tb_scenario! {
 	name: test_worker_with_type,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_specs(vec![WorkerSpec::get(1, 0, 0).expect("WorkerSpec 1.0.0")])
 		.build(),
 	environment Worker {

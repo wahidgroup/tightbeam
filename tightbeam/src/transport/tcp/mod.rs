@@ -430,7 +430,7 @@ macro_rules! impl_tcp_common {
 		}
 
 		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::PolicyConf for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::PolicyConfig for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{

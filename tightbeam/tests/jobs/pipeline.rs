@@ -16,7 +16,7 @@ use tightbeam::{Beamable, Frame, TightBeamError};
 #[cfg(feature = "testing-csp")]
 use tightbeam::tb_process_spec;
 #[cfg(feature = "testing-csp")]
-use tightbeam::testing::ScenarioConf;
+use tightbeam::testing::ScenarioConfig;
 
 pub(crate) const FALLBACK_TRIGGERED: Urn<'static> = Urn::new("test", "event:pipeline/fallback-triggered");
 pub(crate) const PIPELINE_COMPLETE: Urn<'static> = Urn::new("test", "event:pipeline/pipeline-complete");
@@ -166,7 +166,7 @@ tb_process_spec! {
 #[cfg(feature = "testing-csp")]
 tb_scenario! {
 	name: test_pipeline_auto_trace_urns,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(AutoTraceSpec::latest())
 		.with_csp(PipelineProcess)
 		.build(),

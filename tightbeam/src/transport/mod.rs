@@ -152,7 +152,7 @@ mod tests {
 		use std::sync::{mpsc, Arc};
 
 		use crate::asn1::Frame;
-		use crate::transport::policy::{PolicyConf, RestartLinearBackoff};
+		use crate::transport::policy::{PolicyConfig, RestartLinearBackoff};
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::tcp::TightBeamSocketAddr;
 

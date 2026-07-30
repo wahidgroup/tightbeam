@@ -19,10 +19,10 @@ use tightbeam::{
 	at_least,
 	builder::TypeBuilder,
 	colony::{
-		cluster::{Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		cluster::{Cluster, ClusterConfig, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
 		common::ColonyNamespace,
-		hive::{Hive, HiveConf, HiveTlsConfig},
-		servlet::ServletConf,
+		hive::{Hive, HiveConfig, HiveTlsConfig},
+		servlet::ServletConfig,
 	},
 	crypto::{
 		key::Secp256k1KeyProvider,
@@ -116,13 +116,13 @@ fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
 	}
 }
 
-fn hive_tls_config(certs: &TestCerts) -> HiveConf {
+fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
 	let hive_tls = Arc::new(HiveTlsConfig {
 		certificate: CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
 		key: Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
 		validators: vec![],
 	});
-	HiveConf {
+	HiveConfig {
 		hive_tls: Some(hive_tls),
 		trust_store: Some(Arc::clone(&certs.cluster_trust)),
 		..Default::default()
@@ -131,9 +131,9 @@ fn hive_tls_config(certs: &TestCerts) -> HiveConf {
 
 fn servlet_tls_config(
 	certs: &TestCerts,
-) -> Result<ServletConf<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>, TightBeamError> {
+) -> Result<ServletConfig<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>, TightBeamError> {
 	Ok(
-		ServletConf::<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>::builder()
+		ServletConfig::<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>::builder()
 			.with_certificate(
 				CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
 				Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
@@ -195,7 +195,7 @@ tb_scenario! {
 		exec: |SetupEnv { trace, context: certs }| async move {
 			// Start cluster; the gateway and hive both offer mux, so the
 			// colony links run multiplexed
-			let mut cluster_conf = ClusterConf::new(cluster_tls_config(&certs));
+			let mut cluster_conf = ClusterConfig::new(cluster_tls_config(&certs));
 			cluster_conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
 
 			let cluster_trace = Arc::new(TraceCollector::new());
@@ -208,7 +208,7 @@ tb_scenario! {
 			let servlet = AuthorizationServlet::start(Arc::clone(&servlet_trace), Some(servlet_conf)).await?;
 
 			// Create and establish hive
-			let mut hive = PaymentProcessorHive::new(Some(HiveConf {
+			let mut hive = PaymentProcessorHive::new(Some(HiveConfig {
 				mux_offer: Some(TransportOffer::mux(8)),
 				..hive_tls_config(&certs)
 			}))?;

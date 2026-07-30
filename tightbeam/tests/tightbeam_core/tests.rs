@@ -14,7 +14,7 @@ use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
 use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
-use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils;
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
@@ -221,7 +221,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: version_check_all,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_specs(vec![
 			VersionSpec::get(0, 0, 0).expect("VersionSpec 0.0.0"),
 			VersionSpec::get(1, 0, 0).expect("VersionSpec 1.0.0"),

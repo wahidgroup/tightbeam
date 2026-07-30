@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tightbeam::{
 	colony::{
 		common::ColonyNamespace,
-		hive::{Hive, HiveConf},
-		servlet::ServletConf,
+		hive::{Hive, HiveConfig},
+		servlet::ServletConfig,
 	},
 	compose,
 	crypto::x509::CertificateSpec,
@@ -82,10 +82,10 @@ servlet! {
 
 fn streaming_servlet_conf(
 	materials: &ServerMaterials,
-) -> Result<ServletConf<TokioListener, StreamLabel>, TightBeamError> {
+) -> Result<ServletConfig<TokioListener, StreamLabel>, TightBeamError> {
 	let cert = CertificateSpec::Built(Box::new((*materials.certificate).to_owned()));
 	let key = Arc::clone(&materials.key_provider);
-	Ok(ServletConf::<TokioListener, StreamLabel>::builder()
+	Ok(ServletConfig::<TokioListener, StreamLabel>::builder()
 		.with_certificate(cert, key, vec![])?
 		.with_mux_offer(Some(TransportOffer::mux(8)))
 		.with_config(Arc::new(()))
@@ -277,7 +277,7 @@ async fn start_streaming_hive(
 	let servlet = StreamingEchoServlet::start(Arc::clone(&trace), config).await?;
 
 	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let conf = HiveConf {
+	let conf = HiveConfig {
 		trust_store: Some(trust_store),
 		mux_offer: Some(TransportOffer::mux(8)),
 		..Default::default()
@@ -303,7 +303,7 @@ tb_assert_spec! {
 
 // `HiveContext::open_stream` drives a real sibling servlet: the hive's
 // intra-hive pool validates the servlet certificate through
-// `HiveConf::trust_store`, negotiates mux, and the streamed body's
+// `HiveConfig::trust_store`, negotiates mux, and the streamed body's
 // unary reply comes back as message bytes, the same shape as `call`.
 tb_scenario! {
 	name: hive_context_streams_to_sibling_servlet,

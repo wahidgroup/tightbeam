@@ -35,7 +35,7 @@ pub const DEFAULT_ABANDONMENT_LIMIT: u32 = 5;
 
 /// Configuration for pheromone-based servlet tracking
 #[derive(Debug, Clone)]
-pub struct PheromoneConf {
+pub struct PheromoneConfig {
 	/// Decay rate per evaporation cycle in basis points (1000 = 10%)
 	pub evaporation_rate: BasisPoints,
 	/// How often to run evaporation
@@ -55,7 +55,7 @@ pub const DEFAULT_REINFORCEMENT_BOOST: u64 = 500;
 /// Default weakening penalty (0 = only increment trial count on failure)
 pub const DEFAULT_WEAKENING_PENALTY: u64 = 0;
 
-impl Default for PheromoneConf {
+impl Default for PheromoneConfig {
 	fn default() -> Self {
 		Self {
 			evaporation_rate: BasisPoints::new(DEFAULT_EVAPORATION_RATE_BPS),
@@ -348,15 +348,17 @@ pub struct ServletRegistry {
 	/// Reverse index: hive_id -> Vec<address>
 	hive_index: RwLock<HashMap<SharedId, Vec<SharedId>>>,
 	/// Serializes slate accept and reconciliation: conflict/cap checks and
-	/// install span several lock acquisitions and must not interleave
+	/// install span several lock acquisitions and must not interleave.
+	/// Local installs hold it too, so a local route cannot land between a
+	/// peer ad's conflict probe and its install.
 	reconcile_gate: Mutex<()>,
 	/// Configuration
-	config: PheromoneConf,
+	config: PheromoneConfig,
 }
 
 impl ServletRegistry {
 	/// Create a new registry with the given configuration
-	pub fn new(config: PheromoneConf) -> Self {
+	pub fn new(config: PheromoneConfig) -> Self {
 		Self {
 			entries: RwLock::new(HashMap::new()),
 			type_index: RwLock::new(HashMap::new()),
@@ -439,13 +441,16 @@ impl ServletRegistry {
 	/// Add entries for all servlet types from a hive
 	///
 	/// Creates one entry per servlet type, using hive address as servlet address
-	/// (servlet-level addresses can be added later via direct registration)
+	/// (servlet-level addresses can be added later via direct registration).
+	/// Holds `reconcile_gate` so the local install cannot interleave with a
+	/// peer conflict probe in [`Self::reconcile_peer_slate`].
 	pub fn add_entries_from_hive(
 		&self,
 		hive_id: &SharedId,
 		hive_address: &SharedId,
 		servlet_types: &[SharedId],
 	) -> Result<(), ClusterError> {
+		let _gate = self.reconcile_gate.lock()?;
 		for servlet_type in servlet_types {
 			let entry = ServletEntry::new(
 				Arc::clone(hive_address),
@@ -480,9 +485,11 @@ impl ServletRegistry {
 	/// before the first add. Any mid-flight failure rolls back to the
 	/// prior slate, so a caller never observes a mixed one. Every entry
 	/// must carry `hive_id` as its hive, or the prune misses it.
-	/// Serialized by `reconcile_gate`.
-	#[cfg(test)]
-	fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
+	///
+	/// Serialized by `reconcile_gate`: a local slate that lands between
+	/// [`Self::reconcile_peer_slate`]'s conflict probe and its install
+	/// would be replaced by peer rows the probe was meant to refuse.
+	pub fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
 		let _gate = self.reconcile_gate.lock()?;
 		self.reconcile_slate(hive_id, entries)
 	}
@@ -584,12 +591,15 @@ impl ServletRegistry {
 	///
 	/// Atomic: either every change lands or the registry is unchanged.
 	/// Rejects adds/removes that reference another hive's routes.
+	/// Holds `reconcile_gate` so the local install cannot interleave with a
+	/// peer conflict probe in [`Self::reconcile_peer_slate`].
 	pub fn apply_address_update(
 		&self,
 		hive_id: &[u8],
 		added: Vec<ServletEntry>,
 		removed: &[&[u8]],
 	) -> Result<(), ClusterError> {
+		let _gate = self.reconcile_gate.lock()?;
 		for entry in &added {
 			if entry.owner_id().as_ref() != hive_id {
 				return Err(ClusterError::ServletNotOwned);
@@ -901,7 +911,7 @@ impl ServletRegistry {
 	}
 
 	/// Get configuration
-	pub fn config(&self) -> &PheromoneConf {
+	pub fn config(&self) -> &PheromoneConfig {
 		&self.config
 	}
 
@@ -919,7 +929,7 @@ impl ServletRegistry {
 
 impl Default for ServletRegistry {
 	fn default() -> Self {
-		Self::new(PheromoneConf::default())
+		Self::new(PheromoneConfig::default())
 	}
 }
 
@@ -1090,7 +1100,7 @@ mod tests {
 	#[test]
 	fn peer_entries_excludes_abandoned() {
 		let limit = 2;
-		let config = PheromoneConf { abandonment_limit: limit, ..Default::default() };
+		let config = PheromoneConfig { abandonment_limit: limit, ..Default::default() };
 		let registry = ServletRegistry::new(config);
 
 		let peer = ServletEntry::peer(
@@ -1293,6 +1303,31 @@ mod tests {
 		assert_eq!(registry.peer_entries().ok().unwrap_or_default().len(), 1);
 	}
 
+	// A local slate and a peer ad race for the same hive-index key. Both
+	// paths hold the reconcile gate, so the ad either sees the local rows
+	// and refuses, or completes first and its rows are then replaced. A
+	// missing local route at the end proves a local install landed inside
+	// the ad's probe-to-install window and was clobbered by peer rows.
+	#[test]
+	fn reconcile_peer_slate_excludes_concurrent_local_install() {
+		for _ in 0..500 {
+			let registry = ServletRegistry::default();
+			std::thread::scope(|scope| {
+				scope.spawn(|| {
+					let slate = vec![named_entry(b"gw", b"calc", b"gw")];
+					registry.reconcile_by_hive(b"gw", slate).ok();
+				});
+				scope.spawn(|| {
+					let ad = admitted(b"gw", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"gw")]);
+					registry.reconcile_peer_slate(ad, PeerCaps::default()).ok();
+				});
+			});
+
+			let locals = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
+			assert_eq!(locals.len(), 1);
+		}
+	}
+
 	#[test]
 	fn peer_key_conflicts_only_with_local_routes() {
 		// (seeded entry, probe key, expected conflict)
@@ -1366,7 +1401,7 @@ mod tests {
 	#[test]
 	fn registry_remove_abandoned_prunes_entries() {
 		let limit = 2;
-		let config = PheromoneConf { abandonment_limit: limit, ..Default::default() };
+		let config = PheromoneConfig { abandonment_limit: limit, ..Default::default() };
 		let registry = ServletRegistry::new(config);
 
 		let entry = test_entry(5000, limit);

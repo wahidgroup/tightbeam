@@ -314,7 +314,7 @@ mod tests {
 	crate::test_worker! {
 		name: lucky_number_worker_checks_winner,
 		setup: || {
-			LuckyNumberDeterminer::new(LuckyNumberDeterminerConf { lotto_number: 42 })
+			LuckyNumberDeterminer::new(LuckyNumberDeterminerConfig { lotto_number: 42 })
 		},
 		assertions: |worker| async move {
 			assert_eq!(worker.queue_capacity(), 64);

@@ -24,7 +24,7 @@ pub(crate) const RECEIVE_RESPONSE: Urn<'static> = Urn::new("test", "event:connec
 pub(crate) const SEND_MESSAGE: Urn<'static> = Urn::new("test", "event:connection-reuse/send-message");
 
 use tightbeam::{
-	colony::servlet::ServletConf,
+	colony::servlet::ServletConfig,
 	compose,
 	der::Sequence,
 	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,
@@ -224,7 +224,7 @@ tb_scenario! {
 				}
 			}
 
-			let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, TestMessage>::builder()
 				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();

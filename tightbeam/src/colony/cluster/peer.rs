@@ -8,7 +8,7 @@
 use core::str::FromStr;
 use std::sync::Arc;
 
-use super::{ClusterConf, ServletEntry, SharedId};
+use super::{ClusterConfig, ServletEntry, SharedId};
 use crate::colony::common::{is_bare_servlet_type, type_canonical_bytes, ColonyNamespace, PeerAdvertisement};
 use crate::constants::MAX_ADVERTISED_TYPES;
 use crate::policy::TransitStatus;
@@ -52,7 +52,7 @@ impl AdmittedPeerAd {
 	/// URN SAN), and wire checks. Caps and local-route conflicts are
 	/// registry policy, checked under the reconcile gate in
 	/// [`super::ServletRegistry::reconcile_peer_slate`].
-	pub fn admit(frame: &Frame, ad: &PeerAdvertisement, conf: &ClusterConf) -> Result<Self, TransitStatus> {
+	pub fn admit(frame: &Frame, ad: &PeerAdvertisement, conf: &ClusterConfig) -> Result<Self, TransitStatus> {
 		let dial_addr: SharedId = Arc::from(ad.gateway_addr.as_slice());
 
 		// The signer certificate resolves exactly once; the slate key
@@ -89,7 +89,7 @@ impl AdmittedPeerAd {
 			&ad.gateway_addr,
 			&ad.advertised_types,
 			&conf.namespace,
-			conf.peer_dial_allowlist.as_deref(),
+			conf.peer.peer_dial_allowlist.as_deref(),
 		)?;
 
 		let slate = build_peer_slate(

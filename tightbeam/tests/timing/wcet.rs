@@ -10,7 +10,7 @@ use tightbeam::instrumentation::TbInstrumentationConfig;
 use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::trace::TraceConfig;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet, TightBeamError};
 
@@ -67,7 +67,7 @@ fn build_timing_fdr_config(specs: Vec<Process>) -> FdrConfig {
 // The actual timing verification would be called during FDR exploration or in hooks.
 tb_scenario! {
 	name: test_wcet_constraint_passing,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(SimpleWcetSpec::latest())
 		.with_fdr(build_timing_fdr_config(vec![SimpleWcetProcess::process()]))
 		.with_trace(TraceConfig::with_instrumentation(TbInstrumentationConfig {
@@ -111,7 +111,7 @@ tb_scenario! {
 // Tests that durations exactly equal to the constraint are acceptable
 tb_scenario! {
 	name: test_wcet_constraint_at_limit,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(SimpleWcetSpec::latest())
 		.with_fdr(build_timing_fdr_config(vec![SimpleWcetProcess::process()]))
 		.with_trace(TraceConfig::with_instrumentation(TbInstrumentationConfig {
@@ -155,7 +155,7 @@ tb_scenario! {
 // observed durations exceed the WCET constraint.
 tb_scenario! {
 	name: test_wcet_constraint_violation,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(SimpleWcetSpec::latest())
 		.with_fdr(build_timing_fdr_config(vec![SimpleWcetProcess::process()]))
 		.with_trace(TraceConfig::with_instrumentation(TbInstrumentationConfig {

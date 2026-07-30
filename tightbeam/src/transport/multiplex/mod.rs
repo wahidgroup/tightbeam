@@ -156,7 +156,7 @@ impl MuxRole {
 /// its stream, so no ID-keyed cancel surface exists.
 pub trait MultiplexedProtocol {
 	/// Peer-advertised cap on concurrent locally-initiated streams
-	/// (HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` analog).
+	/// (HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`).
 	fn max_concurrent_streams(&self) -> u32;
 
 	/// Open a stream, send `frame`, await the correlated response.

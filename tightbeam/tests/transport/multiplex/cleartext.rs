@@ -8,7 +8,7 @@ use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::handshake::negotiation::MuxSettings;
 use tightbeam::transport::multiplex::MuxRole;
@@ -117,7 +117,7 @@ tb_process_spec! {
 // open/cancel pairs answered with GoAway(EnhanceYourCalm).
 tb_scenario! {
 	name: mux_cleartext_cancel_budget,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MuxCleartextCancelBudgetSpec::latest())
 		.with_csp(MuxCleartextCancelBudgetProcess)
 		.build(),

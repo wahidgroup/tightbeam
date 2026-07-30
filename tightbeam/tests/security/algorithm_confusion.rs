@@ -33,7 +33,7 @@ use tightbeam::{
 	exactly, job,
 	oids::{AES_256_GCM, SIGNER_ECDSA_WITH_SHA3_256},
 	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ScenarioConf, SetupEnv},
+	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	utils::urn::Urn,
 	TightBeamError,
@@ -71,7 +71,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: algorithm_confusion,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(AlgorithmConfusionSpec::latest())
 		.with_csp(AlgorithmConfusionProcess)
 		.build(),

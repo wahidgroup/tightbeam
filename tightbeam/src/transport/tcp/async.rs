@@ -1213,7 +1213,7 @@ mod tests {
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	use crate::policy::{SessionContext, TransitStatus};
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
-	use crate::transport::policy::PolicyConf;
+	use crate::transport::policy::PolicyConfig;
 
 	#[cfg(all(feature = "x509", feature = "aead"))]
 	mod cipher_install {

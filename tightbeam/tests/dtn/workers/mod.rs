@@ -14,10 +14,10 @@ pub mod telemetry_builder;
 
 pub use command_ack_handler::CommandAckHandlerWorker;
 pub use command_execution::CommandExecutionWorker;
-pub use frame_request_handler::{FrameRequestHandlerWorker, FrameRequestHandlerWorkerConf};
-pub use frame_response_handler::{FrameResponseHandlerWorker, FrameResponseHandlerWorkerConf};
+pub use frame_request_handler::{FrameRequestHandlerWorker, FrameRequestHandlerWorkerConfig};
+pub use frame_response_handler::{FrameResponseHandlerWorker, FrameResponseHandlerWorkerConfig};
 pub use mission_control_telemetry_handler::{
-	MissionControlTelemetryHandlerWorker, MissionControlTelemetryHandlerWorkerConf,
+	MissionControlTelemetryHandlerWorker, MissionControlTelemetryHandlerWorkerConfig,
 };
-pub use rover_command_handler::{RoverCommandHandlerWorker, RoverCommandHandlerWorkerConf};
-pub use telemetry_builder::{TelemetryBuilderWorker, TelemetryBuilderWorkerConf};
+pub use rover_command_handler::{RoverCommandHandlerWorker, RoverCommandHandlerWorkerConfig};
+pub use telemetry_builder::{TelemetryBuilderWorker, TelemetryBuilderWorkerConfig};

@@ -17,7 +17,7 @@
 //!
 //! Fresh keys per direction from the epoch KDF chain
 //! ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)
-//! analog with an explicit exchange); the prior epoch secret drops the
+//! with an explicit exchange); the prior epoch secret drops the
 //! moment the next one installs
 //! ([RFC 9846 § 7.2](https://datatracker.ietf.org/doc/html/rfc9846#section-7.2)).
 //!

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ScenarioConf, SetupEnv},
+	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	utils::urn::Urn,
 	TightBeamError,
@@ -87,7 +87,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: replay_attack,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(ReplayAttackSpec::latest())
 		.with_csp(ReplayAttackProcess)
 		.build(),

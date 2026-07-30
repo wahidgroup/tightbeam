@@ -23,7 +23,7 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::{create_v0_tightbeam, ClientEnv, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::policy::PolicyConf;
+use tightbeam::transport::policy::PolicyConfig;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{
 	ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, TransportError, TransportFailure,

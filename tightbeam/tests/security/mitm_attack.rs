@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ScenarioConf, SetupEnv},
+	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::HandshakeError,
 	utils::urn::Urn,
@@ -93,7 +93,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: mitm_attack,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MitmAttackSpec::latest())
 		.with_csp(MitmAttackProcess)
 		.build(),

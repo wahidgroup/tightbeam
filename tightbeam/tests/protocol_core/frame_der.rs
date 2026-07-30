@@ -5,7 +5,7 @@ use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid, Key, KeyInit};
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::prelude::*;
-use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
@@ -121,7 +121,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: frame_der_roundtrip,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_specs(vec![
 			FrameDerSpec::get(1, 0, 0).expect("FrameDerSpec 1.0.0")
 		])

@@ -291,7 +291,7 @@ where
 ///
 /// Top-level keys:
 /// - `name:` test function name (omit with `fuzz: afl`)
-/// - `spec:` AssertSpec type (latest version) or `config:` ScenarioConf
+/// - `spec:` AssertSpec type (latest version) or `config:` ScenarioConfig
 /// - `fuzz: afl` optional AFL target (Bare/Servlet, needs testing-csp)
 ///
 /// Environment-block keys:
@@ -316,7 +316,7 @@ macro_rules! tb_scenario {
 	) => {
 		$crate::tb_scenario! {
 			name: $test_name,
-			config: $crate::testing::ScenarioConf::builder().with_spec(<$spec>::latest()).build(),
+			config: $crate::testing::ScenarioConfig::builder().with_spec(<$spec>::latest()).build(),
 			$($rest)*
 		}
 	};
@@ -329,7 +329,7 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario! {
 			fuzz: afl,
 			csp: $csp_type,
-			config: $crate::testing::ScenarioConf::builder().with_spec(<$spec>::latest()).build(),
+			config: $crate::testing::ScenarioConfig::builder().with_spec(<$spec>::latest()).build(),
 			$($rest)*
 		}
 	};
@@ -1052,7 +1052,7 @@ mod tests {
 
 	use crate::testing::specs::assert::TBSpec;
 	use crate::testing::specs::csp::{CspValidationResult, CspViolation, Event, Process, ProcessSpec, State};
-	use crate::testing::{HookContext, ScenarioConf, TestHooks};
+	use crate::testing::{HookContext, ScenarioConfig, TestHooks};
 	use crate::trace::ConsumedTrace;
 
 	struct AlwaysInvalidSpec;
@@ -1089,7 +1089,7 @@ mod tests {
 			})),
 		};
 
-		let config = ScenarioConf::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build();
+		let config = ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build();
 		let hook_ctx = HookContext::new(ConsumedTrace::new());
 		let outcome = catch_unwind(AssertUnwindSafe(|| {
 			crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, Ok::<(), core::fmt::Error>(()));

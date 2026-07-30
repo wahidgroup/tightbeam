@@ -192,7 +192,7 @@ pub(super) enum PeerStream {
 }
 
 /// Sender-side flow-control ledger for one stream direction (QUIC
-/// MAX_STREAM_DATA analog,
+/// MAX_STREAM_DATA,
 /// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
 /// Requests and responses on the same stream never collide here: an
 /// endpoint sends request chunks only on IDs it allocated and response

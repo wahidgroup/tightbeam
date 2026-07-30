@@ -66,7 +66,7 @@ macro_rules! cluster {
 		$($vis)* struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
 			servlet_registry: ::std::sync::Arc<$crate::colony::cluster::ServletRegistry>,
-			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
+			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConfig>,
 			pool: ::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>,
 			peer_pool: ::core::option::Option<::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>>,
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
@@ -89,7 +89,7 @@ macro_rules! cluster {
 
 			async fn start(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-				config: $crate::colony::cluster::ClusterConf,
+				config: $crate::colony::cluster::ClusterConfig,
 			) -> Result<Self, $crate::TightBeamError> {
 				use $crate::transport::Protocol;
 
@@ -359,7 +359,7 @@ macro_rules! cluster {
 				&self.registry
 			}
 
-			fn heartbeat_config(&self) -> &$crate::colony::cluster::HeartbeatConf {
+			fn heartbeat_config(&self) -> &$crate::colony::cluster::HeartbeatConfig {
 				&self.config.heartbeat
 			}
 
@@ -582,21 +582,25 @@ macro_rules! cluster {
 			// rolls the hive entry back so no half-registered state lingers.
 			//
 			// The announced slate REPLACES any prior rows for this hive:
-			// re-registration is the reconciliation primitive.
+			// re-registration is the reconciliation primitive. The gated
+			// reconcile serializes the install with peer-ad conflict
+			// probes, so a local route cannot land inside a peer ad's
+			// probe-to-install window and then be clobbered by peer rows.
 			let registered = $registry.register_with_signer(request, signer_id).and_then(|()| {
-				let _ = $servlet_registry.remove_by_hive(&hive_addr);
-				servlet_info
+				let slate: ::std::vec::Vec<$crate::colony::cluster::ServletEntry> = servlet_info
 					.iter()
-					.try_for_each(|(servlet_type, servlet_addr)| {
-						let entry = $crate::colony::cluster::ServletEntry::new(
+					.map(|(servlet_type, servlet_addr)| {
+						$crate::colony::cluster::ServletEntry::new(
 							::std::sync::Arc::clone(servlet_addr),  // Actual servlet address!
 							::std::sync::Arc::clone(servlet_type),
 							::std::sync::Arc::clone(&hive_addr),
 							$config.pheromone.initial_pheromone,
 							$config.pheromone.abandonment_limit,
-						);
-						$servlet_registry.add(entry)
+						)
 					})
+					.collect();
+				$servlet_registry
+					.reconcile_by_hive(&hive_addr, slate)
 					.inspect_err(|_| {
 						let _ = $registry.unregister(&hive_addr);
 						let _ = $servlet_registry.remove_by_hive(&hive_addr);
@@ -1252,7 +1256,7 @@ macro_rules! cluster {
 		// plus decremented radius bound propagation. A gateway with no
 		// peers skips the task entirely: the reflood signature is the
 		// costly step and would fan out to nobody.
-		if hop_ttl > 0 && !$config.peers.is_empty() {
+		if hop_ttl > 0 && !$config.peer.peers.is_empty() {
 			let reflood_pool = $crate::cluster!(@peer_dial_pool $peer_pool, $pool);
 			let config = ::std::sync::Arc::clone(&$config);
 			let reflood_rumor = rumor.clone();
@@ -1350,7 +1354,7 @@ macro_rules! cluster {
 			};
 
 			let mut fanout = ::tokio::task::JoinSet::new();
-			for peer in $config.peers.iter() {
+			for peer in $config.peer.peers.iter() {
 				let ::core::result::Result::Ok(peer_addr) = peer.parse() else {
 					continue;
 				};
@@ -1782,7 +1786,7 @@ macro_rules! cluster {
 		let trace = $trace;
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
-			let Some(interval) = config.advertise_interval else { return };
+			let Some(interval) = config.peer.advertise_interval else { return };
 
 			// Per-peer push ledger for grey-hole detection: digests each
 			// peer acknowledged with `Ok` during anti-entropy repair. Loop
@@ -1826,7 +1830,7 @@ macro_rules! cluster {
 					}
 				}
 
-				if config.peers.is_empty() {
+				if config.peer.peers.is_empty() {
 					continue;
 				}
 
@@ -1839,7 +1843,7 @@ macro_rules! cluster {
 					.take($crate::constants::MAX_ADVERTISED_TYPES)
 					.collect();
 
-				for peer in config.peers.iter() {
+				for peer in config.peer.peers.iter() {
 					let Ok(peer_addr) = peer.parse() else { continue };
 					let _ = $crate::cluster!(
 						@send_advertisement_async pool, config, peer_addr, gateway_addr.clone(), slate.clone(), $digest

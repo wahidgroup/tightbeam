@@ -132,7 +132,7 @@ tb_process_spec! {
 tb_scenario! {
 	fuzz: afl,
 	csp: VerificationProcess,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(VerificationSpec::latest())
 		.with_csp(VerificationProcess)
 		.build(),

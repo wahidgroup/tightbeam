@@ -32,7 +32,7 @@ use crate::router::RouterError;
 use crate::trace::TraceCollector;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
-use crate::transport::policy::PolicyConf;
+use crate::transport::policy::PolicyConfig;
 use crate::transport::serve::{unimplemented_error, MuxService};
 use crate::transport::AsyncListenerTrait;
 use crate::transport::Protocol;
@@ -212,7 +212,7 @@ pub fn prepare_typed_frame(frame: &mut Frame, ctx: &ServletContext) -> Result<()
 
 /// Configuration for a servlet, containing x509, application config, and workers
 #[cfg(feature = "x509")]
-pub struct ServletConf<P, M, C: CryptoProvider = DefaultCryptoProvider>
+pub struct ServletConfig<P, M, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P: Protocol,
 	M: Message,
@@ -232,7 +232,7 @@ where
 
 /// Configuration for a servlet, containing application config and workers
 #[cfg(not(feature = "x509"))]
-pub struct ServletConf<P, M>
+pub struct ServletConfig<P, M>
 where
 	P: Protocol,
 	M: Message,
@@ -248,9 +248,9 @@ where
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 }
 
-/// Builder for ServletConf
+/// Builder for ServletConfig
 #[cfg(feature = "x509")]
-pub struct ServletConfBuilder<P, M, C: CryptoProvider = DefaultCryptoProvider>
+pub struct ServletConfigBuilder<P, M, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P: Protocol,
 	M: Message,
@@ -266,9 +266,9 @@ where
 	_phantom: PhantomData<(P, M, C)>,
 }
 
-/// Builder for ServletConf
+/// Builder for ServletConfig
 #[cfg(not(feature = "x509"))]
-pub struct ServletConfBuilder<P, M>
+pub struct ServletConfigBuilder<P, M>
 where
 	P: Protocol,
 	M: Message,
@@ -284,15 +284,15 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl<P, M, C> ServletConf<P, M, C>
+impl<P, M, C> ServletConfig<P, M, C>
 where
 	P: Protocol,
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Create a new ServletConf builder
-	pub fn builder() -> ServletConfBuilder<P, M, C> {
-		ServletConfBuilder::default()
+	/// Create a new ServletConfig builder
+	pub fn builder() -> ServletConfigBuilder<P, M, C> {
+		ServletConfigBuilder::default()
 	}
 
 	/// Get a worker by name (downcasted to the specific type)
@@ -352,14 +352,14 @@ where
 }
 
 #[cfg(not(feature = "x509"))]
-impl<P, M> ServletConf<P, M>
+impl<P, M> ServletConfig<P, M>
 where
 	P: Protocol,
 	M: Message,
 {
-	/// Create a new ServletConf builder
-	pub fn builder() -> ServletConfBuilder<P, M> {
-		ServletConfBuilder::default()
+	/// Create a new ServletConfig builder
+	pub fn builder() -> ServletConfigBuilder<P, M> {
+		ServletConfigBuilder::default()
 	}
 
 	/// Get a worker by name (downcasted to the specific type)
@@ -414,7 +414,7 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl<P, M, C> Default for ServletConf<P, M, C>
+impl<P, M, C> Default for ServletConfig<P, M, C>
 where
 	P: Protocol,
 	M: Message,
@@ -438,7 +438,7 @@ where
 }
 
 #[cfg(not(feature = "x509"))]
-impl<P, M> Default for ServletConf<P, M>
+impl<P, M> Default for ServletConfig<P, M>
 where
 	P: Protocol,
 	M: Message,
@@ -459,7 +459,7 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl<P, M, C> Default for ServletConfBuilder<P, M, C>
+impl<P, M, C> Default for ServletConfigBuilder<P, M, C>
 where
 	P: Protocol,
 	M: Message,
@@ -481,7 +481,7 @@ where
 }
 
 #[cfg(not(feature = "x509"))]
-impl<P, M> Default for ServletConfBuilder<P, M>
+impl<P, M> Default for ServletConfigBuilder<P, M>
 where
 	P: Protocol,
 	M: Message,
@@ -501,7 +501,7 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl<P, M, C> ServletConfBuilder<P, M, C>
+impl<P, M, C> ServletConfigBuilder<P, M, C>
 where
 	P: Protocol,
 	M: Message,
@@ -593,9 +593,9 @@ where
 		self
 	}
 
-	/// Build the final ServletConf
-	pub fn build(self) -> ServletConf<P, M, C> {
-		ServletConf {
+	/// Build the final ServletConfig
+	pub fn build(self) -> ServletConfig<P, M, C> {
+		ServletConfig {
 			_protocol: PhantomData,
 			_message: PhantomData,
 			_crypto: PhantomData,
@@ -612,7 +612,7 @@ where
 }
 
 #[cfg(not(feature = "x509"))]
-impl<P, M> ServletConfBuilder<P, M>
+impl<P, M> ServletConfigBuilder<P, M>
 where
 	P: Protocol,
 	M: Message,
@@ -680,9 +680,9 @@ where
 		self
 	}
 
-	/// Build the final ServletConf
-	pub fn build(self) -> ServletConf<P, M> {
-		ServletConf {
+	/// Build the final ServletConfig
+	pub fn build(self) -> ServletConfig<P, M> {
+		ServletConfig {
 			_protocol: PhantomData,
 			_message: PhantomData,
 			mux_offer: self.mux_offer,
@@ -705,7 +705,7 @@ where
 /// The servlet is generic over the input message type `I` that it processes.
 /// All workers in a servlet must share the same input type.
 pub trait Servlet<I> {
-	/// Configuration type for this servlet (use ServletConf)
+	/// Configuration type for this servlet (use ServletConfig)
 	type Conf;
 
 	/// Address type for this servlet (protocol-specific)
@@ -741,7 +741,7 @@ pub trait Servlet<I> {
 
 /// The interactions one servlet answers, one method per stream kind.
 ///
-/// The servlet analog of [`MuxService`]: every method receives the
+/// The servlet equivalent of [`MuxService`]: every method receives the
 /// servlet's runtime context (workers, env config, decryptor/inflator,
 /// hive link) instead of the transport session, because servlet handlers
 /// are context-blind by design. Unimplemented kinds refuse with
@@ -943,7 +943,7 @@ pub fn serve_servlet<L, S>(
 ) -> rt::JoinHandle
 where
 	L: AsyncListenerTrait + Sync + 'static,
-	L::Transport: AcceptedConnection + PolicyConf + MuxCapable + 'static,
+	L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 	S: ServletService,
 {
 	let service = Arc::new(ContextService { service: Arc::new(service), ctx });

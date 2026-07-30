@@ -28,7 +28,7 @@ pub(crate) const CLIENT_CERT_REJECTED: Urn<'static> = Urn::new("test", "event:mu
 pub(crate) const SERVER_CERT_REJECTED: Urn<'static> = Urn::new("test", "event:mutual-auth/server-cert-rejected");
 use tightbeam::{
 	at_least,
-	colony::servlet::ServletConf,
+	colony::servlet::ServletConfig,
 	compose,
 	crypto::{
 		hash::Sha3_256,
@@ -169,7 +169,7 @@ tb_scenario! {
 	environment Servlet {
 		start: |env| async move {
 			let trace = Arc::new(env.trace);
-			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
 				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
@@ -255,7 +255,7 @@ tb_scenario! {
 	environment Servlet {
 		start: |env| async move {
 			let trace = Arc::new(env.trace);
-			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
 				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
@@ -325,7 +325,7 @@ tb_scenario! {
 
 			let certificate = CertificateSpec::Built(Box::new(invalid_server_cert));
 			let provider = Arc::new(Secp256k1KeyProvider::from(invalid_server_key));
-			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
 				.with_certificate(certificate, provider, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();

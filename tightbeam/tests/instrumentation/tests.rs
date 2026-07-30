@@ -4,7 +4,7 @@
 
 #![cfg(all(feature = "instrument", feature = "tokio", feature = "tcp", feature = "testing"))]
 
-use tightbeam::testing::{create_test_message, ClientEnv, ScenarioConf, SetupEnv};
+use tightbeam::testing::{create_test_message, ClientEnv, ScenarioConfig, SetupEnv};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{MessageEmitter, Protocol};
@@ -115,7 +115,7 @@ mod sink {
 
 tb_scenario! {
 	name: test_auto_instrumentation_capture,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(AutoInstrSpec::latest())
 		.with_csp(MessageFlowProc)
 		.build(),

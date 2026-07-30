@@ -178,17 +178,17 @@ pub(crate) fn create_invalid_move_response(id: Vec<u8>, order: u64) -> Result<Fr
 	}
 }
 
-pub struct ChessEngineServletConf {
+pub struct ChessEngineServletConfig {
 	pub manager: ChessMatchManager,
 }
 
 servlet! {
 	/// Chess engine servlet for processing chess moves
-	pub ChessEngineServlet<ChessMoveRequest, EnvConfig = ChessEngineServletConf>,
+	pub ChessEngineServlet<ChessMoveRequest, EnvConfig = ChessEngineServletConfig>,
 	protocol: TokioListener,
 	handle: raw |message, ctx| async move {
 		let trace = ctx.trace();
-		let config: &ChessEngineServletConf = ctx.env_config()?;
+		let config: &ChessEngineServletConfig = ctx.env_config()?;
 		let message_id = message.metadata.id.clone();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {

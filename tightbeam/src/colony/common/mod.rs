@@ -69,7 +69,7 @@ const DEFAULT_REPELLENCY_THRESHOLD: u64 = (MAX_PHEROMONE * 4) / 5;
 /// Instance-selection strategy for distributing work across instances of
 /// one servlet type.
 ///
-/// Object-safe so a [`ClusterConf`](crate::colony::cluster::ClusterConf)
+/// Object-safe so a [`ClusterConfig`](crate::colony::cluster::ClusterConfig)
 /// carries any strategy as `Arc<dyn LoadBalancer>`, defaulting to
 /// [`StochasticForager`] the way crypto config defaults to a provider.
 pub trait LoadBalancer: Send + Sync {
@@ -81,7 +81,7 @@ pub trait LoadBalancer: Send + Sync {
 /// stream even when constructed within the same millisecond.
 static BALANCER_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Seed drawn from the shared sequence, decorrelated from wall-clock so
+/// Seed drawn from the shared sequence, decorrelated from clock time so
 /// balancers built in the same instant still diverge.
 fn fresh_seed() -> u64 {
 	let sequence = BALANCER_SEED_SEQUENCE.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed);

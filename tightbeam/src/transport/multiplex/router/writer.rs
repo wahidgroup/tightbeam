@@ -339,8 +339,8 @@ where
 		Ok(())
 	}
 
-	/// [RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5)
-	/// analog: act before the send cipher reaches its record limit.
+	/// [RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5):
+	/// act before the send cipher reaches its record limit.
 	///
 	/// A client with rekey materials opens an in-band renewal at a
 	/// headroom above the drain threshold ([`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]

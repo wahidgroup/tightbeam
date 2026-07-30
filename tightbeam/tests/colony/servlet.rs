@@ -1,9 +1,9 @@
-//! Simple servlet test for ServletConf pattern with workers
+//! Simple servlet test for ServletConfig pattern with workers
 
 use std::sync::Arc;
 
 use tightbeam::{
-	colony::servlet::ServletConf,
+	colony::servlet::ServletConfig,
 	compose,
 	compress::ZstdCompression,
 	crypto::{
@@ -81,7 +81,7 @@ worker! {
 
 // Define the servlet's environment config
 #[derive(Clone)]
-pub struct CalcServletConf {
+pub struct CalcServletConfig {
 	pub squarer_offset: u32,
 	pub final_multiplier: u32,
 	pub value: u32,
@@ -89,11 +89,11 @@ pub struct CalcServletConf {
 
 servlet! {
 	/// Simple test servlet that USES config and workers
-	pub CalcServlet<CalcRequest, EnvConfig = CalcServletConf>,
+	pub CalcServlet<CalcRequest, EnvConfig = CalcServletConfig>,
 	protocol: TokioListener,
 	handle: |request, frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &CalcServletConf = ctx.env_config()?;
+		let config: &CalcServletConfig = ctx.env_config()?;
 
 		trace.event(SERVLET_RECEIVE)?;
 
@@ -145,7 +145,7 @@ tb_scenario! {
 	name: test_servlet_conf_with_workers,
 	spec: CalcServletSpec,
 	environment Servlet {
-		context: CalcServletConf {
+		context: CalcServletConfig {
 			squarer_offset: 10,
 			final_multiplier: 3,
 			value: 5,
@@ -153,11 +153,11 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: config }| async move {
 			let trace = Arc::new(trace);
 			let doubler = DoublerWorker::new(());
-			let squarer = SquarerWorker::new(SquarerWorkerConf {
+			let squarer = SquarerWorker::new(SquarerWorkerConfig {
 				add_offset: config.squarer_offset
 			});
 
-			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
 				.with_worker(doubler)
 				.with_worker(squarer)
@@ -222,7 +222,7 @@ servlet! {
 	/// verified by the collector gate, then decrypted and decompressed in
 	/// place by the capabilities configured via `with_message_decryptor` and
 	/// `with_message_inflator`
-	pub SecureCalcServlet<CalcRequest, EnvConfig = CalcServletConf>,
+	pub SecureCalcServlet<CalcRequest, EnvConfig = CalcServletConfig>,
 	protocol: TokioListener,
 	handle: |request, frame, ctx| async move {
 		let trace = ctx.trace();
@@ -257,7 +257,7 @@ tb_scenario! {
 	name: test_typed_servlet_full_feature_stack,
 	spec: SecureCalcServletSpec,
 	environment Servlet {
-		context: CalcServletConf {
+		context: CalcServletConfig {
 			squarer_offset: 0,
 			final_multiplier: 1,
 			value: 7,
@@ -265,7 +265,7 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: config }| async move {
 			let trace = Arc::new(trace);
 			let verifying_key = *create_test_signing_key().verifying_key();
-			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
 				.with_collector_gate(SignatureGate { verifying_key })
 				.with_message_decryptor(shared_cipher())

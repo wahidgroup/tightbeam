@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tightbeam::{
 	crypto::x509::policy::{CertificateValidation, DirectTrustValidator},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ScenarioConf, SetupEnv},
+	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	utils::urn::Urn,
 	TightBeamError,
@@ -64,7 +64,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: certificate_trust,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(CertificateTrustSpec::latest())
 		.with_csp(CertificateTrustProcess)
 		.build(),

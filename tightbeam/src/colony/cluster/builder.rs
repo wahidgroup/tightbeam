@@ -4,10 +4,10 @@ use core::time::Duration;
 use std::sync::Arc;
 
 #[cfg(feature = "x509")]
-use super::{cert_colony_urn, GossipAdmission, GossipConf};
+use super::{cert_colony_urn, GossipAdmission, GossipConfig};
 use super::{
-	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-	DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
+	ClusterConfig, ClusterTlsConfig, HeartbeatCallback, HeartbeatConfig, PeerConfig, PheromoneConfig,
+	DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
 use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
 #[cfg(feature = "x509")]
@@ -18,11 +18,11 @@ use crate::transport::client::pool::PoolConfig;
 use crate::utils::urn::Urn;
 
 // ============================================================================
-// HeartbeatConfBuilder
+// HeartbeatConfigBuilder
 // ============================================================================
 
-/// Builder for HeartbeatConf
-pub struct HeartbeatConfBuilder {
+/// Builder for HeartbeatConfig
+pub struct HeartbeatConfigBuilder {
 	interval: Duration,
 	timeout: Duration,
 	max_concurrent: usize,
@@ -30,7 +30,7 @@ pub struct HeartbeatConfBuilder {
 	on_heartbeat: Option<HeartbeatCallback>,
 }
 
-impl Default for HeartbeatConfBuilder {
+impl Default for HeartbeatConfigBuilder {
 	fn default() -> Self {
 		Self {
 			interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
@@ -42,14 +42,14 @@ impl Default for HeartbeatConfBuilder {
 	}
 }
 
-impl HeartbeatConf {
-	/// Create a builder for HeartbeatConf
-	pub fn builder() -> HeartbeatConfBuilder {
-		HeartbeatConfBuilder::default()
+impl HeartbeatConfig {
+	/// Create a builder for HeartbeatConfig
+	pub fn builder() -> HeartbeatConfigBuilder {
+		HeartbeatConfigBuilder::default()
 	}
 }
 
-impl HeartbeatConfBuilder {
+impl HeartbeatConfigBuilder {
 	/// Set the interval between heartbeat checks
 	pub fn with_interval(mut self, interval: Duration) -> Self {
 		self.interval = interval;
@@ -80,9 +80,9 @@ impl HeartbeatConfBuilder {
 		self
 	}
 
-	/// Build the HeartbeatConf
-	pub fn build(self) -> HeartbeatConf {
-		HeartbeatConf {
+	/// Build the HeartbeatConfig
+	pub fn build(self) -> HeartbeatConfig {
+		HeartbeatConfig {
 			interval: self.interval,
 			timeout: self.timeout,
 			max_concurrent: self.max_concurrent,
@@ -93,59 +93,55 @@ impl HeartbeatConfBuilder {
 }
 
 // ============================================================================
-// ClusterConfBuilder
+// ClusterConfigBuilder
 // ============================================================================
 
-/// Builder for ClusterConf
+/// Builder for ClusterConfig
 #[cfg(feature = "x509")]
-pub struct ClusterConfBuilder {
+pub struct ClusterConfigBuilder {
 	namespace: ColonyNamespace,
 	load_balancer: Arc<dyn LoadBalancer>,
-	heartbeat: HeartbeatConf,
-	pheromone: PheromoneConf,
+	heartbeat: HeartbeatConfig,
+	pheromone: PheromoneConfig,
 	policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pool_config: PoolConfig,
 	control_freshness_window_ms: u64,
 	bind_addr: Option<String>,
-	peers: Vec<String>,
-	advertise_interval: Option<Duration>,
-	peer_dial_allowlist: Option<Vec<String>>,
-	gossip: GossipConf,
+	peer: PeerConfig,
+	gossip: GossipConfig,
 	tls: ClusterTlsConfig,
 }
 
 #[cfg(feature = "x509")]
-impl ClusterConf {
-	/// Create a builder for ClusterConf
-	pub fn builder(tls: ClusterTlsConfig) -> ClusterConfBuilder {
-		ClusterConfBuilder {
+impl ClusterConfig {
+	/// Create a builder for ClusterConfig
+	pub fn builder(tls: ClusterTlsConfig) -> ClusterConfigBuilder {
+		ClusterConfigBuilder {
 			namespace: ColonyNamespace::default(),
 			load_balancer: Arc::new(StochasticForager::default()),
-			heartbeat: HeartbeatConf::default(),
-			pheromone: PheromoneConf::default(),
+			heartbeat: HeartbeatConfig::default(),
+			pheromone: PheromoneConfig::default(),
 			policies: Vec::new(),
 			pool_config: PoolConfig::default(),
 			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			bind_addr: None,
-			peers: Vec::new(),
-			advertise_interval: None,
-			peer_dial_allowlist: None,
-			gossip: GossipConf::default(),
+			peer: PeerConfig::default(),
+			gossip: GossipConfig::default(),
 			tls,
 		}
 	}
 }
 
 #[cfg(feature = "x509")]
-impl ClusterConfBuilder {
+impl ClusterConfigBuilder {
 	/// Set the heartbeat configuration
-	pub fn with_heartbeat_config(mut self, config: HeartbeatConf) -> Self {
+	pub fn with_heartbeat_config(mut self, config: HeartbeatConfig) -> Self {
 		self.heartbeat = config;
 		self
 	}
 
 	/// Set the pheromone configuration for bio-inspired routing
-	pub fn with_pheromone_config(mut self, config: PheromoneConf) -> Self {
+	pub fn with_pheromone_config(mut self, config: PheromoneConfig) -> Self {
 		self.pheromone = config;
 		self
 	}
@@ -187,33 +183,39 @@ impl ClusterConfBuilder {
 		self
 	}
 
+	/// Set peer-federation configuration (dial list, beat, allowlist)
+	pub fn with_peer_config(mut self, config: PeerConfig) -> Self {
+		self.peer = config;
+		self
+	}
+
 	/// Set the peer gateways this gateway advertises its exported types to
 	pub fn with_peers(mut self, peers: impl IntoIterator<Item = String>) -> Self {
-		self.peers = peers.into_iter().collect();
+		self.peer.peers = peers.into_iter().collect();
 		self
 	}
 
 	/// Set the re-advertise beat cadence (enables the advertise beat)
 	pub fn with_advertise_interval(mut self, interval: Duration) -> Self {
-		self.advertise_interval = Some(interval);
+		self.peer.advertise_interval = Some(interval);
 		self
 	}
 
 	/// Restrict claimed peer dial addresses to this exact-match allowlist
 	pub fn with_peer_dial_allowlist(mut self, allowlist: impl IntoIterator<Item = String>) -> Self {
-		self.peer_dial_allowlist = Some(allowlist.into_iter().collect());
+		self.peer.peer_dial_allowlist = Some(allowlist.into_iter().collect());
 		self
 	}
 
 	/// Set the gossip subsystem configuration (freshness/ttl/retention +
-	/// journal); defaults to [`GossipConf::default`]
-	pub fn with_gossip_config(mut self, config: GossipConf) -> Self {
+	/// journal); defaults to [`GossipConfig::default`]
+	pub fn with_gossip_config(mut self, config: GossipConfig) -> Self {
 		self.gossip = config;
 		self
 	}
 
 	/// Set the per-signer gossip rate admission.
-	/// Defaults to the token bucket in [`GossipConf::default`].
+	/// Defaults to the token bucket in [`GossipConfig::default`].
 	pub fn with_gossip_admission(mut self, admission: Arc<dyn GossipAdmission>) -> Self {
 		self.gossip.admission = admission;
 		self
@@ -226,8 +228,8 @@ impl ClusterConfBuilder {
 		self
 	}
 
-	/// Build the ClusterConf
-	pub fn build(self) -> ClusterConf {
+	/// Build the ClusterConfig
+	pub fn build(self) -> ClusterConfig {
 		// Colony membership is derived from the certificate exactly once:
 		// the colony URN binds to the cert's URI SAN, and every per-frame
 		// membership check compares against this cached value. A cert
@@ -237,7 +239,7 @@ impl ClusterConfBuilder {
 			.ok()
 			.and_then(|cert| cert_colony_urn(&self.namespace, &cert));
 
-		ClusterConf {
+		ClusterConfig {
 			namespace: self.namespace,
 			load_balancer: self.load_balancer,
 			heartbeat: self.heartbeat,
@@ -246,9 +248,7 @@ impl ClusterConfBuilder {
 			pool_config: self.pool_config,
 			control_freshness_window_ms: self.control_freshness_window_ms,
 			bind_addr: self.bind_addr,
-			peers: self.peers,
-			advertise_interval: self.advertise_interval,
-			peer_dial_allowlist: self.peer_dial_allowlist,
+			peer: self.peer,
 			gossip: self.gossip,
 			colony_urn,
 			tls: self.tls,

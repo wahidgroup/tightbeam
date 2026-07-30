@@ -27,15 +27,15 @@ pub mod peer;
 pub mod gossip;
 
 // Re-export submodule types
-pub use builder::{ClusterConfBuilder, HeartbeatConfBuilder};
+pub use builder::{ClusterConfigBuilder, HeartbeatConfigBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
-pub use servlet_registry::{PeerCaps, PeerRouteInfo, PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
+pub use servlet_registry::{PeerCaps, PeerRouteInfo, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry};
 
 #[cfg(feature = "x509")]
 pub use gossip::{
 	gossip_digest, gossip_fresh, gossip_want, signer_attribution, wanted_digests, Admission, AdmittedGossip,
-	GossipAdmission, GossipConf, GossipDigest, GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
+	GossipAdmission, GossipConfig, GossipDigest, GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
 };
 
 #[cfg(feature = "x509")]
@@ -73,7 +73,7 @@ pub(crate) const DEFAULT_MAX_FAILURES: u32 = 3;
 /// Retry semantics are expressed through `interval` (cadence) and
 /// `max_failures` (tolerance): a failed heartbeat is retried on the next
 /// cycle rather than through a separate retry policy.
-pub struct HeartbeatConf {
+pub struct HeartbeatConfig {
 	/// Interval between heartbeat checks
 	pub interval: Duration,
 	/// Timeout before evicting unresponsive hives
@@ -86,7 +86,7 @@ pub struct HeartbeatConf {
 	pub on_heartbeat: Option<HeartbeatCallback>,
 }
 
-impl Default for HeartbeatConf {
+impl Default for HeartbeatConfig {
 	fn default() -> Self {
 		Self {
 			interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
@@ -98,9 +98,9 @@ impl Default for HeartbeatConf {
 	}
 }
 
-impl core::fmt::Debug for HeartbeatConf {
+impl core::fmt::Debug for HeartbeatConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		f.debug_struct("HeartbeatConf")
+		f.debug_struct("HeartbeatConfig")
 			.field("interval", &self.interval)
 			.field("timeout", &self.timeout)
 			.field("max_concurrent", &self.max_concurrent)
@@ -110,7 +110,7 @@ impl core::fmt::Debug for HeartbeatConf {
 	}
 }
 
-impl HeartbeatConf {
+impl HeartbeatConfig {
 	/// Add a callback to be invoked on each heartbeat result
 	pub fn with_callback(mut self, callback: HeartbeatCallback) -> Self {
 		self.on_heartbeat = Some(callback);
@@ -198,38 +198,12 @@ impl core::fmt::Debug for ClusterTlsConfig {
 	}
 }
 
-/// Configuration for clusters
+/// Peer-federation dial and advertisement policy
 ///
-/// Contains settings for load balancing, health checks, gateway policies,
-/// and cryptographic signing for cluster -> hive communication.
-///
-/// # Type Parameters
-/// The balancer is stored as `Arc<dyn LoadBalancer>` so any strategy is
-/// pluggable at runtime, defaulting to
-/// [`StochasticForager`](crate::colony::common::StochasticForager).
-pub struct ClusterConf {
-	/// Naming scope inbound resource URNs are validated against.
-	/// Registrations, address updates, and work requests carrying a
-	/// foreign authority or realm are refused at the gateway.
-	pub namespace: ColonyNamespace,
-	/// Load balancing strategy for distributing work across hives
-	pub load_balancer: Arc<dyn LoadBalancer>,
-	/// Heartbeat configuration
-	pub heartbeat: HeartbeatConf,
-	/// Pheromone configuration for bio-inspired routing
-	pub pheromone: PheromoneConf,
-	/// Gate policies for the gateway (rate limiting, auth, etc.)
-	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	/// Connection pool configuration for hive connections
-	pub pool_config: PoolConfig,
-	/// Freshness window in milliseconds for signed hive control frames
-	/// (registration, address updates); stale or replayed frames inside
-	/// the window are rejected (CWE-294)
-	pub control_freshness_window_ms: u64,
-	/// Gateway bind address, parsed via the protocol address's `FromStr`.
-	/// `None` binds the protocol default. A stable address lets hives
-	/// re-register through gateway restarts without reconfiguration.
-	pub bind_addr: Option<String>,
+/// Outbound peer dials, the re-advertise beat, and the optional inbound
+/// dial-address allowlist. Trust anchors stay on [`ClusterTlsConfig::peer_trust`].
+#[derive(Clone, Debug)]
+pub struct PeerConfig {
 	/// Peer gateway addresses this gateway dials to advertise its exported
 	/// types. A dial-list, not an identity gate: a partial or asymmetric peer
 	/// graph is expected. Empty disables outbound advertisement.
@@ -242,9 +216,51 @@ pub struct ClusterConf {
 	/// When `Some`, inbound peer ads may only claim dial addresses in this
 	/// list (exact string match). `None` accepts any parseable socket.
 	pub peer_dial_allowlist: Option<Vec<String>>,
+}
+
+impl Default for PeerConfig {
+	fn default() -> Self {
+		Self { peers: Vec::new(), advertise_interval: None, peer_dial_allowlist: None }
+	}
+}
+
+/// Configuration for clusters
+///
+/// Contains settings for load balancing, health checks, gateway policies,
+/// and cryptographic signing for cluster -> hive communication.
+///
+/// # Type Parameters
+/// The balancer is stored as `Arc<dyn LoadBalancer>` so any strategy is
+/// pluggable at runtime, defaulting to
+/// [`StochasticForager`](crate::colony::common::StochasticForager).
+pub struct ClusterConfig {
+	/// Naming scope inbound resource URNs are validated against.
+	/// Registrations, address updates, and work requests carrying a
+	/// foreign authority or realm are refused at the gateway.
+	pub namespace: ColonyNamespace,
+	/// Load balancing strategy for distributing work across hives
+	pub load_balancer: Arc<dyn LoadBalancer>,
+	/// Heartbeat configuration
+	pub heartbeat: HeartbeatConfig,
+	/// Pheromone configuration for bio-inspired routing
+	pub pheromone: PheromoneConfig,
+	/// Gate policies for the gateway (rate limiting, auth, etc.)
+	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	/// Connection pool configuration for hive connections
+	pub pool_config: PoolConfig,
+	/// Freshness window in milliseconds for signed hive control frames
+	/// (registration, address updates); stale or replayed frames inside
+	/// the window are rejected (CWE-294)
+	pub control_freshness_window_ms: u64,
+	/// Gateway bind address, parsed via the protocol address's `FromStr`.
+	/// `None` binds the protocol default. A stable address lets hives
+	/// re-register through gateway restarts without reconfiguration.
+	pub bind_addr: Option<String>,
+	/// Peer-federation dial list, advertise beat, and dial allowlist
+	pub peer: PeerConfig,
 	/// Gossip subsystem configuration (freshness/ttl/retention + journal)
 	#[cfg(feature = "x509")]
-	pub gossip: GossipConf,
+	pub gossip: GossipConfig,
 	/// Colony URN from the gateway certificate's URI Subject Alternative
 	/// Name, derived once at config build by
 	/// [`cert_colony_urn`](crate::colony::cluster::cert_colony_urn).
@@ -254,7 +270,7 @@ pub struct ClusterConf {
 	/// forwarding and hive registration never require membership.
 	///
 	/// Private so membership cannot drift from the certificate: the
-	/// builder derives it and [`ClusterConf::colony_urn`] reads it.
+	/// builder derives it and [`ClusterConfig::colony_urn`] reads it.
 	#[cfg(feature = "x509")]
 	colony_urn: Option<Urn<'static>>,
 	/// TLS configuration for cluster -> hive connections
@@ -263,7 +279,7 @@ pub struct ClusterConf {
 }
 
 #[cfg(feature = "x509")]
-impl ClusterConf {
+impl ClusterConfig {
 	/// Create a new cluster configuration with TLS config
 	pub fn new(tls: ClusterTlsConfig) -> Self {
 		Self::builder(tls).build()
@@ -280,7 +296,7 @@ impl ClusterConf {
 }
 
 #[cfg(feature = "x509")]
-impl core::fmt::Debug for ClusterConf {
+impl core::fmt::Debug for ClusterConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterConfig")
 			.field("namespace", &self.namespace)
@@ -290,9 +306,7 @@ impl core::fmt::Debug for ClusterConf {
 			.field("pool_config", &self.pool_config)
 			.field("control_freshness_window_ms", &self.control_freshness_window_ms)
 			.field("bind_addr", &self.bind_addr)
-			.field("peers", &self.peers)
-			.field("advertise_interval", &self.advertise_interval)
-			.field("peer_dial_allowlist", &self.peer_dial_allowlist)
+			.field("peer", &self.peer)
 			.field("gossip", &self.gossip)
 			.field("colony_urn", &self.colony_urn)
 			.field("tls", &self.tls)
@@ -325,7 +339,7 @@ pub trait Cluster: Sized + Send + Sync {
 	/// Start the cluster gateway
 	fn start(
 		trace: Arc<TraceCollector>,
-		config: ClusterConf,
+		config: ClusterConfig,
 	) -> impl Future<Output = Result<Self, crate::TightBeamError>> + Send;
 
 	/// Get the gateway address
@@ -363,7 +377,7 @@ pub trait ClusterHeartbeat: Cluster {
 	fn registry(&self) -> &Arc<HiveRegistry>;
 
 	/// Access heartbeat configuration
-	fn heartbeat_config(&self) -> &HeartbeatConf;
+	fn heartbeat_config(&self) -> &HeartbeatConfig;
 
 	/// Send a single heartbeat to a hive
 	///
@@ -442,16 +456,16 @@ mod tests {
 	}
 
 	// =========================================================================
-	// ClusterConf Tests
+	// ClusterConfig Tests
 	// =========================================================================
 
 	#[test]
-	fn cluster_conf_defaults() {
-		let config = ClusterConf::new(test_tls_config());
+	fn cluster_config_defaults() {
+		let config = ClusterConfig::new(test_tls_config());
 		assert_eq!(config.heartbeat.interval, Duration::from_secs(5));
 		assert_eq!(config.heartbeat.timeout, Duration::from_secs(15));
 		assert!(config.policies.is_empty());
-		assert!(config.peer_dial_allowlist.is_none());
+		assert!(config.peer.peer_dial_allowlist.is_none());
 	}
 
 	// =========================================================================

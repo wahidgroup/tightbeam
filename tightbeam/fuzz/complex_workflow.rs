@@ -67,7 +67,7 @@ tb_process_spec! {
 tb_scenario! {
 	fuzz: afl,
 	csp: WorkflowFuzzProc,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(WorkflowFuzzSpec::latest())
 		.with_csp(WorkflowFuzzProc)
 		.build(),

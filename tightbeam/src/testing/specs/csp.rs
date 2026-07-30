@@ -785,7 +785,7 @@ mod tests {
 	use super::*;
 	use crate::testing::assertions::Assertion;
 	use crate::testing::create_test_message;
-	use crate::testing::{ClientEnv, ScenarioConf, SetupEnv, TestHooks};
+	use crate::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestHooks};
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;
@@ -1344,7 +1344,7 @@ mod tests {
 
 	tb_scenario! {
 		name: test_csp_with_bare_environment,
-		config: ScenarioConf::builder()
+		config: ScenarioConfig::builder()
 			.with_spec(SimpleBareFlowSpec::latest())
 			.with_csp(SimpleBareFlowProc)
 			.build(),
@@ -1397,7 +1397,7 @@ mod tests {
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	crate::tb_scenario! {
 		name: test_csp_process_with_assert_spec_integration,
-		config: ScenarioConf::builder()
+		config: ScenarioConfig::builder()
 			.with_spec(ClientServerFlowSpec::latest())
 			.with_csp(ClientServerFlowProc)
 			.with_hooks(TestHooks {
@@ -1470,7 +1470,7 @@ mod tests {
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	tb_scenario! {
 		name: test_servlet_environment_integration,
-		config: ScenarioConf::builder()
+		config: ScenarioConfig::builder()
 			.with_spec(ClientServerFlowSpec::latest())
 			.with_csp(ClientServerFlowProc)
 			.build(),

@@ -38,7 +38,7 @@ use tightbeam::transport::handshake::negotiation::{
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
 use tightbeam::transport::multiplex::{MuxAcceptor, MuxRole, MuxTransport, ReplySink, StreamBody};
-use tightbeam::transport::policy::PolicyConf;
+use tightbeam::transport::policy::PolicyConfig;
 use tightbeam::transport::serve::MuxService;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{

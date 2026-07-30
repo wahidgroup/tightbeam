@@ -8,7 +8,7 @@ use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ClientEnv, ScenarioConf, SetupEnv};
+use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxStreamKind};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
@@ -79,7 +79,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: mux_goaway_drains_and_rejects_new,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MuxGoAwayDrainSpec::latest())
 		.with_csp(MuxGoAwayDrainProcess)
 		.build(),
@@ -289,7 +289,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: mux_cancel_budget_boundary,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MuxCancelBudgetSpec::latest())
 		.with_csp(MuxCancelBudgetProcess)
 		.build(),

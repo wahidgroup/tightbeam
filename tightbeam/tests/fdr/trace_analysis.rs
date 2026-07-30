@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tightbeam::testing::fdr::{FdrConfig, FdrTraceExt};
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
@@ -84,7 +84,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_trace_analysis_methods,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(TraceAnalysisSpec::latest())
 		.with_fdr(build_fdr_config(vec![SimpleRequestResponse::process()]))
 		.with_hooks(TestHooks {
