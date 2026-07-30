@@ -1,13 +1,8 @@
-//! Servlet registry with bio-inspired pheromone-based routing
+//! Servlet route registry with pheromone scoring and trial-based abandonment.
 //!
-//! Implements Ant Colony Optimization (ACO) and Artificial Bee Colony (ABC)
-//! principles for emergent load balancing and self-healing servlet discovery.
-//!
-//! # Key Concepts
-//!
-//! - **Pheromone**: Success metric that grows with successful requests and decays over time
-//! - **Trial Count**: Failure metric from ABC - entries are abandoned after too many failures
-//! - **Evaporation**: Natural decay of pheromone to forget stale routes
+//! - Pheromone rises on successful work and decays on a timer.
+//! - Trial count rises on failure; entries abandon past a limit.
+//! - Local hive routes and peer-learned routes share the same scoring tables.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
@@ -94,8 +89,7 @@ impl Default for PeerCaps {
 ///
 /// `Local` resolves to a servlet this gateway owns. `Peer` resolves to
 /// a peer gateway that owns the servlet, reached by forwarding. Both
-/// share the same pheromone trail machinery, so locality preference is
-/// emergent rather than configured.
+/// share the same pheromone scoring tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RouteKind {
 	#[default]
@@ -103,10 +97,7 @@ pub enum RouteKind {
 	Peer,
 }
 
-/// A servlet instance tracked with pheromone-based scoring
-///
-/// Combines ACO pheromone trails with ABC trial-based abandonment
-/// for emergent load balancing and failure detection.
+/// A servlet instance tracked with pheromone score and trial count.
 ///
 /// Fields are private so the route-key discipline holds by construction:
 /// [`ServletEntry::local`] keys by the servlet address it dials, while
@@ -228,7 +219,7 @@ impl ServletEntry {
 		self.route_kind
 	}
 
-	/// Consecutive failure count (ABC trial metric)
+	/// Consecutive failure count toward abandonment
 	#[must_use]
 	pub fn trial_count(&self) -> u32 {
 		self.trial_count.load(Ordering::Relaxed)
@@ -336,10 +327,10 @@ impl Clone for ServletEntry {
 // Servlet Registry
 // ============================================================================
 
-/// Registry of servlet entries with pheromone-based routing
+/// Registry of servlet entries with pheromone-based routing.
 ///
-/// Tracks individual servlet instances across hives, enabling
-/// bio-inspired load balancing via pheromone reinforcement/evaporation.
+/// Tracks servlet instances across hives and peer gateways. Reinforcement
+/// and evaporation steer selection; trial limits abandon dead routes.
 pub struct ServletRegistry {
 	/// Map of servlet address -> entry
 	entries: RwLock<HashMap<SharedId, ServletEntry>>,

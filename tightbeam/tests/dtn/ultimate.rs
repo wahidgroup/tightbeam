@@ -147,8 +147,8 @@ use crate::dtn::{
 	ordering::OutOfOrderBuffer,
 	servlets::{
 		EarthRelaySatelliteServlet, EarthRelaySatelliteServletConfig, MarsRelaySatelliteServlet,
-		MarsRelaySatelliteServletConfig, MissionControlServlet, MissionControlServletConfig, MissionState, RoverServlet,
-		RoverServletConfig,
+		MarsRelaySatelliteServletConfig, MissionControlServlet, MissionControlServletConfig, MissionState,
+		RoverServlet, RoverServletConfig,
 	},
 	storage::FrameStore,
 	workers::{

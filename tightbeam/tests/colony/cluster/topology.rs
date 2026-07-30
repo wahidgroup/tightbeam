@@ -53,7 +53,11 @@ impl<L: LoadBalancer> LoadBalancer for RecordingBalancer<L> {
 	}
 }
 
-fn topology_cluster_conf(trace: &TraceCollector, ctx: &TopologyCtx, inner: impl LoadBalancer + 'static) -> ClusterConfig {
+fn topology_cluster_conf(
+	trace: &TraceCollector,
+	ctx: &TopologyCtx,
+	inner: impl LoadBalancer + 'static,
+) -> ClusterConfig {
 	let tls = cluster_tls_config(ctx.certs.as_ref());
 	let load_balancer = RecordingBalancer::new(inner, trace, ctx);
 	ClusterConfig::builder(tls).with_load_balancer(load_balancer).build()

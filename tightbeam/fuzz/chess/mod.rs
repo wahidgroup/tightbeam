@@ -27,7 +27,8 @@ use tightbeam::transport::ConnectionBuilder;
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 use board::{
-	ChessEngineServlet, ChessEngineServletConfig, ChessMatchManager, ChessMoveRequest, ChessMoveResponse, GameStatusCode,
+	ChessEngineServlet, ChessEngineServletConfig, ChessMatchManager, ChessMoveRequest, ChessMoveResponse,
+	GameStatusCode,
 };
 use piece::Piece;
 use r#move::ChessMove;

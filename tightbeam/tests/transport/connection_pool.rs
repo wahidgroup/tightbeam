@@ -278,7 +278,9 @@ servlet! {
 	feature = "sha3",
 	feature = "aead"
 ))]
-fn pool_echo_conf(message_count: Arc<AtomicUsize>) -> Result<ServletConfig<TokioListener, TestMessage>, TightBeamError> {
+fn pool_echo_conf(
+	message_count: Arc<AtomicUsize>,
+) -> Result<ServletConfig<TokioListener, TestMessage>, TightBeamError> {
 	Ok(ServletConfig::<TokioListener, TestMessage>::builder()
 		.with_certificate(
 			SERVER_CERT,

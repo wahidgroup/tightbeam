@@ -25,8 +25,8 @@ struct StopProbeServlet {
 }
 
 impl ServletBox for StopProbeServlet {
-	fn addr_bytes(&self) -> Vec<u8> {
-		b"127.0.0.1:0".to_vec()
+	fn addr_bytes(&self) -> std::sync::Arc<[u8]> {
+		std::sync::Arc::from(b"127.0.0.1:0".as_slice())
 	}
 
 	fn stop_boxed(self: Box<Self>) {
@@ -96,11 +96,10 @@ tb_scenario! {
 			let cluster_conf = ClusterConfig::builder(cluster_tls_config(&certs))
 				.with_gate_policy(Arc::new(RejectAllPolicy))
 				.build();
+
 			start_cluster(&trace, cluster_conf).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			let cluster_addr = cluster.addr();
-
 			let work_request = ClusterRequest::Work(ClusterWorkRequest::new(
 				servlet_urn("ping"),
 				encode(&PingRequest { value: 21 })?,
@@ -112,6 +111,7 @@ tb_scenario! {
 				.with_message(work_request)
 				.build()?;
 
+			let cluster_addr = cluster.addr();
 			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
 			trace.event(WORK_SENT)?;
@@ -158,8 +158,6 @@ tb_scenario! {
 			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			let cluster_addr = cluster.addr();
-
 			// Hive validates the cluster's TLS certificate but has no
 			// signing identity of its own: control frames go out unsigned
 			let hive_conf = HiveConfig {
@@ -172,6 +170,7 @@ tb_scenario! {
 
 			trace.event(REGISTRATION_SENT)?;
 
+			let cluster_addr = cluster.addr();
 			let response = hive.register_with_cluster(cluster_addr).await?;
 			record_register_response(&trace, &response, &cluster)?;
 
@@ -211,7 +210,6 @@ tb_scenario! {
 			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			let cluster_addr = cluster.addr();
 			let hive_conf = HiveConfig {
 				trust_store: Some(Arc::clone(&certs.trust)),
 				reregister_interval: Some(Duration::from_millis(50)),
@@ -223,6 +221,7 @@ tb_scenario! {
 
 			trace.event(REGISTRATION_SENT)?;
 
+			let cluster_addr = cluster.addr();
 			let response = hive.register_with_cluster(cluster_addr).await?;
 			record_register_response(&trace, &response, &cluster)?;
 
@@ -278,7 +277,6 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let cluster_addr = cluster.addr();
-
 			let mut client = connect_cluster(&certs, cluster_addr).await?;
 			let signed = signed_control_frame(
 				&certs,
@@ -805,7 +803,6 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let mut client = connect_cluster(&certs.gateway, cluster.addr()).await?;
-
 			let hive_a_addr = b"127.0.0.1:65020".as_slice();
 
 			register_signed_hive(&mut client, &certs.hive_a.1, b"owner-reg", hive_a_addr).await?;

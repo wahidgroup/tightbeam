@@ -583,8 +583,8 @@ struct LocatorStopProbe {
 }
 
 impl ServletBox for LocatorStopProbe {
-	fn addr_bytes(&self) -> Vec<u8> {
-		self.addr.clone()
+	fn addr_bytes(&self) -> std::sync::Arc<[u8]> {
+		std::sync::Arc::from(self.addr.as_slice())
 	}
 
 	fn stop_boxed(self: Box<Self>) {

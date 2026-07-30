@@ -1,19 +1,20 @@
-//! Builder patterns for cluster configuration
+//! Builders for [`ClusterConfig`](super::ClusterConfig) and heartbeat settings.
 
 use core::time::Duration;
 use std::sync::Arc;
 
-#[cfg(feature = "x509")]
-use super::{cert_colony_urn, GossipAdmission, GossipConfig};
 use super::{
 	ClusterConfig, ClusterTlsConfig, HeartbeatCallback, HeartbeatConfig, PeerConfig, PheromoneConfig,
 	DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
 use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
-#[cfg(feature = "x509")]
-use crate::crypto::x509::Certificate;
 use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
+
+#[cfg(feature = "x509")]
+use super::{cert_colony_urn, GossipAdmission, GossipConfig};
+#[cfg(feature = "x509")]
+use crate::crypto::x509::Certificate;
 #[cfg(feature = "x509")]
 use crate::utils::urn::Urn;
 
@@ -140,7 +141,7 @@ impl ClusterConfigBuilder {
 		self
 	}
 
-	/// Set the pheromone configuration for bio-inspired routing
+	/// Set pheromone configuration for route selection and evaporation
 	pub fn with_pheromone_config(mut self, config: PheromoneConfig) -> Self {
 		self.pheromone = config;
 		self

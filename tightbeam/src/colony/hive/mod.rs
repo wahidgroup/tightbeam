@@ -78,8 +78,8 @@ pub type SpawnerFn = Arc<
 /// This enables hives to store servlets of different types in a single collection.
 /// Servlets implement this trait to be registerable with a hive.
 pub trait ServletBox: Send + Sync {
-	/// Get the servlet's bound address as bytes
-	fn addr_bytes(&self) -> Vec<u8>;
+	/// Shared bound-address bytes (encoded once at servlet start).
+	fn addr_bytes(&self) -> Arc<[u8]>;
 
 	/// Stop the servlet (consumes the boxed servlet)
 	fn stop_boxed(self: Box<Self>);
@@ -213,7 +213,10 @@ impl ServletRegistry for HashMapRegistry {
 			.map(|guard| {
 				guard
 					.values()
-					.map(|reg| (reg.servlet_type.clone(), reg.servlet.addr_bytes()))
+					.map(|reg| {
+						let address = reg.servlet.addr_bytes().as_ref().to_vec();
+						(reg.servlet_type.clone(), address)
+					})
 					.collect()
 			})
 			.unwrap_or_default()

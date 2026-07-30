@@ -140,7 +140,10 @@ pub(super) fn servlet_tls_config(
 
 /// Start the gateway on the scenario trace so the cluster's built-in
 /// lifecycle events land where the assertion specs verify them.
-pub(super) async fn start_cluster(trace: &TraceCollector, conf: ClusterConfig) -> Result<ClusterGateway, TightBeamError> {
+pub(super) async fn start_cluster(
+	trace: &TraceCollector,
+	conf: ClusterConfig,
+) -> Result<ClusterGateway, TightBeamError> {
 	ClusterGateway::start(Arc::new(trace.share()), conf).await
 }
 

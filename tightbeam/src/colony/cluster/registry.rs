@@ -1,4 +1,4 @@
-//! Hive registry for managing registered hives and servlet type indexing
+//! Hive registry: membership, utilization, and servlet-type reverse index.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};

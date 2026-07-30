@@ -1,4 +1,4 @@
-//! Cluster-specific error types
+//! Cluster gateway error types.
 
 use crate::transport::error::TransportError;
 use crate::{Errorizable, TightBeamError};

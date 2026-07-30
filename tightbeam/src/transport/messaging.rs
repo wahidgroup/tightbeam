@@ -200,120 +200,136 @@ pub trait MessageEmitter: MessageIO {
 	/// - `status`: TransitStatus from the response
 	/// - `response`: Optional response frame from server
 	/// - `original`: Original frame if rejected (for retry), None if sent/consumed
-	#[allow(async_fn_in_trait)]
-	async fn perform_send_receive(
+	fn perform_send_receive(
 		&mut self,
 		message: Frame,
-	) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>;
+	) -> impl Future<Output = TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>> + MaybeSend;
 
 	/// Send a TightBeam message
-	#[allow(async_fn_in_trait)]
-	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-		let mut letter = Letter::from(message);
-		let mut current_attempt = attempt.unwrap_or(0);
-
-		loop {
-			// Evaluate gate policy before sending. Emitter gates are
-			// client-side and connection-context-free: the empty context.
-			let status = self
-				.to_emitter_gate_policy_ref()
-				.evaluate(Some(letter.try_peek()?), &SessionContext::default());
-			if status != TransitStatus::Ok {
-				return Err(TransportError::from(status));
-			}
-
-			// Take message for send operation
-			let message_to_send = letter.try_take()?;
-
-			// Perform protocol-specific send/receive
-			let (status, response, original_message) = match self.perform_send_receive(message_to_send).await {
-				Ok(result) => result,
-				Err(e) => {
-					let frame = evaluate_retry(self.to_restart_policy_ref(), e, current_attempt)?;
-					// Unbox to put back into Letter
-					letter.try_return_to_sender(*frame)?;
-					current_attempt += 1;
-					continue;
-				}
-			};
-
-			// Check transport status and handle response
-			let result: TransportResult<&Frame> = if status != TransitStatus::Ok {
-				if let Some(msg) = original_message {
-					// Server rejected - return frame for retry
-					match TransportFailure::try_from(status) {
-						Ok(failure) => Err(TransportError::from_failure(msg, failure)),
-						Err(error) => Err(error),
-					}
-				} else {
-					return Err(TransportError::from(status));
-				}
-			} else {
-				match &response {
-					Some(msg) => Ok(msg),
-					None => return Ok(None),
-				}
-			};
-
-			// Evaluate retry policy only on error
-			match result {
-				Err(error) => {
-					let frame = evaluate_retry(self.to_restart_policy_ref(), error, current_attempt)?;
-					// Unbox to put back into Letter
-					letter.try_return_to_sender(*frame)?;
-					current_attempt += 1;
-				}
-				Ok(_) => {
-					return Ok(response);
-				}
-			}
-		}
+	fn emit(
+		&mut self,
+		message: Frame,
+		attempt: Option<usize>,
+	) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		emit_with_retry(self, message, attempt)
 	}
 
 	/// Default implementation for non-x509 transports
 	#[cfg(not(feature = "x509"))]
-	#[allow(async_fn_in_trait)]
-	async fn perform_send_receive(
+	fn perform_send_receive(
 		&mut self,
 		message: Frame,
-	) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)> {
-		// Build the request around a shared Arc so the frame stays available
-		// for retry without pattern-matching the envelope back apart.
-		let frame_arc = Arc::new(message);
-		let message = Arc::clone(&frame_arc);
-		let envelope = TransportEnvelope::Request(RequestPackage { message });
+	) -> impl Future<Output = TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>> + MaybeSend {
+		async {
+			// Build the request around a shared Arc so the frame stays available
+			// for retry without pattern-matching the envelope back apart.
+			let frame_arc = Arc::new(message);
+			let message = Arc::clone(&frame_arc);
+			let envelope = TransportEnvelope::Request(RequestPackage { message });
 
-		// Send the envelope
-		self.write_envelope_bytes(&envelope.to_der()?).await?;
+			// Send the envelope
+			self.write_envelope_bytes(&envelope.to_der()?).await?;
 
-		// Receive response
-		let response_bytes = self.read_envelope_bytes().await?;
-		let response_envelope = Self::decode_envelope(&response_bytes)?;
+			// Receive response
+			let response_bytes = self.read_envelope_bytes().await?;
+			let response_envelope = Self::decode_envelope(&response_bytes)?;
 
-		// Parse response
-		let (status, response) = match response_envelope {
-			TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
-			TransportEnvelope::Request(_) => {
-				return Err(TransportError::InvalidMessage);
-			}
-			#[cfg(any(feature = "x509", feature = "transport-multiplex"))]
-			_ => {
-				return Err(TransportError::InvalidMessage);
+			// Parse response
+			let (status, response) = match response_envelope {
+				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
+				TransportEnvelope::Request(_) => {
+					return Err(TransportError::InvalidMessage);
+				}
+				#[cfg(any(feature = "x509", feature = "transport-multiplex"))]
+				_ => {
+					return Err(TransportError::InvalidMessage);
+				}
+			};
+
+			// Return frame if rejected
+			let original = if status != TransitStatus::Ok {
+				Some(Arc::try_unwrap(frame_arc).unwrap_or_else(|arc| (*arc).clone()))
+			} else {
+				None
+			};
+
+			Ok((
+				status,
+				response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
+				original,
+			))
+		}
+	}
+}
+
+/// Default [`MessageEmitter::emit`] body as a free function so the returned
+/// future can carry [`MaybeSend`] without an AFIT default-method capture.
+async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
+	emitter: &mut T,
+	message: Frame,
+	attempt: Option<usize>,
+) -> TransportResult<Option<Frame>> {
+	let mut letter = Letter::from(message);
+	let mut current_attempt = attempt.unwrap_or(0);
+
+	loop {
+		// Evaluate gate policy before sending. Emitter gates are
+		// client-side and connection-context-free: the empty context.
+		let status = emitter
+			.to_emitter_gate_policy_ref()
+			.evaluate(Some(letter.try_peek()?), &SessionContext::default());
+		if status != TransitStatus::Ok {
+			return Err(TransportError::from(status));
+		}
+
+		// Take message for send operation
+		let message_to_send = letter.try_take()?;
+
+		// Perform protocol-specific send/receive
+		let (status, response, original_message) = match emitter.perform_send_receive(message_to_send).await {
+			Ok(result) => result,
+			Err(e) => {
+				let frame = evaluate_retry(emitter.to_restart_policy_ref(), e, current_attempt)?;
+				// Unbox to put back into Letter
+				letter.try_return_to_sender(*frame)?;
+				current_attempt += 1;
+				continue;
 			}
 		};
 
-		// Return frame if rejected
-		let original = if status != TransitStatus::Ok {
-			Some(Arc::try_unwrap(frame_arc).unwrap_or_else(|arc| (*arc).clone()))
+		// Check transport status and handle response
+		let result: TransportResult<&Frame> = if status != TransitStatus::Ok {
+			if let Some(msg) = original_message {
+				// Server rejected - return frame for retry
+				match TransportFailure::try_from(status) {
+					Ok(failure) => Err(TransportError::from_failure(msg, failure)),
+					Err(error) => Err(error),
+				}
+			} else {
+				return Err(TransportError::from(status));
+			}
 		} else {
-			None
+			match &response {
+				Some(msg) => Ok(msg),
+				None => return Ok(None),
+			}
 		};
 
-		Ok((
-			status,
-			response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
-			original,
-		))
+		// Evaluate retry policy only on error
+		match result {
+			Err(error) => {
+				let frame = evaluate_retry(emitter.to_restart_policy_ref(), error, current_attempt)?;
+				// Unbox to put back into Letter
+				letter.try_return_to_sender(*frame)?;
+				current_attempt += 1;
+			}
+			Ok(_) => {
+				return Ok(response);
+			}
+		}
 	}
 }
 

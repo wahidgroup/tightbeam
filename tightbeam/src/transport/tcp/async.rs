@@ -1130,28 +1130,31 @@ where
 	}
 
 	/// Protocol-specific send/receive with handshake and timeout
-	async fn perform_send_receive(
+	fn perform_send_receive(
 		&mut self,
 		message: Frame,
-	) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)> {
-		self.ensure_handshake_complete().await?;
+	) -> impl core::future::Future<Output = TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>> + MaybeSend
+	{
+		async {
+			self.ensure_handshake_complete().await?;
 
-		#[cfg(feature = "tokio")]
-		{
-			let timeout_duration = self.operation_timeout;
-			if let Some(duration) = timeout_duration {
-				match timeout(duration, async { self.perform_emit_cycle(message).await }).await {
-					Ok(result) => result,
-					Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
+			#[cfg(feature = "tokio")]
+			{
+				let timeout_duration = self.operation_timeout;
+				if let Some(duration) = timeout_duration {
+					match timeout(duration, async { self.perform_emit_cycle(message).await }).await {
+						Ok(result) => result,
+						Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
+					}
+				} else {
+					self.perform_emit_cycle(message).await
 				}
-			} else {
+			}
+
+			#[cfg(not(feature = "tokio"))]
+			{
 				self.perform_emit_cycle(message).await
 			}
-		}
-
-		#[cfg(not(feature = "tokio"))]
-		{
-			self.perform_emit_cycle(message).await
 		}
 	}
 }
