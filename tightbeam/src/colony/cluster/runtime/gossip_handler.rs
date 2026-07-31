@@ -90,7 +90,8 @@ pub(crate) async fn handle_peer_ad(
 		return refuse_peer_ad_release(&frame, &trace, replay_guard, status);
 	}
 
-	let _ = trace.event(CLUSTER_PEER_ADVERTISED);
+	trace.event(CLUSTER_PEER_ADVERTISED)?;
+
 	reply_frame(&frame.metadata.id, PeerAdvertisementResponse { status: TransitStatus::Ok })
 }
 

@@ -311,6 +311,11 @@ fn admissible_pex_hints<'c>(
 }
 
 /// One anti-entropy reconcile round with a peer, including grey-hole scoring.
+///
+/// An `Err` from this function is peer-attributable: the beat loops score it
+/// toward eviction or probe discard. A local fault (journal, lock, frame
+/// signing) skips the affected step instead, so a healthy peer is never
+/// penalized for a fault on this gateway.
 #[cfg(feature = "x509")]
 pub(crate) async fn reconcile_gossip_async<P, D>(
 	pool: Arc<ClusterPool<P>>,
@@ -341,13 +346,12 @@ where
 	D: ClusterDigest,
 {
 	let now = current_timestamp_ms();
-	let held: Vec<Vec<u8>> = config
-		.gossip
-		.journal
-		.held_digests(now)?
-		.iter()
-		.map(|digest| digest.to_vec())
-		.collect();
+	// A journal fault is this gateway's, not the peer's: skip the round so
+	// the beat does not score every peer for a fault none of them caused.
+	let Ok(held_digests) = config.gossip.journal.held_digests(now) else {
+		return Ok(());
+	};
+	let held: Vec<Vec<u8>> = held_digests.iter().map(|digest| digest.to_vec()).collect();
 
 	let mut client = pool.connect(peer_addr).await?;
 
@@ -379,15 +383,23 @@ where
 
 	let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held });
 
-	let frame = FrameBuilder::from(Version::V2)
+	// Frame construction and signing are local: a fault here happened
+	// before the peer was asked anything, so the round is skipped rather
+	// than scored.
+	let Ok(frame) = FrameBuilder::from(Version::V2)
 		.with_id(b"gossip-reconcile")
 		.with_order(now)
 		.with_message(request)
 		.with_priority(MessagePriority::NetworkControl)
 		.with_witness_hasher::<D>()
-		.build()?;
+		.build()
+	else {
+		return Ok(());
+	};
 
-	let signed_frame = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await?;
+	let Ok(signed_frame) = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await else {
+		return Ok(());
+	};
 	let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 	let reply: GossipWant = decode(&response.message)?;
 
@@ -398,87 +410,104 @@ where
 		return Err(ClusterError::OversizedReconcileReply);
 	}
 
-	// The completed round is the verified probe of the addrman discipline.
-	// This dialed address answered a signed reconcile under a same-colony
-	// certificate, so it earns a tried slot and joins the beat/reflood
-	// target set.
+	// The reply is decoded and within bounds: the peer has proven liveness.
+	// Everything below is local bookkeeping and best-effort repair inside
+	// one fallible scope.
 	//
-	// - Promotion waits for the reply: a pooled connection keeps its
-	//   handshake certificate after the peer dies.
-	// - Promoting on the gate alone would reset the failure count every
-	//   beat, and a dead peer could never be evicted.
-	let peer_id = client.peer_certificate().and_then(cert_fingerprint_id);
-	if config.peer.table.promote(peer, peer_id.as_deref(), now)? {
-		if let Ok(event) = trace.event(CLUSTER_PEER_DISCOVERED) {
-			event.with_payload(peer.as_bytes()).emit();
+	// - `?` inside the scope keeps every step, including each trace event,
+	//   a usable fault-injection point (testing-fault).
+	// - The boundary after the scope tolerates its error, so a local fault
+	//   is never scored against the peer that just answered.
+	// - A peer that dies mid-repair is caught by the next beat's dial.
+	let local_round: Result<(), ClusterError> = async {
+		// The completed round is the verified probe of the addrman
+		// discipline. This dialed address answered a signed reconcile
+		// under a same-colony certificate, so it earns a tried slot and
+		// joins the beat/reflood target set.
+		//
+		// - Promotion waits for the reply: a pooled connection keeps its
+		//   handshake certificate after the peer dies.
+		// - Promoting on the gate alone would reset the failure count
+		//   every beat, and a dead peer could never be evicted.
+		let peer_id = client.peer_certificate().and_then(cert_fingerprint_id);
+		if config.peer.table.promote(peer, peer_id.as_deref(), now)? {
+			trace.event(CLUSTER_PEER_DISCOVERED)?.with_payload(peer.as_bytes()).emit();
 		}
-	}
 
-	let GossipWant { want, pex } = reply;
+		let GossipWant { want, pex } = reply;
 
-	// PEX entries are unverified hints.
-	//
-	// - The dial allowlist gates them before they are learned.
-	// - They enter the capped new table only.
-	// - They become dial targets solely through a later feeler probe that
-	//   passes the same colony gate as above.
-	//
-	// Sources:
-	// - CWE-345, insufficient verification of data authenticity:
-	//   <https://cwe.mitre.org/data/definitions/345.html>
-	let hints = admissible_pex_hints(pex, config.peer.peer_dial_allowlist.as_deref());
-	config.peer.table.learn(hints)?;
+		// PEX entries are unverified hints.
+		//
+		// - The dial allowlist gates them before they are learned.
+		// - They enter the capped new table only.
+		// - They become dial targets solely through a later feeler probe
+		//   that passes the same colony gate as above.
+		//
+		// Sources:
+		// - CWE-345, insufficient verification of data authenticity:
+		//   <https://cwe.mitre.org/data/definitions/345.html>
+		let hints = admissible_pex_hints(pex, config.peer.peer_dial_allowlist.as_deref());
+		config.peer.table.learn(hints)?;
 
-	let wanted = wanted_digests(&want);
+		let wanted = wanted_digests(&want);
 
-	// Grey-hole containment signal.
-	//
-	// - A previously acked digest wanted again while retained is a drop.
-	// - Score at most one weaken per reconciliation round.
-	let dropped = wanted.iter().any(|digest| acked.contains(digest));
-	if dropped {
-		let _ = servlet_registry.weaken_peer_by_dial(peer.as_bytes());
-		let _ = trace.event(CLUSTER_GOSSIP_DROP_SIGNAL);
-	}
-	for digest in &wanted {
-		acked.remove(digest);
-	}
+		// Grey-hole containment signal.
+		//
+		// - A previously acked digest wanted again while retained is a drop.
+		// - Score at most one weaken per reconciliation round.
+		let dropped = wanted.iter().any(|digest| acked.contains(digest));
+		if dropped {
+			let _ = servlet_registry.weaken_peer_by_dial(peer.as_bytes());
+			trace.event(CLUSTER_GOSSIP_DROP_SIGNAL)?;
+		}
+		for digest in &wanted {
+			acked.remove(digest);
+		}
 
-	let now = current_timestamp_ms();
-	let seen_ttl_ms = config.gossip.seen_ttl.as_millis() as u64;
-	let missing = config.gossip.journal.fetch(&wanted, now)?;
+		let now = current_timestamp_ms();
+		let seen_ttl_ms = config.gossip.seen_ttl.as_millis() as u64;
+		let missing = config.gossip.journal.fetch(&wanted, now)?;
 
-	// Repair push: verbatim rumor, outer lifetime 0, only if still fresh.
-	let admissible = missing
-		.into_iter()
-		.filter(|rumor| gossip_fresh(rumor.metadata.order, seen_ttl_ms, now));
+		// Repair push: verbatim rumor, outer lifetime 0, only if still fresh.
+		let admissible = missing
+			.into_iter()
+			.filter(|rumor| gossip_fresh(rumor.metadata.order, seen_ttl_ms, now));
 
-	for rumor in admissible {
-		let Ok(pushed_digest) = gossip_digest::<D>(&rumor) else {
-			continue;
-		};
-		let push = ClusterRequest::Gossip(Box::new(rumor));
+		for rumor in admissible {
+			let Ok(pushed_digest) = gossip_digest::<D>(&rumor) else {
+				continue;
+			};
+			let push = ClusterRequest::Gossip(Box::new(rumor));
 
-		let frame = FrameBuilder::from(Version::V2)
-			.with_id(b"gossip-repair")
-			.with_message(push)
-			.with_priority(MessagePriority::NetworkControl)
-			.with_lifetime(0)
-			.with_witness_hasher::<D>()
-			.build()?;
+			let frame = FrameBuilder::from(Version::V2)
+				.with_id(b"gossip-repair")
+				.with_message(push)
+				.with_priority(MessagePriority::NetworkControl)
+				.with_lifetime(0)
+				.with_witness_hasher::<D>()
+				.build()?;
 
-		let signed = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await?;
+			let signed = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await?;
 
-		// Arm grey-hole ledger only on explicit Ok reply.
-		if let Some(push_reply) = client.emit(signed, None).await? {
-			let decoded: Result<GossipResponse, _> = decode(&push_reply.message);
-			if let Ok(gossip_reply) = decoded {
-				if matches!(gossip_reply.status, TransitStatus::Ok) {
-					acked.insert(pushed_digest);
+			// Arm grey-hole ledger only on explicit Ok reply.
+			if let Some(push_reply) = client.emit(signed, None).await? {
+				let decoded: Result<GossipResponse, _> = decode(&push_reply.message);
+				if let Ok(gossip_reply) = decoded {
+					if matches!(gossip_reply.status, TransitStatus::Ok) {
+						acked.insert(pushed_digest);
+					}
 				}
 			}
 		}
+
+		Ok(())
 	}
+	.await;
+
+	// Tolerate boundary: the reconcile round already succeeded, so a local
+	// fault above skips the rest of the round without charging the peer.
+	// The next beat retries the skipped bookkeeping and repair.
+	let _ = local_round;
 
 	Ok(())
 }
@@ -555,7 +584,7 @@ where
 	// Drop known duplicates before rate admission so echoes cannot drain the bucket.
 	match config.gossip.journal.seen(&admitted.digest(), now) {
 		Ok(true) => {
-			let _ = trace.event(CLUSTER_GOSSIP_DUPLICATE);
+			trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
 			return reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok });
 		}
 		Ok(false) => {}
@@ -577,7 +606,7 @@ where
 
 	match config.gossip.journal.record(&signer_id, admitted.digest(), &rumor, now) {
 		Ok(Admission::Duplicate) => {
-			let _ = trace.event(CLUSTER_GOSSIP_DUPLICATE);
+			trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
 			return reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok });
 		}
 		Ok(Admission::New) => {}
@@ -649,7 +678,9 @@ where
 			let _ = config.peer.table.exclude_self(local);
 		}
 
-		// Per-peer Ok ledger for grey-hole detection; bounded by journal x peers (CWE-770).
+		// Per-peer Ok ledger for grey-hole detection. Each beat retains only
+		// the live target and probe addresses, so churned PEX hints cannot
+		// grow the map without bound (CWE-770).
 		let mut push_ledger: HashMap<String, HashSet<GossipDigest>> = HashMap::new();
 
 		loop {
@@ -675,6 +706,7 @@ where
 			// are unverified candidates awaiting their feeler dial.
 			let targets = config.peer.table.target_set().unwrap_or_default();
 			let probes = config.peer.table.probe_sample(current_timestamp_ms()).unwrap_or_default();
+			push_ledger.retain(|peer, _| targets.contains(peer) || probes.contains(peer));
 			if targets.is_empty() && probes.is_empty() {
 				continue;
 			}

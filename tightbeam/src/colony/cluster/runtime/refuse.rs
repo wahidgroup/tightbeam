@@ -39,7 +39,8 @@ pub(crate) fn refuse_peer_ad(
 	trace: &TraceCollector,
 	status: TransitStatus,
 ) -> Result<Option<Frame>, TightBeamError> {
-	let _ = trace.event(CLUSTER_PEER_ADVERTISE_REFUSED);
+	trace.event(CLUSTER_PEER_ADVERTISE_REFUSED)?;
+
 	reply_frame(&frame.metadata.id, PeerAdvertisementResponse { status })
 }
 

@@ -66,7 +66,8 @@ pub(crate) async fn handle_register(
 	match registered {
 		Ok(()) => {
 			let hive_count = registry.len().unwrap_or_default() as u64;
-			let _ = trace.event_with(CLUSTER_HIVE_REGISTERED, &[], hive_count);
+			trace.event_with(CLUSTER_HIVE_REGISTERED, &[], hive_count)?;
+
 			let response = RegisterHiveResponse { status: TransitStatus::Ok, hive_id: Some(hive_identity) };
 			reply_frame(&frame.metadata.id, response)
 		}
@@ -102,7 +103,8 @@ pub(crate) async fn handle_address_update(
 
 	match servlet_registry.apply_address_update(&hive_id, added, &removed) {
 		Ok(()) => {
-			let _ = trace.event(CLUSTER_UPDATE_ACCEPTED);
+			trace.event(CLUSTER_UPDATE_ACCEPTED)?;
+
 			let response = ServletAddressUpdateResponse { status: TransitStatus::Ok };
 			reply_frame(&frame.metadata.id, response)
 		}
@@ -208,7 +210,8 @@ fn refuse_register(
 	trace: &TraceCollector,
 	status: TransitStatus,
 ) -> Result<Option<Frame>, TightBeamError> {
-	let _ = trace.event(CLUSTER_REGISTER_REFUSED);
+	trace.event(CLUSTER_REGISTER_REFUSED)?;
+
 	let response = RegisterHiveResponse { status, hive_id: None };
 	reply_frame(&frame.metadata.id, response)
 }
@@ -228,7 +231,8 @@ fn refuse_update(
 	trace: &TraceCollector,
 	status: TransitStatus,
 ) -> Result<Option<Frame>, TightBeamError> {
-	let _ = trace.event(CLUSTER_UPDATE_REFUSED);
+	trace.event(CLUSTER_UPDATE_REFUSED)?;
+
 	let response = ServletAddressUpdateResponse { status };
 	reply_frame(&frame.metadata.id, response)
 }
