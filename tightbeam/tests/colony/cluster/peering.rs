@@ -553,12 +553,16 @@ tb_assert_spec! {
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1)),
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
-			(PEER_ROUTES_AFTER, exactly!(1), equals!(0u64))
+			(PEER_ROUTES_AFTER, exactly!(1), equals!(0u64)),
+			(PEER_HINT_LEARNED_ON_REFUSE, exactly!(1), equals!(1u64))
 		]
 	}
 }
 
 // Claimed gateway_addr that matches a local servlet address is refused.
+// The refusal gates routing state only: the admitted identity still
+// lands in the discovery new table, where the probe gate decides its
+// fate. A slate refusal therefore never erases graph connectivity.
 tb_scenario! {
 	name: cluster_refuses_peer_dial_colliding_local_servlet,
 	spec: ClusterPeerCollideSpec,
@@ -566,7 +570,9 @@ tb_scenario! {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let cluster = start_cluster(&trace, peering_cluster_conf(&certs)).await?;
+			let conf = peering_cluster_conf(&certs);
+			let table = Arc::clone(&conf.peer.table);
+			let cluster = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(cluster.addr()).await?;
 
 			let hive_addr = hive.addr().to_string().into_bytes();
@@ -580,6 +586,9 @@ tb_scenario! {
 			.await?;
 
 			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("echo")]).await?;
+
+			let (new_count, _) = table.learned().unwrap_or_default();
+			trace.event_with(PEER_HINT_LEARNED_ON_REFUSE, &[], new_count as u64)?;
 
 			cluster.stop();
 			hive.stop();

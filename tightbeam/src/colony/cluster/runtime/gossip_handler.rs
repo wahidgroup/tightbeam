@@ -75,7 +75,12 @@ pub(crate) async fn handle_peer_ad(
 	// beat graph stays unidirectional and a seed-bootstrapped node is
 	// never dialed back. The hint sits in the capped new table until
 	// this gateway's own probe passes the colony gate.
+	//
+	// Learning precedes slate reconciliation because the hint depends
+	// only on the admitted identity and dial address, not on routing
+	// state. A slate refusal below MUST NOT erase graph connectivity.
 	let hint = admitted.discovery_hint();
+	let _ = config.peer.table.learn(hint);
 
 	if let Err(error) = servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
 		let status = match error {
@@ -85,7 +90,6 @@ pub(crate) async fn handle_peer_ad(
 		return refuse_peer_ad_release(&frame, &trace, replay_guard, status);
 	}
 
-	let _ = config.peer.table.learn(hint);
 	let _ = trace.event(CLUSTER_PEER_ADVERTISED);
 	reply_frame(&frame.metadata.id, PeerAdvertisementResponse { status: TransitStatus::Ok })
 }
