@@ -31,7 +31,7 @@ use crate::builder::frame::FrameBuilder;
 #[cfg(feature = "x509")]
 use crate::builder::TypeBuilder;
 #[cfg(feature = "x509")]
-use crate::colony::cluster::peer::cert_fingerprint_id;
+use crate::colony::cluster::peer::{cert_fingerprint_id, peer_dial_allowed};
 #[cfg(feature = "x509")]
 use crate::colony::cluster::{
 	cert_colony_urn, gossip_digest, gossip_fresh, peer_signer_fingerprint, wanted_digests, Admission, AdmittedGossip,
@@ -40,7 +40,7 @@ use crate::colony::cluster::{
 #[cfg(feature = "x509")]
 use crate::colony::common::{
 	current_timestamp_ms, ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipWant,
-	PeerAdvertisement, PeerAdvertisementResponse,
+	PeerAdvertisement, PeerAdvertisementResponse, PeerGossip,
 };
 #[cfg(feature = "x509")]
 use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_PEX_SAMPLE};
@@ -290,6 +290,26 @@ fn reconcile_reply_oversized(reply: &GossipWant) -> bool {
 	reply.want.len() > MAX_GOSSIP_LOG || reply.pex.len() > MAX_PEX_SAMPLE
 }
 
+/// Peer-exchange hints that this gateway may learn.
+///
+/// An entry must parse as a discovery hint and pass the operator's dial
+/// allowlist. The allowlist gates a shared address exactly like an
+/// inbound advertisement claim, so a later feeler probe never dials an
+/// address the operator refused (CWE-284).
+///
+/// Sources:
+/// - CWE-284, improper access control:
+///   <https://cwe.mitre.org/data/definitions/284.html>
+#[cfg(feature = "x509")]
+fn admissible_pex_hints<'c>(
+	pex: Vec<PeerGossip>,
+	allowlist: Option<&'c [String]>,
+) -> impl Iterator<Item = PeerHint> + 'c {
+	pex.into_iter()
+		.filter_map(|entry| PeerHint::try_from(entry).ok())
+		.filter(move |hint| peer_dial_allowed(hint.gateway_addr.as_bytes(), allowlist))
+}
+
 /// One anti-entropy reconcile round with a peer, including grey-hole scoring.
 #[cfg(feature = "x509")]
 pub(crate) async fn reconcile_gossip_async<P, D>(
@@ -371,9 +391,11 @@ where
 	let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 	let reply: GossipWant = decode(&response.message)?;
 
-	// Oversized want-list or PEX sample is abuse: drop the round (CWE-770).
+	// Oversized want-list or PEX sample is abuse: fail the round (CWE-770).
+	// The beat then scores the peer like any failed round, so an abuser
+	// is discarded from `new` or counted toward eviction from `tried`.
 	if reconcile_reply_oversized(&reply) {
-		return Ok(());
+		return Err(ClusterError::OversizedReconcileReply);
 	}
 
 	// The completed round is the verified probe of the addrman discipline.
@@ -396,6 +418,7 @@ where
 
 	// PEX entries are unverified hints.
 	//
+	// - The dial allowlist gates them before they are learned.
 	// - They enter the capped new table only.
 	// - They become dial targets solely through a later feeler probe that
 	//   passes the same colony gate as above.
@@ -403,8 +426,8 @@ where
 	// Sources:
 	// - CWE-345, insufficient verification of data authenticity:
 	//   <https://cwe.mitre.org/data/definitions/345.html>
-	let hints = pex.into_iter().filter_map(|entry| PeerHint::try_from(entry).ok());
-	let _ = config.peer.table.learn(hints)?;
+	let hints = admissible_pex_hints(pex, config.peer.peer_dial_allowlist.as_deref());
+	config.peer.table.learn(hints)?;
 
 	let wanted = wanted_digests(&want);
 
@@ -740,7 +763,6 @@ where
 #[cfg(all(test, feature = "x509"))]
 mod tests {
 	use super::*;
-	use crate::colony::common::PeerGossip;
 
 	fn reply(want_len: usize, pex_len: usize) -> GossipWant {
 		let want = vec![vec![0u8; 32]; want_len];
@@ -758,5 +780,25 @@ mod tests {
 		for (want_len, pex_len, oversized) in cases {
 			assert_eq!(reconcile_reply_oversized(&reply(want_len, pex_len)), oversized);
 		}
+	}
+
+	fn pex_entry(addr: &str) -> PeerGossip {
+		PeerGossip { peer_id: Vec::new(), gateway_addr: addr.as_bytes().to_vec() }
+	}
+
+	#[test]
+	fn pex_hints_admitted_without_allowlist() {
+		let pex = vec![pex_entry("10.0.0.1:9000"), pex_entry("10.66.0.1:9000")];
+		let admitted: Vec<PeerHint> = admissible_pex_hints(pex, None).collect();
+		assert_eq!(admitted.len(), 2);
+	}
+
+	#[test]
+	fn pex_hints_off_allowlist_refused() {
+		let allowlist = vec![String::from("10.0.0.1:9000")];
+		let pex = vec![pex_entry("10.0.0.1:9000"), pex_entry("10.66.0.1:9000")];
+		let admitted: Vec<PeerHint> = admissible_pex_hints(pex, Some(&allowlist)).collect();
+		assert_eq!(admitted.len(), 1);
+		assert_eq!(admitted[0].gateway_addr, "10.0.0.1:9000");
 	}
 }

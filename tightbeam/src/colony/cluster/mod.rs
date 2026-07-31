@@ -200,6 +200,8 @@ pub struct PeerConfig {
 	pub advertise_interval: Option<Duration>,
 	/// When `Some`, inbound peer ads may only claim dial addresses in this
 	/// list (exact string match). `None` accepts any parseable socket.
+	/// Peer-exchange hints pass the same gate before the table learns
+	/// them, so discovery never dials an address outside the list.
 	pub peer_dial_allowlist: Option<Vec<String>>,
 	/// Discovery table: `peers` as un-evictable anchors plus bounded,
 	/// prefix-bucketed learned peers. The config builder rebuilds it so

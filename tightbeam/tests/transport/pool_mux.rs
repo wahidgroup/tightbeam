@@ -102,6 +102,8 @@ pub(crate) const LEASE_EXPOSES_SETTLED_RECEIPT: Urn<'static> =
 	Urn::new("test", "event:pool-mux/lease-exposes-settled-receipt");
 pub(crate) const LEASE_OBSERVES_ROTATED_RECEIPT: Urn<'static> =
 	Urn::new("test", "event:pool-mux/lease-observes-rotated-receipt");
+pub(crate) const MUX_LEASE_PINS_PEER_CERTIFICATE: Urn<'static> =
+	Urn::new("test", "event:pool-mux/mux-lease-pins-peer-certificate");
 pub(crate) const OVERFLOW_EMIT_ECHOES_ON_SECOND_CONNECTION: Urn<'static> =
 	Urn::new("test", "event:pool-mux/overflow-emit-echoes-on-second-connection");
 pub(crate) const REFUSED_EMIT_SURFACES_BUSY: Urn<'static> =
@@ -517,6 +519,39 @@ tb_scenario! {
 				&[],
 				duplex_refused && unary_refused && served,
 			)?;
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub MuxPeerCertificateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::POOL_DIAL, exactly!(1)),
+			(MUX_LEASE_PINS_PEER_CERTIFICATE, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A caller that gates policy on peer identity reads the certificate off
+// the lease before its first emit. A mux connection handshakes eagerly
+// at dial, so its lease must expose the validated peer certificate the
+// same way an exclusive lease does.
+tb_scenario! {
+	name: pooled_mux_lease_exposes_peer_certificate,
+	spec: MuxPeerCertificateSpec,
+	environment ServiceClient {
+		context: ServerMaterials::generate(),
+		server: |env| async move { start_echo_server(&env.context, Some(mux_offer(8))).await },
+		client: |ClientEnv { trace, context: materials, addr }| async move {
+			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
+			let lease = pool.connect(addr).await?;
+
+			let pinned = lease.peer_certificate() == Some(&materials.certificate);
+			trace.event_with(MUX_LEASE_PINS_PEER_CERTIFICATE, &[], pinned)?;
 			Ok(())
 		}
 	}

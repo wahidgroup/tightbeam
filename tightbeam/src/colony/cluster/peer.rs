@@ -142,7 +142,7 @@ fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
 ///
 /// `None` accepts any address that already passed [`peer_gateway_addr_valid`].
 #[must_use]
-fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool {
+pub(crate) fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool {
 	let Some(allowed) = allowlist else {
 		return true;
 	};

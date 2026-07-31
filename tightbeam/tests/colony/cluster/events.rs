@@ -72,6 +72,8 @@ pub(crate) const PEER_PROBE_FOREIGN_REFUSED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-probe-foreign-refused");
 pub(crate) const PEER_HINT_LEARNED_ON_REFUSE: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-hint-learned-on-refuse");
+pub(crate) const PEER_ABUSE_CANDIDATE_DISCARDED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-abuse-candidate-discarded");
 pub(crate) const PEER_EVICT_MEMBER_PROMOTED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-evict-member-promoted");
 pub(crate) const PEER_EVICT_TARGET_DROPPED: Urn<'static> = Urn::new("test", "event:cluster/peer-evict-target-dropped");

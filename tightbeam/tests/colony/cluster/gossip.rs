@@ -1,6 +1,12 @@
 //! Gossip flood (rumor plane).
 
 use super::common::*;
+use tightbeam::colony::common::{reply_frame, PeerGossip};
+use tightbeam::constants::MAX_PEX_SAMPLE;
+use tightbeam::prelude::TightBeamSocketAddr;
+use tightbeam::server;
+use tightbeam::transport::handshake::HandshakeKeyManager;
+use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 
 // ============================================================================
 // Gossip Flood (rumor plane)
@@ -1983,6 +1989,80 @@ async fn wait_for_target_dropped(table: &PeerTable, addr: &str, attempts: u32, i
 	dropped(table)
 }
 
+/// Same-colony gateway that answers every frame with an oversized
+/// peer-exchange sample.
+///
+/// The TLS identity is honest, so the prober's colony gate passes.
+/// Only the reply volume abuses the protocol.
+async fn start_oversized_reconcile_server(
+	certs: &ClusterTestCerts,
+) -> Result<(tokio::task::JoinHandle<()>, String), TightBeamError> {
+	let key_manager = HandshakeKeyManager::new(Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())));
+	let config = TransportEncryptionConfig::new(certs.cert.to_owned(), key_manager);
+	let bind_addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
+	let (listener, addr) = TokioListener::bind_with(bind_addr, config).await?;
+
+	let handle = server! {
+		protocol TokioListener: listener,
+		handle: move |frame: Frame| async move {
+			let entry = PeerGossip { peer_id: Vec::new(), gateway_addr: b"10.66.0.1:9000".to_vec() };
+			let pex = vec![entry; MAX_PEX_SAMPLE + 1];
+			reply_frame(&frame.metadata.id, GossipWant { want: Vec::new(), pex })
+		}
+	};
+
+	Ok((handle, addr.to_string()))
+}
+
+tb_assert_spec! {
+	pub ClusterOversizedReplySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_PEER_DISCOVERED, exactly!(0)),
+			(PEER_ABUSE_CANDIDATE_DISCARDED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// An oversized reconcile reply is misbehavior, not a completed round.
+//
+// The rogue holds a valid same-colony certificate, so it passes the
+// handshake and the colony gate. Its reply exceeds MAX_PEX_SAMPLE.
+//
+// - The candidate is never promoted (CLUSTER_PEER_DISCOVERED exactly 0).
+// - The probe discards the candidate, so the abuser cannot hold a
+//   prefix bucket slot or re-enter the probe rotation.
+tb_scenario! {
+	name: cluster_feeler_discards_oversized_reconcile_reply,
+	spec: ClusterOversizedReplySpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let (rogue, rogue_addr) = start_oversized_reconcile_server(&certs).await?;
+
+			let prober_conf = fast_probing_conf(&certs, Arc::clone(&certs.trust));
+			let table = Arc::clone(&prober_conf.peer.table);
+			let prober = start_cluster(&trace, prober_conf).await?;
+
+			let _ = table.learn(vec![PeerHint { gateway_addr: rogue_addr.clone(), peer_id: None }]);
+
+			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
+			let targets = table.target_set().unwrap_or_default();
+			trace.event_with(PEER_ABUSE_CANDIDATE_DISCARDED, &[], drained && !targets.contains(&rogue_addr))?;
+
+			rogue.abort();
+			prober.stop();
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
 tb_assert_spec! {
 	pub ClusterPeerEvictionSpec,
 	V(1,0,0): {
@@ -2023,6 +2103,7 @@ tb_scenario! {
 			// - Expiring idle pool leases forces every beat onto a fresh dial.
 			// - The dropped listener refuses that dial, as a dead remote process would.
 			prober_conf.pool_config.idle_timeout = Some(Duration::from_millis(50));
+
 			let table = Arc::clone(&prober_conf.peer.table);
 			let prober = start_cluster(&trace, prober_conf).await?;
 

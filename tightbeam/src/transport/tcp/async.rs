@@ -521,6 +521,10 @@ where
 		take_rekey_context(self, MuxRole::Client)
 	}
 
+	fn handshake_peer_certificate(&self) -> Option<Arc<Certificate>> {
+		self.to_peer_certificate_arc()
+	}
+
 	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)> {
 		self.into_split()
 	}
