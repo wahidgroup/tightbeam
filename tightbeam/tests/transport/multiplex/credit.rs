@@ -11,7 +11,7 @@ use tightbeam::instrumentation::events;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{
 	GoAwayReason, MuxCreditPackage, MuxDataPackage, MuxEnvelope, MuxOpenPackage, MuxStreamKind,
@@ -145,7 +145,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: mux_stream_credit_stall_and_resume,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MuxCreditStallSpec::latest())
 		.with_csp(MuxCreditStallProcess)
 		.build(),
@@ -229,7 +229,7 @@ tb_process_spec! {
 // Zero budget: data emits fail fast; ping/shutdown still work.
 tb_scenario! {
 	name: mux_zero_budget_refuses_data_drains_clean,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MuxZeroBudgetSpec::latest())
 		.with_csp(MuxZeroBudgetProcess)
 		.build(),

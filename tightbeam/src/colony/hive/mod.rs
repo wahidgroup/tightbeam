@@ -1,10 +1,13 @@
 //! Hive framework for servlet orchestration.
 //!
-//! Hives orchestrate multiple servlets, enabling intra-hive communication
-//! and coordinated lifecycle management.
+//! - Manages servlet registration, scaling, and cluster control-plane traffic.
+//! - Exposes [`Hive`] and [`HiveConfig`] for application wiring.
 
 pub mod error;
 pub mod gates;
+pub mod runtime;
+
+pub use runtime::{HiveContextImpl, HiveRuntime};
 
 // Re-export common types used by hives
 pub use crate::colony::common::{
@@ -12,7 +15,7 @@ pub use crate::colony::common::{
 	ColonyNamespace, ColonyResource, HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse,
 	InstanceMetrics, ListServletsParams, ListServletsResult, LoadBalancer, PowerOfTwoChoices, RegisterHiveRequest,
 	RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletAddressUpdate,
-	ServletAddressUpdateResponse, ServletInfo, ServletScaleConf, SpawnServletParams, SpawnServletResult,
+	ServletAddressUpdateResponse, ServletInfo, ServletScaleConfig, SpawnServletParams, SpawnServletResult,
 	StochasticForager, StopServletParams, StopServletResult,
 };
 
@@ -43,7 +46,7 @@ use core::time::Duration;
 
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
 use crate::trace::TraceCollector;
-use crate::transport::handshake::negotiation::TransportOffer;
+use crate::transport::client::pool::PoolConfig;
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::serve::unimplemented_error;
@@ -78,8 +81,8 @@ pub type SpawnerFn = Arc<
 /// This enables hives to store servlets of different types in a single collection.
 /// Servlets implement this trait to be registerable with a hive.
 pub trait ServletBox: Send + Sync {
-	/// Get the servlet's bound address as bytes
-	fn addr_bytes(&self) -> Vec<u8>;
+	/// Shared bound-address bytes (encoded once at servlet start).
+	fn addr_bytes(&self) -> Arc<[u8]>;
 
 	/// Stop the servlet (consumes the boxed servlet)
 	fn stop_boxed(self: Box<Self>);
@@ -113,11 +116,11 @@ pub trait ServletBox: Send + Sync {
 
 /// A registered servlet with its spawner function for auto-scaling.
 pub struct ServletRegistration {
-	/// The running servlet instance
+	/// Running servlet instance stored under the hive registry.
 	pub servlet: Box<dyn ServletBox>,
-	/// Function to spawn additional instances of this servlet type
+	/// Closure that creates another instance of this servlet type.
 	pub spawner: SpawnerFn,
-	/// The servlet type URN (e.g., `urn:tightbeam::servlet:auth`)
+	/// Type URN that identifies this servlet kind for routing and scaling.
 	pub servlet_type: Urn<'static>,
 }
 
@@ -213,7 +216,10 @@ impl ServletRegistry for HashMapRegistry {
 			.map(|guard| {
 				guard
 					.values()
-					.map(|reg| (reg.servlet_type.clone(), reg.servlet.addr_bytes()))
+					.map(|reg| {
+						let address = reg.servlet.addr_bytes().as_ref().to_vec();
+						(reg.servlet_type.clone(), address)
+					})
 					.collect()
 			})
 			.unwrap_or_default()
@@ -271,7 +277,7 @@ pub trait Hive: Sized + Send + Sync {
 	///
 	/// The hive is created but not yet established. Call `register()` to add
 	/// servlets, then `establish()` to start the hive.
-	fn new(config: Option<HiveConf>) -> Result<Self, TightBeamError>;
+	fn new(config: Option<HiveConfig>) -> Result<Self, TightBeamError>;
 
 	/// Register an already-started servlet with the hive.
 	///
@@ -309,14 +315,14 @@ pub trait Hive: Sized + Send + Sync {
 	/// Created at `new` and populated with servlet addresses at
 	/// `establish`; the same `Arc` is live-updated as servlets scale.
 	/// Hand it to
-	/// [`ServletConfBuilder::with_hive_context`](crate::colony::servlet::ServletConfBuilder::with_hive_context)
+	/// [`ServletConfigBuilder::with_hive_context`](crate::colony::servlet::ServletConfigBuilder::with_hive_context)
 	/// so servlet handlers can reach siblings, or use it directly for
 	/// [`HiveContext::call`], [`HiveContext::open_stream`], and
 	/// [`HiveContext::open_duplex`].
 	fn context(&self) -> Arc<dyn HiveContext>;
 
 	/// Get the hive's control server address.
-	fn addr(&self) -> Self::Address;
+	fn addr(&self) -> &Self::Address;
 
 	/// Get addresses of all registered servlets.
 	///
@@ -335,11 +341,14 @@ pub trait Hive: Sized + Send + Sync {
 	/// The cluster will then route work to the servlets and send management
 	/// commands (heartbeat, spawn, stop) to this hive's control server.
 	///
+	/// Must be called after [`Hive::establish`]. A provisional address from
+	/// [`Hive::new`] is not a live control socket.
+	///
 	/// # Arguments
 	/// * `cluster_addr` - The address of the cluster controller
 	fn register_with_cluster(
 		&self,
-		cluster_addr: <Self::Protocol as Protocol>::Address,
+		cluster_addr: &<Self::Protocol as Protocol>::Address,
 	) -> impl Future<Output = Result<RegisterHiveResponse, TightBeamError>> + Send;
 
 	/// Begin graceful shutdown - stop accepting new requests.
@@ -356,17 +365,16 @@ pub trait Hive: Sized + Send + Sync {
 // TLS Configuration
 // =============================================================================
 
-/// TLS configuration for hive servlets
+/// TLS material for hive control-plane and servlet identity.
 ///
-/// Contains certificate, key, and validators for encrypted transport.
-/// Wrapped in `Arc` when stored in `HiveConf` because validators are trait objects.
+/// Wrapped in `Arc` inside [`HiveConfig`] because validators are trait objects.
 #[cfg(feature = "x509")]
 pub struct HiveTlsConfig {
-	/// Server certificate specification
+	/// Server certificate specification used for TLS identity.
 	pub certificate: crate::crypto::x509::CertificateSpec,
-	/// Private key provider for signing operations
+	/// Private key provider used for handshake and control-frame signing.
 	pub key: Arc<dyn crate::crypto::key::SigningKeyProvider>,
-	/// Client certificate validators (e.g., public key pinning)
+	/// Client certificate validators such as public-key pinning.
 	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 }
 
@@ -484,125 +492,146 @@ where
 // Hive Configuration
 // =============================================================================
 
-/// Configuration for hives
-///
-/// A hive resolves each servlet type to a single instance address, so it
-/// carries no balancer: instance selection across a type's replicas is the
-/// cluster gateway's job. See [`ClusterConf`](crate::colony::cluster::ClusterConf).
-#[derive(Clone)]
-pub struct HiveConf {
-	/// Naming scope resource URNs are validated against. Registrations
-	/// carrying a foreign authority or realm are refused at
-	/// [`Hive::register`], before anything reaches a cluster.
-	pub namespace: ColonyNamespace,
-	/// Default scaling config for all servlet types
-	pub default_scale: ServletScaleConf,
-	/// Per-type overrides (keyed by servlet type URN)
-	pub servlet_overrides: HashMap<Urn<'static>, ServletScaleConf>,
-	/// Cooldown between scaling decisions (default: 5 seconds)
+/// Auto-scale evaluation cadence and per-type overrides.
+#[derive(Clone, Debug)]
+pub struct HiveScalingConfig {
+	/// Default scaling thresholds applied when no per-type override exists.
+	pub default_scale: ServletScaleConfig,
+	/// Per-type scaling overrides keyed by servlet type URN.
+	pub overrides: HashMap<Urn<'static>, ServletScaleConfig>,
+	/// Minimum wait between scaling evaluation cycles.
 	pub cooldown: Duration,
-	/// Queue capacity per servlet for utilization calculation (default: 100)
-	pub queue_capacity: u32,
-	/// Backpressure threshold in basis points (default: 9000 = 90%)
-	pub backpressure_threshold: BasisPoints,
-	/// Circuit breaker failure threshold before tripping (default: 3)
-	pub circuit_breaker_threshold: u8,
-	/// Circuit breaker cooldown in milliseconds (default: 30_000)
-	pub circuit_breaker_cooldown_ms: u64,
-	/// Max connections per servlet for forwarding (default: 8)
-	pub servlet_pool_size: usize,
-	/// Idle timeout for pooled connections (default: 30s)
-	pub servlet_pool_idle_timeout: Option<Duration>,
-	/// Drain timeout before force-stop (default: 30s)
-	pub drain_timeout: Duration,
-	/// Freshness window for signed cluster commands in milliseconds
-	/// (default: 30_000). Commands whose `Frame.metadata.order` lies
-	/// outside this window of the hive clock, or whose signature was
-	/// already seen inside it, are rejected. See [`ReplayGuard`].
-	#[cfg(feature = "x509")]
-	pub command_freshness_window_ms: u64,
-	/// Retry policy for cluster notifications (scaling events).
-	/// Default: exponential backoff with 3 attempts, 500ms base delay.
-	#[cfg(feature = "std")]
-	pub cluster_notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
-	/// Trust store for certificate-based cluster command authentication
-	/// and for validating servlet certificates on intra-hive pool
-	/// connections. Required for receiving authenticated ClusterCommand
-	/// messages (if None, all cluster commands are rejected) and for
-	/// [`HiveContext`] calls to encrypted servlets (clients fail closed
-	/// without a trust anchor).
-	#[cfg(feature = "x509")]
-	pub trust_store: Option<Arc<dyn CertificateTrust>>,
-	/// TLS configuration for spawned servlets (default: None = plain transport)
-	#[cfg(feature = "x509")]
-	pub hive_tls: Option<Arc<HiveTlsConfig>>,
-	/// Multiplexing advertisement for the servlet pool and the control
-	/// server (default: `None` = single-flight). Pool connections to a
-	/// servlet multiplex only when the servlet also advertises via
-	/// [`ServletConfBuilder::with_mux_offer`](crate::colony::servlet::ServletConfBuilder::with_mux_offer)
-	pub mux_offer: Option<TransportOffer>,
-	/// Anti-entropy re-registration beat (default: 5s; `None` disables).
-	///
-	/// Every interval the hive re-announces its full servlet slate,
-	/// freshly signed, to every gateway it has registered with..
-	pub reregister_interval: Option<Duration>,
 }
 
-impl core::fmt::Debug for HiveConf {
+impl Default for HiveScalingConfig {
+	fn default() -> Self {
+		Self {
+			default_scale: ServletScaleConfig::default(),
+			overrides: HashMap::new(),
+			cooldown: Duration::from_secs(5),
+		}
+	}
+}
+
+/// Manage-path admission, drain, and gateway anti-entropy.
+#[derive(Clone)]
+pub struct HiveControlConfig {
+	/// Utilization threshold that trips manage-path backpressure.
+	pub backpressure_threshold: BasisPoints,
+	/// Maximum wait for graceful drain before force-stopping remaining servlets.
+	pub drain_timeout: Duration,
+	/// Anti-entropy interval for re-announcing the servlet slate to gateways.
+	///
+	/// Every interval the hive re-announces its full servlet slate, freshly
+	/// signed, to every gateway it has registered with. `None` disables the beat.
+	pub reregister_interval: Option<Duration>,
+	/// Consecutive auth failures that open the cluster circuit breaker.
+	pub circuit_breaker_threshold: u8,
+	/// Milliseconds the circuit breaker stays open before a half-open probe.
+	pub circuit_breaker_cooldown_ms: u64,
+	/// Freshness window for signed cluster commands in milliseconds.
+	///
+	/// Commands whose `Frame.metadata.order` is outside this window, or whose
+	/// signature was already seen inside it, are rejected. See [`ReplayGuard`].
+	#[cfg(feature = "x509")]
+	pub command_freshness_window_ms: u64,
+	/// Retry policy used when fanning out scaling updates to gateways.
+	#[cfg(feature = "std")]
+	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
+}
+
+impl core::fmt::Debug for HiveControlConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		let mut d = f.debug_struct("HiveConf");
-		d.field("namespace", &self.namespace)
-			.field("default_scale", &self.default_scale)
-			.field("servlet_overrides", &self.servlet_overrides)
-			.field("cooldown", &self.cooldown)
-			.field("queue_capacity", &self.queue_capacity)
-			.field("backpressure_threshold", &self.backpressure_threshold)
+		let mut d = f.debug_struct("HiveControlConfig");
+		d.field("backpressure_threshold", &self.backpressure_threshold)
+			.field("drain_timeout", &self.drain_timeout)
+			.field("reregister_interval", &self.reregister_interval)
 			.field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
 			.field("circuit_breaker_cooldown_ms", &self.circuit_breaker_cooldown_ms);
 		#[cfg(feature = "x509")]
 		d.field("command_freshness_window_ms", &self.command_freshness_window_ms);
-		d.field("servlet_pool_size", &self.servlet_pool_size)
-			.field("servlet_pool_idle_timeout", &self.servlet_pool_idle_timeout)
-			.field("drain_timeout", &self.drain_timeout);
 		#[cfg(feature = "std")]
-		d.field("cluster_notify_retry", &"<RetryPolicy>");
-		#[cfg(feature = "x509")]
-		d.field("trust_store", &self.trust_store.as_ref().map(|_| "<CertificateTrust>"));
-		#[cfg(feature = "x509")]
-		d.field("hive_tls", &self.hive_tls);
-		d.field("reregister_interval", &self.reregister_interval);
+		d.field("notify_retry", &"<RetryPolicy>");
 		d.finish()
 	}
 }
 
-impl Default for HiveConf {
+impl Default for HiveControlConfig {
 	fn default() -> Self {
 		Self {
-			namespace: ColonyNamespace::default(),
-			default_scale: ServletScaleConf::default(),
-			servlet_overrides: HashMap::new(),
-			cooldown: Duration::from_secs(5),
-			queue_capacity: 100,
 			backpressure_threshold: BasisPoints::new(DEFAULT_BACKPRESSURE_THRESHOLD_BPS),
+			drain_timeout: Duration::from_secs(30),
+			reregister_interval: Some(Duration::from_secs(5)),
 			circuit_breaker_threshold: 3,
 			circuit_breaker_cooldown_ms: 30_000,
-			servlet_pool_size: 8,
-			servlet_pool_idle_timeout: Some(Duration::from_secs(30)),
-			drain_timeout: Duration::from_secs(30),
 			#[cfg(feature = "x509")]
 			command_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			#[cfg(feature = "std")]
-			cluster_notify_retry: Arc::new(crate::transport::policy::RestartExponentialBackoff {
+			notify_retry: Arc::new(crate::transport::policy::RestartExponentialBackoff {
 				max_attempts: 3,
 				scale_factor: 500,
 				jitter: Some(Box::new(crate::transport::policy::DecorrelatedJitter)),
 			}),
+		}
+	}
+}
+
+/// Configuration for hive lifecycle, scaling, and control-plane security.
+///
+/// A hive resolves each servlet type to one local instance address.
+/// Instance selection across replicas is the cluster gateway's job.
+/// See [`ClusterConfig`](crate::colony::cluster::ClusterConfig).
+#[derive(Clone)]
+pub struct HiveConfig {
+	/// Naming scope resource URNs are validated against.
+	/// Registrations with a foreign authority or realm fail at [`Hive::register`].
+	pub namespace: ColonyNamespace,
+	/// Auto-scale evaluation and per-type overrides.
+	pub scaling: HiveScalingConfig,
+	/// Manage-path admission, drain, and gateway anti-entropy.
+	pub control: HiveControlConfig,
+	/// Intra-hive servlet pool and control-server mux advertisement.
+	///
+	/// Pool connections multiplex only when the servlet also advertises via
+	/// [`ServletConfigBuilder::with_mux_offer`](crate::colony::servlet::ServletConfigBuilder::with_mux_offer).
+	pub pool: PoolConfig,
+	/// Trust store for cluster-command auth and intra-hive servlet TLS.
+	///
+	/// When `None`, authenticated cluster commands are rejected and encrypted
+	/// servlet calls fail closed without a trust anchor.
+	#[cfg(feature = "x509")]
+	pub trust_store: Option<Arc<dyn CertificateTrust>>,
+	/// TLS identity for control-plane signing and encrypted transport.
+	#[cfg(feature = "x509")]
+	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+}
+
+impl core::fmt::Debug for HiveConfig {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		let mut d = f.debug_struct("HiveConfig");
+		d.field("namespace", &self.namespace)
+			.field("scaling", &self.scaling)
+			.field("control", &self.control)
+			.field("pool", &self.pool);
+		#[cfg(feature = "x509")]
+		d.field("trust_store", &self.trust_store.as_ref().map(|_| "<CertificateTrust>"));
+		#[cfg(feature = "x509")]
+		d.field("hive_tls", &self.hive_tls);
+		d.finish()
+	}
+}
+
+impl Default for HiveConfig {
+	fn default() -> Self {
+		Self {
+			namespace: ColonyNamespace::default(),
+			scaling: HiveScalingConfig::default(),
+			control: HiveControlConfig::default(),
+			pool: PoolConfig { max_connections: 8, idle_timeout: Some(Duration::from_secs(30)), mux_offer: None },
 			#[cfg(feature = "x509")]
 			trust_store: None,
 			#[cfg(feature = "x509")]
 			hive_tls: None,
-			mux_offer: None,
-			reregister_interval: Some(Duration::from_secs(5)),
 		}
 	}
 }

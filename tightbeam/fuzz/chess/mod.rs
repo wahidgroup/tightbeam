@@ -17,9 +17,9 @@ mod utils;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tightbeam::colony::servlet::ServletConf;
+use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
-use tightbeam::testing::{ScenarioConf, ServletEnv, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, ServletEnv, SetupEnv};
 use tightbeam::transport::policy::RestartExponentialBackoff;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::ClientBuilder;
@@ -27,7 +27,8 @@ use tightbeam::transport::ConnectionBuilder;
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 use board::{
-	ChessEngineServlet, ChessEngineServletConf, ChessMatchManager, ChessMoveRequest, ChessMoveResponse, GameStatusCode,
+	ChessEngineServlet, ChessEngineServletConfig, ChessMatchManager, ChessMoveRequest, ChessMoveResponse,
+	GameStatusCode,
 };
 use piece::Piece;
 use r#move::ChessMove;
@@ -152,16 +153,16 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(ChessAssertSpec::latest())
 		.with_csp(ChessGameFlow)
 		.build(),
 	environment Servlet {
-		context: ChessEngineServletConf {
+		context: ChessEngineServletConfig {
 			manager: ChessMatchManager::default(),
 		},
 		start: |SetupEnv { trace, context }| async move {
-			let servlet_conf = ServletConf::<TokioListener, ChessMoveRequest>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, ChessMoveRequest>::builder()
 				.with_config(context)
 				.build();
 

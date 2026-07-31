@@ -14,7 +14,7 @@ const DEFAULT_SCALE_DOWN_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Per-servlet-type scaling configuration
 #[derive(Debug, Clone, Copy)]
-pub struct ServletScaleConf {
+pub struct ServletScaleConfig {
 	/// Minimum instances to maintain (default: 1)
 	pub min_instances: usize,
 	/// Maximum instances allowed (default: 10)
@@ -36,7 +36,7 @@ pub struct ServletScaleConf {
 	pub scale_down_cooldown: Duration,
 }
 
-impl Default for ServletScaleConf {
+impl Default for ServletScaleConfig {
 	fn default() -> Self {
 		Self {
 			min_instances: 1,
@@ -59,7 +59,7 @@ pub struct ScalingMetrics {
 	/// Current instance count
 	pub current_instances: usize,
 	/// Scaling configuration for this type
-	pub config: ServletScaleConf,
+	pub config: ServletScaleConfig,
 }
 
 /// Output decision from the scaling worker

@@ -42,7 +42,7 @@ use x509::*;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
-	pub use crate::transport::policy::{CoreRetryPolicy, PolicyConf, RestartPolicy, RetryAction};
+	pub use crate::transport::policy::{CoreRetryPolicy, PolicyConfig, RestartPolicy, RetryAction};
 }
 
 #[cfg(feature = "transport-policy")]
@@ -116,7 +116,7 @@ impl ClientPolicies {
 	pub fn apply<P>(self, mut transport: P::Transport) -> P::Transport
 	where
 		P: Protocol,
-		P::Transport: MessageEmitter + MessageCollector + PolicyConf,
+		P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
 	{
 		if let Some(r) = self.restart {
 			transport = transport.with_restart(r);
@@ -221,10 +221,11 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 #[cfg(not(feature = "x509"))]
 impl<P: Protocol + Send, C: CryptoProvider + 'static> ClientBuilder<P, C>
 where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConf,
-	P::Address: Send,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
+	P::Address: Clone + Send,
 {
-	pub async fn connect(self, addr: P::Address) -> TransportResult<GenericClient<P>> {
+	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
+		let addr = addr.borrow().clone();
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let transport = P::create_transport(stream);
 		let configured = self.policies.apply::<P>(transport);
@@ -236,10 +237,11 @@ where
 #[cfg(feature = "x509")]
 impl<P: Protocol + Send, C: CryptoProvider + Send + Sync + 'static> ClientBuilder<P, C>
 where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C>,
-	P::Address: Send,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
+	P::Address: Clone + Send,
 {
-	pub async fn connect(self, addr: P::Address) -> TransportResult<GenericClient<P>> {
+	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
+		let addr = addr.borrow().clone();
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let mut transport = P::create_transport(stream);
 		if let Some(store) = self.trust_store {
@@ -265,7 +267,7 @@ where
 #[cfg(all(feature = "std", not(feature = "x509")))]
 impl<P: Protocol + Send, C: CryptoProvider + 'static> ConnectionBuilder<P> for ClientBuilder<P, C>
 where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConf,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
 	P::Address: Send,
 {
 	type Output = Self;
@@ -283,7 +285,7 @@ where
 #[cfg(all(feature = "std", feature = "x509"))]
 impl<P: Protocol + Send, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P> for ClientBuilder<P, C>
 where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C>,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
 	P::Address: Send,
 {
 	type Output = Self;

@@ -6,7 +6,7 @@ use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Event;
-use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, wcet, TightBeamError};
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario};
@@ -59,7 +59,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_rma_with_fdr,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(RmaAssertSpec::latest())
 		.with_csp(RmaSchedulableProcess)
 		.with_fdr(FdrConfig {

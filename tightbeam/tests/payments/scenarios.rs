@@ -15,14 +15,14 @@
 use std::sync::Arc;
 
 use sha3::Sha3_256;
+use tightbeam::exactly;
 use tightbeam::{
-	at_least,
 	builder::TypeBuilder,
 	colony::{
-		cluster::{Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		cluster::{Cluster, ClusterConfig, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
 		common::ColonyNamespace,
-		hive::{Hive, HiveConf, HiveTlsConfig},
-		servlet::ServletConf,
+		hive::{Hive, HiveConfig, HiveTlsConfig},
+		servlet::ServletConfig,
 	},
 	crypto::{
 		key::Secp256k1KeyProvider,
@@ -35,10 +35,10 @@ use tightbeam::{
 		},
 	},
 	decode, encode,
+	instrumentation::events,
 	policy::TransitStatus,
 	tb_assert_spec, tb_scenario,
 	testing::SetupEnv,
-	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 	},
@@ -51,11 +51,11 @@ use crate::common::x509::create_test_cert_with_key;
 use super::cluster::PaymentGatewayCluster;
 use super::currency::MonetaryAmount;
 use super::hives::PaymentProcessorHive;
-use super::messages::{CreditTransferTransaction, PaymentIdentification, PaymentStatusCode, TransactionStatus};
-use super::servlets::AuthorizationServlet;
+use super::messages::{CreditTransferTransaction, PaymentIdentification};
+use super::servlets::{AuthorizationServlet, AUTHORIZATION_APPROVED};
 
-pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> = Urn::new("test", "event:scenarios/authorization-approved");
-pub(crate) const WORK_COMPLETED: Urn<'static> = Urn::new("test", "event:scenarios/work-completed");
+/// Client-observed work reply status (`TransitStatus` on the wire response).
+pub(crate) const WORK_STATUS: Urn<'static> = Urn::new("test", "event:scenarios/work-status");
 
 /// Type URN the payment scenario registers and targets.
 fn authorization_urn() -> Urn<'static> {
@@ -116,13 +116,13 @@ fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
 	}
 }
 
-fn hive_tls_config(certs: &TestCerts) -> HiveConf {
+fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
 	let hive_tls = Arc::new(HiveTlsConfig {
 		certificate: CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
 		key: Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
 		validators: vec![],
 	});
-	HiveConf {
+	HiveConfig {
 		hive_tls: Some(hive_tls),
 		trust_store: Some(Arc::clone(&certs.cluster_trust)),
 		..Default::default()
@@ -131,14 +131,16 @@ fn hive_tls_config(certs: &TestCerts) -> HiveConf {
 
 fn servlet_tls_config(
 	certs: &TestCerts,
-) -> Result<ServletConf<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>, TightBeamError> {
+) -> Result<ServletConfig<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>, TightBeamError> {
 	Ok(
-		ServletConf::<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>::builder()
+		ServletConfig::<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>::builder()
 			.with_certificate(
 				CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
 				Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
 				vec![],
 			)?
+			// Match cluster/hive mux offers so work forwards negotiate mux.
+			.with_mux_offer(Some(TransportOffer::mux(8)))
 			.with_config(Arc::new(()))
 			.build(),
 	)
@@ -178,7 +180,14 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(WORK_COMPLETED, at_least!(1))
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(1)),
+			(events::CLUSTER_WORK_REFUSED, exactly!(0)),
+			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(0)),
+			(events::CLUSTER_WORK_FAILED, exactly!(0)),
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(0)),
+			(WORK_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(AUTHORIZATION_APPROVED, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -193,32 +202,26 @@ tb_scenario! {
 	environment Bare {
 		context: TestCerts::generate(),
 		exec: |SetupEnv { trace, context: certs }| async move {
-			// Start cluster; the gateway and hive both offer mux, so the
-			// colony links run multiplexed
-			let mut cluster_conf = ClusterConf::new(cluster_tls_config(&certs));
-			cluster_conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
+			// One shared collector so cluster instrument events and servlet
+			// outcomes land on the scenario spec (colony registration style).
+			let mut cluster_conf = ClusterConfig::new(cluster_tls_config(&certs));
+			cluster_conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
-			let cluster_trace = Arc::new(TraceCollector::new());
-			let cluster = PaymentGatewayCluster::start(Arc::clone(&cluster_trace), cluster_conf).await?;
+			let cluster = PaymentGatewayCluster::start(Arc::new(trace.share()), cluster_conf).await?;
 			let cluster_addr = cluster.addr();
 
-			// Start servlet with TLS
 			let servlet_conf = servlet_tls_config(&certs)?;
-			let servlet_trace = Arc::new(TraceCollector::new());
-			let servlet = AuthorizationServlet::start(Arc::clone(&servlet_trace), Some(servlet_conf)).await?;
+			let servlet = AuthorizationServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
 
-			// Create and establish hive
-			let mut hive = PaymentProcessorHive::new(Some(HiveConf {
-				mux_offer: Some(TransportOffer::mux(8)),
-				..hive_tls_config(&certs)
-			}))?;
+			let mut hive_conf = hive_tls_config(&certs);
+			hive_conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+
+			let mut hive = PaymentProcessorHive::new(Some(hive_conf))?;
 			hive.register(authorization_urn(), servlet, |t| AuthorizationServlet::start(t, None))?;
-			hive.establish(Arc::new(TraceCollector::new())).await?;
+			hive.establish(Arc::new(trace.share())).await?;
 
-			// Register hive with cluster
 			let _reg_response = hive.register_with_cluster(cluster_addr).await?;
 
-			// Create authorization transaction
 			let transaction = create_auth_transaction(b"E2E-001", MonetaryAmount::new(10000, *b"USD"));
 			let work_request =
 				ClusterRequest::Work(ClusterWorkRequest::new(authorization_urn(), encode(&transaction)?));
@@ -229,7 +232,6 @@ tb_scenario! {
 				.with_message(work_request)
 				.build()?;
 
-			// Connect to cluster with TLS
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(Arc::clone(&certs.cluster_trust))
 				.build();
@@ -237,20 +239,8 @@ tb_scenario! {
 			let mut client = builder.connect(cluster_addr).await?;
 			let response_frame = client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
+			trace.event_with(WORK_STATUS, &[], work_response.status)?;
 
-			// Mark test completion
-			trace.event(WORK_COMPLETED)?;
-
-			// Verify routing succeeded
-			if work_response.status == TransitStatus::Ok {
-				if let Some(payload) = work_response.payload {
-					let status: TransactionStatus = decode(&payload)?;
-					let is_approved = matches!(status.status, PaymentStatusCode::AcceptedCustomerProfile);
-					trace.event_with(AUTHORIZATION_APPROVED, &[] as &[&str], is_approved)?;
-				}
-			}
-
-			// Cleanup
 			hive.stop();
 			cluster.stop();
 

@@ -400,8 +400,8 @@ impl MuxHandle {
 	}
 
 	/// Connection-level liveness probe
-	/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)
-	/// analog): resolves when the peer's ack arrives.
+	/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)):
+	/// resolves when the peer's ack arrives.
 	///
 	/// No stream is allocated and the peer's application handler never runs,
 	/// so this doubles as an idle keepalive for links whose carrier cannot
@@ -433,9 +433,9 @@ impl MuxHandle {
 	}
 
 	/// Gracefully shut the connection down
-	/// ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8)
-	/// analog): sends GoAway, halts the allocator, awaits pending-table
-	/// drain, then closes the writer driver.
+	/// ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8)):
+	/// sends GoAway, halts the allocator, awaits pending-table drain, then
+	/// closes the writer driver.
 	///
 	/// A drain deadline composes by wrapping this future in the
 	/// caller's timer.

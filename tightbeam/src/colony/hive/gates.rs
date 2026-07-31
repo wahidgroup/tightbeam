@@ -356,12 +356,9 @@ impl ReplayGuard {
 /// 7. Reject signatures already seen inside the window (replay: `PermissionDenied`, not counted)
 /// 8. On success: record success (resets breaker)
 ///
-/// Only step 5 counts toward the circuit breaker: it is the sole failure
-/// that proves someone holds a trusted identity claim with a bad key.
-/// Counting anything an unauthenticated peer can send would let garbage
-/// frames sever the hive from its legitimate cluster (CWE-645). Steps 6-7
-/// are not counted either: a replayed capture carries a *valid* signature,
-/// and counting it would let a replay attacker trip the breaker.
+/// Only step 5 counts toward the circuit breaker.
+/// Counting unauthenticated failures would let garbage sever the control plane (CWE-645).
+/// Steps 6-7 are not counted: a replayed capture still carries a valid signature.
 #[cfg(feature = "x509")]
 pub struct ClusterSecurityGate {
 	/// Circuit breaker for tracking auth failures
@@ -418,11 +415,7 @@ impl GatePolicy for ClusterSecurityGate {
 			TrustVerification::Verified => {}
 		}
 
-		// Shape gate only; the decoded value is discarded and the command
-		// dispatcher decodes again. Running the decode HERE, before the
-		// freshness and replay steps, keeps a signed-but-malformed frame
-		// from ever taking a replay-guard record or consuming partition
-		// capacity (CWE-770).
+		// Decode before freshness so malformed frames never consume replay capacity (CWE-770).
 		let Ok(_command) = crate::decode::<ClusterCommand>(&frame.message) else {
 			return TransitStatus::PermissionDenied;
 		};
@@ -462,7 +455,7 @@ impl GatePolicy for ClusterSecurityGate {
 pub struct BackpressureGate {
 	/// Current aggregate utilization (basis points as u16)
 	utilization: Arc<AtomicU16>,
-	/// Threshold above which to reject (from HiveConf)
+	/// Threshold above which to reject (from HiveConfig)
 	threshold: BasisPoints,
 }
 

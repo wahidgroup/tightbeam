@@ -51,7 +51,7 @@ use tightbeam::{
 	instrumentation::TbInstrumentationConfig,
 	prelude::*,
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
-	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, ScenarioConf},
+	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, ScenarioConfig},
 	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig},
 	transport::{
 		tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient, PoolConfig,
@@ -146,16 +146,16 @@ use crate::dtn::{
 	messages::{EarthCommand, MessageChainState, RoverCommand, RoverTelemetry},
 	ordering::OutOfOrderBuffer,
 	servlets::{
-		EarthRelaySatelliteServlet, EarthRelaySatelliteServletConf, MarsRelaySatelliteServlet,
-		MarsRelaySatelliteServletConf, MissionControlServlet, MissionControlServletConf, MissionState, RoverServlet,
-		RoverServletConf,
+		EarthRelaySatelliteServlet, EarthRelaySatelliteServletConfig, MarsRelaySatelliteServlet,
+		MarsRelaySatelliteServletConfig, MissionControlServlet, MissionControlServletConfig, MissionState,
+		RoverServlet, RoverServletConfig,
 	},
 	storage::FrameStore,
 	workers::{
-		CommandAckHandlerWorker, CommandExecutionWorker, FrameRequestHandlerWorker, FrameRequestHandlerWorkerConf,
-		FrameResponseHandlerWorker, FrameResponseHandlerWorkerConf, MissionControlTelemetryHandlerWorker,
-		MissionControlTelemetryHandlerWorkerConf, RoverCommandHandlerWorker, RoverCommandHandlerWorkerConf,
-		TelemetryBuilderWorker, TelemetryBuilderWorkerConf,
+		CommandAckHandlerWorker, CommandExecutionWorker, FrameRequestHandlerWorker, FrameRequestHandlerWorkerConfig,
+		FrameResponseHandlerWorker, FrameResponseHandlerWorkerConfig, MissionControlTelemetryHandlerWorker,
+		MissionControlTelemetryHandlerWorkerConfig, RoverCommandHandlerWorker, RoverCommandHandlerWorkerConfig,
+		TelemetryBuilderWorker, TelemetryBuilderWorkerConfig,
 	},
 };
 
@@ -736,7 +736,7 @@ fn build_dtn_fdr_config_refinement() -> FdrConfig {
 
 tb_scenario! {
 	name: dtn_ultimate_realistic,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(DtnEventCountSpec::latest())
 		.with_csp(DtnComposedSystem)
 		.with_fdr(build_dtn_fdr_config_refinement())
@@ -886,7 +886,7 @@ tb_scenario! {
 				&config.rover_fault_handler,
 			));
 
-			let rover_config = RoverServletConf {
+			let rover_config = RoverServletConfig {
 				mars_relay_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder
 				mars_relay_pool: rover_mars_pool,
 				rover_signing_key: rover_signing_key.to_owned(),
@@ -900,23 +900,23 @@ tb_scenario! {
 			};
 
 			// Initialize workers for Rover
-			let command_handler_worker = RoverCommandHandlerWorker::new(RoverCommandHandlerWorkerConf {
+			let command_handler_worker = RoverCommandHandlerWorker::new(RoverCommandHandlerWorkerConfig {
 				mission_state: Arc::clone(&shared_mission_state),
 			});
 			let command_worker = CommandExecutionWorker::new(());
-			let telemetry_worker = TelemetryBuilderWorker::new(TelemetryBuilderWorkerConf {
+			let telemetry_worker = TelemetryBuilderWorker::new(TelemetryBuilderWorkerConfig {
 				default_battery: 85,
 				default_temp: -63,
 			});
-			let rover_frame_request_handler_worker = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConf {
+			let rover_frame_request_handler_worker = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConfig {
 				chain_processor: Arc::clone(&rover_processor),
 				can_cascade: false, // Rover is origin, cannot cascade
 			});
-			let rover_frame_response_handler_worker = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConf {
+			let rover_frame_response_handler_worker = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConfig {
 				chain_processor: Arc::clone(&rover_processor),
 			});
 
-			let rover_servlet_conf = tightbeam::colony::servlet::ServletConf::<TokioListener, RelayMessage>::builder()
+			let rover_servlet_conf = tightbeam::colony::servlet::ServletConfig::<TokioListener, RelayMessage>::builder()
 				.with_certificate(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(ROVER_PINNING)])?
 				.with_config(Arc::new(rover_config))
 				.with_worker(command_handler_worker)
@@ -926,7 +926,7 @@ tb_scenario! {
 				.with_worker(rover_frame_response_handler_worker)
 				.build();
 			let rover_servlet = RoverServlet::start(Arc::clone(&trace), Some(rover_servlet_conf)).await?;
-			let rover_addr = rover_servlet.addr();
+			let rover_addr = rover_servlet.addr().to_owned();
 
 			// Store rover address
 			config.rover_addr.write()?.replace(rover_addr);
@@ -945,7 +945,7 @@ tb_scenario! {
 			// Mars Relay needs earth_relay_addr which we don't have yet
 			// We'll use an Arc<RwLock<Option<>>> pattern and update it after Earth Relay starts
 			let mars_earth_relay_addr = Arc::new(RwLock::new(None));
-			let mars_relay_config = MarsRelaySatelliteServletConf {
+			let mars_relay_config = MarsRelaySatelliteServletConfig {
 				mars_relay_signing_key: mars_relay_signing_key.to_owned(),
 				mission_control_verifying_key: mc_verifying_key,
 				earth_relay_verifying_key: earth_relay_verifying_key_val,
@@ -960,15 +960,15 @@ tb_scenario! {
 			};
 
 			// Initialize workers for Mars Relay
-			let mars_frame_request_handler_worker = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConf {
+			let mars_frame_request_handler_worker = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConfig {
 				chain_processor: Arc::clone(&mars_relay_processor),
 				can_cascade: true, // Mars Relay can cascade in both directions
 			});
-			let mars_frame_response_handler_worker = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConf {
+			let mars_frame_response_handler_worker = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConfig {
 				chain_processor: Arc::clone(&mars_relay_processor),
 			});
 
-			let mars_relay_servlet_conf = tightbeam::colony::servlet::ServletConf::<TokioListener, RelayMessage>::builder()
+			let mars_relay_servlet_conf = tightbeam::colony::servlet::ServletConfig::<TokioListener, RelayMessage>::builder()
 				.with_certificate(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(MARS_RELAY_PINNING)])?
 				.with_config(Arc::new(mars_relay_config))
 				.with_worker(mars_frame_request_handler_worker)
@@ -976,7 +976,7 @@ tb_scenario! {
 				.build();
 			let mars_relay_servlet_conf = Some(mars_relay_servlet_conf);
 			let mars_relay_servlet = MarsRelaySatelliteServlet::start(Arc::clone(&trace), mars_relay_servlet_conf).await?;
-			let mars_relay_addr = mars_relay_servlet.addr();
+			let mars_relay_addr = mars_relay_servlet.addr().to_owned();
 
 			// Store Mars Relay servlet and address
 			config._mars_relay_servlet.write()?.replace(mars_relay_servlet);
@@ -995,7 +995,7 @@ tb_scenario! {
 
 			// Earth Relay needs mission_control_addr which we don't have yet
 			let earth_mission_control_addr = Arc::new(RwLock::new(None));
-			let earth_relay_config = EarthRelaySatelliteServletConf {
+			let earth_relay_config = EarthRelaySatelliteServletConfig {
 				earth_relay_signing_key: earth_relay_signing_key.to_owned(),
 				mission_control_verifying_key: mc_verifying_key,
 				mars_relay_verifying_key: mars_relay_verifying_key_val,
@@ -1010,15 +1010,15 @@ tb_scenario! {
 			};
 
 			// Initialize workers for Earth Relay
-			let earth_frame_request_handler_worker = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConf {
+			let earth_frame_request_handler_worker = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConfig {
 				chain_processor: Arc::clone(&earth_relay_processor),
 				can_cascade: true, // Earth Relay can cascade in both directions
 			});
-			let earth_frame_response_handler_worker = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConf {
+			let earth_frame_response_handler_worker = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConfig {
 				chain_processor: Arc::clone(&earth_relay_processor),
 			});
 
-			let earth_relay_servlet_conf = tightbeam::colony::servlet::ServletConf::<TokioListener, RelayMessage>::builder()
+			let earth_relay_servlet_conf = tightbeam::colony::servlet::ServletConfig::<TokioListener, RelayMessage>::builder()
 				.with_certificate(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(EARTH_RELAY_PINNING)])?
 				.with_config(Arc::new(earth_relay_config))
 				.with_worker(earth_frame_request_handler_worker)
@@ -1026,7 +1026,7 @@ tb_scenario! {
 				.build();
 			let earth_relay_servlet_conf = Some(earth_relay_servlet_conf);
 			let earth_relay_servlet = EarthRelaySatelliteServlet::start(Arc::clone(&trace), earth_relay_servlet_conf).await?;
-			let earth_relay_addr = earth_relay_servlet.addr();
+			let earth_relay_addr = earth_relay_servlet.addr().to_owned();
 
 			// Update Mars Relay's earth_relay_addr
 			*mars_earth_relay_addr.write()? = Some(earth_relay_addr);
@@ -1039,7 +1039,7 @@ tb_scenario! {
 			// 4. START MISSION CONTROL SERVLET
 			// ================================================================
 
-			let mc_config = MissionControlServletConf {
+			let mc_config = MissionControlServletConfig {
 				mission_control_signing_key: mission_control_signing_key.to_owned(),
 				rover_verifying_key: rover_verifying_key_val,
 				earth_relay_verifying_key: earth_relay_verifying_key_val,
@@ -1051,20 +1051,20 @@ tb_scenario! {
 			};
 
 			// Initialize workers for Mission Control
-			let telemetry_handler_worker = MissionControlTelemetryHandlerWorker::new(MissionControlTelemetryHandlerWorkerConf {
+			let telemetry_handler_worker = MissionControlTelemetryHandlerWorker::new(MissionControlTelemetryHandlerWorkerConfig {
 				mission_state: Arc::clone(&shared_mission_state),
 				max_commands: COMMAND_ROUND_TRIPS as u64,
 			});
-			let frame_request_handler_worker = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConf {
+			let frame_request_handler_worker = FrameRequestHandlerWorker::new(FrameRequestHandlerWorkerConfig {
 				chain_processor: Arc::clone(&mc_processor),
 				can_cascade: false, // Mission Control is origin, cannot cascade
 			});
-			let frame_response_handler_worker = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConf {
+			let frame_response_handler_worker = FrameResponseHandlerWorker::new(FrameResponseHandlerWorkerConfig {
 				chain_processor: Arc::clone(&mc_processor),
 			});
 			let command_ack_handler_worker = CommandAckHandlerWorker::new(());
 
-			let mc_servlet_conf = tightbeam::colony::servlet::ServletConf::<TokioListener, RelayMessage>::builder()
+			let mc_servlet_conf = tightbeam::colony::servlet::ServletConfig::<TokioListener, RelayMessage>::builder()
 				.with_certificate(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(MISSION_CONTROL_PINNING)])?
 				.with_config(Arc::new(mc_config))
 				.with_worker(telemetry_handler_worker)
@@ -1073,7 +1073,7 @@ tb_scenario! {
 				.with_worker(command_ack_handler_worker)
 				.build();
 			let mc_servlet = MissionControlServlet::start(Arc::clone(&trace), Some(mc_servlet_conf)).await?;
-			let mc_addr = mc_servlet.addr();
+			let mc_addr = mc_servlet.addr().to_owned();
 
 			// Update Earth Relay's mission_control_addr
 			*earth_mission_control_addr.write()? = Some(mc_addr);

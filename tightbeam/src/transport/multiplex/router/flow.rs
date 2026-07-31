@@ -46,7 +46,7 @@ pub(super) fn renewal_floor(drain_floor: u64) -> u64 {
 }
 
 /// Receiver-side stream credit policy: decides when to raise a
-/// stream's absolute cumulative chunk limit (QUIC MAX_STREAM_DATA analog,
+/// stream's absolute cumulative chunk limit (QUIC MAX_STREAM_DATA,
 /// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
 ///
 /// The receiver's granted limit bounds per-stream reassembly memory

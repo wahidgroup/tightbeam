@@ -6,8 +6,6 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "x509")]
-use super::ClusterTlsConfig;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
@@ -15,6 +13,9 @@ use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool, PoolConf
 use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::Protocol;
 use crate::TightBeamError;
+
+#[cfg(feature = "x509")]
+use super::ClusterTlsConfig;
 
 type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
 type ClusterKey = HandshakeKeyManager<DefaultCryptoProvider>;

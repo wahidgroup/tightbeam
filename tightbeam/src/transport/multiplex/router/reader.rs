@@ -141,7 +141,7 @@ where
 	/// Bounds `peer_reassembly` so partial opens cannot hold state
 	/// beyond the cap
 	/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)
-	/// stream accounting analog).
+	/// stream accounting).
 	peer_cap: u32,
 	/// Largest chunk payload accepted inbound (locally advertised)
 	recv_chunk_size: usize,

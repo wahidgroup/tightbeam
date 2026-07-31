@@ -8,7 +8,7 @@
 
 #![cfg(feature = "testing-fdr")]
 
-use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConf, SetupEnv};
+use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
@@ -115,7 +115,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_tennis_valid_trace_refinement,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(ValidTennisSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![TennisScorer::process()],
@@ -156,7 +156,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_tennis_invalid_trace_refinement,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(InvalidTennisSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![TennisScorer::process()],
@@ -199,7 +199,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_tennis_deuce_to_advantage,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(DeuceTennisSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![TennisScorer::process()],
@@ -242,7 +242,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_failures_refinement,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(FailuresTennisSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![TennisScorer::process()],

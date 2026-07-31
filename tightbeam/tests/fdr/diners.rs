@@ -7,7 +7,7 @@
 
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const EATS: Urn<'static> = Urn::new("test", "event:diners/eats");
@@ -242,7 +242,7 @@ tightbeam::tb_assert_spec! {
 
 tightbeam::tb_scenario! {
 	name: test_philosophers_valid_trace_refinement,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(ValidPhilosopherSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![DiningPhilosophers::process()],
@@ -288,7 +288,7 @@ tightbeam::tb_assert_spec! {
 
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_trace_refinement,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(DeadlockPhilosopherSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![DiningPhilosophers::process()],
@@ -336,7 +336,7 @@ tightbeam::tb_assert_spec! {
 
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_free_refinement,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(DeadlockFreePhilosopherSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![DeadlockFreePhilosophers::process()],
@@ -380,7 +380,7 @@ tightbeam::tb_scenario! {
 // The deadlock trace (both pick left) should fail refinement against deadlock-free spec
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_violates_deadlock_free,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(DeadlockPhilosopherSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![DeadlockFreePhilosophers::process()],

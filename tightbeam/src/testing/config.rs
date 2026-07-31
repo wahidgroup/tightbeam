@@ -1,6 +1,6 @@
 //! Unified configuration for tb_scenario! tests
 //!
-//! This module provides `ScenarioConf` and `ScenarioConfBuilder` for consolidating
+//! This module provides `ScenarioConfig` and `ScenarioConfigBuilder` for consolidating
 //! test specifications, CSP processes, FDR configuration, trace collectors, and hooks.
 //!
 //! ## Zero-Copy Design
@@ -32,7 +32,7 @@ use crate::testing::timing::TimingConstraints;
 
 /// Unified configuration for tb_scenario! tests (zero-copy with Arc wrapping)
 #[derive(Clone)]
-pub struct ScenarioConf {
+pub struct ScenarioConfig {
 	specs: Arc<Vec<&'static BuiltAssertSpec>>,
 	trace: Arc<TraceCollector>,
 	hooks: Option<Arc<TestHooks>>,
@@ -43,10 +43,10 @@ pub struct ScenarioConf {
 	fdr: Option<Arc<FdrConfig>>,
 }
 
-impl ScenarioConf {
+impl ScenarioConfig {
 	/// Create a new builder
-	pub fn builder() -> ScenarioConfBuilder {
-		ScenarioConfBuilder::default()
+	pub fn builder() -> ScenarioConfigBuilder {
+		ScenarioConfigBuilder::default()
 	}
 
 	// ===== Accessors (zero-copy) =====
@@ -74,7 +74,7 @@ impl ScenarioConf {
 	}
 }
 
-impl Default for ScenarioConf {
+impl Default for ScenarioConfig {
 	fn default() -> Self {
 		Self {
 			specs: Arc::new(Vec::new()),
@@ -88,9 +88,9 @@ impl Default for ScenarioConf {
 	}
 }
 
-/// Builder for ScenarioConf (consumes owned values, wraps in Arc on build)
+/// Builder for ScenarioConfig (consumes owned values, wraps in Arc on build)
 #[derive(Default)]
-pub struct ScenarioConfBuilder {
+pub struct ScenarioConfigBuilder {
 	specs: Vec<&'static BuiltAssertSpec>,
 	trace: TraceCollector,
 	hooks: Option<TestHooks>,
@@ -101,7 +101,7 @@ pub struct ScenarioConfBuilder {
 	fdr: Option<FdrConfig>,
 }
 
-impl ScenarioConfBuilder {
+impl ScenarioConfigBuilder {
 	/// Add a single spec to the list (builder convention)
 	pub fn with_spec(mut self, spec: &'static BuiltAssertSpec) -> Self {
 		self.specs.push(spec);
@@ -137,8 +137,8 @@ impl ScenarioConfBuilder {
 	}
 
 	/// Consumes the builder and wraps collected fields in `Arc`.
-	pub fn build(self) -> ScenarioConf {
-		ScenarioConf {
+	pub fn build(self) -> ScenarioConfig {
+		ScenarioConfig {
 			specs: Arc::new(self.specs),
 			trace: Arc::new(self.trace),
 			hooks: self.hooks.map(Arc::new),
@@ -196,7 +196,7 @@ mod tests {
 
 	#[test]
 	fn builder_collects_specs_without_hooks() {
-		let config = ScenarioConf::builder().build();
+		let config = ScenarioConfig::builder().build();
 		assert!(config.specs().is_empty());
 		assert!(config.hooks().is_none());
 	}

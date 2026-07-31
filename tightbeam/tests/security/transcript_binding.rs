@@ -30,7 +30,7 @@
 //!   <https://cwe.mitre.org/data/definitions/300.html>
 //! - CAPEC-220: Client-Server Protocol Manipulation
 //!   <https://capec.mitre.org/data/definitions/220.html>
-//! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection (analogous control)
+//! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection
 
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ use tightbeam::{
 	crypto::{ecies::Secp256k1EciesMessage, profiles::DefaultCryptoProvider, profiles::SecurityProfileDesc},
 	der::{Decode, Encode},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{ScenarioConf, SetupEnv},
+	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{
 		client::EciesHandshakeClient,
@@ -91,7 +91,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: transcript_binding,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(TranscriptBindingSpec::latest())
 		.with_csp(TranscriptBindingProcess)
 		.build(),

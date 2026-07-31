@@ -14,7 +14,7 @@
 //! - IEC 61508 (Functional Safety)
 
 use tightbeam::testing::fdr::FdrConfig;
-use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
 use tightbeam::utils::BasisPoints;
 use tightbeam::TightBeamError;
@@ -175,7 +175,7 @@ fn build_deterministic_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_deterministic_fault_injection,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(DeterministicSpec::latest())
 		.with_fdr(build_deterministic_config())
 		.with_hooks(TestHooks {
@@ -259,7 +259,7 @@ fn build_probabilistic_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_probabilistic_fault_injection,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(ProbabilisticSpec::latest())
 		.with_fdr(build_probabilistic_config())
 		.with_hooks(TestHooks {
@@ -355,7 +355,7 @@ fn build_multi_fault_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_multi_fault_injection,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(MultiFaultSpec::latest())
 		.with_fdr(build_multi_fault_config())
 		.with_hooks(TestHooks {
@@ -461,7 +461,7 @@ fn build_coverage_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_fault_coverage_analysis,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(CoverageSpec::latest())
 		.with_fdr(build_coverage_config())
 		.with_hooks(TestHooks {

@@ -477,7 +477,7 @@ mod tests {
 	use super::*;
 	use crate::policy::TransitStatus;
 	use crate::testing::*;
-	use crate::transport::policy::PolicyConf;
+	use crate::transport::policy::PolicyConfig;
 
 	/// Serve one single-flight request with an empty reply, answering
 	/// with the gate's status.

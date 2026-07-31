@@ -253,7 +253,7 @@ pub const MIN_MUX_CHUNK_SIZE: u32 = 1024;
 /// Bounds the largest single envelope a stream chunk can occupy so one
 /// stream cannot monopolize the shared writer, the motivation HTTP/2
 /// solves with its frame-size ceiling
-/// ([RFC 9113 § 4.2](https://datatracker.ietf.org/doc/html/rfc9113#section-4.2) analog).
+/// ([RFC 9113 § 4.2](https://datatracker.ietf.org/doc/html/rfc9113#section-4.2)).
 pub const MAX_MUX_CHUNK_SIZE: u32 = 64 * 1024;
 
 /// Default per-chunk payload size advertised when none is configured

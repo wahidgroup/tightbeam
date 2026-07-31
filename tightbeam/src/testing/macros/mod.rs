@@ -291,7 +291,7 @@ where
 ///
 /// Top-level keys:
 /// - `name:` test function name (omit with `fuzz: afl`)
-/// - `spec:` AssertSpec type (latest version) or `config:` ScenarioConf
+/// - `spec:` AssertSpec type (latest version) or `config:` ScenarioConfig
 /// - `fuzz: afl` optional AFL target (Bare/Servlet, needs testing-csp)
 ///
 /// Environment-block keys:
@@ -316,7 +316,7 @@ macro_rules! tb_scenario {
 	) => {
 		$crate::tb_scenario! {
 			name: $test_name,
-			config: $crate::testing::ScenarioConf::builder().with_spec(<$spec>::latest()).build(),
+			config: $crate::testing::ScenarioConfig::builder().with_spec(<$spec>::latest()).build(),
 			$($rest)*
 		}
 	};
@@ -329,7 +329,7 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario! {
 			fuzz: afl,
 			csp: $csp_type,
-			config: $crate::testing::ScenarioConf::builder().with_spec(<$spec>::latest()).build(),
+			config: $crate::testing::ScenarioConfig::builder().with_spec(<$spec>::latest()).build(),
 			$($rest)*
 		}
 	};
@@ -871,8 +871,8 @@ macro_rules! tb_scenario {
 		)
 		.await
 		.expect("Failed to start servlet");
-		let server_addr = servlet_instance.addr();
 
+		let server_addr = servlet_instance.addr().to_owned();
 		let client = $crate::tb_scenario!(@servlet_client
 			trace.share(), ::std::sync::Arc::clone(&context), server_addr $(, $setup_expr)?
 		);
@@ -969,14 +969,14 @@ macro_rules! tb_scenario {
 		#[allow(unused_mut)]
 		let mut hive_stops: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
 		$(
-			let cluster_addr = cluster_instance.addr();
+			let cluster_addr = cluster_instance.addr().clone();
 			let hive_futures = ($hives_closure)($crate::testing::env::SetupEnv {
 				trace: trace.share(),
 				context: ::std::sync::Arc::clone(&context),
 			});
 			for hive_future in hive_futures {
 				let hive = hive_future.await.expect("Failed to start hive");
-				hive.register_with_cluster(cluster_addr).await.expect("Failed to register hive");
+				hive.register_with_cluster(&cluster_addr).await.expect("Failed to register hive");
 				hive_stops.push(Box::new(move || hive.stop()));
 			}
 		)?
@@ -1052,7 +1052,7 @@ mod tests {
 
 	use crate::testing::specs::assert::TBSpec;
 	use crate::testing::specs::csp::{CspValidationResult, CspViolation, Event, Process, ProcessSpec, State};
-	use crate::testing::{HookContext, ScenarioConf, TestHooks};
+	use crate::testing::{HookContext, ScenarioConfig, TestHooks};
 	use crate::trace::ConsumedTrace;
 
 	struct AlwaysInvalidSpec;
@@ -1089,7 +1089,7 @@ mod tests {
 			})),
 		};
 
-		let config = ScenarioConf::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build();
+		let config = ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build();
 		let hook_ctx = HookContext::new(ConsumedTrace::new());
 		let outcome = catch_unwind(AssertUnwindSafe(|| {
 			crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, Ok::<(), core::fmt::Error>(()));

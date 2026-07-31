@@ -1,13 +1,12 @@
-//! Hive registry for managing registered hives and servlet type indexing
+//! Hive registry: membership, utilization, and servlet-type reverse index.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::utils::BasisPoints;
-
 use super::error::ClusterError;
 use crate::colony::common::{type_canonical_bytes, RegisterHiveRequest};
+use crate::utils::BasisPoints;
 
 /// Shared byte slice for hive and servlet identifiers
 pub type SharedId = Arc<[u8]>;
@@ -211,6 +210,7 @@ impl HiveRegistry {
 		if let Some(entry) = hives.get_mut(hive_id) {
 			entry.failure_count = 0;
 		}
+
 		Ok(())
 	}
 
@@ -222,6 +222,7 @@ impl HiveRegistry {
 			entry.utilization = utilization;
 			entry.failure_count = 0;
 		}
+
 		Ok(())
 	}
 
@@ -251,9 +252,9 @@ impl HiveRegistry {
 	}
 
 	/// List all available servlet types across all registered hives
-	pub fn to_available_servlets(&self) -> Result<Vec<Vec<u8>>, ClusterError> {
+	pub fn to_available_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
 		let index = self.servlet_index.read()?;
-		Ok(index.keys().map(|k| k.to_vec()).collect())
+		Ok(index.keys().map(Arc::clone).collect())
 	}
 
 	/// Get a snapshot of all registered hives

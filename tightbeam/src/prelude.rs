@@ -78,7 +78,7 @@ pub mod collect {
 	pub use crate::transport::MessageCollector;
 
 	#[cfg(feature = "transport-policy")]
-	pub use crate::transport::policy::{self, PolicyConf};
+	pub use crate::transport::policy::{self, PolicyConfig};
 
 	#[cfg(feature = "tcp")]
 	pub use crate::transport::tcp;

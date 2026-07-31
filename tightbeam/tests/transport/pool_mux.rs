@@ -38,7 +38,7 @@ use tightbeam::transport::handshake::negotiation::{
 };
 use tightbeam::transport::handshake::receipt::SessionReceipt;
 use tightbeam::transport::multiplex::{MuxAcceptor, MuxRole, MuxTransport, ReplySink, StreamBody};
-use tightbeam::transport::policy::PolicyConf;
+use tightbeam::transport::policy::PolicyConfig;
 use tightbeam::transport::serve::MuxService;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
@@ -257,7 +257,7 @@ fn mux_pool_with_idle_timeout(
 	trace: &TraceCollector,
 ) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
 	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let config = PoolConfig { idle_timeout, max_connections, mux_offer: offer };
+	let config = PoolConfig { idle_timeout, max_connections, mux_offer: offer.map(Arc::new) };
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
@@ -1565,7 +1565,7 @@ fn metered_pool(
 	let identity = CertificateSpec::Built(Box::new(client_certificate));
 	let client_provider = Arc::clone(&ctx.client_provider);
 	let receipt_approver = Arc::new(PayingApprover::answering(METERED_RESPONSE)?);
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: metered_offer() };
+	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: metered_offer().map(Arc::new) };
 	let builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)

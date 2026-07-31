@@ -4,7 +4,7 @@ use core::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
-use tightbeam::testing::{ScenarioConf, SetupEnv};
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
@@ -61,7 +61,7 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_edf_with_fdr,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(EdfAssertSpec::latest())
 		.with_fdr(FdrConfig {
 			seeds: 2,

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tightbeam::{
 	colony::{
 		common::ColonyNamespace,
-		hive::{Hive, HiveConf},
-		servlet::ServletConf,
+		hive::{Hive, HiveConfig},
+		servlet::ServletConfig,
 	},
 	compose,
 	crypto::x509::CertificateSpec,
@@ -67,6 +67,7 @@ servlet! {
 		let bytes = body.into_bytes().await?;
 		let label = bytes.len().to_string();
 		let frame = reply_frame(&label)?;
+
 		Ok(Some(frame))
 	},
 	duplex: |body, reply, ctx| async move {
@@ -76,16 +77,17 @@ servlet! {
 		while let Some(chunk) = body.chunk().await? {
 			reply.push(&chunk).await?;
 		}
+
 		Ok(())
 	}
 }
 
 fn streaming_servlet_conf(
 	materials: &ServerMaterials,
-) -> Result<ServletConf<TokioListener, StreamLabel>, TightBeamError> {
+) -> Result<ServletConfig<TokioListener, StreamLabel>, TightBeamError> {
 	let cert = CertificateSpec::Built(Box::new((*materials.certificate).to_owned()));
 	let key = Arc::clone(&materials.key_provider);
-	Ok(ServletConf::<TokioListener, StreamLabel>::builder()
+	Ok(ServletConfig::<TokioListener, StreamLabel>::builder()
 		.with_certificate(cert, key, vec![])?
 		.with_mux_offer(Some(TransportOffer::mux(8)))
 		.with_config(Arc::new(()))
@@ -101,7 +103,11 @@ async fn pooled_lease(
 	addr: <TokioListener as tightbeam::transport::Protocol>::Address,
 ) -> Result<PooledClient<TokioListener>, TightBeamError> {
 	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: Some(TransportOffer::mux(8)) };
+	let config = PoolConfig {
+		idle_timeout: None,
+		max_connections: 1,
+		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
+	};
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
@@ -148,6 +154,7 @@ tb_scenario! {
 			let request = reply_frame("unary-body")?;
 			let reply = client.emit(request.to_owned(), None).await?;
 			let value = reply.map(|frame| frame.message.to_owned()) == Some(request.message.to_owned());
+
 			trace.event_with(UNARY_ECHOES, &[], value)?;
 
 			// Streaming: 8 bytes pushed, servlet reports "8"
@@ -158,6 +165,7 @@ tb_scenario! {
 			let reply = response.await?;
 			let expected = reply_frame("8")?;
 			let value = reply.map(|frame| frame.message.to_owned()) == Some(expected.message.to_owned());
+
 			trace.event_with(STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
 
 			// Duplex: chunks echo back in order
@@ -173,6 +181,7 @@ tb_scenario! {
 			let value = first.as_deref() == Some(b"ping-1".as_slice())
 				&& second.as_deref() == Some(b"ping-2".as_slice())
 				&& trailer.is_none();
+
 			trace.event_with(DUPLEX_ECHOES_CHUNKS, &[], value)?;
 
 			Ok(())
@@ -193,6 +202,7 @@ servlet! {
 		let bytes = body.into_bytes().await?;
 		let label = bytes.len().to_string();
 		let frame = reply_frame(&label)?;
+
 		Ok(Some(frame))
 	}
 }
@@ -229,6 +239,7 @@ tb_scenario! {
 				client.emit(request, None).await,
 				Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
 			);
+
 			trace.event_with(STREAM_ONLY_UNARY_REFUSED, &[], unary_refused)?;
 
 			let (mut sink, response) = client.open_stream()?;
@@ -238,6 +249,7 @@ tb_scenario! {
 			let reply = response.await?;
 			let expected = reply_frame("5")?;
 			let value = reply.map(|frame| frame.message.to_owned()) == Some(expected.message.to_owned());
+
 			trace.event_with(STREAM_ONLY_REPLY_OK, &[], value)?;
 
 			Ok(())
@@ -277,11 +289,8 @@ async fn start_streaming_hive(
 	let servlet = StreamingEchoServlet::start(Arc::clone(&trace), config).await?;
 
 	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let conf = HiveConf {
-		trust_store: Some(trust_store),
-		mux_offer: Some(TransportOffer::mux(8)),
-		..Default::default()
-	};
+	let mut conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
+	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 	let mut hive = StreamingHive::new(Some(conf))?;
 	hive.register(stream_echo_urn(), servlet, |t| StreamingEchoServlet::start(t, None))?;
@@ -303,7 +312,7 @@ tb_assert_spec! {
 
 // `HiveContext::open_stream` drives a real sibling servlet: the hive's
 // intra-hive pool validates the servlet certificate through
-// `HiveConf::trust_store`, negotiates mux, and the streamed body's
+// `HiveConfig::trust_store`, negotiates mux, and the streamed body's
 // unary reply comes back as message bytes, the same shape as `call`.
 tb_scenario! {
 	name: hive_context_streams_to_sibling_servlet,
@@ -323,6 +332,7 @@ tb_scenario! {
 			let reply_bytes = response.await?;
 			let label: StreamLabel = decode(&reply_bytes)?;
 			let value = label.label == "9";
+
 			trace.event_with(HIVE_STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
 
 			hive.stop();
@@ -361,6 +371,7 @@ tb_scenario! {
 			sink.push(b"hive-1").await?;
 
 			let first = body.chunk().await?;
+
 			sink.close_with(b"hive-2").await?;
 
 			let second = body.chunk().await?;
@@ -369,6 +380,7 @@ tb_scenario! {
 			let value = first.as_deref() == Some(b"hive-1".as_slice())
 				&& second.as_deref() == Some(b"hive-2".as_slice())
 				&& trailer.is_none();
+
 			trace.event_with(HIVE_DUPLEX_ECHOES_CHUNKS, &[], value)?;
 
 			hive.stop();

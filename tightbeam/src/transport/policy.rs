@@ -18,7 +18,7 @@ use crate::utils::jitter::decorrelated_bounds;
 /// Default implementations are no-ops that return `self` unchanged.
 /// Transports that support specific policies should override the
 /// relevant methods.
-pub trait PolicyConf
+pub trait PolicyConfig
 where
 	Self: Sized,
 {

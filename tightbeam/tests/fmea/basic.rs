@@ -3,7 +3,7 @@
 use tightbeam::error::TightBeamError;
 use tightbeam::testing::fdr::{FdrConfig, FdrVerdict};
 use tightbeam::testing::fmea::{FmeaConfig, SeverityScale};
-use tightbeam::testing::{FaultModel, ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::testing::{FaultModel, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
 use tightbeam::utils::BasisPoints;
 use tightbeam::{tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
@@ -86,7 +86,7 @@ fn verify_fmea_report(verdict_opt: &Option<FdrVerdict>) -> Result<(), Box<dyn st
 
 tb_scenario! {
 	name: test_fmea_mil_std,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(FmeaTestSpec::latest())
 		.with_fdr(create_test_config(SeverityScale::MilStd1629))
 		.with_hooks(TestHooks {
@@ -109,7 +109,7 @@ tb_scenario! {
 
 tb_scenario! {
 	name: test_fmea_iso26262,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(FmeaTestSpec::latest())
 		.with_fdr(create_test_config(SeverityScale::Iso26262))
 		.with_hooks(TestHooks {

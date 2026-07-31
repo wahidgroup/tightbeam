@@ -1,4 +1,4 @@
-//! Connection pooling for transport layer
+//! Connection pooling for the transport layer.
 
 use core::hash::Hash;
 use core::marker::PhantomData;
@@ -40,7 +40,7 @@ use x509::*;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
-	pub use crate::transport::policy::PolicyConf;
+	pub use crate::transport::policy::PolicyConfig;
 	pub use crate::transport::MessageEmitter;
 	pub use crate::Frame;
 }
@@ -79,46 +79,44 @@ pooled_mux! {
 	use crate::transport::serve::drive_mux;
 }
 
-/// Builder trait for connection configuration
+/// Shared builder surface for direct clients and connection pools.
 ///
-/// Implemented by both ClientBuilder (for direct connections) and
-/// ConnectionPoolBuilder (for pooled connections), enabling unified builder API.
+/// [`ClientBuilder`] and [`ConnectionPoolBuilder`] both implement this trait
+/// so callers configure timeouts and identity the same way.
 pub trait ConnectionBuilder<P: Protocol>: Sized {
-	/// The type returned by build()
+	/// Built client or pool produced by [`ConnectionBuilder::build`].
 	type Output;
 
-	/// Configure timeout for operations
+	/// Cap how long a connect or I/O wait may block.
 	fn with_timeout(self, timeout: Duration) -> Self;
 
-	/// Configure trust store for server certificate validation
+	/// Trust anchors used to validate the peer certificate.
 	#[cfg(feature = "x509")]
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
-	/// Configure client identity for mutual TLS
+	/// Client certificate and key for mutual authentication.
 	#[cfg(feature = "x509")]
 	fn with_client_identity(self, cert: CertificateSpec, key: Arc<dyn SigningKeyProvider>) -> TransportResult<Self>;
 
-	/// Build the configured builder/pool (sync)
+	/// Finish configuration and produce the client or pool.
 	fn build(self) -> Self::Output;
 }
 
-/// Configuration for connection pool
+/// Limits and multiplexing policy for a [`ConnectionPool`].
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
-	/// Optional idle timeout for connections
-	/// None means connections never expire
-	pub idle_timeout: Option<Duration>,
-	/// Maximum total connections in the pool (default: 64)
-	pub max_connections: usize,
-	/// Multiplexing advertisement for pooled connections. With an offer set,
-	/// `connect` shares multiplexed connections per destination, opening
-	/// additional ones only when stream caps fill.
+	/// Drop idle exclusive leases after this duration.
 	///
-	/// Note: Each fresh dial deep-copies the offer: ASN.1 wire types stay
-	/// owned, and refcount sharing would require `Arc<TransportOffer>`
-	/// across the whole pool / transport / orchestrator config plane.
-	/// TODO: revisit this
-	pub mux_offer: Option<TransportOffer>,
+	/// `None` keeps idle connections until the pool evicts them for other reasons.
+	pub idle_timeout: Option<Duration>,
+	/// Hard cap on live connections across all destinations (default: 64).
+	pub max_connections: usize,
+	/// Multiplexing advertisement for pooled dials.
+	///
+	/// When set, `connect` reuses one multiplexed connection per destination
+	/// until stream caps fill. The value is shared by refcount across dials.
+	/// The handshake still clones the offer once into the orchestrator.
+	pub mux_offer: Option<Arc<TransportOffer>>,
 }
 
 impl Default for PoolConfig {
@@ -175,7 +173,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
 	where
 		Pro: Protocol,
-		Pro::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C>,
+		Pro::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
 	{
 		let mut configured = transport;
 		if let Some(store) = &self.trust_store {
@@ -338,20 +336,15 @@ pooled_mux! {
 	struct MuxEntry {
 		id: u64,
 		handle: MuxHandle,
-		/// Reader driver task: finishes when the connection dies, so it
-		/// doubles as the entry's liveness witness.
-		reader_task: rt::JoinHandle,
-		/// When a lease last emitted on this connection.
+		/// Reader driver task used as the entry liveness witness.
 		///
-		/// The mux core never reads a clock
-		/// ([sans-io](https://sans-io.readthedocs.io/how-to-sans-io.html), as
-		/// [quinn-proto](https://docs.rs/quinn-proto) and [h2](https://docs.rs/h2)
-		/// keep their state machines), so the pool stamps activity at its own
-		/// emit boundary. This is the same recipe as
-		/// [hyper-util's pool `idle_at`](https://docs.rs/hyper-util/latest/src/hyper_util/client/legacy/pool.rs.html).
-		/// Shared with every lease, which stamps it outside the pool lock.
-		/// While [`MuxHandle::has_pending_streams`] returns `true`, the pruner
-		/// treats the entry as active no matter how old the stamp is.
+		/// The task ends when the connection dies.
+		reader_task: rt::JoinHandle,
+		/// Shared activity stamp used by idle pruning for this mux entry.
+		///
+		/// The mux core does not read a clock. Each lease updates this stamp
+		/// when emit starts, outside the pool lock. An entry with pending
+		/// streams stays active even if the stamp is old.
 		last_used: Arc<Mutex<Instant>>,
 	}
 }
@@ -588,7 +581,7 @@ where
 	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
 	where
 		P: PersistentConnection + Send + Sync,
-		P::Transport: MessageEmitter + MessageCollector + PolicyConf + Send + Sync,
+		P::Transport: MessageEmitter + MessageCollector + PolicyConfig + Send + Sync,
 	{
 		if let Some(client) = self.try_take_ready_client(&addr)? {
 			return Ok(self.wrap_client(client, addr));
@@ -609,17 +602,17 @@ where
 
 	/// Lease a ready connection or open a fresh one, held exclusively.
 	#[cfg(feature = "x509")]
-	async fn connect_single_flight(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
+	async fn connect_single_flight(self: &Arc<Self>, addr: &P::Address) -> TransportResult<PooledClient<P, C>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport:
-			MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C> + Send + Sync,
+			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
-		if let Some(client) = self.try_take_ready_client(&addr)? {
-			return Ok(self.wrap_client(client, addr));
+		if let Some(client) = self.try_take_ready_client(addr)? {
+			return Ok(self.wrap_client(client, addr.clone()));
 		}
 
-		let mut reservation = self.reserve_slot(&addr)?;
+		let mut reservation = self.reserve_slot(addr)?;
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 
 		let mut transport = self.tls.apply::<P>(P::create_transport(stream));
@@ -639,7 +632,7 @@ where
 
 		reservation.disarm();
 
-		Ok(self.wrap_client(client, addr))
+		Ok(self.wrap_client(client, addr.clone()))
 	}
 
 	#[cfg(all(
@@ -655,15 +648,15 @@ where
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport:
-			MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C> + Send + Sync,
+			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
-		self.connect_single_flight(addr).await
+		self.connect_single_flight(&addr).await
 	}
 
 	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, C>>>
 	where
 		P: PersistentConnection + Send + Sync,
-		P::Transport: MessageEmitter + MessageCollector + PolicyConf + Send + Sync,
+		P::Transport: MessageEmitter + MessageCollector + PolicyConfig + Send + Sync,
 	{
 		let maybe_client = self.try_take_ready_client(addr)?;
 		Ok(maybe_client.map(|client| self.wrap_client(client, addr.clone())))
@@ -687,7 +680,7 @@ pooled_mux! {
 		P::Address: Hash + Eq + Clone + Send + Sync,
 		P::Transport: MessageEmitter
 			+ MessageCollector
-			+ PolicyConf
+			+ PolicyConfig
 			+ X509ClientConfig<CryptoProvider = C>
 			+ MuxConnector
 			+ Send
@@ -695,34 +688,48 @@ pooled_mux! {
 	{
 		/// Connect to a destination, multiplexing when
 		/// [`PoolConfig::mux_offer`] is set and the peer accepts.
-		pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>> {
-			let offer = match &self.config.mux_offer {
-				Some(offer) => offer.to_owned(),
-				None => return self.connect_single_flight(addr).await,
-			};
+		pub async fn connect(
+			self: &Arc<Self>,
+			addr: impl core::borrow::Borrow<P::Address>,
+		) -> TransportResult<PooledClient<P, C>>
+		where
+			P::Address: Clone,
+		{
+			let addr = addr.borrow();
+			if self.config.mux_offer.is_none() {
+				return self.connect_single_flight(addr).await;
+			}
 
-			self.acquire_mux(addr, offer, MuxSelection::PreferHeadroom).await
+			self.acquire_mux(addr, MuxSelection::PreferHeadroom).await
 		}
 
-		/// The acquisition funnel for every mux-offering caller: a pooled mux
-		/// entry, then an idle exclusive connection left over from a peer that
-		/// declined the mux offer at handshake, then a fresh dial. Selection
-		/// policy lives here alone so no caller can skip a reuse tier.
+		/// Acquire a mux lease through the reuse tiers, in order.
+		///
+		/// Tries a pooled mux entry first. Next tries an idle exclusive lease
+		/// left when a peer declined multiplexing. Finally opens a fresh dial.
+		/// All mux-offering callers share this path so no tier is skipped.
 		async fn acquire_mux(
 			self: &Arc<Self>,
-			addr: P::Address,
-			offer: TransportOffer,
+			addr: &P::Address,
 			selection: MuxSelection,
 		) -> TransportResult<PooledClient<P, C>> {
-			if let Some(lease) = self.try_take_mux_handle(&addr, selection)? {
-				return Ok(self.wrap_mux_client(lease, addr));
+			if let Some(lease) = self.try_take_mux_handle(addr, selection)? {
+				return Ok(self.wrap_mux_client(lease, addr.clone()));
 			}
 
-			if let Some(client) = self.try_take_ready_client(&addr)? {
-				return Ok(self.wrap_client(client, addr));
+			if let Some(client) = self.try_take_ready_client(addr)? {
+				return Ok(self.wrap_client(client, addr.clone()));
 			}
 
-			self.open_mux_connection(addr, offer).await
+			let offer = match &self.config.mux_offer {
+				// One shared PoolConfig offer for every dial.
+				Some(offer) => Arc::clone(offer),
+				None => {
+					return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
+				}
+			};
+
+			self.open_mux_connection(addr.clone(), offer).await
 		}
 
 		/// Open a fresh connection with a mux offer, falling back to an
@@ -730,7 +737,7 @@ pooled_mux! {
 		async fn open_mux_connection(
 			self: &Arc<Self>,
 			addr: P::Address,
-			offer: TransportOffer,
+			offer: Arc<TransportOffer>,
 		) -> TransportResult<PooledClient<P, C>> {
 			let mut reservation = self.reserve_slot(&addr)?;
 
@@ -1011,7 +1018,7 @@ pooled_mux! {
 		P::Address: Hash + Eq + Clone + Send + Sync,
 		P::Transport: MessageEmitter
 			+ MessageCollector
-			+ PolicyConf
+			+ PolicyConfig
 			+ X509ClientConfig<CryptoProvider = C>
 			+ MuxConnector
 			+ Send
@@ -1092,18 +1099,17 @@ pooled_mux! {
 		/// Cap-exhaustion failover: move the lease through the acquisition
 		/// funnel (pooled headroom before a fresh dial) and retry there once.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-			let offer = match &self.pool.config.mux_offer {
-				Some(offer) => offer.to_owned(),
+			if self.pool.config.mux_offer.is_none() {
 				// A mux lease exists only when an offer is configured
-				None => return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)),
-			};
+				return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
+			}
 
 			#[cfg(feature = "instrument")]
 			self.pool.emit_event(events::POOL_FAILOVER);
 
 			*self = self
 				.pool
-				.acquire_mux(self.addr.clone(), offer, MuxSelection::RequireHeadroom)
+				.acquire_mux(&self.addr, MuxSelection::RequireHeadroom)
 				.await?;
 
 			match self.mux.as_ref() {

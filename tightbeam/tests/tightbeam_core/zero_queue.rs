@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use tightbeam::asn1::{DigestInfo, MessagePriority};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
-use tightbeam::colony::servlet::{Servlet, ServletConf};
+use tightbeam::colony::servlet::{Servlet, ServletConfig};
 use tightbeam::crypto::{
 	hash::Sha3_256,
 	key::{Secp256k1KeyProvider, SigningKeyProvider, SigningKeySpec},
@@ -13,9 +13,9 @@ use tightbeam::crypto::{
 };
 use tightbeam::der::ValueOrd;
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
-use tightbeam::prelude::policy::PolicyConf;
+use tightbeam::prelude::policy::PolicyConfig;
 use tightbeam::prelude::*;
-use tightbeam::testing::ScenarioConf;
+use tightbeam::testing::ScenarioConfig;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::policy::{RestartLinearBackoff, RestartPolicy, RetryAction};
 use tightbeam::transport::tcp::r#async::TokioListener;
@@ -386,7 +386,7 @@ tb_scenario! {
 			let stats = Arc::new(BackPressureStats::default());
 			let adaptive_gate = AdaptiveGate::new(Arc::clone(&stats), Arc::clone(&trace));
 
-			let servlet_conf = ServletConf::<TokioListener, WorkOrder>::builder()
+			let servlet_conf = ServletConfig::<TokioListener, WorkOrder>::builder()
 				.with_config(Arc::clone(&stats))
 				.with_collector_gate(adaptive_gate)
 				.build();

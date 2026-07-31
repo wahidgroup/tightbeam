@@ -1,11 +1,14 @@
-//! Instrumentation subsystem (feature = "instrument").
+//! Instrumentation subsystem.
 //!
 //! Implements the normative event taxonomy and evidence artifact hashing
 //! defined for the tighbeam protocol.
 //!
 //! Feature gating contract:
-//! - When `instrument` is disabled all public APIs are no-ops and compile away.
-//! - When enabled emission MUST be amortized O(1) and overflow MUST set a flag.
+//! - The module and [`events`] URN inventory are available whenever `std` is
+//!   enabled so callers can label trace records without opting into TbEvent.
+//! - When `instrument` is disabled, emit APIs are no-op stubs.
+//! - When `instrument` is enabled, emission MUST be amortized O(1) and overflow
+//!   MUST set a flag.
 //!
 //! Evidence hashing uses SHA3-256 over a stable length-prefixed byte
 //! layout. `TbEvent` / `EvidenceArtifact` themselves encode as DER.
@@ -16,8 +19,6 @@ pub mod events;
 
 #[cfg(not(feature = "instrument"))]
 pub mod stub {
-	use core::time::Duration;
-
 	use crate::utils::urn::Urn;
 	use crate::TightBeamError;
 

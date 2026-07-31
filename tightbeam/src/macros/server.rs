@@ -106,7 +106,7 @@ impl MuxService for SharedHandlerService {
 /// Report a service failure to the error channel, degrading it to an
 /// opaque `Internal` so the peer-visible status never leaks the
 /// original error once it has been reported locally.
-#[cfg(feature = "tokio")]
+#[cfg(pooled_mux)]
 async fn report_failure(errors: &mut Option<ErrorSender>, err: TightBeamError) -> TightBeamError {
 	match errors.as_mut() {
 		Some(tx) => {

@@ -406,6 +406,15 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Hive already established"))]
 	AlreadyEstablished,
 
+	/// Hive has not been established yet
+	///
+	/// Cluster registration and other control-plane operations require a
+	/// bound control listener. Call [`Hive::establish`](crate::colony::hive::Hive::establish)
+	/// first so the registered address matches the live accept socket.
+	#[cfg(feature = "colony")]
+	#[cfg_attr(feature = "derive", error("Hive not established"))]
+	NotEstablished,
+
 	/// Task join error
 	#[cfg(feature = "colony")]
 	#[cfg_attr(feature = "derive", error("Task join failed"))]
@@ -552,6 +561,8 @@ impl core::fmt::Display for TightBeamError {
 			}
 			#[cfg(feature = "colony")]
 			TightBeamError::AlreadyEstablished => write!(f, "Hive already established"),
+			#[cfg(feature = "colony")]
+			TightBeamError::NotEstablished => write!(f, "Hive not established"),
 			#[cfg(feature = "colony")]
 			TightBeamError::JoinError => write!(f, "Task join failed"),
 			TightBeamError::UnsupportedVersion(err) => {

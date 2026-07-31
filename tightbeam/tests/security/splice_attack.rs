@@ -49,7 +49,7 @@ use tightbeam::{
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{
 		utils::{create_test_certificate, create_test_signing_key},
-		ScenarioConf, SetupEnv,
+		ScenarioConfig, SetupEnv,
 	},
 	trace::TraceCollector,
 	transport::handshake::{
@@ -99,7 +99,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: splice_attack,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(SpliceAttackSpec::latest())
 		.with_csp(SpliceAttackProcess)
 		.build(),

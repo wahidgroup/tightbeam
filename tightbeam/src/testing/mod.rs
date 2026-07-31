@@ -39,7 +39,7 @@ pub mod schedulability;
 pub mod timing;
 
 // Re-exports
-pub use config::{HookContext, ScenarioConf, ScenarioConfBuilder, TestHooks};
+pub use config::{HookContext, ScenarioConfig, ScenarioConfigBuilder, TestHooks};
 pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
 pub use export::ScenarioResultExport;
 pub use result::ScenarioResult;

@@ -14,7 +14,7 @@
 //!    discipline.
 //!
 //! ## Expected control
-//! Exact-next counter nonces (RFC 9846 § 5.3 analog) MUST fail closed:
+//! Exact-next counter nonces (RFC 9846 § 5.3) MUST fail closed:
 //! deleting an envelope desynchronizes the counter and surfaces
 //! `TamperDetected` on the very next message. Replaying an envelope is
 //! rejected after the original consumes its counter.
@@ -41,7 +41,7 @@ use tightbeam::job;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::config::ScenarioConf;
+use tightbeam::testing::config::ScenarioConfig;
 use tightbeam::testing::{create_v0_tightbeam, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::protocols::{AsyncReadStream, AsyncWriteStream, SplittableStream};
@@ -95,7 +95,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: envelope_delete_detected,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(EnvelopeDeleteSpec::latest())
 		.with_csp(EnvelopeDeleteProcess)
 		.build(),
@@ -159,7 +159,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: envelope_replay_detected,
-	config: ScenarioConf::builder()
+	config: ScenarioConfig::builder()
 		.with_spec(EnvelopeReplaySpec::latest())
 		.with_csp(EnvelopeReplayProcess)
 		.build(),

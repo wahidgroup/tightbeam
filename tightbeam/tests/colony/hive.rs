@@ -12,7 +12,7 @@ use tightbeam::{
 			current_timestamp_ms, servlet_instance, ClusterCommand, ClusterCommandResponse, ClusterStatus,
 			ColonyNamespace, HeartbeatParams, HiveManagementRequest, SpawnServletParams, StopServletParams,
 		},
-		hive::{Hive, HiveConf, HiveTlsConfig, ServletBox},
+		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
 	},
 	compose,
 	crypto::{
@@ -28,7 +28,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
-		GenericClient,
+		GenericClient, Protocol,
 	},
 	utils::{urn::Urn, BasisPoints},
 	Beamable, Frame, TightBeamError, Version,
@@ -55,6 +55,7 @@ pub(crate) const FIRST_SPAWN_FORBIDDEN: Urn<'static> = Urn::new("test", "event:h
 pub(crate) const FORGED_HEARTBEAT_DENIED: Urn<'static> = Urn::new("test", "event:hive/forged-heartbeat-denied");
 pub(crate) const HIVE_ESTABLISHED: Urn<'static> = Urn::new("test", "event:hive/hive-established");
 pub(crate) const HIVE_STARTED: Urn<'static> = Urn::new("test", "event:hive/hive-started");
+pub(crate) const REGISTER_BEFORE_ESTABLISH: Urn<'static> = Urn::new("test", "event:hive/register-before-establish");
 pub(crate) const OPEN_BREAKER_HEARTBEAT_SHAPE: Urn<'static> =
 	Urn::new("test", "event:hive/open-breaker-heartbeat-shape");
 pub(crate) const RETRY_SPAWN_ACCEPTED: Urn<'static> = Urn::new("test", "event:hive/retry-spawn-accepted");
@@ -135,7 +136,7 @@ tb_assert_spec! {
 /// the registered-servlet count for the spec to value-assert.
 async fn establish_registered_hive(
 	trace: &TraceCollector,
-	conf: Option<HiveConf>,
+	conf: Option<HiveConfig>,
 ) -> Result<HiveX509Test, TightBeamError> {
 	trace.event(HIVE_STARTED)?;
 
@@ -163,15 +164,9 @@ tb_scenario! {
 	environment Hive {
 		context: hive_tls(),
 		start: |SetupEnv { trace, context: tls }| async move {
-			establish_registered_hive(
-				&trace,
-				Some(HiveConf {
-					hive_tls: Some(tls),
-					mux_offer: Some(TransportOffer::mux(4)),
-					..Default::default()
-				}),
-			)
-			.await
+			let mut conf = HiveConfig { hive_tls: Some(tls), ..Default::default() };
+			conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(4)));
+			establish_registered_hive(&trace, Some(conf)).await
 		},
 		client: |HiveEnv { hive, .. }| async move {
 			hive.stop();
@@ -251,7 +246,7 @@ fn trusted_signer(subject: &str) -> TrustedSignerContext {
 async fn start_trusted_hive(
 	trace: &TraceCollector,
 	ctx: &TrustedSignerContext,
-	mut conf: HiveConf,
+	mut conf: HiveConfig,
 ) -> Result<HiveX509Test, TightBeamError> {
 	conf.trust_store = Some(pinning_trust_store(&ctx.certificate)?);
 
@@ -380,16 +375,10 @@ tb_scenario! {
 	environment Hive {
 		context: trusted_signer("CN=Hive Gate Cluster"),
 		start: |SetupEnv { trace, context: signer }| async move {
-			start_trusted_hive(
-				&trace,
-				&signer,
-				HiveConf {
-					circuit_breaker_threshold: 1,
-					circuit_breaker_cooldown_ms: 60_000,
-					..Default::default()
-				},
-			)
-			.await
+			let mut conf = HiveConfig::default();
+			conf.control.circuit_breaker_threshold = 1;
+			conf.control.circuit_breaker_cooldown_ms = 60_000;
+			start_trusted_hive(&trace, &signer, conf).await
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive).await?;
@@ -468,15 +457,10 @@ tb_scenario! {
 		// Threshold zero: idle utilization already saturates the gate,
 		// so every manage command sees the backpressure verdict.
 		start: |SetupEnv { trace, context: signer }| async move {
-			start_trusted_hive(
-				&trace,
-				&signer,
-				HiveConf {
-					backpressure_threshold: BasisPoints::default(),
-					..Default::default()
-				},
-			)
-			.await
+			let mut conf = HiveConfig::default();
+			conf.control.backpressure_threshold = BasisPoints::default();
+
+			start_trusted_hive(&trace, &signer, conf).await
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive).await?;
@@ -513,6 +497,42 @@ tb_scenario! {
 }
 
 // ============================================================================
+// Cluster registration requires a bound control listener
+// ============================================================================
+
+tb_assert_spec! {
+	pub HiveRegisterBeforeEstablishSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(REGISTER_BEFORE_ESTABLISH, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A provisional `addr` from `Hive::new` must not reach the cluster:
+// register before establish is refused with `NotEstablished`.
+tb_scenario! {
+	name: hive_register_before_establish_refused,
+	spec: HiveRegisterBeforeEstablishSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let hive = HiveX509Test::new(None)?;
+			let cluster_addr: <TokioListener as Protocol>::Address = "127.0.0.1:9".parse()?;
+			let refused = matches!(
+				hive.register_with_cluster(&cluster_addr).await,
+				Err(TightBeamError::NotEstablished)
+			);
+
+			trace.event_with(REGISTER_BEFORE_ESTABLISH, &[], refused)?;
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
 // Replay forget on manage handler failure
 // ============================================================================
 
@@ -540,7 +560,7 @@ tb_scenario! {
 			let seed = HiveTestServlet::start(Arc::new(trace.share()), None).await?;
 			let trust_store = pinning_trust_store(&signer.certificate)?;
 
-			let conf = HiveConf { trust_store: Some(trust_store), ..Default::default() };
+			let conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
 			let mut hive = HiveX509Test::new(Some(conf))?;
 			hive.register(servlet_urn("flaky"), seed, move |t| {
 				let fail_flag = Arc::clone(&fail_once);
@@ -583,8 +603,8 @@ struct LocatorStopProbe {
 }
 
 impl ServletBox for LocatorStopProbe {
-	fn addr_bytes(&self) -> Vec<u8> {
-		self.addr.clone()
+	fn addr_bytes(&self) -> std::sync::Arc<[u8]> {
+		std::sync::Arc::from(self.addr.as_slice())
 	}
 
 	fn stop_boxed(self: Box<Self>) {
@@ -621,7 +641,7 @@ tb_scenario! {
 			};
 
 			let trust_store = pinning_trust_store(&signer.certificate)?;
-			let conf = HiveConf { trust_store: Some(trust_store), ..Default::default() };
+			let conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
 			let mut hive = HiveX509Test::new(Some(conf))?;
 			hive.register(servlet_urn("orphan"), seed, |t| async move {
 				Ok(LocatorStopProbe {

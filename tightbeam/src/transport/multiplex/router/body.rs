@@ -208,8 +208,8 @@ impl ForwardedStream {
 	}
 
 	/// Raise the granted limit. Grants are absolute and monotonic
-	/// ([RFC 9113 § 6.9.1](https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1)
-	/// analog), so a stale lower value is ignored.
+	/// ([RFC 9113 § 6.9.1](https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1)),
+	/// so a stale lower value is ignored.
 	pub(super) fn raise_limit(&mut self, limit: u64) {
 		self.limit = self.limit.max(limit);
 	}

@@ -1,14 +1,13 @@
-//! Peer-advertisement admission for the cluster gateway macro
+//! Peer-advertisement admission for the cluster gateway.
 //!
 //! [`AdmittedPeerAd`] is the only path from a wire advertisement to a
-//! reconcilable slate: construction runs signer resolution and wire
-//! checks, so the identity, dial address, and slate of one verified
-//! advertisement travel as a single value.
+//! reconcilable slate. Signer resolution and wire checks run at
+//! construction so identity, dial address, and slate travel as one value.
 
 use core::str::FromStr;
 use std::sync::Arc;
 
-use super::{ClusterConf, ServletEntry, SharedId};
+use super::{ClusterConfig, ServletEntry, SharedId};
 use crate::colony::common::{is_bare_servlet_type, type_canonical_bytes, ColonyNamespace, PeerAdvertisement};
 use crate::constants::MAX_ADVERTISED_TYPES;
 use crate::policy::TransitStatus;
@@ -29,30 +28,29 @@ use crate::x509::ext::pkix::name::GeneralName;
 #[cfg(feature = "x509")]
 use crate::x509::ext::pkix::SubjectAltName;
 
-/// Peer advertisement that passed signer resolution and wire checks
+/// Peer advertisement that passed signer resolution and wire checks.
 ///
-/// Construction via [`AdmittedPeerAd::admit`] is the only public path,
-/// so the registry can never receive an unvalidated slate and the
-/// signer identity cannot be transposed with the claimed dial address.
+/// [`AdmittedPeerAd::admit`] is the only public path: the registry never
+/// receives an unvalidated slate, and signer identity cannot be
+/// transposed with the claimed dial address.
 pub struct AdmittedPeerAd {
-	/// Signer cert fingerprint (or claimed address without x509)
+	/// Signer cert fingerprint (claimed address when x509 is off)
 	pub(super) peer_hive_id: SharedId,
-	/// Claimed gateway socket the slate dials through
+	/// Claimed gateway socket every slate entry dials
 	pub(super) dial_addr: SharedId,
 	/// Peer-routed entries keyed by `peer_hive_id NUL type`
 	pub(super) slate: Vec<ServletEntry>,
 }
 
 impl AdmittedPeerAd {
-	/// Admit a wire advertisement, failing closed with the refusal status
+	/// Admit a wire advertisement. Fail closed with a refusal status.
 	///
-	/// Runs signer resolution (slates key by cert fingerprint, never the
-	/// claimed `gateway_addr`), the colony-membership gate (both this
-	/// gateway's certificate and the signer's must carry a valid colony
-	/// URN SAN), and wire checks. Caps and local-route conflicts are
-	/// registry policy, checked under the reconcile gate in
+	/// Resolves the signer (slates key by cert fingerprint, never claimed
+	/// `gateway_addr`), gates colony membership (local and peer certs
+	/// must carry a colony URN SAN), then runs wire checks. Caps and
+	/// local-route conflicts are registry policy under
 	/// [`super::ServletRegistry::reconcile_peer_slate`].
-	pub fn admit(frame: &Frame, ad: &PeerAdvertisement, conf: &ClusterConf) -> Result<Self, TransitStatus> {
+	pub fn admit(frame: &Frame, ad: &PeerAdvertisement, conf: &ClusterConfig) -> Result<Self, TransitStatus> {
 		let dial_addr: SharedId = Arc::from(ad.gateway_addr.as_slice());
 
 		// The signer certificate resolves exactly once; the slate key
@@ -89,7 +87,7 @@ impl AdmittedPeerAd {
 			&ad.gateway_addr,
 			&ad.advertised_types,
 			&conf.namespace,
-			conf.peer_dial_allowlist.as_deref(),
+			conf.peer.peer_dial_allowlist.as_deref(),
 		)?;
 
 		let slate = build_peer_slate(
@@ -104,10 +102,10 @@ impl AdmittedPeerAd {
 	}
 }
 
-/// Whether a claimed peer gateway address is safe dial data
+/// Whether a claimed peer gateway address is safe dial data.
 ///
-/// Refuses empty, non-UTF-8, NUL-bearing, or non-parseable sockets: the
-/// dial path parses UTF-8 sockets, and NUL would corrupt composite route keys.
+/// Refuses empty, non-UTF-8, NUL-bearing, or non-parseable sockets.
+/// The dial path parses UTF-8; NUL would corrupt composite route keys.
 #[must_use]
 fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
 	let nonempty = !gateway_addr.is_empty();
@@ -120,10 +118,9 @@ fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
 	nonempty && no_nul && parseable
 }
 
-/// Whether `gateway_addr` is permitted by an optional exact-match allowlist
+/// Whether `gateway_addr` is on an optional exact-match allowlist.
 ///
-/// `None` allowlist accepts any address that already passed
-/// [`peer_gateway_addr_valid`].
+/// `None` accepts any address that already passed [`peer_gateway_addr_valid`].
 #[must_use]
 fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool {
 	let Some(allowed) = allowlist else {
@@ -137,13 +134,13 @@ fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool 
 	matched
 }
 
-/// Whether every advertised type is a bare servlet URN in `namespace`
+/// Whether every advertised type is a bare servlet URN in `namespace`.
 #[must_use]
 fn advertised_types_are_nestmate(namespace: &ColonyNamespace, types: &[Urn<'static>]) -> bool {
 	types.iter().all(|urn| is_bare_servlet_type(namespace, urn))
 }
 
-/// Wire-level advertisement checks (no registry lock)
+/// Wire-level advertisement checks. No registry lock.
 fn peer_advertisement_wire_ok(
 	gateway_addr: &[u8],
 	types: &[Urn<'static>],
@@ -162,12 +159,11 @@ fn peer_advertisement_wire_ok(
 	}
 }
 
-/// Resolve a frame's signer certificate on the given trust plane
+/// Resolve a frame's signer certificate on the given trust plane.
 ///
-/// The single resolution point for every signer-derived fact: the
-/// fingerprint and the colony membership both start from this lookup,
-/// so a caller needing both resolves the certificate once. Missing
-/// trust, signer, or certificate fails closed with `None`.
+/// Single resolution for signer-derived facts: fingerprint and colony
+/// membership both start here so callers resolve the cert once.
+/// Missing trust, signer, or certificate fails closed with `None`.
 #[cfg(feature = "x509")]
 #[must_use]
 pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Frame) -> Option<&'t Certificate> {
@@ -177,10 +173,10 @@ pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Fr
 	trust.find_by_signer_info(signer_info)
 }
 
-/// Certificate fingerprint as a shared slate/attribution identifier
+/// Certificate fingerprint as a shared slate/attribution identifier.
 ///
-/// A fingerprint that fails to compute cannot key a slate or attribute
-/// misbehavior, so it fails closed with `None`.
+/// Fail closed with `None` when the fingerprint cannot be computed:
+/// an unkeyed slate or unattributable misbehavior is refused.
 #[cfg(feature = "x509")]
 #[must_use]
 fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
@@ -189,11 +185,10 @@ fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
 	Some(Arc::from(fingerprint.as_slice()))
 }
 
-/// Resolve a frame's peer identity from the signer's certificate
+/// Peer identity from the signer's certificate fingerprint.
 ///
-/// Peer slates reconcile by cert fingerprint, not claimed `gateway_addr`,
-/// and misbehavior scoring attributes by the same fingerprint. Missing
-/// trust, signer, or fingerprint computation fails closed with `None`.
+/// Slates reconcile and score misbehavior by fingerprint, never claimed
+/// `gateway_addr`. Missing trust, signer, or fingerprint fails closed.
 #[cfg(feature = "x509")]
 #[must_use]
 pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
@@ -202,15 +197,13 @@ pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Fra
 	cert_fingerprint_id(cert)
 }
 
-/// Colony URN from the certificate's URI Subject Alternative Name
+/// Colony URN from the certificate URI Subject Alternative Name.
 ///
-/// Colony membership binds to the URI SAN (RFC 5280 §4.2.1.6), never
-/// the subject: the Subject DN stays operator-owned and is never
-/// interpreted. Non-URI SAN entries and URIs that do not validate as a
-/// colony URN in `namespace` are ignored, not errors. Returns `None`
-/// when the extension is absent or malformed, when no entry validates,
-/// or when more than one distinct colony URN is present: an ambiguous
-/// identity fails closed (CWE-706).
+/// Membership binds to the URI SAN (RFC 5280 §4.2.1.6), never the
+/// Subject DN. Non-URI SANs and URIs that fail colony validation in
+/// `namespace` are ignored. `None` when the extension is absent or
+/// malformed, when no entry validates, or when more than one distinct
+/// colony URN is present: ambiguous identity fails closed (CWE-706).
 #[cfg(feature = "x509")]
 #[must_use]
 pub fn cert_colony_urn(namespace: &ColonyNamespace, cert: &Certificate) -> Option<Urn<'static>> {
@@ -238,12 +231,11 @@ pub fn cert_colony_urn(namespace: &ColonyNamespace, cert: &Certificate) -> Optio
 	colony
 }
 
-/// Colony URN of a frame's signer, resolved on the given trust plane
+/// Colony URN of a frame's signer on the given trust plane.
 ///
-/// Membership travels in the signer's certificate, never in frame
-/// bytes: unsigned scope bytes would be weaker than the certificate
-/// binding (CWE-345). Missing trust, signer, or certificate fails
-/// closed with `None`.
+/// Membership travels in the signer certificate, never frame bytes:
+/// unsigned scope would be weaker than the certificate binding (CWE-345).
+/// Missing trust, signer, or certificate fails closed.
 #[cfg(feature = "x509")]
 #[must_use]
 pub fn frame_colony_urn(
@@ -256,7 +248,7 @@ pub fn frame_colony_urn(
 	cert_colony_urn(namespace, cert)
 }
 
-/// Build a Peer-routed slate keyed by `peer_hive_id` NUL type
+/// Peer-routed slate keyed by `peer_hive_id` NUL type.
 ///
 /// `dial` is the claimed gateway socket stored on every entry.
 #[must_use]

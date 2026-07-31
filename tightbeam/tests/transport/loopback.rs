@@ -253,7 +253,7 @@ async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Re
 
 	// Confidentiality (CWE-311): the CMS backend transports the session key
 	// wrapped inside the KeyExchange EnvelopedData, so the raw key MUST NOT
-	// appear anywhere in the cleartext wire bytes. This is the CMS analogue
+	// appear anywhere in the cleartext wire bytes. This is the CMS equivalent
 	// of the ECIES `confidentiality` threat test, exercised on the real
 	// random-key path (not the fixture's constant test key).
 	let session_key = session_key_bytes(&client, "CMS client must hold a session key after start")?;

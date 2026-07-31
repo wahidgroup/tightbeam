@@ -22,10 +22,10 @@ use tightbeam::{
 	builder::TypeBuilder,
 	cluster,
 	colony::{
-		cluster::{ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		cluster::{ClusterConfig, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
 		common::ColonyNamespace,
-		hive::{Hive, HiveConf, HiveTlsConfig},
-		servlet::ServletConf,
+		hive::{Hive, HiveConfig, HiveTlsConfig},
+		servlet::ServletConfig,
 	},
 	compose,
 	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
@@ -100,7 +100,7 @@ fn laser_certs() -> GatewayCerts {
 	GatewayCerts::generate("CN=Laser Gateway")
 }
 
-fn laser_cluster_conf(certs: &GatewayCerts) -> ClusterConf {
+fn laser_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
 	let tls = ClusterTlsConfig {
 		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
 		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
@@ -110,8 +110,8 @@ fn laser_cluster_conf(certs: &GatewayCerts) -> ClusterConf {
 		peer_trust: None,
 	};
 
-	let mut conf = ClusterConf::new(tls);
-	conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
+	let mut conf = ClusterConfig::new(tls);
+	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf
 }
 
@@ -122,24 +122,26 @@ fn beam_urn() -> Urn<'static> {
 		.expect("test names satisfy the mint grammar")
 }
 
-fn laser_hive_conf(certs: &GatewayCerts) -> HiveConf {
+fn laser_hive_conf(certs: &GatewayCerts) -> HiveConfig {
 	let hive_tls = Arc::new(HiveTlsConfig {
 		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
 		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 		validators: vec![],
 	});
-	HiveConf {
+
+	let mut conf = HiveConfig {
 		hive_tls: Some(hive_tls),
 		trust_store: Some(Arc::clone(&certs.trust)),
-		mux_offer: Some(TransportOffer::mux(8)),
 		..Default::default()
-	}
+	};
+	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+	conf
 }
 
-fn laser_servlet_conf(certs: &GatewayCerts) -> Result<ServletConf<LaserListener, BeamRequest>, TightBeamError> {
+fn laser_servlet_conf(certs: &GatewayCerts) -> Result<ServletConfig<LaserListener, BeamRequest>, TightBeamError> {
 	let cert = CertificateSpec::Built(Box::new(certs.cert.to_owned()));
 	let key = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
-	Ok(ServletConf::<LaserListener, BeamRequest>::builder()
+	Ok(ServletConfig::<LaserListener, BeamRequest>::builder()
 		.with_certificate(cert, key, vec![])?
 		.with_mux_offer(Some(TransportOffer::mux(8)))
 		.with_config(Arc::new(()))
@@ -149,7 +151,7 @@ fn laser_servlet_conf(certs: &GatewayCerts) -> Result<ServletConf<LaserListener,
 async fn start_laser_hive(
 	trace: TraceCollector,
 	certs: Arc<GatewayCerts>,
-	conf: HiveConf,
+	conf: HiveConfig,
 ) -> Result<LaserHive, TightBeamError> {
 	let config = Some(laser_servlet_conf(&certs)?);
 	let trace = Arc::new(trace.share());
@@ -162,7 +164,7 @@ async fn start_laser_hive(
 }
 
 /// Emit one beam work request through a gateway and decode the response.
-async fn emit_beam_work(certs: &GatewayCerts, addr: LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
+async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
 	let work_request = ClusterRequest::Work(ClusterWorkRequest::new(beam_urn(), encode(&BeamRequest { value: 21 })?));
 
 	let frame = frame_compose(Version::V0)
@@ -184,7 +186,7 @@ async fn emit_beam_work(certs: &GatewayCerts, addr: LaserAddr) -> Result<Cluster
 /// Poll a gateway until it routes work: a freshly restarted gateway has
 /// an empty registry until the hive's anti-entropy beat re-registers.
 /// Branching lives here, not in scenarios.
-async fn wait_for_routed(certs: &GatewayCerts, addr: LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
+async fn wait_for_routed(certs: &GatewayCerts, addr: &LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
 	for _ in 0..50 {
 		if let Ok(response) = emit_beam_work(certs, addr).await {
 			if response.status == TransitStatus::Ok {
@@ -212,6 +214,7 @@ impl MuxService for BeamLengthService {
 			V0: id: b"beam-length",
 				message: message
 		}?;
+
 		Ok(Some(frame))
 	}
 }
@@ -254,13 +257,13 @@ tb_scenario! {
 					.with_config(PoolConfig {
 						idle_timeout: None,
 						max_connections: 1,
-						mux_offer: Some(TransportOffer::mux(8)),
+						mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 					})
 					.with_trust_store(Arc::clone(&certs.trust))
 					.build(),
 			);
-			let lease = pool.connect(addr).await?;
 
+			let lease = pool.connect(addr).await?;
 			let (mut sink, response) = lease.open_stream()?;
 			sink.push(b"lase").await?;
 			sink.close_with(b"beam").await?;
@@ -268,7 +271,9 @@ tb_scenario! {
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
 			let decoded: BeamResponse = decode(&reply.message)?;
 			let value = decoded.doubled == 8;
+
 			trace.event_with(LASER_SERVER_STREAM_REPORTS_LENGTH, &[], value)?;
+
 			Ok(())
 		}
 	}
@@ -355,11 +360,12 @@ tb_scenario! {
 		},
 		hives: |SetupEnv { trace, context: certs }| {
 			let mut conf = laser_hive_conf(&certs);
-			conf.reregister_interval = Some(Duration::from_millis(100));
+			conf.control.reregister_interval = Some(Duration::from_millis(100));
 			vec![start_laser_hive(trace, certs, conf)]
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let before = emit_beam_work(&certs, cluster.addr()).await?;
+
 			trace.event_with(LASER_ROUTE_BEFORE_RESTART, &[], before.status)?;
 
 			cluster.stop();

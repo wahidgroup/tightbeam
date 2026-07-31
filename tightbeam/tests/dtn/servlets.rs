@@ -162,7 +162,7 @@ async fn wait_for_address(
 // ============================================================================
 
 #[derive(Clone)]
-pub struct MissionControlServletConf {
+pub struct MissionControlServletConfig {
 	pub mission_control_signing_key: Secp256k1SigningKey,
 	pub rover_verifying_key: Secp256k1VerifyingKey,
 	pub earth_relay_verifying_key: Secp256k1VerifyingKey,
@@ -175,11 +175,11 @@ pub struct MissionControlServletConf {
 
 servlet! {
 	/// Mission Control receives telemetry and sends commands to Rover via relays
-	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConf>,
+	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &MissionControlServletConf = ctx.env_config()?;
+		let config: &MissionControlServletConfig = ctx.env_config()?;
 		let frame_order = frame.metadata.order;
 
 		// Verify signature using trait method
@@ -291,7 +291,7 @@ servlet! {
 	}
 }
 
-impl DtnNode for MissionControlServletConf {
+impl DtnNode for MissionControlServletConfig {
 	fn node_name(&self) -> &str {
 		"mission_control"
 	}
@@ -322,7 +322,7 @@ impl DtnNode for MissionControlServletConf {
 // ============================================================================
 
 #[derive(Clone)]
-pub struct EarthRelaySatelliteServletConf {
+pub struct EarthRelaySatelliteServletConfig {
 	pub earth_relay_signing_key: Secp256k1SigningKey,
 	pub mission_control_verifying_key: Secp256k1VerifyingKey,
 	pub mars_relay_verifying_key: Secp256k1VerifyingKey,
@@ -338,11 +338,11 @@ pub struct EarthRelaySatelliteServletConf {
 
 servlet! {
 	/// Earth Relay forwards messages between Mission Control and Mars Relay
-	pub EarthRelaySatelliteServlet<RelayMessage, EnvConfig = EarthRelaySatelliteServletConf>,
+	pub EarthRelaySatelliteServlet<RelayMessage, EnvConfig = EarthRelaySatelliteServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &EarthRelaySatelliteServletConf = ctx.env_config()?;
+		let config: &EarthRelaySatelliteServletConfig = ctx.env_config()?;
 		// Verify signature and determine source
 		let from_mission_control = if frame.nonrepudiation.is_some() {
 			if frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_ok() {
@@ -500,7 +500,7 @@ servlet! {
 	}
 }
 
-impl DtnNode for EarthRelaySatelliteServletConf {
+impl DtnNode for EarthRelaySatelliteServletConfig {
 	fn node_name(&self) -> &str {
 		"earth_relay"
 	}
@@ -535,7 +535,7 @@ impl DtnNode for EarthRelaySatelliteServletConf {
 // ============================================================================
 
 #[derive(Clone)]
-pub struct MarsRelaySatelliteServletConf {
+pub struct MarsRelaySatelliteServletConfig {
 	pub mars_relay_signing_key: Secp256k1SigningKey,
 	pub mission_control_verifying_key: Secp256k1VerifyingKey,
 	pub earth_relay_verifying_key: Secp256k1VerifyingKey,
@@ -551,11 +551,11 @@ pub struct MarsRelaySatelliteServletConf {
 
 servlet! {
 	/// Mars Relay forwards messages between Earth Relay and Rover
-	pub MarsRelaySatelliteServlet<RelayMessage, EnvConfig = MarsRelaySatelliteServletConf>,
+	pub MarsRelaySatelliteServlet<RelayMessage, EnvConfig = MarsRelaySatelliteServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &MarsRelaySatelliteServletConf = ctx.env_config()?;
+		let config: &MarsRelaySatelliteServletConfig = ctx.env_config()?;
 		// Verify signature and determine source
 		// Earth Relay forwards messages, so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation.is_some() {
@@ -726,7 +726,7 @@ servlet! {
 	}
 }
 
-impl DtnNode for MarsRelaySatelliteServletConf {
+impl DtnNode for MarsRelaySatelliteServletConfig {
 	fn node_name(&self) -> &str {
 		"mars_relay"
 	}
@@ -761,7 +761,7 @@ impl DtnNode for MarsRelaySatelliteServletConf {
 // ============================================================================
 
 #[derive(Clone)]
-pub struct RoverServletConf {
+pub struct RoverServletConfig {
 	pub mars_relay_addr: TightBeamSocketAddr,
 	pub mars_relay_pool: Arc<ConnectionPool<TokioListener>>,
 	pub rover_signing_key: Secp256k1SigningKey,
@@ -777,11 +777,11 @@ pub struct RoverServletConf {
 
 servlet! {
 	/// Mars Rover executes commands and sends telemetry
-	pub RoverServlet<RelayMessage, EnvConfig = RoverServletConf>,
+	pub RoverServlet<RelayMessage, EnvConfig = RoverServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &RoverServletConf = ctx.env_config()?;
+		let config: &RoverServletConfig = ctx.env_config()?;
 		// Verify signature
 		if frame.nonrepudiation.is_some()
 			&& frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_err()
@@ -883,7 +883,7 @@ servlet! {
 	}
 }
 
-impl DtnNode for RoverServletConf {
+impl DtnNode for RoverServletConfig {
 	fn node_name(&self) -> &str {
 		"rover"
 	}

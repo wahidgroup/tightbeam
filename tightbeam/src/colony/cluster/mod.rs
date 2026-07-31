@@ -1,41 +1,39 @@
-//! Cluster framework for servlet orchestration
+//! Cluster framework: gateways that route work to registered hives.
 //!
-//! Clusters are gateways that receive work requests from external clients
-//! and route them to registered hives/hives based on servlet type.
-//!
-//! # Architecture
-//!
-//! 1. **Hives/Drones register** with the cluster, announcing available servlet types
-//! 2. **Cluster maintains registry** of hives and their capabilities
-//! 3. **Clients send** `ClusterWorkRequest` with `servlet_type` and `payload`
-//! 4. **Cluster routes** to a hive that supports the requested servlet type
-//! 5. **Cluster forwards** payload and returns response to client
+//! - Hives register and announce servlet types.
+//! - The gateway keeps hive and servlet registries.
+//! - Clients send [`ClusterWorkRequest`] with a servlet type and payload.
+//! - The gateway selects a route and forwards the payload.
 
 pub mod builder;
 pub mod error;
 pub mod macros;
 pub mod registry;
+pub mod runtime;
 pub mod servlet_registry;
 
+#[cfg(feature = "x509")]
+#[doc(hidden)]
+pub mod gossip;
 #[doc(hidden)]
 pub mod outbound;
 #[doc(hidden)]
 pub mod peer;
 
-#[cfg(feature = "x509")]
-#[doc(hidden)]
-pub mod gossip;
-
-// Re-export submodule types
-pub use builder::{ClusterConfBuilder, HeartbeatConfBuilder};
+pub use builder::{ClusterConfigBuilder, HeartbeatConfigBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
-pub use servlet_registry::{PeerCaps, PeerRouteInfo, PheromoneConf, RouteKind, ServletEntry, ServletRegistry};
+pub use runtime::ClusterGateway;
+pub use servlet_registry::{
+	PeerCaps, PeerRouteInfo, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, DEFAULT_ABANDONMENT_LIMIT,
+	DEFAULT_EVAPORATION_INTERVAL_SECS, DEFAULT_EVAPORATION_RATE_BPS, DEFAULT_INITIAL_PHEROMONE,
+	DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
+};
 
 #[cfg(feature = "x509")]
 pub use gossip::{
 	gossip_digest, gossip_fresh, gossip_want, signer_attribution, wanted_digests, Admission, AdmittedGossip,
-	GossipAdmission, GossipConf, GossipDigest, GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
+	GossipAdmission, GossipConfig, GossipDigest, GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
 };
 
 #[cfg(feature = "x509")]
@@ -50,11 +48,11 @@ use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
 use crate::transport::{Protocol, TightBeamAddress};
-#[cfg(feature = "x509")]
-use crate::utils::urn::Urn;
 
 #[cfg(feature = "x509")]
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
+#[cfg(feature = "x509")]
+use crate::utils::urn::Urn;
 
 use super::common::{ColonyNamespace, LoadBalancer};
 
@@ -62,31 +60,29 @@ use super::common::{ColonyNamespace, LoadBalancer};
 // Configuration
 // =============================================================================
 
-// Heartbeat default constants (single source of truth)
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub(crate) const DEFAULT_MAX_FAILURES: u32 = 3;
 
-/// Configuration for cluster heartbeat behavior
+/// Heartbeat cadence, eviction timeout, and failure tolerance.
 ///
-/// Retry semantics are expressed through `interval` (cadence) and
-/// `max_failures` (tolerance): a failed heartbeat is retried on the next
-/// cycle rather than through a separate retry policy.
-pub struct HeartbeatConf {
-	/// Interval between heartbeat checks
+/// A failed heartbeat is retried on the next `interval` cycle.
+/// Eviction uses `max_failures`, not a separate retry policy.
+pub struct HeartbeatConfig {
+	/// Time between heartbeat cycles
 	pub interval: Duration,
-	/// Timeout before evicting unresponsive hives
+	/// Age after which a silent hive is evicted
 	pub timeout: Duration,
-	/// Maximum concurrent heartbeat requests
+	/// Cap on concurrent heartbeat dials per cycle
 	pub max_concurrent: usize,
-	/// Failed heartbeats before eviction
+	/// Consecutive failures before unregistering a hive
 	pub max_failures: u32,
-	/// Optional callback for heartbeat events (monitoring, testing)
+	/// Optional per-result callback for monitoring or tests
 	pub on_heartbeat: Option<HeartbeatCallback>,
 }
 
-impl Default for HeartbeatConf {
+impl Default for HeartbeatConfig {
 	fn default() -> Self {
 		Self {
 			interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
@@ -98,9 +94,9 @@ impl Default for HeartbeatConf {
 	}
 }
 
-impl core::fmt::Debug for HeartbeatConf {
+impl core::fmt::Debug for HeartbeatConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		f.debug_struct("HeartbeatConf")
+		f.debug_struct("HeartbeatConfig")
 			.field("interval", &self.interval)
 			.field("timeout", &self.timeout)
 			.field("max_concurrent", &self.max_concurrent)
@@ -110,63 +106,47 @@ impl core::fmt::Debug for HeartbeatConf {
 	}
 }
 
-impl HeartbeatConf {
-	/// Add a callback to be invoked on each heartbeat result
+impl HeartbeatConfig {
+	/// Attach a callback invoked after each heartbeat result.
 	pub fn with_callback(mut self, callback: HeartbeatCallback) -> Self {
 		self.on_heartbeat = Some(callback);
 		self
 	}
 }
 
-// =============================================================================
-// Heartbeat Callback
-// =============================================================================
-
-/// Event emitted for each heartbeat result
-///
-/// Provides information about the heartbeat outcome for monitoring,
-/// metrics collection, or testing purposes.
+/// Outcome of one hive heartbeat, for monitoring or tests.
 #[derive(Debug, Clone)]
 pub struct HeartbeatEvent {
-	/// Address of the hive that was checked
+	/// Hive control address that was dialed
 	pub hive_addr: Arc<[u8]>,
-	/// Whether the heartbeat succeeded
+	/// Whether the hive answered within policy
 	pub success: bool,
-	/// Utilization reported by the hive (if successful)
+	/// Utilization from the hive when the heartbeat succeeded
 	pub utilization: Option<crate::utils::BasisPoints>,
 }
 
-/// Callback type for heartbeat events
+/// Callback after each heartbeat result.
 ///
-/// Called after each heartbeat result is processed. The callback must be
-/// thread-safe (`Send + Sync`) as it may be invoked from multiple concurrent
-/// heartbeat tasks.
+/// Must be `Send + Sync`: the loop may invoke it from concurrent tasks.
 pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 
-// ============================================================================
-// TLS Configuration
-// ============================================================================
-
-/// TLS configuration for cluster -> hive connections
-///
-/// Contains certificate, key, and validators for encrypted transport.
-/// Used by the connection pool for mutual TLS with hives.
+/// TLS material for the gateway accept loop and hive/peer dials.
 #[cfg(feature = "x509")]
 pub struct ClusterTlsConfig {
-	/// Cluster's certificate (used for both client and hive connections)
+	/// Gateway certificate (server identity; also used on outbound client dials)
 	pub certificate: CertificateSpec,
-	/// Private key provider for signing operations (supports HSM/KMS)
+	/// Signing key for control frames and TLS (HSM/KMS capable)
 	pub key: Arc<dyn SigningKeyProvider>,
-	/// Server certificate validators for hive connections (cluster->hive)
+	/// Server-certificate validators for outbound hive dials
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
-	/// Client certificate validators for mutual auth (client->cluster)
+	/// Client-certificate validators for inbound mutual TLS
 	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
-	/// Trust store for validating hive/servlet server certificates (outbound connections)
+	/// Trust store for hive/servlet server certificates on outbound dials
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 	/// Trust anchor for peer-gateway advertisements and relayed gossip.
-	/// A separate authority from `hive_trust`: peer certificates cannot
-	/// register as hives, hive certificates cannot forge peer ads. `None`
-	/// disables inbound federation (advertisements are refused).
+	/// Separate from `hive_trust`: peer certificates cannot register as
+	/// hives; hive certificates cannot forge peer ads. `None` disables
+	/// inbound federation (advertisements are refused).
 	pub peer_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 }
 
@@ -198,81 +178,81 @@ impl core::fmt::Debug for ClusterTlsConfig {
 	}
 }
 
-/// Configuration for clusters
+/// Peer-federation dial list, advertise beat, and inbound dial allowlist.
 ///
-/// Contains settings for load balancing, health checks, gateway policies,
-/// and cryptographic signing for cluster -> hive communication.
-///
-/// # Type Parameters
-/// The balancer is stored as `Arc<dyn LoadBalancer>` so any strategy is
-/// pluggable at runtime, defaulting to
-/// [`StochasticForager`](crate::colony::common::StochasticForager).
-pub struct ClusterConf {
-	/// Naming scope inbound resource URNs are validated against.
-	/// Registrations, address updates, and work requests carrying a
-	/// foreign authority or realm are refused at the gateway.
-	pub namespace: ColonyNamespace,
-	/// Load balancing strategy for distributing work across hives
-	pub load_balancer: Arc<dyn LoadBalancer>,
-	/// Heartbeat configuration
-	pub heartbeat: HeartbeatConf,
-	/// Pheromone configuration for bio-inspired routing
-	pub pheromone: PheromoneConf,
-	/// Gate policies for the gateway (rate limiting, auth, etc.)
-	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	/// Connection pool configuration for hive connections
-	pub pool_config: PoolConfig,
-	/// Freshness window in milliseconds for signed hive control frames
-	/// (registration, address updates); stale or replayed frames inside
-	/// the window are rejected (CWE-294)
-	pub control_freshness_window_ms: u64,
-	/// Gateway bind address, parsed via the protocol address's `FromStr`.
-	/// `None` binds the protocol default. A stable address lets hives
-	/// re-register through gateway restarts without reconfiguration.
-	pub bind_addr: Option<String>,
-	/// Peer gateway addresses this gateway dials to advertise its exported
-	/// types. A dial-list, not an identity gate: a partial or asymmetric peer
-	/// graph is expected. Empty disables outbound advertisement.
+/// Trust anchors stay on [`ClusterTlsConfig::peer_trust`].
+#[derive(Clone, Debug, Default)]
+pub struct PeerConfig {
+	/// Peer gateway addresses dialed to advertise exported types.
+	/// Dial list, not an identity gate; partial or asymmetric graphs are
+	/// expected. Empty disables outbound advertisement.
 	///
-	/// The advertised slate is never configured: each beat snapshots the hive
-	/// registry, so peers learn exactly the types this colony serves right now.
+	/// The slate is never configured: each beat snapshots the local
+	/// servlet registry so peers learn types currently served.
 	pub peers: Vec<String>,
-	/// Re-advertise beat cadence. `None` disables the advertise beat.
+	/// Re-advertise beat cadence. `None` disables the beat.
 	pub advertise_interval: Option<Duration>,
 	/// When `Some`, inbound peer ads may only claim dial addresses in this
 	/// list (exact string match). `None` accepts any parseable socket.
 	pub peer_dial_allowlist: Option<Vec<String>>,
-	/// Gossip subsystem configuration (freshness/ttl/retention + journal)
+}
+
+/// Runtime configuration for a cluster gateway.
+///
+/// Load balancer is `Arc<dyn LoadBalancer>`, defaulting to
+/// [`StochasticForager`](crate::colony::common::StochasticForager).
+pub struct ClusterConfig {
+	/// Naming scope for inbound resource URNs.
+	/// Foreign authority or realm on register, update, or work is refused.
+	pub namespace: ColonyNamespace,
+	/// Strategy for selecting among candidate servlet instances
+	pub load_balancer: Arc<dyn LoadBalancer>,
+	/// Hive health probes and eviction policy
+	pub heartbeat: HeartbeatConfig,
+	/// Route scoring: reinforcement, weaken, and evaporation
+	pub pheromone: PheromoneConfig,
+	/// Gate policies evaluated before request decode
+	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	/// Outbound connection pool settings for hive and peer dials
+	pub pool_config: PoolConfig,
+	/// Freshness window (ms) for signed hive control frames.
+	/// Stale or replayed registration/update frames are rejected (CWE-294).
+	pub control_freshness_window_ms: u64,
+	/// Gateway bind address via the protocol address `FromStr`.
+	/// `None` binds the protocol default. A stable address lets hives
+	/// re-register across gateway restarts without reconfiguration.
+	pub bind_addr: Option<String>,
+	/// Peer-federation dial list, advertise beat, and dial allowlist
+	pub peer: PeerConfig,
+	/// Gossip freshness, TTL, ingress, journal, and admission
 	#[cfg(feature = "x509")]
-	pub gossip: GossipConf,
-	/// Colony URN from the gateway certificate's URI Subject Alternative
-	/// Name, derived once at config build by
-	/// [`cert_colony_urn`](crate::colony::cluster::cert_colony_urn).
-	/// `None` means this gateway is not a colony member: gossip publish,
-	/// relay, and reconciliation are refused, peer advertisements are
-	/// refused, and the advertise beat skips gossip reconciliation. Work
-	/// forwarding and hive registration never require membership.
+	pub gossip: GossipConfig,
+	/// Colony URN from the gateway certificate URI SAN, derived once at
+	/// build by [`cert_colony_urn`](crate::colony::cluster::cert_colony_urn).
+	/// `None` means not a colony member: gossip publish/relay/reconcile
+	/// and peer ads are refused; the advertise beat skips gossip
+	/// reconciliation. Work and hive registration never require membership.
 	///
 	/// Private so membership cannot drift from the certificate: the
-	/// builder derives it and [`ClusterConf::colony_urn`] reads it.
+	/// builder derives it; [`ClusterConfig::colony_urn`] reads it.
 	#[cfg(feature = "x509")]
 	colony_urn: Option<Urn<'static>>,
-	/// TLS configuration for cluster -> hive connections
+	/// TLS material for accept and outbound dials
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
 }
 
 #[cfg(feature = "x509")]
-impl ClusterConf {
-	/// Create a new cluster configuration with TLS config
+impl ClusterConfig {
+	/// Build a default config around the given TLS material.
 	pub fn new(tls: ClusterTlsConfig) -> Self {
 		Self::builder(tls).build()
 	}
 
-	/// Colony URN from the gateway certificate's URI SAN
+	/// Colony URN from the gateway certificate URI SAN.
 	///
-	/// `None` means this gateway is not a colony member. Derived once
-	/// by the builder from the certificate; read-only afterwards.
+	/// `None` when this gateway is not a colony member. Derived once by
+	/// the builder; read-only afterwards.
 	#[must_use]
 	pub fn colony_urn(&self) -> Option<&Urn<'static>> {
 		self.colony_urn.as_ref()
@@ -280,7 +260,7 @@ impl ClusterConf {
 }
 
 #[cfg(feature = "x509")]
-impl core::fmt::Debug for ClusterConf {
+impl core::fmt::Debug for ClusterConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterConfig")
 			.field("namespace", &self.namespace)
@@ -290,9 +270,7 @@ impl core::fmt::Debug for ClusterConf {
 			.field("pool_config", &self.pool_config)
 			.field("control_freshness_window_ms", &self.control_freshness_window_ms)
 			.field("bind_addr", &self.bind_addr)
-			.field("peers", &self.peers)
-			.field("advertise_interval", &self.advertise_interval)
-			.field("peer_dial_allowlist", &self.peer_dial_allowlist)
+			.field("peer", &self.peer)
 			.field("gossip", &self.gossip)
 			.field("colony_urn", &self.colony_urn)
 			.field("tls", &self.tls)
@@ -310,69 +288,63 @@ pub use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ClusterWorkR
 // Cluster Trait
 // =============================================================================
 
-/// Trait for cluster implementations
+/// Trait for cluster gateway implementations.
 ///
-/// Clusters are gateways that route work requests to registered hives
-/// based on servlet type. Hives register dynamically, and the cluster
-/// learns available servlet types from their registrations.
+/// Gateways route work to registered hives by servlet type. Hives register
+/// dynamically; servlet types are learned from those registrations.
 pub trait Cluster: Sized + Send + Sync {
-	/// The protocol type this cluster uses
+	/// Protocol this gateway serves
 	type Protocol: Protocol;
 
-	/// Address type for this cluster
+	/// Bound address type for this gateway
 	type Address: TightBeamAddress;
 
-	/// Start the cluster gateway
+	/// Bind, spawn accept and background loops, return the running gateway
 	fn start(
 		trace: Arc<TraceCollector>,
-		config: ClusterConf,
+		config: ClusterConfig,
 	) -> impl Future<Output = Result<Self, crate::TightBeamError>> + Send;
 
-	/// Get the gateway address
-	fn addr(&self) -> Self::Address;
+	/// Gateway listen address (borrowed; no clone).
+	fn addr(&self) -> &Self::Address;
 
-	/// Get available servlet types (from registered hives)
-	fn available_servlets(&self) -> Vec<Vec<u8>>;
+	/// Servlet types available from registered local hives
+	fn available_servlets(&self) -> Vec<SharedId>;
 
-	/// Get servlet types reachable through peer gateways (learned, not local)
-	fn peer_servlets(&self) -> Vec<Vec<u8>>;
+	/// Servlet types reachable through peer gateways (learned, not local)
+	fn peer_servlets(&self) -> Vec<SharedId>;
 
-	/// Learned peer routes with dial and peer identity for operators
+	/// Learned peer routes with dial address and peer identity
 	fn peer_routes(&self) -> Vec<PeerRouteInfo>;
 
-	/// Get the number of registered hives
+	/// Count of currently registered hives
 	fn hive_count(&self) -> usize;
 
-	/// Get the trace collector
+	/// Shared trace collector for this gateway
 	fn trace(&self) -> Arc<TraceCollector>;
 
-	/// Stop the cluster
+	/// Abort accept and background tasks
 	fn stop(self);
 
-	/// Wait for the cluster to finish
+	/// Wait until the accept loop finishes
 	fn join(self) -> impl Future<Output = Result<(), crate::colony::servlet::servlet_runtime::rt::JoinError>> + Send;
 }
 
-/// Heartbeat surface of a cluster gateway
+/// Heartbeat surface of a cluster gateway.
 ///
-/// Split from [`Cluster`] so a consumer that only routes work never
-/// depends on health-monitoring internals (interface segregation).
-/// The `cluster!` macro implements both traits for every gateway.
+/// Split from [`Cluster`] so work-only consumers never depend on health
+/// internals. [`ClusterGateway`] implements both traits for every alias.
 pub trait ClusterHeartbeat: Cluster {
-	/// Access the hive registry
+	/// Shared hive registry
 	fn registry(&self) -> &Arc<HiveRegistry>;
 
-	/// Access heartbeat configuration
-	fn heartbeat_config(&self) -> &HeartbeatConf;
+	/// Heartbeat interval, timeout, and failure policy
+	fn heartbeat_config(&self) -> &HeartbeatConfig;
 
-	/// Send a single heartbeat to a hive
+	/// Send one signed heartbeat to a hive via the connection pool.
 	///
-	/// Builds a signed heartbeat frame and sends it via the connection pool.
-	/// Returns the heartbeat result from the hive.
-	///
-	/// The heartbeat loop itself is generated by the `cluster!` macro
-	/// (tokio `JoinSet` with bounded concurrency); it is not part of the
-	/// trait surface.
+	/// The background loop lives in [`ClusterGateway::start`]
+	/// (`JoinSet`, bounded concurrency); it is not on this trait.
 	fn send_heartbeat(
 		&self,
 		addr: Self::Address,
@@ -442,16 +414,16 @@ mod tests {
 	}
 
 	// =========================================================================
-	// ClusterConf Tests
+	// ClusterConfig Tests
 	// =========================================================================
 
 	#[test]
-	fn cluster_conf_defaults() {
-		let config = ClusterConf::new(test_tls_config());
+	fn cluster_config_defaults() {
+		let config = ClusterConfig::new(test_tls_config());
 		assert_eq!(config.heartbeat.interval, Duration::from_secs(5));
 		assert_eq!(config.heartbeat.timeout, Duration::from_secs(15));
 		assert!(config.policies.is_empty());
-		assert!(config.peer_dial_allowlist.is_none());
+		assert!(config.peer.peer_dial_allowlist.is_none());
 	}
 
 	// =========================================================================
