@@ -81,6 +81,10 @@ pub enum ClusterError {
 	/// Gossip journal backend could not service the request
 	#[error("Gossip journal unavailable")]
 	GossipJournalUnavailable,
+
+	/// Reconcile reply exceeded the want-list or peer-exchange cap
+	#[error("Oversized reconcile reply")]
+	OversizedReconcileReply,
 }
 
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {

@@ -10,7 +10,7 @@ use crate::testing::fdr::explorer::MemoizationCache;
 
 /// Default memoization cache implementation
 ///
-/// Keyed on [`Process::structure_digest`] values so structurally
+/// Keyed on [`crate::testing::specs::csp::Process::structure_digest`] values so structurally
 /// different processes never share entries, even when algebra operators
 /// give them identical names. Each entry stores the completeness
 /// flag of the computation that produced it.

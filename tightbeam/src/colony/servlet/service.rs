@@ -16,11 +16,11 @@ use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 
 use crate::colony::servlet::servlet_runtime::rt;
 
-/// Lifecycle interface for named servlets and [`ServletRuntime`].
+/// Lifecycle interface for named servlets and [`crate::colony::servlet::ServletRuntime`].
 ///
 /// Generic over input message type `I`. Workers attached to a servlet share
 /// that same input type. `servlet!` implements this for the generated type;
-/// macro-free code uses [`ServletRuntime`] with [`RuntimeServletConf`].
+/// macro-free code uses [`crate::colony::servlet::ServletRuntime`] with [`RuntimeServletConf`].
 pub trait Servlet<I> {
 	/// Configuration type (typically [`ServletConfig`]).
 	type Conf;
@@ -48,7 +48,7 @@ pub trait Servlet<I> {
 	/// Utilization in basis points (`0..=10000`) for hive balancing.
 	///
 	/// Default `None` means no metrics. Override (for example with
-	/// [`LatencyTracker`]) when the hive should read load.
+	/// [`crate::colony::servlet::LatencyTracker`]) when the hive should read load.
 	fn utilization(&self) -> Option<BasisPoints> {
 		None
 	}
@@ -59,7 +59,7 @@ pub trait Servlet<I> {
 /// Handlers receive [`ServletContext`] (workers, env, decryptor/inflator,
 /// hive link), not the transport session. Missing kinds refuse with
 /// `Unimplemented`. Build with [`ServletHandlers`], or implement this trait
-/// and pass it to [`ServletRuntime::start`].
+/// and pass it to [`crate::colony::servlet::ServletRuntime::start`].
 pub trait ServletService: Send + Sync + 'static {
 	/// Handle one request/response exchange on a unary stream.
 	///
@@ -154,7 +154,7 @@ impl ServletHandlers {
 		self
 	}
 
-	/// Decode message type `I` after [`prepare_typed_frame`], then run `handler`.
+	/// Decode message type `I` after [`crate::colony::servlet::prepare_typed_frame`], then run `handler`.
 	pub fn on_typed_unary<I, F, Fut>(self, handler: F) -> Self
 	where
 		I: Message + Send + 'static,
@@ -207,10 +207,10 @@ impl ServletService for ServletHandlers {
 	}
 }
 
-/// Config + handlers for [`Servlet`] on [`ServletRuntime`].
+/// Config + handlers for [`Servlet`] on [`crate::colony::servlet::ServletRuntime`].
 ///
 /// Use this when a call site needs [`Servlet::start`] without `servlet!`.
-/// Hive registration only needs [`ServletBox`], which [`ServletRuntime`]
+/// Hive registration only needs [`crate::colony::hive::ServletBox`], which [`crate::colony::servlet::ServletRuntime`]
 /// already implements.
 #[cfg(feature = "x509")]
 pub struct RuntimeServletConf<P, M, C: CryptoProvider = DefaultCryptoProvider>
@@ -236,7 +236,7 @@ where
 	}
 }
 
-/// Config + handlers for [`Servlet`] on [`ServletRuntime`].
+/// Config + handlers for [`Servlet`] on [`crate::colony::servlet::ServletRuntime`].
 #[cfg(not(feature = "x509"))]
 pub struct RuntimeServletConf<P, M>
 where

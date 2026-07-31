@@ -305,7 +305,7 @@ where
 /// [`HiveEnv`]: crate::testing::env::HiveEnv
 /// [`TraceCollector`]: crate::trace::TraceCollector
 /// [`PipelineBuilder`]: crate::utils::task::PipelineBuilder
-/// [`TokioListener`]: crate::transport::tcp::r#async::TokioListener
+/// [`TokioListener`]: crate::transport::tcp::async::TokioListener
 #[macro_export]
 macro_rules! tb_scenario {
 	// spec: -> config:

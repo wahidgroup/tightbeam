@@ -81,7 +81,7 @@ pooled_mux! {
 
 /// Shared builder surface for direct clients and connection pools.
 ///
-/// [`ClientBuilder`] and [`ConnectionPoolBuilder`] both implement this trait
+/// [`crate::transport::client::ClientBuilder`] and [`ConnectionPoolBuilder`] both implement this trait
 /// so callers configure timeouts and identity the same way.
 pub trait ConnectionBuilder<P: Protocol>: Sized {
 	/// Built client or pool produced by [`ConnectionBuilder::build`].
@@ -346,6 +346,12 @@ pooled_mux! {
 		/// when emit starts, outside the pool lock. An entry with pending
 		/// streams stays active even if the stamp is old.
 		last_used: Arc<Mutex<Instant>>,
+		/// Validated peer certificate pinned at the eager mux handshake.
+		///
+		/// The mux drivers consume the transport, so the certificate is
+		/// captured at dial. Every lease on this entry reads peer
+		/// identity from this shared handle.
+		peer_certificate: Option<Arc<Certificate>>,
 	}
 }
 
@@ -776,6 +782,10 @@ pooled_mux! {
 				}
 			};
 
+			// The mux drivers consume the transport below, so this is the
+			// last point where the handshake certificate is readable.
+			let peer_certificate = transport.handshake_peer_certificate();
+
 			let rekey = transport.take_rekey()?;
 			let (reader, writer) = transport.into_envelope_halves()?;
 			let (handle, responder, reader_task) = drive_mux(reader, writer, MuxRole::Client, settings, None, rekey);
@@ -806,12 +816,13 @@ pooled_mux! {
 					handle: handle.clone(),
 					reader_task,
 					last_used: Arc::clone(&last_used),
+					peer_certificate: peer_certificate.clone(),
 				});
 			}
 
 			reservation.disarm();
 
-			let lease = MuxLease { id, handle, last_used };
+			let lease = MuxLease { id, handle, last_used, peer_certificate };
 			Ok(self.wrap_mux_client(lease, addr))
 		}
 
@@ -911,6 +922,9 @@ pooled_mux! {
 		/// so the pruner can read idle time without a clock in the mux
 		/// core (see [`MuxEntry::last_used`]).
 		last_used: Arc<Mutex<Instant>>,
+		/// Shared handle to the entry's pinned peer certificate
+		/// (see [`MuxEntry::peer_certificate`]).
+		peer_certificate: Option<Arc<Certificate>>,
 	}
 
 	impl MuxLease {
@@ -928,6 +942,7 @@ pooled_mux! {
 				id: entry.id,
 				handle: entry.handle.clone(),
 				last_used: Arc::clone(&entry.last_used),
+				peer_certificate: entry.peer_certificate.clone(),
 			}
 		}
 	}
@@ -975,15 +990,21 @@ where
 
 	/// Validated TLS peer certificate pinned by this connection's handshake
 	///
-	/// `None` on a multiplexed lease or before mutual authentication
-	/// completes. A caller that gates policy on peer identity MUST fail
-	/// closed on `None`.
+	/// A mux lease answers from the certificate pinned at its eager dial
+	/// handshake. An exclusive lease reads its transport, so the answer
+	/// is `None` until the handshake completes. A caller that gates
+	/// policy on peer identity MUST fail closed on `None`.
 	#[cfg(feature = "x509")]
 	pub fn peer_certificate(&self) -> Option<&Certificate>
 	where
 		P::Transport: crate::transport::state::EncryptedProtocolState,
 	{
 		use crate::transport::state::EncryptedProtocolState;
+
+		#[cfg(pooled_mux)]
+		if let Some(lease) = self.mux.as_ref() {
+			return lease.peer_certificate.as_deref();
+		}
 
 		self.client.as_ref()?.transport().to_peer_certificate_ref()
 	}
@@ -1064,6 +1085,24 @@ pooled_mux! {
 				}
 				outcome => outcome,
 			}
+		}
+
+		/// Warm the connection by completing its handshake without
+		/// emitting an application frame.
+		///
+		/// Callers that gate on peer identity before disclosing a request
+		/// drive this first so [`peer_certificate`](Self::peer_certificate)
+		/// is populated.
+		///
+		/// - A mux lease already handshook eagerly at dial, so it returns at once.
+		/// - A single-flight lease defers its handshake to the first
+		///   [`emit`](Self::emit).
+		pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()> {
+			if self.mux.is_some() {
+				return Ok(());
+			}
+
+			self.conn()?.complete_handshake().await
 		}
 
 		/// Open a streamed request on the shared mux connection: push

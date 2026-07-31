@@ -4,7 +4,7 @@
 //! and negotiation ([`MuxAcceptor::negotiate_mux`]): [`serve_mux`] runs the
 //! whole mux plane (gated halves, drivers, responder) with the caller's
 //! [`MuxService`] behind the transport's collector gate. The connection
-//! pool uses [`drive_mux`] for the client side of the same plane, staying
+//! pool uses `drive_mux` for the client side of the same plane, staying
 //! generic over [`MuxConnector`](crate::transport::multiplex::MuxConnector).
 
 use core::future::Future;

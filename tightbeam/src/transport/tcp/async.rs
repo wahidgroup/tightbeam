@@ -359,7 +359,7 @@ where
 	/// Report whether the underlying stream still appears connected.
 	///
 	/// The liveness hook external protocols need to implement
-	/// [`PersistentConnection`](crate::transport::PersistentConnection)
+	/// [`PersistentConnection`]
 	/// for pooled connections; the stream itself is not exposed.
 	pub fn is_alive(&self) -> bool {
 		AsyncProtocolStream::is_alive(&self.stream)
@@ -467,6 +467,7 @@ where
 		let Some(settings) = self.negotiated_mux() else {
 			return Err(TransportError::InvalidState);
 		};
+
 		let rekey = take_rekey_context(&mut self, role)?;
 		let (reader, writer) = self.into_split()?;
 
@@ -518,6 +519,10 @@ where
 
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
 		take_rekey_context(self, MuxRole::Client)
+	}
+
+	fn handshake_peer_certificate(&self) -> Option<Arc<Certificate>> {
+		self.to_peer_certificate_arc()
 	}
 
 	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)> {
@@ -895,12 +900,13 @@ where
 		let (send_key, recv_key) = session_keys.into_parts();
 
 		let max_encrypted_envelope = self.max_encrypted_envelope;
+
 		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
 		let operation_timeout = self.operation_timeout;
 		#[cfg(feature = "instrument")]
 		let trace = self.trace.as_ref().map(TraceCollector::share);
-		let (read_half, write_half) = self.stream.into_split();
 
+		let (read_half, write_half) = self.stream.into_split();
 		let reader = TransportReader {
 			stream: read_half,
 			recv_key,
@@ -941,10 +947,11 @@ where
 		}
 
 		let max_cleartext_envelope = self.max_cleartext_envelope;
+
 		#[cfg(feature = "instrument")]
 		let trace = self.trace.as_ref().map(TraceCollector::share);
-		let (read_half, write_half) = self.stream.into_split();
 
+		let (read_half, write_half) = self.stream.into_split();
 		let reader = CleartextReader {
 			stream: read_half,
 			max_cleartext_envelope,
@@ -1636,6 +1643,46 @@ mod tests {
 		let received = received_rx.recv().await;
 		assert_eq!(Some(request), received);
 		assert!(received_rx.try_recv().is_err());
+
+		server_handle.await??;
+		Ok(())
+	}
+
+	// The gossip colony gate reads the peer certificate before any
+	// request is disclosed (CWE-668), so the deferred single-flight
+	// handshake must be drivable on its own: it populates the peer
+	// certificate, sends no application frame, and repeats as a no-op.
+	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[tokio::test]
+	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {
+		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
+		let (listener, server_addr) = bind_encrypted(config).await?;
+
+		let request = create_v0_tightbeam(None, None);
+		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
+		let server_handle = tokio::spawn(async move {
+			let (mut transport, _peer) = listener.accept().await?;
+			respond_with(&mut transport, move |msg: Frame| {
+				let _ = received_tx.try_send(msg);
+				None
+			})
+			.await
+		});
+
+		let trust_store = trust_store_for(cert)?;
+		let client_stream = TcpStream::connect(server_addr).await?;
+		let mut transport = tcp_transport_from(client_stream).with_trust_store(trust_store);
+		assert!(transport.to_peer_certificate_ref().is_none());
+
+		transport.ensure_handshake_complete().await?;
+		assert!(transport.to_peer_certificate_ref().is_some());
+		assert!(received_rx.try_recv().is_err());
+
+		transport.ensure_handshake_complete().await?;
+		transport.emit(request.to_owned(), None).await?;
+
+		let received = received_rx.recv().await;
+		assert_eq!(Some(request), received);
 
 		server_handle.await??;
 		Ok(())

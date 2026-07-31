@@ -14,6 +14,7 @@ use crate::colony::servlet::servlet_runtime::rt;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::instrumentation::events::{
 	CLUSTER_GOSSIP_ACCEPTED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE, CLUSTER_GOSSIP_RELAY_WEAKENED,
+	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
 };
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
@@ -30,17 +31,19 @@ use crate::builder::frame::FrameBuilder;
 #[cfg(feature = "x509")]
 use crate::builder::TypeBuilder;
 #[cfg(feature = "x509")]
+use crate::colony::cluster::peer::{cert_fingerprint_id, peer_dial_allowed};
+#[cfg(feature = "x509")]
 use crate::colony::cluster::{
 	cert_colony_urn, gossip_digest, gossip_fresh, peer_signer_fingerprint, wanted_digests, Admission, AdmittedGossip,
-	GossipDigest,
+	GossipDigest, PeerHint,
 };
 #[cfg(feature = "x509")]
 use crate::colony::common::{
 	current_timestamp_ms, ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipWant,
-	PeerAdvertisement, PeerAdvertisementResponse,
+	PeerAdvertisement, PeerAdvertisementResponse, PeerGossip,
 };
 #[cfg(feature = "x509")]
-use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG};
+use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_PEX_SAMPLE};
 #[cfg(feature = "x509")]
 use crate::decode;
 #[cfg(feature = "x509")]
@@ -186,6 +189,13 @@ pub(crate) async fn reflood_gossip<P, D>(
 		+ 'static,
 	D: ClusterDigest,
 {
+	// Flood targets are anchors plus verified tried peers; an
+	// unverified candidate never receives rumor bytes.
+	let targets = config.peer.table.target_set().unwrap_or_default();
+	if targets.is_empty() {
+		return;
+	}
+
 	let request = ClusterRequest::Gossip(Box::new(rumor));
 
 	let frame = match FrameBuilder::from(Version::V2)
@@ -206,7 +216,7 @@ pub(crate) async fn reflood_gossip<P, D>(
 	};
 
 	let mut fanout = tokio::task::JoinSet::new();
-	for peer in config.peer.peers.iter() {
+	for peer in targets.iter() {
 		let Ok(peer_addr) = peer.parse::<P::Address>() else {
 			continue;
 		};
@@ -270,7 +280,42 @@ where
 	Ok(decoded.status)
 }
 
+/// Whether a reconcile reply exceeds its wire bounds.
+///
+/// A conforming gateway never sends more than [`MAX_GOSSIP_LOG`] wants
+/// or [`MAX_PEX_SAMPLE`] peer-exchange entries, so an oversized reply
+/// is abuse and the requester drops the whole round (CWE-770).
+#[cfg(feature = "x509")]
+fn reconcile_reply_oversized(reply: &GossipWant) -> bool {
+	reply.want.len() > MAX_GOSSIP_LOG || reply.pex.len() > MAX_PEX_SAMPLE
+}
+
+/// Peer-exchange hints that this gateway may learn.
+///
+/// An entry must parse as a discovery hint and pass the operator's dial
+/// allowlist. The allowlist gates a shared address exactly like an
+/// inbound advertisement claim, so a later feeler probe never dials an
+/// address the operator refused (CWE-284).
+///
+/// Sources:
+/// - CWE-284, improper access control:
+///   <https://cwe.mitre.org/data/definitions/284.html>
+#[cfg(feature = "x509")]
+fn admissible_pex_hints<'c>(
+	pex: Vec<PeerGossip>,
+	allowlist: Option<&'c [String]>,
+) -> impl Iterator<Item = PeerHint> + 'c {
+	pex.into_iter()
+		.filter_map(|entry| PeerHint::try_from(entry).ok())
+		.filter(move |hint| peer_dial_allowed(hint.gateway_addr.as_bytes(), allowlist))
+}
+
 /// One anti-entropy reconcile round with a peer, including grey-hole scoring.
+///
+/// An `Err` from this function is peer-attributable: the beat loops score it
+/// toward eviction or probe discard. A local fault (journal, lock, frame
+/// signing) skips the affected step instead, so a healthy peer is never
+/// penalized for a fault on this gateway.
 #[cfg(feature = "x509")]
 pub(crate) async fn reconcile_gossip_async<P, D>(
 	pool: Arc<ClusterPool<P>>,
@@ -279,7 +324,7 @@ pub(crate) async fn reconcile_gossip_async<P, D>(
 	servlet_registry: Arc<ServletRegistry>,
 	trace: Arc<TraceCollector>,
 	acked: &mut HashSet<GossipDigest>,
-	peer_bytes: &[u8],
+	peer: &str,
 ) -> Result<(), ClusterError>
 where
 	P: Protocol
@@ -301,90 +346,168 @@ where
 	D: ClusterDigest,
 {
 	let now = current_timestamp_ms();
-	let held: Vec<Vec<u8>> = config
-		.gossip
-		.journal
-		.held_digests(now)?
-		.iter()
-		.map(|digest| digest.to_vec())
-		.collect();
+	// A journal fault is this gateway's, not the peer's: skip the round so
+	// the beat does not score every peer for a fault none of them caused.
+	let Ok(held_digests) = config.gossip.journal.held_digests(now) else {
+		return Ok(());
+	};
+	let held: Vec<Vec<u8>> = held_digests.iter().map(|digest| digest.to_vec()).collect();
 
 	let mut client = pool.connect(peer_addr).await?;
 
-	// Colony scope gate (CWE-668): peer handshake cert MUST match local colony.
+	// A feeler probe reconciles on a cold single-flight connection whose
+	// handshake defers to first emit.
+	//
+	// - Warm the lease before the gate reads the peer certificate.
+	// - The gate MUST precede any request emit.
+	// - Completing the handshake here is the only way to learn peer
+	//   identity without first disclosing the reconcile.
+	//
+	// Sources:
+	// - CWE-668, exposure of resource to wrong sphere:
+	//   <https://cwe.mitre.org/data/definitions/668.html>
+	client.complete_handshake().await?;
+
+	// Colony scope gate: peer handshake cert MUST match local colony.
 	let peer_colony = client
 		.peer_certificate()
 		.and_then(|cert| cert_colony_urn(&config.namespace, cert));
 	if peer_colony.as_ref() != config.colony_urn() {
+		// A definitive foreign identity leaves both learned tables at once.
+		//
+		// - Waiting out the failure threshold would keep advertising to a
+		//   peer that re-keyed outside the colony.
+		let _ = config.peer.table.expel(peer);
 		return Ok(());
 	}
 
 	let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held });
 
-	let frame = FrameBuilder::from(Version::V2)
+	// Frame construction and signing are local: a fault here happened
+	// before the peer was asked anything, so the round is skipped rather
+	// than scored.
+	let Ok(frame) = FrameBuilder::from(Version::V2)
 		.with_id(b"gossip-reconcile")
 		.with_order(now)
 		.with_message(request)
 		.with_priority(MessagePriority::NetworkControl)
 		.with_witness_hasher::<D>()
-		.build()?;
+		.build()
+	else {
+		return Ok(());
+	};
 
-	let signed_frame = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await?;
+	let Ok(signed_frame) = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await else {
+		return Ok(());
+	};
 	let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 	let reply: GossipWant = decode(&response.message)?;
 
-	// Oversized want-list is abuse: drop the round (CWE-770).
-	if reply.want.len() > MAX_GOSSIP_LOG {
-		return Ok(());
+	// Oversized want-list or PEX sample is abuse: fail the round (CWE-770).
+	// The beat then scores the peer like any failed round, so an abuser
+	// is discarded from `new` or counted toward eviction from `tried`.
+	if reconcile_reply_oversized(&reply) {
+		return Err(ClusterError::OversizedReconcileReply);
 	}
 
-	let wanted = wanted_digests(&reply.want);
+	// The reply is decoded and within bounds: the peer has proven liveness.
+	// Everything below is local bookkeeping and best-effort repair inside
+	// one fallible scope.
+	//
+	// - `?` inside the scope keeps every step, including each trace event,
+	//   a usable fault-injection point (testing-fault).
+	// - The boundary after the scope tolerates its error, so a local fault
+	//   is never scored against the peer that just answered.
+	// - A peer that dies mid-repair is caught by the next beat's dial.
+	let local_round: Result<(), ClusterError> = async {
+		// The completed round is the verified probe of the addrman
+		// discipline. This dialed address answered a signed reconcile
+		// under a same-colony certificate, so it earns a tried slot and
+		// joins the beat/reflood target set.
+		//
+		// - Promotion waits for the reply: a pooled connection keeps its
+		//   handshake certificate after the peer dies.
+		// - Promoting on the gate alone would reset the failure count
+		//   every beat, and a dead peer could never be evicted.
+		let peer_id = client.peer_certificate().and_then(cert_fingerprint_id);
+		if config.peer.table.promote(peer, peer_id.as_deref(), now)? {
+			trace.event(CLUSTER_PEER_DISCOVERED)?.with_payload(peer.as_bytes()).emit();
+		}
 
-	// Grey-hole: previously acked digest wanted again while retained. One weaken per round.
-	let dropped = wanted.iter().any(|digest| acked.contains(digest));
-	if dropped {
-		let _ = servlet_registry.weaken_peer_by_dial(peer_bytes);
-		let _ = trace.event(CLUSTER_GOSSIP_DROP_SIGNAL);
-	}
-	for digest in &wanted {
-		acked.remove(digest);
-	}
+		let GossipWant { want, pex } = reply;
 
-	let now = current_timestamp_ms();
-	let seen_ttl_ms = config.gossip.seen_ttl.as_millis() as u64;
-	let missing = config.gossip.journal.fetch(&wanted, now)?;
+		// PEX entries are unverified hints.
+		//
+		// - The dial allowlist gates them before they are learned.
+		// - They enter the capped new table only.
+		// - They become dial targets solely through a later feeler probe
+		//   that passes the same colony gate as above.
+		//
+		// Sources:
+		// - CWE-345, insufficient verification of data authenticity:
+		//   <https://cwe.mitre.org/data/definitions/345.html>
+		let hints = admissible_pex_hints(pex, config.peer.peer_dial_allowlist.as_deref());
+		config.peer.table.learn(hints)?;
 
-	// Repair push: verbatim rumor, outer lifetime 0, only if still fresh.
-	let admissible = missing
-		.into_iter()
-		.filter(|rumor| gossip_fresh(rumor.metadata.order, seen_ttl_ms, now));
+		let wanted = wanted_digests(&want);
 
-	for rumor in admissible {
-		let Ok(pushed_digest) = gossip_digest::<D>(&rumor) else {
-			continue;
-		};
-		let push = ClusterRequest::Gossip(Box::new(rumor));
+		// Grey-hole containment signal.
+		//
+		// - A previously acked digest wanted again while retained is a drop.
+		// - Score at most one weaken per reconciliation round.
+		let dropped = wanted.iter().any(|digest| acked.contains(digest));
+		if dropped {
+			let _ = servlet_registry.weaken_peer_by_dial(peer.as_bytes());
+			trace.event(CLUSTER_GOSSIP_DROP_SIGNAL)?;
+		}
+		for digest in &wanted {
+			acked.remove(digest);
+		}
 
-		let frame = FrameBuilder::from(Version::V2)
-			.with_id(b"gossip-repair")
-			.with_message(push)
-			.with_priority(MessagePriority::NetworkControl)
-			.with_lifetime(0)
-			.with_witness_hasher::<D>()
-			.build()?;
+		let now = current_timestamp_ms();
+		let seen_ttl_ms = config.gossip.seen_ttl.as_millis() as u64;
+		let missing = config.gossip.journal.fetch(&wanted, now)?;
 
-		let signed = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await?;
+		// Repair push: verbatim rumor, outer lifetime 0, only if still fresh.
+		let admissible = missing
+			.into_iter()
+			.filter(|rumor| gossip_fresh(rumor.metadata.order, seen_ttl_ms, now));
 
-		// Arm grey-hole ledger only on explicit Ok reply.
-		if let Some(push_reply) = client.emit(signed, None).await? {
-			let decoded: Result<GossipResponse, _> = decode(&push_reply.message);
-			if let Ok(gossip_reply) = decoded {
-				if matches!(gossip_reply.status, TransitStatus::Ok) {
-					acked.insert(pushed_digest);
+		for rumor in admissible {
+			let Ok(pushed_digest) = gossip_digest::<D>(&rumor) else {
+				continue;
+			};
+			let push = ClusterRequest::Gossip(Box::new(rumor));
+
+			let frame = FrameBuilder::from(Version::V2)
+				.with_id(b"gossip-repair")
+				.with_message(push)
+				.with_priority(MessagePriority::NetworkControl)
+				.with_lifetime(0)
+				.with_witness_hasher::<D>()
+				.build()?;
+
+			let signed = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await?;
+
+			// Arm grey-hole ledger only on explicit Ok reply.
+			if let Some(push_reply) = client.emit(signed, None).await? {
+				let decoded: Result<GossipResponse, _> = decode(&push_reply.message);
+				if let Ok(gossip_reply) = decoded {
+					if matches!(gossip_reply.status, TransitStatus::Ok) {
+						acked.insert(pushed_digest);
+					}
 				}
 			}
 		}
+
+		Ok(())
 	}
+	.await;
+
+	// Tolerate boundary: the reconcile round already succeeded, so a local
+	// fault above skips the rest of the round without charging the peer.
+	// The next beat retries the skipped bookkeeping and repair.
+	let _ = local_round;
 
 	Ok(())
 }
@@ -461,7 +584,7 @@ where
 	// Drop known duplicates before rate admission so echoes cannot drain the bucket.
 	match config.gossip.journal.seen(&admitted.digest(), now) {
 		Ok(true) => {
-			let _ = trace.event(CLUSTER_GOSSIP_DUPLICATE);
+			trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
 			return reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok });
 		}
 		Ok(false) => {}
@@ -483,7 +606,7 @@ where
 
 	match config.gossip.journal.record(&signer_id, admitted.digest(), &rumor, now) {
 		Ok(Admission::Duplicate) => {
-			let _ = trace.event(CLUSTER_GOSSIP_DUPLICATE);
+			trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
 			return reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok });
 		}
 		Ok(Admission::New) => {}
@@ -504,7 +627,7 @@ where
 	.await;
 
 	// Detached reflood: verbatim rumor, decremented outer TTL. Skip if no peers.
-	if hop_ttl > 0 && !config.peer.peers.is_empty() {
+	if hop_ttl > 0 && config.peer.table.has_targets() {
 		let reflood_pool = peer_dial_pool(&peer_pool, &pool);
 		let config = Arc::clone(&config);
 		let reflood_rumor = rumor.clone();
@@ -549,7 +672,15 @@ where
 			return;
 		};
 
-		// Per-peer Ok ledger for grey-hole detection; bounded by journal x peers (CWE-770).
+		// A gateway must never learn itself as a peer: PEX replies echo
+		// installed routes, which include this gateway's own address.
+		if let Ok(local) = from_utf8(&gateway_addr) {
+			let _ = config.peer.table.exclude_self(local);
+		}
+
+		// Per-peer Ok ledger for grey-hole detection. Each beat retains only
+		// the live target and probe addresses, so churned PEX hints cannot
+		// grow the map without bound (CWE-770).
 		let mut push_ledger: HashMap<String, HashSet<GossipDigest>> = HashMap::new();
 
 		loop {
@@ -571,7 +702,12 @@ where
 				}
 			}
 
-			if config.peer.peers.is_empty() {
+			// Beat targets are anchors plus verified tried peers; probes
+			// are unverified candidates awaiting their feeler dial.
+			let targets = config.peer.table.target_set().unwrap_or_default();
+			let probes = config.peer.table.probe_sample(current_timestamp_ms()).unwrap_or_default();
+			push_ledger.retain(|peer, _| targets.contains(peer) || probes.contains(peer));
+			if targets.is_empty() && probes.is_empty() {
 				continue;
 			}
 
@@ -584,7 +720,7 @@ where
 				.take(MAX_ADVERTISED_TYPES)
 				.collect();
 
-			for peer in config.peer.peers.iter() {
+			for peer in targets.iter() {
 				let Ok(peer_addr) = peer.parse::<P::Address>() else {
 					continue;
 				};
@@ -599,18 +735,102 @@ where
 				// Same-beat anti-entropy; colony members only.
 				if config.colony_urn().is_some() {
 					let acked = push_ledger.entry(peer.clone()).or_default();
-					let _ = reconcile_gossip_async::<P, D>(
+					let round = reconcile_gossip_async::<P, D>(
 						Arc::clone(&pool),
 						Arc::clone(&config),
 						peer_addr,
 						Arc::clone(&servlet_registry),
 						Arc::clone(&trace),
 						acked,
-						peer.as_bytes(),
+						peer,
 					)
 					.await;
+					// A failed round counts toward eviction.
+					//
+					// - A dead tried peer frees its bucket slot after the
+					//   failure threshold.
+					// - Anchors never live in tried, so the count does not
+					//   affect them.
+					if round.is_err() && config.peer.table.record_failure(peer).unwrap_or(false) {
+						if let Ok(event) = trace.event(CLUSTER_PEER_EVICTED) {
+							event.with_payload(peer.as_bytes()).emit();
+						}
+					}
+				}
+			}
+
+			// Feeler probes run reconcile only.
+			//
+			// - The colony gate inside the round verifies the candidate and
+			//   promotes it.
+			// - An unverified hint never receives the advertised slate.
+			// - A failed dial discards the candidate so dead addresses cannot
+			//   clog a prefix bucket.
+			if config.colony_urn().is_some() {
+				for peer in probes.iter() {
+					let Ok(peer_addr) = peer.parse::<P::Address>() else {
+						let _ = config.peer.table.discard(peer);
+						continue;
+					};
+					let acked = push_ledger.entry(peer.clone()).or_default();
+					let probed = reconcile_gossip_async::<P, D>(
+						Arc::clone(&pool),
+						Arc::clone(&config),
+						peer_addr,
+						Arc::clone(&servlet_registry),
+						Arc::clone(&trace),
+						acked,
+						peer,
+					)
+					.await;
+					if probed.is_err() {
+						let _ = config.peer.table.discard(peer);
+					}
 				}
 			}
 		}
 	})
+}
+
+#[cfg(all(test, feature = "x509"))]
+mod tests {
+	use super::*;
+
+	fn reply(want_len: usize, pex_len: usize) -> GossipWant {
+		let want = vec![vec![0u8; 32]; want_len];
+		let pex = vec![PeerGossip { peer_id: Vec::new(), gateway_addr: b"127.0.0.1:9000".to_vec() }; pex_len];
+		GossipWant { want, pex }
+	}
+
+	#[test]
+	fn reconcile_reply_bounds_want_and_pex() {
+		let cases = [
+			(MAX_GOSSIP_LOG, MAX_PEX_SAMPLE, false),
+			(MAX_GOSSIP_LOG + 1, MAX_PEX_SAMPLE, true),
+			(MAX_GOSSIP_LOG, MAX_PEX_SAMPLE + 1, true),
+		];
+		for (want_len, pex_len, oversized) in cases {
+			assert_eq!(reconcile_reply_oversized(&reply(want_len, pex_len)), oversized);
+		}
+	}
+
+	fn pex_entry(addr: &str) -> PeerGossip {
+		PeerGossip { peer_id: Vec::new(), gateway_addr: addr.as_bytes().to_vec() }
+	}
+
+	#[test]
+	fn pex_hints_admitted_without_allowlist() {
+		let pex = vec![pex_entry("10.0.0.1:9000"), pex_entry("10.66.0.1:9000")];
+		let admitted: Vec<PeerHint> = admissible_pex_hints(pex, None).collect();
+		assert_eq!(admitted.len(), 2);
+	}
+
+	#[test]
+	fn pex_hints_off_allowlist_refused() {
+		let allowlist = vec![String::from("10.0.0.1:9000")];
+		let pex = vec![pex_entry("10.0.0.1:9000"), pex_entry("10.66.0.1:9000")];
+		let admitted: Vec<PeerHint> = admissible_pex_hints(pex, Some(&allowlist)).collect();
+		assert_eq!(admitted.len(), 1);
+		assert_eq!(admitted[0].gateway_addr, "10.0.0.1:9000");
+	}
 }

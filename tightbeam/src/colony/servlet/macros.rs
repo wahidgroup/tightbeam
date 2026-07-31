@@ -1,9 +1,9 @@
-//! Servlet macros: parse handler arms into [`ServletHandlers`], then start
+//! Servlet macros: parse handler arms into [`crate::colony::servlet::ServletHandlers`], then start
 //! a [`ServletRuntime`](crate::colony::servlet::ServletRuntime).
 //!
 //! Accept-loop and lifecycle logic live on the runtime, not in these arms.
 
-/// Build [`ServletHandlers`] from optional unary, stream, and duplex arms.
+/// Build [`crate::colony::servlet::ServletHandlers`] from optional unary, stream, and duplex arms.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __servlet_handlers {

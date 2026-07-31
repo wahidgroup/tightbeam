@@ -60,3 +60,24 @@ pub(crate) const GOSSIP_RECONCILE_STRANGER_WANT: Urn<'static> =
 pub(crate) const GOSSIP_REPLAY_STATUS: Urn<'static> = Urn::new("test", "event:cluster/gossip-replay-status");
 pub(crate) const GOSSIP_HELD_NO_INGRESS: Urn<'static> = Urn::new("test", "event:cluster/gossip-held-no-ingress");
 pub(crate) const GOSSIP_PENDING_NO_INGRESS: Urn<'static> = Urn::new("test", "event:cluster/gossip-pending-no-ingress");
+pub(crate) const PEER_TABLE_FLOOD_ADMITTED: Urn<'static> = Urn::new("test", "event:cluster/peer-table-flood-admitted");
+pub(crate) const PEER_TABLE_ANCHOR_RETAINED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-table-anchor-retained");
+pub(crate) const PEER_TABLE_TARGETS_BOUNDED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-table-targets-bounded");
+pub(crate) const PEER_PROBE_HINTS_ADMITTED: Urn<'static> = Urn::new("test", "event:cluster/peer-probe-hints-admitted");
+pub(crate) const PEER_PROBE_MEMBER_PROMOTED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-probe-member-promoted");
+pub(crate) const PEER_PROBE_FOREIGN_REFUSED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-probe-foreign-refused");
+pub(crate) const PEER_HINT_LEARNED_ON_REFUSE: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-hint-learned-on-refuse");
+pub(crate) const PEER_ABUSE_CANDIDATE_DISCARDED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-abuse-candidate-discarded");
+pub(crate) const PEER_EVICT_MEMBER_PROMOTED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-evict-member-promoted");
+pub(crate) const PEER_EVICT_TARGET_DROPPED: Urn<'static> = Urn::new("test", "event:cluster/peer-evict-target-dropped");
+pub(crate) const PEER_LOCAL_FAULT_MEMBER_PROMOTED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-local-fault-member-promoted");
+pub(crate) const PEER_LOCAL_FAULT_MEMBER_RETAINED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-local-fault-member-retained");

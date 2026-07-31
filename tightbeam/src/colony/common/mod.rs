@@ -56,13 +56,13 @@ pub const MAX_PHEROMONE: u64 = 10_000;
 ///
 /// Baseline weight every live instance keeps so a cold instance is never
 /// starved to zero probability. See [`StochasticForager`] sources.
-const DEFAULT_EXPLORATION_FLOOR: u64 = MAX_PHEROMONE / 20;
+pub const DEFAULT_EXPLORATION_FLOOR: u64 = MAX_PHEROMONE / 20;
 
 /// Default [`StochasticForager`] repellency threshold.
 ///
 /// Trail strength past which extra pheromone stops attracting and begins
 /// to repel. See [`StochasticForager`] sources.
-const DEFAULT_REPELLENCY_THRESHOLD: u64 = (MAX_PHEROMONE * 4) / 5;
+pub const DEFAULT_REPELLENCY_THRESHOLD: u64 = (MAX_PHEROMONE * 4) / 5;
 
 /// Strategy that selects one instance among candidates of a servlet type.
 ///

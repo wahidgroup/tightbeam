@@ -142,7 +142,7 @@ where
 	// namespace; foreign authorities and realms are refused
 	// before the registry is consulted.
 	if !is_bare_servlet_type(&config.namespace, &request.servlet_type) {
-		let _ = trace.event(CLUSTER_WORK_REFUSED);
+		trace.event(CLUSTER_WORK_REFUSED)?;
 		return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::PermissionDenied));
 	}
 
@@ -162,7 +162,7 @@ where
 	let entries = match entries {
 		Ok(e) if !e.is_empty() => e,
 		_ => {
-			let _ = trace.event(CLUSTER_WORK_UNAVAILABLE);
+			trace.event(CLUSTER_WORK_UNAVAILABLE)?;
 			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::Unavailable));
 		}
 	};
@@ -175,7 +175,7 @@ where
 	let selected_idx = match config.load_balancer.select(&metrics) {
 		Some(idx) => idx,
 		None => {
-			let _ = trace.event(CLUSTER_WORK_UNAVAILABLE);
+			trace.event(CLUSTER_WORK_UNAVAILABLE)?;
 			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::Unavailable));
 		}
 	};
@@ -215,7 +215,8 @@ where
 				// and relay so the client sees one envelope.
 				match decode::<ClusterWorkResponse>(&response_payload) {
 					Ok(peer_response) => {
-						let _ = trace.event(CLUSTER_WORK_FORWARDED);
+						trace.event(CLUSTER_WORK_FORWARDED)?;
+
 						if peer_response.status == TransitStatus::Ok {
 							work_trail_ok(&servlet_registry, &route_key, &config, &trace);
 						} else {

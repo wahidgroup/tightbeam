@@ -1,4 +1,4 @@
-//! Builders for [`ClusterConfig`](super::ClusterConfig) and heartbeat settings.
+//! Builders for [`ClusterConfig`] and heartbeat settings.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -7,6 +7,8 @@ use super::{
 	ClusterConfig, ClusterTlsConfig, HeartbeatCallback, HeartbeatConfig, PeerConfig, PheromoneConfig,
 	DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
+#[cfg(feature = "x509")]
+use super::{MemoryPeerStore, PeerStore, PeerTable};
 use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
 use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
@@ -109,6 +111,7 @@ pub struct ClusterConfigBuilder {
 	control_freshness_window_ms: u64,
 	bind_addr: Option<String>,
 	peer: PeerConfig,
+	peer_store: Arc<dyn PeerStore>,
 	gossip: GossipConfig,
 	tls: ClusterTlsConfig,
 }
@@ -127,6 +130,7 @@ impl ClusterConfig {
 			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			bind_addr: None,
 			peer: PeerConfig::default(),
+			peer_store: Arc::new(MemoryPeerStore),
 			gossip: GossipConfig::default(),
 			tls,
 		}
@@ -208,6 +212,15 @@ impl ClusterConfigBuilder {
 		self
 	}
 
+	/// Set the persistence driver beneath the peer discovery table.
+	/// Defaults to the process-local [`MemoryPeerStore`]. A durable
+	/// driver preserves learned peers across restarts; the table still
+	/// owns every discovery bound, so a driver cannot bypass them.
+	pub fn with_peer_store(mut self, store: Arc<dyn PeerStore>) -> Self {
+		self.peer_store = store;
+		self
+	}
+
 	/// Set the gossip subsystem configuration (freshness/ttl/retention +
 	/// journal); defaults to [`GossipConfig::default`]
 	pub fn with_gossip_config(mut self, config: GossipConfig) -> Self {
@@ -240,6 +253,14 @@ impl ClusterConfigBuilder {
 			.ok()
 			.and_then(|cert| cert_colony_urn(&self.namespace, &cert));
 
+		// The discovery table derives from the dial list at build, so the
+		// configured peers are always its un-evictable anchors. The
+		// injected driver rehydrates learned peers through the capped
+		// admission path. The anchor list is a one-time copy because
+		// `peers` stays readable configuration beside the table.
+		let mut peer = self.peer;
+		peer.table = Arc::new(PeerTable::new(peer.peers.clone(), self.peer_store));
+
 		ClusterConfig {
 			namespace: self.namespace,
 			load_balancer: self.load_balancer,
@@ -249,7 +270,7 @@ impl ClusterConfigBuilder {
 			pool_config: self.pool_config,
 			control_freshness_window_ms: self.control_freshness_window_ms,
 			bind_addr: self.bind_addr,
-			peer: self.peer,
+			peer,
 			gossip: self.gossip,
 			colony_urn,
 			tls: self.tls,

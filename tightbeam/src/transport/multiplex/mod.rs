@@ -49,6 +49,9 @@ use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::Frame;
 
+#[cfg(feature = "x509")]
+use crate::x509::Certificate;
+
 /// Converts a caller-owned or already-shared mux offer into a shared handle.
 ///
 /// Accept loops and pools store [`Arc<TransportOffer>`] so each connection
@@ -262,6 +265,15 @@ pub trait MuxConnector: MuxCapable {
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
 		Ok(None)
 	}
+
+	/// Validated peer certificate pinned by a completed client handshake.
+	///
+	/// [`MuxConnector::into_envelope_halves`] consumes the transport, so
+	/// the connection pool reads peer identity here first and shares it
+	/// with every lease. A transport without encryption material answers
+	/// `None`, and identity-gating callers MUST fail closed on `None`.
+	#[cfg(feature = "x509")]
+	fn handshake_peer_certificate(&self) -> Option<Arc<Certificate>>;
 
 	/// Split into envelope halves for the mux drivers.
 	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)>;

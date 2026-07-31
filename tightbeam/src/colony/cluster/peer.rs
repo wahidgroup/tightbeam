@@ -7,7 +7,7 @@
 use core::str::FromStr;
 use std::sync::Arc;
 
-use super::{ClusterConfig, ServletEntry, SharedId};
+use super::{ClusterConfig, PeerHint, ServletEntry, SharedId};
 use crate::colony::common::{is_bare_servlet_type, type_canonical_bytes, ColonyNamespace, PeerAdvertisement};
 use crate::constants::MAX_ADVERTISED_TYPES;
 use crate::policy::TransitStatus;
@@ -57,7 +57,6 @@ impl AdmittedPeerAd {
 		// (fingerprint) and the membership gate both derive from it.
 		#[cfg(feature = "x509")]
 		let signer_cert = frame_signer_cert(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
-
 		#[cfg(feature = "x509")]
 		let peer_hive_id = cert_fingerprint_id(signer_cert).ok_or(TransitStatus::PermissionDenied)?;
 
@@ -100,6 +99,27 @@ impl AdmittedPeerAd {
 
 		Ok(Self { peer_hive_id, dial_addr, slate })
 	}
+
+	/// Discovery hint from this admitted advertisement: the verified
+	/// signer's claimed dial address plus its certificate fingerprint.
+	///
+	/// The advertiser dialed this gateway, so nothing proves the claimed
+	/// address dials back yet. The peer table holds the hint in `new`
+	/// until this gateway's own probe passes the colony gate. The
+	/// Bitcoin address manager holds a self-announced address the same
+	/// way.
+	///
+	/// The hint owns its fields because it outlives this borrowed
+	/// advertisement inside the peer table.
+	#[must_use]
+	pub fn discovery_hint(&self) -> Option<PeerHint> {
+		let gateway_addr = core::str::from_utf8(&self.dial_addr).ok()?;
+
+		Some(PeerHint {
+			gateway_addr: gateway_addr.to_string(),
+			peer_id: Some(self.peer_hive_id.to_vec()),
+		})
+	}
 }
 
 /// Whether a claimed peer gateway address is safe dial data.
@@ -122,7 +142,7 @@ fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
 ///
 /// `None` accepts any address that already passed [`peer_gateway_addr_valid`].
 #[must_use]
-fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool {
+pub(crate) fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool {
 	let Some(allowed) = allowlist else {
 		return true;
 	};
@@ -151,7 +171,6 @@ fn peer_advertisement_wire_ok(
 	let dial_allowed = peer_dial_allowed(gateway_addr, allowlist);
 	let types_valid = advertised_types_are_nestmate(namespace, types);
 	let within_type_cap = types.len() <= MAX_ADVERTISED_TYPES;
-
 	if dial_valid && dial_allowed && types_valid && within_type_cap {
 		Ok(())
 	} else {
@@ -179,9 +198,8 @@ pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Fr
 /// an unkeyed slate or unattributable misbehavior is refused.
 #[cfg(feature = "x509")]
 #[must_use]
-fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
+pub(crate) fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
 	let fingerprint = CertificateTrustStore::to_fingerprint(cert).ok()?;
-
 	Some(Arc::from(fingerprint.as_slice()))
 }
 
@@ -193,7 +211,6 @@ fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
 #[must_use]
 pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
 	let cert = frame_signer_cert(trust, frame)?;
-
 	cert_fingerprint_id(cert)
 }
 
@@ -207,9 +224,9 @@ pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Fra
 #[cfg(feature = "x509")]
 #[must_use]
 pub fn cert_colony_urn(namespace: &ColonyNamespace, cert: &Certificate) -> Option<Urn<'static>> {
-	let san: SubjectAltName = certificate_extension(cert).ok()??;
-
 	let mut colony: Option<Urn<'static>> = None;
+
+	let san: SubjectAltName = certificate_extension(cert).ok()??;
 	for entry in &san.0 {
 		let GeneralName::UniformResourceIdentifier(uri) = entry else {
 			continue;

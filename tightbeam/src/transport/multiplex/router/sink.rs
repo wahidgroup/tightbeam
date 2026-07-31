@@ -82,7 +82,7 @@ enum SinkStream {
 
 /// Producer half of a streamed request: pushes chunks on a
 /// locally-initiated stream, closed by flagging the final chunk
-/// `last` (see [`MuxHandle::open_stream`] and [`MuxHandle::open_duplex`]).
+/// `last` (see [`crate::transport::multiplex::MuxHandle::open_stream`] and [`crate::transport::multiplex::MuxHandle::open_duplex`]).
 ///
 /// Pushes reach the wire eagerly, so a duplex conversation can await
 /// reply chunks between pushes. [`close_with`](RequestSink::close_with)
@@ -245,7 +245,7 @@ impl Drop for RequestSink {
 
 /// Producer half of a duplex stream: pushes reply chunks on a
 /// peer-initiated stream ahead of the closing trailer
-/// (see [`MuxResponder::serve_duplex`]).
+/// (see [`crate::transport::multiplex::MuxResponder::serve_duplex`]).
 ///
 /// Every push debits the session budget and parks on the peer's
 /// stream credit exactly like a reassembled response.

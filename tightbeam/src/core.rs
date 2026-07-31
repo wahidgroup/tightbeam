@@ -98,7 +98,7 @@ impl Frame {
 	/// Encode the Frame for signature verification (TBS - to-be-signed).
 	///
 	/// Excludes `nonrepudiation` without cloning the frame: the borrowing
-	/// [`TbsScaffold`](crate::frame::TbsScaffold) reuses the derived field
+	/// `TbsScaffold` reuses the derived field
 	/// encoders, so these bytes are bit-identical to the DER encoding of the
 	/// frame with `nonrepudiation` set to `None`.
 	pub fn to_tbs(&self) -> Result<Vec<u8>> {

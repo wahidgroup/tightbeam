@@ -262,7 +262,7 @@ pub mod active {
 	/// Event retention policy for a [`TraceCollector`](crate::trace::TraceCollector).
 	///
 	/// The collector delivers every emitted [`TbEvent`] to exactly one sink.
-	/// When [`TraceConfig::sink`](crate::trace::TraceConfig::sink is `None`,
+	/// When [`TraceConfig::sink`](crate::trace::TraceConfig::sink) is `None`,
 	/// the collector MUST use [`BoundedMemorySink`] sized by `max_events`.
 	/// Implementations MAY forward to an exporter, spill to disk, or retain
 	/// unbounded history.

@@ -19,9 +19,12 @@ pub mod gossip;
 pub mod outbound;
 #[doc(hidden)]
 pub mod peer;
+#[doc(hidden)]
+pub mod peer_table;
 
 pub use builder::{ClusterConfigBuilder, HeartbeatConfigBuilder};
 pub use error::ClusterError;
+pub use peer_table::{AddressGroup, MemoryPeerStore, PeerHint, PeerRecord, PeerStore, PeerTable};
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use runtime::ClusterGateway;
 pub use servlet_registry::{
@@ -189,12 +192,23 @@ pub struct PeerConfig {
 	///
 	/// The slate is never configured: each beat snapshots the local
 	/// servlet registry so peers learn types currently served.
+	///
+	/// Set peers through the config builder: `table` derives its anchor
+	/// set from this list at build, and the beat dials the table.
 	pub peers: Vec<String>,
 	/// Re-advertise beat cadence. `None` disables the beat.
 	pub advertise_interval: Option<Duration>,
 	/// When `Some`, inbound peer ads may only claim dial addresses in this
 	/// list (exact string match). `None` accepts any parseable socket.
+	/// Peer-exchange hints pass the same gate before the table learns
+	/// them, so discovery never dials an address outside the list.
 	pub peer_dial_allowlist: Option<Vec<String>>,
+	/// Discovery table: `peers` as un-evictable anchors plus bounded,
+	/// prefix-bucketed learned peers. The config builder rebuilds it so
+	/// the anchors are always derived from `peers` and the injected
+	/// [`PeerStore`] rehydrates learned peers through the capped
+	/// admission path.
+	pub table: Arc<PeerTable>,
 }
 
 /// Runtime configuration for a cluster gateway.

@@ -245,14 +245,36 @@ pub struct GossipReconciliation {
 
 wire_sequence!(GossipReconciliation { held: octets_seq });
 
+/// One peer shared over peer exchange: an identity and where to dial it.
+///
+/// A sharer only exchanges peers it verified itself, yet the entry is
+/// still an unverified hint to its receiver: admission is bounded per
+/// address prefix, and only a probe dial whose handshake certificate
+/// proves the local colony makes the peer a dial target. The
+/// fingerprint is advisory identity for deduplication; trust never
+/// derives from exchanged bytes (CWE-345).
+#[derive(Debug, Beamable, Clone, PartialEq)]
+pub struct PeerGossip {
+	/// Certificate fingerprint the sharer verified the peer under.
+	pub peer_id: Vec<u8>,
+	/// Address the peer gateway was dialed at.
+	pub gateway_addr: Vec<u8>,
+}
+
+wire_sequence!(PeerGossip { peer_id: octets, gateway_addr: octets });
+
 /// Reply to a [`GossipReconciliation`]: digests the peer lacks and wants as `Gossip` rumors.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipWant {
 	/// Content digests the replier lacks and is requesting.
 	pub want: Vec<Vec<u8>>,
+	/// Peer-exchange sample: verified peers the replier shares so a
+	/// seed-bootstrapped requester can discover the colony graph.
+	/// Capped at `MAX_PEX_SAMPLE` in both directions.
+	pub pex: Vec<PeerGossip>,
 }
 
-wire_sequence!(GossipWant { want: octets_seq });
+wire_sequence!(GossipWant { want: octets_seq, pex: plain });
 
 // =============================================================================
 // Servlet Activation Messages
@@ -664,6 +686,27 @@ mod tests {
 	#[test]
 	fn cluster_request_reconcile_gossip_empty_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::ReconcileGossip(GossipReconciliation { held: vec![] }))
+	}
+
+	#[test]
+	fn gossip_want_round_trips_with_pex() -> Result<()> {
+		let original = GossipWant {
+			want: vec![vec![0xAAu8; 32]],
+			pex: vec![PeerGossip { peer_id: vec![1, 2, 3], gateway_addr: b"127.0.0.1:9100".to_vec() }],
+		};
+		let encoded = crate::encode(&original)?;
+		let decoded: GossipWant = crate::decode(&encoded)?;
+		assert_eq!(original, decoded);
+		Ok(())
+	}
+
+	#[test]
+	fn gossip_want_round_trips_empty() -> Result<()> {
+		let original = GossipWant { want: vec![], pex: vec![] };
+		let encoded = crate::encode(&original)?;
+		let decoded: GossipWant = crate::decode(&encoded)?;
+		assert_eq!(original, decoded);
+		Ok(())
 	}
 
 	#[test]

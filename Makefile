@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked audit ci
+.PHONY: all help help-body help-ref version setup check build clean test lint doc-lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked audit ci
 
 .NOTPARALLEL: ci
 
@@ -56,16 +56,16 @@ help-body:
 	@printf '    fuzz-test       Build and run AFL fuzz testing for 60 seconds\n'
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
-	@printf '    lint            Lint + spellcheck (fix=1 to auto-fix; extra clippy args via ARGS)\n'
+	@printf '    lint            Lint + spellcheck + rustdoc (fix=1 to auto-fix; extra clippy args via ARGS)\n'
 	@printf '    spellcheck      Spellcheck the repository with typos\n'
 	@printf '    audit           Run security audit (RustSec cargo-audit; fix=1 reserved)\n'
 	@printf '    ci              Full pipeline: lint + build + test-all\n'
-	@printf '    doc             Build documentation (all features)\n'
+	@printf '    doc             Build documentation (all features; -D warnings)\n'
 	@printf '    release         Release workflow (see OPTIONS)\n'
 	@printf '    release-derive  Derive-only release: tag tightbeam-derive (see OPTIONS)\n'
 	@printf '    check-yanked    Check if current version has been yanked (derive=1 for derive)\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
-	@printf '    fix             If set (e.g., fix=1), apply lint fixes: cargo fmt + clippy --fix\n'
+	@printf '    fix             If set (e.g., fix=1), apply fmt + clippy --fix; rustdoc still denies warnings\n'
 	@printf '    debug           If set (e.g., debug=1), export RUST_LOG=debug\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'
 	@printf '    no-default      If set (e.g., 1), passes --no-default-features to Cargo\n'
@@ -153,15 +153,21 @@ else
 	cargo fmt --all --check
 	cargo clippy --all-targets --all-features $(ARGS) -- -D warnings
 endif
+	@$(MAKE) doc-lint
 	@$(MAKE) spellcheck
+
+# Rustdoc has no cargo --fix path for intra-doc / private-link warnings.
+# Both lint and doc deny them so CI and local builds fail closed the same way.
+doc-lint: setup
+	@echo "Checking rustdoc (RUSTDOCFLAGS=-D warnings)..."
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 spellcheck: setup
 	@echo "Checking spelling..."
 	typos
 
-doc: setup
-	@echo "Building documentation..."
-	cargo doc --no-deps --all-features
+doc: doc-lint
+	@echo "Documentation build complete."
 
 audit: setup
 	@chmod +x scripts/audit.sh

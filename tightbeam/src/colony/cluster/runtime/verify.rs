@@ -20,7 +20,8 @@ pub(crate) fn evaluate_gates(
 	for policy in config.policies.iter() {
 		let status = GatePolicy::evaluate(policy.as_ref(), Some(frame), session);
 		if status != TransitStatus::Ok {
-			let _ = trace.event(CLUSTER_GATE_BLOCKED);
+			trace.event(CLUSTER_GATE_BLOCKED).map_err(|_| status)?;
+
 			return Err(status);
 		}
 	}

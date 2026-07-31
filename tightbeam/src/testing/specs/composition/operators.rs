@@ -21,9 +21,9 @@ impl Process {
 	/// S = S_P × S_Q (Cartesian product of state spaces)
 	///
 	/// ## Transitions
-	/// - (p,q) --[e]--> (p',q') if e ∈ αP ∩ αQ, p --[e]--> p', q --[e]--> q'
-	/// - (p,q) --[e]--> (p',q)  if e ∈ αP \ αQ, p --[e]--> p'
-	/// - (p,q) --[e]--> (p,q')  if e ∈ αQ \ αP, q --[e]--> q'
+	/// - `(p,q) --[e]--> (p',q')` if `e ∈ αP ∩ αQ`, `p --[e]--> p'`, `q --[e]--> q'`
+	/// - `(p,q) --[e]--> (p',q)` if `e ∈ αP \ αQ`, `p --[e]--> p'`
+	/// - `(p,q) --[e]--> (p,q')` if `e ∈ αQ \ αP`, `q --[e]--> q'`
 	pub fn synchronized_parallel(p: &Process, q: &Process) -> Result<Process, CompositionError> {
 		let sync_alphabet: HashSet<Event> = p.observable.intersection(&q.observable).copied().collect();
 		let name = intern(format!("({} || {})", p.name, q.name));
@@ -39,8 +39,8 @@ impl Process {
 	/// S = S_P × S_Q
 	///
 	/// ## Transitions
-	/// - (p,q) --[e]--> (p',q) for any p --[e]--> p'
-	/// - (p,q) --[e]--> (p,q') for any q --[e]--> q'
+	/// - `(p,q) --[e]--> (p',q)` for any `p --[e]--> p'`
+	/// - `(p,q) --[e]--> (p,q')` for any `q --[e]--> q'`
 	pub fn interleaved_parallel(p: &Process, q: &Process) -> Result<Process, CompositionError> {
 		let name = intern(format!("({} ||| {})", p.name, q.name));
 		Self::parallel_compose(name, p, q, HashSet::new())
@@ -58,9 +58,9 @@ impl Process {
 	/// S = S_P × S_Q
 	///
 	/// ## Transitions
-	/// - (p,q) --[e]--> (p',q') if e ∈ A, p --[e]--> p', q --[e]--> q'
-	/// - (p,q) --[e]--> (p',q)  if e ∉ A, p --[e]--> p'
-	/// - (p,q) --[e]--> (p,q')  if e ∉ A, q --[e]--> q'
+	/// - `(p,q) --[e]--> (p',q')` if `e ∈ A`, `p --[e]--> p'`, `q --[e]--> q'`
+	/// - `(p,q) --[e]--> (p',q)` if `e ∉ A`, `p --[e]--> p'`
+	/// - `(p,q) --[e]--> (p,q')` if `e ∉ A`, `q --[e]--> q'`
 	pub fn interface_parallel(
 		p: &Process,
 		q: &Process,

@@ -59,6 +59,24 @@ impl<P: Protocol> GenericClient<P> {
 		self.transport.emit(frame, attempt).await
 	}
 
+	/// Drive the client handshake to completion without emitting an
+	/// application frame.
+	///
+	/// The single-flight dial defers its handshake to the first
+	/// [`emit`](Self::emit), so a caller that must read peer identity
+	/// (for example a colony gate) before disclosing any request warms
+	/// the connection here first. A transport without encryption
+	/// material completes as a no-op.
+	#[cfg(feature = "transport-multiplex")]
+	pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()>
+	where
+		P::Transport: crate::transport::multiplex::MuxConnector,
+	{
+		use crate::transport::multiplex::MuxConnector;
+
+		self.transport.complete_client_handshake().await
+	}
+
 	pub async fn reconnect(&mut self) -> TransportResult<()>
 	where
 		P::Address: Clone,

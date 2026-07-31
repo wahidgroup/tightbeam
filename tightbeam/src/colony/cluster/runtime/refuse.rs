@@ -31,7 +31,7 @@ pub(crate) fn refuse_gossip(
 
 pub(crate) fn refuse_reconcile(frame: &Frame, trace: &TraceCollector) -> Result<Option<Frame>, TightBeamError> {
 	gossip_refused_event(frame, trace);
-	reply_frame(&frame.metadata.id, GossipWant { want: Vec::new() })
+	reply_frame(&frame.metadata.id, GossipWant { want: Vec::new(), pex: Vec::new() })
 }
 
 pub(crate) fn refuse_peer_ad(
@@ -39,7 +39,8 @@ pub(crate) fn refuse_peer_ad(
 	trace: &TraceCollector,
 	status: TransitStatus,
 ) -> Result<Option<Frame>, TightBeamError> {
-	let _ = trace.event(CLUSTER_PEER_ADVERTISE_REFUSED);
+	trace.event(CLUSTER_PEER_ADVERTISE_REFUSED)?;
+
 	reply_frame(&frame.metadata.id, PeerAdvertisementResponse { status })
 }
 
