@@ -135,7 +135,15 @@ where
 		}
 		#[cfg(feature = "x509")]
 		ClusterRequest::ReconcileGossip(reconciliation) => {
-			handle_reconcile(frame, reconciliation, ctx.config, ctx.trace, &ctx.replay_guard).await
+			handle_reconcile(
+				frame,
+				reconciliation,
+				ctx.servlet_registry,
+				ctx.config,
+				ctx.trace,
+				&ctx.replay_guard,
+			)
+			.await
 		}
 	}
 }

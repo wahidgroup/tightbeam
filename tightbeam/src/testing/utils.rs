@@ -262,6 +262,28 @@ pub fn create_test_certificate(signing_key: &SigningKey) -> Certificate {
 /// already provides.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub fn create_test_certificate_with_uri_sans(signing_key: &SigningKey, uris: &[&str]) -> Certificate {
+	test_certificate_named_with_uri_sans(signing_key, RdnSequence::default(), uris)
+}
+
+/// [`create_test_certificate_with_uri_sans`] variant with a `CN=<cn>`
+/// subject and issuer.
+///
+/// Trust-store issuer selection commits to the first subject-DN match
+/// (see [`CertificateValidation::evaluate`]), so a store anchoring
+/// several self-signed identities needs each under a distinct DN. The
+/// empty-subject SAN fixtures all share one DN and would collide.
+///
+/// [`CertificateValidation::evaluate`]: crate::crypto::x509::policy::CertificateValidation::evaluate
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub fn create_test_certificate_with_cn_and_uri_sans(signing_key: &SigningKey, cn: &str, uris: &[&str]) -> Certificate {
+	let name = test_cn_name(cn).expect("test common names satisfy PrintableString");
+	test_certificate_named_with_uri_sans(signing_key, name, uris)
+}
+
+/// Shared body of the URI-SAN fixtures: `name` as both subject and
+/// issuer (self-signed shape), each of `uris` as a SAN entry.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_certificate_named_with_uri_sans(signing_key: &SigningKey, name: RdnSequence, uris: &[&str]) -> Certificate {
 	let names = uris
 		.iter()
 		.map(|uri| {
@@ -271,13 +293,24 @@ pub fn create_test_certificate_with_uri_sans(signing_key: &SigningKey, uris: &[&
 		.collect();
 	let san = SubjectAltName(names);
 
-	test_certificate_with_extensions(signing_key, Some(vec![test_extension(&san)]))
+	test_certificate_named(signing_key, name, Some(vec![test_extension(&san)]))
 }
 
 /// Shared body of the placeholder-signed test certificate fixtures:
 /// empty subject and issuer, fixed serial, caller-chosen extensions.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option<Vec<Extension>>) -> Certificate {
+	test_certificate_named(signing_key, RdnSequence::default(), extensions)
+}
+
+/// Placeholder-signed test certificate with `name` as both subject and
+/// issuer, fixed serial, and caller-chosen extensions.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_certificate_named(
+	signing_key: &SigningKey,
+	name: RdnSequence,
+	extensions: Option<Vec<Extension>>,
+) -> Certificate {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key
 		.to_public_key_der()
@@ -286,7 +319,6 @@ fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option
 		SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).expect("freshly encoded SPKI re-decodes");
 	let algorithm = test_signature_algorithm();
 	let validity = test_validity().expect("fixed test validity window is valid");
-	let empty_name = RdnSequence::default();
 	let serial_number = SerialNumber::new(&[1]).expect("single-byte serial is valid");
 	let signature = BitString::new(0, vec![0; 64]).expect("64-byte placeholder is a valid BitString");
 
@@ -294,9 +326,9 @@ fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option
 		version: X509Version::V3,
 		serial_number,
 		signature: algorithm.to_owned(),
-		issuer: empty_name.to_owned(),
+		issuer: name.to_owned(),
 		validity,
-		subject: empty_name,
+		subject: name,
 		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,

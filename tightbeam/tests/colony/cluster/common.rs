@@ -18,7 +18,7 @@ pub(super) use tightbeam::{
 		cluster::{
 			Admission, Cluster, ClusterConfig, ClusterError, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest,
 			ClusterWorkResponse, GossipAdmission, GossipConfig, GossipDigest, GossipJournal, HeartbeatConfig,
-			MemoryGossipJournal, TokenBucketAdmission,
+			MemoryGossipJournal, PeerHint, PeerTable, TokenBucketAdmission,
 		},
 		common::{
 			current_timestamp_ms, servlet_instance, type_canonical_bytes, ColonyNamespace, GossipReconciliation,
@@ -33,7 +33,7 @@ pub(super) use tightbeam::{
 	},
 	constants::{
 		DEFAULT_COMMAND_FRESHNESS_WINDOW_MS, DEFAULT_GOSSIP_RETENTION_MS, MAX_ADVERTISED_TYPES,
-		MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL,
+		MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_TTL, MAX_PEER_BUCKET,
 	},
 	crypto::{
 		key::Secp256k1KeyProvider,
@@ -510,13 +510,21 @@ pub(super) fn containment_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfi
 	conf
 }
 
+/// Like [`peering_cluster_conf`] but dialing `peers` as beat anchors.
+/// Peers must pass through the builder: the discovery table derives its
+/// un-evictable anchor set at build.
+pub(super) fn peering_cluster_conf_with_peers(certs: &ClusterTestCerts, peers: Vec<String>) -> ClusterConfig {
+	let tls = ClusterTlsConfig { peer_trust: Some(Arc::clone(&certs.trust)), ..cluster_tls_config(certs) };
+	ClusterConfig::builder(tls).with_peers(peers).build()
+}
+
 /// Gateway conf that advertises to `peer` on a fast beat. The slate is
 /// never configured: each beat snapshots the hive registry.
 pub(super) fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: String) -> ClusterConfig {
-	let mut conf = ClusterConfig::new(cluster_tls_config(certs));
-	conf.peer.peers = vec![peer];
-	conf.peer.advertise_interval = Some(Duration::from_millis(100));
-	conf
+	ClusterConfig::builder(cluster_tls_config(certs))
+		.with_peers([peer])
+		.with_advertise_interval(Duration::from_millis(100))
+		.build()
 }
 
 /// Send one signed advertisement of `types` from a peer at `gateway_addr`,

@@ -14,6 +14,7 @@ use crate::colony::servlet::servlet_runtime::rt;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::instrumentation::events::{
 	CLUSTER_GOSSIP_ACCEPTED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE, CLUSTER_GOSSIP_RELAY_WEAKENED,
+	CLUSTER_PEER_DISCOVERED,
 };
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
@@ -30,9 +31,11 @@ use crate::builder::frame::FrameBuilder;
 #[cfg(feature = "x509")]
 use crate::builder::TypeBuilder;
 #[cfg(feature = "x509")]
+use crate::colony::cluster::peer::cert_fingerprint_id;
+#[cfg(feature = "x509")]
 use crate::colony::cluster::{
 	cert_colony_urn, gossip_digest, gossip_fresh, peer_signer_fingerprint, wanted_digests, Admission, AdmittedGossip,
-	GossipDigest,
+	GossipDigest, PeerHint,
 };
 #[cfg(feature = "x509")]
 use crate::colony::common::{
@@ -40,7 +43,7 @@ use crate::colony::common::{
 	PeerAdvertisement, PeerAdvertisementResponse,
 };
 #[cfg(feature = "x509")]
-use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG};
+use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_PEX_SAMPLE};
 #[cfg(feature = "x509")]
 use crate::decode;
 #[cfg(feature = "x509")]
@@ -186,6 +189,13 @@ pub(crate) async fn reflood_gossip<P, D>(
 		+ 'static,
 	D: ClusterDigest,
 {
+	// Flood targets are anchors plus verified tried peers; an
+	// unverified candidate never receives rumor bytes.
+	let targets = config.peer.table.target_set().unwrap_or_default();
+	if targets.is_empty() {
+		return;
+	}
+
 	let request = ClusterRequest::Gossip(Box::new(rumor));
 
 	let frame = match FrameBuilder::from(Version::V2)
@@ -206,7 +216,7 @@ pub(crate) async fn reflood_gossip<P, D>(
 	};
 
 	let mut fanout = tokio::task::JoinSet::new();
-	for peer in config.peer.peers.iter() {
+	for peer in targets.iter() {
 		let Ok(peer_addr) = peer.parse::<P::Address>() else {
 			continue;
 		};
@@ -270,6 +280,16 @@ where
 	Ok(decoded.status)
 }
 
+/// Whether a reconcile reply exceeds its wire bounds.
+///
+/// A conforming gateway never sends more than [`MAX_GOSSIP_LOG`] wants
+/// or [`MAX_PEX_SAMPLE`] peer-exchange entries, so an oversized reply
+/// is abuse and the requester drops the whole round (CWE-770).
+#[cfg(feature = "x509")]
+fn reconcile_reply_oversized(reply: &GossipWant) -> bool {
+	reply.want.len() > MAX_GOSSIP_LOG || reply.pex.len() > MAX_PEX_SAMPLE
+}
+
 /// One anti-entropy reconcile round with a peer, including grey-hole scoring.
 #[cfg(feature = "x509")]
 pub(crate) async fn reconcile_gossip_async<P, D>(
@@ -279,7 +299,7 @@ pub(crate) async fn reconcile_gossip_async<P, D>(
 	servlet_registry: Arc<ServletRegistry>,
 	trace: Arc<TraceCollector>,
 	acked: &mut HashSet<GossipDigest>,
-	peer_bytes: &[u8],
+	peer: &str,
 ) -> Result<(), ClusterError>
 where
 	P: Protocol
@@ -311,12 +331,32 @@ where
 
 	let mut client = pool.connect(peer_addr).await?;
 
+	// A feeler probe reconciles on a cold single-flight connection whose
+	// handshake defers to first emit, so warm it before the gate reads
+	// the peer certificate. The gate MUST precede any request emit
+	// (CWE-668), so completing the handshake here is the only way to
+	// learn peer identity without first disclosing the reconcile.
+	client.complete_handshake().await?;
+
 	// Colony scope gate (CWE-668): peer handshake cert MUST match local colony.
 	let peer_colony = client
 		.peer_certificate()
 		.and_then(|cert| cert_colony_urn(&config.namespace, cert));
 	if peer_colony.as_ref() != config.colony_urn() {
+		// A definitive foreign identity leaves the new table instead of
+		// clogging its prefix bucket with an undialable candidate.
+		let _ = config.peer.table.discard(peer);
 		return Ok(());
+	}
+
+	// The gate above is the verified probe of the addrman discipline:
+	// this dialed address answered with a same-colony certificate, so
+	// it earns a tried slot and joins the beat/reflood target set.
+	let peer_id = client.peer_certificate().and_then(cert_fingerprint_id);
+	if config.peer.table.promote(peer, peer_id.as_deref(), now)? {
+		if let Ok(event) = trace.event(CLUSTER_PEER_DISCOVERED) {
+			event.with_payload(peer.as_bytes()).emit();
+		}
 	}
 
 	let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held });
@@ -333,17 +373,25 @@ where
 	let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 	let reply: GossipWant = decode(&response.message)?;
 
-	// Oversized want-list is abuse: drop the round (CWE-770).
-	if reply.want.len() > MAX_GOSSIP_LOG {
+	// Oversized want-list or PEX sample is abuse: drop the round (CWE-770).
+	if reconcile_reply_oversized(&reply) {
 		return Ok(());
 	}
 
-	let wanted = wanted_digests(&reply.want);
+	let GossipWant { want, pex } = reply;
+
+	// PEX entries are unverified hints (CWE-345): they enter the capped
+	// new table only, and become dial targets solely through a later
+	// feeler probe that passes the same colony gate as above.
+	let hints = pex.into_iter().filter_map(|entry| PeerHint::try_from(entry).ok());
+	let _ = config.peer.table.learn(hints)?;
+
+	let wanted = wanted_digests(&want);
 
 	// Grey-hole: previously acked digest wanted again while retained. One weaken per round.
 	let dropped = wanted.iter().any(|digest| acked.contains(digest));
 	if dropped {
-		let _ = servlet_registry.weaken_peer_by_dial(peer_bytes);
+		let _ = servlet_registry.weaken_peer_by_dial(peer.as_bytes());
 		let _ = trace.event(CLUSTER_GOSSIP_DROP_SIGNAL);
 	}
 	for digest in &wanted {
@@ -504,7 +552,7 @@ where
 	.await;
 
 	// Detached reflood: verbatim rumor, decremented outer TTL. Skip if no peers.
-	if hop_ttl > 0 && !config.peer.peers.is_empty() {
+	if hop_ttl > 0 && config.peer.table.has_targets() {
 		let reflood_pool = peer_dial_pool(&peer_pool, &pool);
 		let config = Arc::clone(&config);
 		let reflood_rumor = rumor.clone();
@@ -549,6 +597,12 @@ where
 			return;
 		};
 
+		// A gateway must never learn itself as a peer: PEX replies echo
+		// installed routes, which include this gateway's own address.
+		if let Ok(local) = from_utf8(&gateway_addr) {
+			let _ = config.peer.table.exclude_self(local);
+		}
+
 		// Per-peer Ok ledger for grey-hole detection; bounded by journal x peers (CWE-770).
 		let mut push_ledger: HashMap<String, HashSet<GossipDigest>> = HashMap::new();
 
@@ -571,7 +625,11 @@ where
 				}
 			}
 
-			if config.peer.peers.is_empty() {
+			// Beat targets are anchors plus verified tried peers; probes
+			// are unverified candidates awaiting their feeler dial.
+			let targets = config.peer.table.target_set().unwrap_or_default();
+			let probes = config.peer.table.probe_sample(current_timestamp_ms()).unwrap_or_default();
+			if targets.is_empty() && probes.is_empty() {
 				continue;
 			}
 
@@ -584,7 +642,7 @@ where
 				.take(MAX_ADVERTISED_TYPES)
 				.collect();
 
-			for peer in config.peer.peers.iter() {
+			for peer in targets.iter() {
 				let Ok(peer_addr) = peer.parse::<P::Address>() else {
 					continue;
 				};
@@ -606,11 +664,63 @@ where
 						Arc::clone(&servlet_registry),
 						Arc::clone(&trace),
 						acked,
-						peer.as_bytes(),
+						peer,
 					)
 					.await;
 				}
 			}
+
+			// Feeler probes run reconcile only. The colony gate inside the
+			// round verifies the candidate and promotes it. An unverified
+			// hint never receives the advertised slate. A failed dial
+			// discards the candidate so dead addresses cannot clog a
+			// prefix bucket.
+			if config.colony_urn().is_some() {
+				for peer in probes.iter() {
+					let Ok(peer_addr) = peer.parse::<P::Address>() else {
+						let _ = config.peer.table.discard(peer);
+						continue;
+					};
+					let acked = push_ledger.entry(peer.clone()).or_default();
+					let probed = reconcile_gossip_async::<P, D>(
+						Arc::clone(&pool),
+						Arc::clone(&config),
+						peer_addr,
+						Arc::clone(&servlet_registry),
+						Arc::clone(&trace),
+						acked,
+						peer,
+					)
+					.await;
+					if probed.is_err() {
+						let _ = config.peer.table.discard(peer);
+					}
+				}
+			}
 		}
 	})
+}
+
+#[cfg(all(test, feature = "x509"))]
+mod tests {
+	use super::*;
+	use crate::colony::common::PeerGossip;
+
+	fn reply(want_len: usize, pex_len: usize) -> GossipWant {
+		let want = vec![vec![0u8; 32]; want_len];
+		let pex = vec![PeerGossip { peer_id: Vec::new(), gateway_addr: b"127.0.0.1:9000".to_vec() }; pex_len];
+		GossipWant { want, pex }
+	}
+
+	#[test]
+	fn reconcile_reply_bounds_want_and_pex() {
+		let cases = [
+			(MAX_GOSSIP_LOG, MAX_PEX_SAMPLE, false),
+			(MAX_GOSSIP_LOG + 1, MAX_PEX_SAMPLE, true),
+			(MAX_GOSSIP_LOG, MAX_PEX_SAMPLE + 1, true),
+		];
+		for (want_len, pex_len, oversized) in cases {
+			assert_eq!(reconcile_reply_oversized(&reply(want_len, pex_len)), oversized);
+		}
+	}
 }

@@ -1066,6 +1066,24 @@ pooled_mux! {
 			}
 		}
 
+		/// Warm the connection by completing its handshake without
+		/// emitting an application frame.
+		///
+		/// A mux lease already handshook eagerly at dial.
+		/// It therefore returns at once.
+		///
+		/// A single-flight lease defers its handshake to the first
+		/// [`emit`](Self::emit). A caller that gates on peer identity
+		/// before disclosing a request drives it here first.
+		/// [`peer_certificate`](Self::peer_certificate) is then populated.
+		pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()> {
+			if self.mux.is_some() {
+				return Ok(());
+			}
+
+			self.conn()?.complete_handshake().await
+		}
+
 		/// Open a streamed request on the shared mux connection: push
 		/// chunks through the sink, then await the unary response.
 		///

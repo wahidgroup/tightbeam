@@ -1066,10 +1066,10 @@ fn cross_plane_advertising_conf(certs: &SplitPlaneCerts, peer: String) -> Cluste
 		..cluster_tls_config(&certs.exporter)
 	};
 
-	let mut conf = ClusterConfig::new(tls);
-	conf.peer.peers = vec![peer];
-	conf.peer.advertise_interval = Some(Duration::from_millis(100));
-	conf
+	ClusterConfig::builder(tls)
+		.with_peers([peer])
+		.with_advertise_interval(Duration::from_millis(100))
+		.build()
 }
 
 tb_assert_spec! {

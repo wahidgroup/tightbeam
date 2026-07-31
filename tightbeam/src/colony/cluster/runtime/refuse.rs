@@ -31,7 +31,7 @@ pub(crate) fn refuse_gossip(
 
 pub(crate) fn refuse_reconcile(frame: &Frame, trace: &TraceCollector) -> Result<Option<Frame>, TightBeamError> {
 	gossip_refused_event(frame, trace);
-	reply_frame(&frame.metadata.id, GossipWant { want: Vec::new() })
+	reply_frame(&frame.metadata.id, GossipWant { want: Vec::new(), pex: Vec::new() })
 }
 
 pub(crate) fn refuse_peer_ad(

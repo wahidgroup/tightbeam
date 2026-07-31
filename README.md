@@ -19,7 +19,7 @@ Copyright (C) Tanveer Wahid, WahidGroup, LLC (2025). All Rights Reserved.
 
 tightbeam is a Layer-5 messaging framework. Frames use Abstract Syntax Notation One (ASN.1) with Distinguished Encoding Rules (DER). Versioned metadata carries protocol control data beside the application message.
 
-Hot paths aim for zero-copy operation where the design allows it. Production paths avoid panic for ordinary error cases. Core protocol types target `no_std` environments; see Status for current limits.
+> Zero-Copy, Zero-Panic, no_std-Ready
 
 ## Table of Contents
 
@@ -189,7 +189,7 @@ Hot paths aim for zero-copy operation where the design allows it. Production pat
 
 ## 1. Introduction
 
-tightbeam defines a structured, versioned messaging protocol. Information fidelity stays in the open interval **I(t) ∈ (0,1)** for all time t in the operating lifetime T. Protocol choices keep Frames inside that bound.
+tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Its philosophy is predicated upon a return to first order principles.
 
 ### 1.1 Information Fidelity Constraint
 
@@ -209,41 +209,42 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ### 1.3 Document Conventions
 
-This document follows the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322] for structure and editorial style. Prose uses short full sentences and active voice. Prefer bullets or short paragraphs by default. Use a table only when readers must compare parallel rows. Project terms and software names override generic wording.
+This document adheres to the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322] for structure and editorial style:
 
-- **Section pattern**: Normative sections progress through concept, specification, implementation, then testing.
-- **Requirements language**: Key words follow [§1.2 Requirements Language](#12-requirements-language).
-- **Terminology**: Project terms are defined once in [§2 Terminology](#2-terminology) and used consistently after that.
-- **Citations**: External standards are cited by name and linked on first mention in a section. Full entries live in [§14 References](#14-references). Every reference entry is cited at least once. Every in-text citation resolves to an entry there.
+- **Section pattern**: Normative sections progress through concept -> specification -> implementation -> testing.
+- **Requirements language**: Key words are interpreted per [RFC 2119][rfc2119] (see [§1.2 Requirements Language](#12-requirements-language)).
+- **Terminology**: Project terms are defined once in [§2 Terminology](#2-terminology) and used consistently thereafter.
+- **Citations**: External standards are cited by name and linked on their first mention within a section. Full references are recorded in [§14 References](#14-references). Every entry there is cited at least once in the text, and every in-text citation resolves to an entry there.
 
 ## 2. Terminology
 
-The following project terms MUST be used consistently. This list holds identity nouns only. Design properties are indexed in [§3.1 Information Theory Properties](#31-information-theory-properties). Security and state terms such as Message Integrity (MI), Frame Integrity (FI), Matrix, `previous_frame`, and Nonrepudiation are defined in [§5.7](#57-semantic-constraints) and [§5.8](#58-what-is-the-matrix).
+The following project terms MUST be used consistently:
 
-- [tightbeam](https://docs.rs/tightbeam-rs/latest): The project name. Write it in lowercase as tightbeam.
-- [Frame](#42-frame-structure): A versioned snapshot at time t.
-- [Message](#53-message-structure): A typed application payload carried inside a Frame.
-- [Metadata](#43-metadata-specification): Protocol control fields carried with a Frame.
-- [Version](#41-version-evolution): The protocol generation identifier (`V0` through `V3`).
+- [tightbeam](https://docs.rs/tightbeam-rs/latest): The project name. Lowercase as tightbeam.
+- [Frame](#42-frame-structure): A versioned snapshot (state) at time t.
+- [Message](#53-message-structure): A typed application payload serialized within a Frame.
+- [Metadata](#43-metadata-specification): Per-message metadata as defined by the protocol.
+- [Version](#41-version-evolution): The protocol version identifier.
 - [TIP](tips/tip-0001.md): tightbeam Improvement Proposal.
+- [Information Theory Properties](#31-information-theory-properties)
 
 ## 3. Architecture
 
 ### 3.1 Information Theory Properties
 
-tightbeam keeps Frames inside the fidelity bound **I(t) ∈ (0,1)** through the following design properties. The list is a property index, not a second glossary. Nouns stay in [§2 Terminology](#2-terminology). Each entry links to the normative rules.
+tightbeam implements high-fidelity information transmission through the following bounds:
 
 - **STRUCTURE**: ASN.1 DER gives a single canonical encoding for equal values ([§5.5 Encoding Rules](#55-encoding-rules)).
 - **IDEMPOTENCE**: Each Frame carries a unique `id` for message identification ([§4.1 Version Evolution](#41-version-evolution)).
 - **ORDER**: Each Frame carries a monotonic `order` value ([§5.7.1 Message Ordering](#571-message-ordering)).
-- **COMPACTNESS**: A Frame MAY carry enforceable compression via `compactness` ([§5.7.2 Compression Requirements](#572-compression-requirements)).
-- **INTEGRITY**: Message Integrity (MI) and Frame Integrity (FI) bind body and envelope ([§5.7.3 Integrity Semantics](#573-integrity-semantics-order-of-operations)).
+- **COMPACTNESS**: A Frame MAY carry enforceable compression ([§5.7.2 Compression Requirements](#572-compression-requirements)).
+- **INTEGRITY**: Message Integrity (MI) and Frame Integrity (FI) ([§5.7.3 Integrity Semantics](#573-integrity-semantics-order-of-operations)).
 - **CONFIDENTIALITY**: A Frame MAY protect the body with AEAD encryption ([§5.7.3](#573-integrity-semantics-order-of-operations)).
 - **PRIORITY**: A Frame MAY carry one of six `MessagePriority` levels ([§5.1 Enumerated Types](#51-enumerated-types)).
 - **LIFETIME**: A Frame MAY carry a 64-bit TTL in `lifetime` ([§4.3 Metadata Specification](#43-metadata-specification)).
 - **STATE**: Previous Frame chaining links snapshots across time ([§5.7.4 Previous Frame Chaining](#574-previous-frame-chaining)).
 - **MATRIX**: Matrix carries dense application control state ([§5.8 What is the Matrix?](#58-what-is-the-matrix)).
-- **NONREPUDIATION**: A signature MAY bind the signed Frame fields ([§5.7.5 Nonrepudiation Coverage and Binding](#575-nonrepudiation-coverage-and-binding)).
+- **NONREPUDIATION**: A signature MAY bind a signed Frame ([§5.7.5 Nonrepudiation Coverage and Binding](#575-nonrepudiation-coverage-and-binding)).
 
 ## 4. Protocol Specification
 
@@ -258,7 +259,7 @@ Each protocol version inherits the required features of the prior version. A hig
 | V2      | All V1 required features                                   | Priority (`MessagePriority`); lifetime (TTL); Previous Frame chaining         |
 | V3      | All V2 required features                                   | Matrix control                                                                |
 
-Concrete field requirements and forbidden fields are stated in [§5.6 Version-Specific Constraints](#56-version-specific-constraints). Semantic rules for integrity, chaining, and signatures are stated in [§5.7 Semantic Constraints](#57-semantic-constraints).
+> Note: Concrete field requirements and forbidden fields are stated in [§5.6 Version-Specific Constraints](#56-version-specific-constraints). Semantic rules for integrity, chaining, and signatures are stated in [§5.7 Semantic Constraints](#57-semantic-constraints).
 
 ### 4.2 Frame Structure
 
@@ -2459,6 +2460,10 @@ Workers can be tested using the `tb_scenario!` macro with `environment Worker`:
 
 ```rust
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, worker};
+use tightbeam::utils::urn::Urn;
+
+const WORKER_CALLED: Urn<'static> = Urn::new("test", "event:worker/called");
+const RESPONSE_RECEIVED: Urn<'static> = Urn::new("test", "event:worker/response-received");
 
 tb_assert_spec! {
 	pub PingPongSpec,
@@ -2466,8 +2471,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(worker_called, exactly!(1)),
-			(response_received, exactly!(1), equals!("pong"))
+			(WORKER_CALLED, exactly!(1)),
+			(RESPONSE_RECEIVED, exactly!(1), equals!("pong"))
 		]
 	}
 }
@@ -2482,12 +2487,12 @@ tb_scenario! {
 			})
 		},
 		stimulus: |WorkerEnv { trace, worker, .. }| async move {
-			trace.event_with(PingPongSpec::worker_called, &[], ())?;
+			trace.event_with(WORKER_CALLED, &[], ())?;
 
 			let request = RequestMessage { content: "ping".to_string() };
 			let response = worker.relay(Arc::new(request)).await?;
 
-			trace.event_with(PingPongSpec::response_received, &[], response.result)?;
+			trace.event_with(RESPONSE_RECEIVED, &[], response.result)?;
 			Ok(())
 		}
 	}
@@ -2499,7 +2504,7 @@ The `environment Worker` syntax provides:
 - `setup`: Creates the worker builder from a `SetupEnv` (sync)
 - `stimulus`: Drives the started worker through `WorkerEnv` via `relay()` and records trace events
 
-Ident assertion keys generate constants on the spec type (`PingPongSpec::worker_called`). Event sites and assertions share that definition. The `spec:` key is shorthand for a `ScenarioConfig` with that spec's latest version.
+Assertion labels are `Urn` constants shared by emit sites and the spec (exact string match). The `spec:` key expands to a `ScenarioConfig` with that spec's latest version.
 
 #### 9.3.2 E: Servlets
 
@@ -3717,15 +3722,15 @@ let session_id = PipelineBuilder::new(trace)
 
 ## 12. Testing Framework
 
-The tightbeam testing framework provides three progressive verification layers for rigorous behavioral testing of protocol implementations.
+tightbeam tests protocol behavior through three progressive verification layers. Layers stack: start with assertions, then add CSP, then FDR.
 
 ### 12.1 Architecture and Concepts
 
-The tightbeam testing framework is built on two foundational concepts from formal methods and statistical testing theory:
+Two formal-methods ideas underpin the stack:
 
 #### Communicating Sequential Processes (CSP)
 
-CSP is a formal language for describing patterns of interaction in concurrent systems, developed by Tony Hoare.[^hoare1978][^roscoe2010] In tightbeam, CSP provides the mathematical foundation for modeling protocol behavior as labeled transition systems (LTS). Each process specification defines:
+CSP describes concurrent interaction patterns (Hoare; Roscoe).[^hoare1978][^roscoe2010] In tightbeam, CSP models protocol behavior as a labeled transition system (LTS). Each process specification defines:
 
 - **Alphabet (Σ, τ)**: Observable events visible to the environment (Σ) and hidden internal events (τ)
 - **State Space**: Named states representing protocol phases
@@ -3756,59 +3761,60 @@ This progressive approach allows developers to start with simple assertions and 
 
 #### 12.1.1 Three-Layer Progressive Verification
 
-tightbeam implements formal verification through three complementary layers, each building upon the previous:
-
 | Layer          | Feature Flag  | Purpose                        | Specification      | Usage                                       |
 | -------------- | ------------- | ------------------------------ | ------------------ | ------------------------------------------- |
 | L1 AssertSpec  | `testing`     | Runtime assertion verification | `tb_assert_spec!`  | Required: `.with_spec()` or `.with_specs()` |
 | L2 ProcessSpec | `testing-csp` | CSP state machine modeling     | `tb_process_spec!` | Optional: `.with_csp()`                     |
 | L3 Refinement  | `testing-fdr` | Trace/failures refinement      | Inline config      | Optional: `.with_fdr()`                     |
 
-**Layer 1 (Assertions)**: Verifies that expected events occur with correct cardinality. This provides basic behavioral correctness through declarative assertion specifications.
+**Layer 1 (Assertions)**: Declares expected labels, cardinalities, and optional values. Verifies that the recorded assertion stream matches.
 
-**Layer 2 (CSP Process Models)**: Adds formal state machine modeling using Communicating Sequential Processes (CSP) theory. Validates that execution traces follow valid state transitions and distinguishes between observable (external) and hidden (internal) events.
+**Layer 2 (CSP)**: Adds a process model. Validates that the trace follows valid transitions and separates observable vs hidden events.
 
-**Layer 3 (FDR Refinement)**: Enables multi-seed exploration for exhaustive verification of trace refinement, failures refinement, and divergence freedom. Based on FDR (Failures-Divergences Refinement) model checking methodology.
+**Layer 3 (FDR)**: Multi-seed exploration for trace refinement, failures refinement, and divergence freedom.
 
 #### 12.1.2 Unified Entry Point: tb_scenario!
 
-All three layers are accessed through the `tb_scenario!` macro, which provides:
+All three layers run through `tb_scenario!`:
 
-- Consistent syntax across all verification layers
-- Progressive enhancement (L1 -> L1+L2 -> L1+L2+L3)
-- Environment abstraction (ServiceClient, Servlet, Worker, Bare, Cluster, Hive)
-- Instrumentation integration
-- Policy enforcement
+- One syntax for L1, L1+L2, and L1+L2+L3
+- Environments: `Bare`, `Worker`, `ServiceClient`, `Servlet`, `Pipeline`, `Cluster`, `Hive`
+- Trace / instrumentation hooks (`TraceConfig`)
+- Optional policy and fault configuration
 
 #### 12.1.3 Feature Flag Architecture
 
-The testing framework uses progressive feature flags:
+Progressive flags (each builds on the previous where noted):
 
-- `testing`: Enables L1 assertion verification (foundation)
-- `testing-csp`: Enables L1+L2 CSP process modeling
-- `testing-fdr`: Enables L1+L2+L3 refinement checking (requires `testing-csp`)
-- `testing-timing`: Enables timing verification (WCET, deadline, jitter, slack) - requires `testing`
-- `testing-schedulability`: Enables schedulability analysis (RMA/EDF) - requires `testing-timing`
-
-Each layer builds on the previous, ensuring consistent semantics across verification levels.
+- `testing`: L1 assertion verification
+- `testing-csp`: L1+L2 CSP process modeling (requires `testing`)
+- `testing-fdr`: L1+L2+L3 refinement checking (requires `testing-csp`)
+- `testing-timing`: WCET, deadline, jitter, slack (requires `testing` + `testing-csp`, pulls `instrument`)
+- `testing-schedulability`: RMA/EDF analysis (requires `testing-timing`)
+- `testing-fault`: Deterministic/probabilistic fault injection (requires `testing-fdr`)
+- `testing-fmea`: FMEA campaign helpers (requires `testing-fault` + `instrument`)
+- `testing-fuzz` / `testing-fuzz-ijon`: AFL fuzzing (+ optional IJON; requires `testing-csp`)
 
 ### 12.2 Layer 1: Assertion Specifications
 
 #### 12.2.1 Concept
 
-AssertSpec defines expected behavioral invariants through declarative assertion specifications. Each specification version declares:
+An AssertSpec declares expected behavioral invariants per semantic version. Each version lists:
 
-- Expected assertion labels (event identifiers)
-- Cardinality constraints (exactly, at_least, at_most, between)
-- Value assertions (equals) for verifying assertion payload values
-- Execution mode (Accept, Reject)
-- Gate policy (Ok, rejection statuses, etc.)
+- Assertion labels (`Urn` expressions)
+- Cardinality constraints (`exactly`, `at_least`, `at_most`, `between`, `present`, `absent`)
+- Optional value checks (`equals!`)
+- Execution mode (`Accept` / `Reject`)
+- Gate expectation (`Ok` or a rejection status)
 
-Specifications are versioned using semantic versioning (major.minor.patch) and produce deterministic SHA3-256 hashes over their canonical representation.
+Versions use major.minor.patch and produce a deterministic SHA3-256 hash over their canonical representation.
 
 #### 12.2.2 Specification: tb_assert_spec! Syntax
 
 ```rust
+const RECEIVED: Urn<'static> = Urn::new("test", "event:demo/received");
+const RESPONDED: Urn<'static> = Urn::new("test", "event:demo/responded");
+
 tb_assert_spec! {
 	pub MySpec,
 	V(1,0,0): {
@@ -3816,8 +3822,8 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v1"],
 		assertions: [
-			(Received, exactly!(1)),
-			(Responded, exactly!(1), equals!("ok"))
+			(RECEIVED, exactly!(1)),
+			(RESPONDED, exactly!(1), equals!("ok"))
 		]
 	},
 	V(1,1,0): {
@@ -3825,8 +3831,8 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v1.1"],
 		assertions: [
-			(Received, exactly!(1)),
-			(Responded, exactly!(2))
+			(RECEIVED, exactly!(1)),
+			(RESPONDED, exactly!(2))
 		]
 	},
 }
@@ -3867,7 +3873,7 @@ V(major, minor, patch): {
 
 #### 12.2.3 Implementation Examples
 
-**Basic Specification**:
+**Basic specification** (same URN constants as in §12.2.2):
 
 ```rust
 tb_assert_spec! {
@@ -3877,8 +3883,8 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v1"],
 		assertions: [
-			(A, exactly!(1)),
-			(R, exactly!(1))
+			(RECEIVED, exactly!(1)),
+			(RESPONDED, exactly!(1))
 		]
 	},
 	V(1,1,0): {
@@ -3886,8 +3892,8 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v1.1"],
 		assertions: [
-			(A, exactly!(1)),
-			(R, exactly!(2))
+			(RECEIVED, exactly!(1)),
+			(RESPONDED, exactly!(2))
 		]
 	},
 }
@@ -3895,24 +3901,21 @@ tb_assert_spec! {
 
 #### 12.2.4 Generated API
 
-Each `tb_assert_spec!` generates a type with the following methods:
+Each `tb_assert_spec!` generates a type with:
 
 ```rust
 impl MySpec {
-	// Retrieve all defined versions
-	pub fn all() -> &'static [AssertionSpec];
-
-	// Lookup specific version
-	pub fn get(major: u16, minor: u16, patch: u16) -> Option<&'static AssertionSpec>;
-
-	// Get highest semantic version
-	pub fn latest() -> &'static AssertionSpec;
+	pub fn all() -> &'static [BuiltAssertSpec];
+	pub fn get(major: u16, minor: u16, patch: u16) -> Option<&'static BuiltAssertSpec>;
+	pub fn latest() -> &'static BuiltAssertSpec;
 }
 ```
 
+Assertion labels in the `assertions:` list are ordinary Rust expressions (typically `Urn<'static>` constants in scope). The macro does not invent associated constants on the spec type. Emit sites and the spec MUST use the same rendered URN string (exact match; see [§10.2](#102-event-kind-taxonomy)).
+
 #### 12.2.5 Cardinality Helpers
 
-The framework provides cardinality constraint macros:
+Cardinality macros:
 
 - `exactly!(n)`: Exactly n occurrences
 - `at_least!(n)`: Minimum n occurrences
@@ -3923,9 +3926,9 @@ The framework provides cardinality constraint macros:
 
 #### 12.2.6 Value Assertion Helpers
 
-The framework provides value assertion helpers for verifying assertion payload values:
+Value check:
 
-- `equals!(value)`: Verify assertion value equality
+- `equals!(value)`: Assert equality on the recorded payload
 
 **Supported Types**:
 
@@ -3953,25 +3956,33 @@ Assertions can be tagged with arbitrary string labels for flexible categorizatio
 
 #### 12.2.8 Recording Trace Events
 
-`TraceCollector` exposes two entry points:
+`TraceCollector` records assertion labels through `IntoEventLabel` (implemented for `Urn` / `&Urn`, and for CSP `Event` when `testing-csp` is on). String literals are not accepted.
 
-- `trace.event("label")` records a label-only event (no tags/value) and advances the CSP oracle.
-- `trace.event_with("label", &["tag"], value)` records the label with tags plus an optional value (anything implementing `Into<AssertionValue>`, e.g. `bool`, `u64`, `Version`, etc.).:
+- `trace.event(URN)` records a label-only assertion and, with `instrument`, also emits `ASSERT_LABEL`.
+- `trace.event_with(URN, &["tag"], value)` adds tags plus an optional value (`Into<AssertionValue>`).
 
 ```rust
-trace.event("relay_start")?;
-trace.event_with("response_ok", &["tag_a"], true)?;
+use tightbeam::utils::urn::Urn;
+
+const RELAY_START: Urn<'static> = Urn::new("test", "event:demo/relay-start");
+const RESPONSE_OK: Urn<'static> = Urn::new("test", "event:demo/response-ok");
+
+trace.event(RELAY_START)?;
+trace.event_with(RESPONSE_OK, &["tag_a"], true)?;
 ```
 
-**How Tags Work**:
+**Tags:**
 
-- Assertions are emitted with tags: `trace.event_with("label", &["tag1", "tag2"], ())`
-- Specs filter assertions using `tag_filter: ["tag1"]` - only assertions with matching tags are validated
-- A single assertion can satisfy multiple specs by including multiple tags
+- Emit with tags: `trace.event_with(FEATURE, &["v0", "v1"], ())`
+- Specs filter with `tag_filter: ["v0"]` -- only matching tagged assertions count
+- One emit can satisfy several versioned specs by listing multiple tags
 
-**Example: Version-Scoped Testing**:
+**Example: version-scoped testing:**
 
 ```rust
+const FEATURE: Urn<'static> = Urn::new("test", "event:demo/feature");
+const V1_SPECIFIC: Urn<'static> = Urn::new("test", "event:demo/v1-specific");
+
 tb_assert_spec! {
 	pub VersionSpec,
 	V(0,0,0): {
@@ -3979,7 +3990,7 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v0"],
 		assertions: [
-			(feature, exactly!(1), equals!(IsNone)),
+			(FEATURE, exactly!(1), equals!(IsNone)),
 		]
 	},
 	V(1,0,0): {
@@ -3987,8 +3998,8 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: ["v1"],
 		assertions: [
-			(feature, exactly!(1), equals!(IsNone)),
-			(v1_specific, exactly!(1))
+			(FEATURE, exactly!(1), equals!(IsNone)),
+			(V1_SPECIFIC, exactly!(1))
 		]
 	}
 }
@@ -4000,16 +4011,15 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			// Single assertion satisfies both version specs via tags
-			trace.event_with("feature", &["v0", "v1"], Presence::of_option(&some_option))?;
-			trace.event_with("v2_specific", &["v1"], ())?;
+			trace.event_with(FEATURE, &["v0", "v1"], Presence::of_option(&some_option))?;
+			trace.event_with(V1_SPECIFIC, &["v1"], ())?;
 			Ok(())
 		}
 	}
 }
 ```
 
-All such events are emitted via the instrumentation subsystem described in §10. Layer 1-3 verification operates over this event stream as the authoritative trace for a single execution.
+Layer 1 matches the assertion stream (`AssertionLabel` exact URN string). With `instrument` enabled, the same emit also writes `ASSERT_LABEL` / `ASSERT_PAYLOAD` into the §10 event sink. Control-plane inventory URNs (`events::CLUSTER_*`, and so on) are separate emit paths (`emit_event` / `emit`).
 
 #### 12.2.9 Schedulability Analysis
 
@@ -4641,34 +4651,33 @@ Faults are injected during CSP exploration before state transitions. Injected fa
 
 ### 12.7 Unified Testing: tb_scenario! Macro
 
-The `tb_scenario!` macro is the unified entry point for all testing layers, executing AssertSpec verifications under selectable environments with optional CSP and FDR verification.
+`tb_scenario!` is the single entry point for L1–L3 under a chosen environment.
 
-**Design Principles**:
+**Design principles:**
 
-- Single consistent syntax across all verification layers
-- Progressive enhancement (L1 -> L1+L2 -> L1+L2+L3)
-- Environment abstraction (ServiceClient, Servlet, Worker, Bare, Cluster, Hive)
-- Instrumentation integration
-- Policy enforcement
+- One syntax for all verification layers
+- Progressive enhancement (L1 → L1+L2 → L1+L2+L3)
+- Environments: `Bare`, `Worker`, `ServiceClient`, `Servlet`, `Pipeline`, `Cluster`, `Hive`
+- Optional `TraceConfig` / hooks / fault models
 
 #### 12.7.1 Syntax
 
 ```rust
 tb_scenario! {
-	name: test_function_name,        // OPTIONAL: creates standalone #[test] function NOTE: Do NOT use with `fuzz: afl`
-	spec: AssertSpecType,            // Layer 1 assertion spec (latest version). Use config: for anything more
+	name: test_function_name,        // OPTIONAL: creates standalone #[test] (Do NOT use with `fuzz: afl`)
+	spec: AssertSpecType,            // Layer 1 latest version. Use config: for anything more
 	config: ScenarioConfig::builder()  // Full configuration (alternative to spec:)
-		.with_spec(AssertSpecType::latest())          // Layer 1 assertion spec
-		.with_csp(ProcessSpecType)                    // OPTIONAL: Layer 2 CSP model (requires testing-csp)
-		.with_fdr(FdrConfig { ... })                  // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-		.with_trace(TraceConfig::builder()            // OPTIONAL: unified trace config (§10)
+		.with_spec(AssertSpecType::latest())          // Layer 1
+		.with_csp(ProcessSpecType)                    // OPTIONAL: L2 (testing-csp)
+		.with_fdr(FdrConfig { ... })                  // OPTIONAL: L3 (testing-fdr)
+		.with_trace(TraceConfig::builder()            // OPTIONAL: §10
 			.with_instrumentation(TbInstrumentationConfig { ... })
 			.with_logger(LoggerConfig::new(...))
 			.build())
-		.with_hooks(TestHooks { ... })                // OPTIONAL: on_pass/on_fail callbacks
+		.with_hooks(TestHooks { ... })                // OPTIONAL: on_pass/on_fail
 		.build(),
-	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
-	environment <Variant> { ... },   // REQUIRED: execution environment (Bare, Worker, ServiceClient, Servlet, Cluster, Hive)
+	fuzz: afl,                       // OPTIONAL: AFL mode (testing-csp / testing-fuzz)
+	environment <Variant> { ... },   // REQUIRED: Bare | Worker | ServiceClient | Servlet | Pipeline | Cluster | Hive
 }
 ```
 
@@ -4678,7 +4687,7 @@ Every closure receives one environment struct from `tightbeam::testing::env`. Se
 
 The `context:` key inside the environment block is evaluated once per test and shared as `Arc<C>` with every closure (unit when omitted).
 
-See sections 10.3.4 and 10.4 for detailed environment examples.
+Environment examples also appear in [§9.3](#93-components) (Worker, Servlet, Hive, Cluster) and [§12.7.2](#1272-examples).
 
 #### 12.7.2 Examples
 
@@ -5106,7 +5115,7 @@ tb_process_spec! {
 
 ### 12.9 Feature Matrix
 
-The following table summarizes capabilities available across the testing layers:
+Capabilities by testing layer:
 
 | Capability                                      | `testing`        | `testing-csp`            | `testing-fdr`                    | `testing-fuzz`      |
 | ----------------------------------------------- | ---------------- | ------------------------ | -------------------------------- | ------------------- |
@@ -5143,7 +5152,7 @@ The following table summarizes capabilities available across the testing layers:
 
 ### 12.10 Standards Compliance Mapping
 
-The following mapping relates tightbeam verification features to common high-assurance standards and regulations. The framework supports many certification requirements. Final certification evidence and process compliance remain the integrator's responsibility.
+Maps tightbeam verification features to common high-assurance standards. The crate supports many evidence needs. Final certification evidence and process compliance remain the integrator's responsibility.
 
 #### 12.10.1 DO-178C DAL A / ISO 26262 ASIL-D
 

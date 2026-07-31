@@ -412,3 +412,36 @@ pub const DEFAULT_GOSSIP_RATE_REFILL_MS: u64 = 250;
 /// Bounding tracked signers keeps memory finite when many identities publish.
 /// Admission fails closed once the ceiling is reached (CWE-770).
 pub const MAX_GOSSIP_RATE_SIGNERS: usize = 4096;
+
+/// Ceiling on unverified candidates held in the peer discovery table
+///
+/// Peer-exchange hints are attacker-suppliable, so the new table is
+/// bounded before any hint is dialed (CWE-770).
+pub const MAX_PEER_TABLE_NEW: usize = 256;
+
+/// Ceiling on verified learned peers held in the peer discovery table
+///
+/// Aligned with [`MAX_PEER_GATEWAYS`]: the dial graph never grows past
+/// the number of peer gateways one registry may track (CWE-770).
+pub const MAX_PEER_TABLE_TRIED: usize = MAX_PEER_GATEWAYS;
+
+/// Ceiling on peer-table entries sharing one address prefix bucket
+///
+/// Discovery buckets learned peers by /16 (IPv4) or /32 (IPv6) prefix.
+/// The per-bucket bound is the eclipse countermeasure: an attacker
+/// inside one network position cannot dominate either table
+/// (Heilman et al., USENIX Security 2015).
+pub const MAX_PEER_BUCKET: usize = 8;
+
+/// Ceiling on peers shared in one peer-exchange sample
+///
+/// Bounds the reply so one reconcile round cannot flood a requester
+/// with discovery hints (CWE-770).
+pub const MAX_PEX_SAMPLE: usize = 8;
+
+/// Ceiling on unverified candidates probed per advertise beat
+///
+/// Feeler dials verify candidates before promotion. Bounding them per
+/// beat keeps discovery traffic a small constant beside the anchor and
+/// tried dials.
+pub const PEER_PROBE_PER_BEAT: usize = 4;

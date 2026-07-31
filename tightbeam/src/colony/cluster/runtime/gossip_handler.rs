@@ -39,6 +39,10 @@ use crate::builder::frame::FrameBuilder;
 use crate::builder::TypeBuilder;
 #[cfg(feature = "x509")]
 use crate::colony::cluster::{frame_colony_urn, gossip_want};
+#[cfg(feature = "x509")]
+use crate::colony::common::PeerGossip;
+#[cfg(feature = "x509")]
+use crate::constants::MAX_PEX_SAMPLE;
 
 /// Admit a peer advertisement and reconcile its servlet slate.
 pub(crate) async fn handle_peer_ad(
@@ -67,6 +71,12 @@ pub(crate) async fn handle_peer_ad(
 		}
 	};
 
+	// A verified advertiser is also a discovery hint: without it the
+	// beat graph stays unidirectional and a seed-bootstrapped node is
+	// never dialed back. The hint sits in the capped new table until
+	// this gateway's own probe passes the colony gate.
+	let hint = admitted.discovery_hint();
+
 	if let Err(error) = servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
 		let status = match error {
 			ClusterError::PeerSlateConflict | ClusterError::PeerCapExceeded => TransitStatus::PermissionDenied,
@@ -75,6 +85,7 @@ pub(crate) async fn handle_peer_ad(
 		return refuse_peer_ad_release(&frame, &trace, replay_guard, status);
 	}
 
+	let _ = config.peer.table.learn(hint);
 	let _ = trace.event(CLUSTER_PEER_ADVERTISED);
 	reply_frame(&frame.metadata.id, PeerAdvertisementResponse { status: TransitStatus::Ok })
 }
@@ -155,14 +166,8 @@ where
 	}
 
 	// Freshness uses rumor issue time in `admit` (seen-ttl), not the control window.
-	gossip_pipeline::<P, D>(
-		GossipOrigin::Relay,
-		frame,
-		GossipPipelineCtx { servlet_registry, config, pool, peer_pool, trace },
-		rumor,
-		hop_ttl,
-	)
-	.await
+	let ctx = GossipPipelineCtx { servlet_registry, config, pool, peer_pool, trace };
+	gossip_pipeline::<P, D>(GossipOrigin::Relay, frame, ctx, rumor, hop_ttl).await
 }
 
 /// Mint and flood origin-signed gossip from a local hive-plane publisher.
@@ -239,11 +244,55 @@ where
 	.await
 }
 
+/// Peer-exchange sample for a reconcile reply.
+///
+/// Probe-verified peers from the discovery table merge with live peer
+/// routes installed from signed advertisements. Entries are deduped by
+/// dial address and capped at [`MAX_PEX_SAMPLE`] (CWE-770).
+///
+/// This gateway verified both sources. The receiver still treats every
+/// entry as an unverified hint until its own probe passes the colony gate.
+#[cfg(feature = "x509")]
+fn pex_sample(config: &ClusterConfig, servlet_registry: &ServletRegistry) -> Vec<PeerGossip> {
+	let verified = config
+		.peer
+		.table
+		.sample_for_pex(MAX_PEX_SAMPLE)
+		.unwrap_or_default()
+		.into_iter()
+		.map(|record| PeerGossip {
+			peer_id: record.peer_id.unwrap_or_default(),
+			gateway_addr: record.gateway_addr.into_bytes(),
+		});
+
+	// Registry entries are borrowed, so the wire message copies them once.
+	let routes = servlet_registry
+		.peer_entries()
+		.unwrap_or_default()
+		.into_iter()
+		.map(|entry| PeerGossip { peer_id: entry.owner_id().to_vec(), gateway_addr: entry.dial_target().to_vec() });
+
+	// The sample never exceeds MAX_PEX_SAMPLE, so a linear scan dedupes
+	// by dial address without a set allocation per entry.
+	let mut pex: Vec<PeerGossip> = Vec::new();
+	for candidate in verified.chain(routes) {
+		if pex.len() == MAX_PEX_SAMPLE {
+			break;
+		}
+		if !pex.iter().any(|shared| shared.gateway_addr == candidate.gateway_addr) {
+			pex.push(candidate);
+		}
+	}
+
+	pex
+}
+
 /// Compare peer digests and reply with digests this gateway still needs.
 #[cfg(feature = "x509")]
 pub(crate) async fn handle_reconcile(
 	frame: Frame,
 	reconciliation: GossipReconciliation,
+	servlet_registry: Arc<ServletRegistry>,
 	config: Arc<ClusterConfig>,
 	trace: Arc<TraceCollector>,
 	replay_guard: &GatewayReplayGuard,
@@ -275,5 +324,10 @@ pub(crate) async fn handle_reconcile(
 		Err(_) => Vec::new(),
 	};
 
-	reply_frame(&frame.metadata.id, GossipWant { want })
+	// The reply carries the peer-exchange sample, the GossipSub v1.1 PX
+	// piggyback shape. A seed-bootstrapped requester discovers the
+	// colony graph on its existing beat with no extra round trip.
+	let pex = pex_sample(&config, &servlet_registry);
+
+	reply_frame(&frame.metadata.id, GossipWant { want, pex })
 }
