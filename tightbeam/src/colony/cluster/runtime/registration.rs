@@ -167,6 +167,9 @@ fn build_servlet_slate(
 		.collect()
 }
 
+/// Parsed address-update delta: hive id, added entries, removed locators.
+type ParsedAddressUpdate<'a> = (Arc<[u8]>, Vec<ServletEntry>, Vec<&'a [u8]>);
+
 /// Parse hive identity, added entries, and removed instance locators.
 ///
 /// Returns `None` when the hive URN, any added locator, or any removed URN
@@ -174,7 +177,7 @@ fn build_servlet_slate(
 fn parse_address_update<'a>(
 	config: &ClusterConfig,
 	update: &'a ServletAddressUpdate,
-) -> Option<(Arc<[u8]>, Vec<ServletEntry>, Vec<&'a [u8]>)> {
+) -> Option<ParsedAddressUpdate<'a>> {
 	let claimed = config.namespace.validate(&update.hive_id).ok()?;
 	let ColonyResource::Hive { addr } = claimed else {
 		return None;
