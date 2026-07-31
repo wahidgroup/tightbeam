@@ -1,4 +1,3 @@
-use core::mem;
 use core::time::Duration;
 #[cfg(feature = "tokio")]
 use std::io::Error as IoError;
@@ -571,7 +570,7 @@ where
 
 	#[cfg(feature = "transport-policy")]
 	fn into_gated_halves(mut self) -> TransportResult<GatedHalves<Self>> {
-		let gate = Box::new(mem::take(&mut self.collector_gate));
+		let gate = Box::new(core::mem::take(&mut self.collector_gate));
 		let halves = self.into_split()?;
 		Ok((gate, halves))
 	}
