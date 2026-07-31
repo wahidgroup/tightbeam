@@ -1,4 +1,4 @@
-//! Cluster macros: name a gateway type as an alias of [`ClusterGateway`].
+//! Cluster macros: name a gateway type as an alias of [`crate::colony::cluster::ClusterGateway`].
 //!
 //! Lifecycle, dispatch, heartbeat, and gossip live in
 //! [`crate::colony::cluster::runtime`].

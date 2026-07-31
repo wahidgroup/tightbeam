@@ -6,7 +6,7 @@ use crate::{Frame, Message};
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
-/// Single `Arc` spelling for both std and no_std builds so [`routes!`]
+/// Single `Arc` spelling for both std and no_std builds so [`crate::routes!`]
 /// can emit one `dispatch` body via `$crate::router::Arc`.
 #[cfg(not(feature = "std"))]
 pub use alloc::sync::Arc;
@@ -75,7 +75,7 @@ pub trait RouterPolicy: Send + Sync {
 	///
 	/// Residual: two DER-structurally-identical types still cross-decode
 	/// (the wire format carries no type discriminator by design -- the
-	/// receiver decides the type, never the sender). [`routes!`] keeps
+	/// receiver decides the type, never the sender). [`crate::routes!`] keeps
 	/// each type adjacent to its handler to confine that risk.
 	///
 	/// # Errors

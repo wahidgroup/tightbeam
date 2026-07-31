@@ -1,6 +1,6 @@
 //! Protocol-generic servlet accept-loop state.
 //!
-//! - `servlet!` builds [`ServletHandlers`] and calls [`ServletRuntime::start`].
+//! - `servlet!` builds [`crate::colony::servlet::ServletHandlers`] and calls [`ServletRuntime::start`].
 //! - Hand-written [`ServletService`]s use the same entry point.
 //! - Address bytes are encoded once at start and shared as [`Arc<[u8]>`].
 //! - Callers borrow [`addr`](ServletRuntime::addr) instead of cloning it.

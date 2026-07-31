@@ -1,10 +1,10 @@
 //! Pluggable key backend abstraction for tightbeam transport encryption.
 //!
-//! This module provides the [`KeyProvider`] trait, which abstracts cryptographic
+//! This module provides the [`SigningKeyProvider`] trait, which abstracts cryptographic
 //! key operations to enable flexible backend integration (in-memory, HSM, KMS, enclave).
 //!
 //! The trait is algorithm-agnostic, using byte representations for all values.
-//! Concrete implementations (e.g., [`InMemoryKeyProvider`]) handle algorithm-specific
+//! Concrete implementations (e.g., [`InMemorySigningKeyProvider`]) handle algorithm-specific
 //! encoding/decoding.
 
 use core::fmt::Debug;
@@ -254,7 +254,7 @@ pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
 
 /// In-memory key provider generic over any RustCrypto signing key.
 ///
-/// This is the reference implementation for [`KeyProvider`], storing the private
+/// This is the reference implementation for [`SigningKeyProvider`], storing the private
 /// key directly in memory. Suitable for development, testing, and applications
 /// where HSM/KMS integration is not required.
 ///

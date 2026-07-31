@@ -135,7 +135,7 @@ where
 	}
 
 	/// Override the receiver-side stream credit policy (default:
-	/// [`BufferedGrantor`] with a [`DEFAULT_MUX_STREAM_CREDIT`]-chunk window).
+	/// [`crate::transport::multiplex::BufferedGrantor`] with a [`crate::constants::DEFAULT_MUX_STREAM_CREDIT`]-chunk window).
 	#[must_use]
 	pub fn with_credit_grantor(mut self, grantor: Arc<dyn CreditGrantor>) -> Self {
 		self.reader.set_grantor(grantor);

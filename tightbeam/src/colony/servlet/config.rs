@@ -428,7 +428,7 @@ where
 	/// Finish the builder into a [`ServletConfig`].
 	///
 	/// When [`Self::with_config`] was not called, env defaults to `()` so
-	/// [`ServletRuntime::start`] matches [`ServletConfig::default`].
+	/// [`crate::colony::servlet::ServletRuntime::start`] matches [`ServletConfig::default`].
 	pub fn build(self) -> ServletConfig<P, M, C> {
 		ServletConfig {
 			_protocol: PhantomData,
@@ -457,7 +457,7 @@ where
 	/// Finish the builder into a [`ServletConfig`].
 	///
 	/// When [`Self::with_config`] was not called, env defaults to `()` so
-	/// [`ServletRuntime::start`] matches [`ServletConfig::default`].
+	/// [`crate::colony::servlet::ServletRuntime::start`] matches [`ServletConfig::default`].
 	pub fn build(self) -> ServletConfig<P, M> {
 		ServletConfig {
 			_protocol: PhantomData,

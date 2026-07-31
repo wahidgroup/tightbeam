@@ -130,7 +130,7 @@ fn resolve_outcome(outcome: Result<StreamOutcome, oneshot::Canceled>) -> Transpo
 ///
 /// Shares pending-stream state and the outbound queue across clones
 /// (`Arc` + channel refcount bumps only). Does not drive I/O: spawn
-/// [`MuxReaderDriver`] and [`MuxWriterDriver`] on the caller's executor.
+/// [`crate::transport::multiplex::MuxReaderDriver`] and [`crate::transport::multiplex::MuxWriterDriver`] on the caller's executor.
 /// See [`MuxHandle::emit_on_stream`] and [`MuxHandle::ping`].
 #[derive(Clone)]
 pub struct MuxHandle {
@@ -170,7 +170,7 @@ impl MuxHandle {
 	///
 	/// Dropping the returned future before it resolves cancels the
 	/// stream: the pending entry is removed, the cap slot freed, and a
-	/// best-effort [`MuxCancelPackage`] sent. Per-stream timeouts
+	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`] sent. Per-stream timeouts
 	/// compose by wrapping this future in the caller's timer.
 	///
 	/// # Errors

@@ -834,8 +834,9 @@ impl TraceCollector {
 
 	/// Whether the configured sink dropped any event (sticky)
 	///
-	/// Feed this into [`EvidenceArtifact::finalize`]
-	/// (crate::instrumentation::EvidenceArtifact::finalize) so evidence
+	/// Feed this into
+	/// [`EvidenceArtifact::finalize`](crate::instrumentation::EvidenceArtifact::finalize)
+	/// so evidence
 	/// built from a truncated trace reports `overflow = true`.
 	#[cfg(feature = "instrument")]
 	pub fn overflowed(&self) -> bool {

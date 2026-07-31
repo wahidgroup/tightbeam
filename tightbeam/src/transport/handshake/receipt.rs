@@ -790,7 +790,7 @@ impl fmt::Debug for SessionOutcome {
 /// Covers activated, authorizer-refused, and countersignature
 /// missing/invalid endings. Observation is a record, not a decision:
 /// the hook cannot veto
-/// ([`TransportAuthorizer`](crate::transport::handshake::negotiation::TransportAuthorizer)
+/// ([`TransportAuthorizer`]
 /// already decided) and runs after the verdict is final.
 ///
 /// # Contract

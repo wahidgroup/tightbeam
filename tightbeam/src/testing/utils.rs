@@ -258,7 +258,7 @@ pub fn create_test_certificate(signing_key: &SigningKey) -> Certificate {
 ///
 /// The subject stays empty: identity claims such as colony membership
 /// bind to the SAN, never the subject. With an empty subject the SAN
-/// MUST be critical (RFC 5280 §4.2.1.6), which [`test_extension`]
+/// MUST be critical (RFC 5280 §4.2.1.6), which `test_extension`
 /// already provides.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub fn create_test_certificate_with_uri_sans(signing_key: &SigningKey, uris: &[&str]) -> Certificate {

@@ -123,7 +123,7 @@ impl RecvStream {
 ///
 /// Responses resolve their pending stream (unknown IDs silently
 /// discarded: cancel/response races are benign). Requests flow to the
-/// [`MuxResponder`]. Chunked payloads reassemble here, bounded by the
+/// [`crate::transport::multiplex::MuxResponder`]. Chunked payloads reassemble here, bounded by the
 /// credit this endpoint granted. The [`CreditGrantor`] decides when to
 /// raise a stream's limit. Protocol violations answer with a GoAway
 /// and fail the driver. Spawn [`MuxReaderDriver::drive`] on the

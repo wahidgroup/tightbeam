@@ -359,7 +359,7 @@ where
 	/// Report whether the underlying stream still appears connected.
 	///
 	/// The liveness hook external protocols need to implement
-	/// [`PersistentConnection`](crate::transport::PersistentConnection)
+	/// [`PersistentConnection`]
 	/// for pooled connections; the stream itself is not exposed.
 	pub fn is_alive(&self) -> bool {
 		AsyncProtocolStream::is_alive(&self.stream)

@@ -81,7 +81,7 @@ pooled_mux! {
 
 /// Shared builder surface for direct clients and connection pools.
 ///
-/// [`ClientBuilder`] and [`ConnectionPoolBuilder`] both implement this trait
+/// [`crate::transport::client::ClientBuilder`] and [`ConnectionPoolBuilder`] both implement this trait
 /// so callers configure timeouts and identity the same way.
 pub trait ConnectionBuilder<P: Protocol>: Sized {
 	/// Built client or pool produced by [`ConnectionBuilder::build`].

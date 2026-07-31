@@ -1,4 +1,4 @@
-//! Worker macros: name, config, policies, and handler wiring over [`WorkerRuntime`].
+//! Worker macros: name, config, policies, and handler wiring over [`crate::colony::worker::WorkerRuntime`].
 
 #[macro_export]
 macro_rules! worker {

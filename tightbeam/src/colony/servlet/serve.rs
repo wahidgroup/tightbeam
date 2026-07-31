@@ -62,7 +62,7 @@ impl<S: ServletService> MuxService for ContextService<S> {
 ///
 /// Returns the loop [`rt::JoinHandle`]; aborting it stops the servlet.
 /// Generic over [`AsyncListenerTrait`] so every protocol shares one path.
-/// [`ServletRuntime::start`] calls this after bind and context setup.
+/// [`crate::colony::servlet::ServletRuntime::start`] calls this after bind and context setup.
 pub fn serve_servlet<L, S>(
 	listener: L,
 	gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,

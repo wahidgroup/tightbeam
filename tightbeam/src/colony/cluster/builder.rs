@@ -1,4 +1,4 @@
-//! Builders for [`ClusterConfig`](super::ClusterConfig) and heartbeat settings.
+//! Builders for [`ClusterConfig`] and heartbeat settings.
 
 use core::time::Duration;
 use std::sync::Arc;

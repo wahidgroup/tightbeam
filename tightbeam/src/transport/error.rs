@@ -130,7 +130,7 @@ pub enum TransportError {
 	IoError(IoError),
 }
 
-/// Narrows [`TightBeamError`](crate::error::TightBeamError) into [`TransportError`];
+/// Narrows [`TightBeamError`] into [`TransportError`];
 /// variants without a transport counterpart collapse to [`TransportError::InvalidMessage`].
 impl From<TightBeamError> for TransportError {
 	fn from(err: TightBeamError) -> Self {

@@ -71,7 +71,7 @@ use crate::trace::TraceCollector;
 /// Source of the connection audit trail for access-gate verdicts.
 ///
 /// Every plane that evaluates a collector gate implements this (the TCP
-/// transports, the mux handle) so [`gate_inbound`] can record the
+/// transports, the mux handle) so `gate_inbound` can record the
 /// verdict wherever the gate runs.
 #[cfg(feature = "transport-policy")]
 pub trait GateAudit {
@@ -641,7 +641,7 @@ where
 
 /// Extract the application request from a collected envelope and gate it
 /// with the session's peer context, recording the verdict through
-/// [`gate_inbound`].
+/// `gate_inbound`.
 #[cfg(feature = "transport-policy")]
 fn gate_collected_envelope<T>(
 	transport: &T,

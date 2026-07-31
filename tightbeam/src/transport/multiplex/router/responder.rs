@@ -428,7 +428,7 @@ impl MuxResponder {
 	/// unary and streaming streams answers [`TransitStatus::Unimplemented`].
 	///
 	/// Request chunks arrive as the initiator pushes them (see
-	/// [`RequestSink::push`]), so a conversational handler may reply
+	/// [`crate::transport::multiplex::RequestSink::push`]), so a conversational handler may reply
 	/// per chunk. The request body ends at the initiator's close, so
 	/// a handler that replies per chunk still consumes the body to
 	/// its end before returning the trailer status.

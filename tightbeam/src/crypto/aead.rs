@@ -357,7 +357,7 @@ fn build_counter_nonce(value: u64, nonce_len: usize) -> TbResult<Vec<u8>> {
 /// authenticated-encryption safety margin for about 2^24.5 full-size records
 /// per key. RFC 9846 makes acting before the limit a MUST). Encryption fails
 /// closed with [`TightBeamError::RekeyRequired`] at
-/// [`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT):
+/// [`DEFAULT_REKEY_RECORD_LIMIT`]:
 /// receipt-bearing multiplexed sessions renew keys in band before the limit,
 /// while every other session must be reestablished for fresh directional keys.
 pub struct SendCipher {
@@ -375,7 +375,7 @@ impl SendCipher {
 	/// Override the record limit at which encryption demands a rekey.
 	///
 	/// Clamped to
-	/// [`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT):
+	/// [`DEFAULT_REKEY_RECORD_LIMIT`]:
 	/// the AES-GCM bound (RFC 9846 § 5.5) is MUST that no configuration may raise.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		self.rekey_limit = limit.min(DEFAULT_REKEY_RECORD_LIMIT);
@@ -450,7 +450,7 @@ impl SendCipher {
 ///
 /// The receive direction enforces the AES-GCM per-key volume bound: an
 /// honest peer halts or renews its [`SendCipher`] at
-/// [`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT),
+/// [`DEFAULT_REKEY_RECORD_LIMIT`],
 /// so a counter at or past that bound means the peer ignored the record
 /// limit (RFC 9846 § 5.5) and decryption fails closed with
 /// [`TightBeamError::RekeyRequired`]. The configurable rekey limit is a
@@ -476,7 +476,7 @@ impl RecvCipher {
 	/// from, driving receive-direction renewal and drain triggers.
 	///
 	/// Trigger policy: decryption refuses records at the AES-GCM volume bound
-	/// ([`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT))
+	/// ([`DEFAULT_REKEY_RECORD_LIMIT`])
 	/// regardless of this value, so a threshold below the peer's send
 	/// limit can never refuse legitimate records.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {

@@ -229,7 +229,7 @@ pub trait DigestProvider {
 ///
 /// Separates AEAD operations (encryption/decryption) from other crypto primitives.
 ///
-/// `AeadCipher` MUST implement [`Encryptor`](crate::crypto::aead::Encryptor) for
+/// `AeadCipher` MUST implement [`Encryptor`] for
 /// `AeadOid` so the wire algorithm identifier cannot diverge from the cipher.
 #[cfg(feature = "aead")]
 pub trait AeadProvider {
