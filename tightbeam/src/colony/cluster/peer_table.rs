@@ -9,6 +9,8 @@
 //! - An unverified hint enters the `new` table only. A probe dial whose
 //!   handshake certificate proves the local colony promotes the peer to
 //!   `tried`. Only anchors and `tried` peers receive traffic.
+//! - A `tried` resident that fails consecutive beats is evicted, so a
+//!   dead peer cannot hold a bucket slot. Discovery refills the table.
 //!
 //! [`PeerStore`] is the persistence seam. The table owns every eclipse
 //! invariant. A driver only loads and saves learned records. A hydrated
@@ -31,7 +33,9 @@ use std::sync::{Arc, Mutex};
 
 use super::ClusterError;
 use crate::colony::common::PeerGossip;
-use crate::constants::{MAX_PEER_BUCKET, MAX_PEER_TABLE_NEW, MAX_PEER_TABLE_TRIED, PEER_PROBE_PER_BEAT};
+use crate::constants::{
+	MAX_PEER_BUCKET, MAX_PEER_TABLE_NEW, MAX_PEER_TABLE_TRIED, MAX_PEER_TRIED_FAILURES, PEER_PROBE_PER_BEAT,
+};
 
 /// Network locality bucket of one peer address.
 ///
@@ -157,6 +161,11 @@ impl PeerStore for MemoryPeerStore {
 struct PeerEntry {
 	peer_id: Option<Vec<u8>>,
 	last_probe_ms: u64,
+	/// Consecutive failed beat dials since the last verified probe.
+	///
+	/// The count lives in memory only. A restart starts the count at
+	/// zero because the following beats re-verify every resident.
+	failures: usize,
 }
 
 #[derive(Debug, Default)]
@@ -354,7 +363,7 @@ impl PeerTable {
 
 		if self.anchor_keys.contains(&key) {
 			let mut state = self.state.lock()?;
-			let entry = PeerEntry { peer_id: peer_id.map(<[u8]>::to_vec), last_probe_ms: now_ms };
+			let entry = PeerEntry { peer_id: peer_id.map(<[u8]>::to_vec), last_probe_ms: now_ms, failures: 0 };
 			state.anchors_verified.insert(key, entry);
 
 			return Ok(false);
@@ -363,6 +372,7 @@ impl PeerTable {
 		let mut state = self.state.lock()?;
 		if let Some(entry) = state.tried.get_mut(&key) {
 			entry.last_probe_ms = now_ms;
+			entry.failures = 0;
 
 			if let Some(peer_id) = peer_id {
 				entry.peer_id = Some(peer_id.to_vec());
@@ -392,7 +402,8 @@ impl PeerTable {
 	///
 	/// Only the new table is pruned here, so dead or foreign addresses cannot
 	/// clog a prefix bucket. Tried residents are never evicted by a transient
-	/// failure. Misbehavior is handled by relay scoring.
+	/// failure; repeated beat failures go through [`Self::record_failure`].
+	/// Misbehavior is handled by relay scoring.
 	pub fn discard(&self, addr: &str) -> Result<(), ClusterError> {
 		let Some(key) = address_key(addr) else {
 			return Ok(());
@@ -400,6 +411,70 @@ impl PeerTable {
 
 		let mut state = self.state.lock()?;
 		if state.new.remove(&key).is_some() {
+			self.persist_snapshot(&state);
+		}
+
+		Ok(())
+	}
+
+	/// Record a failed beat dial of a tried peer.
+	///
+	/// Residents re-verify on every beat, so consecutive failures measure
+	/// liveness. Returns `true` only on an eviction so the caller can emit
+	/// one event per reclaimed peer.
+	///
+	/// - Failures beyond [`MAX_PEER_TRIED_FAILURES`] evict the entry.
+	/// - Eviction frees the prefix bucket slot for a live candidate.
+	/// - The threshold tolerates a transient partition.
+	/// - A verified probe resets the count.
+	/// - Eviction fails closed: the table shrinks toward its anchors, and
+	///   discovery refills it.
+	/// - Anchors never live in tried, so this method ignores an anchor address.
+	///
+	/// # Sources
+	///
+	/// - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
+	///   Bitcoin's peer-to-peer network (feeler probes / tried eviction):
+	///   [USENIX Security '15](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
+	///   [ePrint 2015/263](https://eprint.iacr.org/2015/263)
+	pub fn record_failure(&self, addr: &str) -> Result<bool, ClusterError> {
+		let Some(key) = address_key(addr) else {
+			return Ok(false);
+		};
+
+		let mut state = self.state.lock()?;
+		let Some(entry) = state.tried.get_mut(&key) else {
+			return Ok(false);
+		};
+
+		entry.failures = entry.failures.saturating_add(1);
+		if entry.failures < MAX_PEER_TRIED_FAILURES {
+			return Ok(false);
+		}
+
+		state.tried.remove(&key);
+		self.persist_snapshot(&state);
+
+		Ok(true)
+	}
+
+	/// Remove an address from both learned tables.
+	///
+	/// A probe that answers with a foreign-colony certificate is a
+	/// definitive identity mismatch, not a transient fault.
+	///
+	/// - The address leaves discovery at once.
+	/// - It does not wait out the failure threshold.
+	/// - A re-keyed peer therefore stops receiving advertisements.
+	pub fn expel(&self, addr: &str) -> Result<(), ClusterError> {
+		let Some(key) = address_key(addr) else {
+			return Ok(());
+		};
+
+		let mut state = self.state.lock()?;
+		let from_new = state.new.remove(&key).is_some();
+		let from_tried = state.tried.remove(&key).is_some();
+		if from_new || from_tried {
 			self.persist_snapshot(&state);
 		}
 
@@ -527,7 +602,7 @@ impl PeerTable {
 			return false;
 		}
 
-		let entry = PeerEntry { peer_id: record.peer_id, last_probe_ms: record.last_probe_ms };
+		let entry = PeerEntry { peer_id: record.peer_id, last_probe_ms: record.last_probe_ms, failures: 0 };
 		if record.tried {
 			let within_table = state.tried.len() < MAX_PEER_TABLE_TRIED;
 			let within_bucket = bucket_len(&state.tried, group) < MAX_PEER_BUCKET;
@@ -746,6 +821,72 @@ mod tests {
 		table.discard("10.0.0.1:9000")?;
 		table.discard("10.1.0.1:9000")?;
 		assert_eq!(table.learned()?, (0, 1));
+		Ok(())
+	}
+
+	#[test]
+	fn record_failure_evicts_tried_peer_at_threshold() -> Result<(), ClusterError> {
+		let table = PeerTable::default();
+		table.promote("10.0.0.1:9000", None, 1_000)?;
+
+		let evictions: Vec<bool> = (0..MAX_PEER_TRIED_FAILURES)
+			.map(|_| table.record_failure("10.0.0.1:9000").unwrap_or_default())
+			.collect();
+		assert_eq!(evictions, vec![false, false, true]);
+		assert_eq!(table.learned()?, (0, 0));
+		Ok(())
+	}
+
+	#[test]
+	fn verified_probe_resets_failure_count() -> Result<(), ClusterError> {
+		let table = PeerTable::default();
+		table.promote("10.0.0.1:9000", None, 1_000)?;
+		table.record_failure("10.0.0.1:9000")?;
+		table.record_failure("10.0.0.1:9000")?;
+
+		table.promote("10.0.0.1:9000", None, 2_000)?;
+
+		table.record_failure("10.0.0.1:9000")?;
+		table.record_failure("10.0.0.1:9000")?;
+		assert_eq!(table.learned()?, (0, 1));
+		Ok(())
+	}
+
+	#[test]
+	fn record_failure_ignores_anchors_and_unknown_addresses() -> Result<(), ClusterError> {
+		let table = table_with_anchor("127.0.0.1:9000");
+		let anchor_evicted = table.record_failure("127.0.0.1:9000")?;
+		let unknown_evicted = table.record_failure("10.0.0.1:9000")?;
+		assert!(!anchor_evicted);
+		assert!(!unknown_evicted);
+		Ok(())
+	}
+
+	#[test]
+	fn eviction_frees_the_prefix_bucket_slot() -> Result<(), ClusterError> {
+		let table = PeerTable::default();
+		for host in 0..MAX_PEER_BUCKET {
+			table.promote(&format!("10.0.0.{}:9000", host + 1), None, 1_000)?;
+		}
+		assert!(!table.promote("10.0.9.9:9000", None, 2_000)?);
+
+		for _ in 0..MAX_PEER_TRIED_FAILURES {
+			table.record_failure("10.0.0.1:9000")?;
+		}
+
+		assert!(table.promote("10.0.9.9:9000", None, 3_000)?);
+		Ok(())
+	}
+
+	#[test]
+	fn expel_clears_both_learned_tables() -> Result<(), ClusterError> {
+		let table = PeerTable::default();
+		table.learn(vec![hint("10.0.0.1:9000")])?;
+		table.promote("10.1.0.1:9000", None, 1_000)?;
+
+		table.expel("10.0.0.1:9000")?;
+		table.expel("10.1.0.1:9000")?;
+		assert_eq!(table.learned()?, (0, 0));
 		Ok(())
 	}
 

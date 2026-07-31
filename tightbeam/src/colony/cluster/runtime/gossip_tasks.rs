@@ -14,7 +14,7 @@ use crate::colony::servlet::servlet_runtime::rt;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::instrumentation::events::{
 	CLUSTER_GOSSIP_ACCEPTED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE, CLUSTER_GOSSIP_RELAY_WEAKENED,
-	CLUSTER_PEER_DISCOVERED,
+	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
 };
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
@@ -332,31 +332,29 @@ where
 	let mut client = pool.connect(peer_addr).await?;
 
 	// A feeler probe reconciles on a cold single-flight connection whose
-	// handshake defers to first emit, so warm it before the gate reads
-	// the peer certificate. The gate MUST precede any request emit
-	// (CWE-668), so completing the handshake here is the only way to
-	// learn peer identity without first disclosing the reconcile.
+	// handshake defers to first emit.
+	//
+	// - Warm the lease before the gate reads the peer certificate.
+	// - The gate MUST precede any request emit.
+	// - Completing the handshake here is the only way to learn peer
+	//   identity without first disclosing the reconcile.
+	//
+	// Sources:
+	// - CWE-668, exposure of resource to wrong sphere:
+	//   <https://cwe.mitre.org/data/definitions/668.html>
 	client.complete_handshake().await?;
 
-	// Colony scope gate (CWE-668): peer handshake cert MUST match local colony.
+	// Colony scope gate: peer handshake cert MUST match local colony.
 	let peer_colony = client
 		.peer_certificate()
 		.and_then(|cert| cert_colony_urn(&config.namespace, cert));
 	if peer_colony.as_ref() != config.colony_urn() {
-		// A definitive foreign identity leaves the new table instead of
-		// clogging its prefix bucket with an undialable candidate.
-		let _ = config.peer.table.discard(peer);
+		// A definitive foreign identity leaves both learned tables at once.
+		//
+		// - Waiting out the failure threshold would keep advertising to a
+		//   peer that re-keyed outside the colony.
+		let _ = config.peer.table.expel(peer);
 		return Ok(());
-	}
-
-	// The gate above is the verified probe of the addrman discipline:
-	// this dialed address answered with a same-colony certificate, so
-	// it earns a tried slot and joins the beat/reflood target set.
-	let peer_id = client.peer_certificate().and_then(cert_fingerprint_id);
-	if config.peer.table.promote(peer, peer_id.as_deref(), now)? {
-		if let Ok(event) = trace.event(CLUSTER_PEER_DISCOVERED) {
-			event.with_payload(peer.as_bytes()).emit();
-		}
 	}
 
 	let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held });
@@ -378,17 +376,42 @@ where
 		return Ok(());
 	}
 
+	// The completed round is the verified probe of the addrman discipline.
+	// This dialed address answered a signed reconcile under a same-colony
+	// certificate, so it earns a tried slot and joins the beat/reflood
+	// target set.
+	//
+	// - Promotion waits for the reply: a pooled connection keeps its
+	//   handshake certificate after the peer dies.
+	// - Promoting on the gate alone would reset the failure count every
+	//   beat, and a dead peer could never be evicted.
+	let peer_id = client.peer_certificate().and_then(cert_fingerprint_id);
+	if config.peer.table.promote(peer, peer_id.as_deref(), now)? {
+		if let Ok(event) = trace.event(CLUSTER_PEER_DISCOVERED) {
+			event.with_payload(peer.as_bytes()).emit();
+		}
+	}
+
 	let GossipWant { want, pex } = reply;
 
-	// PEX entries are unverified hints (CWE-345): they enter the capped
-	// new table only, and become dial targets solely through a later
-	// feeler probe that passes the same colony gate as above.
+	// PEX entries are unverified hints.
+	//
+	// - They enter the capped new table only.
+	// - They become dial targets solely through a later feeler probe that
+	//   passes the same colony gate as above.
+	//
+	// Sources:
+	// - CWE-345, insufficient verification of data authenticity:
+	//   <https://cwe.mitre.org/data/definitions/345.html>
 	let hints = pex.into_iter().filter_map(|entry| PeerHint::try_from(entry).ok());
 	let _ = config.peer.table.learn(hints)?;
 
 	let wanted = wanted_digests(&want);
 
-	// Grey-hole: previously acked digest wanted again while retained. One weaken per round.
+	// Grey-hole containment signal.
+	//
+	// - A previously acked digest wanted again while retained is a drop.
+	// - Score at most one weaken per reconciliation round.
 	let dropped = wanted.iter().any(|digest| acked.contains(digest));
 	if dropped {
 		let _ = servlet_registry.weaken_peer_by_dial(peer.as_bytes());
@@ -657,7 +680,7 @@ where
 				// Same-beat anti-entropy; colony members only.
 				if config.colony_urn().is_some() {
 					let acked = push_ledger.entry(peer.clone()).or_default();
-					let _ = reconcile_gossip_async::<P, D>(
+					let round = reconcile_gossip_async::<P, D>(
 						Arc::clone(&pool),
 						Arc::clone(&config),
 						peer_addr,
@@ -667,14 +690,27 @@ where
 						peer,
 					)
 					.await;
+					// A failed round counts toward eviction.
+					//
+					// - A dead tried peer frees its bucket slot after the
+					//   failure threshold.
+					// - Anchors never live in tried, so the count does not
+					//   affect them.
+					if round.is_err() && config.peer.table.record_failure(peer).unwrap_or(false) {
+						if let Ok(event) = trace.event(CLUSTER_PEER_EVICTED) {
+							event.with_payload(peer.as_bytes()).emit();
+						}
+					}
 				}
 			}
 
-			// Feeler probes run reconcile only. The colony gate inside the
-			// round verifies the candidate and promotes it. An unverified
-			// hint never receives the advertised slate. A failed dial
-			// discards the candidate so dead addresses cannot clog a
-			// prefix bucket.
+			// Feeler probes run reconcile only.
+			//
+			// - The colony gate inside the round verifies the candidate and
+			//   promotes it.
+			// - An unverified hint never receives the advertised slate.
+			// - A failed dial discards the candidate so dead addresses cannot
+			//   clog a prefix bucket.
 			if config.colony_urn().is_some() {
 				for peer in probes.iter() {
 					let Ok(peer_addr) = peer.parse::<P::Address>() else {

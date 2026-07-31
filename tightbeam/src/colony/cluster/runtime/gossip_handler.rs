@@ -247,11 +247,18 @@ where
 /// Peer-exchange sample for a reconcile reply.
 ///
 /// Probe-verified peers from the discovery table merge with live peer
-/// routes installed from signed advertisements. Entries are deduped by
-/// dial address and capped at [`MAX_PEX_SAMPLE`] (CWE-770).
+/// routes installed from signed advertisements.
 ///
-/// This gateway verified both sources. The receiver still treats every
-/// entry as an unverified hint until its own probe passes the colony gate.
+/// - Entries are deduped by dial address.
+/// - The sample is capped at [`MAX_PEX_SAMPLE`].
+/// - This gateway verified both sources.
+/// - The receiver still treats every entry as an unverified hint until its
+///   own probe passes the colony gate.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
 #[cfg(feature = "x509")]
 fn pex_sample(config: &ClusterConfig, servlet_registry: &ServletRegistry) -> Vec<PeerGossip> {
 	let verified = config

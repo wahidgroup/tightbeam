@@ -70,3 +70,6 @@ pub(crate) const PEER_PROBE_MEMBER_PROMOTED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-probe-member-promoted");
 pub(crate) const PEER_PROBE_FOREIGN_REFUSED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-probe-foreign-refused");
+pub(crate) const PEER_EVICT_MEMBER_PROMOTED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-evict-member-promoted");
+pub(crate) const PEER_EVICT_TARGET_DROPPED: Urn<'static> = Urn::new("test", "event:cluster/peer-evict-target-dropped");

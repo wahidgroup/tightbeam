@@ -1069,13 +1069,13 @@ pooled_mux! {
 		/// Warm the connection by completing its handshake without
 		/// emitting an application frame.
 		///
-		/// A mux lease already handshook eagerly at dial.
-		/// It therefore returns at once.
+		/// Callers that gate on peer identity before disclosing a request
+		/// drive this first so [`peer_certificate`](Self::peer_certificate)
+		/// is populated.
 		///
-		/// A single-flight lease defers its handshake to the first
-		/// [`emit`](Self::emit). A caller that gates on peer identity
-		/// before disclosing a request drives it here first.
-		/// [`peer_certificate`](Self::peer_certificate) is then populated.
+		/// - A mux lease already handshook eagerly at dial, so it returns at once.
+		/// - A single-flight lease defers its handshake to the first
+		///   [`emit`](Self::emit).
 		pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()> {
 			if self.mux.is_some() {
 				return Ok(());
