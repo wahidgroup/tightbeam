@@ -19,9 +19,6 @@ use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use digest::consts::U32;
-use digest::OutputSizeUser;
-
 use super::ClusterError;
 use crate::asn1::Frame;
 use crate::colony::common::GossipRumor;
@@ -30,7 +27,7 @@ use crate::constants::{
 	DEFAULT_GOSSIP_TTL, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_RATE_SIGNERS,
 	MAX_GOSSIP_TTL,
 };
-use crate::crypto::hash::Digest;
+use crate::crypto::hash::{Digest, OutputSizeUser, U32};
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::utils::urn::Urn;

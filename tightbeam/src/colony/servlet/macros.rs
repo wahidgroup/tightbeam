@@ -14,82 +14,65 @@ macro_rules! __servlet_handlers {
 		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| $duplex_body:block)?
 	) => {{
 		$crate::colony::servlet::ServletHandlers::default()
-			$(
-				.on_unary(move |__frame_in: $crate::Frame, __ctx: ::std::sync::Arc<$crate::colony::servlet::ServletContext>| async move {
-					let $frame = __frame_in;
-					let $ctx = &*__ctx;
-					let __response: ::core::result::Result<
-						::core::option::Option<$crate::Frame>,
-						$crate::TightBeamError,
-					> = $handler_body;
-					__response
-				})
-			)?
-			$(
-				.on_streaming(move |__body_in: $crate::transport::multiplex::StreamBody, __ctx: ::std::sync::Arc<$crate::colony::servlet::ServletContext>| async move {
-					let $sbody = __body_in;
-					let $sctx = &*__ctx;
-					let __response: ::core::result::Result<
-						::core::option::Option<$crate::Frame>,
-						$crate::TightBeamError,
-					> = $stream_body;
-					__response
-				})
-			)?
-			$(
-				.on_duplex(move |__body_in: $crate::transport::multiplex::StreamBody, __reply_in: $crate::transport::multiplex::ReplySink, __ctx: ::std::sync::Arc<$crate::colony::servlet::ServletContext>| async move {
-					let $dbody = __body_in;
-					let $dreply = __reply_in;
-					let $dctx = &*__ctx;
-					let __response: ::core::result::Result<(), $crate::TightBeamError> = $duplex_body;
-					__response
-				})
-			)?
+			$(.on_unary(move |$frame, __ctx| async move {
+				let $ctx = __ctx.as_ref();
+				$handler_body
+			}))?
+			$(.on_streaming(move |$sbody, __ctx| async move {
+				let $sctx = __ctx.as_ref();
+				$stream_body
+			}))?
+			$(.on_duplex(move |$dbody, $dreply, __ctx| async move {
+				let $dctx = __ctx.as_ref();
+				$duplex_body
+			}))?
 	}};
 }
 
-/// Named servlet type that wraps [`ServletRuntime`].
+/// Named servlet wrapper: struct, `Deref` to runtime, [`Servlet`] + [`ServletBox`].
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __servlet_structs {
-	($vis:vis, $servlet_name:ident, $protocol:path, $env_config:ty) => {
+macro_rules! __servlet_define {
+	(
+		$vis:vis,
+		$servlet_name:ident,
+		$protocol:path,
+		$env_config:ty,
+		$input:ty
+		$(, handle: |$frame:ident, $ctx:ident| $handler_body:block)?
+		$(, stream: |$sbody:ident, $sctx:ident| $stream_body:block)?
+		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| $duplex_body:block)?
+	) => {
 		$vis struct $servlet_name {
 			runtime: $crate::colony::servlet::ServletRuntime<$protocol>,
 			_phantom: ::core::marker::PhantomData<$env_config>,
 		}
-	};
-}
 
-/// Inherent `start` and lifecycle methods that forward to the runtime.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __servlet_impl_methods {
-	($vis:vis, $servlet_name:ident, $protocol:path, $input:ty) => {
+		impl ::core::ops::Deref for $servlet_name {
+			type Target = $crate::colony::servlet::ServletRuntime<$protocol>;
+
+			fn deref(&self) -> &Self::Target {
+				&self.runtime
+			}
+		}
+
 		impl $servlet_name {
+			/// Start convenience that does not require the [`Servlet`] trait in scope.
 			#[allow(dead_code)]
 			$vis async fn start(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 				config: Option<$crate::colony::servlet::ServletConfig<$protocol, $input>>,
 			) -> Result<Self, $crate::TightBeamError> {
-				let started = <Self as $crate::colony::servlet::Servlet<$input>>::start(trace, config).await?;
-				Ok(started)
+				<Self as $crate::colony::servlet::Servlet<$input>>::start(trace, config).await
 			}
 
-			#[allow(dead_code)]
-			pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
-				self.runtime.addr().clone()
-			}
-
-			#[allow(dead_code)]
-			pub fn set_trace(&self, trace: ::std::sync::Arc<$crate::trace::TraceCollector>) {
-				self.runtime.set_trace(trace);
-			}
-
+			/// Stop convenience for by-value calls without the [`Servlet`] trait in scope.
 			#[allow(dead_code)]
 			pub fn stop(self) {
 				self.runtime.stop();
 			}
 
+			/// Join convenience; Deref cannot forward by-value [`ServletRuntime::join`].
 			#[allow(dead_code)]
 			#[cfg(feature = "tokio")]
 			pub async fn join(
@@ -104,21 +87,7 @@ macro_rules! __servlet_impl_methods {
 				self.runtime.join()
 			}
 		}
-	};
-}
 
-/// [`Servlet`](crate::colony::servlet::Servlet) impl: handlers then runtime start.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __servlet_trait_impl {
-	(
-		$servlet_name:ident,
-		$protocol:path,
-		$input:ty
-		$(, handle: |$frame:ident, $ctx:ident| $handler_body:block)?
-		$(, stream: |$sbody:ident, $sctx:ident| $stream_body:block)?
-		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| $duplex_body:block)?
-	) => {
 		impl $crate::colony::servlet::Servlet<$input> for $servlet_name {
 			type Conf = $crate::colony::servlet::ServletConfig<$protocol, $input>;
 			type Address = <$protocol as $crate::transport::Protocol>::Address;
@@ -127,7 +96,6 @@ macro_rules! __servlet_trait_impl {
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 				config: Option<Self::Conf>,
 			) -> Result<Self, $crate::TightBeamError> {
-				let servlet_conf = config.unwrap_or_default();
 				let service = $crate::__servlet_handlers!(
 					@arms
 					$(, handle: |$frame, $ctx| $handler_body)?
@@ -136,19 +104,18 @@ macro_rules! __servlet_trait_impl {
 				);
 				let runtime = $crate::colony::servlet::ServletRuntime::<$protocol>::start(
 					trace,
-					servlet_conf,
+					config.unwrap_or_default(),
 					service,
 				)
 				.await?;
-				let servlet = Self {
+				Ok(Self {
 					runtime,
 					_phantom: ::core::marker::PhantomData,
-				};
-				Ok(servlet)
+				})
 			}
 
-			fn addr(&self) -> Self::Address {
-				self.runtime.addr().clone()
+			fn addr(&self) -> &Self::Address {
+				self.runtime.addr()
 			}
 
 			fn stop(self) {
@@ -159,21 +126,14 @@ macro_rules! __servlet_trait_impl {
 				self.runtime.join().await
 			}
 		}
-	};
-}
 
-/// [`ServletBox`](crate::colony::hive::ServletBox) forwarding for hive registration.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __servlet_box_impl {
-	($servlet_name:ident) => {
 		impl $crate::colony::hive::ServletBox for $servlet_name {
 			fn addr_bytes(&self) -> ::std::sync::Arc<[u8]> {
 				self.runtime.addr_bytes()
 			}
 
 			fn stop_boxed(self: Box<Self>) {
-				(*self).stop();
+				self.runtime.stop();
 			}
 
 			fn utilization(&self) -> Option<$crate::utils::BasisPoints> {
@@ -211,7 +171,7 @@ macro_rules! servlet {
 	// No handler arms: refuse at compile time.
 	(
 		$(#[$meta:meta])*
-		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
+		$vis:vis $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path $(,)?
 	) => {
 		::core::compile_error!(
@@ -219,19 +179,10 @@ macro_rules! servlet {
 		);
 	};
 
+	// Typed delivery (public or private).
 	(
 		$(#[$meta:meta])*
-		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
-		protocol: $protocol:path $(,)?
-	) => {
-		::core::compile_error!(
-			"servlet! requires at least one handler arm (`handle:`, `stream:`, or `duplex:`)"
-		);
-	};
-	// Public servlet, typed delivery.
-	(
-		$(#[$meta:meta])*
-		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
+		$vis:vis $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path,
 		handle: |$msg:ident, $frame:ident, $ctx:ident| async move $handler_body:block
 		$(, stream: |$sbody:ident, $sctx:ident| async move $stream_body:block)?
@@ -240,7 +191,7 @@ macro_rules! servlet {
 	) => {
 		$crate::servlet! {
 			$(#[$meta])*
-			pub $servlet_name<$input, EnvConfig = $env_config>,
+			$vis $servlet_name<$input, EnvConfig = $env_config>,
 			protocol: $protocol,
 			handle: raw |$frame, $ctx| async move {
 				let mut $frame = $frame;
@@ -253,35 +204,10 @@ macro_rules! servlet {
 		}
 	};
 
-	// Private servlet, typed delivery.
+	// Raw frame (unary arm optional).
 	(
 		$(#[$meta:meta])*
-		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
-		protocol: $protocol:path,
-		handle: |$msg:ident, $frame:ident, $ctx:ident| async move $handler_body:block
-		$(, stream: |$sbody:ident, $sctx:ident| async move $stream_body:block)?
-		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| async move $duplex_body:block)?
-		$(,)?
-	) => {
-		$crate::servlet! {
-			$(#[$meta])*
-			$servlet_name<$input, EnvConfig = $env_config>,
-			protocol: $protocol,
-			handle: raw |$frame, $ctx| async move {
-				let mut $frame = $frame;
-				$crate::colony::servlet::prepare_typed_frame(&mut $frame, $ctx)?;
-				let $msg: $input = $crate::decode(&$frame.message)?;
-				$handler_body
-			}
-			$(, stream: |$sbody, $sctx| async move $stream_body)?
-			$(, duplex: |$dbody, $dreply, $dctx| async move $duplex_body)?
-		}
-	};
-
-	// Public servlet, raw frame (unary arm optional).
-	(
-		$(#[$meta:meta])*
-		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
+		$vis:vis $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path
 		$(, handle: raw |$frame:ident, $ctx:ident| async move $handler_body:block)?
 		$(, stream: |$sbody:ident, $sctx:ident| async move $stream_body:block)?
@@ -289,42 +215,15 @@ macro_rules! servlet {
 		$(,)?
 	) => {
 		$(#[$meta])*
-		$crate::__servlet_structs!(pub, $servlet_name, $protocol, $env_config);
-
-		$crate::__servlet_impl_methods!(pub, $servlet_name, $protocol, $input);
-		$crate::__servlet_trait_impl!(
+		$crate::__servlet_define!(
+			$vis,
 			$servlet_name,
 			$protocol,
+			$env_config,
 			$input
 			$(, handle: |$frame, $ctx| $handler_body)?
 			$(, stream: |$sbody, $sctx| $stream_body)?
 			$(, duplex: |$dbody, $dreply, $dctx| $duplex_body)?
 		);
-		$crate::__servlet_box_impl!($servlet_name);
-	};
-
-	// Private servlet, raw frame (unary arm optional).
-	(
-		$(#[$meta:meta])*
-		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
-		protocol: $protocol:path
-		$(, handle: raw |$frame:ident, $ctx:ident| async move $handler_body:block)?
-		$(, stream: |$sbody:ident, $sctx:ident| async move $stream_body:block)?
-		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| async move $duplex_body:block)?
-		$(,)?
-	) => {
-		$(#[$meta])*
-		$crate::__servlet_structs!(, $servlet_name, $protocol, $env_config);
-
-		$crate::__servlet_impl_methods!(pub, $servlet_name, $protocol, $input);
-		$crate::__servlet_trait_impl!(
-			$servlet_name,
-			$protocol,
-			$input
-			$(, handle: |$frame, $ctx| $handler_body)?
-			$(, stream: |$sbody, $sctx| $stream_body)?
-			$(, duplex: |$dbody, $dreply, $dctx| $duplex_body)?
-		);
-		$crate::__servlet_box_impl!($servlet_name);
 	};
 }

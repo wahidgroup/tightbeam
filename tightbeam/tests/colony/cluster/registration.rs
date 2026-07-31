@@ -210,11 +210,11 @@ tb_scenario! {
 			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			let hive_conf = HiveConfig {
+			let mut hive_conf = HiveConfig {
 				trust_store: Some(Arc::clone(&certs.trust)),
-				reregister_interval: Some(Duration::from_millis(50)),
 				..Default::default()
 			};
+			hive_conf.control.reregister_interval = Some(Duration::from_millis(50));
 
 			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
 			hive.establish(Arc::new(trace.share())).await?;
@@ -378,6 +378,7 @@ tb_scenario! {
 				registration_request(hive_addr),
 			)
 			.await?;
+
 			let response_frame = emit_frame(&mut client, ok_reg).await?;
 			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
@@ -386,6 +387,7 @@ tb_scenario! {
 				vec![servlet_info_mismatched("ping", b"127.0.0.1:65102", b"127.0.0.1:65198")],
 				vec![],
 			);
+
 			let refused_update = signed_control_frame(&certs, b"misalign-update", bad_add).await?;
 			let response_frame = emit_frame(&mut client, refused_update).await?;
 			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;

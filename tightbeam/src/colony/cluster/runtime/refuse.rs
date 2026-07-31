@@ -24,13 +24,13 @@ pub(crate) fn refuse_gossip(
 	status: TransitStatus,
 ) -> Result<Option<Frame>, TightBeamError> {
 	gossip_refused_event(frame, trace);
-	reply_frame(frame.metadata.id.clone(), crate::colony::common::GossipResponse { status })
+	reply_frame(&frame.metadata.id, crate::colony::common::GossipResponse { status })
 }
 
 pub(crate) fn refuse_reconcile(frame: &Frame, trace: &TraceCollector) -> Result<Option<Frame>, TightBeamError> {
 	gossip_refused_event(frame, trace);
 	reply_frame(
-		frame.metadata.id.clone(),
+		&frame.metadata.id,
 		crate::colony::common::GossipWant { want: Vec::new() },
 	)
 }
@@ -42,7 +42,7 @@ pub(crate) fn refuse_peer_ad(
 ) -> Result<Option<Frame>, TightBeamError> {
 	let _ = trace.event(crate::instrumentation::events::CLUSTER_PEER_ADVERTISE_REFUSED);
 	reply_frame(
-		frame.metadata.id.clone(),
+		&frame.metadata.id,
 		crate::colony::common::PeerAdvertisementResponse { status },
 	)
 }

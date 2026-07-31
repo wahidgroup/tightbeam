@@ -163,15 +163,9 @@ tb_scenario! {
 	environment Hive {
 		context: hive_tls(),
 		start: |SetupEnv { trace, context: tls }| async move {
-			establish_registered_hive(
-				&trace,
-				Some(HiveConfig {
-					hive_tls: Some(tls),
-					mux_offer: Some(TransportOffer::mux(4)),
-					..Default::default()
-				}),
-			)
-			.await
+			let mut conf = HiveConfig { hive_tls: Some(tls), ..Default::default() };
+			conf.pool.mux_offer = Some(TransportOffer::mux(4));
+			establish_registered_hive(&trace, Some(conf)).await
 		},
 		client: |HiveEnv { hive, .. }| async move {
 			hive.stop();
@@ -380,16 +374,10 @@ tb_scenario! {
 	environment Hive {
 		context: trusted_signer("CN=Hive Gate Cluster"),
 		start: |SetupEnv { trace, context: signer }| async move {
-			start_trusted_hive(
-				&trace,
-				&signer,
-				HiveConfig {
-					circuit_breaker_threshold: 1,
-					circuit_breaker_cooldown_ms: 60_000,
-					..Default::default()
-				},
-			)
-			.await
+			let mut conf = HiveConfig::default();
+			conf.control.circuit_breaker_threshold = 1;
+			conf.control.circuit_breaker_cooldown_ms = 60_000;
+			start_trusted_hive(&trace, &signer, conf).await
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive).await?;
@@ -468,15 +456,10 @@ tb_scenario! {
 		// Threshold zero: idle utilization already saturates the gate,
 		// so every manage command sees the backpressure verdict.
 		start: |SetupEnv { trace, context: signer }| async move {
-			start_trusted_hive(
-				&trace,
-				&signer,
-				HiveConfig {
-					backpressure_threshold: BasisPoints::default(),
-					..Default::default()
-				},
-			)
-			.await
+			let mut conf = HiveConfig::default();
+			conf.control.backpressure_threshold = BasisPoints::default();
+
+			start_trusted_hive(&trace, &signer, conf).await
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive).await?;

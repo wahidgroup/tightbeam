@@ -46,14 +46,14 @@ where
 	D: ClusterDigest,
 {
 	if let Err(status) = evaluate_gates(&frame, &session, &ctx.config, &ctx.trace) {
-		return reply_frame(frame.metadata.id.clone(), ClusterWorkResponse::err(status));
+		return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(status));
 	}
 
 	let cluster_request = match decode::<ClusterRequest>(&frame.message) {
 		Ok(request) => request,
 		Err(_) => {
 			return reply_frame(
-				frame.metadata.id.clone(),
+				&frame.metadata.id,
 				ClusterWorkResponse::err(TransitStatus::PermissionDenied),
 			);
 		}

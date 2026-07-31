@@ -926,7 +926,7 @@ tb_scenario! {
 				.with_worker(rover_frame_response_handler_worker)
 				.build();
 			let rover_servlet = RoverServlet::start(Arc::clone(&trace), Some(rover_servlet_conf)).await?;
-			let rover_addr = rover_servlet.addr();
+			let rover_addr = rover_servlet.addr().to_owned();
 
 			// Store rover address
 			config.rover_addr.write()?.replace(rover_addr);
@@ -976,7 +976,7 @@ tb_scenario! {
 				.build();
 			let mars_relay_servlet_conf = Some(mars_relay_servlet_conf);
 			let mars_relay_servlet = MarsRelaySatelliteServlet::start(Arc::clone(&trace), mars_relay_servlet_conf).await?;
-			let mars_relay_addr = mars_relay_servlet.addr();
+			let mars_relay_addr = mars_relay_servlet.addr().to_owned();
 
 			// Store Mars Relay servlet and address
 			config._mars_relay_servlet.write()?.replace(mars_relay_servlet);
@@ -1026,7 +1026,7 @@ tb_scenario! {
 				.build();
 			let earth_relay_servlet_conf = Some(earth_relay_servlet_conf);
 			let earth_relay_servlet = EarthRelaySatelliteServlet::start(Arc::clone(&trace), earth_relay_servlet_conf).await?;
-			let earth_relay_addr = earth_relay_servlet.addr();
+			let earth_relay_addr = earth_relay_servlet.addr().to_owned();
 
 			// Update Mars Relay's earth_relay_addr
 			*mars_earth_relay_addr.write()? = Some(earth_relay_addr);
@@ -1073,7 +1073,7 @@ tb_scenario! {
 				.with_worker(command_ack_handler_worker)
 				.build();
 			let mc_servlet = MissionControlServlet::start(Arc::clone(&trace), Some(mc_servlet_conf)).await?;
-			let mc_addr = mc_servlet.addr();
+			let mc_addr = mc_servlet.addr().to_owned();
 
 			// Update Earth Relay's mission_control_addr
 			*earth_mission_control_addr.write()? = Some(mc_addr);

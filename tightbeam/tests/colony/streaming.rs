@@ -67,6 +67,7 @@ servlet! {
 		let bytes = body.into_bytes().await?;
 		let label = bytes.len().to_string();
 		let frame = reply_frame(&label)?;
+
 		Ok(Some(frame))
 	},
 	duplex: |body, reply, ctx| async move {
@@ -76,6 +77,7 @@ servlet! {
 		while let Some(chunk) = body.chunk().await? {
 			reply.push(&chunk).await?;
 		}
+
 		Ok(())
 	}
 }
@@ -148,6 +150,7 @@ tb_scenario! {
 			let request = reply_frame("unary-body")?;
 			let reply = client.emit(request.to_owned(), None).await?;
 			let value = reply.map(|frame| frame.message.to_owned()) == Some(request.message.to_owned());
+
 			trace.event_with(UNARY_ECHOES, &[], value)?;
 
 			// Streaming: 8 bytes pushed, servlet reports "8"
@@ -158,6 +161,7 @@ tb_scenario! {
 			let reply = response.await?;
 			let expected = reply_frame("8")?;
 			let value = reply.map(|frame| frame.message.to_owned()) == Some(expected.message.to_owned());
+
 			trace.event_with(STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
 
 			// Duplex: chunks echo back in order
@@ -173,6 +177,7 @@ tb_scenario! {
 			let value = first.as_deref() == Some(b"ping-1".as_slice())
 				&& second.as_deref() == Some(b"ping-2".as_slice())
 				&& trailer.is_none();
+
 			trace.event_with(DUPLEX_ECHOES_CHUNKS, &[], value)?;
 
 			Ok(())
@@ -193,6 +198,7 @@ servlet! {
 		let bytes = body.into_bytes().await?;
 		let label = bytes.len().to_string();
 		let frame = reply_frame(&label)?;
+
 		Ok(Some(frame))
 	}
 }
@@ -229,6 +235,7 @@ tb_scenario! {
 				client.emit(request, None).await,
 				Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
 			);
+
 			trace.event_with(STREAM_ONLY_UNARY_REFUSED, &[], unary_refused)?;
 
 			let (mut sink, response) = client.open_stream()?;
@@ -238,6 +245,7 @@ tb_scenario! {
 			let reply = response.await?;
 			let expected = reply_frame("5")?;
 			let value = reply.map(|frame| frame.message.to_owned()) == Some(expected.message.to_owned());
+
 			trace.event_with(STREAM_ONLY_REPLY_OK, &[], value)?;
 
 			Ok(())
@@ -277,11 +285,8 @@ async fn start_streaming_hive(
 	let servlet = StreamingEchoServlet::start(Arc::clone(&trace), config).await?;
 
 	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let conf = HiveConfig {
-		trust_store: Some(trust_store),
-		mux_offer: Some(TransportOffer::mux(8)),
-		..Default::default()
-	};
+	let mut conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
+	conf.pool.mux_offer = Some(TransportOffer::mux(8));
 
 	let mut hive = StreamingHive::new(Some(conf))?;
 	hive.register(stream_echo_urn(), servlet, |t| StreamingEchoServlet::start(t, None))?;
@@ -323,6 +328,7 @@ tb_scenario! {
 			let reply_bytes = response.await?;
 			let label: StreamLabel = decode(&reply_bytes)?;
 			let value = label.label == "9";
+
 			trace.event_with(HIVE_STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
 
 			hive.stop();
@@ -361,6 +367,7 @@ tb_scenario! {
 			sink.push(b"hive-1").await?;
 
 			let first = body.chunk().await?;
+
 			sink.close_with(b"hive-2").await?;
 
 			let second = body.chunk().await?;
@@ -369,6 +376,7 @@ tb_scenario! {
 			let value = first.as_deref() == Some(b"hive-1".as_slice())
 				&& second.as_deref() == Some(b"hive-2".as_slice())
 				&& trailer.is_none();
+
 			trace.event_with(HIVE_DUPLEX_ECHOES_CHUNKS, &[], value)?;
 
 			hive.stop();

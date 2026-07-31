@@ -45,7 +45,7 @@ fn work_trail_fail(
 ) -> Result<Option<Frame>, TightBeamError> {
 	work_trail_weaken(servlet_registry, route_key, config, trace);
 	reply_frame(
-		frame.metadata.id.clone(),
+		&frame.metadata.id,
 		crate::colony::cluster::ClusterWorkResponse::err(status),
 	)
 }
@@ -75,7 +75,7 @@ where
 {
 	let addr_str =
 		core::str::from_utf8(&addr).map_err(|_| crate::colony::cluster::ClusterError::InvalidAddress(addr.to_vec()))?;
-	let parsed_addr = addr_str
+	let parsed_addr: P::Address = addr_str
 		.parse()
 		.map_err(|_| crate::colony::cluster::ClusterError::InvalidAddress(addr.to_vec()))?;
 
@@ -141,7 +141,7 @@ where
 	if !crate::colony::common::is_bare_servlet_type(&config.namespace, &request.servlet_type) {
 		let _ = trace.event(crate::instrumentation::events::CLUSTER_WORK_REFUSED);
 		return reply_frame(
-			frame.metadata.id.clone(),
+			&frame.metadata.id,
 			crate::colony::cluster::ClusterWorkResponse::err(crate::policy::TransitStatus::PermissionDenied),
 		);
 	}
@@ -164,7 +164,7 @@ where
 		_ => {
 			let _ = trace.event(crate::instrumentation::events::CLUSTER_WORK_UNAVAILABLE);
 			return reply_frame(
-				frame.metadata.id.clone(),
+				&frame.metadata.id,
 				crate::colony::cluster::ClusterWorkResponse::err(crate::policy::TransitStatus::Unavailable),
 			);
 		}
@@ -183,7 +183,7 @@ where
 		None => {
 			let _ = trace.event(crate::instrumentation::events::CLUSTER_WORK_UNAVAILABLE);
 			return reply_frame(
-				frame.metadata.id.clone(),
+				&frame.metadata.id,
 				crate::colony::cluster::ClusterWorkResponse::err(crate::policy::TransitStatus::Unavailable),
 			);
 		}
@@ -217,7 +217,7 @@ where
 			crate::colony::cluster::RouteKind::Local => {
 				work_trail_ok(&servlet_registry, &route_key, &config, &trace);
 				reply_frame(
-					frame.metadata.id.clone(),
+					&frame.metadata.id,
 					crate::colony::cluster::ClusterWorkResponse::ok(response_payload),
 				)
 			}
@@ -233,7 +233,7 @@ where
 							work_trail_weaken(&servlet_registry, &route_key, &config, &trace);
 						}
 
-						reply_frame(frame.metadata.id.clone(), peer_response)
+						reply_frame(&frame.metadata.id, peer_response)
 					}
 					Err(_) => work_trail_fail(
 						&servlet_registry,

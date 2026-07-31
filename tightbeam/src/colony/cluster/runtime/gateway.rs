@@ -139,6 +139,7 @@ where
 				let validators: Vec<_> = config.tls.client_validators.iter().map(Arc::clone).collect();
 				encryption_config = encryption_config.with_client_validators(validators);
 			}
+
 			P::bind_with(bind_addr, encryption_config).await.map_err(protocol_error)?
 		};
 
@@ -184,7 +185,8 @@ where
 		#[cfg(feature = "x509")]
 		let advertise_handle = {
 			let advertise_pool = peer_dial_pool(&peer_pool, &pool);
-			let gateway_addr: Vec<u8> = addr.clone().into();
+			let gateway_bytes: Vec<u8> = addr.clone().into();
+			let gateway_addr: Arc<[u8]> = Arc::from(gateway_bytes);
 			Some(build_advertise_task::<P, D>(
 				Arc::clone(&servlet_registry),
 				advertise_pool,
@@ -212,21 +214,21 @@ where
 		})
 	}
 
-	fn addr(&self) -> Self::Address {
-		self.addr.clone()
+	fn addr(&self) -> &Self::Address {
+		&self.addr
 	}
 
-	fn available_servlets(&self) -> Vec<Vec<u8>> {
+	fn available_servlets(&self) -> Vec<crate::colony::cluster::SharedId> {
 		self.registry.to_available_servlets().unwrap_or_default()
 	}
 
-	fn peer_servlets(&self) -> Vec<Vec<u8>> {
-		let mut types: Vec<Vec<u8>> = self
+	fn peer_servlets(&self) -> Vec<crate::colony::cluster::SharedId> {
+		let mut types: Vec<crate::colony::cluster::SharedId> = self
 			.servlet_registry
 			.peer_entries()
 			.unwrap_or_default()
 			.into_iter()
-			.map(|entry| entry.servlet_type().to_vec())
+			.map(|entry| Arc::clone(entry.servlet_type()))
 			.collect();
 		types.sort_unstable();
 		types.dedup();

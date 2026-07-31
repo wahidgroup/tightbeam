@@ -609,17 +609,17 @@ where
 
 	/// Lease a ready connection or open a fresh one, held exclusively.
 	#[cfg(feature = "x509")]
-	async fn connect_single_flight(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
+	async fn connect_single_flight(self: &Arc<Self>, addr: &P::Address) -> TransportResult<PooledClient<P, C>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport:
 			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
-		if let Some(client) = self.try_take_ready_client(&addr)? {
-			return Ok(self.wrap_client(client, addr));
+		if let Some(client) = self.try_take_ready_client(addr)? {
+			return Ok(self.wrap_client(client, addr.clone()));
 		}
 
-		let mut reservation = self.reserve_slot(&addr)?;
+		let mut reservation = self.reserve_slot(addr)?;
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 
 		let mut transport = self.tls.apply::<P>(P::create_transport(stream));
@@ -639,7 +639,7 @@ where
 
 		reservation.disarm();
 
-		Ok(self.wrap_client(client, addr))
+		Ok(self.wrap_client(client, addr.clone()))
 	}
 
 	#[cfg(all(
@@ -657,7 +657,7 @@ where
 		P::Transport:
 			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
-		self.connect_single_flight(addr).await
+		self.connect_single_flight(&addr).await
 	}
 
 	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, C>>>
@@ -695,34 +695,48 @@ pooled_mux! {
 	{
 		/// Connect to a destination, multiplexing when
 		/// [`PoolConfig::mux_offer`] is set and the peer accepts.
-		pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>> {
-			let offer = match &self.config.mux_offer {
-				Some(offer) => offer.to_owned(),
-				None => return self.connect_single_flight(addr).await,
-			};
+		pub async fn connect(
+			self: &Arc<Self>,
+			addr: impl core::borrow::Borrow<P::Address>,
+		) -> TransportResult<PooledClient<P, C>>
+		where
+			P::Address: Clone,
+		{
+			let addr = addr.borrow();
+			if self.config.mux_offer.is_none() {
+				return self.connect_single_flight(addr).await;
+			}
 
-			self.acquire_mux(addr, offer, MuxSelection::PreferHeadroom).await
+			self.acquire_mux(addr, MuxSelection::PreferHeadroom).await
 		}
 
 		/// The acquisition funnel for every mux-offering caller: a pooled mux
 		/// entry, then an idle exclusive connection left over from a peer that
 		/// declined the mux offer at handshake, then a fresh dial. Selection
 		/// policy lives here alone so no caller can skip a reuse tier.
+		///
+		/// Address and mux offer are cloned only on wrap or fresh dial.
 		async fn acquire_mux(
 			self: &Arc<Self>,
-			addr: P::Address,
-			offer: TransportOffer,
+			addr: &P::Address,
 			selection: MuxSelection,
 		) -> TransportResult<PooledClient<P, C>> {
-			if let Some(lease) = self.try_take_mux_handle(&addr, selection)? {
-				return Ok(self.wrap_mux_client(lease, addr));
+			if let Some(lease) = self.try_take_mux_handle(addr, selection)? {
+				return Ok(self.wrap_mux_client(lease, addr.clone()));
 			}
 
-			if let Some(client) = self.try_take_ready_client(&addr)? {
-				return Ok(self.wrap_client(client, addr));
+			if let Some(client) = self.try_take_ready_client(addr)? {
+				return Ok(self.wrap_client(client, addr.clone()));
 			}
 
-			self.open_mux_connection(addr, offer).await
+			let offer = match &self.config.mux_offer {
+				Some(offer) => offer.to_owned(),
+				None => {
+					return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
+				}
+			};
+
+			self.open_mux_connection(addr.clone(), offer).await
 		}
 
 		/// Open a fresh connection with a mux offer, falling back to an
@@ -1092,18 +1106,17 @@ pooled_mux! {
 		/// Cap-exhaustion failover: move the lease through the acquisition
 		/// funnel (pooled headroom before a fresh dial) and retry there once.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-			let offer = match &self.pool.config.mux_offer {
-				Some(offer) => offer.to_owned(),
+			if self.pool.config.mux_offer.is_none() {
 				// A mux lease exists only when an offer is configured
-				None => return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)),
-			};
+				return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
+			}
 
 			#[cfg(feature = "instrument")]
 			self.pool.emit_event(events::POOL_FAILOVER);
 
 			*self = self
 				.pool
-				.acquire_mux(self.addr.clone(), offer, MuxSelection::RequireHeadroom)
+				.acquire_mux(&self.addr, MuxSelection::RequireHeadroom)
 				.await?;
 
 			match self.mux.as_ref() {

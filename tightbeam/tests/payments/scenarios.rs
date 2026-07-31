@@ -208,10 +208,10 @@ tb_scenario! {
 			let servlet = AuthorizationServlet::start(Arc::clone(&servlet_trace), Some(servlet_conf)).await?;
 
 			// Create and establish hive
-			let mut hive = PaymentProcessorHive::new(Some(HiveConfig {
-				mux_offer: Some(TransportOffer::mux(8)),
-				..hive_tls_config(&certs)
-			}))?;
+			let mut hive_conf = hive_tls_config(&certs);
+			hive_conf.pool.mux_offer = Some(TransportOffer::mux(8));
+
+			let mut hive = PaymentProcessorHive::new(Some(hive_conf))?;
 			hive.register(authorization_urn(), servlet, |t| AuthorizationServlet::start(t, None))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 

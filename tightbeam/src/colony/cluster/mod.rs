@@ -12,14 +12,13 @@ pub mod registry;
 pub mod runtime;
 pub mod servlet_registry;
 
+#[cfg(feature = "x509")]
+#[doc(hidden)]
+pub mod gossip;
 #[doc(hidden)]
 pub mod outbound;
 #[doc(hidden)]
 pub mod peer;
-
-#[cfg(feature = "x509")]
-#[doc(hidden)]
-pub mod gossip;
 
 pub use builder::{ClusterConfigBuilder, HeartbeatConfigBuilder};
 pub use error::ClusterError;
@@ -302,14 +301,14 @@ pub trait Cluster: Sized + Send + Sync {
 		config: ClusterConfig,
 	) -> impl Future<Output = Result<Self, crate::TightBeamError>> + Send;
 
-	/// Gateway listen address
-	fn addr(&self) -> Self::Address;
+	/// Gateway listen address (borrowed; no clone).
+	fn addr(&self) -> &Self::Address;
 
 	/// Servlet types available from registered local hives
-	fn available_servlets(&self) -> Vec<Vec<u8>>;
+	fn available_servlets(&self) -> Vec<SharedId>;
 
 	/// Servlet types reachable through peer gateways (learned, not local)
-	fn peer_servlets(&self) -> Vec<Vec<u8>>;
+	fn peer_servlets(&self) -> Vec<SharedId>;
 
 	/// Learned peer routes with dial address and peer identity
 	fn peer_routes(&self) -> Vec<PeerRouteInfo>;

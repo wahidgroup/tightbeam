@@ -184,9 +184,9 @@ tb_scenario! {
 			let mut peers = cluster.peer_servlets();
 			peers.sort_unstable();
 
-			let mut expected = vec![
-				type_canonical_bytes(&servlet_urn("ping")),
-				type_canonical_bytes(&servlet_urn("echo")),
+			let mut expected: Vec<std::sync::Arc<[u8]>> = vec![
+				std::sync::Arc::from(type_canonical_bytes(&servlet_urn("ping"))),
+				std::sync::Arc::from(type_canonical_bytes(&servlet_urn("echo"))),
 			];
 			expected.sort_unstable();
 
@@ -268,10 +268,12 @@ tb_scenario! {
 
 			let survivors = cluster.peer_servlets();
 			trace.event_with(PEER_ROUTES_AFTER_WITHDRAWAL, &[], survivors.len() as u64)?;
+
+			let ping_type = type_canonical_bytes(&servlet_urn("ping"));
 			trace.event_with(
 				PEER_PING_LIVE_AFTER_WITHDRAWAL,
 				&[],
-				u64::from(survivors.contains(&type_canonical_bytes(&servlet_urn("ping")))),
+				u64::from(survivors.iter().any(|servlet_type| servlet_type.as_ref() == ping_type.as_slice())),
 			)?;
 
 			cluster.stop();
@@ -892,7 +894,9 @@ tb_scenario! {
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
 			let ping_canonical = type_canonical_bytes(&servlet_urn("ping"));
-			let keyed = learned.first().is_some_and(|learned_type| *learned_type == ping_canonical);
+			let keyed = learned
+				.first()
+				.is_some_and(|learned_type| learned_type.as_ref() == ping_canonical.as_slice());
 			trace.event_with(PEER_PING_TYPE_LEARNED, &[], u64::from(keyed))?;
 
 			advertiser.stop();

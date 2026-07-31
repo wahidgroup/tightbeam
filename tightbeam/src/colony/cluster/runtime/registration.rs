@@ -34,7 +34,7 @@ pub(crate) async fn handle_register(
 	if origin_status != TransitStatus::Ok {
 		let _ = trace.event(CLUSTER_REGISTER_REFUSED);
 		return reply_frame(
-			frame.metadata.id.clone(),
+			&frame.metadata.id,
 			RegisterHiveResponse { status: origin_status, hive_id: None },
 		);
 	}
@@ -43,7 +43,7 @@ pub(crate) async fn handle_register(
 	if freshness_status != TransitStatus::Ok {
 		let _ = trace.event(CLUSTER_REGISTER_REFUSED);
 		return reply_frame(
-			frame.metadata.id.clone(),
+			&frame.metadata.id,
 			RegisterHiveResponse { status: freshness_status, hive_id: None },
 		);
 	}
@@ -61,7 +61,7 @@ pub(crate) async fn handle_register(
 	if !urns_valid {
 		let _ = trace.event(CLUSTER_REGISTER_REFUSED);
 		return reply_frame(
-			frame.metadata.id.clone(),
+			&frame.metadata.id,
 			RegisterHiveResponse { status: TransitStatus::PermissionDenied, hive_id: None },
 		);
 	}
@@ -73,7 +73,7 @@ pub(crate) async fn handle_register(
 	let Some(hive_identity) = hive_identity else {
 		let _ = trace.event(CLUSTER_REGISTER_REFUSED);
 		return reply_frame(
-			frame.metadata.id.clone(),
+			&frame.metadata.id,
 			RegisterHiveResponse { status: TransitStatus::PermissionDenied, hive_id: None },
 		);
 	};
@@ -141,7 +141,7 @@ pub(crate) async fn handle_register(
 		}
 	};
 
-	reply_frame(frame.metadata.id.clone(), response)
+	reply_frame(&frame.metadata.id, response)
 }
 
 /// Handle servlet address updates: hive-origin, freshness, signer bind, apply delta.
@@ -158,7 +158,7 @@ pub(crate) async fn handle_address_update(
 	if origin_status != TransitStatus::Ok {
 		let _ = trace.event(CLUSTER_UPDATE_REFUSED);
 		return reply_frame(
-			frame.metadata.id.clone(),
+			&frame.metadata.id,
 			ServletAddressUpdateResponse { status: origin_status },
 		);
 	}
@@ -167,7 +167,7 @@ pub(crate) async fn handle_address_update(
 	if freshness_status != TransitStatus::Ok {
 		let _ = trace.event(CLUSTER_UPDATE_REFUSED);
 		return reply_frame(
-			frame.metadata.id.clone(),
+			&frame.metadata.id,
 			ServletAddressUpdateResponse { status: freshness_status },
 		);
 	}
@@ -196,7 +196,7 @@ pub(crate) async fn handle_address_update(
 		_ => {
 			let _ = trace.event(CLUSTER_UPDATE_REFUSED);
 			return reply_frame(
-				frame.metadata.id.clone(),
+				&frame.metadata.id,
 				ServletAddressUpdateResponse { status: TransitStatus::PermissionDenied },
 			);
 		}
@@ -219,7 +219,7 @@ pub(crate) async fn handle_address_update(
 
 			let _ = trace.event(CLUSTER_UPDATE_REFUSED);
 			return reply_frame(
-				frame.metadata.id.clone(),
+				&frame.metadata.id,
 				ServletAddressUpdateResponse { status: TransitStatus::PermissionDenied },
 			);
 		}
@@ -257,5 +257,5 @@ pub(crate) async fn handle_address_update(
 		}
 	};
 
-	reply_frame(frame.metadata.id.clone(), ServletAddressUpdateResponse { status })
+	reply_frame(&frame.metadata.id, ServletAddressUpdateResponse { status })
 }

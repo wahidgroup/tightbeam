@@ -222,9 +222,10 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 impl<P: Protocol + Send, C: CryptoProvider + 'static> ClientBuilder<P, C>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
-	P::Address: Send,
+	P::Address: Clone + Send,
 {
-	pub async fn connect(self, addr: P::Address) -> TransportResult<GenericClient<P>> {
+	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
+		let addr = addr.borrow().clone();
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let transport = P::create_transport(stream);
 		let configured = self.policies.apply::<P>(transport);
@@ -237,9 +238,10 @@ where
 impl<P: Protocol + Send, C: CryptoProvider + Send + Sync + 'static> ClientBuilder<P, C>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
-	P::Address: Send,
+	P::Address: Clone + Send,
 {
-	pub async fn connect(self, addr: P::Address) -> TransportResult<GenericClient<P>> {
+	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
+		let addr = addr.borrow().clone();
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let mut transport = P::create_transport(stream);
 		if let Some(store) = self.trust_store {

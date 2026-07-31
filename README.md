@@ -2275,7 +2275,7 @@ let server_handle = server! {
 ```
 
 - `with_mux_offer` takes an `Option<TransportOffer>`. `None` advertises nothing.
-- `servlet!`, `hive!`, and `cluster!` servers inherit the branch through their `server!` delegation. `HiveConfig::mux_offer` and `ClusterConfig::pool_config.mux_offer` carry the advertisement to their listeners and pools.
+- `servlet!`, `hive!`, and `cluster!` servers inherit the branch through their `server!` delegation. `HiveConfig::pool.mux_offer` and `ClusterConfig::pool_config.mux_offer` carry the advertisement to their listeners and pools.
 - The sync (`std`-thread) serving path never multiplexes. Mux drivers need an async executor.
 - Serving mux requires `transport-multiplex` (plus `x509`, `tokio`, `transport-policy`). A server built without it never advertises and keeps serving single-flight peers.
 
@@ -2627,6 +2627,16 @@ let servlet_conf = ServletConfig::<TokioListener, RequestMessage>::builder()
 PingPongServletWithWorker::start(trace, Some(servlet_conf)).await?
 ```
 
+**Macro-free path**
+
+`servlet!` wraps `ServletRuntime`. Without the macro:
+
+1. Build handlers with `ServletHandlers` (typed unary via `on_typed_unary` or `dispatch_typed_unary`).
+2. Call `ServletRuntime::start(trace, servlet_conf, handlers)`.
+3. For APIs bounded on `Servlet<I>`, pass `RuntimeServletConf { config, service }` into `Servlet::start`.
+
+Omitting `with_config` defaults the servlet env to `()`.
+
 **Worker Lifecycle**
 
 Workers follow a two-phase lifecycle:
@@ -2738,7 +2748,7 @@ Hives support two operating modes:
 
 **Single-Servlet Mode** lets a hive "morph" between servlet types. The cluster sends an `ActivateServletRequest`. The hive stops its current servlet and starts the requested one. That supports dynamic workload reallocation--for example switching from "analysis" to "calculation" based on cluster demand.
 
-**Multi-Servlet Mode** runs all registered servlets at once, each on a different port. That requires a "mycelial" protocol (like TCP) which supports multiple endpoints. Call `establish_hive()` to spawn all servlets, then register with a cluster to advertise capabilities.
+**Multi-Servlet Mode** runs all registered servlets at once, each on a different port. That requires a "mycelial" protocol (like TCP) which supports multiple endpoints. Call `establish(trace)` after `register` to spawn registered servlets, then register with a cluster to advertise capabilities.
 
 The protocol's capabilities select the mode. On mycelial protocols, multi-servlet mode usually gives the best throughput.
 
@@ -2750,49 +2760,37 @@ Non-mycelial protocols (like in-memory channels) stay in single-servlet mode.
 
 ##### The `hive!` Macro
 
-Define a hive type with its available servlets:
+`hive!` names a type alias of `HiveRuntime<P>`. Register servlets at runtime:
 
 ```rust
 hive! {
 	pub MyHive,
-	protocol: TokioListener,
-	servlets: {
-		ping: PingServlet<PingRequest>,
-		calc: CalculatorServlet<CalcRequest>
-	}
+	protocol: TokioListener
 }
+
+// Equivalent without the macro:
+// type MyHive = HiveRuntime<TokioListener>;
 ```
 
-Add security policies to gate incoming messages:
-
-```rust
-hive! {
-	pub SecureHive,
-	protocol: TokioListener,
-	policies: {
-		with_collector_gate: [SignatureGate::new(verifying_key)]
-	},
-	servlets: {
-		ping: PingServlet<PingRequest>
-	}
-}
-```
+Collector gates for the control plane live on the hive accept path (not in the macro). Attach them when you configure the control server / trust path for your deployment.
 
 ##### Hive Lifecycle
 
 A typical hive lifecycle with cluster integration:
 
 ```rust
-// 1. Start the hive
-let mut hive = MyHive::start(trace, Some(HiveConfig::default())).await?;
+// 1. Construct the hive (does not bind yet)
+let mut hive = MyHive::new(Some(HiveConfig::default()))?;
 
-// 2. Establish multi-servlet mode (spawns all servlets on separate ports)
-hive.establish_hive().await?;
+// 2. Register servlet types with spawners for auto-scale
+hive.register(ping_urn(), ping_servlet, |t| PingServlet::start(t, None))?;
+hive.register(calc_urn(), calc_servlet, |t| CalculatorServlet::start(t, None))?;
 
-// 3. Register with cluster (announces available servlet types)
-let response = hive.register_with_cluster(cluster_addr).await?;
+// 3. Establish: bind control plane and spawn registered servlets
+hive.establish(trace).await?;
 
-// 4. Hive now receives work routed by the cluster
+// 4. Announce servlet slate to a cluster gateway
+hive.register_with_cluster(&cluster_addr).await?;
 
 // 5. Clean shutdown
 hive.stop();
@@ -2811,7 +2809,7 @@ let hive_conf = HiveConfig {
 
 Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores) for building trust stores from cluster certificates.
 
-Signed commands are additionally checked for freshness: each `ClusterCommand` carries an `issued_at_ms` timestamp, and the hive rejects commands outside `command_freshness_window_ms` of its clock or whose signature was already seen inside that window (replay protection).
+Signed commands are additionally checked for freshness: each `ClusterCommand` carries an `issued_at_ms` timestamp, and the hive rejects commands outside `control.command_freshness_window_ms` of its clock or whose signature was already seen inside that window (replay protection).
 
 ##### Resilience Features
 
@@ -2821,13 +2819,16 @@ Hives include built-in resilience mechanisms:
 
 **Circuit Breaker**: After consecutive failures (default: 3), the circuit opens and the hive temporarily stops accepting work, allowing time for recovery before resuming.
 
-These are configured via `HiveConfig`:
+These are configured via nested `HiveControlConfig`:
 
 ```rust
 let hive_conf = HiveConfig {
-	backpressure_threshold: BasisPoints::new(8000),  // 80%
-	circuit_breaker_threshold: 5,                    // Open after 5 failures
-	circuit_breaker_cooldown_ms: 60_000,             // 1 minute cooldown
+	control: HiveControlConfig {
+		backpressure_threshold: BasisPoints::new(8000), // 80%
+		circuit_breaker_threshold: 5,                   // Open after 5 failures
+		circuit_breaker_cooldown_ms: 60_000,            // 1 minute cooldown
+		..Default::default()
+	},
 	..Default::default()
 };
 ```
@@ -2858,28 +2859,32 @@ When `hive_tls` is set, the hive control server binds with TLS and outbound cont
 ##### HiveConfig Reference
 
 ```rust
+pub struct HiveScalingConfig {
+	pub default_scale: ServletScaleConfig,
+	/// Per-type overrides keyed by servlet type URN
+	pub overrides: HashMap<Urn<'static>, ServletScaleConfig>,
+	pub cooldown: Duration, // Default: 5s
+}
+
+pub struct HiveControlConfig {
+	pub backpressure_threshold: BasisPoints,         // Default: 9000 (90%)
+	pub drain_timeout: Duration,                     // Default: 30s
+	pub reregister_interval: Option<Duration>,       // Default: 5s; None disables
+	pub circuit_breaker_threshold: u8,               // Default: 3
+	pub circuit_breaker_cooldown_ms: u64,            // Default: 30_000
+	pub command_freshness_window_ms: u64,            // Default: 30_000 (replay window)
+	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
+}
+
 pub struct HiveConfig {
 	/// Naming scope for resource URNs (foreign authority/realm refused at register)
 	pub namespace: ColonyNamespace,
-	pub default_scale: ServletScaleConfig,
-	/// Per-type overrides keyed by servlet type URN
-	pub servlet_overrides: HashMap<Urn<'static>, ServletScaleConfig>,
-	pub cooldown: Duration,                         // Default: 5s
-	pub queue_capacity: u32,                        // Default: 100
-	pub backpressure_threshold: BasisPoints,        // Default: 9000 (90%)
-	pub circuit_breaker_threshold: u8,              // Default: 3
-	pub circuit_breaker_cooldown_ms: u64,           // Default: 30_000
-	pub servlet_pool_size: usize,                   // Default: 8
-	pub servlet_pool_idle_timeout: Option<Duration>,// Default: 30s
-	pub drain_timeout: Duration,                    // Default: 30s
-	pub command_freshness_window_ms: u64,           // Default: 30_000 (replay window)
-	pub cluster_notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
+	pub scaling: HiveScalingConfig,
+	pub control: HiveControlConfig,
+	/// Intra-hive servlet pool + control-server mux (`pool.mux_offer`, default None)
+	pub pool: PoolConfig,
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
-	/// Multiplexing offer for servlet pool + control server (default: None = single-flight)
-	pub mux_offer: Option<TransportOffer>,
-	/// Anti-entropy re-registration beat (default: 5s; None disables)
-	pub reregister_interval: Option<Duration>,
 }
 ```
 
@@ -2895,11 +2900,10 @@ tb_scenario! {
 		// Signer pinned by the hive trust store
 		context: trusted_signer("CN=Hive Backpressure Cluster"),
 		// Returns the established hive
-		start: |SetupEnv { context: signer, .. }| async move {
-			start_trusted_hive(&signer, HiveConfig {
-				backpressure_threshold: BasisPoints::default(),
-				..Default::default()
-			}).await
+		start: |SetupEnv { trace, context: signer, .. }| async move {
+			let mut conf = HiveConfig::default();
+			conf.control.backpressure_threshold = BasisPoints::default();
+			start_trusted_hive(&trace, &signer, conf).await
 		},
 		// Owns the hive for drain, registry checks, and stop
 		client: |HiveEnv { trace, context: signer, hive }| async move {
@@ -3193,11 +3197,9 @@ tb_scenario! {
 		// Omit when driving registration from the client.
 		hives: |SetupEnv { context: certs, .. }| vec![async move {
 			let servlet = PingServlet::start(Arc::new(TraceCollector::new()), None).await?;
-			let mut hive = TestHive::new(Some(HiveConfig {
-				mux_offer: Some(TransportOffer::mux(8)),
-				..hive_tls_config(&certs)
-			}))?;
-			hive.register("ping", servlet, |t| PingServlet::start(t, None))?;
+			// hive_tls_config sets pool.mux_offer for multiplexed hive <-> servlet
+			let mut hive = TestHive::new(Some(hive_tls_config(&certs)))?;
+			hive.register(ping_type(), servlet, |t| PingServlet::start(t, None))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 			Ok(hive)
 		}],

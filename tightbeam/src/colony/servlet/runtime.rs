@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use crate::colony::common::take_and_abort;
 use crate::colony::hive::{HiveContext, ServletBox};
 use crate::colony::servlet::servlet_runtime::rt;
-use crate::colony::servlet::{serve_servlet, ServletConfig, ServletContext, ServletService, WorkerBox};
+use crate::colony::servlet::{
+	serve_servlet, RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, WorkerBox,
+};
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
 use crate::macros::server::AcceptedConnection;
@@ -216,5 +218,69 @@ where
 
 	fn stop_boxed(self: Box<Self>) {
 		(*self).stop();
+	}
+}
+
+/// [`Servlet`] entry that takes [`RuntimeServletConf`] (config + handlers).
+///
+/// Prefer inherent [`ServletRuntime::start`] when you already have a
+/// [`ServletService`]. Use this impl when an API bounds on [`Servlet`].
+#[cfg(feature = "x509")]
+impl<P, M, C> Servlet<M> for ServletRuntime<P>
+where
+	P: Protocol + EncryptedProtocol<CryptoProvider = C> + Send + Sync + 'static,
+	P::Listener: AsyncListenerTrait + Sync + 'static,
+	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
+	M: Message + Send + Sync + 'static,
+	C: CryptoProvider + Send + Sync + 'static,
+{
+	type Conf = RuntimeServletConf<P, M, C>;
+	type Address = P::Address;
+
+	async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, TightBeamError> {
+		let RuntimeServletConf { config, service } = config.unwrap_or_default();
+		// Three-argument inherent start (not this trait method).
+		ServletRuntime::start(trace, config, service).await
+	}
+
+	fn addr(&self) -> &Self::Address {
+		ServletRuntime::addr(self)
+	}
+
+	fn stop(self) {
+		ServletRuntime::stop(self);
+	}
+
+	async fn join(self) -> Result<(), rt::JoinError> {
+		ServletRuntime::join(self).await
+	}
+}
+
+#[cfg(not(feature = "x509"))]
+impl<P, M> Servlet<M> for ServletRuntime<P>
+where
+	P: Protocol + Send + Sync + 'static,
+	P::Listener: AsyncListenerTrait + Sync + 'static,
+	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
+	M: Message + Send + Sync + 'static,
+{
+	type Conf = RuntimeServletConf<P, M>;
+	type Address = P::Address;
+
+	async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, TightBeamError> {
+		let RuntimeServletConf { config, service } = config.unwrap_or_default();
+		ServletRuntime::start(trace, config, service).await
+	}
+
+	fn addr(&self) -> &Self::Address {
+		ServletRuntime::addr(self)
+	}
+
+	fn stop(self) {
+		ServletRuntime::stop(self);
+	}
+
+	async fn join(self) -> Result<(), rt::JoinError> {
+		ServletRuntime::join(self).await
 	}
 }

@@ -205,7 +205,7 @@ pub(crate) async fn reflood_gossip<P, D>(
 
 	let mut fanout = tokio::task::JoinSet::new();
 	for peer in config.peer.peers.iter() {
-		let Ok(peer_addr) = peer.parse() else {
+		let Ok(peer_addr) = peer.parse::<P::Address>() else {
 			continue;
 		};
 
@@ -227,7 +227,7 @@ pub(crate) async fn send_advertisement_async<P, D>(
 	pool: Arc<ClusterPool<P>>,
 	config: Arc<ClusterConfig>,
 	peer_addr: P::Address,
-	gateway_addr: Vec<u8>,
+	gateway_addr: Arc<[u8]>,
 	types: Vec<Urn<'static>>,
 ) -> Result<TransitStatus, ClusterError>
 where
@@ -249,6 +249,7 @@ where
 		+ 'static,
 	D: ClusterDigest,
 {
+	let gateway_addr = gateway_addr.as_ref().to_vec();
 	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement { gateway_addr, advertised_types: types });
 	let frame = FrameBuilder::from(Version::V2)
 		.with_id(b"peer-advertise")
@@ -459,7 +460,7 @@ where
 	match config.gossip.journal.seen(&admitted.digest(), now) {
 		Ok(true) => {
 			let _ = trace.event(CLUSTER_GOSSIP_DUPLICATE);
-			return reply_frame(frame.metadata.id.clone(), GossipResponse { status: TransitStatus::Ok });
+			return reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok });
 		}
 		Ok(false) => {}
 		Err(_) => {
@@ -481,7 +482,7 @@ where
 	match config.gossip.journal.record(&signer_id, admitted.digest(), &rumor, now) {
 		Ok(Admission::Duplicate) => {
 			let _ = trace.event(CLUSTER_GOSSIP_DUPLICATE);
-			return reply_frame(frame.metadata.id.clone(), GossipResponse { status: TransitStatus::Ok });
+			return reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok });
 		}
 		Ok(Admission::New) => {}
 		Err(_) => {
@@ -509,7 +510,7 @@ where
 		drop(rt::spawn(reflood_gossip::<P, D>(reflood_pool, config, reflood_rumor, next_ttl)));
 	}
 
-	reply_frame(frame.metadata.id.clone(), GossipResponse { status: TransitStatus::Ok })
+	reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok })
 }
 
 /// Spawn the advertise/reconcile beat that re-announces local types to peers.
@@ -519,7 +520,7 @@ pub fn build_advertise_task<P, D>(
 	pool: Arc<ClusterPool<P>>,
 	local_pool: Arc<ClusterPool<P>>,
 	config: Arc<ClusterConfig>,
-	gateway_addr: Vec<u8>,
+	gateway_addr: Arc<[u8]>,
 	trace: Arc<TraceCollector>,
 ) -> rt::JoinHandle
 where
@@ -562,6 +563,7 @@ where
 					let Ok(digest) = gossip_digest::<D>(&rumor) else {
 						continue;
 					};
+
 					gossip_deliver_local::<P>(&servlet_registry, &config, &local_pool, &trace, body.payload, digest)
 						.await;
 				}
@@ -588,7 +590,7 @@ where
 					Arc::clone(&pool),
 					Arc::clone(&config),
 					peer_addr.clone(),
-					gateway_addr.clone(),
+					Arc::clone(&gateway_addr),
 					slate.clone(),
 				)
 				.await;

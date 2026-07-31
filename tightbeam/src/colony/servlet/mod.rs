@@ -1,5 +1,15 @@
 //! Servlet framework: policy-gated accept loops that dispatch unary,
 //! streaming, and duplex handlers with shared workers and env config.
+//!
+//! # Macro-free path
+//!
+//! 1. Build handlers with [`ServletHandlers`] (or implement [`ServletService`]).
+//! 2. Call [`ServletRuntime::start`] with a [`ServletConfig`].
+//! 3. For call sites that need [`Servlet`], pass [`RuntimeServletConf`]
+//!    (config + handlers) into [`Servlet::start`] on [`ServletRuntime`].
+//!
+//! Typed unary delivery without `servlet!`:
+//! [`ServletHandlers::on_typed_unary`] or [`dispatch_typed_unary`].
 
 pub mod macros;
 pub mod runtime;
@@ -195,6 +205,26 @@ pub fn prepare_typed_frame(frame: &mut Frame, ctx: &ServletContext) -> Result<()
 	}
 
 	Ok(())
+}
+
+/// Prepare, decode, and invoke a typed unary handler.
+///
+/// Same cleartext contract as the typed `handle:` arm of `servlet!`.
+pub async fn dispatch_typed_unary<I, F, Fut>(
+	mut frame: Frame,
+	ctx: &ServletContext,
+	handler: F,
+) -> Result<Option<Frame>, TightBeamError>
+where
+	I: Message,
+	F: FnOnce(I, Frame, &ServletContext) -> Fut,
+	Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
+{
+	prepare_typed_frame(&mut frame, ctx)?;
+
+	let message: I = crate::decode(&frame.message)?;
+	let response = handler(message, frame, ctx).await?;
+	Ok(response)
 }
 
 // ============================================================================
@@ -620,6 +650,9 @@ where
 	}
 
 	/// Finish the builder into a [`ServletConfig`].
+	///
+	/// When [`Self::with_config`] was not called, env defaults to `()` so
+	/// [`ServletRuntime::start`] matches [`ServletConfig::default`].
 	pub fn build(self) -> ServletConfig<P, M, C> {
 		ServletConfig {
 			_protocol: PhantomData,
@@ -627,7 +660,7 @@ where
 			_crypto: PhantomData,
 			x509_config: self.x509_config,
 			mux_offer: self.mux_offer,
-			servlet_config: self.servlet_config,
+			servlet_config: self.servlet_config.or_else(|| Some(Arc::new(()))),
 			hive_context: self.hive_context,
 			workers: self.workers,
 			collector_gates: self.collector_gates,
@@ -708,12 +741,15 @@ where
 	}
 
 	/// Finish the builder into a [`ServletConfig`].
+	///
+	/// When [`Self::with_config`] was not called, env defaults to `()` so
+	/// [`ServletRuntime::start`] matches [`ServletConfig::default`].
 	pub fn build(self) -> ServletConfig<P, M> {
 		ServletConfig {
 			_protocol: PhantomData,
 			_message: PhantomData,
 			mux_offer: self.mux_offer,
-			servlet_config: self.servlet_config,
+			servlet_config: self.servlet_config.or_else(|| Some(Arc::new(()))),
 			hive_context: self.hive_context,
 			workers: self.workers,
 			collector_gates: self.collector_gates,
@@ -723,10 +759,11 @@ where
 	}
 }
 
-/// Lifecycle interface for servlets produced by `servlet!` (and equivalents).
+/// Lifecycle interface for named servlets and [`ServletRuntime`].
 ///
 /// Generic over input message type `I`. Workers attached to a servlet share
-/// that same input type.
+/// that same input type. `servlet!` implements this for the generated type;
+/// macro-free code uses [`ServletRuntime`] with [`RuntimeServletConf`].
 pub trait Servlet<I> {
 	/// Configuration type (typically [`ServletConfig`]).
 	type Conf;
@@ -742,8 +779,8 @@ pub trait Servlet<I> {
 	where
 		Self: Sized;
 
-	/// Bound listen address.
-	fn addr(&self) -> Self::Address;
+	/// Bound listen address (borrowed; no clone).
+	fn addr(&self) -> &Self::Address;
 
 	/// Abort the accept loop.
 	fn stop(self);
@@ -767,7 +804,8 @@ pub trait Servlet<I> {
 /// with `Unimplemented`.
 ///
 /// - `servlet!` builds this via [`ServletHandlers`].
-/// - Macro-free path: implement the trait and call [`serve_servlet`].
+/// - Macro-free path: implement the trait (or use [`ServletHandlers`]) and
+///   call [`ServletRuntime::start`].
 pub trait ServletService: Send + Sync + 'static {
 	/// Answer one unary request frame.
 	///
@@ -860,6 +898,75 @@ impl ServletHandlers {
 	{
 		self.duplex = Some(Box::new(move |body, reply, ctx| Box::pin(handler(body, reply, ctx))));
 		self
+	}
+
+	/// Typed unary arm: [`prepare_typed_frame`], decode `I`, then `handler`.
+	pub fn on_typed_unary<I, F, Fut>(self, handler: F) -> Self
+	where
+		I: Message + Send + 'static,
+		F: Fn(I, Frame, &ServletContext) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + Send + 'static,
+	{
+		let handler = Arc::new(handler);
+		self.on_unary(move |frame, ctx| {
+			let handler = Arc::clone(&handler);
+			async move {
+				dispatch_typed_unary(frame, ctx.as_ref(), |message, frame, ctx| handler(message, frame, ctx)).await
+			}
+		})
+	}
+}
+
+/// Config + handlers for [`Servlet`] on [`ServletRuntime`].
+///
+/// Use this when a call site needs [`Servlet::start`] without `servlet!`.
+/// Hive registration only needs [`ServletBox`], which [`ServletRuntime`]
+/// already implements.
+#[cfg(feature = "x509")]
+pub struct RuntimeServletConf<P, M, C: CryptoProvider = DefaultCryptoProvider>
+where
+	P: Protocol,
+	M: Message,
+{
+	/// Bind, workers, gates, and env for the accept loop.
+	pub config: ServletConfig<P, M, C>,
+	/// Request handlers installed on the runtime.
+	pub service: ServletHandlers,
+}
+
+#[cfg(feature = "x509")]
+impl<P, M, C> Default for RuntimeServletConf<P, M, C>
+where
+	P: Protocol,
+	M: Message,
+	C: CryptoProvider + Send + Sync + 'static,
+{
+	fn default() -> Self {
+		Self { config: ServletConfig::default(), service: ServletHandlers::default() }
+	}
+}
+
+/// Config + handlers for [`Servlet`] on [`ServletRuntime`].
+#[cfg(not(feature = "x509"))]
+pub struct RuntimeServletConf<P, M>
+where
+	P: Protocol,
+	M: Message,
+{
+	/// Bind, workers, gates, and env for the accept loop.
+	pub config: ServletConfig<P, M>,
+	/// Request handlers installed on the runtime.
+	pub service: ServletHandlers,
+}
+
+#[cfg(not(feature = "x509"))]
+impl<P, M> Default for RuntimeServletConf<P, M>
+where
+	P: Protocol,
+	M: Message,
+{
+	fn default() -> Self {
+		Self { config: ServletConfig::default(), service: ServletHandlers::default() }
 	}
 }
 

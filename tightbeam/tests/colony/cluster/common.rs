@@ -113,11 +113,9 @@ pub(super) fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConfig {
 		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 		validators: vec![],
 	});
-	HiveConfig {
-		hive_tls: Some(hive_tls),
-		mux_offer: Some(TransportOffer::mux(8)),
-		..Default::default()
-	}
+	let mut conf = HiveConfig { hive_tls: Some(hive_tls), ..Default::default() };
+	conf.pool.mux_offer = Some(TransportOffer::mux(8));
+	conf
 }
 
 pub(super) fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConfig {
@@ -149,7 +147,7 @@ pub(super) async fn start_cluster(
 
 pub(super) async fn connect_cluster(
 	certs: &ClusterTestCerts,
-	addr: <TokioListener as tightbeam::transport::Protocol>::Address,
+	addr: &<TokioListener as tightbeam::transport::Protocol>::Address,
 ) -> Result<GenericClient<TokioListener>, TightBeamError> {
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_trust_store(Arc::clone(&certs.trust))
@@ -267,7 +265,11 @@ pub(super) fn servlet_info_mismatched(servlet_name: &str, urn_addr: &[u8], route
 
 /// Poll until the gateway has learned peer types or attempts exhaust.
 /// Branching lives here, not in scenarios.
-pub(super) async fn wait_for_peer_types(cluster: &ClusterGateway, attempts: u32, interval: Duration) -> Vec<Vec<u8>> {
+pub(super) async fn wait_for_peer_types(
+	cluster: &ClusterGateway,
+	attempts: u32,
+	interval: Duration,
+) -> Vec<tightbeam::colony::cluster::SharedId> {
 	for _ in 0..attempts {
 		let types = cluster.peer_servlets();
 		if !types.is_empty() {
@@ -366,7 +368,10 @@ pub(super) async fn start_ping_hive(
 	let servlet_conf = servlet_tls_config(&certs)?;
 	let servlet = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
 
-	let mut hive = ClusterTestHive::new(Some(HiveConfig { mux_offer, ..hive_tls_config(&certs) }))?;
+	let mut conf = hive_tls_config(&certs);
+	conf.pool.mux_offer = mux_offer;
+
+	let mut hive = ClusterTestHive::new(Some(conf))?;
 	hive.register(servlet_urn("ping"), servlet, |t| ClusterTestServlet::start(t, None))?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)

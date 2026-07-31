@@ -75,7 +75,7 @@ pub(crate) async fn handle_peer_ad(
 
 	let _ = trace.event(CLUSTER_PEER_ADVERTISED);
 	reply_frame(
-		frame.metadata.id.clone(),
+		&frame.metadata.id,
 		PeerAdvertisementResponse { status: TransitStatus::Ok },
 	)
 }
@@ -276,5 +276,5 @@ pub(crate) async fn handle_reconcile(
 		Err(_) => Vec::new(),
 	};
 
-	reply_frame(frame.metadata.id.clone(), GossipWant { want })
+	reply_frame(&frame.metadata.id, GossipWant { want })
 }

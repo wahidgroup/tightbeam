@@ -871,8 +871,8 @@ macro_rules! tb_scenario {
 		)
 		.await
 		.expect("Failed to start servlet");
-		let server_addr = servlet_instance.addr();
 
+		let server_addr = servlet_instance.addr().to_owned();
 		let client = $crate::tb_scenario!(@servlet_client
 			trace.share(), ::std::sync::Arc::clone(&context), server_addr $(, $setup_expr)?
 		);
@@ -969,14 +969,14 @@ macro_rules! tb_scenario {
 		#[allow(unused_mut)]
 		let mut hive_stops: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
 		$(
-			let cluster_addr = cluster_instance.addr();
+			let cluster_addr = cluster_instance.addr().clone();
 			let hive_futures = ($hives_closure)($crate::testing::env::SetupEnv {
 				trace: trace.share(),
 				context: ::std::sync::Arc::clone(&context),
 			});
 			for hive_future in hive_futures {
 				let hive = hive_future.await.expect("Failed to start hive");
-				hive.register_with_cluster(cluster_addr).await.expect("Failed to register hive");
+				hive.register_with_cluster(&cluster_addr).await.expect("Failed to register hive");
 				hive_stops.push(Box::new(move || hive.stop()));
 			}
 		)?
