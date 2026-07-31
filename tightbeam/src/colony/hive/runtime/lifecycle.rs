@@ -324,6 +324,12 @@ where
 		&self,
 		cluster_addr: &<Self::Protocol as Protocol>::Address,
 	) -> Result<RegisterHiveResponse, TightBeamError> {
+		// Control addr is provisional until establish binds the listener.
+		// Registering early would install a wrong heartbeat/manage target.
+		if self.control_server_handle.is_none() {
+			return Err(TightBeamError::NotEstablished);
+		}
+
 		let cluster_addr = *cluster_addr;
 		let response = register_once::<P>(&*self.servlets, self.addr, cluster_addr, &self.config).await?;
 

@@ -116,13 +116,14 @@ extern crate alloc;
 #[cfg(all(not(feature = "std"), feature = "zeroize"))]
 use alloc::vec::Vec;
 
+mod wire;
+
 // Before other modules so `compose!` is in crate-wide textual scope.
 #[cfg(feature = "builder")]
 #[macro_use]
 mod compose;
 
 pub(crate) mod frame;
-/// The Version is a fundamental constraint
 pub(crate) mod version;
 
 pub mod asn1;
@@ -131,11 +132,11 @@ pub mod core;
 pub mod error;
 pub mod flags;
 pub mod helpers;
+pub mod macros;
 pub mod matrix;
 pub mod oids;
 pub mod prelude;
 pub mod utils;
-mod wire;
 
 #[cfg(feature = "builder")]
 pub mod builder;
@@ -147,9 +148,8 @@ pub mod compress;
 pub mod crypto;
 #[cfg(feature = "doc")]
 pub mod doc;
-#[cfg(feature = "instrument")]
+#[cfg(feature = "std")]
 pub mod instrumentation;
-pub mod macros;
 #[cfg(feature = "policy")]
 pub mod policy;
 #[cfg(feature = "random")]
@@ -176,22 +176,20 @@ pub use der;
 pub use paste;
 pub use pkcs12;
 pub use spki;
+pub use utils::{decode, encode};
 
 #[cfg(feature = "hex")]
 pub use hex_literal::hex;
 #[cfg(all(feature = "std", not(feature = "tokio")))]
 pub use std::sync::mpsc;
+#[cfg(feature = "derive")]
+pub use tightbeam_derive::{Beamable, Errorizable, Flaggable};
 #[cfg(feature = "time")]
 pub use time;
 #[cfg(feature = "tokio")]
 pub use tokio::sync::mpsc;
 #[cfg(feature = "x509")]
 pub use x509_cert as x509;
-
-pub use utils::{decode, encode};
-
-#[cfg(feature = "derive")]
-pub use tightbeam_derive::{Beamable, Errorizable, Flaggable};
 
 extern crate self as tightbeam;
 

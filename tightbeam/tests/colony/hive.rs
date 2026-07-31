@@ -28,7 +28,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
-		GenericClient,
+		GenericClient, Protocol,
 	},
 	utils::{urn::Urn, BasisPoints},
 	Beamable, Frame, TightBeamError, Version,
@@ -55,6 +55,7 @@ pub(crate) const FIRST_SPAWN_FORBIDDEN: Urn<'static> = Urn::new("test", "event:h
 pub(crate) const FORGED_HEARTBEAT_DENIED: Urn<'static> = Urn::new("test", "event:hive/forged-heartbeat-denied");
 pub(crate) const HIVE_ESTABLISHED: Urn<'static> = Urn::new("test", "event:hive/hive-established");
 pub(crate) const HIVE_STARTED: Urn<'static> = Urn::new("test", "event:hive/hive-started");
+pub(crate) const REGISTER_BEFORE_ESTABLISH: Urn<'static> = Urn::new("test", "event:hive/register-before-establish");
 pub(crate) const OPEN_BREAKER_HEARTBEAT_SHAPE: Urn<'static> =
 	Urn::new("test", "event:hive/open-breaker-heartbeat-shape");
 pub(crate) const RETRY_SPAWN_ACCEPTED: Urn<'static> = Urn::new("test", "event:hive/retry-spawn-accepted");
@@ -489,6 +490,42 @@ tb_scenario! {
 		context: (),
 		start: |SetupEnv { trace, .. }| async move { establish_registered_hive(&trace, None).await },
 		client: |HiveEnv { hive, .. }| async move {
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Cluster registration requires a bound control listener
+// ============================================================================
+
+tb_assert_spec! {
+	pub HiveRegisterBeforeEstablishSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(REGISTER_BEFORE_ESTABLISH, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A provisional `addr` from `Hive::new` must not reach the cluster:
+// register before establish is refused with `NotEstablished`.
+tb_scenario! {
+	name: hive_register_before_establish_refused,
+	spec: HiveRegisterBeforeEstablishSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let hive = HiveX509Test::new(None)?;
+			let cluster_addr: <TokioListener as Protocol>::Address = "127.0.0.1:9".parse()?;
+			let refused = matches!(
+				hive.register_with_cluster(&cluster_addr).await,
+				Err(TightBeamError::NotEstablished)
+			);
+
+			trace.event_with(REGISTER_BEFORE_ESTABLISH, &[], refused)?;
 			hive.stop();
 			Ok(())
 		}

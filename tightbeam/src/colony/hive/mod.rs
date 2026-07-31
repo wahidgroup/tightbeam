@@ -341,6 +341,9 @@ pub trait Hive: Sized + Send + Sync {
 	/// The cluster will then route work to the servlets and send management
 	/// commands (heartbeat, spawn, stop) to this hive's control server.
 	///
+	/// Must be called after [`Hive::establish`]. A provisional address from
+	/// [`Hive::new`] is not a live control socket.
+	///
 	/// # Arguments
 	/// * `cluster_addr` - The address of the cluster controller
 	fn register_with_cluster(
