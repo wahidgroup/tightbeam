@@ -77,3 +77,7 @@ pub(crate) const PEER_ABUSE_CANDIDATE_DISCARDED: Urn<'static> =
 pub(crate) const PEER_EVICT_MEMBER_PROMOTED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-evict-member-promoted");
 pub(crate) const PEER_EVICT_TARGET_DROPPED: Urn<'static> = Urn::new("test", "event:cluster/peer-evict-target-dropped");
+pub(crate) const PEER_LOCAL_FAULT_MEMBER_PROMOTED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-local-fault-member-promoted");
+pub(crate) const PEER_LOCAL_FAULT_MEMBER_RETAINED: Urn<'static> =
+	Urn::new("test", "event:cluster/peer-local-fault-member-retained");

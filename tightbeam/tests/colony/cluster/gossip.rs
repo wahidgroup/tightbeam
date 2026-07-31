@@ -2124,3 +2124,125 @@ tb_scenario! {
 		}
 	}
 }
+
+/// [`GossipJournal`] that serves normally until switched faulty, then fails
+/// [`GossipJournal::held_digests`] and [`GossipJournal::fetch`].
+///
+/// The switch models a storage fault appearing on a live gateway whose
+/// peers keep answering.
+#[derive(Default)]
+struct FaultSwitchJournal {
+	inner: MemoryGossipJournal,
+	faulty: AtomicBool,
+}
+
+impl FaultSwitchJournal {
+	fn fail_now(&self) {
+		self.faulty.store(true, Ordering::SeqCst);
+	}
+
+	fn guard(&self) -> Result<(), ClusterError> {
+		if self.faulty.load(Ordering::SeqCst) {
+			return Err(ClusterError::GossipJournalUnavailable);
+		}
+
+		Ok(())
+	}
+}
+
+impl GossipJournal for FaultSwitchJournal {
+	fn record(
+		&self,
+		signer: &[u8],
+		digest: GossipDigest,
+		rumor: &Frame,
+		now_ms: u64,
+	) -> Result<Admission, ClusterError> {
+		self.inner.record(signer, digest, rumor, now_ms)
+	}
+
+	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
+		self.inner.seen(digest, now_ms)
+	}
+
+	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
+		self.guard()?;
+		self.inner.held_digests(now_ms)
+	}
+
+	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+		self.guard()?;
+		self.inner.fetch(wanted, now_ms)
+	}
+
+	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.pending_local(now_ms)
+	}
+
+	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
+		self.inner.ack_local(digest)
+	}
+
+	fn retention_ms(&self) -> u64 {
+		self.inner.retention_ms()
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterLocalFaultSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_PEER_DISCOVERED, exactly!(1)),
+			(PEER_LOCAL_FAULT_MEMBER_PROMOTED, exactly!(1), equals!(true)),
+			(PEER_LOCAL_FAULT_MEMBER_RETAINED, exactly!(1), equals!(true)),
+			(events::CLUSTER_PEER_EVICTED, exactly!(0))
+		]
+	}
+}
+
+// A local journal fault is never scored against an answering peer.
+//
+// The prober promotes the live member into tried, then its own journal
+// starts failing `held_digests` at the start of every reconcile round.
+//
+// - Each beat skips the round instead of recording a dial failure.
+// - The failure count never reaches the eviction threshold.
+// - The member stays a beat target (no CLUSTER_PEER_EVICTED).
+tb_scenario! {
+	name: cluster_local_journal_fault_retains_answering_peer,
+	spec: ClusterLocalFaultSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let journal = Arc::new(FaultSwitchJournal::default());
+			let mut prober_conf = fast_probing_conf(&certs, Arc::clone(&certs.trust));
+			prober_conf.gossip.journal = Arc::clone(&journal) as Arc<dyn GossipJournal>;
+
+			let table = Arc::clone(&prober_conf.peer.table);
+			let prober = start_cluster(&trace, prober_conf).await?;
+
+			let member_addr = cluster.addr().to_string();
+			let _ = table.learn(vec![PeerHint { gateway_addr: member_addr.clone(), peer_id: None }]);
+
+			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
+			let targets = table.target_set().unwrap_or_default();
+			trace.event_with(PEER_LOCAL_FAULT_MEMBER_PROMOTED, &[], drained && targets.contains(&member_addr))?;
+
+			journal.fail_now();
+
+			// The poll window covers the eviction threshold several times
+			// over at the fast beat cadence, so a scored fault would show.
+			let dropped = wait_for_target_dropped(&table, &member_addr, 15, Duration::from_millis(100)).await;
+			trace.event_with(PEER_LOCAL_FAULT_MEMBER_RETAINED, &[], !dropped)?;
+
+			prober.stop();
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
