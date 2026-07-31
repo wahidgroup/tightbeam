@@ -14,10 +14,15 @@ use crate::transport::{MessageCollector, MessageEmitter, PersistentConnection, P
 use crate::utils::urn::Urn;
 use crate::{Frame, Metadata, TightBeamError, Version};
 
+/// Instance or type key to shared servlet address bytes.
+type AddressMap = HashMap<Vec<u8>, Arc<[u8]>>;
+/// Shared, lockable address map for concurrent route updates.
+type SharedAddressMap = Arc<RwLock<AddressMap>>;
+
 /// Shared address maps and pool used for sibling servlet calls.
 pub struct HiveContextImpl<P: Protocol> {
-	servlet_addresses: Arc<RwLock<HashMap<Vec<u8>, Arc<[u8]>>>>,
-	type_index: Arc<RwLock<HashMap<Vec<u8>, Arc<[u8]>>>>,
+	servlet_addresses: SharedAddressMap,
+	type_index: SharedAddressMap,
 	pool: Arc<ConnectionPool<P>>,
 }
 

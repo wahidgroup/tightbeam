@@ -1,4 +1,7 @@
+use core::hash::Hash;
 use core::marker::PhantomData;
+use core::str::FromStr;
+use core::time::Duration;
 use std::sync::Arc;
 
 use crate::colony::cluster::outbound::build_cluster_pools;
@@ -6,20 +9,30 @@ use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, Gatewa
 use crate::colony::cluster::runtime::dispatch::handle_gateway_request;
 use crate::colony::cluster::runtime::gossip_tasks::{build_advertise_task, peer_dial_pool};
 use crate::colony::cluster::runtime::heartbeat::{send_heartbeat_async, spawn_evaporation_loop, spawn_heartbeat_loop};
-use crate::colony::cluster::{Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HiveRegistry, ServletRegistry};
-use crate::colony::common::take_and_abort;
+use crate::colony::cluster::{
+	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, PeerRouteInfo,
+	ServletRegistry, SharedId,
+};
+use crate::colony::common::{take_and_abort, HeartbeatResult};
 use crate::colony::servlet::servlet_runtime::rt;
+use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
+use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::x509::Certificate;
 use crate::macros::server::{into_shared_session_handler, serve_connection, AcceptedConnection};
 use crate::trace::TraceCollector;
+use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
+use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{
-	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, TransportError, X509ClientConfig,
+	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, TransportEncryptionConfig, TransportError,
+	X509ClientConfig,
 };
 use crate::Frame;
 use crate::TightBeamError;
+use tokio::sync::Semaphore;
 
 fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
 	TightBeamError::from(error.into())
@@ -30,9 +43,9 @@ use crate::colony::hive::ReplayGuard;
 
 /// Running cluster gateway for protocol `P` and digest `D`.
 ///
-/// - Owns accept, heartbeat, evaporation, and advertise task handles.
-/// - Exposes state through [`Cluster`] / [`ClusterHeartbeat`] only.
-pub struct ClusterGateway<P, D = crate::crypto::hash::Sha3_256>
+/// Owns the accept, heartbeat, evaporation, and advertise tasks.
+/// Callers reach state only through [`Cluster`] and [`ClusterHeartbeat`].
+pub struct ClusterGateway<P, D = Sha3_256>
 where
 	P: Protocol,
 {
@@ -59,13 +72,13 @@ where
 		+ 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
 		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
-		+ crate::transport::state::EncryptedProtocolState
+		+ EncryptedProtocolState
 		+ Send
 		+ Sync
 		+ 'static,
@@ -89,13 +102,13 @@ where
 		+ 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
 		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
-		+ crate::transport::state::EncryptedProtocolState
+		+ EncryptedProtocolState
 		+ Send
 		+ Sync
 		+ 'static,
@@ -105,19 +118,18 @@ where
 	type Address = P::Address;
 
 	async fn start(trace: Arc<TraceCollector>, config: ClusterConfig) -> Result<Self, TightBeamError> {
-		// The admission freshness window MUST NOT outlive journal
-		// retention: a rumor older than retention has no digest
-		// left to deduplicate against, so a wider window would
-		// re-admit a replayed rumor as new (CWE-294). Clamped
-		// here, where the config becomes immutable, so mutation
-		// after the builder cannot widen the window.
+		// The admission freshness window MUST NOT outlive journal retention
+		// (CWE-294). A rumor older than retention has no digest left, so a
+		// wider window would re-admit a replay as new. The clamp runs before
+		// the config is wrapped in Arc, so callers cannot widen the window.
 		#[cfg(feature = "x509")]
 		let config = {
 			let mut config = config;
-			let retention = core::time::Duration::from_millis(config.gossip.journal.retention_ms());
+			let retention = Duration::from_millis(config.gossip.journal.retention_ms());
 			if config.gossip.seen_ttl > retention {
 				config.gossip.seen_ttl = retention;
 			}
+
 			config
 		};
 
@@ -132,9 +144,9 @@ where
 
 		#[cfg(feature = "x509")]
 		let (listener, addr) = {
-			let cert_obj = crate::crypto::x509::Certificate::try_from(config.tls.certificate.clone())?;
-			let key_mgr = crate::transport::handshake::HandshakeKeyManager::new(Arc::clone(&config.tls.key));
-			let mut encryption_config = crate::transport::TransportEncryptionConfig::new(cert_obj, key_mgr);
+			let cert_obj = Certificate::try_from(config.tls.certificate.clone())?;
+			let key_mgr = HandshakeKeyManager::new(Arc::clone(&config.tls.key));
+			let mut encryption_config = TransportEncryptionConfig::new(cert_obj, key_mgr);
 			if !config.tls.client_validators.is_empty() {
 				let validators: Vec<_> = config.tls.client_validators.iter().map(Arc::clone).collect();
 				encryption_config = encryption_config.with_client_validators(validators);
@@ -218,12 +230,12 @@ where
 		&self.addr
 	}
 
-	fn available_servlets(&self) -> Vec<crate::colony::cluster::SharedId> {
+	fn available_servlets(&self) -> Vec<SharedId> {
 		self.registry.to_available_servlets().unwrap_or_default()
 	}
 
-	fn peer_servlets(&self) -> Vec<crate::colony::cluster::SharedId> {
-		let mut types: Vec<crate::colony::cluster::SharedId> = self
+	fn peer_servlets(&self) -> Vec<SharedId> {
+		let mut types: Vec<SharedId> = self
 			.servlet_registry
 			.peer_entries()
 			.unwrap_or_default()
@@ -235,7 +247,7 @@ where
 		types
 	}
 
-	fn peer_routes(&self) -> Vec<crate::colony::cluster::PeerRouteInfo> {
+	fn peer_routes(&self) -> Vec<PeerRouteInfo> {
 		self.servlet_registry
 			.peer_entries()
 			.unwrap_or_default()
@@ -275,13 +287,13 @@ where
 		+ 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
 		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
-		+ crate::transport::state::EncryptedProtocolState
+		+ EncryptedProtocolState
 		+ Send
 		+ Sync
 		+ 'static,
@@ -291,14 +303,11 @@ where
 		&self.registry
 	}
 
-	fn heartbeat_config(&self) -> &crate::colony::cluster::HeartbeatConfig {
+	fn heartbeat_config(&self) -> &HeartbeatConfig {
 		&self.config.heartbeat
 	}
 
-	async fn send_heartbeat(
-		&self,
-		addr: Self::Address,
-	) -> Result<crate::colony::common::HeartbeatResult, ClusterError> {
+	async fn send_heartbeat(&self, addr: Self::Address) -> Result<HeartbeatResult, ClusterError> {
 		send_heartbeat_async::<P, D>(Arc::clone(&self.pool), Arc::clone(&self.config), addr).await
 	}
 }
@@ -315,7 +324,7 @@ where
 	}
 }
 
-/// Spawn the gateway accept loop that dispatches [`handle_gateway_request`].
+/// Bind the accept loop that admits peers and dispatches control frames.
 pub(crate) fn spawn_gateway_server<P, D>(listener: P::Listener, ctx: GatewayRuntimeCtx<P>) -> rt::JoinHandle
 where
 	P: Protocol
@@ -326,32 +335,34 @@ where
 		+ 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
 		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
-		+ crate::transport::state::EncryptedProtocolState
+		+ EncryptedProtocolState
 		+ Send
 		+ Sync
 		+ 'static,
 	D: ClusterDigest,
 {
-	let mux_offer = ctx.config.pool_config.mux_offer.to_owned();
+	// One shared mux advertisement for every accepted connection.
+	let mux_offer = ctx.config.pool_config.mux_offer.as_ref().map(Arc::clone);
 	let handler = into_shared_session_handler(move |frame: Frame, session| {
 		let ctx = ctx.clone();
 		async move { handle_gateway_request::<P, D>(frame, session, ctx).await }
 	});
 
 	rt::spawn(async move {
-		let permits = Arc::new(tokio::sync::Semaphore::new(crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS));
+		let permits = Arc::new(Semaphore::new(DEFAULT_MAX_SERVER_CONNECTIONS));
 		loop {
 			let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
 				break;
 			};
 			match listener.accept().await {
 				Ok((mut transport, _addr)) => {
+					// Share the offer by refcount; do not deep-copy authorization octets.
 					transport = transport.with_mux_offer(mux_offer.clone());
 					let handler = Arc::clone(&handler);
 					rt::spawn(async move {

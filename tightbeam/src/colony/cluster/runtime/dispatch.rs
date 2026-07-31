@@ -1,5 +1,8 @@
 //! Thin gateway request router: gates, then match on ClusterRequest.
 
+use core::hash::Hash;
+use core::str::FromStr;
+
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::gossip_handler::handle_peer_ad;
 use crate::colony::cluster::runtime::registration::{handle_address_update, handle_register};
@@ -33,7 +36,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -52,10 +55,7 @@ where
 	let cluster_request = match decode::<ClusterRequest>(&frame.message) {
 		Ok(request) => request,
 		Err(_) => {
-			return reply_frame(
-				&frame.metadata.id,
-				ClusterWorkResponse::err(TransitStatus::PermissionDenied),
-			);
+			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::PermissionDenied));
 		}
 	};
 

@@ -183,13 +183,7 @@ impl PaymentStatusCode {
 ///
 /// Based on ISO 20022 pacs.002 TransactionStatus.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
-#[beam(
-	profile(TightbeamProfile),
-	confidential,
-	nonrepudiable,
-	message_integrity,
-	min_version = "V1"
-)]
+#[beam(profile(TightbeamProfile), min_version = "V1")]
 pub struct TransactionStatus {
 	/// Original payment identification
 	pub original_payment_id: PaymentIdentification,

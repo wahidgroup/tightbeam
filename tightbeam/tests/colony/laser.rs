@@ -111,7 +111,7 @@ fn laser_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
 	};
 
 	let mut conf = ClusterConfig::new(tls);
-	conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
+	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf
 }
 
@@ -134,7 +134,7 @@ fn laser_hive_conf(certs: &GatewayCerts) -> HiveConfig {
 		trust_store: Some(Arc::clone(&certs.trust)),
 		..Default::default()
 	};
-	conf.pool.mux_offer = Some(TransportOffer::mux(8));
+	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf
 }
 
@@ -257,7 +257,7 @@ tb_scenario! {
 					.with_config(PoolConfig {
 						idle_timeout: None,
 						max_connections: 1,
-						mux_offer: Some(TransportOffer::mux(8)),
+						mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 					})
 					.with_trust_store(Arc::clone(&certs.trust))
 					.build(),

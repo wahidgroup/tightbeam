@@ -4,7 +4,12 @@
 //! - Exposes lifecycle through [`Hive`] only.
 //! - `hive!` names a type alias of [`HiveRuntime`].
 
+use core::future::Future;
+use core::hash::Hash;
+use core::pin::Pin;
+use core::str::FromStr;
 use core::sync::atomic::AtomicU16;
+use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -12,7 +17,7 @@ use std::time::Instant;
 use crate::colony::common::{canonical_bytes, take_and_abort, ColonyResource};
 use crate::colony::hive::runtime::{
 	instance_urn, register_once, spawn_control_server, spawn_reregister_task, spawn_scaling_task, HiveContextImpl,
-	HiveControlCtx,
+	HiveControlCtx, ScalingTaskCtx,
 };
 use crate::colony::hive::{
 	HashMapRegistry, Hive, HiveConfig, HiveContext, RegisterHiveResponse, ServletBox, ServletRegistration,
@@ -44,8 +49,8 @@ use crate::transport::TransportEncryptionConfig;
 
 /// Running hive for protocol `P`.
 ///
-/// - Owns accept, scaling, and anti-entropy task handles.
-/// - Exposes state through [`Hive`] only.
+/// Owns accept, scaling, and anti-entropy tasks. Callers reach state only
+/// through [`Hive`].
 pub struct HiveRuntime<P: Protocol> {
 	servlets: Arc<HashMapRegistry>,
 	spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
@@ -106,7 +111,7 @@ where
 
 		#[cfg(feature = "x509")]
 		{
-			return match config.hive_tls.as_ref() {
+			match config.hive_tls.as_ref() {
 				Some(hive_tls) => {
 					let certificate = Certificate::try_from(hive_tls.certificate.clone())?;
 					let key_manager = HandshakeKeyManager::new(Arc::clone(&hive_tls.key));
@@ -119,7 +124,7 @@ where
 					Ok(P::bind_with(bind_addr, encryption_config).await?)
 				}
 				None => Ok(P::bind(bind_addr).await?),
-			};
+			}
 		}
 
 		#[cfg(not(feature = "x509"))]
@@ -143,7 +148,7 @@ fn seed_hive_routes<P: Protocol>(servlets: &HashMapRegistry, hive_context: &Hive
 	servlets.for_each(|key, reg| {
 		let addr_bytes = reg.servlet.addr_bytes();
 		let type_key = canonical_bytes(&reg.servlet_type);
-		// Real Vec clone: for_each borrows the registry key; add_route needs owned.
+		// for_each borrows the registry key; add_route needs an owned copy.
 		hive_context.add_route(key.clone(), addr_bytes, &type_key);
 	});
 }
@@ -158,7 +163,7 @@ where
 		+ 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Copy + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Copy + Send + Sync + FromStr + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
 	P::Transport: MessageEmitter
@@ -211,7 +216,7 @@ where
 	where
 		S: ServletBox + 'static,
 		F: Fn(Arc<TraceCollector>) -> Fut + Send + Sync + 'static,
-		Fut: core::future::Future<Output = Result<S, TightBeamError>> + Send + 'static,
+		Fut: Future<Output = Result<S, TightBeamError>> + Send + 'static,
 	{
 		if self.control_server_handle.is_some() {
 			return Err(TightBeamError::AlreadyEstablished);
@@ -233,10 +238,7 @@ where
 			Box::pin(async move {
 				let servlet = fut.await?;
 				Ok(Box::new(servlet) as Box<dyn ServletBox>)
-			})
-				as core::pin::Pin<
-					Box<dyn core::future::Future<Output = Result<Box<dyn ServletBox>, TightBeamError>> + Send>,
-				>
+			}) as Pin<Box<dyn Future<Output = Result<Box<dyn ServletBox>, TightBeamError>> + Send>>
 		});
 
 		// Key by instance URN bytes so manage stop and scaling share one lookup.
@@ -261,21 +263,22 @@ where
 
 		seed_hive_routes(&self.servlets, &self.hive_context);
 
-		let mux_offer = self.config.pool.mux_offer.to_owned();
+		// Share the configured mux offer with the control accept loop.
+		let mux_offer = self.config.pool.mux_offer.as_ref().map(Arc::clone);
 		let control_ctx = self.build_control_ctx();
 
 		self.control_server_handle = Some(spawn_control_server::<P>(listener, mux_offer, control_ctx));
-		self.scaling_handle = Some(spawn_scaling_task::<P>(
-			Arc::clone(&self.servlets),
-			Arc::clone(&self.spawners),
-			Arc::clone(&self.trace),
-			Arc::clone(&self.utilization),
-			Arc::clone(&self.utilization_map),
-			Arc::clone(&self.cluster_addrs),
-			Arc::clone(&self.hive_context),
-			self.addr,
-			self.config.clone(),
-		));
+		self.scaling_handle = Some(spawn_scaling_task::<P>(ScalingTaskCtx {
+			servlets: Arc::clone(&self.servlets),
+			spawners: Arc::clone(&self.spawners),
+			trace: Arc::clone(&self.trace),
+			utilization: Arc::clone(&self.utilization),
+			utilization_map: Arc::clone(&self.utilization_map),
+			cluster_addrs: Arc::clone(&self.cluster_addrs),
+			hive_context: Arc::clone(&self.hive_context),
+			hive_addr: self.addr,
+			config: self.config.clone(),
+		}));
 
 		// Re-announce the slate each interval; gateway registries are soft state.
 		self.reregister_handle = Some(spawn_reregister_task::<P>(
@@ -362,7 +365,7 @@ where
 				break;
 			}
 
-			tokio::time::sleep(core::time::Duration::from_millis(100)).await;
+			tokio::time::sleep(Duration::from_millis(100)).await;
 		}
 
 		Ok(())

@@ -1,3 +1,4 @@
+use core::mem;
 use core::time::Duration;
 #[cfg(feature = "tokio")]
 use std::io::Error as IoError;
@@ -392,7 +393,9 @@ where
 ))]
 mod mux {
 	pub(crate) use crate::transport::io::take_rekey_context;
-	pub use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxRekeyContext, MuxRole, MuxTransport};
+	pub use crate::transport::multiplex::{
+		IntoMuxOffer, MuxCapable, MuxConnector, MuxRekeyContext, MuxRole, MuxTransport,
+	};
 
 	#[cfg(feature = "transport-policy")]
 	pub(crate) use crate::transport::messaging::{collect_step, CollectStep};
@@ -420,8 +423,8 @@ where
 	TransportError: From<S::Error>,
 {
 	/// Local mux advertisement bound into the handshake transcript; `None` advertises nothing.
-	pub fn with_mux_offer(mut self, offer: Option<TransportOffer>) -> Self {
-		self.mux_config = offer;
+	pub fn with_mux_offer(mut self, offer: impl IntoMuxOffer) -> Self {
+		self.mux_config = offer.into_mux_offer();
 		self
 	}
 }
@@ -486,7 +489,7 @@ impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> MuxCapable for Tcp
 where
 	TransportError: From<S::Error>,
 {
-	fn with_mux_offer(self, offer: Option<TransportOffer>) -> Self {
+	fn with_mux_offer(self, offer: Option<Arc<TransportOffer>>) -> Self {
 		self.with_mux_offer(offer)
 	}
 
@@ -568,7 +571,7 @@ where
 
 	#[cfg(feature = "transport-policy")]
 	fn into_gated_halves(mut self) -> TransportResult<GatedHalves<Self>> {
-		let gate = Box::new(core::mem::take(&mut self.collector_gate));
+		let gate = Box::new(mem::take(&mut self.collector_gate));
 		let halves = self.into_split()?;
 		Ok((gate, halves))
 	}
@@ -1192,6 +1195,9 @@ mod tests {
 	use crate::transport::io::EncryptedMessageIO;
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig, X509ClientConfig};
 
+	#[cfg(feature = "x509")]
+	use crate::policy::TransitStatus;
+
 	/// Serve one single-flight request: collect, apply `reply` to an
 	/// accepted frame, answer with the gate's status.
 	#[cfg(feature = "x509")]
@@ -1203,7 +1209,7 @@ mod tests {
 		let (request, status) = transport.collect_message().await?;
 		let frame = Arc::try_unwrap(request).unwrap_or_else(|shared| (*shared).clone());
 		let message = match status {
-			crate::policy::TransitStatus::Ok => reply(frame),
+			TransitStatus::Ok => reply(frame),
 			_ => None,
 		};
 
@@ -1211,7 +1217,7 @@ mod tests {
 	}
 
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
-	use crate::policy::{SessionContext, TransitStatus};
+	use crate::policy::SessionContext;
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	use crate::transport::policy::PolicyConfig;
 

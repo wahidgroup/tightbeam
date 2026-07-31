@@ -114,7 +114,7 @@ pub(super) fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConfig {
 		validators: vec![],
 	});
 	let mut conf = HiveConfig { hive_tls: Some(hive_tls), ..Default::default() };
-	conf.pool.mux_offer = Some(TransportOffer::mux(8));
+	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf
 }
 
@@ -369,7 +369,7 @@ pub(super) async fn start_ping_hive(
 	let servlet = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
 
 	let mut conf = hive_tls_config(&certs);
-	conf.pool.mux_offer = mux_offer;
+	conf.pool.mux_offer = mux_offer.map(Arc::new);
 
 	let mut hive = ClusterTestHive::new(Some(conf))?;
 	hive.register(servlet_urn("ping"), servlet, |t| ClusterTestServlet::start(t, None))?;
@@ -381,7 +381,7 @@ pub(super) async fn start_ping_hive(
 /// and the cluster -> hive pool.
 pub(super) fn routing_cluster_conf(certs: &ClusterTestCerts, mux_offer: Option<TransportOffer>) -> ClusterConfig {
 	let mut conf = ClusterConfig::new(cluster_tls_config(certs));
-	conf.pool_config.mux_offer = mux_offer;
+	conf.pool_config.mux_offer = mux_offer.map(Arc::new);
 	conf
 }
 

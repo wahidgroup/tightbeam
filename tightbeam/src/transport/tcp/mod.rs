@@ -215,7 +215,7 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "x509")]
 			pub(crate) session_keys: Option<$crate::crypto::aead::SessionKeys>,
 			#[cfg(feature = "x509")]
-			pub(crate) mux_config: Option<$crate::transport::handshake::negotiation::TransportOffer>,
+			pub(crate) mux_config: Option<::std::sync::Arc<$crate::transport::handshake::negotiation::TransportOffer>>,
 			#[cfg(feature = "x509")]
 			pub(crate) transport_authorizer:
 				Option<Arc<dyn $crate::transport::handshake::negotiation::TransportAuthorizer>>,
@@ -628,7 +628,7 @@ macro_rules! impl_tcp_common {
 			}
 
 			fn to_mux_config(&self) -> Option<TransportOffer> {
-				self.mux_config.to_owned()
+				self.mux_config.as_ref().map(|offer| (**offer).clone())
 			}
 
 			fn to_transport_authorizer(&self) -> Option<Arc<dyn TransportAuthorizer>> {

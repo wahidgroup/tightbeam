@@ -140,8 +140,9 @@ tb_scenario! {
 			let routes = cluster.peer_routes();
 			let exposed = routes.len() == 1
 				&& routes.first().is_some_and(|route| {
-					route.servlet_type == ping_canonical
-						&& route.dial_addr == PEER_GATEWAY_ADDR && !route.peer_id.is_empty()
+					let servlet_type: &[u8] = route.servlet_type.as_ref();
+					let dial_addr: &[u8] = route.dial_addr.as_ref();
+					servlet_type == ping_canonical.as_slice() && dial_addr == PEER_GATEWAY_ADDR && !route.peer_id.is_empty()
 				});
 
 			trace.event_with(PEER_ROUTE_EXPOSED, &[], u64::from(exposed))?;

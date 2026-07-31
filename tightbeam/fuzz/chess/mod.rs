@@ -177,7 +177,7 @@ tb_scenario! {
 				.with_timeout(Duration::from_millis(500))
 				.build();
 
-			let client = client_builder.connect(env.addr.clone()).await?;
+			let client = client_builder.connect(env.addr).await?;
 			Ok(client)
 		},
 		client: |ServletEnv { trace, mut client, .. }| async move {

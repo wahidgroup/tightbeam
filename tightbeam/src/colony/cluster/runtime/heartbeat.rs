@@ -1,22 +1,33 @@
 //! Hive heartbeat send/process and evaporation loop spawn.
 
+use core::hash::Hash;
+use core::str::{from_utf8, FromStr};
+use core::time::Duration;
+use std::sync::Arc;
+
+use crate::builder::frame::FrameBuilder;
+use crate::builder::TypeBuilder;
+use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool};
+use crate::colony::cluster::{ClusterConfig, ClusterError, HeartbeatEvent, HiveEntry, HiveRegistry, ServletRegistry};
+use crate::colony::common::{
+	current_timestamp_ms, ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HeartbeatResult,
+};
+use crate::colony::servlet::servlet_runtime::rt;
 use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::decode;
+use crate::instrumentation::events::CLUSTER_HIVE_EVICTED;
+use crate::policy::TransitStatus;
+use crate::trace::TraceCollector;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
+use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
-use std::sync::Arc;
+use crate::{MessagePriority, Version};
 
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool};
-use crate::colony::cluster::{ClusterConfig, ClusterError, HeartbeatEvent, HiveRegistry, ServletRegistry};
-use crate::colony::common::HeartbeatResult;
-use crate::colony::servlet::servlet_runtime::rt;
-use crate::policy::TransitStatus;
-use crate::trace::TraceCollector;
-
-pub fn parse_hive_addr<A: core::str::FromStr>(hive: &crate::colony::cluster::HiveEntry) -> Option<(Arc<[u8]>, A)> {
+pub fn parse_hive_addr<A: FromStr>(hive: &HiveEntry) -> Option<(Arc<[u8]>, A)> {
 	let hive_addr = Arc::clone(&hive.address);
-	core::str::from_utf8(&hive_addr)
+	from_utf8(&hive_addr)
 		.ok()
 		.and_then(|s| s.parse().ok())
 		.map(|addr| (hive_addr, addr))
@@ -64,7 +75,7 @@ pub fn process_heartbeat_result(
 				if failures >= max_failures {
 					let _ = registry.unregister(&hive_addr);
 					let _ = servlet_registry.remove_by_hive(&hive_addr);
-					let _ = trace.event(crate::instrumentation::events::CLUSTER_HIVE_EVICTED);
+					let _ = trace.event(CLUSTER_HIVE_EVICTED);
 				}
 			}
 		}
@@ -83,50 +94,41 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
 		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
-		+ crate::transport::state::EncryptedProtocolState
+		+ EncryptedProtocolState
 		+ Send
 		+ Sync
 		+ 'static,
 	D: ClusterDigest,
 {
-	use crate::builder::TypeBuilder;
-
-	let cmd = crate::colony::common::ClusterCommand {
-		heartbeat: Some(crate::colony::common::HeartbeatParams {
-			cluster_status: crate::colony::common::ClusterStatus::Healthy,
-		}),
+	let cmd = ClusterCommand {
+		heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
 		manage: None,
 	};
 
 	// Priority is a V2+ metadata field. Composing it on V1 fails at
 	// build time and every heartbeat would count as a send failure.
 	// `metadata.order` is the command freshness binding (CWE-294).
-	let frame = crate::builder::frame::FrameBuilder::from(crate::Version::V2)
+	let frame = FrameBuilder::from(Version::V2)
 		.with_id(b"heartbeat")
-		.with_order(crate::colony::common::current_timestamp_ms())
+		.with_order(current_timestamp_ms())
 		.with_message(cmd)
-		.with_priority(crate::MessagePriority::NetworkControl)
+		.with_priority(MessagePriority::NetworkControl)
 		.with_witness_hasher::<D>()
 		.build()?;
 
 	let signed_frame = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await?;
 
 	let mut client = pool.connect(addr).await?;
-	let response = client
-		.emit(signed_frame, None)
-		.await?
-		.ok_or(crate::colony::cluster::ClusterError::NoResponse)?;
+	let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
-	let cmd_response: crate::colony::common::ClusterCommandResponse = crate::decode(&response.message)?;
-	cmd_response
-		.heartbeat
-		.ok_or(crate::colony::cluster::ClusterError::MalformedResponse)
+	let cmd_response: ClusterCommandResponse = decode(&response.message)?;
+	cmd_response.heartbeat.ok_or(ClusterError::MalformedResponse)
 }
 
 pub(crate) fn spawn_heartbeat_loop<P, D>(
@@ -143,13 +145,13 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
 		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
-		+ crate::transport::state::EncryptedProtocolState
+		+ EncryptedProtocolState
 		+ Send
 		+ Sync
 		+ 'static,
@@ -193,7 +195,7 @@ where
 			if let Ok(evicted) = registry.evict_stale() {
 				for entry in evicted {
 					let _ = servlet_registry.remove_by_hive(&entry.address);
-					let _ = trace.event(crate::instrumentation::events::CLUSTER_HIVE_EVICTED);
+					let _ = trace.event(CLUSTER_HIVE_EVICTED);
 				}
 			}
 
@@ -204,7 +206,7 @@ where
 
 pub(crate) fn spawn_evaporation_loop(
 	servlet_registry: Arc<ServletRegistry>,
-	evaporation_interval: core::time::Duration,
+	evaporation_interval: Duration,
 ) -> rt::JoinHandle {
 	rt::spawn(async move {
 		loop {

@@ -20,18 +20,30 @@ use crate::transport::{MessageEmitter, Protocol, X509ClientConfig};
 use crate::utils::urn::Urn;
 use crate::TightBeamError;
 
+/// Shared handles for the hive auto-scaling loop.
+pub struct ScalingTaskCtx<P: Protocol> {
+	/// Registered servlet instances keyed by instance URN bytes.
+	pub servlets: Arc<HashMapRegistry>,
+	/// Per-type spawners used when scaling up.
+	pub spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
+	/// Hive-level instrumentation collector.
+	pub trace: Arc<TraceCollector>,
+	/// Aggregate utilization published for manage-path backpressure.
+	pub utilization: Arc<AtomicU16>,
+	/// Per-instance utilization samples keyed by instance URN bytes.
+	pub utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
+	/// Gateways that receive scaling address updates.
+	pub cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
+	/// Intra-hive route maps updated when instances appear or leave.
+	pub hive_context: Arc<HiveContextImpl<P>>,
+	/// Hive control-plane address used to mint the hive URN.
+	pub hive_addr: P::Address,
+	/// Scaling thresholds, cooldowns, and notify retry policy.
+	pub config: HiveConfig,
+}
+
 /// Spawn the cooling-loop task that scales servlet instances per type.
-pub fn spawn_scaling_task<P>(
-	servlets: Arc<HashMapRegistry>,
-	spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
-	trace: Arc<TraceCollector>,
-	utilization: Arc<AtomicU16>,
-	utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
-	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
-	hive_context: Arc<HiveContextImpl<P>>,
-	hive_addr: P::Address,
-	config: HiveConfig,
-) -> rt::JoinHandle
+pub fn spawn_scaling_task<P>(ctx: ScalingTaskCtx<P>) -> rt::JoinHandle
 where
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
@@ -40,6 +52,17 @@ where
 	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
 	TightBeamError: From<P::Error>,
 {
+	let ScalingTaskCtx {
+		servlets,
+		spawners,
+		trace,
+		utilization,
+		utilization_map,
+		cluster_addrs,
+		hive_context,
+		hive_addr,
+		config,
+	} = ctx;
 	let config = Arc::new(config);
 	let hive_urn = mint_hive_urn(hive_addr, &config);
 
@@ -199,9 +222,11 @@ fn collect_type_load(
 
 	servlets.for_each_by_type(type_prefix, |key, reg| {
 		count += 1;
+
 		let reported = reg.servlet.utilization().map(|bp| bp.get() as u64);
 		let cached = util_guard.as_ref().ok().and_then(|g| g.get(key).map(|&v| v as u64));
 		let unknown = UNKNOWN_SERVLET_UTILIZATION_BPS as u64;
+
 		util_sum += reported.or(cached).unwrap_or(unknown);
 	});
 
@@ -268,13 +293,7 @@ where
 
 	let type_prefix = type_prefix_bytes(action.servlet_type);
 	// HashMap iteration order is unspecified, so the removed instance is arbitrary.
-	let Some(key) = action
-		.servlets
-		.keys()
-		.into_iter()
-		.filter(|k| k.starts_with(&type_prefix))
-		.last()
-	else {
+	let Some(key) = action.servlets.keys().into_iter().rfind(|k| k.starts_with(&type_prefix)) else {
 		return false;
 	};
 

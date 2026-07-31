@@ -2,6 +2,10 @@
 
 use crate::colony::cluster::runtime::bounds::GatewayReplayGuard;
 use crate::colony::cluster::ClusterConfig;
+use crate::colony::common::current_timestamp_ms;
+use crate::colony::hive::{verify_frame_signature, TrustVerification};
+use crate::der::Encode;
+use crate::instrumentation::events::CLUSTER_GATE_BLOCKED;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
 use crate::Frame;
@@ -16,10 +20,11 @@ pub(crate) fn evaluate_gates(
 	for policy in config.policies.iter() {
 		let status = GatePolicy::evaluate(policy.as_ref(), Some(frame), session);
 		if status != TransitStatus::Ok {
-			let _ = trace.event(crate::instrumentation::events::CLUSTER_GATE_BLOCKED);
+			let _ = trace.event(CLUSTER_GATE_BLOCKED);
 			return Err(status);
 		}
 	}
+
 	Ok(())
 }
 
@@ -28,9 +33,9 @@ pub(crate) fn verify_hive_origin(config: &ClusterConfig, frame: &Frame) -> Trans
 	#[cfg(feature = "x509")]
 	{
 		match config.tls.hive_trust.as_ref() {
-			Some(trust) => match crate::colony::hive::verify_frame_signature(trust.as_ref(), frame) {
-				crate::colony::hive::TrustVerification::Verified => TransitStatus::Ok,
-				crate::colony::hive::TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
+			Some(trust) => match verify_frame_signature(trust.as_ref(), frame) {
+				TrustVerification::Verified => TransitStatus::Ok,
+				TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
 				_ => TransitStatus::PermissionDenied,
 			},
 			None => TransitStatus::PermissionDenied,
@@ -48,9 +53,9 @@ pub(crate) fn verify_peer_origin(config: &ClusterConfig, frame: &Frame) -> Trans
 	#[cfg(feature = "x509")]
 	{
 		match config.tls.peer_trust.as_ref() {
-			Some(trust) => match crate::colony::hive::verify_frame_signature(trust.as_ref(), frame) {
-				crate::colony::hive::TrustVerification::Verified => TransitStatus::Ok,
-				crate::colony::hive::TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
+			Some(trust) => match verify_frame_signature(trust.as_ref(), frame) {
+				TrustVerification::Verified => TransitStatus::Ok,
+				TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
 				_ => TransitStatus::PermissionDenied,
 			},
 			None => TransitStatus::PermissionDenied,
@@ -63,11 +68,11 @@ pub(crate) fn verify_peer_origin(config: &ClusterConfig, frame: &Frame) -> Trans
 	}
 }
 
-/// Freshness + replay partition for signed control frames (CWE-294).
+/// Reject stale or replayed signed control frames (CWE-294).
 pub(crate) fn verify_control_freshness(frame: &Frame, replay_guard: &GatewayReplayGuard) -> TransitStatus {
 	#[cfg(feature = "x509")]
 	{
-		let now = crate::colony::common::current_timestamp_ms();
+		let now = current_timestamp_ms();
 		if !replay_guard.is_fresh(frame.metadata.order, now) {
 			return TransitStatus::PermissionDenied;
 		}
@@ -75,8 +80,7 @@ pub(crate) fn verify_control_freshness(frame: &Frame, replay_guard: &GatewayRepl
 		let Some(signer_info) = frame.nonrepudiation.as_ref() else {
 			return TransitStatus::Unauthenticated;
 		};
-
-		let Ok(signer_id) = crate::der::Encode::to_der(&signer_info.sid) else {
+		let Ok(signer_id) = Encode::to_der(&signer_info.sid) else {
 			return TransitStatus::PermissionDenied;
 		};
 		if !replay_guard.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now) {

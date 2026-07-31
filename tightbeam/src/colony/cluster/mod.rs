@@ -24,7 +24,11 @@ pub use builder::{ClusterConfigBuilder, HeartbeatConfigBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use runtime::ClusterGateway;
-pub use servlet_registry::{PeerCaps, PeerRouteInfo, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry};
+pub use servlet_registry::{
+	PeerCaps, PeerRouteInfo, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, DEFAULT_ABANDONMENT_LIMIT,
+	DEFAULT_EVAPORATION_INTERVAL_SECS, DEFAULT_EVAPORATION_RATE_BPS, DEFAULT_INITIAL_PHEROMONE,
+	DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
+};
 
 #[cfg(feature = "x509")]
 pub use gossip::{

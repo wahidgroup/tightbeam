@@ -367,7 +367,7 @@ fn pool_with_offer(
 	let client_certificate = ctx.client_certificate.as_ref().to_owned();
 	let identity = CertificateSpec::Built(Box::new(client_certificate));
 	let client_provider = Arc::clone(&ctx.client_provider);
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer };
+	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: mux_offer.map(Arc::new) };
 	let mut builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)

@@ -164,7 +164,7 @@ tb_scenario! {
 		context: hive_tls(),
 		start: |SetupEnv { trace, context: tls }| async move {
 			let mut conf = HiveConfig { hive_tls: Some(tls), ..Default::default() };
-			conf.pool.mux_offer = Some(TransportOffer::mux(4));
+			conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(4)));
 			establish_registered_hive(&trace, Some(conf)).await
 		},
 		client: |HiveEnv { hive, .. }| async move {

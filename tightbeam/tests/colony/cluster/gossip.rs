@@ -17,6 +17,7 @@ fn gossip_cluster_conf(certs: &ClusterTestCerts, peers: Vec<String>) -> (Cluster
 		ingress: Some(servlet_urn("ping")),
 		..Default::default()
 	};
+
 	(conf, journal)
 }
 
@@ -511,7 +512,7 @@ tb_scenario! {
 			// gateway offers mux: the frame must chunk across the link to
 			// reach gossip admission at all.
 			let mut conf = peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust));
-			conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
+			conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
@@ -540,7 +541,7 @@ tb_scenario! {
 			// chunked path reflood uses) to reach admission, where the
 			// payload bound refuses it on the correct plane.
 			let pool_config = PoolConfig {
-				mux_offer: Some(TransportOffer::mux(8)),
+				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 				..Default::default()
 			};
 			let pool = Arc::new(

@@ -41,12 +41,59 @@
 mod router;
 
 use core::future::Future;
+use std::sync::Arc;
 
 use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::Frame;
+
+/// Converts a caller-owned or already-shared mux offer into a shared handle.
+///
+/// Accept loops and pools store [`Arc<TransportOffer>`] so each connection
+/// bumps a refcount instead of deep-copying authorization octets.
+pub trait IntoMuxOffer {
+	/// Shared offer for transport storage, or `None` to advertise nothing.
+	fn into_mux_offer(self) -> Option<Arc<TransportOffer>>;
+}
+
+impl IntoMuxOffer for Option<TransportOffer> {
+	fn into_mux_offer(self) -> Option<Arc<TransportOffer>> {
+		self.map(Arc::new)
+	}
+}
+
+impl IntoMuxOffer for Option<Arc<TransportOffer>> {
+	fn into_mux_offer(self) -> Option<Arc<TransportOffer>> {
+		self
+	}
+}
+
+impl IntoMuxOffer for TransportOffer {
+	fn into_mux_offer(self) -> Option<Arc<TransportOffer>> {
+		Some(Arc::new(self))
+	}
+}
+
+impl IntoMuxOffer for Arc<TransportOffer> {
+	fn into_mux_offer(self) -> Option<Arc<TransportOffer>> {
+		Some(self)
+	}
+}
+
+impl IntoMuxOffer for &Arc<TransportOffer> {
+	fn into_mux_offer(self) -> Option<Arc<TransportOffer>> {
+		// Share one advertisement across accept/dial sites.
+		Some(Arc::clone(self))
+	}
+}
+
+impl IntoMuxOffer for Option<&Arc<TransportOffer>> {
+	fn into_mux_offer(self) -> Option<Arc<TransportOffer>> {
+		self.map(Arc::clone)
+	}
+}
 
 #[cfg(feature = "transport-policy")]
 use crate::policy::GatePolicy;
@@ -73,22 +120,22 @@ pub use router::{
 pub struct StreamId(u32);
 
 impl StreamId {
-	/// Wrap a raw stream ID.
+	/// Build from the wire-encoded stream identifier.
 	pub const fn new(id: u32) -> Self {
 		Self(id)
 	}
 
-	/// Raw numeric ID carried on the wire.
+	/// Wire-encoded identifier for framing and role checks.
 	pub const fn value(&self) -> u32 {
 		self.0
 	}
 
-	/// Client-initiated streams use odd IDs.
+	/// True when this id is odd (client-allocated).
 	pub const fn is_client_initiated(&self) -> bool {
 		self.0 % 2 == 1
 	}
 
-	/// Server-initiated streams use even IDs (including the reserved ID 0).
+	/// True when this id is even (server-allocated), including reserved id 0.
 	pub const fn is_server_initiated(&self) -> bool {
 		self.0.is_multiple_of(2)
 	}
@@ -101,15 +148,15 @@ impl StreamId {
 /// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
-	/// Stream is idle (not yet used)
+	/// Unused id; does not count toward the concurrency cap.
 	Idle,
-	/// Stream is open and active
+	/// Both sides may send; counts toward the concurrency cap.
 	Open,
-	/// Stream is half-closed (local side closed)
+	/// Local send closed; still counts toward the concurrency cap.
 	HalfClosedLocal,
-	/// Stream is half-closed (remote side closed)
+	/// Remote send closed; still counts toward the concurrency cap.
 	HalfClosedRemote,
-	/// Stream is fully closed
+	/// Fully closed; does not count toward the concurrency cap.
 	Closed,
 }
 
@@ -173,7 +220,11 @@ pub trait MultiplexedProtocol {
 /// anywhere else would negotiate a capability the endpoint cannot honor.
 pub trait MuxCapable: Sized {
 	/// Local mux advertisement. `None` advertises nothing.
-	fn with_mux_offer(self, offer: Option<TransportOffer>) -> Self;
+	///
+	/// Callers that already hold a shared offer pass `Some(Arc::clone(&offer))`.
+	/// Owned offers convert at the boundary via [`IntoMuxOffer`] on inherent
+	/// transport helpers.
+	fn with_mux_offer(self, offer: Option<Arc<TransportOffer>>) -> Self;
 
 	/// Negotiated multiplexing settings from a completed handshake.
 	/// `None` means the connection is single-flight.

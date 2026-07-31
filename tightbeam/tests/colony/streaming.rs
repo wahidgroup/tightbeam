@@ -103,7 +103,11 @@ async fn pooled_lease(
 	addr: <TokioListener as tightbeam::transport::Protocol>::Address,
 ) -> Result<PooledClient<TokioListener>, TightBeamError> {
 	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: Some(TransportOffer::mux(8)) };
+	let config = PoolConfig {
+		idle_timeout: None,
+		max_connections: 1,
+		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
+	};
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
@@ -286,7 +290,7 @@ async fn start_streaming_hive(
 
 	let trust_store = pinning_trust_store(&materials.certificate)?;
 	let mut conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
-	conf.pool.mux_offer = Some(TransportOffer::mux(8));
+	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 	let mut hive = StreamingHive::new(Some(conf))?;
 	hive.register(stream_echo_urn(), servlet, |t| StreamingEchoServlet::start(t, None))?;

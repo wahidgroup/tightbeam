@@ -110,7 +110,11 @@ fn doorman_pool(
 	let client_certificate = ctx.client_certificate.as_ref().to_owned();
 	let identity = CertificateSpec::Built(Box::new(client_certificate));
 	let client_provider = Arc::clone(&ctx.client_provider);
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: Some(TransportOffer::mux(1)) };
+	let config = PoolConfig {
+		idle_timeout: None,
+		max_connections: 1,
+		mux_offer: Some(Arc::new(TransportOffer::mux(1))),
+	};
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)

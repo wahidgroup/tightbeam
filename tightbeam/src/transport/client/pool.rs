@@ -1,4 +1,4 @@
-//! Connection pooling for transport layer
+//! Connection pooling for the transport layer.
 
 use core::hash::Hash;
 use core::marker::PhantomData;
@@ -79,46 +79,44 @@ pooled_mux! {
 	use crate::transport::serve::drive_mux;
 }
 
-/// Builder trait for connection configuration
+/// Shared builder surface for direct clients and connection pools.
 ///
-/// Implemented by both ClientBuilder (for direct connections) and
-/// ConnectionPoolBuilder (for pooled connections), enabling unified builder API.
+/// [`ClientBuilder`] and [`ConnectionPoolBuilder`] both implement this trait
+/// so callers configure timeouts and identity the same way.
 pub trait ConnectionBuilder<P: Protocol>: Sized {
-	/// The type returned by build()
+	/// Built client or pool produced by [`ConnectionBuilder::build`].
 	type Output;
 
-	/// Configure timeout for operations
+	/// Cap how long a connect or I/O wait may block.
 	fn with_timeout(self, timeout: Duration) -> Self;
 
-	/// Configure trust store for server certificate validation
+	/// Trust anchors used to validate the peer certificate.
 	#[cfg(feature = "x509")]
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
-	/// Configure client identity for mutual TLS
+	/// Client certificate and key for mutual authentication.
 	#[cfg(feature = "x509")]
 	fn with_client_identity(self, cert: CertificateSpec, key: Arc<dyn SigningKeyProvider>) -> TransportResult<Self>;
 
-	/// Build the configured builder/pool (sync)
+	/// Finish configuration and produce the client or pool.
 	fn build(self) -> Self::Output;
 }
 
-/// Configuration for connection pool
+/// Limits and multiplexing policy for a [`ConnectionPool`].
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
-	/// Optional idle timeout for connections
-	/// None means connections never expire
-	pub idle_timeout: Option<Duration>,
-	/// Maximum total connections in the pool (default: 64)
-	pub max_connections: usize,
-	/// Multiplexing advertisement for pooled connections. With an offer set,
-	/// `connect` shares multiplexed connections per destination, opening
-	/// additional ones only when stream caps fill.
+	/// Drop idle exclusive leases after this duration.
 	///
-	/// Note: Each fresh dial deep-copies the offer: ASN.1 wire types stay
-	/// owned, and refcount sharing would require `Arc<TransportOffer>`
-	/// across the whole pool / transport / orchestrator config plane.
-	/// TODO: revisit this
-	pub mux_offer: Option<TransportOffer>,
+	/// `None` keeps idle connections until the pool evicts them for other reasons.
+	pub idle_timeout: Option<Duration>,
+	/// Hard cap on live connections across all destinations (default: 64).
+	pub max_connections: usize,
+	/// Multiplexing advertisement for pooled dials.
+	///
+	/// When set, `connect` reuses one multiplexed connection per destination
+	/// until stream caps fill. The value is shared by refcount across dials.
+	/// The handshake still clones the offer once into the orchestrator.
+	pub mux_offer: Option<Arc<TransportOffer>>,
 }
 
 impl Default for PoolConfig {
@@ -338,20 +336,15 @@ pooled_mux! {
 	struct MuxEntry {
 		id: u64,
 		handle: MuxHandle,
-		/// Reader driver task: finishes when the connection dies, so it
-		/// doubles as the entry's liveness witness.
-		reader_task: rt::JoinHandle,
-		/// When a lease last emitted on this connection.
+		/// Reader driver task used as the entry liveness witness.
 		///
-		/// The mux core never reads a clock
-		/// ([sans-io](https://sans-io.readthedocs.io/how-to-sans-io.html), as
-		/// [quinn-proto](https://docs.rs/quinn-proto) and [h2](https://docs.rs/h2)
-		/// keep their state machines), so the pool stamps activity at its own
-		/// emit boundary. This is the same recipe as
-		/// [hyper-util's pool `idle_at`](https://docs.rs/hyper-util/latest/src/hyper_util/client/legacy/pool.rs.html).
-		/// Shared with every lease, which stamps it outside the pool lock.
-		/// While [`MuxHandle::has_pending_streams`] returns `true`, the pruner
-		/// treats the entry as active no matter how old the stamp is.
+		/// The task ends when the connection dies.
+		reader_task: rt::JoinHandle,
+		/// Shared activity stamp used by idle pruning for this mux entry.
+		///
+		/// The mux core does not read a clock. Each lease updates this stamp
+		/// when emit starts, outside the pool lock. An entry with pending
+		/// streams stays active even if the stamp is old.
 		last_used: Arc<Mutex<Instant>>,
 	}
 }
@@ -710,12 +703,11 @@ pooled_mux! {
 			self.acquire_mux(addr, MuxSelection::PreferHeadroom).await
 		}
 
-		/// The acquisition funnel for every mux-offering caller: a pooled mux
-		/// entry, then an idle exclusive connection left over from a peer that
-		/// declined the mux offer at handshake, then a fresh dial. Selection
-		/// policy lives here alone so no caller can skip a reuse tier.
+		/// Acquire a mux lease through the reuse tiers, in order.
 		///
-		/// Address and mux offer are cloned only on wrap or fresh dial.
+		/// Tries a pooled mux entry first. Next tries an idle exclusive lease
+		/// left when a peer declined multiplexing. Finally opens a fresh dial.
+		/// All mux-offering callers share this path so no tier is skipped.
 		async fn acquire_mux(
 			self: &Arc<Self>,
 			addr: &P::Address,
@@ -730,7 +722,8 @@ pooled_mux! {
 			}
 
 			let offer = match &self.config.mux_offer {
-				Some(offer) => offer.to_owned(),
+				// One shared PoolConfig offer for every dial.
+				Some(offer) => Arc::clone(offer),
 				None => {
 					return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
 				}
@@ -744,7 +737,7 @@ pooled_mux! {
 		async fn open_mux_connection(
 			self: &Arc<Self>,
 			addr: P::Address,
-			offer: TransportOffer,
+			offer: Arc<TransportOffer>,
 		) -> TransportResult<PooledClient<P, C>> {
 			let mut reservation = self.reserve_slot(&addr)?;
 

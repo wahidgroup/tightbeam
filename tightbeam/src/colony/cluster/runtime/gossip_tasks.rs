@@ -1,5 +1,7 @@
 //! Gossip background tasks: local deliver, reflood, reconcile, advertise beat.
 
+use core::hash::Hash;
+use core::str::{from_utf8, FromStr};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -120,7 +122,7 @@ pub(crate) async fn gossip_deliver_local<P>(
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -172,7 +174,7 @@ pub(crate) async fn reflood_gossip<P, D>(
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -237,7 +239,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -286,7 +288,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -413,7 +415,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -530,7 +532,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -577,7 +579,7 @@ where
 				.local_servlets()
 				.unwrap_or_default()
 				.iter()
-				.filter_map(|bytes| core::str::from_utf8(bytes).ok())
+				.filter_map(|bytes| from_utf8(bytes).ok())
 				.filter_map(|canonical| canonical.parse().ok())
 				.take(MAX_ADVERTISED_TYPES)
 				.collect();

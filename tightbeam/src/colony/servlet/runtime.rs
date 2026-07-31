@@ -5,6 +5,7 @@
 //! - Address bytes are encoded once at start and shared as [`Arc<[u8]>`].
 //! - Callers borrow [`addr`](ServletRuntime::addr) instead of cloning it.
 
+use core::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -34,9 +35,9 @@ use crate::transport::EncryptedProtocol;
 
 /// Config fields [`ServletRuntime::start`] needs after the listener binds.
 pub(crate) struct ServletRuntimeParts {
-	pub(crate) env_config: Arc<dyn core::any::Any + Send + Sync>,
+	pub(crate) env_config: Arc<dyn Any + Send + Sync>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	pub(crate) mux_offer: Option<TransportOffer>,
+	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,

@@ -64,7 +64,7 @@ pub struct HiveControlCtx<P: Protocol> {
 /// Spawn the hive control accept loop that dispatches [`handle_command`].
 pub fn spawn_control_server<P>(
 	listener: P::Listener,
-	mux_offer: Option<TransportOffer>,
+	mux_offer: Option<Arc<TransportOffer>>,
 	ctx: HiveControlCtx<P>,
 ) -> rt::JoinHandle
 where
@@ -76,7 +76,6 @@ where
 {
 	let ctx = Arc::new(ctx);
 	let handler = into_shared_session_handler(move |frame: Frame, session| {
-		// Arc::clone: refcount bump for the shared control context.
 		let ctx = Arc::clone(&ctx);
 		async move { handle_command(frame, session, ctx).await }
 	});
@@ -87,11 +86,10 @@ where
 			let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
 				break;
 			};
+
 			match listener.accept().await {
 				Ok((mut transport, _addr)) => {
-					// TODO: MuxCapable stores owned Option<TransportOffer>
-					// (small ints + optional token). Arc would not help until
-					// the trait accepts a shared handle.
+					// Share the mux offer with each accepted control connection.
 					transport = transport.with_mux_offer(mux_offer.clone());
 
 					let handler = Arc::clone(&handler);
@@ -126,9 +124,8 @@ where
 		return Ok(Some(reply));
 	}
 
-	let is_draining = ctx.draining_since.read().map(|g| g.is_some()).unwrap_or(false);
-
 	// Refuse non-heartbeat manage while draining; reply in the manage CHOICE shape.
+	let is_draining = ctx.draining_since.read().map(|g| g.is_some()).unwrap_or(false);
 	if is_draining && !is_heartbeat {
 		return reply_frame(
 			&frame.metadata.id,
@@ -250,12 +247,12 @@ where
 	P: Protocol,
 {
 	let util = BasisPoints::new_saturating(ctx.utilization.load(Ordering::Relaxed));
+	let active_count = ctx.servlets.count() as u32;
 	let status = if util.get() >= ctx.bp_threshold.get() {
 		TransitStatus::ResourceExhausted
 	} else {
 		TransitStatus::Ok
 	};
-	let active_count = ctx.servlets.count() as u32;
 
 	reply_frame_with_priority(
 		&frame.metadata.id,
@@ -290,7 +287,6 @@ where
 	};
 
 	let registration = ServletRegistration { servlet: new_servlet, spawner: Arc::clone(spawner), servlet_type };
-
 	let Ok((instance, addr_bytes)) = insert_instance(&*ctx.servlets, &*ctx.hive_context, registration) else {
 		return spawn_denied();
 	};

@@ -1,5 +1,7 @@
 //! Peer-ad, gossip relay, publish, and reconcile request handlers.
 
+use core::hash::Hash;
+use core::str::FromStr;
 use std::sync::Arc;
 
 use crate::colony::cluster::peer::AdmittedPeerAd;
@@ -38,7 +40,7 @@ use crate::builder::TypeBuilder;
 #[cfg(feature = "x509")]
 use crate::colony::cluster::{frame_colony_urn, gossip_want};
 
-/// Handle [`PeerAdvertisement`]: peer-origin, freshness, admit, reconcile slate.
+/// Admit a peer advertisement and reconcile its servlet slate.
 pub(crate) async fn handle_peer_ad(
 	frame: Frame,
 	advertisement: PeerAdvertisement,
@@ -74,13 +76,10 @@ pub(crate) async fn handle_peer_ad(
 	}
 
 	let _ = trace.event(CLUSTER_PEER_ADVERTISED);
-	reply_frame(
-		&frame.metadata.id,
-		PeerAdvertisementResponse { status: TransitStatus::Ok },
-	)
+	reply_frame(&frame.metadata.id, PeerAdvertisementResponse { status: TransitStatus::Ok })
 }
 
-/// Handle relayed origin-signed gossip from a peer gateway.
+/// Admit a peer-relayed origin-signed rumor and continue the flood.
 #[cfg(feature = "x509")]
 pub(crate) async fn handle_gossip_relay<P, D>(
 	frame: Frame,
@@ -98,7 +97,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -166,7 +165,7 @@ where
 	.await
 }
 
-/// Handle origin gossip publish from a local hive-plane publisher.
+/// Mint and flood origin-signed gossip from a local hive-plane publisher.
 #[cfg(feature = "x509")]
 pub(crate) async fn handle_publish<P, D>(
 	frame: Frame,
@@ -184,7 +183,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
@@ -240,7 +239,7 @@ where
 	.await
 }
 
-/// Handle peer anti-entropy digest summary; reply with digests this gateway lacks.
+/// Compare peer digests and reply with digests this gateway still needs.
 #[cfg(feature = "x509")]
 pub(crate) async fn handle_reconcile(
 	frame: Frame,
