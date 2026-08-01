@@ -26,7 +26,57 @@ use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
 use crate::{Frame, Metadata, TightBeamError, Version};
 
-fn work_trail_ok(
+/// A route the load balancer chose for a servlet type: the pheromone
+/// key to reinforce or weaken, the socket to dial, and whether the
+/// route leaves this colony.
+pub(crate) struct RouteChoice {
+	pub(crate) route_key: Arc<[u8]>,
+	pub(crate) dial_addr: Arc<[u8]>,
+	pub(crate) route_kind: RouteKind,
+}
+
+/// Select one route for `type_key` over its live pheromone trails.
+///
+/// Already-forwarded work selects `Local` only (one-hop loop guard);
+/// origin work selects `Local` and `Peer` so pheromone prefers nearby
+/// nests while still failing over across the colony. `None` means no
+/// entry serves the type or the balancer declined, which the caller
+/// answers as [`TransitStatus::Unavailable`].
+pub(crate) fn select_route(
+	servlet_registry: &ServletRegistry,
+	config: &ClusterConfig,
+	type_key: &[u8],
+	forwarded: bool,
+) -> Option<RouteChoice> {
+	let entries = if forwarded {
+		servlet_registry.local_entries_for_type(type_key)
+	} else {
+		servlet_registry.entries_for_type(type_key)
+	};
+	let entries = match entries {
+		Ok(entries) if !entries.is_empty() => entries,
+		_ => return None,
+	};
+
+	let metrics: Vec<InstanceMetrics> = entries
+		.iter()
+		.map(|entry| InstanceMetrics { instance_key: entry.route_key().to_vec(), pheromone: entry.pheromone_level() })
+		.collect();
+
+	// The balancer is caller-configurable (`Arc<dyn LoadBalancer>`), so
+	// its index is untrusted: an out-of-range answer degrades to
+	// `Unavailable` instead of panicking the request path.
+	let selected_idx = config.load_balancer.select(&metrics)?;
+	let selected_entry = entries.get(selected_idx)?;
+
+	Some(RouteChoice {
+		route_key: Arc::clone(selected_entry.route_key()),
+		dial_addr: Arc::clone(selected_entry.dial_target()),
+		route_kind: selected_entry.route_kind(),
+	})
+}
+
+pub(crate) fn work_trail_ok(
 	servlet_registry: &ServletRegistry,
 	route_key: &Arc<[u8]>,
 	config: &ClusterConfig,
@@ -36,7 +86,7 @@ fn work_trail_ok(
 	let _ = trace.event(CLUSTER_WORK_ROUTED);
 }
 
-fn work_trail_weaken(
+pub(crate) fn work_trail_weaken(
 	servlet_registry: &ServletRegistry,
 	route_key: &Arc<[u8]>,
 	config: &ClusterConfig,
@@ -151,39 +201,15 @@ where
 	let servlet_type = request.servlet_type;
 	let payload = request.payload;
 
-	// One-hop loop guard: already-forwarded work selects Local only.
-	// Origin work selects Local and Peer so pheromone can prefer
-	// nearby nests while still failing over across the colony.
-	let entries = if forwarded {
-		servlet_registry.local_entries_for_type(&type_key)
-	} else {
-		servlet_registry.entries_for_type(&type_key)
-	};
-	let entries = match entries {
-		Ok(e) if !e.is_empty() => e,
-		_ => {
-			trace.event(CLUSTER_WORK_UNAVAILABLE)?;
-			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::Unavailable));
-		}
-	};
-
-	let metrics: Vec<InstanceMetrics> = entries
-		.iter()
-		.map(|e| InstanceMetrics { instance_key: e.route_key().to_vec(), pheromone: e.pheromone_level() })
-		.collect();
-
-	let selected_idx = match config.load_balancer.select(&metrics) {
-		Some(idx) => idx,
+	let choice = match select_route(&servlet_registry, &config, &type_key, forwarded) {
+		Some(choice) => choice,
 		None => {
 			trace.event(CLUSTER_WORK_UNAVAILABLE)?;
 			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::Unavailable));
 		}
 	};
 
-	let selected_entry = &entries[selected_idx];
-	let route_key = Arc::clone(selected_entry.route_key());
-	let dial_addr = Arc::clone(selected_entry.dial_target());
-	let route_kind = selected_entry.route_kind();
+	let RouteChoice { route_key, dial_addr, route_kind } = choice;
 
 	// Local hops carry bare app payload on the hive trust plane.
 	// Peer hops re-enter the peer gateway as Work{forwarded:true}

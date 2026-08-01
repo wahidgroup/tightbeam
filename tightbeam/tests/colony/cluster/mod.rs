@@ -18,4 +18,5 @@ mod gossip;
 mod peering;
 mod registration;
 mod routing;
+mod streaming;
 mod topology;

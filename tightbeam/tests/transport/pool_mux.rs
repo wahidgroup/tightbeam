@@ -39,7 +39,7 @@ use tightbeam::transport::handshake::negotiation::{
 use tightbeam::transport::handshake::receipt::SessionReceipt;
 use tightbeam::transport::multiplex::{MuxAcceptor, MuxRole, MuxTransport, ReplySink, StreamBody};
 use tightbeam::transport::policy::PolicyConfig;
-use tightbeam::transport::serve::MuxService;
+use tightbeam::transport::serve::{CallContext, MuxService};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	ClientBuilder, ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, ResponsePackage, TransportError,
@@ -199,7 +199,7 @@ where
 struct LengthService;
 
 impl MuxService for LengthService {
-	async fn streaming(&self, body: StreamBody, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+	async fn streaming(&self, body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		let bytes = body.into_bytes().await?;
 		Ok(Some(mux_frame(&bytes.len().to_string())))
 	}
@@ -210,12 +210,7 @@ impl MuxService for LengthService {
 struct DuplexEchoService;
 
 impl MuxService for DuplexEchoService {
-	async fn duplex(
-		&self,
-		mut body: StreamBody,
-		mut reply: ReplySink,
-		_session: SessionContext,
-	) -> Result<(), TightBeamError> {
+	async fn duplex(&self, mut body: StreamBody, mut reply: ReplySink, _cx: CallContext) -> Result<(), TightBeamError> {
 		while let Some(chunk) = body.chunk().await? {
 			reply.push(&chunk).await?;
 		}
@@ -229,21 +224,16 @@ impl MuxService for DuplexEchoService {
 struct MixedService;
 
 impl MuxService for MixedService {
-	async fn unary(&self, frame: Frame, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+	async fn unary(&self, frame: Frame, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		Ok(Some(frame))
 	}
 
-	async fn streaming(&self, body: StreamBody, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+	async fn streaming(&self, body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		let bytes = body.into_bytes().await?;
 		Ok(Some(mux_frame(&bytes.len().to_string())))
 	}
 
-	async fn duplex(
-		&self,
-		mut body: StreamBody,
-		mut reply: ReplySink,
-		_session: SessionContext,
-	) -> Result<(), TightBeamError> {
+	async fn duplex(&self, mut body: StreamBody, mut reply: ReplySink, _cx: CallContext) -> Result<(), TightBeamError> {
 		while let Some(chunk) = body.chunk().await? {
 			reply.push(&chunk).await?;
 		}
@@ -1112,7 +1102,7 @@ struct ProbeLengthService {
 }
 
 impl MuxService for ProbeLengthService {
-	async fn streaming(&self, body: StreamBody, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+	async fn streaming(&self, body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		self.gate.handler_invoked.store(true, Ordering::SeqCst);
 		let bytes = body.into_bytes().await?;
 		Ok(Some(mux_frame(&bytes.len().to_string())))
@@ -1125,12 +1115,7 @@ struct ProbeDuplexService {
 }
 
 impl MuxService for ProbeDuplexService {
-	async fn duplex(
-		&self,
-		mut body: StreamBody,
-		mut reply: ReplySink,
-		_session: SessionContext,
-	) -> Result<(), TightBeamError> {
+	async fn duplex(&self, mut body: StreamBody, mut reply: ReplySink, _cx: CallContext) -> Result<(), TightBeamError> {
 		self.gate.handler_invoked.store(true, Ordering::SeqCst);
 		while let Some(chunk) = body.chunk().await? {
 			reply.push(&chunk).await?;

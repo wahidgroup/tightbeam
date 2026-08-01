@@ -235,7 +235,7 @@ impl MuxHandle {
 	pub fn open_stream(
 		&self,
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-		self.open_stream_routed(StreamRoute::local())
+		self.open_stream_with_route(StreamRoute::local())
 	}
 
 	/// Open a streaming request to a servlet type, so a gateway
@@ -253,12 +253,17 @@ impl MuxHandle {
 		&self,
 		target: impl Into<Urn<'static>>,
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-		self.open_stream_routed(StreamRoute::to(target.into()))
+		self.open_stream_with_route(StreamRoute::to(target.into()))
 	}
 
-	/// Open core shared by the routed and unrouted entries. The route
-	/// parts ride the sink until its first chunk emits the Open.
-	fn open_stream_routed(
+	/// Open a streaming request carrying a fully-formed [`StreamRoute`].
+	///
+	/// Shared open core behind [`open_stream`](Self::open_stream) and
+	/// [`open_stream_to`](Self::open_stream_to); the crate-internal
+	/// entry a gateway uses to re-emit a client stream to a peer with
+	/// [`StreamRoute::forwarded_to`]. The route parts ride the sink
+	/// until its first chunk emits the Open.
+	pub(crate) fn open_stream_with_route(
 		&self,
 		route: StreamRoute,
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
@@ -316,7 +321,7 @@ impl MuxHandle {
 	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
 	/// - `Draining`: GoAway sent or received. No new streams
 	pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
-		self.open_duplex_routed(StreamRoute::local())
+		self.open_duplex_with_route(StreamRoute::local())
 	}
 
 	/// Open a duplex stream to a servlet type, so a gateway responder
@@ -331,12 +336,17 @@ impl MuxHandle {
 	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
 	/// - `Draining`: GoAway sent or received. No new streams
 	pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
-		self.open_duplex_routed(StreamRoute::to(target.into()))
+		self.open_duplex_with_route(StreamRoute::to(target.into()))
 	}
 
-	/// Open core shared by the routed and unrouted entries. The route
-	/// parts ride the sink until its first chunk emits the Open.
-	fn open_duplex_routed(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
+	/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
+	///
+	/// Shared open core behind [`open_duplex`](Self::open_duplex) and
+	/// [`open_duplex_to`](Self::open_duplex_to); the crate-internal
+	/// entry a gateway uses to re-emit a client duplex stream to a
+	/// peer with [`StreamRoute::forwarded_to`]. The route parts ride
+	/// the sink until its first chunk emits the Open.
+	pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 		let (target, forwarded) = route.into_parts();
 		let (sender, receiver) = oneshot::channel();
 		let reservation = self.shared.reserve_stream_slot(sender)?;
@@ -592,6 +602,25 @@ mod tests {
 			sent.try_recv(),
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
 				if package.target() == Some(&target) && !package.forwarded()
+		));
+
+		Ok(())
+	}
+
+	// A forwarded route stamps both the target and the loop guard on
+	// the Open, so a peer gateway serves it locally and never
+	// re-forwards it.
+	#[test]
+	fn test_open_stream_with_forwarded_route_stamps_guard() -> TransportResult<()> {
+		let (handle, mut sent) = duplex_handle();
+		let target = Urn::new("tb", "servlet:ledger");
+		let (sink, _response) = handle.open_stream_with_route(StreamRoute::forwarded_to(target.clone()))?;
+		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
+
+		assert!(matches!(
+			sent.try_recv(),
+			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
+				if package.target() == Some(&target) && package.forwarded()
 		));
 
 		Ok(())

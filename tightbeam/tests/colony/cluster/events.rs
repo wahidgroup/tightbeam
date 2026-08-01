@@ -81,3 +81,10 @@ pub(crate) const PEER_LOCAL_FAULT_MEMBER_PROMOTED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-local-fault-member-promoted");
 pub(crate) const PEER_LOCAL_FAULT_MEMBER_RETAINED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-local-fault-member-retained");
+pub(crate) const STREAM_SERVLET_HANDLED: Urn<'static> = Urn::new("test", "event:cluster/stream-servlet-handled");
+pub(crate) const STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/stream-echoed");
+pub(crate) const DUPLEX_SERVLET_HANDLED: Urn<'static> = Urn::new("test", "event:cluster/duplex-servlet-handled");
+pub(crate) const DUPLEX_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/duplex-echoed");
+pub(crate) const DUPLEX_LIVE_BEFORE_CANCEL: Urn<'static> = Urn::new("test", "event:cluster/duplex-live-before-cancel");
+pub(crate) const DUPLEX_CANCEL_PROPAGATED: Urn<'static> = Urn::new("test", "event:cluster/duplex-cancel-propagated");
+pub(crate) const SERVLET_DUPLEX_CANCELLED: Urn<'static> = Urn::new("test", "event:cluster/servlet-duplex-cancelled");

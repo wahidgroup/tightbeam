@@ -118,25 +118,22 @@ pub use router::{
 	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
 };
 
-/// Grpc-style route stamped on a stream's Open record.
+/// Grpc-style route carried on a stream's Open record.
 ///
 /// The route selects the responder's dispatch target (a servlet [`Urn`],
 /// the stream analog of an HTTP `:path`) and carries the stream loop guard.
-/// [`StreamRoute::local`] reproduces an unrouted local open, so the routed
+/// The default route reproduces an unrouted local open, so the routed
 /// and unrouted open paths share one wire shape.
 ///
-/// The type is internal: callers reach it through the typed
-/// `open_stream_to` and `open_duplex_to` entry points, which name a
-/// servlet type the same way `HiveContext::call` does.
+/// Initiators stamp a route through the typed `open_stream_to` /
+/// `open_duplex_to` entry points, which name a servlet type the same way
+/// `HiveContext::call` does. A served handler reads the route it received
+/// through [`CallContext`](crate::transport::serve::CallContext).
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StreamRoute {
-	/// Servlet type the responder dispatches to, or `None` for a
-	/// local stream whose address is already resolved.
-	pub(crate) target: Option<Urn<'static>>,
-	/// Loop guard: a forwarded open is served locally and never
-	/// re-forwarded.
-	pub(crate) forwarded: bool,
+pub struct StreamRoute {
+	target: Option<Urn<'static>>,
+	forwarded: bool,
 }
 
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
@@ -153,9 +150,33 @@ impl StreamRoute {
 		Self { target: Some(target), forwarded: false }
 	}
 
+	/// Route to a servlet type on an already-forwarded open. A
+	/// gateway stamps this when it re-emits a client stream to a peer
+	/// gateway, so the peer serves it locally and never re-forwards.
+	pub(crate) fn forwarded_to(target: Urn<'static>) -> Self {
+		Self { target: Some(target), forwarded: true }
+	}
+
+	/// Reconstruct a route from the parts carried on a received Open.
+	pub(crate) fn from_parts(target: Option<Urn<'static>>, forwarded: bool) -> Self {
+		Self { target, forwarded }
+	}
+
 	/// Split into the target and loop-guard flag stamped on the Open.
 	pub(crate) fn into_parts(self) -> (Option<Urn<'static>>, bool) {
 		(self.target, self.forwarded)
+	}
+
+	/// Grpc-style dispatch target, or `None` for an unrouted stream
+	/// whose responder address is already resolved.
+	pub fn target(&self) -> Option<&Urn<'static>> {
+		self.target.as_ref()
+	}
+
+	/// Whether an upstream gateway already forwarded this open. A
+	/// forwarded stream is served locally and never re-forwarded.
+	pub fn forwarded(&self) -> bool {
+		self.forwarded
 	}
 }
 

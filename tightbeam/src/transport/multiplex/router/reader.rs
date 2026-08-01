@@ -23,7 +23,7 @@ use crate::transport::envelopes::{
 };
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::io::EnvelopeSource;
-use crate::transport::multiplex::StreamId;
+use crate::transport::multiplex::{StreamId, StreamRoute};
 use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
 
@@ -62,8 +62,9 @@ pub(super) enum InboundEvent {
 	/// Unary-kind stream reassembled into its message frame
 	Request(u32, Arc<Frame>),
 	/// Streaming or duplex kind: the body forwards chunks as they
-	/// arrive; the kind fixes the reply shape
-	StreamOpen(u32, MuxStreamKind, StreamBody),
+	/// arrive; the kind fixes the reply shape, and the route carries
+	/// the grpc-style dispatch target the initiator stamped on the Open.
+	StreamOpen(u32, MuxStreamKind, StreamBody, StreamRoute),
 	Cancel(u32),
 }
 
@@ -908,13 +909,16 @@ where
 			return Err(self.protocol_violation());
 		}
 
+		let kind = package.kind();
+		let route = StreamRoute::from_parts(package.target().cloned(), package.forwarded());
+
 		if package.last() {
 			let _ = forwarder.forward(BodyEvent::End);
 		} else {
 			self.peer_bodies.insert(stream_id, forwarder);
 		}
 
-		self.dispatch_stream_open(stream_id, package.kind(), body).await
+		self.dispatch_stream_open(stream_id, kind, body, route).await
 	}
 
 	/// Hand a fresh streaming body to the responder, refusing the
@@ -924,8 +928,9 @@ where
 		stream_id: u32,
 		kind: MuxStreamKind,
 		body: StreamBody,
+		route: StreamRoute,
 	) -> TransportResult<()> {
-		let event = InboundEvent::StreamOpen(stream_id, kind, body);
+		let event = InboundEvent::StreamOpen(stream_id, kind, body, route);
 		if self.inbound.send(event).await.is_err() {
 			self.peer_bodies.remove(&stream_id);
 			self.refuse_stream(stream_id)?;
@@ -1478,9 +1483,9 @@ mod tests {
 		let dispatched = fixture.inbound.try_recv();
 		assert!(matches!(
 			dispatched,
-			Ok(InboundEvent::StreamOpen(1, MuxStreamKind::Streaming, _))
+			Ok(InboundEvent::StreamOpen(1, MuxStreamKind::Streaming, _, _))
 		));
-		let Ok(InboundEvent::StreamOpen(_, _, mut body)) = dispatched else {
+		let Ok(InboundEvent::StreamOpen(_, _, mut body, _)) = dispatched else {
 			return;
 		};
 

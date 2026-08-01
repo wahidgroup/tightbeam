@@ -75,7 +75,9 @@ pooled_mux! {
 	use crate::runtime::rt;
 	use crate::utils::marker::MaybeSend;
 	use crate::transport::handshake::receipt::StoredReceipt;
-	use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxHandle, MuxRole, RequestSink, StreamBody};
+	use crate::transport::multiplex::{
+		MuxCapable, MuxConnector, MuxHandle, MuxRole, RequestSink, StreamBody, StreamRoute,
+	};
 	use crate::transport::serve::drive_mux;
 }
 
@@ -1141,6 +1143,25 @@ pooled_mux! {
 			lease.handle.open_stream_to(target)
 		}
 
+		/// Open a streamed request carrying a fully-formed [`StreamRoute`].
+		///
+		/// The crate-internal entry a gateway uses to re-emit a client
+		/// stream to a peer gateway with [`StreamRoute::forwarded_to`],
+		/// so the peer serves it locally and never re-forwards. Otherwise
+		/// identical to [`open_stream`](Self::open_stream).
+		///
+		/// # Errors
+		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		pub(crate) fn open_stream_with_route(
+			&self,
+			route: StreamRoute,
+		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
+			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
+			lease.stamp();
+
+			lease.handle.open_stream_with_route(route)
+		}
+
 		/// Open a duplex stream on the shared mux connection: push request
 		/// chunks through the sink while the peer's reply arrives
 		/// incrementally through the body.
@@ -1167,6 +1188,22 @@ pooled_mux! {
 			lease.stamp();
 
 			lease.handle.open_duplex_to(target)
+		}
+
+		/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
+		///
+		/// The crate-internal entry a gateway uses to re-emit a client
+		/// duplex stream to a peer gateway with [`StreamRoute::forwarded_to`],
+		/// so the peer serves it locally and never re-forwards. Otherwise
+		/// identical to [`open_duplex`](Self::open_duplex).
+		///
+		/// # Errors
+		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
+			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
+			lease.stamp();
+
+			lease.handle.open_duplex_with_route(route)
 		}
 
 		/// Cap-exhaustion failover: move the lease through the acquisition

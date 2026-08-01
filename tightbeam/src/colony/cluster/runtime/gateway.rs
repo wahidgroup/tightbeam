@@ -1,3 +1,4 @@
+use core::future::Future;
 use core::hash::Hash;
 use core::marker::PhantomData;
 use core::str::FromStr;
@@ -9,6 +10,7 @@ use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, Gatewa
 use crate::colony::cluster::runtime::dispatch::handle_gateway_request;
 use crate::colony::cluster::runtime::gossip_tasks::{build_advertise_task, peer_dial_pool};
 use crate::colony::cluster::runtime::heartbeat::{send_heartbeat_async, spawn_evaporation_loop, spawn_heartbeat_loop};
+use crate::colony::cluster::runtime::streaming::{splice_duplex, splice_streaming};
 use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, PeerRouteInfo,
 	ServletRegistry, SharedId,
@@ -19,12 +21,13 @@ use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::x509::Certificate;
-use crate::macros::server::{into_shared_session_handler, serve_connection, AcceptedConnection};
+use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::trace::TraceCollector;
 use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
-use crate::transport::multiplex::{MuxCapable, MuxConnector};
+use crate::transport::multiplex::{MuxCapable, MuxConnector, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
+use crate::transport::serve::{unimplemented_error, CallContext, MuxService};
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{
 	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, TransportEncryptionConfig, TransportError,
@@ -324,6 +327,86 @@ where
 	}
 }
 
+/// The gateway as a [`MuxService`].
+///
+/// Unary frames route through the cluster dispatch exactly as before.
+/// Streamed and duplex opens route by the target `Urn` on their
+/// [`CallContext`]: a `Local` trail dials the servlet on the hive
+/// plane, a `Peer` trail splices the stream to the peer gateway on the
+/// peer plane (see [`splice_streaming`] and [`splice_duplex`]).
+struct GatewayMuxService<P, D>
+where
+	P: Protocol,
+{
+	ctx: GatewayRuntimeCtx<P>,
+	_digest: PhantomData<D>,
+}
+
+impl<P, D> MuxService for GatewayMuxService<P, D>
+where
+	P: Protocol
+		+ PersistentConnection
+		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
+		+ Send
+		+ Sync
+		+ 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
+	P::Transport: MessageEmitter
+		+ MessageCollector
+		+ PolicyConfig
+		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
+		+ MuxConnector
+		+ EncryptedProtocolState
+		+ Send
+		+ Sync
+		+ 'static,
+	D: ClusterDigest,
+{
+	fn unary(
+		&self,
+		frame: Frame,
+		cx: CallContext,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		let ctx = self.ctx.clone();
+		async move { handle_gateway_request::<P, D>(frame, cx.into_session(), ctx).await }
+	}
+
+	fn streaming(
+		&self,
+		body: StreamBody,
+		cx: CallContext,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		let ctx = self.ctx.clone();
+		async move {
+			// An unrouted stream names no servlet type, so the gateway
+			// has nothing to dispatch.
+			let Some(target) = cx.target().cloned() else {
+				return Err(unimplemented_error());
+			};
+
+			splice_streaming::<P>(body, target, cx.forwarded(), ctx).await
+		}
+	}
+
+	fn duplex(
+		&self,
+		body: StreamBody,
+		reply: ReplySink,
+		cx: CallContext,
+	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
+		let ctx = self.ctx.clone();
+		async move {
+			// An unrouted stream names no servlet type, so the gateway
+			// has nothing to dispatch.
+			let Some(target) = cx.target().cloned() else {
+				return Err(unimplemented_error());
+			};
+
+			splice_duplex::<P>(body, reply, target, cx.forwarded(), ctx).await
+		}
+	}
+}
+
 /// Bind the accept loop that admits peers and dispatches control frames.
 pub(crate) fn spawn_gateway_server<P, D>(listener: P::Listener, ctx: GatewayRuntimeCtx<P>) -> rt::JoinHandle
 where
@@ -349,10 +432,7 @@ where
 {
 	// One shared mux advertisement for every accepted connection.
 	let mux_offer = ctx.config.pool_config.mux_offer.as_ref().map(Arc::clone);
-	let handler = into_shared_session_handler(move |frame: Frame, session| {
-		let ctx = ctx.clone();
-		async move { handle_gateway_request::<P, D>(frame, session, ctx).await }
-	});
+	let service = Arc::new(GatewayMuxService::<P, D> { ctx, _digest: PhantomData });
 
 	rt::spawn(async move {
 		let permits = Arc::new(Semaphore::new(DEFAULT_MAX_SERVER_CONNECTIONS));
@@ -364,10 +444,10 @@ where
 				Ok((mut transport, _addr)) => {
 					// Share the offer by refcount; do not deep-copy authorization octets.
 					transport = transport.with_mux_offer(mux_offer.clone());
-					let handler = Arc::clone(&handler);
+					let service = Arc::clone(&service);
 					rt::spawn(async move {
 						let _permit = permit;
-						serve_connection(transport, handler, None, None).await;
+						serve_connection_service(transport, service, None, None).await;
 					});
 				}
 				Err(_) => break,

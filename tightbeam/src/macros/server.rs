@@ -26,9 +26,9 @@ use crate::transport::state::EncryptedProtocolState;
 #[cfg(pooled_mux)]
 use crate::transport::multiplex::MuxAcceptor;
 #[cfg(pooled_mux)]
-use crate::transport::multiplex::{ReplySink, StreamBody};
+use crate::transport::multiplex::{ReplySink, StreamBody, StreamRoute};
 #[cfg(pooled_mux)]
-use crate::transport::serve::{serve_mux, MuxService};
+use crate::transport::serve::{serve_mux, CallContext, MuxService};
 
 #[cfg(feature = "tokio")]
 use self::server_runtime::rt::{ErrorSender, OkSender};
@@ -97,9 +97,9 @@ impl MuxService for SharedHandlerService {
 	fn unary(
 		&self,
 		frame: Frame,
-		session: SessionContext,
+		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
-		(self.0)(frame, session)
+		(self.0)(frame, cx.into_session())
 	}
 }
 
@@ -132,12 +132,12 @@ impl<S: MuxService> MuxService for ReportedService<S> {
 	fn unary(
 		&self,
 		frame: Frame,
-		session: SessionContext,
+		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let service = Arc::clone(&self.service);
 		let mut errors = self.errors.clone();
 		async move {
-			match service.unary(frame, session).await {
+			match service.unary(frame, cx).await {
 				Ok(response) => Ok(response),
 				Err(err) => Err(report_failure(&mut errors, err).await),
 			}
@@ -147,12 +147,12 @@ impl<S: MuxService> MuxService for ReportedService<S> {
 	fn streaming(
 		&self,
 		body: StreamBody,
-		session: SessionContext,
+		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let service = Arc::clone(&self.service);
 		let mut errors = self.errors.clone();
 		async move {
-			match service.streaming(body, session).await {
+			match service.streaming(body, cx).await {
 				Ok(response) => Ok(response),
 				Err(err) => Err(report_failure(&mut errors, err).await),
 			}
@@ -163,12 +163,12 @@ impl<S: MuxService> MuxService for ReportedService<S> {
 		&self,
 		body: StreamBody,
 		reply: ReplySink,
-		session: SessionContext,
+		cx: CallContext,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		let service = Arc::clone(&self.service);
 		let mut errors = self.errors.clone();
 		async move {
-			match service.duplex(body, reply, session).await {
+			match service.duplex(body, reply, cx).await {
 				Ok(()) => Ok(()),
 				Err(err) => Err(report_failure(&mut errors, err).await),
 			}
@@ -220,7 +220,10 @@ pub async fn serve_connection_service<T, S>(
 
 	let respond = move |frame: Frame, session: SessionContext| {
 		let service = Arc::clone(&service);
-		async move { service.unary(frame, session).await }
+		// The single-flight fallback serves unary only, and a unary
+		// open carries no route, so the call context is local.
+		let cx = CallContext::new(session, StreamRoute::local());
+		async move { service.unary(frame, cx).await }
 	};
 	serve_single_flight(transport, respond, error_tx, ok_tx).await;
 }
