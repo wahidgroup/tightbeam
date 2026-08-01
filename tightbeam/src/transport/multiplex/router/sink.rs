@@ -14,6 +14,7 @@ use super::shared::{enqueue_stream_cancel, BudgetStanding, MuxShared, OpenReques
 use super::writer::{drain_with_reason, renew_or_drain};
 use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::{TransportError, TransportResult};
+use crate::utils::urn::Urn;
 
 /// Send one credit-gated data chunk: reserve a writer-queue slot,
 /// then take the stream credit and enqueue in one critical section
@@ -93,17 +94,25 @@ pub struct RequestSink {
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
 	closed: bool,
+	/// Grpc-style route stamped on the stream's Open, consumed when
+	/// the first chunk opens the stream.
+	target: Option<Urn<'static>>,
+	/// Loop guard stamped beside the route on the stream's Open.
+	forwarded: bool,
 }
 
 impl RequestSink {
 	/// Sink over a reserved (unopened) stream. `duplex` carries the
-	/// reply forwarder to register once the ID exists.
+	/// reply forwarder to register once the ID exists. `target` and
+	/// `forwarded` stamp the stream's Open with a grpc-style route.
 	pub(super) fn new(
 		reservation: StreamReservation,
 		kind: MuxStreamKind,
 		shared: Arc<MuxShared>,
 		outbound: mpsc::Sender<Outbound>,
 		duplex: Option<ForwardedStream>,
+		target: Option<Urn<'static>>,
+		forwarded: bool,
 	) -> Self {
 		Self {
 			stream: SinkStream::Reserved { reservation, duplex },
@@ -111,6 +120,8 @@ impl RequestSink {
 			shared,
 			outbound,
 			closed: false,
+			target,
+			forwarded,
 		}
 	}
 
@@ -212,11 +223,21 @@ impl RequestSink {
 	/// One wire record: the first chunk travels as the stream's
 	/// `Open` through the atomic open, every later chunk as `Data`.
 	async fn send_chunk(&mut self, chunk: &[u8], last: bool, records: u64) -> TransportResult<()> {
+		let target = self.target.take();
+		let forwarded = self.forwarded;
 		match &mut self.stream {
 			SinkStream::Reserved { reservation, duplex } => {
-				let mut request = OpenRequest { kind: self.kind, last, payload: chunk, records, duplex: duplex.take() };
-				let stream_id = send_open_envelope(&self.shared, &mut self.outbound, reservation, &mut request).await?;
+				let mut request = OpenRequest {
+					kind: self.kind,
+					last,
+					payload: chunk,
+					records,
+					duplex: duplex.take(),
+					target,
+					forwarded,
+				};
 
+				let stream_id = send_open_envelope(&self.shared, &mut self.outbound, reservation, &mut request).await?;
 				self.stream = SinkStream::Opened(stream_id);
 				Ok(())
 			}
@@ -318,7 +339,15 @@ mod tests {
 		let (sender, receiver) = oneshot::channel();
 		let reservation = shared.reserve_stream_slot(sender).expect("fresh connection has stream slots");
 
-		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, Arc::clone(&shared), outbound, None);
+		let sink = RequestSink::new(
+			reservation,
+			MuxStreamKind::Streaming,
+			Arc::clone(&shared),
+			outbound,
+			None,
+			None,
+			false,
+		);
 		(shared, sink, sent, receiver)
 	}
 

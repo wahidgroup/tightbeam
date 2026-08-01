@@ -31,6 +31,7 @@ mod multiplex {
 	pub use crate::der::Enumerated;
 	pub use crate::der::Sequence;
 	pub use crate::der::{DecodeValue, FixedTag, Header};
+	pub use crate::utils::urn::Urn;
 }
 
 #[cfg(feature = "transport-multiplex")]
@@ -347,6 +348,16 @@ pub struct MuxOpenPackage {
 	pub(crate) last: bool,
 	pub(crate) kind: MuxStreamKind,
 	pub(crate) payload: OctetString,
+	/// Optional grpc-style route (`:path`) selecting the responder's
+	/// dispatch target. Absent for a local stream whose address is
+	/// already resolved; present when a gateway must route or splice
+	/// the open by servlet type.
+	pub(crate) target: Option<Urn<'static>>,
+	/// Stream loop guard with the same contract as the unary
+	/// `forwarded` flag: a gateway serves a `forwarded` open locally
+	/// and never re-forwards it. DER-omitted on the common `false` open.
+	#[asn1(default = "bool::default")]
+	pub(crate) forwarded: bool,
 }
 
 #[cfg(feature = "transport-multiplex")]
@@ -355,7 +366,18 @@ impl MuxOpenPackage {
 	/// `payload` longer than the DER length cap
 	pub fn new(stream_id: u32, last: bool, kind: MuxStreamKind, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
 		let payload = OctetString::new(payload)?;
-		Ok(Self { stream_id, last, kind, payload })
+		Ok(Self { stream_id, last, kind, payload, target: None, forwarded: false })
+	}
+
+	/// Stamp a grpc-style route and loop-guard flag on this open.
+	///
+	/// A `None` target with `forwarded = false` reproduces an
+	/// unrouted local open, so the routed and unrouted paths share
+	/// one wire shape.
+	pub fn with_route(mut self, target: Option<Urn<'static>>, forwarded: bool) -> Self {
+		self.target = target;
+		self.forwarded = forwarded;
+		self
 	}
 
 	pub fn stream_id(&self) -> u32 {
@@ -374,6 +396,18 @@ impl MuxOpenPackage {
 
 	pub fn payload(&self) -> &[u8] {
 		self.payload.as_bytes()
+	}
+
+	/// Grpc-style route selecting the responder's dispatch target, or
+	/// `None` for an already-resolved local stream.
+	pub fn target(&self) -> Option<&Urn<'static>> {
+		self.target.as_ref()
+	}
+
+	/// Whether an upstream gateway already forwarded this open. A
+	/// `forwarded` open is served locally and never re-forwarded.
+	pub fn forwarded(&self) -> bool {
+		self.forwarded
 	}
 }
 
@@ -958,6 +992,42 @@ mod tests {
 			let decoded = MuxOpenPackage::from_der(&package.to_der()?)?;
 			assert_eq!(decoded.kind(), kind);
 		}
+
+		Ok(())
+	}
+
+	// An unrouted open carries no target and is not forwarded, and
+	// the grpc-style route survives the wire when stamped.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_open_package_route_round_trips() -> Result<(), Box<dyn Error>> {
+		let target = Urn::new("tb", "servlet:ledger");
+
+		let unrouted = MuxOpenPackage::new(9, false, MuxStreamKind::Streaming, frame_payload("open-local")?)?;
+		assert_eq!(unrouted.target(), None);
+		assert!(!unrouted.forwarded());
+
+		let routed = unrouted.clone().with_route(Some(target.clone()), true);
+		let decoded = MuxOpenPackage::from_der(&routed.to_der()?)?;
+		assert_eq!(decoded.target(), Some(&target));
+		assert!(decoded.forwarded());
+
+		Ok(())
+	}
+
+	// A default open must encode to the exact bytes of the pre-route
+	// wire shape: the DER-optional target and DEFAULT-false forwarded
+	// add nothing, so existing peers decode it unchanged.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_open_package_unrouted_is_wire_stable() -> Result<(), Box<dyn Error>> {
+		let package = MuxOpenPackage::new(11, true, MuxStreamKind::Unary, frame_payload("open-stable")?)?;
+		let encoded = package.to_der()?;
+		let decoded = MuxOpenPackage::from_der(&encoded)?;
+		assert_eq!(decoded, package);
+		assert_eq!(decoded.target(), None);
+		assert!(!decoded.forwarded());
+		assert_eq!(decoded.to_der()?, encoded);
 
 		Ok(())
 	}

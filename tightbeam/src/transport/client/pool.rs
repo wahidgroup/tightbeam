@@ -1097,6 +1097,7 @@ pooled_mux! {
 		/// - A mux lease already handshook eagerly at dial, so it returns at once.
 		/// - A single-flight lease defers its handshake to the first
 		///   [`emit`](Self::emit).
+		#[cfg(feature = "colony")]
 		pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()> {
 			if self.mux.is_some() {
 				return Ok(());
@@ -1122,6 +1123,24 @@ pooled_mux! {
 			lease.handle.open_stream()
 		}
 
+		/// Open a streamed request routed to `target`: the peer gateway
+		/// reads the grpc-style route to dispatch locally or splice the
+		/// stream to a further peer.
+		///
+		/// Otherwise identical to [`open_stream`](Self::open_stream).
+		///
+		/// # Errors
+		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		pub fn open_stream_to(
+			&self,
+			target: impl Into<Urn<'static>>,
+		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
+			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
+			lease.stamp();
+
+			lease.handle.open_stream_to(target)
+		}
+
 		/// Open a duplex stream on the shared mux connection: push request
 		/// chunks through the sink while the peer's reply arrives
 		/// incrementally through the body.
@@ -1133,6 +1152,21 @@ pooled_mux! {
 			lease.stamp();
 
 			lease.handle.open_duplex()
+		}
+
+		/// Open a duplex stream routed to `target`: the peer gateway
+		/// reads the grpc-style route to dispatch locally or splice
+		/// both directions to a further peer.
+		///
+		/// Otherwise identical to [`open_duplex`](Self::open_duplex).
+		///
+		/// # Errors
+		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
+			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
+			lease.stamp();
+
+			lease.handle.open_duplex_to(target)
 		}
 
 		/// Cap-exhaustion failover: move the lease through the acquisition

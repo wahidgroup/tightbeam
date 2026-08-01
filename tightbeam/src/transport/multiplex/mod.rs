@@ -52,6 +52,9 @@ use crate::Frame;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
 
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+use crate::utils::urn::Urn;
+
 /// Converts a caller-owned or already-shared mux offer into a shared handle.
 ///
 /// Accept loops and pools store [`Arc<TransportOffer>`] so each connection
@@ -114,6 +117,47 @@ pub use router::{
 	BufferedGrantor, CreditGrantor, MuxDispatch, MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport,
 	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
 };
+
+/// Grpc-style route stamped on a stream's Open record.
+///
+/// The route selects the responder's dispatch target (a servlet [`Urn`],
+/// the stream analog of an HTTP `:path`) and carries the stream loop guard.
+/// [`StreamRoute::local`] reproduces an unrouted local open, so the routed
+/// and unrouted open paths share one wire shape.
+///
+/// The type is internal: callers reach it through the typed
+/// `open_stream_to` and `open_duplex_to` entry points, which name a
+/// servlet type the same way `HiveContext::call` does.
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StreamRoute {
+	/// Servlet type the responder dispatches to, or `None` for a
+	/// local stream whose address is already resolved.
+	pub(crate) target: Option<Urn<'static>>,
+	/// Loop guard: a forwarded open is served locally and never
+	/// re-forwarded.
+	pub(crate) forwarded: bool,
+}
+
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+impl StreamRoute {
+	/// Unrouted local stream: the responder dispatches by its own
+	/// resolved address. Identical on the wire to a pre-route open.
+	pub(crate) fn local() -> Self {
+		Self::default()
+	}
+
+	/// Route to a servlet type. A gateway reads the target to
+	/// dispatch locally or splice to a peer.
+	pub(crate) fn to(target: Urn<'static>) -> Self {
+		Self { target: Some(target), forwarded: false }
+	}
+
+	/// Split into the target and loop-guard flag stamped on the Open.
+	pub(crate) fn into_parts(self) -> (Option<Urn<'static>>, bool) {
+		(self.target, self.forwarded)
+	}
+}
 
 /// Stream identifier within one multiplexed connection.
 ///

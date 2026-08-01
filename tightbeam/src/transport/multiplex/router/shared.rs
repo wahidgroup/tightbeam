@@ -124,6 +124,12 @@ pub(super) struct OpenRequest<'a> {
 	pub(super) payload: &'a [u8],
 	pub(super) records: u64,
 	pub(super) duplex: Option<ForwardedStream>,
+	/// Grpc-style route stamped on the Open record, or `None` for an
+	/// unrouted local open.
+	pub(super) target: Option<Urn<'static>>,
+	/// Loop guard stamped beside the route: a forwarded open is
+	/// served locally and never re-forwarded.
+	pub(super) forwarded: bool,
 }
 
 /// Outcome delivered to a pending stream's oneshot slot.
@@ -915,7 +921,7 @@ impl MuxShared {
 		}
 
 		let package = match MuxOpenPackage::new(stream_id, request.last, request.kind, request.payload) {
-			Ok(package) => package,
+			Ok(package) => package.with_route(request.target.take(), request.forwarded),
 			Err(err) => return Poll::Ready(Err(TransportError::DerError(err))),
 		};
 		let enqueued = outbound
@@ -1177,8 +1183,16 @@ mod tests {
 	fn open_one(shared: &Arc<MuxShared>) -> TransportResult<u32> {
 		let mut reservation = shared.reserve_stream_slot(slot())?;
 		let (mut outbound, _wire) = mpsc::channel(4);
-		let mut request =
-			OpenRequest { kind: MuxStreamKind::Unary, last: true, payload: &[], records: 1, duplex: None };
+		let mut request = OpenRequest {
+			kind: MuxStreamKind::Unary,
+			last: true,
+			payload: &[],
+			records: 1,
+			duplex: None,
+			target: None,
+			forwarded: false,
+		};
+
 		let mut cx = noop_cx();
 		match shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx) {
 			Poll::Ready(result) => result,
@@ -1390,15 +1404,25 @@ mod tests {
 		let shared = shared(MuxRole::Client, 4);
 		let mut reservation = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
 		let (mut outbound, _wire) = mpsc::channel(4);
-		let mut request =
-			OpenRequest { kind: MuxStreamKind::Unary, last: true, payload: &[], records: 1, duplex: None };
+		let mut request = OpenRequest {
+			kind: MuxStreamKind::Unary,
+			last: true,
+			payload: &[],
+			records: 1,
+			duplex: None,
+			target: None,
+			forwarded: false,
+		};
+
 		let mut cx = noop_cx();
 
 		shared.lock().rekey_hard_floor = true;
+
 		let parked = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
 		assert!(matches!(parked, Poll::Pending));
 
 		shared.lock().rekey_hard_floor = false;
+
 		let opened = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
 		assert!(matches!(opened, Poll::Ready(Ok(1))));
 	}

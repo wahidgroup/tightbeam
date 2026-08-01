@@ -22,9 +22,10 @@ use crate::transport::envelopes::{
 	GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
 };
 use crate::transport::error::TransportFailure;
-use crate::transport::multiplex::{MultiplexedProtocol, StreamingProtocol};
+use crate::transport::multiplex::{MultiplexedProtocol, StreamRoute, StreamingProtocol};
 use crate::transport::{TransportError, TransportResult};
 use crate::utils::marker::MaybeSend;
+use crate::utils::urn::Urn;
 use crate::Frame;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -234,6 +235,34 @@ impl MuxHandle {
 	pub fn open_stream(
 		&self,
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
+		self.open_stream_routed(StreamRoute::local())
+	}
+
+	/// Open a streaming request to a servlet type, so a gateway
+	/// responder can dispatch or splice the stream by that target.
+	///
+	/// The target names a servlet type, exactly as `HiveContext::call`
+	/// does: the caller says what work it wants, never a specific
+	/// instance. A `Urn<'static>` const passes with no allocation.
+	/// Otherwise identical to [`open_stream`](Self::open_stream).
+	///
+	/// # Errors
+	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
+	/// - `Draining`: GoAway sent or received. No new streams
+	pub fn open_stream_to(
+		&self,
+		target: impl Into<Urn<'static>>,
+	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
+		self.open_stream_routed(StreamRoute::to(target.into()))
+	}
+
+	/// Open core shared by the routed and unrouted entries. The route
+	/// parts ride the sink until its first chunk emits the Open.
+	fn open_stream_routed(
+		&self,
+		route: StreamRoute,
+	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
+		let (target, forwarded) = route.into_parts();
 		let (sender, receiver) = oneshot::channel();
 		let reservation = self.shared.reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
@@ -244,6 +273,8 @@ impl MuxHandle {
 			Arc::clone(&self.shared),
 			outbound_handle(&self.outbound),
 			None,
+			target,
+			forwarded,
 		);
 
 		let shared = Arc::clone(&self.shared);
@@ -285,6 +316,28 @@ impl MuxHandle {
 	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
 	/// - `Draining`: GoAway sent or received. No new streams
 	pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
+		self.open_duplex_routed(StreamRoute::local())
+	}
+
+	/// Open a duplex stream to a servlet type, so a gateway responder
+	/// can dispatch or splice both directions by that target.
+	///
+	/// The target names a servlet type, exactly as `HiveContext::call`
+	/// does: the caller says what work it wants, never a specific
+	/// instance. A `Urn<'static>` const passes with no allocation.
+	/// Otherwise identical to [`open_duplex`](Self::open_duplex).
+	///
+	/// # Errors
+	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
+	/// - `Draining`: GoAway sent or received. No new streams
+	pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
+		self.open_duplex_routed(StreamRoute::to(target.into()))
+	}
+
+	/// Open core shared by the routed and unrouted entries. The route
+	/// parts ride the sink until its first chunk emits the Open.
+	fn open_duplex_routed(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
+		let (target, forwarded) = route.into_parts();
 		let (sender, receiver) = oneshot::channel();
 		let reservation = self.shared.reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
@@ -310,6 +363,8 @@ impl MuxHandle {
 			Arc::clone(&self.shared),
 			outbound_handle(&self.outbound),
 			Some(forwarder),
+			target,
+			forwarded,
 		);
 		Ok((sink, body))
 	}
@@ -337,6 +392,8 @@ impl MuxHandle {
 			payload: first,
 			records: total,
 			duplex: None,
+			target: None,
+			forwarded: false,
 		};
 
 		let stream_id = send_open_envelope(&self.shared, &mut outbound, reservation, &mut request).await?;
@@ -487,6 +544,7 @@ mod tests {
 	use super::super::testing::{client_shared, poll_chunk, poll_now};
 	use super::*;
 	use crate::transport::envelopes::MuxEnvelope;
+	use crate::utils::urn::Urn;
 
 	fn duplex_handle() -> (MuxHandle, mpsc::Receiver<Outbound>) {
 		let (outbound, sent) = mpsc::channel(8);
@@ -518,6 +576,42 @@ mod tests {
 		));
 		assert!(handle.shared.take_duplex(1).is_none());
 		assert!(!handle.shared.is_pending(1));
+	}
+
+	// open_stream_to stamps the grpc-style route on the stream's
+	// Open record so a gateway responder can dispatch or splice by
+	// target. The unrouted open remains route-free.
+	#[test]
+	fn test_open_stream_to_stamps_route_on_open() -> TransportResult<()> {
+		let (handle, mut sent) = duplex_handle();
+		let target = Urn::new("tb", "servlet:ledger");
+		let (sink, _response) = handle.open_stream_to(target.clone())?;
+		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
+
+		assert!(matches!(
+			sent.try_recv(),
+			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
+				if package.target() == Some(&target) && !package.forwarded()
+		));
+
+		Ok(())
+	}
+
+	// The unrouted open path carries no route: open_stream emits an
+	// Open with no target and no forwarded flag.
+	#[test]
+	fn test_open_stream_local_open_has_no_route() -> TransportResult<()> {
+		let (handle, mut sent) = duplex_handle();
+		let (sink, _response) = handle.open_stream()?;
+		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
+
+		assert!(matches!(
+			sent.try_recv(),
+			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
+				if package.target().is_none() && !package.forwarded()
+		));
+
+		Ok(())
 	}
 
 	// A resolved reply disarms the guard: dropping the body after
