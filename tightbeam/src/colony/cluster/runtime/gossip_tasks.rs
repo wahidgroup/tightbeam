@@ -5,6 +5,9 @@ use core::str::{from_utf8, FromStr};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[cfg(feature = "x509")]
+use std::sync::Mutex;
+
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool};
 use crate::colony::cluster::runtime::refuse::refuse_gossip;
 use crate::colony::cluster::runtime::work::{balancer_pick, forward_work};
@@ -238,6 +241,8 @@ pub(crate) async fn reflood_gossip<P, D>(
 		};
 
 		let peer_pool = Arc::clone(&peer_pool);
+		// Each emit consumes an owned frame, so a fan-out to N targets
+		// needs N owned frames. The clone is that fan-out cost.
 		let frame = signed_frame.clone();
 		fanout.spawn(async move {
 			if let Ok(mut client) = peer_pool.connect(peer_addr).await {
@@ -263,6 +268,8 @@ async fn mint_ad_frame<D>(
 where
 	D: ClusterDigest,
 {
+	// The wire type owns its bytes, so the encode boundary takes an
+	// owned copy of the address.
 	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
 		gateway_addr: gateway_addr.to_vec(),
 		advertised_types: types,
@@ -279,14 +286,15 @@ where
 	Ok(signed_frame)
 }
 
-/// Sign and send one peer advertisement to a dialed peer gateway.
+/// Send one pre-signed peer advertisement to a dialed peer gateway.
+///
+/// The caller mints and signs one frame per beat and fans it out, so
+/// a dial never pays a per-peer signature.
 #[cfg(feature = "x509")]
-pub(crate) async fn send_advertisement_async<P, D>(
+pub(crate) async fn send_advertisement_async<P>(
 	pool: Arc<ClusterPool<P>>,
-	config: Arc<ClusterConfig>,
 	peer_addr: P::Address,
-	gateway_addr: Arc<[u8]>,
-	types: Vec<Urn<'static>>,
+	signed_frame: Frame,
 ) -> Result<TransitStatus, ClusterError>
 where
 	P: Protocol
@@ -305,10 +313,7 @@ where
 		+ Send
 		+ Sync
 		+ 'static,
-	D: ClusterDigest,
 {
-	let signed_frame = mint_ad_frame::<D>(&config, gateway_addr.as_ref(), types).await?;
-
 	let mut client = pool.connect(peer_addr).await?;
 	let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
@@ -373,9 +378,9 @@ where
 ///   advertisement is an ephemeral hint, and re-publish is what keeps
 ///   it fresh.
 /// - The origin never applies its own slate.
-/// - A local fault skips this beat and traces
-///   `CLUSTER_PEER_AD_PUBLISH_FAILED` for the audit trail. A later
-///   beat publishes a fresh rumor.
+/// - A mint fault returns `false` and traces
+///   `CLUSTER_PEER_AD_PUBLISH_FAILED` for the audit trail. The caller
+///   keeps its publish baseline, so the next beat retries.
 #[cfg(feature = "x509")]
 pub(crate) async fn publish_slate_rumor<P, D>(
 	pool: Arc<ClusterPool<P>>,
@@ -383,7 +388,8 @@ pub(crate) async fn publish_slate_rumor<P, D>(
 	trace: Arc<TraceCollector>,
 	gateway_addr: Arc<[u8]>,
 	types: Vec<Urn<'static>>,
-) where
+) -> bool
+where
 	P: Protocol
 		+ PersistentConnection
 		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
@@ -404,7 +410,7 @@ pub(crate) async fn publish_slate_rumor<P, D>(
 {
 	let Some(minted) = mint_slate_rumor::<D>(&config, gateway_addr.as_ref(), types).await else {
 		let _ = trace.event(CLUSTER_PEER_AD_PUBLISH_FAILED);
-		return;
+		return false;
 	};
 
 	// Witness the published digest so the origin's own echo dedups
@@ -419,6 +425,8 @@ pub(crate) async fn publish_slate_rumor<P, D>(
 	// a published rumor.
 	let hop_ttl = u64::from(config.gossip.ttl.min(MAX_GOSSIP_TTL));
 	reflood_gossip::<P, D>(pool, config, minted.rumor, hop_ttl.saturating_sub(1)).await;
+
+	true
 }
 
 /// Dial address of a relaying peer, from its live direct routes.
@@ -661,6 +669,8 @@ where
 	let Ok(held_digests) = config.gossip.journal.held_digests(now) else {
 		return Ok(());
 	};
+	// The reconciliation wire type carries digests as owned OCTET
+	// STRING bytes, so each fixed-size digest copies once here.
 	let held: Vec<Vec<u8>> = held_digests.iter().map(|digest| digest.to_vec()).collect();
 
 	let mut client = pool.connect(peer_addr).await?;
@@ -975,25 +985,52 @@ where
 /// the same cadence: on change and on a slow timer, never per beat
 /// (see [`DEFAULT_AD_RUMOR_REFRESH_MS`] for the source).
 ///
+/// The publish task detaches from the beat, so a claim settles in two
+/// steps rather than at claim time.
+///
+/// - [`Self::take_due`] claims a publish slot and blocks re-entry
+///   while the task runs.
+/// - [`Self::commit`] records the baseline after a rumor went out.
+/// - [`Self::abort`] releases a failed claim with the old baseline
+///   intact, so the next beat retries.
+///
 /// [`DEFAULT_AD_RUMOR_REFRESH_MS`]: crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS
 #[cfg(feature = "x509")]
 struct AdPublishState {
-	last: Option<(u64, Vec<Urn<'static>>, Vec<String>)>,
+	inner: Mutex<AdPublishInner>,
 	refresh_ms: u64,
+}
+
+/// Baseline and claim flag behind the [`AdPublishState`] lock.
+#[cfg(feature = "x509")]
+#[derive(Default)]
+struct AdPublishInner {
+	last: Option<(u64, Vec<Urn<'static>>, Vec<String>)>,
+	in_flight: bool,
 }
 
 #[cfg(feature = "x509")]
 impl AdPublishState {
 	fn new(refresh: Duration) -> Self {
 		let refresh_ms = u64::try_from(refresh.as_millis()).unwrap_or(u64::MAX);
-		Self { last: None, refresh_ms }
+		Self { inner: Mutex::new(AdPublishInner::default()), refresh_ms }
 	}
 
-	/// Claim one due publish: `true` records `now` and the published
-	/// state, `false` leaves the state untouched so the next beat
-	/// re-evaluates against the same baseline.
-	fn take_due(&mut self, now: u64, slate: &[Urn<'static>], targets: &[String]) -> bool {
-		let due = match &self.last {
+	/// Claim one due publish slot.
+	///
+	/// `true` marks a publish in flight and leaves the baseline
+	/// untouched until the task settles the claim. `false` means
+	/// nothing changed, the refresh is not due, or a publish is
+	/// already in flight.
+	fn take_due(&self, now: u64, slate: &[Urn<'static>], targets: &[String]) -> bool {
+		let Ok(mut inner) = self.inner.lock() else {
+			return false;
+		};
+		if inner.in_flight {
+			return false;
+		}
+
+		let due = match &inner.last {
 			None => true,
 			Some((at_ms, published_slate, published_targets)) => {
 				published_slate != slate
@@ -1001,11 +1038,28 @@ impl AdPublishState {
 					|| now.saturating_sub(*at_ms) >= self.refresh_ms
 			}
 		};
-		if due {
-			self.last = Some((now, slate.to_vec(), targets.to_vec()));
-		}
 
+		inner.in_flight = due;
 		due
+	}
+
+	/// Record a completed publish as the new suppression baseline.
+	fn commit(&self, now: u64, slate: Vec<Urn<'static>>, targets: Vec<String>) {
+		let Ok(mut inner) = self.inner.lock() else {
+			return;
+		};
+
+		inner.last = Some((now, slate, targets));
+		inner.in_flight = false;
+	}
+
+	/// Release a failed claim without touching the baseline.
+	fn abort(&self) {
+		let Ok(mut inner) = self.inner.lock() else {
+			return;
+		};
+
+		inner.in_flight = false;
 	}
 }
 
@@ -1053,7 +1107,7 @@ where
 		// the live target and probe addresses, so churned PEX hints cannot
 		// grow the map without bound (CWE-770).
 		let mut push_ledger: HashMap<String, HashSet<GossipDigest>> = HashMap::new();
-		let mut ad_publish = AdPublishState::new(config.peer.rumor_refresh);
+		let ad_publish = Arc::new(AdPublishState::new(config.peer.rumor_refresh));
 		loop {
 			rt::sleep(interval).await;
 
@@ -1104,32 +1158,66 @@ where
 			// install a direct trail to it. The flood detaches, like
 			// the pipeline reflood, because a slow or dead flood
 			// target must not stall the direct advertisements below.
+			// The task settles the claim itself: the baseline commits
+			// only after a rumor went out, so a failed mint retries on
+			// the next beat instead of waiting out the refresh.
 			let now = current_timestamp_ms();
 			if config.colony_urn().is_some() && ad_publish.take_due(now, &slate, &targets) {
-				drop(rt::spawn(publish_slate_rumor::<P, D>(
-					Arc::clone(&pool),
-					Arc::clone(&config),
-					Arc::clone(&trace),
-					Arc::clone(&gateway_addr),
-					slate.clone(),
-				)));
+				let publish_state = Arc::clone(&ad_publish);
+				let publish_pool = Arc::clone(&pool);
+				let publish_config = Arc::clone(&config);
+				let publish_trace = Arc::clone(&trace);
+				let publish_addr = Arc::clone(&gateway_addr);
+				// The captured vectors become the commit baseline, and
+				// the mint consumes its own slate copy inside the task.
+				let publish_slate = slate.clone();
+				let publish_targets = targets.clone();
+				drop(rt::spawn(async move {
+					let published = publish_slate_rumor::<P, D>(
+						publish_pool,
+						publish_config,
+						publish_trace,
+						publish_addr,
+						publish_slate.clone(),
+					)
+					.await;
+					if published {
+						publish_state.commit(current_timestamp_ms(), publish_slate, publish_targets);
+					} else {
+						publish_state.abort();
+					}
+				}));
+			}
+
+			// One mint and one signature serve every direct target this
+			// beat. The frame carries no peer-specific field, so each
+			// dial takes a clone of the signed frame instead of paying
+			// a fresh signature. The mint takes the slate by move, as
+			// its last use this beat. A mint fault skips the direct
+			// advertisements but never the reconcile rounds.
+			let mut ad_frame = None;
+			if !targets.is_empty() {
+				ad_frame = mint_ad_frame::<D>(&config, gateway_addr.as_ref(), slate).await.ok();
 			}
 
 			for peer in targets.iter() {
 				let Ok(peer_addr) = peer.parse::<P::Address>() else {
 					continue;
 				};
-				let _ = send_advertisement_async::<P, D>(
-					Arc::clone(&pool),
-					Arc::clone(&config),
-					peer_addr.clone(),
-					Arc::clone(&gateway_addr),
-					slate.clone(),
-				)
-				.await;
+
+				if let Some(frame) = &ad_frame {
+					// The dial consumes both arguments. The address
+					// serves the reconcile below again, and the frame
+					// serves every remaining target.
+					let _ = send_advertisement_async::<P>(Arc::clone(&pool), peer_addr.clone(), frame.clone()).await;
+				}
+
 				// Anti-entropy runs in the same beat, for colony
 				// members only.
 				if config.colony_urn().is_some() {
+					// The entry API takes an owned key even on a hit, and
+					// the short address clone costs less than a second
+					// lookup.
 					let acked = push_ledger.entry(peer.clone()).or_default();
 					let round = reconcile_gossip_async::<P, D>(
 						Arc::clone(&pool),
@@ -1168,6 +1256,9 @@ where
 						let _ = config.peer.table.discard(peer);
 						continue;
 					};
+
+					// The entry API takes an owned key even on a hit, and
+					// the short address clone costs less than a second lookup.
 					let acked = push_ledger.entry(peer.clone()).or_default();
 					let probed = reconcile_gossip_async::<P, D>(
 						Arc::clone(&pool),
@@ -1261,14 +1352,15 @@ mod tests {
 
 	#[test]
 	fn ad_publish_first_beat_is_due() {
-		let mut state = AdPublishState::new(Duration::from_millis(1_000));
+		let state = AdPublishState::new(Duration::from_millis(1_000));
 		assert!(state.take_due(0, &[], &[]));
 	}
 
 	#[test]
 	fn ad_publish_unchanged_state_suppresses_until_refresh() {
-		let mut state = AdPublishState::new(Duration::from_millis(1_000));
+		let state = AdPublishState::new(Duration::from_millis(1_000));
 		state.take_due(0, &[], &[]);
+		state.commit(0, Vec::new(), Vec::new());
 
 		assert!(!state.take_due(999, &[], &[]));
 		assert!(state.take_due(1_000, &[], &[]));
@@ -1276,26 +1368,56 @@ mod tests {
 
 	#[test]
 	fn ad_publish_slate_change_fires_before_refresh() {
-		let mut state = AdPublishState::new(Duration::from_millis(1_000));
+		let state = AdPublishState::new(Duration::from_millis(1_000));
 		state.take_due(0, &[], &[]);
+		state.commit(0, Vec::new(), Vec::new());
 
 		assert!(state.take_due(1, &ad_slate(&["ping"]), &[]));
 	}
 
 	#[test]
 	fn ad_publish_target_change_fires_before_refresh() {
-		let mut state = AdPublishState::new(Duration::from_millis(1_000));
+		let state = AdPublishState::new(Duration::from_millis(1_000));
 		state.take_due(0, &[], &[]);
+		state.commit(0, Vec::new(), Vec::new());
 
 		assert!(state.take_due(1, &[], &[String::from("peer:1")]));
 	}
 
 	#[test]
 	fn ad_publish_suppressed_beat_keeps_the_refresh_baseline() {
-		let mut state = AdPublishState::new(Duration::from_millis(1_000));
+		let state = AdPublishState::new(Duration::from_millis(1_000));
 		state.take_due(0, &[], &[]);
+		state.commit(0, Vec::new(), Vec::new());
 		state.take_due(500, &[], &[]);
 
 		assert!(state.take_due(1_000, &[], &[]));
+	}
+
+	#[test]
+	fn ad_publish_claim_in_flight_blocks_reentry() {
+		let state = AdPublishState::new(Duration::from_millis(1_000));
+		state.take_due(0, &[], &[]);
+
+		assert!(!state.take_due(1, &ad_slate(&["ping"]), &[]));
+	}
+
+	#[test]
+	fn ad_publish_aborted_claim_retries_on_the_next_beat() {
+		let state = AdPublishState::new(Duration::from_millis(1_000));
+		state.take_due(0, &[], &[]);
+		state.abort();
+
+		assert!(state.take_due(1, &[], &[]));
+	}
+
+	#[test]
+	fn ad_publish_commit_settles_the_claim_and_the_baseline() {
+		let state = AdPublishState::new(Duration::from_millis(1_000));
+		state.take_due(0, &[], &[]);
+		state.commit(500, Vec::new(), Vec::new());
+
+		assert!(!state.take_due(1_499, &[], &[]));
+		assert!(state.take_due(1_500, &[], &[]));
 	}
 }

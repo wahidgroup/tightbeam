@@ -1066,7 +1066,7 @@ mod tests {
 		const TEST_TRANSCRIPT: [u8; 32] = [1u8; 32];
 		const TEST_SESSION_KEY: [u8; 32] = [2u8; 32];
 
-		/// Drive Init → Complete for a mutual-auth CMS server handshake.
+		/// Drive Init -> Complete for a mutual-auth CMS server handshake.
 		async fn complete_handshake(
 			server: &mut CmsHandshakeServer<DefaultCryptoProvider>,
 			server_public_key: &PublicKey<k256::Secp256k1>,
