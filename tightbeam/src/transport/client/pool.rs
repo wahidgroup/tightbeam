@@ -1146,9 +1146,9 @@ pooled_mux! {
 		/// Open a streamed request carrying a fully-formed [`StreamRoute`].
 		///
 		/// The crate-internal entry a gateway uses to re-emit a client
-		/// stream to a peer gateway with [`StreamRoute::forwarded_to`],
-		/// so the peer serves it locally and never re-forwards. Otherwise
-		/// identical to [`open_stream`](Self::open_stream).
+		/// stream to a peer gateway with [`StreamRoute::relayed_to`] and
+		/// the relay budget decremented. Otherwise identical to
+		/// [`open_stream`](Self::open_stream).
 		///
 		/// # Errors
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
@@ -1193,9 +1193,9 @@ pooled_mux! {
 		/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
 		///
 		/// The crate-internal entry a gateway uses to re-emit a client
-		/// duplex stream to a peer gateway with [`StreamRoute::forwarded_to`],
-		/// so the peer serves it locally and never re-forwards. Otherwise
-		/// identical to [`open_duplex`](Self::open_duplex).
+		/// duplex stream to a peer gateway with [`StreamRoute::relayed_to`]
+		/// and the relay budget decremented. Otherwise identical to
+		/// [`open_duplex`](Self::open_duplex).
 		///
 		/// # Errors
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane

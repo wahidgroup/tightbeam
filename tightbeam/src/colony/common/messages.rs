@@ -1,6 +1,6 @@
 //! Protocol messages for cluster-hive communication
 //!
-//! All message types used in the cluster ↔ hive protocol.
+//! All message types used in the protocol between cluster and hive.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 #[cfg(feature = "x509")]
 use crate::asn1::Frame;
+use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
 use crate::utils::urn::Urn;
@@ -31,27 +32,38 @@ pub struct ClusterWorkRequest {
 	pub servlet_type: Urn<'static>,
 	/// Raw message payload (encoded inner message)
 	pub payload: Vec<u8>,
-	/// Whether a peer gateway already forwarded this work once
+	/// Relay budget: how many gateway forwards this work may still spend
 	///
-	/// Client origin is `false` ([`ClusterWorkRequest::new`]). A gateway
-	/// that selects a Peer route sets this when re-emitting to the peer.
-	/// An inbound `true` is served locally only and never re-forwarded.
-	pub forwarded: bool,
+	/// A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel
+	/// ([`ClusterWorkRequest::new`]), which defers the budget to
+	/// gateway policy. Each gateway clamps the inbound value to its
+	/// own `max_hops`, so one clamp rule covers the origin sentinel
+	/// and a relayed value. A gateway that selects a peer route
+	/// re-emits with the clamped budget decremented
+	/// ([`ClusterWorkRequest::into_relayed`]). An inbound `0` is
+	/// served locally only and never re-forwarded.
+	pub hops_remaining: u8,
 }
 
-wire_sequence!(ClusterWorkRequest { servlet_type: plain, payload: octets, forwarded: plain });
+wire_sequence!(ClusterWorkRequest {
+	servlet_type: plain,
+	payload: octets,
+	hops_remaining: default(DEFAULT_HOP_BUDGET),
+});
 
 impl ClusterWorkRequest {
-	/// Origin work from a client (`forwarded = false`)
+	/// Origin work from a client: the sentinel budget defers the hop
+	/// cap to the first gateway's `max_hops` policy.
 	#[must_use]
 	pub fn new(servlet_type: Urn<'static>, payload: Vec<u8>) -> Self {
-		Self { servlet_type, payload, forwarded: false }
+		Self { servlet_type, payload, hops_remaining: DEFAULT_HOP_BUDGET }
 	}
 
-	/// Mark this request as already forwarded (loop-guard probe / peer hop)
+	/// Re-emit toward a peer with the remaining relay budget. A `0`
+	/// budget is the terminal hop: the receiver serves locally only.
 	#[must_use]
-	pub fn into_forwarded(mut self) -> Self {
-		self.forwarded = true;
+	pub fn into_relayed(mut self, hops_remaining: u8) -> Self {
+		self.hops_remaining = hops_remaining;
 		self
 	}
 }
@@ -103,7 +115,7 @@ pub enum ClusterRequest {
 	/// Relayed origin-signed rumor frame from a peer gateway [context 4]
 	///
 	/// Boxed because a nested [`Frame`] is far larger than the other
-	/// variants; the wire encoding is unchanged.
+	/// variants. The wire encoding is unchanged.
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "4", constructed = "true")]
 	Gossip(Box<Frame>),
@@ -195,6 +207,21 @@ pub struct PeerAdvertisementResponse {
 	pub status: TransitStatus,
 }
 
+/// How a receiving gateway consumes an admitted rumor payload.
+///
+/// The kind travels inside the signed rumor body, so a relay cannot
+/// reinterpret an application payload as routing control.
+#[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GossipRumorKind {
+	/// Opaque application payload delivered through the ingress policy.
+	#[default]
+	Application = 0,
+	/// Origin-signed peer advertisement frame bytes, applied to the
+	/// receiving gateway's peer routing state for transitive discovery.
+	PeerAdvertisement = 1,
+}
+
 /// The signed content of one gossip rumor: its opaque payload.
 ///
 /// This one structure serves both gossip roles. A publisher sends it as
@@ -220,9 +247,28 @@ pub struct PeerAdvertisementResponse {
 pub struct GossipRumor {
 	/// Opaque application payload delivered through the ingress policy.
 	pub payload: Vec<u8>,
+	/// How the receiving gateway consumes `payload`. The common
+	/// application kind is the DER DEFAULT, so it is omitted on the
+	/// wire.
+	pub kind: GossipRumorKind,
 }
 
-wire_sequence!(GossipRumor { payload: octets });
+wire_sequence!(GossipRumor { payload: octets, kind: default(GossipRumorKind::Application) });
+
+impl GossipRumor {
+	/// Application rumor delivered through the ingress policy.
+	#[must_use]
+	pub fn application(payload: Vec<u8>) -> Self {
+		Self { payload, kind: GossipRumorKind::Application }
+	}
+
+	/// Advertisement rumor carrying an origin-signed ad frame's DER
+	/// bytes for transitive peer discovery.
+	#[must_use]
+	pub fn peer_advertisement(ad_frame: Vec<u8>) -> Self {
+		Self { payload: ad_frame, kind: GossipRumorKind::PeerAdvertisement }
+	}
+}
 
 /// Response to a gossip rumor
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
@@ -251,7 +297,7 @@ wire_sequence!(GossipReconciliation { held: octets_seq });
 /// still an unverified hint to its receiver: admission is bounded per
 /// address prefix, and only a probe dial whose handshake certificate
 /// proves the local colony makes the peer a dial target. The
-/// fingerprint is advisory identity for deduplication; trust never
+/// fingerprint is advisory identity for deduplication, and trust never
 /// derives from exchanged bytes (CWE-345).
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerGossip {
@@ -646,7 +692,7 @@ mod tests {
 	#[cfg(feature = "x509")]
 	#[test]
 	fn cluster_request_gossip_round_trips() -> Result<()> {
-		let rumor_body = GossipRumor { payload: vec![0x02, 0x01, 0x2A] };
+		let rumor_body = GossipRumor::application(vec![0x02, 0x01, 0x2A]);
 		let rumor = Frame {
 			version: crate::asn1::Version::V0,
 			metadata: crate::asn1::Metadata {
@@ -671,7 +717,7 @@ mod tests {
 	#[cfg(feature = "x509")]
 	#[test]
 	fn cluster_request_publish_gossip_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::PublishGossip(GossipRumor { payload: vec![0x02, 0x01, 0x2A] }))
+		round_trip(ClusterRequest::PublishGossip(GossipRumor::application(vec![0x02, 0x01, 0x2A])))
 	}
 
 	#[cfg(feature = "x509")]

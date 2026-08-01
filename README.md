@@ -3033,10 +3033,14 @@ Behavior:
 2. The receiver admits on the peer trust plane: signature, freshness, colony membership on both sides, parseable dial address, optional allowlist, and namespace-scoped servlet types.
 3. Installed routes are soft-state and keyed by the peer's signer certificate fingerprint. The claimed `gateway_addr` is the dial target. An empty advertisement clears that peer's routes.
 4. The load balancer selects among Local and Peer trails together. Locality emerges from pheromone strength rather than a hard preference flag.
-5. A peer hop re-emits `ClusterWorkRequest` with `forwarded: true`. An inbound forwarded request is local-only--a one-hop loop guard so peer graphs cannot bounce work forever.
+5. A peer hop re-emits `ClusterWorkRequest` with a decremented `hops_remaining` budget. The origin stamps the sentinel `u8::MAX`, which means forward as far as policy allows. The first gateway clamps that to its `PeerConfig::max_hops` (default 1). A default topology therefore forwards exactly once, and peer graphs cannot bounce work forever. A spent budget refuses `Unavailable` instead of forwarding.
 6. Peer dials prefer the peer connection pool when `peer_trust` is set. Peer failures weaken trails and can abandon a grey-hole peer while local routes keep serving.
 
 `peers` is a dial list, not an identity mesh. Partial or asymmetric peer graphs are expected.
+
+Member gateways also flood their slate as an advertisement rumor, so peers of peers learn exported types transitively. A relayed rumor installs two soft-state trails. The direct trail dials the origin's claimed address. The relay trail dials the delivering peer and reconciles under its own composite bucket.
+
+The relay trail competes for selection only when the remaining hop budget covers the extra hop (`max_hops >= 2`). A dead direct address then fails over to it by pheromone weakening. The rumor refloods on change, or every `PeerConfig::rumor_refresh` while unchanged.
 
 ##### Heartbeat Mechanism
 
@@ -3070,7 +3074,7 @@ When multiple instances support the same servlet type, the cluster uses a `LoadB
 
 ##### Colony Gossip
 
-Colony gossip floods origin-signed rumors across member gateways--the pheromone broadcast of the swarm. A publisher asks the local gateway to mint a rumor; peers relay and repair until hop budget or freshness expires.
+Colony gossip floods origin-signed rumors across member gateways: the pheromone broadcast of the swarm. A publisher asks the local gateway to mint a rumor; peers relay and repair until hop budget or freshness expires.
 
 ```rust
 let conf = ClusterConfig::builder(tls)
@@ -3088,7 +3092,7 @@ Flow:
 
 1. **Publish**: A hive-plane signed `PublishGossip` carries `GossipRumor { payload }`. The accepting origin gateway must be a colony member. It mints an origin-signed rumor Frame (id and issue time from the publish frame) and starts the flood.
 2. **Relay**: Peers carry `ClusterRequest::Gossip` with an outer relay Frame. Hop radius lives only in the outer `metadata.lifetime`. The inner rumor stays byte-identical under the origin signature. Relays verify on the peer trust plane; the origin colony URN MUST equal the local gateway's colony URN.
-3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice.
+3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice. An application rumor is recorded for repair and delivery retry. A peer advertisement rumor is only witnessed (`GossipJournal::witness`, a required trait method). Its digest deduplicates and breaks flood loops, but the bytes are never retained, repaired, or delivered locally.
 4. **Local ingress**: `GossipConfig.ingress` names a servlet type on the receiving gateway. `None` means journal and reflood only (immediate local ack).
 5. **Reflood**: Remaining hop TTL and a non-empty `peers` list continue the flood.
 6. **Reconcile**: `ReconcileGossip` exchanges held digests; the peer answers with `GossipWant`. The advertise beat also runs anti-entropy repair and pending-local retry.
@@ -3102,12 +3106,12 @@ Clients interact with clusters through work request messages:
 1. Client sends `ClusterWorkRequest` with `servlet_type` and encoded `payload`
 2. Cluster looks up Local and Peer routes for that servlet type
 3. Load balancer selects an instance (hive or peer gateway)
-4. Cluster forwards the payload--directly to a local hive, or one hop to a peer with `forwarded: true`
+4. Cluster forwards the payload: directly to a local hive, or to a peer gateway with a decremented `hops_remaining` budget
 5. The serving hive processes and returns a response
 6. Cluster wraps the response in `ClusterWorkResponse` and returns it to the client
 
 ```rust
-// Client sends (forwarded defaults to false):
+// Client sends (hops_remaining defaults to the u8::MAX origin sentinel):
 let request = ClusterWorkRequest::new(
 	servlet_type_urn, // e.g. urn:tightbeam::servlet:calculator
 	encode(&CalcRequest { value: 42 })?,
@@ -3132,6 +3136,12 @@ pub struct PeerConfig {
 	pub advertise_interval: Option<Duration>,
 	/// Optional exact-match allowlist for claimed peer dial addresses
 	pub peer_dial_allowlist: Option<Vec<String>>,
+	/// Hop budget honored on inbound work and routed stream opens
+	/// (default 1; `0` disables forwarding; `2` enables relay fallback)
+	pub max_hops: u8,
+	/// Advertisement rumor reflood interval while the slate is unchanged
+	/// (keep it under the gossip freshness window)
+	pub rumor_refresh: Duration,
 }
 
 pub struct ClusterConfig {

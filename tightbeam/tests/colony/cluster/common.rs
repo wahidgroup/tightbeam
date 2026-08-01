@@ -64,8 +64,8 @@ pub(super) use tightbeam::{
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
 
 /// Failed forwards a peer trail tolerates before abandonment in the
-/// infection-containment scenarios. Kept small so the gate stays fast;
-/// the containment specs assert exactly this many `CLUSTER_WORK_FAILED`
+/// infection-containment scenarios. Kept small so the gate stays fast.
+/// The containment specs assert exactly this many `CLUSTER_WORK_FAILED`
 /// before selection drops the peer.
 pub(super) const CONTAINMENT_ABANDON_LIMIT: u32 = 3;
 
@@ -83,6 +83,27 @@ pub(super) fn test_colony_urn() -> Urn<'static> {
 
 pub(super) fn cluster_certs() -> ClusterTestCerts {
 	GatewayCerts::generate_colony(&test_colony_urn())
+}
+
+/// Fresh gateway identity in `colony`: a random key and a certificate
+/// that carries the colony URN as a URI SAN.
+///
+/// [`cluster_certs`] cannot serve for multi-gateway topologies: every
+/// generated cert shares the fixed test signing key. All gateways
+/// would then resolve to one signer fingerprint, and a relay could
+/// never be told apart from an origin.
+pub(super) fn colony_identity(cn: &str, colony: &Urn<'_>) -> (Certificate, Secp256k1SigningKey) {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
+
+	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let cert = create_test_certificate_with_cn_and_uri_sans(&raw, cn, &[&colony.to_string()]);
+	(cert, Secp256k1SigningKey::from(raw))
+}
+
+/// [`colony_identity`] in the colony every member gateway joins.
+pub(super) fn member_identity(cn: &str) -> (Certificate, Secp256k1SigningKey) {
+	colony_identity(cn, &test_colony_urn())
 }
 
 // ============================================================================
@@ -194,6 +215,25 @@ pub(super) fn record_work_status(trace: &TraceCollector, response: &ClusterWorkR
 	trace.event_with(WORK_STATUS, &[], response.status)?;
 	trace.event_with(WORK_PAYLOAD, &[], u64::from(response.payload.is_some()))?;
 	Ok(())
+}
+
+/// Sign a [`ClusterRequest::PublishGossip`] control frame with issue-time
+/// order and hop radius.
+pub(super) async fn signed_publish_gossip(
+	key: &Secp256k1SigningKey,
+	id: &[u8],
+	body: GossipRumor,
+	hop_ttl: u64,
+) -> Result<Frame, TightBeamError> {
+	let unsigned = frame_compose(Version::V2)
+		.with_id(id)
+		.with_order(current_timestamp_ms())
+		.with_lifetime(hop_ttl)
+		.with_message(ClusterRequest::PublishGossip(body))
+		.build()?;
+
+	let provider = Secp256k1KeyProvider::from(key.to_owned());
+	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
 }
 
 pub(super) async fn signed_control_frame_with_order(
@@ -369,7 +409,7 @@ cluster! {
 }
 
 /// Ping-servlet hive with an optional mux offer for both the hive control
-/// server and the hive -> cluster pool, on the scenario trace.
+/// server and the hive-to-cluster pool, on the scenario trace.
 pub(super) async fn start_ping_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
@@ -388,17 +428,24 @@ pub(super) async fn start_ping_hive(
 }
 
 /// Cluster conf with an optional mux offer for both the gateway server
-/// and the cluster -> hive pool.
+/// and the cluster-to-hive pool.
 pub(super) fn routing_cluster_conf(certs: &ClusterTestCerts, mux_offer: Option<TransportOffer>) -> ClusterConfig {
 	let mut conf = ClusterConfig::new(cluster_tls_config(certs));
 	conf.pool_config.mux_offer = mux_offer.map(Arc::new);
 	conf
 }
 
+/// Add the standard eight-stream mux offer to a cluster conf, so the
+/// gateway serves routed streams and its pools open them.
+pub(super) fn with_mux_offer(mut conf: ClusterConfig) -> ClusterConfig {
+	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+	conf
+}
+
 /// Emit one ping work request through the gateway and record the echoed
 /// payload as a valued event. The spec asserts the gateway routed it
-/// (`events::CLUSTER_WORK_ROUTED`) and the echo value (`WORK_ECHOED`);
-/// a refusal or missing payload leaves `WORK_ECHOED` absent.
+/// (`events::CLUSTER_WORK_ROUTED`) and the echo value (`WORK_ECHOED`).
+/// A refusal or missing payload leaves `WORK_ECHOED` absent.
 pub(super) async fn record_ping_echo(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
@@ -454,13 +501,13 @@ pub(super) async fn emit_ping_work(
 	decode(&emit_frame(client, frame).await?.message)
 }
 
-/// Ping work already marked forwarded (loop-guard probe).
-pub(super) async fn emit_forwarded_ping_work(
+/// Ping work with a spent relay budget (hop-exhaustion probe).
+pub(super) async fn emit_relayed_ping_work(
 	client: &mut GenericClient<TokioListener>,
 	id: &[u8],
 ) -> Result<ClusterWorkResponse, TightBeamError> {
 	let work_request = ClusterRequest::Work(
-		ClusterWorkRequest::new(servlet_urn("ping"), encode(&PingRequest { value: 21 })?).into_forwarded(),
+		ClusterWorkRequest::new(servlet_urn("ping"), encode(&PingRequest { value: 21 })?).into_relayed(0),
 	);
 
 	let frame = frame_compose(Version::V0)
@@ -512,7 +559,7 @@ pub(super) fn peering_with_dial_allowlist(certs: &ClusterTestCerts, allowlist: V
 }
 
 /// Importer conf whose peer trails abandon after a few failed forwards.
-/// The limit is small so containment scenarios stay fast; the specs pin
+/// The limit is small so containment scenarios stay fast. The specs pin
 /// [`CONTAINMENT_ABANDON_LIMIT`] failures before routing stops.
 pub(super) fn containment_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 	let mut conf = peering_cluster_conf(certs);

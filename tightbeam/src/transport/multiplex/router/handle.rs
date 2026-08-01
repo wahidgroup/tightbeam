@@ -16,6 +16,7 @@ use super::shared::{
 };
 use super::sink::{send_data_envelope, send_open_envelope, RequestSink};
 use super::writer::{drain_with_reason, renew_or_drain};
+use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{
@@ -103,7 +104,7 @@ impl Drop for ForgetPingOnDrop {
 	}
 }
 
-/// Prefer moving the frame out of the Arc; deep-copy only when the
+/// Prefer moving the frame out of the Arc. Deep-copy only when the
 /// inbound path still holds a shared reference (dual ownership).
 fn unwrap_frame(frame: Arc<Frame>) -> Frame {
 	Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone())
@@ -259,15 +260,15 @@ impl MuxHandle {
 	/// Open a streaming request carrying a fully-formed [`StreamRoute`].
 	///
 	/// Shared open core behind [`open_stream`](Self::open_stream) and
-	/// [`open_stream_to`](Self::open_stream_to); the crate-internal
-	/// entry a gateway uses to re-emit a client stream to a peer with
-	/// [`StreamRoute::forwarded_to`]. The route parts ride the sink
-	/// until its first chunk emits the Open.
+	/// [`open_stream_to`](Self::open_stream_to). It is the
+	/// crate-internal entry a gateway uses to re-emit a client stream
+	/// to a peer with [`StreamRoute::relayed_to`]. The route parts
+	/// stay on the sink until its first chunk emits the Open.
 	pub(crate) fn open_stream_with_route(
 		&self,
 		route: StreamRoute,
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-		let (target, forwarded) = route.into_parts();
+		let (target, hops_remaining) = route.into_parts();
 		let (sender, receiver) = oneshot::channel();
 		let reservation = self.shared.reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
@@ -279,7 +280,7 @@ impl MuxHandle {
 			outbound_handle(&self.outbound),
 			None,
 			target,
-			forwarded,
+			hops_remaining,
 		);
 
 		let shared = Arc::clone(&self.shared);
@@ -342,12 +343,12 @@ impl MuxHandle {
 	/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
 	///
 	/// Shared open core behind [`open_duplex`](Self::open_duplex) and
-	/// [`open_duplex_to`](Self::open_duplex_to); the crate-internal
-	/// entry a gateway uses to re-emit a client duplex stream to a
-	/// peer with [`StreamRoute::forwarded_to`]. The route parts ride
-	/// the sink until its first chunk emits the Open.
+	/// [`open_duplex_to`](Self::open_duplex_to). It is the
+	/// crate-internal entry a gateway uses to re-emit a client duplex
+	/// stream to a peer with [`StreamRoute::relayed_to`]. The route
+	/// parts stay on the sink until its first chunk emits the Open.
 	pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
-		let (target, forwarded) = route.into_parts();
+		let (target, hops_remaining) = route.into_parts();
 		let (sender, receiver) = oneshot::channel();
 		let reservation = self.shared.reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
@@ -356,9 +357,9 @@ impl MuxHandle {
 		// the pending entry only holds the stream's cap slot
 		drop(receiver);
 
-		// The forwarder rides the reservation into the sink and
+		// The forwarder follows the reservation into the sink and
 		// registers under the assigned ID at first push, before the
-		// Open can reach the peer
+		// Open can reach the peer.
 		let (mut body, forwarder) =
 			stream_body(Arc::clone(&slot), self.shared.initial_recv_credit, self.drain_feedback.clone());
 
@@ -374,7 +375,7 @@ impl MuxHandle {
 			outbound_handle(&self.outbound),
 			Some(forwarder),
 			target,
-			forwarded,
+			hops_remaining,
 		);
 		Ok((sink, body))
 	}
@@ -403,7 +404,7 @@ impl MuxHandle {
 			records: total,
 			duplex: None,
 			target: None,
-			forwarded: false,
+			hops_remaining: DEFAULT_HOP_BUDGET,
 		};
 
 		let stream_id = send_open_envelope(&self.shared, &mut outbound, reservation, &mut request).await?;
@@ -590,7 +591,7 @@ mod tests {
 
 	// open_stream_to stamps the grpc-style route on the stream's
 	// Open record so a gateway responder can dispatch or splice by
-	// target. The unrouted open remains route-free.
+	// target. The origin open carries the default relay budget.
 	#[test]
 	fn test_open_stream_to_stamps_route_on_open() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
@@ -601,33 +602,33 @@ mod tests {
 		assert!(matches!(
 			sent.try_recv(),
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if package.target() == Some(&target) && !package.forwarded()
+				if package.target() == Some(&target) && package.hops_remaining() == DEFAULT_HOP_BUDGET
 		));
 
 		Ok(())
 	}
 
-	// A forwarded route stamps both the target and the loop guard on
-	// the Open, so a peer gateway serves it locally and never
-	// re-forwards it.
+	// A relayed route stamps the target and the spent budget on the
+	// Open, so a peer gateway serves it locally and never re-forwards
+	// it.
 	#[test]
-	fn test_open_stream_with_forwarded_route_stamps_guard() -> TransportResult<()> {
+	fn test_open_stream_with_relayed_route_stamps_budget() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
 		let target = Urn::new("tb", "servlet:ledger");
-		let (sink, _response) = handle.open_stream_with_route(StreamRoute::forwarded_to(target.clone()))?;
+		let (sink, _response) = handle.open_stream_with_route(StreamRoute::relayed_to(target.clone(), 0))?;
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 
 		assert!(matches!(
 			sent.try_recv(),
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if package.target() == Some(&target) && package.forwarded()
+				if package.target() == Some(&target) && package.hops_remaining() == 0
 		));
 
 		Ok(())
 	}
 
 	// The unrouted open path carries no route: open_stream emits an
-	// Open with no target and no forwarded flag.
+	// Open with no target and the default relay budget.
 	#[test]
 	fn test_open_stream_local_open_has_no_route() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
@@ -637,7 +638,7 @@ mod tests {
 		assert!(matches!(
 			sent.try_recv(),
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
-				if package.target().is_none() && !package.forwarded()
+				if package.target().is_none() && package.hops_remaining() == DEFAULT_HOP_BUDGET
 		));
 
 		Ok(())

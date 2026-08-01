@@ -97,14 +97,14 @@ pub struct RequestSink {
 	/// Grpc-style route stamped on the stream's Open, consumed when
 	/// the first chunk opens the stream.
 	target: Option<Urn<'static>>,
-	/// Loop guard stamped beside the route on the stream's Open.
-	forwarded: bool,
+	/// Relay budget stamped beside the route on the stream's Open.
+	hops_remaining: u8,
 }
 
 impl RequestSink {
 	/// Sink over a reserved (unopened) stream. `duplex` carries the
 	/// reply forwarder to register once the ID exists. `target` and
-	/// `forwarded` stamp the stream's Open with a grpc-style route.
+	/// `hops_remaining` stamp the stream's Open with a grpc-style route.
 	pub(super) fn new(
 		reservation: StreamReservation,
 		kind: MuxStreamKind,
@@ -112,7 +112,7 @@ impl RequestSink {
 		outbound: mpsc::Sender<Outbound>,
 		duplex: Option<ForwardedStream>,
 		target: Option<Urn<'static>>,
-		forwarded: bool,
+		hops_remaining: u8,
 	) -> Self {
 		Self {
 			stream: SinkStream::Reserved { reservation, duplex },
@@ -121,7 +121,7 @@ impl RequestSink {
 			outbound,
 			closed: false,
 			target,
-			forwarded,
+			hops_remaining,
 		}
 	}
 
@@ -199,8 +199,8 @@ impl RequestSink {
 		let credits = payload_credits(payload.len(), self.shared.send_chunk_size, self.shared.credit_unit);
 		let standing = self.shared.admit_debit(credits, false).await?;
 
-		// The open seeds the ledger with the payload's records; an
-		// already-open stream extends it push by push
+		// The open seeds the ledger with the payload's records. An
+		// already-open stream extends it push by push.
 		let records = chunk_records(payload.len(), self.shared.send_chunk_size);
 		if let SinkStream::Opened(stream_id) = self.stream {
 			self.shared.add_send_records(stream_id, records);
@@ -232,7 +232,7 @@ impl RequestSink {
 					records,
 					duplex: duplex.take(),
 					target: self.target.take(),
-					forwarded: self.forwarded,
+					hops_remaining: self.hops_remaining,
 				};
 
 				let opened = send_open_envelope(&self.shared, &mut self.outbound, reservation, &mut request).await;
@@ -243,9 +243,9 @@ impl RequestSink {
 					}
 					Err(err) => {
 						// A failed open leaves the sink reserved: hand back
-						// whatever the open did not consume so a retried
-						// first chunk still stamps the route and registers
-						// the reply forwarder.
+						// whatever the open did not consume. A retried
+						// first chunk then still stamps the route and
+						// registers the reply forwarder.
 						self.target = request.target;
 						*duplex = request.duplex;
 						Err(err)
@@ -335,6 +335,7 @@ mod tests {
 	use super::super::shared::StreamOutcome;
 	use super::super::testing::{client_shared, poll_now};
 	use super::*;
+	use crate::constants::DEFAULT_HOP_BUDGET;
 	use crate::transport::envelopes::{CancelReason, MuxEnvelope};
 
 	/// Reserved (unopened) request sink on a fresh client with the
@@ -360,7 +361,7 @@ mod tests {
 			outbound,
 			None,
 			target,
-			false,
+			DEFAULT_HOP_BUDGET,
 		);
 		(shared, sink, sent, receiver)
 	}
@@ -375,7 +376,7 @@ mod tests {
 		routed_sink_fixture(None)
 	}
 
-	// Pushes reach the wire eagerly; the bare close carries the
+	// Pushes reach the wire eagerly. The bare close carries the
 	// `last` flag on an empty trailer record: push/push/close must
 	// travel as Open(!last), Data(!last), Data(last, empty).
 	#[test]
@@ -404,7 +405,7 @@ mod tests {
 		));
 	}
 
-	// A known final chunk rides the `last` record itself: no empty
+	// A known final chunk carries the `last` flag itself: no empty
 	// trailer follows it.
 	#[test]
 	fn test_request_sink_close_with_flags_final_chunk() {

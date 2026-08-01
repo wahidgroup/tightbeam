@@ -7,7 +7,7 @@
 use core::str::FromStr;
 use std::sync::Arc;
 
-use super::{ClusterConfig, PeerHint, ServletEntry, SharedId};
+use super::{ClusterConfig, PeerHint, PheromoneConfig, ServletEntry, SharedId};
 use crate::colony::common::{is_bare_servlet_type, type_canonical_bytes, ColonyNamespace, PeerAdvertisement};
 use crate::constants::MAX_ADVERTISED_TYPES;
 use crate::policy::TransitStatus;
@@ -40,6 +40,24 @@ pub struct AdmittedPeerAd {
 	pub(super) dial_addr: SharedId,
 	/// Peer-routed entries keyed by `peer_hive_id NUL type`
 	pub(super) slate: Vec<ServletEntry>,
+	/// Issue order of the signed advertisement frame. Reconciliation
+	/// refuses an order older than the newest applied (CWE-294).
+	pub(super) order: u64,
+}
+
+/// Fallback trails for one admitted advertisement through one relay.
+///
+/// The slate reconciles under the composite `origin NUL relay` bucket,
+/// so relay trails live and die independently of the origin's direct
+/// slate. The origin's next direct advertisement cannot evict them.
+/// A dead relay decays away by staleness pruning.
+pub struct RelayTrail {
+	/// The composite `origin NUL relay` bucket this slate reconciles under.
+	pub(super) bucket: SharedId,
+	/// Relay-routed entries keyed by `bucket NUL type`.
+	pub(super) slate: Vec<ServletEntry>,
+	/// Issue order of the advertisement the trails derive from.
+	pub(super) order: u64,
 }
 
 impl AdmittedPeerAd {
@@ -53,7 +71,7 @@ impl AdmittedPeerAd {
 	pub fn admit(frame: &Frame, ad: &PeerAdvertisement, conf: &ClusterConfig) -> Result<Self, TransitStatus> {
 		let dial_addr: SharedId = Arc::from(ad.gateway_addr.as_slice());
 
-		// The signer certificate resolves exactly once; the slate key
+		// The signer certificate resolves exactly once. The slate key
 		// (fingerprint) and the membership gate both derive from it.
 		#[cfg(feature = "x509")]
 		let signer_cert = frame_signer_cert(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
@@ -97,7 +115,52 @@ impl AdmittedPeerAd {
 			conf.pheromone.abandonment_limit,
 		);
 
-		Ok(Self { peer_hive_id, dial_addr, slate })
+		Ok(Self { peer_hive_id, dial_addr, slate, order: frame.metadata.order })
+	}
+
+	/// Relay trails through `relay_id`, the gateway that relayed this
+	/// advertisement: one per advertised type, dialing `relay_dial`.
+	///
+	/// Routing then holds two trails per type: the direct trail dialing
+	/// the origin, and a relay trail through the relaying peer.
+	/// Pheromone feedback can therefore fail over to the relay when
+	/// the origin is unreachable. The trails reconcile under their own
+	/// `origin NUL relay` bucket
+	/// ([`super::ServletRegistry::reconcile_relay_trail`]), so the
+	/// origin's direct slate lifecycle never evicts the fallback.
+	/// Returns `None` when the relay is the origin itself (the direct
+	/// trail already dials it) or when the slate advertises nothing.
+	#[must_use]
+	pub fn relay_trail(
+		&self,
+		relay_id: &SharedId,
+		relay_dial: SharedId,
+		pheromone: &PheromoneConfig,
+	) -> Option<RelayTrail> {
+		if relay_id.as_ref() == self.peer_hive_id.as_ref() {
+			return None;
+		}
+		if self.slate.is_empty() {
+			return None;
+		}
+
+		let bucket = ServletEntry::relay_bucket(&self.peer_hive_id, relay_id);
+		let slate: Vec<ServletEntry> = self
+			.slate
+			.iter()
+			.map(|entry| {
+				ServletEntry::peer_relay(
+					Arc::clone(&self.peer_hive_id),
+					Arc::clone(relay_id),
+					Arc::clone(entry.servlet_type()),
+					Arc::clone(&relay_dial),
+					pheromone.initial_pheromone,
+					pheromone.abandonment_limit,
+				)
+			})
+			.collect();
+
+		Some(RelayTrail { bucket, slate, order: self.order })
 	}
 
 	/// Discovery hint from this admitted advertisement: the verified
@@ -125,7 +188,7 @@ impl AdmittedPeerAd {
 /// Whether a claimed peer gateway address is safe dial data.
 ///
 /// Refuses empty, non-UTF-8, NUL-bearing, or non-parseable sockets.
-/// The dial path parses UTF-8; NUL would corrupt composite route keys.
+/// The dial path parses UTF-8, and NUL would corrupt composite route keys.
 #[must_use]
 fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
 	let nonempty = !gateway_addr.is_empty();
@@ -349,6 +412,51 @@ mod tests {
 		assert_eq!(slate[0].route_key()[32], 0);
 	}
 
+	fn admitted_ad(origin: &SharedId, dial: &[u8], types: &[Urn<'static>]) -> AdmittedPeerAd {
+		let slate = build_peer_slate(origin, Arc::from(dial), types, 5000, 5);
+		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial_addr: Arc::from(dial), slate, order: 0 }
+	}
+
+	fn some_trail(trail: Option<RelayTrail>) -> RelayTrail {
+		trail.expect("relay trail for a distinct relay with a live slate")
+	}
+
+	#[test]
+	fn relay_trail_none_for_self_relay() {
+		let origin: SharedId = Arc::from([1u8; 32].as_slice());
+		let ad = admitted_ad(&origin, b"127.0.0.1:9000", &[ping_type()]);
+		let trail = ad.relay_trail(&origin, Arc::from(b"127.0.0.1:9001".as_slice()), &PheromoneConfig::default());
+		assert!(trail.is_none());
+	}
+
+	#[test]
+	fn relay_trail_none_for_empty_slate() {
+		let origin: SharedId = Arc::from([1u8; 32].as_slice());
+		let relay: SharedId = Arc::from([2u8; 32].as_slice());
+		let ad = admitted_ad(&origin, b"127.0.0.1:9000", &[]);
+		let trail = ad.relay_trail(&relay, Arc::from(b"127.0.0.1:9001".as_slice()), &PheromoneConfig::default());
+		assert!(trail.is_none());
+	}
+
+	#[test]
+	fn relay_trail_buckets_by_origin_and_relay() {
+		let origin: SharedId = Arc::from([1u8; 32].as_slice());
+		let relay: SharedId = Arc::from([2u8; 32].as_slice());
+		let ad = admitted_ad(&origin, b"127.0.0.1:9000", &[ping_type()]);
+
+		let trail =
+			some_trail(ad.relay_trail(&relay, Arc::from(b"127.0.0.1:9001".as_slice()), &PheromoneConfig::default()));
+
+		let expected_bucket: Vec<u8> = [origin.as_ref(), &[0u8], relay.as_ref()].concat();
+		assert_eq!(trail.bucket.as_ref(), expected_bucket.as_slice());
+		assert_eq!(trail.slate.len(), 1);
+		assert_eq!(trail.slate[0].route_kind(), RouteKind::PeerRelay);
+		assert_eq!(trail.slate[0].bucket().as_ref(), expected_bucket.as_slice());
+		assert_eq!(trail.slate[0].owner_id().as_ref(), origin.as_ref());
+		assert_eq!(trail.slate[0].relay_id().map(|id| id.as_ref()), Some(relay.as_ref()));
+		assert_eq!(trail.slate[0].dial_target().as_ref(), b"127.0.0.1:9001");
+	}
+
 	#[test]
 	fn peer_advertisement_wire_ok_refuses_bad_dial() {
 		let ns = nestmate_ns();
@@ -373,6 +481,15 @@ mod tests {
 
 		fn main_colony() -> Urn<'static> {
 			nestmate_ns().colony("main").expect("static colony name")
+		}
+
+		fn other_colony() -> Urn<'static> {
+			nestmate_ns().colony("other").expect("static colony name")
+		}
+
+		fn foreign_colony() -> Urn<'static> {
+			let foreign = ColonyNamespace::new("acme", "").unwrap_or_default();
+			foreign.colony("main").expect("static colony name")
 		}
 
 		#[test]
@@ -404,8 +521,8 @@ mod tests {
 		#[test]
 		fn cert_colony_urn_fails_closed_on_ambiguity() {
 			let key = create_test_signing_key();
-			let other = nestmate_ns().colony("other").expect("static colony name");
-			let cert = create_test_certificate_with_uri_sans(&key, &[&main_colony().to_string(), &other.to_string()]);
+			let cert =
+				create_test_certificate_with_uri_sans(&key, &[&main_colony().to_string(), &other_colony().to_string()]);
 			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), None);
 		}
 
@@ -419,9 +536,7 @@ mod tests {
 		#[test]
 		fn cert_colony_urn_is_none_for_foreign_namespace() {
 			let key = create_test_signing_key();
-			let foreign = ColonyNamespace::new("acme", "").unwrap_or_default();
-			let urn = foreign.colony("main").expect("static colony name");
-			let cert = create_test_certificate_with_uri_sans(&key, &[&urn.to_string()]);
+			let cert = create_test_certificate_with_uri_sans(&key, &[&foreign_colony().to_string()]);
 			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), None);
 		}
 	}

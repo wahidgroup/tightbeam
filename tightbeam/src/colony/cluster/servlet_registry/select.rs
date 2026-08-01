@@ -1,5 +1,7 @@
+use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::{ClusterError, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, SharedId};
 
@@ -78,11 +80,20 @@ impl ServletRegistry {
 		Ok(conflict)
 	}
 
-	pub(super) fn peer_slate_exceeds_caps(
+	/// Whether reconciling `new_slate_len` routes under `bucket` would
+	/// exceed the caps for its route kind (CWE-770).
+	///
+	/// `count_kind` scopes both counts, so direct slates and relay
+	/// trails spend separate budgets. `max_identities` bounds distinct
+	/// buckets of that kind (direct gateways, or `(origin, relay)`
+	/// relay buckets). `max_routes` bounds that kind's total stored
+	/// routes.
+	pub(super) fn slate_exceeds_caps(
 		&self,
-		hive_id: &[u8],
+		bucket: &[u8],
 		new_slate_len: usize,
-		max_gateways: usize,
+		count_kind: RouteKind,
+		max_identities: usize,
 		max_routes: usize,
 	) -> Result<bool, ClusterError> {
 		if new_slate_len == 0 {
@@ -90,35 +101,35 @@ impl ServletRegistry {
 		}
 
 		let entries = self.entries.read()?;
-		let mut peer_total = 0usize;
-		let mut prior_for_hive = 0usize;
-		let mut gateways = HashSet::new();
-		for entry in entries.values().filter(|entry| entry.route_kind() == RouteKind::Peer) {
-			peer_total += 1;
+		let mut kind_total = 0usize;
+		let mut prior_for_bucket = 0usize;
+		let mut identities = HashSet::new();
+		for entry in entries.values().filter(|entry| entry.route_kind() == count_kind) {
+			kind_total += 1;
 
-			let owner = entry.owner_id().as_ref();
-			gateways.insert(owner);
-			if owner == hive_id {
-				prior_for_hive += 1;
+			let entry_bucket = entry.bucket().as_ref();
+			identities.insert(entry_bucket);
+			if entry_bucket == bucket {
+				prior_for_bucket += 1;
 			}
 		}
 
-		let routes_after = peer_total.saturating_sub(prior_for_hive).saturating_add(new_slate_len);
+		let routes_after = kind_total.saturating_sub(prior_for_bucket).saturating_add(new_slate_len);
 		if routes_after > max_routes {
 			return Ok(true);
 		}
 
-		let gateway_is_new = !gateways.contains(hive_id);
-		let gateways_after = gateways.len().saturating_add(usize::from(gateway_is_new));
-		Ok(gateways_after > max_gateways)
+		let identity_is_new = !identities.contains(bucket);
+		let identities_after = identities.len().saturating_add(usize::from(identity_is_new));
+		Ok(identities_after > max_identities)
 	}
 
-	/// Live routes reached through peer gateways.
+	/// Live routes reached through peer gateways, relay trails included.
 	pub fn peer_entries(&self) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
 		let entries = self.entries.read()?;
 		let result = entries
 			.values()
-			.filter(|entry| entry.route_kind() == RouteKind::Peer)
+			.filter(|entry| entry.route_kind().is_peer())
 			.filter(|entry| entry.is_live())
 			.map(Arc::clone)
 			.collect();
@@ -165,26 +176,34 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
-	/// Weaken every live route advertised by a peer identity.
+	/// Weaken every live route attributed to a peer identity: direct
+	/// routes it advertised, relay trails learned for it, and relay
+	/// trails that forward through it.
 	pub fn weaken_peer(&self, peer_id: &[u8]) -> Result<usize, ClusterError> {
+		let attributed = |entry: &ServletEntry| {
+			entry.owner_id().as_ref() == peer_id || entry.relay_id().is_some_and(|relay| relay.as_ref() == peer_id)
+		};
+
 		let entries = self.entries.read()?;
 		let weakened = entries
 			.values()
-			.filter(|entry| entry.route_kind() == RouteKind::Peer)
+			.filter(|entry| entry.route_kind().is_peer())
 			.filter(|entry| entry.is_live())
-			.filter(|entry| entry.owner_id().as_ref() == peer_id)
+			.filter(|entry| attributed(entry))
 			.map(|entry| entry.weaken())
 			.count();
 
 		Ok(weakened)
 	}
 
-	/// Weaken every live peer route that dials `dial_addr`.
+	/// Weaken every live peer route that dials `dial_addr`, relay
+	/// trails included: a misbehaving gateway weakens every trail
+	/// through it.
 	pub fn weaken_peer_by_dial(&self, dial_addr: &[u8]) -> Result<usize, ClusterError> {
 		let entries = self.entries.read()?;
 		let weakened = entries
 			.values()
-			.filter(|entry| entry.route_kind() == RouteKind::Peer)
+			.filter(|entry| entry.route_kind().is_peer())
 			.filter(|entry| entry.is_live())
 			.filter(|entry| entry.dial_target().as_ref() == dial_addr)
 			.map(|entry| entry.weaken())
@@ -202,6 +221,37 @@ impl ServletRegistry {
 		}
 
 		Ok(())
+	}
+
+	/// Drop relay trails whose last reconcile is older than `max_age`.
+	///
+	/// A relay trail refreshes only when a relayed advertisement rumor
+	/// reconciles its bucket, so a trail past `max_age` lost its refresh
+	/// path. Selection alone cannot retire it: a trail that is never picked
+	/// never accrues trials, so age is the lifecycle bound (CWE-772).
+	///
+	/// # Sources
+	///
+	/// - CWE-772, missing release of resource after effective lifetime:
+	///   <https://cwe.mitre.org/data/definitions/772.html>
+	pub fn prune_stale_relay_trails(&self, max_age: Duration) -> Result<usize, ClusterError> {
+		let now = Instant::now();
+		let stale = {
+			let entries = self.entries.read()?;
+			entries
+				.values()
+				.filter(|entry| entry.route_kind() == RouteKind::PeerRelay)
+				.filter(|entry| now.duration_since(entry.installed_at()) > max_age)
+				.map(|entry| Arc::clone(entry.route_key()))
+				.collect::<Vec<_>>()
+		};
+
+		let count = stale.len();
+		for route_key in &stale {
+			self.remove(route_key)?;
+		}
+
+		Ok(count)
 	}
 
 	/// Drop every entry that reached its abandonment limit.

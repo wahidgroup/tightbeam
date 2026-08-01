@@ -429,8 +429,8 @@ tb_assert_spec! {
 	}
 }
 
-// Already-forwarded work never re-forwards: peer-only types stay
-// Unavailable under the one-hop loop guard.
+// Work with a spent relay budget never re-forwards: peer-only types
+// stay Unavailable once the hop budget reaches zero.
 tb_scenario! {
 	name: cluster_refuses_reforward_of_peer_work,
 	spec: ClusterPeerForwardLoopGuardSpec,
@@ -445,7 +445,7 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let work_response = emit_forwarded_ping_work(&mut client, b"reforward-guard").await?;
+			let work_response = emit_relayed_ping_work(&mut client, b"reforward-guard").await?;
 			record_work_status(&trace, &work_response)?;
 
 			cluster.stop();
@@ -471,8 +471,9 @@ tb_assert_spec! {
 	}
 }
 
-// Unary cross-cluster forward: ping lives only on B; client asks A; A
-// wraps Work{forwarded:true}, B serves locally, echo returns.
+// Unary cross-cluster forward: ping lives only on B. The client asks
+// A, A re-emits Work with the budget spent, B serves locally, and the
+// echo returns.
 tb_scenario! {
 	name: cluster_forwards_work_to_peer_gateway,
 	spec: ClusterPeerForwardEchoSpec,
@@ -597,8 +598,8 @@ tb_scenario! {
 	}
 }
 
-// WORK_SENT = CONTAINMENT_ABANDON_LIMIT failing forwards + 1 probe after
-// abandonment; CLUSTER_WORK_FAILED = CONTAINMENT_ABANDON_LIMIT.
+// WORK_SENT = CONTAINMENT_ABANDON_LIMIT failing forwards + 1 probe
+// after abandonment. CLUSTER_WORK_FAILED = CONTAINMENT_ABANDON_LIMIT.
 tb_assert_spec! {
 	pub ClusterPeerContainmentSpec,
 	V(1,0,0): {

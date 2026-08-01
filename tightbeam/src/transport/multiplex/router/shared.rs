@@ -85,7 +85,7 @@ impl OpenSlot {
 ///
 /// Dropping an unopened reservation releases the cap slot and resolves the
 /// response future as locally cancelled. Once opened, the pending table owns
-/// the stream's lifecycle and the drop is a no-op.
+/// the stream's lifecycle and the drop does nothing.
 pub(super) struct StreamReservation {
 	shared: Arc<MuxShared>,
 	sender: Option<oneshot::Sender<StreamOutcome>>,
@@ -115,7 +115,7 @@ impl Drop for StreamReservation {
 /// One stream's Open record, handed to
 /// [`MuxShared::poll_open_enqueue`]. `records` seeds the sender
 /// ledger (the payload's chunk count, or the whole message's for a
-/// unary emit); `duplex` carries the reply forwarder to register
+/// unary emit). `duplex` carries the reply forwarder to register
 /// under the assigned ID before the Open can reach the peer.
 pub(super) struct OpenRequest<'a> {
 	pub(super) kind: MuxStreamKind,
@@ -126,9 +126,10 @@ pub(super) struct OpenRequest<'a> {
 	/// Grpc-style route stamped on the Open record, or `None` for an
 	/// unrouted local open.
 	pub(super) target: Option<Urn<'static>>,
-	/// Loop guard stamped beside the route: a forwarded open is
-	/// served locally and never re-forwarded.
-	pub(super) forwarded: bool,
+	/// Relay budget stamped beside the route: the number of gateway
+	/// forwards the stream may still spend. A `0` open is served
+	/// locally and never re-forwarded.
+	pub(super) hops_remaining: u8,
 }
 
 /// Outcome delivered to a pending stream's oneshot slot.
@@ -178,13 +179,13 @@ pub(super) fn enqueue_stream_cancel(shared: &MuxShared, outbound: &mpsc::Sender<
 pub(super) enum RekeyPhase {
 	/// No renewal in flight
 	Idle,
-	/// `RekeyRequest` written; awaiting the server's response
+	/// `RekeyRequest` is written, and the server's response is awaited.
 	AwaitingResponse,
-	/// Response verified; new c2s admissions park while owed chunks
-	/// flush ahead of the `RekeyAck`
+	/// The response verified. New c2s admissions park while owed
+	/// chunks flush ahead of the `RekeyAck`.
 	FlushingAck,
-	/// `RekeyAck` written (send cipher switched); c2s parked until
-	/// `RekeyDone` activates the fresh epoch budget
+	/// `RekeyAck` is written and the send cipher switched. C2s stays
+	/// parked until `RekeyDone` activates the fresh epoch budget.
 	AwaitingDone,
 }
 
@@ -318,11 +319,11 @@ pub(super) struct MuxShared {
 	/// Initial per-stream chunk limit for outbound data
 	/// (peer-advertised)
 	initial_send_credit: u64,
-	/// Initial per-stream chunk limit granted to the peer (local
-	/// receive window; duplex reply bodies size from it)
+	/// Initial per-stream chunk limit granted to the peer: the local
+	/// receive window, which duplex reply bodies size from.
 	pub(super) initial_recv_credit: u64,
-	/// Connection collector inherited from the split halves;
-	/// control-plane events land here
+	/// Connection collector inherited from the split halves.
+	/// Control-plane events land here
 	/// (see [`crate::instrumentation::events`]).
 	#[cfg(feature = "instrument")]
 	pub(super) trace: Option<TraceCollector>,
@@ -346,7 +347,7 @@ pub(super) struct MuxShared {
 	/// initial terms)
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	initial_send_budget: Option<u64>,
-	/// Current epoch's dual-signed receipt; renewal rotates it
+	/// Current epoch's dual-signed receipt. Renewal rotates it.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	session_receipt: Mutex<Option<Arc<StoredReceipt>>>,
 }
@@ -421,13 +422,14 @@ impl MuxShared {
 		self.duplex_lock().remove(&stream_id)
 	}
 
-	/// Forward one reply chunk into a duplex body. `None` when the
-	/// stream is not duplex; `Some(false)` on a credit overrun.
+	/// Forward one reply chunk into a duplex body. Returns `None` when
+	/// the stream is not duplex, and `Some(false)` on a credit
+	/// overrun.
 	pub(super) fn forward_duplex_chunk(&self, stream_id: u32, payload: &[u8]) -> Option<bool> {
 		let mut map = self.duplex_lock();
 		let stream = map.get_mut(&stream_id)?;
-		let accepted = stream.accept_and_forward(payload);
 
+		let accepted = stream.accept_and_forward(payload);
 		Some(accepted)
 	}
 
@@ -454,13 +456,13 @@ impl MuxShared {
 			if *stream_id <= last_stream_id {
 				return true;
 			}
-			let _ = stream.forward(BodyEvent::Failed(TransportError::Draining));
 
+			let _ = stream.forward(BodyEvent::Failed(TransportError::Draining));
 			false
 		});
 	}
 
-	/// Drop every duplex reply forwarder on connection failure; the
+	/// Drop every duplex reply forwarder on connection failure. The
 	/// bodies observe the closed channel.
 	fn fail_all_duplex(&self) {
 		self.duplex_lock().clear();
@@ -513,7 +515,7 @@ impl MuxShared {
 	/// Extend a registered sender ledger by `chunks` outbound
 	/// records: streamed replies learn their length one push at a
 	/// time. A missing ledger means the stream already resolved
-	/// (cancel or failure); the send path reports that itself.
+	/// (cancel or failure), and the send path reports that itself.
 	pub(super) fn add_send_records(&self, stream_id: u32, chunks: u64) {
 		let mut state = self.lock();
 		let Some(stream) = state.send_streams.get_mut(&stream_id) else {
@@ -642,9 +644,9 @@ impl MuxShared {
 		Ok(BudgetStanding::Healthy)
 	}
 
-	/// Debit `credits` from the outbound session budget (test seam
-	/// over [`Self::debit_budget`]; production paths wait out
-	/// renewals via [`Self::admit_debit`]).
+	/// Debit `credits` from the outbound session budget: a test entry
+	/// over [`Self::debit_budget`]. Production paths wait out renewals
+	/// via [`Self::admit_debit`].
 	#[cfg(test)]
 	pub(super) fn debit_send_budget(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
 		let mut state = self.lock();
@@ -749,7 +751,8 @@ impl MuxShared {
 		Self::wake_on_quiesce(&mut state);
 	}
 
-	/// Send cipher active after Ack; lifts the hard-floor park.
+	/// The send cipher is active after the Ack, which lifts the
+	/// hard-floor park.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(super) fn mark_ack_written(&self) {
 		let mut state = self.lock();
@@ -809,8 +812,8 @@ impl MuxShared {
 		trace.emit_event(event);
 	}
 
-	/// Record a GoAway control event: the reason name labels why and
-	/// its wire code rides as the assertable value.
+	/// Record a GoAway control event: the reason name labels why, and
+	/// its wire code is the assertable value.
 	#[cfg(feature = "instrument")]
 	pub(super) fn emit_goaway_event(&self, event: Urn<'static>, reason: GoAwayReason) {
 		let Some(trace) = self.trace.as_ref() else {
@@ -920,7 +923,7 @@ impl MuxShared {
 		}
 
 		let package = match MuxOpenPackage::new(stream_id, request.last, request.kind, request.payload) {
-			Ok(package) => package.with_route(request.target.take(), request.forwarded),
+			Ok(package) => package.with_route(request.target.take(), request.hops_remaining),
 			Err(err) => return Poll::Ready(Err(TransportError::DerError(err))),
 		};
 		let enqueued = outbound
@@ -1156,6 +1159,7 @@ mod tests {
 	use super::super::testing::{noop_cx, poll_chunk};
 	use super::*;
 
+	use crate::constants::DEFAULT_HOP_BUDGET;
 	use crate::transport::envelopes::MuxEnvelope;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -1189,7 +1193,7 @@ mod tests {
 			records: 1,
 			duplex: None,
 			target: None,
-			forwarded: false,
+			hops_remaining: DEFAULT_HOP_BUDGET,
 		};
 
 		let mut cx = noop_cx();
@@ -1410,7 +1414,7 @@ mod tests {
 			records: 1,
 			duplex: None,
 			target: None,
-			forwarded: false,
+			hops_remaining: DEFAULT_HOP_BUDGET,
 		};
 
 		let mut cx = noop_cx();

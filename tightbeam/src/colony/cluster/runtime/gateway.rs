@@ -18,7 +18,7 @@ use crate::colony::cluster::{
 };
 use crate::colony::common::{take_and_abort, HeartbeatResult};
 use crate::colony::servlet::servlet_runtime::rt;
-use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
+use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::x509::Certificate;
@@ -139,8 +139,8 @@ where
 
 		let config = Arc::new(config);
 
-		// The gateway always serves TLS when x509 is enabled;
-		// an empty client_validators list means server-auth only.
+		// The gateway always serves TLS when x509 is enabled. An empty
+		// client_validators list means server-auth only.
 		let bind_addr = match config.bind_addr.as_deref() {
 			Some(raw) => raw.parse().map_err(|_| TransportError::InvalidMessage)?,
 			None => P::default_bind_address().map_err(protocol_error)?,
@@ -163,7 +163,10 @@ where
 		let (listener, addr) = P::bind(bind_addr).await.map_err(protocol_error)?;
 
 		let registry = Arc::new(HiveRegistry::new(config.heartbeat.timeout));
-		let servlet_registry = Arc::new(ServletRegistry::new(config.pheromone.clone()));
+		let servlet_registry = Arc::new(
+			ServletRegistry::new(config.pheromone.clone())
+				.with_ad_tombstone_window_ms(config.control_freshness_window_ms),
+		);
 
 		let pools = build_cluster_pools::<P>(config.pool_config.clone(), &config.tls)?;
 		let pool = pools.hive;
@@ -195,8 +198,21 @@ where
 			Arc::clone(&trace),
 		);
 
-		let evaporation_handle =
-			spawn_evaporation_loop(Arc::clone(&servlet_registry), config.pheromone.evaporation_interval);
+		// Three refresh intervals of silence retire a relay trail.
+		// One missed refresh is churn. Three means the refresh path
+		// died. The default refresh interval floors the TTL, so an
+		// aggressive `rumor_refresh` cannot churn healthy fallbacks.
+		let relay_trail_ttl = config
+			.peer
+			.rumor_refresh
+			.saturating_mul(3)
+			.max(Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS));
+		let evaporation_handle = spawn_evaporation_loop(
+			Arc::clone(&servlet_registry),
+			config.pheromone.evaporation_interval,
+			relay_trail_ttl,
+			Arc::clone(&trace),
+		);
 
 		#[cfg(feature = "x509")]
 		let advertise_handle = {
@@ -330,11 +346,11 @@ where
 
 /// The gateway as a [`MuxService`].
 ///
-/// Unary frames route through the cluster dispatch exactly as before.
-/// Streamed and duplex opens route by the target `Urn` on their
-/// [`CallContext`]: a `Local` trail dials the servlet on the hive
-/// plane, a `Peer` trail splices the stream to the peer gateway on the
-/// peer plane (see [`splice_streaming`] and [`splice_duplex`]).
+/// Unary frames route through the cluster dispatch. Streamed and
+/// duplex opens route by the target `Urn` on their [`CallContext`].
+/// A `Local` trail dials the servlet on the hive plane. A `Peer`
+/// trail splices the stream to the peer gateway on the peer plane
+/// (see [`splice_streaming`] and [`splice_duplex`]).
 struct GatewayMuxService<P, D>
 where
 	P: Protocol,
@@ -391,7 +407,7 @@ where
 				return Err(unimplemented_error());
 			};
 
-			splice_streaming::<P>(body, target, cx.forwarded(), ctx).await
+			splice_streaming::<P>(body, target, cx.hops_remaining(), ctx).await
 		}
 	}
 
@@ -415,7 +431,7 @@ where
 				return Err(unimplemented_error());
 			};
 
-			splice_duplex::<P>(body, reply, target, cx.forwarded(), ctx).await
+			splice_duplex::<P>(body, reply, target, cx.hops_remaining(), ctx).await
 		}
 	}
 }
@@ -455,7 +471,8 @@ where
 			};
 			match listener.accept().await {
 				Ok((mut transport, _addr)) => {
-					// Share the offer by refcount; do not deep-copy authorization octets.
+					// Share the offer by refcount. Do not deep-copy
+					// the authorization octets.
 					transport = transport.with_mux_offer(mux_offer.clone());
 					let service = Arc::clone(&service);
 					rt::spawn(async move {

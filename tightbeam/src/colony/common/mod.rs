@@ -42,8 +42,14 @@ pub use urn::{
 #[derive(Debug, Clone)]
 pub struct InstanceMetrics {
 	/// Opaque instance handle for the balancing round.
+	///
+	/// The key is owned on purpose. A borrowed key would put a lifetime
+	/// on the public [`LoadBalancer`] trait and every implementor.
+	/// Canonical instance-URN bytes are short, so the per-round copy is
+	/// bounded and cheaper than that API cost.
 	pub instance_key: Vec<u8>,
-	/// Stigmergic trail strength (`0..=`[`MAX_PHEROMONE`]); higher is stronger.
+	/// Stigmergic trail strength in `0..=`[`MAX_PHEROMONE`]. Higher is
+	/// stronger.
 	pub pheromone: u64,
 }
 
@@ -87,7 +93,7 @@ fn fresh_seed() -> u64 {
 
 /// Advance SplitMix64 state and return the mixed output.
 ///
-/// Reference: Vigna, `splitmix64.c` (2015); see [`SPLITMIX64_GAMMA`].
+/// Reference: Vigna, `splitmix64.c` (2015). See [`SPLITMIX64_GAMMA`].
 /// One `fetch_add` claims a unique state, so concurrent callers never
 /// share a draw.
 fn splitmix64_next(state: &AtomicU64) -> u64 {
@@ -160,7 +166,7 @@ impl Default for StochasticForager {
 impl StochasticForager {
 	/// Build with a fixed RNG seed for reproducible selection streams.
 	///
-	/// Other knobs keep their defaults; chain setters to override them.
+	/// Other knobs keep their defaults. Chain setters to override them.
 	pub fn with_seed(seed: u64) -> Self {
 		Self { rng: Arc::new(AtomicU64::new(seed)), ..Self::default() }
 	}

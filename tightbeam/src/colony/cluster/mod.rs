@@ -46,6 +46,7 @@ use core::future::Future;
 use core::time::Duration;
 use std::sync::Arc;
 
+use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_HOPS};
 use crate::crypto::key::SigningKeyProvider;
 use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
@@ -136,7 +137,8 @@ pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 /// TLS material for the gateway accept loop and hive/peer dials.
 #[cfg(feature = "x509")]
 pub struct ClusterTlsConfig {
-	/// Gateway certificate (server identity; also used on outbound client dials)
+	/// Gateway certificate: the server identity, also presented on
+	/// outbound client dials.
 	pub certificate: CertificateSpec,
 	/// Signing key for control frames and TLS (HSM/KMS capable)
 	pub key: Arc<dyn SigningKeyProvider>,
@@ -147,9 +149,9 @@ pub struct ClusterTlsConfig {
 	/// Trust store for hive/servlet server certificates on outbound dials
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 	/// Trust anchor for peer-gateway advertisements and relayed gossip.
-	/// Separate from `hive_trust`: peer certificates cannot register as
-	/// hives; hive certificates cannot forge peer ads. `None` disables
-	/// inbound federation (advertisements are refused).
+	/// Separate from `hive_trust`: peer certificates cannot register
+	/// as hives, and hive certificates cannot forge peer ads. `None`
+	/// disables inbound federation (advertisements are refused).
 	pub peer_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 }
 
@@ -184,11 +186,11 @@ impl core::fmt::Debug for ClusterTlsConfig {
 /// Peer-federation dial list, advertise beat, and inbound dial allowlist.
 ///
 /// Trust anchors stay on [`ClusterTlsConfig::peer_trust`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PeerConfig {
 	/// Peer gateway addresses dialed to advertise exported types.
-	/// Dial list, not an identity gate; partial or asymmetric graphs are
-	/// expected. Empty disables outbound advertisement.
+	/// Dial list, not an identity gate. Partial or asymmetric graphs
+	/// are expected. Empty disables outbound advertisement.
 	///
 	/// The slate is never configured: each beat snapshots the local
 	/// servlet registry so peers learn types currently served.
@@ -209,6 +211,39 @@ pub struct PeerConfig {
 	/// [`PeerStore`] rehydrates learned peers through the capped
 	/// admission path.
 	pub table: Arc<PeerTable>,
+	/// Cap on the relay budget this gateway honors on inbound work and
+	/// routed stream opens: the effective budget is
+	/// `min(wire value, max_hops)`. An origin request carries the
+	/// sentinel budget, so the clamp also stamps the origin with this
+	/// cap.
+	///
+	/// - The default [`DEFAULT_MAX_HOPS`] forwards at most once.
+	/// - `0` disables forwarding entirely.
+	/// - `2` enables relay-trail fallback.
+	pub max_hops: u8,
+	/// Advertisement-rumor refresh interval.
+	///
+	/// The beat floods the slate rumor when the slate or the flood
+	/// target set changed, plus one refresh on this interval. The
+	/// config builder clamps the interval to the gossip freshness
+	/// window (`GossipConfig::seen_ttl`) so a refreshed rumor always
+	/// admits as fresh.
+	pub rumor_refresh: Duration,
+}
+
+/// The default peer plane: no peers, no beat, no allowlist, and the
+/// single-forward relay cap.
+impl Default for PeerConfig {
+	fn default() -> Self {
+		Self {
+			peers: Vec::new(),
+			advertise_interval: None,
+			peer_dial_allowlist: None,
+			table: Arc::default(),
+			max_hops: DEFAULT_MAX_HOPS,
+			rumor_refresh: Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS),
+		}
+	}
 }
 
 /// Runtime configuration for a cluster gateway.
@@ -244,11 +279,11 @@ pub struct ClusterConfig {
 	/// Colony URN from the gateway certificate URI SAN, derived once at
 	/// build by [`cert_colony_urn`](crate::colony::cluster::cert_colony_urn).
 	/// `None` means not a colony member: gossip publish/relay/reconcile
-	/// and peer ads are refused; the advertise beat skips gossip
+	/// and peer ads are refused, and the advertise beat skips gossip
 	/// reconciliation. Work and hive registration never require membership.
 	///
-	/// Private so membership cannot drift from the certificate: the
-	/// builder derives it; [`ClusterConfig::colony_urn`] reads it.
+	/// Private so membership cannot drift from the certificate. The
+	/// builder derives it, and [`ClusterConfig::colony_urn`] reads it.
 	#[cfg(feature = "x509")]
 	colony_urn: Option<Urn<'static>>,
 	/// TLS material for accept and outbound dials
@@ -266,7 +301,7 @@ impl ClusterConfig {
 	/// Colony URN from the gateway certificate URI SAN.
 	///
 	/// `None` when this gateway is not a colony member. Derived once by
-	/// the builder; read-only afterwards.
+	/// the builder, and read-only afterwards.
 	#[must_use]
 	pub fn colony_urn(&self) -> Option<&Urn<'static>> {
 		self.colony_urn.as_ref()
@@ -304,8 +339,9 @@ pub use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ClusterWorkR
 
 /// Trait for cluster gateway implementations.
 ///
-/// Gateways route work to registered hives by servlet type. Hives register
-/// dynamically; servlet types are learned from those registrations.
+/// Gateways route work to registered hives by servlet type. Hives
+/// register dynamically, and servlet types are learned from those
+/// registrations.
 pub trait Cluster: Sized + Send + Sync {
 	/// Protocol this gateway serves
 	type Protocol: Protocol;
@@ -319,7 +355,7 @@ pub trait Cluster: Sized + Send + Sync {
 		config: ClusterConfig,
 	) -> impl Future<Output = Result<Self, crate::TightBeamError>> + Send;
 
-	/// Gateway listen address (borrowed; no clone).
+	/// Gateway listen address, borrowed without a clone.
 	fn addr(&self) -> &Self::Address;
 
 	/// Servlet types available from registered local hives
@@ -358,7 +394,7 @@ pub trait ClusterHeartbeat: Cluster {
 	/// Send one signed heartbeat to a hive via the connection pool.
 	///
 	/// The background loop lives in [`ClusterGateway::start`]
-	/// (`JoinSet`, bounded concurrency); it is not on this trait.
+	/// (`JoinSet`, bounded concurrency). It is not on this trait.
 	fn send_heartbeat(
 		&self,
 		addr: Self::Address,

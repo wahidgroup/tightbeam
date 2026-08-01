@@ -33,27 +33,10 @@ fn gossip_cluster_conf(certs: &ClusterTestCerts, peers: Vec<String>) -> (Cluster
 ///
 /// - Flood scope is the origin certificate's colony URN.
 /// - Local delivery is the receiving gateway's ingress policy.
-/// - Hop radius rides the outer frame's `metadata.lifetime`, never the body.
+/// - The outer frame's `metadata.lifetime` carries the hop radius,
+///   never the body.
 fn rumor_body(payload: Vec<u8>) -> GossipRumor {
-	GossipRumor { payload }
-}
-
-/// Sign a [`PublishGossip`] control frame with issue-time order and hop radius.
-async fn signed_publish_gossip(
-	key: &Secp256k1SigningKey,
-	id: &[u8],
-	body: GossipRumor,
-	hop_ttl: u64,
-) -> Result<Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V2)
-		.with_id(id)
-		.with_order(current_timestamp_ms())
-		.with_lifetime(hop_ttl)
-		.with_message(ClusterRequest::PublishGossip(body))
-		.build()?;
-
-	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+	GossipRumor::application(payload)
 }
 
 /// Mint an origin-signed rumor [`Frame`] (the nested gossip content).
@@ -68,7 +51,7 @@ async fn mint_origin_rumor(key: &Secp256k1SigningKey, id: &[u8], body: GossipRum
 	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
 }
 
-/// Sign a [`Gossip`] relay frame carrying a verbatim origin rumor.
+/// Sign a [`Gossip`] relay frame carrying an unchanged origin rumor.
 async fn signed_relay_gossip(
 	key: &Secp256k1SigningKey,
 	id: &[u8],
@@ -111,6 +94,27 @@ async fn send_gossip_frame_as(
 	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message)?;
 	trace.event_with(marker, &[], response.status)?;
 	Ok(())
+}
+
+/// Mint a ping application rumor signed by `origin_key`, wrap it in a
+/// zero-hop relay envelope signed by `relay_key`, and emit it to
+/// `cluster`. The decoded status records as `GOSSIP_RELAY_STATUS`.
+/// Frame ids derive from `label`, so each call floods a distinct
+/// digest.
+pub(super) async fn relay_application_rumor(
+	trace: &TraceCollector,
+	connect_certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+	origin_key: &Secp256k1SigningKey,
+	relay_key: &Secp256k1SigningKey,
+	label: &str,
+) -> Result<(), TightBeamError> {
+	let inner_id = format!("{label}-inner");
+	let relay_id = format!("{label}-relay");
+	let body = rumor_body(encode(&PingRequest { value: 21 })?);
+	let rumor = mint_origin_rumor(origin_key, inner_id.as_bytes(), body).await?;
+	let frame = signed_relay_gossip(relay_key, relay_id.as_bytes(), rumor, 0).await?;
+	send_gossip_frame_as(trace, connect_certs, cluster, frame, GOSSIP_RELAY_STATUS).await
 }
 
 /// Sign a [`ReconcileGossip`] control frame listing the sender's held digests.
@@ -544,8 +548,7 @@ tb_scenario! {
 			//
 			// - The gateway therefore offers mux.
 			// - The frame must chunk across the link to reach gossip admission at all.
-			let mut conf = peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust));
-			conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+			let conf = with_mux_offer(peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust)));
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
@@ -571,7 +574,7 @@ tb_scenario! {
 
 			// A rumor past the gossip bound exceeds what one single-flight envelope carries.
 			//
-			// - It rides a pooled mux link (the same chunked path reflood uses) to reach admission.
+			// - It crosses a pooled mux link (the same chunked path reflood uses) to reach admission.
 			// - The payload bound then refuses it on the correct plane.
 			let pool_config = PoolConfig {
 				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
@@ -684,7 +687,7 @@ tb_assert_spec! {
 // The rumor reaches R before R's ping servlet registers, so it stays pending.
 //
 // - After registration, R's beat delivers from the pending set and acks.
-// - R has no peers; the beat runs solely for pending_local retry.
+// - R has no peers, so the beat runs solely for pending_local retry.
 tb_scenario! {
 	name: cluster_gossip_retries_pending_local_delivery,
 	spec: ClusterGossipRetrySpec,
@@ -748,6 +751,10 @@ impl GossipJournal for CountingJournal {
 	) -> Result<Admission, ClusterError> {
 		self.records.fetch_add(1, Ordering::SeqCst);
 		self.inner.record(signer, digest, rumor, now_ms)
+	}
+
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, now_ms)
 	}
 
 	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
@@ -1132,6 +1139,10 @@ impl GossipJournal for AmnesiacJournal {
 		Ok(Admission::New)
 	}
 
+	fn witness(&self, _signer: &[u8], _digest: GossipDigest, _now_ms: u64) -> Result<Admission, ClusterError> {
+		Ok(Admission::New)
+	}
+
 	// Retaining nothing, the grey hole never reports a digest as seen.
 	// Every repair push therefore reaches record and is re-acknowledged.
 	fn seen(&self, _digest: &GossipDigest, _now_ms: u64) -> Result<bool, ClusterError> {
@@ -1326,15 +1337,11 @@ struct ForeignColonyCtx {
 /// - Its own `CN` keeps trust-store issuer resolution unambiguous.
 /// - One trust store can therefore anchor both identities.
 fn foreign_colony_certs() -> ClusterTestCerts {
-	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
-
 	let foreign_urn = colony_ns().colony("other").expect("static colony name");
-	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let cert = create_test_certificate_with_cn_and_uri_sans(&raw, "Foreign Gateway", &[&foreign_urn.to_string()]);
+	let (cert, key) = colony_identity("Foreign Gateway", &foreign_urn);
 	let trust = combined_trust(&[&cert]);
 
-	GatewayCerts { cert, key: Secp256k1SigningKey::from(raw), trust }
+	GatewayCerts { cert, key, trust }
 }
 
 fn foreign_colony_ctx() -> ForeignColonyCtx {
@@ -1410,33 +1417,14 @@ tb_scenario! {
 			// - The peer check alone must refuse.
 			// - Without colony equality on the outer frame, this path would admit,
 			//   journal, deliver, and reflood.
-			let same_colony = mint_origin_rumor(
-				&ctx.gateway.key,
-				b"same-colony-inner",
-				rumor_body(encode(&PingRequest { value: 21 })?),
-			)
-			.await?;
-			let frame =
-				signed_relay_gossip(&ctx.foreign_key, b"foreign-relay-same", same_colony, 0).await?;
-			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+			relay_application_rumor(&trace, &ctx.gateway, &cluster, &ctx.gateway.key, &ctx.foreign_key, "same-colony")
+				.await?;
 
-			let foreign = mint_origin_rumor(
-				&ctx.foreign_key,
-				b"foreign-inner",
-				rumor_body(encode(&PingRequest { value: 21 })?),
-			)
-			.await?;
-			let frame = signed_relay_gossip(&ctx.foreign_key, b"foreign-relay", foreign, 0).await?;
-			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+			relay_application_rumor(&trace, &ctx.gateway, &cluster, &ctx.foreign_key, &ctx.foreign_key, "foreign")
+				.await?;
 
-			let stranger = mint_origin_rumor(
-				&ctx.stranger_key,
-				b"stranger-inner",
-				rumor_body(encode(&PingRequest { value: 21 })?),
-			)
-			.await?;
-			let frame = signed_relay_gossip(&ctx.stranger_key, b"stranger-relay", stranger, 0).await?;
-			send_gossip_frame_as(&trace, &ctx.gateway, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
+			relay_application_rumor(&trace, &ctx.gateway, &cluster, &ctx.stranger_key, &ctx.stranger_key, "stranger")
+				.await?;
 
 			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], cluster.peer_routes().len() as u64)?;
 
@@ -1726,7 +1714,8 @@ tb_assert_spec! {
 // - S's beat verifies its anchor P and shares P over PEX.
 // - X learns P, feeler-probes it through the colony gate, and promotes it
 //   (CLUSTER_PEER_DISCOVERED).
-// - X's advertisement teaches P to dial back; P promotes X the same way.
+// - X's advertisement teaches P to dial back, and P promotes X the
+//   same way.
 // - A rumor published at P at ttl 0 never floods.
 // - It reaches X's ingress only across those two discovered edges.
 tb_scenario! {
@@ -2159,6 +2148,10 @@ impl GossipJournal for FaultSwitchJournal {
 		now_ms: u64,
 	) -> Result<Admission, ClusterError> {
 		self.inner.record(signer, digest, rumor, now_ms)
+	}
+
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, now_ms)
 	}
 
 	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {

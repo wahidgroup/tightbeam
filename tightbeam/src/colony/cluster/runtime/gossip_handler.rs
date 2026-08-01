@@ -38,7 +38,7 @@ use crate::builder::frame::FrameBuilder;
 #[cfg(feature = "x509")]
 use crate::builder::TypeBuilder;
 #[cfg(feature = "x509")]
-use crate::colony::cluster::{frame_colony_urn, gossip_want};
+use crate::colony::cluster::{frame_colony_urn, gossip_want, RouteKind};
 #[cfg(feature = "x509")]
 use crate::colony::common::PeerGossip;
 #[cfg(feature = "x509")]
@@ -84,7 +84,9 @@ pub(crate) async fn handle_peer_ad(
 
 	if let Err(error) = servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
 		let status = match error {
-			ClusterError::PeerSlateConflict | ClusterError::PeerCapExceeded => TransitStatus::PermissionDenied,
+			ClusterError::PeerSlateConflict | ClusterError::PeerCapExceeded | ClusterError::StalePeerAd => {
+				TransitStatus::PermissionDenied
+			}
 			_ => TransitStatus::Unavailable,
 		};
 		return refuse_peer_ad_release(&frame, &trace, replay_guard, status);
@@ -132,7 +134,7 @@ where
 	}
 
 	// Colony flood scope (CWE-668): peer MUST share this gateway's colony URN.
-	// Mismatch is policy refusal; do not score the relay.
+	// Mismatch is policy refusal. Do not score the relay.
 	let Some(local_colony) = config.colony_urn() else {
 		return refuse_gossip(&frame, &trace, TransitStatus::PermissionDenied);
 	};
@@ -164,7 +166,8 @@ where
 		return refuse_gossip(&frame, &trace, rumor_status);
 	}
 
-	// Origin colony from the signer cert, never rumor bytes (CWE-345). Policy refuse; no score.
+	// Origin colony from the signer cert, never rumor bytes (CWE-345).
+	// A mismatch refuses on policy and does not score the relay.
 	let origin_colony = frame_colony_urn(&config.namespace, config.tls.peer_trust.as_deref(), &rumor);
 	if origin_colony.as_ref() != Some(local_colony) {
 		return refuse_gossip(&frame, &trace, TransitStatus::PermissionDenied);
@@ -278,10 +281,14 @@ fn pex_sample(config: &ClusterConfig, servlet_registry: &ServletRegistry) -> Vec
 		});
 
 	// Registry entries are borrowed, so the wire message copies them once.
+	// Only direct routes qualify: a relay trail pairs the origin's
+	// identity with the relay's dial address, which is not a dialable
+	// hint.
 	let routes = servlet_registry
 		.peer_entries()
 		.unwrap_or_default()
 		.into_iter()
+		.filter(|entry| entry.route_kind() == RouteKind::Peer)
 		.map(|entry| PeerGossip { peer_id: entry.owner_id().to_vec(), gateway_addr: entry.dial_target().to_vec() });
 
 	// The sample never exceeds MAX_PEX_SAMPLE, so a linear scan dedupes
@@ -314,7 +321,8 @@ pub(crate) async fn handle_reconcile(
 		return refuse_reconcile(&frame, &trace);
 	}
 
-	// Same-colony only before freshness (CWE-668); avoid replay record on policy refuse (CWE-772).
+	// Same-colony only before freshness (CWE-668). A policy refuse
+	// must not leave a replay record behind (CWE-772).
 	let requester_colony = frame_colony_urn(&config.namespace, config.tls.peer_trust.as_deref(), &frame);
 	if config.colony_urn().is_none() || requester_colony.as_ref() != config.colony_urn() {
 		return refuse_reconcile(&frame, &trace);
@@ -330,7 +338,7 @@ pub(crate) async fn handle_reconcile(
 		return refuse_reconcile(&frame, &trace);
 	}
 
-	// Journal fault: empty want; repair waits for a later beat.
+	// A journal fault yields an empty want. Repair waits for a later beat.
 	let want = match config.gossip.journal.held_digests(current_timestamp_ms()) {
 		Ok(held) => gossip_want(&reconciliation.held, &held),
 		Err(_) => Vec::new(),

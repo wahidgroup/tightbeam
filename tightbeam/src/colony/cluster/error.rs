@@ -74,6 +74,10 @@ pub enum ClusterError {
 	#[error("Peer slate exceeds caps")]
 	PeerCapExceeded,
 
+	/// Peer advertisement is older than the newest one applied for its bucket
+	#[error("Peer advertisement is stale")]
+	StalePeerAd,
+
 	/// Gossip journal refused a record because a capacity bound was reached
 	#[error("Gossip journal at capacity")]
 	GossipJournalAtCapacity,

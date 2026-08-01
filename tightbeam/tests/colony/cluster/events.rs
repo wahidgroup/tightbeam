@@ -90,3 +90,6 @@ pub(crate) const DUPLEX_CANCEL_PROPAGATED: Urn<'static> = Urn::new("test", "even
 pub(crate) const SERVLET_DUPLEX_CANCELLED: Urn<'static> = Urn::new("test", "event:cluster/servlet-duplex-cancelled");
 pub(crate) const STREAM_GATE_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/stream-gate-refused");
 pub(crate) const DUPLEX_GATE_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/duplex-gate-refused");
+pub(crate) const STREAM_BUDGET_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/stream-budget-refused");
+pub(crate) const RELAY_ROUTES_INSTALLED: Urn<'static> = Urn::new("test", "event:cluster/relay-routes-installed");
+pub(crate) const RELAY_TRUE_ADDR_RESTORED: Urn<'static> = Urn::new("test", "event:cluster/relay-true-addr-restored");

@@ -14,7 +14,9 @@
 
 mod common;
 mod events;
+mod federation;
 mod gossip;
+mod organizations;
 mod peering;
 mod registration;
 mod routing;

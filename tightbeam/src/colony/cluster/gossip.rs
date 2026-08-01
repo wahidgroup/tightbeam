@@ -15,13 +15,14 @@
 //! [`GossipJournal`] stores digests for deduplication and retention.
 //! [`MemoryGossipJournal`] is the in-memory default.
 
+use core::mem::discriminant;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use super::ClusterError;
 use crate::asn1::Frame;
-use crate::colony::common::GossipRumor;
+use crate::colony::common::{GossipRumor, GossipRumorKind};
 use crate::constants::{
 	DEFAULT_GOSSIP_RATE_BURST, DEFAULT_GOSSIP_RATE_REFILL_MS, DEFAULT_GOSSIP_RETENTION_MS, DEFAULT_GOSSIP_SEEN_TTL_MS,
 	DEFAULT_GOSSIP_TTL, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_RATE_SIGNERS,
@@ -127,6 +128,7 @@ pub fn signer_attribution(frame: &Frame) -> Option<Vec<u8>> {
 pub struct AdmittedGossip {
 	digest: GossipDigest,
 	payload: Vec<u8>,
+	kind: GossipRumorKind,
 }
 
 impl AdmittedGossip {
@@ -147,7 +149,7 @@ impl AdmittedGossip {
 		let fresh = gossip_fresh(rumor.metadata.order, seen_ttl_ms, now_ms);
 		if within_payload && within_ttl && fresh {
 			let digest = gossip_digest::<D>(rumor).map_err(|_| TransitStatus::PermissionDenied)?;
-			let admitted = Self { digest, payload: body.payload };
+			let admitted = Self { digest, payload: body.payload, kind: body.kind };
 			Ok(admitted)
 		} else {
 			Err(TransitStatus::PermissionDenied)
@@ -165,14 +167,30 @@ impl AdmittedGossip {
 	pub fn payload(&self) -> &[u8] {
 		&self.payload
 	}
+
+	/// Consume the admission and yield the owned payload.
+	///
+	/// Local delivery takes the bytes this admission already owns, so
+	/// the handoff never copies them.
+	#[must_use]
+	pub fn into_payload(self) -> Vec<u8> {
+		self.payload
+	}
+
+	/// How the origin intends this rumor to be consumed.
+	#[must_use]
+	pub fn kind(&self) -> GossipRumorKind {
+		self.kind
+	}
 }
 
 /// Per-signer rate admission gating the gossip pipeline.
 ///
 /// Consulted after signature verification and before journal record or
 /// reflood. An over-limit signer cannot grow retained state or amplify
-/// traffic (CWE-770). The token-bucket default bounds burst and sustained
-/// rate; a custom implementation may meter on any signer-derived dimension.
+/// traffic (CWE-770). The token-bucket default bounds burst and
+/// sustained rate. A custom implementation may meter on any
+/// signer-derived dimension.
 pub trait GossipAdmission: Send + Sync {
 	/// Admit one rumor from `signer` at `now_ms`.
 	///
@@ -273,15 +291,16 @@ impl GossipAdmission for TokenBucketAdmission {
 /// Deduplication and retention store for delivery and anti-entropy.
 ///
 /// The gateway calls only this interface. The in-memory default gives
-/// bounded-window eventual delivery; a durable backend can retain across
-/// restarts. Errors are typed [`ClusterError`] variants.
+/// bounded-window eventual delivery. A durable backend can retain
+/// across restarts. Errors are typed [`ClusterError`] variants.
 pub trait GossipJournal: Send + Sync {
 	/// Deduplicate and retain one origin-signed rumor in a single step.
 	///
-	/// The rumor is retained verbatim so anti-entropy repair can forward
-	/// identical origin-signed bytes. [`Admission::New`] when unseen and
-	/// now recorded; [`Admission::Duplicate`] when already retained.
-	/// Fails closed at capacity.
+	/// The rumor is retained unchanged so anti-entropy repair can
+	/// forward identical origin-signed bytes. Returns
+	/// [`Admission::New`] when unseen and now recorded, and
+	/// [`Admission::Duplicate`] when already retained. Fails closed at
+	/// capacity.
 	fn record(
 		&self,
 		signer: &[u8],
@@ -290,12 +309,29 @@ pub trait GossipJournal: Send + Sync {
 		now_ms: u64,
 	) -> Result<Admission, ClusterError>;
 
-	/// Whether a digest is already retained, without recording it.
+	/// Deduplicate one ephemeral rumor digest without retaining the rumor.
+	///
+	/// Advertisement-class rumors dedup and loop-break on the seen set
+	/// only. The advertise beat re-publishes fresh state, so repairing
+	/// a stale hint would waste relay bandwidth and retention capacity.
+	///
+	/// A witnessed digest:
+	///
+	/// - MUST report as seen through [`GossipJournal::seen`].
+	/// - MUST NOT appear in [`GossipJournal::held_digests`],
+	///   [`GossipJournal::fetch`], or [`GossipJournal::pending_local`].
+	///
+	/// Returns [`Admission::New`] when unseen and now witnessed, or
+	/// [`Admission::Duplicate`] when already seen. Fails closed at capacity.
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError>;
+
+	/// Whether a digest is already retained or witnessed, without recording it.
 	///
 	/// Probed before rate admission so a duplicate does not spend a
 	/// signer's token: relay echoes are normal and MUST NOT drain the
-	/// bucket. Advisory only. [`GossipJournal::record`] remains the
-	/// atomic dedup step for races past the probe.
+	/// bucket. Advisory only. [`GossipJournal::record`] and
+	/// [`GossipJournal::witness`] remain the atomic dedup steps for
+	/// races past the probe.
 	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError>;
 
 	/// Digests still inside the retention window, for reconciliation summaries.
@@ -319,22 +355,34 @@ pub trait GossipJournal: Send + Sync {
 	fn retention_ms(&self) -> u64;
 }
 
-/// One retained rumor and the bookkeeping the journal tracks for it.
+/// One deduplicated digest and the bookkeeping the journal tracks for it.
 struct JournalEntry {
-	rumor: Frame,
 	signer: Vec<u8>,
 	recorded_ms: u64,
-	delivered_local: bool,
+	body: JournalBody,
+}
+
+/// What the journal keeps behind a deduplicated digest.
+///
+/// A retained rumor serves anti-entropy repair and local delivery
+/// retry. A witnessed digest serves dedup only and holds no bytes.
+/// The retained rumor is boxed so a witnessed entry costs one
+/// pointer, never a full inline [`Frame`].
+enum JournalBody {
+	Retained { rumor: Box<Frame>, delivered_local: bool },
+	Witnessed,
 }
 
 /// In-memory [`GossipJournal`] with per-signer partitioning.
 ///
-/// Dedup is global on the content digest: rumor bytes travel verbatim
+/// Dedup is global on the content digest: rumor bytes travel unchanged
 /// across relays (only the OUTER hop frame is rebuilt), so the digest
-/// matches wherever the rumor arrives. Per-signer capacity bounds how many
-/// distinct rumors one signer may hold, so a signer minting digests cannot
-/// evict rumors recorded for other signers. Retention prunes on every read
-/// and write in both clock directions so an aged-out rumor is never returned.
+/// matches wherever the rumor arrives. Per-signer capacity bounds
+/// retained and witnessed entries separately, so one signer's flood
+/// on either plane cannot starve its own other plane. The global cap
+/// is shared across signers and kinds: a memory ceiling, not a
+/// fairness partition. Retention prunes on every read and write in
+/// both clock directions so an aged-out rumor is never returned.
 pub struct MemoryGossipJournal {
 	entries: Mutex<HashMap<GossipDigest, JournalEntry>>,
 	retention_ms: u64,
@@ -376,8 +424,8 @@ pub struct GossipConfig {
 	pub ttl: u8,
 	/// Servlet type URN admitted rumors are delivered to on this gateway.
 	/// Local delivery is receiving-gateway policy, never rumor content.
-	/// `None` journals and refloods only; the record is marked delivered
-	/// so it never enters the pending retry set.
+	/// `None` journals and refloods only. The record is marked
+	/// delivered so it never enters the pending retry set.
 	pub ingress: Option<Urn<'static>>,
 	/// Dedup and retention store. Owns its own retention window.
 	pub journal: Arc<dyn GossipJournal>,
@@ -409,12 +457,19 @@ impl core::fmt::Debug for GossipConfig {
 	}
 }
 
-impl GossipJournal for MemoryGossipJournal {
-	fn record(
+impl MemoryGossipJournal {
+	/// Deduplicate `digest` under the capacity discipline and store
+	/// `body` when it is new (CWE-770).
+	///
+	/// The per-signer budget counts only entries of the incoming body
+	/// kind: a signer's witnessed advertisement digests can never
+	/// crowd out its retained application rumors. The reverse holds
+	/// too.
+	fn admit(
 		&self,
 		signer: &[u8],
 		digest: GossipDigest,
-		rumor: &Frame,
+		body: JournalBody,
 		now_ms: u64,
 	) -> Result<Admission, ClusterError> {
 		let mut entries = self.entries.lock()?;
@@ -424,17 +479,17 @@ impl GossipJournal for MemoryGossipJournal {
 			return Ok(Admission::Duplicate);
 		}
 
-		let signer_held = entries.values().filter(|entry| entry.signer == signer).count();
+		let body_kind = discriminant(&body);
+		let signer_held = entries
+			.values()
+			.filter(|entry| entry.signer == signer)
+			.filter(|entry| discriminant(&entry.body) == body_kind)
+			.count();
 		let within_global = entries.len() < self.capacity;
 		let within_signer = signer_held < self.per_signer_capacity;
 
 		if within_global && within_signer {
-			let entry = JournalEntry {
-				rumor: rumor.clone(),
-				signer: signer.to_vec(),
-				recorded_ms: now_ms,
-				delivered_local: false,
-			};
+			let entry = JournalEntry { signer: signer.to_vec(), recorded_ms: now_ms, body };
 			entries.insert(digest, entry);
 
 			Ok(Admission::New)
@@ -442,9 +497,27 @@ impl GossipJournal for MemoryGossipJournal {
 			Err(ClusterError::GossipJournalAtCapacity)
 		}
 	}
+}
+
+impl GossipJournal for MemoryGossipJournal {
+	fn record(
+		&self,
+		signer: &[u8],
+		digest: GossipDigest,
+		rumor: &Frame,
+		now_ms: u64,
+	) -> Result<Admission, ClusterError> {
+		let body = JournalBody::Retained { rumor: Box::new(rumor.clone()), delivered_local: false };
+		self.admit(signer, digest, body, now_ms)
+	}
+
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError> {
+		self.admit(signer, digest, JournalBody::Witnessed, now_ms)
+	}
 
 	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
 		let mut entries = self.entries.lock()?;
+
 		Self::prune(&mut entries, self.retention_ms, now_ms);
 
 		Ok(entries.contains_key(digest))
@@ -456,20 +529,30 @@ impl GossipJournal for MemoryGossipJournal {
 
 	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
 		let mut entries = self.entries.lock()?;
+
 		Self::prune(&mut entries, self.retention_ms, now_ms);
-		let digests = entries.keys().copied().collect();
+
+		let digests = entries
+			.iter()
+			.filter(|(_, entry)| matches!(entry.body, JournalBody::Retained { .. }))
+			.map(|(digest, _)| *digest)
+			.collect();
 
 		Ok(digests)
 	}
 
 	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
 		let mut entries = self.entries.lock()?;
+
 		Self::prune(&mut entries, self.retention_ms, now_ms);
 
 		let found = wanted
 			.iter()
 			.filter_map(|digest| entries.get(digest))
-			.map(|entry| entry.rumor.clone())
+			.filter_map(|entry| match &entry.body {
+				JournalBody::Retained { rumor, .. } => Some(rumor.as_ref().clone()),
+				JournalBody::Witnessed => None,
+			})
 			.collect();
 
 		Ok(found)
@@ -477,12 +560,15 @@ impl GossipJournal for MemoryGossipJournal {
 
 	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
 		let mut entries = self.entries.lock()?;
+
 		Self::prune(&mut entries, self.retention_ms, now_ms);
 
 		let pending = entries
 			.values()
-			.filter(|entry| !entry.delivered_local)
-			.map(|entry| entry.rumor.clone())
+			.filter_map(|entry| match &entry.body {
+				JournalBody::Retained { rumor, delivered_local: false } => Some(rumor.as_ref().clone()),
+				_ => None,
+			})
 			.collect();
 
 		Ok(pending)
@@ -491,7 +577,9 @@ impl GossipJournal for MemoryGossipJournal {
 	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
 		let mut entries = self.entries.lock()?;
 		if let Some(entry) = entries.get_mut(digest) {
-			entry.delivered_local = true;
+			if let JournalBody::Retained { delivered_local, .. } = &mut entry.body {
+				*delivered_local = true;
+			}
 		}
 
 		Ok(())
@@ -509,7 +597,7 @@ mod tests {
 	}
 
 	fn rumor(order: u64, payload: Vec<u8>) -> Frame {
-		let body = GossipRumor { payload };
+		let body = GossipRumor::application(payload);
 		Frame {
 			version: Version::V0,
 			metadata: Metadata {
@@ -558,6 +646,14 @@ mod tests {
 		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, 30_000, 1_000)?;
 		assert_eq!(admitted.digest(), digest(&frame));
 		assert_eq!(admitted.payload(), &[1, 2, 3]);
+		Ok(())
+	}
+
+	#[test]
+	fn into_payload_yields_the_admitted_body() -> Result<(), TransitStatus> {
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, 30_000, 1_000)?;
+		assert_eq!(admitted.into_payload(), vec![1, 2, 3]);
 		Ok(())
 	}
 
@@ -617,6 +713,85 @@ mod tests {
 		assert!(!before);
 		assert!(after);
 		assert!(!expired);
+		Ok(())
+	}
+
+	#[test]
+	fn witness_dedups_same_digest() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::default();
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		let first = journal.witness(b"signer-a", digest, 1_000)?;
+		let second = journal.witness(b"signer-a", digest, 1_000)?;
+		assert_eq!(first, Admission::New);
+		assert_eq!(second, Admission::Duplicate);
+		Ok(())
+	}
+
+	#[test]
+	fn witness_is_seen_but_never_retained() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::default();
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		journal.witness(b"signer-a", digest, 1_000)?;
+
+		assert!(journal.seen(&digest, 1_000)?);
+		assert!(journal.held_digests(1_000)?.is_empty());
+		assert!(journal.fetch(&[digest], 1_000)?.is_empty());
+		assert!(journal.pending_local(1_000)?.is_empty());
+		Ok(())
+	}
+
+	#[test]
+	fn witness_blocks_record_of_same_digest() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::default();
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		journal.witness(b"signer-a", digest, 1_000)?;
+		let replay = journal.record(b"signer-a", digest, &frame, 1_000)?;
+		assert_eq!(replay, Admission::Duplicate);
+		Ok(())
+	}
+
+	#[test]
+	fn witness_expires_with_retention() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::new(30_000);
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		journal.witness(b"signer-a", digest, 1_000)?;
+		assert!(journal.seen(&digest, 1_000)?);
+		assert!(!journal.seen(&digest, 90_000)?);
+		Ok(())
+	}
+
+	#[test]
+	fn witness_fails_closed_at_signer_capacity() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::with_limits(30_000, 8, 1);
+		let first = rumor(1_000, vec![1]);
+		let second = rumor(1_000, vec![2]);
+
+		journal.witness(b"signer-a", digest(&first), 1_000)?;
+
+		let overflow = journal.witness(b"signer-a", digest(&second), 1_000);
+		assert!(matches!(overflow, Err(ClusterError::GossipJournalAtCapacity)));
+		Ok(())
+	}
+
+	#[test]
+	fn witness_and_record_spend_separate_signer_budgets() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::with_limits(30_000, 8, 1);
+		let witnessed = rumor(1_000, vec![1]);
+		let retained = rumor(1_000, vec![2]);
+
+		let hint = journal.witness(b"signer-a", digest(&witnessed), 1_000)?;
+		let application = journal.record(b"signer-a", digest(&retained), &retained, 1_000)?;
+
+		assert_eq!(hint, Admission::New);
+		assert_eq!(application, Admission::New);
 		Ok(())
 	}
 

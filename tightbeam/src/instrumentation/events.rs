@@ -14,8 +14,9 @@ pub const END: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:core/end");
 pub const WARN: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:core/warn");
 pub const ERROR: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:core/error");
 
-// Trace clock origin (UNIX epoch ns in the label); once per collector so
-// relative `timestamp_ns` values reconstruct to absolute times.
+// Trace clock origin (UNIX epoch ns in the label). Emitted once per
+// collector so relative `timestamp_ns` values reconstruct to absolute
+// times.
 pub const TRACE_CLOCK_ORIGIN: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:trace/clock-origin");
 
 // Gate events
@@ -115,7 +116,7 @@ pub const SESSION_RECEIPT_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event
 pub const SESSION_CERT_REJECTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:session/cert-rejected");
 
 // Hive lifecycle: the anti-entropy beat re-announces the hive's servlet
-// slate to every registered gateway; the event value is the gateway's
+// slate to every registered gateway. The event value is the gateway's
 // response status (`Unavailable` when the gateway was unreachable).
 pub const HIVE_REREGISTERED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:hive/reregistered");
 
@@ -134,6 +135,12 @@ pub const CLUSTER_WORK_FAILED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:clu
 pub const CLUSTER_WORK_FORWARDED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-forwarded");
 pub const CLUSTER_HIVE_EVICTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/hive-evicted");
 pub const CLUSTER_PEER_ADVERTISED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-advertised");
+pub const CLUSTER_PEER_AD_LEARNED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-ad-learned");
+pub const CLUSTER_PEER_AD_DROPPED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-ad-dropped");
+pub const CLUSTER_PEER_AD_PUBLISH_FAILED: Urn<'static> =
+	Urn::new(TIGHTBEAM_NID, "event:cluster/peer-ad-publish-failed");
+pub const CLUSTER_RELAY_TRAIL_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/relay-trail-refused");
+pub const CLUSTER_RELAY_TRAIL_PRUNED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/relay-trail-pruned");
 pub const CLUSTER_PEER_DISCOVERED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-discovered");
 pub const CLUSTER_PEER_EVICTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-evicted");
 pub const CLUSTER_PEER_ADVERTISE_REFUSED: Urn<'static> =

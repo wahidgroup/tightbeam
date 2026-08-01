@@ -61,7 +61,7 @@ where
 /// rather than a stale handshake snapshot) with the stream's
 /// [`StreamRoute`] (the grpc-style dispatch target the initiator
 /// stamped on the Open). Handlers take only what they need through the
-/// accessors; the struct grows without churning method signatures.
+/// accessors, so the struct grows without churning method signatures.
 ///
 /// Unary opens are unrouted today ([`CallContext::target`] is `None`):
 /// a unary frame self-describes its addressing in its payload, and no
@@ -76,7 +76,7 @@ impl CallContext {
 	/// Bundle a live session with the stream's route.
 	///
 	/// Public so an external [`MuxService`] implementation can build a
-	/// context in its own tests; the serving path assembles one per
+	/// context in its own tests. The serving path assembles one per
 	/// dispatch. An unrouted call takes `StreamRoute::default()`.
 	pub fn new(session: SessionContext, route: StreamRoute) -> Self {
 		Self { session, route }
@@ -103,10 +103,11 @@ impl CallContext {
 		self.route.target()
 	}
 
-	/// Whether an upstream gateway already forwarded this open. A
-	/// forwarded stream is served locally and never re-forwarded.
-	pub fn forwarded(&self) -> bool {
-		self.route.forwarded()
+	/// Relay budget left on this open: the number of gateway forwards
+	/// the stream may still spend. A `0` stream is served locally and
+	/// never re-forwarded.
+	pub fn hops_remaining(&self) -> u8 {
+		self.route.hops_remaining()
 	}
 }
 
@@ -138,7 +139,7 @@ pub trait MuxService: Send + Sync + 'static {
 
 	/// Consume a streamed request body and answer with an optional
 	/// unary reply frame. The collector gate has already run at
-	/// dispatch with no request frame (`None`); see [`GatePolicy`].
+	/// dispatch with no request frame (`None`). See [`GatePolicy`].
 	///
 	/// # Errors
 	/// The failure closes the stream with its mapped status (see
@@ -154,7 +155,7 @@ pub trait MuxService: Send + Sync + 'static {
 
 	/// Consume request chunks while pushing reply chunks (full duplex
 	/// on one stream). The collector gate has already run at dispatch
-	/// with no request frame (`None`); see [`GatePolicy`].
+	/// with no request frame (`None`). See [`GatePolicy`].
 	///
 	/// # Errors
 	/// The failure closes the stream with a mapped status (see [`serve_mux`]).
@@ -171,8 +172,8 @@ pub trait MuxService: Send + Sync + 'static {
 
 /// A frame-in/frame-out closure is a unary-only [`MuxService`]:
 /// streaming and duplex streams answer [`TransitStatus::Unimplemented`].
-/// The closure keeps the bare [`SessionContext`] grammar; a unary open
-/// carries no route to expose.
+/// The closure keeps the bare [`SessionContext`] grammar, and a unary
+/// open carries no route to expose.
 impl<F, Fut> MuxService for F
 where
 	F: Fn(Frame, SessionContext) -> Fut + Send + Sync + 'static,

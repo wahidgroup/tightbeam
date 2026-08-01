@@ -488,6 +488,80 @@ pub const MAX_PEER_GATEWAYS: usize = 64;
 ///   <https://cwe.mitre.org/data/definitions/770.html>
 pub const MAX_PEER_ROUTES: usize = 1024;
 
+/// Ceiling on distinct relay-trail buckets tracked in one servlet registry
+///
+/// Relay trails bucket per `(origin, relay)` pair, so a colony of `N`
+/// members can mint up to `N * (N - 1)` buckets. The budget is
+/// separate from [`MAX_PEER_GATEWAYS`]: relay fan-in must never starve
+/// the admission of a new direct gateway.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const MAX_RELAY_BUCKETS: usize = 64;
+
+/// Ceiling on total live relay-trail routes tracked in one servlet registry
+///
+/// Separate from [`MAX_PEER_ROUTES`] for the same reason
+/// [`MAX_RELAY_BUCKETS`] is separate from [`MAX_PEER_GATEWAYS`]: a
+/// full relay plane must leave the direct-route budget untouched.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const MAX_RELAY_ROUTES: usize = 1024;
+
+/// Origin sentinel for the relay budget on work and routed stream opens
+///
+/// The budget is the number of gateway forwards a request may still
+/// spend. Each peer hop decrements it, and `0` serves locally only.
+/// An origin stamps `u8::MAX`, which means "forward as far as policy
+/// allows". The first gateway clamps the value to its own `max_hops`,
+/// so the client never asserts topology knowledge and a crafted large
+/// value gains nothing. A relayed hop carries the explicit decremented
+/// value, which every later gateway clamps again. The sentinel is also
+/// the DER DEFAULT, so the common origin request omits the field on
+/// the wire.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const DEFAULT_HOP_BUDGET: u8 = u8::MAX;
+
+/// Default advertisement-rumor refresh interval in milliseconds
+///
+/// The advertise beat floods the local slate as an advertisement rumor
+/// only when the slate or the flood target set changed. One refresh on
+/// this interval lets late joiners and pruned witnesses relearn the
+/// origin. Bitcoin self-announces addresses the same way: on change
+/// and on a slow timer, never per beat. The refresh MUST stay under
+/// the gossip freshness window ([`DEFAULT_GOSSIP_SEEN_TTL_MS`]) so a
+/// refreshed rumor always admits as fresh.
+///
+/// # Sources
+///
+/// - Bitcoin P2P network, periodic self-announcement of the local
+///   address to peers:
+///   <https://developer.bitcoin.org/devguide/p2p_network.html>
+pub const DEFAULT_AD_RUMOR_REFRESH_MS: u64 = 30_000;
+
+/// Default `max_hops` relay cap on a cluster gateway
+///
+/// One forward: a gateway relays a request to a peer at most once,
+/// and the peer serves locally only. Operators raise the cap to
+/// enable relay-trail fallback, which needs two forwards end to end.
+/// The cap bounds the forwarding work one request can demand from
+/// this gateway, whatever budget the wire carries.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const DEFAULT_MAX_HOPS: u8 = 1;
+
 /// Ceiling on the payload bytes carried in one gossip envelope
 ///
 /// A gossip rumor floods the peer graph.

@@ -62,7 +62,7 @@ pub(super) enum InboundEvent {
 	/// Unary-kind stream reassembled into its message frame
 	Request(u32, Arc<Frame>),
 	/// Streaming or duplex kind: the body forwards chunks as they
-	/// arrive; the kind fixes the reply shape, and the route carries
+	/// arrive. The kind fixes the reply shape, and the route carries
 	/// the grpc-style dispatch target the initiator stamped on the Open.
 	StreamOpen(u32, MuxStreamKind, StreamBody, StreamRoute),
 	Cancel(u32),
@@ -154,7 +154,7 @@ where
 	peer_reassembly: HashMap<u32, RecvStream>,
 	/// Streaming peer-initiated requests: chunks forward to the
 	/// handler's [`StreamBody`] instead of reassembling. Holds only
-	/// peer-initiated stream IDs; locally-initiated duplex replies
+	/// peer-initiated stream IDs. Locally-initiated duplex replies
 	/// live in the shared `duplex_recv` registry.
 	peer_bodies: HashMap<u32, ForwardedStream>,
 	/// Reassembly of responses to locally-initiated streams
@@ -163,8 +163,8 @@ where
 	/// notes are bounded by forwarded chunks, which grants bound
 	/// by the per-stream windows.
 	drained: mpsc::UnboundedReceiver<DrainNote>,
-	/// Cloned into each body; holding one end keeps `drained` open
-	/// for the driver's lifetime
+	/// Cloned into each body. Holding one end keeps `drained` open
+	/// for the driver's lifetime.
 	drain_feedback: mpsc::UnboundedSender<DrainNote>,
 	/// Control commands buffered while the writer queue is full so
 	/// the read loop never parks
@@ -172,8 +172,8 @@ where
 	/// Bounded: grants coalesce per stream and evict when the stream
 	/// closes, ping acks are capped, rekey legs are one-in-flight
 	pending_control: VecDeque<Outbound>,
-	/// Role-fixed rekey exchange; `None` keeps every rekey leg an
-	/// unsolicited protocol violation
+	/// Role-fixed rekey exchange. `None` keeps every rekey leg an
+	/// unsolicited protocol violation.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	rekey: Option<RekeyDriver>,
 	/// Client epoch state held between the `RekeyAck` and the
@@ -724,7 +724,7 @@ where
 			.retain(|envelope| !is_credit_grant_for(envelope, stream_id));
 	}
 
-	/// Queue a ping ack; probes beyond [`MAX_PENDING_PING_ACKS`] draw no ack.
+	/// Queue a ping ack. Probes beyond [`MAX_PENDING_PING_ACKS`] draw no ack.
 	fn queue_ping_ack(&mut self, package: MuxPingPackage) -> TransportResult<()> {
 		let buffered_acks = self.pending_control.iter().filter(|envelope| is_ping_ack(envelope)).count();
 		if buffered_acks >= MAX_PENDING_PING_ACKS {
@@ -889,9 +889,8 @@ where
 
 	/// Accept a streaming- or duplex-kind open: chunks forward to
 	/// the handler's [`StreamBody`] as they arrive, no reassembly.
-	/// The initial grant window doubles as the body channel bound;
-	/// further grants follow consumer drain (see
-	/// [`Self::grant_streaming`]).
+	/// The initial grant window doubles as the body channel bound.
+	/// Further grants follow consumer drain (see [`Self::grant_streaming`]).
 	async fn accept_streaming_open(&mut self, stream_id: u32, package: MuxOpenPackage) -> TransportResult<()> {
 		self.charge_inbound_chunk(package.payload())?;
 
@@ -910,7 +909,7 @@ where
 		}
 
 		let kind = package.kind();
-		let route = StreamRoute::from_parts(package.target().cloned(), package.forwarded());
+		let route = StreamRoute::from_parts(package.target().cloned(), package.hops_remaining());
 
 		if package.last() {
 			let _ = forwarder.forward(BodyEvent::End);
@@ -1161,9 +1160,10 @@ where
 		self.queue_ping_ack(MuxPingPackage::new(true, package.opaque()))
 	}
 
-	/// Refuse a peer-initiated stream with a `Rejected` cancel. Rides
-	/// the control buffer: a refusal lost to a full writer queue would
-	/// leave the peer's stream pending forever.
+	/// Refuse a peer-initiated stream with a `Rejected` cancel. The
+	/// cancel goes through the control buffer: a refusal lost to a
+	/// full writer queue would leave the peer's stream pending
+	/// forever.
 	fn refuse_stream(&mut self, stream_id: u32) -> TransportResult<()> {
 		let package = MuxCancelPackage::new(stream_id, CancelReason::Rejected);
 		self.queue_control(package.into())

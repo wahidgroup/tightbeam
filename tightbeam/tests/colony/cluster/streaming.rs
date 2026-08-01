@@ -2,7 +2,7 @@
 //!
 //! The stream-echo servlet lives only in cluster B. A client opens a
 //! routed stream against cluster A (`open_stream_to` / `open_duplex_to`),
-//! and A splices it to B's gateway with the stream loop guard set; B
+//! and A splices it to B's gateway with the hop budget spent. B then
 //! serves it locally. Cancelling the client stream propagates across
 //! the splice to the servlet.
 
@@ -15,9 +15,9 @@ use super::common::*;
 /// propagation deterministically instead of sleeping a fixed time.
 ///
 /// Shared by every scenario in this binary, yet only a genuine
-/// mid-stream abort can set it: a completing duplex handler disarms
+/// mid-stream abort can set it. A completing duplex handler disarms
 /// its probe before the responder sends the End trailer the client
-/// waits on. A new scenario that cancels this servlet must not run
+/// waits on. A new scenario that cancels this servlet MUST NOT run
 /// beside [`cluster_duplex_cancel_propagates_to_peer`].
 static DUPLEX_CANCEL_SEEN: AtomicBool = AtomicBool::new(false);
 
@@ -75,8 +75,8 @@ servlet! {
 }
 
 /// Hive hosting one stream-echo servlet, muxed on both the servlet
-/// server and the hive -> cluster pool.
-async fn start_stream_hive(
+/// server and the hive-to-cluster pool.
+pub(super) async fn start_stream_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
@@ -93,22 +93,18 @@ async fn start_stream_hive(
 /// [`peering_cluster_conf`] with a mux offer, so the gateway serves
 /// routed streams and its pools open them.
 fn mux_peering_conf(certs: &ClusterTestCerts) -> ClusterConfig {
-	let mut conf = peering_cluster_conf(certs);
-	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
-	conf
+	with_mux_offer(peering_cluster_conf(certs))
 }
 
 /// [`advertising_cluster_conf`] with a mux offer, so the exporting
 /// gateway serves forwarded streams from its peer.
 fn mux_advertising_conf(certs: &ClusterTestCerts, peer: String) -> ClusterConfig {
-	let mut conf = advertising_cluster_conf(certs, peer);
-	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
-	conf
+	with_mux_offer(advertising_cluster_conf(certs, peer))
 }
 
 /// Pooled mux lease against a gateway, for the routed stream entry
 /// points ([`PooledClient::open_stream_to`] / [`PooledClient::open_duplex_to`]).
-async fn pooled_cluster_client(
+pub(super) async fn pooled_cluster_client(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
 	addr: &<TokioListener as Protocol>::Address,
@@ -182,9 +178,10 @@ tb_assert_spec! {
 }
 
 // Streaming cross-cluster forward: stream-echo lives only in the
-// exporter; the client opens a routed stream against the importer; the
-// importer splices to the exporter (loop guard set), the exporter
-// serves locally, and the servlet's reply frame relays back verbatim.
+// exporter. The client opens a routed stream against the importer,
+// and the importer splices to the exporter with the hop budget spent.
+// The exporter serves locally, and the servlet's reply frame relays
+// back unchanged.
 tb_scenario! {
 	name: cluster_forwards_streaming_to_peer_gateway,
 	spec: ClusterStreamForwardSpec,
@@ -292,10 +289,11 @@ tb_scenario! {
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
-			let mut conf = ClusterConfig::builder(cluster_tls_config(&certs))
-				.with_gate_policy(Arc::new(RejectAllPolicy))
-				.build();
-			conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+			let conf = with_mux_offer(
+				ClusterConfig::builder(cluster_tls_config(&certs))
+					.with_gate_policy(Arc::new(RejectAllPolicy))
+					.build(),
+			);
 
 			start_cluster(&trace, conf).await
 		},
@@ -339,10 +337,10 @@ tb_assert_spec! {
 
 // Cancel propagation across the splice: the client proves the duplex
 // path is live (one chunk echoes end to end), then drops its stream
-// halves. The cancel crosses importer -> exporter -> servlet, aborting
-// the servlet handler, which the cancel probe reports. The propagation
-// flag is recorded before any teardown, so a shutdown abort cannot
-// satisfy the spec spuriously.
+// halves. The cancel crosses the importer, the exporter, and the
+// servlet, aborting the servlet handler, which the cancel probe
+// reports. The propagation flag is recorded before any teardown, so
+// a shutdown abort cannot satisfy the spec spuriously.
 tb_scenario! {
 	name: cluster_duplex_cancel_propagates_to_peer,
 	spec: ClusterDuplexCancelSpec,

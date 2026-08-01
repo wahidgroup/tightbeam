@@ -15,7 +15,7 @@ use crate::colony::common::{
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
-use crate::instrumentation::events::CLUSTER_HIVE_EVICTED;
+use crate::instrumentation::events::{CLUSTER_HIVE_EVICTED, CLUSTER_RELAY_TRAIL_PRUNED};
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
@@ -25,6 +25,9 @@ use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
 use crate::{MessagePriority, Version};
 
+/// Parse a registered hive's stored address into the protocol address
+/// type, returning the raw bytes beside the parsed form. `None` means
+/// the stored bytes are not a dialable address for this protocol.
 pub fn parse_hive_addr<A: FromStr>(hive: &HiveEntry) -> Option<(Arc<[u8]>, A)> {
 	let hive_addr = Arc::clone(&hive.address);
 	from_utf8(&hive_addr)
@@ -49,6 +52,13 @@ fn fire_heartbeat_callback(
 	}
 }
 
+/// Settle one heartbeat outcome against the registries.
+///
+/// A live answer refreshes the hive's lease and utilization. A dead
+/// or refused answer counts one failure. At `max_failures` the hive
+/// unregisters, its servlet routes drop, and the eviction traces as
+/// [`CLUSTER_HIVE_EVICTED`]. The configured heartbeat callback fires
+/// for both outcomes.
 pub fn process_heartbeat_result(
 	registry: &HiveRegistry,
 	servlet_registry: &ServletRegistry,
@@ -82,6 +92,12 @@ pub fn process_heartbeat_result(
 	}
 }
 
+/// Send one signed heartbeat command to a hive and decode its answer.
+///
+/// # Errors
+/// - [`ClusterError::NoResponse`]: the hive closed without answering
+/// - [`ClusterError::MalformedResponse`]: the answer carried no heartbeat result
+/// - transport or signing failures from the dial and emit
 pub async fn send_heartbeat_async<P, D>(
 	pool: Arc<ClusterPool<P>>,
 	config: Arc<ClusterConfig>,
@@ -131,6 +147,7 @@ where
 	cmd_response.heartbeat.ok_or(ClusterError::MalformedResponse)
 }
 
+/// Spawn the periodic heartbeat loop over every registered hive.
 pub(crate) fn spawn_heartbeat_loop<P, D>(
 	registry: Arc<HiveRegistry>,
 	servlet_registry: Arc<ServletRegistry>,
@@ -204,15 +221,31 @@ where
 	})
 }
 
+/// Spawn the pheromone evaporation loop, which also retires abandoned
+/// routes and relay trails older than `relay_trail_ttl`.
 pub(crate) fn spawn_evaporation_loop(
 	servlet_registry: Arc<ServletRegistry>,
 	evaporation_interval: Duration,
+	relay_trail_ttl: Duration,
+	trace: Arc<TraceCollector>,
 ) -> rt::JoinHandle {
 	rt::spawn(async move {
 		loop {
 			rt::sleep(evaporation_interval).await;
 			let _ = servlet_registry.evaporate();
 			let _ = servlet_registry.remove_abandoned();
+			// Relay trails refresh only through relayed rumors, so a
+			// trail that outlived its refresh window retires by age.
+			// Selection alone can never abandon an unpicked trail.
+			// A retired fallback traces with its count, so a route
+			// that silently vanished stays diagnosable (ISO 27001
+			// A.8.15).
+			if let Ok(pruned) = servlet_registry.prune_stale_relay_trails(relay_trail_ttl) {
+				if pruned > 0 {
+					let count = u64::try_from(pruned).unwrap_or(u64::MAX);
+					let _ = trace.event_with(CLUSTER_RELAY_TRAIL_PRUNED, &[], count);
+				}
+			}
 		}
 	})
 }

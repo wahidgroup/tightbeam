@@ -212,17 +212,41 @@ impl ClusterConfigBuilder {
 		self
 	}
 
+	/// Cap the relay budget honored on inbound work and routed stream
+	/// opens. The default honors a single forward, and `0` disables
+	/// forwarding.
+	///
+	/// Relay-trail fallback needs `2`: the trail spends one forward at
+	/// the relay and one more to reach the owner. A gateway below
+	/// that cap never installs relay trails.
+	pub fn with_max_hops(mut self, max_hops: u8) -> Self {
+		self.peer.max_hops = max_hops;
+		self
+	}
+
+	/// Set the advertisement-rumor refresh interval.
+	///
+	/// [`ClusterConfigBuilder::build`] clamps the interval to the
+	/// gossip freshness window (`GossipConfig::seen_ttl`): a refresh
+	/// slower than the window would re-publish rumors that peers
+	/// refuse as stale.
+	pub fn with_rumor_refresh(mut self, rumor_refresh: Duration) -> Self {
+		self.peer.rumor_refresh = rumor_refresh;
+		self
+	}
+
 	/// Set the persistence driver beneath the peer discovery table.
 	/// Defaults to the process-local [`MemoryPeerStore`]. A durable
-	/// driver preserves learned peers across restarts; the table still
+	/// driver preserves learned peers across restarts. The table still
 	/// owns every discovery bound, so a driver cannot bypass them.
 	pub fn with_peer_store(mut self, store: Arc<dyn PeerStore>) -> Self {
 		self.peer_store = store;
 		self
 	}
 
-	/// Set the gossip subsystem configuration (freshness/ttl/retention +
-	/// journal); defaults to [`GossipConfig::default`]
+	/// Set the gossip subsystem configuration: freshness, ttl,
+	/// retention, and the journal. Defaults to
+	/// [`GossipConfig::default`].
 	pub fn with_gossip_config(mut self, config: GossipConfig) -> Self {
 		self.gossip = config;
 		self
@@ -260,6 +284,11 @@ impl ClusterConfigBuilder {
 		// `peers` stays readable configuration beside the table.
 		let mut peer = self.peer;
 		peer.table = Arc::new(PeerTable::new(peer.peers.clone(), self.peer_store));
+
+		// A refresh slower than the gossip freshness window would
+		// re-publish advertisement rumors that peers refuse as stale,
+		// so the interval clamps to the window.
+		peer.rumor_refresh = peer.rumor_refresh.min(self.gossip.seen_ttl);
 
 		ClusterConfig {
 			namespace: self.namespace,
