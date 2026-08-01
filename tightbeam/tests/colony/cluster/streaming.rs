@@ -270,6 +270,58 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
+	pub ClusterStreamGateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_GATE_BLOCKED, exactly!(2)),
+			(STREAM_GATE_REFUSED, exactly!(1), equals!(true)),
+			(DUPLEX_GATE_REFUSED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// Gate policies cover stream opens: the reject-all policy that denies
+// unary work also refuses routed streaming and duplex opens before any
+// route is consulted, so mux streams cannot bypass `with_gate_policy`.
+tb_scenario! {
+	name: cluster_policy_gate_blocks_streams,
+	spec: ClusterStreamGateSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let mut conf = ClusterConfig::builder(cluster_tls_config(&certs))
+				.with_gate_policy(Arc::new(RejectAllPolicy))
+				.build();
+			conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+
+			start_cluster(&trace, conf).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let client = pooled_cluster_client(&trace, &certs, cluster.addr()).await?;
+			trace.event(WORK_SENT)?;
+
+			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"denied").await?;
+
+			let refused = response.await.is_err();
+			trace.event_with(STREAM_GATE_REFUSED, &[], refused)?;
+
+			let (sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"denied").await?;
+
+			let refused = body.chunk().await.is_err();
+			trace.event_with(DUPLEX_GATE_REFUSED, &[], refused)?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
 	pub ClusterDuplexCancelSpec,
 	V(1,0,0): {
 		mode: Accept,

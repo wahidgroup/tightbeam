@@ -11,14 +11,15 @@ use crate::trace::TraceCollector;
 use crate::Frame;
 
 /// Run collector gate policies before decoding the request envelope.
+/// A stream open carries no request frame, so it evaluates with `None`.
 pub(crate) fn evaluate_gates(
-	frame: &Frame,
+	frame: Option<&Frame>,
 	session: &SessionContext,
 	config: &ClusterConfig,
 	trace: &TraceCollector,
 ) -> Result<(), TransitStatus> {
 	for policy in config.policies.iter() {
-		let status = GatePolicy::evaluate(policy.as_ref(), Some(frame), session);
+		let status = GatePolicy::evaluate(policy.as_ref(), frame, session);
 		if status != TransitStatus::Ok {
 			trace.event(CLUSTER_GATE_BLOCKED).map_err(|_| status)?;
 

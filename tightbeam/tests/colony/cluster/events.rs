@@ -88,3 +88,5 @@ pub(crate) const DUPLEX_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/d
 pub(crate) const DUPLEX_LIVE_BEFORE_CANCEL: Urn<'static> = Urn::new("test", "event:cluster/duplex-live-before-cancel");
 pub(crate) const DUPLEX_CANCEL_PROPAGATED: Urn<'static> = Urn::new("test", "event:cluster/duplex-cancel-propagated");
 pub(crate) const SERVLET_DUPLEX_CANCELLED: Urn<'static> = Urn::new("test", "event:cluster/servlet-duplex-cancelled");
+pub(crate) const STREAM_GATE_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/stream-gate-refused");
+pub(crate) const DUPLEX_GATE_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/duplex-gate-refused");

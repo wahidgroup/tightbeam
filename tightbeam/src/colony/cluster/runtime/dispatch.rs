@@ -48,7 +48,7 @@ where
 		+ 'static,
 	D: ClusterDigest,
 {
-	if let Err(status) = evaluate_gates(&frame, &session, &ctx.config, &ctx.trace) {
+	if let Err(status) = evaluate_gates(Some(&frame), &session, &ctx.config, &ctx.trace) {
 		return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(status));
 	}
 

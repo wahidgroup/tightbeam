@@ -10,7 +10,8 @@ use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, Gatewa
 use crate::colony::cluster::runtime::dispatch::handle_gateway_request;
 use crate::colony::cluster::runtime::gossip_tasks::{build_advertise_task, peer_dial_pool};
 use crate::colony::cluster::runtime::heartbeat::{send_heartbeat_async, spawn_evaporation_loop, spawn_heartbeat_loop};
-use crate::colony::cluster::runtime::streaming::{splice_duplex, splice_streaming};
+use crate::colony::cluster::runtime::streaming::{refuse, splice_duplex, splice_streaming};
+use crate::colony::cluster::runtime::verify::evaluate_gates;
 use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, PeerRouteInfo,
 	ServletRegistry, SharedId,
@@ -378,6 +379,12 @@ where
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
 		async move {
+			// The same gate policies that guard unary work run before
+			// any routing, so a stream open cannot bypass them.
+			if let Err(status) = evaluate_gates(None, cx.session(), &ctx.config, &ctx.trace) {
+				return Err(refuse(status));
+			}
+
 			// An unrouted stream names no servlet type, so the gateway
 			// has nothing to dispatch.
 			let Some(target) = cx.target().cloned() else {
@@ -396,6 +403,12 @@ where
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
 		async move {
+			// The same gate policies that guard unary work run before
+			// any routing, so a stream open cannot bypass them.
+			if let Err(status) = evaluate_gates(None, cx.session(), &ctx.config, &ctx.trace) {
+				return Err(refuse(status));
+			}
+
 			// An unrouted stream names no servlet type, so the gateway
 			// has nothing to dispatch.
 			let Some(target) = cx.target().cloned() else {

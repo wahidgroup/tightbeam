@@ -163,6 +163,16 @@ pub(super) async fn emit_frame(
 	client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)
 }
 
+/// Gate policy that denies every request, for scenarios proving the
+/// gateway enforces `with_gate_policy` on unary work and stream opens.
+pub(super) struct RejectAllPolicy;
+
+impl GatePolicy for RejectAllPolicy {
+	fn evaluate(&self, _message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+		TransitStatus::PermissionDenied
+	}
+}
+
 /// Record a registration outcome on the trace: the wire status as
 /// `REGISTER_STATUS`, the registry size as `REGISTRY_HIVES`, and whether
 /// a hive id was assigned as `REGISTER_ASSIGNED_ID`. The specs pin the

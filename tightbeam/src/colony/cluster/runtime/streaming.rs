@@ -47,7 +47,7 @@ struct SplicePlan<P: Protocol> {
 
 /// Refuse a stream with a terminal transit status. The mux responder
 /// maps the failure onto the stream's `End` trailer.
-fn refuse(status: TransitStatus) -> TightBeamError {
+pub(super) fn refuse(status: TransitStatus) -> TightBeamError {
 	TransportError::from(status).into()
 }
 
