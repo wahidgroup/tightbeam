@@ -7,6 +7,7 @@
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
+use tightbeam::colony::cluster::{ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
 
 /// Dial address nothing listens on: a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
@@ -523,6 +524,145 @@ tb_scenario! {
 			trace.event_with(STREAM_BUDGET_REFUSED, &[], refused)?;
 
 			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// Balancer that pins the first pick to one route key, so a scenario
+/// deterministically dials a decoy before the bounded failover. An
+/// unset or excluded preference defers to the first candidate.
+struct DecoyFirstBalancer {
+	preferred: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl LoadBalancer for DecoyFirstBalancer {
+	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize> {
+		let preferred = self.preferred.lock().ok()?;
+		let pinned = preferred
+			.as_ref()
+			.and_then(|key| candidates.iter().position(|candidate| candidate.instance_key == *key));
+
+		pinned.or(Some(0))
+	}
+}
+
+/// Set the balancer preference. Harness helper: the lock only poisons
+/// after a balancer panic, which fails the scenario anyway.
+fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: Vec<u8>) {
+	let mut preferred = cell.lock().expect("preference lock poisons only after a balancer panic");
+	*preferred = Some(key);
+}
+
+/// Route key `cluster` holds for `type_name` toward `dial_addr`,
+/// rebuilt through the public [`ServletEntry::peer`] constructor so
+/// the key discipline stays in one place.
+fn peer_route_key_for_dial(cluster: &ClusterGateway, type_name: &str, dial_addr: &[u8]) -> Option<Vec<u8>> {
+	let canonical = type_canonical_bytes(&servlet_urn(type_name));
+	cluster
+		.peer_routes()
+		.into_iter()
+		.find(|route| route.dial_addr.as_ref() == dial_addr && route.servlet_type.as_ref() == canonical.as_slice())
+		.map(|route| {
+			ServletEntry::peer(
+				route.peer_id,
+				route.servlet_type,
+				route.dial_addr,
+				DEFAULT_INITIAL_PHEROMONE,
+				DEFAULT_ABANDONMENT_LIMIT,
+			)
+		})
+		.map(|entry| entry.route_key().to_vec())
+}
+
+tb_assert_spec! {
+	pub ClusterLiveDecoyFailoverSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(PEER_AD_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
+			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(2u64)),
+			(WORK_SENT, exactly!(1)),
+			(events::CLUSTER_WORK_UNAVAILABLE, exactly!(1)),
+			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
+			(WORK_ECHOED, exactly!(1), equals!(42u64))
+		]
+	}
+}
+
+// A live decoy answers but cannot serve: its well-formed `Unavailable`
+// reply joins the bounded failover instead of relaying to the client.
+//
+// - B is a live member gateway with no ping servlet. Its injected
+//   advertisement claims ping at its own address, so A installs a
+//   trail to a gateway that answers and refuses.
+// - Every advertise beat is off, so both of A's trails come from the
+//   two injected advertisements and the event counts are exact.
+// - The pinned balancer makes A dial B first, deterministically. The
+//   one `CLUSTER_WORK_UNAVAILABLE` fires on B, never on A.
+// - The echo proves the failover: A weakens the decoy trail and
+//   retries C's trail within the same request.
+tb_scenario! {
+	name: cluster_live_peer_unavailable_reply_fails_over,
+	spec: ClusterLiveDecoyFailoverSpec,
+	environment Hive {
+		context: federation_ctx(),
+		start: |SetupEnv { trace, context: ctx }| async move {
+			start_ping_hive(trace, Arc::clone(&ctx.c), None).await
+		},
+		client: |HiveEnv { trace, context: ctx, hive }| async move {
+			let mut conf_b = federation_conf(&ctx.b, vec![], 1);
+			conf_b.peer.advertise_interval = None;
+			let gateway_b = start_cluster(&trace, conf_b).await?;
+
+			let mut conf_c = federation_conf(&ctx.c, vec![], 1);
+			conf_c.peer.advertise_interval = None;
+			let gateway_c = start_cluster(&trace, conf_c).await?;
+			hive.register_with_cluster(gateway_c.addr()).await?;
+
+			let preferred = Arc::new(Mutex::new(None));
+			let mut conf_a = federation_conf(&ctx.a, vec![], 1);
+			conf_a.peer.advertise_interval = None;
+			conf_a.load_balancer = Arc::new(DecoyFirstBalancer { preferred: Arc::clone(&preferred) });
+			let gateway_a = start_cluster(&trace, conf_a).await?;
+
+			// Both trails install by injected advertisement: the decoy
+			// claim from B and the honest claim from C.
+			let decoy_addr = gateway_b.addr().to_string();
+			advertise_peer_signed(&trace, &ctx.a, &ctx.b.key, &gateway_a, decoy_addr.as_bytes(), vec![servlet_urn("ping")])
+				.await?;
+			let origin_addr = gateway_c.addr().to_string();
+			advertise_peer_signed(
+				&trace,
+				&ctx.a,
+				&ctx.c.key,
+				&gateway_a,
+				origin_addr.as_bytes(),
+				vec![servlet_urn("ping")],
+			)
+			.await?;
+			let installed = wait_for_type_routes(&gateway_a, "ping", 2, 100, Duration::from_millis(100)).await;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], installed as u64)?;
+
+			// Pin the first pick to the decoy trail.
+			let decoy_key = peer_route_key_for_dial(&gateway_a, "ping", decoy_addr.as_bytes())
+				.ok_or(TightBeamError::MissingResponse)?;
+			pin_preference(&preferred, decoy_key);
+
+			let mut client = connect_cluster(&ctx.a, gateway_a.addr()).await?;
+			trace.event(WORK_SENT)?;
+
+			let work_response = emit_ping_work(&mut client, b"live-decoy-failover").await?;
+			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
+			let ping_response: PingResponse = decode(&payload)?;
+			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+
+			gateway_a.stop();
+			gateway_c.stop();
+			gateway_b.stop();
+			hive.stop();
 			Ok(())
 		}
 	}

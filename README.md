@@ -2218,13 +2218,15 @@ The accepting endpoint uses `MuxRole::Server` with the same assembly sequence. E
 Test multiplexed services with `environment ServiceClient`. The `server:` closure starts a `server!` accept loop advertising `with_mux_offer`. The `client:` closure drives a mux-offering `ConnectionPool` against the bound address. Peers that decline the offer fall back to single-flight. The same scenario shape covers both paths.
 
 ```rust
+const ECHO_OVER_MUX: Urn<'static> = Urn::new("test", "event:mux/echo-over-mux");
+
 tb_assert_spec! {
 	pub EchoOverMuxSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(echo_over_mux, exactly!(1), equals!(true))
+			(ECHO_OVER_MUX, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -2251,7 +2253,7 @@ tb_scenario! {
 			let frame = create_v0_tightbeam(Some("ping"), None);
 			let reply = lease.emit(frame.clone(), None).await?;
 
-			trace.event_with(EchoOverMuxSpec::echo_over_mux, &[], reply == Some(frame))?;
+			trace.event_with(ECHO_OVER_MUX, &[], reply == Some(frame))?;
 
 			Ok(())
 		}
@@ -2572,6 +2574,8 @@ pub struct PingPongServletConfig {
 **Step 2**: Define the servlet using `EnvConfig`:
 
 ```rust
+const REQUEST_RECEIVED: Urn<'static> = Urn::new("test", "event:servlet/request-received");
+
 tightbeam::servlet! {
 	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConfig>,
 	protocol: TokioListener,
@@ -2579,7 +2583,7 @@ tightbeam::servlet! {
 		// Access context members
 		let trace = ctx.trace();
 		let config: &PingPongServletConfig = ctx.env_config()?;
-		trace.event_with("request_received", &[], config.service_name.clone())?;
+		trace.event_with(REQUEST_RECEIVED, &[], config.service_name.clone())?;
 
 		// Handler receives Frame, not decoded message
 		let decoded = decode::<RequestMessage, _>(&frame.message)?;
@@ -2684,16 +2688,21 @@ Servlets with workers can be tested using `environment Servlet`:
 ```rust
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, servlet, worker};
 
+const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/receive");
+const WORKER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/worker-process");
+const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:servlet/respond");
+const RESULT_VERIFIED: Urn<'static> = Urn::new("test", "event:servlet/result-verified");
+
 tb_assert_spec! {
 	pub CalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(servlet_receive, exactly!(1)),
-			(worker_process, exactly!(1)),
-			(servlet_respond, exactly!(1)),
-			(result_verified, exactly!(1), equals!(10u32))
+			(SERVLET_RECEIVE, exactly!(1)),
+			(WORKER_PROCESS, exactly!(1)),
+			(SERVLET_RESPOND, exactly!(1)),
+			(RESULT_VERIFIED, exactly!(1), equals!(10u32))
 		]
 	}
 }
@@ -2729,7 +2738,7 @@ tb_scenario! {
 				.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			trace.event_with(CalcServletSpec::result_verified, &[], response.result)?;
+			trace.event_with(RESULT_VERIFIED, &[], response.result)?;
 			Ok(())
 		}
 	}
@@ -2898,6 +2907,20 @@ pub struct HiveConfig {
 Standalone hive behavior (control plane gates, circuit breaker, backpressure, drain) is tested with `environment Hive`:
 
 ```rust
+const BACKPRESSURE_MANAGE_SHAPE: Urn<'static> =
+	Urn::new("test", "event:hive/backpressure-manage-shape");
+
+tb_assert_spec! {
+	pub HiveBackpressureShapeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(BACKPRESSURE_MANAGE_SHAPE, exactly!(1))
+		]
+	}
+}
+
 tb_scenario! {
 	name: hive_backpressure_reply_shape,
 	spec: HiveBackpressureShapeSpec,
@@ -2918,7 +2941,7 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_stop).await?;
 			assert_manage_stop_shape(&response, TransitStatus::ResourceExhausted);
 
-			trace.event(HiveBackpressureShapeSpec::backpressure_manage_manage_shape)?;
+			trace.event(BACKPRESSURE_MANAGE_SHAPE)?;
 
 			hive.stop();
 			Ok(())
@@ -3184,14 +3207,17 @@ Clusters can be tested using `environment Cluster`:
 ```rust
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, cluster, hive};
 
+const WORK_SENT: Urn<'static> = Urn::new("test", "event:cluster/work-sent");
+const ROUTING_ACCEPTED: Urn<'static> = Urn::new("test", "event:cluster/routing-accepted");
+
 tb_assert_spec! {
 	pub ClusterRoutingSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(work_sent, exactly!(1)),
-			(routing_accepted, exactly!(1))
+			(WORK_SENT, exactly!(1)),
+			(ROUTING_ACCEPTED, exactly!(1))
 		]
 	}
 }
@@ -3220,7 +3246,7 @@ tb_scenario! {
 		}],
 		// Owns the cluster for registry checks and stop
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			trace.event(ClusterRoutingSpec::work_sent)?;
+			trace.event(WORK_SENT)?;
 
 			let request = ClusterWorkRequest::new(
 				ping_type(), // urn:tightbeam::servlet:ping
@@ -3235,7 +3261,7 @@ tb_scenario! {
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
 			assert_eq!(work_response.status, TransitStatus::Ok);
 
-			trace.event(ClusterRoutingSpec::routing_accepted)?;
+			trace.event(ROUTING_ACCEPTED)?;
 
 			cluster.stop();
 			Ok(())
@@ -3284,7 +3310,7 @@ Each emitted event carries a kind URN from the closed inventory in `tightbeam::i
 urn:tightbeam:event:<domain>/<event-name>
 ```
 
-Domains (illustrative; full constants live in that module):
+Domains (see `tightbeam::instrumentation::events` for the full set):
 
 - **Core / meta**: `core/start`, `core/end`, `core/warn`, `core/error`, `trace/clock-origin`
 - **External**: `gate/accept`, `gate/reject`, `transport/request-recv`, `transport/response-send`
@@ -3655,16 +3681,25 @@ PipelineBuilder::new(trace)
 Assert the full job URNs (exact string match; see [§10.2](#102-event-kind-taxonomy)):
 
 ```rust
+const CREATE_HS_START: Urn<'static> =
+	Urn::new("tightbeam", "event:job/create-handshake-request-start");
+const CREATE_HS_SUCCESS: Urn<'static> =
+	Urn::new("tightbeam", "event:job/create-handshake-request-success");
+const VALIDATE_START: Urn<'static> =
+	Urn::new("tightbeam", "event:job/validate-request-start");
+const VALIDATE_SUCCESS: Urn<'static> =
+	Urn::new("tightbeam", "event:job/validate-request-success");
+
 tb_assert_spec! {
 	pub PipelineSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			("urn:tightbeam:event:job/create-handshake-request-start", exactly!(1)),
-			("urn:tightbeam:event:job/create-handshake-request-success", exactly!(1)),
-			("urn:tightbeam:event:job/validate-request-start", exactly!(1)),
-			("urn:tightbeam:event:job/validate-request-success", exactly!(1))
+			(CREATE_HS_START, exactly!(1)),
+			(CREATE_HS_SUCCESS, exactly!(1)),
+			(VALIDATE_START, exactly!(1)),
+			(VALIDATE_SUCCESS, exactly!(1))
 		]
 	}
 }
@@ -3673,18 +3708,18 @@ tb_process_spec! {
 	pub PipelineProcess,
 	events {
 		observable {
-			"urn:tightbeam:event:job/create-handshake-request-start",
-			"urn:tightbeam:event:job/create-handshake-request-success",
-			"urn:tightbeam:event:job/validate-request-start",
-			"urn:tightbeam:event:job/validate-request-success"
+			CREATE_HS_START,
+			CREATE_HS_SUCCESS,
+			VALIDATE_START,
+			VALIDATE_SUCCESS
 		}
 		hidden {}
 	}
 	states {
-		Idle => { "urn:tightbeam:event:job/create-handshake-request-start" => Creating },
-		Creating => { "urn:tightbeam:event:job/create-handshake-request-success" => Validating },
-		Validating => { "urn:tightbeam:event:job/validate-request-start" => ValidatingRun },
-		ValidatingRun => { "urn:tightbeam:event:job/validate-request-success" => Done },
+		Idle => { CREATE_HS_START => Creating },
+		Creating => { CREATE_HS_SUCCESS => Validating },
+		Validating => { VALIDATE_START => ValidatingRun },
+		ValidatingRun => { VALIDATE_SUCCESS => Done },
 		Done => {}
 	}
 	terminal { Done }
@@ -3952,11 +3987,11 @@ Value check:
 
 ```rust
 assertions: [
-	(priority, exactly!(1), equals!(MessagePriority::LowLatency)),
-	(lifetime, exactly!(1), equals!(3_600)),
-	(version, exactly!(1), equals!(Version::V2)),
-	(confidentiality, exactly!(1), equals!(IsSome)),
-	(optional_field, exactly!(1), equals!(IsNone))
+	(PRIORITY, exactly!(1), equals!(MessagePriority::LowLatency)),
+	(LIFETIME, exactly!(1), equals!(3_600)),
+	(VERSION, exactly!(1), equals!(Version::V2)),
+	(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
+	(OPTIONAL_FIELD, exactly!(1), equals!(IsNone))
 ]
 ```
 
@@ -4114,15 +4149,19 @@ When CSP is configured via `.with_csp()` in `tb_scenario!`:
 ```rust
 use tightbeam::testing::*;
 
+const RECEIVED: Urn<'static> = Urn::new("test", "event:csp/received");
+const RESPONDED: Urn<'static> = Urn::new("test", "event:csp/responded");
+const INTERNAL_PROCESSING: Urn<'static> = Urn::new("test", "event:csp/internal-processing");
+
 tb_process_spec! {
 	pub SimpleProcess,
 	events {
-		observable { "Received", "Responded" }
-		hidden { "internal_processing" }
+		observable { RECEIVED, RESPONDED }
+		hidden { INTERNAL_PROCESSING }
 	}
 	states {
-		Idle       => { "Received" => Processing }
-		Processing => { "internal_processing" => Processing, "Responded" => Idle }
+		Idle       => { RECEIVED => Processing }
+		Processing => { INTERNAL_PROCESSING => Processing, RESPONDED => Idle }
 	}
 	terminal { Idle }
 	choice { Processing }
@@ -4180,22 +4219,39 @@ The `tb_compose_spec!` macro generates a type that implements `CompositionSpec` 
 ```rust
 use tightbeam::testing::*;
 
+const REQUEST: Urn<'static> = Urn::new("test", "event:flow/request");
+const RESPONSE: Urn<'static> = Urn::new("test", "event:flow/response");
+const RETRY: Urn<'static> = Urn::new("test", "event:flow/retry");
+
+tb_assert_spec! {
+	pub RequestRetrySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(REQUEST, exactly!(1)),
+			(RETRY, exactly!(1)),
+			(RESPONSE, exactly!(1))
+		]
+	},
+}
+
 // Two simple processes
 tb_process_spec! {
 	pub RequestFlow,
-	events { observable { "request", "response" } }
+	events { observable { REQUEST, RESPONSE } }
 	states {
-		Idle => { "request" => Waiting },
-		Waiting => { "response" => Idle }
+		Idle => { REQUEST => Waiting },
+		Waiting => { RESPONSE => Idle }
 	}
 	terminal { Idle }
 }
 
 tb_process_spec! {
 	pub RetryFlow,
-	events { observable { "retry" } }
+	events { observable { RETRY } }
 	states {
-		RetryIdle => { "retry" => RetryIdle }
+		RetryIdle => { RETRY => RetryIdle }
 	}
 	terminal { RetryIdle }
 }
@@ -4219,14 +4275,14 @@ tb_compose_spec! {
 tb_scenario! {
 	name: test_request_with_retry,
 	config: ScenarioConfig::builder()
-		.with_spec(ClientServerSpec::latest())
+		.with_spec(RequestRetrySpec::latest())
 		.with_csp(RequestWithRetry)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("request")?;
-			trace.event("retry")?;
-			trace.event("response")?;
+			trace.event(REQUEST)?;
+			trace.event(RETRY)?;
+			trace.event(RESPONSE)?;
 			Ok(())
 		}
 	}
@@ -4297,16 +4353,19 @@ fdr: FdrConfig {
 **Simple Example**:
 
 ```rust
+const START: Urn<'static> = Urn::new("test", "event:simple/start");
+const FINISH: Urn<'static> = Urn::new("test", "event:simple/finish");
+
 // Define a simple two-state process
 tb_process_spec! {
 	pub SimpleProcess,
 	events {
-		observable { "start", "finish" }
+		observable { START, FINISH }
 		hidden { }
 	}
 	states {
-		Idle => { "start" => Working },
-		Working => { "finish" => Idle }
+		Idle => { START => Working },
+		Working => { FINISH => Idle }
 	}
 	terminal { Idle }
 }
@@ -4318,8 +4377,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(start, exactly!(1)),
-			(finish, exactly!(1))
+			(START, exactly!(1)),
+			(FINISH, exactly!(1))
 		]
 	},
 }
@@ -4341,8 +4400,8 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("start")?;
-			trace.event("finish")?;
+			trace.event(START)?;
+			trace.event(FINISH)?;
 			Ok(())
 		}
 	}
@@ -4441,10 +4500,10 @@ tb_process_spec! {
 	pub ClientServerProcess,
 	events {
 		// Observable alphabet (Σ): externally visible protocol events
-		observable { "connect", "request", "response", "disconnect" }
+		observable { CONNECT, REQUEST, RESPONSE, DISCONNECT }
 
 		// Hidden alphabet (τ): internal implementation details
-		hidden { "serialize", "encrypt", "decrypt", "deserialize" }
+		hidden { SERIALIZE, ENCRYPT, DECRYPT, DESERIALIZE }
 	}
 	// ...
 }
@@ -4456,8 +4515,8 @@ tb_process_spec! {
 
 The instrumentation taxonomy (§10.2) maps tightbeam events to categories:
 
-- **Observable**: `gate_accept`, `gate_reject`, `request_recv`, `response_send`, `assert_label`
-- **Hidden (τ)**: `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`, `process_hidden`
+- **Observable**: `gate/accept`, `gate/reject`, `transport/request-recv`, `transport/response-send`, `assert/label`
+- **Hidden (τ)**: `handler/enter`, `handler/exit`, `crypto/step`, `compress/step`, `route/step`, `policy/eval`, `process/hidden`
 
 #### 12.5.3 Nondeterministic Choice and Refusal Sets
 
@@ -4706,14 +4765,17 @@ Environment examples also appear in [§9.3](#93-components) (Worker, Servlet, Hi
 ```rust
 use tightbeam::testing::*;
 
+const RECEIVED: Urn<'static> = Urn::new("test", "event:bare/received");
+const RESPONDED: Urn<'static> = Urn::new("test", "event:bare/responded");
+
 tb_assert_spec! {
 	pub BareSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(Received, exactly!(1)),
-			(Responded, exactly!(1))
+			(RECEIVED, exactly!(1)),
+			(RESPONDED, exactly!(1))
 		]
 	},
 }
@@ -4721,11 +4783,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub BareProcess,
 	events {
-		observable { "Received", "Responded" }
+		observable { RECEIVED, RESPONDED }
 	}
 	states {
-		Idle       => { "Received" => Processing }
-		Processing => { "Responded" => Idle }
+		Idle       => { RECEIVED => Processing }
+		Processing => { RESPONDED => Idle }
 	}
 	terminal { Idle }
 }
@@ -4738,8 +4800,8 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(BareSpec::Received)?;
-			trace.event(BareSpec::Responded)?;
+			trace.event(RECEIVED)?;
+			trace.event(RESPONDED)?;
 			Ok(())
 		}
 	}
@@ -4748,14 +4810,22 @@ tb_scenario! {
 
 **Full Example: All Three Layers with ServiceClient Environment**
 
-This example demonstrates progressive verification from L1 through L3:
-
 ```rust
 #![cfg(all(feature = "testing-fdr", feature = "tcp", feature = "tokio"))]
 use tightbeam::testing::*;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::Protocol;
+
+const CONNECT: Urn<'static> = Urn::new("test", "event:client-server/connect");
+const REQUEST: Urn<'static> = Urn::new("test", "event:client-server/request");
+const RESPONSE: Urn<'static> = Urn::new("test", "event:client-server/response");
+const DISCONNECT: Urn<'static> = Urn::new("test", "event:client-server/disconnect");
+const MESSAGE_CONTENT: Urn<'static> = Urn::new("test", "event:client-server/message-content");
+const SERIALIZE: Urn<'static> = Urn::new("test", "event:client-server/serialize");
+const ENCRYPT: Urn<'static> = Urn::new("test", "event:client-server/encrypt");
+const DECRYPT: Urn<'static> = Urn::new("test", "event:client-server/decrypt");
+const DESERIALIZE: Urn<'static> = Urn::new("test", "event:client-server/deserialize");
 
 // Layer 1: Assert spec - defines expected assertions and cardinalities
 tb_assert_spec! {
@@ -4764,11 +4834,11 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(connect, exactly!(1)),
-			(request, exactly!(1)),
-			(response, exactly!(2)),
-			(disconnect, exactly!(1)),
-			(message_content, exactly!(1), equals!("test"))
+			(CONNECT, exactly!(1)),
+			(REQUEST, exactly!(1)),
+			(RESPONSE, exactly!(2)),
+			(DISCONNECT, exactly!(1)),
+			(MESSAGE_CONTENT, exactly!(1), equals!("test"))
 		]
 	},
 }
@@ -4777,17 +4847,17 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub ClientServerProcess,
 	events {
-		observable { "connect", "request", "response", "disconnect" }
-		hidden { "serialize", "encrypt", "decrypt", "deserialize" }
+		observable { CONNECT, REQUEST, RESPONSE, DISCONNECT }
+		hidden { SERIALIZE, ENCRYPT, DECRYPT, DESERIALIZE }
 	}
 	states {
-		Idle        => { "connect" => Connected }
-		Connected   => { "request" => Processing, "serialize" => Serializing }
-		Serializing => { "encrypt" => Encrypting }
-		Encrypting  => { "request" => Processing }
-		Processing  => { "decrypt" => Decrypting, "response" => Responded }
-		Decrypting  => { "deserialize" => Processing }
-		Responded   => { "disconnect" => Idle }
+		Idle        => { CONNECT => Connected }
+		Connected   => { REQUEST => Processing, SERIALIZE => Serializing }
+		Serializing => { ENCRYPT => Encrypting }
+		Encrypting  => { REQUEST => Processing }
+		Processing  => { DECRYPT => Decrypting, RESPONSE => Responded }
+		Decrypting  => { DESERIALIZE => Processing }
+		Responded   => { DISCONNECT => Idle }
 	}
 	terminal { Idle }
 	choice { Connected, Processing }
@@ -4828,9 +4898,9 @@ tb_scenario! {
 				protocol TokioListener: listener,
 				assertions: trace.share(),
 				handle: |frame, trace| async move {
-					trace.event("connect")?;
-					trace.event("request")?;
-					trace.event("response")?;
+					trace.event(CONNECT)?;
+					trace.event(REQUEST)?;
+					trace.event(RESPONSE)?;
 					Some(frame)
 				}
 			};
@@ -4840,7 +4910,7 @@ tb_scenario! {
 			let stream = <TokioListener as Protocol>::connect(addr).await?;
 			let mut client = <TokioListener as Protocol>::create_transport(stream);
 
-			trace.event("response")?;
+			trace.event(RESPONSE)?;
 			let frame = compose! {
 				V0: id: "test",
 				order: 1u64,
@@ -4851,10 +4921,10 @@ tb_scenario! {
 			// Decode response and emit value assertion
 			if let Some(resp_frame) = response {
 				let decoded: TestMessage = crate::decode(&resp_frame.message)?;
-				trace.event_with("message_content", &[], decoded.content)?;
+				trace.event_with(MESSAGE_CONTENT, &[], decoded.content)?;
 			}
 
-			trace.event("disconnect")?;
+			trace.event(DISCONNECT)?;
 			Ok(())
 		}
 	}
@@ -4952,6 +5022,11 @@ tb_scenario! {
 use tightbeam::testing::error::TestingError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
+const START: Urn<'static> = Urn::new("test", "event:fuzz/start");
+const ACTION_A: Urn<'static> = Urn::new("test", "event:fuzz/action-a");
+const ACTION_B: Urn<'static> = Urn::new("test", "event:fuzz/action-b");
+const DONE: Urn<'static> = Urn::new("test", "event:fuzz/done");
+
 // Layer 1: Assertion spec
 tb_assert_spec! {
 	pub SimpleFuzzSpec,
@@ -4959,10 +5034,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(start, exactly!(1)),
-			(action_a, at_least!(0)),
-			(action_b, at_least!(0)),
-			(done, exactly!(1))
+			(START, exactly!(1)),
+			(ACTION_A, at_least!(0)),
+			(ACTION_B, at_least!(0)),
+			(DONE, exactly!(1))
 		]
 	},
 }
@@ -4971,12 +5046,12 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SimpleFuzzProc,
 	events {
-		observable { "start", "action_a", "action_b", "done" }
+		observable { START, ACTION_A, ACTION_B, DONE }
 		hidden { }
 	}
 	states {
-		S0 => { "start" => S1 },
-		S1 => { "action_a" => S1, "action_b" => S1, "done" => S2 }
+		S0 => { START => S1 },
+		S1 => { ACTION_A => S1, ACTION_B => S1, DONE => S2 }
 	}
 	terminal { S2 }
 }
@@ -5056,9 +5131,9 @@ Valid events are sorted by label, so the byte-to-event mapping is deterministic 
 
 ```
 Input: [0x00, 0x01, 0x00, 0x02]
-Trace: "start" -> "action_a" -> "action_b" -> "done"
+Trace: START -> ACTION_A -> ACTION_B -> DONE
 State: S0 -> S1 -> S1 -> S2
-Result: Crash at state S1 after "action_b"
+Result: Crash at state S1 after ACTION_B
 ```
 
 #### 12.8.5 IJON Integration: Input-to-State Correspondence
@@ -5112,14 +5187,17 @@ if (input[0] == 0xDEADBEEF) {
 tightbeam equivalent - no manual annotation needed:
 
 ```rust
+const MAGIC_DETECTED: Urn<'static> = Urn::new("test", "event:parser/magic-detected");
+const PARSE_CONTINUE: Urn<'static> = Urn::new("test", "event:parser/parse-continue");
+
 tb_process_spec! {
-    pub ParserProcess,
-    events { observable { "magic_detected", "parse_continue" } }
-    states {
-        Init   => { "magic_detected" => SpecialState, "parse_continue" => Parsing }
-        SpecialState => { /* ... */ }
-    }
-    // IJON automatically reports when SpecialState is reached
+	pub ParserProcess,
+	events { observable { MAGIC_DETECTED, PARSE_CONTINUE } }
+	states {
+		Init   => { MAGIC_DETECTED => SpecialState, PARSE_CONTINUE => Parsing }
+		SpecialState => { /* ... */ }
+	}
+	// IJON automatically reports when SpecialState is reached
 }
 ```
 
@@ -5315,44 +5393,48 @@ The following table summarizes tightbeam's native support for high-assurance sta
 
 ## 13. End-to-End Examples
 
-The following examples are complete and runnable.
-
 ### 13.1 Complete Client-Server Application
 
-This example demonstrates an end-to-end worker and servlet setup tested with `tb_scenario!`, covering assertion specs, CSP process specs, and environment integration.
+End-to-end worker and servlet flows under `tb_scenario!` with AssertSpec + CSP. Assertion and process labels are `Urn` constants (exact match).
 
 #### Worker Integration Example
 
 ```rust
 use tightbeam::testing::*;
+use tightbeam::utils::urn::Urn;
 
-// Define assertion spec for worker behavior
+const RELAY_START: Urn<'static> = Urn::new("test", "event:worker/relay-start");
+const RELAY_SUCCESS: Urn<'static> = Urn::new("test", "event:worker/relay-success");
+const RELAY_REJECTED: Urn<'static> = Urn::new("test", "event:worker/relay-rejected");
+const RESPONSE_RESULT: Urn<'static> = Urn::new("test", "event:worker/response-result");
+const VALIDATE_MESSAGE: Urn<'static> = Urn::new("test", "event:worker/validate-message");
+const PROCESS_MESSAGE: Urn<'static> = Urn::new("test", "event:worker/process-message");
+
 tb_assert_spec! {
 	pub PingPongWorkerSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(relay_start, exactly!(2)),
-			(relay_success, exactly!(1)),
-			(response_result, exactly!(1), equals!("PONG")),
-			(relay_rejected, exactly!(1))
+			(RELAY_START, exactly!(2)),
+			(RELAY_SUCCESS, exactly!(1)),
+			(RESPONSE_RESULT, exactly!(1), equals!("PONG")),
+			(RELAY_REJECTED, exactly!(1))
 		]
 	},
 }
 
-// Define CSP process spec for worker state machine
 tb_process_spec! {
 	pub PingPongWorkerProcess,
 	events {
-		observable { "relay_start", "relay_success", "relay_rejected" }
-		hidden { "validate_message", "process_message" }
+		observable { RELAY_START, RELAY_SUCCESS, RELAY_REJECTED }
+		hidden { VALIDATE_MESSAGE, PROCESS_MESSAGE }
 	}
 	states {
-		Idle       => { "relay_start" => Processing }
-		Processing => { "validate_message" => Validating }
-		Validating => { "process_message" => Responding, "relay_rejected" => Idle }
-		Responding => { "relay_success" => Idle }
+		Idle       => { RELAY_START => Processing }
+		Processing => { VALIDATE_MESSAGE => Validating }
+		Validating => { PROCESS_MESSAGE => Responding, RELAY_REJECTED => Idle }
+		Responding => { RELAY_SUCCESS => Idle }
 	}
 	terminal { Idle }
 	choice { Validating }
@@ -5369,8 +5451,7 @@ tb_scenario! {
 			PingPongWorker::default()
 		},
 		stimulus: |WorkerEnv { trace, worker, .. }| async move {
-			// Test accepted message
-			trace.event("relay_start")?;
+			trace.event(RELAY_START)?;
 
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
@@ -5379,12 +5460,11 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(pong) = response {
-				trace.event("relay_success")?;
-				trace.event_with("response_result", &[], pong.result)?;
+				trace.event(RELAY_SUCCESS)?;
+				trace.event_with(RESPONSE_RESULT, &[], pong.result)?;
 			}
 
-			// Test rejected message
-			trace.event("relay_start")?;
+			trace.event(RELAY_START)?;
 
 			let pong_msg = RequestMessage {
 				content: "PONG".to_string(),
@@ -5393,7 +5473,7 @@ tb_scenario! {
 
 			let result = worker.relay(Arc::new(pong_msg)).await;
 			if result.is_err() {
-				trace.event("relay_rejected")?;
+				trace.event(RELAY_REJECTED)?;
 			}
 
 			Ok(())
@@ -5406,34 +5486,40 @@ tb_scenario! {
 
 ```rust
 use tightbeam::testing::*;
+use tightbeam::utils::urn::Urn;
 
-// Define assertion spec for servlet behavior
+const REQUEST_RECEIVED: Urn<'static> = Urn::new("test", "event:servlet/request-received");
+const PONG_SENT: Urn<'static> = Urn::new("test", "event:servlet/pong-sent");
+const RESPONSE_RESULT: Urn<'static> = Urn::new("test", "event:servlet/response-result");
+const IS_WINNER: Urn<'static> = Urn::new("test", "event:servlet/is-winner");
+const VALIDATE_LUCKY_NUMBER: Urn<'static> = Urn::new("test", "event:servlet/validate-lucky-number");
+const FORMAT_RESPONSE: Urn<'static> = Urn::new("test", "event:servlet/format-response");
+
 tb_assert_spec! {
 	pub PingPongSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(request_received, exactly!(1)),
-			(pong_sent, exactly!(1)),
-			(response_result, exactly!(1), equals!("PONG")),
-			(is_winner, exactly!(1), equals!(true))
+			(REQUEST_RECEIVED, exactly!(1)),
+			(PONG_SENT, exactly!(1)),
+			(RESPONSE_RESULT, exactly!(1), equals!("PONG")),
+			(IS_WINNER, exactly!(1), equals!(true))
 		]
 	},
 }
 
-// Define process spec for servlet state machine
 tb_process_spec! {
 	pub PingPongProcess,
 	events {
-		observable { "request_received", "pong_sent" }
-		hidden { "validate_lucky_number", "format_response" }
+		observable { REQUEST_RECEIVED, PONG_SENT }
+		hidden { VALIDATE_LUCKY_NUMBER, FORMAT_RESPONSE }
 	}
 	states {
-		Idle       => { "request_received" => Processing }
-		Processing => { "validate_lucky_number" => Validating }
-		Validating => { "format_response" => Responding }
-		Responding => { "pong_sent" => Idle }
+		Idle       => { REQUEST_RECEIVED => Processing }
+		Processing => { VALIDATE_LUCKY_NUMBER => Validating }
+		Validating => { FORMAT_RESPONSE => Responding }
+		Responding => { PONG_SENT => Idle }
 	}
 	terminal { Idle }
 	choice { Processing }
@@ -5466,22 +5552,17 @@ tb_scenario! {
 				}
 			}
 
-			// Client-side assertion before sending
-			trace.event("request_received")?;
+			trace.event(REQUEST_RECEIVED)?;
 
-			// Test winning case
 			let ping_message = generate_message(42, None)?;
 			let Some(response) = client.emit(ping_message, None).await? else {
 				return Err(TightBeamError::MissingResponse);
 			};
 			let response_message: ResponseMessage = decode(&response.message)?;
 
-			// Emit value assertions for spec verification
-			trace.event_with("response_result", &[], response_message.result)?;
-			trace.event_with("is_winner", &[], response_message.is_winner)?;
-
-			// Client-side assertion after receiving
-			trace.event("pong_sent")?;
+			trace.event_with(RESPONSE_RESULT, &[], response_message.result)?;
+			trace.event_with(IS_WINNER, &[], response_message.is_winner)?;
+			trace.event(PONG_SENT)?;
 
 			Ok(())
 		}
@@ -5555,8 +5636,8 @@ tb_scenario! {
 
 This project is licensed under either of
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](../LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](../LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 **at your option**. You may choose whichever license best fits your needs:
 
@@ -5576,10 +5657,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 #### Project Structure
 
-The workspace consists of the following components:
-
+- **tightbeam/src/lib.rs**: Crate root
 - **tightbeam/src/core.rs**: Shared library code and common utilities
-- **tightbeam/src/lib.rs**: Library root
 - **tightbeam/tests/**: Integration test suites
 
 [crate-image]: https://img.shields.io/crates/v/tightbeam-rs.svg

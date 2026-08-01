@@ -285,37 +285,68 @@ where
 	}
 }
 
-/// Settle a successful forward: reinforce or weaken the trail and
+/// Decoded outcome of one answered forward.
+///
+/// The response buffer moves in and decodes exactly once, so the
+/// failover check and the settle share one parse.
+enum ForwardOutcome {
+	/// A local hive answered with bare app payload.
+	Local(Vec<u8>),
+	/// A peer gateway answered with a decoded work response.
+	Peer(ClusterWorkResponse),
+	/// A peer gateway answered with bytes that do not decode.
+	PeerGarbled,
+}
+
+impl ForwardOutcome {
+	/// Classify one answered forward by route kind.
+	fn classify(route_kind: RouteKind, response_payload: Vec<u8>) -> Self {
+		match route_kind {
+			RouteKind::Local => Self::Local(response_payload),
+			RouteKind::Peer | RouteKind::PeerRelay => match decode::<ClusterWorkResponse>(&response_payload) {
+				Ok(peer_response) => Self::Peer(peer_response),
+				Err(_) => Self::PeerGarbled,
+			},
+		}
+	}
+
+	/// `true` when a live route reported it cannot serve the type.
+	///
+	/// This is the same failover class as a transport fault mapped to
+	/// [`TransitStatus::Unavailable`]: the trail is useless for this
+	/// type right now, and a garbled peer reply proves nothing better.
+	/// Every other refusal relays unchanged so the caller keeps its
+	/// retryability contract.
+	fn is_unavailable(&self) -> bool {
+		match self {
+			Self::Local(_) => false,
+			Self::Peer(peer_response) => peer_response.status == TransitStatus::Unavailable,
+			Self::PeerGarbled => true,
+		}
+	}
+}
+
+/// Settle an answered forward: reinforce or weaken the trail and
 /// reply to the caller with one envelope.
 fn settle_forward<P>(
 	ctx: &WorkCtx<'_, P>,
 	frame: &Frame,
 	choice: &RouteChoice,
-	response_payload: Vec<u8>,
+	outcome: ForwardOutcome,
 ) -> Result<Option<Frame>, TightBeamError>
 where
 	P: Protocol,
 {
-	match choice.route_kind {
-		RouteKind::Local => {
+	match outcome {
+		ForwardOutcome::Local(response_payload) => {
 			work_trail_ok(ctx.servlet_registry, &choice.route_key, ctx.config, ctx.trace);
 			reply_frame(&frame.metadata.id, ClusterWorkResponse::ok(response_payload))
 		}
-		RouteKind::Peer | RouteKind::PeerRelay => {
-			// Peer gateways reply with a ClusterWorkResponse. Decode
-			// and relay it so the client sees one envelope.
-			let Ok(peer_response) = decode::<ClusterWorkResponse>(&response_payload) else {
-				return work_trail_fail(
-					ctx.servlet_registry,
-					&choice.route_key,
-					ctx.config,
-					ctx.trace,
-					frame,
-					TransitStatus::Unavailable,
-				);
-			};
-
+		ForwardOutcome::Peer(peer_response) => {
+			// Relay the peer's own envelope so the client sees one
+			// envelope end to end.
 			ctx.trace.event(CLUSTER_WORK_FORWARDED)?;
+
 			if peer_response.status == TransitStatus::Ok {
 				work_trail_ok(ctx.servlet_registry, &choice.route_key, ctx.config, ctx.trace);
 			} else {
@@ -324,6 +355,14 @@ where
 
 			reply_frame(&frame.metadata.id, peer_response)
 		}
+		ForwardOutcome::PeerGarbled => work_trail_fail(
+			ctx.servlet_registry,
+			&choice.route_key,
+			ctx.config,
+			ctx.trace,
+			frame,
+			TransitStatus::Unavailable,
+		),
 	}
 }
 
@@ -419,7 +458,22 @@ where
 		// toward instances that answer and away from ones that fail.
 		match forward_result {
 			Ok(response_payload) => {
-				return settle_forward(&ctx, &frame, &choice, response_payload);
+				let outcome = ForwardOutcome::classify(choice.route_kind, response_payload);
+
+				// A live peer that reports it cannot serve the type
+				// joins the same bounded failover as a transport
+				// fault: weaken the trail and retry the next-best one.
+				if outcome.is_unavailable() && excluded.is_none() {
+					if let Some(retry) = retry_payload {
+						work_trail_weaken(&servlet_registry, &choice.route_key, &config, &trace);
+
+						excluded = Some(choice.route_key);
+						attempt_payload = retry;
+						continue;
+					}
+				}
+
+				return settle_forward(&ctx, &frame, &choice, outcome);
 			}
 			Err(error) => {
 				let status = forward_failure_status(error);
@@ -484,6 +538,48 @@ mod tests {
 		)
 	}
 
+	fn encoded_work_response(response: &ClusterWorkResponse) -> Vec<u8> {
+		encode(response).expect("test responses satisfy the codec")
+	}
+
+	#[test]
+	fn forward_outcome_local_reply_never_fails_over() {
+		let outcome = ForwardOutcome::classify(RouteKind::Local, b"pong".to_vec());
+		assert!(!outcome.is_unavailable());
+		assert!(matches!(outcome, ForwardOutcome::Local(payload) if payload == b"pong"));
+	}
+
+	#[test]
+	fn forward_outcome_peer_unavailable_reply_fails_over() {
+		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::Unavailable));
+		assert!(ForwardOutcome::classify(RouteKind::Peer, bytes).is_unavailable());
+	}
+
+	#[test]
+	fn forward_outcome_relay_unavailable_reply_fails_over() {
+		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::Unavailable));
+		assert!(ForwardOutcome::classify(RouteKind::PeerRelay, bytes).is_unavailable());
+	}
+
+	#[test]
+	fn forward_outcome_peer_ok_reply_settles() {
+		let bytes = encoded_work_response(&ClusterWorkResponse::ok(b"pong".to_vec()));
+		assert!(!ForwardOutcome::classify(RouteKind::Peer, bytes).is_unavailable());
+	}
+
+	#[test]
+	fn forward_outcome_peer_refusal_relays_unchanged() {
+		let bytes = encoded_work_response(&ClusterWorkResponse::err(TransitStatus::PermissionDenied));
+		assert!(!ForwardOutcome::classify(RouteKind::Peer, bytes).is_unavailable());
+	}
+
+	#[test]
+	fn forward_outcome_garbled_peer_reply_fails_over() {
+		let outcome = ForwardOutcome::classify(RouteKind::Peer, b"not-a-response".to_vec());
+		assert!(matches!(outcome, ForwardOutcome::PeerGarbled));
+		assert!(outcome.is_unavailable());
+	}
+
 	#[cfg(feature = "x509")]
 	fn test_config() -> ClusterConfig {
 		let key: Secp256k1SigningKey = create_test_signing_key();
@@ -500,14 +596,12 @@ mod tests {
 	#[test]
 	fn relayed_work_stamps_a_decremented_budget() {
 		let work = relayed_work(ping_type(), vec![1], 2);
-
 		assert_eq!(work.hops_remaining, 1);
 	}
 
 	#[test]
 	fn relayed_work_saturates_a_spent_budget_at_zero() {
 		let work = relayed_work(ping_type(), vec![1], 0);
-
 		assert_eq!(work.hops_remaining, 0);
 	}
 
@@ -517,7 +611,6 @@ mod tests {
 	fn relayed_envelope_carries_the_decremented_budget_on_the_wire() -> Result<(), TightBeamError> {
 		let envelope = encode(&ClusterRequest::Work(relayed_work(ping_type(), vec![7], 2)))?;
 		let decoded = decode::<ClusterRequest>(&envelope)?;
-
 		assert!(matches!(decoded, ClusterRequest::Work(work) if work.hops_remaining == 1));
 		Ok(())
 	}
@@ -543,16 +636,13 @@ mod tests {
 	#[test]
 	fn balancer_pick_refuses_an_out_of_range_index() {
 		let entries = vec![Arc::new(peer_entry(b"first", b"first:1"))];
-
 		assert!(balancer_pick(&RogueBalancer, &entries).is_none());
 	}
 
 	#[test]
 	fn balancer_pick_returns_the_selected_entry() {
 		let entries = vec![Arc::new(peer_entry(b"first", b"first:1"))];
-
 		let picked = balancer_pick(&FirstBalancer, &entries);
-
 		assert!(matches!(picked, Some(entry) if entry.dial_target().as_ref() == b"first:1"));
 	}
 
@@ -577,11 +667,10 @@ mod tests {
 		let config = test_config();
 		let registry = ServletRegistry::default();
 		registry.add(relay_entry(b"origin", b"relay", b"relay:1"))?;
-		let type_key = canonical_bytes(&ping_type());
 
+		let type_key = canonical_bytes(&ping_type());
 		let below = select_route(&registry, &config, &type_key, 1, None);
 		let at_gate = select_route(&registry, &config, &type_key, 2, None);
-
 		assert!(below.is_none());
 		assert!(matches!(at_gate, Some(choice) if choice.route_kind == RouteKind::PeerRelay));
 		Ok(())
@@ -594,12 +683,11 @@ mod tests {
 		let registry = ServletRegistry::default();
 		registry.add(peer_entry(b"first", b"first:1"))?;
 		registry.add(peer_entry(b"second", b"second:1"))?;
-		let type_key = canonical_bytes(&ping_type());
 
+		let type_key = canonical_bytes(&ping_type());
 		let failed = select_route(&registry, &config, &type_key, 1, None).map(|choice| choice.route_key);
 		let failed = failed.as_deref();
 		let retry = select_route(&registry, &config, &type_key, 1, failed);
-
 		assert!(matches!((failed, &retry), (Some(first), Some(next)) if next.route_key.as_ref() != first));
 		Ok(())
 	}
