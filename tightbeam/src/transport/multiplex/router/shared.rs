@@ -20,6 +20,7 @@ use crate::transport::error::TransportFailure;
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::multiplex::MuxRole;
 use crate::transport::{TransportError, TransportResult};
+use crate::utils::urn::Urn;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::receipt::StoredReceipt;
@@ -28,8 +29,6 @@ use crate::transport::handshake::receipt::StoredReceipt;
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(feature = "instrument")]
-use crate::utils::urn::Urn;
 
 fn wake_all(wakers: &mut Vec<Waker>) {
 	for waker in wakers.drain(..) {

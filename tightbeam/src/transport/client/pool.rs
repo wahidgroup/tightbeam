@@ -52,7 +52,7 @@ use policy::*;
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(feature = "instrument")]
+#[cfg(any(feature = "instrument", pooled_mux))]
 use crate::utils::urn::Urn;
 
 /// Item gate for the pooled-mux path: multiplexed pooling needs the mux

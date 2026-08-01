@@ -223,8 +223,6 @@ impl RequestSink {
 	/// One wire record: the first chunk travels as the stream's
 	/// `Open` through the atomic open, every later chunk as `Data`.
 	async fn send_chunk(&mut self, chunk: &[u8], last: bool, records: u64) -> TransportResult<()> {
-		let target = self.target.take();
-		let forwarded = self.forwarded;
 		match &mut self.stream {
 			SinkStream::Reserved { reservation, duplex } => {
 				let mut request = OpenRequest {
@@ -233,13 +231,26 @@ impl RequestSink {
 					payload: chunk,
 					records,
 					duplex: duplex.take(),
-					target,
-					forwarded,
+					target: self.target.take(),
+					forwarded: self.forwarded,
 				};
 
-				let stream_id = send_open_envelope(&self.shared, &mut self.outbound, reservation, &mut request).await?;
-				self.stream = SinkStream::Opened(stream_id);
-				Ok(())
+				let opened = send_open_envelope(&self.shared, &mut self.outbound, reservation, &mut request).await;
+				match opened {
+					Ok(stream_id) => {
+						self.stream = SinkStream::Opened(stream_id);
+						Ok(())
+					}
+					Err(err) => {
+						// A failed open leaves the sink reserved: hand back
+						// whatever the open did not consume so a retried
+						// first chunk still stamps the route and registers
+						// the reply forwarder.
+						self.target = request.target;
+						*duplex = request.duplex;
+						Err(err)
+					}
+				}
 			}
 			SinkStream::Opened(stream_id) => {
 				let stream_id = *stream_id;
@@ -326,9 +337,12 @@ mod tests {
 	use super::*;
 	use crate::transport::envelopes::{CancelReason, MuxEnvelope};
 
-	/// Reserved (unopened) request sink on a fresh client, with the
-	/// outbound queue's receiving end and the response receiver.
-	fn sink_fixture() -> (
+	/// Reserved (unopened) request sink on a fresh client with the
+	/// given route, plus the outbound queue's receiving end and the
+	/// response receiver.
+	fn routed_sink_fixture(
+		target: Option<Urn<'static>>,
+	) -> (
 		Arc<MuxShared>,
 		RequestSink,
 		mpsc::Receiver<Outbound>,
@@ -345,10 +359,20 @@ mod tests {
 			Arc::clone(&shared),
 			outbound,
 			None,
-			None,
+			target,
 			false,
 		);
 		(shared, sink, sent, receiver)
+	}
+
+	/// Unrouted variant of [`routed_sink_fixture`].
+	fn sink_fixture() -> (
+		Arc<MuxShared>,
+		RequestSink,
+		mpsc::Receiver<Outbound>,
+		oneshot::Receiver<StreamOutcome>,
+	) {
+		routed_sink_fixture(None)
 	}
 
 	// Pushes reach the wire eagerly; the bare close carries the
@@ -478,6 +502,19 @@ mod tests {
 
 		let outcome = receiver.try_recv();
 		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
+	}
+
+	// A failed open must not strip the route: the target stays on
+	// the sink so a retried first chunk still opens routed.
+	#[test]
+	fn test_request_sink_failed_open_keeps_route() {
+		let (_shared, mut sink, sent, _outcome) = routed_sink_fixture(Some(Urn::new("tb", "servlet:ledger")));
+
+		drop(sent);
+
+		let pushed = poll_now(sink.push([1u8]));
+		assert!(matches!(pushed, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		assert!(sink.target.is_some());
 	}
 
 	// An empty request body still travels: close without a push
