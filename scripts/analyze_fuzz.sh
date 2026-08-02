@@ -38,25 +38,23 @@ VERIFY_PATTERNS=()
 # Try common locations: tests/fuzz/, <crate>/tests/fuzz/, fuzz/
 detect_fuzz_base() {
     local test_name="$1"
-    # Try different common locations
-    for base in "tests/fuzz" "tightbeam/tests/fuzz" "fuzz" "tests"; do
+    # Prefer source trees. Never fall back into target/ (rustdoc and
+    # build artifacts also match *fuzz* and steal seed paths).
+    for base in "tightbeam/fuzz" "tests/fuzz" "tightbeam/tests/fuzz" "fuzz" "tests"; do
         if [ -d "$base/$test_name" ] || [ -f "$base/${test_name}.rs" ]; then
             echo "$base"
             return 0
         fi
     done
-    # Default to tests/fuzz if it exists
+    if [ -d "tightbeam/fuzz" ]; then
+        echo "tightbeam/fuzz"
+        return 0
+    fi
     if [ -d "tests/fuzz" ]; then
         echo "tests/fuzz"
         return 0
     fi
-    # Fallback to first directory containing "fuzz"
-    local found=$(find . -maxdepth 3 -type d -name "*fuzz*" 2>/dev/null | head -1)
-    if [ -n "$found" ]; then
-        echo "$found" | sed 's|^\./||'
-        return 0
-    fi
-    echo "tests/fuzz"  # Default fallback
+    echo "tightbeam/fuzz"
 }
 
 # Print usage information
@@ -218,6 +216,34 @@ if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [ "$DURATION" -le 0 ]; then
     exit 1
 fi
 
+# Tokio colony/chess targets: no memcap, no forkserver, and a hang
+# timeout that tolerates multi-gateway boot. Ephemeral ports / multi-task
+# I/O break AFL's forkserver dry run even when the runtime is built
+# inside the fuzz closure.
+DISABLE_FORKSRV=false
+has_mem_limit=false
+has_timeout=false
+for arg in "${AFL_ARGS_ARRAY[@]+"${AFL_ARGS_ARRAY[@]}"}"; do
+	if [ "$arg" = "-m" ]; then
+		has_mem_limit=true
+	fi
+	if [ "$arg" = "-t" ]; then
+		has_timeout=true
+	fi
+done
+case "$TEST_NAME" in
+	colony|chess)
+		if [ "$has_mem_limit" = false ]; then
+			AFL_ARGS_ARRAY=("-m" "none" "${AFL_ARGS_ARRAY[@]+"${AFL_ARGS_ARRAY[@]}"}")
+		fi
+		if [ "$has_timeout" = false ]; then
+			AFL_ARGS_ARRAY=("-t" "5000" "${AFL_ARGS_ARRAY[@]+"${AFL_ARGS_ARRAY[@]}"}")
+		fi
+		AFL_ARGS="${AFL_ARGS_ARRAY[*]}"
+		DISABLE_FORKSRV=true
+		;;
+esac
+
 # Validate verify patterns if verify is enabled
 if [ "$VERIFY_CODE" = true ] && [ ${#VERIFY_PATTERNS[@]} -eq 0 ]; then
     echo "Error: --verify requires at least one --pattern" >&2
@@ -281,7 +307,7 @@ echo ""
 # Check prerequisites
 echo "[*] Checking prerequisites..."
 if ! command -v cargo-afl &> /dev/null; then
-    echo "[!] ERROR: cargo-afl not found. Install with: cargo install cargo-afl" >&2
+    echo "[!] ERROR: cargo-afl not found. Run: make setup" >&2
     exit 1
 fi
 echo "[+] cargo-afl found"
@@ -304,29 +330,31 @@ echo "[*] Building fuzz target..."
 BUILD_OK=false
 TARGET_HINT="fuzz_${TEST_NAME}"
 if command -v make &> /dev/null && make -n fuzz-build &> /dev/null 2>&1; then
-	if make fuzz-build > /dev/null 2>&1; then
+	FUZZ_BUILD_LOG="$(mktemp)"
+	if make fuzz-build >"$FUZZ_BUILD_LOG" 2>&1; then
 		BUILD_OK=true
 	else
 		echo "    [!] make fuzz-build failed, falling back to direct cargo-afl build..."
+		echo "    --- make fuzz-build (last 20 lines) ---"
+		tail -n 20 "$FUZZ_BUILD_LOG" | sed 's/^/    /'
+		echo "    --------------------------------------"
 	fi
+	rm -f "$FUZZ_BUILD_LOG"
 fi
 if [ "$BUILD_OK" = false ]; then
-	# Try building with different feature combinations
-	# Chess fuzz target requires additional features
-	if [ "$TEST_NAME" = "chess" ]; then
-		if RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "fuzz_${TEST_NAME}" --features "std,testing-fuzz,testing-fdr,testing-csp" > /dev/null 2>&1; then
+	# Feature sets mirror scripts/fuzz-build.sh.
+	FEATURES="std,testing-fuzz"
+	case "$TEST_NAME" in
+		chess) FEATURES="std,testing-fuzz,testing-fdr,testing-csp" ;;
+		colony) FEATURES="full,testing-fuzz,testing-csp" ;;
+	esac
+	for CANDIDATE_BIN in "fuzz_${TEST_NAME}" "${TEST_NAME}"; do
+		if RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "$CANDIDATE_BIN" --features "$FEATURES" > /dev/null 2>&1; then
 			BUILD_OK=true
-			TARGET_HINT="fuzz_${TEST_NAME}"
+			TARGET_HINT="$CANDIDATE_BIN"
+			break
 		fi
-	else
-		for CANDIDATE_BIN in "fuzz_${TEST_NAME}" "${TEST_NAME}"; do
-			if RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "$CANDIDATE_BIN" --features "std,testing-fuzz" > /dev/null 2>&1; then
-				BUILD_OK=true
-				TARGET_HINT="$CANDIDATE_BIN"
-				break
-			fi
-		done
-	fi
+	done
 fi
 if [ "$BUILD_OK" = false ]; then
 	if RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing > /dev/null 2>&1; then
@@ -483,14 +511,20 @@ fi
 if [ "$SKIP_CPU_FREQ" = true ]; then
     AFL_ENV_VARS+=("AFL_SKIP_CPUFREQ=1")
 fi
+if [ "$DISABLE_FORKSRV" = true ]; then
+    AFL_ENV_VARS+=("AFL_NO_FORKSRV=1")
+fi
 
 if [ ${#AFL_ENV_VARS[@]} -gt 0 ]; then
-    echo "[*] Note: Skipping AFL system configuration checks"
+    echo "[*] Note: AFL environment overrides"
     if [ "$SKIP_CRASH_CHECK" = true ]; then
         echo "    - Crash reporting check disabled"
     fi
     if [ "$SKIP_CPU_FREQ" = true ]; then
         echo "    - CPU frequency scaling check disabled"
+    fi
+    if [ "$DISABLE_FORKSRV" = true ]; then
+        echo "    - Forkserver disabled (Tokio target)"
     fi
 fi
 
@@ -598,8 +632,17 @@ COVERAGE=$(grep "^bitmap_cvg" "$STATS_FILE" | awk '{print $3}' | sed 's/%//' || 
 EDGES_FOUND=$(grep "^edges_found" "$STATS_FILE" | awk '{print $3}' || echo "0")
 TOTAL_EDGES=$(grep "^total_edges" "$STATS_FILE" | awk '{print $3}' || echo "0")
 CYCLES=$(grep "^cycles_done" "$STATS_FILE" | awk '{print $3}' || echo "0")
-UNIQUE_CRASHES=$(grep "^unique_crashes" "$STATS_FILE" | awk '{print $3}' || echo "0")
-UNIQUE_HANGS=$(grep "^unique_hangs" "$STATS_FILE" | awk '{print $3}' || echo "0")
+# AFL++ 4.x writes saved_*; older AFL used unique_*. Prefer saved_*.
+UNIQUE_CRASHES=$(grep "^saved_crashes" "$STATS_FILE" | awk '{print $3}')
+if [ -z "$UNIQUE_CRASHES" ]; then
+	UNIQUE_CRASHES=$(grep "^unique_crashes" "$STATS_FILE" | awk '{print $3}' || echo "0")
+fi
+UNIQUE_CRASHES=${UNIQUE_CRASHES:-0}
+UNIQUE_HANGS=$(grep "^saved_hangs" "$STATS_FILE" | awk '{print $3}')
+if [ -z "$UNIQUE_HANGS" ]; then
+	UNIQUE_HANGS=$(grep "^unique_hangs" "$STATS_FILE" | awk '{print $3}' || echo "0")
+fi
+UNIQUE_HANGS=${UNIQUE_HANGS:-0}
 
 # Performance Metrics
 echo "[*] Performance Metrics"
@@ -725,4 +768,3 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "[+] Analysis Complete"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-

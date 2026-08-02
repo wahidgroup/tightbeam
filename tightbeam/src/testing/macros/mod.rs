@@ -292,7 +292,10 @@ where
 /// Top-level keys:
 /// - `name:` test function name (omit with `fuzz: afl`)
 /// - `spec:` AssertSpec type (latest version) or `config:` ScenarioConfig
-/// - `fuzz: afl` optional AFL target (Bare/Servlet, needs testing-csp)
+/// - `fuzz: afl` optional AFL target (Bare/Servlet/Hive/Cluster). Bare,
+///   Hive, and Cluster wrap `afl::fuzz!` and pass
+///   [`TraceCollector::with_fuzz_oracle`] into the runner; needs
+///   testing-csp)
 ///
 /// Environment-block keys:
 /// - `context:` fixture evaluated once per test, shared as `Arc<C>`
@@ -345,7 +348,11 @@ macro_rules! tb_scenario {
 							let _ = on_fail(&$hook_ctx, &violation);
 						}
 					}
-					panic!("Spec verification failed for {}: {:?}", spec.id(), violation);
+					panic!(
+						"Spec verification failed for {}: {:?}",
+						$crate::testing::TBSpec::id(*spec),
+						violation
+					);
 				}
 				Ok(()) => {}
 			}
@@ -464,6 +471,10 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== FUZZ VARIANT: AFL fuzz target for Bare environment (generates fn main()) =====
+	//
+	// Without `--cfg fuzzing`, smoke-runs once with an empty oracle so
+	// `config` / `exec` stay used under IDE and `cargo check` (avoids
+	// unused-import noise on `SetupEnv` in the closure pattern).
 	(
 		fuzz: afl,
 		csp: $csp_type:ty,
@@ -479,6 +490,7 @@ macro_rules! tb_scenario {
 				let process = <$csp_type>::process();
 
 				// Create fresh trace with oracle for this AFL iteration
+				let _config = $config;
 				let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
 				let env = $crate::testing::env::SetupEnv {
 					trace,
@@ -492,7 +504,17 @@ macro_rules! tb_scenario {
 
 		#[cfg(not(fuzzing))]
 		fn main() {
-			panic!("This is an AFL fuzz target. Build with: RUSTFLAGS='--cfg fuzzing' cargo afl build --bin <name>");
+			#[cfg(feature = "testing-csp")]
+			let process = <$csp_type>::process();
+			let config = $config;
+			let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
+			let env = $crate::testing::env::SetupEnv {
+				trace: trace.share(),
+				context: ::std::sync::Arc::new(()),
+			};
+			let exec_result = $crate::testing::macros::__tb_env_call_sync($exec_closure, env);
+			let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
+			$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, exec_result);
 		}
 	};
 
@@ -510,6 +532,110 @@ macro_rules! tb_scenario {
 				config: $config,
 				environment Servlet { $($env_body)* }
 			)
+		}
+	};
+
+	// ===== INTERNAL: Tokio Hive/Cluster AFL mains =====
+	//
+	// Shared by the Hive and Cluster `fuzz: afl` arms. Builds
+	// `TraceCollector::with_fuzz_oracle` each AFL iteration (or empty
+	// bytes for smoke) and forwards into `@run_hive` / `@run_cluster`.
+	// The Tokio runtime is created inside the fuzz closure so worker
+	// threads are not live before AFL's forkserver handoff.
+	(@afl_async
+		csp: $csp_type:ty,
+		config: $config:expr,
+		label: $label:literal,
+		@$run:ident
+		$($run_body:tt)*
+	) => {
+		#[cfg(all(fuzzing, feature = "tokio"))]
+		fn main() {
+			afl::fuzz!(|data: &[u8]| {
+				let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+					return;
+				};
+				runtime.block_on(async {
+					#[cfg(feature = "testing-csp")]
+					let process = <$csp_type>::process();
+					let config = $config;
+					let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
+					$crate::tb_scenario!(@$run
+						config: config,
+						trace: trace,
+						$($run_body)*
+					)
+				});
+			});
+		}
+
+		#[cfg(all(not(fuzzing), feature = "tokio"))]
+		#[tokio::main]
+		async fn main() {
+			#[cfg(feature = "testing-csp")]
+			let process = <$csp_type>::process();
+			let config = $config;
+			let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
+			$crate::tb_scenario!(@$run
+				config: config,
+				trace: trace,
+				$($run_body)*
+			)
+		}
+
+		#[cfg(not(feature = "tokio"))]
+		fn main() {
+			panic!(concat!($label, " AFL target requires the tokio feature"));
+		}
+	};
+
+	// ===== FUZZ VARIANT: AFL fuzz target for Hive environment =====
+	(
+		fuzz: afl,
+		csp: $csp_type:ty,
+		config: $config:expr,
+		environment Hive {
+			$(context: $context:expr,)?
+			start: $start_closure:expr,
+			client: $client_closure:expr
+		}
+		$(,)?
+	) => {
+		$crate::tb_scenario! {
+			@afl_async
+			csp: $csp_type,
+			config: $config,
+			label: "Hive",
+			@run_hive
+			context: [ $($context)? ],
+			start: $start_closure,
+			client: $client_closure
+		}
+	};
+
+	// ===== FUZZ VARIANT: AFL fuzz target for Cluster environment =====
+	(
+		fuzz: afl,
+		csp: $csp_type:ty,
+		config: $config:expr,
+		environment Cluster {
+			$(context: $context:expr,)?
+			start: $start_closure:expr,
+			$(hives: $hives_closure:expr,)?
+			client: $client_closure:expr
+		}
+		$(,)?
+	) => {
+		$crate::tb_scenario! {
+			@afl_async
+			csp: $csp_type,
+			config: $config,
+			label: "Cluster",
+			@run_cluster
+			context: [ $($context)? ],
+			start: $start_closure,
+			hives: [ $($hives_closure)? ],
+			client: $client_closure
 		}
 	};
 
@@ -674,8 +800,11 @@ macro_rules! tb_scenario {
 		#[cfg(feature = "tokio")]
 		#[tokio::test]
 		async fn $test_name() {
+			let config = $config;
+			let trace = config.trace();
 			$crate::tb_scenario!(@run_cluster
-				config: $config,
+				config: config,
+				trace: trace,
 				context: [ $($context)? ],
 				start: $start_closure,
 				hives: [ $($hives_closure)? ],
@@ -698,8 +827,11 @@ macro_rules! tb_scenario {
 		#[cfg(feature = "tokio")]
 		#[tokio::test]
 		async fn $test_name() {
+			let config = $config;
+			let trace = config.trace();
 			$crate::tb_scenario!(@run_hive
-				config: $config,
+				config: config,
+				trace: trace,
 				context: [ $($context)? ],
 				start: $start_closure,
 				client: $client_closure
@@ -713,8 +845,6 @@ macro_rules! tb_scenario {
 		context: [ $($context:expr)? ],
 		exec: |$env:pat_param| async move $exec_body:block
 	) => {{
-		use $crate::testing::TBSpec;
-
 		let config = $config;
 		let trace = config.trace();
 		let env = $crate::testing::env::SetupEnv {
@@ -734,8 +864,6 @@ macro_rules! tb_scenario {
 		context: [ $($context:expr)? ],
 		exec: $exec_closure:expr
 	) => {{
-		use $crate::testing::TBSpec;
-
 		let config = $config;
 		let trace = config.trace();
 		let env = $crate::testing::env::SetupEnv {
@@ -768,7 +896,6 @@ macro_rules! tb_scenario {
 		config: $config:expr,
 		exec: $exec_closure:expr
 	) => {{
-		use $crate::testing::TBSpec;
 		use $crate::utils::task::PipelineBuilder;
 
 		let config = $config;
@@ -791,8 +918,6 @@ macro_rules! tb_scenario {
 		setup: $setup_closure:expr,
 		stimulus: $stimulus_closure:expr
 	) => {{
-		use $crate::testing::TBSpec;
-
 		let config = $config;
 		let trace = config.trace();
 		let context = ::std::sync::Arc::new(($($context)?));
@@ -856,8 +981,6 @@ macro_rules! tb_scenario {
 			client: $client_closure:expr
 		}
 	) => {{
-		use $crate::testing::TBSpec;
-
 		let config = $config;
 		let trace = config.trace();
 		let context = ::std::sync::Arc::new(($($context)?));
@@ -900,8 +1023,6 @@ macro_rules! tb_scenario {
 		server: $server_closure:expr,
 		client: $client_closure:expr
 	) => {{
-		use $crate::testing::TBSpec;
-
 		let config = $config;
 		let trace = config.trace();
 		let context = ::std::sync::Arc::new(($($context)?));
@@ -936,21 +1057,25 @@ macro_rules! tb_scenario {
 	// `start` returns the cluster. Optional `hives` returns futures that
 	// `tb_scenario!` awaits and registers. `client` owns the cluster for
 	// registry assertions and the consuming `stop`.
+	//
+	// `trace` is supplied by the caller: named tests pass `config.trace()`,
+	// AFL arms pass `TraceCollector::with_fuzz_oracle(...)` so the oracle
+	// wires through the same path as Bare.
 	(@run_cluster
 		config: $config:expr,
+		trace: $trace:expr,
 		context: [ $($context:expr)? ],
 		start: $start_closure:expr,
 		hives: [ $($hives_closure:expr)? ],
 		client: $client_closure:expr
 	) => {{
-		use $crate::testing::TBSpec;
 		#[allow(unused_imports)]
 		use $crate::colony::cluster::Cluster;
 		#[allow(unused_imports)]
 		use $crate::colony::hive::Hive;
 
 		let config = $config;
-		let trace = config.trace();
+		let trace = $trace;
 		let context = ::std::sync::Arc::new(($($context)?));
 
 		let cluster_instance = $crate::testing::macros::__tb_env_call(
@@ -1003,17 +1128,16 @@ macro_rules! tb_scenario {
 
 	// ===== INTERNAL: Hive environment =====
 	// Like Cluster without registration: `start` returns the hive and
-	// `client` owns it.
+	// `client` owns it. `trace` is caller-supplied (see `@run_cluster`).
 	(@run_hive
 		config: $config:expr,
+		trace: $trace:expr,
 		context: [ $($context:expr)? ],
 		start: $start_closure:expr,
 		client: $client_closure:expr
 	) => {{
-		use $crate::testing::TBSpec;
-
 		let config = $config;
-		let trace = config.trace();
+		let trace = $trace;
 		let context = ::std::sync::Arc::new(($($context)?));
 
 		let hive_instance = $crate::testing::macros::__tb_env_call(
@@ -1050,7 +1174,6 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::Arc;
 
-	use crate::testing::specs::assert::TBSpec;
 	use crate::testing::specs::csp::{CspValidationResult, CspViolation, Event, Process, ProcessSpec, State};
 	use crate::testing::{HookContext, ScenarioConfig, TestHooks};
 	use crate::trace::ConsumedTrace;

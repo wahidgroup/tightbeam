@@ -12,6 +12,7 @@
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
@@ -206,7 +207,7 @@ tb_scenario! {
 			// Complete
 			trace.event(VERIFICATION_COMPLETE)?;
 
-			Ok(())
+			Ok::<(), tightbeam::TightBeamError>(())
 		}
 	}
 }

@@ -9,6 +9,7 @@
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
@@ -58,10 +59,10 @@ tb_scenario! {
 
 			// Make assertions based on execution trace
 			for event in trace.oracle().trace() {
-				trace.event(*event)?;
+				trace.event(event)?;
 			}
 
-			Ok(())
+			Ok::<(), tightbeam::TightBeamError>(())
 		}
 	}
 }

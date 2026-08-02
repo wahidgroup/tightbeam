@@ -3071,8 +3071,8 @@ By default a federated gateway advertises and serves every locally registered se
 
 **Planes**
 
-- **Discoverability**: the advertise beat filters the slate through `PeerConfig::exported_types`, so direct ads and slate rumors never disclose unexported types.
-- **Enforcement**: unary Work requests and routed stream opens evaluate the export boundary where the servlet target is known. A peer that guesses a type name is refused unless a grant opens that target (`PermissionDenied`, traced as `CLUSTER_EXPORT_REFUSED`).
+- **Discoverability**: each advertise beat filters the slate through `PeerConfig::exported_types` (`ExportAllowlist::export_keys`), so direct ads and slate rumors never disclose unexported types.
+- **Enforcement**: unary Work requests and routed stream opens evaluate the export boundary where the servlet target is known (`ExportAllowlist::contains`). A peer that guesses a type name is refused unless a grant opens that target (`PermissionDenied`, traced as `CLUSTER_EXPORT_REFUSED`).
 
 The enforcement pipeline layers these checks in order:
 
@@ -3402,13 +3402,13 @@ tb_scenario! {
 The `environment Cluster` syntax provides:
 
 - `context`: Scenario fixture (certificates, flags) shared as `Arc<C>` with every closure
-- `start`: Configures and starts the cluster from a `SetupEnv`, returns the cluster instance
-- `hives` (OPTIONAL): Returns hive futures from a `SetupEnv`. Each is awaited and registered with the cluster
-- `client`: Owns the cluster through `ClusterEnv`, builds connections from the context, asserts registry state, and stops the cluster
+- `start`: Configures and starts the program under test from a `SetupEnv`, and returns it. Usually one gateway. When the federation itself is under test, `start` may return a multi-org topology (seed plus peers already peered)
+- `hives` (OPTIONAL): Returns hive futures from a `SetupEnv`. Each is awaited and registered with the value returned by `start` when that value exposes `addr()` (typically one seed gateway). Omit when registration itself is the stimulus, or when hives register inside topology boot
+- `client`: Owns that program through `ClusterEnv.cluster`, dials gateways, asserts registry state, and runs the consuming stop
 
 Adversarial registration scenarios (unsigned, replayed, stale, hijacked) omit `hives:` and drive registration from the client, asserting the rejection and the registry count on the owned instance.
 
-Peer federation and gossip use the same `environment Cluster` shape with peer trust, dial lists, and signed `AdvertisePeer` / `PublishGossip` frames from the client. See `tests/colony/cluster/` (`registration.rs`, `routing.rs`, `topology.rs`, `peering.rs`, `gossip.rs`).
+Peer federation and gossip use the same `environment Cluster` shape with peer trust, dial lists, and signed `AdvertisePeer` / `PublishGossip` frames from the client. Two multi-gateway patterns apply: (1) when the federation is under test, boot the full topology in `start` (see `fuzz/colony/`); (2) when peering itself is the stimulus, own the seed in `start` with optional seed-side `hives:` and boot peer gateways in `client`. Do not wrap a cluster under test in `environment Hive` only for lifecycle. See `tests/colony/cluster/` (`registration.rs`, `routing.rs`, `topology.rs`, `peering.rs`, `gossip.rs`).
 
 ##### Conclusion
 
@@ -5136,7 +5136,7 @@ tb_scenario! {
 **Feature Requirements**:
 
 - `testing-csp` feature flag (required for CSP oracle)
-- `cargo-afl` installed: `cargo install cargo-afl`
+- `cargo-afl` installed (via `make setup`)
 - `std` feature flag (required for most fuzz targets)
 
 #### 12.8.2 Creating Fuzz Targets
@@ -5215,13 +5215,13 @@ tb_scenario! {
 **Prerequisites**:
 
 ```bash
-cargo install cargo-afl
+make setup   # installs cargo-afl
 ```
 
 **Run AFL Fuzzer**:
 
 ```bash
-# Build fuzz targets first
+# Build fuzz targets first (or: make fuzz-build)
 # Note: Some fuzz targets may require additional features
 RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing --features "std,testing-csp,testing-fuzz"
 

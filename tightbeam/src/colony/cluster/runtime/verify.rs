@@ -295,7 +295,7 @@ mod tests {
 	use super::*;
 	use crate::builder::frame::FrameBuilder;
 	use crate::builder::TypeBuilder;
-	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, ExportGate, ExportGrant};
+	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, ExportGate, ExportGrant, StaticExportList};
 	use crate::colony::common::ColonyNamespace;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
@@ -327,7 +327,7 @@ mod tests {
 			hive_trust: None,
 			peer_trust: None,
 		});
-		config.peer.exported_types = Some(vec![servlet("ping")]);
+		config.peer.exported_types = Some(Arc::new(StaticExportList::new(vec![servlet("ping")])));
 
 		config
 	}
@@ -420,7 +420,6 @@ mod tests {
 			&config,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict, Ok(()));
 	}
 
@@ -437,7 +436,6 @@ mod tests {
 			&config,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict, Err(TransitStatus::PermissionDenied));
 	}
 
@@ -469,7 +467,6 @@ mod tests {
 			&config,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict, Err(TransitStatus::PermissionDenied));
 	}
 
@@ -485,7 +482,6 @@ mod tests {
 			&config,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict, Ok(()));
 	}
 
@@ -511,7 +507,6 @@ mod tests {
 		config.policies.push(Arc::new(UnknownPolicy));
 
 		let verdict = evaluate_gates(None, &SessionContext::default(), &config, &TraceCollector::default());
-
 		assert_eq!(verdict, Err(TransitStatus::Internal));
 	}
 

@@ -28,45 +28,44 @@ clone_on_ref_ptr = "deny"
 tightbeam-derive = { version = "0.1.7", path = "tightbeam-derive" }
 
 # RustCrypto dependencies
-spki = { version = "0.7", default-features = false }
-der = { version = "0.7", default-features = false, features = [
+spki = { version = "=0.7.3", default-features = false }
+der = { version = "=0.7.10", default-features = false, features = [
 	"alloc",
 	"derive",
 	"oid",
 ] }
-cms = { version = "0.2.3", default-features = false }
-pkcs12 = { version = "0.1.0", default-features = false }
-hkdf = { version = "0.12.4", default-features = false }
-x509-cert = { version = "0.2.5", default-features = false, features = [
+cms = { version = "=0.2.3", default-features = false }
+pkcs12 = { version = "=0.1.0", default-features = false }
+hkdf = { version = "=0.12.4", default-features = false }
+x509-cert = { version = "=0.2.5", default-features = false, features = [
 	"pem",
-	"sct",
 ] }
-hex-literal = { version = "1.1.0", default-features = false }
-elliptic-curve = { version = "0.13.8", default-features = false }
-zeroize = { version = "1.5", features = ["alloc", "zeroize_derive"] }
-crypto-common = { version = "0.1.7", default-features = false, features = [
+hex-literal = { version = "=1.1.0", default-features = false }
+elliptic-curve = { version = "=0.13.8", default-features = false }
+zeroize = { version = "=1.9.0", features = ["alloc", "zeroize_derive"] }
+crypto-common = { version = "=0.1.7", default-features = false, features = [
 	"getrandom",
 	"rand_core",
 ] }
-aead = { version = "0.5.2", default-features = false, features = ["alloc"] }
-signature = { version = "2.2.0", default-features = false, features = [
+aead = { version = "=0.5.2", default-features = false, features = ["alloc"] }
+signature = { version = "=2.2.0", default-features = false, features = [
 	"alloc",
 ] }
-digest = { version = "0.10.7", default-features = false, features = ["alloc"] }
-aes = { version = "0.8.4", default-features = false }
-aes-gcm = { version = "0.10.3", default-features = false, features = [
+digest = { version = "=0.10.7", default-features = false, features = ["alloc"] }
+aes = { version = "=0.8.4", default-features = false }
+aes-gcm = { version = "=0.10.3", default-features = false, features = [
 	"aes",
 	"alloc",
 ] }
-aes-kw = { version = "0.2.1", default-features = false, features = ["alloc"] }
-sha3 = { version = "0.10.8", default-features = false, features = ["oid"] }
-ecdsa = { version = "0.16.9", default-features = false, features = [
+aes-kw = { version = "=0.2.1", default-features = false, features = ["alloc"] }
+sha3 = { version = "=0.10.9", default-features = false, features = ["oid"] }
+ecdsa = { version = "=0.16.9", default-features = false, features = [
 	"signing",
 	"digest",
 	"der",
 ] }
-kem = { version = "0.2.0", default-features = false }
-k256 = { version = "0.13.4", default-features = false, features = [
+kem = { version = "=0.2.0", default-features = false }
+k256 = { version = "=0.13.4", default-features = false, features = [
 	"alloc",
 	"signature",
 	"schnorr",
@@ -75,40 +74,38 @@ k256 = { version = "0.13.4", default-features = false, features = [
 ] }
 
 # Non-RustCrypto dependencies
-rayon = { version = "1.11.0", default-features = false }
-rand_core = { version = "0.6", default-features = false, features = [
+rayon = { version = "=1.12.0", default-features = false }
+rand_core = { version = "=0.6.4", default-features = false, features = [
 	"getrandom",
 ] }
-tokio = { version = "1.50.0", default-features = false, features = ["full"] }
-time = { version = "0.3.47", default-features = false, features = [
+tokio = { version = "=1.53.1", default-features = false, features = [
+	"rt",
+	"rt-multi-thread",
+	"net",
+	"io-util",
+	"time",
+	"sync",
 	"macros",
+] }
+time = { version = "=0.3.47", default-features = false, features = [
 	"alloc",
 ] }
 
 # Async utilities
-futures = { version = "0.3.32", default-features = false, features = ["alloc"] }
+futures = { version = "=0.3.33", default-features = false, features = ["alloc"] }
 
 # Compression dependencies
-zeekstd = { version = "0.6.2", default-features = false }
+zeekstd = { version = "=0.6.2", default-features = false }
 
 # Dev dependencies
-husky-rs = "0.3"
-paste = { version = "1.0.15" }
-gumdrop = { version = "0.8.1" }
-rand = { version = "0.9" }
-trybuild = { version = "1.0.117", features = ["diff"] }
-fake = { version = "=4.3.0", features = [
-	"derive",
-	"uuid",
-	"time",
-	"url",
-	"email_address",
-] }
+husky-rs = { version = "=0.3.3" }
+paste = { version = "=1.0.15" }
+trybuild = { version = "=1.0.118", features = ["diff"] }
 
 # Proc macro dependencies
-proc-macro2 = "1.0.106"
-quote = "1.0.46"
-syn = { version = "2.0.118", features = ["full", "derive"] }
+proc-macro2 = { version = "=1.0.107" }
+quote = { version = "=1.0.47" }
+syn = { version = "=2.0.119", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
-afl = { version = "0.17.1" }
+afl = { version = "=0.17.1" }

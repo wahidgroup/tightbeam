@@ -62,9 +62,7 @@ afl = { workspace = true, optional = true }
 
 [dev-dependencies]
 husky-rs = { workspace = true }
-rand = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-fake = { workspace = true }
+tokio = { workspace = true }
 trybuild = { workspace = true }
 
 [features]
@@ -310,6 +308,11 @@ required-features = ["std", "testing-fuzz"]
 [[bin]]
 name = "fuzz_chess"
 path = "fuzz/chess/mod.rs"
+required-features = ["full", "testing-fuzz"]
+
+[[bin]]
+name = "fuzz_colony"
+path = "fuzz/colony/mod.rs"
 required-features = ["full", "testing-fuzz"]
 
 [build-dependencies]

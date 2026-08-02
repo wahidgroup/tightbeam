@@ -60,7 +60,10 @@ pub use servlet_registry::{
 };
 
 #[cfg(feature = "x509")]
-pub use export::{cert_is_first_party, session_is_first_party, ExportGate, ExportGrant};
+pub use export::{
+	cert_is_first_party, session_is_first_party, DynamicExportList, ExportAllowlist, ExportGate, ExportGrant,
+	StaticExportList,
+};
 
 #[cfg(feature = "x509")]
 pub use gossip::{
@@ -233,7 +236,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 ///
 /// Trust anchors stay on [`ClusterTlsConfig::peer_trust`]. Export
 /// discoverability and enforcement share [`PeerConfig::exported_types`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PeerConfig {
 	/// Peer gateway addresses dialed to advertise exported types.
 	///
@@ -282,20 +285,21 @@ pub struct PeerConfig {
 	/// Servlet types disclosed to and reachable by external peers.
 	///
 	/// `None` exports every locally served type. `Some` restricts both
-	/// planes of the export boundary:
+	/// planes of the export boundary through an [`ExportAllowlist`]:
 	///
-	/// - **Discoverability**: the advertise beat filters the slate, so
-	///   ads and rumors never disclose unexported types.
-	/// - **Enforcement**: the gateway enforces the same list on unary Work
-	///   and routed stream opens. External peers and relayed requests are
-	///   refused on unexported targets even when they guess the type name.
-	///   Enforcement reads this field on each request, so the two planes
-	///   never drift.
+	/// - **Discoverability**: each advertise beat asks
+	///   [`ExportAllowlist::allows_canonical`] per local servlet key,
+	///   so ads and rumors never disclose unexported types.
+	/// - **Enforcement**: the gateway calls
+	///   [`ExportAllowlist::contains`] on unary Work and routed stream
+	///   opens. External peers and relayed requests are refused on
+	///   unexported targets even when they guess the type name.
 	///
-	/// Entries are bare servlet type URNs, the same form work requests
-	/// and stream opens carry as their target.
+	/// Install a static list with
+	/// [`ClusterConfigBuilder::with_exported_types`] or a live handle
+	/// with [`ClusterConfigBuilder::with_export_allowlist`].
 	#[cfg(feature = "x509")]
-	pub exported_types: Option<Vec<Urn<'static>>>,
+	pub exported_types: Option<Arc<dyn ExportAllowlist>>,
 }
 
 /// The default peer plane: no peers, no beat, no allowlist, and the
@@ -312,6 +316,24 @@ impl Default for PeerConfig {
 			#[cfg(feature = "x509")]
 			exported_types: None,
 		}
+	}
+}
+
+impl core::fmt::Debug for PeerConfig {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		let mut debug = f.debug_struct("PeerConfig");
+		debug
+			.field("peers", &self.peers)
+			.field("advertise_interval", &self.advertise_interval)
+			.field("peer_dial_allowlist", &self.peer_dial_allowlist)
+			.field("table", &self.table)
+			.field("max_hops", &self.max_hops)
+			.field("rumor_refresh", &self.rumor_refresh);
+
+		#[cfg(feature = "x509")]
+		debug.field("exported_types", &self.exported_types.as_ref().map(|_| "<ExportAllowlist>"));
+
+		debug.finish()
 	}
 }
 

@@ -52,7 +52,7 @@ help-body:
 	@printf '    clean           Clean build artifacts\n'
 	@printf '    test            Run all tests (honors cargo features and no-default)\n'
 	@printf '    test-all        Run tests with all feature combinations\n'
-	@printf '    fuzz-build      Build AFL-instrumented fuzz targets (requires cargo-afl)\n'
+	@printf '    fuzz-build      Build AFL-instrumented fuzz targets (cargo-afl via setup)\n'
 	@printf '    fuzz-test       Build and run AFL fuzz testing for 60 seconds\n'
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'

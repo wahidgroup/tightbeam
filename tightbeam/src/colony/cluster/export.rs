@@ -59,8 +59,9 @@
 //! - CWE-285, improper authorization:
 //!   <https://cwe.mitre.org/data/definitions/285.html>
 
+use core::str::from_utf8;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use super::ClusterConfig;
 use crate::colony::common::canonical_bytes;
@@ -68,6 +69,165 @@ use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
 use crate::policy::{SessionContext, TransitStatus};
 use crate::utils::urn::Urn;
+
+/// Live export allowlist shared by discoverability and enforcement.
+///
+/// Install through
+/// [`ClusterConfigBuilder::with_export_allowlist`](super::ClusterConfigBuilder::with_export_allowlist)
+/// or the static helper
+/// [`ClusterConfigBuilder::with_exported_types`](super::ClusterConfigBuilder::with_exported_types).
+/// `None` on [`PeerConfig::exported_types`](super::PeerConfig) means every
+/// locally served type is exported.
+///
+/// # Planes
+///
+/// - **Enforcement** calls [`ExportAllowlist::contains`] on each work or
+///   stream open, so a mutable list takes effect on the next request.
+/// - **Discoverability** calls [`ExportAllowlist::allows_canonical`] per
+///   local servlet key on each advertise beat, so the slate tracks the
+///   same live membership without building an owned key set.
+///
+/// # Keys
+///
+/// List entries are servlet type URNs without an instance tail, so their
+/// canonical bytes equal the registry's type keys. An instance-bearing
+/// entry would answer [`ExportAllowlist::contains`] on that exact target
+/// but never match an advertised type key.
+pub trait ExportAllowlist: Send + Sync {
+	/// Whether `target` is on the export list.
+	fn contains(&self, target: &Urn<'_>) -> bool;
+
+	/// Whether a canonical registry type key is exported.
+	///
+	/// The provided method parses `key` and delegates to
+	/// [`ExportAllowlist::contains`], so the two views cannot diverge.
+	/// The built-in lists override it with a cached-set lookup that
+	/// borrows `key`. A key that fails to parse is not exported.
+	fn allows_canonical(&self, key: &[u8]) -> bool {
+		let Ok(canonical) = from_utf8(key) else {
+			return false;
+		};
+		let Ok(target) = canonical.parse::<Urn<'static>>() else {
+			return false;
+		};
+
+		self.contains(&target)
+	}
+}
+
+/// Fixed export list installed at config build.
+#[derive(Clone, Debug)]
+pub struct StaticExportList {
+	types: Vec<Urn<'static>>,
+	keys: HashSet<Vec<u8>>,
+}
+
+impl StaticExportList {
+	/// Build an allowlist from the given servlet type URNs.
+	pub fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
+		let types: Vec<Urn<'static>> = types.into_iter().collect();
+		let keys = types.iter().map(canonical_bytes).collect();
+		Self { types, keys }
+	}
+}
+
+impl ExportAllowlist for StaticExportList {
+	fn contains(&self, target: &Urn<'_>) -> bool {
+		self.types.iter().any(|allowed| allowed == target)
+	}
+
+	fn allows_canonical(&self, key: &[u8]) -> bool {
+		self.keys.contains(key)
+	}
+}
+
+/// URN list and its canonical key cache under one lock, so the two views
+/// of the membership mutate atomically and cannot diverge mid-update.
+#[derive(Default)]
+struct ExportMembership {
+	types: Vec<Urn<'static>>,
+	keys: HashSet<Vec<u8>>,
+}
+
+impl ExportMembership {
+	fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
+		let types: Vec<Urn<'static>> = types.into_iter().collect();
+		let keys = types.iter().map(canonical_bytes).collect();
+		Self { types, keys }
+	}
+}
+
+/// Interior-mutable export list for tests and long-running fuzz harnesses.
+///
+/// Mutations are visible to the next [`ExportAllowlist::contains`] and
+/// [`ExportAllowlist::allows_canonical`] call. Poisoned locks treat the
+/// list as empty so both planes stay fail-closed.
+#[derive(Default)]
+pub struct DynamicExportList {
+	membership: RwLock<ExportMembership>,
+}
+
+impl DynamicExportList {
+	/// Build a mutable allowlist from the given servlet type URNs.
+	pub fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
+		Self { membership: RwLock::new(ExportMembership::new(types)) }
+	}
+
+	/// Replace the export membership with `types`.
+	pub fn set(&self, types: impl IntoIterator<Item = Urn<'static>>) {
+		if let Ok(mut guard) = self.membership.write() {
+			*guard = ExportMembership::new(types);
+		}
+	}
+
+	/// Insert `target` when it is not already listed.
+	pub fn insert(&self, target: Urn<'static>) {
+		if let Ok(mut guard) = self.membership.write() {
+			if !guard.types.iter().any(|allowed| allowed == &target) {
+				guard.keys.insert(canonical_bytes(&target));
+				guard.types.push(target);
+			}
+		}
+	}
+
+	/// Remove every entry equal to `target`.
+	pub fn remove(&self, target: &Urn<'_>) {
+		if let Ok(mut guard) = self.membership.write() {
+			// Keys are collected from the retained-out entries, not
+			// recomputed from `target`, so a stored entry that compares
+			// equal under a different canonical form still drops its
+			// own cached key.
+			let mut dropped = Vec::new();
+			guard.types.retain(|allowed| {
+				if allowed == target {
+					dropped.push(canonical_bytes(allowed));
+					return false;
+				}
+
+				true
+			});
+			for key in dropped {
+				guard.keys.remove(&key);
+			}
+		}
+	}
+}
+
+impl ExportAllowlist for DynamicExportList {
+	fn contains(&self, target: &Urn<'_>) -> bool {
+		let Ok(guard) = self.membership.read() else {
+			return false;
+		};
+		guard.types.iter().any(|allowed| allowed == target)
+	}
+
+	fn allows_canonical(&self, key: &[u8]) -> bool {
+		let Ok(guard) = self.membership.read() else {
+			return false;
+		};
+		guard.keys.contains(key)
+	}
+}
 
 /// Custom export gate for servlet targets crossing the gateway.
 ///
@@ -148,7 +308,7 @@ pub(crate) enum ExportDecision {
 /// when it is exported, granted, or a first-party origin request, and
 /// every deny gate must then agree.
 pub(crate) struct ExportPolicy<'a> {
-	exported: Option<&'a [Urn<'static>]>,
+	exported: Option<&'a dyn ExportAllowlist>,
 	hive_trust: Option<&'a dyn CertificateTrust>,
 	peer_trust: Option<&'a dyn CertificateTrust>,
 	grants: &'a [Arc<dyn ExportGrant>],
@@ -261,8 +421,8 @@ pub fn session_is_first_party(
 
 /// Built-in allowlist verdict on a resolved servlet target.
 ///
-/// `exported` is the configured export list, or `None` when the gateway
-/// exports every type. The verdict reads the live configuration on each
+/// `exported` is the configured allowlist, or `None` when the gateway
+/// exports every type. The verdict reads the live allowlist on each
 /// request so the enforcement plane and the advertise filter stay aligned.
 /// Grants are applied by the gateway after this allowlist refuses; this
 /// function is the allowlist step alone.
@@ -276,7 +436,7 @@ pub fn session_is_first_party(
 /// 3. An unexported origin request passes only for a first-party session.
 /// 4. Any other unexported request is refused.
 pub(crate) fn export_verdict(
-	exported: Option<&[Urn<'static>]>,
+	exported: Option<&dyn ExportAllowlist>,
 	hive_trust: Option<&dyn CertificateTrust>,
 	peer_trust: Option<&dyn CertificateTrust>,
 	target: &Urn<'_>,
@@ -286,7 +446,7 @@ pub(crate) fn export_verdict(
 	let Some(exported) = exported else {
 		return TransitStatus::Ok;
 	};
-	if exported.iter().any(|allowed| allowed == target) {
+	if exported.contains(target) {
 		return TransitStatus::Ok;
 	}
 	if relayed {
@@ -297,24 +457,6 @@ pub(crate) fn export_verdict(
 	}
 
 	TransitStatus::PermissionDenied
-}
-
-/// Canonical-byte lookup set of an exported-type list.
-///
-/// The advertise beat builds this once per task and filters the slate
-/// against it, so ads and rumors disclose exported types only.
-pub(crate) fn export_set(exported: &[Urn<'static>]) -> HashSet<Vec<u8>> {
-	exported.iter().map(canonical_bytes).collect()
-}
-
-/// Whether a canonical type key belongs on the advertised slate.
-///
-/// `None` means no export list is configured, which exports every type.
-pub(crate) fn slate_exported(exports: Option<&HashSet<Vec<u8>>>, canonical: &[u8]) -> bool {
-	match exports {
-		Some(set) => set.contains(canonical),
-		None => true,
-	}
 }
 
 #[cfg(test)]
@@ -388,6 +530,10 @@ mod tests {
 		assert!(!cert_is_first_party(Some(&cert), None, None));
 	}
 
+	fn static_list(types: impl IntoIterator<Item = Urn<'static>>) -> StaticExportList {
+		StaticExportList::new(types)
+	}
+
 	#[test]
 	fn verdict_without_export_list_passes_every_target() {
 		let cert = test_certificate();
@@ -399,7 +545,7 @@ mod tests {
 
 	#[test]
 	fn verdict_passes_exported_target_for_external_peer() {
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(Some(&exported), None, None, &servlet("ping"), Some(&test_certificate()), true),
 			TransitStatus::Ok
@@ -411,7 +557,7 @@ mod tests {
 		let cert = foreign_certificate();
 		let hive = trust_of(&test_certificate());
 		let peer = trust_of(&cert);
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
@@ -427,7 +573,7 @@ mod tests {
 
 	#[test]
 	fn verdict_refuses_unexported_relayed_request() {
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(Some(&exported), None, None, &servlet("ledger"), None, true),
 			TransitStatus::PermissionDenied
@@ -439,7 +585,7 @@ mod tests {
 		let cert = test_certificate();
 		let hive = trust_of(&cert);
 		let peer = trust_of(&foreign_certificate());
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
@@ -458,7 +604,7 @@ mod tests {
 		let cert = test_certificate();
 		let hive = trust_of(&cert);
 		let peer = trust_of(&cert);
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
@@ -475,7 +621,7 @@ mod tests {
 	#[test]
 	fn verdict_refuses_unexported_anonymous_origin_target() {
 		let hive = trust_of(&test_certificate());
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(Some(&exported), Some(hive.as_ref()), None, &servlet("ledger"), None, false),
 			TransitStatus::PermissionDenied
@@ -486,25 +632,60 @@ mod tests {
 	fn empty_export_list_refuses_every_target_for_external_peer() {
 		let cert = foreign_certificate();
 		let hive = trust_of(&test_certificate());
+		let exported = static_list([]);
 		assert_eq!(
-			export_verdict(Some(&[]), Some(hive.as_ref()), None, &servlet("ping"), Some(&cert), false),
+			export_verdict(Some(&exported), Some(hive.as_ref()), None, &servlet("ping"), Some(&cert), false),
 			TransitStatus::PermissionDenied
 		);
 	}
 
 	#[test]
-	fn export_set_filters_slate_to_exported_keys() {
-		let exports = export_set(&[servlet("ping")]);
-		let exported_key = canonical_bytes(&servlet("ping"));
-		let hidden_key = canonical_bytes(&servlet("ledger"));
-		assert!(slate_exported(Some(&exports), &exported_key));
-		assert!(!slate_exported(Some(&exports), &hidden_key));
+	fn dynamic_allowlist_mutation_visible_to_verdict_and_keys() {
+		let list = DynamicExportList::new([servlet("ping")]);
+		let ledger = servlet("ledger");
+		let ledger_key = canonical_bytes(&ledger);
+
+		assert_eq!(
+			export_verdict(Some(&list), None, None, &ledger, None, true),
+			TransitStatus::PermissionDenied
+		);
+		assert!(!list.allows_canonical(&ledger_key));
+
+		list.insert(ledger.clone());
+
+		assert_eq!(export_verdict(Some(&list), None, None, &ledger, None, true), TransitStatus::Ok);
+		assert!(list.allows_canonical(&ledger_key));
+
+		list.remove(&ledger);
+
+		assert_eq!(
+			export_verdict(Some(&list), None, None, &ledger, None, true),
+			TransitStatus::PermissionDenied
+		);
+		assert!(!list.allows_canonical(&ledger_key));
 	}
 
 	#[test]
-	fn missing_export_list_exports_all() {
-		let key = canonical_bytes(&servlet("ledger"));
-		assert!(slate_exported(None, &key));
+	fn static_list_filters_slate_to_exported_keys() {
+		let exports = static_list([servlet("ping")]);
+		assert!(exports.allows_canonical(&canonical_bytes(&servlet("ping"))));
+		assert!(!exports.allows_canonical(&canonical_bytes(&servlet("ledger"))));
+	}
+
+	struct ContainsOnlyList(Urn<'static>);
+
+	impl ExportAllowlist for ContainsOnlyList {
+		fn contains(&self, target: &Urn<'_>) -> bool {
+			&self.0 == target
+		}
+	}
+
+	#[test]
+	fn default_canonical_lookup_delegates_to_contains() {
+		let list = ContainsOnlyList(servlet("ping"));
+		assert!(list.allows_canonical(&canonical_bytes(&servlet("ping"))));
+		assert!(!list.allows_canonical(&canonical_bytes(&servlet("ledger"))));
+		assert!(!list.allows_canonical(&[0xFF]));
 	}
 
 	struct GrantTarget;
