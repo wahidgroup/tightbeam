@@ -167,6 +167,7 @@ impl StreamRoute {
 	/// budget. A gateway stamps this when it re-emits a client stream
 	/// to a peer gateway with the budget decremented. A `0` budget is
 	/// served locally and never re-forwarded.
+	#[cfg(feature = "colony")]
 	pub(crate) fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> Self {
 		Self { target: Some(target), hops_remaining }
 	}

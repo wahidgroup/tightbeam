@@ -75,10 +75,11 @@ pooled_mux! {
 	use crate::runtime::rt;
 	use crate::utils::marker::MaybeSend;
 	use crate::transport::handshake::receipt::StoredReceipt;
-	use crate::transport::multiplex::{
-		MuxCapable, MuxConnector, MuxHandle, MuxRole, RequestSink, StreamBody, StreamRoute,
-	};
+	use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxHandle, MuxRole, RequestSink, StreamBody};
 	use crate::transport::serve::drive_mux;
+
+	#[cfg(feature = "colony")]
+	use crate::transport::multiplex::StreamRoute;
 }
 
 /// Shared builder surface for direct clients and connection pools.
@@ -1152,6 +1153,7 @@ pooled_mux! {
 		///
 		/// # Errors
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		#[cfg(feature = "colony")]
 		pub(crate) fn open_stream_with_route(
 			&self,
 			route: StreamRoute,
@@ -1199,6 +1201,7 @@ pooled_mux! {
 		///
 		/// # Errors
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		#[cfg(feature = "colony")]
 		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
 			lease.stamp();

@@ -597,8 +597,8 @@ mod tests {
 		let (handle, mut sent) = duplex_handle();
 		let target = Urn::new("tb", "servlet:ledger");
 		let (sink, _response) = handle.open_stream_to(target.clone())?;
-		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 
+		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
 			sent.try_recv(),
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
@@ -608,16 +608,15 @@ mod tests {
 		Ok(())
 	}
 
-	// A relayed route stamps the target and the spent budget on the
-	// Open, so a peer gateway serves it locally and never re-forwards
-	// it.
+	// An explicit spent budget on the Open is served locally and
+	// never re-forwarded by a peer gateway.
 	#[test]
 	fn test_open_stream_with_relayed_route_stamps_budget() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
 		let target = Urn::new("tb", "servlet:ledger");
-		let (sink, _response) = handle.open_stream_with_route(StreamRoute::relayed_to(target.clone(), 0))?;
-		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
+		let (sink, _response) = handle.open_stream_with_route(StreamRoute::from_parts(Some(target.clone()), 0))?;
 
+		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
 			sent.try_recv(),
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
@@ -633,8 +632,8 @@ mod tests {
 	fn test_open_stream_local_open_has_no_route() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
 		let (sink, _response) = handle.open_stream()?;
-		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 
+		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
 			sent.try_recv(),
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Open(package))))
