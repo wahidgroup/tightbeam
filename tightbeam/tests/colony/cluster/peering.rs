@@ -371,17 +371,22 @@ tb_scenario! {
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
-			start_cluster(&trace, peering_cluster_conf(&certs)).await
+			// Hive-plane frames below sign with the hive-plane identity,
+			// which the split trust holds beside the gateway identity.
+			let mut conf = peering_cluster_conf(&certs);
+			conf.tls.hive_trust = Some(split_hive_trust(&certs));
+			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let hive_addr = b"127.0.0.1:65031".as_slice();
 			let locator = String::from_utf8_lossy(PEER_GATEWAY_ADDR);
+			let hive_id = hive_plane_certs();
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
-			register_signed_hive(&mut client, &certs.key, b"reg-conflict", hive_addr).await?;
+			register_signed_hive(&mut client, &hive_id.key, b"reg-conflict", hive_addr).await?;
 			emit_servlet_update(
 				&mut client,
-				&certs.key,
+				&hive_id.key,
 				b"add-conflict",
 				servlet_address_update(hive_addr, vec![servlet_info("ping", PEER_GATEWAY_ADDR)], vec![]),
 			)
@@ -397,7 +402,7 @@ tb_scenario! {
 			send_advertisement_frame(&trace, &certs, &cluster, frame.to_owned()).await?;
 			emit_servlet_update(
 				&mut client,
-				&certs.key,
+				&hive_id.key,
 				b"del-conflict",
 				servlet_address_update(hive_addr, vec![], vec![servlet_instance(&servlet_urn("ping"), locator.as_ref())]),
 			)
@@ -569,18 +574,23 @@ tb_scenario! {
 	spec: ClusterPeerCollideSpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		start: |SetupEnv { trace, context: _ }| start_ping_hive(trace, hive_plane_certs(), None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let conf = peering_cluster_conf(&certs);
+			let mut conf = peering_cluster_conf(&certs);
+			conf.tls.hive_trust = Some(split_hive_trust(&certs));
+
 			let table = Arc::clone(&conf.peer.table);
 			let cluster = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(cluster.addr()).await?;
 
+			// The update must present the registered signer, so it signs
+			// with the hive-plane identity.
 			let hive_addr = hive.addr().to_string().into_bytes();
+			let hive_id = hive_plane_certs();
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			emit_servlet_update(
 				&mut client,
-				&certs.key,
+				&hive_id.key,
 				b"collide-local",
 				servlet_address_update(&hive_addr, vec![servlet_info("ping", PEER_GATEWAY_ADDR)], vec![]),
 			)
@@ -729,9 +739,12 @@ tb_scenario! {
 		.build(),
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		start: |SetupEnv { trace, context: _ }| start_ping_hive(trace, hive_plane_certs(), None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
-			let importer = start_cluster(&trace, containment_cluster_conf(&certs)).await?;
+			let mut conf = containment_cluster_conf(&certs);
+			conf.tls.hive_trust = Some(split_hive_trust(&certs));
+
+			let importer = start_cluster(&trace, conf).await?;
 
 			install_ping_peer(&trace, &certs, &importer).await?;
 
@@ -785,9 +798,10 @@ tb_scenario! {
 	spec: ClusterPeerLocalitySpec,
 	environment Hive {
 		context: cluster_certs(),
-		start: |SetupEnv { trace, context: certs }| start_ping_hive(trace, certs, None),
+		start: |SetupEnv { trace, context: _ }| start_ping_hive(trace, hive_plane_certs(), None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut local_conf = peering_cluster_conf(&certs);
+			local_conf.tls.hive_trust = Some(split_hive_trust(&certs));
 			local_conf.load_balancer = Arc::new(StochasticForager::with_seed(0x7F0));
 			let local_gateway = start_cluster(&trace, local_conf).await?;
 

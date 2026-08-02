@@ -1,6 +1,16 @@
-//! Integration tests for Cluster environment
+//! Integration tests for the colony cluster environment.
 //!
-//! Tests the Cluster lifecycle with hive registration and work routing.
+//! These scenarios exercise hive registration, work routing, peering,
+//! federation, gossip, streaming, and the servlet export boundary. Each
+//! submodule owns one concern and shares fixtures through [common].
+//!
+//! # Modules
+//!
+//! - [`exports`]: servlet export boundary (discoverability and enforcement)
+//! - [`federation`], [`peering`], [`gossip`]: peer federation and soft state
+//! - [`registration`], [`routing`], [`topology`]: hive lifecycle and trails
+//! - [`streaming`]: routed stream and duplex opens
+//! - [`organizations`]: multi-org trust layouts
 
 #![cfg(all(
 	feature = "std",
@@ -14,6 +24,7 @@
 
 mod common;
 mod events;
+mod exports;
 mod federation;
 mod gossip;
 mod organizations;

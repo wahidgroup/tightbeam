@@ -43,6 +43,12 @@ struct MultiOrgCtx {
 	foreign: Arc<ClusterTestCerts>,
 	rogue_key: Secp256k1SigningKey,
 	stranger_key: Secp256k1SigningKey,
+	/// Peer-plane stores per gateway, excluding the gateway's own
+	/// identity: peer membership wins on the hive plane, so a member's
+	/// hive registrations must not verify on its own peer store.
+	peers_of_entry: Arc<dyn CertificateTrust>,
+	peers_of_origin: Arc<dyn CertificateTrust>,
+	peers_of_foreign: Arc<dyn CertificateTrust>,
 }
 
 fn multi_org_ctx() -> MultiOrgCtx {
@@ -60,6 +66,9 @@ fn multi_org_ctx() -> MultiOrgCtx {
 	let stranger_cert = create_test_certificate(&raw_stranger);
 
 	let trust = combined_trust(&[&cert_entry, &cert_origin, &cert_foreign, &cert_rogue, &stranger_cert]);
+	let peers_of_entry = combined_trust(&[&cert_origin, &cert_foreign, &cert_rogue, &stranger_cert]);
+	let peers_of_origin = combined_trust(&[&cert_entry, &cert_foreign, &cert_rogue, &stranger_cert]);
+	let peers_of_foreign = combined_trust(&[&cert_entry, &cert_origin, &cert_rogue, &stranger_cert]);
 
 	MultiOrgCtx {
 		entry: Arc::new(GatewayCerts { cert: cert_entry, key: key_entry, trust: Arc::clone(&trust) }),
@@ -67,6 +76,9 @@ fn multi_org_ctx() -> MultiOrgCtx {
 		foreign: Arc::new(GatewayCerts { cert: cert_foreign, key: foreign_key, trust }),
 		rogue_key,
 		stranger_key: Secp256k1SigningKey::from(raw_stranger),
+		peers_of_entry,
+		peers_of_origin,
+		peers_of_foreign,
 	}
 }
 
@@ -76,8 +88,8 @@ fn multi_org_ctx() -> MultiOrgCtx {
 /// concurrently, so a rumor can land after a fresher direct ad and
 /// drop as stale. The scenario injects every control-plane frame
 /// instead, which keeps the trace exact for the refinements below.
-fn quiet_member_conf(certs: &ClusterTestCerts) -> ClusterConfig {
-	let mut conf = federation_conf(certs, vec![], 1);
+fn quiet_member_conf(certs: &ClusterTestCerts, peer_trust: Arc<dyn CertificateTrust>) -> ClusterConfig {
+	let mut conf = federation_conf(certs, peer_trust, vec![], 1);
 	conf.peer.advertise_interval = None;
 	conf
 }
@@ -205,8 +217,8 @@ tb_scenario! {
 			start_ping_hive(trace, Arc::clone(&ctx.origin), None).await
 		},
 		client: |HiveEnv { trace, context: ctx, hive }| async move {
-			let gateway_origin = start_cluster(&trace, quiet_member_conf(&ctx.origin)).await?;
-			let gateway_entry = start_cluster(&trace, quiet_member_conf(&ctx.entry)).await?;
+			let gateway_origin = start_cluster(&trace, quiet_member_conf(&ctx.origin, Arc::clone(&ctx.peers_of_origin))).await?;
+			let gateway_entry = start_cluster(&trace, quiet_member_conf(&ctx.entry, Arc::clone(&ctx.peers_of_entry))).await?;
 
 			hive.register_with_cluster(gateway_origin.addr()).await?;
 
@@ -318,10 +330,10 @@ tb_scenario! {
 	environment Cluster {
 		context: multi_org_ctx(),
 		start: |SetupEnv { trace, context: ctx }| async move {
-			start_cluster(&trace, quiet_member_conf(&ctx.entry)).await
+			start_cluster(&trace, quiet_member_conf(&ctx.entry, Arc::clone(&ctx.peers_of_entry))).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			let foreign_conf = federation_conf(&ctx.foreign, vec![cluster.addr().to_string()], 1);
+			let foreign_conf = federation_conf(&ctx.foreign, Arc::clone(&ctx.peers_of_foreign), vec![cluster.addr().to_string()], 1);
 			let gateway_foreign = start_cluster(&trace, foreign_conf).await?;
 
 			// No public state changes at the entry (that is the

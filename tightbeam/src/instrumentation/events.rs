@@ -1,8 +1,17 @@
 //! Event URN constants for tightbeam instrumentation events.
 //!
-//! The single system-wide inventory: one URN per emit site or event kind,
-//! domain-scoped in the NSS so identities never collide.
-//! Format: `urn:tightbeam:event:<domain>/<event-name>`
+//! The single system-wide inventory assigns one URN per emit site or event
+//! kind. Domain-scoped NSS segments keep identities from colliding across
+//! subsystems.
+//!
+//! # Format
+//!
+//! `urn:tightbeam:event:<domain>/<event-name>`
+//!
+//! # Organization
+//!
+//! Short section headers group related constants by plane. Names are
+//! self-explanatory; section blocks do not restate each symbol.
 
 use crate::utils::urn::Urn;
 
@@ -14,9 +23,7 @@ pub const END: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:core/end");
 pub const WARN: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:core/warn");
 pub const ERROR: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:core/error");
 
-// Trace clock origin (UNIX epoch ns in the label). Emitted once per
-// collector so relative `timestamp_ns` values reconstruct to absolute
-// times.
+// Trace clock origin events
 pub const TRACE_CLOCK_ORIGIN: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:trace/clock-origin");
 
 // Gate events
@@ -115,14 +122,10 @@ pub const SESSION_RECEIPT_SETTLED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event
 pub const SESSION_RECEIPT_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:session/receipt-refused");
 pub const SESSION_CERT_REJECTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:session/cert-rejected");
 
-// Hive lifecycle: the anti-entropy beat re-announces the hive's servlet
-// slate to every registered gateway. The event value is the gateway's
-// response status (`Unavailable` when the gateway was unreachable).
+// Hive lifecycle events
 pub const HIVE_REREGISTERED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:hive/reregistered");
 
-// Cluster gateway lifecycle: every accept/refuse decision the gateway
-// makes fires exactly one event, so audits and scenario specs observe
-// what the cluster did rather than re-deriving it from responses.
+// Cluster gateway events
 pub const CLUSTER_GATE_BLOCKED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gate-blocked");
 pub const CLUSTER_HIVE_REGISTERED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/hive-registered");
 pub const CLUSTER_REGISTER_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/register-refused");
@@ -134,17 +137,30 @@ pub const CLUSTER_WORK_UNAVAILABLE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "even
 pub const CLUSTER_WORK_FAILED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-failed");
 pub const CLUSTER_WORK_FORWARDED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/work-forwarded");
 pub const CLUSTER_HIVE_EVICTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/hive-evicted");
+
+// Cluster export events
+pub const CLUSTER_EXPORT_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/export-refused");
+pub const CLUSTER_EXPORT_GRANTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/export-granted");
+pub const CLUSTER_EXPORT_UNBOUNDED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/export-unbounded");
+pub const CLUSTER_EXPORT_IDENTITY_UNAVAILABLE: Urn<'static> =
+	Urn::new(TIGHTBEAM_NID, "event:cluster/export-identity-unavailable");
+
+// Cluster peer advertisement events
 pub const CLUSTER_PEER_ADVERTISED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-advertised");
 pub const CLUSTER_PEER_AD_LEARNED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-ad-learned");
 pub const CLUSTER_PEER_AD_DROPPED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-ad-dropped");
 pub const CLUSTER_PEER_AD_PUBLISH_FAILED: Urn<'static> =
 	Urn::new(TIGHTBEAM_NID, "event:cluster/peer-ad-publish-failed");
-pub const CLUSTER_RELAY_TRAIL_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/relay-trail-refused");
-pub const CLUSTER_RELAY_TRAIL_PRUNED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/relay-trail-pruned");
 pub const CLUSTER_PEER_DISCOVERED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-discovered");
 pub const CLUSTER_PEER_EVICTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/peer-evicted");
 pub const CLUSTER_PEER_ADVERTISE_REFUSED: Urn<'static> =
 	Urn::new(TIGHTBEAM_NID, "event:cluster/peer-advertise-refused");
+
+// Cluster relay events
+pub const CLUSTER_RELAY_TRAIL_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/relay-trail-refused");
+pub const CLUSTER_RELAY_TRAIL_PRUNED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/relay-trail-pruned");
+
+// Cluster gossip events
 pub const CLUSTER_GOSSIP_ACCEPTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-accepted");
 pub const CLUSTER_GOSSIP_DUPLICATE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-duplicate");
 pub const CLUSTER_GOSSIP_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-refused");

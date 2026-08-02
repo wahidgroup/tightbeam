@@ -3011,7 +3011,7 @@ Clusters require TLS configuration for secure communication with hives and, when
 let tls = ClusterTlsConfig {
 	certificate: CertificateSpec::Built(Box::new(cert)),
 	key: Arc::new(Secp256k1KeyProvider::from(key)),
-	validators: vec![],         // Optional: validators for hive certificates
+	validators: vec![],         // Optional: extra checks on dialed server certs (both planes)
 	client_validators: vec![],  // Non-empty: gateway requires client certs (mTLS)
 	hive_trust: Some(hive_trust),  // Hive-plane: registration, address updates, PublishGossip
 	peer_trust: Some(peer_trust),  // Peer-plane: AdvertisePeer, relayed Gossip, ReconcileGossip
@@ -3064,6 +3064,125 @@ Behavior:
 Member gateways also flood their slate as an advertisement rumor, so peers of peers learn exported types transitively. A relayed rumor installs two soft-state trails. The direct trail dials the origin's claimed address. The relay trail dials the delivering peer and reconciles under its own composite bucket.
 
 The relay trail competes for selection only when the remaining hop budget covers the extra hop (`max_hops >= 2`). A dead direct address then fails over to it by pheromone weakening. The rumor refloods on change, or every `PeerConfig::rumor_refresh` while unchanged.
+
+##### Servlet Export Boundary
+
+By default a federated gateway advertises and serves every locally registered servlet type. The export boundary restricts what crosses the organization edge.
+
+**Planes**
+
+- **Discoverability**: the advertise beat filters the slate through `PeerConfig::exported_types`, so direct ads and slate rumors never disclose unexported types.
+- **Enforcement**: unary Work requests and routed stream opens evaluate the export boundary where the servlet target is known. A peer that guesses a type name is refused unless a grant opens that target (`PermissionDenied`, traced as `CLUSTER_EXPORT_REFUSED`).
+
+The enforcement pipeline layers these checks in order:
+
+1. Session gate policies (`with_gate_policy`) before the request envelope is decoded.
+2. Built-in allowlist from `exported_types`.
+3. Positive `ExportGrant` widening when the allowlist refuses.
+4. Custom `ExportGate` intersection (a deny gate overrides a grant).
+5. The servlet handles the request.
+
+```rust
+let conf = ClusterConfig::builder(tls)
+	.with_peers([peer_addr.to_string()])
+	.with_advertise_interval(Duration::from_secs(5))
+	// Advertise and export only these types to external peers
+	.with_exported_types([namespace.servlet("ping")?])
+	.build();
+```
+
+**Allowlist**
+
+`with_exported_types` drives a fail-closed built-in allowlist. Enforcement reads the live configuration on each request, so the two planes never drift. The allowlist rules apply in order:
+
+1. An exported target passes for everyone.
+2. An unexported relayed request is refused. The hop marker (`hops_remaining` below the origin sentinel) is unauthenticated defense in depth. The identity rule below is the control that holds against a forged budget.
+3. An unexported origin request passes only for a first-party session: not relayed, a member of `hive_trust`, and not of `peer_trust`.
+4. Any other unexported request is refused (external peers, sessions in neither store, and anonymous sessions).
+
+When the allowlist refuses, a matching `ExportGrant` may still allow the target before deny gates run.
+
+**Grants**
+
+`ExportGrant` opens one unexported target to selected caller identities. A target passes when it is exported, granted, or a first-party origin request, and every deny gate must then agree.
+
+```rust
+struct PartnerGrant {
+	granted_spki: Vec<u8>,
+	target: Urn<'static>,
+}
+
+impl ExportGrant for PartnerGrant {
+	fn grants(&self, target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> bool {
+		*target == self.target && session.peer_public_key() == Some(self.granted_spki.as_slice())
+	}
+}
+
+let conf = ClusterConfig::builder(tls)
+	.with_exported_types([namespace.servlet("search")?])
+	// Partner B may reach "ledger" without it being advertised
+	.with_export_grant(Arc::new(PartnerGrant { granted_spki, target: namespace.servlet("ledger")? }))
+	.build();
+```
+
+Grant semantics:
+
+- The granted subject is the adjacent authenticated principal. On a relayed request that principal is the relaying peer gateway, so a grant matching a relayed request expresses federation-level trust in that gateway. Conservative grants test `!relayed`.
+- A granted type never appears on the advertised slate. It is a private interface whose URN the grantee learns out of band.
+- Do not emulate a grant by exporting the type and denying everyone except the partner. That workaround is fail-open (a forgotten gate opens the type to every peer) and it advertises the type to the whole federation.
+
+**Custom gates**
+
+Granular per-identity rules compose through custom gates:
+
+1. Every gate must pass (intersection with the allow sources).
+2. A deny gate overrides a grant.
+3. `session_is_first_party` exposes the built-in classifier for reuse.
+
+```rust
+struct DenyPeerKeyGate {
+	denied_spki: Vec<u8>,
+	target: Urn<'static>,
+}
+
+impl ExportGate for DenyPeerKeyGate {
+	fn evaluate(&self, target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> TransitStatus {
+		if *target == self.target && session.peer_public_key() == Some(self.denied_spki.as_slice()) {
+			return TransitStatus::PermissionDenied;
+		}
+
+		TransitStatus::Ok
+	}
+}
+
+let conf = ClusterConfig::builder(tls)
+	.with_exported_types([namespace.servlet("ping")?])
+	.with_export_gate(Arc::new(DenyPeerKeyGate { denied_spki, target: namespace.servlet("ping")? }))
+	.build();
+```
+
+**Mutual TLS**
+
+First-party recognition requires mutual TLS. The accept plane stores a session certificate only when `ClusterTlsConfig::client_validators` is configured. Without that, every session is anonymous, so an export list also blocks unexported targets on the origin plane. The gateway traces `CLUSTER_EXPORT_IDENTITY_UNAVAILABLE` once at start when an export list is set but client identity is not captured (`client_validators` empty or `hive_trust` missing).
+
+**Configuration**
+
+- `None` (the default) exports every locally served type. A federated gateway (`peer_trust` set or a non-empty peer dial list) in that posture traces `CLUSTER_EXPORT_UNBOUNDED` once at start.
+- An empty list advertises nothing and leaves unexported targets to first-party origin callers only.
+
+**Advertisements and peer precedence**
+
+- Advertisements are filtered only by the static `exported_types` list. Custom gates and grants cannot alter ads, because ads are minted per beat rather than per session.
+- Peer membership wins. A certificate in `peer_trust` is never first-party, even when `hive_trust` also holds it, so an identity in both stores cannot escalate to unexported targets.
+- The same precedence guards the hive plane. A control frame whose signer is in `peer_trust` is refused there, so a certificate in both stores cannot register hives.
+
+**Auditing**
+
+A refusal traces `CLUSTER_EXPORT_REFUSED` with the caller certificate fingerprint as payload and the relayed flag as value. Audits attribute the refusal to a principal and can infer hop-marker versus origin-plane refusal from that flag. A deciding grant traces `CLUSTER_EXPORT_GRANTED` under the same convention, so widened access stays attributable.
+
+**Gossip ingress**
+
+The gossip ingress sink (`GossipConfig::ingress`) sits outside the export boundary. Colony scope and the origin signature gate which peers may flood a rumor, and the operator, not the peer, chooses the delivery type.
 
 ##### Heartbeat Mechanism
 
@@ -3165,6 +3284,10 @@ pub struct PeerConfig {
 	/// Advertisement rumor reflood interval while the slate is unchanged
 	/// (keep it under the gossip freshness window)
 	pub rumor_refresh: Duration,
+	/// Servlet types disclosed to and reachable by external peers.
+	/// `None` exports every locally served type. `Some` drives both the
+	/// advertise filter and the fail-closed allowlist.
+	pub exported_types: Option<Vec<Urn<'static>>>,
 }
 
 pub struct ClusterConfig {
@@ -3185,6 +3308,12 @@ pub struct ClusterConfig {
 	pub pheromone: PheromoneConfig,
 	/// Gate policies evaluated on every gateway frame before decoding
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	/// Custom export gates evaluated where the servlet target is known.
+	/// They compose with the allow sources as intersection.
+	pub export_gates: Vec<Arc<dyn ExportGate>>,
+	/// Positive export grants evaluated when the allowlist refuses.
+	/// Allow sources compose as union. Deny gates still override.
+	pub export_grants: Vec<Arc<dyn ExportGrant>>,
 	/// Connection pool configuration for hive (and peer) connections
 	pub pool_config: PoolConfig,
 

@@ -1,4 +1,8 @@
-//! X.509 certificate test helpers
+//! X.509 certificate test helpers.
+//!
+//! These fixtures mint gateway identities and multi-anchor trust stores for
+//! colony transport and federation tests, including split-plane export
+//! scenarios that need distinct organizations and mutual TLS.
 
 #![allow(dead_code)]
 
@@ -61,8 +65,9 @@ pub fn create_server_config(
 	TransportEncryptionConfig::new(cert, key_manager).with_client_validators(validators)
 }
 
-/// Self-signed gateway materials shared by colony transport tests: one
-/// certificate serves as identity and trust anchor for cluster, hive,
+/// Self-signed gateway materials shared by colony transport tests.
+///
+/// One certificate serves as identity and trust anchor for cluster, hive,
 /// and servlet endpoints alike.
 pub struct GatewayCerts {
 	pub cert: Certificate,
@@ -83,10 +88,12 @@ impl GatewayCerts {
 		Self { cert, key, trust }
 	}
 
-	/// Generate a colony-member gateway identity: the certificate carries
-	/// `colony_urn` as a URI Subject Alternative Name (RFC 5280 §4.2.1.6)
-	/// with an empty subject, so membership provably binds to the SAN
-	/// alone. Colony membership gates gossip and peer federation.
+	/// Generate a colony-member gateway identity.
+	///
+	/// The certificate carries `colony_urn` as a URI Subject Alternative Name
+	/// (RFC 5280 section 4.2.1.6) with an empty subject, so membership
+	/// provably binds to the SAN alone. Colony membership gates gossip and
+	/// peer federation.
 	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
 		let raw = create_test_signing_key();
 		let cert = create_test_certificate_with_uri_sans(&raw, &[&colony_urn.to_string()]);
@@ -96,9 +103,8 @@ impl GatewayCerts {
 	}
 }
 
-/// Trust store anchoring several independent identities at once (multi-peer
-/// federation tests).
-pub fn combined_trust(certs: &[&Certificate]) -> Arc<dyn CertificateTrust> {
+/// Trust builder anchoring several independent identities at once.
+fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder<Sha3_256> {
 	let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
 	for cert in certs {
 		builder = builder
@@ -106,7 +112,23 @@ pub fn combined_trust(certs: &[&Certificate]) -> Arc<dyn CertificateTrust> {
 			.expect("Failed to anchor combined trust");
 	}
 
-	Arc::new(builder.build())
+	builder
+}
+
+/// Trust store anchoring several independent identities at once.
+///
+/// Used by multi-peer federation and split-plane export tests.
+pub fn combined_trust(certs: &[&Certificate]) -> Arc<dyn CertificateTrust> {
+	Arc::new(combined_trust_builder(certs).build())
+}
+
+/// Client-certificate validator anchoring several identities at once.
+///
+/// Used on the inbound mutual-TLS accept plane
+/// (`ClusterTlsConfig::client_validators`). Export scenarios turn this on so
+/// the gateway can recognize first-party origin sessions.
+pub fn combined_validator(certs: &[&Certificate]) -> Arc<dyn CertificateValidation> {
+	Arc::new(combined_trust_builder(certs).build())
 }
 
 /// Extract Common Name (CN) from certificate subject

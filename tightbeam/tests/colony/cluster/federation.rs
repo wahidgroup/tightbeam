@@ -12,13 +12,21 @@ use tightbeam::colony::cluster::{ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAUL
 /// Dial address nothing listens on: a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
 
-/// Three distinct colony-member identities under one combined trust
-/// store (see [`member_identity`] for why [`cluster_certs`] cannot
-/// serve here: relay trails refuse self-relay).
+/// Three distinct colony-member identities (see [`member_identity`]
+/// for why [`cluster_certs`] cannot serve here: relay trails refuse
+/// self-relay).
+///
+/// The combined store on `.trust` serves the hive and dial planes.
+/// Each gateway's peer store excludes its own identity: peer membership
+/// wins on the hive plane, so a member's hive registrations must not
+/// verify on its own peer store.
 struct FederationCtx {
 	a: Arc<ClusterTestCerts>,
 	b: Arc<ClusterTestCerts>,
 	c: Arc<ClusterTestCerts>,
+	peers_of_a: Arc<dyn CertificateTrust>,
+	peers_of_b: Arc<dyn CertificateTrust>,
+	peers_of_c: Arc<dyn CertificateTrust>,
 }
 
 fn federation_ctx() -> FederationCtx {
@@ -26,20 +34,30 @@ fn federation_ctx() -> FederationCtx {
 	let (cert_b, key_b) = member_identity("Gateway B");
 	let (cert_c, key_c) = member_identity("Gateway C");
 	let trust = combined_trust(&[&cert_a, &cert_b, &cert_c]);
+	let peers_of_a = combined_trust(&[&cert_b, &cert_c]);
+	let peers_of_b = combined_trust(&[&cert_a, &cert_c]);
+	let peers_of_c = combined_trust(&[&cert_a, &cert_b]);
 
 	FederationCtx {
 		a: Arc::new(GatewayCerts { cert: cert_a, key: key_a, trust: Arc::clone(&trust) }),
 		b: Arc::new(GatewayCerts { cert: cert_b, key: key_b, trust: Arc::clone(&trust) }),
 		c: Arc::new(GatewayCerts { cert: cert_c, key: key_c, trust }),
+		peers_of_a,
+		peers_of_b,
+		peers_of_c,
 	}
 }
 
-/// Member gateway conf on a fast beat: `peers` as anchors, the shared
-/// combined store on both trust planes, and a fast rumor refresh so
-/// late-promoted flood targets still learn the slate within the test
-/// window.
-pub(super) fn federation_conf(certs: &ClusterTestCerts, peers: Vec<String>, max_hops: u8) -> ClusterConfig {
-	let tls = ClusterTlsConfig { peer_trust: Some(Arc::clone(&certs.trust)), ..cluster_tls_config(certs) };
+/// Member gateway conf on a fast beat: `peers` as anchors, the given
+/// peer-plane store, and a fast rumor refresh so late-promoted flood
+/// targets still learn the slate within the test window.
+pub(super) fn federation_conf(
+	certs: &ClusterTestCerts,
+	peer_trust: Arc<dyn CertificateTrust>,
+	peers: Vec<String>,
+	max_hops: u8,
+) -> ClusterConfig {
+	let tls = ClusterTlsConfig { peer_trust: Some(peer_trust), ..cluster_tls_config(certs) };
 
 	ClusterConfig::builder(tls)
 		.with_peers(peers)
@@ -51,8 +69,13 @@ pub(super) fn federation_conf(certs: &ClusterTestCerts, peers: Vec<String>, max_
 
 /// [`federation_conf`] with a mux offer, so the gateway serves routed
 /// streams and its pools open them.
-fn mux_federation_conf(certs: &ClusterTestCerts, peers: Vec<String>, max_hops: u8) -> ClusterConfig {
-	with_mux_offer(federation_conf(certs, peers, max_hops))
+fn mux_federation_conf(
+	certs: &ClusterTestCerts,
+	peer_trust: Arc<dyn CertificateTrust>,
+	peers: Vec<String>,
+	max_hops: u8,
+) -> ClusterConfig {
+	with_mux_offer(federation_conf(certs, peer_trust, peers, max_hops))
 }
 
 /// Hive hosting the ping servlet under a distinct "beacon" type, so a
@@ -225,13 +248,13 @@ tb_scenario! {
 			start_ping_hive(trace, Arc::clone(&ctx.c), None).await
 		},
 		client: |HiveEnv { trace, context: ctx, hive }| async move {
-			let gateway_b = start_cluster(&trace, federation_conf(&ctx.b, vec![], 1)).await?;
+			let gateway_b = start_cluster(&trace, federation_conf(&ctx.b, Arc::clone(&ctx.peers_of_b), vec![], 1)).await?;
 
-			let mut conf_c = federation_conf(&ctx.c, vec![gateway_b.addr().to_string()], 1);
+			let mut conf_c = federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![gateway_b.addr().to_string()], 1);
 			conf_c.peer.peer_dial_allowlist = Some(vec![gateway_b.addr().to_string()]);
-			let gateway_c = start_cluster(&trace, conf_c).await?;
 
-			let gateway_a = start_cluster(&trace, federation_conf(&ctx.a, vec![gateway_b.addr().to_string()], 1)).await?;
+			let gateway_c = start_cluster(&trace, conf_c).await?;
+			let gateway_a = start_cluster(&trace, federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![gateway_b.addr().to_string()], 1)).await?;
 
 			hive.register_with_cluster(gateway_c.addr()).await?;
 
@@ -296,19 +319,20 @@ tb_scenario! {
 			start_ping_hive(trace, Arc::clone(&ctx.c), None).await
 		},
 		client: |HiveEnv { trace, context: ctx, hive }| async move {
-			let gateway_b = start_cluster(&trace, federation_conf(&ctx.b, vec![], 1)).await?;
+			let gateway_b = start_cluster(&trace, federation_conf(&ctx.b, Arc::clone(&ctx.peers_of_b), vec![], 1)).await?;
 			let beacon_hive = start_beacon_hive(trace.share(), Arc::clone(&ctx.b)).await?;
 			beacon_hive.register_with_cluster(gateway_b.addr()).await?;
 
 			// C serves ping at its real address but never advertises on
 			// its own: the test injects both of C's advertisements, so
 			// the dead claim at A can never be repaired by a fresh one.
-			let mut conf_c = federation_conf(&ctx.c, vec![], 1);
+			let mut conf_c = federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![], 1);
 			conf_c.peer.advertise_interval = None;
+
 			let gateway_c = start_cluster(&trace, conf_c).await?;
 			hive.register_with_cluster(gateway_c.addr()).await?;
 
-			let gateway_a = start_cluster(&trace, federation_conf(&ctx.a, vec![gateway_b.addr().to_string()], 2)).await?;
+			let gateway_a = start_cluster(&trace, federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![gateway_b.addr().to_string()], 2)).await?;
 
 			// Flood until A holds both trails: the dead direct and the
 			// relay via B.
@@ -367,11 +391,10 @@ tb_assert_spec! {
 //
 // - A holds a dead direct trail and a relay trail through B, and B
 //   holds C's true address.
-// - A's splice spends its clamped budget of two. A dead direct pick
-//   fails at dial and the bounded retry crosses the relay trail,
-//   while a relay pick crosses it immediately. Two forwards prove the two-hop
-//   splice, and the servlet handling proves the body crossed both
-//   hops intact.
+// - A's splice spends its clamped budget of two. A dead direct pick fails
+//   at dial and the bounded retry crosses the relay trail, while a relay
+//   pick crosses it immediately. Two forwards prove the two-hop splice,
+//   and the servlet handling proves the body crossed both hops intact.
 tb_scenario! {
 	name: cluster_relay_trail_carries_stream_around_dead_origin_addr,
 	spec: ClusterStreamRelayFallbackSpec,
@@ -381,7 +404,7 @@ tb_scenario! {
 			start_stream_hive(trace, Arc::clone(&ctx.c)).await
 		},
 		client: |HiveEnv { trace, context: ctx, hive }| async move {
-			let gateway_b = start_cluster(&trace, mux_federation_conf(&ctx.b, vec![], 1)).await?;
+			let gateway_b = start_cluster(&trace, mux_federation_conf(&ctx.b, Arc::clone(&ctx.peers_of_b), vec![], 1)).await?;
 			let beacon_hive = start_beacon_hive(trace.share(), Arc::clone(&ctx.b)).await?;
 			beacon_hive.register_with_cluster(gateway_b.addr()).await?;
 
@@ -389,13 +412,14 @@ tb_scenario! {
 			// advertises on its own: the test injects both of C's
 			// advertisements, so the dead claim at A can never be
 			// repaired by a fresh one.
-			let mut conf_c = mux_federation_conf(&ctx.c, vec![], 1);
+			let mut conf_c = mux_federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![], 1);
 			conf_c.peer.advertise_interval = None;
+
 			let gateway_c = start_cluster(&trace, conf_c).await?;
 			hive.register_with_cluster(gateway_c.addr()).await?;
 
 			let gateway_a =
-				start_cluster(&trace, mux_federation_conf(&ctx.a, vec![gateway_b.addr().to_string()], 2)).await?;
+				start_cluster(&trace, mux_federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![gateway_b.addr().to_string()], 2)).await?;
 
 			// Flood until A holds both trails: the dead direct and the
 			// relay via B.
@@ -613,19 +637,21 @@ tb_scenario! {
 			start_ping_hive(trace, Arc::clone(&ctx.c), None).await
 		},
 		client: |HiveEnv { trace, context: ctx, hive }| async move {
-			let mut conf_b = federation_conf(&ctx.b, vec![], 1);
+			let mut conf_b = federation_conf(&ctx.b, Arc::clone(&ctx.peers_of_b), vec![], 1);
 			conf_b.peer.advertise_interval = None;
 			let gateway_b = start_cluster(&trace, conf_b).await?;
 
-			let mut conf_c = federation_conf(&ctx.c, vec![], 1);
+			let mut conf_c = federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![], 1);
 			conf_c.peer.advertise_interval = None;
+
 			let gateway_c = start_cluster(&trace, conf_c).await?;
 			hive.register_with_cluster(gateway_c.addr()).await?;
 
 			let preferred = Arc::new(Mutex::new(None));
-			let mut conf_a = federation_conf(&ctx.a, vec![], 1);
+			let mut conf_a = federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![], 1);
 			conf_a.peer.advertise_interval = None;
 			conf_a.load_balancer = Arc::new(DecoyFirstBalancer { preferred: Arc::clone(&preferred) });
+
 			let gateway_a = start_cluster(&trace, conf_a).await?;
 
 			// Both trails install by injected advertisement: the decoy

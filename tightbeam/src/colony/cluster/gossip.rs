@@ -1,15 +1,23 @@
 //! Gossip admission, content digest, and retention journal.
 //!
-//! - Floods origin-signed rumors across gateways of one colony.
-//! - Local delivery follows the operator ingress policy.
-//! - Forwarding continues while hop time-to-live remains.
+//! Colony gateways flood origin-signed rumors within one colony and
+//! deliver admitted rumors locally according to operator ingress policy.
+//! Forwarding continues while hop time-to-live remains on the outer
+//! relay frame.
+//!
+//! # Colony scope
 //!
 //! Flood scope is colony membership: the origin certificate URI SAN
 //! colony URN MUST equal the local gateway colony URN.
 //!
-//! A rumor is an origin-signed [`Frame`]. The accepting gateway signs once.
-//! Later hops and anti-entropy repair carry those same signed bytes.
-//! Hop radius lives in OUTER relay-frame `metadata.lifetime`.
+//! # Rumor model
+//!
+//! A rumor is an origin-signed [`Frame`]. The accepting gateway signs
+//! once. Later hops and anti-entropy repair carry those same signed bytes.
+//! Hop radius lives in OUTER relay-frame `metadata.lifetime`, not in the
+//! content digest.
+//!
+//! # Admission path
 //!
 //! [`AdmittedGossip`] is the only path from a wire rumor to delivery.
 //! [`GossipJournal`] stores digests for deduplication and retention.
@@ -36,8 +44,8 @@ use crate::{decode, encode};
 
 /// Fixed 32-byte content digest of a gossip rumor.
 ///
-/// Algorithm is the deployment crypto-profile digest.
-/// Every gateway MUST derive the same digest for the same rumor.
+/// Algorithm is the deployment crypto-profile digest. Every gateway MUST
+/// derive the same digest for the same rumor.
 pub type GossipDigest = [u8; 32];
 
 /// Whether a recorded rumor is newly seen or a suppressed duplicate.
@@ -53,6 +61,9 @@ pub enum Admission {
 ///
 /// Coverage includes identity, issue time, payload, and origin signature.
 /// Hop radius lives on the OUTER relay frame and MUST NOT enter the digest.
+///
+/// # Algorithm
+///
 /// Algorithm `D` MUST be the cluster crypto-profile digest (CWE-694).
 pub fn gossip_digest<D>(rumor: &Frame) -> Result<GossipDigest, ClusterError>
 where
@@ -70,9 +81,9 @@ where
 
 /// Digests advertised by a peer that this gateway does not retain.
 ///
-/// Reconciliation is a set difference over content digests.
-/// A repeated advertisement entry appears once in the want list so a peer
-/// cannot inflate the reply by repeating itself (CWE-770).
+/// Reconciliation is a set difference over content digests. A repeated
+/// advertisement entry appears once in the want list so a peer cannot
+/// inflate the reply by repeating itself (CWE-770).
 #[must_use]
 pub fn gossip_want(advertised: &[Vec<u8>], held: &[GossipDigest]) -> Vec<Vec<u8>> {
 	let local: HashSet<&[u8]> = held.iter().map(|digest| digest.as_slice()).collect();
@@ -88,8 +99,9 @@ pub fn gossip_want(advertised: &[Vec<u8>], held: &[GossipDigest]) -> Vec<Vec<u8>
 
 /// Digests from a peer want-list that decode to a fixed 32-byte digest.
 ///
-/// Wrong-length entries cannot be retained digests and are dropped (CWE-20).
-/// Duplicates collapse to one so a peer MUST NOT multiply repair pushes (CWE-770).
+/// Wrong-length entries cannot be retained digests and are dropped
+/// (CWE-20). Duplicates collapse to one so a peer MUST NOT multiply
+/// repair pushes (CWE-770).
 #[must_use]
 pub fn wanted_digests(want: &[Vec<u8>]) -> Vec<GossipDigest> {
 	let mut unique: HashSet<GossipDigest> = HashSet::new();
@@ -123,8 +135,8 @@ pub fn signer_attribution(frame: &Frame) -> Option<Vec<u8>> {
 
 /// Rumor that passed payload, hop-radius, and freshness checks.
 ///
-/// Construct only through [`AdmittedGossip::admit`].
-/// Signature and colony-membership checks run in the gateway handler first.
+/// Construct only through [`AdmittedGossip::admit`]. Signature and
+/// colony-membership checks run in the gateway handler first.
 pub struct AdmittedGossip {
 	digest: GossipDigest,
 	payload: Vec<u8>,
@@ -136,8 +148,12 @@ impl AdmittedGossip {
 	///
 	/// `ttl` is the remaining hop radius from OUTER `metadata.lifetime`.
 	/// Freshness uses rumor `metadata.order` as the signed issue time.
-	/// Refuse decode failure, oversized payload, `ttl` above [`MAX_GOSSIP_TTL`],
-	/// or a stale issue time. Cap hop radius here at the trust boundary (CWE-770).
+	///
+	/// # Refusal
+	///
+	/// Refuse decode failure, oversized payload, `ttl` above
+	/// [`MAX_GOSSIP_TTL`], or a stale issue time. Cap hop radius here at
+	/// the trust boundary (CWE-770).
 	pub fn admit<D>(rumor: &Frame, ttl: u64, seen_ttl_ms: u64, now_ms: u64) -> Result<Self, TransitStatus>
 	where
 		D: Digest + OutputSizeUser<OutputSize = U32>,
@@ -188,9 +204,12 @@ impl AdmittedGossip {
 ///
 /// Consulted after signature verification and before journal record or
 /// reflood. An over-limit signer cannot grow retained state or amplify
-/// traffic (CWE-770). The token-bucket default bounds burst and
-/// sustained rate. A custom implementation may meter on any
-/// signer-derived dimension.
+/// traffic (CWE-770).
+///
+/// # Default
+///
+/// The token-bucket default bounds burst and sustained rate. A custom
+/// implementation may meter on any signer-derived dimension.
 pub trait GossipAdmission: Send + Sync {
 	/// Admit one rumor from `signer` at `now_ms`.
 	///
@@ -207,10 +226,14 @@ struct TokenBucket {
 
 /// In-memory token-bucket [`GossipAdmission`] keyed on the signer.
 ///
-/// Each signer spends one token per rumor from a bucket of `burst` capacity.
-/// The bucket regains one token every `refill_interval`.
+/// Each signer spends one token per rumor from a bucket of `burst`
+/// capacity. The bucket regains one token every `refill_interval`.
 /// Full-capacity buckets carry no state and are pruned on every call.
-/// An unseen signer is refused once the tracked-signer ceiling is reached (CWE-770).
+///
+/// # Signer ceiling
+///
+/// An unseen signer is refused once the tracked-signer ceiling is
+/// reached (CWE-770).
 pub struct TokenBucketAdmission {
 	buckets: Mutex<HashMap<Vec<u8>, TokenBucket>>,
 	burst: u32,
@@ -225,7 +248,9 @@ impl TokenBucketAdmission {
 		Self::with_limits(burst, refill_interval, MAX_GOSSIP_RATE_SIGNERS)
 	}
 
-	/// Burst, refill, and signer ceiling. A zero interval refills once per millisecond.
+	/// Burst, refill, and signer ceiling.
+	///
+	/// A zero interval refills once per millisecond.
 	#[must_use]
 	pub fn with_limits(burst: u32, refill_interval: Duration, capacity: usize) -> Self {
 		Self {
@@ -291,8 +316,8 @@ impl GossipAdmission for TokenBucketAdmission {
 /// Deduplication and retention store for delivery and anti-entropy.
 ///
 /// The gateway calls only this interface. The in-memory default gives
-/// bounded-window eventual delivery. A durable backend can retain
-/// across restarts. Errors are typed [`ClusterError`] variants.
+/// bounded-window eventual delivery. A durable backend can retain across
+/// restarts. Errors are typed [`ClusterError`] variants.
 pub trait GossipJournal: Send + Sync {
 	/// Deduplicate and retain one origin-signed rumor in a single step.
 	///
@@ -312,8 +337,10 @@ pub trait GossipJournal: Send + Sync {
 	/// Deduplicate one ephemeral rumor digest without retaining the rumor.
 	///
 	/// Advertisement-class rumors dedup and loop-break on the seen set
-	/// only. The advertise beat re-publishes fresh state, so repairing
-	/// a stale hint would waste relay bandwidth and retention capacity.
+	/// only. The advertise beat re-publishes fresh state, so repairing a
+	/// stale hint would waste relay bandwidth and retention capacity.
+	///
+	/// # Witnessed digest
 	///
 	/// A witnessed digest:
 	///
@@ -327,11 +354,12 @@ pub trait GossipJournal: Send + Sync {
 
 	/// Whether a digest is already retained or witnessed, without recording it.
 	///
-	/// Probed before rate admission so a duplicate does not spend a
-	/// signer's token: relay echoes are normal and MUST NOT drain the
-	/// bucket. Advisory only. [`GossipJournal::record`] and
-	/// [`GossipJournal::witness`] remain the atomic dedup steps for
-	/// races past the probe.
+	/// Probed before rate admission so a duplicate does not spend a signer's
+	/// token: relay echoes are normal and MUST NOT drain the bucket.
+	///
+	/// Advisory only. [`GossipJournal::record`] and
+	/// [`GossipJournal::witness`] remain the atomic dedup steps for races
+	/// past the probe.
 	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError>;
 
 	/// Digests still inside the retention window, for reconciliation summaries.
@@ -349,8 +377,8 @@ pub trait GossipJournal: Send + Sync {
 	/// Retention horizon in milliseconds.
 	///
 	/// The gateway clamps admission freshness (`seen_ttl`) to this horizon
-	/// at start: a rumor older than retention has no digest left to
-	/// deduplicate against, so a wider window would re-admit a replayed
+	/// at start, because a rumor older than retention has no digest left
+	/// to deduplicate against. A wider window would re-admit a replayed
 	/// rumor as new (CWE-294).
 	fn retention_ms(&self) -> u64;
 }
@@ -364,10 +392,10 @@ struct JournalEntry {
 
 /// What the journal keeps behind a deduplicated digest.
 ///
-/// A retained rumor serves anti-entropy repair and local delivery
-/// retry. A witnessed digest serves dedup only and holds no bytes.
-/// The retained rumor is boxed so a witnessed entry costs one
-/// pointer, never a full inline [`Frame`].
+/// A retained rumor serves anti-entropy repair and local delivery retry.
+/// A witnessed digest serves dedup only and holds no bytes. The retained
+/// rumor is boxed so a witnessed entry costs one pointer, never a full
+/// inline [`Frame`].
 enum JournalBody {
 	Retained { rumor: Box<Frame>, delivered_local: bool },
 	Witnessed,
@@ -377,12 +405,19 @@ enum JournalBody {
 ///
 /// Dedup is global on the content digest: rumor bytes travel unchanged
 /// across relays (only the OUTER hop frame is rebuilt), so the digest
-/// matches wherever the rumor arrives. Per-signer capacity bounds
-/// retained and witnessed entries separately, so one signer's flood
-/// on either plane cannot starve its own other plane. The global cap
-/// is shared across signers and kinds: a memory ceiling, not a
-/// fairness partition. Retention prunes on every read and write in
-/// both clock directions so an aged-out rumor is never returned.
+/// matches wherever the rumor arrives.
+///
+/// # Capacity
+///
+/// Per-signer capacity bounds retained and witnessed entries separately,
+/// so one signer's flood on either plane cannot starve its own other
+/// plane. The global cap is shared across signers and kinds: a memory
+/// ceiling, not a fairness partition.
+///
+/// # Retention
+///
+/// Retention prunes on every read and write in both clock directions so
+/// an aged-out rumor is never returned.
 pub struct MemoryGossipJournal {
 	entries: Mutex<HashMap<GossipDigest, JournalEntry>>,
 	retention_ms: u64,
@@ -423,9 +458,19 @@ pub struct GossipConfig {
 	/// Origin publish hop radius, clamped to [`MAX_GOSSIP_TTL`].
 	pub ttl: u8,
 	/// Servlet type URN admitted rumors are delivered to on this gateway.
+	///
 	/// Local delivery is receiving-gateway policy, never rumor content.
-	/// `None` journals and refloods only. The record is marked
-	/// delivered so it never enters the pending retry set.
+	/// `None` journals and refloods only. The record is marked delivered
+	/// so it never enters the pending retry set.
+	///
+	/// # Export boundary
+	///
+	/// The ingress sink sits outside the export boundary. Colony scope and
+	/// the origin signature already gate which peers may flood a rumor, and
+	/// the operator, not the peer, chooses the delivery type, so the export
+	/// allowlist does not apply here. An operator who restricts exports
+	/// should treat the ingress type as an intentional local delivery
+	/// channel for admitted colony gossip.
 	pub ingress: Option<Urn<'static>>,
 	/// Dedup and retention store. Owns its own retention window.
 	pub journal: Arc<dyn GossipJournal>,
@@ -458,13 +503,14 @@ impl core::fmt::Debug for GossipConfig {
 }
 
 impl MemoryGossipJournal {
-	/// Deduplicate `digest` under the capacity discipline and store
-	/// `body` when it is new (CWE-770).
+	/// Deduplicate `digest` under the capacity discipline and store `body`
+	/// when it is new (CWE-770).
 	///
-	/// The per-signer budget counts only entries of the incoming body
-	/// kind: a signer's witnessed advertisement digests can never
-	/// crowd out its retained application rumors. The reverse holds
-	/// too.
+	/// # Per-signer budget
+	///
+	/// The per-signer budget counts only entries of the incoming body kind:
+	/// a signer's witnessed advertisement digests can never crowd out its
+	/// retained application rumors. The reverse holds too.
 	fn admit(
 		&self,
 		signer: &[u8],

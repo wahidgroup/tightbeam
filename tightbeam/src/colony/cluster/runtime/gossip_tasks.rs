@@ -1,12 +1,22 @@
-//! Gossip background tasks: local deliver, reflood, reconcile, advertise beat.
+//! Gossip background tasks for the cluster advertise beat.
+//!
+//! The beat re-announces the local slate, publishes origin-signed
+//! advertisement rumors, and runs anti-entropy reconcile rounds against
+//! verified peers and feeler probes.
+//!
+//! # Planes
+//!
+//! - **Direct advertisement**: one minted frame dials every verified target.
+//! - **Rumor flood**: the same signed frame wraps in a gossip rumor for
+//!   members beyond direct reach.
+//! - **Pipeline**: admit, rate-limit, journal, deliver locally, and reflood
+//!   inbound rumors.
+//! - **Reconcile**: anti-entropy repair and peer-exchange hint learning.
 
 use core::hash::Hash;
 use core::str::{from_utf8, FromStr};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-#[cfg(feature = "x509")]
-use std::sync::Mutex;
 
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool};
 use crate::colony::cluster::runtime::refuse::refuse_gossip;
@@ -20,10 +30,6 @@ use crate::instrumentation::events::{
 	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
 };
 
-#[cfg(feature = "x509")]
-use crate::instrumentation::events::{
-	CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_RELAY_TRAIL_REFUSED,
-};
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
@@ -35,38 +41,36 @@ use crate::Frame;
 use crate::TightBeamError;
 
 #[cfg(feature = "x509")]
-use core::time::Duration;
+mod x509 {
+	pub(crate) use core::time::Duration;
+	pub(crate) use std::sync::Mutex;
+
+	pub(crate) use crate::builder::frame::FrameBuilder;
+	pub(crate) use crate::builder::TypeBuilder;
+	pub(crate) use crate::colony::cluster::export::{export_set, slate_exported};
+	pub(crate) use crate::colony::cluster::peer::{cert_fingerprint_id, peer_dial_allowed, AdmittedPeerAd};
+	pub(crate) use crate::colony::cluster::{
+		cert_colony_urn, gossip_digest, gossip_fresh, peer_signer_fingerprint, wanted_digests, Admission,
+		AdmittedGossip, GossipDigest, PeerCaps, PeerHint, RouteKind,
+	};
+	pub(crate) use crate::colony::common::{
+		current_timestamp_ms, ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipRumorKind,
+		GossipWant, PeerAdvertisement, PeerAdvertisementResponse, PeerGossip,
+	};
+	pub(crate) use crate::colony::hive::{verify_frame_signature, TrustVerification};
+	pub(crate) use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_GOSSIP_TTL, MAX_PEX_SAMPLE};
+	pub(crate) use crate::decode;
+	pub(crate) use crate::der::Encode;
+	pub(crate) use crate::encode;
+	pub(crate) use crate::instrumentation::events::{
+		CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_RELAY_TRAIL_REFUSED,
+	};
+	pub(crate) use crate::utils::urn::Urn;
+	pub(crate) use crate::{MessagePriority, Version};
+}
 
 #[cfg(feature = "x509")]
-use crate::builder::frame::FrameBuilder;
-#[cfg(feature = "x509")]
-use crate::builder::TypeBuilder;
-#[cfg(feature = "x509")]
-use crate::colony::cluster::peer::{cert_fingerprint_id, peer_dial_allowed, AdmittedPeerAd};
-#[cfg(feature = "x509")]
-use crate::colony::cluster::{
-	cert_colony_urn, gossip_digest, gossip_fresh, peer_signer_fingerprint, wanted_digests, Admission, AdmittedGossip,
-	GossipDigest, PeerCaps, PeerHint, RouteKind,
-};
-#[cfg(feature = "x509")]
-use crate::colony::common::{
-	current_timestamp_ms, ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipRumorKind,
-	GossipWant, PeerAdvertisement, PeerAdvertisementResponse, PeerGossip,
-};
-#[cfg(feature = "x509")]
-use crate::colony::hive::{verify_frame_signature, TrustVerification};
-#[cfg(feature = "x509")]
-use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_GOSSIP_TTL, MAX_PEX_SAMPLE};
-#[cfg(feature = "x509")]
-use crate::decode;
-#[cfg(feature = "x509")]
-use crate::der::Encode;
-#[cfg(feature = "x509")]
-use crate::encode;
-#[cfg(feature = "x509")]
-use crate::utils::urn::Urn;
-#[cfg(feature = "x509")]
-use crate::{MessagePriority, Version};
+use x509::*;
 
 #[cfg(not(feature = "x509"))]
 type GossipDigest = [u8; 32];
@@ -178,6 +182,10 @@ pub(crate) async fn gossip_deliver_local<P>(
 }
 
 /// Fan out a still-live rumor to configured peers with decremented hop TTL.
+///
+/// Targets are anchors plus verified tried peers. An unverified candidate
+/// never receives rumor bytes. Each target receives an owned clone of the
+/// signed frame because emit consumes the frame.
 #[cfg(feature = "x509")]
 pub(crate) async fn reflood_gossip<P, D>(
 	peer_pool: Arc<ClusterPool<P>>,
@@ -256,9 +264,13 @@ pub(crate) async fn reflood_gossip<P, D>(
 
 /// Mint and sign one peer advertisement frame for this gateway's slate.
 ///
-/// One mint serves both delivery paths: the direct dial to a peer and
-/// the advertisement rumor on the gossip flood, so both carry the same
-/// signer-binds-to-address unit.
+/// One mint serves both delivery paths so direct dials and gossip rumors
+/// carry the same signer-binds-to-address unit.
+///
+/// # Delivery paths
+///
+/// - Direct dial through [`send_advertisement_async`]
+/// - Advertisement rumor through [`mint_slate_rumor`] and [`publish_slate_rumor`]
 #[cfg(feature = "x509")]
 async fn mint_ad_frame<D>(
 	config: &ClusterConfig,
@@ -332,6 +344,9 @@ struct MintedAdRumor {
 
 /// Mint, sign, and digest one advertisement rumor for the local slate.
 ///
+/// Wraps a [`mint_ad_frame`] payload in a signed gossip rumor and extracts
+/// the digest and signer id for witness and reflood.
+///
 /// Returns `None` on a local fault (key, codec, or journal input). The
 /// caller records it, and a later beat re-publishes fresh.
 #[cfg(feature = "x509")]
@@ -369,18 +384,20 @@ where
 
 /// Publish the local slate as an origin-signed advertisement rumor.
 ///
-/// The rumor wraps the identical signed frame that a direct
-/// advertisement dials out. A member beyond direct reach therefore
-/// admits it through the same signer-binds-to-address path once the
-/// flood relays it.
+/// The rumor wraps the identical signed frame that direct advertisement
+/// dials out, so members beyond direct reach admit through the same
+/// signer-binds-to-address path once the flood relays it.
 ///
-/// - The published digest is witnessed, never retained. An
-///   advertisement is an ephemeral hint, and re-publish is what keeps
-///   it fresh.
-/// - The origin never applies its own slate.
-/// - A mint fault returns `false` and traces
-///   `CLUSTER_PEER_AD_PUBLISH_FAILED` for the audit trail. The caller
-///   keeps its publish baseline, so the next beat retries.
+/// # Journal
+///
+/// The published digest is witnessed, never retained. Advertisements are
+/// ephemeral hints; re-publish keeps them fresh. The origin never applies
+/// its own slate.
+///
+/// # Failures
+///
+/// A mint fault returns `false`, traces `CLUSTER_PEER_AD_PUBLISH_FAILED`,
+/// and leaves the caller's publish baseline intact so the next beat retries.
 #[cfg(feature = "x509")]
 pub(crate) async fn publish_slate_rumor<P, D>(
 	pool: Arc<ClusterPool<P>>,
@@ -450,27 +467,29 @@ fn relay_dial_addr(servlet_registry: &ServletRegistry, relay_id: &[u8]) -> Optio
 
 /// Apply one admitted peer-advertisement rumor to routing state.
 ///
-/// The wrapped frame MUST verify on the peer trust plane, and it MUST
-/// be signed by the same origin as the rumor itself. A member can
-/// therefore neither create nor re-wrap another member's advertisement
-/// under a fresh rumor.
+/// The wrapped frame MUST verify on the peer trust plane, and the rumor
+/// signer MUST match the inner advertisement signer. A member therefore
+/// cannot create or re-wrap another member's advertisement.
 ///
-/// - Admission follows the identical direct-ad path
-///   ([`AdmittedPeerAd::admit`]): order freshness, colony gate, dial
-///   allowlist, wire checks, and the discovery hint.
-/// - Slate reconciliation installs a direct trail that dials the
-///   origin.
-/// - When this gateway's `max_hops` affords relay forwarding and the
-///   relaying peer is known, a relay trail through it installs beside
-///   the direct trail as the fallback route.
-/// - Registry policy refuses a slate that collides with a local route.
-///   The same policy keeps a gateway from installing its own echoed
-///   slate as a peer route.
+/// # Admission
+///
+/// Follows the identical direct-ad path ([`AdmittedPeerAd::admit`]):
+/// order freshness, colony gate, dial allowlist, wire checks, and the
+/// discovery hint.
+///
+/// # Reconciliation
+///
+/// - Slate reconciliation installs a direct trail that dials the origin.
+/// - When `max_hops` affords relay forwarding and the relaying peer is
+///   known, a relay trail installs beside the direct trail as fallback.
+/// - Registry policy refuses a slate that collides with a local route,
+///   including this gateway's own echoed slate.
+///
+/// # Audit
 ///
 /// A learned slate traces `CLUSTER_PEER_AD_LEARNED` with the origin
-/// fingerprint. Every refusal traces `CLUSTER_PEER_AD_DROPPED`, so a
-/// dropped advertisement is never silent (ISO 27001 A.8.15). The drop
-/// carries the rumor signer fingerprint when it is verifiable.
+/// fingerprint. Every refusal traces `CLUSTER_PEER_AD_DROPPED` (ISO 27001
+/// A.8.15), carrying the rumor signer when verifiable.
 #[cfg(feature = "x509")]
 pub(crate) fn apply_peer_ad_rumor(
 	servlet_registry: &ServletRegistry,
@@ -504,9 +523,17 @@ pub(crate) fn apply_peer_ad_rumor(
 /// Verify, admit, and reconcile one advertisement rumor.
 ///
 /// Returns the learned origin fingerprint, or `None` for any refusal.
-/// The caller owns the learned and dropped audit events. The
-/// best-effort relay-trail refusal traces here, since the ad itself
-/// still learns.
+/// The caller owns learned and dropped audit events. Relay-trail refusal
+/// traces here because the ad itself still learns.
+///
+/// # Evaluation order
+///
+/// 1. Decode and verify the inner frame on the peer trust plane.
+/// 2. Bind rumor and inner signers to the same origin.
+/// 3. Reject stale or far-future control orders.
+/// 4. Admit through [`AdmittedPeerAd::admit`].
+/// 5. Learn the discovery hint and reconcile the direct slate.
+/// 6. Best-effort relay-trail install when hops and dial address allow.
 #[cfg(feature = "x509")]
 fn try_apply_peer_ad_rumor(
 	servlet_registry: &ServletRegistry,
@@ -586,13 +613,17 @@ fn try_apply_peer_ad_rumor(
 
 /// Whether an inner advertisement order sits inside the freshness window.
 ///
-/// The rumor path has no signed-control replay guard, because the
-/// gossip journal already dedups identical rumors by digest. This
-/// order bound alone aligns the rumor path with the direct path's
-/// `verify_control_freshness` order check. A replayed ad older than
-/// the window never reconciles, so the ad-order tombstone covers every
-/// admissible replay (CWE-294). A far-future order is refused, so it
-/// cannot pin a ledger row forever (CWE-770).
+/// The rumor path has no signed-control replay guard because the gossip
+/// journal already dedups identical rumors by digest. This order bound
+/// aligns the rumor path with the direct path's `verify_control_freshness`
+/// check.
+///
+/// # Fail-closed
+///
+/// - A replayed ad older than the window never reconciles, so the
+///   ad-order tombstone covers every admissible replay (CWE-294).
+/// - A far-future order is refused so it cannot pin a ledger row forever
+///   (CWE-770).
 #[cfg(feature = "x509")]
 fn ad_order_fresh(order: u64, now: u64, window_ms: u64) -> bool {
 	now.abs_diff(order) <= window_ms
@@ -615,7 +646,8 @@ fn reconcile_reply_oversized(reply: &GossipWant) -> bool {
 /// inbound advertisement claim, so a later feeler probe never dials an
 /// address the operator refused (CWE-284).
 ///
-/// Sources:
+/// # Sources
+///
 /// - CWE-284, improper access control:
 ///   <https://cwe.mitre.org/data/definitions/284.html>
 #[cfg(feature = "x509")]
@@ -631,9 +663,22 @@ fn admissible_pex_hints<'c>(
 /// One anti-entropy reconcile round with a peer, including grey-hole scoring.
 ///
 /// An `Err` from this function is peer-attributable: the beat loops score it
-/// toward eviction or probe discard. A local fault (journal, lock, frame
-/// signing) skips the affected step instead, so a healthy peer is never
-/// penalized for a fault on this gateway.
+/// toward eviction or probe discard. A local fault skips the affected step
+/// instead, so a healthy peer is never penalized for a fault on this gateway.
+///
+/// # Round order
+///
+/// 1. Collect held digests from the journal.
+/// 2. Complete handshake and verify colony scope.
+/// 3. Emit signed reconcile request and decode the reply.
+/// 4. Reject oversized want-lists or PEX samples.
+/// 5. Promote the peer, learn PEX hints, and score grey-hole drops.
+/// 6. Repair missing rumors from the journal.
+///
+/// # Fault attribution
+///
+/// - Local faults before emit or inside the post-reply scope skip scoring.
+/// - Oversized replies and dial failures return `Err` for peer scoring.
 #[cfg(feature = "x509")]
 pub(crate) async fn reconcile_gossip_async<P, D>(
 	pool: Arc<ClusterPool<P>>,
@@ -844,6 +889,16 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 }
 
 /// Admit, rate-limit, journal, deliver locally, and optionally reflood one rumor.
+///
+/// # Pipeline order
+///
+/// 1. Admit the rumor (TTL, freshness, wire bounds).
+/// 2. Attribute rate and journal to the verified origin signer, never the relay.
+/// 3. Drop known duplicates before rate admission.
+/// 4. Rate-limit before journal and reflood.
+/// 5. Witness advertisement rumors; retain application rumors for repair.
+/// 6. Deliver application rumors locally or apply advertisement rumors to routing.
+/// 7. Detach reflood when hop TTL and targets remain.
 #[cfg(feature = "x509")]
 pub(crate) async fn gossip_pipeline<P, D>(
 	origin: GossipOrigin,
@@ -979,20 +1034,18 @@ where
 
 /// Change-driven publish state for the advertisement rumor.
 ///
-/// The beat publishes when the slate or the flood target set changed.
-/// One refresh on the configured interval lets late joiners and pruned
-/// witnesses relearn the origin. Bitcoin self-announces addresses on
-/// the same cadence: on change and on a slow timer, never per beat
-/// (see [`DEFAULT_AD_RUMOR_REFRESH_MS`] for the source).
+/// The beat publishes when the slate or flood target set changed, and on
+/// a configured refresh interval for late joiners (see
+/// [`DEFAULT_AD_RUMOR_REFRESH_MS`]).
 ///
-/// The publish task detaches from the beat, so a claim settles in two
-/// steps rather than at claim time.
+/// # Claim lifecycle
 ///
-/// - [`Self::take_due`] claims a publish slot and blocks re-entry
-///   while the task runs.
-/// - [`Self::commit`] records the baseline after a rumor went out.
-/// - [`Self::abort`] releases a failed claim with the old baseline
-///   intact, so the next beat retries.
+/// 1. [`Self::take_due`] claims a publish slot and blocks re-entry while
+///    the task runs.
+/// 2. The detached task mints and refloods the rumor.
+/// 3. [`Self::commit`] records the baseline after a rumor went out.
+/// 4. [`Self::abort`] releases a failed claim with the old baseline
+///    intact, so the next beat retries.
 ///
 /// [`DEFAULT_AD_RUMOR_REFRESH_MS`]: crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS
 #[cfg(feature = "x509")]
@@ -1064,6 +1117,10 @@ impl AdPublishState {
 }
 
 /// Spawn the advertise/reconcile beat that re-announces local types to peers.
+///
+/// Each beat retries pending local delivery, publishes due advertisement
+/// rumors, dials verified targets with one shared mint, and runs reconcile
+/// rounds for colony members and feeler probes.
 #[cfg(feature = "x509")]
 pub fn build_advertise_task<P, D>(
 	servlet_registry: Arc<ServletRegistry>,
@@ -1108,6 +1165,11 @@ where
 		// grow the map without bound (CWE-770).
 		let mut push_ledger: HashMap<String, HashSet<GossipDigest>> = HashMap::new();
 		let ad_publish = Arc::new(AdPublishState::new(config.peer.rumor_refresh));
+
+		// The slate below is the single place advertised types are
+		// gathered, so one export filter covers the direct ads and
+		// the rumor flood. The lookup set builds once per task.
+		let export_keys = config.peer.exported_types.as_deref().map(export_set);
 		loop {
 			rt::sleep(interval).await;
 
@@ -1148,6 +1210,7 @@ where
 				.local_servlets()
 				.unwrap_or_default()
 				.iter()
+				.filter(|bytes| slate_exported(export_keys.as_ref(), bytes))
 				.filter_map(|bytes| from_utf8(bytes).ok())
 				.filter_map(|canonical| canonical.parse().ok())
 				.take(MAX_ADVERTISED_TYPES)

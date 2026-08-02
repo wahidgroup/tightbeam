@@ -1,10 +1,37 @@
 //! Shared fixtures for colony cluster integration tests.
+//!
+//! Certificate identities, TLS configs, trace recorders, and peering
+//! preamble helpers live here so scenario modules stay assertion-focused.
+//!
+//! # Certificates
+//!
+//! [`member_identity`] mints a distinct gateway certificate per organization.
+//! [`cluster_certs`] shares one signing key and therefore cannot distinguish
+//! relay from origin in multi-gateway topologies.
+//!
+//! # Trust planes
+//!
+//! Use the layout that matches the scenario:
+//!
+//! - Shared [`cluster_certs`] with overlapping `peer_trust`: register and
+//!   sign hive control frames with [`hive_plane_certs`] and
+//!   [`split_hive_trust`] (peer membership wins on the hive plane).
+//! - Distinct [`member_identity`] federation or org topologies: put the
+//!   full combined store on `hive_trust` and exclude self from `peer_trust`.
+//! - Export-boundary scenarios: per-org split planes in `exports.rs`
+//!   (`hive_trust` = own org, `peer_trust` = external peer).
+//!
+//! # Work probes
+//!
+//! [`emit_typed_work`] always encodes a ping payload under the supplied
+//! type name. Export scenarios reuse it for private types that still run
+//! the ping servlet.
 
 use tightbeam::{cluster, compose, hive, servlet};
 
 // Re-exports consumed by sibling scenario modules via `use super::common::*`.
 pub(super) use super::events::*;
-pub(super) use crate::common::x509::{combined_trust, GatewayCerts};
+pub(super) use crate::common::x509::{combined_trust, combined_validator, GatewayCerts};
 pub(super) use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub(super) use core::time::Duration;
 pub(super) use sha3::Sha3_256;
@@ -85,13 +112,13 @@ pub(super) fn cluster_certs() -> ClusterTestCerts {
 	GatewayCerts::generate_colony(&test_colony_urn())
 }
 
-/// Fresh gateway identity in `colony`: a random key and a certificate
-/// that carries the colony URN as a URI SAN.
+/// Fresh gateway identity in `colony`: a random key and a certificate that
+/// carries the colony URN as a URI SAN.
 ///
-/// [`cluster_certs`] cannot serve for multi-gateway topologies: every
-/// generated cert shares the fixed test signing key. All gateways
-/// would then resolve to one signer fingerprint, and a relay could
-/// never be told apart from an origin.
+/// [`cluster_certs`] cannot serve multi-gateway topologies because every
+/// generated cert shares the fixed test signing key. All gateways would
+/// then resolve to one signer fingerprint, and a relay could never be
+/// told apart from an origin.
 pub(super) fn colony_identity(cn: &str, colony: &Urn<'_>) -> (Certificate, Secp256k1SigningKey) {
 	use tightbeam::random::OsRng;
 	use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
@@ -104,6 +131,39 @@ pub(super) fn colony_identity(cn: &str, colony: &Urn<'_>) -> (Certificate, Secp2
 /// [`colony_identity`] in the colony every member gateway joins.
 pub(super) fn member_identity(cn: &str) -> (Certificate, Secp256k1SigningKey) {
 	colony_identity(cn, &test_colony_urn())
+}
+
+/// Deterministic hive-plane identity, disjoint from the shared gateway
+/// identity.
+///
+/// The hive plane refuses a signer that `peer_trust` also holds (peer
+/// membership wins). Fixtures that put the shared gateway certificate in
+/// `peer_trust` for relay verification therefore register hives and sign
+/// origin publishes with this identity instead. The fixed scalar keeps
+/// the identity stable across closures, like [`cluster_certs`].
+///
+/// The bundled trust store covers the shared gateway identity so the
+/// hive can dial its gateway.
+pub(super) fn hive_plane_certs() -> Arc<ClusterTestCerts> {
+	use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
+
+	let raw = k256::ecdsa::SigningKey::from_bytes(&[7u8; 32].into()).expect("static scalar is a valid key");
+	let cert = create_test_certificate_with_cn_and_uri_sans(&raw, "Hive Plane", &[&test_colony_urn().to_string()]);
+	let gateway = cluster_certs();
+	let trust = combined_trust(&[&gateway.cert, &cert]);
+	let key = Secp256k1SigningKey::from(raw);
+
+	Arc::new(GatewayCerts { cert, key, trust })
+}
+
+/// Gateway hive trust for shared [`cluster_certs`] fixtures.
+///
+/// Combines the gateway identity (hive-pool dials between gateways) with
+/// the hive-plane identity (registration, address updates, and origin
+/// publishes). Do not pass a [`member_identity`] gateway here; federation
+/// and organization scenarios exclude self from `peer_trust` instead.
+pub(super) fn split_hive_trust(gateway: &ClusterTestCerts) -> Arc<dyn CertificateTrust> {
+	combined_trust(&[&gateway.cert, &hive_plane_certs().cert])
 }
 
 // ============================================================================
@@ -483,12 +543,18 @@ pub(super) async fn emit_servlet_update(
 	decode(&emit_frame(client, frame).await?.message)
 }
 
-pub(super) async fn emit_ping_work(
+/// Emit unary work under `type_name` with a ping payload.
+///
+/// The type URN is caller-chosen, but the body is always [`PingRequest`].
+/// Export scenarios use this for private types that still host the ping
+/// servlet.
+pub(super) async fn emit_typed_work(
 	client: &mut GenericClient<TokioListener>,
+	type_name: &str,
 	id: &[u8],
 ) -> Result<ClusterWorkResponse, TightBeamError> {
 	let work_request = ClusterRequest::Work(ClusterWorkRequest::new(
-		servlet_urn("ping"),
+		servlet_urn(type_name),
 		encode(&PingRequest { value: 21 })?,
 	));
 
@@ -499,6 +565,13 @@ pub(super) async fn emit_ping_work(
 		.build()?;
 
 	decode(&emit_frame(client, frame).await?.message)
+}
+
+pub(super) async fn emit_ping_work(
+	client: &mut GenericClient<TokioListener>,
+	id: &[u8],
+) -> Result<ClusterWorkResponse, TightBeamError> {
+	emit_typed_work(client, "ping", id).await
 }
 
 /// Ping work with a spent relay budget (hop-exhaustion probe).
@@ -525,15 +598,18 @@ pub(super) fn foreign_realm_instance(addr: &str) -> Urn<'static> {
 	servlet_instance(&namespace.servlet("ping").expect("test names satisfy the mint grammar"), addr)
 }
 
-/// Gateway conf that accepts peer advertisements: `peer_trust` anchors the
-/// advertising gateway's certificate. No `peers` set, so this gateway
-/// only receives.
+/// Gateway conf that accepts peer advertisements.
+///
+/// `peer_trust` anchors the advertising gateway's certificate. No `peers`
+/// set, so this gateway only receives.
 pub(super) fn peering_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 	peering_cluster_conf_with_trust(certs, Arc::clone(&certs.trust))
 }
 
-/// Like [`peering_cluster_conf`] but with an explicit peer trust store
-/// (used when more than one peer identity must verify).
+/// Like [`peering_cluster_conf`] but with an explicit peer trust store.
+///
+/// Used when more than one peer identity must verify, including federation
+/// peer-exclusion layouts and export split-plane scenarios.
 pub(super) fn peering_cluster_conf_with_trust(
 	certs: &ClusterTestCerts,
 	peer_trust: Arc<dyn CertificateTrust>,
@@ -584,9 +660,10 @@ pub(super) fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: String) -
 		.build()
 }
 
-/// Send one signed advertisement of `types` from a peer at `gateway_addr`,
-/// signed by `signer`. The decoded status lands on the trace for spec
-/// verification.
+/// Send one signed advertisement of `types` from a peer at `gateway_addr`.
+///
+/// The frame is signed by `signer`. The decoded status lands on the trace
+/// for spec verification.
 pub(super) async fn advertise_peer_signed(
 	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
@@ -604,10 +681,11 @@ pub(super) async fn advertise_peer_signed(
 	send_advertisement_frame(trace, connect_certs, cluster, frame).await
 }
 
-/// Emit an already-signed advertisement frame: lets replay scenarios
-/// resend a byte-identical frame. Every decoded status lands on the
-/// trace as `PEER_AD_STATUS`, and the surviving peer-route count as
-/// `PEER_ROUTES_AFTER`, for spec verification.
+/// Emit an already-signed advertisement frame.
+///
+/// Replay scenarios resend a byte-identical frame. Every decoded status
+/// lands on the trace as `PEER_AD_STATUS`, and the surviving peer-route
+/// count as `PEER_ROUTES_AFTER`, for spec verification.
 pub(super) async fn send_advertisement_frame(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,

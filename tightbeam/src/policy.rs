@@ -65,6 +65,21 @@ pub enum TransitStatus {
 }
 
 impl TransitStatus {
+	/// Gate-verdict normalization for [`GatePolicy`] and export-gate loops.
+	///
+	/// [`TransitStatus::Unknown`] is a local bug, not a verdict, so it
+	/// maps to [`TransitStatus::Internal`]. The peer then sees a server
+	/// fault. Call sites apply this before a gate status reaches the wire
+	/// or the export audit trail. The built-in export allowlist does not
+	/// use this helper.
+	#[must_use]
+	pub(crate) const fn normalized_verdict(self) -> Self {
+		match self {
+			Self::Unknown => Self::Internal,
+			verdict => verdict,
+		}
+	}
+
 	/// Canonical variant name, e.g. as an audit-event label.
 	pub const fn as_str(&self) -> &'static str {
 		match self {
