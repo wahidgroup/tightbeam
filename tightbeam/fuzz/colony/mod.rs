@@ -108,9 +108,11 @@ tb_scenario! {
 			ColonyTopology::boot(&trace).await
 		},
 		client: |ClusterEnv { trace, cluster: mut topo, .. }| async move {
-			run_actions(&trace, &mut topo).await?;
+			let result = run_actions(&trace, &mut topo).await;
+
 			topo.stop();
-			Ok(())
+
+			result
 		}
 	}
 }
