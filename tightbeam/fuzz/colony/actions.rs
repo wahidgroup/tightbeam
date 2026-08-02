@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tightbeam::colony::cluster::{
-	Cluster, ClusterRequest, ClusterWorkRequest, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+	Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ServletEntry, DEFAULT_ABANDONMENT_LIMIT,
+	DEFAULT_INITIAL_PHEROMONE,
 };
 use tightbeam::colony::common::type_canonical_bytes;
 use tightbeam::compose;
@@ -13,6 +14,7 @@ use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::decode;
 use tightbeam::der::Encode;
+use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::client::pool::{ConnectionPool, PoolConfig};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
@@ -234,16 +236,24 @@ async fn emit_cluster_work(
 	*order += 1;
 
 	let outcome = tokio::time::timeout(CLIENT_IO_TIMEOUT, client.emit(frame, None)).await;
-	match outcome {
-		Ok(Ok(Some(response))) if (work.is_success)(&response.message) => {
-			if !work.allowed {
-				trace.event(events::SHADOW_VIOLATION)?;
+	let success = match outcome {
+		Ok(Ok(Some(response))) => match decode::<ClusterWorkResponse>(&response.message) {
+			Ok(ClusterWorkResponse { status: TransitStatus::Ok, payload: Some(payload) }) => {
+				(work.is_success)(&payload)
 			}
-			trace.event(work.ok)?;
+			_ => false,
+		},
+		_ => false,
+	};
+
+	if success {
+		if !work.allowed {
+			trace.event(events::SHADOW_VIOLATION)?;
 		}
-		_ => {
-			trace.event(work.denied)?;
-		}
+
+		trace.event(work.ok)?;
+	} else {
+		trace.event(work.denied)?;
 	}
 	Ok(())
 }
