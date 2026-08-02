@@ -479,7 +479,7 @@ async fn open_duplex_action(trace: &TraceCollector, org: &OrgNode, selector: u8)
 			Ok::<_, TightBeamError>(echoed)
 		};
 		match tokio::time::timeout(CLIENT_IO_TIMEOUT, collect).await {
-			Ok(Ok(n)) if n == 3 => Ok(true),
+			Ok(Ok(3)) => Ok(true),
 			_ => Ok(false),
 		}
 	}

@@ -4,18 +4,18 @@
 //! address. The Cluster scenario `start` returns this topology as the
 //! owned program; the client dials any org gateway for work and CSR.
 //! Advertise beats stay disabled; routes install only via one-shot
-//! [`ClusterRequest::AdvertisePeer`] actions.
+//! [`tightbeam::colony::cluster::ClusterRequest::AdvertisePeer`] actions.
 
 use std::sync::{Arc, Mutex};
 
 use tightbeam::cluster;
 use tightbeam::colony::cluster::{Cluster, ClusterConfig, DynamicExportList, ExportAllowlist};
 use tightbeam::colony::hive::Hive;
-use tightbeam::policy::GatePolicy;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::Certificate;
 use tightbeam::hive;
+use tightbeam::policy::GatePolicy;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::client::pool::PoolConfig;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
@@ -95,42 +95,48 @@ impl ColonyTopology {
 
 		let alpha = boot_org(
 			trace,
-			"alpha",
-			Arc::clone(&alpha_certs),
-			alpha_peers,
-			&federation,
-			true,
-			2,
-			vec![],
-			false,
-			Some(Arc::clone(&decoy_pin)),
+			BootOrg {
+				name: "alpha",
+				own: Arc::clone(&alpha_certs),
+				peer_trust: alpha_peers,
+				federation_certs: &federation,
+				with_csr: true,
+				max_hops: 2,
+				peers: vec![],
+				with_peer_ping: false,
+				decoy_pin: Some(Arc::clone(&decoy_pin)),
+			},
 		)
 		.await?;
 		let alpha_addr = alpha.gateway.addr().to_string();
 		let beta = boot_org(
 			trace,
-			"beta",
-			Arc::clone(&beta_certs),
-			beta_peers,
-			&federation,
-			false,
-			1,
-			vec![alpha_addr.clone()],
-			true,
-			None,
+			BootOrg {
+				name: "beta",
+				own: Arc::clone(&beta_certs),
+				peer_trust: beta_peers,
+				federation_certs: &federation,
+				with_csr: false,
+				max_hops: 1,
+				peers: vec![alpha_addr.clone()],
+				with_peer_ping: true,
+				decoy_pin: None,
+			},
 		)
 		.await?;
 		let gamma = boot_org(
 			trace,
-			"gamma",
-			Arc::clone(&gamma_certs),
-			gamma_peers,
-			&federation,
-			false,
-			0,
-			vec![alpha_addr],
-			true,
-			None,
+			BootOrg {
+				name: "gamma",
+				own: Arc::clone(&gamma_certs),
+				peer_trust: gamma_peers,
+				federation_certs: &federation,
+				with_csr: false,
+				max_hops: 0,
+				peers: vec![alpha_addr],
+				with_peer_ping: true,
+				decoy_pin: None,
+			},
 		)
 		.await?;
 
@@ -152,18 +158,32 @@ pub(crate) fn gateway_bundle(cert: Certificate, key: Secp256k1SigningKey) -> Gat
 	GatewayCerts { cert, key, trust }
 }
 
-async fn boot_org(
-	trace: &TraceCollector,
+/// Per-org boot knobs for [`boot_org`].
+struct BootOrg<'a> {
 	name: &'static str,
 	own: Arc<ClusterTestCerts>,
 	peer_trust: Arc<dyn CertificateTrust>,
-	federation_certs: &[&Certificate],
+	federation_certs: &'a [&'a Certificate],
 	with_csr: bool,
 	max_hops: u8,
 	peers: Vec<String>,
 	with_peer_ping: bool,
 	decoy_pin: Option<Arc<Mutex<Option<Vec<u8>>>>>,
-) -> Result<OrgNode, TightBeamError> {
+}
+
+async fn boot_org(trace: &TraceCollector, cfg: BootOrg<'_>) -> Result<OrgNode, TightBeamError> {
+	let BootOrg {
+		name,
+		own,
+		peer_trust,
+		federation_certs,
+		with_csr,
+		max_hops,
+		peers,
+		with_peer_ping,
+		decoy_pin,
+	} = cfg;
+
 	let mut exported = vec![servlet_urn("public"), servlet_urn("stream-echo")];
 	if with_peer_ping {
 		exported.push(servlet_urn("peer-ping"));

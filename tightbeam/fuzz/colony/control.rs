@@ -100,7 +100,7 @@ pub(crate) async fn advertise_peer_types(
 	types: Vec<Urn<'static>>,
 	order: u64,
 ) -> Result<bool, TightBeamError> {
-	let gateway_addr: Vec<u8> = advertiser.gateway.addr().clone().into();
+	let gateway_addr: Vec<u8> = (*advertiser.gateway.addr()).into();
 	emit_advertise(trace, advertiser, receiver, gateway_addr, types, order).await
 }
 
