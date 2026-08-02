@@ -82,24 +82,36 @@ where
 
 /// Outbound trust store composed with the operator validator chain.
 ///
-/// The handshake client validates the server certificate through one
-/// validation object cast from the pool trust store. This composite
-/// keeps every trust-store operation delegated and appends
-/// `ClusterTlsConfig::validators` to `evaluate`, so each outbound dial
+/// The handshake client validates the server identity through the pool
+/// trust store on two paths: [`CertificateValidation::evaluate`] for a
+/// bare certificate and [`CertificateTrust::verify_chain`] for a
+/// provisioned chain. This composite appends
+/// `ClusterTlsConfig::validators` to both paths, so each outbound dial
 /// enforces the operator's extra checks (pinning, expiry, policy).
 ///
 /// # Evaluation order
 ///
-/// 1. The underlying trust store evaluates the certificate.
-/// 2. Each configured operator validator evaluates in registration order.
+/// 1. The underlying trust store evaluates the certificate or chain.
+/// 2. Each configured operator validator evaluates the dialed leaf in
+///    registration order.
 ///
 /// [`CertificateTrust::is_trusted`] still delegates to the store alone.
-/// Outbound handshakes use [`CertificateValidation::evaluate`], so the
-/// validator chain is the production path.
 #[cfg(feature = "x509")]
 struct ValidatedTrust {
 	store: Arc<dyn CertificateTrust>,
 	validators: Vec<Arc<dyn CertificateValidation>>,
+}
+
+#[cfg(feature = "x509")]
+impl ValidatedTrust {
+	/// Run the operator validator chain over the dialed server leaf.
+	fn validate_leaf(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		for validator in self.validators.iter() {
+			validator.evaluate(cert)?;
+		}
+
+		Ok(())
+	}
 }
 
 #[cfg(feature = "x509")]
@@ -116,11 +128,7 @@ impl core::fmt::Debug for ValidatedTrust {
 impl CertificateValidation for ValidatedTrust {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		self.store.evaluate(cert)?;
-		for validator in self.validators.iter() {
-			validator.evaluate(cert)?;
-		}
-
-		Ok(())
+		self.validate_leaf(cert)
 	}
 }
 
@@ -131,7 +139,13 @@ impl CertificateTrust for ValidatedTrust {
 	}
 
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
-		self.store.verify_chain(chain)
+		self.store.verify_chain(chain)?;
+
+		// Anchor-first ordering: the dialed server identity is the last
+		// entry. Operator validators target that leaf, not intermediates,
+		// so a pin on the server certificate cannot false-fail on a CA.
+		let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
+		self.validate_leaf(leaf)
 	}
 
 	fn find_by_signer_info(&self, signer_info: &SignerInfo) -> Option<&Certificate> {
@@ -210,7 +224,6 @@ mod tests {
 	fn empty_validator_chain_returns_store_unchanged() {
 		let store = trust_of(&create_test_certificate(&create_test_signing_key()));
 		let composed = validated_trust(Arc::clone(&store), &[]);
-
 		assert!(Arc::ptr_eq(&store, &composed));
 	}
 
@@ -218,8 +231,19 @@ mod tests {
 	fn operator_validator_rejects_store_trusted_certificate() {
 		let cert = create_test_certificate(&create_test_signing_key());
 		let composed = validated_trust(trust_of(&cert), &[Arc::new(RejectAll)]);
-
 		assert!(composed.is_trusted(&cert));
 		assert!(composed.evaluate(&cert).is_err());
+	}
+
+	#[test]
+	fn operator_validator_rejects_store_verified_chain() {
+		let cert = create_test_certificate(&create_test_signing_key());
+		let store = trust_of(&cert);
+		let chain = [cert];
+
+		assert!(store.verify_chain(&chain).is_ok());
+
+		let composed = validated_trust(store, &[Arc::new(RejectAll)]);
+		assert!(composed.verify_chain(&chain).is_err());
 	}
 }
