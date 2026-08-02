@@ -2218,13 +2218,15 @@ The accepting endpoint uses `MuxRole::Server` with the same assembly sequence. E
 Test multiplexed services with `environment ServiceClient`. The `server:` closure starts a `server!` accept loop advertising `with_mux_offer`. The `client:` closure drives a mux-offering `ConnectionPool` against the bound address. Peers that decline the offer fall back to single-flight. The same scenario shape covers both paths.
 
 ```rust
+const ECHO_OVER_MUX: Urn<'static> = Urn::new("test", "event:mux/echo-over-mux");
+
 tb_assert_spec! {
 	pub EchoOverMuxSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(echo_over_mux, exactly!(1), equals!(true))
+			(ECHO_OVER_MUX, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -2251,7 +2253,7 @@ tb_scenario! {
 			let frame = create_v0_tightbeam(Some("ping"), None);
 			let reply = lease.emit(frame.clone(), None).await?;
 
-			trace.event_with(EchoOverMuxSpec::echo_over_mux, &[], reply == Some(frame))?;
+			trace.event_with(ECHO_OVER_MUX, &[], reply == Some(frame))?;
 
 			Ok(())
 		}
@@ -2572,6 +2574,8 @@ pub struct PingPongServletConfig {
 **Step 2**: Define the servlet using `EnvConfig`:
 
 ```rust
+const REQUEST_RECEIVED: Urn<'static> = Urn::new("test", "event:servlet/request-received");
+
 tightbeam::servlet! {
 	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConfig>,
 	protocol: TokioListener,
@@ -2579,7 +2583,7 @@ tightbeam::servlet! {
 		// Access context members
 		let trace = ctx.trace();
 		let config: &PingPongServletConfig = ctx.env_config()?;
-		trace.event_with("request_received", &[], config.service_name.clone())?;
+		trace.event_with(REQUEST_RECEIVED, &[], config.service_name.clone())?;
 
 		// Handler receives Frame, not decoded message
 		let decoded = decode::<RequestMessage, _>(&frame.message)?;
@@ -2684,16 +2688,21 @@ Servlets with workers can be tested using `environment Servlet`:
 ```rust
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, servlet, worker};
 
+const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/receive");
+const WORKER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/worker-process");
+const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:servlet/respond");
+const RESULT_VERIFIED: Urn<'static> = Urn::new("test", "event:servlet/result-verified");
+
 tb_assert_spec! {
 	pub CalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(servlet_receive, exactly!(1)),
-			(worker_process, exactly!(1)),
-			(servlet_respond, exactly!(1)),
-			(result_verified, exactly!(1), equals!(10u32))
+			(SERVLET_RECEIVE, exactly!(1)),
+			(WORKER_PROCESS, exactly!(1)),
+			(SERVLET_RESPOND, exactly!(1)),
+			(RESULT_VERIFIED, exactly!(1), equals!(10u32))
 		]
 	}
 }
@@ -2729,7 +2738,7 @@ tb_scenario! {
 				.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			trace.event_with(CalcServletSpec::result_verified, &[], response.result)?;
+			trace.event_with(RESULT_VERIFIED, &[], response.result)?;
 			Ok(())
 		}
 	}
@@ -2898,6 +2907,20 @@ pub struct HiveConfig {
 Standalone hive behavior (control plane gates, circuit breaker, backpressure, drain) is tested with `environment Hive`:
 
 ```rust
+const BACKPRESSURE_MANAGE_SHAPE: Urn<'static> =
+	Urn::new("test", "event:hive/backpressure-manage-shape");
+
+tb_assert_spec! {
+	pub HiveBackpressureShapeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(BACKPRESSURE_MANAGE_SHAPE, exactly!(1))
+		]
+	}
+}
+
 tb_scenario! {
 	name: hive_backpressure_reply_shape,
 	spec: HiveBackpressureShapeSpec,
@@ -2918,7 +2941,7 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_stop).await?;
 			assert_manage_stop_shape(&response, TransitStatus::ResourceExhausted);
 
-			trace.event(HiveBackpressureShapeSpec::backpressure_manage_manage_shape)?;
+			trace.event(BACKPRESSURE_MANAGE_SHAPE)?;
 
 			hive.stop();
 			Ok(())
@@ -2988,7 +3011,7 @@ Clusters require TLS configuration for secure communication with hives and, when
 let tls = ClusterTlsConfig {
 	certificate: CertificateSpec::Built(Box::new(cert)),
 	key: Arc::new(Secp256k1KeyProvider::from(key)),
-	validators: vec![],         // Optional: validators for hive certificates
+	validators: vec![],         // Optional: extra checks on dialed server certs (both planes)
 	client_validators: vec![],  // Non-empty: gateway requires client certs (mTLS)
 	hive_trust: Some(hive_trust),  // Hive-plane: registration, address updates, PublishGossip
 	peer_trust: Some(peer_trust),  // Peer-plane: AdvertisePeer, relayed Gossip, ReconcileGossip
@@ -3033,10 +3056,133 @@ Behavior:
 2. The receiver admits on the peer trust plane: signature, freshness, colony membership on both sides, parseable dial address, optional allowlist, and namespace-scoped servlet types.
 3. Installed routes are soft-state and keyed by the peer's signer certificate fingerprint. The claimed `gateway_addr` is the dial target. An empty advertisement clears that peer's routes.
 4. The load balancer selects among Local and Peer trails together. Locality emerges from pheromone strength rather than a hard preference flag.
-5. A peer hop re-emits `ClusterWorkRequest` with `forwarded: true`. An inbound forwarded request is local-only--a one-hop loop guard so peer graphs cannot bounce work forever.
+5. A peer hop re-emits `ClusterWorkRequest` with a decremented `hops_remaining` budget. The origin stamps the sentinel `u8::MAX`, which means forward as far as policy allows. The first gateway clamps that to its `PeerConfig::max_hops` (default 1). A default topology therefore forwards exactly once, and peer graphs cannot bounce work forever. A spent budget refuses `Unavailable` instead of forwarding.
 6. Peer dials prefer the peer connection pool when `peer_trust` is set. Peer failures weaken trails and can abandon a grey-hole peer while local routes keep serving.
 
 `peers` is a dial list, not an identity mesh. Partial or asymmetric peer graphs are expected.
+
+Member gateways also flood their slate as an advertisement rumor, so peers of peers learn exported types transitively. A relayed rumor installs two soft-state trails. The direct trail dials the origin's claimed address. The relay trail dials the delivering peer and reconciles under its own composite bucket.
+
+The relay trail competes for selection only when the remaining hop budget covers the extra hop (`max_hops >= 2`). A dead direct address then fails over to it by pheromone weakening. The rumor refloods on change, or every `PeerConfig::rumor_refresh` while unchanged.
+
+##### Servlet Export Boundary
+
+By default a federated gateway advertises and serves every locally registered servlet type. The export boundary restricts what crosses the organization edge.
+
+**Planes**
+
+- **Discoverability**: the advertise beat filters the slate through `PeerConfig::exported_types`, so direct ads and slate rumors never disclose unexported types.
+- **Enforcement**: unary Work requests and routed stream opens evaluate the export boundary where the servlet target is known. A peer that guesses a type name is refused unless a grant opens that target (`PermissionDenied`, traced as `CLUSTER_EXPORT_REFUSED`).
+
+The enforcement pipeline layers these checks in order:
+
+1. Session gate policies (`with_gate_policy`) before the request envelope is decoded.
+2. Built-in allowlist from `exported_types`.
+3. Positive `ExportGrant` widening when the allowlist refuses.
+4. Custom `ExportGate` intersection (a deny gate overrides a grant).
+5. The servlet handles the request.
+
+```rust
+let conf = ClusterConfig::builder(tls)
+	.with_peers([peer_addr.to_string()])
+	.with_advertise_interval(Duration::from_secs(5))
+	// Advertise and export only these types to external peers
+	.with_exported_types([namespace.servlet("ping")?])
+	.build();
+```
+
+**Allowlist**
+
+`with_exported_types` drives a fail-closed built-in allowlist. Enforcement reads the live configuration on each request, so the two planes never drift. The allowlist rules apply in order:
+
+1. An exported target passes for everyone.
+2. An unexported relayed request is refused. The hop marker (`hops_remaining` below the origin sentinel) is unauthenticated defense in depth. The identity rule below is the control that holds against a forged budget.
+3. An unexported origin request passes only for a first-party session: not relayed, a member of `hive_trust`, and not of `peer_trust`.
+4. Any other unexported request is refused (external peers, sessions in neither store, and anonymous sessions).
+
+When the allowlist refuses, a matching `ExportGrant` may still allow the target before deny gates run.
+
+**Grants**
+
+`ExportGrant` opens one unexported target to selected caller identities. A target passes when it is exported, granted, or a first-party origin request, and every deny gate must then agree.
+
+```rust
+struct PartnerGrant {
+	granted_spki: Vec<u8>,
+	target: Urn<'static>,
+}
+
+impl ExportGrant for PartnerGrant {
+	fn grants(&self, target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> bool {
+		*target == self.target && session.peer_public_key() == Some(self.granted_spki.as_slice())
+	}
+}
+
+let conf = ClusterConfig::builder(tls)
+	.with_exported_types([namespace.servlet("search")?])
+	// Partner B may reach "ledger" without it being advertised
+	.with_export_grant(Arc::new(PartnerGrant { granted_spki, target: namespace.servlet("ledger")? }))
+	.build();
+```
+
+Grant semantics:
+
+- The granted subject is the adjacent authenticated principal. On a relayed request that principal is the relaying peer gateway, so a grant matching a relayed request expresses federation-level trust in that gateway. Conservative grants test `!relayed`.
+- A granted type never appears on the advertised slate. It is a private interface whose URN the grantee learns out of band.
+- Do not emulate a grant by exporting the type and denying everyone except the partner. That workaround is fail-open (a forgotten gate opens the type to every peer) and it advertises the type to the whole federation.
+
+**Custom gates**
+
+Granular per-identity rules compose through custom gates:
+
+1. Every gate must pass (intersection with the allow sources).
+2. A deny gate overrides a grant.
+3. `session_is_first_party` exposes the built-in classifier for reuse.
+
+```rust
+struct DenyPeerKeyGate {
+	denied_spki: Vec<u8>,
+	target: Urn<'static>,
+}
+
+impl ExportGate for DenyPeerKeyGate {
+	fn evaluate(&self, target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> TransitStatus {
+		if *target == self.target && session.peer_public_key() == Some(self.denied_spki.as_slice()) {
+			return TransitStatus::PermissionDenied;
+		}
+
+		TransitStatus::Ok
+	}
+}
+
+let conf = ClusterConfig::builder(tls)
+	.with_exported_types([namespace.servlet("ping")?])
+	.with_export_gate(Arc::new(DenyPeerKeyGate { denied_spki, target: namespace.servlet("ping")? }))
+	.build();
+```
+
+**Mutual TLS**
+
+First-party recognition requires mutual TLS. The accept plane stores a session certificate only when `ClusterTlsConfig::client_validators` is configured. Without that, every session is anonymous, so an export list also blocks unexported targets on the origin plane. The gateway traces `CLUSTER_EXPORT_IDENTITY_UNAVAILABLE` once at start when an export list is set but client identity is not captured (`client_validators` empty or `hive_trust` missing).
+
+**Configuration**
+
+- `None` (the default) exports every locally served type. A federated gateway (`peer_trust` set or a non-empty peer dial list) in that posture traces `CLUSTER_EXPORT_UNBOUNDED` once at start.
+- An empty list advertises nothing and leaves unexported targets to first-party origin callers only.
+
+**Advertisements and peer precedence**
+
+- Advertisements are filtered only by the static `exported_types` list. Custom gates and grants cannot alter ads, because ads are minted per beat rather than per session.
+- Peer membership wins. A certificate in `peer_trust` is never first-party, even when `hive_trust` also holds it, so an identity in both stores cannot escalate to unexported targets.
+- The same precedence guards the hive plane. A control frame whose signer is in `peer_trust` is refused there, so a certificate in both stores cannot register hives.
+
+**Auditing**
+
+A refusal traces `CLUSTER_EXPORT_REFUSED` with the caller certificate fingerprint as payload and the relayed flag as value. Audits attribute the refusal to a principal and can infer hop-marker versus origin-plane refusal from that flag. A deciding grant traces `CLUSTER_EXPORT_GRANTED` under the same convention, so widened access stays attributable.
+
+**Gossip ingress**
+
+The gossip ingress sink (`GossipConfig::ingress`) sits outside the export boundary. Colony scope and the origin signature gate which peers may flood a rumor, and the operator, not the peer, chooses the delivery type.
 
 ##### Heartbeat Mechanism
 
@@ -3070,7 +3216,7 @@ When multiple instances support the same servlet type, the cluster uses a `LoadB
 
 ##### Colony Gossip
 
-Colony gossip floods origin-signed rumors across member gateways--the pheromone broadcast of the swarm. A publisher asks the local gateway to mint a rumor; peers relay and repair until hop budget or freshness expires.
+Colony gossip floods origin-signed rumors across member gateways: the pheromone broadcast of the swarm. A publisher asks the local gateway to mint a rumor; peers relay and repair until hop budget or freshness expires.
 
 ```rust
 let conf = ClusterConfig::builder(tls)
@@ -3088,7 +3234,7 @@ Flow:
 
 1. **Publish**: A hive-plane signed `PublishGossip` carries `GossipRumor { payload }`. The accepting origin gateway must be a colony member. It mints an origin-signed rumor Frame (id and issue time from the publish frame) and starts the flood.
 2. **Relay**: Peers carry `ClusterRequest::Gossip` with an outer relay Frame. Hop radius lives only in the outer `metadata.lifetime`. The inner rumor stays byte-identical under the origin signature. Relays verify on the peer trust plane; the origin colony URN MUST equal the local gateway's colony URN.
-3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice.
+3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice. An application rumor is recorded for repair and delivery retry. A peer advertisement rumor is only witnessed (`GossipJournal::witness`, a required trait method). Its digest deduplicates and breaks flood loops, but the bytes are never retained, repaired, or delivered locally.
 4. **Local ingress**: `GossipConfig.ingress` names a servlet type on the receiving gateway. `None` means journal and reflood only (immediate local ack).
 5. **Reflood**: Remaining hop TTL and a non-empty `peers` list continue the flood.
 6. **Reconcile**: `ReconcileGossip` exchanges held digests; the peer answers with `GossipWant`. The advertise beat also runs anti-entropy repair and pending-local retry.
@@ -3102,12 +3248,12 @@ Clients interact with clusters through work request messages:
 1. Client sends `ClusterWorkRequest` with `servlet_type` and encoded `payload`
 2. Cluster looks up Local and Peer routes for that servlet type
 3. Load balancer selects an instance (hive or peer gateway)
-4. Cluster forwards the payload--directly to a local hive, or one hop to a peer with `forwarded: true`
+4. Cluster forwards the payload: directly to a local hive, or to a peer gateway with a decremented `hops_remaining` budget
 5. The serving hive processes and returns a response
 6. Cluster wraps the response in `ClusterWorkResponse` and returns it to the client
 
 ```rust
-// Client sends (forwarded defaults to false):
+// Client sends (hops_remaining defaults to the u8::MAX origin sentinel):
 let request = ClusterWorkRequest::new(
 	servlet_type_urn, // e.g. urn:tightbeam::servlet:calculator
 	encode(&CalcRequest { value: 42 })?,
@@ -3132,6 +3278,16 @@ pub struct PeerConfig {
 	pub advertise_interval: Option<Duration>,
 	/// Optional exact-match allowlist for claimed peer dial addresses
 	pub peer_dial_allowlist: Option<Vec<String>>,
+	/// Hop budget honored on inbound work and routed stream opens
+	/// (default 1; `0` disables forwarding; `2` enables relay fallback)
+	pub max_hops: u8,
+	/// Advertisement rumor reflood interval while the slate is unchanged
+	/// (keep it under the gossip freshness window)
+	pub rumor_refresh: Duration,
+	/// Servlet types disclosed to and reachable by external peers.
+	/// `None` exports every locally served type. `Some` drives both the
+	/// advertise filter and the fail-closed allowlist.
+	pub exported_types: Option<Vec<Urn<'static>>>,
 }
 
 pub struct ClusterConfig {
@@ -3152,6 +3308,12 @@ pub struct ClusterConfig {
 	pub pheromone: PheromoneConfig,
 	/// Gate policies evaluated on every gateway frame before decoding
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	/// Custom export gates evaluated where the servlet target is known.
+	/// They compose with the allow sources as intersection.
+	pub export_gates: Vec<Arc<dyn ExportGate>>,
+	/// Positive export grants evaluated when the allowlist refuses.
+	/// Allow sources compose as union. Deny gates still override.
+	pub export_grants: Vec<Arc<dyn ExportGrant>>,
 	/// Connection pool configuration for hive (and peer) connections
 	pub pool_config: PoolConfig,
 
@@ -3174,14 +3336,17 @@ Clusters can be tested using `environment Cluster`:
 ```rust
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, cluster, hive};
 
+const WORK_SENT: Urn<'static> = Urn::new("test", "event:cluster/work-sent");
+const ROUTING_ACCEPTED: Urn<'static> = Urn::new("test", "event:cluster/routing-accepted");
+
 tb_assert_spec! {
 	pub ClusterRoutingSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(work_sent, exactly!(1)),
-			(routing_accepted, exactly!(1))
+			(WORK_SENT, exactly!(1)),
+			(ROUTING_ACCEPTED, exactly!(1))
 		]
 	}
 }
@@ -3210,7 +3375,7 @@ tb_scenario! {
 		}],
 		// Owns the cluster for registry checks and stop
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			trace.event(ClusterRoutingSpec::work_sent)?;
+			trace.event(WORK_SENT)?;
 
 			let request = ClusterWorkRequest::new(
 				ping_type(), // urn:tightbeam::servlet:ping
@@ -3225,7 +3390,7 @@ tb_scenario! {
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
 			assert_eq!(work_response.status, TransitStatus::Ok);
 
-			trace.event(ClusterRoutingSpec::routing_accepted)?;
+			trace.event(ROUTING_ACCEPTED)?;
 
 			cluster.stop();
 			Ok(())
@@ -3274,7 +3439,7 @@ Each emitted event carries a kind URN from the closed inventory in `tightbeam::i
 urn:tightbeam:event:<domain>/<event-name>
 ```
 
-Domains (illustrative; full constants live in that module):
+Domains (see `tightbeam::instrumentation::events` for the full set):
 
 - **Core / meta**: `core/start`, `core/end`, `core/warn`, `core/error`, `trace/clock-origin`
 - **External**: `gate/accept`, `gate/reject`, `transport/request-recv`, `transport/response-send`
@@ -3645,16 +3810,25 @@ PipelineBuilder::new(trace)
 Assert the full job URNs (exact string match; see [§10.2](#102-event-kind-taxonomy)):
 
 ```rust
+const CREATE_HS_START: Urn<'static> =
+	Urn::new("tightbeam", "event:job/create-handshake-request-start");
+const CREATE_HS_SUCCESS: Urn<'static> =
+	Urn::new("tightbeam", "event:job/create-handshake-request-success");
+const VALIDATE_START: Urn<'static> =
+	Urn::new("tightbeam", "event:job/validate-request-start");
+const VALIDATE_SUCCESS: Urn<'static> =
+	Urn::new("tightbeam", "event:job/validate-request-success");
+
 tb_assert_spec! {
 	pub PipelineSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			("urn:tightbeam:event:job/create-handshake-request-start", exactly!(1)),
-			("urn:tightbeam:event:job/create-handshake-request-success", exactly!(1)),
-			("urn:tightbeam:event:job/validate-request-start", exactly!(1)),
-			("urn:tightbeam:event:job/validate-request-success", exactly!(1))
+			(CREATE_HS_START, exactly!(1)),
+			(CREATE_HS_SUCCESS, exactly!(1)),
+			(VALIDATE_START, exactly!(1)),
+			(VALIDATE_SUCCESS, exactly!(1))
 		]
 	}
 }
@@ -3663,18 +3837,18 @@ tb_process_spec! {
 	pub PipelineProcess,
 	events {
 		observable {
-			"urn:tightbeam:event:job/create-handshake-request-start",
-			"urn:tightbeam:event:job/create-handshake-request-success",
-			"urn:tightbeam:event:job/validate-request-start",
-			"urn:tightbeam:event:job/validate-request-success"
+			CREATE_HS_START,
+			CREATE_HS_SUCCESS,
+			VALIDATE_START,
+			VALIDATE_SUCCESS
 		}
 		hidden {}
 	}
 	states {
-		Idle => { "urn:tightbeam:event:job/create-handshake-request-start" => Creating },
-		Creating => { "urn:tightbeam:event:job/create-handshake-request-success" => Validating },
-		Validating => { "urn:tightbeam:event:job/validate-request-start" => ValidatingRun },
-		ValidatingRun => { "urn:tightbeam:event:job/validate-request-success" => Done },
+		Idle => { CREATE_HS_START => Creating },
+		Creating => { CREATE_HS_SUCCESS => Validating },
+		Validating => { VALIDATE_START => ValidatingRun },
+		ValidatingRun => { VALIDATE_SUCCESS => Done },
 		Done => {}
 	}
 	terminal { Done }
@@ -3942,11 +4116,11 @@ Value check:
 
 ```rust
 assertions: [
-	(priority, exactly!(1), equals!(MessagePriority::LowLatency)),
-	(lifetime, exactly!(1), equals!(3_600)),
-	(version, exactly!(1), equals!(Version::V2)),
-	(confidentiality, exactly!(1), equals!(IsSome)),
-	(optional_field, exactly!(1), equals!(IsNone))
+	(PRIORITY, exactly!(1), equals!(MessagePriority::LowLatency)),
+	(LIFETIME, exactly!(1), equals!(3_600)),
+	(VERSION, exactly!(1), equals!(Version::V2)),
+	(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
+	(OPTIONAL_FIELD, exactly!(1), equals!(IsNone))
 ]
 ```
 
@@ -4104,15 +4278,19 @@ When CSP is configured via `.with_csp()` in `tb_scenario!`:
 ```rust
 use tightbeam::testing::*;
 
+const RECEIVED: Urn<'static> = Urn::new("test", "event:csp/received");
+const RESPONDED: Urn<'static> = Urn::new("test", "event:csp/responded");
+const INTERNAL_PROCESSING: Urn<'static> = Urn::new("test", "event:csp/internal-processing");
+
 tb_process_spec! {
 	pub SimpleProcess,
 	events {
-		observable { "Received", "Responded" }
-		hidden { "internal_processing" }
+		observable { RECEIVED, RESPONDED }
+		hidden { INTERNAL_PROCESSING }
 	}
 	states {
-		Idle       => { "Received" => Processing }
-		Processing => { "internal_processing" => Processing, "Responded" => Idle }
+		Idle       => { RECEIVED => Processing }
+		Processing => { INTERNAL_PROCESSING => Processing, RESPONDED => Idle }
 	}
 	terminal { Idle }
 	choice { Processing }
@@ -4170,22 +4348,39 @@ The `tb_compose_spec!` macro generates a type that implements `CompositionSpec` 
 ```rust
 use tightbeam::testing::*;
 
+const REQUEST: Urn<'static> = Urn::new("test", "event:flow/request");
+const RESPONSE: Urn<'static> = Urn::new("test", "event:flow/response");
+const RETRY: Urn<'static> = Urn::new("test", "event:flow/retry");
+
+tb_assert_spec! {
+	pub RequestRetrySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(REQUEST, exactly!(1)),
+			(RETRY, exactly!(1)),
+			(RESPONSE, exactly!(1))
+		]
+	},
+}
+
 // Two simple processes
 tb_process_spec! {
 	pub RequestFlow,
-	events { observable { "request", "response" } }
+	events { observable { REQUEST, RESPONSE } }
 	states {
-		Idle => { "request" => Waiting },
-		Waiting => { "response" => Idle }
+		Idle => { REQUEST => Waiting },
+		Waiting => { RESPONSE => Idle }
 	}
 	terminal { Idle }
 }
 
 tb_process_spec! {
 	pub RetryFlow,
-	events { observable { "retry" } }
+	events { observable { RETRY } }
 	states {
-		RetryIdle => { "retry" => RetryIdle }
+		RetryIdle => { RETRY => RetryIdle }
 	}
 	terminal { RetryIdle }
 }
@@ -4209,14 +4404,14 @@ tb_compose_spec! {
 tb_scenario! {
 	name: test_request_with_retry,
 	config: ScenarioConfig::builder()
-		.with_spec(ClientServerSpec::latest())
+		.with_spec(RequestRetrySpec::latest())
 		.with_csp(RequestWithRetry)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("request")?;
-			trace.event("retry")?;
-			trace.event("response")?;
+			trace.event(REQUEST)?;
+			trace.event(RETRY)?;
+			trace.event(RESPONSE)?;
 			Ok(())
 		}
 	}
@@ -4287,16 +4482,19 @@ fdr: FdrConfig {
 **Simple Example**:
 
 ```rust
+const START: Urn<'static> = Urn::new("test", "event:simple/start");
+const FINISH: Urn<'static> = Urn::new("test", "event:simple/finish");
+
 // Define a simple two-state process
 tb_process_spec! {
 	pub SimpleProcess,
 	events {
-		observable { "start", "finish" }
+		observable { START, FINISH }
 		hidden { }
 	}
 	states {
-		Idle => { "start" => Working },
-		Working => { "finish" => Idle }
+		Idle => { START => Working },
+		Working => { FINISH => Idle }
 	}
 	terminal { Idle }
 }
@@ -4308,8 +4506,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(start, exactly!(1)),
-			(finish, exactly!(1))
+			(START, exactly!(1)),
+			(FINISH, exactly!(1))
 		]
 	},
 }
@@ -4331,8 +4529,8 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("start")?;
-			trace.event("finish")?;
+			trace.event(START)?;
+			trace.event(FINISH)?;
 			Ok(())
 		}
 	}
@@ -4431,10 +4629,10 @@ tb_process_spec! {
 	pub ClientServerProcess,
 	events {
 		// Observable alphabet (Σ): externally visible protocol events
-		observable { "connect", "request", "response", "disconnect" }
+		observable { CONNECT, REQUEST, RESPONSE, DISCONNECT }
 
 		// Hidden alphabet (τ): internal implementation details
-		hidden { "serialize", "encrypt", "decrypt", "deserialize" }
+		hidden { SERIALIZE, ENCRYPT, DECRYPT, DESERIALIZE }
 	}
 	// ...
 }
@@ -4446,8 +4644,8 @@ tb_process_spec! {
 
 The instrumentation taxonomy (§10.2) maps tightbeam events to categories:
 
-- **Observable**: `gate_accept`, `gate_reject`, `request_recv`, `response_send`, `assert_label`
-- **Hidden (τ)**: `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`, `process_hidden`
+- **Observable**: `gate/accept`, `gate/reject`, `transport/request-recv`, `transport/response-send`, `assert/label`
+- **Hidden (τ)**: `handler/enter`, `handler/exit`, `crypto/step`, `compress/step`, `route/step`, `policy/eval`, `process/hidden`
 
 #### 12.5.3 Nondeterministic Choice and Refusal Sets
 
@@ -4696,14 +4894,17 @@ Environment examples also appear in [§9.3](#93-components) (Worker, Servlet, Hi
 ```rust
 use tightbeam::testing::*;
 
+const RECEIVED: Urn<'static> = Urn::new("test", "event:bare/received");
+const RESPONDED: Urn<'static> = Urn::new("test", "event:bare/responded");
+
 tb_assert_spec! {
 	pub BareSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(Received, exactly!(1)),
-			(Responded, exactly!(1))
+			(RECEIVED, exactly!(1)),
+			(RESPONDED, exactly!(1))
 		]
 	},
 }
@@ -4711,11 +4912,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub BareProcess,
 	events {
-		observable { "Received", "Responded" }
+		observable { RECEIVED, RESPONDED }
 	}
 	states {
-		Idle       => { "Received" => Processing }
-		Processing => { "Responded" => Idle }
+		Idle       => { RECEIVED => Processing }
+		Processing => { RESPONDED => Idle }
 	}
 	terminal { Idle }
 }
@@ -4728,8 +4929,8 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(BareSpec::Received)?;
-			trace.event(BareSpec::Responded)?;
+			trace.event(RECEIVED)?;
+			trace.event(RESPONDED)?;
 			Ok(())
 		}
 	}
@@ -4738,14 +4939,22 @@ tb_scenario! {
 
 **Full Example: All Three Layers with ServiceClient Environment**
 
-This example demonstrates progressive verification from L1 through L3:
-
 ```rust
 #![cfg(all(feature = "testing-fdr", feature = "tcp", feature = "tokio"))]
 use tightbeam::testing::*;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::Protocol;
+
+const CONNECT: Urn<'static> = Urn::new("test", "event:client-server/connect");
+const REQUEST: Urn<'static> = Urn::new("test", "event:client-server/request");
+const RESPONSE: Urn<'static> = Urn::new("test", "event:client-server/response");
+const DISCONNECT: Urn<'static> = Urn::new("test", "event:client-server/disconnect");
+const MESSAGE_CONTENT: Urn<'static> = Urn::new("test", "event:client-server/message-content");
+const SERIALIZE: Urn<'static> = Urn::new("test", "event:client-server/serialize");
+const ENCRYPT: Urn<'static> = Urn::new("test", "event:client-server/encrypt");
+const DECRYPT: Urn<'static> = Urn::new("test", "event:client-server/decrypt");
+const DESERIALIZE: Urn<'static> = Urn::new("test", "event:client-server/deserialize");
 
 // Layer 1: Assert spec - defines expected assertions and cardinalities
 tb_assert_spec! {
@@ -4754,11 +4963,11 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(connect, exactly!(1)),
-			(request, exactly!(1)),
-			(response, exactly!(2)),
-			(disconnect, exactly!(1)),
-			(message_content, exactly!(1), equals!("test"))
+			(CONNECT, exactly!(1)),
+			(REQUEST, exactly!(1)),
+			(RESPONSE, exactly!(2)),
+			(DISCONNECT, exactly!(1)),
+			(MESSAGE_CONTENT, exactly!(1), equals!("test"))
 		]
 	},
 }
@@ -4767,17 +4976,17 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub ClientServerProcess,
 	events {
-		observable { "connect", "request", "response", "disconnect" }
-		hidden { "serialize", "encrypt", "decrypt", "deserialize" }
+		observable { CONNECT, REQUEST, RESPONSE, DISCONNECT }
+		hidden { SERIALIZE, ENCRYPT, DECRYPT, DESERIALIZE }
 	}
 	states {
-		Idle        => { "connect" => Connected }
-		Connected   => { "request" => Processing, "serialize" => Serializing }
-		Serializing => { "encrypt" => Encrypting }
-		Encrypting  => { "request" => Processing }
-		Processing  => { "decrypt" => Decrypting, "response" => Responded }
-		Decrypting  => { "deserialize" => Processing }
-		Responded   => { "disconnect" => Idle }
+		Idle        => { CONNECT => Connected }
+		Connected   => { REQUEST => Processing, SERIALIZE => Serializing }
+		Serializing => { ENCRYPT => Encrypting }
+		Encrypting  => { REQUEST => Processing }
+		Processing  => { DECRYPT => Decrypting, RESPONSE => Responded }
+		Decrypting  => { DESERIALIZE => Processing }
+		Responded   => { DISCONNECT => Idle }
 	}
 	terminal { Idle }
 	choice { Connected, Processing }
@@ -4818,9 +5027,9 @@ tb_scenario! {
 				protocol TokioListener: listener,
 				assertions: trace.share(),
 				handle: |frame, trace| async move {
-					trace.event("connect")?;
-					trace.event("request")?;
-					trace.event("response")?;
+					trace.event(CONNECT)?;
+					trace.event(REQUEST)?;
+					trace.event(RESPONSE)?;
 					Some(frame)
 				}
 			};
@@ -4830,7 +5039,7 @@ tb_scenario! {
 			let stream = <TokioListener as Protocol>::connect(addr).await?;
 			let mut client = <TokioListener as Protocol>::create_transport(stream);
 
-			trace.event("response")?;
+			trace.event(RESPONSE)?;
 			let frame = compose! {
 				V0: id: "test",
 				order: 1u64,
@@ -4841,10 +5050,10 @@ tb_scenario! {
 			// Decode response and emit value assertion
 			if let Some(resp_frame) = response {
 				let decoded: TestMessage = crate::decode(&resp_frame.message)?;
-				trace.event_with("message_content", &[], decoded.content)?;
+				trace.event_with(MESSAGE_CONTENT, &[], decoded.content)?;
 			}
 
-			trace.event("disconnect")?;
+			trace.event(DISCONNECT)?;
 			Ok(())
 		}
 	}
@@ -4942,6 +5151,11 @@ tb_scenario! {
 use tightbeam::testing::error::TestingError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
+const START: Urn<'static> = Urn::new("test", "event:fuzz/start");
+const ACTION_A: Urn<'static> = Urn::new("test", "event:fuzz/action-a");
+const ACTION_B: Urn<'static> = Urn::new("test", "event:fuzz/action-b");
+const DONE: Urn<'static> = Urn::new("test", "event:fuzz/done");
+
 // Layer 1: Assertion spec
 tb_assert_spec! {
 	pub SimpleFuzzSpec,
@@ -4949,10 +5163,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(start, exactly!(1)),
-			(action_a, at_least!(0)),
-			(action_b, at_least!(0)),
-			(done, exactly!(1))
+			(START, exactly!(1)),
+			(ACTION_A, at_least!(0)),
+			(ACTION_B, at_least!(0)),
+			(DONE, exactly!(1))
 		]
 	},
 }
@@ -4961,12 +5175,12 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SimpleFuzzProc,
 	events {
-		observable { "start", "action_a", "action_b", "done" }
+		observable { START, ACTION_A, ACTION_B, DONE }
 		hidden { }
 	}
 	states {
-		S0 => { "start" => S1 },
-		S1 => { "action_a" => S1, "action_b" => S1, "done" => S2 }
+		S0 => { START => S1 },
+		S1 => { ACTION_A => S1, ACTION_B => S1, DONE => S2 }
 	}
 	terminal { S2 }
 }
@@ -5046,9 +5260,9 @@ Valid events are sorted by label, so the byte-to-event mapping is deterministic 
 
 ```
 Input: [0x00, 0x01, 0x00, 0x02]
-Trace: "start" -> "action_a" -> "action_b" -> "done"
+Trace: START -> ACTION_A -> ACTION_B -> DONE
 State: S0 -> S1 -> S1 -> S2
-Result: Crash at state S1 after "action_b"
+Result: Crash at state S1 after ACTION_B
 ```
 
 #### 12.8.5 IJON Integration: Input-to-State Correspondence
@@ -5102,14 +5316,17 @@ if (input[0] == 0xDEADBEEF) {
 tightbeam equivalent - no manual annotation needed:
 
 ```rust
+const MAGIC_DETECTED: Urn<'static> = Urn::new("test", "event:parser/magic-detected");
+const PARSE_CONTINUE: Urn<'static> = Urn::new("test", "event:parser/parse-continue");
+
 tb_process_spec! {
-    pub ParserProcess,
-    events { observable { "magic_detected", "parse_continue" } }
-    states {
-        Init   => { "magic_detected" => SpecialState, "parse_continue" => Parsing }
-        SpecialState => { /* ... */ }
-    }
-    // IJON automatically reports when SpecialState is reached
+	pub ParserProcess,
+	events { observable { MAGIC_DETECTED, PARSE_CONTINUE } }
+	states {
+		Init   => { MAGIC_DETECTED => SpecialState, PARSE_CONTINUE => Parsing }
+		SpecialState => { /* ... */ }
+	}
+	// IJON automatically reports when SpecialState is reached
 }
 ```
 
@@ -5305,44 +5522,48 @@ The following table summarizes tightbeam's native support for high-assurance sta
 
 ## 13. End-to-End Examples
 
-The following examples are complete and runnable.
-
 ### 13.1 Complete Client-Server Application
 
-This example demonstrates an end-to-end worker and servlet setup tested with `tb_scenario!`, covering assertion specs, CSP process specs, and environment integration.
+End-to-end worker and servlet flows under `tb_scenario!` with AssertSpec + CSP. Assertion and process labels are `Urn` constants (exact match).
 
 #### Worker Integration Example
 
 ```rust
 use tightbeam::testing::*;
+use tightbeam::utils::urn::Urn;
 
-// Define assertion spec for worker behavior
+const RELAY_START: Urn<'static> = Urn::new("test", "event:worker/relay-start");
+const RELAY_SUCCESS: Urn<'static> = Urn::new("test", "event:worker/relay-success");
+const RELAY_REJECTED: Urn<'static> = Urn::new("test", "event:worker/relay-rejected");
+const RESPONSE_RESULT: Urn<'static> = Urn::new("test", "event:worker/response-result");
+const VALIDATE_MESSAGE: Urn<'static> = Urn::new("test", "event:worker/validate-message");
+const PROCESS_MESSAGE: Urn<'static> = Urn::new("test", "event:worker/process-message");
+
 tb_assert_spec! {
 	pub PingPongWorkerSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(relay_start, exactly!(2)),
-			(relay_success, exactly!(1)),
-			(response_result, exactly!(1), equals!("PONG")),
-			(relay_rejected, exactly!(1))
+			(RELAY_START, exactly!(2)),
+			(RELAY_SUCCESS, exactly!(1)),
+			(RESPONSE_RESULT, exactly!(1), equals!("PONG")),
+			(RELAY_REJECTED, exactly!(1))
 		]
 	},
 }
 
-// Define CSP process spec for worker state machine
 tb_process_spec! {
 	pub PingPongWorkerProcess,
 	events {
-		observable { "relay_start", "relay_success", "relay_rejected" }
-		hidden { "validate_message", "process_message" }
+		observable { RELAY_START, RELAY_SUCCESS, RELAY_REJECTED }
+		hidden { VALIDATE_MESSAGE, PROCESS_MESSAGE }
 	}
 	states {
-		Idle       => { "relay_start" => Processing }
-		Processing => { "validate_message" => Validating }
-		Validating => { "process_message" => Responding, "relay_rejected" => Idle }
-		Responding => { "relay_success" => Idle }
+		Idle       => { RELAY_START => Processing }
+		Processing => { VALIDATE_MESSAGE => Validating }
+		Validating => { PROCESS_MESSAGE => Responding, RELAY_REJECTED => Idle }
+		Responding => { RELAY_SUCCESS => Idle }
 	}
 	terminal { Idle }
 	choice { Validating }
@@ -5359,8 +5580,7 @@ tb_scenario! {
 			PingPongWorker::default()
 		},
 		stimulus: |WorkerEnv { trace, worker, .. }| async move {
-			// Test accepted message
-			trace.event("relay_start")?;
+			trace.event(RELAY_START)?;
 
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
@@ -5369,12 +5589,11 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(pong) = response {
-				trace.event("relay_success")?;
-				trace.event_with("response_result", &[], pong.result)?;
+				trace.event(RELAY_SUCCESS)?;
+				trace.event_with(RESPONSE_RESULT, &[], pong.result)?;
 			}
 
-			// Test rejected message
-			trace.event("relay_start")?;
+			trace.event(RELAY_START)?;
 
 			let pong_msg = RequestMessage {
 				content: "PONG".to_string(),
@@ -5383,7 +5602,7 @@ tb_scenario! {
 
 			let result = worker.relay(Arc::new(pong_msg)).await;
 			if result.is_err() {
-				trace.event("relay_rejected")?;
+				trace.event(RELAY_REJECTED)?;
 			}
 
 			Ok(())
@@ -5396,34 +5615,40 @@ tb_scenario! {
 
 ```rust
 use tightbeam::testing::*;
+use tightbeam::utils::urn::Urn;
 
-// Define assertion spec for servlet behavior
+const REQUEST_RECEIVED: Urn<'static> = Urn::new("test", "event:servlet/request-received");
+const PONG_SENT: Urn<'static> = Urn::new("test", "event:servlet/pong-sent");
+const RESPONSE_RESULT: Urn<'static> = Urn::new("test", "event:servlet/response-result");
+const IS_WINNER: Urn<'static> = Urn::new("test", "event:servlet/is-winner");
+const VALIDATE_LUCKY_NUMBER: Urn<'static> = Urn::new("test", "event:servlet/validate-lucky-number");
+const FORMAT_RESPONSE: Urn<'static> = Urn::new("test", "event:servlet/format-response");
+
 tb_assert_spec! {
 	pub PingPongSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(request_received, exactly!(1)),
-			(pong_sent, exactly!(1)),
-			(response_result, exactly!(1), equals!("PONG")),
-			(is_winner, exactly!(1), equals!(true))
+			(REQUEST_RECEIVED, exactly!(1)),
+			(PONG_SENT, exactly!(1)),
+			(RESPONSE_RESULT, exactly!(1), equals!("PONG")),
+			(IS_WINNER, exactly!(1), equals!(true))
 		]
 	},
 }
 
-// Define process spec for servlet state machine
 tb_process_spec! {
 	pub PingPongProcess,
 	events {
-		observable { "request_received", "pong_sent" }
-		hidden { "validate_lucky_number", "format_response" }
+		observable { REQUEST_RECEIVED, PONG_SENT }
+		hidden { VALIDATE_LUCKY_NUMBER, FORMAT_RESPONSE }
 	}
 	states {
-		Idle       => { "request_received" => Processing }
-		Processing => { "validate_lucky_number" => Validating }
-		Validating => { "format_response" => Responding }
-		Responding => { "pong_sent" => Idle }
+		Idle       => { REQUEST_RECEIVED => Processing }
+		Processing => { VALIDATE_LUCKY_NUMBER => Validating }
+		Validating => { FORMAT_RESPONSE => Responding }
+		Responding => { PONG_SENT => Idle }
 	}
 	terminal { Idle }
 	choice { Processing }
@@ -5456,22 +5681,17 @@ tb_scenario! {
 				}
 			}
 
-			// Client-side assertion before sending
-			trace.event("request_received")?;
+			trace.event(REQUEST_RECEIVED)?;
 
-			// Test winning case
 			let ping_message = generate_message(42, None)?;
 			let Some(response) = client.emit(ping_message, None).await? else {
 				return Err(TightBeamError::MissingResponse);
 			};
 			let response_message: ResponseMessage = decode(&response.message)?;
 
-			// Emit value assertions for spec verification
-			trace.event_with("response_result", &[], response_message.result)?;
-			trace.event_with("is_winner", &[], response_message.is_winner)?;
-
-			// Client-side assertion after receiving
-			trace.event("pong_sent")?;
+			trace.event_with(RESPONSE_RESULT, &[], response_message.result)?;
+			trace.event_with(IS_WINNER, &[], response_message.is_winner)?;
+			trace.event(PONG_SENT)?;
 
 			Ok(())
 		}
@@ -5545,8 +5765,8 @@ tb_scenario! {
 
 This project is licensed under either of
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](../LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](../LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 **at your option**. You may choose whichever license best fits your needs:
 
@@ -5566,10 +5786,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 #### Project Structure
 
-The workspace consists of the following components:
-
+- **tightbeam/src/lib.rs**: Crate root
 - **tightbeam/src/core.rs**: Shared library code and common utilities
-- **tightbeam/src/lib.rs**: Library root
 - **tightbeam/tests/**: Integration test suites
 
 [crate-image]: https://img.shields.io/crates/v/tightbeam-rs.svg

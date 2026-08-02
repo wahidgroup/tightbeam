@@ -1,10 +1,37 @@
 //! Shared fixtures for colony cluster integration tests.
+//!
+//! Certificate identities, TLS configs, trace recorders, and peering
+//! preamble helpers live here so scenario modules stay assertion-focused.
+//!
+//! # Certificates
+//!
+//! [`member_identity`] mints a distinct gateway certificate per organization.
+//! [`cluster_certs`] shares one signing key and therefore cannot distinguish
+//! relay from origin in multi-gateway topologies.
+//!
+//! # Trust planes
+//!
+//! Use the layout that matches the scenario:
+//!
+//! - Shared [`cluster_certs`] with overlapping `peer_trust`: register and
+//!   sign hive control frames with [`hive_plane_certs`] and
+//!   [`split_hive_trust`] (peer membership wins on the hive plane).
+//! - Distinct [`member_identity`] federation or org topologies: put the
+//!   full combined store on `hive_trust` and exclude self from `peer_trust`.
+//! - Export-boundary scenarios: per-org split planes in `exports.rs`
+//!   (`hive_trust` = own org, `peer_trust` = external peer).
+//!
+//! # Work probes
+//!
+//! [`emit_typed_work`] always encodes a ping payload under the supplied
+//! type name. Export scenarios reuse it for private types that still run
+//! the ping servlet.
 
 use tightbeam::{cluster, compose, hive, servlet};
 
 // Re-exports consumed by sibling scenario modules via `use super::common::*`.
 pub(super) use super::events::*;
-pub(super) use crate::common::x509::{combined_trust, GatewayCerts};
+pub(super) use crate::common::x509::{combined_trust, combined_validator, GatewayCerts};
 pub(super) use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub(super) use core::time::Duration;
 pub(super) use sha3::Sha3_256;
@@ -64,8 +91,8 @@ pub(super) use tightbeam::{
 pub(crate) const PEER_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9000";
 
 /// Failed forwards a peer trail tolerates before abandonment in the
-/// infection-containment scenarios. Kept small so the gate stays fast;
-/// the containment specs assert exactly this many `CLUSTER_WORK_FAILED`
+/// infection-containment scenarios. Kept small so the gate stays fast.
+/// The containment specs assert exactly this many `CLUSTER_WORK_FAILED`
 /// before selection drops the peer.
 pub(super) const CONTAINMENT_ABANDON_LIMIT: u32 = 3;
 
@@ -83,6 +110,60 @@ pub(super) fn test_colony_urn() -> Urn<'static> {
 
 pub(super) fn cluster_certs() -> ClusterTestCerts {
 	GatewayCerts::generate_colony(&test_colony_urn())
+}
+
+/// Fresh gateway identity in `colony`: a random key and a certificate that
+/// carries the colony URN as a URI SAN.
+///
+/// [`cluster_certs`] cannot serve multi-gateway topologies because every
+/// generated cert shares the fixed test signing key. All gateways would
+/// then resolve to one signer fingerprint, and a relay could never be
+/// told apart from an origin.
+pub(super) fn colony_identity(cn: &str, colony: &Urn<'_>) -> (Certificate, Secp256k1SigningKey) {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
+
+	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let cert = create_test_certificate_with_cn_and_uri_sans(&raw, cn, &[&colony.to_string()]);
+	(cert, Secp256k1SigningKey::from(raw))
+}
+
+/// [`colony_identity`] in the colony every member gateway joins.
+pub(super) fn member_identity(cn: &str) -> (Certificate, Secp256k1SigningKey) {
+	colony_identity(cn, &test_colony_urn())
+}
+
+/// Deterministic hive-plane identity, disjoint from the shared gateway
+/// identity.
+///
+/// The hive plane refuses a signer that `peer_trust` also holds (peer
+/// membership wins). Fixtures that put the shared gateway certificate in
+/// `peer_trust` for relay verification therefore register hives and sign
+/// origin publishes with this identity instead. The fixed scalar keeps
+/// the identity stable across closures, like [`cluster_certs`].
+///
+/// The bundled trust store covers the shared gateway identity so the
+/// hive can dial its gateway.
+pub(super) fn hive_plane_certs() -> Arc<ClusterTestCerts> {
+	use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
+
+	let raw = k256::ecdsa::SigningKey::from_bytes(&[7u8; 32].into()).expect("static scalar is a valid key");
+	let cert = create_test_certificate_with_cn_and_uri_sans(&raw, "Hive Plane", &[&test_colony_urn().to_string()]);
+	let gateway = cluster_certs();
+	let trust = combined_trust(&[&gateway.cert, &cert]);
+	let key = Secp256k1SigningKey::from(raw);
+
+	Arc::new(GatewayCerts { cert, key, trust })
+}
+
+/// Gateway hive trust for shared [`cluster_certs`] fixtures.
+///
+/// Combines the gateway identity (hive-pool dials between gateways) with
+/// the hive-plane identity (registration, address updates, and origin
+/// publishes). Do not pass a [`member_identity`] gateway here; federation
+/// and organization scenarios exclude self from `peer_trust` instead.
+pub(super) fn split_hive_trust(gateway: &ClusterTestCerts) -> Arc<dyn CertificateTrust> {
+	combined_trust(&[&gateway.cert, &hive_plane_certs().cert])
 }
 
 // ============================================================================
@@ -163,6 +244,16 @@ pub(super) async fn emit_frame(
 	client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)
 }
 
+/// Gate policy that denies every request, for scenarios proving the
+/// gateway enforces `with_gate_policy` on unary work and stream opens.
+pub(super) struct RejectAllPolicy;
+
+impl GatePolicy for RejectAllPolicy {
+	fn evaluate(&self, _message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+		TransitStatus::PermissionDenied
+	}
+}
+
 /// Record a registration outcome on the trace: the wire status as
 /// `REGISTER_STATUS`, the registry size as `REGISTRY_HIVES`, and whether
 /// a hive id was assigned as `REGISTER_ASSIGNED_ID`. The specs pin the
@@ -184,6 +275,25 @@ pub(super) fn record_work_status(trace: &TraceCollector, response: &ClusterWorkR
 	trace.event_with(WORK_STATUS, &[], response.status)?;
 	trace.event_with(WORK_PAYLOAD, &[], u64::from(response.payload.is_some()))?;
 	Ok(())
+}
+
+/// Sign a [`ClusterRequest::PublishGossip`] control frame with issue-time
+/// order and hop radius.
+pub(super) async fn signed_publish_gossip(
+	key: &Secp256k1SigningKey,
+	id: &[u8],
+	body: GossipRumor,
+	hop_ttl: u64,
+) -> Result<Frame, TightBeamError> {
+	let unsigned = frame_compose(Version::V2)
+		.with_id(id)
+		.with_order(current_timestamp_ms())
+		.with_lifetime(hop_ttl)
+		.with_message(ClusterRequest::PublishGossip(body))
+		.build()?;
+
+	let provider = Secp256k1KeyProvider::from(key.to_owned());
+	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
 }
 
 pub(super) async fn signed_control_frame_with_order(
@@ -359,7 +469,7 @@ cluster! {
 }
 
 /// Ping-servlet hive with an optional mux offer for both the hive control
-/// server and the hive -> cluster pool, on the scenario trace.
+/// server and the hive-to-cluster pool, on the scenario trace.
 pub(super) async fn start_ping_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
@@ -378,17 +488,24 @@ pub(super) async fn start_ping_hive(
 }
 
 /// Cluster conf with an optional mux offer for both the gateway server
-/// and the cluster -> hive pool.
+/// and the cluster-to-hive pool.
 pub(super) fn routing_cluster_conf(certs: &ClusterTestCerts, mux_offer: Option<TransportOffer>) -> ClusterConfig {
 	let mut conf = ClusterConfig::new(cluster_tls_config(certs));
 	conf.pool_config.mux_offer = mux_offer.map(Arc::new);
 	conf
 }
 
+/// Add the standard eight-stream mux offer to a cluster conf, so the
+/// gateway serves routed streams and its pools open them.
+pub(super) fn with_mux_offer(mut conf: ClusterConfig) -> ClusterConfig {
+	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+	conf
+}
+
 /// Emit one ping work request through the gateway and record the echoed
 /// payload as a valued event. The spec asserts the gateway routed it
-/// (`events::CLUSTER_WORK_ROUTED`) and the echo value (`WORK_ECHOED`);
-/// a refusal or missing payload leaves `WORK_ECHOED` absent.
+/// (`events::CLUSTER_WORK_ROUTED`) and the echo value (`WORK_ECHOED`).
+/// A refusal or missing payload leaves `WORK_ECHOED` absent.
 pub(super) async fn record_ping_echo(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
@@ -426,12 +543,18 @@ pub(super) async fn emit_servlet_update(
 	decode(&emit_frame(client, frame).await?.message)
 }
 
-pub(super) async fn emit_ping_work(
+/// Emit unary work under `type_name` with a ping payload.
+///
+/// The type URN is caller-chosen, but the body is always [`PingRequest`].
+/// Export scenarios use this for private types that still host the ping
+/// servlet.
+pub(super) async fn emit_typed_work(
 	client: &mut GenericClient<TokioListener>,
+	type_name: &str,
 	id: &[u8],
 ) -> Result<ClusterWorkResponse, TightBeamError> {
 	let work_request = ClusterRequest::Work(ClusterWorkRequest::new(
-		servlet_urn("ping"),
+		servlet_urn(type_name),
 		encode(&PingRequest { value: 21 })?,
 	));
 
@@ -444,13 +567,20 @@ pub(super) async fn emit_ping_work(
 	decode(&emit_frame(client, frame).await?.message)
 }
 
-/// Ping work already marked forwarded (loop-guard probe).
-pub(super) async fn emit_forwarded_ping_work(
+pub(super) async fn emit_ping_work(
+	client: &mut GenericClient<TokioListener>,
+	id: &[u8],
+) -> Result<ClusterWorkResponse, TightBeamError> {
+	emit_typed_work(client, "ping", id).await
+}
+
+/// Ping work with a spent relay budget (hop-exhaustion probe).
+pub(super) async fn emit_relayed_ping_work(
 	client: &mut GenericClient<TokioListener>,
 	id: &[u8],
 ) -> Result<ClusterWorkResponse, TightBeamError> {
 	let work_request = ClusterRequest::Work(
-		ClusterWorkRequest::new(servlet_urn("ping"), encode(&PingRequest { value: 21 })?).into_forwarded(),
+		ClusterWorkRequest::new(servlet_urn("ping"), encode(&PingRequest { value: 21 })?).into_relayed(0),
 	);
 
 	let frame = frame_compose(Version::V0)
@@ -468,15 +598,18 @@ pub(super) fn foreign_realm_instance(addr: &str) -> Urn<'static> {
 	servlet_instance(&namespace.servlet("ping").expect("test names satisfy the mint grammar"), addr)
 }
 
-/// Gateway conf that accepts peer advertisements: `peer_trust` anchors the
-/// advertising gateway's certificate. No `peers` set, so this gateway
-/// only receives.
+/// Gateway conf that accepts peer advertisements.
+///
+/// `peer_trust` anchors the advertising gateway's certificate. No `peers`
+/// set, so this gateway only receives.
 pub(super) fn peering_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 	peering_cluster_conf_with_trust(certs, Arc::clone(&certs.trust))
 }
 
-/// Like [`peering_cluster_conf`] but with an explicit peer trust store
-/// (used when more than one peer identity must verify).
+/// Like [`peering_cluster_conf`] but with an explicit peer trust store.
+///
+/// Used when more than one peer identity must verify, including federation
+/// peer-exclusion layouts and export split-plane scenarios.
 pub(super) fn peering_cluster_conf_with_trust(
 	certs: &ClusterTestCerts,
 	peer_trust: Arc<dyn CertificateTrust>,
@@ -502,7 +635,7 @@ pub(super) fn peering_with_dial_allowlist(certs: &ClusterTestCerts, allowlist: V
 }
 
 /// Importer conf whose peer trails abandon after a few failed forwards.
-/// The limit is small so containment scenarios stay fast; the specs pin
+/// The limit is small so containment scenarios stay fast. The specs pin
 /// [`CONTAINMENT_ABANDON_LIMIT`] failures before routing stops.
 pub(super) fn containment_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 	let mut conf = peering_cluster_conf(certs);
@@ -527,9 +660,10 @@ pub(super) fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: String) -
 		.build()
 }
 
-/// Send one signed advertisement of `types` from a peer at `gateway_addr`,
-/// signed by `signer`. The decoded status lands on the trace for spec
-/// verification.
+/// Send one signed advertisement of `types` from a peer at `gateway_addr`.
+///
+/// The frame is signed by `signer`. The decoded status lands on the trace
+/// for spec verification.
 pub(super) async fn advertise_peer_signed(
 	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
@@ -547,10 +681,11 @@ pub(super) async fn advertise_peer_signed(
 	send_advertisement_frame(trace, connect_certs, cluster, frame).await
 }
 
-/// Emit an already-signed advertisement frame: lets replay scenarios
-/// resend a byte-identical frame. Every decoded status lands on the
-/// trace as `PEER_AD_STATUS`, and the surviving peer-route count as
-/// `PEER_ROUTES_AFTER`, for spec verification.
+/// Emit an already-signed advertisement frame.
+///
+/// Replay scenarios resend a byte-identical frame. Every decoded status
+/// lands on the trace as `PEER_AD_STATUS`, and the surviving peer-route
+/// count as `PEER_ROUTES_AFTER`, for spec verification.
 pub(super) async fn send_advertisement_frame(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,

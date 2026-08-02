@@ -1,11 +1,12 @@
+use core::time::Duration;
 use std::sync::Arc;
 
 use super::{
 	ClusterError, PeerCaps, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, DEFAULT_ABANDONMENT_LIMIT,
 	DEFAULT_INITIAL_PHEROMONE,
 };
-use crate::colony::cluster::peer::AdmittedPeerAd;
-use crate::colony::common::MAX_PHEROMONE;
+use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
+use crate::colony::common::{current_timestamp_ms, MAX_PHEROMONE};
 use crate::utils::BasisPoints;
 
 // =========================================================================
@@ -344,20 +345,246 @@ fn peer_dial_conflicts_with_local_servlet_address() {
 }
 
 #[test]
-fn peer_slate_exceeds_caps_counts_gateways_and_routes() {
+fn slate_exceeds_caps_counts_gateways_and_routes() {
 	let registry = ServletRegistry::default();
 	registry.reconcile_by_hive(b"fp1", vec![peer_entry(b"a", b"fp1")]).ok();
 	registry.reconcile_by_hive(b"fp2", vec![peer_entry(b"a", b"fp2")]).ok();
 
-	assert_eq!(registry.peer_slate_exceeds_caps(b"fp3", 1, 2, 1024).ok(), Some(true));
-	assert_eq!(registry.peer_slate_exceeds_caps(b"fp1", 1, 2, 1024).ok(), Some(false));
-	// fp1 prior=1, fp2=1; slate of 5 => routes_after=6 > max 5
-	assert_eq!(registry.peer_slate_exceeds_caps(b"fp1", 5, 64, 5).ok(), Some(true));
-	assert_eq!(registry.peer_slate_exceeds_caps(b"fp1", 0, 1, 1).ok(), Some(false));
+	assert_eq!(
+		registry.slate_exceeds_caps(b"fp3", 1, RouteKind::Peer, 2, 1024).ok(),
+		Some(true)
+	);
+	assert_eq!(
+		registry.slate_exceeds_caps(b"fp1", 1, RouteKind::Peer, 2, 1024).ok(),
+		Some(false)
+	);
+	// With fp1 prior=1 and fp2=1, a slate of 5 makes routes_after=6,
+	// over the max of 5.
+	assert_eq!(registry.slate_exceeds_caps(b"fp1", 5, RouteKind::Peer, 64, 5).ok(), Some(true));
+	assert_eq!(registry.slate_exceeds_caps(b"fp1", 0, RouteKind::Peer, 1, 1).ok(), Some(false));
 }
 
 fn admitted(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>) -> AdmittedPeerAd {
-	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial_addr: Arc::from(dial), slate }
+	admitted_with_order(hive, dial, slate, 0)
+}
+
+fn admitted_with_order(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>, order: u64) -> AdmittedPeerAd {
+	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial_addr: Arc::from(dial), slate, order }
+}
+
+/// Relay trail under the composite `origin NUL relay` bucket.
+fn relay_trail(origin: &[u8], relay: &[u8], servlet_type: &[u8], dial: &[u8]) -> RelayTrail {
+	let slate = vec![ServletEntry::peer_relay(
+		Arc::from(origin),
+		Arc::from(relay),
+		Arc::from(servlet_type),
+		Arc::from(dial),
+		DEFAULT_INITIAL_PHEROMONE,
+		DEFAULT_ABANDONMENT_LIMIT,
+	)];
+
+	RelayTrail { bucket: ServletEntry::relay_bucket(origin, relay), slate, order: 0 }
+}
+
+// The relay bucket lives independently of the origin's direct slate:
+// a fresh direct advertisement reconciles only the origin bucket, so
+// the fallback trail through the relay survives it.
+#[test]
+fn direct_reconcile_preserves_relay_bucket() {
+	let registry = ServletRegistry::default();
+	let first = admitted(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")]);
+	registry.reconcile_peer_slate(first, PeerCaps::default()).ok();
+
+	let trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001");
+	let installed = registry.reconcile_relay_trail(trail, PeerCaps::default());
+	assert!(matches!(installed, Ok(())));
+
+	let refresh = admitted(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")]);
+	registry.reconcile_peer_slate(refresh, PeerCaps::default()).ok();
+
+	let entries = registry.peer_entries().ok().unwrap_or_default();
+	assert_eq!(entries.len(), 2);
+	assert!(entries.iter().any(|entry| entry.route_kind() == RouteKind::PeerRelay));
+}
+
+#[test]
+fn relay_reconcile_replaces_only_its_bucket() {
+	let registry = ServletRegistry::default();
+	let ad = admitted(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")]);
+	registry.reconcile_peer_slate(ad, PeerCaps::default()).ok();
+	registry
+		.reconcile_relay_trail(
+			relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"),
+			PeerCaps::default(),
+		)
+		.ok();
+
+	let replaced = relay_trail(b"origin", b"relay", b"sum", b"127.0.0.1:9001");
+	registry.reconcile_relay_trail(replaced, PeerCaps::default()).ok();
+
+	let entries = registry.peer_entries().ok().unwrap_or_default();
+	assert_eq!(entries.len(), 2);
+	assert!(entries.iter().any(|entry| entry.route_kind() == RouteKind::Peer));
+	assert!(entries
+		.iter()
+		.any(|entry| entry.route_kind() == RouteKind::PeerRelay && entry.servlet_type().as_ref() == b"sum"));
+}
+
+// Relay buckets spend their own budget: a gateway table at its direct
+// cap still admits a relay trail, and a new direct gateway is never
+// refused because relay buckets exist.
+#[test]
+fn relay_buckets_do_not_spend_the_direct_gateway_cap() {
+	let registry = ServletRegistry::default();
+	let caps = PeerCaps { max_gateways: 1, max_relay_buckets: 1, ..Default::default() };
+	let ad = admitted(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")]);
+	registry.reconcile_peer_slate(ad, caps).ok();
+
+	let installed = registry.reconcile_relay_trail(relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"), caps);
+	assert!(matches!(installed, Ok(())));
+}
+
+// A member relaying many origins mints one bucket per (origin, relay)
+// pair, so the relay-bucket cap bounds relay-spam bucket inflation.
+#[test]
+fn relay_bucket_cap_refuses_extra_buckets() {
+	let registry = ServletRegistry::default();
+	let caps = PeerCaps { max_relay_buckets: 1, ..Default::default() };
+	let first = registry.reconcile_relay_trail(relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"), caps);
+	assert!(matches!(first, Ok(())));
+
+	let refused = registry.reconcile_relay_trail(relay_trail(b"other", b"relay", b"calc", b"127.0.0.1:9001"), caps);
+	assert!(matches!(refused, Err(ClusterError::PeerCapExceeded)));
+}
+
+// An origin that withdraws its whole direct slate withdraws its relay
+// fallbacks with it: a relay trail never outlives every direct claim.
+#[test]
+fn empty_direct_slate_clears_relay_trails_for_origin() {
+	let registry = ServletRegistry::default();
+	let ad = admitted(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")]);
+	registry.reconcile_peer_slate(ad, PeerCaps::default()).ok();
+	registry
+		.reconcile_relay_trail(
+			relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"),
+			PeerCaps::default(),
+		)
+		.ok();
+
+	let clearing = admitted(b"origin", b"127.0.0.1:9000", Vec::new());
+	registry.reconcile_peer_slate(clearing, PeerCaps::default()).ok();
+
+	assert!(registry.peer_entries().ok().unwrap_or_default().is_empty());
+}
+
+// A replayed advertisement older than the newest applied one must not
+// regress the slate, for direct buckets and relay buckets alike.
+#[test]
+fn stale_ad_order_is_refused_per_bucket() {
+	let registry = ServletRegistry::default();
+	let fresh = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], 20);
+	assert!(matches!(registry.reconcile_peer_slate(fresh, PeerCaps::default()), Ok(())));
+
+	let replayed = admitted_with_order(b"origin", b"127.0.0.1:9666", vec![peer_entry(b"calc", b"origin")], 10);
+	let refused = registry.reconcile_peer_slate(replayed, PeerCaps::default());
+	assert!(matches!(refused, Err(ClusterError::StalePeerAd)));
+
+	let mut trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001");
+	trail.order = 20;
+	assert!(matches!(registry.reconcile_relay_trail(trail, PeerCaps::default()), Ok(())));
+
+	let mut replayed_trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9666");
+	replayed_trail.order = 10;
+
+	let refused_trail = registry.reconcile_relay_trail(replayed_trail, PeerCaps::default());
+	assert!(matches!(refused_trail, Err(ClusterError::StalePeerAd)));
+}
+
+// The order ledger keys per bucket: an equal-order refresh reconciles,
+// and the direct bucket's order never gates the relay bucket.
+#[test]
+fn equal_ad_order_reconciles_idempotently() {
+	let registry = ServletRegistry::default();
+	let first = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], 20);
+	registry.reconcile_peer_slate(first, PeerCaps::default()).ok();
+
+	let refresh = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], 20);
+	assert!(matches!(registry.reconcile_peer_slate(refresh, PeerCaps::default()), Ok(())));
+
+	let trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001");
+	assert!(matches!(registry.reconcile_relay_trail(trail, PeerCaps::default()), Ok(())));
+}
+
+// A withdrawal (empty slate) leaves an order tombstone: a replayed
+// older advertisement inside the freshness window cannot reinstall
+// routes the origin already withdrew.
+#[test]
+fn withdrawal_tombstone_refuses_older_ad_reinstall() {
+	// The unbounded window pins the retain rule itself: the outcome
+	// must not depend on how much clock elapses between statements.
+	let registry = ServletRegistry::new(PheromoneConfig::default()).with_ad_tombstone_window_ms(u64::MAX);
+	let issued = current_timestamp_ms();
+	let install = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], issued);
+	registry.reconcile_peer_slate(install, PeerCaps::default()).ok();
+
+	let withdrawal = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![], issued + 1);
+	registry.reconcile_peer_slate(withdrawal, PeerCaps::default()).ok();
+
+	let replayed = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], issued);
+	let result = registry.reconcile_peer_slate(replayed, PeerCaps::default());
+	assert!(matches!(result, Err(ClusterError::StalePeerAd)));
+}
+
+// Past the window the freshness gate refuses the replayed frame
+// itself, so the ledger prunes the dead bucket's tombstone and stays
+// bounded.
+#[test]
+fn expired_tombstone_prunes_from_the_ledger() {
+	let registry = ServletRegistry::new(PheromoneConfig::default()).with_ad_tombstone_window_ms(0);
+	let issued = current_timestamp_ms().saturating_sub(10);
+	let install = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], issued);
+	registry.reconcile_peer_slate(install, PeerCaps::default()).ok();
+
+	let withdrawal = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![], issued + 1);
+	registry.reconcile_peer_slate(withdrawal, PeerCaps::default()).ok();
+
+	let rows = registry.ad_orders.lock().map(|ledger| ledger.len()).unwrap_or(usize::MAX);
+	assert_eq!(rows, 0);
+}
+
+// Relay trails refresh only through reconciles, so age past `max_age`
+// is the retirement signal. Direct trails are untouched.
+#[test]
+fn prune_stale_relay_trails_drops_only_aged_relay_buckets() {
+	let registry = ServletRegistry::default();
+	let ad = admitted(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")]);
+	registry.reconcile_peer_slate(ad, PeerCaps::default()).ok();
+	registry
+		.reconcile_relay_trail(
+			relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001"),
+			PeerCaps::default(),
+		)
+		.ok();
+
+	assert_eq!(registry.prune_stale_relay_trails(Duration::from_secs(600)).ok(), Some(0));
+	assert_eq!(registry.prune_stale_relay_trails(Duration::ZERO).ok(), Some(1));
+
+	let survivors = registry.peer_entries().ok().unwrap_or_default();
+	assert_eq!(survivors.len(), 1);
+	assert_eq!(survivors[0].route_kind(), RouteKind::Peer);
+}
+
+// weaken_peer scores every trail attributed to an identity: its own
+// direct routes and every relay trail that forwards through it.
+#[test]
+fn weaken_peer_scores_relay_trails_through_the_peer() {
+	let registry = ServletRegistry::default();
+	registry.add(peer_entry(b"urn:t:a", b"relay")).ok();
+	let trail = relay_trail(b"origin", b"relay", b"urn:t:a", b"127.0.0.1:9001");
+	registry.reconcile_relay_trail(trail, PeerCaps::default()).ok();
+
+	assert_eq!(registry.weaken_peer(b"relay").ok(), Some(2));
+	assert_eq!(registry.weaken_peer(b"origin").ok(), Some(1));
 }
 
 #[test]

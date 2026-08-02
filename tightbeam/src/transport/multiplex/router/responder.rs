@@ -26,6 +26,7 @@ use crate::transport::envelopes::{
 	GoAwayReason, MuxDataPackage, MuxEndPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
 };
 use crate::transport::error::TransportFailure;
+use crate::transport::multiplex::StreamRoute;
 use crate::transport::{TransportError, TransportResult};
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::Frame;
@@ -48,7 +49,7 @@ enum ResponderEvent {
 /// initiator stamped on the stream.
 enum StreamWork {
 	Frame(Arc<Frame>),
-	Body(MuxStreamKind, StreamBody),
+	Body(MuxStreamKind, StreamBody, StreamRoute),
 }
 
 /// Kind-routed handler set for one connection's peer streams.
@@ -68,16 +69,23 @@ pub trait MuxDispatch {
 	/// Consume a streamed request body and answer with the terminal
 	/// response. Consuming chunks replenishes the peer's stream
 	/// credit, so a slow handler parks the sender (end-to-end backpressure).
-	fn streaming(&self, body: StreamBody) -> impl Future<Output = ResponsePackage> + MaybeSend {
-		let _ = body;
+	/// The route carries the grpc-style dispatch target stamped on the Open.
+	fn streaming(&self, body: StreamBody, route: StreamRoute) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		let _ = (body, route);
 		ready(ResponsePackage::new(TransitStatus::Unimplemented, None))
 	}
 
 	/// Consume request chunks while pushing reply chunks (full
 	/// duplex on one stream). The returned status closes the stream
-	/// as its `End` trailer.
-	fn duplex(&self, body: StreamBody, reply: ReplySink) -> impl Future<Output = TransitStatus> + MaybeSend {
-		let _ = (body, reply);
+	/// as its `End` trailer. The route carries the grpc-style
+	/// dispatch target stamped on the Open.
+	fn duplex(
+		&self,
+		body: StreamBody,
+		reply: ReplySink,
+		route: StreamRoute,
+	) -> impl Future<Output = TransitStatus> + MaybeSend {
+		let _ = (body, reply, route);
 		ready(TransitStatus::Unimplemented)
 	}
 }
@@ -104,8 +112,8 @@ where
 				Poll::Ready(Some(InboundEvent::Request(stream_id, frame))) => {
 					return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Frame(frame)));
 				}
-				Poll::Ready(Some(InboundEvent::StreamOpen(stream_id, kind, body))) => {
-					return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Body(kind, body)));
+				Poll::Ready(Some(InboundEvent::StreamOpen(stream_id, kind, body, route))) => {
+					return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Body(kind, body, route)));
 				}
 				Poll::Ready(Some(InboundEvent::Cancel(stream_id))) => {
 					return Poll::Ready(ResponderEvent::Cancelled(stream_id));
@@ -154,7 +162,7 @@ where
 	H: Fn(StreamBody) -> Fut,
 	Fut: Future<Output = ResponsePackage> + MaybeSend,
 {
-	fn streaming(&self, body: StreamBody) -> impl Future<Output = ResponsePackage> + MaybeSend {
+	fn streaming(&self, body: StreamBody, _route: StreamRoute) -> impl Future<Output = ResponsePackage> + MaybeSend {
 		(self.0)(body)
 	}
 }
@@ -168,7 +176,12 @@ where
 	H: Fn(StreamBody, ReplySink) -> Fut,
 	Fut: Future<Output = TransitStatus> + MaybeSend,
 {
-	fn duplex(&self, body: StreamBody, reply: ReplySink) -> impl Future<Output = TransitStatus> + MaybeSend {
+	fn duplex(
+		&self,
+		body: StreamBody,
+		reply: ReplySink,
+		_route: StreamRoute,
+	) -> impl Future<Output = TransitStatus> + MaybeSend {
 		(self.0)(body, reply)
 	}
 }
@@ -196,19 +209,19 @@ async fn dispatch_stream<D: MuxDispatch>(
 			let response = boxed(dispatch.unary(frame)).await;
 			send_response(&shared, &outbound, stream_id, response).await
 		}
-		StreamWork::Body(MuxStreamKind::Streaming, body) => {
-			let response = boxed(dispatch.streaming(body)).await;
+		StreamWork::Body(MuxStreamKind::Streaming, body, route) => {
+			let response = boxed(dispatch.streaming(body, route)).await;
 			send_response(&shared, &outbound, stream_id, response).await
 		}
-		StreamWork::Body(MuxStreamKind::Duplex, body) => {
+		StreamWork::Body(MuxStreamKind::Duplex, body, route) => {
 			let reply = ReplySink::new(stream_id, Arc::clone(&shared), outbound_handle(&outbound));
-			let status = boxed(dispatch.duplex(body, reply)).await;
+			let status = boxed(dispatch.duplex(body, reply, route)).await;
 			send_end_trailer(&shared, &outbound, stream_id, status).await
 		}
 		// Unreachable by construction: the reader reassembles
 		// unary-kind streams into frames. Answered safely rather
 		// than asserted.
-		StreamWork::Body(MuxStreamKind::Unary, _) => {
+		StreamWork::Body(MuxStreamKind::Unary, _, _) => {
 			note_internal_error(&shared);
 			let refusal = ResponsePackage::new(TransitStatus::Internal, None);
 			send_response(&shared, &outbound, stream_id, refusal).await

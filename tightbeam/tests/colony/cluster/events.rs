@@ -1,8 +1,14 @@
 //! Client-side cluster scenario event markers.
 //!
-//! Facts the gateway cannot observe (the client reached its send, a probe
-//! fired). Gateway decisions are asserted through the built-in `tightbeam`
-//! events the cluster fires on the scenario trace.
+//! These URNs record facts the gateway cannot observe, such as a client send
+//! completing or a probe firing. Gateway decisions are asserted through the
+//! built-in `tightbeam` events the cluster fires on the scenario trace.
+//!
+//! # Export boundary
+//!
+//! Markers from `EXPORT_HIDDEN_ROUTES` through `EXPORT_GRANT_ECHOED` pair
+//! with `CLUSTER_EXPORT_*` events (including grants) in the servlet export
+//! scenarios.
 
 use tightbeam::utils::urn::Urn;
 
@@ -81,3 +87,23 @@ pub(crate) const PEER_LOCAL_FAULT_MEMBER_PROMOTED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-local-fault-member-promoted");
 pub(crate) const PEER_LOCAL_FAULT_MEMBER_RETAINED: Urn<'static> =
 	Urn::new("test", "event:cluster/peer-local-fault-member-retained");
+pub(crate) const STREAM_SERVLET_HANDLED: Urn<'static> = Urn::new("test", "event:cluster/stream-servlet-handled");
+pub(crate) const STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/stream-echoed");
+pub(crate) const DUPLEX_SERVLET_HANDLED: Urn<'static> = Urn::new("test", "event:cluster/duplex-servlet-handled");
+pub(crate) const DUPLEX_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/duplex-echoed");
+pub(crate) const DUPLEX_LIVE_BEFORE_CANCEL: Urn<'static> = Urn::new("test", "event:cluster/duplex-live-before-cancel");
+pub(crate) const DUPLEX_CANCEL_PROPAGATED: Urn<'static> = Urn::new("test", "event:cluster/duplex-cancel-propagated");
+pub(crate) const SERVLET_DUPLEX_CANCELLED: Urn<'static> = Urn::new("test", "event:cluster/servlet-duplex-cancelled");
+pub(crate) const STREAM_GATE_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/stream-gate-refused");
+pub(crate) const DUPLEX_GATE_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/duplex-gate-refused");
+pub(crate) const STREAM_BUDGET_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/stream-budget-refused");
+pub(crate) const RELAY_ROUTES_INSTALLED: Urn<'static> = Urn::new("test", "event:cluster/relay-routes-installed");
+pub(crate) const RELAY_TRUE_ADDR_RESTORED: Urn<'static> = Urn::new("test", "event:cluster/relay-true-addr-restored");
+pub(crate) const EXPORT_HIDDEN_ROUTES: Urn<'static> = Urn::new("test", "event:cluster/export-hidden-routes");
+pub(crate) const EXPORT_DENIED_STATUS: Urn<'static> = Urn::new("test", "event:cluster/export-denied-status");
+pub(crate) const EXPORT_LOCAL_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/export-local-echoed");
+pub(crate) const EXPORT_PEER_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/export-peer-echoed");
+pub(crate) const EXPORT_STREAM_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/export-stream-refused");
+pub(crate) const EXPORT_DUPLEX_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/export-duplex-refused");
+pub(crate) const EXPORT_ANON_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/export-anon-refused");
+pub(crate) const EXPORT_GRANT_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/export-grant-echoed");

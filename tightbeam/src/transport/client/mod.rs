@@ -67,7 +67,7 @@ impl<P: Protocol> GenericClient<P> {
 	/// (for example a colony gate) before disclosing any request warms
 	/// the connection here first. A transport without encryption
 	/// material completes as a no-op.
-	#[cfg(feature = "transport-multiplex")]
+	#[cfg(all(feature = "transport-multiplex", feature = "colony"))]
 	pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()>
 	where
 		P::Transport: crate::transport::multiplex::MuxConnector,

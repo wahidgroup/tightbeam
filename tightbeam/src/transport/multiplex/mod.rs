@@ -52,6 +52,11 @@ use crate::Frame;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
 
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+use crate::constants::DEFAULT_HOP_BUDGET;
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+use crate::utils::urn::Urn;
+
 /// Converts a caller-owned or already-shared mux offer into a shared handle.
 ///
 /// Accept loops and pools store [`Arc<TransportOffer>`] so each connection
@@ -115,6 +120,82 @@ pub use router::{
 	MuxWriterDriver, ReplySink, RequestSink, StreamBody,
 };
 
+/// Grpc-style route carried on a stream's Open record.
+///
+/// The route selects the responder's dispatch target (a servlet [`Urn`],
+/// the stream analog of an HTTP `:path`) and carries the relay budget.
+/// The default route reproduces an unrouted local open, so the routed
+/// and unrouted open paths share one wire shape.
+///
+/// Initiators stamp a route through the typed `open_stream_to` /
+/// `open_duplex_to` entry points, which name a servlet type the same way
+/// `HiveContext::call` does. A served handler reads the route it received
+/// through [`CallContext`](crate::transport::serve::CallContext).
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamRoute {
+	target: Option<Urn<'static>>,
+	hops_remaining: u8,
+}
+
+/// The default route: unrouted, with the origin relay budget so it
+/// stays DER-omitted on the wire like a pre-route open.
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+impl Default for StreamRoute {
+	fn default() -> Self {
+		Self { target: None, hops_remaining: DEFAULT_HOP_BUDGET }
+	}
+}
+
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+impl StreamRoute {
+	/// Unrouted local stream: the responder dispatches by its own
+	/// resolved address. Identical on the wire to a pre-route open.
+	pub(crate) fn local() -> Self {
+		Self::default()
+	}
+
+	/// Route to a servlet type with the origin sentinel budget, which
+	/// defers the hop cap to the first gateway's `max_hops` policy. A
+	/// gateway reads the target to dispatch locally or splice to a
+	/// peer.
+	pub(crate) fn to(target: Urn<'static>) -> Self {
+		Self { target: Some(target), hops_remaining: DEFAULT_HOP_BUDGET }
+	}
+
+	/// Route to a servlet type with an explicit remaining relay
+	/// budget. A gateway stamps this when it re-emits a client stream
+	/// to a peer gateway with the budget decremented. A `0` budget is
+	/// served locally and never re-forwarded.
+	#[cfg(feature = "colony")]
+	pub(crate) fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> Self {
+		Self { target: Some(target), hops_remaining }
+	}
+
+	/// Reconstruct a route from the parts carried on a received Open.
+	pub(crate) fn from_parts(target: Option<Urn<'static>>, hops_remaining: u8) -> Self {
+		Self { target, hops_remaining }
+	}
+
+	/// Split into the target and relay budget stamped on the Open.
+	pub(crate) fn into_parts(self) -> (Option<Urn<'static>>, u8) {
+		(self.target, self.hops_remaining)
+	}
+
+	/// Grpc-style dispatch target, or `None` for an unrouted stream
+	/// whose responder address is already resolved.
+	pub fn target(&self) -> Option<&Urn<'static>> {
+		self.target.as_ref()
+	}
+
+	/// Relay budget left on this open: the number of gateway forwards
+	/// the stream may still spend. A `0` stream is served locally and
+	/// never re-forwarded.
+	pub fn hops_remaining(&self) -> u8 {
+		self.hops_remaining
+	}
+}
+
 /// Stream identifier within one multiplexed connection.
 ///
 /// Odd IDs are client-initiated, even IDs are server-initiated, and ID 0 is reserved
@@ -151,15 +232,19 @@ impl StreamId {
 /// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
-	/// Unused id; does not count toward the concurrency cap.
+	/// The id is unused and does not count toward the concurrency cap.
 	Idle,
-	/// Both sides may send; counts toward the concurrency cap.
+	/// Both sides may send. The stream counts toward the concurrency
+	/// cap.
 	Open,
-	/// Local send closed; still counts toward the concurrency cap.
+	/// Local send is closed. The stream still counts toward the
+	/// concurrency cap.
 	HalfClosedLocal,
-	/// Remote send closed; still counts toward the concurrency cap.
+	/// Remote send is closed. The stream still counts toward the
+	/// concurrency cap.
 	HalfClosedRemote,
-	/// Fully closed; does not count toward the concurrency cap.
+	/// The stream is fully closed and does not count toward the
+	/// concurrency cap.
 	Closed,
 }
 

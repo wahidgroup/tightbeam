@@ -7,19 +7,20 @@ use crate::colony::servlet::servlet_runtime::rt;
 use crate::colony::servlet::{ServletContext, ServletService};
 use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
-use crate::policy::{GatePolicy, SessionContext};
+use crate::policy::GatePolicy;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
-use crate::transport::serve::MuxService;
+use crate::transport::serve::{CallContext, MuxService};
 use crate::transport::AsyncListenerTrait;
 use crate::{Frame, TightBeamError};
 
 /// [`MuxService`] adapter that binds a [`ServletService`] to its context.
 ///
-/// Drops transport [`SessionContext`] at this boundary. Peer identity is
-/// enforced by collector gates before dispatch; handlers see
-/// [`ServletContext`] only. Session-aware logic belongs on [`MuxService`].
+/// Drops the transport [`CallContext`] (session and route) at this
+/// boundary. Peer identity is enforced by collector gates before
+/// dispatch; handlers see [`ServletContext`] only. Session-aware or
+/// route-aware logic belongs on [`MuxService`].
 struct ContextService<S> {
 	service: Arc<S>,
 	ctx: Arc<ServletContext>,
@@ -29,7 +30,7 @@ impl<S: ServletService> MuxService for ContextService<S> {
 	fn unary(
 		&self,
 		frame: Frame,
-		_session: SessionContext,
+		_cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let service = Arc::clone(&self.service);
 		let ctx = Arc::clone(&self.ctx);
@@ -39,7 +40,7 @@ impl<S: ServletService> MuxService for ContextService<S> {
 	fn streaming(
 		&self,
 		body: StreamBody,
-		_session: SessionContext,
+		_cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let service = Arc::clone(&self.service);
 		let ctx = Arc::clone(&self.ctx);
@@ -50,7 +51,7 @@ impl<S: ServletService> MuxService for ContextService<S> {
 		&self,
 		body: StreamBody,
 		reply: ReplySink,
-		_session: SessionContext,
+		_cx: CallContext,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		let service = Arc::clone(&self.service);
 		let ctx = Arc::clone(&self.ctx);

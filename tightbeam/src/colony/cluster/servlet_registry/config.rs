@@ -1,12 +1,15 @@
 use core::time::Duration;
 
-use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES};
+use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
 use crate::utils::BasisPoints;
 
-/// Default pheromone configuration constants.
+/// Default decay per evaporation cycle in basis points (1000 = 10%).
 pub const DEFAULT_EVAPORATION_RATE_BPS: u16 = 1000;
+/// Default seconds between evaporation cycles.
 pub const DEFAULT_EVAPORATION_INTERVAL_SECS: u64 = 30;
+/// Default starting pheromone level for a new entry.
 pub const DEFAULT_INITIAL_PHEROMONE: u64 = 5000;
+/// Default consecutive failures before a route abandons.
 pub const DEFAULT_ABANDONMENT_LIMIT: u32 = 5;
 /// Default reinforcement boost (500 = 5% pheromone increase on success).
 pub const DEFAULT_REINFORCEMENT_BOOST: u64 = 500;
@@ -45,18 +48,28 @@ impl Default for PheromoneConfig {
 
 /// Storage caps for peer-learned routes (CWE-770).
 ///
-/// A named pair prevents callers from silently transposing adjacent
-/// gateway and route limits.
+/// Named fields prevent callers from silently transposing adjacent
+/// limits. Direct slates and relay trails hold separate budgets so
+/// relay fan-in can never starve direct-gateway admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCaps {
-	/// Maximum distinct peer gateways holding installed slates.
+	/// Maximum distinct peer gateways holding installed direct slates.
 	pub max_gateways: usize,
-	/// Maximum stored peer routes across all gateways.
+	/// Maximum stored direct peer routes across all gateways.
 	pub max_routes: usize,
+	/// Maximum distinct `(origin, relay)` buckets holding relay trails.
+	pub max_relay_buckets: usize,
+	/// Maximum stored relay-trail routes across all buckets.
+	pub max_relay_routes: usize,
 }
 
 impl Default for PeerCaps {
 	fn default() -> Self {
-		Self { max_gateways: MAX_PEER_GATEWAYS, max_routes: MAX_PEER_ROUTES }
+		Self {
+			max_gateways: MAX_PEER_GATEWAYS,
+			max_routes: MAX_PEER_ROUTES,
+			max_relay_buckets: MAX_RELAY_BUCKETS,
+			max_relay_routes: MAX_RELAY_ROUTES,
+		}
 	}
 }

@@ -27,10 +27,12 @@ mod multiplex {
 	#[cfg(not(feature = "x509"))]
 	pub use crate::cms::signed_data::SignedData;
 	pub use crate::cms::signed_data::SignerInfo;
+	pub use crate::constants::DEFAULT_HOP_BUDGET;
 	pub use crate::der::asn1::OctetString;
 	pub use crate::der::Enumerated;
 	pub use crate::der::Sequence;
 	pub use crate::der::{DecodeValue, FixedTag, Header};
+	pub use crate::utils::urn::Urn;
 }
 
 #[cfg(feature = "transport-multiplex")]
@@ -227,7 +229,7 @@ pub enum GoAwayReason {
 
 #[cfg(feature = "transport-multiplex")]
 impl GoAwayReason {
-	/// Stable kebab-case name for audit labels; application codes share
+	/// Stable kebab-case name for audit labels. Application codes share
 	/// one label and stay distinguishable by their wire code.
 	pub fn as_str(&self) -> &'static str {
 		match self {
@@ -314,12 +316,12 @@ macro_rules! mux_chunk_package {
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MuxStreamKind {
-	/// Body reassembles into one frame; the reply is a unary `End`.
+	/// Body reassembles into one frame. The reply is a unary `End`.
 	#[default]
 	Unary = 0,
-	/// Body is consumed incrementally; the reply is a unary `End`.
+	/// Body is consumed incrementally. The reply is a unary `End`.
 	Streaming = 1,
-	/// Body is consumed incrementally; the reply streams back as
+	/// Body is consumed incrementally. The reply streams back as
 	/// `Data*` records ahead of the closing trailer.
 	Duplex = 2,
 }
@@ -347,6 +349,26 @@ pub struct MuxOpenPackage {
 	pub(crate) last: bool,
 	pub(crate) kind: MuxStreamKind,
 	pub(crate) payload: OctetString,
+	/// Optional grpc-style route (`:path`) selecting the responder's
+	/// dispatch target. Absent for a local stream whose address is
+	/// already resolved. Present when a gateway must route or splice
+	/// the open by servlet type.
+	pub(crate) target: Option<Urn<'static>>,
+	/// Relay budget with the same contract as the unary
+	/// `hops_remaining` field: the number of gateway forwards the
+	/// stream may still spend, decremented per hop. The origin stamps
+	/// the [`DEFAULT_HOP_BUDGET`] sentinel and every gateway clamps to
+	/// its own `max_hops`. A gateway serves a `0` open locally and
+	/// never re-forwards it. DER-omitted on the common origin open.
+	#[asn1(default = "default_hop_budget")]
+	pub(crate) hops_remaining: u8,
+}
+
+/// DER DEFAULT for [`MuxOpenPackage::hops_remaining`]: the origin
+/// sentinel, so unrouted and origin-routed opens omit the field.
+#[cfg(feature = "transport-multiplex")]
+fn default_hop_budget() -> u8 {
+	DEFAULT_HOP_BUDGET
 }
 
 #[cfg(feature = "transport-multiplex")]
@@ -355,7 +377,18 @@ impl MuxOpenPackage {
 	/// `payload` longer than the DER length cap
 	pub fn new(stream_id: u32, last: bool, kind: MuxStreamKind, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
 		let payload = OctetString::new(payload)?;
-		Ok(Self { stream_id, last, kind, payload })
+		Ok(Self { stream_id, last, kind, payload, target: None, hops_remaining: DEFAULT_HOP_BUDGET })
+	}
+
+	/// Stamp a grpc-style route and relay budget on this open.
+	///
+	/// A `None` target with the default budget reproduces an
+	/// unrouted local open, so the routed and unrouted paths share
+	/// one wire shape.
+	pub fn with_route(mut self, target: Option<Urn<'static>>, hops_remaining: u8) -> Self {
+		self.target = target;
+		self.hops_remaining = hops_remaining;
+		self
 	}
 
 	pub fn stream_id(&self) -> u32 {
@@ -374,6 +407,19 @@ impl MuxOpenPackage {
 
 	pub fn payload(&self) -> &[u8] {
 		self.payload.as_bytes()
+	}
+
+	/// Grpc-style route selecting the responder's dispatch target, or
+	/// `None` for an already-resolved local stream.
+	pub fn target(&self) -> Option<&Urn<'static>> {
+		self.target.as_ref()
+	}
+
+	/// Relay budget left on this open: the number of gateway forwards
+	/// it may still spend. A `0` open is served locally and never
+	/// re-forwarded.
+	pub fn hops_remaining(&self) -> u8 {
+		self.hops_remaining
 	}
 }
 
@@ -606,8 +652,8 @@ impl MuxRekeyAckPackage {
 /// Server-to-client key-switch marker closing a rekey exchange: the
 /// server has settled the epoch receipt and switched its send cipher.
 ///
-/// Encodes as an empty SEQUENCE; the derive macro cannot produce one,
-/// so the DER traits are implemented by hand.
+/// Encodes as an empty SEQUENCE. The derive macro cannot produce one,
+/// so the DER traits are written by hand.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MuxRekeyDonePackage {}
@@ -962,6 +1008,42 @@ mod tests {
 		Ok(())
 	}
 
+	// An unrouted open carries no target and the origin budget, and
+	// the grpc-style route with a spent budget survives the wire.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_open_package_route_round_trips() -> Result<(), Box<dyn Error>> {
+		let target = Urn::new("tb", "servlet:ledger");
+
+		let unrouted = MuxOpenPackage::new(9, false, MuxStreamKind::Streaming, frame_payload("open-local")?)?;
+		assert_eq!(unrouted.target(), None);
+		assert_eq!(unrouted.hops_remaining(), DEFAULT_HOP_BUDGET);
+
+		let routed = unrouted.clone().with_route(Some(target.clone()), 0);
+		let decoded = MuxOpenPackage::from_der(&routed.to_der()?)?;
+		assert_eq!(decoded.target(), Some(&target));
+		assert_eq!(decoded.hops_remaining(), 0);
+
+		Ok(())
+	}
+
+	// A default open must encode to the exact bytes of the pre-route
+	// wire shape: the DER-optional target and DEFAULT-budget hops
+	// add nothing, so existing peers decode it unchanged.
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_open_package_unrouted_is_wire_stable() -> Result<(), Box<dyn Error>> {
+		let package = MuxOpenPackage::new(11, true, MuxStreamKind::Unary, frame_payload("open-stable")?)?;
+		let encoded = package.to_der()?;
+		let decoded = MuxOpenPackage::from_der(&encoded)?;
+		assert_eq!(decoded, package);
+		assert_eq!(decoded.target(), None);
+		assert_eq!(decoded.hops_remaining(), DEFAULT_HOP_BUDGET);
+		assert_eq!(decoded.to_der()?, encoded);
+
+		Ok(())
+	}
+
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_data_package_encode_decode() -> Result<(), Box<dyn Error>> {
@@ -1013,7 +1095,7 @@ mod tests {
 		])
 	}
 
-	/// Structurally valid `SignerInfo` for wire round-trips; the
+	/// Structurally valid `SignerInfo` for wire round-trips. The
 	/// signature bytes are arbitrary because envelope tests exercise
 	/// encoding, not verification.
 	#[cfg(feature = "transport-multiplex")]

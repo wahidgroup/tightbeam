@@ -12,6 +12,7 @@ mod gossip_tasks;
 mod heartbeat;
 mod refuse;
 mod registration;
+mod streaming;
 mod verify;
 mod work;
 

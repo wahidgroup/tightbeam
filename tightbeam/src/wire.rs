@@ -5,6 +5,28 @@
 //! It contradicts the OCTET STRING schema this crate documents.
 //! The derive accepts `#[asn1(type = "OCTET STRING")]` only for borrowed `&[u8]`.
 //! This module keeps public fields as `Vec<u8>` while encoding the octet form.
+//!
+//! # Sources
+//!
+//! ITU publishes these Recommendations as PDF. Each link opens the 02/2021
+//! English PDF at the file page that begins the cited clause (`#page=N`).
+//!
+//! - ITU-T X.680 (02/2021) § 23, notation for the octetstring type:
+//!   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.680-202102-I%21%21PDF-E&lang=e&type=items#page=56>
+//! - ITU-T X.680 (02/2021) § 25, notation for sequence types
+//!   (`OPTIONAL` / `DEFAULT`):
+//!   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.680-202102-I%21%21PDF-E&lang=e&type=items#page=57>
+//! - ITU-T X.680 (02/2021) § 31, notation for prefixed types
+//!   (`TaggedType` / `EXPLICIT`):
+//!   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.680-202102-I%21%21PDF-E&lang=e&type=items#page=66>
+//! - ITU-T X.690 (02/2021) § 8.7 / § 8.9, octetstring and sequence encodings:
+//!   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=18>
+//! - ITU-T X.690 (02/2021) § 8.10 / § 8.14, sequence-of and prefixed-type
+//!   encodings:
+//!   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=19>
+//! - ITU-T X.690 (02/2021) § 11.5, set and sequence components with default
+//!   value (DER omits a component equal to its default):
+//!   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -15,10 +37,64 @@ use alloc::vec::Vec;
 use crate::der::asn1::{OctetString, OctetStringRef};
 use crate::der::{Decode, Reader, Result};
 
+#[cfg(feature = "colony")]
+use crate::der::{ErrorKind, FixedTag};
+
 /// Decode one field through its own [`Decode`] impl, so macro expansions
 /// do not depend on the `Reader` trait being in scope at the call site.
 pub(crate) fn decode_plain<'a, R: Reader<'a>, T: Decode<'a>>(reader: &mut R) -> Result<T> {
 	reader.decode()
+}
+
+/// Decode a trailing `DEFAULT` field: an absent field takes the schema
+/// default (a field equal to its default is omitted from the encoding).
+///
+/// A present field equal to the default is refused as non-canonical.
+/// Accepting both forms would give one value two distinct signed encodings.
+///
+/// Gated on `colony` with its only consumers, the colony message codecs,
+/// so minimal builds carry no dead helper.
+///
+/// # Sources
+///
+/// - ITU-T X.690 (02/2021) § 11.5, set and sequence components with default
+///   value:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
+#[cfg(feature = "colony")]
+pub(crate) fn decode_or_default<'a, R: Reader<'a>, T>(reader: &mut R, default: T) -> Result<T>
+where
+	T: Decode<'a> + FixedTag + PartialEq,
+{
+	if reader.is_finished() {
+		return Ok(default);
+	}
+
+	let value = reader.decode::<T>()?;
+	if value == default {
+		return Err(ErrorKind::Noncanonical { tag: T::TAG }.into());
+	}
+
+	Ok(value)
+}
+
+/// Encode a `DEFAULT` field: a value equal to its schema default
+/// encodes nothing.
+///
+/// Gated on `colony` with its only consumers, the colony message codecs,
+/// so minimal builds carry no dead helper.
+///
+/// # Sources
+///
+/// - ITU-T X.690 (02/2021) § 11.5, set and sequence components with default
+///   value:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
+#[cfg(feature = "colony")]
+pub(crate) fn default_field<T: Copy + PartialEq>(value: &T, default: T) -> Option<T> {
+	if *value == default {
+		return None;
+	}
+
+	Some(*value)
 }
 
 /// Decode one `OCTET STRING` into owned bytes.
@@ -82,6 +158,21 @@ pub(crate) fn octets_seq_refs(list: &[Vec<u8>]) -> Result<Vec<OctetStringRef<'_>
 /// - `octets_opt`: `Option<Vec<u8>>` as `OCTET STRING OPTIONAL`.
 /// - `octets_seq`: `Vec<Vec<u8>>` as `SEQUENCE OF OCTET STRING`.
 /// - `ctx($tag)`: `Option<T>` as EXPLICIT `[$tag] T OPTIONAL`.
+/// - `default($value)`: trailing `T DEFAULT $value` for `Copy` scalars.
+///   The field is omitted when equal to `$value`.
+///
+/// # Sources
+///
+/// - ITU-T X.680 (02/2021) § 23 / § 25 / § 31:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.680-202102-I%21%21PDF-E&lang=e&type=items#page=56>,
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.680-202102-I%21%21PDF-E&lang=e&type=items#page=57>,
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.680-202102-I%21%21PDF-E&lang=e&type=items#page=66>
+/// - ITU-T X.690 (02/2021) § 8.7 / § 8.9:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=18>
+/// - ITU-T X.690 (02/2021) § 8.10 / § 8.14:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=19>
+/// - ITU-T X.690 (02/2021) § 11.5:
+///   <https://www.itu.int/rec/dologin_pub.asp?id=T-REC-X.690-202102-I%21%21PDF-E&lang=e&type=items#page=29>
 macro_rules! wire_sequence {
 	(@decode $reader:ident, plain) => {
 		$crate::wire::decode_plain($reader)?
@@ -97,6 +188,9 @@ macro_rules! wire_sequence {
 	};
 	(@decode $reader:ident, ctx($tag:expr)) => {
 		::der::asn1::ContextSpecific::decode_explicit($reader, $tag)?.map(|field| field.value)
+	};
+	(@decode $reader:ident, default($value:expr)) => {
+		$crate::wire::decode_or_default($reader, $value)?
 	};
 	(@encodable $self:ident, $field:ident, plain) => {
 		&$self.$field
@@ -116,6 +210,9 @@ macro_rules! wire_sequence {
 			tag_mode: ::der::TagMode::Explicit,
 			value,
 		})
+	};
+	(@encodable $self:ident, $field:ident, default($value:expr)) => {
+		&$crate::wire::default_field(&$self.$field, $value)
 	};
 	($name:ident { $($field:ident : $kind:tt $(($tag:expr))?),+ $(,)? }) => {
 		impl<'wire> ::der::DecodeValue<'wire> for $name {
@@ -220,5 +317,42 @@ mod tests {
 		let body = [0x04, 0x04, 0x78, 0x78, 0x78, 0x78];
 		assert!(encoded.windows(body.len()).any(|window| window == body));
 		Ok(())
+	}
+
+	#[derive(Debug, Clone, PartialEq, Eq)]
+	struct BudgetProbe {
+		budget: u8,
+	}
+
+	const BUDGET_DEFAULT: u8 = 7;
+
+	wire_sequence!(BudgetProbe { budget: default(BUDGET_DEFAULT) });
+
+	#[test]
+	fn default_field_is_omitted_on_the_wire() -> Result<()> {
+		let encoded = BudgetProbe { budget: BUDGET_DEFAULT }.to_der()?;
+		let decoded = BudgetProbe::from_der(&encoded)?;
+
+		assert_eq!(encoded, [0x30, 0x00]);
+		assert_eq!(decoded.budget, BUDGET_DEFAULT);
+		Ok(())
+	}
+
+	#[test]
+	fn non_default_field_round_trips() -> Result<()> {
+		let decoded = BudgetProbe::from_der(&BudgetProbe { budget: 5 }.to_der()?)?;
+
+		assert_eq!(decoded.budget, 5);
+		Ok(())
+	}
+
+	#[test]
+	fn present_default_value_is_refused_as_noncanonical() {
+		// SEQUENCE { INTEGER 7 }: an encoder violating ITU-T X.690 § 11.5 by
+		// writing the schema default instead of omitting the field.
+		// See the module-level `# Sources` for the recommendation link.
+		let encoded = [0x30, 0x03, 0x02, 0x01, 0x07];
+
+		assert!(BudgetProbe::from_der(&encoded).is_err());
 	}
 }

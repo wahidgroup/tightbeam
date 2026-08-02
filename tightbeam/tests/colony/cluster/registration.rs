@@ -65,14 +65,6 @@ tb_scenario! {
 // Gate Policy Enforcement
 // ============================================================================
 
-struct RejectAllPolicy;
-
-impl GatePolicy for RejectAllPolicy {
-	fn evaluate(&self, _message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-		TransitStatus::PermissionDenied
-	}
-}
-
 tb_assert_spec! {
 	pub ClusterPolicySpec,
 	V(1,0,0): {

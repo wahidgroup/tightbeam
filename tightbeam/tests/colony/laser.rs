@@ -31,14 +31,14 @@ use tightbeam::{
 	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
 	decode, encode, exactly, hive,
 	instrumentation::events,
-	policy::{SessionContext, TransitStatus},
+	policy::TransitStatus,
 	server, servlet, tb_assert_spec, tb_scenario,
 	testing::{ClientEnv, ClusterEnv, SetupEnv},
 	trace::TraceCollector,
 	transport::{
 		handshake::{negotiation::TransportOffer, HandshakeKeyManager},
 		multiplex::StreamBody,
-		serve::MuxService,
+		serve::{CallContext, MuxService},
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
 	utils::compose as frame_compose,
@@ -206,7 +206,7 @@ async fn wait_for_routed(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Clust
 struct BeamLengthService;
 
 impl MuxService for BeamLengthService {
-	async fn streaming(&self, body: StreamBody, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+	async fn streaming(&self, body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		let bytes = body.into_bytes().await?;
 		let doubled = bytes.len() as u32;
 		let message = BeamResponse { doubled };

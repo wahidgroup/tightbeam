@@ -14,6 +14,7 @@ use super::shared::{enqueue_stream_cancel, BudgetStanding, MuxShared, OpenReques
 use super::writer::{drain_with_reason, renew_or_drain};
 use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::{TransportError, TransportResult};
+use crate::utils::urn::Urn;
 
 /// Send one credit-gated data chunk: reserve a writer-queue slot,
 /// then take the stream credit and enqueue in one critical section
@@ -93,17 +94,25 @@ pub struct RequestSink {
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
 	closed: bool,
+	/// Grpc-style route stamped on the stream's Open, consumed when
+	/// the first chunk opens the stream.
+	target: Option<Urn<'static>>,
+	/// Relay budget stamped beside the route on the stream's Open.
+	hops_remaining: u8,
 }
 
 impl RequestSink {
 	/// Sink over a reserved (unopened) stream. `duplex` carries the
-	/// reply forwarder to register once the ID exists.
+	/// reply forwarder to register once the ID exists. `target` and
+	/// `hops_remaining` stamp the stream's Open with a grpc-style route.
 	pub(super) fn new(
 		reservation: StreamReservation,
 		kind: MuxStreamKind,
 		shared: Arc<MuxShared>,
 		outbound: mpsc::Sender<Outbound>,
 		duplex: Option<ForwardedStream>,
+		target: Option<Urn<'static>>,
+		hops_remaining: u8,
 	) -> Self {
 		Self {
 			stream: SinkStream::Reserved { reservation, duplex },
@@ -111,6 +120,8 @@ impl RequestSink {
 			shared,
 			outbound,
 			closed: false,
+			target,
+			hops_remaining,
 		}
 	}
 
@@ -188,8 +199,8 @@ impl RequestSink {
 		let credits = payload_credits(payload.len(), self.shared.send_chunk_size, self.shared.credit_unit);
 		let standing = self.shared.admit_debit(credits, false).await?;
 
-		// The open seeds the ledger with the payload's records; an
-		// already-open stream extends it push by push
+		// The open seeds the ledger with the payload's records. An
+		// already-open stream extends it push by push.
 		let records = chunk_records(payload.len(), self.shared.send_chunk_size);
 		if let SinkStream::Opened(stream_id) = self.stream {
 			self.shared.add_send_records(stream_id, records);
@@ -214,11 +225,32 @@ impl RequestSink {
 	async fn send_chunk(&mut self, chunk: &[u8], last: bool, records: u64) -> TransportResult<()> {
 		match &mut self.stream {
 			SinkStream::Reserved { reservation, duplex } => {
-				let mut request = OpenRequest { kind: self.kind, last, payload: chunk, records, duplex: duplex.take() };
-				let stream_id = send_open_envelope(&self.shared, &mut self.outbound, reservation, &mut request).await?;
+				let mut request = OpenRequest {
+					kind: self.kind,
+					last,
+					payload: chunk,
+					records,
+					duplex: duplex.take(),
+					target: self.target.take(),
+					hops_remaining: self.hops_remaining,
+				};
 
-				self.stream = SinkStream::Opened(stream_id);
-				Ok(())
+				let opened = send_open_envelope(&self.shared, &mut self.outbound, reservation, &mut request).await;
+				match opened {
+					Ok(stream_id) => {
+						self.stream = SinkStream::Opened(stream_id);
+						Ok(())
+					}
+					Err(err) => {
+						// A failed open leaves the sink reserved: hand back
+						// whatever the open did not consume. A retried
+						// first chunk then still stamps the route and
+						// registers the reply forwarder.
+						self.target = request.target;
+						*duplex = request.duplex;
+						Err(err)
+					}
+				}
 			}
 			SinkStream::Opened(stream_id) => {
 				let stream_id = *stream_id;
@@ -303,11 +335,15 @@ mod tests {
 	use super::super::shared::StreamOutcome;
 	use super::super::testing::{client_shared, poll_now};
 	use super::*;
+	use crate::constants::DEFAULT_HOP_BUDGET;
 	use crate::transport::envelopes::{CancelReason, MuxEnvelope};
 
-	/// Reserved (unopened) request sink on a fresh client, with the
-	/// outbound queue's receiving end and the response receiver.
-	fn sink_fixture() -> (
+	/// Reserved (unopened) request sink on a fresh client with the
+	/// given route, plus the outbound queue's receiving end and the
+	/// response receiver.
+	fn routed_sink_fixture(
+		target: Option<Urn<'static>>,
+	) -> (
 		Arc<MuxShared>,
 		RequestSink,
 		mpsc::Receiver<Outbound>,
@@ -318,11 +354,29 @@ mod tests {
 		let (sender, receiver) = oneshot::channel();
 		let reservation = shared.reserve_stream_slot(sender).expect("fresh connection has stream slots");
 
-		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, Arc::clone(&shared), outbound, None);
+		let sink = RequestSink::new(
+			reservation,
+			MuxStreamKind::Streaming,
+			Arc::clone(&shared),
+			outbound,
+			None,
+			target,
+			DEFAULT_HOP_BUDGET,
+		);
 		(shared, sink, sent, receiver)
 	}
 
-	// Pushes reach the wire eagerly; the bare close carries the
+	/// Unrouted variant of [`routed_sink_fixture`].
+	fn sink_fixture() -> (
+		Arc<MuxShared>,
+		RequestSink,
+		mpsc::Receiver<Outbound>,
+		oneshot::Receiver<StreamOutcome>,
+	) {
+		routed_sink_fixture(None)
+	}
+
+	// Pushes reach the wire eagerly. The bare close carries the
 	// `last` flag on an empty trailer record: push/push/close must
 	// travel as Open(!last), Data(!last), Data(last, empty).
 	#[test]
@@ -351,7 +405,7 @@ mod tests {
 		));
 	}
 
-	// A known final chunk rides the `last` record itself: no empty
+	// A known final chunk carries the `last` flag itself: no empty
 	// trailer follows it.
 	#[test]
 	fn test_request_sink_close_with_flags_final_chunk() {
@@ -449,6 +503,19 @@ mod tests {
 
 		let outcome = receiver.try_recv();
 		assert!(matches!(outcome, Ok(Some(StreamOutcome::Cancelled(CancelReason::Cancelled)))));
+	}
+
+	// A failed open must not strip the route: the target stays on
+	// the sink so a retried first chunk still opens routed.
+	#[test]
+	fn test_request_sink_failed_open_keeps_route() {
+		let (_shared, mut sink, sent, _outcome) = routed_sink_fixture(Some(Urn::new("tb", "servlet:ledger")));
+
+		drop(sent);
+
+		let pushed = poll_now(sink.push([1u8]));
+		assert!(matches!(pushed, Poll::Ready(Err(TransportError::ConnectionClosed))));
+		assert!(sink.target.is_some());
 	}
 
 	// An empty request body still travels: close without a push

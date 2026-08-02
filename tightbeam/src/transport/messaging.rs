@@ -92,18 +92,15 @@ pub trait GateAudit {
 /// request frame at dispatch; session-scoped gates still evaluate.
 ///
 /// A gate returning [`TransitStatus::Unknown`] is a local bug, not a
-/// verdict: it is normalized to [`TransitStatus::Internal`] so the peer
-/// sees a server fault and the audit trail records a reject.
+/// verdict: [`TransitStatus::normalized_verdict`] maps it to
+/// [`TransitStatus::Internal`] so the peer sees a server fault.
 #[cfg(feature = "transport-policy")]
 pub(crate) fn gate_inbound<G, A>(gate: &G, audit: &A, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus
 where
 	G: GatePolicy + ?Sized,
 	A: GateAudit + ?Sized,
 {
-	let status = match gate.evaluate(frame, session) {
-		TransitStatus::Unknown => TransitStatus::Internal,
-		verdict => verdict,
-	};
+	let status = gate.evaluate(frame, session).normalized_verdict();
 
 	#[cfg(feature = "instrument")]
 	if let Some(trace) = audit.audit_trace() {
