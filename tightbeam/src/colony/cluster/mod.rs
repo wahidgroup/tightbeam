@@ -60,7 +60,9 @@ pub use servlet_registry::{
 };
 
 #[cfg(feature = "x509")]
-pub use export::{DynamicExportList, ExportAllowlist, ExportGate, ExportGrant, Party, StaticExportList, TrustPlanes};
+pub use export::{
+	DynamicExportList, ExportAllowlist, ExportGate, ExportGrant, Party, StaticExportList, TrustPlaneStores, TrustPlanes,
+};
 
 #[cfg(feature = "x509")]
 pub use gossip::{
@@ -586,6 +588,22 @@ mod tests {
 		assert!(config.peer.peer_dial_allowlist.is_none());
 	}
 
+	#[test]
+	fn cluster_config_peers_accept_str_slices() {
+		let config = ClusterConfig::builder(test_tls_config())
+			.with_peers(["127.0.0.1:9000", "127.0.0.1:9001"])
+			.with_peer_dial_allowlist(["127.0.0.1:9000"])
+			.build();
+		assert_eq!(
+			config.peer.peers,
+			vec!["127.0.0.1:9000".to_string(), "127.0.0.1:9001".to_string()]
+		);
+		assert_eq!(
+			config.peer.peer_dial_allowlist.as_deref(),
+			Some(["127.0.0.1:9000".to_string()].as_slice())
+		);
+	}
+
 	// =========================================================================
 	// ClusterWorkResponse Tests
 	// =========================================================================
@@ -595,6 +613,13 @@ mod tests {
 		let response = ClusterWorkResponse::ok(b"test".to_vec());
 		assert_eq!(response.status, TransitStatus::Ok);
 		assert_eq!(response.payload, Some(b"test".to_vec()));
+	}
+
+	#[test]
+	fn work_response_ok_accepts_byte_slices() {
+		let response = ClusterWorkResponse::ok(b"test");
+		assert_eq!(response.status, TransitStatus::Ok);
+		assert_eq!(response.payload.as_deref(), Some(b"test".as_slice()));
 	}
 
 	#[test]

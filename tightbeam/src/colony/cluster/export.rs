@@ -401,8 +401,8 @@ pub enum Party {
 /// one place, and a call site cannot transpose the two stores.
 ///
 /// Build one from a [`ClusterTlsConfig`](super::ClusterTlsConfig) through
-/// [`From`] on the enforcement path. [`TrustPlanes::new`] pairs two loose
-/// stores for callers that hold them directly, such as a test harness.
+/// [`From`] on the enforcement path. [`TrustPlanes::new`] takes a
+/// [`TrustPlaneStores`] carrier so hive and peer borrows stay named.
 ///
 /// # Fail-closed
 ///
@@ -415,9 +415,21 @@ pub struct TrustPlanes<'a> {
 	peer: Option<&'a dyn CertificateTrust>,
 }
 
+/// Named hive/peer trust-store borrows for [`TrustPlanes::new`].
+///
+/// Named fields prevent swapping the two same-typed plane stores at the
+/// call site.
+#[derive(Clone, Copy)]
+pub struct TrustPlaneStores<'a> {
+	/// First-party (hive/client) trust plane.
+	pub hive: Option<&'a dyn CertificateTrust>,
+	/// Federated peer trust plane.
+	pub peer: Option<&'a dyn CertificateTrust>,
+}
+
 impl<'a> From<&'a super::ClusterTlsConfig> for TrustPlanes<'a> {
 	fn from(tls: &'a super::ClusterTlsConfig) -> Self {
-		Self::new(tls.hive_trust.as_deref(), tls.peer_trust.as_deref())
+		Self { hive: tls.hive_trust.as_deref(), peer: tls.peer_trust.as_deref() }
 	}
 }
 
@@ -426,10 +438,11 @@ impl<'a> TrustPlanes<'a> {
 	///
 	/// Prefer [`From`] on a [`ClusterTlsConfig`](super::ClusterTlsConfig)
 	/// where one is available. This constructor serves callers that hold
-	/// the two stores directly, such as a test harness.
+	/// the two stores directly, such as a test harness. Pass planes through
+	/// [`TrustPlaneStores`] so hive and peer cannot be swapped by position.
 	#[must_use]
-	pub fn new(hive: Option<&'a dyn CertificateTrust>, peer: Option<&'a dyn CertificateTrust>) -> Self {
-		Self { hive, peer }
+	pub fn new(stores: TrustPlaneStores<'a>) -> Self {
+		Self { hive: stores.hive, peer: stores.peer }
 	}
 
 	/// Classify `cert` against the two planes.
@@ -546,8 +559,20 @@ mod tests {
 	fn first_party_classifies_hive_anchored_cert() {
 		let cert = test_certificate();
 		let hive = trust_of(&cert);
-		let planes = TrustPlanes::new(Some(hive.as_ref()), None);
+		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: None });
 		assert_eq!(planes.classify(Some(&cert)), Party::FirstParty);
+	}
+
+	/// Named plane fields keep hive and peer stores distinct under classify.
+	#[test]
+	fn trust_plane_stores_named_fields_are_distinct() {
+		let hive_cert = test_certificate();
+		let peer_cert = foreign_certificate();
+		let hive = trust_of(&hive_cert);
+		let peer = trust_of(&peer_cert);
+		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
+		assert_eq!(planes.classify(Some(&hive_cert)), Party::FirstParty);
+		assert_eq!(planes.classify(Some(&peer_cert)), Party::Peer);
 	}
 
 	#[test]
@@ -555,7 +580,7 @@ mod tests {
 		let cert = foreign_certificate();
 		let hive = trust_of(&test_certificate());
 		let peer = trust_of(&cert);
-		let planes = TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref()));
+		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
 
 		assert_eq!(planes.classify(Some(&cert)), Party::Peer);
 	}
@@ -565,20 +590,20 @@ mod tests {
 		let cert = test_certificate();
 		let hive = trust_of(&cert);
 		let peer = trust_of(&cert);
-		let planes = TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref()));
+		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
 		assert_eq!(planes.classify(Some(&cert)), Party::Peer);
 	}
 
 	#[test]
 	fn first_party_rejects_anonymous_session() {
-		let planes = TrustPlanes::new(None, None);
+		let planes = TrustPlanes::new(TrustPlaneStores { hive: None, peer: None });
 		assert_eq!(planes.classify_session(&SessionContext::default()), Party::Untrusted);
 	}
 
 	#[test]
 	fn first_party_without_hive_trust_classifies_nobody() {
 		let cert = test_certificate();
-		let planes = TrustPlanes::new(None, None);
+		let planes = TrustPlanes::new(TrustPlaneStores { hive: None, peer: None });
 		assert_eq!(planes.classify(Some(&cert)), Party::Untrusted);
 	}
 
@@ -590,7 +615,13 @@ mod tests {
 	fn verdict_without_export_list_passes_every_target() {
 		let cert = test_certificate();
 		assert_eq!(
-			export_verdict(None, &TrustPlanes::new(None, None), &servlet("ledger"), Some(&cert), true),
+			export_verdict(
+				None,
+				&TrustPlanes::new(TrustPlaneStores { hive: None, peer: None }),
+				&servlet("ledger"),
+				Some(&cert),
+				true
+			),
 			TransitStatus::Ok
 		);
 	}
@@ -601,7 +632,7 @@ mod tests {
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				&TrustPlanes::new(None, None),
+				&TrustPlanes::new(TrustPlaneStores { hive: None, peer: None }),
 				&servlet("ping"),
 				Some(&test_certificate()),
 				true
@@ -619,7 +650,7 @@ mod tests {
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				&TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref())),
+				&TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) }),
 				&servlet("ledger"),
 				Some(&cert),
 				false
@@ -632,7 +663,13 @@ mod tests {
 	fn verdict_refuses_unexported_relayed_request() {
 		let exported = static_list([servlet("ping")]);
 		assert_eq!(
-			export_verdict(Some(&exported), &TrustPlanes::new(None, None), &servlet("ledger"), None, true),
+			export_verdict(
+				Some(&exported),
+				&TrustPlanes::new(TrustPlaneStores { hive: None, peer: None }),
+				&servlet("ledger"),
+				None,
+				true
+			),
 			TransitStatus::PermissionDenied
 		);
 	}
@@ -646,7 +683,7 @@ mod tests {
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				&TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref())),
+				&TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) }),
 				&servlet("ledger"),
 				Some(&cert),
 				false
@@ -664,7 +701,7 @@ mod tests {
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				&TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref())),
+				&TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) }),
 				&servlet("ledger"),
 				Some(&cert),
 				false
@@ -680,7 +717,7 @@ mod tests {
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				&TrustPlanes::new(Some(hive.as_ref()), None),
+				&TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: None }),
 				&servlet("ledger"),
 				None,
 				false
@@ -697,7 +734,7 @@ mod tests {
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				&TrustPlanes::new(Some(hive.as_ref()), None),
+				&TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: None }),
 				&servlet("ping"),
 				Some(&cert),
 				false
@@ -713,7 +750,13 @@ mod tests {
 		let ledger_key = canonical_bytes(&ledger);
 
 		assert_eq!(
-			export_verdict(Some(&list), &TrustPlanes::new(None, None), &ledger, None, true),
+			export_verdict(
+				Some(&list),
+				&TrustPlanes::new(TrustPlaneStores { hive: None, peer: None }),
+				&ledger,
+				None,
+				true
+			),
 			TransitStatus::PermissionDenied
 		);
 		assert!(!list.allows_canonical(&ledger_key));
@@ -721,7 +764,13 @@ mod tests {
 		list.insert(ledger.clone());
 
 		assert_eq!(
-			export_verdict(Some(&list), &TrustPlanes::new(None, None), &ledger, None, true),
+			export_verdict(
+				Some(&list),
+				&TrustPlanes::new(TrustPlaneStores { hive: None, peer: None }),
+				&ledger,
+				None,
+				true
+			),
 			TransitStatus::Ok
 		);
 		assert!(list.allows_canonical(&ledger_key));
@@ -729,7 +778,13 @@ mod tests {
 		list.remove(&ledger);
 
 		assert_eq!(
-			export_verdict(Some(&list), &TrustPlanes::new(None, None), &ledger, None, true),
+			export_verdict(
+				Some(&list),
+				&TrustPlanes::new(TrustPlaneStores { hive: None, peer: None }),
+				&ledger,
+				None,
+				true
+			),
 			TransitStatus::PermissionDenied
 		);
 		assert!(!list.allows_canonical(&ledger_key));

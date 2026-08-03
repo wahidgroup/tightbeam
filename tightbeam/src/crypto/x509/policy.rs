@@ -225,10 +225,19 @@ where
 
 	/// Create validator directly from pre-computed fingerprints.
 	///
-	/// This method allows creating a validator without cloning certificates,
-	/// as fingerprints can be computed once and passed directly.
-	pub fn from_fingerprints(fingerprints: impl IntoIterator<Item = Vec<u8>>) -> Self {
-		Self { fingerprints: fingerprints.into_iter().collect(), _digest: PhantomData }
+	/// Accepts any iterator of byte slices; each fingerprint is copied
+	/// into an owned [`Vec<u8>`] for later comparison. This method
+	/// allows creating a validator without cloning certificates, as
+	/// fingerprints can be computed once and passed directly.
+	pub fn from_fingerprints<I, S>(fingerprints: I) -> Self
+	where
+		I: IntoIterator<Item = S>,
+		S: AsRef<[u8]>,
+	{
+		Self {
+			fingerprints: fingerprints.into_iter().map(|fp| fp.as_ref().to_vec()).collect(),
+			_digest: PhantomData,
+		}
 	}
 }
 
@@ -271,10 +280,10 @@ pub struct DirectTrustValidator {
 impl DirectTrustValidator {
 	/// Add a trust chain to the validator.
 	///
-	/// # Arguments
-	/// * `trust_chain` - Vector of certificates representing the trust chain
-	pub fn with_trust_chain(mut self, trust_chain: Vec<Certificate>) -> Self {
-		self.trust_chain = trust_chain;
+	/// Accepts any iterator of [`Certificate`] values; an empty chain
+	/// keeps the fail-closed default (no anchors).
+	pub fn with_trust_chain(mut self, trust_chain: impl IntoIterator<Item = Certificate>) -> Self {
+		self.trust_chain = trust_chain.into_iter().collect();
 		self
 	}
 }
@@ -357,9 +366,11 @@ pub struct ChainValidator {
 #[cfg(feature = "std")]
 impl ChainValidator {
 	/// Add a validator to the chain.
+	///
+	/// The validator is boxed inside, matching [`crate::policy::GateChain::push`].
 	#[allow(clippy::should_implement_trait)]
-	pub fn add(mut self, validator: Box<dyn CertificateValidation>) -> Self {
-		self.validators.push(validator);
+	pub fn add(mut self, validator: impl CertificateValidation + 'static) -> Self {
+		self.validators.push(Box::new(validator));
 		self
 	}
 }

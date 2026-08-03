@@ -171,9 +171,11 @@ impl UrnSpecBuilder {
 		self
 	}
 
-	/// Set custom NSS format string (e.g., "{}:{}/{}")
-	pub fn nss_format(mut self, format: &str) -> Self {
-		self.nss_format = NssFormat::Custom(format.to_string());
+	/// Set custom NSS format string (e.g., "{}:{}/{}").
+	///
+	/// `format` accepts any type that converts via [`AsRef<str>`].
+	pub fn nss_format(mut self, format: impl AsRef<str>) -> Self {
+		self.nss_format = NssFormat::Custom(format.as_ref().to_string());
 		self
 	}
 

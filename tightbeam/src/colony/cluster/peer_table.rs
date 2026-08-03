@@ -194,7 +194,7 @@ pub struct PeerTable {
 
 impl Default for PeerTable {
 	fn default() -> Self {
-		Self::new(Vec::new(), Arc::new(MemoryPeerStore))
+		Self::new(Vec::<String>::new(), Arc::new(MemoryPeerStore))
 	}
 }
 
@@ -283,12 +283,18 @@ fn lane_key<'t>(lane: &[(&'t String, &'t PeerEntry)]) -> Option<&'t String> {
 impl PeerTable {
 	/// Build a table around the given anchors and persistence driver.
 	///
+	/// Accepts any iterator of values convertible into [`String`].
 	/// Hydration replays persisted records through the capped admission path.
 	/// A driver fault degrades to an anchors-only start. An empty table is
 	/// safe because discovery refills it. A faulty driver must never seed
 	/// unchecked entries.
 	#[must_use]
-	pub fn new(anchors: Vec<String>, store: Arc<dyn PeerStore>) -> Self {
+	pub fn new<I, S>(anchors: I, store: Arc<dyn PeerStore>) -> Self
+	where
+		I: IntoIterator<Item = S>,
+		S: Into<String>,
+	{
+		let anchors: Vec<String> = anchors.into_iter().map(Into::into).collect();
 		let anchor_keys = anchors
 			.iter()
 			.map(|anchor| address_key(anchor).unwrap_or_else(|| anchor.clone()))
@@ -959,7 +965,7 @@ mod tests {
 			.collect();
 		seed.push(record("10.1.0.1:9000", true));
 
-		let table = PeerTable::new(Vec::new(), Arc::new(CountingStore::seeded(seed)));
+		let table = PeerTable::new(Vec::<String>::new(), Arc::new(CountingStore::seeded(seed)));
 		assert_eq!(table.learned()?, (MAX_PEER_BUCKET, 1));
 		Ok(())
 	}
@@ -968,7 +974,7 @@ mod tests {
 	fn mutations_persist_through_the_driver() -> Result<(), ClusterError> {
 		let store = Arc::new(CountingStore::seeded(Vec::new()));
 		let driver: Arc<dyn PeerStore> = store.clone();
-		let table = PeerTable::new(Vec::new(), driver);
+		let table = PeerTable::new(Vec::<String>::new(), driver);
 
 		table.learn(vec![hint("10.0.0.1:9000")])?;
 		table.promote("10.0.0.1:9000", None, 1_000)?;

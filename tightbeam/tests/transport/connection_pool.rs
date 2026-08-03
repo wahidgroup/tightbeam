@@ -46,7 +46,7 @@ use tightbeam::{
 		policy::Secp256k1Policy,
 		sign::ecdsa::Secp256k1,
 		x509::{
-			policy::PublicKeyPinning,
+			policy::{CertificateValidation, PublicKeyPinning},
 			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 			Certificate, CertificateSpec,
 		},
@@ -281,12 +281,11 @@ servlet! {
 fn pool_echo_conf(
 	message_count: Arc<AtomicUsize>,
 ) -> Result<ServletConfig<TokioListener, TestMessage>, TightBeamError> {
+	let key = SERVER_KEY.to_provider::<Secp256k1>()?;
+	let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
+
 	Ok(ServletConfig::<TokioListener, TestMessage>::builder()
-		.with_certificate(
-			SERVER_CERT,
-			SERVER_KEY.to_provider::<Secp256k1>()?,
-			vec![Arc::new(CLIENT_PINNING)],
-		)?
+		.with_certificate(SERVER_CERT, key, validators)?
 		.with_config(Arc::new(PoolEchoServletConfig { message_count }))
 		.build())
 }

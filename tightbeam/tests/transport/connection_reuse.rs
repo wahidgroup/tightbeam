@@ -41,7 +41,7 @@ use tightbeam::{
 		policy::Secp256k1Policy,
 		sign::ecdsa::Secp256k1,
 		x509::{
-			policy::PublicKeyPinning,
+			policy::{CertificateValidation, PublicKeyPinning},
 			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 			Certificate, CertificateSpec,
 		},
@@ -224,19 +224,23 @@ tb_scenario! {
 				}
 			}
 
+			let key = SERVER_KEY.to_provider::<Secp256k1>()?;
+			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, TestMessage>::builder()
-				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, key, validators)?
 				.with_config(Arc::new(()))
 				.build();
+
 			let servlet_task = TlsEchoServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
 			let addr = servlet_task.addr();
 
 			trace.event(CLIENT_CONNECT)?;
 
 			// Configure client with TLS credentials
+			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(CLIENT_CERT, key)?
 				.build();
 			let mut client = builder.connect(addr).await?;
 

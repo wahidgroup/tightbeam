@@ -1,6 +1,6 @@
 //! Dynamic export grants and deny gates for the colony fuzz.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
@@ -11,36 +11,48 @@ use tightbeam::utils::urn::Urn;
 #[derive(Default)]
 pub(crate) struct DynamicAclState {
 	/// SPKI DER bytes granted per target URN string.
-	grants: RwLock<HashSet<(Vec<u8>, String)>>,
+	grants: RwLock<HashMap<Vec<u8>, HashSet<String>>>,
 	/// SPKI DER bytes denied for any target when present.
 	denied: RwLock<HashSet<Vec<u8>>>,
 }
 
 impl DynamicAclState {
-	pub fn grant(&self, spki: Vec<u8>, target: &Urn<'_>) {
+	/// `spki` accepts any type that converts via `AsRef<[u8]>`.
+	pub fn grant(&self, spki: impl AsRef<[u8]>, target: &Urn<'_>) {
 		if let Ok(mut guard) = self.grants.write() {
-			guard.insert((spki, target.to_string()));
+			guard.entry(spki.as_ref().to_vec()).or_default().insert(target.to_string());
 		}
 	}
 
-	pub fn revoke_grant(&self, spki: &[u8], target: &Urn<'_>) {
+	pub fn revoke_grant(&self, spki: impl AsRef<[u8]>, target: &Urn<'_>) {
+		let spki = spki.as_ref();
 		if let Ok(mut guard) = self.grants.write() {
-			guard.remove(&(spki.to_vec(), target.to_string()));
+			let empty = if let Some(targets) = guard.get_mut(spki) {
+				targets.remove(&target.to_string());
+				targets.is_empty()
+			} else {
+				false
+			};
+			if empty {
+				guard.remove(spki);
+			}
 		}
 	}
 
-	pub fn deny(&self, spki: Vec<u8>) {
+	pub fn deny(&self, spki: impl AsRef<[u8]>) {
 		if let Ok(mut guard) = self.denied.write() {
-			guard.insert(spki);
+			guard.insert(spki.as_ref().to_vec());
 		}
 	}
 
-	pub fn allow(&self, spki: &[u8]) {
+	pub fn allow(&self, spki: impl AsRef<[u8]>) {
 		if let Ok(mut guard) = self.denied.write() {
-			guard.remove(spki);
+			guard.remove(spki.as_ref());
 		}
 	}
 
+	/// Lookup borrows the SPKI bytes through [`HashMap`]'s `Borrow<[u8]>`
+	/// support, so the hot path does not allocate a temporary SPKI key.
 	pub fn is_granted(&self, spki: Option<&[u8]>, target: &Urn<'_>) -> bool {
 		let Some(spki) = spki else {
 			return false;
@@ -49,7 +61,8 @@ impl DynamicAclState {
 			return false;
 		};
 
-		guard.contains(&(spki.to_vec(), target.to_string()))
+		let target = target.to_string();
+		guard.get(spki).is_some_and(|targets| targets.contains(&target))
 	}
 
 	pub fn is_denied(&self, spki: Option<&[u8]>) -> bool {
