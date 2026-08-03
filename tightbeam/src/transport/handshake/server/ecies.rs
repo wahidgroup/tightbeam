@@ -90,10 +90,6 @@ where
 	session_observer: Option<Arc<dyn SessionObserver>>,
 	mux_settings: Option<MuxSettings>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	/// Captured client identity in one of two grades: chain-validated
-	/// when `client_validators` ran, possession-verified otherwise. Both
-	/// grades passed the proof-of-possession signature over the bound
-	/// auth digest; trust decisions belong to policy, not to capture.
 	validated_client_cert: Option<Arc<Certificate>>,
 	session_receipt: Option<SessionReceipt>,
 	receipt_artifact: Option<SignedData>,
@@ -576,17 +572,15 @@ where
 		}
 	}
 
-	/// Validate or opportunistically capture the offered client identity.
+	/// Validate and capture the offered client identity when mutual auth
+	/// is configured.
 	///
-	/// When `client_validators` is set, a client certificate is required and
-	/// every validator MUST pass before the possession check. When validators
-	/// are absent, a client that offers no certificate stays anonymous. An
-	/// offered certificate is still captured after its proof-of-possession
-	/// signature verifies over the bound auth digest.
-	///
-	/// Capture records identity only. Trust-store membership and export
-	/// first-party classification stay in policy, so a possession-verified
-	/// capture without chain validation does not widen authorization by itself.
+	/// When `client_validators` is set, a client certificate is required.
+	/// Every validator MUST pass before the possession check, and only
+	/// then is the identity stored. When validators are absent
+	/// (server-auth only), the session stays anonymous: an offered
+	/// certificate is discarded and never reaches
+	/// [`SessionContext`](crate::policy::SessionContext).
 	#[cfg(feature = "x509")]
 	fn validate_client_certificate(&mut self, client_kex: &mut ClientKeyExchange) -> Result<(), HandshakeError>
 	where
@@ -596,24 +590,26 @@ where
 		for<'a> P::Signature: TryFrom<&'a [u8]>,
 		P::VerifyingKey: PrehashVerifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
-		let client_cert = match (client_kex.client_certificate.take(), &self.client_validators) {
-			(Some(cert), _) => cert,
-			// Client cert is required when validators are present
+		let (client_cert, validators) = match (client_kex.client_certificate.take(), &self.client_validators) {
 			(None, Some(_)) => return Err(HandshakeError::MissingClientCertificate),
 			(None, None) => return Ok(()),
+			// Server-auth only: discard offered identity so authorization
+			// paths cannot key off an unvalidated certificate.
+			(Some(_), None) => {
+				let _ = client_kex.client_signature.take();
+				return Ok(());
+			}
+			(Some(cert), Some(validators)) => (cert, validators),
 		};
 
 		// Chain validation runs before the possession check, so a
 		// certificate refused by any validator is never captured.
-		if let Some(validators) = &self.client_validators {
-			for validator in validators.iter() {
-				validator.evaluate(&client_cert)?;
-			}
+		for validator in validators.iter() {
+			validator.evaluate(&client_cert)?;
 		}
 
-		// Verify client signature over the bound auth digest. Capture
-		// never records an identity the peer cannot sign for, so the
-		// possession check runs in both capture grades.
+		// Verify client signature over the bound auth digest so capture
+		// never records an identity the peer cannot sign for.
 		let client_signature = client_kex
 			.client_signature
 			.as_ref()
@@ -991,10 +987,10 @@ mod tests {
 		Ok(())
 	}
 
-	/// A validator-less server captures an offered identity once its
-	/// proof-of-possession signature verifies.
+	/// A validator-less server discards an offered client identity so the
+	/// session stays anonymous (server-auth only).
 	#[tokio::test]
-	async fn test_opportunistic_capture_stores_offered_identity() -> Result<(), Box<dyn Error>> {
+	async fn test_validatorless_server_discards_offered_identity() -> Result<(), Box<dyn Error>> {
 		let mut server = TestEciesServerBuilder::new().build()?;
 		let client_random = generate_nonce::<32>(None)?;
 
@@ -1005,15 +1001,15 @@ mod tests {
 		let client_kex_der = build_identified_client_key_exchange(&server, &client, None).await?;
 		server.process_client_key_exchange(&client_kex_der).await?;
 
-		let captured = server.validated_client_cert.as_deref();
-		assert_eq!(captured, Some(&client.certificate));
+		assert!(server.validated_client_cert.is_none());
 		Ok(())
 	}
 
-	/// A validator-less server refuses an offered identity whose
-	/// possession signature does not verify.
+	/// A validator-less server also discards an offered identity with a
+	/// forged possession signature; the handshake still completes as
+	/// anonymous server-auth.
 	#[tokio::test]
-	async fn test_opportunistic_capture_rejects_bad_possession_signature() -> Result<(), Box<dyn Error>> {
+	async fn test_validatorless_server_discards_forged_offered_identity() -> Result<(), Box<dyn Error>> {
 		let mut server = TestEciesServerBuilder::new().build()?;
 		let client_random = generate_nonce::<32>(None)?;
 
@@ -1022,9 +1018,10 @@ mod tests {
 
 		let client = create_test_certificate();
 		let forged_digest = [0u8; 32];
-		let client_kex_der = build_identified_client_key_exchange(&server, &client, Some(forged_digest)).await?;
 
-		assert!(server.process_client_key_exchange(&client_kex_der).await.is_err());
+		let client_kex_der = build_identified_client_key_exchange(&server, &client, Some(forged_digest)).await?;
+		server.process_client_key_exchange(&client_kex_der).await?;
+
 		assert!(server.validated_client_cert.is_none());
 		Ok(())
 	}

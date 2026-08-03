@@ -210,10 +210,9 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 
 	let mut tls = cluster_tls_config(&own);
 	tls.peer_trust = Some(Arc::clone(&peer_trust));
-	// With empty client_validators, the ECIES server admits anonymous
-	// dials and opportunistically captures any offered identity whose
-	// proof-of-possession signature verifies. Mutual-TLS chain
-	// validation is covered by integration tests.
+	// Empty client_validators means server-auth only: anonymous dials are
+	// admitted and offered client certificates are discarded. Mutual-TLS
+	// capture is covered by integration tests that install validators.
 	tls.client_validators = vec![];
 
 	let pool = PoolConfig {

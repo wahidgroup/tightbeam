@@ -83,7 +83,11 @@ async fn emit_advertise(
 	order: u64,
 ) -> Result<AuthzClass, TightBeamError> {
 	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement { gateway_addr, advertised_types: types });
-	let frame = signed_control_frame(&signer.certs.key, b"peer-advertise", request, order).await?;
+	let frame = match signed_control_frame(&signer.certs.key, b"peer-advertise", request, order).await {
+		Ok(frame) => frame,
+		Err(_) => return Ok(AuthzClass::InfraFail),
+	};
+
 	let server_trust = Arc::clone(&receiver.certs.trust);
 	let mut client = match connect_as(server_trust, &signer.certs, receiver.gateway.addr()).await {
 		Ok(client) => client,
@@ -92,11 +96,14 @@ async fn emit_advertise(
 
 	trace.event(events::PEER_ADVERTISE_SENT)?;
 
-	let Some(response_frame) = client.emit(frame, None).await? else {
-		return Ok(AuthzClass::InfraFail);
+	let response_frame = match client.emit(frame, None).await {
+		Ok(Some(frame)) => frame,
+		Ok(None) | Err(_) => return Ok(AuthzClass::InfraFail),
 	};
-
-	let response: PeerAdvertisementResponse = decode(&response_frame.message)?;
+	let response: PeerAdvertisementResponse = match decode(&response_frame.message) {
+		Ok(response) => response,
+		Err(_) => return Ok(AuthzClass::InfraFail),
+	};
 	if response.status == TransitStatus::Ok {
 		trace.event_with(events::PEER_ROUTES_AFTER, &[], receiver.gateway.peer_servlets().len() as u64)?;
 		return Ok(AuthzClass::Success);

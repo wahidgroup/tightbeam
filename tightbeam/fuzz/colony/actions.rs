@@ -810,7 +810,10 @@ async fn hostile_foreign_work(
 
 	let identity = Arc::clone(&pick_org_ref(topo, id_idx).certs);
 	let target = target_urn(selector);
-	let predicted = shadow_predict(pick_org_ref(topo, dial_idx), &target, Some(&identity), false);
+	// Empty client_validators discard offered identity on the wire, so
+	// the session stays anonymous even when the dial presents a foreign
+	// certificate. Predict against that anonymous boundary.
+	let predicted = shadow_predict(pick_org_ref(topo, dial_idx), &target, None, false);
 	let request = ClusterWorkRequest::new(target, encode(&PingRequest { value: 21 })?);
 
 	emit_cluster_work(
