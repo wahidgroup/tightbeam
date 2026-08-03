@@ -403,7 +403,7 @@ where
 {
 	/// Enable encrypted transport with the given server certificate.
 	///
-	/// - Non-empty `validators`: mutual auth: every validator must accept the client cert.
+	/// - Non-empty `validators`: mutual auth. Every validator must accept the client cert.
 	/// - Empty `validators`: no client authentication.
 	///
 	/// `validators` accepts any iterator of shared [`CertificateValidation`] values.
