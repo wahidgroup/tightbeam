@@ -5,15 +5,18 @@ use std::sync::Arc;
 
 use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::compose;
+use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
+use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::der::{Encode, Sequence};
 use tightbeam::servlet;
 use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
+use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::Beamable;
 use tightbeam::TightBeamError;
 
-use crate::fixtures::fixed_signing_key;
+use crate::fixtures::{fixed_signing_key, ClusterTestCerts};
 use crate::limits::MAX_CSR_ISSUED;
 
 /// CSR request carrying a subject public key and requested colony SAN.
@@ -86,8 +89,20 @@ servlet! {
 
 pub(crate) type CsrServletConfig = ServletConfig<TokioListener, CsrRequest, DefaultCryptoProvider>;
 
-pub(crate) fn csr_servlet_config(issuer: Arc<CsrIssuer>) -> Result<CsrServletConfig, TightBeamError> {
+/// Servlet TLS identity is the org identity, anchored in the org trust
+/// the gateway's forward pool validates against (see
+/// [`crate::servlets::ping_servlet_config`]).
+pub(crate) fn csr_servlet_config(
+	issuer: Arc<CsrIssuer>,
+	certs: &ClusterTestCerts,
+) -> Result<CsrServletConfig, TightBeamError> {
+	let transport_offer = TransportOffer::mux(8);
+	let key = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
+	let cert = CertificateSpec::Built(Box::new(certs.cert.as_ref().clone()));
+
 	Ok(ServletConfig::<TokioListener, CsrRequest, DefaultCryptoProvider>::builder()
+		.with_certificate(cert, key, vec![])?
+		.with_mux_offer(Some(transport_offer))
 		.with_config(issuer)
 		.build())
 }

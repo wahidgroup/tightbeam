@@ -12,6 +12,7 @@ use tightbeam::cluster;
 use tightbeam::colony::cluster::{Cluster, ClusterConfig, DynamicExportList, ExportAllowlist, ExportGate, ExportGrant};
 use tightbeam::colony::hive::Hive;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+use tightbeam::crypto::x509::policy::ExpiryValidator;
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::Certificate;
 use tightbeam::hive;
@@ -210,10 +211,10 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 
 	let mut tls = cluster_tls_config(&own);
 	tls.peer_trust = Some(Arc::clone(&peer_trust));
-	// Empty client_validators means server-auth only: anonymous dials are
-	// admitted and offered client certificates are discarded. Mutual-TLS
-	// capture is covered by integration tests that install validators.
-	tls.client_validators = vec![];
+	// Mutual-TLS posture: a configured validator makes the accept plane
+	// capture possession-verified client identities, so grants, deny
+	// gates, and first-party origin stay live under the oracle.
+	tls.client_validators = vec![Arc::new(ExpiryValidator)];
 
 	let pool = PoolConfig {
 		idle_timeout: None,
@@ -254,11 +255,11 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 	}
 
 	for servlet_type in local_types {
-		register_ping(&mut hive, trace, servlet_type).await?;
+		register_ping(&mut hive, trace, servlet_type, &own).await?;
 	}
 
 	let csr_issuer = match with_csr {
-		true => Some(register_csr(&mut hive, trace, name).await?),
+		true => Some(register_csr(&mut hive, trace, name, &own).await?),
 		false => None,
 	};
 
@@ -299,12 +300,23 @@ async fn register_ping(
 	hive: &mut ColonyFuzzHive,
 	trace: &TraceCollector,
 	servlet_type: Urn<'static>,
+	certs: &Arc<ClusterTestCerts>,
 ) -> Result<(), TightBeamError> {
 	let trace = share_trace(trace);
-	let config = ping_servlet_config()?;
+	let config = ping_servlet_config(certs)?;
 	let servlet = ColonyPingServlet::start(trace, Some(config)).await?;
-	// Scale-out rebuilds a fresh ping instance with default config.
-	let respawn = |t| ColonyPingServlet::start(t, None);
+
+	// Scale-out rebuilds with the same org TLS identity, so respawned
+	// instances stay dialable by the gateway's forward pool.
+	let spawn_certs = Arc::clone(certs);
+	let respawn = move |t| {
+		let certs = Arc::clone(&spawn_certs);
+
+		async move {
+			let config = ping_servlet_config(&certs)?;
+			ColonyPingServlet::start(t, Some(config)).await
+		}
+	};
 
 	hive.register(servlet_type, servlet, respawn)
 }
@@ -314,21 +326,24 @@ async fn register_csr(
 	hive: &mut ColonyFuzzHive,
 	trace: &TraceCollector,
 	org_name: &str,
+	certs: &Arc<ClusterTestCerts>,
 ) -> Result<Arc<CsrIssuer>, TightBeamError> {
 	let allowed_colony = colony_urn(org_name).to_string();
 	let issuer = Arc::new(CsrIssuer::new(allowed_colony));
 	let csr_type = servlet_urn("csr");
 	let trace = share_trace(trace);
-	let config = csr_servlet_config(Arc::clone(&issuer))?;
+	let config = csr_servlet_config(Arc::clone(&issuer), certs)?;
 	let servlet = CsrServlet::start(trace, Some(config)).await?;
 
 	// Spawner owns its issuer clone; OrgNode keeps the returned handle.
 	let spawn_issuer = Arc::clone(&issuer);
+	let spawn_certs = Arc::clone(certs);
 	let respawn = move |t| {
 		let issuer = Arc::clone(&spawn_issuer);
+		let certs = Arc::clone(&spawn_certs);
 
 		async move {
-			let config = csr_servlet_config(issuer)?;
+			let config = csr_servlet_config(issuer, &certs)?;
 			CsrServlet::start(t, Some(config)).await
 		}
 	};

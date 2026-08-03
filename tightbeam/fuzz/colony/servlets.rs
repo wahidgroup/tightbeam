@@ -4,13 +4,17 @@ use std::sync::Arc;
 
 use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::compose;
+use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
+use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::der::Sequence;
 use tightbeam::servlet;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::Beamable;
 use tightbeam::TightBeamError;
+
+use crate::fixtures::ClusterTestCerts;
 
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub(crate) struct PingRequest {
@@ -51,9 +55,18 @@ servlet! {
 
 pub(crate) type PingServletConfig = ServletConfig<TokioListener, PingRequest, DefaultCryptoProvider>;
 
-pub(crate) fn ping_servlet_config() -> Result<PingServletConfig, TightBeamError> {
+/// Servlet TLS identity is the org identity, anchored in the org trust
+/// the gateway's forward pool validates against. Without it the
+/// gateway-to-servlet hop cannot handshake and every work forward
+/// degrades to `Unavailable`.
+pub(crate) fn ping_servlet_config(certs: &ClusterTestCerts) -> Result<PingServletConfig, TightBeamError> {
+	let transport_offer = TransportOffer::mux(8);
+	let key = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
+	let cert = CertificateSpec::Built(Box::new(certs.cert.as_ref().clone()));
+
 	Ok(ServletConfig::<TokioListener, PingRequest, DefaultCryptoProvider>::builder()
-		.with_mux_offer(Some(TransportOffer::mux(8)))
+		.with_certificate(cert, key, vec![])?
+		.with_mux_offer(Some(transport_offer))
 		.with_config(Arc::new(()))
 		.build())
 }
