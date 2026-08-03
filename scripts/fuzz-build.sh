@@ -4,7 +4,7 @@ set -euo pipefail
 # Build AFL-instrumented fuzz targets (requires cargo-afl).
 
 if ! command -v cargo-afl >/dev/null 2>&1; then
-	echo "Error: cargo-afl not found. Install with: cargo install cargo-afl" >&2
+	echo "Error: cargo-afl not found. Run: make setup" >&2
 	exit 1
 fi
 
@@ -16,6 +16,9 @@ done
 
 echo "  - fuzz_chess"
 RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_chess --features "std,testing-fuzz,testing-fdr,testing-csp"
+
+echo "  - fuzz_colony"
+RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_colony --features "full,testing-fuzz,testing-fuzz-ijon,testing-csp"
 
 echo ""
 echo "Fuzz targets built successfully!"

@@ -26,7 +26,7 @@
 use super::common::*;
 use super::federation::{type_route_count, wait_for_type_routes};
 use super::streaming::{pooled_cluster_client, StreamEchoServlet};
-use tightbeam::colony::cluster::{ExportGate, ExportGrant};
+use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
 use tightbeam::der::Encode;
 
 /// Two organizations under split trust planes.
@@ -606,7 +606,13 @@ struct DenyPeerKeyGate {
 }
 
 impl ExportGate for DenyPeerKeyGate {
-	fn evaluate(&self, target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> TransitStatus {
+	fn evaluate(
+		&self,
+		target: &Urn<'_>,
+		session: &SessionContext,
+		_planes: &TrustPlanes<'_>,
+		_relayed: bool,
+	) -> TransitStatus {
 		if *target == self.target && session.peer_public_key() == Some(self.denied_spki.as_slice()) {
 			return TransitStatus::PermissionDenied;
 		}

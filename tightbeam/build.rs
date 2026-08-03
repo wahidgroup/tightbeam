@@ -5,6 +5,10 @@
 use cfg_aliases::cfg_aliases;
 
 fn main() {
+	// Declare the `fuzzing` cfg so rustc check-cfg accepts IJON and fuzz
+	// gates in the library. AFL harnesses set it through RUSTFLAGS.
+	println!("cargo::rustc-check-cfg=cfg(fuzzing)");
+
 	// Names the compound predicates that gate whole subsystems, so the
 	// build graph has one definition instead of hand-copied clause lists
 	// that can drift independently.

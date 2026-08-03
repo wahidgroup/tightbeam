@@ -109,7 +109,7 @@ impl TransitStatus {
 /// The identity facts a gate or request handler may key on: the validated
 /// peer certificate from a mutual-auth handshake and the dual-signed
 /// session receipt when the session is budget-bearing. The empty (default)
-/// context means no authenticated facts: cleartext connections,client-side
+/// context means no authenticated facts: cleartext connections, client-side
 /// emit paths, and in-process evaluation all answer it.
 ///
 /// On the mux serving path (`serve_mux`) the context is assembled per
@@ -139,6 +139,8 @@ impl SessionContext {
 	/// transport after its handshake completed.
 	pub fn capture<T: EncryptedProtocolState>(transport: &T) -> Self {
 		let peer_certificate = transport.to_peer_certificate_arc();
+		// Capture encodes SPKI once per session snapshot. Transport
+		// admission does not yet share a cached Arc for this field.
 		let peer_public_key = peer_certificate.as_deref().and_then(spki_der);
 		Self {
 			peer_certificate,
@@ -408,8 +410,10 @@ mod tests {
 			.with(StaticGate(TransitStatus::Ok))
 			.with(StaticGate(TransitStatus::ResourceExhausted))
 			.with(StaticGate(TransitStatus::PermissionDenied));
+
+		let frame = create_frame_with_frame_integrity();
 		assert!(matches!(
-			chain.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default()),
+			chain.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::ResourceExhausted
 		));
 	}
@@ -421,15 +425,18 @@ mod tests {
 			.with(StaticGate(TransitStatus::PermissionDenied))
 			.with(ProbeGate(Arc::clone(&evaluated)));
 
-		let _ = chain.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default());
+		let frame = create_frame_with_frame_integrity();
+		let _ = chain.evaluate(Some(&frame), &SessionContext::default());
 		assert!(!evaluated.load(Ordering::SeqCst));
 	}
 
 	#[test]
 	fn accepts_intact_frame() {
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
+
+		let frame = create_frame_with_frame_integrity();
 		assert!(matches!(
-			gate.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default()),
+			gate.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::Ok
 		));
 	}

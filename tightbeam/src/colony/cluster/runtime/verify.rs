@@ -59,6 +59,22 @@ pub(crate) fn spent_relay_budget(hops_remaining: u8) -> bool {
 	hops_remaining != DEFAULT_HOP_BUDGET
 }
 
+/// Run configured [`GatePolicy`] instances with no audit side effects.
+pub(crate) fn policies_allow(
+	frame: Option<&Frame>,
+	session: &SessionContext,
+	config: &ClusterConfig,
+) -> Result<(), TransitStatus> {
+	for policy in config.policies.iter() {
+		let status = GatePolicy::evaluate(policy.as_ref(), frame, session).normalized_verdict();
+		if status != TransitStatus::Ok {
+			return Err(status);
+		}
+	}
+
+	Ok(())
+}
+
 /// Run collector gate policies before decoding the request envelope.
 ///
 /// Each configured policy must return [`TransitStatus::Ok`], so the first
@@ -75,16 +91,13 @@ pub(crate) fn evaluate_gates(
 	config: &ClusterConfig,
 	trace: &TraceCollector,
 ) -> Result<(), TransitStatus> {
-	for policy in config.policies.iter() {
-		let status = GatePolicy::evaluate(policy.as_ref(), frame, session).normalized_verdict();
-		if status != TransitStatus::Ok {
+	match policies_allow(frame, session, config) {
+		Ok(()) => Ok(()),
+		Err(status) => {
 			trace.event(CLUSTER_GATE_BLOCKED).map_err(|_| status)?;
-
-			return Err(status);
+			Err(status)
 		}
 	}
-
-	Ok(())
 }
 
 /// Enforce the export boundary on a resolved servlet target.
@@ -175,9 +188,7 @@ fn trace_export_outcome(trace: &TraceCollector, outcome: Urn<'static>, session: 
 ///
 /// Peer membership wins across the whole trust plane. A signer the peer
 /// store trusts is an external peer, so it must not act on the hive
-/// plane even when `hive_trust` also trusts it. This mirrors the
-/// first-party precedence rule in
-/// [`cert_is_first_party`](crate::colony::cluster::export::cert_is_first_party).
+/// plane even when `hive_trust` also trusts it.
 #[cfg(feature = "x509")]
 fn signer_is_peer(config: &ClusterConfig, frame: &Frame) -> bool {
 	config
@@ -292,10 +303,14 @@ pub(crate) fn verify_control_freshness(frame: &Frame, replay_guard: &GatewayRepl
 
 #[cfg(all(test, feature = "x509"))]
 mod tests {
+	use std::sync::Arc;
+
 	use super::*;
 	use crate::builder::frame::FrameBuilder;
 	use crate::builder::TypeBuilder;
-	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, ExportGate, ExportGrant};
+	use crate::colony::cluster::{
+		CertificateSpec, ClusterTlsConfig, ExportGate, ExportGrant, StaticExportList, TrustPlanes,
+	};
 	use crate::colony::common::ColonyNamespace;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
@@ -308,7 +323,6 @@ mod tests {
 	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::testing::{create_test_certificate, create_test_message, create_test_signing_key};
 	use crate::Version;
-	use std::sync::Arc;
 
 	fn servlet(name: &str) -> Urn<'static> {
 		ColonyNamespace::default()
@@ -327,7 +341,7 @@ mod tests {
 			hive_trust: None,
 			peer_trust: None,
 		});
-		config.peer.exported_types = Some(vec![servlet("ping")]);
+		config.peer.exported_types = Some(Arc::new(StaticExportList::new(vec![servlet("ping")])));
 
 		config
 	}
@@ -359,7 +373,13 @@ mod tests {
 	struct DenyAllGate;
 
 	impl ExportGate for DenyAllGate {
-		fn evaluate(&self, _target: &Urn<'_>, _session: &SessionContext, _relayed: bool) -> TransitStatus {
+		fn evaluate(
+			&self,
+			_target: &Urn<'_>,
+			_session: &SessionContext,
+			_planes: &TrustPlanes<'_>,
+			_relayed: bool,
+		) -> TransitStatus {
 			TransitStatus::PermissionDenied
 		}
 	}
@@ -367,7 +387,13 @@ mod tests {
 	struct UnknownGate;
 
 	impl ExportGate for UnknownGate {
-		fn evaluate(&self, _target: &Urn<'_>, _session: &SessionContext, _relayed: bool) -> TransitStatus {
+		fn evaluate(
+			&self,
+			_target: &Urn<'_>,
+			_session: &SessionContext,
+			_planes: &TrustPlanes<'_>,
+			_relayed: bool,
+		) -> TransitStatus {
 			TransitStatus::Unknown
 		}
 	}
@@ -420,7 +446,6 @@ mod tests {
 			&config,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict, Ok(()));
 	}
 
@@ -437,7 +462,6 @@ mod tests {
 			&config,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict, Err(TransitStatus::PermissionDenied));
 	}
 
@@ -469,7 +493,6 @@ mod tests {
 			&config,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict, Err(TransitStatus::PermissionDenied));
 	}
 
@@ -485,7 +508,6 @@ mod tests {
 			&config,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict, Ok(()));
 	}
 
@@ -511,7 +533,6 @@ mod tests {
 		config.policies.push(Arc::new(UnknownPolicy));
 
 		let verdict = evaluate_gates(None, &SessionContext::default(), &config, &TraceCollector::default());
-
 		assert_eq!(verdict, Err(TransitStatus::Internal));
 	}
 

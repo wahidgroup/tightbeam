@@ -59,8 +59,9 @@
 //! - CWE-285, improper authorization:
 //!   <https://cwe.mitre.org/data/definitions/285.html>
 
+use core::str::from_utf8;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use super::ClusterConfig;
 use crate::colony::common::canonical_bytes;
@@ -68,6 +69,165 @@ use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
 use crate::policy::{SessionContext, TransitStatus};
 use crate::utils::urn::Urn;
+
+/// Live export allowlist shared by discoverability and enforcement.
+///
+/// Install through
+/// [`ClusterConfigBuilder::with_export_allowlist`](super::ClusterConfigBuilder::with_export_allowlist)
+/// or the static helper
+/// [`ClusterConfigBuilder::with_exported_types`](super::ClusterConfigBuilder::with_exported_types).
+/// `None` on [`PeerConfig::exported_types`](super::PeerConfig) means every
+/// locally served type is exported.
+///
+/// # Planes
+///
+/// - **Enforcement** calls [`ExportAllowlist::contains`] on each work or
+///   stream open, so a mutable list takes effect on the next request.
+/// - **Discoverability** calls [`ExportAllowlist::allows_canonical`] per
+///   local servlet key on each advertise beat, so the slate tracks the
+///   same live membership without building an owned key set.
+///
+/// # Keys
+///
+/// List entries are servlet type URNs without an instance tail, so their
+/// canonical bytes equal the registry's type keys. An instance-bearing
+/// entry would answer [`ExportAllowlist::contains`] on that exact target
+/// but never match an advertised type key.
+pub trait ExportAllowlist: Send + Sync {
+	/// Whether `target` is on the export list.
+	fn contains(&self, target: &Urn<'_>) -> bool;
+
+	/// Whether a canonical registry type key is exported.
+	///
+	/// The provided method parses `key` and delegates to
+	/// [`ExportAllowlist::contains`], so the two views cannot diverge.
+	/// The built-in lists override it with a cached-set lookup that
+	/// borrows `key`. A key that fails to parse is not exported.
+	fn allows_canonical(&self, key: &[u8]) -> bool {
+		let Ok(canonical) = from_utf8(key) else {
+			return false;
+		};
+		let Ok(target) = canonical.parse::<Urn<'static>>() else {
+			return false;
+		};
+
+		self.contains(&target)
+	}
+}
+
+/// Fixed export list installed at config build.
+#[derive(Clone, Debug)]
+pub struct StaticExportList {
+	types: Vec<Urn<'static>>,
+	keys: HashSet<Vec<u8>>,
+}
+
+impl StaticExportList {
+	/// Build an allowlist from the given servlet type URNs.
+	pub fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
+		let types: Vec<Urn<'static>> = types.into_iter().collect();
+		let keys = types.iter().map(canonical_bytes).collect();
+		Self { types, keys }
+	}
+}
+
+impl ExportAllowlist for StaticExportList {
+	fn contains(&self, target: &Urn<'_>) -> bool {
+		self.types.iter().any(|allowed| allowed == target)
+	}
+
+	fn allows_canonical(&self, key: &[u8]) -> bool {
+		self.keys.contains(key)
+	}
+}
+
+/// URN list and its canonical key cache under one lock, so the two views
+/// of the membership mutate atomically and cannot diverge mid-update.
+#[derive(Default)]
+struct ExportMembership {
+	types: Vec<Urn<'static>>,
+	keys: HashSet<Vec<u8>>,
+}
+
+impl ExportMembership {
+	fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
+		let types: Vec<Urn<'static>> = types.into_iter().collect();
+		let keys = types.iter().map(canonical_bytes).collect();
+		Self { types, keys }
+	}
+}
+
+/// Interior-mutable export list for tests and long-running fuzz harnesses.
+///
+/// Mutations are visible to the next [`ExportAllowlist::contains`] and
+/// [`ExportAllowlist::allows_canonical`] call. Poisoned locks treat the
+/// list as empty so both planes stay fail-closed.
+#[derive(Default)]
+pub struct DynamicExportList {
+	membership: RwLock<ExportMembership>,
+}
+
+impl DynamicExportList {
+	/// Build a mutable allowlist from the given servlet type URNs.
+	pub fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
+		Self { membership: RwLock::new(ExportMembership::new(types)) }
+	}
+
+	/// Replace the export membership with `types`.
+	pub fn set(&self, types: impl IntoIterator<Item = Urn<'static>>) {
+		if let Ok(mut guard) = self.membership.write() {
+			*guard = ExportMembership::new(types);
+		}
+	}
+
+	/// Insert `target` when it is not already listed.
+	pub fn insert(&self, target: Urn<'static>) {
+		if let Ok(mut guard) = self.membership.write() {
+			if !guard.types.iter().any(|allowed| allowed == &target) {
+				guard.keys.insert(canonical_bytes(&target));
+				guard.types.push(target);
+			}
+		}
+	}
+
+	/// Remove every entry equal to `target`.
+	pub fn remove(&self, target: &Urn<'_>) {
+		if let Ok(mut guard) = self.membership.write() {
+			// Keys are collected from the retained-out entries, not
+			// recomputed from `target`, so a stored entry that compares
+			// equal under a different canonical form still drops its
+			// own cached key.
+			let mut dropped = Vec::new();
+			guard.types.retain(|allowed| {
+				if allowed == target {
+					dropped.push(canonical_bytes(allowed));
+					return false;
+				}
+
+				true
+			});
+			for key in dropped {
+				guard.keys.remove(&key);
+			}
+		}
+	}
+}
+
+impl ExportAllowlist for DynamicExportList {
+	fn contains(&self, target: &Urn<'_>) -> bool {
+		let Ok(guard) = self.membership.read() else {
+			return false;
+		};
+		guard.types.iter().any(|allowed| allowed == target)
+	}
+
+	fn allows_canonical(&self, key: &[u8]) -> bool {
+		let Ok(guard) = self.membership.read() else {
+			return false;
+		};
+		guard.keys.contains(key)
+	}
+}
 
 /// Custom export gate for servlet targets crossing the gateway.
 ///
@@ -88,10 +248,19 @@ pub trait ExportGate: Send + Sync {
 	/// - `session`: caller identity facts (see
 	///   [`SessionContext::peer_certificate`] and
 	///   [`SessionContext::peer_public_key`])
+	/// - `planes`: the two federation trust planes, for gates that reuse
+	///   the first-party classifier through
+	///   [`TrustPlanes::classify_session`] beside their own rules
 	/// - `relayed`: `true` when the request already spent relay budget
 	///   and therefore entered through a peer gateway rather than a
 	///   direct client
-	fn evaluate(&self, target: &Urn<'_>, session: &SessionContext, relayed: bool) -> TransitStatus;
+	fn evaluate(
+		&self,
+		target: &Urn<'_>,
+		session: &SessionContext,
+		planes: &TrustPlanes<'_>,
+		relayed: bool,
+	) -> TransitStatus;
 }
 
 /// Positive grant widening the export boundary for selected callers.
@@ -135,6 +304,7 @@ fn session_granted(grants: &[Arc<dyn ExportGrant>], target: &Urn<'_>, session: &
 /// Deciding allow source of a passed export boundary.
 ///
 /// Returned only when the full verdict passes, including deny gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExportDecision {
 	/// The built-in allowlist allowed the target.
 	Allowed,
@@ -144,13 +314,13 @@ pub(crate) enum ExportDecision {
 
 /// Live-configuration view of the export boundary.
 ///
-/// One composition point for every enforcement call site. A target passes
-/// when it is exported, granted, or a first-party origin request, and
-/// every deny gate must then agree.
+/// Sealed composition derived from [`ClusterConfig`] through [`From`].
+/// Wire handlers never construct this view by hand. The unary work arm
+/// and the stream open handlers share one core through
+/// [`evaluate_export_gates`](super::runtime::verify::evaluate_export_gates).
 pub(crate) struct ExportPolicy<'a> {
-	exported: Option<&'a [Urn<'static>]>,
-	hive_trust: Option<&'a dyn CertificateTrust>,
-	peer_trust: Option<&'a dyn CertificateTrust>,
+	exported: Option<&'a dyn ExportAllowlist>,
+	planes: TrustPlanes<'a>,
 	grants: &'a [Arc<dyn ExportGrant>],
 	gates: &'a [Arc<dyn ExportGate>],
 }
@@ -159,8 +329,7 @@ impl<'a> From<&'a ClusterConfig> for ExportPolicy<'a> {
 	fn from(config: &'a ClusterConfig) -> Self {
 		Self {
 			exported: config.peer.exported_types.as_deref(),
-			hive_trust: config.tls.hive_trust.as_deref(),
-			peer_trust: config.tls.peer_trust.as_deref(),
+			planes: TrustPlanes::from(&config.tls),
 			grants: &config.export_grants,
 			gates: &config.export_gates,
 		}
@@ -178,20 +347,16 @@ impl ExportPolicy<'_> {
 	/// allow source only when the full verdict passes. A gate verdict
 	/// of [`TransitStatus::Unknown`] normalizes to
 	/// [`TransitStatus::Internal`] before it reaches the wire.
+	///
+	/// `GatePolicy` is evaluated separately before this step.
 	pub(crate) fn verdict(
 		&self,
 		target: &Urn<'_>,
 		session: &SessionContext,
 		relayed: bool,
 	) -> Result<ExportDecision, TransitStatus> {
-		let allowlist = export_verdict(
-			self.exported,
-			self.hive_trust,
-			self.peer_trust,
-			target,
-			session.peer_certificate(),
-			relayed,
-		);
+		let allowlist = export_verdict(self.exported, &self.planes, target, session.peer_certificate(), relayed);
+
 		let mut decision = ExportDecision::Allowed;
 		if allowlist != TransitStatus::Ok {
 			if !session_granted(self.grants, target, session, relayed) {
@@ -202,7 +367,7 @@ impl ExportPolicy<'_> {
 		}
 
 		for gate in self.gates {
-			let status = gate.evaluate(target, session, relayed).normalized_verdict();
+			let status = gate.evaluate(target, session, &self.planes, relayed).normalized_verdict();
 			if status != TransitStatus::Ok {
 				return Err(status);
 			}
@@ -212,57 +377,101 @@ impl ExportPolicy<'_> {
 	}
 }
 
-/// First-party classification of a caller certificate.
+/// Which trust plane a caller certificate belongs to.
 ///
-/// A certificate is first-party when it is a member of `hive_trust` and
-/// not of `peer_trust`. The check is trust-store membership through
-/// `is_trusted`, not chain path validation.
+/// Classification encodes store precedence: peer membership wins over
+/// hive membership. A certificate held by both stores is therefore
+/// [`Party::Peer`], never [`Party::FirstParty`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Party {
+	/// A member of the hive plane and not the peer plane.
+	FirstParty,
+	/// A member of the peer plane. Peer membership wins over hive
+	/// membership, so a certificate held by both stores lands here.
+	Peer,
+	/// Anonymous (`None`), or trusted by neither plane.
+	Untrusted,
+}
+
+/// The two federation trust planes as one classifier.
 ///
-/// # Classification
+/// A gateway trusts its own hives on the first-party plane and federated
+/// peers on the peer plane. [`TrustPlanes`] borrows both stores as one
+/// unit so the precedence rule ("peer membership wins") lives in exactly
+/// one place, and a call site cannot transpose the two stores.
 ///
-/// - First-party: a member of `hive_trust` and not of `peer_trust`
-/// - External peer: a member of `peer_trust` (peer membership wins,
-///   even when `hive_trust` also holds the certificate)
-/// - Never first-party: anonymous callers (`None`), peer-only sessions,
-///   and sessions in neither store
+/// Build one from a [`ClusterTlsConfig`](super::ClusterTlsConfig) through
+/// [`From`] on the enforcement path. [`TrustPlanes::new`] pairs two loose
+/// stores for callers that hold them directly, such as a test harness.
 ///
 /// # Fail-closed
 ///
-/// A missing `hive_trust` store classifies nobody as first-party, so the
-/// boundary refuses callers it cannot place.
-#[must_use]
-pub fn cert_is_first_party(
-	cert: Option<&Certificate>,
-	hive_trust: Option<&dyn CertificateTrust>,
-	peer_trust: Option<&dyn CertificateTrust>,
-) -> bool {
-	let Some(cert) = cert else {
-		return false;
-	};
-	if peer_trust.is_some_and(|trust| trust.is_trusted(cert)) {
-		return false;
-	}
-
-	hive_trust.is_some_and(|trust| trust.is_trusted(cert))
+/// A missing hive store classifies nobody as first-party, so the boundary
+/// refuses callers it cannot place. Membership is trust-store lookup
+/// through [`CertificateTrust::is_trusted`], not chain path validation.
+#[derive(Clone, Copy)]
+pub struct TrustPlanes<'a> {
+	hive: Option<&'a dyn CertificateTrust>,
+	peer: Option<&'a dyn CertificateTrust>,
 }
 
-/// [`cert_is_first_party`] on a session's authenticated identity.
-///
-/// Custom [`ExportGate`] implementations call this to reuse the
-/// first-party classifier beside their own per-identity rules.
-#[must_use]
-pub fn session_is_first_party(
-	session: &SessionContext,
-	hive_trust: Option<&dyn CertificateTrust>,
-	peer_trust: Option<&dyn CertificateTrust>,
-) -> bool {
-	cert_is_first_party(session.peer_certificate(), hive_trust, peer_trust)
+impl<'a> From<&'a super::ClusterTlsConfig> for TrustPlanes<'a> {
+	fn from(tls: &'a super::ClusterTlsConfig) -> Self {
+		Self::new(tls.hive_trust.as_deref(), tls.peer_trust.as_deref())
+	}
+}
+
+impl<'a> TrustPlanes<'a> {
+	/// Pair a hive-plane and a peer-plane trust store.
+	///
+	/// Prefer [`From`] on a [`ClusterTlsConfig`](super::ClusterTlsConfig)
+	/// where one is available. This constructor serves callers that hold
+	/// the two stores directly, such as a test harness.
+	#[must_use]
+	pub fn new(hive: Option<&'a dyn CertificateTrust>, peer: Option<&'a dyn CertificateTrust>) -> Self {
+		Self { hive, peer }
+	}
+
+	/// Classify `cert` against the two planes.
+	///
+	/// Peer membership wins: a certificate in both stores is
+	/// [`Party::Peer`]. Anonymous (`None`) and unknown certificates are
+	/// [`Party::Untrusted`].
+	#[must_use]
+	pub fn classify(&self, cert: Option<&Certificate>) -> Party {
+		let Some(cert) = cert else {
+			return Party::Untrusted;
+		};
+		if self.peer.is_some_and(|trust| trust.is_trusted(cert)) {
+			return Party::Peer;
+		}
+		if self.hive.is_some_and(|trust| trust.is_trusted(cert)) {
+			return Party::FirstParty;
+		}
+
+		Party::Untrusted
+	}
+
+	/// [`TrustPlanes::classify`] on a session's authenticated identity.
+	///
+	/// Custom [`ExportGate`] implementations classify the caller here
+	/// beside their own per-identity rules.
+	#[must_use]
+	pub fn classify_session(&self, session: &SessionContext) -> Party {
+		self.classify(session.peer_certificate())
+	}
+
+	/// Whether `cert` is a first-party caller.
+	#[must_use]
+	pub fn is_first_party(&self, cert: Option<&Certificate>) -> bool {
+		matches!(self.classify(cert), Party::FirstParty)
+	}
 }
 
 /// Built-in allowlist verdict on a resolved servlet target.
 ///
-/// `exported` is the configured export list, or `None` when the gateway
-/// exports every type. The verdict reads the live configuration on each
+/// `exported` is the configured allowlist, or `None` when the gateway
+/// exports every type. The verdict reads the live allowlist on each
 /// request so the enforcement plane and the advertise filter stay aligned.
 /// Grants are applied by the gateway after this allowlist refuses; this
 /// function is the allowlist step alone.
@@ -276,9 +485,8 @@ pub fn session_is_first_party(
 /// 3. An unexported origin request passes only for a first-party session.
 /// 4. Any other unexported request is refused.
 pub(crate) fn export_verdict(
-	exported: Option<&[Urn<'static>]>,
-	hive_trust: Option<&dyn CertificateTrust>,
-	peer_trust: Option<&dyn CertificateTrust>,
+	exported: Option<&dyn ExportAllowlist>,
+	planes: &TrustPlanes<'_>,
 	target: &Urn<'_>,
 	cert: Option<&Certificate>,
 	relayed: bool,
@@ -286,35 +494,17 @@ pub(crate) fn export_verdict(
 	let Some(exported) = exported else {
 		return TransitStatus::Ok;
 	};
-	if exported.iter().any(|allowed| allowed == target) {
+	if exported.contains(target) {
 		return TransitStatus::Ok;
 	}
 	if relayed {
 		return TransitStatus::PermissionDenied;
 	}
-	if cert_is_first_party(cert, hive_trust, peer_trust) {
+	if planes.is_first_party(cert) {
 		return TransitStatus::Ok;
 	}
 
 	TransitStatus::PermissionDenied
-}
-
-/// Canonical-byte lookup set of an exported-type list.
-///
-/// The advertise beat builds this once per task and filters the slate
-/// against it, so ads and rumors disclose exported types only.
-pub(crate) fn export_set(exported: &[Urn<'static>]) -> HashSet<Vec<u8>> {
-	exported.iter().map(canonical_bytes).collect()
-}
-
-/// Whether a canonical type key belongs on the advertised slate.
-///
-/// `None` means no export list is configured, which exports every type.
-pub(crate) fn slate_exported(exports: Option<&HashSet<Vec<u8>>>, canonical: &[u8]) -> bool {
-	match exports {
-		Some(set) => set.contains(canonical),
-		None => true,
-	}
 }
 
 #[cfg(test)]
@@ -356,7 +546,8 @@ mod tests {
 	fn first_party_classifies_hive_anchored_cert() {
 		let cert = test_certificate();
 		let hive = trust_of(&cert);
-		assert!(cert_is_first_party(Some(&cert), Some(hive.as_ref()), None));
+		let planes = TrustPlanes::new(Some(hive.as_ref()), None);
+		assert_eq!(planes.classify(Some(&cert)), Party::FirstParty);
 	}
 
 	#[test]
@@ -364,8 +555,9 @@ mod tests {
 		let cert = foreign_certificate();
 		let hive = trust_of(&test_certificate());
 		let peer = trust_of(&cert);
+		let planes = TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref()));
 
-		assert!(!cert_is_first_party(Some(&cert), Some(hive.as_ref()), Some(peer.as_ref())));
+		assert_eq!(planes.classify(Some(&cert)), Party::Peer);
 	}
 
 	#[test]
@@ -373,35 +565,47 @@ mod tests {
 		let cert = test_certificate();
 		let hive = trust_of(&cert);
 		let peer = trust_of(&cert);
-
-		assert!(!cert_is_first_party(Some(&cert), Some(hive.as_ref()), Some(peer.as_ref())));
+		let planes = TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref()));
+		assert_eq!(planes.classify(Some(&cert)), Party::Peer);
 	}
 
 	#[test]
 	fn first_party_rejects_anonymous_session() {
-		assert!(!session_is_first_party(&SessionContext::default(), None, None));
+		let planes = TrustPlanes::new(None, None);
+		assert_eq!(planes.classify_session(&SessionContext::default()), Party::Untrusted);
 	}
 
 	#[test]
 	fn first_party_without_hive_trust_classifies_nobody() {
 		let cert = test_certificate();
-		assert!(!cert_is_first_party(Some(&cert), None, None));
+		let planes = TrustPlanes::new(None, None);
+		assert_eq!(planes.classify(Some(&cert)), Party::Untrusted);
+	}
+
+	fn static_list(types: impl IntoIterator<Item = Urn<'static>>) -> StaticExportList {
+		StaticExportList::new(types)
 	}
 
 	#[test]
 	fn verdict_without_export_list_passes_every_target() {
 		let cert = test_certificate();
 		assert_eq!(
-			export_verdict(None, None, None, &servlet("ledger"), Some(&cert), true),
+			export_verdict(None, &TrustPlanes::new(None, None), &servlet("ledger"), Some(&cert), true),
 			TransitStatus::Ok
 		);
 	}
 
 	#[test]
 	fn verdict_passes_exported_target_for_external_peer() {
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
-			export_verdict(Some(&exported), None, None, &servlet("ping"), Some(&test_certificate()), true),
+			export_verdict(
+				Some(&exported),
+				&TrustPlanes::new(None, None),
+				&servlet("ping"),
+				Some(&test_certificate()),
+				true
+			),
 			TransitStatus::Ok
 		);
 	}
@@ -411,12 +615,11 @@ mod tests {
 		let cert = foreign_certificate();
 		let hive = trust_of(&test_certificate());
 		let peer = trust_of(&cert);
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				Some(hive.as_ref()),
-				Some(peer.as_ref()),
+				&TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref())),
 				&servlet("ledger"),
 				Some(&cert),
 				false
@@ -427,9 +630,9 @@ mod tests {
 
 	#[test]
 	fn verdict_refuses_unexported_relayed_request() {
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
-			export_verdict(Some(&exported), None, None, &servlet("ledger"), None, true),
+			export_verdict(Some(&exported), &TrustPlanes::new(None, None), &servlet("ledger"), None, true),
 			TransitStatus::PermissionDenied
 		);
 	}
@@ -439,12 +642,11 @@ mod tests {
 		let cert = test_certificate();
 		let hive = trust_of(&cert);
 		let peer = trust_of(&foreign_certificate());
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				Some(hive.as_ref()),
-				Some(peer.as_ref()),
+				&TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref())),
 				&servlet("ledger"),
 				Some(&cert),
 				false
@@ -458,12 +660,11 @@ mod tests {
 		let cert = test_certificate();
 		let hive = trust_of(&cert);
 		let peer = trust_of(&cert);
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
 			export_verdict(
 				Some(&exported),
-				Some(hive.as_ref()),
-				Some(peer.as_ref()),
+				&TrustPlanes::new(Some(hive.as_ref()), Some(peer.as_ref())),
 				&servlet("ledger"),
 				Some(&cert),
 				false
@@ -475,9 +676,15 @@ mod tests {
 	#[test]
 	fn verdict_refuses_unexported_anonymous_origin_target() {
 		let hive = trust_of(&test_certificate());
-		let exported = [servlet("ping")];
+		let exported = static_list([servlet("ping")]);
 		assert_eq!(
-			export_verdict(Some(&exported), Some(hive.as_ref()), None, &servlet("ledger"), None, false),
+			export_verdict(
+				Some(&exported),
+				&TrustPlanes::new(Some(hive.as_ref()), None),
+				&servlet("ledger"),
+				None,
+				false
+			),
 			TransitStatus::PermissionDenied
 		);
 	}
@@ -486,25 +693,69 @@ mod tests {
 	fn empty_export_list_refuses_every_target_for_external_peer() {
 		let cert = foreign_certificate();
 		let hive = trust_of(&test_certificate());
+		let exported = static_list([]);
 		assert_eq!(
-			export_verdict(Some(&[]), Some(hive.as_ref()), None, &servlet("ping"), Some(&cert), false),
+			export_verdict(
+				Some(&exported),
+				&TrustPlanes::new(Some(hive.as_ref()), None),
+				&servlet("ping"),
+				Some(&cert),
+				false
+			),
 			TransitStatus::PermissionDenied
 		);
 	}
 
 	#[test]
-	fn export_set_filters_slate_to_exported_keys() {
-		let exports = export_set(&[servlet("ping")]);
-		let exported_key = canonical_bytes(&servlet("ping"));
-		let hidden_key = canonical_bytes(&servlet("ledger"));
-		assert!(slate_exported(Some(&exports), &exported_key));
-		assert!(!slate_exported(Some(&exports), &hidden_key));
+	fn dynamic_allowlist_mutation_visible_to_verdict_and_keys() {
+		let list = DynamicExportList::new([servlet("ping")]);
+		let ledger = servlet("ledger");
+		let ledger_key = canonical_bytes(&ledger);
+
+		assert_eq!(
+			export_verdict(Some(&list), &TrustPlanes::new(None, None), &ledger, None, true),
+			TransitStatus::PermissionDenied
+		);
+		assert!(!list.allows_canonical(&ledger_key));
+
+		list.insert(ledger.clone());
+
+		assert_eq!(
+			export_verdict(Some(&list), &TrustPlanes::new(None, None), &ledger, None, true),
+			TransitStatus::Ok
+		);
+		assert!(list.allows_canonical(&ledger_key));
+
+		list.remove(&ledger);
+
+		assert_eq!(
+			export_verdict(Some(&list), &TrustPlanes::new(None, None), &ledger, None, true),
+			TransitStatus::PermissionDenied
+		);
+		assert!(!list.allows_canonical(&ledger_key));
 	}
 
 	#[test]
-	fn missing_export_list_exports_all() {
-		let key = canonical_bytes(&servlet("ledger"));
-		assert!(slate_exported(None, &key));
+	fn static_list_filters_slate_to_exported_keys() {
+		let exports = static_list([servlet("ping")]);
+		assert!(exports.allows_canonical(&canonical_bytes(&servlet("ping"))));
+		assert!(!exports.allows_canonical(&canonical_bytes(&servlet("ledger"))));
+	}
+
+	struct ContainsOnlyList(Urn<'static>);
+
+	impl ExportAllowlist for ContainsOnlyList {
+		fn contains(&self, target: &Urn<'_>) -> bool {
+			&self.0 == target
+		}
+	}
+
+	#[test]
+	fn default_canonical_lookup_delegates_to_contains() {
+		let list = ContainsOnlyList(servlet("ping"));
+		assert!(list.allows_canonical(&canonical_bytes(&servlet("ping"))));
+		assert!(!list.allows_canonical(&canonical_bytes(&servlet("ledger"))));
+		assert!(!list.allows_canonical(&[0xFF]));
 	}
 
 	struct GrantTarget;

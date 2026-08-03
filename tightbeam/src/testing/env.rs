@@ -47,14 +47,18 @@ pub struct ClientEnv<C, A> {
 	pub addr: A,
 }
 
-/// Cluster `client` closure: owns the cluster instance so registry
-/// assertions and the consuming `stop` are available.
+/// Cluster `client` closure: owns the program returned by `start`.
+///
+/// `G` is usually one gateway. Multi-org harnesses may return a larger
+/// topology (seed plus peers) as `G`; the client still owns a single
+/// consuming teardown for that value.
 pub struct ClusterEnv<C, G> {
 	/// Trace handle recording into the scenario's collector.
 	pub trace: TraceCollector,
 	/// Scenario fixture from the `context:` key, shared as `Arc<C>`.
 	pub context: Arc<C>,
-	/// Started cluster instance, owned by the closure.
+	/// Value returned by `start`, owned by the closure for registry
+	/// checks and consuming `stop`.
 	pub cluster: G,
 }
 

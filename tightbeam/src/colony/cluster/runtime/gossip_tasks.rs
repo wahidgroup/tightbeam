@@ -47,7 +47,6 @@ mod x509 {
 
 	pub(crate) use crate::builder::frame::FrameBuilder;
 	pub(crate) use crate::builder::TypeBuilder;
-	pub(crate) use crate::colony::cluster::export::{export_set, slate_exported};
 	pub(crate) use crate::colony::cluster::peer::{cert_fingerprint_id, peer_dial_allowed, AdmittedPeerAd};
 	pub(crate) use crate::colony::cluster::{
 		cert_colony_urn, gossip_digest, gossip_fresh, peer_signer_fingerprint, wanted_digests, Admission,
@@ -1168,8 +1167,8 @@ where
 
 		// The slate below is the single place advertised types are
 		// gathered, so one export filter covers the direct ads and
-		// the rumor flood. The lookup set builds once per task.
-		let export_keys = config.peer.exported_types.as_deref().map(export_set);
+		// the rumor flood. Membership is asked per key each beat so a
+		// live ExportAllowlist stays aligned with enforcement.
 		loop {
 			rt::sleep(interval).await;
 
@@ -1201,16 +1200,19 @@ where
 			// dial.
 			let targets = config.peer.table.target_set().unwrap_or_default();
 			let probes = config.peer.table.probe_sample(current_timestamp_ms()).unwrap_or_default();
+
 			push_ledger.retain(|peer, _| targets.contains(peer) || probes.contains(peer));
+
 			if targets.is_empty() && probes.is_empty() {
 				continue;
 			}
 
+			let exports = config.peer.exported_types.as_deref();
 			let slate: Vec<Urn<'static>> = servlet_registry
 				.local_servlets()
 				.unwrap_or_default()
 				.iter()
-				.filter(|bytes| slate_exported(export_keys.as_ref(), bytes))
+				.filter(|bytes| exports.is_none_or(|list| list.allows_canonical(bytes)))
 				.filter_map(|bytes| from_utf8(bytes).ok())
 				.filter_map(|canonical| canonical.parse().ok())
 				.take(MAX_ADVERTISED_TYPES)

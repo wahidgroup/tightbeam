@@ -7,10 +7,12 @@
 //!
 //! # Export boundary
 //!
-//! Discoverability and enforcement share one servlet-type list:
+//! Discoverability and enforcement share one [`ExportAllowlist`]:
 //!
-//! - [`ClusterConfigBuilder::with_exported_types`] filters the advertise
-//!   slate and drives the fail-closed built-in allowlist.
+//! - [`ClusterConfigBuilder::with_exported_types`] installs a static list
+//!   that filters the advertise slate and drives the fail-closed allowlist.
+//! - [`ClusterConfigBuilder::with_export_allowlist`] installs a live handle
+//!   when membership must change after start.
 //! - [`ClusterConfigBuilder::with_export_grant`] adds positive grants
 //!   that compose as union with the allowlist.
 //! - [`ClusterConfigBuilder::with_export_gate`] adds per-identity gates
@@ -42,7 +44,8 @@ use crate::transport::client::pool::PoolConfig;
 #[cfg(feature = "x509")]
 mod x509 {
 	pub(crate) use crate::colony::cluster::{
-		cert_colony_urn, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore, PeerStore, PeerTable,
+		cert_colony_urn, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
+		PeerStore, PeerTable, StaticExportList,
 	};
 	pub(crate) use crate::crypto::x509::Certificate;
 	pub(crate) use crate::utils::urn::Urn;
@@ -230,7 +233,19 @@ impl ClusterConfigBuilder {
 	/// mutual TLS (see
 	/// [`ClusterTlsConfig::client_validators`](super::ClusterTlsConfig)).
 	pub fn with_exported_types(mut self, exported: impl IntoIterator<Item = Urn<'static>>) -> Self {
-		self.peer.exported_types = Some(exported.into_iter().collect());
+		self.peer.exported_types = Some(Arc::new(StaticExportList::new(exported)));
+		self
+	}
+
+	/// Install a live export allowlist shared by discoverability and
+	/// enforcement.
+	///
+	/// Use this when the membership must change after
+	/// [`Cluster::start`](super::Cluster::start), for example a fuzz
+	/// harness that mutates exports under load. Prefer
+	/// [`ClusterConfigBuilder::with_exported_types`] for a fixed list.
+	pub fn with_export_allowlist(mut self, exported: Arc<dyn ExportAllowlist>) -> Self {
+		self.peer.exported_types = Some(exported);
 		self
 	}
 

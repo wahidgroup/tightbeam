@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Idempotent development-environment setup: Rust toolchain components,
-# cargo-audit, and typos. A content hash of the manifests is stamped under
-# .make/ so unchanged re-runs are skipped.
+# cargo-audit, typos, and cargo-afl. A content hash of the manifests is
+# stamped under .make/ so unchanged re-runs are skipped.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STAMP_DIR="$ROOT/.make"
@@ -40,6 +40,9 @@ setup_required() {
 		return 0
 	fi
 	if ! command -v typos >/dev/null 2>&1; then
+		return 0
+	fi
+	if ! command -v cargo-afl >/dev/null 2>&1; then
 		return 0
 	fi
 	if [ ! -f "$SETUP_HASH_FILE" ]; then
@@ -103,6 +106,10 @@ install_rust_tooling() {
 	if ! command -v typos >/dev/null 2>&1; then
 		echo "Installing typos..."
 		cargo install typos-cli --locked
+	fi
+	if ! command -v cargo-afl >/dev/null 2>&1; then
+		echo "Installing cargo-afl..."
+		cargo install cargo-afl --locked
 	fi
 }
 

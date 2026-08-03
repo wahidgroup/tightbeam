@@ -128,9 +128,9 @@ pub use router::{
 /// and unrouted open paths share one wire shape.
 ///
 /// Initiators stamp a route through the typed `open_stream_to` /
-/// `open_duplex_to` entry points, which name a servlet type the same way
-/// `HiveContext::call` does. A served handler reads the route it received
-/// through [`CallContext`](crate::transport::serve::CallContext).
+/// `open_duplex_to` entry points, which name a servlet type URN the same
+/// way a unary routed call names its target. A served handler reads the
+/// route it received through [`CallContext`](crate::transport::serve::CallContext).
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRoute {
@@ -155,21 +155,26 @@ impl StreamRoute {
 		Self::default()
 	}
 
-	/// Route to a servlet type with the origin sentinel budget, which
-	/// defers the hop cap to the first gateway's `max_hops` policy. A
-	/// gateway reads the target to dispatch locally or splice to a
-	/// peer.
-	pub(crate) fn to(target: Urn<'static>) -> Self {
+	/// Route to a servlet type with the origin sentinel budget, which defers
+	/// the hop cap to the first gateway's `max_hops` policy. A gateway reads
+	/// the target to dispatch locally or splice to a peer. Prefer
+	/// [`PooledClient::open_stream_to`](crate::transport::PooledClient::open_stream_to) /
+	/// [`PooledClient::open_duplex_to`](crate::transport::PooledClient::open_duplex_to)
+	/// when the caller does not need a raw [`StreamRoute`].
+	pub fn to(target: Urn<'static>) -> Self {
 		Self { target: Some(target), hops_remaining: DEFAULT_HOP_BUDGET }
 	}
 
 	/// Route to a servlet type with an explicit remaining relay
 	/// budget. A gateway stamps this when it re-emits a client stream
 	/// to a peer gateway with the budget decremented. A `0` budget is
-	/// served locally and never re-forwarded.
+	/// served locally and never re-forwarded. Origin opens use
+	/// [`Self::to`] instead.
 	#[cfg(feature = "colony")]
 	pub(crate) fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> Self {
-		Self { target: Some(target), hops_remaining }
+		// The sentinel encodes an origin open. A relayed route must stay
+		// below it so hop-budget accounting treats the open as already relayed.
+		Self { target: Some(target), hops_remaining: hops_remaining.min(DEFAULT_HOP_BUDGET - 1) }
 	}
 
 	/// Reconstruct a route from the parts carried on a received Open.
@@ -428,4 +433,18 @@ pub trait StreamingProtocol: MultiplexedProtocol {
 	/// Open a duplex stream: push request chunks through the sink while
 	/// the peer's reply arrives incrementally through the body.
 	fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)>;
+}
+
+#[cfg(all(test, feature = "colony"))]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn relayed_to_sentinel_clamps_to_relayed_route() {
+		let sentinel = StreamRoute::relayed_to(Urn::new("fuzz", "servlet:test/ping"), DEFAULT_HOP_BUDGET);
+		assert_eq!(sentinel.hops_remaining(), DEFAULT_HOP_BUDGET - 1);
+
+		let below = StreamRoute::relayed_to(Urn::new("fuzz", "servlet:test/ping"), 1);
+		assert_eq!(below.hops_remaining(), 1);
+	}
 }

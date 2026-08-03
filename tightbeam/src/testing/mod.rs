@@ -33,6 +33,8 @@ pub mod fdr;
 pub mod fmea;
 #[cfg(feature = "testing-fuzz")]
 pub mod fuzz;
+#[cfg(all(feature = "testing-fuzz", feature = "colony"))]
+pub mod routes;
 #[cfg(feature = "testing-timing")]
 pub mod schedulability;
 #[cfg(feature = "testing-timing")]

@@ -1146,10 +1146,14 @@ pooled_mux! {
 
 		/// Open a streamed request carrying a fully-formed [`StreamRoute`].
 		///
-		/// The crate-internal entry a gateway uses to re-emit a client
-		/// stream to a peer gateway with [`StreamRoute::relayed_to`] and
-		/// the relay budget decremented. Otherwise identical to
-		/// [`open_stream`](Self::open_stream).
+		/// Use cases:
+		/// - [`StreamRoute::to`] for an origin open
+		/// - [`StreamRoute::relayed_to`] when re-emitting a spent hop budget
+		///
+		/// Prefer [`open_stream_to`](Self::open_stream_to) when the
+		/// route is a plain origin target. Otherwise identical to
+		/// [`open_stream`](Self::open_stream). Crate-internal callers
+		/// pass a fully formed route when the origin helpers are not enough.
 		///
 		/// # Errors
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
@@ -1194,10 +1198,14 @@ pooled_mux! {
 
 		/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
 		///
-		/// The crate-internal entry a gateway uses to re-emit a client
-		/// duplex stream to a peer gateway with [`StreamRoute::relayed_to`]
-		/// and the relay budget decremented. Otherwise identical to
-		/// [`open_duplex`](Self::open_duplex).
+		/// Use cases:
+		/// - [`StreamRoute::to`] for an origin open
+		/// - [`StreamRoute::relayed_to`] when re-emitting a spent hop budget
+		///
+		/// Prefer [`open_duplex_to`](Self::open_duplex_to) when the
+		/// route is a plain origin target. Otherwise identical to
+		/// [`open_duplex`](Self::open_duplex). Crate-internal callers
+		/// pass a fully formed route when the origin helpers are not enough.
 		///
 		/// # Errors
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane

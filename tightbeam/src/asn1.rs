@@ -14,9 +14,6 @@ pub use crate::der::{Choice, Enumerated, Sequence};
 pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 
-#[cfg(feature = "x509")]
-pub use crate::x509::ext::pkix::{HashAlgorithm, SignatureAlgorithm};
-
 use crate::der::TagNumber;
 use crate::wire::wire_sequence;
 
