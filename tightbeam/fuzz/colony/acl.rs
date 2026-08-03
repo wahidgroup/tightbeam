@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use tightbeam::colony::cluster::{ExportGate, ExportGrant};
+use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
 use tightbeam::policy::{SessionContext, TransitStatus};
 use tightbeam::utils::urn::Urn;
 
@@ -66,6 +66,7 @@ impl DynamicAclState {
 
 /// Grant that consults a shared [`DynamicAclState`].
 pub(crate) struct DynamicGrant {
+	/// Shared grant and deny tables consulted on each evaluation.
 	pub state: Arc<DynamicAclState>,
 }
 
@@ -81,11 +82,18 @@ impl ExportGrant for DynamicGrant {
 
 /// Deny gate that consults a shared [`DynamicAclState`].
 pub(crate) struct DynamicDenyGate {
+	/// Shared grant and deny tables consulted on each evaluation.
 	pub state: Arc<DynamicAclState>,
 }
 
 impl ExportGate for DynamicDenyGate {
-	fn evaluate(&self, _target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> TransitStatus {
+	fn evaluate(
+		&self,
+		_target: &Urn<'_>,
+		session: &SessionContext,
+		_planes: &TrustPlanes<'_>,
+		_relayed: bool,
+	) -> TransitStatus {
 		if self.state.is_denied(session.peer_public_key()) {
 			return TransitStatus::PermissionDenied;
 		}

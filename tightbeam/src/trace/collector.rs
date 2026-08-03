@@ -647,26 +647,24 @@ impl TraceCollector {
 		Ok(EventBuilder::new(self, label_cow, Some(tags.into()), Some(value.into())))
 	}
 
+	/// Live-step the fuzz CSP oracle when the recorded label is in alphabet.
+	///
+	/// Labels are full URN renderings. Identity matches
+	/// [`crate::testing::specs::csp::Event`] via the shared intern pool so
+	/// structure-aware and simple harnesses all step without alias tables.
+	///
+	/// A failed step is ignored when the label is disabled or outside the
+	/// process alphabet. End-of-run CSP validation still owns hard acceptance.
 	#[cfg(feature = "testing-fuzz")]
 	fn dispatch_csp_event(&self, label: &str) {
-		if let Some(ref oracle) = self.state.oracle {
-			if let Some(csp_label) = Self::map_csp_label(label) {
-				use crate::testing::specs::csp::Event;
-				let event = Event(csp_label);
-				let _ = oracle.step_event(&event);
-			}
-		}
-	}
+		let Some(oracle) = self.state.oracle.as_ref() else {
+			return;
+		};
 
-	#[cfg(feature = "testing-fuzz")]
-	fn map_csp_label(label: &str) -> Option<&'static str> {
-		match label {
-			"client_move_sent" => Some("move_request"),
-			"client_move_validated" => Some("move_valid"),
-			"client_move_rejected" => Some("move_invalid"),
-			"client_game_ended" => Some("game_over"),
-			_ => None,
-		}
+		use crate::testing::specs::csp::{intern, Event};
+
+		let event = Event(intern(label));
+		let _ = oracle.step_event(&event);
 	}
 
 	#[cfg(feature = "instrument")]

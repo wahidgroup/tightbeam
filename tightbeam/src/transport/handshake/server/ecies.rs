@@ -90,6 +90,10 @@ where
 	session_observer: Option<Arc<dyn SessionObserver>>,
 	mux_settings: Option<MuxSettings>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	/// Captured client identity in one of two grades: chain-validated
+	/// when `client_validators` ran, possession-verified otherwise. Both
+	/// grades passed the proof-of-possession signature over the bound
+	/// auth digest; trust decisions belong to policy, not to capture.
 	validated_client_cert: Option<Arc<Certificate>>,
 	session_receipt: Option<SessionReceipt>,
 	receipt_artifact: Option<SignedData>,
@@ -572,6 +576,17 @@ where
 		}
 	}
 
+	/// Validate or opportunistically capture the offered client identity.
+	///
+	/// When `client_validators` is set, a client certificate is required and
+	/// every validator MUST pass before the possession check. When validators
+	/// are absent, a client that offers no certificate stays anonymous. An
+	/// offered certificate is still captured after its proof-of-possession
+	/// signature verifies over the bound auth digest.
+	///
+	/// Capture records identity only. Trust-store membership and export
+	/// first-party classification stay in policy, so a possession-verified
+	/// capture without chain validation does not widen authorization by itself.
 	#[cfg(feature = "x509")]
 	fn validate_client_certificate(&mut self, client_kex: &mut ClientKeyExchange) -> Result<(), HandshakeError>
 	where
@@ -581,51 +596,48 @@ where
 		for<'a> P::Signature: TryFrom<&'a [u8]>,
 		P::VerifyingKey: PrehashVerifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
-		if let Some(validators) = &self.client_validators {
+		let client_cert = match (client_kex.client_certificate.take(), &self.client_validators) {
+			(Some(cert), _) => cert,
 			// Client cert is required when validators are present
-			let client_cert = client_kex
-				.client_certificate
-				.take()
-				.ok_or(HandshakeError::MissingClientCertificate)?;
+			(None, Some(_)) => return Err(HandshakeError::MissingClientCertificate),
+			(None, None) => return Ok(()),
+		};
 
-			// Run validator chain (includes expiry, pinning, policy, etc.)
+		// Chain validation runs before the possession check, so a
+		// certificate refused by any validator is never captured.
+		if let Some(validators) = &self.client_validators {
 			for validator in validators.iter() {
 				validator.evaluate(&client_cert)?;
 			}
-
-			// Verify client signature over the bound auth digest
-			let client_signature = client_kex
-				.client_signature
-				.as_ref()
-				.ok_or(HandshakeError::SignatureVerificationFailed)?;
-
-			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
-
-			// Recompute the digest the client signed: transcript hash bound to
-			// this exact encrypted payload and this exact certificate,
-			// so the signature cannot be spliced from another exchange.
-			let cert_der = client_cert.to_der()?;
-			let auth_digest = compute_client_auth_digest::<P::Digest>(
-				&transcript_hash,
-				client_kex.encrypted_data.as_bytes(),
-				&cert_der,
-			)?;
-
-			// Extract public key from client certificate
-			// Parse public key
-			let public_key = extract_verifying_key_from_cert::<P::Curve>(&client_cert)?;
-			// Parse signature
-			let signature = P::Signature::try_from(client_signature.as_bytes())
-				.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
-
-			// Create verifying key from public key
-			let verifying_key = P::VerifyingKey::from(&public_key);
-			verifying_key.verify_prehash(&auth_digest, &signature)?;
-
-			// Store validated cert (identity is now locked)
-			let client_cert = Arc::new(client_cert);
-			self.validated_client_cert = Some(client_cert);
 		}
+
+		// Verify client signature over the bound auth digest. Capture
+		// never records an identity the peer cannot sign for, so the
+		// possession check runs in both capture grades.
+		let client_signature = client_kex
+			.client_signature
+			.as_ref()
+			.ok_or(HandshakeError::SignatureVerificationFailed)?;
+
+		let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+
+		// Recompute the digest the client signed: transcript hash bound to
+		// this exact encrypted payload and this exact certificate,
+		// so the signature cannot be spliced from another exchange.
+		let cert_der = client_cert.to_der()?;
+		let auth_digest =
+			compute_client_auth_digest::<P::Digest>(&transcript_hash, client_kex.encrypted_data.as_bytes(), &cert_der)?;
+
+		let public_key = extract_verifying_key_from_cert::<P::Curve>(&client_cert)?;
+		let signature = P::Signature::try_from(client_signature.as_bytes())
+			.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+
+		let verifying_key = P::VerifyingKey::from(&public_key);
+		verifying_key.verify_prehash(&auth_digest, &signature)?;
+
+		// Storing the certificate locks the captured identity; this is
+		// the only write after construction.
+		self.validated_client_cert = Some(Arc::new(client_cert));
 
 		Ok(())
 	}
@@ -663,6 +675,7 @@ where
 				let expected_sid = certificate_signer_identifier::<P::Digest>(client_cert)?;
 				let public_key = extract_verifying_key_from_cert::<P::Curve>(client_cert)?;
 				let verifying_key = P::VerifyingKey::from(&public_key);
+
 				settle_receipt_ack::<P::Digest, P::Signature, _>(
 					&receipt,
 					Some(ack),
@@ -830,6 +843,7 @@ mod tests {
 	use super::*;
 	use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 	use crate::crypto::ecies::{encrypt, Secp256k1EciesMessage};
+	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::profiles::SecurityProfileDesc;
 	use crate::random::{generate_nonce, OsRng};
 	use crate::transport::handshake::negotiation::{select_profile, SecurityOffer};
@@ -960,6 +974,61 @@ mod tests {
 		Ok(())
 	}
 
+	/// An anonymous dial against a validator-less server captures no
+	/// client identity.
+	#[tokio::test]
+	async fn test_anonymous_dial_captures_no_identity() -> Result<(), Box<dyn Error>> {
+		let mut server = TestEciesServerBuilder::new().build()?;
+		let client_random = generate_nonce::<32>(None)?;
+
+		let client_hello_der = create_test_client_hello(&client_random)?;
+		server.process_client_hello(&client_hello_der).await?;
+
+		let client_kex_der = build_test_client_key_exchange(&server)?;
+		server.process_client_key_exchange(&client_kex_der).await?;
+
+		assert!(server.validated_client_cert.is_none());
+		Ok(())
+	}
+
+	/// A validator-less server captures an offered identity once its
+	/// proof-of-possession signature verifies.
+	#[tokio::test]
+	async fn test_opportunistic_capture_stores_offered_identity() -> Result<(), Box<dyn Error>> {
+		let mut server = TestEciesServerBuilder::new().build()?;
+		let client_random = generate_nonce::<32>(None)?;
+
+		let client_hello_der = create_test_client_hello(&client_random)?;
+		server.process_client_hello(&client_hello_der).await?;
+
+		let client = create_test_certificate();
+		let client_kex_der = build_identified_client_key_exchange(&server, &client, None).await?;
+		server.process_client_key_exchange(&client_kex_der).await?;
+
+		let captured = server.validated_client_cert.as_deref();
+		assert_eq!(captured, Some(&client.certificate));
+		Ok(())
+	}
+
+	/// A validator-less server refuses an offered identity whose
+	/// possession signature does not verify.
+	#[tokio::test]
+	async fn test_opportunistic_capture_rejects_bad_possession_signature() -> Result<(), Box<dyn Error>> {
+		let mut server = TestEciesServerBuilder::new().build()?;
+		let client_random = generate_nonce::<32>(None)?;
+
+		let client_hello_der = create_test_client_hello(&client_random)?;
+		server.process_client_hello(&client_hello_der).await?;
+
+		let client = create_test_certificate();
+		let forged_digest = [0u8; 32];
+		let client_kex_der = build_identified_client_key_exchange(&server, &client, Some(forged_digest)).await?;
+
+		assert!(server.process_client_key_exchange(&client_kex_der).await.is_err());
+		assert!(server.validated_client_cert.is_none());
+		Ok(())
+	}
+
 	/// A conforming payload recovers the key material and the absent ack.
 	#[test]
 	fn test_payload_parse_recovers_session_data() -> Result<(), Box<dyn Error>> {
@@ -1048,7 +1117,6 @@ mod tests {
 	fn test_client_hello_transport_offer_round_trip() -> Result<(), Box<dyn Error>> {
 		let hello_der = create_test_client_hello_with_transport_offer(&[7u8; 32], Some(TransportOffer::mux(16)))?;
 		let decoded = ClientHello::from_der(&hello_der)?;
-
 		assert_eq!(decoded.security_offer, None);
 		assert_eq!(decoded.transport_offer, Some(TransportOffer::mux(16)));
 		Ok(())
@@ -1060,11 +1128,11 @@ mod tests {
 	async fn test_transport_negotiation() -> Result<(), Box<dyn Error>> {
 		// Offered and locally enabled: negotiated with directional caps
 		{
-			let mut server = TestEciesServerBuilder::new()
-				.build()?
-				.with_transport_config(TransportOffer::mux(4));
-			let client_hello_der =
-				create_test_client_hello_with_transport_offer(&[0u8; 32], Some(TransportOffer::mux(8)))?;
+			let transport_offer = TransportOffer::mux(4);
+			let mut server = TestEciesServerBuilder::new().build()?.with_transport_config(transport_offer);
+
+			let transport_offer = TransportOffer::mux(8);
+			let client_hello_der = create_test_client_hello_with_transport_offer(&[0u8; 32], Some(transport_offer))?;
 			let response_der = server.process_client_hello(&client_hello_der).await?;
 
 			let response = ServerHandshake::from_der(&response_der)?;
@@ -1080,9 +1148,9 @@ mod tests {
 
 		// Offered but not locally enabled: single-flight
 		{
+			let transport_offer = TransportOffer::mux(8);
 			let mut server = TestEciesServerBuilder::new().build()?;
-			let client_hello_der =
-				create_test_client_hello_with_transport_offer(&[1u8; 32], Some(TransportOffer::mux(8)))?;
+			let client_hello_der = create_test_client_hello_with_transport_offer(&[1u8; 32], Some(transport_offer))?;
 			let response_der = server.process_client_hello(&client_hello_der).await?;
 
 			let response = ServerHandshake::from_der(&response_der)?;
@@ -1092,9 +1160,8 @@ mod tests {
 
 		// Locally enabled but not offered: single-flight
 		{
-			let mut server = TestEciesServerBuilder::new()
-				.build()?
-				.with_transport_config(TransportOffer::mux(4));
+			let transport_offer = TransportOffer::mux(4);
+			let mut server = TestEciesServerBuilder::new().build()?.with_transport_config(transport_offer);
 			let client_hello_der = create_test_client_hello_with_transport_offer(&[2u8; 32], None)?;
 			let response_der = server.process_client_hello(&client_hello_der).await?;
 
@@ -1152,5 +1219,66 @@ mod tests {
 
 		// Build ClientKeyExchange message
 		create_test_client_key_exchange(&encrypted_message.to_bytes())
+	}
+
+	/// Build an identified ClientKeyExchange: the encrypted payload plus
+	/// the client certificate and its proof-of-possession signature.
+	///
+	/// `override_digest` replaces the bound auth digest so negative tests
+	/// can present a signature over the wrong material.
+	async fn build_identified_client_key_exchange<P>(
+		server: &EciesHandshakeServer<P>,
+		client: &TestCertificate,
+		override_digest: Option<[u8; 32]>,
+	) -> Result<Vec<u8>, Box<dyn Error>>
+	where
+		P: CryptoProvider,
+		P::AeadCipher: KeyInit,
+	{
+		let server_pubkey = k256::PublicKey::from_sec1_bytes(
+			server
+				.server_cert
+				.tbs_certificate
+				.subject_public_key_info
+				.subject_public_key
+				.raw_bytes(),
+		)?;
+
+		let stored_client_random = server.client_random.ok_or(HandshakeError::InvalidState)?;
+		let base_session_key = generate_nonce::<32>(None)?;
+
+		let payload = EciesSessionPayload {
+			base_key: OctetString::new(base_session_key)?,
+			client_random: OctetString::new(stored_client_random)?,
+			receipt_ack: None,
+		};
+		let plaintext = payload.to_der()?;
+
+		let aad = server.aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG));
+		let encrypted_message = encrypt::<_, _, _, Secp256k1EciesMessage, P::Kdf, P::AeadCipher>(
+			&server_pubkey,
+			&plaintext,
+			aad,
+			Some(&mut OsRng),
+		)?;
+		let encrypted_bytes = encrypted_message.to_bytes();
+
+		let transcript_hash = server.transcript_hash().ok_or(HandshakeError::InvalidState)?;
+		let cert_der = client.certificate.to_der()?;
+		let auth_digest = match override_digest {
+			Some(digest) => digest,
+			None => compute_client_auth_digest::<P::Digest>(&transcript_hash, &encrypted_bytes, &cert_der)?,
+		};
+
+		let provider = Secp256k1KeyProvider::from(client.signing_key.to_owned());
+		let signature = provider.sign_prehash(&auth_digest).await?;
+
+		let client_kex = ClientKeyExchange {
+			encrypted_data: OctetString::new(encrypted_bytes)?,
+			client_certificate: Some(client.certificate.to_owned()),
+			client_signature: Some(OctetString::new(signature.to_vec())?),
+		};
+
+		Ok(client_kex.to_der()?)
 	}
 }

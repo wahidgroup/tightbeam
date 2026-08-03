@@ -38,6 +38,7 @@ tb_assert_spec! {
 		assertions: [
 			(events::ACTION_RUN, at_least!(0)),
 			(events::SHADOW_VIOLATION, exactly!(0)),
+			(events::SHADOW_TOO_CLOSED, exactly!(0)),
 			(events::ACTIONS_BALANCE, exactly!(1), tags: ["balance"]),
 		]
 	},
@@ -48,13 +49,13 @@ tb_process_spec! {
 	pub ColonyCoopFlow,
 	events {
 		observable {
-			events::ACTION_RUN, events::SHADOW_VIOLATION, events::WORK_OK, events::WORK_DENIED,
-			events::CSR_ISSUED, events::CSR_REFUSED, events::SERVLET_ADDED, events::SERVLET_REMOVED,
-			events::STRESS_BURST, events::EXPORT_MUTATED, events::GRANT_MUTATED, events::GATE_MUTATED,
-			events::POLICY_GATE_MUTATED, events::PEER_ADVERTISE_SENT, events::PEER_AD_OK, events::PEER_AD_DENIED,
-			events::PEER_ROUTES_AFTER, events::CROSS_ORG_WORK, events::STREAM_OK, events::STREAM_DENIED,
-			events::DUPLEX_OK, events::DUPLEX_DENIED, events::HOSTILE_ANON, events::HOSTILE_FOREIGN,
-			events::FAILOVER_PROBED, events::ACTIONS_BALANCE
+			events::ACTION_RUN, events::SHADOW_VIOLATION, events::SHADOW_TOO_CLOSED, events::WORK_OK,
+			events::WORK_DENIED, events::CSR_ISSUED, events::CSR_REFUSED, events::SERVLET_ADDED,
+			events::SERVLET_REMOVED, events::STRESS_BURST, events::EXPORT_MUTATED, events::GRANT_MUTATED,
+			events::GATE_MUTATED, events::POLICY_GATE_MUTATED, events::PEER_ADVERTISE_SENT, events::PEER_AD_OK,
+			events::PEER_AD_DENIED, events::PEER_ROUTES_AFTER, events::CROSS_ORG_WORK, events::STREAM_OK,
+			events::STREAM_DENIED, events::DUPLEX_OK, events::DUPLEX_DENIED, events::HOSTILE_ANON,
+			events::HOSTILE_FOREIGN, events::FAILOVER_PROBED, events::ACTIONS_BALANCE
 		}
 		hidden { }
 	}
@@ -89,6 +90,7 @@ tb_process_spec! {
 			events::HOSTILE_FOREIGN => Acting,
 			events::FAILOVER_PROBED => Acting,
 			events::SHADOW_VIOLATION => Acting,
+			events::SHADOW_TOO_CLOSED => Acting,
 			events::ACTIONS_BALANCE => Idle,
 		}
 	}

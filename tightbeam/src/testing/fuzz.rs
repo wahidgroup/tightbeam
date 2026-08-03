@@ -26,12 +26,13 @@
 //! cargo afl build --test fuzzing --features "std,testing-fuzz,testing-fuzz-ijon"
 //! ```
 //!
-//! When enabled, the oracle automatically calls:
-//! - `afl::ijon_max!("csp_coverage", ...)` - maximize state+transition coverage
-//! - `afl::ijon_set!("csp_state", ...)` - track unique states visited
+//! When enabled, each successful CSP step reports to AFL IJON:
+//! - `ijon_max(coverage_score)` maximizes state and transition coverage.
+//! - `afl::ijon_set!(track_state)` tracks unique states visited.
 //!
-//! This helps AFL prioritize inputs that explore new protocol states beyond
-//! code coverage.
+//! Structure-aware targets that drive work through `fuzz_u8` still feed
+//! CSP IJON when `trace.event` live-steps the oracle. This helps AFL
+//! prioritize inputs that explore new protocol states beyond code coverage.
 //!
 //! # Verifying AFL Integration
 //!
@@ -73,10 +74,9 @@
 //!      target/debug/deps/fuzzing-* -- -V
 //!    ```
 //!
-//! 3. Check AFL UI for IJON metrics:
-//!    - Look for "csp_coverage" in maximization targets
-//!    - Look for "csp_state" in state tracking
-//!    - Coverage should increase faster with IJON enabled
+//! 3. Confirm IJON symbols and map activity:
+//!    - Binary exports `ijon_set`, `ijon_max`, and `__afl_ijon_*`
+//!    - AFL discovers more unique paths with IJON enabled
 //!
 //! 4. Compare with/without IJON:
 //!    ```bash
@@ -290,9 +290,47 @@ impl CspOracle {
 
 		self.current_state = next_states[(choice as usize) % next_states.len()];
 		self.visited_states.insert(self.current_state);
+		self.report_ijon();
 
 		true
 	}
+
+	/// Report CSP state and coverage to AFL IJON after a successful step.
+	///
+	/// Requires `testing-fuzz-ijon` and `--cfg fuzzing` (cargo-afl builds).
+	/// Plain `cargo test` / `cargo build` keep a no-op so the AFL runtime
+	/// symbols are not required at link time.
+	///
+	/// Coverage reports through the function form of IJON maximization with
+	/// a stable line-hashed location. The AFL IJON entry points are
+	/// `unsafe extern "C"`, so this harness-only path waives crate-wide
+	/// `deny(unsafe_code)`.
+	#[cfg(all(fuzzing, feature = "testing-fuzz-ijon"))]
+	#[allow(unsafe_code)]
+	fn report_ijon(&self) {
+		// Function-scoped: `CString` exists only in std and only this
+		// fuzzing-gated body needs it.
+		use std::ffi::CString;
+
+		afl::ijon_set!(self.track_state());
+		// SAFETY: LOC is written once from a single-threaded AFL worker before
+		// ijon_max reads it. file!() has no interior NUL, so CString::new succeeds.
+		unsafe {
+			static mut LOC: u32 = 0;
+			if LOC == 0 {
+				let Ok(cfile) = CString::new(file!()) else {
+					return;
+				};
+
+				LOC = afl::ijon_hashstr(line!(), cfile.as_ptr());
+			}
+
+			afl::ijon_max(LOC, self.coverage_score());
+		}
+	}
+
+	#[cfg(not(all(fuzzing, feature = "testing-fuzz-ijon")))]
+	fn report_ijon(&self) {}
 
 	/// Reset oracle to initial state
 	pub fn reset(&mut self) {
@@ -311,10 +349,8 @@ impl CspOracle {
 	///
 	/// ## IJON Integration
 	/// ```ignore
-	/// // In fuzz target:
-	/// if oracle.fuzz_from_bytes(data).is_ok() {
-	///     afl::ijon_set!("state", oracle.track_state());
-	/// }
+	/// // Automatic after each successful step when testing-fuzz-ijon is on:
+	/// afl::ijon_set!(oracle.track_state());
 	/// ```
 	///
 	/// This tells AFL: "I'm interested in reaching different state hash values."
@@ -342,10 +378,8 @@ impl CspOracle {
 	///
 	/// ## IJON Integration
 	/// ```ignore
-	/// // In fuzz target:
-	/// if oracle.fuzz_from_bytes(data).is_ok() {
-	///     afl::ijon_max!("coverage", oracle.coverage_score());
-	/// }
+	/// // Automatic after each successful step when testing-fuzz-ijon is on:
+	/// afl::ijon_max(loc, oracle.coverage_score());
 	/// ```
 	///
 	/// This tells AFL: "Maximize this coverage score."
@@ -447,12 +481,9 @@ impl CspOracle {
 	/// - Any panics/crashes during execution
 	///
 	/// ## IJON Integration (Automatic)
-	/// When built with `--features testing-fuzz-ijon`, the oracle automatically
-	/// reports CSP state exploration to AFL's IJON system:
-	/// - `ijon_max!("csp_coverage", ...)` - maximize state+transition coverage
-	/// - `ijon_set!("csp_state", ...)` - track unique states visited
-	///
-	/// This guides AFL toward unexplored protocol states beyond code coverage.
+	/// When built with `--features testing-fuzz-ijon` and `--cfg fuzzing`
+	/// (cargo-afl), each successful step reports CSP exploration through
+	/// `afl::ijon_set!(track_state)` and `afl::ijon_max(coverage_score)`.
 	///
 	/// ## Returns
 	/// - `Ok(())`: Execution reached terminal state successfully
@@ -637,9 +668,13 @@ impl FuzzContext {
 	///
 	/// ## Usage
 	/// ```ignore
-	/// // Manually step CSP state machine
-	/// trace.oracle().step_event(&Event::new("move_request"))?;
+	/// // Manually step CSP state machine with a process-alphabet event
+	/// trace.oracle().step_event(&Event::from(events::ACTION_RUN))?;
 	/// ```
+	///
+	/// A successful step reports CSP state to IJON when `testing-fuzz-ijon`
+	/// is enabled under cargo-afl builds (`--cfg fuzzing`), not under
+	/// ordinary `cargo test`.
 	///
 	/// ## Errors
 	/// Returns `Err(TestingError::FuzzInputLockPoisoned)` if mutex is poisoned.
@@ -773,6 +808,7 @@ impl FuzzContext {
 /// Tests common patterns across oracle and context components
 mod tests {
 	use super::*;
+	use crate::utils::urn::Urn;
 
 	// ===== Test Fixtures =====
 
@@ -851,27 +887,48 @@ mod tests {
 			.expect("fixture process builder has a valid initial state")
 	}
 
+	/// Build a single-step process whose transition label is a full URN:
+	/// S0 --urn--> S1 (terminal)
+	#[allow(dead_code)]
+	fn build_urn_step_process(event: Urn<'static>) -> Process {
+		Process::builder("UrnStep")
+			.initial_state(State("S0"))
+			.add_observable(event.clone())
+			.add_transition(State("S0"), event, State("S1"))
+			.add_terminal(State("S1"))
+			.build()
+			.expect("fixture process builder has a valid initial state")
+	}
+
 	// ===== IJON Feature Tests =====
 
 	#[cfg(feature = "testing-fuzz-ijon")]
 	#[test]
 	fn oracle_ijon_feature_enabled() {
-		// This test verifies that the IJON feature flag compiles correctly.
-		// IJON macros only execute inside afl::fuzz!() at runtime, so we verify
-		// the feature enables the right code paths without actually calling IJON.
+		// report_ijon is cfg(fuzzing), so cargo test exercises the no-op
+		// arm while cargo-afl builds compile the real macros.
 		let proc = build_simple_process("go");
 		let mut oracle = CspOracle::new(proc);
 
-		// fuzz_from_bytes will skip IJON calls in test mode (cfg(test) is true)
 		let input = vec![0];
 		let result = oracle.fuzz_from_bytes(&input);
 		assert!(result.is_ok(), "IJON feature should not break fuzzing");
 		assert_eq!(oracle.visited_states().len(), 2);
 		assert_eq!(oracle.visited_transitions().len(), 1);
 
-		// Verify IJON-related methods work
 		let _ = oracle.track_state();
 		let _ = oracle.coverage_score();
+	}
+
+	#[test]
+	fn step_event_accepts_full_urn_label() {
+		const GO: Urn<'static> = Urn::new("fuzz", "event:test/go");
+		let proc = build_urn_step_process(GO);
+
+		let ctx = FuzzContext::new(Vec::new(), proc);
+		let event = Event::from(GO);
+		assert!(matches!(ctx.step_event(&event), Ok(true)));
+		assert!(matches!(ctx.current_state(), Some(State("S1"))));
 	}
 
 	/// Generate tests for oracle core functionality

@@ -60,10 +60,7 @@ pub use servlet_registry::{
 };
 
 #[cfg(feature = "x509")]
-pub use export::{
-	cert_is_first_party, session_is_first_party, DynamicExportList, ExportAllowlist, ExportGate, ExportGrant,
-	StaticExportList,
-};
+pub use export::{DynamicExportList, ExportAllowlist, ExportGate, ExportGrant, Party, StaticExportList, TrustPlanes};
 
 #[cfg(feature = "x509")]
 pub use gossip::{
@@ -192,7 +189,7 @@ pub struct ClusterTlsConfig {
 	///    verify their signature against it.
 	/// 3. The export boundary classifies a caller as first-party when
 	///    the store holds the caller certificate and `peer_trust` does
-	///    not (see [`cert_is_first_party`]).
+	///    not (see [`TrustPlanes`]).
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 	/// Trust anchor for peer-gateway advertisements and relayed gossip.
 	///

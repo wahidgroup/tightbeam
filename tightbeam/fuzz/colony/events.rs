@@ -9,6 +9,7 @@ const FUZZ_NID: &str = "fuzz";
 
 pub(crate) const ACTION_RUN: Urn<'static> = Urn::new(FUZZ_NID, "event:colony/action-run");
 pub(crate) const SHADOW_VIOLATION: Urn<'static> = Urn::new(FUZZ_NID, "event:colony/shadow-violation");
+pub(crate) const SHADOW_TOO_CLOSED: Urn<'static> = Urn::new(FUZZ_NID, "event:colony/shadow-too-closed");
 pub(crate) const WORK_OK: Urn<'static> = Urn::new(FUZZ_NID, "event:colony/work-ok");
 pub(crate) const WORK_DENIED: Urn<'static> = Urn::new(FUZZ_NID, "event:colony/work-denied");
 pub(crate) const CSR_ISSUED: Urn<'static> = Urn::new(FUZZ_NID, "event:colony/csr-issued");

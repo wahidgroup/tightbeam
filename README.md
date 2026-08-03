@@ -3137,7 +3137,7 @@ Granular per-identity rules compose through custom gates:
 
 1. Every gate must pass (intersection with the allow sources).
 2. A deny gate overrides a grant.
-3. `session_is_first_party` exposes the built-in classifier for reuse.
+3. `TrustPlanes`, handed to every gate, exposes the built-in first-party classifier for reuse.
 
 ```rust
 struct DenyPeerKeyGate {
@@ -3146,7 +3146,7 @@ struct DenyPeerKeyGate {
 }
 
 impl ExportGate for DenyPeerKeyGate {
-	fn evaluate(&self, target: &Urn<'_>, session: &SessionContext, _relayed: bool) -> TransitStatus {
+	fn evaluate(&self, target: &Urn<'_>, session: &SessionContext, _planes: &TrustPlanes<'_>, _relayed: bool) -> TransitStatus {
 		if *target == self.target && session.peer_public_key() == Some(self.denied_spki.as_slice()) {
 			return TransitStatus::PermissionDenied;
 		}

@@ -60,18 +60,34 @@ impl LoadBalancer for StableRoundRobin {
 
 /// Pins the first pick to a preferred route key so decoy failover is deterministic.
 pub(crate) struct DecoyFirstBalancer {
+	/// Route key the balancer prefers first so decoy failover stays deterministic.
 	pub preferred: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl LoadBalancer for DecoyFirstBalancer {
 	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize> {
+		if candidates.is_empty() {
+			return None;
+		}
+
 		let Ok(preferred) = self.preferred.lock() else {
-			return candidates.first().map(|_| 0);
+			return Some(0);
 		};
 
 		preferred
 			.as_ref()
 			.and_then(|key| candidates.iter().position(|candidate| candidate.instance_key == *key))
 			.or(Some(0))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn decoy_first_empty_candidates_returns_none() {
+		let balancer = DecoyFirstBalancer { preferred: Arc::new(Mutex::new(None)) };
+		assert!(balancer.select(&[]).is_none());
 	}
 }

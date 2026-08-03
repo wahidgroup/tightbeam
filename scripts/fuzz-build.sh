@@ -18,7 +18,7 @@ echo "  - fuzz_chess"
 RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_chess --features "std,testing-fuzz,testing-fdr,testing-csp"
 
 echo "  - fuzz_colony"
-RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_colony --features "full,testing-fuzz,testing-csp"
+RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_colony --features "full,testing-fuzz,testing-fuzz-ijon,testing-csp"
 
 echo ""
 echo "Fuzz targets built successfully!"

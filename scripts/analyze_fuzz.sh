@@ -342,11 +342,10 @@ if command -v make &> /dev/null && make -n fuzz-build &> /dev/null 2>&1; then
 	rm -f "$FUZZ_BUILD_LOG"
 fi
 if [ "$BUILD_OK" = false ]; then
-	# Feature sets mirror scripts/fuzz-build.sh.
 	FEATURES="std,testing-fuzz"
 	case "$TEST_NAME" in
 		chess) FEATURES="std,testing-fuzz,testing-fdr,testing-csp" ;;
-		colony) FEATURES="full,testing-fuzz,testing-csp" ;;
+		colony) FEATURES="full,testing-fuzz,testing-fuzz-ijon,testing-csp" ;;
 	esac
 	for CANDIDATE_BIN in "fuzz_${TEST_NAME}" "${TEST_NAME}"; do
 		if RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "$CANDIDATE_BIN" --features "$FEATURES" > /dev/null 2>&1; then
