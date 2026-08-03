@@ -160,8 +160,8 @@ fn pick_org_ref(topo: &ColonyTopology, idx: u8) -> &OrgNode {
 
 /// Owned copy of the fixture-encoded SPKI DER for APIs that take
 /// ownership (ACL mutation, CSR payloads).
-fn org_spki(org: &OrgNode) -> Vec<u8> {
-	org.certs.spki.to_vec()
+fn org_spki(org: &OrgNode) -> &[u8] {
+	org.certs.spki.as_ref()
 }
 
 fn mutate_export(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<(), TightBeamError> {
@@ -183,7 +183,7 @@ fn mutate_grant(trace: &TraceCollector, topo: &ColonyTopology, selector: u8) -> 
 	if selector & 1 == 0 {
 		org.acl.grant(grantee_spki, &target);
 	} else {
-		org.acl.revoke_grant(&grantee_spki, &target);
+		org.acl.revoke_grant(grantee_spki, &target);
 	}
 
 	trace.event(events::GRANT_MUTATED)?;
@@ -195,7 +195,7 @@ fn mutate_gate(trace: &TraceCollector, org: &OrgNode, selector: u8) -> Result<()
 	if selector & 1 == 0 {
 		org.acl.deny(spki);
 	} else {
-		org.acl.allow(&spki);
+		org.acl.allow(spki);
 	}
 
 	trace.event(events::GATE_MUTATED)?;
@@ -467,7 +467,7 @@ async fn submit_csr(
 	let spki = org_spki(org);
 
 	let req = CsrRequest {
-		spki: spki.clone(),
+		spki: spki.to_vec(),
 		colony: colony_urn(org.name).to_string(),
 		cn: format!("csr-{}", selector),
 	};

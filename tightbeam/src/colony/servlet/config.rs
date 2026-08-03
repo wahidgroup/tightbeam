@@ -403,18 +403,21 @@ where
 {
 	/// Enable encrypted transport with the given server certificate.
 	///
-	/// - Non-empty `validators`: mutual auth; every validator must accept the client cert.
+	/// - Non-empty `validators`: mutual auth. Every validator must accept the client cert.
 	/// - Empty `validators`: no client authentication.
+	///
+	/// `validators` accepts any iterator of shared [`CertificateValidation`] values.
 	pub fn with_certificate(
 		mut self,
 		cert: CertificateSpec,
 		key: Arc<dyn SigningKeyProvider>,
-		validators: Vec<Arc<dyn CertificateValidation>>,
+		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
 	) -> Result<Self, TightBeamError> {
 		let certificate = Certificate::try_from(cert)?;
 		let key_manager: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
 		let mut encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
 
+		let validators: Vec<_> = validators.into_iter().collect();
 		if !validators.is_empty() {
 			encryption_config = encryption_config.with_client_validators(validators);
 		}

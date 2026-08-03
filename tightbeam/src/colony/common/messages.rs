@@ -54,9 +54,11 @@ wire_sequence!(ClusterWorkRequest {
 impl ClusterWorkRequest {
 	/// Origin work from a client: the sentinel budget defers the hop
 	/// cap to the first gateway's `max_hops` policy.
+	///
+	/// `payload` accepts any value convertible into [`Vec<u8>`].
 	#[must_use]
-	pub fn new(servlet_type: Urn<'static>, payload: Vec<u8>) -> Self {
-		Self { servlet_type, payload, hops_remaining: DEFAULT_HOP_BUDGET }
+	pub fn new(servlet_type: Urn<'static>, payload: impl Into<Vec<u8>>) -> Self {
+		Self { servlet_type, payload: payload.into(), hops_remaining: DEFAULT_HOP_BUDGET }
 	}
 
 	/// Re-emit toward a peer with the remaining relay budget. A `0`
@@ -80,10 +82,12 @@ pub struct ClusterWorkResponse {
 wire_sequence!(ClusterWorkResponse { status: plain, payload: octets_opt });
 
 impl ClusterWorkResponse {
-	/// Create a successful response with payload
+	/// Create a successful response with payload.
+	///
+	/// `payload` accepts any value convertible into [`Vec<u8>`].
 	#[inline]
-	pub fn ok(payload: Vec<u8>) -> Self {
-		Self { status: TransitStatus::Ok, payload: Some(payload) }
+	pub fn ok(payload: impl Into<Vec<u8>>) -> Self {
+		Self { status: TransitStatus::Ok, payload: Some(payload.into()) }
 	}
 
 	/// Create an error response with status
@@ -257,16 +261,20 @@ wire_sequence!(GossipRumor { payload: octets, kind: default(GossipRumorKind::App
 
 impl GossipRumor {
 	/// Application rumor delivered through the ingress policy.
+	///
+	/// `payload` accepts any value convertible into [`Vec<u8>`].
 	#[must_use]
-	pub fn application(payload: Vec<u8>) -> Self {
-		Self { payload, kind: GossipRumorKind::Application }
+	pub fn application(payload: impl Into<Vec<u8>>) -> Self {
+		Self { payload: payload.into(), kind: GossipRumorKind::Application }
 	}
 
 	/// Advertisement rumor carrying an origin-signed ad frame's DER
 	/// bytes for transitive peer discovery.
+	///
+	/// `ad_frame` accepts any value convertible into [`Vec<u8>`].
 	#[must_use]
-	pub fn peer_advertisement(ad_frame: Vec<u8>) -> Self {
-		Self { payload: ad_frame, kind: GossipRumorKind::PeerAdvertisement }
+	pub fn peer_advertisement(ad_frame: impl Into<Vec<u8>>) -> Self {
+		Self { payload: ad_frame.into(), kind: GossipRumorKind::PeerAdvertisement }
 	}
 }
 

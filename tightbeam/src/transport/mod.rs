@@ -132,8 +132,12 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		}
 	}
 
-	pub fn with_client_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
-		let validators = Arc::new(validators);
+	/// Accepts any iterator of shared [`CertificateValidation`] values.
+	pub fn with_client_validators(
+		mut self,
+		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
+	) -> Self {
+		let validators = Arc::new(validators.into_iter().collect::<Vec<_>>());
 		self.client_validators = Some(validators);
 		self
 	}

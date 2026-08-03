@@ -760,8 +760,11 @@ impl TraceCollector {
 	/// label records why (e.g. the refusing status) and the payload
 	/// records who (e.g. the peer's SPKI DER) as its SHA3-256 hash when
 	/// payload capture is enabled.
+	///
+	/// `label` accepts any type that converts via [`AsRef<str>`].
 	#[cfg(feature = "instrument")]
-	pub fn emit_event_with_evidence(&self, event: Urn<'static>, label: &str, payload: Option<&[u8]>) {
+	pub fn emit_event_with_evidence(&self, event: Urn<'static>, label: impl AsRef<str>, payload: Option<&[u8]>) {
+		let label = label.as_ref();
 		#[cfg(feature = "testing")]
 		{
 			if let Ok(builder) = self.event(&event) {
@@ -773,15 +776,17 @@ impl TraceCollector {
 		self.emit_internal(event, Some(label), payload, None, self.state.clock.now_ns());
 	}
 
-	/// Dual-write a production control-plane event carrying a
-	/// spec-assertable value: the label records why (e.g. the GoAway
-	/// reason name) and the value carries its wire code for `equals!`
-	/// assertions.
+	/// Dual-write a production control-plane event carrying a spec-assertable
+	/// value: the label records why (e.g. the GoAway reason name) and the
+	/// value carries its wire code for `equals!` assertions.
+	///
+	/// `label` accepts any type that converts via [`AsRef<str>`].
 	#[cfg(feature = "instrument")]
-	pub fn emit_event_with_value<V>(&self, event: Urn<'static>, label: &str, value: V)
+	pub fn emit_event_with_value<V>(&self, event: Urn<'static>, label: impl AsRef<str>, value: V)
 	where
 		V: Into<EventValue>,
 	{
+		let label = label.as_ref();
 		#[cfg(feature = "testing")]
 		{
 			if let Ok(builder) = self.event_with(&event, &[], value) {

@@ -476,6 +476,18 @@ crate::impl_error_display!(UkmBuilderError {
 
 pub type UkmResult<T> = ::core::result::Result<T, UkmBuilderError>;
 
+/// Named client/server nonces for [`UkmBuilder::new`].
+///
+/// Named fields prevent swapping the two same-typed `[u8; 32]` nonces at
+/// the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UkmNonces {
+	/// Client contribution to the UKM nonce pair.
+	pub client: [u8; 32],
+	/// Server contribution to the UKM nonce pair.
+	pub server: [u8; 32],
+}
+
 #[derive(Debug, Default)]
 pub struct UkmBuilder {
 	client: [u8; 32],
@@ -484,16 +496,21 @@ pub struct UkmBuilder {
 }
 
 impl UkmBuilder {
-	pub fn new(client: [u8; 32], server: [u8; 32]) -> Self {
-		Self { client, server, extensions: Vec::new() }
+	/// Takes [`UkmNonces`] so client and server contributions cannot be
+	/// swapped by position.
+	pub fn new(nonces: UkmNonces) -> Self {
+		Self { client: nonces.client, server: nonces.server, extensions: Vec::new() }
 	}
 
-	pub fn with_extension(mut self, tag: u8, data: &[u8]) -> UkmResult<Self> {
+	/// `data` accepts any type that converts via `AsRef<[u8]>`.
+	pub fn with_extension(mut self, tag: u8, data: impl AsRef<[u8]>) -> UkmResult<Self> {
 		self.add_extension(tag, data)?;
 		Ok(self)
 	}
 
-	pub fn add_extension(&mut self, tag: u8, data: &[u8]) -> UkmResult<()> {
+	/// `data` accepts any type that converts via `AsRef<[u8]>`.
+	pub fn add_extension(&mut self, tag: u8, data: impl AsRef<[u8]>) -> UkmResult<()> {
+		let data = data.as_ref();
 		if self.extensions.iter().any(|(t, _)| *t == tag) {
 			return Err(UkmBuilderError::DuplicateTag { tag });
 		}
@@ -590,18 +607,43 @@ mod tests {
 	fn ukm_basic_deterministic() {
 		let c = nonce(0xAA);
 		let s = nonce(0xBB);
-		let ukm1 = UkmBuilder::new(c, s).finalize();
-		let ukm2 = UkmBuilder::new(c, s).finalize();
+		let ukm1 = UkmBuilder::new(UkmNonces { client: c, server: s }).finalize();
+		let ukm2 = UkmBuilder::new(UkmNonces { client: c, server: s }).finalize();
 		assert_eq!(ukm1, ukm2);
 		assert!(ukm1.starts_with(TIGHTBEAM_UKM_PREFIX));
 		assert_eq!(ukm1.len(), TIGHTBEAM_UKM_PREFIX.len() + 64);
+	}
+
+	/// Named nonce fields keep client and server bytes in wire order.
+	#[test]
+	fn ukm_nonces_named_fields_preserve_order() {
+		let client = nonce(0x11);
+		let server = nonce(0x22);
+		let ukm = UkmBuilder::new(UkmNonces { client, server }).finalize();
+		let body = &ukm[TIGHTBEAM_UKM_PREFIX.len()..];
+		assert_eq!(&body[..32], &client);
+		assert_eq!(&body[32..64], &server);
+	}
+
+	#[test]
+	fn ukm_extension_accepts_byte_slices() -> Result<(), Box<dyn std::error::Error>> {
+		let owned = vec![1u8, 2, 3];
+		let ukm = UkmBuilder::new(UkmNonces { client: nonce(7), server: nonce(8) })
+			.with_extension(0x10, owned.as_slice())?
+			.finalize();
+
+		let tail = &ukm[TIGHTBEAM_UKM_PREFIX.len() + 64..];
+		assert_eq!(tail[0], 0x10);
+		assert_eq!(&tail[1..3], &(3u16.to_be_bytes()));
+		assert_eq!(&tail[3..6], &[1, 2, 3]);
+		Ok(())
 	}
 
 	#[test]
 	fn ukm_extension_encoding() -> Result<(), Box<dyn std::error::Error>> {
 		let c = nonce(1);
 		let s = nonce(2);
-		let ukm = UkmBuilder::new(c, s)
+		let ukm = UkmBuilder::new(UkmNonces { client: c, server: s })
 			.with_extension(0x01, b"hello")?
 			.with_extension(0x02, b"world")?
 			.finalize();
@@ -624,7 +666,7 @@ mod tests {
 		let c = nonce(3);
 		let s = nonce(4);
 
-		let mut b = UkmBuilder::new(c, s);
+		let mut b = UkmBuilder::new(UkmNonces { client: c, server: s });
 		assert!(b.add_extension(0x01, b"a").is_ok());
 		assert!(matches!(
 			b.add_extension(0x01, b"b"),
@@ -639,7 +681,7 @@ mod tests {
 		let c = nonce(5);
 		let s = nonce(6);
 
-		let mut b = UkmBuilder::new(c, s);
+		let mut b = UkmBuilder::new(UkmNonces { client: c, server: s });
 		let big = vec![0u8; (u16::MAX as usize) + 1];
 		assert!(matches!(
 			b.add_extension(0x02, &big),

@@ -19,13 +19,6 @@
 
 use std::sync::Arc;
 
-use tightbeam::utils::urn::Urn;
-
-pub(crate) const AUTHENTICATED: Urn<'static> = Urn::new("test", "event:mutual-auth/authenticated");
-pub(crate) const RESPONSE_RECEIVED: Urn<'static> = Urn::new("test", "event:mutual-auth/response-received");
-pub(crate) const SERVER_ID: Urn<'static> = Urn::new("test", "event:mutual-auth/server-id");
-pub(crate) const CLIENT_CERT_REJECTED: Urn<'static> = Urn::new("test", "event:mutual-auth/client-cert-rejected");
-pub(crate) const SERVER_CERT_REJECTED: Urn<'static> = Urn::new("test", "event:mutual-auth/server-cert-rejected");
 use tightbeam::{
 	at_least,
 	colony::servlet::ServletConfig,
@@ -36,7 +29,7 @@ use tightbeam::{
 		policy::Secp256k1Policy,
 		sign::ecdsa::Secp256k1,
 		x509::{
-			policy::PublicKeyPinning,
+			policy::{CertificateValidation, PublicKeyPinning},
 			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 			Certificate, CertificateSpec,
 		},
@@ -48,8 +41,15 @@ use tightbeam::{
 	testing::{assertions::Presence, macros::IsSome},
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, MessageEmitter},
+	utils::urn::Urn,
 	Beamable,
 };
+
+pub(crate) const AUTHENTICATED: Urn<'static> = Urn::new("test", "event:mutual-auth/authenticated");
+pub(crate) const RESPONSE_RECEIVED: Urn<'static> = Urn::new("test", "event:mutual-auth/response-received");
+pub(crate) const SERVER_ID: Urn<'static> = Urn::new("test", "event:mutual-auth/server-id");
+pub(crate) const CLIENT_CERT_REJECTED: Urn<'static> = Urn::new("test", "event:mutual-auth/client-cert-rejected");
+pub(crate) const SERVER_CERT_REJECTED: Urn<'static> = Urn::new("test", "event:mutual-auth/server-cert-rejected");
 
 // ============================================================================
 // Static X.509 Configuration
@@ -169,17 +169,20 @@ tb_scenario! {
 	environment Servlet {
 		start: |env| async move {
 			let trace = Arc::new(env.trace);
+			let key = SERVER_KEY.to_provider::<Secp256k1>()?;
+			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
-				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, key, validators)?
 				.with_config(Arc::new(()))
 				.build();
 
 			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
 		setup: |env| async move {
+			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(CLIENT_CERT, key)?
 				.build();
 
 			let client = builder.connect(env.addr).await?;
@@ -255,8 +258,10 @@ tb_scenario! {
 	environment Servlet {
 		start: |env| async move {
 			let trace = Arc::new(env.trace);
+			let key = SERVER_KEY.to_provider::<Secp256k1>()?;
+			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
-				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, key, validators)?
 				.with_config(Arc::new(()))
 				.build();
 
@@ -325,8 +330,9 @@ tb_scenario! {
 
 			let certificate = CertificateSpec::Built(Box::new(invalid_server_cert));
 			let provider = Arc::new(Secp256k1KeyProvider::from(invalid_server_key));
+			let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
 			let servlet_conf = ServletConfig::<TokioListener, AuthRequest>::builder()
-				.with_certificate(certificate, provider, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(certificate, provider, validators)?
 				.with_config(Arc::new(()))
 				.build();
 
@@ -335,9 +341,10 @@ tb_scenario! {
 		setup: |env| async move {
 			// Client trusts only SERVER_CERT; the presented certificate
 			// differs, so the client-side validation must refuse it.
+			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(CLIENT_CERT, key)?
 				.build();
 
 			// A successful exchange records `false` and fails the spec,

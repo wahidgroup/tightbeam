@@ -200,8 +200,9 @@ impl<P: CryptoProvider> TokioListener<P> {
 		self.listener.local_addr()
 	}
 
-	pub async fn bind(addr: &str) -> Result<Self, IoError> {
-		let listener = TcpListener::bind(addr).await?;
+	/// `addr` accepts any type that converts via [`AsRef<str>`].
+	pub async fn bind(addr: impl AsRef<str>) -> Result<Self, IoError> {
+		let listener = TcpListener::bind(addr.as_ref()).await?;
 		Ok(Self {
 			listener,
 			#[cfg(feature = "x509")]

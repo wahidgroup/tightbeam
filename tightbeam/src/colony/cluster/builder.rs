@@ -317,11 +317,16 @@ impl ClusterConfigBuilder {
 
 	/// Set peer gateway addresses dialed to advertise exported types.
 	///
-	/// The dial list is not an identity gate. Partial or asymmetric
-	/// federation graphs are expected. An empty list disables outbound
-	/// advertisement.
-	pub fn with_peers(mut self, peers: impl IntoIterator<Item = String>) -> Self {
-		self.peer.peers = peers.into_iter().collect();
+	/// Accepts any iterator of values convertible into [`String`] (for
+	/// example `&str` arrays). The dial list is not an identity gate.
+	/// Partial or asymmetric federation graphs are expected. An empty
+	/// list disables outbound advertisement.
+	pub fn with_peers<I, S>(mut self, peers: I) -> Self
+	where
+		I: IntoIterator<Item = S>,
+		S: Into<String>,
+	{
+		self.peer.peers = peers.into_iter().map(Into::into).collect();
 		self
 	}
 
@@ -333,10 +338,15 @@ impl ClusterConfigBuilder {
 
 	/// Restrict claimed peer dial addresses to this exact-match allowlist.
 	///
+	/// Accepts any iterator of values convertible into [`String`].
 	/// Peer-exchange hints pass the same gate before the discovery table
 	/// learns them.
-	pub fn with_peer_dial_allowlist(mut self, allowlist: impl IntoIterator<Item = String>) -> Self {
-		self.peer.peer_dial_allowlist = Some(allowlist.into_iter().collect());
+	pub fn with_peer_dial_allowlist<I, S>(mut self, allowlist: I) -> Self
+	where
+		I: IntoIterator<Item = S>,
+		S: Into<String>,
+	{
+		self.peer.peer_dial_allowlist = Some(allowlist.into_iter().map(Into::into).collect());
 		self
 	}
 

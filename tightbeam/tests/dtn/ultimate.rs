@@ -42,6 +42,7 @@ use tightbeam::{
 		policy::Secp256k1Policy,
 		sign::ecdsa::{Secp256k1, Secp256k1SigningKey},
 		x509::{
+			policy::CertificateValidation,
 			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 			Certificate, CertificateSpec,
 		},
@@ -886,8 +887,9 @@ tb_scenario! {
 				&config.rover_fault_handler,
 			));
 
+			let socket_addr = TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
 			let rover_config = RoverServletConfig {
-				mars_relay_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder
+				mars_relay_addr: socket_addr,
 				mars_relay_pool: rover_mars_pool,
 				rover_signing_key: rover_signing_key.to_owned(),
 				mission_control_verifying_key: mc_verifying_key,
@@ -916,8 +918,10 @@ tb_scenario! {
 				chain_processor: Arc::clone(&rover_processor),
 			});
 
+			let rover_key = ROVER_KEY.to_provider::<Secp256k1>()?;
+			let validators = vec![Arc::new(ROVER_PINNING) as Arc<dyn CertificateValidation>];
 			let rover_servlet_conf = tightbeam::colony::servlet::ServletConfig::<TokioListener, RelayMessage>::builder()
-				.with_certificate(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(ROVER_PINNING)])?
+				.with_certificate(ROVER_CERT, rover_key, validators)?
 				.with_config(Arc::new(rover_config))
 				.with_worker(command_handler_worker)
 				.with_worker(command_worker)
@@ -968,12 +972,15 @@ tb_scenario! {
 				chain_processor: Arc::clone(&mars_relay_processor),
 			});
 
+			let mars_relay_key = MARS_RELAY_KEY.to_provider::<Secp256k1>()?;
+			let validators = vec![Arc::new(MARS_RELAY_PINNING) as Arc<dyn CertificateValidation>];
 			let mars_relay_servlet_conf = tightbeam::colony::servlet::ServletConfig::<TokioListener, RelayMessage>::builder()
-				.with_certificate(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(MARS_RELAY_PINNING)])?
+				.with_certificate(MARS_RELAY_CERT, mars_relay_key, validators)?
 				.with_config(Arc::new(mars_relay_config))
 				.with_worker(mars_frame_request_handler_worker)
 				.with_worker(mars_frame_response_handler_worker)
 				.build();
+
 			let mars_relay_servlet_conf = Some(mars_relay_servlet_conf);
 			let mars_relay_servlet = MarsRelaySatelliteServlet::start(Arc::clone(&trace), mars_relay_servlet_conf).await?;
 			let mars_relay_addr = mars_relay_servlet.addr().to_owned();
@@ -1019,7 +1026,7 @@ tb_scenario! {
 			});
 
 			let earth_relay_servlet_conf = tightbeam::colony::servlet::ServletConfig::<TokioListener, RelayMessage>::builder()
-				.with_certificate(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(EARTH_RELAY_PINNING)])?
+				.with_certificate(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(EARTH_RELAY_PINNING) as Arc<dyn CertificateValidation>])?
 				.with_config(Arc::new(earth_relay_config))
 				.with_worker(earth_frame_request_handler_worker)
 				.with_worker(earth_frame_response_handler_worker)
@@ -1064,14 +1071,17 @@ tb_scenario! {
 			});
 			let command_ack_handler_worker = CommandAckHandlerWorker::new(());
 
+			let mission_control_key = MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?;
+			let validators = vec![Arc::new(MISSION_CONTROL_PINNING) as Arc<dyn CertificateValidation>];
 			let mc_servlet_conf = tightbeam::colony::servlet::ServletConfig::<TokioListener, RelayMessage>::builder()
-				.with_certificate(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(MISSION_CONTROL_PINNING)])?
+				.with_certificate(MISSION_CONTROL_CERT, mission_control_key, validators)?
 				.with_config(Arc::new(mc_config))
 				.with_worker(telemetry_handler_worker)
 				.with_worker(frame_request_handler_worker)
 				.with_worker(frame_response_handler_worker)
 				.with_worker(command_ack_handler_worker)
 				.build();
+
 			let mc_servlet = MissionControlServlet::start(Arc::clone(&trace), Some(mc_servlet_conf)).await?;
 			let mc_addr = mc_servlet.addr().to_owned();
 

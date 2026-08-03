@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist, TrustPlanes};
+use tightbeam::colony::cluster::{DynamicExportList, ExportAllowlist, TrustPlaneStores, TrustPlanes};
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::Certificate;
 use tightbeam::utils::urn::Urn;
@@ -98,12 +98,14 @@ impl GatewayShadow {
 		if self.exports.contains(attempt.target) {
 			return Prediction::Allow;
 		}
-
 		if !attempt.relayed && self.acl.is_granted(attempt.caller_spki, attempt.target) {
 			return Prediction::Allow;
 		}
 
-		let planes = TrustPlanes::new(Some(self.hive_trust.as_ref()), Some(self.peer_trust.as_ref()));
+		let planes = TrustPlanes::new(TrustPlaneStores {
+			hive: Some(self.hive_trust.as_ref()),
+			peer: Some(self.peer_trust.as_ref()),
+		});
 		if !attempt.relayed && planes.is_first_party(attempt.caller_cert) {
 			return Prediction::Allow;
 		}
