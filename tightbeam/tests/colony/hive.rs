@@ -1,6 +1,6 @@
-//! Integration tests for Hive with X.509 certificates
+//! Integration tests for the Hive with X.509 certificates.
 //!
-//! Tests the Hive lifecycle through its public interface with TLS.
+//! The tests drive the Hive lifecycle through its public interface with TLS.
 
 use std::sync::Arc;
 
@@ -13,10 +13,12 @@ use tightbeam::{
 			ColonyNamespace, HeartbeatParams, HiveManagementRequest, SpawnServletParams, StopServletParams,
 		},
 		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
+		servlet::ServletConfig,
 	},
 	compose,
 	crypto::{
 		key::Secp256k1KeyProvider,
+		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
 		x509::{Certificate, CertificateSpec},
 	},
 	decode,
@@ -24,7 +26,7 @@ use tightbeam::{
 	exactly, hive,
 	policy::TransitStatus,
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{HiveEnv, SetupEnv},
+	testing::{create_test_hash_info, create_test_signing_key, HiveEnv, SetupEnv},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
@@ -34,7 +36,7 @@ use tightbeam::{
 	Beamable, Frame, TightBeamError, Version,
 };
 
-use crate::common::security::{expectation_failure, pinning_trust_store};
+use crate::common::security::{expectation_failure, pinning_trust_store, ServerMaterials};
 use crate::common::x509::create_test_cert_with_key;
 
 fn colony_ns() -> ColonyNamespace {
@@ -69,10 +71,6 @@ pub(crate) const UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
 pub(crate) const UNSIGNED_MANAGE_MANAGE_SHAPE: Urn<'static> =
 	Urn::new("test", "event:hive/unsigned-manage-manage-shape");
 
-// ============================================================================
-// Test Messages
-// ============================================================================
-
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct HiveTestRequest {
 	pub value: u32,
@@ -82,10 +80,6 @@ pub struct HiveTestRequest {
 pub struct HiveTestResponse {
 	pub doubled: u32,
 }
-
-// ============================================================================
-// Test Servlets
-// ============================================================================
 
 servlet! {
 	HiveTestServlet<HiveTestRequest, EnvConfig = ()>,
@@ -102,18 +96,10 @@ servlet! {
 	}
 }
 
-// ============================================================================
-// Test Hive
-// ============================================================================
-
 hive! {
 	HiveX509Test,
 	protocol: TokioListener
 }
-
-// ============================================================================
-// Assertion Spec
-// ============================================================================
 
 tb_assert_spec! {
 	pub HiveEstablishSpec,
@@ -127,12 +113,8 @@ tb_assert_spec! {
 	}
 }
 
-// ============================================================================
-// Integration Test
-// ============================================================================
-
 /// Registers a test servlet, establishes the hive, and records the
-/// establish events on the scenario trace; `HIVE_ESTABLISHED` carries
+/// establish events on the scenario trace. `HIVE_ESTABLISHED` carries
 /// the registered-servlet count for the spec to value-assert.
 async fn establish_registered_hive(
 	trace: &TraceCollector,
@@ -175,11 +157,8 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Gate Reply Shapes - fixtures
-// ============================================================================
-
-/// Fresh heartbeat command body (freshness binds to `Frame.metadata.order`).
+/// Builds a fresh heartbeat command body. Freshness binds to
+/// `Frame.metadata.order`.
 fn heartbeat_command() -> ClusterCommand {
 	ClusterCommand {
 		heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
@@ -187,8 +166,9 @@ fn heartbeat_command() -> ClusterCommand {
 	}
 }
 
-/// Command frame with integrity witness (unsigned until the caller signs it).
-/// `metadata.order` is the freshness binding (CWE-294).
+/// Builds a command frame with an integrity witness. The frame stays
+/// unsigned until the caller signs it. `metadata.order` is the freshness
+/// binding (CWE-294).
 fn command_frame_with_order(id: &[u8], cmd: ClusterCommand, order: u64) -> Result<Frame, TightBeamError> {
 	FrameBuilder::from(Version::V1)
 		.with_id(id)
@@ -202,7 +182,8 @@ fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError
 	command_frame_with_order(id, cmd, current_timestamp_ms())
 }
 
-/// Manage command with a stop request (unique id per call site).
+/// Builds a manage command frame with a stop request. Each call site
+/// passes a unique id.
 fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 	let manage_cmd = ClusterCommand {
 		heartbeat: None,
@@ -216,7 +197,7 @@ fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 	command_frame(id, manage_cmd)
 }
 
-/// Manage command with a spawn request.
+/// Builds a manage command frame with a spawn request.
 fn spawn_command_frame(id: &[u8], servlet_type: &str) -> Result<Frame, TightBeamError> {
 	let manage_cmd = ClusterCommand {
 		heartbeat: None,
@@ -230,7 +211,7 @@ fn spawn_command_frame(id: &[u8], servlet_type: &str) -> Result<Frame, TightBeam
 	command_frame(id, manage_cmd)
 }
 
-/// Signer pinned by the hive trust store. `start` builds the trust store
+/// A signer that the hive trust store pins. `start` builds the trust store
 /// from the certificate. The client signs command frames with the provider.
 struct TrustedSignerContext {
 	certificate: Certificate,
@@ -267,8 +248,9 @@ async fn emit_command(
 	decode(&response.message)
 }
 
-/// Heartbeat CHOICE present; manage CHOICE absent; optional sealed
-/// capacity (no pre-auth leak). Returns the status for the caller to
+/// Requires the heartbeat CHOICE to be present and the manage CHOICE to
+/// be absent. When `sealed_capacity` is set, the reply must not leak
+/// capacity before authentication. Returns the status for the caller to
 /// record as a valued event the spec asserts.
 fn heartbeat_shape_status(
 	response: &ClusterCommandResponse,
@@ -289,8 +271,9 @@ fn heartbeat_shape_status(
 	Ok(heartbeat.status)
 }
 
-/// Manage/stop CHOICE present; heartbeat CHOICE absent. Returns the
-/// stop status for the caller to record as a valued event.
+/// Requires the manage/stop CHOICE to be present and the heartbeat CHOICE
+/// to be absent. Returns the stop status for the caller to record as a
+/// valued event.
 fn manage_stop_shape_status(response: &ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
 	if response.heartbeat.is_some() {
 		return Err(expectation_failure("manage response must not use the heartbeat shape"));
@@ -304,8 +287,9 @@ fn manage_stop_shape_status(response: &ClusterCommandResponse) -> Result<Transit
 	Ok(stop.status)
 }
 
-/// Manage/spawn CHOICE present; heartbeat CHOICE absent. Returns the
-/// spawn status for the caller to record as a valued event.
+/// Requires the manage/spawn CHOICE to be present and the heartbeat CHOICE
+/// to be absent. Returns the spawn status for the caller to record as a
+/// valued event.
 fn manage_spawn_shape_status(response: &ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
 	if response.heartbeat.is_some() {
 		return Err(expectation_failure("manage response must not use the heartbeat shape"));
@@ -365,10 +349,10 @@ tb_assert_spec! {
 	}
 }
 
-// Security rejects must come back in the CHOICE the sender expects:
-// a heartbeat rejected in the manage shape decodes as MalformedResponse
-// on the cluster and counts toward eviction, severing a control plane
-// whose breaker would otherwise recover after cooldown.
+// Security rejects must come back in the CHOICE the sender expects.
+// A heartbeat rejected in the manage shape decodes as MalformedResponse
+// on the cluster and counts toward eviction, so it would sever a control
+// plane whose breaker would otherwise recover after cooldown.
 tb_scenario! {
 	name: hive_gate_reply_shapes,
 	spec: HiveGateShapeSpec,
@@ -383,17 +367,19 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive).await?;
 
-			// Unsigned heartbeat: heartbeat CHOICE, no capacity data pre-auth
+			// An unsigned heartbeat must come back in the heartbeat CHOICE
+			// with no capacity data before authentication.
 			let unsigned_heartbeat = command_frame(b"hb-unsigned", heartbeat_command())?;
 			let response = emit_command(&mut client, unsigned_heartbeat).await?;
 			trace.event_with(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(&response, true)?)?;
 
-			// Unsigned manage: manage CHOICE (security verdict, no drain probe)
+			// An unsigned manage command must come back in the manage CHOICE
+			// as a security verdict, not a drain probe.
 			let unsigned_stop = stop_command_frame(b"manage-unsigned")?;
 			let response = emit_command(&mut client, unsigned_stop).await?;
 			trace.event_with(UNSIGNED_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(&response)?)?;
 
-			// Signed heartbeat: accepted end-to-end
+			// A signed heartbeat must be accepted end to end.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-signed").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			trace.event_with(SIGNED_HEARTBEAT_ACCEPTED, &[], heartbeat_shape_status(&response, false)?)?;
@@ -406,7 +392,7 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_stop).await?;
 			trace.event_with(DRAINING_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(&response)?)?;
 
-			// Trip the breaker (threshold 1): a trusted signer identity with a
+			// Trip the breaker at threshold 1. A trusted signer identity with a
 			// signature transplanted from a different frame is the one failure
 			// class the breaker counts.
 			let now = current_timestamp_ms();
@@ -420,9 +406,9 @@ tb_scenario! {
 			let response = emit_command(&mut client, forged).await?;
 			trace.event_with(FORGED_HEARTBEAT_DENIED, &[], heartbeat_shape_status(&response, false)?)?;
 
-			// Open breaker: a valid heartbeat is rejected during cooldown but
-			// keeps the heartbeat CHOICE, so the cluster records a reply
-			// instead of MalformedResponse eviction pressure.
+			// With the breaker open, a valid heartbeat is rejected during
+			// cooldown but keeps the heartbeat CHOICE, so the cluster records
+			// a reply instead of MalformedResponse eviction pressure.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-open").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			trace.event_with(OPEN_BREAKER_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(&response, true)?)?;
@@ -454,7 +440,7 @@ tb_scenario! {
 	spec: HiveBackpressureShapeSpec,
 	environment Hive {
 		context: trusted_signer("CN=Hive Backpressure Cluster"),
-		// Threshold zero: idle utilization already saturates the gate,
+		// A zero threshold means idle utilization already saturates the gate,
 		// so every manage command sees the backpressure verdict.
 		start: |SetupEnv { trace, context: signer }| async move {
 			let mut conf = HiveConfig::default();
@@ -469,8 +455,9 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_stop).await?;
 			trace.event_with(BACKPRESSURE_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(&response)?)?;
 
-			// Signed heartbeat is exempt from the gate: heartbeat CHOICE
-			// with real capacity data (ResourceExhausted status reflects saturation).
+			// A signed heartbeat is exempt from the gate. It replies in the
+			// heartbeat CHOICE with real capacity data, and the
+			// ResourceExhausted status reflects saturation.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-bp").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			trace.event_with(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(&response, false)?)?;
@@ -482,7 +469,7 @@ tb_scenario! {
 	}
 }
 
-// Test without TLS to verify basic hive functionality
+// The establish flow must also work without TLS.
 tb_scenario! {
 	name: hive_establish_no_tls,
 	spec: HiveEstablishSpec,
@@ -496,10 +483,6 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Cluster registration requires a bound control listener
-// ============================================================================
-
 tb_assert_spec! {
 	pub HiveRegisterBeforeEstablishSpec,
 	V(1,0,0): {
@@ -511,8 +494,8 @@ tb_assert_spec! {
 	}
 }
 
-// A provisional `addr` from `Hive::new` must not reach the cluster:
-// register before establish is refused with `NotEstablished`.
+// A provisional `addr` from `Hive::new` must not reach the cluster, so
+// registration before establish is refused with `NotEstablished`.
 tb_scenario! {
 	name: hive_register_before_establish_refused,
 	spec: HiveRegisterBeforeEstablishSpec,
@@ -532,10 +515,6 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Replay forget on manage handler failure
-// ============================================================================
-
 tb_assert_spec! {
 	pub HiveSpawnRetrySpec,
 	V(1,0,0): {
@@ -548,6 +527,8 @@ tb_assert_spec! {
 	}
 }
 
+// A manage handler failure forgets the replay guard, so the same signed
+// frame may be submitted again and succeed on the retry.
 tb_scenario! {
 	name: hive_manage_failure_allows_signed_retry,
 	spec: HiveSpawnRetrySpec,
@@ -593,9 +574,9 @@ tb_scenario! {
 	}
 }
 
-/// Probe servlet with a caller-chosen locator. Seed uses UTF-8 so
-/// `register` succeeds; spawn uses non-UTF-8 so instance URN minting
-/// fails. Only the spawn probe emits [`SERVLET_STOPPED`] on teardown.
+/// A probe servlet with a caller-chosen locator. The seed uses UTF-8 so
+/// `register` succeeds. The spawn uses non-UTF-8 so building the instance
+/// URN fails. Only the spawn probe emits [`SERVLET_STOPPED`] on teardown.
 struct LocatorStopProbe {
 	trace: TraceCollector,
 	addr: Vec<u8>,
@@ -659,6 +640,178 @@ tb_scenario! {
 			let signed = signed_spawn_frame(&signer.provider, b"spawn-orphan", "orphan").await?;
 			let response = emit_command(&mut client, signed).await?;
 			trace.event_with(SPAWN_NON_UTF8_FORBIDDEN, &[], manage_spawn_shape_status(&response)?)?;
+
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+// The scenarios below prove intra-hive full-frame delivery. The frame a
+// sibling servlet receives through `HiveContext::call` is the frame the
+// caller composed and signed. The frame the caller receives back is the
+// frame the servlet responded with. Both end-to-end envelopes survive the
+// intra-hive route, including the id, the nonrepudiation block, and the
+// previous-frame linkage.
+
+pub(crate) const HIVE_CALL_SIGNED: Urn<'static> = Urn::new("test", "event:hive/call-signed");
+pub(crate) const HIVE_CALL_PREVIOUS: Urn<'static> = Urn::new("test", "event:hive/call-previous");
+pub(crate) const CONTRACT_FRAME_CLIENT_ID: Urn<'static> = Urn::new("test", "event:hive/contract-frame-client-id");
+pub(crate) const CONTRACT_FRAME_SIGNED: Urn<'static> = Urn::new("test", "event:hive/contract-frame-signed");
+pub(crate) const CONTRACT_FRAME_PREVIOUS: Urn<'static> = Urn::new("test", "event:hive/contract-frame-previous");
+pub(crate) const CONTRACT_FRAME_SIG_VALID: Urn<'static> = Urn::new("test", "event:hive/contract-frame-sig-valid");
+pub(crate) const HIVE_CALL_REPLY_ID: Urn<'static> = Urn::new("test", "event:hive/call-reply-id");
+pub(crate) const HIVE_CALL_REPLY_SIGNED: Urn<'static> = Urn::new("test", "event:hive/call-reply-signed");
+pub(crate) const HIVE_CALL_REPLY_SIG_VALID: Urn<'static> = Urn::new("test", "event:hive/call-reply-sig-valid");
+pub(crate) const HIVE_CALL_ECHOED: Urn<'static> = Urn::new("test", "event:hive/call-echoed");
+
+/// Returns the deterministic contract key that the caller and the sibling
+/// servlet share, so each side can verify the other's frame signature
+/// without key distribution.
+fn contract_signing_key() -> Secp256k1SigningKey {
+	Secp256k1SigningKey::from(create_test_signing_key())
+}
+
+/// Signs `frame` with the shared contract key under the canonical
+/// SHA3-256 convention.
+async fn sign_contract_frame(frame: Frame) -> Result<Frame, TightBeamError> {
+	let provider = Secp256k1KeyProvider::from(contract_signing_key());
+	frame.sign_with_provider::<Sha3_256, _>(&provider).await
+}
+
+/// Returns true when the signature on `frame` verifies against the shared
+/// contract key. A verified signature proves byte fidelity end to end.
+fn contract_signature_verifies(frame: &Frame) -> bool {
+	frame
+		.verify::<Secp256k1Signature, Sha3_256>(contract_signing_key().verifying_key())
+		.is_ok()
+}
+
+servlet! {
+	/// Records what the handler observes about the frame it receives for an
+	/// intra-hive call. The probes cover the caller's frame id, the
+	/// nonrepudiation block, the previous-frame linkage, and whether the
+	/// caller's signature verifies over the received bytes. The handler
+	/// responds with a signed frame so the caller can verify the response
+	/// envelope the same way.
+	FrameContractServlet<HiveTestRequest, EnvConfig = ()>,
+	protocol: TokioListener,
+	handle: |req, frame, ctx| async move {
+		let trace = ctx.trace();
+
+		// The SIGNED and PREVIOUS probes witness presence only. Byte
+		// fidelity rests on SIG_VALID, whose signature covers the frame's
+		// to-be-signed bytes.
+		let sig_valid = contract_signature_verifies(&frame);
+
+		trace.event_with(CONTRACT_FRAME_CLIENT_ID, &[], u32::from(frame.metadata.id == b"hive-signed-call"))?;
+		trace.event_with(CONTRACT_FRAME_SIGNED, &[], u32::from(frame.nonrepudiation.is_some()))?;
+		trace.event_with(CONTRACT_FRAME_PREVIOUS, &[], u32::from(frame.metadata.previous_frame.is_some()))?;
+		trace.event_with(CONTRACT_FRAME_SIG_VALID, &[], u32::from(sig_valid))?;
+
+		let unsigned = FrameBuilder::from(Version::V0)
+			.with_id(b"hive-contract-reply")
+			.with_message(HiveTestResponse { doubled: req.value * 2 })
+			.build()?;
+
+		Ok(Some(sign_contract_frame(unsigned).await?))
+	}
+}
+
+/// Builds the contract-servlet TLS config so the hive pool can pin its
+/// certificate.
+fn contract_servlet_conf(
+	materials: &ServerMaterials,
+) -> Result<ServletConfig<TokioListener, HiveTestRequest>, TightBeamError> {
+	let cert = CertificateSpec::Built(Box::new((*materials.certificate).to_owned()));
+	let key = Arc::clone(&materials.key_provider);
+	Ok(ServletConfig::<TokioListener, HiveTestRequest>::builder()
+		.with_certificate(cert, key, vec![])?
+		.with_mux_offer(Some(TransportOffer::mux(8)))
+		.with_config(Arc::new(()))
+		.build())
+}
+
+/// Starts an established hive with one `FrameContractServlet` sibling.
+/// The intra-hive pool pins the servlet certificate and offers mux.
+async fn start_contract_hive(
+	trace: TraceCollector,
+	materials: &ServerMaterials,
+) -> Result<HiveX509Test, TightBeamError> {
+	let config = Some(contract_servlet_conf(materials)?);
+	let trace = Arc::new(trace.share());
+	let servlet = FrameContractServlet::start(Arc::clone(&trace), config).await?;
+
+	let trust_store = pinning_trust_store(&materials.certificate)?;
+	let mut conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
+	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+
+	let mut hive = HiveX509Test::new(Some(conf))?;
+	hive.register(servlet_urn("contract"), servlet, |t| FrameContractServlet::start(t, None))?;
+	hive.establish(trace).await?;
+	Ok(hive)
+}
+
+tb_assert_spec! {
+	pub HiveCallFrameDeliverySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(HIVE_CALL_SIGNED, exactly!(1), equals!(1u32)),
+			(HIVE_CALL_PREVIOUS, exactly!(1), equals!(1u32)),
+			(CONTRACT_FRAME_CLIENT_ID, exactly!(1), equals!(1u32)),
+			(CONTRACT_FRAME_SIGNED, exactly!(1), equals!(1u32)),
+			(CONTRACT_FRAME_PREVIOUS, exactly!(1), equals!(1u32)),
+			(CONTRACT_FRAME_SIG_VALID, exactly!(1), equals!(1u32)),
+			(HIVE_CALL_REPLY_ID, exactly!(1), equals!(1u32)),
+			(HIVE_CALL_REPLY_SIGNED, exactly!(1), equals!(1u32)),
+			(HIVE_CALL_REPLY_SIG_VALID, exactly!(1), equals!(1u32)),
+			(HIVE_CALL_ECHOED, exactly!(1), equals!(42u64))
+		]
+	}
+}
+
+// The caller composes and signs a typed command frame and submits it
+// through `HiveContext::call`. The presence probes only witness that an
+// id, a signature block, and a previous-frame digest exist, so they
+// cannot prove byte fidelity. The two SIG_VALID assertions carry that
+// proof, because each signature verifies only over the exact bytes the
+// other side signed.
+tb_scenario! {
+	name: hive_context_call_delivers_signed_frame,
+	spec: HiveCallFrameDeliverySpec,
+	environment Hive {
+		context: ServerMaterials::generate(),
+		start: |SetupEnv { trace, context: materials }| async move {
+			start_contract_hive(trace, &materials).await
+		},
+		client: |HiveEnv { trace, hive, .. }| async move {
+			let unsigned = FrameBuilder::from(Version::V2)
+				.with_id(b"hive-signed-call")
+				.with_order(current_timestamp_ms())
+				.with_previous_hash(create_test_hash_info())
+				.with_message(HiveTestRequest { value: 21 })
+				.build()?;
+
+			let signed = sign_contract_frame(unsigned).await?;
+
+			trace.event_with(HIVE_CALL_SIGNED, &[], u32::from(signed.nonrepudiation.is_some()))?;
+			trace.event_with(HIVE_CALL_PREVIOUS, &[], u32::from(signed.metadata.previous_frame.is_some()))?;
+
+			// The public surface under test is `HiveContext::call`. The
+			// caller's complete signed frame goes out as composed, and the
+			// servlet's complete reply frame comes back.
+			let ctx = hive.context();
+			let contract = servlet_urn("contract");
+			let reply = ctx.call(&contract, signed).await?;
+
+			trace.event_with(HIVE_CALL_REPLY_ID, &[], u32::from(reply.metadata.id == b"hive-contract-reply"))?;
+			trace.event_with(HIVE_CALL_REPLY_SIGNED, &[], u32::from(reply.nonrepudiation.is_some()))?;
+			trace.event_with(HIVE_CALL_REPLY_SIG_VALID, &[], u32::from(contract_signature_verifies(&reply)))?;
+
+			let response: HiveTestResponse = decode(&reply.message)?;
+			trace.event_with(HIVE_CALL_ECHOED, &[], u64::from(response.doubled))?;
 
 			hive.stop();
 			Ok(())

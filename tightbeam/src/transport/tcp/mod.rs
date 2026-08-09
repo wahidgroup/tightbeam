@@ -44,7 +44,7 @@ pub trait TcpListenerTrait: Protocol + Send {
 	fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error>;
 }
 
-/// Socket address abstraction for no_std environments
+/// Socket address abstraction for no_std environments.
 #[cfg(not(feature = "std"))]
 #[derive(Debug, Clone)]
 pub enum SocketAddr {
@@ -81,7 +81,7 @@ impl Protocol for TcpListener {
 	}
 }
 
-// The EncryptedProtocol impl for sync TCP lives on the wrapper in sync.rs
+// The EncryptedProtocol impl for sync TCP lives on the wrapper in sync.rs.
 
 #[cfg(all(feature = "std", feature = "tcp"))]
 impl TcpListenerTrait for TcpListener {
@@ -90,7 +90,6 @@ impl TcpListenerTrait for TcpListener {
 	}
 }
 
-// std::net implementations when std is available
 #[cfg(all(feature = "std", feature = "tcp"))]
 impl ProtocolStream for TcpStream {
 	type Error = IoError;
@@ -110,7 +109,7 @@ impl ProtocolStream for TcpStream {
 	}
 }
 
-// New type wrapper for SocketAddr that implements Into<Vec<u8>>
+/// Newtype wrapper for `SocketAddr` that implements `Into<Vec<u8>>`.
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TightBeamSocketAddr(pub SocketAddr);
@@ -164,12 +163,14 @@ impl ops::Deref for TightBeamSocketAddr {
 #[cfg(feature = "std")]
 impl TightBeamAddress for TightBeamSocketAddr {}
 
-/// Macro to generate common transport implementation for both sync and async.
+/// Macro to generate the common transport implementation for both sync
+/// and async.
 ///
-/// Defines the transport struct itself (single source for the field list --
-/// the sync and async variants must stay distinct types because their stream
-/// traits would produce overlapping trait impls on one shared struct) plus
-/// the `From<S>` constructor, key-dropping `Drop`, and shared trait impls.
+/// Defines the transport struct itself plus the `From<S>` constructor,
+/// key-dropping `Drop`, and shared trait impls. The struct definition is
+/// the single source for the field list. The sync and async variants must
+/// stay distinct types because their stream traits would produce
+/// overlapping trait impls on one shared struct.
 #[macro_export]
 macro_rules! impl_tcp_common {
 	($transport:ident, $stream_trait:path) => {
@@ -233,7 +234,7 @@ macro_rules! impl_tcp_common {
 			pub(crate) server_handshake: Option<$crate::transport::handshake::BoxedServerHandshake>,
 			#[cfg(feature = "x509")]
 			pub(crate) handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind,
-			/// Connection instrumentation collector
+			/// Connection instrumentation collector.
 			#[cfg(feature = "instrument")]
 			pub(crate) trace: Option<$crate::trace::TraceCollector>,
 			pub(crate) _phantom: core::marker::PhantomData<P>,
@@ -377,12 +378,13 @@ macro_rules! impl_tcp_common {
 		where
 			TransportError: From<S::Error>,
 		{
-			/// Peer certificate after completed mutual authentication; `None` if unused or incomplete.
+			/// Peer certificate after completed mutual authentication.
+			/// `None` if unused or incomplete.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
 				self.peer_certificate.as_deref()
 			}
 
-			/// Negotiated multiplexing settings; `None` means single-flight.
+			/// Negotiated multiplexing settings. `None` means single-flight.
 			pub fn negotiated_mux(&self) -> Option<$crate::transport::handshake::negotiation::MuxSettings> {
 				self.mux_settings
 			}
@@ -474,7 +476,7 @@ macro_rules! impl_tcp_common {
 		}
 
 		// Without x509 there is no encryption-aware override, so the
-		// default single-flight collector applies; the gate items only
+		// default single-flight collector applies. The gate items only
 		// exist under transport-policy.
 		#[cfg(not(all(feature = "x509", feature = "transport-policy")))]
 		impl<S: $stream_trait> $crate::transport::MessageCollector for $transport<S>
@@ -490,7 +492,7 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		// Audit source for gate verdicts: one definition feeds every
+		// Audit source for gate verdicts. One definition feeds every
 		// collector plane this transport serves.
 		#[cfg(feature = "transport-policy")]
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::GateAudit for $transport<S, P>
@@ -509,8 +511,8 @@ macro_rules! impl_tcp_common {
 			TransportError: From<S::Error>
 		{}
 
-		// State accessors shared verbatim by the sync and async transports:
-		// a single definition keeps the two from drifting.
+		// State accessors shared as-is by the sync and async transports.
+		// A single definition keeps the two from drifting.
 		#[cfg(feature = "x509")]
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider + Send + Sync + 'static>
 			$crate::transport::state::EncryptedProtocolState for $transport<S, P>

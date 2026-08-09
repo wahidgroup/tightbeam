@@ -6,7 +6,7 @@
 //!
 //! # Planes
 //!
-//! - **Direct advertisement**: one minted frame dials every verified target.
+//! - **Direct advertisement**: one signed frame dials every verified target.
 //! - **Rumor flood**: the same signed frame wraps in a gossip rumor for
 //!   members beyond direct reach.
 //! - **Pipeline**: admit, rate-limit, journal, deliver locally, and reflood
@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool};
 use crate::colony::cluster::runtime::refuse::refuse_gossip;
-use crate::colony::cluster::runtime::work::{balancer_pick, forward_work};
+use crate::colony::cluster::runtime::work::{balancer_pick, forward_envelope};
 use crate::colony::cluster::{ClusterConfig, ClusterError, ServletRegistry};
 use crate::colony::common::{canonical_bytes, reply_frame};
 use crate::colony::servlet::servlet_runtime::rt;
@@ -77,9 +77,9 @@ type GossipDigest = [u8; 32];
 /// Origin of a gossip pipeline invocation.
 #[derive(Clone, Copy)]
 pub(crate) enum GossipOrigin {
-	/// Peer-relayed rumor: invalid input may score the relay.
+	/// A peer-relayed rumor. Invalid input may score the relay.
 	Relay,
-	/// Local publish: admission failure refuses without trail scoring.
+	/// A local publish. An admission failure refuses without trail scoring.
 	Origin,
 }
 
@@ -171,7 +171,7 @@ pub(crate) async fn gossip_deliver_local<P>(
 			let selected = balancer_pick(config.load_balancer.as_ref(), &entries);
 			if let Some(entry) = selected {
 				let dial_addr = Arc::clone(entry.dial_target());
-				if let Ok(_response) = forward_work(pool, dial_addr, payload).await {
+				if let Ok(_response) = forward_envelope(pool, dial_addr, payload).await {
 					let _ = config.gossip.journal.ack_local(&digest_value);
 					let _ = trace.event(CLUSTER_GOSSIP_ACCEPTED);
 				}
@@ -261,10 +261,10 @@ pub(crate) async fn reflood_gossip<P, D>(
 	while fanout.join_next().await.is_some() {}
 }
 
-/// Mint and sign one peer advertisement frame for this gateway's slate.
+/// Create and sign one peer advertisement frame for this gateway's slate.
 ///
-/// One mint serves both delivery paths so direct dials and gossip rumors
-/// carry the same signer-binds-to-address unit.
+/// One frame serves both delivery paths, so direct dials and gossip
+/// rumors carry the same signer-binds-to-address unit.
 ///
 /// # Delivery paths
 ///
@@ -299,7 +299,7 @@ where
 
 /// Send one pre-signed peer advertisement to a dialed peer gateway.
 ///
-/// The caller mints and signs one frame per beat and fans it out, so
+/// The caller creates and signs one frame per beat and fans it out, so
 /// a dial never pays a per-peer signature.
 #[cfg(feature = "x509")]
 pub(crate) async fn send_advertisement_async<P>(
@@ -332,7 +332,7 @@ where
 	Ok(decoded.status)
 }
 
-/// One minted advertisement rumor ready to witness and flood.
+/// One signed advertisement rumor ready to witness and flood.
 #[cfg(feature = "x509")]
 struct MintedAdRumor {
 	rumor: Frame,
@@ -341,7 +341,7 @@ struct MintedAdRumor {
 	minted_ms: u64,
 }
 
-/// Mint, sign, and digest one advertisement rumor for the local slate.
+/// Create, sign, and digest one advertisement rumor for the local slate.
 ///
 /// Wraps a [`mint_ad_frame`] payload in a signed gossip rumor and extracts
 /// the digest and signer id for witness and reflood.
@@ -395,7 +395,7 @@ where
 ///
 /// # Failures
 ///
-/// A mint fault returns `false`, traces `CLUSTER_PEER_AD_PUBLISH_FAILED`,
+/// A creation fault returns `false`, traces `CLUSTER_PEER_AD_PUBLISH_FAILED`,
 /// and leaves the caller's publish baseline intact so the next beat retries.
 #[cfg(feature = "x509")]
 pub(crate) async fn publish_slate_rumor<P, D>(
@@ -445,10 +445,11 @@ where
 	true
 }
 
-/// Dial address of a relaying peer, from its live direct routes.
+/// Returns the dial address of a relaying peer, from its live direct
+/// routes.
 ///
-/// Only direct routes qualify: a relay entry's dial address belongs to
-/// yet another relay, never to `relay_id` itself. Returns `None` when
+/// Only direct routes qualify because a relay entry's dial address belongs
+/// to yet another relay, never to `relay_id` itself. Returns `None` when
 /// the relay never advertised directly to this gateway. Without a
 /// verified dial address there is no relay trail to install, and the
 /// direct trail from the rumor still stands alone.
@@ -595,7 +596,7 @@ fn try_apply_peer_ad_rumor(
 
 	servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()).ok()?;
 
-	// Fallback install is best-effort: the direct trail already
+	// Fallback install is best-effort. The direct trail already
 	// landed, and a refused relay bucket (caps or a stale order) only
 	// forfeits the fallback path. The refusal still traces, so a
 	// missing fallback is diagnosable (ISO 27001 A.8.15).
@@ -661,7 +662,7 @@ fn admissible_pex_hints<'c>(
 
 /// One anti-entropy reconcile round with a peer, including grey-hole scoring.
 ///
-/// An `Err` from this function is peer-attributable: the beat loops score it
+/// An `Err` from this function is peer-attributable, so the beat loops score it
 /// toward eviction or probe discard. A local fault skips the affected step
 /// instead, so a healthy peer is never penalized for a fault on this gateway.
 ///
@@ -708,7 +709,7 @@ where
 	D: ClusterDigest,
 {
 	let now = current_timestamp_ms();
-	// A journal fault is this gateway's, not the peer's: skip the round so
+	// A journal fault is this gateway's, not the peer's. Skip the round so
 	// the beat does not score every peer for a fault none of them caused.
 	let Ok(held_digests) = config.gossip.journal.held_digests(now) else {
 		return Ok(());
@@ -732,7 +733,8 @@ where
 	//   <https://cwe.mitre.org/data/definitions/668.html>
 	client.complete_handshake().await?;
 
-	// Colony scope gate: peer handshake cert MUST match local colony.
+	// The colony scope gate requires the peer handshake cert to match
+	// the local colony.
 	let peer_colony = client
 		.peer_certificate()
 		.and_then(|cert| cert_colony_urn(&config.namespace, cert));
@@ -747,7 +749,7 @@ where
 
 	let request = ClusterRequest::ReconcileGossip(GossipReconciliation { held });
 
-	// Frame construction and signing are local: a fault here happened
+	// Frame construction and signing are local. A fault here happened
 	// before the peer was asked anything, so the round is skipped rather
 	// than scored.
 	let Ok(frame) = FrameBuilder::from(Version::V2)
@@ -767,15 +769,15 @@ where
 	let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 	let reply: GossipWant = decode(&response.message)?;
 
-	// Oversized want-list or PEX sample is abuse: fail the round (CWE-770).
-	// The beat then scores the peer like any failed round, so an abuser
+	// An oversized want-list or PEX sample is abuse, so the round fails
+	// (CWE-770). The beat then scores the peer like any failed round, so an abuser
 	// is discarded from `new` or counted toward eviction from `tried`.
 	if reconcile_reply_oversized(&reply) {
 		return Err(ClusterError::OversizedReconcileReply);
 	}
 
-	// The reply is decoded and within bounds: the peer has proven liveness.
-	// Everything below is local bookkeeping and best-effort repair inside
+	// The reply is decoded and within bounds, so the peer has proven
+	// liveness. Everything below is local bookkeeping and best-effort repair inside
 	// one fallible scope.
 	//
 	// - `?` inside the scope keeps every step, including each trace event,
@@ -789,8 +791,8 @@ where
 		// under a same-colony certificate, so it earns a tried slot and
 		// joins the beat/reflood target set.
 		//
-		// - Promotion waits for the reply: a pooled connection keeps its
-		//   handshake certificate after the peer dies.
+		// - Promotion waits for the reply because a pooled connection
+		//   keeps its handshake certificate after the peer dies.
 		// - Promoting on the gate alone would reset the failure count
 		//   every beat, and a dead peer could never be evicted.
 		let peer_id = client.peer_certificate().and_then(cert_fingerprint_id);
@@ -854,7 +856,7 @@ where
 
 			let signed = frame.sign_with_provider::<D, _>(config.tls.key.as_ref()).await?;
 
-			// Arm grey-hole ledger only on explicit Ok reply.
+			// Arm the grey-hole ledger only on an explicit Ok reply.
 			if let Some(push_reply) = client.emit(signed, None).await? {
 				let decoded: Result<GossipResponse, _> = decode(&push_reply.message);
 				if let Ok(gossip_reply) = decoded {
@@ -940,7 +942,8 @@ where
 		}
 	};
 
-	// Key rate/journal on verified origin signer, never the relay (CWE-770).
+	// Rate and journal keys use the verified origin signer, never the
+	// relay (CWE-770).
 	let attributed = gossip_attribution(origin, &frame, &rumor);
 	let signer_id = match attributed.nonrepudiation.as_ref() {
 		Some(signer_info) => match Encode::to_der(&signer_info.sid) {
@@ -968,7 +971,8 @@ where
 		}
 	}
 
-	// Rate-limit before journal/reflood (CWE-770). Backend fault refuses closed.
+	// The rate limit runs before journal and reflood (CWE-770). A
+	// backend fault refuses closed.
 	match config.gossip.admission.allow(&signer_id, now) {
 		Ok(true) => {}
 		Ok(false) => {
@@ -1041,7 +1045,7 @@ where
 ///
 /// 1. [`Self::take_due`] claims a publish slot and blocks re-entry while
 ///    the task runs.
-/// 2. The detached task mints and refloods the rumor.
+/// 2. The detached task creates and refloods the rumor.
 /// 3. [`Self::commit`] records the baseline after a rumor went out.
 /// 4. [`Self::abort`] releases a failed claim with the old baseline
 ///    intact, so the next beat retries.
@@ -1118,8 +1122,8 @@ impl AdPublishState {
 /// Spawn the advertise/reconcile beat that re-announces local types to peers.
 ///
 /// Each beat retries pending local delivery, publishes due advertisement
-/// rumors, dials verified targets with one shared mint, and runs reconcile
-/// rounds for colony members and feeler probes.
+/// rumors, dials verified targets with one shared signed frame, and runs
+/// reconcile rounds for colony members and feeler probes.
 #[cfg(feature = "x509")]
 pub fn build_advertise_task<P, D>(
 	servlet_registry: Arc<ServletRegistry>,
@@ -1153,7 +1157,7 @@ where
 			return;
 		};
 
-		// A gateway must never learn itself as a peer: PEX replies echo
+		// A gateway must never learn itself as a peer. PEX replies echo
 		// installed routes, which include this gateway's own address.
 		if let Ok(local) = from_utf8(&gateway_addr) {
 			let _ = config.peer.table.exclude_self(local);
@@ -1220,12 +1224,14 @@ where
 
 			// The slate also floods as an origin-signed rumor, so
 			// members beyond direct dial reach learn this gateway and
-			// install a direct trail to it. The flood detaches, like
-			// the pipeline reflood, because a slow or dead flood
-			// target must not stall the direct advertisements below.
-			// The task settles the claim itself: the baseline commits
-			// only after a rumor went out, so a failed mint retries on
-			// the next beat instead of waiting out the refresh.
+			// install a direct trail to it.
+			//
+			// The flood detaches, like the pipeline reflood, because a
+			// slow or dead flood target must not stall the direct
+			// advertisements below. The detached task settles the claim
+			// itself, and the baseline commits only after a rumor went
+			// out. A failed publish therefore retries on the next beat
+			// instead of waiting out the refresh.
 			let now = current_timestamp_ms();
 			if config.colony_urn().is_some() && ad_publish.take_due(now, &slate, &targets) {
 				let publish_state = Arc::clone(&ad_publish);
@@ -1234,7 +1240,7 @@ where
 				let publish_trace = Arc::clone(&trace);
 				let publish_addr = Arc::clone(&gateway_addr);
 				// The captured vectors become the commit baseline, and
-				// the mint consumes its own slate copy inside the task.
+				// the publish consumes its own slate copy inside the task.
 				let publish_slate = slate.clone();
 				let publish_targets = targets.clone();
 				drop(rt::spawn(async move {
@@ -1254,12 +1260,12 @@ where
 				}));
 			}
 
-			// One mint and one signature serve every direct target this
-			// beat. The frame carries no peer-specific field, so each
-			// dial takes a clone of the signed frame instead of paying
-			// a fresh signature. The mint takes the slate by move, as
-			// its last use this beat. A mint fault skips the direct
-			// advertisements but never the reconcile rounds.
+			// One frame and one signature serve every direct target
+			// this beat. The frame carries no peer-specific field, so
+			// each dial takes a clone of the signed frame instead of
+			// paying a fresh signature. The frame build takes the slate
+			// by move, as its last use this beat. A build fault skips
+			// the direct advertisements but never the reconcile rounds.
 			let mut ad_frame = None;
 			if !targets.is_empty() {
 				ad_frame = mint_ad_frame::<D>(&config, gateway_addr.as_ref(), slate).await.ok();

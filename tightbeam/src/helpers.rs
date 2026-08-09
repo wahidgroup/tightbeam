@@ -9,7 +9,6 @@ use alloc::boxed::Box;
 #[cfg(all(not(feature = "std"), any(feature = "kdf", feature = "aead")))]
 use alloc::vec::Vec;
 
-// Re-exports
 #[cfg(feature = "zeroize")]
 pub use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -117,9 +116,8 @@ impl<'a> DecodeValue<'a> for Asn1Matrix {
 
 impl EncodeValue for Asn1Matrix {
 	fn value_len(&self) -> crate::der::Result<Length> {
-		// INTEGER(n) + OCTET STRING(data)
+		// The value is INTEGER(n) followed by OCTET STRING(data).
 		let n_len = self.n.encoded_len()?;
-		// Validate before encoding
 		if self.n == 0 {
 			return Err(crate::der::ErrorKind::Value { tag: Tag::Integer }.into());
 		}
@@ -136,7 +134,6 @@ impl EncodeValue for Asn1Matrix {
 	}
 
 	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
-		// Encode fields inside SEQUENCE
 		self.n.encode(encoder)?;
 
 		let os = crate::der::asn1::OctetString::new(self.data.as_slice())?;
@@ -144,7 +141,7 @@ impl EncodeValue for Asn1Matrix {
 	}
 }
 
-/// Create a SignatureInfo by signing data
+/// Create a SignatureInfo by signing data.
 #[macro_export]
 #[cfg(feature = "signature")]
 macro_rules! sign {
@@ -154,11 +151,11 @@ macro_rules! sign {
 	}};
 }
 
-/// Macro to sign a document and insert the signature
+/// Macro to sign a document and insert the signature.
 #[macro_export]
 #[cfg(feature = "signature")]
 macro_rules! notarize {
-	// Pattern for Signatory trait objects (takes a reference)
+	// Pattern for Signatory trait objects (takes a reference).
 	(tbs: $tbs:expr, position: $position:ident, signer: & $signer:expr) => {{
 		use $crate::crypto::sign::Signatory;
 
@@ -170,7 +167,7 @@ macro_rules! notarize {
 		Ok::<_, $crate::TightBeamError>(tbs)
 	}};
 
-	// Pattern for callable (Box<dyn FnOnce> or closures)
+	// Pattern for callables (Box<dyn FnOnce> or closures).
 	(tbs: $tbs:expr, position: $position:ident, signer: $signer:expr) => {{
 		let unsigned_bytes = $crate::encode(&$tbs)?;
 		let $position = Some($signer(&unsigned_bytes)?);
@@ -275,10 +272,10 @@ macro_rules! mutex {
 	};
 }
 
-/// Extension trait for Frame to add compute_hash method
+/// Extension trait for `Frame` that adds the `compute_hash` method.
 #[cfg(feature = "digest")]
 pub trait FrameHashExt {
-	/// Compute hash of the frame using the specified digest algorithm
+	/// Compute the hash of the frame using the specified digest algorithm.
 	fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
 	where
 		D: digest::Digest + crate::der::oid::AssociatedOid;
@@ -310,27 +307,27 @@ impl crate::Frame {
 	///
 	/// # Returns
 	/// The signed frame with the `nonrepudiation` field populated.
+	///
+	/// # See also
+	/// - [`Frame::verify`](crate::Frame::verify): the verification
+	///   counterpart under the same canonical convention
 	pub async fn sign_with_provider<D, P>(self, provider: &P) -> Result<Self>
 	where
 		D: Digest + AssociatedOid,
 		P: SigningKeyProvider + ?Sized,
 	{
-		// 1. Encode the frame (without signature field)
 		let unsigned_bytes = self.to_tbs()?;
 
-		// 2. Sign under the canonical convention: hash the TBS bytes once
-		// with `D`, then have the provider sign that prehash. The digest
-		// algorithm recorded in the SignerInfo below is therefore the digest
+		// The canonical convention hashes the TBS bytes once with `D`,
+		// then the provider signs that prehash. The digest algorithm
+		// recorded in the SignerInfo below is therefore the digest
 		// actually used by the signature.
 		let mut tbs_hasher = D::new();
 		tbs_hasher.update(&unsigned_bytes);
 
 		let signature_bytes = provider.sign_prehash(&tbs_hasher.finalize()).await?;
-
-		// 3. Get signature algorithm from provider
 		let signature_algorithm = provider.algorithm();
 
-		// 4. Compute signer identifier from public key
 		let public_key_der = provider.to_public_key_bytes().await?;
 		let mut hasher = D::new();
 		hasher.update(&public_key_der);
@@ -342,11 +339,7 @@ impl crate::Frame {
 		let skid_octets = OctetString::new(skid_bytes)?;
 		let skid = SubjectKeyIdentifier::from(skid_octets);
 		let sid = SignerIdentifier::SubjectKeyIdentifier(skid);
-
-		// 5. Build digest algorithm identifier
 		let digest_alg = AlgorithmIdentifierOwned { oid: D::OID, parameters: None };
-
-		// 6. Assemble and attach the SignerInfo
 		let signer_info = SignerInfo::from_parts(signature_bytes, signature_algorithm, digest_alg, sid)?;
 
 		Ok(self.attach_signer_info(signer_info))
@@ -399,27 +392,22 @@ impl crate::Frame {
 	where
 		P: EncryptingKeyProvider,
 	{
-		// 1. Generate random nonce
 		let mut nonce = vec![0u8; nonce_size];
 		crate::random::generate_random_bytes(&mut nonce, None)?;
 
-		// 2. Encrypt the message bytes
 		let ciphertext = provider.encrypt(&nonce, &self.message).await?;
-
-		// 3. Get encryption algorithm from provider
 		let content_enc_alg = provider.algorithm();
 
-		// 4. Store nonce in algorithm parameters
+		// The nonce travels in the algorithm parameters so the receiver
+		// can decrypt without out-of-band state.
 		let nonce_octets = OctetString::new(nonce.as_slice())?;
 		let parameters = Some(Any::encode_from(&nonce_octets)?);
 		let content_enc_alg = AlgorithmIdentifierOwned { oid: content_enc_alg.oid, parameters };
 
-		// 5. Create EncryptedContentInfo
 		let content_type = crate::oids::DATA;
 		let encrypted_content = Some(OctetString::new(ciphertext.as_slice())?);
 		let encrypted_content_info = EncryptedContentInfo { content_type, content_enc_alg, encrypted_content };
 
-		// 6. Update frame
 		self.metadata.confidentiality = Some(encrypted_content_info);
 		self.message = ciphertext;
 
@@ -445,17 +433,14 @@ impl crate::Frame {
 	where
 		P: EncryptingKeyProvider,
 	{
-		// 1. Extract EncryptedContentInfo
 		let encrypted_content_info = self
 			.metadata
 			.confidentiality
 			.take()
 			.ok_or(TightBeamError::MissingEncryptionInfo)?;
 
-		// 2. Extract ciphertext from message field
 		let ciphertext = self.message.as_slice();
 
-		// 3. Extract nonce from algorithm parameters
 		let nonce_any = encrypted_content_info
 			.content_enc_alg
 			.parameters
@@ -465,10 +450,7 @@ impl crate::Frame {
 		let nonce_octet_string: OctetString = nonce_any.decode_as()?;
 		let nonce = nonce_octet_string.as_bytes();
 
-		// 4. Decrypt using the provider
 		let plaintext = provider.decrypt(nonce, ciphertext).await?;
-
-		// 5. Update frame
 		self.message = plaintext;
 
 		Ok(self)
@@ -660,8 +642,9 @@ mod tests {
 			let frame = unsigned_frame()?;
 			let signing_key = create_test_signing_key();
 
-			// External backends must follow the canonical convention:
-			// SHA3-256 over the TBS bytes, ECDSA over that prehash.
+			// External backends must follow the canonical convention.
+			// SHA3-256 runs over the TBS bytes, and ECDSA signs that
+			// prehash.
 			let tbs = frame.to_tbs()?;
 			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;
 
@@ -715,7 +698,6 @@ mod tests {
 			let message = create_test_message(None);
 			let original_message_bytes = crate::encode(&message)?;
 
-			// Create frame
 			let frame = FrameBuilder::from(Version::V1)
 				.with_id("test-encrypt")
 				.with_order(1696521600)
@@ -724,17 +706,14 @@ mod tests {
 			assert!(frame.metadata.confidentiality.is_none());
 			assert_eq!(frame.message, original_message_bytes);
 
-			// Create encryption key provider
 			let key_bytes = [42u8; 32];
 			let cipher = Aes256Gcm::new_from_slice(&key_bytes)?;
 			let provider = Aes256GcmKeyProvider::from(cipher);
 
-			// Encrypt
 			let encrypted_frame = frame.encrypt_with_provider(&provider, 12).await?;
 			assert!(encrypted_frame.metadata.confidentiality.is_some());
 			assert_ne!(encrypted_frame.message, original_message_bytes);
 
-			// Decrypt
 			let decrypted_frame = encrypted_frame.decrypt_with_provider(&provider).await?;
 			assert!(decrypted_frame.metadata.confidentiality.is_none());
 			assert_eq!(decrypted_frame.message, original_message_bytes);

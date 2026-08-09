@@ -42,19 +42,19 @@ pub trait Inflator {
 pub trait Message:
 	EncodeValue + Tagged + for<'a> crate::der::Decode<'a> + Clone + PartialEq + core::fmt::Debug + Sized + Send + Sync
 {
-	/// Minimum version required to send this message type
+	/// Minimum version required to send this message type.
 	const MIN_VERSION: Version = Version::V0;
-	/// Whether this message type requires non-repudiation (signing)
+	/// Whether this message type requires non-repudiation (signing).
 	const MUST_BE_NON_REPUDIABLE: bool = false;
-	/// Whether this message type requires confidentiality (encryption)
+	/// Whether this message type requires confidentiality (encryption).
 	const MUST_BE_CONFIDENTIAL: bool = false;
-	/// Whether this message type requires compression
+	/// Whether this message type requires compression.
 	const MUST_BE_COMPRESSED: bool = false;
-	/// Whether this message type requires prioritization
+	/// Whether this message type requires prioritization.
 	const MUST_BE_PRIORITIZED: bool = false;
-	/// Whether this message type requires message integrity (hashing)
+	/// Whether this message type requires message integrity (hashing).
 	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
-	/// Whether this message type requires frame integrity (hashing)
+	/// Whether this message type requires frame integrity (hashing).
 	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
 
 	/// Whether this message type has a custom security profile that
@@ -97,10 +97,10 @@ impl Frame {
 
 	/// Encode the Frame for signature verification (TBS - to-be-signed).
 	///
-	/// Excludes `nonrepudiation` without cloning the frame: the borrowing
-	/// `TbsScaffold` reuses the derived field
-	/// encoders, so these bytes are bit-identical to the DER encoding of the
-	/// frame with `nonrepudiation` set to `None`.
+	/// Excludes `nonrepudiation` without cloning the frame. The borrowing
+	/// `TbsScaffold` reuses the derived field encoders, so these bytes
+	/// are bit-identical to the DER encoding of the frame with
+	/// `nonrepudiation` set to `None`.
 	pub fn to_tbs(&self) -> Result<Vec<u8>> {
 		let scaffold = crate::frame::TbsScaffold {
 			version: &self.version,
@@ -112,10 +112,10 @@ impl Frame {
 		Ok(scaffold.to_der()?)
 	}
 
-	/// Verify the signature of the TightBeam message
+	/// Verify the signature of the TightBeam message.
 	///
 	/// This verifies the signature against the entire TightBeam structure
-	/// under the canonical convention: the TBS encoding is hashed once with
+	/// under the canonical convention. The TBS encoding is hashed once with
 	/// `D` and the signature is checked against that prehash.
 	///
 	/// # Arguments
@@ -129,16 +129,20 @@ impl Frame {
 	/// - The TightBeam doesn't contain a signature
 	/// - The SignerInfo advertises a digest other than `D`
 	/// - Signature verification fails
+	///
+	/// # See also
+	/// - [`Frame::sign_with_provider`]: the signing counterpart under the
+	///   same canonical convention
+	/// - [`Frame::to_tbs`]: the exact bytes the signature covers
 	pub fn verify<S, D>(&self, verifier: &impl PrehashVerifier<S>) -> Result<()>
 	where
 		S: SignatureEncoding,
 		D: Digest + AssociatedOid,
 	{
-		// Extract signature info from the Frame
 		let signature_info = self.nonrepudiation.as_ref().ok_or(TightBeamError::MissingSignature)?;
 
 		// The canonical convention binds the signature to the digest declared
-		// in the SignerInfo; a mismatch is algorithm confusion, not merely a
+		// in the SignerInfo. A mismatch is algorithm confusion, not merely a
 		// bad signature.
 		if signature_info.digest_alg.oid != D::OID {
 			return Err(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
@@ -148,14 +152,9 @@ impl Frame {
 		}
 
 		let signature_bytes: &[u8] = signature_info.signature.as_bytes();
-
-		// Decode the signature
 		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;
-
-		// Encode TBS (to-be-signed) structure without cloning - skip the signature field
 		let tbs_der = self.to_tbs()?;
 
-		// Verify signature
 		verify_canonical::<D, S>(verifier, &tbs_der, &signature)?;
 
 		Ok(())
@@ -196,11 +195,11 @@ impl Frame {
 			.take()
 			.ok_or(TightBeamError::MissingEncryptionInfo)?;
 
-		// The encrypted content is stored in the message field - move it into the info
+		// The encrypted content lives in the message field, so it moves
+		// into the info before decryption.
 		let message = OctetString::new(core::mem::take(&mut self.message))?;
 		encrypted_content_info.encrypted_content = Some(message);
 
-		// Decrypt using the Decryptor trait
 		decryptor.decrypt_content(&encrypted_content_info)
 	}
 
@@ -241,13 +240,16 @@ impl Frame {
 	/// its cleartext equivalent.
 	///
 	/// Frame-level `integrity` and `nonrepudiation` cover the encrypted
-	/// body and are left untouched: verify them *before* calling, they
-	/// will no longer match afterwards.
+	/// body and are left untouched. Verify them *before* calling
+	/// ([`Frame::verify_frame_integrity`], [`Frame::verify`]), because
+	/// they will no longer match afterwards. The message commitment in
+	/// `metadata.integrity` is the check that survives decryption
+	/// ([`Frame::verify_commitment_of`]).
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingEncryptionInfo`] -- frame is not encrypted.
-	/// - [`TightBeamError::MissingInflator`] -- body is compressed with no inflator.
+	/// - [`TightBeamError::MissingEncryptionInfo`] when the frame is not encrypted.
+	/// - [`TightBeamError::MissingInflator`] when the body is compressed with no inflator.
 	/// - Decryption or decompression errors from the underlying implementations.
 	pub fn decrypt_in_place(
 		&mut self,
@@ -341,7 +343,8 @@ pub enum IntegrityVerdict {
 	Absent,
 	/// The stored digest was produced by a different algorithm than `D`.
 	AlgorithmMismatch,
-	/// Recomputed digest differs: the covered bytes changed after digesting.
+	/// Recomputed digest differs because the covered bytes changed after
+	/// digesting.
 	Mismatch,
 }
 
@@ -392,7 +395,7 @@ impl Frame {
 	/// Verify a disclosed [`Opening`](crate::crypto::commitment::Opening)
 	/// against this frame's message commitment.
 	///
-	/// Convenience over [`Frame::message_commitment_verdict`]: returns
+	/// Convenience over [`Frame::message_commitment_verdict`]. Returns
 	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch alike.
 	/// Callers that must distinguish a stripped commitment from a tampered one
 	/// use the verdict method.
@@ -403,11 +406,52 @@ impl Frame {
 		Ok(self.message_commitment_verdict::<D>(opening)?.is_verified())
 	}
 
+	/// Verify this frame's message commitment against a message the
+	/// caller holds, re-proving the opening in place.
+	///
+	/// Convenience over [`Opening`](crate::crypto::commitment::Opening)
+	/// plus [`Frame::verify_message_commitment`] for receivers that
+	/// already decoded the typed message.
+	///
+	/// # Contract
+	///
+	/// - After [`Frame::decrypt_in_place`] unwraps the body, the
+	///   commitment in `metadata.integrity` is the surviving
+	///   cryptographic bind between the frame and that cleartext.
+	/// - `salt` must match the value the sender committed with.
+	///
+	/// # Returns
+	///
+	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch
+	/// alike. Callers that must distinguish those conditions use
+	/// [`Frame::message_commitment_verdict`].
+	pub fn verify_commitment_of<D, M>(&self, message: &M, salt: impl AsRef<[u8]>) -> Result<bool>
+	where
+		D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
+		M: Message,
+	{
+		let (_, opening) = crate::crypto::commitment::Opening::prove::<D, M>(message, salt)?;
+
+		self.verify_message_commitment::<D>(&opening)
+	}
+
 	/// Check this frame's frame-integrity (FI) digest, reporting which
 	/// condition held.
 	///
 	/// Recomputes `H(SEQUENCE { version, metadata })` with `D` and compares it
 	/// against the stored digest.
+	///
+	/// # Ordering
+	///
+	/// The FI digest covers the wire envelope, including any
+	/// `confidentiality` info. Verify it *before*
+	/// [`Frame::decrypt_in_place`], because decryption rewrites the
+	/// envelope and the digest no longer recomputes afterwards.
+	///
+	/// # See also
+	///
+	/// [`Frame::verify_commitment_of`]: the message commitment is the
+	/// integrity check that survives decryption.
 	pub fn frame_integrity_verdict<D>(&self) -> Result<IntegrityVerdict>
 	where
 		D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
@@ -430,7 +474,7 @@ impl Frame {
 
 	/// Verify this frame's frame-integrity (FI) digest.
 	///
-	/// Convenience over [`Frame::frame_integrity_verdict`]: returns
+	/// Convenience over [`Frame::frame_integrity_verdict`]. Returns
 	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch alike.
 	/// Callers that must distinguish a stripped FI field from a tampered
 	/// envelope use the verdict method.
@@ -477,7 +521,7 @@ impl Frame {
 impl Frame {
 	/// Decompress the plaintext bytes if compression was used.
 	///
-	/// This is a no-op when the `compress` feature is disabled.
+	/// Without the `compress` feature this only rejects compressed input.
 	pub fn decompress(plaintext: Vec<u8>, was_compressed: bool, _inflator: Option<&dyn Inflator>) -> Result<Vec<u8>> {
 		if was_compressed {
 			Err(TightBeamError::MissingFeature("compress"))
@@ -516,7 +560,6 @@ mod tests {
 
 	use super::*;
 
-	// Test data structures
 	#[derive(Clone, Debug, PartialEq, der::Sequence)]
 	struct SimpleMessage {
 		id: u64,
@@ -530,14 +573,14 @@ mod tests {
 		flag: bool,
 	}
 
-	/// Pin `decoded` to the type of `original`: with reduced feature sets the
+	/// Pin `decoded` to the type of `original`. With reduced feature sets the
 	/// `serde_json` dev-dependency's `PartialEq<Value>` impls for integers make
 	/// a bare `assert_eq!` on `decode`'s inferred output ambiguous.
 	fn assert_round_trip<T: PartialEq + core::fmt::Debug>(original: &T, decoded: &T) {
 		assert_eq!(original, decoded);
 	}
 
-	/// Macro to generate encode/decode round-trip tests
+	/// Macro to generate encode/decode round-trip tests.
 	macro_rules! test_encode_decode {
 		($($name:ident: $value:expr,)*) => {
 			$(
@@ -545,15 +588,13 @@ mod tests {
 				fn $name() -> Result<()> {
 					let original = $value;
 
-					// Encode
 					let encoded = crate::encode(&original)?;
 					assert!(!encoded.is_empty());
 
-					// Decode
 					let decoded = crate::decode(&encoded)?;
 					assert_round_trip(&original, &decoded);
 
-					// Verify it's valid DER (encode again and compare)
+					// A second encode proves the decoded value is valid DER.
 					let re_encoded = crate::encode(&decoded)?;
 					assert_eq!(encoded, re_encoded);
 
@@ -592,7 +633,7 @@ mod tests {
 		encode_decode_bool_false: false,
 	}
 
-	/// Macro to generate decode failure tests
+	/// Macro to generate decode failure tests.
 	macro_rules! test_decode_failure {
 		($($name:ident: $data:expr => $type:ty,)*) => {
 			$(
@@ -614,7 +655,6 @@ mod tests {
 
 	#[test]
 	fn decode_truncated_should_fail() -> Result<()> {
-		// Create a valid encoding then truncate it
 		let original = SimpleMessage { id: 100, name: "test".to_string() };
 		let mut encoded = crate::encode(&original)?;
 		encoded.truncate(5);
@@ -625,7 +665,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// Macro to generate TightBeam encode/decode round-trip tests
+	/// Macro to generate TightBeam encode/decode round-trip tests.
 	macro_rules! test_tightbeam_roundtrip {
 		($($name:ident: $tightbeam:expr,)*) => {
 			$(
@@ -633,16 +673,13 @@ mod tests {
 				fn $name() -> Result<()> {
 					let original = $tightbeam;
 
-					// Encode
 					let encoded = crate::encode(&original)?;
 					assert!(!encoded.is_empty());
 
-					// Decode
 					let decoded: Frame = crate::decode(&encoded)?;
-					// Verify round-trip
 					assert_eq!(original, decoded);
 
-					// Verify it's valid DER (encode again and compare)
+					// A second encode proves the decoded value is valid DER.
 					let re_encoded = crate::encode(&decoded)?;
 					assert_eq!(encoded, re_encoded);
 
@@ -709,7 +746,7 @@ mod tests {
 		},
 	}
 
-	/// Macro to test TightBeam conversions
+	/// Macro to test TightBeam conversions.
 	macro_rules! test_tightbeam_conversions {
 		($($name:ident: $tightbeam:expr => $target:ty,)*) => {
 			$(
@@ -757,7 +794,7 @@ mod tests {
 		} => Version,
 	}
 
-	/// Macro to test TightBeam TryFrom conversions (owned only)
+	/// Macro to test TightBeam TryFrom conversions (owned only).
 	macro_rules! test_tightbeam_try_conversions {
 		(success: $($name:ident: $tightbeam:expr => $target:ty,)*) => {
 			$(
@@ -827,7 +864,7 @@ mod tests {
 	}
 
 	test_tightbeam_try_conversions! {
-		failure: // Do nothing: should fail due to missing fields
+		failure: // These conversions should fail due to missing fields.
 		tightbeam_v0_to_signature_info_fails: {
 			let message = create_test_message(None);
 			compose! {
@@ -848,7 +885,6 @@ mod tests {
 		} => EncryptedContentInfo,
 	}
 
-	// Test data structures for Profile type testing
 	#[cfg(feature = "derive")]
 	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
 	#[beam(profile = 1)]
@@ -876,20 +912,20 @@ mod tests {
 	#[test]
 	#[allow(clippy::assertions_on_constants)]
 	fn test_profile_types() {
-		// All message types should have a Profile type that implements SecurityProfile
+		// Every message type must expose a Profile type that implements
+		// SecurityProfile.
 		fn assert_security_profile<P: crate::crypto::profiles::SecurityProfile>() {}
 
 		assert_security_profile::<<NumericProfileMessage as crate::Message>::Profile>();
 		assert_security_profile::<<TypeProfileMessage as crate::Message>::Profile>();
 		assert_security_profile::<<NoProfileMessage as crate::Message>::Profile>();
 
-		// Type-based profile should be StandardProfile
+		// A type-based profile resolves to the named profile type.
 		assert_eq!(
 			core::any::TypeId::of::<<TypeProfileMessage as crate::Message>::Profile>(),
 			core::any::TypeId::of::<crate::crypto::profiles::TightbeamProfile>()
 		);
 
-		// Test HAS_PROFILE values
 		assert!(!NumericProfileMessage::HAS_PROFILE);
 		assert!(TypeProfileMessage::HAS_PROFILE);
 		assert!(!NoProfileMessage::HAS_PROFILE);
@@ -923,6 +959,51 @@ mod tests {
 			unsigned.nonrepudiation = None;
 
 			assert_eq!(frame.to_tbs()?, crate::encode(&unsigned)?);
+
+			Ok(())
+		}
+	}
+
+	#[cfg(all(feature = "digest", feature = "sha3", feature = "builder"))]
+	mod message_commitment {
+		use super::*;
+		use crate::crypto::commitment::Opening;
+		use crate::crypto::hash::Sha3_256;
+
+		#[test]
+		fn verify_commitment_of_recomputes_over_message() -> Result<()> {
+			let message = create_test_message(None);
+			let (commitment, _) = Opening::prove::<Sha3_256, _>(&message, [])?;
+
+			let mut frame = compose! { V1: id: "commit-1", order: 1u64, message: message.clone() }?;
+			frame.metadata.integrity = Some(commitment);
+
+			assert!(frame.verify_commitment_of::<Sha3_256, _>(&message, [])?);
+
+			Ok(())
+		}
+
+		#[test]
+		fn verify_commitment_of_rejects_other_message() -> Result<()> {
+			let committed = create_test_message(None);
+			let (commitment, _) = Opening::prove::<Sha3_256, _>(&committed, [])?;
+
+			let mut frame = compose! { V1: id: "commit-2", order: 2u64, message: committed }?;
+			frame.metadata.integrity = Some(commitment);
+
+			let other = create_test_message(Some("a different body"));
+
+			assert!(!frame.verify_commitment_of::<Sha3_256, _>(&other, [])?);
+
+			Ok(())
+		}
+
+		#[test]
+		fn verify_commitment_of_is_false_without_commitment() -> Result<()> {
+			let message = create_test_message(None);
+			let frame = compose! { V1: id: "commit-3", order: 3u64, message: message.clone() }?;
+
+			assert!(!frame.verify_commitment_of::<Sha3_256, _>(&message, [])?);
 
 			Ok(())
 		}

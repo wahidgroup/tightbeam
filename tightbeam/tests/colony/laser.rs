@@ -16,20 +16,22 @@
 use core::time::Duration;
 use std::sync::Arc;
 
+use sha3::Sha3_256;
 use tightbeam::der::Sequence;
 use tightbeam::{
 	at_least,
 	builder::TypeBuilder,
 	cluster,
 	colony::{
-		cluster::{ClusterConfig, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		cluster::{ClusterConfig, ClusterTlsConfig},
 		common::ColonyNamespace,
 		hive::{Hive, HiveConfig, HiveTlsConfig},
 		servlet::ServletConfig,
+		SubmitWork,
 	},
 	compose,
 	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
-	decode, encode, exactly, hive,
+	decode, exactly, hive,
 	instrumentation::events,
 	policy::TransitStatus,
 	server, servlet, tb_assert_spec, tb_scenario,
@@ -58,8 +60,8 @@ pub(crate) const LASER_SERVER_STREAM_REPORTS_LENGTH: Urn<'static> =
 pub(crate) const LASER_ROUTE_BEFORE_RESTART: Urn<'static> = Urn::new("test", "event:laser/route-before-restart");
 pub(crate) const LASER_ROUTE_AFTER_RESTART: Urn<'static> = Urn::new("test", "event:laser/route-after-restart");
 
-/// Stable airspace slot the restart scenario rebinds; far above the
-/// slots `LaserAddr::ANY` assigns sequentially.
+/// The stable airspace slot the restart scenario rebinds. It sits far
+/// above the slots that `LaserAddr::ANY` assigns sequentially.
 const RESTART_GATEWAY_ADDR: &str = "laser://9901";
 
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -115,7 +117,7 @@ fn laser_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
 	conf
 }
 
-/// Type URN every laser scenario registers and targets.
+/// Returns the type URN that every laser scenario registers and targets.
 fn beam_urn() -> Urn<'static> {
 	ColonyNamespace::default()
 		.servlet("beam")
@@ -163,15 +165,23 @@ async fn start_laser_hive(
 	Ok(hive)
 }
 
-/// Emit one beam work request through a gateway and decode the response.
-async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
-	let work_request = ClusterRequest::Work(ClusterWorkRequest::new(beam_urn(), encode(&BeamRequest { value: 21 })?));
-
-	let frame = frame_compose(Version::V0)
-		.with_id(b"laser-work")
+/// Submits one beam work request through a gateway via
+/// [`SubmitWork::submit_work_to`] and returns the servlet's response
+/// frame.
+///
+/// The typed request travels as the client's complete signed frame, so
+/// the servlet receives the same envelope over the laser transport as
+/// over any other protocol. A refusal surfaces as
+/// [`TightBeamError::WorkRefused`].
+async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame, TightBeamError> {
+	let unsigned = frame_compose(Version::V0)
+		.with_id(b"laser-beam")
 		.with_order(0)
-		.with_message(work_request)
+		.with_message(BeamRequest { value: 21 })
 		.build()?;
+
+	let provider = Secp256k1KeyProvider::from(certs.key.to_owned());
+	let inner = unsigned.sign_with_provider::<Sha3_256, _>(&provider).await?;
 
 	let mut client = ClientBuilder::<LaserListener>::builder()
 		.with_trust_store(Arc::clone(&certs.trust))
@@ -179,19 +189,17 @@ async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Cluste
 		.connect(addr)
 		.await?;
 
-	let response_frame: Frame = client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-	decode(&response_frame.message)
+	client.submit_work_to(beam_urn(), &inner).await
 }
 
-/// Poll a gateway until it routes work: a freshly restarted gateway has
+/// Polls a gateway until it routes work. A freshly restarted gateway has
 /// an empty registry until the hive's anti-entropy beat re-registers.
-/// Branching lives here, not in scenarios.
-async fn wait_for_routed(certs: &GatewayCerts, addr: &LaserAddr) -> Result<ClusterWorkResponse, TightBeamError> {
+/// Any failed submission, refusals included, retries until the attempts
+/// exhaust. Branching lives here, not in the scenarios.
+async fn wait_for_routed(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame, TightBeamError> {
 	for _ in 0..50 {
-		if let Ok(response) = emit_beam_work(certs, addr).await {
-			if response.status == TransitStatus::Ok {
-				return Ok(response);
-			}
+		if let Ok(servlet_frame) = emit_beam_work(certs, addr).await {
+			return Ok(servlet_frame);
 		}
 
 		tokio::time::sleep(Duration::from_millis(100)).await;
@@ -200,8 +208,9 @@ async fn wait_for_routed(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Clust
 	Err(expectation_failure("gateway never routed work after restart"))
 }
 
-/// Streaming-only service for the lone `server!` proof: answers with the
-/// collected body length; other kinds refuse through the defaults.
+/// A streaming-only service for the lone `server!` proof. It answers with
+/// the collected body length, and other interaction kinds refuse through
+/// the defaults.
 #[derive(Clone)]
 struct BeamLengthService;
 
@@ -231,7 +240,7 @@ tb_assert_spec! {
 }
 
 // A lone `server!` (no colony) bound to the laser protocol serves a
-// streaming interaction end to end: encryption, mux negotiation, and
+// streaming interaction end to end. Encryption, mux negotiation, and
 // stream dispatch all go through the protocol traits.
 tb_scenario! {
 	name: lone_server_streams_over_laser_protocol,
@@ -295,8 +304,9 @@ tb_assert_spec! {
 }
 
 // A laser tightbeam reaches the cluster gateway and routes to a hive
-// servlet: client -> cluster -> hive control -> servlet, all links on
-// the in-memory laser protocol, all encrypted, all multiplexed.
+// servlet. The path runs from the client through the cluster and hive
+// control to the servlet. Every link uses the in-memory laser protocol,
+// encrypted and multiplexed.
 tb_scenario! {
 	name: cluster_routes_work_over_laser_protocol,
 	spec: LaserRoutingSpec,
@@ -314,13 +324,13 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			trace.event(LASER_WORK_SENT)?;
 
-			let work_response = emit_beam_work(&certs, cluster.addr()).await?;
-			trace.event_with(LASER_WORK_STATUS, &[], work_response.status)?;
+			// A served frame proves the gateway reported `Ok`, because the
+			// client surface resolves any other status into `WorkRefused`.
+			let servlet_frame = emit_beam_work(&certs, cluster.addr()).await?;
+			trace.event_with(LASER_WORK_STATUS, &[], TransitStatus::Ok)?;
 
-			if let Some(payload) = work_response.payload {
-				let beam_response: BeamResponse = decode(&payload)?;
-				trace.event_with(LASER_WORK_ECHOED, &[], beam_response.doubled)?;
-			}
+			let beam_response: BeamResponse = decode(&servlet_frame.message)?;
+			trace.event_with(LASER_WORK_ECHOED, &[], beam_response.doubled)?;
 
 			cluster.stop();
 			Ok(())
@@ -343,10 +353,10 @@ tb_assert_spec! {
 	}
 }
 
-// The gateway registry is soft state: a replacement gateway starts empty
+// The gateway registry is soft state. A replacement gateway starts empty
 // on the same stable address, the hive's anti-entropy beat re-registers
-// within one interval, and work routes again -- no operator, no consensus,
-// no persistence.
+// within one interval, and work routes again with no operator, no
+// consensus, and no persistence.
 tb_scenario! {
 	name: cluster_recovers_hive_after_gateway_restart,
 	spec: LaserGatewayRestartSpec,
@@ -364,9 +374,11 @@ tb_scenario! {
 			vec![start_laser_hive(trace, certs, conf)]
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			let before = emit_beam_work(&certs, cluster.addr()).await?;
+			// Served frames prove the gateway reported `Ok` before and
+			// after the restart, because refusals surface as errors instead.
+			emit_beam_work(&certs, cluster.addr()).await?;
 
-			trace.event_with(LASER_ROUTE_BEFORE_RESTART, &[], before.status)?;
+			trace.event_with(LASER_ROUTE_BEFORE_RESTART, &[], TransitStatus::Ok)?;
 
 			cluster.stop();
 
@@ -376,8 +388,8 @@ tb_scenario! {
 				LaserCluster::start(Arc::new(trace.share()), config).await?
 			};
 
-			let after = wait_for_routed(&certs, replacement.addr()).await?;
-			trace.event_with(LASER_ROUTE_AFTER_RESTART, &[], after.status)?;
+			wait_for_routed(&certs, replacement.addr()).await?;
+			trace.event_with(LASER_ROUTE_AFTER_RESTART, &[], TransitStatus::Ok)?;
 
 			replacement.stop();
 			Ok(())

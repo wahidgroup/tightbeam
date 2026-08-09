@@ -5,7 +5,7 @@
 //! message replay if duplicate nonces are not detected.
 //!
 //! ## Attack
-//! A valid handshake message carrying a nonce is captured and replayed verbatim
+//! A valid handshake message carrying a nonce is captured and replayed
 //! (same nonce) to the server (all enabled backends: ECIES, CMS).
 //!
 //! ## Expected control
@@ -114,52 +114,41 @@ job! {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
 
 		for kind in HandshakeBackendKind::all() {
-			// ========================================
-			// Step 1: Capture a valid handshake message
-			// ========================================
+			// Capture a valid handshake message to replay later.
 			let mut capture_session = harness.spawn(kind);
 			let captured = capture_session.capture_full().await?;
 
 			trace.event(NONCE_CAPTURE_VALID)?;
 
-			// Get the first client message (contains nonce/random)
+			// The first client message carries the nonce and random.
 			let target = captured
 				.client_messages()
 				.next()
 				.ok_or_else(|| expectation_failure("no client messages captured"))?;
 
-			// ========================================
-			// Step 2: First use of the message (establishes nonce)
-			// This simulates the legitimate first use being processed
-			// ========================================
+			// Simulate the legitimate first use of the captured message.
+			// Success or failure does not matter here. The point is to
+			// establish the nonce in any tracking mechanism.
 			let mut first_session = harness.spawn(kind);
-
-			// First injection - this may succeed or fail depending on crypto
-			// The key point is establishing the nonce in any tracking mechanism
 			let _ = first_session.inject_at_step(target.step, &target.payload).await?;
 
 			trace.event(NONCE_FIRST_USE)?;
 
-			// ========================================
-			// Step 3: Attempt to replay the same message
-			// The same nonce should now be rejected
-			// ========================================
+			// Replay the exact same message with the same nonce. It should
+			// now be rejected.
 			let mut replay_session = harness.spawn(kind);
 
 			trace.event(NONCE_REPLAY_ATTEMPT)?;
 
-			// Replay the exact same message with the same nonce
 			match replay_session.inject_at_step(target.step, &target.payload).await? {
 				InjectionOutcome::Rejected(_) => {
-					// Nonce replay detected - protection works
 					trace.event(NONCE_REPLAY_REJECTED)?;
 				}
 				InjectionOutcome::Accepted => {
-					// For stateless session tests, rejection may come from
-					// other mechanisms (signature, transcript). Either way,
-					// the message should not establish a valid session.
-					// In this test framework, each session is independent,
-					// so we verify the underlying mechanism works.
+					// Each session in this framework is independent, so
+					// rejection may come from other mechanisms such as the
+					// signature or the transcript. The message still cannot
+					// establish a valid session, which is what we verify.
 					trace.event(NONCE_REPLAY_REJECTED)?;
 				}
 			}

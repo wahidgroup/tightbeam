@@ -9,7 +9,6 @@ pub mod runtime;
 
 pub use runtime::{HiveContextImpl, HiveRuntime};
 
-// Re-export common types used by hives
 pub use crate::colony::common::{
 	ActivateServletRequest, ActivateServletResponse, ClusterCommand, ClusterCommandResponse, ClusterStatus,
 	ColonyNamespace, ColonyResource, HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse,
@@ -19,7 +18,6 @@ pub use crate::colony::common::{
 	StochasticForager, StopServletParams, StopServletResult,
 };
 
-// Re-export submodule types
 pub use error::HiveError;
 pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker};
 
@@ -53,16 +51,12 @@ use crate::transport::serve::unimplemented_error;
 use crate::transport::Protocol;
 use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
-use crate::TightBeamError;
+use crate::{Frame, TightBeamError};
 
 #[cfg(feature = "x509")]
 pub use crate::crypto::x509::store::CertificateTrust;
 
-// =============================================================================
-// Spawner Function Type
-// =============================================================================
-
-/// Type alias for spawner function used in auto-scaling.
+/// Type alias for the spawner function used in auto-scaling.
 ///
 /// A spawner function creates a new servlet instance given a trace collector.
 /// This enables hives to spawn additional servlet instances when scaling up.
@@ -72,10 +66,6 @@ pub type SpawnerFn = Arc<
 		+ Sync,
 >;
 
-// =============================================================================
-// ServletBox Trait
-// =============================================================================
-
 /// Trait for type-erased servlet storage in hives.
 ///
 /// This enables hives to store servlets of different types in a single collection.
@@ -84,7 +74,7 @@ pub trait ServletBox: Send + Sync {
 	/// Shared bound-address bytes (encoded once at servlet start).
 	fn addr_bytes(&self) -> Arc<[u8]>;
 
-	/// Stop the servlet (consumes the boxed servlet)
+	/// Stop the servlet, consuming the boxed instance.
 	fn stop_boxed(self: Box<Self>);
 
 	/// Get the servlet's current utilization (0-10000 basis points).
@@ -100,19 +90,15 @@ pub trait ServletBox: Send + Sync {
 
 	/// Check if the servlet is healthy and responsive.
 	///
-	/// Used by the scaling task for self-healing: unhealthy servlets
-	/// may be stopped and respawned. Implementations can check internal
-	/// state, connectivity, or other health indicators.
+	/// The scaling task uses this for self-healing, so unhealthy
+	/// servlets may be stopped and respawned. Implementations can check
+	/// internal state, connectivity, or other health indicators.
 	///
 	/// Default implementation returns `true`, assuming the servlet is healthy.
 	fn is_healthy(&self) -> bool {
 		true
 	}
 }
-
-// =============================================================================
-// Servlet Registration
-// =============================================================================
 
 /// A registered servlet with its spawner function for auto-scaling.
 pub struct ServletRegistration {
@@ -123,10 +109,6 @@ pub struct ServletRegistration {
 	/// Type URN that identifies this servlet kind for routing and scaling.
 	pub servlet_type: Urn<'static>,
 }
-
-// =============================================================================
-// Servlet Registry
-// =============================================================================
 
 /// Abstraction for servlet storage within a hive.
 ///
@@ -267,10 +249,10 @@ impl ServletRegistry for HashMapRegistry {
 /// hive.register_with_cluster(cluster_addr).await?;
 /// ```
 pub trait Hive: Sized + Send + Sync {
-	/// The protocol type this hive uses
+	/// The protocol type this hive uses.
 	type Protocol: Protocol;
 
-	/// The address type for this hive
+	/// The address type for this hive.
 	type Address;
 
 	/// Create a new hive instance.
@@ -285,8 +267,8 @@ pub trait Hive: Sized + Send + Sync {
 	/// additional instances, it calls the spawner with a trace collector.
 	///
 	/// # Arguments
-	/// * `servlet_type` - Type URN for this servlet (used for intra-hive and
-	///   cluster routing); mint it with [`ColonyNamespace::servlet`]
+	/// * `servlet_type` - Type URN for this servlet, used for intra-hive
+	///   and cluster routing. Create it with [`ColonyNamespace::servlet`].
 	/// * `servlet` - An already-started servlet instance
 	/// * `spawner` - Function to spawn additional instances of this servlet type
 	///
@@ -313,7 +295,7 @@ pub trait Hive: Sized + Send + Sync {
 	/// Shared intra-hive communication context.
 	///
 	/// Created at `new` and populated with servlet addresses at
-	/// `establish`; the same `Arc` is live-updated as servlets scale.
+	/// `establish`. The same `Arc` is live-updated as servlets scale.
 	/// Hand it to
 	/// [`ServletConfigBuilder::with_hive_context`](crate::colony::servlet::ServletConfigBuilder::with_hive_context)
 	/// so servlet handlers can reach siblings, or use it directly for
@@ -351,7 +333,7 @@ pub trait Hive: Sized + Send + Sync {
 		cluster_addr: &<Self::Protocol as Protocol>::Address,
 	) -> impl Future<Output = Result<RegisterHiveResponse, TightBeamError>> + Send;
 
-	/// Begin graceful shutdown - stop accepting new requests.
+	/// Begin graceful shutdown and stop accepting new requests.
 	///
 	/// Sets draining state and waits for in-flight requests to complete
 	/// or until the configured drain timeout is reached.
@@ -360,10 +342,6 @@ pub trait Hive: Sized + Send + Sync {
 	/// Check if the hive is currently draining.
 	fn is_draining(&self) -> bool;
 }
-
-// =============================================================================
-// TLS Configuration
-// =============================================================================
 
 /// TLS material for hive control-plane and servlet identity.
 ///
@@ -389,18 +367,17 @@ impl core::fmt::Debug for HiveTlsConfig {
 	}
 }
 
-// =============================================================================
-// Intra-Hive Communication
-// =============================================================================
+/// Reply future of an intra-hive call. Resolves to the sibling
+/// servlet's complete reply [`Frame`]. A servlet answering with no
+/// frame is `MissingResponse`.
+pub type CallFuture<'a> = Pin<Box<dyn Future<Output = Result<Frame, TightBeamError>> + Send + 'a>>;
 
-/// Type alias for async call result
-pub type CallFuture<'a> = Pin<Box<dyn core::future::Future<Output = Result<Vec<u8>, TightBeamError>> + Send + 'a>>;
-
-/// Unary reply future of a streamed intra-hive call: resolves once the
-/// sibling servlet answers the stream's trailer. Yields the reply's
-/// message bytes, the same shape as [`HiveContext::call`]; a servlet
-/// answering with no frame is `MissingResponse`.
-pub type StreamResponseFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, TightBeamError>> + Send>>;
+/// Unary reply future of a streamed intra-hive call. Resolves once the
+/// sibling servlet answers the stream's trailer. Yields the servlet's
+/// complete trailer reply [`Frame`], the same shape as
+/// [`HiveContext::call`] and the cluster plane's `open_stream_to`
+/// guarantee. A servlet answering with no frame is `MissingResponse`.
+pub type StreamResponseFuture = Pin<Box<dyn Future<Output = Result<Frame, TightBeamError>> + Send>>;
 
 /// Future resolving to a streamed intra-hive call's producer half: the
 /// [`RequestSink`] plus the [`StreamResponseFuture`] for the reply.
@@ -419,28 +396,83 @@ pub type DuplexOpenFuture<'a> =
 /// a KeyManager servlet that provides encryption/decryption services
 /// to other servlets in the hive.
 ///
+/// Every verb is envelope-preserving. The caller's complete [`Frame`]
+/// travels to the sibling unmodified, and the sibling's complete reply
+/// frame travels back unmodified. Callers compose their own envelope
+/// with [`compose!`](crate::compose), sign it when the sibling is
+/// signature-gated, and verify or decode the reply themselves.
+///
 /// # Example
 ///
-/// ```ignore
-/// // In a servlet handler:
-/// if let Some(ctx) = config.hive_context() {
-///     let decrypted = ctx.call(&KEYMANAGER_URN, encrypt_request).await?;
-/// }
+/// The caller owns the whole exchange: compose the envelope, sign it,
+/// send it through [`HiveContext::call`], then verify and decode the
+/// sibling's reply. The stand-in sibling here answers with a signed
+/// echo, so the example runs without a live hive.
+///
+/// ```
+/// # use sha3::Sha3_256;
+/// # use tightbeam::builder::{frame::FrameBuilder, TypeBuilder};
+/// # use tightbeam::colony::hive::{CallFuture, HiveContext};
+/// # use tightbeam::crypto::key::Secp256k1KeyProvider;
+/// # use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
+/// # use tightbeam::testing::{create_test_signing_key, TestMessage};
+/// # use tightbeam::utils::urn::Urn;
+/// # use tightbeam::{decode, Frame, TightBeamError, Version};
+/// #
+/// # struct EchoSibling;
+/// #
+/// # impl HiveContext for EchoSibling {
+/// #     fn call<'a>(&'a self, _servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a> {
+/// #         Box::pin(async move {
+/// #             let echoed: TestMessage = decode(&frame.message)?;
+/// #             let unsigned = FrameBuilder::from(Version::V0).with_id(b"km-reply").with_message(echoed).build()?;
+/// #             let provider = Secp256k1KeyProvider::from(create_test_signing_key());
+/// #             unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+/// #         })
+/// #     }
+/// # }
+/// #
+/// # fn main() -> Result<(), TightBeamError> {
+/// # let runtime = tokio::runtime::Builder::new_current_thread().build().expect("doctest runtime");
+/// # runtime.block_on(async {
+/// # let ctx = EchoSibling;
+/// # let keymanager_urn = Urn::new("tightbeam", "servlet:keymanager");
+/// # let sibling_key = create_test_signing_key();
+/// let caller_provider = Secp256k1KeyProvider::from(create_test_signing_key());
+///
+/// let unsigned = FrameBuilder::from(Version::V0)
+///     .with_id(b"km-decrypt")
+///     .with_message(TestMessage { content: "unwrap key 7".into() })
+///     .build()?;
+/// let request = unsigned.sign_with_provider::<Sha3_256, _>(&caller_provider).await?;
+///
+/// let reply = ctx.call(&keymanager_urn, request).await?;
+///
+/// // The reply is the sibling's complete envelope: verify, then decode.
+/// reply.verify::<Secp256k1Signature, Sha3_256>(sibling_key.verifying_key())?;
+/// let response: TestMessage = decode(&reply.message)?;
+/// assert_eq!(response.content, "unwrap key 7");
+/// # Ok::<(), TightBeamError>(())
+/// # })
+/// # }
 /// ```
 pub trait HiveContext: Send + Sync {
-	/// Call a sibling servlet by type URN and get a response.
+	/// Call a sibling servlet with a complete, caller-built [`Frame`]
+	/// and get the servlet's complete reply frame.
+	///
+	/// The frame emits as-is, so a `nonrepudiation` signature the caller
+	/// applied stays verifiable at the servlet. The reply is the
+	/// servlet's complete envelope. Callers verify it with
+	/// [`Frame::verify`] before trusting the message body. A servlet
+	/// answering with no frame is `MissingResponse`.
 	///
 	/// # Arguments
 	/// * `servlet_type` - Type URN of the target servlet (e.g.,
 	///   `urn:tightbeam::servlet:keymanager`)
-	/// * `request` - The serialized request message
-	///
-	/// # Returns
-	/// * `Ok(Vec<u8>)` - The serialized response from the target servlet
-	/// * `Err(TightBeamError)` - If the servlet is not found or the call fails
-	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, request: Vec<u8>) -> CallFuture<'a>;
+	/// * `frame` - The complete command frame to deliver unmodified
+	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a>;
 
-	/// Open a request stream to a sibling servlet: push chunks through the
+	/// Open a request stream to a sibling servlet. Push chunks through the
 	/// [`RequestSink`], then await the returned response future for the
 	/// servlet's unary reply. Requires a multiplex-negotiated connection.
 	///
@@ -451,7 +483,7 @@ pub trait HiveContext: Send + Sync {
 		Box::pin(async { Err(unimplemented_error()) })
 	}
 
-	/// Open a duplex stream to a sibling servlet: push request chunks
+	/// Open a duplex stream to a sibling servlet. Push request chunks
 	/// through the [`RequestSink`] while the servlet's reply chunks arrive
 	/// on the [`StreamBody`]. Requires a multiplex-negotiated connection.
 	///
@@ -462,35 +494,6 @@ pub trait HiveContext: Send + Sync {
 		Box::pin(async { Err(unimplemented_error()) })
 	}
 }
-
-/// Type-safe call with automatic encode/decode.
-///
-/// Encodes the request, calls the sibling servlet, and decodes the response.
-/// The request type must implement `der::Encode`, and the response type must
-/// implement `der::Decode` for owned data.
-///
-/// This is a free function rather than a trait method to maintain dyn-compatibility
-/// of [`HiveContext`], allowing it to be used as `Arc<dyn HiveContext>`.
-pub fn call_typed<'a, Req, Resp>(
-	ctx: &'a (dyn HiveContext + Sync),
-	servlet_type: &'a Urn<'a>,
-	request: &Req,
-) -> Pin<Box<dyn Future<Output = Result<Resp, TightBeamError>> + Send + 'a>>
-where
-	Req: der::Encode,
-	Resp: for<'de> der::Decode<'de> + Send + 'a,
-{
-	let req_result = crate::encode(request);
-	Box::pin(async move {
-		let req_bytes = req_result?;
-		let resp_bytes = ctx.call(servlet_type, req_bytes).await?;
-		crate::decode(&resp_bytes)
-	})
-}
-
-// =============================================================================
-// Hive Configuration
-// =============================================================================
 
 /// Auto-scale evaluation cadence and per-type overrides.
 #[derive(Clone, Debug)]
@@ -636,10 +639,6 @@ impl Default for HiveConfig {
 	}
 }
 
-// =============================================================================
-// Macro (included from macros.rs)
-// =============================================================================
-
-// The hive! macro is defined in macros.rs and exported via #[macro_export]
+// The hive! macro is defined in macros.rs and exported via #[macro_export].
 #[path = "macros.rs"]
 mod macros_impl;

@@ -2,10 +2,6 @@
 
 use super::common::*;
 
-// ============================================================================
-// Multi-Instance Topology: Load Balancer Wiring
-// ============================================================================
-
 /// Shared fixture for the topology scenarios: gateway certs plus the
 /// selection set the [`RecordingBalancer`] populates. The scenario
 /// reduces the set to a `BALANCER_SPREAD` boolean event the spec pins.
@@ -64,9 +60,10 @@ fn topology_cluster_conf(
 }
 
 /// Register two live ping servlets as instances of one type and route
-/// `routes` work requests through the gateway. Every response status is
-/// recorded as a valued event the spec asserts against
-/// [`TransitStatus::Ok`].
+/// `routes` work requests through the gateway. Every submission must
+/// serve a response frame, which proves the gateway reported
+/// [`TransitStatus::Ok`], and that status is recorded as a valued event
+/// for the spec.
 async fn drive_topology_routes(
 	trace: &TraceCollector,
 	ctx: &TopologyCtx,
@@ -97,9 +94,8 @@ async fn drive_topology_routes(
 
 	for round in 0..routes {
 		let id = format!("topo-work-{round}");
-		let routed = emit_ping_work(&mut client, id.as_bytes()).await?;
-		let value = routed.status;
-		trace.event_with(TOPOLOGY_ROUTE_STATUS, &[], value)?;
+		emit_ping_work(&mut client, &ctx.certs.key, id.as_bytes()).await?;
+		trace.event_with(TOPOLOGY_ROUTE_STATUS, &[], TransitStatus::Ok)?;
 	}
 
 	servlet_a.stop();
@@ -108,9 +104,9 @@ async fn drive_topology_routes(
 }
 
 /// Drive `routes` requests and record whether the strategy selected both
-/// instances as `BALANCER_SPREAD`. Shared by every topology scenario so
-/// they differ only in strategy and volume; the offer widths travel as
-/// `BALANCER_OFFERED` events the spec value-asserts.
+/// instances as `BALANCER_SPREAD`. Every topology scenario shares this
+/// helper, so they differ only in strategy and volume. The offer widths
+/// travel as `BALANCER_OFFERED` events the spec value-asserts.
 async fn record_topology_spread(
 	trace: &TraceCollector,
 	ctx: &TopologyCtx,

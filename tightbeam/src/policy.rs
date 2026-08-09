@@ -22,7 +22,7 @@ use crate::x509::Certificate;
 /// Transport response status codes.
 ///
 /// The gRPC canonical status registry (`google.rpc.Code`), adopted
-/// verbatim so wire values match the registry.
+/// as-is so wire values match the registry.
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransitStatus {
@@ -30,8 +30,8 @@ pub enum TransitStatus {
 	Ok = 0,
 	/// The caller cancelled the operation.
 	Cancelled = 1,
-	/// Unclassified failure. Never a valid gate verdict: evaluation
-	/// normalizes it to [`TransitStatus::Internal`].
+	/// Unclassified failure. It is never a valid gate verdict, so
+	/// evaluation normalizes it to [`TransitStatus::Internal`].
 	#[default]
 	Unknown = 2,
 	/// The request is malformed regardless of system state.
@@ -44,7 +44,7 @@ pub enum TransitStatus {
 	AlreadyExists = 6,
 	/// The caller is identified but refused authorization.
 	PermissionDenied = 7,
-	/// Capacity refusal; retry with backoff may succeed.
+	/// Capacity refusal. A retry with backoff may succeed.
 	ResourceExhausted = 8,
 	/// System state must change before a retry can succeed.
 	FailedPrecondition = 9,
@@ -56,7 +56,7 @@ pub enum TransitStatus {
 	Unimplemented = 12,
 	/// The receiver hit a local fault; nothing was wrong with the request.
 	Internal = 13,
-	/// Transient unavailability; retry with backoff.
+	/// Transient unavailability. Retry with backoff.
 	Unavailable = 14,
 	/// Unrecoverable data loss or corruption.
 	DataLoss = 15,
@@ -106,11 +106,12 @@ impl TransitStatus {
 
 /// Authenticated peer context of one established session.
 ///
-/// The identity facts a gate or request handler may key on: the validated
-/// peer certificate from a mutual-auth handshake and the dual-signed
-/// session receipt when the session is budget-bearing. The empty (default)
-/// context means no authenticated facts: cleartext connections, client-side
-/// emit paths, and in-process evaluation all answer it.
+/// These are the identity facts a gate or request handler may key on,
+/// namely the validated peer certificate from a mutual-auth handshake and
+/// the dual-signed session receipt when the session is budget-bearing.
+/// The empty (default) context means no authenticated facts. Cleartext
+/// connections, client-side emit paths, and in-process evaluation all
+/// answer it.
 ///
 /// On the mux serving path (`serve_mux`) the context is assembled per
 /// invocation with the live receipt, so gates and handlers observe
@@ -163,16 +164,17 @@ impl SessionContext {
 		}
 	}
 
-	/// Validated peer certificate: client identity on a mutual-auth
-	/// server, trust-store-validated server identity on a client.
+	/// Validated peer certificate. On a mutual-auth server this is the
+	/// client identity. On a client it is the trust-store-validated
+	/// server identity.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
 		self.peer_certificate.as_deref()
 	}
 
-	/// DER-encoded `SubjectPublicKeyInfo` of the authenticated peer: the
-	/// stable account key services meter or list against. Encoded once
-	/// at capture; `None` without a peer certificate or when encoding
-	/// failed.
+	/// DER-encoded `SubjectPublicKeyInfo` of the authenticated peer,
+	/// which is the stable account key services meter or list against.
+	/// Encoded once at capture. `None` without a peer certificate or
+	/// when encoding failed.
 	pub fn peer_public_key(&self) -> Option<&[u8]> {
 		self.peer_public_key.as_deref()
 	}
@@ -245,7 +247,6 @@ where
 	fn evaluate(&self, message: &T) -> TransitStatus {
 		let status = self.inner.evaluate(message);
 
-		// Observe the evaluation (transparent)
 		(self.observer)(message, &status);
 
 		status
@@ -261,7 +262,7 @@ impl GatePolicy for AcceptAllGate {
 	}
 }
 
-/// Ordered gate composition: member gates evaluate in insertion order and
+/// Ordered gate composition. Member gates evaluate in insertion order and
 /// the first non-[`TransitStatus::Ok`] verdict decides. An empty chain
 /// accepts, matching [`AcceptAllGate`].
 #[derive(Default)]
@@ -315,7 +316,8 @@ where
 	D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
 {
 	fn evaluate(&self, message: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-		// Optional integrity: no request frame means nothing to check.
+		// Integrity is optional here, so no request frame means
+		// nothing to check.
 		let Some(message) = message else {
 			return TransitStatus::Ok;
 		};
@@ -330,7 +332,7 @@ where
 /// Middleware wrapper for gate policies that observes evaluations.
 ///
 /// Wraps any `GatePolicy` and calls a closure with the evaluation result.
-/// The middleware is transparent - it passes through the gate's decision
+/// The middleware is transparent and passes through the gate's decision
 /// unchanged.
 #[derive(Debug, Clone)]
 pub struct GateMiddleware<G: GatePolicy, F>
@@ -362,7 +364,6 @@ where
 	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		let status = self.inner.evaluate(message, session);
 
-		// Observe the evaluation (transparent)
 		(self.observer)(message, &status);
 
 		status

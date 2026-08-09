@@ -12,7 +12,7 @@ use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{MessageCollector, MessageEmitter, PersistentConnection, Protocol, X509ClientConfig};
 use crate::utils::urn::Urn;
-use crate::{Frame, Metadata, TightBeamError, Version};
+use crate::{Frame, TightBeamError};
 
 /// Instance or type key to shared servlet address bytes.
 type AddressMap = HashMap<Vec<u8>, Arc<[u8]>>;
@@ -27,7 +27,7 @@ pub struct HiveContextImpl<P: Protocol> {
 }
 
 impl<P: Protocol> HiveContextImpl<P> {
-	/// Empty maps bound to the hive servlet pool.
+	/// Creates empty maps bound to the hive servlet pool.
 	pub fn new(pool: Arc<ConnectionPool<P>>) -> Self {
 		Self {
 			servlet_addresses: Arc::new(RwLock::new(HashMap::new())),
@@ -36,7 +36,8 @@ impl<P: Protocol> HiveContextImpl<P> {
 		}
 	}
 
-	/// Record an instance route; first registration per type wins the index.
+	/// Record an instance route. The first registration per type wins
+	/// the index.
 	///
 	/// `addr` moves into the instance map. The type index takes an extra
 	/// [`Arc`] handle only when the type is new (refcount bump, not a byte
@@ -47,7 +48,8 @@ impl<P: Protocol> HiveContextImpl<P> {
 		};
 
 		if let Ok(mut type_idx) = self.type_index.write() {
-			// Arc::clone: share the same address bytes in the type index.
+			// The type index shares the same address bytes rather than
+			// copying them.
 			type_idx.entry(type_bytes.to_vec()).or_insert_with(|| Arc::clone(&addr));
 		}
 
@@ -87,26 +89,6 @@ impl<P: Protocol> HiveContextImpl<P> {
 		}
 	}
 
-	fn build_frame(id: &[u8], message: Vec<u8>) -> Frame {
-		Frame {
-			version: Version::V0,
-			metadata: Metadata {
-				id: id.to_vec(),
-				order: 0,
-				compactness: None,
-				integrity: None,
-				confidentiality: None,
-				priority: None,
-				lifetime: None,
-				previous_frame: None,
-				matrix: None,
-			},
-			message,
-			integrity: None,
-			nonrepudiation: None,
-		}
-	}
-
 	fn resolve_addr(&self, servlet_type: &Urn<'_>) -> Result<P::Address, TightBeamError>
 	where
 		P::Address: core::str::FromStr,
@@ -135,18 +117,14 @@ where
 		+ Sync
 		+ 'static,
 {
-	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, request: Vec<u8>) -> CallFuture<'a> {
+	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a> {
 		Box::pin(async move {
 			let addr = self.resolve_addr(servlet_type)?;
 			let mut pooled_conn = self.pool.connect(addr).await?;
-			let frame = Self::build_frame(b"hive-call", request);
+			// The caller's frame emits as-is so an applied nonrepudiation
+			// signature stays verifiable at the servlet.
 			let response = pooled_conn.emit(frame, None).await?;
-			let message = match response {
-				Some(mut frame) => core::mem::take(&mut frame.message),
-				None => return Err(TightBeamError::MissingResponse),
-			};
-
-			Ok(message)
+			response.ok_or(TightBeamError::MissingResponse)
 		})
 	}
 
@@ -156,16 +134,12 @@ where
 			let pooled_conn = self.pool.connect(addr).await?;
 			let (sink, response) = pooled_conn.open_stream()?;
 
-			// The lease returns to the pool here; the sink and response live
-			// on the shared mux plane independently.
+			// The lease returns to the pool here. The sink and response live
+			// on the shared mux plane independently. The pool-level future
+			// already yields the servlet's complete trailer reply frame.
 			let response: StreamResponseFuture = Box::pin(async move {
 				let reply = response.await?;
-				let message = match reply {
-					Some(mut frame) => core::mem::take(&mut frame.message),
-					None => return Err(TightBeamError::MissingResponse),
-				};
-
-				Ok(message)
+				reply.ok_or(TightBeamError::MissingResponse)
 			});
 
 			Ok((sink, response))

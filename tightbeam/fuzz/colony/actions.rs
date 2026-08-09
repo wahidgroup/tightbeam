@@ -24,7 +24,7 @@ use tightbeam::transport::multiplex::RequestSink;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, PooledClient, Protocol};
 use tightbeam::utils::urn::Urn;
-use tightbeam::{encode, Frame, TightBeamError};
+use tightbeam::{Frame, TightBeamError};
 
 use crate::control::{advertise_peer_at, advertise_peer_types, CONTROL_ORDER_BASE};
 use crate::csr::{CsrRequest, CsrResponse};
@@ -158,8 +158,8 @@ fn pick_org_ref(topo: &ColonyTopology, idx: u8) -> &OrgNode {
 	}
 }
 
-/// Owned copy of the fixture-encoded SPKI DER for APIs that take
-/// ownership (ACL mutation, CSR payloads).
+/// Fixture-encoded SPKI DER borrowed from the identity bundle. Callers
+/// that need ownership (ACL mutation, CSR payloads) copy it themselves.
 fn org_spki(org: &OrgNode) -> &[u8] {
 	org.certs.spki.as_ref()
 }
@@ -265,12 +265,21 @@ pub(crate) fn is_authz_status(status: TransitStatus) -> bool {
 	matches!(status, TransitStatus::PermissionDenied | TransitStatus::Unauthenticated)
 }
 
+/// Build the client's end-to-end work frame around a typed ping request.
+///
+/// Gateways deliver this frame to the servlet, so the fuzz harness exercises
+/// the same frame-in-frame contract as real clients.
+fn inner_ping_frame() -> Result<Frame, TightBeamError> {
+	compose! { V0: id: "colony-fuzz-inner", order: 0u64, message: PingRequest { value: 21 } }
+}
+
 fn classify_work_message(message: &[u8], payload_ok: impl FnOnce(&[u8]) -> bool) -> AuthzClass {
 	match decode::<ClusterWorkResponse>(&message) {
-		Ok(ClusterWorkResponse { status: TransitStatus::Ok, payload: Some(payload) }) if payload_ok(&payload) => {
-			AuthzClass::Success
-		}
-		Ok(ClusterWorkResponse { status, .. }) if is_authz_status(status) => AuthzClass::AuthzDenied,
+		Ok(response) if response.status == TransitStatus::Ok => match response.into_frame() {
+			Ok(Some(frame)) if payload_ok(&frame.message) => AuthzClass::Success,
+			Ok(_) | Err(_) => AuthzClass::InfraFail,
+		},
+		Ok(response) if is_authz_status(response.status) => AuthzClass::AuthzDenied,
 		Ok(_) | Err(_) => AuthzClass::InfraFail,
 	}
 }
@@ -278,7 +287,7 @@ fn classify_work_message(message: &[u8], payload_ok: impl FnOnce(&[u8]) -> bool)
 /// Compare a shadow prediction against the wire outcome and emit the
 /// outcome plus any oracle divergence.
 ///
-/// Only `Allow`/`Deny` participate in the oracle: a predicted `Deny` that
+/// Only `Allow`/`Deny` participate in the oracle. A predicted `Deny` that
 /// the wire allowed is a `SHADOW_VIOLATION`, and a predicted `Allow` that
 /// the wire refused is `SHADOW_TOO_CLOSED`. `Unmodeled` skips both
 /// directions while the plain outcome event still emits.
@@ -427,7 +436,7 @@ async fn emit_work(trace: &TraceCollector, org: &OrgNode, selector: u8, order: &
 	let relayed = selector & 0x80 != 0;
 	let predicted = shadow_predict(org, &target, Some(&org.certs), relayed);
 
-	let mut request = ClusterWorkRequest::new(target.clone(), encode(&PingRequest { value: 21 })?);
+	let mut request = ClusterWorkRequest::new(target.clone(), &inner_ping_frame()?)?;
 	if relayed {
 		request = request.into_relayed(1);
 	}
@@ -471,6 +480,7 @@ async fn submit_csr(
 		colony: colony_urn(org.name).to_string(),
 		cn: format!("csr-{}", selector),
 	};
+	let inner = compose! { V0: id: "colony-fuzz-csr-inner", order: 0u64, message: req }?;
 
 	emit_cluster_work(
 		trace,
@@ -478,7 +488,7 @@ async fn submit_csr(
 		Some(&org.certs),
 		order,
 		ClusterWork {
-			request: ClusterWorkRequest::new(target, encode(&req)?),
+			request: ClusterWorkRequest::new(target, &inner)?,
 			frame_id: "colony-fuzz-csr",
 			predicted,
 			ok: events::CSR_ISSUED,
@@ -548,12 +558,12 @@ async fn advertise_live_peer(
 
 /// Drive the peer-advertisement deny path with `Prediction::Deny`.
 ///
-/// Two hostile shapes selected by the oracle byte: an advertisement
-/// signed by an identity outside the receiver's peer-trust set, and a
-/// replayed `control_order`. The freshness/replay stage is not modeled
-/// by the shadow (see [`crate::shadow`]), so the replay case asserts
-/// `Deny` only when the priming advertisement landed; each expects the
-/// wire to refuse into `PEER_AD_DENIED`, never `SHADOW_VIOLATION`.
+/// The oracle byte selects one of two hostile shapes, either an
+/// advertisement signed by an identity outside the receiver's peer-trust
+/// set or a replayed `control_order`. The freshness/replay stage is not
+/// modeled by the shadow (see [`crate::shadow`]), so the replay case
+/// asserts `Deny` only when the priming advertisement landed. Each shape
+/// expects the wire to refuse into `PEER_AD_DENIED`, never `SHADOW_VIOLATION`.
 async fn negative_peer_ad(
 	trace: &TraceCollector,
 	topo: &mut ColonyTopology,
@@ -563,9 +573,9 @@ async fn negative_peer_ad(
 	let types = vec![advertised_type(selector)];
 
 	if selector & 1 == 0 {
-		// Untrusted signer: alpha signs an advertisement to its own
-		// gateway, but alpha is not in alpha's peer-trust set, so the
-		// peer-origin check refuses. The shadow agrees: Deny.
+		// Untrusted signer shape. Alpha signs an advertisement to its
+		// own gateway, but alpha is not in alpha's peer-trust set, so
+		// the peer-origin check refuses. The shadow agrees with Deny.
 		let order = *control_order;
 
 		*control_order += 1;
@@ -575,7 +585,7 @@ async fn negative_peer_ad(
 
 		record_authz_oracle(trace, predicted, class, events::PEER_AD_OK, events::PEER_AD_DENIED)
 	} else {
-		// Replayed control order: a first legitimate advertisement
+		// Replayed control order shape. A first legitimate advertisement
 		// primes the replay guard, then the same signer resends at the
 		// same order. The replay guard refuses the duplicate signature.
 		let order = *control_order;
@@ -591,7 +601,7 @@ async fn negative_peer_ad(
 
 		// A prime that did not land leaves the replay guard unprimed,
 		// so the resend is fresh on the wire and may legitimately
-		// succeed; only a landed prime makes the duplicate order a
+		// succeed. Only a landed prime makes the duplicate order a
 		// modeled `Deny`.
 		let replay_predicted = if prime_class == AuthzClass::Success {
 			Prediction::Deny
@@ -630,7 +640,7 @@ async fn cross_org_work(
 	let gamma_hop = shadow_predict(&topo.gamma, &target, Some(&topo.alpha.certs), true);
 	let predicted = compose_path([dial_hop, beta_hop, gamma_hop]);
 
-	let mut request = ClusterWorkRequest::new(target, encode(&PingRequest { value: 21 })?);
+	let mut request = ClusterWorkRequest::new(target, &inner_ping_frame()?)?;
 	if relayed {
 		request = request.into_relayed(1);
 	}
@@ -780,7 +790,7 @@ async fn hostile_anon_work(
 		None,
 		order,
 		ClusterWork {
-			request: ClusterWorkRequest::new(target, encode(&PingRequest { value: 21 })?),
+			request: ClusterWorkRequest::new(target, &inner_ping_frame()?)?,
 			frame_id: "colony-fuzz-anon",
 			predicted,
 			ok: events::WORK_OK,
@@ -815,7 +825,7 @@ async fn hostile_foreign_work(
 	// (validators are configured), so the boundary classifies that
 	// certificate, not an anonymous session. Predict with it.
 	let predicted = shadow_predict(pick_org_ref(topo, dial_idx), &target, Some(&identity), false);
-	let request = ClusterWorkRequest::new(target, encode(&PingRequest { value: 21 })?);
+	let request = ClusterWorkRequest::new(target, &inner_ping_frame()?)?;
 
 	emit_cluster_work(
 		trace,

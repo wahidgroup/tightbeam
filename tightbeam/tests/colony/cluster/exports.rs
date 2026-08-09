@@ -85,7 +85,7 @@ fn mtls_split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> Clus
 
 /// Exporter with a static export list and no advertise beat.
 ///
-/// Used by the stream-boundary scenario, which injects route claims by hand.
+/// Used by the stream-boundary scenario, which injects route claims directly.
 fn exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported: Vec<Urn<'static>>) -> ClusterConfig {
 	ClusterConfig::builder(split_plane_tls(own, peer))
 		.with_exported_types(exported)
@@ -122,8 +122,8 @@ fn exporter_conf_with_gate(
 ///
 /// Used by the ad-filter scenario, where discoverability itself is under
 /// test. The grant proves the slate stays filtered even when a caller is
-/// granted an unexported type: grants are per-session and never mint into
-/// ads.
+/// granted an unexported type, because grants are per-session and never
+/// enter ads.
 fn advertising_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
@@ -230,14 +230,14 @@ async fn start_split_stream_hive(
 async fn record_echo(
 	trace: &TraceCollector,
 	client: &mut GenericClient<TokioListener>,
+	key: &Secp256k1SigningKey,
 	type_name: &str,
 	id: &[u8],
 	marker: Urn<'static>,
 ) -> Result<(), TightBeamError> {
 	trace.event(WORK_SENT)?;
-	let response = emit_typed_work(client, type_name, id).await?;
-	let payload = response.payload.ok_or(TightBeamError::MissingResponse)?;
-	let ping_response: PingResponse = decode(&payload)?;
+	let servlet_frame = emit_typed_work(client, key, type_name, id).await?;
+	let ping_response = decode_ping_echo(&servlet_frame)?;
 	trace.event_with(marker, &[], u64::from(ping_response.doubled))?;
 	Ok(())
 }
@@ -278,11 +278,10 @@ tb_assert_spec! {
 //
 // The beat advertises only the exported slate. The exporter serves "ping"
 // and "ledger" but exports "ping" alone, while a grant opens "ledger" to
-// B's key. Every beat frame (direct ad and slate rumor) carries the
-// filtered slate, so the observer installs exactly one ping trail and zero
-// ledger trails: the grant never mints into ads. One ad carries the whole
-// slate, so once ping is installed the ledger absence is decisive, not a
-// race.
+// B's key. Every beat frame (direct ad and slate rumor) carries the filtered
+// slate, so the observer installs exactly one ping trail and zero ledger
+// trails. The grant never enters ads. One ad carries the whole slate, so
+// once ping is installed the ledger absence is decisive, not a race.
 tb_scenario! {
 	name: cluster_export_list_filters_advertised_slate,
 	spec: ClusterExportAdFilterSpec,
@@ -383,19 +382,21 @@ tb_scenario! {
 			let mut client_b = connect_cluster(&ctx.b, gateway_b.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let relayed_denied = emit_typed_work(&mut client_b, "ledger", b"export-relayed-work").await?;
-			trace.event_with(EXPORT_DENIED_STATUS, &[], relayed_denied.status)?;
+			let refused_work = emit_typed_work(&mut client_b, &ctx.b.key, "ledger", b"export-relayed-work").await;
+			let relayed_denied = work_refusal_status(refused_work)?;
+			trace.event_with(EXPORT_DENIED_STATUS, &[], relayed_denied)?;
 
-			record_echo(&trace, &mut client_b, "ping", b"export-peer-work", EXPORT_PEER_ECHOED).await?;
+			record_echo(&trace, &mut client_b, &ctx.b.key, "ping", b"export-peer-work", EXPORT_PEER_ECHOED).await?;
 
 			let mut peer_direct = connect_with_identity(Arc::clone(&ctx.a.trust), &ctx.b, gateway_a.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let identity_denied = emit_typed_work(&mut peer_direct, "ledger", b"export-identity-work").await?;
-			trace.event_with(EXPORT_DENIED_STATUS, &[], identity_denied.status)?;
+			let refused_work = emit_typed_work(&mut peer_direct, &ctx.b.key, "ledger", b"export-identity-work").await;
+			let identity_denied = work_refusal_status(refused_work)?;
+			trace.event_with(EXPORT_DENIED_STATUS, &[], identity_denied)?;
 
 			let mut client_a = connect_with_identity(Arc::clone(&ctx.a.trust), &ctx.a, gateway_a.addr()).await?;
-			record_echo(&trace, &mut client_a, "ledger", b"export-local-work", EXPORT_LOCAL_ECHOED).await?;
+			record_echo(&trace, &mut client_a, &ctx.a.key, "ledger", b"export-local-work", EXPORT_LOCAL_ECHOED).await?;
 
 			gateway_b.stop();
 			gateway_a.stop();
@@ -474,13 +475,14 @@ tb_scenario! {
 			.await?;
 
 			let mut client_b = connect_cluster(&ctx.b, gateway_b.addr()).await?;
-			record_echo(&trace, &mut client_b, "ledger", b"export-grant-work", EXPORT_GRANT_ECHOED).await?;
+			record_echo(&trace, &mut client_b, &ctx.b.key, "ledger", b"export-grant-work", EXPORT_GRANT_ECHOED).await?;
 
 			let mut client_c = connect_with_identity(Arc::clone(&ctx.a.trust), &ctx.c, gateway_a.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let ungranted_denied = emit_typed_work(&mut client_c, "ledger", b"export-ungranted-work").await?;
-			trace.event_with(EXPORT_DENIED_STATUS, &[], ungranted_denied.status)?;
+			let refused_work = emit_typed_work(&mut client_c, &ctx.c.key, "ledger", b"export-ungranted-work").await;
+			let ungranted_denied = work_refusal_status(refused_work)?;
+			trace.event_with(EXPORT_DENIED_STATUS, &[], ungranted_denied)?;
 
 			gateway_b.stop();
 			gateway_a.stop();
@@ -675,11 +677,12 @@ tb_scenario! {
 			let mut client_b = connect_cluster(&ctx.b, gateway_b.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let denied = emit_typed_work(&mut client_b, "ping", b"gate-denied-work").await?;
-			trace.event_with(EXPORT_DENIED_STATUS, &[], denied.status)?;
+			let refused_work = emit_typed_work(&mut client_b, &ctx.b.key, "ping", b"gate-denied-work").await;
+			let denied = work_refusal_status(refused_work)?;
+			trace.event_with(EXPORT_DENIED_STATUS, &[], denied)?;
 
 			let mut client_a = connect_with_identity(Arc::clone(&ctx.a.trust), &ctx.a, gateway_a.addr()).await?;
-			record_echo(&trace, &mut client_a, "ping", b"gate-local-work", EXPORT_LOCAL_ECHOED).await?;
+			record_echo(&trace, &mut client_a, &ctx.a.key, "ping", b"gate-local-work", EXPORT_LOCAL_ECHOED).await?;
 
 			gateway_b.stop();
 			gateway_a.stop();

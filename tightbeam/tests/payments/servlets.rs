@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use sha3::Sha3_256;
 use tightbeam::asn1::MessagePriority;
 use tightbeam::crypto::aead::Aes256Gcm;
 use tightbeam::crypto::ecies::{decrypt as ecies_decrypt, EciesPublicKeyOps, Secp256k1EciesMessage};
@@ -36,15 +37,12 @@ use super::messages::{
 	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,
 };
 
-// ============================================================================
-// Priority Calculation
-// ============================================================================
-
-/// Calculate message priority based on transaction amount
+/// Calculates the message priority from the transaction amount.
 ///
-/// High-value transactions (> 100,000 quanta normalized to USD) get Expedited priority.
+/// High-value transactions (over 100,000 quanta normalized to USD) get
+/// Expedited priority.
 pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
-	// Normalize to USD-equivalent quanta (rough approximation)
+	// Normalize to USD-equivalent quanta (rough approximation).
 	let normalized = match &amount.currency {
 		b"JPY" => amount.value / 100,  // ~100 JPY = 1 USD
 		b"KRW" => amount.value / 1300, // ~1300 KRW = 1 USD
@@ -62,20 +60,13 @@ pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 	}
 }
 
-// ============================================================================
-// Authorization Servlet
-// ============================================================================
-
 servlet! {
 	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
-
-		// Create harness for validation
 		let harness = PaymentHarness::new(Arc::clone(trace));
 
-		// Check for duplicates and return cached response if available
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
 				V2: id: &frame.metadata.id,
@@ -83,12 +74,12 @@ servlet! {
 			}?));
 		}
 
-		// Verify integrity
-		if frame.integrity.is_some() {
-			trace.event_with(INTEGRITY_VERIFIED, &[PAYMENT_TAG], true)?;
-		}
+		// The message-integrity commitment must recompute over the
+		// decrypted transaction body, so this event proves cryptographic
+		// verification of what the client committed to, not presence.
+		let commitment_verified = frame.verify_commitment_of::<Sha3_256, _>(&req, [])?;
+		trace.event_with(INTEGRITY_VERIFIED, &[PAYMENT_TAG], commitment_verified)?;
 
-		// Log currency processing
 		match &req.instructed_amount.currency {
 			b"JPY" => trace.event_with(CURRENCY_JPY_PROCESSED, &[PAYMENT_TAG], true)?,
 			b"USD" => trace.event_with(CURRENCY_USD_PROCESSED, &[PAYMENT_TAG], true)?,
@@ -96,20 +87,16 @@ servlet! {
 			_ => trace.event_with(CURRENCY_OTHER_PROCESSED, &[PAYMENT_TAG], true)?,
 		};
 
-		// Check priority - only emit event for high-value transactions
 		let priority = to_priority(&req.instructed_amount);
 		if priority == MessagePriority::Expedited {
 			trace.event_with(HIGH_VALUE_EXPEDITED, &[PAYMENT_TAG], true)?;
 		}
 
-		// Generate authorization code
 		let auth_code = format!("AUTH{:08X}", req.creation_datetime as u32).into_bytes();
 		let response = TransactionStatus::approved(req.payment_id.to_owned(), auth_code);
 
-		// Cache the response
 		harness.dedup.cache_response(&frame, response.to_owned())?;
 
-		// Authorization approved
 		trace.event_with(AUTHORIZATION_APPROVED, &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
@@ -119,20 +106,13 @@ servlet! {
 	}
 }
 
-// ============================================================================
-// Capture Servlet
-// ============================================================================
-
 servlet! {
 	pub CaptureServlet<CaptureTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
-
-		// Create harness for validation
 		let harness = PaymentHarness::new(Arc::clone(trace));
 
-		// Check for duplicates and return cached response if available
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
 				V2: id: &frame.metadata.id,
@@ -140,28 +120,24 @@ servlet! {
 			}?));
 		}
 
-		// Verify chain linkage (previous_frame should link to authorization)
+		// previous_frame should link back to the authorization frame.
 		if frame.metadata.previous_frame.is_some() {
 			trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
 		} else {
 			trace.event_with(CHAIN_BROKEN, &[PAYMENT_TAG], true)?;
 		}
 
-		// Create payment identification for response
 		let payment_id = PaymentIdentification::new(
 			b"CAPTURE",
 			req.original_end_to_end_id.to_owned(),
 			format!("CAP{}", req.capture_datetime).as_bytes(),
 		);
 
-		// Generate settlement code
 		let settlement_code = format!("SETTLE{:08X}", req.capture_datetime as u32).into_bytes();
 		let response = TransactionStatus::captured(payment_id, settlement_code);
 
-		// Cache the response
 		harness.dedup.cache_response(&frame, response.to_owned())?;
 
-		// Capture completed
 		trace.event_with(CAPTURE_COMPLETED, &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
@@ -171,16 +147,13 @@ servlet! {
 	}
 }
 
-// ============================================================================
-// KeyManager Servlet
-// ============================================================================
-
-/// Wrapper enum for KeyManager requests (public key or decrypt)
+/// Wrapper enum for KeyManager requests, either a public key fetch or a
+/// decrypt.
 #[derive(tightbeam::Beamable, tightbeam::der::Choice, Clone, Debug, PartialEq, Eq)]
 pub enum KeyManagerRequest {
-	/// Request to get the public key
+	/// Request to get the public key.
 	GetPublicKey(GetPublicKeyRequest),
-	/// Request to decrypt ciphertext
+	/// Request to decrypt ciphertext.
 	Decrypt(DecryptRequest),
 }
 
@@ -193,7 +166,6 @@ servlet! {
 
 		match req {
 			KeyManagerRequest::GetPublicKey(_) => {
-				// Return the public key derived from the secret key
 				let response = GetPublicKeyResponse {
 					public_key: secret_key.public_key().to_bytes(),
 				};
@@ -204,11 +176,8 @@ servlet! {
 				}?))
 			}
 			KeyManagerRequest::Decrypt(decrypt_req) => {
-				// Parse the ECIES message from ciphertext bytes
 				let ecies_msg = Secp256k1EciesMessage::from_bytes(&decrypt_req.ciphertext)?;
-				// Decrypt using the secret key
 				let plaintext_secret = ecies_decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(secret_key.as_ref(), &ecies_msg, None)?;
-				// Convert SecretSlice<u8> to Vec<u8>
 				let plaintext = plaintext_secret.to_insecure()?.to_vec();
 				let response = DecryptResponse { plaintext };
 				trace.event_with(KEYMANAGER_DECRYPT_SUCCESS, &[PAYMENT_TAG], true)?;
@@ -220,10 +189,6 @@ servlet! {
 		}
 	}
 }
-
-// ============================================================================
-// Unit Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

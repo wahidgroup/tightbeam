@@ -264,9 +264,8 @@ tb_scenario! {
 			let mut client = connect_cluster(&ctx.a, gateway_a.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let work_response = emit_ping_work(&mut client, b"transitive-work").await?;
-			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-			let ping_response: PingResponse = decode(&payload)?;
+			let servlet_frame = emit_ping_work(&mut client, &ctx.a.key, b"transitive-work").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
 			gateway_a.stop();
@@ -324,7 +323,7 @@ tb_scenario! {
 			beacon_hive.register_with_cluster(gateway_b.addr()).await?;
 
 			// C serves ping at its real address but never advertises on
-			// its own: the test injects both of C's advertisements, so
+			// its own. The test injects both of C's advertisements, so
 			// the dead claim at A can never be repaired by a fresh one.
 			let mut conf_c = federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![], 1);
 			conf_c.peer.advertise_interval = None;
@@ -350,9 +349,8 @@ tb_scenario! {
 			let mut client = connect_cluster(&ctx.a, gateway_a.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let work_response = emit_ping_work(&mut client, b"relay-fallback-work").await?;
-			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-			let ping_response: PingResponse = decode(&payload)?;
+			let servlet_frame = emit_ping_work(&mut client, &ctx.a.key, b"relay-fallback-work").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
 			gateway_a.stop();
@@ -409,7 +407,7 @@ tb_scenario! {
 			beacon_hive.register_with_cluster(gateway_b.addr()).await?;
 
 			// C serves stream-echo at its real address but never
-			// advertises on its own: the test injects both of C's
+			// advertises on its own. The test injects both of C's
 			// advertisements, so the dead claim at A can never be
 			// repaired by a fresh one.
 			let mut conf_c = mux_federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![], 1);
@@ -487,8 +485,8 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let work_response = emit_ping_work(&mut client, b"sentinel-clamp").await?;
-			record_work_status(&trace, &work_response)?;
+			let refused_work = emit_ping_work(&mut client, &certs.key, b"sentinel-clamp").await;
+			record_work_refusal(&trace, refused_work)?;
 
 			cluster.stop();
 			Ok(())
@@ -571,8 +569,8 @@ impl LoadBalancer for DecoyFirstBalancer {
 	}
 }
 
-/// Set the balancer preference. Harness helper: the lock only poisons
-/// after a balancer panic, which fails the scenario anyway.
+/// Sets the balancer preference. The lock only poisons after a balancer
+/// panic, which fails the scenario anyway.
 fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: Vec<u8>) {
 	let mut preferred = cell.lock().expect("preference lock poisons only after a balancer panic");
 	*preferred = Some(key);
@@ -680,9 +678,8 @@ tb_scenario! {
 			let mut client = connect_cluster(&ctx.a, gateway_a.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let work_response = emit_ping_work(&mut client, b"live-decoy-failover").await?;
-			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-			let ping_response: PingResponse = decode(&payload)?;
+			let servlet_frame = emit_ping_work(&mut client, &ctx.a.key, b"live-decoy-failover").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
 			gateway_a.stop();
