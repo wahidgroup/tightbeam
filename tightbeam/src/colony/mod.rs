@@ -1,4 +1,4 @@
-//! Colony framework for distributed servlet orchestration
+//! Colony framework for distributed servlet orchestration.
 //!
 //! This module provides the building blocks for creating distributed message
 //! processing systems:
@@ -15,9 +15,13 @@
 //! - [`servlet`]: Servlet trait and configuration builders
 //! - [`hive`]: Hive trait, configuration, and security gates
 //! - [`cluster`]: Cluster trait, registry, and configuration
+//! - [`client`]: Client-side work submission against a cluster gateway
 
+pub mod client;
 pub mod cluster;
 pub mod common;
 pub mod hive;
 pub mod servlet;
 pub mod worker;
+
+pub use client::SubmitWork;

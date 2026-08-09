@@ -2,26 +2,25 @@
 //!
 //! ## Weakness
 //! A [`SessionReceipt`] is a dual-signed, third-party-verifiable artifact
-//! attesting the budgets granted for a metered session. If the value the
-//! server signs into the receipt is the raw wire request rather than the
-//! value the transport actually enforces, the artifact attests a fact the
-//! system does not implement: enforcement clamps every direction to
-//! [`MAX_MUX_SESSION_BUDGET`] (CWE-770), but the signed receipt would carry
-//! the unclamped request. Both parties then countersign a budget neither
-//! endpoint will honour.
+//! attesting the budgets granted for a metered session. Enforcement clamps
+//! every direction to [`MAX_MUX_SESSION_BUDGET`] (CWE-770). If the server
+//! signs the raw request into the receipt instead of the enforced value,
+//! the artifact attests a fact the system does not implement. Both parties
+//! then countersign a budget neither endpoint will honour.
 //!
 //! ## Attack
 //! A client offers `requested_budgets` far above the enforcement ceiling
 //! against a server with no local budget ceiling configured. The server
-//! grants the request verbatim, signs a receipt over the raw figure, and
-//! the client countersigns. The resulting third-party-verifiable artifact
-//! states a credit volume the session will never admit.
+//! grants the request, signs a receipt over the raw figure, and the client
+//! countersigns. The resulting third-party-verifiable artifact states a
+//! credit volume the session will never admit.
 //!
 //! ## Expected control
 //! The budgets and credit unit bound into the receipt MUST be the same
-//! values the transport enforces: the grant is clamped once, at the choke
-//! point, before it enters both the transcript and the receipt, so wire
-//! accept, receipt body, and enforced budget are byte-identical (SSOT).
+//! values the transport enforces. The grant is clamped once, at the choke
+//! point, before it enters both the transcript and the receipt. The wire
+//! accept, the receipt body, and the enforced budget are then
+//! byte-identical (SSOT).
 //!
 //! ## References
 //! - CWE-770: Allocation of Resources Without Limits or Throttling
@@ -76,7 +75,7 @@ tb_assert_spec! {
 
 // A budget request above the enforcement ceiling must yield a receipt
 // whose budgets equal the values the transport actually enforces, not the
-// raw request: the signed artifact is the single source of truth.
+// raw request. The signed artifact is the single source of truth.
 tb_scenario! {
 	name: receipt_budgets_bound_to_enforcement,
 	spec: ReceiptBudgetClampSpec,
@@ -101,8 +100,8 @@ tb_scenario! {
 
 			trace.event_with(RECEIPT_BUDGETS_WITHIN_CEILING, &[], is_client_to_server_within_ceiling && is_server_to_client_within_ceiling)?;
 
-			// The client's send budget is the client-to-server direction;
-			// its receive budget is the server-to-client direction.
+			// The client's send budget is the client-to-server direction.
+			// Its receive budget is the server-to-client direction.
 			let is_budget_matched = Some(stored.receipt().budgets.client_to_server) == settings.send_budget
 				&& Some(stored.receipt().budgets.server_to_client) == settings.recv_budget;
 			trace.event_with(RECEIPT_MATCHES_ENFORCED_BUDGET, &[], is_budget_matched)?;

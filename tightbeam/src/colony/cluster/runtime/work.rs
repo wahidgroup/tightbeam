@@ -1,4 +1,5 @@
-//! Work routing: select a route, forward payload, update pheromone scores.
+//! Work routing selects a route, forwards the payload, and updates the
+//! pheromone scores.
 
 use core::hash::Hash;
 use core::mem;
@@ -65,7 +66,7 @@ pub(crate) fn balancer_pick<'e>(
 	balancer: &dyn LoadBalancer,
 	entries: &'e [Arc<ServletEntry>],
 ) -> Option<&'e Arc<ServletEntry>> {
-	// The key copy is deliberate: `InstanceMetrics` owns its key so the
+	// The key copy is deliberate. `InstanceMetrics` owns its key so the
 	// public trait stays lifetime-free. See the field documentation.
 	let metrics: Vec<InstanceMetrics> = entries
 		.iter()
@@ -77,13 +78,17 @@ pub(crate) fn balancer_pick<'e>(
 
 /// Select one route for `type_key` over its live pheromone trails.
 ///
-/// A spent relay budget (`hops_remaining == 0`) selects `Local` only.
-/// A live budget selects `Local` and `Peer`, so pheromone prefers
-/// nearby nests while still failing over across the colony. A relay trail
-/// spends one hop at the relay before the owner is reached, so it only
-/// selects when the budget affords at least two forwards. `exclude`
-/// removes one just-failed route key so a bounded retry picks the
-/// next-best trail. `None` means no entry serves the type or the
+/// The relay budget bounds which trail kinds are eligible:
+///
+/// - `hops_remaining == 0` selects `Local` only.
+/// - A live budget selects `Local` and `Peer`, so pheromone prefers
+///   nearby nests while still failing over across the colony.
+/// - A relay trail spends one hop at the relay before the owner is
+///   reached, so it selects only when the budget affords at least two
+///   forwards.
+///
+/// `exclude` removes one just-failed route key so a bounded retry picks
+/// the next-best trail. `None` means no entry serves the type or the
 /// balancer declined, which the caller answers as
 /// [`TransitStatus::Unavailable`].
 pub(crate) fn select_route(
@@ -157,11 +162,8 @@ fn work_trail_fail(
 	reply_frame(&frame.metadata.id, ClusterWorkResponse::err(status))
 }
 
-pub(crate) async fn forward_work<P>(
-	pool: &Arc<ClusterPool<P>>,
-	addr: Arc<[u8]>,
-	payload: Vec<u8>,
-) -> Result<Vec<u8>, ClusterError>
+/// Dial `addr` on `pool`, emit `frame`, and return the reply frame.
+async fn emit_forward<P>(pool: &Arc<ClusterPool<P>>, addr: Arc<[u8]>, frame: Frame) -> Result<Frame, ClusterError>
 where
 	P: Protocol
 		+ PersistentConnection
@@ -183,31 +185,86 @@ where
 	let addr_str = str::from_utf8(&addr).map_err(|_| ClusterError::InvalidAddress(addr.to_vec()))?;
 	let parsed_addr: P::Address = addr_str.parse().map_err(|_| ClusterError::InvalidAddress(addr.to_vec()))?;
 
+	let mut client = pool.connect(parsed_addr).await.map_err(|_| ClusterError::ConnectFailed)?;
+	match client.emit(frame, None).await {
+		Ok(Some(response)) => Ok(response),
+		Ok(None) => Err(ClusterError::NoResponse),
+		Err(e) => Err(ClusterError::from(e)),
+	}
+}
+
+/// Deliver a client's end-to-end frame to a local servlet and return the
+/// servlet's complete reply frame, encoded.
+///
+/// `frame` is the client's frame decoded from
+/// [`ClusterWorkRequest::payload`] and re-emitted as-is. DER is
+/// canonical, so the emitted bytes match what the client signed and the
+/// servlet can verify the envelope end to end. The reply frame returns
+/// encoded whole so the client can verify the servlet's envelope the
+/// same way.
+pub(crate) async fn forward_frame<P>(
+	pool: &Arc<ClusterPool<P>>,
+	addr: Arc<[u8]>,
+	frame: Frame,
+) -> Result<Vec<u8>, ClusterError>
+where
+	P: Protocol
+		+ PersistentConnection
+		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
+		+ Send
+		+ Sync
+		+ 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
+	P::Transport: MessageEmitter
+		+ MessageCollector
+		+ PolicyConfig
+		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
+		+ MuxConnector
+		+ EncryptedProtocolState
+		+ Send
+		+ Sync
+		+ 'static,
+{
+	let response = emit_forward(pool, addr, frame).await?;
+	Ok(encode(&response)?)
+}
+
+/// Emit hop-local bytes under a fresh transport wrapper and return the
+/// reply body.
+///
+/// This is the hop plumbing for messages that are not end-to-end
+/// frames: a re-encoded [`ClusterRequest::Work`] envelope toward a peer
+/// gateway, or a gossip application payload toward an ingress servlet.
+pub(crate) async fn forward_envelope<P>(
+	pool: &Arc<ClusterPool<P>>,
+	addr: Arc<[u8]>,
+	message: Vec<u8>,
+) -> Result<Vec<u8>, ClusterError>
+where
+	P: Protocol
+		+ PersistentConnection
+		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
+		+ Send
+		+ Sync
+		+ 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
+	P::Transport: MessageEmitter
+		+ MessageCollector
+		+ PolicyConfig
+		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
+		+ MuxConnector
+		+ EncryptedProtocolState
+		+ Send
+		+ Sync
+		+ 'static,
+{
 	let mut metadata = Metadata::default();
 	metadata.id = b"work-forward".to_vec();
 
-	let frame = Frame {
-		version: Version::V0,
-		metadata,
-		message: payload,
-		integrity: None,
-		nonrepudiation: None,
-	};
+	let frame = Frame { version: Version::V0, metadata, message, integrity: None, nonrepudiation: None };
 
-	let mut client = pool.connect(parsed_addr).await.map_err(|_| ClusterError::ConnectFailed)?;
-
-	let mut response = match client.emit(frame, None).await {
-		Ok(Some(r)) => r,
-		Ok(None) => {
-			return Err(ClusterError::NoResponse);
-		}
-		Err(e) => {
-			return Err(ClusterError::from(e));
-		}
-	};
-
-	let message = mem::take(&mut response.message);
-	Ok(message)
+	let mut response = emit_forward(pool, addr, frame).await?;
+	Ok(mem::take(&mut response.message))
 }
 
 /// Dial pools one work attempt may use, by trust plane.
@@ -216,8 +273,8 @@ struct WorkPools<'p, P: Protocol> {
 	peer: Option<&'p Arc<ClusterPool<P>>>,
 }
 
-// Manual impls: a derive would demand `P: Copy`, and the fields are
-// references regardless of `P`.
+// These impls are manual because a derive would demand `P: Copy`, and
+// the fields are references regardless of `P`.
 impl<P: Protocol> Clone for WorkPools<'_, P> {
 	fn clone(&self) -> Self {
 		*self
@@ -234,20 +291,32 @@ struct WorkCtx<'c, P: Protocol> {
 	pools: WorkPools<'c, P>,
 }
 
-/// Relayed work envelope for a peer hop: same type and payload, with
-/// one forward spent from the budget.
+/// Builds the relayed work envelope for a peer hop. It carries the same
+/// type and client frame bytes, with one forward spent from the budget.
+///
+/// The struct is constructed literally because the payload is already
+/// the client's encoded frame and travels opaquely. No re-encode
+/// happens at relay hops.
 fn relayed_work(servlet_type: Urn<'static>, payload: Vec<u8>, hops_remaining: u8) -> ClusterWorkRequest {
-	ClusterWorkRequest::new(servlet_type, payload).into_relayed(spend_hop(hops_remaining))
+	ClusterWorkRequest { servlet_type, payload, hops_remaining: spend_hop(hops_remaining) }
 }
 
-/// Forward one selected route: bare payload to a local hive, or a
-/// budget-decremented Work envelope to a peer gateway.
+/// Forward along one selected route. A local servlet receives the
+/// client's frame. A peer gateway receives a budget-decremented Work
+/// envelope.
+///
+/// `frame_cache` holds the frame the admission check already decoded
+/// from `payload`. A local forward consumes it, so the admission decode
+/// is the only parse on the first local attempt. A bounded retry that
+/// lands on a second local route decodes again from its retained
+/// payload copy.
 async fn forward_attempt<P>(
 	choice: &RouteChoice,
 	pools: WorkPools<'_, P>,
 	servlet_type: &Urn<'static>,
 	payload: Vec<u8>,
 	hops_remaining: u8,
+	frame_cache: &mut Option<Frame>,
 ) -> Result<Vec<u8>, ClusterError>
 where
 	P: Protocol
@@ -269,16 +338,22 @@ where
 {
 	let dial_addr = Arc::clone(&choice.dial_addr);
 
-	// Local hops carry bare app payload on the hive trust plane.
-	// Peer hops re-enter the peer gateway as Work with the budget
-	// decremented, on the peer trust plane.
+	// Local hops deliver the client's frame on the hive
+	// trust plane. Peer hops re-enter the peer gateway as Work with
+	// the budget decremented, on the peer trust plane.
 	match choice.route_kind {
-		RouteKind::Local => forward_work(pools.hive, dial_addr, payload).await,
+		RouteKind::Local => {
+			let frame = match frame_cache.take() {
+				Some(frame) => frame,
+				None => decode(&payload)?,
+			};
+			forward_frame(pools.hive, dial_addr, frame).await
+		}
 		RouteKind::Peer | RouteKind::PeerRelay => match pools.peer {
 			Some(peer_pool) => {
 				let work = relayed_work(servlet_type.clone(), payload, hops_remaining);
 				let envelope = encode(&ClusterRequest::Work(work))?;
-				forward_work(peer_pool, dial_addr, envelope).await
+				forward_envelope(peer_pool, dial_addr, envelope).await
 			}
 			None => Err(ClusterError::ConnectFailed),
 		},
@@ -290,7 +365,7 @@ where
 /// The response buffer moves in and decodes exactly once, so the
 /// failover check and the settle share one parse.
 enum ForwardOutcome {
-	/// A local hive answered with bare app payload.
+	/// A local servlet answered. The bytes are its encoded reply frame.
 	Local(Vec<u8>),
 	/// A peer gateway answered with a decoded work response.
 	Peer(ClusterWorkResponse),
@@ -313,7 +388,7 @@ impl ForwardOutcome {
 	/// `true` when a live route reported it cannot serve the type.
 	///
 	/// This is the same failover class as a transport fault mapped to
-	/// [`TransitStatus::Unavailable`]: the trail is useless for this
+	/// [`TransitStatus::Unavailable`]. The trail is useless for this
 	/// type right now, and a garbled peer reply proves nothing better.
 	/// Every other refusal relays unchanged so the caller keeps its
 	/// retryability contract.
@@ -326,8 +401,8 @@ impl ForwardOutcome {
 	}
 }
 
-/// Settle an answered forward: reinforce or weaken the trail and
-/// reply to the caller with one envelope.
+/// Settle an answered forward. This reinforces or weakens the trail and
+/// replies to the caller with one envelope.
 fn settle_forward<P>(
 	ctx: &WorkCtx<'_, P>,
 	frame: &Frame,
@@ -414,6 +489,21 @@ where
 		return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::PermissionDenied));
 	}
 
+	// The payload must decode as the client's end-to-end frame. Bytes
+	// that do not are a permanent caller fault, refused before route
+	// selection so one malformed request can never weaken a healthy
+	// pheromone trail, burn the bounded failover retry, or misreport
+	// as a retryable infrastructure fault. The decoded frame is kept
+	// for the first local forward, which re-emits it as-is.
+	let client_frame: Frame = match decode(&request.payload) {
+		Ok(client_frame) => client_frame,
+		Err(_) => {
+			trace.event(CLUSTER_WORK_REFUSED)?;
+			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::InvalidArgument));
+		}
+	};
+	let mut frame_cache = Some(client_frame);
+
 	let ctx = WorkCtx {
 		servlet_registry: &servlet_registry,
 		config: &config,
@@ -452,17 +542,26 @@ where
 			None
 		};
 
-		let forward_result = forward_attempt(&choice, ctx.pools, &servlet_type, attempt_payload, hops_remaining).await;
+		let forward_result = forward_attempt(
+			&choice,
+			ctx.pools,
+			&servlet_type,
+			attempt_payload,
+			hops_remaining,
+			&mut frame_cache,
+		)
+		.await;
 
-		// Pheromone feedback: the outcome steers future selection
-		// toward instances that answer and away from ones that fail.
+		// The outcome feeds the pheromone scores, steering future
+		// selection toward instances that answer and away from ones
+		// that fail.
 		match forward_result {
 			Ok(response_payload) => {
 				let outcome = ForwardOutcome::classify(choice.route_kind, response_payload);
 
 				// A live peer that reports it cannot serve the type
 				// joins the same bounded failover as a transport
-				// fault: weaken the trail and retry the next-best one.
+				// fault. Weaken the trail and retry the next-best one.
 				if outcome.is_unavailable() && excluded.is_none() {
 					if let Some(retry) = retry_payload {
 						work_trail_weaken(&servlet_registry, &choice.route_key, &config, &trace);
@@ -478,7 +577,7 @@ where
 			Err(error) => {
 				let status = forward_failure_status(error);
 
-				// Fast failover: an unavailable trail weakens now and
+				// Fast failover. An unavailable trail weakens now and
 				// the next-best trail gets the single retry.
 				if status == TransitStatus::Unavailable && excluded.is_none() {
 					if let Some(retry) = retry_payload {
@@ -605,7 +704,7 @@ mod tests {
 		assert_eq!(work.hops_remaining, 0);
 	}
 
-	// Pins the on-wire budget: dropping the decrement in `relayed_work`
+	// Pins the on-wire budget. Dropping the decrement in `relayed_work`
 	// fails here even when integration topologies mask it with a clamp.
 	#[test]
 	fn relayed_envelope_carries_the_decremented_budget_on_the_wire() -> Result<(), TightBeamError> {

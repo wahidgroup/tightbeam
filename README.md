@@ -3172,7 +3172,7 @@ First-party recognition requires mutual TLS. The accept plane stores a session c
 
 **Advertisements and peer precedence**
 
-- Advertisements are filtered only by the static `exported_types` list. Custom gates and grants cannot alter ads, because ads are minted per beat rather than per session.
+- Advertisements are filtered only by the static `exported_types` list. Custom gates and grants cannot alter ads, because ads are created per beat rather than per session.
 - Peer membership wins. A certificate in `peer_trust` is never first-party, even when `hive_trust` also holds it, so an identity in both stores cannot escalate to unexported targets.
 - The same precedence guards the hive plane. A control frame whose signer is in `peer_trust` is refused there, so a certificate in both stores cannot register hives.
 
@@ -3216,7 +3216,7 @@ When multiple instances support the same servlet type, the cluster uses a `LoadB
 
 ##### Colony Gossip
 
-Colony gossip floods origin-signed rumors across member gateways: the pheromone broadcast of the swarm. A publisher asks the local gateway to mint a rumor; peers relay and repair until hop budget or freshness expires.
+Colony gossip floods origin-signed rumors across member gateways: the pheromone broadcast of the swarm. A publisher asks the local gateway to create a rumor. Peers relay and repair until hop budget or freshness expires.
 
 ```rust
 let conf = ClusterConfig::builder(tls)
@@ -3232,7 +3232,7 @@ let conf = ClusterConfig::builder(tls)
 
 Flow:
 
-1. **Publish**: A hive-plane signed `PublishGossip` carries `GossipRumor { payload }`. The accepting origin gateway must be a colony member. It mints an origin-signed rumor Frame (id and issue time from the publish frame) and starts the flood.
+1. **Publish**: A hive-plane signed `PublishGossip` carries `GossipRumor { payload }`. The accepting origin gateway must be a colony member. It creates an origin-signed rumor Frame (id and issue time from the publish frame) and starts the flood.
 2. **Relay**: Peers carry `ClusterRequest::Gossip` with an outer relay Frame. Hop radius lives only in the outer `metadata.lifetime`. The inner rumor stays byte-identical under the origin signature. Relays verify on the peer trust plane; the origin colony URN MUST equal the local gateway's colony URN.
 3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice. An application rumor is recorded for repair and delivery retry. A peer advertisement rumor is only witnessed (`GossipJournal::witness`, a required trait method). Its digest deduplicates and breaks flood loops, but the bytes are never retained, repaired, or delivered locally.
 4. **Local ingress**: `GossipConfig.ingress` names a servlet type on the receiving gateway. `None` means journal and reflood only (immediate local ack).
@@ -3243,30 +3243,49 @@ Misbehavior on tampered or lifetime-missing relays weakens peer trails. A foreig
 
 ##### Work Request Flow
 
-Clients interact with clusters through work request messages:
+The unary work plane is request-reply with end-to-end envelopes. The client's complete frame reaches the servlet byte-for-byte, and the servlet's complete response frame comes back the same way. Outer transport frames are hop-local wrappers, so end-to-end signatures, integrity, and previous-frame linkage survive the route in both directions.
 
-1. Client sends `ClusterWorkRequest` with `servlet_type` and encoded `payload`
-2. Cluster looks up Local and Peer routes for that servlet type
-3. Load balancer selects an instance (hive or peer gateway)
-4. Cluster forwards the payload: directly to a local hive, or to a peer gateway with a decremented `hops_remaining` budget
-5. The serving hive processes and returns a response
-6. Cluster wraps the response in `ClusterWorkResponse` and returns it to the client
+1. Client composes its complete end-to-end frame (typed message, plus whatever the message profile requires: signature, integrity, encryption)
+2. Client submits it with `SubmitWork::submit_work_to`, which nests the frame in a `ClusterWorkRequest` under a hop-local transport wrapper
+3. The gateway validates that the payload decodes as a frame (a malformed payload refuses `InvalidArgument` before route selection), then looks up Local and Peer routes for the servlet type
+4. Load balancer selects an instance. A local route delivers the client frame to the servlet byte-for-byte. A peer route re-emits the envelope with a decremented `hops_remaining` budget
+5. The servlet handler receives the client's frame, verifies what it must (`Frame::verify`, `Frame::verify_commitment_of`), and responds with its own complete frame
+6. The gateway returns the servlet's frame unmodified inside `ClusterWorkResponse`. `submit_work_to` resolves it via `ClusterWorkResponse::served`, which yields the frame on success and `TightBeamError::WorkRefused(status)` on refusal
 
 ```rust
-// Client sends (hops_remaining defaults to the u8::MAX origin sentinel):
-let request = ClusterWorkRequest::new(
-	servlet_type_urn, // e.g. urn:tightbeam::servlet:calculator
-	encode(&CalcRequest { value: 42 })?,
-);
+use tightbeam::colony::SubmitWork;
 
-// Client receives:
-let response: ClusterWorkResponse = decode(&frame.message)?;
-match response.status {
-	TransitStatus::Ok => { /* process response.payload */ }
-	TransitStatus::Unavailable => { /* no hive available */ }
-	_ => { /* handle other statuses */ }
-}
+// Sign the end-to-end frame so the servlet can verify the sender.
+let unsigned = compose(Version::V2)
+	.with_id(b"calc-001")
+	.with_order(current_timestamp_ms())
+	.with_message(CalcRequest { value: 42 })
+	.build()?;
+let work = unsigned.sign_with_provider::<Sha3_256, _>(&provider).await?;
+
+// One method call on a connected client: wraps the work frame in the
+// hop-local transport envelope and resolves the gateway's reply down
+// to the servlet's complete response frame.
+let response = client.submit_work_to(calculator_urn, &work).await?;
+
+// The servlet's envelope is verifiable end to end.
+response.verify::<Secp256k1Signature, Sha3_256>(&servlet_public_key)?;
+let result: CalcResponse = decode(&response.message)?;
 ```
+
+A refusal surfaces as `Err(TightBeamError::WorkRefused(status))`. For example, the status is `Unavailable` when no route serves the type, or `InvalidArgument` when the payload is not a frame. Callers that need the raw wire envelope decode `ClusterWorkResponse` themselves and use `into_frame`.
+
+**Plane guarantees**
+
+`submit_work_to` completes the family of routed client methods. All three verbs route by servlet-type URN through the same pheromone trails, hop budget, and gate wall. They differ in what each direction protects:
+
+| Verb             | Request protection                         | Reply protection                                |
+| ---------------- | ------------------------------------------ | ----------------------------------------------- |
+| `submit_work_to` | complete `Frame`, byte-for-byte end to end | complete `Frame` back, byte-for-byte end to end |
+| `open_stream_to` | raw chunks, hop-protected only             | complete `Frame` back (relayed unchanged)       |
+| `open_duplex_to` | raw chunks, hop-protected only             | raw chunks, hop-protected only                  |
+
+Stream chunks are not individually framed or signed. Their integrity rests on transport encryption per hop plus the gateway splice, not on the end-to-end envelope contract of unary work. The terminal reply frame of a routed stream is a complete frame and can carry a signature the client verifies with `Frame::verify`. Work that must be nonrepudiable end to end in both directions belongs on the unary plane.
 
 ##### ClusterConfig Reference
 
@@ -3377,18 +3396,18 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			trace.event(WORK_SENT)?;
 
-			let request = ClusterWorkRequest::new(
-				ping_type(), // urn:tightbeam::servlet:ping
-				encode(&PingRequest { value: 21 })?,
-			);
+			// The end-to-end work frame the servlet receives unmodified.
+			let work = compose! {
+				V0: id: b"work-001", message: PingRequest { value: 21 }
+			}?;
 
+			// submit_work_to wraps the frame in the hop-local transport
+			// envelope and resolves the reply to the servlet's response
+			// frame. A refusal would surface as WorkRefused.
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
-			let response_frame = client.emit(compose! {
-				V0: id: b"work-001", message: ClusterRequest::Work(request)
-			}?, None).await?.ok_or(TightBeamError::MissingResponse)?;
-
-			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
-			assert_eq!(work_response.status, TransitStatus::Ok);
+			let response = client.submit_work_to(ping_type(), &work).await?;
+			let echoed: PingResponse = decode(&response.message)?;
+			assert_eq!(echoed.doubled, 42);
 
 			trace.event(ROUTING_ACCEPTED)?;
 
@@ -3485,7 +3504,7 @@ Runtime values captured under `assert_payload` MUST be transformed before emissi
 - Literal integers MAY be emitted directly as 64-bit unsigned values if they are not sensitive.
 - Structured values SHOULD emit a static schema tag plus digest.
 
-> Warning: Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
+> Warning: Secret or potentially sensitive raw data MUST NOT be emitted.
 
 ### 10.5 Configuration
 

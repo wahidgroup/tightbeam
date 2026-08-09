@@ -1,6 +1,7 @@
-//! Protocol messages for cluster-hive communication
+//! Protocol messages for cluster-hive communication.
 //!
-//! All message types used in the protocol between cluster and hive.
+//! This module defines every message type in the protocol between the
+//! cluster and the hive.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -8,31 +9,33 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-#[cfg(feature = "x509")]
 use crate::asn1::Frame;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
 use crate::utils::urn::Urn;
-use crate::utils::BasisPoints;
+use crate::utils::{decode, encode, BasisPoints};
 use crate::wire::wire_sequence;
-use crate::Beamable;
+use crate::{Beamable, TightBeamError};
 
-// =============================================================================
-// Cluster Inbound Protocol
-// =============================================================================
-
-/// Work request envelope for cluster routing
+/// Work request envelope for cluster routing.
 ///
 /// Clients send this to the cluster gateway. The gateway selects a local
-/// servlet or peer gateway by `servlet_type`, then delivers `payload`.
+/// servlet or peer gateway by `servlet_type`, then delivers the client
+/// frame in `payload` to the servlet byte-for-byte.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ClusterWorkRequest {
-	/// Target servlet type URN (e.g., `urn:tightbeam::servlet:ping`)
+	/// Target servlet type URN (e.g., `urn:tightbeam::servlet:ping`).
 	pub servlet_type: Urn<'static>,
-	/// Raw message payload (encoded inner message)
+	/// DER bytes of the client's complete end-to-end [`Frame`].
+	///
+	/// The frame's `message` is the servlet's typed input. Gateways
+	/// forward these bytes unmodified, so the client's signature,
+	/// integrity, and previous-frame linkage stay verifiable at the
+	/// servlet ([`Frame::verify`]).
 	pub payload: Vec<u8>,
-	/// Relay budget: how many gateway forwards this work may still spend
+	/// The relay budget, counting how many gateway forwards this work
+	/// may still spend.
 	///
 	/// A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel
 	/// ([`ClusterWorkRequest::new`]), which defers the budget to
@@ -52,17 +55,15 @@ wire_sequence!(ClusterWorkRequest {
 });
 
 impl ClusterWorkRequest {
-	/// Origin work from a client: the sentinel budget defers the hop
-	/// cap to the first gateway's `max_hops` policy.
-	///
-	/// `payload` accepts any value convertible into [`Vec<u8>`].
-	#[must_use]
-	pub fn new(servlet_type: Urn<'static>, payload: impl Into<Vec<u8>>) -> Self {
-		Self { servlet_type, payload: payload.into(), hops_remaining: DEFAULT_HOP_BUDGET }
+	/// Builds origin work from a client, nesting the client's complete
+	/// frame as the end-to-end payload. The sentinel budget defers the
+	/// hop cap to the first gateway's `max_hops` policy.
+	pub fn new(servlet_type: Urn<'static>, frame: &Frame) -> Result<Self, TightBeamError> {
+		Ok(Self { servlet_type, payload: encode(frame)?, hops_remaining: DEFAULT_HOP_BUDGET })
 	}
 
 	/// Re-emit toward a peer with the remaining relay budget. A `0`
-	/// budget is the terminal hop: the receiver serves locally only.
+	/// budget is the terminal hop, so the receiver serves locally only.
 	#[must_use]
 	pub fn into_relayed(mut self, hops_remaining: u8) -> Self {
 		self.hops_remaining = hops_remaining;
@@ -70,19 +71,27 @@ impl ClusterWorkRequest {
 	}
 }
 
-/// Work response from cluster
+/// Work response from the cluster.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ClusterWorkResponse {
-	/// Status of the routing/execution
+	/// Status of the routing and execution.
 	pub status: TransitStatus,
-	/// Response payload from servlet (if successful)
+	/// DER bytes of the servlet's complete response [`Frame`] on
+	/// success, absent on refusal.
+	///
+	/// Gateways return the servlet's reply frame unmodified, so its
+	/// signature and metadata stay verifiable at the client
+	/// ([`Frame::verify`]). Decode with
+	/// [`ClusterWorkResponse::into_frame`], or resolve success and
+	/// refusal in one step with [`ClusterWorkResponse::served`].
 	pub payload: Option<Vec<u8>>,
 }
 
 wire_sequence!(ClusterWorkResponse { status: plain, payload: octets_opt });
 
 impl ClusterWorkResponse {
-	/// Create a successful response with payload.
+	/// Create a successful response carrying the servlet's encoded
+	/// response frame.
 	///
 	/// `payload` accepts any value convertible into [`Vec<u8>`].
 	#[inline]
@@ -90,10 +99,36 @@ impl ClusterWorkResponse {
 		Self { status: TransitStatus::Ok, payload: Some(payload.into()) }
 	}
 
-	/// Create an error response with status
+	/// Create an error response with the given status.
 	#[inline]
 	pub fn err(status: TransitStatus) -> Self {
 		Self { status, payload: None }
+	}
+
+	/// Decode the servlet's complete response frame from the payload.
+	///
+	/// Refusals carry no payload and yield `None`. Callers that treat a
+	/// refusal as an error use [`ClusterWorkResponse::served`] instead.
+	pub fn into_frame(self) -> Result<Option<Frame>, TightBeamError> {
+		match self.payload {
+			Some(payload) => Ok(Some(decode(&payload)?)),
+			None => Ok(None),
+		}
+	}
+
+	/// Resolve the response into the servlet's frame or a typed error.
+	///
+	/// The unary work plane is request-reply, so a served request always
+	/// carries the servlet's complete response frame. A non-`Ok` status
+	/// is a refusal and maps to [`TightBeamError::WorkRefused`]. An `Ok`
+	/// status without a payload violates the plane contract and maps to
+	/// [`TightBeamError::MissingResponse`].
+	pub fn served(self) -> Result<Frame, TightBeamError> {
+		if self.status != TransitStatus::Ok {
+			return Err(TightBeamError::WorkRefused(self.status));
+		}
+
+		self.into_frame()?.ok_or(TightBeamError::MissingResponse)
 	}
 }
 
@@ -133,11 +168,7 @@ pub enum ClusterRequest {
 	ReconcileGossip(GossipReconciliation),
 }
 
-// =============================================================================
-// Hive Registration Messages
-// =============================================================================
-
-/// Message type for registering a hive with a cluster
+/// Message type for registering a hive with a cluster.
 ///
 /// This message is sent from a hive to a cluster controller to announce
 /// its availability and capabilities, including actual servlet addresses.
@@ -184,15 +215,11 @@ pub struct ServletAddressUpdateResponse {
 	pub status: TransitStatus,
 }
 
-// =============================================================================
-// Peer Federation Messages
-// =============================================================================
-
 /// A peer gateway advertising the servlet types its colony exports.
 ///
 /// Sent gateway-to-gateway so a receiving colony can learn which types a
-/// peer serves and forward work there. Carries only type URNs (never
-/// instance addresses): the peer is reached at `gateway_addr`, which
+/// peer serves and forward work there. It carries only type URNs, never
+/// instance addresses. The peer is reached at `gateway_addr`, which
 /// resolves the whole peer colony rather than a single servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerAdvertisement {
@@ -226,7 +253,7 @@ pub enum GossipRumorKind {
 	PeerAdvertisement = 1,
 }
 
-/// The signed content of one gossip rumor: its opaque payload.
+/// The signed content of one gossip rumor, which is its opaque payload.
 ///
 /// This one structure serves both gossip roles. A publisher sends it as
 /// [`ClusterRequest::PublishGossip`] to request a flood. The accepting
@@ -237,14 +264,14 @@ pub enum GossipRumorKind {
 ///
 /// The rumor names no destination. Flood scope is colony membership,
 /// carried in the origin certificate's colony URN SAN and never in rumor
-/// bytes: unsigned scope bytes would be weaker than the certificate
-/// binding (CWE-345). Local delivery is receiving-gateway policy, the
-/// optional gossip ingress servlet type.
+/// bytes, because unsigned scope bytes would be weaker than the
+/// certificate binding (CWE-345). Local delivery is receiving-gateway
+/// policy, the optional gossip ingress servlet type.
 ///
 /// The rumor frame's `metadata.id` is the rumor identity and its
 /// `metadata.order` is the issue time in unix milliseconds (§5.7.1 permits
 /// a time-based order), both copied from the publish frame. Hop state such
-/// as the remaining flood radius MUST stay outside the rumor frame: it
+/// as the remaining flood radius MUST stay outside the rumor frame. It
 /// travels in the `metadata.lifetime` of the outer relay frame, which each
 /// relay rebuilds and re-signs.
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -299,10 +326,10 @@ pub struct GossipReconciliation {
 
 wire_sequence!(GossipReconciliation { held: octets_seq });
 
-/// One peer shared over peer exchange: an identity and where to dial it.
+/// One peer shared over peer exchange, as an identity and where to dial it.
 ///
 /// A sharer only exchanges peers it verified itself, yet the entry is
-/// still an unverified hint to its receiver: admission is bounded per
+/// still an unverified hint to its receiver. Admission is bounded per
 /// address prefix, and only a probe dial whose handshake certificate
 /// proves the local colony makes the peer a dial target. The
 /// fingerprint is advisory identity for deduplication, and trust never
@@ -317,12 +344,13 @@ pub struct PeerGossip {
 
 wire_sequence!(PeerGossip { peer_id: octets, gateway_addr: octets });
 
-/// Reply to a [`GossipReconciliation`]: digests the peer lacks and wants as `Gossip` rumors.
+/// Reply to a [`GossipReconciliation`] naming the digests the peer lacks
+/// and wants as `Gossip` rumors.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipWant {
 	/// Content digests the replier lacks and is requesting.
 	pub want: Vec<Vec<u8>>,
-	/// Peer-exchange sample: verified peers the replier shares so a
+	/// Peer-exchange sample of verified peers the replier shares so a
 	/// seed-bootstrapped requester can discover the colony graph.
 	/// Capped at `MAX_PEX_SAMPLE` in both directions.
 	pub pex: Vec<PeerGossip>,
@@ -330,11 +358,7 @@ pub struct GossipWant {
 
 wire_sequence!(GossipWant { want: octets_seq, pex: plain });
 
-// =============================================================================
-// Servlet Activation Messages
-// =============================================================================
-
-/// Message type for activating a servlet on a hive
+/// Message type for activating a servlet on a hive.
 ///
 /// This message is sent from a cluster controller to a hive to instruct
 /// it to morph into a specific servlet configuration.
@@ -373,11 +397,7 @@ impl ActivateServletResponse {
 	}
 }
 
-// =============================================================================
-// Servlet Info
-// =============================================================================
-
-/// Servlet information entry
+/// Servlet information entry.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ServletInfo {
 	/// Servlet instance URN (type URN with a `/{addr}` tail)
@@ -388,11 +408,7 @@ pub struct ServletInfo {
 
 wire_sequence!(ServletInfo { servlet_id: plain, address: octets });
 
-// =============================================================================
-// Hive Management Messages
-// =============================================================================
-
-/// Hive management request message
+/// Hive management request message.
 ///
 /// Uses context-specific tags to distinguish between different request types.
 /// Only one field should be set per request.
@@ -534,11 +550,7 @@ impl HiveManagementResponse {
 	}
 }
 
-// =============================================================================
-// Cluster Command Protocol
-// =============================================================================
-
-/// Status reported by cluster in heartbeat
+/// Status reported by the cluster in a heartbeat.
 ///
 /// Clusters report their current operational status to hives during heartbeat.
 /// Hives may use this to adjust their behavior (e.g., reduce capacity during draining).
@@ -564,7 +576,7 @@ pub enum ClusterStatus {
 /// **Security**: Requires nonrepudiation signature and frame integrity.
 /// Frames without proper authentication will be rejected and may trigger
 /// the circuit breaker. Freshness binds to `Frame.metadata.order` (unix
-/// milliseconds): hives reject commands outside their freshness window
+/// milliseconds), so hives reject commands outside their freshness window
 /// and replays of already-seen signatures within it (CWE-294).
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 #[beam(frame_integrity)]
@@ -578,10 +590,10 @@ pub struct ClusterCommand {
 	pub manage: Option<HiveManagementRequest>,
 }
 
-/// Heartbeat parameters
+/// Heartbeat parameters.
 ///
-/// Minimal payload - identity is established via certificate in the
-/// frame's nonrepudiation signature.
+/// The payload is minimal because the certificate in the frame's
+/// nonrepudiation signature establishes identity.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HeartbeatParams {
 	/// Cluster's current operational status
@@ -614,12 +626,8 @@ pub struct HeartbeatResult {
 	pub active_servlets: u32,
 }
 
-// =============================================================================
-// Response Builder Helpers
-// =============================================================================
-
 impl ClusterCommandResponse {
-	/// Create a heartbeat response
+	/// Create a heartbeat response.
 	#[inline]
 	pub fn heartbeat(status: TransitStatus, utilization: BasisPoints, active_servlets: u32) -> Self {
 		Self {
@@ -638,6 +646,7 @@ impl ClusterCommandResponse {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::asn1::{Metadata, Version};
 	use crate::colony::common::{servlet_instance, ColonyNamespace};
 	use crate::error::Result;
 
@@ -658,6 +667,19 @@ mod tests {
 		ColonyNamespace::default()
 			.hive("127.0.0.1:9000")
 			.expect("test locators satisfy the mint grammar")
+	}
+
+	fn work_frame() -> Frame {
+		let mut metadata = Metadata::default();
+		metadata.id = b"work-1".to_vec();
+
+		Frame {
+			version: Version::V0,
+			metadata,
+			message: vec![0x02, 0x01, 0x2A],
+			integrity: None,
+			nonrepudiation: None,
+		}
 	}
 
 	#[test]
@@ -683,10 +705,41 @@ mod tests {
 
 	#[test]
 	fn cluster_request_work_round_trips() -> Result<()> {
-		round_trip(ClusterRequest::Work(ClusterWorkRequest::new(
-			ping_type(),
-			vec![0x02, 0x01, 0x2A],
-		)))
+		round_trip(ClusterRequest::Work(ClusterWorkRequest::new(ping_type(), &work_frame())?))
+	}
+
+	#[test]
+	fn work_response_into_frame_round_trips() -> Result<()> {
+		let frame = work_frame();
+		let response = ClusterWorkResponse::ok(encode(&frame)?);
+		assert_eq!(response.into_frame()?, Some(frame));
+		Ok(())
+	}
+
+	#[test]
+	fn work_response_err_into_frame_is_none() -> Result<()> {
+		assert_eq!(ClusterWorkResponse::err(TransitStatus::Unavailable).into_frame()?, None);
+		Ok(())
+	}
+
+	#[test]
+	fn work_response_served_yields_frame() -> Result<()> {
+		let frame = work_frame();
+		let response = ClusterWorkResponse::ok(encode(&frame)?);
+		assert_eq!(response.served()?, frame);
+		Ok(())
+	}
+
+	#[test]
+	fn work_response_served_maps_refusal_to_work_refused() {
+		let served = ClusterWorkResponse::err(TransitStatus::Unavailable).served();
+		assert!(matches!(served, Err(TightBeamError::WorkRefused(TransitStatus::Unavailable))));
+	}
+
+	#[test]
+	fn work_response_served_rejects_ok_without_payload() {
+		let response = ClusterWorkResponse { status: TransitStatus::Ok, payload: None };
+		assert!(matches!(response.served(), Err(TightBeamError::MissingResponse)));
 	}
 
 	#[test]
@@ -765,8 +818,8 @@ mod tests {
 
 	#[test]
 	fn bare_inner_type_rejected_without_envelope_tag() -> Result<()> {
-		let bare = crate::encode(&ClusterWorkRequest::new(ping_type(), vec![]))?;
-		let decoded = crate::decode::<ClusterRequest>(&bare);
+		let bare = encode(&ClusterWorkRequest::new(ping_type(), &work_frame())?)?;
+		let decoded = decode::<ClusterRequest>(&bare);
 		assert!(decoded.is_err());
 		Ok(())
 	}

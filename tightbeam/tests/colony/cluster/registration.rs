@@ -2,10 +2,6 @@
 
 use super::common::*;
 
-// ============================================================================
-// Environment Teardown
-// ============================================================================
-
 tb_assert_spec! {
 	pub ClusterTeardownSpec,
 	V(1,0,0): {
@@ -61,10 +57,6 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Gate Policy Enforcement
-// ============================================================================
-
 tb_assert_spec! {
 	pub ClusterPolicySpec,
 	V(1,0,0): {
@@ -92,25 +84,15 @@ tb_scenario! {
 			start_cluster(&trace, cluster_conf).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			let work_request = ClusterRequest::Work(ClusterWorkRequest::new(
-				servlet_urn("ping"),
-				encode(&PingRequest { value: 21 })?,
-			));
-
-			let frame = frame_compose(Version::V0)
-				.with_id(b"policy-test")
-				.with_order(0)
-				.with_message(work_request)
-				.build()?;
+			let inner = signed_work_frame(&certs.key, b"policy-test").await?;
 
 			let cluster_addr = cluster.addr();
 			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
 			trace.event(WORK_SENT)?;
 
-			let response_frame = emit_frame(&mut client, frame).await?;
-			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
-			record_work_status(&trace, &work_response)?;
+			let refused_work = client.submit_work_to(servlet_urn("ping"), &inner).await;
+			record_work_refusal(&trace, refused_work)?;
 
 			cluster.stop();
 
@@ -118,10 +100,6 @@ tb_scenario! {
 		}
 	}
 }
-
-// ============================================================================
-// Unsigned Registration Rejection
-// ============================================================================
 
 tb_assert_spec! {
 	pub ClusterUnsignedRegistrationSpec,
@@ -144,14 +122,14 @@ tb_scenario! {
 	environment Cluster {
 		context: cluster_certs(),
 		// Registration itself is under test, so no `hives:` key.
-		// The client drives it; the spec asserts the rejection.
+		// The client drives it, and the spec asserts the rejection.
 		start: |SetupEnv { trace, context: certs }| async move {
-			// Cluster requires signed hive-origin frames (hive_trust set)
+			// The cluster requires signed hive-origin frames (hive_trust set).
 			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			// Hive validates the cluster's TLS certificate but has no
-			// signing identity of its own: control frames go out unsigned
+			// The hive validates the cluster's TLS certificate but has no
+			// signing identity of its own, so control frames go out unsigned.
 			let hive_conf = HiveConfig {
 				trust_store: Some(Arc::clone(&certs.trust)),
 				..Default::default()
@@ -217,8 +195,8 @@ tb_scenario! {
 			let response = hive.register_with_cluster(cluster_addr).await?;
 			record_register_response(&trace, &response, &cluster)?;
 
-			// Several anti-entropy intervals: a queued gateway would emit
-			// HIVE_REREGISTERED; an unqueued one stays silent.
+			// Wait several anti-entropy intervals. A queued gateway would
+			// emit HIVE_REREGISTERED, and an unqueued one stays silent.
 			tokio::time::sleep(Duration::from_millis(250)).await;
 
 			hive.stop();
@@ -228,10 +206,6 @@ tb_scenario! {
 		}
 	}
 }
-
-// ============================================================================
-// Missing Trust Store Fails Closed
-// ============================================================================
 
 tb_assert_spec! {
 	pub ClusterNoTrustStoreSpec,
@@ -254,8 +228,8 @@ tb_scenario! {
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
-			// Gateway without hive_trust cannot authenticate control
-			// frames and must fail closed: even a validly signed
+			// A gateway without hive_trust cannot authenticate control
+			// frames and must fail closed, so even a validly signed
 			// registration is rejected.
 			let tls = ClusterTlsConfig {
 				certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
@@ -289,10 +263,6 @@ tb_scenario! {
 		}
 	}
 }
-
-// ============================================================================
-// Servlet URN locator must match route address
-// ============================================================================
 
 tb_assert_spec! {
 	pub ClusterServletLocatorAlignSpec,
@@ -363,7 +333,7 @@ tb_scenario! {
 			let response_frame = emit_frame(&mut client, refused_reg).await?;
 			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
-			// Clean registration, then a mismatched add must refuse.
+			// A clean registration lands, then a mismatched add must refuse.
 			let ok_reg = signed_control_frame(
 				&certs,
 				b"align-reg",
@@ -390,10 +360,6 @@ tb_scenario! {
 		}
 	}
 }
-
-// ============================================================================
-// Replayed / Stale Control Frame Rejection
-// ============================================================================
 
 tb_assert_spec! {
 	pub ClusterReplaySpec,
@@ -450,7 +416,7 @@ tb_scenario! {
 			let cluster_addr = cluster.addr();
 			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
-			// Fresh signed registration is accepted
+			// A fresh signed registration is accepted.
 			let fresh = signed_control_frame(
 				&certs,
 				b"replay-reg",
@@ -462,11 +428,12 @@ tb_scenario! {
 			let response_frame = emit_frame(&mut client, fresh).await?;
 			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
-			// Byte-identical resend carries an already-seen signature
+			// A byte-identical resend carries an already-seen signature.
 			let response_frame = emit_frame(&mut client, replayed).await?;
 			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
-			// Valid signature but order outside the freshness window
+			// The signature is valid but the order lies outside the
+			// freshness window.
 			let stale_ts = current_timestamp_ms() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
 			let stale = signed_control_frame_with_order(
 				&certs.key,
@@ -479,7 +446,7 @@ tb_scenario! {
 			let response_frame = emit_frame(&mut client, stale).await?;
 			let _: RegisterHiveResponse = decode(&response_frame.message)?;
 
-			// Same enforcement on servlet address updates
+			// The same enforcement applies to servlet address updates.
 			let update = servlet_address_update(
 				b"127.0.0.1:65000",
 				vec![servlet_info("ping", b"127.0.0.1:65001")],
@@ -500,10 +467,6 @@ tb_scenario! {
 		}
 	}
 }
-
-// ============================================================================
-// Rejected Heartbeats Evict The Hive
-// ============================================================================
 
 tb_assert_spec! {
 	pub ClusterHeartbeatRejectionSpec,
@@ -570,7 +533,7 @@ tb_scenario! {
 				.with_callback(Arc::new(move |event| {
 					// utilization is only Some when the heartbeat response
 					// decoded, proving the failure came from the rejected
-					// status rather than a transport error
+					// status rather than a transport error.
 					let decoded_reject = !event.success && event.utilization.is_some();
 					callback_rejection
 						.rejected_decoded
@@ -587,12 +550,12 @@ tb_scenario! {
 			let certs = &rejection.certs;
 			let cluster_addr = cluster.addr();
 
-			// Hive serves the shared cert (cluster trusts it for TLS) but
-			// configures no trust store for inbound commands
+			// The hive serves the shared cert (the cluster trusts it for
+			// TLS) but configures no trust store for inbound commands.
 			let mut hive = ClusterTestHive::new(Some(hive_tls_config_no_trust(certs)))?;
 			hive.establish(Arc::new(trace.share())).await?;
 
-			// Register the hive out-of-band with a validly signed frame
+			// Register the hive out-of-band with a validly signed frame.
 			let hive_addr_bytes = hive.addr().to_string().into_bytes();
 			let registration = signed_control_frame(
 				certs,
@@ -606,8 +569,8 @@ tb_scenario! {
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			record_register_response(&trace, &response, &cluster)?;
 
-			// Heartbeats run every 100ms with max_failures = 1: the first
-			// PermissionDenied heartbeat must evict the hive
+			// Heartbeats run every 100ms with max_failures = 1, so the
+			// first PermissionDenied heartbeat must evict the hive.
 			let emptied = wait_for_empty_registry(&cluster, 50, Duration::from_millis(100)).await;
 			trace.event_with(REGISTRY_EMPTIED, &[], u64::from(emptied))?;
 
@@ -622,10 +585,8 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Signer-bound ServletAddressUpdate (cross-hive tampering)
-// ============================================================================
-
+// Two hive identities under one gateway prove ServletAddressUpdate is
+// signer-bound, so one hive cannot tamper with another's routes.
 struct DualHiveCerts {
 	gateway: ClusterTestCerts,
 	hive_a: (Certificate, Secp256k1SigningKey),
@@ -822,10 +783,6 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Removal Updates Unroute Instances
-// ============================================================================
-
 tb_assert_spec! {
 	pub ClusterRemovalSpec,
 	V(1,0,0): {
@@ -899,7 +856,7 @@ tb_scenario! {
 			let request = servlet_address_update(hive_addr, added, vec![]);
 			emit_servlet_update(&mut client, &certs.key, b"removal-add", request).await?;
 
-			emit_ping_work(&mut client, b"pre-removal-work").await?;
+			emit_ping_work(&mut client, &certs.key, b"pre-removal-work").await?;
 
 			let removed = vec![foreign_realm_instance(&servlet_addr)];
 			let request = servlet_address_update(hive_addr, vec![], removed);
@@ -909,7 +866,10 @@ tb_scenario! {
 			let request = servlet_address_update(hive_addr, vec![], removed);
 			emit_servlet_update(&mut client, &certs.key, b"removal-remove", request).await?;
 
-			emit_ping_work(&mut client, b"post-removal-work").await?;
+			// The removed instance no longer routes, so the submission
+			// must resolve to a refusal.
+			let refused_work = emit_ping_work(&mut client, &certs.key, b"post-removal-work").await;
+			work_refusal_status(refused_work)?;
 
 			servlet.stop();
 			cluster.stop();

@@ -2,10 +2,6 @@
 
 use super::common::*;
 
-// ============================================================================
-// Peer Federation (advertisement control plane)
-// ============================================================================
-
 tb_assert_spec! {
 	pub ClusterPeerAdvertisedSpec,
 	V(1,0,0): {
@@ -27,7 +23,7 @@ tb_assert_spec! {
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok))
 		]
 	},
-	// 1.2.0: the surviving route count joins the contract: one advertised
+	// 1.2.0: the surviving route count joins the contract. One advertised
 	// type must leave exactly one installed peer route.
 	V(1,2,0): {
 		mode: Accept,
@@ -51,8 +47,8 @@ tb_assert_spec! {
 			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1))
 		]
 	},
-	// 1.1.0: refusal contract pins the wire status AND the security
-	// property refuse => zero installed peer routes.
+	// 1.1.0: the refusal contract pins the wire status and the security
+	// property that a refusal installs zero peer routes.
 	V(1,1,0): {
 		mode: Accept,
 		gate: Ok,
@@ -450,7 +446,7 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let work_response = emit_relayed_ping_work(&mut client, b"reforward-guard").await?;
+			let work_response = emit_relayed_ping_work(&mut client, &certs.key, b"reforward-guard").await?;
 			record_work_status(&trace, &work_response)?;
 
 			cluster.stop();
@@ -499,10 +495,8 @@ tb_scenario! {
 			trace.event(WORK_SENT)?;
 
 			let mut client = connect_cluster(&certs, receiver.addr()).await?;
-			let work_response = emit_ping_work(&mut client, b"forward-echo").await?;
-			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-
-			let ping_response: PingResponse = decode(&payload)?;
+			let servlet_frame = emit_ping_work(&mut client, &certs.key, b"forward-echo").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
 			advertiser.stop();
@@ -513,8 +507,8 @@ tb_scenario! {
 	}
 }
 
-// Peer hops dial on peer_trust: importer with hive_trust=None still forwards
-// when the peer gateway cert is anchored only in peer_trust.
+// Peer hops dial on peer_trust: an importer with hive_trust=None still
+// forwards when the peer gateway cert is anchored only in peer_trust.
 tb_scenario! {
 	name: cluster_forwards_on_peer_trust_plane,
 	spec: ClusterPeerForwardEchoSpec,
@@ -535,9 +529,8 @@ tb_scenario! {
 			trace.event(WORK_SENT)?;
 
 			let mut client = connect_cluster(&certs, receiver.addr()).await?;
-			let work_response = emit_ping_work(&mut client, b"peer-plane").await?;
-			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-			let ping_response: PingResponse = decode(&payload)?;
+			let servlet_frame = emit_ping_work(&mut client, &certs.key, b"peer-plane").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
 			advertiser.stop();
@@ -608,8 +601,9 @@ tb_scenario! {
 	}
 }
 
-// WORK_SENT = CONTAINMENT_ABANDON_LIMIT failing forwards + 1 probe
-// after abandonment. CLUSTER_WORK_FAILED = CONTAINMENT_ABANDON_LIMIT.
+// WORK_SENT counts CONTAINMENT_ABANDON_LIMIT failing forwards plus one
+// probe after abandonment. CLUSTER_WORK_FAILED counts exactly
+// CONTAINMENT_ABANDON_LIMIT.
 tb_assert_spec! {
 	pub ClusterPeerContainmentSpec,
 	V(1,0,0): {
@@ -668,17 +662,20 @@ tb_scenario! {
 
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 
-			// Each forward reaches the dead peer and weakens the trail.
+			// Each forward reaches the dead peer, weakens the trail, and
+			// resolves to a refusal at the client.
 			for i in 0..CONTAINMENT_ABANDON_LIMIT {
 				trace.event(WORK_SENT)?;
 				let id = [b'f', i as u8];
-				let _ = emit_ping_work(&mut client, &id).await?;
+				let refused_work = emit_ping_work(&mut client, &certs.key, &id).await;
+				work_refusal_status(refused_work)?;
 			}
 
 			// Trail abandoned: selection drops it, so the peer-only type
 			// is Unavailable and no further forward is attempted.
 			trace.event(WORK_SENT)?;
-			let _ = emit_ping_work(&mut client, b"gone").await?;
+			let refused_work = emit_ping_work(&mut client, &certs.key, b"gone").await;
+			work_refusal_status(refused_work)?;
 
 			cluster.stop();
 			Ok(())
@@ -751,10 +748,12 @@ tb_scenario! {
 			let mut client = connect_cluster(&certs, importer.addr()).await?;
 
 			// Fail the peer trail into abandonment before any local route.
+			// Every submission resolves to a refusal at the client.
 			for i in 0..CONTAINMENT_ABANDON_LIMIT {
 				trace.event(WORK_SENT)?;
 				let id = [b'x', i as u8];
-				let _ = emit_ping_work(&mut client, &id).await?;
+				let refused_work = emit_ping_work(&mut client, &certs.key, &id).await;
+				work_refusal_status(refused_work)?;
 			}
 
 			// Heal the colony: a local ping hive joins after the bad nest
@@ -762,9 +761,8 @@ tb_scenario! {
 			hive.register_with_cluster(importer.addr()).await?;
 
 			trace.event(WORK_SENT)?;
-			let work_response = emit_ping_work(&mut client, b"local").await?;
-			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-			let ping_response: PingResponse = decode(&payload)?;
+			let servlet_frame = emit_ping_work(&mut client, &certs.key, b"local").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
 			importer.stop();
@@ -791,8 +789,8 @@ tb_assert_spec! {
 }
 
 // Local and peer both serve ping: warm local trails first, then admit the
-// peer route. Seeded forager keeps the roulette stream reproducible so the
-// reinforced local trail claims most later work on-colony.
+// peer route. The seeded forager keeps the roulette stream reproducible so
+// the reinforced local trail claims most later work on-colony.
 tb_scenario! {
 	name: cluster_locality_prefers_local_over_peer,
 	spec: ClusterPeerLocalitySpec,
@@ -813,9 +811,8 @@ tb_scenario! {
 				let mut client = connect_cluster(&certs, local_gateway.addr()).await?;
 				let id = [b'w', b'a', b'r', i];
 
-				let work_response = emit_ping_work(&mut client, &id).await?;
-				let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-				let ping_response: PingResponse = decode(&payload)?;
+				let servlet_frame = emit_ping_work(&mut client, &certs.key, &id).await?;
+				let ping_response = decode_ping_echo(&servlet_frame)?;
 				trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 			}
 
@@ -832,9 +829,8 @@ tb_scenario! {
 				let mut client = connect_cluster(&certs, local_gateway.addr()).await?;
 				let id = [b'l', b'o', b'c', i];
 
-				let work_response = emit_ping_work(&mut client, &id).await?;
-				let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-				let ping_response: PingResponse = decode(&payload)?;
+				let servlet_frame = emit_ping_work(&mut client, &certs.key, &id).await?;
+				let ping_response = decode_ping_echo(&servlet_frame)?;
 				trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 			}
 

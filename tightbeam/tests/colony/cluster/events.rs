@@ -107,3 +107,13 @@ pub(crate) const EXPORT_STREAM_REFUSED: Urn<'static> = Urn::new("test", "event:c
 pub(crate) const EXPORT_DUPLEX_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/export-duplex-refused");
 pub(crate) const EXPORT_ANON_REFUSED: Urn<'static> = Urn::new("test", "event:cluster/export-anon-refused");
 pub(crate) const EXPORT_GRANT_ECHOED: Urn<'static> = Urn::new("test", "event:cluster/export-grant-echoed");
+pub(crate) const CLIENT_WORK_SIGNED: Urn<'static> = Urn::new("test", "event:cluster/client-work-signed");
+pub(crate) const CLIENT_WORK_PREVIOUS: Urn<'static> = Urn::new("test", "event:cluster/client-work-previous");
+pub(crate) const PROBE_FRAME_CLIENT_ID: Urn<'static> = Urn::new("test", "event:cluster/probe-frame-client-id");
+pub(crate) const PROBE_FRAME_SIGNED: Urn<'static> = Urn::new("test", "event:cluster/probe-frame-signed");
+pub(crate) const PROBE_FRAME_PREVIOUS: Urn<'static> = Urn::new("test", "event:cluster/probe-frame-previous");
+pub(crate) const CLIENT_GOT_SERVLET_ID: Urn<'static> = Urn::new("test", "event:cluster/client-got-servlet-id");
+pub(crate) const CLIENT_GOT_SERVLET_SIGNED: Urn<'static> = Urn::new("test", "event:cluster/client-got-servlet-signed");
+pub(crate) const PROBE_FRAME_SIG_VALID: Urn<'static> = Urn::new("test", "event:cluster/probe-frame-sig-valid");
+pub(crate) const CLIENT_GOT_SERVLET_SIG_VALID: Urn<'static> =
+	Urn::new("test", "event:cluster/client-got-servlet-sig-valid");

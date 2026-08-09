@@ -1,6 +1,8 @@
-//! Streaming and duplex interactions through the colony stack: `servlet!`
-//! stream/duplex arms served over one multiplexed connection and consumed
-//! through the pooled client, alongside unary requests.
+//! Streaming and duplex interactions through the colony stack.
+//!
+//! The `servlet!` stream and duplex arms serve over one multiplexed
+//! connection, and the pooled client consumes them alongside unary
+//! requests.
 
 use std::sync::Arc;
 
@@ -53,9 +55,11 @@ fn reply_frame(label: &str) -> Result<Frame, TightBeamError> {
 }
 
 servlet! {
-	/// One servlet answering all three interaction kinds: unary echoes the
-	/// frame, stream reports the collected body length, duplex echoes every
-	/// request chunk back through the reply sink.
+	/// One servlet that answers all three interaction kinds.
+	///
+	/// - The unary arm echoes the frame.
+	/// - The stream arm reports the collected body length.
+	/// - The duplex arm echoes every request chunk back through the reply sink.
 	pub StreamingEchoServlet<StreamLabel, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
@@ -94,9 +98,9 @@ fn streaming_servlet_conf(
 		.build())
 }
 
-/// Pooled mux lease with pinned server trust, shared by every scenario
-/// in this file. The servlets here install no client validators, so the
-/// handshake authenticates the server only.
+/// Builds a pooled mux lease with pinned server trust, shared by every
+/// scenario in this file. The servlets here install no client validators,
+/// so the handshake authenticates the server only.
 async fn pooled_lease(
 	trace: &tightbeam::trace::TraceCollector,
 	materials: &ServerMaterials,
@@ -136,7 +140,7 @@ tb_assert_spec! {
 }
 
 // All three interaction kinds reach one servlet over one pooled mux
-// connection: the handler arm's shape is the only thing the servlet decides.
+// connection. The handler arm's shape is the only thing the servlet decides.
 tb_scenario! {
 	name: servlet_serves_unary_stream_and_duplex,
 	spec: ColonyStreamingSpec,
@@ -150,14 +154,13 @@ tb_scenario! {
 			pooled_lease(&trace, &materials, addr).await
 		},
 		client: |ServletEnv { trace, mut client, .. }| async move {
-			// Unary
 			let request = reply_frame("unary-body")?;
 			let reply = client.emit(request.to_owned(), None).await?;
 			let value = reply.map(|frame| frame.message.to_owned()) == Some(request.message.to_owned());
 
 			trace.event_with(UNARY_ECHOES, &[], value)?;
 
-			// Streaming: 8 bytes pushed, servlet reports "8"
+			// The stream pushes 8 bytes, so the servlet reports "8".
 			let (mut sink, response) = client.open_stream()?;
 			sink.push(b"abcd").await?;
 			sink.close_with(b"efgh").await?;
@@ -168,7 +171,7 @@ tb_scenario! {
 
 			trace.event_with(STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
 
-			// Duplex: chunks echo back in order
+			// Duplex chunks echo back in order.
 			let (mut sink, mut body) = client.open_duplex()?;
 			sink.push(b"ping-1").await?;
 
@@ -194,7 +197,7 @@ pub(crate) const STREAM_ONLY_UNARY_REFUSED: Urn<'static> =
 	Urn::new("test", "event:colony-streaming/stream-only-unary-refused");
 
 servlet! {
-	/// Streaming-only servlet: no `handle:` arm at all. Unary requests
+	/// A streaming-only servlet with no `handle:` arm at all. Unary requests
 	/// refuse with `Unimplemented` through the service defaults.
 	pub StreamOnlyServlet<StreamLabel, EnvConfig = ()>,
 	protocol: TokioListener,
@@ -257,10 +260,6 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// Intra-hive streaming: HiveContext::open_stream against a sibling servlet
-// ============================================================================
-
 hive! {
 	StreamingHive,
 	protocol: TokioListener
@@ -271,15 +270,16 @@ pub(crate) const HIVE_STREAM_REPLY_REPORTS_LENGTH: Urn<'static> =
 pub(crate) const HIVE_DUPLEX_ECHOES_CHUNKS: Urn<'static> =
 	Urn::new("test", "event:colony-streaming/hive-duplex-echoes-chunks");
 
-/// Type URN every hive scenario in this file registers and targets.
+/// Returns the type URN that every hive scenario in this file registers
+/// and targets.
 fn stream_echo_urn() -> Urn<'static> {
 	ColonyNamespace::default()
 		.servlet("stream-echo")
 		.expect("test names satisfy the mint grammar")
 }
 
-/// Established hive with one `StreamingEchoServlet` sibling: the
-/// intra-hive pool pins the servlet certificate and offers mux.
+/// Starts an established hive with one `StreamingEchoServlet` sibling.
+/// The intra-hive pool pins the servlet certificate and offers mux.
 async fn start_streaming_hive(
 	trace: TraceCollector,
 	materials: &ServerMaterials,
@@ -310,10 +310,11 @@ tb_assert_spec! {
 	}
 }
 
-// `HiveContext::open_stream` drives a real sibling servlet: the hive's
+// `HiveContext::open_stream` drives a real sibling servlet. The hive's
 // intra-hive pool validates the servlet certificate through
-// `HiveConfig::trust_store`, negotiates mux, and the streamed body's
-// unary reply comes back as message bytes, the same shape as `call`.
+// `HiveConfig::trust_store` and negotiates mux. The streamed body's
+// unary reply comes back as the servlet's complete reply frame, the
+// same shape as `call`.
 tb_scenario! {
 	name: hive_context_streams_to_sibling_servlet,
 	spec: HiveStreamingSpec,
@@ -329,8 +330,8 @@ tb_scenario! {
 			sink.push(b"hive-").await?;
 			sink.close_with(b"beam").await?;
 
-			let reply_bytes = response.await?;
-			let label: StreamLabel = decode(&reply_bytes)?;
+			let reply = response.await?;
+			let label: StreamLabel = decode(&reply.message)?;
 			let value = label.label == "9";
 
 			trace.event_with(HIVE_STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
@@ -353,7 +354,7 @@ tb_assert_spec! {
 	}
 }
 
-// `HiveContext::open_duplex` against the same sibling: request chunks
+// `HiveContext::open_duplex` targets the same sibling. Request chunks
 // echo back on the reply body in order, and the trailer closes it.
 tb_scenario! {
 	name: hive_context_duplexes_to_sibling_servlet,

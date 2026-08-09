@@ -16,7 +16,7 @@
 //! divergence freedom, and deadlock freedom against the same process.
 //! A separate scenario then runs the foreign gateway live, so its own
 //! beat produces the cross-organization frames the exact scenario
-//! injects by hand.
+//! injects directly.
 
 use super::common::*;
 use super::federation::{federation_conf, flood_ad_rumor, type_route_count};
@@ -84,7 +84,7 @@ fn multi_org_ctx() -> MultiOrgCtx {
 
 /// [`federation_conf`] with the advertise beat disabled.
 ///
-/// A live beat mints direct advertisements and slate rumors
+/// A live beat creates direct advertisements and slate rumors
 /// concurrently, so a rumor can land after a fresher direct ad and
 /// drop as stale. The scenario injects every control-plane frame
 /// instead, which keeps the trace exact for the refinements below.
@@ -241,9 +241,8 @@ tb_scenario! {
 			let mut client = connect_cluster(&ctx.entry, gateway_entry.addr()).await?;
 			trace.event(WORK_SENT)?;
 
-			let work_response = emit_ping_work(&mut client, b"multi-org-work").await?;
-			let payload = work_response.payload.ok_or(TightBeamError::MissingResponse)?;
-			let ping_response: PingResponse = decode(&payload)?;
+			let servlet_frame = emit_ping_work(&mut client, &ctx.entry.key, b"multi-org-work").await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
 			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
 			// Cross-organization relay: colony "other" is trusted on
@@ -337,8 +336,8 @@ tb_scenario! {
 			let gateway_foreign = start_cluster(&trace, foreign_conf).await?;
 
 			// No public state changes at the entry (that is the
-			// point), so there is nothing to poll: hold the window
-			// open for a dozen 100 ms beats instead.
+			// point), so there is nothing to poll. The client holds
+			// the window open for a dozen 100 ms beats instead.
 			tokio::time::sleep(Duration::from_millis(1500)).await;
 
 			trace.event_with(PEER_ROUTES_AFTER, &[], cluster.peer_routes().len() as u64)?;
