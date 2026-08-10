@@ -497,7 +497,9 @@ pub trait Cluster: Sized + Send + Sync {
 	/// Abort accept and background tasks.
 	fn stop(self);
 
-	/// Wait until the accept loop finishes.
+	/// Wait until the accept loops finish.
+	///
+	/// Awaits the colony accept task and, when bound, the edge accept task.
 	fn join(self) -> impl Future<Output = Result<(), crate::colony::servlet::servlet_runtime::rt::JoinError>> + Send;
 }
 

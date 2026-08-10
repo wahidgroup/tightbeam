@@ -388,10 +388,17 @@ where
 	}
 
 	async fn join(mut self) -> Result<(), rt::JoinError> {
-		if let Some(handle) = self.server_handle.take() {
-			rt::join(handle).await
-		} else {
-			Ok(())
+		let colony = self.server_handle.take();
+		let edge = self.edge_handle.take();
+		match (colony, edge) {
+			(Some(colony), Some(edge)) => {
+				let (colony_res, edge_res) = tokio::join!(colony, edge);
+				colony_res?;
+				edge_res
+			}
+			(Some(colony), None) => rt::join(colony).await,
+			(None, Some(edge)) => rt::join(edge).await,
+			(None, None) => Ok(()),
 		}
 	}
 }
