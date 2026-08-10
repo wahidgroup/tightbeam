@@ -379,6 +379,14 @@ pub struct ClusterConfig {
 	/// `None` binds the protocol default. A stable address lets hives
 	/// re-register across gateway restarts without reconfiguration.
 	pub bind_addr: Option<String>,
+	/// Edge accept plane bind address via the edge protocol address `FromStr`.
+	///
+	/// `None` disables the edge plane. When set, the gateway binds a second
+	/// listener with the same TLS material for external clients (for example
+	/// a browser transport) and admits `Work` frames only: control frames are
+	/// refused with `PermissionDenied`, so an edge client can never join the
+	/// colony control plane. Hives keep registering on `bind_addr`.
+	pub edge_bind_addr: Option<String>,
 	/// Peer-federation dial list, advertise beat, and dial allowlist.
 	pub peer: PeerConfig,
 	/// Gossip freshness, origin TTL, ingress, journal, and admission.
@@ -431,6 +439,7 @@ impl core::fmt::Debug for ClusterConfig {
 			.field("pool_config", &self.pool_config)
 			.field("control_freshness_window_ms", &self.control_freshness_window_ms)
 			.field("bind_addr", &self.bind_addr)
+			.field("edge_bind_addr", &self.edge_bind_addr)
 			.field("peer", &self.peer)
 			.field("gossip", &self.gossip)
 			.field("colony_urn", &self.colony_urn)

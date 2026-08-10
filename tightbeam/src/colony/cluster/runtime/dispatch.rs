@@ -15,7 +15,7 @@
 use core::hash::Hash;
 use core::str::FromStr;
 
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayPlane, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::gossip_handler::handle_peer_ad;
 use crate::colony::cluster::runtime::registration::{handle_address_update, handle_register};
 use crate::colony::cluster::runtime::verify::{evaluate_export_gates, evaluate_gates, spent_relay_budget};
@@ -44,10 +44,13 @@ use crate::colony::cluster::runtime::gossip_handler::{handle_gossip_relay, handl
 /// - `frame`: admitted unary control frame
 /// - `session`: caller identity facts for the connection
 /// - `ctx`: shared gateway runtime state (registry, config, trace, pools)
+/// - `plane`: accept plane the connection arrived on.
+///   The edge plane admits `Work` only and refuses every control variant.
 pub(crate) async fn handle_gateway_request<P, D>(
 	frame: Frame,
 	session: SessionContext,
 	ctx: GatewayRuntimeCtx<P>,
+	plane: GatewayPlane,
 ) -> Result<Option<Frame>, TightBeamError>
 where
 	P: Protocol
@@ -79,6 +82,11 @@ where
 		}
 	};
 
+	// The edge plane is a work-submission surface only.
+	if plane == GatewayPlane::Edge && !matches!(cluster_request, ClusterRequest::Work(_)) {
+		return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::PermissionDenied));
+	}
+
 	match cluster_request {
 		ClusterRequest::RegisterHive(request) => {
 			handle_register(
@@ -105,7 +113,8 @@ where
 			.await
 		}
 		ClusterRequest::Work(request) => {
-			// Export gates: target and relayed flag are known after decode.
+			// Target and relayed flag are known only after decode, so export
+			// gates run on the Work arm rather than before envelope decode.
 			let relayed = spent_relay_budget(request.hops_remaining);
 			if let Err(status) =
 				evaluate_export_gates(&request.servlet_type, &session, relayed, &ctx.config, &ctx.trace)

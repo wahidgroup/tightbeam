@@ -1,10 +1,11 @@
 //! Work routing through the cluster gateway.
 
-use tightbeam::servlet;
 use tightbeam::testing::create_test_hash_info;
+use tightbeam::{cluster, servlet};
 
 use super::common::*;
 use super::federation::{federation_conf, wait_for_type_routes};
+use crate::common::security::expectation_failure;
 
 tb_assert_spec! {
 	pub ClusterRoutingSpec,
@@ -445,6 +446,116 @@ tb_scenario! {
 			record_ping_echo(&trace, &certs, &cluster).await?;
 
 			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+cluster! {
+	/// Gateway with an edge accept plane, proving the `edge:` macro arm.
+	///
+	/// The edge protocol matches the colony protocol here because core
+	/// ships one async transport, so a mixed-transport colony (TCP colony,
+	/// WebSocket edge) is exercised by the transport extensions.
+	EdgeClusterGateway,
+	protocol: TokioListener,
+	edge: TokioListener
+}
+
+tb_assert_spec! {
+	pub ClusterEdgePlaneSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(WORK_SENT, exactly!(1)),
+			(WORK_ECHOED, exactly!(1), equals!(42u64)),
+			(EDGE_CONTROL_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(1))
+		]
+	}
+}
+
+// The edge accept plane is a work-only surface on its own listener. Work
+// submitted at the edge address routes to the servlet exactly like colony
+// work, while a validly signed hive registration on the same connection
+// is refused with PermissionDenied. The hive keeps registering through
+// the colony plane (CLUSTER_HIVE_REGISTERED stays 1).
+tb_scenario! {
+	name: cluster_edge_plane_admits_work_only,
+	spec: ClusterEdgePlaneSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
+			conf.edge_bind_addr = Some("127.0.0.1:0".into());
+			EdgeClusterGateway::start(Arc::new(trace.share()), conf).await
+		},
+		hives: |SetupEnv { trace, context: certs }| vec![start_ping_hive(trace, certs, Some(TransportOffer::mux(8)))],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let Some(edge_addr) = cluster.edge_addr() else {
+				return Err(expectation_failure("edge plane did not bind"));
+			};
+
+			let inner = signed_work_frame(&certs.key, b"edge-work").await?;
+
+			trace.event(WORK_SENT)?;
+
+			let mut client = connect_cluster(&certs, edge_addr).await?;
+			let servlet_frame = client.submit_work_to(servlet_urn("ping"), &inner).await?;
+			let ping_response = decode_ping_echo(&servlet_frame)?;
+
+			trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
+
+			let signed = signed_control_frame(
+				&certs,
+				b"edge-reg",
+				registration_request(b"127.0.0.1:65001"),
+			)
+			.await?;
+
+			let response_frame = emit_frame(&mut client, signed).await?;
+			let refusal: ClusterWorkResponse = decode(&response_frame.message)?;
+
+			trace.event_with(EDGE_CONTROL_STATUS, &[], refusal.status)?;
+
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterEdgeBindFailureSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(EDGE_START_FAILED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A configured edge plane that cannot parse its bind address fails
+// Cluster::start closed: the call returns Err and no accept loop is
+// left running (bind-then-spawn owns both listeners before spawn).
+tb_scenario! {
+	name: cluster_edge_bind_failure_fails_start,
+	spec: ClusterEdgeBindFailureSpec,
+	environment Bare {
+		context: cluster_certs(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
+			conf.edge_bind_addr = Some("not-a-socket-addr".into());
+
+			let failed = EdgeClusterGateway::start(Arc::new(trace.share()), conf)
+				.await
+				.is_err();
+
+			trace.event_with(EDGE_START_FAILED, &[], failed)?;
 
 			Ok(())
 		}
