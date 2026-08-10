@@ -10,6 +10,7 @@ use tightbeam::transport::{PooledClient, Protocol};
 use tightbeam::{compose, servlet};
 
 use super::common::*;
+use crate::common::security::expectation_failure;
 
 /// Set by the duplex cancel probe so the cancel scenario can wait for
 /// propagation deterministically instead of sleeping a fixed time.
@@ -314,6 +315,60 @@ tb_scenario! {
 			trace.event_with(DUPLEX_GATE_REFUSED, &[], refused)?;
 
 			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterEdgePlaneStreamRefuseSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(EDGE_STREAM_REFUSED, exactly!(1), equals!(true)),
+			(EDGE_DUPLEX_REFUSED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// The edge accept plane is Work-only: with a live stream servlet registered
+// on the colony plane, mux streaming and duplex opens on the edge address
+// still fail closed. Without the plane refuse, those opens would splice.
+tb_scenario! {
+	name: cluster_edge_plane_refuses_streams,
+	spec: ClusterEdgePlaneStreamRefuseSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| start_stream_hive(trace, certs),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let mut conf = routing_cluster_conf(&certs, Some(TransportOffer::mux(8)));
+			conf.edge_bind_addr = Some("127.0.0.1:0".into());
+
+			let cluster = start_cluster(&trace, conf).await?;
+			hive.register_with_cluster(cluster.addr()).await?;
+
+			let Some(edge_addr) = cluster.edge_addr() else {
+				return Err(expectation_failure("edge plane did not bind"));
+			};
+
+			let client = pooled_cluster_client(&trace, &certs, edge_addr).await?;
+
+			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"denied").await?;
+
+			let refused = response.await.is_err();
+			trace.event_with(EDGE_STREAM_REFUSED, &[], refused)?;
+
+			let (sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
+			sink.close_with(b"denied").await?;
+
+			let refused = body.chunk().await.is_err();
+			trace.event_with(EDGE_DUPLEX_REFUSED, &[], refused)?;
+
+			cluster.stop();
+			hive.stop();
 			Ok(())
 		}
 	}

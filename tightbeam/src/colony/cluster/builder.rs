@@ -150,6 +150,7 @@ pub struct ClusterConfigBuilder {
 	pool_config: PoolConfig,
 	control_freshness_window_ms: u64,
 	bind_addr: Option<String>,
+	edge_bind_addr: Option<String>,
 	peer: PeerConfig,
 	peer_store: Arc<dyn PeerStore>,
 	gossip: GossipConfig,
@@ -171,6 +172,7 @@ impl ClusterConfig {
 			pool_config: PoolConfig::default(),
 			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			bind_addr: None,
+			edge_bind_addr: None,
 			peer: PeerConfig::default(),
 			peer_store: Arc::new(MemoryPeerStore),
 			gossip: GossipConfig::default(),
@@ -302,6 +304,19 @@ impl ClusterConfigBuilder {
 	/// without reconfiguration.
 	pub fn with_bind_addr(mut self, addr: impl Into<String>) -> Self {
 		self.bind_addr = Some(addr.into());
+		self
+	}
+
+	/// Bind a second accept plane for external clients on the edge
+	/// protocol declared by the `cluster!` macro.
+	///
+	/// The edge plane serves the same TLS material and gate policies as
+	/// the colony plane but admits `Work` frames only: registration,
+	/// updates, peer ads, and gossip are refused with `PermissionDenied`.
+	/// Use this to expose the gateway to a browser transport while the
+	/// colony keeps its internal protocol.
+	pub fn with_edge_bind_addr(mut self, addr: impl Into<String>) -> Self {
+		self.edge_bind_addr = Some(addr.into());
 		self
 	}
 
@@ -455,6 +470,7 @@ impl ClusterConfigBuilder {
 			pool_config: self.pool_config,
 			control_freshness_window_ms: self.control_freshness_window_ms,
 			bind_addr: self.bind_addr,
+			edge_bind_addr: self.edge_bind_addr,
 			peer,
 			gossip: self.gossip,
 			colony_urn,

@@ -13,14 +13,16 @@
 //! [`super::verify::evaluate_export_gates`] (allowlist, grants, and gates).
 
 use core::future::Future;
-use core::hash::Hash;
 use core::marker::PhantomData;
-use core::str::FromStr;
 use core::time::Duration;
 use std::sync::Arc;
 
+use tokio::sync::Semaphore;
+
 use crate::colony::cluster::outbound::build_cluster_pools;
-use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
+use crate::colony::cluster::runtime::bounds::{
+	ClusterDigest, ClusterPool, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayPlane, GatewayRuntimeCtx,
+};
 use crate::colony::cluster::runtime::dispatch::handle_gateway_request;
 use crate::colony::cluster::runtime::gossip_tasks::{build_advertise_task, peer_dial_pool};
 use crate::colony::cluster::runtime::heartbeat::{send_heartbeat_async, spawn_evaporation_loop, spawn_heartbeat_loop};
@@ -37,25 +39,16 @@ use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::x509::Certificate;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
+use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
 use crate::transport::handshake::HandshakeKeyManager;
-use crate::transport::messaging::{MessageCollector, MessageEmitter};
-use crate::transport::multiplex::{MuxCapable, MuxConnector, ReplySink, StreamBody};
+use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::serve::{unimplemented_error, CallContext, MuxService};
-use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{
-	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, TransportEncryptionConfig, TransportError,
-	X509ClientConfig,
-};
+use crate::transport::{AsyncListenerTrait, Protocol, TransportEncryptionConfig, TransportError};
 use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
-use tokio::sync::Semaphore;
-
-fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
-	TightBeamError::from(error.into())
-}
 
 #[cfg(feature = "x509")]
 use crate::colony::hive::ReplayGuard;
@@ -107,78 +100,100 @@ fn warn_export_posture(config: &ClusterConfig, trace: &TraceCollector) {
 	let _ = (config, trace);
 }
 
-/// Running cluster gateway for protocol `P` and digest `D`.
+/// Assemble the accept-side TLS configuration shared by the colony and
+/// edge listeners.
 ///
-/// Owns the accept, heartbeat, evaporation, and advertise tasks for one bind
-/// address. Callers reach cluster state only through [`Cluster`] and
+/// Both planes present the same certificate and key so an external edge
+/// client pins the same gateway identity that hives already trust. An
+/// empty `client_validators` list means server-auth only.
+#[cfg(feature = "x509")]
+fn accept_encryption_config(
+	config: &ClusterConfig,
+) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
+	let cert_obj = Certificate::try_from(config.tls.certificate.clone())?;
+	let key_mgr = HandshakeKeyManager::new(Arc::clone(&config.tls.key));
+	let mut encryption_config = TransportEncryptionConfig::new(cert_obj, key_mgr);
+	if !config.tls.client_validators.is_empty() {
+		let validators: Vec<_> = config.tls.client_validators.iter().map(Arc::clone).collect();
+		encryption_config = encryption_config.with_client_validators(validators);
+	}
+
+	Ok(encryption_config)
+}
+
+fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
+	TightBeamError::from(error.into())
+}
+
+/// Running cluster gateway for protocol `P`, digest `D`, and edge
+/// protocol `E`.
+///
+/// Owns the accept, heartbeat, evaporation, and advertise tasks for the
+/// colony bind address and, when configured, a second edge accept plane.
+/// Callers reach cluster state only through [`Cluster`] and
 /// [`ClusterHeartbeat`].
-pub struct ClusterGateway<P, D = Sha3_256>
+///
+/// # Edge accept plane
+///
+/// `E` defaults to `P`, so a gateway without an edge declaration uses a
+/// single accept plane. When [`ClusterConfig::edge_bind_addr`] is set, the
+/// gateway binds a second listener over `E` with the same TLS material.
+/// Edge connections share the colony mux service but dispatch on the
+/// edge plane, which admits `Work` frames only. Hives and peers keep
+/// using the colony plane at [`Cluster::addr`].
+pub struct ClusterGateway<P, D = Sha3_256, E = P>
 where
 	P: Protocol,
+	E: Protocol,
 {
 	registry: Arc<HiveRegistry>,
 	servlet_registry: Arc<ServletRegistry>,
 	config: Arc<ClusterConfig>,
 	pool: Arc<ClusterPool<P>>,
 	server_handle: Option<rt::JoinHandle>,
+	edge_handle: Option<rt::JoinHandle>,
 	heartbeat_handle: Option<rt::JoinHandle>,
 	evaporation_handle: Option<rt::JoinHandle>,
 	advertise_handle: Option<rt::JoinHandle>,
 	addr: P::Address,
+	edge_addr: Option<E::Address>,
 	trace: Arc<TraceCollector>,
 	_digest: PhantomData<D>,
 }
 
-impl<P, D> ClusterGateway<P, D>
+impl<P, D, E> ClusterGateway<P, D, E>
 where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Listener: AsyncListenerTrait + Sync + 'static,
-	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
-	D: ClusterDigest,
+	P: Protocol,
+	E: Protocol,
+{
+	/// Bound edge accept plane address, or `None` when
+	/// [`ClusterConfig::edge_bind_addr`] was unset.
+	///
+	/// External clients dial this address. Hives keep registering on
+	/// [`Cluster::addr`].
+	pub fn edge_addr(&self) -> Option<&E::Address> {
+		self.edge_addr.as_ref()
+	}
+}
+
+impl<P, D, E> ClusterGateway<P, D, E>
+where
+	P: Protocol,
+	E: Protocol,
 {
 	fn abort_tasks(&mut self) {
 		take_and_abort(&mut self.advertise_handle);
 		take_and_abort(&mut self.evaporation_handle);
 		take_and_abort(&mut self.heartbeat_handle);
+		take_and_abort(&mut self.edge_handle);
 		take_and_abort(&mut self.server_handle);
 	}
 }
 
-impl<P, D> Cluster for ClusterGateway<P, D>
+impl<P, D, E> Cluster for ClusterGateway<P, D, E>
 where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Listener: AsyncListenerTrait + Sync + 'static,
-	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
+	P: GatewayColonyProtocol,
+	E: GatewayAcceptProtocol,
 	D: ClusterDigest,
 {
 	type Protocol = P;
@@ -210,17 +225,9 @@ where
 		};
 
 		#[cfg(feature = "x509")]
-		let (listener, addr) = {
-			let cert_obj = Certificate::try_from(config.tls.certificate.clone())?;
-			let key_mgr = HandshakeKeyManager::new(Arc::clone(&config.tls.key));
-			let mut encryption_config = TransportEncryptionConfig::new(cert_obj, key_mgr);
-			if !config.tls.client_validators.is_empty() {
-				let validators: Vec<_> = config.tls.client_validators.iter().map(Arc::clone).collect();
-				encryption_config = encryption_config.with_client_validators(validators);
-			}
-
-			P::bind_with(bind_addr, encryption_config).await.map_err(protocol_error)?
-		};
+		let (listener, addr) = P::bind_with(bind_addr, accept_encryption_config(&config)?)
+			.await
+			.map_err(protocol_error)?;
 
 		#[cfg(not(feature = "x509"))]
 		let (listener, addr) = P::bind(bind_addr).await.map_err(protocol_error)?;
@@ -240,18 +247,45 @@ where
 		#[cfg(not(feature = "x509"))]
 		let replay_guard_for_server = ();
 
-		let server_handle = spawn_gateway_server::<P, D>(
-			listener,
-			GatewayRuntimeCtx {
-				registry: Arc::clone(&registry),
-				servlet_registry: Arc::clone(&servlet_registry),
-				config: Arc::clone(&config),
-				pool: Arc::clone(&pool),
-				peer_pool: peer_pool.as_ref().map(Arc::clone),
-				trace: Arc::clone(&trace),
-				replay_guard: replay_guard_for_server,
-			},
-		);
+		let ctx = GatewayRuntimeCtx {
+			registry: Arc::clone(&registry),
+			servlet_registry: Arc::clone(&servlet_registry),
+			config: Arc::clone(&config),
+			pool: Arc::clone(&pool),
+			peer_pool: peer_pool.as_ref().map(Arc::clone),
+			trace: Arc::clone(&trace),
+			replay_guard: replay_guard_for_server,
+		};
+
+		// Bind every configured accept plane before spawning any accept
+		// loop. An edge parse or bind failure returns Err with the colony
+		// listener still local, so no detached accept task remains.
+		let (edge_listener, edge_addr) = match config.edge_bind_addr.as_deref() {
+			Some(raw) => {
+				let edge_bind: E::Address = raw.parse().map_err(|_| TransportError::InvalidMessage)?;
+
+				#[cfg(feature = "x509")]
+				let (edge_listener, edge_addr) = E::bind_with(edge_bind, accept_encryption_config(&config)?)
+					.await
+					.map_err(protocol_error)?;
+
+				#[cfg(not(feature = "x509"))]
+				let (edge_listener, edge_addr) = E::bind(edge_bind).await.map_err(protocol_error)?;
+
+				(Some(edge_listener), Some(edge_addr))
+			}
+			None => (None, None),
+		};
+
+		// The context is all Arc::clone
+		let server_handle = spawn_gateway_server::<P, P::Listener, D>(listener, ctx.clone(), GatewayPlane::Colony);
+
+		// The edge plane serves the same mux service restricted to Work
+		// dispatch (see [`GatewayPlane`]).
+		let edge_handle = edge_listener.map(|edge_listener| {
+			// The context is all Arc::clone
+			spawn_gateway_server::<P, E::Listener, D>(edge_listener, ctx.clone(), GatewayPlane::Edge)
+		});
 
 		let heartbeat_handle = spawn_heartbeat_loop::<P, D>(
 			Arc::clone(&registry),
@@ -300,10 +334,12 @@ where
 			config,
 			pool,
 			server_handle: Some(server_handle),
+			edge_handle,
 			heartbeat_handle: Some(heartbeat_handle),
 			evaporation_handle: Some(evaporation_handle),
 			advertise_handle,
 			addr,
+			edge_addr,
 			trace,
 			_digest: PhantomData,
 		})
@@ -352,34 +388,25 @@ where
 	}
 
 	async fn join(mut self) -> Result<(), rt::JoinError> {
-		if let Some(handle) = self.server_handle.take() {
-			rt::join(handle).await
-		} else {
-			Ok(())
+		let colony = self.server_handle.take();
+		let edge = self.edge_handle.take();
+		match (colony, edge) {
+			(Some(colony), Some(edge)) => {
+				let (colony_res, edge_res) = tokio::join!(colony, edge);
+				colony_res?;
+				edge_res
+			}
+			(Some(colony), None) => rt::join(colony).await,
+			(None, Some(edge)) => rt::join(edge).await,
+			(None, None) => Ok(()),
 		}
 	}
 }
 
-impl<P, D> ClusterHeartbeat for ClusterGateway<P, D>
+impl<P, D, E> ClusterHeartbeat for ClusterGateway<P, D, E>
 where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Listener: AsyncListenerTrait + Sync + 'static,
-	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
+	P: GatewayColonyProtocol,
+	E: GatewayAcceptProtocol,
 	D: ClusterDigest,
 {
 	fn registry(&self) -> &Arc<HiveRegistry> {
@@ -395,14 +422,16 @@ where
 	}
 }
 
-impl<P, D> Drop for ClusterGateway<P, D>
+impl<P, D, E> Drop for ClusterGateway<P, D, E>
 where
 	P: Protocol,
+	E: Protocol,
 {
 	fn drop(&mut self) {
 		take_and_abort(&mut self.advertise_handle);
 		take_and_abort(&mut self.evaporation_handle);
 		take_and_abort(&mut self.heartbeat_handle);
+		take_and_abort(&mut self.edge_handle);
 		take_and_abort(&mut self.server_handle);
 	}
 }
@@ -420,7 +449,9 @@ where
 ///
 /// # Export boundary
 ///
-/// Stream and duplex opens share the Work-arm boundary order:
+/// Stream and duplex opens refuse on [`GatewayPlane::Edge`] before any
+/// gate or route work. On the colony plane they share the Work-arm
+/// boundary order:
 ///
 /// 1. [`evaluate_gates`] before routing.
 /// 2. Resolve the servlet target from the call context.
@@ -431,27 +462,13 @@ where
 	P: Protocol,
 {
 	ctx: GatewayRuntimeCtx<P>,
+	plane: GatewayPlane,
 	_digest: PhantomData<D>,
 }
 
 impl<P, D> MuxService for GatewayMuxService<P, D>
 where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
+	P: GatewayColonyProtocol,
 	D: ClusterDigest,
 {
 	fn unary(
@@ -460,7 +477,8 @@ where
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
-		async move { handle_gateway_request::<P, D>(frame, cx.into_session(), ctx).await }
+		let plane = self.plane;
+		async move { handle_gateway_request::<P, D>(frame, cx.into_session(), ctx, plane).await }
 	}
 
 	fn streaming(
@@ -469,9 +487,9 @@ where
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
+		let plane = self.plane;
 		async move {
-			let target = guard_stream_open(&cx, &ctx)?;
-
+			let target = guard_stream_open(&cx, &ctx, plane)?;
 			splice_streaming::<P>(body, target, cx.hops_remaining(), ctx).await
 		}
 	}
@@ -483,8 +501,9 @@ where
 		cx: CallContext,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
+		let plane = self.plane;
 		async move {
-			let target = guard_stream_open(&cx, &ctx)?;
+			let target = guard_stream_open(&cx, &ctx, plane)?;
 
 			splice_duplex::<P>(body, reply, target, cx.hops_remaining(), ctx).await
 		}
@@ -493,8 +512,9 @@ where
 
 /// Boundary guard shared by the streaming and duplex open handlers.
 ///
-/// Mirrors the unary Work arm so a stream open cannot bypass session gate
-/// policies or the export boundary. Evaluation order:
+/// The edge accept plane admits unary `Work` only, so stream and duplex
+/// opens refuse there before any gate or route work. On the colony
+/// plane, evaluation mirrors the unary Work arm:
 ///
 /// 1. [`evaluate_gates`] with no request frame.
 /// 2. Resolve the servlet target from the call context.
@@ -502,10 +522,18 @@ where
 /// 4. [`evaluate_export_gates`] on that target and session.
 ///
 /// An unrouted open names no servlet type, so it fails with `Unimplemented`.
-fn guard_stream_open<P>(cx: &CallContext, ctx: &GatewayRuntimeCtx<P>) -> Result<Urn<'static>, TightBeamError>
+fn guard_stream_open<P>(
+	cx: &CallContext,
+	ctx: &GatewayRuntimeCtx<P>,
+	plane: GatewayPlane,
+) -> Result<Urn<'static>, TightBeamError>
 where
 	P: Protocol,
 {
+	if plane == GatewayPlane::Edge {
+		return Err(refuse(TransitStatus::PermissionDenied));
+	}
+
 	if let Err(status) = evaluate_gates(None, cx.session(), &ctx.config, &ctx.trace) {
 		return Err(refuse(status));
 	}
@@ -522,37 +550,39 @@ where
 	Ok(target)
 }
 
+/// Backoff after one failed accept before the loop resumes.
+///
+/// A refused handshake or a transient socket fault (for example EMFILE)
+/// MUST NOT kill the accept loop, but resuming without delay would spin
+/// the task hot on a persistent bind-level fault.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Bind the accept loop that admits peers and dispatches control frames.
 ///
-/// Calls [`warn_export_posture`] once before accepting connections. Each
-/// admitted transport shares one mux offer by reference count.
-pub(crate) fn spawn_gateway_server<P, D>(listener: P::Listener, ctx: GatewayRuntimeCtx<P>) -> rt::JoinHandle
+/// `L` is the listener actually bound: the colony protocol listener or the
+/// edge protocol listener. Both feed the same [`GatewayMuxService`] over
+/// the colony pool protocol `P`. Colony accepts call [`warn_export_posture`]
+/// once before the loop starts. Each admitted transport shares one mux offer
+/// by reference count.
+pub(crate) fn spawn_gateway_server<P, L, D>(
+	listener: L,
+	ctx: GatewayRuntimeCtx<P>,
+	plane: GatewayPlane,
+) -> rt::JoinHandle
 where
-	P: Protocol
-		+ PersistentConnection
-		+ EncryptedProtocol<CryptoProvider = DefaultCryptoProvider>
-		+ Send
-		+ Sync
-		+ 'static,
-	P::Listener: AsyncListenerTrait + Sync + 'static,
-	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
-		+ MuxConnector
-		+ EncryptedProtocolState
-		+ Send
-		+ Sync
-		+ 'static,
+	P: GatewayColonyProtocol,
+	L: AsyncListenerTrait + Sync + 'static,
+	L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 	D: ClusterDigest,
 {
-	warn_export_posture(&ctx.config, &ctx.trace);
+	// The posture concerns colony-wide export configuration, so it is
+	// reported once, not once per accept plane.
+	if plane == GatewayPlane::Colony {
+		warn_export_posture(&ctx.config, &ctx.trace);
+	}
 
-	// One shared mux advertisement for every accepted connection.
 	let mux_offer = ctx.config.pool_config.mux_offer.as_ref().map(Arc::clone);
-	let service = Arc::new(GatewayMuxService::<P, D> { ctx, _digest: PhantomData });
+	let service = Arc::new(GatewayMuxService::<P, D> { ctx, plane, _digest: PhantomData });
 
 	rt::spawn(async move {
 		let permits = Arc::new(Semaphore::new(DEFAULT_MAX_SERVER_CONNECTIONS));
@@ -560,19 +590,22 @@ where
 			let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
 				break;
 			};
-			match listener.accept().await {
-				Ok((mut transport, _addr)) => {
-					// Share the mux offer by reference count; do not deep-copy
-					// the authorization octets.
-					transport = transport.with_mux_offer(mux_offer.clone());
-					let service = Arc::clone(&service);
-					rt::spawn(async move {
-						let _permit = permit;
-						serve_connection_service(transport, service, None, None).await;
-					});
-				}
-				Err(_) => break,
-			}
+			// let-else drops the failed accept (and its non-Send error)
+			// before the backoff await, so the loop future stays Send.
+			let Ok((mut transport, _addr)) = listener.accept().await else {
+				rt::sleep(ACCEPT_ERROR_BACKOFF).await;
+				continue;
+			};
+
+			// Clone the Arc so each accept shares the mux offer without
+			// copying authorization octets.
+			transport = transport.with_mux_offer(mux_offer.clone());
+
+			let service = Arc::clone(&service);
+			rt::spawn(async move {
+				let _permit = permit;
+				serve_connection_service(transport, service, None, None).await;
+			});
 		}
 	})
 }
