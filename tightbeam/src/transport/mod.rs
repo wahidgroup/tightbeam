@@ -128,7 +128,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			max_cleartext_envelope: DEFAULT_MAX_CLEARTEXT_ENVELOPE,
 			max_encrypted_envelope: DEFAULT_MAX_ENCRYPTED_ENVELOPE,
-			handshake_timeout: Duration::from_secs(10),
+			handshake_timeout: crate::constants::DEFAULT_HANDSHAKE_TIMEOUT,
 		}
 	}
 

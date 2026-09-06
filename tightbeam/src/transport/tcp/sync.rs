@@ -111,7 +111,7 @@ where
 				_ => Some(Instant::now() + self.handshake_timeout),
 			}
 		} else {
-			self.operation_timeout.map(|timeout| Instant::now() + timeout)
+			Some(Instant::now() + self.operation_timeout)
 		};
 
 		let result = (|| -> TransportResult<Vec<u8>> {
@@ -216,16 +216,12 @@ where
 
 	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		#[cfg(feature = "std")]
-		if let Some(timeout) = self.operation_timeout {
-			self.stream.set_timeout(Some(timeout))?;
-		}
+		self.stream.set_timeout(Some(self.operation_timeout))?;
 
 		let result = self.stream.write_all(buffer);
 
 		#[cfg(feature = "std")]
-		if self.operation_timeout.is_some() {
-			let _ = self.stream.set_timeout(None);
-		}
+		let _ = self.stream.set_timeout(None);
 
 		result?;
 		Ok(())
@@ -294,17 +290,10 @@ where
 
 		#[cfg(feature = "std")]
 		{
-			let timeout_duration = self.operation_timeout;
-			if let Some(duration) = timeout_duration {
-				self.stream.set_timeout(Some(duration))?;
-			}
+			self.stream.set_timeout(Some(self.operation_timeout))?;
 
 			let result = self.perform_emit_cycle(message).await;
-
-			if timeout_duration.is_some() {
-				let _ = self.stream.set_timeout(None);
-			}
-
+			let _ = self.stream.set_timeout(None);
 			result.map_err(|e| {
 				if let TransportError::IoError(io_err) = &e {
 					if io_err.kind() == ErrorKind::TimedOut {

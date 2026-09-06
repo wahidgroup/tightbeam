@@ -424,6 +424,31 @@ pub const DEFAULT_MAX_CLEARTEXT_ENVELOPE: usize = 128 * 1024;
 ///   <https://cwe.mitre.org/data/definitions/400.html>
 pub const DEFAULT_MAX_ENCRYPTED_ENVELOPE: usize = 256 * 1024;
 
+/// Default deadline for a single read or write on an established session
+///
+/// The handshake carries its own allowance. Once a session is established,
+/// a peer that stops speaking mid-frame holds the connection, its task, and
+/// its accept-loop permit for as long as it stays silent.
+///
+/// Every transport carries this deadline, including one that sets no
+/// explicit timeout, so an established session always has an expiry.
+///
+/// # Sources
+///
+/// - CWE-400, uncontrolled resource consumption:
+///   <https://cwe.mitre.org/data/definitions/400.html>
+/// - CWE-772, missing release of resource after effective lifetime:
+///   <https://cwe.mitre.org/data/definitions/772.html>
+pub const DEFAULT_OPERATION_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
+
+/// Default allowance for a handshake to complete
+///
+/// One home for the allowance that [`TransportEncryptionConfig`] and the TCP
+/// transports both read.
+///
+/// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
+pub const DEFAULT_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+
 /// Default ceiling for decompressed message bodies (16 MiB)
 ///
 /// Compressed frame bodies arrive under the transport's envelope ceiling.

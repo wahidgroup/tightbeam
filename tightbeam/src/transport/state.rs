@@ -26,6 +26,34 @@ use crate::trace::TraceCollector;
 #[cfg(feature = "aead")]
 use crate::transport::handshake::EpochMaterials;
 
+/// Which wire mode a session is entitled to write.
+///
+/// A session occupies exactly one phase, derived from the handshake position
+/// together with the endpoint's encryption provisioning. Both facts are read
+/// in one place, so every write site receives the same answer.
+///
+/// [`EncryptedProtocolState::session_phase`] is the sole decider. Callers
+/// match every arm, so a new phase surfaces at every write site as a compile
+/// error.
+///
+/// # Sources
+///
+/// - CWE-311, missing encryption of sensitive data:
+///   <https://cwe.mitre.org/data/definitions/311.html>
+#[cfg(feature = "x509")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionPhase {
+	/// The endpoint carries no encryption provisioning, so frames travel in
+	/// the clear as a configured choice.
+	Cleartext,
+	/// Encryption is provisioned and the handshake is outstanding. A write
+	/// in this phase fails with
+	/// [`TransportFailure::EncryptorUnavailable`](crate::transport::error::TransportFailure::EncryptorUnavailable).
+	Pending,
+	/// The handshake completed and directional session keys are installed.
+	Encrypted,
+}
+
 /// State accessors for encrypted transports, separate from I/O.
 #[cfg(feature = "x509")]
 pub trait EncryptedProtocolState {
@@ -43,6 +71,33 @@ pub trait EncryptedProtocolState {
 
 	/// Advance or reset the handshake state machine.
 	fn set_handshake_state(&mut self, state: TcpHandshakeState);
+
+	/// Whether this endpoint is provisioned to encrypt.
+	///
+	/// A server certificate, a trust store, or client validators each imply a
+	/// handshake. This method is the canonical home for that derivation. The
+	/// handshake dispatcher and the wire-mode decision both read it here.
+	fn expects_encryption(&self) -> bool {
+		self.to_server_certificate_ref().is_some()
+			|| self.to_trust_store_ref().is_some()
+			|| self.is_client_validators_present()
+	}
+
+	/// The phase that decides this session's wire mode.
+	///
+	/// [`SessionPhase::Encrypted`] requires a completed handshake. A
+	/// provisioned endpoint at any earlier handshake position holds
+	/// [`SessionPhase::Pending`], so a stalled or failed attempt keeps the
+	/// session at a phase whose writes stay encrypted.
+	fn session_phase(&self) -> SessionPhase {
+		if self.to_handshake_state() == TcpHandshakeState::Complete {
+			SessionPhase::Encrypted
+		} else if self.expects_encryption() {
+			SessionPhase::Pending
+		} else {
+			SessionPhase::Cleartext
+		}
+	}
 
 	/// Local server certificate, when this endpoint presents one.
 	fn to_server_certificate_ref(&self) -> Option<&Certificate>;
@@ -178,5 +233,104 @@ pub trait EncryptedProtocolState {
 	#[cfg(feature = "instrument")]
 	fn to_trace_ref(&self) -> Option<&TraceCollector> {
 		None
+	}
+}
+
+#[cfg(all(test, feature = "x509", feature = "aead"))]
+mod tests {
+	use super::*;
+	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::transport::error::TransportError;
+
+	/// Carries the two inputs [`EncryptedProtocolState::session_phase`] reads.
+	struct PhaseProbe {
+		handshake: TcpHandshakeState,
+		validators: bool,
+	}
+
+	impl PhaseProbe {
+		fn provisioned(handshake: TcpHandshakeState) -> Self {
+			Self { handshake, validators: true }
+		}
+	}
+
+	impl EncryptedProtocolState for PhaseProbe {
+		type CryptoProvider = DefaultCryptoProvider;
+
+		fn to_handshake_state(&self) -> TcpHandshakeState {
+			self.handshake
+		}
+
+		fn is_client_validators_present(&self) -> bool {
+			self.validators
+		}
+
+		fn to_server_certificate_ref(&self) -> Option<&Certificate> {
+			None
+		}
+
+		fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		fn set_handshake_state(&mut self, state: TcpHandshakeState) {
+			self.handshake = state;
+		}
+
+		fn set_session_keys(&mut self, _keys: SessionKeys) {}
+
+		fn unset_session_keys(&mut self) {}
+
+		fn to_mux_config(&self) -> Option<TransportOffer> {
+			None
+		}
+
+		fn set_mux_settings(&mut self, _settings: Option<MuxSettings>) {}
+
+		fn set_peer_certificate(&mut self, _cert: Certificate) {}
+
+		fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
+			unreachable!()
+		}
+	}
+
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+	fn awaiting_server_response() -> TcpHandshakeState {
+		TcpHandshakeState::AwaitingServerResponse { initiated_at: std::time::Instant::now() }
+	}
+
+	#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+	fn awaiting_server_response() -> TcpHandshakeState {
+		TcpHandshakeState::AwaitingServerResponse { initiated_at: 0 }
+	}
+
+	#[test]
+	fn unprovisioned_session_is_cleartext() {
+		let probe = PhaseProbe { handshake: TcpHandshakeState::None, validators: false };
+		assert_eq!(probe.session_phase(), SessionPhase::Cleartext);
+	}
+
+	#[test]
+	fn completed_handshake_is_encrypted() {
+		let probe = PhaseProbe::provisioned(TcpHandshakeState::Complete);
+		assert_eq!(probe.session_phase(), SessionPhase::Encrypted);
+	}
+
+	#[test]
+	fn provisioned_session_before_the_handshake_is_pending() {
+		let probe = PhaseProbe::provisioned(TcpHandshakeState::None);
+		assert_eq!(probe.session_phase(), SessionPhase::Pending);
+	}
+
+	/// A stalled attempt holds [`SessionPhase::Pending`], which is what keeps
+	/// the payload encrypted when the handshake never completes (CWE-311).
+	#[test]
+	fn provisioned_session_awaiting_the_handshake_is_pending() {
+		let probe = PhaseProbe::provisioned(awaiting_server_response());
+		assert_eq!(probe.session_phase(), SessionPhase::Pending);
 	}
 }
