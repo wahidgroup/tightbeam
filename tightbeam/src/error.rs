@@ -42,10 +42,34 @@ impl<Received: core::fmt::Debug, Expected: core::fmt::Debug> core::fmt::Display
 #[derive(Debug)]
 pub enum CompressionError {
 	#[cfg(feature = "zstd")]
-	#[cfg_attr(feature = "derive", error("ZSTD compression/decompression error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
-	ZSTD(zeekstd::Error),
+	/// The zstd codec refused the frame, reported as its numeric code.
+	///
+	/// `zstd_safe::get_error_name` renders the code as zstd's own name for
+	/// the condition.
+	#[cfg_attr(feature = "derive", error("ZSTD compression/decompression error: code {0}"))]
+	ZSTD(usize),
+
+	/// Bytes remain after the single zstd frame.
+	///
+	/// A compressed body is exactly one plain frame. Skippable frames and a
+	/// seekable-format seek table arrive as trailing input, which the parse
+	/// boundary refuses.
+	#[cfg(feature = "zstd")]
+	#[cfg_attr(feature = "derive", error("{0} trailing octets after the zstd frame"))]
+	TrailingBytes(usize),
+
+	/// The input ended before the frame completed.
+	#[cfg(feature = "zstd")]
+	#[cfg_attr(feature = "derive", error("zstd frame is truncated"))]
+	Truncated,
+
+	/// The decoder consumed no input and produced no output.
+	///
+	/// The decompression loop advances one of its two cursors on every
+	/// iteration, and this refusal holds that guarantee (CWE-835).
+	#[cfg(feature = "zstd")]
+	#[cfg_attr(feature = "derive", error("zstd decoder stalled without consuming input"))]
+	Stalled,
 
 	#[cfg(feature = "std")]
 	#[cfg_attr(feature = "derive", error("I/O error during compression/decompression: {0}"))]
@@ -63,13 +87,19 @@ impl core::fmt::Display for CompressionError {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
 			#[cfg(feature = "zstd")]
-			CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
+			CompressionError::ZSTD(code) => write!(f, "ZSTD compression/decompression error: code {code}"),
 			#[cfg(feature = "std")]
 			CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
 			#[cfg(feature = "zstd")]
 			CompressionError::OutputLimitExceeded(limit) => {
 				write!(f, "decompressed output exceeds the {limit}-byte limit")
 			}
+			#[cfg(feature = "zstd")]
+			CompressionError::TrailingBytes(n) => write!(f, "{n} trailing octets after the zstd frame"),
+			#[cfg(feature = "zstd")]
+			CompressionError::Truncated => write!(f, "zstd frame is truncated"),
+			#[cfg(feature = "zstd")]
+			CompressionError::Stalled => write!(f, "zstd decoder stalled without consuming input"),
 			// Without zstd/std the enum is uninhabited; this arm is
 			// unreachable but keeps the match exhaustive for the compiler.
 			#[cfg(not(any(feature = "zstd", feature = "std")))]
@@ -660,10 +690,6 @@ crate::impl_from!(signature::Error => TightBeamError::SignatureError);
 #[cfg(all(feature = "signature", not(feature = "derive")))]
 crate::impl_from!(crate::crypto::sign::elliptic_curve::Error => TightBeamError::EllipticCurveError);
 
-#[cfg(all(feature = "zstd", not(feature = "derive")))]
-crate::impl_from!(zeekstd::Error => TightBeamError::CompressionError via CompressionError::ZSTD);
-#[cfg(all(feature = "zstd", not(feature = "derive")))]
-crate::impl_from!(zeekstd::Error => CompressionError::ZSTD);
 #[cfg(all(feature = "testing", not(feature = "derive")))]
 crate::impl_from!(crate::testing::error::TestingError => TightBeamError::TestingError);
 #[cfg(all(feature = "std", not(feature = "derive")))]

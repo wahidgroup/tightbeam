@@ -55,7 +55,7 @@ futures = { workspace = true, optional = true }
 paste = { workspace = true }
 
 ## Compression dependencies
-zeekstd = { workspace = true, optional = true }
+zstd-safe = { workspace = true, optional = true }
 
 ## Fuzzing dependencies
 afl = { workspace = true, optional = true }
@@ -261,7 +261,7 @@ std = [
 	"aes-gcm?/std",
 	"sha3?/std",
 	"k256?/std",
-	"zeekstd?/std",
+	"zstd-safe?/std",
 	"time?/std",
 	"rand_core?/std",
 ]
@@ -278,7 +278,7 @@ time = ["dep:time", "time/std", "der/time", "der/std"]
 tokio = ["dep:tokio", "std", "async-transport"]
 futures = ["dep:futures"]
 rayon = ["dep:rayon"]
-zstd = ["dep:zeekstd", "compress", "std"]
+zstd = ["dep:zstd-safe", "compress", "std"]
 # TODO
 gzip = ["compress"]
 

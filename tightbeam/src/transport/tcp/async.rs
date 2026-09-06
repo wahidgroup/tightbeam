@@ -602,7 +602,7 @@ where
 	/// path: a peer that byte-drips a frame cannot pin the reader task
 	/// forever (CWE-400).
 	#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-	operation_timeout: Option<Duration>,
+	operation_timeout: Duration,
 	/// Connection collector carried across the split (see
 	/// [`EnvelopeSource::trace`])
 	#[cfg(feature = "instrument")]
@@ -638,10 +638,7 @@ where
 		let max_len = self.max_encrypted_envelope.unwrap_or(DEFAULT_MAX_ENVELOPE);
 
 		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-		let wire_bytes = match self.operation_timeout {
-			Some(deadline) => timeout(deadline, self.stream.read_frame(Some(max_len))).await??,
-			None => self.stream.read_frame(Some(max_len)).await?,
-		};
+		let wire_bytes = timeout(self.operation_timeout, self.stream.read_frame(Some(max_len))).await??;
 		#[cfg(not(all(feature = "tokio", feature = "std", feature = "transport-policy")))]
 		let wire_bytes = self.stream.read_frame(Some(max_len)).await?;
 
@@ -697,7 +694,7 @@ where
 	/// path: a peer that never drains its receive buffer cannot pin the
 	/// writer task forever (CWE-400).
 	#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-	operation_timeout: Option<Duration>,
+	operation_timeout: Duration,
 	/// Connection collector carried across the split (see
 	/// [`EnvelopeSink::trace`])
 	#[cfg(feature = "instrument")]
@@ -734,10 +731,7 @@ where
 		let wire_bytes = wire_envelope.to_der()?;
 
 		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-		match self.operation_timeout {
-			Some(deadline) => timeout(deadline, self.stream.write_frame(&wire_bytes)).await??,
-			None => self.stream.write_frame(&wire_bytes).await?,
-		}
+		timeout(self.operation_timeout, self.stream.write_frame(&wire_bytes)).await??;
 
 		#[cfg(not(all(feature = "tokio", feature = "std", feature = "transport-policy")))]
 		self.stream.write_frame(&wire_bytes).await?;
@@ -1030,7 +1024,7 @@ where
 					_ => {
 						#[cfg(feature = "transport-policy")]
 						{
-							self.operation_timeout
+							Some(self.operation_timeout)
 						}
 						#[cfg(not(feature = "transport-policy"))]
 						{
@@ -1044,7 +1038,7 @@ where
 			let timeout_duration: Option<Duration> = {
 				#[cfg(feature = "transport-policy")]
 				{
-					self.operation_timeout
+					Some(self.operation_timeout)
 				}
 				#[cfg(not(feature = "transport-policy"))]
 				{
@@ -1072,11 +1066,7 @@ where
 
 	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		#[cfg(all(feature = "tokio", feature = "transport-policy"))]
-		if let Some(dur) = self.operation_timeout {
-			timeout(dur, self.stream.write_frame(buffer)).await??;
-		} else {
-			self.stream.write_frame(buffer).await?;
-		}
+		timeout(self.operation_timeout, self.stream.write_frame(buffer)).await??;
 
 		#[cfg(not(all(feature = "tokio", feature = "transport-policy")))]
 		self.stream.write_frame(buffer).await?;
@@ -1103,17 +1093,8 @@ where
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
-		let mut builder = limits.apply(EnvelopeBuilder::response(response_pkg));
-
-		if self.to_handshake_state() == TcpHandshakeState::Complete {
-			let encryptor = self.to_encryptor_ref()?;
-			let wire_mode = WireMode::Encrypted;
-			builder = builder.with_wire_mode(wire_mode);
-			builder = builder.with_encryptor(encryptor);
-		} else {
-			let wire_mode = WireMode::Cleartext;
-			builder = builder.with_wire_mode(wire_mode);
-		}
+		let builder = limits.apply(EnvelopeBuilder::response(response_pkg));
+		let builder = self.apply_wire_mode(builder)?;
 
 		let wire_envelope = builder.build()?;
 		let wire_bytes = wire_envelope.to_der()?;
@@ -1148,14 +1129,9 @@ where
 
 		#[cfg(feature = "tokio")]
 		{
-			let timeout_duration = self.operation_timeout;
-			if let Some(duration) = timeout_duration {
-				match timeout(duration, async { self.perform_emit_cycle(message).await }).await {
-					Ok(result) => result,
-					Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
-				}
-			} else {
-				self.perform_emit_cycle(message).await
+			match timeout(self.operation_timeout, async { self.perform_emit_cycle(message).await }).await {
+				Ok(result) => result,
+				Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
 			}
 		}
 
@@ -1167,9 +1143,9 @@ where
 }
 
 #[cfg(feature = "tokio")]
-impl<P: CryptoProvider + Send + Sync> PersistentConnection for TokioListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		transport.is_alive()
+		transport.is_alive() && transport.session_phase().is_writable()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {
@@ -1267,7 +1243,7 @@ mod tests {
 				send_key: SendCipher::new(test_runtime()).with_rekey_limit(rekey_limit),
 				max_encrypted_envelope: None,
 				#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-				operation_timeout: None,
+				operation_timeout: crate::constants::DEFAULT_OPERATION_TIMEOUT,
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1279,7 +1255,7 @@ mod tests {
 				recv_key: RecvCipher::new(test_runtime()),
 				max_encrypted_envelope: None,
 				#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-				operation_timeout: None,
+				operation_timeout: crate::constants::DEFAULT_OPERATION_TIMEOUT,
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}

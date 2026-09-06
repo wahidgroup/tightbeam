@@ -187,7 +187,7 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "transport-policy")]
 			pub(crate) collector_gate: $crate::policy::GateChain,
 			#[cfg(all(feature = "std", feature = "transport-policy"))]
-			pub(crate) operation_timeout: Option<core::time::Duration>,
+			pub(crate) operation_timeout: core::time::Duration,
 			#[cfg(feature = "x509")]
 			pub(crate) trust_store: Option<Arc<dyn $crate::crypto::x509::store::CertificateTrust>>,
 			#[cfg(feature = "x509")]
@@ -254,7 +254,7 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "transport-policy")]
 					collector_gate: $crate::policy::GateChain::default(),
 					#[cfg(all(feature = "std", feature = "transport-policy"))]
-					operation_timeout: None,
+					operation_timeout: $crate::constants::DEFAULT_OPERATION_TIMEOUT,
 					#[cfg(feature = "x509")]
 					trust_store: None,
 					#[cfg(feature = "x509")]
@@ -453,7 +453,7 @@ macro_rules! impl_tcp_common {
 
 			#[cfg(feature = "std")]
 			fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
-				self.operation_timeout = Some(timeout);
+				self.operation_timeout = timeout;
 				self
 			}
 		}

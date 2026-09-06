@@ -52,7 +52,7 @@ mod policy {
 	pub use crate::policy::TransitStatus;
 	pub use crate::transport::error::TransportError;
 	pub use crate::transport::policy::RestartPolicy;
-	pub use crate::transport::{EnvelopeBuilder, EnvelopeLimits, ProtocolStream, WireMode};
+	pub use crate::transport::{EnvelopeBuilder, EnvelopeLimits, ProtocolStream};
 }
 
 #[cfg(feature = "transport-policy")]
@@ -111,7 +111,7 @@ where
 				_ => Some(Instant::now() + self.handshake_timeout),
 			}
 		} else {
-			self.operation_timeout.map(|timeout| Instant::now() + timeout)
+			Some(Instant::now() + self.operation_timeout)
 		};
 
 		let result = (|| -> TransportResult<Vec<u8>> {
@@ -216,16 +216,12 @@ where
 
 	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		#[cfg(feature = "std")]
-		if let Some(timeout) = self.operation_timeout {
-			self.stream.set_timeout(Some(timeout))?;
-		}
+		self.stream.set_timeout(Some(self.operation_timeout))?;
 
 		let result = self.stream.write_all(buffer);
 
 		#[cfg(feature = "std")]
-		if self.operation_timeout.is_some() {
-			let _ = self.stream.set_timeout(None);
-		}
+		let _ = self.stream.set_timeout(None);
 
 		result?;
 		Ok(())
@@ -250,18 +246,8 @@ where
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
-		let mut builder = limits.apply(EnvelopeBuilder::response(response_pkg));
-
-		if self.to_handshake_state() == TcpHandshakeState::Complete {
-			let wire_mode = WireMode::Encrypted;
-			builder = builder.with_wire_mode(wire_mode);
-
-			let encryptor = self.to_encryptor_ref()?;
-			builder = builder.with_encryptor(encryptor);
-		} else {
-			let wire_mode = WireMode::Cleartext;
-			builder = builder.with_wire_mode(wire_mode);
-		}
+		let builder = limits.apply(EnvelopeBuilder::response(response_pkg));
+		let builder = self.apply_wire_mode(builder)?;
 
 		let wire_envelope = builder.build()?;
 		let wire_bytes = wire_envelope.to_der()?;
@@ -294,17 +280,10 @@ where
 
 		#[cfg(feature = "std")]
 		{
-			let timeout_duration = self.operation_timeout;
-			if let Some(duration) = timeout_duration {
-				self.stream.set_timeout(Some(duration))?;
-			}
+			self.stream.set_timeout(Some(self.operation_timeout))?;
 
 			let result = self.perform_emit_cycle(message).await;
-
-			if timeout_duration.is_some() {
-				let _ = self.stream.set_timeout(None);
-			}
-
+			let _ = self.stream.set_timeout(None);
 			result.map_err(|e| {
 				if let TransportError::IoError(io_err) = &e {
 					if io_err.kind() == ErrorKind::TimedOut {

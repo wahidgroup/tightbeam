@@ -28,7 +28,7 @@ use crate::constants::DEFAULT_MAX_ENCRYPTED_ENVELOPE;
 use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
-use crate::transport::envelopes::{TransportEnvelope, WireEnvelope, WireMode};
+use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
@@ -69,7 +69,6 @@ use deadline::*;
 mod x509 {
 	pub use crate::crypto::aead::Decryptor;
 	pub use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
-	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::state::EncryptedProtocolState;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -80,6 +79,7 @@ mod x509 {
 		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 		pub use crate::crypto::sign::Verifier;
 		pub use crate::spki::EncodePublicKey;
+		pub use crate::transport::handshake::TcpHandshakeState;
 		pub use crate::transport::handshake::{
 			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError, HandshakeProtocolKind,
 			ServerHandshakeProtocol,
@@ -467,17 +467,8 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let max_encrypted = self.to_max_encrypted_envelope().unwrap_or(DEFAULT_MAX_ENCRYPTED_ENVELOPE);
 		let limits = EnvelopeLimits::from_pair(self.to_max_cleartext_envelope(), Some(max_encrypted));
-		let mut builder = limits.apply(EnvelopeBuilder::request(message));
-
-		if self.to_handshake_state() == TcpHandshakeState::Complete {
-			let encryptor = self.to_encryptor_ref()?;
-			let wire_mode = WireMode::Encrypted;
-			builder = builder.with_wire_mode(wire_mode);
-			builder = builder.with_encryptor(encryptor);
-		} else {
-			let wire_mode = WireMode::Cleartext;
-			builder = builder.with_wire_mode(wire_mode);
-		}
+		let builder = limits.apply(EnvelopeBuilder::request(message));
+		let builder = self.apply_wire_mode(builder)?;
 
 		builder.finish()
 	}
@@ -568,11 +559,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		// AEAD bound
 		P::AeadCipher: KeyInit,
 	{
-		let should_handshake = (self.to_server_certificate_ref().is_some()
-			|| self.to_trust_store_ref().is_some()
-			|| self.is_client_validators_present())
-			&& self.to_handshake_state() == TcpHandshakeState::None;
-
+		let should_handshake = self.expects_encryption() && self.to_handshake_state() == TcpHandshakeState::None;
 		if should_handshake {
 			self.perform_client_handshake().await?;
 		}
@@ -599,11 +586,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync,
 	{
-		let should_handshake = (self.to_server_certificate_ref().is_some()
-			|| self.to_trust_store_ref().is_some()
-			|| self.is_client_validators_present())
-			&& self.to_handshake_state() == TcpHandshakeState::None;
-
+		let should_handshake = self.expects_encryption() && self.to_handshake_state() == TcpHandshakeState::None;
 		if should_handshake {
 			self.perform_client_handshake().await?;
 		}

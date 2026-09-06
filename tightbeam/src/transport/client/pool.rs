@@ -637,7 +637,7 @@ where
 		#[cfg(feature = "instrument")]
 		self.emit_event(events::POOL_DIAL);
 
-		let client = GenericClient::from_transport_with_addr(transport, addr.clone());
+		let client = GenericClient::from_transport(transport);
 
 		reservation.disarm();
 
@@ -777,7 +777,7 @@ pooled_mux! {
 					#[cfg(feature = "instrument")]
 					self.emit_event(events::POOL_MUX_DECLINED);
 
-					let client = GenericClient::from_transport_with_addr(transport, addr.clone());
+					let client = GenericClient::from_transport(transport);
 
 					reservation.disarm();
 

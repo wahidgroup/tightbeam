@@ -229,8 +229,7 @@ where
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let transport = P::create_transport(stream);
 		let configured = self.policies.apply::<P>(transport);
-
-		Ok(GenericClient::from_transport_with_addr(configured, addr))
+		Ok(GenericClient::from_transport(configured))
 	}
 }
 
@@ -260,7 +259,7 @@ where
 		}
 
 		let configured = self.policies.apply::<P>(transport);
-		Ok(GenericClient::from_transport_with_addr(configured, addr))
+		Ok(GenericClient::from_transport(configured))
 	}
 }
 
