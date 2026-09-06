@@ -198,7 +198,7 @@ mod tests {
 	];
 
 	/// The skippable frame alone, taken from the octet stream above.
-	const SKIPPABLE_TAIL: &[u8] = &TRAILING_SEEK_TABLE.split_at(44).1;
+	const SKIPPABLE_TAIL: &[u8] = TRAILING_SEEK_TABLE.split_at(44).1;
 
 	#[test]
 	fn seekable_footer_input_terminates() -> Result<()> {

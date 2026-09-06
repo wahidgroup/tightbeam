@@ -254,7 +254,7 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "transport-policy")]
 					collector_gate: $crate::policy::GateChain::default(),
 					#[cfg(all(feature = "std", feature = "transport-policy"))]
-					operation_timeout: crate::constants::DEFAULT_OPERATION_TIMEOUT,
+					operation_timeout: $crate::constants::DEFAULT_OPERATION_TIMEOUT,
 					#[cfg(feature = "x509")]
 					trust_store: None,
 					#[cfg(feature = "x509")]
