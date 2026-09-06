@@ -6,7 +6,7 @@ use crate::{cms::signed_data::EncapsulatedContentInfo, error::CompressionResult,
 #[cfg(feature = "zstd")]
 use crate::{
 	cms::content_info::CmsVersion, constants::DEFAULT_MAX_DECOMPRESSED_LEN, error::CompressionError,
-	spki::AlgorithmIdentifierOwned,
+	oids::COMPRESSION_CONTENT, spki::AlgorithmIdentifierOwned,
 };
 
 pub use crate::core::Inflator;
@@ -70,12 +70,11 @@ impl Compressor for ZstdCompression {
 		content_info: Option<EncapsulatedContentInfo>,
 	) -> CompressionResult<(Vec<u8>, CompressedData)> {
 		let mut output: Vec<u8> = Vec::with_capacity(zstd_safe::compress_bound(data.len()));
-		zstd_safe::compress(&mut output, data, ZSTD_LEVEL)
-			.map_err(|code| CompressionError::ZSTD(zstd_safe::get_error_name(code)))?;
+		zstd_safe::compress(&mut output, data, ZSTD_LEVEL).map_err(CompressionError::ZSTD)?;
 
 		let compression_alg = AlgorithmIdentifierOwned::from(self);
-		let encap_content_info = content_info
-			.unwrap_or(EncapsulatedContentInfo { econtent_type: crate::oids::COMPRESSION_CONTENT, econtent: None });
+		let encap_content_info =
+			content_info.unwrap_or(EncapsulatedContentInfo { econtent_type: COMPRESSION_CONTENT, econtent: None });
 		let compressed_data = CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info };
 
 		Ok((output, compressed_data))
@@ -105,8 +104,7 @@ impl Inflator for ZstdCompression {
 
 			let remaining = {
 				let mut buffer = zstd_safe::OutBuffer::around_pos(&mut out, produced);
-				ctx.decompress_stream(&mut buffer, &mut input)
-					.map_err(|code| CompressionError::ZSTD(zstd_safe::get_error_name(code)))?
+				ctx.decompress_stream(&mut buffer, &mut input).map_err(CompressionError::ZSTD)?
 			};
 
 			// A frame boundary is the only successful exit.

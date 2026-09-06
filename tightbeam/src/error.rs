@@ -42,8 +42,12 @@ impl<Received: core::fmt::Debug, Expected: core::fmt::Debug> core::fmt::Display
 #[derive(Debug)]
 pub enum CompressionError {
 	#[cfg(feature = "zstd")]
-	#[cfg_attr(feature = "derive", error("ZSTD compression/decompression error: {0}"))]
-	ZSTD(&'static str),
+	/// The zstd codec refused the frame, reported as its numeric code.
+	///
+	/// `zstd_safe::get_error_name` renders the code as zstd's own name for
+	/// the condition.
+	#[cfg_attr(feature = "derive", error("ZSTD compression/decompression error: code {0}"))]
+	ZSTD(usize),
 
 	/// Bytes remain after the single zstd frame.
 	///
@@ -83,7 +87,7 @@ impl core::fmt::Display for CompressionError {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
 			#[cfg(feature = "zstd")]
-			CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
+			CompressionError::ZSTD(code) => write!(f, "ZSTD compression/decompression error: code {code}"),
 			#[cfg(feature = "std")]
 			CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
 			#[cfg(feature = "zstd")]
