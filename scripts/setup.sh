@@ -6,6 +6,7 @@ set -euo pipefail
 # stamped under .make/ so unchanged re-runs are skipped.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TOOL_VERSION="$ROOT/scripts/tool-version.sh"
 STAMP_DIR="$ROOT/.make"
 SETUP_HASH_FILE="$STAMP_DIR/setup.hash"
 LOCK_FILE="$STAMP_DIR/setup.lock"
@@ -31,18 +32,50 @@ compute_setup_hash() {
 			"$ROOT/rust-toolchain.toml" \
 			"$ROOT/typos.toml" \
 			"$ROOT/scripts/setup.sh" \
+			"$ROOT/scripts/tool-version.sh" \
 			2>/dev/null
 	} | "${SHA256_CMD[@]}" | awk '{ print $1 }'
 }
 
+pinned() {
+	"$TOOL_VERSION" "$1"
+}
+
+tool_at_version() {
+	local binary="$1"
+	local version="$2"
+	local probe=(--version)
+
+	command -v "$binary" >/dev/null 2>&1 || return 1
+
+	if [ "$binary" = "cargo-afl" ]; then
+		probe=(afl --version)
+	fi
+
+	"$binary" "${probe[@]}" 2>/dev/null | grep -qE "(^|[[:space:]])${version}([[:space:]]|\$)"
+}
+
+install_pinned() {
+	local binary="$1"
+	local crate="$2"
+	local version="$3"
+
+	if tool_at_version "$binary" "$version"; then
+		return 0
+	fi
+
+	echo "Installing $crate $version..."
+	cargo install "$crate" --version "$version" --locked --force
+}
+
 setup_required() {
-	if ! command -v cargo-audit >/dev/null 2>&1; then
+	if ! tool_at_version cargo-audit "$(pinned cargo-audit)"; then
 		return 0
 	fi
-	if ! command -v typos >/dev/null 2>&1; then
+	if ! tool_at_version typos "$(pinned typos-cli)"; then
 		return 0
 	fi
-	if ! command -v cargo-afl >/dev/null 2>&1; then
+	if ! tool_at_version cargo-afl "$(pinned cargo-afl)"; then
 		return 0
 	fi
 	if [ ! -f "$SETUP_HASH_FILE" ]; then
@@ -99,18 +132,9 @@ install_rust_tooling() {
 	rustup toolchain install
 	rustup component add rustfmt clippy
 
-	if ! command -v cargo-audit >/dev/null 2>&1; then
-		echo "Installing cargo-audit..."
-		cargo install cargo-audit --locked
-	fi
-	if ! command -v typos >/dev/null 2>&1; then
-		echo "Installing typos..."
-		cargo install typos-cli --locked
-	fi
-	if ! command -v cargo-afl >/dev/null 2>&1; then
-		echo "Installing cargo-afl..."
-		cargo install cargo-afl --locked
-	fi
+	install_pinned cargo-audit cargo-audit "$(pinned cargo-audit)"
+	install_pinned typos typos-cli "$(pinned typos-cli)"
+	install_pinned cargo-afl cargo-afl "$(pinned cargo-afl)"
 }
 
 main() {

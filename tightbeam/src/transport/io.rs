@@ -28,7 +28,7 @@ use crate::constants::DEFAULT_MAX_ENCRYPTED_ENVELOPE;
 use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
-use crate::transport::envelopes::{TransportEnvelope, WireEnvelope, WireMode};
+use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
@@ -53,6 +53,8 @@ mod deadline {
 	pub use core::time::Duration;
 
 	pub use tokio::time::timeout;
+
+	pub use crate::transport::error::TransportFailure;
 }
 
 #[cfg(all(
@@ -67,8 +69,7 @@ use deadline::*;
 mod x509 {
 	pub use crate::crypto::aead::Decryptor;
 	pub use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
-	pub use crate::transport::error::TransportFailure;
-	pub use crate::transport::state::{EncryptedProtocolState, SessionPhase};
+	pub use crate::transport::state::EncryptedProtocolState;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	mod handshake {
@@ -466,20 +467,8 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let max_encrypted = self.to_max_encrypted_envelope().unwrap_or(DEFAULT_MAX_ENCRYPTED_ENVELOPE);
 		let limits = EnvelopeLimits::from_pair(self.to_max_cleartext_envelope(), Some(max_encrypted));
-		let mut builder = limits.apply(EnvelopeBuilder::request(message));
-
-		builder = match self.session_phase() {
-			SessionPhase::Encrypted => {
-				let encryptor = self.to_encryptor_ref()?;
-				builder.with_wire_mode(WireMode::Encrypted).with_encryptor(encryptor)
-			}
-			SessionPhase::Cleartext => builder.with_wire_mode(WireMode::Cleartext),
-			// Pending withholds the frame until keys exist, so the payload
-			// stays encrypted across a stalled handshake attempt.
-			SessionPhase::Pending => {
-				return Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
-			}
-		};
+		let builder = limits.apply(EnvelopeBuilder::request(message));
+		let builder = self.apply_wire_mode(builder)?;
 
 		builder.finish()
 	}

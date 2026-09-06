@@ -1093,17 +1093,8 @@ where
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
-		let mut builder = limits.apply(EnvelopeBuilder::response(response_pkg));
-
-		if self.to_handshake_state() == TcpHandshakeState::Complete {
-			let encryptor = self.to_encryptor_ref()?;
-			let wire_mode = WireMode::Encrypted;
-			builder = builder.with_wire_mode(wire_mode);
-			builder = builder.with_encryptor(encryptor);
-		} else {
-			let wire_mode = WireMode::Cleartext;
-			builder = builder.with_wire_mode(wire_mode);
-		}
+		let builder = limits.apply(EnvelopeBuilder::response(response_pkg));
+		let builder = self.apply_wire_mode(builder)?;
 
 		let wire_envelope = builder.build()?;
 		let wire_bytes = wire_envelope.to_der()?;
@@ -1152,9 +1143,9 @@ where
 }
 
 #[cfg(feature = "tokio")]
-impl<P: CryptoProvider + Send + Sync> PersistentConnection for TokioListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		transport.is_alive()
+		transport.is_alive() && transport.session_phase().is_writable()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {

@@ -15,6 +15,12 @@ readme = "README.md"
 keywords = ["cryptography", "security", "messaging", "protocol"]
 categories = ["cryptography", "network-programming"]
 
+# Developer tools installed by scripts/setup.sh.
+[workspace.metadata.tools]
+cargo-audit = "0.22.2"
+typos-cli = "1.49.0"
+cargo-afl = "0.18.2"
+
 [workspace.lints.rust]
 # Catch dead imports under cfg-gated paths that `--all-features` never compiles.
 unused_imports = "deny"
