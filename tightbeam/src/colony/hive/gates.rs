@@ -15,7 +15,7 @@ use std::sync::Arc;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use crate::colony::common::current_timestamp_ms;
-use crate::policy::{GatePolicy, SessionContext, TransitStatus};
+use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
 use crate::utils::BasisPoints;
 use crate::Frame;
 
@@ -109,12 +109,12 @@ impl ClusterCircuitBreaker {
 	/// after its cooldown. Each signer's failures gate that signer alone, so
 	/// the colony control plane stays open to every other member
 	/// (CWE-645).
-	pub fn allow_request(&self, signer: &[u8]) -> bool {
+	pub fn allow_request(&self, signer: ProvenPeer<'_>) -> bool {
 		let Ok(mut signers) = self.signers.lock() else {
 			return false;
 		};
 
-		let Some(circuit) = signers.get_mut(signer) else {
+		let Some(circuit) = signers.get_mut(signer.as_key()) else {
 			return true;
 		};
 
@@ -136,24 +136,24 @@ impl ClusterCircuitBreaker {
 	}
 
 	/// Record a successful request from `signer`
-	pub fn record_success(&self, signer: &[u8]) {
+	pub fn record_success(&self, signer: ProvenPeer<'_>) {
 		let Ok(mut signers) = self.signers.lock() else {
 			return;
 		};
 
-		signers.remove(signer);
+		signers.remove(signer.as_key());
 	}
 
 	/// Record an authentication failure attributed to `signer`
 	///
 	/// A failure while half-open re-opens immediately and restarts the
 	/// cooldown.
-	pub fn record_auth_failure(&self, signer: &[u8]) {
+	pub fn record_auth_failure(&self, signer: ProvenPeer<'_>) {
 		let Ok(mut signers) = self.signers.lock() else {
 			return;
 		};
 
-		let circuit = signers.entry(signer.to_vec()).or_insert(SignerCircuit::CLOSED);
+		let circuit = signers.entry(signer.as_key().to_vec()).or_insert(SignerCircuit::CLOSED);
 		if matches!(circuit.state, CircuitState::HalfOpen) {
 			circuit.state = CircuitState::Open;
 			circuit.opened_at = current_timestamp_ms();
@@ -169,21 +169,23 @@ impl ClusterCircuitBreaker {
 	}
 
 	/// Current circuit state for `signer`
-	pub fn state(&self, signer: &[u8]) -> CircuitState {
+	pub fn state(&self, signer: ProvenPeer<'_>) -> CircuitState {
 		let Ok(signers) = self.signers.lock() else {
 			return CircuitState::Open;
 		};
 
-		signers.get(signer).map_or(CircuitState::Closed, |circuit| circuit.state)
+		signers
+			.get(signer.as_key())
+			.map_or(CircuitState::Closed, |circuit| circuit.state)
 	}
 
 	/// Whether `signer`'s circuit is currently open (tripped)
-	pub fn is_open(&self, signer: &[u8]) -> bool {
+	pub fn is_open(&self, signer: ProvenPeer<'_>) -> bool {
 		self.state(signer) == CircuitState::Open
 	}
 
 	/// Close `signer`'s circuit and clear its failure history
-	pub fn reset(&self, signer: &[u8]) {
+	pub fn reset(&self, signer: ProvenPeer<'_>) {
 		self.record_success(signer);
 	}
 
@@ -445,9 +447,10 @@ impl ReplayGuard {
 /// 7. Reject signatures already seen inside the window (replay: `PermissionDenied`, not counted)
 /// 8. On success: record success (resets breaker)
 ///
-/// Only step 5 counts toward the circuit breaker.
-/// Counting unauthenticated failures would let garbage sever the control plane (CWE-645).
-/// Steps 6-7 are not counted: a replayed capture still carries a valid signature.
+/// Only step 5 counts toward the circuit breaker, and it counts against
+/// the [`ProvenPeer`] the transport handshake established, so one member's
+/// failures gate that member alone (CWE-645). Steps 6-7 stay uncounted,
+/// because a replayed capture still carries a valid signature.
 #[cfg(feature = "x509")]
 pub struct ClusterSecurityGate {
 	/// Circuit breaker for tracking auth failures
@@ -477,7 +480,7 @@ impl ClusterSecurityGate {
 
 #[cfg(feature = "x509")]
 impl GatePolicy for ClusterSecurityGate {
-	fn evaluate(&self, frame: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
+	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		let Some(frame) = frame else {
 			return TransitStatus::Unauthenticated;
 		};
@@ -490,14 +493,20 @@ impl GatePolicy for ClusterSecurityGate {
 			return TransitStatus::Unauthenticated;
 		}
 
-		// One identity keys the breaker and the replay partition, so a
-		// signer is gated and recorded under one name. An unencodable
-		// identifier has no attribution, so it fails closed.
+		// The replay partition keys on the signer, which the verification
+		// below proves. An unencodable identifier has no attribution, so
+		// it fails closed.
 		let Ok(signer_id) = signer_info.sid.to_der() else {
 			return TransitStatus::PermissionDenied;
 		};
 
-		if !self.circuit_breaker.allow_request(&signer_id) {
+		// The breaker keys on the handshake-proven peer, because a failure
+		// reached here before the signature was checked. [`ProvenPeer`] is
+		// the only key the breaker accepts, so a caller who copies a
+		// trusted `SignerIdentifier` spends its own budget (CWE-345).
+		let breaker_key = session.proven_peer();
+
+		if !self.circuit_breaker.allow_request(breaker_key) {
 			return TransitStatus::PermissionDenied;
 		}
 
@@ -505,7 +514,7 @@ impl GatePolicy for ClusterSecurityGate {
 			TrustVerification::MissingSignature => return TransitStatus::Unauthenticated,
 			TrustVerification::UnknownSigner => return TransitStatus::PermissionDenied,
 			TrustVerification::Invalid => {
-				self.circuit_breaker.record_auth_failure(&signer_id);
+				self.circuit_breaker.record_auth_failure(breaker_key);
 				return TransitStatus::PermissionDenied;
 			}
 			TrustVerification::Verified => {}
@@ -529,7 +538,7 @@ impl GatePolicy for ClusterSecurityGate {
 			return TransitStatus::PermissionDenied;
 		}
 
-		self.circuit_breaker.record_success(&signer_id);
+		self.circuit_breaker.record_success(breaker_key);
 
 		TransitStatus::Ok
 	}
@@ -655,53 +664,67 @@ mod tests {
 
 	const SIGNER: &[u8] = b"signer-under-test";
 
+	/// The identity under test, as a handshake would prove it.
+	fn signer() -> ProvenPeer<'static> {
+		ProvenPeer::for_test(SIGNER)
+	}
+
+	/// A second proven identity, for isolation assertions.
+	fn other() -> ProvenPeer<'static> {
+		ProvenPeer::for_test(b"other-signer")
+	}
+
 	#[test]
 	fn breaker_trips_after_threshold() {
 		let breaker = ClusterCircuitBreaker::new(3, 60_000);
+		breaker.record_auth_failure(signer());
+		breaker.record_auth_failure(signer());
 
-		breaker.record_auth_failure(SIGNER);
-		breaker.record_auth_failure(SIGNER);
-		assert_eq!(breaker.state(SIGNER), CircuitState::Closed);
+		assert_eq!(breaker.state(signer()), CircuitState::Closed);
 
-		breaker.record_auth_failure(SIGNER);
-		assert_eq!(breaker.state(SIGNER), CircuitState::Open);
-		assert!(!breaker.allow_request(SIGNER));
+		breaker.record_auth_failure(signer());
+
+		assert_eq!(breaker.state(signer()), CircuitState::Open);
+		assert!(!breaker.allow_request(signer()));
 	}
 
 	#[test]
 	fn breaker_probe_success_closes() {
 		let breaker = ClusterCircuitBreaker::new(1, 0);
+		breaker.record_auth_failure(signer());
 
-		breaker.record_auth_failure(SIGNER);
-		assert!(breaker.allow_request(SIGNER));
-		assert_eq!(breaker.state(SIGNER), CircuitState::HalfOpen);
+		assert!(breaker.allow_request(signer()));
+		assert_eq!(breaker.state(signer()), CircuitState::HalfOpen);
 
-		breaker.record_success(SIGNER);
-		assert_eq!(breaker.state(SIGNER), CircuitState::Closed);
+		breaker.record_success(signer());
+
+		assert_eq!(breaker.state(signer()), CircuitState::Closed);
 	}
 
 	#[test]
 	fn breaker_probe_failure_reopens() {
 		let breaker = ClusterCircuitBreaker::new(1, 0);
+		breaker.record_auth_failure(signer());
 
-		breaker.record_auth_failure(SIGNER);
-		assert!(breaker.allow_request(SIGNER));
-		assert_eq!(breaker.state(SIGNER), CircuitState::HalfOpen);
+		assert!(breaker.allow_request(signer()));
+		assert_eq!(breaker.state(signer()), CircuitState::HalfOpen);
 
-		breaker.record_auth_failure(SIGNER);
-		assert_eq!(breaker.state(SIGNER), CircuitState::Open);
+		breaker.record_auth_failure(signer());
+
+		assert_eq!(breaker.state(signer()), CircuitState::Open);
 	}
 
 	#[test]
 	fn breaker_reset_clears_state() {
 		let breaker = ClusterCircuitBreaker::new(1, 60_000);
+		breaker.record_auth_failure(signer());
 
-		breaker.record_auth_failure(SIGNER);
-		assert!(breaker.is_open(SIGNER));
+		assert!(breaker.is_open(signer()));
 
-		breaker.reset(SIGNER);
-		assert_eq!(breaker.state(SIGNER), CircuitState::Closed);
-		assert!(breaker.allow_request(SIGNER));
+		breaker.reset(signer());
+
+		assert_eq!(breaker.state(signer()), CircuitState::Closed);
+		assert!(breaker.allow_request(signer()));
 	}
 
 	#[cfg(feature = "x509")]
@@ -785,7 +808,6 @@ mod tests {
 	fn backpressure_gate_ignores_priority() -> Result<(), crate::TightBeamError> {
 		let utilization = Arc::new(AtomicU16::new(9_500));
 		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
-
 		let frame = work_frame(Some(crate::MessagePriority::NetworkControl))?;
 		assert_eq!(
 			GatePolicy::evaluate(&gate, Some(&frame), &SessionContext::default()),
@@ -799,7 +821,6 @@ mod tests {
 	fn backpressure_gate_accepts_below_threshold() -> Result<(), crate::TightBeamError> {
 		let utilization = Arc::new(AtomicU16::new(1_000));
 		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
-
 		let frame = work_frame(None)?;
 		assert_eq!(
 			GatePolicy::evaluate(&gate, Some(&frame), &SessionContext::default()),
@@ -864,20 +885,119 @@ mod tests {
 		Ok(())
 	}
 
+	/// Trust store that resolves every signer and fails every signature,
+	/// which drives [`TrustVerification::Invalid`] deterministically.
+	#[derive(Debug)]
+	struct AlwaysInvalid {
+		certificate: crate::crypto::x509::Certificate,
+	}
+
+	impl crate::crypto::x509::policy::CertificateValidation for AlwaysInvalid {
+		fn evaluate(
+			&self,
+			_cert: &crate::crypto::x509::Certificate,
+		) -> Result<(), crate::crypto::x509::error::CertificateValidationError> {
+			Ok(())
+		}
+	}
+
+	impl crate::crypto::policy::VerificationPolicy for AlwaysInvalid {
+		fn verify_signature(
+			&self,
+			_algorithm: &crate::der::asn1::ObjectIdentifier,
+			_public_key_der: &[u8],
+			_message: &[u8],
+			_signature: &[u8],
+		) -> Result<(), crate::crypto::x509::error::CertificateValidationError> {
+			Err(
+				crate::crypto::x509::error::CertificateValidationError::SignatureVerificationFailed(
+					signature::Error::new(),
+				),
+			)
+		}
+	}
+
+	impl CertificateTrust for AlwaysInvalid {
+		fn is_trusted(&self, _cert: &crate::crypto::x509::Certificate) -> bool {
+			true
+		}
+
+		fn verify_chain(
+			&self,
+			_chain: &[crate::crypto::x509::Certificate],
+		) -> Result<(), crate::crypto::x509::error::CertificateValidationError> {
+			Ok(())
+		}
+
+		fn find_by_signer_info(&self, _signer_info: &crate::SignerInfo) -> Option<&crate::crypto::x509::Certificate> {
+			Some(&self.certificate)
+		}
+
+		fn to_policy_ref(&self) -> &dyn crate::crypto::policy::VerificationPolicy {
+			self
+		}
+	}
+
+	/// A caller who copies a trusted `SignerIdentifier` and attaches a bad
+	/// signature is counted against its own transport peer, so the copied
+	/// signer keeps its budget (CWE-345).
+	#[tokio::test]
+	async fn a_forged_signer_id_gates_the_sender_not_the_signer() -> Result<(), crate::TightBeamError> {
+		use crate::builder::TypeBuilder;
+
+		let signing_key = crate::testing::utils::create_test_signing_key();
+		let certificate = crate::testing::utils::create_test_certificate(&signing_key);
+		let provider = crate::crypto::key::EcdsaKeyProvider::from(signing_key.clone());
+
+		let unsigned = crate::utils::compose(crate::Version::V2)
+			.with_id(b"control")
+			.with_order(current_timestamp_ms())
+			.with_message(crate::testing::TestMessage { content: "payload".into() })
+			.with_witness_hasher::<crate::crypto::hash::Sha3_256>()
+			.build()?;
+		let signed = unsigned
+			.sign_with_provider::<crate::crypto::hash::Sha3_256, _>(&provider)
+			.await?;
+		let signer_id = signed
+			.nonrepudiation
+			.as_ref()
+			.and_then(|info| crate::der::Encode::to_der(&info.sid).ok())
+			.expect("the signed frame carries a signer id");
+
+		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 60_000));
+		let gate = ClusterSecurityGate::new(
+			Arc::clone(&breaker),
+			Arc::new(AlwaysInvalid { certificate: certificate.clone() }),
+			Arc::new(ReplayGuard::new(60_000)),
+		);
+
+		let sender = SessionContext::for_peer(Arc::new(certificate));
+		let sender_key = sender.peer_public_key().expect("the session carries a peer key").to_vec();
+		let verdicts = [
+			gate.evaluate(Some(&signed), &sender),
+			gate.evaluate(Some(&signed), &sender),
+			gate.evaluate(Some(&signed), &sender),
+		];
+
+		assert_eq!(verdicts, [TransitStatus::PermissionDenied; 3]);
+		assert!(breaker.is_open(ProvenPeer::for_test(&sender_key)));
+		assert!(!breaker.is_open(ProvenPeer::for_test(&signer_id)));
+
+		Ok(())
+	}
+
 	/// One signer's failures leave every other signer admitted, so a
 	/// compromised member leaves the colony control plane open (CWE-645).
 	#[test]
 	fn a_tripped_signer_does_not_gate_another() {
-		const OTHER: &[u8] = b"other-signer";
 		let breaker = ClusterCircuitBreaker::new(3, 60_000);
-
 		for _ in 0..3 {
-			breaker.record_auth_failure(SIGNER);
+			breaker.record_auth_failure(signer());
 		}
 
-		assert!(breaker.is_open(SIGNER));
-		assert!(!breaker.allow_request(SIGNER));
-		assert!(breaker.allow_request(OTHER));
+		assert!(breaker.is_open(signer()));
+		assert!(!breaker.allow_request(signer()));
+		assert!(breaker.allow_request(other()));
 	}
 
 	/// A signature recorded under one signer is refused under another, so
@@ -885,8 +1005,8 @@ mod tests {
 	#[test]
 	fn a_replay_is_refused_across_partitions() {
 		const OTHER: &[u8] = b"other-signer";
-		let guard = ReplayGuard::new(60_000);
 
+		let guard = ReplayGuard::new(60_000);
 		assert!(guard.check_and_insert(SIGNER, b"signature", 1_000));
 		assert!(!guard.check_and_insert(OTHER, b"signature", 1_000));
 	}
@@ -896,7 +1016,6 @@ mod tests {
 	#[test]
 	fn an_expired_record_is_admitted_again() {
 		let guard = ReplayGuard::new(1_000);
-
 		assert!(guard.check_and_insert(SIGNER, b"signature", 1_000));
 		assert!(guard.check_and_insert(SIGNER, b"signature", 5_000));
 	}

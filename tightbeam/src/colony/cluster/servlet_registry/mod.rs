@@ -13,8 +13,9 @@ mod select;
 mod tests;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
+use crate::colony::common::current_timestamp_ms;
 use crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
 
 pub(super) use super::error::ClusterError;
@@ -37,6 +38,7 @@ pub(super) struct Routes {
 	entries: HashMap<SharedId, Arc<ServletEntry>>,
 	by_type: HashMap<SharedId, Vec<SharedId>>,
 	by_bucket: HashMap<SharedId, Vec<SharedId>>,
+	ad_orders: HashMap<SharedId, u64>,
 }
 
 impl Routes {
@@ -136,11 +138,6 @@ impl Routes {
 		self.by_bucket.get(bucket).map_or(&[], Vec::as_slice)
 	}
 
-	/// Whether any route still occupies `bucket`.
-	pub(super) fn holds_bucket(&self, bucket: &[u8]) -> bool {
-		self.by_bucket.contains_key(bucket)
-	}
-
 	/// Whether a local route already claims `hive_id` as its key or bucket.
 	pub(super) fn peer_key_conflicts_local(&self, hive_id: &[u8]) -> bool {
 		if self.get(hive_id).is_some_and(|entry| entry.route_kind() == RouteKind::Local) {
@@ -194,33 +191,91 @@ impl Routes {
 		identities.len().saturating_add(usize::from(identity_is_new)) > max_identities
 	}
 
-	/// Admits a peer slate under the guard that will apply it.
+	/// Admits one advertisement: freshness, conflicts, caps, the swap, and
+	/// the order it applied at.
 	///
-	/// The conflict and cap probes read the same routes the swap mutates,
-	/// so a local install landing between a probe and the swap can no
-	/// longer be erased by it (CWE-367).
-	pub(super) fn admit_peer_slate(
+	/// Every step reads and writes under the guard the caller already
+	/// holds, so concurrent advertisements for one bucket apply in a
+	/// single order and the ledger always names the slate installed
+	/// (CWE-294, CWE-367).
+	#[allow(clippy::too_many_arguments)]
+	pub(super) fn admit_peer_ad(
 		&mut self,
-		bucket: &[u8],
+		bucket: &SharedId,
 		dial_addr: Option<&[u8]>,
 		slate: Vec<ServletEntry>,
 		count_kind: RouteKind,
 		max_identities: usize,
 		max_routes: usize,
+		order: u64,
+		tombstone_window_ms: u64,
 	) -> Result<(), ClusterError> {
-		if self.peer_key_conflicts_local(bucket) {
+		if self.ad_orders.get(bucket.as_ref()).is_some_and(|&applied| order < applied) {
+			return Err(ClusterError::StalePeerAd);
+		}
+		if self.peer_key_conflicts_local(bucket.as_ref()) {
 			return Err(ClusterError::PeerSlateConflict);
 		}
 		if dial_addr.is_some_and(|addr| self.peer_dial_conflicts_local(addr)) {
 			return Err(ClusterError::PeerSlateConflict);
 		}
-		if self.slate_exceeds_caps(bucket, slate.len(), count_kind, max_identities, max_routes) {
+		if self.slate_exceeds_caps(bucket.as_ref(), slate.len(), count_kind, max_identities, max_routes) {
 			return Err(ClusterError::PeerCapExceeded);
 		}
 
-		self.reconcile(bucket, slate);
+		let clearing = slate.is_empty();
+
+		self.reconcile(bucket.as_ref(), slate);
+
+		// A withdrawn direct slate withdraws the relay fallbacks learned
+		// from it, in the same step that withdraws the direct routes.
+		if clearing && count_kind == RouteKind::Peer {
+			self.remove_relay_trails_for_origin(bucket.as_ref());
+		}
+
+		self.record_ad_order(Arc::clone(bucket), order, tombstone_window_ms);
 
 		Ok(())
+	}
+
+	/// Drops every relay trail learned for one origin identity.
+	pub(super) fn remove_relay_trails_for_origin(&mut self, origin_id: &[u8]) -> usize {
+		let stale: Vec<SharedId> = self
+			.values()
+			.filter(|entry| entry.route_kind() == RouteKind::PeerRelay)
+			.filter(|entry| entry.owner_id().as_ref() == origin_id)
+			.map(|entry| Arc::clone(entry.route_key()))
+			.collect();
+
+		for route_key in &stale {
+			self.remove(route_key.as_ref());
+		}
+
+		stale.len()
+	}
+
+	/// Records the order this bucket last applied at.
+	///
+	/// A row lives as long as its bucket holds entries. Once the bucket
+	/// empties, the row survives one freshness window as a tombstone, so a
+	/// replayed older advertisement still loses to the withdrawal it would
+	/// otherwise undo (CWE-294).
+	fn record_ad_order(&mut self, bucket: SharedId, order: u64, tombstone_window_ms: u64) {
+		self.ad_orders.insert(bucket, order);
+
+		// Disjoint field borrows: the ledger prunes against the live index
+		// without copying its keys.
+		let now = current_timestamp_ms();
+		let by_bucket = &self.by_bucket;
+		self.ad_orders.retain(|bucket, applied| {
+			by_bucket.contains_key(bucket) || now.saturating_sub(*applied) <= tombstone_window_ms
+		});
+	}
+
+	/// Rows the order ledger holds.
+	#[cfg(test)]
+	pub(super) fn ad_order_rows(&self) -> usize {
+		self.ad_orders.len()
 	}
 
 	/// Applies one hive's additions and removals in a single step.
@@ -270,11 +325,6 @@ impl Routes {
 pub struct ServletRegistry {
 	/// Entries and the two reverse indexes derived from them.
 	pub(super) routes: RwLock<Routes>,
-	/// Newest advertisement order applied per peer bucket, which lets a
-	/// replayed older advertisement lose to the slate it would regress
-	/// (CWE-294). [`ServletRegistry::record_ad_order`] states how rows
-	/// enter and leave.
-	pub(super) ad_orders: Mutex<HashMap<SharedId, u64>>,
 	/// Milliseconds a dead bucket's order tombstone survives.
 	pub(super) ad_tombstone_window_ms: u64,
 	/// Scoring and lifecycle configuration.
@@ -286,7 +336,6 @@ impl ServletRegistry {
 	pub fn new(config: PheromoneConfig) -> Self {
 		Self {
 			routes: RwLock::new(Routes::default()),
-			ad_orders: Mutex::new(HashMap::new()),
 			ad_tombstone_window_ms: DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			config,
 		}

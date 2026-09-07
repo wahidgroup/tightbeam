@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use super::{ClusterError, PeerCaps, RouteKind, ServletEntry, ServletRegistry, SharedId};
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
-use crate::colony::common::current_timestamp_ms;
 
 impl ServletRegistry {
 	/// Adds a servlet entry.
@@ -41,19 +40,17 @@ impl ServletRegistry {
 		Ok(self.routes.write()?.remove(address))
 	}
 
-	/// Replaces one hive slate atomically.
+	/// Replaces one hive's slate atomically.
+	///
+	/// A local slate carries no advertisement order: the hive's own signed
+	/// registration gates it, and the order ledger belongs to the peer
+	/// advertisements that carry one.
 	pub fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
-		self.reconcile_slate(hive_id, entries)
-	}
-
-	fn reconcile_slate(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
 		self.routes.write()?.reconcile(hive_id, entries);
-
 		Ok(())
 	}
 
-	/// Reconciles an admitted peer slate after stale, conflict, and cap
-	/// checks.
+	/// Reconciles an admitted peer slate after stale, conflict, and cap checks.
 	///
 	/// The registry refuses an advertisement older than the newest one
 	/// applied for the origin, so a replayed ad inside the freshness
@@ -63,24 +60,16 @@ impl ServletRegistry {
 	pub fn reconcile_peer_slate(&self, ad: AdmittedPeerAd, caps: PeerCaps) -> Result<(), ClusterError> {
 		let AdmittedPeerAd { peer_hive_id, dial_addr, slate, order } = ad;
 
-		self.refuse_stale_ad(&peer_hive_id, order)?;
-
-		let clearing = slate.is_empty();
-
-		self.routes.write()?.admit_peer_slate(
+		self.routes.write()?.admit_peer_ad(
 			&peer_hive_id,
 			Some(&dial_addr),
 			slate,
 			RouteKind::Peer,
 			caps.max_gateways,
 			caps.max_routes,
-		)?;
-
-		if clearing {
-			self.remove_relay_trails_for_origin(&peer_hive_id)?;
-		}
-
-		self.record_ad_order(peer_hive_id, order)
+			order,
+			self.ad_tombstone_window_ms,
+		)
 	}
 
 	/// Replaces one relay-trail slate atomically under its own bucket.
@@ -100,67 +89,21 @@ impl ServletRegistry {
 	pub fn reconcile_relay_trail(&self, trail: RelayTrail, caps: PeerCaps) -> Result<(), ClusterError> {
 		let RelayTrail { bucket, slate, order } = trail;
 
-		self.refuse_stale_ad(&bucket, order)?;
-
-		self.routes.write()?.admit_peer_slate(
+		self.routes.write()?.admit_peer_ad(
 			&bucket,
 			None,
 			slate,
 			RouteKind::PeerRelay,
 			caps.max_relay_buckets,
 			caps.max_relay_routes,
-		)?;
-		self.record_ad_order(bucket, order)
-	}
-
-	/// Refuses an advertisement older than the newest applied for `bucket`.
-	fn refuse_stale_ad(&self, bucket: &[u8], order: u64) -> Result<(), ClusterError> {
-		let ledger = self.ad_orders.lock()?;
-		if ledger.get(bucket).is_some_and(|&applied| order < applied) {
-			return Err(ClusterError::StalePeerAd);
-		}
-
-		Ok(())
-	}
-
-	/// Records the applied advertisement order.
-	///
-	/// A row lives as long as its bucket holds entries. Once the bucket
-	/// empties, the row survives one freshness window as a tombstone, so a
-	/// replayed older advertisement still loses to the withdrawal it would
-	/// otherwise undo (CWE-294).
-	///
-	/// Orders are frame-issue timestamps, so past that window the freshness
-	/// gate refuses the replay on its own. Expired tombstones prune here,
-	/// which bounds the ledger to the peer caps plus the window.
-	fn record_ad_order(&self, bucket: SharedId, order: u64) -> Result<(), ClusterError> {
-		let mut ledger = self.ad_orders.lock()?;
-		ledger.insert(bucket, order);
-
-		let routes = self.routes.read()?;
-		let now = current_timestamp_ms();
-		ledger.retain(|bucket, applied| {
-			routes.holds_bucket(bucket.as_ref()) || now.saturating_sub(*applied) <= self.ad_tombstone_window_ms
-		});
-
-		Ok(())
+			order,
+			self.ad_tombstone_window_ms,
+		)
 	}
 
 	/// Removes every relay trail learned for one origin identity.
 	pub fn remove_relay_trails_for_origin(&self, origin_id: &[u8]) -> Result<usize, ClusterError> {
-		let mut routes = self.routes.write()?;
-		let stale: Vec<SharedId> = routes
-			.values()
-			.filter(|entry| entry.route_kind() == RouteKind::PeerRelay)
-			.filter(|entry| entry.owner_id().as_ref() == origin_id)
-			.map(|entry| Arc::clone(entry.route_key()))
-			.collect();
-
-		for route_key in &stale {
-			routes.remove(route_key.as_ref());
-		}
-
-		Ok(stale.len())
+		Ok(self.routes.write()?.remove_relay_trails_for_origin(origin_id))
 	}
 
 	/// Removes every entry belonging to a hive.

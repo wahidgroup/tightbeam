@@ -371,6 +371,43 @@ fn admitted_with_order(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>, order
 	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial_addr: Arc::from(dial), slate, order }
 }
 
+// Two advertisements for one bucket race. The order ledger and the
+// installed slate are one decision, so whichever applies last leaves the
+// ledger naming the slate that is installed. A ledger below the installed
+// order would admit a replay the withdrawal already refused (CWE-294).
+#[test]
+fn racing_ads_leave_the_ledger_naming_the_installed_slate() {
+	let registry = Arc::new(ServletRegistry::default());
+	let older = Arc::clone(&registry);
+	let newer = Arc::clone(&registry);
+
+	let low = std::thread::spawn(move || {
+		older
+			.reconcile_peer_slate(
+				admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"echo", b"origin")], 10),
+				PeerCaps::default(),
+			)
+			.ok()
+	});
+	let high = std::thread::spawn(move || {
+		newer
+			.reconcile_peer_slate(
+				admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], 20),
+				PeerCaps::default(),
+			)
+			.ok()
+	});
+
+	low.join().expect("thread joins");
+	high.join().expect("thread joins");
+
+	let installed: Vec<Arc<[u8]>> = routes(&registry)
+		.values()
+		.map(|entry| Arc::clone(entry.servlet_type()))
+		.collect();
+	assert_eq!(installed, vec![Arc::<[u8]>::from(b"calc".as_slice())]);
+}
+
 /// Relay trail under the composite `origin NUL relay` bucket.
 fn relay_trail(origin: &[u8], relay: &[u8], servlet_type: &[u8], dial: &[u8]) -> RelayTrail {
 	let slate = vec![ServletEntry::peer_relay(
@@ -547,7 +584,7 @@ fn expired_tombstone_prunes_from_the_ledger() {
 	let withdrawal = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![], issued + 1);
 	registry.reconcile_peer_slate(withdrawal, PeerCaps::default()).ok();
 
-	let rows = registry.ad_orders.lock().map(|ledger| ledger.len()).unwrap_or(usize::MAX);
+	let rows = routes(&registry).ad_order_rows();
 	assert_eq!(rows, 0);
 }
 

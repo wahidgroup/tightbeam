@@ -83,7 +83,7 @@ pub(crate) enum GossipOrigin {
 	Origin,
 }
 
-impl<P: Protocol> GossipPipelineCtx<P> {
+impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// The pool peers are dialed on.
 	///
 	/// A configured peer plane keeps peer traffic off the hive pool. With
@@ -890,8 +890,8 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 	pub(crate) config: Arc<ClusterConfig>,
 	/// Connection pool local ingress delivery dials on.
 	pub(crate) pool: Arc<ClusterPool<P>>,
-	/// Connection pool reserved for peer gateways, when one is configured.
-	pub(crate) peer_pool: Option<Arc<ClusterPool<P>>>,
+	/// Pool peers are dialed on, resolved once from the gateway's planes.
+	pub(crate) peer_pool: Arc<ClusterPool<P>>,
 	/// Instrumentation collector for gossip admission and refusal events.
 	pub(crate) trace: Arc<TraceCollector>,
 	/// Owner of the reflood this pipeline starts.
@@ -902,11 +902,13 @@ pub(crate) struct GossipPipelineCtx<P: Protocol> {
 impl<P: Protocol> From<GatewayRuntimeCtx<P>> for GossipPipelineCtx<P> {
 	/// Projects the gateway's runtime state onto what a rumor needs.
 	fn from(ctx: GatewayRuntimeCtx<P>) -> Self {
+		let peer_pool = ctx.peer_dial_pool();
+
 		Self {
 			servlet_registry: ctx.servlet_registry,
 			config: ctx.config,
+			peer_pool,
 			pool: ctx.pool,
-			peer_pool: ctx.peer_pool,
 			trace: ctx.trace,
 			tasks: ctx.tasks,
 		}
@@ -951,8 +953,7 @@ where
 		+ 'static,
 	D: ClusterDigest,
 {
-	let peer_dial_pool = ctx.peer_dial_pool();
-	let GossipPipelineCtx { servlet_registry, config, pool, peer_pool: _, trace, tasks } = ctx;
+	let GossipPipelineCtx { servlet_registry, config, pool, peer_pool, trace, tasks } = ctx;
 
 	let admitted = match AdmittedGossip::admit::<D>(
 		&rumor,
@@ -1052,7 +1053,7 @@ where
 	// gateway stops a reflood still dialling. The rumor moves into the task
 	// unchanged, and the reply only needs the outer frame id.
 	if hop_ttl > 0 && config.peer.table.has_targets() {
-		let reflood_pool = peer_dial_pool;
+		let reflood_pool = peer_pool;
 		let config = Arc::clone(&config);
 		let next_ttl = hop_ttl - 1;
 		tasks.spawn(reflood_gossip::<P, D>(reflood_pool, config, rumor, next_ttl));
@@ -1172,7 +1173,7 @@ where
 {
 	/// Runs the advertise and reconcile beat for this gateway.
 	pub(crate) fn spawn_advertise<D: ClusterDigest>(self, gateway_addr: Arc<[u8]>) -> rt::JoinHandle {
-		let pool = GossipPipelineCtx::from(self.clone()).peer_dial_pool();
+		let pool = self.peer_dial_pool();
 		let GatewayRuntimeCtx { servlet_registry, config, pool: local_pool, trace, tasks, .. } = self;
 
 		rt::spawn(async move {
