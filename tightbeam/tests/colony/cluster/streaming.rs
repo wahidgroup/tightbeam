@@ -77,7 +77,7 @@ servlet! {
 
 /// Hive hosting one stream-echo servlet, muxed on both the servlet
 /// server and the hive-to-cluster pool.
-pub(super) async fn start_stream_hive(
+pub async fn start_stream_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
@@ -105,7 +105,7 @@ fn mux_advertising_conf(certs: &ClusterTestCerts, peer: String) -> ClusterConfig
 
 /// Pooled mux lease against a gateway, for the routed stream entry
 /// points ([`PooledClient::open_stream_to`] / [`PooledClient::open_duplex_to`]).
-pub(super) async fn pooled_cluster_client(
+pub async fn pooled_cluster_client(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
 	addr: &<TokioListener as Protocol>::Address,

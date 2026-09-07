@@ -53,7 +53,7 @@ struct SplicePlan<P: Protocol> {
 
 /// Refuse a stream with a terminal transit status. The mux responder
 /// maps the failure onto the stream's `End` trailer.
-pub(super) fn refuse(status: TransitStatus) -> TightBeamError {
+pub fn refuse(status: TransitStatus) -> TightBeamError {
 	TransportError::from(status).into()
 }
 
@@ -66,13 +66,13 @@ fn relayed_route(target: &Urn<'static>, effective: u8) -> StreamRoute {
 
 /// Choose a route for `target` and turn it into a dialing plan.
 ///
-/// The inbound relay budget is clamped to the gateway's `max_hops`
-/// policy before selection, and a peer re-emit spends one hop.
-/// `exclude` removes one just-failed route key so a bounded retry
-/// picks the next-best trail. Before any dial, a non-bare or
-/// foreign-realm target refuses with `PermissionDenied`. An unroutable
-/// target (no live trail, or a peer target with no peer plane
-/// configured) refuses with `Unavailable`.
+/// The inbound relay budget is clamped to the gateway's `max_hops` policy
+/// before selection, and a peer re-emit spends one hop. `exclude` removes
+/// one just-failed route key so a bounded retry picks the next-best trail.
+///
+/// Before any dial, a non-bare or foreign-realm target refuses with
+/// `PermissionDenied`. An unroutable target (no live trail, or a peer
+/// target with no peer plane configured) refuses with `Unavailable`.
 fn plan_splice<P: Protocol>(
 	target: &Urn<'static>,
 	hops_remaining: u8,

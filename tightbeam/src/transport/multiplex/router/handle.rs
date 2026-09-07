@@ -44,7 +44,7 @@ use crate::transport::GateAudit;
 /// The stream's ID is read through its [`OpenSlot`] at drop time: a
 /// guard dropped before the Open ever went out stands down on its
 /// own (nothing on the wire, the reservation releases the cap slot).
-pub(super) struct CancelOnDrop {
+pub struct CancelOnDrop {
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
 	slot: Arc<OpenSlot>,
@@ -62,7 +62,7 @@ impl CancelOnDrop {
 		}
 	}
 
-	pub(super) fn disarm(&mut self) {
+	pub fn disarm(&mut self) {
 		self.armed = false;
 	}
 }
@@ -157,7 +157,7 @@ impl GateAudit for MuxHandle {
 impl MuxHandle {
 	/// Assemble a handle over the connection's shared state and
 	/// queues (refcount bumps only, no data copies).
-	pub(super) fn new(
+	pub fn new(
 		shared: Arc<MuxShared>,
 		outbound: mpsc::Sender<Outbound>,
 		drain_feedback: mpsc::UnboundedSender<DrainNote>,
@@ -172,8 +172,7 @@ impl MuxHandle {
 	///
 	/// Dropping the returned future before it resolves cancels the
 	/// stream: the pending entry is removed, the cap slot freed, and a
-	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`] sent. Per-stream timeouts
-	/// compose by wrapping this future in the caller's timer.
+	/// best-effort [`crate::transport::envelopes::MuxCancelPackage`] sent.
 	///
 	/// # Errors
 	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted

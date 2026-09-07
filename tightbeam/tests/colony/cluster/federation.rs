@@ -51,7 +51,7 @@ fn federation_ctx() -> FederationCtx {
 /// Member gateway conf on a fast beat: `peers` as anchors, the given
 /// peer-plane store, and a fast rumor refresh so late-promoted flood
 /// targets still learn the slate within the test window.
-pub(super) fn federation_conf(
+pub fn federation_conf(
 	certs: &ClusterTestCerts,
 	peer_trust: Arc<dyn CertificateTrust>,
 	peers: Vec<String>,
@@ -102,7 +102,7 @@ async fn start_beacon_hive(
 /// rumor under the receiving gateway's own key. Each call creates a
 /// fresh rumor, so every call floods anew (ads dedup on digest and are
 /// never repaired). Returns the admission status the gateway replied.
-pub(super) async fn flood_ad_rumor(
+pub async fn flood_ad_rumor(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
 	cluster: &ClusterGateway,
@@ -139,7 +139,7 @@ pub(super) async fn flood_ad_rumor(
 }
 
 /// Count the live peer routes for `type_name` on `cluster`.
-pub(super) fn type_route_count(cluster: &ClusterGateway, type_name: &str) -> usize {
+pub fn type_route_count(cluster: &ClusterGateway, type_name: &str) -> usize {
 	let canonical = type_canonical_bytes(&servlet_urn(type_name));
 	cluster
 		.peer_routes()
@@ -150,7 +150,7 @@ pub(super) fn type_route_count(cluster: &ClusterGateway, type_name: &str) -> usi
 
 /// Poll until `cluster` holds `want` routes for `type_name` or
 /// attempts exhaust. Branching lives here, not in scenarios.
-pub(super) async fn wait_for_type_routes(
+pub async fn wait_for_type_routes(
 	cluster: &ClusterGateway,
 	type_name: &str,
 	want: usize,

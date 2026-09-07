@@ -20,7 +20,7 @@ use crate::utils::urn::Urn;
 /// then take the stream credit and enqueue in one critical section
 /// (see [`MuxShared::poll_send_enqueue`]). Fails once the stream's
 /// ledger is gone (cancelled, resolved, or connection failure).
-pub(super) async fn send_data_envelope(
+pub async fn send_data_envelope(
 	shared: &MuxShared,
 	outbound: &mut mpsc::Sender<Outbound>,
 	stream_id: u32,
@@ -39,7 +39,7 @@ pub(super) async fn send_data_envelope(
 /// [`MuxShared::poll_open_enqueue`]): reserve a writer-queue slot,
 /// then assign the stream ID and enqueue in one critical section so
 /// Opens hit the wire in ID order.
-pub(super) async fn send_open_envelope(
+pub async fn send_open_envelope(
 	shared: &MuxShared,
 	outbound: &mut mpsc::Sender<Outbound>,
 	reservation: &mut StreamReservation,
@@ -105,7 +105,7 @@ impl RequestSink {
 	/// Sink over a reserved (unopened) stream. `duplex` carries the
 	/// reply forwarder to register once the ID exists. `target` and
 	/// `hops_remaining` stamp the stream's Open with a grpc-style route.
-	pub(super) fn new(
+	pub fn new(
 		reservation: StreamReservation,
 		kind: MuxStreamKind,
 		shared: Arc<MuxShared>,
@@ -288,7 +288,7 @@ pub struct ReplySink {
 }
 
 impl ReplySink {
-	pub(super) fn new(stream_id: u32, shared: Arc<MuxShared>, outbound: mpsc::Sender<Outbound>) -> Self {
+	pub fn new(stream_id: u32, shared: Arc<MuxShared>, outbound: mpsc::Sender<Outbound>) -> Self {
 		// Streamed replies learn their length push by push
 		shared.register_send_stream(stream_id, 0);
 

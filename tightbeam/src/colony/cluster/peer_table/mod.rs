@@ -33,6 +33,10 @@ use core::str::FromStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+mod guard;
+
+use guard::{GuardedTable, PeerEntry, TableState};
+
 use super::ClusterError;
 use crate::colony::common::PeerGossip;
 use crate::constants::{
@@ -159,30 +163,6 @@ impl PeerStore for MemoryPeerStore {
 	}
 }
 
-#[derive(Debug, Clone)]
-struct PeerEntry {
-	peer_id: Option<Vec<u8>>,
-	last_probe_ms: u64,
-	/// Consecutive failed beat dials since the last verified probe.
-	///
-	/// The count lives in memory only. A restart starts the count at
-	/// zero because the following beats re-verify every resident.
-	failures: usize,
-}
-
-#[derive(Debug, Default)]
-struct TableState {
-	new: HashMap<String, PeerEntry>,
-	tried: HashMap<String, PeerEntry>,
-	/// Anchors whose beat dial passed the colony gate.
-	///
-	/// A seed shares its verified anchors over PEX, which is how a
-	/// bootstrapping peer learns its first dial targets.
-	anchors_verified: HashMap<String, PeerEntry>,
-	/// This gateway's own advertised address, held out of peer admission.
-	local: Option<String>,
-}
-
 /// Anchored bounded peer discovery table.
 ///
 /// Interior mutability lets the advertise beat, reconcile rounds, and
@@ -190,8 +170,14 @@ struct TableState {
 pub struct PeerTable {
 	anchors: Vec<String>,
 	anchor_keys: HashSet<String>,
-	state: Mutex<TableState>,
+	state: GuardedTable,
 	store: Arc<dyn PeerStore>,
+	/// Newest generation written, and the gate that orders driver writes.
+	///
+	/// This is separate from `state`, so a slow driver delays the next
+	/// write rather than the routing reads that take the table lock
+	/// (CWE-667).
+	persisted: Mutex<u64>,
 }
 
 impl Default for PeerTable {
@@ -301,14 +287,22 @@ impl PeerTable {
 			.iter()
 			.map(|anchor| address_key(anchor).unwrap_or_else(|| anchor.clone()))
 			.collect();
-		let table = Self { anchors, anchor_keys, state: Mutex::new(TableState::default()), store };
 
+		let table = Self {
+			anchors,
+			anchor_keys,
+			state: GuardedTable::default(),
+			store,
+			persisted: Mutex::new(0),
+		};
 		let records = table.store.hydrate().unwrap_or_default();
-		if let Ok(mut state) = table.state.lock() {
+		let _ = table.state.change(|state| {
 			for record in records {
-				table.admit_record(&mut state, record);
+				table.admit_record(state, record);
 			}
-		}
+
+			((), false)
+		});
 
 		table
 	}
@@ -479,9 +473,8 @@ impl PeerTable {
 	/// The returned targets outlive the table lock, so each beat draws
 	/// owned copies. The set is bounded by the anchor and tried caps.
 	pub fn target_set(&self) -> Result<Vec<String>, ClusterError> {
-		let state = self.state.lock()?;
+		let mut learned = self.state.read(|state| state.tried.keys().cloned().collect::<Vec<String>>())?;
 		let mut targets = self.anchors.clone();
-		let mut learned: Vec<String> = state.tried.keys().cloned().collect();
 
 		learned.sort();
 		targets.extend(learned);
@@ -496,15 +489,19 @@ impl PeerTable {
 	/// probed candidate. Sampled candidates are stamped with `now_ms` so
 	/// later beats rotate through the backlog.
 	pub fn probe_sample(&self, now_ms: u64) -> Result<Vec<String>, ClusterError> {
-		let mut state = self.state.lock()?;
-		let sample = diversity_sample(state.new.iter(), PEER_PROBE_PER_BEAT);
-		for addr in &sample {
-			if let Some(entry) = state.new.get_mut(addr) {
-				entry.last_probe_ms = now_ms;
+		// A probe stamp rotates the backlog within a run. The next durable
+		// change carries whatever stamp is current, so the beat spends no
+		// driver write of its own.
+		self.with_table(|state| {
+			let sample = diversity_sample(state.new.iter(), PEER_PROBE_PER_BEAT);
+			for addr in &sample {
+				if let Some(entry) = state.new.get_mut(addr) {
+					entry.last_probe_ms = now_ms;
+				}
 			}
-		}
 
-		Ok(sample)
+			(sample, false)
+		})
 	}
 
 	/// Diversity-bucketed sample of verified peers to share over PEX.
@@ -516,31 +513,29 @@ impl PeerTable {
 	/// Only probe-verified peers are shared. Forwarding an unverified hint
 	/// would launder it with this gateway's reputation.
 	pub fn sample_for_pex(&self, cap: usize) -> Result<Vec<PeerRecord>, ClusterError> {
-		let state = self.state.lock()?;
-
-		// Anchors and tried are disjoint maps, so chaining them borrows a
-		// disjoint shareable view without building a merged copy. Only the
-		// sampled records own their data, because they outlive the lock.
-		let shareable = state.tried.iter().chain(state.anchors_verified.iter());
-		let sample = diversity_sample(shareable, cap)
-			.into_iter()
-			.filter_map(|addr| {
-				let entry = state.tried.get(&addr).or_else(|| state.anchors_verified.get(&addr))?;
-				Some(PeerRecord {
-					gateway_addr: addr,
-					peer_id: entry.peer_id.clone(),
-					tried: true,
-					last_probe_ms: entry.last_probe_ms,
+		self.state.read(|state| {
+			// Anchors and tried are disjoint maps, so chaining them borrows a
+			// disjoint shareable view without building a merged copy. Only the
+			// sampled records own their data, because they outlive the guard.
+			let shareable = state.tried.iter().chain(state.anchors_verified.iter());
+			diversity_sample(shareable, cap)
+				.into_iter()
+				.filter_map(|addr| {
+					let entry = state.tried.get(&addr).or_else(|| state.anchors_verified.get(&addr))?;
+					Some(PeerRecord {
+						gateway_addr: addr,
+						peer_id: entry.peer_id.clone(),
+						tried: true,
+						last_probe_ms: entry.last_probe_ms,
+					})
 				})
-			})
-			.collect();
-		Ok(sample)
+				.collect()
+		})
 	}
 
 	/// Current learned sizes as `(new, tried)` for operators and tests.
 	pub fn learned(&self) -> Result<(usize, usize), ClusterError> {
-		let state = self.state.lock()?;
-		Ok((state.new.len(), state.tried.len()))
+		self.state.read(|state| (state.new.len(), state.tried.len()))
 	}
 
 	/// Record this gateway's own advertised address.
@@ -553,11 +548,15 @@ impl PeerTable {
 			return Ok(());
 		};
 
-		let mut state = self.state.lock()?;
-		state.new.remove(&key);
-		state.tried.remove(&key);
-		state.local = Some(key);
-		Ok(())
+		// The advertise beat re-excludes on every start, so the local
+		// address needs no driver write to stay out of admission.
+		self.with_table(|state| {
+			state.new.remove(&key);
+			state.tried.remove(&key);
+			state.local = Some(key);
+
+			((), false)
+		})
 	}
 
 	/// Whether any dial target exists.
@@ -570,7 +569,7 @@ impl PeerTable {
 			return true;
 		}
 
-		self.state.lock().map(|state| !state.tried.is_empty()).unwrap_or(false)
+		self.state.read(|state| !state.tried.is_empty()).unwrap_or(false)
 	}
 
 	/// Admit one record into its table under the capped admission path.
@@ -619,56 +618,50 @@ impl PeerTable {
 		true
 	}
 
-	/// Persist the learned tables best-effort.
-	///
-	/// The in-memory table stays authoritative, so the beat proceeds through
-	/// a driver write fault. The next mutation retries the write.
-	///
-	/// Each record is an owned copy: [`PeerRecord`] owns its fields by
-	/// the [`PeerStore`] contract, so the snapshot outlives the guard that
-	/// produced it.
-	fn snapshot(state: &TableState) -> Vec<PeerRecord> {
-		state
-			.new
-			.iter()
-			.map(|(addr, entry)| (addr, entry, false))
-			.chain(state.tried.iter().map(|(addr, entry)| (addr, entry, true)))
-			.map(|(addr, entry, tried)| PeerRecord {
-				gateway_addr: addr.clone(),
-				peer_id: entry.peer_id.clone(),
-				tried,
-				last_probe_ms: entry.last_probe_ms,
-			})
-			.collect()
-	}
-
-	/// Applies `change` under the table lock, then writes the snapshot it
+	/// Applies `change` under the table guard, then writes the snapshot it
 	/// asked for.
 	///
 	/// `change` returns its outcome and whether the learned tables moved.
 	/// Every mutation routes through here, so the decision to write lives in
 	/// one place, and the guard is released before the pluggable driver runs.
 	/// A driver that blocks therefore delays no other caller (CWE-667).
+	///
+	/// The in-memory table stays authoritative, so the beat proceeds through
+	/// a driver write fault. The next mutation retries the write.
 	fn with_table<T>(&self, change: impl FnOnce(&mut TableState) -> (T, bool)) -> Result<T, ClusterError> {
-		let (outcome, snapshot) = {
-			let mut state = self.state.lock()?;
-			let (outcome, persist) = change(&mut state);
-
-			(outcome, persist.then(|| Self::snapshot(&state)))
-		};
-
-		if let Some(records) = snapshot {
-			let _ = self.store.persist(&records);
+		let (outcome, write) = self.state.change(change)?;
+		if let Some(write) = write {
+			self.persist_at(write.generation, &write.records);
 		}
 
 		Ok(outcome)
+	}
+
+	/// Writes `records` when `generation` is newer than what the driver holds.
+	///
+	/// The gate serialises driver writes, so concurrent mutations reach the
+	/// driver in generation order. A snapshot a newer generation already
+	/// superseded is dropped, which keeps an evicted peer from returning on
+	/// the next hydrate.
+	fn persist_at(&self, generation: u64, records: &[PeerRecord]) {
+		let Ok(mut persisted) = self.persisted.lock() else {
+			return;
+		};
+
+		if generation <= *persisted {
+			return;
+		}
+
+		let _ = self.store.persist(records);
+		*persisted = generation;
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::sync::atomic::{AtomicUsize, Ordering};
+	use core::time::Duration;
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 	fn hint(addr: &str) -> PeerHint {
 		PeerHint { gateway_addr: addr.to_string(), peer_id: None }
@@ -986,11 +979,87 @@ mod tests {
 		Ok(())
 	}
 
+	/// Driver that stalls its first write until released, and records the
+	/// row count each snapshot carried.
+	#[derive(Debug, Default)]
+	struct StallingStore {
+		widths: Mutex<Vec<usize>>,
+		started: AtomicUsize,
+		released: AtomicBool,
+	}
+
+	impl StallingStore {
+		/// Blocks until the driver has entered its first write.
+		fn await_first_write(&self) {
+			while self.started.load(Ordering::SeqCst) == 0 {
+				std::thread::yield_now();
+			}
+		}
+
+		/// Blocks the caller until [`StallingStore::release`] runs.
+		fn await_release(&self) {
+			while !self.released.load(Ordering::SeqCst) {
+				std::thread::yield_now();
+			}
+		}
+
+		fn release(&self) {
+			self.released.store(true, Ordering::SeqCst);
+		}
+	}
+
+	impl PeerStore for StallingStore {
+		fn hydrate(&self) -> Result<Vec<PeerRecord>, ClusterError> {
+			Ok(Vec::new())
+		}
+
+		fn persist(&self, records: &[PeerRecord]) -> Result<(), ClusterError> {
+			if self.started.fetch_add(1, Ordering::SeqCst) == 0 {
+				self.await_release();
+			}
+
+			if let Ok(mut widths) = self.widths.lock() {
+				widths.push(records.len());
+			}
+
+			Ok(())
+		}
+	}
+
+	/// A snapshot taken under the guard holds every earlier change, so the
+	/// driver's rows only ever grow. A stale snapshot landing after a newer
+	/// one would hydrate peers a later mutation removed (CWE-362).
+	///
+	/// The first write stalls inside the driver while a second mutation
+	/// runs, which is the interleaving that reorders unguarded writes.
+	#[test]
+	fn driver_writes_land_in_generation_order() -> Result<(), ClusterError> {
+		let store = Arc::new(StallingStore::default());
+		let table = Arc::new(PeerTable::new(Vec::<String>::new(), Arc::clone(&store) as Arc<dyn PeerStore>));
+		let first = Arc::clone(&table);
+		let stalled = std::thread::spawn(move || first.learn(vec![hint("10.1.0.1:9000")]));
+
+		store.await_first_write();
+
+		let second = Arc::clone(&table);
+		let follower = std::thread::spawn(move || second.learn(vec![hint("10.2.0.1:9000")]));
+
+		std::thread::sleep(Duration::from_millis(50));
+		store.release();
+		stalled.join().expect("thread joins")?;
+		follower.join().expect("thread joins")?;
+
+		let widths = store.widths.lock().expect("driver handle").clone();
+		assert!(widths.windows(2).all(|pair| pair[0] <= pair[1]));
+		assert_eq!(widths.last().copied(), Some(2));
+
+		Ok(())
+	}
+
 	/// A driver that reaches back into the table while it is being written.
 	///
-	/// The write runs after the guard is released, so this re-entry
-	/// succeeds. Holding the guard across the driver call would deadlock
-	/// on a non-reentrant mutex instead (CWE-667).
+	/// The write runs after the table guard is released, so this re-entry
+	/// reads the table it was called from (CWE-667).
 	struct ReentrantStore {
 		table: Mutex<Option<Arc<PeerTable>>>,
 		observed: AtomicUsize,

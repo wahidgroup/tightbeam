@@ -6,24 +6,24 @@ use crate::transport::multiplex::StreamId;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE;
 
-pub(super) fn cap_as_usize(cap: u32) -> usize {
+pub fn cap_as_usize(cap: u32) -> usize {
 	usize::try_from(cap).unwrap_or(usize::MAX)
 }
 
-pub(super) fn len_as_u64(len: usize) -> u64 {
+pub fn len_as_u64(len: usize) -> u64 {
 	u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// Chunk records a payload occupies at `chunk_size` bytes per chunk.
 /// An empty payload travels inline in its trailer and occupies none.
-pub(super) fn chunk_records(payload_len: usize, chunk_size: usize) -> u64 {
+pub fn chunk_records(payload_len: usize, chunk_size: usize) -> u64 {
 	len_as_u64(payload_len).div_ceil(len_as_u64(chunk_size.max(1)))
 }
 
 /// Session-budget credits a payload debits: `ceil(len / credit_unit)`
 /// summed per chunk, so the sender's whole-frame debit equals the sum
 /// of the receiver's per-chunk debits.
-pub(super) fn payload_credits(payload_len: usize, chunk_size: usize, credit_unit: u32) -> u64 {
+pub fn payload_credits(payload_len: usize, chunk_size: usize, credit_unit: u32) -> u64 {
 	let chunk_size = len_as_u64(chunk_size.max(1));
 	let unit = u64::from(credit_unit.max(1));
 	let len = len_as_u64(payload_len);
@@ -41,7 +41,7 @@ pub(super) fn payload_credits(payload_len: usize, chunk_size: usize, credit_unit
 /// plus fixed slack so the exchange legs land before the drain
 /// threshold would trip ([`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]).
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(super) fn renewal_floor(drain_floor: u64) -> u64 {
+pub fn renewal_floor(drain_floor: u64) -> u64 {
 	drain_floor.saturating_add(DEFAULT_REKEY_RENEWAL_ALLOWANCE)
 }
 

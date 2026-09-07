@@ -16,7 +16,7 @@ use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
 
 /// Chunk-level event the reader forwards to a [`StreamBody`].
-pub(super) enum BodyEvent {
+pub enum BodyEvent {
 	Chunk(Vec<u8>),
 	/// Clean `last`-flagged end of the body.
 	End,
@@ -29,9 +29,9 @@ pub(super) enum BodyEvent {
 /// `consumed` is the absolute chunk count the handler has drained,
 /// the reader's input to credit replenishment. Monotonic and
 /// idempotent like every ledger position in the credit design.
-pub(super) struct DrainNote {
-	pub(super) stream_id: u32,
-	pub(super) consumed: u64,
+pub struct DrainNote {
+	pub stream_id: u32,
+	pub consumed: u64,
 }
 
 /// Incremental stream body: a peer request under
@@ -65,7 +65,7 @@ pub struct StreamBody {
 impl StreamBody {
 	/// Arm the drop guard: dropping this body before its terminal
 	/// event cancels the stream on both endpoints.
-	pub(super) fn arm_guard(&mut self, guard: CancelOnDrop) {
+	pub fn arm_guard(&mut self, guard: CancelOnDrop) {
 		self.guard = Some(guard);
 	}
 
@@ -175,7 +175,7 @@ impl Stream for StreamBody {
 /// Channel capacity covers the grant window plus the `End` marker:
 /// the reader clamps streaming grants to `consumed + window`, so a
 /// conforming peer can never overrun the channel.
-pub(super) fn stream_body(
+pub fn stream_body(
 	slot: Arc<OpenSlot>,
 	window: u64,
 	drained: mpsc::UnboundedSender<DrainNote>,
@@ -190,7 +190,7 @@ pub(super) fn stream_body(
 
 /// Reader-side ledger of a streaming request: chunks forward into
 /// the body channel instead of a reassembly buffer.
-pub(super) struct ForwardedStream {
+pub struct ForwardedStream {
 	events: mpsc::Sender<BodyEvent>,
 	/// Chunks accepted so far
 	received: u64,
@@ -203,19 +203,19 @@ pub(super) struct ForwardedStream {
 
 impl ForwardedStream {
 	/// Current `(limit, window)` pair for grant arithmetic.
-	pub(super) fn limits(&self) -> (u64, u64) {
+	pub fn limits(&self) -> (u64, u64) {
 		(self.limit, self.window)
 	}
 
 	/// Raise the granted limit. Grants are absolute and monotonic
 	/// ([RFC 9113 § 6.9.1](https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1)),
 	/// so a stale lower value is ignored.
-	pub(super) fn raise_limit(&mut self, limit: u64) {
+	pub fn raise_limit(&mut self, limit: u64) {
 		self.limit = self.limit.max(limit);
 	}
 
 	/// Account one arriving chunk against the granted limit.
-	pub(super) fn accept_chunk(&mut self) -> bool {
+	pub fn accept_chunk(&mut self) -> bool {
 		if self.received >= self.limit {
 			return false;
 		}
@@ -229,7 +229,7 @@ impl ForwardedStream {
 	/// conforming peer (grants are clamped to channel capacity), so
 	/// overflow reports as a failure like a disconnect. A dropped
 	/// (Closed) body is also failure: consumed credit stays consumed.
-	pub(super) fn forward(&mut self, event: BodyEvent) -> bool {
+	pub fn forward(&mut self, event: BodyEvent) -> bool {
 		self.events.try_send(event).is_ok()
 	}
 
@@ -238,7 +238,7 @@ impl ForwardedStream {
 	/// trailers, empty bodies) consume their credit but forward no
 	/// chunk event: the consumer sees data or the end, never a
 	/// phantom empty chunk.
-	pub(super) fn accept_and_forward(&mut self, payload: &[u8]) -> bool {
+	pub fn accept_and_forward(&mut self, payload: &[u8]) -> bool {
 		if !self.accept_chunk() {
 			return false;
 		}
@@ -251,7 +251,7 @@ impl ForwardedStream {
 
 	/// Whether the consuming body has been dropped (refused at the
 	/// cap or abandoned by its handler).
-	pub(super) fn severed(&self) -> bool {
+	pub fn severed(&self) -> bool {
 		self.events.is_closed()
 	}
 }

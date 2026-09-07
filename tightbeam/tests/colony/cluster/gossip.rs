@@ -121,7 +121,7 @@ async fn send_gossip_frame_as(
 /// `cluster`. The decoded status records as `GOSSIP_RELAY_STATUS`.
 /// Frame ids derive from `label`, so each call floods a distinct
 /// digest.
-pub(super) async fn relay_application_rumor(
+pub async fn relay_application_rumor(
 	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
