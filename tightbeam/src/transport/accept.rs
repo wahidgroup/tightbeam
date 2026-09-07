@@ -2,16 +2,16 @@
 //!
 //! [`AcceptPlane`] is the crate's accept loop. The servlet, hive, gateway,
 //! and `server!` planes each drive one, so the connection cap, the permit
-//! lifetime, the handler task set, and the accept-failure budget stated once.
+//! lifetime, the handler task set, and the accept retry pace stated once.
 
 use core::future::Future;
 use std::sync::Arc;
 
-use crate::constants::{DEFAULT_ACCEPT_FAILURE_BUDGET, DEFAULT_ACCEPT_RETRY_DELAY, DEFAULT_MAX_SERVER_CONNECTIONS};
+use crate::constants::{DEFAULT_ACCEPT_RETRY_DELAY, DEFAULT_MAX_SERVER_CONNECTIONS};
 use crate::runtime::rt;
 use crate::transport::protocols::AsyncListenerTrait;
 
-/// Accepts connections under a fixed budget, owning what it admits.
+/// Accepts connections under a fixed cap, owning what it admits.
 ///
 /// One permit per live connection caps concurrent handlers, so a connection
 /// flood queues in the listener backlog, which bounds live tasks and
@@ -21,7 +21,6 @@ use crate::transport::protocols::AsyncListenerTrait;
 pub struct AcceptPlane {
 	permits: Arc<tokio::sync::Semaphore>,
 	connections: tokio::task::JoinSet<()>,
-	consecutive_failures: u32,
 }
 
 impl Default for AcceptPlane {
@@ -41,7 +40,6 @@ impl AcceptPlane {
 		Self {
 			permits: Arc::new(tokio::sync::Semaphore::new(max_connections)),
 			connections: tokio::task::JoinSet::new(),
-			consecutive_failures: 0,
 		}
 	}
 
@@ -58,7 +56,6 @@ impl AcceptPlane {
 	where
 		F: Future<Output = ()> + Send + 'static,
 	{
-		self.consecutive_failures = 0;
 		self.connections.spawn(async move {
 			let _permit = permit;
 			handler.await;
@@ -67,17 +64,11 @@ impl AcceptPlane {
 
 	/// Waits out one failed accept.
 	///
-	/// Returns `false` once the failures exhaust
-	/// [`DEFAULT_ACCEPT_FAILURE_BUDGET`], which stops a loop whose listener
-	/// has closed.
-	async fn absorb_failure(&mut self) -> bool {
-		self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-		if self.consecutive_failures > DEFAULT_ACCEPT_FAILURE_BUDGET {
-			return false;
-		}
-
+	/// A listener this plane holds stays usable, so an accept failure is a
+	/// descriptor shortage or a refused peer. The plane paces the retry and
+	/// keeps accepting. The task's owner ends the loop.
+	async fn absorb_failure(&self) {
 		rt::sleep(DEFAULT_ACCEPT_RETRY_DELAY).await;
-		true
 	}
 
 	/// Accepts on `listener` until the plane closes, running each admitted
@@ -124,9 +115,7 @@ impl AcceptPlane {
 
 			drop(permit);
 			failure.await;
-			if !self.absorb_failure().await {
-				break;
-			}
+			self.absorb_failure().await;
 		}
 	}
 }
@@ -136,16 +125,6 @@ mod tests {
 	use super::*;
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::Duration;
-
-	/// Fails `plane` up to its budget, returning the last verdict.
-	async fn spend_failure_budget(plane: &mut AcceptPlane) -> bool {
-		let mut verdict = true;
-		for _ in 0..DEFAULT_ACCEPT_FAILURE_BUDGET {
-			verdict = plane.absorb_failure().await;
-		}
-
-		verdict
-	}
 
 	#[tokio::test(start_paused = true)]
 	async fn a_full_plane_admits_no_further_connection() {
@@ -162,23 +141,6 @@ mod tests {
 		plane.serve(permit, async {});
 		tokio::task::yield_now().await;
 		assert!(tokio::time::timeout(Duration::from_secs(1), plane.reserve()).await.is_ok());
-	}
-
-	#[tokio::test(start_paused = true)]
-	async fn the_budget_ends_a_loop_whose_listener_stays_broken() {
-		let mut plane = AcceptPlane::new(1);
-		assert!(spend_failure_budget(&mut plane).await);
-		assert!(!plane.absorb_failure().await);
-	}
-
-	#[tokio::test(start_paused = true)]
-	async fn a_served_connection_restores_the_budget() {
-		let mut plane = AcceptPlane::new(1);
-		assert!(spend_failure_budget(&mut plane).await);
-
-		let permit = plane.reserve().await.expect("a free slot");
-		plane.serve(permit, async {});
-		assert!(spend_failure_budget(&mut plane).await);
 	}
 
 	#[tokio::test]

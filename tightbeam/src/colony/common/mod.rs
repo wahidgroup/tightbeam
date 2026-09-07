@@ -681,6 +681,29 @@ mod tests {
 		assert!(!FINISHED.load(std::sync::atomic::Ordering::SeqCst));
 	}
 
+	/// A beat already past its own checks is ended by the group that owns
+	/// it, so work cannot outlast the stop that withdrew its routes
+	/// (CWE-362).
+	#[tokio::test]
+	async fn a_running_task_ends_when_its_group_stops() {
+		static BEATS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+		let group = TaskGroup::default();
+		group.spawn(async {
+			loop {
+				BEATS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		});
+
+		tokio::time::sleep(Duration::from_millis(30)).await;
+		group.abort_all();
+		let settled = BEATS.load(std::sync::atomic::Ordering::SeqCst);
+
+		tokio::time::sleep(Duration::from_millis(40)).await;
+		assert_eq!(BEATS.load(std::sync::atomic::Ordering::SeqCst), settled);
+	}
+
 	#[tokio::test]
 	async fn work_started_after_the_stop_does_not_outlive_it() {
 		static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

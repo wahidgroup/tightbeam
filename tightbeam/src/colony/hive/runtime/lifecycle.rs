@@ -295,16 +295,12 @@ where
 				hive_addr: self.addr,
 				config: self.config.clone(),
 				tasks: self.tasks.clone(),
-				drain: self.drain.clone(),
 			}
 			.spawn(),
 		);
 
 		// Re-announce the slate each interval. Gateway registries are soft state.
-		self.tasks.adopt(
-			self.cluster_link()
-				.spawn_reregister(Arc::clone(&self.trace), self.drain.clone()),
-		);
+		self.tasks.adopt(self.cluster_link().spawn_reregister(Arc::clone(&self.trace)));
 
 		Ok(())
 	}
@@ -361,6 +357,11 @@ where
 
 	async fn drain(&self) -> Result<(), TightBeamError> {
 		self.drain.begin();
+
+		// Stop the beats before waiting on commands. A re-announce or a
+		// scale-up that outlived the wait would reinstall the very routes
+		// this drain withdraws (CWE-362).
+		self.tasks.abort_all();
 
 		let drain_timeout = self.config.control.drain_timeout;
 		let start = Instant::now();

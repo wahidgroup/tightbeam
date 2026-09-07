@@ -6,7 +6,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::builder::TypeBuilder;
-use crate::colony::common::{current_timestamp_ms, ClusterRequest, DrainMode, TaskGroup};
+use crate::colony::common::{current_timestamp_ms, ClusterRequest, TaskGroup};
 use crate::colony::hive::{
 	HashMapRegistry, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
 	ServletAddressUpdateResponse, ServletInfo, ServletRegistry,
@@ -171,7 +171,7 @@ where
 	///
 	/// The beat ends once the hive drains: a hive that is going away stops
 	/// advertising itself, and the drain announces its emptied slate once.
-	pub fn spawn_reregister(&self, trace: Arc<TraceCollector>, drain: DrainMode) -> rt::JoinHandle {
+	pub fn spawn_reregister(&self, trace: Arc<TraceCollector>) -> rt::JoinHandle {
 		let link = self.clone();
 		rt::spawn(async move {
 			let Some(interval) = link.config.control.reregister_interval else {
@@ -180,10 +180,6 @@ where
 
 			loop {
 				tokio::time::sleep(interval).await;
-
-				if drain.is_draining() {
-					return;
-				}
 
 				for gateway in link.gateways() {
 					let outcome = link.register(gateway).await;

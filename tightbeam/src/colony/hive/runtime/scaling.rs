@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::colony::common::{
-	aggregate_utilization, canonical_bytes, instance_urn, type_prefix_bytes, DrainMode, ScalingDecision,
-	ScalingMetrics, ServletInfo, ServletScaleConfig, TaskGroup,
+	aggregate_utilization, canonical_bytes, instance_urn, type_prefix_bytes, ScalingDecision, ScalingMetrics,
+	ServletInfo, ServletScaleConfig, TaskGroup,
 };
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
 use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistration, ServletRegistry, SpawnerFn};
@@ -42,8 +42,6 @@ pub struct ScalingLoop<P: Protocol> {
 	pub config: HiveConfig,
 	/// Owner of the gateway notifications this loop starts.
 	pub tasks: TaskGroup,
-	/// Drain state. A draining hive stops changing its own slate.
-	pub drain: DrainMode,
 }
 
 impl<P> ScalingLoop<P>
@@ -69,7 +67,6 @@ where
 			hive_addr,
 			config,
 			tasks,
-			drain,
 		} = ctx;
 
 		let config = Arc::new(config);
@@ -87,11 +84,6 @@ where
 
 			loop {
 				tokio::time::sleep(config.scaling.cooldown).await;
-
-				// Drain is terminal, so the loop ends here.
-				if drain.is_draining() {
-					return;
-				}
 
 				let scale_blocked = is_scale_blocked(hive_urn.is_none(), &link);
 				let mut hive_total_util = 0u64;

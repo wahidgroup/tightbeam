@@ -166,22 +166,10 @@ pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
 ///   <https://cwe.mitre.org/data/definitions/400.html>
 pub const DEFAULT_MAX_SERVER_CONNECTIONS: usize = 1024;
 
-/// Consecutive accept failures an accept loop absorbs before it stops
-///
-/// A descriptor shortage clears on its own, so the loop retries. A closed
-/// listener fails every time, so the budget ends the loop within a
-/// bounded number of attempts.
-///
-/// # Sources
-///
-/// - CWE-835, loop with unreachable exit condition:
-///   <https://cwe.mitre.org/data/definitions/835.html>
-pub const DEFAULT_ACCEPT_FAILURE_BUDGET: u32 = 8;
-
 /// Delay between accept retries after a failed accept
 ///
-/// Spaces the retries far enough apart that a transient shortage has time
-/// to clear within [`DEFAULT_ACCEPT_FAILURE_BUDGET`] attempts.
+/// Spaces the retries far enough apart that a descriptor shortage has time
+/// to clear between attempts.
 pub const DEFAULT_ACCEPT_RETRY_DELAY: core::time::Duration = core::time::Duration::from_millis(50);
 
 // ============================================================================
