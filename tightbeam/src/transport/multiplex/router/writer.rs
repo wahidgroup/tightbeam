@@ -37,7 +37,7 @@ use crate::instrumentation::events;
 
 /// Halt the allocator and build the GoAway, once per connection.
 /// `None` when shutdown already began.
-pub(super) fn goaway_package(shared: &MuxShared, reason: GoAwayReason) -> Option<GoAwayPackage> {
+pub fn goaway_package(shared: &MuxShared, reason: GoAwayReason) -> Option<GoAwayPackage> {
 	let last_peer = shared.begin_shutdown()?;
 
 	#[cfg(feature = "instrument")]
@@ -48,7 +48,7 @@ pub(super) fn goaway_package(shared: &MuxShared, reason: GoAwayReason) -> Option
 
 /// Queue a GoAway with `reason` and halt the allocator, exactly once
 /// per connection. Shared by graceful shutdown and the budget drain.
-pub(super) async fn drain_with_reason(
+pub async fn drain_with_reason(
 	shared: &MuxShared,
 	outbound: &mpsc::Sender<Outbound>,
 	reason: GoAwayReason,
@@ -69,7 +69,7 @@ pub(super) async fn drain_with_reason(
 /// Best-effort GoAway on a fault path: the notice rides `try_send`
 /// so it never parks the faulting loop - the connection is ending
 /// either way.
-pub(super) fn goaway_best_effort(
+pub fn goaway_best_effort(
 	shared: &MuxShared,
 	outbound: &mpsc::Sender<Outbound>,
 	last_stream_id: u32,
@@ -89,7 +89,7 @@ pub(super) fn goaway_best_effort(
 /// triggers collapse to a single `RekeyRequest`. A contended exchange
 /// means a renewal is already being processed, which makes opening moot.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(super) fn open_renewal(
+pub fn open_renewal(
 	shared: &MuxShared,
 	exchange: &FuturesMutex<Box<dyn ClientRekeyExchange>>,
 ) -> Option<TransportEnvelope> {
@@ -105,7 +105,7 @@ pub(super) fn open_renewal(
 
 /// On a budget at the drain reserve, renew in band when possible,
 /// otherwise GoAway drain (no rekey materials).
-pub(super) async fn renew_or_drain(shared: &MuxShared, outbound: &mpsc::Sender<Outbound>) -> TransportResult<()> {
+pub async fn renew_or_drain(shared: &MuxShared, outbound: &mpsc::Sender<Outbound>) -> TransportResult<()> {
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	if shared.renewal_ready() {
 		// A full queue drops the trigger: the budget stays at
@@ -171,12 +171,7 @@ where
 	/// Assemble the writer driver over the outbound queue's receiving
 	/// end: the single construction point, so a new field has exactly
 	/// one home.
-	pub(super) fn new(
-		writer: W,
-		commands: mpsc::Receiver<Outbound>,
-		shared: Arc<MuxShared>,
-		drain_headroom: u64,
-	) -> Self {
+	pub fn new(writer: W, commands: mpsc::Receiver<Outbound>, shared: Arc<MuxShared>, drain_headroom: u64) -> Self {
 		Self {
 			writer,
 			commands,
@@ -195,13 +190,13 @@ where
 
 	/// Attach the client half of the rekey exchange (refcount bump).
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn set_exchange(&mut self, exchange: Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>) {
+	pub(crate) fn set_exchange(&mut self, exchange: Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>) {
 		self.exchange = Some(exchange);
 	}
 
 	/// Override the time budget for one renewal exchange.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-	pub(super) fn set_renewal_deadline(&mut self, deadline: Duration) {
+	pub fn set_renewal_deadline(&mut self, deadline: Duration) {
 		self.renewal_deadline = deadline;
 	}
 

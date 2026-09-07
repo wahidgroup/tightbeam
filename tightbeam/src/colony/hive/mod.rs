@@ -79,11 +79,11 @@ pub trait ServletBox: Send + Sync {
 
 	/// Get the servlet's current utilization (0-10000 basis points).
 	///
-	/// Returns `None` if the servlet does not report utilization.
+	/// Returns `Some` for a servlet that reports utilization.
 	/// Used by the scaling task to evaluate scaling decisions.
 	///
-	/// Default implementation returns `None`, indicating the servlet
-	/// does not self-report utilization.
+	/// Default implementation returns `None`, which the scaling task reads
+	/// as an unreported sample.
 	fn utilization(&self) -> Option<BasisPoints> {
 		None
 	}
@@ -131,6 +131,24 @@ pub trait ServletRegistry: Send + Sync {
 	fn for_each_by_type<F>(&self, prefix: &[u8], f: F)
 	where
 		F: FnMut(&Vec<u8>, &ServletRegistration);
+
+	/// Current servlet slate, one entry per registered instance.
+	///
+	/// A registration whose address is not a valid instance locator is
+	/// skipped, so a malformed entry costs its own row and not the slate.
+	fn slate(&self) -> Vec<ServletInfo> {
+		let mut list = Vec::new();
+		self.for_each(|_key, reg| {
+			let address = reg.servlet.addr_bytes();
+			let Ok(servlet_id) = crate::colony::common::instance_urn(&reg.servlet_type, address.as_ref()) else {
+				return;
+			};
+
+			list.push(ServletInfo { servlet_id, address: address.as_ref().to_vec() });
+		});
+
+		list
+	}
 
 	/// Count of registered servlets.
 	fn count(&self) -> usize;
@@ -311,7 +329,11 @@ pub trait Hive: Sized + Send + Sync {
 	/// Returns a list of (type URN, address_bytes) pairs.
 	fn servlet_addresses(&self) -> Vec<(Urn<'static>, Vec<u8>)>;
 
-	/// Stop the hive, control server, scaling task, and all registered servlets.
+	/// Stop the hive, its control server, its scaling task, every connection
+	/// it is serving, and all registered servlets.
+	///
+	/// Connection handlers are aborted where they stand. Use [`Hive::drain`]
+	/// first to let in-flight requests finish.
 	fn stop(self);
 
 	/// Wait for the hive to complete (joins control server handle).
@@ -335,8 +357,10 @@ pub trait Hive: Sized + Send + Sync {
 
 	/// Begin graceful shutdown and stop accepting new requests.
 	///
-	/// Sets draining state and waits for in-flight requests to complete
-	/// or until the configured drain timeout is reached.
+	/// Returns as soon as every connection handler has finished, so an idle
+	/// hive drains at once. The configured drain timeout is the backstop: if
+	/// requests remain in flight when it elapses, the registered servlets are
+	/// stopped under it.
 	fn drain(&self) -> impl Future<Output = Result<(), TightBeamError>> + Send;
 
 	/// Check if the hive is currently draining.

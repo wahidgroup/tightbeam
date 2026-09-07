@@ -2,8 +2,8 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use super::{
-	ClusterError, PeerCaps, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, DEFAULT_ABANDONMENT_LIMIT,
-	DEFAULT_INITIAL_PHEROMONE,
+	ClusterError, PeerCaps, PheromoneConfig, RouteKind, Routes, ServletEntry, ServletRegistry,
+	DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 };
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
 use crate::colony::common::{current_timestamp_ms, MAX_PHEROMONE};
@@ -14,6 +14,11 @@ use crate::utils::BasisPoints;
 // =========================================================================
 
 /// Create a test entry with specified pheromone and abandonment limit
+/// Read guard over the registry's routes, where the admission logic lives.
+fn routes(registry: &ServletRegistry) -> std::sync::RwLockReadGuard<'_, Routes> {
+	registry.routes.read().expect("routes lock")
+}
+
 fn test_entry(pheromone: u64, abandonment_limit: u32) -> ServletEntry {
 	ServletEntry::new(
 		Arc::from(b"addr".as_slice()),
@@ -215,7 +220,7 @@ fn local_entries_for_type_empty_when_only_peer_routes() {
 }
 
 // Non-empty slates install before they prune, so a serialized
-// registry is never observably empty once seeded. An empty sighting
+// registry holds a seeded slate at every observation. An empty sighting
 // or a final count other than one proves interleaved reconciles
 // pruned each other's fresh installs.
 #[test]
@@ -340,8 +345,8 @@ fn reconcile_by_hive_preserves_peer_trail_state() {
 fn peer_dial_conflicts_with_local_servlet_address() {
 	let registry = ServletRegistry::default();
 	registry.add(named_entry(b"127.0.0.1:9000", b"calc", b"hive1")).ok();
-	assert_eq!(registry.peer_dial_conflicts_local(b"127.0.0.1:9000").ok(), Some(true));
-	assert_eq!(registry.peer_dial_conflicts_local(b"127.0.0.1:9001").ok(), Some(false));
+	assert!(routes(&registry).peer_dial_conflicts_local(b"127.0.0.1:9000"));
+	assert!(!routes(&registry).peer_dial_conflicts_local(b"127.0.0.1:9001"));
 }
 
 #[test]
@@ -350,18 +355,12 @@ fn slate_exceeds_caps_counts_gateways_and_routes() {
 	registry.reconcile_by_hive(b"fp1", vec![peer_entry(b"a", b"fp1")]).ok();
 	registry.reconcile_by_hive(b"fp2", vec![peer_entry(b"a", b"fp2")]).ok();
 
-	assert_eq!(
-		registry.slate_exceeds_caps(b"fp3", 1, RouteKind::Peer, 2, 1024).ok(),
-		Some(true)
-	);
-	assert_eq!(
-		registry.slate_exceeds_caps(b"fp1", 1, RouteKind::Peer, 2, 1024).ok(),
-		Some(false)
-	);
+	assert!(routes(&registry).slate_exceeds_caps(b"fp3", 1, RouteKind::Peer, 2, 1024));
+	assert!(!routes(&registry).slate_exceeds_caps(b"fp1", 1, RouteKind::Peer, 2, 1024));
 	// With fp1 prior=1 and fp2=1, a slate of 5 makes routes_after=6,
 	// over the max of 5.
-	assert_eq!(registry.slate_exceeds_caps(b"fp1", 5, RouteKind::Peer, 64, 5).ok(), Some(true));
-	assert_eq!(registry.slate_exceeds_caps(b"fp1", 0, RouteKind::Peer, 1, 1).ok(), Some(false));
+	assert!(routes(&registry).slate_exceeds_caps(b"fp1", 5, RouteKind::Peer, 64, 5));
+	assert!(!routes(&registry).slate_exceeds_caps(b"fp1", 0, RouteKind::Peer, 1, 1));
 }
 
 fn admitted(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>) -> AdmittedPeerAd {
@@ -370,6 +369,43 @@ fn admitted(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>) -> AdmittedPeerA
 
 fn admitted_with_order(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>, order: u64) -> AdmittedPeerAd {
 	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial_addr: Arc::from(dial), slate, order }
+}
+
+// Two advertisements for one bucket race. The order ledger and the
+// installed slate are one decision, so whichever applies last leaves the
+// ledger naming the slate that is installed. A ledger below the installed
+// order would admit a replay the withdrawal already refused (CWE-294).
+#[test]
+fn racing_ads_leave_the_ledger_naming_the_installed_slate() {
+	let registry = Arc::new(ServletRegistry::default());
+	let older = Arc::clone(&registry);
+	let newer = Arc::clone(&registry);
+
+	let low = std::thread::spawn(move || {
+		older
+			.reconcile_peer_slate(
+				admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"echo", b"origin")], 10),
+				PeerCaps::default(),
+			)
+			.ok()
+	});
+	let high = std::thread::spawn(move || {
+		newer
+			.reconcile_peer_slate(
+				admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], 20),
+				PeerCaps::default(),
+			)
+			.ok()
+	});
+
+	low.join().expect("thread joins");
+	high.join().expect("thread joins");
+
+	let installed: Vec<Arc<[u8]>> = routes(&registry)
+		.values()
+		.map(|entry| Arc::clone(entry.servlet_type()))
+		.collect();
+	assert_eq!(installed, vec![Arc::<[u8]>::from(b"calc".as_slice())]);
 }
 
 /// Relay trail under the composite `origin NUL relay` bucket.
@@ -430,8 +466,8 @@ fn relay_reconcile_replaces_only_its_bucket() {
 		.any(|entry| entry.route_kind() == RouteKind::PeerRelay && entry.servlet_type().as_ref() == b"sum"));
 }
 
-// Relay buckets spend their own budget: a gateway table at its direct
-// cap still admits a relay trail, and a new direct gateway is never
+// cap still admits a relay trail, and a new direct gateway keeps its own
+// budget.
 // refused because relay buckets exist.
 #[test]
 fn relay_buckets_do_not_spend_the_direct_gateway_cap() {
@@ -458,7 +494,7 @@ fn relay_bucket_cap_refuses_extra_buckets() {
 }
 
 // An origin that withdraws its whole direct slate withdraws its relay
-// fallbacks with it: a relay trail never outlives every direct claim.
+// fallbacks with it: a relay trail lasts as long as a direct claim.
 #[test]
 fn empty_direct_slate_clears_relay_trails_for_origin() {
 	let registry = ServletRegistry::default();
@@ -501,7 +537,7 @@ fn stale_ad_order_is_refused_per_bucket() {
 }
 
 // The order ledger keys per bucket: an equal-order refresh reconciles,
-// and the direct bucket's order never gates the relay bucket.
+// and each bucket's order gates that bucket alone.
 #[test]
 fn equal_ad_order_reconciles_idempotently() {
 	let registry = ServletRegistry::default();
@@ -515,8 +551,8 @@ fn equal_ad_order_reconciles_idempotently() {
 	assert!(matches!(registry.reconcile_relay_trail(trail, PeerCaps::default()), Ok(())));
 }
 
-// A withdrawal (empty slate) leaves an order tombstone: a replayed
-// older advertisement inside the freshness window cannot reinstall
+// older advertisement inside the freshness window leaves the withdrawal
+// standing.
 // routes the origin already withdrew.
 #[test]
 fn withdrawal_tombstone_refuses_older_ad_reinstall() {
@@ -548,7 +584,7 @@ fn expired_tombstone_prunes_from_the_ledger() {
 	let withdrawal = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![], issued + 1);
 	registry.reconcile_peer_slate(withdrawal, PeerCaps::default()).ok();
 
-	let rows = registry.ad_orders.lock().map(|ledger| ledger.len()).unwrap_or(usize::MAX);
+	let rows = routes(&registry).ad_order_rows();
 	assert_eq!(rows, 0);
 }
 
@@ -640,7 +676,7 @@ fn peer_key_conflicts_only_with_local_routes() {
 		let registry = ServletRegistry::default();
 		registry.add(entry.clone()).ok();
 
-		assert_eq!(registry.peer_key_conflicts_local(probe).ok(), Some(*expected));
+		assert_eq!(routes(&registry).peer_key_conflicts_local(probe), *expected);
 	}
 }
 
@@ -665,7 +701,6 @@ fn seed_reregistered_registry() -> ServletRegistry {
 #[test]
 fn registry_reregistration_does_not_duplicate_indices() {
 	let registry = seed_reregistered_registry();
-
 	let found = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
 	assert_eq!(found.len(), 1);
 	assert!(matches!(registry.len().ok(), Some(1)));
@@ -722,7 +757,6 @@ fn weaken_peer_targets_all_routes_of_one_peer() -> Result<(), ClusterError> {
 	registry.add(peer_entry(b"urn:t:a", b"fp-b"))?;
 
 	let weakened = registry.weaken_peer(b"fp-a")?;
-
 	assert_eq!(weakened, 2);
 	Ok(())
 }
@@ -788,7 +822,6 @@ fn weaken_peer_by_dial_targets_matching_gateway() -> Result<(), ClusterError> {
 	registry.add(peer_entry_dial(b"urn:t:a", b"fp-b", b"127.0.0.1:9200"))?;
 
 	let weakened = registry.weaken_peer_by_dial(b"127.0.0.1:9100")?;
-
 	assert_eq!(weakened, 2);
 	Ok(())
 }

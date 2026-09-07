@@ -89,7 +89,7 @@ pub trait GateAudit {
 /// here, so access decisions are observable evidence on every plane.
 ///
 /// `frame` is [`None`] for mux streaming / duplex opens that have no
-/// request frame at dispatch; session-scoped gates still evaluate.
+/// request frame at dispatch. Session-scoped gates still evaluate.
 ///
 /// A gate returning [`TransitStatus::Unknown`] is a local bug, not a
 /// verdict: [`TransitStatus::normalized_verdict`] maps it to
@@ -156,11 +156,33 @@ impl From<Frame> for Letter {
 	}
 }
 
-/// One restart-policy evaluation over a failed send: `Ok` carries the
-/// frame to resend, `Err` the terminal error. Errors without a frame
-/// cannot retry and pass through unchanged.
+/// Observe a restart policy's backoff.
+///
+/// A tokio build yields the worker so other connections keep running. A
+/// std build without a reactor parks the calling thread, which is the only
+/// timer it has.
 #[cfg(feature = "transport-policy")]
-fn evaluate_retry<P>(policy: &P, error: TransportError, attempt: usize) -> Result<Box<Frame>, TransportError>
+async fn await_retry_delay(delay: core::time::Duration) {
+	if delay.is_zero() {
+		return;
+	}
+
+	#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+	tokio::time::sleep(delay).await;
+
+	#[cfg(all(feature = "std", not(feature = "tokio"), not(target_arch = "wasm32")))]
+	std::thread::sleep(delay);
+}
+
+/// One restart-policy evaluation over a failed send: `Ok` carries the
+/// frame to resend and the delay to observe first, `Err` the terminal
+/// error. An error carrying no frame passes through unchanged.
+#[cfg(feature = "transport-policy")]
+fn evaluate_retry<P>(
+	policy: &P,
+	error: TransportError,
+	attempt: usize,
+) -> Result<(Box<Frame>, core::time::Duration), TransportError>
 where
 	P: RestartPolicy + ?Sized,
 {
@@ -168,8 +190,8 @@ where
 		TransportError::MessageNotSent(boxed_frame, ref failure) => {
 			// Pass the box to policy (no unboxing, single allocation)
 			match policy.evaluate(boxed_frame, failure, attempt) {
-				RetryAction::Retry(_) if attempt == usize::MAX => Err(TransportError::MaxRetriesExceeded),
-				RetryAction::Retry(retry_boxed_frame) => Ok(retry_boxed_frame),
+				RetryAction::Retry { .. } if attempt == usize::MAX => Err(TransportError::MaxRetriesExceeded),
+				RetryAction::Retry { frame, delay } => Ok((frame, delay)),
 				RetryAction::NoRetry => Err(TransportError::OperationFailed(*failure)),
 			}
 		}
@@ -275,9 +297,9 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 	loop {
 		// Evaluate gate policy before sending. Emitter gates are
 		// client-side and connection-context-free: the empty context.
-		let status = emitter
-			.to_emitter_gate_policy_ref()
-			.evaluate(Some(letter.try_peek()?), &SessionContext::default());
+		let message = Some(letter.try_peek()?);
+		let session = SessionContext::default();
+		let status = emitter.to_emitter_gate_policy_ref().evaluate(message, &session);
 		if status != TransitStatus::Ok {
 			return Err(TransportError::from(status));
 		}
@@ -289,7 +311,9 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 		let (status, response, original_message) = match emitter.perform_send_receive(message_to_send).await {
 			Ok(result) => result,
 			Err(e) => {
-				let frame = evaluate_retry(emitter.to_restart_policy_ref(), e, current_attempt)?;
+				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), e, current_attempt)?;
+				await_retry_delay(delay).await;
+
 				// Unbox to put back into Letter
 				letter.try_return_to_sender(*frame)?;
 				current_attempt += 1;
@@ -318,7 +342,8 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 		// Evaluate retry policy only on error
 		match result {
 			Err(error) => {
-				let frame = evaluate_retry(emitter.to_restart_policy_ref(), error, current_attempt)?;
+				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), error, current_attempt)?;
+				await_retry_delay(delay).await;
 				// Unbox to put back into Letter
 				letter.try_return_to_sender(*frame)?;
 				current_attempt += 1;
@@ -366,11 +391,11 @@ where
 
 /// Everything a message collector must already be.
 ///
-/// Exists because supertraits cannot be feature-gated inline: with
+/// Exists because a supertrait takes no inline feature gate: with
 /// `transport-policy` every collector must also expose an audit trail
 /// ([`GateAudit`]) for gate-verdict recording. The blanket impl satisfies
-/// the requirement automatically; implementers never name this trait.
-#[cfg(feature = "transport-policy")]
+/// the requirement automatically, so implementers reach it through
+/// [`MessageCollector`] alone.
 pub trait CollectorRequirements: MessageIO + GateAudit {}
 
 #[cfg(feature = "transport-policy")]
@@ -404,7 +429,7 @@ pub trait MessageCollector: CollectorRequirements {
 		async move {
 			// Read and decode the envelope (can be overridden for encryption)
 			let decoded_envelope = self.read_decoded_envelope().await?;
-			// Cleartext connections authenticate nothing: empty context.
+			// A cleartext connection carries no peer identity: empty context.
 			let session = SessionContext::default();
 			gate_collected_envelope(self, decoded_envelope, &session)
 		}
@@ -443,7 +468,7 @@ pub trait MessageCollector: CollectorRequirements {
 				None => return Ok(None), // Connection closed gracefully
 			};
 
-			// Cleartext connections authenticate nothing: empty context.
+			// A cleartext connection carries no peer identity: empty context.
 			let session = SessionContext::default();
 			let gated = gate_collected_envelope(self, decoded_envelope, &session)?;
 			Ok(Some(gated))
@@ -473,7 +498,7 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Send a response for a previously collected message
+	/// Send a response for one collected message
 	fn send_response(
 		&mut self,
 		status: TransitStatus,
@@ -514,7 +539,7 @@ pub trait MessageCollector: CollectorRequirements {
 	/// X509-enabled collect_message with encryption and handshake support
 	/// (CMS-only build variant).
 	///
-	/// Trait where-clauses do not elaborate to callers, so the method is
+	/// A trait where-clause stays with the trait, so the method is
 	/// declared per feature combination with that build's predicate set.
 	#[cfg(all(
 		feature = "transport-policy",
@@ -599,8 +624,8 @@ where
 					TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 						Ok(CollectStep::Handshake(envelope.to_der()?))
 					}
-					// Circuit breaker: application traffic must never arrive
-					// cleartext once encryption is configured.
+					// Circuit breaker: once encryption is configured, application
+					// traffic arrives encrypted.
 					_ => {
 						transport.set_handshake_state(TcpHandshakeState::None);
 						transport.unset_session_keys();

@@ -8,7 +8,7 @@ use crate::transport::envelopes::TransportEnvelope;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::aead::SendCipher;
 
-pub(super) enum Outbound {
+pub enum Outbound {
 	Envelope(TransportEnvelope),
 	/// Write the envelope, then switch the send direction to the new
 	/// epoch cipher (client `RekeyAck` / server `RekeyDone` boundary,
@@ -24,6 +24,6 @@ pub(super) enum Outbound {
 
 /// Exclusive outbound handle for `SinkExt::send` / `try_send`.
 /// `mpsc::Sender` is Arc-backed so this is a refcount bump.
-pub(super) fn outbound_handle(outbound: &mpsc::Sender<Outbound>) -> mpsc::Sender<Outbound> {
+pub fn outbound_handle(outbound: &mpsc::Sender<Outbound>) -> mpsc::Sender<Outbound> {
 	outbound.clone()
 }

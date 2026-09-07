@@ -179,9 +179,54 @@ impl SessionContext {
 		self.peer_public_key.as_deref()
 	}
 
+	/// Session bound to `certificate` as its authenticated peer.
+	#[cfg(test)]
+	pub(crate) fn for_peer(certificate: Arc<Certificate>) -> Self {
+		let peer_public_key = spki_der(&certificate);
+		Self { peer_certificate: Some(certificate), peer_public_key, session_receipt: None }
+	}
+
+	/// The identity this session's handshake proved.
+	///
+	/// Returns [`ProvenPeer::ANONYMOUS`] when the transport authenticated
+	/// no peer, so a caller always has one identity to key on.
+	#[cfg(feature = "transport")]
+	pub fn proven_peer(&self) -> ProvenPeer<'_> {
+		self.peer_public_key.as_deref().map_or(ProvenPeer::ANONYMOUS, ProvenPeer)
+	}
+
 	/// Dual-signed session receipt, when the session is budget-bearing.
 	pub fn session_receipt(&self) -> Option<&Arc<StoredReceipt>> {
 		self.session_receipt.as_ref()
+	}
+}
+
+/// An identity the transport handshake proved.
+///
+/// A gate that counts failures before it checks a frame's signature MUST
+/// key those counts on something the sender could not choose. Minting is
+/// [`SessionContext::proven_peer`] alone, so frame-carried bytes stay out
+/// of a per-identity budget (CWE-345).
+///
+/// A session whose transport proved no peer yields [`ProvenPeer::ANONYMOUS`],
+/// which is the whole attribution a cleartext plane offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProvenPeer<'a>(&'a [u8]);
+
+impl<'a> ProvenPeer<'a> {
+	/// The shared identity of every caller a transport left unauthenticated.
+	pub const ANONYMOUS: Self = Self(b"anonymous-peer");
+
+	/// Key bytes for the identity, readable inside the crate that mints it.
+	#[must_use]
+	pub(crate) fn as_key(&self) -> &'a [u8] {
+		self.0
+	}
+
+	/// Mint an identity for a test that stands in for a handshake.
+	#[cfg(test)]
+	pub(crate) fn for_test(key: &'a [u8]) -> Self {
+		Self(key)
 	}
 }
 
@@ -434,7 +479,6 @@ mod tests {
 	#[test]
 	fn accepts_intact_frame() {
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
-
 		let frame = create_frame_with_frame_integrity();
 		assert!(matches!(
 			gate.evaluate(Some(&frame), &SessionContext::default()),
@@ -458,7 +502,6 @@ mod tests {
 	fn rejects_frame_without_integrity() -> crate::error::Result<()> {
 		let message = create_test_message(None);
 		let frame = compose! { V0: id: "gate-no-fi", order: 1u64, message: message }?;
-
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
 		assert!(matches!(
 			gate.evaluate(Some(&frame), &SessionContext::default()),

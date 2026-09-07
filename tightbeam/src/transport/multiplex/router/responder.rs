@@ -354,7 +354,7 @@ pub struct MuxResponder {
 impl MuxResponder {
 	/// Assemble the responder over the inbound event queue, at the
 	/// default cancel budget ([`DEFAULT_MUX_CANCEL_BUDGET`]).
-	pub(super) fn new(
+	pub fn new(
 		inbound: mpsc::Receiver<InboundEvent>,
 		outbound: mpsc::Sender<Outbound>,
 		shared: Arc<MuxShared>,
@@ -364,7 +364,7 @@ impl MuxResponder {
 	}
 
 	/// Override the peer cancel budget (CVE-2023-44487 hardening).
-	pub(super) fn set_cancel_budget(&mut self, budget: u32) {
+	pub fn set_cancel_budget(&mut self, budget: u32) {
 		self.cancel_budget = budget;
 	}
 

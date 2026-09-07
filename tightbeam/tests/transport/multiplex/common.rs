@@ -43,29 +43,29 @@ use crate::transport::support::{
 	serve_one_handshake_message,
 };
 
-pub(super) type SplitReader = TransportReader<TokioReadHalf>;
-pub(super) type SplitWriter = TransportWriter<TokioWriteHalf>;
-pub(super) type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
-pub(super) type ServeTask = JoinHandle<Result<(), TransportError>>;
-pub(super) type HandlerFuture = Pin<Box<dyn Future<Output = ResponsePackage> + Send>>;
-pub(super) type StatusFuture = Pin<Box<dyn Future<Output = TransitStatus> + Send>>;
+pub type SplitReader = TransportReader<TokioReadHalf>;
+pub type SplitWriter = TransportWriter<TokioWriteHalf>;
+pub type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
+pub type ServeTask = JoinHandle<Result<(), TransportError>>;
+pub type HandlerFuture = Pin<Box<dyn Future<Output = ResponsePackage> + Send>>;
+pub type StatusFuture = Pin<Box<dyn Future<Output = TransitStatus> + Send>>;
 
-pub(super) fn large_mux_frame(label: &str) -> Frame {
+pub fn large_mux_frame(label: &str) -> Frame {
 	// Sized so the encoded frame spans roughly fifteen 1024-byte chunks,
 	// enough to cross the rekey record limits the drain scenarios configure.
 	let padding = "x".repeat(15000);
 	mux_frame(&format!("{label}-{padding}"))
 }
 
-pub(super) fn chunked_offer(cap: u32) -> TransportOffer {
+pub fn chunked_offer(cap: u32) -> TransportOffer {
 	mux_offer(cap).with_chunk_payload_size(1024)
 }
 
-pub(super) fn client_stream_id(index: u32) -> u32 {
+pub fn client_stream_id(index: u32) -> u32 {
 	index * 2 + 1
 }
 
-pub(super) async fn establish_transports(
+pub async fn establish_transports(
 	client_offer: Option<TransportOffer>,
 	server_offer: Option<TransportOffer>,
 ) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
@@ -95,26 +95,23 @@ pub(super) async fn establish_transports(
 	Ok((client, server))
 }
 
-pub(super) struct MuxEndpoint {
-	pub(super) handle: MuxHandle,
-	pub(super) _reader_task: JoinHandle<()>,
+pub struct MuxEndpoint {
+	pub handle: MuxHandle,
+	pub _reader_task: JoinHandle<()>,
 }
 
 /// Per-endpoint limits for hardening scenarios.
 #[derive(Default)]
-pub(super) struct MuxEndpointConfig {
-	pub(super) rekey_limit: Option<u64>,
-	pub(super) cancel_budget: Option<u32>,
-	pub(super) grantor: Option<Arc<dyn CreditGrantor>>,
-	pub(super) rekey: bool,
-	pub(super) renewal_deadline: Option<Duration>,
+pub struct MuxEndpointConfig {
+	pub rekey_limit: Option<u64>,
+	pub cancel_budget: Option<u32>,
+	pub grantor: Option<Arc<dyn CreditGrantor>>,
+	pub rekey: bool,
+	pub renewal_deadline: Option<Duration>,
 }
 
 /// Shared tail of encrypted and cleartext endpoint constructors.
-pub(super) fn spawn_mux_tasks<R, W>(
-	mut mux: MuxTransport<R, W>,
-	cancel_budget: Option<u32>,
-) -> (MuxEndpoint, MuxResponder)
+pub fn spawn_mux_tasks<R, W>(mut mux: MuxTransport<R, W>, cancel_budget: Option<u32>) -> (MuxEndpoint, MuxResponder)
 where
 	R: EnvelopeSource + Send + 'static,
 	W: EnvelopeSink + Send + 'static,
@@ -129,7 +126,7 @@ where
 	(endpoint, responder)
 }
 
-pub(super) fn spawn_mux_endpoint_with(
+pub fn spawn_mux_endpoint_with(
 	mut transport: TcpTransport<TokioStream>,
 	role: MuxRole,
 	config: MuxEndpointConfig,
@@ -166,14 +163,14 @@ pub(super) fn spawn_mux_endpoint_with(
 	Ok(endpoint_pair)
 }
 
-pub(super) fn spawn_mux_endpoint(
+pub fn spawn_mux_endpoint(
 	transport: TcpTransport<TokioStream>,
 	role: MuxRole,
 ) -> Result<(MuxEndpoint, MuxResponder), TightBeamError> {
 	spawn_mux_endpoint_with(transport, role, MuxEndpointConfig::default())
 }
 
-pub(super) fn spawn_cleartext_mux_endpoint(
+pub fn spawn_cleartext_mux_endpoint(
 	transport: TcpTransport<TokioStream>,
 	role: MuxRole,
 	settings: MuxSettings,
@@ -186,7 +183,7 @@ pub(super) fn spawn_cleartext_mux_endpoint(
 	Ok(endpoint_pair)
 }
 
-pub(super) async fn establish_cleartext_transports(
+pub async fn establish_cleartext_transports(
 ) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
 	let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
 	let addr = listener.local_addr()?;
@@ -206,7 +203,7 @@ pub(super) async fn establish_cleartext_transports(
 
 /// Server-side trace entrypoint: the accepted connection carries the
 /// collector, every downstream plane inherits it.
-pub(super) async fn accept_mux_server(
+pub async fn accept_mux_server(
 	listener: TokioListener,
 	offer: TransportOffer,
 	trace: TraceCollector,
@@ -221,7 +218,7 @@ pub(super) async fn accept_mux_server(
 	spawn_mux_endpoint(transport, MuxRole::Server)
 }
 
-pub(super) async fn start_mux_server<H, Fut>(
+pub async fn start_mux_server<H, Fut>(
 	materials: &ServerMaterials,
 	cap: u32,
 	handler: H,
@@ -242,21 +239,21 @@ where
 	Ok((serve_task, addr))
 }
 
-pub(super) struct MuxClient {
-	pub(super) endpoint: MuxEndpoint,
-	pub(super) responder: MuxResponder,
-	pub(super) settings: MuxSettings,
+pub struct MuxClient {
+	pub endpoint: MuxEndpoint,
+	pub responder: MuxResponder,
+	pub settings: MuxSettings,
 }
 
 impl MuxClient {
-	pub(super) fn handle(&self) -> &MuxHandle {
+	pub fn handle(&self) -> &MuxHandle {
 		&self.endpoint.handle
 	}
 }
 
 /// Client-side trace entrypoint: the connection carries the collector,
 /// every downstream plane inherits it.
-pub(super) async fn connect_mux_client(
+pub async fn connect_mux_client(
 	addr: SocketAddr,
 	materials: &ServerMaterials,
 	cap: u32,
@@ -274,13 +271,13 @@ pub(super) async fn connect_mux_client(
 }
 
 /// Muxed client against raw server halves (test owns wire ordering).
-pub(super) struct ClientMuxServerRaw {
-	pub(super) client: MuxEndpoint,
-	pub(super) server_reader: SplitReader,
-	pub(super) server_writer: SplitWriter,
+pub struct ClientMuxServerRaw {
+	pub client: MuxEndpoint,
+	pub server_reader: SplitReader,
+	pub server_writer: SplitWriter,
 }
 
-pub(super) async fn establish_client_mux_server_raw_with(
+pub async fn establish_client_mux_server_raw_with(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
 	trace: TraceCollector,
@@ -292,14 +289,14 @@ pub(super) async fn establish_client_mux_server_raw_with(
 	Ok(ClientMuxServerRaw { client: client_end, server_reader, server_writer })
 }
 
-pub(super) async fn establish_client_mux_server_raw(
+pub async fn establish_client_mux_server_raw(
 	cap: u32,
 	trace: TraceCollector,
 ) -> Result<ClientMuxServerRaw, TightBeamError> {
 	establish_client_mux_server_raw_with(mux_offer(cap), mux_offer(cap), trace).await
 }
 
-pub(super) async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Frame) -> Result<bool, TightBeamError> {
+pub async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Frame) -> Result<bool, TightBeamError> {
 	let emit_task = spawn_emit(&link.client.handle, frame.to_owned());
 	let (stream_id, message) = read_muxed_request(&mut link.server_reader).await?;
 	write_muxed_echo(&mut link.server_writer, stream_id, &message).await?;
@@ -309,14 +306,14 @@ pub(super) async fn raw_echo_roundtrip(link: &mut ClientMuxServerRaw, frame: &Fr
 }
 
 /// Muxed server against raw client halves (test drives requests on the wire).
-pub(super) struct ServerMuxClientRaw {
-	pub(super) server: MuxEndpoint,
-	pub(super) responder: MuxResponder,
-	pub(super) client_reader: SplitReader,
-	pub(super) client_writer: SplitWriter,
+pub struct ServerMuxClientRaw {
+	pub server: MuxEndpoint,
+	pub responder: MuxResponder,
+	pub client_reader: SplitReader,
+	pub client_writer: SplitWriter,
 }
 
-pub(super) fn split_server_mux_client_raw(
+pub fn split_server_mux_client_raw(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
 	server_config: MuxEndpointConfig,
@@ -327,7 +324,7 @@ pub(super) fn split_server_mux_client_raw(
 	Ok(ServerMuxClientRaw { server: server_end, responder, client_reader, client_writer })
 }
 
-pub(super) async fn establish_server_mux_client_raw_with(
+pub async fn establish_server_mux_client_raw_with(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
 	server_config: MuxEndpointConfig,
@@ -337,7 +334,7 @@ pub(super) async fn establish_server_mux_client_raw_with(
 	split_server_mux_client_raw(client, server, server_config, trace)
 }
 
-pub(super) async fn establish_server_mux_client_raw(
+pub async fn establish_server_mux_client_raw(
 	client_cap: u32,
 	server_cap: u32,
 	server_config: MuxEndpointConfig,
@@ -346,13 +343,13 @@ pub(super) async fn establish_server_mux_client_raw(
 	establish_server_mux_client_raw_with(mux_offer(client_cap), mux_offer(server_cap), server_config, trace).await
 }
 
-pub(super) struct MuxPair {
-	pub(super) client: MuxEndpoint,
-	pub(super) server: MuxEndpoint,
-	pub(super) _server_serve: ServeTask,
+pub struct MuxPair {
+	pub client: MuxEndpoint,
+	pub server: MuxEndpoint,
+	pub _server_serve: ServeTask,
 }
 
-pub(super) fn spawn_echo_pair_with(
+pub fn spawn_echo_pair_with(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
 	client_config: MuxEndpointConfig,
@@ -371,7 +368,7 @@ pub(super) fn spawn_echo_pair_with(
 	})
 }
 
-pub(super) fn spawn_echo_pair(
+pub fn spawn_echo_pair(
 	client: TcpTransport<TokioStream>,
 	server: TcpTransport<TokioStream>,
 	server_config: MuxEndpointConfig,
@@ -380,7 +377,7 @@ pub(super) fn spawn_echo_pair(
 	spawn_echo_pair_with(client, server, MuxEndpointConfig::default(), server_config, trace)
 }
 
-pub(super) async fn establish_echo_pair(
+pub async fn establish_echo_pair(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
 	server_config: MuxEndpointConfig,
@@ -390,22 +387,22 @@ pub(super) async fn establish_echo_pair(
 	spawn_echo_pair(client, server, server_config, trace)
 }
 
-pub(super) fn echo_response(frame: &Arc<Frame>) -> ResponsePackage {
+pub fn echo_response(frame: &Arc<Frame>) -> ResponsePackage {
 	ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(frame)))
 }
 
 /// Terminal outcome of a fully drained [`StreamBody`].
-pub(super) struct DrainedBody {
+pub struct DrainedBody {
 	/// Every chunk's bytes, in arrival order.
-	pub(super) bytes: Vec<u8>,
+	pub bytes: Vec<u8>,
 	/// Chunks consumed before the terminal event.
-	pub(super) chunks: usize,
+	pub chunks: usize,
 	/// The failure that ended the body, `None` on a clean end.
-	pub(super) failure: Option<TransportError>,
+	pub failure: Option<TransportError>,
 }
 
 /// Drain a stream body to its terminal outcome, collecting chunks.
-pub(super) async fn drain_body(body: &mut StreamBody) -> DrainedBody {
+pub async fn drain_body(body: &mut StreamBody) -> DrainedBody {
 	let mut bytes = Vec::new();
 	let mut chunks = 0usize;
 	loop {
@@ -421,12 +418,12 @@ pub(super) async fn drain_body(body: &mut StreamBody) -> DrainedBody {
 }
 
 /// Whether a counting handler observed a chunked (multi-record) body.
-pub(super) fn saw_multiple_chunks(counter: &AtomicUsize) -> bool {
+pub fn saw_multiple_chunks(counter: &AtomicUsize) -> bool {
 	counter.load(Ordering::SeqCst) > 1
 }
 
 /// Echo of a body reassembled from streamed chunks.
-pub(super) fn echo_reassembled(buffer: &[u8]) -> ResponsePackage {
+pub fn echo_reassembled(buffer: &[u8]) -> ResponsePackage {
 	match Frame::from_der(buffer) {
 		Ok(frame) => ResponsePackage::new(TransitStatus::Ok, Some(frame)),
 		Err(_) => ResponsePackage::new(TransitStatus::InvalidArgument, None),
@@ -435,7 +432,7 @@ pub(super) fn echo_reassembled(buffer: &[u8]) -> ResponsePackage {
 
 /// Streaming echo handler: consumes the body chunk by chunk, counts
 /// arrivals, then echoes the reassembled frame.
-pub(super) fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody) -> HandlerFuture {
+pub fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody) -> HandlerFuture {
 	move |mut body| {
 		let counter = Arc::clone(&chunks_seen);
 		Box::pin(async move {
@@ -454,7 +451,7 @@ pub(super) fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(S
 
 /// Push a payload through a request sink as two chunks, then close:
 /// the smallest sequence exercising the held-back `last` framing.
-pub(super) async fn push_split(mut sink: RequestSink, payload: &[u8]) -> Result<(), TransportError> {
+pub async fn push_split(mut sink: RequestSink, payload: &[u8]) -> Result<(), TransportError> {
 	let middle = payload.len() / 2;
 	sink.push(&payload[..middle]).await?;
 	sink.push(&payload[middle..]).await?;
@@ -464,7 +461,7 @@ pub(super) async fn push_split(mut sink: RequestSink, payload: &[u8]) -> Result<
 
 /// Duplex echo handler: streams every request chunk straight back,
 /// counting arrivals, and ends the reply with the trailer status.
-pub(super) fn duplex_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody, ReplySink) -> StatusFuture {
+pub fn duplex_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBody, ReplySink) -> StatusFuture {
 	move |mut body, mut reply| {
 		let counter = Arc::clone(&chunks_seen);
 		Box::pin(async move {
@@ -484,7 +481,7 @@ pub(super) fn duplex_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(Stre
 	}
 }
 
-pub(super) fn gated_echo_handler(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
+pub fn gated_echo_handler(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame| {
 		let started = Arc::clone(&started);
 		let release = Arc::clone(&release);
@@ -496,7 +493,7 @@ pub(super) fn gated_echo_handler(started: Arc<Notify>, release: Arc<Notify>) -> 
 	}
 }
 
-pub(super) fn spawn_gated_echo(responder: MuxResponder) -> (Arc<Notify>, Arc<Notify>, ServeTask) {
+pub fn spawn_gated_echo(responder: MuxResponder) -> (Arc<Notify>, Arc<Notify>, ServeTask) {
 	let started = Arc::new(Notify::new());
 	let release = Arc::new(Notify::new());
 	let handler = gated_echo_handler(Arc::clone(&started), Arc::clone(&release));
@@ -504,14 +501,14 @@ pub(super) fn spawn_gated_echo(responder: MuxResponder) -> (Arc<Notify>, Arc<Not
 	(started, release, tokio::spawn(responder.serve(handler)))
 }
 
-pub(super) struct GatedMuxContext {
-	pub(super) materials: ServerMaterials,
-	pub(super) started: Notify,
-	pub(super) release: Notify,
+pub struct GatedMuxContext {
+	pub materials: ServerMaterials,
+	pub started: Notify,
+	pub release: Notify,
 }
 
 impl GatedMuxContext {
-	pub(super) fn generate() -> Self {
+	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
 			started: Notify::new(),
@@ -520,7 +517,7 @@ impl GatedMuxContext {
 	}
 }
 
-pub(super) fn gated_echo(ctx: Arc<GatedMuxContext>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
+pub fn gated_echo(ctx: Arc<GatedMuxContext>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame| {
 		let ctx = Arc::clone(&ctx);
 		Box::pin(async move {
@@ -531,16 +528,16 @@ pub(super) fn gated_echo(ctx: Arc<GatedMuxContext>) -> impl Fn(Arc<Frame>) -> Ha
 	}
 }
 
-pub(super) fn immediate_echo_handler() -> impl Fn(Arc<Frame>) -> core::future::Ready<ResponsePackage> {
+pub fn immediate_echo_handler() -> impl Fn(Arc<Frame>) -> core::future::Ready<ResponsePackage> {
 	|frame| core::future::ready(echo_response(&frame))
 }
 
-pub(super) fn spawn_immediate_echo(responder: MuxResponder) -> ServeTask {
+pub fn spawn_immediate_echo(responder: MuxResponder) -> ServeTask {
 	tokio::spawn(responder.serve(immediate_echo_handler()))
 }
 
 /// Hold `held_frame` until a different frame arrives (then release the hold).
-pub(super) fn order_forcing_echo(held_frame: Frame, gate: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
+pub fn order_forcing_echo(held_frame: Frame, gate: Arc<Notify>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame: Arc<Frame>| {
 		let held_frame = held_frame.to_owned();
 		let gate = Arc::clone(&gate);
@@ -557,16 +554,16 @@ pub(super) fn order_forcing_echo(held_frame: Frame, gate: Arc<Notify>) -> impl F
 }
 
 /// Cancel-abort fixture; drop witness records handler abort.
-pub(super) struct AbortContext {
-	pub(super) materials: ServerMaterials,
-	pub(super) started: Notify,
-	pub(super) never: Notify,
-	pub(super) aborted: AtomicBool,
-	pub(super) calls: AtomicU32,
+pub struct AbortContext {
+	pub materials: ServerMaterials,
+	pub started: Notify,
+	pub never: Notify,
+	pub aborted: AtomicBool,
+	pub calls: AtomicU32,
 }
 
 impl AbortContext {
-	pub(super) fn generate() -> Self {
+	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
 			started: Notify::new(),
@@ -577,7 +574,7 @@ impl AbortContext {
 	}
 }
 
-pub(super) fn first_parks_then_echo(ctx: Arc<AbortContext>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
+pub fn first_parks_then_echo(ctx: Arc<AbortContext>) -> impl Fn(Arc<Frame>) -> HandlerFuture {
 	move |frame: Arc<Frame>| {
 		let ctx = Arc::clone(&ctx);
 		Box::pin(async move {
@@ -592,13 +589,13 @@ pub(super) fn first_parks_then_echo(ctx: Arc<AbortContext>) -> impl Fn(Arc<Frame
 	}
 }
 
-pub(super) fn spawn_emit(handle: &MuxHandle, frame: Frame) -> EmitTask {
+pub fn spawn_emit(handle: &MuxHandle, frame: Frame) -> EmitTask {
 	let handle = handle.to_owned();
 	tokio::spawn(async move { handle.emit_on_stream(&frame).await })
 }
 
 /// Abort an in-flight emit. Drop guard removes pending and queues MuxCancel.
-pub(super) async fn abort_emit(task: EmitTask) {
+pub async fn abort_emit(task: EmitTask) {
 	task.abort();
 
 	let join = task.await;
@@ -608,7 +605,7 @@ pub(super) async fn abort_emit(task: EmitTask) {
 	);
 }
 
-pub(super) async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u32, Arc<Frame>), TightBeamError> {
+pub async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u32, Arc<Frame>), TightBeamError> {
 	let envelope = reader.read_envelope().await?;
 	match envelope {
 		TransportEnvelope::Mux(MuxEnvelope::Open(package)) if package.last() => {
@@ -619,12 +616,12 @@ pub(super) async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Res
 	}
 }
 
-pub(super) async fn read_muxed_request_id<R: EnvelopeSource>(reader: &mut R) -> Result<u32, TightBeamError> {
+pub async fn read_muxed_request_id<R: EnvelopeSource>(reader: &mut R) -> Result<u32, TightBeamError> {
 	let (stream_id, _frame) = read_muxed_request(reader).await?;
 	Ok(stream_id)
 }
 
-pub(super) async fn expect_muxed_request(
+pub async fn expect_muxed_request(
 	reader: &mut SplitReader,
 	expected_id: u32,
 	msg: &'static str,
@@ -637,12 +634,12 @@ pub(super) async fn expect_muxed_request(
 	Ok(frame)
 }
 
-pub(super) fn muxed_request_envelope(stream_id: u32, frame: Frame) -> Result<TransportEnvelope, TightBeamError> {
+pub fn muxed_request_envelope(stream_id: u32, frame: Frame) -> Result<TransportEnvelope, TightBeamError> {
 	let payload = frame.to_der()?;
 	Ok(MuxOpenPackage::new(stream_id, true, MuxStreamKind::Unary, payload)?.into())
 }
 
-pub(super) async fn write_muxed_request<W: EnvelopeSink>(
+pub async fn write_muxed_request<W: EnvelopeSink>(
 	writer: &mut W,
 	stream_id: u32,
 	frame: Frame,
@@ -651,7 +648,7 @@ pub(super) async fn write_muxed_request<W: EnvelopeSink>(
 	Ok(())
 }
 
-pub(super) async fn write_muxed_end(
+pub async fn write_muxed_end(
 	writer: &mut SplitWriter,
 	stream_id: u32,
 	status: TransitStatus,
@@ -662,7 +659,7 @@ pub(super) async fn write_muxed_end(
 	Ok(())
 }
 
-pub(super) async fn write_muxed_echo(
+pub async fn write_muxed_echo(
 	writer: &mut SplitWriter,
 	stream_id: u32,
 	frame: &Arc<Frame>,
@@ -671,7 +668,7 @@ pub(super) async fn write_muxed_echo(
 	write_muxed_end(writer, stream_id, TransitStatus::Ok, payload).await
 }
 
-pub(super) async fn write_goaway(
+pub async fn write_goaway(
 	writer: &mut SplitWriter,
 	last_stream_id: u32,
 	reason: GoAwayReason,
@@ -682,7 +679,7 @@ pub(super) async fn write_goaway(
 }
 
 /// Write a muxed request then its cancel (Rapid Reset open/cancel pair).
-pub(super) async fn write_open_cancel<W: EnvelopeSink>(
+pub async fn write_open_cancel<W: EnvelopeSink>(
 	writer: &mut W,
 	stream_id: u32,
 	frame: Frame,
@@ -693,7 +690,7 @@ pub(super) async fn write_open_cancel<W: EnvelopeSink>(
 	Ok(())
 }
 
-pub(super) fn is_muxed_response(envelope: &TransportEnvelope, stream_id: u32) -> bool {
+pub fn is_muxed_response(envelope: &TransportEnvelope, stream_id: u32) -> bool {
 	matches!(
 		envelope,
 		TransportEnvelope::Mux(MuxEnvelope::End(package)) if package.stream_id() == stream_id
@@ -702,7 +699,7 @@ pub(super) fn is_muxed_response(envelope: &TransportEnvelope, stream_id: u32) ->
 
 /// Poll `shutdown` once so GoAway is sent and the allocator halts, then
 /// return the pinned future for the caller to await the drain.
-pub(super) async fn kick_shutdown(
+pub async fn kick_shutdown(
 	handle: &MuxHandle,
 ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
 	let mut shutdown_future = Box::pin(handle.shutdown());
@@ -715,42 +712,42 @@ pub(super) async fn kick_shutdown(
 	shutdown_future
 }
 
-pub(super) fn is_echo(result: Option<Frame>, expected: &Frame) -> bool {
+pub fn is_echo(result: Option<Frame>, expected: &Frame) -> bool {
 	result.as_ref() == Some(expected)
 }
 
-pub(super) fn is_streams_exhausted(result: &Result<Option<Frame>, TransportError>) -> bool {
+pub fn is_streams_exhausted(result: &Result<Option<Frame>, TransportError>) -> bool {
 	matches!(result, Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)))
 }
 
-pub(super) fn is_busy(result: &Result<Option<Frame>, TransportError>) -> bool {
+pub fn is_busy(result: &Result<Option<Frame>, TransportError>) -> bool {
 	matches!(
 		result,
 		Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))
 	)
 }
 
-pub(super) fn is_draining(result: &Result<Option<Frame>, TransportError>) -> bool {
+pub fn is_draining(result: &Result<Option<Frame>, TransportError>) -> bool {
 	matches!(result, Err(TransportError::Draining))
 }
 
-pub(super) fn is_connection_closed(result: &Result<Option<Frame>, TransportError>) -> bool {
+pub fn is_connection_closed(result: &Result<Option<Frame>, TransportError>) -> bool {
 	matches!(result, Err(TransportError::ConnectionClosed))
 }
 
-pub(super) fn is_invalid_message<T>(result: &Result<T, TransportError>) -> bool {
+pub fn is_invalid_message<T>(result: &Result<T, TransportError>) -> bool {
 	matches!(result, Err(TransportError::InvalidMessage))
 }
 
-pub(super) fn is_policy_rejection(result: &Result<(), TransportError>) -> bool {
+pub fn is_policy_rejection(result: &Result<(), TransportError>) -> bool {
 	matches!(result, Err(TransportError::OperationFailed(TransportFailure::PolicyRejection)))
 }
 
-pub(super) fn is_budget_exhausted(result: &Result<Option<Frame>, TransportError>) -> bool {
+pub fn is_budget_exhausted(result: &Result<Option<Frame>, TransportError>) -> bool {
 	matches!(result, Err(TransportError::OperationFailed(TransportFailure::BudgetExhausted)))
 }
 
-pub(super) async fn read_remaining_chunks(
+pub async fn read_remaining_chunks(
 	reader: &mut SplitReader,
 	stream_id: u32,
 	mut payload: Vec<u8>,
@@ -773,7 +770,7 @@ pub(super) async fn read_remaining_chunks(
 }
 
 /// Skip stream traffic until GoAway(`reason`).
-pub(super) async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayReason) -> Result<bool, TightBeamError> {
+pub async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayReason) -> Result<bool, TightBeamError> {
 	timeout(Duration::from_secs(2), async {
 		loop {
 			let envelope = reader.read_envelope().await?;
@@ -787,7 +784,7 @@ pub(super) async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayRe
 }
 
 /// Poll `goaway_reason()` until `reason` or timeout.
-pub(super) async fn await_goaway_reason(handle: &MuxHandle, reason: GoAwayReason) -> bool {
+pub async fn await_goaway_reason(handle: &MuxHandle, reason: GoAwayReason) -> bool {
 	let observed = timeout(Duration::from_secs(2), async {
 		while handle.goaway_reason() != Some(reason) {
 			sleep(Duration::from_millis(5)).await;
@@ -800,7 +797,7 @@ pub(super) async fn await_goaway_reason(handle: &MuxHandle, reason: GoAwayReason
 
 /// Receiver policy that never raises a stream's limit, pinning the
 /// sender to the initial credit window.
-pub(super) struct NeverGrant;
+pub struct NeverGrant;
 
 impl CreditGrantor for NeverGrant {
 	fn replenish(&self, _stream_id: StreamId, _received: u64, _limit: u64) -> Option<u64> {
@@ -809,7 +806,7 @@ impl CreditGrantor for NeverGrant {
 }
 
 /// Authorizer granting half of each requested budget direction.
-pub(super) struct HalvingAuthorizer;
+pub struct HalvingAuthorizer;
 
 impl TransportAuthorizer for HalvingAuthorizer {
 	fn authorize<'a>(
@@ -828,9 +825,9 @@ impl TransportAuthorizer for HalvingAuthorizer {
 }
 
 /// Application refusal code carried by [`RefusingAuthorizer`].
-pub(super) const REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR;
+pub const REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR;
 
-pub(super) struct RefusingAuthorizer;
+pub struct RefusingAuthorizer;
 
 impl TransportAuthorizer for RefusingAuthorizer {
 	fn authorize<'a>(
@@ -843,7 +840,7 @@ impl TransportAuthorizer for RefusingAuthorizer {
 
 /// Authorizer whose backend never responds, simulating a hung
 /// authorization service on the unauthenticated handshake path.
-pub(super) struct HangingAuthorizer;
+pub struct HangingAuthorizer;
 
 impl TransportAuthorizer for HangingAuthorizer {
 	fn authorize<'a>(
@@ -854,7 +851,7 @@ impl TransportAuthorizer for HangingAuthorizer {
 	}
 }
 
-pub(super) fn is_goaway(envelope: &TransportEnvelope, reason: GoAwayReason, last_stream_id: Option<u32>) -> bool {
+pub fn is_goaway(envelope: &TransportEnvelope, reason: GoAwayReason, last_stream_id: Option<u32>) -> bool {
 	match envelope {
 		TransportEnvelope::Mux(MuxEnvelope::GoAway(package)) => {
 			let reason_ok = package.reason() == reason;
@@ -870,7 +867,7 @@ pub(super) fn is_goaway(envelope: &TransportEnvelope, reason: GoAwayReason, last
 }
 
 /// Observes abort of an in-flight handler: flag flips only on cancellation.
-pub(super) struct DropWitness(pub(super) Arc<AbortContext>);
+pub struct DropWitness(pub Arc<AbortContext>);
 
 impl Drop for DropWitness {
 	fn drop(&mut self) {
@@ -880,21 +877,21 @@ impl Drop for DropWitness {
 
 /// One rekey headroom case:
 /// `drain_headroom = 2 * (local_cap + peer_cap) + 1`.
-pub(super) struct RekeyCase {
-	pub(super) server_local_cap: u32,
-	pub(super) server_peer_cap: u32,
-	pub(super) rekey_limit: u64,
+pub struct RekeyCase {
+	pub server_local_cap: u32,
+	pub server_peer_cap: u32,
+	pub rekey_limit: u64,
 }
 
 impl RekeyCase {
-	pub(super) fn headroom(&self) -> u64 {
+	pub fn headroom(&self) -> u64 {
 		u64::from(self.server_local_cap)
 			.saturating_add(u64::from(self.server_peer_cap))
 			.saturating_mul(2)
 			.saturating_add(1)
 	}
 
-	pub(super) fn responses_before_goaway(&self) -> u32 {
+	pub fn responses_before_goaway(&self) -> u32 {
 		let headroom = self.headroom();
 		debug_assert!(self.rekey_limit > headroom);
 		(self.rekey_limit - headroom) as u32
@@ -905,7 +902,7 @@ impl RekeyCase {
 ///
 /// Verifies the wire answer (reason and abuse watermark) inline and returns
 /// whether the responder surfaced a policy rejection.
-pub(super) async fn run_cancel_abuse<R, W>(
+pub async fn run_cancel_abuse<R, W>(
 	mut client_reader: R,
 	mut client_writer: W,
 	responder: MuxResponder,
@@ -935,26 +932,26 @@ where
 	Ok(is_policy_rejection(&refused))
 }
 
-pub(super) struct ServerInitContext {
-	pub(super) materials: ServerMaterials,
-	pub(super) done: Notify,
+pub struct ServerInitContext {
+	pub materials: ServerMaterials,
+	pub done: Notify,
 }
 
 impl ServerInitContext {
-	pub(super) fn generate() -> Self {
+	pub fn generate() -> Self {
 		Self { materials: ServerMaterials::generate(), done: Notify::new() }
 	}
 }
 
 /// `handler_calls` proves pings bypass the responder.
-pub(super) struct PingContext {
-	pub(super) materials: ServerMaterials,
-	pub(super) handler_calls: AtomicU32,
-	pub(super) server_ping_done: Notify,
+pub struct PingContext {
+	pub materials: ServerMaterials,
+	pub handler_calls: AtomicU32,
+	pub server_ping_done: Notify,
 }
 
 impl PingContext {
-	pub(super) fn generate() -> Self {
+	pub fn generate() -> Self {
 		Self {
 			materials: ServerMaterials::generate(),
 			handler_calls: AtomicU32::new(0),

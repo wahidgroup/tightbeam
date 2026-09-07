@@ -55,6 +55,7 @@ use crate::transport::handshake::{
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::zeroize::Zeroizing;
+use crate::ZeroizingBytes;
 
 /// Client-side CMS handshake orchestrator.
 ///
@@ -187,7 +188,7 @@ where
 	/// Provision the server certificate chain, ordered root to leaf.
 	///
 	/// When set, server authentication validates the full chain against the
-	/// trust store ([RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1)) instead of evaluating the bare certificate.
+	/// trust store ([RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1)), which covers every certificate in the path.
 	#[must_use]
 	pub fn with_server_certificate_chain(mut self, chain: Arc<[Certificate]>) -> Self {
 		self.server_chain = Some(chain);
@@ -263,8 +264,8 @@ where
 	/// Validate state and server certificate for key exchange.
 	///
 	/// Fail-closed (CWE-295): a configured trust store is mandatory. Expiry
-	/// alone authenticates nobody, so a missing store aborts the handshake
-	/// instead of silently degrading.
+	/// alone authenticates nobody, so a missing store aborts the
+	/// handshake.
 	///
 	/// With a provisioned chain, the full path is validated
 	/// ([RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1))
@@ -382,7 +383,7 @@ where
 	/// DER-encoded EnvelopedData
 	pub fn build_key_exchange(
 		&mut self,
-		session_key: Vec<u8>,
+		session_key: ZeroizingBytes,
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validate state and certificate
@@ -477,7 +478,7 @@ where
 	/// - Offer sent: accepted profile must be a member of the offer
 	/// - No offer (dealer's choice): any accepted profile is stored
 	/// - No attribute present: selection stays `None` (trait-level `complete()`
-	///   then fails closed rather than proceeding with an unknown profile)
+	///   then fails closed, which holds an unknown profile out of the session)
 	fn apply_security_accept(&mut self, accept: Option<SecurityAccept>) -> Result<(), HandshakeError> {
 		match (accept, &self.security_offer) {
 			(Some(accept), Some(offer)) => {
@@ -575,8 +576,8 @@ where
 
 		// The acknowledgement is confidential: the client SignerInfo (and
 		// the bearer answer bound in its signed attributes) travels in an
-		// EnvelopedData encrypted to the server certificate, never the
-		// cleartext SignedData.
+		// EnvelopedData encrypted to the server certificate, which keeps it
+		// off the cleartext SignedData.
 		let mut os = OsRng;
 		let ack_der = Zeroizing::new(countersignature.to_der()?);
 		let envelope_der = self.encrypt_to_server(&ack_der, &mut os)?;
@@ -754,14 +755,20 @@ where
 	}
 
 	/// Finalize key exchange by updating transcript and state.
-	fn finalize_key_exchange(&mut self, enveloped_data_der: &[u8], session_key: Vec<u8>) -> Result<(), HandshakeError> {
+	fn finalize_key_exchange(
+		&mut self,
+		enveloped_data_der: &[u8],
+		session_key: ZeroizingBytes,
+	) -> Result<(), HandshakeError> {
 		// Add to transcript if we're computing it internally
 		if self.transcript_hash.is_none() {
 			self.transcript_buffer.extend_from_slice(enveloped_data_der);
 		}
 
 		// Store session key and transition state
-		self.session_key = Some(Secret::from(session_key));
+		// `Zeroizing` holds its buffer to the end of the scope, so the key
+		// reaches its long-term owner as a copy. Both buffers wipe.
+		self.session_key = Some(Secret::from(session_key.to_vec()));
 		// Transition directly from Init -> KeyExchangeSent (CMS path) or HelloSent -> KeyExchangeSent
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
@@ -834,7 +841,7 @@ where
 			.client_certificate
 			.as_ref()
 			.map(|cert| {
-				// CMS CertificateSet owns the cert; orchestrator keeps Arc.
+				// CMS CertificateSet owns the cert. The orchestrator keeps its Arc.
 				let choice = CertificateChoices::Certificate(cert.as_ref().to_owned());
 				Ok::<_, HandshakeError>(CertificateSet(vec![choice].try_into()?))
 			})
@@ -922,8 +929,8 @@ where
 		Box::pin(async move {
 			// Fresh random session key per handshake: a constant key
 			// would make every session trivially decryptable (CWE-321).
-			let session_key = Zeroizing::new(generate_nonce::<32>(None)?);
-			self.build_key_exchange(session_key.to_vec(), None)
+			let session_key = ZeroizingBytes::new(generate_nonce::<32>(None)?.to_vec());
+			self.build_key_exchange(session_key, None)
 		})
 	}
 
@@ -1006,6 +1013,7 @@ where
 
 #[cfg(test)]
 mod tests {
+	use crate::ZeroizingBytes;
 	use std::error::Error;
 	use std::sync::Arc;
 
@@ -1047,8 +1055,8 @@ mod tests {
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 
 		// When: Client builds a valid key exchange
-		let session_key = vec![2u8; 32];
-		let key_exchange = client.build_key_exchange(session_key.to_owned(), None)?;
+		let session_key = [2u8; 32];
+		let key_exchange = client.build_key_exchange(ZeroizingBytes::new(session_key.to_vec()), None)?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		// Verify session key is stored
 		assert!(client.session_key().is_some());
@@ -1071,9 +1079,9 @@ mod tests {
 			digest_alg,
 			signature_alg,
 		)?;
+
 		let server_finished = server_finished_builder.build(&transcript_hash)?;
 		let server_finished = server_finished.to_der()?;
-
 		let verified = client.process_server_finished(&server_finished)?;
 		assert_eq!(verified, transcript_hash);
 		assert_eq!(client.state(), ClientHandshakeState::ServerFinishedReceived);
@@ -1097,6 +1105,7 @@ mod tests {
 		if let Some(root) = root {
 			builder = builder.with_certificate(root)?;
 		}
+
 		Ok(Arc::new(builder.build()))
 	}
 
@@ -1116,7 +1125,7 @@ mod tests {
 		.with_trust_store(trust_store(store_root)?))
 	}
 
-	/// A client without a trust store must abort instead of degrading to
+	/// A client without a trust store aborts, ahead of
 	/// expiry-only server authentication (CWE-295).
 	#[test]
 	fn test_missing_trust_store_fails_closed() -> Result<(), Box<dyn Error>> {
@@ -1127,7 +1136,7 @@ mod tests {
 			Arc::new(server.certificate),
 		);
 
-		let result = client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None);
+		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
 		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
 		Ok(())
 	}
@@ -1138,8 +1147,8 @@ mod tests {
 	fn from_chain_validates_and_targets_leaf() -> Result<(), Box<dyn Error>> {
 		let chain = create_test_certificate_chain()?;
 		let mut client = chain_client(chain.to_arc(), Some(chain.root.to_owned()))?;
+		client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None)?;
 
-		client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None)?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		assert_eq!(client.server_leaf()?, &chain.leaf);
 		Ok(())
@@ -1149,8 +1158,7 @@ mod tests {
 	fn from_chain_rejects_untrusted_chain() -> Result<(), Box<dyn Error>> {
 		let chain = create_test_certificate_chain()?;
 		let mut client = chain_client(chain.to_arc(), None)?;
-
-		let result = client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None);
+		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
 		assert!(matches!(result, Err(HandshakeError::CertificateValidationError(_))));
 		Ok(())
 	}
@@ -1167,7 +1175,7 @@ mod tests {
 				.with_server_certificate_chain(chain.to_arc())
 				.with_trust_store(trust_store(Some(chain.root.to_owned()))?);
 
-		let result = client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None);
+		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
 		assert!(matches!(result, Err(HandshakeError::PinnedCertificateMismatch)));
 		Ok(())
 	}
@@ -1176,8 +1184,7 @@ mod tests {
 	fn from_chain_rejects_empty_chain() -> Result<(), Box<dyn Error>> {
 		let chain = create_test_certificate_chain()?;
 		let mut client = chain_client(Arc::from(Vec::new()), Some(chain.root))?;
-
-		let result = client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None);
+		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
 		assert!(matches!(result, Err(HandshakeError::MissingServerCertificate)));
 		Ok(())
 	}

@@ -17,30 +17,27 @@ use core::marker::PhantomData;
 use core::time::Duration;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
-
 use crate::colony::cluster::outbound::build_cluster_pools;
 use crate::colony::cluster::runtime::bounds::{
 	ClusterDigest, ClusterPool, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayPlane, GatewayRuntimeCtx,
 };
-use crate::colony::cluster::runtime::dispatch::handle_gateway_request;
-use crate::colony::cluster::runtime::gossip_tasks::{build_advertise_task, peer_dial_pool};
-use crate::colony::cluster::runtime::heartbeat::{send_heartbeat_async, spawn_evaporation_loop, spawn_heartbeat_loop};
+use crate::colony::cluster::runtime::heartbeat::send_heartbeat_async;
 use crate::colony::cluster::runtime::streaming::{refuse, splice_duplex, splice_streaming};
 use crate::colony::cluster::runtime::verify::{evaluate_export_gates, evaluate_gates, spent_relay_budget};
 use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, PeerRouteInfo,
 	ServletRegistry, SharedId,
 };
-use crate::colony::common::{take_and_abort, HeartbeatResult};
+use crate::colony::common::{take_and_abort, HeartbeatResult, TaskGroup};
 use crate::colony::servlet::servlet_runtime::rt;
-use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
+use crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS;
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::x509::Certificate;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
+use crate::transport::accept::AcceptPlane;
 use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
@@ -150,11 +147,11 @@ where
 	servlet_registry: Arc<ServletRegistry>,
 	config: Arc<ClusterConfig>,
 	pool: Arc<ClusterPool<P>>,
+	/// The accept planes, which [`Cluster::join`] awaits.
 	server_handle: Option<rt::JoinHandle>,
 	edge_handle: Option<rt::JoinHandle>,
-	heartbeat_handle: Option<rt::JoinHandle>,
-	evaporation_handle: Option<rt::JoinHandle>,
-	advertise_handle: Option<rt::JoinHandle>,
+	/// Every background task this gateway started.
+	tasks: TaskGroup,
 	addr: P::Address,
 	edge_addr: Option<E::Address>,
 	trace: Arc<TraceCollector>,
@@ -182,9 +179,7 @@ where
 	E: Protocol,
 {
 	fn abort_tasks(&mut self) {
-		take_and_abort(&mut self.advertise_handle);
-		take_and_abort(&mut self.evaporation_handle);
-		take_and_abort(&mut self.heartbeat_handle);
+		self.tasks.abort_all();
 		take_and_abort(&mut self.edge_handle);
 		take_and_abort(&mut self.server_handle);
 	}
@@ -200,10 +195,10 @@ where
 	type Address = P::Address;
 
 	async fn start(trace: Arc<TraceCollector>, config: ClusterConfig) -> Result<Self, TightBeamError> {
-		// The admission freshness window MUST NOT outlive journal retention
+		// The admission freshness window MUST stay within journal retention
 		// (CWE-294). A rumor older than retention has no digest left, so a
 		// wider window would re-admit a replay as new. The clamp runs before
-		// config is wrapped in Arc, so callers cannot widen the window afterward.
+		// config is wrapped in Arc, which fixes the window for its lifetime.
 		#[cfg(feature = "x509")]
 		let config = {
 			let mut config = config;
@@ -247,6 +242,7 @@ where
 		#[cfg(not(feature = "x509"))]
 		let replay_guard_for_server = ();
 
+		let tasks = TaskGroup::default();
 		let ctx = GatewayRuntimeCtx {
 			registry: Arc::clone(&registry),
 			servlet_registry: Arc::clone(&servlet_registry),
@@ -255,6 +251,7 @@ where
 			peer_pool: peer_pool.as_ref().map(Arc::clone),
 			trace: Arc::clone(&trace),
 			replay_guard: replay_guard_for_server,
+			tasks: tasks.clone(),
 		};
 
 		// Bind every configured accept plane before spawning any accept
@@ -278,55 +275,33 @@ where
 		};
 
 		// The context is all Arc::clone
-		let server_handle = spawn_gateway_server::<P, P::Listener, D>(listener, ctx.clone(), GatewayPlane::Colony);
+		let server_handle = ctx.clone().serve::<P::Listener, D>(listener, GatewayPlane::Colony);
 
 		// The edge plane serves the same mux service restricted to Work
 		// dispatch (see [`GatewayPlane`]).
 		let edge_handle = edge_listener.map(|edge_listener| {
 			// The context is all Arc::clone
-			spawn_gateway_server::<P, E::Listener, D>(edge_listener, ctx.clone(), GatewayPlane::Edge)
+			ctx.clone().serve::<E::Listener, D>(edge_listener, GatewayPlane::Edge)
 		});
 
-		let heartbeat_handle = spawn_heartbeat_loop::<P, D>(
-			Arc::clone(&registry),
-			Arc::clone(&servlet_registry),
-			Arc::clone(&config),
-			Arc::clone(&pool),
-			Arc::clone(&trace),
-		);
+		tasks.adopt(ctx.clone().spawn_heartbeat::<D>());
 
 		// Three refresh intervals of silence retire a relay trail: one missed
 		// refresh is churn, three means the refresh path died. The default
 		// refresh interval floors the TTL, so an aggressive `rumor_refresh`
-		// cannot churn healthy fallbacks.
+		// keeps a healthy fallback in place.
 		let relay_trail_ttl = config
 			.peer
 			.rumor_refresh
 			.saturating_mul(3)
 			.max(Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS));
-		let evaporation_handle = spawn_evaporation_loop(
-			Arc::clone(&servlet_registry),
-			config.pheromone.evaporation_interval,
-			relay_trail_ttl,
-			Arc::clone(&trace),
-		);
+		tasks.adopt(ctx.clone().spawn_evaporation(relay_trail_ttl));
 
 		#[cfg(feature = "x509")]
-		let advertise_handle = {
-			let advertise_pool = peer_dial_pool(&peer_pool, &pool);
+		{
 			let gateway_bytes: Vec<u8> = addr.clone().into();
-			let gateway_addr: Arc<[u8]> = Arc::from(gateway_bytes);
-			Some(build_advertise_task::<P, D>(
-				Arc::clone(&servlet_registry),
-				advertise_pool,
-				Arc::clone(&pool),
-				Arc::clone(&config),
-				gateway_addr,
-				Arc::clone(&trace),
-			))
-		};
-		#[cfg(not(feature = "x509"))]
-		let advertise_handle = None;
+			tasks.adopt(ctx.clone().spawn_advertise::<D>(Arc::from(gateway_bytes)));
+		}
 
 		Ok(Self {
 			registry,
@@ -335,9 +310,7 @@ where
 			pool,
 			server_handle: Some(server_handle),
 			edge_handle,
-			heartbeat_handle: Some(heartbeat_handle),
-			evaporation_handle: Some(evaporation_handle),
-			advertise_handle,
+			tasks,
 			addr,
 			edge_addr,
 			trace,
@@ -428,11 +401,7 @@ where
 	E: Protocol,
 {
 	fn drop(&mut self) {
-		take_and_abort(&mut self.advertise_handle);
-		take_and_abort(&mut self.evaporation_handle);
-		take_and_abort(&mut self.heartbeat_handle);
-		take_and_abort(&mut self.edge_handle);
-		take_and_abort(&mut self.server_handle);
+		self.abort_tasks();
 	}
 }
 
@@ -478,7 +447,7 @@ where
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
 		let plane = self.plane;
-		async move { handle_gateway_request::<P, D>(frame, cx.into_session(), ctx, plane).await }
+		async move { ctx.handle_request::<D>(frame, cx.into_session(), plane).await }
 	}
 
 	fn streaming(
@@ -550,62 +519,39 @@ where
 	Ok(target)
 }
 
-/// Backoff after one failed accept before the loop resumes.
-///
-/// A refused handshake or a transient socket fault (for example EMFILE)
-/// MUST NOT kill the accept loop, but resuming without delay would spin
-/// the task hot on a persistent bind-level fault.
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
+	/// Serves one accept plane, dispatching each connection through
+	/// [`GatewayMuxService`].
+	///
+	/// `L` is the listener actually bound: the colony protocol listener or
+	/// the edge protocol listener. Both feed the same service over the
+	/// colony pool protocol `P`. Colony accepts call [`warn_export_posture`]
+	/// once before the loop starts. Each admitted transport shares one mux
+	/// offer by reference count.
+	pub(crate) fn serve<L, D>(self, listener: L, plane: GatewayPlane) -> rt::JoinHandle
+	where
+		L: AsyncListenerTrait + Sync + 'static,
+		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
+		D: ClusterDigest,
+	{
+		let ctx = self;
 
-/// Bind the accept loop that admits peers and dispatches control frames.
-///
-/// `L` is the listener actually bound: the colony protocol listener or the
-/// edge protocol listener. Both feed the same [`GatewayMuxService`] over
-/// the colony pool protocol `P`. Colony accepts call [`warn_export_posture`]
-/// once before the loop starts. Each admitted transport shares one mux offer
-/// by reference count.
-pub(crate) fn spawn_gateway_server<P, L, D>(
-	listener: L,
-	ctx: GatewayRuntimeCtx<P>,
-	plane: GatewayPlane,
-) -> rt::JoinHandle
-where
-	P: GatewayColonyProtocol,
-	L: AsyncListenerTrait + Sync + 'static,
-	L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	D: ClusterDigest,
-{
-	// The posture concerns colony-wide export configuration, so it is
-	// reported once, not once per accept plane.
-	if plane == GatewayPlane::Colony {
-		warn_export_posture(&ctx.config, &ctx.trace);
-	}
+		// The posture concerns colony-wide export configuration, so it is
+		// reported once, not once per accept plane.
+		if plane == GatewayPlane::Colony {
+			warn_export_posture(&ctx.config, &ctx.trace);
+		}
 
-	let mux_offer = ctx.config.pool_config.mux_offer.as_ref().map(Arc::clone);
-	let service = Arc::new(GatewayMuxService::<P, D> { ctx, plane, _digest: PhantomData });
+		let mux_offer = ctx.config.pool_config.mux_offer.as_ref().map(Arc::clone);
+		let service = Arc::new(GatewayMuxService::<P, D> { ctx, plane, _digest: PhantomData });
 
-	rt::spawn(async move {
-		let permits = Arc::new(Semaphore::new(DEFAULT_MAX_SERVER_CONNECTIONS));
-		loop {
-			let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-				break;
-			};
-			// let-else drops the failed accept (and its non-Send error)
-			// before the backoff await, so the loop future stays Send.
-			let Ok((mut transport, _addr)) = listener.accept().await else {
-				rt::sleep(ACCEPT_ERROR_BACKOFF).await;
-				continue;
-			};
-
+		rt::spawn(AcceptPlane::default().accept_on(listener, move |mut transport: L::Transport| {
 			// Clone the Arc so each accept shares the mux offer without
 			// copying authorization octets.
 			transport = transport.with_mux_offer(mux_offer.clone());
 
 			let service = Arc::clone(&service);
-			rt::spawn(async move {
-				let _permit = permit;
-				serve_connection_service(transport, service, None, None).await;
-			});
-		}
-	})
+			async move { serve_connection_service(transport, service, None, None).await }
+		}))
+	}
 }

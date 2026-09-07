@@ -58,7 +58,7 @@ use crate::instrumentation::events;
 const MAX_PENDING_PING_ACKS: usize = 4;
 
 /// Peer-initiated event routed from the reader to the responder.
-pub(super) enum InboundEvent {
+pub enum InboundEvent {
 	/// Unary-kind stream reassembled into its message frame
 	Request(u32, Arc<Frame>),
 	/// Streaming or duplex kind: the body forwards chunks as they
@@ -259,7 +259,7 @@ where
 	/// Assemble the reader driver over its shared state and
 	/// channels: the single construction point, so a new field has
 	/// exactly one home.
-	pub(super) fn new(
+	pub fn new(
 		reader: R,
 		shared: Arc<MuxShared>,
 		inbound: mpsc::Sender<InboundEvent>,
@@ -299,12 +299,12 @@ where
 
 	/// Drain-note sender for bodies created outside the reader
 	/// (refcount bump, not a data copy).
-	pub(super) fn drain_feedback(&self) -> mpsc::UnboundedSender<DrainNote> {
+	pub fn drain_feedback(&self) -> mpsc::UnboundedSender<DrainNote> {
 		self.drain_feedback.clone()
 	}
 
 	/// Override the receiver-side stream credit policy.
-	pub(super) fn set_grantor(&mut self, grantor: Arc<dyn CreditGrantor>) {
+	pub fn set_grantor(&mut self, grantor: Arc<dyn CreditGrantor>) {
 		self.grantor = grantor;
 	}
 
@@ -313,7 +313,7 @@ where
 	/// cipher's remaining records, and (client role) open admissions
 	/// gating for renewals.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn attach_rekey(&mut self, driver: RekeyDriver, receipt: StoredReceipt) {
+	pub(crate) fn attach_rekey(&mut self, driver: RekeyDriver, receipt: StoredReceipt) {
 		self.shared.rotate_receipt(receipt);
 		self.epoch_recv_baseline = self.reader.remaining_records();
 

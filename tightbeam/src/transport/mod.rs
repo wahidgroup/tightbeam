@@ -1,8 +1,8 @@
 //! Transport layer for TightBeam protocol
 
-// Cargo features cannot express "at least one of"; a protocol-less TCP
-// transport has no handshake and cannot collect messages, so fail the build
-// early with a clear message instead of a missing-method error.
+// Cargo features express "any of" alone, so a protocol-less TCP transport
+// would compile without a handshake or message collection. Fail the build
+// early with a clear message.
 #[cfg(all(
 	any(feature = "tcp", feature = "async-transport"),
 	not(any(feature = "transport-cms", feature = "transport-ecies"))
@@ -34,6 +34,8 @@ pub mod messaging;
 pub mod protocols;
 pub mod state;
 
+#[cfg(feature = "tokio")]
+pub mod accept;
 #[cfg(any(feature = "tcp", feature = "tokio", feature = "async-transport"))]
 pub(crate) mod framing;
 #[cfg(feature = "transport-multiplex")]

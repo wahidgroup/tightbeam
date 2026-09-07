@@ -98,8 +98,11 @@ pub trait RestartPolicy: CoreRetryPolicy {
 /// Action to take when evaluating retry policy
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetryAction {
-	/// Retry with the provided frame (same or modified from input)
-	Retry(Box<Frame>),
+	/// Resend `frame` once `delay` has elapsed.
+	///
+	/// The policy decides how long to wait. The caller performs the wait,
+	/// so an async caller yields its worker for the duration.
+	Retry { frame: Box<Frame>, delay: core::time::Duration },
 	/// Do not retry, propagate the error
 	NoRetry,
 }
@@ -133,7 +136,7 @@ impl JitterStrategy for DecorrelatedJitter {
 	}
 }
 
-/// Never restart - fail immediately on any error.
+/// Fail immediately on any error.
 #[derive(Default)]
 pub struct NoRestart;
 
@@ -225,20 +228,13 @@ macro_rules! impl_timed_backoff_policy {
 					return RetryAction::NoRetry;
 				}
 
-				// Calculate delay and sleep
-				match &self.jitter {
-					Some(jitter_strategy) => {
-						let delay_ms = $delay_calc(self, attempt);
-						let delay_ms = jitter_strategy.apply(delay_ms);
-						std::thread::sleep(Duration::from_millis(delay_ms));
-					}
-					None => {
-						std::thread::sleep(Duration::from_millis($delay_calc(self, attempt)));
-					}
-				}
+				let base_ms = $delay_calc(self, attempt);
+				let delay_ms = match &self.jitter {
+					Some(jitter_strategy) => jitter_strategy.apply(base_ms),
+					None => base_ms,
+				};
 
-				// Return the same box for retry
-				RetryAction::Retry(frame)
+				RetryAction::Retry { frame, delay: Duration::from_millis(delay_ms) }
 			}
 		}
 	};

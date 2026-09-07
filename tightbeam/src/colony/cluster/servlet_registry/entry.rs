@@ -245,7 +245,7 @@ impl ServletEntry {
 	}
 
 	/// When the last reconcile built this entry, for staleness pruning.
-	pub(super) fn installed_at(&self) -> Instant {
+	pub fn installed_at(&self) -> Instant {
 		self.installed_at
 	}
 
@@ -340,7 +340,7 @@ impl ServletEntry {
 	///
 	/// `installed_at` is deliberately not carried: a replacement is a
 	/// fresh reconcile, and staleness pruning must see it as one.
-	pub(super) fn preserve_peer_trail_from(&mut self, prev: &Self) {
+	pub fn preserve_peer_trail_from(&mut self, prev: &Self) {
 		let both_peer = self.route_kind.is_peer() && prev.route_kind.is_peer();
 		if !both_peer {
 			return;
