@@ -29,17 +29,6 @@
 //! authority and realm: wrong authority, wrong realm, or malformed grammar is
 //! refused at the boundary.
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::{
-	borrow::Cow,
-	format,
-	string::{String, ToString},
-	vec::Vec,
-};
-#[cfg(feature = "std")]
 use std::borrow::Cow;
 
 use crate::utils::urn::{Urn, UrnValidationError};

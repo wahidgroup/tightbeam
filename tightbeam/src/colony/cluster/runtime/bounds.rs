@@ -7,6 +7,7 @@ use std::sync::Arc;
 use digest::consts::U32;
 use digest::{Digest, OutputSizeUser};
 
+use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
 use crate::colony::common::TaskGroup;
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -20,15 +21,7 @@ use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
 
-#[cfg(feature = "x509")]
-use crate::colony::hive::ReplayGuard;
-
 pub(crate) type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
-
-#[cfg(feature = "x509")]
-pub(crate) type GatewayReplayGuard = Arc<ReplayGuard>;
-#[cfg(not(feature = "x509"))]
-pub(crate) type GatewayReplayGuard = ();
 
 /// Accept plane a gateway connection arrived on.
 ///
@@ -145,10 +138,7 @@ impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
 			peer_pool: self.peer_pool.as_ref().map(Arc::clone),
 			trace: Arc::clone(&self.trace),
 			tasks: self.tasks.clone(),
-			#[cfg(feature = "x509")]
-			replay_guard: Arc::clone(&self.replay_guard),
-			#[cfg(not(feature = "x509"))]
-			replay_guard: (),
+			replay_guard: self.replay_guard.clone(),
 		}
 	}
 }

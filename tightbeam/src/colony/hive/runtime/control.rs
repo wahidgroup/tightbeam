@@ -26,9 +26,7 @@ use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::{Frame, MessagePriority, TightBeamError};
 
-#[cfg(feature = "x509")]
 use crate::colony::hive::{ClusterCircuitBreaker, ClusterSecurityGate, ReplayGuard};
-#[cfg(feature = "x509")]
 use crate::crypto::x509::store::CertificateTrust;
 
 /// Shared state for hive control-plane request handling.
@@ -81,13 +79,10 @@ pub struct HiveControlCtx<P: Protocol> {
 	pub hive_context: Arc<HiveContextImpl<P>>,
 	/// Utilization threshold that trips [`BackpressureGate`] on manage traffic.
 	pub bp_threshold: BasisPoints,
-	#[cfg(feature = "x509")]
 	/// Circuit breaker shared with [`ClusterSecurityGate`] for auth failures.
 	pub circuit_breaker: Arc<ClusterCircuitBreaker>,
-	#[cfg(feature = "x509")]
 	/// Freshness window and replay set for signed cluster commands.
 	pub replay_guard: Arc<ReplayGuard>,
-	#[cfg(feature = "x509")]
 	/// Trust store for certificate-based cluster command authentication.
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 }
@@ -143,7 +138,6 @@ where
 			.unwrap_or(false);
 
 		// Security gate runs before drain so drain state answers authenticated peers.
-		#[cfg(feature = "x509")]
 		if let Some(reply) = security_gate_reply(&frame, &session, &ctx, is_heartbeat)? {
 			return Ok(Some(reply));
 		}
@@ -202,7 +196,6 @@ where
 	}
 }
 
-#[cfg(feature = "x509")]
 fn security_gate_reply<P>(
 	frame: &Frame,
 	session: &SessionContext,
@@ -361,7 +354,6 @@ fn forget_replay<P>(_frame: &Frame, _ctx: &HiveControlCtx<P>)
 where
 	P: Protocol,
 {
-	#[cfg(feature = "x509")]
 	if let Some(signer_info) = _frame.nonrepudiation.as_ref() {
 		_ctx.replay_guard.forget(signer_info.signature.as_bytes());
 	}

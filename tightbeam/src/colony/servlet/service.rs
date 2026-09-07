@@ -11,7 +11,6 @@ use crate::transport::{Protocol, TightBeamAddress};
 use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
 
-#[cfg(feature = "x509")]
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 
 use crate::colony::servlet::servlet_runtime::rt;
@@ -212,7 +211,6 @@ impl ServletService for ServletHandlers {
 /// Use this when a call site needs [`Servlet::start`] without `servlet!`.
 /// Hive registration only needs [`crate::colony::hive::ServletBox`], which [`crate::colony::servlet::ServletRuntime`]
 /// already implements.
-#[cfg(feature = "x509")]
 pub struct RuntimeServletConf<P, M, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P: Protocol,
@@ -224,36 +222,11 @@ where
 	pub service: ServletHandlers,
 }
 
-#[cfg(feature = "x509")]
 impl<P, M, C> Default for RuntimeServletConf<P, M, C>
 where
 	P: Protocol,
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
-{
-	fn default() -> Self {
-		Self { config: ServletConfig::default(), service: ServletHandlers::default() }
-	}
-}
-
-/// Config + handlers for [`Servlet`] on [`crate::colony::servlet::ServletRuntime`].
-#[cfg(not(feature = "x509"))]
-pub struct RuntimeServletConf<P, M>
-where
-	P: Protocol,
-	M: Message,
-{
-	/// Bind, workers, gates, and env for the accept loop.
-	pub config: ServletConfig<P, M>,
-	/// Request handlers installed on the runtime.
-	pub service: ServletHandlers,
-}
-
-#[cfg(not(feature = "x509"))]
-impl<P, M> Default for RuntimeServletConf<P, M>
-where
-	P: Protocol,
-	M: Message,
 {
 	fn default() -> Self {
 		Self { config: ServletConfig::default(), service: ServletHandlers::default() }

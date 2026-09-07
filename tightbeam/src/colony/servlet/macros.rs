@@ -74,17 +74,10 @@ macro_rules! __servlet_define {
 
 			/// Join convenience; Deref cannot forward by-value [`ServletRuntime::join`].
 			#[allow(dead_code)]
-			#[cfg(feature = "tokio")]
 			pub async fn join(
 				self,
 			) -> ::core::result::Result<(), $crate::colony::servlet::servlet_runtime::rt::JoinError> {
 				self.runtime.join().await
-			}
-
-			#[allow(dead_code)]
-			#[cfg(all(not(feature = "tokio"), feature = "std"))]
-			pub fn join(self) -> Result<(), $crate::colony::servlet::servlet_runtime::rt::JoinError> {
-				self.runtime.join()
 			}
 		}
 

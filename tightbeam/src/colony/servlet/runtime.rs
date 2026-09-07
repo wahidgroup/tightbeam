@@ -28,9 +28,7 @@ use crate::transport::Protocol;
 use crate::transport::TransportError;
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
 use crate::crypto::profiles::CryptoProvider;
-#[cfg(feature = "x509")]
 use crate::transport::EncryptedProtocol;
 
 /// Config fields [`ServletRuntime::start`] needs after the listener binds.
@@ -67,7 +65,6 @@ where
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 {
 	/// Bind, start workers, build context, and spawn the accept loop.
-	#[cfg(feature = "x509")]
 	pub async fn start<M, C, S>(
 		trace: Arc<TraceCollector>,
 		mut servlet_conf: ServletConfig<P, M, C>,
@@ -87,24 +84,6 @@ where
 			P::bind(bind_addr).await.map_err(protocol_error)?
 		};
 
-		let parts = servlet_conf.into_runtime_parts()?;
-		let runtime = Self::spawn_loop(trace, parts, service, listener, addr).await?;
-		Ok(runtime)
-	}
-
-	/// Bind, start workers, build context, and spawn the accept loop.
-	#[cfg(not(feature = "x509"))]
-	pub async fn start<M, S>(
-		trace: Arc<TraceCollector>,
-		servlet_conf: ServletConfig<P, M>,
-		service: S,
-	) -> Result<Self, TightBeamError>
-	where
-		M: Message,
-		S: ServletService,
-	{
-		let bind_addr = P::default_bind_address().map_err(protocol_error)?;
-		let (listener, addr) = P::bind(bind_addr).await.map_err(protocol_error)?;
 		let parts = servlet_conf.into_runtime_parts()?;
 		let runtime = Self::spawn_loop(trace, parts, service, listener, addr).await?;
 		Ok(runtime)
@@ -180,21 +159,9 @@ impl<P: Protocol> ServletRuntime<P> {
 	}
 
 	/// Wait for the accept loop to finish after stop or peer close.
-	#[cfg(feature = "tokio")]
 	pub async fn join(mut self) -> Result<(), rt::JoinError> {
 		if let Some(handle) = self.server_handle.take() {
 			let joined = rt::join(handle).await;
-			return joined;
-		}
-
-		Ok(())
-	}
-
-	/// Wait for the accept loop to finish after stop or peer close.
-	#[cfg(all(not(feature = "tokio"), feature = "std"))]
-	pub fn join(mut self) -> Result<(), rt::JoinError> {
-		if let Some(handle) = self.server_handle.take() {
-			let joined = rt::join(handle);
 			return joined;
 		}
 
@@ -226,7 +193,6 @@ where
 ///
 /// Prefer inherent [`ServletRuntime::start`] when you already have a
 /// [`ServletService`]. Use this impl when an API bounds on [`Servlet`].
-#[cfg(feature = "x509")]
 impl<P, M, C> Servlet<M> for ServletRuntime<P>
 where
 	P: Protocol + EncryptedProtocol<CryptoProvider = C> + Send + Sync + 'static,
@@ -241,35 +207,6 @@ where
 	async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, TightBeamError> {
 		let RuntimeServletConf { config, service } = config.unwrap_or_default();
 		// Three-argument inherent start (not this trait method).
-		ServletRuntime::start(trace, config, service).await
-	}
-
-	fn addr(&self) -> &Self::Address {
-		ServletRuntime::addr(self)
-	}
-
-	fn stop(self) {
-		ServletRuntime::stop(self);
-	}
-
-	async fn join(self) -> Result<(), rt::JoinError> {
-		ServletRuntime::join(self).await
-	}
-}
-
-#[cfg(not(feature = "x509"))]
-impl<P, M> Servlet<M> for ServletRuntime<P>
-where
-	P: Protocol + Send + Sync + 'static,
-	P::Listener: AsyncListenerTrait + Sync + 'static,
-	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	M: Message + Send + Sync + 'static,
-{
-	type Conf = RuntimeServletConf<P, M>;
-	type Address = P::Address;
-
-	async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, TightBeamError> {
-		let RuntimeServletConf { config, service } = config.unwrap_or_default();
 		ServletRuntime::start(trace, config, service).await
 	}
 

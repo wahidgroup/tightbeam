@@ -9,16 +9,14 @@
 //! 1. [`evaluate_gates`] on the request frame and session.
 //! 2. Decode [`ClusterRequest`] from the frame body.
 //! 3. On [`ClusterRequest::Work`], [`evaluate_export_gates`] with
-//!    [`spent_relay_budget`] before [`handle_work`].
+//!    [`HopBudget::is_relayed`] before [`GatewayRuntimeCtx::handle_work`].
 //! 4. Route all other variants to their handlers (registration, gossip, etc.).
 
 use core::hash::Hash;
 use core::str::FromStr;
 
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayPlane, GatewayRuntimeCtx};
-use crate::colony::cluster::runtime::verify::{evaluate_export_gates, evaluate_gates, spent_relay_budget};
-use crate::colony::cluster::runtime::work::handle_work;
-use crate::colony::cluster::ClusterWorkResponse;
+use crate::colony::cluster::{ClusterWorkResponse, HopBudget};
 use crate::colony::common::{reply_frame, ClusterRequest};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
@@ -31,7 +29,6 @@ use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509Cl
 use crate::Frame;
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
 use crate::colony::cluster::runtime::gossip_tasks::GossipPipelineCtx;
 
 impl<P> GatewayRuntimeCtx<P>
@@ -68,9 +65,9 @@ where
 		session: SessionContext,
 		plane: GatewayPlane,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let ctx = self;
-		if let Err(status) = evaluate_gates(Some(&frame), &session, &ctx.config, &ctx.trace) {
-			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(status));
+		let gate_status = self.config.evaluate_gates(Some(&frame), &session, &self.trace)?;
+		if gate_status != TransitStatus::Ok {
+			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(gate_status));
 		}
 
 		let cluster_request = match decode::<ClusterRequest>(&frame.message) {
@@ -86,36 +83,30 @@ where
 		}
 
 		match cluster_request {
-			ClusterRequest::RegisterHive(request) => ctx.handle_register(frame, request).await,
-			ClusterRequest::ServletAddressUpdate(update) => ctx.handle_address_update(frame, update).await,
+			ClusterRequest::RegisterHive(request) => self.handle_register(frame, request).await,
+			ClusterRequest::ServletAddressUpdate(update) => self.handle_address_update(frame, update).await,
 			ClusterRequest::Work(request) => {
 				// Target and relayed flag are known after decode, so export
 				// gates run on the Work arm.
-				let relayed = spent_relay_budget(request.hops_remaining);
-				if let Err(status) =
-					evaluate_export_gates(&request.servlet_type, &session, relayed, &ctx.config, &ctx.trace)
-				{
-					return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(status));
+				let budget = HopBudget::from_wire(request.hops_remaining, self.config.peer.max_hops);
+				let export_status = self.config.evaluate_export_gates(
+					&request.servlet_type,
+					&session,
+					budget.is_relayed(),
+					&self.trace,
+				)?;
+
+				if export_status != TransitStatus::Ok {
+					let message = ClusterWorkResponse::err(export_status);
+					return reply_frame(&frame.metadata.id, message);
 				}
 
-				handle_work(
-					frame,
-					request,
-					ctx.servlet_registry,
-					ctx.config,
-					ctx.pool,
-					ctx.peer_pool,
-					ctx.trace,
-				)
-				.await
+				self.handle_work(frame, request, budget).await
 			}
-			ClusterRequest::AdvertisePeer(advertisement) => ctx.handle_peer_ad(frame, advertisement).await,
-			#[cfg(feature = "x509")]
-			ClusterRequest::Gossip(rumor) => GossipPipelineCtx::from(ctx).relay::<D>(frame, rumor).await,
-			#[cfg(feature = "x509")]
-			ClusterRequest::PublishGossip(body) => GossipPipelineCtx::from(ctx).publish::<D>(frame, body).await,
-			#[cfg(feature = "x509")]
-			ClusterRequest::ReconcileGossip(reconciliation) => ctx.handle_reconcile(frame, reconciliation).await,
+			ClusterRequest::AdvertisePeer(advertisement) => self.handle_peer_ad(frame, advertisement).await,
+			ClusterRequest::Gossip(rumor) => GossipPipelineCtx::from(self).relay::<D>(frame, rumor).await,
+			ClusterRequest::PublishGossip(body) => GossipPipelineCtx::from(self).publish::<D>(frame, body).await,
+			ClusterRequest::ReconcileGossip(reconciliation) => self.handle_reconcile(frame, reconciliation).await,
 		}
 	}
 }

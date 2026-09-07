@@ -1,32 +1,96 @@
 //! Peer-advertisement admission for the cluster gateway.
-//!
-//! [`AdmittedPeerAd`] is the only path from a wire advertisement to a
-//! reconcilable slate. Signer resolution and wire checks run at
-//! construction so identity, dial address, and slate travel as one value.
 
 use core::str::FromStr;
 use std::sync::Arc;
 
 use super::{ClusterConfig, PeerHint, PheromoneConfig, ServletEntry, SharedId};
 use crate::colony::common::{is_bare_servlet_type, type_canonical_bytes, ColonyNamespace, PeerAdvertisement};
-use crate::constants::MAX_ADVERTISED_TYPES;
+use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
 use crate::policy::TransitStatus;
 use crate::transport::tcp::TightBeamSocketAddr;
 use crate::utils::urn::Urn;
 use crate::Frame;
 
-#[cfg(feature = "x509")]
 use crate::colony::common::ColonyResource;
-#[cfg(feature = "x509")]
 use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
-#[cfg(feature = "x509")]
 use crate::crypto::x509::utils::certificate_extension;
-#[cfg(feature = "x509")]
 use crate::crypto::x509::Certificate;
-#[cfg(feature = "x509")]
 use crate::x509::ext::pkix::name::GeneralName;
-#[cfg(feature = "x509")]
 use crate::x509::ext::pkix::SubjectAltName;
+
+/// Forwards a work request or routed stream open may still spend.
+///
+/// The wire carries a raw count, so the budget is parsed once at the
+/// gateway boundary through [`HopBudget::from_wire`], which clamps it to
+/// the operator's [`PeerConfig::max_hops`]. Every downstream rule reads
+/// this value rather than the raw octet, so a peer cannot spend more
+/// forwards than the operator allows (CWE-770).
+///
+/// [`PeerConfig::max_hops`]: super::PeerConfig::max_hops
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopBudget {
+	/// Forwards this gateway may still spend, under the operator's cap.
+	remaining: u8,
+	/// Whether the sender had already spent part of the budget.
+	relayed: bool,
+}
+
+impl HopBudget {
+	/// Clamps a wire budget to the operator's cap.
+	///
+	/// An origin request carries the sentinel budget, so the clamp also
+	/// stamps the origin with the local cap.
+	#[must_use]
+	pub fn from_wire(wire: u8, max_hops: u8) -> Self {
+		Self { remaining: wire.min(max_hops), relayed: wire != DEFAULT_HOP_BUDGET }
+	}
+
+	/// Spends one forward, saturating at zero.
+	#[must_use]
+	pub fn spend(self) -> Self {
+		Self { remaining: self.remaining.saturating_sub(1), relayed: self.relayed }
+	}
+
+	/// Whether a peer already spent part of this budget.
+	///
+	/// An origin request arrives carrying the sentinel, so anything below
+	/// it reached this gateway through at least one relay. The answer is
+	/// read from the wire count before the cap clamps it, because a cap
+	/// below the sentinel would otherwise make every origin request look
+	/// relayed. The export boundary reads this to tell a direct caller
+	/// from a relayed one.
+	#[must_use]
+	pub fn is_relayed(&self) -> bool {
+		self.relayed
+	}
+
+	/// Whether the budget affords a forward to a peer gateway.
+	#[must_use]
+	pub fn allows_forward(&self) -> bool {
+		self.remaining > 0
+	}
+
+	/// Whether the budget affords the two forwards a relay trail needs.
+	///
+	/// A relay trail spends one hop at the relay before the owner is
+	/// reached, so a shorter budget could never select it.
+	#[must_use]
+	pub fn allows_relay_trail(&self) -> bool {
+		self.remaining >= 2
+	}
+
+	/// The count this budget puts back on the wire.
+	#[must_use]
+	pub fn wire(&self) -> u8 {
+		self.remaining
+	}
+
+	/// A budget clamped to the default cap, for tests that pick a wire count.
+	#[cfg(test)]
+	pub(crate) fn for_test(wire: u8) -> Self {
+		Self::from_wire(wire, DEFAULT_HOP_BUDGET)
+	}
+}
 
 /// Peer advertisement that passed signer resolution and wire checks.
 ///
@@ -73,25 +137,15 @@ impl AdmittedPeerAd {
 
 		// The signer certificate resolves exactly once. The slate key
 		// (fingerprint) and the membership gate both derive from it.
-		#[cfg(feature = "x509")]
-		let signer_cert = frame_signer_cert(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
-		#[cfg(feature = "x509")]
+		let signer_cert =
+			frame_signer_cert(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
 		let peer_hive_id = cert_fingerprint_id(signer_cert).ok_or(TransitStatus::PermissionDenied)?;
-
-		// Without x509 there is no signer fingerprint to bind: the
-		// claimed address is the only available slate key.
-		#[cfg(not(feature = "x509"))]
-		let peer_hive_id = {
-			let _ = frame;
-			Arc::clone(&dial_addr)
-		};
 
 		// Federation is a colony operation: both this gateway and the
 		// advertising peer must carry a valid colony URN SAN. A cert
 		// without one still serves general transport and work, never
 		// membership. Without x509 there is no certificate to carry
 		// membership, so no gate applies.
-		#[cfg(feature = "x509")]
 		{
 			let local_member = conf.colony_urn().is_some();
 			let peer_member = cert_colony_urn(&conf.namespace, signer_cert).is_some();
@@ -246,7 +300,6 @@ fn peer_advertisement_wire_ok(
 /// Single resolution for signer-derived facts: fingerprint and colony
 /// membership both start here so callers resolve the cert once.
 /// Missing trust, signer, or certificate fails closed with `None`.
-#[cfg(feature = "x509")]
 #[must_use]
 pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Frame) -> Option<&'t Certificate> {
 	let trust = trust?;
@@ -259,7 +312,6 @@ pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Fr
 ///
 /// Fail closed with `None` when the fingerprint cannot be computed:
 /// an unkeyed slate or unattributable misbehavior is refused.
-#[cfg(feature = "x509")]
 #[must_use]
 pub(crate) fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
 	let fingerprint = CertificateTrustStore::to_fingerprint(cert).ok()?;
@@ -270,7 +322,6 @@ pub(crate) fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
 ///
 /// Slates reconcile and score misbehavior by fingerprint, never claimed
 /// `gateway_addr`. Missing trust, signer, or fingerprint fails closed.
-#[cfg(feature = "x509")]
 #[must_use]
 pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
 	let cert = frame_signer_cert(trust, frame)?;
@@ -284,7 +335,6 @@ pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Fra
 /// `namespace` are ignored. `None` when the extension is absent or
 /// malformed, when no entry validates, or when more than one distinct
 /// colony URN is present: ambiguous identity fails closed (CWE-706).
-#[cfg(feature = "x509")]
 #[must_use]
 pub fn cert_colony_urn(namespace: &ColonyNamespace, cert: &Certificate) -> Option<Urn<'static>> {
 	let mut colony: Option<Urn<'static>> = None;
@@ -316,7 +366,6 @@ pub fn cert_colony_urn(namespace: &ColonyNamespace, cert: &Certificate) -> Optio
 /// Membership travels in the signer certificate, never frame bytes:
 /// unsigned scope would be weaker than the certificate binding (CWE-345).
 /// Missing trust, signer, or certificate fails closed.
-#[cfg(feature = "x509")]
 #[must_use]
 pub fn frame_colony_urn(
 	namespace: &ColonyNamespace,
@@ -472,7 +521,6 @@ mod tests {
 		assert_eq!(status, Err(TransitStatus::PermissionDenied));
 	}
 
-	#[cfg(all(feature = "x509", feature = "secp256k1", feature = "signature"))]
 	mod colony_urn {
 		use super::*;
 		use crate::testing::utils::{

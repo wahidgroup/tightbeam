@@ -19,22 +19,14 @@ use crate::transport::MessageEmitter;
 use crate::utils::urn::Urn;
 use crate::utils::{decode, encode};
 
-// Pooled clients only expose `emit` on the multiplexed build (the
-// `pooled_mux` cfg alias), which the `colony` feature always satisfies.
-#[cfg(pooled_mux)]
-mod mux {
-	pub use core::hash::Hash;
+use core::hash::Hash;
 
-	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::transport::client::PooledClient;
-	pub use crate::transport::multiplex::MuxConnector;
-	pub use crate::transport::policy::PolicyConfig;
-	pub use crate::transport::protocols::PersistentConnection;
-	pub use crate::transport::{MessageCollector, X509ClientConfig};
-}
-
-#[cfg(pooled_mux)]
-use mux::*;
+use crate::crypto::profiles::CryptoProvider;
+use crate::transport::client::PooledClient;
+use crate::transport::multiplex::MuxConnector;
+use crate::transport::policy::PolicyConfig;
+use crate::transport::protocols::PersistentConnection;
+use crate::transport::{MessageCollector, X509ClientConfig};
 
 /// Submit unary work to a cluster gateway and receive the servlet's
 /// complete response frame.
@@ -95,7 +87,6 @@ where
 	}
 }
 
-#[cfg(pooled_mux)]
 impl<P, C> SubmitWork for PooledClient<P, C>
 where
 	P: Protocol + PersistentConnection + Send + Sync,

@@ -214,7 +214,9 @@ where
 						}
 					}
 					Err(_) => {
-						let _ = self.trace.event(make_event_urn(&job_name, "error"));
+						if let Err(e) = self.trace.event(make_event_urn(&job_name, "error")) {
+							return Err(E::from(e));
+						}
 					}
 				}
 
@@ -368,7 +370,6 @@ mod tests {
 	#[test]
 	fn test_result_is_pipeline() {
 		let result: Result<i32, &str> = Ok(42);
-
 		let doubled = result.map(|x| x * 2).run();
 		assert_eq!(doubled, Ok(84));
 	}
@@ -376,7 +377,6 @@ mod tests {
 	#[test]
 	fn test_pipeline_and_then() {
 		let result: Result<i32, &str> = Ok(10);
-
 		let computed = result.map(|x| x + 5).map(|x| x * 2).run();
 		assert_eq!(computed, Ok(30));
 	}
@@ -384,7 +384,6 @@ mod tests {
 	#[test]
 	fn test_pipeline_or_else() {
 		let result: Result<i32, &str> = Err("error");
-
 		let with_fallback: Result<i32, &str> = result.or(Ok(100)).run();
 		assert_eq!(with_fallback, Ok(100));
 	}
@@ -405,7 +404,6 @@ mod tests {
 	fn test_join_with_error() {
 		let pipe1: Result<i32, &str> = Ok(10);
 		let pipe2: Result<i32, &str> = Err("failed");
-
 		let result = join(pipe1, pipe2).run();
 		assert_eq!(result, Err("failed"));
 	}
@@ -413,7 +411,6 @@ mod tests {
 	#[test]
 	fn test_pipeline_or_else_fallback() {
 		let result: Result<i32, &str> = Err("error");
-
 		let with_fallback: Result<i32, &str> = result.or(Ok(100)).run();
 		assert_eq!(with_fallback, Ok(100));
 	}

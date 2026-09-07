@@ -5,23 +5,14 @@ pub mod messages;
 pub mod scaling;
 pub mod urn;
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
 use core::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec::Vec};
-
-#[cfg(feature = "std")]
 use std::sync::Arc;
-#[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
 use crate::utils::BasisPoints;
 
-#[cfg(feature = "std")]
 use crate::runtime::rt;
 
 pub use messages::*;
@@ -377,7 +368,6 @@ pub fn reply_frame_with_priority<M: crate::Message>(
 /// Take an optional join handle and abort it when present.
 ///
 /// Shared by servlet, hive, and cluster `stop` / `Drop` paths.
-#[cfg(feature = "std")]
 pub fn take_and_abort(handle: &mut Option<rt::JoinHandle>) {
 	if let Some(handle) = handle.take() {
 		rt::abort(&handle);
@@ -392,11 +382,9 @@ pub fn take_and_abort(handle: &mut Option<rt::JoinHandle>) {
 /// reading the same handle keeps those decisions from disagreeing.
 ///
 /// Drain is terminal. A runtime that has entered it stays in it.
-#[cfg(feature = "std")]
 #[derive(Clone, Default)]
 pub struct DrainMode(std::sync::Arc<std::sync::RwLock<Option<std::time::Instant>>>);
 
-#[cfg(feature = "std")]
 impl DrainMode {
 	/// Enters drain, keeping the instant of the first entry.
 	pub fn begin(&self) {
@@ -424,19 +412,16 @@ impl DrainMode {
 ///
 /// The handle is shared, so a context handed to a request handler can adopt
 /// work the handler starts.
-#[cfg(feature = "std")]
 #[derive(Clone, Default)]
 pub struct TaskGroup(std::sync::Arc<std::sync::Mutex<TaskGroupState>>);
 
 /// Running handles, and whether the group has stopped.
-#[cfg(feature = "std")]
 #[derive(Default)]
 struct TaskGroupState {
 	running: Vec<rt::JoinHandle>,
 	stopped: bool,
 }
 
-#[cfg(feature = "std")]
 impl TaskGroup {
 	/// Takes ownership of `handle`, releasing handles whose task has ended.
 	///

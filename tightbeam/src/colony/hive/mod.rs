@@ -21,21 +21,12 @@ pub use crate::colony::common::{
 pub use error::HiveError;
 pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker};
 
-#[cfg(feature = "x509")]
 pub use gates::{
 	verify_frame_signature, ClusterSecurityGate, PeerListGate, PeerListMode, ReplayGuard, TrustVerification,
 };
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec::Vec};
-
-#[cfg(feature = "std")]
 use std::collections::HashMap;
 
-#[cfg(feature = "std")]
 use std::sync::Arc;
 
 use core::future::Future;
@@ -53,7 +44,6 @@ use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
 
-#[cfg(feature = "x509")]
 pub use crate::crypto::x509::store::CertificateTrust;
 
 /// Type alias for the spawner function used in auto-scaling.
@@ -370,7 +360,6 @@ pub trait Hive: Sized + Send + Sync {
 /// TLS material for hive control-plane and servlet identity.
 ///
 /// Wrapped in `Arc` inside [`HiveConfig`] because validators are trait objects.
-#[cfg(feature = "x509")]
 pub struct HiveTlsConfig {
 	/// Server certificate specification used for TLS identity.
 	pub certificate: crate::crypto::x509::CertificateSpec,
@@ -380,7 +369,6 @@ pub struct HiveTlsConfig {
 	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 }
 
-#[cfg(feature = "x509")]
 impl core::fmt::Debug for HiveTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("HiveTlsConfig")
@@ -560,10 +548,8 @@ pub struct HiveControlConfig {
 	///
 	/// Commands whose `Frame.metadata.order` is outside this window, or whose
 	/// signature was already seen inside it, are rejected. See [`ReplayGuard`].
-	#[cfg(feature = "x509")]
 	pub command_freshness_window_ms: u64,
 	/// Retry policy used when fanning out scaling updates to gateways.
-	#[cfg(feature = "std")]
 	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
 }
 
@@ -575,9 +561,7 @@ impl core::fmt::Debug for HiveControlConfig {
 			.field("reregister_interval", &self.reregister_interval)
 			.field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
 			.field("circuit_breaker_cooldown_ms", &self.circuit_breaker_cooldown_ms);
-		#[cfg(feature = "x509")]
 		d.field("command_freshness_window_ms", &self.command_freshness_window_ms);
-		#[cfg(feature = "std")]
 		d.field("notify_retry", &"<RetryPolicy>");
 		d.finish()
 	}
@@ -591,9 +575,7 @@ impl Default for HiveControlConfig {
 			reregister_interval: Some(Duration::from_secs(5)),
 			circuit_breaker_threshold: 3,
 			circuit_breaker_cooldown_ms: 30_000,
-			#[cfg(feature = "x509")]
 			command_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
-			#[cfg(feature = "std")]
 			notify_retry: Arc::new(crate::transport::policy::RestartExponentialBackoff {
 				max_attempts: 3,
 				scale_factor: 500,
@@ -626,10 +608,8 @@ pub struct HiveConfig {
 	///
 	/// When `None`, authenticated cluster commands are rejected and encrypted
 	/// servlet calls fail closed without a trust anchor.
-	#[cfg(feature = "x509")]
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 	/// TLS identity for control-plane signing and encrypted transport.
-	#[cfg(feature = "x509")]
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
 }
 
@@ -640,9 +620,7 @@ impl core::fmt::Debug for HiveConfig {
 			.field("scaling", &self.scaling)
 			.field("control", &self.control)
 			.field("pool", &self.pool);
-		#[cfg(feature = "x509")]
 		d.field("trust_store", &self.trust_store.as_ref().map(|_| "<CertificateTrust>"));
-		#[cfg(feature = "x509")]
 		d.field("hive_tls", &self.hive_tls);
 		d.finish()
 	}
@@ -655,9 +633,7 @@ impl Default for HiveConfig {
 			scaling: HiveScalingConfig::default(),
 			control: HiveControlConfig::default(),
 			pool: PoolConfig { max_connections: 8, idle_timeout: Some(Duration::from_secs(30)), mux_offer: None },
-			#[cfg(feature = "x509")]
 			trust_store: None,
-			#[cfg(feature = "x509")]
 			hive_tls: None,
 		}
 	}

@@ -3,12 +3,6 @@
 //! This module defines every message type in the protocol between the
 //! cluster and the hive.
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 use crate::asn1::Frame;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
@@ -155,15 +149,12 @@ pub enum ClusterRequest {
 	///
 	/// Boxed because a nested [`Frame`] is far larger than the other
 	/// variants. The wire encoding is unchanged.
-	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "4", constructed = "true")]
 	Gossip(Box<Frame>),
 	/// Origin gossip rumor from a local publisher [context 5]
-	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "5", constructed = "true")]
 	PublishGossip(GossipRumor),
 	/// Anti-entropy digest summary from a peer gateway [context 6]
-	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "6", constructed = "true")]
 	ReconcileGossip(GossipReconciliation),
 }
@@ -750,7 +741,6 @@ mod tests {
 		}))
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn cluster_request_gossip_round_trips() -> Result<()> {
 		let rumor_body = GossipRumor::application(vec![0x02, 0x01, 0x2A]);
@@ -775,13 +765,11 @@ mod tests {
 		round_trip(ClusterRequest::Gossip(Box::new(rumor)))
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn cluster_request_publish_gossip_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::PublishGossip(GossipRumor::application(vec![0x02, 0x01, 0x2A])))
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn cluster_request_reconcile_gossip_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::ReconcileGossip(GossipReconciliation {
@@ -789,7 +777,6 @@ mod tests {
 		}))
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn cluster_request_reconcile_gossip_empty_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::ReconcileGossip(GossipReconciliation { held: vec![] }))

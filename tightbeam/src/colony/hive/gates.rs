@@ -3,13 +3,6 @@
 //! Contains circuit breaker, replay guard, and security gate implementations
 //! for cluster command authentication and capacity management.
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
-#[cfg(feature = "std")]
 use std::sync::Arc;
 
 use core::sync::atomic::{AtomicU16, Ordering};
@@ -19,18 +12,11 @@ use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
 use crate::utils::BasisPoints;
 use crate::Frame;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub use std::collections::{HashMap, HashSet};
-	pub use std::sync::Mutex;
-
-	pub use crate::colony::common::ClusterCommand;
-	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::der::Encode;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
+use crate::colony::common::ClusterCommand;
+use crate::crypto::x509::store::CertificateTrust;
+use crate::der::Encode;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 // ============================================================================
 // Circuit Breaker
@@ -209,7 +195,6 @@ impl ClusterCircuitBreaker {
 /// from "trusted identity claimed with a bad signature" so callers can
 /// apply different consequences (the circuit breaker only counts the
 /// last one).
-#[cfg(feature = "x509")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustVerification {
 	/// Frame carries no nonrepudiation signature
@@ -228,7 +213,6 @@ pub enum TrustVerification {
 /// verifies the signature over the frame's to-be-signed bytes. Shared by
 /// [`ClusterSecurityGate`] (hive side) and the cluster gateway's
 /// registration authentication.
-#[cfg(feature = "x509")]
 pub fn verify_frame_signature(trust_store: &dyn CertificateTrust, frame: &Frame) -> TrustVerification {
 	let Some(signer_info) = frame.nonrepudiation.as_ref() else {
 		return TrustVerification::MissingSignature;
@@ -266,7 +250,6 @@ pub fn verify_frame_signature(trust_store: &dyn CertificateTrust, frame: &Frame)
 /// Legitimate traffic is bounded by a signer's command rate inside one
 /// window. Each signer's partition fails closed at capacity, which holds
 /// while an attacker lacks the fresh valid signatures that would fill it.
-#[cfg(feature = "x509")]
 pub const REPLAY_GUARD_CAPACITY: usize = 1024;
 
 /// Bounded freshness and replay window for signed cluster commands
@@ -278,7 +261,6 @@ pub const REPLAY_GUARD_CAPACITY: usize = 1024;
 /// partition leaves the others admitting. Entries more than the window away
 /// from the current clock are pruned on each check, so memory is bounded by
 /// [`REPLAY_GUARD_CAPACITY`] per trusted signer.
-#[cfg(feature = "x509")]
 type SignerPartitions = HashMap<Vec<u8>, HashMap<Vec<u8>, u64>>;
 
 /// Recorded signatures, partitioned by signer and indexed by signature.
@@ -286,14 +268,12 @@ type SignerPartitions = HashMap<Vec<u8>, HashMap<Vec<u8>, u64>>;
 /// The partitions hold the per-signer capacity. The index answers "have I
 /// seen this signature" in one lookup, so admission costs the same whether
 /// the colony has one trusted signer or a thousand.
-#[cfg(feature = "x509")]
 #[derive(Default)]
 struct SeenSignatures {
 	partitions: SignerPartitions,
 	owner: HashMap<Vec<u8>, Vec<u8>>,
 }
 
-#[cfg(feature = "x509")]
 impl SeenSignatures {
 	/// Whether `signature` is recorded and still inside the window.
 	///
@@ -365,13 +345,11 @@ impl SeenSignatures {
 	}
 }
 
-#[cfg(feature = "x509")]
 pub struct ReplayGuard {
 	seen: Mutex<SeenSignatures>,
 	window_ms: u64,
 }
 
-#[cfg(feature = "x509")]
 impl ReplayGuard {
 	/// Create a guard with the given freshness window in milliseconds
 	pub fn new(window_ms: u64) -> Self {
@@ -451,7 +429,6 @@ impl ReplayGuard {
 /// the [`ProvenPeer`] the transport handshake established, so one member's
 /// failures gate that member alone (CWE-645). Steps 6-7 stay uncounted,
 /// because a replayed capture still carries a valid signature.
-#[cfg(feature = "x509")]
 pub struct ClusterSecurityGate {
 	/// Circuit breaker for tracking auth failures
 	circuit_breaker: Arc<ClusterCircuitBreaker>,
@@ -461,7 +438,6 @@ pub struct ClusterSecurityGate {
 	replay_guard: Arc<ReplayGuard>,
 }
 
-#[cfg(feature = "x509")]
 impl ClusterSecurityGate {
 	/// Create a new security gate with certificate-based trust
 	///
@@ -478,7 +454,6 @@ impl ClusterSecurityGate {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl GatePolicy for ClusterSecurityGate {
 	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		let Some(frame) = frame else {
@@ -592,7 +567,6 @@ impl GatePolicy for BackpressureGate {
 // ============================================================================
 
 /// Membership mode of a [`PeerListGate`].
-#[cfg(feature = "x509")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerListMode {
 	/// White list: only listed peer keys are admitted.
@@ -607,14 +581,12 @@ pub enum PeerListMode {
 /// mutually-authenticated peer certificate, not the frame signer which is an
 /// application-level concern. An empty session context answers as an absent
 /// peer, so allow lists fail closed (`Unauthenticated`) and deny lists admit.
-#[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct PeerListGate {
 	keys: HashSet<Vec<u8>>,
 	mode: PeerListMode,
 }
 
-#[cfg(feature = "x509")]
 impl PeerListGate {
 	/// White list admitting only these peer public keys (SPKI DER).
 	pub fn allow<I, K>(keys: I) -> Self
@@ -651,7 +623,6 @@ impl PeerListGate {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl GatePolicy for PeerListGate {
 	fn evaluate(&self, _message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		self.admit(session.peer_certificate().is_some(), session.peer_public_key())
@@ -727,7 +698,6 @@ mod tests {
 		assert!(breaker.allow_request(signer()));
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_accepts_first_rejects_second() {
 		let guard = ReplayGuard::new(30_000);
@@ -736,7 +706,6 @@ mod tests {
 		assert!(guard.check_and_insert(b"signer-1", b"sig-b", 2_000));
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_prunes_expired_entries() {
 		let guard = ReplayGuard::new(1_000);
@@ -744,7 +713,6 @@ mod tests {
 		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 3_000));
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_prunes_future_dated_entries_after_clock_regression() {
 		let guard = ReplayGuard::new(1_000);
@@ -752,7 +720,6 @@ mod tests {
 		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 5_000));
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_saturated_signer_does_not_block_others() {
 		let guard = ReplayGuard::new(30_000);
@@ -762,7 +729,6 @@ mod tests {
 		assert!(guard.check_and_insert(b"signer-2", b"sig-a", 1_000));
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_rejects_replay_across_signer_partitions() {
 		let guard = ReplayGuard::new(30_000);
@@ -770,7 +736,6 @@ mod tests {
 		assert!(!guard.check_and_insert(b"signer-2", b"sig-a", 1_000));
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_forget_permits_retry() {
 		let guard = ReplayGuard::new(30_000);
@@ -779,7 +744,6 @@ mod tests {
 		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 2_000));
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_freshness_window_is_bidirectional() {
 		let guard = ReplayGuard::new(1_000);
@@ -830,7 +794,6 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn peer_allow_list_admits_listed_key_only() {
 		let gate = PeerListGate::allow([b"key-a".to_vec()]);
@@ -838,14 +801,12 @@ mod tests {
 		assert_eq!(gate.admit(true, Some(b"key-b")), TransitStatus::PermissionDenied);
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn peer_allow_list_fails_closed_without_identity() {
 		let gate = PeerListGate::allow([b"key-a".to_vec()]);
 		assert_eq!(gate.admit(false, None), TransitStatus::Unauthenticated);
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn peer_deny_list_refuses_listed_key_only() {
 		let gate = PeerListGate::deny([b"key-a".to_vec()]);
@@ -853,14 +814,12 @@ mod tests {
 		assert_eq!(gate.admit(true, Some(b"key-b")), TransitStatus::Ok);
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn peer_deny_list_admits_absent_identity() {
 		let gate = PeerListGate::deny([b"key-a".to_vec()]);
 		assert_eq!(gate.admit(false, None), TransitStatus::Ok);
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn peer_list_refuses_certified_peer_without_spki() {
 		let allow = PeerListGate::allow([b"key-a".to_vec()]);
@@ -869,7 +828,6 @@ mod tests {
 		assert_eq!(deny.admit(true, None), TransitStatus::Internal);
 	}
 
-	#[cfg(feature = "x509")]
 	#[test]
 	fn peer_list_empty_context_answers_as_absent_peer() -> Result<(), crate::TightBeamError> {
 		let frame = work_frame(None)?;
