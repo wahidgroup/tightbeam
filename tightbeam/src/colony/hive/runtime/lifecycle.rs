@@ -14,11 +14,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use crate::colony::common::{canonical_bytes, take_and_abort, ColonyResource};
-use crate::colony::hive::runtime::{
-	instance_urn, register_once, spawn_control_server, spawn_reregister_task, spawn_scaling_task, HiveContextImpl,
-	HiveControlCtx, ScalingTaskCtx,
-};
+use crate::colony::common::{canonical_bytes, instance_urn, take_and_abort, ColonyResource, DrainMode, TaskGroup};
+use crate::colony::hive::runtime::control::InFlight;
+use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveControlCtx, ScalingLoop};
 use crate::colony::hive::{
 	HashMapRegistry, Hive, HiveConfig, HiveContext, RegisterHiveResponse, ServletBox, ServletRegistration,
 	ServletRegistry, SpawnerFn,
@@ -56,21 +54,26 @@ pub struct HiveRuntime<P: Protocol> {
 	spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
 	config: HiveConfig,
 	trace: Arc<TraceCollector>,
+	/// The control accept loop, which [`Hive::join`] awaits.
 	control_server_handle: Option<rt::JoinHandle>,
 	addr: P::Address,
-	scaling_handle: Option<rt::JoinHandle>,
+	/// Every background task this runtime started.
+	tasks: TaskGroup,
 	utilization: Arc<AtomicU16>,
 	utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
-	draining_since: Arc<RwLock<Option<Instant>>>,
+	drain: DrainMode,
+	/// Commands in flight, which a drain waits to reach zero.
+	in_flight: InFlight,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
-	reregister_handle: Option<rt::JoinHandle>,
 	hive_context: Arc<HiveContextImpl<P>>,
 }
 
+/// How often a drain re-checks whether its commands have finished.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 impl<P: Protocol> HiveRuntime<P> {
 	fn abort_tasks(&mut self) {
-		take_and_abort(&mut self.scaling_handle);
-		take_and_abort(&mut self.reregister_handle);
+		self.tasks.abort_all();
 		take_and_abort(&mut self.control_server_handle);
 	}
 
@@ -81,7 +84,8 @@ impl<P: Protocol> HiveRuntime<P> {
 			trace: Arc::clone(&self.trace),
 			utilization: Arc::clone(&self.utilization),
 			utilization_map: Arc::clone(&self.utilization_map),
-			draining_since: Arc::clone(&self.draining_since),
+			drain: self.drain.clone(),
+			in_flight: self.in_flight.clone(),
 			hive_context: Arc::clone(&self.hive_context),
 			bp_threshold: self.config.control.backpressure_threshold,
 			#[cfg(feature = "x509")]
@@ -100,11 +104,22 @@ impl<P: Protocol> HiveRuntime<P> {
 impl<P> HiveRuntime<P>
 where
 	P: Protocol + EncryptedProtocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
-	P::Address: Clone + Send + Sync + 'static,
+	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
+	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + 'static,
 	TightBeamError: From<P::Error>,
 {
+	/// Binds this hive's slate, gateways, address, and configuration.
+	fn cluster_link(&self) -> ClusterLink<P> {
+		ClusterLink::new(
+			Arc::clone(&self.servlets),
+			Arc::clone(&self.cluster_addrs),
+			self.addr,
+			Arc::new(self.config.clone()),
+		)
+	}
+
 	/// Encrypt the control plane when hive_tls is set (spawn/stop must not travel cleartext).
 	async fn bind_control_listener(config: &HiveConfig) -> Result<(P::Listener, P::Address), TightBeamError> {
 		let bind_addr = P::default_bind_address()?;
@@ -148,7 +163,7 @@ fn seed_hive_routes<P: Protocol>(servlets: &HashMapRegistry, hive_context: &Hive
 	servlets.for_each(|key, reg| {
 		let addr_bytes = reg.servlet.addr_bytes();
 		let type_key = canonical_bytes(&reg.servlet_type);
-		// for_each borrows the registry key; add_route needs an owned copy.
+		// for_each borrows the registry key, and add_route needs an owned copy.
 		hive_context.add_route(key.clone(), addr_bytes, &type_key);
 	});
 }
@@ -202,12 +217,12 @@ where
 			trace: Arc::new(TraceCollector::default()),
 			control_server_handle: None,
 			addr,
-			scaling_handle: None,
+			tasks: TaskGroup::default(),
 			utilization: Arc::new(AtomicU16::new(0)),
 			utilization_map: Arc::new(Mutex::new(HashMap::new())),
-			draining_since: Arc::new(RwLock::new(None)),
+			drain: DrainMode::default(),
+			in_flight: InFlight::default(),
 			cluster_addrs: Arc::new(RwLock::new(Vec::new())),
-			reregister_handle: None,
 			hive_context,
 		})
 	}
@@ -267,27 +282,29 @@ where
 		let mux_offer = self.config.pool.mux_offer.as_ref().map(Arc::clone);
 		let control_ctx = self.build_control_ctx();
 
-		self.control_server_handle = Some(spawn_control_server::<P>(listener, mux_offer, control_ctx));
-		self.scaling_handle = Some(spawn_scaling_task::<P>(ScalingTaskCtx {
-			servlets: Arc::clone(&self.servlets),
-			spawners: Arc::clone(&self.spawners),
-			trace: Arc::clone(&self.trace),
-			utilization: Arc::clone(&self.utilization),
-			utilization_map: Arc::clone(&self.utilization_map),
-			cluster_addrs: Arc::clone(&self.cluster_addrs),
-			hive_context: Arc::clone(&self.hive_context),
-			hive_addr: self.addr,
-			config: self.config.clone(),
-		}));
+		self.control_server_handle = Some(control_ctx.serve(listener, mux_offer));
+		self.tasks.adopt(
+			ScalingLoop {
+				servlets: Arc::clone(&self.servlets),
+				spawners: Arc::clone(&self.spawners),
+				trace: Arc::clone(&self.trace),
+				utilization: Arc::clone(&self.utilization),
+				utilization_map: Arc::clone(&self.utilization_map),
+				cluster_addrs: Arc::clone(&self.cluster_addrs),
+				hive_context: Arc::clone(&self.hive_context),
+				hive_addr: self.addr,
+				config: self.config.clone(),
+				tasks: self.tasks.clone(),
+				drain: self.drain.clone(),
+			}
+			.spawn(),
+		);
 
-		// Re-announce the slate each interval; gateway registries are soft state.
-		self.reregister_handle = Some(spawn_reregister_task::<P>(
-			Arc::clone(&self.servlets),
-			Arc::clone(&self.trace),
-			Arc::clone(&self.cluster_addrs),
-			self.addr,
-			self.config.clone(),
-		));
+		// Re-announce the slate each interval. Gateway registries are soft state.
+		self.tasks.adopt(
+			self.cluster_link()
+				.spawn_reregister(Arc::clone(&self.trace), self.drain.clone()),
+		);
 
 		Ok(())
 	}
@@ -331,54 +348,46 @@ where
 		}
 
 		let cluster_addr = *cluster_addr;
-		let response = register_once::<P>(&*self.servlets, self.addr, cluster_addr, &self.config).await?;
+		let link = self.cluster_link();
+		let response = link.register(cluster_addr).await?;
 
 		// Remember the gateway only after acceptance so refused peers are not polled.
 		if response.status == TransitStatus::Ok {
-			if let Ok(mut addrs) = self.cluster_addrs.write() {
-				let incoming: Vec<u8> = cluster_addr.into();
-				let known = addrs.iter().any(|addr| {
-					let bytes: Vec<u8> = (*addr).into();
-					bytes == incoming
-				});
-				if !known {
-					addrs.push(cluster_addr);
-				}
-			}
+			link.remember(cluster_addr);
 		}
 
 		Ok(response)
 	}
 
 	async fn drain(&self) -> Result<(), TightBeamError> {
-		{
-			let mut guard = self.draining_since.write().map_err(|_| TightBeamError::LockPoisoned)?;
-			*guard = Some(Instant::now());
-		}
+		self.drain.begin();
 
 		let drain_timeout = self.config.control.drain_timeout;
 		let start = Instant::now();
 
-		loop {
-			let timed_out = start.elapsed() >= drain_timeout;
-			if self.servlets.count() == 0 || timed_out {
-				if timed_out {
-					self.servlets
-						.drain_all()
-						.into_iter()
-						.for_each(|(_, reg)| reg.servlet.stop_boxed());
-				}
-				break;
-			}
-
-			tokio::time::sleep(Duration::from_millis(100)).await;
+		// Wait on commands, not on open connections: a control connection
+		// idles between commands by design. The timeout is the backstop for
+		// work that outlasts it.
+		while !self.in_flight.is_idle() && start.elapsed() < drain_timeout {
+			tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
 		}
+
+		// Either path ends drained, so a caller that awaited this call holds
+		// a hive with no running servlets.
+		self.servlets
+			.drain_all()
+			.into_iter()
+			.for_each(|(_, reg)| reg.servlet.stop_boxed());
+
+		// Announce the emptied slate so gateways retire this hive's routes
+		// now, ahead of the heartbeat that would eventually miss.
+		self.cluster_link().announce_slate().await;
 
 		Ok(())
 	}
 
 	fn is_draining(&self) -> bool {
-		self.draining_since.read().map(|g| g.is_some()).unwrap_or(false)
+		self.drain.is_draining()
 	}
 }
 

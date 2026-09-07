@@ -25,8 +25,8 @@
 //!
 //! A [`ColonyNamespace`] is the minting and validation authority for one
 //! deployment. Gateways validate inbound URNs against their own
-//! namespace, so segments sharing a network cannot cross-register or
-//! cross-route: wrong authority, wrong realm, or malformed grammar is
+//! namespace, so a segment registers and routes inside its own
+//! authority and realm: wrong authority, wrong realm, or malformed grammar is
 //! refused at the boundary.
 
 #[cfg(not(feature = "std"))]
@@ -43,6 +43,7 @@ use alloc::{
 use std::borrow::Cow;
 
 use crate::utils::urn::{Urn, UrnValidationError};
+use crate::TightBeamError;
 
 /// Default naming authority for colony resources.
 pub const COLONY_NID: &str = "tightbeam";
@@ -130,8 +131,8 @@ impl ColonyNamespace {
 	/// Name (RFC 5280 §4.2.1.6) and asserts colony membership for
 	/// gossip and peer federation. The refusal rules match
 	/// [`ColonyNamespace::servlet`]: a name with `/` or `:` would
-	/// reparse as a different resource, and an empty name cannot name
-	/// anything.
+	/// reparse as a different resource, and a name carries at least one
+	/// character.
 	pub fn colony(&self, name: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
 		let name = name.as_ref();
 		Self::validate_single_segment_name(name)?;
@@ -155,8 +156,8 @@ impl ColonyNamespace {
 
 	/// Mint the URN identifying a hive by its registration locator.
 	///
-	/// An empty locator is refused: it cannot name anything and
-	/// validation refuses an empty `resource-id`. `:` and `/` are
+	/// An empty locator is refused: validation requires a nonempty
+	/// `resource-id`. `:` and `/` are
 	/// allowed because locators carry them (`host:port`, URL paths) and
 	/// the hive `resource-id` is the whole remaining tail.
 	pub fn hive(&self, addr: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
@@ -221,8 +222,8 @@ impl ColonyNamespace {
 				Ok(ColonyResource::Servlet { name, instance })
 			}
 			HIVE_SEGMENT => Ok(ColonyResource::Hive { addr: id }),
-			// A colony name is one segment: a `/` or extra `:` cannot
-			// come from `colony`, so such an id names nothing mintable.
+			// A colony name is one segment, so an id carrying `/` or an extra
+			// `:` names something outside the mintable grammar.
 			COLONY_SEGMENT => {
 				Self::validate_single_segment_name(id)?;
 				Ok(ColonyResource::Colony { name: id })
@@ -242,6 +243,19 @@ pub fn servlet_instance(servlet_type: &Urn<'_>, addr: impl AsRef<str>) -> Urn<'s
 	}
 }
 
+/// Servlet-type URN with the instance locator as the resource-id tail.
+///
+/// # Errors
+///
+/// - [`UrnValidationError::InvalidFormat`] -- `addr_bytes` is not UTF-8.
+pub fn instance_urn(type_urn: &Urn<'_>, addr_bytes: impl AsRef<[u8]>) -> Result<Urn<'static>, TightBeamError> {
+	let addr = core::str::from_utf8(addr_bytes.as_ref()).map_err(|_| {
+		TightBeamError::UrnValidationError(UrnValidationError::InvalidFormat { field: "resource-id", pattern: None })
+	})?;
+
+	Ok(servlet_instance(type_urn, addr))
+}
+
 /// Whether `urn` is a bare servlet type in `namespace` (no instance tail)
 #[must_use]
 pub fn is_bare_servlet_type(namespace: &ColonyNamespace, urn: &Urn<'_>) -> bool {
@@ -257,7 +271,7 @@ pub fn canonical_bytes(urn: &Urn<'_>) -> Vec<u8> {
 }
 
 /// Canonical bytes of a URN with any instance tail stripped: the type
-/// key an instance belongs to. NID, realm, and servlet name cannot
+/// key an instance belongs to. NID, realm, and servlet name exclude
 /// contain `/`, so the first `/` in the canonical form always marks the
 /// start of the instance tail.
 pub fn type_canonical_bytes(urn: &Urn<'_>) -> Vec<u8> {
@@ -271,8 +285,8 @@ pub fn type_canonical_bytes(urn: &Urn<'_>) -> Vec<u8> {
 
 /// Byte prefix matching every instance key under a servlet type: the
 /// type's canonical bytes plus the tail delimiter. The delimiter keeps
-/// one type's prefix from matching another type's keys (`beam` never
-/// matches `beam2/...`).
+/// one type's prefix from matching another type's keys (`beam` matches
+/// `beam/...` alone, leaving `beam2/...` to its own type).
 pub fn type_prefix_bytes(servlet_type: &Urn<'_>) -> Vec<u8> {
 	let mut prefix = type_canonical_bytes(servlet_type);
 	prefix.push(b'/');

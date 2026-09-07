@@ -12,7 +12,7 @@
 //!
 //! ## Expected control
 //! The answer MUST travel in an `EnvelopedData` encrypted to the server
-//! certificate (RFC 5652 s6), never the cleartext wire. The server MUST
+//! certificate (RFC 5652 s6), which keeps it off the cleartext wire. The server MUST
 //! decrypt it, verify the countersignature over the plaintext, settle,
 //! and retain the identical dual-signed receipt on both endpoints.
 //!
@@ -112,8 +112,8 @@ tb_assert_spec! {
 
 // The settlement answer must survive the CMS EnvelopedData round trip
 // (client encrypts to the server certificate, server decrypts, verifies
-// the countersignature over the plaintext, and settles) while never
-// appearing in the cleartext client Finished bytes.
+// the countersignature over the plaintext, and settles) while staying
+// out of the cleartext client Finished bytes.
 tb_scenario! {
 	name: cms_response_confidential_round_trip,
 	spec: ReceiptConfidentialitySpec,
@@ -135,7 +135,7 @@ tb_scenario! {
 
 			// Full budget-bearing handshake including the receipt
 			// acknowledgement.
-			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
 			let server_finished = server.build_server_finished().await?;
@@ -145,7 +145,7 @@ tb_scenario! {
 			server.process_client_finished(&client_finished)?;
 			server.process_receipt_ack(&client_finished).await?;
 
-			// The plaintext answer must never appear in the cleartext
+			// The plaintext answer MUST stay out of the cleartext
 			// client Finished bytes: it travels in an EnvelopedData encrypted
 			// to the server certificate.
 			let response_leaked = contains_window(&client_finished, RESPONSE);

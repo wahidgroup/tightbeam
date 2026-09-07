@@ -62,7 +62,7 @@ afl = { workspace = true, optional = true }
 
 [dev-dependencies]
 husky-rs = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
 
 [features]

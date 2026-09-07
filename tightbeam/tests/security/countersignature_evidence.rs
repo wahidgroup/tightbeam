@@ -3,8 +3,8 @@
 //! ## Weakness
 //! The [`SessionObserver`] contract promises the server a record of every
 //! budget-bearing session whose receipt exchange concluded. If a
-//! countersignature that arrived but failed verification (or never
-//! arrived at all) aborts the handshake before the observer fires, the
+//! countersignature that failed verification, or that was withheld,
+//! aborts the handshake before the observer fires, the
 //! most suspicious terminal states, forged-countersignature probes and
 //! withheld countersignatures, are invisible to the application ledger.
 //!
@@ -12,16 +12,16 @@
 //! An attacker tampers with the carriage of a budget-bearing receipt
 //! acknowledgement, or strips the acknowledgement attribute from the
 //! client Finished. The handshake correctly aborts, but the operator's
-//! ledger shows nothing: repeated probes leave no evidence.
+//! ledger stays silent: repeated probes leave no evidence.
 //!
 //! ## Expected control
 //! Every concluded receipt exchange MUST reach the observer before the
 //! abort: an absent acknowledgement records
 //! `SessionVerdict::CountersignatureMissing` (a failing one records
-//! `SessionVerdict::CountersignatureInvalid`). Settlement MUST never
-//! fire and the session MUST never activate. A tamper rejected before
-//! the exchange concludes is not a concluded exchange and records
-//! nothing.
+//! `SessionVerdict::CountersignatureInvalid`). Settlement MUST stay
+//! unfired and the session MUST stay inactive. The observer records a
+//! concluded exchange, so a tamper rejected before the exchange concludes
+//! leaves the ledger unchanged.
 //!
 //! ## References
 //! - CWE-778: Insufficient Logging
@@ -135,7 +135,7 @@ mod ecies {
 				let server_handshake = server.process_client_hello(&client_hello).await?;
 				let client_kex_der = client.process_server_handshake(&server_handshake).await?;
 
-				// Auth signature covers encrypted_data; flip a ciphertext
+				// Auth signature covers encrypted_data. Flip a ciphertext
 				// byte - the only wire handle a MITM has on the sealed ack.
 				let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
 				let mut forged = kex.encrypted_data.as_bytes().to_vec();
@@ -156,8 +156,8 @@ mod ecies {
 					authorizer.settle_calls() == 0,
 				)?;
 
-				// Nothing concluded: the receipt exchange never reached a
-				// verdict, so the observer records nothing.
+				// The receipt exchange reached no verdict, so the observer
+				// ledger stays empty.
 				let outcomes = observer.recorded();
 				trace.event_with(
 					NO_OUTCOME_BEFORE_CONCLUSION,
@@ -254,7 +254,7 @@ mod cms {
 				let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 				let (mut client, mut server) = (pair.client, pair.server);
 
-				let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
+				let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 				server.process_key_exchange(&key_exchange).await?;
 
 				let server_finished = server.build_server_finished().await?;

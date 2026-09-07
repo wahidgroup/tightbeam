@@ -11,6 +11,9 @@ use alloc::vec::Vec;
 
 use crate::spki::AlgorithmIdentifierOwned;
 
+#[cfg(feature = "transport-ecies")]
+use crate::ZeroizingArray;
+
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod transport {
 	#[cfg(any(
@@ -39,7 +42,7 @@ pub fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
 // Orchestrator utilities
 // ============================================================================
 
-/// Enforce a single expected handshake state; mismatch yields `InvalidState`.
+/// Enforce a single expected handshake state. A mismatch yields `InvalidState`.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[inline]
 pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), HandshakeError> {
@@ -170,7 +173,7 @@ where
 /// Erase ephemeral ECIES key material after session establishment (CWE-226).
 #[cfg(feature = "transport-ecies")]
 pub fn clear_session_randoms(
-	base_session_key: &mut Option<[u8; 32]>,
+	base_session_key: &mut Option<ZeroizingArray<32>>,
 	client_random: &mut Option<[u8; 32]>,
 	server_random: &mut Option<[u8; 32]>,
 ) {

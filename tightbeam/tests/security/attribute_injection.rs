@@ -16,7 +16,7 @@
 //! Every TightBeam handshake attribute is single-use: the server MUST
 //! parse the SignedData once, and a duplicate unsigned attribute MUST
 //! fail closed before any value is consumed. The budget-bearing session
-//! MUST never activate.
+//! MUST stay inactive.
 //!
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
@@ -99,10 +99,9 @@ tb_assert_spec! {
 	}
 }
 
-// A duplicate RECEIPT_ACK unsigned attribute passes every signature
-// check (nothing signs unsigned attributes), so the server's single-use
-// attribute rule is the only control: the receipt acknowledgement must
-// fail closed and the session must never activate.
+// check (a signature covers signed attributes alone), so the server's
+// single-use attribute rule is the control: the receipt acknowledgement
+// must fail closed and the session must stay inactive.
 tb_scenario! {
 	name: cms_duplicate_receipt_attribute_fails_closed,
 	spec: AttributeInjectionSpec,
@@ -116,7 +115,7 @@ tb_scenario! {
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
 			let server_finished = server.build_server_finished().await?;
@@ -126,7 +125,7 @@ tb_scenario! {
 			let client_finished = client.build_client_finished().await?;
 			let tampered = inject_duplicate_receipt_ack(&client_finished)?;
 
-			// Signature verification cannot see the injection: the
+			// Signature verification covers the signed attributes, so the
 			// tampered Finished still authenticates.
 			let finished_accepted = server.process_client_finished(&tampered).is_ok();
 			trace.event_with(

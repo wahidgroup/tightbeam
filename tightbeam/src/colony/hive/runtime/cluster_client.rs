@@ -6,10 +6,9 @@
 use std::sync::{Arc, RwLock};
 
 use crate::builder::TypeBuilder;
-use crate::colony::common::{current_timestamp_ms, ClusterRequest};
-use crate::colony::hive::runtime::servlet_slate;
+use crate::colony::common::{current_timestamp_ms, ClusterRequest, DrainMode, TaskGroup};
 use crate::colony::hive::{
-	HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
+	HashMapRegistry, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
 	ServletAddressUpdateResponse, ServletInfo, ServletRegistry,
 };
 use crate::crypto::hash::Sha3_256;
@@ -31,7 +30,7 @@ use crate::{Frame, Message, TightBeamError, Version};
 type ClientIdentity = (Arc<Certificate>, Arc<HandshakeKeyManager<DefaultCryptoProvider>>);
 
 /// Build a hive-to-cluster control frame, signed when hive TLS is configured.
-pub async fn build_control_frame(
+async fn build_control_frame(
 	id: &[u8],
 	message: impl Message,
 	hive_tls: Option<Arc<HiveTlsConfig>>,
@@ -60,86 +59,35 @@ pub async fn build_control_frame(
 	}
 }
 
-/// One signed registration of the hive's current servlet slate to one gateway.
-pub async fn register_once<P>(
-	servlets: &impl ServletRegistry,
-	hive_addr: P::Address,
-	cluster_addr: P::Address,
-	config: &HiveConfig,
-) -> Result<RegisterHiveResponse, TightBeamError>
-where
-	P: Protocol + Send + Sync,
-	P::Address: Clone + Send + Sync,
-	P::Stream: Send,
-	P::Error: Send,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send,
-	TightBeamError: From<P::Error>,
-{
-	let servlet_addresses = servlet_slate(servlets);
-	let request = ClusterRequest::RegisterHive(RegisterHiveRequest {
-		hive_addr: hive_addr.into(),
-		servlet_addresses,
-		metadata: Some(b"hive".to_vec()),
-	});
-
-	let mut transport = dial_cluster::<P>(cluster_addr, config.trust_store.as_ref(), config.hive_tls.as_ref()).await?;
-	let hive_tls_for_frame = config.hive_tls.as_ref().map(Arc::clone);
-	let frame = build_control_frame(b"hive-registration", request, hive_tls_for_frame).await?;
-
-	let response_frame = transport.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-
-	decode::<RegisterHiveResponse>(&response_frame.message)
-}
-
-/// Anti-entropy beat: re-announce the full slate to every registered gateway.
-pub fn spawn_reregister_task<P>(
-	servlets: Arc<impl ServletRegistry + 'static>,
-	trace: Arc<TraceCollector>,
-	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
-	hive_addr: P::Address,
-	config: HiveConfig,
-) -> rt::JoinHandle
-where
-	P: Protocol + Send + Sync + 'static,
-	P::Address: Clone + Send + Sync + 'static,
-	P::Stream: Send + 'static,
-	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + 'static,
-	TightBeamError: From<P::Error>,
-{
-	rt::spawn(async move {
-		let Some(interval) = config.control.reregister_interval else {
-			return;
-		};
-
-		loop {
-			tokio::time::sleep(interval).await;
-
-			let Some(gateways) = snapshot_gateways(&cluster_addrs) else {
-				return;
-			};
-
-			for gateway in gateways {
-				let outcome = register_once::<P>(&*servlets, hive_addr.clone(), gateway, &config).await;
-				let status = outcome.map(|response| response.status).unwrap_or(TransitStatus::Unavailable);
-				let _ = trace.event_with(HIVE_REREGISTERED, &[], status);
-			}
-		}
-	})
-}
-
-/// Fan out a scaling add/remove update to every registered gateway.
+/// This hive's link to the gateways it registered with.
 ///
-/// Exhausted retries trigger an immediate full-slate reconcile to every peer.
-pub fn notify_cluster<P>(
-	servlets: Arc<impl ServletRegistry + 'static>,
+/// Registration, the anti-entropy re-announce, and the scaling fan-out read
+/// the same slate, gateway list, control address, and configuration. One
+/// owner holds those four, so a caller names the operation and the link
+/// supplies the state.
+pub struct ClusterLink<P: Protocol> {
+	servlets: Arc<HashMapRegistry>,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
 	hive_addr: P::Address,
-	hive_urn: Arc<Urn<'static>>,
-	servlet_info: ServletInfo,
-	is_added: bool,
 	config: Arc<HiveConfig>,
-) where
+}
+
+impl<P: Protocol> Clone for ClusterLink<P>
+where
+	P::Address: Clone,
+{
+	fn clone(&self) -> Self {
+		Self {
+			servlets: Arc::clone(&self.servlets),
+			cluster_addrs: Arc::clone(&self.cluster_addrs),
+			hive_addr: self.hive_addr.clone(),
+			config: Arc::clone(&self.config),
+		}
+	}
+}
+
+impl<P> ClusterLink<P>
+where
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
@@ -147,45 +95,158 @@ pub fn notify_cluster<P>(
 	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + 'static,
 	TightBeamError: From<P::Error>,
 {
-	rt::spawn(async move {
-		let Some(gateways) = snapshot_gateways(&cluster_addrs) else {
+	/// Binds the hive's slate and control address to its gateway list.
+	pub fn new(
+		servlets: Arc<HashMapRegistry>,
+		cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
+		hive_addr: P::Address,
+		config: Arc<HiveConfig>,
+	) -> Self {
+		Self { servlets, cluster_addrs, hive_addr, config }
+	}
+
+	/// Gateways this hive has registered with.
+	///
+	/// A poisoned list reads as empty, which is the same refusal every
+	/// other reader of this list makes: a known gateway is what gives the
+	/// hive something to announce to and something to scale for.
+	pub fn gateways(&self) -> Vec<P::Address> {
+		self.cluster_addrs.read().map(|addrs| addrs.clone()).unwrap_or_default()
+	}
+
+	/// Whether any gateway has accepted this hive.
+	pub fn has_gateways(&self) -> bool {
+		self.cluster_addrs.read().is_ok_and(|addrs| !addrs.is_empty())
+	}
+
+	/// Records `gateway` as one this hive is registered with.
+	///
+	/// Registration is idempotent, so the list holds one row per gateway and
+	/// the beat below dials each once.
+	pub fn remember(&self, gateway: P::Address) {
+		let Ok(mut addrs) = self.cluster_addrs.write() else {
 			return;
 		};
-		if gateways.is_empty() {
-			return;
+
+		let incoming: Vec<u8> = gateway.into();
+		let known = addrs.iter().any(|addr| {
+			let bytes: Vec<u8> = (*addr).into();
+			bytes == incoming
+		});
+		if !known {
+			addrs.push(gateway);
 		}
+	}
 
-		let update = scaling_update_request(&hive_urn, servlet_info, is_added);
-		let hive_tls = config.hive_tls.as_ref().map(Arc::clone);
-		let trust_store = config.trust_store.as_ref().map(Arc::clone);
+	/// Sends one signed registration of the current slate to `gateway`.
+	pub async fn register(&self, gateway: P::Address) -> Result<RegisterHiveResponse, TightBeamError> {
+		let servlet_addresses = self.servlets.slate();
+		let request = ClusterRequest::RegisterHive(RegisterHiveRequest {
+			hive_addr: self.hive_addr.into(),
+			servlet_addresses,
+			metadata: Some(b"hive".to_vec()),
+		});
 
-		let Ok(frame) = build_control_frame(b"scaling-update", update, hive_tls.clone()).await else {
-			return;
-		};
+		let trust_store = self.config.trust_store.as_ref();
+		let hive_tls = self.config.hive_tls.as_ref();
+		let mut transport = dial_cluster::<P>(gateway, trust_store, hive_tls).await?;
+		let hive_tls_for_frame = self.config.hive_tls.as_ref().map(Arc::clone);
 
-		// A TLS-registered hive must not fall back to cleartext for scaling updates (CWE-319).
-		let Some(client_identity) = resolve_client_identity(hive_tls.as_ref()) else {
-			return;
-		};
+		let frame = build_control_frame(b"hive-registration", request, hive_tls_for_frame).await?;
+		let response_frame = transport.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
+		decode::<RegisterHiveResponse>(&response_frame.message)
+	}
 
-		let any_failed = fanout_scaling_update::<P>(
-			&gateways,
-			&frame,
-			trust_store.as_ref(),
-			client_identity.as_ref(),
-			config.control.notify_retry.as_ref(),
-		)
-		.await;
-
-		if any_failed {
-			reconcile_all::<P>(&*servlets, hive_addr, &gateways, &config).await;
+	/// Re-announces the current slate to every registered gateway.
+	///
+	/// Soft state: exhausted retries leave a gateway divergent until the
+	/// next beat re-announces.
+	pub async fn announce_slate(&self) {
+		for gateway in self.gateways() {
+			let _ = self.register(gateway).await;
 		}
-	});
-}
+	}
 
-fn snapshot_gateways<A: Clone>(cluster_addrs: &RwLock<Vec<A>>) -> Option<Vec<A>> {
-	let guard = cluster_addrs.read().ok()?;
-	Some(guard.clone())
+	/// Runs the anti-entropy beat that re-announces the slate on an interval.
+	///
+	/// The beat ends once the hive drains: a hive that is going away stops
+	/// advertising itself, and the drain announces its emptied slate once.
+	pub fn spawn_reregister(&self, trace: Arc<TraceCollector>, drain: DrainMode) -> rt::JoinHandle {
+		let link = self.clone();
+		rt::spawn(async move {
+			let Some(interval) = link.config.control.reregister_interval else {
+				return;
+			};
+
+			loop {
+				tokio::time::sleep(interval).await;
+
+				if drain.is_draining() {
+					return;
+				}
+
+				for gateway in link.gateways() {
+					let outcome = link.register(gateway).await;
+					let status = outcome.map(|response| response.status).unwrap_or(TransitStatus::Unavailable);
+					let _ = trace.event_with(HIVE_REREGISTERED, &[], status);
+				}
+			}
+		})
+	}
+
+	/// Fans out one scaling add/remove update to every registered gateway.
+	///
+	/// A hive whose URN could not be minted holds its announcement, because
+	/// the change needs an identity to attribute it to.
+	///
+	/// The fan-out runs under `tasks`, so stopping the hive stops an update
+	/// still retrying against an unreachable gateway. Exhausted retries fall
+	/// back to a full-slate announcement.
+	pub fn notify_scaling(
+		&self,
+		tasks: &TaskGroup,
+		hive_urn: Option<&Arc<Urn<'static>>>,
+		servlet_info: ServletInfo,
+		is_added: bool,
+	) {
+		let Some(hive_urn) = hive_urn.map(Arc::clone) else {
+			return;
+		};
+
+		let link = self.clone();
+		tasks.spawn(async move {
+			let gateways = link.gateways();
+			if gateways.is_empty() {
+				return;
+			}
+
+			let update = scaling_update_request(&hive_urn, servlet_info, is_added);
+			let hive_tls = link.config.hive_tls.as_ref().map(Arc::clone);
+			let trust_store = link.config.trust_store.as_ref().map(Arc::clone);
+
+			let Ok(frame) = build_control_frame(b"scaling-update", update, hive_tls.clone()).await else {
+				return;
+			};
+
+			// A TLS-registered hive must not fall back to cleartext for scaling updates (CWE-319).
+			let Some(client_identity) = resolve_client_identity(hive_tls.as_ref()) else {
+				return;
+			};
+
+			let any_failed = fanout_scaling_update::<P>(
+				&gateways,
+				&frame,
+				trust_store.as_ref(),
+				client_identity.as_ref(),
+				link.config.control.notify_retry.as_ref(),
+			)
+			.await;
+
+			if any_failed {
+				link.announce_slate().await;
+			}
+		});
+	}
 }
 
 fn scaling_update_request(hive_urn: &Urn<'static>, servlet_info: ServletInfo, is_added: bool) -> ClusterRequest {
@@ -325,25 +386,6 @@ where
 	}
 
 	false
-}
-
-async fn reconcile_all<P>(
-	servlets: &impl ServletRegistry,
-	hive_addr: P::Address,
-	gateways: &[P::Address],
-	config: &HiveConfig,
-) where
-	P: Protocol + Send + Sync,
-	P::Address: Clone + Send + Sync,
-	P::Stream: Send,
-	P::Error: Send,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send,
-	TightBeamError: From<P::Error>,
-{
-	// Soft-state reconcile: exhausted retries leave peers divergent until the next beat.
-	for gateway in gateways {
-		let _ = register_once::<P>(servlets, hive_addr.clone(), gateway.clone(), config).await;
-	}
 }
 
 async fn retry_delay(attempt: usize, max: usize, policy: &dyn CoreRetryPolicy) {

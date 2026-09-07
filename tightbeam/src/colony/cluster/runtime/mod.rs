@@ -17,5 +17,4 @@ mod verify;
 mod work;
 
 pub use gateway::ClusterGateway;
-pub use gossip_tasks::{build_advertise_task, peer_dial_pool};
-pub use heartbeat::{parse_hive_addr, process_heartbeat_result, send_heartbeat_async};
+pub use heartbeat::{process_heartbeat_result, send_heartbeat_async};

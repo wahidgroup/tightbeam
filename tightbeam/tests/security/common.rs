@@ -108,15 +108,20 @@ pub enum Direction {
 /// A single handshake message captured during the flow.
 #[derive(Debug, Clone)]
 pub struct CapturedMessage {
+	/// Position of this message in the handshake flow, starting at zero.
 	pub step: usize,
+	/// Which endpoint sent the message.
 	pub direction: Direction,
+	/// Exact DER bytes as they crossed the wire.
 	pub payload: Vec<u8>,
 }
 
 /// Result of running a full handshake with capture.
 #[derive(Debug, Clone)]
 pub struct CapturedHandshake {
+	/// Every message the flow produced, in send order.
 	pub messages: Vec<CapturedMessage>,
+	/// Handshake backend that produced the capture.
 	pub kind: HandshakeBackendKind,
 }
 
@@ -357,7 +362,7 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 /// This simulates a MITM attacker modifying message bytes in transit. The
 /// tampering targets bytes in the last quarter of the payload, which for a
 /// certificate-bearing handshake message lands inside the signature / signed
-/// content rather than on the outer DER tag+length octets at the front.
+/// content, ahead of the outer DER tag+length octets at the front.
 ///
 /// # Parameters
 /// - `payload`: Original message bytes
@@ -771,10 +776,10 @@ impl HandshakeProtocol for CmsSession {
 	fn capture_full(&mut self) -> Pin<Box<dyn Future<Output = Result<CapturedHandshake, TightBeamError>> + Send + '_>> {
 		Box::pin(async move {
 			let mut messages = Vec::new();
-			let session_key = vec![0xA5; 32];
+			let session_key = tightbeam::ZeroizingBytes::new(vec![0xA5; 32]);
 
 			// Step 0: Key Exchange (C -> S)
-			let key_exchange = self.client.build_key_exchange(session_key, None)?;
+			let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?;
 			messages.push(CapturedMessage {
 				step: 0,
 				direction: Direction::ClientToServer,
@@ -821,8 +826,7 @@ impl HandshakeProtocol for CmsSession {
 	) -> Pin<Box<dyn Future<Output = Result<InjectionOutcome, TightBeamError>> + Send + '_>> {
 		let msg = msg.to_vec();
 		Box::pin(async move {
-			let session_key = vec![0xA5; 32];
-
+			let session_key = tightbeam::ZeroizingBytes::new(vec![0xA5; 32]);
 			match step {
 				0 => {
 					// Inject at KeyExchange
@@ -833,7 +837,7 @@ impl HandshakeProtocol for CmsSession {
 				}
 				2 => {
 					// Run step 0-1 normally, then inject at ServerFinished
-					let key_exchange = self.client.build_key_exchange(session_key, None)?;
+					let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?;
 					self.server.process_key_exchange(&key_exchange).await?;
 
 					// Now inject the message as server finished
@@ -844,7 +848,7 @@ impl HandshakeProtocol for CmsSession {
 				}
 				4 => {
 					// Run steps 0-3 normally, then inject at ClientFinished
-					let key_exchange = self.client.build_key_exchange(session_key, None)?;
+					let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?;
 					self.server.process_key_exchange(&key_exchange).await?;
 
 					let server_finished = self.server.build_server_finished().await?;

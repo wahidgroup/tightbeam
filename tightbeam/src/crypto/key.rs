@@ -25,6 +25,8 @@ use core::pin::Pin;
 
 #[cfg(feature = "signature")]
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
+#[cfg(feature = "ecdh")]
+use crate::zeroize::Zeroizing;
 #[cfg(all(feature = "std", any(feature = "signature", feature = "aead")))]
 use std::sync::Arc;
 
@@ -89,8 +91,8 @@ use crate::crypto::secret::SecretSlice;
 
 /// Errors from key provider operations.
 ///
-/// Deliberately does not derive `Errorizable`: this module builds without
-/// the `derive` feature, so the message strings live in exactly one place --
+/// Hand-written so this module builds without the `derive` feature, with
+/// the message strings in exactly one place --
 /// the `impl_error_display!` block below.
 #[derive(Debug)]
 pub enum KeyError {
@@ -113,6 +115,10 @@ pub enum KeyError {
 	#[cfg(feature = "aead")]
 	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 
+	/// Signing key material of the wrong length for the curve
+	#[cfg(feature = "signature")]
+	KeyLengthError(crate::error::ReceivedExpectedError<usize, usize>),
+
 	/// Operation not supported by this key provider
 	UnsupportedOperation,
 }
@@ -127,6 +133,8 @@ crate::impl_error_display!(unconditional KeyError {
 	AeadError(e) => "AEAD error: {e}",
 	#[cfg(feature = "aead")]
 	NonceLengthError(e) => "Nonce length mismatch: {e}",
+	#[cfg(feature = "signature")]
+	KeyLengthError(e) => "Signing key length mismatch: {e}",
 	UnsupportedOperation => "Operation not supported by this key provider",
 });
 
@@ -173,6 +181,11 @@ impl SigningKeySpec {
 	{
 		match self {
 			SigningKeySpec::Bytes(bytes) => {
+				let expected = FieldBytesSize::<C>::USIZE;
+				if bytes.len() != expected {
+					return Err(KeyError::KeyLengthError((bytes.len(), expected).into()));
+				}
+
 				let field_bytes = GenericArray::from_slice(bytes);
 				let signing_key = SigningKey::<C>::from_bytes(field_bytes)?;
 				Ok(Arc::new(EcdsaKeyProvider::from(signing_key)))
@@ -187,12 +200,12 @@ impl SigningKeySpec {
 /// Implementations of this trait provide access to private key operations
 /// (key agreement, signing) without exposing the raw key material. This
 /// enables integration with Hardware Security Modules (HSMs), Key Management
-/// Services (KMS), and secure enclaves where private keys cannot leave the
+/// Services (KMS), and secure enclaves that hold private keys inside the
 /// secure boundary.
 ///
 /// # Security Properties
 ///
-/// - **Key Encapsulation**: Private keys never leave the provider boundary
+/// - **Key Encapsulation**: Private keys stay inside the provider boundary
 /// - **Uniform Interface**: In-memory and remote backends use identical APIs
 /// - **Async by Default**: All operations async for maximum flexibility
 /// - **Algorithm Agnostic**: Byte encoding allows any signature/key algorithm
@@ -211,14 +224,14 @@ pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
 	///
 	/// # Errors
 	///
-	/// Returns [`KeyError`] if the backend cannot retrieve the public key.
+	/// Returns [`KeyError`] when the backend fails to retrieve the public key.
 	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>>;
 
 	/// Signs a precomputed digest (prehash) using this provider's private key.
 	///
 	/// The canonical tightbeam convention hashes content exactly once (see
-	/// `crypto::sign::sign_canonical`); providers MUST sign the given prehash
-	/// directly and MUST NOT rehash it, so the produced signature matches the
+	/// `crypto::sign::sign_canonical`). Providers MUST sign the given prehash
+	/// directly, so the produced signature matches the
 	/// advertised signature-algorithm OID regardless of backend.
 	///
 	/// # Arguments
@@ -447,12 +460,14 @@ where
 	#[cfg(feature = "ecdh")]
 	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
 		let pk_result = PublicKey::<C>::from_sec1_bytes(peer_public_key);
-		let secret_key = *self.signing_key.as_nonzero_scalar();
+		// The scalar copy lives across the await, so it is wrapped: a
+		// cancelled agreement drops it wiped, ahead of the freed future
+		// holding the private key (CWE-226).
+		let secret_key = Zeroizing::new(*self.signing_key.as_nonzero_scalar());
 
 		Box::pin(async move {
 			let pk = pk_result?;
-			let shared_secret = diffie_hellman(secret_key, pk.as_affine());
-
+			let shared_secret = diffie_hellman(*secret_key, pk.as_affine());
 			Ok(SecretSlice::from(shared_secret.raw_secret_bytes().to_vec()))
 		})
 	}
@@ -500,12 +515,12 @@ pub type Secp256k1KeyProvider = EcdsaKeyProvider<Secp256k1>;
 /// Implementations of this trait provide access to symmetric encryption
 /// and decryption operations without exposing the raw key material. This
 /// enables integration with Hardware Security Modules (HSMs), Key Management
-/// Services (KMS), and secure enclaves where encryption keys cannot leave the
+/// Services (KMS), and secure enclaves that hold encryption keys inside the
 /// secure boundary.
 ///
 /// # Security Properties
 ///
-/// - **Key Encapsulation**: Encryption keys never leave the provider boundary
+/// - **Key Encapsulation**: Encryption keys stay inside the provider boundary
 /// - **Uniform Interface**: In-memory and remote backends use identical APIs
 /// - **Async by Default**: All operations async for maximum flexibility
 /// - **Algorithm Agnostic**: Byte encoding allows any AEAD cipher
@@ -519,7 +534,7 @@ pub trait EncryptingKeyProvider: Send + Sync + Debug {
 	/// # Arguments
 	///
 	/// * `nonce` - The nonce/IV for this encryption operation. The caller MUST
-	///   ensure the `(key, nonce)` pair is never reused for AEAD ciphers.
+	///   ensure each `(key, nonce)` pair is unique for AEAD ciphers.
 	/// * `plaintext` - The data to encrypt
 	///
 	/// # Returns
@@ -797,5 +812,14 @@ mod tests {
 		let alg = provider.algorithm();
 		assert_eq!(alg.oid, Secp256k1Signature::ALGORITHM_OID);
 		Ok(())
+	}
+
+	/// Short key material reaches a typed refusal ahead of the
+	/// fixed-size conversion's assert.
+	#[test]
+	fn short_signing_key_bytes_are_refused() {
+		let spec = SigningKeySpec::Bytes(&[0u8; 5]);
+		let refused = spec.to_provider::<crate::crypto::sign::ecdsa::k256::Secp256k1>();
+		assert!(matches!(refused, Err(KeyError::KeyLengthError(_))));
 	}
 }

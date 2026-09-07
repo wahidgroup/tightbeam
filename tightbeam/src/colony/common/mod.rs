@@ -21,11 +21,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
 use crate::utils::BasisPoints;
 
+#[cfg(feature = "std")]
+use crate::runtime::rt;
+
 pub use messages::*;
 pub use scaling::*;
 pub use urn::{
-	canonical_bytes, is_bare_servlet_type, servlet_instance, type_canonical_bytes, type_prefix_bytes, ColonyNamespace,
-	ColonyResource, COLONY_NID,
+	canonical_bytes, instance_urn, is_bare_servlet_type, servlet_instance, type_canonical_bytes, type_prefix_bytes,
+	ColonyNamespace, ColonyResource, COLONY_NID,
 };
 
 // ============================================================================
@@ -38,7 +41,7 @@ pub use urn::{
 ///   The registry raises it on a successful forward and lowers it on
 ///   failure or evaporation. Balancers use it as the sole selection signal.
 /// - `instance_key`: opaque identity (canonical instance-URN bytes).
-///   Balancers MUST NOT interpret these bytes.
+///   Balancers treat these bytes as opaque.
 #[derive(Debug, Clone)]
 pub struct InstanceMetrics {
 	/// Opaque instance handle for the balancing round.
@@ -60,8 +63,8 @@ pub const MAX_PHEROMONE: u64 = 10_000;
 
 /// Default [`StochasticForager`] exploration floor.
 ///
-/// Baseline weight every live instance keeps so a cold instance is never
-/// starved to zero probability. See [`StochasticForager`] sources.
+/// Baseline weight every live instance keeps so a cold instance stays
+/// selectable.
 pub const DEFAULT_EXPLORATION_FLOOR: u64 = MAX_PHEROMONE / 20;
 
 /// Default [`StochasticForager`] repellency threshold.
@@ -94,8 +97,8 @@ fn fresh_seed() -> u64 {
 /// Advance SplitMix64 state and return the mixed output.
 ///
 /// Reference: Vigna, `splitmix64.c` (2015). See [`SPLITMIX64_GAMMA`].
-/// One `fetch_add` claims a unique state, so concurrent callers never
-/// share a draw.
+/// One `fetch_add` claims a unique state, so concurrent callers each draw
+/// their own value.
 fn splitmix64_next(state: &AtomicU64) -> u64 {
 	let mut z = state
 		.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed)
@@ -111,7 +114,7 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 /// Each instance is drawn with probability proportional to its foraging
 /// weight, the faithful realization of the stigmergic model the registry
 /// maintains. Unlike a deterministic argmax, equal trails split the load
-/// rather than locking every request onto one instance.
+/// which spreads load across the eligible instances.
 ///
 /// # Behavior
 ///
@@ -211,7 +214,7 @@ impl LoadBalancer for StochasticForager {
 				let raw = splitmix64_next(&self.rng);
 
 				// Zero floor and dead trails: every weight is zero. Draw
-				// uniformly instead of dividing by zero.
+				// uniformly, which also covers a zero count.
 				if total == 0 {
 					return Some((raw as usize) % last_plus_one);
 				}
@@ -375,23 +378,118 @@ pub fn reply_frame_with_priority<M: crate::Message>(
 ///
 /// Shared by servlet, hive, and cluster `stop` / `Drop` paths.
 #[cfg(feature = "std")]
-pub fn take_and_abort(handle: &mut Option<crate::runtime::rt::JoinHandle>) {
+pub fn take_and_abort(handle: &mut Option<rt::JoinHandle>) {
 	if let Some(handle) = handle.take() {
-		crate::runtime::rt::abort(&handle);
+		rt::abort(&handle);
 	}
 }
 
-/// Abort every owned join handle in `handles`.
+/// Whether a runtime has entered drain, and since when.
+///
+/// Drain is one fact read from several places: the control plane refuses
+/// new manage work, the scaling loop stops changing the slate, and the
+/// re-announce loop stops advertising a hive that is going away. Each
+/// reading the same handle keeps those decisions from disagreeing.
+///
+/// Drain is terminal. A runtime that has entered it stays in it.
 #[cfg(feature = "std")]
-pub fn abort_all(handles: impl IntoIterator<Item = crate::runtime::rt::JoinHandle>) {
-	for handle in handles {
-		crate::runtime::rt::abort(&handle);
+#[derive(Clone, Default)]
+pub struct DrainMode(std::sync::Arc<std::sync::RwLock<Option<std::time::Instant>>>);
+
+#[cfg(feature = "std")]
+impl DrainMode {
+	/// Enters drain, keeping the instant of the first entry.
+	pub fn begin(&self) {
+		let Ok(mut since) = self.0.write() else {
+			return;
+		};
+
+		since.get_or_insert_with(std::time::Instant::now);
+	}
+
+	/// Whether drain has begun.
+	#[must_use]
+	pub fn is_draining(&self) -> bool {
+		self.0.read().is_ok_and(|since| since.is_some())
+	}
+}
+
+/// The background tasks one runtime started.
+///
+/// A runtime keeps one group and puts every task it spawns in it, so
+/// stopping the runtime stops that work with a single call. Spawning
+/// without the group leaves a task running past the stop that was meant to
+/// end it (CWE-772), which is why the group is the only spawn path these
+/// runtimes offer.
+///
+/// The handle is shared, so a context handed to a request handler can adopt
+/// work the handler starts.
+#[cfg(feature = "std")]
+#[derive(Clone, Default)]
+pub struct TaskGroup(std::sync::Arc<std::sync::Mutex<TaskGroupState>>);
+
+/// Running handles, and whether the group has stopped.
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct TaskGroupState {
+	running: Vec<rt::JoinHandle>,
+	stopped: bool,
+}
+
+#[cfg(feature = "std")]
+impl TaskGroup {
+	/// Takes ownership of `handle`, releasing handles whose task has ended.
+	///
+	/// A stopped group aborts `handle` on arrival, so work that starts while
+	/// the runtime is stopping ends with the stop (CWE-772). The sweep bounds
+	/// the group by the tasks actually running, which keeps a runtime that
+	/// spawns per request at the size of its live work.
+	pub fn adopt(&self, handle: rt::JoinHandle) {
+		let Ok(mut state) = self.0.lock() else {
+			// A poisoned group has lost track of what it holds, so the handle
+			// is aborted here.
+			rt::abort(&handle);
+			return;
+		};
+
+		if state.stopped {
+			rt::abort(&handle);
+			return;
+		}
+
+		state.running.retain(|task| !task.is_finished());
+		state.running.push(handle);
+	}
+
+	/// Runs `task` under this group's ownership.
+	pub fn spawn<F>(&self, task: F)
+	where
+		F: core::future::Future<Output = ()> + Send + 'static,
+	{
+		self.adopt(rt::spawn(task));
+	}
+
+	/// Stops the group and aborts every task it still owns.
+	///
+	/// Stopping is terminal: a later [`TaskGroup::spawn`] aborts on
+	/// arrival, which keeps the stop reaching every task the group starts.
+	pub fn abort_all(&self) {
+		let Ok(mut state) = self.0.lock() else {
+			return;
+		};
+
+		state.stopped = true;
+		for task in state.running.drain(..) {
+			rt::abort(&task);
+		}
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use super::{DrainMode, TaskGroup};
 	use std::collections::HashSet;
+	use std::time::Duration;
 
 	use super::{
 		InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager, DEFAULT_EXPLORATION_FLOOR,
@@ -547,5 +645,65 @@ mod tests {
 		for &(total, count, expected) in AGGREGATE_CASES {
 			assert_eq!(super::aggregate_utilization(total, count).get(), expected);
 		}
+	}
+
+	#[test]
+	fn a_fresh_runtime_is_not_draining() {
+		assert!(!DrainMode::default().is_draining());
+	}
+
+	#[test]
+	fn every_holder_of_the_handle_sees_the_drain() {
+		let mode = DrainMode::default();
+		let reader = mode.clone();
+		mode.begin();
+		assert!(reader.is_draining());
+	}
+
+	/// Handles the group is still holding.
+	fn owned(group: &TaskGroup) -> usize {
+		group.0.lock().expect("task group lock").running.len()
+	}
+
+	#[tokio::test]
+	async fn stopping_a_group_aborts_the_work_it_owns() {
+		static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+		let group = TaskGroup::default();
+		group.spawn(async {
+			tokio::time::sleep(Duration::from_secs(30)).await;
+			FINISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+		});
+
+		tokio::task::yield_now().await;
+		group.abort_all();
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		assert!(!FINISHED.load(std::sync::atomic::Ordering::SeqCst));
+	}
+
+	#[tokio::test]
+	async fn work_started_after_the_stop_does_not_outlive_it() {
+		static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+		let group = TaskGroup::default();
+		group.abort_all();
+		group.spawn(async {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+			FINISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+		});
+
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		assert!(!FINISHED.load(std::sync::atomic::Ordering::SeqCst));
+		assert_eq!(owned(&group), 0);
+	}
+
+	#[tokio::test]
+	async fn a_finished_task_leaves_the_group_on_the_next_spawn() {
+		let group = TaskGroup::default();
+		group.spawn(async {});
+		tokio::time::sleep(Duration::from_millis(20)).await;
+
+		group.spawn(std::future::pending());
+		assert_eq!(owned(&group), 1);
 	}
 }

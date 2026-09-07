@@ -67,7 +67,7 @@ where
 /// Everything one accepted async server connection must already be:
 /// message collection for the single-flight loop, mux negotiation for
 /// the takeover, and handshake state for session capture. Satisfied
-/// blanket-wise; callers never implement this by hand.
+/// blanket-wise, so a caller reaches it through the supertraits.
 #[cfg(pooled_mux)]
 pub trait AcceptedConnection: MessageCollector + MuxAcceptor + EncryptedProtocolState + Send {}
 
@@ -104,8 +104,8 @@ impl MuxService for SharedHandlerService {
 }
 
 /// Report a service failure to the error channel, degrading it to an
-/// opaque `Internal` so the peer-visible status never leaks the
-/// original error once it has been reported locally.
+/// opaque `Internal` so the peer-visible status carries the mapped code
+/// once the original error has been recorded locally.
 #[cfg(pooled_mux)]
 async fn report_failure(errors: &mut Option<ErrorSender>, err: TightBeamError) -> TightBeamError {
 	match errors.as_mut() {
@@ -256,7 +256,7 @@ pub async fn serve_connection<T>(
 /// Single-flight request/response loop over one connection: collect,
 /// answer through `respond`, send. A handler failure answers
 /// `Internal` so the peer can tell it apart from an accepted empty
-/// reply; the original error goes to the channel.
+/// reply. The original error goes to the channel.
 #[cfg(feature = "tokio")]
 async fn serve_single_flight<T, F, Fut>(
 	mut transport: T,
@@ -282,7 +282,7 @@ async fn serve_single_flight<T, F, Fut>(
 			}
 		};
 
-		// Prefer moving the frame out of the Arc; deep-copy only when
+		// Prefer moving the frame out of the Arc. Deep-copy only when
 		// the inbound path still holds a shared reference.
 		let frame_owned = Arc::try_unwrap(frame).unwrap_or_else(|arc| (*arc).clone());
 		let (status, response) = if status == TransitStatus::Ok {
@@ -321,7 +321,7 @@ fn capture_session<T: EncryptedProtocolState>(transport: &T) -> SessionContext {
 	SessionContext::capture(transport)
 }
 
-/// Cleartext builds authenticate nothing: empty context.
+/// A cleartext build carries no peer identity: empty context.
 #[cfg(all(feature = "tokio", not(feature = "x509")))]
 fn capture_session<T>(_transport: &T) -> SessionContext {
 	SessionContext::default()
@@ -637,10 +637,10 @@ pub mod server_runtime {
 	/// Runtime primitives (re-exported from unified runtime)
 	pub mod rt {
 		pub use crate::runtime::rt::*;
-		/// Accept-loop concurrency primitive for the async `server!`
-		/// expansion (macro plumbing, not part of the public surface).
+		/// Accept-loop connection plane for the async `server!` expansion
+		/// (macro plumbing, not part of the public surface).
 		#[cfg(feature = "tokio")]
-		pub use tokio::sync::Semaphore;
+		pub use crate::transport::accept::AcceptPlane;
 
 		use crate::transport::error::TransportError;
 
@@ -761,49 +761,40 @@ macro_rules! server {
 	}};
 
 	(@async_loop_body $protocol:path, $listener:ident, $handler:ident, $serve:path, $error_tx:ident, $ok_tx:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
-		// Concurrency cap (CWE-400): accepting pauses while that many
-		// connection tasks are alive, so a connection flood queues in the
-		// listener backlog instead of pinning unbounded tasks and file
-		// descriptors. `policies: { max_connections: [ n ] }` overrides
-		// the default.
-		let __connection_permits = ::std::sync::Arc::new(
-			$crate::macros::server::server_runtime::rt::Semaphore::new(
-				$crate::server!(@extract_max_connections $($policy_name: [ $( $policy_expr ),* ]),*),
-			),
-		);
-		loop {
-			let ::core::result::Result::Ok(__connection_permit) =
-				::std::sync::Arc::clone(&__connection_permits).acquire_owned().await
-			else {
-				// Unreachable in practice: the semaphore is never closed.
-				break;
-			};
-			match $listener.accept().await {
-				Ok((mut __transport, _addr)) => {
+		// `policies: { max_connections: [ n ] }` overrides the plane's
+		// default connection cap.
+		let __accept_errors = $error_tx.clone();
+		$crate::macros::server::server_runtime::rt::AcceptPlane::new(
+			$crate::server!(@extract_max_connections $($policy_name: [ $( $policy_expr ),* ]),*),
+		)
+		.accept_on_reporting(
+			$listener,
+			move |mut __transport| {
+				$(
 					$(
-						$(
-							__transport = $crate::server!(@apply_one_policy __transport, $policy_name, $policy_expr);
-						)*
+						__transport = $crate::server!(@apply_one_policy __transport, $policy_name, $policy_expr);
 					)*
-					let __service_clone = ::std::sync::Arc::clone(&$handler);
-					let __error_channel = $error_tx.clone();
-					let __ok_channel = $ok_tx.clone();
-					$crate::macros::server::server_runtime::rt::spawn(async move {
-						// The permit lives as long as the connection task,
-						// releasing its accept slot on any exit path.
-						let _connection_permit = __connection_permit;
-						$serve(__transport, __service_clone, __error_channel, __ok_channel).await;
-					});
+				)*
+				let __service_clone = ::std::sync::Arc::clone(&$handler);
+				let __error_channel = $error_tx.clone();
+				let __ok_channel = $ok_tx.clone();
+				async move {
+					$serve(__transport, __service_clone, __error_channel, __ok_channel).await;
 				}
-				Err(e) => {
-					if let Some(tx) = $error_tx.as_mut() {
-						let _ = tx.send(e.into()).await;
+			},
+			move |__accept_error| {
+				// The listener error converts here, so the loop reports it
+				// without holding a protocol error across an await.
+				let __reported = ::core::convert::Into::into(__accept_error);
+				let __channel = __accept_errors.clone();
+				async move {
+					if let Some(tx) = __channel {
+						let _ = tx.send(__reported).await;
 					}
-
-					break;
 				}
-			}
-		}
+			},
+		)
+		.await;
 	}};
 
 	(@sync_loop $protocol:path, $listener:expr, $handler:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
@@ -848,7 +839,7 @@ macro_rules! server {
 	}};
 
 	// Service form: the caller supplies a full `MuxService`, so streaming
-	// and duplex interactions dispatch to it instead of being refused.
+	// and duplex interactions dispatch to it.
 	(@async_service_loop $protocol:path, $listener:expr, $service:expr, $error_tx:expr, $ok_tx:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		let mut __listener = $listener;
 		let __service = ::std::sync::Arc::new($service);
@@ -915,7 +906,7 @@ macro_rules! server {
 		$crate::__tightbeam_server_protocol_bind_handle!($protocol, $addr, $handler)
 	}};
 
-	// Session-aware handler with policies; must match ahead of the
+	// Session-aware handler with policies. This arm matches ahead of the
 	// context-blind `handle: $handler:expr` arm.
 	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: move |$frame:ident $(: $frame_ty:ty)?, $session:ident $(: $session_ty:ty)?| $body:expr) => {{
 		$crate::__tightbeam_server_protocol_policies_session_handle!(

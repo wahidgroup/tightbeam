@@ -16,77 +16,82 @@ use crate::{Frame, TightBeamError};
 
 /// Instance or type key to shared servlet address bytes.
 type AddressMap = HashMap<Vec<u8>, Arc<[u8]>>;
-/// Shared, lockable address map for concurrent route updates.
-type SharedAddressMap = Arc<RwLock<AddressMap>>;
 
-/// Shared address maps and pool used for sibling servlet calls.
+/// Instance routes and the type index they produce.
+///
+/// The index is derived from the instances, so both live behind one lock
+/// and under one owner. A reader sees an index that names an address the
+/// instance map still holds, and no caller can order two acquisitions
+/// against another caller (CWE-362).
+#[derive(Default)]
+struct Routes {
+	instances: AddressMap,
+	by_type: AddressMap,
+}
+
+impl Routes {
+	/// The first instance registered for a type owns the index entry.
+	///
+	/// `addr` moves into the instance map. The index takes an extra [`Arc`]
+	/// handle only for a new type, so it shares the address bytes.
+	fn insert(&mut self, key: Vec<u8>, addr: Arc<[u8]>, type_bytes: &[u8]) {
+		self.by_type.entry(type_bytes.to_vec()).or_insert_with(|| Arc::clone(&addr));
+		self.instances.insert(key, addr);
+	}
+
+	/// Drops an instance and promotes a sibling of the same type into the
+	/// index when the departing instance held it.
+	fn remove(&mut self, key: &[u8], type_prefix: &[u8], type_bytes: &[u8], removed: &Arc<[u8]>) {
+		self.instances.remove(key);
+
+		if self.by_type.get(type_bytes) != Some(removed) {
+			return;
+		}
+
+		let replacement = self
+			.instances
+			.iter()
+			.find(|(instance, _)| instance.starts_with(type_prefix))
+			.map(|(_, addr)| Arc::clone(addr));
+
+		match replacement {
+			Some(addr) => self.by_type.insert(type_bytes.to_vec(), addr),
+			None => self.by_type.remove(type_bytes),
+		};
+	}
+
+	fn resolve(&self, type_key: &[u8]) -> Option<Arc<[u8]>> {
+		self.by_type.get(type_key).cloned()
+	}
+}
+
+/// Shared routes and pool used for sibling servlet calls.
 pub struct HiveContextImpl<P: Protocol> {
-	servlet_addresses: SharedAddressMap,
-	type_index: SharedAddressMap,
+	routes: Arc<RwLock<Routes>>,
 	pool: Arc<ConnectionPool<P>>,
 }
 
 impl<P: Protocol> HiveContextImpl<P> {
-	/// Creates empty maps bound to the hive servlet pool.
+	/// Creates empty routes bound to the hive servlet pool.
 	pub fn new(pool: Arc<ConnectionPool<P>>) -> Self {
-		Self {
-			servlet_addresses: Arc::new(RwLock::new(HashMap::new())),
-			type_index: Arc::new(RwLock::new(HashMap::new())),
-			pool,
-		}
+		Self { routes: Arc::new(RwLock::new(Routes::default())), pool }
 	}
 
-	/// Record an instance route. The first registration per type wins
-	/// the index.
-	///
-	/// `addr` moves into the instance map. The type index takes an extra
-	/// [`Arc`] handle only when the type is new (refcount bump, not a byte
-	/// copy). `type_bytes.to_vec()` is a real key copy for the type index.
 	pub fn add_route(&self, key: Vec<u8>, addr: Arc<[u8]>, type_bytes: &[u8]) {
-		let Ok(mut addrs) = self.servlet_addresses.write() else {
+		let Ok(mut routes) = self.routes.write() else {
 			return;
 		};
 
-		if let Ok(mut type_idx) = self.type_index.write() {
-			// The type index shares the same address bytes rather than
-			// copying them.
-			type_idx.entry(type_bytes.to_vec()).or_insert_with(|| Arc::clone(&addr));
-		}
-
-		addrs.insert(key, addr);
+		routes.insert(key, addr, type_bytes);
 	}
 
-	/// Drop an instance route and repair the type index when needed.
 	pub fn remove_route(&self, key: &[u8], type_urn: &Urn<'_>, type_bytes: &[u8], removed_addr: &Arc<[u8]>) {
-		if let Ok(mut addrs) = self.servlet_addresses.write() {
-			addrs.remove(key);
-		}
-
-		let Ok(mut type_idx) = self.type_index.write() else {
-			return;
-		};
-
-		if type_idx.get(type_bytes) != Some(removed_addr) {
-			return;
-		}
-
 		let type_prefix = type_prefix_bytes(type_urn);
-		let Ok(addrs) = self.servlet_addresses.read() else {
+		let Ok(mut routes) = self.routes.write() else {
 			return;
 		};
 
-		let replacement = addrs
-			.iter()
-			.find(|(k, _)| k.starts_with(&type_prefix))
-			.map(|(_, a)| Arc::clone(a));
-		match replacement {
-			Some(new_addr) => {
-				type_idx.insert(type_bytes.to_vec(), new_addr);
-			}
-			None => {
-				type_idx.remove(type_bytes);
-			}
-		}
+		routes.remove(key, &type_prefix, type_bytes, removed_addr);
 	}
 
 	fn resolve_addr(&self, servlet_type: &Urn<'_>) -> Result<P::Address, TightBeamError>
@@ -94,9 +99,9 @@ impl<P: Protocol> HiveContextImpl<P> {
 		P::Address: core::str::FromStr,
 	{
 		let route_err = || TightBeamError::RouterError(RouterError::UnknownRoute);
-		let type_idx = self.type_index.read().map_err(|_| TightBeamError::LockPoisoned)?;
+		let routes = self.routes.read().map_err(|_| TightBeamError::LockPoisoned)?;
 		let type_key = canonical_bytes(servlet_type);
-		let addr_bytes = type_idx.get(&type_key).cloned().ok_or_else(route_err)?;
+		let addr_bytes = routes.resolve(&type_key).ok_or_else(route_err)?;
 		let addr_str = core::str::from_utf8(addr_bytes.as_ref()).map_err(|_| route_err())?;
 
 		let parsed = addr_str.parse().map_err(|_| route_err())?;
@@ -154,5 +159,96 @@ where
 			let duplex = pooled_conn.open_duplex()?;
 			Ok(duplex)
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::mpsc;
+	use std::thread;
+	use std::time::Duration;
+
+	const TYPE: &[u8] = b"urn:tb:servlet:echo";
+	const PREFIX: &[u8] = b"urn:tb:servlet:echo/";
+
+	fn addr(bytes: &'static str) -> Arc<[u8]> {
+		Arc::from(bytes.as_bytes())
+	}
+
+	fn instance(tail: &str) -> Vec<u8> {
+		format!("urn:tb:servlet:echo/{tail}").into_bytes()
+	}
+
+	#[test]
+	fn first_instance_of_a_type_owns_the_index() {
+		let mut routes = Routes::default();
+		routes.insert(instance("a"), addr("10.0.0.1"), TYPE);
+		routes.insert(instance("b"), addr("10.0.0.2"), TYPE);
+		assert_eq!(routes.resolve(TYPE), Some(addr("10.0.0.1")));
+	}
+
+	#[test]
+	fn removing_the_indexed_instance_promotes_a_sibling() {
+		let mut routes = Routes::default();
+		routes.insert(instance("a"), addr("10.0.0.1"), TYPE);
+		routes.insert(instance("b"), addr("10.0.0.2"), TYPE);
+		routes.remove(&instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
+		assert_eq!(routes.resolve(TYPE), Some(addr("10.0.0.2")));
+	}
+
+	#[test]
+	fn removing_the_last_instance_clears_the_type() {
+		let mut routes = Routes::default();
+		routes.insert(instance("a"), addr("10.0.0.1"), TYPE);
+		routes.remove(&instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
+		assert_eq!(routes.resolve(TYPE), None);
+	}
+
+	#[test]
+	fn removing_a_sibling_leaves_the_index() {
+		let mut routes = Routes::default();
+		routes.insert(instance("a"), addr("10.0.0.1"), TYPE);
+		routes.insert(instance("b"), addr("10.0.0.2"), TYPE);
+		routes.remove(&instance("b"), PREFIX, TYPE, &addr("10.0.0.2"));
+		assert_eq!(routes.resolve(TYPE), Some(addr("10.0.0.1")));
+	}
+
+	/// Insert and remove run concurrently against one lock. Two locks
+	/// acquired in opposite orders wedge both threads, so the bounded wait
+	/// reports that as a failure within the wait (CWE-362).
+	#[test]
+	fn concurrent_insert_and_remove_finish() {
+		let routes = Arc::new(RwLock::new(Routes::default()));
+		let (done, finished) = mpsc::channel();
+
+		let inserter = Arc::clone(&routes);
+		let insert_done = done.clone();
+		thread::spawn(move || {
+			for _ in 0..20_000 {
+				inserter
+					.write()
+					.expect("routes lock")
+					.insert(instance("a"), addr("10.0.0.1"), TYPE);
+			}
+
+			insert_done.send(()).expect("receiver alive");
+		});
+
+		let remover = Arc::clone(&routes);
+		thread::spawn(move || {
+			for _ in 0..20_000 {
+				remover
+					.write()
+					.expect("routes lock")
+					.remove(&instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
+			}
+
+			done.send(()).expect("receiver alive");
+		});
+
+		for _ in 0..2 {
+			assert!(finished.recv_timeout(Duration::from_secs(10)).is_ok());
+		}
 	}
 }

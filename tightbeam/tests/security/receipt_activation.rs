@@ -9,7 +9,7 @@
 //! `complete()` activates a metered session whenever the client Finished
 //! merely verified, without confirming the countersigned receipt settled,
 //! a driver that forgets the acknowledgement step activates a budget the
-//! client never countersigned, defeating non-repudiation.
+//! client left uncountersigned, defeating non-repudiation.
 //!
 //! ## Attack
 //! A server integration processes the client Finished and calls
@@ -65,7 +65,7 @@ tb_assert_spec! {
 }
 
 // A manual driver that runs the CMS handshake through the client Finished
-// but skips the receipt acknowledgement MUST NOT be able to activate the
+// but skips the receipt acknowledgement MUST fail to activate the
 // budget-bearing session: complete() fails closed.
 tb_scenario! {
 	name: complete_requires_settled_receipt,
@@ -83,7 +83,7 @@ tb_scenario! {
 
 			// Drive the handshake manually through the client Finished, then
 			// deliberately skip process_receipt_ack.
-			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
 			let server_finished = server.build_server_finished().await?;
@@ -92,7 +92,7 @@ tb_scenario! {
 			let client_finished = client.build_client_finished().await?;
 			server.process_client_finished(&client_finished)?;
 
-			// The countersigned receipt was never acknowledged, so the
+			// The countersigned receipt reached no acknowledgement, so the
 			// metered session must not activate.
 			let complete_result = server.complete();
 			let activation_refused = matches!(complete_result, Err(HandshakeError::CountersignatureMissing));

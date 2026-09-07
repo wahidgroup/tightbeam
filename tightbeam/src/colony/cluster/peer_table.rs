@@ -3,14 +3,16 @@
 //! This module holds discovery state for the peer beat. The design follows
 //! Bitcoin's address manager as analyzed against eclipse attacks.
 //!
-//! - Configured anchors cannot be evicted and are always dialed.
+//! - Configured anchors hold their slots for the table's life and are
+//!   always dialed.
 //! - Learned peers are bucketed by address prefix with per-bucket caps.
-//!   One network position therefore cannot dominate the table (CWE-770).
+//!   One network position therefore holds at most its own bucket's
+//!   share of the table (CWE-770).
 //! - An unverified hint enters the `new` table only. A probe dial whose
 //!   handshake certificate proves the local colony promotes the peer to
 //!   `tried`. Only anchors and `tried` peers receive traffic.
 //! - A `tried` resident that fails consecutive beats is evicted, so a
-//!   dead peer cannot hold a bucket slot. Discovery refills the table.
+//!   bucket slot follows liveness. Discovery refills the table.
 //!
 //! [`PeerStore`] is the persistence seam. The table owns every eclipse
 //! invariant. A driver only loads and saves learned records. A hydrated
@@ -90,9 +92,9 @@ impl TryFrom<PeerGossip> for PeerHint {
 
 	/// Convert one peer-exchange wire entry into a discovery hint.
 	///
-	/// The entry is untrusted wire input. A dial address that is not UTF-8
-	/// can never parse as a socket, so admission refuses it first. An empty
-	/// fingerprint means the sharer sent no identity.
+	/// The entry is untrusted wire input. Admission requires a UTF-8 dial
+	/// address that parses as a socket. An empty fingerprint means the
+	/// sharer sent no identity.
 	///
 	/// The conversion moves both buffers, and a refused address travels
 	/// back inside the error, so neither outcome copies wire bytes.
@@ -126,17 +128,17 @@ pub struct PeerRecord {
 ///
 /// The table owns every eclipse invariant. Those invariants include prefix
 /// bucketing, table and bucket caps, and anchor permanence. A full tried
-/// bucket also keeps its residents instead of displacing them.
+/// bucket also keeps its residents, so a newcomer waits for a freed slot.
 ///
 /// A driver only loads and saves learned records. Hydrated records re-enter
-/// through the same capped admission path, so a driver cannot bypass the
-/// bounds.
+/// through the same capped admission path, so the bounds apply to a
+/// hydrated record as they do to a learned one.
 ///
-/// Persistence is advisory. A driver fault never interrupts routing.
+/// Persistence is advisory, so routing proceeds through a driver fault.
 /// Hydration failure degrades to an anchors-only start. That direction is
 /// safe because discovery refills the table.
 pub trait PeerStore: Send + Sync {
-	/// Load previously persisted learned peers.
+	/// Load learned peers from a prior run.
 	fn hydrate(&self) -> Result<Vec<PeerRecord>, ClusterError>;
 
 	/// Replace the persisted snapshot of learned peers.
@@ -174,17 +176,17 @@ struct TableState {
 	tried: HashMap<String, PeerEntry>,
 	/// Anchors whose beat dial passed the colony gate.
 	///
-	/// Anchors never enter `tried`. A seed MUST still share its verified
-	/// anchors over PEX, or a bootstrapping peer could learn nothing.
+	/// A seed shares its verified anchors over PEX, which is how a
+	/// bootstrapping peer learns its first dial targets.
 	anchors_verified: HashMap<String, PeerEntry>,
-	/// This gateway's own advertised address. It is never admitted as a peer.
+	/// This gateway's own advertised address, held out of peer admission.
 	local: Option<String>,
 }
 
 /// Anchored bounded peer discovery table.
 ///
 /// Interior mutability lets the advertise beat, reconcile rounds, and
-/// detached reflood tasks share one instance through configuration.
+/// reflood tasks share one instance through configuration.
 pub struct PeerTable {
 	anchors: Vec<String>,
 	anchor_keys: HashSet<String>,
@@ -227,7 +229,7 @@ fn bucket_len(map: &HashMap<String, PeerEntry>, group: AddressGroup) -> usize {
 
 /// Round-robin sample across prefix buckets.
 ///
-/// One prefix therefore cannot monopolize a bounded sample. Buckets are
+/// One prefix therefore draws at most its own share of a bounded sample.
 /// visited in sorted-key order so the draw is deterministic. Each bucket
 /// prefers its least recently probed peer.
 ///
@@ -286,8 +288,8 @@ impl PeerTable {
 	/// Accepts any iterator of values convertible into [`String`].
 	/// Hydration replays persisted records through the capped admission path.
 	/// A driver fault degrades to an anchors-only start. An empty table is
-	/// safe because discovery refills it. A faulty driver must never seed
-	/// unchecked entries.
+	/// safe because discovery refills it. A driver seeds through the same
+	/// capped admission path every other record takes.
 	#[must_use]
 	pub fn new<I, S>(anchors: I, store: Arc<dyn PeerStore>) -> Self
 	where
@@ -315,32 +317,29 @@ impl PeerTable {
 	///
 	/// Anchors, known addresses, unparsable addresses, and hints beyond the
 	/// per-prefix or table caps are dropped. Cap overflow is the eclipse
-	/// bound: one address prefix cannot flood discovery (CWE-770).
+	/// bound: one address prefix draws its own share of discovery (CWE-770).
 	///
 	/// Returns how many hints were admitted.
 	pub fn learn<I>(&self, hints: I) -> Result<usize, ClusterError>
 	where
 		I: IntoIterator<Item = PeerHint>,
 	{
-		let mut state = self.state.lock()?;
-		let mut admitted = 0;
-		for hint in hints {
-			let record = PeerRecord {
-				gateway_addr: hint.gateway_addr,
-				peer_id: hint.peer_id,
-				tried: false,
-				last_probe_ms: 0,
-			};
-			if self.admit_record(&mut state, record) {
-				admitted += 1;
+		self.with_table(|state| {
+			let mut admitted = 0;
+			for hint in hints {
+				let record = PeerRecord {
+					gateway_addr: hint.gateway_addr,
+					peer_id: hint.peer_id,
+					tried: false,
+					last_probe_ms: 0,
+				};
+				if self.admit_record(state, record) {
+					admitted += 1;
+				}
 			}
-		}
 
-		if admitted > 0 {
-			self.persist_snapshot(&state);
-		}
-
-		Ok(admitted)
+			(admitted, admitted > 0)
+		})
 	}
 
 	/// Record a verified probe of `addr` and promote it into tried.
@@ -352,75 +351,61 @@ impl PeerTable {
 	/// A full tried prefix bucket keeps its residents and leaves the
 	/// candidate in new. That is the test-before-evict discipline. Residents
 	/// re-verify on every beat, so a candidate waits for a freed slot
-	/// instead of displacing a verified peer.
-	///
-	/// A verified anchor never moves into tried because it is already a
-	/// permanent target. The probe is still recorded so the anchor becomes
-	/// shareable over PEX. Without that record, a seed whose only peers are
-	/// anchors would have nothing to share, and a bootstrapping node could
-	/// never discover the graph.
-	///
-	/// The table copies `peer_id` into the stored entry. The borrowed
-	/// fingerprint lives only as long as the caller's handshake.
+	/// so a candidate waits for a freed slot.
 	pub fn promote(&self, addr: &str, peer_id: Option<&[u8]>, now_ms: u64) -> Result<bool, ClusterError> {
 		let Some(key) = address_key(addr) else {
 			return Ok(false);
 		};
 
+		// Anchors are configured, so a verified anchor moves no learned row.
 		if self.anchor_keys.contains(&key) {
-			let mut state = self.state.lock()?;
-			let entry = PeerEntry { peer_id: peer_id.map(<[u8]>::to_vec), last_probe_ms: now_ms, failures: 0 };
-			state.anchors_verified.insert(key, entry);
+			return self.with_table(|state| {
+				let entry = PeerEntry { peer_id: peer_id.map(<[u8]>::to_vec), last_probe_ms: now_ms, failures: 0 };
+				state.anchors_verified.insert(key, entry);
 
-			return Ok(false);
+				(false, false)
+			});
 		}
 
-		let mut state = self.state.lock()?;
-		if let Some(entry) = state.tried.get_mut(&key) {
-			entry.last_probe_ms = now_ms;
-			entry.failures = 0;
+		self.with_table(|state| {
+			if let Some(entry) = state.tried.get_mut(&key) {
+				entry.last_probe_ms = now_ms;
+				entry.failures = 0;
 
-			if let Some(peer_id) = peer_id {
-				entry.peer_id = Some(peer_id.to_vec());
+				if let Some(peer_id) = peer_id {
+					entry.peer_id = Some(peer_id.to_vec());
+				}
+
+				return (false, true);
 			}
 
-			self.persist_snapshot(&state);
+			let record = PeerRecord {
+				gateway_addr: key,
+				peer_id: peer_id.map(<[u8]>::to_vec),
+				tried: true,
+				last_probe_ms: now_ms,
+			};
 
-			return Ok(false);
-		}
-
-		let record = PeerRecord {
-			gateway_addr: key,
-			peer_id: peer_id.map(<[u8]>::to_vec),
-			tried: true,
-			last_probe_ms: now_ms,
-		};
-
-		let promoted = self.admit_record(&mut state, record);
-		if promoted {
-			self.persist_snapshot(&state);
-		}
-
-		Ok(promoted)
+			let promoted = self.admit_record(state, record);
+			(promoted, promoted)
+		})
 	}
 
 	/// Drop a candidate whose probe failed.
 	///
-	/// Only the new table is pruned here, so dead or foreign addresses cannot
-	/// clog a prefix bucket. Tried residents are never evicted by a transient
-	/// failure; repeated beat failures go through [`Self::record_failure`].
+	/// Pruning applies to the new table, which keeps a prefix bucket holding
+	/// live addresses. A tried resident leaves through repeated beat failures
+	/// in [`Self::record_failure`].
 	/// Misbehavior is handled by relay scoring.
 	pub fn discard(&self, addr: &str) -> Result<(), ClusterError> {
 		let Some(key) = address_key(addr) else {
 			return Ok(());
 		};
 
-		let mut state = self.state.lock()?;
-		if state.new.remove(&key).is_some() {
-			self.persist_snapshot(&state);
-		}
-
-		Ok(())
+		self.with_table(|state| {
+			let removed = state.new.remove(&key).is_some();
+			((), removed)
+		})
 	}
 
 	/// Record a failed beat dial of a tried peer.
@@ -435,7 +420,7 @@ impl PeerTable {
 	/// - A verified probe resets the count.
 	/// - Eviction fails closed: the table shrinks toward its anchors, and
 	///   discovery refills it.
-	/// - Anchors never live in tried, so this method ignores an anchor address.
+	/// - This method applies to tried residents, where a learned peer sits.
 	///
 	/// # Sources
 	///
@@ -448,20 +433,20 @@ impl PeerTable {
 			return Ok(false);
 		};
 
-		let mut state = self.state.lock()?;
-		let Some(entry) = state.tried.get_mut(&key) else {
-			return Ok(false);
-		};
+		self.with_table(|state| {
+			let Some(entry) = state.tried.get_mut(&key) else {
+				return (false, false);
+			};
 
-		entry.failures = entry.failures.saturating_add(1);
-		if entry.failures < MAX_PEER_TRIED_FAILURES {
-			return Ok(false);
-		}
+			entry.failures = entry.failures.saturating_add(1);
+			if entry.failures < MAX_PEER_TRIED_FAILURES {
+				return (false, false);
+			}
 
-		state.tried.remove(&key);
-		self.persist_snapshot(&state);
+			state.tried.remove(&key);
 
-		Ok(true)
+			(true, true)
+		})
 	}
 
 	/// Remove an address from both learned tables.
@@ -470,28 +455,26 @@ impl PeerTable {
 	/// definitive identity mismatch, not a transient fault.
 	///
 	/// - The address leaves discovery at once.
-	/// - It does not wait out the failure threshold.
+	/// - The address leaves at once, ahead of the failure threshold.
 	/// - A re-keyed peer therefore stops receiving advertisements.
 	pub fn expel(&self, addr: &str) -> Result<(), ClusterError> {
 		let Some(key) = address_key(addr) else {
 			return Ok(());
 		};
 
-		let mut state = self.state.lock()?;
-		let from_new = state.new.remove(&key).is_some();
-		let from_tried = state.tried.remove(&key).is_some();
-		if from_new || from_tried {
-			self.persist_snapshot(&state);
-		}
+		self.with_table(|state| {
+			let from_new = state.new.remove(&key).is_some();
+			let from_tried = state.tried.remove(&key).is_some();
 
-		Ok(())
+			((), from_new || from_tried)
+		})
 	}
 
 	/// Dial targets for the advertise/reconcile beat and gossip reflood.
 	///
-	/// Anchors always lead the set and cannot be displaced by learned peers.
-	/// Verified tried peers follow. New entries never appear. An unverified
-	/// hint MUST NOT receive advertisements or rumor bytes.
+	/// Anchors always lead the set, then verified tried peers. A `new` entry
+	/// joins the set once a probe promotes it, so advertisements and rumor
+	/// bytes reach verified identities only.
 	///
 	/// The returned targets outlive the table lock, so each beat draws
 	/// owned copies. The set is bounded by the anchor and tried caps.
@@ -508,8 +491,8 @@ impl PeerTable {
 
 	/// Bounded feeler sample of unverified candidates for this beat.
 	///
-	/// Sampling round-robins across prefix buckets so one prefix cannot
-	/// monopolize probe capacity. Each bucket prefers its least recently
+	/// Sampling round-robins across prefix buckets so each prefix draws its
+	/// own share of probe capacity. Each bucket prefers its least recently
 	/// probed candidate. Sampled candidates are stamped with `now_ms` so
 	/// later beats rotate through the backlog.
 	pub fn probe_sample(&self, now_ms: u64) -> Result<Vec<String>, ClusterError> {
@@ -528,14 +511,14 @@ impl PeerTable {
 	///
 	/// The shareable set is tried peers plus probe-verified anchors. Draws
 	/// round-robin across prefix buckets up to `cap`, so the shared view
-	/// spans prefixes instead of amplifying one position.
+	/// spans prefixes in proportion to what each holds.
 	///
 	/// Only probe-verified peers are shared. Forwarding an unverified hint
 	/// would launder it with this gateway's reputation.
 	pub fn sample_for_pex(&self, cap: usize) -> Result<Vec<PeerRecord>, ClusterError> {
 		let state = self.state.lock()?;
 
-		// Anchors never enter tried, so chaining the two maps borrows a
+		// Anchors and tried are disjoint maps, so chaining them borrows a
 		// disjoint shareable view without building a merged copy. Only the
 		// sampled records own their data, because they outlive the lock.
 		let shareable = state.tried.iter().chain(state.anchors_verified.iter());
@@ -562,9 +545,9 @@ impl PeerTable {
 
 	/// Record this gateway's own advertised address.
 	///
-	/// Peer exchange must never teach a gateway to dial itself. PEX replies
-	/// echo installed routes, which include the requester's own advertised
-	/// address.
+	/// Peer exchange echoes installed routes, which include the requester's
+	/// own advertised address, so the table holds that address out of
+	/// admission. PEX replies therefore teach a gateway its peers alone.
 	pub fn exclude_self(&self, addr: &str) -> Result<(), ClusterError> {
 		let Some(key) = address_key(addr) else {
 			return Ok(());
@@ -638,14 +621,14 @@ impl PeerTable {
 
 	/// Persist the learned tables best-effort.
 	///
-	/// The in-memory table stays authoritative. A driver write fault never
-	/// interrupts the beat. The next mutation retries the write.
+	/// The in-memory table stays authoritative, so the beat proceeds through
+	/// a driver write fault. The next mutation retries the write.
 	///
 	/// Each record is an owned copy: [`PeerRecord`] owns its fields by
-	/// the [`PeerStore`] contract, so the snapshot cannot borrow from
-	/// the locked maps. Writes happen only on admission or promotion.
-	fn persist_snapshot(&self, state: &TableState) {
-		let records: Vec<PeerRecord> = state
+	/// the [`PeerStore`] contract, so the snapshot outlives the guard that
+	/// produced it.
+	fn snapshot(state: &TableState) -> Vec<PeerRecord> {
+		state
 			.new
 			.iter()
 			.map(|(addr, entry)| (addr, entry, false))
@@ -656,8 +639,29 @@ impl PeerTable {
 				tried,
 				last_probe_ms: entry.last_probe_ms,
 			})
-			.collect();
-		let _ = self.store.persist(&records);
+			.collect()
+	}
+
+	/// Applies `change` under the table lock, then writes the snapshot it
+	/// asked for.
+	///
+	/// `change` returns its outcome and whether the learned tables moved.
+	/// Every mutation routes through here, so the decision to write lives in
+	/// one place, and the guard is released before the pluggable driver runs.
+	/// A driver that blocks therefore delays no other caller (CWE-667).
+	fn with_table<T>(&self, change: impl FnOnce(&mut TableState) -> (T, bool)) -> Result<T, ClusterError> {
+		let (outcome, snapshot) = {
+			let mut state = self.state.lock()?;
+			let (outcome, persist) = change(&mut state);
+
+			(outcome, persist.then(|| Self::snapshot(&state)))
+		};
+
+		if let Some(records) = snapshot {
+			let _ = self.store.persist(&records);
+		}
+
+		Ok(outcome)
 	}
 }
 
@@ -979,6 +983,43 @@ mod tests {
 		table.learn(vec![hint("10.0.0.1:9000")])?;
 		table.promote("10.0.0.1:9000", None, 1_000)?;
 		assert_eq!(store.persists.load(Ordering::SeqCst), 2);
+		Ok(())
+	}
+
+	/// A driver that reaches back into the table while it is being written.
+	///
+	/// The write runs after the guard is released, so this re-entry
+	/// succeeds. Holding the guard across the driver call would deadlock
+	/// on a non-reentrant mutex instead (CWE-667).
+	struct ReentrantStore {
+		table: Mutex<Option<Arc<PeerTable>>>,
+		observed: AtomicUsize,
+	}
+
+	impl PeerStore for ReentrantStore {
+		fn hydrate(&self) -> Result<Vec<PeerRecord>, ClusterError> {
+			Ok(Vec::new())
+		}
+
+		fn persist(&self, _records: &[PeerRecord]) -> Result<(), ClusterError> {
+			let table = self.table.lock().expect("driver handle").clone();
+			if let Some(table) = table {
+				let (new, tried) = table.learned()?;
+				self.observed.store(new + tried, Ordering::SeqCst);
+			}
+
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn the_table_lock_is_free_while_the_driver_writes() -> Result<(), ClusterError> {
+		let store = Arc::new(ReentrantStore { table: Mutex::new(None), observed: AtomicUsize::new(0) });
+		let table = Arc::new(PeerTable::new(vec!["10.0.0.1:9000"], Arc::clone(&store) as Arc<dyn PeerStore>));
+		*store.table.lock().expect("driver handle") = Some(Arc::clone(&table));
+		table.learn(vec![hint("10.1.0.1:9000")])?;
+
+		assert_eq!(store.observed.load(Ordering::SeqCst), 1);
 		Ok(())
 	}
 }

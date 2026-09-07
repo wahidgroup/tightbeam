@@ -108,8 +108,8 @@ pub const AES_GCM_TAG_SIZE: usize = 16;
 /// - Receipt-bearing mux sessions renew in band first.
 /// - Other sessions drain via GoAway.
 /// - Receivers refuse counters past this constant volume bound.
-/// - `with_rekey_limit` overrides the renewal/drain trigger only.
-///   It never overrides the receive-side refusal bound.
+/// - `with_rekey_limit` overrides the renewal/drain trigger. The
+///   receive-side refusal bound stays at this constant.
 ///
 /// # Sources
 ///
@@ -146,7 +146,7 @@ pub const DEFAULT_REKEY_MIN_SPEND_RECORDS: u64 = 4;
 /// draining the connection
 ///
 /// Bounds the c2s data park (Ack-to-Done window plus the hard floor).
-/// A peer that never answers cannot stall the session indefinitely.
+/// A peer that stops answering releases the park through expiry.
 /// Expiry converges on the existing GoAway drain path.
 pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
 
@@ -165,6 +165,24 @@ pub const DEFAULT_REKEY_DEADLINE_SECS: u64 = 30;
 /// - CWE-400, uncontrolled resource consumption:
 ///   <https://cwe.mitre.org/data/definitions/400.html>
 pub const DEFAULT_MAX_SERVER_CONNECTIONS: usize = 1024;
+
+/// Consecutive accept failures an accept loop absorbs before it stops
+///
+/// A descriptor shortage clears on its own, so the loop retries. A closed
+/// listener fails every time, so the budget ends the loop within a
+/// bounded number of attempts.
+///
+/// # Sources
+///
+/// - CWE-835, loop with unreachable exit condition:
+///   <https://cwe.mitre.org/data/definitions/835.html>
+pub const DEFAULT_ACCEPT_FAILURE_BUDGET: u32 = 8;
+
+/// Delay between accept retries after a failed accept
+///
+/// Spaces the retries far enough apart that a transient shortage has time
+/// to clear within [`DEFAULT_ACCEPT_FAILURE_BUDGET`] attempts.
+pub const DEFAULT_ACCEPT_RETRY_DELAY: core::time::Duration = core::time::Duration::from_millis(50);
 
 // ============================================================================
 // Testing & Verification Constants
@@ -255,15 +273,16 @@ pub const DEFAULT_FAULT_SEED: u64 = 0xDEADBEEF;
 /// The cluster should then route work elsewhere.
 pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
 
-/// Utilization assumed for servlets that do not report one (50% = 5000 bps)
+/// Utilization assumed for a servlet that reports none (50% = 5000 bps)
 ///
 /// The scaling task needs a per-instance figure to average.
 ///
 /// A servlet without self-reported or hive-tracked utilization counts as
 /// half loaded.
 ///
-/// - It does not force scale-up the way 100% would.
-/// - It does not mask load on siblings the way 0% would.
+/// - It leaves scale-up to a servlet that reports real load, as 100% would
+///   force.
+/// - It surfaces on siblings' averages, which 0% would hide.
 pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 
 /// Default freshness window for signed cluster commands (30 seconds)
@@ -310,8 +329,8 @@ pub const DEFAULT_MUX_CANCEL_BUDGET: u32 = 1024;
 /// `max_peer_initiated_streams` values. Deriving [`MuxSettings`] clamps
 /// both directions to this ceiling.
 ///
-/// - An absurd advertisement cannot inflate bookkeeping bounds far
-///   beyond useful concurrency.
+/// - An advertisement inflates bookkeeping bounds only up to useful
+///   concurrency.
 /// - Both endpoints apply the same clamp to the same wire values.
 ///
 /// [`MuxSettings`]: crate::transport::handshake::negotiation::MuxSettings
@@ -337,7 +356,7 @@ pub const MIN_MUX_CHUNK_SIZE: u32 = 1024;
 /// Ceiling on the negotiated per-chunk payload size (64 KiB)
 ///
 /// Bounds the largest single envelope a stream chunk can occupy.
-/// One stream therefore cannot monopolize the shared writer.
+/// One stream therefore takes at most this share of the shared writer.
 ///
 /// # Sources
 ///
@@ -361,7 +380,7 @@ pub const DEFAULT_MUX_CREDIT_UNIT: u32 = 1024;
 /// The initial window bounds receive-side reassembly memory per stream
 /// (`window * chunk size`).
 ///
-/// - An absurd advertisement cannot inflate that bound.
+/// - An advertisement raises that bound only up to this ceiling.
 /// - Grants may raise a live stream's absolute limit past the initial
 ///   window while bytes remain under [`MAX_MUX_REASSEMBLY_BYTES`].
 ///
@@ -408,8 +427,8 @@ pub const DEFAULT_MAX_CLEARTEXT_ENVELOPE: usize = 128 * 1024;
 /// Default ceiling in bytes for an encrypted envelope on the wire (256 KiB)
 ///
 /// A server refuses a frame whose declared content length exceeds this
-/// ceiling. It refuses before reading the content, so allocation cannot
-/// be forced.
+/// ceiling. It refuses before reading the content, so the declared length
+/// bounds the allocation.
 ///
 /// - The refusal closes the connection.
 /// - The sender sees a reset, not a typed error.
@@ -468,7 +487,7 @@ pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 /// Hard ceiling on unary mux reassembly buffer bytes per stream
 ///
 /// Credit grants may raise the chunk window.
-/// Accepted payload bytes must never exceed this bound.
+/// Accepted payload bytes stay within this bound.
 /// Aligns with [`DEFAULT_MAX_DECOMPRESSED_LEN`].
 ///
 /// # Sources
@@ -517,8 +536,8 @@ pub const MAX_PEER_ROUTES: usize = 1024;
 ///
 /// Relay trails bucket per `(origin, relay)` pair, so a colony of `N`
 /// members can mint up to `N * (N - 1)` buckets. The budget is
-/// separate from [`MAX_PEER_GATEWAYS`]: relay fan-in must never starve
-/// the admission of a new direct gateway.
+/// separate from [`MAX_PEER_GATEWAYS`]: relay fan-in and direct-gateway
+/// admission each hold their own budget.
 ///
 /// # Sources
 ///
@@ -544,8 +563,8 @@ pub const MAX_RELAY_ROUTES: usize = 1024;
 /// spend. Each peer hop decrements it, and `0` serves locally only.
 /// An origin stamps `u8::MAX`, which means "forward as far as policy
 /// allows". The first gateway clamps the value to its own `max_hops`,
-/// so the client never asserts topology knowledge and a crafted large
-/// value gains nothing. A relayed hop carries the explicit decremented
+/// so the client asserts its own reachability alone and a crafted large
+/// value clamps to the same ceiling. A relayed hop carries the explicit
 /// value, which every later gateway clamps again. The sentinel is also
 /// the DER DEFAULT, so the common origin request omits the field on
 /// the wire.
@@ -562,7 +581,7 @@ pub const DEFAULT_HOP_BUDGET: u8 = u8::MAX;
 /// only when the slate or the flood target set changed. One refresh on
 /// this interval lets late joiners and pruned witnesses relearn the
 /// origin. Bitcoin self-announces addresses the same way: on change
-/// and on a slow timer, never per beat. The refresh MUST stay under
+/// and on a slow timer, well below one refresh per beat. The refresh MUST stay under
 /// the gossip freshness window ([`DEFAULT_GOSSIP_SEEN_TTL_MS`]) so a
 /// refreshed rumor always admits as fresh.
 ///
@@ -629,8 +648,8 @@ pub const MAX_GOSSIP_LOG: usize = 4096;
 /// Ceiling on gossip rumors retained per signer in one in-memory journal
 ///
 /// Partitioning the journal per signer isolates retention per identity.
-/// One signer minting distinct digests cannot evict rumors recorded for
-/// other signers.
+/// One signer's distinct digests spend that signer's own retention, which
+/// leaves other signers' rumors recorded.
 ///
 /// # Sources
 ///
@@ -705,7 +724,7 @@ pub const MAX_PEER_TABLE_NEW: usize = 256;
 /// Ceiling on verified learned peers held in the peer discovery table
 ///
 /// Aligned with [`MAX_PEER_GATEWAYS`].
-/// The dial graph never grows past the number of peer gateways one
+/// The dial graph stays within the number of peer gateways one
 /// registry may track.
 ///
 /// # Sources
@@ -719,7 +738,7 @@ pub const MAX_PEER_TABLE_TRIED: usize = MAX_PEER_GATEWAYS;
 /// Discovery buckets learned peers by /16 (IPv4) or /32 (IPv6) prefix.
 /// The per-bucket bound is the eclipse countermeasure.
 ///
-/// An attacker inside one network position cannot dominate either table.
+/// One network position therefore holds its own share of either table.
 ///
 /// # Sources
 ///
@@ -731,8 +750,8 @@ pub const MAX_PEER_BUCKET: usize = 8;
 
 /// Ceiling on peers shared in one peer-exchange sample
 ///
-/// Bounds the reply. One reconcile round therefore cannot flood a requester
-/// with discovery hints.
+/// Bounds the reply. One reconcile round therefore returns at most this
+/// many discovery hints.
 ///
 /// # Sources
 ///

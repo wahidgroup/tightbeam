@@ -8,6 +8,7 @@ use digest::consts::U32;
 use digest::{Digest, OutputSizeUser};
 
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
+use crate::colony::common::TaskGroup;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::der::oid::AssociatedOid;
 use crate::macros::server::AcceptedConnection;
@@ -33,8 +34,8 @@ pub(crate) type GatewayReplayGuard = ();
 ///
 /// The colony plane serves hives and peers with full control dispatch.
 /// The edge plane serves external clients and admits `Work` frames only,
-/// so an edge client can never register hives, advertise peers, or
-/// inject gossip.
+/// so registration, peer advertisement, and gossip stay on the colony
+/// plane.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GatewayPlane {
 	Colony,
@@ -116,13 +117,22 @@ impl<T> GatewayColonyProtocol for T where
 
 /// Shared gateway state passed into accept-loop request handling.
 pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
+	/// Registered hives and the servlet types each advertises.
 	pub(crate) registry: Arc<HiveRegistry>,
+	/// Servlet routes, both local and peer-learned, with their trails.
 	pub(crate) servlet_registry: Arc<ServletRegistry>,
+	/// Colony identity, gates, peer caps, and gossip policy.
 	pub(crate) config: Arc<ClusterConfig>,
+	/// Connection pool this gateway dials hives on.
 	pub(crate) pool: Arc<ClusterPool<P>>,
+	/// Connection pool reserved for peer gateways, when one is configured.
 	pub(crate) peer_pool: Option<Arc<ClusterPool<P>>>,
+	/// Instrumentation collector for gateway control-plane events.
 	pub(crate) trace: Arc<TraceCollector>,
+	/// Freshness ledger that admits each signed control frame once.
 	pub(crate) replay_guard: GatewayReplayGuard,
+	/// Owner of the background work a request handler starts.
+	pub(crate) tasks: TaskGroup,
 }
 
 impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
@@ -134,6 +144,7 @@ impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
 			pool: Arc::clone(&self.pool),
 			peer_pool: self.peer_pool.as_ref().map(Arc::clone),
 			trace: Arc::clone(&self.trace),
+			tasks: self.tasks.clone(),
 			#[cfg(feature = "x509")]
 			replay_guard: Arc::clone(&self.replay_guard),
 			#[cfg(not(feature = "x509"))]

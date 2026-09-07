@@ -46,6 +46,7 @@ use crate::transport::handshake::{DirectionalCiphers, EpochMaterials, HandshakeA
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
+use crate::ZeroizingArray;
 
 /// Client-side ECIES handshake orchestrator.
 ///
@@ -59,9 +60,9 @@ where
 	state: ClientStateMachine,
 	client_random: Option<[u8; 32]>,
 	/// Exact DER bytes of the sent `ClientHello`, bound into the transcript
-	/// so a MITM cannot rewrite the offer undetected (CWE-757).
+	/// so a rewritten offer changes the transcript hash (CWE-757).
 	client_hello: Option<Vec<u8>>,
-	base_session_key: Option<[u8; 32]>,
+	base_session_key: Option<ZeroizingArray<32>>,
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: Option<&'static [u8]>,
@@ -228,7 +229,7 @@ where
 	///
 	/// Fail-closed (CWE-295): a configured certificate validator is
 	/// mandatory. Expiry alone authenticates nobody, so a missing validator
-	/// aborts the handshake instead of silently degrading.
+	/// aborts the handshake.
 	fn validate_and_extract_server_handshake(
 		&self,
 		server_handshake_der: &[u8],
@@ -291,7 +292,7 @@ where
 	/// Generate and store base session key.
 	fn generate_base_session_key(&mut self) -> Result<(), HandshakeError> {
 		let base_key = generate_nonce::<32>(None)?;
-		self.base_session_key = Some(base_key);
+		self.base_session_key = Some(ZeroizingArray::new(base_key));
 
 		Ok(())
 	}
@@ -347,7 +348,7 @@ where
 		self.validate_profile_selection(&server_handshake)?;
 
 		// 5. Validate transport capability negotiation (fails closed on an
-		// accept the client never offered)
+		// accept the client offered)
 		let offer = self.transport_offer.as_ref();
 		let accept = server_handshake.transport_accept.as_ref();
 		self.mux_settings = client_mux_settings(offer, accept)?;
@@ -365,7 +366,7 @@ where
 
 		// 9. Generate and encrypt session key. The countersignature (and
 		// the settlement answer bound inside it) folds into the ECIES
-		// payload, never onto the cleartext wire. After encoding it
+		// payload, which keeps it confidential. After encoding it
 		// moves into the completed stored artifact (zero copy).
 		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake, pending_receipt)?;
 
@@ -432,16 +433,16 @@ where
 		pending_receipt: Option<(SignedData, SignerInfo)>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		self.generate_base_session_key()?;
-		let base_key = self.base_session_key.ok_or(HandshakeError::InvalidState)?;
-		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
 
+		let base_key = self.base_session_key.as_deref().ok_or(HandshakeError::InvalidState)?;
+		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
 		let (artifact, receipt_ack) = match pending_receipt {
 			Some((artifact, ack)) => (Some(artifact), Some(ack)),
 			None => (None, None),
 		};
 
 		let (encrypted_bytes, receipt_ack) = self.perform_ecies_encryption(
-			&base_key,
+			base_key,
 			&client_random,
 			receipt_ack,
 			&server_handshake.certificate,
@@ -469,7 +470,7 @@ where
 	/// Returns the pending artifact plus the countersignature destined
 	/// for the confidential key-exchange payload. Completion is
 	/// deferred until after payload encoding so the `SignerInfo` moves
-	/// (never copies) into the stored artifact.
+	/// into the stored artifact by move.
 	async fn process_session_receipt(
 		&mut self,
 		server_handshake: &mut ServerHandshake,
@@ -532,7 +533,7 @@ where
 	/// Prepare client authentication materials if required or available.
 	///
 	/// The signature covers `Digest(transcript_hash || encrypted_data || cert_der)`
-	/// so it cannot be spliced onto a different key exchange or identity.
+	/// so it binds to this key exchange and this identity alone.
 	///
 	/// Returns tuple of (optional certificate, optional signature).
 	async fn prepare_client_auth(
@@ -580,14 +581,14 @@ where
 		salt[32..].copy_from_slice(server_random);
 
 		let salt_bytes = salt.as_slice();
-		let session_ciphers = self.derive_directional_aead(base_key, salt_bytes)?;
+		let session_ciphers = self.derive_directional_aead(base_key.as_slice(), salt_bytes)?;
 
 		// Invariant: AEAD key derivation occurs exactly once after transcript locked
 		self.invariants.derive_aead_once()?;
 
 		// 3. Seed epoch materials for post-handshake renewal
 		if let Some(transcript_hash) = self.transcript_hash {
-			let materials = derive_epoch_materials::<P>(base_key, salt_bytes, transcript_hash)?;
+			let materials = derive_epoch_materials::<P>(base_key.as_slice(), salt_bytes, transcript_hash)?;
 			self.epoch_materials = Some(materials);
 		}
 
@@ -660,7 +661,7 @@ where
 	/// Encrypt the session payload to the server's public key.
 	///
 	/// Hands the `receipt_ack` back after encoding: the caller moves it
-	/// into the completed stored artifact instead of cloning it.
+	/// into the completed stored artifact by move.
 	fn perform_ecies_encryption(
 		&self,
 		base_key: &[u8; 32],
@@ -877,7 +878,7 @@ mod tests {
 		Ok(())
 	}
 
-	/// A client without a certificate validator must abort instead of
+	/// A client without a certificate validator aborts, ahead of
 	/// degrading to expiry-only server authentication (CWE-295).
 	#[tokio::test]
 	async fn test_missing_validator_fails_closed() -> Result<(), Box<dyn Error>> {

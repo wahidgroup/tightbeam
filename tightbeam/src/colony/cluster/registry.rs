@@ -30,15 +30,154 @@ pub struct HiveEntry {
 	pub signer_id: Option<SharedId>,
 }
 
+impl HiveEntry {
+	/// This hive's control address, parsed for the dialing protocol.
+	///
+	/// Returns the stored bytes beside the parsed form. [`None`] means the
+	/// stored address parses for this protocol, so a caller dials only an
+	/// address this entry holds.
+	pub fn dial_target<A: core::str::FromStr>(&self) -> Option<(SharedId, A)> {
+		let address = Arc::clone(&self.address);
+		core::str::from_utf8(&address)
+			.ok()
+			.and_then(|raw| raw.parse().ok())
+			.map(|parsed| (address, parsed))
+	}
+}
+
+/// Registered hives and the servlet-type index they produce.
+///
+/// The index is derived from each entry's `servlet_types`, so both live
+/// behind one lock and under one owner. A signer check and the insert it
+/// guards run under a single guard, and a type lookup sees hives the map
+/// still holds (CWE-362, CWE-367).
+#[derive(Default)]
+struct Members {
+	hives: HashMap<SharedId, HiveEntry>,
+	by_type: HashMap<SharedId, Vec<SharedId>>,
+}
+
+impl Members {
+	/// Whether `incoming` may claim `hive_id`.
+	///
+	/// A hive with a bound signer accepts re-registration only from that
+	/// signer. An unbound hive accepts any (CWE-639).
+	fn admits_signer(&self, hive_id: &[u8], incoming: Option<&SharedId>) -> bool {
+		let Some(existing) = self.hives.get(hive_id) else {
+			return true;
+		};
+
+		match (&existing.signer_id, incoming) {
+			(Some(bound), Some(candidate)) => bound.as_ref() == candidate.as_ref(),
+			(Some(_), None) => false,
+			(None, _) => true,
+		}
+	}
+
+	/// Replaces any prior registration and reindexes its servlet types.
+	fn insert(&mut self, hive_id: SharedId, entry: HiveEntry) {
+		self.remove(hive_id.as_ref());
+
+		for servlet_type in entry.servlet_types.iter() {
+			self.by_type
+				.entry(Arc::clone(servlet_type))
+				.or_default()
+				.push(Arc::clone(&hive_id));
+		}
+
+		self.hives.insert(hive_id, entry);
+	}
+
+	fn remove(&mut self, hive_id: &[u8]) -> Option<HiveEntry> {
+		let entry = self.hives.remove(hive_id)?;
+		for servlet_type in entry.servlet_types.iter() {
+			let Some(hive_ids) = self.by_type.get_mut(servlet_type) else {
+				continue;
+			};
+
+			hive_ids.retain(|id| id.as_ref() != hive_id);
+			if hive_ids.is_empty() {
+				self.by_type.remove(servlet_type);
+			}
+		}
+
+		Some(entry)
+	}
+
+	fn for_type(&self, servlet_type: &[u8]) -> Vec<HiveEntry> {
+		let Some(hive_ids) = self.by_type.get(servlet_type) else {
+			return Vec::new();
+		};
+
+		hive_ids.iter().filter_map(|id| self.hives.get(id.as_ref()).cloned()).collect()
+	}
+
+	fn signer_for(&self, hive_id: &[u8]) -> Option<SharedId> {
+		self.hives.get(hive_id).and_then(|entry| entry.signer_id.clone())
+	}
+
+	/// Records a heartbeat. `false` when the hive left the registry.
+	fn record_utilization(&mut self, hive_id: &[u8], utilization: BasisPoints) -> bool {
+		let Some(entry) = self.hives.get_mut(hive_id) else {
+			return false;
+		};
+
+		entry.utilization = utilization;
+		entry.last_seen = Instant::now();
+
+		true
+	}
+
+	fn increment_failure(&mut self, hive_id: &[u8]) -> u32 {
+		let Some(entry) = self.hives.get_mut(hive_id) else {
+			return 0;
+		};
+
+		entry.failure_count = entry.failure_count.saturating_add(1);
+		entry.failure_count
+	}
+
+	fn reset_failure(&mut self, hive_id: &[u8]) {
+		if let Some(entry) = self.hives.get_mut(hive_id) {
+			entry.failure_count = 0;
+		}
+	}
+
+	fn touch(&mut self, hive_id: &[u8], utilization: BasisPoints) {
+		if let Some(entry) = self.hives.get_mut(hive_id) {
+			entry.last_seen = Instant::now();
+			entry.utilization = utilization;
+			entry.failure_count = 0;
+		}
+	}
+
+	fn available_servlets(&self) -> Vec<SharedId> {
+		self.by_type.keys().map(Arc::clone).collect()
+	}
+
+	fn all(&self) -> Vec<HiveEntry> {
+		self.hives.values().cloned().collect()
+	}
+
+	fn len(&self) -> usize {
+		self.hives.len()
+	}
+
+	fn stale(&self, now: Instant, timeout: Duration) -> Vec<SharedId> {
+		self.hives
+			.iter()
+			.filter(|(_, entry)| now.duration_since(entry.last_seen) > timeout)
+			.map(|(id, _)| Arc::clone(id))
+			.collect()
+	}
+}
+
 /// Registry of hives with servlet type indexing
 ///
 /// Maintains a mapping of hives and a reverse index from servlet types
 /// to hives that support them. Thread-safe for concurrent access.
 pub struct HiveRegistry {
-	/// Map of hive_id -> HiveEntry
-	hives: RwLock<HashMap<SharedId, HiveEntry>>,
-	/// Reverse index: servlet_type -> Vec<hive_id>
-	servlet_index: RwLock<HashMap<SharedId, Vec<SharedId>>>,
+	members: RwLock<Members>,
 	/// Heartbeat timeout for eviction
 	timeout: Duration,
 }
@@ -46,11 +185,7 @@ pub struct HiveRegistry {
 impl HiveRegistry {
 	/// Create a new registry with the given heartbeat timeout
 	pub fn new(timeout: Duration) -> Self {
-		Self {
-			hives: RwLock::new(HashMap::new()),
-			servlet_index: RwLock::new(HashMap::new()),
-			timeout,
-		}
+		Self { members: RwLock::new(Members::default()), timeout }
 	}
 
 	/// Register a hive and index its servlet types
@@ -76,17 +211,6 @@ impl HiveRegistry {
 	) -> Result<(), ClusterError> {
 		let hive_id: SharedId = request.hive_addr.into();
 
-		{
-			let hives = self.hives.read()?;
-			if let Some(existing) = hives.get(hive_id.as_ref()) {
-				match (&existing.signer_id, &signer_id) {
-					(Some(bound), Some(incoming)) if bound.as_ref() == incoming.as_ref() => {}
-					(Some(_), _) => return Err(ClusterError::SignerMismatch),
-					(None, _) => {}
-				}
-			}
-		}
-
 		// Index by servlet TYPE: instance URNs collapse onto their type
 		// key so work routed by type finds every instance-bearing hive.
 		let mut seen = HashSet::new();
@@ -100,6 +224,7 @@ impl HiveRegistry {
 			.collect();
 
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
+		let signer_id_ref = signer_id.clone();
 
 		let address = Arc::clone(&hive_id);
 		let entry_servlet_types = Arc::clone(&servlet_types);
@@ -113,116 +238,50 @@ impl HiveRegistry {
 			signer_id,
 		};
 
-		self.unregister(&hive_id)?;
-
-		{
-			let mut hives = self.hives.write()?;
-			let hive_id = Arc::clone(&hive_id);
-			hives.insert(hive_id, entry);
+		let mut members = self.members.write()?;
+		if !members.admits_signer(hive_id.as_ref(), signer_id_ref.as_ref()) {
+			return Err(ClusterError::SignerMismatch);
 		}
 
-		{
-			let mut index = self.servlet_index.write()?;
-			for servlet_type in servlet_types.iter() {
-				let servlet_type = Arc::clone(servlet_type);
-				let hive_id = Arc::clone(&hive_id);
-				index.entry(servlet_type).or_default().push(hive_id);
-			}
-		}
-
+		members.insert(hive_id, entry);
 		Ok(())
 	}
 
 	/// Signer bound to `hive_id` at registration, if any
 	pub fn signer_for(&self, hive_id: &[u8]) -> Result<Option<SharedId>, ClusterError> {
-		let hives = self.hives.read()?;
-		Ok(hives.get(hive_id).and_then(|entry| entry.signer_id.clone()))
+		let members = self.members.read()?;
+		Ok(members.signer_for(hive_id))
 	}
 
 	/// Unregister a hive and remove from indices
 	pub fn unregister(&self, hive_id: &[u8]) -> Result<Option<HiveEntry>, ClusterError> {
-		// Remove from hives map (O(1) lookup via Borrow<[u8]>)
-		let entry = {
-			let mut hives = self.hives.write()?;
-			hives.remove(hive_id)
-		};
-
-		// Remove from servlet index
-		if let Some(ref entry) = entry {
-			let mut index = self.servlet_index.write()?;
-			for servlet_type in entry.servlet_types.iter() {
-				if let Some(hive_ids) = index.get_mut(servlet_type) {
-					hive_ids.retain(|id| id.as_ref() != hive_id);
-					if hive_ids.is_empty() {
-						index.remove(servlet_type);
-					}
-				}
-			}
-		}
-
-		Ok(entry)
+		Ok(self.members.write()?.remove(hive_id))
 	}
 
 	/// Find all hives that support a servlet type
 	pub fn hives_for_type(&self, servlet_type: &[u8]) -> Result<Vec<HiveEntry>, ClusterError> {
-		// O(1) lookup via Borrow<[u8]>
-		let index = self.servlet_index.read()?;
-		let hive_ids = match index.get(servlet_type) {
-			Some(ids) => ids.clone(),
-			None => return Ok(Vec::new()),
-		};
-
-		drop(index);
-
-		let hives = self.hives.read()?;
-		let entries: Vec<HiveEntry> = hive_ids.iter().filter_map(|id| hives.get(id.as_ref()).cloned()).collect();
-
-		Ok(entries)
+		Ok(self.members.read()?.for_type(servlet_type))
 	}
 
 	/// Update hive utilization from heartbeat
 	pub fn update_utilization(&self, hive_id: &[u8], utilization: BasisPoints) -> Result<bool, ClusterError> {
-		let mut hives = self.hives.write()?;
-		// O(1) lookup via Borrow<[u8]>
-		if let Some(entry) = hives.get_mut(hive_id) {
-			entry.utilization = utilization;
-			entry.last_seen = Instant::now();
-			Ok(true)
-		} else {
-			Ok(false)
-		}
+		Ok(self.members.write()?.record_utilization(hive_id, utilization))
 	}
 
 	/// Increment failure count for a hive, returning the new count
 	pub fn increment_failure(&self, hive_id: &[u8]) -> Result<u32, ClusterError> {
-		let mut hives = self.hives.write()?;
-		if let Some(entry) = hives.get_mut(hive_id) {
-			entry.failure_count = entry.failure_count.saturating_add(1);
-			Ok(entry.failure_count)
-		} else {
-			Ok(0)
-		}
+		Ok(self.members.write()?.increment_failure(hive_id))
 	}
 
 	/// Reset failure count for a hive
 	pub fn reset_failure(&self, hive_id: &[u8]) -> Result<(), ClusterError> {
-		let mut hives = self.hives.write()?;
-		if let Some(entry) = hives.get_mut(hive_id) {
-			entry.failure_count = 0;
-		}
-
+		self.members.write()?.reset_failure(hive_id);
 		Ok(())
 	}
 
 	/// Touch a hive: update last_seen, utilization, and reset failure count
 	pub fn touch(&self, hive_id: &[u8], utilization: BasisPoints) -> Result<(), ClusterError> {
-		let mut hives = self.hives.write()?;
-		if let Some(entry) = hives.get_mut(hive_id) {
-			entry.last_seen = Instant::now();
-			entry.utilization = utilization;
-			entry.failure_count = 0;
-		}
-
+		self.members.write()?.touch(hive_id, utilization);
 		Ok(())
 	}
 
@@ -232,41 +291,29 @@ impl HiveRegistry {
 	/// (e.g. servlet registry rows) for each evicted hive.
 	pub fn evict_stale(&self) -> Result<Vec<HiveEntry>, ClusterError> {
 		let now = Instant::now();
-		let stale_ids: Vec<SharedId> = {
-			let hives = self.hives.read()?;
-			hives
-				.iter()
-				.filter(|(_, entry)| now.duration_since(entry.last_seen) > self.timeout)
-				.map(|(id, _)| Arc::clone(id))
-				.collect()
-		};
+		let mut members = self.members.write()?;
 
-		let mut evicted = Vec::with_capacity(stale_ids.len());
-		for id in &stale_ids {
-			if let Some(entry) = self.unregister(id)? {
-				evicted.push(entry);
-			}
-		}
-
+		let stale_ids = members.stale(now, self.timeout);
+		let evicted = stale_ids.iter().filter_map(|id| members.remove(id.as_ref())).collect();
 		Ok(evicted)
 	}
 
 	/// List all available servlet types across all registered hives
 	pub fn to_available_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
-		let index = self.servlet_index.read()?;
-		Ok(index.keys().map(Arc::clone).collect())
+		let members = self.members.read()?;
+		Ok(members.available_servlets())
 	}
 
 	/// Get a snapshot of all registered hives
 	pub fn all_hives(&self) -> Result<Vec<HiveEntry>, ClusterError> {
-		let hives = self.hives.read()?;
-		Ok(hives.values().cloned().collect())
+		let members = self.members.read()?;
+		Ok(members.all())
 	}
 
 	/// Count the number of registered hives
 	pub fn len(&self) -> Result<usize, ClusterError> {
-		let hives = self.hives.read()?;
-		Ok(hives.len())
+		let members = self.members.read()?;
+		Ok(members.len())
 	}
 
 	/// Check if the registry is empty
@@ -316,7 +363,6 @@ mod tests {
 		let hives = registry.hives_for_type(&type_key("ping"))?;
 		assert_eq!(hives.len(), 1);
 		assert_eq!(hives[0].servlet_types.len(), 1);
-
 		Ok(())
 	}
 
@@ -391,6 +437,51 @@ mod tests {
 			assert_eq!(bound.as_deref(), case.bound_after);
 		}
 
+		Ok(())
+	}
+
+	/// Two signers race to claim one hive id. Exactly one binds, because the
+	/// check and the insert share a guard (CWE-639).
+	#[test]
+	fn concurrent_registration_binds_one_signer() -> Result<(), ClusterError> {
+		use std::thread;
+
+		let contested = b"hive-contested";
+		for _ in 0..2_000 {
+			let registry = Arc::new(HiveRegistry::default());
+			let first: SharedId = Arc::from(b"signer-one".as_slice());
+			let second: SharedId = Arc::from(b"signer-two".as_slice());
+
+			let one = Arc::clone(&registry);
+			let one_signer = Arc::clone(&first);
+			let left = thread::spawn(move || one.register_with_signer(request(contested, &["echo"]), Some(one_signer)));
+
+			let two = Arc::clone(&registry);
+			let two_signer = Arc::clone(&second);
+			let right =
+				thread::spawn(move || two.register_with_signer(request(contested, &["echo"]), Some(two_signer)));
+
+			let outcomes = [left.join().expect("thread joins"), right.join().expect("thread joins")];
+			let accepted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+			assert_eq!(accepted, 1);
+
+			let bound = registry.signer_for(contested)?.expect("the winner bound a signer");
+			assert!(bound.as_ref() == first.as_ref() || bound.as_ref() == second.as_ref());
+		}
+
+		Ok(())
+	}
+
+	/// Removing a hive drops it from the type index in the same guard, so a
+	/// lookup names the hives the map holds.
+	#[test]
+	fn unregister_clears_the_type_index() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::default();
+		registry.register(request(b"hive-a", &["echo"]))?;
+		registry.unregister(b"hive-a")?;
+
+		assert!(registry.hives_for_type(&type_key("echo"))?.is_empty());
+		assert!(registry.to_available_servlets()?.is_empty());
 		Ok(())
 	}
 }

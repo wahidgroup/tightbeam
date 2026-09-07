@@ -8,8 +8,8 @@ use rand_core::CryptoRng;
 /// Adapts a `&mut dyn CryptoRngCore` to the `Sized` `CryptoRng + RngCore`
 /// bounds required by generic constructors such as `SecretKey::random`.
 ///
-/// A `dyn` RNG is unsized, so it cannot satisfy `impl CryptoRngCore` bounds
-/// directly. This wrapper forwards every method to the underlying trait object,
+/// A `dyn` RNG is unsized, so `impl CryptoRngCore` bounds take this sized
+/// wrapper. It forwards every method to the underlying trait object,
 /// letting callers inject their own CSPRNG.
 #[cfg(any(feature = "ecies", feature = "transport-cms"))]
 pub(crate) struct RngWrapper<'a>(pub(crate) &'a mut dyn CryptoRngCore);
@@ -59,7 +59,7 @@ pub fn generate_nonce<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Re
 		&mut rand_core::OsRng
 	};
 
-	rng.fill_bytes(&mut nonce);
+	rng.try_fill_bytes(&mut nonce)?;
 
 	Ok(nonce)
 }
@@ -88,7 +88,8 @@ pub fn generate_random_bytes(bytes: &mut [u8], rng: Option<&mut dyn RngCore>) ->
 		&mut rand_core::OsRng
 	};
 
-	rng.fill_bytes(bytes);
+	rng.try_fill_bytes(bytes)?;
+
 	Ok(())
 }
 

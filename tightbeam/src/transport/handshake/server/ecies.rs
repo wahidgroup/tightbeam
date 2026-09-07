@@ -59,6 +59,7 @@ use crate::transport::handshake::{
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
+use crate::ZeroizingArray;
 use crate::ZeroizingBytes;
 
 /// Server-side ECIES handshake orchestrator.
@@ -79,7 +80,7 @@ where
 	server_cert: Arc<Certificate>,
 	client_random: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
-	base_session_key: Option<[u8; 32]>,
+	base_session_key: Option<ZeroizingArray<32>>,
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: Option<&'static [u8]>,
 	supported_profiles: Vec<SecurityProfileDesc>,
@@ -103,7 +104,7 @@ where
 /// material, the anti-replay random, and the client's receipt
 /// countersignature (absent for unmetered sessions).
 struct SessionPayload {
-	base_session_key: [u8; 32],
+	base_session_key: ZeroizingArray<32>,
 	client_random: [u8; 32],
 	/// Client receipt `SignerInfo`. Its signed attributes bind the
 	/// bearer settlement answer, so it arrives only through this
@@ -400,7 +401,8 @@ where
 		salt[32..].copy_from_slice(server_random);
 
 		let salt_bytes = salt.as_slice();
-		let session_ciphers = self.derive_directional_aead(base_session_key, salt_bytes)?;
+		let input_key_material = base_session_key.as_slice();
+		let session_ciphers = self.derive_directional_aead(input_key_material, salt_bytes)?;
 		self.invariants.derive_aead_once()?;
 
 		// 4. Derive the epoch-0 rekey materials alongside the traffic
@@ -408,7 +410,8 @@ where
 		// renewal later chains from this secret without touching the
 		// handshake again
 		if let Some(transcript_hash) = self.transcript_hash {
-			let materials = derive_epoch_materials::<P>(base_session_key, salt_bytes, transcript_hash)?;
+			let input_key_material = base_session_key.as_slice();
+			let materials = derive_epoch_materials::<P>(input_key_material, salt_bytes, transcript_hash)?;
 			self.epoch_materials = Some(materials);
 		}
 
@@ -480,7 +483,7 @@ where
 			client_cert_required: self.client_validators.is_some(),
 			transport_accept,
 			// Dual ownership by design: this copy is DER-encoded onto
-			// the wire and dropped; the retained artifact absorbs the
+			// the wire and dropped. The retained artifact absorbs the
 			// client SignerInfo at settlement.
 			session_receipt: self.receipt_artifact.clone(),
 		};
@@ -550,7 +553,7 @@ where
 			return Err(HandshakeError::InvalidDecryptedPayloadSize);
 		}
 
-		let mut base_session_key = [0u8; 32];
+		let mut base_session_key = ZeroizingArray::new([0u8; 32]);
 		let mut client_random = [0u8; 32];
 		base_session_key.copy_from_slice(base_key_bytes);
 		client_random.copy_from_slice(random_bytes);
@@ -579,8 +582,8 @@ where
 	/// Every validator MUST pass before the possession check, and only
 	/// then is the identity stored. When validators are absent
 	/// (server-auth only), the session stays anonymous: an offered
-	/// certificate is discarded and never reaches
-	/// [`SessionContext`](crate::policy::SessionContext).
+	/// certificate is discarded, and
+	/// [`SessionContext`](crate::policy::SessionContext) reports no peer.
 	#[cfg(feature = "x509")]
 	fn validate_client_certificate(&mut self, client_kex: &mut ClientKeyExchange) -> Result<(), HandshakeError>
 	where
@@ -594,7 +597,7 @@ where
 			(None, Some(_)) => return Err(HandshakeError::MissingClientCertificate),
 			(None, None) => return Ok(()),
 			// Server-auth only: discard offered identity so authorization
-			// paths cannot key off an unvalidated certificate.
+			// paths key off a validated certificate alone.
 			(Some(_), None) => {
 				let _ = client_kex.client_signature.take();
 				return Ok(());
@@ -603,13 +606,13 @@ where
 		};
 
 		// Chain validation runs before the possession check, so a
-		// certificate refused by any validator is never captured.
+		// certificate reaches capture once every validator accepts it.
 		for validator in validators.iter() {
 			validator.evaluate(&client_cert)?;
 		}
 
 		// Verify client signature over the bound auth digest so capture
-		// never records an identity the peer cannot sign for.
+		// records an identity the peer proved possession of.
 		let client_signature = client_kex
 			.client_signature
 			.as_ref()
@@ -619,7 +622,7 @@ where
 
 		// Recompute the digest the client signed: transcript hash bound to
 		// this exact encrypted payload and this exact certificate,
-		// so the signature cannot be spliced from another exchange.
+		// so the signature binds to this exchange alone.
 		let cert_der = client_cert.to_der()?;
 		let auth_digest =
 			compute_client_auth_digest::<P::Digest>(&transcript_hash, client_kex.encrypted_data.as_bytes(), &cert_der)?;
@@ -631,7 +634,7 @@ where
 		let verifying_key = P::VerifyingKey::from(&public_key);
 		verifying_key.verify_prehash(&auth_digest, &signature)?;
 
-		// Storing the certificate locks the captured identity; this is
+		// Storing the certificate locks the captured identity. This is
 		// the only write after construction.
 		self.validated_client_cert = Some(Arc::new(client_cert));
 
@@ -640,10 +643,9 @@ where
 
 	/// Verify the client's receipt countersignature and settle with the
 	/// authorizer.
-	///
-	/// Does nothing when no receipt was issued. Otherwise fails closed:
-	/// a missing or invalid countersignature aborts the handshake, and a
-	/// settle refusal aborts with the application code. The completed
+	/// A handshake that issued no receipt completes here. An issued receipt
+	/// fails closed: a missing or invalid countersignature aborts the
+	/// handshake, and a [`StoredReceipt`] is retained once both hold.
 	/// [`StoredReceipt`] is retained only after both.
 	#[cfg(feature = "x509")]
 	async fn process_receipt_ack(&mut self, receipt_ack: Option<SignerInfo>) -> Result<(), HandshakeError>
@@ -687,7 +689,7 @@ where
 		// outcome even when the SignerInfo folds into the artifact.
 		let countersignature = receipt_ack.as_ref().map(SignerInfo::to_der).transpose()?;
 
-		// A verified countersignature completes the artifact; a failed
+		// A verified countersignature completes the artifact. A failed
 		// one stays out of it but its DER remains in the outcome as
 		// evidence.
 		let artifact = match (verdict, receipt_ack) {
@@ -1006,7 +1008,7 @@ mod tests {
 	}
 
 	/// A validator-less server also discards an offered identity with a
-	/// forged possession signature; the handshake still completes as
+	/// forged possession signature. The handshake still completes as
 	/// anonymous server-auth.
 	#[tokio::test]
 	async fn test_validatorless_server_discards_forged_offered_identity() -> Result<(), Box<dyn Error>> {
@@ -1030,7 +1032,6 @@ mod tests {
 	#[test]
 	fn test_payload_parse_recovers_session_data() -> Result<(), Box<dyn Error>> {
 		let server = TestEciesServerBuilder::new().build()?;
-
 		let unanswered = EciesSessionPayload {
 			base_key: OctetString::new([3u8; 32])?,
 			client_random: OctetString::new([5u8; 32])?,
@@ -1038,7 +1039,7 @@ mod tests {
 		};
 
 		let payload = server.extract_session_data_from_payload(&unanswered.to_der()?)?;
-		assert_eq!(payload.base_session_key, [3u8; 32]);
+		assert_eq!(payload.base_session_key.as_slice(), [3u8; 32]);
 		assert_eq!(payload.client_random, [5u8; 32]);
 		assert!(payload.receipt_ack.is_none());
 

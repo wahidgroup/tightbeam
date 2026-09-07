@@ -2,23 +2,22 @@
 
 use core::sync::atomic::{AtomicU16, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
 use crate::colony::common::{
-	canonical_bytes, reply_frame, reply_frame_with_priority, ClusterCommand, ClusterCommandResponse,
+	canonical_bytes, reply_frame, reply_frame_with_priority, ClusterCommand, ClusterCommandResponse, DrainMode,
 };
-use crate::colony::hive::runtime::{insert_instance, remove_instance, servlet_slate, HiveContextImpl};
+use crate::colony::hive::runtime::{HiveContextImpl, HiveInstances};
 use crate::colony::hive::{
 	BackpressureGate, HashMapRegistry, HiveManagementRequest, HiveManagementResponse, ServletRegistration,
 	ServletRegistry, SpawnerFn,
 };
 use crate::colony::servlet::servlet_runtime::rt;
-use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::decode;
 use crate::macros::server::{into_shared_session_handler, serve_connection, AcceptedConnection};
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
+use crate::transport::accept::AcceptPlane;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::MuxCapable;
 use crate::transport::policy::PolicyConfig;
@@ -33,6 +32,36 @@ use crate::colony::hive::{ClusterCircuitBreaker, ClusterSecurityGate, ReplayGuar
 use crate::crypto::x509::store::CertificateTrust;
 
 /// Shared state for hive control-plane request handling.
+/// Commands currently being handled.
+///
+/// A drain waits on this: a control connection idles between commands by
+/// design, so an open connection counts as work only while it holds a
+/// command.
+#[derive(Clone, Default)]
+pub struct InFlight(Arc<core::sync::atomic::AtomicUsize>);
+
+impl InFlight {
+	/// Counts one command for as long as the returned guard lives.
+	pub fn enter(&self) -> InFlightGuard {
+		self.0.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+		InFlightGuard(Arc::clone(&self.0))
+	}
+
+	/// Whether no command is currently being handled.
+	pub fn is_idle(&self) -> bool {
+		self.0.load(core::sync::atomic::Ordering::Acquire) == 0
+	}
+}
+
+/// Releases its count on drop, so an early return still settles the drain.
+pub struct InFlightGuard(Arc<core::sync::atomic::AtomicUsize>);
+
+impl Drop for InFlightGuard {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+	}
+}
+
 pub struct HiveControlCtx<P: Protocol> {
 	/// Registry of running servlet instances keyed by instance URN bytes.
 	pub servlets: Arc<HashMapRegistry>,
@@ -42,10 +71,12 @@ pub struct HiveControlCtx<P: Protocol> {
 	pub trace: Arc<TraceCollector>,
 	/// Hive-wide utilization in basis points for heartbeats and backpressure.
 	pub utilization: Arc<AtomicU16>,
-	/// Per-instance utilization cache when a servlet does not self-report.
+	/// Per-instance utilization cache for a servlet that reports none.
 	pub utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
-	/// Instant when drain began; `Some` refuses non-heartbeat manage commands.
-	pub draining_since: Arc<RwLock<Option<Instant>>>,
+	/// Drain state. Draining refuses every manage command but the heartbeat.
+	pub drain: DrainMode,
+	/// Commands in flight, which a drain waits to reach zero.
+	pub in_flight: InFlight,
 	/// Intra-hive routing context updated as instances are inserted or removed.
 	pub hive_context: Arc<HiveContextImpl<P>>,
 	/// Utilization threshold that trips [`BackpressureGate`] on manage traffic.
@@ -61,12 +92,7 @@ pub struct HiveControlCtx<P: Protocol> {
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 }
 
-/// Spawn the hive control accept loop that dispatches [`handle_command`].
-pub fn spawn_control_server<P>(
-	listener: P::Listener,
-	mux_offer: Option<Arc<TransportOffer>>,
-	ctx: HiveControlCtx<P>,
-) -> rt::JoinHandle
+impl<P> HiveControlCtx<P>
 where
 	P: Protocol + Send + Sync + 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
@@ -74,111 +100,106 @@ where
 	P::Address: Clone + Send + Sync + 'static,
 	P::Transport: Send + Sync + 'static,
 {
-	let ctx = Arc::new(ctx);
-	let handler = into_shared_session_handler(move |frame: Frame, session| {
-		let ctx = Arc::clone(&ctx);
-		async move { handle_command(frame, session, ctx).await }
-	});
+	/// Serves the hive control plane on `listener`.
+	///
+	/// Each accepted connection dispatches through
+	/// [`HiveControlCtx::handle_command`] against this context.
+	pub fn serve(self, listener: P::Listener, mux_offer: Option<Arc<TransportOffer>>) -> rt::JoinHandle {
+		let ctx = Arc::new(self);
+		let handler = into_shared_session_handler(move |frame: Frame, session| {
+			let ctx = Arc::clone(&ctx);
+			async move { ctx.handle_command(frame, session).await }
+		});
 
-	rt::spawn(async move {
-		let permits = Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_SERVER_CONNECTIONS));
-		loop {
-			let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-				break;
-			};
+		rt::spawn(AcceptPlane::default().accept_on(
+			listener,
+			move |mut transport: <P::Listener as Protocol>::Transport| {
+				// Share the mux offer with each accepted control connection.
+				transport = transport.with_mux_offer(mux_offer.clone());
 
-			match listener.accept().await {
-				Ok((mut transport, _addr)) => {
-					// Share the mux offer with each accepted control connection.
-					transport = transport.with_mux_offer(mux_offer.clone());
-
-					let handler = Arc::clone(&handler);
-					rt::spawn(async move {
-						let _permit = permit;
-						serve_connection(transport, handler, None, None).await;
-					});
-				}
-				Err(_) => break,
-			}
-		}
-	})
+				let handler = Arc::clone(&handler);
+				async move { serve_connection(transport, handler, None, None).await }
+			},
+		))
+	}
 }
 
-/// Authenticate, gate, and dispatch one cluster command frame.
-pub async fn handle_command<P>(
-	frame: Frame,
-	session: SessionContext,
-	ctx: Arc<HiveControlCtx<P>>,
-) -> Result<Option<Frame>, TightBeamError>
+impl<P> HiveControlCtx<P>
 where
 	P: Protocol + Send + Sync + 'static,
 	P::Transport: Send + Sync + 'static,
 {
-	let is_heartbeat = decode::<ClusterCommand>(&frame.message)
-		.map(|cmd| cmd.heartbeat.is_some())
-		.unwrap_or(false);
+	/// Authenticate, gate, and dispatch one cluster command frame.
+	pub async fn handle_command(
+		self: Arc<Self>,
+		frame: Frame,
+		session: SessionContext,
+	) -> Result<Option<Frame>, TightBeamError> {
+		let ctx = self;
+		let _in_flight = ctx.in_flight.enter();
 
-	// Security gate runs before drain so unauthenticated peers cannot probe draining.
-	#[cfg(feature = "x509")]
-	if let Some(reply) = security_gate_reply(&frame, &session, &ctx, is_heartbeat)? {
-		return Ok(Some(reply));
-	}
+		let is_heartbeat = decode::<ClusterCommand>(&frame.message)
+			.map(|cmd| cmd.heartbeat.is_some())
+			.unwrap_or(false);
 
-	// Refuse non-heartbeat manage while draining; reply in the manage CHOICE shape.
-	let is_draining = ctx.draining_since.read().map(|g| g.is_some()).unwrap_or(false);
-	if is_draining && !is_heartbeat {
-		return reply_frame(
-			&frame.metadata.id,
-			ClusterCommandResponse::manage(HiveManagementResponse::stop_err(TransitStatus::Unavailable)),
-		);
-	}
-
-	// Authenticated heartbeats skip backpressure so health checks survive load.
-	// Exemption is after the security gate so unauthenticated peers get no bypass.
-	if !is_heartbeat {
-		if let Some(reply) = backpressure_reply(&frame, &session, &ctx)? {
+		// Security gate runs before drain so drain state answers authenticated peers.
+		#[cfg(feature = "x509")]
+		if let Some(reply) = security_gate_reply(&frame, &session, &ctx, is_heartbeat)? {
 			return Ok(Some(reply));
 		}
+
+		// Refuse non-heartbeat manage while draining, in the manage CHOICE shape.
+		if ctx.drain.is_draining() && !is_heartbeat {
+			return reply_frame(
+				&frame.metadata.id,
+				ClusterCommandResponse::manage(HiveManagementResponse::stop_err(TransitStatus::Unavailable)),
+			);
+		}
+
+		// Authenticated heartbeats skip backpressure so health checks survive load.
+		// Exemption is after the security gate so unauthenticated peers get no bypass.
+		if !is_heartbeat {
+			if let Some(reply) = backpressure_reply(&frame, &session, &ctx)? {
+				return Ok(Some(reply));
+			}
+		}
+
+		let Ok(cmd) = decode::<ClusterCommand>(&frame.message) else {
+			return Ok(None);
+		};
+
+		if cmd.heartbeat.is_some() {
+			return heartbeat_reply(&frame, &ctx);
+		}
+
+		if let Some(manage) = cmd.manage {
+			return ctx.handle_manage(frame, manage).await;
+		}
+
+		Ok(None)
 	}
 
-	let Ok(cmd) = decode::<ClusterCommand>(&frame.message) else {
-		return Ok(None);
-	};
+	/// Spawn, list, or stop servlets for one management request.
+	pub async fn handle_manage(
+		self: Arc<Self>,
+		frame: Frame,
+		request: HiveManagementRequest,
+	) -> Result<Option<Frame>, TightBeamError> {
+		let ctx = self;
+		if let Some(spawn) = request.spawn {
+			return manage_spawn(frame, spawn.servlet_type, ctx).await;
+		}
 
-	if cmd.heartbeat.is_some() {
-		return heartbeat_reply(&frame, &ctx);
+		if request.list.is_some() {
+			return manage_list(&frame, &ctx);
+		}
+
+		if let Some(stop) = request.stop {
+			return manage_stop(frame, stop.servlet_id, ctx);
+		}
+
+		Ok(None)
 	}
-
-	if let Some(manage) = cmd.manage {
-		return handle_manage(frame, manage, ctx).await;
-	}
-
-	Ok(None)
-}
-
-/// Spawn, list, or stop servlets for one management request.
-pub async fn handle_manage<P>(
-	frame: Frame,
-	request: HiveManagementRequest,
-	ctx: Arc<HiveControlCtx<P>>,
-) -> Result<Option<Frame>, TightBeamError>
-where
-	P: Protocol + Send + Sync + 'static,
-	P::Transport: Send + Sync + 'static,
-{
-	if let Some(spawn) = request.spawn {
-		return manage_spawn(frame, spawn.servlet_type, ctx).await;
-	}
-
-	if request.list.is_some() {
-		return manage_list(&frame, &ctx);
-	}
-
-	if let Some(stop) = request.stop {
-		return manage_stop(frame, stop.servlet_id, ctx);
-	}
-
-	Ok(None)
 }
 
 #[cfg(feature = "x509")]
@@ -287,7 +308,8 @@ where
 	};
 
 	let registration = ServletRegistration { servlet: new_servlet, spawner: Arc::clone(spawner), servlet_type };
-	let Ok((instance, addr_bytes)) = insert_instance(&*ctx.servlets, &*ctx.hive_context, registration) else {
+	let instances = HiveInstances::new(&ctx.servlets, &ctx.hive_context);
+	let Ok((instance, addr_bytes)) = instances.insert(registration) else {
 		return spawn_denied();
 	};
 
@@ -303,7 +325,7 @@ fn manage_list<P>(frame: &Frame, ctx: &HiveControlCtx<P>) -> Result<Option<Frame
 where
 	P: Protocol,
 {
-	let list = servlet_slate(&*ctx.servlets);
+	let list = ctx.servlets.slate();
 	reply_frame(
 		&frame.metadata.id,
 		ClusterCommandResponse::manage(HiveManagementResponse::list_ok(list)),
@@ -319,7 +341,8 @@ where
 	P: Protocol,
 {
 	let id_bytes = canonical_bytes(&servlet_id);
-	if remove_instance(&*ctx.servlets, &*ctx.hive_context, &id_bytes).is_some() {
+	let instances = HiveInstances::new(&ctx.servlets, &ctx.hive_context);
+	if instances.remove(&id_bytes).is_some() {
 		return reply_frame(
 			&frame.metadata.id,
 			ClusterCommandResponse::manage(HiveManagementResponse::stop_ok()),

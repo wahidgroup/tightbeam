@@ -146,8 +146,7 @@ mod tests {
 		value: u64,
 	}
 
-	// Every public arm is invoked here so broken expansions fail `cargo test`
-	// instead of surviving until a consumer expands them.
+	// Every public arm expands here, so a broken arm fails `cargo test`.
 	policy! {
 		GatePolicy: TestGateBusy |_frame| {
 			TransitStatus::ResourceExhausted
@@ -181,13 +180,13 @@ mod tests {
 			TransitStatus::Ok
 		}
 		RestartPolicy: TestRestart |frame, _failure, _attempt| {
-			RetryAction::Retry(frame)
+			RetryAction::Retry { frame, delay: core::time::Duration::ZERO }
 		}
 		RestartPolicy: TestRestartMaxOnly (2) |frame, _failure, _attempt| {
-			RetryAction::Retry(frame)
+			RetryAction::Retry { frame, delay: core::time::Duration::ZERO }
 		}
 		RestartPolicy: TestRestartConfigured (3, 250) |frame, _failure, _attempt| {
-			RetryAction::Retry(frame)
+			RetryAction::Retry { frame, delay: core::time::Duration::ZERO }
 		}
 	}
 
