@@ -757,7 +757,8 @@ mod tests {
 		use crate::builder::TypeBuilder;
 
 		// V2: priority is a V2+ metadata field
-		let mut builder = crate::utils::compose(crate::Version::V2)
+		let mut builder = crate::Version::V2
+			.compose()
 			.with_id(b"work")
 			.with_order(0)
 			.with_message(crate::testing::TestMessage { content: "payload".into() });
@@ -907,7 +908,8 @@ mod tests {
 		let certificate = crate::testing::utils::create_test_certificate(&signing_key);
 		let provider = crate::crypto::key::EcdsaKeyProvider::from(signing_key.clone());
 
-		let unsigned = crate::utils::compose(crate::Version::V2)
+		let unsigned = crate::Version::V2
+			.compose()
 			.with_id(b"control")
 			.with_order(current_timestamp_ms())
 			.with_message(crate::testing::TestMessage { content: "payload".into() })
@@ -916,12 +918,8 @@ mod tests {
 		let signed = unsigned
 			.sign_with_provider::<crate::crypto::hash::Sha3_256, _>(&provider)
 			.await?;
-		let signer_id = signed
-			.nonrepudiation
-			.as_ref()
-			.and_then(|info| crate::der::Encode::to_der(&info.sid).ok())
-			.expect("the signed frame carries a signer id");
 
+		let signer_id = signed.signer_id().expect("the signed frame carries a signer id");
 		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 60_000));
 		let gate = ClusterSecurityGate::new(
 			Arc::clone(&breaker),

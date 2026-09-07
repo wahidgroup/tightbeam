@@ -132,7 +132,7 @@ tb_scenario! {
 
 			// One learned route keyed by the advertised type, exposing the
 			// claimed dial path and the signer fingerprint.
-			let ping_canonical = type_canonical_bytes(&servlet_urn("ping"));
+			let ping_canonical = servlet_urn("ping").type_canonical_bytes();
 			let routes = cluster.peer_routes();
 			let exposed = routes.len() == 1
 				&& routes.first().is_some_and(|route| {
@@ -182,8 +182,8 @@ tb_scenario! {
 			peers.sort_unstable();
 
 			let mut expected: Vec<std::sync::Arc<[u8]>> = vec![
-				std::sync::Arc::from(type_canonical_bytes(&servlet_urn("ping"))),
-				std::sync::Arc::from(type_canonical_bytes(&servlet_urn("echo"))),
+				std::sync::Arc::from(servlet_urn("ping").type_canonical_bytes()),
+				std::sync::Arc::from(servlet_urn("echo").type_canonical_bytes()),
 			];
 			expected.sort_unstable();
 
@@ -266,7 +266,7 @@ tb_scenario! {
 			let survivors = cluster.peer_servlets();
 			trace.event_with(PEER_ROUTES_AFTER_WITHDRAWAL, &[], survivors.len() as u64)?;
 
-			let ping_type = type_canonical_bytes(&servlet_urn("ping"));
+			let ping_type = servlet_urn("ping").type_canonical_bytes();
 			trace.event_with(
 				PEER_PING_LIVE_AFTER_WITHDRAWAL,
 				&[],
@@ -400,7 +400,7 @@ tb_scenario! {
 				&mut client,
 				&hive_id.key,
 				b"del-conflict",
-				servlet_address_update(hive_addr, vec![], vec![servlet_instance(&servlet_urn("ping"), locator.as_ref())]),
+				servlet_address_update(hive_addr, vec![], vec![servlet_urn("ping").servlet_instance(locator.as_ref())]),
 			)
 			.await?;
 
@@ -914,7 +914,7 @@ tb_scenario! {
 			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], learned.len() as u64)?;
 
-			let ping_canonical = type_canonical_bytes(&servlet_urn("ping"));
+			let ping_canonical = servlet_urn("ping").type_canonical_bytes();
 			let keyed = learned
 				.first()
 				.is_some_and(|learned_type| learned_type.as_ref() == ping_canonical.as_slice());

@@ -1,6 +1,11 @@
 use core::time::Duration;
+use std::sync::Arc;
 
+use crate::colony::cluster::registry::SharedId;
+use crate::colony::cluster::servlet_registry::entry::ServletEntry;
+use crate::colony::common::ServletInfo;
 use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
+use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 
 /// Default decay per evaporation cycle in basis points (1000 = 10%).
@@ -31,6 +36,52 @@ pub struct PheromoneConfig {
 	pub reinforcement_boost: u64,
 	/// Pheromone penalty on a failed request.
 	pub weakening_penalty: u64,
+}
+
+impl PheromoneConfig {
+	/// Route entries for one hive's advertised servlets.
+	///
+	/// Every entry starts on this colony's pheromone level and abandonment
+	/// limit, so a freshly registered route competes on the same terms as
+	/// the routes already in the registry.
+	pub(crate) fn servlet_slate(&self, servlets: &[ServletInfo], hive_addr: &SharedId) -> Vec<ServletEntry> {
+		servlets
+			.iter()
+			.map(|info| {
+				ServletEntry::new(
+					Arc::from(info.address.as_slice()),
+					Arc::from(info.servlet_id.type_canonical_bytes().as_slice()),
+					Arc::clone(hive_addr),
+					self.initial_pheromone,
+					self.abandonment_limit,
+				)
+			})
+			.collect()
+	}
+
+	/// Peer-routed slate keyed by `peer_hive_id` NUL type.
+	///
+	/// `dial` is the claimed gateway socket stored on every entry, so every
+	/// type this peer advertises resolves to the one gateway that owns it.
+	pub(crate) fn peer_slate(
+		&self,
+		peer_hive_id: &SharedId,
+		dial: SharedId,
+		types: &[Urn<'static>],
+	) -> Vec<ServletEntry> {
+		types
+			.iter()
+			.map(|urn| {
+				ServletEntry::peer(
+					Arc::clone(peer_hive_id),
+					Arc::from(urn.type_canonical_bytes().as_slice()),
+					Arc::clone(&dial),
+					self.initial_pheromone,
+					self.abandonment_limit,
+				)
+			})
+			.collect()
+	}
 }
 
 impl Default for PheromoneConfig {

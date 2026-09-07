@@ -189,7 +189,7 @@ impl SessionContext {
 	}
 
 	/// Session bound to `certificate` as its authenticated peer.
-	#[cfg(test)]
+	#[cfg(all(test, feature = "colony"))]
 	pub(crate) fn for_peer(certificate: Arc<Certificate>) -> Self {
 		let peer_public_key = spki_der(&certificate);
 		Self { peer_certificate: Some(certificate), peer_public_key, session_receipt: None }
@@ -226,14 +226,18 @@ impl<'a> ProvenPeer<'a> {
 	/// The shared identity of every caller a transport left unauthenticated.
 	pub const ANONYMOUS: Self = Self(b"anonymous-peer");
 
-	/// Key bytes for the identity, readable inside the crate that mints it.
+	/// Key bytes for the identity.
+	///
+	/// A gate keys its per-identity state on these bytes. They come from
+	/// the transport handshake, so a sender cannot pick which budget its
+	/// frames are counted against.
 	#[must_use]
-	pub(crate) fn as_key(&self) -> &'a [u8] {
+	pub fn as_key(&self) -> &'a [u8] {
 		self.0
 	}
 
 	/// Mint an identity for a test that stands in for a handshake.
-	#[cfg(test)]
+	#[cfg(all(test, feature = "colony"))]
 	pub(crate) fn for_test(key: &'a [u8]) -> Self {
 		Self(key)
 	}

@@ -476,11 +476,9 @@ impl TBSpec for BuiltAssertSpec {
 impl BuiltAssertSpec {
 	/// Check schedulability assertion
 	fn check_schedulability(assertion: &SchedulabilityAssertion) -> Result<(), SpecViolation> {
-		use crate::testing::schedulability::{is_edf_schedulable, is_rm_schedulable};
-
 		let result = match assertion.task_set.scheduler {
-			SchedulerType::RateMonotonic => is_rm_schedulable(&assertion.task_set),
-			SchedulerType::EarliestDeadlineFirst => is_edf_schedulable(&assertion.task_set),
+			SchedulerType::RateMonotonic => assertion.task_set.is_rm_schedulable(),
+			SchedulerType::EarliestDeadlineFirst => assertion.task_set.is_edf_schedulable(),
 		};
 
 		match result {

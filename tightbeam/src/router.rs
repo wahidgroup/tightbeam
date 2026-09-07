@@ -40,29 +40,6 @@ crate::impl_error_display!(RouterError {
 
 crate::impl_from!(crate::der::Error => RouterError::DecodeFailed);
 
-/// Reject frames whose body cannot be type-validated at routing time.
-///
-/// The router is strictly cleartext: an encrypted or compressed body
-/// cannot be decoded as the dispatched type, so validation would be
-/// impossible and misdelivery silent. Decrypt/inflate upstream, then
-/// route. Hand-written [`RouterPolicy`] impls MUST call this before
-/// decoding.
-///
-/// # Errors
-///
-/// - [`RouterError::ConfidentialFrame`] -- `metadata.confidentiality` is set.
-/// - [`RouterError::CompressedFrame`] -- `metadata.compactness` is set.
-pub fn ensure_cleartext(frame: &Frame) -> Result<()> {
-	if frame.metadata.confidentiality.is_some() {
-		return Err(RouterError::ConfidentialFrame);
-	}
-	if frame.metadata.compactness.is_some() {
-		return Err(RouterError::CompressedFrame);
-	}
-
-	Ok(())
-}
-
 pub trait RouterPolicy: Send + Sync {
 	/// Route `frame` to the handler registered for message type `T`,
 	/// delivering the body decoded as `T`.
@@ -71,7 +48,7 @@ pub trait RouterPolicy: Send + Sync {
 	/// typed value to the handler, so a mismatched turbofish fails
 	/// loudly at the dispatch site instead of silently delivering
 	/// foreign bytes. Opaque payloads are rejected before any decode
-	/// attempt (see [`ensure_cleartext`]).
+	/// attempt (see [`Frame::ensure_cleartext`]).
 	///
 	/// Residual: two DER-structurally-identical types still cross-decode
 	/// (the wire format carries no type discriminator by design -- the
@@ -84,7 +61,24 @@ pub trait RouterPolicy: Send + Sync {
 	/// - [`RouterError::CompressedFrame`] -- body is compressed.
 	/// - [`RouterError::DecodeFailed`] -- body did not decode as `T`.
 	/// - [`RouterError::UnknownRoute`] -- no handler registered for `T`.
-	fn dispatch<T: Message + Send + 'static>(&self, frame: Arc<Frame>) -> Result<()>;
+	fn dispatch<T: Message + Send + 'static>(&self, frame: Arc<Frame>) -> Result<()> {
+		frame.ensure_cleartext()?;
+
+		self.dispatch_cleartext::<T>(frame)
+	}
+
+	/// Deliver a frame whose body [`dispatch`](Self::dispatch) already
+	/// admitted as cleartext.
+	///
+	/// Implementations decode and route. The opaque-body guard runs in
+	/// `dispatch`, so an implementation reaches this method with a
+	/// cleartext body by construction.
+	///
+	/// # Errors
+	///
+	/// - [`RouterError::DecodeFailed`] -- body did not decode as `T`.
+	/// - [`RouterError::UnknownRoute`] -- no handler registered for `T`.
+	fn dispatch_cleartext<T: Message + Send + 'static>(&self, frame: Arc<Frame>) -> Result<()>;
 }
 
 /// Declare a router struct and its [`RouterPolicy`] impl.
@@ -104,11 +98,10 @@ macro_rules! routes {
 		struct $RouterName { $( $field : $fty ),* }
 
 		impl $crate::router::RouterPolicy for $RouterName {
-			fn dispatch<T: $crate::Message + Send + 'static>(
+			fn dispatch_cleartext<T: $crate::Message + Send + 'static>(
 				&self,
 				frame: $crate::router::Arc<$crate::Frame>,
 			) -> $crate::router::Result<()> {
-				$crate::router::ensure_cleartext(&frame)?;
 				$(
 					if core::any::TypeId::of::<T>() == core::any::TypeId::of::<$MsgTy>() {
 						let decoded: $MsgTy = $crate::der::Decode::from_der(frame.message.as_slice())?;
@@ -121,6 +114,35 @@ macro_rules! routes {
 			}
 		}
 	};
+}
+
+impl Frame {
+	/// Reject frames whose body cannot be type-validated at routing time.
+	///
+	/// The router reads cleartext only. An encrypted or compressed body is
+	/// opaque bytes, so a decode against the dispatched type either fails
+	/// confusingly or succeeds against a structurally similar type and
+	/// misdelivers in silence. Decrypt or inflate upstream through
+	/// [`Frame::prepare_typed`](crate::Frame::prepare_typed), then route.
+	///
+	/// [`RouterPolicy::dispatch`] applies this guard for every
+	/// implementation, so a router reaches its decode with a cleartext
+	/// body by construction.
+	///
+	/// # Errors
+	///
+	/// - [`RouterError::ConfidentialFrame`] -- `metadata.confidentiality` is set.
+	/// - [`RouterError::CompressedFrame`] -- `metadata.compactness` is set.
+	pub fn ensure_cleartext(&self) -> Result<()> {
+		if self.metadata.confidentiality.is_some() {
+			return Err(RouterError::ConfidentialFrame);
+		}
+		if self.metadata.compactness.is_some() {
+			return Err(RouterError::CompressedFrame);
+		}
+
+		Ok(())
+	}
 }
 
 #[cfg(all(test, feature = "builder"))]

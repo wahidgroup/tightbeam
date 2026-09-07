@@ -9,7 +9,6 @@ use core::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::colony::common::take_and_abort;
 use crate::colony::hive::{HiveContext, ServletBox};
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::colony::servlet::{
@@ -155,7 +154,7 @@ impl<P: Protocol> ServletRuntime<P> {
 
 	/// Abort the accept loop.
 	pub fn stop(mut self) {
-		take_and_abort(&mut self.server_handle);
+		rt::take_and_abort(&mut self.server_handle);
 	}
 
 	/// Wait for the accept loop to finish after stop or peer close.
@@ -171,7 +170,7 @@ impl<P: Protocol> ServletRuntime<P> {
 
 impl<P: Protocol> Drop for ServletRuntime<P> {
 	fn drop(&mut self) {
-		take_and_abort(&mut self.server_handle);
+		rt::take_and_abort(&mut self.server_handle);
 	}
 }
 

@@ -10,21 +10,18 @@ use std::sync::Arc;
 use futures::channel::mpsc;
 use futures::future::{ready, AbortHandle, Abortable, Aborted, Either};
 use futures::stream::FuturesUnordered;
-use futures::{SinkExt, Stream};
+use futures::Stream;
 
 use super::body::StreamBody;
-use super::flow::{cap_as_usize, chunk_records, payload_credits};
+use super::flow::cap_as_usize;
+use super::link::MuxLink;
 use super::outbound::{outbound_handle, Outbound};
 use super::reader::InboundEvent;
-use super::shared::{BudgetStanding, MuxShared};
-use super::sink::{send_data_envelope, ReplySink};
-use super::writer::{drain_with_reason, goaway_best_effort};
+use super::shared::MuxShared;
+use super::sink::ReplySink;
 use crate::constants::DEFAULT_MUX_CANCEL_BUDGET;
-use crate::der::Encode;
 use crate::policy::TransitStatus;
-use crate::transport::envelopes::{
-	GoAwayReason, MuxDataPackage, MuxEndPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
-};
+use crate::transport::envelopes::{GoAwayReason, MuxStreamKind, ResponsePackage};
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::StreamRoute;
 use crate::transport::{TransportError, TransportResult};
@@ -90,52 +87,48 @@ pub trait MuxDispatch {
 	}
 }
 
-async fn next_responder_event<Fut>(
-	inbound: &mut mpsc::Receiver<InboundEvent>,
-	tasks: &mut FuturesUnordered<Abortable<Fut>>,
-	inbound_open: bool,
-) -> ResponderEvent
-where
-	Fut: Future<Output = (u32, TransportResult<()>)>,
-{
-	poll_fn(|cx| {
-		if let Poll::Ready(Some(completion)) = Pin::new(&mut *tasks).poll_next(cx) {
-			let event = match completion {
-				Ok((stream_id, result)) => ResponderEvent::Finished(stream_id, result),
-				Err(Aborted) => ResponderEvent::Aborted,
-			};
+impl MuxResponder {
+	/// Next responder event, preferring handler completions over new
+	/// inbound work so a finished stream releases its slot before the
+	/// loop admits another.
+	async fn next_event<Fut>(
+		&mut self,
+		tasks: &mut FuturesUnordered<Abortable<Fut>>,
+		inbound_open: bool,
+	) -> ResponderEvent
+	where
+		Fut: Future<Output = (u32, TransportResult<()>)>,
+	{
+		let inbound = &mut self.inbound;
+		poll_fn(|cx| {
+			if let Poll::Ready(Some(completion)) = Pin::new(&mut *tasks).poll_next(cx) {
+				let event = match completion {
+					Ok((stream_id, result)) => ResponderEvent::Finished(stream_id, result),
+					Err(Aborted) => ResponderEvent::Aborted,
+				};
 
-			return Poll::Ready(event);
-		}
-		if inbound_open {
-			match Pin::new(&mut *inbound).poll_next(cx) {
-				Poll::Ready(Some(InboundEvent::Request(stream_id, frame))) => {
-					return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Frame(frame)));
-				}
-				Poll::Ready(Some(InboundEvent::StreamOpen(stream_id, kind, body, route))) => {
-					return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Body(kind, body, route)));
-				}
-				Poll::Ready(Some(InboundEvent::Cancel(stream_id))) => {
-					return Poll::Ready(ResponderEvent::Cancelled(stream_id));
-				}
-				Poll::Ready(None) => return Poll::Ready(ResponderEvent::Closed),
-				Poll::Pending => {}
+				return Poll::Ready(event);
 			}
-		}
+			if inbound_open {
+				match Pin::new(&mut *inbound).poll_next(cx) {
+					Poll::Ready(Some(InboundEvent::Request(stream_id, frame))) => {
+						return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Frame(frame)));
+					}
+					Poll::Ready(Some(InboundEvent::StreamOpen(stream_id, kind, body, route))) => {
+						return Poll::Ready(ResponderEvent::Stream(stream_id, StreamWork::Body(kind, body, route)));
+					}
+					Poll::Ready(Some(InboundEvent::Cancel(stream_id))) => {
+						return Poll::Ready(ResponderEvent::Cancelled(stream_id));
+					}
+					Poll::Ready(None) => return Poll::Ready(ResponderEvent::Closed),
+					Poll::Pending => {}
+				}
+			}
 
-		Poll::Pending
-	})
-	.await
-}
-
-/// Record a responder answering [`TransitStatus::Internal`] from a
-/// local inconsistency, so the peer-observed status has a local
-/// investigation trail.
-fn note_internal_error(shared: &MuxShared) {
-	#[cfg(feature = "instrument")]
-	shared.emit_event(events::MUX_INTERNAL_ERROR);
-	#[cfg(not(feature = "instrument"))]
-	let _ = shared;
+			Poll::Pending
+		})
+		.await
+	}
 }
 
 /// [`MuxDispatch`] over a unary closure: serves only unary-kind
@@ -194,142 +187,53 @@ fn boxed<'a, T>(future: impl Future<Output = T> + MaybeSend + 'a) -> MaybeSendFu
 	Box::pin(future)
 }
 
-/// One peer stream's full lifecycle: route the work to the
-/// [`MuxDispatch`] method matching its kind, then send the stream's
-/// terminal record (response or trailer).
-async fn dispatch_stream<D: MuxDispatch>(
-	shared: Arc<MuxShared>,
-	outbound: mpsc::Sender<Outbound>,
-	dispatch: Arc<D>,
-	stream_id: u32,
-	work: StreamWork,
-) -> TransportResult<()> {
-	match work {
-		StreamWork::Frame(frame) => {
-			let response = boxed(dispatch.unary(frame)).await;
-			send_response(&shared, &outbound, stream_id, response).await
-		}
-		StreamWork::Body(MuxStreamKind::Streaming, body, route) => {
-			let response = boxed(dispatch.streaming(body, route)).await;
-			send_response(&shared, &outbound, stream_id, response).await
-		}
-		StreamWork::Body(MuxStreamKind::Duplex, body, route) => {
-			let reply = ReplySink::new(stream_id, Arc::clone(&shared), outbound_handle(&outbound));
-			let status = boxed(dispatch.duplex(body, reply, route)).await;
-			send_end_trailer(&shared, &outbound, stream_id, status).await
-		}
-		// Unreachable by construction: the reader reassembles
-		// unary-kind streams into frames. Answered safely rather
-		// than asserted.
-		StreamWork::Body(MuxStreamKind::Unary, _, _) => {
-			note_internal_error(&shared);
-			let refusal = ResponsePackage::new(TransitStatus::Internal, None);
-			send_response(&shared, &outbound, stream_id, refusal).await
-		}
-	}
-}
-
-/// Task tail shared by the response-bearing dispatchers: await the
-/// handler's response, then send it as the stream's terminal record.
-fn respond_task<Fut>(
-	shared: &Arc<MuxShared>,
-	outbound: &mpsc::Sender<Outbound>,
-	stream_id: u32,
-	response: Fut,
-) -> impl Future<Output = TransportResult<()>> + MaybeSend
-where
-	Fut: Future<Output = ResponsePackage> + MaybeSend,
-{
-	let shared = Arc::clone(shared);
-	let outbound = outbound_handle(outbound);
-	async move {
-		let response = response.await;
-		send_response(&shared, &outbound, stream_id, response).await
-	}
-}
-
-/// Send a response on a peer-initiated stream, chunking when it
-/// exceeds the peer's advertised receive size: full chunks travel as
-/// `Data(last = false)` and the final chunk travels inline in the `End`
-/// trailer (responder grammar). Every payload-bearing record is gated
-/// by the peer's stream credit. A response the session budget cannot
-/// carry degrades to a payload-free `ResourceExhausted` refusal.
-async fn send_response(
-	shared: &MuxShared,
-	outbound: &mpsc::Sender<Outbound>,
-	stream_id: u32,
-	response: ResponsePackage,
-) -> TransportResult<()> {
-	let mut status = response.status();
-	let mut payload = match response.message() {
-		Some(frame) => frame.as_ref().to_der()?,
-		None => Vec::new(),
-	};
-
-	let credits = payload_credits(payload.len(), shared.send_chunk_size, shared.credit_unit);
-	match shared.admit_debit(credits, true).await {
-		Ok(BudgetStanding::Healthy) => {}
-		Ok(BudgetStanding::Exhausting) => {
-			drain_with_reason(shared, outbound, GoAwayReason::BudgetExhausted).await?;
-		}
-		// Even the drain reserve cannot carry the payload: refuse
-		// the stream for free instead of tearing the connection
-		Err(_) => {
-			status = TransitStatus::ResourceExhausted;
-			payload = Vec::new();
-		}
-	}
-
-	if payload.is_empty() {
-		return send_end_trailer(shared, outbound, stream_id, status).await;
-	}
-	let mut outbound = outbound_handle(outbound);
-
-	let chunk_size = shared.send_chunk_size;
-	let total = chunk_records(payload.len(), chunk_size);
-	shared.register_send_stream(stream_id, total);
-
-	let mut sent: u64 = 0;
-	for chunk in payload.chunks(chunk_size) {
-		sent += 1;
-
-		let envelope = if sent == total {
-			TransportEnvelope::from(MuxEndPackage::new(stream_id, status, chunk)?)
-		} else {
-			TransportEnvelope::from(MuxDataPackage::new(stream_id, false, chunk)?)
-		};
-		match send_data_envelope(shared, &mut outbound, stream_id, envelope).await {
-			Ok(()) => {}
-			// Ledger removed mid-send: the peer cancelled the stream
-			// and the receiver will discard what already went out
-			Err(TransportError::OperationFailed(TransportFailure::Cancelled)) => return Ok(()),
-			Err(err) => {
-				shared.finish_send_stream(stream_id);
-				return Err(err);
+impl MuxLink {
+	/// One peer stream's full lifecycle: route the work to the
+	/// [`MuxDispatch`] method matching its kind, then send the stream's
+	/// terminal record (response or trailer).
+	async fn dispatch_stream<D: MuxDispatch>(
+		self,
+		dispatch: Arc<D>,
+		stream_id: u32,
+		work: StreamWork,
+	) -> TransportResult<()> {
+		match work {
+			StreamWork::Frame(frame) => {
+				let response = boxed(dispatch.unary(frame)).await;
+				self.send_response(stream_id, response).await
+			}
+			StreamWork::Body(MuxStreamKind::Streaming, body, route) => {
+				let response = boxed(dispatch.streaming(body, route)).await;
+				self.send_response(stream_id, response).await
+			}
+			StreamWork::Body(MuxStreamKind::Duplex, body, route) => {
+				let reply = ReplySink::new(stream_id, self.clone());
+				let status = boxed(dispatch.duplex(body, reply, route)).await;
+				self.send_end_trailer(stream_id, status).await
+			}
+			// Unreachable by construction: the reader reassembles
+			// unary-kind streams into frames. Answered safely rather
+			// than asserted.
+			StreamWork::Body(MuxStreamKind::Unary, _, _) => {
+				self.shared().note_internal_error();
+				let refusal = ResponsePackage::new(TransitStatus::Internal, None);
+				self.send_response(stream_id, refusal).await
 			}
 		}
 	}
 
-	shared.finish_send_stream(stream_id);
-
-	Ok(())
-}
-
-/// Terminal `End` trailer closing a peer-initiated stream. Payload-free,
-/// so it travels outside stream credit like every empty `End`, and it
-/// releases the stream's sender ledger.
-async fn send_end_trailer(
-	shared: &MuxShared,
-	outbound: &mpsc::Sender<Outbound>,
-	stream_id: u32,
-	status: TransitStatus,
-) -> TransportResult<()> {
-	let package = MuxEndPackage::new(stream_id, status, Vec::new())?;
-	let mut outbound = outbound_handle(outbound);
-	let sent = outbound.send(Outbound::Envelope(package.into())).await;
-	shared.finish_send_stream(stream_id);
-
-	sent.map_err(|_| TransportError::ConnectionClosed)
+	/// Task tail shared by the response-bearing dispatchers: await the
+	/// handler's response, then send it as the stream's terminal record.
+	fn respond_task<Fut>(&self, stream_id: u32, response: Fut) -> impl Future<Output = TransportResult<()>> + MaybeSend
+	where
+		Fut: Future<Output = ResponsePackage> + MaybeSend,
+	{
+		let link = self.clone();
+		async move {
+			let response = response.await;
+			link.send_response(stream_id, response).await
+		}
+	}
 }
 
 /// Serves peer-initiated streams with a caller-supplied handler.
@@ -352,6 +256,11 @@ pub struct MuxResponder {
 }
 
 impl MuxResponder {
+	/// This responder's connection state paired with its outbound queue.
+	fn link(&self) -> MuxLink {
+		MuxLink::new(Arc::clone(&self.shared), outbound_handle(&self.outbound))
+	}
+
 	/// Assemble the responder over the inbound event queue, at the
 	/// default cancel budget ([`DEFAULT_MUX_CANCEL_BUDGET`]).
 	pub fn new(
@@ -386,17 +295,10 @@ impl MuxResponder {
 	where
 		D: MuxDispatch + MaybeSend + MaybeSync + 'static,
 	{
-		let shared = Arc::clone(&self.shared);
-		let outbound = outbound_handle(&self.outbound);
+		let link = self.link();
 		let dispatch = Arc::new(dispatch);
 		self.dispatch_streams(move |stream_id, work| {
-			dispatch_stream(
-				Arc::clone(&shared),
-				outbound_handle(&outbound),
-				Arc::clone(&dispatch),
-				stream_id,
-				work,
-			)
+			link.clone().dispatch_stream(Arc::clone(&dispatch), stream_id, work)
 		})
 		.await
 	}
@@ -475,7 +377,7 @@ impl MuxResponder {
 				return Ok(());
 			}
 
-			match next_responder_event(&mut self.inbound, &mut tasks, inbound_open).await {
+			match self.next_event(&mut tasks, inbound_open).await {
 				ResponderEvent::Closed => inbound_open = false,
 				ResponderEvent::Aborted => {}
 				ResponderEvent::Cancelled(stream_id) => {
@@ -498,7 +400,7 @@ impl MuxResponder {
 					let at_cap = in_flight.len() >= cap_as_usize(self.peer_cap);
 					let work = if at_cap {
 						let refusal = ready(ResponsePackage::new(TransitStatus::ResourceExhausted, None));
-						Either::Right(respond_task(&self.shared, &self.outbound, stream_id, refusal))
+						Either::Right(self.link().respond_task(stream_id, refusal))
 					} else {
 						Either::Left(dispatch(stream_id, work))
 					};
@@ -528,7 +430,7 @@ impl MuxResponder {
 		#[cfg(feature = "instrument")]
 		self.shared.emit_event(events::MUX_CANCEL_BUDGET);
 
-		goaway_best_effort(&self.shared, &self.outbound, last_stream_id, GoAwayReason::EnhanceYourCalm);
+		self.link().goaway_best_effort(last_stream_id, GoAwayReason::EnhanceYourCalm);
 
 		TransportError::OperationFailed(TransportFailure::PolicyRejection)
 	}

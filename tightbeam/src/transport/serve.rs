@@ -193,26 +193,6 @@ pub(crate) fn unimplemented_error() -> TightBeamError {
 	TransportError::from(TransitStatus::Unimplemented).into()
 }
 
-/// Map a service failure to the stream's terminal status: a failure already
-/// carrying a transit status keeps it, anything else answers
-/// [`TransitStatus::Internal`] so the peer can tell a failure apart from an
-/// accepted empty reply and the failure stays attributable.
-fn failure_status(error: &TightBeamError) -> TransitStatus {
-	if let TightBeamError::TransportError(TransportError::OperationFailed(failure)) = error {
-		return TransitStatus::try_from(*failure).unwrap_or(TransitStatus::Internal);
-	}
-
-	TransitStatus::Internal
-}
-
-/// Terminal response for a unary or streaming service outcome.
-fn respond(outcome: Result<Option<Frame>, TightBeamError>) -> ResponsePackage {
-	match outcome {
-		Ok(message) => ResponsePackage::new(TransitStatus::Ok, message),
-		Err(error) => ResponsePackage::new(failure_status(&error), None),
-	}
-}
-
 /// [`MuxDispatch`] adapter running a [`MuxService`] behind the transport's
 /// collector gate: gated unary frames answer with the gate's status and never
 /// reach the service, and every invocation sees the live session receipt.
@@ -244,7 +224,7 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 
 			let request = Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone());
 			let cx = CallContext::new(session, StreamRoute::local());
-			respond(service.unary(request, cx).await)
+			ResponsePackage::from_outcome(service.unary(request, cx).await)
 		}
 	}
 
@@ -258,7 +238,7 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 			}
 
 			let cx = CallContext::new(session, route);
-			respond(service.streaming(body, cx).await)
+			ResponsePackage::from_outcome(service.streaming(body, cx).await)
 		}
 	}
 
@@ -279,7 +259,7 @@ impl<S: MuxService> MuxDispatch for GatedService<S> {
 			let cx = CallContext::new(session, route);
 			match service.duplex(body, reply, cx).await {
 				Ok(()) => TransitStatus::Ok,
-				Err(error) => failure_status(&error),
+				Err(error) => error.failure_status(),
 			}
 		}
 	}

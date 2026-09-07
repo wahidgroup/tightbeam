@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use futures::channel::mpsc;
 
-use super::body::{stream_body, DrainNote, ForwardedStream, StreamBody};
+use super::body::{DrainNote, ForwardedStream, StreamBody};
 use super::shared::{MuxShared, OpenSlot};
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::multiplex::MuxRole;
@@ -29,11 +29,12 @@ pub fn client_shared() -> Arc<MuxShared> {
 /// Body/forwarder pair with its drain-note receiver.
 pub fn body_fixture(stream_id: u32, window: u64) -> (StreamBody, ForwardedStream, mpsc::UnboundedReceiver<DrainNote>) {
 	let (feedback, notes) = mpsc::unbounded();
-	let (body, forwarder) = stream_body(OpenSlot::assigned(stream_id), window, feedback);
-
+	let (body, forwarder) = StreamBody::pair(OpenSlot::assigned(stream_id), window, feedback);
 	(body, forwarder, notes)
 }
 
-pub fn poll_chunk(body: &mut StreamBody) -> Poll<TransportResult<Option<Vec<u8>>>> {
-	poll_now(body.chunk())
+impl StreamBody {
+	pub fn poll_chunk_now(&mut self) -> Poll<TransportResult<Option<Vec<u8>>>> {
+		poll_now(self.chunk())
+	}
 }

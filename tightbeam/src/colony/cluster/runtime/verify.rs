@@ -7,27 +7,27 @@
 //!
 //! # Gate policies
 //!
-//! [`evaluate_gates`] runs configured [`GatePolicy`] instances before the
+//! [`ClusterConfig::evaluate_gates`] runs configured [`GatePolicy`] instances before the
 //! request envelope is decoded. Stream opens carry no request frame, so they
 //! pass `None` for the frame argument.
 //!
 //! # Export boundary
 //!
-//! [`evaluate_export_gates`] runs [`ExportPolicy`] where the servlet target
+//! [`ClusterConfig::evaluate_export_gates`] runs [`ExportPolicy`] where the servlet target
 //! is resolved: allowlist, then grants, then deny gates.
 //! [`HopBudget::is_relayed`] supplies the `relayed` flag. Verdict algebra and
 //! posture warnings live in [`crate::colony::cluster::export`].
 //!
 //! # Origin and freshness
 //!
-//! [`verify_hive_origin`] and [`verify_peer_origin`] verify frame signatures
+//! [`ClusterConfig::verify_hive_origin`] and [`ClusterConfig::verify_peer_origin`] verify frame signatures
 //! against the configured trust stores. [`GatewayReplayGuard`] rejects
 //! stale or replayed signed control frames.
 //!
 //! [`GatewayReplayGuard`]: super::freshness::GatewayReplayGuard
 
 use crate::colony::cluster::export::{ExportDecision, ExportPolicy};
-use crate::colony::cluster::peer::cert_fingerprint_id;
+use crate::colony::cluster::peer::ColonyCertificate;
 use crate::colony::cluster::ClusterConfig;
 use crate::colony::hive::{verify_frame_signature, TrustVerification};
 use crate::instrumentation::events::{CLUSTER_EXPORT_GRANTED, CLUSTER_EXPORT_REFUSED, CLUSTER_GATE_BLOCKED};
@@ -37,51 +37,51 @@ use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
 
-/// Trace an export boundary outcome with the caller principal and relay
-/// context.
+/// One caller under export-boundary audit.
 ///
-/// Refusals emit [`CLUSTER_EXPORT_REFUSED`] and deciding grants emit
-/// [`CLUSTER_EXPORT_GRANTED`], sharing one enrichment convention.
-///
-/// # Payload
-///
-/// The event value carries the `relayed` flag. When mutual TLS captured a
-/// caller certificate, the payload is its fingerprint (matching the
-/// peer-advertisement refusal convention). Anonymous sessions emit no payload.
-fn trace_export_outcome(
-	trace: &TraceCollector,
-	outcome: Urn<'static>,
-	session: &SessionContext,
+/// A refusal and a deciding grant describe the same caller, so they share
+/// one enrichment convention rather than each assembling its own.
+struct ExportAudit<'a> {
+	trace: &'a TraceCollector,
+	session: &'a SessionContext,
 	relayed: bool,
-) -> Result<(), TightBeamError> {
-	let fingerprint = session.peer_certificate().and_then(cert_fingerprint_id);
-	let event = trace.event_with(outcome, &[], relayed)?;
-	match fingerprint.as_ref() {
-		Some(id) => event.with_payload(id.as_ref()).emit(),
-		None => event.emit(),
-	}
-
-	Ok(())
 }
 
-/// Whether the frame signer is also a member of `tls.peer_trust`.
-///
-/// Peer membership wins across the whole trust plane. A signer the peer
-/// store trusts is an external peer, so it must not act on the hive
-/// plane even when `hive_trust` also trusts it.
-fn signer_is_peer(config: &ClusterConfig, frame: &Frame) -> bool {
-	config
-		.tls
-		.peer_trust
-		.as_ref()
-		.is_some_and(|trust| matches!(verify_frame_signature(trust.as_ref(), frame), TrustVerification::Verified))
+impl ExportAudit<'_> {
+	/// Emit `outcome` for this caller.
+	///
+	/// The event value carries the `relayed` flag. Where mutual TLS
+	/// captured a caller certificate, the payload is its fingerprint,
+	/// matching the peer-advertisement refusal convention. An anonymous
+	/// session emits no payload.
+	fn record(&self, outcome: Urn<'static>) -> Result<(), TightBeamError> {
+		let fingerprint = self.session.peer_certificate().and_then(ColonyCertificate::fingerprint_id);
+		let event = self.trace.event_with(outcome, &[], self.relayed)?;
+		match fingerprint.as_ref() {
+			Some(id) => event.with_payload(id.as_ref()).emit(),
+			None => event.emit(),
+		}
+
+		Ok(())
+	}
 }
 
 impl ClusterConfig {
+	/// Whether the frame signer is also a member of `tls.peer_trust`.
+	///
+	/// Peer membership wins across the whole trust plane. A signer the peer
+	/// store trusts is an external peer, so it must not act on the hive
+	/// plane even where `hive_trust` also trusts it.
+	fn signer_is_peer(&self, frame: &Frame) -> bool {
+		self.tls
+			.peer_trust
+			.as_ref()
+			.is_some_and(|trust| matches!(verify_frame_signature(trust.as_ref(), frame), TrustVerification::Verified))
+	}
+
 	/// Run configured [`GatePolicy`] instances with no audit side effects.
 	pub(crate) fn policies_allow(&self, frame: Option<&Frame>, session: &SessionContext) -> Result<(), TransitStatus> {
 		let config = self;
-
 		for policy in config.policies.iter() {
 			let status = GatePolicy::evaluate(policy.as_ref(), frame, session).normalized_verdict();
 			if status != TransitStatus::Ok {
@@ -152,15 +152,16 @@ impl ClusterConfig {
 		relayed: bool,
 		trace: &TraceCollector,
 	) -> Result<TransitStatus, TightBeamError> {
+		let audit = ExportAudit { trace, session, relayed };
 		match ExportPolicy::from(self).verdict(target, session, relayed) {
 			Ok(ExportDecision::Allowed) => Ok(TransitStatus::Ok),
 			Ok(ExportDecision::Granted) => {
-				trace_export_outcome(trace, CLUSTER_EXPORT_GRANTED, session, relayed)?;
+				audit.record(CLUSTER_EXPORT_GRANTED)?;
 
 				Ok(TransitStatus::Ok)
 			}
 			Err(status) => {
-				trace_export_outcome(trace, CLUSTER_EXPORT_REFUSED, session, relayed)?;
+				audit.record(CLUSTER_EXPORT_REFUSED)?;
 
 				Ok(status)
 			}
@@ -182,7 +183,7 @@ impl ClusterConfig {
 	pub(crate) fn verify_hive_origin(&self, frame: &Frame) -> TransitStatus {
 		match self.tls.hive_trust.as_ref() {
 			Some(trust) => match verify_frame_signature(trust.as_ref(), frame) {
-				TrustVerification::Verified if signer_is_peer(self, frame) => TransitStatus::PermissionDenied,
+				TrustVerification::Verified if self.signer_is_peer(frame) => TransitStatus::PermissionDenied,
 				TrustVerification::Verified => TransitStatus::Ok,
 				TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
 				_ => TransitStatus::PermissionDenied,
@@ -357,7 +358,6 @@ mod tests {
 			&TraceCollector::default(),
 		);
 		assert_eq!(verdict?, TransitStatus::Ok);
-
 		Ok(())
 	}
 
@@ -374,7 +374,6 @@ mod tests {
 			&TraceCollector::default(),
 		);
 		assert_eq!(verdict?, TransitStatus::PermissionDenied);
-
 		Ok(())
 	}
 
@@ -389,9 +388,7 @@ mod tests {
 			false,
 			&TraceCollector::default(),
 		);
-
 		assert_eq!(verdict?, TransitStatus::PermissionDenied);
-
 		Ok(())
 	}
 
@@ -407,7 +404,6 @@ mod tests {
 			&TraceCollector::default(),
 		);
 		assert_eq!(verdict?, TransitStatus::PermissionDenied);
-
 		Ok(())
 	}
 
@@ -423,7 +419,6 @@ mod tests {
 			&TraceCollector::default(),
 		);
 		assert_eq!(verdict?, TransitStatus::Ok);
-
 		Ok(())
 	}
 
@@ -439,7 +434,6 @@ mod tests {
 			&TraceCollector::default(),
 		);
 		assert_eq!(verdict?, TransitStatus::Internal);
-
 		Ok(())
 	}
 
@@ -458,9 +452,9 @@ mod tests {
 	fn hive_origin_passes_hive_only_signer() {
 		let key: Secp256k1SigningKey = create_test_signing_key();
 		let frame = signed_control_frame(&key);
+
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&create_test_certificate(&key)));
-
 		assert_eq!(config.verify_hive_origin(&frame), TransitStatus::Ok);
 	}
 
@@ -469,10 +463,10 @@ mod tests {
 		let key: Secp256k1SigningKey = create_test_signing_key();
 		let frame = signed_control_frame(&key);
 		let cert = create_test_certificate(&key);
+
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
-
 		assert_eq!(config.verify_hive_origin(&frame), TransitStatus::PermissionDenied);
 	}
 }

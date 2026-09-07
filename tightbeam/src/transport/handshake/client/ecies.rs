@@ -23,22 +23,21 @@ use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, P
 use crate::crypto::sign::PrehashVerifier;
 use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::utils::{extract_verifying_key_bytes, validate_certificate_expiry};
+use crate::crypto::x509::utils::CertificateExt;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{client_mux_settings, MuxSettings, SecurityOffer, TransportOffer};
+use crate::transport::handshake::receipt::ReceiptArtifact;
+use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, certificate_signer_identifier, complete_receipt_artifact, countersign_receipt,
-	match_receipt_to_accept, receipt_from_artifact, signer_for_role, verify_receipt_signer, ReceiptApprover,
-	ReceiptRole, StoredReceipt,
+	approve_or_fail_closed, match_receipt_to_accept, verify_receipt_signer, ReceiptApprover, ReceiptRole, StoredReceipt,
 };
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
-use crate::transport::handshake::utils::{
-	compute_client_auth_digest, compute_ecies_transcript_hash, octet_string_to_32_byte_array, validate_state,
-};
+use crate::transport::handshake::utils::HandshakeOctets;
+use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake,
 };
@@ -237,7 +236,7 @@ where
 		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
 		let validator = self.certificate_validator.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
 
-		validate_certificate_expiry(&server_handshake.certificate)?;
+		server_handshake.certificate.validate_expiry()?;
 		validator.evaluate(&server_handshake.certificate)?;
 
 		Ok(server_handshake)
@@ -245,9 +244,8 @@ where
 
 	/// Extract and store server random from handshake.
 	fn extract_server_random(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
-		let server_random = octet_string_to_32_byte_array(&server_handshake.server_random)?;
+		let server_random = server_handshake.server_random.to_32_byte_array()?;
 		self.server_random = Some(server_random);
-
 		Ok(())
 	}
 
@@ -451,7 +449,7 @@ where
 
 		if let Some(artifact) = artifact {
 			let countersignature = receipt_ack.ok_or(HandshakeError::InvalidState)?;
-			let completed = complete_receipt_artifact(artifact, countersignature)?;
+			let completed = artifact.complete(countersignature)?;
 			self.stored_receipt = Some(StoredReceipt::try_from(completed)?);
 		}
 
@@ -486,7 +484,7 @@ where
 		// Consume the artifact: the completed copy this function stores
 		// is its only owner from here on.
 		let artifact = server_handshake.session_receipt.take();
-		let parsed_receipt = artifact.as_ref().map(receipt_from_artifact).transpose()?;
+		let parsed_receipt = artifact.as_ref().map(ReceiptArtifact::receipt).transpose()?;
 		let Some(receipt) =
 			match_receipt_to_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
 		else {
@@ -496,10 +494,12 @@ where
 		// Server SignerInfo over the receipt body: third-party verifiable
 		// agreement, so an unsigned receipt is no receipt at all.
 		let artifact = artifact.ok_or(HandshakeError::ReceiptMissing)?;
-		let server_signer = signer_for_role(&artifact, ReceiptRole::Server)?.ok_or(HandshakeError::ReceiptMissing)?;
+		let server_signer = artifact
+			.signer_for_role(ReceiptRole::Server)?
+			.ok_or(HandshakeError::ReceiptMissing)?;
 
 		let receipt_der = receipt.to_der()?;
-		let expected_sid = certificate_signer_identifier::<P::Digest>(&server_handshake.certificate)?;
+		let expected_sid = server_handshake.certificate.signer_identifier::<P::Digest>()?;
 		let verifying_key = self.extract_verifying_key(&server_handshake.certificate)?;
 		verify_receipt_signer::<P::Digest, P::Signature, _>(
 			&receipt_der,
@@ -525,7 +525,7 @@ where
 		// without an approver).
 		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), &receipt).await?;
 		let answer = response.as_ref().map(OctetString::as_bytes);
-		let countersignature = countersign_receipt::<P::Digest>(&receipt, answer, key_provider.as_ref()).await?;
+		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider.as_ref()).await?;
 
 		Ok(Some((artifact, countersignature)))
 	}
@@ -802,7 +802,7 @@ where
 #[cfg(feature = "secp256k1")]
 impl ExtractVerifyingKey for Secp256k1VerifyingKey {
 	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError> {
-		let public_key_bytes = extract_verifying_key_bytes(cert);
+		let public_key_bytes = cert.verifying_key_bytes();
 		let public_key = k256::PublicKey::from_sec1_bytes(public_key_bytes)?;
 		Ok(Self::from(public_key))
 	}

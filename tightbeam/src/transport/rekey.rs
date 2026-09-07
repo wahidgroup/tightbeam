@@ -49,15 +49,14 @@ use crate::random::generate_nonce;
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
 use crate::transport::handshake::negotiation::TransportAuthorizer;
 use crate::transport::handshake::primitives::kdf_chain;
+use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, complete_receipt_artifact, countersign_receipt, receipt_from_artifact,
-	record_receipt_outcome, settle_receipt_ack, sign_receipt, signer_for_role, transcript_digest_info,
-	verify_receipt_signer, ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt,
-	SessionVerdict, StoredReceipt,
+	approve_or_fail_closed, record_receipt_outcome, sign_receipt, transcript_digest_info, verify_receipt_signer,
+	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
 };
+use crate::transport::handshake::HandshakeOctets;
 use crate::transport::handshake::{
-	compute_transcript_digest, derive_directional_from_oid, octet_string_to_32_byte_array, EpochMaterials,
-	HandshakeError,
+	compute_transcript_digest, derive_directional_from_oid, EpochMaterials, HandshakeError,
 };
 use crate::transport::multiplex::MuxRole;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
@@ -271,14 +270,14 @@ where
 		let pending = self.pending.take().ok_or(HandshakeError::InvalidState)?;
 		let response_der = response.to_der()?;
 		let MuxRekeyResponsePackage { server_random, epoch_receipt } = response;
-		let server_random = octet_string_to_32_byte_array(&server_random)?;
+		let server_random = server_random.to_32_byte_array()?;
 		let epoch_receipt = epoch_receipt.ok_or(HandshakeError::ReceiptMissing)?;
 		let artifact = *epoch_receipt;
 
-		let receipt = receipt_from_artifact(&artifact)?;
+		let receipt = artifact.receipt()?;
 		let receipt_der = receipt.to_der()?;
 		let server_role = ReceiptRole::Server;
-		let server_signer = signer_for_role(&artifact, server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
+		let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
 		verify_receipt_signer::<P::Digest, P::Signature, _>(
 			&receipt_der,
 			server_signer,
@@ -303,11 +302,11 @@ where
 		let answer = approve_or_fail_closed(self.approver.as_deref(), &receipt).await?;
 		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
 		let provider = self.materials.signing_provider.as_ref();
-		let countersignature = countersign_receipt::<P::Digest>(&receipt, answer_bytes, provider).await?;
+		let countersignature = receipt.countersign::<P::Digest>(answer_bytes, provider).await?;
 
 		// Dual ownership by design: one copy folds into the retained
 		// artifact, the other is DER-encoded onto the wire in the ack.
-		let completed = complete_receipt_artifact(artifact, countersignature.clone())?;
+		let completed = artifact.complete(countersignature.clone())?;
 		let stored = StoredReceipt::try_from(completed)?;
 
 		let ack = MuxRekeyAckPackage::new(Some(countersignature));
@@ -395,7 +394,7 @@ where
 		}
 
 		let request_der = request.to_der()?;
-		let client_random = octet_string_to_32_byte_array(&request.client_random)?;
+		let client_random = request.client_random.to_32_byte_array()?;
 		let server_random = generate_nonce::<32>(None)?;
 
 		let challenge_hash =
@@ -448,14 +447,15 @@ where
 		let MuxRekeyAckPackage { countersignature } = ack;
 		let countersignature = countersignature.map(|boxed| *boxed);
 
-		let (verdict, ancillary_response) = settle_receipt_ack::<P::Digest, P::Signature, _>(
-			&pending.receipt,
-			countersignature.as_ref(),
-			&self.materials.peer_sid,
-			&self.materials.peer_verifying_key,
-			self.authorizer.as_deref(),
-		)
-		.await?;
+		let (verdict, ancillary_response) = pending
+			.receipt
+			.settle_ack::<P::Digest, P::Signature, _>(
+				countersignature.as_ref(),
+				&self.materials.peer_sid,
+				&self.materials.peer_verifying_key,
+				self.authorizer.as_deref(),
+			)
+			.await?;
 
 		let countersignature_der = countersignature.as_ref().map(SignerInfo::to_der).transpose()?;
 
@@ -464,7 +464,7 @@ where
 		// evidence.
 		let artifact = match (verdict, countersignature) {
 			(SessionVerdict::Activated | SessionVerdict::SettlementRejected { .. }, Some(signer)) => {
-				complete_receipt_artifact(pending.artifact, signer)?
+				pending.artifact.complete(signer)?
 			}
 			(_, _) => pending.artifact,
 		};
@@ -719,6 +719,7 @@ mod tests {
 		let request = client.start_renewal()?;
 		let response = server.process_request(&request).await?;
 		let (ack, client_install) = client.process_response(response).await?;
+
 		let outcome = server.process_ack(ack).await?;
 		assert!(outcome.rejection.is_none());
 		Ok((client_install, outcome.install))
@@ -728,7 +729,6 @@ mod tests {
 	async fn exchange_rotates_both_endpoints() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
 		let (client_install, server_install) = run_exchange(&mut client, &mut server).await?;
-
 		assert_eq!(client_install.epoch, 1);
 		assert_eq!(server_install.epoch, 1);
 		assert_eq!(client.epoch(), 1);
@@ -751,8 +751,8 @@ mod tests {
 	async fn chained_exchanges_stay_in_step() -> Result<(), Box<dyn std::error::Error>> {
 		let (mut client, mut server) = rekey_pair()?;
 		run_exchange(&mut client, &mut server).await?;
-		let (client_install, server_install) = run_exchange(&mut client, &mut server).await?;
 
+		let (client_install, server_install) = run_exchange(&mut client, &mut server).await?;
 		assert_eq!(client_install.epoch, 2);
 		assert_eq!(server_install.epoch, 2);
 
@@ -769,9 +769,10 @@ mod tests {
 		let response = server.process_request(&request).await?;
 
 		let epoch_receipt = response.epoch_receipt().ok_or(HandshakeError::ReceiptMissing)?;
-		let receipt = receipt_from_artifact(epoch_receipt)?;
+		let receipt = epoch_receipt.receipt()?;
 		assert_eq!(receipt.budgets, SAMPLE_BUDGETS);
 		assert_eq!(receipt.credit_unit, SAMPLE_CREDIT_UNIT);
+
 		let chain_root = transcript_digest_info::<Sha3_256>(SAMPLE_CHAIN_ROOT)?;
 		assert_ne!(receipt.transcript_hash, chain_root);
 		Ok(())
@@ -801,6 +802,7 @@ mod tests {
 		assert!(matches!(unsolicited, Err(HandshakeError::InvalidState)));
 
 		server.pending = None;
+
 		let bare_ack = server.process_ack(MuxRekeyAckPackage::new(None)).await;
 		assert!(matches!(bare_ack, Err(HandshakeError::InvalidState)));
 		Ok(())
@@ -837,9 +839,9 @@ mod tests {
 		let replay = response.to_owned();
 
 		client.process_response(response).await.map(|_| ())?;
-
 		// A replay targets the advanced chain: the pin no longer matches.
 		client.pending = Some(PendingRenewal { client_random: [3u8; 32], request_der: request.to_der()? });
+
 		let replayed = client.process_response(replay).await;
 		assert!(matches!(replayed, Err(HandshakeError::ReceiptMismatch)));
 		Ok(())
@@ -863,11 +865,12 @@ mod tests {
 		let request = client.start_renewal()?;
 		let response = server.process_request(&request).await?;
 		let epoch_receipt = response.epoch_receipt().ok_or(HandshakeError::ReceiptMissing)?;
-		let receipt = receipt_from_artifact(epoch_receipt)?;
+		let receipt = epoch_receipt.receipt()?;
+
 		client.process_response(response).await.map(|_| ())?;
 
 		let intruder = test_identity()?;
-		let forged = countersign_receipt::<Sha3_256>(&receipt, None, intruder.provider.as_ref()).await?;
+		let forged = receipt.countersign::<Sha3_256>(None, intruder.provider.as_ref()).await?;
 		let foreign_ack = MuxRekeyAckPackage::new(Some(forged));
 		let foreign = server.process_ack(foreign_ack).await;
 		assert!(matches!(foreign, Err(HandshakeError::SignatureVerificationFailed)));

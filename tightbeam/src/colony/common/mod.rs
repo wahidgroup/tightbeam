@@ -17,10 +17,7 @@ use crate::runtime::rt;
 
 pub use messages::*;
 pub use scaling::*;
-pub use urn::{
-	canonical_bytes, instance_urn, is_bare_servlet_type, servlet_instance, type_canonical_bytes, type_prefix_bytes,
-	ColonyNamespace, ColonyResource, COLONY_NID,
-};
+pub use urn::{ColonyNamespace, ColonyResource, COLONY_NID};
 
 // ============================================================================
 // Load Balancing
@@ -331,7 +328,8 @@ pub fn reply_frame<M: crate::Message>(
 ) -> Result<Option<crate::Frame>, crate::TightBeamError> {
 	use crate::builder::TypeBuilder;
 
-	let frame = crate::utils::compose(crate::Version::V0)
+	let frame = crate::Version::V0
+		.compose()
 		.with_id(id)
 		.with_order(0)
 		.with_message(message)
@@ -351,7 +349,8 @@ pub fn reply_frame_with_priority<M: crate::Message>(
 ) -> Result<Option<crate::Frame>, crate::TightBeamError> {
 	use crate::builder::TypeBuilder;
 
-	let frame = crate::utils::compose(crate::Version::V2)
+	let frame = crate::Version::V2
+		.compose()
 		.with_id(id)
 		.with_order(0)
 		.with_priority(priority)
@@ -364,15 +363,6 @@ pub fn reply_frame_with_priority<M: crate::Message>(
 // ============================================================================
 // Task Lifecycle
 // ============================================================================
-
-/// Take an optional join handle and abort it when present.
-///
-/// Shared by servlet, hive, and cluster `stop` / `Drop` paths.
-pub fn take_and_abort(handle: &mut Option<rt::JoinHandle>) {
-	if let Some(handle) = handle.take() {
-		rt::abort(&handle);
-	}
-}
 
 /// Whether a runtime has entered drain, and since when.
 ///

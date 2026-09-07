@@ -19,10 +19,6 @@ use crate::testing::specs::csp::{Action, Event, Process, State};
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::config::{FaultInjection, FaultModel, InjectedFaultRecord};
 #[cfg(feature = "testing-timing")]
-use crate::testing::fdr::subsys::timing::check_event_wcet_violation;
-#[cfg(feature = "testing-timing")]
-use crate::testing::fdr::subsys::timing::check_timing_violations;
-#[cfg(feature = "testing-timing")]
 use crate::testing::timing::{TimingConstraint, TimingConstraints};
 
 /// Default exploration engine implementation
@@ -436,15 +432,13 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 		#[cfg(feature = "testing-timing")]
 		{
-			use crate::testing::fdr::subsys::timing::check_timed_transition_guard;
-
 			// Check timing guards if timed transitions exist
 			if let Some(ref timed_transitions) = process.timed_transitions {
 				if let Some(transitions) = timed_transitions.get(&(state.process_state, action.event)) {
 					// Filter transitions by guard satisfaction
 					let valid_transitions: Vec<_> = transitions
 						.iter()
-						.filter(|tt| check_timed_transition_guard(tt, &state.clock_values))
+						.filter(|tt| tt.guard_satisfied(&state.clock_values))
 						.collect();
 
 					if valid_transitions.is_empty() {
@@ -471,7 +465,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 							if let Some(ref constraints) = process.timing_constraints {
 								// Look up WCET for this event
 								let wcet = Self::lookup_wcet(&action.event, constraints);
-								if check_event_wcet_violation(&action.event, wcet, constraints) {
+								if constraints.wcet_violated(&action.event, wcet) {
 									// Prune this branch: WCET violation
 									*timing_pruned += 1;
 									continue;
@@ -517,7 +511,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 						// Look up WCET for this event
 						// Check if this event's WCET violates its constraint
 						let wcet = Self::lookup_wcet(&action.event, constraints);
-						if check_event_wcet_violation(&action.event, wcet, constraints) {
+						if constraints.wcet_violated(&action.event, wcet) {
 							// Prune this branch: WCET violation
 							*timing_pruned += 1;
 							continue;
@@ -557,6 +551,6 @@ impl<'a> DefaultExplorationEngine<'a> {
 	/// Check if exploration state violates timing constraints
 	#[cfg(feature = "testing-timing")]
 	fn check_timing_violations(state: &ExplorationState, constraints: &TimingConstraints) -> bool {
-		check_timing_violations(&state.trace, state.elapsed_time, &state.event_times, constraints)
+		constraints.violated_by(&state.trace, state.elapsed_time, &state.event_times)
 	}
 }

@@ -9,8 +9,8 @@ use tightbeam::{
 	builder::{frame::FrameBuilder, TypeBuilder},
 	colony::{
 		common::{
-			current_timestamp_ms, servlet_instance, ClusterCommand, ClusterCommandResponse, ClusterStatus,
-			ColonyNamespace, HeartbeatParams, HiveManagementRequest, SpawnServletParams, StopServletParams,
+			current_timestamp_ms, ClusterCommand, ClusterCommandResponse, ClusterStatus, ColonyNamespace,
+			HeartbeatParams, HiveManagementRequest, SpawnServletParams, StopServletParams,
 		},
 		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
 		servlet::ServletConfig,
@@ -185,14 +185,10 @@ fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError
 /// Builds a manage command frame with a stop request. Each call site
 /// passes a unique id.
 fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
-	let manage_cmd = ClusterCommand {
-		heartbeat: None,
-		manage: Some(HiveManagementRequest {
-			spawn: None,
-			list: None,
-			stop: Some(StopServletParams { servlet_id: servlet_instance(&servlet_urn("none"), "127.0.0.1:0") }),
-		}),
-	};
+	let servlet_id = servlet_urn("none").servlet_instance("127.0.0.1:0");
+	let stop = StopServletParams { servlet_id };
+	let manage = HiveManagementRequest { spawn: None, list: None, stop: Some(stop) };
+	let manage_cmd = ClusterCommand { heartbeat: None, manage: Some(manage) };
 
 	command_frame(id, manage_cmd)
 }

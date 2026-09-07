@@ -11,16 +11,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use futures::channel::{mpsc, oneshot};
 
 use super::body::{BodyEvent, ForwardedStream};
-use super::flow::cap_as_usize;
-use super::outbound::{outbound_handle, Outbound};
+use super::flow::{cap_as_usize, chunk_records, payload_credits};
+use super::outbound::Outbound;
 use crate::transport::envelopes::{
-	CancelReason, GoAwayReason, MuxCancelPackage, MuxOpenPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
+	CancelReason, GoAwayReason, MuxOpenPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
 };
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::multiplex::MuxRole;
 use crate::transport::{TransportError, TransportResult};
 use crate::utils::urn::Urn;
+use crate::Frame;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::receipt::StoredReceipt;
@@ -147,34 +148,21 @@ pub enum StreamOutcome {
 	Draining,
 }
 
-pub fn cancel_error(reason: CancelReason) -> TransportError {
-	match reason {
-		CancelReason::Cancelled => TransportError::OperationFailed(TransportFailure::Cancelled),
-		CancelReason::Timeout => TransportError::OperationFailed(TransportFailure::DeadlineExceeded),
-		CancelReason::Rejected => TransportError::OperationFailed(TransportFailure::ResourceExhausted),
-		// An app-coded cancel is still a cancel. The code itself
-		// carries no transport-failure mapping of its own
-		CancelReason::Application(_) => TransportError::OperationFailed(TransportFailure::Cancelled),
-	}
-}
-
-/// Resolve a locally-initiated stream as cancelled and notify the
-/// peer: the local teardown shared by every abandoned send path
-/// (drop guards, abandoned sinks, explicit close).
-///
-/// The wire cancel travels on a fresh sender clone, whose guaranteed
-/// slot (channel capacity = buffer + senders) admits it even when the
-/// queue is otherwise full. The only unreachable case is a
-/// disconnected queue, where the writer - and the connection - are
-/// already gone.
-pub fn enqueue_stream_cancel(shared: &MuxShared, outbound: &mpsc::Sender<Outbound>, stream_id: u32) {
-	if let Some(mut forwarder) = shared.take_duplex(stream_id) {
-		let _ = forwarder.forward(BodyEvent::Failed(cancel_error(CancelReason::Cancelled)));
-	}
-	if let Some(sender) = shared.remove_pending(stream_id) {
-		let _ = sender.send(StreamOutcome::Cancelled(CancelReason::Cancelled));
-		let package = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
-		let _ = outbound_handle(outbound).try_send(Outbound::Envelope(package.into()));
+impl StreamOutcome {
+	/// The caller-facing result of one pending stream.
+	///
+	/// # Errors
+	///
+	/// - The response's own status where the responder refused.
+	/// - [`TransportError::Draining`] -- the peer went away above this
+	///   stream.
+	/// - The cancel reason's error where the peer cancelled.
+	pub(crate) fn resolve(self) -> TransportResult<Option<Frame>> {
+		match self {
+			Self::Response(response) => response.resolve(),
+			Self::Cancelled(reason) => Err(reason.cancel_error()),
+			Self::Draining => Err(TransportError::Draining),
+		}
 	}
 }
 
@@ -814,6 +802,34 @@ impl MuxShared {
 		slot.as_ref().map(Arc::clone)
 	}
 
+	/// Meter one pushed payload: debit the session budget and account
+	/// the payload's records on the stream's sender ledger. The one
+	/// budget rule both streaming sinks share.
+	///
+	/// # Errors
+	///
+	/// The refusal [`Self::admit_debit`] reports for a payload the budget
+	/// cannot carry.
+	pub(crate) async fn debit_push(
+		&self,
+		stream_id: u32,
+		payload_len: usize,
+		reserved: bool,
+	) -> TransportResult<BudgetStanding> {
+		let credits = payload_credits(payload_len, self.send_chunk_size, self.credit_unit);
+		let standing = self.admit_debit(credits, reserved).await?;
+		self.add_send_records(stream_id, chunk_records(payload_len, self.send_chunk_size));
+		Ok(standing)
+	}
+
+	/// Record a responder answering [`TransitStatus::Internal`] from a
+	/// local inconsistency, so the peer-observed status has a local
+	/// investigation trail.
+	pub(crate) fn note_internal_error(&self) {
+		#[cfg(feature = "instrument")]
+		self.emit_event(events::MUX_INTERNAL_ERROR);
+	}
+
 	/// Dual-write a control-plane event: core kind URN into the
 	/// instrument log, plus the stable label for spec assertions and
 	/// CSP alphabets.
@@ -1031,7 +1047,6 @@ impl MuxShared {
 	pub fn fail_pending_above(&self, last_stream_id: u32, reason: GoAwayReason) {
 		{
 			let mut state = self.lock();
-
 			state.goaway_received = Some(last_stream_id);
 			state.goaway_reason = Some(reason);
 
@@ -1162,10 +1177,27 @@ impl Future for DrainPending {
 	}
 }
 
+impl MuxShared {}
+
+impl CancelReason {
+	pub fn cancel_error(&self) -> TransportError {
+		match self {
+			CancelReason::Cancelled => TransportError::OperationFailed(TransportFailure::Cancelled),
+			CancelReason::Timeout => TransportError::OperationFailed(TransportFailure::DeadlineExceeded),
+			CancelReason::Rejected => TransportError::OperationFailed(TransportFailure::ResourceExhausted),
+			// An app-coded cancel is still a cancel. The code itself
+			// carries no transport-failure mapping of its own
+			CancelReason::Application(_) => TransportError::OperationFailed(TransportFailure::Cancelled),
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::super::body::stream_body;
-	use super::super::testing::{noop_cx, poll_chunk};
+	use super::super::body::StreamBody;
+	use super::super::link::MuxLink;
+	use super::super::outbound::outbound_handle;
+	use super::super::testing::noop_cx;
 	use super::*;
 
 	use crate::constants::DEFAULT_HOP_BUDGET;
@@ -1311,7 +1343,7 @@ mod tests {
 	}
 
 	fn assert_cancel_maps(reason: CancelReason, failure: TransportFailure) {
-		let error = cancel_error(reason);
+		let error = reason.cancel_error();
 		assert!(matches!(
 			error,
 			TransportError::OperationFailed(got) if got == failure
@@ -1388,10 +1420,10 @@ mod tests {
 	fn test_ids_follow_open_order_not_reservation_order() {
 		let shared = shared(MuxRole::Client, 4);
 		let early = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
-
 		assert!(matches!(open_one(&shared), Ok(1)));
 
 		drop(early);
+
 		assert!(matches!(open_one(&shared), Ok(3)));
 	}
 
@@ -1654,7 +1686,6 @@ mod tests {
 		let (flag, waker) = FlagWake::pair();
 		let mut cx = Context::from_waker(&waker);
 		assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Pending));
-
 		assert!(shared.remove_pending(1).is_some());
 
 		assert!(flag.woken());
@@ -1848,7 +1879,7 @@ mod tests {
 		let mut filler = outbound_handle(&outbound);
 		while filler.try_send(Outbound::Close).is_ok() {}
 
-		enqueue_stream_cancel(&shared, &outbound, 1);
+		MuxLink::new(shared, outbound).enqueue_stream_cancel(1);
 
 		let mut saw_cancel = false;
 		while let Ok(command) = wire.try_recv() {
@@ -1869,15 +1900,15 @@ mod tests {
 	fn test_fail_duplex_above_fails_disowned_replies() {
 		let shared = shared(MuxRole::Client, 4);
 		let (feedback, _notes) = mpsc::unbounded();
-		let (mut kept, below) = stream_body(OpenSlot::assigned(1), 4, feedback.clone());
-		let (mut disowned, above) = stream_body(OpenSlot::assigned(3), 4, feedback);
+		let (mut kept, below) = StreamBody::pair(OpenSlot::assigned(1), 4, feedback.clone());
+		let (mut disowned, above) = StreamBody::pair(OpenSlot::assigned(3), 4, feedback);
 		shared.insert_duplex(1, below);
 		shared.insert_duplex(3, above);
 
 		shared.fail_duplex_above(1);
 
-		assert!(matches!(poll_chunk(&mut kept), Poll::Pending));
-		assert!(matches!(poll_chunk(&mut disowned), Poll::Ready(Err(TransportError::Draining))));
+		assert!(matches!(kept.poll_chunk_now(), Poll::Pending));
+		assert!(matches!(disowned.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
 		assert!(shared.take_duplex(1).is_some());
 		assert!(shared.take_duplex(3).is_none());
 	}

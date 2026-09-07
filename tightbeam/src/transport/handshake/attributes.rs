@@ -1,7 +1,10 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use alloc::vec::Vec;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -87,85 +90,85 @@ impl From<&Attribute> for HandshakeAttribute {
 	}
 }
 
-// -------------------------- Builders --------------------------
-
-/// Encode SecurityOffer for wire transmission.
+/// A payload carried as a handshake attribute under its own OID.
 ///
-/// Client uses this to advertise supported security profiles to server.
+/// Each implementation is the one home for its type's attribute OID, so
+/// the encode and decode sides agree on which OID names which type.
 #[cfg(feature = "transport-cms")]
-pub fn encode_security_offer(offer: &SecurityOffer) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(offer)?;
-	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, any)
+pub trait AttributePayload {
+	/// OID this payload is carried under.
+	const OID: ObjectIdentifier;
 }
 
-/// Encode SecurityAccept for wire transmission.
-///
-/// Server uses this to inform client which profile was selected.
 #[cfg(feature = "transport-cms")]
-pub fn encode_security_accept(accept: &SecurityAccept) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(accept)?;
-	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT, any)
+impl AttributePayload for SecurityOffer {
+	const OID: ObjectIdentifier = HANDSHAKE_SECURITY_OFFER;
 }
 
-/// Canonical DER bytes of a `SecurityAccept` for transcript binding.
-///
-/// Both handshake sides append these bytes to the transcript before the
-/// Finished hash is computed, binding the negotiated profile to the
-/// signature (CWE-345): a tampered accept attribute changes the client's
-/// transcript hash and fails signature verification.
 #[cfg(feature = "transport-cms")]
-pub fn security_accept_transcript_bytes(accept: &SecurityAccept) -> Result<Vec<u8>, HandshakeError> {
-	use crate::der::Encode;
-
-	Ok(Any::encode_from(accept)?.to_der()?)
+impl AttributePayload for SecurityAccept {
+	const OID: ObjectIdentifier = HANDSHAKE_SECURITY_ACCEPT;
 }
 
-/// Encode TransportOffer for wire transmission.
-///
-/// Client uses this to advertise transport capabilities (multiplexing).
 #[cfg(feature = "transport-cms")]
-pub fn encode_transport_offer(offer: &TransportOffer) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(offer)?;
-	HandshakeAttribute::new_single(HANDSHAKE_TRANSPORT_OFFER, any)
+impl AttributePayload for TransportOffer {
+	const OID: ObjectIdentifier = HANDSHAKE_TRANSPORT_OFFER;
 }
 
-/// Encode TransportAccept for wire transmission.
-///
-/// Server uses this to activate multiplexing offered by the client.
 #[cfg(feature = "transport-cms")]
-pub fn encode_transport_accept(accept: &TransportAccept) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(accept)?;
-	HandshakeAttribute::new_single(HANDSHAKE_TRANSPORT_ACCEPT, any)
+impl AttributePayload for TransportAccept {
+	const OID: ObjectIdentifier = HANDSHAKE_TRANSPORT_ACCEPT;
 }
 
-/// Canonical DER bytes of a `TransportAccept` for transcript binding.
-///
-/// Same contract as [`security_accept_transcript_bytes`]: a tampered
-/// transport accept attribute changes the transcript hash and fails
-/// signature verification (CWE-345).
 #[cfg(feature = "transport-cms")]
-pub fn transport_accept_transcript_bytes(accept: &TransportAccept) -> Result<Vec<u8>, HandshakeError> {
-	use crate::der::Encode;
-
-	Ok(Any::encode_from(accept)?.to_der()?)
+impl AttributePayload for SignedData {
+	const OID: ObjectIdentifier = SESSION_RECEIPT;
 }
 
-/// Encode a session receipt artifact attribute (CMS carriage): the
-/// server-signed receipt `SignedData`.
 #[cfg(feature = "transport-cms")]
-pub fn encode_session_receipt(artifact: &SignedData) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(artifact)?;
-	HandshakeAttribute::new_single(SESSION_RECEIPT, any)
+impl AttributePayload for OctetString {
+	const OID: ObjectIdentifier = RECEIPT_ACK;
 }
 
-/// Encode a receipt acknowledgement attribute. The octets are a
-/// DER-encoded EnvelopedData encrypted to the server whose plaintext is
-/// the client's receipt `SignerInfo`. Neither the countersignature nor
-/// the settlement answer bound inside it travels the cleartext wire.
 #[cfg(feature = "transport-cms")]
-pub fn encode_receipt_ack(envelope: &OctetString) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(envelope)?;
-	HandshakeAttribute::new_single(RECEIPT_ACK, any)
+impl HandshakeAttribute {
+	/// Encodes `payload` under its own OID for wire transmission.
+	pub fn encode<T>(payload: &T) -> Result<Self, HandshakeError>
+	where
+		T: AttributePayload + Tagged + crate::der::EncodeValue,
+	{
+		Self::new_single(T::OID, Any::encode_from(payload)?)
+	}
+
+	/// Decodes this attribute, requiring the OID `T` is carried under.
+	///
+	/// An attribute of another type yields [`HandshakeError::MissingAttribute`],
+	/// so a peer cannot substitute one negotiated value for another.
+	pub fn decode<'a, T>(&'a self) -> Result<T, HandshakeError>
+	where
+		T: AttributePayload + crate::der::Choice<'a> + crate::der::DecodeValue<'a>,
+	{
+		if self.attr_type != T::OID {
+			return Err(HandshakeError::MissingAttribute);
+		}
+
+		Ok(self.value()?.decode_as()?)
+	}
+
+	/// Canonical DER bytes of `payload` for transcript binding.
+	///
+	/// Both handshake sides append these bytes to the transcript before
+	/// the Finished hash is computed, binding the negotiated value to the
+	/// signature (CWE-345): a tampered attribute changes the peer's
+	/// transcript hash and fails signature verification.
+	pub fn transcript_bytes<T>(payload: &T) -> Result<Vec<u8>, HandshakeError>
+	where
+		T: AttributePayload + Tagged + crate::der::EncodeValue,
+	{
+		use crate::der::Encode;
+
+		Ok(Any::encode_from(payload)?.to_der()?)
+	}
 }
 
 // -------------------------- Decoders --------------------------
@@ -182,118 +185,6 @@ fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 	}
 
 	Ok(((b[0] as u16) << 8) | b[1] as u16)
-}
-
-/// Extract SecurityOffer from unprotected attributes.
-///
-/// # Parameters
-/// - `attr`: HandshakeAttribute with HANDSHAKE_SECURITY_OFFER_OID type
-///
-/// # Returns
-/// The decoded SecurityOffer
-#[cfg(feature = "transport-cms")]
-pub fn extract_security_offer(attr: &HandshakeAttribute) -> Result<SecurityOffer, HandshakeError> {
-	if attr.attr_type != HANDSHAKE_SECURITY_OFFER {
-		return Err(HandshakeError::MissingAttribute);
-	}
-
-	let any = attr.value()?;
-	Ok(any.decode_as()?)
-}
-
-/// Extract SecurityAccept from unprotected attributes.
-///
-/// # Parameters
-/// - `attr`: HandshakeAttribute with HANDSHAKE_SECURITY_ACCEPT_OID type
-///
-/// # Returns
-/// The decoded SecurityAccept
-#[cfg(feature = "transport-cms")]
-pub fn extract_security_accept(attr: &HandshakeAttribute) -> Result<SecurityAccept, HandshakeError> {
-	if attr.attr_type != HANDSHAKE_SECURITY_ACCEPT {
-		return Err(HandshakeError::MissingAttribute);
-	}
-
-	let any = attr.value()?;
-	Ok(any.decode_as()?)
-}
-
-/// Extract TransportOffer from unprotected attributes.
-#[cfg(feature = "transport-cms")]
-pub fn extract_transport_offer(attr: &HandshakeAttribute) -> Result<TransportOffer, HandshakeError> {
-	if attr.attr_type != HANDSHAKE_TRANSPORT_OFFER {
-		return Err(HandshakeError::MissingAttribute);
-	}
-
-	let any = attr.value()?;
-	Ok(any.decode_as()?)
-}
-
-/// Extract TransportAccept from unprotected attributes.
-#[cfg(feature = "transport-cms")]
-pub fn extract_transport_accept(attr: &HandshakeAttribute) -> Result<TransportAccept, HandshakeError> {
-	if attr.attr_type != HANDSHAKE_TRANSPORT_ACCEPT {
-		return Err(HandshakeError::MissingAttribute);
-	}
-
-	let any = attr.value()?;
-	Ok(any.decode_as()?)
-}
-
-/// Extract the server-signed receipt `SignedData` artifact from
-/// unprotected attributes.
-#[cfg(feature = "transport-cms")]
-pub fn extract_session_receipt(attr: &HandshakeAttribute) -> Result<SignedData, HandshakeError> {
-	if attr.attr_type != SESSION_RECEIPT {
-		return Err(HandshakeError::MissingAttribute);
-	}
-
-	let any = attr.value()?;
-	Ok(any.decode_as()?)
-}
-
-/// Extract the enveloped receipt-acknowledgement bytes from unprotected
-/// attributes.
-#[cfg(feature = "transport-cms")]
-pub fn extract_receipt_ack(attr: &HandshakeAttribute) -> Result<OctetString, HandshakeError> {
-	if attr.attr_type != RECEIPT_ACK {
-		return Err(HandshakeError::MissingAttribute);
-	}
-
-	let any = attr.value()?;
-	Ok(any.decode_as()?)
-}
-
-/// Find at most one unsigned attribute with `oid` across the SignerInfos
-/// of a parsed Finished message, rejecting duplicates.
-///
-/// [RFC 5652 §11.4](https://datatracker.ietf.org/doc/html/rfc5652#section-11.4)
-/// permits repeated unsigned attributes, but every TightBeam handshake
-/// attribute is single-use: a duplicate is either a builder bug or an
-/// injection attempt, and fails closed.
-#[cfg(feature = "transport-cms")]
-pub fn find_unsigned_attr(
-	signed_data: &SignedData,
-	oid: ObjectIdentifier,
-) -> Result<Option<HandshakeAttribute>, HandshakeError> {
-	let mut found = None;
-	let matches = signed_data
-		.signer_infos
-		.0
-		.iter()
-		.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref())
-		.flat_map(|attrs| attrs.iter())
-		.filter(|attr| attr.oid == oid);
-
-	for attr in matches {
-		if found.is_some() {
-			return Err(HandshakeError::DuplicateAttribute);
-		}
-
-		found = Some(HandshakeAttribute::from(attr));
-	}
-
-	Ok(found)
 }
 
 /// Decode an alert code from a single INTEGER-bearing `Any`.
@@ -316,17 +207,6 @@ fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 	}
 }
 
-/// Extract alert from X.509 attribute without cloning
-pub fn extract_alert_x509(attr: &Attribute) -> Result<HandshakeAlert, HandshakeError> {
-	// Convert values to Vec<Any> (unavoidable due to SetOfVec API)
-	let values: Vec<Any> = attr.values.clone().into();
-	if values.len() != 1 {
-		return Err(HandshakeError::InvalidAttributeArity);
-	}
-
-	alert_from_any(&values[0])
-}
-
 // -------------------------- Attribute search --------------------------
 
 #[cfg(feature = "transport-cms")]
@@ -340,6 +220,7 @@ pub fn find<'a>(
 			if found.is_some() {
 				return Err(HandshakeError::DuplicateAttribute);
 			}
+
 			found = Some(a);
 		}
 	}
@@ -363,6 +244,72 @@ pub fn find_x509<'a>(attrs: &'a [&Attribute], oid: &ObjectIdentifier) -> Result<
 }
 
 // -------------------------- Tests --------------------------
+/// Handshake attribute lookups on a CMS `SignedData`.
+#[cfg(feature = "transport-cms")]
+pub trait HandshakeAttributes {
+	/// Find at most one unsigned attribute with `oid` across the
+	/// SignerInfos of a parsed Finished message, rejecting duplicates.
+	///
+	/// [RFC 5652 §11.4](https://datatracker.ietf.org/doc/html/rfc5652#section-11.4)
+	/// permits repeated unsigned attributes, but every TightBeam handshake
+	/// attribute is single-use: a duplicate is either a builder bug or an
+	/// injection attempt, and fails closed.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DuplicateAttribute`] when the oid repeats
+	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError>;
+}
+
+#[cfg(feature = "transport-cms")]
+impl HandshakeAttributes for SignedData {
+	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
+		let mut found = None;
+		let matches = self
+			.signer_infos
+			.0
+			.iter()
+			.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref())
+			.flat_map(|attrs| attrs.iter())
+			.filter(|attr| attr.oid == oid);
+
+		for attr in matches {
+			if found.is_some() {
+				return Err(HandshakeError::DuplicateAttribute);
+			}
+
+			found = Some(HandshakeAttribute::from(attr));
+		}
+
+		Ok(found)
+	}
+}
+
+/// Handshake alert decoding on the x509-cert `Attribute`.
+pub trait HandshakeAlertAttribute {
+	/// Alert code carried by this attribute.
+	///
+	/// The profile admits one value, so any other arity is refused.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidAttributeArity`] on any arity but one
+	/// - [`HandshakeError::IntegerOutOfRange`] on a code above `u8::MAX`
+	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError>;
+}
+
+impl HandshakeAlertAttribute for Attribute {
+	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError> {
+		if self.values.len() != 1 {
+			return Err(HandshakeError::InvalidAttributeArity);
+		}
+
+		let value = self.values.get(0).ok_or(HandshakeError::InvalidAttributeArity)?;
+
+		alert_from_any(value)
+	}
+}
+
 #[cfg(all(test, feature = "transport-cms"))]
 mod tests {
 	use super::*;
@@ -429,11 +376,11 @@ mod tests {
 		];
 		for (alert, code) in alerts.iter() {
 			let attr = mk_alert_attr(&[*code])?;
-			assert_eq!(extract_alert_x509(&attr)?, *alert);
+			assert_eq!(attr.handshake_alert()?, *alert);
 		}
 
 		let unknown = mk_alert_attr(&[0x07])?;
-		assert!(matches!(extract_alert_x509(&unknown), Err(HandshakeError::UnknownAlertCode(7))));
+		assert!(matches!(unknown.handshake_alert(), Err(HandshakeError::UnknownAlertCode(7))));
 		Ok(())
 	}
 
@@ -441,11 +388,11 @@ mod tests {
 	fn alert_integer_out_of_range_rejected() -> Result<(), der::Error> {
 		// Three-byte INTEGER exceeds the u16 decode domain outright.
 		let wide = mk_alert_attr(&[0x01, 0x02, 0x03])?;
-		assert!(matches!(extract_alert_x509(&wide), Err(HandshakeError::IntegerOutOfRange)));
+		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 
 		// 0x0101 = 257. Truncating to u8 would alias alert code 1 (AuthRequired).
 		let above = mk_alert_attr(&[0x01, 0x01])?;
-		assert!(matches!(extract_alert_x509(&above), Err(HandshakeError::IntegerOutOfRange)));
+		assert!(matches!(above.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 		Ok(())
 	}
 

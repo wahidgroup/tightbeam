@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::crypto::hash::Digest;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::utils::{ensure_signature_algorithm_consistency, validate_certificate_expiry};
+use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
 use crate::der::asn1::GeneralizedTime;
 use crate::der::Encode;
@@ -87,7 +87,7 @@ pub struct ExpiryValidator;
 impl CertificateValidation for ExpiryValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): validity-period check only.
-		validate_certificate_expiry(cert)
+		cert.validate_expiry()
 	}
 }
 
@@ -291,7 +291,7 @@ impl DirectTrustValidator {
 impl CertificateValidation for DirectTrustValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): the certificate must be within its validity period.
-		validate_certificate_expiry(cert)?;
+		cert.validate_expiry()?;
 
 		// RFC 5280 §6.1.1: direct trust - the presented certificate must itself
 		// be a configured trust anchor (no path building is performed here).
@@ -344,7 +344,7 @@ impl SignatureVerification for DirectTrustValidator {
 		}
 
 		// RFC 5280 §4.1.1.2: signatureAlgorithm must match tbsCertificate.signature.
-		ensure_signature_algorithm_consistency(cert)?;
+		cert.ensure_signature_algorithm_consistency()?;
 
 		// RFC 5280 §6.1.3(a)(1): verify the signature using the issuer's key.
 		let message = cert.tbs_certificate.to_der()?;

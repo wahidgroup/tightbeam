@@ -11,24 +11,21 @@ use alloc::vec::Vec;
 
 use crate::spki::AlgorithmIdentifierOwned;
 
-#[cfg(feature = "transport-ecies")]
-use crate::ZeroizingArray;
-
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+use crate::asn1::OctetString;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-mod transport {
-	#[cfg(any(
-		feature = "transport-ecies",
-		all(feature = "transport-multiplex", feature = "transport-cms")
-	))]
-	pub use crate::asn1::OctetString;
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-	pub use crate::transport::handshake::error::HandshakeError;
-	pub use crate::x509::Certificate;
-}
-
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use transport::*;
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::x509::utils::CertificateExt;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::error::HandshakeError;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::x509::Certificate;
 
 /// AES-256-GCM algorithm identifier.
 ///
@@ -55,37 +52,12 @@ pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), Hands
 
 /// Parse the certificate SPKI into a curve `PublicKey` for
 /// signature verification.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub fn extract_verifying_key_from_cert<C>(cert: &Certificate) -> Result<PublicKey<C>, HandshakeError>
-where
-	C: Curve + CurveArithmetic,
-	<C as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-{
-	let pubkey_bytes = crate::crypto::x509::utils::extract_verifying_key_bytes(cert);
-	Ok(PublicKey::<C>::from_sec1_bytes(pubkey_bytes)?)
-}
-
 /// Fixed 32-byte view of an ECIES wire nonce.
 /// Wrong length fails closed.
-#[cfg(any(
-	feature = "transport-ecies",
-	all(feature = "transport-multiplex", feature = "transport-cms")
-))]
-pub fn octet_string_to_32_byte_array(octet_string: &OctetString) -> Result<[u8; 32], HandshakeError> {
-	let bytes = octet_string.as_bytes();
-	if bytes.len() != 32 {
-		return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
-	}
-
-	let mut out = [0u8; 32];
-	out.copy_from_slice(bytes);
-	Ok(out)
-}
-
 /// 32-byte transcript digest under digest algorithm `D`.
 ///
 /// Wider digests (e.g. SHA3-512) truncate to the leading 32 bytes.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub fn compute_transcript_digest<D>(data: &[u8]) -> Result<[u8; 32], HandshakeError>
 where
@@ -170,18 +142,64 @@ where
 	compute_transcript_digest::<D>(&data)
 }
 
-/// Erase ephemeral ECIES key material after session establishment (CWE-226).
-#[cfg(feature = "transport-ecies")]
-pub fn clear_session_randoms(
-	base_session_key: &mut Option<ZeroizingArray<32>>,
-	client_random: &mut Option<[u8; 32]>,
-	server_random: &mut Option<[u8; 32]>,
-) {
-	use crate::zeroize::Zeroize;
+/// Fixed-width views of a DER `OctetString`.
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+pub trait HandshakeOctets {
+	/// Fixed 32-byte view of an ECIES wire nonce.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::OctetStringLengthError`] on any other length,
+	///   so a short or long nonce fails closed
+	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError>;
+}
 
-	base_session_key.zeroize();
-	client_random.zeroize();
-	server_random.zeroize();
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+impl HandshakeOctets for OctetString {
+	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError> {
+		let bytes = self.as_bytes();
+		if bytes.len() != 32 {
+			return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
+		}
+
+		let mut out = [0u8; 32];
+		out.copy_from_slice(bytes);
+		Ok(out)
+	}
+}
+
+/// Public-key extraction from a certificate.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub trait HandshakeVerifyingKey {
+	/// Public key parsed from this certificate's SPKI, on curve `C`.
+	///
+	/// # Errors
+	///
+	/// - SEC1 decode failures over the certificate's key bytes
+	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
+	where
+		C: Curve + CurveArithmetic,
+		<C as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl HandshakeVerifyingKey for Certificate {
+	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
+	where
+		C: Curve + CurveArithmetic,
+		<C as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	{
+		let pubkey_bytes = self.verifying_key_bytes();
+		Ok(PublicKey::<C>::from_sec1_bytes(pubkey_bytes)?)
+	}
 }
 
 #[cfg(test)]

@@ -474,34 +474,57 @@ pub fn ecies_kdf_with_size<P: KdfFunction, const N: usize>(
 	P::derive_dual_keys::<N>(shared_secret, &shared_info, salt)
 }
 
-/// ECIES with raw SharedInfo: caller supplies exact SharedInfo/OtherInfo bytes (no EPK auto-append).
-/// IKM is the shared secret Z.
-pub fn ecies_kdf_with_shared_info<P: KdfFunction>(
-	shared_secret: SecretSlice<u8>,
-	shared_info: impl AsRef<[u8]>,
-	salt: Option<&[u8]>,
-) -> Result<ZeroizingArray<32>> {
-	let insecure_shared_secret = shared_secret.to_insecure()?;
-	let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
-	assert_valid_shared_secret(shared_secret)?;
-	assert_valid_salt(salt)?;
+/// ECIES key derivation over a shared secret.
+pub trait EciesKdf {
+	/// Derive a 32-byte key with caller-supplied SharedInfo (no EPK append).
+	///
+	/// # Errors
+	///
+	/// - Shared-secret or salt validation failures
+	fn ecies_kdf_with_shared_info<P: KdfFunction>(
+		self,
+		shared_info: impl AsRef<[u8]>,
+		salt: Option<&[u8]>,
+	) -> Result<ZeroizingArray<32>>;
 
-	P::derive_key::<32>(shared_secret, shared_info, salt)
+	/// Derive a dual key of `N` bytes with caller-supplied SharedInfo.
+	///
+	/// # Errors
+	///
+	/// - Shared-secret or salt validation failures
+	fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
+		self,
+		shared_info: impl AsRef<[u8]>,
+		salt: Option<&[u8]>,
+	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)>;
 }
 
-/// ECIES dual-key with raw SharedInfo: caller supplies exact SharedInfo/OtherInfo bytes.
-/// IKM is the shared secret Z. Provider-specific bounds may apply.
-pub fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
-	shared_secret: SecretSlice<u8>,
-	shared_info: impl AsRef<[u8]>,
-	salt: Option<&[u8]>,
-) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
-	let insecure_shared_secret = shared_secret.to_insecure()?;
-	let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
-	assert_valid_shared_secret(shared_secret)?;
-	assert_valid_salt(salt)?;
+impl EciesKdf for SecretSlice<u8> {
+	fn ecies_kdf_with_shared_info<P: KdfFunction>(
+		self,
+		shared_info: impl AsRef<[u8]>,
+		salt: Option<&[u8]>,
+	) -> Result<ZeroizingArray<32>> {
+		let insecure_shared_secret = self.to_insecure()?;
+		let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
+		assert_valid_shared_secret(shared_secret)?;
+		assert_valid_salt(salt)?;
 
-	P::derive_dual_keys::<N>(shared_secret, shared_info, salt)
+		P::derive_key::<32>(shared_secret, shared_info, salt)
+	}
+
+	fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
+		self,
+		shared_info: impl AsRef<[u8]>,
+		salt: Option<&[u8]>,
+	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
+		let insecure_shared_secret = self.to_insecure()?;
+		let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
+		assert_valid_shared_secret(shared_secret)?;
+		assert_valid_salt(salt)?;
+
+		P::derive_dual_keys::<N>(shared_secret, shared_info, salt)
+	}
 }
 
 #[cfg(test)]
@@ -747,7 +770,7 @@ mod tests {
 	fn test_x963_dual_keys_large_shared_info() -> crate::error::Result<()> {
 		let large_info = vec![0xABu8; 300];
 		let (k_enc, k_mac) =
-			ecies_kdf_with_shared_info_and_size::<X963Sha3_256, 32>(shared_secret_32(), &large_info, None)?;
+			shared_secret_32().ecies_kdf_with_shared_info_and_size::<X963Sha3_256, 32>(&large_info, None)?;
 
 		assert_key_pair_lengths!(k_enc, k_mac, 32);
 		assert_keys_different!(k_enc, k_mac);

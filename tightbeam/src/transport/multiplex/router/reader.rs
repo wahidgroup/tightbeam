@@ -10,11 +10,12 @@ use futures::channel::mpsc;
 use futures::future::{select, Either};
 use futures::{pin_mut, SinkExt, StreamExt};
 
-use super::body::{stream_body, BodyEvent, DrainNote, ForwardedStream, StreamBody};
+use super::body::{BodyEvent, DrainNote, ForwardedStream, StreamBody};
 use super::flow::{cap_as_usize, payload_credits, BufferedGrantor, CreditGrantor};
+use super::link::MuxLink;
+use super::outbound::outbound_handle;
 use super::outbound::Outbound;
-use super::shared::{cancel_error, MuxShared, OpenSlot, PeerStream, StreamOutcome};
-use super::writer::{goaway_best_effort, goaway_package};
+use super::shared::{MuxShared, OpenSlot, PeerStream, StreamOutcome};
 use crate::der::Decode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{
@@ -31,8 +32,6 @@ use crate::Frame;
 use super::flow::renewal_floor;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use super::shared::RekeyPhase;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use super::writer::open_renewal;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::DEFAULT_REKEY_MIN_SPEND_RECORDS;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -220,20 +219,6 @@ async fn flush_control(outbound: &mut mpsc::Sender<Outbound>, pending: &mut VecD
 	Ok(())
 }
 
-/// Whether `command` is a buffered credit grant for `stream_id`.
-fn is_credit_grant_for(command: &Outbound, stream_id: u32) -> bool {
-	matches!(
-		command,
-		Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package)))
-			if package.stream_id() == stream_id
-	)
-}
-
-/// Whether `command` is a buffered ping ack.
-fn is_ping_ack(command: &Outbound) -> bool {
-	matches!(command, Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Ping(_))))
-}
-
 /// One unit of read-loop work (see [`MuxReaderDriver::next_event`]).
 enum ReaderEvent {
 	Envelope(TransportEnvelope),
@@ -243,12 +228,17 @@ enum ReaderEvent {
 	Flushed,
 }
 
-/// The driver holds a feedback sender for the body channel, so the
-/// note stream outlives every body.
-fn drain_event(note: Option<DrainNote>) -> ReaderEvent {
-	match note {
-		Some(note) => ReaderEvent::Drained(note),
-		None => ReaderEvent::Flushed,
+impl ReaderEvent {
+	/// Read one drain report off the note stream.
+	///
+	/// The driver holds a feedback sender for the body channel, so the note
+	/// stream outlives every body. [`None`] therefore means the flush
+	/// completed rather than that a body ended.
+	fn drained(note: Option<DrainNote>) -> Self {
+		match note {
+			Some(note) => Self::Drained(note),
+			None => Self::Flushed,
+		}
 	}
 }
 
@@ -256,6 +246,11 @@ impl<R> MuxReaderDriver<R>
 where
 	R: EnvelopeSource,
 {
+	/// This driver\'s connection state paired with its outbound queue.
+	fn link(&self) -> MuxLink {
+		MuxLink::new(Arc::clone(&self.shared), outbound_handle(&self.outbound))
+	}
+
 	/// Assemble the reader driver over its shared state and
 	/// channels: the single construction point, so a new field has
 	/// exactly one home.
@@ -403,7 +398,7 @@ where
 		let Some(RekeyDriver::Client(exchange)) = self.rekey.as_ref() else {
 			return Ok(());
 		};
-		let Some(request) = open_renewal(&self.shared, exchange) else {
+		let Some(request) = self.shared.open_renewal(exchange) else {
 			return Ok(());
 		};
 
@@ -423,7 +418,7 @@ where
 		#[cfg(feature = "instrument")]
 		self.shared.emit_event(events::MUX_REKEY_REFUSED);
 
-		let Some(package) = goaway_package(&self.shared, refusal_reason(code)) else {
+		let Some(package) = self.shared.goaway_package(refusal_reason(code)) else {
 			return Ok(());
 		};
 
@@ -628,7 +623,7 @@ where
 		if pending_control.is_empty() {
 			return match select(read, note).await {
 				Either::Left((envelope, _)) => Ok(ReaderEvent::Envelope(envelope?)),
-				Either::Right((note, _)) => Ok(drain_event(note)),
+				Either::Right((note, _)) => Ok(ReaderEvent::drained(note)),
 			};
 		}
 
@@ -637,7 +632,7 @@ where
 
 		match select(read, select(note, flush)).await {
 			Either::Left((envelope, _)) => Ok(ReaderEvent::Envelope(envelope?)),
-			Either::Right((Either::Left((note, _)), _)) => Ok(drain_event(note)),
+			Either::Right((Either::Left((note, _)), _)) => Ok(ReaderEvent::drained(note)),
 			Either::Right((Either::Right((flushed, _)), _)) => {
 				flushed?;
 				Ok(ReaderEvent::Flushed)
@@ -720,13 +715,12 @@ where
 	/// closes: ids never recur, so a leftover grant is dead weight that
 	/// would accumulate across stream churn under writer backpressure.
 	fn evict_credit(&mut self, stream_id: u32) {
-		self.pending_control
-			.retain(|envelope| !is_credit_grant_for(envelope, stream_id));
+		self.pending_control.retain(|envelope| !envelope.is_credit_grant_for(stream_id));
 	}
 
 	/// Queue a ping ack. Probes beyond [`MAX_PENDING_PING_ACKS`] draw no ack.
 	fn queue_ping_ack(&mut self, package: MuxPingPackage) -> TransportResult<()> {
-		let buffered_acks = self.pending_control.iter().filter(|envelope| is_ping_ack(envelope)).count();
+		let buffered_acks = self.pending_control.iter().filter(|envelope| envelope.is_ping_ack()).count();
 		if buffered_acks >= MAX_PENDING_PING_ACKS {
 			return Ok(());
 		}
@@ -899,7 +893,7 @@ where
 			return Err(self.protocol_violation());
 		}
 
-		let (body, mut forwarder) = stream_body(
+		let (body, mut forwarder) = StreamBody::pair(
 			OpenSlot::assigned(stream_id),
 			self.initial_recv_credit,
 			self.drain_feedback.clone(),
@@ -1118,9 +1112,11 @@ where
 		if self.shared.role.initiates(stream_id) {
 			// Peer cancelled/refused a stream we initiated
 			self.local_reassembly.remove(&stream_id);
+
 			if let Some(mut forwarder) = self.shared.take_duplex(stream_id) {
-				let _ = forwarder.forward(BodyEvent::Failed(cancel_error(package.reason())));
+				let _ = forwarder.forward(BodyEvent::Failed(package.reason().cancel_error()));
 			}
+
 			self.evict_credit(stream_id);
 			self.shared.resolve(stream_id, StreamOutcome::Cancelled(package.reason()));
 			return Ok(());
@@ -1174,7 +1170,7 @@ where
 		self.shared.emit_event(events::MUX_PROTOCOL_ERROR);
 
 		let last = self.shared.last_peer_stream_id();
-		goaway_best_effort(&self.shared, &self.outbound, last, GoAwayReason::ProtocolError);
+		self.link().goaway_best_effort(last, GoAwayReason::ProtocolError);
 
 		TransportError::InvalidMessage
 	}
@@ -1187,7 +1183,7 @@ mod tests {
 	use core::sync::atomic::{AtomicUsize, Ordering};
 	use core::task::Poll;
 
-	use super::super::testing::{body_fixture, noop_cx, poll_chunk};
+	use super::super::testing::{body_fixture, noop_cx};
 	use super::*;
 	use crate::transport::multiplex::MuxRole;
 	use crate::utils::marker::MaybeSend;
@@ -1328,7 +1324,6 @@ mod tests {
 	#[test]
 	fn test_refusal_cancel_buffers_when_queue_full() -> TransportResult<()> {
 		let mut fixture = reader_with_full_queue(vec![]);
-
 		fixture.driver.refuse_stream(1)?;
 
 		assert!(matches!(
@@ -1352,7 +1347,6 @@ mod tests {
 
 		let mut driver = Box::pin(fixture.driver.drive());
 		poll_times(&mut driver, 8);
-
 		assert_eq!(delivered.load(Ordering::SeqCst), 2);
 	}
 
@@ -1399,7 +1393,7 @@ mod tests {
 
 		let buffered: Vec<_> = fixture.driver.pending_control.iter().collect();
 		assert_eq!(buffered.len(), 2);
-		assert!(is_credit_grant_for(buffered[0], 3));
+		assert!(buffered[0].is_credit_grant_for(3));
 		assert!(matches!(
 			buffered[1],
 			Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package)))
@@ -1430,7 +1424,7 @@ mod tests {
 
 		let buffered: Vec<_> = fixture.driver.pending_control.iter().collect();
 		assert_eq!(buffered.len(), 1);
-		assert!(is_credit_grant_for(buffered[0], 3));
+		assert!(buffered[0].is_credit_grant_for(3));
 
 		Ok(())
 	}
@@ -1451,13 +1445,14 @@ mod tests {
 	fn test_streaming_grant_clamps_to_channel_window() -> TransportResult<()> {
 		let mut fixture = reader_with_full_queue(Vec::new());
 		fixture.driver.grantor = Arc::new(GreedyGrant);
+
 		let (_body, forwarder, _notes) = body_fixture(5, 2);
 		fixture.driver.peer_bodies.insert(5, forwarder);
-
 		fixture.driver.grant_streaming(DrainNote { stream_id: 5, consumed: 1 })?;
 
 		let limit = fixture.driver.peer_bodies.get(&5).map(|stream| stream.limits().0);
 		assert_eq!(limit, Some(3));
+
 		let buffered: Vec<_> = fixture.driver.pending_control.iter().collect();
 		assert_eq!(buffered.len(), 1);
 		assert!(matches!(
@@ -1471,8 +1466,8 @@ mod tests {
 
 	#[test]
 	fn test_streaming_open_forwards_chunks_without_reassembly() {
-		let open =
-			MuxOpenPackage::new(1, false, MuxStreamKind::Streaming, vec![1u8; 4]).expect("fixture open fits a package");
+		let kind = MuxStreamKind::Streaming;
+		let open = MuxOpenPackage::new(1, false, kind, vec![1u8; 4]).expect("fixture open fits a package");
 		let data = MuxDataPackage::new(1, true, vec![2u8; 4]).expect("fixture chunk fits a package");
 		let mut fixture = reader_with_full_queue(vec![open.into(), data.into()]);
 
@@ -1485,15 +1480,17 @@ mod tests {
 			dispatched,
 			Ok(InboundEvent::StreamOpen(1, MuxStreamKind::Streaming, _, _))
 		));
+
 		let Ok(InboundEvent::StreamOpen(_, _, mut body, _)) = dispatched else {
 			return;
 		};
 
-		let first = poll_chunk(&mut body);
+		let first = body.poll_chunk_now();
 		assert!(matches!(first, Poll::Ready(Ok(Some(chunk))) if chunk == [1u8; 4]));
-		let second = poll_chunk(&mut body);
+
+		let second = body.poll_chunk_now();
 		assert!(matches!(second, Poll::Ready(Ok(Some(chunk))) if chunk == [2u8; 4]));
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 	}
 
 	// A refused or abandoned body evicts its forwarder on the next
@@ -1503,12 +1500,13 @@ mod tests {
 	fn test_forward_request_chunk_evicts_severed_body() {
 		let mut fixture = reader_with_full_queue(Vec::new());
 		let (body, forwarder, _notes) = body_fixture(1, 4);
+
 		drop(body);
+
 		fixture.driver.peer_bodies.insert(1, forwarder);
 
 		let package = MuxDataPackage::new(1, false, vec![7u8; 4]).expect("fixture chunk fits a package");
 		let routed = fixture.driver.forward_request_chunk(&package);
-
 		assert!(routed.is_ok());
 		assert!(fixture.driver.peer_bodies.is_empty());
 	}
@@ -1524,10 +1522,9 @@ mod tests {
 			.driver
 			.pending_control
 			.iter()
-			.filter(|envelope| is_ping_ack(envelope))
+			.filter(|envelope| envelope.is_ping_ack())
 			.count();
 		assert_eq!(buffered_acks, MAX_PENDING_PING_ACKS);
-
 		Ok(())
 	}
 }

@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use crate::colony::common::current_timestamp_ms;
 use crate::colony::hive::ReplayGuard;
-use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::Frame;
 
@@ -41,7 +40,7 @@ impl GatewayReplayGuard {
 		let Some(signer_info) = frame.nonrepudiation.as_ref() else {
 			return TransitStatus::Unauthenticated;
 		};
-		let Ok(signer_id) = Encode::to_der(&signer_info.sid) else {
+		let Some(signer_id) = frame.signer_id() else {
 			return TransitStatus::PermissionDenied;
 		};
 		if !self.0.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now) {

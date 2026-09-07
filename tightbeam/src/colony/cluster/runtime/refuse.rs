@@ -6,7 +6,6 @@
 //! against another.
 
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
-use crate::colony::cluster::signer_attribution;
 use crate::colony::common::{reply_frame, GossipResponse, GossipWant, PeerAdvertisementResponse};
 use crate::instrumentation::events::{CLUSTER_GOSSIP_REFUSED, CLUSTER_PEER_ADVERTISE_REFUSED};
 use crate::policy::TransitStatus;
@@ -62,7 +61,7 @@ impl<'f> Refusal<'f> {
 	/// Records the refusal, attributed to the frame's signer when signed.
 	fn trace_gossip(self) -> Result<(), TightBeamError> {
 		let event = self.trace.event(CLUSTER_GOSSIP_REFUSED)?;
-		match signer_attribution(self.frame) {
+		match self.frame.signer_id() {
 			Some(signer) => event.with_payload(&signer).emit(),
 			None => event.emit(),
 		}

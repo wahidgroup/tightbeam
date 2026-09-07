@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use crate::colony::common::{canonical_bytes, instance_urn, take_and_abort, ColonyResource, DrainMode, TaskGroup};
+use crate::colony::common::{ColonyResource, DrainMode, TaskGroup};
 use crate::colony::hive::runtime::control::InFlight;
 use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveControlCtx, ScalingLoop};
 use crate::colony::hive::{
@@ -37,8 +37,6 @@ use crate::utils::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
 use crate::colony::hive::{ClusterCircuitBreaker, ReplayGuard};
-use crate::crypto::x509::Certificate;
-use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::TransportEncryptionConfig;
 
 /// Running hive for protocol `P`.
@@ -70,7 +68,7 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 impl<P: Protocol> HiveRuntime<P> {
 	fn abort_tasks(&mut self) {
 		self.tasks.abort_all();
-		take_and_abort(&mut self.control_server_handle);
+		rt::take_and_abort(&mut self.control_server_handle);
 	}
 
 	fn build_control_ctx(&self) -> HiveControlCtx<P> {
@@ -120,8 +118,7 @@ where
 		{
 			match config.hive_tls.as_ref() {
 				Some(hive_tls) => {
-					let certificate = Certificate::try_from(hive_tls.certificate.clone())?;
-					let key_manager = HandshakeKeyManager::new(Arc::clone(&hive_tls.key));
+					let (certificate, key_manager) = hive_tls.identity()?;
 					let mut encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
 					if !hive_tls.validators.is_empty() {
 						let validators: Vec<_> = hive_tls.validators.iter().map(Arc::clone).collect();
@@ -134,24 +131,6 @@ where
 			}
 		}
 	}
-}
-
-fn collect_spawners(servlets: &HashMapRegistry) -> HashMap<Urn<'static>, SpawnerFn> {
-	let mut spawners = HashMap::new();
-	servlets.for_each(|_key, reg| {
-		spawners.insert(reg.servlet_type.clone(), Arc::clone(&reg.spawner));
-	});
-
-	spawners
-}
-
-fn seed_hive_routes<P: Protocol>(servlets: &HashMapRegistry, hive_context: &HiveContextImpl<P>) {
-	servlets.for_each(|key, reg| {
-		let addr_bytes = reg.servlet.addr_bytes();
-		let type_key = canonical_bytes(&reg.servlet_type);
-		// for_each borrows the registry key, and add_route needs an owned copy.
-		hive_context.add_route(key.clone(), addr_bytes, &type_key);
-	});
 }
 
 impl<P> Hive for HiveRuntime<P>
@@ -242,7 +221,7 @@ where
 		});
 
 		// Key by instance URN bytes so manage stop and scaling share one lookup.
-		let key = canonical_bytes(&instance_urn(&servlet_type, servlet.addr_bytes())?);
+		let key = servlet_type.instance_urn(servlet.addr_bytes())?.canonical_bytes();
 		let registration = ServletRegistration { servlet: Box::new(servlet), spawner, servlet_type };
 
 		self.servlets.insert(key, registration)?;
@@ -259,9 +238,9 @@ where
 		let (listener, addr) = Self::bind_control_listener(&self.config).await?;
 
 		self.addr = addr;
-		self.spawners = Arc::new(collect_spawners(&self.servlets));
+		self.spawners = Arc::new(self.servlets.spawners());
 
-		seed_hive_routes(&self.servlets, &self.hive_context);
+		self.hive_context.seed_routes(&self.servlets);
 
 		// Share the configured mux offer with the control accept loop.
 		let mux_offer = self.config.pool.mux_offer.as_ref().map(Arc::clone);

@@ -48,6 +48,32 @@ pub enum AssertionValue {
 	TransitStatus(TransitStatus),
 }
 
+impl AssertionValue {
+	/// One-line rendering of the held value, for instrument-log payloads.
+	#[cfg(feature = "instrument")]
+	pub(crate) fn render(&self) -> String {
+		match self {
+			Self::String(s) => s.to_string(),
+			Self::Bool(b) => b.to_string(),
+			Self::U8(n) => n.to_string(),
+			Self::U32(n) => n.to_string(),
+			Self::U64(n) => n.to_string(),
+			Self::I32(n) => n.to_string(),
+			Self::I64(n) => n.to_string(),
+			Self::F64(n) => n.to_string(),
+			Self::MessagePriority(p) => format!("{p:?}"),
+			Self::Version(v) => format!("{v:?}"),
+			Self::Some(inner) => format!("Some({inner:?})"),
+			Self::IsNone => "none".to_string(),
+			Self::IsSome => "some".to_string(),
+			Self::RatioActual(n, d) => format!("{n}/{d}"),
+			Self::RatioLimit(n, d) => format!("≤{n}/{d}"),
+			#[cfg(feature = "policy")]
+			Self::TransitStatus(status) => format!("{status:?}"),
+		}
+	}
+}
+
 impl PartialEq for AssertionValue {
 	fn eq(&self, other: &Self) -> bool {
 		match (self, other) {

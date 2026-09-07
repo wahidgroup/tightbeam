@@ -720,15 +720,6 @@ pub(crate) fn client_mux_settings(
 	Ok(Some(settings))
 }
 
-/// Server-side settings from the client's offer and the accept just emitted.
-///
-/// Directional views are clamped through the same choke points as
-/// [`client_mux_settings`].
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) fn server_mux_settings(offer: &TransportOffer, accept: &TransportAccept) -> MuxSettings {
-	mux_settings(offer, accept, false)
-}
-
 /// Directional [`MuxSettings`] from the clamped wire values both endpoints
 /// observed.
 ///
@@ -903,35 +894,48 @@ impl ProfileStrengthPolicy for NoStrengthFloor {
 	}
 }
 
-/// Select the first mutually supported profile in *local* preference order.
-///
-/// Iterates `supported` as configured and picks the first profile the peer
-/// also offered. Peer offer ordering carries no weight: a MITM rewriting
-/// it cannot steer selection toward a weaker mutual profile (CWE-757).
-///
-/// # Errors
-///
-/// - [`NegotiationError::EmptyOffer`] - peer sent an empty offer.
-/// - [`NegotiationError::OfferTooLarge`] - offer exceeds [`MAX_OFFER_PROFILES`].
-/// - [`NegotiationError::NoMutualProfile`] - no intersection with `supported`.
-pub(crate) fn select_profile(
-	offer: &SecurityOffer,
-	supported: &[SecurityProfileDesc],
-) -> Result<SecurityProfileDesc, NegotiationError> {
-	if offer.profiles.is_empty() {
-		return Err(NegotiationError::EmptyOffer);
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl TransportOffer {
+	/// Server-side settings from this offer and the accept it answered with.
+	///
+	/// Directional views are clamped through the same choke points as
+	/// [`client_mux_settings`].
+	pub(crate) fn server_mux_settings(&self, accept: &TransportAccept) -> MuxSettings {
+		mux_settings(self, accept, false)
 	}
-	if offer.profiles.len() > MAX_OFFER_PROFILES {
-		return Err(NegotiationError::OfferTooLarge { count: offer.profiles.len(), max: MAX_OFFER_PROFILES });
-	}
+}
 
-	for candidate in supported {
-		if offer.profiles.contains(candidate) {
-			return Ok(*candidate);
+impl SecurityOffer {
+	/// Select the first mutually supported profile in *local* preference order.
+	///
+	/// Iterates `supported` as configured and picks the first profile the peer
+	/// also offered. Peer offer ordering carries no weight: a MITM rewriting
+	/// it cannot steer selection toward a weaker mutual profile (CWE-757).
+	///
+	/// # Errors
+	///
+	/// - [`NegotiationError::EmptyOffer`] - peer sent an empty offer.
+	/// - [`NegotiationError::OfferTooLarge`] - offer exceeds [`MAX_OFFER_PROFILES`].
+	/// - [`NegotiationError::NoMutualProfile`] - no intersection with `supported`.
+	pub(crate) fn select_profile(
+		&self,
+		supported: &[SecurityProfileDesc],
+	) -> Result<SecurityProfileDesc, NegotiationError> {
+		if self.profiles.is_empty() {
+			return Err(NegotiationError::EmptyOffer);
 		}
-	}
+		if self.profiles.len() > MAX_OFFER_PROFILES {
+			return Err(NegotiationError::OfferTooLarge { count: self.profiles.len(), max: MAX_OFFER_PROFILES });
+		}
 
-	Err(NegotiationError::NoMutualProfile)
+		for candidate in supported {
+			if self.profiles.contains(candidate) {
+				return Ok(*candidate);
+			}
+		}
+
+		Err(NegotiationError::NoMutualProfile)
+	}
 }
 
 // Exercises mux negotiation helpers when a transport flavor is enabled.
@@ -1018,7 +1022,7 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::from([p1, p2, p3]));
 		let supported = [p2, p3];
 
-		let selected = select_profile(&offer, &supported)?;
+		let selected = offer.select_profile(&supported)?;
 		assert_eq!(selected, p2);
 
 		Ok(())
@@ -1034,7 +1038,7 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::from([p1, p2]));
 		let supported = [p2, p1];
 
-		let selected = select_profile(&offer, &supported)?;
+		let selected = offer.select_profile(&supported)?;
 		assert_eq!(selected, p2);
 
 		Ok(())
@@ -1049,7 +1053,7 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::from([p1, p2]));
 		let supported = [p3];
 
-		let result = select_profile(&offer, &supported);
+		let result = offer.select_profile(&supported);
 		assert!(matches!(result, Err(NegotiationError::NoMutualProfile)));
 	}
 
@@ -1059,7 +1063,7 @@ mod tests {
 		let offer = SecurityOffer::new(vec![profile; MAX_OFFER_PROFILES + 1]);
 		let supported = [profile];
 
-		let result = select_profile(&offer, &supported);
+		let result = offer.select_profile(&supported);
 		assert!(matches!(result, Err(NegotiationError::OfferTooLarge { count: 33, max: 32 })));
 	}
 
@@ -1068,7 +1072,7 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::new());
 		let supported = [sample_profile(1)];
 
-		let result = select_profile(&offer, &supported);
+		let result = offer.select_profile(&supported);
 		assert!(matches!(result, Err(NegotiationError::EmptyOffer)));
 	}
 
@@ -1333,7 +1337,7 @@ mod tests {
 		assert_eq!(client.local_initiated_cap, 4);
 		assert_eq!(client.peer_initiated_cap, 8);
 
-		let server = server_mux_settings(&offer, &accept);
+		let server = offer.server_mux_settings(&accept);
 		assert_eq!(server.local_initiated_cap, 8);
 		assert_eq!(server.peer_initiated_cap, 4);
 
@@ -1360,7 +1364,7 @@ mod tests {
 		assert_eq!(client.initial_send_credit, 32);
 		assert_eq!(client.initial_recv_credit, 16);
 
-		let server = server_mux_settings(&offer, &accept);
+		let server = offer.server_mux_settings(&accept);
 		assert_eq!(server.send_chunk_size, 8 * 1024);
 		assert_eq!(server.recv_chunk_size, 32 * 1024);
 		assert_eq!(server.credit_unit, 2048);
@@ -1380,7 +1384,7 @@ mod tests {
 		assert_eq!(client.send_budget, Some(100));
 		assert_eq!(client.recv_budget, Some(300));
 
-		let server = server_mux_settings(&offer, &accept);
+		let server = offer.server_mux_settings(&accept);
 		assert_eq!(server.send_budget, Some(300));
 		assert_eq!(server.recv_budget, Some(100));
 
@@ -1409,7 +1413,7 @@ mod tests {
 		assert_eq!(client.local_initiated_cap, MAX_MUX_STREAM_CAP);
 		assert_eq!(client.peer_initiated_cap, MAX_MUX_STREAM_CAP);
 
-		let server = server_mux_settings(&offer, &accept);
+		let server = offer.server_mux_settings(&accept);
 		assert_eq!(server.local_initiated_cap, MAX_MUX_STREAM_CAP);
 		assert_eq!(server.peer_initiated_cap, MAX_MUX_STREAM_CAP);
 
@@ -1581,7 +1585,7 @@ mod tests {
 
 		for (client_profiles, server_profiles, expected_aead, expected_key_size) in cases {
 			let offer = SecurityOffer::new(client_profiles.to_vec());
-			let selected = select_profile(&offer, server_profiles)?;
+			let selected = offer.select_profile(server_profiles)?;
 			assert_eq!(selected.aead, Some(expected_aead));
 			assert_eq!(selected.aead_key_size, Some(expected_key_size));
 		}

@@ -145,6 +145,17 @@ mod attributes;
 mod common;
 mod error;
 mod utils;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub(crate) use utils::HandshakeOctets;
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub(crate) use utils::HandshakeVerifyingKey;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod wire;
@@ -179,9 +190,7 @@ pub(crate) use utils::aes_256_gcm_algorithm;
 ))]
 mod mux {
 	pub(crate) use super::common::derive_directional_from_oid;
-	pub(crate) use super::utils::{
-		compute_transcript_digest, extract_verifying_key_from_cert, octet_string_to_32_byte_array,
-	};
+	pub(crate) use super::utils::compute_transcript_digest;
 }
 
 #[cfg(all(

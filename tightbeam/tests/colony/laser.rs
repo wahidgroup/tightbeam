@@ -43,7 +43,6 @@ use tightbeam::{
 		serve::{CallContext, MuxService},
 		ClientBuilder, ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, TransportEncryptionConfig,
 	},
-	utils::compose as frame_compose,
 	utils::urn::Urn,
 	Beamable, Frame, TightBeamError, Version,
 };
@@ -174,7 +173,8 @@ async fn start_laser_hive(
 /// over any other protocol. A refusal surfaces as
 /// [`TightBeamError::WorkRefused`].
 async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V0)
+	let unsigned = Version::V0
+		.compose()
 		.with_id(b"laser-beam")
 		.with_order(0)
 		.with_message(BeamRequest { value: 21 })

@@ -5,8 +5,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::error::ClusterError;
-use crate::colony::common::{type_canonical_bytes, RegisterHiveRequest};
+use crate::colony::common::RegisterHiveRequest;
 use crate::utils::BasisPoints;
+use crate::Frame;
 
 /// Shared byte slice for hive and servlet identifiers
 pub type SharedId = Arc<[u8]>;
@@ -218,7 +219,7 @@ impl HiveRegistry {
 			.servlet_addresses
 			.iter()
 			.filter_map(|info| {
-				let type_key: SharedId = Arc::from(type_canonical_bytes(&info.servlet_id).as_slice());
+				let type_key: SharedId = Arc::from(info.servlet_id.type_canonical_bytes().as_slice());
 				seen.insert(Arc::clone(&type_key)).then_some(type_key)
 			})
 			.collect();
@@ -251,6 +252,18 @@ impl HiveRegistry {
 	pub fn signer_for(&self, hive_id: &[u8]) -> Result<Option<SharedId>, ClusterError> {
 		let members = self.members.read()?;
 		Ok(members.signer_for(hive_id))
+	}
+
+	/// Whether `frame` carries the signer bound to `hive_id` at registration.
+	///
+	/// An unsigned frame, an unregistered hive, and a hive registered with
+	/// no signer all answer `false`: each leaves an update unattributable to
+	/// the hive it claims to speak for (CWE-639).
+	pub(crate) fn signer_matches(&self, frame: &Frame, hive_id: &[u8]) -> bool {
+		match (frame.signer_id(), self.signer_for(hive_id)) {
+			(Some(claimed), Ok(Some(bound))) => claimed.as_slice() == bound.as_ref(),
+			_ => false,
+		}
 	}
 
 	/// Unregister a hive and remove from indices
@@ -352,7 +365,7 @@ mod tests {
 	fn type_key(name: &str) -> Vec<u8> {
 		let namespace = ColonyNamespace::default();
 		let urn = namespace.servlet(name).expect("test names satisfy the mint grammar");
-		type_canonical_bytes(&urn)
+		urn.type_canonical_bytes()
 	}
 
 	#[test]

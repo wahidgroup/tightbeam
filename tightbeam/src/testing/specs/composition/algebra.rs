@@ -12,90 +12,88 @@ use std::collections::{HashMap, HashSet};
 use crate::testing::specs::composition::CompositionError;
 use crate::testing::specs::csp::{intern, Event, Process, ProcessBuilder, State};
 
-/// Add both operands' alphabets to the builder, preserving the
-/// observable/hidden classification
-fn union_alphabets(builder: ProcessBuilder, p: &Process, q: &Process) -> ProcessBuilder {
-	let builder = p
-		.observable
-		.iter()
-		.chain(&q.observable)
-		.fold(builder, |b, event| b.add_observable(event));
+impl ProcessBuilder {
+	/// Add both operands' alphabets, preserving the observable and hidden
+	/// classification.
+	fn union_alphabets(self, p: &Process, q: &Process) -> Self {
+		let builder = p
+			.observable
+			.iter()
+			.chain(&q.observable)
+			.fold(self, |b, event| b.add_observable(event));
 
-	p.hidden.iter().chain(&q.hidden).fold(builder, |b, event| b.add_hidden(event))
-}
+		p.hidden.iter().chain(&q.hidden).fold(builder, |b, event| b.add_hidden(event))
+	}
 
-/// Copy every state of `process` into the builder through `map_state`
-fn copy_states<S>(builder: ProcessBuilder, process: &Process, map_state: S) -> ProcessBuilder
-where
-	S: Fn(&State) -> State,
-{
-	process.states.iter().fold(builder, |b, state| b.add_state(map_state(state)))
-}
+	/// Copy every state of `process` through `map_state`.
+	fn copy_states<S>(self, process: &Process, map_state: S) -> Self
+	where
+		S: Fn(&State) -> State,
+	{
+		process.states.iter().fold(self, |b, state| b.add_state(map_state(state)))
+	}
 
-/// Copy every terminal state of `process` into the builder through `map_state`
-fn copy_terminals<S>(builder: ProcessBuilder, process: &Process, map_state: S) -> ProcessBuilder
-where
-	S: Fn(&State) -> State,
-{
-	process
-		.terminal
-		.iter()
-		.fold(builder, |b, state| b.add_terminal(map_state(state)))
-}
+	/// Copy every terminal state of `process` through `map_state`.
+	fn copy_terminals<S>(self, process: &Process, map_state: S) -> Self
+	where
+		S: Fn(&State) -> State,
+	{
+		process.terminal.iter().fold(self, |b, state| b.add_terminal(map_state(state)))
+	}
 
-/// Copy every transition of `process` into the builder, mapping states
-/// through `map_state` and events through `map_event`
-fn copy_transitions<S, E>(builder: ProcessBuilder, process: &Process, map_state: S, map_event: E) -> ProcessBuilder
-where
-	S: Fn(&State) -> State,
-	E: Fn(Event) -> Event,
-{
-	let map_state = &map_state;
-	let map_event = &map_event;
+	/// Copy every transition of `process`, mapping states through
+	/// `map_state` and events through `map_event`.
+	fn copy_transitions<S, E>(self, process: &Process, map_state: S, map_event: E) -> Self
+	where
+		S: Fn(&State) -> State,
+		E: Fn(Event) -> Event,
+	{
+		let map_state = &map_state;
+		let map_event = &map_event;
 
-	process
-		.states
-		.iter()
-		.flat_map(move |state| {
-			process.enabled(*state).into_iter().flat_map(move |action| {
-				process
-					.step(*state, &action.event)
-					.into_iter()
-					.map(move |target| (map_state(state), map_event(action.event), map_state(&target)))
+		process
+			.states
+			.iter()
+			.flat_map(move |state| {
+				process.enabled(*state).into_iter().flat_map(move |action| {
+					process
+						.step(*state, &action.event)
+						.into_iter()
+						.map(move |target| (map_state(state), map_event(action.event), map_state(&target)))
+				})
 			})
-		})
-		.fold(builder, |b, (from, event, to)| b.add_transition(from, event, to))
-}
+			.fold(self, |b, (from, event, to)| b.add_transition(from, event, to))
+	}
 
-/// Prefixed copies of both operands: states, alphabets, transitions, and
-/// terminals of `p` under `P_` and `q` under `Q_`. Shared scaffold of the
-/// choice operators, which differ only in how their initial state wires
-/// into the copies.
-fn prefixed_operands(builder: ProcessBuilder, p: &Process, q: &Process) -> ProcessBuilder {
-	let builder = copy_states(builder, p, |state| State::prefixed(state, "P"));
-	let builder = copy_states(builder, q, |state| State::prefixed(state, "Q"));
-	let builder = union_alphabets(builder, p, q);
-	let builder = copy_transitions(builder, p, |state| State::prefixed(state, "P"), |event| event);
-	let builder = copy_transitions(builder, q, |state| State::prefixed(state, "Q"), |event| event);
-	let builder = copy_terminals(builder, p, |state| State::prefixed(state, "P"));
+	/// Prefixed copies of both operands: states, alphabets, transitions, and
+	/// terminals of `p` under `P_` and `q` under `Q_`. Shared scaffold of the
+	/// choice operators, which differ only in how their initial state wires
+	/// into the copies.
+	fn prefixed_operands(self, p: &Process, q: &Process) -> Self {
+		self.copy_states(p, |state| State::prefixed(state, "P"))
+			.copy_states(q, |state| State::prefixed(state, "Q"))
+			.union_alphabets(p, q)
+			.copy_transitions(p, |state| State::prefixed(state, "P"), |event| event)
+			.copy_transitions(q, |state| State::prefixed(state, "Q"), |event| event)
+			.copy_terminals(p, |state| State::prefixed(state, "P"))
+			.copy_terminals(q, |state| State::prefixed(state, "Q"))
+	}
 
-	copy_terminals(builder, q, |state| State::prefixed(state, "Q"))
-}
-
-/// Copy the transitions leaving `process`'s initial state so they originate
-/// from `from` instead, targeting the prefixed copies (external choice's
-/// first-event commitment)
-fn fan_out_initial(builder: ProcessBuilder, process: &Process, from: State, prefix: &str) -> ProcessBuilder {
-	process
-		.enabled(process.initial)
-		.into_iter()
-		.flat_map(|action| {
-			process
-				.step(process.initial, &action.event)
-				.into_iter()
-				.map(move |target| (action.event, State::prefixed(&target, prefix)))
-		})
-		.fold(builder, |b, (event, target)| b.add_transition(from, event, target))
+	/// Copy the transitions leaving `process`'s initial state so they
+	/// originate from `from` instead, targeting the prefixed copies
+	/// (external choice's first-event commitment).
+	fn fan_out_initial(self, process: &Process, from: State, prefix: &str) -> Self {
+		process
+			.enabled(process.initial)
+			.into_iter()
+			.flat_map(|action| {
+				process
+					.step(process.initial, &action.event)
+					.into_iter()
+					.map(move |target| (action.event, State::prefixed(&target, prefix)))
+			})
+			.fold(self, |b, (event, target)| b.add_transition(from, event, target))
+	}
 }
 
 impl Process {
@@ -110,14 +108,16 @@ impl Process {
 	/// - State space and transitions remain unchanged
 	pub fn hide(&self, hidden_events: HashSet<Event>) -> Result<Process, CompositionError> {
 		let name = intern(format!("({} \\ A)", self.name));
-		let builder = copy_states(Process::builder(name).initial_state(self.initial), self, |state| *state);
-		let builder = copy_terminals(builder, self, |state| *state);
+		let builder = Process::builder(name)
+			.initial_state(self.initial)
+			.copy_states(self, |state| *state);
+
+		let builder = builder.copy_terminals(self, |state| *state);
 		let builder = self
 			.observable
 			.iter()
 			.filter(|e| !hidden_events.contains(e))
 			.fold(builder, |b, event| b.add_observable(event));
-
 		let builder = self
 			.observable
 			.iter()
@@ -125,8 +125,7 @@ impl Process {
 			.fold(builder, |b, event| b.add_hidden(event));
 
 		let builder = self.hidden.iter().fold(builder, |b, event| b.add_hidden(event));
-		let builder = copy_transitions(builder, self, |state| *state, |event| event);
-
+		let builder = builder.copy_transitions(self, |state| *state, |event| event);
 		Ok(builder.build()?)
 	}
 
@@ -139,8 +138,10 @@ impl Process {
 	/// - `mapping`: HashMap from old event to new event
 	pub fn rename(&self, mapping: HashMap<Event, Event>) -> Result<Process, CompositionError> {
 		let name = intern(format!("({} [[r]])", self.name));
-		let builder = copy_states(Process::builder(name).initial_state(self.initial), self, |state| *state);
-		let builder = copy_terminals(builder, self, |state| *state);
+		let builder = Process::builder(name)
+			.initial_state(self.initial)
+			.copy_states(self, |state| *state);
+		let builder = builder.copy_terminals(self, |state| *state);
 		let observable_events: Vec<Event> = self
 			.observable
 			.iter()
@@ -148,11 +149,9 @@ impl Process {
 			.collect();
 
 		let builder = observable_events.into_iter().fold(builder, |b, event| b.add_observable(event));
-
 		let hidden_events: Vec<Event> = self.hidden.iter().map(|event| *mapping.get(event).unwrap_or(event)).collect();
 		let builder = hidden_events.into_iter().fold(builder, |b, event| b.add_hidden(event));
-		let builder = copy_transitions(builder, self, |state| *state, |event| *mapping.get(&event).unwrap_or(&event));
-
+		let builder = builder.copy_transitions(self, |state| *state, |event| *mapping.get(&event).unwrap_or(&event));
 		Ok(builder.build()?)
 	}
 
@@ -170,19 +169,18 @@ impl Process {
 	/// - P terminal states have τ-transition to Q initial state
 	pub fn sequential(p: &Process, q: &Process) -> Result<Process, CompositionError> {
 		let name = intern(format!("({} ; {})", p.name, q.name));
-		let builder = copy_states(Process::builder(name).initial_state(p.initial), p, |state| *state);
-		let builder = copy_states(builder, q, |state| State::prefixed(state, "Q"));
-		let builder = union_alphabets(builder, p, q);
-		let builder = copy_transitions(builder, p, |state| *state, |event| event);
-		let builder = copy_transitions(builder, q, |state| State::prefixed(state, "Q"), |event| event);
+		let builder = Process::builder(name).initial_state(p.initial).copy_states(p, |state| *state);
+		let builder = builder.copy_states(q, |state| State::prefixed(state, "Q"));
+		let builder = builder.union_alphabets(p, q);
+		let builder = builder.copy_transitions(p, |state| *state, |event| event);
+		let builder = builder.copy_transitions(q, |state| State::prefixed(state, "Q"), |event| event);
 
 		let q_initial_renamed = State::prefixed(&q.initial, "Q");
 		let builder = p.terminal.iter().fold(builder.add_hidden(Event("tau_seq")), |b, p_terminal| {
 			b.add_transition(*p_terminal, Event("tau_seq"), q_initial_renamed)
 		});
 
-		let builder = copy_terminals(builder, q, |state| State::prefixed(state, "Q"));
-
+		let builder = builder.copy_terminals(q, |state| State::prefixed(state, "Q"));
 		Ok(builder.build()?)
 	}
 
@@ -198,9 +196,9 @@ impl Process {
 		let choice_initial = State("ExternalChoice_Initial");
 		let name = intern(format!("({} [] {})", p.name, q.name));
 		let builder = Process::builder(name).initial_state(choice_initial).add_state(choice_initial);
-		let builder = prefixed_operands(builder, p, q);
-		let builder = fan_out_initial(builder, p, choice_initial, "P");
-		let builder = fan_out_initial(builder, q, choice_initial, "Q");
+		let builder = builder.prefixed_operands(p, q);
+		let builder = builder.fan_out_initial(p, choice_initial, "P");
+		let builder = builder.fan_out_initial(q, choice_initial, "Q");
 
 		Ok(builder.build()?)
 	}
@@ -218,7 +216,7 @@ impl Process {
 			.add_hidden(Event("tau_choice_p"))
 			.add_hidden(Event("tau_choice_q"));
 
-		let builder = prefixed_operands(builder, p, q);
+		let builder = builder.prefixed_operands(p, q);
 		let builder = builder
 			.add_transition(choice_initial, Event("tau_choice_p"), State::prefixed(&p.initial, "P"))
 			.add_transition(choice_initial, Event("tau_choice_q"), State::prefixed(&q.initial, "Q"))

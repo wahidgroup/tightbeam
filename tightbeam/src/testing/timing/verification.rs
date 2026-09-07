@@ -13,7 +13,6 @@ use crate::utils::statistics::{DefaultStatisticalAnalyzer, Percentile, Statistic
 
 use super::constraints::{TimingConstraint, TimingConstraints};
 use super::deadline::Deadline;
-use super::path::extract_paths;
 use super::violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 
 /// Timing verification result (DER-encodable core)
@@ -381,7 +380,7 @@ impl TimingConstraints {
 	) {
 		// Extract execution paths from trace
 		// For each path-based WCET constraint
-		let execution_paths = extract_paths(trace, process);
+		let execution_paths = trace.execution_paths(process);
 		for path_wcet in constraints.path_wcets() {
 			// Find matching execution paths
 			let max_duration_ns = path_wcet.max_duration_ns();

@@ -9,7 +9,8 @@ macro_rules! relay {
 		// Build a simple V0 wrapper with id=0, order=0. `build` is called
 		// through its trait path so callers need not import `TypeBuilder`.
 		let __result: ::core::result::Result<(), $crate::TightBeamError> = $crate::builder::TypeBuilder::build(
-			$crate::utils::compose($crate::Version::V0)
+			$crate::Version::V0
+				.compose()
 				.with_id(b"\0")
 				.with_order(0u64)
 				.with_message($beamable),

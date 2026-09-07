@@ -118,51 +118,45 @@ impl ServletContext {
 		worker.relay(input).await.map_err(|error| error.into())
 	}
 }
+impl Frame {
+	/// Decrypt or inflate this frame's body in place for typed dispatch.
+	///
+	/// # Errors
+	///
+	/// - [`RouterError::ConfidentialFrame`]: encrypted body, no decryptor.
+	/// - [`RouterError::CompressedFrame`]: compressed body, no inflator.
+	/// - Decryption or decompression errors from the configured implementations.
+	pub fn prepare_typed(&mut self, ctx: &ServletContext) -> Result<(), TightBeamError> {
+		if self.metadata.confidentiality.is_some() {
+			let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
+			self.decrypt_in_place(decryptor, ctx.message_inflator())?;
+			return Ok(());
+		}
+		if self.metadata.compactness.is_some() {
+			let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
+			self.inflate_in_place(inflator)?;
+		}
 
-/// Normalize a frame to cleartext before typed delivery.
-///
-/// Fail-closed and in place: encrypted bodies without a decryptor, and
-/// compressed bodies without an inflator, are rejected before decode.
-/// On success the body is cleartext for the servlet's declared input type.
-///
-/// # Errors
-///
-/// - [`RouterError::ConfidentialFrame`]: encrypted body, no decryptor.
-/// - [`RouterError::CompressedFrame`]: compressed body, no inflator.
-/// - Decryption or decompression errors from the configured implementations.
-pub fn prepare_typed_frame(frame: &mut Frame, ctx: &ServletContext) -> Result<(), TightBeamError> {
-	if frame.metadata.confidentiality.is_some() {
-		let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
-		frame.decrypt_in_place(decryptor, ctx.message_inflator())?;
-
-		return Ok(());
+		Ok(())
 	}
 
-	if frame.metadata.compactness.is_some() {
-		let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
-		frame.inflate_in_place(inflator)?;
+	/// Prepare, decode, and invoke a typed unary handler.
+	///
+	/// Runs [`Frame::prepare_typed`] first, so an encrypted or compressed
+	/// body without the matching transform fails closed before decode.
+	pub async fn dispatch_typed_unary<I, F, Fut>(
+		mut self,
+		ctx: &ServletContext,
+		handler: F,
+	) -> Result<Option<Frame>, TightBeamError>
+	where
+		I: Message,
+		F: FnOnce(I, Frame, &ServletContext) -> Fut,
+		Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
+	{
+		self.prepare_typed(ctx)?;
+
+		let message: I = crate::decode(&self.message)?;
+		handler(message, self, ctx).await
 	}
-
-	Ok(())
-}
-
-/// Prepare, decode, and invoke a typed unary handler.
-///
-/// Runs [`prepare_typed_frame`] first. Encrypted or compressed bodies
-/// without the matching transform fail closed before decode.
-pub async fn dispatch_typed_unary<I, F, Fut>(
-	mut frame: Frame,
-	ctx: &ServletContext,
-	handler: F,
-) -> Result<Option<Frame>, TightBeamError>
-where
-	I: Message,
-	F: FnOnce(I, Frame, &ServletContext) -> Fut,
-	Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
-{
-	prepare_typed_frame(&mut frame, ctx)?;
-
-	let message: I = crate::decode(&frame.message)?;
-	let response = handler(message, frame, ctx).await?;
-	Ok(response)
 }

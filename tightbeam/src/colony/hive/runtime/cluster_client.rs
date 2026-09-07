@@ -6,28 +6,24 @@
 use std::sync::{Arc, RwLock};
 
 use crate::builder::TypeBuilder;
-use crate::colony::common::{current_timestamp_ms, ClusterRequest, TaskGroup};
+use crate::colony::common::{current_timestamp_ms, ClusterRequest, ServletChange, TaskGroup};
 use crate::colony::hive::{
-	HashMapRegistry, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
-	ServletAddressUpdateResponse, ServletInfo, ServletRegistry,
+	HashMapRegistry, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse,
+	ServletAddressUpdateResponse, ServletRegistry,
 };
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::x509::store::CertificateTrust;
-use crate::crypto::x509::Certificate;
 use crate::decode;
 use crate::instrumentation::events::HIVE_REREGISTERED;
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
 use crate::trace::TraceCollector;
-use crate::transport::handshake::HandshakeKeyManager;
+use crate::transport::client::pool::ClientIdentity;
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::{MessageEmitter, Protocol, X509ClientConfig};
-use crate::utils::compose;
 use crate::utils::urn::Urn;
 use crate::{Frame, Message, TightBeamError, Version};
-
-type ClientIdentity = (Arc<Certificate>, Arc<HandshakeKeyManager<DefaultCryptoProvider>>);
 
 /// Build a hive-to-cluster control frame, signed when hive TLS is configured.
 async fn build_control_frame(
@@ -40,7 +36,8 @@ async fn build_control_frame(
 
 	match hive_tls.as_ref() {
 		Some(hive_tls) => {
-			let unsigned = compose(Version::V0)
+			let unsigned = Version::V0
+				.compose()
 				.with_id(id)
 				.with_order(order)
 				.with_message(message)
@@ -49,7 +46,8 @@ async fn build_control_frame(
 			Ok(signed)
 		}
 		None => {
-			let frame = compose(Version::V0)
+			let frame = Version::V0
+				.compose()
 				.with_id(id)
 				.with_order(order)
 				.with_message(message)
@@ -205,12 +203,11 @@ where
 	/// The fan-out runs under `tasks`, so stopping the hive stops an update
 	/// still retrying against an unreachable gateway. Exhausted retries fall
 	/// back to a full-slate announcement.
-	pub fn notify_scaling(
+	pub(crate) fn notify_scaling(
 		&self,
 		tasks: &TaskGroup,
 		hive_urn: Option<&Arc<Urn<'static>>>,
-		servlet_info: ServletInfo,
-		is_added: bool,
+		change: ServletChange,
 	) {
 		let Some(hive_urn) = hive_urn.map(Arc::clone) else {
 			return;
@@ -223,17 +220,20 @@ where
 				return;
 			}
 
-			let update = scaling_update_request(&hive_urn, servlet_info, is_added);
+			let update = ClusterRequest::ServletAddressUpdate(change.into_update(hive_urn.as_ref().clone()));
 			let hive_tls = link.config.hive_tls.as_ref().map(Arc::clone);
 			let trust_store = link.config.trust_store.as_ref().map(Arc::clone);
-
 			let Ok(frame) = build_control_frame(b"scaling-update", update, hive_tls.clone()).await else {
 				return;
 			};
 
 			// A TLS-registered hive must not fall back to cleartext for scaling updates (CWE-319).
-			let Some(client_identity) = resolve_client_identity(hive_tls.as_ref()) else {
-				return;
+			let client_identity = match hive_tls.as_ref() {
+				Some(tls) => match tls.client_identity() {
+					Ok(identity) => Some(identity),
+					Err(_) => return,
+				},
+				None => None,
 			};
 
 			let any_failed = fanout_scaling_update::<P>(
@@ -249,35 +249,6 @@ where
 				link.announce_slate().await;
 			}
 		});
-	}
-}
-
-fn scaling_update_request(hive_urn: &Urn<'static>, servlet_info: ServletInfo, is_added: bool) -> ClusterRequest {
-	if is_added {
-		return ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
-			hive_id: hive_urn.clone(),
-			added: vec![servlet_info],
-			removed: vec![],
-		});
-	}
-
-	ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
-		hive_id: hive_urn.clone(),
-		added: vec![],
-		removed: vec![servlet_info.servlet_id],
-	})
-}
-
-/// `None` aborts the notify task (TLS configured but identity unusable).
-/// `Some(None)` is cleartext. `Some(Some(_))` is a client identity.
-fn resolve_client_identity(hive_tls: Option<&Arc<HiveTlsConfig>>) -> Option<Option<ClientIdentity>> {
-	match hive_tls {
-		Some(hive_tls) => {
-			let cert = Certificate::try_from(hive_tls.certificate.clone()).ok()?;
-			let key_mgr = HandshakeKeyManager::new(Arc::clone(&hive_tls.key));
-			Some(Some((Arc::new(cert), Arc::new(key_mgr))))
-		}
-		None => Some(None),
 	}
 }
 
@@ -301,9 +272,7 @@ where
 	}
 
 	if let Some(hive_tls) = hive_tls {
-		let cert = Certificate::try_from(hive_tls.certificate.clone())?;
-		let key_mgr = HandshakeKeyManager::new(Arc::clone(&hive_tls.key));
-		transport = transport.with_client_identity(Arc::new(cert), Arc::new(key_mgr));
+		transport = hive_tls.client_identity()?.offer_on(transport);
 	}
 
 	Ok(transport)
@@ -369,8 +338,8 @@ where
 		if let Some(store) = trust_store {
 			transport = transport.with_trust_store(Arc::clone(store));
 		}
-		if let Some((cert, key_mgr)) = client_identity {
-			transport = transport.with_client_identity(Arc::clone(cert), Arc::clone(key_mgr));
+		if let Some(identity) = client_identity {
+			transport = identity.offer_on(transport);
 		}
 
 		// Transport Ok is not acceptance: require TransitStatus::Ok in the body.

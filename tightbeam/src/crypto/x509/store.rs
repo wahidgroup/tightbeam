@@ -13,7 +13,6 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::Certificate;
 
 #[cfg(feature = "std")]
-use crate::crypto::x509::utils::validate_certificate_expiry;
 #[cfg(feature = "std")]
 use crate::der::Encode;
 
@@ -28,10 +27,11 @@ mod std_imports {
 	pub use crate::crypto::policy::VerificationPolicy;
 	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::crypto::x509::name::Name;
-	pub use crate::crypto::x509::utils::{certificate_extension, ensure_signature_algorithm_consistency};
 	pub use crate::der::oid::AssociatedOid;
 }
 
+#[cfg(feature = "std")]
+use crate::crypto::x509::utils::CertificateExt;
 #[cfg(feature = "std")]
 use std_imports::*;
 
@@ -263,7 +263,7 @@ fn ensure_terminal_is_end_entity(path: &[&Certificate]) -> Result<(), Certificat
 		return Ok(());
 	};
 
-	match certificate_extension::<BasicConstraints>(terminal)? {
+	match terminal.extension::<BasicConstraints>()? {
 		Some(basic_constraints) if basic_constraints.ca => Err(CertificateValidationError::EndEntityIsCa),
 		_ => Ok(()),
 	}
@@ -281,12 +281,12 @@ fn ensure_terminal_is_end_entity(path: &[&Certificate]) -> Result<(), Certificat
 /// certificates are rejected (see [`CertificateTrustStore::validate_path`]).
 #[cfg(feature = "std")]
 fn ensure_issuer_is_ca(issuer: &Certificate) -> Result<(), CertificateValidationError> {
-	match certificate_extension::<BasicConstraints>(issuer)? {
+	match issuer.extension::<BasicConstraints>()? {
 		Some(basic_constraints) if basic_constraints.ca => {}
 		_ => return Err(CertificateValidationError::IssuerNotCa),
 	}
 
-	if let Some(key_usage) = certificate_extension::<KeyUsage>(issuer)? {
+	if let Some(key_usage) = issuer.extension::<KeyUsage>()? {
 		if !key_usage.0.contains(KeyUsages::KeyCertSign) {
 			return Err(CertificateValidationError::MissingKeyCertSign);
 		}
@@ -307,7 +307,7 @@ fn ensure_issuer_is_ca(issuer: &Certificate) -> Result<(), CertificateValidation
 #[cfg(feature = "std")]
 fn ensure_path_len(chain: &[&Certificate]) -> Result<(), CertificateValidationError> {
 	for (index, cert) in chain.iter().enumerate() {
-		let Some(basic_constraints) = certificate_extension::<BasicConstraints>(cert)? else {
+		let Some(basic_constraints) = cert.extension::<BasicConstraints>()? else {
 			continue;
 		};
 		let Some(max_intermediates) = basic_constraints.path_len_constraint else {
@@ -418,7 +418,7 @@ impl CertificateTrustStore {
 	/// path structure and cryptography only.
 	fn validate_path(&self, path: &[&Certificate]) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): every certificate must be within its validity period.
-		path.iter().try_for_each(|cert| validate_certificate_expiry(cert))?;
+		path.iter().try_for_each(|cert| cert.validate_expiry())?;
 
 		// RFC 5280 §4.2 / §6.1.3(f): fail closed on unprocessed critical extensions.
 		path.iter().try_for_each(|cert| ensure_critical_extensions_processed(cert))?;
@@ -427,7 +427,7 @@ impl CertificateTrustStore {
 		ensure_terminal_is_end_entity(path)?;
 
 		// RFC 5280 §4.1.1.2: signatureAlgorithm must match tbsCertificate.signature.
-		path.iter().try_for_each(|cert| ensure_signature_algorithm_consistency(cert))?;
+		path.iter().try_for_each(|cert| cert.ensure_signature_algorithm_consistency())?;
 
 		// Verify issuer/subject chaining and signatures via sliding window
 		path.windows(2).try_for_each(|pair| {
@@ -653,7 +653,7 @@ impl<D: Digest> TrustBuilder for CertificateTrustBuilder<D> {
 		}
 
 		// Validate expiry for all certificates
-		chain.iter().try_for_each(validate_certificate_expiry)?;
+		chain.iter().try_for_each(CertificateExt::validate_expiry)?;
 
 		// Validate issuer/subject chaining (structural only, no crypto)
 		chain.windows(2).try_for_each(|pair| {
@@ -670,7 +670,7 @@ impl<D: Digest> TrustBuilder for CertificateTrustBuilder<D> {
 	}
 
 	fn with_certificate(mut self, cert: Certificate) -> Result<Self, CertificateValidationError> {
-		validate_certificate_expiry(&cert)?;
+		cert.validate_expiry()?;
 		self.add_certificate(cert)?;
 		Ok(self)
 	}

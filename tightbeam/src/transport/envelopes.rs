@@ -16,6 +16,7 @@ use crate::asn1::Frame;
 use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::der::{Choice, Decode, Encode, EncodeValue, Length, Reader, Result as DerResult, Tag, Tagged, Writer};
 use crate::policy::TransitStatus;
+use crate::transport::error::TransportError;
 
 #[cfg(feature = "derive")]
 use crate::Beamable;
@@ -96,6 +97,38 @@ pub struct ResponsePackage {
 }
 
 impl ResponsePackage {
+	/// Terminal response for a unary or streaming service outcome.
+	///
+	/// The inverse of [`Self::resolve`]: a success carries the frame, and a
+	/// failure carries its status alone. The two together are the whole
+	/// round trip of one service call.
+	pub(crate) fn from_outcome(outcome: Result<Option<Frame>, crate::TightBeamError>) -> Self {
+		match outcome {
+			Ok(message) => Self::new(TransitStatus::Ok, message),
+			Err(error) => Self::new(error.failure_status(), None),
+		}
+	}
+
+	/// The caller-facing result this response carries.
+	///
+	/// A non-[`TransitStatus::Ok`] status is the error, so a caller reads
+	/// the frame only where the responder reported success.
+	///
+	/// The frame moves out of its `Arc` where this is the last holder, and
+	/// copies only where the inbound path still shares it.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError`] -- for any status other than [`TransitStatus::Ok`].
+	pub(crate) fn resolve(self) -> Result<Option<Frame>, TransportError> {
+		match self.status {
+			TransitStatus::Ok => Ok(self
+				.message
+				.map(|frame| Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone()))),
+			status => Err(TransportError::from(status)),
+		}
+	}
+
 	pub fn new(status: TransitStatus, message: Option<Frame>) -> Self {
 		Self { status, message: message.map(Arc::new) }
 	}

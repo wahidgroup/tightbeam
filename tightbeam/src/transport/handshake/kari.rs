@@ -71,26 +71,6 @@ pub(crate) fn key_wrap_key_size<P: CryptoProvider>() -> Result<usize, HandshakeE
 	key_wrap_key_size_from_oid(oid)
 }
 
-/// Derive a KEK of `key_size` bytes using the provider's HKDF
-/// (shared_secret as IKM, UKM as salt, info as context).
-pub(crate) fn derive_kek<P>(
-	shared_secret: &SecretSlice<u8>,
-	ukm: &[u8],
-	kdf_info: &[u8],
-	key_size: usize,
-) -> Result<ZeroizingBytes, HandshakeError>
-where
-	P: CryptoProvider,
-{
-	if ukm.is_empty() {
-		return Err(HandshakeError::MissingUkm);
-	}
-
-	let derived = shared_secret.with(|shared| P::Kdf::derive_dynamic_key(shared, kdf_info, Some(ukm), key_size))?;
-	let kek = derived?;
-	Ok(kek)
-}
-
 /// Dispatch a keyed AES-KW operation to the variant matching the KEK length.
 ///
 /// `$op16`/`$op24`/`$op32` are the provider's size-specific wrapper or unwrapper
@@ -182,7 +162,7 @@ where
 {
 	let shared_secret = derive_shared_secret(sender_priv, recipient_pub)?;
 	let key_size = key_wrap_key_size::<P>()?;
-	let kek = derive_kek::<P>(&shared_secret, ukm, kdf_info, key_size)?;
+	let kek = shared_secret.derive_kek::<P>(ukm, kdf_info, key_size)?;
 
 	wrap_with_kek(provider, kek.as_slice(), cek)
 }
@@ -204,7 +184,7 @@ where
 {
 	let shared_secret = derive_shared_secret(recipient_priv, originator_pub)?;
 	let key_size = key_wrap_key_size::<P>()?;
-	let kek = derive_kek::<P>(&shared_secret, ukm, kdf_info, key_size)?;
+	let kek = shared_secret.derive_kek::<P>(ukm, kdf_info, key_size)?;
 	let cek = unwrap_and_verify_with_kek(provider, kek.as_slice(), wrapped)?;
 
 	Ok(cek)
@@ -304,6 +284,30 @@ where
 	}
 
 	Ok(cek)
+}
+
+/// KEK derivation over a shared secret on the handshake plane.
+pub(crate) trait HandshakeKek {
+	/// Derive a KEK of `key_size` bytes using the provider's HKDF
+	/// (shared_secret as IKM, UKM as salt, info as context).
+	fn derive_kek<P>(&self, ukm: &[u8], kdf_info: &[u8], key_size: usize) -> Result<ZeroizingBytes, HandshakeError>
+	where
+		P: CryptoProvider;
+}
+
+impl HandshakeKek for SecretSlice<u8> {
+	fn derive_kek<P>(&self, ukm: &[u8], kdf_info: &[u8], key_size: usize) -> Result<ZeroizingBytes, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
+		if ukm.is_empty() {
+			return Err(HandshakeError::MissingUkm);
+		}
+
+		let derived = self.with(|shared| P::Kdf::derive_dynamic_key(shared, kdf_info, Some(ukm), key_size))?;
+		let kek = derived?;
+		Ok(kek)
+	}
 }
 
 #[cfg(test)]

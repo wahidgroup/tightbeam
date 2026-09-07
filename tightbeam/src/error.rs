@@ -700,6 +700,26 @@ impl core::error::Error for TightBeamError {}
 #[cfg(all(feature = "compress", not(feature = "derive")))]
 impl core::error::Error for CompressionError {}
 
+#[cfg(feature = "transport")]
+impl TightBeamError {
+	/// Terminal status a service failure answers a peer with.
+	///
+	/// A failure already carrying a transit status keeps it. Anything else
+	/// answers [`TransitStatus::Internal`](crate::policy::TransitStatus::Internal),
+	/// so a peer tells a failure apart
+	/// from an accepted empty reply and the failure stays attributable.
+	#[must_use]
+	pub(crate) fn failure_status(&self) -> crate::policy::TransitStatus {
+		use crate::policy::TransitStatus;
+
+		if let TightBeamError::TransportError(crate::transport::TransportError::OperationFailed(failure)) = self {
+			return TransitStatus::try_from(*failure).unwrap_or(TransitStatus::Internal);
+		}
+
+		TransitStatus::Internal
+	}
+}
+
 // A generic source type cannot go through impl_from!, so the unit-variant
 // conversion is written out.
 #[cfg(feature = "std")]

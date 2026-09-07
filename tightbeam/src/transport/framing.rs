@@ -67,32 +67,34 @@ pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<u
 	Some(length)
 }
 
-/// Classify a byte-read failure at a frame boundary.
-///
-/// EOF before the first byte of a frame is the peer hanging up cleanly
-/// between messages: [`TransportError::ConnectionClosed`], which
-/// `try_read_decoded_envelope` maps to `Ok(None)`. Everything else passes
-/// through unchanged.
-pub(crate) fn classify_boundary_error(error: TransportError) -> TransportError {
-	#[cfg(feature = "std")]
-	if matches!(&error, TransportError::IoError(io) if io.kind() == ErrorKind::UnexpectedEof) {
-		return TransportError::ConnectionClosed;
+impl TransportError {
+	/// Classify a byte-read failure at a frame boundary.
+	///
+	/// EOF before the first byte of a frame is the peer hanging up
+	/// cleanly between messages: [`TransportError::ConnectionClosed`],
+	/// which `try_read_decoded_envelope` maps to `Ok(None)`. Everything
+	/// else passes through unchanged.
+	pub(crate) fn at_frame_boundary(self) -> Self {
+		#[cfg(feature = "std")]
+		if matches!(&self, Self::IoError(io) if io.kind() == ErrorKind::UnexpectedEof) {
+			return Self::ConnectionClosed;
+		}
+
+		self
 	}
 
-	error
-}
-
-/// Classify a byte-read failure inside a frame.
-///
-/// EOF after the frame started is a truncated message, never a clean
-/// close: [`TransportError::InvalidMessage`]. Everything else passes
-/// through unchanged.
-pub(crate) fn classify_truncation_error(error: TransportError) -> TransportError {
-	match &error {
-		TransportError::ConnectionClosed => TransportError::InvalidMessage,
-		#[cfg(feature = "std")]
-		TransportError::IoError(io) if io.kind() == ErrorKind::UnexpectedEof => TransportError::InvalidMessage,
-		_ => error,
+	/// Classify a byte-read failure inside a frame.
+	///
+	/// EOF after the frame started is a truncated message, never a clean
+	/// close: [`TransportError::InvalidMessage`]. Everything else passes
+	/// through unchanged.
+	pub(crate) fn inside_frame(self) -> Self {
+		match &self {
+			Self::ConnectionClosed => Self::InvalidMessage,
+			#[cfg(feature = "std")]
+			Self::IoError(io) if io.kind() == ErrorKind::UnexpectedEof => Self::InvalidMessage,
+			_ => self,
+		}
 	}
 }
 
@@ -156,27 +158,27 @@ mod tests {
 	#[test]
 	fn boundary_classification_maps_eof_to_clean_close() {
 		let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
-		assert!(matches!(classify_boundary_error(eof), TransportError::ConnectionClosed));
+		assert!(matches!((eof).at_frame_boundary(), TransportError::ConnectionClosed));
 
 		let reset = TransportError::IoError(ErrorKind::ConnectionReset.into());
-		assert!(matches!(classify_boundary_error(reset), TransportError::IoError(_)));
+		assert!(matches!((reset).at_frame_boundary(), TransportError::IoError(_)));
 	}
 
 	#[test]
 	fn truncation_classification_maps_eof_to_invalid_message() {
 		assert!(matches!(
-			classify_truncation_error(TransportError::ConnectionClosed),
+			(TransportError::ConnectionClosed).inside_frame(),
 			TransportError::InvalidMessage
 		));
 		assert!(matches!(
-			classify_truncation_error(TransportError::ConnectionFailed),
+			(TransportError::ConnectionFailed).inside_frame(),
 			TransportError::ConnectionFailed
 		));
 
 		#[cfg(feature = "std")]
 		{
 			let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
-			assert!(matches!(classify_truncation_error(eof), TransportError::InvalidMessage));
+			assert!(matches!((eof).inside_frame(), TransportError::InvalidMessage));
 		}
 	}
 

@@ -144,7 +144,7 @@ servlet! {
 		trace.event_with(PROBE_FRAME_PREVIOUS, &[], u32::from(frame.metadata.previous_frame.is_some()))?;
 		trace.event_with(PROBE_FRAME_SIG_VALID, &[], u32::from(sig_valid))?;
 
-		let unsigned = frame_compose(Version::V0)
+		let unsigned = Version::V0.compose()
 			.with_id(b"probe-response")
 			.with_message(PingResponse { doubled: req.value * 2 })
 			.build()?;
@@ -178,7 +178,8 @@ async fn record_frame_contract(
 	certs: &ClusterTestCerts,
 	gateway: &ClusterGateway,
 ) -> Result<(), TightBeamError> {
-	let unsigned = frame_compose(Version::V2)
+	let unsigned = Version::V2
+		.compose()
 		.with_id(b"client-signed-work")
 		.with_order(current_timestamp_ms())
 		.with_previous_hash(create_test_hash_info())
@@ -283,7 +284,7 @@ tb_scenario! {
 			trace.event(WORK_SENT)?;
 
 			let refused_work = client
-				.submit_work_to(servlet_instance(&servlet_urn("ping"), "127.0.0.1:9999"), &inner)
+				.submit_work_to(servlet_urn("ping").servlet_instance("127.0.0.1:9999"), &inner)
 				.await;
 			record_work_refusal(&trace, refused_work)?;
 
@@ -429,7 +430,7 @@ tb_scenario! {
 				hops_remaining: 0,
 			};
 
-			let frame = frame_compose(Version::V0)
+			let frame = Version::V0.compose()
 				.with_id(b"malformed-work")
 				.with_order(0)
 				.with_message(ClusterRequest::Work(malformed))

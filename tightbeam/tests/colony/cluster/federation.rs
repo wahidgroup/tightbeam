@@ -116,7 +116,8 @@ pub async fn flood_ad_rumor(
 	let inner = signed_control_frame_with(signer, id, advertisement).await?;
 
 	let provider = Secp256k1KeyProvider::from(signer.to_owned());
-	let rumor = frame_compose(Version::V2)
+	let rumor = Version::V2
+		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_message(GossipRumor::peer_advertisement(encode(&inner)?))
@@ -124,7 +125,8 @@ pub async fn flood_ad_rumor(
 		.sign_with_provider::<Sha3_256, _>(&provider)
 		.await?;
 
-	let frame = frame_compose(Version::V2)
+	let frame = Version::V2
+		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_lifetime(hop_ttl)
@@ -140,7 +142,7 @@ pub async fn flood_ad_rumor(
 
 /// Count the live peer routes for `type_name` on `cluster`.
 pub fn type_route_count(cluster: &ClusterGateway, type_name: &str) -> usize {
-	let canonical = type_canonical_bytes(&servlet_urn(type_name));
+	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
 		.iter()
@@ -208,7 +210,7 @@ async fn flood_until_routes(
 
 /// Whether any route for `type_name` on `cluster` dials `dial_addr`.
 fn type_route_dials(cluster: &ClusterGateway, type_name: &str, dial_addr: &[u8]) -> bool {
-	let canonical = type_canonical_bytes(&servlet_urn(type_name));
+	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
 		.iter()
@@ -580,7 +582,7 @@ fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: Vec<u8>) {
 /// rebuilt through the public [`ServletEntry::peer`] constructor so
 /// the key discipline stays in one place.
 fn peer_route_key_for_dial(cluster: &ClusterGateway, type_name: &str, dial_addr: &[u8]) -> Option<Vec<u8>> {
-	let canonical = type_canonical_bytes(&servlet_urn(type_name));
+	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
 		.into_iter()

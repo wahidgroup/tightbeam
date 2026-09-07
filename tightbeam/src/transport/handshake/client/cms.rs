@@ -19,9 +19,8 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
 use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier};
 use crate::crypto::x509::store::CertificateTrust;
-use crate::crypto::x509::utils::{
-	compute_signer_identifier, compute_signer_identifier_from_der, validate_certificate_expiry,
-};
+use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::utils::{compute_signer_identifier, compute_signer_identifier_from_der};
 use crate::crypto::x509::Certificate;
 use crate::der::asn1::{OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
@@ -29,11 +28,8 @@ use crate::der::{Any, Decode, Encode};
 use crate::oids::{DATA, HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_TRANSPORT_ACCEPT, SESSION_RECEIPT};
 use crate::random::{generate_nonce, CryptoRngCore, OsRng, RngWrapper};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
-use crate::transport::handshake::attributes::{
-	encode_receipt_ack, encode_security_offer, encode_transport_offer, extract_security_accept,
-	extract_session_receipt, extract_transport_accept, find_unsigned_attr, security_accept_transcript_bytes,
-	transport_accept_transcript_bytes,
-};
+use crate::transport::handshake::attributes::HandshakeAttribute;
+use crate::transport::handshake::attributes::HandshakeAttributes;
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
@@ -41,14 +37,16 @@ use crate::transport::handshake::negotiation::{
 	client_mux_settings, MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
+use crate::transport::handshake::receipt::ReceiptArtifact;
+use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, certificate_signer_identifier, complete_receipt_artifact, countersign_receipt,
-	match_receipt_to_accept, receipt_from_artifact, signer_for_role, verify_receipt_signer, ReceiptApprover,
-	ReceiptRole, SessionReceipt, StoredReceipt,
+	approve_or_fail_closed, match_receipt_to_accept, verify_receipt_signer, ReceiptApprover, ReceiptRole,
+	SessionReceipt, StoredReceipt,
 };
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
-use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
+use crate::transport::handshake::utils::HandshakeVerifyingKey;
+use crate::transport::handshake::utils::{compute_transcript_digest, validate_state};
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization,
 };
@@ -275,7 +273,7 @@ where
 		self.validate_expected_state(ClientHandshakeState::Init)?;
 
 		let store = self.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
-		validate_certificate_expiry(self.server_leaf()?)?;
+		self.server_leaf()?.validate_expiry()?;
 
 		match (&self.server_chain, &self.server_cert) {
 			(Some(chain), pinned) => {
@@ -330,7 +328,7 @@ where
 
 	/// Extract the server's verifying key from a certificate or similar.
 	fn extract_server_verifying_key(&self, server_cert: &Certificate) -> Result<P::VerifyingKey, HandshakeError> {
-		let server_public_key = extract_verifying_key_from_cert::<P::Curve>(server_cert)?;
+		let server_public_key = server_cert.verifying_key::<P::Curve>()?;
 		Ok(P::VerifyingKey::from(server_public_key))
 	}
 
@@ -435,11 +433,11 @@ where
 		let transport_accept = extract_transport_accept_attr(&signed_data)?;
 		if self.transcript_hash.is_none() {
 			if let Some(ref accept) = accept {
-				let accept_bytes = security_accept_transcript_bytes(accept)?;
+				let accept_bytes = HandshakeAttribute::transcript_bytes(accept)?;
 				self.transcript_buffer.extend_from_slice(&accept_bytes);
 			}
 			if let Some(ref accept) = transport_accept {
-				let accept_bytes = transport_accept_transcript_bytes(accept)?;
+				let accept_bytes = HandshakeAttribute::transcript_bytes(accept)?;
 				self.transcript_buffer.extend_from_slice(&accept_bytes);
 			}
 
@@ -518,7 +516,7 @@ where
 		let artifact = extract_session_receipt_attr(signed_data)?;
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
-		let parsed_receipt = artifact.as_ref().map(receipt_from_artifact).transpose()?;
+		let parsed_receipt = artifact.as_ref().map(ReceiptArtifact::receipt).transpose()?;
 		let Some(receipt) =
 			match_receipt_to_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
 		else {
@@ -528,10 +526,12 @@ where
 		// Server SignerInfo over the receipt body: third-party verifiable
 		// agreement, so an unsigned receipt is no receipt at all.
 		let artifact = artifact.ok_or(HandshakeError::ReceiptMissing)?;
-		let server_signer = signer_for_role(&artifact, ReceiptRole::Server)?.ok_or(HandshakeError::ReceiptMissing)?;
+		let server_signer = artifact
+			.signer_for_role(ReceiptRole::Server)?
+			.ok_or(HandshakeError::ReceiptMissing)?;
 
 		let receipt_der = receipt.to_der()?;
-		let expected_sid = certificate_signer_identifier::<P::Digest>(self.server_leaf()?)?;
+		let expected_sid = self.server_leaf()?.signer_identifier::<P::Digest>()?;
 		let verifying_key = self.extract_server_verifying_key(self.server_leaf()?)?;
 		verify_receipt_signer::<P::Digest, P::Signature, _>(
 			&receipt_der,
@@ -572,7 +572,7 @@ where
 		let response = approve_or_fail_closed(approver, &receipt).await?;
 		let answer = response.as_ref().map(OctetString::as_bytes);
 		let key_provider = self.client_key_provider.as_ref();
-		let countersignature = countersign_receipt::<P::Digest>(&receipt, answer, key_provider).await?;
+		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider).await?;
 
 		// The acknowledgement is confidential: the client SignerInfo (and
 		// the bearer answer bound in its signed attributes) travels in an
@@ -582,13 +582,13 @@ where
 		let ack_der = Zeroizing::new(countersignature.to_der()?);
 		let envelope_der = self.encrypt_to_server(&ack_der, &mut os)?;
 		let envelope = OctetString::new(envelope_der)?;
-		let ack_attr = encode_receipt_ack(&envelope)?;
+		let ack_attr = HandshakeAttribute::encode(&envelope)?;
 
 		let values = SetOfVec::try_from(ack_attr.attr_values)?;
 		let x509_attrs = vec![Attribute { oid: ack_attr.attr_type, values }];
 
 		// Both endpoints retain the identical completed artifact.
-		let completed = complete_receipt_artifact(server_artifact, countersignature)?;
+		let completed = server_artifact.complete(countersignature)?;
 		self.stored_receipt = Some(StoredReceipt::try_from(completed)?);
 
 		Ok(Some(Attributes::try_from(x509_attrs)?))
@@ -725,12 +725,12 @@ where
 
 		// Add SecurityOffer as unprotected attribute if configured
 		if let Some(ref offer) = self.security_offer {
-			let offer_attr = encode_security_offer(offer)?;
+			let offer_attr = HandshakeAttribute::encode(offer)?;
 			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
 		}
 		// Add TransportOffer as unprotected attribute if configured
 		if let Some(ref offer) = self.transport_offer {
-			let offer_attr = encode_transport_offer(offer)?;
+			let offer_attr = HandshakeAttribute::encode(offer)?;
 			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
 		}
 
@@ -870,24 +870,27 @@ where
 /// Extract the server's `SecurityAccept` from a Finished message's unsigned
 /// attributes, if present.
 fn extract_security_accept_attr(signed_data: &SignedData) -> Result<Option<SecurityAccept>, HandshakeError> {
-	find_unsigned_attr(signed_data, HANDSHAKE_SECURITY_ACCEPT)?
-		.map(|attr| extract_security_accept(&attr))
+	signed_data
+		.find_unsigned_attr(HANDSHAKE_SECURITY_ACCEPT)?
+		.map(|attr| attr.decode::<SecurityAccept>())
 		.transpose()
 }
 
 /// Extract the server's `TransportAccept` from a Finished message's unsigned
 /// attributes, if present.
 fn extract_transport_accept_attr(signed_data: &SignedData) -> Result<Option<TransportAccept>, HandshakeError> {
-	find_unsigned_attr(signed_data, HANDSHAKE_TRANSPORT_ACCEPT)?
-		.map(|attr| extract_transport_accept(&attr))
+	signed_data
+		.find_unsigned_attr(HANDSHAKE_TRANSPORT_ACCEPT)?
+		.map(|attr| attr.decode::<TransportAccept>())
 		.transpose()
 }
 
 /// Extract the server's receipt `SignedData` artifact from a Finished message's unsigned
 /// attributes, if present.
 fn extract_session_receipt_attr(signed_data: &SignedData) -> Result<Option<SignedData>, HandshakeError> {
-	find_unsigned_attr(signed_data, SESSION_RECEIPT)?
-		.map(|attr| extract_session_receipt(&attr))
+	signed_data
+		.find_unsigned_attr(SESSION_RECEIPT)?
+		.map(|attr| attr.decode::<SignedData>())
 		.transpose()
 }
 
@@ -1032,7 +1035,7 @@ mod tests {
 	use crate::random::OsRng;
 	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::testing::utils::create_test_certificate_chain;
-	use crate::transport::handshake::attributes::encode_security_accept;
+	use crate::transport::handshake::attributes::HandshakeAttribute;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	use crate::transport::handshake::error::HandshakeError;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
@@ -1217,14 +1220,14 @@ mod tests {
 			let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
 			let builder =
 				TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(&signing_key, digest_alg, signature_alg)?;
-			let mut signed_data = builder.build(&[7u8; 32])?;
 
-			let accept_attr = encode_security_accept(&SecurityAccept::new(profile))?;
+			let accept_attr = HandshakeAttribute::encode(&SecurityAccept::new(profile))?;
 			let x509_attr = Attribute {
 				oid: HANDSHAKE_SECURITY_ACCEPT,
 				values: SetOfVec::try_from(accept_attr.attr_values)?,
 			};
 
+			let mut signed_data = builder.build(&[7u8; 32])?;
 			let attrs = Attributes::try_from(vec![x509_attr])?;
 			let mut signer_infos: Vec<_> = signed_data.signer_infos.0.iter().cloned().collect();
 

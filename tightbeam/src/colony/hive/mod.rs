@@ -25,17 +25,18 @@ pub use gates::{
 	verify_frame_signature, ClusterSecurityGate, PeerListGate, PeerListMode, ReplayGuard, TrustVerification,
 };
 
-use std::collections::HashMap;
-
-use std::sync::Arc;
-
 use core::future::Future;
 use core::pin::Pin;
 use core::time::Duration;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
+use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::x509::Certificate;
 use crate::trace::TraceCollector;
-use crate::transport::client::pool::PoolConfig;
+use crate::transport::client::pool::{ClientIdentity, PoolConfig};
+use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::serve::unimplemented_error;
@@ -130,7 +131,7 @@ pub trait ServletRegistry: Send + Sync {
 		let mut list = Vec::new();
 		self.for_each(|_key, reg| {
 			let address = reg.servlet.addr_bytes();
-			let Ok(servlet_id) = crate::colony::common::instance_urn(&reg.servlet_type, address.as_ref()) else {
+			let Ok(servlet_id) = reg.servlet_type.instance_urn(address.as_ref()) else {
 				return;
 			};
 
@@ -162,6 +163,21 @@ pub struct HashMapRegistry {
 impl Default for HashMapRegistry {
 	fn default() -> Self {
 		Self { inner: std::sync::Mutex::new(HashMap::new()) }
+	}
+}
+
+impl HashMapRegistry {
+	/// Spawners for every servlet type currently registered.
+	///
+	/// Instances of one type share a spawner, so the map holds one entry
+	/// per type rather than one per instance.
+	pub(crate) fn spawners(&self) -> HashMap<Urn<'static>, SpawnerFn> {
+		let mut spawners = HashMap::new();
+		self.for_each(|_key, reg| {
+			spawners.insert(reg.servlet_type.clone(), Arc::clone(&reg.spawner));
+		});
+
+		spawners
 	}
 }
 
@@ -369,6 +385,34 @@ pub struct HiveTlsConfig {
 	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 }
 
+impl HiveTlsConfig {
+	/// Materializes the certificate and handshake key this hive presents.
+	///
+	/// A hive presents one identity everywhere: dialing a gateway, dialing
+	/// a sibling servlet, and accepting on its own control plane. Each of
+	/// those reads it here, so the three agree by construction.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- [`Self::certificate`]
+	///   holds PEM or DER that does not decode as a certificate.
+	pub(crate) fn identity(&self) -> Result<(Certificate, HandshakeKeyManager<DefaultCryptoProvider>), TightBeamError> {
+		let certificate = Certificate::try_from(self.certificate.clone())?;
+		let key_manager = HandshakeKeyManager::new(Arc::clone(&self.key));
+		Ok((certificate, key_manager))
+	}
+
+	/// The same identity as shared handles, ready to offer on a dial.
+	///
+	/// # Errors
+	///
+	/// Whatever [`Self::identity`] reports.
+	pub(crate) fn client_identity(&self) -> Result<ClientIdentity, TightBeamError> {
+		let (certificate, key_manager) = self.identity()?;
+		Ok(ClientIdentity::new(Arc::new(certificate), Arc::new(key_manager)))
+	}
+}
+
 impl core::fmt::Debug for HiveTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("HiveTlsConfig")
@@ -518,6 +562,16 @@ pub struct HiveScalingConfig {
 	pub cooldown: Duration,
 }
 
+impl HiveScalingConfig {
+	/// Scaling thresholds that apply to `servlet_type`.
+	///
+	/// A type with no entry in [`Self::overrides`] scales on
+	/// [`Self::default_scale`].
+	pub(crate) fn scale_config(&self, servlet_type: &Urn<'_>) -> ServletScaleConfig {
+		self.overrides.get(servlet_type).copied().unwrap_or(self.default_scale)
+	}
+}
+
 impl Default for HiveScalingConfig {
 	fn default() -> Self {
 		Self {
@@ -611,6 +665,18 @@ pub struct HiveConfig {
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 	/// TLS identity for control-plane signing and encrypted transport.
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+}
+
+impl HiveConfig {
+	/// Hive identity URN minted from the control address `hive_addr`.
+	///
+	/// [`None`] where the address is not UTF-8 or falls outside
+	/// [`Self::namespace`]. A hive that reaches [`None`] holds its cluster
+	/// announcements, which keeps an unusable identity off the wire.
+	pub(crate) fn hive_urn(&self, hive_addr: impl Into<Vec<u8>>) -> Option<Urn<'static>> {
+		let bytes: Vec<u8> = hive_addr.into();
+		self.namespace.hive_from_bytes(&bytes)
+	}
 }
 
 impl core::fmt::Debug for HiveConfig {

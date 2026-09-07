@@ -12,167 +12,113 @@ use crate::testing::fdr::config::Trace;
 use crate::testing::specs::csp::Event;
 use crate::testing::timing::{TimedTransition, TimingConstraint, TimingConstraints, TimingGuard};
 
-/// Check if current trace violates any timing constraints
-///
-/// Returns `true` if any timing constraint is violated, `false` otherwise.
-/// This allows pruning of violating traces during exploration.
-pub fn check_timing_violations(
-	trace: &Trace,
-	elapsed_time: Duration,
-	event_times: &[(Event, Duration)],
-	constraints: &TimingConstraints,
-) -> bool {
-	// Check deadline constraints
-	if check_deadline_violations(event_times, constraints) {
-		return true;
+impl TimingConstraints {
+	/// Whether the current trace violates any timing constraint.
+	///
+	/// The exploration prunes on `true`, so a violating trace is cut before
+	/// its successors are generated.
+	pub fn violated_by(&self, trace: &Trace, elapsed_time: Duration, event_times: &[(Event, Duration)]) -> bool {
+		self.deadline_violated(event_times) || self.path_wcet_violated(trace, elapsed_time)
 	}
 
-	// Check path WCET constraints
-	if check_path_wcet_violations(trace, elapsed_time, constraints) {
-		return true;
-	}
-
-	false
-}
-
-/// Check if a specific event's WCET violates its constraint
-///
-/// This is called during exploration after looking up the WCET for an event.
-/// It checks if the WCET value exceeds the constraint for that event.
-pub fn check_event_wcet_violation(event: &Event, event_wcet: Duration, constraints: &TimingConstraints) -> bool {
-	check_wcet_violations(event, event_wcet, constraints)
-}
-
-/// Check if any WCET constraint is violated
-///
-/// A WCET violation occurs if the WCET for an event exceeds its constraint.
-/// During exploration, we use WCET as worst-case time, so we check if the
-/// WCET value itself exceeds the constraint.
-fn check_wcet_violations(event: &Event, event_wcet: Duration, constraints: &TimingConstraints) -> bool {
-	// Check if the WCET for this event exceeds its constraint
-	if let Some(TimingConstraint::Wcet(wcet_config)) = constraints.get(event) {
-		// The event_wcet is the WCET value we looked up for this event
-		// Check if it exceeds the constraint
-		if event_wcet > wcet_config.duration {
-			return true;
-		}
-	}
-
-	false
-}
-
-/// Check if any deadline constraint is violated
-///
-/// A deadline violation occurs if the time between start_event and end_event
-/// exceeds the deadline duration.
-fn check_deadline_violations(event_times: &[(Event, Duration)], constraints: &TimingConstraints) -> bool {
-	for deadline in constraints.deadlines() {
-		// Find start_event and end_event in event_times
-		let mut start_time: Option<Duration> = None;
-		let mut end_time: Option<Duration> = None;
-		for (event, time) in event_times {
-			if *event == deadline.start_event {
-				start_time = Some(*time);
-			}
-			if *event == deadline.end_event {
-				end_time = Some(*time);
-			}
-		}
-
-		// If both events found, check deadline
-		if let (Some(start), Some(end)) = (start_time, end_time) {
-			let latency = end - start;
-			if latency > deadline.duration {
-				return true;
-			}
-		}
-	}
-
-	false
-}
-
-/// Check if any path WCET constraint is violated
-///
-/// A path WCET violation occurs if the cumulative WCET along a matching path
-/// exceeds the path WCET limit.
-fn check_path_wcet_violations(trace: &Trace, elapsed_time: Duration, constraints: &TimingConstraints) -> bool {
-	for path_wcet in constraints.path_wcets() {
-		// Check if current trace matches the path pattern
-		if matches_path_pattern(trace, &path_wcet.path) {
-			// If path matches and elapsed time exceeds limit, violation
-			if elapsed_time > path_wcet.max_duration {
-				return true;
-			}
-		}
-	}
-
-	false
-}
-
-/// Check if trace matches a path pattern (exact match)
-fn matches_path_pattern(trace: &Trace, pattern: &[Event]) -> bool {
-	if trace.len() != pattern.len() {
-		return false;
-	}
-
-	trace.iter().zip(pattern.iter()).all(|(a, b)| a == b)
-}
-
-/// Evaluate a timing guard against current clock values
-///
-/// Returns `true` if the guard is satisfied, `false` otherwise.
-/// If the clock is not found in clock_values, returns `false` (guard not satisfied).
-#[cfg(feature = "testing-timing")]
-pub fn evaluate_timing_guard(guard: &TimingGuard, clock_values: &HashMap<String, Duration>) -> bool {
-	match guard {
-		TimingGuard::ClockLessThan(name, duration) => clock_values.get(name).is_some_and(|v| *v < *duration),
-		TimingGuard::ClockLessEqual(name, duration) => clock_values.get(name).is_some_and(|v| *v <= *duration),
-		TimingGuard::ClockGreaterThan(name, duration) => clock_values.get(name).is_some_and(|v| *v > *duration),
-		TimingGuard::ClockGreaterEqual(name, duration) => clock_values.get(name).is_some_and(|v| *v >= *duration),
-		TimingGuard::ClockEquals(name, duration) => clock_values.get(name).is_some_and(|v| *v == *duration),
-		TimingGuard::ClockInRange(name, d1, d2) => clock_values.get(name).is_some_and(|v| *v >= *d1 && *v <= *d2),
-	}
-}
-
-/// Check if a timed transition's guard is satisfied
-///
-/// Returns `true` if:
-/// - The transition has no guard (backward compatible)
-/// - The transition has a guard and it is satisfied
-///
-/// Returns `false` if the guard exists and is not satisfied.
-#[cfg(feature = "testing-timing")]
-pub fn check_timed_transition_guard(transition: &TimedTransition, clock_values: &HashMap<String, Duration>) -> bool {
-	// If no guard, transition is always enabled (backward compatible)
-	if let Some(ref guard) = transition.guard {
-		evaluate_timing_guard(guard, clock_values)
-	} else {
-		true
-	}
-}
-
-/// Check if schedulability constraints are violated
-///
-/// Runs schedulability analysis (RMA or EDF) on the process's task set.
-/// Returns `true` if the task set is NOT schedulable (violation detected).
-#[cfg(feature = "testing-schedulability")]
-pub fn check_schedulability_violations(
-	process: &crate::testing::specs::csp::Process,
-) -> Result<bool, crate::testing::schedulability::SchedulabilityError> {
-	use crate::testing::schedulability::{is_edf_schedulable, is_rm_schedulable, SchedulerType};
-
-	// Generate TaskSet from timing + periods
-	if let Some(task_set) = process.generate_task_set()? {
-		// Run schedulability analysis
-		let result = match task_set.scheduler {
-			SchedulerType::RateMonotonic => is_rm_schedulable(&task_set)?,
-			SchedulerType::EarliestDeadlineFirst => is_edf_schedulable(&task_set)?,
+	/// Whether `event_wcet` exceeds the WCET constraint on `event`.
+	///
+	/// The exploration uses WCET as the worst-case time, so the looked-up
+	/// value is compared against the constraint directly.
+	pub fn wcet_violated(&self, event: &Event, event_wcet: Duration) -> bool {
+		let Some(TimingConstraint::Wcet(wcet_config)) = self.get(event) else {
+			return false;
 		};
 
-		// Return true if NOT schedulable (violation detected)
+		event_wcet > wcet_config.duration
+	}
+
+	/// Whether the time between any deadline's start and end event exceeds
+	/// that deadline's duration.
+	///
+	/// A deadline whose two events are not both in `event_times` has not
+	/// been exercised yet, so it cannot be violated.
+	fn deadline_violated(&self, event_times: &[(Event, Duration)]) -> bool {
+		self.deadlines().iter().any(|deadline| {
+			let start = event_times
+				.iter()
+				.find(|(event, _)| *event == deadline.start_event)
+				.map(|(_, time)| *time);
+			let end = event_times
+				.iter()
+				.find(|(event, _)| *event == deadline.end_event)
+				.map(|(_, time)| *time);
+
+			matches!((start, end), (Some(start), Some(end)) if end - start > deadline.duration)
+		})
+	}
+
+	/// Whether the cumulative WCET along a matching path exceeds its limit.
+	///
+	/// A path matches only on an exact event sequence, so a longer or
+	/// shorter trace leaves that path's limit unspent.
+	fn path_wcet_violated(&self, trace: &Trace, elapsed_time: Duration) -> bool {
+		self.path_wcets().iter().any(|path_wcet| {
+			let matched =
+				trace.len() == path_wcet.path.len() && trace.iter().zip(path_wcet.path.iter()).all(|(a, b)| a == b);
+
+			matched && elapsed_time > path_wcet.max_duration
+		})
+	}
+}
+
+#[cfg(feature = "testing-timing")]
+impl TimingGuard {
+	/// Whether this guard holds for `clock_values`.
+	///
+	/// A clock the guard names but the map omits leaves the guard
+	/// unsatisfied, so an unstarted clock never enables a transition.
+	pub fn satisfied_by(&self, clock_values: &HashMap<String, Duration>) -> bool {
+		match self {
+			TimingGuard::ClockLessThan(name, duration) => clock_values.get(name).is_some_and(|v| *v < *duration),
+			TimingGuard::ClockLessEqual(name, duration) => clock_values.get(name).is_some_and(|v| *v <= *duration),
+			TimingGuard::ClockGreaterThan(name, duration) => clock_values.get(name).is_some_and(|v| *v > *duration),
+			TimingGuard::ClockGreaterEqual(name, duration) => clock_values.get(name).is_some_and(|v| *v >= *duration),
+			TimingGuard::ClockEquals(name, duration) => clock_values.get(name).is_some_and(|v| *v == *duration),
+			TimingGuard::ClockInRange(name, d1, d2) => clock_values.get(name).is_some_and(|v| *v >= *d1 && *v <= *d2),
+		}
+	}
+}
+
+#[cfg(feature = "testing-timing")]
+impl TimedTransition {
+	/// Whether this transition is enabled at `clock_values`.
+	///
+	/// A transition with no guard is always enabled.
+	pub fn guard_satisfied(&self, clock_values: &HashMap<String, Duration>) -> bool {
+		self.guard.as_ref().is_none_or(|guard| guard.satisfied_by(clock_values))
+	}
+}
+
+#[cfg(feature = "testing-schedulability")]
+impl crate::testing::specs::csp::Process {
+	/// Whether this process's task set fails schedulability analysis.
+	///
+	/// A process with no schedulability configuration has no task set to
+	/// analyse, so it reports no violation.
+	///
+	/// # Errors
+	///
+	/// - [`SchedulabilityError`](crate::testing::schedulability::SchedulabilityError)
+	///   from task-set generation or the analysis itself.
+	pub fn schedulability_violated(&self) -> Result<bool, crate::testing::schedulability::SchedulabilityError> {
+		use crate::testing::schedulability::SchedulerType;
+
+		let Some(task_set) = self.generate_task_set()? else {
+			return Ok(false);
+		};
+
+		let result = match task_set.scheduler {
+			SchedulerType::RateMonotonic => task_set.is_rm_schedulable()?,
+			SchedulerType::EarliestDeadlineFirst => task_set.is_edf_schedulable()?,
+		};
+
 		Ok(!result.is_schedulable)
-	} else {
-		Ok(false) // No schedulability config, no violation
 	}
 }
 
@@ -283,7 +229,7 @@ mod tests {
 			constraints.add_path_wcet(path_wcet);
 		}
 
-		let has_violation = check_timing_violations(&trace, elapsed_time, &event_times, &constraints);
+		let has_violation = constraints.violated_by(&trace, elapsed_time, &event_times);
 		assert_eq!(has_violation, case.expected_violation);
 
 		Ok(())
@@ -305,7 +251,7 @@ mod tests {
 		let elapsed_time = Duration::from_millis(100);
 		let event_times = vec![];
 
-		let has_violation = check_timing_violations(&trace, elapsed_time, &event_times, &constraints);
+		let has_violation = constraints.violated_by(&trace, elapsed_time, &event_times);
 		assert!(!has_violation);
 	}
 
@@ -317,30 +263,14 @@ mod tests {
 		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
 
 		// WCET within constraint: no violation
-		assert!(!check_event_wcet_violation(
-			&Event("process"),
-			Duration::from_millis(50),
-			&constraints
-		));
-		assert!(!check_event_wcet_violation(
-			&Event("process"),
-			Duration::from_millis(100),
-			&constraints
-		));
+		assert!(!constraints.wcet_violated(&Event("process"), Duration::from_millis(50)));
+		assert!(!constraints.wcet_violated(&Event("process"), Duration::from_millis(100)));
 
 		// WCET exceeds constraint: violation
-		assert!(check_event_wcet_violation(
-			&Event("process"),
-			Duration::from_millis(150),
-			&constraints
-		));
+		assert!(constraints.wcet_violated(&Event("process"), Duration::from_millis(150)));
 
 		// Event without constraint: no violation
-		assert!(!check_event_wcet_violation(
-			&Event("other"),
-			Duration::from_millis(1000),
-			&constraints
-		));
+		assert!(!constraints.wcet_violated(&Event("other"), Duration::from_millis(1000)));
 
 		Ok(())
 	}

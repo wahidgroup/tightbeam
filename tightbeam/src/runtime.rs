@@ -56,6 +56,17 @@ pub mod rt {
 		handle.abort();
 	}
 
+	/// Take an optional join handle and abort it when present.
+	///
+	/// Servlet, hive, and cluster `stop` and `Drop` paths all release a
+	/// task the same way, so the take and the abort stay one step and a
+	/// stopped runtime cannot keep a live handle.
+	pub fn take_and_abort(handle: &mut Option<JoinHandle>) {
+		if let Some(handle) = handle.take() {
+			abort(&handle);
+		}
+	}
+
 	/// Wait for a task to complete
 	pub async fn join(handle: JoinHandle) -> Result<(), JoinError> {
 		handle.await
@@ -164,6 +175,16 @@ pub mod rt {
 	/// Abort a thread (no-op for std threads - dropping detaches)
 	pub fn abort(_handle: &JoinHandle) {
 		// No cooperative cancellation for std threads
+	}
+
+	/// Take an optional join handle and drop it when present.
+	///
+	/// Dropping detaches a std thread, so the handle is released and the
+	/// thread runs to its own end.
+	pub fn take_and_abort(handle: &mut Option<JoinHandle>) {
+		if let Some(handle) = handle.take() {
+			abort(&handle);
+		}
 	}
 
 	/// Wait for a thread to complete

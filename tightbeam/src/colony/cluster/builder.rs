@@ -42,8 +42,8 @@ use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
 
 use crate::colony::cluster::{
-	cert_colony_urn, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
-	PeerStore, PeerTable, StaticExportList,
+	ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore, PeerStore, PeerTable,
+	StaticExportList,
 };
 use crate::crypto::x509::Certificate;
 use crate::utils::urn::Urn;
@@ -435,7 +435,7 @@ impl ClusterConfigBuilder {
 		// gateway a non-member, fail closed.
 		let colony_urn = Certificate::try_from(self.tls.certificate.clone())
 			.ok()
-			.and_then(|cert| cert_colony_urn(&self.namespace, &cert));
+			.and_then(|cert| self.namespace.cert_colony_urn(&cert));
 
 		// The discovery table derives from the dial list at build, so the
 		// configured peers are always its un-evictable anchors. The

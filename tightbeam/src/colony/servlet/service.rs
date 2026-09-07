@@ -2,7 +2,7 @@ use core::future::Future;
 use core::pin::Pin;
 use std::sync::Arc;
 
-use crate::colony::servlet::{dispatch_typed_unary, ServletConfig, ServletContext};
+use crate::colony::servlet::{ServletConfig, ServletContext};
 use crate::core::Message;
 use crate::trace::TraceCollector;
 use crate::transport::multiplex::{ReplySink, StreamBody};
@@ -153,7 +153,7 @@ impl ServletHandlers {
 		self
 	}
 
-	/// Decode message type `I` after [`crate::colony::servlet::prepare_typed_frame`], then run `handler`.
+	/// Decode message type `I` after [`crate::Frame::prepare_typed`], then run `handler`.
 	pub fn on_typed_unary<I, F, Fut>(self, handler: F) -> Self
 	where
 		I: Message + Send + 'static,
@@ -164,7 +164,9 @@ impl ServletHandlers {
 		self.on_unary(move |frame, ctx| {
 			let handler = Arc::clone(&handler);
 			async move {
-				dispatch_typed_unary(frame, ctx.as_ref(), |message, frame, ctx| handler(message, frame, ctx)).await
+				frame
+					.dispatch_typed_unary(ctx.as_ref(), |message, frame, ctx| handler(message, frame, ctx))
+					.await
 			}
 		})
 	}

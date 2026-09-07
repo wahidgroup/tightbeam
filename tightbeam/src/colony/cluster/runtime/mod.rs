@@ -30,22 +30,19 @@ use self::bounds::{
 };
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
-use crate::colony::cluster::outbound::build_cluster_pools;
 use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, HopBudget, PeerRouteInfo,
 	ServletRegistry, SharedId,
 };
-use crate::colony::common::{take_and_abort, HeartbeatResult, TaskGroup};
+use crate::colony::common::{HeartbeatResult, TaskGroup};
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS;
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
-use crate::crypto::x509::Certificate;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
-use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::serve::{unimplemented_error, CallContext, MuxService};
@@ -56,61 +53,65 @@ use crate::TightBeamError;
 
 use crate::instrumentation::events::{CLUSTER_EXPORT_IDENTITY_UNAVAILABLE, CLUSTER_EXPORT_UNBOUNDED};
 
-/// Emit one-time export-posture warnings when the gateway starts.
-///
-/// Two configurations weaken the organization edge without an explicit
-/// operator choice at request time, so the gateway surfaces each condition
-/// once for audit.
-///
-/// # Warnings
-///
-/// - Federated gateway with no export list: serves and advertises every local
-///   type to external peers ([`CLUSTER_EXPORT_UNBOUNDED`]).
-/// - Export list without captured client identity: every session stays
-///   anonymous, so unexported targets are unreachable from the origin plane
-///   as well ([`CLUSTER_EXPORT_IDENTITY_UNAVAILABLE`]).
-///
-/// # Sources
-///
-/// - NIST SP 800-53 Rev. 5 CM-6, configuration settings:
-///   <https://csrc.nist.gov/projects/risk-management/sp800-53-controls/release-search#/control?version=5.1&number=CM-6>
-fn warn_export_posture(config: &ClusterConfig, trace: &TraceCollector) -> Result<(), TightBeamError> {
-	let federation_active = config.tls.peer_trust.is_some() || !config.peer.peers.is_empty();
-	match config.peer.exported_types.as_ref() {
-		None => {
-			if federation_active {
-				trace.event(CLUSTER_EXPORT_UNBOUNDED)?.emit();
+impl ClusterConfig {
+	/// Emit one-time export-posture warnings when the gateway starts.
+	///
+	/// Two configurations weaken the organization edge without an explicit
+	/// operator choice at request time, so the gateway surfaces each
+	/// condition once for audit.
+	///
+	/// # Warnings
+	///
+	/// - Federated gateway with no export list: serves and advertises every
+	///   local type to external peers ([`CLUSTER_EXPORT_UNBOUNDED`]).
+	/// - Export list without captured client identity: every session stays
+	///   anonymous, so unexported targets are unreachable from the origin
+	///   plane as well ([`CLUSTER_EXPORT_IDENTITY_UNAVAILABLE`]).
+	///
+	/// # Sources
+	///
+	/// - NIST SP 800-53 Rev. 5 CM-6, configuration settings:
+	///   <https://csrc.nist.gov/projects/risk-management/sp800-53-controls/release-search#/control?version=5.1&number=CM-6>
+	fn warn_export_posture(&self, trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let federation_active = self.tls.peer_trust.is_some() || !self.peer.peers.is_empty();
+		match self.peer.exported_types.as_ref() {
+			None => {
+				if federation_active {
+					trace.event(CLUSTER_EXPORT_UNBOUNDED)?.emit();
+				}
+			}
+			Some(_) => {
+				let identity_captured = !self.tls.client_validators.is_empty() && self.tls.hive_trust.is_some();
+				if !identity_captured {
+					trace.event(CLUSTER_EXPORT_IDENTITY_UNAVAILABLE)?.emit();
+				}
 			}
 		}
-		Some(_) => {
-			let identity_captured = !config.tls.client_validators.is_empty() && config.tls.hive_trust.is_some();
-			if !identity_captured {
-				trace.event(CLUSTER_EXPORT_IDENTITY_UNAVAILABLE)?.emit();
-			}
+
+		Ok(())
+	}
+
+	/// Assemble the accept-side TLS configuration shared by the colony and
+	/// edge listeners.
+	///
+	/// Both planes present the same certificate and key so an external edge
+	/// client pins the same gateway identity that hives already trust. An
+	/// empty `client_validators` list means server-auth only.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- the configured
+	///   certificate does not decode.
+	fn accept_encryption_config(&self) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
+		let (certificate, key_manager) = self.tls.identity()?;
+		let mut encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+		if !self.tls.client_validators.is_empty() {
+			let validators: Vec<_> = self.tls.client_validators.iter().map(Arc::clone).collect();
+			encryption_config = encryption_config.with_client_validators(validators);
 		}
+
+		Ok(encryption_config)
 	}
-
-	Ok(())
-}
-
-/// Assemble the accept-side TLS configuration shared by the colony and
-/// edge listeners.
-///
-/// Both planes present the same certificate and key so an external edge
-/// client pins the same gateway identity that hives already trust. An
-/// empty `client_validators` list means server-auth only.
-fn accept_encryption_config(
-	config: &ClusterConfig,
-) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
-	let cert_obj = Certificate::try_from(config.tls.certificate.clone())?;
-	let key_mgr = HandshakeKeyManager::new(Arc::clone(&config.tls.key));
-	let mut encryption_config = TransportEncryptionConfig::new(cert_obj, key_mgr);
-	if !config.tls.client_validators.is_empty() {
-		let validators: Vec<_> = config.tls.client_validators.iter().map(Arc::clone).collect();
-		encryption_config = encryption_config.with_client_validators(validators);
-	}
-
-	Ok(encryption_config)
 }
 
 fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
@@ -174,8 +175,8 @@ where
 {
 	fn abort_tasks(&mut self) {
 		self.tasks.abort_all();
-		take_and_abort(&mut self.edge_handle);
-		take_and_abort(&mut self.server_handle);
+		rt::take_and_abort(&mut self.edge_handle);
+		rt::take_and_abort(&mut self.server_handle);
 	}
 }
 
@@ -212,7 +213,7 @@ where
 			None => P::default_bind_address().map_err(protocol_error)?,
 		};
 
-		let (listener, addr) = P::bind_with(bind_addr, accept_encryption_config(&config)?)
+		let (listener, addr) = P::bind_with(bind_addr, config.accept_encryption_config()?)
 			.await
 			.map_err(protocol_error)?;
 
@@ -222,7 +223,7 @@ where
 				.with_ad_tombstone_window_ms(config.control_freshness_window_ms),
 		);
 
-		let pools = build_cluster_pools::<P>(config.pool_config.clone(), &config.tls)?;
+		let pools = config.pool_config.build_cluster_pools::<P>(&config.tls)?;
 		let pool = pools.hive;
 		let peer_pool = pools.peer;
 
@@ -245,8 +246,7 @@ where
 		let (edge_listener, edge_addr) = match config.edge_bind_addr.as_deref() {
 			Some(raw) => {
 				let edge_bind: E::Address = raw.parse().map_err(|_| TransportError::InvalidMessage)?;
-
-				let (edge_listener, edge_addr) = E::bind_with(edge_bind, accept_encryption_config(&config)?)
+				let (edge_listener, edge_addr) = E::bind_with(edge_bind, config.accept_encryption_config()?)
 					.await
 					.map_err(protocol_error)?;
 
@@ -257,7 +257,7 @@ where
 
 		// Export posture is colony-wide configuration, so the one startup
 		// path reports it once rather than each accept plane.
-		warn_export_posture(&config, &trace)?;
+		config.warn_export_posture(&trace)?;
 
 		// The context is all Arc::clone
 		let server_handle = ctx.clone().serve::<P::Listener, D>(listener, GatewayPlane::Colony);
@@ -444,7 +444,7 @@ where
 		let ctx = self.ctx.clone();
 		let plane = self.plane;
 		async move {
-			let (target, budget) = guard_stream_open(&cx, &ctx, plane)?;
+			let (target, budget) = ctx.guard_stream_open(&cx, plane)?;
 			ctx.splice_streaming(body, target, budget).await
 		}
 	}
@@ -458,54 +458,53 @@ where
 		let ctx = self.ctx.clone();
 		let plane = self.plane;
 		async move {
-			let (target, budget) = guard_stream_open(&cx, &ctx, plane)?;
+			let (target, budget) = ctx.guard_stream_open(&cx, plane)?;
 			ctx.splice_duplex(body, reply, target, budget).await
 		}
 	}
 }
 
-/// Boundary guard shared by the streaming and duplex open handlers.
-///
-/// The edge accept plane admits unary `Work` only, so stream and duplex
-/// opens refuse there before any gate or route work. On the colony
-/// plane, evaluation mirrors the unary Work arm:
-///
-/// 1. [`ClusterConfig::evaluate_gates`] with no request frame.
-/// 2. Resolve the servlet target from the call context.
-/// 3. Derive `relayed` from [`HopBudget::is_relayed`].
-/// 4. [`ClusterConfig::evaluate_export_gates`] on that target and session.
-///
-/// An unrouted open names no servlet type, so it fails with `Unimplemented`.
-fn guard_stream_open<P>(
-	cx: &CallContext,
-	ctx: &GatewayRuntimeCtx<P>,
-	plane: GatewayPlane,
-) -> Result<(Urn<'static>, HopBudget), TightBeamError>
-where
-	P: Protocol,
-{
-	if plane == GatewayPlane::Edge {
-		return Err(TransitStatus::PermissionDenied.refusal());
+impl<P: Protocol> GatewayRuntimeCtx<P> {
+	/// Boundary guard shared by the streaming and duplex open handlers.
+	///
+	/// The edge accept plane admits unary `Work` only, so stream and duplex
+	/// opens refuse there before any gate or route work. On the colony
+	/// plane the open passes the same boundary a unary request passes:
+	///
+	/// 1. [`ClusterConfig::evaluate_gates`] with no request frame.
+	/// 2. Resolve the servlet target from the call context.
+	/// 3. Derive `relayed` from [`HopBudget::is_relayed`].
+	/// 4. [`ClusterConfig::evaluate_export_gates`] on that target and session.
+	///
+	/// An unrouted open names no servlet type, so it fails with `Unimplemented`.
+	fn guard_stream_open(
+		&self,
+		cx: &CallContext,
+		plane: GatewayPlane,
+	) -> Result<(Urn<'static>, HopBudget), TightBeamError> {
+		if plane == GatewayPlane::Edge {
+			return Err(TransitStatus::PermissionDenied.refusal());
+		}
+
+		let gate_status = self.config.evaluate_gates(None, cx.session(), &self.trace)?;
+		if gate_status != TransitStatus::Ok {
+			return Err(gate_status.refusal());
+		}
+
+		let Some(target) = cx.target().cloned() else {
+			return Err(unimplemented_error());
+		};
+
+		let budget = HopBudget::from_wire(cx.hops_remaining(), self.config.peer.max_hops);
+		let is_relayed = budget.is_relayed();
+		let session = cx.session();
+		let export_status = self.config.evaluate_export_gates(&target, session, is_relayed, &self.trace)?;
+		if export_status != TransitStatus::Ok {
+			return Err(export_status.refusal());
+		}
+
+		Ok((target, budget))
 	}
-
-	let gate_status = ctx.config.evaluate_gates(None, cx.session(), &ctx.trace)?;
-	if gate_status != TransitStatus::Ok {
-		return Err(gate_status.refusal());
-	}
-
-	let Some(target) = cx.target().cloned() else {
-		return Err(unimplemented_error());
-	};
-
-	let budget = HopBudget::from_wire(cx.hops_remaining(), ctx.config.peer.max_hops);
-	let export_status = ctx
-		.config
-		.evaluate_export_gates(&target, cx.session(), budget.is_relayed(), &ctx.trace)?;
-	if export_status != TransitStatus::Ok {
-		return Err(export_status.refusal());
-	}
-
-	Ok((target, budget))
 }
 
 impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
