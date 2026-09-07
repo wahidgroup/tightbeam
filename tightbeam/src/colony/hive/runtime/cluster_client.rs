@@ -178,15 +178,22 @@ where
 				return;
 			};
 
-			loop {
-				tokio::time::sleep(interval).await;
+			let beat: Result<(), TightBeamError> = async move {
+				loop {
+					tokio::time::sleep(interval).await;
 
-				for gateway in link.gateways() {
-					let outcome = link.register(gateway).await;
-					let status = outcome.map(|response| response.status).unwrap_or(TransitStatus::Unavailable);
-					let _ = trace.event_with(HIVE_REREGISTERED, &[], status);
+					for gateway in link.gateways() {
+						let outcome = link.register(gateway).await;
+						let status = outcome.map(|response| response.status).unwrap_or(TransitStatus::Unavailable);
+						trace.event_with(HIVE_REREGISTERED, &[], status)?;
+					}
 				}
 			}
+			.await;
+
+			// A trace fault ends the beat, which is the effect a
+			// `testing-fault` injection observes.
+			drop(beat);
 		})
 	}
 
@@ -292,6 +299,7 @@ where
 	if let Some(store) = trust_store {
 		transport = transport.with_trust_store(Arc::clone(store));
 	}
+
 	if let Some(hive_tls) = hive_tls {
 		let cert = Certificate::try_from(hive_tls.certificate.clone())?;
 		let key_mgr = HandshakeKeyManager::new(Arc::clone(&hive_tls.key));

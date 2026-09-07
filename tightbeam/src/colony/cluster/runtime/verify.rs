@@ -15,152 +15,27 @@
 //!
 //! [`evaluate_export_gates`] runs [`ExportPolicy`] where the servlet target
 //! is resolved: allowlist, then grants, then deny gates.
-//! [`spent_relay_budget`] supplies the `relayed` flag. Verdict algebra and
+//! [`HopBudget::is_relayed`] supplies the `relayed` flag. Verdict algebra and
 //! posture warnings live in [`crate::colony::cluster::export`].
 //!
 //! # Origin and freshness
 //!
 //! [`verify_hive_origin`] and [`verify_peer_origin`] verify frame signatures
-//! against the configured trust stores. [`verify_control_freshness`] rejects
+//! against the configured trust stores. [`GatewayReplayGuard`] rejects
 //! stale or replayed signed control frames.
+//!
+//! [`GatewayReplayGuard`]: super::freshness::GatewayReplayGuard
 
-use crate::colony::cluster::runtime::bounds::GatewayReplayGuard;
+use crate::colony::cluster::export::{ExportDecision, ExportPolicy};
+use crate::colony::cluster::peer::cert_fingerprint_id;
 use crate::colony::cluster::ClusterConfig;
-use crate::colony::common::current_timestamp_ms;
 use crate::colony::hive::{verify_frame_signature, TrustVerification};
-use crate::constants::DEFAULT_HOP_BUDGET;
-use crate::der::Encode;
-use crate::instrumentation::events::CLUSTER_GATE_BLOCKED;
+use crate::instrumentation::events::{CLUSTER_EXPORT_GRANTED, CLUSTER_EXPORT_REFUSED, CLUSTER_GATE_BLOCKED};
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
 use crate::utils::urn::Urn;
 use crate::Frame;
-
-#[cfg(feature = "x509")]
-mod x509 {
-	pub(crate) use crate::colony::cluster::export::{ExportDecision, ExportPolicy};
-	pub(crate) use crate::colony::cluster::peer::cert_fingerprint_id;
-	pub(crate) use crate::instrumentation::events::{CLUSTER_EXPORT_GRANTED, CLUSTER_EXPORT_REFUSED};
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
-
-/// Whether a request already spent relay budget.
-///
-/// A hop budget below the origin sentinel marks the request as relayed
-/// through a peer gateway rather than from a direct client.
-///
-/// # Call sites
-///
-/// The unary work arm and the streaming/duplex open handlers derive the export
-/// boundary's `relayed` flag through this predicate.
-pub(crate) fn spent_relay_budget(hops_remaining: u8) -> bool {
-	hops_remaining != DEFAULT_HOP_BUDGET
-}
-
-/// Run configured [`GatePolicy`] instances with no audit side effects.
-pub(crate) fn policies_allow(
-	frame: Option<&Frame>,
-	session: &SessionContext,
-	config: &ClusterConfig,
-) -> Result<(), TransitStatus> {
-	for policy in config.policies.iter() {
-		let status = GatePolicy::evaluate(policy.as_ref(), frame, session).normalized_verdict();
-		if status != TransitStatus::Ok {
-			return Err(status);
-		}
-	}
-
-	Ok(())
-}
-
-/// Run collector gate policies before decoding the request envelope.
-///
-/// Each configured policy must return [`TransitStatus::Ok`], so the first
-/// refusal short-circuits dispatch.
-///
-/// - `frame`: request envelope when present; `None` for stream opens that carry
-///   no unary frame
-/// - `session`: caller identity and transport facts for the admitted connection
-/// - `config`: live cluster configuration, including the policy list
-/// - `trace`: collector that receives [`CLUSTER_GATE_BLOCKED`] on refusal
-pub(crate) fn evaluate_gates(
-	frame: Option<&Frame>,
-	session: &SessionContext,
-	config: &ClusterConfig,
-	trace: &TraceCollector,
-) -> Result<(), TransitStatus> {
-	match policies_allow(frame, session, config) {
-		Ok(()) => Ok(()),
-		Err(status) => {
-			trace.event(CLUSTER_GATE_BLOCKED).map_err(|_| status)?;
-			Err(status)
-		}
-	}
-}
-
-/// Enforce the export boundary on a resolved servlet target.
-///
-/// The verdict algebra lives in [`ExportPolicy`], read from live
-/// configuration so enforcement stays aligned with the advertise filter.
-/// This wrapper adds the audit plane.
-///
-/// 1. Run [`ExportPolicy::verdict`] (allowlist, grants, then deny gates).
-/// 2. Trace [`CLUSTER_EXPORT_REFUSED`] or [`CLUSTER_EXPORT_GRANTED`] with
-///    the caller certificate fingerprint and the relayed flag.
-///
-/// The granted event fires only when the full verdict passes, because a
-/// grant overridden by a deny gate did not decide the outcome.
-///
-/// - `target`: servlet type under enforcement
-/// - `session`: caller identity facts for the admitted connection
-/// - `relayed`: `true` when [`spent_relay_budget`] marks the request as
-///   peer-relayed
-/// - `config`: live cluster configuration, including export lists, grants,
-///   and gates
-/// - `trace`: collector that receives the boundary audit events
-///
-/// # Call sites
-///
-/// - Unary work arm in [`super::dispatch`]
-/// - Streaming and duplex open handlers in [`super::gateway`]
-///
-/// # Sources
-///
-/// - CWE-285, improper authorization:
-///   <https://cwe.mitre.org/data/definitions/285.html>
-/// - ISO/IEC 27001:2022 A.8.15, logging:
-///   <https://www.iso.org/standard/82875.html>
-pub(crate) fn evaluate_export_gates(
-	target: &Urn<'_>,
-	session: &SessionContext,
-	relayed: bool,
-	config: &ClusterConfig,
-	trace: &TraceCollector,
-) -> Result<(), TransitStatus> {
-	#[cfg(feature = "x509")]
-	{
-		match ExportPolicy::from(config).verdict(target, session, relayed) {
-			Ok(ExportDecision::Allowed) => Ok(()),
-			Ok(ExportDecision::Granted) => {
-				trace_export_outcome(trace, CLUSTER_EXPORT_GRANTED, session, relayed);
-
-				Ok(())
-			}
-			Err(status) => {
-				trace_export_outcome(trace, CLUSTER_EXPORT_REFUSED, session, relayed);
-
-				Err(status)
-			}
-		}
-	}
-	#[cfg(not(feature = "x509"))]
-	{
-		let _ = (target, session, relayed, config, trace);
-		Ok(())
-	}
-}
+use crate::TightBeamError;
 
 /// Trace an export boundary outcome with the caller principal and relay
 /// context.
@@ -173,15 +48,20 @@ pub(crate) fn evaluate_export_gates(
 /// The event value carries the `relayed` flag. When mutual TLS captured a
 /// caller certificate, the payload is its fingerprint (matching the
 /// peer-advertisement refusal convention). Anonymous sessions emit no payload.
-#[cfg(feature = "x509")]
-fn trace_export_outcome(trace: &TraceCollector, outcome: Urn<'static>, session: &SessionContext, relayed: bool) {
+fn trace_export_outcome(
+	trace: &TraceCollector,
+	outcome: Urn<'static>,
+	session: &SessionContext,
+	relayed: bool,
+) -> Result<(), TightBeamError> {
 	let fingerprint = session.peer_certificate().and_then(cert_fingerprint_id);
-	if let Ok(event) = trace.event_with(outcome, &[], relayed) {
-		match fingerprint.as_ref() {
-			Some(id) => event.with_payload(id.as_ref()).emit(),
-			None => event.emit(),
-		}
+	let event = trace.event_with(outcome, &[], relayed)?;
+	match fingerprint.as_ref() {
+		Some(id) => event.with_payload(id.as_ref()).emit(),
+		None => event.emit(),
 	}
+
+	Ok(())
 }
 
 /// Whether the frame signer is also a member of `tls.peer_trust`.
@@ -189,7 +69,6 @@ fn trace_export_outcome(trace: &TraceCollector, outcome: Urn<'static>, session: 
 /// Peer membership wins across the whole trust plane. A signer the peer
 /// store trusts is an external peer, so it must not act on the hive
 /// plane even when `hive_trust` also trusts it.
-#[cfg(feature = "x509")]
 fn signer_is_peer(config: &ClusterConfig, frame: &Frame) -> bool {
 	config
 		.tls
@@ -198,24 +77,112 @@ fn signer_is_peer(config: &ClusterConfig, frame: &Frame) -> bool {
 		.is_some_and(|trust| matches!(verify_frame_signature(trust.as_ref(), frame), TrustVerification::Verified))
 }
 
-/// Verify hive-origin control frames against `tls.hive_trust`.
-///
-/// A missing trust store or a failed signature yields
-/// [`TransitStatus::PermissionDenied`]. A frame without a signature yields
-/// [`TransitStatus::Unauthenticated`]. A signer that `tls.peer_trust`
-/// also trusts is refused: peer membership wins, so an identity held by
-/// both stores never acts on the hive plane.
-///
-/// # Sources
-///
-/// - CWE-306, missing authentication for critical function:
-///   <https://cwe.mitre.org/data/definitions/306.html>
-pub(crate) fn verify_hive_origin(config: &ClusterConfig, frame: &Frame) -> TransitStatus {
-	#[cfg(feature = "x509")]
-	{
-		match config.tls.hive_trust.as_ref() {
+impl ClusterConfig {
+	/// Run configured [`GatePolicy`] instances with no audit side effects.
+	pub(crate) fn policies_allow(&self, frame: Option<&Frame>, session: &SessionContext) -> Result<(), TransitStatus> {
+		let config = self;
+
+		for policy in config.policies.iter() {
+			let status = GatePolicy::evaluate(policy.as_ref(), frame, session).normalized_verdict();
+			if status != TransitStatus::Ok {
+				return Err(status);
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Run collector gate policies before decoding the request envelope.
+	///
+	/// Each configured policy must return [`TransitStatus::Ok`], so the first
+	/// refusal short-circuits dispatch.
+	///
+	/// - `frame`: request envelope when present; `None` for stream opens that carry no unary frame
+	/// - `session`: caller identity and transport facts for the admitted connection
+	/// - `trace`: collector that receives [`CLUSTER_GATE_BLOCKED`] on refusal
+	pub(crate) fn evaluate_gates(
+		&self,
+		frame: Option<&Frame>,
+		session: &SessionContext,
+		trace: &TraceCollector,
+	) -> Result<TransitStatus, TightBeamError> {
+		let config = self;
+		let Err(status) = config.policies_allow(frame, session) else {
+			return Ok(TransitStatus::Ok);
+		};
+
+		trace.event(CLUSTER_GATE_BLOCKED)?.emit();
+
+		Ok(status)
+	}
+
+	/// Enforce the export boundary on a resolved servlet target.
+	///
+	/// The verdict algebra lives in [`ExportPolicy`], read from live
+	/// configuration so enforcement stays aligned with the advertise filter.
+	/// This wrapper adds the audit plane.
+	///
+	/// 1. Run [`ExportPolicy::verdict`] (allowlist, grants, then deny gates).
+	/// 2. Trace [`CLUSTER_EXPORT_REFUSED`] or [`CLUSTER_EXPORT_GRANTED`] with
+	///    the caller certificate fingerprint and the relayed flag.
+	///
+	/// The granted event fires only when the full verdict passes, because a
+	/// grant overridden by a deny gate did not decide the outcome.
+	///
+	/// - `target`: servlet type under enforcement
+	/// - `session`: caller identity facts for the admitted connection
+	/// - `relayed`: `true` when [`HopBudget::is_relayed`] marks the request as peer-relayed
+	/// - `trace`: collector that receives the boundary audit events
+	///
+	/// # Call sites
+	///
+	/// - Unary work arm in [`super::dispatch`]
+	/// - Streaming and duplex open handlers in [`super`]
+	///
+	/// # Sources
+	///
+	/// - CWE-285, improper authorization:
+	///   <https://cwe.mitre.org/data/definitions/285.html>
+	/// - ISO/IEC 27001:2022 A.8.15, logging:
+	///   <https://www.iso.org/standard/82875.html>
+	pub(crate) fn evaluate_export_gates(
+		&self,
+		target: &Urn<'_>,
+		session: &SessionContext,
+		relayed: bool,
+		trace: &TraceCollector,
+	) -> Result<TransitStatus, TightBeamError> {
+		match ExportPolicy::from(self).verdict(target, session, relayed) {
+			Ok(ExportDecision::Allowed) => Ok(TransitStatus::Ok),
+			Ok(ExportDecision::Granted) => {
+				trace_export_outcome(trace, CLUSTER_EXPORT_GRANTED, session, relayed)?;
+
+				Ok(TransitStatus::Ok)
+			}
+			Err(status) => {
+				trace_export_outcome(trace, CLUSTER_EXPORT_REFUSED, session, relayed)?;
+
+				Ok(status)
+			}
+		}
+	}
+
+	/// Verify hive-origin control frames against `tls.hive_trust`.
+	///
+	/// - A missing trust store or a failed signature yields [`TransitStatus::PermissionDenied`].
+	/// - A frame without a signature yields [`TransitStatus::Unauthenticated`].
+	///
+	/// A signer that `tls.peer_trust` also trusts is refused: peer membership
+	/// wins, so an identity held by both stores never acts on the hive plane.
+	///
+	/// # Sources
+	///
+	/// - CWE-306, missing authentication for critical function:
+	///   <https://cwe.mitre.org/data/definitions/306.html>
+	pub(crate) fn verify_hive_origin(&self, frame: &Frame) -> TransitStatus {
+		match self.tls.hive_trust.as_ref() {
 			Some(trust) => match verify_frame_signature(trust.as_ref(), frame) {
-				TrustVerification::Verified if signer_is_peer(config, frame) => TransitStatus::PermissionDenied,
+				TrustVerification::Verified if signer_is_peer(self, frame) => TransitStatus::PermissionDenied,
 				TrustVerification::Verified => TransitStatus::Ok,
 				TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
 				_ => TransitStatus::PermissionDenied,
@@ -223,27 +190,18 @@ pub(crate) fn verify_hive_origin(config: &ClusterConfig, frame: &Frame) -> Trans
 			None => TransitStatus::PermissionDenied,
 		}
 	}
-	#[cfg(not(feature = "x509"))]
-	{
-		let _ = (config, frame);
-		TransitStatus::Ok
-	}
-}
 
-/// Verify peer-origin control frames against `tls.peer_trust`.
-///
-/// A missing trust store or a failed signature yields
-/// [`TransitStatus::PermissionDenied`]. A frame without a signature yields
-/// [`TransitStatus::Unauthenticated`].
-///
-/// # Sources
-///
-/// - CWE-306, missing authentication for critical function:
-///   <https://cwe.mitre.org/data/definitions/306.html>
-pub(crate) fn verify_peer_origin(config: &ClusterConfig, frame: &Frame) -> TransitStatus {
-	#[cfg(feature = "x509")]
-	{
-		match config.tls.peer_trust.as_ref() {
+	/// Verify peer-origin control frames against `tls.peer_trust`.
+	///
+	/// - A missing trust store or a failed signature yields [`TransitStatus::PermissionDenied`].
+	/// - A frame without a signature yields [`TransitStatus::Unauthenticated`].
+	///
+	/// # Sources
+	///
+	/// - CWE-306, missing authentication for critical function:
+	///   <https://cwe.mitre.org/data/definitions/306.html>
+	pub(crate) fn verify_peer_origin(&self, frame: &Frame) -> TransitStatus {
+		match self.tls.peer_trust.as_ref() {
 			Some(trust) => match verify_frame_signature(trust.as_ref(), frame) {
 				TrustVerification::Verified => TransitStatus::Ok,
 				TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
@@ -252,56 +210,9 @@ pub(crate) fn verify_peer_origin(config: &ClusterConfig, frame: &Frame) -> Trans
 			None => TransitStatus::PermissionDenied,
 		}
 	}
-	#[cfg(not(feature = "x509"))]
-	{
-		let _ = (config, frame);
-		TransitStatus::Ok
-	}
 }
 
-/// Reject stale or replayed signed control frames.
-///
-/// Freshness binds `metadata.order` and the signer signature through the
-/// gateway replay guard.
-///
-/// The checks apply in order:
-///
-/// 1. Reject when `metadata.order` falls outside the freshness window.
-/// 2. Require non-repudiation (`signer_info`) on the frame.
-/// 3. Insert the signature in the replay guard; refuse duplicates.
-///
-/// # Sources
-///
-/// - CWE-294, authentication bypass by capture-replay:
-///   <https://cwe.mitre.org/data/definitions/294.html>
-pub(crate) fn verify_control_freshness(frame: &Frame, replay_guard: &GatewayReplayGuard) -> TransitStatus {
-	#[cfg(feature = "x509")]
-	{
-		let now = current_timestamp_ms();
-		if !replay_guard.is_fresh(frame.metadata.order, now) {
-			return TransitStatus::PermissionDenied;
-		}
-
-		let Some(signer_info) = frame.nonrepudiation.as_ref() else {
-			return TransitStatus::Unauthenticated;
-		};
-		let Ok(signer_id) = Encode::to_der(&signer_info.sid) else {
-			return TransitStatus::PermissionDenied;
-		};
-		if !replay_guard.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now) {
-			return TransitStatus::PermissionDenied;
-		}
-
-		TransitStatus::Ok
-	}
-	#[cfg(not(feature = "x509"))]
-	{
-		let _ = (frame, replay_guard);
-		TransitStatus::Ok
-	}
-}
-
-#[cfg(all(test, feature = "x509"))]
+#[cfg(test)]
 mod tests {
 	use std::sync::Arc;
 
@@ -435,105 +346,112 @@ mod tests {
 	}
 
 	#[test]
-	fn grant_widens_unexported_target() {
+	fn grant_widens_unexported_target() -> Result<(), TightBeamError> {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(GrantAll));
 
-		let verdict = evaluate_export_gates(
+		let verdict = config.evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			false,
-			&config,
 			&TraceCollector::default(),
 		);
-		assert_eq!(verdict, Ok(()));
+		assert_eq!(verdict?, TransitStatus::Ok);
+
+		Ok(())
 	}
 
 	#[test]
-	fn deny_gate_overrides_grant() {
+	fn deny_gate_overrides_grant() -> Result<(), TightBeamError> {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(GrantAll));
 		config.export_gates.push(Arc::new(DenyAllGate));
 
-		let verdict = evaluate_export_gates(
+		let verdict = config.evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			false,
-			&config,
 			&TraceCollector::default(),
 		);
-		assert_eq!(verdict, Err(TransitStatus::PermissionDenied));
+		assert_eq!(verdict?, TransitStatus::PermissionDenied);
+
+		Ok(())
 	}
 
 	#[test]
-	fn anonymous_session_matches_no_identity_grant() {
+	fn anonymous_session_matches_no_identity_grant() -> Result<(), TightBeamError> {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(IdentityGrant));
 
-		let verdict = evaluate_export_gates(
+		let verdict = config.evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			false,
-			&config,
 			&TraceCollector::default(),
 		);
 
-		assert_eq!(verdict, Err(TransitStatus::PermissionDenied));
+		assert_eq!(verdict?, TransitStatus::PermissionDenied);
+
+		Ok(())
 	}
 
 	#[test]
-	fn origin_only_grant_refuses_relayed_request() {
+	fn origin_only_grant_refuses_relayed_request() -> Result<(), TightBeamError> {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(OriginOnlyGrant));
 
-		let verdict = evaluate_export_gates(
+		let verdict = config.evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			true,
-			&config,
 			&TraceCollector::default(),
 		);
-		assert_eq!(verdict, Err(TransitStatus::PermissionDenied));
+		assert_eq!(verdict?, TransitStatus::PermissionDenied);
+
+		Ok(())
 	}
 
 	#[test]
-	fn origin_only_grant_passes_origin_request() {
+	fn origin_only_grant_passes_origin_request() -> Result<(), TightBeamError> {
 		let mut config = exporting_config();
 		config.export_grants.push(Arc::new(OriginOnlyGrant));
 
-		let verdict = evaluate_export_gates(
+		let verdict = config.evaluate_export_gates(
 			&servlet("ledger"),
 			&SessionContext::default(),
 			false,
-			&config,
 			&TraceCollector::default(),
 		);
-		assert_eq!(verdict, Ok(()));
+		assert_eq!(verdict?, TransitStatus::Ok);
+
+		Ok(())
 	}
 
 	#[test]
-	fn unknown_export_gate_verdict_normalizes_to_internal() {
+	fn unknown_export_gate_verdict_normalizes_to_internal() -> Result<(), TightBeamError> {
 		let mut config = exporting_config();
 		config.export_gates.push(Arc::new(UnknownGate));
 
-		let verdict = evaluate_export_gates(
+		let verdict = config.evaluate_export_gates(
 			&servlet("ping"),
 			&SessionContext::default(),
 			false,
-			&config,
 			&TraceCollector::default(),
 		);
+		assert_eq!(verdict?, TransitStatus::Internal);
 
-		assert_eq!(verdict, Err(TransitStatus::Internal));
+		Ok(())
 	}
 
 	#[test]
-	fn unknown_gate_policy_verdict_normalizes_to_internal() {
+	fn unknown_gate_policy_verdict_normalizes_to_internal() -> Result<(), TightBeamError> {
 		let mut config = exporting_config();
 		config.policies.push(Arc::new(UnknownPolicy));
 
-		let verdict = evaluate_gates(None, &SessionContext::default(), &config, &TraceCollector::default());
-		assert_eq!(verdict, Err(TransitStatus::Internal));
+		let verdict = config.evaluate_gates(None, &SessionContext::default(), &TraceCollector::default());
+		assert_eq!(verdict?, TransitStatus::Internal);
+
+		Ok(())
 	}
 
 	#[test]
@@ -543,7 +461,7 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&create_test_certificate(&key)));
 
-		assert_eq!(verify_hive_origin(&config, &frame), TransitStatus::Ok);
+		assert_eq!(config.verify_hive_origin(&frame), TransitStatus::Ok);
 	}
 
 	#[test]
@@ -555,6 +473,6 @@ mod tests {
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
 
-		assert_eq!(verify_hive_origin(&config, &frame), TransitStatus::PermissionDenied);
+		assert_eq!(config.verify_hive_origin(&frame), TransitStatus::PermissionDenied);
 	}
 }

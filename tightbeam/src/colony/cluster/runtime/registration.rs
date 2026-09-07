@@ -3,9 +3,8 @@
 use core::str::from_utf8;
 use std::sync::Arc;
 
-use crate::colony::cluster::runtime::bounds::GatewayReplayGuard;
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
-use crate::colony::cluster::runtime::verify::{verify_control_freshness, verify_hive_origin};
+use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletEntry};
 use crate::colony::common::{
 	reply_frame, type_canonical_bytes, ColonyNamespace, ColonyResource, RegisterHiveRequest, ServletAddressUpdate,
@@ -22,7 +21,6 @@ use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
 use crate::der::Encode;
 
 /// Admit a hive registration and install its servlet slate atomically.
@@ -119,12 +117,12 @@ fn admit_hive_control(
 	frame: &Frame,
 	replay_guard: &GatewayReplayGuard,
 ) -> Result<(), TransitStatus> {
-	let origin_status = verify_hive_origin(config, frame);
+	let origin_status = config.verify_hive_origin(frame);
 	if origin_status != TransitStatus::Ok {
 		return Err(origin_status);
 	}
 
-	let freshness_status = verify_control_freshness(frame, replay_guard);
+	let freshness_status = replay_guard.admits(frame);
 	if freshness_status != TransitStatus::Ok {
 		return Err(freshness_status);
 	}
@@ -220,7 +218,7 @@ fn refuse_register_release(
 	replay_guard: &GatewayReplayGuard,
 	status: TransitStatus,
 ) -> Result<Option<Frame>, TightBeamError> {
-	forget_replay(frame, replay_guard);
+	replay_guard.release(frame);
 	refuse_register(frame, trace, status)
 }
 
@@ -241,21 +239,10 @@ fn refuse_update_release(
 	replay_guard: &GatewayReplayGuard,
 	status: TransitStatus,
 ) -> Result<Option<Frame>, TightBeamError> {
-	forget_replay(frame, replay_guard);
+	replay_guard.release(frame);
 	refuse_update(frame, trace, status)
 }
 
-#[cfg(feature = "x509")]
-fn forget_replay(frame: &Frame, replay_guard: &GatewayReplayGuard) {
-	if let Some(signer_info) = frame.nonrepudiation.as_ref() {
-		replay_guard.forget(signer_info.signature.as_bytes());
-	}
-}
-
-#[cfg(not(feature = "x509"))]
-fn forget_replay(_frame: &Frame, _replay_guard: &GatewayReplayGuard) {}
-
-#[cfg(feature = "x509")]
 fn frame_signer_id(frame: &Frame) -> Option<Arc<[u8]>> {
 	frame
 		.nonrepudiation
@@ -264,12 +251,6 @@ fn frame_signer_id(frame: &Frame) -> Option<Arc<[u8]>> {
 		.map(Arc::from)
 }
 
-#[cfg(not(feature = "x509"))]
-fn frame_signer_id(_frame: &Frame) -> Option<Arc<[u8]>> {
-	None
-}
-
-#[cfg(feature = "x509")]
 fn signer_matches_bound_hive(frame: &Frame, registry: &HiveRegistry, hive_id: &[u8]) -> bool {
 	match (frame.nonrepudiation.as_ref(), registry.signer_for(hive_id)) {
 		(Some(signer_info), Ok(Some(bound))) => match Encode::to_der(&signer_info.sid) {
@@ -278,9 +259,4 @@ fn signer_matches_bound_hive(frame: &Frame, registry: &HiveRegistry, hive_id: &[
 		},
 		_ => false,
 	}
-}
-
-#[cfg(not(feature = "x509"))]
-fn signer_matches_bound_hive(_frame: &Frame, _registry: &HiveRegistry, _hive_id: &[u8]) -> bool {
-	true
 }

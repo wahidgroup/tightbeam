@@ -14,17 +14,11 @@ use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::Protocol;
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub(crate) use crate::colony::cluster::ClusterTlsConfig;
-	pub(crate) use crate::crypto::policy::VerificationPolicy;
-	pub(crate) use crate::crypto::x509::error::CertificateValidationError;
-	pub(crate) use crate::crypto::x509::policy::CertificateValidation;
-	pub(crate) use crate::SignerInfo;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
+use crate::colony::cluster::ClusterTlsConfig;
+use crate::crypto::policy::VerificationPolicy;
+use crate::crypto::x509::error::CertificateValidationError;
+use crate::crypto::x509::policy::CertificateValidation;
+use crate::SignerInfo;
 
 type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
 type ClusterKey = HandshakeKeyManager<DefaultCryptoProvider>;
@@ -46,7 +40,6 @@ pub struct ClusterPools<P: Protocol> {
 /// Takes the whole TLS config: `hive_trust` and `peer_trust` share a
 /// type, so passing them positionally would let a swap compile and
 /// cross the trust planes.
-#[cfg(feature = "x509")]
 #[doc(hidden)]
 pub fn build_cluster_pools<P>(
 	pool_config: PoolConfig,
@@ -96,13 +89,11 @@ where
 ///    registration order.
 ///
 /// [`CertificateTrust::is_trusted`] still delegates to the store alone.
-#[cfg(feature = "x509")]
 struct ValidatedTrust {
 	store: Arc<dyn CertificateTrust>,
 	validators: Vec<Arc<dyn CertificateValidation>>,
 }
 
-#[cfg(feature = "x509")]
 impl ValidatedTrust {
 	/// Run the operator validator chain over the dialed server leaf.
 	fn validate_leaf(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
@@ -114,7 +105,6 @@ impl ValidatedTrust {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl core::fmt::Debug for ValidatedTrust {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ValidatedTrust")
@@ -124,7 +114,6 @@ impl core::fmt::Debug for ValidatedTrust {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl CertificateValidation for ValidatedTrust {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		self.store.evaluate(cert)?;
@@ -132,7 +121,6 @@ impl CertificateValidation for ValidatedTrust {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl CertificateTrust for ValidatedTrust {
 	fn is_trusted(&self, cert: &Certificate) -> bool {
 		self.store.is_trusted(cert)
@@ -161,7 +149,6 @@ impl CertificateTrust for ValidatedTrust {
 ///
 /// An empty chain returns the store unchanged, so the common
 /// no-validator path adds no indirection.
-#[cfg(feature = "x509")]
 fn validated_trust(
 	store: Arc<dyn CertificateTrust>,
 	validators: &[Arc<dyn CertificateValidation>],
@@ -173,7 +160,6 @@ fn validated_trust(
 	Arc::new(ValidatedTrust { store, validators: validators.iter().map(Arc::clone).collect() })
 }
 
-#[cfg(feature = "x509")]
 fn build_one<P>(
 	pool_config: PoolConfig,
 	certificate: Arc<Certificate>,
@@ -196,7 +182,7 @@ where
 	Arc::new(builder.build())
 }
 
-#[cfg(all(test, feature = "x509"))]
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::crypto::hash::Sha3_256;

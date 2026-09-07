@@ -36,13 +36,9 @@ use crate::transport::{
 use crate::utils::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
 use crate::colony::hive::{ClusterCircuitBreaker, ReplayGuard};
-#[cfg(feature = "x509")]
 use crate::crypto::x509::Certificate;
-#[cfg(feature = "x509")]
 use crate::transport::handshake::HandshakeKeyManager;
-#[cfg(feature = "x509")]
 use crate::transport::TransportEncryptionConfig;
 
 /// Running hive for protocol `P`.
@@ -88,14 +84,11 @@ impl<P: Protocol> HiveRuntime<P> {
 			in_flight: self.in_flight.clone(),
 			hive_context: Arc::clone(&self.hive_context),
 			bp_threshold: self.config.control.backpressure_threshold,
-			#[cfg(feature = "x509")]
 			circuit_breaker: Arc::new(ClusterCircuitBreaker::new(
 				self.config.control.circuit_breaker_threshold,
 				self.config.control.circuit_breaker_cooldown_ms,
 			)),
-			#[cfg(feature = "x509")]
 			replay_guard: Arc::new(ReplayGuard::new(self.config.control.command_freshness_window_ms)),
-			#[cfg(feature = "x509")]
 			trust_store: self.config.trust_store.as_ref().map(Arc::clone),
 		}
 	}
@@ -124,7 +117,6 @@ where
 	async fn bind_control_listener(config: &HiveConfig) -> Result<(P::Listener, P::Address), TightBeamError> {
 		let bind_addr = P::default_bind_address()?;
 
-		#[cfg(feature = "x509")]
 		{
 			match config.hive_tls.as_ref() {
 				Some(hive_tls) => {
@@ -140,12 +132,6 @@ where
 				}
 				None => Ok(P::bind(bind_addr).await?),
 			}
-		}
-
-		#[cfg(not(feature = "x509"))]
-		{
-			let _ = config;
-			Ok(P::bind(bind_addr).await?)
 		}
 	}
 }
@@ -200,7 +186,6 @@ where
 		let pool_builder = ConnectionPool::<P>::builder().with_config(config.pool.clone());
 
 		// Intra-hive calls validate servlet certificates against the hive trust store.
-		#[cfg(feature = "x509")]
 		let pool_builder = match config.trust_store.as_ref() {
 			Some(store) => pool_builder.with_trust_store(Arc::clone(store)),
 			None => pool_builder,

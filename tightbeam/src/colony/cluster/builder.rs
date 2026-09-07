@@ -41,18 +41,12 @@ use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
 use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub(crate) use crate::colony::cluster::{
-		cert_colony_urn, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
-		PeerStore, PeerTable, StaticExportList,
-	};
-	pub(crate) use crate::crypto::x509::Certificate;
-	pub(crate) use crate::utils::urn::Urn;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
+use crate::colony::cluster::{
+	cert_colony_urn, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
+	PeerStore, PeerTable, StaticExportList,
+};
+use crate::crypto::x509::Certificate;
+use crate::utils::urn::Urn;
 
 // ============================================================================
 // HeartbeatConfigBuilder
@@ -138,7 +132,6 @@ impl HeartbeatConfigBuilder {
 /// Start from TLS material via [`ClusterConfig::builder`], then chain
 /// federation, export, gossip, and routing options before
 /// [`ClusterConfigBuilder::build`].
-#[cfg(feature = "x509")]
 pub struct ClusterConfigBuilder {
 	namespace: ColonyNamespace,
 	load_balancer: Arc<dyn LoadBalancer>,
@@ -157,7 +150,6 @@ pub struct ClusterConfigBuilder {
 	tls: ClusterTlsConfig,
 }
 
-#[cfg(feature = "x509")]
 impl ClusterConfig {
 	/// Create a builder seeded with the given TLS material.
 	pub fn builder(tls: ClusterTlsConfig) -> ClusterConfigBuilder {
@@ -181,7 +173,6 @@ impl ClusterConfig {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl ClusterConfigBuilder {
 	/// Replace the hive heartbeat configuration.
 	pub fn with_heartbeat_config(mut self, config: HeartbeatConfig) -> Self {

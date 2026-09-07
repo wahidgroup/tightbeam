@@ -33,12 +33,10 @@ pub mod builder;
 pub mod error;
 pub mod macros;
 pub mod registry;
-pub mod runtime;
+mod runtime;
 pub mod servlet_registry;
 
-#[cfg(feature = "x509")]
 pub mod export;
-#[cfg(feature = "x509")]
 #[doc(hidden)]
 pub mod gossip;
 #[doc(hidden)]
@@ -59,19 +57,16 @@ pub use servlet_registry::{
 	DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
 };
 
-#[cfg(feature = "x509")]
 pub use export::{
 	DynamicExportList, ExportAllowlist, ExportGate, ExportGrant, Party, StaticExportList, TrustPlaneStores, TrustPlanes,
 };
 
-#[cfg(feature = "x509")]
 pub use gossip::{
 	gossip_digest, gossip_fresh, gossip_want, signer_attribution, wanted_digests, Admission, AdmittedGossip,
 	GossipAdmission, GossipConfig, GossipDigest, GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
 };
 
-#[cfg(feature = "x509")]
-pub use peer::{cert_colony_urn, frame_colony_urn, frame_signer_cert, peer_signer_fingerprint};
+pub use peer::{cert_colony_urn, frame_colony_urn, frame_signer_cert, peer_signer_fingerprint, HopBudget};
 
 use core::future::Future;
 use core::time::Duration;
@@ -84,12 +79,10 @@ use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
 use crate::transport::{Protocol, TightBeamAddress};
 
-#[cfg(feature = "x509")]
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
-#[cfg(feature = "x509")]
 use crate::utils::urn::Urn;
 
-use super::common::{ColonyNamespace, LoadBalancer};
+use super::common::{ColonyNamespace, InstanceMetrics, LoadBalancer};
 
 // =============================================================================
 // Configuration
@@ -166,7 +159,6 @@ pub struct HeartbeatEvent {
 pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 
 /// TLS material for the gateway accept loop and hive/peer dials.
-#[cfg(feature = "x509")]
 pub struct ClusterTlsConfig {
 	/// Gateway certificate: server identity, also presented on outbound
 	/// client dials.
@@ -203,7 +195,6 @@ pub struct ClusterTlsConfig {
 	pub peer_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 }
 
-#[cfg(feature = "x509")]
 impl Clone for ClusterTlsConfig {
 	fn clone(&self) -> Self {
 		Self {
@@ -217,7 +208,6 @@ impl Clone for ClusterTlsConfig {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl core::fmt::Debug for ClusterTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterTlsConfig")
@@ -297,7 +287,6 @@ pub struct PeerConfig {
 	/// Install a static list with
 	/// [`ClusterConfigBuilder::with_exported_types`] or a live handle
 	/// with [`ClusterConfigBuilder::with_export_allowlist`].
-	#[cfg(feature = "x509")]
 	pub exported_types: Option<Arc<dyn ExportAllowlist>>,
 }
 
@@ -312,7 +301,6 @@ impl Default for PeerConfig {
 			table: Arc::default(),
 			max_hops: DEFAULT_MAX_HOPS,
 			rumor_refresh: Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS),
-			#[cfg(feature = "x509")]
 			exported_types: None,
 		}
 	}
@@ -329,7 +317,6 @@ impl core::fmt::Debug for PeerConfig {
 			.field("max_hops", &self.max_hops)
 			.field("rumor_refresh", &self.rumor_refresh);
 
-		#[cfg(feature = "x509")]
 		debug.field("exported_types", &self.exported_types.as_ref().map(|_| "<ExportAllowlist>"));
 
 		debug.finish()
@@ -358,7 +345,6 @@ pub struct ClusterConfig {
 	///
 	/// All gates must pass, so they compose as intersection with the allow
 	/// sources (exported list, grants, and the first-party origin rule).
-	#[cfg(feature = "x509")]
 	pub export_gates: Vec<Arc<dyn ExportGate>>,
 	/// Positive export grants evaluated when the built-in allowlist
 	/// refuses a target.
@@ -366,7 +352,6 @@ pub struct ClusterConfig {
 	/// Allow sources compose as union: exported, granted, or first-party
 	/// origin. Deny gates still override a grant. Granted types never
 	/// appear on the advertised slate.
-	#[cfg(feature = "x509")]
 	pub export_grants: Vec<Arc<dyn ExportGrant>>,
 	/// Outbound connection pool settings for hive and peer dials.
 	pub pool_config: PoolConfig,
@@ -390,7 +375,6 @@ pub struct ClusterConfig {
 	/// Peer-federation dial list, advertise beat, and dial allowlist.
 	pub peer: PeerConfig,
 	/// Gossip freshness, origin TTL, ingress, journal, and admission.
-	#[cfg(feature = "x509")]
 	pub gossip: GossipConfig,
 	/// Colony URN from the gateway certificate URI SAN.
 	///
@@ -402,15 +386,28 @@ pub struct ClusterConfig {
 	///
 	/// Private so membership cannot drift from the certificate. The
 	/// builder derives it, and [`ClusterConfig::colony_urn`] reads it.
-	#[cfg(feature = "x509")]
 	colony_urn: Option<Urn<'static>>,
 	/// TLS material for accept and outbound dials.
-	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
 }
 
-#[cfg(feature = "x509")]
 impl ClusterConfig {
+	/// One balancer draw over `entries`, guarding the untrusted index.
+	///
+	/// The balancer is operator-configurable, so its answer is untrusted.
+	pub(crate) fn pick_instance<'e>(&self, entries: &'e [Arc<ServletEntry>]) -> Option<&'e Arc<ServletEntry>> {
+		// The key copy is deliberate. `InstanceMetrics` owns its key.
+		let metrics: Vec<InstanceMetrics> = entries
+			.iter()
+			.map(|entry| InstanceMetrics {
+				instance_key: entry.route_key().to_vec(),
+				pheromone: entry.pheromone_level(),
+			})
+			.collect();
+
+		self.load_balancer.select(&metrics).and_then(|idx| entries.get(idx))
+	}
+
 	/// Build a default config around the given TLS material.
 	pub fn new(tls: ClusterTlsConfig) -> Self {
 		Self::builder(tls).build()
@@ -426,7 +423,6 @@ impl ClusterConfig {
 	}
 }
 
-#[cfg(feature = "x509")]
 impl core::fmt::Debug for ClusterConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterConfig")

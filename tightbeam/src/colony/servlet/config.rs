@@ -15,21 +15,14 @@ use crate::transport::multiplex::IntoMuxOffer;
 use crate::transport::Protocol;
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
 use crate::crypto::key::SigningKeyProvider;
-#[cfg(feature = "x509")]
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
-#[cfg(feature = "x509")]
 use crate::crypto::x509::policy::CertificateValidation;
-#[cfg(feature = "x509")]
 use crate::crypto::x509::{Certificate, CertificateSpec};
-#[cfg(feature = "x509")]
 use crate::transport::handshake::HandshakeKeyManager;
-#[cfg(feature = "x509")]
 use crate::transport::TransportEncryptionConfig;
 
 /// Servlet bind and handler configuration (includes transport encryption).
-#[cfg(feature = "x509")]
 pub struct ServletConfig<P, M, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P: Protocol,
@@ -48,26 +41,7 @@ where
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 }
 
-/// Servlet bind and handler configuration (cleartext transport).
-#[cfg(not(feature = "x509"))]
-pub struct ServletConfig<P, M>
-where
-	P: Protocol,
-	M: Message,
-{
-	pub(crate) _protocol: PhantomData<P>,
-	pub(crate) _message: PhantomData<M>,
-	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
-	pub(crate) servlet_config: Option<Arc<dyn Any + Send + Sync>>,
-	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
-	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
-	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
-	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
-}
-
 /// Builder for [`ServletConfig`] with transport encryption.
-#[cfg(feature = "x509")]
 pub struct ServletConfigBuilder<P, M, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P: Protocol,
@@ -82,23 +56,6 @@ where
 	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 	_phantom: PhantomData<(P, M, C)>,
-}
-
-/// Builder for [`ServletConfig`] without transport encryption.
-#[cfg(not(feature = "x509"))]
-pub struct ServletConfigBuilder<P, M>
-where
-	P: Protocol,
-	M: Message,
-{
-	mux_offer: Option<Arc<TransportOffer>>,
-	servlet_config: Option<Arc<dyn Any + Send + Sync>>,
-	hive_context: Option<Arc<dyn HiveContext>>,
-	workers: HashMap<String, Box<dyn WorkerBox>>,
-	collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
-	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
-	_phantom: PhantomData<(P, M)>,
 }
 
 macro_rules! config_accessors {
@@ -150,7 +107,6 @@ macro_rules! config_accessors {
 	};
 }
 
-#[cfg(feature = "x509")]
 impl<P, M, C> ServletConfig<P, M, C>
 where
 	P: Protocol,
@@ -175,26 +131,6 @@ where
 	config_accessors!();
 }
 
-#[cfg(not(feature = "x509"))]
-impl<P, M> ServletConfig<P, M>
-where
-	P: Protocol,
-	M: Message,
-{
-	/// Start a [`ServletConfigBuilder`].
-	pub fn builder() -> ServletConfigBuilder<P, M> {
-		ServletConfigBuilder::default()
-	}
-
-	/// Worker registered under `name`, downcast to `W`.
-	pub fn worker<W: 'static>(&self, name: &str) -> Option<&W> {
-		self.workers.get(name)?.downcast_ref()
-	}
-
-	config_accessors!();
-}
-
-#[cfg(feature = "x509")]
 impl<P, M, C> ServletConfig<P, M, C>
 where
 	P: Protocol,
@@ -221,28 +157,6 @@ where
 	}
 }
 
-#[cfg(not(feature = "x509"))]
-impl<P, M> ServletConfig<P, M>
-where
-	P: Protocol,
-	M: Message,
-{
-	/// Split bind leftovers into the runtime accept-loop parts.
-	pub(crate) fn into_runtime_parts(self) -> Result<runtime::ServletRuntimeParts, TightBeamError> {
-		let env_config = self.servlet_config.ok_or(TightBeamError::MissingConfiguration)?;
-		Ok(runtime::ServletRuntimeParts {
-			env_config,
-			collector_gates: self.collector_gates,
-			mux_offer: self.mux_offer,
-			hive_context: self.hive_context,
-			message_decryptor: self.message_decryptor,
-			message_inflator: self.message_inflator,
-			workers: self.workers,
-		})
-	}
-}
-
-#[cfg(feature = "x509")]
 impl<P, M, C> Default for ServletConfig<P, M, C>
 where
 	P: Protocol,
@@ -266,28 +180,6 @@ where
 	}
 }
 
-#[cfg(not(feature = "x509"))]
-impl<P, M> Default for ServletConfig<P, M>
-where
-	P: Protocol,
-	M: Message,
-{
-	fn default() -> Self {
-		Self {
-			_protocol: PhantomData,
-			_message: PhantomData,
-			mux_offer: None,
-			servlet_config: Some(Arc::new(())),
-			hive_context: None,
-			workers: HashMap::new(),
-			collector_gates: Vec::new(),
-			message_decryptor: None,
-			message_inflator: None,
-		}
-	}
-}
-
-#[cfg(feature = "x509")]
 impl<P, M, C> Default for ServletConfigBuilder<P, M, C>
 where
 	P: Protocol,
@@ -297,26 +189,6 @@ where
 	fn default() -> Self {
 		Self {
 			x509_config: None,
-			mux_offer: None,
-			servlet_config: None,
-			hive_context: None,
-			workers: HashMap::new(),
-			collector_gates: Vec::new(),
-			message_decryptor: None,
-			message_inflator: None,
-			_phantom: PhantomData,
-		}
-	}
-}
-
-#[cfg(not(feature = "x509"))]
-impl<P, M> Default for ServletConfigBuilder<P, M>
-where
-	P: Protocol,
-	M: Message,
-{
-	fn default() -> Self {
-		Self {
 			mux_offer: None,
 			servlet_config: None,
 			hive_context: None,
@@ -394,7 +266,6 @@ macro_rules! builder_methods {
 	};
 }
 
-#[cfg(feature = "x509")]
 impl<P, M, C> ServletConfigBuilder<P, M, C>
 where
 	P: Protocol,
@@ -438,33 +309,6 @@ where
 			_message: PhantomData,
 			_crypto: PhantomData,
 			x509_config: self.x509_config,
-			mux_offer: self.mux_offer,
-			servlet_config: self.servlet_config.or_else(|| Some(Arc::new(()))),
-			hive_context: self.hive_context,
-			workers: self.workers,
-			collector_gates: self.collector_gates,
-			message_decryptor: self.message_decryptor,
-			message_inflator: self.message_inflator,
-		}
-	}
-}
-
-#[cfg(not(feature = "x509"))]
-impl<P, M> ServletConfigBuilder<P, M>
-where
-	P: Protocol,
-	M: Message,
-{
-	builder_methods!();
-
-	/// Finish the builder into a [`ServletConfig`].
-	///
-	/// When [`Self::with_config`] was not called, env defaults to `()` so
-	/// [`crate::colony::servlet::ServletRuntime::start`] matches [`ServletConfig::default`].
-	pub fn build(self) -> ServletConfig<P, M> {
-		ServletConfig {
-			_protocol: PhantomData,
-			_message: PhantomData,
 			mux_offer: self.mux_offer,
 			servlet_config: self.servlet_config.or_else(|| Some(Arc::new(()))),
 			hive_context: self.hive_context,

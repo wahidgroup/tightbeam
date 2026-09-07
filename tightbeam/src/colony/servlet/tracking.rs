@@ -1,9 +1,6 @@
 //! Latency and utilization tracking for servlets
 
-#[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-#[cfg(feature = "std")]
 use std::sync::Arc;
 
 use crate::utils::BasisPoints;

@@ -1,7 +1,5 @@
-//! Cluster macros: name a gateway type as an alias of [`crate::colony::cluster::ClusterGateway`].
-//!
-//! Lifecycle, dispatch, heartbeat, and gossip live in
-//! [`crate::colony::cluster::runtime`].
+//! Cluster macros: name a gateway type as an alias of
+//! [`crate::colony::cluster::ClusterGateway`].
 
 /// Create a cluster gateway type for a protocol (and optional digest and
 /// edge protocol).

@@ -80,6 +80,15 @@ impl TransitStatus {
 		}
 	}
 
+	/// This status as a terminal stream refusal.
+	///
+	/// The mux responder maps the failure onto the stream's `End` trailer.
+	#[cfg(all(feature = "transport", feature = "colony"))]
+	#[must_use]
+	pub(crate) fn refusal(self) -> crate::TightBeamError {
+		crate::transport::error::TransportError::from(self).into()
+	}
+
 	/// Canonical variant name, e.g. as an audit-event label.
 	pub const fn as_str(&self) -> &'static str {
 		match self {
@@ -233,10 +242,10 @@ impl<'a> ProvenPeer<'a> {
 /// Policy trait a user implements to decide message acceptance.
 ///
 /// Gate policies are stateless procedures that evaluate whether a message
-/// should be accepted or rejected. Every evaluation carries the
-/// connection's [`SessionContext`]: identity-blind gates ignore it,
-/// identity gates (black/white lists, receipt checks) key on it. Sites
-/// without authenticated facts pass the empty context.
+/// should be accepted or rejected. Every evaluation carries the connection's
+/// [`SessionContext`]: identity-blind gates ignore it, identity gates
+/// (black/white lists, receipt checks) key on it. Sites without authenticated
+/// facts pass the empty context.
 ///
 /// `message` is [`None`] when the stream kind has no request frame at dispatch
 /// (mux streaming / duplex). Choose the `None` verdict by gate class:
@@ -408,9 +417,7 @@ where
 {
 	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		let status = self.inner.evaluate(message, session);
-
 		(self.observer)(message, &status);
-
 		status
 	}
 }
