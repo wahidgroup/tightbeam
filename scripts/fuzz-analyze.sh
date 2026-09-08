@@ -4,29 +4,9 @@ set -euo pipefail
 # Analyze a specific fuzz crash or hang by replaying it through a fuzz binary.
 # Usage: scripts/fuzz-analyze.sh $FUZZ_RUN/crashes/id:000000...
 
-# Fuzz output is one directory per target. With a single target the run is
-# unambiguous; otherwise the caller names it with FUZZ_TARGET.
-resolve_fuzz_run() {
-	if [ -n "${FUZZ_TARGET:-}" ]; then
-		echo "built/fuzz/out/$FUZZ_TARGET/default"
-		return 0
-	fi
-	local runs
-	mapfile -t runs < <(find built/fuzz/out -mindepth 2 -maxdepth 2 -type d -name default 2>/dev/null | sort)
-	if [ "${#runs[@]}" -eq 1 ]; then
-		echo "${runs[0]}"
-		return 0
-	fi
-	if [ "${#runs[@]}" -eq 0 ]; then
-		echo "built/fuzz/out/none/default"
-		return 0
-	fi
-	echo "Error: several fuzz runs present. Set FUZZ_TARGET to one of:" >&2
-	printf '  %s\n' "${runs[@]}" >&2
-	return 1
-}
-
-FUZZ_RUN=$(resolve_fuzz_run)
+# The run directory is resolved by scripts/fuzz-run.sh, which anchors to the
+# repository so this works from any working directory.
+FUZZ_RUN=$("$(dirname "$0")/fuzz-run.sh")
 
 FILE="${1:-}"
 

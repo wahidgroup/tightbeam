@@ -502,6 +502,26 @@ crate::impl_from!(std::sync::mpsc::RecvTimeoutError => TightBeamError::RecvTimeo
 
 #[cfg(feature = "transport")]
 impl TightBeamError {
+	/// Whether this error is a fuzz iteration running out of input.
+	///
+	/// AFL feeds short inputs constantly. An iteration whose oracle ran out of
+	/// bytes before the process reached a terminal state exercised a prefix of
+	/// a run, so its trace is incomplete and its assertions describe events
+	/// the target was never given the input to reach.
+	#[must_use]
+	pub fn is_fuzz_input_exhausted(&self) -> bool {
+		#[cfg(feature = "testing")]
+		{
+			return matches!(
+				self,
+				TightBeamError::TestingError(crate::testing::error::TestingError::FuzzInputExhausted)
+			);
+		}
+
+		#[cfg(not(feature = "testing"))]
+		false
+	}
+
 	/// Terminal status a service failure answers a peer with.
 	///
 	/// A failure already carrying a transit status keeps it. Anything else

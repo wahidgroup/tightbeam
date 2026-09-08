@@ -338,8 +338,14 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== HELPER: Verify specs and call hooks (DRY) =====
+	// ===== HELPER: Verify specs and call hooks =====
 	(@verify_and_call_hooks $config:expr, $hook_ctx:expr, $exec_result:expr) => {
+		// An AFL iteration whose input ran out drove a prefix of a run, not a
+		// violation. Grading it would report every short mutation as a finding.
+		if $exec_result.as_ref().err().is_some_and(|error| error.is_fuzz_input_exhausted()) {
+			return;
+		}
+
 		// Verify Layer 1 assertion specs
 		for spec in $config.specs() {
 			match $crate::testing::specs::verify_trace(*spec, &$hook_ctx.trace) {
@@ -1225,7 +1231,7 @@ mod tests {
 		let config = ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build();
 		let hook_ctx = HookContext::new(ConsumedTrace::new());
 		let outcome = catch_unwind(AssertUnwindSafe(|| {
-			crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, Ok::<(), core::fmt::Error>(()));
+			crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, Ok::<(), crate::TightBeamError>(()));
 		}));
 
 		assert!(outcome.is_err());
