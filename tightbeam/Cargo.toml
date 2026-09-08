@@ -60,6 +60,11 @@ zstd-safe = { workspace = true, optional = true }
 ## Fuzzing dependencies
 afl = { workspace = true, optional = true }
 
+[dev-dependencies]
+husky-rs = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+trybuild = { workspace = true }
+
 [features]
 default = ["full"]
 
