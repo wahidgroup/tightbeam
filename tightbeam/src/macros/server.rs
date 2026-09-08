@@ -850,14 +850,14 @@ macro_rules! server {
 	}};
 
 	($protocol:path: $listener:expr, handle: $handler:expr) => {{
-		$crate::__tb_if_std!({
+		$crate::__tb_require_std!({
 			let __listener = $listener;
 			$crate::server!(@sync_loop $protocol, __listener, $handler,)
 		})
 	}};
 
 	($protocol:path: bind $addr:expr, handle: $handler:expr) => {{
-		$crate::__tb_if_std!({
+		$crate::__tb_require_std!({
 			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler,)
@@ -865,14 +865,14 @@ macro_rules! server {
 	}};
 
 	($protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
-		$crate::__tb_if_std!({
+		$crate::__tb_require_std!({
 			let __listener = $listener;
 			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*);
 		})
 	}};
 
 	($protocol:path: bind $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
-		$crate::__tb_if_std!({
+		$crate::__tb_require_std!({
 			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*);

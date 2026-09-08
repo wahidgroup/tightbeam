@@ -7,10 +7,10 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
 use crate::testing::specs::csp::{CspValidationResult, Event, Process, ProcessBuildError, ProcessSpec, State};
 use crate::trace::ConsumedTrace;
+use crate::Errorizable;
 
 // Submodules
 pub mod algebra;
@@ -127,61 +127,33 @@ pub struct CompositionProperties {
 }
 
 /// Errors that can occur during composition
-#[derive(Debug, Clone)]
+#[derive(Errorizable, Debug, Clone)]
 pub enum CompositionError {
 	/// Alphabets don't match expectations
+	#[error("Alphabet mismatch: expected {expected:?}, got {actual:?}")]
 	AlphabetMismatch { expected: HashSet<Event>, actual: HashSet<Event> },
 
 	/// Deadlock detected at a state
+	#[error("Deadlock detected at state {state}")]
 	DeadlockDetected { state: State },
 
 	/// Livelock detected (infinite τ-cycle)
+	#[error("Livelock detected in cycle: {cycle:?}")]
 	LivelockDetected { cycle: Vec<State> },
 
 	/// Non-determinism detected
+	#[error("Non-determinism at state {state}: events {events:?}")]
 	NonDeterminismDetected { state: State, events: Vec<Event> },
 
 	/// Invalid composition structure
+	#[error("Invalid composition: {reason}")]
 	InvalidComposition { reason: String },
 
 	/// Process construction failed
+	#[error("Process construction failed: {0}")]
+	#[source]
+	#[from]
 	ProcessConstructionFailed(ProcessBuildError),
-}
-
-impl From<ProcessBuildError> for CompositionError {
-	fn from(source: ProcessBuildError) -> Self {
-		Self::ProcessConstructionFailed(source)
-	}
-}
-
-impl fmt::Display for CompositionError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::AlphabetMismatch { expected, actual } => {
-				write!(f, "Alphabet mismatch: expected {:?}, got {:?}", expected, actual)
-			}
-			Self::DeadlockDetected { state } => write!(f, "Deadlock detected at state {}", state),
-			Self::LivelockDetected { cycle } => {
-				write!(f, "Livelock detected in cycle: {:?}", cycle)
-			}
-			Self::NonDeterminismDetected { state, events } => {
-				write!(f, "Non-determinism at state {}: events {:?}", state, events)
-			}
-			Self::InvalidComposition { reason } => write!(f, "Invalid composition: {}", reason),
-			Self::ProcessConstructionFailed(source) => {
-				write!(f, "Process construction failed: {}", source)
-			}
-		}
-	}
-}
-
-impl std::error::Error for CompositionError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		match self {
-			Self::ProcessConstructionFailed(source) => Some(source),
-			_ => None,
-		}
-	}
 }
 
 /// Process expression AST for composition

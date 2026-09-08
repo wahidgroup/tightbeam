@@ -1,99 +1,70 @@
-#!/bin/bash
-# Feature combination tests - edit this file to add/modify combinations
-# Run with: make test-all or ./scripts/test_features.sh
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Feature-matrix gate. Run with: make test-all
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if ! "$ROOT/scripts/tool-installed.sh" cargo-hack; then
+	HACK_VERSION="$("$ROOT/scripts/tool-version.sh" cargo-hack)"
+	echo "Installing cargo-hack $HACK_VERSION..."
+	cargo install cargo-hack --version "$HACK_VERSION" --locked --force
+fi
 
 echo "=== Feature Combination Tests ==="
 
-# Most steps are `cargo check` (compilation only). Steps that carry behavioral
-# tests (the transport backends, and the full default build) run `cargo test`
-# so non-default feature sets are actually exercised, not just compiled.
+echo "[1/14] Check: every feature on its own (cargo hack --each-feature)"
+cargo hack check --package tightbeam-rs --each-feature --no-dev-deps \
+	--exclude-features tcp,async-transport,tokio
 
-# 1. Minimal: std + derive (no zeroize/crypto/builder)
-echo "[1/21] Check: Minimal std + derive"
-cargo check --package tightbeam-rs --no-default-features --features "std,derive"
+echo "[2/14] Check: the excluded features still refuse to build alone"
+for feature in tcp async-transport tokio; do
+	if cargo check --package tightbeam-rs --no-default-features --features "$feature" >/dev/null 2>&1; then
+		echo "  FAIL: '$feature' now builds alone. Drop it from --exclude-features in step 1." >&2
+		exit 1
+	fi
+	echo "  ok: $feature refuses to build without a handshake protocol"
+done
 
-# 2. Minimal: std + crypto (crypto core without aead/digest/x509)
-echo "[2/21] Check: Minimal std + crypto"
-cargo check --package tightbeam-rs --no-default-features --features "std,crypto"
+echo "[3/14] Check: the protocol-requiring features with a protocol"
+cargo check --package tightbeam-rs --no-default-features --features "std,tcp,async-transport,tokio,transport-ecies"
 
-# 3. Minimal: std + derive + builder (frame builder without aead/digest/signature)
-echo "[3/21] Check: Minimal std + derive + builder"
-cargo check --package tightbeam-rs --no-default-features --features "std,derive,builder"
-
-# 4. Bare transport feature (no derive/tcp pulled transitively): a published
-# feature MUST build standalone.
-echo "[4/21] Check: Bare transport (no_std)"
-cargo check --package tightbeam-rs --no-default-features --features "transport"
-
-# 5. Bare transport feature with std.
-echo "[5/21] Check: Bare transport + std"
-cargo check --package tightbeam-rs --no-default-features --features "std,transport"
-
-# 6. Transport CMS (core secure messaging)
-echo "[6/21] Test: Transport CMS"
-cargo test --package tightbeam-rs --no-default-features --features "std,transport-cms,testing"
-
-# 7. Transport ECIES (lighter alternative)
-echo "[7/21] Test: Transport ECIES"
-cargo test --package tightbeam-rs --no-default-features --features "std,transport-ecies,testing"
-
-# 8. Transport CMS + ECIES + TCP + Async (full transport stack)
-echo "[8/21] Check: Transport Full + TCP + Async"
+echo "[4/14] Check: Transport Full + TCP + Async"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,transport-ecies,tcp,tokio,testing"
 
-# 9. CMS-only TCP (no ECIES): the decoupled build the driver split enables
-echo "[9/21] Test: Transport CMS-only + TCP + Async"
-cargo test --package tightbeam-rs --no-default-features --features "std,transport-cms,tcp,tokio,testing"
-
-# 10. Transport CMS + Derive enabled
-echo "[10/21] Check: Transport CMS + Derive"
+echo "[5/14] Check: Transport CMS + Derive"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,derive,testing"
 
-# 11. Testing framework features
-echo "[11/21] Check: Testing CSP/FDR"
+echo "[6/14] Check: Testing CSP/FDR"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing,testing-csp,testing-fdr"
 
-# 12. Testing timing/schedulability (requires CSP)
-echo "[12/21] Check: Testing Timing"
+echo "[7/14] Check: Testing Timing"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing,testing-csp,testing-timing,testing-schedulability"
 
-# 13. Colony (full cluster features)
-echo "[13/21] Check: Colony"
-cargo check --package tightbeam-rs --no-default-features --features "colony,testing"
+echo "[8/14] Test: Consumer macro expansions"
+cargo test --package tightbeam-consumer-test
 
-# 14. no_std: builder (alloc-only, no std)
-echo "[14/21] Check: no_std builder"
-cargo check --package tightbeam-rs --no-default-features --features "builder"
+echo "[9/14] Test: Transport CMS"
+cargo test --package tightbeam-rs --no-default-features --features "std,transport-cms,testing"
 
-# 15. no_std: transport-ecies (alloc-only, no std)
-echo "[15/21] Check: no_std transport-ecies"
-cargo check --package tightbeam-rs --no-default-features --features "transport-ecies"
+echo "[10/14] Test: Transport ECIES"
+cargo test --package tightbeam-rs --no-default-features --features "std,transport-ecies,testing"
 
-# 16. Downstream consumer cfg-leak regression (derive must not emit feature cfgs)
-echo "[16/21] Check: Consumer cfg-leak regression"
-cargo check --package tightbeam-consumer-test
+echo "[11/14] Test: Transport CMS-only + TCP + Async"
+cargo test --package tightbeam-rs --no-default-features --features "std,transport-cms,tcp,tokio,testing"
 
-# 17. Instrument standalone (digest cfg regression: instrument must pull digest)
-echo "[17/21] Check: Instrument standalone"
-cargo check --package tightbeam-rs --no-default-features --features "std,instrument"
-
-# 18. Full (default features) - run tests
-echo "[18/21] Test: Full (default features)"
-make test
-
-# 19. Everything on at once across the workspace - run tests
-echo "[19/21] Test: Workspace all features"
-cargo test --workspace --all-features
-
-# 20. Sync server plane: the std-without-tokio `server!` accept loop only
-# compiles here, so this step pins the sync macro arm against drift.
-echo "[20/21] Test: Sync server (std + tcp, no tokio)"
+echo "[12/14] Test: Sync server (std + tcp, no tokio)"
 cargo test --package tightbeam-rs --no-default-features --features "std,tcp,transport-ecies,transport-policy,testing,instrument" --test suite -- transport::sync_server
 
-# 21. wasm32 browser transport core: async-transport compiles the generic
+echo "[13/14] Test: Full (default features)"
+cargo test --package tightbeam-rs
+
+echo "[14/14] Test: Workspace all features"
+cargo test --workspace --all-features
+
+# wasm32 browser transport core: async-transport compiles the generic
 # AsyncProtocolStream + TcpTransport without tokio.
-echo "[21/21] Check: wasm32 transport-ecies + async-transport (no tokio)"
+echo "[wasm] Check: wasm32 transport-ecies + async-transport (no tokio)"
 if rustup target list --installed | grep -q '^wasm32-unknown-unknown$'; then
 	cargo check --target wasm32-unknown-unknown --package tightbeam-rs --no-default-features --features "std,transport-ecies,async-transport,wasm"
 else

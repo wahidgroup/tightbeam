@@ -3,7 +3,7 @@
 macro_rules! client {
 	// With identity only (mutual auth without policies)
 	(connect $protocol:path: $addr:expr, identity: ($cert:expr, $key:expr)) => {{
-		$crate::__tb_if_std!({
+		$crate::__tb_require_std!({
 			$crate::__tb_select_builder!(
 				{
 					use $crate::transport::ConnectionBuilder;
@@ -23,7 +23,7 @@ macro_rules! client {
 
 	// With identity AND policies (mutual auth with policies)
 	(connect $protocol:path: $addr:expr, identity: ($cert:expr, $key:expr), policies: { $($tt:tt)* }) => {{
-		$crate::__tb_if_std!({
+		$crate::__tb_require_std!({
 			$crate::__tb_select_builder!(
 				{
 					use $crate::transport::ConnectionBuilder;
@@ -55,7 +55,7 @@ macro_rules! client {
 
 	// Generic sync: connect protocol: addr
 	(connect $protocol:path: $addr:expr) => {{
-		$crate::__tb_if_std!({
+		$crate::__tb_require_std!({
 			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
 			let __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
 			$crate::__tb_select_builder!(
@@ -77,7 +77,7 @@ macro_rules! client {
 
 	// Generic sync: connect protocol: addr, policies: {...}
 	(connect $protocol:path: $addr:expr, policies: { $($tt:tt)* }) => {{
-		$crate::__tb_if_std!({
+		$crate::__tb_require_std!({
 			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
 			let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
 			__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
@@ -158,126 +158,96 @@ macro_rules! client {
 		})
 	}};
 
-	// Process individual policies recursively
-	(@process_policy $transport:expr, restart_policy: $value:expr, $($rest:tt)*) => {
+	// One arm per policy key. The trailing comma is optional and the tail may
+	// be empty, so a key needs no second arm for the last position in the list;
+	// `gate` is the shorthand for `emitter_gate`.
+	(@process_policy $transport:expr, restart_policy: $value:expr $(, $($rest:tt)*)?) => {
 		$transport = $transport.with_restart($value);
-		$crate::client!(@process_policy $transport, $($rest)*);
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
-	(@process_policy $transport:expr, restart: $value:expr, $($rest:tt)*) => {
+	(@process_policy $transport:expr, restart: $value:expr $(, $($rest:tt)*)?) => {
 		$transport = $transport.with_restart($value);
-		$crate::client!(@process_policy $transport, $($rest)*);
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
-	// emitter_gate can be singular or array
-	(@process_policy $transport:expr, emitter_gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+	(@process_policy $transport:expr, emitter_gate: [ $( $value:expr ),* $(,)? ] $(, $($rest:tt)*)?) => {
 		$(
 			$transport = $transport.with_emitter_gate($value);
 		)*
-		$crate::client!(@process_policy $transport, $($rest)*);
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
-	(@process_policy $transport:expr, emitter_gate: [ $( $value:expr ),* $(,)? ] $(,)?) => {
+	(@process_policy $transport:expr, emitter_gate: $value:expr $(, $($rest:tt)*)?) => {
+		$transport = $transport.with_emitter_gate($value);
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
+	};
+	(@process_policy $transport:expr, gate: [ $( $value:expr ),* $(,)? ] $(, $($rest:tt)*)?) => {
 		$(
 			$transport = $transport.with_emitter_gate($value);
 		)*
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
-	(@process_policy $transport:expr, emitter_gate: $value:expr, $($rest:tt)*) => {
+	(@process_policy $transport:expr, gate: $value:expr $(, $($rest:tt)*)?) => {
 		$transport = $transport.with_emitter_gate($value);
-		$crate::client!(@process_policy $transport, $($rest)*);
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
-	(@process_policy $transport:expr, emitter_gate: $value:expr $(,)?) => {
-		$transport = $transport.with_emitter_gate($value);
-	};
-	// gate (shorthand for emitter_gate) can be singular or array
-	(@process_policy $transport:expr, gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
-		$(
-			$transport = $transport.with_emitter_gate($value);
-		)*
-		$crate::client!(@process_policy $transport, $($rest)*);
-	};
-	(@process_policy $transport:expr, gate: [ $( $value:expr ),* $(,)? ] $(,)?) => {
-		$(
-			$transport = $transport.with_emitter_gate($value);
-		)*
-	};
-	(@process_policy $transport:expr, gate: $value:expr, $($rest:tt)*) => {
-		$transport = $transport.with_emitter_gate($value);
-		$crate::client!(@process_policy $transport, $($rest)*);
-	};
-	(@process_policy $transport:expr, gate: $value:expr $(,)?) => {
-		$transport = $transport.with_emitter_gate($value);
-	};
-	// collector_gate can be singular or array
-	(@process_policy $transport:expr, collector_gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+	(@process_policy $transport:expr, collector_gate: [ $( $value:expr ),* $(,)? ] $(, $($rest:tt)*)?) => {
 		$(
 			$transport = $transport.with_collector_gate($value);
 		)*
-		$crate::client!(@process_policy $transport, $($rest)*);
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
-	(@process_policy $transport:expr, collector_gate: [ $( $value:expr ),* $(,)? ] $(,)?) => {
-		$(
-			$transport = $transport.with_collector_gate($value);
-		)*
-	};
-	(@process_policy $transport:expr, collector_gate: $value:expr, $($rest:tt)*) => {
+	(@process_policy $transport:expr, collector_gate: $value:expr $(, $($rest:tt)*)?) => {
 		$transport = $transport.with_collector_gate($value);
-		$crate::client!(@process_policy $transport, $($rest)*);
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
-	(@process_policy $transport:expr, collector_gate: $value:expr $(,)?) => {
-		$transport = $transport.with_collector_gate($value);
+	(@process_policy $transport:expr, timeout: $value:expr $(, $($rest:tt)*)?) => {
+		$transport = $transport.with_timeout($value);
+		$($crate::client!(@process_policy $transport, $($rest)*);)?
 	};
-	// timeout accepts Duration
-	(@process_policy $transport:expr, timeout: $value:expr, $($rest:tt)*) => {
-		$crate::__tb_if_std!({ $transport = $transport.with_timeout($value); });
-		$crate::client!(@process_policy $transport, $($rest)*);
-	};
-	(@process_policy $transport:expr, timeout: $value:expr $(,)?) => {
-		$crate::__tb_if_std!({ $transport = $transport.with_timeout($value); });
-	};
-	// Base case: no more policies
 	(@process_policy $transport:expr,) => {};
 	(@process_policy $transport:expr) => {};
 
-	// Process policies for ClientBuilder - similar to process_policy but works with builder methods
-	(@process_policy_builder $builder:expr, restart_policy: $value:expr, $($rest:tt)*) => {
+	// The same keys against `ClientBuilder`, whose setters take the builder.
+	(@process_policy_builder $builder:expr, restart_policy: $value:expr $(, $($rest:tt)*)?) => {
 		$builder = $builder.with_restart($value);
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
-	(@process_policy_builder $builder:expr, restart: $value:expr, $($rest:tt)*) => {
+	(@process_policy_builder $builder:expr, restart: $value:expr $(, $($rest:tt)*)?) => {
 		$builder = $builder.with_restart($value);
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
-	(@process_policy_builder $builder:expr, emitter_gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+	(@process_policy_builder $builder:expr, emitter_gate: [ $( $value:expr ),* $(,)? ] $(, $($rest:tt)*)?) => {
 		$(
 			$builder = $builder.with_emitter_gate($value);
 		)*
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
-	(@process_policy_builder $builder:expr, emitter_gate: $value:expr, $($rest:tt)*) => {
+	(@process_policy_builder $builder:expr, emitter_gate: $value:expr $(, $($rest:tt)*)?) => {
 		$builder = $builder.with_emitter_gate($value);
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
-	(@process_policy_builder $builder:expr, gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+	(@process_policy_builder $builder:expr, gate: [ $( $value:expr ),* $(,)? ] $(, $($rest:tt)*)?) => {
 		$(
 			$builder = $builder.with_emitter_gate($value);
 		)*
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
-	(@process_policy_builder $builder:expr, gate: $value:expr, $($rest:tt)*) => {
+	(@process_policy_builder $builder:expr, gate: $value:expr $(, $($rest:tt)*)?) => {
 		$builder = $builder.with_emitter_gate($value);
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
-	(@process_policy_builder $builder:expr, collector_gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+	(@process_policy_builder $builder:expr, collector_gate: [ $( $value:expr ),* $(,)? ] $(, $($rest:tt)*)?) => {
 		$(
 			$builder = $builder.with_collector_gate($value);
 		)*
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
-	(@process_policy_builder $builder:expr, collector_gate: $value:expr, $($rest:tt)*) => {
+	(@process_policy_builder $builder:expr, collector_gate: $value:expr $(, $($rest:tt)*)?) => {
 		$builder = $builder.with_collector_gate($value);
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
-	(@process_policy_builder $builder:expr, timeout: $value:expr, $($rest:tt)*) => {
-		$crate::__tb_if_std!({ $builder = $builder.with_timeout($value); });
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	(@process_policy_builder $builder:expr, timeout: $value:expr $(, $($rest:tt)*)?) => {
+		$builder = $builder.with_timeout($value);
+		$($crate::client!(@process_policy_builder $builder, $($rest)*);)?
 	};
 	(@process_policy_builder $builder:expr,) => {};
 	(@process_policy_builder $builder:expr) => {};

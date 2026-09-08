@@ -4,7 +4,7 @@
 //! CMS builders and processors.
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 
 use crate::cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use crate::cms::content_info::CmsVersion;

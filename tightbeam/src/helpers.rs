@@ -178,22 +178,6 @@ macro_rules! notarize {
 	}};
 }
 
-#[cfg(feature = "compress")]
-#[macro_export]
-macro_rules! compress {
-	($alg:ident, $data:expr) => {{
-		$crate::utils::compress($data, $crate::AlgorithmIdentifierOwned::$alg)
-	}};
-}
-
-#[cfg(feature = "compress")]
-#[macro_export]
-macro_rules! decompress {
-	($alg:ident, $data:expr) => {{
-		$crate::utils::decompress($data, $crate::AlgorithmIdentifierOwned::$alg)
-	}};
-}
-
 #[cfg(feature = "std")]
 #[macro_export]
 macro_rules! rwlock {

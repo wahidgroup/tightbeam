@@ -30,5 +30,11 @@ tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features 
 	"kdf",
 	"ecdh",
 	"x509",
+	"transport-ecies",
+	"tcp",
+	"tokio",
+	"transport-policy",
+	"testing",
+	"testing-csp",
 ] }
 der = { workspace = true }

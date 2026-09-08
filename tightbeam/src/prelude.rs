@@ -52,11 +52,8 @@ pub use crate::transport::tcp::TightBeamSocketAddr;
 pub mod tb {
 	#[cfg(feature = "builder")]
 	pub use crate::flagset;
-
 	#[cfg(feature = "transport")]
 	pub use crate::{client, server};
-	#[cfg(feature = "compress")]
-	pub use crate::{compress, decompress};
 	#[cfg(feature = "std")]
 	pub use crate::{mutex, rwlock};
 	#[cfg(feature = "signature")]

@@ -6,6 +6,7 @@
 
 use core::fmt;
 
+use crate::Errorizable;
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, collections::BTreeMap as HashMap, vec::Vec};
 #[cfg(feature = "std")]
@@ -67,29 +68,20 @@ pub struct LogRecord<'a> {
 }
 
 /// Errors that can occur during logging operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogError {
 	/// I/O error occurred
+	#[error("I/O error")]
 	IoError,
 	/// Log buffer is full
+	#[error("buffer full")]
 	BufferFull,
 	/// Backend is unavailable
+	#[error("backend unavailable")]
 	BackendUnavailable,
 }
 
-impl fmt::Display for LogError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			LogError::IoError => write!(f, "I/O error"),
-			LogError::BufferFull => write!(f, "buffer full"),
-			LogError::BackendUnavailable => write!(f, "backend unavailable"),
-		}
-	}
-}
-
 #[cfg(feature = "std")]
-impl std::error::Error for LogError {}
-
 /// Trait for logging backends
 ///
 /// Implementations can output logs to various targets (stdout, files, SIEM systems, etc.)

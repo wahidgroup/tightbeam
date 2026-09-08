@@ -1067,61 +1067,6 @@ macro_rules! tb_assert_spec {
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Scenario macro MVP
-// ---------------------------------------------------------------------------
-// Scenario macro MVP: Worker & Bare variants (ServiceClient stubbed)
-// ---------------------------------------------------------------------------
-
-// Helper to validate CSP and FDR (reduces duplication)
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tb_scenario_validate_csp_fdr {
-	(
-		$trace:expr,
-		$(csp: $csp:ty,)?
-		$(fdr: $fdr_config:expr,)?
-	) => {{
-		// CSP validation if provided
-		#[cfg(feature = "testing-csp")]
-		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = {
-			$crate::tb_scenario!(@csp_validate $trace, $($csp)?)
-		};
-
-		#[cfg(not(feature = "testing-csp"))]
-		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = None;
-
-		// Check if CSP validation failed
-		#[cfg(feature = "testing-csp")]
-		let csp_failed = csp_result.as_ref().map(|r| !r.valid).unwrap_or(false);
-		#[cfg(not(feature = "testing-csp"))]
-		let csp_failed = false;
-
-		// FDR validation if provided
-		#[cfg(feature = "testing-fdr")]
-		let (fdr_result, fdr_config): (Option<$crate::testing::fdr::FdrVerdict>, Option<$crate::testing::fdr::FdrConfig>) = {
-			$crate::tb_scenario!(@fdr_validate_with_config $trace, $($fdr_config)?)
-		};
-
-		#[cfg(not(feature = "testing-fdr"))]
-		let (fdr_result, fdr_config): (Option<$crate::testing::fdr::FdrVerdict>, Option<$crate::testing::fdr::FdrConfig>) = (None, None);
-
-		// Check if FDR validation failed
-		#[cfg(feature = "testing-fdr")]
-		let fdr_failed = fdr_result.as_ref().map(|v| !v.passed).unwrap_or(false);
-		#[cfg(not(feature = "testing-fdr"))]
-		let fdr_failed = false;
-
-		// Check if FDR failure is expected (for negative tests)
-		#[cfg(feature = "testing-fdr")]
-		let expect_failure = fdr_config.as_ref().map(|c| c.expect_failure).unwrap_or(false);
-		#[cfg(not(feature = "testing-fdr"))]
-		let expect_failure = false;
-
-		(csp_result, csp_failed, fdr_result, fdr_config, fdr_failed, expect_failure)
-	}};
-}
-
 // Helper macro to call hooks and handle results (reduces duplication)
 #[doc(hidden)]
 #[macro_export]

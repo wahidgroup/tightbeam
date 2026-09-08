@@ -5,6 +5,7 @@
 //! - Earliest Deadline First (EDF)
 //! - Response Time Analysis (exact test)
 
+use crate::Errorizable;
 use core::time::Duration;
 
 /// Real-time task model
@@ -74,43 +75,24 @@ pub struct TaskViolationDetail {
 }
 
 /// Schedulability error
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq)]
 pub enum SchedulabilityError {
 	/// Missing period for an event
+	#[error("Missing period for event: {0}")]
 	MissingPeriod(String),
 	/// Task set contains no tasks
+	#[error("Task set contains no tasks")]
 	EmptyTaskSet,
 	/// Task has a zero period
+	#[error("Task `{task}` has a zero period")]
 	ZeroPeriod { task: String },
 	/// Task deadline exceeds its period (analyses assume D <= T)
+	#[error("Task `{task}` deadline exceeds its period (D <= T required)")]
 	DeadlineExceedsPeriod { task: String },
 	/// Response time analysis requires a fixed-priority scheduler
+	#[error("Response time analysis requires a fixed-priority scheduler, got {scheduler}")]
 	FixedPriorityRequired { scheduler: SchedulerType },
 }
-
-impl core::fmt::Display for SchedulabilityError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			Self::MissingPeriod(event) => {
-				write!(f, "Missing period for event: {event}")
-			}
-			Self::EmptyTaskSet => {
-				write!(f, "Task set contains no tasks")
-			}
-			Self::ZeroPeriod { task } => {
-				write!(f, "Task `{task}` has a zero period")
-			}
-			Self::DeadlineExceedsPeriod { task } => {
-				write!(f, "Task `{task}` deadline exceeds its period (D <= T required)")
-			}
-			Self::FixedPriorityRequired { scheduler } => {
-				write!(f, "Response time analysis requires a fixed-priority scheduler, got {scheduler}")
-			}
-		}
-	}
-}
-
-impl core::error::Error for SchedulabilityError {}
 
 impl TaskSet {
 	/// Validate structural preconditions shared by every analysis.

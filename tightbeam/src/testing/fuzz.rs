@@ -23,7 +23,7 @@
 //! Enable the `testing-fuzz-ijon` feature to guide AFL toward unexplored CSP states:
 //!
 //! ```bash
-//! cargo afl build --test fuzzing --features "std,testing-fuzz,testing-fuzz-ijon"
+//! cargo afl build --bin fuzz_colony --features "full,testing-fuzz,testing-fuzz-ijon"
 //! ```
 //!
 //! When enabled, each successful CSP step reports to AFL IJON:
@@ -101,8 +101,8 @@
 //! ```ignore
 //! tb_scenario! {
 //!     fuzz: afl,
-//!     spec: MySpec,
 //!     csp: MyProcess,
+//!     spec: MySpec,
 //!     environment Bare {
 //!         exec: |trace| {
 //!             // Oracle-guided fuzzing - IJON automatic with feature flag
@@ -127,35 +127,21 @@ use std::sync::{Arc, Mutex};
 
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
+use crate::Errorizable;
 
 /// Oracle-guided fuzz execution error
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FuzzError {
 	/// No valid events available in a non-terminal state
+	#[error("deadlock: no valid events in non-terminal state {state}")]
 	Deadlock { state: State },
 	/// Input bytes ran out before reaching a terminal state
+	#[error("input exhausted before terminal state (stopped in {state})")]
 	InputExhausted { state: State },
 	/// Oracle rejected an event it reported as valid (internal invariant)
+	#[error("oracle rejected valid event {event} in state {state}")]
 	EventRejected { state: State, event: Event },
 }
-
-impl core::fmt::Display for FuzzError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			Self::Deadlock { state } => {
-				write!(f, "deadlock: no valid events in non-terminal state {}", state.0)
-			}
-			Self::InputExhausted { state } => {
-				write!(f, "input exhausted before terminal state (stopped in {})", state.0)
-			}
-			Self::EventRejected { state, event } => {
-				write!(f, "oracle rejected valid event {} in state {}", event.0, state.0)
-			}
-		}
-	}
-}
-
-impl core::error::Error for FuzzError {}
 
 impl From<FuzzError> for TestingError {
 	fn from(error: FuzzError) -> Self {
@@ -554,8 +540,8 @@ impl CspOracle {
 /// ```ignore
 /// tb_scenario! {
 ///     fuzz: afl,
-///     spec: MySpec,
 ///     csp: MyProcess,
+///     spec: MySpec,
 ///     environment Bare {
 ///         exec: |trace| {
 ///             // FuzzContext provides oracle access

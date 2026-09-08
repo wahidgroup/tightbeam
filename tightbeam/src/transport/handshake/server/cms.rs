@@ -10,7 +10,7 @@ use core::marker::PhantomData;
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, sync::Arc, vec::Vec};
 
 #[cfg(feature = "std")]
 use std::sync::Arc;

@@ -153,6 +153,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
+	csp: ChessGameFlow,
 	config: ScenarioConfig::builder()
 		.with_spec(ChessAssertSpec::latest())
 		.with_csp(ChessGameFlow)

@@ -30,6 +30,7 @@ set -euo pipefail
 
 DEFAULT_BRANCH="master"
 DERIVE_TOML="tightbeam-derive/Cargo.toml"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BOLD='\033[1m'
 RED='\033[0;31m'
@@ -58,12 +59,9 @@ remote_tag_exists() {
 	fail "Could not query origin for ${1} (network or auth error)"
 }
 
+# The working-tree version comes from cargo, the same home release.sh reads.
 manifest_version() {
-	awk -F'"' '
-		/^\[package\]/ { f = 1; next }
-		f && /^\[/ { f = 0 }
-		f && /^version/ { print $2; exit }
-	' "$DERIVE_TOML" 2>/dev/null || true
+	"$SCRIPT_DIR/crate-version.sh" tightbeam-derive 2>/dev/null || true
 }
 
 require_signing_key() {
