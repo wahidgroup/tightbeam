@@ -23,6 +23,8 @@ use core::future::Future;
 #[cfg(any(feature = "signature", feature = "aead"))]
 use core::pin::Pin;
 
+use crate::Errorizable;
+
 #[cfg(feature = "signature")]
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 #[cfg(feature = "ecdh")]
@@ -90,53 +92,41 @@ use crate::crypto::secret::SecretSlice;
 // =============================================================================
 
 /// Errors from key provider operations.
-///
-/// Hand-written so this module builds without the `derive` feature, with
-/// the message strings in exactly one place --
-/// the `impl_error_display!` block below.
-#[derive(Debug)]
+#[derive(Errorizable, Debug)]
 pub enum KeyError {
 	/// SPKI encoding/decoding error
+	#[error("SPKI error: {0}")]
 	SpkiError(crate::spki::Error),
 
 	/// Elliptic curve operation error
 	#[cfg(feature = "signature")]
+	#[error("Elliptic curve error: {0}")]
 	EllipticCurveError(EllipticCurveError),
 
 	/// Signature/ECDSA error (e.g., invalid key bytes)
 	#[cfg(feature = "signature")]
+	#[error("Signature error: {0}")]
 	SignatureError(SignatureError),
 
 	/// AEAD encryption/decryption error
 	#[cfg(feature = "aead")]
+	#[error("AEAD error: {0}")]
 	AeadError(AeadError),
 
 	/// Nonce length mismatch
 	#[cfg(feature = "aead")]
+	#[error("Nonce length mismatch: {0}")]
 	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 
 	/// Signing key material of the wrong length for the curve
 	#[cfg(feature = "signature")]
+	#[error("Signing key length mismatch: {0}")]
 	KeyLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 
 	/// Operation not supported by this key provider
+	#[error("Operation not supported by this key provider")]
 	UnsupportedOperation,
 }
-
-crate::impl_error_display!(unconditional KeyError {
-	SpkiError(e) => "SPKI error: {e}",
-	#[cfg(feature = "signature")]
-	EllipticCurveError(e) => "Elliptic curve error: {e}",
-	#[cfg(feature = "signature")]
-	SignatureError(e) => "Signature error: {e}",
-	#[cfg(feature = "aead")]
-	AeadError(e) => "AEAD error: {e}",
-	#[cfg(feature = "aead")]
-	NonceLengthError(e) => "Nonce length mismatch: {e}",
-	#[cfg(feature = "signature")]
-	KeyLengthError(e) => "Signing key length mismatch: {e}",
-	UnsupportedOperation => "Operation not supported by this key provider",
-});
 
 crate::impl_from!(crate::spki::Error => KeyError::SpkiError);
 crate::impl_from!(#[cfg(feature = "signature")] EllipticCurveError => KeyError::EllipticCurveError);

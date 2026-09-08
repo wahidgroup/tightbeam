@@ -498,6 +498,22 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 		let has_from = has_attr(&variant.attrs, "from");
 		let has_source = has_attr(&variant.attrs, "source");
 
+		// A variant that carries data must render it. A message with no
+		// placeholder drops the payload, and the caller sees a bare
+		// description where the values it needed used to be.
+		if !matches!(&variant.fields, syn::Fields::Unit) {
+			if let Some(msg) = error_msg.as_deref() {
+				let literal_braces_removed = msg.replace("{{", "").replace("}}", "");
+				if !literal_braces_removed.contains('{') {
+					return Err(syn::Error::new_spanned(
+						variant,
+						"a variant carrying fields must reference at least one of them in \
+						 #[error(\"...\")]: a message with no placeholder drops the payload",
+					));
+				}
+			}
+		}
+
 		if has_source && !matches!(&variant.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1) {
 			return Err(syn::Error::new_spanned(
 				variant,
@@ -544,12 +560,11 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 						});
 					}
 				} else {
-					display_arms.push(quote! {
-						#(#variant_cfgs)*
-						#name::#variant_name(#(ref #field_bindings),*) => {
-							write!(f, "{}", stringify!(#variant_name))
-						}
-					});
+					return Err(syn::Error::new_spanned(
+						variant,
+						"Errorizable requires #[error(\"...\")] on every variant: a missing message \
+						 would print the variant name and drop the payload",
+					));
 				}
 
 				// Generate From impl if #[from] is present and there's exactly one field
@@ -586,12 +601,11 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 						}
 					});
 				} else {
-					display_arms.push(quote! {
-						#(#variant_cfgs)*
-						#name::#variant_name { .. } => {
-							write!(f, "{}", stringify!(#variant_name))
-						}
-					});
+					return Err(syn::Error::new_spanned(
+						variant,
+						"Errorizable requires #[error(\"...\")] on every variant: a missing message \
+						 would print the variant name and drop the payload",
+					));
 				}
 			}
 			syn::Fields::Unit => {
@@ -601,10 +615,11 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 						#name::#variant_name => write!(f, #msg)
 					});
 				} else {
-					display_arms.push(quote! {
-						#(#variant_cfgs)*
-						#name::#variant_name => write!(f, "{}", stringify!(#variant_name))
-					});
+					return Err(syn::Error::new_spanned(
+						variant,
+						"Errorizable requires #[error(\"...\")] on every variant: a missing message \
+						 would print the variant name and drop the payload",
+					));
 				}
 			}
 		}

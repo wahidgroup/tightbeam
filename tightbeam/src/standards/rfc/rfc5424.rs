@@ -1,4 +1,5 @@
 use crate::der::Enumerated;
+use crate::Errorizable;
 
 /// Syslog Severity (RFC 5424, § 6.2.1)
 /// See `<https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1>`
@@ -65,13 +66,10 @@ impl core::str::FromStr for SyslogSeverity {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RFC5424Error {
+	#[error("invalid RFC5424 severity value: {0}")]
 	InvalidSeverityValue(u8),
+	#[error("invalid RFC5424 severity name: {0}")]
 	InvalidSeverityName(String),
 }
-
-crate::impl_error_display!(unconditional RFC5424Error {
-	InvalidSeverityValue(v) => "invalid RFC5424 severity value: {v}",
-	InvalidSeverityName(s) => "invalid RFC5424 severity name: {s}",
-});

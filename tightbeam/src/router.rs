@@ -2,6 +2,7 @@
 extern crate alloc;
 
 use crate::frame::BodyTransform;
+use crate::Errorizable;
 use crate::{Frame, Message};
 
 /// Single `Arc` spelling for both std and no_std builds so [`crate::routes!`]
@@ -13,20 +14,17 @@ pub use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, RouterError>;
 
-#[derive(Debug)]
+#[derive(Errorizable, Debug)]
 pub enum RouterError {
+	#[error("No route configured for provided message")]
 	UnknownRoute,
+	#[error("Frame body failed to decode as the dispatched type: {0}")]
 	DecodeFailed(crate::der::Error),
+	#[error("Frame body is encrypted; decrypt before routing")]
 	ConfidentialFrame,
+	#[error("Frame body is compressed; inflate before routing")]
 	CompressedFrame,
 }
-
-crate::impl_error_display!(unconditional RouterError {
-	UnknownRoute => "No route configured for provided message",
-	DecodeFailed(source) => "Frame body failed to decode as the dispatched type: {source}",
-	ConfidentialFrame => "Frame body is encrypted; decrypt before routing",
-	CompressedFrame => "Frame body is compressed; inflate before routing",
-});
 
 crate::impl_from!(crate::der::Error => RouterError::DecodeFailed);
 

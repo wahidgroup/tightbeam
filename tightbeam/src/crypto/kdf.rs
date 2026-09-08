@@ -59,6 +59,7 @@ use crate::constants::{
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
 use crate::zeroize::Zeroizing;
+use crate::Errorizable;
 use crate::{ZeroizingArray, ZeroizingBytes};
 
 pub type Result<T> = ::core::result::Result<T, KdfError>;
@@ -289,35 +290,28 @@ impl KdfFunction for X963Sha3_256 {
 }
 
 /// Errors specific to KDF operations
-///
-/// Deliberately does not derive `Errorizable`: this module builds without
-/// the `derive` feature, so the message strings live in exactly one place --
-/// the `impl_error_display!` block below.
-#[derive(Debug, Clone)]
+#[derive(Errorizable, Debug, Clone)]
 pub enum KdfError {
 	/// Key derivation failed (HKDF expansion error)
+	#[error("Key derivation failed: {0}")]
 	DerivationFailed(crate::crypto::hkdf::InvalidLength),
 
 	/// Invalid ephemeral public key length
+	#[error("Invalid ephemeral public key length: expected 33 or 65 bytes, got {0}")]
 	InvalidPublicKeyLength(usize),
 
 	/// Invalid shared secret length
+	#[error("Invalid shared secret length: expected 32 bytes, got {0}")]
 	InvalidSharedSecretLength(usize),
 
 	/// Invalid salt length
+	#[error("Invalid salt length: must be at least 16 bytes, got {0}")]
 	InvalidSaltLength(usize),
 
 	/// Secret material was unavailable during derivation
+	#[error("Secret unavailable: {0}")]
 	SecretUnavailable(crate::crypto::secret::SecretError),
 }
-
-crate::impl_error_display!(unconditional KdfError {
-	DerivationFailed(e) => "Key derivation failed: {e}",
-	InvalidPublicKeyLength(len) => "Invalid ephemeral public key length: expected 33 or 65 bytes, got {len}",
-	InvalidSharedSecretLength(len) => "Invalid shared secret length: expected 32 bytes, got {len}",
-	InvalidSaltLength(len) => "Invalid salt length: must be at least 16 bytes, got {len}",
-	SecretUnavailable(e) => "Secret unavailable: {e}",
-});
 
 crate::impl_from!(crate::crypto::secret::SecretError => KdfError::SecretUnavailable);
 

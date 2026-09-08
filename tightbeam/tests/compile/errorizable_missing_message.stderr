@@ -1,0 +1,5 @@
+error: Errorizable requires #[error("...")] on every variant: a missing message would print the variant name and drop the payload
+ --> tests/compile/errorizable_missing_message.rs:9:2
+  |
+9 |     Undescribed(u8),
+  |     ^^^^^^^^^^^^^^^

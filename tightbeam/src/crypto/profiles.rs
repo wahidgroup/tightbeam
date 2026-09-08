@@ -58,6 +58,7 @@ use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::handshake::HandshakeError;
 #[cfg(feature = "derive")]
 use crate::Beamable;
+use crate::Errorizable;
 /// Macro to generate key wrapper implementations.
 /// Reduces duplication across AES-128/192/256 variants.
 #[cfg(all(feature = "aead", feature = "transport"))]
@@ -458,17 +459,14 @@ impl CryptoProvider for DefaultCryptoProvider {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Errorizable, Debug, Clone)]
 #[allow(unused_variables)]
 pub enum UkmBuilderError {
+	#[error("Duplicate tag: {tag}")]
 	DuplicateTag { tag: u8 },
+	#[error("Extension too large (tag {tag} len {len})")]
 	ExtensionTooLarge { tag: u8, len: usize },
 }
-
-crate::impl_error_display!(unconditional UkmBuilderError {
-	DuplicateTag { tag } => "Duplicate tag: {tag}",
-	ExtensionTooLarge { tag, len } => "Extension too large (tag {tag} len {len})",
-});
 
 pub type UkmResult<T> = ::core::result::Result<T, UkmBuilderError>;
 

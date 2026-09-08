@@ -55,6 +55,7 @@ use crate::crypto::aead::Aes256Gcm;
 use crate::crypto::kdf::HkdfSha3_256;
 #[cfg(feature = "x509")]
 use crate::der::oid::AssociatedOid;
+use crate::Errorizable;
 
 // ============================================================================
 // Generic ECIES Traits
@@ -111,43 +112,36 @@ pub trait EciesEphemeral {
 // ============================================================================
 
 /// Errors specific to ECIES operations
-///
-/// Deliberately does not derive `Errorizable`: this module builds without
-/// the `derive` feature, so the message strings live in exactly one place --
-/// the `impl_error_display!` block below.
-#[derive(Debug, Clone)]
+#[derive(Errorizable, Debug, Clone)]
 pub enum EciesError {
 	/// Invalid ciphertext format
+	#[error("Invalid ECIES ciphertext format")]
 	InvalidCiphertext,
 
 	/// Invalid public key
+	#[error("Invalid ECIES public key: {0}")]
 	InvalidPublicKey(crate::crypto::k256::elliptic_curve::Error),
 
 	/// Invalid secret key
+	#[error("Invalid ECIES secret key: {0}")]
 	InvalidSecretKey(crate::crypto::k256::elliptic_curve::Error),
 
 	/// Encryption failed
+	#[error("ECIES encryption failed: {0}")]
 	EncryptionFailed(crate::crypto::aead::Error),
 
 	/// Decryption failed
+	#[error("ECIES decryption failed: {0}")]
 	DecryptionFailed(crate::crypto::aead::Error),
 
 	/// Key derivation failed
+	#[error("ECIES key derivation failed: {0}")]
 	Kdf(KdfError),
 
 	/// Secret material was unavailable
+	#[error("Secret unavailable: {0}")]
 	SecretUnavailable(crate::crypto::secret::SecretError),
 }
-
-crate::impl_error_display!(unconditional EciesError {
-	InvalidCiphertext => "Invalid ECIES ciphertext format",
-	InvalidPublicKey(e) => "Invalid ECIES public key: {e}",
-	InvalidSecretKey(e) => "Invalid ECIES secret key: {e}",
-	EncryptionFailed(e) => "ECIES encryption failed: {e}",
-	DecryptionFailed(e) => "ECIES decryption failed: {e}",
-	Kdf(e) => "ECIES key derivation failed: {e}",
-	SecretUnavailable(e) => "Secret unavailable: {e}",
-});
 
 crate::impl_from!(KdfError => EciesError::Kdf);
 crate::impl_from!(crate::crypto::secret::SecretError => EciesError::SecretUnavailable);
