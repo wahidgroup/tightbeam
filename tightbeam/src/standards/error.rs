@@ -3,63 +3,70 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
-#[cfg(feature = "derive")]
-use crate::Errorizable;
-
 #[cfg(feature = "standards-rfc")]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RFCError {
 	#[cfg(feature = "standards-rfc")]
-	#[cfg_attr(feature = "derive", error("{0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	RFC5424Error(crate::standards::rfc::rfc5424::RFC5424Error),
 }
 
 #[cfg(feature = "standards-iso")]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ISOError {
-	#[cfg_attr(feature = "derive", error("ISO error: {0}"))]
 	Message(String),
 }
 
-#[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StandardError {
-	#[cfg_attr(feature = "derive", error("{0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	RFC(RFCError),
-	#[cfg_attr(feature = "derive", error("{0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	ISO(ISOError),
 }
 
-#[cfg(not(feature = "derive"))]
-impl From<RFCError> for StandardError {
-	fn from(e: RFCError) -> Self {
-		StandardError::RFC(e)
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl From<ISOError> for StandardError {
-	fn from(e: ISOError) -> Self {
-		StandardError::ISO(e)
-	}
-}
+#[cfg(feature = "standards-rfc")]
+crate::impl_from!(crate::standards::rfc::rfc5424::RFC5424Error => RFCError::RFC5424Error);
+crate::impl_from!(RFCError => StandardError::RFC);
+crate::impl_from!(ISOError => StandardError::ISO);
 
 #[cfg(feature = "standards-rfc")]
-crate::impl_error_display!(RFCError {
+crate::impl_error_display!(unconditional display RFCError {
 	RFC5424Error(e) => "{e}",
 });
 
 #[cfg(feature = "standards-iso")]
-crate::impl_error_display!(ISOError {
+crate::impl_error_display!(unconditional ISOError {
 	Message(s) => "ISO error: {s}",
 });
 
-crate::impl_error_display!(StandardError {
+crate::impl_error_display!(unconditional display StandardError {
 	RFC(e) => "{e}",
 	ISO(e) => "{e}",
 });
+
+// `source()` delegates to the wrapped standard error, so a caller walking
+// the chain reaches the RFC or ISO cause. The wrapped types implement
+// `Error` only under `std`, matching the `Errorizable` derive this
+// replaced.
+#[cfg(all(feature = "std", feature = "standards-rfc"))]
+impl core::error::Error for RFCError {
+	fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+		match self {
+			RFCError::RFC5424Error(err) => Some(err),
+		}
+	}
+}
+
+#[cfg(all(not(feature = "std"), feature = "standards-rfc"))]
+impl core::error::Error for RFCError {}
+
+#[cfg(feature = "std")]
+impl core::error::Error for StandardError {
+	fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+		match self {
+			StandardError::RFC(err) => Some(err),
+			StandardError::ISO(err) => Some(err),
+		}
+	}
+}
+
+#[cfg(not(feature = "std"))]
+impl core::error::Error for StandardError {}

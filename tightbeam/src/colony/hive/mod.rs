@@ -327,8 +327,12 @@ pub trait Hive: Sized + Send + Sync {
 	/// [`HiveContext::open_duplex`].
 	fn context(&self) -> Arc<dyn HiveContext>;
 
-	/// Get the hive's control server address.
-	fn addr(&self) -> &Self::Address;
+	/// The address a cluster dials this hive on.
+	///
+	/// [`None`] until [`Hive::establish`], and for a hive configured with
+	/// no `hive_tls`: signing a registration needs that identity, so a
+	/// hive without one has no address to publish.
+	fn addr(&self) -> Option<&Self::Address>;
 
 	/// Get addresses of all registered servlets.
 	///

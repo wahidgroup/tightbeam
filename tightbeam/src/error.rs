@@ -527,8 +527,8 @@ impl core::fmt::Display for TightBeamError {
 				write!(f, "Encryption or decryption error: {err}")
 			}
 			#[cfg(feature = "aead")]
-			TightBeamError::InvalidKeyLength(_) => {
-				write!(f, "Invalid key length")
+			TightBeamError::InvalidKeyLength(len) => {
+				write!(f, "Invalid key length: {len}")
 			}
 			#[cfg(feature = "ecies")]
 			TightBeamError::EciesError(err) => write!(f, "ECIES error: {err}"),
@@ -539,7 +539,7 @@ impl core::fmt::Display for TightBeamError {
 				write!(f, "Signature verification or generation error: {err}")
 			}
 			#[cfg(feature = "signature")]
-			TightBeamError::EllipticCurveError(_) => write!(f, "Elliptic curve error"),
+			TightBeamError::EllipticCurveError(err) => write!(f, "Elliptic curve error: {err}"),
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
 			#[cfg(feature = "crypto")]
@@ -587,16 +587,7 @@ impl core::fmt::Display for TightBeamError {
 			}
 			#[cfg(feature = "compress")]
 			TightBeamError::CompressionError(err) => write!(f, "Compression error: {err}"),
-			TightBeamError::Sequence(errors) => {
-				write!(f, "Multiple errors: ")?;
-				for (i, error) in errors.iter().enumerate() {
-					if i > 0 {
-						write!(f, "; ")?;
-					}
-					write!(f, "{error}")?;
-				}
-				Ok(())
-			}
+			TightBeamError::Sequence(errors) => write!(f, "Multiple errors occurred: {errors:?}"),
 			#[cfg(feature = "colony")]
 			TightBeamError::AlreadyEstablished => write!(f, "Hive already established"),
 			#[cfg(feature = "colony")]

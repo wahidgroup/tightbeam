@@ -54,7 +54,9 @@ impl ExecutionPath {
 		if pattern.len() > self.events.len() {
 			return false;
 		}
-		// Check if the first N events match the pattern (compare string content, not pointers)
+
+		// Check if the first N events match the pattern
+		// (compare string content, not pointers)
 		self.events
 			.iter()
 			.take(pattern.len())
@@ -121,7 +123,6 @@ impl ConsumedTrace {
 			};
 
 			let csp_event = Event(intern(event_label.as_str()));
-
 			// Check if event is enabled in current state
 			let enabled = process.enabled(current_state);
 			let is_enabled = enabled.iter().any(|a| a.event == csp_event);
@@ -132,6 +133,7 @@ impl ConsumedTrace {
 					current_path_events.clear();
 					current_path_durations.clear();
 				}
+
 				current_state = process.initial; // Reset to initial state
 				continue;
 			}
@@ -179,7 +181,6 @@ mod tests {
 		let events = vec![Event("start"), Event("process"), Event("end")];
 		let durations = vec![Some(10_000_000), Some(20_000_000), Some(5_000_000)];
 		let path = ExecutionPath::new(events.clone(), durations.clone());
-
 		assert_eq!(path.events, events);
 		assert_eq!(path.durations, durations);
 		assert_eq!(path.total_duration, 35_000_000);
@@ -204,7 +205,6 @@ mod tests {
 	fn test_path_wcet_new() {
 		let path = vec![Event("start"), Event("process"), Event("end")];
 		let max_duration = Duration::from_millis(50);
-
 		let path_wcet = PathWcet::new(path.clone(), max_duration);
 		assert_eq!(path_wcet.path, path);
 		assert_eq!(path_wcet.max_duration, max_duration);
@@ -231,6 +231,7 @@ mod tests {
 		#[cfg(feature = "instrument")]
 		{
 			use crate::instrumentation::events;
+
 			trace.instrument_events = events
 				.iter()
 				.enumerate()
@@ -253,11 +254,11 @@ mod tests {
 	#[test]
 	fn test_extract_paths_simple() -> Result<(), ProcessBuildError> {
 		let process = create_test_process()?;
-		let trace =
-			create_trace_with_timing_events(&[("start", 10_000_000), ("process", 20_000_000), ("end", 5_000_000)]);
+		let events = vec![("start", 10_000_000), ("process", 20_000_000), ("end", 5_000_000)];
+		let trace = create_trace_with_timing_events(&events);
 
-		let paths = trace.execution_paths(&process);
 		// Should extract one path with all three events
+		let paths = trace.execution_paths(&process);
 		assert_eq!(paths.len(), 1);
 		assert_eq!(paths[0].events.len(), 3);
 		assert_eq!(paths[0].total_duration, 35_000_000);

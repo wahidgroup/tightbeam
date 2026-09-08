@@ -578,7 +578,12 @@ tb_scenario! {
 
 			// The update must present the registered signer, so it signs
 			// with the hive-plane identity.
-			let hive_addr = hive.addr().to_string().into_bytes();
+			let hive_addr = hive
+				.addr()
+				.ok_or(TightBeamError::NotEstablished)?
+				.to_string()
+				.into_bytes();
+
 			let hive_id = hive_plane_certs();
 			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			emit_servlet_update(

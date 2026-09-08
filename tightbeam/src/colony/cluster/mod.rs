@@ -616,6 +616,12 @@ mod tests {
 		servlet_urn(name).canonical_bytes()
 	}
 
+	/// The signer every fixture registration binds. Registration always
+	/// names one, so the tests name one too.
+	fn test_signer() -> SharedId {
+		Arc::from(b"test-signer".as_slice())
+	}
+
 	fn request(addr: &[u8], servlets: &[&str]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
 			hive_addr: addr.to_vec(),
@@ -694,8 +700,7 @@ mod tests {
 	#[test]
 	fn registry_register_and_lookup() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]))?;
-
+		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]), test_signer())?;
 		// Registered types found
 		assert_eq!(registry.hives_for_type(&type_key("ping"))?.len(), 1);
 		assert_eq!(registry.hives_for_type(&type_key("calc"))?.len(), 1);
@@ -706,62 +711,53 @@ mod tests {
 
 		// Unknown type not found
 		assert!(registry.hives_for_type(&type_key("unknown"))?.is_empty());
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_unregister() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping"]))?;
-
+		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
 		assert_eq!(registry.len()?, 1);
 		assert!(registry.unregister(b"127.0.0.1:8080")?.is_some());
 		assert_eq!(registry.len()?, 0);
 		assert!(registry.hives_for_type(&type_key("ping"))?.is_empty());
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_update_utilization() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping"]))?;
-
+		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
 		assert!(registry.update_utilization(b"127.0.0.1:8080", BasisPoints::new(5000))?);
 		assert_eq!(registry.hives_for_type(&type_key("ping"))?[0].utilization.get(), 5000);
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_available_servlets_deduplicated() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &["ping", "calc"]))?;
-		registry.register(request(b"hive2", &["ping", "worker"]))?;
-
+		registry.register(request(b"hive1", &["ping", "calc"]), test_signer())?;
+		registry.register(request(b"hive2", &["ping", "worker"]), test_signer())?;
 		// ping, calc, worker - ping deduplicated
 		assert_eq!(registry.to_available_servlets()?.len(), 3);
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_multiple_hives_same_type() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &["ping"]))?;
-		registry.register(request(b"hive2", &["ping"]))?;
-
+		registry.register(request(b"hive1", &["ping"]), test_signer())?;
+		registry.register(request(b"hive2", &["ping"]), test_signer())?;
 		assert_eq!(registry.hives_for_type(&type_key("ping"))?.len(), 2);
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_all_hives() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &["ping"]))?;
-		registry.register(request_with_meta(b"hive2", &["calc"], b"metadata"))?;
+		registry.register(request(b"hive1", &["ping"]), test_signer())?;
+		registry.register(request_with_meta(b"hive2", &["calc"], b"metadata"), test_signer())?;
 
 		let all = registry.all_hives()?;
 		assert_eq!(all.len(), 2);

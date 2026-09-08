@@ -128,23 +128,25 @@ tb_scenario! {
 			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			// The hive validates the cluster's TLS certificate but has no
-			// signing identity of its own, so control frames go out unsigned.
-			let hive_conf = HiveConfig {
-				trust_store: Some(Arc::clone(&certs.trust)),
-				..Default::default()
-			};
-
-			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
-			hive.establish(Arc::new(trace.share())).await?;
+			let cluster_addr = cluster.addr();
+			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
 			trace.event(REGISTRATION_SENT)?;
 
-			let cluster_addr = cluster.addr();
-			let response = hive.register_with_cluster(cluster_addr).await?;
+			// Unsigned by construction. A hive cannot drive this case: with
+			// no signing identity it binds no control plane, so it has no
+			// address to register and refuses before it dials.
+			let unsigned = Version::V0
+				.compose()
+				.with_id(b"unsigned-reg")
+				.with_order(current_timestamp_ms())
+				.with_message(registration_request(b"127.0.0.1:65200"))
+				.build()?;
+
+			let response_frame = emit_frame(&mut client, unsigned).await?;
+			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			record_register_response(&trace, &response, &cluster)?;
 
-			hive.stop();
 			cluster.stop();
 
 			Ok(())
@@ -161,7 +163,7 @@ tb_assert_spec! {
 			(REGISTRATION_SENT, exactly!(1)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
 			(events::HIVE_REREGISTERED, exactly!(0)),
-			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Unauthenticated)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(REGISTRY_HIVES, exactly!(1), equals!(0u64)),
 			(REGISTER_ASSIGNED_ID, exactly!(1), equals!(0u64))
 		]
@@ -180,8 +182,17 @@ tb_scenario! {
 			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			// A signing identity of the hive's own, absent from the cluster
+			// hive_trust: the registration is signed and still refused, which
+			// is the response a queued gateway would have to survive.
+			let (hive_cert, hive_key) = colony_identity("CN=Untrusted Hive", &test_colony_urn());
 			let mut hive_conf = HiveConfig {
 				trust_store: Some(Arc::clone(&certs.trust)),
+				hive_tls: Some(Arc::new(HiveTlsConfig {
+					certificate: CertificateSpec::Built(Box::new(hive_cert)),
+					key: Arc::new(Secp256k1KeyProvider::from(hive_key)),
+					validators: vec![],
+				})),
 				..Default::default()
 			};
 			hive_conf.control.reregister_interval = Some(Duration::from_millis(50));
@@ -556,7 +567,11 @@ tb_scenario! {
 			hive.establish(Arc::new(trace.share())).await?;
 
 			// Register the hive out-of-band with a validly signed frame.
-			let hive_addr_bytes = hive.addr().to_string().into_bytes();
+			let hive_addr_bytes = hive
+				.addr()
+				.ok_or(TightBeamError::NotEstablished)?
+				.to_string()
+				.into_bytes();
 			let registration = signed_control_frame(
 				certs,
 				b"hb-reject-reg",

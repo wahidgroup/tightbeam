@@ -197,11 +197,15 @@ impl SessionContext {
 
 	/// The identity this session's handshake proved.
 	///
-	/// Returns [`ProvenPeer::ANONYMOUS`] when the transport authenticated
-	/// no peer, so a caller always has one identity to key on.
+	/// [`None`] where the transport authenticated no peer.
+	///
+	/// A per-identity budget MUST NOT fall back to a shared stand-in:
+	/// every unauthenticated caller would key on the same row, so one
+	/// caller's failures would deny all the others (CWE-645). Each caller
+	/// decides what an unauthenticated transport may do instead.
 	#[cfg(feature = "transport")]
-	pub fn proven_peer(&self) -> ProvenPeer<'_> {
-		self.peer_public_key.as_deref().map_or(ProvenPeer::ANONYMOUS, ProvenPeer)
+	pub fn proven_peer(&self) -> Option<ProvenPeer<'_>> {
+		self.peer_public_key.as_deref().map(ProvenPeer)
 	}
 
 	/// Dual-signed session receipt, when the session is budget-bearing.
@@ -217,15 +221,12 @@ impl SessionContext {
 /// [`SessionContext::proven_peer`] alone, so frame-carried bytes stay out
 /// of a per-identity budget (CWE-345).
 ///
-/// A session whose transport proved no peer yields [`ProvenPeer::ANONYMOUS`],
-/// which is the whole attribution a cleartext plane offers.
+/// A session whose transport proved no peer yields no `ProvenPeer` at all,
+/// so a budget keyed on this type is always attributable to one caller.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProvenPeer<'a>(&'a [u8]);
 
 impl<'a> ProvenPeer<'a> {
-	/// The shared identity of every caller a transport left unauthenticated.
-	pub const ANONYMOUS: Self = Self(b"anonymous-peer");
-
 	/// Key bytes for the identity.
 	///
 	/// A gate keys its per-identity state on these bytes. They come from

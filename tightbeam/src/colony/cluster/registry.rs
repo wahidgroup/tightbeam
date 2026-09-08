@@ -27,8 +27,12 @@ pub struct HiveEntry {
 	pub metadata: Option<Arc<[u8]>>,
 	/// Consecutive heartbeat failures
 	pub failure_count: u32,
-	/// DER-encoded signer identifier bound at registration (x509 control plane)
-	pub signer_id: Option<SharedId>,
+	/// DER-encoded signer identifier bound at registration.
+	///
+	/// Every registration binds one. An entry with no signer would accept
+	/// re-registration from anyone, so that state is not representable
+	/// (CWE-639).
+	pub signer_id: SharedId,
 }
 
 impl HiveEntry {
@@ -61,18 +65,14 @@ struct Members {
 impl Members {
 	/// Whether `incoming` may claim `hive_id`.
 	///
-	/// A hive with a bound signer accepts re-registration only from that
-	/// signer. An unbound hive accepts any (CWE-639).
-	fn admits_signer(&self, hive_id: &[u8], incoming: Option<&SharedId>) -> bool {
+	/// A registered hive accepts re-registration only from the signer bound
+	/// at its first registration. An unregistered id is free (CWE-639).
+	fn admits_signer(&self, hive_id: &[u8], incoming: &SharedId) -> bool {
 		let Some(existing) = self.hives.get(hive_id) else {
 			return true;
 		};
 
-		match (&existing.signer_id, incoming) {
-			(Some(bound), Some(candidate)) => bound.as_ref() == candidate.as_ref(),
-			(Some(_), None) => false,
-			(None, _) => true,
-		}
+		existing.signer_id.as_ref() == incoming.as_ref()
 	}
 
 	/// Replaces any prior registration and reindexes its servlet types.
@@ -114,7 +114,7 @@ impl Members {
 	}
 
 	fn signer_for(&self, hive_id: &[u8]) -> Option<SharedId> {
-		self.hives.get(hive_id).and_then(|entry| entry.signer_id.clone())
+		self.hives.get(hive_id).map(|entry| Arc::clone(&entry.signer_id))
 	}
 
 	/// Records a heartbeat. `false` when the hive left the registry.
@@ -189,27 +189,21 @@ impl HiveRegistry {
 		Self { members: RwLock::new(Members::default()), timeout }
 	}
 
-	/// Register a hive and index its servlet types
+	/// Register a hive, bind its control-plane signer, and index its
+	/// servlet types.
 	///
-	/// If the hive was already registered, updates its entry and re-indexes.
+	/// `signer_id` is the DER-encoded `SignerIdentifier` from the
+	/// registration frame. Later `ServletAddressUpdate` calls must present
+	/// the same signer for this hive id, and re-registration is admitted
+	/// only from the signer bound first (CWE-639).
+	///
 	/// Takes ownership for zero-copy conversion to `Arc<[u8]>`.
-	pub fn register(&self, request: RegisterHiveRequest) -> Result<(), ClusterError> {
-		self.register_with_signer(request, None)
-	}
-
-	/// Register a hive and bind the authenticated control-plane signer
 	///
-	/// `signer_id` is the DER-encoded `SignerIdentifier` from the registration
-	/// frame. Later `ServletAddressUpdate` calls must present the same signer
-	/// for this hive id (CWE-639).
+	/// # Errors
 	///
-	/// Re-registration of an existing hive is allowed only when the incoming
-	/// signer matches the already-bound signer.
-	pub fn register_with_signer(
-		&self,
-		request: RegisterHiveRequest,
-		signer_id: Option<SharedId>,
-	) -> Result<(), ClusterError> {
+	/// - [`ClusterError::SignerMismatch`] -- a different signer already holds this hive id.
+	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
+	pub fn register(&self, request: RegisterHiveRequest, signer_id: SharedId) -> Result<(), ClusterError> {
 		let hive_id: SharedId = request.hive_addr.into();
 
 		// Index by servlet TYPE: instance URNs collapse onto their type
@@ -225,7 +219,7 @@ impl HiveRegistry {
 			.collect();
 
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
-		let signer_id_ref = signer_id.clone();
+		let claimed = Arc::clone(&signer_id);
 
 		let address = Arc::clone(&hive_id);
 		let entry_servlet_types = Arc::clone(&servlet_types);
@@ -240,7 +234,7 @@ impl HiveRegistry {
 		};
 
 		let mut members = self.members.write()?;
-		if !members.admits_signer(hive_id.as_ref(), signer_id_ref.as_ref()) {
+		if !members.admits_signer(hive_id.as_ref(), &claimed) {
 			return Err(ClusterError::SignerMismatch);
 		}
 
@@ -347,6 +341,12 @@ mod tests {
 	use crate::colony::common::ColonyNamespace;
 	use crate::colony::hive::ServletInfo;
 
+	/// The signer every fixture registration binds. Registration always
+	/// names one, so the tests name one too.
+	fn test_signer() -> SharedId {
+		Arc::from(b"test-signer".as_slice())
+	}
+
 	fn request(addr: &[u8], servlets: &[&str]) -> RegisterHiveRequest {
 		let namespace = ColonyNamespace::default();
 		RegisterHiveRequest {
@@ -371,7 +371,7 @@ mod tests {
 	#[test]
 	fn register_deduplicates_type_index() -> Result<(), ClusterError> {
 		let registry = HiveRegistry::default();
-		registry.register(request(b"hive1", &["ping", "ping"]))?;
+		registry.register(request(b"hive1", &["ping", "ping"]), test_signer())?;
 
 		let hives = registry.hives_for_type(&type_key("ping"))?;
 		assert_eq!(hives.len(), 1);
@@ -386,7 +386,7 @@ mod tests {
 	fn evict_stale_behavior() -> Result<(), ClusterError> {
 		for &(ttl, evicted_len, remaining_len) in EVICT_STALE_CASES {
 			let registry = HiveRegistry::new(ttl);
-			registry.register(request(b"hive1", &["ping"]))?;
+			registry.register(request(b"hive1", &["ping"]), test_signer())?;
 
 			std::thread::sleep(Duration::from_millis(1));
 
@@ -399,55 +399,35 @@ mod tests {
 	}
 
 	struct SignerRebindCase {
-		first: Option<&'static [u8]>,
-		second: Option<&'static [u8]>,
+		first: &'static [u8],
+		second: &'static [u8],
 		expect_ok: bool,
-		bound_after: Option<&'static [u8]>,
 	}
 
+	/// An unbound hive is absent from this table because it is absent from
+	/// the type: every registration binds a signer.
 	fn signer_rebind_cases() -> Vec<SignerRebindCase> {
 		vec![
-			SignerRebindCase {
-				first: Some(b"sid-a"),
-				second: Some(b"sid-b"),
-				expect_ok: false,
-				bound_after: Some(b"sid-a"),
-			},
-			SignerRebindCase {
-				first: Some(b"sid-a"),
-				second: Some(b"sid-a"),
-				expect_ok: true,
-				bound_after: Some(b"sid-a"),
-			},
-			SignerRebindCase {
-				first: None,
-				second: Some(b"sid-a"),
-				expect_ok: true,
-				bound_after: Some(b"sid-a"),
-			},
-			SignerRebindCase {
-				first: Some(b"sid-a"),
-				second: None,
-				expect_ok: false,
-				bound_after: Some(b"sid-a"),
-			},
+			SignerRebindCase { first: b"sid-a", second: b"sid-b", expect_ok: false },
+			SignerRebindCase { first: b"sid-a", second: b"sid-a", expect_ok: true },
 		]
 	}
 
 	#[test]
-	fn register_with_signer_rejects_cross_signer_hijack() -> Result<(), ClusterError> {
+	fn register_rejects_cross_signer_hijack() -> Result<(), ClusterError> {
 		for case in signer_rebind_cases() {
 			let registry = HiveRegistry::new(Duration::from_secs(3600));
-			registry.register_with_signer(request(b"hive1", &["ping"]), case.first.map(Arc::from))?;
+			registry.register(request(b"hive1", &["ping"]), Arc::from(case.first))?;
 
-			let result = registry.register_with_signer(request(b"hive1", &["ping"]), case.second.map(Arc::from));
+			let result = registry.register(request(b"hive1", &["ping"]), Arc::from(case.second));
 			assert_eq!(result.is_ok(), case.expect_ok);
 			if !case.expect_ok {
 				assert!(matches!(result, Err(ClusterError::SignerMismatch)));
 			}
 
+			// The signer bound first always survives the attempt.
 			let bound = registry.signer_for(b"hive1")?;
-			assert_eq!(bound.as_deref(), case.bound_after);
+			assert_eq!(bound.as_deref(), Some(case.first));
 		}
 
 		Ok(())
@@ -467,12 +447,11 @@ mod tests {
 
 			let one = Arc::clone(&registry);
 			let one_signer = Arc::clone(&first);
-			let left = thread::spawn(move || one.register_with_signer(request(contested, &["echo"]), Some(one_signer)));
+			let left = thread::spawn(move || one.register(request(contested, &["echo"]), one_signer));
 
 			let two = Arc::clone(&registry);
 			let two_signer = Arc::clone(&second);
-			let right =
-				thread::spawn(move || two.register_with_signer(request(contested, &["echo"]), Some(two_signer)));
+			let right = thread::spawn(move || two.register(request(contested, &["echo"]), two_signer));
 
 			let outcomes = [left.join().expect("thread joins"), right.join().expect("thread joins")];
 			let accepted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
@@ -490,9 +469,8 @@ mod tests {
 	#[test]
 	fn unregister_clears_the_type_index() -> Result<(), ClusterError> {
 		let registry = HiveRegistry::default();
-		registry.register(request(b"hive-a", &["echo"]))?;
+		registry.register(request(b"hive-a", &["echo"]), test_signer())?;
 		registry.unregister(b"hive-a")?;
-
 		assert!(registry.hives_for_type(&type_key("echo"))?.is_empty());
 		assert!(registry.to_available_servlets()?.is_empty());
 		Ok(())

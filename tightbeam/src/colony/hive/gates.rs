@@ -479,7 +479,13 @@ impl GatePolicy for ClusterSecurityGate {
 		// reached here before the signature was checked. [`ProvenPeer`] is
 		// the only key the breaker accepts, so a caller who copies a
 		// trusted `SignerIdentifier` spends its own budget (CWE-345).
-		let breaker_key = session.proven_peer();
+		//
+		// An unauthenticated transport offers no such key. Sharing one row
+		// across every anonymous caller would let a single bad signature
+		// deny the rest, so this plane requires a proven peer (CWE-645).
+		let Some(breaker_key) = session.proven_peer() else {
+			return TransitStatus::Unauthenticated;
+		};
 
 		if !self.circuit_breaker.allow_request(breaker_key) {
 			return TransitStatus::PermissionDenied;

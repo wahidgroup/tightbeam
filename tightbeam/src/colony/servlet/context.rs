@@ -8,6 +8,7 @@ use crate::colony::hive::HiveContext;
 use crate::colony::worker::{Worker, WorkerMetadata};
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
+use crate::frame::BodyTransform;
 use crate::router::RouterError;
 use crate::trace::TraceCollector;
 use crate::{Frame, TightBeamError};
@@ -127,14 +128,16 @@ impl Frame {
 	/// - [`RouterError::CompressedFrame`]: compressed body, no inflator.
 	/// - Decryption or decompression errors from the configured implementations.
 	pub fn prepare_typed(&mut self, ctx: &ServletContext) -> Result<(), TightBeamError> {
-		if self.metadata.confidentiality.is_some() {
-			let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
-			self.decrypt_in_place(decryptor, ctx.message_inflator())?;
-			return Ok(());
-		}
-		if self.metadata.compactness.is_some() {
-			let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
-			self.inflate_in_place(inflator)?;
+		match self.body_transform() {
+			Some(BodyTransform::Decrypt) => {
+				let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
+				self.decrypt_in_place(decryptor, ctx.message_inflator())?;
+			}
+			Some(BodyTransform::Inflate) => {
+				let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
+				self.inflate_in_place(inflator)?;
+			}
+			None => {}
 		}
 
 		Ok(())

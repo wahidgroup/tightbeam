@@ -38,12 +38,17 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
 
+		// A hive registered with no signer is claimable by the next signer
+		// that names it, so an identifier that does not encode refuses here
+		// rather than installing an unbound entry (CWE-639).
+		let Some(signer_id) = frame.signer_id().map(Arc::from) else {
+			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
+		};
+
 		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
 		let slate = self.config.pheromone.servlet_slate(&request.servlet_addresses, &hive_addr);
-		let signer_id = frame.signer_id().map(Arc::from);
-
 		// Atomic: hive entry + full slate, or roll back. Re-register replaces prior rows.
-		let registered = self.registry.register_with_signer(request, signer_id).and_then(|()| {
+		let registered = self.registry.register(request, signer_id).and_then(|()| {
 			self.servlet_registry.reconcile_by_hive(&hive_addr, slate).inspect_err(|_| {
 				let _ = self.registry.unregister(&hive_addr);
 				let _ = self.servlet_registry.remove_by_hive(&hive_addr);

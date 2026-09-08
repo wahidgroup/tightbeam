@@ -1,10 +1,8 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use crate::frame::BodyTransform;
 use crate::{Frame, Message};
-
-#[cfg(feature = "derive")]
-use crate::Errorizable;
 
 /// Single `Arc` spelling for both std and no_std builds so [`crate::routes!`]
 /// can emit one `dispatch` body via `$crate::router::Arc`.
@@ -15,23 +13,15 @@ pub use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, RouterError>;
 
-#[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]
 pub enum RouterError {
-	#[cfg_attr(feature = "derive", error("No route configured for provided message"))]
 	UnknownRoute,
-	#[cfg_attr(
-		feature = "derive",
-		error("Frame body failed to decode as the dispatched type: {0}")
-	)]
 	DecodeFailed(crate::der::Error),
-	#[cfg_attr(feature = "derive", error("Frame body is encrypted; decrypt before routing"))]
 	ConfidentialFrame,
-	#[cfg_attr(feature = "derive", error("Frame body is compressed; inflate before routing"))]
 	CompressedFrame,
 }
 
-crate::impl_error_display!(RouterError {
+crate::impl_error_display!(unconditional RouterError {
 	UnknownRoute => "No route configured for provided message",
 	DecodeFailed(source) => "Frame body failed to decode as the dispatched type: {source}",
 	ConfidentialFrame => "Frame body is encrypted; decrypt before routing",
@@ -39,6 +29,47 @@ crate::impl_error_display!(RouterError {
 });
 
 crate::impl_from!(crate::der::Error => RouterError::DecodeFailed);
+
+/// A frame whose body a router may decode.
+///
+/// Minting is [`CleartextFrame::admit`] alone. An encrypted or compressed
+/// body is opaque bytes, so a decode against the dispatched type either
+/// fails confusingly or succeeds against a structurally similar type and
+/// misdelivers in silence. Carrying the proof in the type means a caller
+/// who invokes [`RouterPolicy::dispatch_cleartext`] directly still cannot
+/// reach a decode with an opaque body (CWE-345).
+pub struct CleartextFrame(Arc<Frame>);
+
+impl CleartextFrame {
+	/// Admit `frame` for routing.
+	///
+	/// Decrypt or inflate upstream through
+	/// [`Frame::prepare_typed`](crate::Frame::prepare_typed), then admit.
+	///
+	/// # Errors
+	///
+	/// - [`RouterError::ConfidentialFrame`] -- `metadata.confidentiality` is set.
+	/// - [`RouterError::CompressedFrame`] -- `metadata.compactness` is set.
+	pub fn admit(frame: Arc<Frame>) -> Result<Self> {
+		match frame.body_transform() {
+			Some(BodyTransform::Decrypt) => Err(RouterError::ConfidentialFrame),
+			Some(BodyTransform::Inflate) => Err(RouterError::CompressedFrame),
+			None => Ok(Self(frame)),
+		}
+	}
+
+	/// The admitted frame, for the decode and for metadata reads.
+	#[must_use]
+	pub fn frame(&self) -> &Frame {
+		&self.0
+	}
+
+	/// The admitted frame as the shared handle a handler keeps.
+	#[must_use]
+	pub fn into_shared(self) -> Arc<Frame> {
+		self.0
+	}
+}
 
 pub trait RouterPolicy: Send + Sync {
 	/// Route `frame` to the handler registered for message type `T`,
@@ -48,7 +79,7 @@ pub trait RouterPolicy: Send + Sync {
 	/// typed value to the handler, so a mismatched turbofish fails
 	/// loudly at the dispatch site instead of silently delivering
 	/// foreign bytes. Opaque payloads are rejected before any decode
-	/// attempt (see [`Frame::ensure_cleartext`]).
+	/// attempt (see [`CleartextFrame`]).
 	///
 	/// Residual: two DER-structurally-identical types still cross-decode
 	/// (the wire format carries no type discriminator by design -- the
@@ -57,28 +88,23 @@ pub trait RouterPolicy: Send + Sync {
 	///
 	/// # Errors
 	///
-	/// - [`RouterError::ConfidentialFrame`] -- body is encrypted.
-	/// - [`RouterError::CompressedFrame`] -- body is compressed.
+	/// - The [`CleartextFrame::admit`] set, for a body still opaque.
 	/// - [`RouterError::DecodeFailed`] -- body did not decode as `T`.
 	/// - [`RouterError::UnknownRoute`] -- no handler registered for `T`.
 	fn dispatch<T: Message + Send + 'static>(&self, frame: Arc<Frame>) -> Result<()> {
-		frame.ensure_cleartext()?;
-
-		self.dispatch_cleartext::<T>(frame)
+		self.dispatch_cleartext::<T>(CleartextFrame::admit(frame)?)
 	}
 
-	/// Deliver a frame whose body [`dispatch`](Self::dispatch) already
-	/// admitted as cleartext.
+	/// Deliver a frame the [`CleartextFrame`] boundary already admitted.
 	///
-	/// Implementations decode and route. The opaque-body guard runs in
-	/// `dispatch`, so an implementation reaches this method with a
-	/// cleartext body by construction.
+	/// Implementations decode and route. The parameter type is the proof,
+	/// so this method cannot be reached with an opaque body.
 	///
 	/// # Errors
 	///
 	/// - [`RouterError::DecodeFailed`] -- body did not decode as `T`.
 	/// - [`RouterError::UnknownRoute`] -- no handler registered for `T`.
-	fn dispatch_cleartext<T: Message + Send + 'static>(&self, frame: Arc<Frame>) -> Result<()>;
+	fn dispatch_cleartext<T: Message + Send + 'static>(&self, frame: CleartextFrame) -> Result<()>;
 }
 
 /// Declare a router struct and its [`RouterPolicy`] impl.
@@ -100,12 +126,13 @@ macro_rules! routes {
 		impl $crate::router::RouterPolicy for $RouterName {
 			fn dispatch_cleartext<T: $crate::Message + Send + 'static>(
 				&self,
-				frame: $crate::router::Arc<$crate::Frame>,
+				frame: $crate::router::CleartextFrame,
 			) -> $crate::router::Result<()> {
 				$(
 					if core::any::TypeId::of::<T>() == core::any::TypeId::of::<$MsgTy>() {
-						let decoded: $MsgTy = $crate::der::Decode::from_der(frame.message.as_slice())?;
-						let ($router, $frame, $msg) = (self, frame, decoded);
+						let decoded: $MsgTy =
+							$crate::der::Decode::from_der(frame.frame().message.as_slice())?;
+						let ($router, $frame, $msg) = (self, frame.into_shared(), decoded);
 						{ $handler }
 						return Ok(());
 					}
@@ -114,35 +141,6 @@ macro_rules! routes {
 			}
 		}
 	};
-}
-
-impl Frame {
-	/// Reject frames whose body cannot be type-validated at routing time.
-	///
-	/// The router reads cleartext only. An encrypted or compressed body is
-	/// opaque bytes, so a decode against the dispatched type either fails
-	/// confusingly or succeeds against a structurally similar type and
-	/// misdelivers in silence. Decrypt or inflate upstream through
-	/// [`Frame::prepare_typed`](crate::Frame::prepare_typed), then route.
-	///
-	/// [`RouterPolicy::dispatch`] applies this guard for every
-	/// implementation, so a router reaches its decode with a cleartext
-	/// body by construction.
-	///
-	/// # Errors
-	///
-	/// - [`RouterError::ConfidentialFrame`] -- `metadata.confidentiality` is set.
-	/// - [`RouterError::CompressedFrame`] -- `metadata.compactness` is set.
-	pub fn ensure_cleartext(&self) -> Result<()> {
-		if self.metadata.confidentiality.is_some() {
-			return Err(RouterError::ConfidentialFrame);
-		}
-		if self.metadata.compactness.is_some() {
-			return Err(RouterError::CompressedFrame);
-		}
-
-		Ok(())
-	}
 }
 
 #[cfg(all(test, feature = "builder"))]
@@ -270,6 +268,54 @@ mod tests {
 		Ok(())
 	}
 
+	/// A policy that decodes whatever it is handed, with no guard of its own.
+	///
+	/// Stands in for a consumer implementing [`RouterPolicy`] by hand: the
+	/// guard must come from the seam, not from this implementation.
+	struct NaiveRouter {
+		seen: std::sync::Mutex<usize>,
+	}
+
+	impl RouterPolicy for NaiveRouter {
+		fn dispatch_cleartext<T: crate::Message + Send + 'static>(
+			&self,
+			frame: crate::router::CleartextFrame,
+		) -> crate::router::Result<()> {
+			let _ = frame.into_shared();
+			let mut seen = self.seen.lock().unwrap_or_else(|err| err.into_inner());
+			*seen += 1;
+			Ok(())
+		}
+	}
+
+	fn confidential(mut frame: Frame) -> Result<Frame, Box<dyn std::error::Error>> {
+		frame.metadata.confidentiality = Some(EncryptedContentInfo {
+			content_type: DATA,
+			content_enc_alg: AlgorithmIdentifier { oid: DATA, parameters: None },
+			encrypted_content: Some(OctetString::new(vec![0; 16])?),
+		});
+		Ok(frame)
+	}
+
+	#[test]
+	fn hand_written_policy_never_sees_a_confidential_frame() -> Result<(), Box<dyn std::error::Error>> {
+		let router = NaiveRouter { seen: std::sync::Mutex::new(0) };
+		let opaque = router.dispatch::<Payment>(Arc::new(confidential(compose_payment(0)?)?));
+		assert!(matches!(opaque, Err(RouterError::ConfidentialFrame)));
+		assert_eq!(*router.seen.lock().unwrap_or_else(|err| err.into_inner()), 0);
+		Ok(())
+	}
+
+	#[test]
+	fn admit_refuses_a_confidential_body() -> Result<(), Box<dyn std::error::Error>> {
+		let frame = Arc::new(confidential(compose_payment(0)?)?);
+		assert!(matches!(
+			crate::router::CleartextFrame::admit(frame),
+			Err(RouterError::ConfidentialFrame)
+		));
+		Ok(())
+	}
+
 	#[test]
 	fn dispatch_rejects_confidential_frame() -> Result<(), Box<dyn std::error::Error>> {
 		let (router, payment_rx, _health_rx) = build_router();
@@ -293,7 +339,6 @@ mod tests {
 	#[test]
 	fn dispatch_rejects_compressed_frame() -> Result<(), Box<dyn std::error::Error>> {
 		let (router, _payment_rx, _health_rx) = build_router();
-
 		let mut frame = compose_payment(0)?;
 		frame.metadata.compactness = Some(CompressedData {
 			version: CmsVersion::V0,

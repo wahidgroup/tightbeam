@@ -95,7 +95,37 @@ impl EncodeValue for TbsScaffold<'_> {
 	}
 }
 
+/// The transform a frame body still needs before a decode.
+///
+/// Read through [`Frame::body_transform`]. Each caller maps this to its
+/// own policy: the router refuses, a servlet applies the transform.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BodyTransform {
+	/// Encrypted. Decrypting also inflates a body that was compressed
+	/// before encryption.
+	Decrypt,
+	/// Compressed only.
+	Inflate,
+}
+
 impl Frame {
+	/// The transform this body still needs before a decode.
+	///
+	/// [`None`] means the body is already decodable. Confidentiality is
+	/// reported first: an encrypted body may also be compressed, and the
+	/// inflate follows the decrypt rather than replacing it.
+	#[must_use]
+	pub fn body_transform(&self) -> Option<BodyTransform> {
+		if self.metadata.confidentiality.is_some() {
+			return Some(BodyTransform::Decrypt);
+		}
+		if self.metadata.compactness.is_some() {
+			return Some(BodyTransform::Inflate);
+		}
+
+		None
+	}
+
 	/// DER encoding of the `SignerIdentifier` this frame claims.
 	///
 	/// Per-signer budgets, replay slots, refusal journals, and gossip

@@ -37,7 +37,10 @@ pub struct ScalingLoop<P: Protocol> {
 	/// Intra-hive route maps updated when instances appear or leave.
 	pub hive_context: Arc<HiveContextImpl<P>>,
 	/// Hive control-plane address that mints the hive URN.
-	pub hive_addr: P::Address,
+	///
+	/// [`None`] for a hive with no control plane, which scales its own
+	/// servlets but announces to no cluster.
+	pub hive_addr: Option<P::Address>,
 	/// Scaling thresholds, cooldowns, and notify retry policy.
 	pub config: HiveConfig,
 	/// Owner of the gateway notifications this loop starts.
@@ -69,15 +72,12 @@ where
 		} = self;
 
 		let config = Arc::new(config);
-		let link = ClusterLink::<P>::new(
-			Arc::clone(&servlets),
-			Arc::clone(&cluster_addrs),
-			hive_addr,
-			Arc::clone(&config),
-		);
+		let link = hive_addr.map(|addr| {
+			ClusterLink::<P>::new(Arc::clone(&servlets), Arc::clone(&cluster_addrs), addr, Arc::clone(&config))
+		});
 		let evaluation_period = config.scaling.cooldown;
 		let task = ScalingTask {
-			hive_urn: config.hive_urn(hive_addr).map(Arc::new),
+			hive_urn: hive_addr.and_then(|addr| config.hive_urn(addr)).map(Arc::new),
 			servlets,
 			trace,
 			utilization,
@@ -177,7 +177,7 @@ struct ScalingTask<P: Protocol> {
 	utilization: Arc<AtomicU16>,
 	utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
 	hive_context: Arc<HiveContextImpl<P>>,
-	link: ClusterLink<P>,
+	link: Option<ClusterLink<P>>,
 	hive_urn: Option<Arc<Urn<'static>>>,
 	config: Arc<HiveConfig>,
 	tasks: TaskGroup,
@@ -198,7 +198,7 @@ where
 	/// Without that identity a watching gateway would keep a slate this
 	/// hive has moved past, so scaling waits until the gateway list empties.
 	fn scale_blocked(&self) -> bool {
-		self.hive_urn.is_none() && self.link.has_gateways()
+		self.hive_urn.is_none() && self.link.as_ref().is_some_and(|link| link.has_gateways())
 	}
 
 	/// Instance count and summed utilization for one servlet type.
@@ -284,7 +284,14 @@ where
 	}
 
 	/// Announces one slate change to every registered gateway.
+	///
+	/// A hive with no control plane reaches no gateway, so the change stays
+	/// local to its own registry.
 	fn announce(&self, change: ServletChange) {
-		self.link.notify_scaling(&self.tasks, self.hive_urn.as_ref(), change);
+		let Some(link) = self.link.as_ref() else {
+			return;
+		};
+
+		link.notify_scaling(&self.tasks, self.hive_urn.as_ref(), change);
 	}
 }
