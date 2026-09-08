@@ -74,7 +74,7 @@ help-body:
 	@printf '    dry-run         If set (e.g., dry-run=1), preview release without changes\n'
 	@printf '    allow-staged    If set (e.g., allow-staged=1), include staged files in release\n'
 	@printf '    yank            If set (e.g., yank=1), yank a published release instead\n'
-	@printf '    derive          If set (e.g., derive=1), check-yanked targets tightbeam-derive\n'
+	@printf '    derive          If set (e.g., derive=1), check-yanked and check-semver target tightbeam-derive\n'
 	@printf 'EXAMPLES:\n'
 	@printf '    make build features="std,tcp,tokio"\n'
 	@printf '    make test no-default=1 features="testing"\n'
@@ -199,4 +199,4 @@ check-yanked:
 
 check-semver: setup
 	@echo "Checking the public API against the published baseline..."
-	cargo semver-checks check-release --package tightbeam-rs
+	cargo semver-checks check-release --package $(if $(filter 1,$(derive)),tightbeam-derive,tightbeam-rs)

@@ -59,9 +59,7 @@ count_files() {
 	fi
 }
 
-TOTAL_CRASHES=0
-TOTAL_HANGS=0
-FAILED_TARGETS=()
+FAILURES=()
 
 for FUZZ_TARGET in "${FUZZ_TARGETS[@]}"; do
 	NAME=$(basename "$FUZZ_TARGET")
@@ -84,7 +82,8 @@ for FUZZ_TARGET in "${FUZZ_TARGETS[@]}"; do
 
 	RESULTS="$OUT_DIR/default"
 	if [ ! -d "$RESULTS" ]; then
-		echo "[$NAME] no output generated, the fuzzer may have exited early"
+		echo "[$NAME] no output directory, the fuzzer did not start"
+		FAILURES+=("$NAME: produced no output, so this target was never fuzzed")
 		echo ""
 		continue
 	fi
@@ -94,27 +93,34 @@ for FUZZ_TARGET in "${FUZZ_TARGETS[@]}"; do
 	QUEUE=$(count_files "$RESULTS/queue")
 	echo "[$NAME] cases: $QUEUE  crashes: $CRASHES  hangs: $HANGS"
 
-	if [ -f "$RESULTS/fuzzer_stats" ]; then
-		EXECS=$(awk '/^execs_done/ {print $3}' "$RESULTS/fuzzer_stats")
-		BITMAP=$(awk '/^bitmap_cvg/ {print $3}' "$RESULTS/fuzzer_stats")
-		STABILITY=$(awk '/^stability/ {print $3}' "$RESULTS/fuzzer_stats")
-		echo "[$NAME] execs: $EXECS  coverage: $BITMAP  stability: $STABILITY"
+	# AFL writes fuzzer_stats for every run it starts. A missing file, or a
+	# zero execution count, means the target came up and did no work.
+	if [ ! -f "$RESULTS/fuzzer_stats" ]; then
+		echo "[$NAME] no fuzzer_stats, the run ended before reporting"
+		FAILURES+=("$NAME: wrote no fuzzer_stats, so this target was never fuzzed")
+		echo ""
+		continue
 	fi
 
-	TOTAL_CRASHES=$((TOTAL_CRASHES + CRASHES))
-	TOTAL_HANGS=$((TOTAL_HANGS + HANGS))
+	EXECS=$(awk '/^execs_done/ {print $3}' "$RESULTS/fuzzer_stats")
+	BITMAP=$(awk '/^bitmap_cvg/ {print $3}' "$RESULTS/fuzzer_stats")
+	STABILITY=$(awk '/^stability/ {print $3}' "$RESULTS/fuzzer_stats")
+	echo "[$NAME] execs: $EXECS  coverage: $BITMAP  stability: $STABILITY"
+
+	if [ -z "$EXECS" ] || [ "$EXECS" -eq 0 ]; then
+		FAILURES+=("$NAME: executed 0 inputs, so this target was never fuzzed")
+	fi
+
 	if [ "$CRASHES" -gt 0 ] || [ "$HANGS" -gt 0 ]; then
-		FAILED_TARGETS+=("$NAME")
+		FAILURES+=("$NAME: $CRASHES crash(es), $HANGS hang(s) in $RESULTS")
 	fi
 	echo ""
 done
 
-if [ "$TOTAL_CRASHES" -gt 0 ] || [ "$TOTAL_HANGS" -gt 0 ]; then
-	echo "FAILED: $TOTAL_CRASHES crash(es) and $TOTAL_HANGS hang(s)" >&2
-	for NAME in "${FAILED_TARGETS[@]}"; do
-		echo "  $NAME: built/fuzz/out/$NAME/default/" >&2
-	done
+if [ "${#FAILURES[@]}" -gt 0 ]; then
+	echo "FAILED: ${#FAILURES[@]} of ${#FUZZ_TARGETS[@]} target(s)" >&2
+	printf '  %s\n' "${FAILURES[@]}" >&2
 	exit 1
 fi
 
-echo "All ${#FUZZ_TARGETS[@]} target(s) finished with no crashes and no hangs."
+echo "All ${#FUZZ_TARGETS[@]} target(s) fuzzed with no crashes and no hangs."
