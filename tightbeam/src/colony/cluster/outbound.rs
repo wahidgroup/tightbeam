@@ -6,19 +6,18 @@
 
 use std::sync::Arc;
 
+use crate::colony::cluster::ClusterTlsConfig;
+use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::x509::error::CertificateValidationError;
+use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
 use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::Protocol;
-use crate::TightBeamError;
-
-use crate::colony::cluster::ClusterTlsConfig;
-use crate::crypto::policy::VerificationPolicy;
-use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::policy::CertificateValidation;
 use crate::SignerInfo;
+use crate::TightBeamError;
 
 type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
 type ClusterKey = HandshakeKeyManager<DefaultCryptoProvider>;
@@ -41,38 +40,6 @@ pub struct ClusterPools<P: Protocol> {
 /// type, so passing them positionally would let a swap compile and
 /// cross the trust planes.
 #[doc(hidden)]
-pub fn build_cluster_pools<P>(
-	pool_config: PoolConfig,
-	tls: &ClusterTlsConfig,
-) -> Result<ClusterPools<P>, TightBeamError>
-where
-	P: Protocol + Send + Sync + 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
-	P::Transport: Send + Sync,
-{
-	let certificate = Arc::new(Certificate::try_from(tls.certificate.clone())?);
-	let key = Arc::new(ClusterKey::new(Arc::clone(&tls.key)));
-
-	let hive_pool = build_one::<P>(
-		pool_config.clone(),
-		Arc::clone(&certificate),
-		Arc::clone(&key),
-		tls.hive_trust
-			.as_ref()
-			.map(|trust| validated_trust(Arc::clone(trust), &tls.validators)),
-	);
-	let peer_pool = tls.peer_trust.as_ref().map(|trust| {
-		build_one::<P>(
-			pool_config,
-			Arc::clone(&certificate),
-			Arc::clone(&key),
-			Some(validated_trust(Arc::clone(trust), &tls.validators)),
-		)
-	});
-
-	Ok(ClusterPools { hive: hive_pool, peer: peer_pool })
-}
-
 /// Outbound trust store composed with the operator validator chain.
 ///
 /// The handshake client validates the server identity through the pool
@@ -160,26 +127,59 @@ fn validated_trust(
 	Arc::new(ValidatedTrust { store, validators: validators.iter().map(Arc::clone).collect() })
 }
 
-fn build_one<P>(
-	pool_config: PoolConfig,
-	certificate: Arc<Certificate>,
-	key: Arc<ClusterKey>,
-	trust: Option<Arc<dyn CertificateTrust>>,
-) -> Arc<ClusterPool<P>>
-where
-	P: Protocol + Send + Sync + 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
-	P::Transport: Send + Sync,
-{
-	let mut builder = ClusterPool::<P>::builder()
-		.with_config(pool_config)
-		.with_shared_client_identity(certificate, key);
+impl PoolConfig {
+	/// One outbound pool on this configuration, presenting `certificate`
+	/// and `key` and validating servers against `trust`.
+	fn build_one<P>(
+		&self,
+		certificate: Arc<Certificate>,
+		key: Arc<ClusterKey>,
+		trust: Option<Arc<dyn CertificateTrust>>,
+	) -> Arc<ClusterPool<P>>
+	where
+		P: Protocol + Send + Sync + 'static,
+		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
+		P::Transport: Send + Sync,
+	{
+		// `with_config` takes the config by value. `PoolConfig` is two scalars
+		// and a refcounted mux offer, so the copy is a pointer bump.
+		let mut builder = ClusterPool::<P>::builder()
+			.with_config(self.clone())
+			.with_shared_client_identity(certificate, key);
 
-	if let Some(store) = trust {
-		builder = builder.with_trust_store(store);
+		if let Some(store) = trust {
+			builder = builder.with_trust_store(store);
+		}
+
+		Arc::new(builder.build())
 	}
 
-	Arc::new(builder.build())
+	pub fn build_cluster_pools<P>(&self, tls: &ClusterTlsConfig) -> Result<ClusterPools<P>, TightBeamError>
+	where
+		P: Protocol + Send + Sync + 'static,
+		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
+		P::Transport: Send + Sync,
+	{
+		let (cert, key_manager) = tls.identity()?;
+		let certificate = Arc::new(cert);
+		let key = Arc::new(key_manager);
+		let hive_pool = self.build_one::<P>(
+			Arc::clone(&certificate),
+			Arc::clone(&key),
+			tls.hive_trust
+				.as_ref()
+				.map(|trust| validated_trust(Arc::clone(trust), &tls.validators)),
+		);
+		let peer_pool = tls.peer_trust.as_ref().map(|trust| {
+			self.build_one::<P>(
+				Arc::clone(&certificate),
+				Arc::clone(&key),
+				Some(validated_trust(Arc::clone(trust), &tls.validators)),
+			)
+		});
+
+		Ok(ClusterPools { hive: hive_pool, peer: peer_pool })
+	}
 }
 
 #[cfg(test)]
@@ -226,7 +226,6 @@ mod tests {
 		let cert = create_test_certificate(&create_test_signing_key());
 		let store = trust_of(&cert);
 		let chain = [cert];
-
 		assert!(store.verify_chain(&chain).is_ok());
 
 		let composed = validated_trust(store, &[Arc::new(RejectAll)]);

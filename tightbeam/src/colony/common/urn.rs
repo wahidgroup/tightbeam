@@ -31,6 +31,7 @@
 
 use std::borrow::Cow;
 
+use crate::colony::common::ServletInfo;
 use crate::utils::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
@@ -158,6 +159,38 @@ impl ColonyNamespace {
 		Ok(self.mint(HIVE_SEGMENT, addr))
 	}
 
+	/// Mint the hive URN for a locator carried as bytes.
+	///
+	/// [`None`] where the bytes are not UTF-8 or the locator is refused by
+	/// [`Self::hive`]. Wire and configuration both hand the locator over as
+	/// bytes, so both reach the URN through one decode.
+	pub(crate) fn hive_from_bytes(&self, addr: &[u8]) -> Option<Urn<'static>> {
+		let addr = core::str::from_utf8(addr).ok()?;
+		self.hive(addr).ok()
+	}
+
+	/// Whether every URN in `types` is a bare servlet type in this namespace.
+	///
+	/// A peer advertises the types it serves, so one foreign or instance
+	/// URN in the list refuses the whole advertisement.
+	pub(crate) fn all_bare_servlet_types(&self, types: &[Urn<'static>]) -> bool {
+		types.iter().all(|urn| self.is_bare_servlet_type(urn))
+	}
+
+	/// Whether the instance locator inside `info.servlet_id` equals the
+	/// address advertised alongside it.
+	///
+	/// A servlet that advertises one address under the identity of another
+	/// redirects that identity's traffic (CWE-639), so the two MUST agree.
+	pub(crate) fn locator_matches(&self, info: &ServletInfo) -> bool {
+		match self.validate(&info.servlet_id) {
+			Ok(ColonyResource::Servlet { instance: Some(locator), .. }) => {
+				locator.as_bytes() == info.address.as_slice()
+			}
+			_ => false,
+		}
+	}
+
 	fn mint(&self, resource_type: &str, id: &str) -> Urn<'static> {
 		Urn {
 			nid: Cow::Owned(String::from(self.nid.as_ref())),
@@ -222,64 +255,71 @@ impl ColonyNamespace {
 	}
 }
 
-/// Mint the instance URN under a servlet type: the type's URN with a
-/// `/{addr}` tail. Authority and realm are inherited from the type, so
-/// no namespace handle is needed.
-pub fn servlet_instance(servlet_type: &Urn<'_>, addr: impl AsRef<str>) -> Urn<'static> {
-	Urn {
-		nid: Cow::Owned(String::from(servlet_type.nid.as_ref())),
-		nss: Cow::Owned(format!("{}/{}", servlet_type.nss, addr.as_ref())),
+impl Urn<'_> {
+	/// Mint the instance URN under a servlet type: the type's URN with a
+	/// `/{addr}` tail. Authority and realm are inherited from the type, so
+	/// no namespace handle is needed.
+	pub fn servlet_instance(&self, addr: impl AsRef<str>) -> Urn<'static> {
+		Urn {
+			nid: Cow::Owned(String::from(self.nid.as_ref())),
+			nss: Cow::Owned(format!("{}/{}", self.nss, addr.as_ref())),
+		}
+	}
+
+	/// Servlet-type URN with the instance locator as the resource-id tail.
+	///
+	/// # Errors
+	///
+	/// - [`UrnValidationError::InvalidFormat`] -- `addr_bytes` is not UTF-8.
+	pub fn instance_urn(&self, addr_bytes: impl AsRef<[u8]>) -> Result<Urn<'static>, TightBeamError> {
+		let addr = core::str::from_utf8(addr_bytes.as_ref()).map_err(|_| {
+			TightBeamError::UrnValidationError(UrnValidationError::InvalidFormat {
+				field: "resource-id",
+				pattern: None,
+			})
+		})?;
+
+		Ok(self.servlet_instance(addr))
+	}
+
+	/// Canonical bytes of a URN: its display form (`urn:nid:nss`).
+	///
+	/// Registries key by this form so lookups agree across processes
+	/// regardless of how the URN was built.
+	pub fn canonical_bytes(&self) -> Vec<u8> {
+		self.to_string().into_bytes()
+	}
+
+	/// Canonical bytes with any instance tail stripped: the type key an
+	/// instance belongs to. NID, realm, and servlet name exclude `/`, so
+	/// the first `/` in the canonical form always marks the tail.
+	pub fn type_canonical_bytes(&self) -> Vec<u8> {
+		let mut canonical = self.to_string();
+		if let Some(tail) = canonical.find('/') {
+			canonical.truncate(tail);
+		}
+
+		canonical.into_bytes()
+	}
+
+	/// Byte prefix matching every instance key under a servlet type: the
+	/// type's canonical bytes plus the tail delimiter. The delimiter keeps
+	/// one type's prefix from matching another type's keys (`beam` matches
+	/// `beam/...` alone, leaving `beam2/...` to its own type).
+	pub fn type_prefix_bytes(&self) -> Vec<u8> {
+		let mut prefix = self.type_canonical_bytes();
+		prefix.push(b'/');
+
+		prefix
 	}
 }
 
-/// Servlet-type URN with the instance locator as the resource-id tail.
-///
-/// # Errors
-///
-/// - [`UrnValidationError::InvalidFormat`] -- `addr_bytes` is not UTF-8.
-pub fn instance_urn(type_urn: &Urn<'_>, addr_bytes: impl AsRef<[u8]>) -> Result<Urn<'static>, TightBeamError> {
-	let addr = core::str::from_utf8(addr_bytes.as_ref()).map_err(|_| {
-		TightBeamError::UrnValidationError(UrnValidationError::InvalidFormat { field: "resource-id", pattern: None })
-	})?;
-
-	Ok(servlet_instance(type_urn, addr))
-}
-
-/// Whether `urn` is a bare servlet type in `namespace` (no instance tail)
-#[must_use]
-pub fn is_bare_servlet_type(namespace: &ColonyNamespace, urn: &Urn<'_>) -> bool {
-	matches!(namespace.validate(urn), Ok(ColonyResource::Servlet { instance: None, .. }))
-}
-
-/// Canonical bytes of a URN: its display form (`urn:nid:nss`).
-///
-/// Registries key by this form so lookups agree across processes
-/// regardless of how the URN was built.
-pub fn canonical_bytes(urn: &Urn<'_>) -> Vec<u8> {
-	urn.to_string().into_bytes()
-}
-
-/// Canonical bytes of a URN with any instance tail stripped: the type
-/// key an instance belongs to. NID, realm, and servlet name exclude
-/// contain `/`, so the first `/` in the canonical form always marks the
-/// start of the instance tail.
-pub fn type_canonical_bytes(urn: &Urn<'_>) -> Vec<u8> {
-	let mut canonical = urn.to_string();
-	if let Some(tail) = canonical.find('/') {
-		canonical.truncate(tail);
+impl ColonyNamespace {
+	/// Whether `urn` is a bare servlet type in this namespace (no tail).
+	#[must_use]
+	pub fn is_bare_servlet_type(&self, urn: &Urn<'_>) -> bool {
+		matches!(self.validate(urn), Ok(ColonyResource::Servlet { instance: None, .. }))
 	}
-
-	canonical.into_bytes()
-}
-
-/// Byte prefix matching every instance key under a servlet type: the
-/// type's canonical bytes plus the tail delimiter. The delimiter keeps
-/// one type's prefix from matching another type's keys (`beam` matches
-/// `beam/...` alone, leaving `beam2/...` to its own type).
-pub fn type_prefix_bytes(servlet_type: &Urn<'_>) -> Vec<u8> {
-	let mut prefix = type_canonical_bytes(servlet_type);
-	prefix.push(b'/');
-	prefix
 }
 
 #[cfg(test)]
@@ -315,7 +355,7 @@ mod tests {
 			),
 			(
 				&prod,
-				servlet_instance(&servlet(&prod, "beam"), "10.0.0.5:9100"),
+				servlet(&prod, "beam").servlet_instance("10.0.0.5:9100"),
 				"urn:tightbeam:prod-us:servlet:beam/10.0.0.5:9100",
 				ColonyResource::Servlet { name: "beam", instance: Some("10.0.0.5:9100") },
 			),
@@ -369,7 +409,7 @@ mod tests {
 				UrnValidationError::RequiredFieldMissing("resource-id"),
 			),
 			(
-				servlet_instance(&servlet(&namespace, "beam"), ""),
+				servlet(&namespace, "beam").servlet_instance(""),
 				UrnValidationError::RequiredFieldMissing("instance"),
 			),
 			(
@@ -410,20 +450,20 @@ mod tests {
 	fn type_canonical_bytes_strips_instance_tail() {
 		let namespace = prod();
 		let servlet_type = servlet(&namespace, "beam");
-		let instance = servlet_instance(&servlet_type, "10.0.0.5:9100");
+		let instance = servlet_type.servlet_instance("10.0.0.5:9100");
 
-		assert_eq!(type_canonical_bytes(&instance), canonical_bytes(&servlet_type));
-		assert_eq!(type_canonical_bytes(&servlet_type), canonical_bytes(&servlet_type));
+		assert_eq!(instance.type_canonical_bytes(), servlet_type.canonical_bytes());
+		assert_eq!(servlet_type.type_canonical_bytes(), servlet_type.canonical_bytes());
 	}
 
 	#[test]
 	fn type_prefix_bounds_instance_keys_to_one_type() {
 		let namespace = prod();
 		let beam = servlet(&namespace, "beam");
-		let beam_instance = canonical_bytes(&servlet_instance(&beam, "10.0.0.5:9100"));
-		let beam2_instance = canonical_bytes(&servlet_instance(&servlet(&namespace, "beam2"), "10.0.0.5:9200"));
+		let beam_instance = beam.servlet_instance("10.0.0.5:9100").canonical_bytes();
+		let beam2_instance = servlet(&namespace, "beam2").servlet_instance("10.0.0.5:9200").canonical_bytes();
 
-		let prefix = type_prefix_bytes(&beam);
+		let prefix = beam.type_prefix_bytes();
 		assert!(beam_instance.starts_with(&prefix));
 		assert!(!beam2_instance.starts_with(&prefix));
 	}

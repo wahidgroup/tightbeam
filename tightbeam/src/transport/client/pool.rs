@@ -131,9 +131,25 @@ impl Default for PoolConfig {
 #[cfg(feature = "x509")]
 #[derive(Clone)]
 /// Client authentication bundle kept behind Arc for zero-copy reuse.
-struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
+pub(crate) struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
 	certificate: Arc<Certificate>,
 	key: Arc<HandshakeKeyManager<C>>,
+}
+
+#[cfg(feature = "x509")]
+impl<C: CryptoProvider> ClientIdentity<C> {
+	/// Bind a certificate to the handshake key that proves it.
+	pub(crate) fn new(certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) -> Self {
+		Self { certificate, key }
+	}
+
+	/// Offer this identity on `transport`, so the dial presents it.
+	///
+	/// The certificate and its key travel together, so a transport cannot
+	/// receive one without the other.
+	pub(crate) fn offer_on<T: X509ClientConfig<CryptoProvider = C>>(&self, transport: T) -> T {
+		transport.with_client_identity(Arc::clone(&self.certificate), Arc::clone(&self.key))
+	}
 }
 
 #[cfg(feature = "x509")]
@@ -158,7 +174,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 	}
 
 	fn set_shared_client_identity(&mut self, certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) {
-		self.client_identity = Some(ClientIdentity { certificate, key });
+		self.client_identity = Some(ClientIdentity::new(certificate, key));
 	}
 
 	fn set_server_certificate_chain(&mut self, chain: Arc<[Certificate]>) {
@@ -184,9 +200,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 			configured = configured.with_trust_store(store);
 		}
 		if let Some(identity) = &self.client_identity {
-			let cert = Arc::clone(&identity.certificate);
-			let key = Arc::clone(&identity.key);
-			configured = configured.with_client_identity(cert, key);
+			configured = identity.offer_on(configured);
 		}
 		if let Some(chain) = &self.server_certificate_chain {
 			let chain = Arc::clone(chain);

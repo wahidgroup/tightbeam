@@ -16,7 +16,6 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Protocol};
-use tightbeam::utils::compose as frame_compose;
 use tightbeam::utils::urn::Urn;
 use tightbeam::{TightBeamError, Version};
 
@@ -38,7 +37,8 @@ pub(crate) async fn signed_control_frame(
 	request: ClusterRequest,
 	order: u64,
 ) -> Result<tightbeam::Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V0)
+	let unsigned = Version::V0
+		.compose()
 		.with_id(id)
 		.with_order(order)
 		.with_message(request)

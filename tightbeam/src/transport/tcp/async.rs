@@ -32,7 +32,7 @@ use crate::policy::TransitStatus;
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
-use crate::transport::io::{decode_transport_envelope, ensure_compatible_versions};
+use crate::transport::io::decode_transport_envelope;
 use crate::transport::protocols::{
 	enforce_frame_cap, AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream,
 };
@@ -791,7 +791,7 @@ where
 
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 		match wire_envelope {
-			WireEnvelope::Cleartext(envelope) => ensure_compatible_versions(envelope),
+			WireEnvelope::Cleartext(envelope) => envelope.ensure_compatible_versions(),
 			WireEnvelope::Encrypted(_) => Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed)),
 		}
 	}

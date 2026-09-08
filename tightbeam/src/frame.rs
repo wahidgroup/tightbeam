@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::asn1::{Frame, Version};
 #[cfg(feature = "signature")]
 use crate::der::asn1::{ContextSpecificRef, OctetStringRef};
@@ -9,9 +12,6 @@ use crate::der::{TagMode, TagNumber};
 use crate::DigestInfo;
 #[cfg(any(feature = "digest", feature = "signature"))]
 use crate::Metadata;
-
-#[cfg(all(not(feature = "std"), feature = "signature"))]
-use alloc::vec::Vec;
 
 /// Envelope-only view (version + metadata) used to compute Frame Integrity
 /// (FI). The message field is excluded by construction: FI MUST be computed
@@ -95,7 +95,49 @@ impl EncodeValue for TbsScaffold<'_> {
 	}
 }
 
+/// The transform a frame body still needs before a decode.
+///
+/// Read through [`Frame::body_transform`]. Each caller maps this to its
+/// own policy: the router refuses, a servlet applies the transform.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BodyTransform {
+	/// Encrypted. Decrypting also inflates a body that was compressed
+	/// before encryption.
+	Decrypt,
+	/// Compressed only.
+	Inflate,
+}
+
 impl Frame {
+	/// The transform this body still needs before a decode.
+	///
+	/// [`None`] means the body is already decodable. Confidentiality is
+	/// reported first: an encrypted body may also be compressed, and the
+	/// inflate follows the decrypt rather than replacing it.
+	#[must_use]
+	pub fn body_transform(&self) -> Option<BodyTransform> {
+		if self.metadata.confidentiality.is_some() {
+			return Some(BodyTransform::Decrypt);
+		}
+		if self.metadata.compactness.is_some() {
+			return Some(BodyTransform::Inflate);
+		}
+
+		None
+	}
+
+	/// DER encoding of the `SignerIdentifier` this frame claims.
+	///
+	/// Per-signer budgets, replay slots, refusal journals, and gossip
+	/// attribution all key on the signer, so they key on these bytes and
+	/// agree on what one signer is. [`None`] where the frame carries no
+	/// signature or the identifier does not encode.
+	#[must_use]
+	pub fn signer_id(&self) -> Option<Vec<u8>> {
+		let signer_info = self.nonrepudiation.as_ref()?;
+		crate::der::Encode::to_der(&signer_info.sid).ok()
+	}
+
 	/// Validate that the frame's version is compatible with its metadata fields.
 	/// This performs compile-time validation when used in const contexts.
 	/// Returns true if valid, false if invalid (compile-time error).

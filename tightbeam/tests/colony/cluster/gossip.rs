@@ -61,7 +61,8 @@ fn rumor_body(payload: Vec<u8>) -> GossipRumor {
 
 /// Mint an origin-signed rumor [`Frame`] (the nested gossip content).
 async fn mint_origin_rumor(key: &Secp256k1SigningKey, id: &[u8], body: GossipRumor) -> Result<Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V2)
+	let unsigned = Version::V2
+		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_message(body)
@@ -78,7 +79,8 @@ async fn signed_relay_gossip(
 	rumor: Frame,
 	hop_ttl: u64,
 ) -> Result<Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V2)
+	let unsigned = Version::V2
+		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_lifetime(hop_ttl)
@@ -143,7 +145,8 @@ async fn signed_reconcile_gossip(
 	id: &[u8],
 	held: Vec<Vec<u8>>,
 ) -> Result<Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V2)
+	let unsigned = Version::V2
+		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_message(ClusterRequest::ReconcileGossip(GossipReconciliation { held }))

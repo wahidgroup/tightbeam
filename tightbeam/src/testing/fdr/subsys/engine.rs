@@ -17,9 +17,6 @@ use crate::testing::fdr::config::{Failure, FdrConfig, FdrVerdict, Trace};
 use crate::testing::fdr::explorer::{ExplorationCore, RefinementChecker, RefinementOutcome, SeedResult};
 use crate::testing::specs::csp::{Process, State};
 
-#[cfg(feature = "testing-fmea")]
-use crate::testing::fmea::generate_fmea_report;
-
 /// FDR exploration engine (pluggable design)
 ///
 /// Generic over subsystem implementations:
@@ -278,7 +275,7 @@ where
 	fn generate_fmea_if_configured(&mut self) {
 		if let Some(ref fmea_config) = self.config.fmea_config {
 			if fmea_config.auto_generate && !self.verdict.faults_injected.is_empty() {
-				match generate_fmea_report(&self.verdict, self.process, Some(fmea_config.clone())) {
+				match self.verdict.fmea_report(self.process, Some(fmea_config.clone())) {
 					Ok(report) => self.verdict.fmea_report = Some(report),
 					Err(e) => eprintln!("Warning: FMEA generation failed: {}", e),
 				}

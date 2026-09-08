@@ -270,7 +270,7 @@ impl<'a> EventBuilder<'a> {
 					.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
 			}
 			Some(EventValue::Value(assertion_value)) => {
-				let value_str = format_assertion_value(assertion_value);
+				let value_str = assertion_value.render();
 				self.collector.emit_internal(
 					events::ASSERT_PAYLOAD,
 					Some(&label),
@@ -883,29 +883,6 @@ fn hash_payload(payload: &[u8]) -> [u8; 32] {
 	let mut arr = [0u8; 32];
 	arr.copy_from_slice(&out);
 	arr
-}
-
-#[cfg(feature = "instrument")]
-fn format_assertion_value(value: &AssertionValue) -> String {
-	match value {
-		AssertionValue::String(s) => s.to_string(),
-		AssertionValue::Bool(b) => b.to_string(),
-		AssertionValue::U8(n) => n.to_string(),
-		AssertionValue::U32(n) => n.to_string(),
-		AssertionValue::U64(n) => n.to_string(),
-		AssertionValue::I32(n) => n.to_string(),
-		AssertionValue::I64(n) => n.to_string(),
-		AssertionValue::F64(n) => n.to_string(),
-		AssertionValue::MessagePriority(p) => format!("{p:?}"),
-		AssertionValue::Version(v) => format!("{v:?}"),
-		AssertionValue::Some(inner) => format!("Some({inner:?})"),
-		AssertionValue::IsNone => "none".to_string(),
-		AssertionValue::IsSome => "some".to_string(),
-		AssertionValue::RatioActual(n, d) => format!("{n}/{d}"),
-		AssertionValue::RatioLimit(n, d) => format!("≤{n}/{d}"),
-		#[cfg(feature = "policy")]
-		AssertionValue::TransitStatus(status) => format!("{status:?}"),
-	}
 }
 
 /// Consumed execution trace after await completion.

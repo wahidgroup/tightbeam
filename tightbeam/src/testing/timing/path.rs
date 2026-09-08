@@ -54,7 +54,9 @@ impl ExecutionPath {
 		if pattern.len() > self.events.len() {
 			return false;
 		}
-		// Check if the first N events match the pattern (compare string content, not pointers)
+
+		// Check if the first N events match the pattern
+		// (compare string content, not pointers)
 		self.events
 			.iter()
 			.take(pattern.len())
@@ -83,88 +85,90 @@ impl PathWcet {
 	}
 }
 
-/// Extract execution paths from a consumed trace
-///
-/// Uses CSP process to identify valid execution paths by matching trace events
-/// to process transitions. Groups consecutive events into paths.
-pub fn extract_paths(trace: &ConsumedTrace, process: &Process) -> Vec<ExecutionPath> {
-	let mut paths = Vec::new();
-	let mut current_path_events = Vec::new();
-	let mut current_path_durations = Vec::new();
-	let mut current_state = process.initial;
+impl ConsumedTrace {
+	/// Execution paths this trace took through `process`.
+	///
+	/// Trace events are matched to process transitions, and consecutive
+	/// events that the current state enables group into one path. An event
+	/// the state does not enable starts a new path, so a path is always a
+	/// walk the process admits.
+	pub fn execution_paths(&self, process: &Process) -> Vec<ExecutionPath> {
+		let mut paths = Vec::new();
+		let mut current_path_events = Vec::new();
+		let mut current_path_durations = Vec::new();
+		let mut current_state = process.initial;
 
-	// Extract timing events from trace
-	let timing_events: Vec<&TbEvent> = {
-		#[cfg(feature = "instrument")]
-		{
-			use crate::instrumentation::events;
-			trace
-				.instrument_events
-				.iter()
-				.filter(|ev| ev.urn == events::TIMING_WCET || ev.urn == events::TIMING_DEADLINE)
-				.collect()
-		}
-		#[cfg(not(feature = "instrument"))]
-		{
-			Vec::new()
-		}
-	};
-
-	// Build paths by following CSP transitions
-	for event in timing_events {
-		// Extract event label
-		let event_label = match &event.label {
-			Some(label) => label,
-			None => continue,
+		// Extract timing events from trace
+		let timing_events: Vec<&TbEvent> = {
+			#[cfg(feature = "instrument")]
+			{
+				use crate::instrumentation::events;
+				self.instrument_events
+					.iter()
+					.filter(|ev| ev.urn == events::TIMING_WCET || ev.urn == events::TIMING_DEADLINE)
+					.collect()
+			}
+			#[cfg(not(feature = "instrument"))]
+			{
+				Vec::new()
+			}
 		};
 
-		let csp_event = Event(intern(event_label.as_str()));
+		// Build paths by following CSP transitions
+		for event in timing_events {
+			// Extract event label
+			let event_label = match &event.label {
+				Some(label) => label,
+				None => continue,
+			};
 
-		// Check if event is enabled in current state
-		let enabled = process.enabled(current_state);
-		let is_enabled = enabled.iter().any(|a| a.event == csp_event);
+			let csp_event = Event(intern(event_label.as_str()));
+			// Check if event is enabled in current state
+			let enabled = process.enabled(current_state);
+			let is_enabled = enabled.iter().any(|a| a.event == csp_event);
+			if !is_enabled {
+				// Event not enabled - start new path
+				if !current_path_events.is_empty() {
+					paths.push(ExecutionPath::new(current_path_events.clone(), current_path_durations.clone()));
+					current_path_events.clear();
+					current_path_durations.clear();
+				}
 
-		if !is_enabled {
-			// Event not enabled - start new path
-			if !current_path_events.is_empty() {
-				paths.push(ExecutionPath::new(current_path_events.clone(), current_path_durations.clone()));
-				current_path_events.clear();
-				current_path_durations.clear();
+				current_state = process.initial; // Reset to initial state
+				continue;
 			}
-			current_state = process.initial; // Reset to initial state
-			continue;
+
+			// Perform transition
+			let next_states = process.step(current_state, &csp_event);
+			if next_states.is_empty() {
+				// Deadlock - finalize current path
+				if !current_path_events.is_empty() {
+					paths.push(ExecutionPath::new(current_path_events.clone(), current_path_durations.clone()));
+					current_path_events.clear();
+					current_path_durations.clear();
+				}
+				current_state = process.initial;
+				continue;
+			}
+
+			// Add event to current path
+			current_path_events.push(csp_event);
+			current_path_durations.push(event.duration_ns);
+
+			// Update state (take first if multiple)
+			current_state = next_states[0];
+
+			// A terminal state continues the current path: the process may
+			// still enable transitions out of it.
 		}
 
-		// Perform transition
-		let next_states = process.step(current_state, &csp_event);
-		if next_states.is_empty() {
-			// Deadlock - finalize current path
-			if !current_path_events.is_empty() {
-				paths.push(ExecutionPath::new(current_path_events.clone(), current_path_durations.clone()));
-				current_path_events.clear();
-				current_path_durations.clear();
-			}
-			current_state = process.initial;
-			continue;
+		// Finalize any remaining path
+		if !current_path_events.is_empty() {
+			paths.push(ExecutionPath::new(current_path_events, current_path_durations));
 		}
 
-		// Add event to current path
-		current_path_events.push(csp_event);
-		current_path_durations.push(event.duration_ns);
-
-		// Update state (take first if multiple)
-		current_state = next_states[0];
-
-		// Note: We don't finalize path on terminal state because the process
-		// may allow transitions from terminal states (e.g., self-loops)
+		paths
 	}
-
-	// Finalize any remaining path
-	if !current_path_events.is_empty() {
-		paths.push(ExecutionPath::new(current_path_events, current_path_durations));
-	}
-
-	paths
 }
 
 #[cfg(test)]
@@ -177,7 +181,6 @@ mod tests {
 		let events = vec![Event("start"), Event("process"), Event("end")];
 		let durations = vec![Some(10_000_000), Some(20_000_000), Some(5_000_000)];
 		let path = ExecutionPath::new(events.clone(), durations.clone());
-
 		assert_eq!(path.events, events);
 		assert_eq!(path.durations, durations);
 		assert_eq!(path.total_duration, 35_000_000);
@@ -187,7 +190,6 @@ mod tests {
 	fn test_execution_path_matches_pattern() {
 		let events = vec![Event("start"), Event("process"), Event("end")];
 		let durations = vec![Some(10_000_000), Some(20_000_000), Some(5_000_000)];
-
 		let path = ExecutionPath::new(events, durations);
 		// Exact match
 		assert!(path.matches_pattern(&[Event("start"), Event("process"), Event("end")]));
@@ -203,7 +205,6 @@ mod tests {
 	fn test_path_wcet_new() {
 		let path = vec![Event("start"), Event("process"), Event("end")];
 		let max_duration = Duration::from_millis(50);
-
 		let path_wcet = PathWcet::new(path.clone(), max_duration);
 		assert_eq!(path_wcet.path, path);
 		assert_eq!(path_wcet.max_duration, max_duration);
@@ -230,6 +231,7 @@ mod tests {
 		#[cfg(feature = "instrument")]
 		{
 			use crate::instrumentation::events;
+
 			trace.instrument_events = events
 				.iter()
 				.enumerate()
@@ -252,11 +254,11 @@ mod tests {
 	#[test]
 	fn test_extract_paths_simple() -> Result<(), ProcessBuildError> {
 		let process = create_test_process()?;
-		let trace =
-			create_trace_with_timing_events(&[("start", 10_000_000), ("process", 20_000_000), ("end", 5_000_000)]);
+		let events = vec![("start", 10_000_000), ("process", 20_000_000), ("end", 5_000_000)];
+		let trace = create_trace_with_timing_events(&events);
 
-		let paths = extract_paths(&trace, &process);
 		// Should extract one path with all three events
+		let paths = trace.execution_paths(&process);
 		assert_eq!(paths.len(), 1);
 		assert_eq!(paths[0].events.len(), 3);
 		assert_eq!(paths[0].total_duration, 35_000_000);

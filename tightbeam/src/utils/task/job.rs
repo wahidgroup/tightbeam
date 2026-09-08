@@ -190,7 +190,7 @@ mod tests {
 	use crate::Frame;
 
 	#[cfg(feature = "colony")]
-	use crate::colony::common::{servlet_instance, ColonyNamespace};
+	use crate::colony::common::ColonyNamespace;
 	#[cfg(feature = "colony")]
 	use crate::colony::hive::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
 	#[cfg(feature = "colony")]
@@ -269,7 +269,7 @@ mod tests {
 
 	#[cfg(feature = "colony")]
 	fn worker_instance() -> crate::utils::urn::Urn<'static> {
-		servlet_instance(&worker_type(), "127.0.0.1:8080")
+		worker_type().servlet_instance("127.0.0.1:8080")
 	}
 
 	#[cfg(feature = "colony")]

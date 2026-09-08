@@ -527,8 +527,8 @@ impl core::fmt::Display for TightBeamError {
 				write!(f, "Encryption or decryption error: {err}")
 			}
 			#[cfg(feature = "aead")]
-			TightBeamError::InvalidKeyLength(_) => {
-				write!(f, "Invalid key length")
+			TightBeamError::InvalidKeyLength(len) => {
+				write!(f, "Invalid key length: {len}")
 			}
 			#[cfg(feature = "ecies")]
 			TightBeamError::EciesError(err) => write!(f, "ECIES error: {err}"),
@@ -539,7 +539,7 @@ impl core::fmt::Display for TightBeamError {
 				write!(f, "Signature verification or generation error: {err}")
 			}
 			#[cfg(feature = "signature")]
-			TightBeamError::EllipticCurveError(_) => write!(f, "Elliptic curve error"),
+			TightBeamError::EllipticCurveError(err) => write!(f, "Elliptic curve error: {err}"),
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
 			#[cfg(feature = "crypto")]
@@ -587,16 +587,7 @@ impl core::fmt::Display for TightBeamError {
 			}
 			#[cfg(feature = "compress")]
 			TightBeamError::CompressionError(err) => write!(f, "Compression error: {err}"),
-			TightBeamError::Sequence(errors) => {
-				write!(f, "Multiple errors: ")?;
-				for (i, error) in errors.iter().enumerate() {
-					if i > 0 {
-						write!(f, "; ")?;
-					}
-					write!(f, "{error}")?;
-				}
-				Ok(())
-			}
+			TightBeamError::Sequence(errors) => write!(f, "Multiple errors occurred: {errors:?}"),
 			#[cfg(feature = "colony")]
 			TightBeamError::AlreadyEstablished => write!(f, "Hive already established"),
 			#[cfg(feature = "colony")]
@@ -699,6 +690,26 @@ crate::impl_from!(std::sync::mpsc::RecvTimeoutError => TightBeamError::RecvTimeo
 impl core::error::Error for TightBeamError {}
 #[cfg(all(feature = "compress", not(feature = "derive")))]
 impl core::error::Error for CompressionError {}
+
+#[cfg(feature = "transport")]
+impl TightBeamError {
+	/// Terminal status a service failure answers a peer with.
+	///
+	/// A failure already carrying a transit status keeps it. Anything else
+	/// answers [`TransitStatus::Internal`](crate::policy::TransitStatus::Internal),
+	/// so a peer tells a failure apart
+	/// from an accepted empty reply and the failure stays attributable.
+	#[must_use]
+	pub(crate) fn failure_status(&self) -> crate::policy::TransitStatus {
+		use crate::policy::TransitStatus;
+
+		if let TightBeamError::TransportError(crate::transport::TransportError::OperationFailed(failure)) = self {
+			return TransitStatus::try_from(*failure).unwrap_or(TransitStatus::Internal);
+		}
+
+		TransitStatus::Internal
+	}
+}
 
 // A generic source type cannot go through impl_from!, so the unit-variant
 // conversion is written out.

@@ -37,7 +37,6 @@ use crate::constants::{
 	MAX_GOSSIP_TTL,
 };
 use crate::crypto::hash::{Digest, OutputSizeUser, U32};
-use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::utils::urn::Urn;
 use crate::{decode, encode};
@@ -57,26 +56,30 @@ pub enum Admission {
 	Duplicate,
 }
 
-/// Digest over the canonical DER encoding of a rumor [`Frame`].
-///
-/// Coverage includes identity, issue time, payload, and origin signature.
-/// Hop radius lives on the OUTER relay frame and MUST NOT enter the digest.
-///
-/// # Algorithm
-///
-/// Algorithm `D` MUST be the cluster crypto-profile digest (CWE-694).
-pub fn gossip_digest<D>(rumor: &Frame) -> Result<GossipDigest, ClusterError>
-where
-	D: Digest + OutputSizeUser<OutputSize = U32>,
-{
-	let bytes = encode(rumor)?;
-	let mut hasher = D::new();
-	hasher.update(&bytes);
+impl Frame {
+	/// Digest over the canonical DER encoding of a rumor.
+	///
+	/// Coverage includes identity, issue time, payload, and origin
+	/// signature. Hop radius lives on the OUTER relay frame and MUST NOT
+	/// enter the digest.
+	///
+	/// # Algorithm
+	///
+	/// Algorithm `D` MUST be the cluster crypto-profile digest (CWE-694).
+	pub fn gossip_digest<D>(&self) -> Result<GossipDigest, ClusterError>
+	where
+		D: Digest + OutputSizeUser<OutputSize = U32>,
+	{
+		let bytes = encode(self)?;
+		let mut hasher = D::new();
+		hasher.update(&bytes);
 
-	let output = hasher.finalize();
-	let mut digest = [0u8; 32];
-	digest.copy_from_slice(&output);
-	Ok(digest)
+		let output = hasher.finalize();
+		let mut digest = [0u8; 32];
+		digest.copy_from_slice(&output);
+
+		Ok(digest)
+	}
 }
 
 /// Digests advertised by a peer that this gateway does not retain.
@@ -121,18 +124,6 @@ pub fn gossip_fresh(order_ms: u64, seen_ttl_ms: u64, now_ms: u64) -> bool {
 	now_ms.abs_diff(order_ms) <= seen_ttl_ms
 }
 
-/// DER encoding of the claimed `SignerIdentifier` on a frame.
-///
-/// Audit evidence on gossip refusals before trust resolution.
-/// `None` when the frame is unsigned or encoding fails.
-#[must_use]
-pub fn signer_attribution(frame: &Frame) -> Option<Vec<u8>> {
-	let signer_info = frame.nonrepudiation.as_ref()?;
-	let attribution = Encode::to_der(&signer_info.sid).ok()?;
-
-	Some(attribution)
-}
-
 /// Rumor that passed payload, hop-radius, and freshness checks.
 ///
 /// Construct only through [`AdmittedGossip::admit`]. Signature and
@@ -164,7 +155,7 @@ impl AdmittedGossip {
 		let within_ttl = ttl <= u64::from(MAX_GOSSIP_TTL);
 		let fresh = gossip_fresh(rumor.metadata.order, seen_ttl_ms, now_ms);
 		if within_payload && within_ttl && fresh {
-			let digest = gossip_digest::<D>(rumor).map_err(|_| TransitStatus::PermissionDenied)?;
+			let digest = rumor.gossip_digest::<D>().map_err(|_| TransitStatus::PermissionDenied)?;
 			let admitted = Self { digest, payload: body.payload, kind: body.kind };
 			Ok(admitted)
 		} else {
@@ -639,7 +630,7 @@ mod tests {
 	use crate::crypto::hash::Sha3_256;
 
 	fn digest(rumor: &Frame) -> GossipDigest {
-		gossip_digest::<Sha3_256>(rumor).expect("test rumor frames encode")
+		rumor.gossip_digest::<Sha3_256>().expect("test rumor frames encode")
 	}
 
 	fn rumor(order: u64, payload: Vec<u8>) -> Frame {

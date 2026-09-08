@@ -9,7 +9,6 @@ use std::sync::Arc;
 use crate::colony::worker::{
 	kill_worker, relay_to_worker, worker_runtime, WorkerKillFuture, WorkerPolicies, WorkerRelayFuture, WorkerRequest,
 };
-use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
 use crate::Message;
 
@@ -106,16 +105,6 @@ where
 	}
 }
 
-fn evaluate_policies<I: Message + Send>(policies: &WorkerPolicies<I>, message: &I) -> Result<(), TransitStatus> {
-	for gate in policies.receptor_gates().iter() {
-		let status = gate.evaluate(message);
-		if status != TransitStatus::Ok {
-			return Err(status);
-		}
-	}
-	Ok(())
-}
-
 async fn run_loop<I, O, C, F, Fut>(
 	mut receiver: worker_runtime::rt::QueueReceiver<WorkerRequest<I, O>>,
 	config: Arc<C>,
@@ -130,7 +119,7 @@ async fn run_loop<I, O, C, F, Fut>(
 {
 	while let Some(request) = worker_runtime::rt::recv(&mut receiver).await {
 		let WorkerRequest { message, respond_to, trace } = request;
-		if let Err(status) = evaluate_policies(&policies, message.as_ref()) {
+		if let Err(status) = policies.admits(message.as_ref()) {
 			let _ = respond_to.send(Err(status));
 			continue;
 		}

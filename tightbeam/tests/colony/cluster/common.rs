@@ -57,9 +57,8 @@ pub use tightbeam::{
 			MemoryGossipJournal, PeerHint, PeerTable, TokenBucketAdmission,
 		},
 		common::{
-			current_timestamp_ms, servlet_instance, type_canonical_bytes, ColonyNamespace, GossipReconciliation,
-			GossipResponse, GossipRumor, GossipWant, InstanceMetrics, LoadBalancer, PeerAdvertisement,
-			PeerAdvertisementResponse, RoundRobin, StochasticForager,
+			current_timestamp_ms, ColonyNamespace, GossipReconciliation, GossipResponse, GossipRumor, GossipWant,
+			InstanceMetrics, LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin, StochasticForager,
 		},
 		hive::{
 			Hive, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
@@ -92,7 +91,6 @@ pub use tightbeam::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 		ConnectionPool, GenericClient, PoolConfig,
 	},
-	utils::compose as frame_compose,
 	utils::urn::Urn,
 	Beamable, Frame, TightBeamError, Version,
 };
@@ -309,7 +307,8 @@ pub async fn signed_publish_gossip(
 	body: GossipRumor,
 	hop_ttl: u64,
 ) -> Result<Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V2)
+	let unsigned = Version::V2
+		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_lifetime(hop_ttl)
@@ -325,7 +324,8 @@ pub async fn signed_control_frame_with_order(
 	request: ClusterRequest,
 	order: u64,
 ) -> Result<Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V0)
+	let unsigned = Version::V0
+		.compose()
 		.with_id(id)
 		.with_order(order)
 		.with_message(request)
@@ -378,7 +378,7 @@ pub fn servlet_address_update(hive_addr: &[u8], added: Vec<ServletInfo>, removed
 
 pub fn servlet_info(servlet_name: &str, address: &[u8]) -> ServletInfo {
 	ServletInfo {
-		servlet_id: servlet_instance(&servlet_urn(servlet_name), String::from_utf8_lossy(address).as_ref()),
+		servlet_id: servlet_urn(servlet_name).servlet_instance(String::from_utf8_lossy(address).as_ref()),
 		address: address.to_vec(),
 	}
 }
@@ -386,7 +386,7 @@ pub fn servlet_info(servlet_name: &str, address: &[u8]) -> ServletInfo {
 /// ServletInfo whose instance locator disagrees with the route address.
 pub fn servlet_info_mismatched(servlet_name: &str, urn_addr: &[u8], route_addr: &[u8]) -> ServletInfo {
 	ServletInfo {
-		servlet_id: servlet_instance(&servlet_urn(servlet_name), String::from_utf8_lossy(urn_addr).as_ref()),
+		servlet_id: servlet_urn(servlet_name).servlet_instance(String::from_utf8_lossy(urn_addr).as_ref()),
 		address: route_addr.to_vec(),
 	}
 }
@@ -551,7 +551,8 @@ pub async fn emit_servlet_update(
 /// the standard ping input. This is the frame gateways must deliver to
 /// the servlet byte-for-byte.
 pub async fn signed_work_frame(key: &Secp256k1SigningKey, id: &[u8]) -> Result<Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V0)
+	let unsigned = Version::V0
+		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_message(PingRequest { value: 21 })
@@ -632,7 +633,8 @@ pub async fn emit_relayed_ping_work(
 	let inner = signed_work_frame(key, id).await?;
 	let work_request = ClusterRequest::Work(ClusterWorkRequest::new(servlet_urn("ping"), &inner)?.into_relayed(0));
 
-	let frame = frame_compose(Version::V0)
+	let frame = Version::V0
+		.compose()
 		.with_id(id)
 		.with_order(0)
 		.with_message(work_request)
@@ -644,7 +646,10 @@ pub async fn emit_relayed_ping_work(
 /// Instance URN in a realm this gateway does not serve.
 pub fn foreign_realm_instance(addr: &str) -> Urn<'static> {
 	let namespace = ColonyNamespace::new("tightbeam", "elsewhere").expect("static namespace parts are valid");
-	servlet_instance(&namespace.servlet("ping").expect("test names satisfy the mint grammar"), addr)
+	namespace
+		.servlet("ping")
+		.expect("test names satisfy the mint grammar")
+		.servlet_instance(addr)
 }
 
 /// Gateway conf that accepts peer advertisements.

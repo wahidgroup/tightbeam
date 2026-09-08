@@ -36,22 +36,27 @@ use crate::der::{Any, Decode, Encode};
 use crate::oids::{self, DATA};
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::spki::EncodePublicKey;
-use crate::transport::handshake::attributes;
+use crate::transport::handshake::attributes::HandshakeAttributes;
+use crate::transport::handshake::attributes::{self, HandshakeAttribute};
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::kari::{derive_kek, key_wrap_key_size, unwrap_and_verify_with_kek};
+use crate::transport::handshake::kari::HandshakeKek;
+use crate::transport::handshake::kari::{key_wrap_key_size, unwrap_and_verify_with_kek};
 use crate::transport::handshake::negotiation::{
-	authorize_transport, server_mux_settings, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept,
+	authorize_transport, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept, SecurityOffer,
 	TransportAccept, TransportAuthorizer, TransportOffer,
 };
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
+use crate::transport::handshake::receipt::ReceiptArtifact;
+use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
-	certificate_signer_identifier, complete_receipt_artifact, record_receipt_outcome, settle_receipt_ack, sign_receipt,
-	SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
+	record_receipt_outcome, sign_receipt, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict,
+	StoredReceipt,
 };
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
-use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
+use crate::transport::handshake::utils::HandshakeVerifyingKey;
+use crate::transport::handshake::utils::{compute_transcript_digest, validate_state};
 use crate::transport::handshake::ServerHandshakeProtocol;
 use crate::transport::handshake::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::utils::marker::MaybeSendFuture;
@@ -275,7 +280,7 @@ where
 			let handshake_attrs = self.convert_to_handshake_attributes(attrs).ok()?;
 			let offer_attr = attributes::find(&handshake_attrs, &oids::HANDSHAKE_SECURITY_OFFER).ok()?;
 
-			attributes::extract_security_offer(offer_attr).ok()
+			offer_attr.decode::<SecurityOffer>().ok()
 		});
 
 		// Use trait method for negotiation
@@ -293,21 +298,17 @@ where
 		let offer = unprotected_attrs.and_then(|attrs| {
 			let handshake_attrs = self.convert_to_handshake_attributes(attrs).ok()?;
 			let offer_attr = attributes::find(&handshake_attrs, &oids::HANDSHAKE_TRANSPORT_OFFER).ok()?;
-
-			attributes::extract_transport_offer(offer_attr).ok()
+			offer_attr.decode::<TransportOffer>().ok()
 		});
 
-		let authorized = authorize_transport(
-			offer.as_ref(),
-			self.transport_config.as_ref(),
-			self.transport_authorizer.as_deref(),
-		)
-		.await?;
+		let local = self.transport_config.as_ref();
+		let authorizer = self.transport_authorizer.as_deref();
+		let authorized = authorize_transport(offer.as_ref(), local, authorizer).await?;
 
 		self.transport_accept = authorized.as_ref().map(|authorized| authorized.accept);
 		self.settlement_challenge = authorized.and_then(|authorized| authorized.challenge);
 		if let (Some(offer), Some(accept)) = (offer.as_ref(), self.transport_accept.as_ref()) {
-			self.mux_settings = Some(server_mux_settings(offer, accept));
+			self.mux_settings = Some(offer.server_mux_settings(accept));
 		}
 
 		Ok(())
@@ -338,7 +339,7 @@ where
 	/// Extract the client's verifying key from certificate.
 	fn extract_client_verifying_key(&self) -> Result<P::VerifyingKey, HandshakeError> {
 		let client_cert = self.as_client_certificate()?;
-		let client_public_key = extract_verifying_key_from_cert::<P::Curve>(client_cert)?;
+		let client_public_key = client_cert.verifying_key::<P::Curve>()?;
 		Ok(P::VerifyingKey::from(client_public_key))
 	}
 
@@ -415,7 +416,7 @@ where
 		let provider = P::default();
 
 		let key_size = key_wrap_key_size::<P>()?;
-		let kek = derive_kek::<P>(&shared_secret, ukm.as_bytes(), TIGHTBEAM_KARI_KDF_INFO, key_size)?;
+		let kek = shared_secret.derive_kek::<P>(ukm.as_bytes(), TIGHTBEAM_KARI_KDF_INFO, key_size)?;
 
 		// Unwrap CEK. `recipient_enc_keys` is an unauthenticated DER
 		// SEQUENCE OF that decodes empty; index only after a length check.
@@ -498,11 +499,11 @@ where
 		// Compute transcript hash if not already set
 		if self.transcript_hash.is_none() {
 			if let Some(profile) = self.selected_profile {
-				let accept_bytes = attributes::security_accept_transcript_bytes(&SecurityAccept::new(profile))?;
+				let accept_bytes = HandshakeAttribute::transcript_bytes(&SecurityAccept::new(profile))?;
 				self.transcript_buffer.extend_from_slice(&accept_bytes);
 			}
 			if let Some(ref accept) = self.transport_accept {
-				let accept_bytes = attributes::transport_accept_transcript_bytes(accept)?;
+				let accept_bytes = HandshakeAttribute::transcript_bytes(accept)?;
 				self.transcript_buffer.extend_from_slice(&accept_bytes);
 			}
 
@@ -548,17 +549,17 @@ where
 		let mut x509_attrs = Vec::new();
 
 		if let Some(profile) = self.selected_profile {
-			let accept_attr = attributes::encode_security_accept(&SecurityAccept::new(profile))?;
+			let accept_attr = HandshakeAttribute::encode(&SecurityAccept::new(profile))?;
 			x509_attrs
 				.push(Attribute { oid: accept_attr.attr_type, values: SetOfVec::try_from(accept_attr.attr_values)? });
 		}
 		if let Some(ref accept) = self.transport_accept {
-			let accept_attr = attributes::encode_transport_accept(accept)?;
+			let accept_attr = HandshakeAttribute::encode(accept)?;
 			x509_attrs
 				.push(Attribute { oid: accept_attr.attr_type, values: SetOfVec::try_from(accept_attr.attr_values)? });
 		}
 		if let Some(ref artifact) = self.receipt_artifact {
-			let receipt_attr = attributes::encode_session_receipt(artifact)?;
+			let receipt_attr = HandshakeAttribute::encode(artifact)?;
 			x509_attrs.push(Attribute {
 				oid: receipt_attr.attr_type,
 				values: SetOfVec::try_from(receipt_attr.attr_values)?,
@@ -766,17 +767,18 @@ where
 			None => (SessionVerdict::CountersignatureMissing, None),
 			Some(ack) => {
 				let client_cert = self.validated_client_cert.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-				let expected_sid = certificate_signer_identifier::<P::Digest>(client_cert)?;
-				let public_key = extract_verifying_key_from_cert::<P::Curve>(client_cert)?;
+				let expected_sid = client_cert.signer_identifier::<P::Digest>()?;
+				let public_key = client_cert.verifying_key::<P::Curve>()?;
 				let verifying_key = P::VerifyingKey::from(public_key);
-				settle_receipt_ack::<P::Digest, P::Signature, _>(
-					&receipt,
-					Some(ack),
-					&expected_sid,
-					&verifying_key,
-					self.transport_authorizer.as_deref(),
-				)
-				.await?
+
+				receipt
+					.settle_ack::<P::Digest, P::Signature, _>(
+						Some(ack),
+						&expected_sid,
+						&verifying_key,
+						self.transport_authorizer.as_deref(),
+					)
+					.await?
 			}
 		};
 
@@ -789,20 +791,24 @@ where
 		// evidence.
 		let artifact = match (verdict, receipt_ack) {
 			(SessionVerdict::Activated | SessionVerdict::SettlementRejected { .. }, Some(ack)) => {
-				complete_receipt_artifact(server_artifact, ack)?
+				server_artifact.complete(ack)?
 			}
 			(_, _) => server_artifact,
 		};
 
+		let countersignature = countersignature.map(OctetString::new).transpose()?;
+		let client_certificate = self.validated_client_cert.as_ref().map(Arc::clone);
 		let outcome = SessionOutcome {
 			receipt,
 			artifact,
-			countersignature: countersignature.map(OctetString::new).transpose()?,
+			countersignature,
 			ancillary_response,
-			client_certificate: self.validated_client_cert.as_ref().map(Arc::clone),
+			client_certificate,
 			verdict,
 		};
-		self.stored_receipt = Some(record_receipt_outcome(self.session_observer.as_deref(), outcome).await?);
+
+		let stored_receipt = record_receipt_outcome(self.session_observer.as_deref(), outcome).await?;
+		self.stored_receipt = Some(stored_receipt);
 
 		Ok(())
 	}
@@ -864,8 +870,9 @@ where
 /// The SignedData is parsed once and duplicate attributes fail closed.
 fn extract_receipt_ack_envelope(signed_data_der: &[u8]) -> Result<Option<OctetString>, HandshakeError> {
 	let signed_data = SignedData::from_der(signed_data_der)?;
-	attributes::find_unsigned_attr(&signed_data, oids::RECEIPT_ACK)?
-		.map(|attr| attributes::extract_receipt_ack(&attr))
+	signed_data
+		.find_unsigned_attr(oids::RECEIPT_ACK)?
+		.map(|attr| attr.decode::<OctetString>())
 		.transpose()
 }
 

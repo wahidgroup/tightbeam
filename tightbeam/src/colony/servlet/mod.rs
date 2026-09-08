@@ -9,7 +9,7 @@
 //!    (config + handlers) into [`Servlet::start`] on [`ServletRuntime`].
 //!
 //! Typed unary delivery without `servlet!`:
-//! [`ServletHandlers::on_typed_unary`] or [`dispatch_typed_unary`].
+//! [`ServletHandlers::on_typed_unary`] or [`crate::Frame::dispatch_typed_unary`].
 
 mod config;
 mod context;
@@ -21,7 +21,7 @@ pub mod runtime;
 pub mod tracking;
 
 pub use config::{ServletConfig, ServletConfigBuilder};
-pub use context::{dispatch_typed_unary, prepare_typed_frame, ServletContext, WorkerBox, WorkerBoxStartFuture};
+pub use context::{ServletContext, WorkerBox, WorkerBoxStartFuture};
 pub use runtime::ServletRuntime;
 pub use serve::serve_servlet;
 pub use service::{RuntimeServletConf, Servlet, ServletFuture, ServletHandlers, ServletService};

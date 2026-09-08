@@ -3,16 +3,21 @@
 use core::hash::Hash;
 use core::str::FromStr;
 
+use crate::builder::frame::FrameBuilder;
+use crate::builder::TypeBuilder;
 use crate::colony::cluster::peer::AdmittedPeerAd;
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::gossip_tasks::{GossipOrigin, GossipPipelineCtx};
 use crate::colony::cluster::runtime::refuse::Refusal;
+use crate::colony::cluster::{gossip_want, RouteKind};
 use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry};
+use crate::colony::common::PeerGossip;
 use crate::colony::common::{
 	current_timestamp_ms, reply_frame, GossipReconciliation, GossipRumor, GossipWant, PeerAdvertisement,
 	PeerAdvertisementResponse,
 };
 use crate::colony::hive::{verify_frame_signature, TrustVerification};
+use crate::constants::MAX_PEX_SAMPLE;
 use crate::constants::{MAX_GOSSIP_LOG, MAX_GOSSIP_TTL};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::instrumentation::events::CLUSTER_PEER_ADVERTISED;
@@ -25,12 +30,6 @@ use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509Cl
 use crate::Frame;
 use crate::TightBeamError;
 use crate::Version;
-
-use crate::builder::frame::FrameBuilder;
-use crate::builder::TypeBuilder;
-use crate::colony::cluster::{frame_colony_urn, gossip_want, RouteKind};
-use crate::colony::common::PeerGossip;
-use crate::constants::MAX_PEX_SAMPLE;
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// Admit one directly dialed peer advertisement and reconcile its slate.
@@ -121,7 +120,10 @@ where
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		};
 
-		let peer_colony = frame_colony_urn(&self.config.namespace, self.config.tls.peer_trust.as_deref(), &frame);
+		let peer_colony = self
+			.config
+			.namespace
+			.frame_colony_urn(self.config.tls.peer_trust.as_deref(), &frame);
 		if peer_colony.as_ref() != Some(local_colony) {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		}
@@ -151,7 +153,10 @@ where
 
 		// Origin colony comes from the signer cert (CWE-345). A mismatch
 		// refuses on policy, and relay scoring stays with wire faults.
-		let origin_colony = frame_colony_urn(&self.config.namespace, self.config.tls.peer_trust.as_deref(), &rumor);
+		let origin_colony = self
+			.config
+			.namespace
+			.frame_colony_urn(self.config.tls.peer_trust.as_deref(), &rumor);
 		if origin_colony.as_ref() != Some(local_colony) {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		}
@@ -204,57 +209,59 @@ where
 	}
 }
 
-/// Peer-exchange sample for a reconcile reply.
-///
-/// Probe-verified peers from the discovery table merge with live peer
-/// routes installed from signed advertisements.
-///
-/// - Entries are deduped by dial address.
-/// - The sample is capped at [`MAX_PEX_SAMPLE`].
-/// - This gateway verified both sources.
-/// - The receiver still treats every entry as an unverified hint until its
-///   own probe passes the colony gate.
-///
-/// # Sources
-///
-/// - CWE-770, allocation of resources without limits or throttling:
-///   <https://cwe.mitre.org/data/definitions/770.html>
-fn pex_sample(config: &ClusterConfig, servlet_registry: &ServletRegistry) -> Vec<PeerGossip> {
-	let verified = config
-		.peer
-		.table
-		.sample_for_pex(MAX_PEX_SAMPLE)
-		.unwrap_or_default()
-		.into_iter()
-		.map(|record| PeerGossip {
-			peer_id: record.peer_id.unwrap_or_default(),
-			gateway_addr: record.gateway_addr.into_bytes(),
-		});
+impl ClusterConfig {
+	/// Peer-exchange sample for a reconcile reply.
+	///
+	/// Probe-verified peers from the discovery table merge with live peer
+	/// routes installed from signed advertisements.
+	///
+	/// - Entries are deduped by dial address.
+	/// - The sample is capped at [`MAX_PEX_SAMPLE`].
+	/// - This gateway verified both sources.
+	/// - The receiver still treats every entry as an unverified hint until
+	///   its own probe passes the colony gate.
+	///
+	/// # Sources
+	///
+	/// - CWE-770, allocation of resources without limits or throttling:
+	///   <https://cwe.mitre.org/data/definitions/770.html>
+	fn pex_sample(&self, servlet_registry: &ServletRegistry) -> Vec<PeerGossip> {
+		let verified = self
+			.peer
+			.table
+			.sample_for_pex(MAX_PEX_SAMPLE)
+			.unwrap_or_default()
+			.into_iter()
+			.map(|record| PeerGossip {
+				peer_id: record.peer_id.unwrap_or_default(),
+				gateway_addr: record.gateway_addr.into_bytes(),
+			});
 
-	// Registry entries are borrowed, so the wire message copies them once.
-	// Only direct routes qualify: a relay trail pairs the origin's
-	// identity with the relay's dial address, which is not a dialable
-	// hint.
-	let routes = servlet_registry
-		.peer_entries()
-		.unwrap_or_default()
-		.into_iter()
-		.filter(|entry| entry.route_kind() == RouteKind::Peer)
-		.map(|entry| PeerGossip { peer_id: entry.owner_id().to_vec(), gateway_addr: entry.dial_target().to_vec() });
+		// Registry entries are borrowed, so the wire message copies them once.
+		// Only direct routes qualify: a relay trail pairs the origin's
+		// identity with the relay's dial address, which is not a dialable
+		// hint.
+		let routes = servlet_registry
+			.peer_entries()
+			.unwrap_or_default()
+			.into_iter()
+			.filter(|entry| entry.route_kind() == RouteKind::Peer)
+			.map(|entry| PeerGossip { peer_id: entry.owner_id().to_vec(), gateway_addr: entry.dial_target().to_vec() });
 
-	// The sample holds to MAX_PEX_SAMPLE, so a linear scan dedupes
-	// by dial address without a set allocation per entry.
-	let mut pex: Vec<PeerGossip> = Vec::new();
-	for candidate in verified.chain(routes) {
-		if pex.len() == MAX_PEX_SAMPLE {
-			break;
+		// The sample holds to MAX_PEX_SAMPLE, so a linear scan dedupes
+		// by dial address without a set allocation per entry.
+		let mut pex: Vec<PeerGossip> = Vec::new();
+		for candidate in verified.chain(routes) {
+			if pex.len() == MAX_PEX_SAMPLE {
+				break;
+			}
+			if !pex.iter().any(|shared| shared.gateway_addr == candidate.gateway_addr) {
+				pex.push(candidate);
+			}
 		}
-		if !pex.iter().any(|shared| shared.gateway_addr == candidate.gateway_addr) {
-			pex.push(candidate);
-		}
+
+		pex
 	}
-
-	pex
 }
 
 /// Compare peer digests and reply with digests this gateway still needs.
@@ -272,7 +279,10 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 		// Same-colony only before freshness (CWE-668). A policy refuse
 		// must not leave a replay record behind (CWE-772).
-		let requester_colony = frame_colony_urn(&self.config.namespace, self.config.tls.peer_trust.as_deref(), &frame);
+		let requester_colony = self
+			.config
+			.namespace
+			.frame_colony_urn(self.config.tls.peer_trust.as_deref(), &frame);
 		if self.config.colony_urn().is_none() || requester_colony.as_ref() != self.config.colony_urn() {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}
@@ -296,7 +306,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// The reply carries the peer-exchange sample, the GossipSub v1.1 PX
 		// piggyback shape. A seed-bootstrapped requester discovers the
 		// colony graph on its existing beat with no extra round trip.
-		let pex = pex_sample(&self.config, &self.servlet_registry);
+		let pex = self.config.pex_sample(&self.servlet_registry);
 
 		reply_frame(&frame.metadata.id, GossipWant { want, pex })
 	}

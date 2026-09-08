@@ -4,19 +4,19 @@ use core::str::FromStr;
 use std::sync::Arc;
 
 use super::{ClusterConfig, PeerHint, PheromoneConfig, ServletEntry, SharedId};
-use crate::colony::common::{is_bare_servlet_type, type_canonical_bytes, ColonyNamespace, PeerAdvertisement};
+use crate::colony::common::ColonyResource;
+use crate::colony::common::{ClusterWorkRequest, ColonyNamespace, PeerAdvertisement};
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
+use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
+use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::Certificate;
 use crate::policy::TransitStatus;
+use crate::transport::multiplex::StreamRoute;
 use crate::transport::tcp::TightBeamSocketAddr;
 use crate::utils::urn::Urn;
-use crate::Frame;
-
-use crate::colony::common::ColonyResource;
-use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
-use crate::crypto::x509::utils::certificate_extension;
-use crate::crypto::x509::Certificate;
 use crate::x509::ext::pkix::name::GeneralName;
 use crate::x509::ext::pkix::SubjectAltName;
+use crate::Frame;
 
 /// Forwards a work request or routed stream open may still spend.
 ///
@@ -85,6 +85,26 @@ impl HopBudget {
 		self.remaining
 	}
 
+	/// Relayed stream route for one peer hop out of this budget.
+	///
+	/// The route reaches the same `target` with one forward spent. Minting
+	/// it through the budget is what spends the hop, so a relay cannot
+	/// stamp a route it did not pay for (CWE-834).
+	#[must_use]
+	pub(crate) fn relayed_route(self, target: &Urn<'static>) -> StreamRoute {
+		StreamRoute::relayed_to(target.clone(), self.spend().wire())
+	}
+
+	/// Relayed work envelope for one peer hop out of this budget.
+	///
+	/// The unary twin of [`Self::relayed_route`]. `payload` is already the
+	/// client's encoded frame and travels opaquely, so a relay hop
+	/// re-encodes nothing.
+	#[must_use]
+	pub(crate) fn relayed_work(self, servlet_type: Urn<'static>, payload: Vec<u8>) -> ClusterWorkRequest {
+		ClusterWorkRequest { servlet_type, payload, hops_remaining: self.spend().wire() }
+	}
+
 	/// A budget clamped to the default cap, for tests that pick a wire count.
 	#[cfg(test)]
 	pub(crate) fn for_test(wire: u8) -> Self {
@@ -139,7 +159,7 @@ impl AdmittedPeerAd {
 		// (fingerprint) and the membership gate both derive from it.
 		let signer_cert =
 			frame_signer_cert(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
-		let peer_hive_id = cert_fingerprint_id(signer_cert).ok_or(TransitStatus::PermissionDenied)?;
+		let peer_hive_id = signer_cert.fingerprint_id().ok_or(TransitStatus::PermissionDenied)?;
 
 		// Federation is a colony operation: both this gateway and the
 		// advertising peer must carry a valid colony URN SAN. A cert
@@ -148,7 +168,7 @@ impl AdmittedPeerAd {
 		// membership, so no gate applies.
 		{
 			let local_member = conf.colony_urn().is_some();
-			let peer_member = cert_colony_urn(&conf.namespace, signer_cert).is_some();
+			let peer_member = conf.namespace.cert_colony_urn(signer_cert).is_some();
 			if !(local_member && peer_member) {
 				return Err(TransitStatus::PermissionDenied);
 			}
@@ -161,13 +181,8 @@ impl AdmittedPeerAd {
 			conf.peer.peer_dial_allowlist.as_deref(),
 		)?;
 
-		let slate = build_peer_slate(
-			&peer_hive_id,
-			Arc::clone(&dial_addr),
-			&ad.advertised_types,
-			conf.pheromone.initial_pheromone,
-			conf.pheromone.abandonment_limit,
-		);
+		let dial = Arc::clone(&dial_addr);
+		let slate = conf.pheromone.peer_slate(&peer_hive_id, dial, &ad.advertised_types);
 
 		Ok(Self { peer_hive_id, dial_addr, slate, order: frame.metadata.order })
 	}
@@ -271,12 +286,6 @@ pub(crate) fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]
 	matched
 }
 
-/// Whether every advertised type is a bare servlet URN in `namespace`.
-#[must_use]
-fn advertised_types_are_nestmate(namespace: &ColonyNamespace, types: &[Urn<'static>]) -> bool {
-	types.iter().all(|urn| is_bare_servlet_type(namespace, urn))
-}
-
 /// Wire-level advertisement checks. No registry lock.
 fn peer_advertisement_wire_ok(
 	gateway_addr: &[u8],
@@ -286,7 +295,7 @@ fn peer_advertisement_wire_ok(
 ) -> Result<(), TransitStatus> {
 	let dial_valid = peer_gateway_addr_valid(gateway_addr);
 	let dial_allowed = peer_dial_allowed(gateway_addr, allowlist);
-	let types_valid = advertised_types_are_nestmate(namespace, types);
+	let types_valid = namespace.all_bare_servlet_types(types);
 	let within_type_cap = types.len() <= MAX_ADVERTISED_TYPES;
 	if dial_valid && dial_allowed && types_valid && within_type_cap {
 		Ok(())
@@ -308,16 +317,6 @@ pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Fr
 	trust.find_by_signer_info(signer_info)
 }
 
-/// Certificate fingerprint as a shared slate/attribution identifier.
-///
-/// Fail closed with `None` when the fingerprint cannot be computed:
-/// an unkeyed slate or unattributable misbehavior is refused.
-#[must_use]
-pub(crate) fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
-	let fingerprint = CertificateTrustStore::to_fingerprint(cert).ok()?;
-	Some(Arc::from(fingerprint.as_slice()))
-}
-
 /// Peer identity from the signer's certificate fingerprint.
 ///
 /// Slates reconcile and score misbehavior by fingerprint, never claimed
@@ -325,89 +324,77 @@ pub(crate) fn cert_fingerprint_id(cert: &Certificate) -> Option<SharedId> {
 #[must_use]
 pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
 	let cert = frame_signer_cert(trust, frame)?;
-	cert_fingerprint_id(cert)
+	cert.fingerprint_id()
 }
 
-/// Colony URN from the certificate URI Subject Alternative Name.
-///
-/// Membership binds to the URI SAN (RFC 5280 §4.2.1.6), never the
-/// Subject DN. Non-URI SANs and URIs that fail colony validation in
-/// `namespace` are ignored. `None` when the extension is absent or
-/// malformed, when no entry validates, or when more than one distinct
-/// colony URN is present: ambiguous identity fails closed (CWE-706).
-#[must_use]
-pub fn cert_colony_urn(namespace: &ColonyNamespace, cert: &Certificate) -> Option<Urn<'static>> {
-	let mut colony: Option<Urn<'static>> = None;
+impl ColonyNamespace {
+	/// Colony URN a certificate asserts, when exactly one is present.
+	///
+	/// Membership binds to the URI SAN (RFC 5280 §4.2.1.6), never the
+	/// Subject DN. Non-URI SANs and URIs that fail colony validation in
+	/// this namespace are ignored. `None` when the extension is absent or
+	/// malformed, when no entry validates, or when more than one distinct
+	/// colony URN is present: ambiguous identity fails closed (CWE-706).
+	#[must_use]
+	pub fn cert_colony_urn(&self, cert: &Certificate) -> Option<Urn<'static>> {
+		let mut colony: Option<Urn<'static>> = None;
 
-	let san: SubjectAltName = certificate_extension(cert).ok()??;
-	for entry in &san.0 {
-		let GeneralName::UniformResourceIdentifier(uri) = entry else {
-			continue;
-		};
-		let Ok(urn) = uri.as_str().parse::<Urn<'static>>() else {
-			continue;
-		};
-		if !matches!(namespace.validate(&urn), Ok(ColonyResource::Colony { .. })) {
-			continue;
+		let san: SubjectAltName = cert.extension().ok()??;
+		for entry in &san.0 {
+			let GeneralName::UniformResourceIdentifier(uri) = entry else {
+				continue;
+			};
+			let Ok(urn) = uri.as_str().parse::<Urn<'static>>() else {
+				continue;
+			};
+			if !matches!(self.validate(&urn), Ok(ColonyResource::Colony { .. })) {
+				continue;
+			}
+
+			match colony.as_ref() {
+				Some(existing) if *existing == urn => {}
+				Some(_) => return None,
+				None => colony = Some(urn),
+			}
 		}
 
-		match colony.as_ref() {
-			Some(existing) if *existing == urn => {}
-			Some(_) => return None,
-			None => colony = Some(urn),
-		}
+		colony
 	}
 
-	colony
+	/// Colony URN of a frame's signer on the given trust plane.
+	///
+	/// Membership travels in the signer certificate, never frame bytes:
+	/// unsigned scope would be weaker than the certificate binding
+	/// (CWE-345). Missing trust, signer, or certificate fails closed.
+	#[must_use]
+	pub fn frame_colony_urn(&self, trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<Urn<'static>> {
+		let cert = frame_signer_cert(trust, frame)?;
+		self.cert_colony_urn(cert)
+	}
 }
 
-/// Colony URN of a frame's signer on the given trust plane.
-///
-/// Membership travels in the signer certificate, never frame bytes:
-/// unsigned scope would be weaker than the certificate binding (CWE-345).
-/// Missing trust, signer, or certificate fails closed.
-#[must_use]
-pub fn frame_colony_urn(
-	namespace: &ColonyNamespace,
-	trust: Option<&dyn CertificateTrust>,
-	frame: &Frame,
-) -> Option<Urn<'static>> {
-	let cert = frame_signer_cert(trust, frame)?;
-
-	cert_colony_urn(namespace, cert)
+/// Peer identity derived from a certificate.
+pub(crate) trait ColonyCertificate {
+	/// Stable peer key derived from the certificate itself.
+	///
+	/// Slates and misbehavior scoring key on this fingerprint, so one peer
+	/// keeps one identity across every `gateway_addr` it advertises.
+	/// `None` when the trust store yields no fingerprint, so an
+	/// unidentifiable peer fails closed.
+	fn fingerprint_id(&self) -> Option<SharedId>;
 }
 
-/// Peer-routed slate keyed by `peer_hive_id` NUL type.
-///
-/// `dial` is the claimed gateway socket stored on every entry.
-#[must_use]
-fn build_peer_slate(
-	peer_hive_id: &SharedId,
-	dial: SharedId,
-	types: &[Urn<'static>],
-	initial_pheromone: u64,
-	abandonment_limit: u32,
-) -> Vec<ServletEntry> {
-	types
-		.iter()
-		.map(|urn| {
-			let type_bytes = type_canonical_bytes(urn);
-			ServletEntry::peer(
-				Arc::clone(peer_hive_id),
-				Arc::from(type_bytes.as_slice()),
-				Arc::clone(&dial),
-				initial_pheromone,
-				abandonment_limit,
-			)
-		})
-		.collect()
+impl ColonyCertificate for Certificate {
+	fn fingerprint_id(&self) -> Option<SharedId> {
+		let fingerprint = CertificateTrustStore::to_fingerprint(self).ok()?;
+		Some(Arc::from(fingerprint.as_slice()))
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::super::RouteKind;
 	use super::*;
-	use crate::colony::common::servlet_instance;
 
 	fn nestmate_ns() -> ColonyNamespace {
 		ColonyNamespace::default()
@@ -443,16 +430,22 @@ mod tests {
 	fn advertised_types_accept_bare_reject_instance() {
 		let ns = nestmate_ns();
 		let bare = ping_type();
-		assert!(advertised_types_are_nestmate(&ns, core::slice::from_ref(&bare)));
+		assert!(ns.all_bare_servlet_types(core::slice::from_ref(&bare)));
 
-		let instance = servlet_instance(&bare, "127.0.0.1:1");
-		assert!(!advertised_types_are_nestmate(&ns, &[instance]));
+		let instance = bare.servlet_instance("127.0.0.1:1");
+		assert!(!ns.all_bare_servlet_types(&[instance]));
+	}
+
+	/// Pheromone settings the slate tests read: the shipped defaults, so a
+	/// changed default shows up here rather than silently diverging.
+	fn test_pheromone() -> PheromoneConfig {
+		PheromoneConfig::default()
 	}
 
 	#[test]
 	fn build_peer_slate_keys_by_hive_and_sets_dial() {
 		let hive: SharedId = Arc::from([1u8; 32].as_slice());
-		let slate = build_peer_slate(&hive, Arc::from(b"127.0.0.1:9000".as_slice()), &[ping_type()], 5000, 5);
+		let slate = test_pheromone().peer_slate(&hive, Arc::from(b"127.0.0.1:9000".as_slice()), &[ping_type()]);
 		assert_eq!(slate.len(), 1);
 		assert_eq!(slate[0].route_kind(), RouteKind::Peer);
 		assert_eq!(slate[0].dial_target().as_ref(), b"127.0.0.1:9000");
@@ -462,7 +455,7 @@ mod tests {
 	}
 
 	fn admitted_ad(origin: &SharedId, dial: &[u8], types: &[Urn<'static>]) -> AdmittedPeerAd {
-		let slate = build_peer_slate(origin, Arc::from(dial), types, 5000, 5);
+		let slate = test_pheromone().peer_slate(origin, Arc::from(dial), types);
 		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial_addr: Arc::from(dial), slate, order: 0 }
 	}
 
@@ -544,7 +537,7 @@ mod tests {
 		fn cert_colony_urn_extracts_a_valid_san() {
 			let key = create_test_signing_key();
 			let cert = create_test_certificate_with_uri_sans(&key, &[&main_colony().to_string()]);
-			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), Some(main_colony()));
+			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
 		}
 
 		#[test]
@@ -555,7 +548,7 @@ mod tests {
 				&key,
 				&[&servlet, "https://example.test", &main_colony().to_string()],
 			);
-			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), Some(main_colony()));
+			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
 		}
 
 		#[test]
@@ -563,7 +556,7 @@ mod tests {
 			let key = create_test_signing_key();
 			let urn = main_colony().to_string();
 			let cert = create_test_certificate_with_uri_sans(&key, &[&urn, &urn]);
-			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), Some(main_colony()));
+			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
 		}
 
 		#[test]
@@ -571,21 +564,21 @@ mod tests {
 			let key = create_test_signing_key();
 			let cert =
 				create_test_certificate_with_uri_sans(&key, &[&main_colony().to_string(), &other_colony().to_string()]);
-			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), None);
+			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
 		}
 
 		#[test]
 		fn cert_colony_urn_is_none_without_san() {
 			let key = create_test_signing_key();
 			let cert = create_test_certificate(&key);
-			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), None);
+			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
 		}
 
 		#[test]
 		fn cert_colony_urn_is_none_for_foreign_namespace() {
 			let key = create_test_signing_key();
 			let cert = create_test_certificate_with_uri_sans(&key, &[&foreign_colony().to_string()]);
-			assert_eq!(cert_colony_urn(&nestmate_ns(), &cert), None);
+			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
 		}
 	}
 }

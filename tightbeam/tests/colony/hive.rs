@@ -4,13 +4,16 @@
 
 use std::sync::Arc;
 
+use tightbeam::crypto::key::SigningKeyProvider;
+use tightbeam::crypto::x509::policy::DirectTrustValidator;
+
 use sha3::Sha3_256;
 use tightbeam::{
 	builder::{frame::FrameBuilder, TypeBuilder},
 	colony::{
 		common::{
-			current_timestamp_ms, servlet_instance, ClusterCommand, ClusterCommandResponse, ClusterStatus,
-			ColonyNamespace, HeartbeatParams, HiveManagementRequest, SpawnServletParams, StopServletParams,
+			current_timestamp_ms, ClusterCommand, ClusterCommandResponse, ClusterStatus, ColonyNamespace,
+			HeartbeatParams, HiveManagementRequest, SpawnServletParams, StopServletParams,
 		},
 		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
 		servlet::ServletConfig,
@@ -185,14 +188,10 @@ fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError
 /// Builds a manage command frame with a stop request. Each call site
 /// passes a unique id.
 fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
-	let manage_cmd = ClusterCommand {
-		heartbeat: None,
-		manage: Some(HiveManagementRequest {
-			spawn: None,
-			list: None,
-			stop: Some(StopServletParams { servlet_id: servlet_instance(&servlet_urn("none"), "127.0.0.1:0") }),
-		}),
-	};
+	let servlet_id = servlet_urn("none").servlet_instance("127.0.0.1:0");
+	let stop = StopServletParams { servlet_id };
+	let manage = HiveManagementRequest { spawn: None, list: None, stop: Some(stop) };
+	let manage_cmd = ClusterCommand { heartbeat: None, manage: Some(manage) };
 
 	command_frame(id, manage_cmd)
 }
@@ -215,12 +214,30 @@ fn spawn_command_frame(id: &[u8], servlet_type: &str) -> Result<Frame, TightBeam
 /// from the certificate. The client signs command frames with the provider.
 struct TrustedSignerContext {
 	certificate: Certificate,
-	provider: Secp256k1KeyProvider,
+	provider: Arc<Secp256k1KeyProvider>,
+}
+
+impl TrustedSignerContext {
+	/// The control-plane TLS this signer's hive presents.
+	///
+	/// The validator chain is what makes the accept side request and keep
+	/// the caller certificate. The security gate keys its per-signer
+	/// breaker on the peer the handshake proves, so a control plane that
+	/// proves no peer has no budget to key on.
+	fn control_tls(&self) -> HiveTlsConfig {
+		let anchor = DirectTrustValidator::default().with_trust_chain([self.certificate.to_owned()]);
+
+		HiveTlsConfig {
+			certificate: CertificateSpec::Built(Box::new(self.certificate.to_owned())),
+			key: Arc::clone(&self.provider) as Arc<dyn SigningKeyProvider>,
+			validators: vec![Arc::new(anchor)],
+		}
+	}
 }
 
 fn trusted_signer(subject: &str) -> TrustedSignerContext {
 	let (certificate, signing_key) = create_test_cert_with_key(subject, 365).expect("signer material");
-	TrustedSignerContext { certificate, provider: Secp256k1KeyProvider::from(signing_key) }
+	TrustedSignerContext { certificate, provider: Arc::new(Secp256k1KeyProvider::from(signing_key)) }
 }
 
 /// Starts an established hive with the context signer pinned in its trust store.
@@ -230,14 +247,29 @@ async fn start_trusted_hive(
 	mut conf: HiveConfig,
 ) -> Result<HiveX509Test, TightBeamError> {
 	conf.trust_store = Some(pinning_trust_store(&ctx.certificate)?);
+	conf.hive_tls = Some(Arc::new(ctx.control_tls()));
 
 	let mut hive = HiveX509Test::new(Some(conf))?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
 
-async fn connect_hive(hive: &HiveX509Test) -> Result<GenericClient<TokioListener>, TightBeamError> {
-	Ok(ClientBuilder::<TokioListener>::builder().build().connect(hive.addr()).await?)
+/// Dials the hive control plane as the trusted signer.
+///
+/// The client presents `ctx` as its certificate, so the accept side proves
+/// a peer and the security gate has an identity to key its breaker on.
+async fn connect_hive(
+	hive: &HiveX509Test,
+	ctx: &TrustedSignerContext,
+) -> Result<GenericClient<TokioListener>, TightBeamError> {
+	let identity = CertificateSpec::Built(Box::new(ctx.certificate.to_owned()));
+	let client = ClientBuilder::<TokioListener>::builder()
+		.with_trust_store(pinning_trust_store(&ctx.certificate)?)
+		.with_client_identity(identity, Arc::clone(&ctx.provider) as Arc<dyn SigningKeyProvider>)?
+		.build();
+
+	let addr = hive.addr().ok_or(TightBeamError::NotEstablished)?;
+	Ok(client.connect(addr).await?)
 }
 
 async fn emit_command(
@@ -365,7 +397,7 @@ tb_scenario! {
 			start_trusted_hive(&trace, &signer, conf).await
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
-			let mut client = connect_hive(&hive).await?;
+			let mut client = connect_hive(&hive, &signer).await?;
 
 			// An unsigned heartbeat must come back in the heartbeat CHOICE
 			// with no capacity data before authentication.
@@ -449,7 +481,7 @@ tb_scenario! {
 			start_trusted_hive(&trace, &signer, conf).await
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
-			let mut client = connect_hive(&hive).await?;
+			let mut client = connect_hive(&hive, &signer).await?;
 
 			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
@@ -540,8 +572,12 @@ tb_scenario! {
 			let fail_once = Arc::new(AtomicBool::new(true));
 			let seed = HiveTestServlet::start(Arc::new(trace.share()), None).await?;
 			let trust_store = pinning_trust_store(&signer.certificate)?;
+			let conf = HiveConfig {
+				trust_store: Some(trust_store),
+				hive_tls: Some(Arc::new(signer.control_tls())),
+				..Default::default()
+			};
 
-			let conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
 			let mut hive = HiveX509Test::new(Some(conf))?;
 			hive.register(servlet_urn("flaky"), seed, move |t| {
 				let fail_flag = Arc::clone(&fail_once);
@@ -558,7 +594,7 @@ tb_scenario! {
 			Ok(hive)
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
-			let mut client = connect_hive(&hive).await?;
+			let mut client = connect_hive(&hive, &signer).await?;
 			let signed = signed_spawn_frame(&signer.provider, b"spawn-retry", "flaky").await?;
 			let replay = signed.to_owned();
 
@@ -622,7 +658,12 @@ tb_scenario! {
 			};
 
 			let trust_store = pinning_trust_store(&signer.certificate)?;
-			let conf = HiveConfig { trust_store: Some(trust_store), ..Default::default() };
+			let conf = HiveConfig {
+				trust_store: Some(trust_store),
+				hive_tls: Some(Arc::new(signer.control_tls())),
+				..Default::default()
+			};
+
 			let mut hive = HiveX509Test::new(Some(conf))?;
 			hive.register(servlet_urn("orphan"), seed, |t| async move {
 				Ok(LocatorStopProbe {
@@ -636,7 +677,7 @@ tb_scenario! {
 			Ok(hive)
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
-			let mut client = connect_hive(&hive).await?;
+			let mut client = connect_hive(&hive, &signer).await?;
 			let signed = signed_spawn_frame(&signer.provider, b"spawn-orphan", "orphan").await?;
 			let response = emit_command(&mut client, signed).await?;
 			trace.event_with(SPAWN_NON_UTF8_FORBIDDEN, &[], manage_spawn_shape_status(&response)?)?;

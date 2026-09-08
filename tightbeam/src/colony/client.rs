@@ -10,14 +10,13 @@
 //! The returned frame is the servlet's end-to-end envelope. Verify its
 //! signature with [`Frame::verify`] before trusting the message body.
 
-use crate::asn1::{Frame, Metadata, Version};
-use crate::colony::common::messages::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
+use crate::asn1::Frame;
+use crate::colony::common::messages::{ClusterWorkRequest, ClusterWorkResponse};
 use crate::error::TightBeamError;
 use crate::transport::client::GenericClient;
 use crate::transport::protocols::Protocol;
 use crate::transport::MessageEmitter;
 use crate::utils::urn::Urn;
-use crate::utils::{decode, encode};
 
 use core::hash::Hash;
 
@@ -48,42 +47,15 @@ pub trait SubmitWork {
 	async fn submit_work_to(&mut self, servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError>;
 }
 
-/// Wrap `work` in the hop-local transport frame the gateway expects.
-///
-/// The wrapper is routing plumbing only. It reuses the work frame's id
-/// for correlation and carries the encoded [`ClusterRequest::Work`]
-/// envelope as its message.
-fn work_transport(servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError> {
-	let request = ClusterRequest::Work(ClusterWorkRequest::new(servlet_type, work)?);
-
-	let mut metadata = Metadata::default();
-	metadata.id = work.metadata.id.clone();
-
-	Ok(Frame {
-		version: Version::V0,
-		metadata,
-		message: encode(&request)?,
-		integrity: None,
-		nonrepudiation: None,
-	})
-}
-
-/// Unwrap the gateway's reply down to the servlet's response frame.
-fn served_reply(reply: Option<Frame>) -> Result<Frame, TightBeamError> {
-	let reply = reply.ok_or(TightBeamError::MissingResponse)?;
-	let response: ClusterWorkResponse = decode(&reply.message)?;
-
-	response.served()
-}
-
 impl<P> SubmitWork for GenericClient<P>
 where
 	P: Protocol,
 	P::Transport: MessageEmitter,
 {
 	async fn submit_work_to(&mut self, servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError> {
-		let reply = self.emit(work_transport(servlet_type, work)?, None).await?;
-		served_reply(reply)
+		let frame = ClusterWorkRequest::transport_frame(servlet_type, work)?;
+		let reply = self.emit(frame, None).await?;
+		ClusterWorkResponse::served_reply(reply)
 	}
 }
 
@@ -101,7 +73,8 @@ where
 		+ Sync,
 {
 	async fn submit_work_to(&mut self, servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError> {
-		let reply = self.emit(work_transport(servlet_type, work)?, None).await?;
-		served_reply(reply)
+		let frame = ClusterWorkRequest::transport_frame(servlet_type, work)?;
+		let reply = self.emit(frame, None).await?;
+		ClusterWorkResponse::served_reply(reply)
 	}
 }

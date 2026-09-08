@@ -247,8 +247,14 @@ pub fn decode<'a, T: der::Decode<'a>>(content: &'a impl AsRef<[u8]>) -> Result<T
 /// `compose!` macro. Useful in contexts where macros cannot be used
 /// (e.g., within other macro definitions).
 #[cfg(feature = "builder")]
-pub fn compose<T: Message>(version: Version) -> FrameBuilder<T> {
-	FrameBuilder::from(version)
+impl Version {
+	/// Start a [`FrameBuilder`] for message type `T` at this version.
+	///
+	/// This is the method form of the `compose!` macro, for contexts
+	/// where a macro cannot be used (inside another macro definition).
+	pub fn compose<T: Message>(self) -> FrameBuilder<T> {
+		FrameBuilder::from(self)
+	}
 }
 
 /// Compress data using the specified algorithm.

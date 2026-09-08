@@ -1,8 +1,5 @@
 use crate::der::Enumerated;
 
-#[cfg(feature = "derive")]
-use crate::Errorizable;
-
 /// Syslog Severity (RFC 5424, § 6.2.1)
 /// See `<https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1>`
 /// Values: 0 (Emergency) .. 7 (Debug)
@@ -69,15 +66,12 @@ impl core::str::FromStr for SyslogSeverity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
 pub enum RFC5424Error {
-	#[cfg_attr(feature = "derive", error("invalid RFC5424 severity value: {0}"))]
 	InvalidSeverityValue(u8),
-	#[cfg_attr(feature = "derive", error("invalid RFC5424 severity name: {0}"))]
 	InvalidSeverityName(String),
 }
 
-crate::impl_error_display!(RFC5424Error {
+crate::impl_error_display!(unconditional RFC5424Error {
 	InvalidSeverityValue(v) => "invalid RFC5424 severity value: {v}",
 	InvalidSeverityName(s) => "invalid RFC5424 severity name: {s}",
 });

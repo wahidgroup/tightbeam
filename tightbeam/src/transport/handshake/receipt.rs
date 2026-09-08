@@ -190,19 +190,10 @@ where
 }
 
 /// SubjectKeyIdentifier-based signer identity of a certificate's public
-/// key, matching what [`sign_receipt`] and [`countersign_receipt`] derive
+/// key, matching what [`sign_receipt`] and [`SessionReceipt::countersign`] derive
 /// from their key providers.
-#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
-pub(crate) fn certificate_signer_identifier<D>(certificate: &Certificate) -> Result<SignerIdentifier, HandshakeError>
-where
-	D: Digest,
-{
-	let spki_der = certificate.tbs_certificate.subject_public_key_info.to_der()?;
-	let sid = compute_signer_identifier_from_der::<D>(&spki_der)?;
-	Ok(sid)
-}
-
 /// Build a single-valued attribute.
+#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn single_valued(oid: ObjectIdentifier, value: Any) -> Result<Attribute, HandshakeError> {
 	let values = SetOfVec::try_from(vec![value])?;
@@ -406,82 +397,11 @@ where
 /// Countersign a verified receipt body into the client `SignerInfo`,
 /// binding the normalized settlement answer through the
 /// [`RECEIPT_ANSWER`] signed attribute.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) async fn countersign_receipt<D>(
-	receipt: &SessionReceipt,
-	answer: Option<&[u8]>,
-	key_provider: &dyn SigningKeyProvider,
-) -> Result<SignerInfo, HandshakeError>
-where
-	D: Digest + AssociatedOid,
-{
-	let receipt_der = receipt.to_der()?;
-	let client_role = ReceiptRole::Client;
-	let normalized_answer = normalize_answer(answer);
-
-	let signer_info = signer_info_over_receipt::<D>(&receipt_der, client_role, normalized_answer, key_provider).await?;
-	Ok(signer_info)
-}
-
 /// Complete a server-signed artifact with the client's `SignerInfo`.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) fn complete_receipt_artifact(
-	mut artifact: SignedData,
-	countersignature: SignerInfo,
-) -> Result<SignedData, HandshakeError> {
-	let digest_present = artifact.digest_algorithms.as_ref().contains(&countersignature.digest_alg);
-	if !digest_present {
-		// RFC 5652 §5.1 lists each signer's digest algorithm in the
-		// digestAlgorithms SET alongside its SignerInfo copy. Heap-free:
-		// receipt digest algorithms carry no parameters.
-		artifact.digest_algorithms.insert(countersignature.digest_alg.to_owned())?;
-	}
-
-	artifact.signer_infos.0.insert(countersignature)?;
-	Ok(artifact)
-}
-
 /// Parse the [`SessionReceipt`] body out of a receipt artifact, failing
 /// closed on a foreign `eContentType` or a detached body.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) fn receipt_from_artifact(artifact: &SignedData) -> Result<SessionReceipt, HandshakeError> {
-	let content_type = artifact.encap_content_info.econtent_type;
-	let content_type_matches = content_type == SESSION_RECEIPT_CONTENT;
-	if !content_type_matches {
-		return Err(HandshakeError::ReceiptMismatch);
-	}
-
-	let econtent = artifact
-		.encap_content_info
-		.econtent
-		.as_ref()
-		.ok_or(HandshakeError::ReceiptMismatch)?;
-
-	let body: OctetString = econtent.decode_as().map_err(|_| HandshakeError::ReceiptMismatch)?;
-	let body_bytes = body.as_bytes();
-	let receipt = SessionReceipt::from_der(body_bytes)?;
-	Ok(receipt)
-}
-
 /// Find the artifact's `SignerInfo` for one role, failing closed when
 /// the role appears more than once.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) fn signer_for_role(artifact: &SignedData, role: ReceiptRole) -> Result<Option<&SignerInfo>, HandshakeError> {
-	let mut found = None;
-	for signer in artifact.signer_infos.0.iter() {
-		if signer_role(signer)? != Some(role) {
-			continue;
-		}
-		if found.is_some() {
-			return Err(HandshakeError::ReceiptMismatch);
-		}
-
-		found = Some(signer);
-	}
-
-	Ok(found)
-}
-
 /// Verify one receipt `SignerInfo` against the receipt body, the
 /// expected role, and the expected signer identity.
 ///
@@ -491,6 +411,7 @@ pub(crate) fn signer_for_role(artifact: &SignedData, role: ReceiptRole) -> Resul
 /// must verify over the attributes DER. Returns the normalized
 /// settlement answer for the client role. Parse and verify failures
 /// collapse to one variant so both carriages report the same error.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn verify_receipt_signer<D, S, V>(
 	receipt_der: &[u8],
@@ -558,13 +479,15 @@ impl TryFrom<SignedData> for StoredReceipt {
 	type Error = HandshakeError;
 
 	fn try_from(artifact: SignedData) -> Result<Self, Self::Error> {
-		let receipt = receipt_from_artifact(&artifact)?;
+		let receipt = artifact.receipt()?;
 
 		let server_role = ReceiptRole::Server;
-		signer_for_role(&artifact, server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
+		artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
 
 		let client_role = ReceiptRole::Client;
-		let client_signer = signer_for_role(&artifact, client_role)?.ok_or(HandshakeError::CountersignatureMissing)?;
+		let client_signer = artifact
+			.signer_for_role(client_role)?
+			.ok_or(HandshakeError::CountersignatureMissing)?;
 		let answer = signer_answer(client_signer)?;
 		let ancillary_response = normalize_answer(answer);
 
@@ -610,7 +533,7 @@ impl StoredReceipt {
 	/// The `SignerInfo` holding one role. Presence and uniqueness were
 	/// validated at construction.
 	pub fn signer(&self, role: ReceiptRole) -> Result<&SignerInfo, HandshakeError> {
-		signer_for_role(&self.artifact, role)?.ok_or(HandshakeError::ReceiptMismatch)
+		self.artifact.signer_for_role(role)?.ok_or(HandshakeError::ReceiptMismatch)
 	}
 
 	/// Verify both signatures from the artifact and the two keys alone.
@@ -627,13 +550,18 @@ impl StoredReceipt {
 		let receipt_der = self.receipt.to_der()?;
 
 		let server_role = ReceiptRole::Server;
-		let server_signer = signer_for_role(&self.artifact, server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
+		let server_signer = self
+			.artifact
+			.signer_for_role(server_role)?
+			.ok_or(HandshakeError::ReceiptMissing)?;
 		let server_sid = compute_signer_identifier::<D, V>(server_key)?;
 		verify_receipt_signer::<D, S, V>(&receipt_der, server_signer, server_role, &server_sid, server_key)?;
 
 		let client_role = ReceiptRole::Client;
-		let client_signer =
-			signer_for_role(&self.artifact, client_role)?.ok_or(HandshakeError::CountersignatureMissing)?;
+		let client_signer = self
+			.artifact
+			.signer_for_role(client_role)?
+			.ok_or(HandshakeError::CountersignatureMissing)?;
 		let client_sid = compute_signer_identifier::<D, V>(client_key)?;
 		verify_receipt_signer::<D, S, V>(&receipt_der, client_signer, client_role, &client_sid, client_key)?;
 
@@ -916,42 +844,6 @@ pub(crate) async fn approve_or_fail_closed(
 /// # When no authorizer is installed
 ///
 /// Activate unconditionally once the signature verifies.
-#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
-pub(crate) async fn settle_receipt_ack<D, S, V>(
-	receipt: &SessionReceipt,
-	ack: Option<&SignerInfo>,
-	expected_sid: &SignerIdentifier,
-	verifying_key: &V,
-	authorizer: Option<&dyn TransportAuthorizer>,
-) -> Result<(SessionVerdict, Option<OctetString>), HandshakeError>
-where
-	D: Digest + AssociatedOid,
-	S: for<'a> TryFrom<&'a [u8]>,
-	V: PrehashVerifier<S>,
-{
-	let Some(ack) = ack else {
-		return Ok((SessionVerdict::CountersignatureMissing, None));
-	};
-
-	let receipt_der = receipt.to_der()?;
-	let client_role = ReceiptRole::Client;
-	let verified = verify_receipt_signer::<D, S, V>(&receipt_der, ack, client_role, expected_sid, verifying_key);
-	let Ok(answer) = verified else {
-		return Ok((SessionVerdict::CountersignatureInvalid, None));
-	};
-
-	let Some(authorizer) = authorizer else {
-		return Ok((SessionVerdict::Activated, answer));
-	};
-
-	let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
-	let settlement = authorizer.settle(receipt, answer_bytes).await;
-	match settlement {
-		Ok(()) => Ok((SessionVerdict::Activated, answer)),
-		Err(refusal) => Ok((SessionVerdict::SettlementRejected { code: refusal.code }, answer)),
-	}
-}
-
 /// Record the outcome with the observer, then activate or abort.
 ///
 /// Every concluded receipt exchange reaches the observer before any
@@ -962,6 +854,7 @@ where
 ///
 /// - [`StoredReceipt`] when the verdict is [`SessionVerdict::Activated`].
 /// - The matching abort [`HandshakeError`] for every other verdict.
+#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
 #[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
 pub(crate) async fn record_receipt_outcome(
 	observer: Option<&dyn SessionObserver>,
@@ -975,6 +868,169 @@ pub(crate) async fn record_receipt_outcome(
 		SessionVerdict::SettlementRejected { code } => Err(HandshakeError::SettlementRejected { code }),
 		SessionVerdict::CountersignatureInvalid => Err(HandshakeError::SignatureVerificationFailed),
 		SessionVerdict::CountersignatureMissing => Err(HandshakeError::CountersignatureMissing),
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl SessionReceipt {
+	/// Client half of the receipt's dual signature: the caller's proof that
+	/// it accepted the session terms this receipt states.
+	///
+	/// The role is fixed to `Client`, so a caller mints its own half here
+	/// and [`sign_receipt`] mints the server's. `answer` is the settlement
+	/// answer bound into the countersignature.
+	///
+	/// # Errors
+	///
+	/// - Encoding or signing failures from the receipt and key provider
+	pub(crate) async fn countersign<D>(
+		&self,
+		answer: Option<&[u8]>,
+		key_provider: &dyn SigningKeyProvider,
+	) -> Result<SignerInfo, HandshakeError>
+	where
+		D: Digest + AssociatedOid,
+	{
+		let receipt_der = self.to_der()?;
+		let client_role = ReceiptRole::Client;
+		let normalized_answer = normalize_answer(answer);
+
+		signer_info_over_receipt::<D>(&receipt_der, client_role, normalized_answer, key_provider).await
+	}
+}
+
+/// Reads and edits on a CMS receipt artifact.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) trait ReceiptArtifact: Sized {
+	/// Complete a server-signed artifact with the client's `SignerInfo`.
+	///
+	/// # Errors
+	///
+	/// - Insertion failures when the artifact's SETs are at capacity
+	fn complete(self, countersignature: SignerInfo) -> Result<Self, HandshakeError>;
+
+	/// Parse the [`SessionReceipt`] body out of this artifact.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::ReceiptMismatch`] on a foreign `eContentType`
+	///   or a detached body
+	fn receipt(&self) -> Result<SessionReceipt, HandshakeError>;
+
+	/// Find this artifact's `SignerInfo` for one role.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::ReceiptMismatch`] when the role repeats
+	fn signer_for_role(&self, role: ReceiptRole) -> Result<Option<&SignerInfo>, HandshakeError>;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl ReceiptArtifact for SignedData {
+	fn complete(mut self, countersignature: SignerInfo) -> Result<Self, HandshakeError> {
+		let digest_present = self.digest_algorithms.as_ref().contains(&countersignature.digest_alg);
+		if !digest_present {
+			// RFC 5652 §5.1 lists each signer's digest algorithm in the
+			// digestAlgorithms SET alongside its SignerInfo copy. Heap-free:
+			// receipt digest algorithms carry no parameters.
+			self.digest_algorithms.insert(countersignature.digest_alg.to_owned())?;
+		}
+
+		self.signer_infos.0.insert(countersignature)?;
+		Ok(self)
+	}
+
+	fn receipt(&self) -> Result<SessionReceipt, HandshakeError> {
+		let content_type = self.encap_content_info.econtent_type;
+		let content_type_matches = content_type == SESSION_RECEIPT_CONTENT;
+		if !content_type_matches {
+			return Err(HandshakeError::ReceiptMismatch);
+		}
+
+		let econtent = self
+			.encap_content_info
+			.econtent
+			.as_ref()
+			.ok_or(HandshakeError::ReceiptMismatch)?;
+
+		let body: OctetString = econtent.decode_as().map_err(|_| HandshakeError::ReceiptMismatch)?;
+		let body_bytes = body.as_bytes();
+		let receipt = SessionReceipt::from_der(body_bytes)?;
+		Ok(receipt)
+	}
+
+	fn signer_for_role(&self, role: ReceiptRole) -> Result<Option<&SignerInfo>, HandshakeError> {
+		let mut found = None;
+		for signer in self.signer_infos.0.iter() {
+			if signer_role(signer)? != Some(role) {
+				continue;
+			}
+			if found.is_some() {
+				return Err(HandshakeError::ReceiptMismatch);
+			}
+
+			found = Some(signer);
+		}
+
+		Ok(found)
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl SessionReceipt {
+	pub(crate) async fn settle_ack<D, S, V>(
+		&self,
+		ack: Option<&SignerInfo>,
+		expected_sid: &SignerIdentifier,
+		verifying_key: &V,
+		authorizer: Option<&dyn TransportAuthorizer>,
+	) -> Result<(SessionVerdict, Option<OctetString>), HandshakeError>
+	where
+		D: Digest + AssociatedOid,
+		S: for<'a> TryFrom<&'a [u8]>,
+		V: PrehashVerifier<S>,
+	{
+		let Some(ack) = ack else {
+			return Ok((SessionVerdict::CountersignatureMissing, None));
+		};
+
+		let receipt_der = self.to_der()?;
+		let client_role = ReceiptRole::Client;
+		let verified = verify_receipt_signer::<D, S, V>(&receipt_der, ack, client_role, expected_sid, verifying_key);
+		let Ok(answer) = verified else {
+			return Ok((SessionVerdict::CountersignatureInvalid, None));
+		};
+
+		let Some(authorizer) = authorizer else {
+			return Ok((SessionVerdict::Activated, answer));
+		};
+
+		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
+		let settlement = authorizer.settle(self, answer_bytes).await;
+		match settlement {
+			Ok(()) => Ok((SessionVerdict::Activated, answer)),
+			Err(refusal) => Ok((SessionVerdict::SettlementRejected { code: refusal.code }, answer)),
+		}
+	}
+}
+
+/// Signer identity derived from a certificate.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) trait ReceiptSigner {
+	/// SubjectKeyIdentifier-based [`SignerIdentifier`] for this certificate.
+	///
+	/// # Errors
+	///
+	/// - Encoding failures over the certificate's SPKI
+	fn signer_identifier<D: Digest>(&self) -> Result<SignerIdentifier, HandshakeError>;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl ReceiptSigner for Certificate {
+	fn signer_identifier<D: Digest>(&self) -> Result<SignerIdentifier, HandshakeError> {
+		let spki_der = self.tbs_certificate.subject_public_key_info.to_der()?;
+		let sid = compute_signer_identifier_from_der::<D>(&spki_der)?;
+		Ok(sid)
 	}
 }
 
@@ -1137,8 +1193,8 @@ mod tests {
 		) -> Result<(StoredReceipt, Secp256k1VerifyingKey, Secp256k1VerifyingKey), HandshakeError> {
 			let (receipt, artifact, server_key) = server_signed(Some(b"challenge")).await?;
 			let (client_provider, client_key) = test_provider();
-			let countersignature = countersign_receipt::<Sha3_256>(&receipt, answer, &client_provider).await?;
-			let completed = complete_receipt_artifact(artifact, countersignature)?;
+			let countersignature = receipt.countersign::<Sha3_256>(answer, &client_provider).await?;
+			let completed = artifact.complete(countersignature)?;
 
 			let stored = StoredReceipt::try_from(completed)?;
 			Ok((stored, server_key, client_key))
@@ -1178,7 +1234,7 @@ mod tests {
 		async fn server_signer_rejected_in_client_role() -> Result<(), HandshakeError> {
 			let (receipt, artifact, server_key) = server_signed(None).await?;
 			let server_role = ReceiptRole::Server;
-			let server_signer = signer_for_role(&artifact, server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
+			let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
 			let receipt_der = receipt.to_der()?;
 			let sid = compute_signer_identifier::<Sha3_256, _>(&server_key)?;
 			let client_role = ReceiptRole::Client;
@@ -1217,8 +1273,7 @@ mod tests {
 		async fn outcome_debug_redacts_countersignature() -> Result<(), HandshakeError> {
 			let (receipt, artifact, _) = server_signed(Some(b"challenge")).await?;
 			let (client_provider, _) = test_provider();
-			let countersignature =
-				countersign_receipt::<Sha3_256>(&receipt, Some(b"preimage"), &client_provider).await?;
+			let countersignature = receipt.countersign::<Sha3_256>(Some(b"preimage"), &client_provider).await?;
 			let countersignature_der = OctetString::new(countersignature.to_der()?)?;
 			let raw_debug = format!("{countersignature_der:?}");
 			let countersignature_len = countersignature_der.as_bytes().len();
@@ -1255,16 +1310,16 @@ mod tests {
 		async fn tampered_ack_settles_as_invalid_verdict() -> Result<(), HandshakeError> {
 			let (receipt, _, _) = server_signed(None).await?;
 			let (client_provider, client_key) = test_provider();
-			let mut ack = countersign_receipt::<Sha3_256>(&receipt, Some(b"preimage"), &client_provider).await?;
+			let mut ack = receipt.countersign::<Sha3_256>(Some(b"preimage"), &client_provider).await?;
 
 			let mut forged = ack.signature.as_bytes().to_vec();
 			forged[0] ^= 0x01;
 			ack.signature = OctetString::new(forged)?;
 
 			let sid = compute_signer_identifier::<Sha3_256, _>(&client_key)?;
-			let (verdict, answer) =
-				settle_receipt_ack::<Sha3_256, Secp256k1Signature, _>(&receipt, Some(&ack), &sid, &client_key, None)
-					.await?;
+			let (verdict, answer) = receipt
+				.settle_ack::<Sha3_256, Secp256k1Signature, _>(Some(&ack), &sid, &client_key, None)
+				.await?;
 			assert!(matches!(verdict, SessionVerdict::CountersignatureInvalid));
 			assert!(answer.is_none());
 			Ok(())

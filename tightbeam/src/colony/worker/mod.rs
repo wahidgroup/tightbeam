@@ -209,6 +209,28 @@ impl<I: Send> WorkerPolicies<I> {
 	pub fn receptor_gates(&self) -> &[Arc<dyn ReceptorPolicy<I> + Send + Sync>] {
 		&self.receptor_gates
 	}
+
+	/// Run every configured receptor gate over `message`.
+	///
+	/// The first refusal short-circuits, so a gate reached by the sweep
+	/// answers on a message the gates before it already admitted.
+	///
+	/// # Errors
+	///
+	/// The refusing gate's own [`TransitStatus`].
+	pub(crate) fn admits(&self, message: &I) -> Result<(), TransitStatus>
+	where
+		I: Message,
+	{
+		for gate in self.receptor_gates.iter() {
+			let status = gate.evaluate(message);
+			if status != TransitStatus::Ok {
+				return Err(status);
+			}
+		}
+
+		Ok(())
+	}
 }
 
 impl<I: Send> Default for WorkerPolicies<I> {

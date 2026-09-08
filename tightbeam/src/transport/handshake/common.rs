@@ -18,15 +18,16 @@ use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::der::asn1::ObjectIdentifier;
 use crate::oids::HANDSHAKE_ABORT_ALERT;
 use crate::oids::{AES_128_GCM, AES_256_GCM};
-use crate::transport::handshake::attributes::{extract_alert_x509, find_x509};
+use crate::transport::handshake::attributes::find_x509;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
-	select_profile, DefaultStrengthFloor, NegotiationError, ProfileStrengthPolicy, SecurityOffer,
+	DefaultStrengthFloor, NegotiationError, ProfileStrengthPolicy, SecurityOffer,
 };
 use crate::ZeroizingBytes;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::TIGHTBEAM_EPOCH_KDF_INFO;
+use crate::transport::handshake::attributes::HandshakeAlertAttribute;
 
 /// Provides profile negotiation logic for server-side handshake orchestrators.
 ///
@@ -78,7 +79,7 @@ pub trait HandshakeNegotiation {
 		}
 
 		match offer {
-			Some(offer) => Ok(select_profile(offer, &eligible)?),
+			Some(offer) => Ok(offer.select_profile(&eligible)?),
 			None => Ok(eligible[0]), // Dealer's choice
 		}
 	}
@@ -292,9 +293,8 @@ pub trait HandshakeAlertHandler {
 	fn check_for_alert(&self, attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		if let Some(attrs) = attrs {
 			let attr_refs: Vec<&Attribute> = attrs.iter().collect();
-
 			if let Ok(alert_attr) = find_x509(&attr_refs, &HANDSHAKE_ABORT_ALERT) {
-				let alert = extract_alert_x509(alert_attr)?;
+				let alert = alert_attr.handshake_alert()?;
 				return Err(HandshakeError::AbortReceived(alert));
 			}
 		}

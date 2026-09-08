@@ -355,18 +355,6 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 	}
 }
 
-/// Extract the application request frame from a single-flight envelope.
-fn single_flight_frame(envelope: TransportEnvelope) -> TransportResult<Arc<Frame>> {
-	match envelope {
-		TransportEnvelope::Request(msg) => Ok(msg.message),
-		TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
-		#[cfg(feature = "x509")]
-		TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => Err(TransportError::InvalidMessage),
-		#[cfg(feature = "transport-multiplex")]
-		TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
-	}
-}
-
 /// Write a single-flight response envelope, shared by both
 /// `MessageCollector` cfg twins. With `x509` the response wraps in a
 /// [`WireEnvelope`] for protocol compatibility.
@@ -444,8 +432,7 @@ pub trait MessageCollector: CollectorRequirements {
 	{
 		async move {
 			let request_envelope = self.read_decoded_envelope().await?;
-			let request = single_flight_frame(request_envelope)?;
-
+			let request = request_envelope.into_request_frame()?;
 			Ok((request, TransitStatus::Ok))
 		}
 	}
@@ -493,7 +480,7 @@ pub trait MessageCollector: CollectorRequirements {
 				None => return Ok(None), // Connection closed gracefully
 			};
 
-			let request = single_flight_frame(request_envelope)?;
+			let request = request_envelope.into_request_frame()?;
 			Ok(Some((request, TransitStatus::Ok)))
 		}
 	}
@@ -673,9 +660,8 @@ fn gate_collected_envelope<T>(
 where
 	T: MessageCollector + ?Sized,
 {
-	let request = single_flight_frame(envelope)?;
+	let request = envelope.into_request_frame()?;
 	let status = gate_inbound(transport.collector_gate(), transport, Some(request.as_ref()), session);
-
 	Ok((request, status))
 }
 

@@ -24,9 +24,7 @@ use crate::trace::TraceCollector;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::error::TransportFailure;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
-use crate::transport::framing::{
-	classify_boundary_error, classify_truncation_error, parse_der_length, reconstruct_der_encoding, LengthForm,
-};
+use crate::transport::framing::{parse_der_length, reconstruct_der_encoding, LengthForm};
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::TransportResult;
 
@@ -277,16 +275,13 @@ where
 	// EOF before the tag is the peer closing between frames; EOF anywhere
 	// after it is a truncated frame.
 	let mut tag = [0u8; 1];
-	stream
-		.read_exact(&mut tag)
-		.await
-		.map_err(|e| classify_boundary_error(e.into()))?;
+	stream.read_exact(&mut tag).await.map_err(|e| (e.into()).at_frame_boundary())?;
 
 	let mut length_first = [0u8; 1];
 	stream
 		.read_exact(&mut length_first)
 		.await
-		.map_err(|e| classify_truncation_error(e.into()))?;
+		.map_err(|e| (e.into()).inside_frame())?;
 
 	let (length_octets, content_length) = match LengthForm::from(length_first[0]) {
 		LengthForm::Short(length) => (Vec::new(), length),
@@ -296,7 +291,7 @@ where
 			stream
 				.read_exact(&mut length_octets)
 				.await
-				.map_err(|e| classify_truncation_error(e.into()))?;
+				.map_err(|e| (e.into()).inside_frame())?;
 
 			let length = parse_der_length(length_first[0], &length_octets).ok_or(TransportError::InvalidMessage)?;
 			(length_octets, length)
@@ -312,10 +307,7 @@ where
 	}
 
 	let mut content = vec![0u8; content_length];
-	stream
-		.read_exact(&mut content)
-		.await
-		.map_err(|e| classify_truncation_error(e.into()))?;
+	stream.read_exact(&mut content).await.map_err(|e| (e.into()).inside_frame())?;
 
 	Ok(reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content))
 }

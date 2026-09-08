@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::colony::common::{canonical_bytes, type_prefix_bytes};
-use crate::colony::hive::{CallFuture, DuplexOpenFuture, HiveContext, StreamOpenFuture, StreamResponseFuture};
+use crate::colony::hive::{
+	CallFuture, DuplexOpenFuture, HashMapRegistry, HiveContext, ServletRegistry, StreamOpenFuture, StreamResponseFuture,
+};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::router::RouterError;
 use crate::transport::client::pool::ConnectionPool;
@@ -86,12 +87,25 @@ impl<P: Protocol> HiveContextImpl<P> {
 	}
 
 	pub fn remove_route(&self, key: &[u8], type_urn: &Urn<'_>, type_bytes: &[u8], removed_addr: &Arc<[u8]>) {
-		let type_prefix = type_prefix_bytes(type_urn);
+		let type_prefix = type_urn.type_prefix_bytes();
 		let Ok(mut routes) = self.routes.write() else {
 			return;
 		};
 
 		routes.remove(key, &type_prefix, type_bytes, removed_addr);
+	}
+
+	/// Adds a route to every instance already in `servlets`.
+	///
+	/// Registration fills the registry before the hive starts, so the
+	/// routes catch up in one pass at start rather than per registration.
+	pub(crate) fn seed_routes(&self, servlets: &HashMapRegistry) {
+		servlets.for_each(|key, reg| {
+			let addr_bytes = reg.servlet.addr_bytes();
+			let type_key = reg.servlet_type.canonical_bytes();
+			// for_each borrows the registry key, and add_route needs an owned copy.
+			self.add_route(key.clone(), addr_bytes, &type_key);
+		});
 	}
 
 	fn resolve_addr(&self, servlet_type: &Urn<'_>) -> Result<P::Address, TightBeamError>
@@ -100,7 +114,7 @@ impl<P: Protocol> HiveContextImpl<P> {
 	{
 		let route_err = || TightBeamError::RouterError(RouterError::UnknownRoute);
 		let routes = self.routes.read().map_err(|_| TightBeamError::LockPoisoned)?;
-		let type_key = canonical_bytes(servlet_type);
+		let type_key = servlet_type.canonical_bytes();
 		let addr_bytes = routes.resolve(&type_key).ok_or_else(route_err)?;
 		let addr_str = core::str::from_utf8(addr_bytes.as_ref()).map_err(|_| route_err())?;
 

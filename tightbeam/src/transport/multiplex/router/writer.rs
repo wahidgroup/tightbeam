@@ -7,14 +7,14 @@ use core::task::{Context, Poll};
 use std::sync::Arc;
 
 use futures::channel::mpsc;
-use futures::{SinkExt, Stream};
+use futures::Stream;
 
-use super::outbound::{outbound_handle, Outbound};
+use super::outbound::Outbound;
 use super::shared::{MuxShared, RekeyPhase};
 use crate::transport::envelopes::{GoAwayPackage, GoAwayReason, TransportEnvelope};
 use crate::transport::io::EnvelopeSink;
 use crate::transport::multiplex::MuxRole;
-use crate::transport::{TransportError, TransportResult};
+use crate::transport::TransportResult;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use super::flow::renewal_floor;
@@ -35,89 +35,12 @@ use std::time::Instant;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
 
-/// Halt the allocator and build the GoAway, once per connection.
-/// `None` when shutdown already began.
-pub fn goaway_package(shared: &MuxShared, reason: GoAwayReason) -> Option<GoAwayPackage> {
-	let last_peer = shared.begin_shutdown()?;
-
-	#[cfg(feature = "instrument")]
-	shared.emit_goaway_event(events::MUX_GOAWAY_SENT, reason);
-
-	Some(GoAwayPackage::new(last_peer, reason))
-}
-
-/// Queue a GoAway with `reason` and halt the allocator, exactly once
-/// per connection. Shared by graceful shutdown and the budget drain.
-pub async fn drain_with_reason(
-	shared: &MuxShared,
-	outbound: &mpsc::Sender<Outbound>,
-	reason: GoAwayReason,
-) -> TransportResult<()> {
-	let Some(package) = goaway_package(shared, reason) else {
-		return Ok(());
-	};
-
-	let mut outbound = outbound_handle(outbound);
-	outbound
-		.send(Outbound::Envelope(package.into()))
-		.await
-		.map_err(|_| TransportError::ConnectionClosed)?;
-
-	Ok(())
-}
-
-/// Best-effort GoAway on a fault path: the notice rides `try_send`
-/// so it never parks the faulting loop - the connection is ending
-/// either way.
-pub fn goaway_best_effort(
-	shared: &MuxShared,
-	outbound: &mpsc::Sender<Outbound>,
-	last_stream_id: u32,
-	reason: GoAwayReason,
-) {
-	#[cfg(feature = "instrument")]
-	shared.emit_goaway_event(events::MUX_GOAWAY_SENT, reason);
-	#[cfg(not(feature = "instrument"))]
-	let _ = shared;
-
-	let package = GoAwayPackage::new(last_stream_id, reason);
-	let _ = outbound_handle(outbound).try_send(Outbound::Envelope(package.into()));
-}
-
 /// Open a renewal exactly once: readiness check and phase
 /// transition happen while holding the exchange, so concurrent
 /// triggers collapse to a single `RekeyRequest`. A contended exchange
 /// means a renewal is already being processed, which makes opening moot.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub fn open_renewal(
-	shared: &MuxShared,
-	exchange: &FuturesMutex<Box<dyn ClientRekeyExchange>>,
-) -> Option<TransportEnvelope> {
-	let mut guard = exchange.try_lock()?;
-	let request = shared.enter_renewal(|| guard.start_renewal().ok())?;
-
-	#[cfg(feature = "instrument")]
-	shared.emit_event(events::MUX_REKEY_REQUESTED);
-
-	let envelope = TransportEnvelope::from(request);
-	Some(envelope)
-}
-
-/// On a budget at the drain reserve, renew in band when possible,
-/// otherwise GoAway drain (no rekey materials).
-pub async fn renew_or_drain(shared: &MuxShared, outbound: &mpsc::Sender<Outbound>) -> TransportResult<()> {
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	if shared.renewal_ready() {
-		// A full queue drops the trigger: the budget stays at
-		// the reserve, so the next debit re-fires it
-		let _ = outbound_handle(outbound).try_send(Outbound::StartRenewal);
-		return Ok(());
-	}
-
-	drain_with_reason(shared, outbound, GoAwayReason::BudgetExhausted).await
-}
-
 /// One unit of writer work, resolved by [`MuxWriterDriver::poll_step`].
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 enum WriterStep {
 	Command(Outbound),
 	/// Owed c2s chunks quiesced: the held `RekeyAck` may go out
@@ -310,7 +233,7 @@ where
 		let Some(exchange) = self.exchange.as_ref() else {
 			return Ok(());
 		};
-		let Some(request) = open_renewal(&self.shared, exchange) else {
+		let Some(request) = self.shared.open_renewal(exchange) else {
 			return Ok(());
 		};
 
@@ -324,7 +247,7 @@ where
 		self.pending_ack = None;
 		self.renewal_started = None;
 
-		if let Some(package) = goaway_package(&self.shared, GoAwayReason::Shutdown) {
+		if let Some(package) = self.shared.goaway_package(GoAwayReason::Shutdown) {
 			let envelope = TransportEnvelope::from(package);
 			self.writer.write_envelope(envelope).await?;
 		}
@@ -352,7 +275,7 @@ where
 			if remaining > renewal_floor(drain_floor) {
 				return Ok(());
 			}
-			if let Some(request) = open_renewal(&self.shared, exchange) {
+			if let Some(request) = self.shared.open_renewal(exchange) {
 				return self.writer.write_envelope(request).await;
 			}
 			if remaining > drain_floor {
@@ -370,11 +293,38 @@ where
 
 		// Bypass the command queue: at the record ceiling the queue
 		// may already be full of owed stream traffic.
-		if let Some(package) = goaway_package(&self.shared, GoAwayReason::Shutdown) {
+		if let Some(package) = self.shared.goaway_package(GoAwayReason::Shutdown) {
 			let envelope = TransportEnvelope::from(package);
 			self.writer.write_envelope(envelope).await?;
 		}
 
 		Ok(())
+	}
+}
+
+impl MuxShared {
+	/// Halt the allocator and build the GoAway, once per connection.
+	/// `None` when shutdown already began.
+	pub(crate) fn goaway_package(&self, reason: GoAwayReason) -> Option<GoAwayPackage> {
+		let last_peer = self.begin_shutdown()?;
+
+		#[cfg(feature = "instrument")]
+		self.emit_goaway_event(events::MUX_GOAWAY_SENT, reason);
+
+		Some(GoAwayPackage::new(last_peer, reason))
+	}
+
+	pub(crate) fn open_renewal(
+		&self,
+		exchange: &FuturesMutex<Box<dyn ClientRekeyExchange>>,
+	) -> Option<TransportEnvelope> {
+		let mut guard = exchange.try_lock()?;
+		let request = self.enter_renewal(|| guard.start_renewal().ok())?;
+
+		#[cfg(feature = "instrument")]
+		self.emit_event(events::MUX_REKEY_REQUESTED);
+
+		let envelope = TransportEnvelope::from(request);
+		Some(envelope)
 	}
 }

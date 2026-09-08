@@ -23,9 +23,7 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
-use crate::transport::framing::{
-	classify_boundary_error, classify_truncation_error, parse_der_length, reconstruct_der_encoding, LengthForm,
-};
+use crate::transport::framing::{parse_der_length, reconstruct_der_encoding, LengthForm};
 use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
 use crate::transport::handshake::{
@@ -123,7 +121,7 @@ where
 			let mut tag_byte = [0u8; 1];
 			self.stream
 				.read_exact(&mut tag_byte)
-				.map_err(|e| classify_boundary_error(e.into()))?;
+				.map_err(|e| (e.into()).at_frame_boundary())?;
 
 			#[cfg(feature = "std")]
 			self.arm_read_deadline(deadline)?;
@@ -131,7 +129,7 @@ where
 			let mut length_first = [0u8; 1];
 			self.stream
 				.read_exact(&mut length_first)
-				.map_err(|e| classify_truncation_error(e.into()))?;
+				.map_err(|e| (e.into()).inside_frame())?;
 
 			let (length_octets, content_length) = match LengthForm::from(length_first[0]) {
 				LengthForm::Short(length) => (vec![], length),
@@ -143,7 +141,7 @@ where
 
 					self.stream
 						.read_exact(&mut length_octets)
-						.map_err(|e| classify_truncation_error(e.into()))?;
+						.map_err(|e| (e.into()).inside_frame())?;
 
 					let length =
 						parse_der_length(length_first[0], &length_octets).ok_or(TransportError::InvalidMessage)?;
@@ -188,19 +186,15 @@ where
 						let end = usize::min(filled + slice_len, content_length);
 						self.stream
 							.read_exact(&mut content[filled..end])
-							.map_err(|e| classify_truncation_error(e.into()))?;
+							.map_err(|e| (e.into()).inside_frame())?;
 						filled = end;
 					}
 				} else {
-					self.stream
-						.read_exact(&mut content)
-						.map_err(|e| classify_truncation_error(e.into()))?;
+					self.stream.read_exact(&mut content).map_err(|e| (e.into()).inside_frame())?;
 				}
 			}
 			#[cfg(not(feature = "std"))]
-			self.stream
-				.read_exact(&mut content)
-				.map_err(|e| classify_truncation_error(e.into()))?;
+			self.stream.read_exact(&mut content).map_err(|e| (e.into()).inside_frame())?;
 
 			let buffer = reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
 			Ok(buffer)

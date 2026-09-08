@@ -6,8 +6,11 @@
 ///   feature is disabled, following the strings of an `Errorizable` derive.
 ///   The message strings exist twice (attribute + macro), so this form is
 ///   reserved for types that need `Errorizable`'s extra codegen.
-/// - `impl_error_display!(unconditional Type { ... })` emits regardless of
-///   features.
+/// - `impl_error_display!(unconditional Type { ... })` emits `Display` and
+///   an empty `Error` regardless of features.
+/// - `impl_error_display!(unconditional display Type { ... })` emits
+///   `Display` alone, for an enum that writes its own `Error` to delegate
+///   `source()` to a wrapped error.
 ///
 /// Variants may carry `cfg` attributes, which are forwarded to the
 /// generated match arms.
@@ -18,6 +21,11 @@ macro_rules! impl_error_display {
 		$crate::impl_error_display!(@impls $error_type { $($body)* });
 	};
 
+	// Display only: the enum writes its own `Error` to carry `source()`.
+	(unconditional display $error_type:ident { $($body:tt)* }) => {
+		$crate::impl_error_display!(@display $error_type { $($body)* });
+	};
+
 	// Derive entry: only when the derive feature is disabled.
 	($error_type:ident { $($body:tt)* }) => {
 		#[cfg(not(feature = "derive"))]
@@ -25,7 +33,14 @@ macro_rules! impl_error_display {
 	};
 
 	// Helper: generate the Display and Error impls
-	(@impls $error_type:ident { $($(#[$vattr:meta])* $variant:ident $(($($tuple_field:ident),*))? $({ $($struct_field:ident),* })? => $fmt:expr),* $(,)? }) => {
+	(@impls $error_type:ident { $($body:tt)* }) => {
+		$crate::impl_error_display!(@display $error_type { $($body)* });
+
+		impl core::error::Error for $error_type {}
+	};
+
+	// Helper: generate the Display impl alone
+	(@display $error_type:ident { $($(#[$vattr:meta])* $variant:ident $(($($tuple_field:ident),*))? $({ $($struct_field:ident),* })? => $fmt:expr),* $(,)? }) => {
 		impl core::fmt::Display for $error_type {
 			fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 				match self {
@@ -37,8 +52,6 @@ macro_rules! impl_error_display {
 				}
 			}
 		}
-
-		impl core::error::Error for $error_type {}
 	};
 
 	// Helper: generate match pattern for unit variant

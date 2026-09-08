@@ -188,7 +188,8 @@ macro_rules! servlet {
 			protocol: $protocol,
 			handle: raw |$frame, $ctx| async move {
 				let mut $frame = $frame;
-				$crate::colony::servlet::prepare_typed_frame(&mut $frame, $ctx)?;
+				$frame.prepare_typed($ctx)?;
+
 				let $msg: $input = $crate::decode(&$frame.message)?;
 				$handler_body
 			}

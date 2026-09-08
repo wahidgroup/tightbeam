@@ -2,7 +2,7 @@
 
 use crate::der::Sequence;
 use crate::instrumentation::EvidenceArtifact;
-use crate::testing::fmea::{FailureMode, FmeaReport, SeverityScale};
+use crate::testing::fmea::{FailureMode, FmeaReport};
 use crate::Beamable;
 
 /// FMEA artifact in ASN.1 format
@@ -35,8 +35,8 @@ pub struct FailureModeAsn1 {
 impl FmeaArtifact {
 	/// Create FMEA artifact from evidence and report
 	pub fn new(evidence: EvidenceArtifact, report: FmeaReport) -> Self {
-		let severity_scale = encode_severity_scale(report.severity_scale);
-		let failure_modes = report.failure_modes.iter().map(encode_failure_mode).collect();
+		let severity_scale = report.severity_scale.wire_code();
+		let failure_modes = report.failure_modes.iter().map(FailureMode::to_asn1).collect();
 
 		Self {
 			evidence,
@@ -45,23 +45,20 @@ impl FmeaArtifact {
 	}
 }
 
-fn encode_severity_scale(scale: SeverityScale) -> u8 {
-	match scale {
-		SeverityScale::MilStd1629 => 0,
-		SeverityScale::Iso26262 => 1,
-	}
-}
+impl FailureMode {
+	/// Wire form of this failure mode, effects joined into one field.
+	fn to_asn1(&self) -> FailureModeAsn1 {
+		let effects = self.effects.join("; ");
 
-fn encode_failure_mode(fm: &FailureMode) -> FailureModeAsn1 {
-	let effects_str = fm.effects.join("; ");
-	FailureModeAsn1 {
-		component: fm.component.as_bytes().to_vec(),
-		failure: fm.failure.as_bytes().to_vec(),
-		effects: effects_str.as_bytes().to_vec(),
-		severity: fm.severity,
-		occurrence: fm.occurrence,
-		detection: fm.detection,
-		rpn: fm.rpn,
+		FailureModeAsn1 {
+			component: self.component.as_bytes().to_vec(),
+			failure: self.failure.as_bytes().to_vec(),
+			effects: effects.as_bytes().to_vec(),
+			severity: self.severity,
+			occurrence: self.occurrence,
+			detection: self.detection,
+			rpn: self.rpn,
+		}
 	}
 }
 

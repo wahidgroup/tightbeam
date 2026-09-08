@@ -11,6 +11,7 @@ use futures::Stream;
 
 use super::handle::CancelOnDrop;
 use super::shared::OpenSlot;
+use super::sink::RequestSink;
 use crate::der::Decode;
 use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
@@ -63,6 +64,42 @@ pub struct StreamBody {
 }
 
 impl StreamBody {
+	/// Assemble a body and the forwarder that feeds it, for one streaming
+	/// request.
+	///
+	/// Channel capacity covers the grant window plus the `End` marker: the
+	/// reader clamps streaming grants to `consumed + window`, so a
+	/// conforming peer can never overrun the channel.
+	pub(crate) fn pair(
+		slot: Arc<OpenSlot>,
+		window: u64,
+		drained: mpsc::UnboundedSender<DrainNote>,
+	) -> (Self, ForwardedStream) {
+		let capacity = usize::try_from(window).unwrap_or(usize::MAX).saturating_add(1);
+		let (events, receiver) = mpsc::channel(capacity);
+
+		let body = Self { slot, events: receiver, drained, consumed: 0, finished: false, guard: None };
+		let forwarder = ForwardedStream { events, received: 0, limit: window, window };
+		(body, forwarder)
+	}
+
+	/// Feed every chunk of this body into `sink`, then close the sink so
+	/// its stream ends.
+	///
+	/// Consuming each chunk replenishes the peer's credit, so a slow
+	/// downstream parks the upstream (end-to-end backpressure).
+	///
+	/// # Errors
+	///
+	/// The first read or push failure, with the sink left unclosed.
+	pub(crate) async fn drain_into(mut self, mut sink: RequestSink) -> TransportResult<()> {
+		while let Some(chunk) = self.chunk().await? {
+			sink.push(&chunk).await?;
+		}
+
+		sink.close().await
+	}
+
 	/// Arm the drop guard: dropping this body before its terminal
 	/// event cancels the stream on both endpoints.
 	pub fn arm_guard(&mut self, guard: CancelOnDrop) {
@@ -170,24 +207,6 @@ impl Stream for StreamBody {
 	}
 }
 
-/// Assemble a body/forwarder pair for one streaming request.
-///
-/// Channel capacity covers the grant window plus the `End` marker:
-/// the reader clamps streaming grants to `consumed + window`, so a
-/// conforming peer can never overrun the channel.
-pub fn stream_body(
-	slot: Arc<OpenSlot>,
-	window: u64,
-	drained: mpsc::UnboundedSender<DrainNote>,
-) -> (StreamBody, ForwardedStream) {
-	let capacity = usize::try_from(window).unwrap_or(usize::MAX).saturating_add(1);
-	let (events, receiver) = mpsc::channel(capacity);
-
-	let body = StreamBody { slot, events: receiver, drained, consumed: 0, finished: false, guard: None };
-	let forwarder = ForwardedStream { events, received: 0, limit: window, window };
-	(body, forwarder)
-}
-
 /// Reader-side ledger of a streaming request: chunks forward into
 /// the body channel instead of a reassembly buffer.
 pub struct ForwardedStream {
@@ -260,7 +279,7 @@ impl ForwardedStream {
 mod tests {
 	use core::task::Poll;
 
-	use super::super::testing::{body_fixture, noop_cx, poll_chunk, poll_now};
+	use super::super::testing::{body_fixture, noop_cx, poll_now};
 	use super::*;
 	use crate::der::Encode;
 	use crate::testing::create_v0_tightbeam;
@@ -272,11 +291,11 @@ mod tests {
 		assert!(forwarder.forward(BodyEvent::Chunk(vec![1, 2])));
 		assert!(forwarder.forward(BodyEvent::End));
 
-		let first = poll_chunk(&mut body);
+		let first = body.poll_chunk_now();
 		assert!(matches!(first, Poll::Ready(Ok(Some(chunk))) if chunk == [1, 2]));
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 		// Terminal state is sticky
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 
 		let note = notes.try_recv();
 		assert!(matches!(note, Ok(DrainNote { stream_id: 7, consumed: 1 })));
@@ -289,7 +308,7 @@ mod tests {
 		let (mut body, forwarder, _notes) = body_fixture(7, 4);
 		drop(forwarder);
 
-		let severed = poll_chunk(&mut body);
+		let severed = body.poll_chunk_now();
 		assert!(matches!(severed, Poll::Ready(Err(TransportError::ConnectionClosed))));
 	}
 
@@ -298,9 +317,9 @@ mod tests {
 		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
 		assert!(forwarder.forward(BodyEvent::Failed(TransportError::Draining)));
 
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Err(TransportError::Draining))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
 		// Terminal state is sticky
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 	}
 
 	#[test]
@@ -390,8 +409,7 @@ mod tests {
 		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
 		assert!(forwarder.accept_and_forward(&[]));
 		assert!(forwarder.forward(BodyEvent::End));
-
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 		assert!(matches!(forwarder.limits(), (4, 4)));
 	}
 }

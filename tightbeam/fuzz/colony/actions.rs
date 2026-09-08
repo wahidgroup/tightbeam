@@ -8,7 +8,6 @@ use tightbeam::colony::cluster::{
 	Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ServletEntry, DEFAULT_ABANDONMENT_LIMIT,
 	DEFAULT_INITIAL_PHEROMONE,
 };
-use tightbeam::colony::common::type_canonical_bytes;
 use tightbeam::compose;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::x509::store::CertificateTrust;
@@ -895,7 +894,7 @@ fn pin_decoy_for(
 	type_name: &str,
 	dial_addr: &[u8],
 ) {
-	let canonical = type_canonical_bytes(&servlet_urn(type_name));
+	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	let key = gateway.peer_routes().into_iter().find_map(|route| {
 		if route.dial_addr.as_ref() != dial_addr || route.servlet_type.as_ref() != canonical.as_slice() {
 			return None;

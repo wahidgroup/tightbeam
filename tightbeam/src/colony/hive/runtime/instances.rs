@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use crate::colony::common::{canonical_bytes, instance_urn};
 use crate::colony::hive::runtime::HiveContextImpl;
 use crate::colony::hive::{HashMapRegistry, ServletRegistration, ServletRegistry};
 use crate::transport::Protocol;
@@ -37,7 +36,7 @@ impl<'a, P: Protocol> HiveInstances<'a, P> {
 	///   unnameable registration ends with its servlet.
 	pub fn insert(&self, registration: ServletRegistration) -> Result<(Urn<'static>, Arc<[u8]>), TightBeamError> {
 		let addr_bytes = registration.servlet.addr_bytes();
-		let instance = match instance_urn(&registration.servlet_type, addr_bytes.as_ref()) {
+		let instance = match registration.servlet_type.instance_urn(addr_bytes.as_ref()) {
 			Ok(instance) => instance,
 			Err(err) => {
 				let ServletRegistration { servlet, .. } = registration;
@@ -46,8 +45,8 @@ impl<'a, P: Protocol> HiveInstances<'a, P> {
 			}
 		};
 
-		let key_bytes = canonical_bytes(&instance);
-		let type_key = canonical_bytes(&registration.servlet_type);
+		let key_bytes = instance.canonical_bytes();
+		let type_key = registration.servlet_type.canonical_bytes();
 		// Vec clone: route map and registry each must own a key.
 		let route_key = key_bytes.clone();
 
@@ -64,7 +63,7 @@ impl<'a, P: Protocol> HiveInstances<'a, P> {
 	/// cluster with. [`None`] means `key` named no instance.
 	pub fn remove(&self, key: &[u8]) -> Option<(Urn<'static>, Arc<[u8]>)> {
 		let ServletRegistration { servlet, servlet_type, .. } = self.servlets.remove(key)?;
-		let removed_type = canonical_bytes(&servlet_type);
+		let removed_type = servlet_type.canonical_bytes();
 		let removed_addr = servlet.addr_bytes();
 
 		servlet.stop_boxed();

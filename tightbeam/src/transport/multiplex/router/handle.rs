@@ -7,21 +7,15 @@ use std::sync::Arc;
 use futures::channel::{mpsc, oneshot};
 use futures::SinkExt;
 
-use super::body::{stream_body, DrainNote, StreamBody};
+use super::body::{DrainNote, StreamBody};
 use super::flow::{chunk_records, payload_credits};
-use super::outbound::{outbound_handle, Outbound};
-use super::shared::{
-	cancel_error, enqueue_stream_cancel, BudgetStanding, MuxShared, OpenRequest, OpenSlot, StreamOutcome,
-	StreamReservation,
-};
-use super::sink::{send_data_envelope, send_open_envelope, RequestSink};
-use super::writer::{drain_with_reason, renew_or_drain};
+use super::link::MuxLink;
+use super::outbound::Outbound;
+use super::shared::{BudgetStanding, MuxShared, OpenRequest, OpenSlot, StreamOutcome, StreamReservation};
+use super::sink::RequestSink;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::Encode;
-use crate::policy::TransitStatus;
-use crate::transport::envelopes::{
-	GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
-};
+use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxPingPackage, MuxStreamKind, TransportEnvelope};
 use crate::transport::error::TransportFailure;
 use crate::transport::multiplex::{MultiplexedProtocol, StreamRoute, StreamingProtocol};
 use crate::transport::{TransportError, TransportResult};
@@ -45,21 +39,15 @@ use crate::transport::GateAudit;
 /// guard dropped before the Open ever went out stands down on its
 /// own (nothing on the wire, the reservation releases the cap slot).
 pub struct CancelOnDrop {
-	shared: Arc<MuxShared>,
-	outbound: mpsc::Sender<Outbound>,
+	link: MuxLink,
 	slot: Arc<OpenSlot>,
 	armed: bool,
 }
 
 impl CancelOnDrop {
 	/// Armed guard over a stream identified by `slot`.
-	fn new(shared: &Arc<MuxShared>, outbound: &mpsc::Sender<Outbound>, slot: Arc<OpenSlot>) -> Self {
-		Self {
-			shared: Arc::clone(shared),
-			outbound: outbound_handle(outbound),
-			slot,
-			armed: true,
-		}
+	fn new(link: &MuxLink, slot: Arc<OpenSlot>) -> Self {
+		Self { link: link.clone(), slot, armed: true }
 	}
 
 	pub fn disarm(&mut self) {
@@ -74,7 +62,7 @@ impl Drop for CancelOnDrop {
 		}
 
 		if let Some(stream_id) = self.slot.get() {
-			enqueue_stream_cancel(&self.shared, &self.outbound, stream_id);
+			self.link.enqueue_stream_cancel(stream_id);
 		}
 	}
 }
@@ -104,30 +92,6 @@ impl Drop for ForgetPingOnDrop {
 	}
 }
 
-/// Prefer moving the frame out of the Arc. Deep-copy only when the
-/// inbound path still holds a shared reference (dual ownership).
-fn unwrap_frame(frame: Arc<Frame>) -> Frame {
-	Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone())
-}
-
-fn resolve_response(response: ResponsePackage) -> TransportResult<Option<Frame>> {
-	match response.status() {
-		TransitStatus::Ok => Ok(response.message.map(unwrap_frame)),
-		status => Err(TransportError::from(status)),
-	}
-}
-
-/// Map a pending stream's delivered outcome (or its dropped slot)
-/// to the caller-facing result.
-fn resolve_outcome(outcome: Result<StreamOutcome, oneshot::Canceled>) -> TransportResult<Option<Frame>> {
-	match outcome {
-		Ok(StreamOutcome::Response(response)) => resolve_response(response),
-		Ok(StreamOutcome::Cancelled(reason)) => Err(cancel_error(reason)),
-		Ok(StreamOutcome::Draining) => Err(TransportError::Draining),
-		Err(_) => Err(TransportError::ConnectionClosed),
-	}
-}
-
 /// Cloneable client handle for a multiplexed connection.
 ///
 /// Shares pending-stream state and the outbound queue across clones
@@ -136,8 +100,7 @@ fn resolve_outcome(outcome: Result<StreamOutcome, oneshot::Canceled>) -> Transpo
 /// See [`MuxHandle::emit_on_stream`] and [`MuxHandle::ping`].
 #[derive(Clone)]
 pub struct MuxHandle {
-	shared: Arc<MuxShared>,
-	outbound: mpsc::Sender<Outbound>,
+	link: MuxLink,
 	/// Consumption reports from duplex reply bodies back to the
 	/// reader's credit replenishment
 	drain_feedback: mpsc::UnboundedSender<DrainNote>,
@@ -150,19 +113,15 @@ pub struct MuxHandle {
 impl GateAudit for MuxHandle {
 	#[cfg(feature = "instrument")]
 	fn audit_trace(&self) -> Option<&TraceCollector> {
-		self.shared.trace.as_ref()
+		self.link.shared().trace.as_ref()
 	}
 }
 
 impl MuxHandle {
 	/// Assemble a handle over the connection's shared state and
 	/// queues (refcount bumps only, no data copies).
-	pub fn new(
-		shared: Arc<MuxShared>,
-		outbound: mpsc::Sender<Outbound>,
-		drain_feedback: mpsc::UnboundedSender<DrainNote>,
-	) -> Self {
-		Self { shared, outbound, drain_feedback }
+	pub(crate) fn new(link: MuxLink, drain_feedback: mpsc::UnboundedSender<DrainNote>) -> Self {
+		Self { link, drain_feedback }
 	}
 
 	/// Send a request on a freshly allocated stream and await its
@@ -184,19 +143,23 @@ impl MuxHandle {
 		// Encode before reserving so an encoding failure never burns
 		// a cap slot or queues work for a stream the peer never saw.
 		let payload = frame.to_der()?;
-		let credits = payload_credits(payload.len(), self.shared.send_chunk_size, self.shared.credit_unit);
+		let credits = payload_credits(
+			payload.len(),
+			self.link.shared().send_chunk_size,
+			self.link.shared().credit_unit,
+		);
 
 		let (sender, receiver) = oneshot::channel();
 		// The reservation holds the cap slot until the Open goes out
 		// and releases it if this future is dropped waiting out a
 		// renewal: no ID exists yet, so nothing needs cancelling
-		let mut reservation = self.shared.reserve_stream_slot(sender)?;
+		let mut reservation = self.link.shared().reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
 
-		let standing = self.shared.admit_debit(credits, false).await?;
+		let standing = self.link.shared().admit_debit(credits, false).await?;
 
-		let total = chunk_records(payload.len(), self.shared.send_chunk_size);
-		let mut guard = CancelOnDrop::new(&self.shared, &self.outbound, Arc::clone(&slot));
+		let total = chunk_records(payload.len(), self.link.shared().send_chunk_size);
+		let mut guard = CancelOnDrop::new(&self.link, Arc::clone(&slot));
 
 		match self.send_request_chunks(&mut reservation, &payload, total).await {
 			Ok(()) => {}
@@ -207,17 +170,18 @@ impl MuxHandle {
 		}
 
 		if matches!(standing, BudgetStanding::Exhausting) {
-			renew_or_drain(&self.shared, &self.outbound).await?;
+			self.link.renew_or_drain().await?;
 		}
 
 		let outcome = receiver.await;
 
 		guard.disarm();
+
 		if let Some(stream_id) = slot.get() {
-			self.shared.finish_send_stream(stream_id);
+			self.link.shared().finish_send_stream(stream_id);
 		}
 
-		resolve_outcome(outcome)
+		outcome.map_or(Err(TransportError::ConnectionClosed), StreamOutcome::resolve)
 	}
 
 	/// Open a streaming request: push chunks through the returned
@@ -269,31 +233,30 @@ impl MuxHandle {
 	) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
 		let (target, hops_remaining) = route.into_parts();
 		let (sender, receiver) = oneshot::channel();
-		let reservation = self.shared.reserve_stream_slot(sender)?;
+		let reservation = self.link.shared().reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
 
 		let sink = RequestSink::new(
 			reservation,
 			MuxStreamKind::Streaming,
-			Arc::clone(&self.shared),
-			outbound_handle(&self.outbound),
+			self.link.clone(),
 			None,
 			target,
 			hops_remaining,
 		);
 
-		let shared = Arc::clone(&self.shared);
-		let outbound = outbound_handle(&self.outbound);
+		let link = self.link.clone();
 		let response = async move {
-			let mut guard = CancelOnDrop::new(&shared, &outbound, Arc::clone(&slot));
+			let mut guard = CancelOnDrop::new(&link, Arc::clone(&slot));
 			let outcome = receiver.await;
 
 			guard.disarm();
+
 			if let Some(stream_id) = slot.get() {
-				shared.finish_send_stream(stream_id);
+				link.shared().finish_send_stream(stream_id);
 			}
 
-			resolve_outcome(outcome)
+			outcome.map_or(Err(TransportError::ConnectionClosed), StreamOutcome::resolve)
 		};
 
 		Ok((sink, response))
@@ -349,7 +312,7 @@ impl MuxHandle {
 	pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 		let (target, hops_remaining) = route.into_parts();
 		let (sender, receiver) = oneshot::channel();
-		let reservation = self.shared.reserve_stream_slot(sender)?;
+		let reservation = self.link.shared().reserve_stream_slot(sender)?;
 		let slot = reservation.slot();
 
 		// The reply travels through the body, not the outcome slot:
@@ -359,19 +322,21 @@ impl MuxHandle {
 		// The forwarder follows the reservation into the sink and
 		// registers under the assigned ID at first push, before the
 		// Open can reach the peer.
-		let (mut body, forwarder) =
-			stream_body(Arc::clone(&slot), self.shared.initial_recv_credit, self.drain_feedback.clone());
+		let (mut body, forwarder) = StreamBody::pair(
+			Arc::clone(&slot),
+			self.link.shared().initial_recv_credit,
+			self.drain_feedback.clone(),
+		);
 
 		// An abandoned reply must reclaim its cap slot: without the
 		// guard, a closed-sink duplex stream has no cancel path and
 		// the slot stays pinned until the peer's trailer
-		body.arm_guard(CancelOnDrop::new(&self.shared, &self.outbound, slot));
+		body.arm_guard(CancelOnDrop::new(&self.link, slot));
 
 		let sink = RequestSink::new(
 			reservation,
 			MuxStreamKind::Duplex,
-			Arc::clone(&self.shared),
-			outbound_handle(&self.outbound),
+			self.link.clone(),
 			Some(forwarder),
 			target,
 			hops_remaining,
@@ -389,8 +354,7 @@ impl MuxHandle {
 		payload: &[u8],
 		total: u64,
 	) -> TransportResult<()> {
-		let chunk_size = self.shared.send_chunk_size;
-		let mut outbound = outbound_handle(&self.outbound);
+		let chunk_size = self.link.shared().send_chunk_size;
 		let mut chunks = payload.chunks(chunk_size);
 		let mut sent: u64 = 0;
 		let first = chunks.next().unwrap_or(&[]);
@@ -406,13 +370,13 @@ impl MuxHandle {
 			hops_remaining: DEFAULT_HOP_BUDGET,
 		};
 
-		let stream_id = send_open_envelope(&self.shared, &mut outbound, reservation, &mut request).await?;
+		let stream_id = self.link.send_open_envelope(reservation, &mut request).await?;
 		for chunk in chunks {
 			sent += 1;
 
 			let data = MuxDataPackage::new(stream_id, sent == total, chunk)?;
 			let data_envelope = TransportEnvelope::from(data);
-			send_data_envelope(&self.shared, &mut outbound, stream_id, data_envelope).await?;
+			self.link.send_data_envelope(stream_id, data_envelope).await?;
 		}
 
 		Ok(())
@@ -424,7 +388,7 @@ impl MuxHandle {
 	/// Advisory: a concurrent emit can take the last slot after this
 	/// returns, so callers still handle `StreamsExhausted`.
 	pub fn has_stream_headroom(&self) -> bool {
-		self.shared.has_stream_headroom()
+		self.link.shared().has_stream_headroom()
 	}
 
 	/// Whether any locally-initiated stream is still awaiting its response.
@@ -432,7 +396,7 @@ impl MuxHandle {
 	/// Callers with a clock use this to pin a connection as active while
 	/// streams are in flight (see pool `last_used` stamping).
 	pub fn has_pending_streams(&self) -> bool {
-		self.shared.has_pending_streams()
+		self.link.shared().has_pending_streams()
 	}
 
 	/// Reason carried by the peer's GoAway, or `None` while the
@@ -442,7 +406,7 @@ impl MuxHandle {
 	/// immediate reconnect, `EnhanceYourCalm` calls for backoff, and
 	/// `ProtocolError` points at a bug rather than a transient fault.
 	pub fn goaway_reason(&self) -> Option<GoAwayReason> {
-		self.shared.goaway_reason()
+		self.link.shared().goaway_reason()
 	}
 
 	/// Current epoch's dual-signed session receipt, rotated in
@@ -450,7 +414,7 @@ impl MuxHandle {
 	/// without receipt-bearing rekey materials.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
-		self.shared.session_receipt()
+		self.link.shared().session_receipt()
 	}
 
 	/// Resolve once a locally-initiated stream would be admitted:
@@ -463,7 +427,7 @@ impl MuxHandle {
 	/// # Errors
 	/// - `Draining`: GoAway sent or received, or stream IDs exhausted.
 	pub fn wait_for_stream_slot(&self) -> impl Future<Output = TransportResult<()>> + MaybeSend {
-		self.shared.stream_slot()
+		self.link.shared().stream_slot()
 	}
 
 	/// Connection-level liveness probe
@@ -479,12 +443,12 @@ impl MuxHandle {
 	/// - `ConnectionClosed`: connection failed before the ack
 	pub async fn ping(&self) -> TransportResult<()> {
 		let (sender, receiver) = oneshot::channel();
-		let opaque = self.shared.allocate_ping(sender)?;
-		let shared = Arc::clone(&self.shared);
+		let opaque = self.link.shared().allocate_ping(sender)?;
+		let shared = Arc::clone(self.link.shared());
 		let mut guard = ForgetPingOnDrop { shared, opaque, armed: true };
 
 		let probe = MuxPingPackage::new(false, opaque);
-		let mut outbound = outbound_handle(&self.outbound);
+		let mut outbound = self.link.sender();
 		outbound
 			.send(Outbound::Envelope(probe.into()))
 			.await
@@ -514,11 +478,10 @@ impl MuxHandle {
 	/// GoAway. Application-defined codes live at or above
 	/// [`MUX_APPLICATION_CODE_FLOOR`](crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR).
 	pub async fn shutdown_with(&self, reason: GoAwayReason) -> TransportResult<()> {
-		drain_with_reason(&self.shared, &self.outbound, reason).await?;
+		self.link.announce_goaway(reason).await?;
+		self.link.shared().drain_pending().await;
 
-		self.shared.drain_pending().await;
-
-		let mut outbound = outbound_handle(&self.outbound);
+		let mut outbound = self.link.sender();
 		let _ = outbound.send(Outbound::Close).await;
 		Ok(())
 	}
@@ -526,7 +489,7 @@ impl MuxHandle {
 
 impl MultiplexedProtocol for MuxHandle {
 	fn max_concurrent_streams(&self) -> u32 {
-		self.shared.local_cap
+		self.link.shared().local_cap
 	}
 
 	fn emit_on_stream(&self, frame: &Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend {
@@ -551,7 +514,7 @@ mod tests {
 	use core::task::Poll;
 
 	use super::super::body::BodyEvent;
-	use super::super::testing::{client_shared, poll_chunk, poll_now};
+	use super::super::testing::{client_shared, poll_now};
 	use super::*;
 	use crate::transport::envelopes::MuxEnvelope;
 	use crate::utils::urn::Urn;
@@ -559,8 +522,7 @@ mod tests {
 	fn duplex_handle() -> (MuxHandle, mpsc::Receiver<Outbound>) {
 		let (outbound, sent) = mpsc::channel(8);
 		let (drain_feedback, _) = mpsc::unbounded();
-		let handle = MuxHandle { shared: client_shared(), outbound, drain_feedback };
-
+		let handle = MuxHandle { link: MuxLink::new(client_shared(), outbound), drain_feedback };
 		(handle, sent)
 	}
 
@@ -584,8 +546,8 @@ mod tests {
 			Ok(Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Cancel(package))))
 				if package.stream_id() == 1
 		));
-		assert!(handle.shared.take_duplex(1).is_none());
-		assert!(!handle.shared.is_pending(1));
+		assert!(handle.link.shared().take_duplex(1).is_none());
+		assert!(!handle.link.shared().is_pending(1));
 	}
 
 	// open_stream_to stamps the grpc-style route on the stream's
@@ -596,7 +558,6 @@ mod tests {
 		let (handle, mut sent) = duplex_handle();
 		let target = Urn::new("tb", "servlet:ledger");
 		let (sink, _response) = handle.open_stream_to(target.clone())?;
-
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
 			sent.try_recv(),
@@ -614,7 +575,6 @@ mod tests {
 		let (handle, mut sent) = duplex_handle();
 		let target = Urn::new("tb", "servlet:ledger");
 		let (sink, _response) = handle.open_stream_with_route(StreamRoute::from_parts(Some(target.clone()), 0))?;
-
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
 			sent.try_recv(),
@@ -631,7 +591,6 @@ mod tests {
 	fn test_open_stream_local_open_has_no_route() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
 		let (sink, _response) = handle.open_stream()?;
-
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
 			sent.try_recv(),
@@ -650,10 +609,15 @@ mod tests {
 		let (sink, mut body) = handle.open_duplex().expect("fresh connection has stream slots");
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 
-		let mut forwarder = handle.shared.take_duplex(1).expect("open_duplex registered the forwarder");
-		let _ = handle.shared.remove_pending(1);
+		let mut forwarder = handle
+			.link
+			.shared()
+			.take_duplex(1)
+			.expect("open_duplex registered the forwarder");
+
+		let _ = handle.link.shared().remove_pending(1);
 		assert!(forwarder.forward(BodyEvent::End));
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 
 		drop(body);
 

@@ -64,7 +64,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use super::ClusterConfig;
-use crate::colony::common::canonical_bytes;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
 use crate::policy::{SessionContext, TransitStatus};
@@ -126,7 +125,7 @@ impl StaticExportList {
 	/// Build an allowlist from the given servlet type URNs.
 	pub fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
 		let types: Vec<Urn<'static>> = types.into_iter().collect();
-		let keys = types.iter().map(canonical_bytes).collect();
+		let keys = types.iter().map(Urn::canonical_bytes).collect();
 		Self { types, keys }
 	}
 }
@@ -152,7 +151,7 @@ struct ExportMembership {
 impl ExportMembership {
 	fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
 		let types: Vec<Urn<'static>> = types.into_iter().collect();
-		let keys = types.iter().map(canonical_bytes).collect();
+		let keys = types.iter().map(Urn::canonical_bytes).collect();
 		Self { types, keys }
 	}
 }
@@ -184,7 +183,7 @@ impl DynamicExportList {
 	pub fn insert(&self, target: Urn<'static>) {
 		if let Ok(mut guard) = self.membership.write() {
 			if !guard.types.iter().any(|allowed| allowed == &target) {
-				guard.keys.insert(canonical_bytes(&target));
+				guard.keys.insert(target.canonical_bytes());
 				guard.types.push(target);
 			}
 		}
@@ -200,7 +199,7 @@ impl DynamicExportList {
 			let mut dropped = Vec::new();
 			guard.types.retain(|allowed| {
 				if allowed == target {
-					dropped.push(canonical_bytes(allowed));
+					dropped.push(allowed.canonical_bytes());
 					return false;
 				}
 
@@ -747,8 +746,7 @@ mod tests {
 	fn dynamic_allowlist_mutation_visible_to_verdict_and_keys() {
 		let list = DynamicExportList::new([servlet("ping")]);
 		let ledger = servlet("ledger");
-		let ledger_key = canonical_bytes(&ledger);
-
+		let ledger_key = ledger.canonical_bytes();
 		assert_eq!(
 			export_verdict(
 				Some(&list),
@@ -793,8 +791,8 @@ mod tests {
 	#[test]
 	fn static_list_filters_slate_to_exported_keys() {
 		let exports = static_list([servlet("ping")]);
-		assert!(exports.allows_canonical(&canonical_bytes(&servlet("ping"))));
-		assert!(!exports.allows_canonical(&canonical_bytes(&servlet("ledger"))));
+		assert!(exports.allows_canonical(&servlet("ping").canonical_bytes()));
+		assert!(!exports.allows_canonical(&servlet("ledger").canonical_bytes()));
 	}
 
 	struct ContainsOnlyList(Urn<'static>);
@@ -808,8 +806,8 @@ mod tests {
 	#[test]
 	fn default_canonical_lookup_delegates_to_contains() {
 		let list = ContainsOnlyList(servlet("ping"));
-		assert!(list.allows_canonical(&canonical_bytes(&servlet("ping"))));
-		assert!(!list.allows_canonical(&canonical_bytes(&servlet("ledger"))));
+		assert!(list.allows_canonical(&servlet("ping").canonical_bytes()));
+		assert!(!list.allows_canonical(&servlet("ledger").canonical_bytes()));
 		assert!(!list.allows_canonical(&[0xFF]));
 	}
 

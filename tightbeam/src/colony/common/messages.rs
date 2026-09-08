@@ -3,7 +3,7 @@
 //! This module defines every message type in the protocol between the
 //! cluster and the hive.
 
-use crate::asn1::Frame;
+use crate::asn1::{Frame, Metadata, Version};
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
@@ -32,13 +32,12 @@ pub struct ClusterWorkRequest {
 	/// may still spend.
 	///
 	/// A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel
-	/// ([`ClusterWorkRequest::new`]), which defers the budget to
-	/// gateway policy. Each gateway clamps the inbound value to its
-	/// own `max_hops`, so one clamp rule covers the origin sentinel
-	/// and a relayed value. A gateway that selects a peer route
-	/// re-emits with the clamped budget decremented
-	/// ([`ClusterWorkRequest::into_relayed`]). An inbound `0` is
-	/// served locally only and never re-forwarded.
+	/// ([`ClusterWorkRequest::new`]), which defers the budget to gateway
+	/// policy. Each gateway clamps the inbound value to its own `max_hops`,
+	/// so one clamp rule covers the origin sentinel and a relayed value.
+	///
+	/// A gateway that selects a peer route re-emits with the clamped budget
+	/// decremented ([`ClusterWorkRequest::into_relayed`]).
 	pub hops_remaining: u8,
 }
 
@@ -62,6 +61,31 @@ impl ClusterWorkRequest {
 	pub fn into_relayed(mut self, hops_remaining: u8) -> Self {
 		self.hops_remaining = hops_remaining;
 		self
+	}
+
+	/// Wrap `work` in the hop-local transport frame the gateway expects.
+	///
+	/// The wrapper is routing plumbing only. It reuses the work frame's id
+	/// for correlation and carries the encoded [`ClusterRequest::Work`]
+	/// envelope as its message, so the client's own frame travels inside
+	/// unmodified.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- `work` or the envelope
+	///   does not encode.
+	pub(crate) fn transport_frame(servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError> {
+		let request = ClusterRequest::Work(Self::new(servlet_type, work)?);
+		let mut metadata = Metadata::default();
+		metadata.id = work.metadata.id.clone();
+
+		Ok(Frame {
+			version: Version::V0,
+			metadata,
+			message: encode(&request)?,
+			integrity: None,
+			nonrepudiation: None,
+		})
 	}
 }
 
@@ -123,6 +147,23 @@ impl ClusterWorkResponse {
 		}
 
 		self.into_frame()?.ok_or(TightBeamError::MissingResponse)
+	}
+
+	/// Unwrap a gateway reply down to the servlet's response frame.
+	///
+	/// The inverse of [`ClusterWorkRequest::transport_frame`]: the reply is
+	/// the hop-local wrapper, and the servlet's own frame travels inside it.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingResponse`] -- the gateway answered with
+	///   no frame at all.
+	/// - Whatever [`Self::served`] reports for the decoded response.
+	pub(crate) fn served_reply(reply: Option<Frame>) -> Result<Frame, TightBeamError> {
+		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
+		let response: Self = decode(&reply.message)?;
+
+		response.served()
 	}
 }
 
@@ -197,6 +238,31 @@ pub struct ServletAddressUpdate {
 	/// Removed servlet instance URNs. Instance identities travel in
 	/// both directions of an update, matching `added`.
 	pub removed: Vec<Urn<'static>>,
+}
+
+/// One servlet instance entering or leaving a hive's slate.
+///
+/// The wire update carries an instance under `added` and a bare URN under
+/// `removed`, so the direction picks which field the instance lands in.
+/// Naming the direction as a variant keeps that choice with the value it
+/// applies to.
+pub(crate) enum ServletChange {
+	/// An instance that has joined the slate, with the address to reach it.
+	Added(ServletInfo),
+	/// An instance that has left the slate.
+	Removed(ServletInfo),
+}
+
+impl ServletChange {
+	/// Wire update announcing this change on behalf of `hive_id`.
+	pub(crate) fn into_update(self, hive_id: Urn<'static>) -> ServletAddressUpdate {
+		match self {
+			Self::Added(servlet) => ServletAddressUpdate { hive_id, added: vec![servlet], removed: vec![] },
+			Self::Removed(servlet) => {
+				ServletAddressUpdate { hive_id, added: vec![], removed: vec![servlet.servlet_id] }
+			}
+		}
+	}
 }
 
 /// Response to servlet address update notification
@@ -638,7 +704,7 @@ impl ClusterCommandResponse {
 mod tests {
 	use super::*;
 	use crate::asn1::{Metadata, Version};
-	use crate::colony::common::{servlet_instance, ColonyNamespace};
+	use crate::colony::common::ColonyNamespace;
 	use crate::error::Result;
 
 	fn round_trip(original: ClusterRequest) -> Result<()> {
@@ -678,7 +744,7 @@ mod tests {
 		round_trip(ClusterRequest::RegisterHive(RegisterHiveRequest {
 			hive_addr: b"127.0.0.1:9000".to_vec(),
 			servlet_addresses: vec![ServletInfo {
-				servlet_id: servlet_instance(&ping_type(), "127.0.0.1:9001"),
+				servlet_id: ping_type().servlet_instance("127.0.0.1:9001"),
 				address: b"127.0.0.1:9001".to_vec(),
 			}],
 			metadata: None,
@@ -690,7 +756,7 @@ mod tests {
 		round_trip(ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
 			hive_id: hive_id(),
 			added: vec![],
-			removed: vec![servlet_instance(&ping_type(), "127.0.0.1:9100")],
+			removed: vec![ping_type().servlet_instance("127.0.0.1:9100")],
 		}))
 	}
 

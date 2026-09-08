@@ -44,7 +44,7 @@ use tightbeam::{
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 	},
-	utils::{compose, urn::Urn},
+	utils::urn::Urn,
 	TightBeamError, Version,
 };
 
@@ -220,7 +220,7 @@ tb_scenario! {
 			let _reg_response = hive.register_with_cluster(cluster_addr).await?;
 
 			let transaction = create_auth_transaction(b"E2E-001", MonetaryAmount::new(10000, *b"USD"));
-			let inner = compose(Version::V1)
+			let inner = Version::V1.compose()
 				.with_id(b"payment-auth-txn")
 				.with_order(0)
 				.with_message(transaction)

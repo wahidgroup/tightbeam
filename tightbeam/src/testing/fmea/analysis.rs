@@ -10,124 +10,137 @@ use crate::testing::fmea::SeverityScale;
 use crate::testing::specs::csp::Process;
 use std::collections::{HashSet, VecDeque};
 
-/// Calculate severity based on CSP criticality analysis
-///
-/// Uses reachability analysis to determine severity:
-/// - Deadlock (no transitions, not terminal) = Catastrophic
-/// - Cannot reach terminal states = Hazardous
-/// - Significantly restricts state space = Major
-/// - Minor state restriction = Minor
-pub fn calculate_severity(fault: &InjectedFaultRecord, process: &Process, scale: SeverityScale) -> u8 {
-	// Production fault records key states as "process.state". bare state names
-	// are accepted for records built directly against a process.
-	let state_name = fault
-		.csp_state
-		.strip_prefix(process.name)
-		.and_then(|rest| rest.strip_prefix('.'))
-		.unwrap_or(fault.csp_state.as_str());
+impl InjectedFaultRecord {
+	/// Severity of this fault, from CSP criticality analysis.
+	///
+	/// Reachability from the fault state decides the rating:
+	/// - Deadlock (no transitions, not terminal) is catastrophic.
+	/// - No reachable terminal state is hazardous.
+	/// - A large state-space restriction is major.
+	/// - A small restriction is minor.
+	pub fn severity(&self, process: &Process, scale: SeverityScale) -> u8 {
+		// Production fault records key states as "process.state". bare state names
+		// are accepted for records built directly against a process.
+		let state_name = self
+			.csp_state
+			.strip_prefix(process.name)
+			.and_then(|rest| rest.strip_prefix('.'))
+			.unwrap_or(self.csp_state.as_str());
 
-	// Find the state where the fault occurs
-	let fault_state = process.states.iter().find(|s| s.0 == state_name).copied();
-	let Some(fault_state) = fault_state else {
-		// Unknown state = medium severity (uncertain impact)
-		return scale.mid_value();
-	};
+		// Find the state where the fault occurs
+		let fault_state = process.states.iter().find(|s| s.0 == state_name).copied();
+		let Some(fault_state) = fault_state else {
+			// Unknown state = medium severity (uncertain impact)
+			return scale.mid_value();
+		};
 
-	// BFS to explore reachable states from fault point
-	let mut visited = HashSet::new();
-	visited.insert(fault_state);
+		// BFS to explore reachable states from fault point
+		let mut visited = HashSet::new();
+		visited.insert(fault_state);
 
-	let mut queue = VecDeque::new();
-	queue.push_back(fault_state);
+		let mut queue = VecDeque::new();
+		queue.push_back(fault_state);
 
-	let mut has_deadlock = false;
-	let mut can_reach_terminal = false;
-	while let Some(current_state) = queue.pop_front() {
-		// Check if terminal
-		if process.is_terminal(current_state) {
-			can_reach_terminal = true;
-			continue;
+		let mut has_deadlock = false;
+		let mut can_reach_terminal = false;
+		while let Some(current_state) = queue.pop_front() {
+			// Check if terminal
+			if process.is_terminal(current_state) {
+				can_reach_terminal = true;
+				continue;
+			}
+
+			// Check for deadlock
+			let enabled = process.enabled(current_state);
+			if enabled.is_empty() {
+				has_deadlock = true;
+				continue;
+			}
+
+			// Explore successors
+			for action in enabled {
+				let successors = process.step(current_state, &action.event);
+				for next_state in successors {
+					if visited.insert(next_state) {
+						queue.push_back(next_state);
+					}
+				}
+			}
 		}
 
-		// Check for deadlock
-		let enabled = process.enabled(current_state);
-		if enabled.is_empty() {
-			has_deadlock = true;
-			continue;
-		}
+		// Calculate severity based on criticality
+		let total_states = process.states.len();
+		let reachable_count = visited.len();
+		let restriction_ratio = (reachable_count as f64) / (total_states as f64);
 
-		// Explore successors
-		for action in enabled {
-			let successors = process.step(current_state, &action.event);
-			for next_state in successors {
-				if visited.insert(next_state) {
-					queue.push_back(next_state);
+		match scale {
+			SeverityScale::MilStd1629 => {
+				// MIL-STD-1629: 1-10 scale
+				if has_deadlock {
+					10 // Catastrophic: System completely stops
+				} else if !can_reach_terminal && !process.terminal.is_empty() {
+					9 // Critical: Cannot complete normal operation
+				} else if restriction_ratio < 0.5 {
+					7 // Severe: More than half of states unreachable
+				} else if restriction_ratio < 0.8 {
+					5 // Moderate: Significant state restriction
+				} else {
+					3 // Minor: Limited impact
+				}
+			}
+			SeverityScale::Iso26262 => {
+				// ISO 26262: 1-4 scale (catastrophic, hazardous, major, minor)
+				if has_deadlock || (!can_reach_terminal && !process.terminal.is_empty()) {
+					4 // Catastrophic: Complete system failure or cannot reach safe terminal
+				} else if restriction_ratio < 0.5 {
+					3 // Hazardous: Severely restricted functionality
+				} else if restriction_ratio < 0.8 {
+					2 // Major: Noticeable degradation
+				} else {
+					1 // Minor: Limited impact
 				}
 			}
 		}
 	}
-
-	// Calculate severity based on criticality
-	let total_states = process.states.len();
-	let reachable_count = visited.len();
-	let restriction_ratio = (reachable_count as f64) / (total_states as f64);
-
-	match scale {
-		SeverityScale::MilStd1629 => {
-			// MIL-STD-1629: 1-10 scale
-			if has_deadlock {
-				10 // Catastrophic: System completely stops
-			} else if !can_reach_terminal && !process.terminal.is_empty() {
-				9 // Critical: Cannot complete normal operation
-			} else if restriction_ratio < 0.5 {
-				7 // Severe: More than half of states unreachable
-			} else if restriction_ratio < 0.8 {
-				5 // Moderate: Significant state restriction
-			} else {
-				3 // Minor: Limited impact
-			}
-		}
-		SeverityScale::Iso26262 => {
-			// ISO 26262: 1-4 scale (catastrophic, hazardous, major, minor)
-			if has_deadlock || (!can_reach_terminal && !process.terminal.is_empty()) {
-				4 // Catastrophic: Complete system failure or cannot reach safe terminal
-			} else if restriction_ratio < 0.5 {
-				3 // Hazardous: Severely restricted functionality
-			} else if restriction_ratio < 0.8 {
-				2 // Major: Noticeable degradation
-			} else {
-				1 // Minor: Limited impact
-			}
-		}
-	}
 }
 
-/// Convert occurrence probability (basis points) to FMEA scale
-pub fn convert_occurrence(probability_bps: u16, scale: SeverityScale) -> u16 {
-	let normalized = match scale {
-		SeverityScale::MilStd1629 => probability_bps / 1000, // 0-10000 -> 0-10
-		SeverityScale::Iso26262 => probability_bps / 2500,   // 0-10000 -> 0-4
-	};
+impl FdrVerdict {
+	/// Detection rating from this run's error-recovery statistics.
+	///
+	/// A run with no recovery attempts has nothing to rate, so it reports
+	/// the scale's midpoint.
+	pub fn detection(&self, scale: SeverityScale) -> u8 {
+		let total = self.error_recovery_successful + self.error_recovery_failed;
+		if total == 0 {
+			return scale.mid_value();
+		}
 
-	(normalized + 1).min(scale.max_value())
-}
+		let success_rate = (self.error_recovery_successful as f64) / (total as f64);
+		let inverted = 1.0 - success_rate;
+		let max = scale.max_value() as f64;
 
-/// Calculate detection rating from error recovery statistics
-pub fn calculate_detection(verdict: &FdrVerdict, scale: SeverityScale) -> u8 {
-	let total = verdict.error_recovery_successful + verdict.error_recovery_failed;
-
-	if total == 0 {
-		return scale.mid_value();
+		((inverted * (max - 1.0)) + 1.0) as u8
 	}
-
-	let success_rate = (verdict.error_recovery_successful as f64) / (total as f64);
-	let inverted = 1.0 - success_rate;
-	let max = scale.max_value() as f64;
-
-	((inverted * (max - 1.0)) + 1.0) as u8
 }
 
 impl SeverityScale {
+	/// Occurrence rating for a probability in basis points.
+	pub fn occurrence(&self, probability_bps: u16) -> u16 {
+		let normalized = match self {
+			Self::MilStd1629 => probability_bps / 1000, // 0-10000 -> 0-10
+			Self::Iso26262 => probability_bps / 2500,   // 0-10000 -> 0-4
+		};
+
+		(normalized + 1).min(self.max_value())
+	}
+
+	/// Wire discriminant for this scale.
+	pub(crate) fn wire_code(&self) -> u8 {
+		match self {
+			Self::MilStd1629 => 0,
+			Self::Iso26262 => 1,
+		}
+	}
 	/// Maximum value for this scale
 	pub(crate) const fn max_value(&self) -> u16 {
 		match self {
@@ -160,8 +173,8 @@ mod tests {
 	}
 
 	fn assert_severity_both_scales(fault: &InjectedFaultRecord, process: &Process, expected_mil: u8, expected_iso: u8) {
-		let severity_mil = calculate_severity(fault, process, SeverityScale::MilStd1629);
-		let severity_iso = calculate_severity(fault, process, SeverityScale::Iso26262);
+		let severity_mil = fault.severity(process, SeverityScale::MilStd1629);
+		let severity_iso = fault.severity(process, SeverityScale::Iso26262);
 		assert_eq!(severity_mil, expected_mil);
 		assert_eq!(severity_iso, expected_iso);
 	}
@@ -305,7 +318,7 @@ mod tests {
 		];
 
 		for (bps, scale, expected) in test_cases {
-			assert_eq!(convert_occurrence(bps, scale), expected);
+			assert_eq!(scale.occurrence(bps), expected);
 		}
 	}
 
@@ -324,7 +337,7 @@ mod tests {
 				error_recovery_failed: failed,
 				..Default::default()
 			};
-			assert_eq!(calculate_detection(&verdict, scale), expected);
+			assert_eq!(verdict.detection(scale), expected);
 		}
 	}
 }

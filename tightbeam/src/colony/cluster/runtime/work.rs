@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
 use crate::colony::cluster::runtime::hop::Hop;
 use crate::colony::cluster::{ClusterConfig, ClusterError, ClusterWorkResponse, HopBudget, RouteKind, ServletRegistry};
-use crate::colony::common::{canonical_bytes, is_bare_servlet_type, reply_frame, ClusterRequest, ClusterWorkRequest};
+use crate::colony::common::{reply_frame, ClusterRequest, ClusterWorkRequest};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::encode;
@@ -17,7 +17,6 @@ use crate::instrumentation::events::{
 };
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
-use crate::transport::error::TransportError;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
@@ -36,28 +35,6 @@ pub(crate) struct RouteChoice {
 	pub(crate) route_key: Arc<[u8]>,
 	pub(crate) dial_addr: Arc<[u8]>,
 	pub(crate) route_kind: RouteKind,
-}
-
-fn work_trail_fail(
-	servlet_registry: &ServletRegistry,
-	route_key: &Arc<[u8]>,
-	config: &ClusterConfig,
-	trace: &TraceCollector,
-	frame: &Frame,
-	status: TransitStatus,
-) -> Result<Option<Frame>, TightBeamError> {
-	servlet_registry.work_trail_weaken(route_key, config, trace)?;
-	reply_frame(&frame.metadata.id, ClusterWorkResponse::err(status))
-}
-
-/// Builds the relayed work envelope for a peer hop. It carries the same
-/// type and client frame bytes, with one forward spent from the budget.
-///
-/// The struct is constructed literally because the payload is already
-/// the client's encoded frame and travels opaquely. No re-encode
-/// happens at relay hops.
-fn relayed_work(servlet_type: Urn<'static>, payload: Vec<u8>, budget: HopBudget) -> ClusterWorkRequest {
-	ClusterWorkRequest { servlet_type, payload, hops_remaining: budget.spend().wire() }
 }
 
 /// Decoded outcome of one answered forward.
@@ -101,16 +78,16 @@ impl ForwardOutcome {
 	}
 }
 
-/// Transit status a failed forward relays to the caller.
-///
-/// A servlet refusal relays unchanged so the caller keeps its
-/// retryability contract. Everything else degrades to `Unavailable`.
-fn forward_failure_status(error: ClusterError) -> TransitStatus {
-	match error {
-		ClusterError::Transport(TransportError::OperationFailed(failure)) => {
-			TransitStatus::try_from(failure).unwrap_or(TransitStatus::Unavailable)
-		}
-		_ => TransitStatus::Unavailable,
+impl<P: Protocol> GatewayRuntimeCtx<P> {
+	/// Weaken the trail that failed and answer the caller with `status`.
+	fn work_trail_fail(
+		&self,
+		route_key: &Arc<[u8]>,
+		frame: &Frame,
+		status: TransitStatus,
+	) -> Result<Option<Frame>, TightBeamError> {
+		self.servlet_registry.work_trail_weaken(route_key, &self.config, &self.trace)?;
+		reply_frame(&frame.metadata.id, ClusterWorkResponse::err(status))
 	}
 }
 
@@ -163,7 +140,7 @@ where
 			}
 			RouteKind::Peer | RouteKind::PeerRelay => match self.peer_pool.as_ref() {
 				Some(peer_pool) => {
-					let work = relayed_work(servlet_type.clone(), payload, budget);
+					let work = budget.relayed_work(servlet_type.clone(), payload);
 					let envelope = encode(&ClusterRequest::Work(work))?;
 					Hop::new(peer_pool, dial_addr).deliver_envelope(envelope).await
 				}
@@ -201,14 +178,7 @@ where
 
 				reply_frame(&frame.metadata.id, peer_response)
 			}
-			ForwardOutcome::PeerGarbled => work_trail_fail(
-				&self.servlet_registry,
-				&choice.route_key,
-				&self.config,
-				&self.trace,
-				frame,
-				TransitStatus::Unavailable,
-			),
+			ForwardOutcome::PeerGarbled => self.work_trail_fail(&choice.route_key, frame, TransitStatus::Unavailable),
 		}
 	}
 
@@ -226,7 +196,7 @@ where
 		// A work target must be a servlet URN in this gateway's
 		// namespace. Foreign authorities and realms are refused
 		// before the registry is consulted.
-		if !is_bare_servlet_type(&self.config.namespace, &request.servlet_type) {
+		if !self.config.namespace.is_bare_servlet_type(&request.servlet_type) {
 			self.trace.event(CLUSTER_WORK_REFUSED)?;
 			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::PermissionDenied));
 		}
@@ -246,7 +216,7 @@ where
 		};
 
 		let mut frame_cache = Some(client_frame);
-		let type_key = canonical_bytes(&request.servlet_type);
+		let type_key = request.servlet_type.canonical_bytes();
 		let servlet_type = request.servlet_type;
 		let mut attempt_payload = request.payload;
 		let mut excluded: Option<Arc<[u8]>> = None;
@@ -307,7 +277,7 @@ where
 					return self.settle_forward(&frame, &choice, outcome);
 				}
 				Err(error) => {
-					let status = forward_failure_status(error);
+					let status = error.forward_status();
 
 					// Fast failover. An unavailable trail weakens now and
 					// the next-best trail gets the single retry.
@@ -321,14 +291,7 @@ where
 						}
 					}
 
-					return work_trail_fail(
-						&self.servlet_registry,
-						&choice.route_key,
-						&self.config,
-						&self.trace,
-						&frame,
-						status,
-					);
+					return self.work_trail_fail(&choice.route_key, &frame, status);
 				}
 			}
 		}
@@ -446,9 +409,10 @@ mod tests {
 	}
 
 	fn peer_entry(peer: &[u8], dial: &[u8]) -> ServletEntry {
+		let servlet_type = ping_type().canonical_bytes();
 		ServletEntry::peer(
 			Arc::from(peer),
-			Arc::from(canonical_bytes(&ping_type()).as_slice()),
+			Arc::from(servlet_type.as_slice()),
 			Arc::from(dial),
 			DEFAULT_INITIAL_PHEROMONE,
 			DEFAULT_ABANDONMENT_LIMIT,
@@ -456,10 +420,11 @@ mod tests {
 	}
 
 	fn relay_entry(origin: &[u8], relay: &[u8], dial: &[u8]) -> ServletEntry {
+		let servlet_type = ping_type().canonical_bytes();
 		ServletEntry::peer_relay(
 			Arc::from(origin),
 			Arc::from(relay),
-			Arc::from(canonical_bytes(&ping_type()).as_slice()),
+			Arc::from(servlet_type.as_slice()),
 			Arc::from(dial),
 			DEFAULT_INITIAL_PHEROMONE,
 			DEFAULT_ABANDONMENT_LIMIT,
@@ -522,25 +487,23 @@ mod tests {
 
 	#[test]
 	fn relayed_work_stamps_a_decremented_budget() {
-		let work = relayed_work(ping_type(), vec![1], HopBudget::for_test(2));
+		let work = HopBudget::for_test(2).relayed_work(ping_type(), vec![1]);
 		assert_eq!(work.hops_remaining, 1);
 	}
 
 	#[test]
 	fn relayed_work_saturates_a_spent_budget_at_zero() {
-		let work = relayed_work(ping_type(), vec![1], HopBudget::for_test(0));
+		let work = HopBudget::for_test(0).relayed_work(ping_type(), vec![1]);
 		assert_eq!(work.hops_remaining, 0);
 	}
 
-	// Pins the on-wire budget. Dropping the decrement in `relayed_work`
-	// fails here even when integration topologies mask it with a clamp.
+	// Pins the on-wire budget. Dropping the decrement in
+	// `HopBudget::relayed_work` fails here even when integration
+	// topologies mask it with a clamp.
 	#[test]
 	fn relayed_envelope_carries_the_decremented_budget_on_the_wire() -> Result<(), TightBeamError> {
-		let envelope = encode(&ClusterRequest::Work(relayed_work(
-			ping_type(),
-			vec![7],
-			HopBudget::for_test(2),
-		)))?;
+		let relayed = HopBudget::for_test(2).relayed_work(ping_type(), vec![7]);
+		let envelope = encode(&ClusterRequest::Work(relayed))?;
 
 		let decoded = decode::<ClusterRequest>(&envelope)?;
 		assert!(matches!(decoded, ClusterRequest::Work(work) if work.hops_remaining == 1));
@@ -634,7 +597,7 @@ mod tests {
 		let registry = ServletRegistry::default();
 		registry.add(relay_entry(b"origin", b"relay", b"relay:1"))?;
 
-		let type_key = canonical_bytes(&ping_type());
+		let type_key = ping_type().canonical_bytes();
 		let below = registry.select_route(&config, &type_key, HopBudget::for_test(1), None);
 		let at_gate = registry.select_route(&config, &type_key, HopBudget::for_test(2), None);
 		assert!(below.is_none());
@@ -649,7 +612,7 @@ mod tests {
 		registry.add(peer_entry(b"first", b"first:1"))?;
 		registry.add(peer_entry(b"second", b"second:1"))?;
 
-		let type_key = canonical_bytes(&ping_type());
+		let type_key = ping_type().canonical_bytes();
 		let failed = registry
 			.select_route(&config, &type_key, HopBudget::for_test(1), None)
 			.map(|choice| choice.route_key);

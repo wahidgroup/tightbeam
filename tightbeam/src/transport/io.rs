@@ -121,8 +121,8 @@ mod x509 {
 		any(feature = "transport-cms", feature = "transport-ecies")
 	))]
 	mod rekey {
-		pub(crate) use crate::transport::handshake::extract_verifying_key_from_cert;
-		pub(crate) use crate::transport::handshake::receipt::certificate_signer_identifier;
+		pub(crate) use crate::transport::handshake::receipt::ReceiptSigner;
+		pub(crate) use crate::transport::handshake::HandshakeVerifyingKey;
 		pub use crate::transport::multiplex::{MuxRekeyContext, MuxRole};
 		pub(crate) use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
 	}
@@ -204,9 +204,9 @@ where
 	let Some(peer_cert) = state.to_peer_certificate_ref() else {
 		return Ok(None);
 	};
-	let public_key = extract_verifying_key_from_cert::<P::Curve>(peer_cert)?;
+	let public_key = peer_cert.verifying_key::<P::Curve>()?;
 	let peer_verifying_key = P::VerifyingKey::from(public_key);
-	let peer_sid = certificate_signer_identifier::<P::Digest>(peer_cert)?;
+	let peer_sid = peer_cert.signer_identifier::<P::Digest>()?;
 	let peer_certificate = Arc::new(peer_cert.clone());
 
 	// Detached last so a session refused above keeps its materials
@@ -242,33 +242,7 @@ where
 /// transport halves.
 pub(crate) fn decode_transport_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
 	let envelope = TransportEnvelope::from_der(buffer)?;
-	ensure_compatible_versions(envelope)
-}
-
-/// Reject an inbound envelope whose frames fail version validation.
-pub(crate) fn ensure_compatible_versions(envelope: TransportEnvelope) -> TransportResult<TransportEnvelope> {
-	if !envelope_versions_compatible(&envelope) {
-		return Err(TransportError::InvalidMessage);
-	}
-
-	Ok(envelope)
-}
-
-/// Check that every frame carried by an inbound envelope satisfies the same
-/// version/metadata compatibility the builder enforces at construction.
-fn envelope_versions_compatible(envelope: &TransportEnvelope) -> bool {
-	match envelope {
-		TransportEnvelope::Request(pkg) => pkg.message.validate_version_compatibility(),
-		TransportEnvelope::Response(pkg) => {
-			pkg.message.as_ref().is_none_or(|frame| frame.validate_version_compatibility())
-		}
-		#[cfg(feature = "x509")]
-		TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => true,
-		// Mux payloads are chunked frame DER: only the mux router can
-		// validate versions, after reassembly
-		#[cfg(feature = "transport-multiplex")]
-		TransportEnvelope::Mux(_) => true,
-	}
+	envelope.ensure_compatible_versions()
 }
 
 /// Receive side of a split envelope link.
@@ -1270,6 +1244,58 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 }
 
+impl TransportEnvelope {
+	/// Whether every frame this envelope carries satisfies the same
+	/// version and metadata compatibility the builder enforces at
+	/// construction.
+	///
+	/// Mux payloads are chunked frame DER, so only the mux router can
+	/// validate their versions, after reassembly.
+	pub(crate) fn versions_compatible(&self) -> bool {
+		match self {
+			TransportEnvelope::Request(pkg) => pkg.message.validate_version_compatibility(),
+			TransportEnvelope::Response(pkg) => {
+				pkg.message.as_ref().is_none_or(|frame| frame.validate_version_compatibility())
+			}
+			#[cfg(feature = "x509")]
+			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => true,
+			#[cfg(feature = "transport-multiplex")]
+			TransportEnvelope::Mux(_) => true,
+		}
+	}
+
+	/// Reject an inbound envelope whose frames fail version validation.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- a carried frame names
+	///   metadata its version does not admit.
+	pub(crate) fn ensure_compatible_versions(self) -> TransportResult<Self> {
+		if !self.versions_compatible() {
+			return Err(TransportError::InvalidMessage);
+		}
+
+		Ok(self)
+	}
+
+	/// The application request frame inside a single-flight envelope.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the envelope is any kind
+	///   other than a request.
+	pub(crate) fn into_request_frame(self) -> TransportResult<Arc<Frame>> {
+		match self {
+			TransportEnvelope::Request(msg) => Ok(msg.message),
+			TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
+			#[cfg(feature = "x509")]
+			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => Err(TransportError::InvalidMessage),
+			#[cfg(feature = "transport-multiplex")]
+			TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1329,7 +1355,7 @@ mod tests {
 	#[test]
 	fn envelope_version_compatibility_and_decode_ingress() -> crate::error::Result<()> {
 		for (_label, envelope, compatible) in version_envelope_cases() {
-			assert_eq!(envelope_versions_compatible(&envelope), compatible);
+			assert_eq!(envelope.versions_compatible(), compatible);
 
 			let bytes = crate::encode(&envelope)?;
 			let decoded = <DecodeProbe as MessageIO>::decode_envelope(&bytes);

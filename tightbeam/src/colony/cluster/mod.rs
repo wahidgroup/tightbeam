@@ -62,11 +62,11 @@ pub use export::{
 };
 
 pub use gossip::{
-	gossip_digest, gossip_fresh, gossip_want, signer_attribution, wanted_digests, Admission, AdmittedGossip,
-	GossipAdmission, GossipConfig, GossipDigest, GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
+	gossip_fresh, gossip_want, wanted_digests, Admission, AdmittedGossip, GossipAdmission, GossipConfig, GossipDigest,
+	GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
 };
 
-pub use peer::{cert_colony_urn, frame_colony_urn, frame_signer_cert, peer_signer_fingerprint, HopBudget};
+pub use peer::{frame_signer_cert, peer_signer_fingerprint, HopBudget};
 
 use core::future::Future;
 use core::time::Duration;
@@ -74,15 +74,17 @@ use std::sync::Arc;
 
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_HOPS};
 use crate::crypto::key::SigningKeyProvider;
+use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::x509::{policy::CertificateValidation, Certificate, CertificateSpec};
 use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
+use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::{Protocol, TightBeamAddress};
-
-use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
 use crate::utils::urn::Urn;
+use crate::TightBeamError;
 
-use super::common::{ColonyNamespace, InstanceMetrics, LoadBalancer};
+use super::common::{ColonyNamespace, ColonyResource, InstanceMetrics, LoadBalancer, ServletAddressUpdate};
 
 // =============================================================================
 // Configuration
@@ -193,6 +195,25 @@ pub struct ClusterTlsConfig {
 	/// by both stores stays an external peer. `None` disables inbound
 	/// federation (advertisements are refused).
 	pub peer_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
+}
+
+impl ClusterTlsConfig {
+	/// Materializes the certificate and handshake key this gateway presents.
+	///
+	/// One identity serves every plane: the colony and edge listeners
+	/// present it, and outbound hive and peer dials offer it as the client
+	/// certificate. Each of those reads it here, so they agree by
+	/// construction.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- [`Self::certificate`]
+	///   holds PEM or DER that does not decode as a certificate.
+	pub(crate) fn identity(&self) -> Result<(Certificate, HandshakeKeyManager<DefaultCryptoProvider>), TightBeamError> {
+		let certificate = Certificate::try_from(self.certificate.clone())?;
+		let key_manager = HandshakeKeyManager::new(Arc::clone(&self.key));
+		Ok((certificate, key_manager))
+	}
 }
 
 impl Clone for ClusterTlsConfig {
@@ -391,7 +412,37 @@ pub struct ClusterConfig {
 	pub tls: ClusterTlsConfig,
 }
 
+/// Parsed address-update delta: hive id, added entries, removed locators.
+pub(crate) type ParsedAddressUpdate<'a> = (Arc<[u8]>, Vec<ServletEntry>, Vec<&'a [u8]>);
+
 impl ClusterConfig {
+	/// Parse hive identity, added entries, and removed instance locators.
+	///
+	/// [`None`] where the hive URN, any added locator, or any removed URN
+	/// falls outside this colony's namespace. The delta is parsed whole, so
+	/// the registry applies it or sees nothing.
+	pub(crate) fn parse_address_update<'a>(&self, update: &'a ServletAddressUpdate) -> Option<ParsedAddressUpdate<'a>> {
+		let ColonyResource::Hive { addr } = self.namespace.validate(&update.hive_id).ok()? else {
+			return None;
+		};
+
+		if !update.added.iter().all(|info| self.namespace.locator_matches(info)) {
+			return None;
+		}
+
+		let mut removed = Vec::with_capacity(update.removed.len());
+		for urn in &update.removed {
+			match self.namespace.validate(urn) {
+				Ok(ColonyResource::Servlet { instance: Some(locator), .. }) => removed.push(locator.as_bytes()),
+				_ => return None,
+			}
+		}
+
+		let hive_id: Arc<[u8]> = Arc::from(addr.as_bytes());
+		let added = self.pheromone.servlet_slate(&update.added, &hive_id);
+		Some((hive_id, added, removed))
+	}
+
 	/// One balancer draw over `entries`, guarding the untrusted index.
 	///
 	/// The balancer is operator-configurable, so its answer is untrusted.
@@ -527,7 +578,7 @@ pub trait ClusterHeartbeat: Cluster {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::common::{canonical_bytes, ColonyNamespace, RegisterHiveRequest};
+	use crate::colony::common::{ColonyNamespace, RegisterHiveRequest};
 	use crate::colony::hive::ServletInfo;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -562,7 +613,13 @@ mod tests {
 	}
 
 	fn type_key(name: &str) -> Vec<u8> {
-		canonical_bytes(&servlet_urn(name))
+		servlet_urn(name).canonical_bytes()
+	}
+
+	/// The signer every fixture registration binds. Registration always
+	/// names one, so the tests name one too.
+	fn test_signer() -> SharedId {
+		Arc::from(b"test-signer".as_slice())
 	}
 
 	fn request(addr: &[u8], servlets: &[&str]) -> RegisterHiveRequest {
@@ -643,8 +700,7 @@ mod tests {
 	#[test]
 	fn registry_register_and_lookup() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]))?;
-
+		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]), test_signer())?;
 		// Registered types found
 		assert_eq!(registry.hives_for_type(&type_key("ping"))?.len(), 1);
 		assert_eq!(registry.hives_for_type(&type_key("calc"))?.len(), 1);
@@ -655,62 +711,53 @@ mod tests {
 
 		// Unknown type not found
 		assert!(registry.hives_for_type(&type_key("unknown"))?.is_empty());
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_unregister() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping"]))?;
-
+		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
 		assert_eq!(registry.len()?, 1);
 		assert!(registry.unregister(b"127.0.0.1:8080")?.is_some());
 		assert_eq!(registry.len()?, 0);
 		assert!(registry.hives_for_type(&type_key("ping"))?.is_empty());
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_update_utilization() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"127.0.0.1:8080", &["ping"]))?;
-
+		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
 		assert!(registry.update_utilization(b"127.0.0.1:8080", BasisPoints::new(5000))?);
 		assert_eq!(registry.hives_for_type(&type_key("ping"))?[0].utilization.get(), 5000);
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_available_servlets_deduplicated() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &["ping", "calc"]))?;
-		registry.register(request(b"hive2", &["ping", "worker"]))?;
-
+		registry.register(request(b"hive1", &["ping", "calc"]), test_signer())?;
+		registry.register(request(b"hive2", &["ping", "worker"]), test_signer())?;
 		// ping, calc, worker - ping deduplicated
 		assert_eq!(registry.to_available_servlets()?.len(), 3);
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_multiple_hives_same_type() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &["ping"]))?;
-		registry.register(request(b"hive2", &["ping"]))?;
-
+		registry.register(request(b"hive1", &["ping"]), test_signer())?;
+		registry.register(request(b"hive2", &["ping"]), test_signer())?;
 		assert_eq!(registry.hives_for_type(&type_key("ping"))?.len(), 2);
-
 		Ok(())
 	}
 
 	#[test]
 	fn registry_all_hives() -> Result<(), ClusterError> {
 		let registry = test_registry();
-		registry.register(request(b"hive1", &["ping"]))?;
-		registry.register(request_with_meta(b"hive2", &["calc"], b"metadata"))?;
+		registry.register(request(b"hive1", &["ping"]), test_signer())?;
+		registry.register(request_with_meta(b"hive2", &["calc"], b"metadata"), test_signer())?;
 
 		let all = registry.all_hives()?;
 		assert_eq!(all.len(), 2);

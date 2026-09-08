@@ -3,24 +3,15 @@ use alloc::vec::Vec;
 
 use crate::Asn1Matrix;
 
-#[cfg(feature = "derive")]
-use crate::Errorizable;
-
 pub type MatrixResult<T> = core::result::Result<T, MatrixError>;
 
-#[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MatrixError {
-	#[cfg_attr(feature = "derive", error("Asn1Matrix: n MUST be in 1..=255 (got {0})"))]
 	InvalidN(u8),
-	#[cfg_attr(
-		feature = "derive",
-		error("Asn1Matrix: data length MUST equal n*n (n={n}, len={len})")
-	)]
 	LengthMismatch { n: u8, len: usize },
 }
 
-crate::impl_error_display!(MatrixError {
+crate::impl_error_display!(unconditional MatrixError {
 	InvalidN(n) => "Asn1Matrix: n MUST be in 1..=255 (got {n})",
 	LengthMismatch { n, len } => "Asn1Matrix: data length MUST equal n*n (n={n}, len={len})",
 });

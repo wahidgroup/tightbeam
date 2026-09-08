@@ -37,19 +37,20 @@ use crate::random::generate_nonce;
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
-	authorize_transport, server_mux_settings, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept,
-	TransportAccept, TransportAuthorizer, TransportOffer,
+	authorize_transport, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept, TransportAccept,
+	TransportAuthorizer, TransportOffer,
 };
+use crate::transport::handshake::receipt::ReceiptArtifact;
+use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
-	certificate_signer_identifier, complete_receipt_artifact, record_receipt_outcome, settle_receipt_ack, sign_receipt,
-	SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
+	record_receipt_outcome, sign_receipt, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict,
+	StoredReceipt,
 };
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
-use crate::transport::handshake::utils::{
-	clear_session_randoms, compute_client_auth_digest, compute_ecies_transcript_hash, extract_verifying_key_from_cert,
-	octet_string_to_32_byte_array, validate_state,
-};
+use crate::transport::handshake::utils::HandshakeOctets;
+use crate::transport::handshake::utils::HandshakeVerifyingKey;
+use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
 use crate::transport::handshake::{
 	ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake, ServerHandshakeProtocol,
 };
@@ -235,11 +236,11 @@ where
 		let transport_accept = authorized.as_ref().map(|authorized| authorized.accept);
 		let settlement_challenge = authorized.and_then(|authorized| authorized.challenge);
 		if let (Some(offer), Some(accept)) = (client_hello.transport_offer.as_ref(), transport_accept.as_ref()) {
-			self.mux_settings = Some(server_mux_settings(offer, accept));
+			self.mux_settings = Some(offer.server_mux_settings(accept));
 		}
 
 		// 5. Extract and store client random
-		let client_random = octet_string_to_32_byte_array(&client_hello.client_random)?;
+		let client_random = client_hello.client_random.to_32_byte_array()?;
 		self.client_random = Some(client_random);
 
 		// 6. Generate and store server random
@@ -624,10 +625,10 @@ where
 		// this exact encrypted payload and this exact certificate,
 		// so the signature binds to this exchange alone.
 		let cert_der = client_cert.to_der()?;
-		let auth_digest =
-			compute_client_auth_digest::<P::Digest>(&transcript_hash, client_kex.encrypted_data.as_bytes(), &cert_der)?;
+		let encrypted_data = client_kex.encrypted_data.as_bytes();
+		let auth_digest = compute_client_auth_digest::<P::Digest>(&transcript_hash, encrypted_data, &cert_der)?;
 
-		let public_key = extract_verifying_key_from_cert::<P::Curve>(&client_cert)?;
+		let public_key = client_cert.verifying_key::<P::Curve>()?;
 		let signature = P::Signature::try_from(client_signature.as_bytes())
 			.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
 
@@ -670,18 +671,18 @@ where
 			None => (SessionVerdict::CountersignatureMissing, None),
 			Some(ack) => {
 				let client_cert = self.validated_client_cert.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-				let expected_sid = certificate_signer_identifier::<P::Digest>(client_cert)?;
-				let public_key = extract_verifying_key_from_cert::<P::Curve>(client_cert)?;
+				let expected_sid = client_cert.signer_identifier::<P::Digest>()?;
+				let public_key = client_cert.verifying_key::<P::Curve>()?;
 				let verifying_key = P::VerifyingKey::from(&public_key);
 
-				settle_receipt_ack::<P::Digest, P::Signature, _>(
-					&receipt,
-					Some(ack),
-					&expected_sid,
-					&verifying_key,
-					self.transport_authorizer.as_deref(),
-				)
-				.await?
+				receipt
+					.settle_ack::<P::Digest, P::Signature, _>(
+						Some(ack),
+						&expected_sid,
+						&verifying_key,
+						self.transport_authorizer.as_deref(),
+					)
+					.await?
 			}
 		};
 
@@ -694,7 +695,7 @@ where
 		// evidence.
 		let artifact = match (verdict, receipt_ack) {
 			(SessionVerdict::Activated | SessionVerdict::SettlementRejected { .. }, Some(ack)) => {
-				complete_receipt_artifact(server_artifact, ack)?
+				server_artifact.complete(ack)?
 			}
 			(_, _) => server_artifact,
 		};
@@ -712,8 +713,14 @@ where
 		Ok(())
 	}
 
+	/// Erase ephemeral ECIES key material after session establishment
+	/// (CWE-226).
 	fn clear_sensitive_data(&mut self) {
-		clear_session_randoms(&mut self.base_session_key, &mut self.client_random, &mut self.server_random);
+		use crate::zeroize::Zeroize;
+
+		self.base_session_key.zeroize();
+		self.client_random.zeroize();
+		self.server_random.zeroize();
 	}
 }
 
@@ -844,7 +851,7 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::profiles::SecurityProfileDesc;
 	use crate::random::{generate_nonce, OsRng};
-	use crate::transport::handshake::negotiation::{select_profile, SecurityOffer};
+	use crate::transport::handshake::negotiation::SecurityOffer;
 	use crate::transport::handshake::tests::*;
 
 	fn create_test_client_hello_with_offer(
@@ -1078,7 +1085,7 @@ mod tests {
 		// Mode 1: Negotiation - client offers [A, B], server supports [B, C] -> selects B
 		{
 			let offer = SecurityOffer::new(vec![p_a, p_b]);
-			let selected = select_profile(&offer, &[p_b, p_c])?;
+			let selected = offer.select_profile(&[p_b, p_c])?;
 			assert_eq!(selected, p_b);
 
 			let mut server = TestEciesServerBuilder::new().build()?.with_supported_profiles(vec![p_b, p_c]);
@@ -1101,7 +1108,7 @@ mod tests {
 		// Error case: No mutual profile
 		{
 			let offer = SecurityOffer::new(vec![p_a, p_b]);
-			let result = select_profile(&offer, &[p_c]);
+			let result = offer.select_profile(&[p_c]);
 			assert!(result.is_err());
 		}
 

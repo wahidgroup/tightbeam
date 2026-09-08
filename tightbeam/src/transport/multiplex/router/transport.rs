@@ -7,6 +7,7 @@ use futures::channel::mpsc;
 
 use super::flow::{cap_as_usize, CreditGrantor};
 use super::handle::MuxHandle;
+use super::link::MuxLink;
 use super::outbound::outbound_handle;
 use super::reader::MuxReaderDriver;
 use super::responder::MuxResponder;
@@ -82,7 +83,12 @@ where
 			outbound_handle(&outbound_sender),
 			&settings,
 		);
-		let handle = MuxHandle::new(Arc::clone(&shared), outbound_handle(&outbound_sender), reader.drain_feedback());
+
+		let handle = MuxHandle::new(
+			MuxLink::new(Arc::clone(&shared), outbound_handle(&outbound_sender)),
+			reader.drain_feedback(),
+		);
+
 		let writer = MuxWriterDriver::new(writer, outbound_receiver, Arc::clone(&shared), drain_headroom);
 		let responder = MuxResponder::new(inbound_receiver, outbound_sender, shared, settings.peer_initiated_cap);
 
