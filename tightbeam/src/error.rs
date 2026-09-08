@@ -4,10 +4,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::spki::ObjectIdentifier;
-use crate::Version;
-
-#[cfg(feature = "derive")]
 use crate::Errorizable;
+use crate::Version;
 
 /// A specialized Result type for TightBeam operations.
 pub type Result<T> = core::result::Result<T, TightBeamError>;
@@ -38,15 +36,14 @@ impl<Received: core::fmt::Debug, Expected: core::fmt::Debug> core::fmt::Display
 }
 
 #[cfg(feature = "compress")]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug)]
+#[derive(Errorizable, Debug)]
 pub enum CompressionError {
 	#[cfg(feature = "zstd")]
 	/// The zstd codec refused the frame, reported as its numeric code.
 	///
 	/// `zstd_safe::get_error_name` renders the code as zstd's own name for
 	/// the condition.
-	#[cfg_attr(feature = "derive", error("ZSTD compression/decompression error: code {0}"))]
+	#[error("ZSTD compression/decompression error: code {0}")]
 	ZSTD(usize),
 
 	/// Bytes remain after the single zstd frame.
@@ -55,12 +52,12 @@ pub enum CompressionError {
 	/// seekable-format seek table arrive as trailing input, which the parse
 	/// boundary refuses.
 	#[cfg(feature = "zstd")]
-	#[cfg_attr(feature = "derive", error("{0} trailing octets after the zstd frame"))]
+	#[error("{0} trailing octets after the zstd frame")]
 	TrailingBytes(usize),
 
 	/// The input ended before the frame completed.
 	#[cfg(feature = "zstd")]
-	#[cfg_attr(feature = "derive", error("zstd frame is truncated"))]
+	#[error("zstd frame is truncated")]
 	Truncated,
 
 	/// The decoder consumed no input and produced no output.
@@ -68,44 +65,17 @@ pub enum CompressionError {
 	/// The decompression loop advances one of its two cursors on every
 	/// iteration, and this refusal holds that guarantee (CWE-835).
 	#[cfg(feature = "zstd")]
-	#[cfg_attr(feature = "derive", error("zstd decoder stalled without consuming input"))]
+	#[error("zstd decoder stalled without consuming input")]
 	Stalled,
 
 	#[cfg(feature = "std")]
-	#[cfg_attr(feature = "derive", error("I/O error during compression/decompression: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("I/O error during compression/decompression: {0}")]
+	#[source]
 	IO(std::io::Error),
 
 	#[cfg(feature = "zstd")]
-	#[cfg_attr(feature = "derive", error("decompressed output exceeds the {0}-byte limit"))]
+	#[error("decompressed output exceeds the {0}-byte limit")]
 	OutputLimitExceeded(usize),
-}
-
-#[cfg(all(feature = "compress", not(feature = "derive")))]
-impl core::fmt::Display for CompressionError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			#[cfg(feature = "zstd")]
-			CompressionError::ZSTD(code) => write!(f, "ZSTD compression/decompression error: code {code}"),
-			#[cfg(feature = "std")]
-			CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
-			#[cfg(feature = "zstd")]
-			CompressionError::OutputLimitExceeded(limit) => {
-				write!(f, "decompressed output exceeds the {limit}-byte limit")
-			}
-			#[cfg(feature = "zstd")]
-			CompressionError::TrailingBytes(n) => write!(f, "{n} trailing octets after the zstd frame"),
-			#[cfg(feature = "zstd")]
-			CompressionError::Truncated => write!(f, "zstd frame is truncated"),
-			#[cfg(feature = "zstd")]
-			CompressionError::Stalled => write!(f, "zstd decoder stalled without consuming input"),
-			// Without zstd/std the enum is uninhabited; this arm is
-			// unreachable but keeps the match exhaustive for the compiler.
-			#[cfg(not(any(feature = "zstd", feature = "std")))]
-			_ => write!(f, ""),
-		}
-	}
 }
 
 /// Trait for injected faults in testing.
@@ -116,330 +86,335 @@ pub trait InjectedError: core::fmt::Debug + core::fmt::Display + Send + Sync {}
 #[cfg(feature = "testing-fault")]
 impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Send + Sync {}
 
-#[cfg_attr(feature = "derive", derive(Errorizable))]
+/// Several errors collected from one operation.
+///
+/// Rendering the list is behavior of the collection, so the chain owns it.
+/// That keeps every [`TightBeamError`] message a single format string, and
+/// the one Display block below stays the only home for all of them.
 #[derive(Debug)]
+pub struct ErrorChain(Vec<TightBeamError>);
+
+impl ErrorChain {
+	/// The collected errors, in the order they were reported.
+	#[must_use]
+	pub fn as_slice(&self) -> &[TightBeamError] {
+		&self.0
+	}
+
+	/// How many errors the chain holds.
+	#[must_use]
+	pub fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	/// Whether the chain holds no error.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+}
+
+impl From<Vec<TightBeamError>> for ErrorChain {
+	fn from(errors: Vec<TightBeamError>) -> Self {
+		Self(errors)
+	}
+}
+
+impl core::fmt::Display for ErrorChain {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		for (position, error) in self.0.iter().enumerate() {
+			if position > 0 {
+				write!(f, "; ")?;
+			}
+			write!(f, "{error}")?;
+		}
+
+		Ok(())
+	}
+}
+
+#[derive(Errorizable, Debug)]
 pub enum TightBeamError {
 	/// Error from the matrix implementation
-	#[cfg_attr(feature = "derive", error("Matrix error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Matrix error: {0}")]
+	#[source]
 	MatrixError(crate::matrix::MatrixError),
 
 	#[cfg(feature = "router")]
-	#[cfg_attr(feature = "derive", error("Route error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Route error: {0}")]
+	#[source]
 	RouterError(crate::router::RouterError),
 
 	/// Error from the message builder
 	#[cfg(feature = "builder")]
-	#[cfg_attr(feature = "derive", error("Build error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Build error: {0}")]
+	#[source]
 	BuildError(crate::builder::error::BuildError),
 
 	/// Error from the standards module.
 	#[cfg(feature = "standards")]
-	#[cfg_attr(feature = "derive", error("Standard error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Standard error: {0}")]
+	#[source]
 	StandardError(crate::standards::error::StandardError),
 
 	#[cfg(feature = "colony")]
-	#[cfg_attr(feature = "derive", error("Hive error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Hive error: {0}")]
+	#[source]
 	HiveError(crate::colony::hive::HiveError),
 
 	#[cfg(feature = "colony")]
-	#[cfg_attr(feature = "derive", error("Worker relay error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Worker relay error: {0}")]
+	#[source]
 	WorkerRelay(crate::colony::worker::WorkerRelayError),
 
 	#[cfg(feature = "std")]
 	/// I/O error
-	#[cfg_attr(feature = "derive", error("I/O error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("I/O error: {0}")]
+	#[source]
 	IoError(std::io::Error),
 
 	#[cfg(feature = "std")]
 	/// Lock poisoned
-	#[cfg_attr(feature = "derive", error("Lock poisoned"))]
+	#[error("Lock poisoned")]
 	LockPoisoned,
 
 	/// Invalid or unsupported algorithm identifier
-	#[cfg_attr(feature = "derive", error("Invalid or unsupported object identifier: {0}"))]
+	#[error("Invalid or unsupported object identifier: {0}")]
 	InvalidOID(crate::der::oid::Error),
 
 	/// Error during signature verification or generation
 	#[cfg(feature = "signature")]
-	#[cfg_attr(feature = "derive", error("Signature verification or generation error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Signature verification or generation error: {0}")]
+	#[source]
 	SignatureError(crate::crypto::sign::Error),
 
 	/// Error from elliptic curve operations
 	#[cfg(feature = "signature")]
-	#[cfg_attr(feature = "derive", error("Elliptic curve error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Elliptic curve error: {0}")]
+	#[source]
 	EllipticCurveError(crate::crypto::sign::elliptic_curve::Error),
 
 	/// Error during serialization
-	#[cfg_attr(feature = "derive", error("Serialization error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Serialization error: {0}")]
+	#[source]
 	SerializationError(crate::der::Error),
 
 	/// Error during compression or decompression
 	#[cfg(feature = "compress")]
-	#[cfg_attr(feature = "derive", error("Compression error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Compression error: {0}")]
+	#[source]
 	CompressionError(CompressionError),
 
 	/// Error during handshake operations
 	#[cfg(feature = "transport")]
-	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Handshake error: {0}")]
+	#[source]
 	HandshakeError(crate::transport::handshake::HandshakeError),
 
 	#[cfg(feature = "transport")]
-	#[cfg_attr(feature = "derive", error("Transport error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Transport error: {0}")]
+	#[source]
 	TransportError(crate::transport::error::TransportError),
 
 	/// Unsupported protocol version
-	#[cfg_attr(
-		feature = "derive",
-		error("Unsupported protocol version: expected {expected:?}, got {received:?}")
-	)]
+	#[error("Unsupported protocol version: {0}")]
 	UnsupportedVersion(ReceivedExpectedError<Version, Version>),
 
 	/// Error during testing operations
 	#[cfg(feature = "testing")]
-	#[cfg_attr(feature = "derive", error("Testing error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Testing error: {0}")]
+	#[source]
 	TestingError(crate::testing::error::TestingError),
 
 	/// Error during URN validation
-	#[cfg_attr(feature = "derive", error("URN validation error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("URN validation error: {0}")]
+	#[source]
 	UrnValidationError(crate::utils::urn::UrnValidationError),
 
 	/// Error during encryption or decryption
 	#[cfg(feature = "aead")]
-	#[cfg_attr(feature = "derive", error("Encryption or decryption error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Encryption or decryption error: {0}")]
+	#[source]
 	EncryptionError(crate::crypto::aead::Error),
 
 	/// Invalid key length for cryptographic operations
 	#[cfg(feature = "aead")]
-	#[cfg_attr(feature = "derive", error("Invalid key length: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Invalid key length: {0}")]
+	#[source]
 	InvalidKeyLength(crypto_common::InvalidLength),
 
 	/// Error during ECIES operations
 	#[cfg(feature = "ecies")]
-	#[cfg_attr(feature = "derive", error("ECIES error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("ECIES error: {0}")]
+	#[source]
 	EciesError(crate::crypto::ecies::EciesError),
 
 	#[cfg(feature = "crypto")]
-	#[cfg_attr(feature = "derive", error("Crypto policy error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Crypto policy error: {0}")]
+	#[source]
 	CryptoPolicyError(crate::crypto::policy::CryptoPolicyError),
 
 	/// Error during certificate validation
 	#[cfg(feature = "x509")]
-	#[cfg_attr(feature = "derive", error("Certificate validation error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Certificate validation error: {0}")]
+	#[source]
 	CertificateValidationError(crate::crypto::x509::error::CertificateValidationError),
 
 	#[cfg(feature = "kdf")]
-	#[cfg_attr(feature = "derive", error("Key derivation error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Key derivation error: {0}")]
+	#[source]
 	KeyDerivationError(crate::crypto::kdf::KdfError),
 
 	/// Error from key provider operations
 	#[cfg(feature = "crypto")]
-	#[cfg_attr(feature = "derive", error("Key provider error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Key provider error: {0}")]
+	#[source]
 	KeyError(crate::crypto::key::KeyError),
 
 	/// Secret material was unavailable
 	#[cfg(feature = "crypto")]
-	#[cfg_attr(feature = "derive", error("Secret unavailable: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("Secret unavailable: {0}")]
+	#[source]
 	SecretUnavailable(crate::crypto::secret::SecretError),
 
 	/// Error obtaining random bytes from the OS
 	#[cfg(feature = "random")]
-	#[cfg_attr(feature = "derive", error("OS random number generator error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("OS random number generator error: {0}")]
+	#[source]
 	OsRngError(rand_core::Error),
 
 	/// Error during SPKI operations
 	#[cfg(feature = "x509")]
-	#[cfg_attr(feature = "derive", error("SPKI error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("SPKI error: {0}")]
+	#[source]
 	SpkiError(crate::spki::Error),
 
 	/// Error during X.509 certificate building
 	#[cfg(feature = "builder")]
-	#[cfg_attr(feature = "derive", error("X.509 builder error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	#[cfg_attr(feature = "derive", source)]
+	#[error("X.509 builder error: {0}")]
+	#[source]
 	X509BuilderError(x509_cert::builder::Error),
 
 	/// Error receiving from channel with timeout
 	#[cfg(feature = "std")]
-	#[cfg_attr(feature = "derive", error("Channel receive timeout error"))]
+	#[error("Channel receive timeout error")]
 	RecvTimeoutError,
 
 	/// Error decoding signature from bytes
 	#[cfg(feature = "signature")]
-	#[cfg_attr(feature = "derive", error("Signature encoding error"))]
+	#[error("Signature encoding error")]
 	SignatureEncodingError,
 
 	/// Invalid metadata
-	#[cfg_attr(feature = "derive", error("Invalid metadata"))]
+	#[error("Invalid metadata")]
 	InvalidMetadata,
 
 	/// Invalid message body
-	#[cfg_attr(feature = "derive", error("Invalid message body"))]
+	#[error("Invalid message body")]
 	InvalidBody,
 
 	/// Invalid overflow value
-	#[cfg_attr(feature = "derive", error("Invalid overflow value"))]
+	#[error("Invalid overflow value")]
 	InvalidOverflowValue,
 
 	/// Invalid order
-	#[cfg_attr(feature = "derive", error("Invalid order"))]
+	#[error("Invalid order")]
 	InvalidOrder,
 
 	/// Missing order
-	#[cfg_attr(feature = "derive", error("Missing order"))]
+	#[error("Missing order")]
 	MissingOrder,
 
 	/// Missing inflator
-	#[cfg_attr(feature = "derive", error("Missing inflator"))]
+	#[error("Missing inflator")]
 	MissingInflator,
 
 	/// Missing feature
-	#[cfg_attr(feature = "derive", error("Missing feature: {0}"))]
+	#[error("Missing feature: {0}")]
 	MissingFeature(&'static str),
 
 	/// Missing priority
-	#[cfg_attr(feature = "derive", error("Missing priority"))]
+	#[error("Missing priority")]
 	MissingPriority,
 
 	/// Missing response
-	#[cfg_attr(feature = "derive", error("Missing response"))]
+	#[error("Missing response")]
 	MissingResponse,
 
 	/// Work refused by the cluster. The gateway reported a non-`Ok`
 	/// transit status instead of a servlet response frame.
 	#[cfg(feature = "policy")]
-	#[cfg_attr(feature = "derive", error("Work refused: {0:?}"))]
+	#[error("Work refused: {0:?}")]
 	WorkRefused(crate::policy::TransitStatus),
 
 	/// Channel closed because the receiving end was dropped before the send.
-	#[cfg_attr(feature = "derive", error("Channel closed"))]
+	#[error("Channel closed")]
 	ChannelClosed,
 
 	/// Signature is missing
 	#[cfg(feature = "signature")]
-	#[cfg_attr(feature = "derive", error("Missing signature"))]
+	#[error("Missing signature")]
 	MissingSignature,
 
 	/// Signature info is missing
 	#[cfg(feature = "signature")]
-	#[cfg_attr(feature = "derive", error("Missing signature info"))]
+	#[error("Missing signature info")]
 	MissingSignatureInfo,
 
 	/// Missing Encryption Info
 	#[cfg(feature = "aead")]
-	#[cfg_attr(feature = "derive", error("Missing encryption info"))]
+	#[error("Missing encryption info")]
 	MissingEncryptionInfo,
 
 	/// AEAD nonce length does not match the cipher's nonce size
 	#[cfg(feature = "aead")]
-	#[cfg_attr(
-		feature = "derive",
-		error("Invalid AEAD nonce length: expected {expected:?}, got {received:?}")
-	)]
+	#[error("Invalid AEAD nonce length: {0}")]
 	InvalidNonceLength(ReceivedExpectedError<usize, usize>),
 
 	/// Send-direction AEAD counter nonce space exhausted
 	#[cfg(feature = "aead")]
-	#[cfg_attr(feature = "derive", error("AEAD counter nonce space exhausted"))]
+	#[error("AEAD counter nonce space exhausted")]
 	NonceExhausted,
 
 	/// Send-direction AEAD record limit reached (RFC 9846 § 5.5)
 	#[cfg(feature = "aead")]
-	#[cfg_attr(
-		feature = "derive",
-		error("AEAD record limit reached: reestablish the session to rekey")
-	)]
+	#[error("AEAD record limit reached: reestablish the session to rekey")]
 	RekeyRequired,
 
 	/// Received AEAD counter nonce is not the exact next in sequence
 	/// (replay, reorder, or deletion)
 	#[cfg(feature = "aead")]
-	#[cfg_attr(
-		feature = "derive",
-		error("Out-of-sequence AEAD nonce: expected {expected:?}, got {received:?}")
-	)]
+	#[error("Out-of-sequence AEAD nonce: {0}")]
 	NonceReplayed(ReceivedExpectedError<u64, u64>),
 
 	/// Missing Integrity Info
 	#[cfg(feature = "digest")]
-	#[cfg_attr(feature = "derive", error("Missing integrity info"))]
+	#[error("Missing integrity info")]
 	MissingDigestInfo,
 
 	/// Missing Compression Info
-	#[cfg_attr(feature = "derive", error("Missing compression info"))]
+	#[error("Missing compression info")]
 	MissingCompressedData,
 
 	/// Invalid algorithm for the message profile
-	#[cfg_attr(feature = "derive", error("Invalid algorithm for message profile"))]
+	#[error("Invalid algorithm for message profile")]
 	InvalidAlgorithm,
 
 	/// Unexpected algorithm for the message profile
-	#[cfg_attr(
-		feature = "derive",
-		error("Unexpected algorithm for message profile: expected {expected:?}, got {received:?}")
-	)]
+	#[error("Unexpected algorithm for message profile: {0}")]
 	UnexpectedAlgorithm(ReceivedExpectedError<ObjectIdentifier, ObjectIdentifier>),
 
 	/// Missing or invalid configuration
-	#[cfg_attr(feature = "derive", error("Missing configuration"))]
+	#[error("Missing configuration")]
 	MissingConfiguration,
 
 	/// Operation not supported by this implementation
-	#[cfg_attr(feature = "derive", error("Unsupported operation"))]
+	#[error("Unsupported operation")]
 	UnsupportedOperation,
 
 	/// Hive already established
 	#[cfg(feature = "colony")]
-	#[cfg_attr(feature = "derive", error("Hive already established"))]
+	#[error("Hive already established")]
 	AlreadyEstablished,
 
 	/// Hive has not been established yet
@@ -448,248 +423,82 @@ pub enum TightBeamError {
 	/// bound control listener. Call [`Hive::establish`](crate::colony::hive::Hive::establish)
 	/// first so the registered address matches the live accept socket.
 	#[cfg(feature = "colony")]
-	#[cfg_attr(feature = "derive", error("Hive not established"))]
+	#[error("Hive not established")]
 	NotEstablished,
 
 	/// Task join error
 	#[cfg(feature = "colony")]
-	#[cfg_attr(feature = "derive", error("Task join failed"))]
+	#[error("Task join failed")]
 	JoinError,
 
 	/// Multiple errors collected together
-	#[cfg_attr(feature = "derive", error("Multiple errors occurred: {0:?}"))]
-	Sequence(Vec<TightBeamError>),
+	#[error("Multiple errors occurred: {0}")]
+	Sequence(ErrorChain),
 
 	/// Injected fault for testing (any error type)
 	#[cfg(feature = "testing-fault")]
-	#[cfg_attr(feature = "derive", error("Injected fault: {0}"))]
+	#[error("Injected fault: {0}")]
 	InjectedFault(Box<dyn InjectedError>),
 }
 
-#[cfg(all(feature = "colony", not(feature = "derive")))]
-impl From<crate::colony::WorkerRelayError> for TightBeamError {
-	fn from(err: crate::colony::WorkerRelayError) -> Self {
-		TightBeamError::WorkerRelay(err)
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for TightBeamError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			TightBeamError::SerializationError(err) => write!(f, "Serialization error: {err}"),
-			TightBeamError::MatrixError(err) => write!(f, "Matrix error: {err}"),
-			#[cfg(feature = "std")]
-			TightBeamError::IoError(err) => write!(f, "I/O error: {err}"),
-			#[cfg(feature = "crypto")]
-			TightBeamError::CryptoPolicyError(err) => write!(f, "Crypto policy error: {err}"),
-			#[cfg(feature = "x509")]
-			TightBeamError::CertificateValidationError(err) => {
-				write!(f, "Certificate validation error: {err}")
-			}
-			#[cfg(feature = "router")]
-			TightBeamError::RouterError(err) => write!(f, "Route error: {err}"),
-			TightBeamError::InvalidMetadata => write!(f, "Invalid metadata"),
-			TightBeamError::InvalidBody => write!(f, "Invalid message body"),
-			TightBeamError::InvalidOID(err) => {
-				write!(f, "Invalid or unsupported object identifier: {err}")
-			}
-			TightBeamError::InvalidOverflowValue => write!(f, "Invalid overflow value"),
-			TightBeamError::InvalidOrder => write!(f, "Invalid order"),
-			TightBeamError::MissingInflator => write!(f, "Missing inflator"),
-			TightBeamError::MissingOrder => write!(f, "Missing order"),
-			TightBeamError::MissingPriority => write!(f, "Missing priority"),
-			TightBeamError::MissingResponse => write!(f, "Missing response"),
-			#[cfg(feature = "policy")]
-			TightBeamError::WorkRefused(status) => write!(f, "Work refused: {status:?}"),
-			TightBeamError::ChannelClosed => write!(f, "Channel closed"),
-			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
-			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),
-			TightBeamError::UnsupportedOperation => write!(f, "Unsupported operation"),
-			#[cfg(feature = "transport")]
-			TightBeamError::HandshakeError(err) => write!(f, "Handshake error: {err}"),
-			#[cfg(feature = "colony")]
-			TightBeamError::HiveError(err) => write!(f, "Hive error: {err}"),
-			#[cfg(feature = "std")]
-			TightBeamError::LockPoisoned => write!(f, "Lock poisoned"),
-			#[cfg(feature = "standards")]
-			TightBeamError::StandardError(err) => write!(f, "Standard error: {err}"),
-			#[cfg(feature = "random")]
-			TightBeamError::OsRngError(err) => write!(f, "OS random number generator error: {err}"),
-			#[cfg(feature = "x509")]
-			TightBeamError::SpkiError(err) => write!(f, "SPKI error: {err}"),
-			#[cfg(feature = "builder")]
-			TightBeamError::X509BuilderError(err) => write!(f, "X.509 builder error: {err}"),
-			#[cfg(feature = "std")]
-			TightBeamError::RecvTimeoutError => write!(f, "Channel receive timeout error"),
-			#[cfg(feature = "aead")]
-			TightBeamError::EncryptionError(err) => {
-				write!(f, "Encryption or decryption error: {err}")
-			}
-			#[cfg(feature = "aead")]
-			TightBeamError::InvalidKeyLength(len) => {
-				write!(f, "Invalid key length: {len}")
-			}
-			#[cfg(feature = "ecies")]
-			TightBeamError::EciesError(err) => write!(f, "ECIES error: {err}"),
-			#[cfg(feature = "kdf")]
-			TightBeamError::KeyDerivationError(err) => write!(f, "Key derivation error: {err}"),
-			#[cfg(feature = "signature")]
-			TightBeamError::SignatureError(err) => {
-				write!(f, "Signature verification or generation error: {err}")
-			}
-			#[cfg(feature = "signature")]
-			TightBeamError::EllipticCurveError(err) => write!(f, "Elliptic curve error: {err}"),
-			#[cfg(feature = "signature")]
-			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
-			#[cfg(feature = "crypto")]
-			TightBeamError::KeyError(err) => write!(f, "Key provider error: {err}"),
-			#[cfg(feature = "crypto")]
-			TightBeamError::SecretUnavailable(err) => write!(f, "Secret unavailable: {err}"),
-			#[cfg(feature = "digest")]
-			TightBeamError::MissingDigestInfo => write!(f, "Missing integrity info"),
-			#[cfg(feature = "aead")]
-			TightBeamError::MissingEncryptionInfo => write!(f, "Missing encryption info"),
-			#[cfg(feature = "aead")]
-			TightBeamError::InvalidNonceLength(err) => {
-				write!(
-					f,
-					"Invalid AEAD nonce length: expected {:?}, got {:?}",
-					err.expected, err.received
-				)
-			}
-			#[cfg(feature = "aead")]
-			TightBeamError::NonceExhausted => write!(f, "AEAD counter nonce space exhausted"),
-			#[cfg(feature = "aead")]
-			TightBeamError::RekeyRequired => {
-				write!(f, "AEAD record limit reached: reestablish the session to rekey")
-			}
-			#[cfg(feature = "aead")]
-			TightBeamError::NonceReplayed(err) => {
-				write!(
-					f,
-					"Out-of-sequence AEAD nonce: expected {:?}, got {:?}",
-					err.expected, err.received
-				)
-			}
-			#[cfg(feature = "signature")]
-			TightBeamError::MissingSignatureInfo => write!(f, "Missing signature info"),
-			#[cfg(feature = "signature")]
-			TightBeamError::MissingSignature => write!(f, "Missing signature"),
-			TightBeamError::MissingCompressedData => write!(f, "Missing compression info"),
-			TightBeamError::InvalidAlgorithm => write!(f, "Invalid algorithm for message profile"),
-			TightBeamError::UnexpectedAlgorithm(err) => {
-				write!(
-					f,
-					"Unexpected algorithm for message profile: expected {:?}, got {:?}",
-					err.expected, err.received
-				)
-			}
-			#[cfg(feature = "compress")]
-			TightBeamError::CompressionError(err) => write!(f, "Compression error: {err}"),
-			TightBeamError::Sequence(errors) => write!(f, "Multiple errors occurred: {errors:?}"),
-			#[cfg(feature = "colony")]
-			TightBeamError::AlreadyEstablished => write!(f, "Hive already established"),
-			#[cfg(feature = "colony")]
-			TightBeamError::NotEstablished => write!(f, "Hive not established"),
-			#[cfg(feature = "colony")]
-			TightBeamError::JoinError => write!(f, "Task join failed"),
-			TightBeamError::UnsupportedVersion(err) => {
-				write!(
-					f,
-					"Unsupported protocol version: expected {:?}, got {:?}",
-					err.expected, err.received
-				)
-			}
-			#[cfg(feature = "testing")]
-			TightBeamError::TestingError(err) => write!(f, "Testing error: {err}"),
-			TightBeamError::UrnValidationError(err) => write!(f, "URN validation error: {err}"),
-			#[cfg(feature = "testing-fault")]
-			TightBeamError::InjectedFault(err) => write!(f, "Injected fault: {err}"),
-		}
-	}
-}
+crate::impl_from!(der::Error => TightBeamError::SerializationError);
+crate::impl_from!(crate::matrix::MatrixError => TightBeamError::MatrixError);
+crate::impl_from!(crate::utils::urn::UrnValidationError => TightBeamError::UrnValidationError);
 
 #[cfg(feature = "std")]
 crate::impl_from!(std::string::FromUtf8Error => TightBeamError::IoError via |err| std::io::Error::new(std::io::ErrorKind::InvalidData, err));
 #[cfg(feature = "std")]
 crate::impl_from!(std::net::AddrParseError => TightBeamError::IoError via |err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err));
-
-// When the `derive` feature is disabled, these provide the From impls that
-// the Errorizable derive macro's #[from] attribute would otherwise generate.
-
-#[cfg(not(feature = "derive"))]
-crate::impl_from!(der::Error => TightBeamError::SerializationError);
-#[cfg(not(feature = "derive"))]
-crate::impl_from!(crate::matrix::MatrixError => TightBeamError::MatrixError);
-#[cfg(not(feature = "derive"))]
-crate::impl_from!(crate::utils::urn::UrnValidationError => TightBeamError::UrnValidationError);
-#[cfg(all(feature = "crypto", not(feature = "derive")))]
+#[cfg(feature = "crypto")]
 crate::impl_from!(crate::crypto::policy::CryptoPolicyError => TightBeamError::CryptoPolicyError);
-#[cfg(all(feature = "kdf", not(feature = "derive")))]
+#[cfg(feature = "kdf")]
 crate::impl_from!(crate::crypto::kdf::KdfError => TightBeamError::KeyDerivationError);
-#[cfg(all(feature = "crypto", not(feature = "derive")))]
+#[cfg(feature = "crypto")]
 crate::impl_from!(crate::crypto::key::KeyError => TightBeamError::KeyError);
-#[cfg(all(feature = "crypto", not(feature = "derive")))]
+#[cfg(feature = "crypto")]
 crate::impl_from!(crate::crypto::secret::SecretError => TightBeamError::SecretUnavailable);
-
-#[cfg(all(feature = "std", not(feature = "derive")))]
+#[cfg(feature = "std")]
 crate::impl_from!(std::io::Error => TightBeamError::IoError);
-
-#[cfg(all(feature = "router", not(feature = "derive")))]
+#[cfg(feature = "router")]
 crate::impl_from!(crate::router::RouterError => TightBeamError::RouterError);
-
-#[cfg(all(feature = "builder", not(feature = "derive")))]
+#[cfg(feature = "builder")]
 crate::impl_from!(crate::builder::error::BuildError => TightBeamError::BuildError);
-
-#[cfg(all(feature = "standards", not(feature = "derive")))]
+#[cfg(feature = "standards")]
 crate::impl_from!(crate::standards::error::StandardError => TightBeamError::StandardError);
-
-#[cfg(all(feature = "colony", not(feature = "derive")))]
+#[cfg(feature = "colony")]
 crate::impl_from!(crate::colony::hive::HiveError => TightBeamError::HiveError);
-#[cfg(all(feature = "colony", not(feature = "derive")))]
+#[cfg(feature = "colony")]
 crate::impl_from!(crate::colony::worker::WorkerRelayError => TightBeamError::WorkerRelay);
-
-#[cfg(all(feature = "transport", not(feature = "derive")))]
+#[cfg(feature = "transport")]
 crate::impl_from!(crate::transport::handshake::HandshakeError => TightBeamError::HandshakeError);
-#[cfg(all(feature = "transport", not(feature = "derive")))]
+#[cfg(feature = "transport")]
 crate::impl_from!(crate::transport::error::TransportError => TightBeamError::TransportError);
-
-#[cfg(all(feature = "random", not(feature = "derive")))]
+#[cfg(feature = "random")]
 crate::impl_from!(rand_core::Error => TightBeamError::OsRngError);
-
-#[cfg(all(feature = "x509", not(feature = "derive")))]
+#[cfg(feature = "x509")]
+crate::impl_from!(crate::crypto::x509::error::CertificateValidationError => TightBeamError::CertificateValidationError);
+#[cfg(feature = "x509")]
 crate::impl_from!(spki::Error => TightBeamError::SpkiError);
-#[cfg(all(feature = "builder", not(feature = "derive")))]
+#[cfg(feature = "builder")]
 crate::impl_from!(x509_cert::builder::Error => TightBeamError::X509BuilderError);
-
-#[cfg(all(feature = "compress", not(feature = "derive")))]
+#[cfg(feature = "compress")]
 crate::impl_from!(CompressionError => TightBeamError::CompressionError);
-#[cfg(all(feature = "std", feature = "compress", not(feature = "derive")))]
+#[cfg(all(feature = "std", feature = "compress"))]
 crate::impl_from!(std::io::Error => CompressionError::IO);
-
-#[cfg(all(feature = "aead", not(feature = "derive")))]
+#[cfg(feature = "aead")]
 crate::impl_from!(aead::Error => TightBeamError::EncryptionError);
-#[cfg(all(feature = "aead", not(feature = "derive")))]
+#[cfg(feature = "aead")]
 crate::impl_from!(crypto_common::InvalidLength => TightBeamError::InvalidKeyLength);
-
-#[cfg(all(feature = "ecies", not(feature = "derive")))]
+#[cfg(feature = "ecies")]
 crate::impl_from!(crate::crypto::ecies::EciesError => TightBeamError::EciesError);
-
-#[cfg(all(feature = "signature", not(feature = "derive")))]
+#[cfg(feature = "signature")]
 crate::impl_from!(signature::Error => TightBeamError::SignatureError);
-#[cfg(all(feature = "signature", not(feature = "derive")))]
+#[cfg(feature = "signature")]
 crate::impl_from!(crate::crypto::sign::elliptic_curve::Error => TightBeamError::EllipticCurveError);
-
-#[cfg(all(feature = "testing", not(feature = "derive")))]
+#[cfg(feature = "testing")]
 crate::impl_from!(crate::testing::error::TestingError => TightBeamError::TestingError);
-#[cfg(all(feature = "std", not(feature = "derive")))]
+#[cfg(feature = "std")]
 crate::impl_from!(std::sync::mpsc::RecvTimeoutError => TightBeamError::RecvTimeoutError discard);
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for TightBeamError {}
-#[cfg(all(feature = "compress", not(feature = "derive")))]
-impl core::error::Error for CompressionError {}
 
 #[cfg(feature = "transport")]
 impl TightBeamError {
@@ -720,24 +529,37 @@ impl<T> From<std::sync::PoisonError<T>> for TightBeamError {
 	}
 }
 
-#[cfg(all(test, feature = "derive", feature = "std"))]
+#[cfg(all(test, feature = "std"))]
 mod tests {
 	use super::*;
 
 	#[test]
 	fn source_annotated_wrappers_expose_their_cause() {
 		let err = TightBeamError::from(crate::matrix::MatrixError::InvalidN(0));
-
 		let source = core::error::Error::source(&err);
-
 		assert!(matches!(err, TightBeamError::MatrixError(_)));
 		assert!(source.is_some());
 	}
 
 	#[test]
+	fn error_chain_renders_a_readable_join() {
+		let chain = ErrorChain::from(vec![TightBeamError::InvalidBody, TightBeamError::MissingOrder]);
+		let wrapped = TightBeamError::Sequence(chain);
+		assert_eq!(
+			wrapped.to_string(),
+			"Multiple errors occurred: Invalid message body; Missing order"
+		);
+	}
+
+	#[test]
+	fn error_chain_renders_a_lone_error_without_a_separator() {
+		let wrapped = TightBeamError::Sequence(ErrorChain::from(vec![TightBeamError::InvalidBody]));
+		assert_eq!(wrapped.to_string(), "Multiple errors occurred: Invalid message body");
+	}
+
+	#[test]
 	fn unit_variants_have_no_source() {
 		let err = TightBeamError::InvalidBody;
-
 		assert!(core::error::Error::source(&err).is_none());
 	}
 }

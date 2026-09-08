@@ -182,7 +182,6 @@ pub use utils::{decode, encode};
 pub use hex_literal::hex;
 #[cfg(all(feature = "std", not(feature = "tokio")))]
 pub use std::sync::mpsc;
-#[cfg(feature = "derive")]
 pub use tightbeam_derive::{Beamable, Errorizable, Flaggable};
 #[cfg(feature = "time")]
 pub use time;

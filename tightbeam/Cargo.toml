@@ -20,7 +20,7 @@ workspace = true
 name = "tightbeam"
 
 [dependencies]
-tightbeam-derive = { workspace = true, optional = true }
+tightbeam-derive = { workspace = true }
 
 # RustCrypto dependencies
 der = { workspace = true }
@@ -130,7 +130,7 @@ transport = [
 	"ecdh",
 ]
 doc = []
-compress = ["tightbeam-derive?/compress"]
+compress = ["tightbeam-derive/compress"]
 transport-policy = ["transport", "policy"]
 transport-multiplex = ["transport", "std", "futures", "futures/std"]
 # UNSTABLE: PQXDH prekey/kdf-chain/hybrid-KEM primitives.
@@ -177,7 +177,7 @@ aead = [
 	"dep:aead",
 	"dep:ecdsa",
 	"dep:crypto-common",
-	"tightbeam-derive?/aead",
+	"tightbeam-derive/aead",
 	"aead/rand_core",
 	"dep:aes",
 	"dep:aes-kw",
@@ -192,12 +192,12 @@ signature = [
 	"dep:ecdsa",
 	"ecdsa/verifying",
 	"ecdsa/pem",
-	"tightbeam-derive?/signature",
+	"tightbeam-derive/signature",
 	"dep:signature",
 	"cms/signature",
 	"x509-cert/signature",
 ]
-digest = ["crypto", "dep:digest", "tightbeam-derive?/digest", "sha3"]
+digest = ["crypto", "dep:digest", "tightbeam-derive/digest", "sha3"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "digest"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
 ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
@@ -244,7 +244,8 @@ transport-ecies = [
 	"ecdh",
 ]
 
-derive = ["dep:tightbeam-derive"]
+# Retained as a no-op: the derive macros are always available.
+derive = []
 
 # Standard library support
 std = [

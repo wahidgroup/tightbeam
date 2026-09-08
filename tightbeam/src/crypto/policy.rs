@@ -4,24 +4,19 @@
 
 use core::fmt::Debug;
 
+use crate::der::oid::ObjectIdentifier;
+use crate::Errorizable;
+
 #[cfg(feature = "x509")]
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::der::oid::ObjectIdentifier;
 
 /// Errors specific to cryptographic policy enforcement
-///
-/// Deliberately does not derive `Errorizable`: this module builds without
-/// the `derive` feature, so the message strings live in exactly one place --
-/// the `impl_error_display!` block below.
-#[derive(Debug)]
+#[derive(Errorizable, Debug)]
 pub enum CryptoPolicyError {
 	/// Algorithm not supported by this policy
+	#[error("Unsupported algorithm: {0}")]
 	UnsupportedAlgorithm(ObjectIdentifier),
 }
-
-crate::impl_error_display!(unconditional CryptoPolicyError {
-	UnsupportedAlgorithm(oid) => "Unsupported algorithm: {oid}",
-});
 
 /// Trait for cryptographic verification policies.
 ///

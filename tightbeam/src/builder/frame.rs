@@ -144,7 +144,7 @@ impl ErrorAccumulator {
 		match self {
 			Self::None => None,
 			Self::One(error) => Some(error),
-			other => Some(TightBeamError::Sequence(other.into())),
+			other => Some(TightBeamError::Sequence(Vec::from(other).into())),
 		}
 	}
 }

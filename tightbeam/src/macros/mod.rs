@@ -1,5 +1,4 @@
 // Error macro is always available
-pub mod error;
 
 // Feature-delegation helpers are always available
 pub mod cfg;

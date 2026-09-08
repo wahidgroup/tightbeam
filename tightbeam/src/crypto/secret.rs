@@ -15,23 +15,17 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::der::{self, Decode, Encode, FixedTag};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
+use crate::Errorizable;
 
 /// Error returned by [`Secret`] accessors when the wrapped value is
 /// unavailable, e.g. already consumed via [`ToInsecure::to_insecure`] or
 /// never present.
-///
-/// Deliberately does not derive `Errorizable`: this module builds without
-/// the `derive` feature, so the message strings live in exactly one place --
-/// the `impl_error_display!` block below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretError {
 	/// Secret value is unavailable (already consumed or never set).
+	#[error("Secret value is unavailable")]
 	Unavailable,
 }
-
-crate::impl_error_display!(unconditional SecretError {
-	Unavailable => "Secret value is unavailable",
-});
 
 /// A secret wrapper that zeroizes its inner value on drop.
 ///

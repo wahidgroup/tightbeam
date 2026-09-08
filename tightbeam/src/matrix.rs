@@ -2,19 +2,19 @@
 use alloc::vec::Vec;
 
 use crate::Asn1Matrix;
+use crate::Errorizable;
 
 pub type MatrixResult<T> = core::result::Result<T, MatrixError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MatrixError {
+	#[error("Asn1Matrix: n MUST be in 1..=255 (got {0})")]
 	InvalidN(u8),
-	LengthMismatch { n: u8, len: usize },
+	LengthMismatch {
+		n: u8,
+		len: usize,
+	},
 }
-
-crate::impl_error_display!(unconditional MatrixError {
-	InvalidN(n) => "Asn1Matrix: n MUST be in 1..=255 (got {n})",
-	LengthMismatch { n, len } => "Asn1Matrix: data length MUST equal n*n (n={n}, len={len})",
-});
 
 /// A common interface for NxN flag matrices (u8 cells), row-major.
 pub trait MatrixLike {
