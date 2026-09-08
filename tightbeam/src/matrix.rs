@@ -10,10 +10,8 @@ pub type MatrixResult<T> = core::result::Result<T, MatrixError>;
 pub enum MatrixError {
 	#[error("Asn1Matrix: n MUST be in 1..=255 (got {0})")]
 	InvalidN(u8),
-	LengthMismatch {
-		n: u8,
-		len: usize,
-	},
+	#[error("Asn1Matrix: data length MUST equal n*n (n={n}, len={len})")]
+	LengthMismatch { n: u8, len: usize },
 }
 
 /// A common interface for NxN flag matrices (u8 cells), row-major.

@@ -48,3 +48,15 @@ fn compile_fail_assert_spec_version_order() {
 	let t = trybuild::TestCases::new();
 	t.compile_fail("tests/compile/assert_spec_version_order.rs");
 }
+
+#[test]
+fn compile_fail_errorizable_missing_message() {
+	let t = trybuild::TestCases::new();
+	t.compile_fail("tests/compile/errorizable_missing_message.rs");
+}
+
+#[test]
+fn compile_fail_errorizable_drops_payload() {
+	let t = trybuild::TestCases::new();
+	t.compile_fail("tests/compile/errorizable_drops_payload.rs");
+}

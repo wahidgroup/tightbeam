@@ -462,7 +462,9 @@ impl CryptoProvider for DefaultCryptoProvider {
 #[derive(Errorizable, Debug, Clone)]
 #[allow(unused_variables)]
 pub enum UkmBuilderError {
+	#[error("Duplicate tag: {tag}")]
 	DuplicateTag { tag: u8 },
+	#[error("Extension too large (tag {tag} len {len})")]
 	ExtensionTooLarge { tag: u8, len: usize },
 }
 

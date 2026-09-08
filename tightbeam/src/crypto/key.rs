@@ -138,7 +138,7 @@ crate::impl_from!(#[cfg(feature = "aead")] AeadError => KeyError::AeadError);
 /// This enum allows keys to be specified in multiple ways for flexible
 /// configuration in const contexts (e.g., servlet! macro).
 #[cfg(feature = "signature")]
-#[derive(Errorizable, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub enum SigningKeySpec {
 	/// Raw key bytes (e.g., secp256k1 scalar - 32 bytes)
 	Bytes(&'static [u8]),
