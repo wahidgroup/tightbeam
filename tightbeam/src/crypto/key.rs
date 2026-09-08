@@ -7,20 +7,19 @@
 //! Concrete implementations (e.g., [`InMemorySigningKeyProvider`]) handle algorithm-specific
 //! encoding/decoding.
 
-use core::fmt::Debug;
-
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
 #[cfg(all(not(feature = "std"), any(feature = "signature", feature = "aead")))]
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
-#[cfg(any(feature = "signature", feature = "aead"))]
-use core::marker::PhantomData;
+use core::fmt::Debug;
 
-#[cfg(any(feature = "signature", feature = "aead"))]
+#[cfg(feature = "aead")]
 use core::future::Future;
 #[cfg(any(feature = "signature", feature = "aead"))]
+use core::marker::PhantomData;
+#[cfg(feature = "aead")]
 use core::pin::Pin;
 
 use crate::Errorizable;
@@ -66,7 +65,6 @@ mod encryption {
 	pub use crate::crypto::aead::{
 		Aead, AeadCore, Aes128Gcm, Aes128GcmOid, Aes256Gcm, Aes256GcmOid, Error as AeadError, Nonce,
 	};
-	pub use crate::crypto::common::typenum::Unsigned;
 }
 
 #[cfg(feature = "aead")]
@@ -74,6 +72,7 @@ use encryption::*;
 
 #[cfg(any(feature = "signature", feature = "aead"))]
 mod common {
+	pub use crate::crypto::common::typenum::Unsigned;
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::spki::AlgorithmIdentifierOwned;
 

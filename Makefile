@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint doc-lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked audit ci
+.PHONY: all help help-body help-ref version setup check build clean test lint doc-lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked check-semver audit ci
 
 .NOTPARALLEL: ci
 
@@ -19,7 +19,6 @@ else
 LINT_MODE := check
 endif
 
-AUDIT_MODE := $(LINT_MODE)
 
 ifneq ($(filter 1,$(debug)),)
 export RUST_LOG = debug
@@ -53,17 +52,18 @@ help-body:
 	@printf '    test            Run all tests (honors cargo features and no-default)\n'
 	@printf '    test-all        Run tests with all feature combinations\n'
 	@printf '    fuzz-build      Build AFL-instrumented fuzz targets (cargo-afl via setup)\n'
-	@printf '    fuzz-test       Build and run AFL fuzz testing for 60 seconds\n'
+	@printf '    fuzz-test       Build and fuzz every target (seconds=N, default 60)\n'
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
 	@printf '    lint            Lint + spellcheck + rustdoc (fix=1 to auto-fix; extra clippy args via ARGS)\n'
 	@printf '    spellcheck      Spellcheck the repository with typos\n'
-	@printf '    audit           Run security audit (RustSec cargo-audit; fix=1 reserved)\n'
-	@printf '    ci              Full pipeline: lint + build + test-all\n'
+	@printf '    audit           Run dependency audit (cargo-deny: advisories, licences, bans)\n'
+	@printf '    ci              Full pipeline: lint + audit + build + test-all\n'
 	@printf '    doc             Build documentation (all features; -D warnings)\n'
 	@printf '    release         Release workflow (see OPTIONS)\n'
 	@printf '    release-derive  Derive-only release: tag tightbeam-derive (see OPTIONS)\n'
-	@printf '    check-yanked    Check if current version has been yanked (derive=1 for derive)\n\n'
+	@printf '    check-yanked    Check if current version has been yanked (derive=1 for derive)\n'
+	@printf '    check-semver    Check the public API against the published baseline\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
 	@printf '    fix             If set (e.g., fix=1), apply fmt + clippy --fix; rustdoc still denies warnings\n'
 	@printf '    debug           If set (e.g., debug=1), export RUST_LOG=debug\n'
@@ -74,7 +74,7 @@ help-body:
 	@printf '    dry-run         If set (e.g., dry-run=1), preview release without changes\n'
 	@printf '    allow-staged    If set (e.g., allow-staged=1), include staged files in release\n'
 	@printf '    yank            If set (e.g., yank=1), yank a published release instead\n'
-	@printf '    derive          If set (e.g., derive=1), check-yanked targets tightbeam-derive\n'
+	@printf '    derive          If set (e.g., derive=1), check-yanked and check-semver target tightbeam-derive\n'
 	@printf 'EXAMPLES:\n'
 	@printf '    make build features="std,tcp,tokio"\n'
 	@printf '    make test no-default=1 features="testing"\n'
@@ -128,14 +128,16 @@ fuzz-build: setup
 	@./scripts/fuzz-build.sh
 
 # Options:
+#   seconds=N               - Fuzz each target for N seconds (default 60)
 #   skip-missing-crashes=1  - Skip crash reporting config check
 #   skip-cpu-freq=1         - Skip CPU frequency scaling check
 fuzz-test: fuzz-build
 	@./scripts/fuzz-test.sh \
+		$(if $(seconds),--seconds $(seconds)) \
 		$(if $(filter 1,$(skip-missing-crashes)),--skip-missing-crashes) \
 		$(if $(filter 1,$(skip-cpu-freq)),--skip-cpu-freq)
 
-# Usage: make analyze-fuzz file=built/fuzz/out/default/crashes/id:000000...
+# Usage: make analyze-fuzz file=built/fuzz/out/<target>/default/crashes/id:000000...
 analyze-fuzz:
 	@./scripts/fuzz-analyze.sh "$(file)"
 
@@ -171,10 +173,11 @@ doc: doc-lint
 
 audit: setup
 	@chmod +x scripts/audit.sh
-	@AUDIT_MODE=$(AUDIT_MODE) ./scripts/audit.sh
+	@./scripts/audit.sh
 
 ci:
 	$(MAKE) lint
+	$(MAKE) audit
 	$(MAKE) build
 	$(MAKE) test-all
 
@@ -193,3 +196,7 @@ release-derive: setup
 
 check-yanked:
 	@./scripts/check-yanked.sh $(if $(filter 1,$(derive)),--derive)
+
+check-semver: setup
+	@echo "Checking the public API against the published baseline..."
+	cargo semver-checks check-release --package $(if $(filter 1,$(derive)),tightbeam-derive,tightbeam-rs)

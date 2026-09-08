@@ -292,10 +292,11 @@ where
 /// Top-level keys:
 /// - `name:` test function name (omit with `fuzz: afl`)
 /// - `spec:` AssertSpec type (latest version) or `config:` ScenarioConfig
-/// - `fuzz: afl` optional AFL target (Bare/Servlet/Hive/Cluster). Bare,
-///   Hive, and Cluster wrap `afl::fuzz!` and pass
-///   [`TraceCollector::with_fuzz_oracle`] into the runner; needs
-///   testing-csp)
+/// - `fuzz: afl` optional AFL target (Bare/Servlet/Hive/Cluster). Every
+///   environment wraps `afl::fuzz!` and passes
+///   [`TraceCollector::with_fuzz_oracle`] into the same runner the named
+///   test uses, so each AFL iteration verifies its specs and its CSP
+///   process. Requires `csp:` and feature `testing-fuzz`
 ///
 /// Environment-block keys:
 /// - `context:` fixture evaluated once per test, shared as `Arc<C>`
@@ -337,8 +338,14 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== HELPER: Verify specs and call hooks (DRY) =====
+	// ===== HELPER: Verify specs and call hooks =====
 	(@verify_and_call_hooks $config:expr, $hook_ctx:expr, $exec_result:expr) => {
+		// An AFL iteration whose input ran out drove a prefix of a run, not a
+		// violation. Grading it would report every short mutation as a finding.
+		if $exec_result.as_ref().err().is_some_and(|error| error.is_fuzz_input_exhausted()) {
+			return;
+		}
+
 		// Verify Layer 1 assertion specs
 		for spec in $config.specs() {
 			match $crate::testing::specs::verify_trace(*spec, &$hook_ctx.trace) {
@@ -360,21 +367,23 @@ macro_rules! tb_scenario {
 
 		// Verify Layer 2 CSP process (when configured). Failures travel
 		// the same path as Layer 1: on_fail first, then the panic.
-		#[cfg(feature = "testing-csp")]
-		if let Some(csp) = $config.csp() {
-			let csp_result =
-				$crate::testing::specs::csp::ProcessSpec::validate_trace(csp.as_ref(), &$hook_ctx.trace);
-			if !csp_result.valid {
-				let violation = $crate::testing::specs::SpecViolation::CspProcessViolation(csp_result.violations);
-				if let Some(hooks) = $config.hooks() {
-					if let Some(ref on_fail) = hooks.on_fail {
-						let _ = on_fail(&$hook_ctx, &violation);
+		$crate::__tb_if_testing_csp!({
+			if let Some(csp) = $config.csp() {
+				let csp_result =
+					$crate::testing::specs::csp::ProcessSpec::validate_trace(csp.as_ref(), &$hook_ctx.trace);
+				if !csp_result.valid {
+					let violation =
+						$crate::testing::specs::SpecViolation::CspProcessViolation(csp_result.violations);
+					if let Some(hooks) = $config.hooks() {
+						if let Some(ref on_fail) = hooks.on_fail {
+							let _ = on_fail(&$hook_ctx, &violation);
+						}
 					}
-				}
 
-				panic!("CSP verification failed: {:?}", violation);
+					panic!("CSP verification failed: {:?}", violation);
+				}
 			}
-		}
+		});
 
 		// Call on_pass hook if present
 		if let Some(hooks) = $config.hooks() {
@@ -398,12 +407,10 @@ macro_rules! tb_scenario {
 		}
 
 		let mut hook_ctx = $crate::testing::HookContext::new(consumed_trace);
-		#[cfg(feature = "testing-csp")]
-		{
+		$crate::__tb_if_testing_csp!({
 			hook_ctx.process = $config.csp().map(|p| std::sync::Arc::clone(p));
-		}
-		#[cfg(feature = "testing-fdr")]
-		{
+		});
+		$crate::__tb_if_testing_fdr!({
 			if let Some(fdr_cfg) = $config.fdr() {
 				hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
 				use $crate::testing::fdr::DefaultFdrExplorer;
@@ -413,21 +420,10 @@ macro_rules! tb_scenario {
 					// Mode A: CSP spec provided - explore the spec model itself
 					let spec_process_cow = csp_spec.to_process_cow();
 					// Create exploration config (empty specs = state-space exploration)
-					let exploration_cfg = std::sync::Arc::new($crate::testing::fdr::FdrConfig {
-						seeds: fdr_cfg.seeds,
-						max_depth: fdr_cfg.max_depth,
-						max_internal_run: fdr_cfg.max_internal_run,
-						timeout_ms: fdr_cfg.timeout_ms,
-						specs: Vec::new(), // Empty: triggers exploration mode
-						fail_fast: fdr_cfg.fail_fast,
-						expect_failure: fdr_cfg.expect_failure,
-						scheduler_count: fdr_cfg.scheduler_count,
-						process_count: fdr_cfg.process_count,
-						scheduler_model: fdr_cfg.scheduler_model.clone(),
-						fault_model: fdr_cfg.fault_model.clone(),
-						#[cfg(feature = "testing-fmea")]
-						fmea_config: fdr_cfg.fmea_config.clone(),
-					});
+					let mut exploration_cfg = (**fdr_cfg).clone();
+					// Empty specs put the explorer in state-space exploration mode.
+					exploration_cfg.specs = Vec::new();
+					let exploration_cfg = std::sync::Arc::new(exploration_cfg);
 
 					let mut explorer = DefaultFdrExplorer::with_defaults(&spec_process_cow, exploration_cfg);
 					let mut verdict = explorer.explore();
@@ -461,7 +457,7 @@ macro_rules! tb_scenario {
 
 				hook_ctx.fdr_verdict = Some(fdr_verdict);
 			}
-		}
+		});
 
 		if !$config.specs().is_empty() {
 			hook_ctx.assert_spec = $config.specs().first().copied();
@@ -470,11 +466,47 @@ macro_rules! tb_scenario {
 		hook_ctx
 	}};
 
-	// ===== FUZZ VARIANT: AFL fuzz target for Bare environment (generates fn main()) =====
+	// ===== INTERNAL: Sync AFL mains =====
 	//
-	// Without `--cfg fuzzing`, smoke-runs once with an empty oracle so
-	// `config` / `exec` stay used under IDE and `cargo check` (avoids
-	// unused-import noise on `SetupEnv` in the closure pattern).
+	// Shared by the Bare `fuzz: afl` arm. Both mains forward into the same
+	// `@run_*` body, so spec and CSP verification is not something the
+	// fuzzing path can omit: only the oracle's input bytes differ. Without
+	// `--cfg fuzzing` the smoke main runs one empty-input iteration, which
+	// keeps `config` and `exec` used under an IDE and `cargo check`.
+	(@afl_sync
+		csp: $csp_type:ty,
+		config: $config:expr,
+		@$run:ident
+		$($run_body:tt)*
+	) => {
+		#[cfg(fuzzing)]
+		fn main() {
+			afl::fuzz!(|data: &[u8]| {
+				let process = <$csp_type>::process();
+				let config = $config;
+				let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
+				$crate::tb_scenario!(@$run
+					config: config,
+					trace: trace,
+					$($run_body)*
+				)
+			});
+		}
+
+		#[cfg(not(fuzzing))]
+		fn main() {
+			let process = <$csp_type>::process();
+			let config = $config;
+			let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
+			$crate::tb_scenario!(@$run
+				config: config,
+				trace: trace,
+				$($run_body)*
+			)
+		}
+	};
+
+	// ===== FUZZ VARIANT: AFL fuzz target for Bare environment (generates fn main()) =====
 	(
 		fuzz: afl,
 		csp: $csp_type:ty,
@@ -482,64 +514,39 @@ macro_rules! tb_scenario {
 		environment Bare { exec: $exec_closure:expr }
 		$(,)?
 	) => {
-		#[cfg(fuzzing)]
-		fn main() {
-			afl::fuzz!(|data: &[u8]| {
-				// Get CSP process directly from concrete type (fresh each iteration)
-				#[cfg(feature = "testing-csp")]
-				let process = <$csp_type>::process();
-
-				// Create fresh trace with oracle for this AFL iteration
-				let _config = $config;
-				let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
-				let env = $crate::testing::env::SetupEnv {
-					trace,
-					context: ::std::sync::Arc::new(()),
-				};
-
-				// Execute fuzz closure
-				let _result = $crate::testing::macros::__tb_env_call_sync($exec_closure, env);
-			});
-		}
-
-		#[cfg(not(fuzzing))]
-		fn main() {
-			#[cfg(feature = "testing-csp")]
-			let process = <$csp_type>::process();
-			let config = $config;
-			let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
-			let env = $crate::testing::env::SetupEnv {
-				trace: trace.share(),
-				context: ::std::sync::Arc::new(()),
-			};
-			let exec_result = $crate::testing::macros::__tb_env_call_sync($exec_closure, env);
-			let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
-			$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, exec_result);
+		$crate::tb_scenario! {
+			@afl_sync
+			csp: $csp_type,
+			config: $config,
+			@run_bare_sync
+			context: [],
+			exec: $exec_closure
 		}
 	};
 
 	// ===== FUZZ VARIANT: AFL fuzz target for Servlet environment (generates fn main()) =====
 	(
 		fuzz: afl,
+		csp: $csp_type:ty,
 		config: $config:expr,
 		environment Servlet { $($env_body:tt)* }
 		$(,)?
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::main]
-		async fn main() {
-			$crate::tb_scenario!(@run_servlet
-				config: $config,
-				environment Servlet { $($env_body)* }
-			)
+		$crate::tb_scenario! {
+			@afl_async
+			csp: $csp_type,
+			config: $config,
+			label: "Servlet",
+			@run_servlet
+			environment Servlet { $($env_body)* }
 		}
 	};
 
-	// ===== INTERNAL: Tokio Hive/Cluster AFL mains =====
+	// ===== INTERNAL: Tokio AFL mains =====
 	//
-	// Shared by the Hive and Cluster `fuzz: afl` arms. Builds
+	// Shared by the Servlet, Hive, and Cluster `fuzz: afl` arms. Builds
 	// `TraceCollector::with_fuzz_oracle` each AFL iteration (or empty
-	// bytes for smoke) and forwards into `@run_hive` / `@run_cluster`.
+	// bytes for smoke) and forwards into the matching `@run_*` body.
 	// The Tokio runtime is created inside the fuzz closure so worker
 	// threads are not live before AFL's forkserver handoff.
 	(@afl_async
@@ -556,7 +563,6 @@ macro_rules! tb_scenario {
 					return;
 				};
 				runtime.block_on(async {
-					#[cfg(feature = "testing-csp")]
 					let process = <$csp_type>::process();
 					let config = $config;
 					let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
@@ -572,7 +578,6 @@ macro_rules! tb_scenario {
 		#[cfg(all(not(fuzzing), feature = "tokio"))]
 		#[tokio::main]
 		async fn main() {
-			#[cfg(feature = "testing-csp")]
 			let process = <$csp_type>::process();
 			let config = $config;
 			let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
@@ -672,8 +677,11 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
+			let config = $config;
+			let trace = config.trace();
 			$crate::tb_scenario!(@run_bare_sync
-				config: $config,
+				config: config,
+				trace: trace,
 				context: [ $($context)? ],
 				exec: $exec_closure
 			)
@@ -731,8 +739,11 @@ macro_rules! tb_scenario {
 		#[cfg(feature = "tokio")]
 		#[tokio::test]
 		async fn $test_name() {
+			let config = $config;
+			let trace = config.trace();
 			$crate::tb_scenario!(@run_servlet
-				config: $config,
+				config: config,
+				trace: trace,
 				environment Servlet { $($env_body)* }
 			)
 		}
@@ -859,13 +870,17 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== INTERNAL: Bare environment (SYNC) =====
+	// `trace` is caller-supplied: a named test passes `config.trace()` and an
+	// AFL arm passes `TraceCollector::with_fuzz_oracle(...)`, so both reach the
+	// one verification below.
 	(@run_bare_sync
 		config: $config:expr,
+		trace: $trace:expr,
 		context: [ $($context:expr)? ],
 		exec: $exec_closure:expr
 	) => {{
 		let config = $config;
-		let trace = config.trace();
+		let trace = $trace;
 		let env = $crate::testing::env::SetupEnv {
 			trace: trace.share(),
 			context: ::std::sync::Arc::new(($($context)?)),
@@ -879,14 +894,13 @@ macro_rules! tb_scenario {
 		let mut hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
 
 		// Extract timing constraints from FDR specs if available (Bare-specific)
-		#[cfg(all(feature = "testing-fdr", feature = "testing-timing"))]
-		{
+		$crate::__tb_if_testing_fdr_timing!({
 			if let Some(fdr_cfg) = config.fdr() {
 				if let Some(first_spec) = fdr_cfg.specs.first() {
 					hook_ctx.timing_constraints = first_spec.timing_constraints.clone().map(std::sync::Arc::new);
 				}
 			}
-		}
+		});
 
 		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, exec_result);
 	}};
@@ -972,8 +986,10 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== INTERNAL: Servlet environment =====
+	// `trace` is caller-supplied (see `@run_bare_sync`).
 	(@run_servlet
 		config: $config:expr,
+		trace: $trace:expr,
 		environment Servlet {
 			$(context: $context:expr,)?
 			start: $start_closure:expr,
@@ -982,7 +998,7 @@ macro_rules! tb_scenario {
 		}
 	) => {{
 		let config = $config;
-		let trace = config.trace();
+		let trace = $trace;
 		let context = ::std::sync::Arc::new(($($context)?));
 
 		let servlet_instance = $crate::testing::macros::__tb_env_call(
@@ -1215,7 +1231,7 @@ mod tests {
 		let config = ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build();
 		let hook_ctx = HookContext::new(ConsumedTrace::new());
 		let outcome = catch_unwind(AssertUnwindSafe(|| {
-			crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, Ok::<(), core::fmt::Error>(()));
+			crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, Ok::<(), crate::TightBeamError>(()));
 		}));
 
 		assert!(outcome.is_err());

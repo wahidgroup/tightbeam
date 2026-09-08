@@ -146,8 +146,6 @@ pub mod colony;
 pub mod compress;
 #[cfg(feature = "crypto")]
 pub mod crypto;
-#[cfg(feature = "doc")]
-pub mod doc;
 #[cfg(feature = "std")]
 pub mod instrumentation;
 #[cfg(feature = "policy")]
@@ -178,11 +176,14 @@ pub use pkcs12;
 pub use spki;
 pub use utils::{decode, encode};
 
+pub use tightbeam_derive::Errorizable;
+
 #[cfg(feature = "hex")]
 pub use hex_literal::hex;
 #[cfg(all(feature = "std", not(feature = "tokio")))]
 pub use std::sync::mpsc;
-pub use tightbeam_derive::{Beamable, Errorizable, Flaggable};
+#[cfg(feature = "derive")]
+pub use tightbeam_derive::{Beamable, Flaggable};
 #[cfg(feature = "time")]
 pub use time;
 #[cfg(feature = "tokio")]

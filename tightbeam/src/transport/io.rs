@@ -2,10 +2,7 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(all(
-	not(feature = "std"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+#[cfg(all(not(feature = "std"), feature = "transport-ecies"))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
@@ -38,7 +35,11 @@ use crate::TightBeamError;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 #[cfg(feature = "transport-ecies")]
 use crate::crypto::ecies::Secp256k1EciesMessage;
-#[cfg(feature = "instrument")]
+// Named only by `emit_handshake_outcome`, so this carries that method's gate.
+#[cfg(all(
+	feature = "instrument",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
@@ -468,7 +469,10 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Dual-write the handshake outcome at the transport driver interface:
 	/// completion or a receipt approval/settlement refusal.
-	#[cfg(feature = "instrument")]
+	#[cfg(all(
+		feature = "instrument",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
 	fn emit_handshake_outcome(&self, outcome: &TransportResult<()>)
 	where
 		Self: EncryptedProtocolState,

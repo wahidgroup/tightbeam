@@ -31,6 +31,7 @@ use crate::utils::urn::Urn;
 use crate::testing::schedulability::{SchedulabilityError, SchedulerType, TaskSet};
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::{TimedTransition, TimingConstraints, TimingGuard};
+use crate::Errorizable;
 
 /// Intern pool for CSP state/event names constructed at runtime.
 ///
@@ -601,21 +602,12 @@ impl ProcessSpec for Process {
 }
 
 /// Error building a [`Process`] from a [`ProcessBuilder`]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessBuildError {
 	/// [`ProcessBuilder::initial_state`] was never called
+	#[error("initial state not set")]
 	MissingInitialState,
 }
-
-impl fmt::Display for ProcessBuildError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::MissingInitialState => write!(f, "initial state not set"),
-		}
-	}
-}
-
-impl core::error::Error for ProcessBuildError {}
 
 /// Builder for CSP Process
 #[derive(Debug)]

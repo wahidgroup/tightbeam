@@ -4,7 +4,10 @@
 //! crypto features transitively.
 #![deny(unexpected_cfgs)]
 
+pub mod expansions;
+
 use der::Sequence;
+
 use tightbeam::builder::{CheckAeadOid, CheckDigestOid, CheckSignatureOid};
 use tightbeam::crypto::aead::Aes256GcmOid;
 use tightbeam::crypto::hash::Sha3_256;

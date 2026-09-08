@@ -129,7 +129,6 @@ transport = [
 	"kdf",
 	"ecdh",
 ]
-doc = []
 compress = ["tightbeam-derive/compress"]
 transport-policy = ["transport", "policy"]
 transport-multiplex = ["transport", "std", "futures", "futures/std"]
@@ -288,9 +287,9 @@ standards = []
 standards-rfc = ["standards"]
 standards-iso = ["standards"]
 
-# AFL fuzz targets - each as a separate binary
-# These are built with: RUSTFLAGS="--cfg fuzzing" cargo afl build --bin <name> --features "std,testing-fuzz"
-# Standard AFL.rs organization: fuzz targets are separate binaries, not tests
+# AFL fuzz targets, one binary each. `required-features` is the only home for
+# what a target needs: scripts/fuzz-build.sh reads it back out of
+# `cargo metadata` rather than repeating a feature list of its own.
 [[bin]]
 name = "fuzz_simple_workflow"
 path = "fuzz/simple_workflow.rs"
@@ -314,7 +313,8 @@ required-features = ["full", "testing-fuzz"]
 [[bin]]
 name = "fuzz_colony"
 path = "fuzz/colony/mod.rs"
-required-features = ["full", "testing-fuzz"]
+# IJON annotations steer the colony state search; the target is unguided without them.
+required-features = ["full", "testing-fuzz", "testing-fuzz-ijon"]
 
 [build-dependencies]
 cfg_aliases = "0.2.2"

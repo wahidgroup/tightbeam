@@ -9,8 +9,6 @@ on:
       - "releases/v*"
       - "releases/derive/v*"
   pull_request:
-    branches:
-      - master
 
 concurrency:
   group: ci-${{ github.ref }}

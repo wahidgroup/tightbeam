@@ -1,84 +1,45 @@
 //! URN validation error types
 
-#[cfg(not(feature = "derive"))]
-use core::fmt;
-
 use crate::utils::urn::builders::spec::Pattern;
 
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 
 /// Errors that can occur during URN validation and construction
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq)]
 pub enum UrnValidationError {
 	/// A required field is missing
-	#[cfg_attr(feature = "derive", error("Required field missing: {0}"))]
+	#[error("Required field missing: {0}")]
 	RequiredFieldMissing(&'static str),
 
 	/// A field has an invalid format
-	#[cfg_attr(
-		feature = "derive",
-		error("Invalid format for field '{field}': expected pattern {pattern:?}")
-	)]
+	#[error("Invalid format for field '{field}': expected pattern {pattern:?}")]
 	InvalidFormat { field: &'static str, pattern: Option<Pattern> },
 
 	/// A forbidden field is present
-	#[cfg_attr(feature = "derive", error("Forbidden field present: {0}"))]
+	#[error("Forbidden field present: {0}")]
 	ForbiddenFieldPresent(&'static str),
 
 	/// NID does not match the spec's expected NID
-	#[cfg_attr(feature = "derive", error("NID does not match spec"))]
+	#[error("NID does not match spec")]
 	NidMismatch,
 
 	/// Realm segment does not match the namespace's realm
-	#[cfg_attr(feature = "derive", error("Realm does not match namespace"))]
+	#[error("Realm does not match namespace")]
 	RealmMismatch,
 
 	/// NID length is invalid (must be 2-32 characters)
-	#[cfg_attr(feature = "derive", error("Invalid NID length: must be 2-32 characters"))]
+	#[error("Invalid NID length: must be 2-32 characters")]
 	InvalidNidLength,
 
 	/// NID must start with a letter
-	#[cfg_attr(feature = "derive", error("Invalid NID: must start with a letter"))]
+	#[error("Invalid NID: must start with a letter")]
 	InvalidNidStart,
 
 	/// NID contains invalid characters (must be alphanumeric and hyphens only)
-	#[cfg_attr(
-		feature = "derive",
-		error("Invalid NID characters: must be alphanumeric and hyphens only")
-	)]
+	#[error("Invalid NID characters: must be alphanumeric and hyphens only")]
 	InvalidNidCharacters,
 
 	/// String is not of the form `urn:<nid>:<nss>`
-	#[cfg_attr(feature = "derive", error("Invalid URN syntax: expected urn:<nid>:<nss>"))]
+	#[error("Invalid URN syntax: expected urn:<nid>:<nss>")]
 	InvalidUrnSyntax,
 }
-
-#[cfg(not(feature = "derive"))]
-impl fmt::Display for UrnValidationError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::RequiredFieldMissing(field) => write!(f, "Required field missing: {field}"),
-			Self::InvalidFormat { field, pattern } => {
-				if let Some(p) = pattern {
-					write!(f, "Invalid format for field '{field}': expected pattern {}", p.pattern_str())
-				} else {
-					write!(f, "Invalid format for field '{field}'")
-				}
-			}
-			Self::ForbiddenFieldPresent(field) => write!(f, "Forbidden field present: {field}"),
-			Self::NidMismatch => write!(f, "NID does not match spec"),
-			Self::RealmMismatch => write!(f, "Realm does not match namespace"),
-			Self::InvalidNidLength => write!(f, "Invalid NID length: must be 2-32 characters"),
-			Self::InvalidNidStart => write!(f, "Invalid NID: must start with a letter"),
-			Self::InvalidNidCharacters => {
-				write!(f, "Invalid NID characters: must be alphanumeric and hyphens only")
-			}
-			Self::InvalidUrnSyntax => write!(f, "Invalid URN syntax: expected urn:<nid>:<nss>"),
-		}
-	}
-}
-
-#[cfg(all(feature = "std", not(feature = "derive")))]
-impl std::error::Error for UrnValidationError {}

@@ -13,6 +13,10 @@
 
 set -euo pipefail
 
+# The run directory is resolved by scripts/fuzz-run.sh, which anchors to the
+# repository so this works from any working directory.
+FUZZ_RUN=$("$(dirname "$0")/fuzz-run.sh")
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Script is in scripts/ directory, project root is one level up
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -614,13 +618,13 @@ echo "Phase 4: Analysis Report"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-if [ ! -f "built/fuzz/out/default/fuzzer_stats" ]; then
+if [ ! -f "$FUZZ_RUN/fuzzer_stats" ]; then
     echo "[!] ERROR: Fuzzer stats not found. Fuzzing may have failed." >&2
     exit 1
 fi
 
 # Extract statistics
-STATS_FILE="built/fuzz/out/default/fuzzer_stats"
+STATS_FILE="$FUZZ_RUN/fuzzer_stats"
 EXECS=$(grep "^execs_done" "$STATS_FILE" | awk '{print $3}' || echo "0")
 EXECS_PER_SEC=$(grep "^execs_per_sec" "$STATS_FILE" | awk '{print $3}' || echo "0")
 CORPUS_COUNT=$(grep "^corpus_count" "$STATS_FILE" | awk '{print $3}' || echo "0")
@@ -680,18 +684,18 @@ echo "[*] Test Case Analysis"
 echo "──────────────────────────────────────────────────────────────────"
 printf "    %-30s %d\n" "Unique Test Cases:" "$CORPUS_COUNT"
 
-if [ -d "built/fuzz/out/default/queue" ]; then
-    QUEUE_COUNT=$(ls built/fuzz/out/default/queue/id:* 2>/dev/null | wc -l)
+if [ -d "$FUZZ_RUN/queue" ]; then
+    QUEUE_COUNT=$(ls $FUZZ_RUN/queue/id:* 2>/dev/null | wc -l)
     printf "    %-30s %d\n" "Queue Size:" "$QUEUE_COUNT"
 
     # Size distribution
     if [ "$QUEUE_COUNT" -gt 0 ]; then
-        LARGEST=$(ls -S built/fuzz/out/default/queue/id:* 2>/dev/null | head -1)
+        LARGEST=$(ls -S $FUZZ_RUN/queue/id:* 2>/dev/null | head -1)
         if [ -n "$LARGEST" ] && [ -f "$LARGEST" ]; then
             LARGEST_SIZE=$(wc -c < "$LARGEST")
             printf "    %-30s %d bytes\n" "Largest Test Case:" "$LARGEST_SIZE"
 
-            SMALLEST=$(ls -Sr built/fuzz/out/default/queue/id:* 2>/dev/null | head -1)
+            SMALLEST=$(ls -Sr $FUZZ_RUN/queue/id:* 2>/dev/null | head -1)
             if [ -n "$SMALLEST" ] && [ -f "$SMALLEST" ]; then
                 SMALLEST_SIZE=$(wc -c < "$SMALLEST")
                 printf "    %-30s %d bytes\n" "Smallest Test Case:" "$SMALLEST_SIZE"
@@ -712,13 +716,13 @@ printf "    %-30s %d\n" "Unique Hangs:" "$UNIQUE_HANGS"
 if [ "$UNIQUE_CRASHES" -gt 0 ]; then
     echo ""
     echo "    [!] Crashes detected! Review them at:"
-    echo "        built/fuzz/out/default/crashes/"
+    echo "        $FUZZ_RUN/crashes/"
 fi
 
 if [ "$UNIQUE_HANGS" -gt 0 ]; then
     echo ""
     echo "    [!] Hangs detected! Review them at:"
-    echo "        built/fuzz/out/default/hangs/"
+    echo "        $FUZZ_RUN/hangs/"
 fi
 echo ""
 
@@ -755,13 +759,13 @@ echo "    Test Cases:       $CORPUS_COUNT"
 echo "    Crashes:          $UNIQUE_CRASHES"
 echo "    Hangs:            $UNIQUE_HANGS"
 echo ""
-echo "    Full stats:       built/fuzz/out/default/fuzzer_stats"
-echo "    Test cases:       built/fuzz/out/default/queue/"
+echo "    Full stats:       $FUZZ_RUN/fuzzer_stats"
+echo "    Test cases:       $FUZZ_RUN/queue/"
 if [ "$UNIQUE_CRASHES" -gt 0 ]; then
-    echo "    Crashes:          built/fuzz/out/default/crashes/"
+    echo "    Crashes:          $FUZZ_RUN/crashes/"
 fi
 if [ "$UNIQUE_HANGS" -gt 0 ]; then
-    echo "    Hangs:           built/fuzz/out/default/hangs/"
+    echo "    Hangs:           $FUZZ_RUN/hangs/"
 fi
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

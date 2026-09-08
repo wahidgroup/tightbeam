@@ -143,7 +143,7 @@ pub struct EventBuilder<'a> {
 	label: Cow<'static, str>,
 	tags: Option<Cow<'static, [&'static str]>>,
 	value: Option<EventValue>,
-	#[cfg(feature = "instrument")]
+	#[cfg(any(feature = "instrument", feature = "logging"))]
 	duration_ns: Option<u64>,
 	#[cfg(feature = "instrument")]
 	payload: Option<&'a [u8]>,
@@ -164,7 +164,7 @@ impl<'a> EventBuilder<'a> {
 			label,
 			tags,
 			value,
-			#[cfg(feature = "instrument")]
+			#[cfg(any(feature = "instrument", feature = "logging"))]
 			duration_ns: None,
 			#[cfg(feature = "instrument")]
 			payload: None,
@@ -175,13 +175,13 @@ impl<'a> EventBuilder<'a> {
 	}
 
 	/// Add timing information to the event
-	#[cfg(feature = "instrument")]
+	#[cfg(any(feature = "instrument", feature = "logging"))]
 	pub fn with_timing(mut self, duration: Duration) -> Self {
 		self.duration_ns = Some(duration.as_nanos() as u64);
 		self
 	}
 
-	#[cfg(not(feature = "instrument"))]
+	#[cfg(not(any(feature = "instrument", feature = "logging")))]
 	pub fn with_timing(self, _duration: Duration) -> Self {
 		self
 	}

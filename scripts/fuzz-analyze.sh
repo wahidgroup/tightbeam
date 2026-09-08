@@ -2,19 +2,23 @@
 set -euo pipefail
 
 # Analyze a specific fuzz crash or hang by replaying it through a fuzz binary.
-# Usage: scripts/fuzz-analyze.sh built/fuzz/out/default/crashes/id:000000...
+# Usage: scripts/fuzz-analyze.sh $FUZZ_RUN/crashes/id:000000...
+
+# The run directory is resolved by scripts/fuzz-run.sh, which anchors to the
+# repository so this works from any working directory.
+FUZZ_RUN=$("$(dirname "$0")/fuzz-run.sh")
 
 FILE="${1:-}"
 
 if [ -z "$FILE" ]; then
 	echo "Error: Please specify a file to analyze" >&2
-	echo "Usage: make analyze-fuzz file=built/fuzz/out/default/crashes/id:000000..." >&2
+	echo "Usage: make analyze-fuzz file=$FUZZ_RUN/crashes/id:000000..." >&2
 	echo ""
 	echo "Available crashes:"
-	ls -1 built/fuzz/out/default/crashes/ 2>/dev/null | grep -v README || echo "  (none)"
+	ls -1 $FUZZ_RUN/crashes/ 2>/dev/null | grep -v README || echo "  (none)"
 	echo ""
 	echo "Available hangs:"
-	ls -1 built/fuzz/out/default/hangs/ 2>/dev/null | grep -v README || echo "  (none)"
+	ls -1 $FUZZ_RUN/hangs/ 2>/dev/null | grep -v README || echo "  (none)"
 	exit 1
 fi
 

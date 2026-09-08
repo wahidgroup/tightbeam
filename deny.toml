@@ -1,0 +1,44 @@
+# cargo-deny policy: the home for what this crate's dependency tree is allowed
+# to contain. `make audit` runs every section below, and the file ships in the
+# published crate so consumers inherit the same justifications.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Each entry is suppressed because no fixed release exists. Revisit when one
+# ships; an entry with no reason is not accepted here.
+ignore = [
+	{ id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack timing side-channel, no fixed upgrade available. Pulled transitively by cms 0.2.3's `builder` feature, which welds in the RSA KeyTrans recipient path. tightbeam uses only KARI/ECDH key agreement, so the affected RSA code path is never exercised." },
+	{ id = "RUSTSEC-2024-0436", reason = "paste is archived as there is nothing further to do. No replacement is required and no vulnerability is claimed." },
+]
+
+[licenses]
+version = 2
+# Permissive only. A copyleft or unreviewed licence in the tree fails the audit
+# rather than reaching a consumer unnoticed.
+allow = [
+	"Apache-2.0",
+	"Apache-2.0 WITH LLVM-exception",
+	"BSD-2-Clause",
+	"BSD-3-Clause",
+	"MIT",
+	"Unicode-3.0",
+	"Unlicense",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A workspace member referenced by path carries no version requirement, which
+# is not the unpinned-registry-dependency this check exists to catch.
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: a git or alternate-registry dependency is not reproducible
+# for a published crate.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
