@@ -512,14 +512,16 @@ impl TightBeamError {
 	pub fn is_fuzz_input_exhausted(&self) -> bool {
 		#[cfg(feature = "testing")]
 		{
-			return matches!(
+			matches!(
 				self,
 				TightBeamError::TestingError(crate::testing::error::TestingError::FuzzInputExhausted)
-			);
+			)
 		}
 
 		#[cfg(not(feature = "testing"))]
-		false
+		{
+			false
+		}
 	}
 
 	/// Terminal status a service failure answers a peer with.
