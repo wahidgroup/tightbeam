@@ -53,8 +53,7 @@ use crate::transport::handshake::receipt::{
 	record_receipt_outcome, sign_receipt, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict,
 	StoredReceipt,
 };
-use crate::transport::handshake::state::HandshakeInvariant;
-use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
+use crate::transport::handshake::state::{Cms, ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_transcript_digest, validate_state};
 use crate::transport::handshake::ServerHandshakeProtocol;
@@ -80,7 +79,7 @@ pub struct CmsHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
-	state: ServerStateMachine,
+	state: ServerStateMachine<Cms>,
 	server_key_provider: Arc<dyn SigningKeyProvider>,
 	client_cert: Option<Arc<Certificate>>,
 	validated_client_cert: Option<Arc<Certificate>>,
@@ -101,7 +100,6 @@ where
 	epoch_materials: Option<EpochMaterials>,
 	mux_settings: Option<MuxSettings>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	invariants: HandshakeInvariant,
 	_phantom: PhantomData<P>,
 }
 
@@ -126,7 +124,7 @@ where
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
-			state: ServerStateMachine::default(),
+			state: ServerStateMachine::<Cms>::default(),
 			server_key_provider,
 			client_cert: None,
 			validated_client_cert: None,
@@ -147,7 +145,6 @@ where
 			epoch_materials: None,
 			mux_settings: None,
 			client_validators,
-			invariants: { HandshakeInvariant::default() },
 			_phantom: PhantomData,
 		}
 	}
@@ -160,7 +157,6 @@ where
 		self.transcript_hash = Some(hash);
 
 		// Lock transcript immediately since it's externally provided
-		let _ = self.invariants.lock_transcript();
 		self
 	}
 
@@ -477,10 +473,6 @@ where
 		// 9. Lock transcript and mark AEAD derivation now that session key material is available.
 		// For CMS, transcript is locked here (after key exchange processed) rather than during
 		// server finished preparation, since session key derivation happens at this point.
-		if !self.invariants.transcript_locked {
-			self.invariants.lock_transcript()?;
-		}
-		self.invariants.derive_aead_once()?;
 
 		Ok(())
 	}
@@ -619,7 +611,6 @@ where
 
 		// Transition state & mark finished sent invariant
 		self.state.transition(ServerHandshakeState::ServerFinishedSent)?;
-		self.invariants.mark_finished_sent()?;
 		Ok(())
 	}
 

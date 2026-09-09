@@ -43,8 +43,7 @@ use crate::transport::handshake::receipt::{
 	approve_or_fail_closed, match_receipt_to_accept, verify_receipt_signer, ReceiptApprover, ReceiptRole,
 	SessionReceipt, StoredReceipt,
 };
-use crate::transport::handshake::state::HandshakeInvariant;
-use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
+use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Cms};
 use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_transcript_digest, validate_state};
 use crate::transport::handshake::{
@@ -69,7 +68,7 @@ pub struct CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
 {
-	state: ClientStateMachine,
+	state: ClientStateMachine<Cms>,
 	client_key_provider: Arc<dyn SigningKeyProvider>,
 	client_certificate: Option<Arc<Certificate>>,
 	server_cert: Option<Arc<Certificate>>,
@@ -87,7 +86,6 @@ where
 	pending_receipt: Option<(SessionReceipt, SignedData)>,
 	stored_receipt: Option<StoredReceipt>,
 	epoch_materials: Option<EpochMaterials>,
-	invariants: HandshakeInvariant,
 }
 
 /// Signer identity and algorithm identifiers for a Finished SignedData.
@@ -145,7 +143,7 @@ where
 		server_chain: Option<Arc<[Certificate]>>,
 	) -> Self {
 		Self {
-			state: ClientStateMachine::default(),
+			state: ClientStateMachine::<Cms>::default(),
 			client_key_provider,
 			client_certificate: None,
 			server_cert,
@@ -163,7 +161,6 @@ where
 			pending_receipt: None,
 			stored_receipt: None,
 			epoch_materials: None,
-			invariants: HandshakeInvariant::default(),
 		}
 	}
 
@@ -465,7 +462,6 @@ where
 
 		// 8. Transition state & lock transcript (transcript hash verified)
 		self.state.transition(ClientHandshakeState::ServerFinishedReceived)?;
-		self.invariants.lock_transcript()?;
 
 		Ok(verified_content)
 	}
@@ -862,7 +858,6 @@ where
 	/// Finalize client finished by transitioning state and marking invariant.
 	fn finalize_client_finished(&mut self) -> Result<(), HandshakeError> {
 		self.state.transition(ClientHandshakeState::ClientFinishedSent)?;
-		self.invariants.mark_finished_sent()?;
 		Ok(())
 	}
 }

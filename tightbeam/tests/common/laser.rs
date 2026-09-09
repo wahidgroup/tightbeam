@@ -151,7 +151,7 @@ pub struct LaserListener<P: CryptoProvider = DefaultCryptoProvider> {
 	config: Option<TransportEncryptionConfig<P>>,
 }
 
-impl<P: CryptoProvider + Send + Sync> LaserListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> LaserListener<P> {
 	fn bind_airspace(addr: LaserAddr) -> Result<(mpsc::UnboundedReceiver<DuplexStream>, LaserAddr), TransportError> {
 		let id = if addr.0 == 0 {
 			next_addr()
@@ -183,7 +183,7 @@ impl<P: CryptoProvider + Send + Sync> LaserListener<P> {
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> Protocol for LaserListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> Protocol for LaserListener<P> {
 	type Listener = LaserListener<P>;
 	type Stream = LaserStream;
 	type Transport = LaserTransport<P>;
@@ -218,7 +218,7 @@ impl<P: CryptoProvider + Send + Sync> Protocol for LaserListener<P> {
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for LaserListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for LaserListener<P> {
 	type Encryptor = RuntimeAead;
 	type Decryptor = RuntimeAead;
 	type CryptoProvider = P;
@@ -233,13 +233,13 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for LaserListener<P> {
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for LaserListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for LaserListener<P> {
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		LaserListener::accept(self).await
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> PersistentConnection for LaserListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for LaserListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
 		transport.is_alive()
 	}

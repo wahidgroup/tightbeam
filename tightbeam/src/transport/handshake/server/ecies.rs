@@ -46,8 +46,7 @@ use crate::transport::handshake::receipt::{
 	record_receipt_outcome, sign_receipt, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict,
 	StoredReceipt,
 };
-use crate::transport::handshake::state::HandshakeInvariant;
-use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
+use crate::transport::handshake::state::{Ecies, ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::HandshakeOctets;
 use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
@@ -76,7 +75,7 @@ pub struct EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
-	state: ServerStateMachine,
+	state: ServerStateMachine<Ecies>,
 	server_key_provider: Arc<dyn SigningKeyProvider>,
 	server_cert: Arc<Certificate>,
 	client_random: Option<[u8; 32]>,
@@ -98,7 +97,6 @@ where
 	stored_receipt: Option<StoredReceipt>,
 	epoch_materials: Option<EpochMaterials>,
 	_phantom: PhantomData<P>,
-	invariants: HandshakeInvariant,
 }
 
 /// Parts of the decrypted ECIES key-exchange payload: session key
@@ -133,7 +131,7 @@ where
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
-			state: ServerStateMachine::default(),
+			state: ServerStateMachine::<Ecies>::default(),
 			server_key_provider,
 			server_cert,
 			client_random: None,
@@ -154,7 +152,6 @@ where
 			receipt_artifact: None,
 			stored_receipt: None,
 			epoch_materials: None,
-			invariants: HandshakeInvariant::default(),
 			_phantom: PhantomData,
 		}
 	}
@@ -270,7 +267,6 @@ where
 			&transport_accept_der,
 		)?;
 		self.transcript_hash = Some(transcript_digest);
-		self.invariants.lock_transcript()?;
 
 		// 8. Sign transcript hash using KeyProvider
 		let signature_bytes = self.sign_transcript_hash(&transcript_digest).await?;
@@ -404,7 +400,6 @@ where
 		let salt_bytes = salt.as_slice();
 		let input_key_material = base_session_key.as_slice();
 		let session_ciphers = self.derive_directional_aead(input_key_material, salt_bytes)?;
-		self.invariants.derive_aead_once()?;
 
 		// 4. Derive the epoch-0 rekey materials alongside the traffic
 		// keys, from the same inputs plus the transcript hash: an in-band

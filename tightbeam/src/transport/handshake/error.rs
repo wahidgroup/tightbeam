@@ -12,16 +12,6 @@ pub type Result<T> = core::result::Result<T, HandshakeError>;
 pub enum HandshakeError {
 	// ---------------- Protocol & structure specific ----------------
 	// Invariant violations (non-panicking)
-	#[error("Handshake invariant violation: transcript already locked")]
-	TranscriptAlreadyLocked,
-	#[error("Handshake invariant violation: transcript not locked")]
-	TranscriptNotLocked,
-	#[error("Handshake invariant violation: AEAD key already derived")]
-	AeadAlreadyDerived,
-	#[error("Handshake invariant violation: Finished already sent")]
-	FinishedAlreadySent,
-	#[error("Handshake invariant violation: Finished before transcript lock")]
-	FinishedBeforeTranscriptLock,
 	/// Invalid client key exchange message
 	#[error("Invalid client key exchange message")]
 	InvalidClientKeyExchange,

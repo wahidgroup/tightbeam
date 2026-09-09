@@ -44,9 +44,9 @@ mod x509 {
 	pub use crate::crypto::sign::Verifier;
 	pub use crate::der::Decode;
 	pub use crate::spki::EncodePublicKey;
-	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::io::EncryptedMessageIO;
 	pub use crate::transport::state::EncryptedProtocolState;
+	pub use crate::transport::state::SessionPhase;
 
 	#[cfg(feature = "transport-ecies")]
 	pub use crate::crypto::ecies::EciesPublicKeyOps;
@@ -605,8 +605,7 @@ where
 					// Circuit breaker: once encryption is configured, application
 					// traffic arrives encrypted.
 					_ => {
-						transport.set_handshake_state(TcpHandshakeState::None);
-						transport.unset_session_keys();
+						transport.reset_session();
 						Err(TransportError::MissingEncryption)
 					}
 				}
@@ -615,17 +614,15 @@ where
 			}
 		}
 		WireEnvelope::Encrypted(encrypted_info) => {
-			if transport.to_handshake_state() != TcpHandshakeState::Complete {
-				transport.set_handshake_state(TcpHandshakeState::None);
-				transport.unset_session_keys();
+			if !matches!(transport.session_phase(), SessionPhase::Encrypted(_)) {
+				transport.reset_session();
 				return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 			}
 
 			let decrypted_bytes = match transport.to_decryptor_ref()?.decrypt_content(&encrypted_info) {
 				Ok(bytes) => bytes,
 				Err(_) => {
-					transport.set_handshake_state(TcpHandshakeState::None);
-					transport.unset_session_keys();
+					transport.reset_session();
 					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 				}
 			};

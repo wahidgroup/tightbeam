@@ -202,13 +202,9 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "x509")]
 			pub(crate) key_manager: Option<Arc<$crate::transport::handshake::HandshakeKeyManager<P>>>,
 			#[cfg(feature = "x509")]
-			pub(crate) handshake_state: $crate::transport::handshake::TcpHandshakeState,
-			/// Every ceiling this transport enforces. Not an `Option`: a
-			/// transport without limits is unrepresentable.
+			pub(crate) phase: $crate::transport::state::SessionPhase,
 			#[cfg(any(feature = "x509", all(feature = "std", feature = "transport-policy")))]
 			pub(crate) limits: $crate::transport::TransportLimits,
-			#[cfg(feature = "x509")]
-			pub(crate) session_keys: Option<$crate::crypto::aead::SessionKeys>,
 			#[cfg(feature = "x509")]
 			pub(crate) mux_config: Option<::std::sync::Arc<$crate::transport::handshake::negotiation::TransportOffer>>,
 			#[cfg(feature = "x509")]
@@ -264,11 +260,9 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					key_manager: None,
 					#[cfg(feature = "x509")]
-					handshake_state: $crate::transport::handshake::TcpHandshakeState::None,
+					phase: $crate::transport::state::SessionPhase::Cleartext,
 					#[cfg(any(feature = "x509", all(feature = "std", feature = "transport-policy")))]
 					limits: $crate::transport::TransportLimits::default(),
-					#[cfg(feature = "x509")]
-					session_keys: None,
 					#[cfg(feature = "x509")]
 					mux_config: None,
 					#[cfg(feature = "x509")]
@@ -322,6 +316,11 @@ macro_rules! impl_tcp_common {
 
 			fn with_trust_store(mut self, store: Arc<dyn $crate::crypto::x509::store::CertificateTrust>) -> Self {
 				self.trust_store = Some(store);
+				// A trust store is encryption provisioning by definition, so
+				// the phase moves with it rather than being derived later.
+				if matches!(self.phase, $crate::transport::state::SessionPhase::Cleartext) {
+					self.phase = $crate::transport::state::SessionPhase::Provisioned;
+				}
 				self
 			}
 
@@ -410,12 +409,7 @@ macro_rules! impl_tcp_common {
 			/// read layer applies the tight `handshake_wire` ceiling and the
 			/// handshake deadline instead of the general envelope limits.
 			pub(crate) fn is_handshake_pending(&self) -> bool {
-				let expects_handshake = self.server_identity.is_some()
-					|| self.trust_store.is_some()
-					|| self.client_validators.is_some()
-					|| self.key_manager.is_some();
-				expects_handshake
-					&& self.handshake_state != $crate::transport::handshake::TcpHandshakeState::Complete
+				self.phase.is_handshake_pending()
 			}
 		}
 
@@ -510,25 +504,25 @@ macro_rules! impl_tcp_common {
 			type CryptoProvider = P;
 
 			fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
-				let session_keys = self.session_keys.as_ref();
-				session_keys
-					.map(SessionKeys::send)
-					.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
+				match &self.phase {
+					$crate::transport::state::SessionPhase::Encrypted(keys) => Ok(keys.send()),
+					_ => Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable)),
+				}
 			}
 
 			fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
-				let session_keys = self.session_keys.as_ref();
-				session_keys
-					.map(SessionKeys::recv)
-					.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
+				match &self.phase {
+					$crate::transport::state::SessionPhase::Encrypted(keys) => Ok(keys.recv()),
+					_ => Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable)),
+				}
 			}
 
-			fn to_handshake_state(&self) -> TcpHandshakeState {
-				self.handshake_state
+			fn session_phase(&self) -> &$crate::transport::state::SessionPhase {
+				&self.phase
 			}
 
-			fn set_handshake_state(&mut self, state: TcpHandshakeState) {
-				self.handshake_state = state;
+			fn set_session_phase(&mut self, phase: $crate::transport::state::SessionPhase) {
+				self.phase = phase;
 			}
 
 			fn to_server_certificate_ref(&self) -> Option<&Certificate> {
@@ -539,10 +533,6 @@ macro_rules! impl_tcp_common {
 				self.server_identity.as_ref().map(Arc::clone)
 			}
 
-			fn set_session_keys(&mut self, keys: SessionKeys) {
-				let _ = self.session_keys.take();
-				self.session_keys = Some(keys);
-			}
 
 			fn limits(&self) -> &$crate::transport::TransportLimits {
 				&self.limits
@@ -607,10 +597,6 @@ macro_rules! impl_tcp_common {
 
 			fn to_client_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
 				self.client_validators.as_ref()
-			}
-
-			fn unset_session_keys(&mut self) {
-				self.session_keys = None;
 			}
 
 			fn to_mux_config(&self) -> Option<TransportOffer> {

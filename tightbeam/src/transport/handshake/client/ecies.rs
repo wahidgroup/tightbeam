@@ -34,8 +34,7 @@ use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
 	approve_or_fail_closed, match_receipt_to_accept, verify_receipt_signer, ReceiptApprover, ReceiptRole, StoredReceipt,
 };
-use crate::transport::handshake::state::HandshakeInvariant;
-use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
+use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Ecies};
 use crate::transport::handshake::utils::HandshakeOctets;
 use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
 use crate::transport::handshake::{
@@ -56,7 +55,7 @@ pub struct EciesHandshakeClient<P, M>
 where
 	P: CryptoProvider,
 {
-	state: ClientStateMachine,
+	state: ClientStateMachine<Ecies>,
 	client_random: Option<[u8; 32]>,
 	/// Exact DER bytes of the sent `ClientHello`, bound into the transcript
 	/// so a rewritten offer changes the transcript hash (CWE-757).
@@ -80,7 +79,6 @@ where
 	server_certificate: Option<Certificate>,
 	_phantom_provider: PhantomData<P>,
 	_phantom_message: PhantomData<M>,
-	invariants: HandshakeInvariant,
 }
 
 /// Helper trait for extracting verifying keys from certificates.
@@ -109,7 +107,7 @@ where
 	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
 	pub fn new(aad_domain_tag: Option<&'static [u8]>) -> Self {
 		Self {
-			state: ClientStateMachine::default(),
+			state: ClientStateMachine::<Ecies>::default(),
 			client_random: None,
 			client_hello: None,
 			base_session_key: None,
@@ -127,7 +125,6 @@ where
 			stored_receipt: None,
 			epoch_materials: None,
 			server_certificate: None,
-			invariants: HandshakeInvariant::default(),
 			_phantom_provider: PhantomData,
 			_phantom_message: PhantomData,
 		}
@@ -145,7 +142,7 @@ where
 		client_key_provider: Option<Arc<dyn SigningKeyProvider>>,
 	) -> Self {
 		Self {
-			state: ClientStateMachine::default(),
+			state: ClientStateMachine::<Ecies>::default(),
 			client_random: None,
 			client_hello: None,
 			base_session_key: None,
@@ -163,7 +160,6 @@ where
 			stored_receipt: None,
 			epoch_materials: None,
 			server_certificate: None,
-			invariants: HandshakeInvariant::default(),
 			_phantom_provider: PhantomData,
 			_phantom_message: PhantomData,
 		}
@@ -282,7 +278,6 @@ where
 		self.transcript_hash = Some(transcript_digest);
 
 		// Invariant: transcript becomes immutable after hash computed
-		self.invariants.lock_transcript()?;
 
 		Ok(())
 	}
@@ -584,7 +579,6 @@ where
 		let session_ciphers = self.derive_directional_aead(base_key.as_slice(), salt_bytes)?;
 
 		// Invariant: AEAD key derivation occurs exactly once after transcript locked
-		self.invariants.derive_aead_once()?;
 
 		// 3. Seed epoch materials for post-handshake renewal
 		if let Some(transcript_hash) = self.transcript_hash {
