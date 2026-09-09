@@ -586,21 +586,12 @@ where
 	// Enforce size ceilings
 	let wire_bytes = transport.read_envelope_bytes().await?;
 	let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-	match &wire_envelope {
-		WireEnvelope::Cleartext(_) => {
-			if let Some(max) = transport.to_max_cleartext_envelope() {
-				if wire_bytes.len() > max {
-					return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
-				}
-			}
-		}
-		WireEnvelope::Encrypted(_) => {
-			if let Some(max) = transport.to_max_encrypted_envelope() {
-				if wire_bytes.len() > max {
-					return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
-				}
-			}
-		}
+	let ceiling = match &wire_envelope {
+		WireEnvelope::Cleartext(_) => transport.limits().cleartext_envelope,
+		WireEnvelope::Encrypted(_) => transport.limits().encrypted_envelope,
+	};
+	if wire_bytes.len() > ceiling {
+		return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 	}
 
 	let has_certificate = transport.to_server_certificate_ref().is_some();

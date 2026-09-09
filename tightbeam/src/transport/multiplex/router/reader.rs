@@ -3,6 +3,7 @@
 //! so a full writer queue never parks the read loop.
 
 use core::future::poll_fn;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -79,6 +80,52 @@ fn refusal_reason(code: u32) -> GoAwayReason {
 	GoAwayReason::SettlementFailed
 }
 
+/// Reassembly bytes buffered across every stream on one connection.
+///
+/// A per-stream ceiling multiplies by the number of streams a peer opens, so
+/// the connection holds this shared counter and every [`RecvStream`] charges
+/// against it.
+#[derive(Debug)]
+struct ReassemblyBudget {
+	used: AtomicUsize,
+	ceiling: usize,
+}
+
+impl Default for ReassemblyBudget {
+	fn default() -> Self {
+		Self::with_ceiling(crate::constants::MAX_MUX_CONNECTION_REASSEMBLY_BYTES)
+	}
+}
+
+impl ReassemblyBudget {
+	fn with_ceiling(ceiling: usize) -> Self {
+		Self { used: AtomicUsize::new(0), ceiling }
+	}
+
+	/// Reserve `bytes` for a stream, or refuse when the connection is full.
+	fn try_charge(&self, bytes: usize) -> bool {
+		let mut used = self.used.load(Ordering::Relaxed);
+		loop {
+			let Some(next) = used.checked_add(bytes).filter(|next| *next <= self.ceiling) else {
+				return false;
+			};
+
+			match self
+				.used
+				.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
+			{
+				Ok(_) => return true,
+				Err(observed) => used = observed,
+			}
+		}
+	}
+
+	/// Return `bytes` to the connection.
+	fn release(&self, bytes: usize) {
+		self.used.fetch_sub(bytes, Ordering::Relaxed);
+	}
+}
+
 /// Receiver-side reassembly state for one inbound stream direction.
 struct RecvStream {
 	/// Chunks concatenated in arrival order (the AEAD channel already
@@ -90,15 +137,30 @@ struct RecvStream {
 	limit: u64,
 	/// Hard byte ceiling on `buffer` (credit grants cannot raise this)
 	max_bytes: usize,
+	/// Connection-wide ceiling this stream's bytes are charged against.
+	///
+	/// Held rather than passed per call so the [`Drop`] below returns the
+	/// bytes no matter which path discards the stream.
+	budget: Arc<ReassemblyBudget>,
+}
+
+/// Returns this stream's buffered bytes to the connection budget.
+///
+/// Map removal, an error return, and task teardown all run this, so a leaked
+/// reservation is not something a call site can forget.
+impl Drop for RecvStream {
+	fn drop(&mut self) {
+		self.budget.release(self.buffer.len());
+	}
 }
 
 impl RecvStream {
-	fn new(limit: u64) -> Self {
-		Self::with_ceiling(limit, crate::constants::MAX_MUX_REASSEMBLY_BYTES)
+	fn new(limit: u64, budget: Arc<ReassemblyBudget>) -> Self {
+		Self::with_ceiling(limit, crate::constants::MAX_MUX_REASSEMBLY_BYTES, budget)
 	}
 
-	fn with_ceiling(limit: u64, max_bytes: usize) -> Self {
-		Self { buffer: Vec::new(), received: 0, limit, max_bytes }
+	fn with_ceiling(limit: u64, max_bytes: usize, budget: Arc<ReassemblyBudget>) -> Self {
+		Self { buffer: Vec::new(), received: 0, limit, max_bytes, budget }
 	}
 
 	/// Account one accepted chunk against the granted limit and
@@ -110,6 +172,12 @@ impl RecvStream {
 			return false;
 		}
 		if self.buffer.len().saturating_add(payload.len()) > self.max_bytes {
+			return false;
+		}
+		// The connection ceiling is charged before the bytes are held, so a
+		// peer spreading its payload across many streams is refused at the
+		// same total as one stream reaching its own ceiling.
+		if !self.budget.try_charge(payload.len()) {
 			return false;
 		}
 
@@ -150,6 +218,8 @@ where
 	/// Credits the peer may still spend inbound. `None` = unmetered
 	recv_budget: Option<u64>,
 	/// Reassembly of peer-initiated request streams
+	/// Reassembly ceiling shared by every stream on this connection.
+	reassembly_budget: Arc<ReassemblyBudget>,
 	peer_reassembly: HashMap<u32, RecvStream>,
 	/// Streaming peer-initiated requests: chunks forward to the
 	/// handler's [`StreamBody`] instead of reassembling. Holds only
@@ -273,6 +343,7 @@ where
 			recv_chunk_size: cap_as_usize(settings.recv_chunk_size).max(1),
 			initial_recv_credit: settings.initial_recv_credit.max(1),
 			recv_budget: settings.recv_budget,
+			reassembly_budget: Arc::new(ReassemblyBudget::default()),
 			peer_reassembly: HashMap::new(),
 			peer_bodies: HashMap::new(),
 			local_reassembly: HashMap::new(),
@@ -868,7 +939,7 @@ where
 			return Err(self.protocol_violation());
 		}
 
-		let stream = RecvStream::new(self.initial_recv_credit);
+		let stream = RecvStream::new(self.initial_recv_credit, Arc::clone(&self.reassembly_budget));
 		let stream = self.park_reassembly(stream_id, stream, package.payload())?;
 		self.peer_reassembly.insert(stream_id, stream);
 
@@ -978,7 +1049,7 @@ where
 	fn take_local_reassembly(&mut self, stream_id: u32) -> RecvStream {
 		self.local_reassembly
 			.remove(&stream_id)
-			.unwrap_or_else(|| RecvStream::new(self.initial_recv_credit))
+			.unwrap_or_else(|| RecvStream::new(self.initial_recv_credit, Arc::clone(&self.reassembly_budget)))
 	}
 
 	/// Accept a non-final chunk and raise credit when the grantor asks.
@@ -1190,11 +1261,52 @@ mod tests {
 
 	#[test]
 	fn test_recv_stream_enforces_granted_limit() {
-		let mut stream = RecvStream::new(2);
+		let mut stream = RecvStream::new(2, Arc::new(ReassemblyBudget::default()));
 		assert!(stream.accept_chunk(b"ab"));
 		assert!(stream.accept_chunk(b"cd"));
 		assert!(!stream.accept_chunk(b"ef"));
 		assert_eq!(stream.buffer.as_slice(), b"abcd");
+	}
+
+	// A peer that spreads its payload across many streams must hit the same
+	// total as one stream reaching its own ceiling. The per-stream ceiling
+	// alone multiplied by the number of streams opened (CWE-770).
+	#[test]
+	fn connection_ceiling_binds_across_streams() {
+		let connection_ceiling = 256usize;
+		let budget = Arc::new(ReassemblyBudget::with_ceiling(connection_ceiling));
+		let chunk = [0u8; 64];
+
+		// Eight streams, each far below its own ceiling, together stop at the
+		// connection ceiling after four chunks.
+		let mut streams: Vec<RecvStream> = (0..8).map(|_| RecvStream::new(u64::MAX, Arc::clone(&budget))).collect();
+
+		let mut charged = 0usize;
+		for stream in &mut streams {
+			if stream.accept_chunk(&chunk) {
+				charged += chunk.len();
+			}
+		}
+
+		assert_eq!(charged, connection_ceiling);
+		assert_eq!(budget.used.load(Ordering::Relaxed), connection_ceiling);
+	}
+
+	// Dropping a stream returns its bytes, so a long-lived connection that
+	// opens and closes streams does not exhaust the budget.
+	#[test]
+	fn dropping_a_stream_returns_its_bytes() {
+		let budget = Arc::new(ReassemblyBudget::with_ceiling(128));
+		{
+			let mut stream = RecvStream::new(u64::MAX, Arc::clone(&budget));
+			assert!(stream.accept_chunk(&[0u8; 128]));
+			assert_eq!(budget.used.load(Ordering::Relaxed), 128);
+		}
+
+		assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+
+		let mut reused = RecvStream::new(u64::MAX, Arc::clone(&budget));
+		assert!(reused.accept_chunk(&[0u8; 128]));
 	}
 
 	// Unary reassembly must refuse past a hard byte ceiling even when
@@ -1202,7 +1314,7 @@ mod tests {
 	#[test]
 	fn test_recv_stream_rejects_past_reassembly_ceiling() {
 		let ceiling = 256usize;
-		let mut stream = RecvStream::with_ceiling(1, ceiling);
+		let mut stream = RecvStream::with_ceiling(1, ceiling, Arc::new(ReassemblyBudget::default()));
 		let chunk = [0u8; 64];
 		let mut accepted = 0usize;
 		loop {

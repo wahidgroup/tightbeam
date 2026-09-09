@@ -53,7 +53,7 @@ pub mod serve;
 pub mod tcp;
 
 // Re-exports from submodules
-pub use builders::{EnvelopeBuilder, EnvelopeLimits};
+pub use builders::EnvelopeBuilder;
 pub use client::GenericClient;
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
@@ -97,8 +97,60 @@ mod x509 {
 #[cfg(feature = "x509")]
 use x509::*;
 
-use crate::constants::{DEFAULT_MAX_CLEARTEXT_ENVELOPE, DEFAULT_MAX_ENCRYPTED_ENVELOPE, TIGHTBEAM_AAD_DOMAIN_TAG};
+use crate::constants::{
+	DEFAULT_HANDSHAKE_MAX_WIRE, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CLEARTEXT_ENVELOPE,
+	DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_OPERATION_TIMEOUT, TIGHTBEAM_AAD_DOMAIN_TAG,
+};
 use crate::transport::handshake::HandshakeKeyManager;
+
+/// Every ceiling a transport enforces, in one value.
+///
+/// Each field is a plain `usize` or `Duration` rather than an `Option`, so a
+/// transport that forgot to configure a limit is unrepresentable.
+///
+/// [`Default`] is the only place these values are chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportLimits {
+	/// Ceiling in bytes for a cleartext envelope on the wire.
+	pub cleartext_envelope: usize,
+	/// Ceiling in bytes for an encrypted envelope on the wire.
+	pub encrypted_envelope: usize,
+	/// Ceiling in bytes for one handshake-phase message on the wire.
+	pub handshake_wire: usize,
+	/// Deadline for a single read or write on the transport.
+	pub operation_timeout: Duration,
+	/// Deadline for the whole handshake exchange.
+	pub handshake_timeout: Duration,
+}
+
+impl TransportLimits {
+	/// Largest envelope this endpoint will read before parsing decides which
+	/// ceiling actually applies.
+	///
+	/// A reader cannot know whether the bytes are a cleartext or an encrypted
+	/// envelope until it has them, so it admits the larger ceiling and the
+	/// per-mode check runs once the wire form is known.
+	#[must_use]
+	pub fn max_envelope(&self) -> usize {
+		if self.encrypted_envelope > self.cleartext_envelope {
+			self.encrypted_envelope
+		} else {
+			self.cleartext_envelope
+		}
+	}
+}
+
+impl Default for TransportLimits {
+	fn default() -> Self {
+		Self {
+			cleartext_envelope: DEFAULT_MAX_CLEARTEXT_ENVELOPE,
+			encrypted_envelope: DEFAULT_MAX_ENCRYPTED_ENVELOPE,
+			handshake_wire: DEFAULT_HANDSHAKE_MAX_WIRE,
+			operation_timeout: DEFAULT_OPERATION_TIMEOUT,
+			handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+		}
+	}
+}
 
 #[cfg(feature = "x509")]
 #[derive(Clone)]
@@ -111,12 +163,8 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	/// Domain-separation tag bound into every AEAD associated-data block.
 	pub aad_domain_tag: &'static [u8],
-	/// Ceiling in bytes for a cleartext envelope on the wire.
-	pub max_cleartext_envelope: usize,
-	/// Ceiling in bytes for an encrypted envelope on the wire.
-	pub max_encrypted_envelope: usize,
-	/// Deadline for the whole handshake exchange.
-	pub handshake_timeout: Duration,
+	/// Every ceiling this endpoint enforces.
+	pub limits: TransportLimits,
 }
 
 #[cfg(feature = "x509")]
@@ -128,9 +176,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 			key_manager,
 			client_validators: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
-			max_cleartext_envelope: DEFAULT_MAX_CLEARTEXT_ENVELOPE,
-			max_encrypted_envelope: DEFAULT_MAX_ENCRYPTED_ENVELOPE,
-			handshake_timeout: crate::constants::DEFAULT_HANDSHAKE_TIMEOUT,
+			limits: TransportLimits::default(),
 		}
 	}
 
@@ -202,6 +248,62 @@ mod tests {
 		Ok(())
 	}
 
+	/// A builder that was told nothing about limits still has them.
+	///
+	/// The transport previously carried `Option<usize>` ceilings defaulted to
+	/// `None`, so a default endpoint read cleartext with no bound at all. Every
+	/// other limit test sets a ceiling explicitly and would not have noticed.
+	#[test]
+	fn default_limits_bound_a_cleartext_envelope() {
+		let limits = TransportLimits::default();
+		assert!(limits.cleartext_envelope > 0);
+		assert!(limits.encrypted_envelope > 0);
+		assert!(limits.handshake_wire > 0);
+
+		// A payload past the default ceiling is refused without the caller
+		// having configured anything.
+		let oversized = "a".repeat(limits.cleartext_envelope + 1);
+		let frame = create_v0_tightbeam(Some(&oversized), None);
+		let result = builders::EnvelopeBuilder::request(frame).finish();
+		assert!(matches!(
+			result,
+			Err(TransportError::MessageNotSent(_, TransportFailure::SizeExceeded))
+		));
+	}
+
+	/// The encrypted ceiling names the sealed wire form, not the plaintext.
+	///
+	/// With a ceiling set to exactly the plaintext length, the payload must
+	/// still be refused: the AEAD tag, the nonce, and the `WireEnvelope`
+	/// wrapper are all added after encoding, and measuring before them let an
+	/// oversized envelope reach the peer as a connection reset.
+	#[cfg(feature = "aes-gcm")]
+	#[test]
+	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {
+		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit, RuntimeAead, SendCipher};
+		use crate::der::oid::AssociatedOid;
+		use crate::der::Encode;
+
+		let frame = create_v0_tightbeam(None, None);
+		let plaintext_len = TransportEnvelope::from(frame.clone()).to_der()?.len();
+		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32])
+			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))?;
+
+		let encryptor = SendCipher::new(RuntimeAead::new(cipher, Aes256GcmOid::OID));
+		let result = builders::EnvelopeBuilder::request(frame)
+			.with_wire_mode(WireMode::Encrypted)
+			.with_encryptor(&encryptor)
+			.with_limits(TransportLimits { encrypted_envelope: plaintext_len, ..TransportLimits::default() })
+			.finish();
+
+		assert!(matches!(
+			result,
+			Err(TransportError::MessageNotSent(_, TransportFailure::SizeExceeded))
+		));
+
+		Ok(())
+	}
+
 	#[cfg(feature = "aes-gcm")]
 	#[test]
 	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn Error>> {
@@ -216,7 +318,7 @@ mod tests {
 		let result = builders::EnvelopeBuilder::request(frame.clone())
 			.with_wire_mode(WireMode::Encrypted)
 			.with_encryptor(&encryptor)
-			.with_max_encrypted_envelope(1)
+			.with_limits(TransportLimits { encrypted_envelope: 1, ..TransportLimits::default() })
 			.finish();
 
 		assert!(matches!(
@@ -231,7 +333,7 @@ mod tests {
 	fn test_envelope_builder_cleartext_limit_returns_message() {
 		let frame = create_v0_tightbeam(None, None);
 		let result = builders::EnvelopeBuilder::request(frame.clone())
-			.with_max_cleartext_envelope(1)
+			.with_limits(TransportLimits { cleartext_envelope: 1, ..TransportLimits::default() })
 			.finish();
 
 		assert!(matches!(

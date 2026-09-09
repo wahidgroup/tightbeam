@@ -36,7 +36,6 @@ pub mod r#async;
 pub mod sync;
 
 // Canonical definition lives in transport::io so it exists without the TCP features.
-pub(crate) use crate::transport::io::HANDSHAKE_MAX_WIRE;
 
 /// Abstract TCP listener trait for different networking backends.
 #[cfg(feature = "tcp")]
@@ -168,9 +167,8 @@ impl TightBeamAddress for TightBeamSocketAddr {}
 ///
 /// Defines the transport struct itself plus the `From<S>` constructor,
 /// key-dropping `Drop`, and shared trait impls. The struct definition is
-/// the single source for the field list. The sync and async variants must
-/// stay distinct types because their stream traits would produce
-/// overlapping trait impls on one shared struct.
+/// the single source for the field list.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! impl_tcp_common {
 	($transport:ident, $stream_trait:path) => {
@@ -186,8 +184,6 @@ macro_rules! impl_tcp_common {
 			pub(crate) emitter_gate: $crate::policy::GateChain,
 			#[cfg(feature = "transport-policy")]
 			pub(crate) collector_gate: $crate::policy::GateChain,
-			#[cfg(all(feature = "std", feature = "transport-policy"))]
-			pub(crate) operation_timeout: core::time::Duration,
 			#[cfg(feature = "x509")]
 			pub(crate) trust_store: Option<Arc<dyn $crate::crypto::x509::store::CertificateTrust>>,
 			#[cfg(feature = "x509")]
@@ -204,15 +200,13 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "x509")]
 			pub(crate) aad_domain_tag: Option<&'static [u8]>,
 			#[cfg(feature = "x509")]
-			pub(crate) max_cleartext_envelope: Option<usize>,
-			#[cfg(feature = "x509")]
-			pub(crate) max_encrypted_envelope: Option<usize>,
-			#[cfg(feature = "x509")]
 			pub(crate) key_manager: Option<Arc<$crate::transport::handshake::HandshakeKeyManager<P>>>,
 			#[cfg(feature = "x509")]
 			pub(crate) handshake_state: $crate::transport::handshake::TcpHandshakeState,
-			#[cfg(feature = "x509")]
-			pub(crate) handshake_timeout: core::time::Duration,
+			/// Every ceiling this transport enforces. Not an `Option`: a
+			/// transport without limits is unrepresentable.
+			#[cfg(any(feature = "x509", all(feature = "std", feature = "transport-policy")))]
+			pub(crate) limits: $crate::transport::TransportLimits,
 			#[cfg(feature = "x509")]
 			pub(crate) session_keys: Option<$crate::crypto::aead::SessionKeys>,
 			#[cfg(feature = "x509")]
@@ -253,8 +247,6 @@ macro_rules! impl_tcp_common {
 					emitter_gate: $crate::policy::GateChain::default(),
 					#[cfg(feature = "transport-policy")]
 					collector_gate: $crate::policy::GateChain::default(),
-					#[cfg(all(feature = "std", feature = "transport-policy"))]
-					operation_timeout: $crate::constants::DEFAULT_OPERATION_TIMEOUT,
 					#[cfg(feature = "x509")]
 					trust_store: None,
 					#[cfg(feature = "x509")]
@@ -270,15 +262,11 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					aad_domain_tag: None,
 					#[cfg(feature = "x509")]
-					max_cleartext_envelope: None,
-					#[cfg(feature = "x509")]
-					max_encrypted_envelope: None,
-					#[cfg(feature = "x509")]
 					key_manager: None,
 					#[cfg(feature = "x509")]
 					handshake_state: $crate::transport::handshake::TcpHandshakeState::None,
-					#[cfg(feature = "x509")]
-					handshake_timeout: core::time::Duration::from_secs(1),
+					#[cfg(any(feature = "x509", all(feature = "std", feature = "transport-policy")))]
+					limits: $crate::transport::TransportLimits::default(),
 					#[cfg(feature = "x509")]
 					session_keys: None,
 					#[cfg(feature = "x509")]
@@ -419,7 +407,7 @@ macro_rules! impl_tcp_common {
 
 			/// True while this endpoint expects an encryption handshake that has
 			/// not completed yet. Such reads face an unauthenticated peer, so the
-			/// read layer applies the tight `HANDSHAKE_MAX_WIRE` cap and the
+			/// read layer applies the tight `handshake_wire` ceiling and the
 			/// handshake deadline instead of the general envelope limits.
 			pub(crate) fn is_handshake_pending(&self) -> bool {
 				let expects_handshake = self.server_identity.is_some()
@@ -453,7 +441,7 @@ macro_rules! impl_tcp_common {
 
 			#[cfg(feature = "std")]
 			fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
-				self.operation_timeout = timeout;
+				self.limits.operation_timeout = timeout;
 				self
 			}
 		}
@@ -556,12 +544,8 @@ macro_rules! impl_tcp_common {
 				self.session_keys = Some(keys);
 			}
 
-			fn to_max_cleartext_envelope(&self) -> Option<usize> {
-				self.max_cleartext_envelope
-			}
-
-			fn to_max_encrypted_envelope(&self) -> Option<usize> {
-				self.max_encrypted_envelope
+			fn limits(&self) -> &$crate::transport::TransportLimits {
+				&self.limits
 			}
 
 			fn is_client_validators_present(&self) -> bool {
@@ -618,7 +602,7 @@ macro_rules! impl_tcp_common {
 			}
 
 			fn to_handshake_timeout(&self) -> Duration {
-				self.handshake_timeout
+				self.limits.handshake_timeout
 			}
 
 			fn to_client_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {

@@ -46,6 +46,7 @@ use tightbeam::testing::{create_v0_tightbeam, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::protocols::{AsyncReadStream, AsyncWriteStream, SplittableStream};
 use tightbeam::transport::tcp::r#async::{TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader};
+use tightbeam::transport::TransportLimits;
 use tightbeam::transport::{
 	EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure, TransportWriter,
 };
@@ -245,7 +246,7 @@ fn tamper_repeats(rule: TamperRule, index: usize) -> usize {
 
 async fn forward_tampered_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf, rule: TamperRule) {
 	let mut index = 0usize;
-	while let Ok(frame) = reader.read_frame(None).await {
+	while let Ok(frame) = reader.read_frame(TransportLimits::default().max_envelope()).await {
 		index += 1;
 		for _ in 0..tamper_repeats(rule, index) {
 			if writer.write_frame(&frame).await.is_err() {
@@ -256,7 +257,7 @@ async fn forward_tampered_frames(mut reader: TokioReadHalf, mut writer: TokioWri
 }
 
 async fn forward_unchanged_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf) {
-	while let Ok(frame) = reader.read_frame(None).await {
+	while let Ok(frame) = reader.read_frame(TransportLimits::default().max_envelope()).await {
 		if writer.write_frame(&frame).await.is_err() {
 			return;
 		}

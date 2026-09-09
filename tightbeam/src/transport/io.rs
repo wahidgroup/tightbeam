@@ -21,7 +21,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::asn1::Frame;
-use crate::constants::DEFAULT_MAX_ENCRYPTED_ENVELOPE;
 use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
@@ -69,7 +68,7 @@ use deadline::*;
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::aead::Decryptor;
-	pub use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
+	pub use crate::transport::builders::EnvelopeBuilder;
 	pub use crate::transport::state::EncryptedProtocolState;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -137,10 +136,6 @@ mod x509 {
 
 #[cfg(feature = "x509")]
 use x509::*;
-
-/// Maximum wire size allowed for handshake-phase messages.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
 
 /// Remaining allowance before the handshake deadline elapses.
 ///
@@ -431,18 +426,17 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Wrap and encrypt a message, returning WireEnvelope
 	/// Protocol-agnostic default implementation
 	///
-	/// Defaults the encrypted ceiling to [`DEFAULT_MAX_ENCRYPTED_ENVELOPE`]
-	/// when the endpoint carries no explicit limit.
-	/// An oversized request then fails locally with typed `SizeExceeded`.
-	/// That returns the frame instead of a peer connection reset.
+	/// The endpoint's own [`TransportLimits`] size the envelope, so an
+	/// oversized request fails locally with a typed `SizeExceeded` that
+	/// returns the frame, rather than as a peer connection reset.
+	///
+	/// [`TransportLimits`]: crate::transport::TransportLimits
 	#[allow(async_fn_in_trait)]
 	async fn wrap_and_encrypt_message(&mut self, message: Frame) -> TransportResult<WireEnvelope>
 	where
 		Self: EncryptedProtocolState,
 	{
-		let max_encrypted = self.to_max_encrypted_envelope().unwrap_or(DEFAULT_MAX_ENCRYPTED_ENVELOPE);
-		let limits = EnvelopeLimits::from_pair(self.to_max_cleartext_envelope(), Some(max_encrypted));
-		let builder = limits.apply(EnvelopeBuilder::request(message));
+		let builder = EnvelopeBuilder::request(message).with_limits(*self.limits());
 		let builder = self.apply_wire_mode(builder)?;
 
 		builder.finish()
@@ -618,7 +612,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Step 1: Build and send client hello
 		let initial_message = client.build_client_hello()?;
-		if initial_message.len() > HANDSHAKE_MAX_WIRE {
+		if initial_message.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
@@ -642,7 +636,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Step 2: Receive server response
 		let response_wire_bytes = self.read_envelope_bytes().await?;
-		if response_wire_bytes.len() > HANDSHAKE_MAX_WIRE {
+		if response_wire_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
@@ -659,13 +653,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		let server_handshake: ServerHandshake =
 			signed_data.as_ref().try_into().map_err(|_| TransportError::InvalidMessage)?;
 		let response_bytes = server_handshake.to_der()?;
-		if response_bytes.len() > HANDSHAKE_MAX_WIRE {
+		if response_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
 		// Step 3: Process server handshake
 		let next_message_bytes = client.process_server_handshake(&response_bytes).await?;
-		if next_message_bytes.len() > HANDSHAKE_MAX_WIRE {
+		if next_message_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
@@ -793,7 +787,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		// Step 1: Start handshake - get initial message
 		let initial_message = orchestrator.start().await?;
-		if initial_message.len() > HANDSHAKE_MAX_WIRE {
+		if initial_message.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
@@ -813,7 +807,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Step 2: Receive server response
 		let response_wire_bytes = self.read_envelope_bytes().await?;
-		if response_wire_bytes.len() > HANDSHAKE_MAX_WIRE {
+		if response_wire_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
@@ -828,7 +822,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		};
 
 		let response_bytes = kind.unwrap_server_response(response_envelope)?;
-		if response_bytes.len() > HANDSHAKE_MAX_WIRE {
+		if response_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
@@ -837,7 +831,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Step 4: Send next message if any (multi-round support)
 		if let Some(msg_bytes) = next_message {
-			if msg_bytes.len() > HANDSHAKE_MAX_WIRE {
+			if msg_bytes.len() > self.limits().handshake_wire {
 				return Err(TransportError::InvalidMessage);
 			}
 
@@ -1026,7 +1020,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Send response if any (multi-round support)
 		if let Some(response) = response_bytes {
-			if response.len() > HANDSHAKE_MAX_WIRE {
+			if response.len() > self.limits().handshake_wire {
 				return Err(TransportError::InvalidMessage);
 			}
 
@@ -1085,7 +1079,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
-		if handshake_bytes.len() > HANDSHAKE_MAX_WIRE {
+		if handshake_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
@@ -1153,7 +1147,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
-		if handshake_bytes.len() > HANDSHAKE_MAX_WIRE {
+		if handshake_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 

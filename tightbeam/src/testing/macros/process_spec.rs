@@ -139,50 +139,53 @@ macro_rules! tb_process_spec {
 
 				// Build timing constraints if present
 				$(
-					#[cfg(feature = "testing-timing")]
-					{
-						use $crate::testing::specs::csp::Event;
-						use $crate::testing::timing::{DeadlineBuilder, TimingConstraints};
-						use $crate::testing::macros::DeadlineParams;
-						let mut timing_constraints = TimingConstraints::default();
+					$crate::__tb_if_testing_timing! {
+						{
+							use $crate::testing::specs::csp::Event;
+							use $crate::testing::timing::{DeadlineBuilder, TimingConstraints};
+							use $crate::testing::macros::DeadlineParams;
+							let mut timing_constraints = TimingConstraints::default();
 
-						$crate::tb_process_spec! {
-							@parse_timing
-							timing_constraints,
-							$($timing_content)*
+							$crate::tb_process_spec! {
+								@parse_timing
+								timing_constraints,
+								$($timing_content)*
+							}
+
+							builder = builder.timing_constraints(timing_constraints);
 						}
-
-						builder = builder.timing_constraints(timing_constraints);
-					}
+					};
 				)?
 
 				$(
-					#[cfg(feature = "testing-schedulability")]
-					{
-						use $crate::testing::specs::csp::Event;
-						use std::collections::HashMap;
-						use core::time::Duration;
+					$crate::__tb_if_testing_schedulability! {
+						{
+							use $crate::testing::specs::csp::Event;
+							use std::collections::HashMap;
+							use core::time::Duration;
 
-						$crate::tb_process_spec! {
-							@parse_schedulability
-							builder,
-							$($schedulability_content)*
+							$crate::tb_process_spec! {
+								@parse_schedulability
+								builder,
+								$($schedulability_content)*
+							}
 						}
-					}
+					};
 				)?
 
 				builder.build().expect("Failed to build Process")
 			}
 		}
 
-		#[cfg(feature = "testing-csp")]
-		impl $crate::testing::specs::csp::ProcessSpec for $name {
-			fn validate_trace(&self, trace: &$crate::trace::ConsumedTrace) -> $crate::testing::specs::csp::CspValidationResult {
-				Self::process().validate_trace(trace)
-			}
+		$crate::__tb_if_testing_csp! {
+			impl $crate::testing::specs::csp::ProcessSpec for $name {
+				fn validate_trace(&self, trace: &$crate::trace::ConsumedTrace) -> $crate::testing::specs::csp::CspValidationResult {
+					Self::process().validate_trace(trace)
+				}
 
-			fn to_process_cow(&self) -> std::borrow::Cow<'_, $crate::testing::specs::csp::Process> {
-				std::borrow::Cow::Owned(Self::process())
+				fn to_process_cow(&self) -> std::borrow::Cow<'_, $crate::testing::specs::csp::Process> {
+					std::borrow::Cow::Owned(Self::process())
+				}
 			}
 		}
 	};
@@ -437,23 +440,27 @@ macro_rules! tb_process_spec {
 		$to_state:ident,
 		$( $reset_clock:expr ),* $(,)?
 	) => {
-		#[cfg(feature = "testing-timing")]
-		{
-			use $crate::testing::specs::csp::{Event, State};
-			use $crate::testing::timing::TimingGuard;
-			let guard: TimingGuard = $crate::guard!($guard_expr);
-			let reset_clocks: Vec<String> = vec![$( $reset_clock.to_string() ),*];
-			$builder = $builder.add_timed_transition(
-				$from_state,
-				Event::from($event),
-				State(stringify!($to_state)),
-				Some(guard),
-				reset_clocks,
-			);
-		}
-		#[cfg(not(feature = "testing-timing"))]
-		{
-			$builder = $builder.add_transition($from_state, $event, $crate::testing::specs::csp::State(stringify!($to_state)));
+		$crate::__tb_select_testing_timing! {
+			{
+				use $crate::testing::specs::csp::{Event, State};
+				use $crate::testing::timing::TimingGuard;
+				let guard: TimingGuard = $crate::guard!($guard_expr);
+				let reset_clocks: Vec<String> = vec![$( $reset_clock.to_string() ),*];
+				$builder = $builder.add_timed_transition(
+					$from_state,
+					Event::from($event),
+					State(stringify!($to_state)),
+					Some(guard),
+					reset_clocks,
+				);
+			}
+			{
+				$builder = $builder.add_transition(
+					$from_state,
+					$event,
+					$crate::testing::specs::csp::State(stringify!($to_state)),
+				);
+			}
 		}
 	};
 }

@@ -897,17 +897,19 @@ macro_rules! __tb_assert_spec_build {
 		$(
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
-		#[cfg(feature = "instrument")]
-		{
-			$(
-				builder = builder.required_events(::core::slice::from_ref(&$ev));
-			)*
-		}
-		$(
-			#[cfg(feature = "testing-timing")]
+		$crate::__tb_if_instrument! {
 			{
-				$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
+				$(
+					builder = builder.required_events(::core::slice::from_ref(&$ev));
+				)*
 			}
+		};
+		$(
+			$crate::__tb_if_testing_timing! {
+				{
+					$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
+				}
+			};
 		)?
 		$vec.push(builder.build());
 	}};
@@ -929,10 +931,11 @@ macro_rules! __tb_assert_spec_build {
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
 		$(
-			#[cfg(feature = "testing-timing")]
-			{
-				$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
-			}
+			$crate::__tb_if_testing_timing! {
+				{
+					$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
+				}
+			};
 		)?
 		$vec.push(builder.build());
 	}};
@@ -1266,27 +1269,28 @@ macro_rules! __tb_scenario_verify_impl {
 		#[allow(unused_mut, unused_assignments)]
 		let mut csp_failed = false;
 
-		#[cfg(feature = "testing-csp")]
-		{
-			$(
-				let csp_spec = <$csp>::default();
-				let csp_result = <$csp as $crate::testing::specs::csp::ProcessSpec>::validate_trace(&csp_spec, &scenario_result.trace);
-				csp_failed = !csp_result.valid;
-				scenario_result.csp_result = Some(csp_result);
-				// Move process into result
-				scenario_result.process = Some(<$csp>::process());
+		$crate::__tb_if_testing_csp! {
+			{
+				$(
+					let csp_spec = <$csp>::default();
+					let csp_result = <$csp as $crate::testing::specs::csp::ProcessSpec>::validate_trace(&csp_spec, &scenario_result.trace);
+					csp_failed = !csp_result.valid;
+					scenario_result.csp_result = Some(csp_result);
+					// Bind the process before storing it, so the timing
+					// constraints are read from the value in hand rather than
+					// from an `Option` this code just filled and must unwrap.
+					let process = <$csp>::process();
 
-				// Move timing constraints into result (if available)
-				#[cfg(feature = "testing-timing")]
-				{
-					let process = scenario_result
-						.process
-						.as_ref()
-						.expect("process assigned immediately above");
-					scenario_result.timing_constraints = process.timing_constraints.clone();
-				}
-			)?
-		}
+					$crate::__tb_if_testing_timing! {
+						{
+							scenario_result.timing_constraints = process.timing_constraints.clone();
+						}
+					};
+
+					scenario_result.process = Some(process);
+				)?
+			}
+		};
 
 		// Layer 3: FDR validation (if provided)
 		#[allow(unused_mut, unused_assignments)]
@@ -1294,32 +1298,36 @@ macro_rules! __tb_scenario_verify_impl {
 		#[allow(unused_mut, unused_assignments)]
 		let mut expect_failure = false;
 
-		#[cfg(feature = "testing-fdr")]
-		{
-			$(
-				use $crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
-				let config: FdrConfig = $fdr_config.into();
-				expect_failure = config.expect_failure;
+		$crate::__tb_if_testing_fdr! {
+			{
+				$(
+					use $crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+					let config: FdrConfig = $fdr_config.into();
+					expect_failure = config.expect_failure;
 
-				// AUTOMATIC MODE SELECTION:
-				// If fault_model + specs provided -> explore spec WITH faults (specification robustness)
-				// Otherwise -> explore execution trace (normal behavior / implementation resilience)
-				#[cfg(feature = "testing-fault")]
-				let process_to_explore = if config.fault_model.is_some() && !config.specs.is_empty() {
-					&config.specs[0]
-				} else {
-					&scenario_result.trace.to_process()
-				};
+					// AUTOMATIC MODE SELECTION:
+					// If fault_model + specs provided -> explore spec WITH faults (specification robustness)
+					// Otherwise -> explore execution trace (normal behavior / implementation resilience)
+					$crate::__tb_select_testing_fault! {
+						{
+							let process_to_explore = if config.fault_model.is_some() && !config.specs.is_empty() {
+								&config.specs[0]
+							} else {
+								&scenario_result.trace.to_process()
+							};
+						}
+						{
+							let process_to_explore = &scenario_result.trace.to_process();
+						}
+					}
 
-				#[cfg(not(feature = "testing-fault"))]
-				let process_to_explore = &scenario_result.trace.to_process();
-
-				let mut explorer = DefaultFdrExplorer::with_defaults(process_to_explore, config.clone());
-				let verdict = explorer.explore();
-				fdr_failed = !verdict.passed;
-				scenario_result.fdr_verdict = Some(verdict);
-			)?
-		}
+					let mut explorer = DefaultFdrExplorer::with_defaults(process_to_explore, config.clone());
+					let verdict = explorer.explore();
+					fdr_failed = !verdict.passed;
+					scenario_result.fdr_verdict = Some(verdict);
+				)?
+			}
+		};
 
 		// Determine overall pass/fail
 		scenario_result.passed = l1_passed && !csp_failed && (!fdr_failed || expect_failure);

@@ -33,13 +33,10 @@ use crate::transport::error::TransportFailure;
 use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
 use crate::transport::io::decode_transport_envelope;
-use crate::transport::protocols::{
-	enforce_frame_cap, AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream,
-};
-use crate::transport::tcp::HANDSHAKE_MAX_WIRE;
+use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
 use crate::transport::ResponsePackage;
 use crate::transport::{
-	EnvelopeBuilder, EnvelopeLimits, MessageCollector, MessageEmitter, MessageIO, TransportError, TransportResult,
+	EnvelopeBuilder, MessageCollector, MessageEmitter, MessageIO, TransportError, TransportLimits, TransportResult,
 	WireMode,
 };
 use crate::Frame;
@@ -55,9 +52,6 @@ use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 use crate::utils::marker::MaybeSend;
-
-/// Fallback envelope read cap when no explicit limit is configured.
-const DEFAULT_MAX_ENVELOPE: usize = 512 * 1024;
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -184,12 +178,9 @@ pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
 	aad_domain_tag: Option<&'static [u8]>,
+	/// Every ceiling handed to each accepted transport.
 	#[cfg(feature = "x509")]
-	max_cleartext_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
-	max_encrypted_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
-	handshake_timeout: Option<Duration>,
+	limits: TransportLimits,
 	#[cfg(feature = "x509")]
 	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
 }
@@ -212,11 +203,7 @@ impl<P: CryptoProvider> TokioListener<P> {
 			#[cfg(feature = "x509")]
 			aad_domain_tag: None,
 			#[cfg(feature = "x509")]
-			max_cleartext_envelope: None,
-			#[cfg(feature = "x509")]
-			max_encrypted_envelope: None,
-			#[cfg(feature = "x509")]
-			handshake_timeout: None,
+			limits: TransportLimits::default(),
 			#[cfg(feature = "x509")]
 			key_manager: None,
 		})
@@ -247,18 +234,7 @@ impl<P: CryptoProvider> TokioListener<P> {
 			transport.aad_domain_tag = Some(aad);
 		}
 
-		if let Some(max) = self.max_cleartext_envelope {
-			transport.max_cleartext_envelope = Some(max);
-		}
-
-		if let Some(max) = self.max_encrypted_envelope {
-			transport.max_encrypted_envelope = Some(max);
-		}
-
-		#[cfg(feature = "x509")]
-		if let Some(timeout) = self.handshake_timeout {
-			transport.handshake_timeout = timeout;
-		}
+		transport.limits = self.limits;
 
 		#[cfg(feature = "x509")]
 		if let Some(signatory) = &self.key_manager {
@@ -294,11 +270,7 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TokioListener<P> {
 				#[cfg(feature = "x509")]
 				aad_domain_tag: None,
 				#[cfg(feature = "x509")]
-				max_cleartext_envelope: None,
-				#[cfg(feature = "x509")]
-				max_encrypted_envelope: None,
-				#[cfg(feature = "x509")]
-				handshake_timeout: None,
+				limits: TransportLimits::default(),
 				#[cfg(feature = "x509")]
 				key_manager: None,
 			},
@@ -339,9 +311,7 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TokioListener<P> {
 				certificate: Some(certificate),
 				client_validators,
 				aad_domain_tag: Some(config.aad_domain_tag),
-				max_cleartext_envelope: Some(config.max_cleartext_envelope),
-				max_encrypted_envelope: Some(config.max_encrypted_envelope),
-				handshake_timeout: Some(config.handshake_timeout),
+				limits: config.limits,
 				key_manager: Some(key_manager),
 			},
 			TightBeamSocketAddr(bound_addr),
@@ -378,9 +348,7 @@ where
 		self.server_identity = Some(certificate);
 		self.client_validators = config.client_validators;
 		self.aad_domain_tag = Some(config.aad_domain_tag);
-		self.max_cleartext_envelope = Some(config.max_cleartext_envelope);
-		self.max_encrypted_envelope = Some(config.max_encrypted_envelope);
-		self.handshake_timeout = config.handshake_timeout;
+		self.limits = config.limits;
 		self.key_manager = Some(config.key_manager);
 		self
 	}
@@ -597,12 +565,7 @@ where
 {
 	stream: R,
 	recv_key: RecvCipher,
-	max_encrypted_envelope: Option<usize>,
-	/// Per-read deadline carried across the split, matching the unsplit
-	/// path: a peer that byte-drips a frame cannot pin the reader task
-	/// forever (CWE-400).
-	#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-	operation_timeout: Duration,
+	limits: TransportLimits,
 	/// Connection collector carried across the split (see
 	/// [`EnvelopeSource::trace`])
 	#[cfg(feature = "instrument")]
@@ -635,14 +598,12 @@ where
 {
 	/// Decrypt one envelope (post-handshake split: wire must be encrypted).
 	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let max_len = self.max_encrypted_envelope.unwrap_or(DEFAULT_MAX_ENVELOPE);
+		let max_len = self.limits.encrypted_envelope;
 
 		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-		let wire_bytes = timeout(self.operation_timeout, self.stream.read_frame(Some(max_len))).await??;
+		let wire_bytes = timeout(self.limits.operation_timeout, self.stream.read_frame(max_len)).await??;
 		#[cfg(not(all(feature = "tokio", feature = "std", feature = "transport-policy")))]
-		let wire_bytes = self.stream.read_frame(Some(max_len)).await?;
-
-		enforce_frame_cap(&wire_bytes, Some(max_len))?;
+		let wire_bytes = self.stream.read_frame(max_len).await?;
 
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 		match wire_envelope {
@@ -689,12 +650,10 @@ where
 {
 	stream: W,
 	send_key: SendCipher,
-	max_encrypted_envelope: Option<usize>,
-	/// Per-write deadline carried across the split, matching the unsplit
-	/// path: a peer that never drains its receive buffer cannot pin the
-	/// writer task forever (CWE-400).
-	#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-	operation_timeout: Duration,
+	/// Every ceiling carried across the split, matching the unsplit path: a
+	/// peer that never drains its receive buffer cannot pin the writer task
+	/// forever (CWE-400).
+	limits: TransportLimits,
 	/// Connection collector carried across the split (see
 	/// [`EnvelopeSink::trace`])
 	#[cfg(feature = "instrument")]
@@ -722,8 +681,7 @@ where
 	TransportError: From<W::Error>,
 {
 	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
-		let limits = EnvelopeLimits::from_pair(None, self.max_encrypted_envelope);
-		let mut builder = limits.apply(EnvelopeBuilder::transport(envelope));
+		let mut builder = EnvelopeBuilder::transport(envelope).with_limits(self.limits);
 		builder = builder.with_wire_mode(WireMode::Encrypted);
 		builder = builder.with_encryptor(&self.send_key);
 
@@ -731,7 +689,7 @@ where
 		let wire_bytes = wire_envelope.to_der()?;
 
 		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-		timeout(self.operation_timeout, self.stream.write_frame(&wire_bytes)).await??;
+		timeout(self.limits.operation_timeout, self.stream.write_frame(&wire_bytes)).await??;
 
 		#[cfg(not(all(feature = "tokio", feature = "std", feature = "transport-policy")))]
 		self.stream.write_frame(&wire_bytes).await?;
@@ -770,7 +728,7 @@ where
 	R: AsyncReadStream,
 {
 	stream: R,
-	max_cleartext_envelope: Option<usize>,
+	limits: TransportLimits,
 	/// Connection collector carried across the split (see
 	/// [`EnvelopeSource::trace`])
 	#[cfg(feature = "instrument")]
@@ -784,10 +742,8 @@ where
 	TransportError: From<R::Error>,
 {
 	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let max_len = self.max_cleartext_envelope.unwrap_or(DEFAULT_MAX_ENVELOPE);
-		let wire_bytes = self.stream.read_frame(Some(max_len)).await?;
-
-		enforce_frame_cap(&wire_bytes, Some(max_len))?;
+		let max_len = self.limits.cleartext_envelope;
+		let wire_bytes = self.stream.read_frame(max_len).await?;
 
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 		match wire_envelope {
@@ -812,7 +768,7 @@ where
 	W: AsyncWriteStream,
 {
 	stream: W,
-	max_cleartext_envelope: Option<usize>,
+	limits: TransportLimits,
 	/// Connection collector carried across the split (see
 	/// [`EnvelopeSink::trace`])
 	#[cfg(feature = "instrument")]
@@ -826,9 +782,8 @@ where
 	TransportError: From<W::Error>,
 {
 	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
-		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, None);
-		let builder = limits
-			.apply(EnvelopeBuilder::transport(envelope))
+		let builder = EnvelopeBuilder::transport(envelope)
+			.with_limits(self.limits)
 			.with_wire_mode(WireMode::Cleartext);
 
 		let wire_envelope = builder.finish()?;
@@ -894,10 +849,8 @@ where
 			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))?;
 		let (send_key, recv_key) = session_keys.into_parts();
 
-		let max_encrypted_envelope = self.max_encrypted_envelope;
+		let limits = self.limits;
 
-		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-		let operation_timeout = self.operation_timeout;
 		#[cfg(feature = "instrument")]
 		let trace = self.trace.as_ref().map(TraceCollector::share);
 
@@ -905,18 +858,14 @@ where
 		let reader = TransportReader {
 			stream: read_half,
 			recv_key,
-			max_encrypted_envelope,
-			#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-			operation_timeout,
+			limits,
 			#[cfg(feature = "instrument")]
 			trace: trace.as_ref().map(TraceCollector::share),
 		};
 		let writer = TransportWriter {
 			stream: write_half,
 			send_key,
-			max_encrypted_envelope,
-			#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-			operation_timeout,
+			limits,
 			#[cfg(feature = "instrument")]
 			trace,
 		};
@@ -941,7 +890,7 @@ where
 			return Err(TransportError::MissingEncryption);
 		}
 
-		let max_cleartext_envelope = self.max_cleartext_envelope;
+		let limits = self.limits;
 
 		#[cfg(feature = "instrument")]
 		let trace = self.trace.as_ref().map(TraceCollector::share);
@@ -949,13 +898,13 @@ where
 		let (read_half, write_half) = self.stream.into_split();
 		let reader = CleartextReader {
 			stream: read_half,
-			max_cleartext_envelope,
+			limits,
 			#[cfg(feature = "instrument")]
 			trace: trace.as_ref().map(TraceCollector::share),
 		};
 		let writer = CleartextWriter {
 			stream: write_half,
-			max_cleartext_envelope,
+			limits,
 			#[cfg(feature = "instrument")]
 			trace,
 		};
@@ -991,19 +940,18 @@ where
 	TransportError: From<S::Error>,
 {
 	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
+		// An unauthenticated handshake read gets the tight handshake ceiling.
+		// An established session gets the larger of the two envelope ceilings,
+		// because the wire form is not known until the bytes are parsed.
 		#[cfg(feature = "x509")]
-		let max_len = if self.is_handshake_pending() {
-			Some(HANDSHAKE_MAX_WIRE)
+		let cap = if self.is_handshake_pending() {
+			self.limits.handshake_wire
 		} else {
-			Some(
-				self.max_encrypted_envelope
-					.or(self.max_cleartext_envelope)
-					.unwrap_or(DEFAULT_MAX_ENVELOPE),
-			)
+			self.limits.max_envelope()
 		};
 
 		#[cfg(not(feature = "x509"))]
-		let max_len = None;
+		let cap = self.limits.max_envelope();
 
 		#[cfg(feature = "tokio")]
 		{
@@ -1013,18 +961,18 @@ where
 					TcpHandshakeState::AwaitingServerResponse { initiated_at }
 					| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
 						let now = Instant::now();
-						let deadline = initiated_at + self.handshake_timeout;
+						let deadline = initiated_at + self.limits.handshake_timeout;
 						if now >= deadline {
 							return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 						}
 
 						Some(deadline.saturating_duration_since(now))
 					}
-					_ if self.is_handshake_pending() => Some(self.handshake_timeout),
+					_ if self.is_handshake_pending() => Some(self.limits.handshake_timeout),
 					_ => {
 						#[cfg(feature = "transport-policy")]
 						{
-							Some(self.operation_timeout)
+							Some(self.limits.operation_timeout)
 						}
 						#[cfg(not(feature = "transport-policy"))]
 						{
@@ -1038,7 +986,7 @@ where
 			let timeout_duration: Option<Duration> = {
 				#[cfg(feature = "transport-policy")]
 				{
-					Some(self.operation_timeout)
+					Some(self.limits.operation_timeout)
 				}
 				#[cfg(not(feature = "transport-policy"))]
 				{
@@ -1047,26 +995,24 @@ where
 			};
 
 			let buffer = if let Some(dur) = timeout_duration {
-				timeout(dur, self.stream.read_frame(max_len)).await??
+				timeout(dur, self.stream.read_frame(cap)).await??
 			} else {
-				self.stream.read_frame(max_len).await?
+				self.stream.read_frame(cap).await?
 			};
 
-			enforce_frame_cap(&buffer, max_len)?;
 			Ok(buffer)
 		}
 
 		#[cfg(not(feature = "tokio"))]
 		{
-			let buffer = self.stream.read_frame(max_len).await?;
-			enforce_frame_cap(&buffer, max_len)?;
+			let buffer = self.stream.read_frame(cap).await?;
 			Ok(buffer)
 		}
 	}
 
 	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		#[cfg(all(feature = "tokio", feature = "transport-policy"))]
-		timeout(self.operation_timeout, self.stream.write_frame(buffer)).await??;
+		timeout(self.limits.operation_timeout, self.stream.write_frame(buffer)).await??;
 
 		#[cfg(not(all(feature = "tokio", feature = "transport-policy")))]
 		self.stream.write_frame(buffer).await?;
@@ -1092,8 +1038,7 @@ where
 
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
-		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
-		let builder = limits.apply(EnvelopeBuilder::response(response_pkg));
+		let builder = EnvelopeBuilder::response(response_pkg).with_limits(self.limits);
 		let builder = self.apply_wire_mode(builder)?;
 
 		let wire_envelope = builder.build()?;
@@ -1129,7 +1074,7 @@ where
 
 		#[cfg(feature = "tokio")]
 		{
-			match timeout(self.operation_timeout, async { self.perform_emit_cycle(message).await }).await {
+			match timeout(self.limits.operation_timeout, async { self.perform_emit_cycle(message).await }).await {
 				Ok(result) => result,
 				Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
 			}
@@ -1219,7 +1164,7 @@ mod tests {
 		impl AsyncReadStream for NullStream {
 			type Error = IoError;
 
-			async fn read_frame(&mut self, _max_len: Option<usize>) -> Result<Vec<u8>, Self::Error> {
+			async fn read_frame(&mut self, _cap: usize) -> Result<Vec<u8>, Self::Error> {
 				Ok(Vec::new())
 			}
 		}
@@ -1241,9 +1186,7 @@ mod tests {
 			TransportWriter {
 				stream: NullStream,
 				send_key: SendCipher::new(test_runtime()).with_rekey_limit(rekey_limit),
-				max_encrypted_envelope: None,
-				#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-				operation_timeout: crate::constants::DEFAULT_OPERATION_TIMEOUT,
+				limits: TransportLimits::default(),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1253,9 +1196,7 @@ mod tests {
 			TransportReader {
 				stream: NullStream,
 				recv_key: RecvCipher::new(test_runtime()),
-				max_encrypted_envelope: None,
-				#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
-				operation_timeout: crate::constants::DEFAULT_OPERATION_TIMEOUT,
+				limits: TransportLimits::default(),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1264,7 +1205,7 @@ mod tests {
 		fn cleartext_writer() -> CleartextWriter<NullStream> {
 			CleartextWriter {
 				stream: NullStream,
-				max_cleartext_envelope: None,
+				limits: TransportLimits::default(),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1273,7 +1214,7 @@ mod tests {
 		fn cleartext_reader() -> CleartextReader<NullStream> {
 			CleartextReader {
 				stream: NullStream,
-				max_cleartext_envelope: None,
+				limits: TransportLimits::default(),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1527,7 +1468,7 @@ mod tests {
 	#[tokio::test]
 	async fn handshake_read_deadline_bounds_silent_client() -> TransportResult<()> {
 		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;
-		config.handshake_timeout = Duration::from_millis(500);
+		config.limits.handshake_timeout = Duration::from_millis(500);
 
 		let (listener, server_addr) = bind_encrypted(config).await?;
 		let server_handle = spawn_accept_handle_request(listener);
@@ -1546,7 +1487,7 @@ mod tests {
 	#[tokio::test]
 	async fn handshake_read_rejects_oversize_frame_before_body() -> TransportResult<()> {
 		let EncryptedTestServer { mut config, .. } = encrypted_test_server()?;
-		config.handshake_timeout = Duration::from_secs(5);
+		config.limits.handshake_timeout = Duration::from_secs(5);
 
 		let (listener, server_addr) = bind_encrypted(config).await?;
 		let server_handle = spawn_accept_handle_request(listener);

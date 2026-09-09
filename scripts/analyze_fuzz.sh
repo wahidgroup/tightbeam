@@ -13,9 +13,6 @@
 
 set -euo pipefail
 
-# The run directory is resolved by scripts/fuzz-run.sh, which anchors to the
-# repository so this works from any working directory.
-FUZZ_RUN=$("$(dirname "$0")/fuzz-run.sh")
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Script is in scripts/ directory, project root is one level up
@@ -193,6 +190,13 @@ fi
 
 TEST_NAME="$1"
 shift
+
+# The test name is the target, so it names this run. Asking scripts/fuzz-run.sh
+# keeps the output layout in one place, and gives each target its own directory
+# so a run here neither collides with `make fuzz-test` nor deletes its results.
+FUZZ_RUN="$(FUZZ_TARGET="fuzz_${TEST_NAME}" "$SCRIPT_DIR/fuzz-run.sh")"
+FUZZ_OUT="$(dirname "$FUZZ_RUN")"
+FUZZ_IN="$PROJECT_ROOT/built/fuzz/in/fuzz_${TEST_NAME}"
 
 # Handle DURATION argument (optional)
 if [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
@@ -417,29 +421,29 @@ echo ""
 
 # Prepare seed inputs
 echo "[*] Preparing seed inputs..."
-mkdir -p built/fuzz/in
+mkdir -p "$FUZZ_IN"
 if [ "$KEEP_OUTPUT" = false ]; then
-    rm -rf built/fuzz/out
+    rm -rf "$FUZZ_OUT"
 fi
-mkdir -p built/fuzz/out
+mkdir -p "$FUZZ_OUT"
 
 # Copy seeds from version-controlled directory to AFL input directory
 if [ -d "$SEED_DIR" ]; then
     # Copy all seed files from seed directory
-    find "$SEED_DIR" -type f \( -name "*.txt" -o -name "*.bin" -o -name "*.dat" \) -exec cp {} built/fuzz/in/ \;
-    SEED_COUNT=$(ls built/fuzz/in/*.* 2>/dev/null | wc -l)
+    find "$SEED_DIR" -type f \( -name "*.txt" -o -name "*.bin" -o -name "*.dat" \) -exec cp {} "$FUZZ_IN/" \;
+    SEED_COUNT=$(find "$FUZZ_IN" -type f | wc -l)
     if [ "$SEED_COUNT" -gt 0 ]; then
         echo "[+] Copied $SEED_COUNT seed files from $SEED_DIR"
     else
         echo "[!] WARNING: No seed files found in $SEED_DIR"
         echo "    Creating minimal seed file..."
-        echo "seed" > built/fuzz/in/seed.txt
+        echo "seed" > "$FUZZ_IN/seed.txt"
         SEED_COUNT=1
     fi
 else
     echo "[!] WARNING: Seed directory not found: $SEED_DIR"
     echo "    Creating minimal seed file..."
-    echo "seed" > built/fuzz/in/seed.txt
+    echo "seed" > "$FUZZ_IN/seed.txt"
     SEED_COUNT=1
 fi
 echo "[+] Prepared $SEED_COUNT seed files for fuzzing"
@@ -533,8 +537,8 @@ fi
 
 echo "[*] Starting AFL fuzzer..."
 echo "    Target: $(basename "$FUZZ_TARGET")"
-echo "    Input: built/fuzz/in/"
-echo "    Output: built/fuzz/out/"
+echo "    Input: $FUZZ_IN/"
+echo "    Output: $FUZZ_OUT/"
 if [ -n "$AFL_ARGS" ]; then
     echo "    Extra AFL args: $AFL_ARGS"
 fi
@@ -548,7 +552,7 @@ run_afl_command() {
     else
         cmd+=("cargo" "afl" "fuzz")
     fi
-    cmd+=("-i" "built/fuzz/in" "-o" "built/fuzz/out")
+    cmd+=("-i" "$FUZZ_IN" "-o" "$FUZZ_OUT")
     if [ ${#AFL_ARGS_ARRAY[@]} -gt 0 ]; then
         cmd+=("${AFL_ARGS_ARRAY[@]}")
     fi

@@ -1,14 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Print the absolute path of the fuzz run to analyze:
-#   fuzz-run.sh
+# Answer questions about the fuzz output layout, which is one directory per
+# target under built/fuzz/out:
 #
-# Fuzz output is one directory per target under built/fuzz/out. With a single
-# target the run is unambiguous, otherwise the caller names it with FUZZ_TARGET.
+#   fuzz-run.sh                  the run to analyze, as an absolute path
+#   fuzz-run.sh --target PATH    the target name owning a crash or hang file
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/built/fuzz/out"
+
+if [ "${1:-}" = "--target" ]; then
+	if [ "$#" -ne 2 ]; then
+		echo "usage: $(basename "$0") --target <crash-or-hang-path>" >&2
+		exit 2
+	fi
+
+	# Resolve the argument so a relative path answers the same as an absolute one.
+	FILE="$(cd "$(dirname "$2")" 2>/dev/null && pwd || true)/$(basename "$2")"
+	case "$FILE" in
+		"$OUT"/*)
+			REST="${FILE#"$OUT"/}"
+			printf '%s\n' "${REST%%/*}"
+			exit 0
+			;;
+		*)
+			echo "ERROR: $2 is not inside $OUT." >&2
+			exit 1
+			;;
+	esac
+fi
 
 if [ -n "${FUZZ_TARGET:-}" ]; then
 	printf '%s\n' "$OUT/$FUZZ_TARGET/default"

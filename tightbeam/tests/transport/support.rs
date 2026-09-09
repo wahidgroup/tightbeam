@@ -126,7 +126,7 @@ pub async fn bind_encrypted_listener_with_timeout(
 	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
 
 	let mut config = TransportEncryptionConfig::new(certificate, key_manager);
-	config.handshake_timeout = handshake_timeout;
+	config.limits.handshake_timeout = handshake_timeout;
 	bind_with_config(config).await
 }
 
