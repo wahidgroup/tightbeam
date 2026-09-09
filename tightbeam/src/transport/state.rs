@@ -21,6 +21,7 @@ use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, Sto
 use crate::transport::handshake::{
 	BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
 };
+use crate::transport::TransportLimits;
 use crate::transport::TransportResult;
 use crate::x509::Certificate;
 
@@ -190,15 +191,8 @@ pub trait EncryptedProtocolState {
 		None
 	}
 
-	/// Cleartext envelope size cap in bytes.
-	fn to_max_cleartext_envelope(&self) -> Option<usize> {
-		None
-	}
-
-	/// Encrypted envelope size cap in bytes.
-	fn to_max_encrypted_envelope(&self) -> Option<usize> {
-		None
-	}
+	/// Every ceiling this endpoint enforces.
+	fn limits(&self) -> &TransportLimits;
 
 	/// Whether client certificate validators are configured (mutual auth).
 	fn is_client_validators_present(&self) -> bool {
@@ -236,7 +230,7 @@ pub trait EncryptedProtocolState {
 
 	/// Absolute deadline applied to handshake-phase reads.
 	fn to_handshake_timeout(&self) -> Duration {
-		Duration::from_secs(1)
+		self.limits().handshake_timeout
 	}
 
 	/// Client certificate validators for mutual authentication.
@@ -273,16 +267,21 @@ mod tests {
 	struct PhaseProbe {
 		handshake: TcpHandshakeState,
 		validators: bool,
+		limits: TransportLimits,
 	}
 
 	impl PhaseProbe {
 		fn provisioned(handshake: TcpHandshakeState) -> Self {
-			Self { handshake, validators: true }
+			Self { handshake, validators: true, limits: TransportLimits::default() }
 		}
 	}
 
 	impl EncryptedProtocolState for PhaseProbe {
 		type CryptoProvider = DefaultCryptoProvider;
+
+		fn limits(&self) -> &TransportLimits {
+			&self.limits
+		}
 
 		fn to_handshake_state(&self) -> TcpHandshakeState {
 			self.handshake
@@ -337,7 +336,11 @@ mod tests {
 
 	#[test]
 	fn unprovisioned_session_is_cleartext() {
-		let probe = PhaseProbe { handshake: TcpHandshakeState::None, validators: false };
+		let probe = PhaseProbe {
+			handshake: TcpHandshakeState::None,
+			validators: false,
+			limits: TransportLimits::default(),
+		};
 		assert_eq!(probe.session_phase(), SessionPhase::Cleartext);
 	}
 

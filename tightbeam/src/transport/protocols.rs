@@ -13,18 +13,13 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-#[cfg(any(feature = "tokio", feature = "async-transport"))]
-use core::mem;
-
 use crate::transport::error::TransportError;
 use crate::utils::marker::MaybeSend;
 
 #[cfg(all(feature = "x509", feature = "instrument"))]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
-use crate::transport::error::TransportFailure;
-#[cfg(any(feature = "tokio", feature = "async-transport"))]
-use crate::transport::framing::{parse_der_length, reconstruct_der_encoding, LengthForm};
+use crate::transport::framing::{FrameHeader, LengthForm};
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::TransportResult;
 
@@ -149,10 +144,11 @@ pub trait AsyncReadStream: MaybeSend + Unpin {
 
 	/// Read one complete DER-encoded envelope from the transport.
 	///
-	/// `max_len` is the largest envelope content length the caller accepts. An
-	/// implementation MUST reject a frame whose declared length exceeds it
-	/// before allocating, to bound memory use.
-	fn read_frame(&mut self, max_len: Option<usize>) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + MaybeSend;
+	/// `cap` is the largest envelope content length the caller accepts. An
+	/// implementation MUST refuse a frame whose declared length exceeds `cap`
+	/// before sizing any buffer. Every implementation in this crate reaches a
+	/// content length only after that check has run.
+	fn read_frame(&mut self, cap: usize) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + MaybeSend;
 }
 
 /// Write-half capability of a frame-oriented async byte transport.
@@ -171,10 +167,11 @@ pub trait AsyncProtocolStream: MaybeSend + Unpin {
 
 	/// Read one complete DER-encoded envelope from the transport.
 	///
-	/// `max_len` is the largest envelope content length the caller accepts. An
-	/// implementation MUST reject a frame whose declared length exceeds it
-	/// before allocating, to bound memory use.
-	fn read_frame(&mut self, max_len: Option<usize>) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + MaybeSend;
+	/// `cap` is the largest envelope content length the caller accepts. An
+	/// implementation MUST refuse a frame whose declared length exceeds `cap`
+	/// before sizing any buffer. Every implementation in this crate reaches a
+	/// content length only after that check has run.
+	fn read_frame(&mut self, cap: usize) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + MaybeSend;
 
 	/// Write one complete DER-encoded envelope to the transport.
 	fn write_frame(&mut self, buffer: &[u8]) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
@@ -231,8 +228,8 @@ pub trait AsyncByteStream: AsyncByteRead + AsyncByteWrite {
 impl<T: AsyncByteRead> AsyncReadStream for T {
 	type Error = TransportError;
 
-	async fn read_frame(&mut self, max_len: Option<usize>) -> Result<Vec<u8>, Self::Error> {
-		read_der_frame(self, max_len).await
+	async fn read_frame(&mut self, cap: usize) -> Result<Vec<u8>, Self::Error> {
+		read_der_frame(self, cap).await
 	}
 }
 
@@ -249,8 +246,8 @@ impl<T: AsyncByteWrite> AsyncWriteStream for T {
 impl<T: AsyncByteStream> AsyncProtocolStream for T {
 	type Error = TransportError;
 
-	async fn read_frame(&mut self, max_len: Option<usize>) -> Result<Vec<u8>, Self::Error> {
-		read_der_frame(self, max_len).await
+	async fn read_frame(&mut self, cap: usize) -> Result<Vec<u8>, Self::Error> {
+		read_der_frame(self, cap).await
 	}
 
 	async fn write_frame(&mut self, buffer: &[u8]) -> Result<(), Self::Error> {
@@ -268,7 +265,7 @@ impl<T: AsyncByteStream> AsyncProtocolStream for T {
 /// enforcement, cap-before-allocate), applied through the blanket frame-trait
 /// impls so no byte-level transport can diverge on wire framing.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
-async fn read_der_frame<R>(stream: &mut R, max_len: Option<usize>) -> TransportResult<Vec<u8>>
+async fn read_der_frame<R>(stream: &mut R, cap: usize) -> TransportResult<Vec<u8>>
 where
 	R: AsyncByteRead + ?Sized,
 {
@@ -283,8 +280,8 @@ where
 		.await
 		.map_err(|e| (e.into()).inside_frame())?;
 
-	let (length_octets, content_length) = match LengthForm::from(length_first[0]) {
-		LengthForm::Short(length) => (Vec::new(), length),
+	let length_octets = match LengthForm::from(length_first[0]) {
+		LengthForm::Short(_) => Vec::new(),
 		LengthForm::Long(octet_count) => {
 			let mut length_octets = vec![0u8; octet_count];
 
@@ -293,43 +290,19 @@ where
 				.await
 				.map_err(|e| (e.into()).inside_frame())?;
 
-			let length = parse_der_length(length_first[0], &length_octets).ok_or(TransportError::InvalidMessage)?;
-			(length_octets, length)
+			length_octets
 		}
 	};
 
-	if let Some(max) = max_len {
-		if content_length > max {
-			// Refuse before allocating or reading the content (CWE-400).
-			// The typed failure distinguishes an oversized frame from a malformed one.
-			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
-		}
-	}
+	// Refuse before allocating or reading the content (CWE-400). `content_len`
+	// exists only on an admitted header, so the buffer below cannot be sized
+	// by a length this cap has not seen.
+	let header = FrameHeader::parse(tag[0], length_first[0], length_octets)?.admit(cap)?;
 
-	let mut content = vec![0u8; content_length];
+	let mut content = vec![0u8; header.content_len()];
 	stream.read_exact(&mut content).await.map_err(|e| (e.into()).inside_frame())?;
 
-	Ok(reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content))
-}
-
-/// Largest DER header this transport accepts: tag octet, first length
-/// octet, and up to `usize`-width length octets.
-#[cfg(any(feature = "tokio", feature = "async-transport"))]
-const DER_HEADER_MAX: usize = 2 + mem::size_of::<usize>();
-
-/// Defense in depth behind [`AsyncReadStream::read_frame`]: whatever code
-/// framed the envelope, the bytes handed downstream must respect the cap.
-#[cfg(any(feature = "tokio", feature = "async-transport"))]
-pub(crate) fn enforce_frame_cap(buffer: &[u8], max_len: Option<usize>) -> TransportResult<()> {
-	let Some(max) = max_len else {
-		return Ok(());
-	};
-
-	if buffer.len() > max.saturating_add(DER_HEADER_MAX) {
-		return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
-	}
-
-	Ok(())
+	Ok(header.reconstruct(&content))
 }
 
 /// Protocol supports persistent connections (keep-alive)
@@ -358,6 +331,7 @@ mod tests {
 	use std::io::{Error as IoError, ErrorKind};
 
 	use super::*;
+	use crate::transport::error::TransportFailure;
 
 	/// Byte-level fixture replaying a scripted wire image; implements
 	/// only the byte traits, so every frame below is recovered by the
@@ -409,8 +383,7 @@ mod tests {
 	async fn blanket_recovers_short_form_frame() -> Result<(), TransportError> {
 		let wire = [0x30, 0x03, 0x01, 0x02, 0x03];
 		let mut stream = ScriptedBytes::new(&wire);
-
-		let frame = AsyncProtocolStream::read_frame(&mut stream, Some(64)).await?;
+		let frame = AsyncProtocolStream::read_frame(&mut stream, 64).await?;
 		assert_eq!(frame, wire);
 		Ok(())
 	}
@@ -419,9 +392,9 @@ mod tests {
 	async fn blanket_recovers_long_form_frame() -> Result<(), TransportError> {
 		let mut wire = vec![0x30, 0x81, 0x80];
 		wire.extend_from_slice(&[0xAB; 0x80]);
-		let mut stream = ScriptedBytes::new(&wire);
 
-		let frame = AsyncProtocolStream::read_frame(&mut stream, Some(256)).await?;
+		let mut stream = ScriptedBytes::new(&wire);
+		let frame = AsyncProtocolStream::read_frame(&mut stream, 256).await?;
 		assert_eq!(frame, wire);
 		Ok(())
 	}
@@ -429,24 +402,21 @@ mod tests {
 	#[tokio::test]
 	async fn blanket_rejects_non_canonical_length() {
 		let mut stream = ScriptedBytes::new(&[0x30, 0x81, 0x05]);
-
-		let result = AsyncProtocolStream::read_frame(&mut stream, None).await;
+		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
 		assert!(matches!(result, Err(TransportError::InvalidMessage)));
 	}
 
 	#[tokio::test]
 	async fn blanket_rejects_indefinite_length() {
 		let mut stream = ScriptedBytes::new(&[0x30, 0x80]);
-
-		let result = AsyncProtocolStream::read_frame(&mut stream, None).await;
+		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
 		assert!(matches!(result, Err(TransportError::InvalidMessage)));
 	}
 
 	#[tokio::test]
 	async fn blanket_rejects_over_cap_before_reading_content() {
 		let mut stream = ScriptedBytes::new(&[0x30, 0x82, 0x01, 0x00]);
-
-		let result = AsyncProtocolStream::read_frame(&mut stream, Some(64)).await;
+		let result = AsyncProtocolStream::read_frame(&mut stream, 64).await;
 		assert!(matches!(
 			result,
 			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
@@ -459,8 +429,7 @@ mod tests {
 	#[tokio::test]
 	async fn boundary_eof_maps_to_connection_closed() {
 		let mut stream = ScriptedBytes::new(&[]);
-
-		let result = AsyncProtocolStream::read_frame(&mut stream, None).await;
+		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
 		assert!(matches!(result, Err(TransportError::ConnectionClosed)));
 	}
 
@@ -469,29 +438,15 @@ mod tests {
 		// Frame promises three content bytes, delivers one: EOF mid-frame
 		// is truncation, not a clean close.
 		let mut stream = ScriptedBytes::new(&[0x30, 0x03, 0x01]);
-
-		let result = AsyncProtocolStream::read_frame(&mut stream, None).await;
+		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
 		assert!(matches!(result, Err(TransportError::InvalidMessage)));
 	}
 
 	#[tokio::test]
 	async fn blanket_write_frame_passes_bytes_through() -> Result<(), TransportError> {
 		let mut stream = ScriptedBytes::new(&[]);
-
 		AsyncProtocolStream::write_frame(&mut stream, &[0x30, 0x01, 0xFF]).await?;
 		assert_eq!(stream.written, vec![0x30, 0x01, 0xFF]);
 		Ok(())
-	}
-
-	#[test]
-	fn frame_cap_guards_returned_buffers() {
-		let oversized = vec![0u8; 64 + DER_HEADER_MAX + 1];
-
-		assert!(matches!(
-			enforce_frame_cap(&oversized, Some(64)),
-			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
-		));
-		assert!(enforce_frame_cap(&oversized, None).is_ok());
-		assert!(enforce_frame_cap(&[0u8; 8], Some(64)).is_ok());
 	}
 }

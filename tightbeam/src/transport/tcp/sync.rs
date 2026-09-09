@@ -30,7 +30,8 @@ use crate::transport::handshake::{
 	BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
 };
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr, HANDSHAKE_MAX_WIRE};
+use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
+use crate::transport::TransportLimits;
 use crate::transport::{
 	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageEmitter, MessageIO, Protocol, ResponsePackage,
 	TransportEncryptionConfig, TransportResult,
@@ -50,7 +51,7 @@ mod policy {
 	pub use crate::policy::TransitStatus;
 	pub use crate::transport::error::TransportError;
 	pub use crate::transport::policy::RestartPolicy;
-	pub use crate::transport::{EnvelopeBuilder, EnvelopeLimits, ProtocolStream};
+	pub use crate::transport::{EnvelopeBuilder, ProtocolStream};
 }
 
 #[cfg(feature = "transport-policy")]
@@ -105,11 +106,11 @@ where
 		let deadline = if handshake_pending {
 			match self.to_handshake_state() {
 				TcpHandshakeState::AwaitingServerResponse { initiated_at }
-				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.handshake_timeout),
-				_ => Some(Instant::now() + self.handshake_timeout),
+				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.limits.handshake_timeout),
+				_ => Some(Instant::now() + self.limits.handshake_timeout),
 			}
 		} else {
-			Some(Instant::now() + self.operation_timeout)
+			Some(Instant::now() + self.limits.operation_timeout)
 		};
 
 		let result = (|| -> TransportResult<Vec<u8>> {
@@ -153,11 +154,9 @@ where
 			// tight handshake cap, established sessions the envelope limits.
 			{
 				let max_allowed = if handshake_pending {
-					HANDSHAKE_MAX_WIRE
+					self.limits.handshake_wire
 				} else {
-					self.max_encrypted_envelope
-						.or(self.max_cleartext_envelope)
-						.unwrap_or(512 * 1024)
+					self.limits.max_envelope()
 				};
 
 				if content_length > max_allowed {
@@ -210,7 +209,7 @@ where
 
 	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		#[cfg(feature = "std")]
-		self.stream.set_timeout(Some(self.operation_timeout))?;
+		self.stream.set_timeout(Some(self.limits.operation_timeout))?;
 
 		let result = self.stream.write_all(buffer);
 
@@ -239,8 +238,7 @@ where
 
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
-		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
-		let builder = limits.apply(EnvelopeBuilder::response(response_pkg));
+		let builder = EnvelopeBuilder::response(response_pkg).with_limits(self.limits);
 		let builder = self.apply_wire_mode(builder)?;
 
 		let wire_envelope = builder.build()?;
@@ -274,7 +272,7 @@ where
 
 		#[cfg(feature = "std")]
 		{
-			self.stream.set_timeout(Some(self.operation_timeout))?;
+			self.stream.set_timeout(Some(self.limits.operation_timeout))?;
 
 			let result = self.perform_emit_cycle(message).await;
 			let _ = self.stream.set_timeout(None);
@@ -306,10 +304,9 @@ pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoPro
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	aad_domain_tag: Option<&'static [u8]>,
-	max_cleartext_envelope: Option<usize>,
-	max_encrypted_envelope: Option<usize>,
+	/// Every ceiling handed to each accepted transport.
+	limits: TransportLimits,
 	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
-	handshake_timeout: Option<Duration>,
 }
 
 #[cfg(feature = "std")]
@@ -336,10 +333,8 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<NetTcpListener, P
 				#[cfg(feature = "x509")]
 				client_validators: None,
 				aad_domain_tag: None,
-				max_cleartext_envelope: None,
-				max_encrypted_envelope: None,
+				limits: TransportLimits::default(),
 				key_manager: None,
-				handshake_timeout: None,
 			},
 			TightBeamSocketAddr(bound_addr),
 		))
@@ -367,10 +362,8 @@ where
 			#[cfg(feature = "x509")]
 			client_validators: None,
 			aad_domain_tag: None,
-			max_cleartext_envelope: None,
-			max_encrypted_envelope: None,
+			limits: TransportLimits::default(),
 			key_manager: None,
-			handshake_timeout: None,
 		}
 	}
 
@@ -388,15 +381,7 @@ where
 			if let Some(aad) = self.aad_domain_tag {
 				transport.aad_domain_tag = Some(aad);
 			}
-			if let Some(max) = self.max_cleartext_envelope {
-				transport.max_cleartext_envelope = Some(max);
-			}
-			if let Some(max) = self.max_encrypted_envelope {
-				transport.max_encrypted_envelope = Some(max);
-			}
-			if let Some(timeout) = self.handshake_timeout {
-				transport.handshake_timeout = timeout;
-			}
+			transport.limits = self.limits;
 		}
 
 		if let Some(ref signatory) = self.key_manager {
@@ -428,11 +413,9 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<NetTcpLi
 				#[cfg(feature = "x509")]
 				client_validators,
 				aad_domain_tag: Some(config.aad_domain_tag),
-				max_cleartext_envelope: Some(config.max_cleartext_envelope),
-				max_encrypted_envelope: Some(config.max_encrypted_envelope),
+				limits: config.limits,
 
 				key_manager: Some(key_manager),
-				handshake_timeout: Some(config.handshake_timeout),
 			},
 			TightBeamSocketAddr(bound_addr),
 		))
@@ -507,7 +490,7 @@ mod tests {
 			let (stream, _) = listener.accept()?;
 			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::from(stream);
 			transport.client_validators = Some(Arc::new(Vec::new()));
-			transport.handshake_timeout = Duration::from_millis(250);
+			transport.limits.handshake_timeout = Duration::from_millis(250);
 
 			let rt = tokio::runtime::Runtime::new()?;
 			let started = Instant::now();

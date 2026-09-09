@@ -5,4 +5,4 @@
 
 pub mod envelope;
 
-pub use envelope::{EnvelopeBuilder, EnvelopeLimits};
+pub use envelope::EnvelopeBuilder;

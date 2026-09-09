@@ -456,6 +456,18 @@ pub const DEFAULT_OPERATION_TIMEOUT: core::time::Duration = core::time::Duration
 /// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
 pub const DEFAULT_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
 
+/// Default ceiling in bytes for one handshake-phase message on the wire.
+///
+/// A handshake message carries certificates, a key share, and a signature. It
+/// is bounded far below a data envelope so an unauthenticated peer cannot make
+/// this endpoint buffer a large allocation before proving its identity.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const DEFAULT_HANDSHAKE_MAX_WIRE: usize = 16 * 1024;
+
 /// Default ceiling for decompressed message bodies (16 MiB)
 ///
 /// Compressed frame bodies arrive under the transport's envelope ceiling.
@@ -483,6 +495,20 @@ pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 /// - CWE-770, allocation of resources without limits or throttling:
 ///   <https://cwe.mitre.org/data/definitions/770.html>
 pub const MAX_MUX_REASSEMBLY_BYTES: usize = DEFAULT_MAX_DECOMPRESSED_LEN;
+
+/// Reassembly bytes one connection may buffer across every open stream.
+///
+/// [`MAX_MUX_REASSEMBLY_BYTES`] bounds a single stream. A peer that opens many
+/// streams multiplies it, so the connection carries this ceiling as well and
+/// every stream charges against it. A connection legitimately reassembling
+/// several streams at once stays inside four stream ceilings. Beyond that the
+/// peer is spending this endpoint's memory rather than making progress.
+///
+/// # Sources
+///
+/// - CWE-770, allocation of resources without limits or throttling:
+///   <https://cwe.mitre.org/data/definitions/770.html>
+pub const MAX_MUX_CONNECTION_REASSEMBLY_BYTES: usize = 4 * MAX_MUX_REASSEMBLY_BYTES;
 
 /// Ceiling on servlet types carried in one peer advertisement
 ///

@@ -72,11 +72,12 @@ macro_rules! test_job {
 		job: $job:expr,
 		assertions: |$frame:ident| async move $assertions:block
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test]
-		async fn $test_name() -> ::core::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
-			let $frame = $job;
-			$assertions
+		$crate::__tb_if_tokio! {
+			#[tokio::test]
+			async fn $test_name() -> ::core::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
+				let $frame = $job;
+				$assertions
+			}
 		}
 	};
 }

@@ -333,7 +333,12 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario! {
 			fuzz: afl,
 			csp: $csp_type,
-			config: $crate::testing::ScenarioConfig::builder().with_spec(<$spec>::latest()).build(),
+			// The oracle uses the type to pick events. Layer 2 verification
+			// reads `config.csp()`, so a config without it grades nothing.
+			config: $crate::testing::ScenarioConfig::builder()
+				.with_spec(<$spec>::latest())
+				.with_csp(<$csp_type as ::core::default::Default>::default())
+				.build(),
 			$($rest)*
 		}
 	};
@@ -654,14 +659,15 @@ macro_rules! tb_scenario {
 		}
 		$(,)?
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test]
-		async fn $test_name() {
-			$crate::tb_scenario!(@run_bare_async
-				config: $config,
-				context: [ $($context)? ],
-				exec: |$env| async move $exec_body
-			)
+		$crate::__tb_if_tokio! {
+			#[tokio::test]
+			async fn $test_name() {
+				$crate::tb_scenario!(@run_bare_async
+					config: $config,
+					context: [ $($context)? ],
+					exec: |$env| async move $exec_body
+				)
+			}
 		}
 	};
 
@@ -717,15 +723,16 @@ macro_rules! tb_scenario {
 		}
 		$(,)?
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test]
-		async fn $test_name() {
-			$crate::tb_scenario!(@run_worker
-				config: $config,
-				context: [ $($context)? ],
-				setup: $setup_closure,
-				stimulus: $stimulus_closure
-			)
+		$crate::__tb_if_tokio! {
+			#[tokio::test]
+			async fn $test_name() {
+				$crate::tb_scenario!(@run_worker
+					config: $config,
+					context: [ $($context)? ],
+					setup: $setup_closure,
+					stimulus: $stimulus_closure
+				)
+			}
 		}
 	};
 
@@ -736,16 +743,17 @@ macro_rules! tb_scenario {
 		environment Servlet { $($env_body:tt)* }
 		$(,)?
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test]
-		async fn $test_name() {
-			let config = $config;
-			let trace = config.trace();
-			$crate::tb_scenario!(@run_servlet
-				config: config,
-				trace: trace,
-				environment Servlet { $($env_body)* }
-			)
+		$crate::__tb_if_tokio! {
+			#[tokio::test]
+			async fn $test_name() {
+				let config = $config;
+				let trace = config.trace();
+				$crate::tb_scenario!(@run_servlet
+					config: config,
+					trace: trace,
+					environment Servlet { $($env_body)* }
+				)
+			}
 		}
 	};
 
@@ -761,15 +769,16 @@ macro_rules! tb_scenario {
 		}
 		$(,)?
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
-		async fn $test_name() {
-			$crate::tb_scenario!(@run_service_client
-				config: $config,
-				context: [ $($context)? ],
-				server: $server_closure,
-				client: $client_closure
-			)
+		$crate::__tb_if_tokio! {
+			#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
+			async fn $test_name() {
+				$crate::tb_scenario!(@run_service_client
+					config: $config,
+					context: [ $($context)? ],
+					server: $server_closure,
+					client: $client_closure
+				)
+			}
 		}
 	};
 
@@ -784,15 +793,16 @@ macro_rules! tb_scenario {
 		}
 		$(,)?
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test]
-		async fn $test_name() {
-			$crate::tb_scenario!(@run_service_client
-				config: $config,
-				context: [ $($context)? ],
-				server: $server_closure,
-				client: $client_closure
-			)
+		$crate::__tb_if_tokio! {
+			#[tokio::test]
+			async fn $test_name() {
+				$crate::tb_scenario!(@run_service_client
+					config: $config,
+					context: [ $($context)? ],
+					server: $server_closure,
+					client: $client_closure
+				)
+			}
 		}
 	};
 
@@ -808,19 +818,20 @@ macro_rules! tb_scenario {
 		}
 		$(,)?
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test]
-		async fn $test_name() {
-			let config = $config;
-			let trace = config.trace();
-			$crate::tb_scenario!(@run_cluster
-				config: config,
-				trace: trace,
-				context: [ $($context)? ],
-				start: $start_closure,
-				hives: [ $($hives_closure)? ],
-				client: $client_closure
-			)
+		$crate::__tb_if_tokio! {
+			#[tokio::test]
+			async fn $test_name() {
+				let config = $config;
+				let trace = config.trace();
+				$crate::tb_scenario!(@run_cluster
+					config: config,
+					trace: trace,
+					context: [ $($context)? ],
+					start: $start_closure,
+					hives: [ $($hives_closure)? ],
+					client: $client_closure
+				)
+			}
 		}
 	};
 
@@ -835,18 +846,19 @@ macro_rules! tb_scenario {
 		}
 		$(,)?
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test]
-		async fn $test_name() {
-			let config = $config;
-			let trace = config.trace();
-			$crate::tb_scenario!(@run_hive
-				config: config,
-				trace: trace,
-				context: [ $($context)? ],
-				start: $start_closure,
-				client: $client_closure
-			)
+		$crate::__tb_if_tokio! {
+			#[tokio::test]
+			async fn $test_name() {
+				let config = $config;
+				let trace = config.trace();
+				$crate::tb_scenario!(@run_hive
+					config: config,
+					trace: trace,
+					context: [ $($context)? ],
+					start: $start_closure,
+					client: $client_closure
+				)
+			}
 		}
 	};
 

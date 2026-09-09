@@ -52,6 +52,7 @@ macro_rules! __tb_require_std {
 #[doc(hidden)]
 macro_rules! __tb_if_tokio {
 	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
 }
 
 #[cfg(not(feature = "tokio"))]
@@ -59,6 +60,91 @@ macro_rules! __tb_if_tokio {
 #[doc(hidden)]
 macro_rules! __tb_if_tokio {
 	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "testing-timing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_timing {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "testing-timing"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_timing {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "testing-schedulability")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_schedulability {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "testing-schedulability"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_schedulability {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "testing-fault")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_fault {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "testing-fault"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_fault {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "instrument")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_instrument {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "instrument"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_instrument {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+// Picks one of two statement sequences on the `testing-fault` feature.
+//
+// Unlike the `__tb_if_*` helpers this emits the chosen tokens bare rather than
+// wrapped in a block, because both alternatives are `let` bindings the
+// surrounding code goes on to use, and one of them borrows a temporary whose
+// lifetime a block would end.
+#[cfg(feature = "testing-fault")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_testing_fault {
+	({ $($with_fault:tt)* } { $($without_fault:tt)* }) => { $($with_fault)* };
+}
+
+#[cfg(not(feature = "testing-fault"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_testing_fault {
+	({ $($with_fault:tt)* } { $($without_fault:tt)* }) => { $($without_fault)* };
 }
 
 // Harness-feature delegation for `tb_scenario!`. The generated scenario body
@@ -70,6 +156,8 @@ macro_rules! __tb_if_tokio {
 #[doc(hidden)]
 macro_rules! __tb_if_testing_csp {
 	({ $($body:tt)* }) => { { $($body)* } };
+	// Item form: an `impl` block cannot be produced by the expression form.
+	($($body:tt)*) => { $($body)* };
 }
 
 #[cfg(not(feature = "testing-csp"))]
@@ -77,6 +165,7 @@ macro_rules! __tb_if_testing_csp {
 #[doc(hidden)]
 macro_rules! __tb_if_testing_csp {
 	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
 }
 
 #[cfg(feature = "testing-fdr")]
@@ -84,6 +173,7 @@ macro_rules! __tb_if_testing_csp {
 #[doc(hidden)]
 macro_rules! __tb_if_testing_fdr {
 	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
 }
 
 #[cfg(not(feature = "testing-fdr"))]
@@ -91,6 +181,7 @@ macro_rules! __tb_if_testing_fdr {
 #[doc(hidden)]
 macro_rules! __tb_if_testing_fdr {
 	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
 }
 
 #[cfg(all(feature = "testing-fdr", feature = "testing-timing"))]
@@ -98,6 +189,7 @@ macro_rules! __tb_if_testing_fdr {
 #[doc(hidden)]
 macro_rules! __tb_if_testing_fdr_timing {
 	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
 }
 
 #[cfg(not(all(feature = "testing-fdr", feature = "testing-timing")))]
@@ -105,6 +197,7 @@ macro_rules! __tb_if_testing_fdr_timing {
 #[doc(hidden)]
 macro_rules! __tb_if_testing_fdr_timing {
 	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
 }
 
 #[cfg(feature = "builder")]

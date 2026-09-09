@@ -15,7 +15,8 @@ use core::mem;
 #[cfg(feature = "std")]
 use std::io::ErrorKind;
 
-use crate::transport::error::TransportError;
+use crate::transport::error::{TransportError, TransportFailure};
+use crate::transport::TransportResult;
 
 /// Shape of a DER length field, classified from its first octet.
 pub(crate) enum LengthForm {
@@ -65,6 +66,67 @@ pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<u
 	}
 
 	Some(length)
+}
+
+/// A DER frame header read from the wire, before any content is allocated.
+///
+/// The declared content length has not been checked against any ceiling, so
+/// this type offers no way to read it: the accessor lives on
+/// [`AdmittedHeader`].
+pub(crate) struct FrameHeader {
+	tag: u8,
+	length_first: u8,
+	length_octets: Vec<u8>,
+	declared_len: usize,
+}
+
+/// A frame header whose declared length has been checked against a ceiling.
+///
+/// [`AdmittedHeader::content_len`] is the only way to obtain a length to
+/// allocate with, so an allocation sized by an unchecked wire value cannot be
+/// written (CWE-770).
+pub(crate) struct AdmittedHeader {
+	header: FrameHeader,
+}
+
+impl FrameHeader {
+	/// Parse a tag and length field into a header.
+	///
+	/// # Errors
+	///
+	/// [`TransportError::InvalidMessage`] when the length field is
+	/// non-canonical or uses the BER indefinite form.
+	pub(crate) fn parse(tag: u8, length_first: u8, length_octets: Vec<u8>) -> TransportResult<Self> {
+		let declared_len = parse_der_length(length_first, &length_octets).ok_or(TransportError::InvalidMessage)?;
+		Ok(Self { tag, length_first, length_octets, declared_len })
+	}
+
+	/// Admit this header when its declared length fits within `cap`.
+	///
+	/// # Errors
+	///
+	/// [`TransportFailure::SizeExceeded`] when the declared length exceeds
+	/// `cap`. The refusal happens here, before the content is read or any
+	/// buffer is sized.
+	pub(crate) fn admit(self, cap: usize) -> TransportResult<AdmittedHeader> {
+		if self.declared_len > cap {
+			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
+		}
+
+		Ok(AdmittedHeader { header: self })
+	}
+}
+
+impl AdmittedHeader {
+	/// Content length that passed the ceiling check.
+	pub(crate) fn content_len(&self) -> usize {
+		self.header.declared_len
+	}
+
+	/// Rebuild the complete DER encoding from this header and its content.
+	pub(crate) fn reconstruct(&self, content: &[u8]) -> Vec<u8> {
+		reconstruct_der_encoding(self.header.tag, self.header.length_first, &self.header.length_octets, content)
+	}
 }
 
 impl TransportError {
