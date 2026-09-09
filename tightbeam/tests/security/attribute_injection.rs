@@ -115,14 +115,14 @@ tb_scenario! {
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?.to_der()?;
 			server.process_key_exchange(&key_exchange).await?;
 
-			let server_finished = server.build_server_finished().await?;
+			let server_finished = server.build_server_finished().await?.to_der()?;
 			client.process_server_finished(&server_finished)?;
 
 			// The MITM injects the duplicate on the wire.
-			let client_finished = client.build_client_finished().await?;
+			let client_finished = client.build_client_finished().await?.to_der()?;
 			let tampered = inject_duplicate_receipt_ack(&client_finished)?;
 
 			// Signature verification covers the signed attributes, so the

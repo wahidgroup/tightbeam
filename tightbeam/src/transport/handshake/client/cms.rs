@@ -8,7 +8,7 @@ use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 
 use crate::cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use crate::cms::content_info::CmsVersion;
-use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::cms::enveloped_data::{EnvelopedData, KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::cms::signed_data::{CertificateSet, EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::crypto::aead::{KeyInit, SessionKeys};
 use crate::crypto::hash::Digest;
@@ -46,6 +46,7 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Cms};
 use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_transcript_digest, validate_state};
+use crate::transport::handshake::HandshakeMessage;
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization,
 };
@@ -373,14 +374,11 @@ where
 	/// - `rng`: Optional CSPRNG for the ephemeral key, UKM, CEK, and content
 	///   nonce. `None` defaults to `OsRng`. Supply one on `no_std` targets
 	///   without an OS-backed `getrandom`.
-	///
-	/// # Returns
-	/// DER-encoded EnvelopedData
 	pub fn build_key_exchange(
 		&mut self,
 		session_key: ZeroizingBytes,
 		rng: Option<&mut dyn CryptoRngCore>,
-	) -> Result<Vec<u8>, HandshakeError> {
+	) -> Result<EnvelopedData, HandshakeError> {
 		// 1. Validate state and certificate
 		self.validate_key_exchange_prerequisites()?;
 
@@ -400,12 +398,14 @@ where
 		let kari_builder = self.build_kari_structure(sender_ephemeral, sender_pub_spki, server_public_key, rid, ukm)?;
 
 		// 6. Create EnvelopedData with optional security offer
-		let enveloped_data_der = self.build_enveloped_data(kari_builder, &session_key, rng)?;
+		let enveloped_data = self.build_enveloped_data(kari_builder, &session_key, rng)?;
 
-		// 7. Update transcript and state
+		// 7. Update transcript and state. The transcript covers the encoded
+		//    form, so it is built here.
+		let enveloped_data_der = enveloped_data.to_der()?;
 		self.finalize_key_exchange(&enveloped_data_der, session_key)?;
 
-		Ok(enveloped_data_der)
+		Ok(enveloped_data)
 	}
 
 	/// Process server Finished message (SignedData over transcript hash).
@@ -592,9 +592,9 @@ where
 
 	/// Build client Finished message (SignedData over transcript hash).
 	///
-	/// # Returns
-	/// DER-encoded SignedData
-	pub async fn build_client_finished(&mut self) -> Result<Vec<u8>, HandshakeError> {
+	/// The client Finished closes the client's side of the transcript, so the
+	/// transcript is already sealed when this runs.
+	pub async fn build_client_finished(&mut self) -> Result<SignedData, HandshakeError> {
 		// 1. Validate state
 		self.validate_client_finished_prerequisites()?;
 
@@ -612,12 +612,12 @@ where
 		let receipt_attrs = self.countersign_pending_receipt().await?;
 
 		// 6. Build SignedData structure
-		let signed_data_der = self.build_signed_data(transcript_hash, &signature_bytes, signer, receipt_attrs)?;
+		let signed_data = self.build_signed_data(transcript_hash, &signature_bytes, signer, receipt_attrs)?;
 
 		// 7. Transition state
 		self.finalize_client_finished()?;
 
-		Ok(signed_data_der)
+		Ok(signed_data)
 	}
 
 	/// Complete the handshake.
@@ -716,7 +716,7 @@ where
 		kari_builder: TightBeamKariBuilder<P>,
 		session_key: &[u8],
 		rng: &mut dyn CryptoRngCore,
-	) -> Result<Vec<u8>, HandshakeError> {
+	) -> Result<EnvelopedData, HandshakeError> {
 		let mut enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
 
 		// Add SecurityOffer as unprotected attribute if configured
@@ -730,8 +730,7 @@ where
 			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
 		}
 
-		let enveloped_data = enveloped_builder.build(session_key, None, Some(rng))?;
-		enveloped_data.to_der().map_err(Into::into)
+		enveloped_builder.build(session_key, None, Some(rng))
 	}
 
 	/// Encrypt an opaque payload to the server certificate as a
@@ -815,7 +814,7 @@ where
 		signature_bytes: &[u8],
 		signer: FinishedSigner,
 		unsigned_attrs: Option<Attributes>,
-	) -> Result<Vec<u8>, HandshakeError> {
+	) -> Result<SignedData, HandshakeError> {
 		let FinishedSigner { id, digest_alg, signature_alg } = signer;
 		let signer_info = SignerInfo {
 			version: CmsVersion::V1,
@@ -843,16 +842,14 @@ where
 			})
 			.transpose()?;
 
-		let signed_data = SignedData {
+		Ok(SignedData {
 			version: CmsVersion::V1,
 			digest_algorithms: vec![digest_alg].try_into()?,
 			encap_content_info,
 			certificates,
 			crls: None,
 			signer_infos: vec![signer_info].try_into()?,
-		};
-
-		signed_data.to_der().map_err(Into::into)
+		})
 	}
 
 	/// Finalize client finished by transitioning state and marking invariant.
@@ -923,26 +920,31 @@ where
 {
 	type Error = HandshakeError;
 
-	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<Vec<u8>, Self::Error>> {
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<HandshakeMessage, Self::Error>> {
 		Box::pin(async move {
 			// Fresh random session key per handshake: a constant key
 			// would make every session trivially decryptable (CWE-321).
 			let session_key = ZeroizingBytes::new(generate_nonce::<32>(None)?.to_vec());
-			self.build_key_exchange(session_key, None)
+			let key_exchange = self.build_key_exchange(session_key, None)?;
+			Ok(HandshakeMessage::EnvelopedData(Box::new(key_exchange)))
 		})
 	}
 
-	fn handle_response<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
-	where
-		'b: 'a,
-	{
+	fn handle_response<'a>(
+		&'a mut self,
+		msg: HandshakeMessage,
+	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, Self::Error>> {
 		Box::pin(async move {
+			// The CMS transcript covers the container DER, so the hash and
+			// the signature check read one encoded form.
+			let server_finished = msg.signed()?.to_der()?;
+
 			// Process server finished
-			self.process_server_finished(msg)?;
+			self.process_server_finished(&server_finished)?;
 
 			// Build client finished
 			let client_finished = self.build_client_finished().await?;
-			Ok(Some(client_finished))
+			Ok(Some(HandshakeMessage::SignedData(Box::new(client_finished))))
 		})
 	}
 
@@ -1016,7 +1018,6 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::{extract_security_accept_attr, CmsHandshakeClient, SignedData};
-	use crate::cms::enveloped_data::EnvelopedData;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::profiles::DefaultCryptoProvider;
@@ -1054,13 +1055,12 @@ mod tests {
 
 		// When: Client builds a valid key exchange
 		let session_key = [2u8; 32];
-		let key_exchange = client.build_key_exchange(ZeroizingBytes::new(session_key.to_vec()), None)?;
+		let enveloped_data = client.build_key_exchange(ZeroizingBytes::new(session_key.to_vec()), None)?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		// Verify session key is stored
 		assert!(client.session_key().is_some());
 
 		// Then: Server should be able to decrypt it using the matching private key
-		let enveloped_data = EnvelopedData::from_der(&key_exchange)?;
 		let server_secret = SecretKey::from(server_test_cert.signing_key.to_owned());
 		let provider = DefaultCryptoProvider::default();
 		let kari_processor = TightBeamKariRecipient::new(provider, server_secret);

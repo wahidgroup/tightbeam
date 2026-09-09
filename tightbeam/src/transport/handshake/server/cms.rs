@@ -56,6 +56,7 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::state::{Cms, ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_transcript_digest, validate_state};
+use crate::transport::handshake::HandshakeMessage;
 use crate::transport::handshake::ServerHandshakeProtocol;
 use crate::transport::handshake::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::utils::marker::MaybeSendFuture;
@@ -573,7 +574,7 @@ where
 		signer_id: SignerIdentifier,
 		digest_alg: AlgorithmIdentifierOwned,
 		signature_alg: AlgorithmIdentifierOwned,
-	) -> Result<Vec<u8>, HandshakeError> {
+	) -> Result<SignedData, HandshakeError> {
 		let signer_info = SignerInfo {
 			version: CmsVersion::V1,
 			sid: signer_id,
@@ -590,16 +591,14 @@ where
 		let econtent_any = Any::from_der(&econtent_der)?;
 		let encap_content_info = EncapsulatedContentInfo { econtent_type: DATA, econtent: Some(econtent_any) };
 
-		let signed_data = SignedData {
+		Ok(SignedData {
 			version: CmsVersion::V1,
 			digest_algorithms: vec![digest_alg].try_into()?,
 			encap_content_info,
 			certificates: None,
 			crls: None,
 			signer_infos: vec![signer_info].try_into()?,
-		};
-
-		Ok(signed_data.to_der()?)
+		})
 	}
 
 	/// Finalize server finished by updating transcript and transitioning state.
@@ -651,10 +650,7 @@ where
 	}
 
 	/// Build server Finished message (SignedData over transcript hash).
-	///
-	/// # Returns
-	/// DER-encoded SignedData
-	pub async fn build_server_finished(&mut self) -> Result<Vec<u8>, HandshakeError> {
+	pub async fn build_server_finished(&mut self) -> Result<SignedData, HandshakeError> {
 		// 1. Validate state
 		self.validate_server_finished_prerequisites()?;
 
@@ -673,13 +669,15 @@ where
 
 		// 6. Build SignedData structure
 		let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidTranscriptHash)?;
-		let signed_data_der =
+		let signed_data =
 			self.build_server_signed_data(transcript_hash, &signature_bytes, signer_id, digest_alg, signature_alg)?;
 
-		// 7. Finalize by updating transcript and state
+		// 7. Finalize by updating transcript and state. The transcript covers
+		//    the encoded form, so it is built here.
+		let signed_data_der = signed_data.to_der()?;
 		self.finalize_server_finished(&signed_data_der)?;
 
-		Ok(signed_data_der)
+		Ok(signed_data)
 	}
 
 	/// Process client Finished message (SignedData over transcript hash).
@@ -935,25 +933,26 @@ where
 {
 	type Error = HandshakeError;
 
-	fn handle_request<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
-	where
-		'b: 'a,
-	{
+	fn handle_request<'a>(
+		&'a mut self,
+		msg: HandshakeMessage,
+	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, Self::Error>> {
 		Box::pin(async move {
-			// Determine which message type this is based on state
+			// The CMS transcript covers the container DER, so each step encodes
+			// the container it accepts.
 			match self.state() {
 				ServerHandshakeState::Init => {
-					// This is KeyExchange (EnvelopedData) - process and send ServerFinished
-					self.process_key_exchange(msg).await?;
+					let key_exchange = msg.enveloped()?.to_der()?;
+					self.process_key_exchange(&key_exchange).await?;
 					let server_finished = self.build_server_finished().await?;
-					Ok(Some(server_finished))
+					Ok(Some(HandshakeMessage::SignedData(Box::new(server_finished))))
 				}
 				ServerHandshakeState::ServerFinishedSent => {
-					// This is ClientFinished (SignedData) - no response needed.
-					// The receipt countersignature verifies and settles before
-					// the session can activate.
-					self.process_client_finished(msg)?;
-					self.process_receipt_ack(msg).await?;
+					// No response is due. The receipt countersignature verifies
+					// and settles before the session can activate.
+					let client_finished = msg.signed()?.to_der()?;
+					self.process_client_finished(&client_finished)?;
+					self.process_receipt_ack(&client_finished).await?;
 					Ok(None)
 				}
 				_ => Err(HandshakeError::InvalidState),

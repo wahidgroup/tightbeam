@@ -1,4 +1,10 @@
 pub type Result<T> = core::result::Result<T, CertificateValidationError>;
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
 use crate::Errorizable;
 
 /// Errors specific to X.509 certificate validation
@@ -64,9 +70,10 @@ pub enum CertificateValidationError {
 	#[error("Certificate not trusted")]
 	CertificateNotTrusted,
 
-	/// Invalid certificate chain (broken chain or untrusted root)
-	#[error("Invalid certificate chain")]
-	InvalidChain,
+	/// Invalid certificate chain: a certificate's issuer does not name the
+	/// subject of the certificate above it.
+	#[error("Certificate chain broken: issuer {issuer} does not match subject {subject}")]
+	InvalidChain { issuer: String, subject: String },
 
 	/// Empty certificate chain provided
 	#[error("Empty certificate chain")]
@@ -77,8 +84,10 @@ pub enum CertificateValidationError {
 	UnsupportedOperation,
 
 	/// Certificates with different fingerprints have the same SKID
-	#[error("SKID collision detected")]
-	SkidCollision,
+	///
+	/// Carries the colliding key identifier, so the store entry can be found.
+	#[error("SKID collision: two certificates share key identifier {skid}")]
+	SkidCollision { skid: String },
 
 	/// Configured digest produces fewer than the 20 bytes required for a SKID
 	#[error("Digest output too short for SKID")]

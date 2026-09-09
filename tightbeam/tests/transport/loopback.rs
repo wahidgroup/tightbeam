@@ -34,6 +34,7 @@ use tightbeam::{
 };
 
 #[cfg(feature = "transport-cms")]
+use tightbeam::transport::handshake::HandshakeMessage;
 use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 
 use crate::common::security::{default_security_profile, expectation_failure, ServerMaterials};
@@ -159,13 +160,13 @@ where
 }
 
 /// Require a handshake reply and convert a missing reply into an expectation failure.
-fn require_reply(reply: Option<Vec<u8>>, msg: &'static str) -> Result<Vec<u8>, TightBeamError> {
-	let bytes = reply.ok_or_else(|| expectation_failure(msg))?;
-	Ok(bytes)
+fn require_reply(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<HandshakeMessage, TightBeamError> {
+	let message = reply.ok_or_else(|| expectation_failure(msg))?;
+	Ok(message)
 }
 
 /// Protocol step that must produce no further reply.
-fn require_terminal(reply: Option<Vec<u8>>, msg: &'static str) -> Result<(), TightBeamError> {
+fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<(), TightBeamError> {
 	if reply.is_some() {
 		return Err(expectation_failure(msg));
 	}
@@ -190,13 +191,13 @@ async fn ecies_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> 
 
 	// ClientHello -> ServerHandshake -> ClientKeyExchange -> (no reply)
 	let client_hello = ClientHandshakeProtocol::start(&mut client).await?;
-	let server_reply = server.handle_request(&client_hello).await?;
+	let server_reply = server.handle_request(client_hello).await?;
 	let server_handshake = require_reply(server_reply, "ECIES server must answer ClientHello")?;
 
-	let client_reply = client.handle_response(&server_handshake).await?;
+	let client_reply = client.handle_response(server_handshake).await?;
 	let client_kex = require_reply(client_reply, "ECIES client must answer ServerHandshake")?;
 
-	let no_reply = server.handle_request(&client_kex).await?;
+	let no_reply = server.handle_request(client_kex).await?;
 	require_terminal(no_reply, "ECIES server must not reply to ClientKeyExchange")?;
 
 	let events = (LOOPBACK_ECIES_COMPLETE, LOOPBACK_ECIES_ROUNDTRIP, LOOPBACK_ECIES_PROFILE_AGREED);
@@ -257,19 +258,19 @@ async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Re
 	// of the ECIES `confidentiality` threat test, exercised on the real
 	// random-key path (not the fixture's constant test key).
 	let session_key = session_key_bytes(&client, "CMS client must hold a session key after start")?;
-	if contains_window(&key_exchange, &session_key) {
+	if contains_window(&key_exchange.to_der()?, &session_key) {
 		return Err(expectation_failure(
 			"CMS session key must not appear in cleartext KeyExchange wire bytes",
 		));
 	}
 
-	let server_reply = server.handle_request(&key_exchange).await?;
+	let server_reply = server.handle_request(key_exchange).await?;
 	let server_finished = require_reply(server_reply, "CMS server must answer KeyExchange with ServerFinished")?;
 
-	let client_reply = client.handle_response(&server_finished).await?;
+	let client_reply = client.handle_response(server_finished).await?;
 	let client_finished = require_reply(client_reply, "CMS client must answer ServerFinished with ClientFinished")?;
 
-	let no_reply = server.handle_request(&client_finished).await?;
+	let no_reply = server.handle_request(client_finished).await?;
 	require_terminal(no_reply, "CMS server must not reply to ClientFinished")?;
 
 	let events = (LOOPBACK_CMS_COMPLETE, LOOPBACK_CMS_ROUNDTRIP, LOOPBACK_CMS_PROFILE_AGREED);

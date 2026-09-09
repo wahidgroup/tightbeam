@@ -84,6 +84,8 @@ pub enum TransportFailure {
 pub enum TransportError {
 	#[error("Connection closed gracefully")]
 	ConnectionClosed,
+	#[error("Peer closed the connection before the handshake completed")]
+	PeerClosedBeforeHandshake,
 	#[error("Connection failed")]
 	ConnectionFailed,
 	#[error("Send failed")]

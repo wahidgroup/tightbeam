@@ -83,8 +83,8 @@ mod x509 {
 		pub use crate::crypto::sign::Verifier;
 		pub use crate::spki::EncodePublicKey;
 		pub use crate::transport::handshake::{
-			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError, HandshakeProtocolKind,
-			ServerHandshakeProtocol,
+			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError, HandshakeMessage,
+			HandshakeProtocolKind, ServerHandshakeProtocol,
 		};
 		pub use crate::transport::state::SessionPhase;
 	}
@@ -101,7 +101,7 @@ mod x509 {
 		pub use crate::crypto::sign::SignatureEncoding;
 		pub use crate::der::oid::AssociatedOid;
 		pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
-		pub use crate::transport::handshake::{ClientHello, ClientKeyExchange, HandshakeFinalization, ServerHandshake};
+		pub use crate::transport::handshake::{HandshakeFinalization, ServerHandshake};
 
 		#[cfg(feature = "std")]
 		pub use crate::crypto::x509::policy::CertificateValidation;
@@ -423,6 +423,31 @@ pub trait EncryptedMessageIO: MessageIO {
 		TransportEnvelope::new_request(message)
 	}
 
+	/// Read one envelope, naming a close by the phase it interrupted.
+	///
+	/// The session phase already records whether a handshake is outstanding,
+	/// so it decides how an end of stream reads and every caller on this
+	/// session gets the same answer.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::PeerClosedBeforeHandshake`] -- the peer ended the
+	///   stream while a handshake was pending, so no session was agreed.
+	/// - [`TransportError::ConnectionClosed`] -- the peer ended the stream on a
+	///   session already agreed, whether cleartext or encrypted.
+	#[allow(async_fn_in_trait)]
+	async fn read_session_bytes(&mut self) -> TransportResult<Vec<u8>>
+	where
+		Self: EncryptedProtocolState,
+	{
+		match self.read_envelope_bytes().await {
+			Err(TransportError::ConnectionClosed) if self.session_phase().is_handshake_pending() => {
+				Err(TransportError::PeerClosedBeforeHandshake)
+			}
+			other => other,
+		}
+	}
+
 	/// Wrap and encrypt a message, returning WireEnvelope
 	/// Protocol-agnostic default implementation
 	///
@@ -611,24 +636,21 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 
 		// Step 1: Build and send client hello
-		let initial_message = client.build_client_hello()?;
-		if initial_message.len() > self.limits().handshake_wire {
+		let client_hello = client.build_client_hello()?;
+		let signed_data: SignedData = (&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
+		let initial_message = HandshakeMessage::SignedData(Box::new(signed_data));
+		if initial_message.encoded_len()? > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		let client_hello = ClientHello::from_der(&initial_message)?;
-		let signed_data: SignedData = (&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
-		let signed_data = Box::new(signed_data);
-		let initial_envelope = TransportEnvelope::SignedData(signed_data);
-
-		let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
+		let wire_envelope = WireEnvelope::Cleartext(initial_message.into());
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
 		self.begin_handshake();
 
 		// Step 2: Receive server response
-		let response_wire_bytes = self.read_envelope_bytes().await?;
+		let response_wire_bytes = self.read_session_bytes().await?;
 		if response_wire_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -651,18 +673,16 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 
 		// Step 3: Process server handshake
-		let next_message_bytes = client.process_server_handshake(&response_bytes).await?;
-		if next_message_bytes.len() > self.limits().handshake_wire {
+		let client_kex = client.process_server_handshake(&response_bytes).await?;
+
+		// Step 4: Send client key exchange
+		let enveloped_data: EnvelopedData = (&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
+		let next_message = HandshakeMessage::EnvelopedData(Box::new(enveloped_data));
+		if next_message.encoded_len()? > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		// Step 4: Send client key exchange
-		let client_kex = ClientKeyExchange::from_der(&next_message_bytes)?;
-		let enveloped_data: EnvelopedData = (&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
-		let enveloped_data = Box::new(enveloped_data);
-		let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
-
-		let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
+		let wire_envelope = WireEnvelope::Cleartext(next_message.into());
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Step 5: Complete handshake and role-map the directional session keys
@@ -765,33 +785,28 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Protocol-agnostic client handshake state machine: bytes in, bytes out.
 	///
-	/// The orchestrator produces and consumes raw handshake bytes; `kind`
-	/// maps them to and from their wire envelopes.
+	/// Handshake messages cross this seam as containers, so the driver needs no
+	/// per-protocol knowledge to move one.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
-	async fn drive_client_handshake(
-		&mut self,
-		kind: HandshakeProtocolKind,
-		mut orchestrator: BoxedClientHandshake,
-	) -> TransportResult<()>
+	async fn drive_client_handshake(&mut self, mut orchestrator: BoxedClientHandshake) -> TransportResult<()>
 	where
 		Self: Sized + MessageIO + EncryptedProtocolState,
 	{
 		// Step 1: Start handshake - get initial message
 		let initial_message = orchestrator.start().await?;
-		if initial_message.len() > self.limits().handshake_wire {
+		if initial_message.encoded_len()? > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		let initial_envelope = kind.wrap_client_start(&initial_message)?;
-		let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
+		let wire_envelope = WireEnvelope::Cleartext(initial_message.into());
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
 		self.begin_handshake();
 
 		// Step 2: Receive server response
-		let response_wire_bytes = self.read_envelope_bytes().await?;
+		let response_wire_bytes = self.read_session_bytes().await?;
 		if response_wire_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -806,22 +821,21 @@ pub trait EncryptedMessageIO: MessageIO {
 			}
 		};
 
-		let response_bytes = kind.unwrap_server_response(response_envelope)?;
-		if response_bytes.len() > self.limits().handshake_wire {
+		let response = HandshakeMessage::try_from(response_envelope)?;
+		if response.encoded_len()? > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
 
 		// Step 3: Handle server response - may return next message to send
-		let next_message = orchestrator.handle_response(&response_bytes).await?;
+		let next_message = orchestrator.handle_response(response).await?;
 
 		// Step 4: Send next message if any (multi-round support)
-		if let Some(msg_bytes) = next_message {
-			if msg_bytes.len() > self.limits().handshake_wire {
+		if let Some(next_message) = next_message {
+			if next_message.encoded_len()? > self.limits().handshake_wire {
 				return Err(TransportError::InvalidMessage);
 			}
 
-			let msg_envelope = kind.wrap_client_followup(&msg_bytes)?;
-			let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
+			let wire_envelope = WireEnvelope::Cleartext(next_message.into());
 			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 		}
 
@@ -888,7 +902,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			}
 		};
 
-		let outcome = self.drive_client_handshake(kind, orchestrator).await;
+		let outcome = self.drive_client_handshake(orchestrator).await;
 
 		#[cfg(feature = "instrument")]
 		self.emit_handshake_outcome(&outcome);
@@ -923,7 +937,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			HandshakeProtocolKind::Cms => self.build_cms_client_orchestrator()?,
 		};
 
-		let outcome = self.drive_client_handshake(kind, orchestrator).await;
+		let outcome = self.drive_client_handshake(orchestrator).await;
 
 		#[cfg(feature = "instrument")]
 		self.emit_handshake_outcome(&outcome);
@@ -988,28 +1002,26 @@ pub trait EncryptedMessageIO: MessageIO {
 		)?)
 	}
 
-	/// Protocol-agnostic server handshake state machine: bytes in, bytes out.
+	/// Protocol-agnostic server handshake state machine.
 	///
-	/// Assumes the persisted orchestrator exists; `kind` maps its response
-	/// bytes to their wire envelope.
+	/// Assumes the persisted orchestrator exists.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
-	async fn drive_server_handshake(&mut self, kind: HandshakeProtocolKind, request: &[u8]) -> TransportResult<()>
+	async fn drive_server_handshake(&mut self, request: HandshakeMessage) -> TransportResult<()>
 	where
 		Self: Sized + MessageIO + EncryptedProtocolState,
 	{
 		let orchestrator = self.to_server_handshake_mut().as_mut().ok_or(TransportError::InvalidState)?;
 		// Process client handshake message - may return response to send
-		let response_bytes = orchestrator.handle_request(request).await?;
+		let response = orchestrator.handle_request(request).await?;
 
 		// Send response if any (multi-round support)
-		if let Some(response) = response_bytes {
-			if response.len() > self.limits().handshake_wire {
+		if let Some(response) = response {
+			if response.encoded_len()? > self.limits().handshake_wire {
 				return Err(TransportError::InvalidMessage);
 			}
 
-			let server_envelope = kind.wrap_server_response(&response)?;
-			let wire_envelope = WireEnvelope::Cleartext(server_envelope);
+			let wire_envelope = WireEnvelope::Cleartext(response.into());
 			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 			self.begin_handshake();
@@ -1059,10 +1071,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 
 		let kind = self.to_handshake_protocol_kind();
-
-		// Parse the wire container and extract the raw handshake message
 		let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
-		let raw_message = kind.unwrap_client_request(&transport_envelope)?;
+		let request = HandshakeMessage::try_from(transport_envelope)?;
 
 		// Get or create handshake orchestrator (persists state across multiple messages)
 		if self.to_server_handshake_mut().is_none() {
@@ -1092,11 +1102,11 @@ pub trait EncryptedMessageIO: MessageIO {
 				return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 			}
 
-			timeout(remaining, self.drive_server_handshake(kind, &raw_message)).await?
+			timeout(remaining, self.drive_server_handshake(request)).await?
 		};
 
 		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
-		let outcome = self.drive_server_handshake(kind, &raw_message).await;
+		let outcome = self.drive_server_handshake(request).await;
 
 		#[cfg(feature = "instrument")]
 		self.emit_handshake_outcome(&outcome);
@@ -1128,10 +1138,8 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		let kind = self.to_handshake_protocol_kind();
 
-		// Parse the wire container and extract the raw handshake message.
-		// The Ecies kind fails closed inside unwrap_client_request.
 		let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
-		let raw_message = kind.unwrap_client_request(&transport_envelope)?;
+		let request = HandshakeMessage::try_from(transport_envelope)?;
 
 		// Get or create handshake orchestrator (persists state across multiple messages)
 		if self.to_server_handshake_mut().is_none() {
@@ -1156,11 +1164,11 @@ pub trait EncryptedMessageIO: MessageIO {
 				return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 			}
 
-			timeout(remaining, self.drive_server_handshake(kind, &raw_message)).await?
+			timeout(remaining, self.drive_server_handshake(request)).await?
 		};
 
 		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
-		let outcome = self.drive_server_handshake(kind, &raw_message).await;
+		let outcome = self.drive_server_handshake(request).await;
 
 		#[cfg(feature = "instrument")]
 		self.emit_handshake_outcome(&outcome);
@@ -1185,7 +1193,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_bytes).await?;
 
 		// Read and decrypt response
-		let response_bytes = self.read_envelope_bytes().await?;
+		let response_bytes = self.read_session_bytes().await?;
 		let response_envelope = self.decrypt_response(response_bytes).await?;
 
 		// Parse response
@@ -1276,6 +1284,17 @@ mod tests {
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::Version;
 
+	#[cfg(feature = "aead")]
+	use crate::crypto::aead::SessionKeys;
+	#[cfg(feature = "aead")]
+	use crate::transport::handshake::negotiation::MuxSettings;
+	#[cfg(feature = "aead")]
+	use crate::transport::handshake::HandshakeInstant;
+	#[cfg(feature = "aead")]
+	use crate::transport::TransportLimits;
+	#[cfg(feature = "aead")]
+	use crate::x509::Certificate;
+
 	fn frame_with_priority(version: Version) -> Frame {
 		let mut metadata = Metadata::default();
 		metadata.priority = Some(MessagePriority::Standard);
@@ -1293,6 +1312,115 @@ mod tests {
 
 		async fn write_envelope_bytes(&mut self, _buffer: &[u8]) -> TransportResult<()> {
 			Ok(())
+		}
+	}
+
+	/// Reads EOF on every call, with the session phase the case under test sets.
+	#[cfg(feature = "aead")]
+	struct ClosedStreamProbe {
+		phase: SessionPhase,
+		limits: TransportLimits,
+	}
+
+	#[cfg(feature = "aead")]
+	impl MessageIO for ClosedStreamProbe {
+		async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		async fn write_envelope_bytes(&mut self, _buffer: &[u8]) -> TransportResult<()> {
+			Ok(())
+		}
+	}
+
+	#[cfg(feature = "aead")]
+	impl EncryptedMessageIO for ClosedStreamProbe {}
+
+	#[cfg(feature = "aead")]
+	impl EncryptedProtocolState for ClosedStreamProbe {
+		type CryptoProvider = crate::crypto::profiles::DefaultCryptoProvider;
+
+		fn limits(&self) -> &TransportLimits {
+			&self.limits
+		}
+
+		fn session_phase(&self) -> &SessionPhase {
+			&self.phase
+		}
+
+		fn set_session_phase(&mut self, phase: SessionPhase) {
+			self.phase = phase;
+		}
+
+		fn is_client_validators_present(&self) -> bool {
+			false
+		}
+
+		fn to_server_certificate_ref(&self) -> Option<&Certificate> {
+			None
+		}
+
+		fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		fn to_mux_config(&self) -> Option<crate::transport::handshake::negotiation::TransportOffer> {
+			None
+		}
+
+		fn set_mux_settings(&mut self, _settings: Option<MuxSettings>) {}
+
+		fn set_peer_certificate(&mut self, _cert: Certificate) {}
+
+		fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
+			unreachable!("the probe drives no server handshake")
+		}
+	}
+
+	/// An end of stream reads differently either side of a handshake, and the
+	/// session phase is what separates the two. A session that already agreed
+	/// its terms reports an ordinary close, so a pool evicts the connection
+	/// rather than recording a handshake failure.
+	#[cfg(feature = "aead")]
+	#[tokio::test]
+	async fn a_close_is_named_by_the_phase_it_interrupts() {
+		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
+		use crate::der::oid::AssociatedOid;
+
+		let encrypted = SessionPhase::Encrypted(SessionKeys::for_client(
+			Aes256Gcm::new(&[0u8; 32].into()),
+			Aes256Gcm::new(&[1u8; 32].into()),
+			Aes256GcmOid::OID,
+		));
+
+		let handshaking = SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() };
+		let cases = [
+			("cleartext session", SessionPhase::Cleartext, TransportError::ConnectionClosed),
+			(
+				"provisioned, handshake not started",
+				SessionPhase::Provisioned,
+				TransportError::PeerClosedBeforeHandshake,
+			),
+			("handshake in flight", handshaking, TransportError::PeerClosedBeforeHandshake),
+			("established session", encrypted, TransportError::ConnectionClosed),
+		];
+
+		for (label, phase, expected) in cases {
+			let mut probe = ClosedStreamProbe { phase, limits: TransportLimits::default() };
+			let error = probe
+				.read_session_bytes()
+				.await
+				.expect_err("the probe always reads an end of stream");
+
+			assert_eq!(
+				core::mem::discriminant(&error),
+				core::mem::discriminant(&expected),
+				"{label}: expected {expected:?}, got {error:?}"
+			);
 		}
 	}
 

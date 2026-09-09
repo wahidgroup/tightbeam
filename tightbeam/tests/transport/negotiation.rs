@@ -26,6 +26,7 @@ use tightbeam::crypto::profiles::{
 };
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 use tightbeam::der::asn1::ObjectIdentifier;
+use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::oids::{AES_128_WRAP, AES_256_WRAP};
 use tightbeam::tb_assert_spec;
@@ -182,13 +183,13 @@ tb_scenario! {
 			)
 			.with_supported_profiles(server_profiles);
 
-			let client_hello = client.build_client_hello()?;
+			let client_hello = client.build_client_hello()?.to_der()?;
 			trace.event(CLIENT_HELLO_SENT)?;
 
-			let server_handshake = server.process_client_hello(&client_hello).await?;
+			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
 			trace.event(SERVER_HELLO_RECEIVED)?;
 
-			let client_kex = client.process_server_handshake(&server_handshake).await?;
+			let client_kex = client.process_server_handshake(&server_handshake).await?.to_der()?;
 			trace.event(CLIENT_KEX_SENT)?;
 
 			server.process_client_key_exchange(&client_kex).await?;

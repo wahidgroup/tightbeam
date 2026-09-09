@@ -10,6 +10,7 @@ use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use core::marker::PhantomData;
 
 use crate::asn1::OctetString;
+use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::{SignedData, SignerInfo};
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{KeyInit, SessionKeys};
@@ -37,6 +38,7 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Ecies};
 use crate::transport::handshake::utils::HandshakeOctets;
 use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
+use crate::transport::handshake::HandshakeMessage;
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake,
 };
@@ -294,7 +296,7 @@ where
 	///
 	/// # Returns
 	/// DER-encoded ClientHello
-	pub fn build_client_hello(&mut self) -> Result<Vec<u8>, HandshakeError> {
+	pub fn build_client_hello(&mut self) -> Result<ClientHello, HandshakeError> {
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::Init)?;
 
@@ -316,7 +318,7 @@ where
 
 		// Transition: mark hello sent
 		self.state.transition(ClientHandshakeState::HelloSent)?;
-		Ok(client_hello_der)
+		Ok(client_hello)
 	}
 
 	/// Process ServerHandshake message and build ClientKeyExchange.
@@ -325,8 +327,11 @@ where
 	/// - `server_handshake_der`: DER-encoded ServerHandshake from server
 	///
 	/// # Returns
-	/// DER-encoded ClientKeyExchange
-	pub async fn process_server_handshake(&mut self, server_handshake_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	/// The client key exchange to send next.
+	pub async fn process_server_handshake(
+		&mut self,
+		server_handshake_der: &[u8],
+	) -> Result<ClientKeyExchange, HandshakeError> {
 		// 1. Validation: must have sent hello
 		self.validate_expected_state(ClientHandshakeState::HelloSent)?;
 		let _client_random_check = self.client_random.ok_or(HandshakeError::InvalidState)?;
@@ -382,7 +387,7 @@ where
 		// 13. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
-		Ok(client_kex.to_der()?)
+		Ok(client_kex)
 	}
 
 	/// Validate server's profile selection against client's offer.
@@ -733,18 +738,28 @@ where
 {
 	type Error = HandshakeError;
 
-	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<Vec<u8>, Self::Error>> {
-		Box::pin(async move { self.build_client_hello() })
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<HandshakeMessage, Self::Error>> {
+		Box::pin(async move {
+			// ECIES tunnels its own messages: the hello travels signed.
+			let client_hello = self.build_client_hello()?;
+			let signed_data = SignedData::try_from(&client_hello)?;
+			Ok(HandshakeMessage::SignedData(Box::new(signed_data)))
+		})
 	}
 
-	fn handle_response<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
-	where
-		'b: 'a,
-	{
+	fn handle_response<'a>(
+		&'a mut self,
+		msg: HandshakeMessage,
+	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, Self::Error>> {
 		Box::pin(async move {
+			// ECIES tunnels its messages inside the containers.
+			let signed_data = msg.signed()?;
+			let server_handshake = ServerHandshake::try_from(&signed_data)?.to_der()?;
+
 			// Process server handshake and build client key exchange
-			let client_kex = self.process_server_handshake(msg).await?;
-			Ok(Some(client_kex))
+			let client_kex = self.process_server_handshake(&server_handshake).await?;
+			let enveloped_data = EnvelopedData::try_from(&client_kex)?;
+			Ok(Some(HandshakeMessage::EnvelopedData(Box::new(enveloped_data))))
 		})
 	}
 
@@ -831,7 +846,7 @@ mod tests {
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 
 		// When: Client builds client hello
-		let client_hello_der = client.build_client_hello()?;
+		let client_hello_der = client.build_client_hello()?.to_der()?;
 		assert_eq!(client.state(), ClientHandshakeState::HelloSent); // Hello sent
 		assert!(client.client_random.is_some());
 
@@ -854,14 +869,13 @@ mod tests {
 		let server_handshake_der =
 			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
 
-		// When: Client processes the server handshake
-		let client_kex_der = client.process_server_handshake(&server_handshake_der).await?;
+		// When: Client processes the server handshake. The test asserts on the
+		// state the call leaves behind, not on the message it returns.
+		client.process_server_handshake(&server_handshake_der).await?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		assert!(client.base_session_key.is_some());
 		assert!(client.transcript_hash.is_some());
 
-		// And: Client key exchange message is valid
-		let _client_kex = ClientKeyExchange::from_der(&client_kex_der)?;
 		// When: Client completes the handshake
 		let _session_key = client.complete()?;
 
@@ -877,7 +891,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_missing_validator_fails_closed() -> Result<(), Box<dyn Error>> {
 		let mut client = TestEciesClientBuilder::new().build();
-		let client_hello_der = client.build_client_hello()?;
+		let client_hello_der = client.build_client_hello()?.to_der()?;
 
 		let test_cert = create_test_certificate();
 		let server_random = generate_nonce::<32>(None)?;
@@ -956,7 +970,7 @@ mod tests {
 				client = client.with_security_offer(offer);
 			}
 
-			let hello = client.build_client_hello()?;
+			let hello = client.build_client_hello()?.to_der()?;
 			Ok((client, hello))
 		};
 

@@ -131,9 +131,9 @@ mod ecies {
 				.with_transport_authorizer(Arc::clone(&authorizer) as _)
 				.with_session_observer(Arc::clone(&observer) as Arc<dyn SessionObserver>);
 
-				let client_hello = client.build_client_hello()?;
-				let server_handshake = server.process_client_hello(&client_hello).await?;
-				let client_kex_der = client.process_server_handshake(&server_handshake).await?;
+				let client_hello = client.build_client_hello()?.to_der()?;
+				let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
+				let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
 
 				// Auth signature covers encrypted_data. Flip a ciphertext
 				// byte - the only wire handle a MITM has on the sealed ack.
@@ -254,13 +254,13 @@ mod cms {
 				let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 				let (mut client, mut server) = (pair.client, pair.server);
 
-				let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
+				let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?.to_der()?;
 				server.process_key_exchange(&key_exchange).await?;
 
-				let server_finished = server.build_server_finished().await?;
+				let server_finished = server.build_server_finished().await?.to_der()?;
 				client.process_server_finished(&server_finished)?;
 
-				let client_finished = client.build_client_finished().await?;
+				let client_finished = client.build_client_finished().await?.to_der()?;
 				// The MITM strips the acknowledgement on the wire.
 				let stripped = strip_receipt_ack(&client_finished)?;
 

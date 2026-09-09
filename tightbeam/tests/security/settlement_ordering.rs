@@ -134,9 +134,9 @@ tb_scenario! {
 			.with_transport_config(TransportOffer::mux(4))
 			.with_transport_authorizer(Arc::clone(&authorizer) as _);
 
-			let client_hello = client.build_client_hello()?;
-			let server_handshake = server.process_client_hello(&client_hello).await?;
-			let client_kex_der = client.process_server_handshake(&server_handshake).await?;
+			let client_hello = client.build_client_hello()?.to_der()?;
+			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
+			let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
 
 			// Confidentiality: the paying party's settlement answer is
 			// folded into the ECIES payload encrypted to the server, so the
