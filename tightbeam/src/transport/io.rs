@@ -423,14 +423,27 @@ pub trait EncryptedMessageIO: MessageIO {
 		TransportEnvelope::new_request(message)
 	}
 
-	/// Read one handshake message, naming a mid-handshake close.
+	/// Read one envelope, naming a close by the phase it interrupted.
 	///
-	/// [`TransportError::ConnectionClosed`] means an orderly end of stream,
-	/// which during a handshake it is not: no session was agreed.
+	/// The session phase already records whether a handshake is outstanding,
+	/// so it decides how an end of stream reads and every caller on this
+	/// session gets the same answer.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::PeerClosedBeforeHandshake`] -- the peer ended the
+	///   stream while a handshake was pending, so no session was agreed.
+	/// - [`TransportError::ConnectionClosed`] -- the peer ended the stream on a
+	///   session already agreed, whether cleartext or encrypted.
 	#[allow(async_fn_in_trait)]
-	async fn read_handshake_bytes(&mut self) -> TransportResult<Vec<u8>> {
+	async fn read_session_bytes(&mut self) -> TransportResult<Vec<u8>>
+	where
+		Self: EncryptedProtocolState,
+	{
 		match self.read_envelope_bytes().await {
-			Err(TransportError::ConnectionClosed) => Err(TransportError::PeerClosedBeforeHandshake),
+			Err(TransportError::ConnectionClosed) if self.session_phase().is_handshake_pending() => {
+				Err(TransportError::PeerClosedBeforeHandshake)
+			}
 			other => other,
 		}
 	}
@@ -637,7 +650,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.begin_handshake();
 
 		// Step 2: Receive server response
-		let response_wire_bytes = self.read_handshake_bytes().await?;
+		let response_wire_bytes = self.read_session_bytes().await?;
 		if response_wire_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -793,7 +806,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.begin_handshake();
 
 		// Step 2: Receive server response
-		let response_wire_bytes = self.read_handshake_bytes().await?;
+		let response_wire_bytes = self.read_session_bytes().await?;
 		if response_wire_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -1180,7 +1193,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_bytes).await?;
 
 		// Read and decrypt response
-		let response_bytes = self.read_handshake_bytes().await?;
+		let response_bytes = self.read_session_bytes().await?;
 		let response_envelope = self.decrypt_response(response_bytes).await?;
 
 		// Parse response
@@ -1271,6 +1284,17 @@ mod tests {
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::Version;
 
+	#[cfg(feature = "aead")]
+	use crate::crypto::aead::SessionKeys;
+	#[cfg(feature = "aead")]
+	use crate::transport::handshake::negotiation::MuxSettings;
+	#[cfg(feature = "aead")]
+	use crate::transport::handshake::HandshakeInstant;
+	#[cfg(feature = "aead")]
+	use crate::transport::TransportLimits;
+	#[cfg(feature = "aead")]
+	use crate::x509::Certificate;
+
 	fn frame_with_priority(version: Version) -> Frame {
 		let mut metadata = Metadata::default();
 		metadata.priority = Some(MessagePriority::Standard);
@@ -1288,6 +1312,115 @@ mod tests {
 
 		async fn write_envelope_bytes(&mut self, _buffer: &[u8]) -> TransportResult<()> {
 			Ok(())
+		}
+	}
+
+	/// Reads EOF on every call, with the session phase the case under test sets.
+	#[cfg(feature = "aead")]
+	struct ClosedStreamProbe {
+		phase: SessionPhase,
+		limits: TransportLimits,
+	}
+
+	#[cfg(feature = "aead")]
+	impl MessageIO for ClosedStreamProbe {
+		async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		async fn write_envelope_bytes(&mut self, _buffer: &[u8]) -> TransportResult<()> {
+			Ok(())
+		}
+	}
+
+	#[cfg(feature = "aead")]
+	impl EncryptedMessageIO for ClosedStreamProbe {}
+
+	#[cfg(feature = "aead")]
+	impl EncryptedProtocolState for ClosedStreamProbe {
+		type CryptoProvider = crate::crypto::profiles::DefaultCryptoProvider;
+
+		fn limits(&self) -> &TransportLimits {
+			&self.limits
+		}
+
+		fn session_phase(&self) -> &SessionPhase {
+			&self.phase
+		}
+
+		fn set_session_phase(&mut self, phase: SessionPhase) {
+			self.phase = phase;
+		}
+
+		fn is_client_validators_present(&self) -> bool {
+			false
+		}
+
+		fn to_server_certificate_ref(&self) -> Option<&Certificate> {
+			None
+		}
+
+		fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		fn to_mux_config(&self) -> Option<crate::transport::handshake::negotiation::TransportOffer> {
+			None
+		}
+
+		fn set_mux_settings(&mut self, _settings: Option<MuxSettings>) {}
+
+		fn set_peer_certificate(&mut self, _cert: Certificate) {}
+
+		fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
+			unreachable!("the probe drives no server handshake")
+		}
+	}
+
+	/// An end of stream reads differently either side of a handshake, and the
+	/// session phase is what separates the two. A session that already agreed
+	/// its terms reports an ordinary close, so a pool evicts the connection
+	/// rather than recording a handshake failure.
+	#[cfg(feature = "aead")]
+	#[tokio::test]
+	async fn a_close_is_named_by_the_phase_it_interrupts() {
+		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
+		use crate::der::oid::AssociatedOid;
+
+		let encrypted = SessionPhase::Encrypted(SessionKeys::for_client(
+			Aes256Gcm::new(&[0u8; 32].into()),
+			Aes256Gcm::new(&[1u8; 32].into()),
+			Aes256GcmOid::OID,
+		));
+
+		let handshaking = SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() };
+		let cases = [
+			("cleartext session", SessionPhase::Cleartext, TransportError::ConnectionClosed),
+			(
+				"provisioned, handshake not started",
+				SessionPhase::Provisioned,
+				TransportError::PeerClosedBeforeHandshake,
+			),
+			("handshake in flight", handshaking, TransportError::PeerClosedBeforeHandshake),
+			("established session", encrypted, TransportError::ConnectionClosed),
+		];
+
+		for (label, phase, expected) in cases {
+			let mut probe = ClosedStreamProbe { phase, limits: TransportLimits::default() };
+			let error = probe
+				.read_session_bytes()
+				.await
+				.expect_err("the probe always reads an end of stream");
+
+			assert_eq!(
+				core::mem::discriminant(&error),
+				core::mem::discriminant(&expected),
+				"{label}: expected {expected:?}, got {error:?}"
+			);
 		}
 	}
 

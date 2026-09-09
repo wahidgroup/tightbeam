@@ -479,6 +479,7 @@ impl MuxShared {
 			for waker in stream.credit_wakers {
 				waker.wake();
 			}
+
 			Self::wake_on_quiesce(state);
 		}
 	}
@@ -622,6 +623,7 @@ impl MuxShared {
 		}
 
 		stream.limit = limit;
+
 		for waker in stream.credit_wakers.drain(..) {
 			waker.wake();
 		}
