@@ -561,41 +561,47 @@ macro_rules! tb_scenario {
 		@$run:ident
 		$($run_body:tt)*
 	) => {
-		#[cfg(all(fuzzing, feature = "tokio"))]
-		fn main() {
-			afl::fuzz!(|data: &[u8]| {
-				let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-					return;
-				};
-				runtime.block_on(async {
+		// `fuzzing` stays a consumer cfg: the fuzz target is the crate built
+		// with `--cfg fuzzing`. Only the feature test belongs to tightbeam.
+		$crate::__tb_select_tokio! {
+			{
+				#[cfg(fuzzing)]
+				fn main() {
+					afl::fuzz!(|data: &[u8]| {
+						let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+							return;
+						};
+						runtime.block_on(async {
+							let process = <$csp_type>::process();
+							let config = $config;
+							let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
+							$crate::tb_scenario!(@$run
+								config: config,
+								trace: trace,
+								$($run_body)*
+							)
+						});
+					});
+				}
+
+				#[cfg(not(fuzzing))]
+				#[tokio::main]
+				async fn main() {
 					let process = <$csp_type>::process();
 					let config = $config;
-					let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
+					let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
 					$crate::tb_scenario!(@$run
 						config: config,
 						trace: trace,
 						$($run_body)*
 					)
-				});
-			});
-		}
-
-		#[cfg(all(not(fuzzing), feature = "tokio"))]
-		#[tokio::main]
-		async fn main() {
-			let process = <$csp_type>::process();
-			let config = $config;
-			let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
-			$crate::tb_scenario!(@$run
-				config: config,
-				trace: trace,
-				$($run_body)*
-			)
-		}
-
-		#[cfg(not(feature = "tokio"))]
-		fn main() {
-			panic!(concat!($label, " AFL target requires the tokio feature"));
+				}
+			}
+			{
+				fn main() {
+					panic!(concat!($label, " AFL target requires the tokio feature"));
+				}
+			}
 		}
 	};
 

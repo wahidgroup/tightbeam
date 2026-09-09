@@ -127,6 +127,42 @@ macro_rules! __tb_if_instrument {
 	($($body:tt)*) => {};
 }
 
+// Picks one of two statement sequences on the `testing-timing` feature.
+//
+// A select takes both halves in one call. Delegating only the positive half
+// and leaving a `#[cfg(not(...))]` twin behind emits both in a consumer.
+#[cfg(feature = "testing-timing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_testing_timing {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($enabled)* };
+}
+
+#[cfg(not(feature = "testing-timing"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_testing_timing {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($disabled)* };
+}
+
+// Picks one of two item sequences on the `tokio` feature.
+//
+// A select takes both halves in one call. Delegating only the positive half
+// and leaving a `#[cfg(not(...))]` twin behind emits both in a consumer.
+#[cfg(feature = "tokio")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_tokio {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($enabled)* };
+}
+
+#[cfg(not(feature = "tokio"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_tokio {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($disabled)* };
+}
+
 // Picks one of two statement sequences on the `testing-fault` feature.
 //
 // Unlike the `__tb_if_*` helpers this emits the chosen tokens bare rather than

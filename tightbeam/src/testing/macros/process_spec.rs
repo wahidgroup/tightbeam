@@ -440,7 +440,7 @@ macro_rules! tb_process_spec {
 		$to_state:ident,
 		$( $reset_clock:expr ),* $(,)?
 	) => {
-		$crate::__tb_if_testing_timing! {
+		$crate::__tb_select_testing_timing! {
 			{
 				use $crate::testing::specs::csp::{Event, State};
 				use $crate::testing::timing::TimingGuard;
@@ -454,10 +454,13 @@ macro_rules! tb_process_spec {
 					reset_clocks,
 				);
 			}
-		};
-		#[cfg(not(feature = "testing-timing"))]
-		{
-			$builder = $builder.add_transition($from_state, $event, $crate::testing::specs::csp::State(stringify!($to_state)));
+			{
+				$builder = $builder.add_transition(
+					$from_state,
+					$event,
+					$crate::testing::specs::csp::State(stringify!($to_state)),
+				);
+			}
 		}
 	};
 }
