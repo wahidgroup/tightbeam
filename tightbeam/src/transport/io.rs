@@ -13,7 +13,10 @@ use core::future::Future;
 
 #[cfg(feature = "std")]
 use std::sync::Arc;
+// `remaining_handshake_deadline` is the only consumer, so this carries that
+// function's gate.
 #[cfg(all(
+	feature = "tokio",
 	feature = "std",
 	not(target_arch = "wasm32"),
 	any(feature = "transport-cms", feature = "transport-ecies")
@@ -79,11 +82,11 @@ mod x509 {
 		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 		pub use crate::crypto::sign::Verifier;
 		pub use crate::spki::EncodePublicKey;
-		pub use crate::transport::handshake::TcpHandshakeState;
 		pub use crate::transport::handshake::{
 			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError, HandshakeProtocolKind,
 			ServerHandshakeProtocol,
 		};
+		pub use crate::transport::state::SessionPhase;
 	}
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -149,12 +152,9 @@ use x509::*;
 ))]
 fn remaining_handshake_deadline<T: EncryptedProtocolState>(state: &T) -> Duration {
 	let allowance = state.to_handshake_timeout();
-	match state.to_handshake_state() {
-		TcpHandshakeState::AwaitingServerResponse { initiated_at }
-		| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
-			(initiated_at + allowance).saturating_duration_since(Instant::now())
-		}
-		_ => allowance,
+	match state.session_phase().initiated_at() {
+		Some(initiated_at) => initiated_at.deadline(allowance).saturating_duration_since(Instant::now()),
+		None => allowance,
 	}
 }
 
@@ -479,7 +479,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			// Multi-round server handshakes report Ok per round; only the
 			// completed state marks the session as established.
 			Ok(()) => {
-				if self.to_handshake_state() != TcpHandshakeState::Complete {
+				if !matches!(self.session_phase(), SessionPhase::Encrypted(_)) {
 					return;
 				}
 
@@ -531,7 +531,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		// AEAD bound
 		P::AeadCipher: KeyInit,
 	{
-		let should_handshake = self.expects_encryption() && self.to_handshake_state() == TcpHandshakeState::None;
+		let should_handshake = matches!(self.session_phase(), SessionPhase::Provisioned);
 		if should_handshake {
 			self.perform_client_handshake().await?;
 		}
@@ -558,7 +558,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync,
 	{
-		let should_handshake = self.expects_encryption() && self.to_handshake_state() == TcpHandshakeState::None;
+		let should_handshake = matches!(self.session_phase(), SessionPhase::Provisioned);
 		if should_handshake {
 			self.perform_client_handshake().await?;
 		}
@@ -625,14 +625,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-		{
-			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse { initiated_at: Instant::now() });
-		}
-		#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
-		{
-			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse { initiated_at: 0 });
-		}
+		self.begin_handshake();
 
 		// Step 2: Receive server response
 		let response_wire_bytes = self.read_envelope_bytes().await?;
@@ -678,14 +671,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		let aead_oid = profile.aead.ok_or(TransportError::InvalidMessage)?;
 		let session_keys = SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
 
-		self.set_session_keys(session_keys);
 		self.set_mux_settings(client.negotiated_mux());
 		self.set_session_receipt(client.session_receipt().cloned());
 		if let Some(peer_cert) = client.peer_certificate().cloned() {
 			self.set_peer_certificate(peer_cert);
 		}
 		self.set_epoch_materials(client.take_epoch_materials());
-		self.set_handshake_state(TcpHandshakeState::Complete);
+		self.complete_handshake(session_keys);
 
 		Ok(())
 	}
@@ -796,14 +788,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-		{
-			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse { initiated_at: Instant::now() });
-		}
-		#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
-		{
-			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse { initiated_at: 0 });
-		}
+		self.begin_handshake();
 
 		// Step 2: Receive server response
 		let response_wire_bytes = self.read_envelope_bytes().await?;
@@ -844,14 +829,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		let session_keys = orchestrator.complete().await?;
 
 		// Handshake complete: persist keys, mux terms, receipt, peer cert, epoch materials
-		self.set_session_keys(session_keys);
 		self.set_mux_settings(orchestrator.negotiated_mux());
 		self.set_session_receipt(orchestrator.session_receipt().cloned());
 		if let Some(peer_cert) = orchestrator.peer_certificate().cloned() {
 			self.set_peer_certificate(peer_cert);
 		}
 		self.set_epoch_materials(orchestrator.take_epoch_materials());
-		self.set_handshake_state(TcpHandshakeState::Complete);
+		self.complete_handshake(session_keys);
 
 		Ok(())
 	}
@@ -1028,15 +1012,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			let wire_envelope = WireEnvelope::Cleartext(server_envelope);
 			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
-			// Set server awaiting state with timeout tracking
-			#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-			{
-				self.set_handshake_state(TcpHandshakeState::AwaitingClientFinish { initiated_at: Instant::now() });
-			}
-			#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
-			{
-				self.set_handshake_state(TcpHandshakeState::AwaitingClientFinish { initiated_at: 0 });
-			}
+			self.begin_handshake();
 		} else {
 			// No response means handshake is complete - get the directional session keys
 			let session_keys = orchestrator.complete().await?;
@@ -1049,11 +1025,10 @@ pub trait EncryptedMessageIO: MessageIO {
 				self.set_peer_certificate(peer_cert);
 			}
 
-			self.set_session_keys(session_keys);
 			self.set_mux_settings(mux_settings);
 			self.set_session_receipt(session_receipt);
 			self.set_epoch_materials(epoch_materials);
-			self.set_handshake_state(TcpHandshakeState::Complete);
+			self.complete_handshake(session_keys);
 
 			// Clear handshake instance - no longer needed
 			*self.to_server_handshake_mut() = None;

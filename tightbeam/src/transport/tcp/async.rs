@@ -55,17 +55,15 @@ use crate::utils::marker::MaybeSend;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::aead::{Decryptor, RecvCipher, SendCipher, SessionKeys};
+	pub use crate::crypto::aead::{Decryptor, RecvCipher, SendCipher};
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::policy::CertificateValidation;
 	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::der::Decode;
 	pub use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
-	pub use crate::transport::handshake::{
-		BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
-	};
+	pub use crate::transport::handshake::{BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind};
 	pub use crate::transport::io::{EnvelopeSink, EnvelopeSource};
-	pub use crate::transport::state::EncryptedProtocolState;
+	pub use crate::transport::state::{EncryptedProtocolState, SessionPhase};
 	pub use crate::transport::{EncryptedMessageIO, TransportEncryptionConfig};
 	pub use crate::x509::Certificate;
 
@@ -186,7 +184,7 @@ pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 }
 
 #[cfg(feature = "tokio")]
-impl<P: CryptoProvider> TokioListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
 		self.listener.local_addr()
 	}
@@ -235,6 +233,7 @@ impl<P: CryptoProvider> TokioListener<P> {
 		}
 
 		transport.limits = self.limits;
+		transport.provision();
 
 		#[cfg(feature = "x509")]
 		if let Some(signatory) = &self.key_manager {
@@ -246,7 +245,7 @@ impl<P: CryptoProvider> TokioListener<P> {
 }
 
 #[cfg(feature = "tokio")]
-impl<P: CryptoProvider + Send + Sync> Protocol for TokioListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TokioListener<P> {
 	type Listener = TokioListener<P>;
 	type Stream = TokioStream;
 	type Error = IoError;
@@ -290,7 +289,7 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TokioListener<P> {
 }
 
 #[cfg(all(feature = "tokio", feature = "x509"))]
-impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TokioListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListener<P> {
 	type Encryptor = SendCipher;
 	type Decryptor = RecvCipher;
 	type CryptoProvider = P;
@@ -338,7 +337,7 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync + 'static> TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
@@ -350,6 +349,7 @@ where
 		self.aad_domain_tag = Some(config.aad_domain_tag);
 		self.limits = config.limits;
 		self.key_manager = Some(config.key_manager);
+		self.provision();
 		self
 	}
 }
@@ -521,7 +521,7 @@ where
 			return Ok(None);
 		}
 
-		while self.to_handshake_state() != TcpHandshakeState::Complete {
+		while !matches!(self.phase, SessionPhase::Encrypted(_)) {
 			match collect_step(self).await? {
 				CollectStep::Handshake(handshake_bytes) => {
 					self.perform_server_handshake(&handshake_bytes).await?;
@@ -839,14 +839,9 @@ where
 	/// - `InvalidState`: handshake has not completed
 	/// - `OperationFailed(EncryptorUnavailable)`: no session keys present
 	pub fn into_split(mut self) -> TransportResult<SplitTransport<S>> {
-		if self.to_handshake_state() != TcpHandshakeState::Complete {
+		let SessionPhase::Encrypted(session_keys) = core::mem::take(&mut self.phase) else {
 			return Err(TransportError::InvalidState);
-		}
-
-		let session_keys = self
-			.session_keys
-			.take()
-			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))?;
+		};
 		let (send_key, recv_key) = session_keys.into_parts();
 
 		let limits = self.limits;
@@ -881,7 +876,7 @@ where
 	/// - `InvalidState`: handshake started or completed.
 	/// - `MissingEncryption`: encryption material is configured.
 	pub fn into_split_cleartext(self) -> TransportResult<CleartextSplitTransport<S>> {
-		if self.to_handshake_state() != TcpHandshakeState::None {
+		if !matches!(self.phase, SessionPhase::Cleartext) {
 			return Err(TransportError::InvalidState);
 		}
 
@@ -913,7 +908,7 @@ where
 }
 
 #[cfg(feature = "tokio")]
-impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioListener<P> {
 	/// Delegates to the inherent accept so both entry points install the
 	/// full listener state.
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
@@ -957,11 +952,10 @@ where
 		{
 			#[cfg(feature = "x509")]
 			let timeout_duration: Option<Duration> = {
-				match self.to_handshake_state() {
-					TcpHandshakeState::AwaitingServerResponse { initiated_at }
-					| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
+				match self.phase.initiated_at() {
+					Some(initiated_at) => {
 						let now = Instant::now();
-						let deadline = initiated_at + self.limits.handshake_timeout;
+						let deadline = initiated_at.deadline(self.limits.handshake_timeout);
 						if now >= deadline {
 							return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 						}
@@ -1388,6 +1382,7 @@ mod tests {
 		let mut transport = tcp_transport_from(stream);
 		transport.handshake_protocol_kind = HandshakeProtocolKind::Cms;
 		transport.key_manager = Some(Arc::new(key_manager));
+		transport.provision();
 		transport
 	}
 

@@ -102,107 +102,118 @@ impl ServerHandshakeState {
 }
 
 // ---------------------------------------------------------------------------
-// Invariant Tracking
-// ---------------------------------------------------------------------------
-
-/// Once-only ordering guards for the handshake state machine: each flag
-/// flips exactly once and later steps demand the earlier ones.
-#[derive(Debug, Default)]
-pub struct HandshakeInvariant {
-	/// The transcript hash is sealed; no further messages may extend it.
-	pub transcript_locked: bool,
-	/// Session AEAD keys were derived (requires a locked transcript).
-	pub aead_key_derived: bool,
-	/// The finished message went out (requires derived AEAD keys).
-	pub finished_sent: bool,
-}
-
-impl HandshakeInvariant {
-	/// Lock the transcript. Returns Ok(true) if newly locked, Ok(false) if it
-	/// was already locked.
-	pub fn lock_transcript(&mut self) -> Result<bool, HandshakeError> {
-		if self.transcript_locked {
-			return Err(HandshakeError::TranscriptAlreadyLocked);
-		}
-
-		self.transcript_locked = true;
-		Ok(true)
-	}
-
-	/// Derive AEAD key exactly once. Ordering: transcript must be locked first.
-	/// Returns Ok(true) if freshly derived, Ok(false) if already derived.
-	/// Errors on ordering violation.
-	pub fn derive_aead_once(&mut self) -> Result<bool, HandshakeError> {
-		if !self.transcript_locked {
-			return Err(HandshakeError::TranscriptNotLocked);
-		}
-		if self.aead_key_derived {
-			return Err(HandshakeError::AeadAlreadyDerived);
-		}
-
-		self.aead_key_derived = true;
-		Ok(true)
-	}
-
-	/// Mark Finished message as sent. Requires transcript lock. Returns Ok(true) if newly marked,
-	/// Err if ordering violated or already sent.
-	pub fn mark_finished_sent(&mut self) -> Result<bool, HandshakeError> {
-		if !self.transcript_locked {
-			return Err(HandshakeError::FinishedBeforeTranscriptLock);
-		}
-		if self.finished_sent {
-			return Err(HandshakeError::FinishedAlreadySent);
-		}
-
-		self.finished_sent = true;
-		Ok(true)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Client State Machine
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
-pub struct ClientStateMachine {
+#[derive(Debug)]
+pub struct ClientStateMachine<F: HandshakeFlow> {
 	state: ClientHandshakeState,
+	flow: core::marker::PhantomData<F>,
 }
 
-impl ClientStateMachine {
-	pub fn state(&self) -> ClientHandshakeState {
-		self.state
+impl<F: HandshakeFlow> Default for ClientStateMachine<F> {
+	fn default() -> Self {
+		Self { state: ClientHandshakeState::default(), flow: core::marker::PhantomData }
+	}
+}
+
+mod sealed {
+	pub trait Sealed {}
+}
+
+/// The handshake flow whose transition table a state machine enforces.
+///
+/// One table per protocol, rather than their union. An ECIES machine cannot
+/// take a CMS-only transition and a CMS machine cannot take an ECIES-only one,
+/// so protocol confusion is refused by the type rather than avoided by the
+/// orchestrator driving a fixed sequence.
+///
+/// Sealed: the flows are the two this crate implements.
+pub trait HandshakeFlow: sealed::Sealed {
+	/// Whether this flow permits a client to move `from` to `to`.
+	fn client_permits(from: ClientHandshakeState, to: ClientHandshakeState) -> bool;
+
+	/// Whether this flow permits a server to move `from` to `to`.
+	fn server_permits(from: ServerHandshakeState, to: ServerHandshakeState) -> bool;
+}
+
+/// The CMS handshake flow: no explicit hello, and a Finished exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cms;
+
+/// The ECIES handshake flow: an explicit hello, and no Finished exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ecies;
+
+impl sealed::Sealed for Cms {}
+impl sealed::Sealed for Ecies {}
+
+impl HandshakeFlow for Cms {
+	fn client_permits(from: ClientHandshakeState, to: ClientHandshakeState) -> bool {
+		use ClientHandshakeState::*;
+		matches!(
+			(from, to),
+			(Init, KeyExchangeSent)
+				| (KeyExchangeSent, ServerFinishedReceived)
+				| (ServerFinishedReceived, ClientFinishedSent)
+				| (ClientFinishedSent, Completed)
+				| (_, Aborted(_))
+				| (_, Failed(_))
+		)
 	}
 
-	// Deliberately the union of the ECIES and CMS transition tables: both
-	// protocols share this machine, so a transition legal in either flow is
-	// accepted here. Protocol-confusion is prevented by the orchestrators,
-	// which drive a fixed sequence.
-	fn can_transition(&self, to: ClientHandshakeState) -> bool {
+	fn server_permits(from: ServerHandshakeState, to: ServerHandshakeState) -> bool {
+		use ServerHandshakeState::*;
+		matches!(
+			(from, to),
+			(Init, KeyExchangeReceived)
+				| (KeyExchangeReceived, ServerFinishedSent)
+				| (ServerFinishedSent, ClientFinishedReceived)
+				| (ClientFinishedReceived, Completed)
+				| (_, Aborted(_))
+				| (_, Failed(_))
+		)
+	}
+}
+
+impl HandshakeFlow for Ecies {
+	fn client_permits(from: ClientHandshakeState, to: ClientHandshakeState) -> bool {
 		use ClientHandshakeState::*;
-		match (self.state, to) {
-			// Linear progression
+		matches!(
+			(from, to),
 			(Init, HelloSent)
-			// CMS direct path (no explicit hello messages)
-			| (Init, KeyExchangeSent)
-			| (HelloSent, ServerHelloReceived)
-			| (ServerHelloReceived, KeyExchangeSent)
-			| (KeyExchangeSent, ServerFinishedReceived)
-			| (ServerFinishedReceived, ClientFinishedSent)
-			| (ClientFinishedSent, Completed)
-			// ECIES short-circuit (no Finished messages)
-			| (KeyExchangeSent, Completed)
-			// Terminal classification
-			| (_, Aborted(_))
-			| (_, Failed(_)) => true,
-			_ => false,
-		}
+				| (HelloSent, ServerHelloReceived)
+				| (ServerHelloReceived, KeyExchangeSent)
+				| (KeyExchangeSent, Completed)
+				| (_, Aborted(_))
+				| (_, Failed(_))
+		)
+	}
+
+	fn server_permits(from: ServerHandshakeState, to: ServerHandshakeState) -> bool {
+		use ServerHandshakeState::*;
+		matches!(
+			(from, to),
+			(Init, ClientHelloReceived)
+				| (ClientHelloReceived, ServerHelloSent)
+				| (ServerHelloSent, KeyExchangeReceived)
+				| (KeyExchangeReceived, Completed)
+				| (_, Aborted(_))
+				| (_, Failed(_))
+		)
+	}
+}
+
+impl<F: HandshakeFlow> ClientStateMachine<F> {
+	pub fn state(&self) -> ClientHandshakeState {
+		self.state
 	}
 
 	pub fn transition(&mut self, to: ClientHandshakeState) -> Result<(), HandshakeError> {
 		if self.state.is_terminal() {
 			return Err(HandshakeError::InvalidState);
 		}
-		if self.can_transition(to) {
+		if F::client_permits(self.state, to) {
 			self.state = to;
 			Ok(())
 		} else {
@@ -215,42 +226,28 @@ impl ClientStateMachine {
 // Server State Machine
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
-pub struct ServerStateMachine {
+#[derive(Debug)]
+pub struct ServerStateMachine<F: HandshakeFlow> {
 	state: ServerHandshakeState,
+	flow: core::marker::PhantomData<F>,
 }
 
-impl ServerStateMachine {
+impl<F: HandshakeFlow> Default for ServerStateMachine<F> {
+	fn default() -> Self {
+		Self { state: ServerHandshakeState::default(), flow: core::marker::PhantomData }
+	}
+}
+
+impl<F: HandshakeFlow> ServerStateMachine<F> {
 	pub fn state(&self) -> ServerHandshakeState {
 		self.state
-	}
-
-	// Union of ECIES and CMS transition tables; see ClientStateMachine note.
-	fn can_transition(&self, to: ServerHandshakeState) -> bool {
-		use ServerHandshakeState::*;
-		match (self.state, to) {
-			// Two entry paths: ECIES (ClientHelloReceived) or CMS (KeyExchangeReceived)
-			(Init, ClientHelloReceived)
-			| (Init, KeyExchangeReceived)
-			| (ClientHelloReceived, ServerHelloSent)
-			| (ServerHelloSent, KeyExchangeReceived)
-			| (KeyExchangeReceived, ServerFinishedSent)
-			| (ServerFinishedSent, ClientFinishedReceived)
-			| (ClientFinishedReceived, Completed)
-			// ECIES short-circuit (no Finished messages)
-			| (KeyExchangeReceived, Completed)
-			// Terminal classification
-			| (_, Aborted(_))
-			| (_, Failed(_)) => true,
-			_ => false,
-		}
 	}
 
 	pub fn transition(&mut self, to: ServerHandshakeState) -> Result<(), HandshakeError> {
 		if self.state.is_terminal() {
 			return Err(HandshakeError::InvalidState);
 		}
-		if self.can_transition(to) {
+		if F::server_permits(self.state, to) {
 			self.state = to;
 			Ok(())
 		} else {
@@ -267,23 +264,22 @@ impl ServerStateMachine {
 mod tests {
 	use super::*;
 
+	/// ECIES: an explicit hello, and completion straight from key exchange.
 	#[test]
-	fn client_linear_flow_ecies_short() {
-		let mut sm = ClientStateMachine::default();
+	fn ecies_client_runs_its_own_flow() {
+		let mut sm = ClientStateMachine::<Ecies>::default();
 		assert_eq!(sm.state(), ClientHandshakeState::Init);
 		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
 		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_ok());
 		assert!(sm.transition(ClientHandshakeState::KeyExchangeSent).is_ok());
-		// ECIES path allows direct complete
 		assert!(sm.transition(ClientHandshakeState::Completed).is_ok());
 		assert!(sm.state().is_completed());
 	}
 
+	/// CMS: no hello, and a Finished exchange before completion.
 	#[test]
-	fn client_full_flow_cms() {
-		let mut sm = ClientStateMachine::default();
-		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
-		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_ok());
+	fn cms_client_runs_its_own_flow() {
+		let mut sm = ClientStateMachine::<Cms>::default();
 		assert!(sm.transition(ClientHandshakeState::KeyExchangeSent).is_ok());
 		assert!(sm.transition(ClientHandshakeState::ServerFinishedReceived).is_ok());
 		assert!(sm.transition(ClientHandshakeState::ClientFinishedSent).is_ok());
@@ -291,8 +287,8 @@ mod tests {
 	}
 
 	#[test]
-	fn server_linear_flow_ecies_short() {
-		let mut sm = ServerStateMachine::default();
+	fn ecies_server_runs_its_own_flow() {
+		let mut sm = ServerStateMachine::<Ecies>::default();
 		assert_eq!(sm.state(), ServerHandshakeState::Init);
 		assert!(sm.transition(ServerHandshakeState::ClientHelloReceived).is_ok());
 		assert!(sm.transition(ServerHandshakeState::ServerHelloSent).is_ok());
@@ -302,22 +298,51 @@ mod tests {
 	}
 
 	#[test]
-	fn server_full_flow_cms() {
-		let mut sm = ServerStateMachine::default();
+	fn cms_server_runs_its_own_flow() {
+		let mut sm = ServerStateMachine::<Cms>::default();
 		assert!(sm.transition(ServerHandshakeState::KeyExchangeReceived).is_ok());
 		assert!(sm.transition(ServerHandshakeState::ServerFinishedSent).is_ok());
 		assert!(sm.transition(ServerHandshakeState::ClientFinishedReceived).is_ok());
 		assert!(sm.transition(ServerHandshakeState::Completed).is_ok());
 	}
 
+	/// The union table accepted either protocol's moves from either machine.
+	/// A CMS client skipping its Finished exchange, or an ECIES client sending
+	/// a Finished it has no message for, is now refused by the table itself.
+	#[test]
+	fn a_flow_refuses_the_other_protocols_transitions() {
+		let mut cms = ClientStateMachine::<Cms>::default();
+		assert!(cms.transition(ClientHandshakeState::HelloSent).is_err());
+		assert!(cms.transition(ClientHandshakeState::KeyExchangeSent).is_ok());
+		assert!(cms.transition(ClientHandshakeState::Completed).is_err());
+
+		let mut ecies = ClientStateMachine::<Ecies>::default();
+		assert!(ecies.transition(ClientHandshakeState::KeyExchangeSent).is_err());
+		assert!(ecies.transition(ClientHandshakeState::HelloSent).is_ok());
+		assert!(ecies.transition(ClientHandshakeState::ServerHelloReceived).is_ok());
+		assert!(ecies.transition(ClientHandshakeState::KeyExchangeSent).is_ok());
+		assert!(ecies.transition(ClientHandshakeState::ServerFinishedReceived).is_err());
+	}
+
+	/// The same split on the server side.
+	#[test]
+	fn a_server_flow_refuses_the_other_protocols_entry() {
+		let mut cms = ServerStateMachine::<Cms>::default();
+		assert!(cms.transition(ServerHandshakeState::ClientHelloReceived).is_err());
+
+		let mut ecies = ServerStateMachine::<Ecies>::default();
+		assert!(ecies.transition(ServerHandshakeState::KeyExchangeReceived).is_err());
+	}
+
 	#[test]
 	fn abort_and_failure_are_terminal() {
-		let mut sm = ClientStateMachine::default();
+		let mut sm = ClientStateMachine::<Ecies>::default();
 		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
 		assert!(sm.transition(ClientHandshakeState::Aborted(AbortReason::PeerAbort)).is_ok());
 		assert!(sm.state().is_aborted());
 		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_err());
-		let mut sm2 = ServerStateMachine::default();
+
+		let mut sm2 = ServerStateMachine::<Cms>::default();
 		assert!(sm2
 			.transition(ServerHandshakeState::Failed(FailureKind::ProtocolViolation))
 			.is_ok());

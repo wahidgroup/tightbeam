@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::builder::TypeBuilder;
-use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
+use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
@@ -26,9 +26,7 @@ use crate::transport::error::TransportFailure;
 use crate::transport::framing::{parse_der_length, reconstruct_der_encoding, LengthForm};
 use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
-use crate::transport::handshake::{
-	BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
-};
+use crate::transport::handshake::{BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind};
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
 use crate::transport::TransportLimits;
@@ -104,10 +102,9 @@ where
 		// applies from the first byte onward.
 		#[cfg(feature = "std")]
 		let deadline = if handshake_pending {
-			match self.to_handshake_state() {
-				TcpHandshakeState::AwaitingServerResponse { initiated_at }
-				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.limits.handshake_timeout),
-				_ => Some(Instant::now() + self.limits.handshake_timeout),
+			match self.phase.initiated_at() {
+				Some(initiated_at) => Some(initiated_at.deadline(self.limits.handshake_timeout)),
+				None => Some(Instant::now() + self.limits.handshake_timeout),
 			}
 		} else {
 			Some(Instant::now() + self.limits.operation_timeout)
@@ -310,7 +307,7 @@ pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoPro
 }
 
 #[cfg(feature = "std")]
-impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<NetTcpListener, P> {
+impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TcpListener<NetTcpListener, P> {
 	type Listener = TcpListener<NetTcpListener, P>;
 	type Stream = NetTcpStream;
 	type Error = IoError;
@@ -349,7 +346,7 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<NetTcpListener, P
 	}
 }
 
-impl<L: TcpListenerTrait, P: CryptoProvider> TcpListener<L, P>
+impl<L: TcpListenerTrait, P: CryptoProvider + Send + Sync + 'static> TcpListener<L, P>
 where
 	TransportError: From<L::Error>,
 	TransportError: From<<L::Stream as ProtocolStream>::Error>,
@@ -381,17 +378,20 @@ where
 			if let Some(aad) = self.aad_domain_tag {
 				transport.aad_domain_tag = Some(aad);
 			}
+
 			transport.limits = self.limits;
+			transport.provision();
 		}
 
 		if let Some(ref signatory) = self.key_manager {
 			transport.key_manager = Some(Arc::clone(signatory));
 		}
+
 		Ok(transport)
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<NetTcpListener, P> {
+impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListener<NetTcpListener, P> {
 	type Encryptor = SendCipher;
 	type Decryptor = RecvCipher;
 	type CryptoProvider = P;
@@ -490,6 +490,7 @@ mod tests {
 			let (stream, _) = listener.accept()?;
 			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::from(stream);
 			transport.client_validators = Some(Arc::new(Vec::new()));
+			transport.provision();
 			transport.limits.handshake_timeout = Duration::from_millis(250);
 
 			let rt = tokio::runtime::Runtime::new()?;

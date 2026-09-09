@@ -29,8 +29,9 @@ use tightbeam::testing::create_v0_tightbeam;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
 use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
-use tightbeam::transport::handshake::{HandshakeKeyManager, TcpHandshakeState};
+use tightbeam::transport::handshake::HandshakeKeyManager;
 use tightbeam::transport::state::EncryptedProtocolState;
+use tightbeam::transport::state::SessionPhase;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO, TransportEncryptionConfig, TransportError,
@@ -253,9 +254,8 @@ pub async fn accept_handshaken_split(listener: TokioListener) -> Result<SplitTra
 	// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
-	assert_eq!(
-		transport.to_handshake_state(),
-		TcpHandshakeState::Complete,
+	assert!(
+		matches!(transport.session_phase(), SessionPhase::Encrypted(_)),
 		"server handshake must complete after ClientKeyExchange"
 	);
 
@@ -269,9 +269,8 @@ pub async fn connect_handshaken_split(
 ) -> Result<SplitTransport<TokioStream>, TightBeamError> {
 	let mut client = connect_pinned_client(addr, server_certificate).await?;
 	client.perform_client_handshake().await?;
-	assert_eq!(
-		client.to_handshake_state(),
-		TcpHandshakeState::Complete,
+	assert!(
+		matches!(client.session_phase(), SessionPhase::Encrypted(_)),
 		"client handshake must complete before splitting"
 	);
 
