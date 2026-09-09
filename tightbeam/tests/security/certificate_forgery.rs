@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use tightbeam::der::Encode;
 use tightbeam::{
 	crypto::x509::{error::CertificateValidationError, policy::CertificateValidation, Certificate},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
@@ -162,9 +163,9 @@ job! {
 				.with_certificate_validator(Arc::new(valid_pinning));
 
 			// Perform handshake
-			let client_hello = client.build_client_hello()?;
-			let server_handshake = server.process_client_hello(&client_hello).await?;
-			let client_kex = client.process_server_handshake(&server_handshake).await?;
+			let client_hello = client.build_client_hello()?.to_der()?;
+			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
+			let client_kex = client.process_server_handshake(&server_handshake).await?.to_der()?;
 			let _server_result = server.process_client_key_exchange(&client_kex).await;
 
 			// If we got here without error, the valid certificate was accepted
@@ -190,8 +191,8 @@ job! {
 				.with_certificate_validator(Arc::new(wrong_pinning));
 
 			// Perform handshake - should fail at process_server_handshake
-			let client_hello = client.build_client_hello()?;
-			let server_handshake = server.process_client_hello(&client_hello).await?;
+			let client_hello = client.build_client_hello()?.to_der()?;
+			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
 
 			match client.process_server_handshake(&server_handshake).await {
 				Err(_) => {
@@ -222,8 +223,8 @@ job! {
 				.with_certificate_validator(Arc::new(reject_all));
 
 			// Perform handshake - should fail at process_server_handshake
-			let client_hello = client.build_client_hello()?;
-			let server_handshake = server.process_client_hello(&client_hello).await?;
+			let client_hello = client.build_client_hello()?.to_der()?;
+			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
 
 			match client.process_server_handshake(&server_handshake).await {
 				Err(_) => {

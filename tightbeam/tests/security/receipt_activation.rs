@@ -33,6 +33,7 @@
 
 use std::sync::Arc;
 
+use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
@@ -83,13 +84,13 @@ tb_scenario! {
 
 			// Drive the handshake manually through the client Finished, then
 			// deliberately skip process_receipt_ack.
-			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?.to_der()?;
 			server.process_key_exchange(&key_exchange).await?;
 
-			let server_finished = server.build_server_finished().await?;
+			let server_finished = server.build_server_finished().await?.to_der()?;
 			client.process_server_finished(&server_finished)?;
 
-			let client_finished = client.build_client_finished().await?;
+			let client_finished = client.build_client_finished().await?.to_der()?;
 			server.process_client_finished(&client_finished)?;
 
 			// The countersigned receipt reached no acknowledgement, so the

@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tightbeam::der::Encode;
 use tightbeam::{
 	crypto::{
 		aead::{Aes128Gcm, Aes128GcmOid, Aes256Gcm},
@@ -542,7 +543,7 @@ impl HandshakeProtocol for EciesSession {
 			let mut messages = Vec::new();
 
 			// Step 0: Client Hello (C -> S)
-			let client_hello = self.client.build_client_hello()?;
+			let client_hello = self.client.build_client_hello()?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 0,
 				direction: Direction::ClientToServer,
@@ -550,7 +551,7 @@ impl HandshakeProtocol for EciesSession {
 			});
 
 			// Step 1: Server Handshake (S -> C)
-			let server_handshake = self.server.process_client_hello(&client_hello).await?;
+			let server_handshake = self.server.process_client_hello(&client_hello).await?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 1,
 				direction: Direction::ServerToClient,
@@ -558,7 +559,7 @@ impl HandshakeProtocol for EciesSession {
 			});
 
 			// Step 2: Client Key Exchange (C -> S)
-			let client_kex = self.client.process_server_handshake(&server_handshake).await?;
+			let client_kex = self.client.process_server_handshake(&server_handshake).await?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 2,
 				direction: Direction::ClientToServer,
@@ -594,8 +595,8 @@ impl HandshakeProtocol for EciesSession {
 				}
 				1 => {
 					// Run step 0 normally, then inject at ServerHandshake
-					let client_hello = self.client.build_client_hello()?;
-					let _ = self.server.process_client_hello(&client_hello).await?;
+					let client_hello = self.client.build_client_hello()?.to_der()?;
+					let _ = self.server.process_client_hello(&client_hello).await?.to_der()?;
 					// Now inject the message as server handshake response
 					match self.client.process_server_handshake(&msg).await {
 						Ok(_) => Ok(InjectionOutcome::Accepted),
@@ -604,9 +605,9 @@ impl HandshakeProtocol for EciesSession {
 				}
 				2 => {
 					// Run steps 0-1 normally, then inject at ClientKeyExchange
-					let client_hello = self.client.build_client_hello()?;
-					let server_handshake = self.server.process_client_hello(&client_hello).await?;
-					let _ = self.client.process_server_handshake(&server_handshake).await?;
+					let client_hello = self.client.build_client_hello()?.to_der()?;
+					let server_handshake = self.server.process_client_hello(&client_hello).await?.to_der()?;
+					let _ = self.client.process_server_handshake(&server_handshake).await?.to_der()?;
 					// Now inject the message as client key exchange
 					match self.server.process_client_key_exchange(&msg).await {
 						Ok(_) => Ok(InjectionOutcome::Accepted),
@@ -663,7 +664,7 @@ impl HandshakeProtocol for Aes128EciesSession {
 			let mut messages = Vec::new();
 
 			// Step 0: Client Hello (C -> S)
-			let client_hello = self.client.build_client_hello()?;
+			let client_hello = self.client.build_client_hello()?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 0,
 				direction: Direction::ClientToServer,
@@ -671,7 +672,7 @@ impl HandshakeProtocol for Aes128EciesSession {
 			});
 
 			// Step 1: Server Handshake (S -> C)
-			let server_handshake = self.server.process_client_hello(&client_hello).await?;
+			let server_handshake = self.server.process_client_hello(&client_hello).await?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 1,
 				direction: Direction::ServerToClient,
@@ -679,7 +680,7 @@ impl HandshakeProtocol for Aes128EciesSession {
 			});
 
 			// Step 2: Client Key Exchange (C -> S)
-			let client_kex = self.client.process_server_handshake(&server_handshake).await?;
+			let client_kex = self.client.process_server_handshake(&server_handshake).await?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 2,
 				direction: Direction::ClientToServer,
@@ -710,17 +711,17 @@ impl HandshakeProtocol for Aes128EciesSession {
 					Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
 				},
 				1 => {
-					let client_hello = self.client.build_client_hello()?;
-					let _ = self.server.process_client_hello(&client_hello).await?;
+					let client_hello = self.client.build_client_hello()?.to_der()?;
+					let _ = self.server.process_client_hello(&client_hello).await?.to_der()?;
 					match self.client.process_server_handshake(&msg).await {
 						Ok(_) => Ok(InjectionOutcome::Accepted),
 						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
 					}
 				}
 				2 => {
-					let client_hello = self.client.build_client_hello()?;
-					let server_handshake = self.server.process_client_hello(&client_hello).await?;
-					let _ = self.client.process_server_handshake(&server_handshake).await?;
+					let client_hello = self.client.build_client_hello()?.to_der()?;
+					let server_handshake = self.server.process_client_hello(&client_hello).await?.to_der()?;
+					let _ = self.client.process_server_handshake(&server_handshake).await?.to_der()?;
 					match self.server.process_client_key_exchange(&msg).await {
 						Ok(_) => Ok(InjectionOutcome::Accepted),
 						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
@@ -779,7 +780,7 @@ impl HandshakeProtocol for CmsSession {
 			let session_key = tightbeam::ZeroizingBytes::new(vec![0xA5; 32]);
 
 			// Step 0: Key Exchange (C -> S)
-			let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?;
+			let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 0,
 				direction: Direction::ClientToServer,
@@ -790,7 +791,7 @@ impl HandshakeProtocol for CmsSession {
 			self.server.process_key_exchange(&key_exchange).await?;
 
 			// Step 2: Server Finished (S -> C)
-			let server_finished = self.server.build_server_finished().await?;
+			let server_finished = self.server.build_server_finished().await?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 2,
 				direction: Direction::ServerToClient,
@@ -801,7 +802,7 @@ impl HandshakeProtocol for CmsSession {
 			self.client.process_server_finished(&server_finished)?;
 
 			// Step 4: Client Finished (C -> S)
-			let client_finished = self.client.build_client_finished().await?;
+			let client_finished = self.client.build_client_finished().await?.to_der()?;
 			messages.push(CapturedMessage {
 				step: 4,
 				direction: Direction::ClientToServer,
@@ -837,7 +838,7 @@ impl HandshakeProtocol for CmsSession {
 				}
 				2 => {
 					// Run step 0-1 normally, then inject at ServerFinished
-					let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?;
+					let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?.to_der()?;
 					self.server.process_key_exchange(&key_exchange).await?;
 
 					// Now inject the message as server finished
@@ -848,10 +849,10 @@ impl HandshakeProtocol for CmsSession {
 				}
 				4 => {
 					// Run steps 0-3 normally, then inject at ClientFinished
-					let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?;
+					let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?.to_der()?;
 					self.server.process_key_exchange(&key_exchange).await?;
 
-					let server_finished = self.server.build_server_finished().await?;
+					let server_finished = self.server.build_server_finished().await?.to_der()?;
 					self.client.process_server_finished(&server_finished)?;
 
 					// Now inject the message as client finished

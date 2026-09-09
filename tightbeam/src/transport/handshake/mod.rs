@@ -608,9 +608,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 
 /// The clock a handshake deadline is measured against.
 ///
-/// Targets without a monotonic clock carry a `u64` stand-in. The alias is the
-/// one place that choice is made, so a type naming it needs no `#[cfg]` of its
-/// own.
+/// Targets without a monotonic clock carry a `u64` stand-in. The alias is
+/// the one place that choice is made, so a type naming it needs no `#[cfg]`
+/// of its own.
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub type HandshakeClock = Instant;
 
@@ -670,6 +670,68 @@ pub enum HandshakeAlert {
 	// captures never decode a stale meaning
 }
 
+/// A handshake message travels the wire in one of two CMS containers.
+///
+/// ECIES carries its own message types inside a container, so its messages
+/// are decoded from one. The CMS handshake exchanges the containers
+/// themselves.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HandshakeMessage {
+	/// Carries an ECIES `ClientHello` or `ServerHandshake`, or a CMS Finished.
+	SignedData(Box<SignedData>),
+	/// Carries an ECIES `ClientKeyExchange`, or a CMS key exchange.
+	EnvelopedData(Box<EnvelopedData>),
+}
+
+impl HandshakeMessage {
+	/// The signed container.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds the
+	///   key-transport container, which this step refuses.
+	pub fn signed(self) -> CoreResult<SignedData, HandshakeError> {
+		match self {
+			Self::SignedData(signed) => Ok(*signed),
+			Self::EnvelopedData(_) => Err(HandshakeError::UnexpectedContainer),
+		}
+	}
+
+	/// The key-transport container.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds the
+	///   signed container, which this step refuses.
+	pub fn enveloped(self) -> CoreResult<EnvelopedData, HandshakeError> {
+		match self {
+			Self::EnvelopedData(enveloped) => Ok(*enveloped),
+			Self::SignedData(_) => Err(HandshakeError::UnexpectedContainer),
+		}
+	}
+
+	/// The DER form of the message, as the transport puts it on the wire.
+	pub fn to_der(&self) -> CoreResult<Vec<u8>, HandshakeError> {
+		match self {
+			Self::SignedData(signed) => Ok(signed.to_der()?),
+			Self::EnvelopedData(enveloped) => Ok(enveloped.to_der()?),
+		}
+	}
+
+	/// Length of the DER form, computed without building the buffer.
+	///
+	/// A length beyond the target's `usize` range saturates to [`usize::MAX`],
+	/// so it exceeds every ceiling and the message is refused.
+	pub fn encoded_len(&self) -> CoreResult<usize, HandshakeError> {
+		let len = match self {
+			Self::SignedData(signed) => signed.encoded_len()?,
+			Self::EnvelopedData(enveloped) => enveloped.encoded_len()?,
+		};
+
+		Ok(usize::try_from(u32::from(len)).unwrap_or(usize::MAX))
+	}
+}
+
 /// Client-side handshake protocol trait.
 ///
 /// Supports multi-round handshakes where the client may need to send multiple
@@ -682,27 +744,29 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 
 	/// Start the handshake, returns the first message to send to the server.
 	#[allow(clippy::type_complexity)]
-	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<Vec<u8>, Self::Error>>;
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<HandshakeMessage, Self::Error>>;
 
 	/// Handle a response from the server.
 	///
-	/// Returns `Some(Vec<u8>)` if the client needs to send another message,
-	/// or `None` if the client has no more messages to send.
-	#[allow(clippy::type_complexity)]
-	fn handle_response<'a, 'b>(
+	/// Returns `Some` when the client owes the server another message, and
+	/// `None` once it has sent its last. Each step accepts one container and
+	/// refuses the other.
+	fn handle_response<'a>(
 		&'a mut self,
-		msg: &'b [u8],
-	) -> MaybeSendFuture<'a, CoreResult<Option<Vec<u8>>, Self::Error>>
-	where
-		'b: 'a;
+		msg: HandshakeMessage,
+	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, Self::Error>>;
 
 	/// Complete the handshake and extract the directional session keys.
 	///
-	/// Should be called after the handshake is complete (when `is_complete()` returns true).
+	/// Should be called after the handshake is complete (when `is_complete()`
+	/// returns true).
+	///
 	/// Returns role-mapped [`SessionKeys`]: the client sends on the
 	/// client-to-server key and receives on the server-to-client key.
-	/// The cipher type is determined by the CryptoProvider's AeadCipher associated type,
-	/// and the OID is taken from the negotiated security profile.
+	///
+	/// The cipher type is determined by the CryptoProvider's AeadCipher
+	/// associated type, and the OID is taken from the negotiated
+	/// security profile.
 	#[cfg(feature = "aead")]
 	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<SessionKeys, Self::Error>>;
 
@@ -739,8 +803,8 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 
 /// Server-side handshake protocol trait.
 ///
-/// Supports multi-round handshakes where the server may need to handle multiple
-/// requests from the client before completing the handshake.
+/// Supports multi-round handshakes where the server may need to handle
+/// multiple requests from the client before completing the handshake.
 ///
 /// `Send` is required on every target except `wasm32`, where the
 /// single-threaded executor lets JS-backed signing providers participate.
@@ -749,24 +813,25 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 
 	/// Handle a request from the client.
 	///
-	/// Can be called multiple times for multi-round handshakes.
-	/// Returns `Some(Vec<u8>)` if the server needs to send a response,
-	/// or `None` if the server has no response to send.
-	#[allow(clippy::type_complexity)]
-	fn handle_request<'a, 'b>(
+	/// Can be called multiple times for multi-round handshakes. Returns `Some`
+	/// when the server owes a response, and `None` when the step completes the
+	/// handshake. Each step accepts one container and refuses the other.
+	fn handle_request<'a>(
 		&'a mut self,
-		msg: &'b [u8],
-	) -> MaybeSendFuture<'a, CoreResult<Option<Vec<u8>>, Self::Error>>
-	where
-		'b: 'a;
+		msg: HandshakeMessage,
+	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, Self::Error>>;
 
 	/// Complete the handshake and extract the directional session keys.
 	///
-	/// Should be called after the handshake is complete (when `is_complete()` returns true).
+	/// Should be called after the handshake is complete (when `is_complete()`
+	/// returns true).
+	///
 	/// Returns role-mapped [`SessionKeys`]: the server sends on the
 	/// server-to-client key and receives on the client-to-server key.
-	/// The cipher type is determined by the CryptoProvider's AeadCipher associated type,
-	/// and the OID is taken from the negotiated security profile.
+	///
+	/// The cipher type is determined by the CryptoProvider's AeadCipher
+	/// associated type, and the OID is taken from the negotiated
+	/// security profile.
 	#[cfg(feature = "aead")]
 	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<SessionKeys, Self::Error>>;
 

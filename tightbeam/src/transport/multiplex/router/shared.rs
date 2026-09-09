@@ -485,6 +485,21 @@ impl MuxShared {
 
 	/// Wake the writer once owed chunks quiesce while it holds a
 	/// `RekeyAck` back (the ack trails every old-epoch chunk).
+	///
+	/// The precondition and the write live together, so the phase advances
+	/// only from `from` to `to` and the rekey sequence stays ordered.
+	///
+	/// Returns whether the move happened.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn advance_rekey(state: &mut MuxState, from: RekeyPhase, to: RekeyPhase) -> bool {
+		if state.rekey != from {
+			return false;
+		}
+
+		state.rekey = to;
+		true
+	}
+
 	fn wake_on_quiesce(state: &mut MuxState) {
 		if state.unsent_chunks == 0 && state.rekey == RekeyPhase::FlushingAck {
 			state.wake_rekey_waiters();
@@ -723,7 +738,7 @@ impl MuxShared {
 		}
 
 		let request = open()?;
-		state.rekey = RekeyPhase::AwaitingResponse;
+		Self::advance_rekey(&mut state, RekeyPhase::Idle, RekeyPhase::AwaitingResponse);
 
 		Some(request)
 	}
@@ -747,7 +762,10 @@ impl MuxShared {
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub fn begin_ack_flush(&self) {
 		let mut state = self.lock();
-		state.rekey = RekeyPhase::FlushingAck;
+		if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingResponse, RekeyPhase::FlushingAck) {
+			return;
+		}
+
 		// Owed chunks may already be quiescent: give the writer its
 		// wake now, ahead of the next ledger transition
 		Self::wake_on_quiesce(&mut state);
@@ -758,7 +776,10 @@ impl MuxShared {
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub fn mark_ack_written(&self) {
 		let mut state = self.lock();
-		state.rekey = RekeyPhase::AwaitingDone;
+		if !Self::advance_rekey(&mut state, RekeyPhase::FlushingAck, RekeyPhase::AwaitingDone) {
+			return;
+		}
+
 		state.rekey_hard_floor = false;
 		state.wake_rekey_waiters();
 	}
@@ -1859,6 +1880,9 @@ mod tests {
 		let parked = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut parked_cx);
 		assert!(matches!(parked, Poll::Pending));
 
+		// The renewal reaches the Ack write through the flush phase, the same
+		// order the reader and writer drive it in.
+		shared.begin_ack_flush();
 		shared.mark_ack_written();
 		assert!(flag.woken());
 

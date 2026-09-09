@@ -436,7 +436,10 @@ impl CertificateTrustStore {
 			// RFC 5280 §6.1.3(a)(4): name chaining - issuer DN must equal the
 			// preceding certificate's subject DN.
 			if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
-				return Err(CertificateValidationError::InvalidChain);
+				return Err(CertificateValidationError::InvalidChain {
+					issuer: cert.tbs_certificate.issuer.to_string(),
+					subject: issuer.tbs_certificate.subject.to_string(),
+				});
 			}
 
 			// RFC 5280 §6.1.4(k),(n): the issuer must be a CA permitted to sign certs.
@@ -631,7 +634,13 @@ impl<D: Digest> CertificateTrustBuilder<D> {
 		// Collision detection: same SKID but different fingerprint
 		if let Some(existing_fp) = self.skid_index.get(&skid) {
 			if *existing_fp != fp {
-				return Err(CertificateValidationError::SkidCollision);
+				return Err(CertificateValidationError::SkidCollision {
+					skid: skid.iter().fold(String::new(), |mut acc, byte| {
+						use core::fmt::Write;
+						let _ = write!(acc, "{byte:02x}");
+						acc
+					}),
+				});
 			}
 		}
 
@@ -660,7 +669,10 @@ impl<D: Digest> TrustBuilder for CertificateTrustBuilder<D> {
 			let (issuer, cert) = (&pair[0], &pair[1]);
 			(cert.tbs_certificate.issuer == issuer.tbs_certificate.subject)
 				.then_some(())
-				.ok_or(CertificateValidationError::InvalidChain)
+				.ok_or_else(|| CertificateValidationError::InvalidChain {
+					issuer: cert.tbs_certificate.issuer.to_string(),
+					subject: issuer.tbs_certificate.subject.to_string(),
+				})
 		})?;
 
 		// Transfer ownership and add all certificates

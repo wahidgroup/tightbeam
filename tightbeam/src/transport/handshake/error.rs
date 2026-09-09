@@ -68,6 +68,10 @@ pub enum HandshakeError {
 	#[error("Invalid handshake state")]
 	InvalidState,
 
+	/// The peer sent the other CMS container for this handshake step
+	#[error("Unexpected handshake container for this step")]
+	UnexpectedContainer,
+
 	/// Missing server key
 	#[error("Missing server key")]
 	MissingServerKey,

@@ -50,6 +50,7 @@ use crate::transport::handshake::state::{Ecies, ServerHandshakeState, ServerStat
 use crate::transport::handshake::utils::HandshakeOctets;
 use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
+use crate::transport::handshake::HandshakeMessage;
 use crate::transport::handshake::{
 	ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake, ServerHandshakeProtocol,
 };
@@ -206,7 +207,7 @@ where
 	///
 	/// # Returns
 	/// DER-encoded ServerHandshake
-	pub async fn process_client_hello(&mut self, client_hello_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	pub async fn process_client_hello(&mut self, client_hello_der: &[u8]) -> Result<ServerHandshake, HandshakeError> {
 		// 1. Validate current state is Init
 		self.validate_expected_state(ServerHandshakeState::Init)?;
 
@@ -276,15 +277,15 @@ where
 		self.issue_session_receipt(&transcript_digest, transport_accept.as_ref(), settlement_challenge)
 			.await?;
 
-		// 10. Build and encode ServerHandshake
-		let server_handshake_der =
+		// 10. Build ServerHandshake
+		let server_handshake =
 			self.build_server_handshake(server_random, signature_bytes, Some(security_accept), transport_accept)?;
 
 		// 11. Transition state through ServerHelloReceived to ServerHelloSent
 		self.state.transition(ServerHandshakeState::ClientHelloReceived)?;
 		self.state.transition(ServerHandshakeState::ServerHelloSent)?;
 
-		Ok(server_handshake_der)
+		Ok(server_handshake)
 	}
 
 	/// Build and sign the [`SessionReceipt`] when the accept grants
@@ -470,8 +471,8 @@ where
 		signature_bytes: Vec<u8>,
 		security_accept: Option<SecurityAccept>,
 		transport_accept: Option<TransportAccept>,
-	) -> Result<Vec<u8>, HandshakeError> {
-		let server_handshake = ServerHandshake {
+	) -> Result<ServerHandshake, HandshakeError> {
+		Ok(ServerHandshake {
 			certificate: Certificate::clone(&self.server_cert),
 			server_random: OctetString::new(server_random)?,
 			signature: OctetString::new(signature_bytes)?,
@@ -482,9 +483,7 @@ where
 			// the wire and dropped. The retained artifact absorbs the
 			// client SignerInfo at settlement.
 			session_receipt: self.receipt_artifact.clone(),
-		};
-
-		Ok(server_handshake.to_der()?)
+		})
 	}
 
 	pub fn decode_client_key_exchange(&self, der_bytes: &[u8]) -> Result<ClientKeyExchange, HandshakeError> {
@@ -768,21 +767,24 @@ where
 {
 	type Error = HandshakeError;
 
-	fn handle_request<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
-	where
-		'b: 'a,
-	{
+	fn handle_request<'a>(
+		&'a mut self,
+		msg: HandshakeMessage,
+	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, Self::Error>> {
 		Box::pin(async move {
-			// Determine which message type this is based on state
+			// ECIES tunnels its messages inside the containers.
 			match self.state() {
 				ServerHandshakeState::Init => {
-					// This is ClientHello - respond with ServerHandshake
-					let server_handshake = self.process_client_hello(msg).await?;
-					Ok(Some(server_handshake))
+					let hello_container = msg.signed()?;
+					let client_hello = ClientHello::try_from(&hello_container)?.to_der()?;
+					let server_handshake = self.process_client_hello(&client_hello).await?;
+					let response = SignedData::try_from(&server_handshake)?;
+					Ok(Some(HandshakeMessage::SignedData(Box::new(response))))
 				}
 				ServerHandshakeState::ServerHelloSent => {
-					// This is ClientKeyExchange - no response needed
-					self.process_client_key_exchange(msg).await?;
+					let enveloped_data = msg.enveloped()?;
+					let client_kex = ClientKeyExchange::try_from(&enveloped_data)?.to_der()?;
+					self.process_client_key_exchange(&client_kex).await?;
 					Ok(None)
 				}
 				_ => Err(HandshakeError::InvalidState),
@@ -885,14 +887,13 @@ mod tests {
 		// Process ClientHello
 		let client_random = generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
-		let server_handshake_der = server.process_client_hello(&client_hello_der).await?;
+		// The test asserts on the state the call leaves behind, not on the
+		// message it returns.
+		server.process_client_hello(&client_hello_der).await?;
 		assert_eq!(server.state(), ServerHandshakeState::ServerHelloSent);
 		assert!(server.client_random.is_some());
 		assert!(server.server_random.is_some());
 		assert!(server.transcript_hash.is_some());
-
-		// Verify server handshake message is valid
-		let _server_handshake = ServerHandshake::from_der(&server_handshake_der)?;
 
 		// Process ClientKeyExchange
 		let client_kex_der = build_test_client_key_exchange(&server)?;
@@ -1133,9 +1134,7 @@ mod tests {
 
 			let transport_offer = TransportOffer::mux(8);
 			let client_hello_der = create_test_client_hello_with_transport_offer(&[0u8; 32], Some(transport_offer))?;
-			let response_der = server.process_client_hello(&client_hello_der).await?;
-
-			let response = ServerHandshake::from_der(&response_der)?;
+			let response = server.process_client_hello(&client_hello_der).await?;
 			assert!(matches!(
 				response.transport_accept,
 				Some(TransportAccept { mux: true, max_peer_initiated_streams: 4, .. })
@@ -1151,9 +1150,7 @@ mod tests {
 			let transport_offer = TransportOffer::mux(8);
 			let mut server = TestEciesServerBuilder::new().build()?;
 			let client_hello_der = create_test_client_hello_with_transport_offer(&[1u8; 32], Some(transport_offer))?;
-			let response_der = server.process_client_hello(&client_hello_der).await?;
-
-			let response = ServerHandshake::from_der(&response_der)?;
+			let response = server.process_client_hello(&client_hello_der).await?;
 			assert_eq!(response.transport_accept, None);
 			assert_eq!(server.mux_settings, None);
 		}
@@ -1163,9 +1160,7 @@ mod tests {
 			let transport_offer = TransportOffer::mux(4);
 			let mut server = TestEciesServerBuilder::new().build()?.with_transport_config(transport_offer);
 			let client_hello_der = create_test_client_hello_with_transport_offer(&[2u8; 32], None)?;
-			let response_der = server.process_client_hello(&client_hello_der).await?;
-
-			let response = ServerHandshake::from_der(&response_der)?;
+			let response = server.process_client_hello(&client_hello_der).await?;
 			assert_eq!(response.transport_accept, None);
 			assert_eq!(server.mux_settings, None);
 		}
@@ -1199,14 +1194,13 @@ mod tests {
 		// Use the stored client_random from the server
 		let stored_client_random = server.client_random.ok_or("Missing client random")?;
 		let base_session_key = generate_nonce::<32>(None)?;
-
 		let payload = EciesSessionPayload {
 			base_key: OctetString::new(base_session_key)?,
 			client_random: OctetString::new(stored_client_random)?,
 			receipt_ack: None,
 		};
-		let plaintext = payload.to_der()?;
 
+		let plaintext = payload.to_der()?;
 		// Use server's AAD domain tag (or default if None)
 		let aad = server.aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG));
 		// Encrypt with ECIES

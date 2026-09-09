@@ -124,8 +124,8 @@ fn strong_weak_pair(
 	(client, server, strong, weak)
 }
 
-async fn expect_client_reject<E>(
-	result: Result<Vec<u8>, E>,
+async fn expect_client_reject<T, E>(
+	result: Result<T, E>,
 	trace: &TraceCollector,
 	event: Urn<'static>,
 	on_accept: &'static str,
@@ -147,8 +147,8 @@ job! {
 		// Phase 1: MITM downgrade: swap accepted profile without touching
 		// randoms, cert, or signature.
 		let (mut client, mut server, strong, weak) = strong_weak_pair(&materials);
-		let client_hello = client.build_client_hello()?;
-		let server_handshake_der = server.process_client_hello(&client_hello).await?;
+		let client_hello = client.build_client_hello()?.to_der()?;
+		let server_handshake_der = server.process_client_hello(&client_hello).await?.to_der()?;
 
 		let mut server_handshake = ServerHandshake::from_der(&server_handshake_der)?;
 		assert_eq!(
@@ -172,7 +172,7 @@ job! {
 		// client_random is preserved, so a random-only transcript would still
 		// verify. The full ClientHello DER binding must make the client reject.
 		let (mut client, mut server, _strong, _weak) = strong_weak_pair(&materials);
-		let client_hello = client.build_client_hello()?;
+		let client_hello = client.build_client_hello()?.to_der()?;
 		let mut stripped_hello = ClientHello::from_der(&client_hello)?;
 		stripped_hello.security_offer = None;
 
@@ -182,7 +182,7 @@ job! {
 			"offer stripping must change ClientHello bytes"
 		);
 
-		let server_handshake_der = server.process_client_hello(&stripped_hello).await?;
+		let server_handshake_der = server.process_client_hello(&stripped_hello).await?.to_der()?;
 		expect_client_reject(
 			client.process_server_handshake(&server_handshake_der).await,
 			&trace,
