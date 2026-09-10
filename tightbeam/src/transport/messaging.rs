@@ -18,22 +18,35 @@ use std::sync::Arc;
 use core::future::Future;
 
 use crate::asn1::Frame;
-use crate::der::Encode;
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
-use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelope};
+use crate::transport::envelopes::TransportEnvelope;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 
+#[cfg(any(
+	not(feature = "x509"),
+	all(
+		feature = "transport-policy",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	)
+))]
+use crate::der::Encode;
+#[cfg(not(feature = "x509"))]
+use crate::transport::envelopes::RequestPackage;
+#[cfg(not(feature = "x509"))]
+use crate::transport::envelopes::ResponsePackage;
+#[cfg(all(
+	feature = "transport-policy",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::transport::envelopes::WireEnvelope;
 #[cfg(all(
 	feature = "transport-policy",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 use crate::TightBeamError;
-
-#[cfg(not(feature = "x509"))]
-use crate::transport::envelopes::RequestPackage;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod x509 {
@@ -47,6 +60,9 @@ mod x509 {
 	pub use crate::transport::io::EncryptedMessageIO;
 	pub use crate::transport::state::EncryptedProtocolState;
 	pub use crate::transport::state::SessionPhase;
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	pub use crate::transport::state::ServerHandshakeSlot;
 
 	#[cfg(feature = "transport-ecies")]
 	pub use crate::crypto::ecies::EciesPublicKeyOps;
@@ -358,6 +374,7 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 /// Write a single-flight response envelope, shared by both
 /// `MessageCollector` cfg twins. With `x509` the response wraps in a
 /// [`WireEnvelope`] for protocol compatibility.
+#[cfg(not(feature = "x509"))]
 async fn send_single_flight_response<T>(
 	transport: &mut T,
 	status: TransitStatus,
@@ -368,12 +385,7 @@ where
 {
 	let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 	let response_envelope = TransportEnvelope::from(response_pkg);
-
-	#[cfg(feature = "x509")]
-	let response_bytes = WireEnvelope::Cleartext(response_envelope).to_der()?;
-	#[cfg(not(feature = "x509"))]
 	let response_bytes = T::encode_envelope(&response_envelope)?;
-
 	transport.write_envelope_bytes(&response_bytes).await
 }
 
@@ -485,7 +497,12 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Send a response for one collected message
+	/// Send a response for one collected message.
+	///
+	/// Without `x509` a transport carries no session phase, so the response
+	/// travels in the clear. An `x509` build decides by phase, so it states
+	/// how it responds rather than inheriting this.
+	#[cfg(not(feature = "x509"))]
 	fn send_response(
 		&mut self,
 		status: TransitStatus,
@@ -497,12 +514,23 @@ pub trait MessageCollector: CollectorRequirements {
 		send_single_flight_response(self, status, message)
 	}
 
+	/// Send a response for one collected message, in the wire mode the session
+	/// phase decides.
+	#[cfg(feature = "x509")]
+	fn send_response(
+		&mut self,
+		status: TransitStatus,
+		message: Option<Frame>,
+	) -> impl Future<Output = TransportResult<()>> + MaybeSend
+	where
+		Self: MaybeSend;
+
 	/// X509-enabled collect_message with encryption and handshake support
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
-		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P>,
+		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: CryptoProvider + Send + Sync + 'static,
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -536,7 +564,7 @@ pub trait MessageCollector: CollectorRequirements {
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
-		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P>,
+		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: CryptoProvider + Send + Sync + 'static,
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -594,10 +622,21 @@ where
 		return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 	}
 
-	let has_certificate = transport.to_server_certificate_ref().is_some();
+	// An established session reads and writes encrypted, so nothing cleartext
+	// is admitted on it. Before that, a provisioned endpoint admits only the
+	// handshake containers, and an unprovisioned one admits traffic.
+	let established = transport.session_state().phase().requires_encryption();
+	let expects_encryption = transport.encryption().is_provisioned();
 	match wire_envelope {
 		WireEnvelope::Cleartext(envelope) => {
-			if has_certificate {
+			if established {
+				// Circuit breaker: a cleartext frame on an agreed session is
+				// not the peer this session established (CWE-319).
+				transport.reset_session();
+				return Err(TransportError::MissingEncryption);
+			}
+
+			if expects_encryption {
 				match envelope {
 					TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 						Ok(CollectStep::Handshake(envelope.to_der()?))
@@ -614,12 +653,12 @@ where
 			}
 		}
 		WireEnvelope::Encrypted(encrypted_info) => {
-			if !matches!(transport.session_phase(), SessionPhase::Encrypted(_)) {
+			if !matches!(transport.session_state().phase(), SessionPhase::Encrypted(_)) {
 				transport.reset_session();
 				return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 			}
 
-			let decrypted_bytes = match transport.to_decryptor_ref()?.decrypt_content(&encrypted_info) {
+			let decrypted_bytes = match transport.session_state().decryptor()?.decrypt_content(&encrypted_info) {
 				Ok(bytes) => bytes,
 				Err(_) => {
 					transport.reset_session();

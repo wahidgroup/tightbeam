@@ -154,25 +154,107 @@ pub enum InjectionOutcome {
 	Rejected(TightBeamError),
 }
 
+/// Boxed future a flow step returns, borrowing the session it runs on.
+type FlowFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, TightBeamError>> + Send + 'a>>;
+
+/// One message in a handshake flow.
+#[derive(Debug, Clone, Copy)]
+pub struct FlowStep {
+	/// Step number the protocol assigns this message.
+	pub index: usize,
+	/// Endpoint that sends it.
+	pub direction: Direction,
+}
+
+/// A handshake flow described as its ordered steps.
+///
+/// A backend states its step table and how one step advances to the next. The
+/// sequence is then written once here, so capture and injection drive the same
+/// machine rather than each transcribing the protocol again.
+pub trait HandshakeFlow: Send {
+	/// Backend this flow belongs to.
+	fn backend(&self) -> HandshakeBackendKind;
+
+	/// Ordered steps this protocol exchanges.
+	fn steps(&self) -> &'static [FlowStep];
+
+	/// Build the opening message, which no earlier step produces.
+	fn open(&mut self) -> FlowFuture<'_, Vec<u8>>;
+
+	/// Hand `msg` to the endpoint that receives step `index`, returning that
+	/// endpoint's reply when the flow continues.
+	fn advance<'a>(&'a mut self, index: usize, msg: &'a [u8]) -> FlowFuture<'a, Option<Vec<u8>>>;
+}
+
 /// Protocol-agnostic handshake operations for security testing.
 ///
-/// This trait abstracts the differences between ECIES and CMS handshake flows,
-/// allowing tests to work with any backend without code duplication.
+/// Both operations are derived from the flow's step table, so a backend states
+/// its sequence once and gets capture and injection from it.
 #[allow(dead_code)]
 pub trait HandshakeProtocol: Send {
 	/// Returns the backend kind for this session.
 	fn kind(&self) -> HandshakeBackendKind;
 
 	/// Run a complete handshake, capturing all exchanged messages.
-	fn capture_full(&mut self) -> Pin<Box<dyn Future<Output = Result<CapturedHandshake, TightBeamError>> + Send + '_>>;
+	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake>;
 
 	/// Run handshake up to step N, then inject a different message at step N.
 	/// Returns the outcome of the injection attempt.
-	fn inject_at_step(
-		&mut self,
-		step: usize,
-		msg: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<InjectionOutcome, TightBeamError>> + Send + '_>>;
+	fn inject_at_step(&mut self, step: usize, msg: &[u8]) -> FlowFuture<'_, InjectionOutcome>;
+}
+
+impl<F: HandshakeFlow> HandshakeProtocol for F {
+	fn kind(&self) -> HandshakeBackendKind {
+		HandshakeFlow::backend(self)
+	}
+
+	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake> {
+		Box::pin(async move {
+			let steps = self.steps();
+			let backend = HandshakeFlow::backend(self);
+			let mut messages = Vec::with_capacity(steps.len());
+			let mut pending = Some(self.open().await?);
+
+			for step in steps {
+				let Some(payload) = pending else {
+					break;
+				};
+
+				pending = self.advance(step.index, &payload).await?;
+				messages.push(CapturedMessage { step: step.index, direction: step.direction, payload });
+			}
+
+			Ok(CapturedHandshake { messages, kind: backend })
+		})
+	}
+
+	fn inject_at_step(&mut self, step: usize, msg: &[u8]) -> FlowFuture<'_, InjectionOutcome> {
+		let msg = msg.to_vec();
+		Box::pin(async move {
+			let steps = self.steps();
+			if !steps.iter().any(|candidate| candidate.index == step) {
+				return Err(invalid_step_error("step is not part of this handshake flow"));
+			}
+
+			// Run the flow normally up to the step under attack. The opening
+			// message is built only once a step before the target needs it, so
+			// injecting at step 0 leaves the client untouched.
+			let mut pending = None;
+			for candidate in steps.iter().take_while(|candidate| candidate.index != step) {
+				let payload = match pending {
+					Some(payload) => payload,
+					None => self.open().await?,
+				};
+
+				pending = self.advance(candidate.index, &payload).await?;
+			}
+
+			match self.advance(step, &msg).await {
+				Ok(_) => Ok(InjectionOutcome::Accepted),
+				Err(e) => Ok(InjectionOutcome::Rejected(e)),
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -304,7 +386,12 @@ impl SecurityThreatHarness {
 		match kind {
 			HandshakeBackendKind::Ecies => {
 				self.emit(Self::HARNESS_SPAWN_ECIES).ok();
-				Box::new(EciesSession::with_profiles(&self.materials, client_profiles, server_profiles))
+				Box::new(EciesSession::with_profiles(
+					&self.materials,
+					client_profiles,
+					server_profiles,
+					None,
+				))
 			}
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
@@ -328,7 +415,14 @@ impl SecurityThreatHarness {
 		match kind {
 			HandshakeBackendKind::Ecies => {
 				self.emit(Self::HARNESS_SPAWN_ECIES_WEAK).ok();
-				Box::new(Aes128EciesSession::new(&self.materials))
+				// Deliberately weak session: opt out of the default strength
+				// floor so the downgrade harness can capture AES-128 wire bytes.
+				Box::new(Aes128EciesSession::with_profiles(
+					&self.materials,
+					vec![weak_security_profile()],
+					vec![weak_security_profile()],
+					Some(Arc::new(NoStrengthFloor)),
+				))
 			}
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
@@ -502,236 +596,93 @@ pub fn generate_wrong_secret_key() -> k256::SecretKey {
 // ECIES Session Implementation
 // ============================================================================
 
-/// ECIES handshake session bundle.
-pub struct EciesSession {
-	client: EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>,
-	server: EciesHandshakeServer<DefaultCryptoProvider>,
-}
-
-impl EciesSession {
-	/// Create session with specific client and server profiles.
-	fn with_profiles(
-		materials: &ServerMaterials,
-		client_profiles: Vec<SecurityProfileDesc>,
-		server_profiles: Vec<SecurityProfileDesc>,
-	) -> Self {
-		let offer = SecurityOffer::new(client_profiles);
-		let validator = pinning_validator(&materials.certificate);
-		let client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(offer)
-			.with_certificate_validator(validator);
-
-		let server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-			Arc::clone(&materials.key_provider),
-			Arc::clone(&materials.certificate),
-			None,
-			None,
-		)
-		.with_supported_profiles(server_profiles);
-
-		Self { client, server }
-	}
-}
-
-impl HandshakeProtocol for EciesSession {
-	fn kind(&self) -> HandshakeBackendKind {
-		HandshakeBackendKind::Ecies
-	}
-
-	fn capture_full(&mut self) -> Pin<Box<dyn Future<Output = Result<CapturedHandshake, TightBeamError>> + Send + '_>> {
-		Box::pin(async move {
-			let mut messages = Vec::new();
-
-			// Step 0: Client Hello (C -> S)
-			let client_hello = self.client.build_client_hello()?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 0,
-				direction: Direction::ClientToServer,
-				payload: client_hello.to_owned(),
-			});
-
-			// Step 1: Server Handshake (S -> C)
-			let server_handshake = self.server.process_client_hello(&client_hello).await?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 1,
-				direction: Direction::ServerToClient,
-				payload: server_handshake.to_owned(),
-			});
-
-			// Step 2: Client Key Exchange (C -> S)
-			let client_kex = self.client.process_server_handshake(&server_handshake).await?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 2,
-				direction: Direction::ClientToServer,
-				payload: client_kex.to_owned(),
-			});
-
-			// Step 3: Server processes KEX (no message, but completes handshake)
-			self.server.process_client_key_exchange(&client_kex).await?;
-
-			// Complete both sides
-			let _ = self.client.complete()?;
-			let _ = self.server.complete()?;
-
-			Ok(CapturedHandshake { messages, kind: HandshakeBackendKind::Ecies })
-		})
-	}
-
-	fn inject_at_step(
-		&mut self,
-		step: usize,
-		msg: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<InjectionOutcome, TightBeamError>> + Send + '_>> {
-		let msg = msg.to_vec();
-		Box::pin(async move {
-			// Run handshake up to the injection point, then inject the message
-			match step {
-				0 => {
-					// Inject at ClientHello - process injected message as client hello
-					match self.server.process_client_hello(&msg).await {
-						Ok(_) => Ok(InjectionOutcome::Accepted),
-						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-					}
-				}
-				1 => {
-					// Run step 0 normally, then inject at ServerHandshake
-					let client_hello = self.client.build_client_hello()?.to_der()?;
-					let _ = self.server.process_client_hello(&client_hello).await?.to_der()?;
-					// Now inject the message as server handshake response
-					match self.client.process_server_handshake(&msg).await {
-						Ok(_) => Ok(InjectionOutcome::Accepted),
-						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-					}
-				}
-				2 => {
-					// Run steps 0-1 normally, then inject at ClientKeyExchange
-					let client_hello = self.client.build_client_hello()?.to_der()?;
-					let server_handshake = self.server.process_client_hello(&client_hello).await?.to_der()?;
-					let _ = self.client.process_server_handshake(&server_handshake).await?.to_der()?;
-					// Now inject the message as client key exchange
-					match self.server.process_client_key_exchange(&msg).await {
-						Ok(_) => Ok(InjectionOutcome::Accepted),
-						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-					}
-				}
-				_ => Err(invalid_step_error("ECIES has only 3 injectable steps (0-2)")),
-			}
-		})
-	}
-}
-
 // ============================================================================
-// AES-128 ECIES Session (for Downgrade Testing)
+// ECIES Session Implementation
 // ============================================================================
 
-/// ECIES handshake session using AES-128-GCM (weaker cipher).
-pub struct Aes128EciesSession {
-	client: EciesHandshakeClient<Aes128CryptoProvider, Secp256k1EciesMessage>,
-	server: EciesHandshakeServer<Aes128CryptoProvider>,
-}
+/// The three messages an ECIES handshake exchanges.
+const ECIES_FLOW: &[FlowStep] = &[
+	FlowStep { index: 0, direction: Direction::ClientToServer },
+	FlowStep { index: 1, direction: Direction::ServerToClient },
+	FlowStep { index: 2, direction: Direction::ClientToServer },
+];
 
-impl Aes128EciesSession {
-	/// Create session with the weak AES-128 profile.
-	fn new(materials: &ServerMaterials) -> Self {
-		let weak_profile = weak_security_profile();
-		let validator = pinning_validator(&materials.certificate);
-		let client = EciesHandshakeClient::<Aes128CryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(vec![weak_profile]))
-			.with_certificate_validator(validator);
+/// Declare an ECIES session over one crypto provider.
+///
+/// The provider bounds cannot be named once on stable, because Rust does not
+/// elaborate associated-type bounds from a supertrait. The sequence itself is
+/// stated once here instead of once per session.
+macro_rules! ecies_session {
+	($name:ident, $provider:ty) => {
+		pub struct $name {
+			client: EciesHandshakeClient<$provider, Secp256k1EciesMessage>,
+			server: EciesHandshakeServer<$provider>,
+		}
 
-		// Deliberately weak session: opt out of the default strength floor so
-		// the downgrade harness can capture AES-128 wire bytes.
-		let server = EciesHandshakeServer::<Aes128CryptoProvider>::new(
-			Arc::clone(&materials.key_provider),
-			Arc::clone(&materials.certificate),
-			None,
-			None,
-		)
-		.with_supported_profiles(vec![weak_profile])
-		.with_strength_policy(Arc::new(NoStrengthFloor));
+		impl $name {
+			/// Create a session with specific client and server profiles.
+			///
+			/// `strength_policy` overrides the server's default strength floor,
+			/// which a deliberately weak downgrade session needs.
+			fn with_profiles(
+				materials: &ServerMaterials,
+				client_profiles: Vec<SecurityProfileDesc>,
+				server_profiles: Vec<SecurityProfileDesc>,
+				strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
+			) -> Self {
+				let validator = pinning_validator(&materials.certificate);
+				let client = EciesHandshakeClient::<$provider, Secp256k1EciesMessage>::new(None)
+					.with_security_offer(SecurityOffer::new(client_profiles))
+					.with_certificate_validator(validator);
 
-		Self { client, server }
-	}
-}
+				let mut server = EciesHandshakeServer::<$provider>::new(
+					Arc::clone(&materials.key_provider),
+					Arc::clone(&materials.certificate),
+					None,
+					None,
+				)
+				.with_supported_profiles(server_profiles);
 
-impl HandshakeProtocol for Aes128EciesSession {
-	fn kind(&self) -> HandshakeBackendKind {
-		HandshakeBackendKind::Ecies
-	}
-
-	fn capture_full(&mut self) -> Pin<Box<dyn Future<Output = Result<CapturedHandshake, TightBeamError>> + Send + '_>> {
-		Box::pin(async move {
-			let mut messages = Vec::new();
-
-			// Step 0: Client Hello (C -> S)
-			let client_hello = self.client.build_client_hello()?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 0,
-				direction: Direction::ClientToServer,
-				payload: client_hello.to_owned(),
-			});
-
-			// Step 1: Server Handshake (S -> C)
-			let server_handshake = self.server.process_client_hello(&client_hello).await?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 1,
-				direction: Direction::ServerToClient,
-				payload: server_handshake.to_owned(),
-			});
-
-			// Step 2: Client Key Exchange (C -> S)
-			let client_kex = self.client.process_server_handshake(&server_handshake).await?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 2,
-				direction: Direction::ClientToServer,
-				payload: client_kex.to_owned(),
-			});
-
-			// Step 3: Server processes KEX (completes handshake)
-			self.server.process_client_key_exchange(&client_kex).await?;
-
-			// Complete both sides
-			let _ = self.client.complete()?;
-			let _ = self.server.complete()?;
-
-			Ok(CapturedHandshake { messages, kind: HandshakeBackendKind::Ecies })
-		})
-	}
-
-	fn inject_at_step(
-		&mut self,
-		step: usize,
-		msg: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<InjectionOutcome, TightBeamError>> + Send + '_>> {
-		let msg = msg.to_vec();
-		Box::pin(async move {
-			match step {
-				0 => match self.server.process_client_hello(&msg).await {
-					Ok(_) => Ok(InjectionOutcome::Accepted),
-					Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-				},
-				1 => {
-					let client_hello = self.client.build_client_hello()?.to_der()?;
-					let _ = self.server.process_client_hello(&client_hello).await?.to_der()?;
-					match self.client.process_server_handshake(&msg).await {
-						Ok(_) => Ok(InjectionOutcome::Accepted),
-						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-					}
+				if let Some(policy) = strength_policy {
+					server = server.with_strength_policy(policy);
 				}
-				2 => {
-					let client_hello = self.client.build_client_hello()?.to_der()?;
-					let server_handshake = self.server.process_client_hello(&client_hello).await?.to_der()?;
-					let _ = self.client.process_server_handshake(&server_handshake).await?.to_der()?;
-					match self.server.process_client_key_exchange(&msg).await {
-						Ok(_) => Ok(InjectionOutcome::Accepted),
-						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-					}
-				}
-				_ => Err(invalid_step_error("ECIES has only 3 injectable steps (0-2)")),
+
+				Self { client, server }
 			}
-		})
-	}
+		}
+
+		impl HandshakeFlow for $name {
+			fn backend(&self) -> HandshakeBackendKind {
+				HandshakeBackendKind::Ecies
+			}
+
+			fn steps(&self) -> &'static [FlowStep] {
+				ECIES_FLOW
+			}
+
+			fn open(&mut self) -> FlowFuture<'_, Vec<u8>> {
+				Box::pin(async move { Ok(self.client.build_client_hello()?.to_der()?) })
+			}
+
+			fn advance<'a>(&'a mut self, index: usize, msg: &'a [u8]) -> FlowFuture<'a, Option<Vec<u8>>> {
+				Box::pin(async move {
+					match index {
+						0 => Ok(Some(self.server.process_client_hello(msg).await?.to_der()?)),
+						1 => Ok(Some(self.client.process_server_handshake(msg).await?.to_der()?)),
+						2 => {
+							self.server.process_client_key_exchange(msg).await?;
+							Ok(None)
+						}
+						_ => Err(invalid_step_error("ECIES has only 3 steps (0-2)")),
+					}
+				})
+			}
+		}
+	};
 }
+
+ecies_session!(EciesSession, DefaultCryptoProvider);
+ecies_session!(Aes128EciesSession, Aes128CryptoProvider);
 
 // ============================================================================
 // CMS Session Implementation
@@ -768,100 +719,52 @@ impl CmsSession {
 	}
 }
 
+/// The three messages a CMS handshake exchanges. The intervening odd steps are
+/// the receiving half of each, so they carry no message of their own.
 #[cfg(feature = "transport-cms")]
-impl HandshakeProtocol for CmsSession {
-	fn kind(&self) -> HandshakeBackendKind {
+const CMS_FLOW: &[FlowStep] = &[
+	FlowStep { index: 0, direction: Direction::ClientToServer },
+	FlowStep { index: 2, direction: Direction::ServerToClient },
+	FlowStep { index: 4, direction: Direction::ClientToServer },
+];
+
+/// Fixed session key the CMS capture wraps, so a captured flow is reproducible.
+#[cfg(feature = "transport-cms")]
+const CMS_SESSION_KEY: [u8; 32] = [0xA5; 32];
+
+#[cfg(feature = "transport-cms")]
+impl HandshakeFlow for CmsSession {
+	fn backend(&self) -> HandshakeBackendKind {
 		HandshakeBackendKind::Cms
 	}
 
-	fn capture_full(&mut self) -> Pin<Box<dyn Future<Output = Result<CapturedHandshake, TightBeamError>> + Send + '_>> {
+	fn steps(&self) -> &'static [FlowStep] {
+		CMS_FLOW
+	}
+
+	fn open(&mut self) -> FlowFuture<'_, Vec<u8>> {
 		Box::pin(async move {
-			let mut messages = Vec::new();
-			let session_key = tightbeam::ZeroizingBytes::new(vec![0xA5; 32]);
-
-			// Step 0: Key Exchange (C -> S)
-			let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 0,
-				direction: Direction::ClientToServer,
-				payload: key_exchange.to_owned(),
-			});
-
-			// Step 1: Server processes KEX (internal)
-			self.server.process_key_exchange(&key_exchange).await?;
-
-			// Step 2: Server Finished (S -> C)
-			let server_finished = self.server.build_server_finished().await?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 2,
-				direction: Direction::ServerToClient,
-				payload: server_finished.to_owned(),
-			});
-
-			// Step 3: Client processes Server Finished (internal)
-			self.client.process_server_finished(&server_finished)?;
-
-			// Step 4: Client Finished (C -> S)
-			let client_finished = self.client.build_client_finished().await?.to_der()?;
-			messages.push(CapturedMessage {
-				step: 4,
-				direction: Direction::ClientToServer,
-				payload: client_finished.to_owned(),
-			});
-
-			// Step 5: Server processes Client Finished
-			self.server.process_client_finished(&client_finished)?;
-
-			// Complete both sides
-			self.client.complete()?;
-			self.server.complete()?;
-
-			Ok(CapturedHandshake { messages, kind: HandshakeBackendKind::Cms })
+			let session_key = tightbeam::ZeroizingBytes::new(CMS_SESSION_KEY.to_vec());
+			Ok(self.client.build_key_exchange(session_key, None)?.to_der()?)
 		})
 	}
 
-	fn inject_at_step(
-		&mut self,
-		step: usize,
-		msg: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<InjectionOutcome, TightBeamError>> + Send + '_>> {
-		let msg = msg.to_vec();
+	fn advance<'a>(&'a mut self, index: usize, msg: &'a [u8]) -> FlowFuture<'a, Option<Vec<u8>>> {
 		Box::pin(async move {
-			let session_key = tightbeam::ZeroizingBytes::new(vec![0xA5; 32]);
-			match step {
+			match index {
 				0 => {
-					// Inject at KeyExchange
-					match self.server.process_key_exchange(&msg).await {
-						Ok(_) => Ok(InjectionOutcome::Accepted),
-						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-					}
+					self.server.process_key_exchange(msg).await?;
+					Ok(Some(self.server.build_server_finished().await?.to_der()?))
 				}
 				2 => {
-					// Run step 0-1 normally, then inject at ServerFinished
-					let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?.to_der()?;
-					self.server.process_key_exchange(&key_exchange).await?;
-
-					// Now inject the message as server finished
-					match self.client.process_server_finished(&msg) {
-						Ok(_) => Ok(InjectionOutcome::Accepted),
-						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-					}
+					self.client.process_server_finished(msg)?;
+					Ok(Some(self.client.build_client_finished().await?.to_der()?))
 				}
 				4 => {
-					// Run steps 0-3 normally, then inject at ClientFinished
-					let key_exchange = self.client.build_key_exchange(session_key.clone(), None)?.to_der()?;
-					self.server.process_key_exchange(&key_exchange).await?;
-
-					let server_finished = self.server.build_server_finished().await?.to_der()?;
-					self.client.process_server_finished(&server_finished)?;
-
-					// Now inject the message as client finished
-					match self.server.process_client_finished(&msg) {
-						Ok(_) => Ok(InjectionOutcome::Accepted),
-						Err(e) => Ok(InjectionOutcome::Rejected(e.into())),
-					}
+					self.server.process_client_finished(msg)?;
+					Ok(None)
 				}
-				_ => Err(invalid_step_error("CMS injectable steps are 0, 2, 4")),
+				_ => Err(invalid_step_error("CMS steps are 0, 2, 4")),
 			}
 		})
 	}

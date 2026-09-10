@@ -983,7 +983,10 @@ macro_rules! tb_scenario {
 	(@servlet_client $trace:expr, $context:expr, $addr:expr) => {{
 		use $crate::transport::tcp::r#async::TokioListener;
 		use $crate::transport::{ClientBuilder, ConnectionBuilder};
-		let builder = ClientBuilder::<TokioListener>::builder().build();
+
+		// The default servlet scenario provisions no trust store, so the
+		// scenario runs in the clear and says so.
+		let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 		builder
 			.connect($addr)
 			.await

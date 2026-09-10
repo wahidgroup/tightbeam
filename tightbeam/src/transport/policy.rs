@@ -6,65 +6,62 @@ use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::policy::{GatePolicy, ReceptorPolicy};
+use crate::policy::GatePolicy;
 use crate::transport::error::TransportFailure;
-use crate::{Frame, Message};
+use crate::Frame;
 
 #[cfg(feature = "std")]
 use crate::utils::jitter::decorrelated_bounds;
 
-/// Trait for transports that support policy configuration
-///
-/// Default implementations are no-ops that return `self` unchanged.
-/// Transports that support specific policies should override the
-/// relevant methods.
-pub trait PolicyConfig
+/// A transport that honours a restart policy.
+pub trait RestartConfig
 where
 	Self: Sized,
 {
-	/// Configure restart policy for the transport.
-	///
-	/// Default: no-op (policy ignored if transport doesn't support it).
-	fn with_restart<P: RestartPolicy + 'static>(self, _: P) -> Self {
-		self
-	}
-
-	/// Configure emitter gate policy.
-	///
-	/// Repeated calls accumulate into a [`crate::policy::GateChain`]:
-	/// gates evaluate in configuration order and the first non-`Ok`
-	/// verdict decides.
-	///
-	/// Default: no-op (policy ignored if transport doesn't support it).
-	fn with_emitter_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
-		self
-	}
-
-	/// Configure collector gate policy.
-	///
-	/// Repeated calls accumulate into a [`crate::policy::GateChain`]:
-	/// gates evaluate in configuration order and the first non-`Ok`
-	/// verdict decides.
-	///
-	/// Default: no-op (policy ignored if transport doesn't support it).
-	fn with_collector_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
-		self
-	}
-
-	/// Configure receptor gate policy.
-	///
-	/// Default: no-op (policy ignored if transport doesn't support it).
-	fn with_receptor_gate<T: Message, R: ReceptorPolicy<T> + 'static>(self, _: R) -> Self {
-		self
-	}
-
-	/// Configure timeout for transport operations.
-	///
-	/// Default: no-op (timeout ignored if transport doesn't support it).
-	fn with_timeout(self, _: core::time::Duration) -> Self {
-		self
-	}
+	/// Configure the restart policy for this transport.
+	fn with_restart<P: RestartPolicy + 'static>(self, policy: P) -> Self;
 }
+
+/// A transport that honours emitter gates.
+pub trait EmitterGateConfig
+where
+	Self: Sized,
+{
+	/// Add an emitter gate.
+	///
+	/// Repeated calls accumulate into a [`crate::policy::GateChain`]: gates
+	/// evaluate in configuration order and the first non-`Ok` verdict decides.
+	fn with_emitter_gate<G: GatePolicy + 'static>(self, gate: G) -> Self;
+}
+
+/// A transport that honours collector gates.
+pub trait CollectorGateConfig
+where
+	Self: Sized,
+{
+	/// Add a collector gate.
+	///
+	/// Repeated calls accumulate into a [`crate::policy::GateChain`]: gates
+	/// evaluate in configuration order and the first non-`Ok` verdict decides.
+	fn with_collector_gate<G: GatePolicy + 'static>(self, gate: G) -> Self;
+}
+
+/// A transport that honours an operation deadline.
+pub trait TimeoutConfig
+where
+	Self: Sized,
+{
+	/// Set the deadline for a single read or write.
+	fn with_timeout(self, timeout: core::time::Duration) -> Self;
+}
+
+/// A transport that honours every policy kind.
+///
+/// This names the whole set for callers that need all of it. Each capability
+/// is its own trait, so a transport advertises exactly what it honours.
+pub trait PolicyConfig: RestartConfig + EmitterGateConfig + CollectorGateConfig + TimeoutConfig {}
+
+impl<T> PolicyConfig for T where T: RestartConfig + EmitterGateConfig + CollectorGateConfig + TimeoutConfig {}
 
 /// Core retry policy - provides basic retry configuration.
 ///

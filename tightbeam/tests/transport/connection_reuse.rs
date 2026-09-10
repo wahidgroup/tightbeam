@@ -178,7 +178,7 @@ tb_scenario! {
 			trace.event(CLIENT_CONNECT)?;
 
 			// Send 3 messages using the same client (connection keep-alive)
-			let client_builder = ClientBuilder::<TokioListener>::builder().build();
+			let client_builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let mut client = client_builder.connect(addr).await?;
 			for i in 1..=3 {
 				trace.event(SEND_MESSAGE)?;

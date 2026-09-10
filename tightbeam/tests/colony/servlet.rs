@@ -166,7 +166,7 @@ tb_scenario! {
 			CalcServlet::start(trace, Some(servlet_conf)).await
 		},
 		setup: |ClientEnv { addr, .. }| async move {
-			let builder = ClientBuilder::<TokioListener>::builder().build();
+			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
@@ -275,7 +275,7 @@ tb_scenario! {
 			SecureCalcServlet::start(trace, Some(servlet_conf)).await
 		},
 		setup: |ClientEnv { addr, .. }| async move {
-			let builder = ClientBuilder::<TokioListener>::builder().build();
+			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let client = builder.connect(addr).await?;
 			Ok(client)
 		},

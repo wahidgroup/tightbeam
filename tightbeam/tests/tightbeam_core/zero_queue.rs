@@ -6,14 +6,9 @@ use std::sync::{Arc, Mutex};
 use tightbeam::asn1::{DigestInfo, MessagePriority};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
 use tightbeam::colony::servlet::{Servlet, ServletConfig};
-use tightbeam::crypto::{
-	hash::Sha3_256,
-	key::{Secp256k1KeyProvider, SigningKeyProvider, SigningKeySpec},
-	x509::CertificateSpec,
-};
+use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::der::ValueOrd;
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
-use tightbeam::prelude::policy::PolicyConfig;
 use tightbeam::prelude::*;
 use tightbeam::testing::ScenarioConfig;
 use tightbeam::trace::TraceCollector;
@@ -26,8 +21,6 @@ use tightbeam::transport::{MessageEmitter, Protocol, TransportResult};
 use tightbeam::Beamable;
 use tightbeam::{at_least, between, exactly, present, server, servlet, tb_assert_spec, tb_scenario};
 use tightbeam::{utils, Frame, TightBeamError, Version};
-
-use crate::common::x509::create_test_cert_with_key;
 
 use tightbeam::utils::urn::Urn;
 
@@ -394,14 +387,11 @@ tb_scenario! {
 			QueueServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
 		setup: |env| async move {
-			let (client_cert, client_key) = create_test_cert_with_key("CN=Test Client", 365)?;
-
-			let key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
-			let certificate = CertificateSpec::Built(Box::new(client_cert));
+			// The servlet under test carries no encryption, so this link is
+			// cleartext and the scenario exercises back pressure over it.
 			let restart_policy = RestartLinearBackoff::new(3, 50, 1, None);
-
 			let builder = ClientBuilder::<TokioListener>::builder()
-				.with_client_identity(certificate, key_provider)?
+				.allow_cleartext()
 				.with_restart(restart_policy)
 				.build();
 

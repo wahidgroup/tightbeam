@@ -323,3 +323,25 @@ macro_rules! __tb_select_builder {
 macro_rules! __tb_select_builder {
 	({ $($with_builder:tt)* } { $($without_builder:tt)* }) => {{ $($without_builder)* }};
 }
+
+/// Emit the body, or refuse to compile when the `builder` feature is absent.
+///
+/// A form that reaches its safety decision through `ClientBuilder` uses this
+/// rather than [`__tb_select_builder`], because a fallback that builds the
+/// transport directly would reach the wire without that decision.
+#[cfg(feature = "builder")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_require_builder {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "builder"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_require_builder {
+	($($body:tt)*) => {
+		::core::compile_error!("a client with an identity requires the `builder` feature of tightbeam")
+	};
+}

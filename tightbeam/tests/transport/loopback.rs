@@ -130,8 +130,8 @@ fn bidirectional_roundtrip_ok(client_keys: &SessionKeys, server_keys: &SessionKe
 /// Emits the three named booleans for `HandshakeLoopbackSpec` to verify via
 /// `equals!(true)`.
 async fn emit_session_ready<C, S>(
-	client: &mut C,
-	server: &mut S,
+	client: Box<C>,
+	server: Box<S>,
 	profile: SecurityProfileDesc,
 	trace: &TraceCollector,
 	events: (Urn<'static>, Urn<'static>, Urn<'static>),
@@ -143,16 +143,22 @@ where
 {
 	let (complete_event, roundtrip_event, profile_event) = events;
 
-	let client_aead = ClientHandshakeProtocol::complete(client).await?;
-	let server_aead = ServerHandshakeProtocol::complete(server).await?;
-	let complete = ClientHandshakeProtocol::is_complete(client) && ServerHandshakeProtocol::is_complete(server);
-	trace.event_with(complete_event, &[], complete)?;
+	// Completing consumes each orchestrator, so both machines are read while
+	// they still exist. `complete()` makes the final transition itself, so the
+	// pair is mid-flight here and the event records that transition happening.
+	let pending_before_completion = !ClientHandshakeProtocol::is_complete(client.as_ref())
+		&& !ServerHandshakeProtocol::is_complete(server.as_ref());
 
-	let roundtrip = bidirectional_roundtrip_ok(&client_aead, &server_aead)?;
+	let client_profile = ClientHandshakeProtocol::selected_profile(client.as_ref());
+	let server_profile = ServerHandshakeProtocol::selected_profile(server.as_ref());
+
+	let client_session = ClientHandshakeProtocol::complete(client).await?;
+	let server_session = ServerHandshakeProtocol::complete(server).await?;
+	trace.event_with(complete_event, &[], pending_before_completion)?;
+
+	let roundtrip = bidirectional_roundtrip_ok(client_session.keys(), server_session.keys())?;
 	trace.event_with(roundtrip_event, &[], roundtrip)?;
 
-	let client_profile = ClientHandshakeProtocol::selected_profile(client);
-	let server_profile = ServerHandshakeProtocol::selected_profile(server);
 	let profile_agreed = client_profile == Some(profile) && server_profile == Some(profile);
 	trace.event_with(profile_event, &[], profile_agreed)?;
 
@@ -170,6 +176,7 @@ fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Resul
 	if reply.is_some() {
 		return Err(expectation_failure(msg));
 	}
+
 	Ok(())
 }
 
@@ -201,7 +208,7 @@ async fn ecies_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> 
 	require_terminal(no_reply, "ECIES server must not reply to ClientKeyExchange")?;
 
 	let events = (LOOPBACK_ECIES_COMPLETE, LOOPBACK_ECIES_ROUNDTRIP, LOOPBACK_ECIES_PROFILE_AGREED);
-	emit_session_ready(&mut client, &mut server, profile, trace, events).await
+	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
 }
 
 /// Build a CMS client/server pair sharing the fixture server identity.
@@ -218,7 +225,6 @@ fn build_cms_pair(
 > {
 	let profile = default_security_profile();
 	let pair = cms_handshake_pair(materials, vec![profile], vec![profile], None)?;
-
 	Ok((pair.client, pair.server))
 }
 
@@ -274,7 +280,7 @@ async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Re
 	require_terminal(no_reply, "CMS server must not reply to ClientFinished")?;
 
 	let events = (LOOPBACK_CMS_COMPLETE, LOOPBACK_CMS_ROUNDTRIP, LOOPBACK_CMS_PROFILE_AGREED);
-	emit_session_ready(&mut client, &mut server, profile, trace, events).await
+	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
 }
 
 /// CMS session keys must be random per handshake (CWE-321).

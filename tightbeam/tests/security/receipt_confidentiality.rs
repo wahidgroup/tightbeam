@@ -185,7 +185,7 @@ tb_scenario! {
 				receipts_match,
 			)?;
 
-			let activated = server.complete().is_ok();
+			let activated = server.take_established().is_ok();
 			trace.event_with(SETTLED_SESSION_ACTIVATES, &[], activated)?;
 
 			Ok::<(), TightBeamError>(())

@@ -35,7 +35,7 @@ use tightbeam::transport::state::SessionPhase;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO, TransportEncryptionConfig, TransportError,
-	WireEnvelope, X509ClientConfig,
+	TransportLimits, WireEnvelope, X509ClientConfig,
 };
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
@@ -125,9 +125,9 @@ pub async fn bind_encrypted_listener_with_timeout(
 ) -> Result<(TokioListener, SocketAddr), TightBeamError> {
 	let certificate = Certificate::clone(&materials.certificate);
 	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
+	let limits = TransportLimits { handshake_timeout, ..TransportLimits::default() };
 
-	let mut config = TransportEncryptionConfig::new(certificate, key_manager);
-	config.limits.handshake_timeout = handshake_timeout;
+	let config = TransportEncryptionConfig::new(certificate, key_manager).with_limits(limits);
 	bind_with_config(config).await
 }
 
@@ -255,7 +255,7 @@ pub async fn accept_handshaken_split(listener: TokioListener) -> Result<SplitTra
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
 	assert!(
-		matches!(transport.session_phase(), SessionPhase::Encrypted(_)),
+		matches!(transport.session_state().phase(), SessionPhase::Encrypted(_)),
 		"server handshake must complete after ClientKeyExchange"
 	);
 
@@ -270,7 +270,7 @@ pub async fn connect_handshaken_split(
 	let mut client = connect_pinned_client(addr, server_certificate).await?;
 	client.perform_client_handshake().await?;
 	assert!(
-		matches!(client.session_phase(), SessionPhase::Encrypted(_)),
+		matches!(client.session_state().phase(), SessionPhase::Encrypted(_)),
 		"client handshake must complete before splitting"
 	);
 

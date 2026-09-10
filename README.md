@@ -1535,6 +1535,7 @@ tightbeam::policy! {
 ```rust
 // Client-side with policies
 let builder = ClientBuilder::<TokioListener>::builder()
+	.allow_cleartext()
 	.with_emitter_gate(IdPatternGate)
 	.with_collector_gate(PriorityGate)
 	.with_restart(RestartLinearBackoff::new(3, 1000, 1, None))
@@ -2723,7 +2724,7 @@ tb_scenario! {
 			CalcServlet::start(Arc::new(env.trace), Some(servlet_conf)).await
 		},
 		setup: |env| async move {
-			let builder = ClientBuilder::<TokioListener>::builder().build();
+			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let client = builder.connect(env.addr).await?;
 			Ok(client)
 		},

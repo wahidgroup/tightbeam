@@ -29,6 +29,7 @@ mod x509 {
 	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::transport::handshake::receipt::ReceiptApprover;
 	pub use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
+	pub use crate::transport::state::EncryptionConfig;
 	pub use crate::transport::TransportEncryptionConfig;
 	pub use crate::x509::Certificate;
 }
@@ -102,27 +103,30 @@ pub trait X509ClientConfig: Sized {
 	/// Trust store against which the peer server certificate is validated.
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
-	/// Client certificate + signing keys for mutual authentication.
+	/// Client certificate and the signing key that proves it.
 	///
-	/// Arcs so pooled connections share one identity without deep-copying
-	/// the certificate per dial.
+	/// Both halves land together, so a transport cannot hold one without the
+	/// other. Arcs, so pooled connections share one identity per dial.
 	fn with_client_identity(self, cert: Arc<Certificate>, key: Arc<HandshakeKeyManager<Self::CryptoProvider>>) -> Self;
 
-	/// Provision the expected server certificate chain, ordered root to
-	/// leaf.
+	/// Provision the expected server certificate chain, ordered root to leaf.
 	///
-	/// Required for key-transport handshakes (CMS): the client encrypts the
-	/// session key to the server's public key in its first message, before
-	/// the server can present a certificate on the wire.
+	/// Required for key-transport handshakes (CMS), where the client encrypts
+	/// the session key to the server's public key before the server presents a
+	/// certificate on the wire.
 	fn with_server_certificate_chain(self, chain: Arc<[Certificate]>) -> Self;
 
-	/// Select the handshake protocol used when encryption is enabled.
+	/// Handshake protocol used once encryption is provisioned.
 	fn with_handshake_protocol(self, kind: HandshakeProtocolKind) -> Self;
 
-	/// Receipt approver consulted before countersigning at the handshake
-	/// and each in-band epoch renewal. Without one the client fails closed
-	/// on challenge-bearing receipts.
+	/// Approver consulted before countersigning a challenge-bearing receipt.
 	fn with_receipt_approver(self, approver: Arc<dyn ReceiptApprover>) -> Self;
+
+	/// Install the provisioning this endpoint was configured with.
+	///
+	/// The configuration moves in one piece, so a builder that accumulates
+	/// it cannot hand over some fields and forget others.
+	fn with_encryption(self, encryption: EncryptionConfig<Self::CryptoProvider>) -> Self;
 
 	/// Production instrumentation collector, propagated downstream
 	/// (handshake, mux plane) by the transport.

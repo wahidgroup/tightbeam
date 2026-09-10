@@ -732,6 +732,104 @@ impl HandshakeMessage {
 	}
 }
 
+/// What a completed handshake agreed, handed over in one value.
+///
+/// A handshake settles the keys and the terms that go with them at the same
+/// moment, so they travel together and a transport that installs the keys
+/// installs the rest with them.
+#[cfg(feature = "aead")]
+#[non_exhaustive]
+pub struct EstablishedSession {
+	/// Role-mapped directional keys. Each side sends on one key and receives
+	/// on the other.
+	keys: SessionKeys,
+	/// Multiplexing terms when both sides negotiated them. `None` leaves the
+	/// session single-flight.
+	mux: Option<MuxSettings>,
+	/// Dual-signed receipt from a budget-bearing handshake.
+	receipt: Option<Arc<StoredReceipt>>,
+	/// Peer certificate validated during mutual authentication.
+	#[cfg(feature = "x509")]
+	peer: Option<Arc<Certificate>>,
+	/// Epoch-0 rekey materials, present exactly while a rekey could use them.
+	epoch: Option<EpochMaterials>,
+}
+
+#[cfg(feature = "aead")]
+impl EstablishedSession {
+	/// Assemble what one handshake agreed.
+	///
+	/// Epoch materials serve a rekey alone, and a rekey re-signs against the
+	/// session receipt and the peer identity. A session missing either can
+	/// never renew, so its epoch secret is released here rather than held,
+	/// unreachable, for as long as the session lives.
+	pub(crate) fn new(
+		keys: SessionKeys,
+		mux: Option<MuxSettings>,
+		receipt: Option<Arc<StoredReceipt>>,
+		#[cfg(feature = "x509")] peer: Option<Arc<Certificate>>,
+		epoch: Option<EpochMaterials>,
+	) -> Self {
+		#[cfg(feature = "x509")]
+		let renewable = receipt.is_some() && peer.is_some();
+		#[cfg(not(feature = "x509"))]
+		let renewable = receipt.is_some();
+
+		let epoch = epoch.filter(|_| renewable);
+
+		Self {
+			keys,
+			mux,
+			receipt,
+			#[cfg(feature = "x509")]
+			peer,
+			epoch,
+		}
+	}
+
+	/// Detach the epoch rekey materials, once.
+	pub(crate) fn take_epoch(&mut self) -> Option<EpochMaterials> {
+		self.epoch.take()
+	}
+
+	/// The directional keys, for a caller that consumes the session.
+	pub fn into_keys(self) -> SessionKeys {
+		self.keys
+	}
+
+	/// Role-mapped directional keys for this session.
+	pub fn keys(&self) -> &SessionKeys {
+		&self.keys
+	}
+
+	/// Multiplexing terms both sides agreed, if any.
+	pub fn mux(&self) -> Option<MuxSettings> {
+		self.mux
+	}
+
+	/// Dual-signed receipt from a budget-bearing handshake.
+	pub fn receipt(&self) -> Option<&StoredReceipt> {
+		self.receipt.as_deref()
+	}
+
+	/// Peer certificate validated during mutual authentication.
+	#[cfg(feature = "x509")]
+	pub fn peer(&self) -> Option<&Certificate> {
+		self.peer.as_deref()
+	}
+
+	/// Shared handle to the validated peer certificate.
+	#[cfg(feature = "x509")]
+	pub fn peer_arc(&self) -> Option<Arc<Certificate>> {
+		self.peer.as_ref().map(Arc::clone)
+	}
+
+	/// Shared handle to the dual-signed session receipt.
+	pub fn receipt_arc(&self) -> Option<Arc<StoredReceipt>> {
+		self.receipt.as_ref().map(Arc::clone)
+	}
+}
+
 /// Client-side handshake protocol trait.
 ///
 /// Supports multi-round handshakes where the client may need to send multiple
@@ -756,49 +854,19 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 		msg: HandshakeMessage,
 	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, Self::Error>>;
 
-	/// Complete the handshake and extract the directional session keys.
+	/// Complete the handshake and take everything it agreed.
 	///
-	/// Should be called after the handshake is complete (when `is_complete()`
-	/// returns true).
-	///
-	/// Returns role-mapped [`SessionKeys`]: the client sends on the
-	/// client-to-server key and receives on the server-to-client key.
-	///
-	/// The cipher type is determined by the CryptoProvider's AeadCipher
-	/// associated type, and the OID is taken from the negotiated
-	/// security profile.
+	/// Call this once `is_complete()` returns true. The client sends on the
+	/// client-to-server key and receives on the server-to-client key. The
+	/// cipher comes from the `CryptoProvider` associated type and the OID
+	/// from the negotiated security profile.
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<SessionKeys, Self::Error>>;
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
 	fn is_complete(&self) -> bool;
 
 	/// Negotiated algorithm OIDs after profile negotiation; `None` before accept.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
-
-	/// Multiplexing settings when both sides negotiated mux; else single-flight.
-	fn negotiated_mux(&self) -> Option<MuxSettings> {
-		None
-	}
-
-	/// Dual-signed receipt after a budget-bearing handshake with both signatures.
-	fn session_receipt(&self) -> Option<&StoredReceipt> {
-		None
-	}
-
-	/// Validated peer certificate (client: server); `None` before validation.
-	#[cfg(feature = "x509")]
-	fn peer_certificate(&self) -> Option<&Certificate> {
-		None
-	}
-
-	/// Take the epoch-0 rekey materials produced at completion.
-	///
-	/// `None` before completion, after the materials were already
-	/// taken, or when the orchestrator retains no epoch state.
-	#[cfg(feature = "aead")]
-	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
-		None
-	}
 }
 
 /// Server-side handshake protocol trait.
@@ -821,48 +889,20 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 		msg: HandshakeMessage,
 	) -> MaybeSendFuture<'a, CoreResult<Option<HandshakeMessage>, Self::Error>>;
 
-	/// Complete the handshake and extract the directional session keys.
+	/// Complete the handshake and take everything it agreed.
 	///
-	/// Should be called after the handshake is complete (when `is_complete()`
-	/// returns true).
-	///
-	/// Returns role-mapped [`SessionKeys`]: the server sends on the
-	/// server-to-client key and receives on the client-to-server key.
-	///
-	/// The cipher type is determined by the CryptoProvider's AeadCipher
-	/// associated type, and the OID is taken from the negotiated
-	/// security profile.
+	/// Call this once `is_complete()` returns true. The server sends on the
+	/// server-to-client key and receives on the client-to-server key. The
+	/// cipher comes from the `CryptoProvider` associated type and the OID from
+	/// the negotiated security profile.
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<SessionKeys, Self::Error>>;
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
 	/// Returns true if the handshake is complete.
 	fn is_complete(&self) -> bool;
 
 	/// Negotiated algorithm OIDs after profile negotiation; `None` before accept.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
-
-	/// Validated client certificate from mutual authentication; immutable for the connection.
-	#[cfg(feature = "x509")]
-	fn peer_certificate(&self) -> Option<&Certificate>;
-
-	/// Multiplexing settings when both sides negotiated mux; else single-flight.
-	fn negotiated_mux(&self) -> Option<MuxSettings> {
-		None
-	}
-
-	/// Dual-signed receipt after a budget-bearing handshake with both signatures.
-	fn session_receipt(&self) -> Option<&StoredReceipt> {
-		None
-	}
-
-	/// Take the epoch-0 rekey materials produced at completion.
-	///
-	/// `None` before completion, after the materials were already
-	/// taken, or when the orchestrator retains no epoch state.
-	#[cfg(feature = "aead")]
-	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
-		None
-	}
 }
 
 /// Boxed client handshake orchestrator.
@@ -1093,7 +1133,6 @@ fn first_octet_string(attr: &Attribute) -> Result<Option<OctetString>> {
 #[cfg(feature = "x509")]
 fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<ClientKeyExchangeAttrs> {
 	let mut parsed = ClientKeyExchangeAttrs::default();
-
 	if let Some(attrs) = &enveloped_data.unprotected_attrs {
 		for attr in attrs.iter() {
 			if attr.oid == CLIENT_CERTIFICATE {

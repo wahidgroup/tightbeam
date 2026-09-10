@@ -33,6 +33,7 @@ mod x509 {
 	pub use crate::crypto::x509::{Certificate, CertificateSpec};
 	pub use crate::transport::handshake::receipt::ReceiptApprover;
 	pub use crate::transport::handshake::HandshakeProtocolKind;
+	pub use crate::transport::state::{ClientIdentity, EncryptionConfig};
 }
 
 #[cfg(feature = "x509")]
@@ -40,7 +41,7 @@ use x509::*;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
-	pub use crate::transport::policy::PolicyConfig;
+	pub use crate::transport::policy::{PolicyConfig, TimeoutConfig};
 	pub use crate::transport::MessageEmitter;
 	pub use crate::Frame;
 }
@@ -129,44 +130,17 @@ impl Default for PoolConfig {
 }
 
 #[cfg(feature = "x509")]
-#[derive(Clone)]
-/// Client authentication bundle kept behind Arc for zero-copy reuse.
-pub(crate) struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
-	certificate: Arc<Certificate>,
-	key: Arc<HandshakeKeyManager<C>>,
-}
-
-#[cfg(feature = "x509")]
-impl<C: CryptoProvider> ClientIdentity<C> {
-	/// Bind a certificate to the handshake key that proves it.
-	pub(crate) fn new(certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) -> Self {
-		Self { certificate, key }
-	}
-
-	/// Offer this identity on `transport`, so the dial presents it.
-	///
-	/// The certificate and its key travel together, so a transport cannot
-	/// receive one without the other.
-	pub(crate) fn offer_on<T: X509ClientConfig<CryptoProvider = C>>(&self, transport: T) -> T {
-		transport.with_client_identity(Arc::clone(&self.certificate), Arc::clone(&self.key))
-	}
-}
-
-#[cfg(feature = "x509")]
 #[derive(Clone, Default)]
 /// Shared TLS assets reused across pooled connections without reallocations.
 struct PoolTlsConfig<C: CryptoProvider = DefaultCryptoProvider> {
-	trust_store: Option<Arc<dyn CertificateTrust>>,
-	client_identity: Option<ClientIdentity<C>>,
-	server_certificate_chain: Option<Arc<[Certificate]>>,
-	handshake_protocol: Option<HandshakeProtocolKind>,
-	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
+	/// Provisioning every dial from this pool starts with.
+	encryption: EncryptionConfig<C>,
 }
 
 #[cfg(feature = "x509")]
 impl<C: CryptoProvider> PoolTlsConfig<C> {
 	fn set_trust_store(&mut self, store: Arc<dyn CertificateTrust>) {
-		self.trust_store = Some(store);
+		self.encryption.trust_store = Some(store);
 	}
 
 	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager<C>) {
@@ -174,19 +148,19 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 	}
 
 	fn set_shared_client_identity(&mut self, certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) {
-		self.client_identity = Some(ClientIdentity::new(certificate, key));
+		ClientIdentity::new(certificate, key).install(&mut self.encryption);
 	}
 
 	fn set_server_certificate_chain(&mut self, chain: Arc<[Certificate]>) {
-		self.server_certificate_chain = Some(chain);
+		self.encryption.server_certificate_chain = Some(chain);
 	}
 
 	fn set_handshake_protocol(&mut self, kind: HandshakeProtocolKind) {
-		self.handshake_protocol = Some(kind);
+		self.encryption.handshake_protocol = kind;
 	}
 
 	fn set_receipt_approver(&mut self, approver: Arc<dyn ReceiptApprover>) {
-		self.receipt_approver = Some(approver);
+		self.encryption.receipt_approver = Some(approver);
 	}
 
 	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
@@ -194,27 +168,9 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		Pro: Protocol,
 		Pro::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
 	{
-		let mut configured = transport;
-		if let Some(store) = &self.trust_store {
-			let store = Arc::clone(store);
-			configured = configured.with_trust_store(store);
-		}
-		if let Some(identity) = &self.client_identity {
-			configured = identity.offer_on(configured);
-		}
-		if let Some(chain) = &self.server_certificate_chain {
-			let chain = Arc::clone(chain);
-			configured = configured.with_server_certificate_chain(chain);
-		}
-		if let Some(kind) = self.handshake_protocol {
-			configured = configured.with_handshake_protocol(kind);
-		}
-		if let Some(approver) = &self.receipt_approver {
-			let approver = Arc::clone(approver);
-			configured = configured.with_receipt_approver(approver);
-		}
-
-		configured
+		// The provisioning moves to the transport whole. Cloning it bumps
+		// refcounts, so a dial copies no certificate.
+		transport.with_encryption(self.encryption.clone())
 	}
 }
 
@@ -244,6 +200,16 @@ impl<P: Protocol, C: CryptoProvider> Default for ConnectionPoolBuilder<P, C> {
 }
 
 impl<P: Protocol, C: CryptoProvider> ConnectionPoolBuilder<P, C> {
+	/// Run this pool's connections without authenticating the peer.
+	///
+	/// Every dial carries the decision, so a pool with no trust store states it
+	/// once rather than each connection failing at its first write.
+	#[cfg(feature = "x509")]
+	pub fn allow_cleartext(mut self) -> Self {
+		self.tls.encryption.allow_cleartext = true;
+		self
+	}
+
 	pub fn with_config(mut self, config: PoolConfig) -> Self {
 		self.config = config;
 		self
@@ -516,6 +482,10 @@ where
 	}
 
 	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, C>> {
+		// Every pool dial reserves a slot first, so this is where the pool
+		// answers the question a single client answers in `ClientBuilder`.
+		self.tls.encryption.check_dial_permitted()?;
+
 		// Single atomic check-and-increment so concurrent callers cannot all
 		// pass a separate limit check and overshoot max_connections.
 		let reserved = self
@@ -1023,7 +993,7 @@ where
 			return lease.peer_certificate.as_deref();
 		}
 
-		self.client.as_ref()?.transport().to_peer_certificate_ref()
+		self.client.as_ref()?.transport().session_state().peer_certificate()
 	}
 }
 

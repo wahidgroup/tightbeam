@@ -155,12 +155,29 @@ impl HandshakeAttribute {
 		Ok(self.value()?.decode_as()?)
 	}
 
+	/// The bytes this attribute's value arrived as.
+	///
+	/// A receiver binds what the peer actually sent. Re-encoding the decoded
+	/// value instead would erase any difference the decoder normalised away:
+	/// `der` sorts a `SET OF` before validating it, so a reordered set would
+	/// hash the same as the well-ordered one and pass unseen (CWE-345).
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::MissingAttribute`] -- the attribute carries no
+	///   value.
+	pub fn received_bytes(&self) -> Result<Vec<u8>, HandshakeError> {
+		use crate::der::Encode;
+
+		Ok(self.value()?.to_der()?)
+	}
+
 	/// Canonical DER bytes of `payload` for transcript binding.
 	///
-	/// Both handshake sides append these bytes to the transcript before
-	/// the Finished hash is computed, binding the negotiated value to the
-	/// signature (CWE-345): a tampered attribute changes the peer's
-	/// transcript hash and fails signature verification.
+	/// The sender's half of the pairing with [`Self::received_bytes`]: these
+	/// are the bytes about to go on the wire, so both sides hash the same
+	/// encoding and a tampered attribute diverges the two transcript hashes
+	/// (CWE-345).
 	pub fn transcript_bytes<T>(payload: &T) -> Result<Vec<u8>, HandshakeError>
 	where
 		T: AttributePayload + Tagged + crate::der::EncodeValue,
@@ -332,6 +349,22 @@ mod tests {
 			oid: HANDSHAKE_ABORT_ALERT,
 			values: SetOfVec::try_from(vec![mk_integer(bytes)?])?,
 		})
+	}
+
+	/// A receiver binds what arrived. `der` sorts a `SET OF` before it
+	/// validates one, so a value that re-encodes to different bytes than it
+	/// arrived as would let that normalisation erase tamper evidence
+	/// (CWE-345, U-107).
+	#[test]
+	fn the_transcript_binds_the_bytes_an_attribute_arrived_as() -> Result<(), HandshakeError> {
+		use crate::der::{Decode, Encode};
+
+		// A SET OF whose members are out of DER order. Decoding sorts them,
+		// so the decoded value no longer describes what was sent.
+		let unsorted = Any::from_der(&[0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01])?;
+		let attribute = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT, unsorted.to_owned())?;
+		assert_eq!(attribute.received_bytes()?, unsorted.to_der()?);
+		Ok(())
 	}
 
 	#[test]

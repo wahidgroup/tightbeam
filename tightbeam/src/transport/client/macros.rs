@@ -4,43 +4,27 @@ macro_rules! client {
 	// With identity only (mutual auth without policies)
 	(connect $protocol:path: $addr:expr, identity: ($cert:expr, $key:expr)) => {{
 		$crate::__tb_require_std!({
-			$crate::__tb_select_builder!(
-				{
-					use $crate::transport::ConnectionBuilder;
-					let builder = $crate::transport::client::ClientBuilder::<$protocol>::builder();
-					let builder = ConnectionBuilder::with_client_identity(builder, $cert, $key)?;
-					let builder = ConnectionBuilder::build(builder);
-					builder.connect($addr).await?
-				}
-				{
-					let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
-					<$protocol as $crate::transport::Protocol>::create_transport(stream)
-						.with_client_identity($cert, $key)
-				}
-			)
+			$crate::__tb_require_builder!({
+				use $crate::transport::ConnectionBuilder;
+				let builder = $crate::transport::client::ClientBuilder::<$protocol>::builder();
+				let builder = ConnectionBuilder::with_client_identity(builder, $cert, $key)?;
+				let builder = ConnectionBuilder::build(builder);
+				builder.connect($addr).await?
+			})
 		})
 	}};
 
 	// With identity AND policies (mutual auth with policies)
 	(connect $protocol:path: $addr:expr, identity: ($cert:expr, $key:expr), policies: { $($tt:tt)* }) => {{
 		$crate::__tb_require_std!({
-			$crate::__tb_select_builder!(
-				{
-					use $crate::transport::ConnectionBuilder;
-					let __builder = $crate::transport::client::ClientBuilder::<$protocol>::builder();
-					let __builder = $crate::client!(@apply_policies_to_builder __builder, { $($tt)* });
-					let __builder = ConnectionBuilder::with_client_identity(__builder, $cert, $key)?;
-					let __builder = ConnectionBuilder::build(__builder);
-					__builder.connect($addr).await?
-				}
-				{
-					let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
-					let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream)
-						.with_client_identity($cert, $key);
-					__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
-					__transport
-				}
-			)
+			$crate::__tb_require_builder!({
+				use $crate::transport::ConnectionBuilder;
+				let __builder = $crate::transport::client::ClientBuilder::<$protocol>::builder();
+				let __builder = $crate::client!(@apply_policies_to_builder __builder, { $($tt)* });
+				let __builder = ConnectionBuilder::with_client_identity(__builder, $cert, $key)?;
+				let __builder = ConnectionBuilder::build(__builder);
+				__builder.connect($addr).await?
+			})
 		})
 	}};
 

@@ -12,20 +12,45 @@ use crate::colony::hive::{
 	ServletAddressUpdateResponse, ServletRegistry,
 };
 use crate::crypto::hash::Sha3_256;
-use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::x509::store::CertificateTrust;
 use crate::decode;
 use crate::instrumentation::events::HIVE_REREGISTERED;
 use crate::policy::TransitStatus;
 use crate::runtime::rt;
 use crate::trace::TraceCollector;
-use crate::transport::client::pool::ClientIdentity;
 use crate::transport::policy::CoreRetryPolicy;
+use crate::transport::state::ClientIdentity;
+use crate::transport::state::EncryptionConfig;
+use crate::transport::TransportResult;
 use crate::transport::{MessageEmitter, Protocol, X509ClientConfig};
 use crate::utils::urn::Urn;
 use crate::{Frame, Message, TightBeamError, Version};
 
 /// Build a hive-to-cluster control frame, signed when hive TLS is configured.
+/// Provisioning a cluster dial starts from.
+#[cfg(feature = "x509")]
+fn cluster_encryption<C: CryptoProvider>(
+	trust_store: Option<&Arc<dyn CertificateTrust>>,
+	identity: Option<&ClientIdentity<C>>,
+) -> TransportResult<EncryptionConfig<C>> {
+	let mut encryption = EncryptionConfig::default();
+	if let Some(store) = trust_store {
+		encryption.trust_store = Some(Arc::clone(store));
+	}
+	if let Some(identity) = identity {
+		identity.install(&mut encryption);
+	}
+
+	// A hive dials the cluster, so it answers the dialer's question here
+	// rather than at the first frame it tries to write. A hive identity with
+	// no trust store would present that identity to whoever answered the
+	// cluster address (CWE-295).
+	encryption.check_dial_permitted()?;
+
+	Ok(encryption)
+}
+
 async fn build_control_frame(
 	id: &[u8],
 	message: impl Message,
@@ -266,16 +291,9 @@ where
 	TightBeamError: From<P::Error>,
 {
 	let stream = P::connect(cluster_addr).await?;
-	let mut transport = P::create_transport(stream);
-	if let Some(store) = trust_store {
-		transport = transport.with_trust_store(Arc::clone(store));
-	}
-
-	if let Some(hive_tls) = hive_tls {
-		transport = hive_tls.client_identity()?.offer_on(transport);
-	}
-
-	Ok(transport)
+	let identity = hive_tls.map(|tls| tls.client_identity()).transpose()?;
+	let encryption = cluster_encryption(trust_store, identity.as_ref())?;
+	Ok(P::create_transport(stream).with_encryption(encryption))
 }
 
 async fn fanout_scaling_update<P>(
@@ -328,21 +346,20 @@ where
 	P::Error: Send,
 	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send,
 {
+	// The provisioning does not change between attempts, and a refused dial is
+	// a configuration this loop cannot retry its way out of.
+	let Ok(encryption) = cluster_encryption(trust_store, client_identity) else {
+		return false;
+	};
+
 	for attempt in 0..=max_attempts {
 		let Ok(stream) = P::connect(gateway).await else {
 			retry_delay(attempt, max_attempts, retry_policy).await;
 			continue;
 		};
 
-		let mut transport = P::create_transport(stream);
-		if let Some(store) = trust_store {
-			transport = transport.with_trust_store(Arc::clone(store));
-		}
-		if let Some(identity) = client_identity {
-			transport = identity.offer_on(transport);
-		}
-
 		// Transport Ok is not acceptance: require TransitStatus::Ok in the body.
+		let mut transport = P::create_transport(stream).with_encryption(encryption.clone());
 		match transport.emit(frame.clone(), None).await {
 			Ok(Some(response)) => {
 				let decoded = decode::<ServletAddressUpdateResponse>(&response.message);

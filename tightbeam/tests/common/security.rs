@@ -345,12 +345,15 @@ mod cms_pair {
 			Arc::clone(&materials.certificate),
 		)
 		.with_security_offer(SecurityOffer::new(client_profiles))
-		.with_trust_store(trust_store);
+		.with_trust_store(trust_store)
+		.with_client_certificate(Arc::clone(&client_certificate));
 
-		let mut server =
-			CmsHandshakeServer::<DefaultCryptoProvider>::new(Arc::clone(&materials.key_provider), validators)
-				.with_supported_profiles(server_profiles);
-		server.set_client_certificate((*client_certificate).to_owned())?;
+		// The server learns the client certificate from the KeyExchange it
+		// processes, as it does in production. Seeding it here would test a
+		// server that already knows what the handshake is meant to establish.
+		let provider = Arc::clone(&materials.key_provider);
+		let server = CmsHandshakeServer::<DefaultCryptoProvider>::new(provider, validators)
+			.with_supported_profiles(server_profiles);
 
 		Ok(CmsHandshakePair { client, server, client_certificate })
 	}

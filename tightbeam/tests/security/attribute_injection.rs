@@ -143,7 +143,7 @@ tb_scenario! {
 				duplicate_rejected,
 			)?;
 
-			let activation = server.complete();
+			let activation = server.take_established();
 			let activation_refused = matches!(activation, Err(HandshakeError::CountersignatureMissing));
 			trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 

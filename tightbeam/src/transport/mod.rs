@@ -154,17 +154,34 @@ impl Default for TransportLimits {
 
 #[cfg(feature = "x509")]
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	/// Identity certificate this endpoint presents during the handshake.
-	pub certificate: Certificate,
+	pub(crate) certificate: Certificate,
 	/// Signing and key-agreement material backing the certificate.
-	pub key_manager: Arc<HandshakeKeyManager<P>>,
+	pub(crate) key_manager: Arc<HandshakeKeyManager<P>>,
 	/// Peer-certificate checks; `Some` demands mutual authentication.
-	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	pub(crate) client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	/// Domain-separation tag bound into every AEAD associated-data block.
-	pub aad_domain_tag: &'static [u8],
+	pub(crate) aad_domain_tag: &'static [u8],
 	/// Every ceiling this endpoint enforces.
-	pub limits: TransportLimits,
+	pub(crate) limits: TransportLimits,
+}
+
+#[cfg(feature = "x509")]
+impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for crate::transport::state::EncryptionConfig<P> {
+	/// The one place a server's configuration becomes provisioning.
+	///
+	/// `limits` is not provisioning, so it stays on the caller to install.
+	fn from(config: TransportEncryptionConfig<P>) -> Self {
+		Self {
+			server_certificate: Some(Arc::new(config.certificate)),
+			client_validators: config.client_validators,
+			aad_domain_tag: Some(config.aad_domain_tag),
+			key_manager: Some(config.key_manager),
+			..Self::default()
+		}
+	}
 }
 
 #[cfg(feature = "x509")]
@@ -181,6 +198,10 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	}
 
 	/// Accepts any iterator of shared [`CertificateValidation`] values.
+	///
+	/// Naming validators demands mutual authentication, so an empty set still
+	/// demands it and admits every client certificate.
+	#[must_use]
 	pub fn with_client_validators(
 		mut self,
 		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
@@ -188,6 +209,33 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		let validators = Arc::new(validators.into_iter().collect::<Vec<_>>());
 		self.client_validators = Some(validators);
 		self
+	}
+
+	/// Replace every ceiling this endpoint enforces.
+	#[must_use]
+	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
+		self.limits = limits;
+		self
+	}
+
+	/// Replace the domain-separation tag bound into every AEAD block.
+	///
+	/// Both endpoints derive their associated data from this tag, so a session
+	/// only completes when the two agree on it.
+	#[must_use]
+	pub fn with_aad_domain_tag(mut self, tag: &'static [u8]) -> Self {
+		self.aad_domain_tag = tag;
+		self
+	}
+
+	/// Every ceiling this endpoint enforces.
+	pub fn limits(&self) -> &TransportLimits {
+		&self.limits
+	}
+
+	/// Identity certificate this endpoint presents during the handshake.
+	pub fn certificate(&self) -> &Certificate {
+		&self.certificate
 	}
 }
 
@@ -204,7 +252,7 @@ mod tests {
 		use std::sync::{mpsc, Arc};
 
 		use crate::asn1::Frame;
-		use crate::transport::policy::{PolicyConfig, RestartLinearBackoff};
+		use crate::transport::policy::{RestartConfig, RestartLinearBackoff};
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::tcp::TightBeamSocketAddr;
 

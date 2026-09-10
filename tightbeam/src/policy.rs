@@ -148,15 +148,11 @@ impl SessionContext {
 	/// Snapshot the peer identity and settled receipt off an encrypted
 	/// transport after its handshake completed.
 	pub fn capture<T: EncryptedProtocolState>(transport: &T) -> Self {
-		let peer_certificate = transport.to_peer_certificate_arc();
-		// Capture encodes SPKI once per session snapshot. Transport
-		// admission does not yet share a cached Arc for this field.
+		// Capture encodes SPKI once per session snapshot.
+		let peer_certificate = transport.session_state().peer_certificate_arc();
 		let peer_public_key = peer_certificate.as_deref().and_then(spki_der);
-		Self {
-			peer_certificate,
-			peer_public_key,
-			session_receipt: transport.to_session_receipt_arc(),
-		}
+		let session_receipt = transport.session_state().receipt_arc();
+		Self { peer_certificate, peer_public_key, session_receipt }
 	}
 
 	/// The same identity with the receipt replaced when a live one exists.
