@@ -852,7 +852,7 @@ where
 			return Err(TransportError::InvalidState);
 		};
 
-		let (send_key, recv_key) = session.keys.into_parts();
+		let (send_key, recv_key) = session.into_keys().into_parts();
 		let limits = self.limits;
 
 		#[cfg(feature = "instrument")]

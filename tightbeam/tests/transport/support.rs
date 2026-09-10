@@ -35,7 +35,7 @@ use tightbeam::transport::state::SessionPhase;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO, TransportEncryptionConfig, TransportError,
-	WireEnvelope, X509ClientConfig,
+	TransportLimits, WireEnvelope, X509ClientConfig,
 };
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
@@ -125,9 +125,9 @@ pub async fn bind_encrypted_listener_with_timeout(
 ) -> Result<(TokioListener, SocketAddr), TightBeamError> {
 	let certificate = Certificate::clone(&materials.certificate);
 	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
+	let limits = TransportLimits { handshake_timeout, ..TransportLimits::default() };
 
-	let mut config = TransportEncryptionConfig::new(certificate, key_manager);
-	config.limits.handshake_timeout = handshake_timeout;
+	let config = TransportEncryptionConfig::new(certificate, key_manager).with_limits(limits);
 	bind_with_config(config).await
 }
 

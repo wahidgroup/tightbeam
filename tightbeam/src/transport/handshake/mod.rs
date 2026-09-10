@@ -742,21 +742,61 @@ impl HandshakeMessage {
 pub struct EstablishedSession {
 	/// Role-mapped directional keys. Each side sends on one key and receives
 	/// on the other.
-	pub(crate) keys: SessionKeys,
+	keys: SessionKeys,
 	/// Multiplexing terms when both sides negotiated them. `None` leaves the
 	/// session single-flight.
-	pub(crate) mux: Option<MuxSettings>,
+	mux: Option<MuxSettings>,
 	/// Dual-signed receipt from a budget-bearing handshake.
-	pub(crate) receipt: Option<Arc<StoredReceipt>>,
+	receipt: Option<Arc<StoredReceipt>>,
 	/// Peer certificate validated during mutual authentication.
 	#[cfg(feature = "x509")]
-	pub(crate) peer: Option<Arc<Certificate>>,
-	/// Epoch-0 rekey materials seeded at completion, for in-band renewal.
-	pub(crate) epoch: Option<EpochMaterials>,
+	peer: Option<Arc<Certificate>>,
+	/// Epoch-0 rekey materials, present exactly while a rekey could use them.
+	epoch: Option<EpochMaterials>,
 }
 
 #[cfg(feature = "aead")]
 impl EstablishedSession {
+	/// Assemble what one handshake agreed.
+	///
+	/// Epoch materials serve a rekey alone, and a rekey re-signs against the
+	/// session receipt and the peer identity. A session missing either can
+	/// never renew, so its epoch secret is released here rather than held,
+	/// unreachable, for as long as the session lives.
+	pub(crate) fn new(
+		keys: SessionKeys,
+		mux: Option<MuxSettings>,
+		receipt: Option<Arc<StoredReceipt>>,
+		#[cfg(feature = "x509")] peer: Option<Arc<Certificate>>,
+		epoch: Option<EpochMaterials>,
+	) -> Self {
+		#[cfg(feature = "x509")]
+		let renewable = receipt.is_some() && peer.is_some();
+		#[cfg(not(feature = "x509"))]
+		let renewable = receipt.is_some();
+
+		let epoch = epoch.filter(|_| renewable);
+
+		Self {
+			keys,
+			mux,
+			receipt,
+			#[cfg(feature = "x509")]
+			peer,
+			epoch,
+		}
+	}
+
+	/// Detach the epoch rekey materials, once.
+	pub(crate) fn take_epoch(&mut self) -> Option<EpochMaterials> {
+		self.epoch.take()
+	}
+
+	/// The directional keys, for a caller that consumes the session.
+	pub fn into_keys(self) -> SessionKeys {
+		self.keys
+	}
+
 	/// Role-mapped directional keys for this session.
 	pub fn keys(&self) -> &SessionKeys {
 		&self.keys
@@ -776,6 +816,17 @@ impl EstablishedSession {
 	#[cfg(feature = "x509")]
 	pub fn peer(&self) -> Option<&Certificate> {
 		self.peer.as_deref()
+	}
+
+	/// Shared handle to the validated peer certificate.
+	#[cfg(feature = "x509")]
+	pub fn peer_arc(&self) -> Option<Arc<Certificate>> {
+		self.peer.as_ref().map(Arc::clone)
+	}
+
+	/// Shared handle to the dual-signed session receipt.
+	pub fn receipt_arc(&self) -> Option<Arc<StoredReceipt>> {
+		self.receipt.as_ref().map(Arc::clone)
 	}
 }
 

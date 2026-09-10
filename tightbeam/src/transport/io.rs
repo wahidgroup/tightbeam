@@ -204,19 +204,19 @@ where
 	};
 
 	let aead_oid = state.session_state().encryptor()?.algorithm_oid();
-	let Some(peer_cert) = state.session_state().peer_certificate() else {
+	let Some(peer_certificate) = state.session_state().peer_certificate_arc() else {
 		return Ok(None);
 	};
 
-	let public_key = peer_cert.verifying_key::<P::Curve>()?;
+	let public_key = peer_certificate.verifying_key::<P::Curve>()?;
 	let peer_verifying_key = P::VerifyingKey::from(public_key);
-	let peer_sid = peer_cert.signer_identifier::<P::Digest>()?;
-	let peer_certificate = Arc::new(peer_cert.clone());
+	let peer_sid = peer_certificate.signer_identifier::<P::Digest>()?;
 
 	// Detached last so a session refused above keeps its materials
 	let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
 		return Ok(None);
 	};
+
 	let reference_receipt = stored.receipt().clone();
 	let materials =
 		RekeyMaterials::<P>::new(epoch, aead_oid, reference_receipt, provider, peer_verifying_key, peer_sid);
@@ -1396,17 +1396,12 @@ mod tests {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
 		use crate::der::oid::AssociatedOid;
 
-		let encrypted = SessionPhase::Encrypted(Box::new(EstablishedSession {
-			keys: SessionKeys::for_client(
-				Aes256Gcm::new(&[0u8; 32].into()),
-				Aes256Gcm::new(&[1u8; 32].into()),
-				Aes256GcmOid::OID,
-			),
-			mux: None,
-			receipt: None,
-			peer: None,
-			epoch: None,
-		}));
+		let keys = SessionKeys::for_client(
+			Aes256Gcm::new(&[0u8; 32].into()),
+			Aes256Gcm::new(&[1u8; 32].into()),
+			Aes256GcmOid::OID,
+		);
+		let encrypted = SessionPhase::Encrypted(Box::new(EstablishedSession::new(keys, None, None, None, None)));
 
 		let handshaking = SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() };
 		let cases = [

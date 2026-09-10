@@ -482,6 +482,10 @@ where
 	}
 
 	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, C>> {
+		// Every pool dial reserves a slot first, so this is where the pool
+		// answers the question a single client answers in `ClientBuilder`.
+		self.tls.encryption.check_dial_permitted()?;
+
 		// Single atomic check-and-increment so concurrent callers cannot all
 		// pass a separate limit check and overshoot max_connections.
 		let reserved = self

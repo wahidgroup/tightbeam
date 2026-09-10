@@ -505,19 +505,16 @@ where
 		let ciphers = EciesHandshakeServer::complete(self)?;
 
 		// The orchestrator is spent, so the receipt moves out rather than
-		// copies. The client certificate is shared behind an `Arc`, so it
-		// is copied out of it.
+		// copies. The client certificate is already shared, so the session
+		// takes a handle to it.
 		#[cfg(feature = "x509")]
 		let peer = self.validated_client_cert.as_ref().map(Arc::clone);
 
-		Ok(EstablishedSession {
-			keys: SessionKeys::for_server(ciphers.client_to_server, ciphers.server_to_client, aead_oid),
-			mux: self.mux_settings,
-			receipt: self.stored_receipt.take().map(Arc::new),
-			#[cfg(feature = "x509")]
-			peer,
-			epoch: self.epoch_materials.take(),
-		})
+		let keys = SessionKeys::for_server(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
+		let mux = self.mux_settings;
+		let receipt = self.stored_receipt.take().map(Arc::new);
+		let epoch = self.epoch_materials.take();
+		Ok(EstablishedSession::new(keys, mux, receipt, peer, epoch))
 	}
 
 	pub fn decode_client_key_exchange(&self, der_bytes: &[u8]) -> Result<ClientKeyExchange, HandshakeError> {

@@ -320,7 +320,7 @@ macro_rules! impl_tcp_common {
 			/// `None` if unused or incomplete.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
 				match self.state.phase() {
-					$crate::transport::state::SessionPhase::Encrypted(session) => session.peer.as_deref(),
+					$crate::transport::state::SessionPhase::Encrypted(session) => session.peer(),
 					_ => None,
 				}
 			}
@@ -328,7 +328,7 @@ macro_rules! impl_tcp_common {
 			/// Negotiated multiplexing settings. `None` means single-flight.
 			pub fn negotiated_mux(&self) -> Option<$crate::transport::handshake::negotiation::MuxSettings> {
 				match self.state.phase() {
-					$crate::transport::state::SessionPhase::Encrypted(session) => session.mux,
+					$crate::transport::state::SessionPhase::Encrypted(session) => session.mux(),
 					_ => None,
 				}
 			}
@@ -336,7 +336,7 @@ macro_rules! impl_tcp_common {
 			/// Dual-signed session receipt from a budget-bearing handshake.
 			pub fn session_receipt(&self) -> Option<&$crate::transport::handshake::receipt::StoredReceipt> {
 				match self.state.phase() {
-					$crate::transport::state::SessionPhase::Encrypted(session) => session.receipt.as_deref(),
+					$crate::transport::state::SessionPhase::Encrypted(session) => session.receipt(),
 					_ => None,
 				}
 			}

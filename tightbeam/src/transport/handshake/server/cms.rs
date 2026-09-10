@@ -148,14 +148,19 @@ where
 		}
 	}
 
-	/// Set an external transcript hash (for testing or custom protocols).
+	/// Replace the transcript digest this handshake verifies against.
 	///
-	/// When set, the internal transcript buffer is not used.
+	/// ## Test
+	///
+	/// Test-only. The transcript is what binds the Finished messages to the
+	/// messages actually exchanged, so a caller-supplied digest verifies
+	/// against a value that covers nothing (CWE-345). Tests use it to start a
+	/// machine mid-handshake without replaying the earlier rounds.
+	#[cfg(test)]
 	#[must_use]
-	pub fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
-		self.transcript_hash = Some(hash);
-
+	pub(crate) fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
 		// Lock transcript immediately since it's externally provided
+		self.transcript_hash = Some(hash);
 		self
 	}
 
@@ -163,7 +168,7 @@ where
 	///
 	/// When profiles are configured, the server will select the first mutually
 	/// supported profile from client's offer. If no profiles are configured or
-	/// client sends no offer, the server uses dealer's choice mode (default profile).
+	/// client sends no offer, the server uses dealer's choice mode.
 	#[must_use]
 	pub fn with_supported_profiles(mut self, profiles: Vec<SecurityProfileDesc>) -> Self {
 		self.supported_profiles = profiles;
@@ -205,11 +210,13 @@ where
 		self
 	}
 
-	/// Set the client certificate (optional, for mutual authentication).
+	/// Record the client certificate this handshake carried.
 	///
-	/// Validates the certificate using the configured validator chain and enforces
-	/// identity immutability (certificate cannot change during re-handshake).
-	pub fn set_client_certificate(&mut self, cert: Certificate) -> Result<(), HandshakeError> {
+	/// Driven by the handshake rather than by a caller: the identity is what
+	/// the exchange establishes, so it arrives from the KeyExchange being
+	/// processed. Runs the configured validator chain and refuses a
+	/// certificate that differs from one an earlier round already locked in.
+	pub(crate) fn set_client_certificate(&mut self, cert: Certificate) -> Result<(), HandshakeError> {
 		// Check for identity immutability - reject if cert changes on re-handshake
 		if let Some(existing_cert) = &self.validated_client_cert {
 			if existing_cert.as_ref() != &cert {
@@ -226,7 +233,6 @@ where
 
 		let cert = Arc::new(cert);
 		self.client_cert = Some(Arc::clone(&cert));
-
 		// Store as validated cert (identity is now locked)
 		self.validated_client_cert = Some(cert);
 
@@ -357,12 +363,11 @@ where
 			client_verifying_key,
 			expected_sid,
 		);
+
 		let processor = TightBeamSignedDataProcessor::new(verifier);
-
-		// Verify content matches our transcript hash
 		let digest_oid = P::Digest::OID;
-		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
 
+		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
 		let expected_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 		if verified_content.len() != 32 || verified_content.as_slice() != expected_hash {
 			Err(HandshakeError::SignatureVerificationFailed)
@@ -402,11 +407,11 @@ where
 			_ => return Err(HandshakeError::InvalidClientKeyExchange),
 		};
 
-		// Perform ECDH using KeyProvider (takes SEC1 bytes directly);
-		// the shared secret arrives already wrapped in SecretSlice.
+		// Perform ECDH using KeyProvider (takes SEC1 bytes directly).
 		let shared_secret = self.server_key_provider.key_agreement(originator_pub_bytes).await?;
 
-		// Derive KEK using HKDF via provider, sized to the negotiated key-wrap algorithm.
+		// Derive KEK using HKDF via provider, sized to the negotiated
+		// key-wrap algorithm.
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let provider = P::default();
 
@@ -469,9 +474,10 @@ where
 		// 8. Decrypt and store session key
 		self.decrypt_session_key(enveloped_data_der).await?;
 
-		// 9. Lock transcript and mark AEAD derivation now that session key material is available.
-		// For CMS, transcript is locked here (after key exchange processed) rather than during
-		// server finished preparation, since session key derivation happens at this point.
+		// 9. Lock transcript and mark AEAD derivation now that session key
+		// material is available. For CMS, transcript is locked here (after key
+		// exchange processed) rather than during server finished preparation,
+		// since session key derivation happens at this point.
 
 		Ok(())
 	}
@@ -669,8 +675,8 @@ where
 		}
 
 		// 2. A budget-bearing session activates only after the receipt
-		// settled (fail closed for drivers that skipped or failed
-		// process_receipt_ack)
+		//    settled (fail closed for drivers that skipped or failed
+		//    process_receipt_ack)
 		if self.receipt_unsettled() {
 			return Err(HandshakeError::CountersignatureMissing);
 		}
@@ -685,10 +691,10 @@ where
 		let ciphers = directional?;
 
 		// 4. Derive the epoch-0 rekey materials alongside the traffic
-		// keys, from the same inputs: an in-band renewal later chains
-		// from this secret without touching the handshake again. CMS
-		// salts key derivation with the transcript hash, so it doubles
-		// as the epoch salt here.
+		//    keys, from the same inputs: an in-band renewal later chains
+		//    from this secret without touching the handshake again. CMS
+		//    salts key derivation with the transcript hash, so it doubles
+		//    as the epoch salt here.
 		let epoch_derived = cek.with(|input_key| derive_epoch_materials::<P>(input_key, &transcript, transcript))?;
 		let materials = epoch_derived?;
 
@@ -697,19 +703,16 @@ where
 
 		// 6. Role-map the directional ciphers with the negotiated OID. The
 		//    orchestrator is spent, so the receipt moves out rather than
-		//    copies. The client certificate is shared behind an `Arc`, so
-		//    it is copied out of it.
+		//    copies. The client certificate is already shared, so the session
+		//    takes a handle to it.
 		#[cfg(feature = "x509")]
 		let peer = self.validated_client_cert.as_ref().map(Arc::clone);
 
-		Ok(EstablishedSession {
-			keys: SessionKeys::for_server(ciphers.client_to_server, ciphers.server_to_client, aead_oid),
-			mux: self.mux_settings,
-			receipt: self.stored_receipt.take().map(Arc::new),
-			#[cfg(feature = "x509")]
-			peer,
-			epoch: Some(materials),
-		})
+		let keys = SessionKeys::for_server(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
+		let mux = self.mux_settings;
+		let receipt = self.stored_receipt.take().map(Arc::new);
+		let epoch = Some(materials);
+		Ok(EstablishedSession::new(keys, mux, receipt, peer, epoch))
 	}
 
 	/// Build server Finished message (SignedData over transcript hash).
@@ -721,7 +724,7 @@ where
 		let digest = self.prepare_server_finished_digest()?;
 
 		// 3. Issue the session receipt: the transcript hash pins it to
-		// this session, the server signature makes it third-party verifiable
+		//    this session, the server signature makes it third-party verifiable
 		self.issue_session_receipt().await?;
 
 		// 4. Sign the digest

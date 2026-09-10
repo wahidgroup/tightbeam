@@ -658,14 +658,12 @@ where
 		// validation, AEAD derivation, invariants, and cleanup.
 		let ciphers = self.complete()?;
 
-		Ok(EstablishedSession {
-			keys: SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid),
-			mux: self.mux_settings,
-			receipt: self.stored_receipt.take().map(Arc::new),
-			epoch: self.epoch_materials.take(),
-			#[cfg(feature = "x509")]
-			peer: self.server_certificate.as_ref().map(Arc::clone),
-		})
+		let keys = SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
+		let mux = self.mux_settings;
+		let receipt = self.stored_receipt.take().map(Arc::new);
+		let epoch = self.epoch_materials.take();
+		let peer = self.server_certificate.as_ref().map(Arc::clone);
+		Ok(EstablishedSession::new(keys, mux, receipt, peer, epoch))
 	}
 
 	// Helper methods

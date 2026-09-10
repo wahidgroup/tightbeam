@@ -22,6 +22,7 @@ use crate::trace::TraceCollector;
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::state::ClientIdentity;
 use crate::transport::state::EncryptionConfig;
+use crate::transport::TransportResult;
 use crate::transport::{MessageEmitter, Protocol, X509ClientConfig};
 use crate::utils::urn::Urn;
 use crate::{Frame, Message, TightBeamError, Version};
@@ -32,7 +33,7 @@ use crate::{Frame, Message, TightBeamError, Version};
 fn cluster_encryption<C: CryptoProvider>(
 	trust_store: Option<&Arc<dyn CertificateTrust>>,
 	identity: Option<&ClientIdentity<C>>,
-) -> EncryptionConfig<C> {
+) -> TransportResult<EncryptionConfig<C>> {
 	let mut encryption = EncryptionConfig::default();
 	if let Some(store) = trust_store {
 		encryption.trust_store = Some(Arc::clone(store));
@@ -41,7 +42,13 @@ fn cluster_encryption<C: CryptoProvider>(
 		identity.install(&mut encryption);
 	}
 
-	encryption
+	// A hive dials the cluster, so it answers the dialer's question here
+	// rather than at the first frame it tries to write. A hive identity with
+	// no trust store would present that identity to whoever answered the
+	// cluster address (CWE-295).
+	encryption.check_dial_permitted()?;
+
+	Ok(encryption)
 }
 
 async fn build_control_frame(
@@ -285,8 +292,7 @@ where
 {
 	let stream = P::connect(cluster_addr).await?;
 	let identity = hive_tls.map(|tls| tls.client_identity()).transpose()?;
-	let encryption = cluster_encryption(trust_store, identity.as_ref());
-
+	let encryption = cluster_encryption(trust_store, identity.as_ref())?;
 	Ok(P::create_transport(stream).with_encryption(encryption))
 }
 
@@ -340,16 +346,20 @@ where
 	P::Error: Send,
 	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send,
 {
+	// The provisioning does not change between attempts, and a refused dial is
+	// a configuration this loop cannot retry its way out of.
+	let Ok(encryption) = cluster_encryption(trust_store, client_identity) else {
+		return false;
+	};
+
 	for attempt in 0..=max_attempts {
 		let Ok(stream) = P::connect(gateway).await else {
 			retry_delay(attempt, max_attempts, retry_policy).await;
 			continue;
 		};
 
-		let mut transport =
-			P::create_transport(stream).with_encryption(cluster_encryption(trust_store, client_identity));
-
 		// Transport Ok is not acceptance: require TransitStatus::Ok in the body.
+		let mut transport = P::create_transport(stream).with_encryption(encryption.clone());
 		match transport.emit(frame.clone(), None).await {
 			Ok(Some(response)) => {
 				let decoded = decode::<ServletAddressUpdateResponse>(&response.message);

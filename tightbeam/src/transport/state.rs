@@ -69,25 +69,22 @@ impl SessionPhase {
 		matches!(self, Self::Cleartext | Self::Encrypted(_))
 	}
 
-	/// Whether a session may move from this phase to `next`.
+	/// Whether this phase admits `event`.
 	///
-	/// A session either stays cleartext, or runs
-	/// `Provisioned -> Handshaking -> Encrypted`. The circuit breaker returns
-	/// any provisioned phase to its start.
-	const fn permits(&self, next: &Self) -> bool {
+	/// The alphabet is small and each event names one move, so two events that
+	/// happen to land on the same phase keep their own legality. Provisioning
+	/// and a reset both reach [`Self::Provisioned`], and only the reset may
+	/// leave an established session.
+	const fn admits(&self, event: &SessionEvent) -> bool {
 		matches!(
-			(self, next),
-			// Provisioning, then the handshake that follows it.
-			(Self::Cleartext, Self::Provisioned)
-				| (Self::Provisioned, Self::Handshaking { .. })
-				| (Self::Handshaking { .. }, Self::Handshaking { .. })
-				| (Self::Handshaking { .. }, Self::Encrypted(_))
-				// The circuit breaker, which returns a session to its start.
-				| (
-					Self::Provisioned | Self::Handshaking { .. } | Self::Encrypted(_),
-					Self::Provisioned | Self::Cleartext,
-				)
-				| (Self::Cleartext, Self::Cleartext)
+			(self, event),
+			// A session is provisioned once, before any handshake runs.
+			(Self::Cleartext, SessionEvent::Provision)
+				// The handshake, which may take several rounds.
+				| (Self::Provisioned | Self::Handshaking { .. }, SessionEvent::BeginHandshake)
+				| (Self::Handshaking { .. }, SessionEvent::Install(_))
+				// The circuit breaker, from wherever the session got to.
+				| (_, SessionEvent::Reset { .. })
 		)
 	}
 
@@ -131,6 +128,36 @@ pub trait SealedProtocolState: sealed::Sealed {}
 #[cfg(feature = "x509")]
 impl<T: SealedProtocolState> sealed::Sealed for T {}
 
+/// What can happen to a session, which is the alphabet the phase table reads.
+///
+/// Naming the move rather than the destination keeps provisioning distinct
+/// from a reset that lands on the same phase.
+#[cfg(feature = "x509")]
+pub(crate) enum SessionEvent {
+	/// Encryption material is installed, so a handshake is now expected.
+	Provision,
+	/// A handshake round starts, timed from now.
+	BeginHandshake,
+	/// A handshake completed and hands over everything it agreed.
+	Install(Box<EstablishedSession>),
+	/// The circuit breaker drops any session and returns to the start.
+	Reset { expects_encryption: bool },
+}
+
+#[cfg(feature = "x509")]
+impl SessionEvent {
+	/// The phase this event lands the session in.
+	fn destination(self) -> SessionPhase {
+		match self {
+			Self::Provision => SessionPhase::Provisioned,
+			Self::BeginHandshake => SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() },
+			Self::Install(session) => SessionPhase::Encrypted(session),
+			Self::Reset { expects_encryption: true } => SessionPhase::Provisioned,
+			Self::Reset { expects_encryption: false } => SessionPhase::Cleartext,
+		}
+	}
+}
+
 /// A session's phase, which moves only along the transition table.
 ///
 /// The phase is private and every move below consults the table, so a caller
@@ -148,17 +175,17 @@ impl SessionState {
 		&self.phase
 	}
 
-	/// Advance to `next`, reporting whether the table allowed the move.
+	/// Apply `event`, reporting whether the table admitted it.
 	///
-	/// The one writer of the phase, private so that the named transitions
-	/// below are the only moves a caller can ask for. A refused move leaves
-	/// the session where it was.
-	fn advance(&mut self, next: SessionPhase) -> bool {
-		if !self.phase.permits(&next) {
+	/// The one writer of the phase, private so that the named moves below are
+	/// the only events a caller can raise. A refused event leaves the session
+	/// where it was.
+	fn apply(&mut self, event: SessionEvent) -> bool {
+		if !self.phase.admits(&event) {
 			return false;
 		}
 
-		self.phase = next;
+		self.phase = event.destination();
 
 		true
 	}
@@ -174,15 +201,14 @@ impl SessionState {
 			return;
 		}
 
-		// A session past `Cleartext` is already provisioned or beyond, so a
-		// declined move is one that would change nothing.
-		let _provisioned = self.advance(SessionPhase::Provisioned);
+		// Only a session still at `Cleartext` has anything to provision.
+		let _provisioned = self.apply(SessionEvent::Provision);
 	}
 
 	/// Record that a handshake has started, timed from now.
 	#[must_use]
 	pub fn begin_handshake(&mut self) -> bool {
-		self.advance(SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() })
+		self.apply(SessionEvent::BeginHandshake)
 	}
 
 	/// Install everything a completed handshake agreed.
@@ -191,7 +217,7 @@ impl SessionState {
 	/// encrypted always carries the terms it runs under.
 	#[must_use]
 	pub fn install_session(&mut self, session: EstablishedSession) -> bool {
-		self.advance(SessionPhase::Encrypted(Box::new(session)))
+		self.apply(SessionEvent::Install(Box::new(session)))
 	}
 
 	/// Drop any session and return to the phase this endpoint starts in.
@@ -200,15 +226,9 @@ impl SessionState {
 	/// an endpoint holding encryption material returns to `Provisioned`, one
 	/// without it to `Cleartext`.
 	pub fn reset(&mut self, expects_encryption: bool) {
-		let start = if expects_encryption {
-			SessionPhase::Provisioned
-		} else {
-			SessionPhase::Cleartext
-		};
-
-		// The breaker runs on a session already in trouble, so a phase that
-		// declines the move is already where the reset would put it.
-		let _returned_to_start = self.advance(start);
+		// The breaker is admitted from every phase, so its answer carries no
+		// information a caller could act on.
+		let _returned_to_start = self.apply(SessionEvent::Reset { expects_encryption });
 	}
 
 	/// Detach the epoch rekey materials the handshake left, once.
@@ -219,7 +239,7 @@ impl SessionState {
 	#[cfg(feature = "aead")]
 	pub fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
 		match &mut self.phase {
-			SessionPhase::Encrypted(session) => session.epoch.take(),
+			SessionPhase::Encrypted(session) => session.take_epoch(),
 			_ => None,
 		}
 	}
@@ -242,7 +262,7 @@ impl SessionState {
 		let session = self
 			.established()
 			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))?;
-		Ok(session.keys.send())
+		Ok(session.keys().send())
 	}
 
 	/// Receive-direction cipher, which exists exactly while a session does.
@@ -255,7 +275,7 @@ impl SessionState {
 		let session = self
 			.established()
 			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))?;
-		Ok(session.keys.recv())
+		Ok(session.keys().recv())
 	}
 
 	/// Validated peer certificate: client identity on a mutual-auth server,
@@ -264,22 +284,22 @@ impl SessionState {
 	/// Read from the established session, so it is present exactly while that
 	/// session is.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
-		self.established()?.peer.as_deref()
+		self.established()?.peer()
 	}
 
 	/// Shared handle to the validated peer certificate.
 	pub fn peer_certificate_arc(&self) -> Option<Arc<Certificate>> {
-		self.established()?.peer.as_ref().map(Arc::clone)
+		self.established()?.peer_arc()
 	}
 
 	/// Dual-signed session receipt from the established session.
 	pub fn receipt(&self) -> Option<&StoredReceipt> {
-		self.established()?.receipt.as_deref()
+		self.established()?.receipt()
 	}
 
 	/// Shared handle to the dual-signed session receipt.
 	pub fn receipt_arc(&self) -> Option<Arc<StoredReceipt>> {
-		self.established()?.receipt.as_ref().map(Arc::clone)
+		self.established()?.receipt_arc()
 	}
 
 	/// Take the phase out, for a caller that consumes the endpoint.
@@ -419,25 +439,40 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		self.is_provisioned() || self.has_client_identity() || self.key_manager.is_some()
 	}
 
-	/// Whether this configuration must name cleartext before it is used.
+	/// Whether this endpoint may dial a peer it cannot authenticate.
 	///
-	/// A builder refuses an endpoint that authenticates no peer, so choosing
-	/// an unauthenticated session is something the caller states.
-	pub fn requires_named_cleartext(&self) -> bool {
-		!self.authenticates_peer() && !self.allow_cleartext
+	/// A dialer picks the address, so it decides who it is willing to reach. An
+	/// endpoint that can establish nothing about its peer reaches whoever
+	/// answered (CWE-295), and naming cleartext is the only way to accept that.
+	///
+	/// The companion rule is [`Self::check_cleartext_write`], which every
+	/// endpoint passes. This one is stricter and applies to dialers alone: a
+	/// server never chooses its peer, so it is not asked this question.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the dialer
+	///   authenticates no peer and did not name cleartext.
+	pub fn check_dial_permitted(&self) -> TransportResult<()> {
+		if !self.authenticates_peer() && !self.allow_cleartext {
+			return Err(TransportError::PeerAuthenticationUnconfigured);
+		}
+
+		Ok(())
 	}
 
-	/// The one definition of an endpoint that must not reach the wire.
+	/// Whether this endpoint may put a cleartext frame on the wire.
 	///
-	/// A client that presents an identity while it can establish nothing about
-	/// its peer would hand that identity, and its traffic, to whoever answered
-	/// the address (CWE-295). Naming cleartext accepts that.
+	/// An endpoint carrying a client identity would hand that identity, and its
+	/// traffic, to a peer it has not authenticated (CWE-295). An endpoint
+	/// carrying no identity reveals nothing about itself, so plain cleartext
+	/// stays available to a deployment that wants it.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- a client
 	///   identity is provisioned with no means of authenticating the peer.
-	pub fn check_peer_authentication(&self) -> TransportResult<()> {
+	pub fn check_cleartext_write(&self) -> TransportResult<()> {
 		if self.has_client_identity() && !self.authenticates_peer() && !self.allow_cleartext {
 			return Err(TransportError::PeerAuthenticationUnconfigured);
 		}
@@ -516,11 +551,11 @@ pub trait EncryptedProtocolState: SealedProtocolState {
 	///   frame waits for the handshake to install keys.
 	fn apply_wire_mode<'a>(&'a self, builder: EnvelopeBuilder<'a>) -> TransportResult<EnvelopeBuilder<'a>> {
 		match self.session_state().phase() {
-			SessionPhase::Encrypted(session) => {
-				Ok(builder.with_wire_mode(WireMode::Encrypted).with_encryptor(session.keys.send()))
-			}
+			SessionPhase::Encrypted(session) => Ok(builder
+				.with_wire_mode(WireMode::Encrypted)
+				.with_encryptor(session.keys().send())),
 			SessionPhase::Cleartext => {
-				self.encryption().check_peer_authentication()?;
+				self.encryption().check_cleartext_write()?;
 				Ok(builder.with_wire_mode(WireMode::Cleartext))
 			}
 			SessionPhase::Provisioned | SessionPhase::Handshaking { .. } => {
@@ -615,14 +650,13 @@ mod tests {
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Cleartext));
 	}
 
-	/// Every move a session can attempt, checked against the table that admits
-	/// it. `SessionState::advance` is the only writer of the phase, so a pair
-	/// the table omits is a move no caller can make.
+	/// Every event a session can raise from every phase it can sit in, checked
+	/// against the table. `SessionState::apply` is the only writer of the
+	/// phase, so a pair the table omits is a move no caller can make.
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	#[test]
-	fn the_table_admits_exactly_the_moves_a_session_may_make() {
-		// Ordered so the permitted matrix below reads row by row.
-		let names = ["cleartext", "provisioned", "handshaking", "encrypted"];
+	fn the_table_admits_exactly_the_events_a_session_may_raise() {
+		let phases = ["cleartext", "provisioned", "handshaking", "encrypted"];
 		let phase_for = |name: &str| match name {
 			"cleartext" => SessionPhase::Cleartext,
 			"provisioned" => SessionPhase::Provisioned,
@@ -630,41 +664,41 @@ mod tests {
 			_ => SessionPhase::Encrypted(Box::new(established_session())),
 		};
 
-		// A session either stays cleartext, or walks provisioned to
-		// handshaking to encrypted. Any provisioned phase may reset.
-		let permitted = [
-			("cleartext", "cleartext"),
-			("cleartext", "provisioned"),
-			("provisioned", "provisioned"),
-			("provisioned", "handshaking"),
-			("provisioned", "cleartext"),
-			("handshaking", "handshaking"),
-			("handshaking", "encrypted"),
-			("handshaking", "provisioned"),
-			("handshaking", "cleartext"),
-			("encrypted", "provisioned"),
-			("encrypted", "cleartext"),
-		];
+		let events = ["provision", "begin", "install", "reset"];
+		let event_for = |name: &str| match name {
+			"provision" => SessionEvent::Provision,
+			"begin" => SessionEvent::BeginHandshake,
+			"install" => SessionEvent::Install(Box::new(established_session())),
+			_ => SessionEvent::Reset { expects_encryption: false },
+		};
 
-		for from in names {
-			for to in names {
-				let mut state = SessionState::at(phase_for(from));
-				let moved = state.advance(phase_for(to));
-				let expected = permitted.contains(&(from, to));
+		// A session is provisioned once, walks the handshake, and may reset
+		// from anywhere. Provisioning an established session is refused, so
+		// reconfiguring a live transport keeps the keys it agreed.
+		let landing = |phase: &str, event: &str| -> Option<&'static str> {
+			match (phase, event) {
+				("cleartext", "provision") => Some("provisioned"),
+				("provisioned" | "handshaking", "begin") => Some("handshaking"),
+				("handshaking", "install") => Some("encrypted"),
+				(_, "reset") => Some("cleartext"),
+				_ => None,
+			}
+		};
 
-				assert_eq!(moved, expected, "{from} to {to}");
+		for phase in phases {
+			for event in events {
+				let mut state = SessionState::at(phase_for(phase));
+				let moved = state.apply(event_for(event));
+				let expected = landing(phase, event);
+				assert_eq!(moved, expected.is_some(), "{phase} on {event}");
 
-				// A refused move leaves the session where it was, so a caller
+				// A refused event leaves the session where it was, so a caller
 				// that ignores the answer still cannot corrupt the phase.
-				let landed = if moved {
-					to
-				} else {
-					from
-				};
+				let landed = expected.unwrap_or(phase);
 				assert_eq!(
 					core::mem::discriminant(state.phase()),
 					core::mem::discriminant(&phase_for(landed)),
-					"{from} to {to} must land in {landed}"
+					"{phase} on {event} must land in {landed}"
 				);
 			}
 		}
@@ -735,7 +769,7 @@ mod tests {
 			panic!("installing a session must leave the phase encrypted");
 		};
 
-		assert!(session.peer.is_some());
+		assert!(session.peer().is_some());
 		assert!(probe.session_state().peer_certificate().is_some());
 	}
 
@@ -767,17 +801,13 @@ mod tests {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
 		use crate::der::oid::AssociatedOid;
 
-		EstablishedSession {
-			keys: SessionKeys::for_client(
-				Aes256Gcm::new(&[0u8; 32].into()),
-				Aes256Gcm::new(&[1u8; 32].into()),
-				Aes256GcmOid::OID,
-			),
-			mux: None,
-			receipt: None,
-			peer: Some(Arc::new(fixture_certificate())),
-			epoch: None,
-		}
+		let keys = SessionKeys::for_client(
+			Aes256Gcm::new(&[0u8; 32].into()),
+			Aes256Gcm::new(&[1u8; 32].into()),
+			Aes256GcmOid::OID,
+		);
+
+		EstablishedSession::new(keys, None, None, Some(Arc::new(fixture_certificate())), None)
 	}
 
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
@@ -796,7 +826,7 @@ mod tests {
 			..EncryptionConfig::default()
 		};
 		assert!(matches!(
-			encryption.check_peer_authentication(),
+			encryption.check_cleartext_write(),
 			Err(TransportError::PeerAuthenticationUnconfigured)
 		));
 	}
@@ -811,7 +841,7 @@ mod tests {
 			allow_cleartext: true,
 			..EncryptionConfig::default()
 		};
-		assert!(encryption.check_peer_authentication().is_ok());
+		assert!(encryption.check_cleartext_write().is_ok());
 	}
 
 	/// A trust store answers for the peer, so the pairing is complete.
@@ -823,7 +853,7 @@ mod tests {
 			client_validators: Some(Arc::new(Vec::new())),
 			..EncryptionConfig::default()
 		};
-		assert!(encryption.check_peer_authentication().is_ok());
+		assert!(encryption.check_cleartext_write().is_ok());
 	}
 
 	/// A server presents its own certificate rather than a client identity, so
@@ -835,7 +865,7 @@ mod tests {
 			server_certificate: Some(Arc::new(fixture_certificate())),
 			..EncryptionConfig::default()
 		};
-		assert!(encryption.check_peer_authentication().is_ok());
+		assert!(encryption.check_cleartext_write().is_ok());
 	}
 
 	#[test]

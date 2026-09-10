@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::GenericClient;
 use crate::asn1::Frame;
-use crate::transport::error::{TransportError, TransportFailure};
+use crate::transport::error::TransportFailure;
 use crate::transport::{MessageCollector, Protocol, TransportResult};
 
 #[cfg(feature = "policy")]
@@ -248,15 +248,11 @@ where
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the client holds
-	///   no trust store and did not call [`Self::allow_cleartext`], so it would
-	///   have accepted any peer.
+	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
+	///   the client holds no trust store and did not call [`Self::allow_cleartext`],
+	///   so it would have accepted any peer.
 	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
-		// A client that authenticates no peer would accept whoever answered the
-		// address, so choosing that is something the caller states (CWE-295).
-		if self.encryption.requires_named_cleartext() {
-			return Err(TransportError::PeerAuthenticationUnconfigured);
-		}
+		self.encryption.check_dial_permitted()?;
 
 		let addr = addr.borrow().clone();
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
@@ -335,14 +331,16 @@ impl GatePolicy for Arc<dyn GatePolicy + Send + Sync> {
 	not(target_arch = "wasm32")
 ))]
 mod tests {
-	use super::*;
-	use crate::transport::tcp::r#async::TokioListener;
-	use crate::transport::tcp::TightBeamSocketAddr;
 	use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+	use super::*;
+	use crate::transport::error::TransportError;
+	use crate::transport::tcp::r#async::TokioListener;
+	use crate::transport::tcp::TightBeamSocketAddr;
+
 	/// Port 1 on loopback, where a connection attempt fails fast. The refusal
-	/// under test is reached before the dial, so the first case never leaves the
-	/// builder and the second fails at the address.
+	/// under test is reached before the dial, so the first case never leaves
+	/// the builder and the second fails at the address.
 	const UNREACHABLE: TightBeamSocketAddr =
 		TightBeamSocketAddr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)));
 
@@ -354,8 +352,8 @@ mod tests {
 		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
 	}
 
-	/// Naming cleartext is what lets the same client through, so it reaches the
-	/// address and fails there instead.
+	/// Naming cleartext is what lets the same client through, so it reaches
+	/// the address and fails there instead.
 	#[tokio::test]
 	async fn naming_cleartext_admits_the_same_client() {
 		let admitted = ClientBuilder::<TokioListener>::builder()
