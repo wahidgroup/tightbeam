@@ -61,6 +61,9 @@ mod x509 {
 	pub use crate::transport::state::EncryptedProtocolState;
 	pub use crate::transport::state::SessionPhase;
 
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	pub use crate::transport::state::ServerHandshakeSlot;
+
 	#[cfg(feature = "transport-ecies")]
 	pub use crate::crypto::ecies::EciesPublicKeyOps;
 }
@@ -527,7 +530,7 @@ pub trait MessageCollector: CollectorRequirements {
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
-		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P>,
+		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: CryptoProvider + Send + Sync + 'static,
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -561,7 +564,7 @@ pub trait MessageCollector: CollectorRequirements {
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
-		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P>,
+		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: CryptoProvider + Send + Sync + 'static,
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -619,9 +622,20 @@ where
 		return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 	}
 
+	// An established session reads and writes encrypted, so nothing cleartext
+	// is admitted on it. Before that, a provisioned endpoint admits only the
+	// handshake containers, and an unprovisioned one admits traffic.
+	let established = transport.session_state().phase().requires_encryption();
 	let expects_encryption = transport.encryption().is_provisioned();
 	match wire_envelope {
 		WireEnvelope::Cleartext(envelope) => {
+			if established {
+				// Circuit breaker: a cleartext frame on an agreed session is
+				// not the peer this session established (CWE-319).
+				transport.reset_session();
+				return Err(TransportError::MissingEncryption);
+			}
+
 			if expects_encryption {
 				match envelope {
 					TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
@@ -639,12 +653,12 @@ where
 			}
 		}
 		WireEnvelope::Encrypted(encrypted_info) => {
-			if !matches!(transport.session_phase(), SessionPhase::Encrypted(_)) {
+			if !matches!(transport.session_state().phase(), SessionPhase::Encrypted(_)) {
 				transport.reset_session();
 				return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 			}
 
-			let decrypted_bytes = match transport.to_decryptor_ref()?.decrypt_content(&encrypted_info) {
+			let decrypted_bytes = match transport.session_state().decryptor()?.decrypt_content(&encrypted_info) {
 				Ok(bytes) => bytes,
 				Err(_) => {
 					transport.reset_session();

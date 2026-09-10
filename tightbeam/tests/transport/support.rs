@@ -255,7 +255,7 @@ pub async fn accept_handshaken_split(listener: TokioListener) -> Result<SplitTra
 	serve_one_handshake_message(&mut transport).await?;
 	serve_one_handshake_message(&mut transport).await?;
 	assert!(
-		matches!(transport.session_phase(), SessionPhase::Encrypted(_)),
+		matches!(transport.session_state().phase(), SessionPhase::Encrypted(_)),
 		"server handshake must complete after ClientKeyExchange"
 	);
 
@@ -270,7 +270,7 @@ pub async fn connect_handshaken_split(
 	let mut client = connect_pinned_client(addr, server_certificate).await?;
 	client.perform_client_handshake().await?;
 	assert!(
-		matches!(client.session_phase(), SessionPhase::Encrypted(_)),
+		matches!(client.session_state().phase(), SessionPhase::Encrypted(_)),
 		"client handshake must complete before splitting"
 	);
 

@@ -25,7 +25,8 @@ use crate::transport::MessageEmitter;
 mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
+	pub use crate::transport::handshake::HandshakeProtocolKind;
+	pub use crate::transport::state::EncryptionConfig;
 	pub use crate::transport::X509ClientConfig;
 	pub use crate::x509::Certificate;
 
@@ -35,6 +36,10 @@ mod x509 {
 	pub use crate::crypto::profiles::DefaultCryptoProvider;
 	#[cfg(feature = "std")]
 	pub use crate::crypto::x509::CertificateSpec;
+	#[cfg(feature = "std")]
+	pub use crate::transport::handshake::HandshakeKeyManager;
+	#[cfg(feature = "std")]
+	pub use crate::transport::state::ClientIdentity;
 }
 
 #[cfg(feature = "x509")]
@@ -139,18 +144,9 @@ impl ClientPolicies {
 
 pub struct ClientBuilder<P: Protocol, C: CryptoProvider + 'static = DefaultCryptoProvider> {
 	policies: ClientPolicies,
+	/// Provisioning this builder accumulates, handed to the transport whole.
 	#[cfg(feature = "x509")]
-	trust_store: Option<Arc<dyn CertificateTrust>>,
-	#[cfg(feature = "x509")]
-	client_certificate: Option<Certificate>,
-	#[cfg(feature = "x509")]
-	client_key: Option<HandshakeKeyManager<C>>,
-	#[cfg(feature = "x509")]
-	server_certificate_chain: Option<Arc<[Certificate]>>,
-	#[cfg(feature = "x509")]
-	handshake_protocol: Option<HandshakeProtocolKind>,
-	#[cfg(feature = "x509")]
-	allow_cleartext: bool,
+	encryption: EncryptionConfig<C>,
 	_ph: PhantomData<(P, C)>,
 }
 
@@ -159,17 +155,7 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 		Self {
 			policies: ClientPolicies::default(),
 			#[cfg(feature = "x509")]
-			trust_store: None,
-			#[cfg(feature = "x509")]
-			client_certificate: None,
-			#[cfg(feature = "x509")]
-			client_key: None,
-			#[cfg(feature = "x509")]
-			server_certificate_chain: None,
-			#[cfg(feature = "x509")]
-			handshake_protocol: None,
-			#[cfg(feature = "x509")]
-			allow_cleartext: false,
+			encryption: EncryptionConfig::default(),
 			_ph: PhantomData,
 		}
 	}
@@ -205,7 +191,7 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 
 	#[cfg(feature = "x509")]
 	pub fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
-		self.trust_store = Some(store);
+		self.encryption.trust_store = Some(store);
 		self
 	}
 
@@ -213,14 +199,14 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 	/// leaf, for key-transport handshakes (CMS).
 	#[cfg(feature = "x509")]
 	pub fn with_server_certificate_chain(mut self, chain: impl Into<Arc<[Certificate]>>) -> Self {
-		self.server_certificate_chain = Some(chain.into());
+		self.encryption.server_certificate_chain = Some(chain.into());
 		self
 	}
 
 	/// Select the handshake protocol used when encryption is enabled.
 	#[cfg(feature = "x509")]
 	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
-		self.handshake_protocol = Some(kind);
+		self.encryption.handshake_protocol = kind;
 		self
 	}
 
@@ -232,7 +218,7 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 	/// loopback fixture or a link a lower layer already secures.
 	#[cfg(feature = "x509")]
 	pub fn allow_cleartext(mut self) -> Self {
-		self.allow_cleartext = true;
+		self.encryption.allow_cleartext = true;
 		self
 	}
 }
@@ -266,30 +252,18 @@ where
 	///   no trust store and did not call [`Self::allow_cleartext`], so it would
 	///   have accepted any peer.
 	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
-		// A client identity proves who the client is and leaves the server
-		// unverified, so only a trust store answers for the peer (CWE-295).
-		if self.trust_store.is_none() && !self.allow_cleartext {
+		// A client that authenticates no peer would accept whoever answered the
+		// address, so choosing that is something the caller states (CWE-295).
+		if self.encryption.requires_named_cleartext() {
 			return Err(TransportError::PeerAuthenticationUnconfigured);
 		}
 
 		let addr = addr.borrow().clone();
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
-		let mut transport = P::create_transport(stream);
-		if let Some(store) = self.trust_store {
-			transport = transport.with_trust_store(store);
-		}
-		if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
-			let cert = Arc::new(cert);
-			let key = Arc::new(key);
-			transport = transport.with_client_identity(cert, key);
-		}
-		if let Some(chain) = self.server_certificate_chain {
-			transport = transport.with_server_certificate_chain(chain);
-		}
-		if let Some(kind) = self.handshake_protocol {
-			transport = transport.with_handshake_protocol(kind);
-		}
 
+		// The provisioning moves to the transport whole, so nothing this
+		// builder accumulated can be left behind.
+		let transport = P::create_transport(stream).with_encryption(self.encryption);
 		let configured = self.policies.apply::<P>(transport);
 		Ok(GenericClient::from_transport(configured))
 	}
@@ -327,7 +301,7 @@ where
 	}
 
 	fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
-		self.trust_store = Some(store);
+		self.encryption.trust_store = Some(store);
 		self
 	}
 
@@ -338,9 +312,7 @@ where
 	) -> TransportResult<Self> {
 		let cert = Certificate::try_from(cert)?;
 		let key_manager: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
-
-		self.client_certificate = Some(cert);
-		self.client_key = Some(key_manager);
+		ClientIdentity::new(Arc::new(cert), Arc::new(key_manager)).install(&mut self.encryption);
 		Ok(self)
 	}
 

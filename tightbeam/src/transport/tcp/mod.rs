@@ -187,7 +187,7 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "x509")]
 			pub(crate) encryption: $crate::transport::state::EncryptionConfig<P>,
 			#[cfg(feature = "x509")]
-			pub(crate) phase: $crate::transport::state::SessionPhase,
+			pub(crate) state: $crate::transport::state::SessionState,
 			#[cfg(any(feature = "x509", all(feature = "std", feature = "transport-policy")))]
 			pub(crate) limits: $crate::transport::TransportLimits,
 			#[cfg(feature = "x509")]
@@ -214,7 +214,7 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					encryption: $crate::transport::state::EncryptionConfig::default(),
 					#[cfg(feature = "x509")]
-					phase: $crate::transport::state::SessionPhase::Cleartext,
+					state: $crate::transport::state::SessionState::default(),
 					#[cfg(any(feature = "x509", all(feature = "std", feature = "transport-policy")))]
 					limits: $crate::transport::TransportLimits::default(),
 					#[cfg(feature = "x509")]
@@ -252,14 +252,14 @@ macro_rules! impl_tcp_common {
 		{
 			type CryptoProvider = P;
 
+			fn with_encryption(mut self, encryption: $crate::transport::state::EncryptionConfig<P>) -> Self {
+				self.encryption = encryption;
+				self.provision_from_encryption()
+			}
+
 			fn with_trust_store(mut self, store: Arc<dyn $crate::crypto::x509::store::CertificateTrust>) -> Self {
 				self.encryption.trust_store = Some(store);
-				// A trust store is encryption provisioning by definition, so
-				// the phase moves with it rather than being derived later.
-				if matches!(self.phase, $crate::transport::state::SessionPhase::Cleartext) {
-					self.phase = $crate::transport::state::SessionPhase::Provisioned;
-				}
-				self
+				self.provision_from_encryption()
 			}
 
 			fn with_client_identity(
@@ -267,8 +267,7 @@ macro_rules! impl_tcp_common {
 				cert: Arc<$crate::x509::Certificate>,
 				key: Arc<$crate::transport::handshake::HandshakeKeyManager<P>>,
 			) -> Self {
-				self.encryption.client_certificate = Some(cert);
-				self.encryption.key_manager = Some(key);
+				$crate::transport::state::ClientIdentity::new(cert, key).install(&mut self.encryption);
 				self
 			}
 
@@ -302,10 +301,25 @@ macro_rules! impl_tcp_common {
 		where
 			TransportError: From<S::Error>,
 		{
+			/// Move to `Provisioned` when this transport's configuration
+			/// expects encryption.
+			///
+			/// Every way of provisioning this transport ends here, so the
+			/// phase and the configuration cannot disagree.
+			pub(crate) fn provision(&mut self) {
+				self.state.provision_for(&self.encryption);
+			}
+
+			/// Builder form of [`Self::provision`].
+			fn provision_from_encryption(mut self) -> Self {
+				self.provision();
+				self
+			}
+
 			/// Peer certificate after completed mutual authentication.
 			/// `None` if unused or incomplete.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
-				match &self.phase {
+				match self.state.phase() {
 					$crate::transport::state::SessionPhase::Encrypted(session) => session.peer.as_deref(),
 					_ => None,
 				}
@@ -313,7 +327,7 @@ macro_rules! impl_tcp_common {
 
 			/// Negotiated multiplexing settings. `None` means single-flight.
 			pub fn negotiated_mux(&self) -> Option<$crate::transport::handshake::negotiation::MuxSettings> {
-				match &self.phase {
+				match self.state.phase() {
 					$crate::transport::state::SessionPhase::Encrypted(session) => session.mux,
 					_ => None,
 				}
@@ -321,7 +335,7 @@ macro_rules! impl_tcp_common {
 
 			/// Dual-signed session receipt from a budget-bearing handshake.
 			pub fn session_receipt(&self) -> Option<&$crate::transport::handshake::receipt::StoredReceipt> {
-				match &self.phase {
+				match self.state.phase() {
 					$crate::transport::state::SessionPhase::Encrypted(session) => session.receipt.as_deref(),
 					_ => None,
 				}
@@ -355,7 +369,7 @@ macro_rules! impl_tcp_common {
 			/// read layer applies the tight `handshake_wire` ceiling and the
 			/// handshake deadline instead of the general envelope limits.
 			pub(crate) fn is_handshake_pending(&self) -> bool {
-				self.phase.is_handshake_pending()
+				self.state.phase().is_handshake_pending()
 			}
 		}
 
@@ -464,6 +478,17 @@ macro_rules! impl_tcp_common {
 		{
 		}
 
+		#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider>
+			$crate::transport::state::ServerHandshakeSlot for $transport<S, P>
+		where
+			TransportError: From<S::Error>,
+		{
+			fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
+				&mut self.server_handshake
+			}
+		}
+
 		#[cfg(feature = "x509")]
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider + Send + Sync + 'static>
 			$crate::transport::state::EncryptedProtocolState for $transport<S, P>
@@ -472,30 +497,12 @@ macro_rules! impl_tcp_common {
 		{
 			type CryptoProvider = P;
 
-			fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
-				match &self.phase {
-					$crate::transport::state::SessionPhase::Encrypted(session) => Ok(session.keys.send()),
-					_ => Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable)),
-				}
+			fn session_state(&self) -> &$crate::transport::state::SessionState {
+				&self.state
 			}
 
-			fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
-				match &self.phase {
-					$crate::transport::state::SessionPhase::Encrypted(session) => Ok(session.keys.recv()),
-					_ => Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable)),
-				}
-			}
-
-			fn session_phase(&self) -> &$crate::transport::state::SessionPhase {
-				&self.phase
-			}
-
-			fn set_session_phase(&mut self, phase: $crate::transport::state::SessionPhase) {
-				self.phase = phase;
-			}
-
-			fn session_phase_mut(&mut self) -> &mut $crate::transport::state::SessionPhase {
-				&mut self.phase
+			fn session_state_mut(&mut self) -> &mut $crate::transport::state::SessionState {
+				&mut self.state
 			}
 
 			fn encryption(&self) -> &$crate::transport::state::EncryptionConfig<P> {
@@ -504,10 +511,6 @@ macro_rules! impl_tcp_common {
 
 			fn limits(&self) -> &$crate::transport::TransportLimits {
 				&self.limits
-			}
-
-			fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
-				&mut self.server_handshake
 			}
 
 			#[cfg(feature = "instrument")]

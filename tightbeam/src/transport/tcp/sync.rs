@@ -97,7 +97,7 @@ where
 		// applies from the first byte onward.
 		#[cfg(feature = "std")]
 		let deadline = if handshake_pending {
-			match self.phase.initiated_at() {
+			match self.state.phase().initiated_at() {
 				Some(initiated_at) => Some(initiated_at.deadline(self.limits.handshake_timeout)),
 				None => Some(Instant::now() + self.limits.handshake_timeout),
 			}

@@ -75,6 +75,9 @@ mod x509 {
 	pub use crate::transport::state::EncryptedProtocolState;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	pub use crate::transport::state::ServerHandshakeSlot;
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	mod handshake {
 		pub use crate::crypto::aead::KeyInit;
 		pub use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc, TightbeamProfile};
@@ -151,7 +154,7 @@ use x509::*;
 ))]
 fn remaining_handshake_deadline<T: EncryptedProtocolState>(state: &T) -> Duration {
 	let allowance = state.to_handshake_timeout();
-	match state.session_phase().initiated_at() {
+	match state.session_state().phase().initiated_at() {
 		Some(initiated_at) => initiated_at.deadline(allowance).saturating_duration_since(Instant::now()),
 		None => allowance,
 	}
@@ -188,7 +191,7 @@ where
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	P::AeadCipher: KeyInit + 'static,
 {
-	let Some(stored) = state.to_session_receipt_ref().cloned() else {
+	let Some(stored) = state.session_state().receipt().cloned() else {
 		return Ok(None);
 	};
 	let Some(provider) = state
@@ -200,17 +203,18 @@ where
 		return Ok(None);
 	};
 
-	let aead_oid = state.to_encryptor_ref()?.algorithm_oid();
-	let Some(peer_cert) = state.to_peer_certificate_ref() else {
+	let aead_oid = state.session_state().encryptor()?.algorithm_oid();
+	let Some(peer_cert) = state.session_state().peer_certificate() else {
 		return Ok(None);
 	};
+
 	let public_key = peer_cert.verifying_key::<P::Curve>()?;
 	let peer_verifying_key = P::VerifyingKey::from(public_key);
 	let peer_sid = peer_cert.signer_identifier::<P::Digest>()?;
 	let peer_certificate = Arc::new(peer_cert.clone());
 
 	// Detached last so a session refused above keeps its materials
-	let Some(epoch) = state.take_epoch_materials() else {
+	let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
 		return Ok(None);
 	};
 	let reference_receipt = stored.receipt().clone();
@@ -386,7 +390,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		match wire_envelope {
 			WireEnvelope::Cleartext(transport_envelope) => {
 				// Check if server expects encryption but received cleartext
-				if self.to_decryptor_ref().is_ok() {
+				if self.session_state().decryptor().is_ok() {
 					// Server has encryption configured, reject cleartext
 					return Err(TransportError::MissingEncryption);
 				}
@@ -394,7 +398,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				Ok(transport_envelope)
 			}
 			WireEnvelope::Encrypted(encrypted_info) => {
-				let decrypted_bytes = self.to_decryptor_ref()?.decrypt_content(&encrypted_info)?;
+				let decrypted_bytes = self.session_state().decryptor()?.decrypt_content(&encrypted_info)?;
 				decrypted_bytes
 					.with(|bytes| Self::decode_envelope(bytes))
 					.map_err(TightBeamError::from)?
@@ -410,8 +414,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let wire_envelope = if encrypt {
 			let envelope_bytes = Self::encode_envelope(&envelope)?;
-			let encrypted_info = self.to_encryptor_ref()?.encrypt_next(&envelope_bytes, None)?;
-
+			let encrypted_info = self.session_state().encryptor()?.encrypt_next(&envelope_bytes, None)?;
 			WireEnvelope::Encrypted(encrypted_info)
 		} else {
 			WireEnvelope::Cleartext(envelope)
@@ -445,7 +448,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: EncryptedProtocolState,
 	{
 		match self.read_envelope_bytes().await {
-			Err(TransportError::ConnectionClosed) if self.session_phase().is_handshake_pending() => {
+			Err(TransportError::ConnectionClosed) if self.session_state().phase().is_handshake_pending() => {
 				Err(TransportError::PeerClosedBeforeHandshake)
 			}
 			other => other,
@@ -467,7 +470,6 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let builder = EnvelopeBuilder::request(message).with_limits(*self.limits());
 		let builder = self.apply_wire_mode(builder)?;
-
 		builder.finish()
 	}
 
@@ -485,7 +487,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				// established session refuses a cleartext answer rather than
 				// accepting unauthenticated content (CWE-319). The session is
 				// broken here, as the inbound collector does.
-				if self.session_phase().requires_encryption() {
+				if self.session_state().phase().requires_encryption() {
 					self.reset_session();
 					return Err(TransportError::MissingEncryption);
 				}
@@ -493,7 +495,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				Ok(env)
 			}
 			WireEnvelope::Encrypted(encrypted_info) => {
-				let decrypted_bytes = self.to_decryptor_ref()?.decrypt_content(&encrypted_info)?;
+				let decrypted_bytes = self.session_state().decryptor()?.decrypt_content(&encrypted_info)?;
 				decrypted_bytes
 					.with(|bytes| Self::decode_envelope(bytes))
 					.map_err(TightBeamError::from)?
@@ -519,12 +521,12 @@ pub trait EncryptedMessageIO: MessageIO {
 			// Multi-round server handshakes report Ok per round; only the
 			// completed state marks the session as established.
 			Ok(()) => {
-				if !matches!(self.session_phase(), SessionPhase::Encrypted(_)) {
+				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
 					return;
 				}
 
 				trace.emit_event(events::SESSION_HANDSHAKE_COMPLETE);
-				if self.to_session_receipt_ref().is_some() {
+				if self.session_state().receipt().is_some() {
 					trace.emit_event(events::SESSION_RECEIPT_SETTLED);
 				}
 			}
@@ -571,7 +573,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		// AEAD bound
 		P::AeadCipher: KeyInit,
 	{
-		let should_handshake = matches!(self.session_phase(), SessionPhase::Provisioned);
+		let should_handshake = matches!(self.session_state().phase(), SessionPhase::Provisioned);
 		if should_handshake {
 			self.perform_client_handshake().await?;
 		}
@@ -598,7 +600,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync,
 	{
-		let should_handshake = matches!(self.session_phase(), SessionPhase::Provisioned);
+		let should_handshake = matches!(self.session_state().phase(), SessionPhase::Provisioned);
 		if should_handshake {
 			self.perform_client_handshake().await?;
 		}
@@ -662,7 +664,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		if !self.begin_handshake() {
+		if !self.session_state_mut().begin_handshake() {
 			return Err(TransportError::InvalidState);
 		}
 
@@ -704,7 +706,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Step 5: Complete the handshake, which hands over everything it agreed
 		let session = client.take_established()?;
-		if !self.install_session(session) {
+		if !self.session_state_mut().install_session(session) {
 			return Err(TransportError::InvalidState);
 		}
 
@@ -826,7 +828,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		if !self.begin_handshake() {
+		if !self.session_state_mut().begin_handshake() {
 			return Err(TransportError::InvalidState);
 		}
 
@@ -866,7 +868,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Step 5: Complete the handshake, which hands over everything it agreed
 		let session = orchestrator.complete().await?;
-		if !self.install_session(session) {
+		if !self.session_state_mut().install_session(session) {
 			return Err(TransportError::InvalidState);
 		}
 
@@ -1042,9 +1044,9 @@ pub trait EncryptedMessageIO: MessageIO {
 	#[allow(async_fn_in_trait)]
 	async fn drive_server_handshake(&mut self, request: HandshakeMessage) -> TransportResult<()>
 	where
-		Self: Sized + MessageIO + EncryptedProtocolState,
+		Self: Sized + MessageIO + EncryptedProtocolState + ServerHandshakeSlot,
 	{
-		let orchestrator = self.to_server_handshake_mut().as_mut().ok_or(TransportError::InvalidState)?;
+		let orchestrator = self.server_handshake_mut().as_mut().ok_or(TransportError::InvalidState)?;
 		// Process client handshake message - may return response to send
 		let response = orchestrator.handle_request(request).await?;
 
@@ -1054,17 +1056,20 @@ pub trait EncryptedMessageIO: MessageIO {
 				return Err(TransportError::InvalidMessage);
 			}
 
-			let wire_envelope = WireEnvelope::Cleartext(response.into());
-			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
-
-			if !self.begin_handshake() {
+			// The transition is attempted first, so a refused move emits
+			// nothing. Writing before the refusal would put a handshake
+			// response on the wire of a session that already agreed one.
+			if !self.session_state_mut().begin_handshake() {
 				return Err(TransportError::InvalidState);
 			}
+
+			let wire_envelope = WireEnvelope::Cleartext(response.into());
+			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 		} else {
 			// No response means the handshake is complete.
-			let orchestrator = self.to_server_handshake_mut().take().ok_or(TransportError::InvalidState)?;
+			let orchestrator = self.server_handshake_mut().take().ok_or(TransportError::InvalidState)?;
 			let session = orchestrator.complete().await?;
-			if !self.install_session(session) {
+			if !self.session_state_mut().install_session(session) {
 				return Err(TransportError::InvalidState);
 			}
 		}
@@ -1077,7 +1082,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	#[allow(async_fn_in_trait)]
 	async fn perform_server_handshake<P>(&mut self, handshake_bytes: &[u8]) -> TransportResult<()>
 	where
-		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P>,
+		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: CryptoProvider + Send + Sync + 'static,
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -1098,7 +1103,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let request = HandshakeMessage::try_from(transport_envelope)?;
 
 		// Get or create handshake orchestrator (persists state across multiple messages)
-		if self.to_server_handshake_mut().is_none() {
+		if self.server_handshake_mut().is_none() {
 			let orchestrator = match kind {
 				HandshakeProtocolKind::Ecies => self.build_ecies_server_orchestrator()?,
 
@@ -1111,7 +1116,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				}
 			};
 
-			*self.to_server_handshake_mut() = Some(orchestrator);
+			*self.server_handshake_mut() = Some(orchestrator);
 		}
 
 		// The tokio runtime supplies the timer: the handshake deadline bounds
@@ -1145,7 +1150,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	#[allow(async_fn_in_trait)]
 	async fn perform_server_handshake<P>(&mut self, handshake_bytes: &[u8]) -> TransportResult<()>
 	where
-		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P>,
+		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: CryptoProvider + Send + Sync + 'static,
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -1160,12 +1165,11 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 
 		let kind = self.encryption().handshake_protocol;
-
 		let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
 		let request = HandshakeMessage::try_from(transport_envelope)?;
 
 		// Get or create handshake orchestrator (persists state across multiple messages)
-		if self.to_server_handshake_mut().is_none() {
+		if self.server_handshake_mut().is_none() {
 			let orchestrator = match kind {
 				HandshakeProtocolKind::Ecies => {
 					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Ecies));
@@ -1173,7 +1177,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				HandshakeProtocolKind::Cms => self.build_cms_server_orchestrator()?,
 			};
 
-			*self.to_server_handshake_mut() = Some(orchestrator);
+			*self.server_handshake_mut() = Some(orchestrator);
 		}
 
 		// The tokio runtime supplies the timer: the handshake deadline bounds
@@ -1307,7 +1311,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::transport::handshake::EstablishedSession;
-	use crate::transport::state::EncryptionConfig;
+	use crate::transport::state::{EncryptionConfig, SessionState};
 	use crate::Version;
 
 	#[cfg(feature = "aead")]
@@ -1340,7 +1344,7 @@ mod tests {
 	/// Reads EOF on every call, with the session phase the case under test sets.
 	#[cfg(feature = "aead")]
 	struct ClosedStreamProbe {
-		phase: SessionPhase,
+		state: SessionState,
 		encryption: EncryptionConfig<DefaultCryptoProvider>,
 		limits: TransportLimits,
 	}
@@ -1373,28 +1377,12 @@ mod tests {
 			&self.encryption
 		}
 
-		fn session_phase(&self) -> &SessionPhase {
-			&self.phase
+		fn session_state(&self) -> &SessionState {
+			&self.state
 		}
 
-		fn set_session_phase(&mut self, phase: SessionPhase) {
-			self.phase = phase;
-		}
-
-		fn session_phase_mut(&mut self) -> &mut SessionPhase {
-			&mut self.phase
-		}
-
-		fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
-			Err(TransportError::ConnectionClosed)
-		}
-
-		fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
-			Err(TransportError::ConnectionClosed)
-		}
-
-		fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
-			unreachable!("the probe drives no server handshake")
+		fn session_state_mut(&mut self) -> &mut SessionState {
+			&mut self.state
 		}
 	}
 
@@ -1434,7 +1422,7 @@ mod tests {
 
 		for (label, phase, expected) in cases {
 			let mut probe = ClosedStreamProbe {
-				phase,
+				state: SessionState::at(phase),
 				encryption: EncryptionConfig::default(),
 				limits: TransportLimits::default(),
 			};

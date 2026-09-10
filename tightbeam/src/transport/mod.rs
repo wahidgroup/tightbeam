@@ -168,6 +168,22 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 }
 
 #[cfg(feature = "x509")]
+impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for crate::transport::state::EncryptionConfig<P> {
+	/// The one place a server's configuration becomes provisioning.
+	///
+	/// `limits` is not provisioning, so it stays on the caller to install.
+	fn from(config: TransportEncryptionConfig<P>) -> Self {
+		Self {
+			server_certificate: Some(Arc::new(config.certificate)),
+			client_validators: config.client_validators,
+			aad_domain_tag: Some(config.aad_domain_tag),
+			key_manager: Some(config.key_manager),
+			..Self::default()
+		}
+	}
+}
+
+#[cfg(feature = "x509")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager<P>) -> Self {
 		let key_manager = Arc::new(key_manager);
