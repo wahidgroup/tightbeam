@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::GenericClient;
 use crate::asn1::Frame;
-use crate::transport::error::TransportFailure;
+use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::{MessageCollector, Protocol, TransportResult};
 
 #[cfg(feature = "policy")]
@@ -42,7 +42,10 @@ use x509::*;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
-	pub use crate::transport::policy::{CoreRetryPolicy, PolicyConfig, RestartPolicy, RetryAction};
+	pub use crate::transport::policy::{
+		CollectorGateConfig, CoreRetryPolicy, EmitterGateConfig, PolicyConfig, RestartConfig, RestartPolicy,
+		RetryAction, TimeoutConfig,
+	};
 }
 
 #[cfg(feature = "transport-policy")]
@@ -146,6 +149,8 @@ pub struct ClientBuilder<P: Protocol, C: CryptoProvider + 'static = DefaultCrypt
 	server_certificate_chain: Option<Arc<[Certificate]>>,
 	#[cfg(feature = "x509")]
 	handshake_protocol: Option<HandshakeProtocolKind>,
+	#[cfg(feature = "x509")]
+	allow_cleartext: bool,
 	_ph: PhantomData<(P, C)>,
 }
 
@@ -163,6 +168,8 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 			server_certificate_chain: None,
 			#[cfg(feature = "x509")]
 			handshake_protocol: None,
+			#[cfg(feature = "x509")]
+			allow_cleartext: false,
 			_ph: PhantomData,
 		}
 	}
@@ -216,6 +223,18 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 		self.handshake_protocol = Some(kind);
 		self
 	}
+
+	/// Run this client without authenticating the server.
+	///
+	/// A client with no trust store verifies nobody, so [`Self::connect`]
+	/// refuses it until this names that as the intent. Frames then travel in
+	/// the clear and any peer answering the address is accepted, which suits a
+	/// loopback fixture or a link a lower layer already secures.
+	#[cfg(feature = "x509")]
+	pub fn allow_cleartext(mut self) -> Self {
+		self.allow_cleartext = true;
+		self
+	}
 }
 
 #[cfg(not(feature = "x509"))]
@@ -239,7 +258,20 @@ where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
 	P::Address: Clone + Send,
 {
+	/// Connect and configure the client.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the client holds
+	///   no trust store and did not call [`Self::allow_cleartext`], so it would
+	///   have accepted any peer.
 	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
+		// A client identity proves who the client is and leaves the server
+		// unverified, so only a trust store answers for the peer (CWE-295).
+		if self.trust_store.is_none() && !self.allow_cleartext {
+			return Err(TransportError::PeerAuthenticationUnconfigured);
+		}
+
 		let addr = addr.borrow().clone();
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let mut transport = P::create_transport(stream);
@@ -320,5 +352,44 @@ where
 impl GatePolicy for Arc<dyn GatePolicy + Send + Sync> {
 	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		(**self).evaluate(message, session)
+	}
+}
+
+#[cfg(all(
+	test,
+	feature = "x509",
+	feature = "tokio",
+	feature = "std",
+	not(target_arch = "wasm32")
+))]
+mod tests {
+	use super::*;
+	use crate::transport::tcp::r#async::TokioListener;
+	use crate::transport::tcp::TightBeamSocketAddr;
+	use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+	/// Port 1 on loopback, where a connection attempt fails fast. The refusal
+	/// under test is reached before the dial, so the first case never leaves the
+	/// builder and the second fails at the address.
+	const UNREACHABLE: TightBeamSocketAddr =
+		TightBeamSocketAddr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)));
+
+	/// A client with no trust store authenticates nobody, so it is refused
+	/// before it opens a connection (CWE-295).
+	#[tokio::test]
+	async fn a_client_without_a_trust_store_is_refused() {
+		let refused = ClientBuilder::<TokioListener>::builder().connect(UNREACHABLE).await;
+		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
+	}
+
+	/// Naming cleartext is what lets the same client through, so it reaches the
+	/// address and fails there instead.
+	#[tokio::test]
+	async fn naming_cleartext_admits_the_same_client() {
+		let admitted = ClientBuilder::<TokioListener>::builder()
+			.allow_cleartext()
+			.connect(UNREACHABLE)
+			.await;
+		assert!(!matches!(admitted, Err(TransportError::PeerAuthenticationUnconfigured)));
 	}
 }

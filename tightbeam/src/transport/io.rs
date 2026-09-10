@@ -96,12 +96,11 @@ mod x509 {
 	mod ecies {
 		pub use crate::cms::enveloped_data::EnvelopedData;
 		pub use crate::cms::signed_data::SignedData;
-		pub use crate::crypto::aead::SessionKeys;
 		pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
 		pub use crate::crypto::sign::SignatureEncoding;
 		pub use crate::der::oid::AssociatedOid;
 		pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
-		pub use crate::transport::handshake::{HandshakeFinalization, ServerHandshake};
+		pub use crate::transport::handshake::ServerHandshake;
 
 		#[cfg(feature = "std")]
 		pub use crate::crypto::x509::policy::CertificateValidation;
@@ -192,7 +191,12 @@ where
 	let Some(stored) = state.to_session_receipt_ref().cloned() else {
 		return Ok(None);
 	};
-	let Some(provider) = state.to_key_manager_ref().map(|manager| manager.signing_provider()) else {
+	let Some(provider) = state
+		.encryption()
+		.key_manager
+		.as_ref()
+		.map(|manager| manager.signing_provider())
+	else {
 		return Ok(None);
 	};
 
@@ -215,14 +219,14 @@ where
 
 	let driver = match role {
 		MuxRole::Client => {
-			let exchange = ClientRekey::new(materials, state.to_receipt_approver());
+			let exchange = ClientRekey::new(materials, state.encryption().receipt_approver.as_ref().map(Arc::clone));
 			RekeyDriver::client(exchange)
 		}
 		MuxRole::Server => {
 			let exchange = ServerRekey::new(
 				materials,
-				state.to_transport_authorizer(),
-				state.to_session_observer(),
+				state.encryption().transport_authorizer.as_ref().map(Arc::clone),
+				state.encryption().session_observer.as_ref().map(Arc::clone),
 				Some(peer_certificate),
 			);
 			RekeyDriver::server(exchange)
@@ -476,7 +480,18 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 		match wire_envelope {
-			WireEnvelope::Cleartext(env) => Ok(env),
+			WireEnvelope::Cleartext(env) => {
+				// The phase decides the wire mode for both directions, so an
+				// established session refuses a cleartext answer rather than
+				// accepting unauthenticated content (CWE-319). The session is
+				// broken here, as the inbound collector does.
+				if self.session_phase().requires_encryption() {
+					self.reset_session();
+					return Err(TransportError::MissingEncryption);
+				}
+
+				Ok(env)
+			}
 			WireEnvelope::Encrypted(encrypted_info) => {
 				let decrypted_bytes = self.to_decryptor_ref()?.decrypt_content(&encrypted_info)?;
 				decrypted_bytes
@@ -620,18 +635,18 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Use trust store for server certificate validation
 		#[cfg(all(feature = "x509", feature = "std"))]
-		if let Some(store) = self.to_trust_store_ref() {
+		if let Some(store) = self.encryption().trust_store.as_ref() {
 			let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
 			client = client.with_certificate_validator(validator);
 		}
 
 		// Offer transport capabilities (multiplexing) when locally configured
-		if let Some(offer) = self.to_mux_config() {
+		if let Some(offer) = self.encryption().mux_offer.as_deref().cloned() {
 			client = client.with_transport_offer(offer);
 		}
 
 		// Receipt approver for budget-bearing sessions
-		if let Some(approver) = self.to_receipt_approver() {
+		if let Some(approver) = self.encryption().receipt_approver.as_ref().map(Arc::clone) {
 			client = client.with_receipt_approver(approver);
 		}
 
@@ -647,7 +662,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		self.begin_handshake();
+		if !self.begin_handshake() {
+			return Err(TransportError::InvalidState);
+		}
 
 		// Step 2: Receive server response
 		let response_wire_bytes = self.read_session_bytes().await?;
@@ -685,19 +702,11 @@ pub trait EncryptedMessageIO: MessageIO {
 		let wire_envelope = WireEnvelope::Cleartext(next_message.into());
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
-		// Step 5: Complete handshake and role-map the directional session keys
-		let ciphers = client.complete()?;
-		let profile = HandshakeFinalization::selected_profile(&client).ok_or(TransportError::InvalidMessage)?;
-		let aead_oid = profile.aead.ok_or(TransportError::InvalidMessage)?;
-		let session_keys = SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
-
-		self.set_mux_settings(client.negotiated_mux());
-		self.set_session_receipt(client.session_receipt().cloned());
-		if let Some(peer_cert) = client.peer_certificate().cloned() {
-			self.set_peer_certificate(peer_cert);
+		// Step 5: Complete the handshake, which hands over everything it agreed
+		let session = client.take_established()?;
+		if !self.install_session(session) {
+			return Err(TransportError::InvalidState);
 		}
-		self.set_epoch_materials(client.take_epoch_materials());
-		self.complete_handshake(session_keys);
 
 		Ok(())
 	}
@@ -722,22 +731,28 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Use trust store for server certificate validation
 		#[cfg(all(feature = "x509", feature = "std"))]
 		let validator = self
-			.to_trust_store_ref()
+			.encryption()
+			.trust_store
+			.as_ref()
 			.map(|store| Arc::clone(store) as Arc<dyn CertificateValidation>);
 
 		#[cfg(not(all(feature = "x509", feature = "std")))]
 		let validator = None;
 
-		let key = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
-		let client_cert = self.to_client_certificate_ref().map(Arc::clone);
+		let key = self
+			.encryption()
+			.key_manager
+			.as_ref()
+			.ok_or(TransportError::MissingEncryption)?;
+		let client_cert = self.encryption().client_certificate.as_ref().map(Arc::clone);
 
 		Ok(key.create_ecies_client::<Secp256k1EciesMessage>(
 			None,
 			client_cert,
 			None,
 			validator,
-			self.to_mux_config(),
-			self.to_receipt_approver(),
+			self.encryption().mux_offer.as_deref().cloned(),
+			self.encryption().receipt_approver.as_ref().map(Arc::clone),
 		)?)
 	}
 
@@ -760,26 +775,34 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync,
 	{
-		let key = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
+		let key = self
+			.encryption()
+			.key_manager
+			.as_ref()
+			.ok_or(TransportError::MissingEncryption)?;
 		let store = self
-			.to_trust_store_ref()
+			.encryption()
+			.trust_store
+			.as_ref()
 			.ok_or(TransportError::HandshakeError(HandshakeError::MissingTrustStore))?;
 		let chain = self
-			.to_server_certificate_chain_ref()
+			.encryption()
+			.server_certificate_chain
+			.as_ref()
 			.ok_or(TransportError::MissingServerCertificateChain)?;
 
 		let trust_store = Arc::clone(store);
 		let server_identity = Arc::clone(chain).into();
 		let security_offer = Some(SecurityOffer::new(vec![SecurityProfileDesc::from(&TightbeamProfile)]));
-		let client_certificate = self.to_client_certificate_ref().map(Arc::clone);
+		let client_certificate = self.encryption().client_certificate.as_ref().map(Arc::clone);
 
 		Ok(key.create_cms_client(CmsClientConfig {
 			server_identity,
 			trust_store,
 			security_offer,
-			transport_offer: self.to_mux_config(),
+			transport_offer: self.encryption().mux_offer.as_deref().cloned(),
 			client_certificate,
-			receipt_approver: self.to_receipt_approver(),
+			receipt_approver: self.encryption().receipt_approver.as_ref().map(Arc::clone),
 		})?)
 	}
 
@@ -803,7 +826,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		self.begin_handshake();
+		if !self.begin_handshake() {
+			return Err(TransportError::InvalidState);
+		}
 
 		// Step 2: Receive server response
 		let response_wire_bytes = self.read_session_bytes().await?;
@@ -839,17 +864,11 @@ pub trait EncryptedMessageIO: MessageIO {
 			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 		}
 
-		// Step 5: Complete handshake and get the directional session keys
-		let session_keys = orchestrator.complete().await?;
-
-		// Handshake complete: persist keys, mux terms, receipt, peer cert, epoch materials
-		self.set_mux_settings(orchestrator.negotiated_mux());
-		self.set_session_receipt(orchestrator.session_receipt().cloned());
-		if let Some(peer_cert) = orchestrator.peer_certificate().cloned() {
-			self.set_peer_certificate(peer_cert);
+		// Step 5: Complete the handshake, which hands over everything it agreed
+		let session = orchestrator.complete().await?;
+		if !self.install_session(session) {
+			return Err(TransportError::InvalidState);
 		}
-		self.set_epoch_materials(orchestrator.take_epoch_materials());
-		self.complete_handshake(session_keys);
 
 		Ok(())
 	}
@@ -877,10 +896,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync,
 	{
-		let kind = self.to_handshake_protocol_kind();
-
+		let kind = self.encryption().handshake_protocol;
 		// Branch: Handle ECIES without mutual auth separately (K=() cannot be trait object)
-		if matches!(kind, HandshakeProtocolKind::Ecies) && self.to_key_manager_ref().is_none() {
+		if matches!(kind, HandshakeProtocolKind::Ecies) && self.encryption().key_manager.as_ref().is_none() {
 			let outcome = self.perform_client_handshake_no_mutual_auth().await;
 
 			#[cfg(feature = "instrument")]
@@ -929,7 +947,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync,
 	{
-		let kind = self.to_handshake_protocol_kind();
+		let kind = self.encryption().handshake_protocol;
 		let orchestrator = match kind {
 			HandshakeProtocolKind::Ecies => {
 				return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Ecies));
@@ -959,9 +977,19 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::VerifyingKey: Verifier<P::Signature> + for<'b> From<&'b PublicKey<P::Curve>>,
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
-		let cert_arc = self.to_server_certificate_arc().ok_or(TransportError::MissingEncryption)?;
-		let key_manager = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
-		let client_validators = self.to_client_validators_ref().map(Arc::clone);
+		let cert_arc = self
+			.encryption()
+			.server_certificate
+			.as_ref()
+			.map(Arc::clone)
+			.ok_or(TransportError::MissingEncryption)?;
+		let key_manager = self
+			.encryption()
+			.key_manager
+			.as_ref()
+			.ok_or(TransportError::MissingEncryption)?;
+
+		let client_validators = self.encryption().client_validators.as_ref().map(Arc::clone);
 		let supported_profiles = vec![SecurityProfileDesc::from(&TightbeamProfile)];
 
 		Ok(key_manager.create_ecies_server(
@@ -969,9 +997,9 @@ pub trait EncryptedMessageIO: MessageIO {
 			None,
 			supported_profiles,
 			client_validators,
-			self.to_mux_config(),
-			self.to_transport_authorizer(),
-			self.to_session_observer(),
+			self.encryption().mux_offer.as_deref().cloned(),
+			self.encryption().transport_authorizer.as_ref().map(Arc::clone),
+			self.encryption().session_observer.as_ref().map(Arc::clone),
 		)?)
 	}
 
@@ -989,16 +1017,21 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
-		let key_manager = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
-		let client_validators = self.to_client_validators_ref().map(Arc::clone);
+		let key_manager = self
+			.encryption()
+			.key_manager
+			.as_ref()
+			.ok_or(TransportError::MissingEncryption)?;
+
+		let client_validators = self.encryption().client_validators.as_ref().map(Arc::clone);
 		let supported_profiles = vec![SecurityProfileDesc::from(&TightbeamProfile)];
 
 		Ok(key_manager.create_cms_server(
 			client_validators,
 			supported_profiles,
-			self.to_mux_config(),
-			self.to_transport_authorizer(),
-			self.to_session_observer(),
+			self.encryption().mux_offer.as_deref().cloned(),
+			self.encryption().transport_authorizer.as_ref().map(Arc::clone),
+			self.encryption().session_observer.as_ref().map(Arc::clone),
 		)?)
 	}
 
@@ -1024,26 +1057,16 @@ pub trait EncryptedMessageIO: MessageIO {
 			let wire_envelope = WireEnvelope::Cleartext(response.into());
 			self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
-			self.begin_handshake();
-		} else {
-			// No response means handshake is complete - get the directional session keys
-			let session_keys = orchestrator.complete().await?;
-			let mux_settings = orchestrator.negotiated_mux();
-			let session_receipt = orchestrator.session_receipt().cloned();
-			let epoch_materials = orchestrator.take_epoch_materials();
-
-			// Extract peer certificate if mutual auth was performed
-			if let Some(peer_cert) = orchestrator.peer_certificate().cloned() {
-				self.set_peer_certificate(peer_cert);
+			if !self.begin_handshake() {
+				return Err(TransportError::InvalidState);
 			}
-
-			self.set_mux_settings(mux_settings);
-			self.set_session_receipt(session_receipt);
-			self.set_epoch_materials(epoch_materials);
-			self.complete_handshake(session_keys);
-
-			// Clear handshake instance - no longer needed
-			*self.to_server_handshake_mut() = None;
+		} else {
+			// No response means the handshake is complete.
+			let orchestrator = self.to_server_handshake_mut().take().ok_or(TransportError::InvalidState)?;
+			let session = orchestrator.complete().await?;
+			if !self.install_session(session) {
+				return Err(TransportError::InvalidState);
+			}
 		}
 
 		Ok(())
@@ -1070,7 +1093,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		let kind = self.to_handshake_protocol_kind();
+		let kind = self.encryption().handshake_protocol;
 		let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
 		let request = HandshakeMessage::try_from(transport_envelope)?;
 
@@ -1136,7 +1159,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		let kind = self.to_handshake_protocol_kind();
+		let kind = self.encryption().handshake_protocol;
 
 		let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
 		let request = HandshakeMessage::try_from(transport_envelope)?;
@@ -1281,19 +1304,18 @@ impl TransportEnvelope {
 mod tests {
 	use super::*;
 	use crate::asn1::{MessagePriority, Metadata};
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
+	use crate::transport::handshake::EstablishedSession;
+	use crate::transport::state::EncryptionConfig;
 	use crate::Version;
 
 	#[cfg(feature = "aead")]
 	use crate::crypto::aead::SessionKeys;
 	#[cfg(feature = "aead")]
-	use crate::transport::handshake::negotiation::MuxSettings;
-	#[cfg(feature = "aead")]
 	use crate::transport::handshake::HandshakeInstant;
 	#[cfg(feature = "aead")]
 	use crate::transport::TransportLimits;
-	#[cfg(feature = "aead")]
-	use crate::x509::Certificate;
 
 	fn frame_with_priority(version: Version) -> Frame {
 		let mut metadata = Metadata::default();
@@ -1319,6 +1341,7 @@ mod tests {
 	#[cfg(feature = "aead")]
 	struct ClosedStreamProbe {
 		phase: SessionPhase,
+		encryption: EncryptionConfig<DefaultCryptoProvider>,
 		limits: TransportLimits,
 	}
 
@@ -1337,11 +1360,17 @@ mod tests {
 	impl EncryptedMessageIO for ClosedStreamProbe {}
 
 	#[cfg(feature = "aead")]
+	impl crate::transport::state::SealedProtocolState for ClosedStreamProbe {}
+
 	impl EncryptedProtocolState for ClosedStreamProbe {
 		type CryptoProvider = crate::crypto::profiles::DefaultCryptoProvider;
 
 		fn limits(&self) -> &TransportLimits {
 			&self.limits
+		}
+
+		fn encryption(&self) -> &EncryptionConfig<DefaultCryptoProvider> {
+			&self.encryption
 		}
 
 		fn session_phase(&self) -> &SessionPhase {
@@ -1352,12 +1381,8 @@ mod tests {
 			self.phase = phase;
 		}
 
-		fn is_client_validators_present(&self) -> bool {
-			false
-		}
-
-		fn to_server_certificate_ref(&self) -> Option<&Certificate> {
-			None
+		fn session_phase_mut(&mut self) -> &mut SessionPhase {
+			&mut self.phase
 		}
 
 		fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
@@ -1367,14 +1392,6 @@ mod tests {
 		fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
 			Err(TransportError::ConnectionClosed)
 		}
-
-		fn to_mux_config(&self) -> Option<crate::transport::handshake::negotiation::TransportOffer> {
-			None
-		}
-
-		fn set_mux_settings(&mut self, _settings: Option<MuxSettings>) {}
-
-		fn set_peer_certificate(&mut self, _cert: Certificate) {}
 
 		fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
 			unreachable!("the probe drives no server handshake")
@@ -1391,11 +1408,17 @@ mod tests {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
 		use crate::der::oid::AssociatedOid;
 
-		let encrypted = SessionPhase::Encrypted(SessionKeys::for_client(
-			Aes256Gcm::new(&[0u8; 32].into()),
-			Aes256Gcm::new(&[1u8; 32].into()),
-			Aes256GcmOid::OID,
-		));
+		let encrypted = SessionPhase::Encrypted(Box::new(EstablishedSession {
+			keys: SessionKeys::for_client(
+				Aes256Gcm::new(&[0u8; 32].into()),
+				Aes256Gcm::new(&[1u8; 32].into()),
+				Aes256GcmOid::OID,
+			),
+			mux: None,
+			receipt: None,
+			peer: None,
+			epoch: None,
+		}));
 
 		let handshaking = SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() };
 		let cases = [
@@ -1410,7 +1433,11 @@ mod tests {
 		];
 
 		for (label, phase, expected) in cases {
-			let mut probe = ClosedStreamProbe { phase, limits: TransportLimits::default() };
+			let mut probe = ClosedStreamProbe {
+				phase,
+				encryption: EncryptionConfig::default(),
+				limits: TransportLimits::default(),
+			};
 			let error = probe
 				.read_session_bytes()
 				.await

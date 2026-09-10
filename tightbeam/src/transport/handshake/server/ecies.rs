@@ -50,13 +50,13 @@ use crate::transport::handshake::state::{Ecies, ServerHandshakeState, ServerStat
 use crate::transport::handshake::utils::HandshakeOctets;
 use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
-use crate::transport::handshake::HandshakeMessage;
 use crate::transport::handshake::{
 	ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake, ServerHandshakeProtocol,
 };
 use crate::transport::handshake::{
 	DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation,
 };
+use crate::transport::handshake::{EstablishedSession, HandshakeMessage};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
@@ -486,6 +486,40 @@ where
 		})
 	}
 
+	/// Complete the handshake and take everything it agreed.
+	///
+	/// The single home for ECIES server completion. The trait implementation
+	/// delegates here, so driver and test read the session terms the same way.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the handshake agreed no profile,
+	///   so it settled on no AEAD algorithm.
+	#[cfg(feature = "aead")]
+	pub fn take_established(&mut self) -> Result<EstablishedSession, HandshakeError>
+	where
+		P::AeadCipher: KeyInit + 'static,
+	{
+		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
+		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
+		let ciphers = EciesHandshakeServer::complete(self)?;
+
+		// The orchestrator is spent, so the receipt moves out rather than
+		// copies. The client certificate is shared behind an `Arc`, so it
+		// is copied out of it.
+		#[cfg(feature = "x509")]
+		let peer = self.validated_client_cert.as_ref().map(Arc::clone);
+
+		Ok(EstablishedSession {
+			keys: SessionKeys::for_server(ciphers.client_to_server, ciphers.server_to_client, aead_oid),
+			mux: self.mux_settings,
+			receipt: self.stored_receipt.take().map(Arc::new),
+			#[cfg(feature = "x509")]
+			peer,
+			epoch: self.epoch_materials.take(),
+		})
+	}
+
 	pub fn decode_client_key_exchange(&self, der_bytes: &[u8]) -> Result<ClientKeyExchange, HandshakeError> {
 		ClientKeyExchange::from_der(der_bytes).map_err(Into::into)
 	}
@@ -756,7 +790,7 @@ impl<P> HandshakeAlertHandler for EciesHandshakeServer<P> where P: CryptoProvide
 
 impl<P> ServerHandshakeProtocol for EciesHandshakeServer<P>
 where
-	P: CryptoProvider + Send + Sync,
+	P: CryptoProvider + Send + Sync + 'static,
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
@@ -800,41 +834,12 @@ where
 		self.selected_profile
 	}
 
-	fn negotiated_mux(&self) -> Option<MuxSettings> {
-		self.mux_settings
-	}
-
-	fn session_receipt(&self) -> Option<&StoredReceipt> {
-		self.stored_receipt.as_ref()
-	}
-
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, Self::Error>> {
 		Box::pin(async move {
-			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
-
-			// Delegate to the inherent method: single source of truth for state
-			// validation, AEAD derivation, invariants, and cleanup.
-			let ciphers = EciesHandshakeServer::complete(self)?;
-
-			// Role-map the directional ciphers with the negotiated OID
-			Ok(SessionKeys::for_server(
-				ciphers.client_to_server,
-				ciphers.server_to_client,
-				aead_oid,
-			))
+			let mut server = self;
+			server.take_established()
 		})
-	}
-
-	#[cfg(feature = "x509")]
-	fn peer_certificate(&self) -> Option<&Certificate> {
-		self.validated_client_cert.as_ref().map(|arc| arc.as_ref())
-	}
-
-	#[cfg(feature = "aead")]
-	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
-		self.epoch_materials.take()
 	}
 }
 

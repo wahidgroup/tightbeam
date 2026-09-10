@@ -40,7 +40,7 @@ use x509::*;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
-	pub use crate::transport::policy::PolicyConfig;
+	pub use crate::transport::policy::{PolicyConfig, TimeoutConfig};
 	pub use crate::transport::MessageEmitter;
 	pub use crate::Frame;
 }

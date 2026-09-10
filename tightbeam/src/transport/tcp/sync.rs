@@ -20,13 +20,10 @@ use std::time::Instant;
 use crate::builder::TypeBuilder;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
 use crate::transport::framing::{parse_der_length, reconstruct_der_encoding, LengthForm};
-use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
-use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
-use crate::transport::handshake::{BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind};
+use crate::transport::handshake::{BoxedServerHandshake, HandshakeKeyManager};
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
 use crate::transport::TransportLimits;
@@ -40,8 +37,6 @@ use crate::Frame;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(feature = "aead")]
-use crate::transport::handshake::EpochMaterials;
-
 #[cfg(feature = "transport-policy")]
 mod policy {
 	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
@@ -370,13 +365,13 @@ where
 
 		{
 			if let Some(ref cert) = self.certificate {
-				transport.server_identity = Some(Arc::clone(cert));
+				transport.encryption.server_certificate = Some(Arc::clone(cert));
 			}
 			if let Some(ref validators) = self.client_validators {
-				transport.client_validators = Some(Arc::clone(validators));
+				transport.encryption.client_validators = Some(Arc::clone(validators));
 			}
 			if let Some(aad) = self.aad_domain_tag {
-				transport.aad_domain_tag = Some(aad);
+				transport.encryption.aad_domain_tag = Some(aad);
 			}
 
 			transport.limits = self.limits;
@@ -384,7 +379,7 @@ where
 		}
 
 		if let Some(ref signatory) = self.key_manager {
-			transport.key_manager = Some(Arc::clone(signatory));
+			transport.encryption.key_manager = Some(Arc::clone(signatory));
 		}
 
 		Ok(transport)
@@ -489,7 +484,7 @@ mod tests {
 		let server_handle = thread::spawn(move || -> TransportResult<(TransportResult<Vec<u8>>, Duration)> {
 			let (stream, _) = listener.accept()?;
 			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::from(stream);
-			transport.client_validators = Some(Arc::new(Vec::new()));
+			transport.encryption.client_validators = Some(Arc::new(Vec::new()));
 			transport.provision();
 			transport.limits.handshake_timeout = Duration::from_millis(250);
 

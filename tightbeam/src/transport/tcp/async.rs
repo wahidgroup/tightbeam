@@ -30,8 +30,16 @@ use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportFailure;
-use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
-use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::transport::handshake::negotiation::MuxSettings;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::io::decode_transport_envelope;
 use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
 use crate::transport::ResponsePackage;
@@ -58,13 +66,22 @@ mod x509 {
 	pub use crate::crypto::aead::{Decryptor, RecvCipher, SendCipher};
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::policy::CertificateValidation;
-	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::der::Decode;
 	pub use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
-	pub use crate::transport::handshake::{BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind};
+	pub use crate::transport::handshake::BoxedServerHandshake;
+	// Only the listener holds a key manager, and it exists under tokio.
+	#[cfg(feature = "tokio")]
+	pub use crate::transport::handshake::HandshakeKeyManager;
 	pub use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 	pub use crate::transport::state::{EncryptedProtocolState, SessionPhase};
 	pub use crate::transport::{EncryptedMessageIO, TransportEncryptionConfig};
+	#[cfg(any(
+		feature = "tokio",
+		all(
+			feature = "transport-multiplex",
+			any(feature = "transport-cms", feature = "transport-ecies")
+		)
+	))]
 	pub use crate::x509::Certificate;
 
 	#[cfg(all(
@@ -73,8 +90,6 @@ mod x509 {
 		any(feature = "transport-cms", feature = "transport-ecies")
 	))]
 	pub use crate::policy::SessionContext;
-	#[cfg(feature = "aead")]
-	pub use crate::transport::handshake::EpochMaterials;
 }
 
 #[cfg(feature = "x509")]
@@ -221,15 +236,13 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 		let mut transport = TcpTransport::from(tokio_stream);
 
 		if let Some(cert) = &self.certificate {
-			transport.server_identity = Some(Arc::clone(cert));
+			transport.encryption.server_certificate = Some(Arc::clone(cert));
 		}
-
 		if let Some(ref validators) = self.client_validators {
-			transport.client_validators = Some(Arc::clone(validators));
+			transport.encryption.client_validators = Some(Arc::clone(validators));
 		}
-
 		if let Some(aad) = self.aad_domain_tag {
-			transport.aad_domain_tag = Some(aad);
+			transport.encryption.aad_domain_tag = Some(aad);
 		}
 
 		transport.limits = self.limits;
@@ -237,7 +250,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 
 		#[cfg(feature = "x509")]
 		if let Some(signatory) = &self.key_manager {
-			transport.key_manager = Some(Arc::clone(signatory));
+			transport.encryption.key_manager = Some(Arc::clone(signatory));
 		}
 
 		Ok((transport, peer_addr))
@@ -343,12 +356,11 @@ where
 {
 	/// Configure this transport as an encrypted server endpoint.
 	pub fn with_server_encryption(mut self, config: TransportEncryptionConfig<P>) -> Self {
-		let certificate = Arc::new(config.certificate);
-		self.server_identity = Some(certificate);
-		self.client_validators = config.client_validators;
-		self.aad_domain_tag = Some(config.aad_domain_tag);
+		self.encryption.server_certificate = Some(Arc::new(config.certificate));
+		self.encryption.client_validators = config.client_validators;
+		self.encryption.aad_domain_tag = Some(config.aad_domain_tag);
+		self.encryption.key_manager = Some(config.key_manager);
 		self.limits = config.limits;
-		self.key_manager = Some(config.key_manager);
 		self.provision();
 		self
 	}
@@ -392,7 +404,7 @@ where
 {
 	/// Local mux advertisement bound into the handshake transcript; `None` advertises nothing.
 	pub fn with_mux_offer(mut self, offer: impl IntoMuxOffer) -> Self {
-		self.mux_config = offer.into_mux_offer();
+		self.encryption.mux_offer = offer.into_mux_offer();
 		self
 	}
 }
@@ -517,7 +529,7 @@ where
 	/// Cleartext servers (no certificate) never handshake and never mux:
 	/// `Ok(None)` without touching the wire.
 	async fn negotiate_mux(&mut self) -> TransportResult<Option<MuxSettings>> {
-		if self.to_server_certificate_ref().is_none() {
+		if !self.encryption().is_provisioned() {
 			return Ok(None);
 		}
 
@@ -839,11 +851,11 @@ where
 	/// - `InvalidState`: handshake has not completed
 	/// - `OperationFailed(EncryptorUnavailable)`: no session keys present
 	pub fn into_split(mut self) -> TransportResult<SplitTransport<S>> {
-		let SessionPhase::Encrypted(session_keys) = core::mem::take(&mut self.phase) else {
+		let SessionPhase::Encrypted(session) = core::mem::take(&mut self.phase) else {
 			return Err(TransportError::InvalidState);
 		};
-		let (send_key, recv_key) = session_keys.into_parts();
 
+		let (send_key, recv_key) = session.keys.into_parts();
 		let limits = self.limits;
 
 		#[cfg(feature = "instrument")]
@@ -880,8 +892,7 @@ where
 			return Err(TransportError::InvalidState);
 		}
 
-		let encryption_configured = self.server_identity.is_some() || self.key_manager.is_some();
-		if encryption_configured {
+		if self.encryption.has_encryption_material() {
 			return Err(TransportError::MissingEncryption);
 		}
 
@@ -1141,7 +1152,7 @@ mod tests {
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	use crate::policy::SessionContext;
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
-	use crate::transport::policy::PolicyConfig;
+	use crate::transport::policy::CollectorGateConfig;
 
 	#[cfg(all(feature = "x509", feature = "aead"))]
 	mod cipher_install {
@@ -1380,8 +1391,8 @@ mod tests {
 		let key_manager = HandshakeKeyManager::new(provider);
 
 		let mut transport = tcp_transport_from(stream);
-		transport.handshake_protocol_kind = HandshakeProtocolKind::Cms;
-		transport.key_manager = Some(Arc::new(key_manager));
+		transport.encryption.handshake_protocol = HandshakeProtocolKind::Cms;
+		transport.encryption.key_manager = Some(Arc::new(key_manager));
 		transport.provision();
 		transport
 	}
@@ -1391,7 +1402,6 @@ mod tests {
 	async fn cms_client_without_trust_store_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
 		let mut transport = cms_test_client(client_stream);
-
 		let handshake = transport.perform_client_handshake().await;
 		assert!(matches!(
 			handshake,
@@ -1425,7 +1435,7 @@ mod tests {
 		let response_frame = expected_response.to_owned();
 		let server_handle = tokio::spawn(async move {
 			let (mut transport, _peer) = listener.accept().await?;
-			transport.handshake_protocol_kind = HandshakeProtocolKind::Cms;
+			transport.encryption.handshake_protocol = HandshakeProtocolKind::Cms;
 
 			respond_with(&mut transport, move |msg: Frame| {
 				let _ = received_tx.try_send(msg);

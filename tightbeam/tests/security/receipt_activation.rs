@@ -95,7 +95,7 @@ tb_scenario! {
 
 			// The countersigned receipt reached no acknowledgement, so the
 			// metered session must not activate.
-			let complete_result = server.complete();
+			let complete_result = server.take_established();
 			let activation_refused = matches!(complete_result, Err(HandshakeError::CountersignatureMissing));
 			trace.event_with(
 				COMPLETE_FAILS_WITHOUT_SETTLEMENT,

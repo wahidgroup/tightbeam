@@ -38,11 +38,11 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Ecies};
 use crate::transport::handshake::utils::HandshakeOctets;
 use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
-use crate::transport::handshake::HandshakeMessage;
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake,
 };
 use crate::transport::handshake::{DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization};
+use crate::transport::handshake::{EstablishedSession, HandshakeMessage};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
@@ -76,9 +76,7 @@ where
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	stored_receipt: Option<StoredReceipt>,
 	epoch_materials: Option<EpochMaterials>,
-	/// Server certificate validated against the trust store, retained
-	/// as the peer identity for post-handshake epoch renewals.
-	server_certificate: Option<Certificate>,
+	server_certificate: Option<Arc<Certificate>>,
 	_phantom_provider: PhantomData<P>,
 	_phantom_message: PhantomData<M>,
 }
@@ -382,7 +380,7 @@ where
 		};
 
 		// 12. Retain the validated server certificate for post-handshake renewals
-		self.server_certificate = Some(server_handshake.certificate);
+		self.server_certificate = Some(Arc::new(server_handshake.certificate));
 
 		// 13. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
@@ -635,7 +633,39 @@ where
 
 	/// Validated server certificate retained for post-handshake epoch renewals.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
-		self.server_certificate.as_ref()
+		self.server_certificate.as_deref()
+	}
+
+	/// Complete the handshake and take everything it agreed.
+	///
+	/// The mutual-auth path reaches this through
+	/// [`ClientHandshakeProtocol`](crate::transport::handshake::ClientHandshakeProtocol),
+	/// and the client-identity-free path calls it directly, so both read the
+	/// session terms the same way.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the handshake has no negotiated
+	///   profile, so it agreed no AEAD algorithm.
+	#[cfg(feature = "aead")]
+	pub fn take_established(&mut self) -> Result<EstablishedSession, HandshakeError>
+	where
+		P::AeadCipher: KeyInit + 'static,
+	{
+		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
+		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
+		// Delegate to the inherent method: single source of truth for state
+		// validation, AEAD derivation, invariants, and cleanup.
+		let ciphers = self.complete()?;
+
+		Ok(EstablishedSession {
+			keys: SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid),
+			mux: self.mux_settings,
+			receipt: self.stored_receipt.take().map(Arc::new),
+			epoch: self.epoch_materials.take(),
+			#[cfg(feature = "x509")]
+			peer: self.server_certificate.as_ref().map(Arc::clone),
+		})
 	}
 
 	// Helper methods
@@ -723,7 +753,7 @@ impl<P, M> HandshakeAlertHandler for EciesHandshakeClient<P, M> where P: CryptoP
 
 impl<P, M> ClientHandshakeProtocol for EciesHandshakeClient<P, M>
 where
-	P: CryptoProvider + Send + Sync,
+	P: CryptoProvider + Send + Sync + 'static,
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
@@ -734,7 +764,7 @@ where
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
 	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey + Send + Sync,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
-	M: EciesMessageOps + Send + Sync,
+	M: EciesMessageOps + Send + Sync + 'static,
 {
 	type Error = HandshakeError;
 
@@ -764,19 +794,10 @@ where
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, Self::Error>> {
 		Box::pin(async move {
-			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
-			// Delegate to the inherent method: single source of truth for state
-			// validation, AEAD derivation, invariants, and cleanup.
-			let ciphers = EciesHandshakeClient::complete(self)?;
-
-			Ok(SessionKeys::for_client(
-				ciphers.client_to_server,
-				ciphers.server_to_client,
-				aead_oid,
-			))
+			let mut client = self;
+			EciesHandshakeClient::take_established(&mut client)
 		})
 	}
 
@@ -786,24 +807,6 @@ where
 
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
-	}
-
-	fn negotiated_mux(&self) -> Option<MuxSettings> {
-		EciesHandshakeClient::negotiated_mux(self)
-	}
-
-	fn session_receipt(&self) -> Option<&StoredReceipt> {
-		EciesHandshakeClient::session_receipt(self)
-	}
-
-	#[cfg(feature = "x509")]
-	fn peer_certificate(&self) -> Option<&Certificate> {
-		EciesHandshakeClient::peer_certificate(self)
-	}
-
-	#[cfg(feature = "aead")]
-	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
-		EciesHandshakeClient::take_epoch_materials(self)
 	}
 }
 

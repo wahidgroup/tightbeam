@@ -46,10 +46,8 @@ use crate::transport::handshake::receipt::{
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Cms};
 use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_transcript_digest, validate_state};
-use crate::transport::handshake::HandshakeMessage;
-use crate::transport::handshake::{
-	Arc, ClientHandshakeProtocol, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization,
-};
+use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
+use crate::transport::handshake::{EstablishedSession, HandshakeMessage};
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::zeroize::Zeroizing;
@@ -86,7 +84,6 @@ where
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	pending_receipt: Option<(SessionReceipt, SignedData)>,
 	stored_receipt: Option<StoredReceipt>,
-	epoch_materials: Option<EpochMaterials>,
 }
 
 /// Signer identity and algorithm identifiers for a Finished SignedData.
@@ -161,7 +158,6 @@ where
 			receipt_approver: None,
 			pending_receipt: None,
 			stored_receipt: None,
-			epoch_materials: None,
 		}
 	}
 
@@ -620,17 +616,6 @@ where
 		Ok(signed_data)
 	}
 
-	/// Complete the handshake.
-	pub fn complete(&mut self) -> Result<(), HandshakeError> {
-		// 1. Validation
-		self.validate_expected_state(ClientHandshakeState::ClientFinishedSent)?;
-
-		// 2. Transition to complete
-		self.state.transition(ClientHandshakeState::Completed)?;
-
-		Ok(())
-	}
-
 	/// Get the current handshake state.
 	pub fn state(&self) -> ClientHandshakeState {
 		self.state.state()
@@ -656,6 +641,66 @@ where
 	/// Server peer identity: pinned certificate or chain leaf used for encryption.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
 		self.server_leaf().ok()
+	}
+
+	/// Complete the handshake and take everything it agreed.
+	///
+	/// The single home for CMS client completion. The trait implementation
+	/// delegates here, so driver and test read the session terms the same way.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the machine has not sent its
+	///   Finished, or the negotiated profile is missing.
+	#[cfg(feature = "aead")]
+	pub fn take_established(&mut self) -> Result<EstablishedSession, HandshakeError>
+	where
+		P::AeadCipher: KeyInit + 'static,
+	{
+		// 1. Validate state
+		if self.state.state() != ClientHandshakeState::ClientFinishedSent {
+			return Err(HandshakeError::InvalidState);
+		}
+
+		// 2. Get CEK (session_key) and profile
+		let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
+		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
+		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
+		let transcript = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+
+		// 3. Derive directional session keys as P::AeadCipher
+		let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript))?;
+		let ciphers = directional?;
+
+		// 4. Seed epoch materials for post-handshake renewal
+		let epoch_derived = cek.with(|input_key| derive_epoch_materials::<P>(input_key, &transcript, transcript))?;
+		let materials = epoch_derived?;
+
+		// 5. Transition to complete
+		self.state.transition(ClientHandshakeState::Completed)?;
+
+		// 6. Role-map the directional ciphers with the negotiated OID. The
+		//    orchestrator is spent, so the receipt moves out rather than
+		//    copies. The peer certificate is a leaf of the retained chain,
+		//    so it is copied out of it.
+		#[cfg(feature = "x509")]
+		let peer = match (&self.server_cert, &self.server_chain) {
+			// A provisioned certificate is already shared, so the session takes
+			// a handle to it.
+			(Some(cert), _) => Some(Arc::clone(cert)),
+			// A chain owns its leaf, so a shared handle needs a copy of it.
+			(None, Some(chain)) => chain.last().cloned().map(Arc::new),
+			(None, None) => None,
+		};
+
+		Ok(EstablishedSession {
+			keys: SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid),
+			mux: self.mux_settings,
+			receipt: self.stored_receipt.take().map(Arc::new),
+			#[cfg(feature = "x509")]
+			peer,
+			epoch: Some(materials),
+		})
 	}
 
 	/// Validate state and certificate for key exchange.
@@ -949,38 +994,10 @@ where
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, Self::Error>> {
 		Box::pin(async move {
-			// 1. Validate state
-			if self.state.state() != ClientHandshakeState::ClientFinishedSent {
-				return Err(HandshakeError::InvalidState);
-			}
-
-			// 2. Get CEK (session_key) and profile
-			let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
-			let transcript = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
-
-			// 3. Derive directional session keys as P::AeadCipher
-			let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript))?;
-			let ciphers = directional?;
-
-			// 4. Seed epoch materials for post-handshake renewal
-			let epoch_derived =
-				cek.with(|input_key| derive_epoch_materials::<P>(input_key, &transcript, transcript))?;
-			let materials = epoch_derived?;
-			self.epoch_materials = Some(materials);
-
-			// 5. Transition to complete
-			self.state.transition(ClientHandshakeState::Completed)?;
-
-			// 6. Role-map the directional ciphers with the negotiated OID
-			Ok(SessionKeys::for_client(
-				ciphers.client_to_server,
-				ciphers.server_to_client,
-				aead_oid,
-			))
+			let mut client = self;
+			client.take_established()
 		})
 	}
 
@@ -990,24 +1007,6 @@ where
 
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
-	}
-
-	fn negotiated_mux(&self) -> Option<MuxSettings> {
-		self.mux_settings
-	}
-
-	fn session_receipt(&self) -> Option<&StoredReceipt> {
-		self.stored_receipt.as_ref()
-	}
-
-	#[cfg(feature = "x509")]
-	fn peer_certificate(&self) -> Option<&Certificate> {
-		CmsHandshakeClient::peer_certificate(self)
-	}
-
-	#[cfg(feature = "aead")]
-	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
-		self.epoch_materials.take()
 	}
 }
 
@@ -1088,10 +1087,9 @@ mod tests {
 		let _client_finished = client.build_client_finished().await?;
 		assert_eq!(client.state(), ClientHandshakeState::ClientFinishedSent);
 
-		// Complete
-		client.complete()?;
-		assert!(client.is_complete());
-		assert_eq!(client.state(), ClientHandshakeState::Completed);
+		// The terminal transition belongs to the real completion, which derives
+		// the keys; the machine is at its last pre-terminal state.
+		assert!(!client.is_complete());
 
 		Ok(())
 	}
