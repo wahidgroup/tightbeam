@@ -102,14 +102,12 @@ fn laser_certs() -> GatewayCerts {
 }
 
 fn laser_cluster_conf(certs: &GatewayCerts) -> ClusterConfig {
-	let tls = ClusterTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-		validators: vec![],
-		client_validators: vec![],
-		hive_trust: Some(Arc::clone(&certs.trust)),
-		peer_trust: None,
-	};
+	let tls = ClusterTlsConfig::new(
+		CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+		Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
+	)
+	.expect("the test certificate must decode")
+	.with_hive_trust(Some(Arc::clone(&certs.trust)));
 
 	let mut conf = ClusterConfig::new(tls);
 	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
@@ -124,11 +122,14 @@ fn beam_urn() -> Urn<'static> {
 }
 
 fn laser_hive_conf(certs: &GatewayCerts) -> HiveConfig {
-	let hive_tls = Arc::new(HiveTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-		validators: vec![],
-	});
+	let hive_tls = Arc::new(
+		HiveTlsConfig::new(
+			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
+			vec![],
+		)
+		.expect("the hive TLS material must decode"),
+	);
 
 	let mut conf = HiveConfig {
 		hive_tls: Some(hive_tls),

@@ -21,7 +21,7 @@ use crate::runtime::rt;
 use crate::trace::TraceCollector;
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::state::ClientIdentity;
-use crate::transport::state::EncryptionConfig;
+use crate::transport::state::{DialableEncryption, EncryptionConfig};
 use crate::transport::TransportResult;
 use crate::transport::{MessageEmitter, Protocol, X509ClientConfig};
 use crate::utils::urn::Urn;
@@ -33,7 +33,7 @@ use crate::{Frame, Message, TightBeamError, Version};
 fn cluster_encryption<C: CryptoProvider>(
 	trust_store: Option<&Arc<dyn CertificateTrust>>,
 	identity: Option<&ClientIdentity<C>>,
-) -> TransportResult<EncryptionConfig<C>> {
+) -> TransportResult<DialableEncryption<C>> {
 	let mut encryption = EncryptionConfig::default();
 	if let Some(store) = trust_store {
 		encryption.trust_store = Some(Arc::clone(store));
@@ -46,9 +46,7 @@ fn cluster_encryption<C: CryptoProvider>(
 	// rather than at the first frame it tries to write. A hive identity with
 	// no trust store would present that identity to whoever answered the
 	// cluster address (CWE-295).
-	encryption.check_dial_permitted()?;
-
-	Ok(encryption)
+	DialableEncryption::new(encryption)
 }
 
 async fn build_control_frame(
@@ -67,7 +65,9 @@ async fn build_control_frame(
 				.with_order(order)
 				.with_message(message)
 				.build()?;
-			let signed = unsigned.sign_with_provider::<Sha3_256, _>(hive_tls.key.as_ref()).await?;
+			let signed = unsigned
+				.sign_with_provider::<Sha3_256, _>(hive_tls.identity().signing_provider())
+				.await?;
 			Ok(signed)
 		}
 		None => {
@@ -253,20 +253,14 @@ where
 			};
 
 			// A TLS-registered hive must not fall back to cleartext for scaling updates (CWE-319).
-			let client_identity = match hive_tls.as_ref() {
-				Some(tls) => match tls.client_identity() {
-					Ok(identity) => Some(identity),
-					Err(_) => return,
-				},
-				None => None,
-			};
-
+			let client_identity = hive_tls.as_ref().map(|tls| tls.identity().clone());
+			let retry_policy = link.config.control.notify_retry.as_ref();
 			let any_failed = fanout_scaling_update::<P>(
 				&gateways,
 				&frame,
 				trust_store.as_ref(),
 				client_identity.as_ref(),
-				link.config.control.notify_retry.as_ref(),
+				retry_policy,
 			)
 			.await;
 
@@ -291,7 +285,7 @@ where
 	TightBeamError: From<P::Error>,
 {
 	let stream = P::connect(cluster_addr).await?;
-	let identity = hive_tls.map(|tls| tls.client_identity()).transpose()?;
+	let identity = hive_tls.map(|tls| tls.identity().clone());
 	let encryption = cluster_encryption(trust_store, identity.as_ref())?;
 	Ok(P::create_transport(stream).with_encryption(encryption))
 }

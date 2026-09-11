@@ -397,7 +397,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListene
 	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
 		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		let certificate = Arc::new(config.certificate);
+		let certificate = config.certificate;
 		let client_validators = config.client_validators.as_ref().map(Arc::clone);
 		let key_manager = Arc::clone(&config.key_manager);
 

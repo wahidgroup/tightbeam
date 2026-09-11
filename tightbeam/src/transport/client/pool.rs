@@ -33,7 +33,7 @@ mod x509 {
 	pub use crate::crypto::x509::{Certificate, CertificateSpec};
 	pub use crate::transport::handshake::receipt::ReceiptApprover;
 	pub use crate::transport::handshake::HandshakeProtocolKind;
-	pub use crate::transport::state::{ClientIdentity, EncryptionConfig};
+	pub use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
 }
 
 #[cfg(feature = "x509")]
@@ -143,10 +143,6 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		self.encryption.trust_store = Some(store);
 	}
 
-	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager<C>) {
-		self.set_shared_client_identity(Arc::new(cert), Arc::new(key));
-	}
-
 	fn set_shared_client_identity(&mut self, certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) {
 		ClientIdentity::new(certificate, key).install(&mut self.encryption);
 	}
@@ -163,14 +159,24 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		self.encryption.receipt_approver = Some(approver);
 	}
 
-	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
+	/// Install this pool's provisioning on a freshly created transport.
+	///
+	/// Every pool dial passes here, so this is where the pool answers the
+	/// dialer rule.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
+	///   authenticates no peer and did not name cleartext.
+	fn apply<Pro>(&self, transport: Pro::Transport) -> TransportResult<Pro::Transport>
 	where
 		Pro: Protocol,
 		Pro::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
 	{
 		// The provisioning moves to the transport whole. Cloning it bumps
 		// refcounts, so a dial copies no certificate.
-		transport.with_encryption(self.encryption.clone())
+		let encryption = DialableEncryption::new(self.encryption.clone())?;
+		Ok(transport.with_encryption(encryption))
 	}
 }
 
@@ -282,10 +288,8 @@ impl<P: Protocol, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P
 		cert: CertificateSpec,
 		key: Arc<dyn SigningKeyProvider>,
 	) -> TransportResult<Self> {
-		let cert_converted = Certificate::try_from(cert)?;
-		let key_converted: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
+		ClientIdentity::<C>::from_spec(cert, key)?.install(&mut self.tls.encryption);
 
-		self.tls.set_client_identity(cert_converted, key_converted);
 		Ok(self)
 	}
 
@@ -482,10 +486,6 @@ where
 	}
 
 	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, C>> {
-		// Every pool dial reserves a slot first, so this is where the pool
-		// answers the question a single client answers in `ClientBuilder`.
-		self.tls.encryption.check_dial_permitted()?;
-
 		// Single atomic check-and-increment so concurrent callers cannot all
 		// pass a separate limit check and overshoot max_connections.
 		let reserved = self
@@ -608,7 +608,7 @@ where
 		let mut reservation = self.reserve_slot(addr)?;
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 
-		let mut transport = self.tls.apply::<P>(P::create_transport(stream));
+		let mut transport = self.tls.apply::<P>(P::create_transport(stream))?;
 		if let Some(timeout) = self.timeout {
 			transport = transport.with_timeout(timeout);
 		}
@@ -735,7 +735,7 @@ pooled_mux! {
 			let mut reservation = self.reserve_slot(&addr)?;
 
 			let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
-			let mut transport = self.tls.apply::<P>(P::create_transport(stream));
+			let mut transport = self.tls.apply::<P>(P::create_transport(stream))?;
 			if let Some(timeout) = self.timeout {
 				transport = transport.with_timeout(timeout);
 			}
@@ -795,9 +795,9 @@ pooled_mux! {
 					}
 				};
 
+				// Handle clone is a refcount bump: pool entry and lease
+				// co-own the connection.
 				let dest_pool = pools.entry(addr.clone()).or_default();
-
-				// Handle clone is a refcount bump: pool entry and lease co-own the connection.
 				dest_pool.mux.push(MuxEntry {
 					id,
 					handle: handle.clone(),
@@ -890,12 +890,10 @@ pooled_mux! {
 		}
 
 		fn wrap_mux_client(self: &Arc<Self>, lease: MuxLease, addr: P::Address) -> PooledClient<P, C> {
-			let pool = Arc::clone(self);
-
 			PooledClient {
 				client: None,
 				mux: Some(lease),
-				pool,
+				pool: Arc::clone(self),
 				addr,
 			}
 		}
@@ -1056,7 +1054,6 @@ pooled_mux! {
 			let (lease_id, handle) = match self.mux.as_ref() {
 				Some(lease) => {
 					lease.stamp();
-
 					(lease.id, lease.handle.clone())
 				}
 				None => return self.conn()?.emit(frame, attempt).await,
@@ -1093,6 +1090,21 @@ pooled_mux! {
 			self.conn()?.complete_handshake().await
 		}
 
+		/// This lease's mux handle, with its activity recorded.
+		///
+		/// Every streaming entry point below needs the same two steps: refuse
+		/// an exclusive lease, then stamp the entry so the pruner counts the
+		/// lease as active.
+		///
+		/// # Errors
+		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		fn stamped_handle(&self) -> TransportResult<&MuxHandle> {
+			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
+			lease.stamp();
+
+			Ok(&lease.handle)
+		}
+
 		/// Open a streamed request on the shared mux connection: push
 		/// chunks through the sink, then await the unary response.
 		///
@@ -1104,10 +1116,7 @@ pooled_mux! {
 		pub fn open_stream(
 			&self,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_stream()
+			self.stamped_handle()?.open_stream()
 		}
 
 		/// Open a streamed request routed to `target`: the peer gateway
@@ -1122,10 +1131,7 @@ pooled_mux! {
 			&self,
 			target: impl Into<Urn<'static>>,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_stream_to(target)
+			self.stamped_handle()?.open_stream_to(target)
 		}
 
 		/// Open a streamed request carrying a fully-formed [`StreamRoute`].
@@ -1146,10 +1152,7 @@ pooled_mux! {
 			&self,
 			route: StreamRoute,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_stream_with_route(route)
+			self.stamped_handle()?.open_stream_with_route(route)
 		}
 
 		/// Open a duplex stream on the shared mux connection: push request
@@ -1159,10 +1162,7 @@ pooled_mux! {
 		/// # Errors
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
 		pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_duplex()
+			self.stamped_handle()?.open_duplex()
 		}
 
 		/// Open a duplex stream routed to `target`: the peer gateway
@@ -1174,10 +1174,7 @@ pooled_mux! {
 		/// # Errors
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
 		pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_duplex_to(target)
+			self.stamped_handle()?.open_duplex_to(target)
 		}
 
 		/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
@@ -1195,10 +1192,7 @@ pooled_mux! {
 		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_duplex_with_route(route)
+			self.stamped_handle()?.open_duplex_with_route(route)
 		}
 
 		/// Cap-exhaustion failover: move the lease through the acquisition

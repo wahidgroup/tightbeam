@@ -313,7 +313,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListe
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
-		let certificate = Arc::new(config.certificate);
+		let certificate = config.certificate;
 		let client_validators = config.client_validators.as_ref().map(Arc::clone);
 		let key_manager = Arc::clone(&config.key_manager);
 
@@ -1123,7 +1123,7 @@ mod tests {
 	use crate::testing::*;
 	use crate::transport::handshake::{HandshakeError, HandshakeKeyManager, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
-	use crate::transport::state::EncryptionConfig;
+	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig, X509ClientConfig};
 
 	#[cfg(feature = "x509")]
@@ -1330,7 +1330,8 @@ mod tests {
 			subject_public_key: spki
 		)?;
 
-		let config = TransportEncryptionConfig::new(cert.to_owned(), signing_key.into());
+		let key_manager = HandshakeKeyManager::<DefaultCryptoProvider>::from(signing_key);
+		let config = TransportEncryptionConfig::new(cert.to_owned(), key_manager);
 		Ok(EncryptedTestServer { cert, config })
 	}
 
@@ -1377,8 +1378,10 @@ mod tests {
 
 	#[cfg(feature = "x509")]
 	/// Provisioning a test client dials with, stated in one place.
-	fn client_encryption(trust_store: Arc<dyn CertificateTrust>) -> EncryptionConfig<DefaultCryptoProvider> {
-		EncryptionConfig { trust_store: Some(trust_store), ..EncryptionConfig::default() }
+	fn client_encryption(trust_store: Arc<dyn CertificateTrust>) -> DialableEncryption<DefaultCryptoProvider> {
+		let encryption = EncryptionConfig { trust_store: Some(trust_store), ..EncryptionConfig::default() };
+
+		DialableEncryption::new(encryption).expect("a trust store answers for the peer")
 	}
 
 	fn tcp_transport_from(stream: TcpStream) -> TcpTransport<TokioStream> {
@@ -1457,12 +1460,13 @@ mod tests {
 		let trust_store = trust_store_for(server_cert)?;
 
 		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut encryption = client_encryption(trust_store);
+		let mut encryption = EncryptionConfig { trust_store: Some(trust_store), ..EncryptionConfig::default() };
 		encryption.client_certificate = Some(client_cert);
 		encryption.key_manager = Some(client_keys);
 		encryption.server_certificate_chain = Some(server_chain);
 		encryption.handshake_protocol = HandshakeProtocolKind::Cms;
 
+		let encryption = DialableEncryption::new(encryption).expect("a trust store answers for the peer");
 		let mut transport = tcp_transport_from(client_stream).with_encryption(encryption);
 		let response = transport.emit(request.to_owned(), None).await?;
 		let received = received_rx.recv().await;

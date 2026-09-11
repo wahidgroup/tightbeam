@@ -217,10 +217,7 @@ fn peer_pair_certs() -> PeerPairCerts {
 
 /// Receiver conf anchoring both pair identities in `peer_trust`.
 fn peering_pair_conf(certs: &PeerPairCerts) -> ClusterConfig {
-	let tls = ClusterTlsConfig {
-		peer_trust: Some(Arc::clone(&certs.peer_trust)),
-		..cluster_tls_config(&certs.gateway)
-	};
+	let tls = cluster_tls_config(&certs.gateway).with_peer_trust(Arc::clone(&certs.peer_trust));
 	ClusterConfig::new(tls)
 }
 
@@ -1073,23 +1070,21 @@ fn share_certs(certs: &ClusterTestCerts) -> Arc<ClusterTestCerts> {
 /// Receiver with its own identity: `peer_trust` anchors the exporter's
 /// certificate so its signed advertisements verify.
 fn receiving_peer_conf(certs: &SplitPlaneCerts) -> ClusterConfig {
-	ClusterConfig::new(ClusterTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.receiver.0.to_owned())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.receiver.1.to_owned())),
-		validators: vec![],
-		client_validators: vec![],
-		hive_trust: Some(Arc::clone(&certs.exporter.trust)),
-		peer_trust: Some(Arc::clone(&certs.exporter.trust)),
-	})
+	ClusterConfig::new(
+		ClusterTlsConfig::new(
+			CertificateSpec::Built(Box::new(certs.receiver.0.to_owned())),
+			Arc::new(Secp256k1KeyProvider::from(certs.receiver.1.to_owned())),
+		)
+		.expect("the test certificate must decode")
+		.with_hive_trust(Some(Arc::clone(&certs.exporter.trust)))
+		.with_peer_trust(Some(Arc::clone(&certs.exporter.trust))),
+	)
 }
 
 /// Advertiser whose hive plane cannot validate the receiver: only
 /// `peer_trust` anchors the receiver's identity.
 fn cross_plane_advertising_conf(certs: &SplitPlaneCerts, peer: String) -> ClusterConfig {
-	let tls = ClusterTlsConfig {
-		peer_trust: Some(Arc::clone(&certs.receiver_trust)),
-		..cluster_tls_config(&certs.exporter)
-	};
+	let tls = cluster_tls_config(&certs.exporter).with_peer_trust(Arc::clone(&certs.receiver_trust));
 
 	ClusterConfig::builder(tls)
 		.with_peers([peer])

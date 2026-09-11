@@ -103,12 +103,10 @@ impl ClusterConfig {
 	/// - [`TightBeamError::SerializationError`] -- the configured
 	///   certificate does not decode.
 	fn accept_encryption_config(&self) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
-		let (certificate, key_manager) = self.tls.identity()?;
-		let mut encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
-		if !self.tls.client_validators.is_empty() {
-			let validators: Vec<_> = self.tls.client_validators.iter().map(Arc::clone).collect();
-			encryption_config = encryption_config.with_client_validators(validators);
-		}
+		let (certificate, key_manager) = self.tls.identity().parts();
+		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+		let encryption_config =
+			encryption_config.with_client_validators(self.tls.client_validators.iter().map(Arc::clone));
 
 		Ok(encryption_config)
 	}

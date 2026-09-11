@@ -245,14 +245,13 @@ mod tests {
 	/// Config exporting only "ping", so "ledger" needs a grant.
 	fn exporting_config() -> ClusterConfig {
 		let key: Secp256k1SigningKey = create_test_signing_key();
-		let mut config = ClusterConfig::new(ClusterTlsConfig {
-			certificate: CertificateSpec::Der(&[]),
-			key: Arc::new(Secp256k1KeyProvider::from(key)),
-			validators: Vec::new(),
-			client_validators: Vec::new(),
-			hive_trust: None,
-			peer_trust: None,
-		});
+		let mut config = ClusterConfig::new(
+			ClusterTlsConfig::new(
+				CertificateSpec::Built(Box::new(create_test_certificate(&key))),
+				Arc::new(Secp256k1KeyProvider::from(key)),
+			)
+			.expect("the test certificate must decode"),
+		);
 		config.peer.exported_types = Some(Arc::new(StaticExportList::new(vec![servlet("ping")])));
 
 		config

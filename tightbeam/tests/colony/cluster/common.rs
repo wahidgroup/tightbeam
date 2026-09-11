@@ -174,14 +174,12 @@ pub fn cluster_tls_config_with_trust(
 	certs: &ClusterTestCerts,
 	hive_trust: Option<Arc<dyn CertificateTrust>>,
 ) -> ClusterTlsConfig {
-	ClusterTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-		validators: vec![],
-		client_validators: vec![],
-		hive_trust,
-		peer_trust: None,
-	}
+	ClusterTlsConfig::new(
+		CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+		Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
+	)
+	.expect("the test certificate must decode")
+	.with_hive_trust(hive_trust)
 }
 
 pub fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
@@ -189,11 +187,14 @@ pub fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
 }
 
 pub fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConfig {
-	let hive_tls = Arc::new(HiveTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-		validators: vec![],
-	});
+	let hive_tls = Arc::new(
+		HiveTlsConfig::new(
+			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
+			vec![],
+		)
+		.expect("the hive TLS material must decode"),
+	);
 	let mut conf = HiveConfig { hive_tls: Some(hive_tls), ..Default::default() };
 	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	conf
@@ -668,17 +669,15 @@ pub fn peering_cluster_conf_with_trust(
 	certs: &ClusterTestCerts,
 	peer_trust: Arc<dyn CertificateTrust>,
 ) -> ClusterConfig {
-	let tls = ClusterTlsConfig { peer_trust: Some(peer_trust), ..cluster_tls_config(certs) };
+	let tls = cluster_tls_config(certs).with_peer_trust(peer_trust);
 	ClusterConfig::new(tls)
 }
 
 /// Importer that trusts peers only on the peer plane (hive_trust empty).
 pub fn peering_peer_trust_only(certs: &ClusterTestCerts) -> ClusterConfig {
-	let tls = ClusterTlsConfig {
-		hive_trust: None,
-		peer_trust: Some(Arc::clone(&certs.trust)),
-		..cluster_tls_config(certs)
-	};
+	let tls = cluster_tls_config(certs)
+		.with_hive_trust(None)
+		.with_peer_trust(Arc::clone(&certs.trust));
 	ClusterConfig::new(tls)
 }
 
@@ -701,7 +700,7 @@ pub fn containment_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 /// Peers must pass through the builder, because the discovery table
 /// derives its un-evictable anchor set at build.
 pub fn peering_cluster_conf_with_peers(certs: &ClusterTestCerts, peers: Vec<String>) -> ClusterConfig {
-	let tls = ClusterTlsConfig { peer_trust: Some(Arc::clone(&certs.trust)), ..cluster_tls_config(certs) };
+	let tls = cluster_tls_config(certs).with_peer_trust(Arc::clone(&certs.trust));
 	ClusterConfig::builder(tls).with_peers(peers).build()
 }
 

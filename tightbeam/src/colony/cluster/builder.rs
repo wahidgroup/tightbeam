@@ -45,7 +45,6 @@ use crate::colony::cluster::{
 	ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore, PeerStore, PeerTable,
 	StaticExportList,
 };
-use crate::crypto::x509::Certificate;
 use crate::utils::urn::Urn;
 
 // ============================================================================
@@ -433,9 +432,7 @@ impl ClusterConfigBuilder {
 		// membership check compares against this cached value. A cert
 		// that fails to decode or carries no valid colony URN leaves the
 		// gateway a non-member, fail closed.
-		let colony_urn = Certificate::try_from(self.tls.certificate.clone())
-			.ok()
-			.and_then(|cert| self.namespace.cert_colony_urn(&cert));
+		let colony_urn = self.namespace.cert_colony_urn(self.tls.identity().certificate());
 
 		// The discovery table derives from the dial list at build, so the
 		// configured peers are always its un-evictable anchors. The

@@ -152,7 +152,7 @@ impl ClusterConfig {
 			.with_witness_hasher::<D>()
 			.build()?;
 
-		let signed_frame = frame.sign_with_provider::<D, _>(self.tls.key.as_ref()).await?;
+		let signed_frame = frame.sign_with_provider::<D, _>(self.tls.identity().signing_provider()).await?;
 		Ok(signed_frame)
 	}
 
@@ -182,7 +182,10 @@ impl ClusterConfig {
 			.build()
 			.ok()?;
 
-		let rumor = rumor.sign_with_provider::<D, _>(self.tls.key.as_ref()).await.ok()?;
+		let rumor = rumor
+			.sign_with_provider::<D, _>(self.tls.identity().signing_provider())
+			.await
+			.ok()?;
 		let digest = rumor.gossip_digest::<D>().ok()?;
 		let signer_id = rumor.signer_id()?;
 
@@ -305,7 +308,10 @@ where
 			Err(_) => return,
 		};
 
-		let signed_frame = match frame.sign_with_provider::<D, _>(self.config.tls.key.as_ref()).await {
+		let signed_frame = match frame
+			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
+			.await
+		{
 			Ok(signed) => signed,
 			Err(_) => return,
 		};
@@ -460,7 +466,10 @@ where
 			return Ok(());
 		};
 
-		let Ok(signed_frame) = frame.sign_with_provider::<D, _>(self.config.tls.key.as_ref()).await else {
+		let Ok(signed_frame) = frame
+			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
+			.await
+		else {
 			return Ok(());
 		};
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
@@ -658,7 +667,9 @@ where
 				.with_witness_hasher::<D>()
 				.build()?;
 
-			let signed = frame.sign_with_provider::<D, _>(self.config.tls.key.as_ref()).await?;
+			let signed = frame
+				.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
+				.await?;
 			// Arm the grey-hole ledger only on an explicit Ok reply.
 			let Some(push_reply) = client.emit(signed, None).await? else {
 				continue;
@@ -1301,20 +1312,19 @@ mod tests {
 	use crate::colony::common::ColonyNamespace;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::testing::create_test_signing_key;
+	use crate::testing::{create_test_certificate, create_test_signing_key};
 
 	/// Config holding the fields these tests read.
 	fn test_config() -> ClusterConfig {
 		let key: Secp256k1SigningKey = create_test_signing_key();
 
-		ClusterConfig::new(ClusterTlsConfig {
-			certificate: CertificateSpec::Der(&[]),
-			key: Arc::new(Secp256k1KeyProvider::from(key)),
-			validators: Vec::new(),
-			client_validators: Vec::new(),
-			hive_trust: None,
-			peer_trust: None,
-		})
+		ClusterConfig::new(
+			ClusterTlsConfig::new(
+				CertificateSpec::Built(Box::new(create_test_certificate(&key))),
+				Arc::new(Secp256k1KeyProvider::from(key)),
+			)
+			.expect("the test certificate must decode"),
+		)
 	}
 
 	fn config_with_window(window_ms: u64) -> ClusterConfig {

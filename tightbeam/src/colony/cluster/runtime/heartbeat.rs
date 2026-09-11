@@ -84,7 +84,9 @@ where
 			.with_witness_hasher::<D>()
 			.build()?;
 
-		let signed_frame = frame.sign_with_provider::<D, _>(self.config.tls.key.as_ref()).await?;
+		let signed_frame = frame
+			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
+			.await?;
 		let mut client = self.pool.connect(addr).await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 

@@ -32,11 +32,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
-use crate::crypto::profiles::DefaultCryptoProvider;
-use crate::crypto::x509::Certificate;
 use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
-use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::serve::unimplemented_error;
@@ -381,48 +378,51 @@ pub trait Hive: Sized + Send + Sync {
 /// TLS material for hive control-plane and servlet identity.
 ///
 /// Wrapped in `Arc` inside [`HiveConfig`] because validators are trait objects.
+#[non_exhaustive]
 pub struct HiveTlsConfig {
-	/// Server certificate specification used for TLS identity.
-	pub certificate: crate::crypto::x509::CertificateSpec,
-	/// Private key provider used for handshake and control-frame signing.
-	pub key: Arc<dyn crate::crypto::key::SigningKeyProvider>,
+	/// The certificate and handshake key this hive presents, decoded once by
+	/// [`Self::new`].
+	identity: ClientIdentity,
 	/// Client certificate validators such as public-key pinning.
 	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 }
 
 impl HiveTlsConfig {
-	/// Materializes the certificate and handshake key this hive presents.
+	/// Decode `certificate` and bind it to the key that proves it.
 	///
-	/// A hive presents one identity everywhere: dialing a gateway, dialing
-	/// a sibling servlet, and accepting on its own control plane. Each of
-	/// those reads it here, so the three agree by construction.
+	/// A hive presents one identity everywhere: dialing a gateway, dialing a
+	/// sibling servlet, and accepting on its own control plane. Decoding it
+	/// here means those three share one certificate rather than each decoding
+	/// the specification again, which a hive would otherwise repeat on every
+	/// control-plane event.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::SerializationError`] -- [`Self::certificate`]
-	///   holds PEM or DER that does not decode as a certificate.
-	pub(crate) fn identity(&self) -> Result<(Certificate, HandshakeKeyManager<DefaultCryptoProvider>), TightBeamError> {
-		let certificate = Certificate::try_from(self.certificate.clone())?;
-		let key_manager = HandshakeKeyManager::new(Arc::clone(&self.key));
-		Ok((certificate, key_manager))
+	/// - [`TightBeamError::SerializationError`] -- `certificate` holds PEM or
+	///   DER that does not decode as a certificate.
+	pub fn new(
+		certificate: crate::crypto::x509::CertificateSpec,
+		key: Arc<dyn crate::crypto::key::SigningKeyProvider>,
+		validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
+	) -> Result<Self, TightBeamError> {
+		let identity = ClientIdentity::from_spec(certificate, key)?;
+
+		Ok(Self { identity, validators })
 	}
 
-	/// The same identity as shared handles, ready to offer on a dial.
+	/// The certificate and handshake key this hive presents.
 	///
-	/// # Errors
-	///
-	/// Whatever [`Self::identity`] reports.
-	pub(crate) fn client_identity(&self) -> Result<ClientIdentity, TightBeamError> {
-		let (certificate, key_manager) = self.identity()?;
-		Ok(ClientIdentity::new(Arc::new(certificate), Arc::new(key_manager)))
+	/// One identity serves the control plane, sibling dials, and gateway
+	/// dials, so all three read it here and cannot disagree.
+	pub fn identity(&self) -> &ClientIdentity {
+		&self.identity
 	}
 }
 
 impl core::fmt::Debug for HiveTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("HiveTlsConfig")
-			.field("certificate", &self.certificate)
-			.field("key", &"<KeyProvider>")
+			.field("identity", &"<ClientIdentity>")
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.finish()
 	}

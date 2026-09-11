@@ -115,27 +115,22 @@ pub(crate) fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
 	let certificate = CertificateSpec::Built(Box::new(certs.cert.as_ref().clone()));
 	let key = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
 
-	ClusterTlsConfig {
-		certificate,
-		key,
-		validators: vec![],
-		client_validators: vec![],
-		hive_trust: Some(Arc::clone(&certs.trust)),
-		peer_trust: None,
-	}
+	ClusterTlsConfig::new(certificate, key)
+		.expect("the test certificate must decode")
+		.with_hive_trust(Arc::clone(&certs.trust))
 }
 
 pub(crate) fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConfig {
 	let certificate = CertificateSpec::Built(Box::new(certs.cert.as_ref().clone()));
 	let key = Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned()));
-	let hive_tls = Arc::new(HiveTlsConfig { certificate, key, validators: vec![] });
+	let hive_tls = Arc::new(HiveTlsConfig::new(certificate, key, vec![]).expect("hive TLS material must decode"));
 	let offer = Arc::new(TransportOffer::mux(8));
-
 	let mut conf = HiveConfig {
 		hive_tls: Some(hive_tls),
 		trust_store: Some(Arc::clone(&certs.trust)),
 		..HiveConfig::default()
 	};
+
 	conf.pool.mux_offer = Some(offer);
 	conf
 }
