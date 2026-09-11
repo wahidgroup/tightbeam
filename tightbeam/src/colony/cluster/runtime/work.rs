@@ -400,7 +400,7 @@ mod tests {
 	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig};
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use crate::testing::create_test_signing_key;
+	use crate::testing::{create_test_certificate, create_test_signing_key};
 
 	fn ping_type() -> Urn<'static> {
 		ColonyNamespace::default()
@@ -475,14 +475,13 @@ mod tests {
 
 	fn test_config() -> ClusterConfig {
 		let key: Secp256k1SigningKey = create_test_signing_key();
-		ClusterConfig::new(ClusterTlsConfig {
-			certificate: CertificateSpec::Der(&[]),
-			key: Arc::new(Secp256k1KeyProvider::from(key)),
-			validators: Vec::new(),
-			client_validators: Vec::new(),
-			hive_trust: None,
-			peer_trust: None,
-		})
+		ClusterConfig::new(
+			ClusterTlsConfig::new(
+				CertificateSpec::Built(Box::new(create_test_certificate(&key))),
+				Arc::new(Secp256k1KeyProvider::from(key)),
+			)
+			.expect("the test certificate must decode"),
+		)
 	}
 
 	#[test]

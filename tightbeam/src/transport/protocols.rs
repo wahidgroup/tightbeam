@@ -29,7 +29,7 @@ mod x509 {
 	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::transport::handshake::receipt::ReceiptApprover;
 	pub use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
-	pub use crate::transport::state::EncryptionConfig;
+	pub use crate::transport::state::DialableEncryption;
 	pub use crate::transport::TransportEncryptionConfig;
 	pub use crate::x509::Certificate;
 }
@@ -124,9 +124,12 @@ pub trait X509ClientConfig: Sized {
 
 	/// Install the provisioning this endpoint was configured with.
 	///
-	/// The configuration moves in one piece, so a builder that accumulates
-	/// it cannot hand over some fields and forget others.
-	fn with_encryption(self, encryption: EncryptionConfig<Self::CryptoProvider>) -> Self;
+	/// The configuration moves in one piece, so a builder that accumulates it
+	/// cannot hand over some fields and forget others. Taking it checked means
+	/// no path reaches a transport without answering the dialer rule.
+	///
+	/// Replaces whatever provisioning this endpoint already held.
+	fn with_encryption(self, encryption: DialableEncryption<Self::CryptoProvider>) -> Self;
 
 	/// Production instrumentation collector, propagated downstream
 	/// (handshake, mux plane) by the transport.

@@ -18,8 +18,8 @@ use crate::TightBeamError;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::{Certificate, CertificateSpec};
-use crate::transport::handshake::HandshakeKeyManager;
+use crate::crypto::x509::CertificateSpec;
+use crate::transport::state::ClientIdentity;
 use crate::transport::TransportEncryptionConfig;
 
 /// Servlet bind and handler configuration (includes transport encryption).
@@ -284,14 +284,10 @@ where
 		key: Arc<dyn SigningKeyProvider>,
 		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
 	) -> Result<Self, TightBeamError> {
-		let certificate = Certificate::try_from(cert)?;
-		let key_manager: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
-		let mut encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+		let (certificate, key_manager) = ClientIdentity::<C>::from_spec(cert, key)?.parts();
+		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
 
-		let validators: Vec<_> = validators.into_iter().collect();
-		if !validators.is_empty() {
-			encryption_config = encryption_config.with_client_validators(validators);
-		}
+		let encryption_config = encryption_config.with_client_validators(validators);
 
 		self.x509_config = Some(encryption_config);
 		Ok(self)

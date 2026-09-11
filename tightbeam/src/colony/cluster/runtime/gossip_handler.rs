@@ -198,7 +198,10 @@ where
 				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 			}
 		};
-		let rumor = match rumor.sign_with_provider::<D, _>(self.config.tls.key.as_ref()).await {
+		let rumor = match rumor
+			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
+			.await
+		{
 			Ok(rumor) => rumor,
 			Err(_) => {
 				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);

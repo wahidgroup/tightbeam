@@ -160,9 +160,7 @@ impl PoolConfig {
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{
-		let (cert, key_manager) = tls.identity()?;
-		let certificate = Arc::new(cert);
-		let key = Arc::new(key_manager);
+		let (certificate, key) = tls.identity().parts();
 		let hive_pool = self.build_one::<P>(
 			Arc::clone(&certificate),
 			Arc::clone(&key),

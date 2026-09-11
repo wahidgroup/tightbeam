@@ -136,11 +136,12 @@ async fn establish_registered_hive(
 
 fn hive_tls() -> HiveTlsConfig {
 	let (cert, signing_key) = create_test_cert_with_key("CN=Hive Test Server", 365).expect("hive TLS material");
-	HiveTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(cert)),
-		key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
-		validators: vec![],
-	}
+	HiveTlsConfig::new(
+		CertificateSpec::Built(Box::new(cert)),
+		Arc::new(Secp256k1KeyProvider::from(signing_key)),
+		vec![],
+	)
+	.expect("the hive TLS material must decode")
 }
 
 tb_scenario! {
@@ -227,11 +228,12 @@ impl TrustedSignerContext {
 	fn control_tls(&self) -> HiveTlsConfig {
 		let anchor = DirectTrustValidator::default().with_trust_chain([self.certificate.to_owned()]);
 
-		HiveTlsConfig {
-			certificate: CertificateSpec::Built(Box::new(self.certificate.to_owned())),
-			key: Arc::clone(&self.provider) as Arc<dyn SigningKeyProvider>,
-			validators: vec![Arc::new(anchor)],
-		}
+		HiveTlsConfig::new(
+			CertificateSpec::Built(Box::new(self.certificate.to_owned())),
+			Arc::clone(&self.provider) as Arc<dyn SigningKeyProvider>,
+			vec![Arc::new(anchor)],
+		)
+		.expect("the hive TLS material must decode")
 	}
 }
 

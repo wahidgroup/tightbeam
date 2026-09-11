@@ -252,8 +252,8 @@ macro_rules! impl_tcp_common {
 		{
 			type CryptoProvider = P;
 
-			fn with_encryption(mut self, encryption: $crate::transport::state::EncryptionConfig<P>) -> Self {
-				self.encryption = encryption;
+			fn with_encryption(mut self, encryption: $crate::transport::state::DialableEncryption<P>) -> Self {
+				self.encryption = encryption.into_inner();
 				self.provision_from_encryption()
 			}
 

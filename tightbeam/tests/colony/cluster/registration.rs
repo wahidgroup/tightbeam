@@ -188,11 +188,8 @@ tb_scenario! {
 			let (hive_cert, hive_key) = colony_identity("CN=Untrusted Hive", &test_colony_urn());
 			let mut hive_conf = HiveConfig {
 				trust_store: Some(Arc::clone(&certs.trust)),
-				hive_tls: Some(Arc::new(HiveTlsConfig {
-					certificate: CertificateSpec::Built(Box::new(hive_cert)),
-					key: Arc::new(Secp256k1KeyProvider::from(hive_key)),
-					validators: vec![],
-				})),
+				hive_tls: Some(Arc::new(HiveTlsConfig::new(CertificateSpec::Built(Box::new(hive_cert)), Arc::new(Secp256k1KeyProvider::from(hive_key)), vec![])
+					.expect("the hive TLS material must decode"))),
 				..Default::default()
 			};
 			hive_conf.control.reregister_interval = Some(Duration::from_millis(50));
@@ -242,14 +239,8 @@ tb_scenario! {
 			// A gateway without hive_trust cannot authenticate control
 			// frames and must fail closed, so even a validly signed
 			// registration is rejected.
-			let tls = ClusterTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
-				key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-				validators: vec![],
-				client_validators: vec![],
-				hive_trust: None,
-				peer_trust: None,
-			};
+			let tls = ClusterTlsConfig::new(CertificateSpec::Built(Box::new(certs.cert.to_owned())), Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())))
+				.expect("the test certificate must decode");
 			start_cluster(&trace, ClusterConfig::new(tls)).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {

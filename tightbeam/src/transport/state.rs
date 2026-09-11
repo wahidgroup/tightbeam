@@ -10,9 +10,11 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use std::sync::Arc;
 
 use crate::crypto::aead::{RecvCipher, SendCipher};
+use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
+use crate::crypto::x509::CertificateSpec;
 use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::WireMode;
 use crate::transport::error::{TransportError, TransportFailure};
@@ -333,6 +335,49 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 		Self { certificate, key }
 	}
 
+	/// Decode `certificate` and bind it to the key that proves it.
+	///
+	/// The one place a [`CertificateSpec`] becomes an endpoint identity, so
+	/// every builder that accepts one decodes it the same way and holds the
+	/// result as shared handles.
+	///
+	/// # Errors
+	///
+	/// - [`SerializationError`] -- `certificate` holds PEM or DER that does
+	///   not decode as a certificate.
+	///
+	/// [`SerializationError`]: crate::TightBeamError::SerializationError
+	pub fn from_spec(
+		certificate: CertificateSpec,
+		key: Arc<dyn SigningKeyProvider>,
+	) -> Result<Self, crate::TightBeamError>
+	where
+		C: Send + Sync + 'static,
+	{
+		let certificate = Certificate::try_from(certificate)?;
+		let key_manager = HandshakeKeyManager::new(key);
+
+		Ok(Self::new(Arc::new(certificate), Arc::new(key_manager)))
+	}
+
+	/// The certificate and the key that proves it, as handles.
+	pub fn parts(&self) -> (Arc<Certificate>, Arc<HandshakeKeyManager<C>>) {
+		(Arc::clone(&self.certificate), Arc::clone(&self.key))
+	}
+
+	/// The certificate this identity presents.
+	pub fn certificate(&self) -> &Certificate {
+		&self.certificate
+	}
+
+	/// The signing key provider behind this identity.
+	///
+	/// The key manager holds the provider, so an endpoint that signs control
+	/// frames reads it from here rather than keeping a second handle to it.
+	pub fn signing_provider(&self) -> &dyn SigningKeyProvider {
+		self.key.provider()
+	}
+
 	/// Write this identity into `encryption`, so both halves land together.
 	pub fn install(&self, encryption: &mut EncryptionConfig<C>) {
 		encryption.client_certificate = Some(Arc::clone(&self.certificate));
@@ -393,7 +438,26 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// store. A client certificate proves who this endpoint is, so it answers
 	/// a different question and is absent here.
 	pub fn authenticates_peer(&self) -> bool {
-		self.trust_store.is_some() || self.client_validators.is_some() || self.server_certificate.is_some()
+		// Destructured without `..` for the same reason as
+		// [`Self::is_provisioned`]: a new kind of peer authority must be
+		// classified here rather than silently ignored (CWE-295).
+		let Self {
+			trust_store,
+			client_validators,
+			server_certificate,
+			server_certificate_chain: _,
+			client_certificate: _,
+			key_manager: _,
+			aad_domain_tag: _,
+			mux_offer: _,
+			transport_authorizer: _,
+			receipt_approver: _,
+			session_observer: _,
+			handshake_protocol: _,
+			allow_cleartext: _,
+		} = self;
+
+		trust_store.is_some() || client_validators.is_some() || server_certificate.is_some()
 	}
 
 	/// Trust store that validates the peer's certificate.
@@ -422,7 +486,27 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// handshake is expected. This is the one definition the handshake
 	/// dispatcher, the inbound collector, and the cleartext split all read.
 	pub fn is_provisioned(&self) -> bool {
-		self.server_certificate.is_some() || self.trust_store.is_some() || self.client_validators.is_some()
+		// Destructured without `..`, so a field added to this configuration
+		// stops compiling here until someone says whether it implies a
+		// handshake. The alternative is a new kind of encryption material
+		// that silently leaves the endpoint in `Cleartext` (CWE-311).
+		let Self {
+			server_certificate,
+			trust_store,
+			client_validators,
+			server_certificate_chain: _,
+			client_certificate: _,
+			key_manager: _,
+			aad_domain_tag: _,
+			mux_offer: _,
+			transport_authorizer: _,
+			receipt_approver: _,
+			session_observer: _,
+			handshake_protocol: _,
+			allow_cleartext: _,
+		} = self;
+
+		server_certificate.is_some() || trust_store.is_some() || client_validators.is_some()
 	}
 
 	/// Whether this endpoint carries a client identity.
@@ -511,6 +595,51 @@ pub trait ServerHandshakeSlot: SealedProtocolState {
 	/// `None` before the first client message arrives, and again once the
 	/// handshake completes and its terms are installed.
 	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake>;
+}
+
+/// Provisioning that has passed [`EncryptionConfig::check_dial_permitted`].
+///
+/// A transport takes its provisioning only in this form, so no path installs
+/// provisioning that was never asked the question.
+///
+/// Passing stays true. The per-field setters a transport exposes only add
+/// material, and no kind of material removes a peer authority. The wire rule,
+/// [`EncryptionConfig::check_cleartext_write`], does not behave that way, so it
+/// stays where every write reaches it.
+#[cfg(feature = "x509")]
+#[derive(Clone)]
+pub struct DialableEncryption<P: CryptoProvider>(EncryptionConfig<P>);
+
+#[cfg(feature = "x509")]
+impl<P: CryptoProvider> DialableEncryption<P> {
+	/// Ask the dialer rule of `encryption`.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the endpoint
+	///   authenticates no peer and did not name cleartext.
+	pub fn new(encryption: EncryptionConfig<P>) -> TransportResult<Self> {
+		encryption.check_dial_permitted()?;
+
+		Ok(Self(encryption))
+	}
+
+	/// Accept provisioning that carries a peer authority by construction.
+	///
+	/// [`TransportEncryptionConfig`] holds a server certificate rather than an
+	/// `Option` of one, so [`EncryptionConfig::authenticates_peer`] holds for
+	/// every value it converts to and the rule has no work to do. It is the
+	/// only caller. Everything else goes through [`Self::new`].
+	///
+	/// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
+	pub(crate) fn from_peer_authority(encryption: EncryptionConfig<P>) -> Self {
+		Self(encryption)
+	}
+
+	/// The provisioning this answer was given for.
+	pub fn into_inner(self) -> EncryptionConfig<P> {
+		self.0
+	}
 }
 
 /// State accessors for encrypted transports, separate from I/O.

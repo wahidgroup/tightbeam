@@ -157,7 +157,7 @@ impl Default for TransportLimits {
 #[non_exhaustive]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	/// Identity certificate this endpoint presents during the handshake.
-	pub(crate) certificate: Certificate,
+	pub(crate) certificate: Arc<Certificate>,
 	/// Signing and key-agreement material backing the certificate.
 	pub(crate) key_manager: Arc<HandshakeKeyManager<P>>,
 	/// Peer-certificate checks; `Some` demands mutual authentication.
@@ -169,13 +169,24 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 }
 
 #[cfg(feature = "x509")]
+impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for crate::transport::state::DialableEncryption<P> {
+	/// A server presents a certificate, which is one of the things that answers
+	/// for the peer, so the dialer rule holds for every configuration of this
+	/// shape and is discharged by the type rather than by a check.
+	fn from(config: TransportEncryptionConfig<P>) -> Self {
+		let encryption = crate::transport::state::EncryptionConfig::from(config);
+		Self::from_peer_authority(encryption)
+	}
+}
+
+#[cfg(feature = "x509")]
 impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for crate::transport::state::EncryptionConfig<P> {
 	/// The one place a server's configuration becomes provisioning.
 	///
 	/// `limits` is not provisioning, so it stays on the caller to install.
 	fn from(config: TransportEncryptionConfig<P>) -> Self {
 		Self {
-			server_certificate: Some(Arc::new(config.certificate)),
+			server_certificate: Some(config.certificate),
 			client_validators: config.client_validators,
 			aad_domain_tag: Some(config.aad_domain_tag),
 			key_manager: Some(config.key_manager),
@@ -186,8 +197,11 @@ impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for crate::transport:
 
 #[cfg(feature = "x509")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
-	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager<P>) -> Self {
-		let key_manager = Arc::new(key_manager);
+	/// Accepts an owned certificate or a handle to a shared one, so a caller
+	/// that already parsed its identity hands it over without copying it.
+	pub fn new(certificate: impl Into<Arc<Certificate>>, key_manager: impl Into<Arc<HandshakeKeyManager<P>>>) -> Self {
+		let certificate = certificate.into();
+		let key_manager = key_manager.into();
 		Self {
 			certificate,
 			key_manager,
@@ -199,15 +213,21 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 
 	/// Accepts any iterator of shared [`CertificateValidation`] values.
 	///
-	/// Naming validators demands mutual authentication, so an empty set still
-	/// demands it and admits every client certificate.
+	/// Naming validators demands mutual authentication. An empty set names no
+	/// check to run, so it demands nothing and leaves the endpoint where it
+	/// was. This is the one definition of that, so a caller holding a possibly
+	/// empty collection hands it over rather than deciding for itself.
 	#[must_use]
 	pub fn with_client_validators(
 		mut self,
 		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
 	) -> Self {
-		let validators = Arc::new(validators.into_iter().collect::<Vec<_>>());
-		self.client_validators = Some(validators);
+		let validators = validators.into_iter().collect::<Vec<_>>();
+		if validators.is_empty() {
+			return self;
+		}
+
+		self.client_validators = Some(Arc::new(validators));
 		self
 	}
 

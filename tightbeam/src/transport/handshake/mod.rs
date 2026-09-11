@@ -434,6 +434,17 @@ impl From<Arc<dyn SigningKeyProvider>> for HandshakeKeyManager<DefaultCryptoProv
 }
 
 #[cfg(feature = "x509")]
+impl<P: CryptoProvider> HandshakeKeyManager<P> {
+	/// The signing key provider this manager was built from.
+	///
+	/// An endpoint that signs control frames reads the provider from the
+	/// manager that already holds it, rather than keeping a second handle.
+	pub fn provider(&self) -> &dyn SigningKeyProvider {
+		self.provider.as_ref()
+	}
+}
+
+#[cfg(feature = "x509")]
 impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	pub fn new(provider: Arc<dyn SigningKeyProvider>) -> Self {
 		Self { provider, _phantom: PhantomData }

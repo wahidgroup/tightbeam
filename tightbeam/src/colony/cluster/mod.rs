@@ -74,12 +74,11 @@ use std::sync::Arc;
 
 use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_HOPS};
 use crate::crypto::key::SigningKeyProvider;
-use crate::crypto::profiles::DefaultCryptoProvider;
-use crate::crypto::x509::{policy::CertificateValidation, Certificate, CertificateSpec};
+use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
 use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
-use crate::transport::handshake::HandshakeKeyManager;
+use crate::transport::state::ClientIdentity;
 use crate::transport::{Protocol, TightBeamAddress};
 use crate::utils::urn::Urn;
 use crate::TightBeamError;
@@ -161,12 +160,12 @@ pub struct HeartbeatEvent {
 pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 
 /// TLS material for the gateway accept loop and hive/peer dials.
+#[non_exhaustive]
 pub struct ClusterTlsConfig {
-	/// Gateway certificate: server identity, also presented on outbound
-	/// client dials.
-	pub certificate: CertificateSpec,
-	/// Signing key for control frames and TLS (HSM/KMS capable).
-	pub key: Arc<dyn SigningKeyProvider>,
+	/// The gateway certificate and handshake key, decoded once by
+	/// [`Self::new`]. The certificate is the server identity, and outbound
+	/// dials present it as the client certificate.
+	identity: ClientIdentity,
 	/// Server-certificate validators for outbound dials.
 	///
 	/// Each validator evaluates the dialed server certificate after the
@@ -198,29 +197,77 @@ pub struct ClusterTlsConfig {
 }
 
 impl ClusterTlsConfig {
-	/// Materializes the certificate and handshake key this gateway presents.
+	/// Decode `certificate` and bind it to the key that proves it.
 	///
-	/// One identity serves every plane: the colony and edge listeners
-	/// present it, and outbound hive and peer dials offer it as the client
-	/// certificate. Each of those reads it here, so they agree by
-	/// construction.
+	/// One identity serves every plane: the colony and edge listeners present
+	/// it, and outbound hive and peer dials offer it as the client
+	/// certificate. Decoding it here means those planes share one certificate
+	/// rather than each decoding the specification again.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::SerializationError`] -- [`Self::certificate`]
-	///   holds PEM or DER that does not decode as a certificate.
-	pub(crate) fn identity(&self) -> Result<(Certificate, HandshakeKeyManager<DefaultCryptoProvider>), TightBeamError> {
-		let certificate = Certificate::try_from(self.certificate.clone())?;
-		let key_manager = HandshakeKeyManager::new(Arc::clone(&self.key));
-		Ok((certificate, key_manager))
+	/// - [`TightBeamError::SerializationError`] -- `certificate` holds PEM or
+	///   DER that does not decode as a certificate.
+	pub fn new(certificate: CertificateSpec, key: Arc<dyn SigningKeyProvider>) -> Result<Self, TightBeamError> {
+		let identity = ClientIdentity::from_spec(certificate, key)?;
+
+		Ok(Self {
+			identity,
+			validators: Vec::new(),
+			client_validators: Vec::new(),
+			hive_trust: None,
+			peer_trust: None,
+		})
+	}
+
+	/// Replace the server-certificate validators applied to outbound dials.
+	#[must_use]
+	pub fn with_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
+		self.validators = validators;
+		self
+	}
+
+	/// Replace the client-certificate validators applied to inbound mutual TLS.
+	#[must_use]
+	pub fn with_client_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
+		self.client_validators = validators;
+		self
+	}
+
+	/// Replace the hive-plane trust store.
+	#[must_use]
+	pub fn with_hive_trust(
+		mut self,
+		store: impl Into<Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>>,
+	) -> Self {
+		self.hive_trust = store.into();
+		self
+	}
+
+	/// Replace the peer-plane trust anchor.
+	#[must_use]
+	pub fn with_peer_trust(
+		mut self,
+		store: impl Into<Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>>,
+	) -> Self {
+		self.peer_trust = store.into();
+		self
+	}
+
+	/// The certificate and handshake key this gateway presents.
+	///
+	/// One identity serves the colony listener, the edge listener, and every
+	/// outbound hive and peer dial, so all of them read it here and cannot
+	/// disagree.
+	pub fn identity(&self) -> &ClientIdentity {
+		&self.identity
 	}
 }
 
 impl Clone for ClusterTlsConfig {
 	fn clone(&self) -> Self {
 		Self {
-			certificate: self.certificate.clone(),
-			key: Arc::clone(&self.key),
+			identity: self.identity.clone(),
 			validators: self.validators.iter().map(Arc::clone).collect(),
 			client_validators: self.client_validators.iter().map(Arc::clone).collect(),
 			hive_trust: self.hive_trust.as_ref().map(Arc::clone),
@@ -232,8 +279,7 @@ impl Clone for ClusterTlsConfig {
 impl core::fmt::Debug for ClusterTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterTlsConfig")
-			.field("certificate", &self.certificate)
-			.field("key", &"<KeyProvider>")
+			.field("identity", &"<ClientIdentity>")
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.field("client_validators", &format!("[{} validators]", self.client_validators.len()))
 			.field("hive_trust", &self.hive_trust.as_ref().map(|_| "Some(<TrustStore>)"))
@@ -583,7 +629,7 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::policy::TransitStatus;
-	use crate::testing::create_test_signing_key;
+	use crate::testing::{create_test_certificate, create_test_signing_key};
 	use crate::utils::BasisPoints;
 
 	// =========================================================================
@@ -592,14 +638,11 @@ mod tests {
 
 	fn test_tls_config() -> ClusterTlsConfig {
 		let key: Secp256k1SigningKey = create_test_signing_key();
-		ClusterTlsConfig {
-			certificate: CertificateSpec::Der(&[]),
-			key: Arc::new(Secp256k1KeyProvider::from(key)),
-			validators: Vec::new(),
-			client_validators: Vec::new(),
-			hive_trust: None,
-			peer_trust: None,
-		}
+		ClusterTlsConfig::new(
+			CertificateSpec::Built(Box::new(create_test_certificate(&key))),
+			Arc::new(Secp256k1KeyProvider::from(key)),
+		)
+		.expect("the test certificate must decode")
 	}
 
 	fn test_registry() -> HiveRegistry {

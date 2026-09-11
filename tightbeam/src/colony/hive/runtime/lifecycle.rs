@@ -170,12 +170,9 @@ where
 		};
 
 		let bind_addr = P::default_bind_address()?;
-		let (certificate, key_manager) = hive_tls.identity()?;
-		let mut encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
-		if !hive_tls.validators.is_empty() {
-			let validators: Vec<_> = hive_tls.validators.iter().map(Arc::clone).collect();
-			encryption_config = encryption_config.with_client_validators(validators);
-		}
+		let (certificate, key_manager) = hive_tls.identity().parts();
+		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+		let encryption_config = encryption_config.with_client_validators(hive_tls.validators.iter().map(Arc::clone));
 
 		Ok(Some(P::bind_with(bind_addr, encryption_config).await?))
 	}

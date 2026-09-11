@@ -1864,11 +1864,9 @@ fn foreign_gateway_ctx() -> ForeignGatewayCtx {
 /// Running gateway from colony "other", TLS-anchored both ways.
 /// A probe against it completes the handshake and fails only the gate.
 fn foreign_gateway_conf(ctx: &ForeignGatewayCtx) -> ClusterConfig {
-	let tls = ClusterTlsConfig {
-		hive_trust: Some(Arc::clone(&ctx.shared_trust)),
-		peer_trust: Some(Arc::clone(&ctx.shared_trust)),
-		..cluster_tls_config_with_trust(&ctx.foreign, None)
-	};
+	let tls = cluster_tls_config_with_trust(&ctx.foreign, None)
+		.with_hive_trust(Arc::clone(&ctx.shared_trust))
+		.with_peer_trust(Arc::clone(&ctx.shared_trust));
 	ClusterConfig::new(tls)
 }
 
@@ -1879,7 +1877,7 @@ fn foreign_gateway_conf(ctx: &ForeignGatewayCtx) -> ClusterConfig {
 /// - `peer_trust` decides which probed identities complete the handshake.
 /// - The colony gate then separates members from strangers.
 fn fast_probing_conf(certs: &ClusterTestCerts, peer_trust: Arc<dyn CertificateTrust>) -> ClusterConfig {
-	let tls = ClusterTlsConfig { peer_trust: Some(peer_trust), ..cluster_tls_config(certs) };
+	let tls = cluster_tls_config(certs).with_peer_trust(peer_trust);
 
 	ClusterConfig::builder(tls)
 		.with_advertise_interval(Duration::from_millis(100))

@@ -68,7 +68,7 @@ fn exports_ctx() -> ExportsCtx {
 /// - `hive_trust` anchors the organization's own identity.
 /// - `peer_trust` anchors only the external peer.
 fn split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> ClusterTlsConfig {
-	ClusterTlsConfig { peer_trust: Some(Arc::clone(&peer.trust)), ..cluster_tls_config(own) }
+	cluster_tls_config(own).with_peer_trust(Arc::clone(&peer.trust))
 }
 
 /// [`split_plane_tls`] with the inbound mutual-TLS accept plane on.

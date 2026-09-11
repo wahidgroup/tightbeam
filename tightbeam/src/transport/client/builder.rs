@@ -26,7 +26,7 @@ mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::transport::handshake::HandshakeProtocolKind;
-	pub use crate::transport::state::EncryptionConfig;
+	pub use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	pub use crate::transport::X509ClientConfig;
 	pub use crate::x509::Certificate;
 
@@ -37,7 +37,6 @@ mod x509 {
 	#[cfg(feature = "std")]
 	pub use crate::crypto::x509::CertificateSpec;
 	#[cfg(feature = "std")]
-	pub use crate::transport::handshake::HandshakeKeyManager;
 	#[cfg(feature = "std")]
 	pub use crate::transport::state::ClientIdentity;
 }
@@ -252,14 +251,13 @@ where
 	///   the client holds no trust store and did not call [`Self::allow_cleartext`],
 	///   so it would have accepted any peer.
 	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
-		self.encryption.check_dial_permitted()?;
-
+		let encryption = DialableEncryption::new(self.encryption)?;
 		let addr = addr.borrow().clone();
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 
 		// The provisioning moves to the transport whole, so nothing this
 		// builder accumulated can be left behind.
-		let transport = P::create_transport(stream).with_encryption(self.encryption);
+		let transport = P::create_transport(stream).with_encryption(encryption);
 		let configured = self.policies.apply::<P>(transport);
 		Ok(GenericClient::from_transport(configured))
 	}
@@ -306,9 +304,8 @@ where
 		cert: CertificateSpec,
 		key: Arc<dyn SigningKeyProvider>,
 	) -> TransportResult<Self> {
-		let cert = Certificate::try_from(cert)?;
-		let key_manager: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
-		ClientIdentity::new(Arc::new(cert), Arc::new(key_manager)).install(&mut self.encryption);
+		ClientIdentity::<C>::from_spec(cert, key)?.install(&mut self.encryption);
+
 		Ok(self)
 	}
 

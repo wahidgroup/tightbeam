@@ -57,7 +57,7 @@ pub fn federation_conf(
 	peers: Vec<String>,
 	max_hops: u8,
 ) -> ClusterConfig {
-	let tls = ClusterTlsConfig { peer_trust: Some(peer_trust), ..cluster_tls_config(certs) };
+	let tls = cluster_tls_config(certs).with_peer_trust(peer_trust);
 
 	ClusterConfig::builder(tls)
 		.with_peers(peers)
