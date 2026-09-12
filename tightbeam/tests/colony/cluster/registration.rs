@@ -25,7 +25,9 @@ impl ServletBox for StopProbeServlet {
 	}
 
 	fn stop_boxed(self: Box<Self>) {
-		let _ = self.trace.event(SERVLET_STOPPED);
+		self.trace
+			.event(SERVLET_STOPPED)
+			.expect("recording the servlet stop is what this probe exists to do");
 	}
 }
 

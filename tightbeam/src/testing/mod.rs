@@ -23,7 +23,7 @@ pub mod macros;
 pub mod result;
 pub mod schedulability;
 pub mod specs;
-pub mod trace;
+pub mod teardown;
 pub mod utils;
 
 #[cfg(feature = "testing-fault")]
@@ -42,6 +42,7 @@ pub use config::{Expect, HookContext, ScenarioConfig, ScenarioConfigBuilder, Sce
 pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
 pub use result::{ScenarioResult, ScenarioVerdict};
 pub use specs::{verify_trace, Layer, SpecViolation, TBSpec, Violations};
+pub use teardown::Teardown;
 pub use utils::*;
 
 #[cfg(feature = "testing-fault")]

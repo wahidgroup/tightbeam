@@ -20,7 +20,7 @@ use tightbeam::{
 	decode,
 	prelude::*,
 	servlet,
-	testing::trace::TraceCollector,
+	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ConnectionPool},
 	utils::task::Pipeline,
 };

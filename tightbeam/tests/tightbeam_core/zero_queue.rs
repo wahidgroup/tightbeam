@@ -289,7 +289,10 @@ impl GatePolicy for AdaptiveGate {
 		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Standard);
 		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata.order) {
 			// Emit trace event for test verification
-			let _ = self.trace.event_with(THROTTLE_ENGAGED, &[QUEUE_TAG], true);
+			self.trace
+				.event_with(THROTTLE_ENGAGED, &[QUEUE_TAG], true)
+				.expect("the spec grades the throttle, so losing it would pass a stale run");
+
 			TransitStatus::ResourceExhausted
 		} else {
 			TransitStatus::Ok

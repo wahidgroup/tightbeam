@@ -12,8 +12,9 @@ pub mod compose_spec;
 pub mod gen_states;
 // Timing-constraint helper macros (Layer 3 - timing)
 pub mod timing_spec;
-
+// VerificationSpec macro (Layer 1 - assertions)
 pub mod verification_spec;
+
 pub use timing_spec::DeadlineParams;
 pub use verification_spec::{
 	absent, between, present, versions_strictly_ascending, AssertSpecBuilder, BuiltAssertSpec, Cardinality,
@@ -24,6 +25,9 @@ pub use verification_spec::{
 pub use crate::testing::assertions::{AssertionValue, IsNone, IsSome, Presence, RatioLimit};
 pub use crate::trace::TraceCollector;
 pub use crate::{absent, at_least, at_most, between, equals, exactly, falsy, present, truthy};
+
+#[cfg(feature = "testing-timing")]
+pub use verification_spec::SchedulabilityAssertion;
 
 /// Helper macro to wrap values for equality assertions in specs
 #[macro_export]
@@ -780,6 +784,8 @@ macro_rules! tb_scenario {
 		.expect("Failed to start servlet");
 
 		let server_addr = servlet_instance.addr().to_owned();
+		let stop_servlet = $crate::testing::Teardown::new(move || servlet_instance.stop());
+
 		let client = $crate::tb_scenario!(@servlet_client
 			trace.share(), ::std::sync::Arc::clone(&context), server_addr $(, $setup_expr)?
 		);
@@ -794,7 +800,7 @@ macro_rules! tb_scenario {
 		)
 		.await;
 
-		servlet_instance.stop();
+		stop_servlet.run();
 
 		$crate::tb_scenario!(@grade config, trace, client_result);
 	}};
@@ -820,6 +826,8 @@ macro_rules! tb_scenario {
 		.await
 		.expect("Server setup failed");
 
+		let stop_server = $crate::testing::Teardown::new(move || server_handle.abort());
+
 		let client_result = $crate::testing::macros::__tb_env_call(
 			$client_closure,
 			$crate::testing::env::ClientEnv {
@@ -830,7 +838,7 @@ macro_rules! tb_scenario {
 		)
 		.await;
 
-		server_handle.abort();
+		stop_server.run();
 
 		$crate::tb_scenario!(@grade config, trace, client_result);
 	}};
@@ -874,7 +882,7 @@ macro_rules! tb_scenario {
 		// needs the concrete type: plain drop only aborts control tasks
 		// and would leak registered servlets.
 		#[allow(unused_mut)]
-		let mut hive_stops: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+		let mut hive_stops: Vec<$crate::testing::Teardown> = Vec::new();
 		$(
 			let cluster_addr = cluster_instance.addr().clone();
 			let hive_futures = ($hives_closure)($crate::testing::env::SetupEnv {
@@ -884,7 +892,7 @@ macro_rules! tb_scenario {
 			for hive_future in hive_futures {
 				let hive = hive_future.await.expect("Failed to start hive");
 				hive.register_with_cluster(&cluster_addr).await.expect("Failed to register hive");
-				hive_stops.push(Box::new(move || hive.stop()));
+				hive_stops.push($crate::testing::Teardown::new(move || hive.stop()));
 			}
 		)?
 
@@ -901,7 +909,7 @@ macro_rules! tb_scenario {
 		.await;
 
 		for stop_hive in hive_stops {
-			stop_hive();
+			stop_hive.run();
 		}
 
 		$crate::tb_scenario!(@grade config, trace, client_result);

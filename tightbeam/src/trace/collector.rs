@@ -245,8 +245,11 @@ impl<'a> EventBuilder<'a> {
 						metadata: None, // TODO: Extract from value
 					};
 
-					// Ignore logging errors (don't fail trace collection)
-					let _ = logger_config.backend.emit(&record);
+					// The trace is the evidence and the log is a convenience,
+					// so a backend that refuses a record must not stop the
+					// event from being collected. Nothing above this reads a
+					// logging outcome.
+					let _unlogged = logger_config.backend.emit(&record);
 				}
 			}
 		}

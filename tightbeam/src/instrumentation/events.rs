@@ -166,3 +166,11 @@ pub const CLUSTER_GOSSIP_DUPLICATE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "even
 pub const CLUSTER_GOSSIP_REFUSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-refused");
 pub const CLUSTER_GOSSIP_RELAY_WEAKENED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-relay-weakened");
 pub const CLUSTER_GOSSIP_DROP_SIGNAL: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-drop-signal");
+/// A rumor this gateway could not build or sign, so no peer received it.
+pub const CLUSTER_GOSSIP_REFLOOD_FAILED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-reflood-failed");
+/// Count of flood targets one reflood round failed to reach.
+pub const CLUSTER_GOSSIP_FANOUT_UNREACHED: Urn<'static> =
+	Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-fanout-unreached");
+/// A journal that refused to witness a digest this gateway published.
+pub const CLUSTER_GOSSIP_WITNESS_REFUSED: Urn<'static> =
+	Urn::new(TIGHTBEAM_NID, "event:cluster/gossip-witness-refused");
