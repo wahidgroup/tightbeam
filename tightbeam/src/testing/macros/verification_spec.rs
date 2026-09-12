@@ -932,11 +932,7 @@ macro_rules! __tb_assert_spec_build {
 			}
 		};
 		$(
-			$crate::__tb_if_testing_timing! {
-				{
-					$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
-				}
-			};
+			$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
 		)?
 		$vec.push(builder.build());
 	}};
@@ -958,19 +954,19 @@ macro_rules! __tb_assert_spec_build {
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
 		$(
-			$crate::__tb_if_testing_timing! {
-				{
-					$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
-				}
-			};
+			$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
 		)?
 		$vec.push(builder.build());
 	}};
 }
 
-// Helper to parse schedulability assertions
+// Attaches a schedulability assertion to the spec under construction.
+//
+// The name is defined in every configuration and the body is what the
+// feature selects, so an expansion may call this without guarding the call
+// itself. A definition gated as a whole makes a missed guard a
+// name-resolution failure in one column of the feature matrix only.
 #[doc(hidden)]
-#[cfg(feature = "testing-timing")]
 #[macro_export]
 macro_rules! __tb_assert_spec_parse_schedulability {
 	(
@@ -978,19 +974,21 @@ macro_rules! __tb_assert_spec_parse_schedulability {
 		task_set: $task_set:expr,
 		scheduler: $scheduler:ident,
 		must_be_schedulable: $must_be:expr,
-	) => {{
-		use $crate::testing::schedulability::SchedulerType;
-		let task_set_with_scheduler = {
-			let mut ts = $task_set.clone();
-			ts.scheduler = SchedulerType::$scheduler;
-			ts
-		};
-		let assertion = $crate::testing::macros::SchedulabilityAssertion {
-			task_set: task_set_with_scheduler,
-			must_be_schedulable: $must_be,
-		};
-		$builder = $builder.schedulability(assertion);
-	}};
+	) => {
+		$crate::__tb_if_testing_timing! {{
+			use $crate::testing::schedulability::SchedulerType;
+			let task_set_with_scheduler = {
+				let mut ts = $task_set.clone();
+				ts.scheduler = SchedulerType::$scheduler;
+				ts
+			};
+			let assertion = $crate::testing::macros::SchedulabilityAssertion {
+				task_set: task_set_with_scheduler,
+				must_be_schedulable: $must_be,
+			};
+			$builder = $builder.schedulability(assertion);
+		}}
+	};
 }
 
 // Helper to add individual assertions (handles tags and values).

@@ -204,6 +204,7 @@ dependencies = [
  "der_derive",
  "flagset",
  "pem-rfc7468",
+ "time",
  "zeroize",
 ]
 

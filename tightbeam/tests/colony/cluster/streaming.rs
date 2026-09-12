@@ -42,7 +42,11 @@ impl Drop for CancelProbe {
 	fn drop(&mut self) {
 		if self.armed {
 			DUPLEX_CANCEL_SEEN.store(true, Ordering::SeqCst);
-			let _ = self.trace.event(SERVLET_DUPLEX_CANCELLED);
+			if let Err(error) = self.trace.event(SERVLET_DUPLEX_CANCELLED) {
+				// Panicking inside a drop that is itself unwinding aborts the
+				// process, so let the first failure be the one reported.
+				assert!(std::thread::panicking(), "recording the duplex cancel failed: {error}");
+			}
 		}
 	}
 }

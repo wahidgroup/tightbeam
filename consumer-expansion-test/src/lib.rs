@@ -61,6 +61,28 @@ mod tests {
 		}
 	}
 
+	// Neither selection enables `testing-timing`, so this spec is the proof
+	// that the schedulability block expands to nothing rather than to a name
+	// the consumer cannot resolve. The `task_set:` expression is dropped with
+	// the block, which is why it may name a feature-gated type.
+	tightbeam::tb_assert_spec! {
+		pub ScheduleBlockSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(SCENARIO_RAN, tightbeam::exactly!(1))
+			],
+			schedulability: {
+				task_set: tightbeam::testing::schedulability::TaskSet {
+					tasks: vec![],
+					scheduler: tightbeam::testing::schedulability::SchedulerType::RateMonotonic,
+				},
+				scheduler: RateMonotonic,
+				must_be_schedulable: true,
+			}
+		}
+	}
+
 	tightbeam::tb_scenario! {
 		name: one_scenario_body_compiles_under_this_selection,
 		config: ScenarioConfig::builder()

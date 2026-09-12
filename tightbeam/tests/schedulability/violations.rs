@@ -175,3 +175,34 @@ tb_scenario! {
 		}
 	}
 }
+
+/// An empty task set: the spec key under test is the block, not the analysis.
+fn schedule_only_task_set() -> tightbeam::testing::schedulability::TaskSet {
+	tightbeam::testing::schedulability::TaskSet {
+		tasks: vec![],
+		scheduler: tightbeam::testing::schedulability::SchedulerType::RateMonotonic,
+	}
+}
+
+tb_assert_spec! {
+	pub ScheduleOnlySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [],
+		schedulability: {
+			task_set: schedule_only_task_set(),
+			scheduler: RateMonotonic,
+			must_be_schedulable: true,
+		}
+	}
+}
+
+// The block is the only thing this spec names, so a spec that can reject is
+// the observable form of the block reaching the built spec.
+#[test]
+fn a_schedulability_block_reaches_the_built_spec() {
+	assert!(
+		tightbeam::testing::TBSpec::can_reject(ScheduleOnlySpec::latest()),
+		"the schedulability block did not reach the spec"
+	);
+}

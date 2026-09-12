@@ -622,7 +622,9 @@ impl ServletBox for LocatorStopProbe {
 
 	fn stop_boxed(self: Box<Self>) {
 		if self.report_stop {
-			let _ = self.trace.event(SERVLET_STOPPED);
+			self.trace
+				.event(SERVLET_STOPPED)
+				.expect("recording the servlet stop is what this probe exists to do");
 		}
 	}
 }

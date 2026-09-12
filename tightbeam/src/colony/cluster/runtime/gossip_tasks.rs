@@ -7,10 +7,8 @@
 //! # Planes
 //!
 //! - **Direct advertisement**: one signed frame dials every verified target.
-//! - **Rumor flood**: the same signed frame wraps in a gossip rumor for
-//!   members beyond direct reach.
-//! - **Pipeline**: admit, rate-limit, journal, deliver locally, and reflood
-//!   inbound rumors.
+//! - **Rumor flood**: the same signed frame wraps in a gossip rumor for members beyond direct reach.
+//! - **Pipeline**: admit, rate-limit, journal, deliver locally, and reflood inbound rumors.
 //! - **Reconcile**: anti-entropy repair and peer-exchange hint learning.
 
 use core::hash::Hash;
@@ -44,7 +42,8 @@ use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::encode;
 use crate::instrumentation::events::{
-	CLUSTER_GOSSIP_ACCEPTED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE, CLUSTER_GOSSIP_RELAY_WEAKENED,
+	CLUSTER_GOSSIP_ACCEPTED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE, CLUSTER_GOSSIP_FANOUT_UNREACHED,
+	CLUSTER_GOSSIP_REFLOOD_FAILED, CLUSTER_GOSSIP_RELAY_WEAKENED, CLUSTER_GOSSIP_WITNESS_REFUSED,
 	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
 };
 use crate::instrumentation::events::{
@@ -281,12 +280,12 @@ where
 	/// Targets are anchors plus verified tried peers, so rumor bytes reach
 	/// verified identities only. Each target receives an owned clone of the
 	/// signed frame because emit consumes the frame.
-	async fn reflood<D: ClusterDigest>(&self, rumor: Frame, ttl: u64) {
+	async fn reflood<D: ClusterDigest>(&self, rumor: Frame, ttl: u64) -> Result<(), TightBeamError> {
 		// Flood targets are anchors plus verified tried peers, so rumor bytes
 		// reach verified identities only.
 		let targets = self.config.peer.table.target_set().unwrap_or_default();
 		if targets.is_empty() {
-			return;
+			return Ok(());
 		}
 
 		// Embedding the decoded rumor re-encodes it, which is byte-identical
@@ -305,7 +304,11 @@ where
 			.build()
 		{
 			Ok(frame) => frame,
-			Err(_) => return,
+			Err(_unbuilt) => {
+				self.trace.event(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
+
+				return Ok(());
+			}
 		};
 
 		let signed_frame = match frame
@@ -313,12 +316,18 @@ where
 			.await
 		{
 			Ok(signed) => signed,
-			Err(_) => return,
+			Err(_unsigned) => {
+				self.trace.event(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
+
+				return Ok(());
+			}
 		};
 
 		let mut fanout = tokio::task::JoinSet::new();
+		let mut unreached: u64 = 0;
 		for peer in targets.iter() {
 			let Ok(peer_addr) = peer.parse::<P::Address>() else {
+				unreached += 1;
 				continue;
 			};
 
@@ -327,13 +336,29 @@ where
 			// needs N owned frames. The clone is that fan-out cost.
 			let frame = signed_frame.clone();
 			fanout.spawn(async move {
-				if let Ok(mut client) = dial_pool.connect(peer_addr).await {
-					let _ = client.emit(frame, None).await;
-				}
+				let Ok(mut client) = dial_pool.connect(peer_addr).await else {
+					return false;
+				};
+
+				client.emit(frame, None).await.is_ok()
 			});
 		}
 
-		while fanout.join_next().await.is_some() {}
+		// One peer being down must not stop the flood to the peers that are
+		// up, so a hop that fails is counted rather than returned. A task
+		// that could not be joined did not reach its peer either, which is
+		// why both fold into the same count.
+		while let Some(joined) = fanout.join_next().await {
+			if !joined.unwrap_or(false) {
+				unreached += 1;
+			}
+		}
+
+		if unreached > 0 {
+			self.trace.event_with(CLUSTER_GOSSIP_FANOUT_UNREACHED, &[], unreached)?;
+		}
+
+		Ok(())
 	}
 
 	/// Send one pre-signed peer advertisement to a dialed peer gateway.
@@ -380,17 +405,25 @@ where
 
 		// Witness the published digest so the origin's own echo dedups.
 		// Retention serves repair and retry, which advertisements forgo.
-		let _ = self
+		// A journal that refuses the witness leaves this gateway able to
+		// re-admit its own echo. The rumor is already minted, so the beat
+		// records the refusal and floods anyway rather than dropping a rumor
+		// that is live.
+		if self
 			.config
 			.gossip
 			.journal
-			.witness(&minted.signer_id, minted.digest, minted.minted_ms);
+			.witness(&minted.signer_id, minted.digest, minted.minted_ms)
+			.is_err()
+		{
+			self.trace.event(CLUSTER_GOSSIP_WITNESS_REFUSED)?;
+		}
 
 		// The stamped lifetime is the budget remaining after this first
 		// hop arrives, matching what the pipeline stamps when it refloods
 		// a published rumor.
 		let hop_ttl = u64::from(self.config.gossip.ttl.min(MAX_GOSSIP_TTL));
-		self.reflood::<D>(minted.rumor, hop_ttl.saturating_sub(1)).await;
+		self.reflood::<D>(minted.rumor, hop_ttl.saturating_sub(1)).await?;
 
 		Ok(true)
 	}
@@ -531,7 +564,7 @@ where
 			// while retained, is a drop. One weaken per round scores it.
 			let dropped = wanted.iter().any(|digest| acked.contains(digest));
 			if dropped {
-				let _ = self.servlet_registry.weaken_peer_by_dial(peer.as_bytes());
+				self.servlet_registry.weaken_peer_by_dial(peer.as_bytes())?;
 				self.trace.event(CLUSTER_GOSSIP_DROP_SIGNAL)?;
 			}
 
@@ -917,7 +950,12 @@ where
 		// unchanged, and the reply only needs the outer frame id.
 		if hop_ttl > 0 && config.peer.table.has_targets() {
 			let next_ttl = hop_ttl - 1;
-			tasks.spawn(async move { flood.reflood::<D>(rumor, next_ttl).await });
+			tasks.spawn(async move {
+				// Detached, so nothing above can act on the outcome. Every
+				// fault the reflood can name is already recorded on the
+				// trace inside it, which is where a reader looks.
+				let _detached = flood.reflood::<D>(rumor, next_ttl).await;
+			});
 		}
 
 		reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok })

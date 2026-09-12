@@ -73,10 +73,6 @@ mod security;
 #[cfg(feature = "colony")]
 mod payments;
 
-// DLT Network test
-// #[cfg(feature = "full")]
-// mod proof;
-
 // Gate decision reading
 #[cfg(feature = "testing")]
 mod gate;
@@ -84,3 +80,7 @@ mod gate;
 // Scenario configuration refusals
 #[cfg(feature = "testing")]
 mod config;
+
+// Teardown on the panic path
+#[cfg(feature = "testing")]
+mod teardown;

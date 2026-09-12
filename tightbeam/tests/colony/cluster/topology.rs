@@ -40,7 +40,9 @@ impl<L: LoadBalancer> RecordingBalancer<L> {
 impl<L: LoadBalancer> LoadBalancer for RecordingBalancer<L> {
 	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize> {
 		let value = candidates.len() as u64;
-		let _ = self.trace.event_with(BALANCER_OFFERED, &[], value);
+		self.trace
+			.event_with(BALANCER_OFFERED, &[], value)
+			.expect("the spec grades the offered count, so losing it would pass a stale run");
 		let pick = self.inner.select(candidates);
 		if let (Some(index), Ok(mut chosen)) = (pick, self.selected.lock()) {
 			chosen.insert(index);

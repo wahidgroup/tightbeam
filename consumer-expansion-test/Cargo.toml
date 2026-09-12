@@ -18,5 +18,6 @@ wide = [
 	"tightbeam/testing",
 	"tightbeam/testing-csp",
 	"tightbeam/testing-fdr",
+	"tightbeam/testing-timing",
 	"tightbeam/instrument",
 ]
