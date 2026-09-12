@@ -222,26 +222,11 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 	}
 }
 
-#[cfg(not(feature = "x509"))]
-impl<P: Protocol + Send, C: CryptoProvider + 'static> ClientBuilder<P, C>
-where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
-	P::Address: Clone + Send,
-{
-	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
-		let addr = addr.borrow().clone();
-		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
-		let transport = P::create_transport(stream);
-		let configured = self.policies.apply::<P>(transport);
-		Ok(GenericClient::from_transport(configured))
-	}
-}
-
 #[cfg(feature = "x509")]
 impl<P: Protocol + Send, C: CryptoProvider + Send + Sync + 'static> ClientBuilder<P, C>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
-	P::Address: Clone + Send,
+	P::Address: Send,
 {
 	/// Connect and configure the client.
 	///
@@ -250,34 +235,16 @@ where
 	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
 	///   the client holds no trust store and did not call [`Self::allow_cleartext`],
 	///   so it would have accepted any peer.
-	pub async fn connect(self, addr: impl core::borrow::Borrow<P::Address>) -> TransportResult<GenericClient<P>> {
+	pub async fn connect(self, addr: impl Into<P::Address>) -> TransportResult<GenericClient<P>> {
 		let encryption = DialableEncryption::new(self.encryption)?;
-		let addr = addr.borrow().clone();
-		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
+		let destination = addr.into();
+		let stream = P::connect(destination).await.map_err(|e| e.into())?;
 
 		// The provisioning moves to the transport whole, so nothing this
 		// builder accumulated can be left behind.
 		let transport = P::create_transport(stream).with_encryption(encryption);
 		let configured = self.policies.apply::<P>(transport);
 		Ok(GenericClient::from_transport(configured))
-	}
-}
-
-#[cfg(all(feature = "std", not(feature = "x509")))]
-impl<P: Protocol + Send, C: CryptoProvider + 'static> ConnectionBuilder<P> for ClientBuilder<P, C>
-where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
-	P::Address: Send,
-{
-	type Output = Self;
-
-	fn with_timeout(mut self, timeout: Duration) -> Self {
-		self.policies = self.policies.with_timeout(timeout);
-		self
-	}
-
-	fn build(self) -> Self::Output {
-		self
 	}
 }
 

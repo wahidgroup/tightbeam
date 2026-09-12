@@ -53,15 +53,12 @@ use std::sync::Arc;
 
 use tightbeam::asn1::OctetString;
 use tightbeam::crypto::ecies::Secp256k1EciesMessage;
-use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::utils::{create_test_certificate, create_test_signing_key};
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
 use tightbeam::transport::handshake::{
@@ -77,8 +74,8 @@ pub(crate) const RESPONSE_CONFIDENTIAL_ON_WIRE: Urn<'static> =
 pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> = Urn::new("test", "event:settlement-ordering/settle-never-fired");
 
 use crate::common::security::{
-	contains_window, default_security_profile, expectation_failure, pinning_validator, PayingApprover, ServerMaterials,
-	SettleSpyAuthorizer,
+	contains_window, default_security_profile, expectation_failure, pinning_validator, ClientMaterials, PayingApprover,
+	ServerMaterials, SettleSpyAuthorizer,
 };
 
 const CHALLENGE: &[u8] = b"settle-ordering-invoice";
@@ -109,16 +106,13 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
 			let profile = default_security_profile();
-
-			let client_signing = create_test_signing_key();
-			let client_cert = Arc::new(create_test_certificate(&client_signing));
-			let signing_key = Secp256k1SigningKey::from(client_signing);
-			let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+			let client_materials = ClientMaterials::deterministic();
+			let client_identity = client_materials.identity();
 
 			let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
 				.with_security_offer(SecurityOffer::new(vec![profile]))
 				.with_certificate_validator(pinning_validator(&materials.certificate))
-				.with_client_identity(Arc::clone(&client_cert), client_provider)
+				.with_client_identity(client_identity)
 				.with_transport_offer(TransportOffer::mux(4).with_budgets(REQUEST))
 				.with_receipt_approver(Arc::new(PayingApprover::answering(RESPONSE)?));
 

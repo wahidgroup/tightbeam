@@ -469,9 +469,10 @@ fn is_received_expected_error(ty: &syn::Type) -> bool {
 ///
 /// # Attributes
 ///
-/// - `#[error("format string")]` - Specifies the display format for the variant
-/// - `#[from]` - Automatically implements `From` for the wrapped type
-/// - `#[source]` - Reports the wrapped value through `Error::source`
+/// - `#[error("format string")]` -- Specifies the display format for the variant
+/// - `#[from]` -- Implements `From` for the wrapped type and reports that value
+///   through `Error::source`, so the payload must implement `core::error::Error`
+/// - `#[source]` -- Reports the wrapped value through `Error::source`
 #[proc_macro_derive(Errorizable, attributes(error, from, source))]
 pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -582,8 +583,11 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 					}
 				}
 
-				// Wrapper variants preserve their cause chain (C-GOOD-ERR).
-				if has_source {
+				// Wrapper variants preserve their cause chain (C-GOOD-ERR). A
+				// single-field `#[from]` variant is a cause, so it joins the
+				// `#[source]` arm.
+				let wraps_cause = has_source || (has_from && field_count == 1);
+				if wraps_cause {
 					source_arms.push(quote! {
 						#(#variant_cfgs)*
 						#name::#variant_name(ref f0) => Some(f0),

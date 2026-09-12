@@ -2,11 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use tightbeam::asn1::Frame;
 use tightbeam::der::Enumerated;
+use tightbeam::der::Sequence;
 use tightbeam::error::TightBeamError;
 use tightbeam::matrix::{MatrixDyn, MatrixError};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::{compose, decode, servlet, Beamable, Sequence};
+use tightbeam::{compose, decode, servlet, Beamable};
 
 use super::events;
 use super::r#move::ChessMove;

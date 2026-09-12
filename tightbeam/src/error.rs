@@ -134,6 +134,7 @@ impl core::fmt::Display for ErrorChain {
 }
 
 #[derive(Errorizable, Debug)]
+#[non_exhaustive]
 pub enum TightBeamError {
 	/// Error from the matrix implementation
 	#[error("Matrix error: {0}")]

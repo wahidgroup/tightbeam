@@ -9,6 +9,7 @@ pub type Result<T> = core::result::Result<T, HandshakeError>;
 
 /// Errors specific to handshake operations
 #[derive(Debug, Errorizable)]
+#[non_exhaustive]
 pub enum HandshakeError {
 	// ---------------- Protocol & structure specific ----------------
 	// Invariant violations (non-panicking)
@@ -61,7 +62,6 @@ pub enum HandshakeError {
 
 	/// CMS builder error
 	#[error("CMS builder error: {0}")]
-	#[from]
 	CmsBuilderError(crate::cms::builder::Error),
 
 	/// Invalid handshake state

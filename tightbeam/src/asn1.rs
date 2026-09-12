@@ -11,8 +11,8 @@ pub use crate::cms::enveloped_data::EncryptedContentInfo;
 pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
 pub use crate::der::asn1::{Any, BitString, ObjectIdentifier, OctetString};
 pub use crate::der::{Choice, Enumerated, Sequence};
-pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
+pub use pkcs12::digest_info::DigestInfo;
 
 use crate::der::TagNumber;
 use crate::wire::wire_sequence;

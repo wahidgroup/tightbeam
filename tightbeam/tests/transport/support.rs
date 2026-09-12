@@ -157,7 +157,7 @@ pub async fn connect_mutual_client(
 	client: &ClientMaterials,
 ) -> Result<TcpTransport<TokioStream>, TightBeamError> {
 	let transport = connect_pinned_client(addr, server_certificate).await?;
-	Ok(transport.with_client_identity(Arc::clone(&client.certificate), Arc::clone(&client.key_manager)))
+	Ok(transport.with_client_identity(client.identity()))
 }
 
 /// Optional per-session hooks for mutual-auth handshakes.

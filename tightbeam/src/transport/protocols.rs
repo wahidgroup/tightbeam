@@ -28,8 +28,8 @@ mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::transport::handshake::receipt::ReceiptApprover;
-	pub use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
-	pub use crate::transport::state::DialableEncryption;
+	pub use crate::transport::handshake::HandshakeProtocolKind;
+	pub use crate::transport::state::{ClientIdentity, DialableEncryption};
 	pub use crate::transport::TransportEncryptionConfig;
 	pub use crate::x509::Certificate;
 }
@@ -105,9 +105,8 @@ pub trait X509ClientConfig: Sized {
 
 	/// Client certificate and the signing key that proves it.
 	///
-	/// Both halves land together, so a transport cannot hold one without the
-	/// other. Arcs, so pooled connections share one identity per dial.
-	fn with_client_identity(self, cert: Arc<Certificate>, key: Arc<HandshakeKeyManager<Self::CryptoProvider>>) -> Self;
+	/// [`ClientIdentity`] owns the binding contract.
+	fn with_client_identity(self, identity: ClientIdentity<Self::CryptoProvider>) -> Self;
 
 	/// Provision the expected server certificate chain, ordered root to leaf.
 	///

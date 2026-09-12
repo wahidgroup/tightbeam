@@ -430,48 +430,6 @@ mod tests {
 	use crate::testing::*;
 	use crate::transport::policy::PolicyConfig;
 
-	/// Serve one single-flight request with an empty reply, answering
-	/// with the gate's status.
-	#[cfg(not(feature = "x509"))]
-	async fn respond_none<T: MessageCollector>(transport: &mut T) -> TransportResult<()> {
-		let (_request, status) = transport.collect_message().await?;
-		transport.send_response(status, None).await
-	}
-
-	#[cfg(not(feature = "x509"))]
-	#[tokio::test]
-	async fn test_tcp_transport_emit_collect() -> TransportResult<()> {
-		let message = create_v0_tightbeam(None, None);
-		let listener = NetTcpListener::bind("127.0.0.1:0")?;
-		let addr = listener.local_addr()?;
-		let (ready_tx, ready_rx) = mpsc::channel();
-
-		let server_handle = thread::spawn(move || -> TransportResult<()> {
-			let server = TcpListener::from_listener(listener);
-			let _ = ready_tx.send(());
-			let mut transport = server.accept()?;
-
-			let rt = tokio::runtime::Runtime::new()?;
-			rt.block_on(respond_none(&mut transport))?;
-			Ok(())
-		});
-
-		let _ = ready_rx.recv();
-
-		let stream = NetTcpStream::connect(addr)?;
-		let mut client_transport = TcpTransport::from(stream);
-		let response = client_transport.emit(message, None).await?;
-
-		// A panicked server thread surfaces as an I/O error rather than a
-		// re-panic. The closure itself only fails through `?`.
-		server_handle
-			.join()
-			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;
-
-		assert_eq!(response, None);
-		Ok(())
-	}
-
 	/// Under the per-recv-only scheme this read complete after ~6s of dripping
 	/// the absolute deadline aborts it at the first slice boundary past
 	/// the budget.
@@ -519,67 +477,6 @@ mod tests {
 
 		assert!(result.is_err());
 		assert!(elapsed < Duration::from_secs(5));
-		Ok(())
-	}
-
-	#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
-	#[tokio::test]
-	async fn test_tcp_transport_with_gate_policy() -> TransportResult<()> {
-		/// First request: ResourceExhausted; second: Ok.
-		struct BusyFirstGate {
-			first: AtomicBool,
-		}
-
-		impl BusyFirstGate {
-			fn new() -> Self {
-				Self { first: AtomicBool::new(true) }
-			}
-		}
-
-		impl GatePolicy for BusyFirstGate {
-			fn evaluate(&self, _msg: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-				if self.first.swap(false, Ordering::SeqCst) {
-					TransitStatus::ResourceExhausted
-				} else {
-					TransitStatus::Ok
-				}
-			}
-		}
-
-		let message = create_v0_tightbeam(None, None);
-		let listener = NetTcpListener::bind("127.0.0.1:0")?;
-		let addr = listener.local_addr()?;
-		let (ready_tx, ready_rx) = mpsc::channel();
-
-		let server_handle = thread::spawn(move || -> TransportResult<()> {
-			let server = TcpListener::from_listener(listener);
-			let _ = ready_tx.send(());
-			let mut transport = server.accept()?.with_collector_gate(BusyFirstGate::new());
-
-			let rt = tokio::runtime::Runtime::new()?;
-			rt.block_on(respond_none(&mut transport)).ok();
-			rt.block_on(respond_none(&mut transport))?;
-			Ok(())
-		});
-
-		let _ = ready_rx.recv();
-
-		let stream = NetTcpStream::connect(addr)?;
-		let mut transport = TcpTransport::from(stream);
-
-		let result = transport.emit(message.clone(), None).await;
-		assert!(matches!(
-			result,
-			Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))
-		));
-
-		transport.emit(message.clone(), None).await?;
-
-		// A panicked server thread surfaces as an I/O error rather than a
-		// re-panic. The closure itself only fails through `?`.
-		server_handle
-			.join()
-			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;
 		Ok(())
 	}
 }

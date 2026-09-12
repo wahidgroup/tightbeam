@@ -187,7 +187,7 @@ async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame,
 	let mut client = ClientBuilder::<LaserListener>::builder()
 		.with_trust_store(Arc::clone(&certs.trust))
 		.build()
-		.connect(addr)
+		.connect(addr.to_owned())
 		.await?;
 
 	client.submit_work_to(beam_urn(), &inner).await

@@ -222,13 +222,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 		})
 	}
 
-	#[cfg(not(feature = "x509"))]
-	pub async fn accept(&self) -> Result<(TokioStream, SocketAddr), IoError> {
-		let (stream, peer_addr) = self.listener.accept().await?;
-		let tokio_stream = TokioStream::from(stream);
-		Ok((tokio_stream, peer_addr))
-	}
-
 	#[cfg(feature = "x509")]
 	pub async fn accept(&self) -> Result<(TcpTransport<TokioStream, P>, SocketAddr), IoError> {
 		let (stream, peer_addr) = self.listener.accept().await?;
@@ -925,13 +918,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioList
 			let (transport, peer_addr) = TokioListener::<P>::accept(self).await?;
 			Ok((transport, TightBeamSocketAddr(peer_addr)))
 		}
-
-		#[cfg(not(feature = "x509"))]
-		{
-			let (stream, peer_addr) = TokioListener::<P>::accept(self).await?;
-			let transport = Self::create_transport(stream);
-			Ok((transport, TightBeamSocketAddr(peer_addr)))
-		}
 	}
 }
 
@@ -952,9 +938,6 @@ where
 		} else {
 			self.limits.max_envelope()
 		};
-
-		#[cfg(not(feature = "x509"))]
-		let cap = self.limits.max_envelope();
 
 		#[cfg(feature = "tokio")]
 		{
@@ -981,18 +964,6 @@ where
 							None
 						}
 					}
-				}
-			};
-
-			#[cfg(not(feature = "x509"))]
-			let timeout_duration: Option<Duration> = {
-				#[cfg(feature = "transport-policy")]
-				{
-					Some(self.limits.operation_timeout)
-				}
-				#[cfg(not(feature = "transport-policy"))]
-				{
-					None
 				}
 			};
 
@@ -1123,7 +1094,7 @@ mod tests {
 	use crate::testing::*;
 	use crate::transport::handshake::{HandshakeError, HandshakeKeyManager, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
-	use crate::transport::state::{DialableEncryption, EncryptionConfig};
+	use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
 	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig, X509ClientConfig};
 
 	#[cfg(feature = "x509")]
@@ -1461,8 +1432,7 @@ mod tests {
 
 		let client_stream = TcpStream::connect(server_addr).await?;
 		let mut encryption = EncryptionConfig { trust_store: Some(trust_store), ..EncryptionConfig::default() };
-		encryption.client_certificate = Some(client_cert);
-		encryption.key_manager = Some(client_keys);
+		ClientIdentity::new(client_cert, client_keys).install(&mut encryption);
 		encryption.server_certificate_chain = Some(server_chain);
 		encryption.handshake_protocol = HandshakeProtocolKind::Cms;
 

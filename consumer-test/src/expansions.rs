@@ -28,7 +28,7 @@ pub enum DebugLevel {
 	Basic = 1,
 }
 
-flagset!(ConsumerFlags: Mode, DebugLevel);
+flagset!(pub ConsumerFlags: Mode, DebugLevel);
 
 /// `compose!` builds a frame through the whole `FrameBuilder` call sequence.
 pub fn compose_arm() -> tightbeam::error::Result<tightbeam::Frame> {

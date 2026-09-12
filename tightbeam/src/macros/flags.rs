@@ -50,11 +50,40 @@ macro_rules! flags {
 /// let mut flags = MyFlags::default();
 /// FlagSet::set(&mut flags, Unregistered::On);
 /// ```
+///
+/// # Visibility
+///
+/// The declaration opens with an optional visibility, and the generated
+/// `struct` carries it, so the caller decides where the flag set is reachable
+/// from. An omitted visibility keeps the type private to the declaring module.
+///
+/// ```
+/// use tightbeam::flags::FlagSet;
+///
+/// #[derive(Default, Clone, Copy)]
+/// pub enum Mode {
+///     #[default]
+///     Off,
+///     On,
+/// }
+///
+/// impl From<Mode> for u8 {
+///     fn from(flag: Mode) -> u8 {
+///         flag as u8
+///     }
+/// }
+///
+/// tightbeam::flagset!(pub(crate) CrateFlags: Mode);
+///
+/// let mut flags = CrateFlags::default();
+/// FlagSet::set(&mut flags, Mode::On);
+/// assert!(FlagSet::contains(&flags, Mode::On));
+/// ```
 #[macro_export]
 macro_rules! flagset {
-	($name:ident: $first:ty $(, $rest:ty)* $(,)?) => {
+	($vis:vis $name:ident: $first:ty $(, $rest:ty)* $(,)?) => {
 		#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-		pub struct $name {
+		$vis struct $name {
 			flags: $crate::flags::Flags<{ $crate::flagset!(@count $first $(, $rest)*) }>,
 		}
 

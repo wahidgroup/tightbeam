@@ -182,12 +182,12 @@ impl MutualAuthServer {
 	) -> Result<Self> {
 		use tightbeam::{compose, decode};
 
-		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::Sequence)]
+		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::der::Sequence)]
 		struct PingMessage {
 			data: String,
 		}
 
-		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::Sequence)]
+		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::der::Sequence)]
 		struct PongMessage {
 			echo: String,
 		}

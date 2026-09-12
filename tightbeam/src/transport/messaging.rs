@@ -25,18 +25,11 @@ use crate::transport::io::MessageIO;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 
-#[cfg(any(
-	not(feature = "x509"),
-	all(
-		feature = "transport-policy",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	)
+#[cfg(all(
+	feature = "transport-policy",
+	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 use crate::der::Encode;
-#[cfg(not(feature = "x509"))]
-use crate::transport::envelopes::RequestPackage;
-#[cfg(not(feature = "x509"))]
-use crate::transport::envelopes::ResponsePackage;
 #[cfg(all(
 	feature = "transport-policy",
 	any(feature = "transport-cms", feature = "transport-ecies")
@@ -251,53 +244,6 @@ pub trait MessageEmitter: MessageIO {
 	{
 		emit_with_retry(self, message, attempt)
 	}
-
-	/// Default implementation for non-x509 transports
-	#[cfg(not(feature = "x509"))]
-	fn perform_send_receive(
-		&mut self,
-		message: Frame,
-	) -> impl Future<Output = TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>> + MaybeSend {
-		async {
-			// Build the request around a shared Arc so the frame stays available
-			// for retry without pattern-matching the envelope back apart.
-			let frame_arc = Arc::new(message);
-			let message = Arc::clone(&frame_arc);
-			let envelope = TransportEnvelope::Request(RequestPackage { message });
-
-			// Send the envelope
-			self.write_envelope_bytes(&envelope.to_der()?).await?;
-
-			// Receive response
-			let response_bytes = self.read_envelope_bytes().await?;
-			let response_envelope = Self::decode_envelope(&response_bytes)?;
-
-			// Parse response
-			let (status, response) = match response_envelope {
-				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
-				TransportEnvelope::Request(_) => {
-					return Err(TransportError::InvalidMessage);
-				}
-				#[cfg(any(feature = "x509", feature = "transport-multiplex"))]
-				_ => {
-					return Err(TransportError::InvalidMessage);
-				}
-			};
-
-			// Return frame if rejected
-			let original = if status != TransitStatus::Ok {
-				Some(Arc::try_unwrap(frame_arc).unwrap_or_else(|arc| (*arc).clone()))
-			} else {
-				None
-			};
-
-			Ok((
-				status,
-				response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())),
-				original,
-			))
-		}
-	}
 }
 
 /// Default [`MessageEmitter::emit`] body as a free function so the returned
@@ -369,24 +315,6 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 			}
 		}
 	}
-}
-
-/// Write a single-flight response envelope, shared by both
-/// `MessageCollector` cfg twins. With `x509` the response wraps in a
-/// [`WireEnvelope`] for protocol compatibility.
-#[cfg(not(feature = "x509"))]
-async fn send_single_flight_response<T>(
-	transport: &mut T,
-	status: TransitStatus,
-	message: Option<Frame>,
-) -> TransportResult<()>
-where
-	T: MessageIO + MaybeSend + ?Sized,
-{
-	let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
-	let response_envelope = TransportEnvelope::from(response_pkg);
-	let response_bytes = T::encode_envelope(&response_envelope)?;
-	transport.write_envelope_bytes(&response_bytes).await
 }
 
 /// Everything a message collector must already be.
@@ -495,23 +423,6 @@ pub trait MessageCollector: CollectorRequirements {
 			let request = request_envelope.into_request_frame()?;
 			Ok(Some((request, TransitStatus::Ok)))
 		}
-	}
-
-	/// Send a response for one collected message.
-	///
-	/// Without `x509` a transport carries no session phase, so the response
-	/// travels in the clear. An `x509` build decides by phase, so it states
-	/// how it responds rather than inheriting this.
-	#[cfg(not(feature = "x509"))]
-	fn send_response(
-		&mut self,
-		status: TransitStatus,
-		message: Option<Frame>,
-	) -> impl Future<Output = TransportResult<()>> + MaybeSend
-	where
-		Self: MaybeSend,
-	{
-		send_single_flight_response(self, status, message)
 	}
 
 	/// Send a response for one collected message, in the wire mode the session

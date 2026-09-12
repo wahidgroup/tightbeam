@@ -365,6 +365,14 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 		(Arc::clone(&self.certificate), Arc::clone(&self.key))
 	}
 
+	/// Shared handle to the certificate this identity presents.
+	///
+	/// The half a caller takes when it needs the certificate alone, so it pays
+	/// one refcount rather than the two [`Self::parts`] charges for a pair.
+	pub fn certificate_arc(&self) -> Arc<Certificate> {
+		Arc::clone(&self.certificate)
+	}
+
 	/// The certificate this identity presents.
 	pub fn certificate(&self) -> &Certificate {
 		&self.certificate
@@ -379,8 +387,11 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 	}
 
 	/// Write this identity into `encryption`, so both halves land together.
+	///
+	/// The key also answers as this endpoint's own signing key, the role a
+	/// server's key manager fills, so both land in one write.
 	pub fn install(&self, encryption: &mut EncryptionConfig<C>) {
-		encryption.client_certificate = Some(Arc::clone(&self.certificate));
+		encryption.client_identity = Some(self.clone());
 		encryption.key_manager = Some(Arc::clone(&self.key));
 	}
 }
@@ -403,8 +414,9 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// Provisioned server chain, ordered root to leaf, required by the CMS
 	/// key-transport handshake before the server speaks.
 	pub(crate) server_certificate_chain: Option<Arc<[Certificate]>>,
-	/// Client certificate presented for mutual authentication.
-	pub(crate) client_certificate: Option<Arc<Certificate>>,
+	/// Client identity presented for mutual authentication: the certificate
+	/// and the key that proves it, bound as one value.
+	pub(crate) client_identity: Option<ClientIdentity<P>>,
 	/// Validators applied to a peer client certificate under mutual
 	/// authentication.
 	pub(crate) client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
@@ -446,7 +458,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			client_validators,
 			server_certificate,
 			server_certificate_chain: _,
-			client_certificate: _,
+			client_identity: _,
 			key_manager: _,
 			aad_domain_tag: _,
 			mux_offer: _,
@@ -472,7 +484,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 
 	/// Client certificate presented for mutual authentication.
 	pub fn client_certificate(&self) -> Option<&Certificate> {
-		self.client_certificate.as_deref()
+		self.client_identity.as_ref().map(ClientIdentity::certificate)
 	}
 
 	/// Handshake protocol used once encryption is provisioned.
@@ -495,7 +507,7 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			trust_store,
 			client_validators,
 			server_certificate_chain: _,
-			client_certificate: _,
+			client_identity: _,
 			key_manager: _,
 			aad_domain_tag: _,
 			mux_offer: _,
@@ -511,22 +523,22 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 
 	/// Whether this endpoint carries a client identity.
 	pub fn has_client_identity(&self) -> bool {
-		self.client_certificate.is_some()
+		self.client_identity.is_some()
 	}
 
 	/// Whether any encryption material is installed at all.
 	///
-	/// Broader than [`Self::is_provisioned`]: a client identity alone starts no
-	/// handshake, yet it means this endpoint was configured for a secured link,
-	/// so handing it a cleartext path is a configuration error.
+	/// Broader than [`Self::is_provisioned`]: a client identity alone starts
+	/// no handshake, yet it means this endpoint was configured for a secured
+	/// link, so handing it a cleartext path is a configuration error.
 	pub fn has_encryption_material(&self) -> bool {
 		self.is_provisioned() || self.has_client_identity() || self.key_manager.is_some()
 	}
 
 	/// Whether this endpoint may dial a peer it cannot authenticate.
 	///
-	/// A dialer picks the address, so it decides who it is willing to reach. An
-	/// endpoint that can establish nothing about its peer reaches whoever
+	/// A dialer picks the address, so it decides who it is willing to reach.
+	/// An endpoint that can establish nothing about its peer reaches whoever
 	/// answered (CWE-295), and naming cleartext is the only way to accept that.
 	///
 	/// The companion rule is [`Self::check_cleartext_write`], which every
@@ -547,8 +559,8 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 
 	/// Whether this endpoint may put a cleartext frame on the wire.
 	///
-	/// An endpoint carrying a client identity would hand that identity, and its
-	/// traffic, to a peer it has not authenticated (CWE-295). An endpoint
+	/// An endpoint carrying a client identity would hand that identity, and
+	/// its traffic, to a peer it has not authenticated (CWE-295). An endpoint
 	/// carrying no identity reveals nothing about itself, so plain cleartext
 	/// stays available to a deployment that wants it.
 	///
@@ -572,7 +584,7 @@ impl<P: CryptoProvider> Default for EncryptionConfig<P> {
 			trust_store: None,
 			server_certificate: None,
 			server_certificate_chain: None,
-			client_certificate: None,
+			client_identity: None,
 			client_validators: None,
 			key_manager: None,
 			aad_domain_tag: None,
@@ -866,7 +878,7 @@ mod tests {
 	#[test]
 	fn a_named_cleartext_client_with_an_identity_reaches_the_wire() {
 		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			client_certificate: Some(Arc::new(fixture_certificate())),
+			client_identity: Some(fixture_client_identity()),
 			allow_cleartext: true,
 			..EncryptionConfig::default()
 		};
@@ -894,10 +906,10 @@ mod tests {
 	fn installing_a_session_lands_every_term_it_agreed() {
 		let mut probe = PhaseProbe::provisioned(handshaking());
 		assert!(probe.session_state_mut().install_session(established_session()));
+
 		let SessionPhase::Encrypted(session) = probe.session_state().phase() else {
 			panic!("installing a session must leave the phase encrypted");
 		};
-
 		assert!(session.peer().is_some());
 		assert!(probe.session_state().peer_certificate().is_some());
 	}
@@ -944,6 +956,15 @@ mod tests {
 		create_test_certificate(&create_test_signing_key())
 	}
 
+	/// Client identity over the fixture certificate and the key that signed it.
+	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	fn fixture_client_identity() -> ClientIdentity<DefaultCryptoProvider> {
+		let signing_key = create_test_signing_key();
+		let certificate = Arc::new(create_test_certificate(&signing_key));
+		let key = Arc::new(HandshakeKeyManager::from(signing_key));
+		ClientIdentity::new(certificate, key)
+	}
+
 	/// A client identity proves who this endpoint is and says nothing about the
 	/// peer, so a cleartext write carrying one is refused wherever the
 	/// transport was built (CWE-295).
@@ -951,7 +972,7 @@ mod tests {
 	#[test]
 	fn a_client_identity_without_peer_authentication_refuses_to_write() {
 		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			client_certificate: Some(Arc::new(fixture_certificate())),
+			client_identity: Some(fixture_client_identity()),
 			..EncryptionConfig::default()
 		};
 		assert!(matches!(
@@ -966,7 +987,7 @@ mod tests {
 	#[test]
 	fn naming_cleartext_admits_a_client_identity() {
 		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			client_certificate: Some(Arc::new(fixture_certificate())),
+			client_identity: Some(fixture_client_identity()),
 			allow_cleartext: true,
 			..EncryptionConfig::default()
 		};
@@ -978,7 +999,7 @@ mod tests {
 	#[test]
 	fn a_trust_store_admits_a_client_identity() {
 		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			client_certificate: Some(Arc::new(fixture_certificate())),
+			client_identity: Some(fixture_client_identity()),
 			client_validators: Some(Arc::new(Vec::new())),
 			..EncryptionConfig::default()
 		};

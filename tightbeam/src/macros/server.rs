@@ -33,35 +33,61 @@ use crate::transport::serve::{serve_mux, CallContext, MuxService};
 #[cfg(feature = "tokio")]
 use self::server_runtime::rt::{ErrorSender, OkSender};
 
+#[doc(hidden)]
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Option<Frame>, crate::TightBeamError>> + Send>>;
+
 /// Connection-scoped handler: every invocation carries the session's
 /// authenticated peer context alongside the frame.
-pub type SharedHandler = Arc<dyn Fn(Frame, SessionContext) -> HandlerFuture + Send + Sync>;
+///
+/// The wrapped closure arrives through [`SharedHandler::from`] or
+/// [`SharedHandler::from_context_blind`], so every value of this type
+/// carries a closure one of those two conversions accepted.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SharedHandler(Arc<dyn Fn(Frame, SessionContext) -> HandlerFuture + Send + Sync>);
 
-/// Adapt a context-blind handler: the session context is dropped.
-pub fn into_shared_handler<F, Fut>(handler: F) -> SharedHandler
-where
-	F: Fn(Frame) -> Fut + Send + Sync + Clone + 'static,
-	Fut: Future<Output = Result<Option<Frame>, crate::TightBeamError>> + Send + 'static,
-{
-	let handler = Arc::new(handler);
-	Arc::new(move |frame: Frame, _session: SessionContext| -> HandlerFuture {
-		let handler = Arc::clone(&handler);
-		Box::pin(async move { handler(frame).await })
-	})
+impl SharedHandler {
+	/// Wrap a context-blind handler (`handle: move |frame| ...`), which the
+	/// shared handler invokes with the frame alone.
+	///
+	/// The session-aware shape reaches the same type through
+	/// [`SharedHandler::from`]. Rust resolves one blanket `From<F>` impl per
+	/// target type, so the second closure shape takes a named conversion.
+	pub fn from_context_blind<F, Fut>(handler: F) -> Self
+	where
+		F: Fn(Frame) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<Option<Frame>, crate::TightBeamError>> + Send + 'static,
+	{
+		let handler = Arc::new(handler);
+		let shared = move |frame: Frame, _session: SessionContext| -> HandlerFuture {
+			let handler = Arc::clone(&handler);
+			Box::pin(async move { handler(frame).await })
+		};
+
+		Self(Arc::new(shared))
+	}
+
+	/// Serve one frame on one session.
+	pub fn call(&self, frame: Frame, session: SessionContext) -> HandlerFuture {
+		(self.0)(frame, session)
+	}
 }
 
-/// Share a session-aware handler (`handle: move |frame, session| ...`).
-pub fn into_shared_session_handler<F, Fut>(handler: F) -> SharedHandler
+/// Wrap a session-aware handler (`handle: move |frame, session| ...`).
+impl<F, Fut> From<F> for SharedHandler
 where
-	F: Fn(Frame, SessionContext) -> Fut + Send + Sync + Clone + 'static,
+	F: Fn(Frame, SessionContext) -> Fut + Send + Sync + 'static,
 	Fut: Future<Output = Result<Option<Frame>, crate::TightBeamError>> + Send + 'static,
 {
-	let handler = Arc::new(handler);
-	Arc::new(move |frame: Frame, session: SessionContext| -> HandlerFuture {
-		let handler = Arc::clone(&handler);
-		Box::pin(async move { handler(frame, session).await })
-	})
+	fn from(handler: F) -> Self {
+		let handler = Arc::new(handler);
+		let shared = move |frame: Frame, session: SessionContext| -> HandlerFuture {
+			let handler = Arc::clone(&handler);
+			Box::pin(async move { handler(frame, session).await })
+		};
+
+		Self(Arc::new(shared))
+	}
 }
 
 /// Everything one accepted async server connection must already be:
@@ -69,22 +95,18 @@ where
 /// the takeover, and handshake state for session capture. Satisfied
 /// blanket-wise, so a caller reaches it through the supertraits.
 #[cfg(pooled_mux)]
+#[doc(hidden)]
 pub trait AcceptedConnection: MessageCollector + MuxAcceptor + EncryptedProtocolState + Send {}
 
 #[cfg(pooled_mux)]
 impl<T: MessageCollector + MuxAcceptor + EncryptedProtocolState + Send> AcceptedConnection for T {}
 
 #[cfg(all(feature = "tokio", not(pooled_mux), feature = "x509"))]
+#[doc(hidden)]
 pub trait AcceptedConnection: MessageCollector + EncryptedProtocolState + Send {}
 
 #[cfg(all(feature = "tokio", not(pooled_mux), feature = "x509"))]
 impl<T: MessageCollector + EncryptedProtocolState + Send> AcceptedConnection for T {}
-
-#[cfg(all(feature = "tokio", not(feature = "x509")))]
-pub trait AcceptedConnection: MessageCollector + Send {}
-
-#[cfg(all(feature = "tokio", not(feature = "x509")))]
-impl<T: MessageCollector + Send> AcceptedConnection for T {}
 
 /// [`SharedHandler`] as a unary-only service: the closure grammar of
 /// `server!` serves unary interactions, streaming kinds answer
@@ -99,7 +121,7 @@ impl MuxService for SharedHandlerService {
 		frame: Frame,
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
-		(self.0)(frame, cx.into_session())
+		self.0.call(frame, cx.into_session())
 	}
 }
 
@@ -183,6 +205,7 @@ impl<S: MuxService> MuxService for ReportedService<S> {
 /// Generic over the accepted transport ([`AcceptedConnection`]), so
 /// every protocol's connections serve identically.
 #[cfg(pooled_mux)]
+#[doc(hidden)]
 pub async fn serve_connection_service<T, S>(
 	mut transport: T,
 	service: Arc<S>,
@@ -232,6 +255,7 @@ pub async fn serve_connection_service<T, S>(
 /// [`serve_connection_service`] over the unary-only adapter when the
 /// mux plane is compiled in, the single-flight loop alone otherwise.
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 pub async fn serve_connection<T>(
 	transport: T,
 	handler: SharedHandler,
@@ -248,7 +272,7 @@ pub async fn serve_connection<T>(
 
 	#[cfg(not(pooled_mux))]
 	{
-		let respond = move |frame: Frame, session: SessionContext| handler(frame, session);
+		let respond = move |frame: Frame, session: SessionContext| handler.call(frame, session);
 		serve_single_flight(transport, respond, error_tx, ok_tx).await;
 	}
 }
@@ -293,6 +317,7 @@ async fn serve_single_flight<T, F, Fut>(
 					if let Some(tx) = error_tx.as_mut() {
 						let _ = tx.send(err.into()).await;
 					}
+
 					(TransitStatus::Internal, None)
 				}
 			}
@@ -321,13 +346,8 @@ fn capture_session<T: EncryptedProtocolState>(transport: &T) -> SessionContext {
 	SessionContext::capture(transport)
 }
 
-/// A cleartext build carries no peer identity: empty context.
-#[cfg(all(feature = "tokio", not(feature = "x509")))]
-fn capture_session<T>(_transport: &T) -> SessionContext {
-	SessionContext::default()
-}
-
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_handle {
 	($protocol:path, $listener:expr, $handler:expr) => {{
@@ -354,6 +374,7 @@ macro_rules! __tightbeam_server_protocol_handle {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_handle {
 	($protocol:path, $listener:expr, $handler:expr) => {{
@@ -365,6 +386,7 @@ macro_rules! __tightbeam_server_protocol_handle {
 }
 
 #[cfg(not(any(feature = "tokio", feature = "std")))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_handle {
 	($protocol:path, $listener:expr, $handler:expr) => {
@@ -373,6 +395,7 @@ macro_rules! __tightbeam_server_protocol_handle {
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_handle {
 	($protocol:path, $addr:expr, $handler:expr) => {{
@@ -387,6 +410,7 @@ macro_rules! __tightbeam_server_protocol_bind_handle {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_handle {
 	($protocol:path, $addr:expr, $handler:expr) => {{
@@ -399,6 +423,7 @@ macro_rules! __tightbeam_server_protocol_bind_handle {
 }
 
 #[cfg(not(any(feature = "tokio", feature = "std")))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_handle {
 	($protocol:path, $addr:expr, $handler:expr) => {
@@ -409,6 +434,7 @@ macro_rules! __tightbeam_server_protocol_bind_handle {
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
@@ -422,6 +448,7 @@ macro_rules! __tightbeam_server_protocol_policies_handle {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
@@ -433,6 +460,7 @@ macro_rules! __tightbeam_server_protocol_policies_handle {
 }
 
 #[cfg(not(any(feature = "tokio", feature = "std")))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
@@ -443,6 +471,7 @@ macro_rules! __tightbeam_server_protocol_policies_handle {
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_session_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
@@ -456,6 +485,7 @@ macro_rules! __tightbeam_server_protocol_policies_session_handle {
 }
 
 #[cfg(not(feature = "tokio"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_session_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
@@ -464,6 +494,7 @@ macro_rules! __tightbeam_server_protocol_policies_session_handle {
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
@@ -481,6 +512,7 @@ macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
@@ -489,6 +521,7 @@ macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
 }
 
 #[cfg(not(any(feature = "tokio", feature = "std")))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
@@ -499,6 +532,7 @@ macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_channels_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, $handler:expr) => {{
@@ -512,6 +546,7 @@ macro_rules! __tightbeam_server_protocol_channels_handle {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_channels_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, $handler:expr) => {{
@@ -524,6 +559,7 @@ macro_rules! __tightbeam_server_protocol_channels_handle {
 }
 
 #[cfg(not(any(feature = "tokio", feature = "std")))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_channels_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, $handler:expr) => {
@@ -535,6 +571,7 @@ macro_rules! __tightbeam_server_protocol_channels_handle {
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
@@ -548,6 +585,7 @@ macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
@@ -560,6 +598,7 @@ macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 }
 
 #[cfg(not(any(feature = "tokio", feature = "std")))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
@@ -571,6 +610,7 @@ macro_rules! __tightbeam_server_protocol_channels_policies_handle {
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
@@ -585,6 +625,7 @@ macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
@@ -597,6 +638,7 @@ macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 }
 
 #[cfg(not(any(feature = "tokio", feature = "std")))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
@@ -633,6 +675,7 @@ macro_rules! __tightbeam_server_protocol_service_handle {
 ///
 /// Re-exports unified runtime and adds server-specific channel helpers.
 #[cfg(any(feature = "tokio", feature = "std"))]
+#[doc(hidden)]
 pub mod server_runtime {
 	/// Runtime primitives (re-exported from unified runtime)
 	pub mod rt {
@@ -707,7 +750,7 @@ macro_rules! server {
 							__transport = $crate::server!(@apply_one_policy __transport, $policy_name, $policy_expr);
 						)*
 					)*
-					let __handler_clone = ::std::sync::Arc::clone(&$handler);
+					let __handler_clone = ::core::clone::Clone::clone(&$handler);
 					#[allow(unused_imports)]
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(move || {
@@ -731,7 +774,7 @@ macro_rules! server {
 								let __session = ::core::clone::Clone::clone(
 									__session_slot.get_or_insert_with(|| $crate::policy::SessionContext::capture(&__transport)),
 								);
-								match $crate::macros::server::server_runtime::rt::block_on((__handler_clone)(frame_owned, __session)) {
+								match $crate::macros::server::server_runtime::rt::block_on(__handler_clone.call(frame_owned, __session)) {
 									Ok(opt) => (status, opt),
 									// A handler failure answers a distinct
 									// status so the peer can tell it apart
@@ -775,7 +818,7 @@ macro_rules! server {
 						__transport = $crate::server!(@apply_one_policy __transport, $policy_name, $policy_expr);
 					)*
 				)*
-				let __service_clone = ::std::sync::Arc::clone(&$handler);
+				let __service_clone = ::core::clone::Clone::clone(&$handler);
 				let __error_channel = $error_tx.clone();
 				let __ok_channel = $ok_tx.clone();
 				async move {
@@ -799,7 +842,7 @@ macro_rules! server {
 
 	(@sync_loop $protocol:path, $listener:expr, $handler:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		let mut __listener = $listener;
-		let __handler = $crate::macros::server::into_shared_handler($handler);
+		let __handler = $crate::macros::server::SharedHandler::from_context_blind($handler);
 
 		$crate::server!(@sync_loop_body $protocol, __listener, __handler, $($policy_name: [ $( $policy_expr ),* ]),*);
 	}};
@@ -822,7 +865,7 @@ macro_rules! server {
 
 	(@async_loop $protocol:path, $listener:expr, $handler:expr, $error_tx:expr, $ok_tx:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		let mut __listener = $listener;
-		let __handler = $crate::macros::server::into_shared_handler($handler);
+		let __handler = $crate::macros::server::SharedHandler::from_context_blind($handler);
 		let mut __error_tx = $error_tx;
 		let mut __ok_tx = $ok_tx;
 
@@ -831,7 +874,7 @@ macro_rules! server {
 
 	(@async_session_loop $protocol:path, $listener:expr, $handler:expr, $error_tx:expr, $ok_tx:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		let mut __listener = $listener;
-		let __handler = $crate::macros::server::into_shared_session_handler($handler);
+		let __handler = $crate::macros::server::SharedHandler::from($handler);
 		let mut __error_tx = $error_tx;
 		let mut __ok_tx = $ok_tx;
 

@@ -81,6 +81,7 @@ pub enum TransportFailure {
 
 /// Transport error types
 #[derive(Debug, Errorizable)]
+#[non_exhaustive]
 pub enum TransportError {
 	#[error("Connection closed gracefully")]
 	ConnectionClosed,

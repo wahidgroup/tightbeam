@@ -32,7 +32,7 @@ impl tightbeam::Message for TestMessage {
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: tb::Version = tb::Version::V0;
+	const MIN_VERSION: asn1::Version = asn1::Version::V0;
 }
 
 #[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
@@ -87,14 +87,14 @@ fn build_v3_frame(message: &TestMessage) -> Result<tightbeam::Frame, TightBeamEr
 	let signing_key = Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
 	let previous_hash = tightbeam::utils::digest::<Sha3_256>(message)?;
 
-	FrameBuilder::from(tb::Version::V3)
+	FrameBuilder::from(asn1::Version::V3)
 		.with_id("frame-der")
 		.with_order(1_696_521_700)
 		.with_message(message.to_owned())
 		.with_message_hasher::<Sha3_256>([])
 		.with_aead::<Aes256GcmOid, _>(cipher)
 		.with_signer::<Secp256k1Signature, _>(signing_key)
-		.with_priority(tb::MessagePriority::Expedited)
+		.with_priority(asn1::MessagePriority::Expedited)
 		.with_lifetime(3_600)
 		.with_previous_hash(previous_hash)
 		.with_matrix(tightbeam::flags![
@@ -114,7 +114,7 @@ tb_assert_spec! {
 			(DER_NONEMPTY, exactly!(1), equals!(true)),
 			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
 			(MATRIX_PRESENT, exactly!(1), equals!(true)),
-			(VERSION, exactly!(1), equals!(tb::Version::V3))
+			(VERSION, exactly!(1), equals!(asn1::Version::V3))
 		]
 	}
 }

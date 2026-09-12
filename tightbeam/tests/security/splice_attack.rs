@@ -37,20 +37,15 @@ use tightbeam::{
 		aead::Aes256Gcm,
 		ecies::{encrypt, Secp256k1EciesMessage},
 		kdf::HkdfSha3_256,
-		key::{Secp256k1KeyProvider, SigningKeyProvider},
 		profiles::DefaultCryptoProvider,
 		secret::ToInsecure,
-		sign::ecdsa::Secp256k1SigningKey,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
 	der::{Decode, Encode, Sequence},
 	exactly, job,
 	random::OsRng,
 	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{
-		utils::{create_test_certificate, create_test_signing_key},
-		ScenarioConfig, SetupEnv,
-	},
+	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{
 		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
@@ -59,7 +54,9 @@ use tightbeam::{
 	TightBeamError,
 };
 
-use crate::common::security::{default_security_profile, expectation_failure, pinning_validator, ServerMaterials};
+use crate::common::security::{
+	default_security_profile, expectation_failure, pinning_validator, ClientMaterials, ServerMaterials,
+};
 
 pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> = Urn::new("test", "event:splice-attack/spliced-kex-rejected");
 
@@ -117,16 +114,14 @@ job! {
 		let profile = default_security_profile();
 
 		// Victim client with an authenticated identity.
-		let client_signing = create_test_signing_key();
-		let client_cert = Arc::new(create_test_certificate(&client_signing));
-		let signing_key = Secp256k1SigningKey::from(client_signing);
-		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let client_materials = ClientMaterials::deterministic();
+		let client_identity = client_materials.identity();
 		let validator = pinning_validator(&materials.certificate);
 
 		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
 			.with_security_offer(SecurityOffer::new(vec![profile]))
 			.with_certificate_validator(validator)
-			.with_client_identity(Arc::clone(&client_cert), client_provider);
+			.with_client_identity(client_identity);
 
 		// Server requires client authentication (validators present).
 		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);

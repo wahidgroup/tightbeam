@@ -109,6 +109,8 @@
 )]
 #![cfg_attr(test, allow(clippy::clone_on_ref_ptr))]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc = include_str!("features.md")]
 
 #[cfg(not(feature = "std"))]
 #[macro_use]
@@ -162,38 +164,42 @@ pub mod standards;
 pub mod trace;
 #[cfg(feature = "transport")]
 pub mod transport;
-#[cfg(feature = "rayon")]
-pub use rayon;
 #[cfg(feature = "zeroize")]
 pub use zeroize;
 
 // Re-export
-pub use asn1::*;
+pub use asn1::{
+	AlgorithmIdentifier, Asn1Matrix, CompressedData, DigestInfo, EncryptedContentInfo, Frame, MessagePriority,
+	Metadata, ObjectIdentifier, SignerInfo, Version,
+};
 pub use cms;
 pub use der;
-pub use paste;
-pub use pkcs12;
 pub use spki;
 pub use utils::{decode, encode};
+
+#[doc(hidden)]
+pub use paste;
 
 pub use tightbeam_derive::Errorizable;
 
 #[cfg(feature = "hex")]
 pub use hex_literal::hex;
-#[cfg(all(feature = "std", not(feature = "tokio")))]
-pub use std::sync::mpsc;
 #[cfg(feature = "derive")]
 pub use tightbeam_derive::{Beamable, Flaggable};
 #[cfg(feature = "time")]
 pub use time;
-#[cfg(feature = "tokio")]
-pub use tokio::sync::mpsc;
 #[cfg(feature = "x509")]
 pub use x509_cert as x509;
 
+/// Multi-producer, single-consumer channel endpoints for the compiled runtime.
+#[cfg(feature = "std")]
+pub mod mpsc {
+	pub use crate::runtime::rt::{channel, Receiver, Sender};
+}
+
 extern crate self as tightbeam;
 
-pub use crate::core::*;
+pub use crate::core::Message;
 pub use crate::error::TightBeamError;
 
 #[cfg(any(test, feature = "testing"))]

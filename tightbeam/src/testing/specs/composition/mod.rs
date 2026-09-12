@@ -151,7 +151,6 @@ pub enum CompositionError {
 
 	/// Process construction failed
 	#[error("Process construction failed: {0}")]
-	#[source]
 	#[from]
 	ProcessConstructionFailed(ProcessBuildError),
 }

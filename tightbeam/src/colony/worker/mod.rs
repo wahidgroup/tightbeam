@@ -64,7 +64,6 @@ pub enum WorkerRelayError {
 	#[cfg_attr(feature = "derive", error("Worker response channel dropped"))]
 	ResponseDropped,
 	#[cfg_attr(feature = "derive", error("Message rejected with status {:?}"))]
-	#[cfg_attr(feature = "derive", from)]
 	Rejected(TransitStatus),
 }
 

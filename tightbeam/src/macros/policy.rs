@@ -1,9 +1,48 @@
+/// Declare one or more policy types, each with the body that evaluates it.
+///
+/// A declaration names the policy trait, an optional visibility, the type
+/// name, the configuration the trait takes, and the evaluation body. The
+/// generated type is a unit struct that derives [`Default`], so a caller names
+/// it wherever a policy value is expected.
+///
+/// | Declaration form | Traits the expansion implements |
+/// | --- | --- |
+/// | `GatePolicy: $vis $Name` followed by `\|frame, session\|`, `\|frame\|`, or no closure | [`crate::policy::GatePolicy`] |
+/// | `ReceptorPolicy<$msg>: $vis $Name` followed by `\|message\|` or no closure | [`crate::policy::ReceptorPolicy`] over `$msg` |
+/// | `RestartPolicy: $vis $Name ($max, $delay)` followed by `\|frame, failure, attempt\|` | [`crate::transport::policy::CoreRetryPolicy`] and [`crate::transport::policy::RestartPolicy`] |
+///
+/// # Restart configuration
+///
+/// `$max` becomes `max_attempts` and `$delay` the per-attempt step of
+/// `delay_ms`, both of which belong to [`crate::transport::policy::CoreRetryPolicy`].
+/// A `RestartPolicy` arm MAY write `($max)` alone for a zero delay, or omit
+/// the pair for one attempt and no delay.
+///
+/// # Visibility
+///
+/// The optional visibility sits between the trait name and the type name, and
+/// the generated `struct` carries it, so the caller decides where the policy
+/// type is reachable from. An omitted visibility keeps the type private to the
+/// declaring module.
+///
+/// ```
+/// use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
+///
+/// tightbeam::policy! {
+///     GatePolicy: pub OpenGate {
+///         TransitStatus::Ok
+///     }
+/// }
+///
+/// let verdict = OpenGate.evaluate(None, &SessionContext::default());
+/// assert_eq!(verdict, TransitStatus::Ok);
+/// ```
 #[macro_export]
 macro_rules! policy {
 	() => {};
-	(GatePolicy: $name:ident | $frame:ident, $session:ident | { $($body:tt)* } $($rest:tt)*) => {
+	(GatePolicy: $vis:vis $name:ident | $frame:ident, $session:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
-		pub struct $name;
+		$vis struct $name;
 
 		impl $crate::policy::GatePolicy for $name {
 			#[allow(unused_variables)]
@@ -18,9 +57,9 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
-	(GatePolicy: $name:ident | $arg:ident | { $($body:tt)* } $($rest:tt)*) => {
+	(GatePolicy: $vis:vis $name:ident | $arg:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
-		pub struct $name;
+		$vis struct $name;
 
 		impl $crate::policy::GatePolicy for $name {
 			#[allow(unused_variables)]
@@ -35,9 +74,9 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
-	(GatePolicy: $name:ident { $($body:tt)* } $($rest:tt)*) => {
+	(GatePolicy: $vis:vis $name:ident { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
-		pub struct $name;
+		$vis struct $name;
 
 		impl $crate::policy::GatePolicy for $name {
 			#[allow(unused_variables)]
@@ -52,9 +91,9 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
-	(ReceptorPolicy<$msg:ty>: $name:ident | $arg:ident | { $($body:tt)* } $($rest:tt)*) => {
+	(ReceptorPolicy<$msg:ty>: $vis:vis $name:ident | $arg:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
-		pub struct $name;
+		$vis struct $name;
 
 		impl $crate::policy::ReceptorPolicy<$msg> for $name {
 			#[allow(unused_variables)]
@@ -65,9 +104,9 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
-	(ReceptorPolicy<$msg:ty>: $name:ident { $($body:tt)* } $($rest:tt)*) => {
+	(ReceptorPolicy<$msg:ty>: $vis:vis $name:ident { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
-		pub struct $name;
+		$vis struct $name;
 
 		impl $crate::policy::ReceptorPolicy<$msg> for $name {
 			#[allow(unused_variables)]
@@ -79,9 +118,9 @@ macro_rules! policy {
 		$crate::policy! { $($rest)* }
 	};
 	// RestartPolicy with config: (max_attempts, delay_ms)
-	(RestartPolicy: $name:ident ($max:expr, $delay:expr) | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
+	(RestartPolicy: $vis:vis $name:ident ($max:expr, $delay:expr) | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
-		pub struct $name;
+		$vis struct $name;
 
 		impl $crate::transport::policy::CoreRetryPolicy for $name {
 			fn max_attempts(&self) -> usize { $max }
@@ -103,13 +142,13 @@ macro_rules! policy {
 		$crate::policy! { $($rest)* }
 	};
 	// RestartPolicy with max_attempts only: (max_attempts)
-	(RestartPolicy: $name:ident ($max:expr) | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
-		$crate::policy! { RestartPolicy: $name ($max, 0) | $frame_arg, $failure_arg, $attempt_arg | { $($body)* } $($rest)* }
+	(RestartPolicy: $vis:vis $name:ident ($max:expr) | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
+		$crate::policy! { RestartPolicy: $vis $name ($max, 0) | $frame_arg, $failure_arg, $attempt_arg | { $($body)* } $($rest)* }
 	};
 	// RestartPolicy default: max_attempts = 1, delay = 0
-	(RestartPolicy: $name:ident | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
+	(RestartPolicy: $vis:vis $name:ident | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
-		pub struct $name;
+		$vis struct $name;
 
 		impl $crate::transport::policy::CoreRetryPolicy for $name {
 			fn max_attempts(&self) -> usize { 1 }
@@ -169,6 +208,12 @@ mod tests {
 		GatePolicy: TestGateImplicitArg {
 			TransitStatus::Ok
 		}
+		GatePolicy: pub(crate) TestGateCrateVisible {
+			TransitStatus::Ok
+		}
+		GatePolicy: pub TestGatePublic {
+			TransitStatus::Ok
+		}
 		ReceptorPolicy<DummyMessage>: TestReceptorReject |message| {
 			if message.value == 0 {
 				TransitStatus::PermissionDenied
@@ -182,7 +227,7 @@ mod tests {
 		RestartPolicy: TestRestart |frame, _failure, _attempt| {
 			RetryAction::Retry { frame, delay: core::time::Duration::ZERO }
 		}
-		RestartPolicy: TestRestartMaxOnly (2) |frame, _failure, _attempt| {
+		RestartPolicy: pub(crate) TestRestartMaxOnly (2) |frame, _failure, _attempt| {
 			RetryAction::Retry { frame, delay: core::time::Duration::ZERO }
 		}
 		RestartPolicy: TestRestartConfigured (3, 250) |frame, _failure, _attempt| {
@@ -237,6 +282,10 @@ mod tests {
 			TransitStatus::Ok
 		);
 		assert_eq!(TestReceptorImplicitArg.evaluate(&DummyMessage { value: 42 }), TransitStatus::Ok);
+
+		let session = SessionContext::default();
+		assert_eq!(TestGateCrateVisible.evaluate(None, &session), TransitStatus::Ok);
+		assert_eq!(TestGatePublic.evaluate(None, &session), TransitStatus::Ok);
 
 		Ok(())
 	}

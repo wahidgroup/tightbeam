@@ -16,7 +16,6 @@ use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{KeyInit, SessionKeys};
 use crate::crypto::ecies::EciesEphemeral;
 use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
-use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -43,6 +42,7 @@ use crate::transport::handshake::{
 };
 use crate::transport::handshake::{DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization};
 use crate::transport::handshake::{EstablishedSession, HandshakeMessage};
+use crate::transport::state::ClientIdentity;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
@@ -71,8 +71,7 @@ where
 	mux_settings: Option<MuxSettings>,
 	selected_profile: Option<SecurityProfileDesc>,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
-	client_certificate: Option<Arc<Certificate>>,
-	client_key_provider: Option<Arc<dyn SigningKeyProvider>>,
+	identity: Option<ClientIdentity<P>>,
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	stored_receipt: Option<StoredReceipt>,
 	epoch_materials: Option<EpochMaterials>,
@@ -119,8 +118,7 @@ where
 			mux_settings: None,
 			selected_profile: None,
 			certificate_validator: None,
-			client_certificate: None,
-			client_key_provider: None,
+			identity: None,
 			receipt_approver: None,
 			stored_receipt: None,
 			epoch_materials: None,
@@ -134,13 +132,8 @@ where
 	///
 	/// # Parameters
 	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption
-	/// - `client_certificate`: Optional client certificate for mutual auth
-	/// - `client_key_provider`: Optional client key provider for mutual auth
-	pub fn new_with_identity(
-		aad_domain_tag: Option<&'static [u8]>,
-		client_certificate: Option<Arc<Certificate>>,
-		client_key_provider: Option<Arc<dyn SigningKeyProvider>>,
-	) -> Self {
+	/// - `identity`: Client identity presented for mutual authentication
+	pub fn new_with_identity(aad_domain_tag: Option<&'static [u8]>, identity: Option<ClientIdentity<P>>) -> Self {
 		Self {
 			state: ClientStateMachine::<Ecies>::default(),
 			client_random: None,
@@ -154,8 +147,7 @@ where
 			mux_settings: None,
 			selected_profile: None,
 			certificate_validator: None,
-			client_certificate,
-			client_key_provider,
+			identity,
 			receipt_approver: None,
 			stored_receipt: None,
 			epoch_materials: None,
@@ -175,16 +167,10 @@ where
 	/// Set client identity for mutual authentication.
 	///
 	/// # Parameters
-	/// - `certificate`: The client's X.509 certificate
-	/// - `key_provider`: The client's key provider
+	/// - `identity`: The client's certificate and the key that proves it
 	#[must_use]
-	pub fn with_client_identity(
-		mut self,
-		certificate: Arc<Certificate>,
-		key_provider: Arc<dyn SigningKeyProvider>,
-	) -> Self {
-		self.client_certificate = Some(certificate);
-		self.client_key_provider = Some(key_provider);
+	pub fn with_client_identity(mut self, identity: ClientIdentity<P>) -> Self {
+		self.identity = Some(identity);
 		self
 	}
 
@@ -507,23 +493,18 @@ where
 			&verifying_key,
 		)?;
 
-		// Countersigning demands a full client identity (certificate for
-		// the server's verification plus signing key): budgets without
-		// mutual authentication fail closed. Checked before approval:
-		// approving can spend an irreversible settlement answer, so every
-		// local precondition must already hold.
-		if self.client_certificate.is_none() {
-			return Err(HandshakeError::MutualAuthRequired);
-		}
-
-		let key_provider: &Arc<dyn SigningKeyProvider> =
-			self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+		// Countersigning demands a client identity, so a budget-bearing
+		// session without mutual authentication fails closed. Checked
+		// before approval: approving can spend an irreversible settlement
+		// answer, so every local precondition must already hold.
+		let identity = self.identity.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+		let key_provider = identity.signing_provider();
 
 		// Approve the receipt and answer its challenge (fail-closed
 		// without an approver).
 		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), &receipt).await?;
 		let answer = response.as_ref().map(OctetString::as_bytes);
-		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider.as_ref()).await?;
+		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider).await?;
 
 		Ok(Some((artifact, countersignature)))
 	}
@@ -540,21 +521,16 @@ where
 		encrypted_data: &[u8],
 	) -> Result<(Option<Certificate>, Option<OctetString>), HandshakeError> {
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
-
-		let cert = match (&self.client_certificate, server_handshake.client_cert_required) {
-			(Some(cert), _) => cert,
+		let identity = match (&self.identity, server_handshake.client_cert_required) {
+			(Some(identity), _) => identity,
 			(None, true) => return Err(HandshakeError::MutualAuthRequired),
 			(None, false) => return Ok((None, None)),
 		};
-		let key_provider = match (&self.client_key_provider, server_handshake.client_cert_required) {
-			(Some(provider), _) => provider,
-			(None, true) => return Err(HandshakeError::MutualAuthRequired),
-			(None, false) => return Err(HandshakeError::InvalidState),
-		};
 
+		let cert = identity.certificate();
 		let cert_der = cert.to_der()?;
 		let auth_digest = compute_client_auth_digest::<P::Digest>(&transcript_digest, encrypted_data, &cert_der)?;
-		let signature_bytes = key_provider.sign_prehash(&auth_digest).await?;
+		let signature_bytes = identity.signing_provider().sign_prehash(&auth_digest).await?;
 
 		let cert = Certificate::clone(cert);
 		let signature = OctetString::new(signature_bytes)?;

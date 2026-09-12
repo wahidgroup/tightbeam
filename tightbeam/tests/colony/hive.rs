@@ -271,7 +271,7 @@ async fn connect_hive(
 		.build();
 
 	let addr = hive.addr().ok_or(TightBeamError::NotEstablished)?;
-	Ok(client.connect(addr).await?)
+	Ok(client.connect(addr.to_owned()).await?)
 }
 
 async fn emit_command(

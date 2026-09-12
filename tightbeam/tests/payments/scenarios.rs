@@ -240,7 +240,7 @@ tb_scenario! {
 			// to the servlet's response frame. `served` admits only an
 			// `Ok` gateway status, so reaching the next line pins the
 			// wire status the spec asserts.
-			let mut client = builder.connect(cluster_addr).await?;
+			let mut client = builder.connect(cluster_addr.to_owned()).await?;
 			let servlet_frame = client.submit_work_to(authorization_urn(), &inner).await?;
 			trace.event_with(WORK_STATUS, &[], TransitStatus::Ok)?;
 

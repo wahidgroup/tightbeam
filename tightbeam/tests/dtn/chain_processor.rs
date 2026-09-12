@@ -9,10 +9,9 @@
 
 use std::sync::{Arc, RwLock};
 
-use tightbeam::asn1::{AlgorithmIdentifier, Frame, OctetString};
+use tightbeam::asn1::{AlgorithmIdentifier, DigestInfo, Frame, OctetString};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::der::{oid::AssociatedOid, Encode};
-use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::TightBeamError;
 
 use crate::dtn::jobs::{PersistAndBufferFrame, ValidateChain};

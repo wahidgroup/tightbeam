@@ -33,33 +33,28 @@ pub enum BuildError {
 	/// Invalid metadata configuration
 	#[error("Invalid metadata: {0}")]
 	#[from]
-	#[source]
 	InvalidMetadata(MetadataError),
 
 	/// Invalid matrix dimensions or contents
 	#[error("Matrix error: {0}")]
 	#[from]
-	#[source]
 	MatrixError(crate::matrix::MatrixError),
 
 	/// Error during serialization
 	#[error("Serialization error: {0}")]
 	#[from]
-	#[source]
 	Serialization(der::Error),
 
 	/// Error during encryption
 	#[cfg(feature = "aead")]
 	#[error("Encryption error: {0}")]
 	#[from]
-	#[source]
 	Encryption(aead::Error),
 
 	/// Error during signing
 	#[cfg(feature = "signature")]
 	#[error("Signature error: {0}")]
 	#[from]
-	#[source]
 	Signature(signature::Error),
 
 	/// Error during compression
@@ -71,7 +66,6 @@ pub enum BuildError {
 	#[cfg(feature = "random")]
 	#[error("Random number generation error: {0}")]
 	#[from]
-	#[source]
 	Random(rand_core::Error),
 
 	/// Missing message body

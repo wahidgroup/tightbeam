@@ -17,13 +17,11 @@ pub enum HiveError {
 	/// Transport/IO error
 	#[error("IO error: {0}")]
 	#[from]
-	#[source]
 	Io(std::io::Error),
 
 	/// Transport-level failure while communicating with a cluster/servlet
 	#[error("Transport error: {0}")]
 	#[from]
-	#[source]
 	Transport(TransportError),
 
 	/// Frame encode/decode/build/sign failure

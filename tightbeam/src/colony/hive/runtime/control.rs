@@ -14,7 +14,7 @@ use crate::colony::hive::{
 };
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::decode;
-use crate::macros::server::{into_shared_session_handler, serve_connection, AcceptedConnection};
+use crate::macros::server::{serve_connection, AcceptedConnection, SharedHandler};
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
@@ -101,7 +101,7 @@ where
 	/// [`HiveControlCtx::handle_command`] against this context.
 	pub fn serve(self, listener: P::Listener, mux_offer: Option<Arc<TransportOffer>>) -> rt::JoinHandle {
 		let ctx = Arc::new(self);
-		let handler = into_shared_session_handler(move |frame: Frame, session| {
+		let handler = SharedHandler::from(move |frame: Frame, session| {
 			let ctx = Arc::clone(&ctx);
 			async move { ctx.handle_command(frame, session).await }
 		});
@@ -112,7 +112,7 @@ where
 				// Share the mux offer with each accepted control connection.
 				transport = transport.with_mux_offer(mux_offer.clone());
 
-				let handler = Arc::clone(&handler);
+				let handler = handler.clone();
 				async move { serve_connection(transport, handler, None, None).await }
 			},
 		))
