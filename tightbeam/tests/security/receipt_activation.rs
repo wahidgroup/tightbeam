@@ -58,7 +58,6 @@ tb_assert_spec! {
 	pub ReceiptActivationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(COMPLETE_FAILS_WITHOUT_SETTLEMENT, exactly!(1), equals!(true))
 		]

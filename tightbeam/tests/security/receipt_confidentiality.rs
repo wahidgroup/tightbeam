@@ -100,7 +100,6 @@ tb_assert_spec! {
 	pub ReceiptConfidentialitySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RESPONSE_CONFIDENTIAL_ON_WIRE, exactly!(1), equals!(true)),
 			(SETTLED_WITH_PLAINTEXT_ONCE, exactly!(1), equals!(true)),

@@ -264,7 +264,6 @@ tb_assert_spec! {
 	pub ClusterExportAdFilterSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -319,7 +318,6 @@ tb_assert_spec! {
 	pub ClusterExportUnaryBoundarySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ADVERTISE_SENT, exactly!(1)),
@@ -410,7 +408,6 @@ tb_assert_spec! {
 	pub ClusterExportGrantSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ADVERTISE_SENT, exactly!(1)),
@@ -496,7 +493,6 @@ tb_assert_spec! {
 	pub ClusterExportStreamBoundarySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ADVERTISE_SENT, exactly!(1)),
@@ -627,7 +623,6 @@ tb_assert_spec! {
 	pub ClusterExportCustomGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ADVERTISE_SENT, exactly!(1)),

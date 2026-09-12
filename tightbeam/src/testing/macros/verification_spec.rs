@@ -176,8 +176,9 @@ impl AssertSpecBuilder {
 		self
 	}
 
-	pub fn gate_decision(mut self, decision: TransitStatus) -> Self {
-		self.gate_decision = Some(decision);
+	/// The gate decision this spec requires, or `None` to require none.
+	pub fn expected_gate(mut self, decision: Option<TransitStatus>) -> Self {
+		self.gate_decision = decision;
 		self
 	}
 
@@ -655,7 +656,7 @@ macro_rules! __tb_assert_spec_build_all {
 		$base:ident,
 		$desc_opt:expr,
 		$(
-			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 			assertions: [ $( $assertion:tt ),* ],
 			$(
 				events: [ $($events_tt:tt)* ],
@@ -691,7 +692,7 @@ macro_rules! __tb_assert_spec_build_all_impl {
 	(
 		$vec:ident, $base:ident, $desc_opt:expr,
 		$(
-			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 			assertions: [ $( $assertion:tt ),* ],
 			$(
 				events: [ $($events_tt:tt)* ],
@@ -719,7 +720,7 @@ macro_rules! __tb_assert_spec_build_all_impl {
 #[macro_export]
 macro_rules! __tb_assert_spec_build_all_impl_with_events {
 	(
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		$(
 			events: [ $($events_tt:tt)* ],
@@ -750,7 +751,7 @@ macro_rules! __tb_assert_spec_build {
 		$vec:ident,
 		$base:ident,
 		$maj:literal, $min:literal, $patch:literal,
-		$mode:ident, $gate:ident,
+		$mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* $(,)? ],
 		$(
 			events: [ $($events_tt:tt)* ],
@@ -776,7 +777,7 @@ macro_rules! __tb_assert_spec_build {
 	// Pattern with desc_opt parameter (from __tb_assert_spec_build_all_impl_with_events)
 	// Has events case
 	(@expand_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ $($events_tt:tt)* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -793,7 +794,7 @@ macro_rules! __tb_assert_spec_build {
 	};
 	// No events case
 	(@expand_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, schedulability: { $($schedule_content:tt)* })?
@@ -809,7 +810,7 @@ macro_rules! __tb_assert_spec_build {
 	};
 	// Legacy pattern without desc_opt (for backward compatibility)
 	(@expand_events
-		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		$(
 			events_tt: [ $($events_tt:tt)* ],
@@ -844,7 +845,7 @@ macro_rules! __tb_assert_spec_build {
 		)?
 	};
 	(@build_with_events_expanded
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ $( $ev:expr ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -863,7 +864,7 @@ macro_rules! __tb_assert_spec_build {
 	}};
 	// Legacy pattern without desc_opt (for backward compatibility)
 	(@build_with_events_expanded
-		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ $($events_tt:tt)* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -882,7 +883,7 @@ macro_rules! __tb_assert_spec_build {
 		}
 	}};
 	(@build_with_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events: [ $( $ev:expr ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -915,7 +916,7 @@ macro_rules! __tb_assert_spec_build {
 	}};
 	// Empty events case
 	(@expand_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -1006,7 +1007,7 @@ macro_rules! tb_assert_spec {
 		$vis:vis $base:ident,
 		$( V ( $maj:literal , $min:literal , $patch:literal ) : {
 			mode: $mode:ident,
-			gate: $gate:ident,
+			$( gate: $gate:ident, )?
 			$( tag_filter: [ $( $tag:expr ),* $(,)? ], )?
 			assertions: [ $( $assertion:tt ),* $(,)? ]
 			$(, events: [ $($events_tt:tt)* ])?
@@ -1033,7 +1034,11 @@ macro_rules! tb_assert_spec {
 					$base,
 					desc_opt,
 					$(
-						$maj, $min, $patch, $mode, $gate,
+						$maj, $min, $patch, $mode,
+						// One decider for the expected gate: a block that omits
+						// `gate:` requires no decision, and every helper below
+						// couriers this value without reading it.
+						::core::option::Option::None $( .or(Some($crate::policy::TransitStatus::$gate)) )?,
 						assertions: [ $( $assertion ),* ],
 						$(
 							events: [ $($events_tt)* ],
@@ -1081,7 +1086,7 @@ macro_rules! __tb_assert_spec_init_builder {
 		$min:literal,
 		$patch:literal,
 		$mode:ident,
-		$gate:ident,
+		$gate:expr,
 		$(tag_filter: [ $($tag:expr),* $(,)? ])?
 		$(, description: $desc:expr)?
 	) => {{
@@ -1090,7 +1095,7 @@ macro_rules! __tb_assert_spec_init_builder {
 			stringify!($base),
 			$crate::trace::ExecutionMode::$mode,
 		);
-		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
+		builder = builder.version(maj, min, patch).expected_gate($gate);
 		$(
 			builder = builder.tag_filter(vec![ $( $tag ),* ]);
 		)?
@@ -1118,14 +1123,12 @@ mod tests {
 		pub VersionedKeySpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(OLDER_KEY, exactly!(1))
 			]
 		},
 		V(2,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(NEWER_KEY, exactly!(1))
 			]

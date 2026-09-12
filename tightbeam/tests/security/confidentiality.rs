@@ -52,7 +52,6 @@ tb_assert_spec! {
 	pub ConfidentialitySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CONF_CAPTURE_HANDSHAKE, exactly!(1u32)),
 			(CONF_EXTRACT_CIPHERTEXT, exactly!(1u32)),

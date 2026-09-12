@@ -48,7 +48,6 @@ tb_assert_spec! {
 	pub SplitEncryptedRoundtripSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(STATUS_OK, exactly!(1), equals!(true)),
 			(FRAME_ECHOED, exactly!(1), equals!(true))
@@ -111,7 +110,6 @@ tb_assert_spec! {
 	pub SplitRejectsPreHandshakeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(INTO_SPLIT_REPORTS_INVALID_STATE, exactly!(1), equals!(true))
 		]
@@ -144,7 +142,6 @@ tb_assert_spec! {
 	pub SplitWriteRekeyLimitSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SECOND_WRITE_DEMANDS_REKEY, exactly!(1), equals!(true))
 		]
@@ -196,7 +193,6 @@ tb_assert_spec! {
 	pub SplitReadRekeyLimitSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FIRST_RECORD_ARRIVES, exactly!(1), equals!(true)),
 			(THRESHOLD_REACHES_ZERO, exactly!(1), equals!(true)),

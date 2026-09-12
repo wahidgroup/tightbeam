@@ -40,7 +40,6 @@ tb_assert_spec! {
 	pub ReplayAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REPLAY_INIT_HANDSHAKE, exactly!(BACKEND_COUNT_U32)),
 			(REPLAY_ATTEMPT, exactly!(BACKEND_COUNT_U32)),

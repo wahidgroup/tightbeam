@@ -451,7 +451,6 @@ tb_assert_spec! {
 	pub PaywallPaidDrawsSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, at_least!(1)),
@@ -490,7 +489,6 @@ tb_assert_spec! {
 	pub PaywallUnpaidLockoutSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(0)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(0)),
@@ -520,7 +518,6 @@ tb_assert_spec! {
 	pub PaywallExhaustedCreditsSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
@@ -574,7 +571,6 @@ tb_assert_spec! {
 	pub PaywallTopupSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
@@ -623,7 +619,6 @@ tb_assert_spec! {
 	pub PaywallLedgerReconnectSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(2)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
@@ -712,7 +707,6 @@ tb_assert_spec! {
 	pub PaywallLiveReceiptSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),

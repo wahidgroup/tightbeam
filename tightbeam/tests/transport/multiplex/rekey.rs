@@ -282,7 +282,6 @@ tb_assert_spec! {
 	pub MuxRekeyBudgetRenewalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -330,7 +329,6 @@ tb_assert_spec! {
 	pub MuxRekeyRecordRenewalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, at_least!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, at_least!(1)),
@@ -351,7 +349,6 @@ tb_assert_spec! {
 	pub MuxRekeyStreamingRenewalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, at_least!(1)),
 			(events::MUX_REKEY_RENEWED, at_least!(2)),
@@ -443,7 +440,6 @@ tb_assert_spec! {
 	pub MuxRekeyEpochChainSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(2)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(2)),
@@ -504,7 +500,6 @@ tb_assert_spec! {
 	pub MuxRekeySettledChallengeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -558,7 +553,6 @@ tb_assert_spec! {
 	pub MuxRekeySettleRefusalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -608,7 +602,6 @@ tb_assert_spec! {
 	pub MuxRekeyApprovalRefusalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -656,7 +649,6 @@ tb_assert_spec! {
 	pub MuxRekeyMinSpendSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(0)),
@@ -694,7 +686,6 @@ tb_assert_spec! {
 	pub MuxRekeyDuplicateRequestSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -744,7 +735,6 @@ tb_assert_spec! {
 	pub MuxRekeyTimeoutSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
@@ -796,7 +786,6 @@ tb_assert_spec! {
 	pub MuxRekeyInertPathsSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(0)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(0)),

@@ -46,7 +46,6 @@ tb_assert_spec! {
 	pub MitmAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(MITM_CAPTURE_HANDSHAKE, exactly!(BACKEND_COUNT_U32)),
 			(MITM_TAMPER_MESSAGE, exactly!(BACKEND_COUNT_U32)),

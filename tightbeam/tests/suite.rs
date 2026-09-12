@@ -76,3 +76,7 @@ mod payments;
 // DLT Network test
 // #[cfg(feature = "full")]
 // mod proof;
+
+// Gate decision reading
+#[cfg(feature = "testing")]
+mod gate;

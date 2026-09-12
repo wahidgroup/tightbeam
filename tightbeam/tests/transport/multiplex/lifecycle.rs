@@ -47,7 +47,6 @@ tb_assert_spec! {
 	pub MuxGoAwayDrainSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
@@ -126,7 +125,6 @@ tb_assert_spec! {
 	pub MuxShutdownReasonSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(2)),
 			(SHUTDOWN_WITH_ADVERTISES_REASON, exactly!(2), equals!(true))
@@ -168,7 +166,6 @@ tb_assert_spec! {
 	pub MuxPeerReasonSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_RECV, exactly!(2)),
 			(PEER_REASON_SURFACES_ON_HANDLE, exactly!(2), equals!(true))
@@ -225,7 +222,6 @@ tb_assert_spec! {
 	pub MuxRekeyHeadroomSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(4)),
 			(events::MUX_EMIT_DRAINING, exactly!(4)),
@@ -259,7 +255,6 @@ tb_assert_spec! {
 	pub MuxCancelBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_CANCEL_BUDGET, exactly!(1)),
 			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::EnhanceYourCalm))),
@@ -317,7 +312,6 @@ tb_assert_spec! {
 	pub MuxPeerGoAwaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_RECV, exactly!(1), equals!(u32::from(GoAwayReason::Shutdown))),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
@@ -376,7 +370,6 @@ tb_assert_spec! {
 	pub MuxProtocolViolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
 			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::ProtocolError))),
@@ -457,7 +450,6 @@ tb_assert_spec! {
 	pub MuxGrammarViolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(4)),
 			(OFFENDER_ANSWERED_WITH_GOAWAY, exactly!(4), equals!(true))
@@ -496,7 +488,6 @@ tb_assert_spec! {
 	pub MuxConnectionDropSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(EMIT_FAILS_CONNECTION_CLOSED, exactly!(1), equals!(true))
 		]

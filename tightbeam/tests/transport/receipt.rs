@@ -373,7 +373,6 @@ tb_assert_spec! {
 	pub ReceiptRoundTripSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(2)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
@@ -425,7 +424,6 @@ tb_assert_spec! {
 	pub ReceiptEmptyAnswerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(2)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
@@ -468,7 +466,6 @@ tb_assert_spec! {
 	pub ReceiptThirdPartySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(BOTH_SIGNATURES_VERIFY_OFFLINE, exactly!(1), equals!(true)),
 			(TAMPERED_ARTIFACT_FAILS_VERIFICATION, exactly!(7), equals!(true))
@@ -513,7 +510,6 @@ tb_assert_spec! {
 	pub ReceiptSettleRejectionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
@@ -584,7 +580,6 @@ tb_assert_spec! {
 	pub ReceiptAbandonedSettlementSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::SESSION_RECEIPT_REFUSED, exactly!(1)),
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(0)),
@@ -645,7 +640,6 @@ tb_assert_spec! {
 	pub ReceiptOutcomeActivatedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(2)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
@@ -689,7 +683,6 @@ tb_assert_spec! {
 	pub ReceiptOutcomeRefusedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::SESSION_RECEIPT_REFUSED, exactly!(1)),
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(1)),
@@ -763,7 +756,6 @@ tb_assert_spec! {
 	pub ReceiptNoApproverSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::SESSION_RECEIPT_REFUSED, exactly!(1)),
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(0)),
@@ -818,7 +810,6 @@ tb_assert_spec! {
 	pub ReceiptMutualAuthSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVER_REFUSES_TO_ISSUE_UNVERIFIABLE_RECEIPT, exactly!(1), equals!(true)),
 			(IDENTITYLESS_CLIENT_REFUSES_TO_COUNTERSIGN, exactly!(1), equals!(true)),

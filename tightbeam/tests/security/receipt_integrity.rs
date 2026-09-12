@@ -65,7 +65,6 @@ tb_assert_spec! {
 	pub ReceiptBudgetClampSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RECEIPT_BUDGETS_WITHIN_CEILING, exactly!(1), equals!(true)),
 			(RECEIPT_MATCHES_ENFORCED_BUDGET, exactly!(1), equals!(true))

@@ -37,7 +37,6 @@ tb_assert_spec! {
 	pub SimpleWcetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PROCESS, exactly!(1))
 		]

@@ -138,7 +138,6 @@ tb_assert_spec! {
 	pub PeerDenyListSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_REJECT, exactly!(1)),
@@ -184,7 +183,6 @@ tb_assert_spec! {
 	pub PeerAllowListSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_ACCEPT, exactly!(1)),

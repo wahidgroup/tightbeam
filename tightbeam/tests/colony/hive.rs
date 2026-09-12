@@ -108,7 +108,6 @@ tb_assert_spec! {
 	pub HiveEstablishSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(HIVE_STARTED, exactly!(1)),
 			(HIVE_ESTABLISHED, exactly!(1), equals!(1u64))
@@ -361,7 +360,6 @@ tb_assert_spec! {
 	pub HiveGateShapeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
 			(UNSIGNED_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
@@ -371,7 +369,6 @@ tb_assert_spec! {
 	},
 	V(1,1,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
 			(UNSIGNED_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
@@ -458,7 +455,6 @@ tb_assert_spec! {
 	pub HiveBackpressureShapeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(BACKPRESSURE_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
 			(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted))
@@ -521,7 +517,6 @@ tb_assert_spec! {
 	pub HiveRegisterBeforeEstablishSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REGISTER_BEFORE_ESTABLISH, exactly!(1), equals!(true))
 		]
@@ -553,7 +548,6 @@ tb_assert_spec! {
 	pub HiveSpawnRetrySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FIRST_SPAWN_FORBIDDEN, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(RETRY_SPAWN_ACCEPTED, exactly!(1), equals!(TransitStatus::Ok))
@@ -637,7 +631,6 @@ tb_assert_spec! {
 	pub HiveSpawnNonUtf8Spec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SPAWN_NON_UTF8_FORBIDDEN, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(SERVLET_STOPPED, exactly!(1))
@@ -799,7 +792,6 @@ tb_assert_spec! {
 	pub HiveCallFrameDeliverySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(HIVE_CALL_SIGNED, exactly!(1), equals!(1u32)),
 			(HIVE_CALL_PREVIOUS, exactly!(1), equals!(1u32)),

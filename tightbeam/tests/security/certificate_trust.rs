@@ -41,7 +41,6 @@ tb_assert_spec! {
 	pub CertificateTrustSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNTRUSTED_CERT_REJECTED, exactly!(1u32))
 		]

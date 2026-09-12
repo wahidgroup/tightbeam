@@ -6,7 +6,6 @@ tb_assert_spec! {
 	pub ClusterPeerAdvertisedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1))
@@ -16,7 +15,6 @@ tb_assert_spec! {
 	// prove the peer saw Ok, not merely that the install event fired.
 	V(1,1,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
@@ -27,7 +25,6 @@ tb_assert_spec! {
 	// type must leave exactly one installed peer route.
 	V(1,2,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
@@ -41,7 +38,6 @@ tb_assert_spec! {
 	pub ClusterPeerRefusedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1))
@@ -51,7 +47,6 @@ tb_assert_spec! {
 	// property that a refusal installs zero peer routes.
 	V(1,1,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1)),
@@ -102,7 +97,6 @@ tb_assert_spec! {
 	pub ClusterPeerRouteIntrospectionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
@@ -153,7 +147,6 @@ tb_assert_spec! {
 	pub ClusterPeerMultiTypeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
@@ -225,7 +218,6 @@ tb_assert_spec! {
 	pub ClusterPeerSignerKeyedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(3)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(3)),
@@ -322,7 +314,6 @@ tb_assert_spec! {
 	pub ClusterPeerReplayReleasedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(2)),
 			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1)),
@@ -414,7 +405,6 @@ tb_assert_spec! {
 	pub ClusterPeerForwardLoopGuardSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1)),
@@ -456,7 +446,6 @@ tb_assert_spec! {
 	pub ClusterPeerForwardEchoSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -542,7 +531,6 @@ tb_assert_spec! {
 	pub ClusterPeerCollideSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
@@ -610,7 +598,6 @@ tb_assert_spec! {
 	pub ClusterPeerContainmentSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(WORK_SENT, exactly!(4)),
@@ -689,7 +676,6 @@ tb_assert_spec! {
 	pub ClusterPeerIsolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(WORK_SENT, exactly!(4)),
@@ -778,7 +764,6 @@ tb_assert_spec! {
 	pub ClusterPeerLocalitySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -849,7 +834,6 @@ tb_assert_spec! {
 	pub ClusterPeerSlateShrinkSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(2)),
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(2)),
@@ -887,7 +871,6 @@ tb_assert_spec! {
 	pub ClusterPeerBeatSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -934,7 +917,6 @@ tb_assert_spec! {
 	pub ClusterBeatUpdatedSlateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
@@ -984,7 +966,6 @@ tb_assert_spec! {
 	pub ClusterBeatCapSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
@@ -1096,7 +1077,6 @@ tb_assert_spec! {
 	pub ClusterPeerPlaneBeatSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, at_least!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),

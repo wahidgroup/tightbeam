@@ -11,7 +11,6 @@ tb_assert_spec! {
 	pub ClusterRoutingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
 			(WORK_ECHOED, exactly!(1), equals!(42u64)),
@@ -60,7 +59,6 @@ tb_assert_spec! {
 	pub ClusterMultiGatewaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(MULTI_REGISTER_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
 			(WORK_SENT, exactly!(2)),
@@ -106,7 +104,6 @@ tb_assert_spec! {
 	pub ClusterInstanceWorkSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
 			(events::CLUSTER_WORK_REFUSED, exactly!(1)),
@@ -224,7 +221,6 @@ tb_assert_spec! {
 	pub ClusterClientFrameDeliverySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
 			(CLIENT_WORK_SIGNED, exactly!(1), equals!(1u32)),
@@ -328,7 +324,6 @@ tb_assert_spec! {
 	pub ClusterPeerHopFrameDeliverySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),
@@ -392,7 +387,6 @@ tb_assert_spec! {
 	pub ClusterMalformedWorkSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(2)),
 			(events::CLUSTER_WORK_REFUSED, exactly!(1)),
@@ -468,7 +462,6 @@ tb_assert_spec! {
 	pub ClusterEdgePlaneSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
 			(WORK_ECHOED, exactly!(1), equals!(42u64)),
@@ -533,7 +526,6 @@ tb_assert_spec! {
 	pub ClusterEdgeBindFailureSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(EDGE_START_FAILED, exactly!(1), equals!(true))
 		]

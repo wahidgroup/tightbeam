@@ -42,7 +42,6 @@ tb_assert_spec! {
 	pub TraceAnalysisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CONNECT, exactly!(1)),
 			(SERIALIZE, exactly!(1)),

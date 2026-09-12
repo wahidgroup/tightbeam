@@ -81,7 +81,6 @@ tb_assert_spec! {
 	pub CmsSocketSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::GATE_ACCEPT, exactly!(1)),
 			(CMS_WIRE_ECHOED, exactly!(1), equals!(true))

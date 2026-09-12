@@ -34,7 +34,6 @@ tb_assert_spec! {
 	pub ColonyAssertSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::ACTION_RUN, at_least!(0)),
 			(events::SHADOW_VIOLATION, exactly!(0)),

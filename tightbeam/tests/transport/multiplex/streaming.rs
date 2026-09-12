@@ -46,7 +46,6 @@ tb_assert_spec! {
 	pub MuxOpenStreamSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(OPEN_STREAM_ECHO_MATCHES, exactly!(1), equals!(true)),
 			(OPEN_STREAM_SERVER_SAW_CHUNKS, exactly!(1), equals!(true))
@@ -86,7 +85,6 @@ tb_assert_spec! {
 	pub MuxOpenDuplexSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(OPEN_DUPLEX_REPLY_MATCHES, exactly!(1), equals!(true)),
 			(OPEN_DUPLEX_REPLY_CHUNKED, exactly!(1), equals!(true))
@@ -135,7 +133,6 @@ tb_assert_spec! {
 	pub MuxUnaryKindVsDuplexSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNARY_KIND_REFUSED_BY_DUPLEX_SERVER, exactly!(1), equals!(true))
 		]
@@ -166,7 +163,6 @@ tb_assert_spec! {
 	pub MuxUnaryKindVsStreamingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNARY_KIND_REFUSED_BY_STREAMING_SERVER, exactly!(1), equals!(true))
 		]
@@ -226,7 +222,6 @@ tb_assert_spec! {
 	pub MuxStreamingCancelSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CANCELLED_RESPONSE_SURFACES, exactly!(1), equals!(true)),
 			(CANCEL_UNWINDS_HANDLER, exactly!(1), equals!(true))
@@ -281,7 +276,6 @@ tb_assert_spec! {
 	pub MuxDuplexCancelSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DUPLEX_CANCEL_FAILS_REPLY, exactly!(1), equals!(true))
 		]
@@ -352,7 +346,6 @@ tb_assert_spec! {
 	pub MuxStreamingBackpressureSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PUSH_STALLS_WITHOUT_DRAIN, exactly!(1), equals!(true)),
 			(PUSH_RESUMES_ON_CONSUMPTION, exactly!(1), equals!(true))
@@ -412,7 +405,6 @@ tb_assert_spec! {
 	pub MuxDuplexPingPongSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PING_PONG_REPLIES_MATCH, exactly!(1), equals!(true)),
 			(PING_PONG_ENDS_CLEAN, exactly!(1), equals!(true))
@@ -466,7 +458,6 @@ tb_assert_spec! {
 	pub MuxDuplexIntoFrameSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(INTO_FRAME_DECODES_REPLY, exactly!(1), equals!(true))
 		]

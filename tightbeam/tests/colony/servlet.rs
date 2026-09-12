@@ -128,7 +128,6 @@ tb_assert_spec! {
 	pub CalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVLET_RECEIVE, exactly!(1)),
 			(DOUBLER_PROCESS, exactly!(1)),
@@ -244,7 +243,6 @@ tb_assert_spec! {
 	pub SecureCalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SECURE_RECEIVE, exactly!(1)),
 			(SECURE_FRAME_CLEARTEXT, exactly!(1), equals!(1u32)),

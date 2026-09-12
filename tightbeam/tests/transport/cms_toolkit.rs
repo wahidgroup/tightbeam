@@ -76,7 +76,6 @@ tb_assert_spec! {
 	pub KariCekSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CEK_WRAPPED, exactly!(1)),
 			(CEK_RECOVERED, exactly!(1)),
@@ -135,7 +134,6 @@ tb_assert_spec! {
 	pub EnvelopeRoundTripSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(ENVELOPE_SEALED, exactly!(1)),
 			(WIRE_ROUNDTRIP, exactly!(1)),
@@ -206,7 +204,6 @@ tb_assert_spec! {
 	pub SignedContentSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CONTENT_SIGNED, exactly!(1)),
 			(SIGNATURE_VERIFIED, exactly!(1)),

@@ -32,7 +32,6 @@ tb_assert_spec! {
 	pub MuxCleartextInterleavedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FIRST_STREAM_ECHOED, exactly!(1), equals!(true)),
 			(SECOND_STREAM_ECHOED, exactly!(1), equals!(true))
@@ -85,7 +84,6 @@ tb_assert_spec! {
 	pub MuxCleartextCancelBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_CANCEL_BUDGET, exactly!(1)),
 			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::EnhanceYourCalm))),
@@ -142,7 +140,6 @@ tb_assert_spec! {
 	pub MuxCleartextChunkedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLEARTEXT_BUDGETS_UNMETERED, exactly!(1), equals!(true)),
 			(CLEARTEXT_CHUNKED_ECHO, exactly!(1), equals!(true))
@@ -192,7 +189,6 @@ tb_assert_spec! {
 	pub MuxCleartextStreamingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLEARTEXT_STREAMING_ECHO, exactly!(1), equals!(true)),
 			(CLEARTEXT_STREAMING_CHUNKED, exactly!(1), equals!(true))

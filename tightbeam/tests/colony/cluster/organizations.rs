@@ -92,7 +92,6 @@ tb_assert_spec! {
 	pub ClusterMultiOrgBoundarySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -271,7 +270,6 @@ tb_assert_spec! {
 	pub ClusterLiveForeignGatewaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
 			(events::CLUSTER_GOSSIP_REFUSED, at_least!(1)),
@@ -324,7 +322,6 @@ tb_assert_spec! {
 	pub ClusterMultiOrgModelSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_PEER_AD_LEARNED, exactly!(1)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),
@@ -360,7 +357,6 @@ tb_assert_spec! {
 	pub ClusterMultiOrgViolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_PEER_AD_LEARNED, exactly!(1)),
 			(events::CLUSTER_WORK_FORWARDED, exactly!(1)),

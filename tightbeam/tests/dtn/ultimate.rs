@@ -507,7 +507,6 @@ tb_assert_spec! {
 	pub DtnEventCountSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			// Lifecycle
 			(MISSION_START, exactly!(1)),

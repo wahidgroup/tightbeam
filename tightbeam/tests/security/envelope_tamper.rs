@@ -73,7 +73,6 @@ tb_assert_spec! {
 	pub EnvelopeDeleteSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DELETED_ENVELOPE_DETECTED, exactly!(1u32))
 		]
@@ -137,7 +136,6 @@ tb_assert_spec! {
 	pub EnvelopeReplaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REPLAYED_ENVELOPE_DETECTED, exactly!(1u32))
 		]

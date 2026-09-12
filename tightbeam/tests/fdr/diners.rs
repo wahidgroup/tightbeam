@@ -224,7 +224,6 @@ tightbeam::tb_assert_spec! {
 	pub ValidPhilosopherSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(THINKS, tightbeam::exactly!(1)),
 			(SITS, tightbeam::exactly!(1)),
@@ -274,7 +273,6 @@ tightbeam::tb_assert_spec! {
 	pub DeadlockPhilosopherSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(THINKS, tightbeam::exactly!(2)),
 			(SITS, tightbeam::exactly!(2)),
@@ -316,7 +314,6 @@ tightbeam::tb_assert_spec! {
 	pub DeadlockFreePhilosopherSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(THINKS, tightbeam::exactly!(2)),
 			(SITS, tightbeam::exactly!(2)),

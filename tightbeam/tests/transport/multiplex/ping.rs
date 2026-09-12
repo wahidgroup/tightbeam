@@ -32,7 +32,6 @@ tb_assert_spec! {
 	pub MuxPingRoundtripSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLIENT_PING_ACKED, exactly!(1), equals!(true)),
 			(SERVER_PING_ACKED, exactly!(1), equals!(true)),
@@ -97,7 +96,6 @@ tb_assert_spec! {
 	pub MuxPingWireAckSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PROBE_ANSWERED_WITH_MATCHING_ACK, exactly!(1), equals!(true)),
 			(FOLLOWUP_ECHOES_AFTER_STRAY_ACK, exactly!(1), equals!(true))
@@ -140,7 +138,6 @@ tb_assert_spec! {
 	pub MuxPingDrainingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),

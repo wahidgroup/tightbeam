@@ -86,7 +86,6 @@ tb_assert_spec! {
 	pub SettlementOrderingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RESPONSE_CONFIDENTIAL_ON_WIRE, exactly!(1), equals!(true)),
 			(CORRUPTED_KEY_EXCHANGE_REJECTED, exactly!(1), equals!(true)),
