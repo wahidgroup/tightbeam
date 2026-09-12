@@ -1,6 +1,7 @@
 //! tb_process_spec! macro for defining CSP processes
 
 /// Define a CSP Process with declarative syntax.
+#[cfg(feature = "testing-csp")]
 #[macro_export]
 macro_rules! tb_process_spec {
 	// Pattern with timing block and optional terminal

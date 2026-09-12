@@ -15,7 +15,6 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 #[cfg(feature = "testing-schedulability")]
@@ -32,6 +31,8 @@ use crate::testing::schedulability::{SchedulabilityError, SchedulerType, TaskSet
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::{TimedTransition, TimingConstraints, TimingGuard};
 use crate::Errorizable;
+
+pub use super::lts::{Action, Alphabet, CspValidationResult, CspViolation, Event, State};
 
 /// Intern pool for CSP state/event names constructed at runtime.
 ///
@@ -56,47 +57,6 @@ where
 	pool.insert(leaked);
 
 	leaked
-}
-
-/// Process state in the LTS
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct State(pub &'static str);
-
-impl fmt::Display for State {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "{}", self.0)
-	}
-}
-
-/// CSP event identifier
-///
-/// Represents a named event in a CSP process specification. Also used by
-/// timing verification to identify events with timing constraints (WCET,
-/// deadlines, jitter) and in violation reports.
-///
-/// Event identity is the full URN rendering (`urn:<nid>:<nss>`): spec
-/// surfaces convert from [`Urn`] so alphabets never collide across NIDs.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Event(pub &'static str);
-
-impl fmt::Display for Event {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "{}", self.0)
-	}
-}
-
-impl From<&Event> for Event {
-	fn from(event: &Event) -> Self {
-		*event
-	}
-}
-
-// CSP event identity is already the full URN rendering, so replaying a
-// process event into a trace preserves URN-keyed labels.
-impl crate::trace::IntoEventLabel for Event {
-	fn into_label(self) -> Cow<'static, str> {
-		Cow::Borrowed(self.0)
-	}
 }
 
 impl From<Urn<'_>> for Event {
@@ -148,40 +108,6 @@ impl<'a> Decode<'a> for Event {
 	}
 }
 
-/// CSP alphabet: observable vs hidden (τ/tau)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Alphabet {
-	/// Observable external event
-	Observable,
-	/// Hidden internal event (τ/tau)
-	Hidden,
-}
-
-/// CSP action: event with alphabet classification
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Action {
-	pub event: Event,
-	pub alphabet: Alphabet,
-}
-
-impl Action {
-	pub fn observable(label: &'static str) -> Self {
-		Self { event: Event(label), alphabet: Alphabet::Observable }
-	}
-
-	pub fn hidden(label: &'static str) -> Self {
-		Self { event: Event(label), alphabet: Alphabet::Hidden }
-	}
-
-	pub fn is_observable(&self) -> bool {
-		matches!(self.alphabet, Alphabet::Observable)
-	}
-
-	pub fn is_hidden(&self) -> bool {
-		matches!(self.alphabet, Alphabet::Hidden)
-	}
-}
-
 /// CSP transition: state --\[event\]--> state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition {
@@ -230,6 +156,27 @@ impl Default for TransitionRelation {
 	}
 }
 
+/// What a process is evidence of.
+///
+/// The stable failures and failures-divergences models need the subject's
+/// refusals. A specification states them; a log does not.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum Observation {
+	/// A process written as a specification.
+	#[default]
+	Model,
+
+	/// One execution recorded as a sequence of events.
+	RecordedTrace,
+}
+
+impl Observation {
+	/// Whether refusals are known, so `[F=` and `[FD=` are defined.
+	pub fn carries_refusals(self) -> bool {
+		matches!(self, Self::Model)
+	}
+}
+
 /// CSP Process (Labeled Transition System)
 ///
 /// Represents a process as an LTS with:
@@ -238,10 +185,17 @@ impl Default for TransitionRelation {
 /// - Transition relation
 /// - Nondeterministic choice points
 /// - Timing constraints (optional, for real-time verification)
+///
+/// `#[non_exhaustive]` because [`ProcessBuilder`] is the only construction
+/// that establishes the invariants between the fields.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Process {
 	/// Human-readable name
 	pub name: &'static str,
+
+	/// What this process is evidence of, set where it is built
+	pub observation: Observation,
 
 	/// Initial state
 	pub initial: State,
@@ -295,6 +249,33 @@ impl Process {
 	/// Get hidden alphabet
 	pub fn hidden_alphabet(&self) -> &HashSet<Event> {
 		&self.hidden
+	}
+
+	/// `trace` restricted to this process's observable alphabet.
+	///
+	/// `traces(P \ X) = { s ↾ (Σ ∖ X) | s ∈ traces(P) }`. A recording also
+	/// holds the steps this process models internally, so it is projected
+	/// before it is compared. Traces model only: hiding is not sound in `F`
+	/// or `FD`.
+	pub fn project(&self, trace: &[Event]) -> Vec<Event> {
+		trace.iter().filter(|event| self.observable.contains(event)).copied().collect()
+	}
+
+	/// The events `other` makes observable that this process models in
+	/// neither alphabet, sorted by name.
+	///
+	/// This process neither permits nor forbids them, so they are model
+	/// coverage rather than a violation.
+	pub(crate) fn unmodelled(&self, other: &Self) -> Vec<Event> {
+		let mut found: Vec<Event> = other
+			.observable
+			.iter()
+			.filter(|event| !self.observable.contains(event) && !self.hidden.contains(event))
+			.copied()
+			.collect();
+		found.sort_unstable();
+
+		found
 	}
 
 	/// Execute transition: s --\[e\]--> ?
@@ -382,13 +363,27 @@ impl Process {
 	}
 
 	/// Generate TaskSet from timing constraints and schedulability periods
+	///
+	/// A process that declares no schedulability block has no task set, which
+	/// is what `Ok(None)` reports.
+	///
+	/// # Errors
+	///
+	/// - [`SchedulabilityError::EmptyTaskSet`] -- the process declares periods
+	///   and no execution times, so every task it names is unanalysable.
+	/// - [`SchedulabilityError`] from task-set generation itself.
 	#[cfg(feature = "testing-schedulability")]
 	pub fn generate_task_set(&self) -> Result<Option<TaskSet>, SchedulabilityError> {
-		if let (Some(timing), Some((scheduler, periods))) = (&self.timing_constraints, &self.schedulability_periods) {
-			Ok(Some(timing.to_task_set(periods, *scheduler)?))
-		} else {
-			Ok(None)
-		}
+		let Some((scheduler, periods)) = &self.schedulability_periods else {
+			return Ok(None);
+		};
+		let Some(timing) = &self.timing_constraints else {
+			return Err(SchedulabilityError::EmptyTaskSet);
+		};
+
+		let task_set = timing.to_task_set(periods, *scheduler)?;
+
+		Ok(Some(task_set))
 	}
 }
 
@@ -405,78 +400,17 @@ pub trait ProcessSpec {
 	fn to_process_cow(&self) -> Cow<'_, Process>;
 }
 
-/// Result of CSP process validation
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CspValidationResult {
-	/// Whether the trace is valid
-	pub valid: bool,
-	/// Violations found during validation
-	pub violations: Vec<CspViolation>,
-}
-
-/// Violation types for CSP validation
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CspViolation {
-	/// Event occurred that was not enabled in current state
-	EventNotEnabled { event: Event, state: State, enabled: Vec<Action> },
-	/// Multiple states reachable (nondeterministic choice not resolved)
-	NondeterministicChoice { event: Event, state: State, next_states: Vec<State> },
-	/// Trace continued after reaching terminal state
-	AfterTermination { event: Event, terminal_state: State },
-	/// No states reachable from transition (deadlock)
-	Deadlock { event: Event, state: State },
-}
-
-impl std::fmt::Display for CspViolation {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			CspViolation::EventNotEnabled { event, state, enabled } => {
-				write!(
-					f,
-					"Event {event:?} not enabled in state {state:?}. Enabled actions: {enabled:?}"
-				)
-			}
-			CspViolation::NondeterministicChoice { event, state, next_states } => {
-				write!(
-					f,
-					"Nondeterministic choice at state {state:?} with event {event:?}. Possible next states: {next_states:?}"
-				)
-			}
-			CspViolation::AfterTermination { event, terminal_state } => {
-				write!(f, "Event {event:?} occurred after terminal state {terminal_state:?}")
-			}
-			CspViolation::Deadlock { event, state } => {
-				write!(f, "Deadlock: Event {event:?} led to no reachable states from {state:?}")
-			}
-		}
-	}
-}
-
 impl Process {
 	/// Validate a consumed trace against this CSP process
 	///
-	/// # Trace contract
+	/// A trace is a sequence over the observable alphabet, so each event is
+	/// matched there and τ transitions are taken silently by τ-closure first.
+	/// An event only enabled as hidden is [`CspViolation::EventNotEnabled`].
 	///
-	/// Traces are sequences of observable events: every assertion label is
-	/// matched against the observable alphabet only. Hidden (τ) events are
-	/// internal to the process and never appear in a consumed trace
-	/// (Roscoe: behaviors are recorded "by an observer who cannot see the
-	/// internal action τ"). Per the operational semantics, τ transitions
-	/// happen silently: before matching each observable event the validator
-	/// expands the candidate states by τ-closure, so processes with hidden
-	/// steps on the path (e.g. `sequential`'s `tau_seq` bridge or
-	/// `internal_choice`'s `tau_choice_*`) validate correctly. An event
-	/// that is only enabled as hidden is reported as
-	/// [`CspViolation::EventNotEnabled`].
-	///
-	/// # Nondeterminism
-	///
-	/// The validator tracks the *set* of states the process may occupy
-	/// (subset construction), so all branches of a nondeterministic choice
-	/// are followed simultaneously. Multiple targets for a `(state, event)`
-	/// pair are legal at states registered via [`ProcessBuilder::add_choice`].
-	/// Multiple targets at an *undeclared* state are reported as
-	/// [`CspViolation::NondeterministicChoice`].
+	/// Candidate states are tracked as a set, so every branch of a
+	/// nondeterministic choice is followed at once. Multiple targets are legal
+	/// only at a state registered via [`ProcessBuilder::add_choice`];
+	/// elsewhere they are [`CspViolation::NondeterministicChoice`].
 	pub fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		let mut violations = Vec::new();
 		let mut current_states = vec![self.initial];
@@ -751,6 +685,7 @@ impl ProcessBuilder {
 
 		Ok(Process {
 			name: self.name,
+			observation: Observation::Model,
 			initial,
 			states: self.states,
 			terminal: self.terminal,
@@ -787,6 +722,47 @@ mod tests {
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use crate::{exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
 
+	/// A spec that models `start` and `send` observably and `prepare`
+	/// internally, and says nothing about anything else.
+	fn alphabet_spec() -> Result<Process, ProcessBuildError> {
+		Process::builder("AlphabetSpec")
+			.initial_state(State("S0"))
+			.add_observable(Event("start"))
+			.add_observable(Event("send"))
+			.add_hidden(Event("prepare"))
+			.add_transition(State("S0"), Event("start"), State("S1"))
+			.add_transition(State("S1"), Event("prepare"), State("S2"))
+			.add_transition(State("S2"), Event("send"), State("S3"))
+			.add_terminal(State("S3"))
+			.build()
+	}
+
+	#[test]
+	fn project_keeps_only_what_the_spec_observes() -> Result<(), ProcessBuildError> {
+		let spec = alphabet_spec()?;
+		let recorded = [Event("start"), Event("prepare"), Event("audit"), Event("send")];
+		let projected = spec.project(&recorded);
+		assert_eq!(projected, vec![Event("start"), Event("send")]);
+		Ok(())
+	}
+
+	#[test]
+	fn unmodelled_names_what_the_spec_leaves_out_of_both_alphabets() -> Result<(), ProcessBuildError> {
+		let spec = alphabet_spec()?;
+		let subject = Process::builder("Subject")
+			.initial_state(State("T0"))
+			.add_observable(Event("start"))
+			.add_observable(Event("prepare"))
+			.add_observable(Event("audit"))
+			.add_transition(State("T0"), Event("start"), State("T1"))
+			.add_terminal(State("T1"))
+			.build()?;
+
+		let outside = spec.unmodelled(&subject);
+		assert_eq!(outside, vec![Event("audit")], "`prepare` is modelled, as the spec's own τ");
+		Ok(())
+	}
+
 	#[test]
 	fn builder_creates_valid_process() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("TestProc")
@@ -806,7 +782,6 @@ mod tests {
 		assert_eq!(proc.observable.len(), 2);
 		assert_eq!(proc.hidden.len(), 1);
 		assert!(proc.is_terminal(State("S3")));
-
 		Ok(())
 	}
 
@@ -825,7 +800,6 @@ mod tests {
 
 		let no_targets = proc.step(State("S0"), &Event("missing"));
 		assert_eq!(no_targets.len(), 0);
-
 		Ok(())
 	}
 
@@ -848,7 +822,6 @@ mod tests {
 		let events: Vec<&str> = enabled.iter().map(|a| a.event.0).collect();
 		assert!(events.contains(&"a"));
 		assert!(events.contains(&"tau"));
-
 		Ok(())
 	}
 
@@ -870,7 +843,6 @@ mod tests {
 		assert!(targets.contains(&State("S2")));
 
 		assert!(proc.is_choice(State("S0")));
-
 		Ok(())
 	}
 
@@ -910,12 +882,10 @@ mod tests {
 	#[test]
 	fn declared_choice_validates_both_branches() -> Result<(), ProcessBuildError> {
 		let proc = branching_process(true)?;
-
 		let via_first = proc.validate_trace(&trace_of(&["go", "x"]));
 		let via_second = proc.validate_trace(&trace_of(&["go", "y"]));
 		assert!(via_first.valid);
 		assert!(via_second.valid);
-
 		Ok(())
 	}
 
@@ -932,7 +902,6 @@ mod tests {
 
 		let result = proc.validate_trace(&trace_of(&["a"]));
 		assert!(result.valid);
-
 		Ok(())
 	}
 
@@ -953,14 +922,12 @@ mod tests {
 
 		let result = proc.validate_trace(&trace_of(&["a", "b"]));
 		assert!(result.valid);
-
 		Ok(())
 	}
 
 	#[test]
 	fn undeclared_nondeterminism_is_flagged() -> Result<(), ProcessBuildError> {
 		let proc = branching_process(false)?;
-
 		let result = proc.validate_trace(&trace_of(&["go", "x"]));
 		assert!(!result.valid);
 		assert!(result
@@ -981,13 +948,11 @@ mod tests {
 			.build()?;
 
 		let result = proc.validate_trace(&trace_of(&["tau"]));
-
 		assert!(!result.valid);
 		assert!(result
 			.violations
 			.iter()
 			.any(|v| matches!(v, CspViolation::EventNotEnabled { .. })));
-
 		Ok(())
 	}
 
@@ -1013,7 +978,6 @@ mod tests {
 
 		let names: Vec<&str> = proc.enabled(State("S0")).iter().map(|a| a.event.0).collect();
 		assert_eq!(names, vec!["a", "b", "c"]);
-
 		Ok(())
 	}
 
@@ -1295,7 +1259,6 @@ mod tests {
 				assert_eq!(action.alphabet, Alphabet::Observable);
 			}
 		}
-
 		for action in proc.enabled(State("S1")) {
 			if action.event.0 == "serialize" || action.event.0 == "queue" {
 				assert!(action.is_hidden());
@@ -1398,8 +1361,8 @@ mod tests {
 					HOOK_CALLED.store(true, Ordering::SeqCst);
 					Ok(())
 				})),
-				on_fail: Some(std::sync::Arc::new(|_result, violation| {
-					panic!("Test should not fail! Violation: {violation:?}")
+				on_fail: Some(std::sync::Arc::new(|_result, violations| {
+					panic!("Test should not fail! Violations: {violations}")
 				})),
 			})
 			.build(),

@@ -70,7 +70,6 @@ tb_scenario! {
 			timeout_ms: 500,
 			specs: vec![EdfSchedulableProcess::process()],
 			fail_fast: true,
-			expect_failure: false,
 			..Default::default()
 		})
 		.build(),

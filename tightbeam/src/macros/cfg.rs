@@ -220,22 +220,6 @@ macro_rules! __tb_if_testing_fdr {
 	($($body:tt)*) => {};
 }
 
-#[cfg(all(feature = "testing-fdr", feature = "testing-timing"))]
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __tb_if_testing_fdr_timing {
-	({ $($body:tt)* }) => { { $($body)* } };
-	($($body:tt)*) => { $($body)* };
-}
-
-#[cfg(not(all(feature = "testing-fdr", feature = "testing-timing")))]
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __tb_if_testing_fdr_timing {
-	({ $($body:tt)* }) => {{}};
-	($($body:tt)*) => {};
-}
-
 #[cfg(feature = "builder")]
 #[macro_export]
 #[doc(hidden)]
@@ -344,4 +328,40 @@ macro_rules! __tb_require_builder {
 	($($body:tt)*) => {
 		::core::compile_error!("a client with an identity requires the `builder` feature of tightbeam")
 	};
+}
+
+/// Picks one of two `fn main` definitions on the `fuzzing` cfg.
+///
+/// The choice rides on an attribute rather than a `$crate` path, because a
+/// `$crate` path expands to a call and a call cannot put an item in the
+/// consumer's crate root. Emitting both halves makes the flag read in the
+/// crate AFL builds with `--cfg fuzzing`.
+///
+/// Each half MUST be exactly one item: the attribute binds to the first item
+/// it precedes.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_fuzzing {
+	({ $($under_fuzzing:tt)* } { $($smoke:tt)* }) => {
+		#[cfg(fuzzing)]
+		$($under_fuzzing)*
+
+		#[cfg(not(fuzzing))]
+		$($smoke)*
+	};
+}
+
+/// Emits the body when tightbeam compiles its own unit tests.
+#[cfg(test)]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_test {
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(test))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_test {
+	($($body:tt)*) => {};
 }

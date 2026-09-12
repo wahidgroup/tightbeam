@@ -74,10 +74,9 @@ fn create_test_config(scale: SeverityScale) -> FdrConfig {
 	}
 }
 
-fn verify_fmea_report(verdict_opt: &Option<FdrVerdict>) -> Result<(), Box<dyn std::error::Error>> {
-	let verdict = verdict_opt.as_ref().ok_or("No FDR verdict")?;
+fn verify_fmea_report(verdict_opt: Option<&FdrVerdict>) -> Result<(), Box<dyn std::error::Error>> {
+	let verdict = verdict_opt.ok_or("No FDR verdict")?;
 	let fmea = verdict.fmea_report.as_ref().ok_or("FMEA report not generated")?;
-
 	assert!(!fmea.failure_modes.is_empty(), "Should have failure modes");
 	assert!(fmea.total_rpn > 0, "Total RPN should be positive");
 
@@ -91,7 +90,7 @@ tb_scenario! {
 		.with_fdr(create_test_config(SeverityScale::MilStd1629))
 		.with_hooks(TestHooks {
 			on_pass: Some(std::sync::Arc::new(|result| {
-				verify_fmea_report(&result.fdr_verdict).expect("FMEA verification failed");
+				verify_fmea_report(result.verdict().fdr()).expect("FMEA verification failed");
 				Ok(())
 			})),
 			on_fail: None,
@@ -114,7 +113,7 @@ tb_scenario! {
 		.with_fdr(create_test_config(SeverityScale::Iso26262))
 		.with_hooks(TestHooks {
 			on_pass: Some(std::sync::Arc::new(|result| {
-				verify_fmea_report(&result.fdr_verdict).expect("FMEA verification failed");
+				verify_fmea_report(result.verdict().fdr()).expect("FMEA verification failed");
 				Ok(())
 			})),
 			on_fail: None,

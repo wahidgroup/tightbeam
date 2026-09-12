@@ -725,7 +725,6 @@ fn build_dtn_fdr_config_refinement() -> FdrConfig {
 		timeout_ms: 15000,
 		specs: vec![DtnComposedSystem::process()], // Triggers trace refinement checking
 		fail_fast: true,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,

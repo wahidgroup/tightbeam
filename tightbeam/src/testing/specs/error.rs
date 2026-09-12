@@ -1,15 +1,17 @@
 //! Spec verification error types
 
+use core::fmt::{Display, Formatter};
+
 use crate::error::ReceivedExpectedError;
 use crate::testing::assertions::AssertionLabel;
+use crate::testing::specs::lts::CspViolation;
+use crate::testing::specs::Layer;
 use crate::trace::ExecutionMode;
 
 #[cfg(feature = "policy")]
 use crate::policy::TransitStatus;
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulabilityError, SchedulabilityResult};
-#[cfg(feature = "testing-csp")]
-use crate::testing::specs::csp::CspViolation;
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
@@ -30,7 +32,6 @@ pub struct AssertionViolationDetail {
 }
 
 /// Event ordering violation details
-#[cfg(feature = "instrument")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventOrderViolationDetail {
 	pub expected_kind: crate::utils::urn::Urn<'static>,
@@ -38,7 +39,6 @@ pub struct EventOrderViolationDetail {
 }
 
 /// Event count mismatch details
-#[cfg(feature = "instrument")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventCountMismatchDetail {
 	pub kind: crate::utils::urn::Urn<'static>,
@@ -50,9 +50,9 @@ pub struct EventCountMismatchDetail {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 pub enum SpecViolation {
-	/// No violation detected (test passed Layer 1)
-	#[cfg_attr(feature = "derive", error("No violation - test passed"))]
-	None,
+	/// The scenario body itself returned an error, carrying its rendering
+	#[cfg_attr(feature = "derive", error("Execution failed: {0}"))]
+	ExecutionFailed(String),
 	/// Response assertion mismatch
 	#[cfg_attr(feature = "derive", error("Response present but spec forbids it"))]
 	ResponseUnexpectedPresence,
@@ -70,17 +70,37 @@ pub enum SpecViolation {
 	#[cfg_attr(feature = "derive", error("Assertion contract violated: {0:?}"))]
 	AssertionViolation(AssertionViolationDetail),
 	/// Event ordering violation (instrumentation)
-	#[cfg(feature = "instrument")]
 	#[cfg_attr(feature = "derive", error("Event order violation: {0:?}"))]
 	EventOrderViolation(EventOrderViolationDetail),
 	/// Event count mismatch
-	#[cfg(feature = "instrument")]
 	#[cfg_attr(feature = "derive", error("Event count mismatch: {0:?}"))]
 	EventCountMismatch(EventCountMismatchDetail),
 	/// CSP process validation failed (Layer 2)
-	#[cfg(feature = "testing-csp")]
 	#[cfg_attr(feature = "derive", error("CSP process violation: {0:?}"))]
 	CspProcessViolation(Vec<CspViolation>),
+	/// Refinement checking rejected the scenario (Layer 3)
+	///
+	/// The witness for each failed check is on the verdict itself, reachable
+	/// through [`ScenarioVerdict::fdr`](crate::testing::ScenarioVerdict::fdr).
+	#[cfg_attr(feature = "derive", error("Refinement check failed"))]
+	RefinementViolation,
+	/// Refinement checking did not conclude (Layer 3)
+	///
+	/// Exploration stopped on a bound or a timeout, so the layer neither
+	/// refuted the run nor cleared it. The bounds are on the verdict itself,
+	/// reachable through
+	/// [`ScenarioVerdict::fdr`](crate::testing::ScenarioVerdict::fdr).
+	#[cfg_attr(
+		feature = "derive",
+		error("Refinement check did not conclude within its exploration bounds")
+	)]
+	RefinementInconclusive,
+	/// A layer the scenario expected a violation from accepted the run
+	#[cfg_attr(
+		feature = "derive",
+		error("Expected a violation from {0:?}, which accepted the run")
+	)]
+	ExpectationUnmet(Layer),
 	/// Schedulability violation (analysis failed)
 	#[cfg(feature = "testing-timing")]
 	#[cfg_attr(feature = "derive", error("Schedulability violation: {0:?}"))]
@@ -96,7 +116,7 @@ pub enum SpecViolation {
 impl std::fmt::Display for SpecViolation {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Self::None => write!(f, "No violation - test passed"),
+			Self::ExecutionFailed(rendering) => write!(f, "Execution failed: {rendering}"),
 			Self::ModeMismatch(err) => write!(f, "Execution mode mismatch: {err}"),
 			Self::ResponseUnexpectedPresence => write!(f, "Response present but spec forbids it"),
 			Self::ResponseUnexpectedAbsence => write!(f, "Response absent but spec requires it"),
@@ -120,7 +140,6 @@ impl std::fmt::Display for SpecViolation {
 					detail.label, detail.expected, detail.actual
 				)
 			}
-			#[cfg(feature = "instrument")]
 			Self::EventOrderViolation(detail) => {
 				write!(
 					f,
@@ -128,7 +147,6 @@ impl std::fmt::Display for SpecViolation {
 					detail.expected_kind, detail.position
 				)
 			}
-			#[cfg(feature = "instrument")]
 			Self::EventCountMismatch(detail) => {
 				write!(
 					f,
@@ -136,13 +154,19 @@ impl std::fmt::Display for SpecViolation {
 					detail.kind, detail.expected, detail.actual
 				)
 			}
-			#[cfg(feature = "testing-csp")]
 			Self::CspProcessViolation(violations) => {
 				write!(f, "CSP process violation:")?;
 				for violation in violations {
 					write!(f, "\n  - {violation}")?;
 				}
 				Ok(())
+			}
+			Self::RefinementViolation => write!(f, "Refinement check failed"),
+			Self::RefinementInconclusive => {
+				write!(f, "Refinement check did not conclude within its exploration bounds")
+			}
+			Self::ExpectationUnmet(layer) => {
+				write!(f, "Expected a violation from {layer:?}, which accepted the run")
 			}
 			#[cfg(feature = "testing-timing")]
 			Self::SchedulabilityViolation(result) => {
@@ -174,3 +198,46 @@ impl std::fmt::Display for SpecViolation {
 
 #[cfg(not(feature = "derive"))]
 impl std::error::Error for SpecViolation {}
+
+/// Every layer that rejected one scenario.
+///
+/// A value of this type exists only where at least one layer rejected the
+/// run, so a caller that holds one knows the scenario failed and can read
+/// each rejection in layer order through [`Violations::iter`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Violations {
+	found: Vec<SpecViolation>,
+}
+
+impl Violations {
+	/// Takes the rejections a grading collected, when it collected any.
+	///
+	/// `None` reports that every layer accepted the run, which is what keeps
+	/// a `Violations` non-empty by construction.
+	pub(crate) fn collected(found: Vec<SpecViolation>) -> Option<Self> {
+		if found.is_empty() {
+			return None;
+		}
+
+		Some(Self { found })
+	}
+
+	/// Every rejection, in layer order.
+	pub fn iter(&self) -> impl Iterator<Item = &SpecViolation> {
+		self.found.iter()
+	}
+}
+
+impl Display for Violations {
+	fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+		for (position, violation) in self.found.iter().enumerate() {
+			if position > 0 {
+				write!(f, "; ")?;
+			}
+
+			write!(f, "{violation}")?;
+		}
+
+		Ok(())
+	}
+}

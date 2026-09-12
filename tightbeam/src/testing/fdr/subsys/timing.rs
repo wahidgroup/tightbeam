@@ -8,7 +8,7 @@ use core::time::Duration;
 
 use std::collections::HashMap;
 
-use crate::testing::fdr::config::Trace;
+use crate::testing::fdr::verdict::Trace;
 use crate::testing::specs::csp::Event;
 use crate::testing::timing::{TimedTransition, TimingConstraint, TimingConstraints, TimingGuard};
 

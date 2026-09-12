@@ -10,8 +10,8 @@ use std::io::Write;
 
 use crate::policy::TransitStatus;
 use crate::testing::assertions::AssertionLabel;
-use crate::testing::fdr::config::AcceptanceSet;
-use crate::testing::specs::csp::{intern, Event, Process, State, TransitionRelation};
+use crate::testing::fdr::verdict::AcceptanceSet;
+use crate::testing::specs::csp::{intern, Event, Observation, Process, State, TransitionRelation};
 use crate::trace::ConsumedTrace;
 
 /// State labels used in FDR trace analysis
@@ -415,6 +415,7 @@ impl FdrTraceExt for ConsumedTrace {
 
 		Process {
 			name: "TraceProcess",
+			observation: Observation::RecordedTrace,
 			initial: s_initial,
 			states,
 			terminal,

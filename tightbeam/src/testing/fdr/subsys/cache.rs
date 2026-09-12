@@ -5,8 +5,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::testing::fdr::config::{Failure, Trace};
 use crate::testing::fdr::explorer::MemoizationCache;
+use crate::testing::fdr::verdict::{Failure, Trace};
 
 /// Default memoization cache implementation
 ///

@@ -53,7 +53,6 @@ fn build_timing_fdr_config(specs: Vec<Process>) -> FdrConfig {
 		timeout_ms: 500,
 		specs,
 		fail_fast: true,
-		expect_failure: false,
 		..Default::default()
 	}
 }
@@ -89,7 +88,7 @@ tb_scenario! {
 					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
 
 				// Verify timing constraints against trace
-				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
+				let timing_result = constraints.verify_with_process(result.trace(), Some(&process))?;
 				// Verify no violations (within constraint: 5ms < 10ms)
 				assert!(timing_result.passed, "Timing verification should pass for duration within constraint. Violations: {:?}", timing_result.wcet_violations);
 				assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected");
@@ -133,7 +132,7 @@ tb_scenario! {
 					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
 
 				// Verify timing constraints against trace
-				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
+				let timing_result = constraints.verify_with_process(result.trace(), Some(&process))?;
 				// Verify no violations (at limit: 10ms == 10ms, should pass)
 				assert!(timing_result.passed, "Timing verification should pass for duration at constraint limit");
 				assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected at limit");
@@ -175,7 +174,7 @@ tb_scenario! {
 					.as_ref()
 					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
 
-				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
+				let timing_result = constraints.verify_with_process(result.trace(), Some(&process))?;
 				assert!(!timing_result.passed, "Timing verification should fail for duration exceeding constraint. Result: {timing_result:?}");
 				assert!(!timing_result.wcet_violations.is_empty(), "WCET violations should be detected");
 				assert_eq!(timing_result.wcet_violations.len(), 1, "Exactly one WCET violation expected");

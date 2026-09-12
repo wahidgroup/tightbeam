@@ -12,8 +12,9 @@ use std::sync::Arc;
 #[cfg(feature = "testing-timing")]
 use core::time::Duration;
 
-use crate::testing::fdr::config::{Failure, FdrConfig, RefusalSet, Trace};
+use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{ExplorationCore, ExplorationState, SeedResult, SeededRng};
+use crate::testing::fdr::verdict::{Failure, RefusalSet, Trace};
 use crate::testing::specs::csp::{Action, Event, Process, State};
 
 #[cfg(feature = "testing-fault")]

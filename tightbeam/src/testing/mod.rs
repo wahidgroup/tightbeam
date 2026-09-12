@@ -18,17 +18,16 @@ pub mod assertions;
 pub mod config;
 pub mod env;
 pub mod error;
-pub mod export;
+pub mod fdr;
 pub mod macros;
 pub mod result;
+pub mod schedulability;
 pub mod specs;
 pub mod trace;
 pub mod utils;
 
 #[cfg(feature = "testing-fault")]
 pub mod fault;
-#[cfg(feature = "testing-fdr")]
-pub mod fdr;
 #[cfg(feature = "testing-fmea")]
 pub mod fmea;
 #[cfg(feature = "testing-fuzz")]
@@ -36,16 +35,13 @@ pub mod fuzz;
 #[cfg(all(feature = "testing-fuzz", feature = "colony"))]
 pub mod routes;
 #[cfg(feature = "testing-timing")]
-pub mod schedulability;
-#[cfg(feature = "testing-timing")]
 pub mod timing;
 
 // Re-exports
-pub use config::{HookContext, ScenarioConfig, ScenarioConfigBuilder, TestHooks};
+pub use config::{Expect, HookContext, ScenarioConfig, ScenarioConfigBuilder, TestHooks};
 pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
-pub use export::ScenarioResultExport;
-pub use result::ScenarioResult;
-pub use specs::{verify_trace, SpecViolation, TBSpec};
+pub use result::{ScenarioResult, ScenarioVerdict};
+pub use specs::{verify_trace, Layer, SpecViolation, TBSpec, Violations};
 pub use utils::*;
 
 #[cfg(feature = "testing-fault")]

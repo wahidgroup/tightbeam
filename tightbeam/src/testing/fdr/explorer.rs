@@ -12,7 +12,8 @@ use core::time::Duration;
 #[cfg(feature = "testing-timing")]
 use std::collections::HashMap;
 
-use super::config::{Failure, FdrConfig, Trace};
+use super::config::FdrConfig;
+use super::verdict::{Failure, Trace};
 use crate::testing::specs::csp::{Event, Process, State};
 
 #[cfg(feature = "testing-fault")]

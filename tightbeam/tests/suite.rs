@@ -29,6 +29,10 @@ mod protocol_core;
 #[cfg(feature = "transport")]
 mod transport;
 
+// The one decider for a scenario's pass or fail
+#[cfg(feature = "testing")]
+mod scenario_verdict;
+
 // FDR refinement checking tests
 #[cfg(feature = "testing-fdr")]
 mod fdr;

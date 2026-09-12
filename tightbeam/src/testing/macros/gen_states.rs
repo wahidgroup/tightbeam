@@ -29,6 +29,7 @@
 /// use my_process::{States, Event};
 /// fault_model.with_fault(States::Ready, Event("send"), || Error, 1000);
 /// ```
+#[cfg(feature = "testing-fault")]
 #[macro_export]
 macro_rules! tb_gen_process_types {
 	(
@@ -80,7 +81,7 @@ macro_rules! tb_gen_process_types {
 	};
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testing-fault"))]
 mod tests {
 	use crate::testing::fault::{ProcessEvent, ProcessState};
 	use crate::utils::urn::Urn;

@@ -7,7 +7,7 @@
 
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::{ScenarioConfig, SetupEnv};
+use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const EATS: Urn<'static> = Urn::new("test", "event:diners/eats");
@@ -25,7 +25,6 @@ fn build_fdr_config(
 	max_depth: usize,
 	max_internal_run: usize,
 	timeout_ms: u64,
-	expect_failure: bool,
 ) -> FdrConfig {
 	FdrConfig {
 		seeds,
@@ -34,7 +33,6 @@ fn build_fdr_config(
 		timeout_ms,
 		specs,
 		fail_fast: true,
-		expect_failure,
 		..Default::default()
 	}
 }
@@ -250,7 +248,6 @@ tightbeam::tb_scenario! {
 			16,
 			8,
 			500,
-			false,
 		))
 		.build(),
 	environment Bare {
@@ -296,7 +293,6 @@ tightbeam::tb_scenario! {
 			10,
 			8,
 			2000,
-			false,
 		))
 		.build(),
 	environment Bare {
@@ -344,7 +340,6 @@ tightbeam::tb_scenario! {
 			18,
 			8,
 			500,
-			false,
 		))
 		.build(),
 	environment Bare {
@@ -388,8 +383,8 @@ tightbeam::tb_scenario! {
 			16,
 			8,
 			500,
-			true,
 		))
+		.with_expect(Expect::Violation(Layer::Refinement))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
