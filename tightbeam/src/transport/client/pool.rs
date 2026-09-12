@@ -24,8 +24,6 @@ use crate::transport::{TransportResult, X509ClientConfig};
 
 #[cfg(feature = "aes-gcm")]
 use crate::crypto::profiles::DefaultCryptoProvider;
-#[cfg(not(feature = "x509"))]
-use crate::transport::client::ClientBuilder;
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -447,18 +445,6 @@ where
 			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))
 	}
 
-	#[cfg(not(feature = "x509"))]
-	fn apply_timeout_to_builder<B>(&self, builder: B) -> B
-	where
-		B: ConnectionBuilder<P>,
-	{
-		if let Some(timeout) = self.timeout {
-			builder.with_timeout(timeout)
-		} else {
-			builder
-		}
-	}
-
 	fn try_take_ready_client(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<GenericClient<P>>>
 	where
 		P: PersistentConnection,
@@ -570,29 +556,6 @@ where
 		});
 	}
 
-	#[cfg(not(feature = "x509"))]
-	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
-	where
-		P: PersistentConnection + Send + Sync,
-		P::Transport: MessageEmitter + MessageCollector + PolicyConfig + Send + Sync,
-	{
-		if let Some(client) = self.try_take_ready_client(&addr)? {
-			return Ok(self.wrap_client(client, addr));
-		}
-
-		let mut reservation = self.reserve_slot(&addr)?;
-		let builder = self.apply_timeout_to_builder(ClientBuilder::<P, C>::builder());
-		let builder = ConnectionBuilder::build(builder);
-		let client = builder.connect(addr.clone()).await?;
-
-		#[cfg(feature = "instrument")]
-		self.emit_event(events::POOL_DIAL);
-
-		reservation.disarm();
-
-		Ok(self.wrap_client(client, addr))
-	}
-
 	/// Lease a ready connection or open a fresh one, held exclusively.
 	#[cfg(feature = "x509")]
 	async fn connect_single_flight(self: &Arc<Self>, addr: &P::Address) -> TransportResult<PooledClient<P, C>>
@@ -637,13 +600,14 @@ where
 			any(feature = "transport-cms", feature = "transport-ecies")
 		))
 	))]
-	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
+	pub async fn connect(self: &Arc<Self>, addr: impl Into<P::Address>) -> TransportResult<PooledClient<P, C>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport:
 			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
-		self.connect_single_flight(&addr).await
+		let destination = addr.into();
+		self.connect_single_flight(&destination).await
 	}
 
 	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, C>>>
@@ -654,16 +618,6 @@ where
 		let maybe_client = self.try_take_ready_client(addr)?;
 		Ok(maybe_client.map(|client| self.wrap_client(client, addr.clone())))
 	}
-}
-
-// Separate impl with tighter bounds for non-x509 features
-#[cfg(feature = "std")]
-#[cfg(not(feature = "x509"))]
-impl<P: Protocol + Send + Sync, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, C>
-where
-	P::Address: Hash + Eq + Clone + Send + Sync,
-	P::Transport: Send + Sync,
-{
 }
 
 pooled_mux! {
@@ -683,17 +637,17 @@ pooled_mux! {
 		/// [`PoolConfig::mux_offer`] is set and the peer accepts.
 		pub async fn connect(
 			self: &Arc<Self>,
-			addr: impl core::borrow::Borrow<P::Address>,
+			addr: impl Into<P::Address>,
 		) -> TransportResult<PooledClient<P, C>>
 		where
 			P::Address: Clone,
 		{
-			let addr = addr.borrow();
+			let destination = addr.into();
 			if self.config.mux_offer.is_none() {
-				return self.connect_single_flight(addr).await;
+				return self.connect_single_flight(&destination).await;
 			}
 
-			self.acquire_mux(addr, MuxSelection::PreferHeadroom).await
+			self.acquire_mux(&destination, MuxSelection::PreferHeadroom).await
 		}
 
 		/// Acquire a mux lease through the reuse tiers, in order.

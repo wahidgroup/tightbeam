@@ -50,7 +50,7 @@ impl tightbeam::Message for TestMessage {
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: tb::Version = tb::Version::V0;
+	const MIN_VERSION: asn1::Version = asn1::Version::V0;
 }
 
 /// Custom test matrix for message metadata
@@ -118,7 +118,7 @@ fn build_crypto(seed: u8) -> Result<TestCrypto, TightBeamError> {
 
 /// Build a test frame for the given version with appropriate capabilities
 fn build_version_frame(
-	version: tb::Version,
+	version: asn1::Version,
 	message: &TestMessage,
 	crypto: &TestCrypto,
 	message_hash: &tightbeam::DigestInfo,
@@ -128,19 +128,19 @@ fn build_version_frame(
 		.with_order(1_696_521_700)
 		.with_message(message.to_owned());
 
-	if version >= tb::Version::V1 {
+	if version >= asn1::Version::V1 {
 		builder = builder
 			.with_message_hasher::<Sha3_256>([])
 			.with_aead::<Aes256GcmOid, _>(crypto.cipher.to_owned())
 			.with_signer::<Secp256k1Signature, _>(crypto.signing_key.to_owned());
 	}
-	if version >= tb::Version::V2 {
+	if version >= asn1::Version::V2 {
 		builder = builder
-			.with_priority(tb::MessagePriority::Expedited)
+			.with_priority(asn1::MessagePriority::Expedited)
 			.with_lifetime(3_600)
 			.with_previous_hash(message_hash.to_owned());
 	}
-	if version == tb::Version::V3 {
+	if version == asn1::Version::V3 {
 		builder = builder.with_matrix(tightbeam::flags![
 			TestFlagSet:
 				FlagTestDevelopmentMode::IsMaintenanceMode,
@@ -166,7 +166,7 @@ tb_assert_spec! {
 			(LIFETIME, exactly!(1), equals!(IsNone)),
 			(PREVIOUS_FRAME, exactly!(1), equals!(IsNone)),
 			(MATRIX, exactly!(1), equals!(IsNone)),
-			(VERSION, exactly!(1), equals!(tb::Version::V0))
+			(VERSION, exactly!(1), equals!(asn1::Version::V0))
 		]
 	},
 	V(1,0,0): {
@@ -182,7 +182,7 @@ tb_assert_spec! {
 			(LIFETIME, exactly!(1), equals!(IsNone)),
 			(PREVIOUS_FRAME, exactly!(1), equals!(IsNone)),
 			(MATRIX, exactly!(1), equals!(IsNone)),
-			(VERSION, exactly!(1), equals!(tb::Version::V1))
+			(VERSION, exactly!(1), equals!(asn1::Version::V1))
 		]
 	},
 	V(2,0,0): {
@@ -194,11 +194,11 @@ tb_assert_spec! {
 			(SIG_VALID, exactly!(1), equals!(true)),
 			(INTEGRITY_OK, exactly!(1), equals!(true)),
 			(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
-			(PRIORITY, exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
+			(PRIORITY, exactly!(1), equals!(Some(asn1::MessagePriority::Expedited))),
 			(LIFETIME, exactly!(1), equals!(Some(3_600u64))),
 			(PREVIOUS_FRAME, exactly!(1), equals!(IsSome)),
 			(MATRIX, exactly!(1), equals!(IsNone)),
-			(VERSION, exactly!(1), equals!(tb::Version::V2))
+			(VERSION, exactly!(1), equals!(asn1::Version::V2))
 		]
 	},
 	V(3,0,0): {
@@ -210,11 +210,11 @@ tb_assert_spec! {
 			(SIG_VALID, exactly!(1), equals!(true)),
 			(INTEGRITY_OK, exactly!(1), equals!(true)),
 			(CONFIDENTIALITY, exactly!(1), equals!(IsSome)),
-			(PRIORITY, exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
+			(PRIORITY, exactly!(1), equals!(Some(asn1::MessagePriority::Expedited))),
 			(LIFETIME, exactly!(1), equals!(Some(3_600u64))),
 			(PREVIOUS_FRAME, exactly!(1), equals!(IsSome)),
 			(MATRIX, exactly!(1), equals!(IsSome)),
-			(VERSION, exactly!(1), equals!(tb::Version::V3))
+			(VERSION, exactly!(1), equals!(asn1::Version::V3))
 		]
 	}
 }
@@ -236,10 +236,10 @@ tb_scenario! {
 			let message_hash = utils::digest::<Sha3_256>(&message)?;
 
 			// Build frames for each version
-			let v0_frame = build_version_frame(tb::Version::V0, &message, &crypto, &message_hash)?;
-			let v1_frame = build_version_frame(tb::Version::V1, &message, &crypto, &message_hash)?;
-			let v2_frame = build_version_frame(tb::Version::V2, &message, &crypto, &message_hash)?;
-			let v3_frame = build_version_frame(tb::Version::V3, &message, &crypto, &message_hash)?;
+			let v0_frame = build_version_frame(asn1::Version::V0, &message, &crypto, &message_hash)?;
+			let v1_frame = build_version_frame(asn1::Version::V1, &message, &crypto, &message_hash)?;
+			let v2_frame = build_version_frame(asn1::Version::V2, &message, &crypto, &message_hash)?;
+			let v3_frame = build_version_frame(asn1::Version::V3, &message, &crypto, &message_hash)?;
 
 			// Roundtrip checks
 			let v0_roundtrip: TestMessage = tightbeam::decode(&v0_frame.message)?;

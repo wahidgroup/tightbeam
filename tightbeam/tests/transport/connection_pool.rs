@@ -321,7 +321,7 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let message_count = Arc::new(AtomicUsize::new(0));
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
-			let server_addr = servlet.addr();
+			let server_addr = servlet.addr().to_owned();
 
 			trace.event(POOL_CREATE)?;
 
@@ -375,8 +375,8 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 	let count2 = Arc::new(AtomicUsize::new(0));
 	let servlet1 = start_pool_echo_servlet(Arc::clone(&count1)).await?;
 	let servlet2 = start_pool_echo_servlet(Arc::clone(&count2)).await?;
-	let addr1 = servlet1.addr();
-	let addr2 = servlet2.addr();
+	let addr1 = servlet1.addr().to_owned();
+	let addr2 = servlet2.addr().to_owned();
 
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
@@ -429,8 +429,7 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 
 	let count = Arc::new(AtomicUsize::new(0));
 	let servlet = start_pool_echo_servlet(Arc::clone(&count)).await?;
-	let addr = servlet.addr();
-
+	let addr = servlet.addr().to_owned();
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_trust_store(make_server_trust_store()?)
@@ -486,8 +485,8 @@ tb_scenario! {
 			let count2 = Arc::new(AtomicUsize::new(0));
 			let servlet1 = start_pool_echo_servlet(Arc::clone(&count1)).await?;
 			let servlet2 = start_pool_echo_servlet(Arc::clone(&count2)).await?;
-			let addr1 = servlet1.addr();
-			let addr2 = servlet2.addr();
+			let addr1 = servlet1.addr().to_owned();
+			let addr2 = servlet2.addr().to_owned();
 
 			trace.event(POOL_CREATE)?;
 
@@ -538,7 +537,7 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let message_count = Arc::new(AtomicUsize::new(0));
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
-			let server_addr = servlet.addr();
+			let server_addr = servlet.addr().to_owned();
 
 			trace.event(POOL_CREATE)?;
 
@@ -552,9 +551,7 @@ tb_scenario! {
 
 			for _ in 0..3 {
 				trace.event(ACQUIRE_CLIENT)?;
-
 				let mut client = pool.connect(server_addr).await?;
-
 				trace.event(SEND_MESSAGE)?;
 
 				let reply = client

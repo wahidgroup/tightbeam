@@ -1,0 +1,13 @@
+error[E0433]: failed to resolve: could not find `testing` in `tightbeam`
+ --> tests/compile/testing_harness_absent.rs:4:16
+  |
+4 | use tightbeam::testing::utils::create_test_signing_key;
+  |                ^^^^^^^ could not find `testing` in `tightbeam`
+  |
+note: found an item that was configured out
+ --> $TIGHTBEAM/src/lib.rs
+  |
+  | #[cfg(any(test, feature = "testing"))]
+  |          --------------------------- the item is gated here
+  | pub mod testing;
+  |         ^^^^^^^

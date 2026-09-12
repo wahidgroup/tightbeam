@@ -606,8 +606,8 @@ tb_scenario! {
 					.with_trace(trace.share())
 					.build(),
 			);
-			let mut mux_client = pool.connect(cluster.addr()).await?;
 
+			let mut mux_client = pool.connect(cluster.addr().to_owned()).await?;
 			let frame = signed_publish_gossip(
 				&ctx.gateway.key,
 				b"oversized-rumor",
@@ -615,6 +615,7 @@ tb_scenario! {
 				2,
 			)
 			.await?;
+
 			let reply = mux_client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: GossipResponse = decode(&reply.message)?;
 			trace.event_with(GOSSIP_PUBLISH_STATUS, &[], response.status)?;

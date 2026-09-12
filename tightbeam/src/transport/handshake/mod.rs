@@ -273,10 +273,13 @@ use std::time::Instant;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	#[cfg(feature = "secp256k1")]
-	pub use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	pub use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
 	pub use crate::x509::Certificate;
+
+	#[cfg(feature = "secp256k1")]
+	pub use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	pub use crate::transport::state::ClientIdentity;
 }
 
 #[cfg(feature = "x509")]
@@ -301,7 +304,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 
 	/// ECIES client orchestrator borrowing the encapsulated signing key.
 	fn create_ecies_client(
-		&self,
+		self: &Arc<Self>,
 		server_cert: Option<Arc<Certificate>>,
 		client_cert: Option<Arc<Certificate>>,
 		aad_domain_tag: Option<&'static [u8]>,
@@ -316,7 +319,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	/// # Returns
 	/// A CMS client handshake orchestrator that borrows the encapsulated key
 	#[cfg(feature = "transport-cms")]
-	fn create_cms_client(&self, config: CmsClientConfig) -> Result<BoxedClientHandshake>;
+	fn create_cms_client(self: &Arc<Self>, config: CmsClientConfig) -> Result<BoxedClientHandshake>;
 
 	/// Create a CMS server handshake orchestrator.
 	///
@@ -503,7 +506,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// ECIES client orchestrator via the encapsulated key provider.
 	#[cfg(feature = "transport-ecies")]
 	pub fn create_ecies_client<M>(
-		&self,
+		self: &Arc<Self>,
 		_server_cert: Option<Arc<Certificate>>,
 		client_cert: Option<Arc<Certificate>>,
 		aad_domain_tag: Option<&'static [u8]>,
@@ -524,8 +527,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + Send + Sync + 'static,
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
-		let provider_opt = client_cert.as_ref().map(|_| Arc::clone(&self.provider));
-		let mut client = EciesHandshakeClient::<P, M>::new_with_identity(aad_domain_tag, client_cert, provider_opt);
+		let identity = client_cert.map(|cert| ClientIdentity::new(cert, Arc::clone(self)));
+		let mut client = EciesHandshakeClient::<P, M>::new_with_identity(aad_domain_tag, identity);
 		if let Some(validator) = validator {
 			client = client.with_certificate_validator(validator);
 		}
@@ -541,7 +544,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 
 	/// CMS client orchestrator via the encapsulated key provider (HSM/KMS-safe).
 	#[cfg(feature = "transport-cms")]
-	pub fn create_cms_client(&self, config: CmsClientConfig) -> Result<BoxedClientHandshake>
+	pub fn create_cms_client(self: &Arc<Self>, config: CmsClientConfig) -> Result<BoxedClientHandshake>
 	where
 		P: Default + 'static,
 		P::Curve: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
@@ -570,7 +573,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 			client = client.with_transport_offer(offer);
 		}
 		if let Some(cert) = config.client_certificate {
-			client = client.with_client_certificate(cert);
+			let identity = ClientIdentity::new(cert, Arc::clone(self));
+			client = client.with_client_identity(identity);
 		}
 		if let Some(approver) = config.receipt_approver {
 			client = client.with_receipt_approver(approver);
@@ -783,8 +787,6 @@ impl EstablishedSession {
 	) -> Self {
 		#[cfg(feature = "x509")]
 		let renewable = receipt.is_some() && peer.is_some();
-		#[cfg(not(feature = "x509"))]
-		let renewable = receipt.is_some();
 
 		let epoch = epoch.filter(|_| renewable);
 
@@ -1177,9 +1179,6 @@ impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 	fn try_from(kex: &ClientKeyExchange) -> CoreResult<Self, Self::Error> {
 		#[cfg(feature = "x509")]
 		let unprotected_attrs = build_client_key_exchange_attrs(kex)?;
-
-		#[cfg(not(feature = "x509"))]
-		let unprotected_attrs = None;
 
 		Ok(EnvelopedData {
 			version: CmsVersion::V0,

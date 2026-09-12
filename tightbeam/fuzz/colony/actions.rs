@@ -220,7 +220,7 @@ async fn connect_with_identity(
 		.with_trust_store(server_trust)
 		.with_client_identity(cert, key)?
 		.build()
-		.connect(addr)
+		.connect(addr.to_owned())
 		.await?)
 }
 
@@ -232,7 +232,7 @@ async fn connect_anon(
 		.with_timeout(CLIENT_IO_TIMEOUT)
 		.with_trust_store(server_trust)
 		.build()
-		.connect(addr)
+		.connect(addr.to_owned())
 		.await?)
 }
 
@@ -243,7 +243,6 @@ async fn pooled_client(
 ) -> Result<PooledClient<TokioListener>, TightBeamError> {
 	let offer = Arc::new(TransportOffer::mux(8));
 	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: Some(offer) };
-
 	let cert = CertificateSpec::Built(Box::new(identity.cert.as_ref().clone()));
 	let key = Arc::new(Secp256k1KeyProvider::from(identity.key.to_owned()));
 

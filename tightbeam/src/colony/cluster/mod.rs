@@ -39,10 +39,8 @@ pub mod servlet_registry;
 pub mod export;
 #[doc(hidden)]
 pub mod gossip;
-#[doc(hidden)]
-pub mod outbound;
-#[doc(hidden)]
-pub mod peer;
+pub(crate) mod outbound;
+pub(crate) mod peer;
 #[doc(hidden)]
 pub mod peer_table;
 
@@ -66,7 +64,7 @@ pub use gossip::{
 	GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
 };
 
-pub use peer::{frame_signer_cert, peer_signer_fingerprint, HopBudget};
+pub use peer::{frame_signer_cert, peer_signer_fingerprint, AdmittedPeerAd, HopBudget, RelayTrail};
 
 use core::future::Future;
 use core::time::Duration;

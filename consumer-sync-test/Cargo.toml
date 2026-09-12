@@ -1,0 +1,18 @@
+[package]
+name = "tightbeam-consumer-test-sync"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features = false, features = [
+	"std",
+	"tcp",
+	"transport-ecies",
+	"transport-policy",
+	"x509",
+	"testing",
+	"instrument",
+] }

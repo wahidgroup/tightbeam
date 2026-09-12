@@ -2,10 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tightbeam::asn1::Frame;
+use tightbeam::asn1::{DigestInfo, Frame};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::der::{Decode, Encode, Sequence};
-use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::{Beamable, TightBeamError};
 
 /// DTN payload for multi-hop communication (used in tests)

@@ -9,12 +9,6 @@ publish = false
 [lints]
 workspace = true
 
-# Regression crate for the derive cfg-leak (#4). It deliberately depends on
-# `tightbeam` with the crypto features enabled while declaring NO features of
-# its own. If `#[derive(Beamable)]` emitted `#[cfg(feature = "...")]` into this
-# crate, `unexpected_cfgs` would fire (denied below) and the OID-checker impls
-# would be silently dropped, breaking the `Check*Oid` bound assertions.
-
 [dependencies]
 tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features = false, features = [
 	"std",
@@ -38,3 +32,6 @@ tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features 
 	"testing-csp",
 ] }
 der = { workspace = true }
+
+[dev-dependencies]
+trybuild = { workspace = true }

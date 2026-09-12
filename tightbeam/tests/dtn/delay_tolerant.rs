@@ -20,11 +20,11 @@
 //! naturally handles delay-tolerant scenarios without additional infrastructure.
 
 use std::time::Duration;
-use tightbeam::asn1::Frame;
+
+use tightbeam::asn1::{DigestInfo, Frame};
 use tightbeam::compose;
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::der::Encode;
-use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::TightBeamError;
 
 use crate::dtn::delay::DelaySimulator;
@@ -113,11 +113,9 @@ async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 
 	// Frame retrieved at Mars
 	let mars_frame1 = relay_store.retrieve("relay-fwd-001")?;
-
 	// Mars verifies complete chain
 	let full_chain = vec![relay_frame1, mars_frame1.to_owned()];
 	let mars_verdict = mars_store.verify_chain(&full_chain)?;
-
 	assert!(mars_verdict.valid, "Chain verification failed at Mars");
 	assert_eq!(mars_verdict.verified_count, 2, "Should verify 2 frames");
 	assert!(mars_verdict.broken_links.is_empty(), "No broken links expected");
@@ -167,7 +165,6 @@ async fn dtn_chain_verification_detects_tampering() -> Result<(), TightBeamError
 	// Create tampered frame3 with wrong previous_frame hash
 	let wrong_hash = Sha3_256::digest(b"wrong");
 	let wrong_digest = DigestInfo::try_from(wrong_hash.as_slice())?;
-
 	let frame3 = compose! {
 		V0: id: "frame-3",
 		order: 3,
@@ -178,7 +175,6 @@ async fn dtn_chain_verification_detects_tampering() -> Result<(), TightBeamError
 	// Verify chain detects tampering
 	let chain = vec![frame1, frame2, frame3];
 	let verdict = store.verify_chain(&chain)?;
-
 	assert!(!verdict.valid, "Chain should be invalid");
 	assert!(!verdict.broken_links.is_empty(), "Should detect broken link");
 	assert_eq!(verdict.broken_links[0].0, 2, "Break should be at frame 3");
@@ -252,10 +248,8 @@ async fn dtn_comparison_traditional_vs_tightbeam() -> Result<(), TightBeamError>
 
 	// Persist (any storage medium works)
 	let frame_id = store.persist(&frame)?;
-
 	// Retrieve (after arbitrary delay)
 	let retrieved = store.retrieve(&frame_id)?;
-
 	// Verify (no custody transfer protocol needed)
 	assert_eq!(retrieved.message, frame.message);
 

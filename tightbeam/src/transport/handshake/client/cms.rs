@@ -49,6 +49,7 @@ use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::utils::{compute_transcript_digest, validate_state};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
 use crate::transport::handshake::{EstablishedSession, HandshakeMessage};
+use crate::transport::state::ClientIdentity;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::zeroize::Zeroizing;
@@ -111,7 +112,9 @@ where
 {
 	state: ClientStateMachine<Cms>,
 	client_key_provider: Arc<dyn SigningKeyProvider>,
-	client_certificate: Option<Arc<Certificate>>,
+	/// Certificate this client presents and the key that proves it, bound as
+	/// one value so both halves reach the authentication path together.
+	identity: Option<ClientIdentity<P>>,
 	server_cert: Option<Arc<Certificate>>,
 	server_chain: Option<ServerChain>,
 	transcript_hash: Option<[u8; 32]>,
@@ -181,7 +184,7 @@ where
 		Self {
 			state: ClientStateMachine::<Cms>::default(),
 			client_key_provider,
-			client_certificate: None,
+			identity: None,
 			server_cert,
 			server_chain,
 			transcript_hash: None,
@@ -232,13 +235,14 @@ where
 		self
 	}
 
-	/// Set client certificate for mutual authentication.
+	/// Set the client identity used for mutual authentication.
 	///
 	/// The certificate is embedded in the client Finished message so the
-	/// server can authenticate the client from the wire.
+	/// server can authenticate the client from the wire, and the key bound
+	/// beside it signs that message.
 	#[must_use]
-	pub fn with_client_certificate(mut self, certificate: impl Into<Arc<Certificate>>) -> Self {
-		self.client_certificate = Some(certificate.into());
+	pub fn with_client_identity(mut self, identity: ClientIdentity<P>) -> Self {
+		self.identity = Some(identity);
 		self
 	}
 
@@ -595,20 +599,17 @@ where
 			return Ok(None);
 		};
 
-		// Countersigning demands a client certificate the server can
-		// verify against: budgets without mutual authentication fail
-		// closed. Checked before approval: approving can spend an
-		// irreversible settlement answer, so every local precondition
-		// must already hold.
-		if self.client_certificate.is_none() {
-			return Err(HandshakeError::MutualAuthRequired);
-		}
+		// Countersigning demands a client identity the server can verify
+		// against: budgets without mutual authentication fail closed.
+		// Checked before approval: approving can spend an irreversible
+		// settlement answer, so every local precondition must already hold.
+		let identity = self.identity.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+		let key_provider = identity.signing_provider();
 
 		// Approve the receipt and answer its challenge.
 		let approver = self.receipt_approver.as_deref();
 		let response = approve_or_fail_closed(approver, &receipt).await?;
 		let answer = response.as_ref().map(OctetString::as_bytes);
-		let key_provider = self.client_key_provider.as_ref();
 		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider).await?;
 
 		// The acknowledgement is confidential: the client SignerInfo (and
@@ -872,15 +873,27 @@ where
 		Ok((transcript_hash, digest_bytes))
 	}
 
-	/// Sign the finished digest using the client key provider.
+	/// The key that signs this client's Finished message.
+	///
+	/// A configured identity carries the key that proves its certificate, so
+	/// the signature and the embedded certificate name one key. Without an
+	/// identity the endpoint signs anonymously with the key it was built from.
+	fn signing_provider(&self) -> &dyn SigningKeyProvider {
+		match self.identity.as_ref() {
+			Some(identity) => identity.signing_provider(),
+			None => self.client_key_provider.as_ref(),
+		}
+	}
+
+	/// Sign the finished digest with this client's signing key.
 	async fn sign_finished_digest(&self, digest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		let signature_bytes = self.client_key_provider.sign_prehash(digest).await?;
+		let signature_bytes = self.signing_provider().sign_prehash(digest).await?;
 		Ok(signature_bytes)
 	}
 
 	/// Build cryptographic components needed for SignedData.
 	async fn build_finished_crypto_components(&self) -> Result<FinishedSigner, HandshakeError> {
-		let public_key_bytes = self.client_key_provider.to_public_key_bytes().await?;
+		let public_key_bytes = self.signing_provider().to_public_key_bytes().await?;
 		let id = compute_signer_identifier_from_der::<P::Digest>(&public_key_bytes)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
@@ -917,11 +930,11 @@ where
 		let encap_content_info = EncapsulatedContentInfo { econtent_type: DATA, econtent: Some(econtent_any) };
 
 		let certificates = self
-			.client_certificate
+			.identity
 			.as_ref()
-			.map(|cert| {
-				// CMS CertificateSet owns the cert. The orchestrator keeps its Arc.
-				let choice = CertificateChoices::Certificate(cert.as_ref().to_owned());
+			.map(|identity| {
+				// CMS CertificateSet owns the cert. The identity keeps its Arc.
+				let choice = CertificateChoices::Certificate(identity.certificate().to_owned());
 				Ok::<_, HandshakeError>(CertificateSet(vec![choice].try_into()?))
 			})
 			.transpose()?;

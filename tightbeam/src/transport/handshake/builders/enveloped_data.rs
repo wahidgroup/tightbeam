@@ -84,7 +84,8 @@ where
 
 	fn build_kari_with_cek(&mut self, cek: &[u8]) -> Result<cms::enveloped_data::RecipientInfo, HandshakeError> {
 		let mut kari_builder = self.kari_builder.take().ok_or(HandshakeError::KariBuilderConsumed)?;
-		Ok(kari_builder.build(cek)?)
+		let recipient_info = kari_builder.build(cek).map_err(HandshakeError::CmsBuilderError)?;
+		Ok(recipient_info)
 	}
 
 	fn build_unprotected_attributes(&mut self) -> Result<Option<Attributes>, HandshakeError> {
@@ -258,11 +259,9 @@ mod tests {
 		fn test_basic_enveloped_data() -> Result<(), Box<dyn core::error::Error>> {
 			// 1. Create test KARI builder
 			let kari_builder = create_test_kari_builder();
-
 			// 2. Build EnvelopedData
 			let plaintext = b"Hello, TightBeam!";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-
 			// 3. Verify structure
 			let enveloped_data = builder.build(plaintext, None, None)?;
 			assert_eq!(enveloped_data.version, CmsVersion::V3);
@@ -297,8 +296,8 @@ mod tests {
 			let Some(attrs) = enveloped_data.unprotected_attrs.as_ref() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
-			assert_eq!(attrs.len(), 2);
 
+			assert_eq!(attrs.len(), 2);
 			Ok(())
 		}
 

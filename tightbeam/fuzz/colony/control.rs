@@ -61,7 +61,7 @@ async fn connect_as(
 		.with_trust_store(server_trust)
 		.with_client_identity(cert, key)?
 		.build()
-		.connect(addr)
+		.connect(addr.to_owned())
 		.await?)
 }
 

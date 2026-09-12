@@ -173,7 +173,7 @@ tb_scenario! {
 			}
 
 			let servlet_task = EchoServlet::start(Arc::new(trace.share()), None).await?;
-			let addr = servlet_task.addr();
+			let addr = servlet_task.addr().to_owned();
 
 			trace.event(CLIENT_CONNECT)?;
 
@@ -232,7 +232,7 @@ tb_scenario! {
 				.build();
 
 			let servlet_task = TlsEchoServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
-			let addr = servlet_task.addr();
+			let addr = servlet_task.addr().to_owned();
 
 			trace.event(CLIENT_CONNECT)?;
 

@@ -231,7 +231,7 @@ pub async fn connect_cluster(
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_trust_store(Arc::clone(&certs.trust))
 		.build()
-		.connect(addr)
+		.connect(addr.to_owned())
 		.await?)
 }
 

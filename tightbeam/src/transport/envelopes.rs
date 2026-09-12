@@ -25,8 +25,6 @@ use crate::{Message, Version};
 
 #[cfg(feature = "transport-multiplex")]
 mod multiplex {
-	#[cfg(not(feature = "x509"))]
-	pub use crate::cms::signed_data::SignedData;
 	pub use crate::cms::signed_data::SignerInfo;
 	pub use crate::constants::DEFAULT_HOP_BUDGET;
 	pub use crate::der::asn1::OctetString;

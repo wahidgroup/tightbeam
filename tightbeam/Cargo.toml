@@ -13,6 +13,13 @@ keywords.workspace = true
 categories.workspace = true
 description = "A secure, high-performance messaging protocol library"
 
+# The test tree and the fuzz corpus serve development
+exclude = ["tests/**", "fuzz/**"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lints]
 workspace = true
 
@@ -61,12 +68,24 @@ zstd-safe = { workspace = true, optional = true }
 afl = { workspace = true, optional = true }
 
 [dev-dependencies]
+tightbeam-rs = { path = ".", features = [
+	"full",
+	"rayon",
+	"zstd",
+	"testing",
+	"testing-csp",
+	"testing-fdr",
+	"testing-schedulability",
+	"testing-fault",
+	"testing-fmea",
+	"testing-timing",
+] }
 husky-rs = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
 
 [features]
-default = ["full"]
+default = ["std", "builder"]
 
 full = [
 	"std",
@@ -95,20 +114,9 @@ full = [
 	"derive",
 	"tokio",
 	"futures",
-	"rayon",
 	"constants",
-	"zstd",
 	"time",
 	"standards-rfc",
-	"standards-iso",
-	"testing",
-	"testing-csp",
-	"testing-fdr",
-	"testing-fuzz",
-	"testing-schedulability",
-	"testing-fault",
-	"testing-fmea",
-	"testing-timing",
 	"instrument",
 	"logging",
 	"colony",
@@ -126,6 +134,7 @@ transport = [
 	"transport-policy",
 	"aead",
 	"signature",
+	"x509",
 	"kdf",
 	"ecdh",
 ]
@@ -163,7 +172,6 @@ testing-fuzz = ["testing", "testing-csp", "dep:afl"]
 testing-fuzz-ijon = ["testing-fuzz"]
 instrument = ["std", "sha3", "digest", "derive"]
 logging = []
-logging-stdout = ["logging", "std"]
 
 # TODO
 bitcoin = ["dep:k256"]
@@ -243,7 +251,8 @@ transport-ecies = [
 	"ecdh",
 ]
 
-# Retained as a no-op: the derive macros are always available.
+# Gates the `Beamable` and `Flaggable` re-exports and the generated error and
+# URN implementations. `builder` and `instrument` both select it.
 derive = []
 
 # Standard library support
@@ -259,6 +268,7 @@ std = [
 	"aead?/std",
 	"signature?/std",
 	"aes-gcm?/std",
+	"aes-kw?/std",
 	"sha3?/std",
 	"k256?/std",
 	"zstd-safe?/std",
@@ -287,9 +297,7 @@ standards = []
 standards-rfc = ["standards"]
 standards-iso = ["standards"]
 
-# AFL fuzz targets, one binary each. `required-features` is the only home for
-# what a target needs: scripts/fuzz-build.sh reads it back out of
-# `cargo metadata` rather than repeating a feature list of its own.
+# AFL fuzz targets, one binary each.
 [[bin]]
 name = "fuzz_simple_workflow"
 path = "fuzz/simple_workflow.rs"
@@ -313,7 +321,7 @@ required-features = ["full", "testing-fuzz"]
 [[bin]]
 name = "fuzz_colony"
 path = "fuzz/colony/mod.rs"
-# IJON annotations steer the colony state search; the target is unguided without them.
+# IJON annotations steer the colony state search
 required-features = ["full", "testing-fuzz", "testing-fuzz-ijon"]
 
 [build-dependencies]

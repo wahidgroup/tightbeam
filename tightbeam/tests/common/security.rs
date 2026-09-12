@@ -22,6 +22,7 @@ use tightbeam::{
 		utils::{create_test_certificate, create_test_signing_key},
 	},
 	transport::handshake::HandshakeKeyManager,
+	transport::state::ClientIdentity,
 	x509::Certificate,
 	TightBeamError,
 };
@@ -69,15 +70,36 @@ impl ServerMaterials {
 pub struct ClientMaterials {
 	pub certificate: Arc<Certificate>,
 	pub key_manager: Arc<HandshakeKeyManager<DefaultCryptoProvider>>,
+	/// The same provider the key manager holds, for a handshake client that
+	/// takes the provider directly.
+	pub key_provider: Arc<dyn SigningKeyProvider>,
 }
 
 impl ClientMaterials {
 	/// Fresh random identity, distinct from any server materials.
 	pub fn generate() -> Self {
 		let signing_key = random_signing_key();
+		Self::from_signing_key(signing_key)
+	}
+
+	/// Fixed-seed identity, for a scenario whose outcome names the client.
+	pub fn deterministic() -> Self {
+		let signing_key = deterministic_signing_key();
+		Self::from_signing_key(signing_key)
+	}
+
+	/// Self-signed certificate over `signing_key`, bound to the key manager
+	/// that proves it.
+	fn from_signing_key(signing_key: Secp256k1SigningKey) -> Self {
 		let certificate = Arc::new(test_certificate(&signing_key));
-		let key_manager = Arc::new(HandshakeKeyManager::from(signing_key));
-		Self { certificate, key_manager }
+		let key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let key_manager = Arc::new(HandshakeKeyManager::new(Arc::clone(&key_provider)));
+		Self { certificate, key_manager, key_provider }
+	}
+
+	/// The certificate and its key as the one value a handshake client takes.
+	pub fn identity(&self) -> ClientIdentity<DefaultCryptoProvider> {
+		ClientIdentity::new(Arc::clone(&self.certificate), Arc::clone(&self.key_manager))
 	}
 }
 
@@ -88,7 +110,6 @@ impl ClientMaterials {
 pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
 	let trust_chain = vec![certificate.to_owned()];
 	let data = DirectTrustValidator::default().with_trust_chain(trust_chain);
-
 	Arc::new(data)
 }
 
@@ -302,17 +323,14 @@ pub use receipt_fixtures::*;
 mod cms_pair {
 	use std::sync::Arc;
 
-	use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 	use tightbeam::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
-	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use tightbeam::crypto::x509::policy::CertificateValidation;
-	use tightbeam::testing::utils::create_test_certificate;
 	use tightbeam::transport::handshake::negotiation::SecurityOffer;
 	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 	use tightbeam::x509::Certificate;
 	use tightbeam::TightBeamError;
 
-	use super::{pinning_trust_store, random_signing_key, ServerMaterials};
+	use super::{pinning_trust_store, ClientMaterials, ServerMaterials};
 
 	/// Mutually authenticated CMS client/server pair over the fixture
 	/// server identity, plus the fresh client certificate the server
@@ -333,10 +351,9 @@ mod cms_pair {
 		server_profiles: Vec<SecurityProfileDesc>,
 		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Result<CmsHandshakePair, TightBeamError> {
-		let client_signing = random_signing_key();
-		let client_certificate = Arc::new(create_test_certificate(&client_signing));
-		let signing_key = Secp256k1SigningKey::from(client_signing);
-		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let client_materials = ClientMaterials::generate();
+		let client_certificate = Arc::clone(&client_materials.certificate);
+		let client_provider = Arc::clone(&client_materials.key_provider);
 		let trust_store = pinning_trust_store(&materials.certificate)?;
 
 		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
@@ -346,7 +363,7 @@ mod cms_pair {
 		)
 		.with_security_offer(SecurityOffer::new(client_profiles))
 		.with_trust_store(trust_store)
-		.with_client_certificate(Arc::clone(&client_certificate));
+		.with_client_identity(client_materials.identity());
 
 		// The server learns the client certificate from the KeyExchange it
 		// processes, as it does in production. Seeding it here would test a
@@ -404,13 +421,9 @@ mod cms_fixtures {
 		let profile = default_security_profile();
 		let offer = TransportOffer::mux(4).with_budgets(request);
 		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
-
 		let pair = cms_handshake_pair(materials, vec![profile], vec![profile], Some(validators))?;
 
-		let mut client = pair
-			.client
-			.with_client_certificate(Arc::clone(&pair.client_certificate))
-			.with_transport_offer(offer.to_owned());
+		let mut client = pair.client.with_transport_offer(offer.to_owned());
 		if let Some(approver) = hooks.approver {
 			client = client.with_receipt_approver(approver);
 		}

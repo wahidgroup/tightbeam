@@ -256,7 +256,7 @@ async fn connect_with_identity(
 			Arc::new(Secp256k1KeyProvider::from(identity.key.to_owned())),
 		)?
 		.build()
-		.connect(addr)
+		.connect(addr.to_owned())
 		.await?)
 }
 

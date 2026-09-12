@@ -262,12 +262,8 @@ macro_rules! impl_tcp_common {
 				self.provision_from_encryption()
 			}
 
-			fn with_client_identity(
-				mut self,
-				cert: Arc<$crate::x509::Certificate>,
-				key: Arc<$crate::transport::handshake::HandshakeKeyManager<P>>,
-			) -> Self {
-				$crate::transport::state::ClientIdentity::new(cert, key).install(&mut self.encryption);
+			fn with_client_identity(mut self, identity: $crate::transport::state::ClientIdentity<P>) -> Self {
+				identity.install(&mut self.encryption);
 				self
 			}
 
@@ -414,23 +410,6 @@ macro_rules! impl_tcp_common {
 			fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
 				self.limits.operation_timeout = timeout;
 				self
-			}
-		}
-
-		#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::MessageEmitter for $transport<S, P>
-		where
-			TransportError: From<S::Error>,
-		{
-			type EmitterGate = dyn GatePolicy;
-			type RestartPolicy = dyn RestartPolicy;
-
-			fn to_restart_policy_ref(&self) -> &Self::RestartPolicy {
-				self.restart_policy.as_ref()
-			}
-
-			fn to_emitter_gate_policy_ref(&self) -> &Self::EmitterGate {
-				&self.emitter_gate
 			}
 		}
 

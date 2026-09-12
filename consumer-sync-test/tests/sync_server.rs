@@ -1,17 +1,4 @@
 //! Sync (`std`-without-`tokio`) `server!` accept-loop coverage.
-//!
-//! The async expansion is exercised by every scenario suite; this test
-//! pins the sync expansion, which otherwise only compiles when an
-//! embedder builds without `tokio`.
-
-#![cfg(all(
-	feature = "tcp",
-	feature = "transport-policy",
-	feature = "x509",
-	feature = "testing",
-	feature = "instrument",
-	not(feature = "tokio")
-))]
 
 use std::net::{TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 use std::thread;

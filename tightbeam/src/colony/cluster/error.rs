@@ -34,13 +34,11 @@ pub enum ClusterError {
 	/// Transport-level failure while communicating with a hive/servlet
 	#[error("Transport error: {0}")]
 	#[from]
-	#[source]
 	Transport(TransportError),
 
 	/// Frame encode/decode/build/sign failure
 	#[error("Frame error: {0}")]
 	#[from]
-	#[source]
 	Frame(TightBeamError),
 
 	/// Response decoded but did not carry the expected field

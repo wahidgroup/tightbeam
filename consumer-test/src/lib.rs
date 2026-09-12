@@ -27,3 +27,7 @@ where
 	Ping: CheckDigestOid<Sha3_256> + CheckAeadOid<Aes256GcmOid> + CheckSignatureOid<Secp256k1Signature>,
 {
 }
+
+// Names the macro-generated type from outside its module, so the visibility
+// `flagset!` was given is what makes this resolve.
+pub use expansions::ConsumerFlags;

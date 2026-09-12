@@ -746,15 +746,22 @@ pub trait EncryptedMessageIO: MessageIO {
 			.key_manager
 			.as_ref()
 			.ok_or(TransportError::MissingEncryption)?;
-		let client_cert = self.encryption().client_certificate.as_ref().map(Arc::clone);
+
+		let transport_offer = self.encryption().mux_offer.as_deref().cloned();
+		let receipt_approver = self.encryption().receipt_approver.as_ref().map(Arc::clone);
+		let client_cert = self
+			.encryption()
+			.client_identity
+			.as_ref()
+			.map(|identity| identity.certificate_arc());
 
 		Ok(key.create_ecies_client::<Secp256k1EciesMessage>(
 			None,
 			client_cert,
 			None,
 			validator,
-			self.encryption().mux_offer.as_deref().cloned(),
-			self.encryption().receipt_approver.as_ref().map(Arc::clone),
+			transport_offer,
+			receipt_approver,
 		)?)
 	}
 
@@ -796,7 +803,11 @@ pub trait EncryptedMessageIO: MessageIO {
 		let trust_store = Arc::clone(store);
 		let server_identity = Arc::clone(chain).into();
 		let security_offer = Some(SecurityOffer::new(vec![SecurityProfileDesc::from(&TightbeamProfile)]));
-		let client_certificate = self.encryption().client_certificate.as_ref().map(Arc::clone);
+		let client_certificate = self
+			.encryption()
+			.client_identity
+			.as_ref()
+			.map(|identity| identity.certificate_arc());
 
 		Ok(key.create_cms_client(CmsClientConfig {
 			server_identity,
@@ -899,8 +910,14 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::AeadCipher: KeyInit + Send + Sync,
 	{
 		let kind = self.encryption().handshake_protocol;
-		// Branch: Handle ECIES without mutual auth separately (K=() cannot be trait object)
-		if matches!(kind, HandshakeProtocolKind::Ecies) && self.encryption().key_manager.as_ref().is_none() {
+		let carries_identity = self.encryption().has_client_identity();
+		let signs_handshake = self.encryption().key_manager.is_some();
+
+		// Branch: an ECIES endpoint that proves no identity of its own takes
+		// the anonymous path, where `K = ()` cannot be a trait object. An
+		// endpoint carrying a client identity stays on the mutual-auth path,
+		// which reports the missing key rather than dialling anonymously.
+		if matches!(kind, HandshakeProtocolKind::Ecies) && !carries_identity && !signs_handshake {
 			let outcome = self.perform_client_handshake_no_mutual_auth().await;
 
 			#[cfg(feature = "instrument")]

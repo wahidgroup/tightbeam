@@ -1,0 +1,13 @@
+[package]
+name = "tightbeam-consumer-test-default"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+tightbeam = { package = "tightbeam-rs", path = "../tightbeam" }
+
+[dev-dependencies]
+trybuild = { version = "=1.0.118", features = ["diff"] }

@@ -9,6 +9,7 @@ use crate::Errorizable;
 
 /// Errors specific to X.509 certificate validation
 #[derive(Errorizable, Debug)]
+#[non_exhaustive]
 pub enum CertificateValidationError {
 	/// Certificate has expired
 	#[error("Certificate has expired")]
