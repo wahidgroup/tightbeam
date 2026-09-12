@@ -70,7 +70,6 @@ tb_assert_spec! {
 	pub MuxChunkedRoundtripSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FIRST_LARGE_FRAME_ECHOED, exactly!(1), equals!(true)),
 			(SECOND_LARGE_FRAME_ECHOED, exactly!(1), equals!(true))
@@ -112,7 +111,6 @@ tb_assert_spec! {
 	pub MuxCreditStallSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(OPEN_CHUNK_SPENDS_INITIAL_CREDIT, exactly!(1), equals!(true)),
 			(SENDER_STALLS_AT_INITIAL_CREDIT, exactly!(1), equals!(true)),
@@ -197,7 +195,6 @@ tb_assert_spec! {
 	pub MuxZeroBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(ZERO_BUDGET_EMIT_REFUSED, exactly!(1), equals!(true)),
@@ -264,7 +261,6 @@ tb_assert_spec! {
 	pub MuxBudgetExhaustionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
@@ -392,7 +388,6 @@ tb_assert_spec! {
 	pub MuxFlowViolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(4)),
 			(OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true)),
@@ -429,7 +424,6 @@ tb_assert_spec! {
 	pub MuxAuthorizerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLIENT_VIEWS_REDUCED_GRANT, exactly!(1), equals!(true)),
 			(SERVER_VIEWS_REDUCED_GRANT, exactly!(1), equals!(true))
@@ -477,7 +471,6 @@ tb_assert_spec! {
 	pub MuxAuthorizerRefusalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVER_REFUSES_WITH_CODE, exactly!(1), equals!(true)),
 			(CLIENT_FAILS_CLOSED, exactly!(1), equals!(true))
@@ -534,7 +527,6 @@ tb_assert_spec! {
 	pub MuxAuthorizerDeadlineSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVER_BOUNDS_HUNG_AUTHORIZER, exactly!(1), equals!(true)),
 			(CLIENT_FAILS_CLOSED, exactly!(1), equals!(true))
@@ -598,7 +590,6 @@ tb_assert_spec! {
 	pub MuxRekeyChunkedDrainSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(events::MUX_GOAWAY_RECV, exactly!(1)),

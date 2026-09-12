@@ -233,7 +233,6 @@ tb_assert_spec! {
 	pub LaserLoneServerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(LASER_SERVER_STREAM_REPORTS_LENGTH, exactly!(1), equals!(true))
 		]
@@ -293,7 +292,6 @@ tb_assert_spec! {
 	pub LaserRoutingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(LASER_WORK_SENT, exactly!(1)),
 			(LASER_WORK_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -343,7 +341,6 @@ tb_assert_spec! {
 	pub LaserGatewayRestartSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(LASER_ROUTE_BEFORE_RESTART, exactly!(1), equals!(TransitStatus::Ok)),
 			(LASER_ROUTE_AFTER_RESTART, exactly!(1), equals!(TransitStatus::Ok)),

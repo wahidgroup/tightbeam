@@ -52,7 +52,6 @@ tb_assert_spec! {
 	pub MuxInterleavedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FIRST_STREAM_ECHOED, exactly!(1), equals!(true)),
 			(SECOND_STREAM_ECHOED, exactly!(1), equals!(true))
@@ -106,7 +105,6 @@ tb_assert_spec! {
 	pub MuxCapExhaustionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_STREAMS_EXHAUSTED, exactly!(1)),
 			(NEGOTIATED_CAP_IS_ONE, exactly!(1), equals!(true)),
@@ -188,7 +186,6 @@ tb_assert_spec! {
 	pub MuxNonNegotiatedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(HANDSHAKE_NEGOTIATED_NO_MUX, exactly!(1), equals!(true)),
 			(MUXED_ENVELOPE_INVALID_MESSAGE, exactly!(1), equals!(true))
@@ -230,7 +227,6 @@ tb_assert_spec! {
 	pub MuxCancelAbortSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FOLLOWUP_ECHOES_ON_FREED_SLOT, exactly!(1), equals!(true)),
 			(HANDLER_ABORTED_ON_CANCEL, exactly!(1), equals!(true))
@@ -298,7 +294,6 @@ tb_assert_spec! {
 	pub MuxCancelRaceSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CANCEL_OBSERVED_ON_WIRE, exactly!(1), equals!(true)),
 			(FOLLOWUP_ECHOES_AFTER_RACE, exactly!(1), equals!(true))
@@ -362,7 +357,6 @@ tb_assert_spec! {
 	pub MuxEndGarbageSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(BUSY_GARBAGE_RESOLVES_AS_BUSY, exactly!(1), equals!(true)),
 			(FOLLOWUP_ECHOES_AFTER_GARBAGE, exactly!(1), equals!(true))
@@ -412,7 +406,6 @@ tb_assert_spec! {
 	pub MuxServerInitiatedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVER_STREAM_ECHOED_BY_CLIENT, exactly!(1), equals!(true))
 		]

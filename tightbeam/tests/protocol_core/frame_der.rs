@@ -109,7 +109,6 @@ tb_assert_spec! {
 	pub FrameDerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DER_NONEMPTY, exactly!(1), equals!(true)),
 			(ROUNDTRIP_OK, exactly!(1), equals!(true)),

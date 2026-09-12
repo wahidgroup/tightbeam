@@ -85,7 +85,6 @@ tb_assert_spec! {
 	pub ManualEventSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PIPELINE_START, exactly!(1)),
 			(PIPELINE_COMPLETE, exactly!(1))
@@ -121,7 +120,6 @@ tb_assert_spec! {
 	pub AutoTraceSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			// Auto-emitted job URNs from PipelineBuilder (urn:tightbeam:event:job/...)
 			(CREATE_TEST_FRAME_START, exactly!(1)),
@@ -192,7 +190,6 @@ tb_assert_spec! {
 	pub FallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FALLBACK_TRIGGERED, exactly!(1))
 		]

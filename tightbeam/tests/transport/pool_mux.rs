@@ -280,7 +280,6 @@ tb_assert_spec! {
 	pub MuxLeaseShareSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::POOL_REUSE_MUX, exactly!(1)),
@@ -319,7 +318,6 @@ tb_assert_spec! {
 	pub PooledStreamSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(POOLED_STREAM_RESPONSE_REPORTS_LENGTH, exactly!(1), equals!(true))
@@ -358,7 +356,6 @@ tb_assert_spec! {
 	pub PooledDuplexSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(POOLED_DUPLEX_ECHOES_CHUNKS, exactly!(1), equals!(true))
@@ -401,7 +398,6 @@ tb_assert_spec! {
 	pub PooledMixedKindsSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(POOLED_MIXED_KINDS_SHARE_ONE_CONNECTION, exactly!(1), equals!(true))
@@ -464,7 +460,6 @@ tb_assert_spec! {
 	pub UnservedKindSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNSERVED_KIND_ANSWERS_UNIMPLEMENTED, exactly!(1), equals!(true))
 		]
@@ -518,7 +513,6 @@ tb_assert_spec! {
 	pub MuxPeerCertificateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(MUX_LEASE_PINS_PEER_CERTIFICATE, exactly!(1), equals!(true))
@@ -551,7 +545,6 @@ tb_assert_spec! {
 	pub MuxLeaseConnSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CONN_REPORTS_INVALID_STATE, exactly!(1), equals!(true))
 		]
@@ -639,7 +632,6 @@ tb_assert_spec! {
 	pub MuxFailoverDialSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(2)),
 			(events::POOL_REUSE_MUX, exactly!(1)),
@@ -678,7 +670,6 @@ tb_assert_spec! {
 	pub MuxFailoverReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(2)),
 			(events::POOL_REUSE_MUX, exactly!(3)),
@@ -725,7 +716,6 @@ tb_assert_spec! {
 	pub MuxNoHeadroomSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::POOL_REUSE_MUX, exactly!(1)),
@@ -768,7 +758,6 @@ tb_assert_spec! {
 	pub MuxDeclinedFallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::POOL_MUX_DECLINED, exactly!(1)),
@@ -802,7 +791,6 @@ tb_assert_spec! {
 	pub MuxDeclinedIdleReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::POOL_MUX_DECLINED, exactly!(1)),
@@ -924,7 +912,6 @@ tb_assert_spec! {
 	pub MuxEvictionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(2)),
 			(events::POOL_EVICTED, exactly!(1)),
@@ -965,7 +952,6 @@ tb_assert_spec! {
 	pub MuxIdlePruneSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(2)),
 			(events::POOL_PRUNED_IDLE, exactly!(1)),
@@ -1009,7 +995,6 @@ tb_assert_spec! {
 	pub MuxServesSingleFlightSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SINGLE_FLIGHT_ECHO_ON_MUX_SERVER, exactly!(1), equals!(true))
 		]
@@ -1147,7 +1132,6 @@ tb_assert_spec! {
 	pub MuxGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_REJECT, exactly!(1)),
@@ -1203,7 +1187,6 @@ tb_assert_spec! {
 	pub MuxStreamGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_REJECT, exactly!(1)),
@@ -1252,7 +1235,6 @@ tb_assert_spec! {
 	pub MuxDuplexGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_REJECT, exactly!(1)),
@@ -1301,7 +1283,6 @@ tb_assert_spec! {
 	pub MuxGateListSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_REJECT, exactly!(1)),
@@ -1359,7 +1340,6 @@ tb_assert_spec! {
 	pub MuxUnknownGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_REJECT, exactly!(1)),
@@ -1417,7 +1397,6 @@ tb_assert_spec! {
 	pub MuxHandlerFailureSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_ACCEPT, exactly!(2)),
@@ -1612,7 +1591,6 @@ tb_assert_spec! {
 	pub PooledMeteringSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::MUX_REKEY_REQUESTED, at_least!(1)),

@@ -926,24 +926,22 @@ impl ConsumedTrace {
 		}
 	}
 
-	/// Determine execution mode based on trace outcome
+	/// What the recorded run did, read from the field that holds each fact.
+	///
+	/// An error is [`ConsumedTrace::error`] and a rejection is a gate decision
+	/// that is not `Ok`. A run with no gate decision took no gate, which is
+	/// not a second way of saying it failed.
 	pub fn execution_mode(&self) -> ExecutionMode {
 		#[cfg(feature = "transport")]
 		if self.error.is_some() {
 			return ExecutionMode::Error;
 		}
-		#[cfg(feature = "policy")]
-		{
-			if matches!(self.gate_decision, Some(TransitStatus::Ok)) {
-				return ExecutionMode::Accept;
-			}
-			if self.gate_decision.is_some() {
-				return ExecutionMode::Reject;
-			}
 
-			ExecutionMode::Error
+		#[cfg(feature = "policy")]
+		if matches!(self.gate_decision, Some(status) if status != TransitStatus::Ok) {
+			return ExecutionMode::Reject;
 		}
-		#[cfg(not(feature = "policy"))]
+
 		ExecutionMode::Accept
 	}
 
@@ -1025,7 +1023,6 @@ mod tests {
 		pub TraceCollectorSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(ALPHA, exactly!(1)),
 				(BETA, exactly!(1)),

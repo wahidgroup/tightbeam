@@ -90,7 +90,6 @@ tb_assert_spec! {
 	pub AttributeInjectionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(INJECTION_INVISIBLE_TO_SIGNATURES, exactly!(1), equals!(true)),
 			(DUPLICATE_ATTRIBUTE_FAILS_CLOSED, exactly!(1), equals!(true)),

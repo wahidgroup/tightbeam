@@ -11,14 +11,12 @@ tb_assert_spec! {
 	pub OutOfOrderSpec,
 	V(2,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(NEWER_KEY, exactly!(1))
 		]
 	},
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(OLDER_KEY, exactly!(1))
 		]

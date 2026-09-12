@@ -48,7 +48,6 @@ tb_assert_spec! {
 	pub AlgorithmConfusionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FOREIGN_OID_REJECTED, exactly!(1u32))
 		]

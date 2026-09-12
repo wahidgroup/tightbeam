@@ -11,7 +11,6 @@ use alloc::{sync::Arc, vec::Vec};
 use std::{sync::Arc, vec::Vec};
 
 use crate::error::TightBeamError;
-use crate::policy::TransitStatus;
 use crate::testing::fdr::FdrVerdict;
 use crate::testing::macros::{BuiltAssertSpec, TraceCollector};
 use crate::testing::result::ScenarioVerdict;
@@ -285,7 +284,6 @@ impl HookContext {
 	pub fn build(config: &ScenarioConfig, trace: &TraceCollector, execution: Result<(), TightBeamError>) -> Self {
 		let mut consumed_trace = ConsumedTrace::new();
 		consumed_trace.populate_from_collector(trace);
-		consumed_trace.gate_decision = Some(TransitStatus::Ok);
 		if execution.is_err() {
 			consumed_trace.error = Some(TransportError::InvalidMessage);
 		}

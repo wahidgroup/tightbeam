@@ -6,7 +6,6 @@ tb_assert_spec! {
 	pub ClusterTeardownSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(SERVLET_STOPPED, exactly!(1))
@@ -61,7 +60,6 @@ tb_assert_spec! {
 	pub ClusterPolicySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
 			(events::CLUSTER_GATE_BLOCKED, exactly!(1)),
@@ -105,7 +103,6 @@ tb_assert_spec! {
 	pub ClusterUnsignedRegistrationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
@@ -158,7 +155,6 @@ tb_assert_spec! {
 	pub ClusterRefusedRegNotQueuedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
@@ -219,7 +215,6 @@ tb_assert_spec! {
 	pub ClusterNoTrustStoreSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
@@ -270,7 +265,6 @@ tb_assert_spec! {
 	pub ClusterServletLocatorAlignSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
@@ -367,7 +361,6 @@ tb_assert_spec! {
 	pub ClusterReplaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(2)),
@@ -474,7 +467,6 @@ tb_assert_spec! {
 	pub ClusterHeartbeatRejectionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -627,7 +619,6 @@ tb_assert_spec! {
 	pub ClusterCrossHiveUpdateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2)),
 			(REGISTER_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
@@ -716,7 +707,6 @@ tb_assert_spec! {
 	pub ClusterRegistrationHijackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
@@ -793,7 +783,6 @@ tb_assert_spec! {
 	pub ClusterRemovalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(1)),

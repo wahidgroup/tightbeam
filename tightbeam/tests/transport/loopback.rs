@@ -68,7 +68,6 @@ tb_assert_spec! {
 	pub HandshakeLoopbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(LOOPBACK_ECIES_COMPLETE, exactly!(ECIES_RUNS), equals!(true)),
 			(LOOPBACK_ECIES_ROUNDTRIP, exactly!(ECIES_RUNS), equals!(true)),

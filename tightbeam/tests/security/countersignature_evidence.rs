@@ -85,7 +85,6 @@ mod ecies {
 		pub CountersignatureTamperSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(TAMPERED_CIPHERTEXT_REJECTED, exactly!(1), equals!(true)),
 				(SETTLE_NEVER_FIRED, exactly!(1), equals!(true)),
@@ -223,7 +222,6 @@ mod cms {
 		pub CountersignatureMissingSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(STRIPPED_FINISHED_STILL_AUTHENTICATES, exactly!(1), equals!(true)),
 				(MISSING_COUNTERSIGNATURE_FAILS_CLOSED, exactly!(1), equals!(true)),

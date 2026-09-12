@@ -238,7 +238,6 @@ tb_assert_spec! {
 	pub ClusterGossipFloodSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(3), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
@@ -313,7 +312,6 @@ tb_assert_spec! {
 	pub ClusterGossipChainSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(3), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -381,7 +379,6 @@ tb_assert_spec! {
 	pub ClusterGossipHiveTrustOnlySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -445,7 +442,6 @@ tb_assert_spec! {
 	pub ClusterGossipTtlClampSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -542,7 +538,6 @@ tb_assert_spec! {
 	pub ClusterGossipPlaneSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(GOSSIP_PUBLISH_STATUS, exactly!(3), equals!(TransitStatus::PermissionDenied)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(3)),
@@ -630,7 +625,6 @@ tb_assert_spec! {
 	pub ClusterGossipReconcileRepairSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -688,7 +682,6 @@ tb_assert_spec! {
 	pub ClusterGossipRetrySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -805,7 +798,6 @@ tb_assert_spec! {
 	pub ClusterGossipJournalSeamSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -820,7 +812,6 @@ tb_assert_spec! {
 	pub ClusterGossipRateLimitSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -880,7 +871,6 @@ tb_assert_spec! {
 	pub ClusterGossipRetentionClampSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -946,7 +936,6 @@ tb_assert_spec! {
 	pub ClusterGossipDuplicateFreeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(4), equals!(TransitStatus::Ok)),
@@ -1055,7 +1044,6 @@ tb_assert_spec! {
 	pub ClusterGossipInvalidRelaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -1196,7 +1184,6 @@ tb_assert_spec! {
 	pub ClusterGossipGreyHoleSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -1285,7 +1272,6 @@ tb_assert_spec! {
 	pub ClusterGossipTamperedRelaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
@@ -1384,7 +1370,6 @@ tb_assert_spec! {
 	pub ClusterGossipForeignColonySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(PEER_ROUTES_AFTER, exactly!(1), equals!(1u64)),
@@ -1494,7 +1479,6 @@ tb_assert_spec! {
 	pub ClusterGossipOriginBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(GOSSIP_RELAY_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(GOSSIP_LIMITED_STATUS, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
@@ -1555,7 +1539,6 @@ tb_assert_spec! {
 	pub ClusterGossipNonMemberSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(events::CLUSTER_GOSSIP_REFUSED, exactly!(1)),
@@ -1601,7 +1584,6 @@ tb_assert_spec! {
 	pub ClusterGossipReconcileSameColonySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(GOSSIP_RECONCILE_MEMBER_WANT, exactly!(1), equals!(1u64)),
 			(GOSSIP_RECONCILE_FOREIGN_WANT, exactly!(1), equals!(0u64)),
@@ -1662,7 +1644,6 @@ tb_assert_spec! {
 	pub ClusterGossipIngressNoneSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
 			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0)),
@@ -1719,7 +1700,6 @@ tb_assert_spec! {
 	pub ClusterPeerDiscoverySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, at_least!(2), equals!(1u64)),
 			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -1789,7 +1769,6 @@ tb_assert_spec! {
 	pub ClusterPeerEclipseBoundSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_TABLE_FLOOD_ADMITTED, exactly!(1), equals!(MAX_PEER_BUCKET as u64)),
 			(PEER_TABLE_ANCHOR_RETAINED, exactly!(1), equals!(true)),
@@ -1915,7 +1894,6 @@ tb_assert_spec! {
 	pub ClusterPeerForeignProbeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_PROBE_HINTS_ADMITTED, exactly!(1), equals!(2u64)),
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(1)),
@@ -2026,7 +2004,6 @@ tb_assert_spec! {
 	pub ClusterOversizedReplySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(0)),
 			(PEER_ABUSE_CANDIDATE_DISCARDED, exactly!(1), equals!(true))
@@ -2075,7 +2052,6 @@ tb_assert_spec! {
 	pub ClusterPeerEvictionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(1)),
 			(PEER_EVICT_MEMBER_PROMOTED, exactly!(1), equals!(true)),
@@ -2204,7 +2180,6 @@ tb_assert_spec! {
 	pub ClusterLocalFaultSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_PEER_DISCOVERED, exactly!(1)),
 			(PEER_LOCAL_FAULT_MEMBER_PROMOTED, exactly!(1), equals!(true)),

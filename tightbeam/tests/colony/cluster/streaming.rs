@@ -164,7 +164,6 @@ tb_assert_spec! {
 	pub ClusterStreamForwardSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -215,7 +214,6 @@ tb_assert_spec! {
 	pub ClusterDuplexForwardSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -271,7 +269,6 @@ tb_assert_spec! {
 	pub ClusterStreamGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
 			(events::CLUSTER_GATE_BLOCKED, exactly!(2)),
@@ -324,7 +321,6 @@ tb_assert_spec! {
 	pub ClusterEdgePlaneStreamRefuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(EDGE_STREAM_REFUSED, exactly!(1), equals!(true)),
@@ -378,7 +374,6 @@ tb_assert_spec! {
 	pub ClusterDuplexCancelSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),

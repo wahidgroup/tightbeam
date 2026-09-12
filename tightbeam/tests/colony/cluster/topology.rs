@@ -125,7 +125,6 @@ tb_assert_spec! {
 	pub TopologySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),

@@ -357,7 +357,6 @@ tb_assert_spec! {
 	pub QueueFreeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		tag_filter: [QUEUE_TAG],
 		assertions: [
 			(LAG_TIP, present!(), equals!(0u64)),

@@ -164,7 +164,6 @@ tb_assert_spec! {
 	pub PoolReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(POOL_CREATE, exactly!(1)),
 			(ACQUIRE_CLIENT, exactly!(3)),
@@ -182,7 +181,6 @@ tb_assert_spec! {
 	// the spec verifies delivery instead of an inline assert.
 	V(1,1,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(POOL_CREATE, exactly!(1)),
 			(ACQUIRE_CLIENT, exactly!(3)),
@@ -201,7 +199,6 @@ tb_assert_spec! {
 	pub PoolIsolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(POOL_CREATE, exactly!(1)),
 			(ACQUIRE_CLIENT, exactly!(3)),
@@ -220,7 +217,6 @@ tb_assert_spec! {
 	// the spec verifies delivery instead of an inline assert.
 	V(1,1,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(POOL_CREATE, exactly!(1)),
 			(ACQUIRE_CLIENT, exactly!(3)),

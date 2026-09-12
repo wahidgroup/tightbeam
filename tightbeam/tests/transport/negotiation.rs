@@ -142,7 +142,6 @@ tb_assert_spec! {
 	pub ProfileNegotiationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(HANDSHAKE_START, exactly!(1)),
 			(CLIENT_HELLO_SENT, exactly!(1)),

@@ -66,7 +66,6 @@ tb_assert_spec! {
 	pub TranscriptBindingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(TAMPERED_ACCEPT_REJECTED, exactly!(1u32)),
 			(STRIPPED_OFFER_REJECTED, exactly!(1u32))

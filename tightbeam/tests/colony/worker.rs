@@ -55,7 +55,6 @@ tb_assert_spec! {
 	pub WorkerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RELAY_START, exactly!(1)),
 			(RELAY_SUCCESS, exactly!(1), equals!("DEFAULT_PONG"))
@@ -63,7 +62,6 @@ tb_assert_spec! {
 	},
 	V(2,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RELAY_START, exactly!(1)),
 			(RELAY_SUCCESS, exactly!(1), equals!("CUSTOM_RESPONSE"))

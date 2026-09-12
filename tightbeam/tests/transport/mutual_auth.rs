@@ -154,7 +154,6 @@ tb_assert_spec! {
 	MutualAuthSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RESPONSE_RECEIVED, exactly!(1), equals!(IsSome)),
 			(SERVER_ID, exactly!(1), equals!("mutual-auth-server")),
@@ -245,7 +244,6 @@ tb_assert_spec! {
 	pub InvalidClientSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLIENT_CERT_REJECTED, exactly!(1), equals!(true))
 		]
@@ -304,7 +302,6 @@ tb_assert_spec! {
 	pub InvalidServerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVER_CERT_REJECTED, exactly!(1), equals!(true)),
 			(events::SESSION_CERT_REJECTED, at_least!(1))

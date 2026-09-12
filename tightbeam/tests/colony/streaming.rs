@@ -127,7 +127,6 @@ tb_assert_spec! {
 	pub ColonyStreamingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVLET_UNARY_HANDLED, exactly!(1)),
 			(SERVLET_STREAM_HANDLED, exactly!(1)),
@@ -214,7 +213,6 @@ tb_assert_spec! {
 	pub StreamOnlyServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(STREAM_ONLY_REPLY_OK, exactly!(1), equals!(true)),
 			(STREAM_ONLY_UNARY_REFUSED, exactly!(1), equals!(true))
@@ -302,7 +300,6 @@ tb_assert_spec! {
 	pub HiveStreamingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVLET_STREAM_HANDLED, exactly!(1)),
 			(HIVE_STREAM_REPLY_REPORTS_LENGTH, exactly!(1), equals!(true))
@@ -346,7 +343,6 @@ tb_assert_spec! {
 	pub HiveDuplexSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVLET_DUPLEX_HANDLED, exactly!(1)),
 			(HIVE_DUPLEX_ECHOES_CHUNKS, exactly!(1), equals!(true))

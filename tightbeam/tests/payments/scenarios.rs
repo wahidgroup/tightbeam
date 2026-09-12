@@ -178,7 +178,6 @@ tb_assert_spec! {
 	pub PaymentGatewaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(1)),

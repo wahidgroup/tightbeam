@@ -73,7 +73,6 @@ tb_assert_spec! {
 	pub SpliceAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SPLICED_KEX_REJECTED, exactly!(1u32))
 		]

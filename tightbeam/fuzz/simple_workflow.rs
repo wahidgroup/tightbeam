@@ -22,7 +22,6 @@ tb_assert_spec! {
 	pub SimpleFuzzSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(START, exactly!(1)),
 			(ACTION_A, at_least!(0)),

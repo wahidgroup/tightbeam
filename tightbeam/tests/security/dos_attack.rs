@@ -45,7 +45,6 @@ tb_assert_spec! {
 	pub DosAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DOS_GENERATE_OVERSIZED, exactly!(BACKEND_COUNT_U32)),
 			(DOS_INJECT_OVERSIZED, exactly!(BACKEND_COUNT_U32)),

@@ -145,7 +145,6 @@ tb_assert_spec! {
 	pub ConnectionReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLIENT_CONNECT, exactly!(1)),
 			(SEND_MESSAGE, exactly!(3)),

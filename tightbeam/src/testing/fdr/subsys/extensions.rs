@@ -97,48 +97,36 @@ pub trait FdrTraceExt {
 
 impl FdrTraceExt for ConsumedTrace {
 	fn csp_valid(&self) -> bool {
-		// Trace is valid if:
-		// 1. No transport errors occurred
-		// 2. Gate decision was reached (Accept or Reject)
-		// 3. If accepted, handler executed (evidenced by assertions)
 		if self.error.is_some() {
 			return false;
 		}
 
-		// Must have a gate decision (part of the protocol)
-		if self.gate_decision.is_none() {
-			return false;
-		}
-
-		// If gate accepted, we expect handler evidence (assertions or response)
+		// A gate that accepted should have something to show for it. A run
+		// with no gate decision took no gate, so there is nothing to test.
 		if matches!(self.gate_decision, Some(TransitStatus::Ok))
 			&& self.assertions.is_empty()
 			&& self.response.is_none()
 		{
-			return false; // Handler should have done something
+			return false;
 		}
 
 		true
 	}
 
 	fn terminated_in_valid_state(&self) -> bool {
-		// Check if execution completed successfully in a terminal state:
-		// 1. No errors
-		// 2. Gate decision reached
-		// 3. For accepted requests: response generated or terminal assertions present
 		if self.error.is_some() {
 			return false;
 		}
 
 		match self.gate_decision {
-			Some(TransitStatus::Ok) => {
-				// Ok path: should have response or assertions (indicating handler execution)
-				self.response.is_some() || !self.assertions.is_empty()
-			}
-			Some(TransitStatus::Unknown) | None => false, // No decision = incomplete execution
-			// Every other status is a rejection; rejection paths are
-			// terminal by definition
+			// Accepted, so the handler should have run.
+			Some(TransitStatus::Ok) => self.response.is_some() || !self.assertions.is_empty(),
+			// A gate that reached no decision did not terminate.
+			Some(TransitStatus::Unknown) => false,
+			// Every other status is a rejection, which is terminal.
 			Some(_) => true,
+			// No gate was taken, so the gate has nothing to say about it.
+			None => true,
 		}
 	}
 

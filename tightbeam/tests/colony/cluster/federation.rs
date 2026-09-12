@@ -221,7 +221,6 @@ tb_assert_spec! {
 	pub ClusterTransitiveDiscoverySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_AD_LEARNED, at_least!(2)),
@@ -283,7 +282,6 @@ tb_assert_spec! {
 	pub ClusterRelayFallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(events::CLUSTER_PEER_AD_LEARNED, at_least!(1)),
@@ -369,7 +367,6 @@ tb_assert_spec! {
 	pub ClusterStreamRelayFallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(events::CLUSTER_PEER_AD_LEARNED, at_least!(1)),
@@ -500,7 +497,6 @@ tb_assert_spec! {
 	pub ClusterStreamBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -603,7 +599,6 @@ tb_assert_spec! {
 	pub ClusterLiveDecoyFailoverSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_AD_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
