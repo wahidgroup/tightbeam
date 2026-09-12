@@ -29,7 +29,6 @@ fn build_fdr_config(
 		timeout_ms,
 		specs,
 		fail_fast: true,
-		expect_failure: false,
 		..Default::default()
 	}
 }

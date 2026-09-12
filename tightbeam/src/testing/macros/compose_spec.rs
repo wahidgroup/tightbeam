@@ -1,6 +1,7 @@
 //! tb_compose_spec! macro for defining CSP process compositions
 
 /// Define a CSP Process Composition with declarative syntax.
+#[cfg(feature = "testing-csp")]
 #[macro_export]
 macro_rules! tb_compose_spec {
 	// ========================================================================
@@ -329,4 +330,5 @@ macro_rules! tb_compose_spec {
 	(@opt_value) => { None };
 }
 
+#[cfg(feature = "testing-csp")]
 pub use tb_compose_spec;

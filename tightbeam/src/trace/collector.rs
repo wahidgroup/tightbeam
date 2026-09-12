@@ -1,5 +1,3 @@
-#![allow(unexpected_cfgs)]
-
 use core::cell::Cell;
 use core::time::Duration;
 

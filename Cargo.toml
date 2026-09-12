@@ -7,6 +7,7 @@ members = [
 ]
 exclude = [
 	"consumer-default-test",
+	"consumer-expansion-test",
 	"consumer-sync-test",
 ]
 

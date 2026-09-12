@@ -1,0 +1,22 @@
+[package]
+name = "tightbeam-consumer-test-expansion"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features = false }
+
+# One `tb_scenario!` body has to compile under both selections.
+[features]
+narrow = ["tightbeam/std", "tightbeam/transport-cms", "tightbeam/testing"]
+wide = [
+	"tightbeam/std",
+	"tightbeam/transport-cms",
+	"tightbeam/testing",
+	"tightbeam/testing-csp",
+	"tightbeam/testing-fdr",
+	"tightbeam/instrument",
+]

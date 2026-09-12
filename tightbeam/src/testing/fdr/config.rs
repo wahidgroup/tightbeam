@@ -3,32 +3,18 @@
 //! This module contains the core configuration structures and result types
 //! used by the FDR exploration engine.
 
-use std::collections::HashSet;
-
 #[cfg(feature = "testing-fault")]
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use crate::testing::error::TestingError;
-use crate::testing::specs::csp::{Event, Process, State};
+use crate::testing::specs::csp::Process;
 
 #[cfg(feature = "testing-fault")]
 use crate::testing::fault::{ProcessEvent, ProcessState};
 #[cfg(feature = "testing-fmea")]
-use crate::testing::fmea::{FmeaConfig, FmeaReport};
+use crate::testing::fmea::FmeaConfig;
 #[cfg(feature = "testing-fault")]
 use crate::{constants::DEFAULT_FAULT_SEED, error::TightBeamError, testing::error::FdrConfigError, utils::BasisPoints};
-
-/// CSP trace: sequence of observable events
-pub type Trace = Vec<Event>;
-
-/// Refusal set: events refused in stable state
-pub type RefusalSet = HashSet<Event>;
-
-/// Failure: (trace, refusal_set)
-pub type Failure = (Trace, RefusalSet);
-
-/// Acceptance set: events accepted after trace
-pub type AcceptanceSet = HashSet<Event>;
 
 /// Scheduler model type
 /// Panics if used when `testing-fault` feature is not enabled
@@ -182,11 +168,6 @@ pub struct FdrConfig {
 	/// When false, checks all specs and collects all violations
 	pub fail_fast: bool,
 
-	/// Expect FDR refinement to fail (for negative tests)
-	/// When true, the test passes if refinement fails
-	/// When false (default), the test fails if refinement fails
-	pub expect_failure: bool,
-
 	/// Number of schedulers (m) - for resource constraint modeling
 	/// When m < n (process_count), some traces become impossible
 	/// Optional: set to Some(_) to enable scheduler modeling, None to disable.
@@ -224,7 +205,6 @@ impl Default for FdrConfig {
 			timeout_ms: 5000,
 			specs: Vec::new(),
 			fail_fast: true,
-			expect_failure: false,
 			scheduler_model: None,
 			#[cfg(feature = "testing-fault")]
 			scheduler_count: None,
@@ -306,145 +286,12 @@ pub struct InjectedFaultRecord {
 	pub probability_bps: u16,
 }
 
-/// FDR verification verdict
-///
-/// Captures verification results from multi-seed exploration and refinement checking:
-/// - Single-process properties: determinism, deadlock, divergence
-/// - Refinement checking: Spec ⊑ Impl (traces, failures, divergences)
-#[derive(Debug, Clone, PartialEq)]
-pub struct FdrVerdict {
-	/// Overall pass/fail status
-	pub passed: bool,
-
-	/// Whether analysis ran without hitting resource bounds or timeouts
-	///
-	/// False when trace/failure sets were truncated (bounded claim) or a
-	/// refinement check was inconclusive. See the type-level docs.
-	pub complete: bool,
-
-	/// Divergence freedom: no infinite τ-loops detected
-	pub divergence_free: bool,
-
-	/// Deadlock freedom: no unexpected STOP states
-	pub deadlock_free: bool,
-
-	/// Determinism: structural proof that the LTS is deterministic
-	///
-	/// True only when the process has no hidden (τ) actions and no
-	/// multi-target `(state, event)` transition -- a sufficient structural
-	/// condition for CSP determinism (Roscoe 2010, §10.5). Informational:
-	/// nondeterminism is a modeling choice, not a failure, so this flag
-	/// does not affect `passed`.
-	pub is_deterministic: bool,
-
-	/// Trace refinement: traces(Impl) ⊆ traces(Spec)
-	/// Only meaningful when specs provided in FdrConfig
-	pub trace_refines: bool,
-
-	/// Failures refinement: failures(Impl) ⊆ failures(Spec)
-	/// Only meaningful when specs provided in FdrConfig
-	pub failures_refines: bool,
-
-	/// Divergence refinement: divergences(Impl) ⊆ divergences(Spec)
-	/// Only meaningful when specs provided in FdrConfig
-	pub divergence_refines: bool,
-
-	/// Witness to trace refinement violation: trace in Impl but not in Spec
-	pub trace_refinement_witness: Option<Trace>,
-
-	/// Witness to failures refinement violation: (trace, refusal) in Impl but not in Spec
-	pub failures_refinement_witness: Option<Failure>,
-
-	/// Witness to divergence refinement violation: divergent trace in Impl but not in Spec
-	pub divergence_refinement_witness: Option<Trace>,
-
-	/// Witness to structural nondeterminism: first `(state, event)` with a
-	/// hidden action or multiple transition targets (sorted state order,
-	/// reproducible)
-	pub determinism_witness: Option<(State, Event)>,
-
-	/// Witness to divergence: (seed, τ-loop sequence) if found
-	pub divergence_witness: Option<(u64, Vec<Event>)>,
-
-	/// Witness to deadlock: (seed, trace, state) if found
-	pub deadlock_witness: Option<(u64, Trace, State)>,
-
-	/// Traces explored across all seeds
-	pub traces_explored: usize,
-
-	/// Distinct states visited
-	pub states_visited: usize,
-
-	/// Number of seeds successfully completed
-	pub seeds_completed: u32,
-
-	/// Seed that caused failure, if any
-	pub failing_seed: Option<u64>,
-
-	/// Number of exploration branches pruned for timing violations
-	///
-	/// Timed exploration drops branches whose WCET/deadline constraints
-	/// fail. A non-zero count means model-level timing violations exist
-	/// even though the surviving paths passed.
-	pub timing_pruned: usize,
-
-	/// Faults that were injected during exploration
-	#[cfg(feature = "testing-fault")]
-	pub faults_injected: Vec<InjectedFaultRecord>,
-
-	/// Seeds that completed (reached exhaustion or terminal states)
-	/// despite at least one injected fault suppressing a transition
-	#[cfg(feature = "testing-fault")]
-	pub error_recovery_successful: usize,
-
-	/// Seeds that deadlocked or diverged after at least one injected
-	/// fault suppressed a transition
-	#[cfg(feature = "testing-fault")]
-	pub error_recovery_failed: usize,
-
-	/// FMEA report
-	#[cfg(feature = "testing-fmea")]
-	pub fmea_report: Option<FmeaReport>,
-}
-
-impl Default for FdrVerdict {
-	fn default() -> Self {
-		Self {
-			passed: true,
-			complete: true,
-			divergence_free: true,
-			deadlock_free: true,
-			is_deterministic: true,
-			trace_refines: true,
-			failures_refines: true,
-			divergence_refines: true,
-			trace_refinement_witness: None,
-			failures_refinement_witness: None,
-			divergence_refinement_witness: None,
-			determinism_witness: None,
-			divergence_witness: None,
-			deadlock_witness: None,
-			traces_explored: 0,
-			states_visited: 0,
-			seeds_completed: 0,
-			failing_seed: None,
-			timing_pruned: 0,
-			#[cfg(feature = "testing-fault")]
-			faults_injected: Vec::new(),
-			#[cfg(feature = "testing-fault")]
-			error_recovery_successful: 0,
-			#[cfg(feature = "testing-fault")]
-			error_recovery_failed: 0,
-			#[cfg(feature = "testing-fmea")]
-			fmea_report: None,
-		}
-	}
-}
-
 #[cfg(test)]
 mod tests {
+	use std::collections::HashSet;
+
 	use super::*;
-	use crate::testing::specs::csp::TransitionRelation;
+	use crate::testing::specs::csp::{Observation, State, TransitionRelation};
 
 	// ========== FaultModel Unit Tests ==========
 
@@ -638,6 +485,7 @@ mod tests {
 		// Mode 2: Refinement checking
 		let spec = Process {
 			name: "Spec",
+			observation: Observation::Model,
 			description: Some("Test spec"),
 			initial: State("S0"),
 			states: vec![State("S0")].into_iter().collect(),
@@ -656,27 +504,5 @@ mod tests {
 
 		let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
 		assert!(!config_refinement.specs.is_empty());
-	}
-
-	// ========== FdrVerdict Tests ==========
-
-	#[test]
-	fn verdict_default_all_pass() {
-		let verdict = FdrVerdict::default();
-		assert!(verdict.passed);
-		assert!(verdict.divergence_free);
-		assert!(verdict.deadlock_free);
-		assert!(verdict.is_deterministic);
-		assert_eq!(verdict.traces_explored, 0);
-		assert_eq!(verdict.states_visited, 0);
-	}
-
-	#[test]
-	fn verdict_tracks_witnesses() {
-		let mut verdict = FdrVerdict::default();
-
-		let trace = vec![Event("unexpected")];
-		verdict.trace_refinement_witness = Some(trace.clone());
-		assert_eq!(verdict.trace_refinement_witness, Some(trace));
 	}
 }

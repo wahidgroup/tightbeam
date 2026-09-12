@@ -13,9 +13,10 @@ use std::collections::HashSet;
 use super::cache::DefaultCache;
 use super::exploration::DefaultExplorationEngine;
 use super::refinement::DefaultRefinementChecker;
-use crate::testing::fdr::config::{Failure, FdrConfig, FdrVerdict, Trace};
+use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{ExplorationCore, RefinementChecker, RefinementOutcome, SeedResult};
-use crate::testing::specs::csp::{Process, State};
+use crate::testing::fdr::verdict::{Decision, Failure, FdrVerdict, Trace};
+use crate::testing::specs::csp::{Event, Process, State};
 
 /// FDR exploration engine (pluggable design)
 ///
@@ -74,8 +75,62 @@ where
 		Self { process, config, explorer, refinement, verdict: FdrVerdict::default() }
 	}
 
-	/// Run multi-seed exploration
+	/// Run Layer 3 and report what it decided.
+	///
+	/// Schedulability is decided on this one exit path, so a spec that misses
+	/// its deadlines cannot reach a consumer as a verdict that held.
 	pub fn explore(&mut self) -> FdrVerdict {
+		let mut verdict = self.explore_modes();
+		verdict.schedulable = self.schedulability();
+
+		verdict
+	}
+
+	/// What schedulability analysis decided about the configured specs.
+	///
+	/// A spec declaring no schedulability block has no task set. An analysis
+	/// error refutes rather than leaving the question open: every
+	/// `SchedulabilityError` names a defect in the declared task set, such as
+	/// a period with no WCET.
+	#[cfg(feature = "testing-schedulability")]
+	fn schedulability(&self) -> Decision {
+		let mut decision = Decision::NotAsserted;
+		for spec in self.config.specs.iter() {
+			let analysed = match spec.schedulability_violated() {
+				Ok(false) => Decision::Holds,
+				Ok(true) | Err(_) => Decision::Refuted,
+			};
+
+			decision = decision.and(analysed);
+		}
+
+		decision
+	}
+
+	/// Where schedulability analysis does not compile in.
+	#[cfg(not(feature = "testing-schedulability"))]
+	fn schedulability(&self) -> Decision {
+		Decision::NotAsserted
+	}
+
+	/// Whether this run asserts deadlock freedom and divergence freedom.
+	///
+	/// Fault injection measures what the faults cause, so the deadlock it
+	/// reaches is an observation for the error-recovery counters and the FMEA
+	/// report, not a claim.
+	#[cfg(feature = "testing-fault")]
+	fn asserts_freedom(&self) -> bool {
+		self.config.fault_model.is_none()
+	}
+
+	/// Where no fault model can be configured.
+	#[cfg(not(feature = "testing-fault"))]
+	fn asserts_freedom(&self) -> bool {
+		true
+	}
+
+	/// Run multi-seed exploration
+	fn explore_modes(&mut self) -> FdrVerdict {
 		// Mode 1: Specification robustness testing (fault model + specs)
 		// When fault_model is provided with specs, explore the spec WITH faults
 		#[cfg(feature = "testing-fault")]
@@ -97,6 +152,11 @@ where
 		}
 
 		// Mode 3: Single-process multi-seed exploration
+		if self.asserts_freedom() {
+			self.verdict.divergence_free = Decision::Holds;
+			self.verdict.deadlock_free = Decision::Holds;
+		}
+
 		#[cfg(feature = "rayon")]
 		{
 			use rayon::prelude::*;
@@ -136,10 +196,6 @@ where
 
 		self.check_determinism();
 
-		// Determinism is informational (see FdrVerdict::is_deterministic):
-		// only divergence and deadlock freedom decide the verdict.
-		self.verdict.passed = self.verdict.divergence_free && self.verdict.deadlock_free;
-
 		#[cfg(feature = "testing-fmea")]
 		self.generate_fmea_if_configured();
 
@@ -148,16 +204,13 @@ where
 
 	/// Update verdict based on seed result
 	///
-	/// With `testing-fault`, seeds that injected at least one fault feed
-	/// the error-recovery counters: completion despite faults counts as a
-	/// recovery, deadlock/divergence after a fault counts as a failed
-	/// recovery. FMEA detection ratings divide these observed counts.
+	/// A seed that injected a fault feeds the error-recovery counters, which
+	/// FMEA detection ratings divide.
 	fn update_verdict_from_result(&mut self, seed: u64, result: &SeedResult) {
 		match result {
 			#[cfg(feature = "testing-fault")]
 			SeedResult::Divergence(_trace, hidden, faults) => {
-				self.verdict.divergence_free = false;
-				self.verdict.passed = false;
+				self.verdict.divergence_free = self.verdict.divergence_free.refute();
 				self.verdict.divergence_witness = Some((seed, hidden.clone()));
 				self.verdict.failing_seed = Some(seed);
 				if !faults.is_empty() {
@@ -167,15 +220,13 @@ where
 			}
 			#[cfg(not(feature = "testing-fault"))]
 			SeedResult::Divergence(_trace, hidden) => {
-				self.verdict.divergence_free = false;
-				self.verdict.passed = false;
+				self.verdict.divergence_free = self.verdict.divergence_free.refute();
 				self.verdict.divergence_witness = Some((seed, hidden.clone()));
 				self.verdict.failing_seed = Some(seed);
 			}
 			#[cfg(feature = "testing-fault")]
 			SeedResult::Deadlock(trace, state, faults) => {
-				self.verdict.deadlock_free = false;
-				self.verdict.passed = false;
+				self.verdict.deadlock_free = self.verdict.deadlock_free.refute();
 				self.verdict.deadlock_witness = Some((seed, trace.clone(), *state));
 				self.verdict.failing_seed = Some(seed);
 				if !faults.is_empty() {
@@ -185,8 +236,7 @@ where
 			}
 			#[cfg(not(feature = "testing-fault"))]
 			SeedResult::Deadlock(trace, state) => {
-				self.verdict.deadlock_free = false;
-				self.verdict.passed = false;
+				self.verdict.deadlock_free = self.verdict.deadlock_free.refute();
 				self.verdict.deadlock_witness = Some((seed, trace.clone(), *state));
 				self.verdict.failing_seed = Some(seed);
 			}
@@ -205,11 +255,10 @@ where
 		}
 	}
 
-	/// Explore specification processes with fault injection
-	/// This tests whether the specifications correctly model error conditions
+	/// Explore every configured spec with fault injection
 	///
-	/// Every configured spec is explored (not just `specs[0]`): a fault
-	/// model that only stresses the first spec silently skips the rest.
+	/// Every spec, not just `specs[0]`: stressing only the first silently
+	/// skips the rest.
 	#[cfg(feature = "testing-fault")]
 	fn explore_specification_with_faults(&mut self) {
 		if self.config.specs.is_empty() {
@@ -265,9 +314,6 @@ where
 		self.verdict.timing_pruned = self.explorer.timing_pruned();
 
 		self.check_determinism();
-
-		// Determinism is informational (see FdrVerdict::is_deterministic).
-		self.verdict.passed = self.verdict.divergence_free && self.verdict.deadlock_free;
 	}
 
 	/// Generate FMEA report if configured
@@ -285,10 +331,9 @@ where
 
 	/// Structural determinism check
 	///
-	/// Proves determinism when the LTS has no hidden (τ) actions and no
-	/// `(state, event)` transition with multiple targets -- a sufficient
-	/// condition for CSP determinism (Roscoe 2010, §10.5). External choice
-	/// (distinct events at one state) is deterministic and is not flagged.
+	/// No hidden actions and no multi-target `(state, event)` transition is
+	/// sufficient for CSP determinism (Roscoe 2010, §10.5). External choice is
+	/// deterministic and is not flagged.
 	fn check_determinism(&mut self) {
 		let mut states: Vec<State> = self.process.states.iter().copied().collect();
 		states.sort_unstable_by_key(|state| state.0);
@@ -307,92 +352,106 @@ where
 		self.verdict.determinism_witness = witness;
 	}
 
-	/// Run refinement checking mode
+	/// Check `process ⊑ spec` in the models the subject admits
 	///
-	/// When `config.specs` is non-empty, checks: process ⊑ spec
-	/// (implementation refines specification) in all three semantic models:
-	/// traces, failures, and divergences. Failures refinement runs
-	/// unconditionally -- trace + divergence refinement suffices only for
-	/// deterministic processes (Roscoe 2010, §12), and skipping it would
-	/// let refusal-only violations pass unverified.
-	///
-	/// Updates verdict with refinement results and witnesses. If
-	/// `config.fail_fast` is true (default), each pass stops at its first
-	/// violation. An inconclusive check (timeout/resource bound) sets
-	/// `passed = false` and `complete = false` without recording a witness.
+	/// Traces refinement is always asked. Failures and divergences are asked
+	/// only of a subject whose refusals are known, or the checker would grade
+	/// it on refusals it synthesized. Under `fail_fast`, each pass stops at
+	/// its first violation.
 	fn check_refinement(&mut self) {
 		if self.config.specs.is_empty() {
 			return;
 		}
 
-		let specs = self.config.specs.clone();
+		// The spec list is read through a refcount rather than a copy: cloning
+		// `Vec<Process>` duplicates every state set and transition map that
+		// the checker only ever reads.
+		let config = Arc::clone(&self.config);
+		let specs = config.specs.as_slice();
+		self.verdict.unmodelled_events = self.unmodelled_events();
 
-		let mut inconclusive = false;
-
-		inconclusive |= self.check_refinement_for_specs(
-			&specs,
+		self.verdict.trace_refines = self.check_refinement_for_specs(
+			specs,
 			|r, s| r.check_trace_refinement(s, self.process),
 			|v, w| {
-				v.trace_refines = false;
 				v.trace_refinement_witness = Some(w);
 			},
 		);
 
-		inconclusive |= self.check_refinement_for_specs(
-			&specs,
+		if !self.process.observation.carries_refusals() {
+			return;
+		}
+
+		self.verdict.failures_refines = self.check_refinement_for_specs(
+			specs,
 			|r, s| r.check_failures_refinement(s, self.process),
 			|v, w| {
-				v.failures_refines = false;
 				v.failures_refinement_witness = Some(w);
 			},
 		);
 
-		inconclusive |= self.check_refinement_for_specs(
-			&specs,
+		self.verdict.divergence_refines = self.check_refinement_for_specs(
+			specs,
 			|r, s| r.check_divergence_refinement(s, self.process),
 			|v, w| {
-				v.divergence_refines = false;
 				v.divergence_refinement_witness = Some(w);
 			},
 		);
-
-		self.verdict.passed = self.verdict.trace_refines
-			&& self.verdict.failures_refines
-			&& self.verdict.divergence_refines
-			&& !inconclusive;
 	}
 
-	/// Helper to check a refinement type across all specs
+	/// The events the subject can perform that no configured spec models,
+	/// sorted by name.
 	///
-	/// Returns true when any spec's check was inconclusive.
-	fn check_refinement_for_specs<W, F, G>(&mut self, specs: &[Process], check: F, record_violation: G) -> bool
+	/// An event one spec models is modelled, so the specs intersect rather
+	/// than accumulate.
+	fn unmodelled_events(&self) -> Vec<Event> {
+		let Some((first, rest)) = self.config.specs.split_first() else {
+			return Vec::new();
+		};
+
+		let mut shared = first.unmodelled(self.process);
+		for spec in rest {
+			let modelled_by_spec = spec.unmodelled(self.process);
+			shared.retain(|event| modelled_by_spec.contains(event));
+		}
+
+		shared
+	}
+
+	/// What one refinement model decided across every spec.
+	///
+	/// A check that ran out of budget decides [`Decision::Unknown`]: no
+	/// counterexample refutes nothing, and an unexhausted search proves
+	/// nothing. A truncated enumeration decides the same way, because
+	/// refinement quantifies over every trace of the subject.
+	fn check_refinement_for_specs<W, F, G>(&mut self, specs: &[Process], check: F, record_witness: G) -> Decision
 	where
 		F: Fn(&mut R, &Process) -> RefinementOutcome<W>,
 		G: Fn(&mut FdrVerdict, W),
 	{
-		let mut inconclusive = false;
+		let mut decision = Decision::NotAsserted;
 		for spec in specs {
 			match check(&mut self.refinement, spec) {
 				RefinementOutcome::Holds { complete } => {
-					if !complete {
-						self.verdict.complete = false;
-					}
+					let held = match complete {
+						true => Decision::Holds,
+						false => Decision::Unknown,
+					};
+
+					decision = decision.and(held);
 				}
 				RefinementOutcome::Violated(witness) => {
-					self.verdict.passed = false;
-					record_violation(&mut self.verdict, witness);
+					record_witness(&mut self.verdict, witness);
+					decision = decision.and(Decision::Refuted);
 					if self.config.fail_fast {
-						return inconclusive;
+						return decision;
 					}
 				}
-				RefinementOutcome::Inconclusive => {
-					self.verdict.complete = false;
-					inconclusive = true;
-				}
+				RefinementOutcome::Inconclusive => decision = decision.and(Decision::Unknown),
 			}
 		}
 
-		inconclusive
+		decision
 	}
 
 	/// Get traces explored (for compatibility)
@@ -422,5 +481,51 @@ impl<'a> DefaultFdrExplorer<'a> {
 		let refinement = DefaultRefinementChecker::new(process, refinement_config, cache);
 
 		FdrExplorer::new_with_arc(process, config, explorer, refinement)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::Decision;
+	use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+	use crate::testing::specs::csp::{Event, Process, ProcessBuildError, State};
+
+	/// A spec that models `start` and nothing else.
+	fn narrow_spec() -> Result<Process, ProcessBuildError> {
+		Process::builder("NarrowSpec")
+			.initial_state(State("S0"))
+			.add_observable(Event("start"))
+			.add_transition(State("S0"), Event("start"), State("S1"))
+			.add_terminal(State("S1"))
+			.build()
+	}
+
+	/// A subject that performs `start`, then an event no spec mentions.
+	fn wider_subject() -> Result<Process, ProcessBuildError> {
+		Process::builder("WiderSubject")
+			.initial_state(State("T0"))
+			.add_observable(Event("start"))
+			.add_observable(Event("audit"))
+			.add_transition(State("T0"), Event("start"), State("T1"))
+			.add_transition(State("T1"), Event("audit"), State("T2"))
+			.add_terminal(State("T2"))
+			.build()
+	}
+
+	#[test]
+	fn refinement_reports_what_the_projection_discarded() -> Result<(), ProcessBuildError> {
+		let subject = wider_subject()?;
+		let config = FdrConfig { specs: vec![narrow_spec()?], ..Default::default() };
+		let mut explorer = DefaultFdrExplorer::with_defaults(&subject, config);
+
+		let verdict = explorer.explore();
+		assert_eq!(verdict.unmodelled_events, vec![Event("audit")]);
+		assert_eq!(
+			verdict.trace_refines,
+			Decision::Holds,
+			"`audit` is projected away, so it is coverage and not a counterexample"
+		);
+
+		Ok(())
 	}
 }

@@ -32,7 +32,6 @@ fn build_fdr_config(specs: Vec<Process>) -> FdrConfig {
 		timeout_ms: 5000,
 		specs,
 		fail_fast: true,
-		expect_failure: false,
 		..Default::default()
 	}
 }
@@ -91,12 +90,12 @@ tb_scenario! {
 			on_pass: Some(Arc::new(|context| {
 				// Acceptance queries: Check what events are accepted at
 				// specific states.
-				if let Some(acceptance) = context.trace.acceptance_at("Connected") {
+				if let Some(acceptance) = context.trace().acceptance_at("Connected") {
 					// At Connected state, process accepts "serialize"
 					assert!(acceptance.iter().any(|e| e.0 == "serialize"));
 				}
 
-				if let Some(acceptance) = context.trace.acceptance_at("Sent") {
+				if let Some(acceptance) = context.trace().acceptance_at("Sent") {
 					// At Sent state, process accepts "decrypt"
 					assert!(acceptance.iter().any(|e| e.0 == "decrypt"));
 				}
@@ -104,8 +103,8 @@ tb_scenario! {
 				// Refusal queries: Verify process can refuse events not in
 				// acceptance set. At Connected, process must do "serialize"
 				// before "request"
-				assert!(context.trace.can_refuse_after("Connected", "request"));
-				assert!(context.trace.can_refuse_after("Connected", "disconnect"));
+				assert!(context.trace().can_refuse_after("Connected", "request"));
+				assert!(context.trace().can_refuse_after("Connected", "disconnect"));
 
 				Ok(())
 			})),

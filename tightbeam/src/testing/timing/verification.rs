@@ -32,22 +32,6 @@ pub struct TimingVerificationResult {
 	pub path_wcet_violations: Vec<PathWcetViolation>,
 }
 
-impl TimingVerificationResult {
-	/// Get task set (if schedulability analysis was performed)
-	#[cfg(feature = "testing-schedulability")]
-	pub fn task_set(&self) -> Option<&crate::testing::schedulability::TaskSet> {
-		// This will be stored in ScenarioResult instead
-		None
-	}
-
-	/// Get schedulability result (if analysis was performed)
-	#[cfg(feature = "testing-schedulability")]
-	pub fn schedulability_result(&self) -> Option<&crate::testing::schedulability::SchedulabilityResult> {
-		// This will be stored in ScenarioResult instead
-		None
-	}
-}
-
 impl TimingConstraints {
 	/// Verify timing constraints against trace
 	///

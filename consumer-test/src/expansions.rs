@@ -103,7 +103,7 @@ mod tests {
 	}
 
 	#[test]
-	#[should_panic(expected = "CSP verification failed")]
+	#[should_panic(expected = "CSP process violation")]
 	fn a_refused_csp_process_fails_the_scenario() {
 		let config = ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).build();
 		let trace = config.trace();

@@ -163,7 +163,6 @@ fn build_deterministic_config() -> FdrConfig {
 		timeout_ms: 2000,
 		specs: vec![FaultTolerantProcess::process()],
 		fail_fast: false,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -180,7 +179,7 @@ tb_scenario! {
 		.with_fdr(build_deterministic_config())
 		.with_hooks(TestHooks {
 			on_pass: Some(std::sync::Arc::new(|result| {
-			if let Some(verdict) = &result.fdr_verdict {
+			if let Some(verdict) = result.verdict().fdr() {
 				// Academic requirement: Deterministic = same faults every run
 				assert!(!verdict.faults_injected.is_empty(), "Deterministic injection must be reproducible");
 				// Note: Each seed explores multiple paths, so we get multiple faults per seed
@@ -247,7 +246,6 @@ fn build_probabilistic_config() -> FdrConfig {
 		timeout_ms: 5000,
 		specs: vec![FaultTolerantProcess::process()],
 		fail_fast: false,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -264,7 +262,7 @@ tb_scenario! {
 		.with_fdr(build_probabilistic_config())
 		.with_hooks(TestHooks {
 			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = &result.fdr_verdict {
+				if let Some(verdict) = result.verdict().fdr() {
 					let fault_count = verdict.faults_injected.len();
 
 					// Industry standard: Statistical validation
@@ -343,7 +341,6 @@ fn build_multi_fault_config() -> FdrConfig {
 		timeout_ms: 3000,
 		specs: vec![FaultTolerantProcess::process()],
 		fail_fast: false,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -360,7 +357,7 @@ tb_scenario! {
 		.with_fdr(build_multi_fault_config())
 		.with_hooks(TestHooks {
 			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = &result.fdr_verdict {
+				if let Some(verdict) = result.verdict().fdr() {
 					// Academic: Verify fault diversity (multiple injection points triggered)
 					let unique_states: std::collections::HashSet<_> = verdict
 						.faults_injected
@@ -449,7 +446,6 @@ fn build_coverage_config() -> FdrConfig {
 		timeout_ms: 5000,
 		specs: vec![FaultTolerantProcess::process()],
 		fail_fast: false,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -466,7 +462,7 @@ tb_scenario! {
 		.with_fdr(build_coverage_config())
 		.with_hooks(TestHooks {
 			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = &result.fdr_verdict {
+				if let Some(verdict) = result.verdict().fdr() {
 					// Industry standard: Calculate fault coverage metrics
 					let total_injection_points = 5; // Configured in fault_model
 					let unique_injection_points: std::collections::HashSet<_> = verdict
