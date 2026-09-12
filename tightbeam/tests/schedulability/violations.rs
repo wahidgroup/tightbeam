@@ -6,17 +6,20 @@ use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
-use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario, wcet};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
 pub(crate) const TASK1: Urn<'static> = Urn::new("test", "event:violations/task1");
 pub(crate) const TASK2: Urn<'static> = Urn::new("test", "event:violations/task2");
 
-// Minimal spec for violation tests
+// Every scenario in this file releases TASK1 once. TASK2 is released by the
+// two-task processes only, so it is not part of the shared contract.
 tb_assert_spec! {
 	pub SchedulabilityViolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		assertions: []
+		assertions: [
+			(TASK1, exactly!(1))
+		]
 	}
 }
 

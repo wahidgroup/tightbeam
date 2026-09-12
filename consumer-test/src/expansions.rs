@@ -105,7 +105,7 @@ mod tests {
 	#[test]
 	#[should_panic(expected = "CSP process violation")]
 	fn a_refused_csp_process_fails_the_scenario() {
-		let config = ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).build();
+		let config = tightbeam::__tb_accept_config!(ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).build());
 		let trace = config.trace();
 
 		tightbeam::tb_scenario!(@run_bare_sync

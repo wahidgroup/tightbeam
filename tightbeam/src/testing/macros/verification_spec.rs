@@ -2,6 +2,8 @@
 //! Provides label helpers, cardinality utilities, and the `BuiltAssertSpec`
 //! wrapper that implements `TBSpec`.
 
+use core::num::NonZeroU32;
+
 use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionValue};
 use crate::testing::specs::{SpecViolation, TBSpec};
 use crate::trace::{ConsumedTrace, ExecutionMode};
@@ -22,35 +24,52 @@ use crate::Errorizable;
 // Cardinality core
 // ---------------------------------------------------------------------------
 
+/// How many times a label may appear for a contract to hold.
+///
+/// Every constructor states a bound that some count fails, so a contract
+/// built from one can reject. `at_least(0)` could not, which is why the lower
+/// bound is a [`NonZeroU32`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Cardinality {
 	min: u32,
 	max: Option<u32>,
-	must_be_present: bool,
 }
 
 impl Cardinality {
-	pub const fn new(min: u32, max: Option<u32>, must_be_present: bool) -> Self {
-		Self { min, max, must_be_present }
-	}
 	pub const fn exactly(n: u32) -> Self {
-		Self { min: n, max: Some(n), must_be_present: n > 0 }
+		Self { min: n, max: Some(n) }
 	}
-	pub const fn at_least(n: u32) -> Self {
-		Self { min: n, max: None, must_be_present: n > 0 }
+
+	/// At least `n`, which must be positive: a lower bound of zero rejects
+	/// nothing. To say a label is optional, leave it out of the spec.
+	pub const fn at_least(n: NonZeroU32) -> Self {
+		Self { min: n.get(), max: None }
 	}
 	pub const fn at_most(n: u32) -> Self {
-		Self { min: 0, max: Some(n), must_be_present: false }
+		Self { min: 0, max: Some(n) }
 	}
+
+	/// Between `min` and `max` inclusive.
+	///
+	/// # Panics
+	///
+	/// - When `max` is below `min`, which no count satisfies. In a constant
+	///   this is caught when the crate is built, not when it is checked, so
+	///   `cargo check` alone does not report it.
 	pub const fn between(min: u32, max: u32) -> Self {
-		Self { min, max: Some(max), must_be_present: min > 0 }
+		assert!(min <= max, "between! requires min <= max, or no count can satisfy it");
+
+		Self { min, max: Some(max) }
 	}
+
 	pub const fn present() -> Self {
-		Self { min: 1, max: None, must_be_present: true }
+		Self { min: 1, max: None }
 	}
+
 	pub const fn absent() -> Self {
-		Self { min: 0, max: Some(0), must_be_present: false }
+		Self { min: 0, max: Some(0) }
 	}
+
 	pub fn describe(&self) -> String {
 		match (self.min, self.max) {
 			(0, Some(0)) => "absent".into(),
@@ -60,6 +79,7 @@ impl Cardinality {
 			(m, None) => format!("at least {m}"),
 		}
 	}
+
 	pub fn is_satisfied_by(&self, count: usize) -> bool {
 		let c = count as u32;
 		if c < self.min {
@@ -72,14 +92,13 @@ impl Cardinality {
 		}
 		true
 	}
+
 	pub fn min(&self) -> u32 {
 		self.min
 	}
+
 	pub fn max(&self) -> Option<u32> {
 		self.max
-	}
-	pub fn must_be_present(&self) -> bool {
-		self.must_be_present
 	}
 }
 
@@ -371,20 +390,15 @@ impl BuiltAssertSpec {
 		}
 
 		// Normalize assertion order independent of insertion sequence
-		let mut norm: Vec<(&str, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
+		let mut norm: Vec<(&str, u32, Option<u32>)> = Vec::with_capacity(contracts.len());
 		for c in contracts {
 			let AssertionLabel::Custom(lbl) = &c.label;
-			norm.push((
-				lbl.as_ref(),
-				c.cardinality.min,
-				c.cardinality.max,
-				c.cardinality.must_be_present,
-			));
+			norm.push((lbl.as_ref(), c.cardinality.min, c.cardinality.max));
 		}
 
 		norm.sort_by(|a, b| a.0.cmp(b.0)); // label only
 
-		for (lbl, min, max, must) in norm {
+		for (lbl, min, max) in norm {
 			h.update(lbl.as_bytes());
 			h.update(min.to_be_bytes());
 
@@ -395,8 +409,6 @@ impl BuiltAssertSpec {
 				}
 				None => h.update([0u8]),
 			}
-
-			h.update([must as u8]);
 		}
 		#[cfg(feature = "instrument")]
 		{
@@ -456,6 +468,10 @@ impl TBSpec for BuiltAssertSpec {
 	}
 	fn expected_gate_decision(&self) -> Option<TransitStatus> {
 		self.inner.gate_decision
+	}
+	#[cfg(feature = "testing-timing")]
+	fn constrains_schedule(&self) -> bool {
+		self.inner.schedulability.is_some()
 	}
 	#[cfg(feature = "instrument")]
 	fn required_events(&self) -> &[crate::utils::urn::Urn<'static>] {
@@ -616,8 +632,18 @@ macro_rules! exactly {
 }
 #[macro_export]
 macro_rules! at_least {
+	(0) => {
+		::core::compile_error!("a lower bound of zero rejects nothing: leave the label out of the spec")
+	};
 	($n:expr) => {
-		$crate::testing::macros::Cardinality::at_least($n)
+		$crate::testing::macros::Cardinality::at_least(
+			const {
+				match ::core::num::NonZeroU32::new($n) {
+					Some(bound) => bound,
+					None => ::core::panic!("this lower bound evaluates to zero, which rejects nothing: leave the label out of the spec"),
+				}
+			},
+		)
 	};
 }
 #[macro_export]

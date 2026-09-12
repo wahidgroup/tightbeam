@@ -11,7 +11,7 @@
 
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
-use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 const START: Urn<'static> = Urn::new("fuzz", "event:simple/start");
 const ACTION_A: Urn<'static> = Urn::new("fuzz", "event:simple/action-a");
@@ -24,8 +24,6 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(START, exactly!(1)),
-			(ACTION_A, at_least!(0)),
-			(ACTION_B, at_least!(0)),
 			(DONE, exactly!(1))
 		]
 	},

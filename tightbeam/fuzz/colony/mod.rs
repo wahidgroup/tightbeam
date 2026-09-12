@@ -24,7 +24,7 @@ mod shadow;
 mod topology;
 
 use tightbeam::testing::{ClusterEnv, ScenarioConfig, SetupEnv};
-use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 use crate::actions::run_actions;
 use crate::topology::ColonyTopology;
@@ -35,10 +35,9 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(events::ACTION_RUN, at_least!(0)),
 			(events::SHADOW_VIOLATION, exactly!(0)),
 			(events::SHADOW_TOO_CLOSED, exactly!(0)),
-			(events::ACTIONS_BALANCE, exactly!(1), tags: ["balance"]),
+			(events::ACTIONS_BALANCE, exactly!(1), tags: ["balance"])
 		]
 	},
 	annotations { description: "Multi-org colony AFL assertion specification" }
