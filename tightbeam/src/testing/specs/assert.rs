@@ -8,14 +8,14 @@ use super::error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation
 use crate::error::ReceivedExpectedError;
 use crate::testing::assertions::AssertionContract;
 use crate::trace::{ConsumedTrace, ExecutionMode};
-#[cfg(feature = "instrument")]
-use crate::utils::urn::Urn;
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
 use super::error::EventOrderViolationDetail;
 #[cfg(feature = "policy")]
 use crate::policy::TransitStatus;
+#[cfg(feature = "instrument")]
+use crate::utils::urn::Urn;
 
 /// Spec trait defining expected test behavior.
 ///
@@ -46,6 +46,36 @@ pub trait TBSpec {
 	/// Expected gate decision (None = any decision acceptable)
 	fn expected_gate_decision(&self) -> Option<TransitStatus> {
 		None
+	}
+
+	/// Whether this spec constrains a task set the schedulability analysis
+	/// can refute.
+	#[cfg(feature = "testing-timing")]
+	fn constrains_schedule(&self) -> bool {
+		false
+	}
+
+	/// Whether this spec can reject a trace on anything but its mode.
+	///
+	/// A spec that names no assertion, no gate decision, no required event
+	/// and no task set constrains only the execution mode, which every
+	/// completed run satisfies. A scenario built from it cannot fail.
+	fn can_reject(&self) -> bool {
+		if !self.required_assertions().is_empty() || self.expected_gate_decision().is_some() {
+			return true;
+		}
+
+		#[cfg(feature = "instrument")]
+		if !self.required_events().is_empty() {
+			return true;
+		}
+
+		#[cfg(feature = "testing-timing")]
+		if self.constrains_schedule() {
+			return true;
+		}
+
+		false
 	}
 
 	/// Custom response validation logic

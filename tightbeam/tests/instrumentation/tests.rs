@@ -9,7 +9,7 @@ use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{MessageEmitter, Protocol};
 use tightbeam::utils::urn::Urn;
-use tightbeam::{compose, server, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::{compose, exactly, server, tb_assert_spec, tb_process_spec, tb_scenario};
 
 pub(crate) const MESSAGE_COLLECT: Urn<'static> = Urn::new("test", "event:instrumentation-tests/message-collect");
 pub(crate) const MESSAGE_EMIT: Urn<'static> = Urn::new("test", "event:instrumentation-tests/message-emit");
@@ -18,7 +18,10 @@ tb_assert_spec! {
 	pub AutoInstrSpec,
 	V(1,0,0): {
 		mode: Accept,
-		assertions: []
+		assertions: [
+			(MESSAGE_EMIT, exactly!(1)),
+			(MESSAGE_COLLECT, exactly!(1))
+		]
 	}
 }
 
@@ -132,7 +135,7 @@ tb_scenario! {
 			};
 			Ok((handle, addr))
 		},
-		client: |ClientEnv { addr, .. }| async move {
+		client: |ClientEnv { trace, addr, .. }| async move {
 			let stream = <TokioListener as Protocol>::connect(addr).await?;
 			let mut client = <TokioListener as Protocol>::create_transport(stream);
 
@@ -141,7 +144,11 @@ tb_scenario! {
 				V0: id: "test", order: 1u64, message: test_message
 			}?;
 
-			let _response = client.emit(test_frame, None).await?;
+			trace.emit_event(MESSAGE_EMIT);
+			let response = client.emit(test_frame, None).await?;
+			trace.emit_event(MESSAGE_COLLECT);
+
+			assert!(response.is_some(), "the echo handler must return the frame it received");
 			Ok(())
 		}
 	}

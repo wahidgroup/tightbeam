@@ -14,9 +14,6 @@ use crate::testing::macros::BuiltAssertSpec;
 use crate::testing::specs::{CspValidationResult, Layer, SpecViolation, Violations};
 use crate::trace::ConsumedTrace;
 
-/// Every layer order the verdict grades, from the first layer to the last.
-const LAYERS: [Layer; 3] = [Layer::Assertion, Layer::Csp, Layer::Refinement];
-
 /// What one verification layer reported about a run.
 ///
 /// A refutation meets an expected-violation expectation. An undecided check
@@ -90,7 +87,7 @@ impl ScenarioVerdict {
 			found.push(SpecViolation::ExecutionFailed(format!("{error:?}")));
 		}
 
-		for layer in LAYERS {
+		for layer in Layer::ALL {
 			match self.reported(layer) {
 				Reported::Accepted => {
 					if expect.names(layer) {

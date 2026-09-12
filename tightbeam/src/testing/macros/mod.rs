@@ -94,6 +94,23 @@ where
 	closure(pipeline).map(|_| ())
 }
 
+/// Binds the configuration a scenario runs, or fails the test with the reason
+/// it was refused.
+///
+/// `tb_scenario!` binds a configuration at several sites. This is the one
+/// place that decides what a refusal does, so the message is not copied at
+/// each of them.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_accept_config {
+	($config:expr) => {
+		match $config {
+			Ok(accepted) => accepted,
+			Err(refused) => ::core::panic!("scenario configuration refused: {}", refused),
+		}
+	};
+}
+
 /// Unified scenario entry point for AssertSpec (and optional CSP/FDR)
 /// verification under a selectable execution environment.
 ///
@@ -230,7 +247,7 @@ macro_rules! tb_scenario {
 				fn main() {
 					afl::fuzz!(|data: &[u8]| {
 						let process = <$csp_type>::process();
-						let config = $config;
+						let config = $crate::__tb_accept_config!($config);
 						let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
 						$crate::tb_scenario!(@$run
 							config: config,
@@ -243,7 +260,7 @@ macro_rules! tb_scenario {
 			{
 				fn main() {
 					let process = <$csp_type>::process();
-					let config = $config;
+					let config = $crate::__tb_accept_config!($config);
 					let trace = $crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
 					$crate::tb_scenario!(@$run
 						config: config,
@@ -317,7 +334,7 @@ macro_rules! tb_scenario {
 								};
 								runtime.block_on(async {
 									let process = <$csp_type>::process();
-									let config = $config;
+									let config = $crate::__tb_accept_config!($config);
 									let trace =
 										$crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
 									$crate::tb_scenario!(@$run
@@ -333,7 +350,7 @@ macro_rules! tb_scenario {
 						#[tokio::main]
 						async fn main() {
 							let process = <$csp_type>::process();
-							let config = $config;
+							let config = $crate::__tb_accept_config!($config);
 							let trace =
 								$crate::trace::TraceCollector::with_fuzz_oracle(::std::vec::Vec::new(), process);
 							$crate::tb_scenario!(@$run
@@ -435,7 +452,7 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			let config = $config;
+			let config = $crate::__tb_accept_config!($config);
 			let trace = config.trace();
 			$crate::tb_scenario!(@run_bare_sync
 				config: config,
@@ -498,7 +515,7 @@ macro_rules! tb_scenario {
 		$crate::__tb_if_tokio! {
 			#[tokio::test]
 			async fn $test_name() {
-				let config = $config;
+				let config = $crate::__tb_accept_config!($config);
 				let trace = config.trace();
 				$crate::tb_scenario!(@run_servlet
 					config: config,
@@ -573,7 +590,7 @@ macro_rules! tb_scenario {
 		$crate::__tb_if_tokio! {
 			#[tokio::test]
 			async fn $test_name() {
-				let config = $config;
+				let config = $crate::__tb_accept_config!($config);
 				let trace = config.trace();
 				$crate::tb_scenario!(@run_cluster
 					config: config,
@@ -601,7 +618,7 @@ macro_rules! tb_scenario {
 		$crate::__tb_if_tokio! {
 			#[tokio::test]
 			async fn $test_name() {
-				let config = $config;
+				let config = $crate::__tb_accept_config!($config);
 				let trace = config.trace();
 				$crate::tb_scenario!(@run_hive
 					config: config,
@@ -620,7 +637,7 @@ macro_rules! tb_scenario {
 		context: [ $($context:expr)? ],
 		exec: |$env:pat_param| async move $exec_body:block
 	) => {{
-		let config = $config;
+		let config = $crate::__tb_accept_config!($config);
 		let trace = config.trace();
 		let env = $crate::testing::env::SetupEnv {
 			trace: trace.share(),
@@ -662,7 +679,7 @@ macro_rules! tb_scenario {
 	) => {{
 		use $crate::utils::task::PipelineBuilder;
 
-		let config = $config;
+		let config = $crate::__tb_accept_config!($config);
 		let trace = config.trace();
 
 		// Create PipelineBuilder with trace context
@@ -681,7 +698,7 @@ macro_rules! tb_scenario {
 		setup: $setup_closure:expr,
 		stimulus: $stimulus_closure:expr
 	) => {{
-		let config = $config;
+		let config = $crate::__tb_accept_config!($config);
 		let trace = config.trace();
 		let context = ::std::sync::Arc::new(($($context)?));
 
@@ -789,7 +806,7 @@ macro_rules! tb_scenario {
 		server: $server_closure:expr,
 		client: $client_closure:expr
 	) => {{
-		let config = $config;
+		let config = $crate::__tb_accept_config!($config);
 		let trace = config.trace();
 		let context = ::std::sync::Arc::new(($($context)?));
 
@@ -976,7 +993,9 @@ crate::__tb_if_test! {
 					})),
 				};
 
-				let config = ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build();
+				let config = crate::__tb_accept_config!(
+					ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build()
+				);
 				let trace = config.trace();
 				let hook_ctx = HookContext::build(&config, &trace, Ok::<(), crate::TightBeamError>(()));
 				let outcome = catch_unwind(AssertUnwindSafe(|| {

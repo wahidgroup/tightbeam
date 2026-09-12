@@ -80,3 +80,7 @@ mod payments;
 // Gate decision reading
 #[cfg(feature = "testing")]
 mod gate;
+
+// Scenario configuration refusals
+#[cfg(feature = "testing")]
+mod config;

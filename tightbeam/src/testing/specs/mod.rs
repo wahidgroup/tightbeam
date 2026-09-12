@@ -30,6 +30,11 @@ pub enum Layer {
 	Refinement,
 }
 
+impl Layer {
+	/// Every layer, in the order they grade a run.
+	pub const ALL: [Self; 3] = [Self::Assertion, Self::Csp, Self::Refinement];
+}
+
 #[cfg(feature = "testing-csp")]
 pub mod composition;
 #[cfg(feature = "testing-csp")]

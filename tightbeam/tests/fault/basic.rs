@@ -140,9 +140,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REQUEST, at_least!(1)),
-			(RESPONSE, at_least!(0)),
-			(RETRY, at_least!(0))
+			(REQUEST, at_least!(1))
 		]
 	}
 }
@@ -220,8 +218,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REQUEST, at_least!(1)),
-			(RESPONSE, at_least!(0))
+			(REQUEST, at_least!(1))
 		]
 	}
 }
@@ -301,9 +298,7 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REQUEST, at_least!(1)),
-			(RETRY, at_least!(0)),
-			(FALLBACK, at_least!(0))
+			(REQUEST, at_least!(1))
 		]
 	}
 }
@@ -391,12 +386,7 @@ tightbeam::tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(REQUEST, exactly!(1)),
-			(RESPONSE, at_least!(0)),
-			(RETRY, at_least!(0)),
-			(FALLBACK, at_least!(0)),
-			(SUCCESS, at_least!(0)),
-			(FAILURE, at_least!(0))
+			(REQUEST, exactly!(1))
 		]
 	}
 }

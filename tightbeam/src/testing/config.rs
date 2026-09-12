@@ -14,9 +14,12 @@ use crate::error::TightBeamError;
 use crate::testing::fdr::FdrVerdict;
 use crate::testing::macros::{BuiltAssertSpec, TraceCollector};
 use crate::testing::result::ScenarioVerdict;
-use crate::testing::specs::{verify_trace, CspValidationResult, Layer, SpecViolation, Violations};
+use crate::testing::specs::{verify_trace, CspValidationResult, Layer, SpecViolation, TBSpec, Violations};
 use crate::trace::ConsumedTrace;
 use crate::transport::error::TransportError;
+
+#[cfg(feature = "derive")]
+use crate::Errorizable;
 
 #[cfg(feature = "testing-fdr")]
 use crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
@@ -44,6 +47,42 @@ impl Expect {
 		matches!(self, Self::Violation(expected) if expected == layer)
 	}
 }
+
+/// Why [`ScenarioConfigBuilder::build`] refused a configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "derive", derive(Errorizable))]
+pub enum ScenarioConfigError {
+	/// Nothing this configuration names can reject a run.
+	#[cfg_attr(
+		feature = "derive",
+		error("no configured verifier can reject a run, so the scenario cannot fail")
+	)]
+	NoEffectiveVerifier,
+
+	/// The expectation names a layer that cannot reject this configuration.
+	#[cfg_attr(
+		feature = "derive",
+		error("expected a violation from {0:?}, which cannot reject this configuration")
+	)]
+	ExpectViolationWithoutVerifier(Layer),
+}
+
+#[cfg(not(feature = "derive"))]
+impl core::fmt::Display for ScenarioConfigError {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		match self {
+			Self::NoEffectiveVerifier => {
+				write!(f, "no configured verifier can reject a run, so the scenario cannot fail")
+			}
+			Self::ExpectViolationWithoutVerifier(layer) => {
+				write!(f, "expected a violation from {layer:?}, which cannot reject this configuration")
+			}
+		}
+	}
+}
+
+#[cfg(not(feature = "derive"))]
+impl std::error::Error for ScenarioConfigError {}
 
 /// Unified configuration for tb_scenario! tests (zero-copy with Arc wrapping)
 #[derive(Clone)]
@@ -163,8 +202,8 @@ impl ScenarioConfig {
 	fn spec_timing_constraints(&self) -> Option<Arc<TimingConstraints>> {
 		let fdr_cfg = self.fdr()?;
 		let first_spec = fdr_cfg.specs.first()?;
-		let constraints = first_spec.timing_constraints.clone()?;
 
+		let constraints = first_spec.timing_constraints.clone()?;
 		Some(Arc::new(constraints))
 	}
 
@@ -245,9 +284,46 @@ impl ScenarioConfigBuilder {
 		self
 	}
 
+	/// Whether `layer` can produce a rejection in this configuration.
+	///
+	/// A layer with no verifier cannot, and neither can an assertion layer
+	/// whose every spec grades nothing, so this is the one predicate both the
+	/// effective-verifier check and the expectation check ask.
+	fn can_reject_at(&self, layer: Layer) -> bool {
+		match layer {
+			Layer::Assertion => self.specs.iter().any(|spec| spec.can_reject()),
+			#[cfg(feature = "testing-csp")]
+			Layer::Csp => self.csp.is_some(),
+			#[cfg(not(feature = "testing-csp"))]
+			Layer::Csp => false,
+			#[cfg(feature = "testing-fdr")]
+			Layer::Refinement => self.fdr.is_some(),
+			#[cfg(not(feature = "testing-fdr"))]
+			Layer::Refinement => false,
+		}
+	}
+
 	/// Consumes the builder and wraps collected fields in `Arc`.
-	pub fn build(self) -> ScenarioConfig {
-		ScenarioConfig {
+	///
+	/// # Errors
+	///
+	/// - [`ScenarioConfigError::NoEffectiveVerifier`] -- no configured layer
+	///   can reject the run, so the scenario would pass whatever happened.
+	/// - [`ScenarioConfigError::ExpectViolationWithoutVerifier`] -- the
+	///   expectation names a layer that cannot reject this configuration, so
+	///   the rejection it waits for can never arrive.
+	pub fn build(self) -> Result<ScenarioConfig, ScenarioConfigError> {
+		if !Layer::ALL.iter().any(|layer| self.can_reject_at(*layer)) {
+			return Err(ScenarioConfigError::NoEffectiveVerifier);
+		}
+
+		if let Expect::Violation(layer) = self.expect {
+			if !self.can_reject_at(layer) {
+				return Err(ScenarioConfigError::ExpectViolationWithoutVerifier(layer));
+			}
+		}
+
+		Ok(ScenarioConfig {
 			specs: Arc::new(self.specs),
 			trace: Arc::new(self.trace),
 			hooks: self.hooks.map(Arc::new),
@@ -256,7 +332,7 @@ impl ScenarioConfigBuilder {
 			csp: self.csp.map(|csp| Arc::from(csp) as Arc<dyn ProcessSpec + Send + Sync>),
 			#[cfg(feature = "testing-fdr")]
 			fdr: self.fdr.map(Arc::new),
-		}
+		})
 	}
 }
 
@@ -342,9 +418,49 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn builder_collects_specs_without_hooks() {
-		let config = ScenarioConfig::builder().build();
-		assert!(config.specs().is_empty());
-		assert!(config.hooks().is_none());
+	fn build_refuses_zero_effective_verifiers() {
+		let refused = ScenarioConfig::builder().build();
+		assert_eq!(refused.err(), Some(ScenarioConfigError::NoEffectiveVerifier));
+	}
+
+	#[cfg(feature = "testing-csp")]
+	mod with_csp {
+		use std::borrow::Cow;
+
+		use super::*;
+		use crate::testing::specs::csp::{CspValidationResult, Process, ProcessSpec, State};
+		use crate::trace::ConsumedTrace;
+
+		/// A CSP layer that accepts every trace. Its only job here is to make
+		/// [`Layer::Csp`] a layer the configuration runs.
+		struct AcceptsEveryTrace;
+
+		impl ProcessSpec for AcceptsEveryTrace {
+			fn validate_trace(&self, _trace: &ConsumedTrace) -> CspValidationResult {
+				CspValidationResult { valid: true, violations: vec![] }
+			}
+
+			fn to_process_cow(&self) -> Cow<'_, Process> {
+				let process = Process::builder("accepts_every_trace")
+					.initial_state(State("start"))
+					.build()
+					.expect("single-state process builds");
+
+				Cow::Owned(process)
+			}
+		}
+
+		#[test]
+		fn build_refuses_expectation_with_no_producer() {
+			let refused = ScenarioConfig::builder()
+				.with_csp(AcceptsEveryTrace)
+				.with_expect(Expect::Violation(Layer::Refinement))
+				.build();
+
+			assert_eq!(
+				refused.err(),
+				Some(ScenarioConfigError::ExpectViolationWithoutVerifier(Layer::Refinement))
+			);
+		}
 	}
 }

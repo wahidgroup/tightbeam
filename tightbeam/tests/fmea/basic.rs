@@ -6,7 +6,7 @@ use tightbeam::testing::fmea::{FmeaConfig, SeverityScale};
 use tightbeam::testing::{FaultModel, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
 use tightbeam::utils::BasisPoints;
-use tightbeam::{tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
+use tightbeam::{exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
 use safety_process::States;
 
@@ -15,12 +15,15 @@ pub(crate) const SAFE_MODE: Urn<'static> = Urn::new("test", "event:fmea-basic/sa
 pub(crate) const SENSOR_READ: Urn<'static> = Urn::new("test", "event:fmea-basic/sensor-read");
 pub(crate) const VALIDATE: Urn<'static> = Urn::new("test", "event:fmea-basic/validate");
 
-// Simple test spec for FMEA tests
 tb_assert_spec! {
 	pub FmeaTestSpec,
 	V(1,0,0): {
 		mode: Accept,
-		assertions: []
+		assertions: [
+			(SENSOR_READ, exactly!(1)),
+			(VALIDATE, exactly!(1)),
+			(ACTUATE, exactly!(1))
+		]
 	}
 }
 

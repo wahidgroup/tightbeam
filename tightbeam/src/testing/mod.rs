@@ -38,7 +38,7 @@ pub mod routes;
 pub mod timing;
 
 // Re-exports
-pub use config::{Expect, HookContext, ScenarioConfig, ScenarioConfigBuilder, TestHooks};
+pub use config::{Expect, HookContext, ScenarioConfig, ScenarioConfigBuilder, ScenarioConfigError, TestHooks};
 pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
 pub use result::{ScenarioResult, ScenarioVerdict};
 pub use specs::{verify_trace, Layer, SpecViolation, TBSpec, Violations};

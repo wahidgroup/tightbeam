@@ -85,7 +85,7 @@ pub use tightbeam::{
 	instrumentation::events,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{create_test_signing_key, ClusterEnv, HiveEnv, ScenarioConfig, SetupEnv},
+	testing::{create_test_signing_key, ClusterEnv, HiveEnv, ScenarioConfig, ScenarioConfigError, SetupEnv},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
