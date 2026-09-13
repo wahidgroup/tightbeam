@@ -14,10 +14,6 @@ use crate::der::Sequence;
 use crate::oids::{HASH_SHA256, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 use crate::{decode, Message};
 
-#[cfg(not(feature = "derive"))]
-use crate::Version;
-
-#[cfg(feature = "derive")]
 use crate::Beamable;
 
 #[cfg(feature = "aead")]
@@ -61,15 +57,7 @@ mod x509_certs {
 use x509_certs::*;
 
 /// Simple test message
-#[cfg(feature = "derive")]
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
-pub struct TestMessage {
-	pub content: String,
-}
-
-/// Simple test message
-#[cfg(not(feature = "derive"))]
-#[derive(Clone, Debug, PartialEq, Sequence)]
 pub struct TestMessage {
 	pub content: String,
 }
@@ -82,75 +70,22 @@ impl TestMessage {
 	}
 }
 
-#[cfg(not(feature = "derive"))]
-impl Message for TestMessage {
-	const MUST_BE_NON_REPUDIABLE: bool = false;
-	const MUST_BE_CONFIDENTIAL: bool = false;
-	const MUST_BE_COMPRESSED: bool = false;
-	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: Version = Version::V0;
-}
-
-#[cfg(feature = "derive")]
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 #[beam(confidential)]
 pub struct ConfidentialNote {
 	pub content: String,
 }
 
-#[cfg(not(feature = "derive"))]
-#[derive(Clone, Debug, PartialEq, Sequence)]
-pub struct ConfidentialNote {
-	pub content: String,
-}
-
-#[cfg(not(feature = "derive"))]
-impl Message for ConfidentialNote {
-	const MUST_BE_CONFIDENTIAL: bool = true;
-	const MUST_BE_NON_REPUDIABLE: bool = false;
-	const MUST_BE_COMPRESSED: bool = false;
-	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: Version = Version::V0;
-}
-
-#[cfg(feature = "derive")]
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 #[beam(profile = 1)]
 pub struct ConfidentialNonrepudiableNote {
 	pub content: String,
 }
 
-#[cfg(feature = "derive")]
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 #[beam(message_integrity, frame_integrity)]
 pub struct IntegralNote {
 	pub content: String,
-}
-
-#[cfg(not(feature = "derive"))]
-#[derive(Clone, Debug, PartialEq, Sequence)]
-pub struct ConfidentialNonrepudiableNote {
-	pub content: String,
-}
-
-#[cfg(not(feature = "derive"))]
-impl Message for ConfidentialNonrepudiableNote {
-	const MUST_BE_CONFIDENTIAL: bool = true;
-	const MUST_BE_NON_REPUDIABLE: bool = true;
-	const MUST_BE_COMPRESSED: bool = false;
-	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: Version = Version::V0;
-}
-
-#[cfg(not(feature = "derive"))]
-impl Message for IntegralNote {
-	const MUST_BE_NON_REPUDIABLE: bool = false;
-	const MUST_BE_CONFIDENTIAL: bool = false;
-	const MUST_BE_COMPRESSED: bool = false;
-	const MUST_BE_PRIORITIZED: bool = false;
-	const MUST_HAVE_MESSAGE_INTEGRITY: bool = true;
-	const MUST_HAVE_FRAME_INTEGRITY: bool = true;
-	const MIN_VERSION: Version = Version::V0;
 }
 
 #[cfg(all(feature = "secp256k1", feature = "signature"))]
@@ -491,15 +426,11 @@ impl TestFrame {
 		#[cfg(not(all(feature = "std", feature = "digest", feature = "random")))]
 		let id = id.unwrap_or("test-message-id");
 
-		#[cfg(feature = "derive")]
 		let result = compose! {
 			V0: id: id,
 				order: order,
 				message: message
 		};
-
-		#[cfg(not(feature = "derive"))]
-		let result = Frame::new_v0(id, order, &message);
 
 		result.expect("Failed to create TightBeam message")
 	}

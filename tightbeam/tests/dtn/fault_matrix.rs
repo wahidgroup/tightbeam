@@ -34,7 +34,7 @@ impl FaultType {
 ///
 /// Matrix layout:
 /// - Cell [0,0]: Low Power fault (0=inactive, 1=active)
-/// - Cell [0,1]: Communications fault (0=inactive, 1=active)  
+/// - Cell [0,1]: Communications fault (0=inactive, 1=active)
 /// - Cell [0,2]: Thermal fault (0=inactive, 1=active)
 /// - Cell [1,0]: Battery percentage (0-100)
 /// - Remaining cells: Reserved for future use
@@ -147,22 +147,17 @@ impl TryFrom<FaultMatrix> for tightbeam::matrix::MatrixDyn {
 	}
 }
 
-/// Extract FaultMatrix from Option<Asn1Matrix> (from frame metadata).
-impl TryFrom<&Option<tightbeam::Asn1Matrix>> for FaultMatrix {
+/// Extract FaultMatrix from the metadata matrix.
+impl TryFrom<&Option<tightbeam::matrix::MatrixDyn>> for FaultMatrix {
 	type Error = tightbeam::TightBeamError;
 
-	fn try_from(matrix_opt: &Option<tightbeam::Asn1Matrix>) -> Result<Self, Self::Error> {
+	fn try_from(matrix_opt: &Option<tightbeam::matrix::MatrixDyn>) -> Result<Self, Self::Error> {
 		match matrix_opt {
-			Some(asn1_matrix) if asn1_matrix.n == 3 => {
-				// Convert Asn1Matrix to Matrix<3>
-				use tightbeam::matrix::MatrixDyn;
-				let matrix_dyn = MatrixDyn::try_from(asn1_matrix)?;
-
-				// Create Matrix<3> from row-major data
+			Some(wire_matrix) if wire_matrix.n() == 3 => {
 				let mut matrix = Matrix::<3>::new();
 				for r in 0..3 {
 					for c in 0..3 {
-						matrix.set(r, c, matrix_dyn.get(r, c));
+						matrix.set(r, c, wire_matrix.get(r, c));
 					}
 				}
 

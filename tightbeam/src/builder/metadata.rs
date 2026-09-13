@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use crate::builder::error::{BuildError, MetadataError};
 use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::matrix::MatrixDyn;
-use crate::{Asn1Matrix, CompressedData, DigestInfo, MessagePriority, Metadata, Version};
+use crate::{CompressedData, DigestInfo, MessagePriority, Metadata, Version};
 
 /// A fluent builder for TightBeam metadata.
 pub struct MetadataBuilder {
@@ -139,12 +139,6 @@ impl MetadataBuilder {
 		reject_unsupported!(lifetime, allows_lifetime);
 		reject_unsupported!(previous_frame, allows_previous_frame);
 		reject_unsupported!(matrix, allows_matrix);
-
-		let matrix = if let Some(m) = matrix {
-			Some(Asn1Matrix::try_from(m)?)
-		} else {
-			None
-		};
 
 		Ok(Metadata {
 			id,

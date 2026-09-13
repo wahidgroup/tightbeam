@@ -169,8 +169,8 @@ pub use zeroize;
 
 // Re-export
 pub use asn1::{
-	AlgorithmIdentifier, Asn1Matrix, CompressedData, DigestInfo, EncryptedContentInfo, Frame, MessagePriority,
-	Metadata, ObjectIdentifier, SignerInfo, Version,
+	AlgorithmIdentifier, CompressedData, DigestInfo, EncryptedContentInfo, Frame, MessagePriority, Metadata,
+	ObjectIdentifier, SignerInfo, Version,
 };
 pub use cms;
 pub use der;

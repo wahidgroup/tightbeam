@@ -1,16 +1,15 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::Asn1Matrix;
 use crate::Errorizable;
 
 pub type MatrixResult<T> = core::result::Result<T, MatrixError>;
 
 #[derive(Errorizable, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MatrixError {
-	#[error("Asn1Matrix: n MUST be in 1..=255 (got {0})")]
+	#[error("matrix: n MUST be in 1..=255 (got {0})")]
 	InvalidN(u8),
-	#[error("Asn1Matrix: data length MUST equal n*n (n={n}, len={len})")]
+	#[error("matrix: data length MUST equal n*n (n={n}, len={len})")]
 	LengthMismatch { n: u8, len: usize },
 }
 
@@ -59,7 +58,12 @@ where
 }
 
 /// Runtime-sized N×N matrix of u8 flags (row-major).
+///
+/// This is the wire type for the V3 metadata matrix. Its fields are private
+/// and [`MatrixDyn::from_row_major`] is the only way to build one, so
+/// `data.len() == n * n` holds for every value that exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct MatrixDyn {
 	n: u8,
 	data: Vec<u8>,
@@ -117,6 +121,46 @@ impl MatrixDyn {
 		let n = self.n as usize;
 		let start = r as usize * n;
 		self.data.get(start..start + n)
+	}
+}
+
+impl crate::der::FixedTag for MatrixDyn {
+	const TAG: crate::der::Tag = crate::der::Tag::Sequence;
+}
+
+impl<'a> crate::der::DecodeValue<'a> for MatrixDyn {
+	/// Reads `n` and the row-major bytes, then hands both to the one
+	/// constructor rather than checking the length a second time here.
+	fn decode_value<R: crate::der::Reader<'a>>(
+		reader: &mut R,
+		_header: crate::der::Header,
+	) -> crate::der::Result<Self> {
+		use crate::der::asn1::OctetString;
+		use crate::der::Decode;
+
+		let n = u8::decode(reader)?;
+		let data = OctetString::decode(reader)?;
+		Self::from_row_major(n, data.as_bytes().to_vec())
+			.ok_or_else(|| crate::der::ErrorKind::Length { tag: crate::der::Tag::OctetString }.into())
+	}
+}
+
+impl crate::der::EncodeValue for MatrixDyn {
+	fn value_len(&self) -> crate::der::Result<crate::der::Length> {
+		use crate::der::asn1::OctetString;
+		use crate::der::Encode;
+
+		let n_len = self.n.encoded_len()?;
+		let data_len = OctetString::new(self.data.as_slice())?.encoded_len()?;
+		n_len + data_len
+	}
+
+	fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
+		use crate::der::asn1::OctetString;
+		use crate::der::Encode;
+
+		self.n.encode(encoder)?;
+		OctetString::new(self.data.as_slice())?.encode(encoder)
 	}
 }
 
@@ -248,69 +292,6 @@ impl TryFrom<u8> for MatrixDyn {
 	}
 }
 
-impl TryFrom<MatrixDyn> for Asn1Matrix {
-	type Error = crate::matrix::MatrixError;
-
-	fn try_from(mut matrix: MatrixDyn) -> Result<Self, Self::Error> {
-		let n = matrix.n();
-		validate_n!(n);
-
-		// MatrixDyn stores row-major n*n bytes, same as Asn1Matrix
-		let expected_len = (n as usize) * (n as usize);
-		if matrix.data.len() != expected_len {
-			return Err(crate::matrix::MatrixError::LengthMismatch { n, len: matrix.data.len() });
-		}
-
-		let data = core::mem::take(&mut matrix.data);
-		Ok(Self { n, data })
-	}
-}
-
-macro_rules! asn1_to_matrix_dyn_impl {
-	($matrix:expr) => {{
-		let n = $matrix.n;
-		validate_n!(n);
-
-		let n_u8 = n as u8;
-		let n2 = n_u8 as usize * n_u8 as usize;
-		if $matrix.data.len() != n2 {
-			return Err(MatrixError::LengthMismatch { n, len: $matrix.data.len() });
-		}
-	}};
-}
-
-impl TryFrom<Asn1Matrix> for MatrixDyn {
-	type Error = MatrixError;
-	fn try_from(m: Asn1Matrix) -> Result<Self, Self::Error> {
-		asn1_to_matrix_dyn_impl!(m);
-
-		let mut m = m;
-		let data = core::mem::take(&mut m.data);
-		let len = data.len();
-
-		MatrixDyn::from_row_major(m.n, data).ok_or(MatrixError::LengthMismatch { n: m.n, len })
-	}
-}
-
-impl TryFrom<&Asn1Matrix> for MatrixDyn {
-	type Error = MatrixError;
-	fn try_from(m: &Asn1Matrix) -> Result<Self, Self::Error> {
-		asn1_to_matrix_dyn_impl!(m);
-
-		MatrixDyn::from_row_major(m.n, m.data.clone()).ok_or(MatrixError::LengthMismatch { n: m.n, len: m.data.len() })
-	}
-}
-
-impl TryFrom<Option<Asn1Matrix>> for MatrixDyn {
-	type Error = MatrixError;
-	fn try_from(m: Option<Asn1Matrix>) -> Result<Self, Self::Error> {
-		match m {
-			Some(m) => Self::try_from(m),
-			None => Ok(Default::default()),
-		}
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -327,12 +308,11 @@ mod tests {
 
 	#[test]
 	#[cfg(feature = "std")]
-	fn absent_asn1_matrix_converts_to_valid_default() -> crate::error::Result<()> {
-		let matrix = MatrixDyn::try_from(None::<Asn1Matrix>)?;
+	fn a_default_matrix_is_the_smallest_valid_one() -> crate::error::Result<()> {
+		let matrix = MatrixDyn::default();
 		assert_eq!(matrix.n(), 1);
 		assert_eq!(matrix.get(0, 0), 0);
 		assert!(matrix.row(0).is_some());
-
 		Ok(())
 	}
 
@@ -438,17 +418,11 @@ mod tests {
 
 		// Test 1: Wire format compliance (n ∈ [1, 255], data.len == n*n)
 		for (n, data) in &test_matrices {
-			// Valid construction
-			let asn1_matrix = Asn1Matrix { n: *n, data: data.clone() };
-			// Validate n bounds
-			assert!(*n >= 1);
-
-			// Validate data length equals n*n
 			let expected_len = (*n as usize) * (*n as usize);
 			assert_eq!(data.len(), expected_len);
 
-			// Test conversion to MatrixDyn preserves row-major ordering
-			let matrix_dyn = MatrixDyn::try_from(&asn1_matrix)?;
+			let matrix_dyn =
+				MatrixDyn::from_row_major(*n, data.clone()).expect("n*n bytes is the shape the constructor accepts");
 			assert_eq!(matrix_dyn.n(), *n);
 			assert_eq!(matrix_dyn.as_bytes(), data.as_slice());
 		}
@@ -458,9 +432,8 @@ mod tests {
 		assert!(invalid_n.is_err());
 
 		// Test 3: Error handling - length mismatch
-		let invalid_asn1 = Asn1Matrix { n: 2, data: vec![1, 2, 3] }; // 3 != 2*2
-		let invalid_conversion = MatrixDyn::try_from(invalid_asn1);
-		assert!(invalid_conversion.is_err());
+		let invalid_length = MatrixDyn::from_row_major(2, vec![1, 2, 3]); // 3 != 2*2
+		assert!(invalid_length.is_none());
 
 		// Test 4: Row-major ordering preservation
 		// Fill with values: row 0 = [10, 11, 12], row 1 = [20, 21, 22], row 2 = [30, 31, 32]
