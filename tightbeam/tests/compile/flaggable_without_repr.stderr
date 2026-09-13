@@ -1,4 +1,4 @@
-error: Flaggable requires #[repr(u8)]: without it a discriminant above 255 is silently truncated by `as u8`
+error: Flaggable requires #[repr(u8)]: a discriminant above 255 is silently truncated by `as u8`
   --> tests/compile/flaggable_without_repr.rs:6:1
    |
  6 | / pub enum Unbounded {
