@@ -85,19 +85,29 @@ use crate::der::{DecodeValue, EncodeValue, FixedTag, Tag};
 pub struct Urn<'a> {
 	/// Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with letter)
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
-	pub nid: Cow<'a, str>,
+	nid: Cow<'a, str>,
 
 	/// Namespace-Specific String (structure defined by namespace)
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.2>`
-	pub nss: Cow<'a, str>,
+	nss: Cow<'a, str>,
 }
 
 impl<'a> Urn<'a> {
-	/// Create an unchecked URN from static strings
+	/// Create a URN from static strings.
 	///
-	/// This can be used in const contexts to define constant URNs.
-	/// No validation is performed - use `verify::<Spec>()` at runtime
-	/// to validate against a spec.
+	/// The RFC 8141 shape of the NID and the non-emptiness of the NSS are
+	/// checked here, in const context, so a malformed literal fails to build
+	/// rather than reaching a `verify` call someone has to remember. Use
+	/// [`Urn::verify`] for what only a spec can say.
+	///
+	/// # Panics
+	///
+	/// - When `nid` is outside RFC 8141's formal-namespace-identifier shape:
+	///   2 to 32 characters, ASCII alphanumeric or hyphen, starting with a
+	///   letter.
+	/// - When `nss` is empty, which names no resource.
+	///
+	/// In a `const` these are build errors, not runtime panics.
 	///
 	/// # Example
 	///
@@ -105,9 +115,52 @@ impl<'a> Urn<'a> {
 	/// # use tightbeam::utils::urn::Urn;
 	/// const EXAMPLE_URN: Urn<'static> = Urn::new("example", "test:resource");
 	/// ```
+	///
+	/// ```compile_fail
+	/// # use tightbeam::utils::urn::Urn;
+	/// const REJECTED: Urn<'static> = Urn::new("9bad", "resource");
+	/// ```
 	#[inline]
 	pub const fn new(nid: &'static str, nss: &'static str) -> Urn<'static> {
+		assert!(
+			nid_has_rfc8141_shape(nid),
+			"URN NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter"
+		);
+		assert!(!nss.is_empty(), "URN NSS must name a resource");
+
 		Urn { nid: Cow::Borrowed(nid), nss: Cow::Borrowed(nss) }
+	}
+
+	/// Build a URN from parts that are not known until run time.
+	///
+	/// [`Urn::new`] is the const path for literals. This one takes the same
+	/// rules to values a caller assembles.
+	///
+	/// # Errors
+	///
+	/// - [`UrnValidationError::InvalidNidLength`], [`UrnValidationError::InvalidNidStart`]
+	///   or [`UrnValidationError::InvalidNidCharacters`] when `nid` is outside
+	///   RFC 8141's formal-namespace-identifier shape.
+	/// - [`UrnValidationError::RequiredFieldMissing`] when `nss` is empty.
+	pub fn from_parts(nid: impl AsRef<str>, nss: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
+		let (nid, nss) = (nid.as_ref(), nss.as_ref());
+		Self::validate_nid(nid)?;
+
+		if nss.is_empty() {
+			return Err(UrnValidationError::RequiredFieldMissing("nss"));
+		}
+
+		Ok(Urn { nid: Cow::Owned(String::from(nid)), nss: Cow::Owned(String::from(nss)) })
+	}
+
+	/// Namespace Identifier.
+	pub fn nid(&self) -> &str {
+		&self.nid
+	}
+
+	/// Namespace-Specific String.
+	pub fn nss(&self) -> &str {
+		&self.nss
 	}
 
 	/// Verify this URN against a spec
@@ -167,6 +220,33 @@ impl<'a> Urn<'a> {
 	pub fn into_owned(self) -> Urn<'static> {
 		Urn { nid: Cow::Owned(self.nid.into_owned()), nss: Cow::Owned(self.nss.into_owned()) }
 	}
+}
+
+/// RFC 8141 s2.1 formal-namespace-identifier, in const context.
+///
+/// Byte-wise because `str::chars` is not available in a `const fn`. The NID is
+/// ASCII by the same production, so bytes and characters agree here.
+const fn nid_has_rfc8141_shape(nid: &str) -> bool {
+	let bytes = nid.as_bytes();
+	if bytes.len() < 2 || bytes.len() > 32 {
+		return false;
+	}
+
+	if !bytes[0].is_ascii_alphabetic() {
+		return false;
+	}
+
+	let mut index = 1;
+	while index < bytes.len() {
+		let byte = bytes[index];
+		if !byte.is_ascii_alphanumeric() && byte != b'-' {
+			return false;
+		}
+
+		index += 1;
+	}
+
+	true
 }
 
 impl<'a> fmt::Display for Urn<'a> {

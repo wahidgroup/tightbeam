@@ -388,7 +388,7 @@ tb_scenario! {
 				&mut client,
 				&hive_id.key,
 				b"del-conflict",
-				servlet_address_update(hive_addr, vec![], vec![servlet_urn("ping").servlet_instance(locator.as_ref())]),
+				servlet_address_update(hive_addr, vec![], vec![servlet_urn("ping").servlet_instance(locator.as_ref()).expect("a servlet type URN yields an instance URN")]),
 			)
 			.await?;
 

@@ -859,7 +859,7 @@ tb_scenario! {
 			let request = servlet_address_update(hive_addr, vec![], removed);
 			emit_servlet_update(&mut client, &certs.key, b"removal-foreign", request).await?;
 
-			let removed = vec![servlet_urn("ping").servlet_instance(&servlet_addr)];
+			let removed = vec![servlet_urn("ping").servlet_instance(&servlet_addr).expect("a servlet type URN yields an instance URN")];
 			let request = servlet_address_update(hive_addr, vec![], removed);
 			emit_servlet_update(&mut client, &certs.key, b"removal-remove", request).await?;
 

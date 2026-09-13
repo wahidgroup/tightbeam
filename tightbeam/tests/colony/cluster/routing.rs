@@ -280,7 +280,7 @@ tb_scenario! {
 			trace.event(WORK_SENT)?;
 
 			let refused_work = client
-				.submit_work_to(servlet_urn("ping").servlet_instance("127.0.0.1:9999"), &inner)
+				.submit_work_to(servlet_urn("ping").servlet_instance("127.0.0.1:9999").expect("a servlet type URN yields an instance URN"), &inner)
 				.await;
 			record_work_refusal(&trace, refused_work)?;
 

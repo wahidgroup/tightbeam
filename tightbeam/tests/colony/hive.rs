@@ -188,7 +188,9 @@ fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError
 /// Builds a manage command frame with a stop request. Each call site
 /// passes a unique id.
 fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
-	let servlet_id = servlet_urn("none").servlet_instance("127.0.0.1:0");
+	let servlet_id = servlet_urn("none")
+		.servlet_instance("127.0.0.1:0")
+		.expect("a servlet type URN yields an instance URN");
 	let stop = StopServletParams { servlet_id };
 	let manage = HiveManagementRequest { spawn: None, list: None, stop: Some(stop) };
 	let manage_cmd = ClusterCommand { heartbeat: None, manage: Some(manage) };

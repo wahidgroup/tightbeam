@@ -1,0 +1,16 @@
+error[E0080]: evaluation panicked: URN NSS must name a resource
+ --> tests/compile/urn_nss_empty.rs:4:32
+  |
+4 | const REJECTED: Urn<'static> = Urn::new("test", "");
+  |                                ^^^^^^^^^^^^^^^^^^^^ evaluation of `REJECTED` failed inside this call
+  |
+note: inside `Urn::<'_>::new`
+ --> $RUST/core/src/panic.rs
+  |
+  |         $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: src/utils/urn/mod.rs
+  |
+  |         assert!(!nss.is_empty(), "URN NSS must name a resource");
+  |         -------------------------------------------------------- in this macro invocation

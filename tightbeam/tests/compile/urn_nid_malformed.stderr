@@ -1,0 +1,19 @@
+error[E0080]: evaluation panicked: URN NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter
+ --> tests/compile/urn_nid_malformed.rs:5:32
+  |
+5 | const REJECTED: Urn<'static> = Urn::new("9bad", "resource");
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `REJECTED` failed inside this call
+  |
+note: inside `Urn::<'_>::new`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: src/utils/urn/mod.rs
+  |
+  | /         assert!(
+  | |             nid_has_rfc8141_shape(nid),
+  | |             "URN NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter"
+  | |         );
+  | |_________- in this macro invocation

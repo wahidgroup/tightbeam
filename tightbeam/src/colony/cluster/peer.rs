@@ -432,7 +432,9 @@ mod tests {
 		let bare = ping_type();
 		assert!(ns.all_bare_servlet_types(core::slice::from_ref(&bare)));
 
-		let instance = bare.servlet_instance("127.0.0.1:1");
+		let instance = bare
+			.servlet_instance("127.0.0.1:1")
+			.expect("a servlet type URN yields an instance URN");
 		assert!(!ns.all_bare_servlet_types(&[instance]));
 	}
 
