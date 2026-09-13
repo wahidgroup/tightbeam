@@ -87,7 +87,7 @@ impl PheromoneConfig {
 impl Default for PheromoneConfig {
 	fn default() -> Self {
 		Self {
-			evaporation_rate: BasisPoints::new(DEFAULT_EVAPORATION_RATE_BPS),
+			evaporation_rate: crate::bps!(DEFAULT_EVAPORATION_RATE_BPS),
 			evaporation_interval: Duration::from_secs(DEFAULT_EVAPORATION_INTERVAL_SECS),
 			initial_pheromone: DEFAULT_INITIAL_PHEROMONE,
 			abandonment_limit: DEFAULT_ABANDONMENT_LIMIT,

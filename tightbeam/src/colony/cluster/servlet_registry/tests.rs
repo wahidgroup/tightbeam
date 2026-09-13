@@ -94,7 +94,7 @@ const EVAPORATE_CASES: &[(u64, u16, u64)] = &[
 fn entry_evaporate_pheromone() {
 	for &(initial, rate, expected) in EVAPORATE_CASES {
 		let entry = test_entry(initial, 5);
-		entry.evaporate(BasisPoints::new(rate));
+		entry.evaporate(BasisPoints::try_from(rate).expect("test rates are within 0-10000 basis points"));
 		assert_eq!(entry.pheromone_level(), expected);
 	}
 }

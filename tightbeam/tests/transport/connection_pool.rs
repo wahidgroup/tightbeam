@@ -56,13 +56,13 @@ use tightbeam::{
 	hex,
 };
 
-pub(crate) const ACQUIRE_CLIENT: Urn<'static> = Urn::new("test", "event:connection-pool/acquire-client");
-pub(crate) const MESSAGE_COUNT: Urn<'static> = Urn::new("test", "event:connection-pool/message-count");
-pub(crate) const POOL_CREATE: Urn<'static> = Urn::new("test", "event:connection-pool/pool-create");
-pub(crate) const RECEIVE_RESPONSE: Urn<'static> = Urn::new("test", "event:connection-pool/receive-response");
-pub(crate) const SEND_MESSAGE: Urn<'static> = Urn::new("test", "event:connection-pool/send-message");
-pub(crate) const SERVLET1_COUNT: Urn<'static> = Urn::new("test", "event:connection-pool/servlet1-count");
-pub(crate) const SERVLET2_COUNT: Urn<'static> = Urn::new("test", "event:connection-pool/servlet2-count");
+pub(crate) const ACQUIRE_CLIENT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/acquire-client");
+pub(crate) const MESSAGE_COUNT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/message-count");
+pub(crate) const POOL_CREATE: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/pool-create");
+pub(crate) const RECEIVE_RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/receive-response");
+pub(crate) const SEND_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/send-message");
+pub(crate) const SERVLET1_COUNT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/servlet1-count");
+pub(crate) const SERVLET2_COUNT: Urn<'static> = tightbeam::urn!("test", "event:connection-pool/servlet2-count");
 
 // ============================================================================
 // Test Message Types

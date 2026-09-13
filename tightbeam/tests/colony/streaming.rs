@@ -37,15 +37,17 @@ pub struct StreamLabel {
 	pub label: String,
 }
 
-pub(crate) const SERVLET_UNARY_HANDLED: Urn<'static> = Urn::new("test", "event:colony-streaming/servlet-unary-handled");
+pub(crate) const SERVLET_UNARY_HANDLED: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/servlet-unary-handled");
 pub(crate) const SERVLET_STREAM_HANDLED: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/servlet-stream-handled");
+	tightbeam::urn!("test", "event:colony-streaming/servlet-stream-handled");
 pub(crate) const SERVLET_DUPLEX_HANDLED: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/servlet-duplex-handled");
-pub(crate) const UNARY_ECHOES: Urn<'static> = Urn::new("test", "event:colony-streaming/unary-echoes");
+	tightbeam::urn!("test", "event:colony-streaming/servlet-duplex-handled");
+pub(crate) const UNARY_ECHOES: Urn<'static> = tightbeam::urn!("test", "event:colony-streaming/unary-echoes");
 pub(crate) const STREAM_REPLY_REPORTS_LENGTH: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/stream-reply-reports-length");
-pub(crate) const DUPLEX_ECHOES_CHUNKS: Urn<'static> = Urn::new("test", "event:colony-streaming/duplex-echoes-chunks");
+	tightbeam::urn!("test", "event:colony-streaming/stream-reply-reports-length");
+pub(crate) const DUPLEX_ECHOES_CHUNKS: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/duplex-echoes-chunks");
 
 fn reply_frame(label: &str) -> Result<Frame, TightBeamError> {
 	Ok(compose! {
@@ -191,9 +193,10 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const STREAM_ONLY_REPLY_OK: Urn<'static> = Urn::new("test", "event:colony-streaming/stream-only-reply-ok");
+pub(crate) const STREAM_ONLY_REPLY_OK: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/stream-only-reply-ok");
 pub(crate) const STREAM_ONLY_UNARY_REFUSED: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/stream-only-unary-refused");
+	tightbeam::urn!("test", "event:colony-streaming/stream-only-unary-refused");
 
 servlet! {
 	/// A streaming-only servlet with no `handle:` arm at all. Unary requests
@@ -264,9 +267,9 @@ hive! {
 }
 
 pub(crate) const HIVE_STREAM_REPLY_REPORTS_LENGTH: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/hive-stream-reply-reports-length");
+	tightbeam::urn!("test", "event:colony-streaming/hive-stream-reply-reports-length");
 pub(crate) const HIVE_DUPLEX_ECHOES_CHUNKS: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/hive-duplex-echoes-chunks");
+	tightbeam::urn!("test", "event:colony-streaming/hive-duplex-echoes-chunks");
 
 /// Returns the type URN that every hive scenario in this file registers
 /// and targets.

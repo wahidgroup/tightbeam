@@ -7,14 +7,14 @@ use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-const INIT: Urn<'static> = Urn::new("fuzz", "event:workflow/init");
-const AUTHENTICATE: Urn<'static> = Urn::new("fuzz", "event:workflow/authenticate");
-const READ: Urn<'static> = Urn::new("fuzz", "event:workflow/read");
-const WRITE: Urn<'static> = Urn::new("fuzz", "event:workflow/write");
-const DELETE: Urn<'static> = Urn::new("fuzz", "event:workflow/delete");
-const COMMIT: Urn<'static> = Urn::new("fuzz", "event:workflow/commit");
-const ROLLBACK: Urn<'static> = Urn::new("fuzz", "event:workflow/rollback");
-const COMPLETE: Urn<'static> = Urn::new("fuzz", "event:workflow/complete");
+const INIT: Urn<'static> = tightbeam::urn!("fuzz", "event:workflow/init");
+const AUTHENTICATE: Urn<'static> = tightbeam::urn!("fuzz", "event:workflow/authenticate");
+const READ: Urn<'static> = tightbeam::urn!("fuzz", "event:workflow/read");
+const WRITE: Urn<'static> = tightbeam::urn!("fuzz", "event:workflow/write");
+const DELETE: Urn<'static> = tightbeam::urn!("fuzz", "event:workflow/delete");
+const COMMIT: Urn<'static> = tightbeam::urn!("fuzz", "event:workflow/commit");
+const ROLLBACK: Urn<'static> = tightbeam::urn!("fuzz", "event:workflow/rollback");
+const COMPLETE: Urn<'static> = tightbeam::urn!("fuzz", "event:workflow/complete");
 
 tb_assert_spec! {
 	pub WorkflowFuzzSpec,

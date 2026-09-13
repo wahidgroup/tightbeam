@@ -19,19 +19,25 @@ use super::harness::{PaymentHarness, PAYMENT_TAG};
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> = Urn::new("test", "event:servlets/authorization-approved");
-pub(crate) const CAPTURE_COMPLETED: Urn<'static> = Urn::new("test", "event:servlets/capture-completed");
-pub(crate) const CHAIN_BROKEN: Urn<'static> = Urn::new("test", "event:servlets/chain-broken");
-pub(crate) const CHAIN_VALID: Urn<'static> = Urn::new("test", "event:servlets/chain-valid");
-pub(crate) const CURRENCY_BHD_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-bhd-processed");
-pub(crate) const CURRENCY_JPY_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-jpy-processed");
-pub(crate) const CURRENCY_OTHER_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-other-processed");
-pub(crate) const CURRENCY_USD_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-usd-processed");
-pub(crate) const HIGH_VALUE_EXPEDITED: Urn<'static> = Urn::new("test", "event:servlets/high-value-expedited");
-pub(crate) const INTEGRITY_VERIFIED: Urn<'static> = Urn::new("test", "event:servlets/integrity-verified");
+pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/authorization-approved");
+pub(crate) const CAPTURE_COMPLETED: Urn<'static> = tightbeam::urn!("test", "event:servlets/capture-completed");
+pub(crate) const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:servlets/chain-broken");
+pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:servlets/chain-valid");
+pub(crate) const CURRENCY_BHD_PROCESSED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/currency-bhd-processed");
+pub(crate) const CURRENCY_JPY_PROCESSED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/currency-jpy-processed");
+pub(crate) const CURRENCY_OTHER_PROCESSED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/currency-other-processed");
+pub(crate) const CURRENCY_USD_PROCESSED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/currency-usd-processed");
+pub(crate) const HIGH_VALUE_EXPEDITED: Urn<'static> = tightbeam::urn!("test", "event:servlets/high-value-expedited");
+pub(crate) const INTEGRITY_VERIFIED: Urn<'static> = tightbeam::urn!("test", "event:servlets/integrity-verified");
 pub(crate) const KEYMANAGER_DECRYPT_SUCCESS: Urn<'static> =
-	Urn::new("test", "event:servlets/keymanager-decrypt-success");
-pub(crate) const KEYMANAGER_PUBKEY_SERVED: Urn<'static> = Urn::new("test", "event:servlets/keymanager-pubkey-served");
+	tightbeam::urn!("test", "event:servlets/keymanager-decrypt-success");
+pub(crate) const KEYMANAGER_PUBKEY_SERVED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/keymanager-pubkey-served");
 use super::messages::{
 	CaptureTransaction, CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest,
 	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,

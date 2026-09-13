@@ -23,25 +23,26 @@ use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const EMIT_FAILS_CONNECTION_CLOSED: Urn<'static> =
-	Urn::new("test", "event:lifecycle/emit-fails-connection-closed");
-pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> = Urn::new("test", "event:lifecycle/inflight-drains-to-echo");
+	tightbeam::urn!("test", "event:lifecycle/emit-fails-connection-closed");
+pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> =
+	tightbeam::urn!("test", "event:lifecycle/inflight-drains-to-echo");
 pub(crate) const LATE_EMIT_REFUSED_DRAINING: Urn<'static> =
-	Urn::new("test", "event:lifecycle/late-emit-refused-draining");
+	tightbeam::urn!("test", "event:lifecycle/late-emit-refused-draining");
 pub(crate) const OFFENDER_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	Urn::new("test", "event:lifecycle/offender-answered-with-goaway");
+	tightbeam::urn!("test", "event:lifecycle/offender-answered-with-goaway");
 pub(crate) const PEER_REASON_SURFACES_ON_HANDLE: Urn<'static> =
-	Urn::new("test", "event:lifecycle/peer-reason-surfaces-on-handle");
+	tightbeam::urn!("test", "event:lifecycle/peer-reason-surfaces-on-handle");
 pub(crate) const PENDING_FAILS_CONNECTION_CLOSED: Urn<'static> =
-	Urn::new("test", "event:lifecycle/pending-fails-connection-closed");
-pub(crate) const REKEY_CASE_HOLDS: Urn<'static> = Urn::new("test", "event:lifecycle/rekey-case-holds");
+	tightbeam::urn!("test", "event:lifecycle/pending-fails-connection-closed");
+pub(crate) const REKEY_CASE_HOLDS: Urn<'static> = tightbeam::urn!("test", "event:lifecycle/rekey-case-holds");
 pub(crate) const RESPONDER_POLICY_REJECTION: Urn<'static> =
-	Urn::new("test", "event:lifecycle/responder-policy-rejection");
+	tightbeam::urn!("test", "event:lifecycle/responder-policy-rejection");
 pub(crate) const SHUTDOWN_WITH_ADVERTISES_REASON: Urn<'static> =
-	Urn::new("test", "event:lifecycle/shutdown-with-advertises-reason");
+	tightbeam::urn!("test", "event:lifecycle/shutdown-with-advertises-reason");
 pub(crate) const STREAM_ABOVE_WATERMARK_DRAINING: Urn<'static> =
-	Urn::new("test", "event:lifecycle/stream-above-watermark-draining");
+	tightbeam::urn!("test", "event:lifecycle/stream-above-watermark-draining");
 pub(crate) const STREAM_AT_WATERMARK_ECHOED: Urn<'static> =
-	Urn::new("test", "event:lifecycle/stream-at-watermark-echoed");
+	tightbeam::urn!("test", "event:lifecycle/stream-at-watermark-echoed");
 
 tb_assert_spec! {
 	pub MuxGoAwayDrainSpec,

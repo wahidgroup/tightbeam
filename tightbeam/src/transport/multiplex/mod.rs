@@ -441,10 +441,10 @@ mod tests {
 
 	#[test]
 	fn relayed_to_sentinel_clamps_to_relayed_route() {
-		let sentinel = StreamRoute::relayed_to(Urn::new("fuzz", "servlet:test/ping"), DEFAULT_HOP_BUDGET);
+		let sentinel = StreamRoute::relayed_to(crate::urn!("fuzz", "servlet:test/ping"), DEFAULT_HOP_BUDGET);
 		assert_eq!(sentinel.hops_remaining(), DEFAULT_HOP_BUDGET - 1);
 
-		let below = StreamRoute::relayed_to(Urn::new("fuzz", "servlet:test/ping"), 1);
+		let below = StreamRoute::relayed_to(crate::urn!("fuzz", "servlet:test/ping"), 1);
 		assert_eq!(below.hops_remaining(), 1);
 	}
 }

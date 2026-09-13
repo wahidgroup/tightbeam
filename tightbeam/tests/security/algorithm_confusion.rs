@@ -42,7 +42,7 @@ use tightbeam::{
 use crate::common::security::{deterministic_signing_key, expectation_failure, test_certificate};
 
 pub(crate) const FOREIGN_OID_REJECTED: Urn<'static> =
-	Urn::new("test", "event:algorithm-confusion/foreign-oid-rejected");
+	tightbeam::urn!("test", "event:algorithm-confusion/foreign-oid-rejected");
 
 tb_assert_spec! {
 	pub AlgorithmConfusionSpec,

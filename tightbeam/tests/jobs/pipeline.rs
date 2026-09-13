@@ -18,22 +18,27 @@ use tightbeam::tb_process_spec;
 #[cfg(feature = "testing-csp")]
 use tightbeam::testing::ScenarioConfig;
 
-pub(crate) const FALLBACK_TRIGGERED: Urn<'static> = Urn::new("test", "event:pipeline/fallback-triggered");
-pub(crate) const PIPELINE_COMPLETE: Urn<'static> = Urn::new("test", "event:pipeline/pipeline-complete");
-pub(crate) const PIPELINE_START: Urn<'static> = Urn::new("test", "event:pipeline/pipeline-start");
+pub(crate) const FALLBACK_TRIGGERED: Urn<'static> = tightbeam::urn!("test", "event:pipeline/fallback-triggered");
+pub(crate) const PIPELINE_COMPLETE: Urn<'static> = tightbeam::urn!("test", "event:pipeline/pipeline-complete");
+pub(crate) const PIPELINE_START: Urn<'static> = tightbeam::urn!("test", "event:pipeline/pipeline-start");
 
 #[cfg(feature = "testing-csp")]
-pub(crate) const CREATE_TEST_FRAME_START: Urn<'static> = Urn::new("tightbeam", "event:job/create-test-frame-start");
+pub(crate) const CREATE_TEST_FRAME_START: Urn<'static> =
+	tightbeam::urn!("tightbeam", "event:job/create-test-frame-start");
 #[cfg(feature = "testing-csp")]
-pub(crate) const CREATE_TEST_FRAME_SUCCESS: Urn<'static> = Urn::new("tightbeam", "event:job/create-test-frame-success");
+pub(crate) const CREATE_TEST_FRAME_SUCCESS: Urn<'static> =
+	tightbeam::urn!("tightbeam", "event:job/create-test-frame-success");
 #[cfg(feature = "testing-csp")]
-pub(crate) const TRANSFORM_CONTENT_START: Urn<'static> = Urn::new("tightbeam", "event:job/transform-content-start");
+pub(crate) const TRANSFORM_CONTENT_START: Urn<'static> =
+	tightbeam::urn!("tightbeam", "event:job/transform-content-start");
 #[cfg(feature = "testing-csp")]
-pub(crate) const TRANSFORM_CONTENT_SUCCESS: Urn<'static> = Urn::new("tightbeam", "event:job/transform-content-success");
+pub(crate) const TRANSFORM_CONTENT_SUCCESS: Urn<'static> =
+	tightbeam::urn!("tightbeam", "event:job/transform-content-success");
 #[cfg(feature = "testing-csp")]
-pub(crate) const VALIDATE_FRAME_START: Urn<'static> = Urn::new("tightbeam", "event:job/validate-frame-start");
+pub(crate) const VALIDATE_FRAME_START: Urn<'static> = tightbeam::urn!("tightbeam", "event:job/validate-frame-start");
 #[cfg(feature = "testing-csp")]
-pub(crate) const VALIDATE_FRAME_SUCCESS: Urn<'static> = Urn::new("tightbeam", "event:job/validate-frame-success");
+pub(crate) const VALIDATE_FRAME_SUCCESS: Urn<'static> =
+	tightbeam::urn!("tightbeam", "event:job/validate-frame-success");
 
 // Test message types
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]

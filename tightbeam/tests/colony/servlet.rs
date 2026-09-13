@@ -23,16 +23,16 @@ use tightbeam::{
 	worker, Beamable, Frame, TightBeamError,
 };
 
-pub(crate) const DOUBLER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/doubler-process");
-pub(crate) const SECURE_FRAME_CLEARTEXT: Urn<'static> = Urn::new("test", "event:servlet/secure-frame-cleartext");
-pub(crate) const SECURE_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/secure-receive");
-pub(crate) const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/servlet-receive");
-pub(crate) const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:servlet/servlet-respond");
-pub(crate) const SQUARER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/squarer-process");
-pub(crate) const VERIFY_DOUBLED: Urn<'static> = Urn::new("test", "event:servlet/verify-doubled");
-pub(crate) const VERIFY_FINAL_RESULT: Urn<'static> = Urn::new("test", "event:servlet/verify-final-result");
-pub(crate) const VERIFY_SECURE_DOUBLED: Urn<'static> = Urn::new("test", "event:servlet/verify-secure-doubled");
-pub(crate) const VERIFY_SQUARED: Urn<'static> = Urn::new("test", "event:servlet/verify-squared");
+pub(crate) const DOUBLER_PROCESS: Urn<'static> = tightbeam::urn!("test", "event:servlet/doubler-process");
+pub(crate) const SECURE_FRAME_CLEARTEXT: Urn<'static> = tightbeam::urn!("test", "event:servlet/secure-frame-cleartext");
+pub(crate) const SECURE_RECEIVE: Urn<'static> = tightbeam::urn!("test", "event:servlet/secure-receive");
+pub(crate) const SERVLET_RECEIVE: Urn<'static> = tightbeam::urn!("test", "event:servlet/servlet-receive");
+pub(crate) const SERVLET_RESPOND: Urn<'static> = tightbeam::urn!("test", "event:servlet/servlet-respond");
+pub(crate) const SQUARER_PROCESS: Urn<'static> = tightbeam::urn!("test", "event:servlet/squarer-process");
+pub(crate) const VERIFY_DOUBLED: Urn<'static> = tightbeam::urn!("test", "event:servlet/verify-doubled");
+pub(crate) const VERIFY_FINAL_RESULT: Urn<'static> = tightbeam::urn!("test", "event:servlet/verify-final-result");
+pub(crate) const VERIFY_SECURE_DOUBLED: Urn<'static> = tightbeam::urn!("test", "event:servlet/verify-secure-doubled");
+pub(crate) const VERIFY_SQUARED: Urn<'static> = tightbeam::urn!("test", "event:servlet/verify-squared");
 
 // ============================================================================
 // Messages

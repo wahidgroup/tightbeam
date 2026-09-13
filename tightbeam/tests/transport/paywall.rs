@@ -61,22 +61,25 @@ use crate::transport::support::{await_receipt_rotation, bind_mutual_listener};
 use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const CREDITS_BOUND_THE_DRAWS: Urn<'static> = Urn::new("test", "event:paywall/credits-bound-the-draws");
-pub(crate) const CUTOFF_CLOSES_THE_WINDOW: Urn<'static> = Urn::new("test", "event:paywall/cutoff-closes-the-window");
-pub(crate) const HOUSE_NEVER_PAYS: Urn<'static> = Urn::new("test", "event:paywall/house-never-pays");
+pub(crate) const CREDITS_BOUND_THE_DRAWS: Urn<'static> =
+	tightbeam::urn!("test", "event:paywall/credits-bound-the-draws");
+pub(crate) const CUTOFF_CLOSES_THE_WINDOW: Urn<'static> =
+	tightbeam::urn!("test", "event:paywall/cutoff-closes-the-window");
+pub(crate) const HOUSE_NEVER_PAYS: Urn<'static> = tightbeam::urn!("test", "event:paywall/house-never-pays");
 pub(crate) const HOUSE_SEES_ROTATED_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:paywall/house-sees-rotated-receipt");
+	tightbeam::urn!("test", "event:paywall/house-sees-rotated-receipt");
 pub(crate) const GAMBLER_LOSES_EVERY_TICKET: Urn<'static> =
-	Urn::new("test", "event:paywall/gambler-loses-every-ticket");
-pub(crate) const LEDGER_BALANCE_EXACT: Urn<'static> = Urn::new("test", "event:paywall/ledger-balance-exact");
-pub(crate) const LEDGER_RUNS_DRY: Urn<'static> = Urn::new("test", "event:paywall/ledger-runs-dry");
+	tightbeam::urn!("test", "event:paywall/gambler-loses-every-ticket");
+pub(crate) const LEDGER_BALANCE_EXACT: Urn<'static> = tightbeam::urn!("test", "event:paywall/ledger-balance-exact");
+pub(crate) const LEDGER_RUNS_DRY: Urn<'static> = tightbeam::urn!("test", "event:paywall/ledger-runs-dry");
 pub(crate) const INVOICE_SETTLES_BEFORE_SERVICE: Urn<'static> =
-	Urn::new("test", "event:paywall/invoice-settles-before-service");
-pub(crate) const TALLY_NO_CUTOFF: Urn<'static> = Urn::new("test", "event:paywall/tally-no-cutoff");
-pub(crate) const TALLY_NO_LOSSES: Urn<'static> = Urn::new("test", "event:paywall/tally-no-losses");
-pub(crate) const TALLY_WINS_MATCH: Urn<'static> = Urn::new("test", "event:paywall/tally-wins-match");
-pub(crate) const TOPUP_ROTATES_RECEIPT: Urn<'static> = Urn::new("test", "event:paywall/topup-rotates-receipt");
-pub(crate) const UNPAID_CLIENT_LOCKED_OUT: Urn<'static> = Urn::new("test", "event:paywall/unpaid-client-locked-out");
+	tightbeam::urn!("test", "event:paywall/invoice-settles-before-service");
+pub(crate) const TALLY_NO_CUTOFF: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-no-cutoff");
+pub(crate) const TALLY_NO_LOSSES: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-no-losses");
+pub(crate) const TALLY_WINS_MATCH: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-wins-match");
+pub(crate) const TOPUP_ROTATES_RECEIPT: Urn<'static> = tightbeam::urn!("test", "event:paywall/topup-rotates-receipt");
+pub(crate) const UNPAID_CLIENT_LOCKED_OUT: Urn<'static> =
+	tightbeam::urn!("test", "event:paywall/unpaid-client-locked-out");
 
 /// Invoice the house binds into every budget-bearing receipt.
 const LOTTERY_INVOICE: &[u8] = b"lottery-invoice-one-credit-per-draw";

@@ -38,9 +38,10 @@ async fn streaming_endpoints(
 	Ok((client_end, responder))
 }
 
-pub(crate) const OPEN_STREAM_ECHO_MATCHES: Urn<'static> = Urn::new("test", "event:streaming/open-stream-echo-matches");
+pub(crate) const OPEN_STREAM_ECHO_MATCHES: Urn<'static> =
+	tightbeam::urn!("test", "event:streaming/open-stream-echo-matches");
 pub(crate) const OPEN_STREAM_SERVER_SAW_CHUNKS: Urn<'static> =
-	Urn::new("test", "event:streaming/open-stream-server-saw-chunks");
+	tightbeam::urn!("test", "event:streaming/open-stream-server-saw-chunks");
 
 tb_assert_spec! {
 	pub MuxOpenStreamSpec,
@@ -77,9 +78,9 @@ tb_scenario! {
 }
 
 pub(crate) const OPEN_DUPLEX_REPLY_MATCHES: Urn<'static> =
-	Urn::new("test", "event:streaming/open-duplex-reply-matches");
+	tightbeam::urn!("test", "event:streaming/open-duplex-reply-matches");
 pub(crate) const OPEN_DUPLEX_REPLY_CHUNKED: Urn<'static> =
-	Urn::new("test", "event:streaming/open-duplex-reply-chunked");
+	tightbeam::urn!("test", "event:streaming/open-duplex-reply-chunked");
 
 tb_assert_spec! {
 	pub MuxOpenDuplexSpec,
@@ -117,9 +118,9 @@ tb_scenario! {
 }
 
 pub(crate) const UNARY_KIND_REFUSED_BY_STREAMING_SERVER: Urn<'static> =
-	Urn::new("test", "event:streaming/unary-kind-refused-by-streaming-server");
+	tightbeam::urn!("test", "event:streaming/unary-kind-refused-by-streaming-server");
 pub(crate) const UNARY_KIND_REFUSED_BY_DUPLEX_SERVER: Urn<'static> =
-	Urn::new("test", "event:streaming/unary-kind-refused-by-duplex-server");
+	tightbeam::urn!("test", "event:streaming/unary-kind-refused-by-duplex-server");
 
 /// Whether a unary-kind emit is refused with `Unimplemented`.
 async fn emit_refused_unimplemented(endpoint: &MuxEndpoint, label: &str) -> bool {
@@ -215,8 +216,9 @@ fn hanging_streaming_handler(started: Arc<Notify>, unwound: Arc<Notify>) -> impl
 }
 
 pub(crate) const CANCELLED_RESPONSE_SURFACES: Urn<'static> =
-	Urn::new("test", "event:streaming/cancelled-response-surfaces");
-pub(crate) const CANCEL_UNWINDS_HANDLER: Urn<'static> = Urn::new("test", "event:streaming/cancel-unwinds-handler");
+	tightbeam::urn!("test", "event:streaming/cancelled-response-surfaces");
+pub(crate) const CANCEL_UNWINDS_HANDLER: Urn<'static> =
+	tightbeam::urn!("test", "event:streaming/cancel-unwinds-handler");
 
 tb_assert_spec! {
 	pub MuxStreamingCancelSpec,
@@ -270,7 +272,7 @@ tb_scenario! {
 }
 
 pub(crate) const DUPLEX_CANCEL_FAILS_REPLY: Urn<'static> =
-	Urn::new("test", "event:streaming/duplex-cancel-fails-reply");
+	tightbeam::urn!("test", "event:streaming/duplex-cancel-fails-reply");
 
 tb_assert_spec! {
 	pub MuxDuplexCancelSpec,
@@ -338,9 +340,9 @@ fn gated_streaming_echo(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(S
 }
 
 pub(crate) const PUSH_STALLS_WITHOUT_DRAIN: Urn<'static> =
-	Urn::new("test", "event:streaming/push-stalls-without-drain");
+	tightbeam::urn!("test", "event:streaming/push-stalls-without-drain");
 pub(crate) const PUSH_RESUMES_ON_CONSUMPTION: Urn<'static> =
-	Urn::new("test", "event:streaming/push-resumes-on-consumption");
+	tightbeam::urn!("test", "event:streaming/push-resumes-on-consumption");
 
 tb_assert_spec! {
 	pub MuxStreamingBackpressureSpec,
@@ -398,8 +400,9 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const PING_PONG_REPLIES_MATCH: Urn<'static> = Urn::new("test", "event:streaming/ping-pong-replies-match");
-pub(crate) const PING_PONG_ENDS_CLEAN: Urn<'static> = Urn::new("test", "event:streaming/ping-pong-ends-clean");
+pub(crate) const PING_PONG_REPLIES_MATCH: Urn<'static> =
+	tightbeam::urn!("test", "event:streaming/ping-pong-replies-match");
+pub(crate) const PING_PONG_ENDS_CLEAN: Urn<'static> = tightbeam::urn!("test", "event:streaming/ping-pong-ends-clean");
 
 tb_assert_spec! {
 	pub MuxDuplexPingPongSpec,
@@ -452,7 +455,8 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const INTO_FRAME_DECODES_REPLY: Urn<'static> = Urn::new("test", "event:streaming/into-frame-decodes-reply");
+pub(crate) const INTO_FRAME_DECODES_REPLY: Urn<'static> =
+	tightbeam::urn!("test", "event:streaming/into-frame-decodes-reply");
 
 tb_assert_spec! {
 	pub MuxDuplexIntoFrameSpec,

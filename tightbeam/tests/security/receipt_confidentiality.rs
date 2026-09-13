@@ -46,15 +46,15 @@ use crate::common::security::{
 };
 
 pub(crate) const RECEIPTS_MATCH_ACROSS_ENDPOINTS: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/receipts-match-across-endpoints");
+	tightbeam::urn!("test", "event:receipt-confidentiality/receipts-match-across-endpoints");
 pub(crate) const RESPONSE_CONFIDENTIAL_ON_WIRE: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/response-confidential-on-wire");
+	tightbeam::urn!("test", "event:receipt-confidentiality/response-confidential-on-wire");
 pub(crate) const SERVER_RECOVERS_PLAINTEXT_ANSWER: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/server-recovers-plaintext-answer");
+	tightbeam::urn!("test", "event:receipt-confidentiality/server-recovers-plaintext-answer");
 pub(crate) const SETTLED_SESSION_ACTIVATES: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/settled-session-activates");
+	tightbeam::urn!("test", "event:receipt-confidentiality/settled-session-activates");
 pub(crate) const SETTLED_WITH_PLAINTEXT_ONCE: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/settled-with-plaintext-once");
+	tightbeam::urn!("test", "event:receipt-confidentiality/settled-with-plaintext-once");
 
 const CHALLENGE: &[u8] = b"cms-conf-invoice";
 const RESPONSE: &[u8] = b"cms-conf-preimage";

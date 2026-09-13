@@ -48,7 +48,7 @@ use crate::common::security::{
 };
 
 pub(crate) const COMPLETE_FAILS_WITHOUT_SETTLEMENT: Urn<'static> =
-	Urn::new("test", "event:receipt-activation/complete-fails-without-settlement");
+	tightbeam::urn!("test", "event:receipt-activation/complete-fails-without-settlement");
 
 const CHALLENGE: &[u8] = b"activation-invoice";
 const RESPONSE: &[u8] = b"activation-preimage";

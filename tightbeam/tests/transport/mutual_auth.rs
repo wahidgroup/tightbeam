@@ -45,11 +45,11 @@ use tightbeam::{
 	Beamable,
 };
 
-pub(crate) const AUTHENTICATED: Urn<'static> = Urn::new("test", "event:mutual-auth/authenticated");
-pub(crate) const RESPONSE_RECEIVED: Urn<'static> = Urn::new("test", "event:mutual-auth/response-received");
-pub(crate) const SERVER_ID: Urn<'static> = Urn::new("test", "event:mutual-auth/server-id");
-pub(crate) const CLIENT_CERT_REJECTED: Urn<'static> = Urn::new("test", "event:mutual-auth/client-cert-rejected");
-pub(crate) const SERVER_CERT_REJECTED: Urn<'static> = Urn::new("test", "event:mutual-auth/server-cert-rejected");
+pub(crate) const AUTHENTICATED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/authenticated");
+pub(crate) const RESPONSE_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/response-received");
+pub(crate) const SERVER_ID: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/server-id");
+pub(crate) const CLIENT_CERT_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/client-cert-rejected");
+pub(crate) const SERVER_CERT_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:mutual-auth/server-cert-rejected");
 
 // ============================================================================
 // Static X.509 Configuration

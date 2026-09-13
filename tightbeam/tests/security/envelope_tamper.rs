@@ -57,9 +57,9 @@ use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split};
 
 pub(crate) const DELETED_ENVELOPE_DETECTED: Urn<'static> =
-	Urn::new("test", "event:envelope-tamper/deleted-envelope-detected");
+	tightbeam::urn!("test", "event:envelope-tamper/deleted-envelope-detected");
 pub(crate) const REPLAYED_ENVELOPE_DETECTED: Urn<'static> =
-	Urn::new("test", "event:envelope-tamper/replayed-envelope-detected");
+	tightbeam::urn!("test", "event:envelope-tamper/replayed-envelope-detected");
 
 /// ECIES sends exactly two cleartext client frames (ClientHello,
 /// ClientKeyExchange), so the first encrypted envelope is frame 3.

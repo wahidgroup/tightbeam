@@ -50,9 +50,9 @@ use crate::common::security::expectation_failure;
 use crate::transport::support::{establish_mutual_transports, MutualSessionHooks};
 
 pub(crate) const RECEIPT_BUDGETS_WITHIN_CEILING: Urn<'static> =
-	Urn::new("test", "event:receipt-integrity/receipt-budgets-within-ceiling");
+	tightbeam::urn!("test", "event:receipt-integrity/receipt-budgets-within-ceiling");
 pub(crate) const RECEIPT_MATCHES_ENFORCED_BUDGET: Urn<'static> =
-	Urn::new("test", "event:receipt-integrity/receipt-matches-enforced-budget");
+	tightbeam::urn!("test", "event:receipt-integrity/receipt-matches-enforced-budget");
 
 /// Client request that overshoots the enforcement ceiling in both
 /// directions, so a faithful receipt must reflect the clamp.

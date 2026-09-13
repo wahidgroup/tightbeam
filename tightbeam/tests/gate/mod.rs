@@ -9,7 +9,7 @@ use tightbeam::trace::{ConsumedTrace, ExecutionMode};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario};
 
-const STEP: Urn<'static> = Urn::new("test", "event:gate/step");
+const STEP: Urn<'static> = tightbeam::urn!("test", "event:gate/step");
 
 tb_assert_spec! {
 	pub GatelessSpec,

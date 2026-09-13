@@ -13,10 +13,10 @@ use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-const START: Urn<'static> = Urn::new("fuzz", "event:simple/start");
-const ACTION_A: Urn<'static> = Urn::new("fuzz", "event:simple/action-a");
-const ACTION_B: Urn<'static> = Urn::new("fuzz", "event:simple/action-b");
-const DONE: Urn<'static> = Urn::new("fuzz", "event:simple/done");
+const START: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/start");
+const ACTION_A: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/action-a");
+const ACTION_B: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/action-b");
+const DONE: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/done");
 
 tb_assert_spec! {
 	pub SimpleFuzzSpec,

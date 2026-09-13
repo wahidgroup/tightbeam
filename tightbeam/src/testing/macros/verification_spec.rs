@@ -53,12 +53,13 @@ impl Cardinality {
 	///
 	/// # Panics
 	///
+	/// Testing suite functions MUST panic on error.
+	///
 	/// - When `max` is below `min`, which no count satisfies. In a constant
 	///   this is caught when the crate is built, not when it is checked, so
 	///   `cargo check` alone does not report it.
 	pub const fn between(min: u32, max: u32) -> Self {
 		assert!(min <= max, "between! requires min <= max, or no count can satisfy it");
-
 		Self { min, max: Some(max) }
 	}
 
@@ -1129,8 +1130,8 @@ macro_rules! __tb_assert_spec_init_builder {
 mod tests {
 	use super::*;
 
-	const OLDER_KEY: Urn<'static> = Urn::new("test", "event:spec/older-key");
-	const NEWER_KEY: Urn<'static> = Urn::new("test", "event:spec/newer-key");
+	const OLDER_KEY: Urn<'static> = crate::urn!("test", "event:spec/older-key");
+	const NEWER_KEY: Urn<'static> = crate::urn!("test", "event:spec/newer-key");
 
 	crate::tb_assert_spec! {
 		pub VersionedKeySpec,

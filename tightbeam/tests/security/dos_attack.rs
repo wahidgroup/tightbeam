@@ -34,9 +34,11 @@ use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
-pub(crate) const DOS_GENERATE_OVERSIZED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-generate-oversized");
-pub(crate) const DOS_INJECT_OVERSIZED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-inject-oversized");
-pub(crate) const DOS_OVERSIZED_REJECTED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-oversized-rejected");
+pub(crate) const DOS_GENERATE_OVERSIZED: Urn<'static> =
+	tightbeam::urn!("test", "event:dos-attack/dos-generate-oversized");
+pub(crate) const DOS_INJECT_OVERSIZED: Urn<'static> = tightbeam::urn!("test", "event:dos-attack/dos-inject-oversized");
+pub(crate) const DOS_OVERSIZED_REJECTED: Urn<'static> =
+	tightbeam::urn!("test", "event:dos-attack/dos-oversized-rejected");
 
 /// Maximum handshake message size (16 KiB) as defined in transport layer.
 const HANDSHAKE_MAX_SIZE: usize = 16 * 1024;

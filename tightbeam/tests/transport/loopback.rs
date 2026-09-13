@@ -46,15 +46,19 @@ use crate::common::security::pinning_validator;
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const LOOPBACK_CMS_COMPLETE: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-complete");
+pub(crate) const LOOPBACK_CMS_COMPLETE: Urn<'static> = tightbeam::urn!("test", "event:loopback/loopback-cms-complete");
 pub(crate) const LOOPBACK_CMS_PROFILE_AGREED: Urn<'static> =
-	Urn::new("test", "event:loopback/loopback-cms-profile-agreed");
-pub(crate) const LOOPBACK_CMS_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-roundtrip");
-pub(crate) const LOOPBACK_CMS_UNIQUE_KEYS: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-unique-keys");
-pub(crate) const LOOPBACK_ECIES_COMPLETE: Urn<'static> = Urn::new("test", "event:loopback/loopback-ecies-complete");
+	tightbeam::urn!("test", "event:loopback/loopback-cms-profile-agreed");
+pub(crate) const LOOPBACK_CMS_ROUNDTRIP: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-cms-roundtrip");
+pub(crate) const LOOPBACK_CMS_UNIQUE_KEYS: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-cms-unique-keys");
+pub(crate) const LOOPBACK_ECIES_COMPLETE: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-ecies-complete");
 pub(crate) const LOOPBACK_ECIES_PROFILE_AGREED: Urn<'static> =
-	Urn::new("test", "event:loopback/loopback-ecies-profile-agreed");
-pub(crate) const LOOPBACK_ECIES_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:loopback/loopback-ecies-roundtrip");
+	tightbeam::urn!("test", "event:loopback/loopback-ecies-profile-agreed");
+pub(crate) const LOOPBACK_ECIES_ROUNDTRIP: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-ecies-roundtrip");
 
 /// Number of CMS loopback passes (0 when the feature is disabled).
 const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;

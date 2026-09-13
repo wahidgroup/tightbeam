@@ -44,42 +44,46 @@ use tightbeam::TightBeamError;
 use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const ANSWER_BOUND: Urn<'static> = Urn::new("test", "event:receipt/answer-bound");
+pub(crate) const ANSWER_BOUND: Urn<'static> = tightbeam::urn!("test", "event:receipt/answer-bound");
 pub(crate) const BOTH_SIGNATURES_VERIFY_OFFLINE: Urn<'static> =
-	Urn::new("test", "event:receipt/both-signatures-verify-offline");
-pub(crate) const CHALLENGE_BOUND: Urn<'static> = Urn::new("test", "event:receipt/challenge-bound");
+	tightbeam::urn!("test", "event:receipt/both-signatures-verify-offline");
+pub(crate) const CHALLENGE_BOUND: Urn<'static> = tightbeam::urn!("test", "event:receipt/challenge-bound");
 pub(crate) const CLIENT_COMPLETES_OPTIMISTICALLY: Urn<'static> =
-	Urn::new("test", "event:receipt/client-completes-optimistically");
+	tightbeam::urn!("test", "event:receipt/client-completes-optimistically");
 pub(crate) const CLIENT_FAILS_CLOSED_UNSUPPORTED: Urn<'static> =
-	Urn::new("test", "event:receipt/client-fails-closed-unsupported");
-pub(crate) const CLIENT_REFUSES_WITH_CODE: Urn<'static> = Urn::new("test", "event:receipt/client-refuses-with-code");
-pub(crate) const CLIENT_RETAINS_RECEIPT: Urn<'static> = Urn::new("test", "event:receipt/client-retains-receipt");
+	tightbeam::urn!("test", "event:receipt/client-fails-closed-unsupported");
+pub(crate) const CLIENT_REFUSES_WITH_CODE: Urn<'static> =
+	tightbeam::urn!("test", "event:receipt/client-refuses-with-code");
+pub(crate) const CLIENT_RETAINS_RECEIPT: Urn<'static> = tightbeam::urn!("test", "event:receipt/client-retains-receipt");
 pub(crate) const CLIENT_SESSION_DEAD_ON_FIRST_USE: Urn<'static> =
-	Urn::new("test", "event:receipt/client-session-dead-on-first-use");
+	tightbeam::urn!("test", "event:receipt/client-session-dead-on-first-use");
 pub(crate) const EMPTY_ANSWER_STORED_AS_ABSENT: Urn<'static> =
-	Urn::new("test", "event:receipt/empty-answer-stored-as-absent");
+	tightbeam::urn!("test", "event:receipt/empty-answer-stored-as-absent");
 pub(crate) const ENDPOINTS_RETAIN_IDENTICAL_RECEIPTS: Urn<'static> =
-	Urn::new("test", "event:receipt/endpoints-retain-identical-receipts");
+	tightbeam::urn!("test", "event:receipt/endpoints-retain-identical-receipts");
 pub(crate) const IDENTITYLESS_CLIENT_NEVER_CONSULTS_APPROVER: Urn<'static> =
-	Urn::new("test", "event:receipt/identityless-client-never-consults-approver");
+	tightbeam::urn!("test", "event:receipt/identityless-client-never-consults-approver");
 pub(crate) const IDENTITYLESS_CLIENT_REFUSES_TO_COUNTERSIGN: Urn<'static> =
-	Urn::new("test", "event:receipt/identityless-client-refuses-to-countersign");
-pub(crate) const RECEIPTS_IDENTICAL: Urn<'static> = Urn::new("test", "event:receipt/receipts-identical");
+	tightbeam::urn!("test", "event:receipt/identityless-client-refuses-to-countersign");
+pub(crate) const RECEIPTS_IDENTICAL: Urn<'static> = tightbeam::urn!("test", "event:receipt/receipts-identical");
 pub(crate) const RECEIPT_MATCHES_NEGOTIATION: Urn<'static> =
-	Urn::new("test", "event:receipt/receipt-matches-negotiation");
-pub(crate) const REFUSAL_OUTCOME_RECORDED: Urn<'static> = Urn::new("test", "event:receipt/refusal-outcome-recorded");
+	tightbeam::urn!("test", "event:receipt/receipt-matches-negotiation");
+pub(crate) const REFUSAL_OUTCOME_RECORDED: Urn<'static> =
+	tightbeam::urn!("test", "event:receipt/refusal-outcome-recorded");
 pub(crate) const REFUSED_RECEIPT_VERIFIES_OFFLINE: Urn<'static> =
-	Urn::new("test", "event:receipt/refused-receipt-verifies-offline");
-pub(crate) const SERVER_NEVER_ACTIVATES: Urn<'static> = Urn::new("test", "event:receipt/server-never-activates");
+	tightbeam::urn!("test", "event:receipt/refused-receipt-verifies-offline");
+pub(crate) const SERVER_NEVER_ACTIVATES: Urn<'static> = tightbeam::urn!("test", "event:receipt/server-never-activates");
 pub(crate) const SERVER_REFUSES_TO_ISSUE_UNVERIFIABLE_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:receipt/server-refuses-to-issue-unverifiable-receipt");
-pub(crate) const SERVER_REJECTS_WITH_CODE: Urn<'static> = Urn::new("test", "event:receipt/server-rejects-with-code");
-pub(crate) const SERVER_RETAINS_RECEIPT: Urn<'static> = Urn::new("test", "event:receipt/server-retains-receipt");
-pub(crate) const SINGLE_OUTCOME_RECORDED: Urn<'static> = Urn::new("test", "event:receipt/single-outcome-recorded");
+	tightbeam::urn!("test", "event:receipt/server-refuses-to-issue-unverifiable-receipt");
+pub(crate) const SERVER_REJECTS_WITH_CODE: Urn<'static> =
+	tightbeam::urn!("test", "event:receipt/server-rejects-with-code");
+pub(crate) const SERVER_RETAINS_RECEIPT: Urn<'static> = tightbeam::urn!("test", "event:receipt/server-retains-receipt");
+pub(crate) const SINGLE_OUTCOME_RECORDED: Urn<'static> =
+	tightbeam::urn!("test", "event:receipt/single-outcome-recorded");
 pub(crate) const TAMPERED_ARTIFACT_FAILS_VERIFICATION: Urn<'static> =
-	Urn::new("test", "event:receipt/tampered-artifact-fails-verification");
+	tightbeam::urn!("test", "event:receipt/tampered-artifact-fails-verification");
 pub(crate) const VERDICT_ACTIVATED_WITH_EVIDENCE: Urn<'static> =
-	Urn::new("test", "event:receipt/verdict-activated-with-evidence");
+	tightbeam::urn!("test", "event:receipt/verdict-activated-with-evidence");
 
 use crate::common::security::{
 	expectation_failure, ClientMaterials, GrantingAuthorizer, PayingApprover as AnsweringApprover, RecordingObserver,

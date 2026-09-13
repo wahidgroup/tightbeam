@@ -126,7 +126,7 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 /// # use tightbeam::error::TightBeamError;
 /// # use tightbeam::trace::{TraceCollector, EventValue};
 /// # use tightbeam::utils::urn::Urn;
-/// # const ROUTE_STEP: Urn<'static> = Urn::new("tightbeam", "event:route/step");
+/// # const ROUTE_STEP: Urn<'static> = tightbeam::urn!("tightbeam", "event:route/step");
 /// # fn example() -> Result<(), TightBeamError> {
 /// # let trace = TraceCollector::default();
 /// trace.event(ROUTE_STEP)?
@@ -534,12 +534,12 @@ impl TraceCollector {
 	///
 	/// # Panics
 	///
+	/// Testing suite functions MUST panic on error.
+	///
 	/// Panics when no oracle is configured. This accessor exists for
 	/// `tb_scenario!`-generated fuzz harnesses (feature `testing-fuzz`),
 	/// where a missing `csp:` parameter is a harness construction bug that
 	/// must abort the fuzz run rather than continue unguided.
-	// Test-harness surface: the documented abort is the contract, so the
-	// zero-panic deny is waived for this accessor alone.
 	#[allow(clippy::expect_used)]
 	#[cfg(feature = "testing-fuzz")]
 	pub fn oracle(&self) -> &crate::testing::fuzz::FuzzContext {
@@ -1019,8 +1019,8 @@ mod tests {
 	use crate::utils::urn::Urn;
 	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};
 
-	const ALPHA: Urn<'static> = Urn::new("test", "event:collector/alpha");
-	const BETA: Urn<'static> = Urn::new("test", "event:collector/beta");
+	const ALPHA: Urn<'static> = crate::urn!("test", "event:collector/alpha");
+	const BETA: Urn<'static> = crate::urn!("test", "event:collector/beta");
 
 	tb_assert_spec! {
 		pub TraceCollectorSpec,

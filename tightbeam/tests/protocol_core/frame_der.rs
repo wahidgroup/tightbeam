@@ -9,10 +9,10 @@ use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
-pub(crate) const DER_NONEMPTY: Urn<'static> = Urn::new("test", "event:frame-der/der-nonempty");
-pub(crate) const MATRIX_PRESENT: Urn<'static> = Urn::new("test", "event:frame-der/matrix-present");
-pub(crate) const ROUNDTRIP_OK: Urn<'static> = Urn::new("test", "event:frame-der/roundtrip-ok");
-pub(crate) const VERSION: Urn<'static> = Urn::new("test", "event:frame-der/version");
+pub(crate) const DER_NONEMPTY: Urn<'static> = tightbeam::urn!("test", "event:frame-der/der-nonempty");
+pub(crate) const MATRIX_PRESENT: Urn<'static> = tightbeam::urn!("test", "event:frame-der/matrix-present");
+pub(crate) const ROUNDTRIP_OK: Urn<'static> = tightbeam::urn!("test", "event:frame-der/roundtrip-ok");
+pub(crate) const VERSION: Urn<'static> = tightbeam::urn!("test", "event:frame-der/version");
 
 #[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
 #[derive(Clone, Debug, PartialEq, Sequence)]

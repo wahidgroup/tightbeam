@@ -37,7 +37,7 @@ use tokio::task::JoinHandle;
 use crate::common::security::{pinning_trust_store, random_signing_key, test_certificate, ServerMaterials};
 use crate::transport::support::bind_mutual_listener;
 
-pub(crate) const CMS_WIRE_ECHOED: Urn<'static> = Urn::new("test", "event:cms-socket/cms-wire-echoed");
+pub(crate) const CMS_WIRE_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cms-socket/cms-wire-echoed");
 
 /// Mutual-auth CMS fixture: server materials plus the client identity the
 /// server pins.

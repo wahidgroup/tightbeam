@@ -497,7 +497,7 @@ pub type DuplexOpenFuture<'a> =
 /// # let runtime = tokio::runtime::Builder::new_current_thread().build().expect("doctest runtime");
 /// # runtime.block_on(async {
 /// # let ctx = EchoSibling;
-/// # let keymanager_urn = Urn::new("tightbeam", "servlet:keymanager");
+/// # let keymanager_urn = tightbeam::urn!("tightbeam", "servlet:keymanager");
 /// # let sibling_key = TestKey::signing();
 /// let caller_provider = Secp256k1KeyProvider::from(TestKey::signing());
 ///
@@ -629,7 +629,7 @@ impl core::fmt::Debug for HiveControlConfig {
 impl Default for HiveControlConfig {
 	fn default() -> Self {
 		Self {
-			backpressure_threshold: BasisPoints::new(DEFAULT_BACKPRESSURE_THRESHOLD_BPS),
+			backpressure_threshold: crate::bps!(DEFAULT_BACKPRESSURE_THRESHOLD_BPS),
 			drain_timeout: Duration::from_secs(30),
 			reregister_interval: Some(Duration::from_secs(5)),
 			circuit_breaker_threshold: 3,

@@ -10,14 +10,14 @@ use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const EATS: Urn<'static> = Urn::new("test", "event:diners/eats");
-pub(crate) const GETS_UP: Urn<'static> = Urn::new("test", "event:diners/gets-up");
-pub(crate) const PICKS_LEFT: Urn<'static> = Urn::new("test", "event:diners/picks-left");
-pub(crate) const PICKS_RIGHT: Urn<'static> = Urn::new("test", "event:diners/picks-right");
-pub(crate) const PUTS_DOWN_LEFT: Urn<'static> = Urn::new("test", "event:diners/puts-down-left");
-pub(crate) const PUTS_DOWN_RIGHT: Urn<'static> = Urn::new("test", "event:diners/puts-down-right");
-pub(crate) const SITS: Urn<'static> = Urn::new("test", "event:diners/sits");
-pub(crate) const THINKS: Urn<'static> = Urn::new("test", "event:diners/thinks");
+pub(crate) const EATS: Urn<'static> = tightbeam::urn!("test", "event:diners/eats");
+pub(crate) const GETS_UP: Urn<'static> = tightbeam::urn!("test", "event:diners/gets-up");
+pub(crate) const PICKS_LEFT: Urn<'static> = tightbeam::urn!("test", "event:diners/picks-left");
+pub(crate) const PICKS_RIGHT: Urn<'static> = tightbeam::urn!("test", "event:diners/picks-right");
+pub(crate) const PUTS_DOWN_LEFT: Urn<'static> = tightbeam::urn!("test", "event:diners/puts-down-left");
+pub(crate) const PUTS_DOWN_RIGHT: Urn<'static> = tightbeam::urn!("test", "event:diners/puts-down-right");
+pub(crate) const SITS: Urn<'static> = tightbeam::urn!("test", "event:diners/sits");
+pub(crate) const THINKS: Urn<'static> = tightbeam::urn!("test", "event:diners/thinks");
 
 fn build_fdr_config(
 	specs: Vec<Process>,

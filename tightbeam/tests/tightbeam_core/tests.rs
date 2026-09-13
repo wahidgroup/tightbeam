@@ -19,17 +19,17 @@ use tightbeam::utils;
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
-pub(crate) const CONFIDENTIALITY: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/confidentiality");
-pub(crate) const INTEGRITY: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/integrity");
-pub(crate) const INTEGRITY_OK: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/integrity-ok");
-pub(crate) const LIFETIME: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/lifetime");
-pub(crate) const MATRIX: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/matrix");
-pub(crate) const NONREPUDIATION: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/nonrepudiation");
-pub(crate) const PREVIOUS_FRAME: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/previous-frame");
-pub(crate) const PRIORITY: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/priority");
-pub(crate) const ROUNDTRIP_OK: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/roundtrip-ok");
-pub(crate) const SIG_VALID: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/sig-valid");
-pub(crate) const VERSION: Urn<'static> = Urn::new("test", "event:tightbeam-core-tests/version");
+pub(crate) const CONFIDENTIALITY: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/confidentiality");
+pub(crate) const INTEGRITY: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/integrity");
+pub(crate) const INTEGRITY_OK: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/integrity-ok");
+pub(crate) const LIFETIME: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/lifetime");
+pub(crate) const MATRIX: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/matrix");
+pub(crate) const NONREPUDIATION: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/nonrepudiation");
+pub(crate) const PREVIOUS_FRAME: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/previous-frame");
+pub(crate) const PRIORITY: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/priority");
+pub(crate) const ROUNDTRIP_OK: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/roundtrip-ok");
+pub(crate) const SIG_VALID: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/sig-valid");
+pub(crate) const VERSION: Urn<'static> = tightbeam::urn!("test", "event:tightbeam-core-tests/version");
 
 /// Simple test message
 #[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]

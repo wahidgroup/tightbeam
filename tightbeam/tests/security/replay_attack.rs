@@ -31,10 +31,11 @@ use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
-pub(crate) const REPLAY_ATTEMPT: Urn<'static> = Urn::new("test", "event:replay-attack/replay-attempt");
-pub(crate) const REPLAY_DETECTED: Urn<'static> = Urn::new("test", "event:replay-attack/replay-detected");
-pub(crate) const REPLAY_INIT_HANDSHAKE: Urn<'static> = Urn::new("test", "event:replay-attack/replay-initial-handshake");
-pub(crate) const REPLAY_REJECTED: Urn<'static> = Urn::new("test", "event:replay-attack/replay-rejected");
+pub(crate) const REPLAY_ATTEMPT: Urn<'static> = tightbeam::urn!("test", "event:replay-attack/replay-attempt");
+pub(crate) const REPLAY_DETECTED: Urn<'static> = tightbeam::urn!("test", "event:replay-attack/replay-detected");
+pub(crate) const REPLAY_INIT_HANDSHAKE: Urn<'static> =
+	tightbeam::urn!("test", "event:replay-attack/replay-initial-handshake");
+pub(crate) const REPLAY_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:replay-attack/replay-rejected");
 
 tb_assert_spec! {
 	pub ReplayAttackSpec,

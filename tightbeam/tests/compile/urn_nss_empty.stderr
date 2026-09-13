@@ -1,16 +1,15 @@
-error[E0080]: evaluation panicked: URN NSS must name a resource
+error[E0080]: evaluation panicked: malformed URN literal: the NSS must not be empty
  --> tests/compile/urn_nss_empty.rs:4:32
   |
-4 | const REJECTED: Urn<'static> = Urn::new("test", "");
-  |                                ^^^^^^^^^^^^^^^^^^^^ evaluation of `REJECTED` failed inside this call
+4 | const REJECTED: Urn<'static> = tightbeam::urn!("test", "");
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `REJECTED::{constant#0}` failed here
   |
-note: inside `Urn::<'_>::new`
- --> $RUST/core/src/panic.rs
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `tightbeam::urn` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/compile/urn_nss_empty.rs:4:32
   |
-  |         $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
-  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+4 | const REJECTED: Urn<'static> = tightbeam::urn!("test", "");
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
- ::: src/utils/urn/mod.rs
-  |
-  |         assert!(!nss.is_empty(), "URN NSS must name a resource");
-  |         -------------------------------------------------------- in this macro invocation
+  = note: this note originates in the macro `tightbeam::urn` (in Nightly builds, run with -Z macro-backtrace for more info)

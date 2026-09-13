@@ -57,10 +57,10 @@ use super::messages::{CreditTransferTransaction, PaymentIdentification, Transact
 use super::servlets::{AuthorizationServlet, AUTHORIZATION_APPROVED, INTEGRITY_VERIFIED};
 
 /// Client-observed work reply status (`TransitStatus` on the wire response).
-pub(crate) const WORK_STATUS: Urn<'static> = Urn::new("test", "event:scenarios/work-status");
+pub(crate) const WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:scenarios/work-status");
 
 /// Client-observed approval decoded from inside the servlet's response frame.
-pub(crate) const CLIENT_AUTH_APPROVED: Urn<'static> = Urn::new("test", "event:scenarios/client-auth-approved");
+pub(crate) const CLIENT_AUTH_APPROVED: Urn<'static> = tightbeam::urn!("test", "event:scenarios/client-auth-approved");
 
 /// Type URN the payment scenario registers and targets.
 fn authorization_urn() -> Urn<'static> {

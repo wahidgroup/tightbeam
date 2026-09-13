@@ -45,13 +45,14 @@ use crate::common::security::pinning_validator;
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const CLIENT_HELLO_SENT: Urn<'static> = Urn::new("test", "event:negotiation/client-hello-sent");
-pub(crate) const CLIENT_KEX_SENT: Urn<'static> = Urn::new("test", "event:negotiation/client-kex-sent");
-pub(crate) const HANDSHAKE_COMPLETE: Urn<'static> = Urn::new("test", "event:negotiation/handshake-complete");
-pub(crate) const HANDSHAKE_START: Urn<'static> = Urn::new("test", "event:negotiation/handshake-start");
-pub(crate) const PROFILE_VERIFIED: Urn<'static> = Urn::new("test", "event:negotiation/profile-verified");
-pub(crate) const SERVER_HELLO_RECEIVED: Urn<'static> = Urn::new("test", "event:negotiation/server-hello-received");
-pub(crate) const SERVER_KEX_RECEIVED: Urn<'static> = Urn::new("test", "event:negotiation/server-kex-received");
+pub(crate) const CLIENT_HELLO_SENT: Urn<'static> = tightbeam::urn!("test", "event:negotiation/client-hello-sent");
+pub(crate) const CLIENT_KEX_SENT: Urn<'static> = tightbeam::urn!("test", "event:negotiation/client-kex-sent");
+pub(crate) const HANDSHAKE_COMPLETE: Urn<'static> = tightbeam::urn!("test", "event:negotiation/handshake-complete");
+pub(crate) const HANDSHAKE_START: Urn<'static> = tightbeam::urn!("test", "event:negotiation/handshake-start");
+pub(crate) const PROFILE_VERIFIED: Urn<'static> = tightbeam::urn!("test", "event:negotiation/profile-verified");
+pub(crate) const SERVER_HELLO_RECEIVED: Urn<'static> =
+	tightbeam::urn!("test", "event:negotiation/server-hello-received");
+pub(crate) const SERVER_KEX_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:negotiation/server-kex-received");
 
 /// Stronger profile: AES-256-GCM with SHA3-512. Selected when both sides
 /// offer it, because AES-128 fails the default 256-bit strength floor.

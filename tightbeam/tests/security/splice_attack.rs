@@ -58,7 +58,8 @@ use crate::common::security::{
 	default_security_profile, expectation_failure, pinning_validator, ClientMaterials, ServerMaterials,
 };
 
-pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> = Urn::new("test", "event:splice-attack/spliced-kex-rejected");
+pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
+	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
 
 /// Attacker's-eye view of the DER key-exchange plaintext: the two
 /// leading OCTET STRINGs are all a splice needs (the trailing receipt

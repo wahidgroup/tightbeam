@@ -34,21 +34,21 @@
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const MISSING_COUNTERSIGNATURE_FAILS_CLOSED: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/missing-countersignature-fails-closed");
+	tightbeam::urn!("test", "event:countersignature-evidence/missing-countersignature-fails-closed");
 pub(crate) const NO_OUTCOME_BEFORE_CONCLUSION: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/no-outcome-before-conclusion");
-pub(crate) const OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE: Urn<'static> = Urn::new(
+	tightbeam::urn!("test", "event:countersignature-evidence/no-outcome-before-conclusion");
+pub(crate) const OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE: Urn<'static> = tightbeam::urn!(
 	"test",
 	"event:countersignature-evidence/outcome-records-missing-countersignature",
 );
 pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/session-never-activates");
+	tightbeam::urn!("test", "event:countersignature-evidence/session-never-activates");
 pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/settle-never-fired");
+	tightbeam::urn!("test", "event:countersignature-evidence/settle-never-fired");
 pub(crate) const STRIPPED_FINISHED_STILL_AUTHENTICATES: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/stripped-finished-still-authenticates");
+	tightbeam::urn!("test", "event:countersignature-evidence/stripped-finished-still-authenticates");
 pub(crate) const TAMPERED_CIPHERTEXT_REJECTED: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/tampered-ciphertext-rejected");
+	tightbeam::urn!("test", "event:countersignature-evidence/tampered-ciphertext-rejected");
 
 #[cfg(feature = "transport-ecies")]
 mod ecies {

@@ -39,10 +39,11 @@ use tightbeam::{
 use crate::security::common::{default_security_profile, expectation_failure, ServerMaterials};
 
 pub(crate) const CERT_REJECT_ALL_REJECTED: Urn<'static> =
-	Urn::new("test", "event:certificate-forgery/cert-reject-all-rejected");
-pub(crate) const CERT_VALID_ACCEPTED: Urn<'static> = Urn::new("test", "event:certificate-forgery/cert-valid-accepted");
+	tightbeam::urn!("test", "event:certificate-forgery/cert-reject-all-rejected");
+pub(crate) const CERT_VALID_ACCEPTED: Urn<'static> =
+	tightbeam::urn!("test", "event:certificate-forgery/cert-valid-accepted");
 pub(crate) const CERT_WRONG_KEY_REJECTED: Urn<'static> =
-	Urn::new("test", "event:certificate-forgery/cert-wrong-key-rejected");
+	tightbeam::urn!("test", "event:certificate-forgery/cert-wrong-key-rejected");
 
 /// A validator that always rejects certificates (for testing rejection path).
 #[derive(Debug, Clone, Copy)]

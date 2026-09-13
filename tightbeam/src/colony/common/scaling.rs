@@ -41,8 +41,8 @@ impl Default for ServletScaleConfig {
 		Self {
 			min_instances: 1,
 			max_instances: 10,
-			scale_up_threshold: BasisPoints::new(8000),
-			scale_down_threshold: BasisPoints::new(2000),
+			scale_up_threshold: crate::bps!(8000),
+			scale_down_threshold: crate::bps!(2000),
 			scale_up_cooldown: DEFAULT_SCALE_UP_COOLDOWN,
 			scale_down_cooldown: DEFAULT_SCALE_DOWN_COOLDOWN,
 		}

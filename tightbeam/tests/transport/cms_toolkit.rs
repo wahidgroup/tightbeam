@@ -45,17 +45,17 @@ use tightbeam::x509::serial_number::SerialNumber;
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const ATTRIBUTE_EXTRACTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/attribute-extracted");
-pub(crate) const CEK_RECOVERED: Urn<'static> = Urn::new("test", "event:cms-toolkit/cek-recovered");
-pub(crate) const CEK_WRAPPED: Urn<'static> = Urn::new("test", "event:cms-toolkit/cek-wrapped");
-pub(crate) const CONTENT_RECOVERED: Urn<'static> = Urn::new("test", "event:cms-toolkit/content-recovered");
-pub(crate) const CONTENT_SIGNED: Urn<'static> = Urn::new("test", "event:cms-toolkit/content-signed");
-pub(crate) const ENVELOPE_SEALED: Urn<'static> = Urn::new("test", "event:cms-toolkit/envelope-sealed");
-pub(crate) const FOREIGN_KEY_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/foreign-key-rejected");
-pub(crate) const SIGNATURE_VERIFIED: Urn<'static> = Urn::new("test", "event:cms-toolkit/signature-verified");
-pub(crate) const TAMPER_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/tamper-rejected");
-pub(crate) const WIRE_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:cms-toolkit/wire-roundtrip");
-pub(crate) const WRONG_KEY_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/wrong-key-rejected");
+pub(crate) const ATTRIBUTE_EXTRACTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/attribute-extracted");
+pub(crate) const CEK_RECOVERED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/cek-recovered");
+pub(crate) const CEK_WRAPPED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/cek-wrapped");
+pub(crate) const CONTENT_RECOVERED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/content-recovered");
+pub(crate) const CONTENT_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/content-signed");
+pub(crate) const ENVELOPE_SEALED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/envelope-sealed");
+pub(crate) const FOREIGN_KEY_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/foreign-key-rejected");
+pub(crate) const SIGNATURE_VERIFIED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/signature-verified");
+pub(crate) const TAMPER_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/tamper-rejected");
+pub(crate) const WIRE_ROUNDTRIP: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/wire-roundtrip");
+pub(crate) const WRONG_KEY_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/wrong-key-rejected");
 
 /// OID for the test-only unprotected attribute carried through the envelope.
 const TOOLKIT_ATTR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1");

@@ -68,10 +68,11 @@ use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
 
 pub(crate) const CORRUPTED_KEY_EXCHANGE_REJECTED: Urn<'static> =
-	Urn::new("test", "event:settlement-ordering/corrupted-key-exchange-rejected");
+	tightbeam::urn!("test", "event:settlement-ordering/corrupted-key-exchange-rejected");
 pub(crate) const RESPONSE_CONFIDENTIAL_ON_WIRE: Urn<'static> =
-	Urn::new("test", "event:settlement-ordering/response-confidential-on-wire");
-pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> = Urn::new("test", "event:settlement-ordering/settle-never-fired");
+	tightbeam::urn!("test", "event:settlement-ordering/response-confidential-on-wire");
+pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
+	tightbeam::urn!("test", "event:settlement-ordering/settle-never-fired");
 
 use crate::common::security::{
 	contains_window, default_security_profile, expectation_failure, pinning_validator, ClientMaterials, PayingApprover,

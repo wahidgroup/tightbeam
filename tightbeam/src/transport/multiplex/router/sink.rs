@@ -454,7 +454,7 @@ mod tests {
 	// the sink so a retried first chunk still opens routed.
 	#[test]
 	fn test_request_sink_failed_open_keeps_route() {
-		let (_shared, mut sink, sent, _outcome) = routed_sink_fixture(Some(Urn::new("tb", "servlet:ledger")));
+		let (_shared, mut sink, sent, _outcome) = routed_sink_fixture(Some(crate::urn!("tb", "servlet:ledger")));
 
 		drop(sent);
 

@@ -35,7 +35,7 @@ use tightbeam::{
 use crate::common::security::{deterministic_signing_key, expectation_failure, random_signing_key, test_certificate};
 
 pub(crate) const UNTRUSTED_CERT_REJECTED: Urn<'static> =
-	Urn::new("test", "event:certificate-trust/untrusted-cert-rejected");
+	tightbeam::urn!("test", "event:certificate-trust/untrusted-cert-rejected");
 
 tb_assert_spec! {
 	pub CertificateTrustSpec,

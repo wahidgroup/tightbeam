@@ -401,18 +401,21 @@ mod tests {
 	fn foreign_or_malformed_urns_are_refused() {
 		let namespace = prod();
 		let cases = [
-			(Urn::new("acme", "prod-us:servlet:beam"), UrnValidationError::NidMismatch),
-			(Urn::new("tightbeam", "staging:servlet:beam"), UrnValidationError::RealmMismatch),
+			(crate::urn!("acme", "prod-us:servlet:beam"), UrnValidationError::NidMismatch),
 			(
-				Urn::new("tightbeam", "prod-us:queue:beam"),
+				crate::urn!("tightbeam", "staging:servlet:beam"),
+				UrnValidationError::RealmMismatch,
+			),
+			(
+				crate::urn!("tightbeam", "prod-us:queue:beam"),
 				UrnValidationError::InvalidFormat { field: "resource-type", pattern: None },
 			),
 			(
-				Urn::new("tightbeam", "prod-us"),
+				crate::urn!("tightbeam", "prod-us"),
 				UrnValidationError::RequiredFieldMissing("resource-type"),
 			),
 			(
-				Urn::new("tightbeam", "prod-us:servlet:"),
+				crate::urn!("tightbeam", "prod-us:servlet:"),
 				UrnValidationError::RequiredFieldMissing("resource-id"),
 			),
 			(
@@ -422,11 +425,11 @@ mod tests {
 				UrnValidationError::RequiredFieldMissing("instance"),
 			),
 			(
-				Urn::new("tightbeam", "prod-us:colony:main/tail"),
+				crate::urn!("tightbeam", "prod-us:colony:main/tail"),
 				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
 			),
 			(
-				Urn::new("tightbeam", "prod-us:colony:main:extra"),
+				crate::urn!("tightbeam", "prod-us:colony:main:extra"),
 				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
 			),
 		];

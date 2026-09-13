@@ -8,8 +8,8 @@ use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
-pub(crate) const TASK1: Urn<'static> = Urn::new("test", "event:violations/task1");
-pub(crate) const TASK2: Urn<'static> = Urn::new("test", "event:violations/task2");
+pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:violations/task1");
+pub(crate) const TASK2: Urn<'static> = tightbeam::urn!("test", "event:violations/task2");
 
 // Every scenario in this file releases TASK1 once. TASK2 is released by the
 // two-task processes only, so it is not part of the shared contract.

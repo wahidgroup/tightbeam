@@ -37,9 +37,10 @@ use crate::common::security::{pinning_trust_store, random_signing_key, test_cert
 use crate::transport::support::bind_mutual_listener;
 
 pub(crate) const ALLOW_LIST_ADMITS_THE_PEER: Urn<'static> =
-	Urn::new("test", "event:peer-list/allow-list-admits-the-peer");
-pub(crate) const DENY_LIST_BARS_THE_DOOR: Urn<'static> = Urn::new("test", "event:peer-list/deny-list-bars-the-door");
-pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = Urn::new("test", "event:peer-list/handler-never-invoked");
+	tightbeam::urn!("test", "event:peer-list/allow-list-admits-the-peer");
+pub(crate) const DENY_LIST_BARS_THE_DOOR: Urn<'static> =
+	tightbeam::urn!("test", "event:peer-list/deny-list-bars-the-door");
+pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = tightbeam::urn!("test", "event:peer-list/handler-never-invoked");
 
 /// Mutual-auth doorman fixture: server materials, the client identity
 /// the gate lists, and whether any frame got past the door.

@@ -26,15 +26,16 @@ use tightbeam::{Frame, TightBeamError};
 use super::support::{accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split};
 use crate::common::security::{expectation_failure, ServerMaterials};
 
-pub(crate) const FIRST_RECORD_ARRIVES: Urn<'static> = Urn::new("test", "event:split/first-record-arrives");
-pub(crate) const FRAME_ECHOED: Urn<'static> = Urn::new("test", "event:split/frame-echoed");
+pub(crate) const FIRST_RECORD_ARRIVES: Urn<'static> = tightbeam::urn!("test", "event:split/first-record-arrives");
+pub(crate) const FRAME_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:split/frame-echoed");
 pub(crate) const INTO_SPLIT_REPORTS_INVALID_STATE: Urn<'static> =
-	Urn::new("test", "event:split/into-split-reports-invalid-state");
+	tightbeam::urn!("test", "event:split/into-split-reports-invalid-state");
 pub(crate) const SECOND_RECORD_STILL_ARRIVES: Urn<'static> =
-	Urn::new("test", "event:split/second-record-still-arrives");
-pub(crate) const SECOND_WRITE_DEMANDS_REKEY: Urn<'static> = Urn::new("test", "event:split/second-write-demands-rekey");
-pub(crate) const STATUS_OK: Urn<'static> = Urn::new("test", "event:split/status-ok");
-pub(crate) const THRESHOLD_REACHES_ZERO: Urn<'static> = Urn::new("test", "event:split/threshold-reaches-zero");
+	tightbeam::urn!("test", "event:split/second-record-still-arrives");
+pub(crate) const SECOND_WRITE_DEMANDS_REKEY: Urn<'static> =
+	tightbeam::urn!("test", "event:split/second-write-demands-rekey");
+pub(crate) const STATUS_OK: Urn<'static> = tightbeam::urn!("test", "event:split/status-ok");
+pub(crate) const THRESHOLD_REACHES_ZERO: Urn<'static> = tightbeam::urn!("test", "event:split/threshold-reaches-zero");
 
 fn request_frame() -> Frame {
 	TestFrame::v0(None, None)

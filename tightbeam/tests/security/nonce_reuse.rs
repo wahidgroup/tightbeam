@@ -36,10 +36,11 @@ use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
-pub(crate) const NONCE_CAPTURE_VALID: Urn<'static> = Urn::new("test", "event:nonce-reuse/nonce-capture-valid");
-pub(crate) const NONCE_FIRST_USE: Urn<'static> = Urn::new("test", "event:nonce-reuse/nonce-first-use");
-pub(crate) const NONCE_REPLAY_ATTEMPT: Urn<'static> = Urn::new("test", "event:nonce-reuse/nonce-replay-attempt");
-pub(crate) const NONCE_REPLAY_REJECTED: Urn<'static> = Urn::new("test", "event:nonce-reuse/nonce-replay-rejected");
+pub(crate) const NONCE_CAPTURE_VALID: Urn<'static> = tightbeam::urn!("test", "event:nonce-reuse/nonce-capture-valid");
+pub(crate) const NONCE_FIRST_USE: Urn<'static> = tightbeam::urn!("test", "event:nonce-reuse/nonce-first-use");
+pub(crate) const NONCE_REPLAY_ATTEMPT: Urn<'static> = tightbeam::urn!("test", "event:nonce-reuse/nonce-replay-attempt");
+pub(crate) const NONCE_REPLAY_REJECTED: Urn<'static> =
+	tightbeam::urn!("test", "event:nonce-reuse/nonce-replay-rejected");
 
 tb_assert_spec! {
 	pub NonceReuseSpec,

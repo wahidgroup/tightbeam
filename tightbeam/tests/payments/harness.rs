@@ -15,11 +15,11 @@ use tightbeam::{utils, Frame, TightBeamError};
 
 use super::messages::TransactionStatus;
 
-pub(crate) const CHAIN_BROKEN: Urn<'static> = Urn::new("test", "event:harness/chain-broken");
-pub(crate) const CHAIN_VALID: Urn<'static> = Urn::new("test", "event:harness/chain-valid");
-pub(crate) const DEDUP_CACHE_HIT: Urn<'static> = Urn::new("test", "event:harness/dedup-cache-hit");
-pub(crate) const DEDUP_KEPT: Urn<'static> = Urn::new("test", "event:harness/dedup-kept");
-pub(crate) const DEDUP_SKIPPED: Urn<'static> = Urn::new("test", "event:harness/dedup-skipped");
+pub(crate) const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:harness/chain-broken");
+pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:harness/chain-valid");
+pub(crate) const DEDUP_CACHE_HIT: Urn<'static> = tightbeam::urn!("test", "event:harness/dedup-cache-hit");
+pub(crate) const DEDUP_KEPT: Urn<'static> = tightbeam::urn!("test", "event:harness/dedup-kept");
+pub(crate) const DEDUP_SKIPPED: Urn<'static> = tightbeam::urn!("test", "event:harness/dedup-skipped");
 
 // ============================================================================
 // Constants

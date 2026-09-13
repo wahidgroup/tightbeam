@@ -24,19 +24,19 @@ use tightbeam::{utils, Frame, TightBeamError, Version};
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const ADAPTIVE_BEHAVIOR: Urn<'static> = Urn::new("test", "event:zero-queue/adaptive-behavior");
-pub(crate) const CHAIN_VALID: Urn<'static> = Urn::new("test", "event:zero-queue/chain-valid");
-pub(crate) const DEDUP_KEPT: Urn<'static> = Urn::new("test", "event:zero-queue/dedup-kept");
-pub(crate) const DEDUP_SKIPPED: Urn<'static> = Urn::new("test", "event:zero-queue/dedup-skipped");
-pub(crate) const EMIT_WORK: Urn<'static> = Urn::new("test", "event:zero-queue/emit-work");
-pub(crate) const LAG_TIP: Urn<'static> = Urn::new("test", "event:zero-queue/lag-tip");
-pub(crate) const THROTTLE_ENGAGED: Urn<'static> = Urn::new("test", "event:zero-queue/throttle-engaged");
-pub(crate) const PRIORITY_RESPECTED: Urn<'static> = Urn::new("test", "event:zero-queue/priority-respected");
-pub(crate) const REPLAY_ATTEMPT: Urn<'static> = Urn::new("test", "event:zero-queue/replay-attempt");
-pub(crate) const RESPONSE_READY: Urn<'static> = Urn::new("test", "event:zero-queue/response-ready");
-pub(crate) const WORKER_COMMIT: Urn<'static> = Urn::new("test", "event:zero-queue/worker-commit");
-pub(crate) const WORKER_FAN_OUT_0: Urn<'static> = Urn::new("test", "event:zero-queue/worker-fan-out-0");
-pub(crate) const WORKER_FAN_OUT_1: Urn<'static> = Urn::new("test", "event:zero-queue/worker-fan-out-1");
+pub(crate) const ADAPTIVE_BEHAVIOR: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/adaptive-behavior");
+pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/chain-valid");
+pub(crate) const DEDUP_KEPT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-kept");
+pub(crate) const DEDUP_SKIPPED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/dedup-skipped");
+pub(crate) const EMIT_WORK: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/emit-work");
+pub(crate) const LAG_TIP: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/lag-tip");
+pub(crate) const THROTTLE_ENGAGED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/throttle-engaged");
+pub(crate) const PRIORITY_RESPECTED: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/priority-respected");
+pub(crate) const REPLAY_ATTEMPT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/replay-attempt");
+pub(crate) const RESPONSE_READY: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/response-ready");
+pub(crate) const WORKER_COMMIT: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-commit");
+pub(crate) const WORKER_FAN_OUT_0: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-fan-out-0");
+pub(crate) const WORKER_FAN_OUT_1: Urn<'static> = tightbeam::urn!("test", "event:zero-queue/worker-fan-out-1");
 
 const QUEUE_TAG: &str = "queue-free";
 const WORKER_0_TAG: &str = "worker:0";

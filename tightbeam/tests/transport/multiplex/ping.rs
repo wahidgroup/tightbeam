@@ -17,16 +17,17 @@ use crate::transport::support::{await_ok, bind_encrypted_listener, mux_frame, mu
 
 use super::common::*;
 
-pub(crate) const CLIENT_PING_ACKED: Urn<'static> = Urn::new("test", "event:ping/client-ping-acked");
+pub(crate) const CLIENT_PING_ACKED: Urn<'static> = tightbeam::urn!("test", "event:ping/client-ping-acked");
 pub(crate) const FOLLOWUP_ECHOES_AFTER_STRAY_ACK: Urn<'static> =
-	Urn::new("test", "event:ping/followup-echoes-after-stray-ack");
-pub(crate) const HANDLER_SAW_ONLY_STREAM: Urn<'static> = Urn::new("test", "event:ping/handler-saw-only-stream");
-pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> = Urn::new("test", "event:ping/inflight-drains-to-echo");
-pub(crate) const PING_REFUSED_DRAINING: Urn<'static> = Urn::new("test", "event:ping/ping-refused-draining");
+	tightbeam::urn!("test", "event:ping/followup-echoes-after-stray-ack");
+pub(crate) const HANDLER_SAW_ONLY_STREAM: Urn<'static> = tightbeam::urn!("test", "event:ping/handler-saw-only-stream");
+pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> = tightbeam::urn!("test", "event:ping/inflight-drains-to-echo");
+pub(crate) const PING_REFUSED_DRAINING: Urn<'static> = tightbeam::urn!("test", "event:ping/ping-refused-draining");
 pub(crate) const PROBE_ANSWERED_WITH_MATCHING_ACK: Urn<'static> =
-	Urn::new("test", "event:ping/probe-answered-with-matching-ack");
-pub(crate) const SERVER_PING_ACKED: Urn<'static> = Urn::new("test", "event:ping/server-ping-acked");
-pub(crate) const STREAM_ECHOES_AFTER_PINGS: Urn<'static> = Urn::new("test", "event:ping/stream-echoes-after-pings");
+	tightbeam::urn!("test", "event:ping/probe-answered-with-matching-ack");
+pub(crate) const SERVER_PING_ACKED: Urn<'static> = tightbeam::urn!("test", "event:ping/server-ping-acked");
+pub(crate) const STREAM_ECHOES_AFTER_PINGS: Urn<'static> =
+	tightbeam::urn!("test", "event:ping/stream-echoes-after-pings");
 
 tb_assert_spec! {
 	pub MuxPingRoundtripSpec,
