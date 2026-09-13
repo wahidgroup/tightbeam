@@ -101,27 +101,43 @@ macro_rules! flagset {
 			}
 		}
 
-		impl From<Vec<u8>> for $name {
-		fn from(bytes: Vec<u8>) -> Self {
-			Self {
-				flags: $crate::flags::Flags::from(bytes.as_slice()),
+		impl ::core::convert::TryFrom<&[u8]> for $name {
+			type Error = $crate::flags::FlagsError;
+
+			/// # Errors
+			///
+			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) when
+			///   the slice does not name exactly this set's flags.
+			fn try_from(bytes: &[u8]) -> ::core::result::Result<Self, Self::Error> {
+				::core::result::Result::Ok(Self { flags: ::core::convert::TryFrom::try_from(bytes)? })
 			}
 		}
-		}
 
-		impl From<&[u8]> for $name {
-		 fn from(bytes: &[u8]) -> Self {
-			Self {
-				flags: $crate::flags::Flags::from(bytes),
+		impl ::core::convert::TryFrom<Vec<u8>> for $name {
+			type Error = $crate::flags::FlagsError;
+
+			/// # Errors
+			///
+			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) when
+			///   the bytes do not name exactly this set's flags.
+			fn try_from(bytes: Vec<u8>) -> ::core::result::Result<Self, Self::Error> {
+				::core::convert::TryFrom::try_from(bytes.as_slice())
 			}
-		 }
 		}
 
-		impl From<Option<Vec<u8>>> for $name {
-			fn from(bytes: Option<Vec<u8>>) -> Self {
+		impl ::core::convert::TryFrom<Option<Vec<u8>>> for $name {
+			type Error = $crate::flags::FlagsError;
+
+			/// Absence is the default set. Present bytes must name the set exactly.
+			///
+			/// # Errors
+			///
+			/// - [`FlagsError::LengthMismatch`](crate::flags::FlagsError) when
+			///   present bytes do not name exactly this set's flags.
+			fn try_from(bytes: Option<Vec<u8>>) -> ::core::result::Result<Self, Self::Error> {
 				match bytes {
-					Some(bytes) => Self::from(bytes),
-					None => Self::default(),
+					Some(bytes) => ::core::convert::TryFrom::try_from(bytes),
+					None => ::core::result::Result::Ok(Self::default()),
 				}
 			}
 		}

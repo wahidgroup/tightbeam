@@ -15,6 +15,7 @@ pub struct Note {
 }
 
 #[derive(Flaggable, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Mode {
 	#[default]
 	Default = 0,
@@ -22,6 +23,7 @@ pub enum Mode {
 }
 
 #[derive(Flaggable, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum DebugLevel {
 	#[default]
 	Default = 0,

@@ -55,6 +55,7 @@ impl tightbeam::Message for TestMessage {
 
 /// Custom test matrix for message metadata
 #[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
+#[repr(u8)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum FlagTestDevelopmentMode {
 	#[default]
@@ -78,6 +79,7 @@ impl PartialEq<u8> for FlagTestDevelopmentMode {
 
 /// Custom test matrix for message metadata
 #[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
+#[repr(u8)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum FlagTestDebugLevel {
 	#[default]
