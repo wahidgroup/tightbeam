@@ -90,13 +90,9 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(FmeaTestSpec::latest())
 		.with_fdr(create_test_config(SeverityScale::MilStd1629))
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				verify_fmea_report(result.verdict().fdr()).expect("FMEA verification failed");
-				Ok(())
-			})),
-			on_fail: None,
-		})
+		.with_hooks(TestHooks::on_pass(|context| {
+				verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -113,13 +109,9 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(FmeaTestSpec::latest())
 		.with_fdr(create_test_config(SeverityScale::Iso26262))
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				verify_fmea_report(result.verdict().fdr()).expect("FMEA verification failed");
-				Ok(())
-			})),
-			on_fail: None,
-		})
+		.with_hooks(TestHooks::on_pass(|context| {
+				verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {

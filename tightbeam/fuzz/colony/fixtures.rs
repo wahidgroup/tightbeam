@@ -16,7 +16,7 @@ use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::crypto::x509::{Certificate, CertificateSpec};
 use tightbeam::der::Encode;
-use tightbeam::testing::utils::{create_test_certificate_with_cn_and_uri_sans, create_test_signing_key};
+use tightbeam::testing::fixtures::{TestCertificate, TestKey};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::utils::urn::Urn;
 
@@ -47,8 +47,8 @@ impl GatewayCerts {
 
 	#[allow(dead_code)]
 	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
-		let raw = create_test_signing_key();
-		let data = create_test_certificate_with_cn_and_uri_sans(&raw, "Colony Gateway", &[&colony_urn.to_string()]);
+		let raw = TestKey::signing();
+		let data = TestCertificate::with_cn_and_uri_sans(&raw, "Colony Gateway", &[&colony_urn.to_string()]);
 
 		let cert = Arc::new(data);
 		let key = Secp256k1SigningKey::from(raw);
@@ -92,7 +92,7 @@ pub(crate) fn fixed_signing_key(seed: u8) -> k256::ecdsa::SigningKey {
 /// Deterministic gateway identity for AFL (seeded key, fixed CN/SAN).
 pub(crate) fn colony_identity(cn: &str, colony: &Urn<'_>, key_seed: u8) -> (Certificate, Secp256k1SigningKey) {
 	let raw = fixed_signing_key(key_seed);
-	let cert = create_test_certificate_with_cn_and_uri_sans(&raw, cn, &[&colony.to_string()]);
+	let cert = TestCertificate::with_cn_and_uri_sans(&raw, cn, &[&colony.to_string()]);
 	(cert, Secp256k1SigningKey::from(raw))
 }
 

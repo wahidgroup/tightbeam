@@ -525,7 +525,7 @@ mod tests {
 
 		#[test]
 		fn test_notarize_macro() -> Result<()> {
-			let mut tbs = crate::testing::create_v0_tightbeam(None, None);
+			let mut tbs = crate::testing::TestFrame::v0(None, None);
 			tbs.nonrepudiation = None; // Ensure no signature initially
 
 			let secret_bytes = [1u8; 32];
@@ -549,31 +549,30 @@ mod tests {
 		use crate::crypto::key::Secp256k1KeyProvider;
 
 		use crate::error::Result;
-		use crate::testing::utils::SixteenByteDigest;
-		use crate::testing::{create_test_message, create_test_signing_key};
+		use crate::testing::fixtures::SixteenByteDigest;
+		use crate::testing::{TestKey, TestMessage};
 		use crate::{TightBeamError, Version};
 
 		#[tokio::test]
 		async fn rejects_digest_shorter_than_skid_window() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let frame = FrameBuilder::from(Version::V1)
 				.with_id("test-short-digest")
 				.with_order(1696521600)
 				.with_message(message)
 				.build()?;
 
-			let signing_key = create_test_signing_key();
+			let signing_key = TestKey::signing();
 			let provider = Secp256k1KeyProvider::from(signing_key);
 
 			let result = frame.sign_with_provider::<SixteenByteDigest, _>(&provider).await;
 			assert!(matches!(result, Err(TightBeamError::InvalidAlgorithm)));
-
 			Ok(())
 		}
 
 		#[tokio::test]
 		async fn test_frame_sign_with_key_provider() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let frame = FrameBuilder::from(Version::V1)
 				.with_id("test-sign")
 				.with_order(1696521600)
@@ -581,7 +580,7 @@ mod tests {
 				.build()?;
 			assert!(frame.nonrepudiation.is_none());
 
-			let signing_key = create_test_signing_key();
+			let signing_key = TestKey::signing();
 			let provider = Secp256k1KeyProvider::from(signing_key);
 
 			let signed_frame = frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
@@ -609,11 +608,11 @@ mod tests {
 		use crate::der::oid::AssociatedOid;
 		use crate::error::Result;
 		use crate::spki::AlgorithmIdentifierOwned;
-		use crate::testing::{create_test_message, create_test_signing_key};
+		use crate::testing::{TestKey, TestMessage};
 		use crate::{SignerInfo, Version};
 
 		fn unsigned_frame() -> Result<crate::Frame> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			FrameBuilder::from(Version::V1)
 				.with_id("test-detached")
 				.with_order(1696521600)
@@ -624,7 +623,7 @@ mod tests {
 		#[test]
 		fn test_attach_signature_roundtrip() -> Result<()> {
 			let frame = unsigned_frame()?;
-			let signing_key = create_test_signing_key();
+			let signing_key = TestKey::signing();
 
 			// External backends must follow the canonical convention.
 			// SHA3-256 runs over the TBS bytes, and ECDSA signs that
@@ -640,14 +639,13 @@ mod tests {
 			assert!(signed.nonrepudiation.is_some());
 
 			signed.verify::<Secp256k1Signature, Sha3_256>(signing_key.verifying_key())?;
-
 			Ok(())
 		}
 
 		#[test]
 		fn test_attach_signer_info_from_parts() -> Result<()> {
 			let frame = unsigned_frame()?;
-			let signing_key = create_test_signing_key();
+			let signing_key = TestKey::signing();
 
 			let tbs = frame.to_tbs()?;
 			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;
@@ -662,7 +660,6 @@ mod tests {
 
 			let signed = frame.attach_signer_info(signer_info);
 			signed.verify::<Secp256k1Signature, Sha3_256>(signing_key.verifying_key())?;
-
 			Ok(())
 		}
 	}
@@ -674,12 +671,12 @@ mod tests {
 		use crate::crypto::aead::{Aes256Gcm, KeyInit};
 		use crate::crypto::key::Aes256GcmKeyProvider;
 		use crate::error::Result;
-		use crate::testing::create_test_message;
+		use crate::testing::TestMessage;
 		use crate::Version;
 
 		#[tokio::test]
 		async fn test_frame_encrypt_decrypt_roundtrip() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let original_message_bytes = crate::encode(&message)?;
 
 			let frame = FrameBuilder::from(Version::V1)
@@ -701,7 +698,6 @@ mod tests {
 			let decrypted_frame = encrypted_frame.decrypt_with_provider(&provider).await?;
 			assert!(decrypted_frame.metadata.confidentiality.is_none());
 			assert_eq!(decrypted_frame.message, original_message_bytes);
-
 			Ok(())
 		}
 	}

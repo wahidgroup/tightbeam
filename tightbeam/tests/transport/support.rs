@@ -25,7 +25,7 @@ use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, 
 use tightbeam::der::{Decode, Encode};
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::testing::create_v0_tightbeam;
+use tightbeam::testing::TestFrame;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
 use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
@@ -80,7 +80,7 @@ pub async fn respond_echo<T: MessageCollector + Send>(mut transport: T) -> Resul
 
 /// A small labeled frame for multiplexed exchanges.
 pub fn mux_frame(label: &str) -> Frame {
-	create_v0_tightbeam(Some(label), None)
+	TestFrame::v0(Some(label), None)
 }
 
 /// A multiplexing offer advertising `cap` peer-initiated streams.

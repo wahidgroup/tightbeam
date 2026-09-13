@@ -1128,7 +1128,7 @@ mod tests {
 		use super::super::*;
 		use crate::crypto::aead::RuntimeAead;
 		use crate::oids::AES_256_GCM;
-		use crate::testing::create_test_cipher_key;
+		use crate::testing::TestKey;
 
 		const PLAINTEXT: &[u8] = b"epoch boundary traffic";
 
@@ -1152,7 +1152,7 @@ mod tests {
 		}
 
 		fn test_runtime() -> RuntimeAead {
-			let (_key, cipher) = create_test_cipher_key();
+			let (_key, cipher) = TestKey::cipher();
 			RuntimeAead::new(cipher, AES_256_GCM)
 		}
 
@@ -1254,8 +1254,8 @@ mod tests {
 	async fn async_round_trip() -> TransportResult<()> {
 		let (listener, client_stream) = bind_and_connect().await?;
 
-		let request = create_v0_tightbeam(None, None);
-		let expected_response = create_v0_tightbeam(None, None);
+		let request = TestFrame::v0(None, None);
+		let expected_response = TestFrame::v0(None, None);
 
 		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
 		let response_frame = expected_response.to_owned();
@@ -1287,7 +1287,7 @@ mod tests {
 
 	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	fn encrypted_test_server() -> TransportResult<EncryptedTestServer> {
-		let signing_key = create_test_signing_key();
+		let signing_key = TestKey::signing();
 		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 		let sha3_signer = Sha3Signer::from(&signing_key);
 		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
@@ -1362,7 +1362,7 @@ mod tests {
 
 	#[cfg(all(feature = "x509", feature = "transport-cms"))]
 	fn cms_test_client(stream: TcpStream) -> TcpTransport<TokioStream> {
-		let signing_key = Secp256k1SigningKey::from(create_test_signing_key());
+		let signing_key = Secp256k1SigningKey::from(TestKey::signing());
 		let key_provider = Secp256k1KeyProvider::from(signing_key);
 		let provider = Arc::new(key_provider);
 		let key_manager = HandshakeKeyManager::new(provider);
@@ -1405,8 +1405,8 @@ mod tests {
 		let EncryptedTestServer { cert: server_cert, config } = encrypted_test_server()?;
 		let (listener, server_addr) = bind_encrypted(config).await?;
 
-		let request = create_v0_tightbeam(None, None);
-		let expected_response = create_v0_tightbeam(None, None);
+		let request = TestFrame::v0(None, None);
+		let expected_response = TestFrame::v0(None, None);
 
 		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
 		let response_frame = expected_response.to_owned();
@@ -1422,7 +1422,7 @@ mod tests {
 		});
 
 		let client_key = SigningKey::from_bytes(&[2u8; 32].into()).map_err(|_| TransportError::InvalidState)?;
-		let client_cert = Arc::new(create_test_certificate(&client_key));
+		let client_cert = Arc::new(TestCertificate::self_signed(&client_key));
 		let client_signing = Secp256k1SigningKey::from(client_key);
 		let key_provider = Secp256k1KeyProvider::from(client_signing);
 		let client_provider = Arc::new(key_provider);
@@ -1513,7 +1513,7 @@ mod tests {
 		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
 		let (listener, server_addr) = bind_encrypted(config).await?;
 
-		let request = create_v0_tightbeam(None, None);
+		let request = TestFrame::v0(None, None);
 		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(2);
 		let server_handle = tokio::spawn(async move {
 			let (transport, _peer) = listener.accept().await?;
@@ -1558,7 +1558,7 @@ mod tests {
 		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
 		let (listener, server_addr) = bind_encrypted(config).await?;
 
-		let request = create_v0_tightbeam(None, None);
+		let request = TestFrame::v0(None, None);
 		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
 		let server_handle = tokio::spawn(async move {
 			let (mut transport, _peer) = listener.accept().await?;

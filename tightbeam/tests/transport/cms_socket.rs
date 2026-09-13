@@ -24,7 +24,7 @@ use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{create_v0_tightbeam, ClientEnv, SetupEnv};
+use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::HandshakeProtocolKind;
 use tightbeam::transport::tcp::r#async::TokioListener;
@@ -111,9 +111,9 @@ tb_scenario! {
 				.with_server_certificate_chain(server_chain)
 				.with_handshake_protocol(HandshakeProtocolKind::Cms)
 				.build();
-			let mut client = builder.connect(addr).await?;
 
-			let frame = create_v0_tightbeam(Some("cms-wire"), None);
+			let mut client = builder.connect(addr).await?;
+			let frame = TestFrame::v0(Some("cms-wire"), None);
 			let reply = client.emit(frame.to_owned(), None).await?;
 			trace.event_with(CMS_WIRE_ECHOED, &[], reply == Some(frame))?;
 			Ok(())

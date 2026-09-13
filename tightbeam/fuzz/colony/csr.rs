@@ -10,7 +10,7 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::der::{Encode, Sequence};
 use tightbeam::servlet;
-use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
+use tightbeam::testing::fixtures::TestCertificate;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::Beamable;
@@ -62,7 +62,7 @@ impl CsrIssuer {
 		// stays stable across identical oracle inputs.
 		let seed = ((issued % 250) as u8).wrapping_add(1);
 		let raw = fixed_signing_key(seed);
-		let cert = create_test_certificate_with_cn_and_uri_sans(&raw, &req.cn, &[&req.colony]);
+		let cert = TestCertificate::with_cn_and_uri_sans(&raw, &req.cn, &[&req.colony]);
 		let certificate = match cert.to_der() {
 			Ok(bytes) => bytes,
 			Err(_) => {

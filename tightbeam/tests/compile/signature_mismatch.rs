@@ -42,7 +42,7 @@ struct SignatureMessage {
 
 fn main() {
 	let message = SignatureMessage { content: "test".to_string() };
-	let signing_key = tightbeam::testing::create_test_signing_key();
+	let signing_key = tightbeam::testing::TestKey::signing();
 
 	// Try to sign with secp256k1 when the profile pins OtherSignature
 	// This should fail to compile with compile-time enforcement

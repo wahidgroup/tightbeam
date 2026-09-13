@@ -32,7 +32,7 @@ use tightbeam::oids::{AES_128_WRAP, AES_256_WRAP};
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{
-	utils::{create_test_certificate, create_test_signing_key},
+	fixtures::{TestCertificate, TestKey},
 	SetupEnv,
 };
 use tightbeam::transport::handshake::client::EciesHandshakeClient;
@@ -131,8 +131,8 @@ fn fallback_profile() -> SecurityProfileDesc {
 }
 
 fn server_materials() -> (Certificate, Arc<dyn SigningKeyProvider>) {
-	let server_signing_key = create_test_signing_key();
-	let server_cert = create_test_certificate(&server_signing_key);
+	let server_signing_key = TestKey::signing();
+	let server_cert = TestCertificate::self_signed(&server_signing_key);
 	let signing_key = Secp256k1SigningKey::from(server_signing_key);
 	let server_key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
 	(server_cert, server_key_provider)

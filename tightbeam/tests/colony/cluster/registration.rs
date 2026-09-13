@@ -596,13 +596,13 @@ struct DualHiveCerts {
 
 fn dual_hive_certs() -> DualHiveCerts {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let gateway = cluster_certs();
 	let raw_a = k256::ecdsa::SigningKey::random(&mut OsRng);
 	let raw_b = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let cert_a = create_test_certificate(&raw_a);
-	let cert_b = create_test_certificate(&raw_b);
+	let cert_a = TestCertificate::self_signed(&raw_a);
+	let cert_b = TestCertificate::self_signed(&raw_b);
 	let key_a = Secp256k1SigningKey::from(raw_a);
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let hive_trust: Arc<dyn CertificateTrust> = Arc::new(

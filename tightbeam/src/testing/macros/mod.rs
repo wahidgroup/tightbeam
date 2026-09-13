@@ -17,8 +17,7 @@ pub mod verification_spec;
 
 pub use timing_spec::DeadlineParams;
 pub use verification_spec::{
-	absent, between, present, versions_strictly_ascending, AssertSpecBuilder, BuiltAssertSpec, Cardinality,
-	SpecBuildError,
+	versions_strictly_ascending, AssertSpecBuilder, BuiltAssertSpec, Cardinality, SpecBuildError,
 };
 
 // Re-exports
@@ -77,6 +76,16 @@ where
 }
 
 /// Call a synchronous scenario closure with its environment struct.
+/// Hands one fuzz input to a raw target.
+///
+/// Named so the closure's argument type is checked at the definition rather
+/// than inside the `afl::fuzz!` expansion, where a mismatch reports against
+/// the macro.
+#[doc(hidden)]
+pub fn __tb_call_raw_fuzz<F: FnOnce(&[u8])>(target: F, data: &[u8]) {
+	target(data);
+}
+
 #[doc(hidden)]
 pub fn __tb_env_call_sync<E, F, T>(closure: F, env: E) -> T
 where
@@ -197,6 +206,35 @@ macro_rules! tb_scenario {
 		}
 	};
 
+	// ===== FUZZ VARIANT: raw bytes into a decoder =====
+	//
+	// No oracle and no scenario. A decoder's contract is that arbitrary bytes
+	// produce a typed error, so the property under test is that the body
+	// returns at all, and there is no trace to grade.
+	(
+		fuzz: afl,
+		raw: $body:expr
+		$(,)?
+	) => {
+		$crate::__tb_select_fuzzing! {
+			{
+				fn main() {
+					afl::fuzz!(|data: &[u8]| {
+						$crate::testing::macros::__tb_call_raw_fuzz($body, data);
+					});
+				}
+			}
+			{
+				fn main() {
+					// Smoke build: the target still has to compile and run
+					// once, so a decoder that cannot handle an empty input is
+					// caught without AFL.
+					$crate::testing::macros::__tb_call_raw_fuzz($body, &[]);
+				}
+			}
+		}
+	};
+
 	// ===== HELPER: Grade a finished scenario =====
 	(@grade $config:expr, $trace:expr, $exec_result:expr) => {
 		// An AFL iteration whose input ran out drove a prefix of a run, not a
@@ -213,11 +251,11 @@ macro_rules! tb_scenario {
 	(@verify_and_call_hooks $config:expr, $hook_ctx:expr) => {
 		// The verdict is read once, here. Every layer, and the scenario body's
 		// own result, reached it through `ScenarioVerdict::from_layers`.
-		match $hook_ctx.verdict().outcome($config.expect()) {
+		match $hook_ctx.outcome() {
 			Err(violations) => {
 				if let Some(hooks) = $config.hooks() {
-					if let Some(ref on_fail) = hooks.on_fail {
-						let _ = on_fail(&$hook_ctx, &violations);
+					if let Some(on_fail) = hooks.rejected() {
+						on_fail(&$hook_ctx, violations);
 					}
 				}
 
@@ -225,8 +263,8 @@ macro_rules! tb_scenario {
 			}
 			Ok(()) => {
 				if let Some(hooks) = $config.hooks() {
-					if let Some(ref on_pass) = hooks.on_pass {
-						let _ = on_pass(&$hook_ctx);
+					if let Some(on_pass) = hooks.accepted() {
+						on_pass(&$hook_ctx);
 					}
 				}
 			}
@@ -993,13 +1031,9 @@ crate::__tb_if_test! {
 			fn csp_failure_invokes_on_fail_before_panicking() {
 				let failed = Arc::new(AtomicBool::new(false));
 				let observed = Arc::clone(&failed);
-				let hooks = TestHooks {
-					on_pass: None,
-					on_fail: Some(Arc::new(move |_ctx, _violation| {
+				let hooks = TestHooks::on_fail(move |_context, _violations| {
 						observed.store(true, Ordering::SeqCst);
-						Ok(())
-					})),
-				};
+					});
 
 				let config = crate::__tb_accept_config!(
 					ScenarioConfig::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build()

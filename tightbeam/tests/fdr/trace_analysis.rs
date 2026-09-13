@@ -7,8 +7,6 @@
 
 #![cfg(feature = "testing-fdr")]
 
-use std::sync::Arc;
-
 use tightbeam::testing::fdr::{FdrConfig, FdrTraceExt};
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
@@ -85,8 +83,7 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(TraceAnalysisSpec::latest())
 		.with_fdr(build_fdr_config(vec![SimpleRequestResponse::process()]))
-		.with_hooks(TestHooks {
-			on_pass: Some(Arc::new(|context| {
+		.with_hooks(TestHooks::on_pass(|context| {
 				// Acceptance queries: Check what events are accepted at
 				// specific states.
 				if let Some(acceptance) = context.trace().acceptance_at("Connected") {
@@ -104,11 +101,7 @@ tb_scenario! {
 				// before "request"
 				assert!(context.trace().can_refuse_after("Connected", "request"));
 				assert!(context.trace().can_refuse_after("Connected", "disconnect"));
-
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {

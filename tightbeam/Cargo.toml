@@ -66,6 +66,7 @@ zstd-safe = { workspace = true, optional = true }
 
 ## Fuzzing dependencies
 afl = { workspace = true, optional = true }
+proptest = { workspace = true, optional = true }
 
 [dev-dependencies]
 tightbeam-rs = { path = ".", features = [
@@ -169,6 +170,9 @@ testing-schedulability = ["testing", "testing-timing"]
 testing-fault = ["testing", "testing-fdr"]
 testing-fmea = ["testing", "testing-fault", "instrument"]
 testing-fuzz = ["testing", "testing-csp", "dep:afl"]
+# Property-based tests over the wire types. Off by default: the strategies
+# only compile when a consumer asks for them.
+testing-property = ["testing", "dep:proptest"]
 testing-fuzz-ijon = ["testing-fuzz"]
 instrument = ["std", "sha3", "digest", "derive"]
 logging = []
@@ -317,6 +321,16 @@ required-features = ["std", "testing-fuzz"]
 name = "fuzz_chess"
 path = "fuzz/chess/mod.rs"
 required-features = ["full", "testing-fuzz"]
+
+[[bin]]
+name = "fuzz_frame_der"
+path = "fuzz/frame_der.rs"
+required-features = ["std", "testing-fuzz"]
+
+[[bin]]
+name = "fuzz_envelope_der"
+path = "fuzz/envelope_der.rs"
+required-features = ["std", "testing-fuzz", "transport"]
 
 [[bin]]
 name = "fuzz_colony"

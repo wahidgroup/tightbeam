@@ -6,7 +6,7 @@
 
 use tightbeam::testing::{Expect, Layer, ScenarioConfig, ScenarioConfigError};
 use tightbeam::utils::urn::Urn;
-use tightbeam::{tb_assert_spec, tb_process_spec};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec};
 
 const STEP: Urn<'static> = Urn::new("test", "event:config/step");
 
@@ -80,5 +80,57 @@ mod with_another_layer {
 			refused.err(),
 			Some(ScenarioConfigError::ExpectViolationWithoutVerifier(Layer::Assertion))
 		);
+	}
+}
+
+#[cfg(feature = "testing-csp")]
+mod progress {
+	use tightbeam::tb_scenario;
+	use tightbeam::testing::SetupEnv;
+
+	use super::*;
+
+	const UNRELATED: Urn<'static> = Urn::new("test", "event:config/unrelated");
+
+	tb_assert_spec! {
+		pub UnrelatedSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(UNRELATED, exactly!(1))
+			]
+		}
+	}
+
+	tb_process_spec! {
+		pub NeverReached,
+		events {
+			observable { STEP }
+			hidden { }
+		}
+		states {
+			S0 => { STEP => S1 }
+		}
+		terminal { S1 }
+	}
+
+	// A trace that takes no transition satisfies every process, so a Layer 2
+	// check over an alphabet the run never touches would hold whatever the
+	// run did. The run below records only an event this process does not
+	// model, which is the shape that check has to reject.
+	tb_scenario! {
+		name: a_process_whose_alphabet_the_run_never_touches_is_refused,
+		config: ScenarioConfig::builder()
+			.with_spec(UnrelatedSpec::latest())
+			.with_csp(NeverReached)
+			.with_expect(Expect::Violation(Layer::Csp))
+			.build(),
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| {
+				trace.event(UNRELATED)?;
+
+				Ok(())
+			}
+		}
 	}
 }

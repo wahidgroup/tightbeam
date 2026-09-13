@@ -111,6 +111,9 @@ pub enum CspViolation {
 	AfterTermination { event: Event, terminal_state: State },
 	/// No states reachable from transition (deadlock)
 	Deadlock { event: Event, state: State },
+	/// The run recorded nothing this process models, so no transition was
+	/// taken and the check would hold whatever the run did
+	NoProgress { initial: State },
 }
 
 impl std::fmt::Display for CspViolation {
@@ -130,6 +133,12 @@ impl std::fmt::Display for CspViolation {
 			}
 			CspViolation::AfterTermination { event, terminal_state } => {
 				write!(f, "Event {event:?} occurred after terminal state {terminal_state:?}")
+			}
+			CspViolation::NoProgress { initial } => {
+				write!(
+					f,
+					"No event in this process's alphabet was recorded, so it never left {initial:?} and graded nothing"
+				)
 			}
 			CspViolation::Deadlock { event, state } => {
 				write!(f, "Deadlock: Event {event:?} led to no reachable states from {state:?}")

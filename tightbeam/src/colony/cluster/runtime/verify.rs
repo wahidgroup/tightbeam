@@ -233,7 +233,7 @@ mod tests {
 	use crate::crypto::x509::Certificate;
 	use crate::der::oid::AssociatedOid;
 	use crate::spki::AlgorithmIdentifierOwned;
-	use crate::testing::{create_test_certificate, create_test_message, create_test_signing_key};
+	use crate::testing::{TestCertificate, TestKey, TestMessage};
 	use crate::Version;
 
 	fn servlet(name: &str) -> Urn<'static> {
@@ -244,10 +244,10 @@ mod tests {
 
 	/// Config exporting only "ping", so "ledger" needs a grant.
 	fn exporting_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = create_test_signing_key();
+		let key: Secp256k1SigningKey = TestKey::signing();
 		let mut config = ClusterConfig::new(
 			ClusterTlsConfig::new(
-				CertificateSpec::Built(Box::new(create_test_certificate(&key))),
+				CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
 				Arc::new(Secp256k1KeyProvider::from(key)),
 			)
 			.expect("the test certificate must decode"),
@@ -330,7 +330,7 @@ mod tests {
 		let frame = FrameBuilder::from(Version::V1)
 			.with_id("verify-origin")
 			.with_order(1)
-			.with_message(create_test_message(None))
+			.with_message(TestMessage::sample(None))
 			.build()
 			.expect("test frame builds");
 
@@ -449,19 +449,19 @@ mod tests {
 
 	#[test]
 	fn hive_origin_passes_hive_only_signer() {
-		let key: Secp256k1SigningKey = create_test_signing_key();
+		let key: Secp256k1SigningKey = TestKey::signing();
 		let frame = signed_control_frame(&key);
 
 		let mut config = exporting_config();
-		config.tls.hive_trust = Some(trust_of(&create_test_certificate(&key)));
+		config.tls.hive_trust = Some(trust_of(&TestCertificate::self_signed(&key)));
 		assert_eq!(config.verify_hive_origin(&frame), TransitStatus::Ok);
 	}
 
 	#[test]
 	fn hive_origin_refuses_dual_anchored_signer() {
-		let key: Secp256k1SigningKey = create_test_signing_key();
+		let key: Secp256k1SigningKey = TestKey::signing();
 		let frame = signed_control_frame(&key);
-		let cert = create_test_certificate(&key);
+		let cert = TestCertificate::self_signed(&key);
 
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));

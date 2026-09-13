@@ -486,6 +486,7 @@ mod tests {
 		let spec = Process {
 			name: "Spec",
 			observation: Observation::Model,
+			requires_progress: true,
 			description: Some("Test spec"),
 			initial: State("S0"),
 			states: vec![State("S0")].into_iter().collect(),

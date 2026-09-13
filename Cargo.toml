@@ -126,3 +126,4 @@ syn = { version = "=2.0.119", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
 afl = { version = "=0.17.1" }
+proptest = { version = "1.8.0", default-features = false, features = ["std"] }

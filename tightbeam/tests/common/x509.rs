@@ -28,7 +28,7 @@ use tightbeam::{
 	prelude::{collect::TokioListener, *},
 	server,
 	spki::SubjectPublicKeyInfoOwned,
-	testing::{create_test_certificate_with_uri_sans, create_test_signing_key},
+	testing::{TestCertificate, TestKey},
 	transport::{handshake::HandshakeKeyManager, EncryptedProtocol, TransportEncryptionConfig},
 	utils::urn::Urn,
 	x509::Certificate,
@@ -37,7 +37,7 @@ use tightbeam::{
 
 /// Create a test certificate with signing key for a given subject and validity period
 pub fn create_test_cert_with_key(subject: &str, validity_days: u64) -> Result<(Certificate, Secp256k1SigningKey)> {
-	let signing_key = create_test_signing_key();
+	let signing_key = TestKey::signing();
 	let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 	let sha3_signer = Sha3Signer::from(&signing_key);
 	let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
@@ -95,8 +95,8 @@ impl GatewayCerts {
 	/// provably binds to the SAN alone. Colony membership gates gossip and
 	/// peer federation.
 	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
-		let raw = create_test_signing_key();
-		let cert = create_test_certificate_with_uri_sans(&raw, &[&colony_urn.to_string()]);
+		let raw = TestKey::signing();
+		let cert = TestCertificate::with_uri_sans(&raw, &[&colony_urn.to_string()]);
 		let key = Secp256k1SigningKey::from(raw);
 		let trust = combined_trust(&[&cert]);
 		Self { cert, key, trust }

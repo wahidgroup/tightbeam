@@ -174,9 +174,8 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(DeterministicSpec::latest())
 		.with_fdr(build_deterministic_config())
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-			if let Some(verdict) = result.verdict().fdr() {
+		.with_hooks(TestHooks::on_pass(|context| {
+			if let Some(verdict) = context.verdict().fdr() {
 				// Academic requirement: Deterministic = same faults every run
 				assert!(!verdict.faults_injected.is_empty(), "Deterministic injection must be reproducible");
 				// Note: Each seed explores multiple paths, so we get multiple faults per seed
@@ -194,10 +193,7 @@ tb_scenario! {
 				println!("✓ Deterministic fault injection verified: {} faults across {} seeds",
 					verdict.faults_injected.len(), verdict.seeds_completed);
 			}
-			Ok(())
-		})),
-		on_fail: None,
-	})
+		}))
 	.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -255,9 +251,8 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(ProbabilisticSpec::latest())
 		.with_fdr(build_probabilistic_config())
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = result.verdict().fdr() {
+		.with_hooks(TestHooks::on_pass(|context| {
+				if let Some(verdict) = context.verdict().fdr() {
 					let fault_count = verdict.faults_injected.len();
 
 					// Industry standard: Statistical validation
@@ -274,10 +269,7 @@ tb_scenario! {
 						(fault_count as f64 / 100.0) * 100.0
 					);
 				}
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -347,9 +339,8 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(MultiFaultSpec::latest())
 		.with_fdr(build_multi_fault_config())
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = result.verdict().fdr() {
+		.with_hooks(TestHooks::on_pass(|context| {
+				if let Some(verdict) = context.verdict().fdr() {
 					// Academic: Verify fault diversity (multiple injection points triggered)
 					let unique_states: std::collections::HashSet<_> = verdict
 						.faults_injected
@@ -362,10 +353,7 @@ tb_scenario! {
 						unique_states.len()
 					);
 				}
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -446,9 +434,8 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(CoverageSpec::latest())
 		.with_fdr(build_coverage_config())
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = result.verdict().fdr() {
+		.with_hooks(TestHooks::on_pass(|context| {
+				if let Some(verdict) = context.verdict().fdr() {
 					// Industry standard: Calculate fault coverage metrics
 					let total_injection_points = 5; // Configured in fault_model
 					let unique_injection_points: std::collections::HashSet<_> = verdict
@@ -472,10 +459,7 @@ tb_scenario! {
 						coverage_percent
 					);
 				}
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {

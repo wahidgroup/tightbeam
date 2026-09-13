@@ -526,7 +526,7 @@ mod tests {
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	use crate::testing::{create_test_certificate, create_test_signing_key};
+	use crate::testing::{TestCertificate, TestKey};
 	use std::sync::Arc;
 
 	fn servlet(name: &str) -> Urn<'static> {
@@ -536,14 +536,14 @@ mod tests {
 	}
 
 	fn test_certificate() -> Certificate {
-		create_test_certificate(&create_test_signing_key())
+		TestCertificate::self_signed(&TestKey::signing())
 	}
 
 	/// A certificate under a distinct key, so a trust store built from
 	/// [`test_certificate`] does not hold it.
 	fn foreign_certificate() -> Certificate {
 		let key = k256::ecdsa::SigningKey::from_bytes(&[2u8; 32].into()).expect("distinct test key");
-		create_test_certificate(&key)
+		TestCertificate::self_signed(&key)
 	}
 
 	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {

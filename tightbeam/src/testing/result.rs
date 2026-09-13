@@ -157,6 +157,7 @@ pub struct ScenarioResult {
 	assert_spec: Option<BuiltAssertSpec>,
 	assert_specs: Vec<BuiltAssertSpec>,
 	verdict: ScenarioVerdict,
+	expect: Expect,
 }
 
 impl ScenarioResult {
@@ -167,6 +168,7 @@ impl ScenarioResult {
 			assert_spec: None,
 			assert_specs: Vec::new(),
 			verdict: ScenarioVerdict::from_layers(Ok(()), result, None, None),
+			expect: Expect::Pass,
 		}
 	}
 
@@ -190,13 +192,17 @@ impl ScenarioResult {
 		&self.verdict
 	}
 
-	/// Whether every layer accepted the run.
+	/// Whether the run decided what the scenario expected.
 	///
 	/// Derived on each read, so a result cannot report a pass its layers do
 	/// not support.
 	pub fn passed(&self) -> bool {
-		let outcome = self.verdict.outcome(Expect::Pass);
-		outcome.is_ok()
+		self.outcome().is_ok()
+	}
+
+	/// What the run decided, measured against what the scenario expected.
+	pub fn outcome(&self) -> Result<(), Violations> {
+		self.verdict.outcome(self.expect)
 	}
 }
 
@@ -207,14 +213,14 @@ impl Default for ScenarioResult {
 			assert_spec: None,
 			assert_specs: Vec::new(),
 			verdict: ScenarioVerdict::default(),
+			expect: Expect::Pass,
 		}
 	}
 }
 
 impl Display for ScenarioResult {
 	fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-		let outcome = self.verdict.outcome(Expect::Pass);
-		match outcome {
+		match self.outcome() {
 			Ok(()) => write!(f, "Verification passed"),
 			Err(violations) => write!(f, "Verification failed: {violations}"),
 		}

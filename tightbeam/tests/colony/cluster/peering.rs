@@ -197,11 +197,11 @@ struct PeerPairCerts {
 
 fn peer_pair_certs() -> PeerPairCerts {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate_with_uri_sans;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let gateway = cluster_certs();
 	let raw_b = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let cert_b = create_test_certificate_with_uri_sans(&raw_b, &[&test_colony_urn().to_string()]);
+	let cert_b = TestCertificate::with_uri_sans(&raw_b, &[&test_colony_urn().to_string()]);
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let peer_trust = combined_trust(&[&gateway.cert, &cert_b]);
 
@@ -1030,11 +1030,11 @@ struct SplitPlaneCerts {
 
 fn split_plane_certs() -> SplitPlaneCerts {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate_with_uri_sans;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let exporter = cluster_certs();
 	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let receiver_cert = create_test_certificate_with_uri_sans(&raw, &[&test_colony_urn().to_string()]);
+	let receiver_cert = TestCertificate::with_uri_sans(&raw, &[&test_colony_urn().to_string()]);
 	let receiver_key = Secp256k1SigningKey::from(raw);
 	let receiver_trust = combined_trust(&[&receiver_cert]);
 	SplitPlaneCerts { exporter, receiver: (receiver_cert, receiver_key), receiver_trust }

@@ -519,10 +519,10 @@ struct GossipPlaneCtx {
 
 fn gossip_plane_ctx() -> GossipPlaneCtx {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let peer_cert = create_test_certificate(&raw);
+	let peer_cert = TestCertificate::self_signed(&raw);
 	let peer_key = Secp256k1SigningKey::from(raw);
 	let peer_trust: Arc<dyn CertificateTrust> = Arc::new(
 		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
@@ -1350,12 +1350,12 @@ fn foreign_colony_certs() -> ClusterTestCerts {
 
 fn foreign_colony_ctx() -> ForeignColonyCtx {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let gateway = cluster_certs();
 	let foreign = foreign_colony_certs();
 	let raw_stranger = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let stranger_cert = create_test_certificate(&raw_stranger);
+	let stranger_cert = TestCertificate::self_signed(&raw_stranger);
 	let peer_trust = combined_trust(&[&gateway.cert, &foreign.cert, &stranger_cert]);
 
 	ForeignColonyCtx {
@@ -1454,16 +1454,16 @@ struct RelayFanoutCtx {
 
 fn relay_fanout_ctx() -> RelayFanoutCtx {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate_with_uri_sans;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let gateway = cluster_certs();
 	let member_urn = test_colony_urn().to_string();
 	let raw_origin = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let origin_cert = create_test_certificate_with_uri_sans(&raw_origin, &[&member_urn]);
+	let origin_cert = TestCertificate::with_uri_sans(&raw_origin, &[&member_urn]);
 	let raw_relay_a = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let relay_a_cert = create_test_certificate_with_uri_sans(&raw_relay_a, &[&member_urn]);
+	let relay_a_cert = TestCertificate::with_uri_sans(&raw_relay_a, &[&member_urn]);
 	let raw_relay_b = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let relay_b_cert = create_test_certificate_with_uri_sans(&raw_relay_b, &[&member_urn]);
+	let relay_b_cert = TestCertificate::with_uri_sans(&raw_relay_b, &[&member_urn]);
 	let peer_trust = combined_trust(&[&gateway.cert, &origin_cert, &relay_a_cert, &relay_b_cert]);
 
 	RelayFanoutCtx {

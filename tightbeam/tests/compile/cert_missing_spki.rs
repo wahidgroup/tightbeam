@@ -2,7 +2,7 @@ use core::time::Duration;
 use tightbeam::cert;
 
 fn main() {
-	let signing_key = tightbeam::testing::create_test_signing_key();
+	let signing_key = tightbeam::testing::TestKey::signing();
 
 	// Root profile requires an explicit subject_public_key
 	// This should fail to compile with the dedicated diagnostic arm

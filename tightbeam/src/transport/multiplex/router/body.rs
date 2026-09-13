@@ -282,7 +282,7 @@ mod tests {
 	use super::super::testing::{body_fixture, noop_cx, poll_now};
 	use super::*;
 	use crate::der::Encode;
-	use crate::testing::create_v0_tightbeam;
+	use crate::testing::TestFrame;
 
 	#[test]
 	fn test_stream_body_yields_chunks_and_reports_drain() {
@@ -377,7 +377,7 @@ mod tests {
 
 	#[test]
 	fn test_into_frame_decodes_collected_chunks() -> TransportResult<()> {
-		let frame = create_v0_tightbeam(Some("collected"), None);
+		let frame = TestFrame::v0(Some("collected"), None);
 		let payload = frame.to_der()?;
 		let middle = payload.len() / 2;
 

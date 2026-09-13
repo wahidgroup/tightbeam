@@ -6,7 +6,7 @@ use std::thread;
 use tightbeam::instrumentation::events;
 use tightbeam::runtime::rt;
 use tightbeam::server;
-use tightbeam::testing::create_v0_tightbeam;
+use tightbeam::testing::TestFrame;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::sync::{TcpListener, TcpTransport};
 use tightbeam::transport::{MessageEmitter, TransportResult};
@@ -30,7 +30,7 @@ fn sync_server_echoes_over_std_tcp() -> TransportResult<()> {
 	let stream = NetTcpStream::connect(addr)?;
 	let mut client = TcpTransport::from(stream);
 
-	let frame = create_v0_tightbeam(Some("sync-echo"), None);
+	let frame = TestFrame::v0(Some("sync-echo"), None);
 	let echoed = rt::block_on(client.emit(frame.to_owned(), None))?;
 	assert_eq!(echoed, Some(frame), "sync server! loop should echo the frame");
 	Ok(())
@@ -57,7 +57,7 @@ fn sync_server_audits_gate_verdicts() -> TransportResult<()> {
 	let stream = NetTcpStream::connect(addr)?;
 	let mut client = TcpTransport::from(stream);
 
-	let frame = create_v0_tightbeam(Some("sync-audit"), None);
+	let frame = TestFrame::v0(Some("sync-audit"), None);
 	let echoed = rt::block_on(client.emit(frame.to_owned(), None))?;
 	assert_eq!(echoed, Some(frame), "audited sync exchange should still echo");
 

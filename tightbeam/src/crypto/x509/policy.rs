@@ -386,11 +386,11 @@ impl CertificateValidation for ChainValidator {
 mod tests {
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::testing::create_expired_test_certificate;
+	use crate::testing::TestCertificate;
 
 	#[test]
 	fn test_expiry_validator_rejects_expired_cert() {
-		let expired_cert = create_expired_test_certificate();
+		let expired_cert = TestCertificate::expired();
 		let validator = ExpiryValidator;
 
 		// This certificate expired on August 17, 2019, so it should be rejected
@@ -416,10 +416,10 @@ mod tests {
 		use crate::crypto::x509::Certificate;
 		use crate::oids::SIGNER_ECDSA_WITH_SHA256;
 		use crate::spki::EncodePublicKey;
-		use crate::testing::utils::{create_test_certificate, create_test_signing_key};
+		use crate::testing::fixtures::{TestCertificate, TestKey};
 
 		fn test_cert() -> Certificate {
-			create_test_certificate(&create_test_signing_key())
+			TestCertificate::self_signed(&TestKey::signing())
 		}
 
 		/// Run the out-of-the-box policy over `cert`, supplying the issuer key
@@ -440,7 +440,7 @@ mod tests {
 		#[test]
 		fn rejects_non_anchor() -> Result<(), Box<dyn core::error::Error>> {
 			let validator = DirectTrustValidator::default().with_trust_chain(vec![test_cert()]);
-			let other = create_test_certificate(&SigningKey::from_bytes(&[7u8; 32].into())?);
+			let other = TestCertificate::self_signed(&SigningKey::from_bytes(&[7u8; 32].into())?);
 			assert!(matches!(
 				validator.evaluate(&other),
 				Err(CertificateValidationError::CertificateNotTrusted)
@@ -462,8 +462,8 @@ mod tests {
 
 		#[test]
 		fn rejects_algorithm_mismatch() {
-			let key = create_test_signing_key();
-			let mut cert = create_test_certificate(&key);
+			let key = TestKey::signing();
+			let mut cert = TestCertificate::self_signed(&key);
 			// signatureAlgorithm disagrees with tbsCertificate.signature (RFC 5280 §4.1.1.2).
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
 			assert!(matches!(
@@ -474,8 +474,8 @@ mod tests {
 
 		#[test]
 		fn rejects_foreign_algorithm() {
-			let key = create_test_signing_key();
-			let mut cert = create_test_certificate(&key);
+			let key = TestKey::signing();
+			let mut cert = TestCertificate::self_signed(&key);
 			// Consistent identifiers, but an algorithm the out-of-the-box policy refuses.
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
 			cert.tbs_certificate.signature.oid = SIGNER_ECDSA_WITH_SHA256;

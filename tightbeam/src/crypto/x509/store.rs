@@ -715,10 +715,8 @@ mod tests {
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::SigningKey;
 	use crate::crypto::sign::Signatory;
-	use crate::testing::create_test_signing_key;
-	use crate::testing::utils::{
-		ca_extensions, create_test_certificate, create_test_certificate_chain, TestCertificateChain,
-	};
+	use crate::testing::fixtures::{TestCertificate, TestCertificateChain};
+	use crate::testing::TestKey;
 
 	type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -782,27 +780,26 @@ mod tests {
 
 	#[test]
 	fn fingerprint_is_32_bytes() -> TestResult {
-		let cert = create_test_certificate(&create_test_signing_key());
+		let cert = TestCertificate::self_signed(&TestKey::signing());
 		assert_eq!(CertificateTrustStore::to_fingerprint(&cert)?.len(), 32);
 		Ok(())
 	}
 
 	#[test]
 	fn is_trusted_matches_fingerprint() -> TestResult {
-		let cert = create_test_certificate(&create_test_signing_key());
+		let cert = TestCertificate::self_signed(&TestKey::signing());
 		let certificate = cert.to_owned();
 		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 		assert!(store.is_trusted(&cert));
-		assert!(!store.is_trusted(&create_test_certificate(&SigningKey::from_bytes(&[2u8; 32].into())?)));
+		assert!(!store.is_trusted(&TestCertificate::self_signed(&SigningKey::from_bytes(&[2u8; 32].into())?)));
 		Ok(())
 	}
 
 	#[test]
 	fn builder_validates_chain_structure() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let chain = vec![chain.root, chain.intermediate, chain.leaf];
 		assert!(TestBuilder::from(Secp256k1Policy).with_chain(chain).is_ok());
-
 		Ok(())
 	}
 
@@ -822,7 +819,7 @@ mod tests {
 
 	#[test]
 	fn evaluate_chain_walking() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		for (store_certs, eval_target, should_succeed) in EVALUATE_CASES {
 			let store = build_store(&chain, *store_certs)?;
 			let cert = target_cert(&chain, *eval_target);
@@ -842,10 +839,10 @@ mod tests {
 	fn evaluate_rejects_cross_chain_cert() -> TestResult {
 		// Store has one chain's root, evaluate leaf from different chain
 		let store = TestBuilder::from(Secp256k1Policy)
-			.with_certificate(create_test_certificate(&create_test_signing_key()))?
+			.with_certificate(TestCertificate::self_signed(&TestKey::signing()))?
 			.build();
 
-		let other_chain = create_test_certificate_chain()?;
+		let other_chain = TestCertificate::chain()?;
 		assert!(store.evaluate(&other_chain.leaf).is_err());
 		Ok(())
 	}
@@ -856,7 +853,7 @@ mod tests {
 
 	#[test]
 	fn verify_chain_cases() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let cases: &[(StoreCerts, &[&Certificate], bool)] = &[
 			// Empty chain fails
 			(StoreCerts::Root, &[], false),
@@ -899,10 +896,10 @@ mod tests {
 	#[test]
 	fn verify_chain_enforces_issuer_constraints() -> TestResult {
 		for (ca, key_cert_sign, path_len, expected) in ISSUER_CONSTRAINT_CASES {
-			let chain = create_test_certificate_chain()?;
+			let chain = TestCertificate::chain()?;
 
 			let mut root = chain.root.to_owned();
-			root.tbs_certificate.extensions = Some(ca_extensions(*ca, *key_cert_sign, *path_len));
+			root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(*ca, *key_cert_sign, *path_len));
 
 			let certificate = root.to_owned();
 			let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
@@ -915,10 +912,10 @@ mod tests {
 
 	#[test]
 	fn evaluate_enforces_path_len_constraint() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 
 		let mut root = chain.root.to_owned();
-		root.tbs_certificate.extensions = Some(ca_extensions(true, true, Some(0)));
+		root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, Some(0)));
 
 		let store = TestBuilder::from(Secp256k1Policy)
 			.with_certificate(root)?
@@ -947,9 +944,8 @@ mod tests {
 	#[test]
 	fn rejects_unknown_critical_extension() {
 		// nameConstraints (2.5.29.30) is not processed by this validator.
-		let mut cert = create_test_certificate(&create_test_signing_key());
+		let mut cert = TestCertificate::self_signed(&TestKey::signing());
 		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", true)]);
-
 		assert!(matches!(
 			ensure_critical_extensions_processed(&cert),
 			Err(CertificateValidationError::UnprocessedCriticalExtension(_))
@@ -958,17 +954,15 @@ mod tests {
 
 	#[test]
 	fn accepts_unknown_noncritical_extension() {
-		let mut cert = create_test_certificate(&create_test_signing_key());
+		let mut cert = TestCertificate::self_signed(&TestKey::signing());
 		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", false)]);
-
 		assert!(ensure_critical_extensions_processed(&cert).is_ok());
 	}
 
 	#[test]
 	fn accepts_processed_critical_extensions() {
-		let mut cert = create_test_certificate(&create_test_signing_key());
-		cert.tbs_certificate.extensions = Some(ca_extensions(true, true, None));
-
+		let mut cert = TestCertificate::self_signed(&TestKey::signing());
+		cert.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, None));
 		assert!(ensure_critical_extensions_processed(&cert).is_ok());
 	}
 
@@ -976,15 +970,14 @@ mod tests {
 	fn accepts_critical_subject_alt_name() {
 		// subjectAltName (2.5.29.17) is processed for colony membership and
 		// MUST be critical when the subject DN is empty (RFC 5280 §4.1.2.6).
-		let mut cert = create_test_certificate(&create_test_signing_key());
+		let mut cert = TestCertificate::self_signed(&TestKey::signing());
 		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.17", true)]);
-
 		assert!(ensure_critical_extensions_processed(&cert).is_ok());
 	}
 
 	#[test]
 	fn verify_chain_rejects_unknown_critical_extension() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 
 		let mut leaf = chain.leaf.to_owned();
 		leaf.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", true)]);
@@ -1004,8 +997,7 @@ mod tests {
 
 	#[test]
 	fn terminal_with_ca_bit_rejected() -> TestResult {
-		let chain = create_test_certificate_chain()?;
-
+		let chain = TestCertificate::chain()?;
 		// Intermediate carries basicConstraints.cA=true as terminal of [root, intermediate].
 		let path = [&chain.root, &chain.intermediate];
 		assert!(matches!(
@@ -1017,8 +1009,7 @@ mod tests {
 
 	#[test]
 	fn terminal_without_ca_bit_accepted() -> TestResult {
-		let chain = create_test_certificate_chain()?;
-
+		let chain = TestCertificate::chain()?;
 		let path = [&chain.root, &chain.intermediate, &chain.leaf];
 		assert!(ensure_terminal_is_end_entity(&path).is_ok());
 		Ok(())
@@ -1026,8 +1017,7 @@ mod tests {
 
 	#[test]
 	fn single_certificate_path_exempt_from_ca_bit_check() -> TestResult {
-		let chain = create_test_certificate_chain()?;
-
+		let chain = TestCertificate::chain()?;
 		// A pinned CA root validating itself is the direct-trust model.
 		let path = [&chain.root];
 		assert!(ensure_terminal_is_end_entity(&path).is_ok());
@@ -1052,16 +1042,15 @@ mod tests {
 
 	#[test]
 	fn static_revocation_list_passes_unlisted_certificate() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let revocation = StaticRevocationList::default().with_certificate(&chain.intermediate)?;
-
 		assert!(revocation.check(&chain.intermediate, &chain.leaf).is_ok());
 		Ok(())
 	}
 
 	#[test]
 	fn verify_chain_rejects_leaf_revoked_by_fingerprint() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let revocation = StaticRevocationList::default().with_certificate(&chain.leaf)?;
 
 		let store = build_store_with_revocation(&chain, revocation)?;
@@ -1072,7 +1061,7 @@ mod tests {
 
 	#[test]
 	fn verify_chain_rejects_leaf_revoked_by_serial() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let issuer = chain.leaf.tbs_certificate.issuer.to_owned();
 		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
 		let revocation = StaticRevocationList::default().with_serial(&issuer, serial)?;
@@ -1085,7 +1074,7 @@ mod tests {
 
 	#[test]
 	fn serial_revocation_is_scoped_to_issuer() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let other_issuer = chain.leaf.tbs_certificate.subject.to_owned();
 		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
 		let revocation = StaticRevocationList::default().with_serial(&other_issuer, serial)?;
@@ -1098,7 +1087,7 @@ mod tests {
 
 	#[test]
 	fn verify_chain_rejects_revoked_anchor() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let revocation = StaticRevocationList::default().with_certificate(&chain.root)?;
 
 		let store = build_store_with_revocation(&chain, revocation)?;
@@ -1113,7 +1102,7 @@ mod tests {
 
 	#[test]
 	fn rejects_algorithm_identifier_mismatch() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 
 		let mut leaf = chain.leaf.to_owned();
 		leaf.signature_algorithm.oid = crate::oids::SIGNER_ECDSA_WITH_SHA256;
@@ -1137,8 +1126,8 @@ mod tests {
 
 	#[test]
 	fn find_by_signer_info_skid() -> TestResult {
-		let key = create_test_signing_key();
-		let cert = create_test_certificate(&key);
+		let key = TestKey::signing();
+		let cert = TestCertificate::self_signed(&key);
 		let certificate = cert.to_owned();
 		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 
@@ -1159,7 +1148,7 @@ mod tests {
 	#[test]
 	fn find_by_signer_info_not_found() -> TestResult {
 		let store = TestBuilder::from(Secp256k1Policy)
-			.with_certificate(create_test_certificate(&create_test_signing_key()))?
+			.with_certificate(TestCertificate::self_signed(&TestKey::signing()))?
 			.build();
 
 		// Different key
