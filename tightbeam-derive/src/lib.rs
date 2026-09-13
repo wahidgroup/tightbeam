@@ -431,6 +431,18 @@ fn expand_flaggable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream
 		}
 	}
 
+	// `as u8` truncates a discriminant above 255 without a word. `repr(u8)`
+	// makes the compiler reject such a discriminant where it is written, so
+	// the cast below cannot lose a flag.
+	let has_repr_u8 = input
+		.attrs
+		.iter()
+		.any(|attr| attr.path().is_ident("repr") && attr.parse_args::<syn::Ident>().is_ok_and(|repr| repr == "u8"));
+	if !has_repr_u8 {
+		let message = "Flaggable requires #[repr(u8)]: a discriminant above 255 is silently truncated by `as u8`";
+		return Err(syn::Error::new_spanned(input, message));
+	}
+
 	Ok(quote! {
 		impl From<#name> for u8 {
 			fn from(val: #name) -> u8 {

@@ -9,6 +9,17 @@
 use alloc::vec::Vec;
 
 use crate::matrix::{Matrix, MatrixLike};
+use crate::Errorizable;
+
+/// Why a byte slice could not become a [`Flags<N>`].
+#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FlagsError {
+	/// Flags are position-stable, so a slice of the wrong length names
+	/// different flags than the caller meant. Padding or truncating it would
+	/// silently change which flag each byte sets.
+	#[error("flags: expected {expected} bytes, got {len}")]
+	LengthMismatch { expected: usize, len: usize },
+}
 
 /// A fixed-size array of flags, where each flag is a `u8`
 ///
@@ -75,13 +86,22 @@ where
 	}
 }
 
-impl<const N: usize> From<&[u8]> for Flags<N> {
-	fn from(bytes: &[u8]) -> Self {
+impl<const N: usize> TryFrom<&[u8]> for Flags<N> {
+	type Error = FlagsError;
+
+	/// # Errors
+	///
+	/// - [`FlagsError::LengthMismatch`] when the slice is not exactly `N`
+	///   bytes. A shorter slice cannot say which flags it omits and a longer
+	///   one cannot say which to drop.
+	fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
 		const { Self::VALID_N };
-		let mut array = [0; N];
-		let len = bytes.len().min(N);
-		array[..len].copy_from_slice(&bytes[..len]);
-		Self(array)
+
+		let array: [u8; N] = bytes
+			.try_into()
+			.map_err(|_| FlagsError::LengthMismatch { expected: N, len: bytes.len() })?;
+
+		Ok(Self(array))
 	}
 }
 
@@ -187,5 +207,31 @@ impl<const N: usize> TryFrom<&crate::flags::Flags<N>> for crate::matrix::MatrixD
 
 	fn try_from(flags: &crate::flags::Flags<N>) -> Result<Self, Self::Error> {
 		flags_to_matrix_dyn_impl!(flags, N)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Flags are position-stable, so padding a short slice or dropping the tail
+	// of a long one silently changes which flag each byte sets.
+	#[test]
+	fn a_slice_shorter_than_the_set_is_refused() {
+		let refused = Flags::<4>::try_from([1u8, 2].as_slice());
+		assert_eq!(refused, Err(FlagsError::LengthMismatch { expected: 4, len: 2 }));
+	}
+
+	#[test]
+	fn a_slice_longer_than_the_set_is_refused() {
+		let refused = Flags::<2>::try_from([1u8, 2, 3, 4].as_slice());
+		assert_eq!(refused, Err(FlagsError::LengthMismatch { expected: 2, len: 4 }));
+	}
+
+	#[test]
+	fn a_slice_of_exactly_the_set_length_is_accepted() {
+		let accepted = Flags::<3>::try_from([7u8, 8, 9].as_slice()).expect("three bytes name three flags");
+		assert_eq!(accepted.get_at(0), 7);
+		assert_eq!(accepted.get_at(2), 9);
 	}
 }
