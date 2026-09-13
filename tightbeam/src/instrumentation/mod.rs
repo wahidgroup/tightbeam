@@ -200,43 +200,42 @@ pub mod active {
 	impl<'a> crate::der::DecodeValue<'a> for TbEvent {
 		fn decode_value<R: crate::der::Reader<'a>>(
 			reader: &mut R,
-			_header: crate::der::Header,
+			header: crate::der::Header,
 		) -> crate::der::Result<Self> {
-			// `FixedTag` already names the outer SEQUENCE and the caller has
-			// consumed its header, so the fields are read from `reader`
-			// directly. Opening a nested sequence here would demand a second
-			// SEQUENCE that `encode_value` never writes.
-			let seq_val = u32::decode(reader)?;
-			let urn_decoded = Urn::decode(reader)?;
-			let urn: Urn<'static> = urn_decoded.into_owned();
+			// Bounds the body to the declared length, so a nested event cannot
+			// read past its own. `sequence` would also demand a second tag.
+			reader.read_nested(header.length, |reader| {
+				let seq_val = u32::decode(reader)?;
+				let urn_decoded = Urn::decode(reader)?;
+				let urn: Urn<'static> = urn_decoded.into_owned();
 
-			let label = ContextSpecific::<String>::decode_explicit(reader, tb_event_tags::LABEL)?.map(|cs| cs.value);
-			// A present hash of the wrong length is malformed input, not an
-			// absent hash. Dropping it to `None` would report the two as the
-			// same thing to every reader downstream.
-			let payload_hash: Option<[u8; 32]> =
-				match ContextSpecific::<OctetString>::decode_explicit(reader, tb_event_tags::PAYLOAD_HASH)? {
-					None => None,
-					Some(field) => {
-						let hash: [u8; 32] = field
-							.value
-							.as_bytes()
-							.try_into()
-							.map_err(|_| crate::der::ErrorKind::Length { tag: crate::der::Tag::OctetString })?;
+				let label =
+					ContextSpecific::<String>::decode_explicit(reader, tb_event_tags::LABEL)?.map(|cs| cs.value);
+				// A present hash of the wrong length is malformed input
+				let payload_hash: Option<[u8; 32]> =
+					match ContextSpecific::<OctetString>::decode_explicit(reader, tb_event_tags::PAYLOAD_HASH)? {
+						None => None,
+						Some(field) => {
+							let hash: [u8; 32] = field
+								.value
+								.as_bytes()
+								.try_into()
+								.map_err(|_| crate::der::ErrorKind::Length { tag: crate::der::Tag::OctetString })?;
 
-						Some(hash)
-					}
-				};
+							Some(hash)
+						}
+					};
 
-			let duration_ns =
-				ContextSpecific::<u64>::decode_explicit(reader, tb_event_tags::DURATION_NS)?.map(|cs| cs.value);
-			let timestamp_ns =
-				ContextSpecific::<u64>::decode_explicit(reader, tb_event_tags::TIMESTAMP_NS)?.map(|cs| cs.value);
-			let flags = u32::decode(reader)?;
-			let extras = ContextSpecific::<OctetString>::decode_explicit(reader, tb_event_tags::EXTRAS)?
-				.map(|cs| cs.value.as_bytes().to_vec());
+				let duration_ns =
+					ContextSpecific::<u64>::decode_explicit(reader, tb_event_tags::DURATION_NS)?.map(|cs| cs.value);
+				let timestamp_ns =
+					ContextSpecific::<u64>::decode_explicit(reader, tb_event_tags::TIMESTAMP_NS)?.map(|cs| cs.value);
+				let flags = u32::decode(reader)?;
+				let extras = ContextSpecific::<OctetString>::decode_explicit(reader, tb_event_tags::EXTRAS)?
+					.map(|cs| cs.value.as_bytes().to_vec());
 
-			Ok(TbEvent { seq: seq_val, urn, label, payload_hash, duration_ns, timestamp_ns, flags, extras })
+				Ok(TbEvent { seq: seq_val, urn, label, payload_hash, duration_ns, timestamp_ns, flags, extras })
+			})
 		}
 	}
 
@@ -450,9 +449,6 @@ mod tests {
 			.expect("a SEQUENCE re-encodes")
 	}
 
-	// The encoder wrote its fields flat while the decoder opened a nested
-	// SEQUENCE, so no recorded event could be read back. Nothing noticed
-	// because nothing decoded one.
 	#[test]
 	fn an_event_survives_a_der_round_trip() {
 		let event = TbEvent {
@@ -477,8 +473,38 @@ mod tests {
 		assert_eq!(decoded.extras, event.extras);
 	}
 
-	// A truncated hash is the shape a truncating relay produces and the
-	// shape an attacker sends, so the decoder has to tell it from absence.
+	/// The same fields, wrapped in a SEQUENCE header that declares `declared`
+	/// bytes of body rather than the body's real length.
+	fn event_with_declared_length(declared: usize) -> Vec<u8> {
+		let honest = event_with_payload_hash(&[7u8; 32]);
+		let body = &honest[2..];
+		assert!(
+			honest[0] == 0x30 && honest[1] < 128,
+			"the helper above writes a short-form SEQUENCE"
+		);
+
+		let mut der = vec![0x30, declared as u8];
+		der.extend_from_slice(body);
+		der
+	}
+
+	// `decode_value` gets an unbounded reader, so a decoder that ignores
+	// `header.length` reads past its own event when events are nested.
+	#[test]
+	fn a_declared_length_shorter_than_the_body_is_refused() {
+		let honest_len = event_with_payload_hash(&[7u8; 32])[1] as usize;
+		let refused = TbEvent::from_der(&event_with_declared_length(honest_len - 4));
+		assert!(refused.is_err(), "a SEQUENCE length that undercuts its body must not decode");
+	}
+
+	#[test]
+	fn a_declared_length_longer_than_the_body_is_refused() {
+		let honest_len = event_with_payload_hash(&[7u8; 32])[1] as usize;
+		let refused = TbEvent::from_der(&event_with_declared_length(honest_len + 4));
+		assert!(refused.is_err(), "a SEQUENCE length that overruns its body must not decode");
+	}
+
+	// A truncated hash must not read as an absent one.
 	#[test]
 	fn a_payload_hash_of_the_wrong_length_is_refused() {
 		let refused = TbEvent::from_der(&event_with_payload_hash(&[0u8; 16]));
