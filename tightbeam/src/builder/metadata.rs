@@ -203,7 +203,7 @@ impl MetadataBuilder {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::create_test_hash_info;
+	use crate::testing::TestDigest;
 
 	/// Fixture 2x2 zero matrix for builder chains.
 	fn fixture_matrix() -> MatrixDyn {
@@ -261,7 +261,7 @@ mod tests {
 		MetadataBuilder::from(Version::V1)
 			.with_id("test-id-v1")
 			.with_order(1696521600u64)
-			.with_integrity_info(create_test_hash_info())
+			.with_integrity_info(TestDigest::info())
 	);
 
 	test_metadata_builder!(
@@ -270,7 +270,7 @@ mod tests {
 		MetadataBuilder::from(Version::V2)
 			.with_id("test-id-v2")
 			.with_order(1696521600u64)
-			.with_integrity_info(create_test_hash_info())
+			.with_integrity_info(TestDigest::info())
 			.with_priority(MessagePriority::LowLatency)
 			.with_lifetime(3600)
 	);
@@ -281,7 +281,7 @@ mod tests {
 		MetadataBuilder::from(Version::V3)
 			.with_id("test-id-v3")
 			.with_order(1696521600u64)
-			.with_integrity_info(create_test_hash_info())
+			.with_integrity_info(TestDigest::info())
 			.with_priority(MessagePriority::LowLatency)
 			.with_lifetime(3600)
 			.with_matrix(fixture_matrix())
@@ -341,7 +341,7 @@ mod tests {
 						MetadataBuilder::from(Version::V0)
 							.with_id("test-id")
 							.with_order(1696521600)
-							.with_integrity_info(create_test_hash_info())
+							.with_integrity_info(TestDigest::info())
 					},
 					expected_error: MetadataError::UnsupportedField { field: "integrity", version: Version::V0 },
 				},
@@ -371,7 +371,7 @@ mod tests {
 						MetadataBuilder::from(Version::V0)
 							.with_id("test-id")
 							.with_order(1696521600)
-							.previous_frame(create_test_hash_info())
+							.previous_frame(TestDigest::info())
 					},
 					expected_error: MetadataError::UnsupportedField { field: "previous_frame", version: Version::V0 },
 				},

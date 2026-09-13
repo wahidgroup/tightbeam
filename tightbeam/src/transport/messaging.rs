@@ -613,7 +613,7 @@ mod tests {
 	use super::*;
 	use crate::instrumentation::events;
 	use crate::policy::GatePolicy;
-	use crate::testing::create_v0_tightbeam;
+	use crate::testing::TestFrame;
 	use crate::trace::TraceCollector;
 	use crate::TightBeamError;
 
@@ -636,7 +636,7 @@ mod tests {
 	#[test]
 	fn gate_verdict_records_reason_and_time() -> Result<(), TightBeamError> {
 		let audit = AuditProbe(TraceCollector::new());
-		let frame = create_v0_tightbeam(Some("gated"), None);
+		let frame = TestFrame::v0(Some("gated"), None);
 
 		let status = gate_inbound(&DenyGate, &audit, Some(&frame), &SessionContext::default());
 		assert_eq!(status, TransitStatus::PermissionDenied);

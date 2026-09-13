@@ -573,6 +573,60 @@ struct FuzzContextInner {
 	oracle: CspOracle,
 }
 
+impl FuzzContextInner {
+	/// Bytes the cursor has not reached.
+	fn remaining(&self) -> usize {
+		self.input.len().saturating_sub(self.cursor)
+	}
+
+	/// Reads `n` bytes without advancing.
+	///
+	/// # Errors
+	///
+	/// - [`TestingError::FuzzInputExhausted`] when fewer than `n` bytes
+	///   remain. The cursor does not move, so a caller may read a shorter
+	///   run instead.
+	fn peek(&self, n: usize) -> Result<&[u8], TestingError> {
+		if self.remaining() < n {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		Ok(&self.input[self.cursor..self.cursor + n])
+	}
+
+	/// Consumes `n` bytes and advances the cursor past them.
+	///
+	/// This is the one place the cursor moves, so exhaustion is decided once
+	/// rather than at each width a caller happens to ask for.
+	///
+	/// # Errors
+	///
+	/// - [`TestingError::FuzzInputExhausted`] when fewer than `n` bytes
+	///   remain. The cursor does not move.
+	fn take(&mut self, n: usize) -> Result<&[u8], TestingError> {
+		if self.remaining() < n {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		let start = self.cursor;
+		self.cursor += n;
+
+		Ok(&self.input[start..self.cursor])
+	}
+
+	/// Consumes exactly `N` bytes as an array, for the fixed-width readers.
+	///
+	/// # Errors
+	///
+	/// - [`TestingError::FuzzInputExhausted`] when fewer than `N` bytes remain.
+	fn take_array<const N: usize>(&mut self) -> Result<[u8; N], TestingError> {
+		let mut taken = [0u8; N];
+		taken.copy_from_slice(self.take(N)?);
+
+		Ok(taken)
+	}
+}
+
 impl FuzzContext {
 	/// Create new fuzz context with input and CSP process
 	pub fn new(input: Vec<u8>, process: Process) -> Self {
@@ -672,83 +726,36 @@ impl FuzzContext {
 	/// Consume and return a u8 from fuzz input
 	pub fn fuzz_u8(&self) -> Result<u8, TestingError> {
 		let mut guard = self.inner.lock()?;
-		if guard.cursor + 1 > guard.input.len() {
-			return Err(TestingError::FuzzInputExhausted);
-		}
 
-		let value = guard.input[guard.cursor];
-
-		guard.cursor += 1;
-
-		Ok(value)
+		Ok(u8::from_be_bytes(guard.take_array()?))
 	}
 
 	/// Consume and return a u16 from fuzz input (big-endian)
 	pub fn fuzz_u16(&self) -> Result<u16, TestingError> {
 		let mut guard = self.inner.lock()?;
-		if guard.cursor + 2 > guard.input.len() {
-			return Err(TestingError::FuzzInputExhausted);
-		}
 
-		let bytes = [guard.input[guard.cursor], guard.input[guard.cursor + 1]];
-
-		guard.cursor += 2;
-
-		Ok(u16::from_be_bytes(bytes))
+		Ok(u16::from_be_bytes(guard.take_array()?))
 	}
 
 	/// Consume and return a u32 from fuzz input (big-endian)
 	pub fn fuzz_u32(&self) -> Result<u32, TestingError> {
 		let mut guard = self.inner.lock()?;
-		if guard.cursor + 4 > guard.input.len() {
-			return Err(TestingError::FuzzInputExhausted);
-		}
-		let bytes = [
-			guard.input[guard.cursor],
-			guard.input[guard.cursor + 1],
-			guard.input[guard.cursor + 2],
-			guard.input[guard.cursor + 3],
-		];
 
-		guard.cursor += 4;
-
-		Ok(u32::from_be_bytes(bytes))
+		Ok(u32::from_be_bytes(guard.take_array()?))
 	}
 
 	/// Consume and return a u64 from fuzz input (big-endian)
 	pub fn fuzz_u64(&self) -> Result<u64, TestingError> {
 		let mut guard = self.inner.lock()?;
-		if guard.cursor + 8 > guard.input.len() {
-			return Err(TestingError::FuzzInputExhausted);
-		}
-		let bytes = [
-			guard.input[guard.cursor],
-			guard.input[guard.cursor + 1],
-			guard.input[guard.cursor + 2],
-			guard.input[guard.cursor + 3],
-			guard.input[guard.cursor + 4],
-			guard.input[guard.cursor + 5],
-			guard.input[guard.cursor + 6],
-			guard.input[guard.cursor + 7],
-		];
 
-		guard.cursor += 8;
-
-		Ok(u64::from_be_bytes(bytes))
+		Ok(u64::from_be_bytes(guard.take_array()?))
 	}
 
 	/// Consume and return N bytes from fuzz input
 	pub fn fuzz_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
 		let mut guard = self.inner.lock()?;
-		if guard.cursor + n > guard.input.len() {
-			return Err(TestingError::FuzzInputExhausted);
-		}
 
-		let bytes = guard.input[guard.cursor..guard.cursor + n].to_vec();
-
-		guard.cursor += n;
-
-		Ok(bytes)
+		Ok(guard.take(n)?.to_vec())
 	}
 
 	/// Get raw fuzz input bytes
@@ -760,33 +767,29 @@ impl FuzzContext {
 	/// Check if N bytes are available in fuzz input
 	pub fn fuzz_has_bytes(&self, n: usize) -> Result<bool, TestingError> {
 		let guard = self.inner.lock()?;
-		Ok(guard.cursor + n <= guard.input.len())
+
+		Ok(guard.remaining() >= n)
 	}
 
 	/// Get remaining byte count in fuzz input
 	pub fn fuzz_remaining(&self) -> Result<usize, TestingError> {
 		let guard = self.inner.lock()?;
-		Ok(guard.input.len() - guard.cursor)
+
+		Ok(guard.remaining())
 	}
 
 	/// Peek at next u8 from fuzz input without consuming
 	pub fn fuzz_peek_u8(&self) -> Result<u8, TestingError> {
 		let guard = self.inner.lock()?;
-		if guard.cursor + 1 > guard.input.len() {
-			return Err(TestingError::FuzzInputExhausted);
-		}
 
-		Ok(guard.input[guard.cursor])
+		Ok(guard.peek(1)?[0])
 	}
 
 	/// Peek at next N bytes from fuzz input without consuming
 	pub fn fuzz_peek_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
 		let guard = self.inner.lock()?;
-		if guard.cursor + n > guard.input.len() {
-			return Err(TestingError::FuzzInputExhausted);
-		}
 
-		Ok(guard.input[guard.cursor..guard.cursor + n].to_vec())
+		Ok(guard.peek(n)?.to_vec())
 	}
 }
 

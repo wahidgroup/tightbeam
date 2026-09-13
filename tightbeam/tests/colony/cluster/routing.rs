@@ -1,6 +1,6 @@
 //! Work routing through the cluster gateway.
 
-use tightbeam::testing::create_test_hash_info;
+use tightbeam::testing::TestDigest;
 use tightbeam::{cluster, servlet};
 
 use super::common::*;
@@ -179,7 +179,7 @@ async fn record_frame_contract(
 		.compose()
 		.with_id(b"client-signed-work")
 		.with_order(current_timestamp_ms())
-		.with_previous_hash(create_test_hash_info())
+		.with_previous_hash(TestDigest::info())
 		.with_message(PingRequest { value: 21 })
 		.build()?;
 

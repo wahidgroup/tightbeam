@@ -732,7 +732,7 @@ mod tests {
 	use crate::Version;
 
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
-	use crate::testing::utils::{create_test_certificate, create_test_signing_key};
+	use crate::testing::fixtures::{TestCertificate, TestKey};
 
 	/// Holds the phase the trait reads back.
 	struct PhaseProbe {
@@ -953,14 +953,14 @@ mod tests {
 
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	fn fixture_certificate() -> Certificate {
-		create_test_certificate(&create_test_signing_key())
+		TestCertificate::self_signed(&TestKey::signing())
 	}
 
 	/// Client identity over the fixture certificate and the key that signed it.
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	fn fixture_client_identity() -> ClientIdentity<DefaultCryptoProvider> {
-		let signing_key = create_test_signing_key();
-		let certificate = Arc::new(create_test_certificate(&signing_key));
+		let signing_key = TestKey::signing();
+		let certificate = Arc::new(TestCertificate::self_signed(&signing_key));
 		let key = Arc::new(HandshakeKeyManager::from(signing_key));
 		ClientIdentity::new(certificate, key)
 	}

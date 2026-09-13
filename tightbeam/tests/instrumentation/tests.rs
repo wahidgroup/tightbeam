@@ -4,7 +4,7 @@
 
 #![cfg(all(feature = "instrument", feature = "tokio", feature = "tcp", feature = "testing"))]
 
-use tightbeam::testing::{create_test_message, ClientEnv, ScenarioConfig, SetupEnv};
+use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestMessage};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{MessageEmitter, Protocol};
@@ -139,7 +139,7 @@ tb_scenario! {
 			let stream = <TokioListener as Protocol>::connect(addr).await?;
 			let mut client = <TokioListener as Protocol>::create_transport(stream);
 
-			let test_message = create_test_message(None);
+			let test_message = TestMessage::sample(None);
 			let test_frame = compose! {
 				V0: id: "test", order: 1u64, message: test_message
 			}?;

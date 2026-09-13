@@ -217,7 +217,7 @@ where
 mod tests {
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::testing::create_expired_test_certificate;
+	use crate::testing::TestCertificate;
 
 	#[test]
 	fn test_pem_macro() {
@@ -273,7 +273,7 @@ mod tests {
 
 	#[test]
 	fn test_expiry_validator_rejects_expired_cert() {
-		let expired_cert = create_expired_test_certificate();
+		let expired_cert = TestCertificate::expired();
 		let validator = ExpiryValidator;
 
 		// This certificate expired on August 17, 2019, so it should be rejected
@@ -293,7 +293,7 @@ mod tests {
 	#[test]
 	fn signer_identifier_rejects_short_digest() {
 		use crate::crypto::x509::utils::compute_signer_identifier_from_der;
-		use crate::testing::utils::SixteenByteDigest;
+		use crate::testing::fixtures::SixteenByteDigest;
 
 		let result = compute_signer_identifier_from_der::<SixteenByteDigest>(b"any-public-key-der");
 		assert!(matches!(result, Err(CertificateValidationError::DigestTooShort)));
@@ -303,11 +303,11 @@ mod tests {
 	mod certificate_extension {
 		use crate::crypto::x509::ext::pkix::BasicConstraints;
 		use crate::crypto::x509::utils::CertificateExt;
-		use crate::testing::utils::create_test_certificate_chain;
+		use crate::testing::fixtures::TestCertificate;
 
 		#[test]
 		fn reads_basic_constraints() -> Result<(), Box<dyn core::error::Error>> {
-			let chain = create_test_certificate_chain()?;
+			let chain = TestCertificate::chain()?;
 			let basic_constraints = &chain
 				.root
 				.extension::<BasicConstraints>()?
@@ -318,7 +318,7 @@ mod tests {
 
 		#[test]
 		fn absent_returns_none() -> Result<(), Box<dyn core::error::Error>> {
-			let chain = create_test_certificate_chain()?;
+			let chain = TestCertificate::chain()?;
 			assert!(&chain.leaf.extension::<BasicConstraints>()?.is_none());
 			Ok(())
 		}

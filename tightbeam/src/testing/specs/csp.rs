@@ -197,6 +197,13 @@ pub struct Process {
 	/// What this process is evidence of, set where it is built
 	pub observation: Observation,
 
+	/// Whether a run that records no event in this alphabet is a violation.
+	///
+	/// A trace that takes no transition satisfies every process, so the
+	/// check would hold whatever the run did. Processes require progress
+	/// unless a scenario states that doing nothing is the behavior it models.
+	pub requires_progress: bool,
+
 	/// Initial state
 	pub initial: State,
 
@@ -484,6 +491,10 @@ impl Process {
 			current_states = next_states;
 		}
 
+		if self.requires_progress && events.is_empty() {
+			violations.push(CspViolation::NoProgress { initial: self.initial });
+		}
+
 		CspValidationResult { valid: violations.is_empty(), violations }
 	}
 
@@ -555,6 +566,7 @@ pub struct ProcessBuilder {
 	hidden: HashSet<Event>,
 	transitions: TransitionRelation,
 	description: Option<&'static str>,
+	requires_progress: bool,
 	#[cfg(feature = "testing-timing")]
 	timing_constraints: Option<TimingConstraints>,
 	#[cfg(feature = "testing-timing")]
@@ -575,6 +587,7 @@ impl ProcessBuilder {
 			hidden: HashSet::new(),
 			transitions: TransitionRelation::new(),
 			description: None,
+			requires_progress: true,
 			#[cfg(feature = "testing-timing")]
 			timing_constraints: None,
 			#[cfg(feature = "testing-timing")]
@@ -582,6 +595,16 @@ impl ProcessBuilder {
 			#[cfg(feature = "testing-schedulability")]
 			schedulability_periods: None,
 		}
+	}
+
+	/// Accepts a run that records no event in this process's alphabet.
+	///
+	/// Only for a process whose modelled behavior is to do nothing. Every
+	/// other process rejects such a run, because a trace that takes no
+	/// transition satisfies every process.
+	pub fn permits_no_progress(mut self) -> Self {
+		self.requires_progress = false;
+		self
 	}
 
 	pub fn initial_state(mut self, state: State) -> Self {
@@ -686,6 +709,7 @@ impl ProcessBuilder {
 		Ok(Process {
 			name: self.name,
 			observation: Observation::Model,
+			requires_progress: self.requires_progress,
 			initial,
 			states: self.states,
 			terminal: self.terminal,
@@ -711,7 +735,7 @@ mod tests {
 
 	use super::*;
 	use crate::testing::assertions::Assertion;
-	use crate::testing::create_test_message;
+	use crate::testing::TestMessage;
 	use crate::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestHooks};
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
@@ -1353,16 +1377,11 @@ mod tests {
 		config: ScenarioConfig::builder()
 			.with_spec(ClientServerFlowSpec::latest())
 			.with_csp(ClientServerFlowProc)
-			.with_hooks(TestHooks {
-				on_pass: Some(std::sync::Arc::new(|_result| {
-					// Hook called - assertions already validated by spec
+			.with_hooks(TestHooks::on_pass(|_context| {
 					HOOK_CALLED.store(true, Ordering::SeqCst);
-					Ok(())
-				})),
-				on_fail: Some(std::sync::Arc::new(|_result, violations| {
+				}).with_on_fail(|_context, violations| {
 					panic!("Test should not fail! Violations: {violations}")
-				})),
-			})
+				}))
 			.build(),
 		environment ServiceClient {
 			worker_threads: 2,
@@ -1390,7 +1409,7 @@ mod tests {
 				// Client-side assertion before sending
 				trace.event(RESPONDED)?;
 
-				let test_message = create_test_message(None);
+				let test_message = TestMessage::sample(None);
 				let test_frame = compose! {
 					V0: id: "test", order: 1u64, message: test_message
 				}?;
@@ -1408,7 +1427,7 @@ mod tests {
 	// Define servlet at module scope for testing
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	servlet! {
-		pub TestServletForScenario<crate::testing::utils::TestMessage, EnvConfig = ()>,
+		pub TestServletForScenario<crate::testing::fixtures::TestMessage, EnvConfig = ()>,
 		protocol: TokioListener,
 		handle: |_msg, frame, ctx| async move {
 			let trace = ctx.trace();
@@ -1445,7 +1464,7 @@ mod tests {
 				// Client-side assertion before sending
 				trace.event(RESPONDED)?;
 
-				let test_message = create_test_message(None);
+				let test_message = TestMessage::sample(None);
 				let test_frame = compose! {
 					V0: id: "test", order: 1u64, message: test_message
 				}?;

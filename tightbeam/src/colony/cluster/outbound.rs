@@ -186,7 +186,7 @@ mod tests {
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	use crate::testing::{create_test_certificate, create_test_signing_key};
+	use crate::testing::{TestCertificate, TestKey};
 
 	struct RejectAll;
 
@@ -206,14 +206,14 @@ mod tests {
 
 	#[test]
 	fn empty_validator_chain_returns_store_unchanged() {
-		let store = trust_of(&create_test_certificate(&create_test_signing_key()));
+		let store = trust_of(&TestCertificate::self_signed(&TestKey::signing()));
 		let composed = validated_trust(Arc::clone(&store), &[]);
 		assert!(Arc::ptr_eq(&store, &composed));
 	}
 
 	#[test]
 	fn operator_validator_rejects_store_trusted_certificate() {
-		let cert = create_test_certificate(&create_test_signing_key());
+		let cert = TestCertificate::self_signed(&TestKey::signing());
 		let composed = validated_trust(trust_of(&cert), &[Arc::new(RejectAll)]);
 		assert!(composed.is_trusted(&cert));
 		assert!(composed.evaluate(&cert).is_err());
@@ -221,7 +221,7 @@ mod tests {
 
 	#[test]
 	fn operator_validator_rejects_store_verified_chain() {
-		let cert = create_test_certificate(&create_test_signing_key());
+		let cert = TestCertificate::self_signed(&TestKey::signing());
 		let store = trust_of(&cert);
 		let chain = [cert];
 		assert!(store.verify_chain(&chain).is_ok());

@@ -19,12 +19,12 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod fdr;
+pub mod fixtures;
 pub mod macros;
 pub mod result;
 pub mod schedulability;
 pub mod specs;
 pub mod teardown;
-pub mod utils;
 
 #[cfg(feature = "testing-fault")]
 pub mod fault;
@@ -38,12 +38,15 @@ pub mod routes;
 pub mod timing;
 
 // Re-exports
-pub use config::{Expect, HookContext, ScenarioConfig, ScenarioConfigBuilder, ScenarioConfigError, TestHooks};
+pub use config::{
+	AcceptedObserver, Expect, HookContext, RejectedObserver, ScenarioConfig, ScenarioConfigBuilder,
+	ScenarioConfigError, TestHooks,
+};
 pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
+pub use fixtures::*;
 pub use result::{ScenarioResult, ScenarioVerdict};
-pub use specs::{verify_trace, Layer, SpecViolation, TBSpec, Violations};
+pub use specs::{Layer, SpecViolation, TBSpec, Violations};
 pub use teardown::Teardown;
-pub use utils::*;
 
 #[cfg(feature = "testing-fault")]
 pub use fault::{ProcessEvent, ProcessState};

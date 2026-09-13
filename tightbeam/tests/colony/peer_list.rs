@@ -20,7 +20,7 @@ use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{create_v0_tightbeam, ClientEnv, SetupEnv};
+use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::policy::CollectorGateConfig;
@@ -129,7 +129,7 @@ fn doorman_pool(
 
 /// One knock on the door: emit a frame and report whether it echoed.
 async fn knock(lease: &mut PooledClient<TokioListener>) -> Result<bool, TightBeamError> {
-	let frame = create_v0_tightbeam(Some("door-knock"), None);
+	let frame = TestFrame::v0(Some("door-knock"), None);
 	let reply = lease.emit(frame.to_owned(), None).await?;
 	Ok(reply == Some(frame))
 }
@@ -163,7 +163,7 @@ tb_scenario! {
 			let pool = doorman_pool(&ctx, &trace)?;
 			let mut lease = pool.connect(addr).await?;
 
-			let outcome = lease.emit(create_v0_tightbeam(Some("door-knock"), None), None).await;
+			let outcome = lease.emit(TestFrame::v0(Some("door-knock"), None), None).await;
 			trace.event_with(
 				DENY_LIST_BARS_THE_DOOR,
 				&[],

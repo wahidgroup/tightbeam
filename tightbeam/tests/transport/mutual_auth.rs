@@ -267,13 +267,13 @@ tb_scenario! {
 		},
 		setup: |env| async move {
 			use tightbeam::crypto::key::Secp256k1KeyProvider;
-			use tightbeam::testing::utils::{create_test_signing_key, create_test_certificate};
+			use tightbeam::testing::fixtures::{TestKey, TestCertificate};
 
 			// Client identity outside the server's pin set: certificate
 			// and signing provider share one fresh key, so the rejection
 			// is the pin check and not a key/certificate mismatch.
-			let invalid_key = create_test_signing_key();
-			let invalid_cert = create_test_certificate(&invalid_key);
+			let invalid_key = TestKey::signing();
+			let invalid_cert = TestCertificate::self_signed(&invalid_key);
 
 			let certificate = CertificateSpec::Built(Box::new(invalid_cert));
 			let provider = Arc::new(Secp256k1KeyProvider::from(invalid_key));
@@ -316,14 +316,14 @@ tb_scenario! {
 		start: |env| async move {
 			let trace = Arc::new(env.trace);
 			use tightbeam::crypto::key::Secp256k1KeyProvider;
-			use tightbeam::testing::utils::{create_test_signing_key, create_test_certificate};
+			use tightbeam::testing::fixtures::{TestKey, TestCertificate};
 
 			// Server presents a certificate outside the client's trust
 			// store: certificate and signing provider share one fresh
 			// key, so the rejection is the trust check and not a
 			// key/certificate mismatch.
-			let invalid_server_key = create_test_signing_key();
-			let invalid_server_cert = create_test_certificate(&invalid_server_key);
+			let invalid_server_key = TestKey::signing();
+			let invalid_server_cert = TestCertificate::self_signed(&invalid_server_key);
 
 			let certificate = CertificateSpec::Built(Box::new(invalid_server_cert));
 			let provider = Arc::new(Secp256k1KeyProvider::from(invalid_server_key));

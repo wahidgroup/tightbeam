@@ -15,7 +15,7 @@ use tightbeam::exactly;
 use tightbeam::policy::TransitStatus;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{create_v0_tightbeam, SetupEnv};
+use tightbeam::testing::{SetupEnv, TestFrame};
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
 	EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError, TransportFailure,
@@ -37,7 +37,7 @@ pub(crate) const STATUS_OK: Urn<'static> = Urn::new("test", "event:split/status-
 pub(crate) const THRESHOLD_REACHES_ZERO: Urn<'static> = Urn::new("test", "event:split/threshold-reaches-zero");
 
 fn request_frame() -> Frame {
-	create_v0_tightbeam(None, None)
+	TestFrame::v0(None, None)
 }
 
 fn request_envelope() -> TransportEnvelope {
@@ -95,11 +95,7 @@ tb_scenario! {
 
 			await_ok(server_handle, "server task must not panic").await?;
 
-			trace.event_with(
-				STATUS_OK,
-				&[],
-				package.status() == TransitStatus::Ok,
-			)?;
+			trace.event_with( STATUS_OK, &[], package.status() == TransitStatus::Ok)?;
 			trace.event_with(FRAME_ECHOED, &[], echoed == sent)?;
 			Ok(())
 		}
@@ -128,11 +124,7 @@ tb_scenario! {
 			let transport: TcpTransport<TokioStream> = TcpTransport::from(tokio_stream);
 
 			let into_split = transport.into_split();
-			trace.event_with(
-				INTO_SPLIT_REPORTS_INVALID_STATE,
-				&[],
-				matches!(into_split, Err(TransportError::InvalidState)),
-			)?;
+			trace.event_with( INTO_SPLIT_REPORTS_INVALID_STATE, &[], matches!(into_split, Err(TransportError::InvalidState)))?;
 			Ok(())
 		}
 	}
@@ -176,14 +168,9 @@ tb_scenario! {
 
 			// Limit spent; second write must fail before bytes leave.
 			let limited = writer.write_envelope(request_envelope()).await;
-
 			await_ok(server_handle, "server task must not panic").await?;
 
-			trace.event_with(
-				SECOND_WRITE_DEMANDS_REKEY,
-				&[],
-				matches!(limited, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired))),
-			)?;
+			trace.event_with( SECOND_WRITE_DEMANDS_REKEY, &[], matches!(limited, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired))))?;
 			Ok(())
 		}
 	}
@@ -209,7 +196,6 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
 			let (listener, addr) = bind_encrypted_listener(&materials).await?;
-
 			let server_handle = tokio::spawn(async move {
 				let (_reader, mut writer) = accept_handshaken_split(listener).await?;
 
@@ -223,27 +209,14 @@ tb_scenario! {
 			let mut reader = reader.with_rekey_limit(1);
 
 			let within_limit = reader.read_envelope().await?;
-			trace.event_with(
-				FIRST_RECORD_ARRIVES,
-				&[],
-				matches!(within_limit, TransportEnvelope::Request(_)),
-			)?;
-			trace.event_with(
-				THRESHOLD_REACHES_ZERO,
-				&[],
-				reader.remaining_records() == 0,
-			)?;
+			trace.event_with( FIRST_RECORD_ARRIVES, &[], matches!(within_limit, TransportEnvelope::Request(_)))?;
+			trace.event_with( THRESHOLD_REACHES_ZERO, &[], reader.remaining_records() == 0)?;
 
 			// Counter past threshold: reader still decrypts.
 			let past_threshold = reader.read_envelope().await;
-
 			await_ok(server_handle, "server task must not panic").await?;
 
-			trace.event_with(
-				SECOND_RECORD_STILL_ARRIVES,
-				&[],
-				matches!(past_threshold, Ok(TransportEnvelope::Request(_))),
-			)?;
+			trace.event_with( SECOND_RECORD_STILL_ARRIVES, &[], matches!(past_threshold, Ok(TransportEnvelope::Request(_))))?;
 			Ok(())
 		}
 	}

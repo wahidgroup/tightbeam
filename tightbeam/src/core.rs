@@ -553,8 +553,7 @@ mod tests {
 		vec::Vec,
 	};
 
-	use crate::testing::create_test_cipher_key;
-	use crate::testing::{create_test_message, create_test_signing_key};
+	use crate::testing::{TestKey, TestMessage};
 	use crate::Beamable;
 	use crate::MessagePriority;
 
@@ -691,7 +690,7 @@ mod tests {
 
 	test_tightbeam_roundtrip! {
 		tightbeam_v0_minimal: {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			compose! {
 				V0:
 					id: "test-001",
@@ -700,7 +699,7 @@ mod tests {
 			}?
 		},
 		tightbeam_v0_large_value: {
-			let message = create_test_message(Some(&("A".repeat(1000))));
+			let message = TestMessage::sample(Some(&("A".repeat(1000))));
 			compose! {
 				V0:
 					id: "test-002",
@@ -712,9 +711,9 @@ mod tests {
 			use crate::crypto::aead::Aes256GcmOid;
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			let message = create_test_message(None);
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
+			let message = TestMessage::sample(None);
+			let (_, cipher) = TestKey::cipher();
+			let signing_key = TestKey::signing();
 
 			compose! {
 				V1: id: "test-003",
@@ -729,9 +728,9 @@ mod tests {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
-			let message = create_test_message(None);
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
+			let message = TestMessage::sample(None);
+			let (_, cipher) = TestKey::cipher();
+			let signing_key = TestKey::signing();
 
 			compose! {
 				V2: id: "test-004",
@@ -763,7 +762,7 @@ mod tests {
 
 	test_tightbeam_conversions! {
 		tightbeam_to_metadata_v0: {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			compose! {
 				V0:
 					id: "meta-001",
@@ -776,9 +775,9 @@ mod tests {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
-			let message = create_test_message(None);
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
+			let message = TestMessage::sample(None);
+			let (_, cipher) = TestKey::cipher();
+			let signing_key = TestKey::signing();
 
 			compose! {
 				V2:
@@ -828,9 +827,9 @@ mod tests {
 			use crate::crypto::aead::Aes256GcmOid;
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			let message = create_test_message(None);
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
+			let message = TestMessage::sample(None);
+			let (_, cipher) = TestKey::cipher();
+			let signing_key = TestKey::signing();
 
 			compose! {
 				V1: id: "sig-001",
@@ -845,9 +844,9 @@ mod tests {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
-			let message = create_test_message(None);
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
+			let message = TestMessage::sample(None);
+			let (_, cipher) = TestKey::cipher();
+			let signing_key = TestKey::signing();
 
 			compose! {
 				V2:
@@ -866,7 +865,7 @@ mod tests {
 	test_tightbeam_try_conversions! {
 		failure: // These conversions should fail due to missing fields.
 		tightbeam_v0_to_signature_info_fails: {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			compose! {
 				V0:
 					id: "fail-001",
@@ -875,7 +874,7 @@ mod tests {
 			}?
 		} => SignerInfo,
 		tightbeam_v0_to_encryption_info_fails: {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			compose! {
 				V0:
 					id: "fail-002",
@@ -934,13 +933,13 @@ mod tests {
 	#[cfg(all(feature = "signature", feature = "builder", feature = "sha3"))]
 	mod tbs_encoding {
 		use super::*;
-		use crate::testing::create_frame_with_frame_integrity;
+		use crate::testing::TestFrame;
 
 		/// Signature validity depends on `to_tbs` staying bit-identical to the
 		/// derived DER encoding of a frame with `nonrepudiation` stripped.
 		#[test]
 		fn tbs_matches_derived_encoding_with_integrity() -> Result<()> {
-			let frame = create_frame_with_frame_integrity();
+			let frame = TestFrame::with_integrity();
 
 			let mut unsigned = frame.clone();
 			unsigned.nonrepudiation = None;
@@ -952,7 +951,7 @@ mod tests {
 
 		#[test]
 		fn tbs_matches_derived_encoding_without_integrity() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let frame = compose! { V0: id: "tbs-basic", order: 1u64, message: message }?;
 
 			let mut unsigned = frame.clone();
@@ -972,7 +971,7 @@ mod tests {
 
 		#[test]
 		fn verify_commitment_of_recomputes_over_message() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let (commitment, _) = Opening::prove::<Sha3_256, _>(&message, [])?;
 
 			let mut frame = compose! { V1: id: "commit-1", order: 1u64, message: message.clone() }?;
@@ -985,26 +984,22 @@ mod tests {
 
 		#[test]
 		fn verify_commitment_of_rejects_other_message() -> Result<()> {
-			let committed = create_test_message(None);
+			let committed = TestMessage::sample(None);
 			let (commitment, _) = Opening::prove::<Sha3_256, _>(&committed, [])?;
 
 			let mut frame = compose! { V1: id: "commit-2", order: 2u64, message: committed }?;
 			frame.metadata.integrity = Some(commitment);
 
-			let other = create_test_message(Some("a different body"));
-
+			let other = TestMessage::sample(Some("a different body"));
 			assert!(!frame.verify_commitment_of::<Sha3_256, _>(&other, [])?);
-
 			Ok(())
 		}
 
 		#[test]
 		fn verify_commitment_of_is_false_without_commitment() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let frame = compose! { V1: id: "commit-3", order: 3u64, message: message.clone() }?;
-
 			assert!(!frame.verify_commitment_of::<Sha3_256, _>(&message, [])?);
-
 			Ok(())
 		}
 	}
@@ -1013,30 +1008,30 @@ mod tests {
 	mod frame_integrity {
 		use super::*;
 		use crate::crypto::hash::{Sha3_256, Sha3_512};
-		use crate::testing::create_frame_with_frame_integrity;
+		use crate::testing::TestFrame;
 
 		#[test]
 		fn verifies_intact_envelope() {
-			let frame = create_frame_with_frame_integrity();
+			let frame = TestFrame::with_integrity();
 			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(true)));
 		}
 
 		#[test]
 		fn rejects_tampered_envelope() {
-			let mut frame = create_frame_with_frame_integrity();
+			let mut frame = TestFrame::with_integrity();
 			frame.metadata.id = b"tampered".to_vec();
 			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(false)));
 		}
 
 		#[test]
 		fn rejects_algorithm_mismatch() {
-			let frame = create_frame_with_frame_integrity();
+			let frame = TestFrame::with_integrity();
 			assert!(matches!(frame.verify_frame_integrity::<Sha3_512>(), Ok(false)));
 		}
 
 		#[test]
 		fn absent_integrity_is_false() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let frame = compose! { V0: id: "no-fi", order: 1u64, message: message }?;
 			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(false)));
 			Ok(())
@@ -1044,7 +1039,7 @@ mod tests {
 
 		#[test]
 		fn verdict_reports_verified() {
-			let frame = create_frame_with_frame_integrity();
+			let frame = TestFrame::with_integrity();
 			assert!(matches!(
 				frame.frame_integrity_verdict::<Sha3_256>(),
 				Ok(IntegrityVerdict::Verified)
@@ -1053,7 +1048,7 @@ mod tests {
 
 		#[test]
 		fn verdict_reports_mismatch_on_tamper() {
-			let mut frame = create_frame_with_frame_integrity();
+			let mut frame = TestFrame::with_integrity();
 			frame.metadata.id = b"tampered".to_vec();
 			assert!(matches!(
 				frame.frame_integrity_verdict::<Sha3_256>(),
@@ -1063,7 +1058,7 @@ mod tests {
 
 		#[test]
 		fn verdict_reports_algorithm_mismatch() {
-			let frame = create_frame_with_frame_integrity();
+			let frame = TestFrame::with_integrity();
 			assert!(matches!(
 				frame.frame_integrity_verdict::<Sha3_512>(),
 				Ok(IntegrityVerdict::AlgorithmMismatch)
@@ -1072,7 +1067,7 @@ mod tests {
 
 		#[test]
 		fn verdict_reports_absent() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let frame = compose! { V0: id: "no-fi-verdict", order: 1u64, message: message }?;
 			assert!(matches!(
 				frame.frame_integrity_verdict::<Sha3_256>(),
@@ -1091,8 +1086,8 @@ mod tests {
 		use crate::testing::TestMessage;
 
 		fn encrypted_frame() -> Result<Frame> {
-			let message = create_test_message(Some("in-place"));
-			let (_, cipher) = create_test_cipher_key();
+			let message = TestMessage::sample(Some("in-place"));
+			let (_, cipher) = TestKey::cipher();
 			compose! {
 				V1: id: "dip-001",
 					order: 1u64,
@@ -1103,7 +1098,7 @@ mod tests {
 
 		#[test]
 		fn yields_cleartext_frame_with_decodable_body() -> Result<()> {
-			let (_, cipher) = create_test_cipher_key();
+			let (_, cipher) = TestKey::cipher();
 			let mut frame = encrypted_frame()?;
 
 			frame.decrypt_in_place(&cipher, None)?;
@@ -1111,7 +1106,7 @@ mod tests {
 			assert!(frame.metadata.confidentiality.is_none());
 
 			let decoded: TestMessage = crate::decode(&frame.message)?;
-			assert_eq!(decoded, create_test_message(Some("in-place")));
+			assert_eq!(decoded, TestMessage::sample(Some("in-place")));
 			Ok(())
 		}
 
@@ -1132,8 +1127,8 @@ mod tests {
 
 		#[test]
 		fn cleartext_frame_rejected() -> Result<()> {
-			let message = create_test_message(None);
-			let (_, cipher) = create_test_cipher_key();
+			let message = TestMessage::sample(None);
+			let (_, cipher) = TestKey::cipher();
 			let mut frame = compose! { V0: id: "dip-002", order: 1u64, message: message }?;
 
 			let result = frame.decrypt_in_place(&cipher, None);
@@ -1149,7 +1144,7 @@ mod tests {
 			use crate::oids::{COMPRESSION_ZSTD, DATA};
 			use crate::spki::AlgorithmIdentifier;
 
-			let (_, cipher) = create_test_cipher_key();
+			let (_, cipher) = TestKey::cipher();
 			let mut frame = encrypted_frame()?;
 			frame.metadata.compactness = Some(CompressedData {
 				version: CmsVersion::V0,
@@ -1214,7 +1209,7 @@ mod tests {
 
 		#[test]
 		fn uncompressed_frame_untouched() -> Result<()> {
-			let message = create_test_message(None);
+			let message = TestMessage::sample(None);
 			let mut frame = compose! { V0: id: "inf-002", order: 1u64, message: message }?;
 			let original = frame.clone();
 

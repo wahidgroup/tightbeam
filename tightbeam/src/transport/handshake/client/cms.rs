@@ -1106,7 +1106,7 @@ mod tests {
 	use crate::oids::{HANDSHAKE_SECURITY_ACCEPT, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 	use crate::random::OsRng;
 	use crate::spki::AlgorithmIdentifierOwned;
-	use crate::testing::utils::create_test_certificate_chain;
+	use crate::testing::fixtures::TestCertificate;
 	use crate::transport::handshake::attributes::HandshakeAttribute;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	use crate::transport::handshake::error::HandshakeError;
@@ -1218,7 +1218,7 @@ mod tests {
 	/// its leaf. No separate pinned certificate is needed.
 	#[test]
 	fn from_chain_validates_and_targets_leaf() -> Result<(), Box<dyn Error>> {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let mut client = chain_client(chain.to_arc(), Some(chain.root.to_owned()))?;
 		client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None)?;
 
@@ -1229,7 +1229,7 @@ mod tests {
 
 	#[test]
 	fn from_chain_rejects_untrusted_chain() -> Result<(), Box<dyn Error>> {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let mut client = chain_client(chain.to_arc(), None)?;
 		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
 		assert!(matches!(result, Err(HandshakeError::CertificateValidationError(_))));
@@ -1241,7 +1241,7 @@ mod tests {
 	/// identity violation.
 	#[test]
 	fn pinned_certificate_mismatch_rejected() -> Result<(), Box<dyn Error>> {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let pinned = Arc::new(create_test_certificate().certificate);
 		let mut client =
 			CmsHandshakeClient::<DefaultCryptoProvider>::new(DefaultCryptoProvider::default(), client_key(), pinned)
@@ -1255,7 +1255,7 @@ mod tests {
 
 	#[test]
 	fn from_chain_rejects_empty_chain() -> Result<(), Box<dyn Error>> {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::chain()?;
 		let mut client = chain_client(Arc::from(Vec::new()), Some(chain.root))?;
 		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
 		assert!(matches!(result, Err(HandshakeError::MissingServerCertificate)));

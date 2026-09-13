@@ -84,3 +84,7 @@ mod config;
 // Teardown on the panic path
 #[cfg(feature = "testing")]
 mod teardown;
+
+// Properties over the wire types
+#[cfg(feature = "testing-property")]
+mod property;

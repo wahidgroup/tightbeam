@@ -14,7 +14,7 @@ use crate::error::TightBeamError;
 use crate::testing::fdr::FdrVerdict;
 use crate::testing::macros::{BuiltAssertSpec, TraceCollector};
 use crate::testing::result::ScenarioVerdict;
-use crate::testing::specs::{verify_trace, CspValidationResult, Layer, SpecViolation, TBSpec, Violations};
+use crate::testing::specs::{CspValidationResult, Layer, SpecViolation, TBSpec, Violations};
 use crate::trace::ConsumedTrace;
 use crate::transport::error::TransportError;
 
@@ -140,7 +140,7 @@ impl ScenarioConfig {
 	pub fn verify(&self, trace: &ConsumedTrace, execution: Result<(), TightBeamError>) -> ScenarioVerdict {
 		let mut layer1: Result<(), SpecViolation> = Ok(());
 		for spec in self.specs() {
-			let verified = verify_trace(*spec, trace);
+			let verified = spec.verify(trace);
 			if let Err(violation) = verified {
 				layer1 = Err(violation);
 				break;
@@ -345,6 +345,7 @@ pub struct HookContext {
 	assert_spec: Option<&'static BuiltAssertSpec>,
 	trace: ConsumedTrace,
 	verdict: ScenarioVerdict,
+	outcome: Result<(), Violations>,
 
 	#[cfg(feature = "testing-csp")]
 	process: Option<Arc<dyn ProcessSpec + Send + Sync>>,
@@ -365,11 +366,13 @@ impl HookContext {
 		}
 
 		let verdict = config.verify(&consumed_trace, execution);
+		let outcome = verdict.outcome(config.expect());
 
 		Self {
 			assert_spec: config.specs().first().copied(),
 			trace: consumed_trace,
 			verdict,
+			outcome,
 			#[cfg(feature = "testing-csp")]
 			process: config.csp().map(Arc::clone),
 			#[cfg(feature = "testing-timing")]
@@ -392,6 +395,15 @@ impl HookContext {
 		&self.verdict
 	}
 
+	/// What the scenario decided, folded across every layer and measured
+	/// against what the scenario expected.
+	///
+	/// Computed once in [`HookContext::build`], so the observer and the
+	/// harness read the same answer rather than each folding the verdict.
+	pub fn outcome(&self) -> Result<(), &Violations> {
+		self.outcome.as_ref().map(|&()| ())
+	}
+
 	/// The CSP process the scenario was validated against.
 	#[cfg(feature = "testing-csp")]
 	pub fn process(&self) -> Option<&Arc<dyn ProcessSpec + Send + Sync>> {
@@ -405,12 +417,59 @@ impl HookContext {
 	}
 }
 
-/// Test lifecycle hooks (receive full scenario context)
+/// Reads a scenario every layer accepted. An observer reports, so it decides
+/// nothing and returns nothing.
+pub type AcceptedObserver = Arc<dyn Fn(&HookContext) + Send + Sync>;
+
+/// Reads a scenario some layer rejected, with the violations it produced.
+///
+/// The two observers take different arguments on purpose: filling the slots
+/// in the wrong order is then a compile error rather than a hook that never
+/// runs.
+pub type RejectedObserver = Arc<dyn Fn(&HookContext, &Violations) + Send + Sync>;
+
+/// What a scenario runs after it is graded, before it panics on a rejection.
+///
+#[derive(Default)]
 pub struct TestHooks {
-	#[allow(clippy::type_complexity)]
-	pub on_pass: Option<Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>>,
-	#[allow(clippy::type_complexity)]
-	pub on_fail: Option<Arc<dyn Fn(&HookContext, &Violations) -> Result<(), TightBeamError> + Send + Sync>>,
+	on_pass: Option<AcceptedObserver>,
+	on_fail: Option<RejectedObserver>,
+}
+
+impl TestHooks {
+	/// Observes a scenario every layer accepted.
+	pub fn on_pass(observer: impl Fn(&HookContext) + Send + Sync + 'static) -> Self {
+		Self { on_pass: Some(Arc::new(observer)), on_fail: None }
+	}
+
+	/// Observes a scenario some layer rejected, before the harness panics.
+	pub fn on_fail(observer: impl Fn(&HookContext, &Violations) + Send + Sync + 'static) -> Self {
+		Self { on_pass: None, on_fail: Some(Arc::new(observer)) }
+	}
+
+	/// Adds the rejection observer to hooks that already carry an acceptance
+	/// observer.
+	pub fn with_on_fail(mut self, observer: impl Fn(&HookContext, &Violations) + Send + Sync + 'static) -> Self {
+		self.on_fail = Some(Arc::new(observer));
+		self
+	}
+
+	/// Adds the acceptance observer to hooks that already carry a rejection
+	/// observer.
+	pub fn with_on_pass(mut self, observer: impl Fn(&HookContext) + Send + Sync + 'static) -> Self {
+		self.on_pass = Some(Arc::new(observer));
+		self
+	}
+
+	/// The observer for a scenario every layer accepted.
+	pub fn accepted(&self) -> Option<&AcceptedObserver> {
+		self.on_pass.as_ref()
+	}
+
+	/// The observer for a scenario some layer rejected.
+	pub fn rejected(&self) -> Option<&RejectedObserver> {
+		self.on_fail.as_ref()
+	}
 }
 
 #[cfg(test)]

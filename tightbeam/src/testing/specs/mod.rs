@@ -41,7 +41,7 @@ pub mod composition;
 pub mod csp;
 
 // Re-exports
-pub use assert::{verify_trace, TBSpec};
+pub use assert::TBSpec;
 pub use error::{
 	AssertionViolationDetail, EventCountMismatchDetail, EventOrderViolationDetail, GateDecisionMismatch, SpecViolation,
 	Violations,

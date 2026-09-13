@@ -42,7 +42,7 @@ use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::config::ScenarioConfig;
-use tightbeam::testing::{create_v0_tightbeam, SetupEnv};
+use tightbeam::testing::{SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::protocols::{AsyncReadStream, AsyncWriteStream, SplittableStream};
 use tightbeam::transport::tcp::r#async::{TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader};
@@ -271,7 +271,7 @@ async fn write_plain_requests(
 	count: usize,
 ) -> Result<(), TightBeamError> {
 	for _ in 0..count {
-		let frame = create_v0_tightbeam(None, None);
+		let frame = TestFrame::v0(None, None);
 		let request = TransportEnvelope::new_request(frame);
 		writer.write_envelope(request).await?;
 	}

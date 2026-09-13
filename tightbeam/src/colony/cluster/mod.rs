@@ -627,7 +627,7 @@ mod tests {
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::policy::TransitStatus;
-	use crate::testing::{create_test_certificate, create_test_signing_key};
+	use crate::testing::{TestCertificate, TestKey};
 	use crate::utils::BasisPoints;
 
 	// =========================================================================
@@ -635,9 +635,9 @@ mod tests {
 	// =========================================================================
 
 	fn test_tls_config() -> ClusterTlsConfig {
-		let key: Secp256k1SigningKey = create_test_signing_key();
+		let key: Secp256k1SigningKey = TestKey::signing();
 		ClusterTlsConfig::new(
-			CertificateSpec::Built(Box::new(create_test_certificate(&key))),
+			CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
 			Arc::new(Secp256k1KeyProvider::from(key)),
 		)
 		.expect("the test certificate must decode")

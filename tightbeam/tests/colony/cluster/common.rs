@@ -85,7 +85,7 @@ pub use tightbeam::{
 	instrumentation::events,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{create_test_signing_key, ClusterEnv, HiveEnv, ScenarioConfig, ScenarioConfigError, SetupEnv},
+	testing::{ClusterEnv, HiveEnv, ScenarioConfig, ScenarioConfigError, SetupEnv, TestKey},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
@@ -125,10 +125,10 @@ pub fn cluster_certs() -> ClusterTestCerts {
 /// told apart from an origin.
 pub fn colony_identity(cn: &str, colony: &Urn<'_>) -> (Certificate, Secp256k1SigningKey) {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let raw = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let cert = create_test_certificate_with_cn_and_uri_sans(&raw, cn, &[&colony.to_string()]);
+	let cert = TestCertificate::with_cn_and_uri_sans(&raw, cn, &[&colony.to_string()]);
 	(cert, Secp256k1SigningKey::from(raw))
 }
 
@@ -149,10 +149,10 @@ pub fn member_identity(cn: &str) -> (Certificate, Secp256k1SigningKey) {
 /// The bundled trust store covers the shared gateway identity so the
 /// hive can dial its gateway.
 pub fn hive_plane_certs() -> Arc<ClusterTestCerts> {
-	use tightbeam::testing::utils::create_test_certificate_with_cn_and_uri_sans;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let raw = k256::ecdsa::SigningKey::from_bytes(&[7u8; 32].into()).expect("static scalar is a valid key");
-	let cert = create_test_certificate_with_cn_and_uri_sans(&raw, "Hive Plane", &[&test_colony_urn().to_string()]);
+	let cert = TestCertificate::with_cn_and_uri_sans(&raw, "Hive Plane", &[&test_colony_urn().to_string()]);
 	let gateway = cluster_certs();
 	let trust = combined_trust(&[&gateway.cert, &cert]);
 	let key = Secp256k1SigningKey::from(raw);
@@ -287,7 +287,7 @@ pub async fn sign_frame(frame: Frame, key: &Secp256k1SigningKey) -> Result<Frame
 /// cryptographically verify the other's frame signature without key
 /// distribution.
 pub fn probe_signing_key() -> Secp256k1SigningKey {
-	Secp256k1SigningKey::from(create_test_signing_key())
+	Secp256k1SigningKey::from(TestKey::signing())
 }
 
 /// Returns whether `frame` carries a signature that verifies against the

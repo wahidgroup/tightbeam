@@ -1,7 +1,7 @@
 error[E0433]: failed to resolve: could not find `testing` in `tightbeam`
  --> tests/compile/testing_harness_absent.rs:4:16
   |
-4 | use tightbeam::testing::utils::create_test_signing_key;
+4 | use tightbeam::testing::fixtures::TestKey;
   |                ^^^^^^^ could not find `testing` in `tightbeam`
   |
 note: found an item that was configured out

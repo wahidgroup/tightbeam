@@ -715,7 +715,7 @@ impl<T: Message> FrameBuilder<T> {
 mod tests {
 	use super::*;
 	use crate::test_builder;
-	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
+	use crate::testing::{TestKey, TestMessage};
 
 	#[cfg(feature = "compress")]
 	use crate::compress::ZstdCompression;
@@ -727,7 +727,7 @@ mod tests {
 		name: test_v0_basic,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V0,
-		message: create_test_message(None),
+		message: TestMessage::sample(None),
 		setup: |builder, msg| {
 			builder
 				.with_message(msg)
@@ -748,13 +748,13 @@ mod tests {
 		name: test_v1_with_encryption,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V1,
-		message: create_test_message(None),
+		message: TestMessage::sample(None),
 		setup: |builder, msg| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
+			let (_, cipher) = TestKey::cipher();
+			let signing_key = TestKey::signing();
 
 		builder
 			.with_message(msg)
@@ -775,7 +775,7 @@ mod tests {
 			assert!(decode_result.is_err(), "Body should be encrypted");
 
 			// Decrypt and verify
-			let (_, cipher) = create_test_cipher_key();
+			let (_, cipher) = TestKey::cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, None)?;
 			assert_eq!(decrypted, message);
 
@@ -793,14 +793,14 @@ mod tests {
 		name: test_v1_with_compression,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V1,
-		message: create_test_message(None),
+		message: TestMessage::sample(None),
 		setup: |builder, msg| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::compress::ZstdCompression;
 
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
+			let (_, cipher) = TestKey::cipher();
+			let signing_key = TestKey::signing();
 
 		builder
 			.with_message(msg)
@@ -822,7 +822,7 @@ mod tests {
 			assert!(decode_result.is_err(), "Body should be encrypted/compressed");
 
 			// Decrypt (automatically decompresses) and verify
-			let (_, cipher) = create_test_cipher_key();
+			let (_, cipher) = TestKey::cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
 
@@ -842,14 +842,14 @@ mod tests {
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V2,
 		message: || {
-			create_test_message(None)
+			TestMessage::sample(None)
 		},
 		setup: |builder, msg| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
+			let (_, cipher) = TestKey::cipher();
+			let signing_key = TestKey::signing();
 
 			// Create a previous message hash for linking
 			let previous_hash = crate::utils::digest::<Sha3_256>(b"previous-message-data")?;
@@ -908,12 +908,12 @@ mod tests {
 			assert!(decode_result.is_err());
 
 			// Verify signature before decrypting (decrypt consumes the frame)
-			let signing_key = create_test_signing_key();
+			let signing_key = TestKey::signing();
 			let verifying_key = signing_key.verifying_key();
 			assert!(tightbeam.verify::<Secp256k1Signature, Sha3_256>(verifying_key).is_ok());
 
 			// Decrypt (automatically decompresses) and verify
-			let (_, cipher) = create_test_cipher_key();
+			let (_, cipher) = TestKey::cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
 
@@ -938,7 +938,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "sha3")]
 	fn test_single_deferred_error_surfaces_bare() {
-		let message = create_test_message(None);
+		let message = TestMessage::sample(None);
 		let result = FrameBuilder::from(Version::V0)
 			.with_id("error-test")
 			.with_order(1696521600)
@@ -951,7 +951,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "sha3")]
 	fn test_multiple_deferred_errors_surface_as_sequence() {
-		let message = create_test_message(None);
+		let message = TestMessage::sample(None);
 		let result = FrameBuilder::from(Version::V0)
 			.with_id("error-test")
 			.with_order(1696521600)
@@ -967,7 +967,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "derive")]
 	fn test_compose_macro() -> Result<()> {
-		let message = create_test_message(None);
+		let message = TestMessage::sample(None);
 		let frame = compose! {
 			V1:
 				id: "test-id",
@@ -987,7 +987,7 @@ mod tests {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-		use crate::testing::{create_test_cipher_key, create_test_signing_key};
+		use crate::testing::TestKey;
 		use crate::Version;
 
 		// Helper macro to run shared test logic after struct definition
@@ -1235,8 +1235,8 @@ mod tests {
 			($test:ident, $name:expr, $confidential:tt, $nonrepudiable:tt, $message_integrity:tt, $frame_integrity:tt, $version:ident) => {
 				#[test]
 				fn $test() -> Result<()> {
-					let (_, cipher) = create_test_cipher_key();
-					let signing_key = create_test_signing_key();
+					let (_, cipher) = TestKey::cipher();
+					let signing_key = TestKey::signing();
 
 					test_msg_struct!($confidential, $nonrepudiable, $message_integrity, $frame_integrity, $version);
 					run_tests!(

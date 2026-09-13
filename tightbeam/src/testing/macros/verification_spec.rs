@@ -102,10 +102,6 @@ impl Cardinality {
 	}
 }
 
-pub const fn between(min: u32, max: u32) -> Cardinality {
-	Cardinality::between(min, max)
-}
-
 /// Compile-time check that `tb_assert_spec!` version blocks strictly
 /// ascend. `latest()` selects the highest semantic version.
 pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
@@ -124,13 +120,6 @@ pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
 	}
 
 	true
-}
-
-pub const fn present() -> Cardinality {
-	Cardinality::present()
-}
-pub const fn absent() -> Cardinality {
-	Cardinality::absent()
 }
 
 // ---------------------------------------------------------------------------

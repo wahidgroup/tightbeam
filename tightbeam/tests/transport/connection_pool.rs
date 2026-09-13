@@ -32,7 +32,7 @@ use tightbeam::{
 	exactly,
 	instrumentation::events,
 	servlet, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{create_v0_tightbeam, SetupEnv},
+	testing::{SetupEnv, TestFrame},
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ConnectionBuilder, ConnectionPool, PoolConfig},
 	utils::urn::Urn,
@@ -339,7 +339,7 @@ tb_scenario! {
 
 				trace.event(SEND_MESSAGE)?;
 
-				let msg = create_v0_tightbeam(Some(&format!("test{i}")), None);
+				let msg = TestFrame::v0(Some(&format!("test{i}")), None);
 				let reply = client.conn()?.emit(msg, None).await?;
 				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;
 			}
@@ -384,13 +384,13 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 
 	// Cycle 1: fresh connection, released healthy back to the pool.
 	let mut first = pool.connect(addr1).await?;
-	let first_reply = first.conn()?.emit(create_v0_tightbeam(Some("cycle-1"), None), None).await?;
+	let first_reply = first.conn()?.emit(TestFrame::v0(Some("cycle-1"), None), None).await?;
 	assert!(first_reply.is_some(), "first acquire must round-trip a message");
 	drop(first);
 
 	// Cycle 2: same destination, must be served from the pool (reuse path).
 	let mut second = pool.connect(addr1).await?;
-	let second_reply = second.conn()?.emit(create_v0_tightbeam(Some("cycle-2"), None), None).await?;
+	let second_reply = second.conn()?.emit(TestFrame::v0(Some("cycle-2"), None), None).await?;
 	assert!(second_reply.is_some(), "reused connection must round-trip a message");
 	drop(second);
 
@@ -436,7 +436,7 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 	);
 
 	let under_cap = "x".repeat(260_000);
-	let msg = create_v0_tightbeam(Some(&under_cap), None);
+	let msg = TestFrame::v0(Some(&under_cap), None);
 	let mut client = pool.connect(addr).await?;
 	let reply = client.conn()?.emit(msg, None).await;
 	assert!(
@@ -450,7 +450,7 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 	// The retry layer strips the frame once the restart policy declines.
 	// The public emit surface therefore reports `OperationFailed(SizeExceeded)`.
 	let over_cap = "x".repeat(263_000);
-	let msg = create_v0_tightbeam(Some(&over_cap), None);
+	let msg = TestFrame::v0(Some(&over_cap), None);
 	let mut client = pool.connect(addr).await?;
 	let refusal = client.conn()?.emit(msg, None).await;
 	assert!(
@@ -502,7 +502,7 @@ tb_scenario! {
 
 				trace.event(SEND_MESSAGE)?;
 
-				let reply = client.conn()?.emit(create_v0_tightbeam(Some(name), None), None).await?;
+				let reply = client.conn()?.emit(TestFrame::v0(Some(name), None), None).await?;
 
 				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;
 			}
@@ -553,7 +553,7 @@ tb_scenario! {
 
 				let reply = client
 					.conn()?
-					.emit(create_v0_tightbeam(Some("concurrent-test"), None), None)
+					.emit(TestFrame::v0(Some("concurrent-test"), None), None)
 					.await?;
 
 				trace.event_with(RECEIVE_RESPONSE, &[], u64::from(reply.is_some()))?;

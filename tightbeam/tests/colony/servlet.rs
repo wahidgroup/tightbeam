@@ -17,7 +17,7 @@ use tightbeam::{
 	exactly,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{create_test_signing_key, ClientEnv, ServletEnv, SetupEnv},
+	testing::{ClientEnv, ServletEnv, SetupEnv, TestKey},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	utils::urn::Urn,
 	worker, Beamable, Frame, TightBeamError,
@@ -262,7 +262,7 @@ tb_scenario! {
 		},
 		start: |SetupEnv { trace, context: config }| async move {
 			let trace = Arc::new(trace);
-			let verifying_key = *create_test_signing_key().verifying_key();
+			let verifying_key = *TestKey::signing().verifying_key();
 			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
 				.with_collector_gate(SignatureGate { verifying_key })
@@ -284,7 +284,7 @@ tb_scenario! {
 					message: CalcRequest { value: config.value },
 					compactness: ZstdCompression::default(),
 					confidentiality<Aes256GcmOid, _>: shared_cipher(),
-					nonrepudiation<Secp256k1Signature, _>: create_test_signing_key(),
+					nonrepudiation<Secp256k1Signature, _>: TestKey::signing(),
 					message_integrity<Sha3_256>: [],
 					frame_integrity: type Sha3_256
 			}?;

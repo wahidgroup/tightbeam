@@ -516,9 +516,7 @@ mod tests {
 
 	mod colony_urn {
 		use super::*;
-		use crate::testing::utils::{
-			create_test_certificate, create_test_certificate_with_uri_sans, create_test_signing_key,
-		};
+		use crate::testing::fixtures::{TestCertificate, TestKey};
 
 		fn main_colony() -> Urn<'static> {
 			nestmate_ns().colony("main").expect("static colony name")
@@ -535,49 +533,46 @@ mod tests {
 
 		#[test]
 		fn cert_colony_urn_extracts_a_valid_san() {
-			let key = create_test_signing_key();
-			let cert = create_test_certificate_with_uri_sans(&key, &[&main_colony().to_string()]);
+			let key = TestKey::signing();
+			let cert = TestCertificate::with_uri_sans(&key, &[&main_colony().to_string()]);
 			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
 		}
 
 		#[test]
 		fn cert_colony_urn_ignores_non_colony_entries() {
-			let key = create_test_signing_key();
+			let key = TestKey::signing();
 			let servlet = ping_type().to_string();
-			let cert = create_test_certificate_with_uri_sans(
-				&key,
-				&[&servlet, "https://example.test", &main_colony().to_string()],
-			);
+			let cert =
+				TestCertificate::with_uri_sans(&key, &[&servlet, "https://example.test", &main_colony().to_string()]);
 			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
 		}
 
 		#[test]
 		fn cert_colony_urn_tolerates_duplicate_identical_entries() {
-			let key = create_test_signing_key();
+			let key = TestKey::signing();
 			let urn = main_colony().to_string();
-			let cert = create_test_certificate_with_uri_sans(&key, &[&urn, &urn]);
+			let cert = TestCertificate::with_uri_sans(&key, &[&urn, &urn]);
 			assert_eq!(nestmate_ns().cert_colony_urn(&cert), Some(main_colony()));
 		}
 
 		#[test]
 		fn cert_colony_urn_fails_closed_on_ambiguity() {
-			let key = create_test_signing_key();
-			let cert =
-				create_test_certificate_with_uri_sans(&key, &[&main_colony().to_string(), &other_colony().to_string()]);
+			let key = TestKey::signing();
+			let cert = TestCertificate::with_uri_sans(&key, &[&main_colony().to_string(), &other_colony().to_string()]);
 			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
 		}
 
 		#[test]
 		fn cert_colony_urn_is_none_without_san() {
-			let key = create_test_signing_key();
-			let cert = create_test_certificate(&key);
+			let key = TestKey::signing();
+			let cert = TestCertificate::self_signed(&key);
 			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
 		}
 
 		#[test]
 		fn cert_colony_urn_is_none_for_foreign_namespace() {
-			let key = create_test_signing_key();
-			let cert = create_test_certificate_with_uri_sans(&key, &[&foreign_colony().to_string()]);
+			let key = TestKey::signing();
+			let cert = TestCertificate::with_uri_sans(&key, &[&foreign_colony().to_string()]);
 			assert_eq!(nestmate_ns().cert_colony_urn(&cert), None);
 		}
 	}

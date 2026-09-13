@@ -404,6 +404,7 @@ impl FdrTraceExt for ConsumedTrace {
 		Process {
 			name: "TraceProcess",
 			observation: Observation::RecordedTrace,
+			requires_progress: false,
 			initial: s_initial,
 			states,
 			terminal,

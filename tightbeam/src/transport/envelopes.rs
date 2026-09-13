@@ -852,7 +852,7 @@ impl TransportEnvelope {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::create_v0_tightbeam;
+	use crate::testing::TestFrame;
 	use std::error::Error;
 
 	struct PackageTestCase {
@@ -863,14 +863,14 @@ mod tests {
 
 	impl PackageTestCase {
 		fn create_request(&self) -> RequestPackage {
-			RequestPackage::new(create_v0_tightbeam(Some(self.message_value), None))
+			RequestPackage::new(TestFrame::v0(Some(self.message_value), None))
 		}
 
 		fn create_response(&self) -> ResponsePackage {
 			ResponsePackage {
 				status: self.expected_status,
 				message: if self.should_have_message {
-					Some(Arc::new(create_v0_tightbeam(Some(self.message_value), None)))
+					Some(Arc::new(TestFrame::v0(Some(self.message_value), None)))
 				} else {
 					None
 				},
@@ -941,7 +941,7 @@ mod tests {
 
 	#[test]
 	fn test_length_validation_request() -> Result<(), Box<dyn Error>> {
-		let original = RequestPackage::new(create_v0_tightbeam(None, None));
+		let original = RequestPackage::new(TestFrame::v0(None, None));
 		let mut encoded = original.to_der()?;
 
 		// Corrupt the length field by manipulating bytes after encoding
@@ -961,10 +961,8 @@ mod tests {
 
 	#[test]
 	fn test_length_validation_response() -> Result<(), Box<dyn Error>> {
-		let original = ResponsePackage {
-			status: TransitStatus::Ok,
-			message: Some(Arc::new(create_v0_tightbeam(None, None))),
-		};
+		let original =
+			ResponsePackage { status: TransitStatus::Ok, message: Some(Arc::new(TestFrame::v0(None, None))) };
 
 		// Corrupt the length field
 		let mut encoded = original.to_der()?;
@@ -993,7 +991,7 @@ mod tests {
 
 	#[cfg(feature = "transport-multiplex")]
 	fn frame_payload(label: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-		let payload = create_v0_tightbeam(Some(label), None).to_der()?;
+		let payload = TestFrame::v0(Some(label), None).to_der()?;
 		Ok(payload)
 	}
 

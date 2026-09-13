@@ -111,7 +111,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 	use crate::spki::EncodePublicKey;
-	use crate::testing::create_test_signing_key;
+	use crate::testing::TestKey;
 
 	/// Interop: a signature produced by the `ecdsa` crate's own
 	/// `DigestSigner<Sha3_256>` path -- independent of this crate's
@@ -119,7 +119,7 @@ mod tests {
 	/// ecdsa-with-SHA3-256 OID.
 	#[test]
 	fn verifies_independent_sha3_ecdsa_signature() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key: Secp256k1SigningKey = create_test_signing_key();
+		let signing_key: Secp256k1SigningKey = TestKey::signing();
 		let message = b"independent sha3-ecdsa interop";
 
 		let mut digest = Sha3_256::default();

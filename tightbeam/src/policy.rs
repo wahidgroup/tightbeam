@@ -430,7 +430,7 @@ mod tests {
 
 	use super::*;
 	use crate::crypto::hash::Sha3_256;
-	use crate::testing::{create_frame_with_frame_integrity, create_test_message};
+	use crate::testing::{TestFrame, TestMessage};
 
 	struct StaticGate(TransitStatus);
 
@@ -453,7 +453,7 @@ mod tests {
 	fn empty_chain_accepts() {
 		let chain = GateChain::default();
 		assert!(matches!(
-			chain.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default()),
+			chain.evaluate(Some(&TestFrame::with_integrity()), &SessionContext::default()),
 			TransitStatus::Ok
 		));
 	}
@@ -465,7 +465,7 @@ mod tests {
 			.with(StaticGate(TransitStatus::ResourceExhausted))
 			.with(StaticGate(TransitStatus::PermissionDenied));
 
-		let frame = create_frame_with_frame_integrity();
+		let frame = TestFrame::with_integrity();
 		assert!(matches!(
 			chain.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::ResourceExhausted
@@ -479,7 +479,7 @@ mod tests {
 			.with(StaticGate(TransitStatus::PermissionDenied))
 			.with(ProbeGate(Arc::clone(&evaluated)));
 
-		let frame = create_frame_with_frame_integrity();
+		let frame = TestFrame::with_integrity();
 		let _ = chain.evaluate(Some(&frame), &SessionContext::default());
 		assert!(!evaluated.load(Ordering::SeqCst));
 	}
@@ -487,7 +487,7 @@ mod tests {
 	#[test]
 	fn accepts_intact_frame() {
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
-		let frame = create_frame_with_frame_integrity();
+		let frame = TestFrame::with_integrity();
 		assert!(matches!(
 			gate.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::Ok
@@ -496,7 +496,7 @@ mod tests {
 
 	#[test]
 	fn rejects_tampered_frame() {
-		let mut frame = create_frame_with_frame_integrity();
+		let mut frame = TestFrame::with_integrity();
 		frame.metadata.id = b"tampered".to_vec();
 
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
@@ -508,7 +508,7 @@ mod tests {
 
 	#[test]
 	fn rejects_frame_without_integrity() -> crate::error::Result<()> {
-		let message = create_test_message(None);
+		let message = TestMessage::sample(None);
 		let frame = compose! { V0: id: "gate-no-fi", order: 1u64, message: message }?;
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
 		assert!(matches!(

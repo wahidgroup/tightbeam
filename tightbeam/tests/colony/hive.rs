@@ -29,7 +29,7 @@ use tightbeam::{
 	exactly, hive,
 	policy::TransitStatus,
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{create_test_hash_info, create_test_signing_key, HiveEnv, SetupEnv},
+	testing::{HiveEnv, SetupEnv, TestDigest, TestKey},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
@@ -707,7 +707,7 @@ pub(crate) const HIVE_CALL_ECHOED: Urn<'static> = Urn::new("test", "event:hive/c
 /// servlet share, so each side can verify the other's frame signature
 /// without key distribution.
 fn contract_signing_key() -> Secp256k1SigningKey {
-	Secp256k1SigningKey::from(create_test_signing_key())
+	Secp256k1SigningKey::from(TestKey::signing())
 }
 
 /// Signs `frame` with the shared contract key under the canonical
@@ -827,7 +827,7 @@ tb_scenario! {
 			let unsigned = FrameBuilder::from(Version::V2)
 				.with_id(b"hive-signed-call")
 				.with_order(current_timestamp_ms())
-				.with_previous_hash(create_test_hash_info())
+				.with_previous_hash(TestDigest::info())
 				.with_message(HiveTestRequest { value: 21 })
 				.build()?;
 

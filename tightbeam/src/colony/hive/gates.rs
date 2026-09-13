@@ -910,8 +910,8 @@ mod tests {
 	async fn a_forged_signer_id_gates_the_sender_not_the_signer() -> Result<(), crate::TightBeamError> {
 		use crate::builder::TypeBuilder;
 
-		let signing_key = crate::testing::utils::create_test_signing_key();
-		let certificate = crate::testing::utils::create_test_certificate(&signing_key);
+		let signing_key = crate::testing::fixtures::TestKey::signing();
+		let certificate = crate::testing::fixtures::TestCertificate::self_signed(&signing_key);
 		let provider = crate::crypto::key::EcdsaKeyProvider::from(signing_key.clone());
 
 		let unsigned = crate::Version::V2

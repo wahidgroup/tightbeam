@@ -262,7 +262,7 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::create_v0_tightbeam;
+	use crate::testing::TestFrame;
 	use crate::transport::error::TransportFailure;
 	use std::error::Error;
 
@@ -302,7 +302,7 @@ mod tests {
 			}
 		};
 
-		let message = create_v0_tightbeam(None, None);
+		let message = TestFrame::v0(None, None);
 		let result = client.emit(message.clone(), None).await;
 		result?;
 
@@ -331,7 +331,7 @@ mod tests {
 		// A payload past the default ceiling is refused without the caller
 		// having configured anything.
 		let oversized = "a".repeat(limits.cleartext_envelope + 1);
-		let frame = create_v0_tightbeam(Some(&oversized), None);
+		let frame = TestFrame::v0(Some(&oversized), None);
 		let result = builders::EnvelopeBuilder::request(frame).finish();
 		assert!(matches!(
 			result,
@@ -352,7 +352,7 @@ mod tests {
 		use crate::der::oid::AssociatedOid;
 		use crate::der::Encode;
 
-		let frame = create_v0_tightbeam(None, None);
+		let frame = TestFrame::v0(None, None);
 		let plaintext_len = TransportEnvelope::from(frame.clone()).to_der()?.len();
 		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32])
 			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))?;
@@ -378,7 +378,7 @@ mod tests {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit, RuntimeAead, SendCipher};
 		use crate::der::oid::AssociatedOid;
 
-		let frame = create_v0_tightbeam(None, None);
+		let frame = TestFrame::v0(None, None);
 		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32])
 			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))?;
 
@@ -399,7 +399,7 @@ mod tests {
 
 	#[test]
 	fn test_envelope_builder_cleartext_limit_returns_message() {
-		let frame = create_v0_tightbeam(None, None);
+		let frame = TestFrame::v0(None, None);
 		let result = builders::EnvelopeBuilder::request(frame.clone())
 			.with_limits(TransportLimits { cleartext_envelope: 1, ..TransportLimits::default() })
 			.finish();

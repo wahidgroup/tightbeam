@@ -39,7 +39,7 @@ use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{create_v0_tightbeam, ClientEnv, SetupEnv, TestMessage};
+use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame, TestMessage};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::MUX_APPLICATION_CODE_FLOOR;
 use tightbeam::transport::handshake::negotiation::{
@@ -266,7 +266,7 @@ async fn start_lottery_server(
 		handle: move |ticket: Frame| async move {
 			let pick: TestMessage = decode(&ticket.message)?;
 			let announced = rig.outcome(&pick.content);
-			Ok(Some(create_v0_tightbeam(Some(&announced), None)))
+			Ok(Some(TestFrame::v0(Some(&announced), None)))
 		}
 	};
 
@@ -331,7 +331,7 @@ async fn start_ledger_lottery_server(
 					.ok_or_else(|| expectation_failure("mutual handshake left no client public key"))?;
 				let pick: TestMessage = decode(&ticket.message)?;
 				let announced = ledger.announce(account, rig, &pick.content);
-				Ok(Some(create_v0_tightbeam(Some(&announced), None)))
+				Ok(Some(TestFrame::v0(Some(&announced), None)))
 			}
 		}
 	};
@@ -385,7 +385,7 @@ fn pool_with_offer(
 /// One draw: emit the pick as a ticket, decode the announced number, and
 /// report whether the gambler won.
 async fn draw(lease: &mut PooledClient<TokioListener>, pick: &str) -> Result<String, TightBeamError> {
-	let ticket = create_v0_tightbeam(Some(pick), None);
+	let ticket = TestFrame::v0(Some(pick), None);
 	let Some(announcement) = lease.emit(ticket, None).await? else {
 		return Err(expectation_failure("draw produced no announcement"));
 	};
@@ -749,7 +749,7 @@ tb_scenario! {
 
 						let pick: TestMessage = decode(&ticket.message)?;
 						let announced = DrawRig::AlwaysWin.outcome(&pick.content);
-						Ok(Some(create_v0_tightbeam(Some(&announced), None)))
+						Ok(Some(TestFrame::v0(Some(&announced), None)))
 					}
 				}
 			};

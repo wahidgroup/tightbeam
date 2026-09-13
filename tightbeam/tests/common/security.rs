@@ -19,7 +19,7 @@ use tightbeam::{
 	random::OsRng,
 	testing::{
 		error::{FdrConfigError, TestingError},
-		utils::{create_test_certificate, create_test_signing_key},
+		fixtures::{TestCertificate, TestKey},
 	},
 	transport::handshake::HandshakeKeyManager,
 	transport::state::ClientIdentity,
@@ -48,8 +48,8 @@ pub struct ServerMaterials {
 
 impl ServerMaterials {
 	pub fn generate() -> Self {
-		let signing_key = create_test_signing_key();
-		let certificate = Arc::new(create_test_certificate(&signing_key));
+		let signing_key = TestKey::signing();
+		let certificate = Arc::new(TestCertificate::self_signed(&signing_key));
 
 		let secret_key_bytes = signing_key.to_bytes();
 		let secret_key = k256::SecretKey::from_bytes(&secret_key_bytes).expect("valid secret key");
@@ -123,7 +123,7 @@ pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn Certific
 
 /// Deterministic signing key (fixed seed) for stable single-identity fixtures.
 pub fn deterministic_signing_key() -> Secp256k1SigningKey {
-	create_test_signing_key()
+	TestKey::signing()
 }
 
 /// Fresh random signing key for distinct, unrelated identities.
@@ -133,7 +133,7 @@ pub fn random_signing_key() -> Secp256k1SigningKey {
 
 /// Self-signed test certificate for the given signing key.
 pub fn test_certificate(signing_key: &Secp256k1SigningKey) -> Certificate {
-	create_test_certificate(signing_key)
+	TestCertificate::self_signed(signing_key)
 }
 
 /// Default profile descriptor shared across threats.

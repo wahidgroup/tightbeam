@@ -45,7 +45,7 @@ struct MultiOrgCtx {
 
 fn multi_org_ctx() -> MultiOrgCtx {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let (cert_entry, key_entry) = member_identity("Org Main Entry Gateway");
 	let (cert_origin, key_origin) = member_identity("Org Main Origin Gateway");
@@ -55,7 +55,7 @@ fn multi_org_ctx() -> MultiOrgCtx {
 	let (cert_rogue, rogue_key) = member_identity("Org Main Rogue");
 
 	let raw_stranger = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let stranger_cert = create_test_certificate(&raw_stranger);
+	let stranger_cert = TestCertificate::self_signed(&raw_stranger);
 
 	let trust = combined_trust(&[&cert_entry, &cert_origin, &cert_foreign, &cert_rogue, &stranger_cert]);
 	let peers_of_entry = combined_trust(&[&cert_origin, &cert_foreign, &cert_rogue, &stranger_cert]);

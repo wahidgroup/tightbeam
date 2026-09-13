@@ -5,8 +5,6 @@
 //! [`SpecViolation::CspProcessViolation`] or `EventOrderViolationDetail` stops
 //! `narrow` from building.
 
-use std::sync::Arc;
-
 use tightbeam::testing::specs::{EventOrderViolationDetail, SpecViolation};
 use tightbeam::testing::TestHooks;
 
@@ -29,13 +27,9 @@ pub fn layer_of(violation: &SpecViolation) -> String {
 
 /// Installs an observer that reads every violation the run produced.
 pub fn observing_hooks() -> TestHooks {
-	TestHooks {
-		on_pass: None,
-		on_fail: Some(Arc::new(|_ctx, violations| {
-			let _layers: Vec<String> = violations.iter().map(layer_of).collect();
-			Ok(())
-		})),
-	}
+	TestHooks::on_fail(|_context, violations| {
+		let _layers: Vec<String> = violations.iter().map(layer_of).collect();
+	})
 }
 
 #[cfg(test)]
