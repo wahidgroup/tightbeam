@@ -517,7 +517,6 @@ mod tests {
 	use super::super::testing::{client_shared, poll_now};
 	use super::*;
 	use crate::transport::envelopes::MuxEnvelope;
-	use crate::utils::urn::Urn;
 
 	fn duplex_handle() -> (MuxHandle, mpsc::Receiver<Outbound>) {
 		let (outbound, sent) = mpsc::channel(8);
@@ -556,7 +555,7 @@ mod tests {
 	#[test]
 	fn test_open_stream_to_stamps_route_on_open() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
-		let target = Urn::new("tb", "servlet:ledger");
+		let target = crate::urn!("tb", "servlet:ledger");
 		let (sink, _response) = handle.open_stream_to(target.clone())?;
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(
@@ -573,7 +572,7 @@ mod tests {
 	#[test]
 	fn test_open_stream_with_relayed_route_stamps_budget() -> TransportResult<()> {
 		let (handle, mut sent) = duplex_handle();
-		let target = Urn::new("tb", "servlet:ledger");
+		let target = crate::urn!("tb", "servlet:ledger");
 		let (sink, _response) = handle.open_stream_with_route(StreamRoute::from_parts(Some(target.clone()), 0))?;
 		assert!(matches!(poll_now(sink.close()), Poll::Ready(Ok(()))));
 		assert!(matches!(

@@ -1292,8 +1292,8 @@ mod tests {
 		}
 	}
 
-	const STEP1: Urn<'static> = Urn::new("test", "event:csp/step1");
-	const STEP2: Urn<'static> = Urn::new("test", "event:csp/step2");
+	const STEP1: Urn<'static> = crate::urn!("test", "event:csp/step1");
+	const STEP2: Urn<'static> = crate::urn!("test", "event:csp/step2");
 
 	// Integration test with tb_scenario! for Bare environment
 	tb_assert_spec! {
@@ -1335,8 +1335,8 @@ mod tests {
 		}
 	}
 
-	const RECEIVED: Urn<'static> = Urn::new("test", "event:csp/received");
-	const RESPONDED: Urn<'static> = Urn::new("test", "event:csp/responded");
+	const RECEIVED: Urn<'static> = crate::urn!("test", "event:csp/received");
+	const RESPONDED: Urn<'static> = crate::urn!("test", "event:csp/responded");
 
 	// Define the assertion spec (what to validate at runtime)
 	tb_assert_spec! {

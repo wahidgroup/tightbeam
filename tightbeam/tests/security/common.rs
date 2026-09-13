@@ -334,17 +334,18 @@ impl Default for SecurityThreatHarness {
 
 impl SecurityThreatHarness {
 	/// Hidden CSP event: a handshake session is about to be constructed.
-	pub const HARNESS_SPAWN_SESSION: Urn<'static> = Urn::new("test", "event:security-harness/spawn-session");
+	pub const HARNESS_SPAWN_SESSION: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-session");
 	/// Hidden CSP event: ECIES backend selected for the session.
-	pub const HARNESS_SPAWN_ECIES: Urn<'static> = Urn::new("test", "event:security-harness/spawn-ecies");
+	pub const HARNESS_SPAWN_ECIES: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-ecies");
 	/// Hidden CSP event: CMS backend selected for the session.
-	pub const HARNESS_SPAWN_CMS: Urn<'static> = Urn::new("test", "event:security-harness/spawn-cms");
+	pub const HARNESS_SPAWN_CMS: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms");
 	/// Hidden CSP event: weak-cipher spawn path entered.
-	pub const HARNESS_SPAWN_WEAK: Urn<'static> = Urn::new("test", "event:security-harness/spawn-weak");
+	pub const HARNESS_SPAWN_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-weak");
 	/// Hidden CSP event: weak ECIES backend selected.
-	pub const HARNESS_SPAWN_ECIES_WEAK: Urn<'static> = Urn::new("test", "event:security-harness/spawn-ecies-weak");
+	pub const HARNESS_SPAWN_ECIES_WEAK: Urn<'static> =
+		tightbeam::urn!("test", "event:security-harness/spawn-ecies-weak");
 	/// Hidden CSP event: weak CMS backend selected.
-	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = Urn::new("test", "event:security-harness/spawn-cms-weak");
+	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms-weak");
 
 	/// Create a harness with a trace collector for internal event emission.
 	pub fn with_trace(trace: Arc<TraceCollector>) -> Self {

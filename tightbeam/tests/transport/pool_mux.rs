@@ -58,70 +58,74 @@ use crate::transport::support::{
 };
 
 pub(crate) const CAPPED_FAILOVER_REUSES_POOLED_HEADROOM: Urn<'static> =
-	Urn::new("test", "event:pool-mux/capped-failover-reuses-pooled-headroom");
+	tightbeam::urn!("test", "event:pool-mux/capped-failover-reuses-pooled-headroom");
 pub(crate) const CONN_REPORTS_INVALID_STATE: Urn<'static> =
-	Urn::new("test", "event:pool-mux/conn-reports-invalid-state");
+	tightbeam::urn!("test", "event:pool-mux/conn-reports-invalid-state");
 pub(crate) const DECLINED_LEASE_IS_EXCLUSIVE: Urn<'static> =
-	Urn::new("test", "event:pool-mux/declined-lease-is-exclusive");
-pub(crate) const EMITS_SURVIVE_RENEWAL: Urn<'static> = Urn::new("test", "event:pool-mux/emits-survive-renewal");
-pub(crate) const EMIT_ECHOES_BEFORE_IDLE: Urn<'static> = Urn::new("test", "event:pool-mux/emit-echoes-before-idle");
+	tightbeam::urn!("test", "event:pool-mux/declined-lease-is-exclusive");
+pub(crate) const EMITS_SURVIVE_RENEWAL: Urn<'static> = tightbeam::urn!("test", "event:pool-mux/emits-survive-renewal");
+pub(crate) const EMIT_ECHOES_BEFORE_IDLE: Urn<'static> =
+	tightbeam::urn!("test", "event:pool-mux/emit-echoes-before-idle");
 pub(crate) const EMIT_ECHOES_BEFORE_TEARDOWN: Urn<'static> =
-	Urn::new("test", "event:pool-mux/emit-echoes-before-teardown");
+	tightbeam::urn!("test", "event:pool-mux/emit-echoes-before-teardown");
 pub(crate) const EMIT_FAILS_ON_DEAD_CONNECTION: Urn<'static> =
-	Urn::new("test", "event:pool-mux/emit-fails-on-dead-connection");
-pub(crate) const EXCLUSIVE_LEASE_ECHOES: Urn<'static> = Urn::new("test", "event:pool-mux/exclusive-lease-echoes");
+	tightbeam::urn!("test", "event:pool-mux/emit-fails-on-dead-connection");
+pub(crate) const EXCLUSIVE_LEASE_ECHOES: Urn<'static> =
+	tightbeam::urn!("test", "event:pool-mux/exclusive-lease-echoes");
 pub(crate) const FIRST_FAILOVER_ECHOES_ON_NEW_DIAL: Urn<'static> =
-	Urn::new("test", "event:pool-mux/first-failover-echoes-on-new-dial");
-pub(crate) const FIRST_LEASE_ECHOES: Urn<'static> = Urn::new("test", "event:pool-mux/first-lease-echoes");
+	tightbeam::urn!("test", "event:pool-mux/first-failover-echoes-on-new-dial");
+pub(crate) const FIRST_LEASE_ECHOES: Urn<'static> = tightbeam::urn!("test", "event:pool-mux/first-lease-echoes");
 pub(crate) const FRESH_CONNECT_ECHOES_AFTER_EVICTION: Urn<'static> =
-	Urn::new("test", "event:pool-mux/fresh-connect-echoes-after-eviction");
+	tightbeam::urn!("test", "event:pool-mux/fresh-connect-echoes-after-eviction");
 pub(crate) const FRESH_CONNECT_ECHOES_AFTER_PRUNE: Urn<'static> =
-	Urn::new("test", "event:pool-mux/fresh-connect-echoes-after-prune");
+	tightbeam::urn!("test", "event:pool-mux/fresh-connect-echoes-after-prune");
 pub(crate) const GATE_LIST_FIRST_REFUSAL_WINS: Urn<'static> =
-	Urn::new("test", "event:pool-mux/gate-list-first-refusal-wins");
+	tightbeam::urn!("test", "event:pool-mux/gate-list-first-refusal-wins");
 pub(crate) const GATE_STATUS_SURFACES_TO_CLIENT: Urn<'static> =
-	Urn::new("test", "event:pool-mux/gate-status-surfaces-to-client");
+	tightbeam::urn!("test", "event:pool-mux/gate-status-surfaces-to-client");
 pub(crate) const GATE_STREAM_STATUS_SURFACES_TO_CLIENT: Urn<'static> =
-	Urn::new("test", "event:pool-mux/gate-stream-status-surfaces-to-client");
+	tightbeam::urn!("test", "event:pool-mux/gate-stream-status-surfaces-to-client");
 pub(crate) const GATE_DUPLEX_STATUS_SURFACES_TO_CLIENT: Urn<'static> =
-	Urn::new("test", "event:pool-mux/gate-duplex-status-surfaces-to-client");
+	tightbeam::urn!("test", "event:pool-mux/gate-duplex-status-surfaces-to-client");
 pub(crate) const GATE_UNKNOWN_ANSWERS_INTERNAL: Urn<'static> =
-	Urn::new("test", "event:pool-mux/gate-unknown-answers-internal");
+	tightbeam::urn!("test", "event:pool-mux/gate-unknown-answers-internal");
 pub(crate) const HANDLER_FAILURE_SURFACES_INTERNAL: Urn<'static> =
-	Urn::new("test", "event:pool-mux/handler-failure-surfaces-internal");
-pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = Urn::new("test", "event:pool-mux/handler-never-invoked");
+	tightbeam::urn!("test", "event:pool-mux/handler-failure-surfaces-internal");
+pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = tightbeam::urn!("test", "event:pool-mux/handler-never-invoked");
 pub(crate) const STREAM_HANDLER_NEVER_INVOKED: Urn<'static> =
-	Urn::new("test", "event:pool-mux/stream-handler-never-invoked");
+	tightbeam::urn!("test", "event:pool-mux/stream-handler-never-invoked");
 pub(crate) const DUPLEX_HANDLER_NEVER_INVOKED: Urn<'static> =
-	Urn::new("test", "event:pool-mux/duplex-handler-never-invoked");
+	tightbeam::urn!("test", "event:pool-mux/duplex-handler-never-invoked");
 pub(crate) const HANDLER_RECOVERS_AFTER_FAILURE: Urn<'static> =
-	Urn::new("test", "event:pool-mux/handler-recovers-after-failure");
+	tightbeam::urn!("test", "event:pool-mux/handler-recovers-after-failure");
 pub(crate) const HELD_EMIT_COMPLETES_AFTER_RELEASE: Urn<'static> =
-	Urn::new("test", "event:pool-mux/held-emit-completes-after-release");
+	tightbeam::urn!("test", "event:pool-mux/held-emit-completes-after-release");
 pub(crate) const LEASE_EXPOSES_SETTLED_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:pool-mux/lease-exposes-settled-receipt");
+	tightbeam::urn!("test", "event:pool-mux/lease-exposes-settled-receipt");
 pub(crate) const LEASE_OBSERVES_ROTATED_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:pool-mux/lease-observes-rotated-receipt");
+	tightbeam::urn!("test", "event:pool-mux/lease-observes-rotated-receipt");
 pub(crate) const MUX_LEASE_PINS_PEER_CERTIFICATE: Urn<'static> =
-	Urn::new("test", "event:pool-mux/mux-lease-pins-peer-certificate");
+	tightbeam::urn!("test", "event:pool-mux/mux-lease-pins-peer-certificate");
 pub(crate) const OVERFLOW_EMIT_ECHOES_ON_SECOND_CONNECTION: Urn<'static> =
-	Urn::new("test", "event:pool-mux/overflow-emit-echoes-on-second-connection");
+	tightbeam::urn!("test", "event:pool-mux/overflow-emit-echoes-on-second-connection");
 pub(crate) const REFUSED_EMIT_SURFACES_BUSY: Urn<'static> =
-	Urn::new("test", "event:pool-mux/refused-emit-surfaces-busy");
-pub(crate) const REUSED_LEASE_ECHOES: Urn<'static> = Urn::new("test", "event:pool-mux/reused-lease-echoes");
-pub(crate) const REUSED_LEASE_IS_EXCLUSIVE: Urn<'static> = Urn::new("test", "event:pool-mux/reused-lease-is-exclusive");
-pub(crate) const SECOND_CONNECTION_DIALED: Urn<'static> = Urn::new("test", "event:pool-mux/second-connection-dialed");
-pub(crate) const SECOND_LEASE_ECHOES: Urn<'static> = Urn::new("test", "event:pool-mux/second-lease-echoes");
+	tightbeam::urn!("test", "event:pool-mux/refused-emit-surfaces-busy");
+pub(crate) const REUSED_LEASE_ECHOES: Urn<'static> = tightbeam::urn!("test", "event:pool-mux/reused-lease-echoes");
+pub(crate) const REUSED_LEASE_IS_EXCLUSIVE: Urn<'static> =
+	tightbeam::urn!("test", "event:pool-mux/reused-lease-is-exclusive");
+pub(crate) const SECOND_CONNECTION_DIALED: Urn<'static> =
+	tightbeam::urn!("test", "event:pool-mux/second-connection-dialed");
+pub(crate) const SECOND_LEASE_ECHOES: Urn<'static> = tightbeam::urn!("test", "event:pool-mux/second-lease-echoes");
 pub(crate) const POOLED_DUPLEX_ECHOES_CHUNKS: Urn<'static> =
-	Urn::new("test", "event:pool-mux/pooled-duplex-echoes-chunks");
+	tightbeam::urn!("test", "event:pool-mux/pooled-duplex-echoes-chunks");
 pub(crate) const POOLED_MIXED_KINDS_SHARE_ONE_CONNECTION: Urn<'static> =
-	Urn::new("test", "event:pool-mux/pooled-mixed-kinds-share-one-connection");
+	tightbeam::urn!("test", "event:pool-mux/pooled-mixed-kinds-share-one-connection");
 pub(crate) const POOLED_STREAM_RESPONSE_REPORTS_LENGTH: Urn<'static> =
-	Urn::new("test", "event:pool-mux/pooled-stream-response-reports-length");
+	tightbeam::urn!("test", "event:pool-mux/pooled-stream-response-reports-length");
 pub(crate) const UNSERVED_KIND_ANSWERS_UNIMPLEMENTED: Urn<'static> =
-	Urn::new("test", "event:pool-mux/unserved-kind-answers-unimplemented");
+	tightbeam::urn!("test", "event:pool-mux/unserved-kind-answers-unimplemented");
 pub(crate) const SINGLE_FLIGHT_ECHO_ON_MUX_SERVER: Urn<'static> =
-	Urn::new("test", "event:pool-mux/single-flight-echo-on-mux-server");
+	tightbeam::urn!("test", "event:pool-mux/single-flight-echo-on-mux-server");
 
 type EmitTask = JoinHandle<Result<Option<Frame>, TransportError>>;
 

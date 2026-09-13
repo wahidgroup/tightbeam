@@ -12,8 +12,8 @@ use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConfig, Se
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-pub(crate) const POINTA: Urn<'static> = Urn::new("test", "event:tennis/pointa");
-pub(crate) const POINTB: Urn<'static> = Urn::new("test", "event:tennis/pointb");
+pub(crate) const POINTA: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointa");
+pub(crate) const POINTB: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointb");
 
 fn build_fdr_config(
 	specs: Vec<Process>,

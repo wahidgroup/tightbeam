@@ -10,8 +10,8 @@ use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, wcet};
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario};
 
-pub(crate) const TASK1: Urn<'static> = Urn::new("test", "event:rma-basic/task1");
-pub(crate) const TASK2: Urn<'static> = Urn::new("test", "event:rma-basic/task2");
+pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:rma-basic/task1");
+pub(crate) const TASK2: Urn<'static> = tightbeam::urn!("test", "event:rma-basic/task2");
 
 // Define a real-time process with timing and schedulability constraints
 tb_process_spec! {

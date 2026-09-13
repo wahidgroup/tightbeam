@@ -37,10 +37,12 @@ use crate::security::common::{
 	BACKEND_COUNT_U32,
 };
 
-pub(crate) const MITM_CAPTURE_HANDSHAKE: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-capture-handshake");
-pub(crate) const MITM_INJECT_TAMPERED: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-inject-tampered");
-pub(crate) const MITM_TAMPERING_DETECTED: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-tampering-detected");
-pub(crate) const MITM_TAMPER_MESSAGE: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-tamper-message");
+pub(crate) const MITM_CAPTURE_HANDSHAKE: Urn<'static> =
+	tightbeam::urn!("test", "event:mitm-attack/mitm-capture-handshake");
+pub(crate) const MITM_INJECT_TAMPERED: Urn<'static> = tightbeam::urn!("test", "event:mitm-attack/mitm-inject-tampered");
+pub(crate) const MITM_TAMPERING_DETECTED: Urn<'static> =
+	tightbeam::urn!("test", "event:mitm-attack/mitm-tampering-detected");
+pub(crate) const MITM_TAMPER_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:mitm-attack/mitm-tamper-message");
 
 tb_assert_spec! {
 	pub MitmAttackSpec,

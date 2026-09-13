@@ -270,7 +270,9 @@ mod tests {
 
 	#[cfg(feature = "colony")]
 	fn worker_instance() -> crate::utils::urn::Urn<'static> {
-		worker_type().servlet_instance("127.0.0.1:8080")
+		worker_type()
+			.servlet_instance("127.0.0.1:8080")
+			.expect("a servlet type URN yields an instance URN")
 	}
 
 	#[cfg(feature = "colony")]

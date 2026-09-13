@@ -41,7 +41,7 @@ mod tests {
 
 	use super::{layer_of, observing_hooks};
 
-	const SCENARIO_RAN: Urn<'static> = Urn::new("test", "event:consumer-expansion/scenario-ran");
+	const SCENARIO_RAN: Urn<'static> = tightbeam::urn!("test", "event:consumer-expansion/scenario-ran");
 
 	// `narrow` compiles without a CSP or refinement layer, so the assertion
 	// layer is the one verifier both selections share.

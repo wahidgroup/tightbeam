@@ -15,7 +15,7 @@ use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario};
 
-const SERVER_UP: Urn<'static> = Urn::new("test", "event:teardown/server-up");
+const SERVER_UP: Urn<'static> = tightbeam::urn!("test", "event:teardown/server-up");
 
 tb_assert_spec! {
 	pub ServerUpSpec,

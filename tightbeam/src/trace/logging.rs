@@ -266,17 +266,17 @@ mod tests {
 	use crate::trace::TraceCollector;
 	use crate::utils::urn::Urn;
 
-	const TEST1: Urn<'static> = Urn::new("test", "event:log/test1");
-	const TEST2: Urn<'static> = Urn::new("test", "event:log/test2");
-	const NO_LOG: Urn<'static> = Urn::new("test", "event:log/no-log");
-	const SHOULD_LOG: Urn<'static> = Urn::new("test", "event:log/should-log");
-	const EMERGENCY: Urn<'static> = Urn::new("test", "event:log/emergency");
-	const ERROR: Urn<'static> = Urn::new("test", "event:log/error");
-	const WARNING: Urn<'static> = Urn::new("test", "event:log/warning");
-	const NOTICE: Urn<'static> = Urn::new("test", "event:log/notice");
-	const INFO: Urn<'static> = Urn::new("test", "event:log/info");
-	const DEBUG: Urn<'static> = Urn::new("test", "event:log/debug");
-	const TEST: Urn<'static> = Urn::new("test", "event:log/test");
+	const TEST1: Urn<'static> = crate::urn!("test", "event:log/test1");
+	const TEST2: Urn<'static> = crate::urn!("test", "event:log/test2");
+	const NO_LOG: Urn<'static> = crate::urn!("test", "event:log/no-log");
+	const SHOULD_LOG: Urn<'static> = crate::urn!("test", "event:log/should-log");
+	const EMERGENCY: Urn<'static> = crate::urn!("test", "event:log/emergency");
+	const ERROR: Urn<'static> = crate::urn!("test", "event:log/error");
+	const WARNING: Urn<'static> = crate::urn!("test", "event:log/warning");
+	const NOTICE: Urn<'static> = crate::urn!("test", "event:log/notice");
+	const INFO: Urn<'static> = crate::urn!("test", "event:log/info");
+	const DEBUG: Urn<'static> = crate::urn!("test", "event:log/debug");
+	const TEST: Urn<'static> = crate::urn!("test", "event:log/test");
 
 	#[test]
 	fn test_log_level_ordering() {

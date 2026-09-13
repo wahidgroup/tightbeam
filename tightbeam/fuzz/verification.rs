@@ -16,19 +16,19 @@ use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-const COMPILATION_CHECK: Urn<'static> = Urn::new("fuzz", "event:verification/compilation-check");
-const WORKSPACE_HAS_AFL: Urn<'static> = Urn::new("fuzz", "event:verification/workspace-has-afl");
-const PACKAGE_ENABLES_AFL: Urn<'static> = Urn::new("fuzz", "event:verification/package-enables-afl");
-const IJON_FEATURE_ENABLED: Urn<'static> = Urn::new("fuzz", "event:verification/ijon-feature-enabled");
-const BINARY_HAS_IJON_MAX: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-ijon-max");
-const BINARY_HAS_IJON_SET: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-ijon-set");
-const BINARY_HAS_IJON_HASHINT: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-ijon-hashint");
-const BINARY_HAS_IJON_MAP_SIZE: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-ijon-map-size");
-const BINARY_HAS_AFL_RUNTIME: Urn<'static> = Urn::new("fuzz", "event:verification/binary-has-afl-runtime");
-const COVERAGE_SCORE: Urn<'static> = Urn::new("fuzz", "event:verification/coverage-score");
-const TRACK_STATE_STABLE: Urn<'static> = Urn::new("fuzz", "event:verification/track-state-stable");
-const FUZZ_ADVANCES_COVERAGE: Urn<'static> = Urn::new("fuzz", "event:verification/fuzz-advances-coverage");
-const VERIFICATION_COMPLETE: Urn<'static> = Urn::new("fuzz", "event:verification/verification-complete");
+const COMPILATION_CHECK: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/compilation-check");
+const WORKSPACE_HAS_AFL: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/workspace-has-afl");
+const PACKAGE_ENABLES_AFL: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/package-enables-afl");
+const IJON_FEATURE_ENABLED: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/ijon-feature-enabled");
+const BINARY_HAS_IJON_MAX: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/binary-has-ijon-max");
+const BINARY_HAS_IJON_SET: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/binary-has-ijon-set");
+const BINARY_HAS_IJON_HASHINT: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/binary-has-ijon-hashint");
+const BINARY_HAS_IJON_MAP_SIZE: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/binary-has-ijon-map-size");
+const BINARY_HAS_AFL_RUNTIME: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/binary-has-afl-runtime");
+const COVERAGE_SCORE: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/coverage-score");
+const TRACK_STATE_STABLE: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/track-state-stable");
+const FUZZ_ADVANCES_COVERAGE: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/fuzz-advances-coverage");
+const VERIFICATION_COMPLETE: Urn<'static> = tightbeam::urn!("fuzz", "event:verification/verification-complete");
 
 // ============================================================================
 // ASSERTION SPEC - Defines Expected Event Sequences

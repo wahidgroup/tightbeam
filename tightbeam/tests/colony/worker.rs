@@ -9,8 +9,8 @@ use tightbeam::utils::urn::Urn;
 use tightbeam::Beamable;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, worker};
 
-pub(crate) const RELAY_START: Urn<'static> = Urn::new("test", "event:worker/relay-start");
-pub(crate) const RELAY_SUCCESS: Urn<'static> = Urn::new("test", "event:worker/relay-success");
+pub(crate) const RELAY_START: Urn<'static> = tightbeam::urn!("test", "event:worker/relay-start");
+pub(crate) const RELAY_SUCCESS: Urn<'static> = tightbeam::urn!("test", "event:worker/relay-success");
 
 // Test message types
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]

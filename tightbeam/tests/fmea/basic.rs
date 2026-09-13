@@ -5,15 +5,14 @@ use tightbeam::testing::fdr::{FdrConfig, FdrVerdict};
 use tightbeam::testing::fmea::{FmeaConfig, SeverityScale};
 use tightbeam::testing::{FaultModel, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
-use tightbeam::utils::BasisPoints;
 use tightbeam::{exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
 use safety_process::States;
 
-pub(crate) const ACTUATE: Urn<'static> = Urn::new("test", "event:fmea-basic/actuate");
-pub(crate) const SAFE_MODE: Urn<'static> = Urn::new("test", "event:fmea-basic/safe-mode");
-pub(crate) const SENSOR_READ: Urn<'static> = Urn::new("test", "event:fmea-basic/sensor-read");
-pub(crate) const VALIDATE: Urn<'static> = Urn::new("test", "event:fmea-basic/validate");
+pub(crate) const ACTUATE: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/actuate");
+pub(crate) const SAFE_MODE: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/safe-mode");
+pub(crate) const SENSOR_READ: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/sensor-read");
+pub(crate) const VALIDATE: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/validate");
 
 tb_assert_spec! {
 	pub FmeaTestSpec,
@@ -62,7 +61,7 @@ impl From<SensorFault> for TightBeamError {
 fn create_test_config(scale: SeverityScale) -> FdrConfig {
 	let start_state = States::Idle;
 	let event = SENSOR_READ;
-	let probability_bps = BasisPoints::new(5000);
+	let probability_bps = tightbeam::bps!(5000);
 	let error_fn = || SensorFault;
 	let fault_model = FaultModel::default().with_fault(start_state, event, error_fn, probability_bps);
 

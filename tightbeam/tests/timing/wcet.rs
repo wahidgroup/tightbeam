@@ -14,7 +14,7 @@ use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const PROCESS: Urn<'static> = Urn::new("test", "event:wcet/process");
+pub(crate) const PROCESS: Urn<'static> = tightbeam::urn!("test", "event:wcet/process");
 
 tb_process_spec! {
 	pub SimpleWcetProcess,

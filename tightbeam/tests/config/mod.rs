@@ -8,7 +8,7 @@ use tightbeam::testing::{Expect, Layer, ScenarioConfig, ScenarioConfigError};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec};
 
-const STEP: Urn<'static> = Urn::new("test", "event:config/step");
+const STEP: Urn<'static> = tightbeam::urn!("test", "event:config/step");
 
 // Names no assertion, no gate decision, no required event and no task set, so
 // it constrains the execution mode alone.
@@ -90,7 +90,7 @@ mod progress {
 
 	use super::*;
 
-	const UNRELATED: Urn<'static> = Urn::new("test", "event:config/unrelated");
+	const UNRELATED: Urn<'static> = tightbeam::urn!("test", "event:config/unrelated");
 
 	tb_assert_spec! {
 		pub UnrelatedSpec,

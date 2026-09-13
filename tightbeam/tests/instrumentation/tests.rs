@@ -11,8 +11,8 @@ use tightbeam::transport::{MessageEmitter, Protocol};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{compose, exactly, server, tb_assert_spec, tb_process_spec, tb_scenario};
 
-pub(crate) const MESSAGE_COLLECT: Urn<'static> = Urn::new("test", "event:instrumentation-tests/message-collect");
-pub(crate) const MESSAGE_EMIT: Urn<'static> = Urn::new("test", "event:instrumentation-tests/message-emit");
+pub(crate) const MESSAGE_COLLECT: Urn<'static> = tightbeam::urn!("test", "event:instrumentation-tests/message-collect");
+pub(crate) const MESSAGE_EMIT: Urn<'static> = tightbeam::urn!("test", "event:instrumentation-tests/message-emit");
 
 tb_assert_spec! {
 	pub AutoInstrSpec,

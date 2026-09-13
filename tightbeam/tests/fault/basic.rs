@@ -16,19 +16,18 @@
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
-use tightbeam::utils::BasisPoints;
 use tightbeam::TightBeamError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
 use fault_tolerant_process::States;
 
-pub(crate) const FAILURE: Urn<'static> = Urn::new("test", "event:fault-basic/failure");
-pub(crate) const FALLBACK: Urn<'static> = Urn::new("test", "event:fault-basic/fallback");
-pub(crate) const INTERNAL_RETRY: Urn<'static> = Urn::new("test", "event:fault-basic/internal-retry");
-pub(crate) const REQUEST: Urn<'static> = Urn::new("test", "event:fault-basic/request");
-pub(crate) const RESPONSE: Urn<'static> = Urn::new("test", "event:fault-basic/response");
-pub(crate) const RETRY: Urn<'static> = Urn::new("test", "event:fault-basic/retry");
-pub(crate) const SUCCESS: Urn<'static> = Urn::new("test", "event:fault-basic/success");
+pub(crate) const FAILURE: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/failure");
+pub(crate) const FALLBACK: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/fallback");
+pub(crate) const INTERNAL_RETRY: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/internal-retry");
+pub(crate) const REQUEST: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/request");
+pub(crate) const RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/response");
+pub(crate) const RETRY: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/retry");
+pub(crate) const SUCCESS: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/success");
 
 // ============================================================================
 // ACADEMIC DEMONSTRATION: State-based fault injection with formal verification
@@ -150,7 +149,7 @@ fn build_deterministic_config() -> FdrConfig {
 		States::Sending,
 		RESPONSE,
 		|| NetworkTimeoutError { duration_ms: 3000, attempt: 1 },
-		BasisPoints::new(10000), // 100% - always inject (deterministic)
+		tightbeam::bps!(10000), // 100% - always inject (deterministic)
 	);
 
 	FdrConfig {
@@ -227,7 +226,7 @@ fn build_probabilistic_config() -> FdrConfig {
 		States::Sending,
 		RESPONSE,
 		|| NetworkTimeoutError { duration_ms: 5000, attempt: 1 },
-		BasisPoints::new(500), // 5% probability (realistic network timeout rate)
+		tightbeam::bps!(500), // 5% probability (realistic network timeout rate)
 	);
 
 	FdrConfig {
@@ -303,19 +302,19 @@ fn build_multi_fault_config() -> FdrConfig {
 			States::Sending,
 			RESPONSE,
 			|| NetworkTimeoutError { duration_ms: 3000, attempt: 1 },
-			BasisPoints::new(5000), // 50% - transient failure
+			tightbeam::bps!(5000), // 50% - transient failure
 		)
 		.with_fault(
 			States::Sending,
 			RETRY,
 			|| MessageCorruptionError { corrupted_bytes: 42 },
-			BasisPoints::new(3000), // 30% - permanent failure
+			tightbeam::bps!(3000), // 30% - permanent failure
 		)
 		.with_fault(
 			States::Retrying,
 			INTERNAL_RETRY,
 			|| ResourceExhaustionError { resource: "memory" },
-			BasisPoints::new(2000), // 20% - system failure
+			tightbeam::bps!(2000), // 20% - system failure
 		);
 
 	FdrConfig {
@@ -386,31 +385,31 @@ fn build_coverage_config() -> FdrConfig {
 			States::Idle,
 			REQUEST,
 			|| NetworkTimeoutError { duration_ms: 100, attempt: 1 },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		)
 		.with_fault(
 			States::Sending,
 			RESPONSE,
 			|| NetworkTimeoutError { duration_ms: 200, attempt: 1 },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		)
 		.with_fault(
 			States::Sending,
 			RETRY,
 			|| MessageCorruptionError { corrupted_bytes: 10 },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		)
 		.with_fault(
 			States::Retrying,
 			INTERNAL_RETRY,
 			|| ResourceExhaustionError { resource: "cpu" },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		)
 		.with_fault(
 			States::Sending,
 			FALLBACK,
 			|| ResourceExhaustionError { resource: "disk" },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		);
 
 	FdrConfig {

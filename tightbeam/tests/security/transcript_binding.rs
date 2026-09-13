@@ -55,9 +55,9 @@ use crate::common::security::{
 };
 
 pub(crate) const STRIPPED_OFFER_REJECTED: Urn<'static> =
-	Urn::new("test", "event:transcript-binding/stripped-offer-rejected");
+	tightbeam::urn!("test", "event:transcript-binding/stripped-offer-rejected");
 pub(crate) const TAMPERED_ACCEPT_REJECTED: Urn<'static> =
-	Urn::new("test", "event:transcript-binding/tampered-accept-rejected");
+	tightbeam::urn!("test", "event:transcript-binding/tampered-accept-rejected");
 
 type EciesClient = EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>;
 type EciesServer = EciesHandshakeServer<DefaultCryptoProvider>;

@@ -1042,7 +1042,7 @@ mod tests {
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_open_package_route_round_trips() -> Result<(), Box<dyn Error>> {
-		let target = Urn::new("tb", "servlet:ledger");
+		let target = crate::urn!("tb", "servlet:ledger");
 
 		let unrouted = MuxOpenPackage::new(9, false, MuxStreamKind::Streaming, frame_payload("open-local")?)?;
 		assert_eq!(unrouted.target(), None);

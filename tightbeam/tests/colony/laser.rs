@@ -51,13 +51,13 @@ use crate::common::laser::{LaserAddr, LaserListener};
 use crate::common::security::expectation_failure;
 use crate::common::x509::GatewayCerts;
 
-pub(crate) const LASER_WORK_SENT: Urn<'static> = Urn::new("test", "event:laser/work-sent");
-pub(crate) const LASER_WORK_STATUS: Urn<'static> = Urn::new("test", "event:laser/work-status");
-pub(crate) const LASER_WORK_ECHOED: Urn<'static> = Urn::new("test", "event:laser/work-echoed");
+pub(crate) const LASER_WORK_SENT: Urn<'static> = tightbeam::urn!("test", "event:laser/work-sent");
+pub(crate) const LASER_WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:laser/work-status");
+pub(crate) const LASER_WORK_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:laser/work-echoed");
 pub(crate) const LASER_SERVER_STREAM_REPORTS_LENGTH: Urn<'static> =
-	Urn::new("test", "event:laser/server-stream-reports-length");
-pub(crate) const LASER_ROUTE_BEFORE_RESTART: Urn<'static> = Urn::new("test", "event:laser/route-before-restart");
-pub(crate) const LASER_ROUTE_AFTER_RESTART: Urn<'static> = Urn::new("test", "event:laser/route-after-restart");
+	tightbeam::urn!("test", "event:laser/server-stream-reports-length");
+pub(crate) const LASER_ROUTE_BEFORE_RESTART: Urn<'static> = tightbeam::urn!("test", "event:laser/route-before-restart");
+pub(crate) const LASER_ROUTE_AFTER_RESTART: Urn<'static> = tightbeam::urn!("test", "event:laser/route-after-restart");
 
 /// The stable airspace slot the restart scenario rebinds. It sits far
 /// above the slots that `LaserAddr::ANY` assigns sequentially.

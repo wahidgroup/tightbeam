@@ -21,12 +21,13 @@ use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const CLEARTEXT_BUDGETS_UNMETERED: Urn<'static> =
-	Urn::new("test", "event:cleartext/cleartext-budgets-unmetered");
-pub(crate) const CLEARTEXT_CHUNKED_ECHO: Urn<'static> = Urn::new("test", "event:cleartext/cleartext-chunked-echo");
-pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:cleartext/first-stream-echoed");
+	tightbeam::urn!("test", "event:cleartext/cleartext-budgets-unmetered");
+pub(crate) const CLEARTEXT_CHUNKED_ECHO: Urn<'static> =
+	tightbeam::urn!("test", "event:cleartext/cleartext-chunked-echo");
+pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cleartext/first-stream-echoed");
 pub(crate) const RESPONDER_POLICY_REJECTION: Urn<'static> =
-	Urn::new("test", "event:cleartext/responder-policy-rejection");
-pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:cleartext/second-stream-echoed");
+	tightbeam::urn!("test", "event:cleartext/responder-policy-rejection");
+pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cleartext/second-stream-echoed");
 
 tb_assert_spec! {
 	pub MuxCleartextInterleavedSpec,
@@ -181,9 +182,10 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const CLEARTEXT_STREAMING_ECHO: Urn<'static> = Urn::new("test", "event:cleartext/cleartext-streaming-echo");
+pub(crate) const CLEARTEXT_STREAMING_ECHO: Urn<'static> =
+	tightbeam::urn!("test", "event:cleartext/cleartext-streaming-echo");
 pub(crate) const CLEARTEXT_STREAMING_CHUNKED: Urn<'static> =
-	Urn::new("test", "event:cleartext/cleartext-streaming-chunked");
+	tightbeam::urn!("test", "event:cleartext/cleartext-streaming-chunked");
 
 tb_assert_spec! {
 	pub MuxCleartextStreamingSpec,

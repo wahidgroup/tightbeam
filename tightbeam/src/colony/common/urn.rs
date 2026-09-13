@@ -112,7 +112,7 @@ impl ColonyNamespace {
 		let name = name.as_ref();
 		Self::validate_single_segment_name(name)?;
 
-		Ok(self.mint(SERVLET_SEGMENT, name))
+		self.mint(SERVLET_SEGMENT, name)
 	}
 
 	/// Mint the URN naming a colony.
@@ -127,7 +127,7 @@ impl ColonyNamespace {
 		let name = name.as_ref();
 		Self::validate_single_segment_name(name)?;
 
-		Ok(self.mint(COLONY_SEGMENT, name))
+		self.mint(COLONY_SEGMENT, name)
 	}
 
 	/// Refuse a `resource-id` that is empty or carries a grammar
@@ -156,7 +156,7 @@ impl ColonyNamespace {
 			return Err(UrnValidationError::RequiredFieldMissing("resource-id"));
 		}
 
-		Ok(self.mint(HIVE_SEGMENT, addr))
+		self.mint(HIVE_SEGMENT, addr)
 	}
 
 	/// Mint the hive URN for a locator carried as bytes.
@@ -191,11 +191,14 @@ impl ColonyNamespace {
 		}
 	}
 
-	fn mint(&self, resource_type: &str, id: &str) -> Urn<'static> {
-		Urn {
-			nid: Cow::Owned(String::from(self.nid.as_ref())),
-			nss: Cow::Owned(format!("{}:{}:{}", self.realm, resource_type, id)),
-		}
+	/// # Errors
+	///
+	/// - Whatever [`Urn::from_parts`] refuses. A namespace built through its
+	///   own constructor cannot produce one, but the namespace's parts are
+	///   not carried in a type that says so.
+	fn mint(&self, resource_type: &str, id: &str) -> Result<Urn<'static>, UrnValidationError> {
+		let nss = format!("{}:{}:{}", self.realm, resource_type, id);
+		Urn::from_parts(self.nid.as_ref(), nss)
 	}
 
 	/// Validate a URN against this namespace and parse its resource.
@@ -209,12 +212,12 @@ impl ColonyNamespace {
 	/// exact matching keeps registry keys derived from canonical bytes
 	/// valid without case folding anywhere.
 	pub fn validate<'a>(&self, urn: &'a Urn<'a>) -> Result<ColonyResource<'a>, UrnValidationError> {
-		if urn.nid.as_ref() != self.nid.as_ref() {
+		if urn.nid() != self.nid.as_ref() {
 			return Err(UrnValidationError::NidMismatch);
 		}
 
 		let (realm, rest) = urn
-			.nss
+			.nss()
 			.split_once(':')
 			.ok_or(UrnValidationError::RequiredFieldMissing("resource-type"))?;
 		if realm != self.realm.as_ref() {
@@ -259,11 +262,14 @@ impl Urn<'_> {
 	/// Mint the instance URN under a servlet type: the type's URN with a
 	/// `/{addr}` tail. Authority and realm are inherited from the type, so
 	/// no namespace handle is needed.
-	pub fn servlet_instance(&self, addr: impl AsRef<str>) -> Urn<'static> {
-		Urn {
-			nid: Cow::Owned(String::from(self.nid.as_ref())),
-			nss: Cow::Owned(format!("{}/{}", self.nss, addr.as_ref())),
-		}
+	/// # Errors
+	///
+	/// - Whatever [`Urn::from_parts`] refuses. This URN's own parts already
+	///   satisfy it, so only a caller holding one built before this rule
+	///   existed can see an error here.
+	pub fn servlet_instance(&self, addr: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
+		let nss = format!("{}/{}", self.nss(), addr.as_ref());
+		Urn::from_parts(self.nid(), nss)
 	}
 
 	/// Servlet-type URN with the instance locator as the resource-id tail.
@@ -279,7 +285,7 @@ impl Urn<'_> {
 			})
 		})?;
 
-		Ok(self.servlet_instance(addr))
+		Ok(self.servlet_instance(addr)?)
 	}
 
 	/// Canonical bytes of a URN: its display form (`urn:nid:nss`).
@@ -309,7 +315,6 @@ impl Urn<'_> {
 	pub fn type_prefix_bytes(&self) -> Vec<u8> {
 		let mut prefix = self.type_canonical_bytes();
 		prefix.push(b'/');
-
 		prefix
 	}
 }
@@ -355,7 +360,9 @@ mod tests {
 			),
 			(
 				&prod,
-				servlet(&prod, "beam").servlet_instance("10.0.0.5:9100"),
+				servlet(&prod, "beam")
+					.servlet_instance("10.0.0.5:9100")
+					.expect("a servlet type URN yields an instance URN"),
 				"urn:tightbeam:prod-us:servlet:beam/10.0.0.5:9100",
 				ColonyResource::Servlet { name: "beam", instance: Some("10.0.0.5:9100") },
 			),
@@ -394,30 +401,35 @@ mod tests {
 	fn foreign_or_malformed_urns_are_refused() {
 		let namespace = prod();
 		let cases = [
-			(Urn::new("acme", "prod-us:servlet:beam"), UrnValidationError::NidMismatch),
-			(Urn::new("tightbeam", "staging:servlet:beam"), UrnValidationError::RealmMismatch),
+			(crate::urn!("acme", "prod-us:servlet:beam"), UrnValidationError::NidMismatch),
 			(
-				Urn::new("tightbeam", "prod-us:queue:beam"),
+				crate::urn!("tightbeam", "staging:servlet:beam"),
+				UrnValidationError::RealmMismatch,
+			),
+			(
+				crate::urn!("tightbeam", "prod-us:queue:beam"),
 				UrnValidationError::InvalidFormat { field: "resource-type", pattern: None },
 			),
 			(
-				Urn::new("tightbeam", "prod-us"),
+				crate::urn!("tightbeam", "prod-us"),
 				UrnValidationError::RequiredFieldMissing("resource-type"),
 			),
 			(
-				Urn::new("tightbeam", "prod-us:servlet:"),
+				crate::urn!("tightbeam", "prod-us:servlet:"),
 				UrnValidationError::RequiredFieldMissing("resource-id"),
 			),
 			(
-				servlet(&namespace, "beam").servlet_instance(""),
+				servlet(&namespace, "beam")
+					.servlet_instance("")
+					.expect("a servlet type URN yields an instance URN"),
 				UrnValidationError::RequiredFieldMissing("instance"),
 			),
 			(
-				Urn::new("tightbeam", "prod-us:colony:main/tail"),
+				crate::urn!("tightbeam", "prod-us:colony:main/tail"),
 				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
 			),
 			(
-				Urn::new("tightbeam", "prod-us:colony:main:extra"),
+				crate::urn!("tightbeam", "prod-us:colony:main:extra"),
 				UrnValidationError::InvalidFormat { field: "resource-id", pattern: None },
 			),
 		];
@@ -450,7 +462,9 @@ mod tests {
 	fn type_canonical_bytes_strips_instance_tail() {
 		let namespace = prod();
 		let servlet_type = servlet(&namespace, "beam");
-		let instance = servlet_type.servlet_instance("10.0.0.5:9100");
+		let instance = servlet_type
+			.servlet_instance("10.0.0.5:9100")
+			.expect("a servlet type URN yields an instance URN");
 
 		assert_eq!(instance.type_canonical_bytes(), servlet_type.canonical_bytes());
 		assert_eq!(servlet_type.type_canonical_bytes(), servlet_type.canonical_bytes());
@@ -460,8 +474,14 @@ mod tests {
 	fn type_prefix_bounds_instance_keys_to_one_type() {
 		let namespace = prod();
 		let beam = servlet(&namespace, "beam");
-		let beam_instance = beam.servlet_instance("10.0.0.5:9100").canonical_bytes();
-		let beam2_instance = servlet(&namespace, "beam2").servlet_instance("10.0.0.5:9200").canonical_bytes();
+		let beam_instance = beam
+			.servlet_instance("10.0.0.5:9100")
+			.expect("a servlet type URN yields an instance URN")
+			.canonical_bytes();
+		let beam2_instance = servlet(&namespace, "beam2")
+			.servlet_instance("10.0.0.5:9200")
+			.expect("a servlet type URN yields an instance URN")
+			.canonical_bytes();
 
 		let prefix = beam.type_prefix_bytes();
 		assert!(beam_instance.starts_with(&prefix));

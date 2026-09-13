@@ -63,7 +63,7 @@ mod tests {
 	use crate::testing::TBSpec;
 	use crate::utils::urn::Urn;
 
-	const MESSAGE_RECEIVED: Urn<'static> = Urn::new("test", "event:demo/message-received");
+	const MESSAGE_RECEIVED: Urn<'static> = crate::urn!("test", "event:demo/message-received");
 
 	crate::tb_assert_spec! {
 		pub DemoSpec,

@@ -42,13 +42,13 @@ use crate::security::common::{
 };
 
 pub(crate) const DOWNGRADE_CAPTURE_STRONG: Urn<'static> =
-	Urn::new("test", "event:downgrade-attack/downgrade-capture-strong");
+	tightbeam::urn!("test", "event:downgrade-attack/downgrade-capture-strong");
 pub(crate) const DOWNGRADE_CAPTURE_WEAK: Urn<'static> =
-	Urn::new("test", "event:downgrade-attack/downgrade-capture-weak");
+	tightbeam::urn!("test", "event:downgrade-attack/downgrade-capture-weak");
 pub(crate) const DOWNGRADE_PROFILES_DIFFER: Urn<'static> =
-	Urn::new("test", "event:downgrade-attack/downgrade-profiles-differ");
+	tightbeam::urn!("test", "event:downgrade-attack/downgrade-profiles-differ");
 pub(crate) const DOWNGRADE_SUBSTITUTION_REJECTED: Urn<'static> =
-	Urn::new("test", "event:downgrade-attack/downgrade-substitution-rejected");
+	tightbeam::urn!("test", "event:downgrade-attack/downgrade-substitution-rejected");
 
 tb_assert_spec! {
 	pub DowngradeAttackSpec,

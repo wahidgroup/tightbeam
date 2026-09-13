@@ -911,7 +911,7 @@ mod tests {
 
 	#[test]
 	fn step_event_accepts_full_urn_label() {
-		const GO: Urn<'static> = Urn::new("fuzz", "event:test/go");
+		const GO: Urn<'static> = crate::urn!("fuzz", "event:test/go");
 		let proc = build_urn_step_process(GO);
 
 		let ctx = FuzzContext::new(Vec::new(), proc);

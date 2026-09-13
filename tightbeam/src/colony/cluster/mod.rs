@@ -628,7 +628,6 @@ mod tests {
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::policy::TransitStatus;
 	use crate::testing::{TestCertificate, TestKey};
-	use crate::utils::BasisPoints;
 
 	// =========================================================================
 	// Test Helpers
@@ -770,7 +769,7 @@ mod tests {
 	fn registry_update_utilization() -> Result<(), ClusterError> {
 		let registry = test_registry();
 		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
-		assert!(registry.update_utilization(b"127.0.0.1:8080", BasisPoints::new(5000))?);
+		assert!(registry.update_utilization(b"127.0.0.1:8080", crate::bps!(5000))?);
 		assert_eq!(registry.hives_for_type(&type_key("ping"))?[0].utilization.get(), 5000);
 		Ok(())
 	}

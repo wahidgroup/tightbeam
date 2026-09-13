@@ -36,42 +36,43 @@ use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const CHAINED_RECEIPT_VERIFIES_AGAINST_ORIGINAL_CERTS: Urn<'static> =
-	Urn::new("test", "event:rekey/chained-receipt-verifies-against-original-certs");
+	tightbeam::urn!("test", "event:rekey/chained-receipt-verifies-against-original-certs");
 pub(crate) const CLEARTEXT_HARVEST_YIELDS_NOTHING: Urn<'static> =
-	Urn::new("test", "event:rekey/cleartext-harvest-yields-nothing");
+	tightbeam::urn!("test", "event:rekey/cleartext-harvest-yields-nothing");
 pub(crate) const CONSECUTIVE_EPOCHS_ROTATE_DISTINCT_RECEIPTS: Urn<'static> =
-	Urn::new("test", "event:rekey/consecutive-epochs-rotate-distinct-receipts");
+	tightbeam::urn!("test", "event:rekey/consecutive-epochs-rotate-distinct-receipts");
 pub(crate) const DUPLICATE_REQUEST_VIOLATES_PROTOCOL: Urn<'static> =
-	Urn::new("test", "event:rekey/duplicate-request-violates-protocol");
+	tightbeam::urn!("test", "event:rekey/duplicate-request-violates-protocol");
 pub(crate) const EMITS_SURVIVE_BUDGET_WATERMARK: Urn<'static> =
-	Urn::new("test", "event:rekey/emits-survive-budget-watermark");
+	tightbeam::urn!("test", "event:rekey/emits-survive-budget-watermark");
 pub(crate) const EMITS_SURVIVE_SETTLED_RENEWAL: Urn<'static> =
-	Urn::new("test", "event:rekey/emits-survive-settled-renewal");
-pub(crate) const EMITS_SURVIVE_TWO_RENEWALS: Urn<'static> = Urn::new("test", "event:rekey/emits-survive-two-renewals");
+	tightbeam::urn!("test", "event:rekey/emits-survive-settled-renewal");
+pub(crate) const EMITS_SURVIVE_TWO_RENEWALS: Urn<'static> =
+	tightbeam::urn!("test", "event:rekey/emits-survive-two-renewals");
 pub(crate) const ENDPOINTS_AGREE_ON_EPOCH_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:rekey/endpoints-agree-on-epoch-receipt");
-pub(crate) const EPOCH_RECEIPT_ROTATES: Urn<'static> = Urn::new("test", "event:rekey/epoch-receipt-rotates");
-pub(crate) const FIRST_REQUEST_ANSWERED: Urn<'static> = Urn::new("test", "event:rekey/first-request-answered");
+	tightbeam::urn!("test", "event:rekey/endpoints-agree-on-epoch-receipt");
+pub(crate) const EPOCH_RECEIPT_ROTATES: Urn<'static> = tightbeam::urn!("test", "event:rekey/epoch-receipt-rotates");
+pub(crate) const FIRST_REQUEST_ANSWERED: Urn<'static> = tightbeam::urn!("test", "event:rekey/first-request-answered");
 pub(crate) const PREMATURE_REQUEST_VIOLATES_PROTOCOL: Urn<'static> =
-	Urn::new("test", "event:rekey/premature-request-violates-protocol");
+	tightbeam::urn!("test", "event:rekey/premature-request-violates-protocol");
 pub(crate) const RECEIPTLESS_DRAIN_KEEPS_TODAYS_PATH: Urn<'static> =
-	Urn::new("test", "event:rekey/receiptless-drain-keeps-todays-path");
+	tightbeam::urn!("test", "event:rekey/receiptless-drain-keeps-todays-path");
 pub(crate) const RECEIPTLESS_SESSION_HAS_NO_EPOCH_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:rekey/receiptless-session-has-no-epoch-receipt");
+	tightbeam::urn!("test", "event:rekey/receiptless-session-has-no-epoch-receipt");
 pub(crate) const RECEIPTLESS_TRANSFER_SURVIVES_DRAIN: Urn<'static> =
-	Urn::new("test", "event:rekey/receiptless-transfer-survives-drain");
+	tightbeam::urn!("test", "event:rekey/receiptless-transfer-survives-drain");
 pub(crate) const REFUSAL_CODE_REACHES_CLIENT: Urn<'static> =
-	Urn::new("test", "event:rekey/refusal-code-reaches-client");
+	tightbeam::urn!("test", "event:rekey/refusal-code-reaches-client");
 pub(crate) const REFUSAL_CODE_REACHES_SERVER: Urn<'static> =
-	Urn::new("test", "event:rekey/refusal-code-reaches-server");
+	tightbeam::urn!("test", "event:rekey/refusal-code-reaches-server");
 pub(crate) const RENEWAL_REQUEST_REACHES_SERVER: Urn<'static> =
-	Urn::new("test", "event:rekey/renewal-request-reaches-server");
+	tightbeam::urn!("test", "event:rekey/renewal-request-reaches-server");
 pub(crate) const SETTLE_HOOK_FIRES_ON_RENEWAL: Urn<'static> =
-	Urn::new("test", "event:rekey/settle-hook-fires-on-renewal");
+	tightbeam::urn!("test", "event:rekey/settle-hook-fires-on-renewal");
 pub(crate) const STALLED_RENEWAL_DRAINS_CLEAN: Urn<'static> =
-	Urn::new("test", "event:rekey/stalled-renewal-drains-clean");
+	tightbeam::urn!("test", "event:rekey/stalled-renewal-drains-clean");
 pub(crate) const TRAFFIC_STRADDLES_KEY_SWITCH: Urn<'static> =
-	Urn::new("test", "event:rekey/traffic-straddles-key-switch");
+	tightbeam::urn!("test", "event:rekey/traffic-straddles-key-switch");
 
 /// Settlement challenge the authorizer binds into every epoch receipt.
 const RENEWAL_CHALLENGE: &[u8] = b"epoch-invoice-7";
@@ -341,9 +342,9 @@ tb_assert_spec! {
 }
 
 pub(crate) const STREAMED_TRAFFIC_STRADDLES_KEY_SWITCH: Urn<'static> =
-	Urn::new("test", "event:rekey/streamed-traffic-straddles-key-switch");
+	tightbeam::urn!("test", "event:rekey/streamed-traffic-straddles-key-switch");
 pub(crate) const STREAMING_EPOCH_RECEIPT_ROTATES: Urn<'static> =
-	Urn::new("test", "event:rekey/streaming-epoch-receipt-rotates");
+	tightbeam::urn!("test", "event:rekey/streaming-epoch-receipt-rotates");
 
 tb_assert_spec! {
 	pub MuxRekeyStreamingRenewalSpec,

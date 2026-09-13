@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: BasisPoints must be 0-10000
+ --> tests/compile/bps_out_of_range.rs:5:31
+  |
+5 | const REJECTED: BasisPoints = tightbeam::bps!(10001);
+  |                               ^^^^^^^^^^^^^^^^^^^^^^ evaluation of `REJECTED::{constant#0}` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `tightbeam::bps` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/compile/bps_out_of_range.rs:5:31
+  |
+5 | const REJECTED: BasisPoints = tightbeam::bps!(10001);
+  |                               ^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the macro `tightbeam::bps` (in Nightly builds, run with -Z macro-backtrace for more info)

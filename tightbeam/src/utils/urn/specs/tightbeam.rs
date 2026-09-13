@@ -243,7 +243,7 @@ mod tests {
 	}
 
 	#[cfg(feature = "testing")]
-	const URN_STRING: Urn<'static> = Urn::new("test", "event:urn-spec/urn-string");
+	const URN_STRING: Urn<'static> = crate::urn!("test", "event:urn-spec/urn-string");
 
 	#[cfg(feature = "testing")]
 	tb_assert_spec! {

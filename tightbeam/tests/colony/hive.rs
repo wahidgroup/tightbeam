@@ -51,28 +51,31 @@ fn servlet_urn(name: &str) -> Urn<'static> {
 }
 
 pub(crate) const BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
-	Urn::new("test", "event:hive/backpressure-heartbeat-heartbeat-shape");
+	tightbeam::urn!("test", "event:hive/backpressure-heartbeat-heartbeat-shape");
 pub(crate) const BACKPRESSURE_MANAGE_MANAGE_SHAPE: Urn<'static> =
-	Urn::new("test", "event:hive/backpressure-manage-manage-shape");
+	tightbeam::urn!("test", "event:hive/backpressure-manage-manage-shape");
 pub(crate) const DRAINING_MANAGE_MANAGE_SHAPE: Urn<'static> =
-	Urn::new("test", "event:hive/draining-manage-manage-shape");
-pub(crate) const FIRST_SPAWN_FORBIDDEN: Urn<'static> = Urn::new("test", "event:hive/first-spawn-forbidden");
-pub(crate) const FORGED_HEARTBEAT_DENIED: Urn<'static> = Urn::new("test", "event:hive/forged-heartbeat-denied");
-pub(crate) const HIVE_ESTABLISHED: Urn<'static> = Urn::new("test", "event:hive/hive-established");
-pub(crate) const HIVE_STARTED: Urn<'static> = Urn::new("test", "event:hive/hive-started");
-pub(crate) const REGISTER_BEFORE_ESTABLISH: Urn<'static> = Urn::new("test", "event:hive/register-before-establish");
+	tightbeam::urn!("test", "event:hive/draining-manage-manage-shape");
+pub(crate) const FIRST_SPAWN_FORBIDDEN: Urn<'static> = tightbeam::urn!("test", "event:hive/first-spawn-forbidden");
+pub(crate) const FORGED_HEARTBEAT_DENIED: Urn<'static> = tightbeam::urn!("test", "event:hive/forged-heartbeat-denied");
+pub(crate) const HIVE_ESTABLISHED: Urn<'static> = tightbeam::urn!("test", "event:hive/hive-established");
+pub(crate) const HIVE_STARTED: Urn<'static> = tightbeam::urn!("test", "event:hive/hive-started");
+pub(crate) const REGISTER_BEFORE_ESTABLISH: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/register-before-establish");
 pub(crate) const OPEN_BREAKER_HEARTBEAT_SHAPE: Urn<'static> =
-	Urn::new("test", "event:hive/open-breaker-heartbeat-shape");
-pub(crate) const RETRY_SPAWN_ACCEPTED: Urn<'static> = Urn::new("test", "event:hive/retry-spawn-accepted");
-pub(crate) const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:hive/servlet-receive");
-pub(crate) const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:hive/servlet-respond");
-pub(crate) const SERVLET_STOPPED: Urn<'static> = Urn::new("test", "event:hive/servlet-stopped");
-pub(crate) const SIGNED_HEARTBEAT_ACCEPTED: Urn<'static> = Urn::new("test", "event:hive/signed-heartbeat-accepted");
-pub(crate) const SPAWN_NON_UTF8_FORBIDDEN: Urn<'static> = Urn::new("test", "event:hive/spawn-non-utf8-forbidden");
+	tightbeam::urn!("test", "event:hive/open-breaker-heartbeat-shape");
+pub(crate) const RETRY_SPAWN_ACCEPTED: Urn<'static> = tightbeam::urn!("test", "event:hive/retry-spawn-accepted");
+pub(crate) const SERVLET_RECEIVE: Urn<'static> = tightbeam::urn!("test", "event:hive/servlet-receive");
+pub(crate) const SERVLET_RESPOND: Urn<'static> = tightbeam::urn!("test", "event:hive/servlet-respond");
+pub(crate) const SERVLET_STOPPED: Urn<'static> = tightbeam::urn!("test", "event:hive/servlet-stopped");
+pub(crate) const SIGNED_HEARTBEAT_ACCEPTED: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/signed-heartbeat-accepted");
+pub(crate) const SPAWN_NON_UTF8_FORBIDDEN: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/spawn-non-utf8-forbidden");
 pub(crate) const UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
-	Urn::new("test", "event:hive/unsigned-heartbeat-heartbeat-shape");
+	tightbeam::urn!("test", "event:hive/unsigned-heartbeat-heartbeat-shape");
 pub(crate) const UNSIGNED_MANAGE_MANAGE_SHAPE: Urn<'static> =
-	Urn::new("test", "event:hive/unsigned-manage-manage-shape");
+	tightbeam::urn!("test", "event:hive/unsigned-manage-manage-shape");
 
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct HiveTestRequest {
@@ -188,7 +191,9 @@ fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError
 /// Builds a manage command frame with a stop request. Each call site
 /// passes a unique id.
 fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
-	let servlet_id = servlet_urn("none").servlet_instance("127.0.0.1:0");
+	let servlet_id = servlet_urn("none")
+		.servlet_instance("127.0.0.1:0")
+		.expect("a servlet type URN yields an instance URN");
 	let stop = StopServletParams { servlet_id };
 	let manage = HiveManagementRequest { spawn: None, list: None, stop: Some(stop) };
 	let manage_cmd = ClusterCommand { heartbeat: None, manage: Some(manage) };
@@ -692,16 +697,18 @@ tb_scenario! {
 // intra-hive route, including the id, the nonrepudiation block, and the
 // previous-frame linkage.
 
-pub(crate) const HIVE_CALL_SIGNED: Urn<'static> = Urn::new("test", "event:hive/call-signed");
-pub(crate) const HIVE_CALL_PREVIOUS: Urn<'static> = Urn::new("test", "event:hive/call-previous");
-pub(crate) const CONTRACT_FRAME_CLIENT_ID: Urn<'static> = Urn::new("test", "event:hive/contract-frame-client-id");
-pub(crate) const CONTRACT_FRAME_SIGNED: Urn<'static> = Urn::new("test", "event:hive/contract-frame-signed");
-pub(crate) const CONTRACT_FRAME_PREVIOUS: Urn<'static> = Urn::new("test", "event:hive/contract-frame-previous");
-pub(crate) const CONTRACT_FRAME_SIG_VALID: Urn<'static> = Urn::new("test", "event:hive/contract-frame-sig-valid");
-pub(crate) const HIVE_CALL_REPLY_ID: Urn<'static> = Urn::new("test", "event:hive/call-reply-id");
-pub(crate) const HIVE_CALL_REPLY_SIGNED: Urn<'static> = Urn::new("test", "event:hive/call-reply-signed");
-pub(crate) const HIVE_CALL_REPLY_SIG_VALID: Urn<'static> = Urn::new("test", "event:hive/call-reply-sig-valid");
-pub(crate) const HIVE_CALL_ECHOED: Urn<'static> = Urn::new("test", "event:hive/call-echoed");
+pub(crate) const HIVE_CALL_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:hive/call-signed");
+pub(crate) const HIVE_CALL_PREVIOUS: Urn<'static> = tightbeam::urn!("test", "event:hive/call-previous");
+pub(crate) const CONTRACT_FRAME_CLIENT_ID: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/contract-frame-client-id");
+pub(crate) const CONTRACT_FRAME_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:hive/contract-frame-signed");
+pub(crate) const CONTRACT_FRAME_PREVIOUS: Urn<'static> = tightbeam::urn!("test", "event:hive/contract-frame-previous");
+pub(crate) const CONTRACT_FRAME_SIG_VALID: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/contract-frame-sig-valid");
+pub(crate) const HIVE_CALL_REPLY_ID: Urn<'static> = tightbeam::urn!("test", "event:hive/call-reply-id");
+pub(crate) const HIVE_CALL_REPLY_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:hive/call-reply-signed");
+pub(crate) const HIVE_CALL_REPLY_SIG_VALID: Urn<'static> = tightbeam::urn!("test", "event:hive/call-reply-sig-valid");
+pub(crate) const HIVE_CALL_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:hive/call-echoed");
 
 /// Returns the deterministic contract key that the caller and the sibling
 /// servlet share, so each side can verify the other's frame signature

@@ -8,9 +8,9 @@ use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
-pub(crate) const TASK1: Urn<'static> = Urn::new("test", "event:edf-basic/task1");
-pub(crate) const TASK2: Urn<'static> = Urn::new("test", "event:edf-basic/task2");
-pub(crate) const TASK3: Urn<'static> = Urn::new("test", "event:edf-basic/task3");
+pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:edf-basic/task1");
+pub(crate) const TASK2: Urn<'static> = tightbeam::urn!("test", "event:edf-basic/task2");
+pub(crate) const TASK3: Urn<'static> = tightbeam::urn!("test", "event:edf-basic/task3");
 
 // Define a real-time process with EDF scheduling
 tb_process_spec! {

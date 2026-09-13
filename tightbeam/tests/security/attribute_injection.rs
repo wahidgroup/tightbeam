@@ -46,11 +46,11 @@ use tightbeam::x509::attr::Attribute;
 use tightbeam::TightBeamError;
 
 pub(crate) const DUPLICATE_ATTRIBUTE_FAILS_CLOSED: Urn<'static> =
-	Urn::new("test", "event:attribute-injection/duplicate-attribute-fails-closed");
+	tightbeam::urn!("test", "event:attribute-injection/duplicate-attribute-fails-closed");
 pub(crate) const INJECTION_INVISIBLE_TO_SIGNATURES: Urn<'static> =
-	Urn::new("test", "event:attribute-injection/injection-invisible-to-signatures");
+	tightbeam::urn!("test", "event:attribute-injection/injection-invisible-to-signatures");
 pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
-	Urn::new("test", "event:attribute-injection/session-never-activates");
+	tightbeam::urn!("test", "event:attribute-injection/session-never-activates");
 
 use crate::common::security::{
 	cms_mutual_budget_pair, expectation_failure, CmsSessionHooks, GrantingAuthorizer, ServerMaterials,

@@ -744,7 +744,9 @@ mod tests {
 		round_trip(ClusterRequest::RegisterHive(RegisterHiveRequest {
 			hive_addr: b"127.0.0.1:9000".to_vec(),
 			servlet_addresses: vec![ServletInfo {
-				servlet_id: ping_type().servlet_instance("127.0.0.1:9001"),
+				servlet_id: ping_type()
+					.servlet_instance("127.0.0.1:9001")
+					.expect("a servlet type URN yields an instance URN"),
 				address: b"127.0.0.1:9001".to_vec(),
 			}],
 			metadata: None,
@@ -756,7 +758,9 @@ mod tests {
 		round_trip(ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
 			hive_id: hive_id(),
 			added: vec![],
-			removed: vec![ping_type().servlet_instance("127.0.0.1:9100")],
+			removed: vec![ping_type()
+				.servlet_instance("127.0.0.1:9100")
+				.expect("a servlet type URN yields an instance URN")],
 		}))
 	}
 

@@ -379,7 +379,9 @@ pub fn servlet_address_update(hive_addr: &[u8], added: Vec<ServletInfo>, removed
 
 pub fn servlet_info(servlet_name: &str, address: &[u8]) -> ServletInfo {
 	ServletInfo {
-		servlet_id: servlet_urn(servlet_name).servlet_instance(String::from_utf8_lossy(address).as_ref()),
+		servlet_id: servlet_urn(servlet_name)
+			.servlet_instance(String::from_utf8_lossy(address).as_ref())
+			.expect("a servlet type URN yields an instance URN"),
 		address: address.to_vec(),
 	}
 }
@@ -387,7 +389,9 @@ pub fn servlet_info(servlet_name: &str, address: &[u8]) -> ServletInfo {
 /// ServletInfo whose instance locator disagrees with the route address.
 pub fn servlet_info_mismatched(servlet_name: &str, urn_addr: &[u8], route_addr: &[u8]) -> ServletInfo {
 	ServletInfo {
-		servlet_id: servlet_urn(servlet_name).servlet_instance(String::from_utf8_lossy(urn_addr).as_ref()),
+		servlet_id: servlet_urn(servlet_name)
+			.servlet_instance(String::from_utf8_lossy(urn_addr).as_ref())
+			.expect("a servlet type URN yields an instance URN"),
 		address: route_addr.to_vec(),
 	}
 }
@@ -651,6 +655,7 @@ pub fn foreign_realm_instance(addr: &str) -> Urn<'static> {
 		.servlet("ping")
 		.expect("test names satisfy the mint grammar")
 		.servlet_instance(addr)
+		.expect("a servlet type URN yields an instance URN")
 }
 
 /// Gateway conf that accepts peer advertisements.

@@ -5,7 +5,6 @@
 //! familiar Result methods.
 
 #[cfg(any(test, feature = "testing"))]
-use std::borrow::Cow;
 #[cfg(any(test, feature = "testing"))]
 use std::sync::Arc;
 
@@ -154,11 +153,9 @@ fn to_snake_case(type_name: &str) -> String {
 ///
 /// Format: `urn:tightbeam:event:job/<job-name>-<suffix>`
 #[cfg(any(test, feature = "testing"))]
-fn make_event_urn(job_name: &str, suffix: &str) -> Urn<'static> {
-	Urn {
-		nid: Cow::Borrowed("tightbeam"),
-		nss: Cow::Owned(format!("event:job/{}-{}", job_name.replace('_', "-"), suffix)),
-	}
+fn make_event_urn(job_name: &str, suffix: &str) -> Result<Urn<'static>, crate::TightBeamError> {
+	let nss = format!("event:job/{}-{}", job_name.replace('_', "-"), suffix);
+	Ok(Urn::from_parts("tightbeam", nss)?)
 }
 
 /// Result with trace context for auto-trace events
@@ -201,7 +198,11 @@ where
 		TracedResult {
 			result: self.result.and_then(|val| {
 				// Auto-emit: urn:tightbeam:instrumentation:event/<job_name>_start
-				if let Err(e) = self.trace.event(make_event_urn(&job_name, "start")) {
+				let event_urn = match make_event_urn(&job_name, "start") {
+					Ok(urn) => urn,
+					Err(e) => return Err(E::from(e)),
+				};
+				if let Err(e) = self.trace.event(event_urn) {
 					return Err(E::from(e));
 				}
 
@@ -209,12 +210,20 @@ where
 				let res = f(val);
 				match &res {
 					Ok(_) => {
-						if let Err(e) = self.trace.event(make_event_urn(&job_name, "success")) {
+						let event_urn = match make_event_urn(&job_name, "success") {
+							Ok(urn) => urn,
+							Err(e) => return Err(E::from(e)),
+						};
+						if let Err(e) = self.trace.event(event_urn) {
 							return Err(E::from(e));
 						}
 					}
 					Err(_) => {
-						if let Err(e) = self.trace.event(make_event_urn(&job_name, "error")) {
+						let event_urn = match make_event_urn(&job_name, "error") {
+							Ok(urn) => urn,
+							Err(e) => return Err(E::from(e)),
+						};
+						if let Err(e) = self.trace.event(event_urn) {
 							return Err(E::from(e));
 						}
 					}
@@ -354,15 +363,21 @@ mod tests {
 	#[test]
 	fn test_make_event_urn() {
 		assert_eq!(
-			make_event_urn("create_handshake_request", "start").to_string(),
+			make_event_urn("create_handshake_request", "start")
+				.expect("a literal NID with a job event NSS")
+				.to_string(),
 			"urn:tightbeam:event:job/create-handshake-request-start"
 		);
 		assert_eq!(
-			make_event_urn("validate_config", "success").to_string(),
+			make_event_urn("validate_config", "success")
+				.expect("a literal NID with a job event NSS")
+				.to_string(),
 			"urn:tightbeam:event:job/validate-config-success"
 		);
 		assert_eq!(
-			make_event_urn("send_request", "error").to_string(),
+			make_event_urn("send_request", "error")
+				.expect("a literal NID with a job event NSS")
+				.to_string(),
 			"urn:tightbeam:event:job/send-request-error"
 		);
 	}

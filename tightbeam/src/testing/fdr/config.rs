@@ -380,11 +380,11 @@ mod tests {
 
 		#[test]
 		fn with_fault_adds_typed_injection() {
-			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(5000));
+			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(5000));
 			assert_eq!(model.injection_points.len(), 1);
 
 			let injection = injection(&model, "TestProcess.TestState", "test_event");
-			assert_eq!(injection.probability_bps, BasisPoints::new(5000));
+			assert_eq!(injection.probability_bps, crate::bps!(5000));
 		}
 
 		#[test]
@@ -393,7 +393,7 @@ mod tests {
 				TestState,
 				TestEvent,
 				|| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test"),
-				BasisPoints::new(100),
+				crate::bps!(100),
 			);
 
 			let error = (injection(&model, "TestProcess.TestState", "test_event").error_factory)();
@@ -403,28 +403,28 @@ mod tests {
 		#[test]
 		fn hashmap_provides_o1_lookup() {
 			let model = FaultModel::default()
-				.with_fault(TestState, TestEvent, || TestError, BasisPoints::new(1000))
-				.with_fault(TestState, AnotherEvent, || TestError, BasisPoints::new(2000))
-				.with_fault(AnotherState, TestEvent, || TestError, BasisPoints::new(3000));
+				.with_fault(TestState, TestEvent, || TestError, crate::bps!(1000))
+				.with_fault(TestState, AnotherEvent, || TestError, crate::bps!(2000))
+				.with_fault(AnotherState, TestEvent, || TestError, crate::bps!(3000));
 			assert_eq!(model.injection_points.len(), 3);
 
 			assert_eq!(
 				injection(&model, "TestProcess.TestState", "test_event").probability_bps,
-				BasisPoints::new(1000)
+				crate::bps!(1000)
 			);
 			assert_eq!(
 				injection(&model, "TestProcess.TestState", "another_event").probability_bps,
-				BasisPoints::new(2000)
+				crate::bps!(2000)
 			);
 			assert_eq!(
 				injection(&model, "TestProcess.AnotherState", "test_event").probability_bps,
-				BasisPoints::new(3000)
+				crate::bps!(3000)
 			);
 		}
 
 		#[test]
 		fn should_inject_probability_0_percent() {
-			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(0));
+			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(0));
 			let injection = injection(&model, "TestProcess.TestState", "test_event");
 			assert!(!injection.should_inject(0));
 			assert!(!injection.should_inject(9999));
@@ -432,7 +432,7 @@ mod tests {
 
 		#[test]
 		fn should_inject_probability_100_percent() {
-			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(10000));
+			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(10000));
 			let injection = injection(&model, "TestProcess.TestState", "test_event");
 			assert!(injection.should_inject(0));
 			assert!(injection.should_inject(9999));
@@ -440,7 +440,7 @@ mod tests {
 
 		#[test]
 		fn should_inject_probability_50_percent() {
-			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(5000));
+			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(5000));
 			let injection = injection(&model, "TestProcess.TestState", "test_event");
 			assert!(injection.should_inject(0));
 			assert!(injection.should_inject(4999));
@@ -449,14 +449,8 @@ mod tests {
 		}
 
 		#[test]
-		#[should_panic(expected = "BasisPoints must be 0-10000")]
-		fn probability_above_10000_panics() {
-			let _model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(10001));
-		}
-
-		#[test]
 		fn clone_preserves_injection_points() {
-			let model1 = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(5000));
+			let model1 = FaultModel::default().with_fault(TestState, TestEvent, || TestError, crate::bps!(5000));
 			let model2 = model1.clone();
 			assert_eq!(model2.injection_points.len(), 1);
 			assert_eq!(model2.injection_strategy, InjectionStrategy::Deterministic);

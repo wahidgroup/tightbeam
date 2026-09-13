@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const CLIENT_CONNECT: Urn<'static> = Urn::new("test", "event:connection-reuse/client-connect");
-pub(crate) const RECEIVE_RESPONSE: Urn<'static> = Urn::new("test", "event:connection-reuse/receive-response");
-pub(crate) const SEND_MESSAGE: Urn<'static> = Urn::new("test", "event:connection-reuse/send-message");
+pub(crate) const CLIENT_CONNECT: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/client-connect");
+pub(crate) const RECEIVE_RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/receive-response");
+pub(crate) const SEND_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/send-message");
 
 use tightbeam::{
 	colony::servlet::ServletConfig,

@@ -25,28 +25,30 @@ use crate::transport::support::{
 use super::common::*;
 
 pub(crate) const BUSY_GARBAGE_RESOLVES_AS_BUSY: Urn<'static> =
-	Urn::new("test", "event:streams/busy-garbage-resolves-as-busy");
-pub(crate) const CANCEL_OBSERVED_ON_WIRE: Urn<'static> = Urn::new("test", "event:streams/cancel-observed-on-wire");
-pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:streams/first-stream-echoed");
+	tightbeam::urn!("test", "event:streams/busy-garbage-resolves-as-busy");
+pub(crate) const CANCEL_OBSERVED_ON_WIRE: Urn<'static> =
+	tightbeam::urn!("test", "event:streams/cancel-observed-on-wire");
+pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:streams/first-stream-echoed");
 pub(crate) const FOLLOWUP_ECHOES_AFTER_GARBAGE: Urn<'static> =
-	Urn::new("test", "event:streams/followup-echoes-after-garbage");
+	tightbeam::urn!("test", "event:streams/followup-echoes-after-garbage");
 pub(crate) const FOLLOWUP_ECHOES_AFTER_RACE: Urn<'static> =
-	Urn::new("test", "event:streams/followup-echoes-after-race");
+	tightbeam::urn!("test", "event:streams/followup-echoes-after-race");
 pub(crate) const FOLLOWUP_ECHOES_ON_FREED_SLOT: Urn<'static> =
-	Urn::new("test", "event:streams/followup-echoes-on-freed-slot");
-pub(crate) const HANDLER_ABORTED_ON_CANCEL: Urn<'static> = Urn::new("test", "event:streams/handler-aborted-on-cancel");
+	tightbeam::urn!("test", "event:streams/followup-echoes-on-freed-slot");
+pub(crate) const HANDLER_ABORTED_ON_CANCEL: Urn<'static> =
+	tightbeam::urn!("test", "event:streams/handler-aborted-on-cancel");
 pub(crate) const HANDSHAKE_NEGOTIATED_NO_MUX: Urn<'static> =
-	Urn::new("test", "event:streams/handshake-negotiated-no-mux");
+	tightbeam::urn!("test", "event:streams/handshake-negotiated-no-mux");
 pub(crate) const HELD_EMIT_ECHOES_AFTER_RELEASE: Urn<'static> =
-	Urn::new("test", "event:streams/held-emit-echoes-after-release");
+	tightbeam::urn!("test", "event:streams/held-emit-echoes-after-release");
 pub(crate) const MUXED_ENVELOPE_INVALID_MESSAGE: Urn<'static> =
-	Urn::new("test", "event:streams/muxed-envelope-invalid-message");
-pub(crate) const NEGOTIATED_CAP_IS_ONE: Urn<'static> = Urn::new("test", "event:streams/negotiated-cap-is-one");
+	tightbeam::urn!("test", "event:streams/muxed-envelope-invalid-message");
+pub(crate) const NEGOTIATED_CAP_IS_ONE: Urn<'static> = tightbeam::urn!("test", "event:streams/negotiated-cap-is-one");
 pub(crate) const SECOND_EMIT_STREAMS_EXHAUSTED: Urn<'static> =
-	Urn::new("test", "event:streams/second-emit-streams-exhausted");
-pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:streams/second-stream-echoed");
+	tightbeam::urn!("test", "event:streams/second-emit-streams-exhausted");
+pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:streams/second-stream-echoed");
 pub(crate) const SERVER_STREAM_ECHOED_BY_CLIENT: Urn<'static> =
-	Urn::new("test", "event:streams/server-stream-echoed-by-client");
+	tightbeam::urn!("test", "event:streams/server-stream-echoed-by-client");
 
 tb_assert_spec! {
 	pub MuxInterleavedSpec,

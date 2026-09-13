@@ -86,10 +86,10 @@ mod tests {
 	use crate::testing::fault::{ProcessEvent, ProcessState};
 	use crate::utils::urn::Urn;
 
-	const CONNECT: Urn<'static> = Urn::new("test", "event:gen-states/connect");
-	const SEND: Urn<'static> = Urn::new("test", "event:gen-states/send");
-	const ACK: Urn<'static> = Urn::new("test", "event:gen-states/ack");
-	const DISCONNECT: Urn<'static> = Urn::new("test", "event:gen-states/disconnect");
+	const CONNECT: Urn<'static> = crate::urn!("test", "event:gen-states/connect");
+	const SEND: Urn<'static> = crate::urn!("test", "event:gen-states/send");
+	const ACK: Urn<'static> = crate::urn!("test", "event:gen-states/ack");
+	const DISCONNECT: Urn<'static> = crate::urn!("test", "event:gen-states/disconnect");
 
 	// Test process definition
 	crate::tb_process_spec! {

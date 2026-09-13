@@ -13,14 +13,14 @@ use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-pub(crate) const CONNECT: Urn<'static> = Urn::new("test", "event:trace-analysis/connect");
-pub(crate) const DECRYPT: Urn<'static> = Urn::new("test", "event:trace-analysis/decrypt");
-pub(crate) const DESERIALIZE: Urn<'static> = Urn::new("test", "event:trace-analysis/deserialize");
-pub(crate) const DISCONNECT: Urn<'static> = Urn::new("test", "event:trace-analysis/disconnect");
-pub(crate) const ENCRYPT: Urn<'static> = Urn::new("test", "event:trace-analysis/encrypt");
-pub(crate) const REQUEST: Urn<'static> = Urn::new("test", "event:trace-analysis/request");
-pub(crate) const RESPONSE: Urn<'static> = Urn::new("test", "event:trace-analysis/response");
-pub(crate) const SERIALIZE: Urn<'static> = Urn::new("test", "event:trace-analysis/serialize");
+pub(crate) const CONNECT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/connect");
+pub(crate) const DECRYPT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/decrypt");
+pub(crate) const DESERIALIZE: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/deserialize");
+pub(crate) const DISCONNECT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/disconnect");
+pub(crate) const ENCRYPT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/encrypt");
+pub(crate) const REQUEST: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/request");
+pub(crate) const RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/response");
+pub(crate) const SERIALIZE: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/serialize");
 
 fn build_fdr_config(specs: Vec<Process>) -> FdrConfig {
 	FdrConfig {
