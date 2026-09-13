@@ -2,7 +2,7 @@
 //!
 //! [`Flags<N>`] stores N position-stable flag bytes and presents them through
 //! [`MatrixLike`] as the diagonal (r == c) of an N×N matrix, matching the
-//! profile convention documented on [`Asn1Matrix`](crate::Asn1Matrix):
+//! profile convention documented on [`MatrixDyn`](crate::matrix::MatrixDyn):
 //! off-diagonal cells read as 0 and writes to them are no-ops.
 
 #[cfg(not(feature = "std"))]

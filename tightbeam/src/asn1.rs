@@ -15,6 +15,7 @@ pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use pkcs12::digest_info::DigestInfo;
 
 use crate::der::TagNumber;
+use crate::matrix::MatrixDyn;
 use crate::wire::wire_sequence;
 
 /// Protocol version determines metadata structure and features
@@ -75,36 +76,6 @@ pub enum MessagePriority {
 	NetworkControl = 5,
 }
 
-/// NxN matrix control flags
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// Matrix ::= SEQUENCE {
-///     n     INTEGER (1..255),
-///     data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
-/// }
-/// ```
-///
-/// Notes:
-/// - n MUST be in 1..=255.
-/// - data MUST be exactly n*n octets, row-major (cell (r,c) at offset r*n + c).
-/// - Encoders MUST only emit conforming lengths; decoders MUST reject
-///   non-conforming lengths.
-/// - Semantics of cell values are profile-defined. By default, off-diagonal
-///   cells are unspecified.
-/// - Profiles MAY map position-stable flags onto the diagonal (r == c); unset
-///   is 0, set/non-default is non-zero.
-/// - Intermediaries MUST preserve bytes unless a profile defines deterministic
-///   merge rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
-pub struct Asn1Matrix {
-	/// Dimension N (1..=255)
-	pub n: u8,
-	/// Row-major bytes; MUST be exactly n*n octets
-	pub data: Vec<u8>,
-}
-
 /// Metadata structure for message handling
 /// Version determines which fields are present
 ///
@@ -145,7 +116,7 @@ pub struct Metadata {
 	pub previous_frame: Option<DigestInfo>,
 
 	// V3+ fields
-	pub matrix: Option<Asn1Matrix>,
+	pub matrix: Option<MatrixDyn>,
 }
 
 wire_sequence!(Metadata {

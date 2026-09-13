@@ -12,12 +12,12 @@ use alloc::vec::Vec;
 #[cfg(feature = "zeroize")]
 pub use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::Frame;
+
+#[cfg(any(feature = "signature", feature = "aead"))]
 use crate::der::asn1::OctetString;
-use crate::der::{Decode, Encode};
-use crate::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Tag, Writer};
+#[cfg(any(feature = "digest", feature = "aead", feature = "signature"))]
 use crate::error::Result;
-use crate::matrix::MatrixError;
-use crate::{Asn1Matrix, Frame};
 
 #[cfg(any(feature = "signature", feature = "digest", feature = "kdf", feature = "aead"))]
 use crate::TightBeamError;
@@ -62,82 +62,6 @@ pub type KeyWrapper<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8]) -> core::resu
 impl AsRef<Frame> for Frame {
 	fn as_ref(&self) -> &Frame {
 		self
-	}
-}
-
-impl Asn1Matrix {
-	/// Validate invariants per spec.
-	pub fn validate(&self) -> Result<()> {
-		if self.n == 0 {
-			return Err(MatrixError::InvalidN(self.n).into());
-		}
-
-		let n2 = (self.n as usize) * (self.n as usize);
-		if self.data.len() != n2 {
-			return Err(MatrixError::LengthMismatch { n: self.n, len: self.data.len() }.into());
-		}
-
-		Ok(())
-	}
-}
-
-impl Default for Asn1Matrix {
-	/// Smallest valid matrix (1×1, zeroed) so the `data.len() == n*n`
-	/// invariant holds for every reachable value. The encoder rejects
-	/// non-conforming lengths.
-	fn default() -> Self {
-		Self { n: 1, data: vec![0u8; 1] }
-	}
-}
-
-impl FixedTag for Asn1Matrix {
-	const TAG: Tag = Tag::Sequence;
-}
-
-impl<'a> DecodeValue<'a> for Asn1Matrix {
-	fn decode_value<R: Reader<'a>>(reader: &mut R, _header: Header) -> crate::der::Result<Self> {
-		let n = u8::decode(reader)?;
-		let data_os = OctetString::decode(reader)?;
-
-		// Strict validation at the untrusted decode boundary, per spec.
-		if n == 0 {
-			return Err(crate::der::ErrorKind::Value { tag: Tag::Integer }.into());
-		}
-
-		let data = data_os.as_bytes();
-		let n2 = (n as usize) * (n as usize);
-		if data.len() != n2 {
-			return Err(crate::der::ErrorKind::Length { tag: Tag::OctetString }.into());
-		}
-
-		Ok(Self { n, data: data.to_vec() })
-	}
-}
-
-impl EncodeValue for Asn1Matrix {
-	fn value_len(&self) -> crate::der::Result<Length> {
-		// The value is INTEGER(n) followed by OCTET STRING(data).
-		let n_len = self.n.encoded_len()?;
-		if self.n == 0 {
-			return Err(crate::der::ErrorKind::Value { tag: Tag::Integer }.into());
-		}
-
-		let n2 = (self.n as usize) * (self.n as usize);
-		if self.data.len() != n2 {
-			return Err(crate::der::ErrorKind::Length { tag: Tag::OctetString }.into());
-		}
-
-		let os = crate::der::asn1::OctetString::new(self.data.as_slice())?;
-		let os_len = os.encoded_len()?;
-		let total = (n_len + os_len)?;
-		Ok(total)
-	}
-
-	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
-		self.n.encode(encoder)?;
-
-		let os = crate::der::asn1::OctetString::new(self.data.as_slice())?;
-		os.encode(encoder)
 	}
 }
 
@@ -486,33 +410,6 @@ mod tests {
 
 			SHARED_MUTEX().lock()?.0 = 42;
 			assert_eq!(*SHARED_MUTEX().lock()?, Counter(42));
-
-			Ok(())
-		}
-	}
-
-	mod asn1_matrix {
-		use crate::error::Result;
-		use crate::Asn1Matrix;
-
-		#[test]
-		fn default_upholds_invariant() -> Result<()> {
-			let matrix = Asn1Matrix::default();
-			assert_eq!(matrix.n, 1);
-			assert_eq!(matrix.data.as_slice(), &[0u8]);
-
-			matrix.validate()?;
-
-			Ok(())
-		}
-
-		#[test]
-		fn default_round_trips_through_der() -> Result<()> {
-			let matrix = Asn1Matrix::default();
-
-			let encoded = crate::encode(&matrix)?;
-			let decoded: Asn1Matrix = crate::decode(&encoded)?;
-			assert_eq!(decoded, matrix);
 
 			Ok(())
 		}

@@ -796,38 +796,20 @@ impl ChessGameState {
 
 	/// Update board state from matrix
 	#[allow(dead_code)]
-	pub(crate) fn update_board_from_matrix(
-		&mut self,
-		matrix: &tightbeam::Asn1Matrix,
-	) -> Result<(), tightbeam::TightBeamError> {
-		// Require Matrix<8> format (8x8 chess board)
-		if matrix.n != 8 || matrix.data.len() != 64 {
+	pub(crate) fn update_board_from_matrix(&mut self, matrix: &MatrixDyn) -> Result<(), tightbeam::TightBeamError> {
+		// Require Matrix<8> format (8x8 chess board). The constructor already
+		// holds `data.len() == n * n`, so the dimension is the whole check.
+		if matrix.n() != 8 {
 			return Err(tightbeam::TightBeamError::InvalidBody);
 		}
 
-		// Update board state from matrix
 		for row in 0..8 {
 			for col in 0..8 {
-				let idx = (row as usize * 8) + col as usize;
-				self.board_mut().set(row, col, matrix.data[idx]);
+				self.board_mut().set(row, col, matrix.get(row, col));
 			}
 		}
 
 		Ok(())
-	}
-}
-
-impl From<&ChessGameState> for tightbeam::Asn1Matrix {
-	fn from(state: &ChessGameState) -> Self {
-		// Encode Matrix<8>: board only (8x8 chess board)
-		let mut data = Vec::with_capacity(64);
-		for row in 0..8 {
-			for col in 0..8 {
-				data.push(state.board.get(row, col));
-			}
-		}
-
-		Self { n: 8, data }
 	}
 }
 
