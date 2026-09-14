@@ -17,7 +17,13 @@ impl TimingConstraints {
 	///
 	/// The exploration prunes on `true`, so a violating trace is cut before
 	/// its successors are generated.
-	pub fn violated_by(&self, trace: &Trace, elapsed_time: Duration, event_times: &[(Event, Duration)]) -> bool {
+	pub fn violated_by(
+		&self,
+		trace: &Trace,
+		elapsed_time: Duration,
+		event_times: impl AsRef<[(Event, Duration)]>,
+	) -> bool {
+		let event_times = event_times.as_ref();
 		self.deadline_violated(event_times) || self.path_wcet_violated(trace, elapsed_time)
 	}
 
@@ -38,7 +44,8 @@ impl TimingConstraints {
 	///
 	/// A deadline whose two events are not both in `event_times` has not
 	/// been exercised yet, so it cannot be violated.
-	fn deadline_violated(&self, event_times: &[(Event, Duration)]) -> bool {
+	fn deadline_violated(&self, event_times: impl AsRef<[(Event, Duration)]>) -> bool {
+		let event_times = event_times.as_ref();
 		self.deadlines().iter().any(|deadline| {
 			let start = event_times
 				.iter()

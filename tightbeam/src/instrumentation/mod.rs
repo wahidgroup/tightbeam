@@ -359,7 +359,12 @@ pub mod active {
 		///
 		/// `overflow` MUST reflect whether the collector dropped events at
 		/// its `max_events` bound (see `TraceCollector::overflowed`).
-		pub fn finalize(spec_hash: [u8; 32], events: Vec<TbEvent>, overflow: bool) -> Result<Self, TightBeamError> {
+		pub fn finalize(
+			spec_hash: [u8; 32],
+			events: impl IntoIterator<Item = TbEvent>,
+			overflow: bool,
+		) -> Result<Self, TightBeamError> {
+			let events: Vec<TbEvent> = events.into_iter().collect();
 			// Canonical byte representation (stable ordering) for trace hash
 			let mut bytes = Vec::with_capacity(events.len() * 64);
 			for ev in &events {
@@ -432,7 +437,8 @@ mod tests {
 	///
 	/// The fields are laid out as `encode_value` writes them, so the only
 	/// thing the caller varies is the hash length.
-	fn event_with_payload_hash(hash: &[u8]) -> Vec<u8> {
+	fn event_with_payload_hash(hash: impl AsRef<[u8]>) -> Vec<u8> {
+		let hash = hash.as_ref();
 		let octets = OctetString::new(hash).expect("test hashes wrap in an OctetString");
 		let tagged_hash = tagged(tb_event_tags::PAYLOAD_HASH, octets);
 
@@ -476,7 +482,7 @@ mod tests {
 	/// The same fields, wrapped in a SEQUENCE header that declares `declared`
 	/// bytes of body rather than the body's real length.
 	fn event_with_declared_length(declared: usize) -> Vec<u8> {
-		let honest = event_with_payload_hash(&[7u8; 32]);
+		let honest = event_with_payload_hash([7u8; 32]);
 		let body = &honest[2..];
 		assert!(
 			honest[0] == 0x30 && honest[1] < 128,
@@ -492,14 +498,14 @@ mod tests {
 	// `header.length` reads past its own event when events are nested.
 	#[test]
 	fn a_declared_length_shorter_than_the_body_is_refused() {
-		let honest_len = event_with_payload_hash(&[7u8; 32])[1] as usize;
+		let honest_len = event_with_payload_hash([7u8; 32])[1] as usize;
 		let refused = TbEvent::from_der(&event_with_declared_length(honest_len - 4));
 		assert!(refused.is_err(), "a SEQUENCE length that undercuts its body must not decode");
 	}
 
 	#[test]
 	fn a_declared_length_longer_than_the_body_is_refused() {
-		let honest_len = event_with_payload_hash(&[7u8; 32])[1] as usize;
+		let honest_len = event_with_payload_hash([7u8; 32])[1] as usize;
 		let refused = TbEvent::from_der(&event_with_declared_length(honest_len + 4));
 		assert!(refused.is_err(), "a SEQUENCE length that overruns its body must not decode");
 	}
@@ -507,13 +513,13 @@ mod tests {
 	// A truncated hash must not read as an absent one.
 	#[test]
 	fn a_payload_hash_of_the_wrong_length_is_refused() {
-		let refused = TbEvent::from_der(&event_with_payload_hash(&[0u8; 16]));
+		let refused = TbEvent::from_der(&event_with_payload_hash([0u8; 16]));
 		assert!(refused.is_err(), "a 16-byte payload hash must not decode as an absent one");
 	}
 
 	#[test]
 	fn a_payload_hash_of_the_right_length_decodes() {
-		let accepted = TbEvent::from_der(&event_with_payload_hash(&[7u8; 32])).expect("a 32-byte hash decodes");
+		let accepted = TbEvent::from_der(&event_with_payload_hash([7u8; 32])).expect("a 32-byte hash decodes");
 		assert_eq!(accepted.payload_hash, Some([7u8; 32]));
 	}
 

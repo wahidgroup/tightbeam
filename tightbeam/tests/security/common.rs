@@ -183,7 +183,11 @@ pub trait HandshakeFlow: Send {
 
 	/// Hand `msg` to the endpoint that receives step `index`, returning that
 	/// endpoint's reply when the flow continues.
-	fn advance<'a>(&'a mut self, index: usize, msg: &'a [u8]) -> FlowFuture<'a, Option<Vec<u8>>>;
+	fn advance<'a>(
+		&'a mut self,
+		index: usize,
+		msg: &'a (impl AsRef<[u8]> + ?Sized + Sync),
+	) -> FlowFuture<'a, Option<Vec<u8>>>;
 }
 
 /// Protocol-agnostic handshake operations for security testing.
@@ -380,9 +384,11 @@ impl SecurityThreatHarness {
 	pub fn spawn_with_profiles(
 		&self,
 		kind: HandshakeBackendKind,
-		client_profiles: Vec<SecurityProfileDesc>,
-		server_profiles: Vec<SecurityProfileDesc>,
+		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 	) -> Box<dyn HandshakeProtocol> {
+		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
+		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
 		self.emit(Self::HARNESS_SPAWN_SESSION).ok();
 		match kind {
 			HandshakeBackendKind::Ecies => {
@@ -465,7 +471,8 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 ///
 /// # Returns
 /// Modified payload with flipped bits
-pub fn tamper_payload(payload: &[u8]) -> Vec<u8> {
+pub fn tamper_payload(payload: impl AsRef<[u8]>) -> Vec<u8> {
+	let payload = payload.as_ref();
 	let mut tampered = payload.to_vec();
 	if tampered.is_empty() {
 		return tampered;
@@ -489,7 +496,9 @@ pub fn tamper_payload(payload: &[u8]) -> Vec<u8> {
 ///
 /// This simulates a MITM attacker adding data to a message.
 #[allow(dead_code)]
-pub fn tamper_payload_append(payload: &[u8], extra: &[u8]) -> Vec<u8> {
+pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>) -> Vec<u8> {
+	let payload = payload.as_ref();
+	let extra = extra.as_ref();
 	let mut tampered = payload.to_vec();
 	tampered.extend_from_slice(extra);
 	tampered
@@ -499,7 +508,8 @@ pub fn tamper_payload_append(payload: &[u8], extra: &[u8]) -> Vec<u8> {
 ///
 /// This simulates a MITM attacker truncating a message.
 #[allow(dead_code)]
-pub fn tamper_payload_truncate(payload: &[u8], keep_bytes: usize) -> Vec<u8> {
+pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> Vec<u8> {
+	let payload = payload.as_ref();
 	payload.iter().take(keep_bytes).copied().collect()
 }
 
@@ -523,7 +533,8 @@ pub enum DecryptionResult {
 ///
 /// # Returns
 /// The encrypted ECIES blob bytes
-pub fn extract_ecies_ciphertext(client_kex_der: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+pub fn extract_ecies_ciphertext(client_kex_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+	let client_kex_der = client_kex_der.as_ref();
 	let client_kex = ClientKeyExchange::from_der(client_kex_der)?;
 	Ok(client_kex.encrypted_data.as_bytes().to_vec())
 }
@@ -538,7 +549,8 @@ pub fn extract_ecies_ciphertext(client_kex_der: &[u8]) -> Result<Vec<u8>, TightB
 ///
 /// # Returns
 /// The 33-byte ephemeral public key
-pub fn extract_ephemeral_pubkey(ecies_ciphertext: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+pub fn extract_ephemeral_pubkey(ecies_ciphertext: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+	let ecies_ciphertext = ecies_ciphertext.as_ref();
 	// ECIES message format: [ephemeral_pubkey (33 bytes) || nonce+ciphertext+tag]
 	const EPHEMERAL_PUBKEY_SIZE: usize = 33;
 
@@ -565,7 +577,12 @@ pub const HANDSHAKE_AAD: &[u8] = b"tb/aead/v1";
 /// # Returns
 /// `DecryptionResult::Success` with plaintext length if decryption worked,
 /// `DecryptionResult::Failed` if decryption failed (wrong key, invalid data, etc.)
-pub fn try_decrypt_ecies(ciphertext: &[u8], secret_key: &k256::SecretKey, aad: Option<&[u8]>) -> DecryptionResult {
+pub fn try_decrypt_ecies(
+	ciphertext: impl AsRef<[u8]>,
+	secret_key: &k256::SecretKey,
+	aad: Option<&[u8]>,
+) -> DecryptionResult {
+	let ciphertext = ciphertext.as_ref();
 	// Parse the ECIES message
 	let message = match Secp256k1EciesMessage::from_bytes(ciphertext) {
 		Ok(m) => m,
@@ -627,10 +644,12 @@ macro_rules! ecies_session {
 			/// which a deliberately weak downgrade session needs.
 			fn with_profiles(
 				materials: &ServerMaterials,
-				client_profiles: Vec<SecurityProfileDesc>,
-				server_profiles: Vec<SecurityProfileDesc>,
+				client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+				server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 				strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 			) -> Self {
+				let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
+				let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
 				let validator = pinning_validator(&materials.certificate);
 				let client = EciesHandshakeClient::<$provider, Secp256k1EciesMessage>::new(None)
 					.with_security_offer(SecurityOffer::new(client_profiles))
@@ -665,7 +684,12 @@ macro_rules! ecies_session {
 				Box::pin(async move { Ok(self.client.build_client_hello()?.to_der()?) })
 			}
 
-			fn advance<'a>(&'a mut self, index: usize, msg: &'a [u8]) -> FlowFuture<'a, Option<Vec<u8>>> {
+			fn advance<'a>(
+				&'a mut self,
+				index: usize,
+				msg: &'a (impl AsRef<[u8]> + ?Sized + Sync),
+			) -> FlowFuture<'a, Option<Vec<u8>>> {
+				let msg = msg.as_ref();
 				Box::pin(async move {
 					match index {
 						0 => Ok(Some(self.server.process_client_hello(msg).await?.to_der()?)),
@@ -704,10 +728,12 @@ impl CmsSession {
 	/// (needed for deliberately weak downgrade-testing sessions).
 	fn with_profiles(
 		materials: &ServerMaterials,
-		client_profiles: Vec<SecurityProfileDesc>,
-		server_profiles: Vec<SecurityProfileDesc>,
+		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	) -> Self {
+		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
+		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
 		let pair = cms_handshake_pair(materials, client_profiles, server_profiles, None)
 			.expect("CMS pair fixture builds from generated materials");
 
@@ -750,7 +776,12 @@ impl HandshakeFlow for CmsSession {
 		})
 	}
 
-	fn advance<'a>(&'a mut self, index: usize, msg: &'a [u8]) -> FlowFuture<'a, Option<Vec<u8>>> {
+	fn advance<'a>(
+		&'a mut self,
+		index: usize,
+		msg: &'a (impl AsRef<[u8]> + ?Sized + Sync),
+	) -> FlowFuture<'a, Option<Vec<u8>>> {
+		let msg = msg.as_ref();
 		Box::pin(async move {
 			match index {
 				0 => {

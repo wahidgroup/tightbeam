@@ -33,7 +33,7 @@ macro_rules! wcet {
 		use std::sync::Arc;
 		$crate::testing::timing::WcetConfigBuilder::default()
 			.with_duration($dur)
-			.with_analyzer(Arc::new($a))
+			.with_analyzer($a)
 			.build()
 			.expect("Failed to build WcetConfig")
 	}};
@@ -42,7 +42,7 @@ macro_rules! wcet {
 		$crate::testing::timing::WcetConfigBuilder::default()
 			.with_duration($dur)
 			.with_percentile($p)
-			.with_analyzer(Arc::new($a))
+			.with_analyzer($a)
 			.build()
 			.expect("Failed to build WcetConfig")
 	}};

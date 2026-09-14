@@ -146,7 +146,7 @@ pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn Error
 	let client_random = generate_nonce::<32>(None)?;
 	let server_random = generate_nonce::<32>(None)?;
 	let base_session_key = generate_nonce::<32>(None)?;
-	let transcript_hash = compute_test_transcript_hash(&client_random, &server_random, &[], &[]);
+	let transcript_hash = compute_test_transcript_hash(client_random, &server_random, [], []);
 
 	Ok(TestHandshakeData { client_random, server_random, base_session_key, transcript_hash })
 }
@@ -154,11 +154,14 @@ pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn Error
 /// Compute a test transcript hash from the ClientHello DER, server random,
 /// and SPKI bytes.
 pub fn compute_test_transcript_hash(
-	client_hello: &[u8],
+	client_hello: impl AsRef<[u8]>,
 	server_random: &[u8; 32],
-	spki_bytes: &[u8],
-	accept_der: &[u8],
+	spki_bytes: impl AsRef<[u8]>,
+	accept_der: impl AsRef<[u8]>,
 ) -> [u8; 32] {
+	let client_hello = client_hello.as_ref();
+	let spki_bytes = spki_bytes.as_ref();
+	let accept_der = accept_der.as_ref();
 	let mut data = Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len());
 	data.extend_from_slice(client_hello);
 	data.extend_from_slice(server_random);
@@ -186,8 +189,9 @@ pub fn create_test_client_hello(client_random: &[u8; 32]) -> Result<Vec<u8>, Box
 pub fn create_test_server_handshake(
 	certificate: &Certificate,
 	server_random: &[u8; 32],
-	signature: &[u8],
+	signature: impl AsRef<[u8]>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
+	let signature = signature.as_ref();
 	let server_handshake = ServerHandshake {
 		certificate: certificate.to_owned(),
 		server_random: OctetString::new(*server_random)?,
@@ -202,7 +206,8 @@ pub fn create_test_server_handshake(
 }
 
 /// Create a test ClientKeyExchange message with the given encrypted data.
-pub fn create_test_client_key_exchange(encrypted_data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn create_test_client_key_exchange(encrypted_data: impl AsRef<[u8]>) -> Result<Vec<u8>, Box<dyn Error>> {
+	let encrypted_data = encrypted_data.as_ref();
 	let client_kex = ClientKeyExchange {
 		encrypted_data: OctetString::new(encrypted_data)?,
 		#[cfg(feature = "x509")]

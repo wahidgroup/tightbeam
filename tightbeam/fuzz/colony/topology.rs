@@ -325,9 +325,10 @@ async fn register_ping(
 async fn register_csr(
 	hive: &mut ColonyFuzzHive,
 	trace: &TraceCollector,
-	org_name: &str,
+	org_name: impl AsRef<str>,
 	certs: &Arc<ClusterTestCerts>,
 ) -> Result<Arc<CsrIssuer>, TightBeamError> {
+	let org_name = org_name.as_ref();
 	let allowed_colony = colony_urn(org_name).to_string();
 	let issuer = Arc::new(CsrIssuer::new(allowed_colony));
 	let csr_type = servlet_urn("csr");

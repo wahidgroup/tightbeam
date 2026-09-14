@@ -44,7 +44,8 @@ impl PheromoneConfig {
 	/// Every entry starts on this colony's pheromone level and abandonment
 	/// limit, so a freshly registered route competes on the same terms as
 	/// the routes already in the registry.
-	pub(crate) fn servlet_slate(&self, servlets: &[ServletInfo], hive_addr: &SharedId) -> Vec<ServletEntry> {
+	pub(crate) fn servlet_slate(&self, servlets: impl AsRef<[ServletInfo]>, hive_addr: &SharedId) -> Vec<ServletEntry> {
+		let servlets = servlets.as_ref();
 		servlets
 			.iter()
 			.map(|info| {
@@ -67,8 +68,9 @@ impl PheromoneConfig {
 		&self,
 		peer_hive_id: &SharedId,
 		dial: SharedId,
-		types: &[Urn<'static>],
+		types: impl AsRef<[Urn<'static>]>,
 	) -> Vec<ServletEntry> {
+		let types = types.as_ref();
 		types
 			.iter()
 			.map(|urn| {

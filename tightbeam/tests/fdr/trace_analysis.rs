@@ -22,7 +22,8 @@ pub(crate) const REQUEST: Urn<'static> = tightbeam::urn!("test", "event:trace-an
 pub(crate) const RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/response");
 pub(crate) const SERIALIZE: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/serialize");
 
-fn build_fdr_config(specs: Vec<Process>) -> FdrConfig {
+fn build_fdr_config(specs: impl IntoIterator<Item = Process>) -> FdrConfig {
+	let specs: Vec<Process> = specs.into_iter().collect();
 	FdrConfig {
 		seeds: 2,
 		max_depth: 8,

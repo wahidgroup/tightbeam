@@ -482,7 +482,8 @@ impl CspOracle {
 	/// - `self.current_state()` - where execution stopped
 	/// - `self.trace()` - sequence of events taken
 	/// - `self.visited_states()` - states explored
-	pub fn fuzz_from_bytes(&mut self, input: &[u8]) -> Result<(), FuzzError> {
+	pub fn fuzz_from_bytes(&mut self, input: impl AsRef<[u8]>) -> Result<(), FuzzError> {
+		let input = input.as_ref();
 		self.reset();
 
 		let mut byte_idx = 0;
@@ -629,7 +630,8 @@ impl FuzzContextInner {
 
 impl FuzzContext {
 	/// Create new fuzz context with input and CSP process
-	pub fn new(input: Vec<u8>, process: Process) -> Self {
+	pub fn new(input: impl Into<Vec<u8>>, process: Process) -> Self {
+		let input: Vec<u8> = input.into();
 		Self {
 			inner: Arc::new(Mutex::new(FuzzContextInner {
 				input,

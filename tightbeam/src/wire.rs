@@ -124,7 +124,8 @@ pub(crate) fn decode_octets_seq<'a, R: Reader<'a>>(reader: &mut R) -> Result<Vec
 }
 
 /// Borrow bytes as an encodable `OCTET STRING`.
-pub(crate) fn octets_ref(bytes: &[u8]) -> Result<OctetStringRef<'_>> {
+pub(crate) fn octets_ref(bytes: &(impl AsRef<[u8]> + ?Sized)) -> Result<OctetStringRef<'_>> {
+	let bytes = bytes.as_ref();
 	OctetStringRef::new(bytes)
 }
 
@@ -142,7 +143,8 @@ pub(crate) fn octets_opt_ref(bytes: &Option<Vec<u8>>) -> Result<Option<OctetStri
 /// Gated on `colony` with its only consumers, the colony message codecs,
 /// so minimal builds carry no dead helper.
 #[cfg(feature = "colony")]
-pub(crate) fn octets_seq_refs(list: &[Vec<u8>]) -> Result<Vec<OctetStringRef<'_>>> {
+pub(crate) fn octets_seq_refs(list: &(impl AsRef<[Vec<u8>]> + ?Sized)) -> Result<Vec<OctetStringRef<'_>>> {
+	let list = list.as_ref();
 	list.iter().map(|bytes| OctetStringRef::new(bytes)).collect()
 }
 

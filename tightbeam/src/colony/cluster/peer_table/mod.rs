@@ -200,7 +200,8 @@ impl core::fmt::Debug for PeerTable {
 ///
 /// The key is the parsed socket rendering so textual variants of one socket
 /// collapse to one entry.
-fn address_key(addr: &str) -> Option<String> {
+fn address_key(addr: impl AsRef<str>) -> Option<String> {
+	let addr = addr.as_ref();
 	let socket: SocketAddr = addr.parse().ok()?;
 	Some(socket.to_string())
 }
@@ -346,7 +347,8 @@ impl PeerTable {
 	/// candidate in new. That is the test-before-evict discipline. Residents
 	/// re-verify on every beat, so a candidate waits for a freed slot
 	/// so a candidate waits for a freed slot.
-	pub fn promote(&self, addr: &str, peer_id: Option<&[u8]>, now_ms: u64) -> Result<bool, ClusterError> {
+	pub fn promote(&self, addr: impl AsRef<str>, peer_id: Option<&[u8]>, now_ms: u64) -> Result<bool, ClusterError> {
+		let addr = addr.as_ref();
 		let Some(key) = address_key(addr) else {
 			return Ok(false);
 		};
@@ -391,7 +393,8 @@ impl PeerTable {
 	/// live addresses. A tried resident leaves through repeated beat failures
 	/// in [`Self::record_failure`].
 	/// Misbehavior is handled by relay scoring.
-	pub fn discard(&self, addr: &str) -> Result<(), ClusterError> {
+	pub fn discard(&self, addr: impl AsRef<str>) -> Result<(), ClusterError> {
+		let addr = addr.as_ref();
 		let Some(key) = address_key(addr) else {
 			return Ok(());
 		};
@@ -422,7 +425,8 @@ impl PeerTable {
 	///   Bitcoin's peer-to-peer network (feeler probes / tried eviction):
 	///   [USENIX Security '15](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
 	///   [ePrint 2015/263](https://eprint.iacr.org/2015/263)
-	pub fn record_failure(&self, addr: &str) -> Result<bool, ClusterError> {
+	pub fn record_failure(&self, addr: impl AsRef<str>) -> Result<bool, ClusterError> {
+		let addr = addr.as_ref();
 		let Some(key) = address_key(addr) else {
 			return Ok(false);
 		};
@@ -451,7 +455,8 @@ impl PeerTable {
 	/// - The address leaves discovery at once.
 	/// - The address leaves at once, ahead of the failure threshold.
 	/// - A re-keyed peer therefore stops receiving advertisements.
-	pub fn expel(&self, addr: &str) -> Result<(), ClusterError> {
+	pub fn expel(&self, addr: impl AsRef<str>) -> Result<(), ClusterError> {
+		let addr = addr.as_ref();
 		let Some(key) = address_key(addr) else {
 			return Ok(());
 		};
@@ -543,7 +548,8 @@ impl PeerTable {
 	/// Peer exchange echoes installed routes, which include the requester's
 	/// own advertised address, so the table holds that address out of
 	/// admission. PEX replies therefore teach a gateway its peers alone.
-	pub fn exclude_self(&self, addr: &str) -> Result<(), ClusterError> {
+	pub fn exclude_self(&self, addr: impl AsRef<str>) -> Result<(), ClusterError> {
+		let addr = addr.as_ref();
 		let Some(key) = address_key(addr) else {
 			return Ok(());
 		};
@@ -643,7 +649,8 @@ impl PeerTable {
 	/// driver in generation order. A snapshot a newer generation already
 	/// superseded is dropped, which keeps an evicted peer from returning on
 	/// the next hydrate.
-	fn persist_at(&self, generation: u64, records: &[PeerRecord]) {
+	fn persist_at(&self, generation: u64, records: impl AsRef<[PeerRecord]>) {
+		let records = records.as_ref();
 		let Ok(mut persisted) = self.persisted.lock() else {
 			return;
 		};
@@ -663,11 +670,13 @@ mod tests {
 	use core::time::Duration;
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-	fn hint(addr: &str) -> PeerHint {
+	fn hint(addr: impl AsRef<str>) -> PeerHint {
+		let addr = addr.as_ref();
 		PeerHint { gateway_addr: addr.to_string(), peer_id: None }
 	}
 
-	fn table_with_anchor(anchor: &str) -> PeerTable {
+	fn table_with_anchor(anchor: impl AsRef<str>) -> PeerTable {
+		let anchor = anchor.as_ref();
 		PeerTable::new(vec![anchor.to_string()], Arc::new(MemoryPeerStore))
 	}
 
@@ -677,7 +686,8 @@ mod tests {
 	}
 
 	impl CountingStore {
-		fn seeded(seed: Vec<PeerRecord>) -> Self {
+		fn seeded(seed: impl IntoIterator<Item = PeerRecord>) -> Self {
+			let seed: Vec<PeerRecord> = seed.into_iter().collect();
 			Self { seed, persists: AtomicUsize::new(0) }
 		}
 	}
@@ -693,7 +703,8 @@ mod tests {
 		}
 	}
 
-	fn record(addr: &str, tried: bool) -> PeerRecord {
+	fn record(addr: impl AsRef<str>, tried: bool) -> PeerRecord {
+		let addr = addr.as_ref();
 		PeerRecord { gateway_addr: addr.to_string(), peer_id: None, tried, last_probe_ms: 0 }
 	}
 
@@ -745,7 +756,7 @@ mod tests {
 	fn learn_caps_one_prefix_bucket() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		let hints: Vec<PeerHint> = (0..MAX_PEER_BUCKET + 3)
-			.map(|host| hint(&format!("10.0.0.{}:9000", host + 1)))
+			.map(|host| hint(format!("10.0.0.{}:9000", host + 1)))
 			.collect();
 		let admitted = table.learn(hints)?;
 		assert_eq!(admitted, MAX_PEER_BUCKET);
@@ -792,7 +803,7 @@ mod tests {
 	fn promote_keeps_residents_of_full_tried_bucket() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		for host in 0..MAX_PEER_BUCKET {
-			table.promote(&format!("10.0.0.{}:9000", host + 1), None, 1_000)?;
+			table.promote(format!("10.0.0.{}:9000", host + 1), None, 1_000)?;
 		}
 
 		table.learn(vec![hint("10.0.9.9:9000")])?;
@@ -869,7 +880,7 @@ mod tests {
 	fn eviction_frees_the_prefix_bucket_slot() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		for host in 0..MAX_PEER_BUCKET {
-			table.promote(&format!("10.0.0.{}:9000", host + 1), None, 1_000)?;
+			table.promote(format!("10.0.0.{}:9000", host + 1), None, 1_000)?;
 		}
 		assert!(!table.promote("10.0.9.9:9000", None, 2_000)?);
 
@@ -908,7 +919,7 @@ mod tests {
 	fn probe_sample_spans_prefix_buckets() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		let crowded: Vec<PeerHint> = (0..PEER_PROBE_PER_BEAT + 2)
-			.map(|host| hint(&format!("10.0.0.{}:9000", host + 1)))
+			.map(|host| hint(format!("10.0.0.{}:9000", host + 1)))
 			.collect();
 		table.learn(crowded)?;
 		table.learn(vec![hint("10.1.0.1:9000")])?;
@@ -958,7 +969,7 @@ mod tests {
 	#[test]
 	fn hydrate_replays_records_through_caps() -> Result<(), ClusterError> {
 		let mut seed: Vec<PeerRecord> = (0..MAX_PEER_BUCKET + 2)
-			.map(|host| record(&format!("10.0.0.{}:9000", host + 1), false))
+			.map(|host| record(format!("10.0.0.{}:9000", host + 1), false))
 			.collect();
 		seed.push(record("10.1.0.1:9000", true));
 

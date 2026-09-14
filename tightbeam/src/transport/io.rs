@@ -477,10 +477,11 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Decrypt a response from wire bytes
 	/// Protocol-agnostic default implementation
 	#[allow(async_fn_in_trait)]
-	async fn decrypt_response(&mut self, wire_bytes: Vec<u8>) -> TransportResult<TransportEnvelope>
+	async fn decrypt_response(&mut self, wire_bytes: impl Into<Vec<u8>>) -> TransportResult<TransportEnvelope>
 	where
 		Self: EncryptedProtocolState,
 	{
+		let wire_bytes: Vec<u8> = wire_bytes.into();
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 		match wire_envelope {
 			WireEnvelope::Cleartext(env) => {
@@ -1098,7 +1099,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Perform server-side handshake (extracted from macro)
 	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
-	async fn perform_server_handshake<P>(&mut self, handshake_bytes: &[u8]) -> TransportResult<()>
+	async fn perform_server_handshake<P>(&mut self, handshake_bytes: impl AsRef<[u8]>) -> TransportResult<()>
 	where
 		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: CryptoProvider + Send + Sync + 'static,
@@ -1112,6 +1113,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
+		let handshake_bytes = handshake_bytes.as_ref();
 		if handshake_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -1166,7 +1168,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// declared per feature combination with that build's predicate set.
 	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
 	#[allow(async_fn_in_trait)]
-	async fn perform_server_handshake<P>(&mut self, handshake_bytes: &[u8]) -> TransportResult<()>
+	async fn perform_server_handshake<P>(&mut self, handshake_bytes: impl AsRef<[u8]>) -> TransportResult<()>
 	where
 		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
 		P: CryptoProvider + Send + Sync + 'static,
@@ -1178,6 +1180,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::Digest: Send + 'static,
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
+		let handshake_bytes = handshake_bytes.as_ref();
 		if handshake_bytes.len() > self.limits().handshake_wire {
 			return Err(TransportError::InvalidMessage);
 		}

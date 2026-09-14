@@ -54,7 +54,8 @@ pub struct SecurityOffer {
 
 impl SecurityOffer {
 	/// Preferential order: first profile is most preferred.
-	pub fn new(profiles: Vec<SecurityProfileDesc>) -> Self {
+	pub fn new(profiles: impl IntoIterator<Item = SecurityProfileDesc>) -> Self {
+		let profiles: Vec<SecurityProfileDesc> = profiles.into_iter().collect();
 		Self { profiles }
 	}
 
@@ -919,8 +920,9 @@ impl SecurityOffer {
 	/// - [`NegotiationError::NoMutualProfile`] - no intersection with `supported`.
 	pub(crate) fn select_profile(
 		&self,
-		supported: &[SecurityProfileDesc],
+		supported: impl AsRef<[SecurityProfileDesc]>,
 	) -> Result<SecurityProfileDesc, NegotiationError> {
+		let supported = supported.as_ref();
 		if self.profiles.is_empty() {
 			return Err(NegotiationError::EmptyOffer);
 		}
@@ -1022,7 +1024,7 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::from([p1, p2, p3]));
 		let supported = [p2, p3];
 
-		let selected = offer.select_profile(&supported)?;
+		let selected = offer.select_profile(supported)?;
 		assert_eq!(selected, p2);
 
 		Ok(())
@@ -1038,7 +1040,7 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::from([p1, p2]));
 		let supported = [p2, p1];
 
-		let selected = offer.select_profile(&supported)?;
+		let selected = offer.select_profile(supported)?;
 		assert_eq!(selected, p2);
 
 		Ok(())
@@ -1053,7 +1055,7 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::from([p1, p2]));
 		let supported = [p3];
 
-		let result = offer.select_profile(&supported);
+		let result = offer.select_profile(supported);
 		assert!(matches!(result, Err(NegotiationError::NoMutualProfile)));
 	}
 
@@ -1063,7 +1065,7 @@ mod tests {
 		let offer = SecurityOffer::new(vec![profile; MAX_OFFER_PROFILES + 1]);
 		let supported = [profile];
 
-		let result = offer.select_profile(&supported);
+		let result = offer.select_profile(supported);
 		assert!(matches!(result, Err(NegotiationError::OfferTooLarge { count: 33, max: 32 })));
 	}
 
@@ -1072,7 +1074,7 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::new());
 		let supported = [sample_profile(1)];
 
-		let result = offer.select_profile(&supported);
+		let result = offer.select_profile(supported);
 		assert!(matches!(result, Err(NegotiationError::EmptyOffer)));
 	}
 

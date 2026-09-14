@@ -75,7 +75,8 @@ impl FrameStore {
 	}
 
 	/// Retrieve a frame by its ID
-	pub fn retrieve(&mut self, id: &str) -> Result<Frame, TightBeamError> {
+	pub fn retrieve(&mut self, id: impl AsRef<str>) -> Result<Frame, TightBeamError> {
+		let id = id.as_ref();
 		// Check memory cache first
 		if let Some(frame) = self.frames.get(id) {
 			return Ok(frame.to_owned());
@@ -92,7 +93,8 @@ impl FrameStore {
 	}
 
 	/// Retrieve a frame by its hash (searches all stored frames)
-	pub fn retrieve_by_hash(&mut self, hash: &[u8]) -> Result<Option<Frame>, TightBeamError> {
+	pub fn retrieve_by_hash(&mut self, hash: impl AsRef<[u8]>) -> Result<Option<Frame>, TightBeamError> {
+		let hash = hash.as_ref();
 		// Check memory cache first
 		let cached = self.frames.values().find_map(|frame| {
 			frame
@@ -126,7 +128,8 @@ impl FrameStore {
 	/// Validates that each frame's `previous_frame` hash matches the
 	/// actual hash of the previous frame, proving integrity without
 	/// requiring trusted intermediaries.
-	pub fn verify_chain(&self, frames: &[Frame]) -> Result<ChainVerdict, TightBeamError> {
+	pub fn verify_chain(&self, frames: impl AsRef<[Frame]>) -> Result<ChainVerdict, TightBeamError> {
+		let frames = frames.as_ref();
 		let broken_links: Vec<(usize, String)> = frames
 			.iter()
 			.enumerate()
@@ -136,7 +139,7 @@ impl FrameStore {
 				let prev_hash = prev_frame.to_der().ok().map(|bytes| Sha3_256::digest(&bytes))?;
 
 				match frame.metadata().previous_frame() {
-					Some(digest_info) if verify_digest(&prev_hash, digest_info) => None,
+					Some(digest_info) if verify_digest(prev_hash, digest_info) => None,
 					Some(_) => Some((i, "Hash mismatch".to_string())),
 					None => Some((i, "Missing previous_frame".to_string())),
 				}
@@ -173,7 +176,8 @@ impl FrameStore {
 }
 
 /// Verify that a computed hash matches the expected DigestInfo
-fn verify_digest(computed: &[u8], expected: &DigestInfo) -> bool {
+fn verify_digest(computed: impl AsRef<[u8]>, expected: &DigestInfo) -> bool {
+	let computed = computed.as_ref();
 	computed == expected.digest.as_bytes()
 }
 

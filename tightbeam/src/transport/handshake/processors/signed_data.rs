@@ -81,9 +81,10 @@ impl TightBeamSignedDataProcessor {
 	/// Process DER-encoded SignedData.
 	pub fn process_der(
 		&self,
-		signed_data_der: &[u8],
+		signed_data_der: impl AsRef<[u8]>,
 		digest_oid: &ObjectIdentifier,
 	) -> Result<Vec<u8>, HandshakeError> {
+		let signed_data_der = signed_data_der.as_ref();
 		let signed_data = SignedData::from_der(signed_data_der)?;
 		self.process(&signed_data, digest_oid)
 	}

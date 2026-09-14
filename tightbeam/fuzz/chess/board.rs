@@ -170,7 +170,8 @@ pub(crate) enum GameStatusCode {
 // ============================================================================
 
 /// Helper function to create an invalid move response
-pub(crate) fn create_invalid_move_response(id: Vec<u8>, order: u64) -> Result<Frame, TightBeamError> {
+pub(crate) fn create_invalid_move_response(id: impl Into<Vec<u8>>, order: u64) -> Result<Frame, TightBeamError> {
+	let id: Vec<u8> = id.into();
 	let response = ChessMoveResponse { game_status: GameStatusCode::InvalidMove };
 	compose! {
 		V0: id: id,

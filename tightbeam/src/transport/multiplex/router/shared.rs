@@ -427,7 +427,8 @@ impl MuxShared {
 	/// Forward one reply chunk into a duplex body. Returns `None` when
 	/// the stream is not duplex, and `Some(false)` on a credit
 	/// overrun.
-	pub fn forward_duplex_chunk(&self, stream_id: u32, payload: &[u8]) -> Option<bool> {
+	pub fn forward_duplex_chunk(&self, stream_id: u32, payload: impl AsRef<[u8]>) -> Option<bool> {
+		let payload = payload.as_ref();
 		let mut map = self.duplex_lock();
 		let stream = map.get_mut(&stream_id)?;
 
@@ -1267,13 +1268,15 @@ mod tests {
 		}
 	}
 
-	fn allocate_ids(shared: &Arc<MuxShared>, ids: &[u32]) {
+	fn allocate_ids(shared: &Arc<MuxShared>, ids: impl AsRef<[u32]>) {
+		let ids = ids.as_ref();
 		for &id in ids {
 			assert!(matches!(open_one(shared), Ok(got) if got == id));
 		}
 	}
 
-	fn allocate_ping_ids(shared: &MuxShared, ids: &[u64]) {
+	fn allocate_ping_ids(shared: &MuxShared, ids: impl AsRef<[u64]>) {
+		let ids = ids.as_ref();
 		for &id in ids {
 			assert!(matches!(shared.allocate_ping(ping_slot()), Ok(got) if got == id));
 		}
@@ -1306,7 +1309,7 @@ mod tests {
 			HeadroomSetup::Fresh { cap } => shared(MuxRole::Client, cap),
 			HeadroomSetup::AtCap { cap } => {
 				let shared = shared(MuxRole::Client, cap);
-				allocate_ids(&shared, &[1]);
+				allocate_ids(&shared, [1]);
 				shared
 			}
 			HeadroomSetup::LocalShutdown { cap } => {
@@ -1354,7 +1357,7 @@ mod tests {
 		let shared = shared(MuxRole::Client, 1);
 		match setup {
 			SlotSetup::ReadyWithHeadroom => {}
-			SlotSetup::PendingAtCap => allocate_ids(&shared, &[1]),
+			SlotSetup::PendingAtCap => allocate_ids(&shared, [1]),
 			SlotSetup::DrainingLocal => {
 				shared.begin_shutdown();
 			}
@@ -1421,7 +1424,7 @@ mod tests {
 	#[test]
 	fn test_cap_exhaustion_reports_busy() {
 		let shared = shared(MuxRole::Client, 2);
-		allocate_ids(&shared, &[1, 3]);
+		allocate_ids(&shared, [1, 3]);
 		assert!(matches!(
 			open_one(&shared),
 			Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
@@ -1431,9 +1434,9 @@ mod tests {
 	#[test]
 	fn test_completed_stream_frees_cap_slot() {
 		let shared = shared(MuxRole::Client, 1);
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 		assert!(shared.remove_pending(1).is_some());
-		allocate_ids(&shared, &[3]);
+		allocate_ids(&shared, [3]);
 	}
 
 	// The heart of the atomic open: whichever initiation sends its
@@ -1513,7 +1516,7 @@ mod tests {
 	fn test_id_space_exhaustion_reports_draining() {
 		let shared = shared(MuxRole::Client, 8);
 		shared.lock().next_stream_id = Some(u32::MAX);
-		allocate_ids(&shared, &[u32::MAX]);
+		allocate_ids(&shared, [u32::MAX]);
 		assert!(matches!(open_one(&shared), Err(TransportError::Draining)));
 	}
 
@@ -1596,7 +1599,7 @@ mod tests {
 	#[test]
 	fn test_ping_allocates_monotonic_opaque() {
 		let shared = shared(MuxRole::Client, 8);
-		allocate_ping_ids(&shared, &[0, 1, 2]);
+		allocate_ping_ids(&shared, [0, 1, 2]);
 	}
 
 	#[test]
@@ -1654,7 +1657,7 @@ mod tests {
 		let shared = shared(MuxRole::Client, 8);
 		assert!(!shared.has_pending_streams());
 
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 
 		assert!(shared.has_pending_streams());
 		assert!(shared.remove_pending(1).is_some());
@@ -1704,7 +1707,7 @@ mod tests {
 	#[test]
 	fn test_stream_slot_wakes_when_slot_frees() {
 		let shared = shared(MuxRole::Client, 1);
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 
 		let (flag, waker) = FlagWake::pair();
 		let mut cx = Context::from_waker(&waker);
@@ -1718,7 +1721,7 @@ mod tests {
 	#[test]
 	fn test_stream_slot_wakes_on_shutdown() {
 		let shared = shared(MuxRole::Client, 1);
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 
 		let (flag, waker) = FlagWake::pair();
 		let mut cx = Context::from_waker(&waker);
@@ -1899,7 +1902,7 @@ mod tests {
 	#[test]
 	fn test_stream_cancel_survives_saturated_queue() {
 		let shared = shared(MuxRole::Client, 2);
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 
 		let (outbound, mut wire) = mpsc::channel(0);
 		let mut filler = outbound_handle(&outbound);

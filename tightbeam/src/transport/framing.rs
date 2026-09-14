@@ -39,7 +39,8 @@ impl From<u8> for LengthForm {
 /// Parse a DER length field into its numeric value.
 ///
 /// Returns `None` for non-canonical or indefinite-length encodings.
-pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
+pub(crate) fn parse_der_length(first_byte: u8, length_octets: impl AsRef<[u8]>) -> Option<usize> {
+	let length_octets = length_octets.as_ref();
 	let octet_count = match LengthForm::from(first_byte) {
 		LengthForm::Short(length) => return Some(length),
 		LengthForm::Long(count) => count,
@@ -96,7 +97,8 @@ impl FrameHeader {
 	///
 	/// [`TransportError::InvalidMessage`] when the length field is
 	/// non-canonical or uses the BER indefinite form.
-	pub(crate) fn parse(tag: u8, length_first: u8, length_octets: Vec<u8>) -> TransportResult<Self> {
+	pub(crate) fn parse(tag: u8, length_first: u8, length_octets: impl Into<Vec<u8>>) -> TransportResult<Self> {
+		let length_octets: Vec<u8> = length_octets.into();
 		let declared_len = parse_der_length(length_first, &length_octets).ok_or(TransportError::InvalidMessage)?;
 		Ok(Self { tag, length_first, length_octets, declared_len })
 	}
@@ -124,7 +126,8 @@ impl AdmittedHeader {
 	}
 
 	/// Rebuild the complete DER encoding from this header and its content.
-	pub(crate) fn reconstruct(&self, content: &[u8]) -> Vec<u8> {
+	pub(crate) fn reconstruct(&self, content: impl AsRef<[u8]>) -> Vec<u8> {
+		let content = content.as_ref();
 		reconstruct_der_encoding(self.header.tag, self.header.length_first, &self.header.length_octets, content)
 	}
 }
@@ -161,7 +164,14 @@ impl TransportError {
 }
 
 /// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
-pub(crate) fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets: &[u8], content: &[u8]) -> Vec<u8> {
+pub(crate) fn reconstruct_der_encoding(
+	tag: u8,
+	length_first: u8,
+	length_octets: impl AsRef<[u8]>,
+	content: impl AsRef<[u8]>,
+) -> Vec<u8> {
+	let length_octets = length_octets.as_ref();
+	let content = content.as_ref();
 	let mut buffer = Vec::with_capacity(2 + length_octets.len() + content.len());
 	buffer.push(tag);
 	buffer.push(length_first);
@@ -247,11 +257,11 @@ mod tests {
 	#[test]
 	fn reconstruct_round_trips_short_and_long_form() {
 		assert_eq!(
-			reconstruct_der_encoding(0x30, 0x02, &[], &[0x01, 0x02]),
+			reconstruct_der_encoding(0x30, 0x02, [], [0x01, 0x02]),
 			vec![0x30, 0x02, 0x01, 0x02]
 		);
 		assert_eq!(
-			reconstruct_der_encoding(0x30, 0x81, &[0x80], &[0xAA]),
+			reconstruct_der_encoding(0x30, 0x81, [0x80], [0xAA]),
 			vec![0x30, 0x81, 0x80, 0xAA]
 		);
 	}

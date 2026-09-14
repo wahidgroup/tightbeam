@@ -45,7 +45,8 @@ impl MemoizationCache for DefaultCache {
 		self.traces_cache.borrow().get(&structure).cloned()
 	}
 
-	fn cache_traces(&mut self, structure: u64, traces: Vec<Trace>, complete: bool) {
+	fn cache_traces(&mut self, structure: u64, traces: impl IntoIterator<Item = Trace>, complete: bool) {
+		let traces: Vec<Trace> = traces.into_iter().collect();
 		self.traces_cache.borrow_mut().insert(structure, (traces, complete));
 	}
 
@@ -53,7 +54,8 @@ impl MemoizationCache for DefaultCache {
 		self.failures_cache.borrow().get(&structure).cloned()
 	}
 
-	fn cache_failures(&mut self, structure: u64, failures: Vec<Failure>, complete: bool) {
+	fn cache_failures(&mut self, structure: u64, failures: impl IntoIterator<Item = Failure>, complete: bool) {
+		let failures: Vec<Failure> = failures.into_iter().collect();
 		self.failures_cache.borrow_mut().insert(structure, (failures, complete));
 	}
 
@@ -61,7 +63,8 @@ impl MemoizationCache for DefaultCache {
 		self.divergences_cache.borrow().get(&structure).cloned()
 	}
 
-	fn cache_divergences(&mut self, structure: u64, divergences: Vec<Trace>, complete: bool) {
+	fn cache_divergences(&mut self, structure: u64, divergences: impl IntoIterator<Item = Trace>, complete: bool) {
+		let divergences: Vec<Trace> = divergences.into_iter().collect();
 		self.divergences_cache.borrow_mut().insert(structure, (divergences, complete));
 	}
 }

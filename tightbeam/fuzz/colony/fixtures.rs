@@ -72,11 +72,13 @@ pub(crate) fn colony_ns() -> ColonyNamespace {
 	ColonyNamespace::default()
 }
 
-pub(crate) fn colony_urn(name: &str) -> Urn<'static> {
+pub(crate) fn colony_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+	let name = name.as_ref();
 	colony_ns().colony(name).expect("static colony name")
 }
 
-pub(crate) fn servlet_urn(name: &str) -> Urn<'static> {
+pub(crate) fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+	let name = name.as_ref();
 	colony_ns().servlet(name).expect("static servlet name")
 }
 
@@ -90,7 +92,12 @@ pub(crate) fn fixed_signing_key(seed: u8) -> k256::ecdsa::SigningKey {
 }
 
 /// Deterministic gateway identity for AFL (seeded key, fixed CN/SAN).
-pub(crate) fn colony_identity(cn: &str, colony: &Urn<'_>, key_seed: u8) -> (Certificate, Secp256k1SigningKey) {
+pub(crate) fn colony_identity(
+	cn: impl AsRef<str>,
+	colony: &Urn<'_>,
+	key_seed: u8,
+) -> (Certificate, Secp256k1SigningKey) {
+	let cn = cn.as_ref();
 	let raw = fixed_signing_key(key_seed);
 	let cert = TestCertificate::with_cn_and_uri_sans(&raw, cn, &[&colony.to_string()]);
 	(cert, Secp256k1SigningKey::from(raw))

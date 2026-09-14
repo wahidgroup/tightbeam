@@ -416,7 +416,8 @@ mod tests {
 	}
 
 	/// Seal a fixture plaintext under a zero nonce with the given cipher.
-	fn seal(cipher: &<DefaultCryptoProvider as AeadProvider>::AeadCipher, plaintext: &[u8]) -> Vec<u8> {
+	fn seal(cipher: &<DefaultCryptoProvider as AeadProvider>::AeadCipher, plaintext: impl AsRef<[u8]>) -> Vec<u8> {
+		let plaintext = plaintext.as_ref();
 		use crate::crypto::aead::Aead;
 
 		let nonce = [0u8; 12];

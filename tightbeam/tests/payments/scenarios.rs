@@ -154,7 +154,8 @@ fn shared_payment_cipher() -> Aes256Gcm {
 	Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[0x42u8; 32]))
 }
 
-fn create_auth_transaction(end_to_end_id: &[u8], amount: MonetaryAmount) -> CreditTransferTransaction {
+fn create_auth_transaction(end_to_end_id: impl AsRef<[u8]>, amount: MonetaryAmount) -> CreditTransferTransaction {
+	let end_to_end_id = end_to_end_id.as_ref();
 	let timestamp = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.map(|d| d.as_millis() as u64)

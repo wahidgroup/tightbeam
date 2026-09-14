@@ -61,7 +61,8 @@ impl<'a, P: Protocol> HiveInstances<'a, P> {
 	///
 	/// Returns the removed type URN and address, which callers notify the
 	/// cluster with. [`None`] means `key` named no instance.
-	pub fn remove(&self, key: &[u8]) -> Option<(Urn<'static>, Arc<[u8]>)> {
+	pub fn remove(&self, key: impl AsRef<[u8]>) -> Option<(Urn<'static>, Arc<[u8]>)> {
+		let key = key.as_ref();
 		let ServletRegistration { servlet, servlet_type, .. } = self.servlets.remove(key)?;
 		let removed_type = servlet_type.canonical_bytes();
 		let removed_addr = servlet.addr_bytes();

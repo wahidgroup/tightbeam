@@ -529,7 +529,8 @@ mod tests {
 	use crate::testing::{TestCertificate, TestKey};
 	use std::sync::Arc;
 
-	fn servlet(name: &str) -> Urn<'static> {
+	fn servlet(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+		let name = name.as_ref();
 		ColonyNamespace::default()
 			.servlet(name)
 			.expect("test names satisfy the mint grammar")

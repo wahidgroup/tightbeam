@@ -647,7 +647,8 @@ mod tests {
 
 	/// Create a timing event; deadline markers carry the value as a
 	/// timestamp, every other timing URN carries it as a duration
-	fn timing_event(event_urn: Urn<'static>, label: &str, value_ns: u64, seq: u32) -> TbEvent {
+	fn timing_event(event_urn: Urn<'static>, label: impl AsRef<str>, value_ns: u64, seq: u32) -> TbEvent {
+		let label = label.as_ref();
 		let is_deadline = event_urn == events::TIMING_DEADLINE;
 		TbEvent {
 			seq,
@@ -670,7 +671,8 @@ mod tests {
 	}
 
 	/// Create a trace with timing events
-	fn trace_with_events(events: Vec<TbEvent>) -> ConsumedTrace {
+	fn trace_with_events(events: impl IntoIterator<Item = TbEvent>) -> ConsumedTrace {
+		let events: Vec<TbEvent> = events.into_iter().collect();
 		let mut trace = ConsumedTrace::new();
 		#[cfg(feature = "instrument")]
 		{

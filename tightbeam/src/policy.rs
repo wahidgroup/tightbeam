@@ -235,7 +235,8 @@ impl<'a> ProvenPeer<'a> {
 
 	/// Mint an identity for a test that stands in for a handshake.
 	#[cfg(all(test, feature = "colony"))]
-	pub(crate) fn for_test(key: &'a [u8]) -> Self {
+	pub(crate) fn for_test(key: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
+		let key = key.as_ref();
 		Self(key)
 	}
 }

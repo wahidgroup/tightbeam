@@ -88,7 +88,9 @@ impl Frame {
 /// advertisement entry appears once in the want list so a peer cannot
 /// inflate the reply by repeating itself (CWE-770).
 #[must_use]
-pub fn gossip_want(advertised: &[Vec<u8>], held: &[GossipDigest]) -> Vec<Vec<u8>> {
+pub fn gossip_want(advertised: impl AsRef<[Vec<u8>]>, held: impl AsRef<[GossipDigest]>) -> Vec<Vec<u8>> {
+	let advertised = advertised.as_ref();
+	let held = held.as_ref();
 	let local: HashSet<&[u8]> = held.iter().map(|digest| digest.as_slice()).collect();
 	let mut unique: HashSet<&[u8]> = HashSet::new();
 
@@ -106,7 +108,8 @@ pub fn gossip_want(advertised: &[Vec<u8>], held: &[GossipDigest]) -> Vec<Vec<u8>
 /// (CWE-20). Duplicates collapse to one so a peer MUST NOT multiply
 /// repair pushes (CWE-770).
 #[must_use]
-pub fn wanted_digests(want: &[Vec<u8>]) -> Vec<GossipDigest> {
+pub fn wanted_digests(want: impl AsRef<[Vec<u8>]>) -> Vec<GossipDigest> {
+	let want = want.as_ref();
 	let mut unique: HashSet<GossipDigest> = HashSet::new();
 
 	want.iter()
@@ -504,11 +507,12 @@ impl MemoryGossipJournal {
 	/// retained application rumors. The reverse holds too.
 	fn admit(
 		&self,
-		signer: &[u8],
+		signer: impl AsRef<[u8]>,
 		digest: GossipDigest,
 		body: JournalBody,
 		now_ms: u64,
 	) -> Result<Admission, ClusterError> {
+		let signer = signer.as_ref();
 		let mut entries = self.entries.lock()?;
 		Self::prune(&mut entries, self.retention_ms, now_ms);
 
@@ -634,7 +638,8 @@ mod tests {
 		rumor.gossip_digest::<Sha3_256>().expect("test rumor frames encode")
 	}
 
-	fn rumor(order: u64, payload: Vec<u8>) -> Frame {
+	fn rumor(order: u64, payload: impl Into<Vec<u8>>) -> Frame {
+		let payload: Vec<u8> = payload.into();
 		let body = GossipRumor::application(payload);
 		FrameBuilder::from(Version::V0)
 			.with_id("rumor")
@@ -888,7 +893,7 @@ mod tests {
 		let held_digest = digest(&held);
 		let advertised = vec![held_digest.to_vec(), digest(&missing).to_vec()];
 
-		let want = gossip_want(&advertised, &[held_digest]);
+		let want = gossip_want(&advertised, [held_digest]);
 		assert_eq!(want, vec![digest(&missing).to_vec()]);
 	}
 
@@ -898,7 +903,7 @@ mod tests {
 		let second = digest(&rumor(1_000, vec![2]));
 		let advertised = vec![first.to_vec(), second.to_vec()];
 
-		let want = gossip_want(&advertised, &[first, second]);
+		let want = gossip_want(&advertised, [first, second]);
 		assert!(want.is_empty());
 	}
 
@@ -925,7 +930,7 @@ mod tests {
 		let missing = digest(&rumor(1_000, vec![2]));
 		let advertised = vec![missing.to_vec(), missing.to_vec(), missing.to_vec()];
 
-		let want = gossip_want(&advertised, &[]);
+		let want = gossip_want(&advertised, []);
 		assert_eq!(want, vec![missing.to_vec()]);
 	}
 

@@ -228,9 +228,10 @@ fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 
 #[cfg(feature = "transport-cms")]
 pub fn find<'a>(
-	attrs: &'a [HandshakeAttribute],
+	attrs: &'a (impl AsRef<[HandshakeAttribute]> + ?Sized),
 	oid: &ObjectIdentifier,
 ) -> Result<&'a HandshakeAttribute, HandshakeError> {
+	let attrs = attrs.as_ref();
 	let mut found: Option<&HandshakeAttribute> = None;
 	for a in attrs.iter() {
 		if &a.attr_type == oid {
@@ -334,17 +335,20 @@ mod tests {
 	use crate::der::asn1::{OctetString as DerOctetString, SetOfVec, UintRef};
 	use crate::oids::{HANDSHAKE_ABORT_ALERT, HANDSHAKE_SECURITY_ACCEPT};
 
-	fn mk_integer(bytes: &[u8]) -> Result<Any, der::Error> {
+	fn mk_integer(bytes: impl AsRef<[u8]>) -> Result<Any, der::Error> {
+		let bytes = bytes.as_ref();
 		let u = UintRef::new(bytes)?;
 		Any::encode_from(&u)
 	}
 
-	fn mk_octet(bytes: &[u8]) -> Result<Any, der::Error> {
+	fn mk_octet(bytes: impl AsRef<[u8]>) -> Result<Any, der::Error> {
+		let bytes = bytes.as_ref();
 		let os = DerOctetString::new(bytes)?;
 		Any::encode_from(&os)
 	}
 
-	fn mk_alert_attr(bytes: &[u8]) -> Result<Attribute, der::Error> {
+	fn mk_alert_attr(bytes: impl AsRef<[u8]>) -> Result<Attribute, der::Error> {
+		let bytes = bytes.as_ref();
 		Ok(Attribute {
 			oid: HANDSHAKE_ABORT_ALERT,
 			values: SetOfVec::try_from(vec![mk_integer(bytes)?])?,
@@ -369,7 +373,7 @@ mod tests {
 
 	#[test]
 	fn duplicate_detected() -> Result<(), HandshakeError> {
-		let a1 = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, mk_octet(&[0x11u8; 32])?)?;
+		let a1 = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, mk_octet([0x11u8; 32])?)?;
 		let a2 = a1.to_owned();
 		let attrs = vec![a1, a2];
 		assert!(matches!(
@@ -381,7 +385,7 @@ mod tests {
 
 	#[test]
 	fn missing_attribute_detected() -> Result<(), HandshakeError> {
-		let only = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, mk_octet(&[0x22u8; 32])?)?;
+		let only = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, mk_octet([0x22u8; 32])?)?;
 		let attrs = vec![only];
 		assert!(matches!(
 			find(&attrs, &HANDSHAKE_SECURITY_ACCEPT),
@@ -392,7 +396,7 @@ mod tests {
 
 	#[test]
 	fn invalid_attribute_arity() -> Result<(), der::Error> {
-		let any = mk_octet(&[0x33u8; 32])?;
+		let any = mk_octet([0x33u8; 32])?;
 		let attr = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![any.to_owned(), any] };
 		assert!(matches!(attr.value(), Err(HandshakeError::InvalidAttributeArity)));
 		Ok(())
@@ -408,11 +412,11 @@ mod tests {
 			(HandshakeAlert::FinishedIntegrityFail, 5u8),
 		];
 		for (alert, code) in alerts.iter() {
-			let attr = mk_alert_attr(&[*code])?;
+			let attr = mk_alert_attr([*code])?;
 			assert_eq!(attr.handshake_alert()?, *alert);
 		}
 
-		let unknown = mk_alert_attr(&[0x07])?;
+		let unknown = mk_alert_attr([0x07])?;
 		assert!(matches!(unknown.handshake_alert(), Err(HandshakeError::UnknownAlertCode(7))));
 		Ok(())
 	}
@@ -420,19 +424,19 @@ mod tests {
 	#[test]
 	fn alert_integer_out_of_range_rejected() -> Result<(), der::Error> {
 		// Three-byte INTEGER exceeds the u16 decode domain outright.
-		let wide = mk_alert_attr(&[0x01, 0x02, 0x03])?;
+		let wide = mk_alert_attr([0x01, 0x02, 0x03])?;
 		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 
 		// 0x0101 = 257. Truncating to u8 would alias alert code 1 (AuthRequired).
-		let above = mk_alert_attr(&[0x01, 0x01])?;
+		let above = mk_alert_attr([0x01, 0x01])?;
 		assert!(matches!(above.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 		Ok(())
 	}
 
 	#[test]
 	fn attribute_ord_tiebreaks_on_value() -> Result<(), der::Error> {
-		let low = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![mk_integer(&[0x01])?] };
-		let high = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![mk_integer(&[0x02])?] };
+		let low = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![mk_integer([0x01])?] };
+		let high = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![mk_integer([0x02])?] };
 		assert_eq!(low.cmp(&high), Ordering::Less);
 		assert_eq!(high.cmp(&low), Ordering::Greater);
 		assert_eq!(low.cmp(&low.to_owned()), Ordering::Equal);

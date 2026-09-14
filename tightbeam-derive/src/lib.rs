@@ -14,10 +14,11 @@ use syn::{parse_macro_input, Attribute, DeriveInput, Meta, Token};
 /// `#[beam(...)]` mixes bare identifiers (`confidential`) with name-value
 /// pairs (`min_version = "V1"`) and lists (`profile(MyProfile)`), so every
 /// reader shares this parse-and-walk shell instead of re-implementing it.
-fn for_each_beam_meta<F>(attrs: &[Attribute], mut f: F) -> syn::Result<()>
+fn for_each_beam_meta<F>(attrs: impl AsRef<[Attribute]>, mut f: F) -> syn::Result<()>
 where
 	F: FnMut(Meta) -> syn::Result<()>,
 {
+	let attrs = attrs.as_ref();
 	for attr in attrs {
 		if !attr.path().is_ident("beam") {
 			continue;
@@ -36,7 +37,9 @@ where
 	Ok(())
 }
 
-fn has_flag(attrs: &[Attribute], name: &str) -> syn::Result<bool> {
+fn has_flag(attrs: impl AsRef<[Attribute]>, name: impl AsRef<str>) -> syn::Result<bool> {
+	let attrs = attrs.as_ref();
+	let name = name.as_ref();
 	let mut found = false;
 	for_each_beam_meta(attrs, |meta| {
 		if let Meta::Path(path) = &meta {
@@ -51,7 +54,8 @@ fn has_flag(attrs: &[Attribute], name: &str) -> syn::Result<bool> {
 	Ok(found)
 }
 
-fn get_version_value(attrs: &[Attribute]) -> syn::Result<Option<syn::Ident>> {
+fn get_version_value(attrs: impl AsRef<[Attribute]>) -> syn::Result<Option<syn::Ident>> {
+	let attrs = attrs.as_ref();
 	let mut version = None;
 	for_each_beam_meta(attrs, |meta| {
 		let Meta::NameValue(nv) = &meta else {
@@ -83,7 +87,8 @@ fn get_version_value(attrs: &[Attribute]) -> syn::Result<Option<syn::Ident>> {
 	Ok(version)
 }
 
-fn get_profile_value(attrs: &[Attribute]) -> syn::Result<Option<(u8, proc_macro2::Span)>> {
+fn get_profile_value(attrs: impl AsRef<[Attribute]>) -> syn::Result<Option<(u8, proc_macro2::Span)>> {
+	let attrs = attrs.as_ref();
 	let mut profile = None;
 	for_each_beam_meta(attrs, |meta| {
 		let Meta::NameValue(nv) = &meta else {
@@ -108,7 +113,8 @@ fn get_profile_value(attrs: &[Attribute]) -> syn::Result<Option<(u8, proc_macro2
 	Ok(profile)
 }
 
-fn get_profile_type(attrs: &[Attribute]) -> syn::Result<Option<syn::Type>> {
+fn get_profile_type(attrs: impl AsRef<[Attribute]>) -> syn::Result<Option<syn::Type>> {
+	let attrs = attrs.as_ref();
 	let mut profile = None;
 	for_each_beam_meta(attrs, |meta| {
 		let Meta::List(profile_list) = &meta else {
@@ -126,11 +132,14 @@ fn get_profile_type(attrs: &[Attribute]) -> syn::Result<Option<syn::Type>> {
 	Ok(profile)
 }
 
-fn has_attr(attrs: &[Attribute], name: &str) -> bool {
+fn has_attr(attrs: impl AsRef<[Attribute]>, name: impl AsRef<str>) -> bool {
+	let attrs = attrs.as_ref();
+	let name = name.as_ref();
 	attrs.iter().any(|attr| attr.path().is_ident(name))
 }
 
-fn get_error_message(attrs: &[Attribute]) -> Option<String> {
+fn get_error_message(attrs: impl AsRef<[Attribute]>) -> Option<String> {
+	let attrs = attrs.as_ref();
 	for attr in attrs {
 		if attr.path().is_ident("error") {
 			if let Meta::List(list) = &attr.meta {

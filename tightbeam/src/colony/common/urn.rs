@@ -133,7 +133,8 @@ impl ColonyNamespace {
 	/// Refuse a `resource-id` that is empty or carries a grammar
 	/// delimiter, so a minted URN always validates back as the same
 	/// resource.
-	fn validate_single_segment_name(name: &str) -> Result<(), UrnValidationError> {
+	fn validate_single_segment_name(name: impl AsRef<str>) -> Result<(), UrnValidationError> {
+		let name = name.as_ref();
 		if name.is_empty() {
 			return Err(UrnValidationError::RequiredFieldMissing("resource-id"));
 		}
@@ -164,7 +165,8 @@ impl ColonyNamespace {
 	/// [`None`] where the bytes are not UTF-8 or the locator is refused by
 	/// [`Self::hive`]. Wire and configuration both hand the locator over as
 	/// bytes, so both reach the URN through one decode.
-	pub(crate) fn hive_from_bytes(&self, addr: &[u8]) -> Option<Urn<'static>> {
+	pub(crate) fn hive_from_bytes(&self, addr: impl AsRef<[u8]>) -> Option<Urn<'static>> {
+		let addr = addr.as_ref();
 		let addr = core::str::from_utf8(addr).ok()?;
 		self.hive(addr).ok()
 	}
@@ -173,7 +175,8 @@ impl ColonyNamespace {
 	///
 	/// A peer advertises the types it serves, so one foreign or instance
 	/// URN in the list refuses the whole advertisement.
-	pub(crate) fn all_bare_servlet_types(&self, types: &[Urn<'static>]) -> bool {
+	pub(crate) fn all_bare_servlet_types(&self, types: impl AsRef<[Urn<'static>]>) -> bool {
+		let types = types.as_ref();
 		types.iter().all(|urn| self.is_bare_servlet_type(urn))
 	}
 
@@ -196,7 +199,9 @@ impl ColonyNamespace {
 	/// - Whatever [`Urn::from_parts`] refuses. A namespace built through its
 	///   own constructor cannot produce one, but the namespace's parts are
 	///   not carried in a type that says so.
-	fn mint(&self, resource_type: &str, id: &str) -> Result<Urn<'static>, UrnValidationError> {
+	fn mint(&self, resource_type: impl AsRef<str>, id: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
+		let resource_type = resource_type.as_ref();
+		let id = id.as_ref();
 		let nss = format!("{}:{}:{}", self.realm, resource_type, id);
 		Urn::from_parts(self.nid.as_ref(), nss)
 	}
@@ -335,15 +340,18 @@ mod tests {
 		ColonyNamespace::new("tightbeam", "prod-us").unwrap_or_default()
 	}
 
-	fn servlet(namespace: &ColonyNamespace, name: &str) -> Urn<'static> {
+	fn servlet(namespace: &ColonyNamespace, name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+		let name = name.as_ref();
 		namespace.servlet(name).expect("test names satisfy the mint grammar")
 	}
 
-	fn hive(namespace: &ColonyNamespace, addr: &str) -> Urn<'static> {
+	fn hive(namespace: &ColonyNamespace, addr: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+		let addr = addr.as_ref();
 		namespace.hive(addr).expect("test locators satisfy the mint grammar")
 	}
 
-	fn colony(namespace: &ColonyNamespace, name: &str) -> Urn<'static> {
+	fn colony(namespace: &ColonyNamespace, name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+		let name = name.as_ref();
 		namespace.colony(name).expect("test names satisfy the mint grammar")
 	}
 

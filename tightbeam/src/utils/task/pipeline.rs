@@ -120,7 +120,8 @@ where
 /// - `my_crate::ValidateConfig::run` -> `validate_config`
 /// - `CreateHandshakeRequest` -> `create_handshake_request` (fallback)
 #[cfg(any(test, feature = "testing"))]
-fn to_snake_case(type_name: &str) -> String {
+fn to_snake_case(type_name: impl AsRef<str>) -> String {
+	let type_name = type_name.as_ref();
 	// Split by "::" and collect segments
 	let segments: Vec<&str> = type_name.split("::").collect();
 	// For Job::run paths, the struct name is second-to-last (before "run")
@@ -153,7 +154,12 @@ fn to_snake_case(type_name: &str) -> String {
 ///
 /// Format: `urn:tightbeam:event:job/<job-name>-<suffix>`
 #[cfg(any(test, feature = "testing"))]
-fn make_event_urn(job_name: &str, suffix: &str) -> Result<Urn<'static>, crate::TightBeamError> {
+fn make_event_urn(
+	job_name: &(impl AsRef<str> + ?Sized),
+	suffix: &(impl AsRef<str> + ?Sized),
+) -> Result<Urn<'static>, crate::TightBeamError> {
+	let job_name = job_name.as_ref();
+	let suffix = suffix.as_ref();
 	let nss = format!("event:job/{}-{}", job_name.replace('_', "-"), suffix);
 	Ok(Urn::from_parts("tightbeam", nss)?)
 }

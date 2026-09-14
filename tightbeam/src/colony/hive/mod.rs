@@ -106,10 +106,10 @@ pub struct ServletRegistration {
 /// implementations could use sharded storage for high concurrency.
 pub trait ServletRegistry: Send + Sync {
 	/// Insert a servlet registration.
-	fn insert(&self, key: Vec<u8>, registration: ServletRegistration) -> Result<(), TightBeamError>;
+	fn insert(&self, key: impl Into<Vec<u8>>, registration: ServletRegistration) -> Result<(), TightBeamError>;
 
 	/// Remove and return a servlet registration.
-	fn remove(&self, key: &[u8]) -> Option<ServletRegistration>;
+	fn remove(&self, key: impl AsRef<[u8]>) -> Option<ServletRegistration>;
 
 	/// Iterate over all registrations via callback.
 	fn for_each<F>(&self, f: F)
@@ -117,7 +117,7 @@ pub trait ServletRegistry: Send + Sync {
 		F: FnMut(&Vec<u8>, &ServletRegistration);
 
 	/// Find registrations by type prefix via callback.
-	fn for_each_by_type<F>(&self, prefix: &[u8], f: F)
+	fn for_each_by_type<F>(&self, prefix: impl AsRef<[u8]>, f: F)
 	where
 		F: FnMut(&Vec<u8>, &ServletRegistration);
 
@@ -180,7 +180,8 @@ impl HashMapRegistry {
 }
 
 impl ServletRegistry for HashMapRegistry {
-	fn insert(&self, key: Vec<u8>, registration: ServletRegistration) -> Result<(), TightBeamError> {
+	fn insert(&self, key: impl Into<Vec<u8>>, registration: ServletRegistration) -> Result<(), TightBeamError> {
+		let key: Vec<u8> = key.into();
 		self.inner
 			.lock()
 			.map_err(|_| TightBeamError::LockPoisoned)?
@@ -188,7 +189,8 @@ impl ServletRegistry for HashMapRegistry {
 		Ok(())
 	}
 
-	fn remove(&self, key: &[u8]) -> Option<ServletRegistration> {
+	fn remove(&self, key: impl AsRef<[u8]>) -> Option<ServletRegistration> {
+		let key = key.as_ref();
 		self.inner.lock().ok()?.remove(key)
 	}
 
@@ -201,10 +203,11 @@ impl ServletRegistry for HashMapRegistry {
 		}
 	}
 
-	fn for_each_by_type<F>(&self, prefix: &[u8], mut f: F)
+	fn for_each_by_type<F>(&self, prefix: impl AsRef<[u8]>, mut f: F)
 	where
 		F: FnMut(&Vec<u8>, &ServletRegistration),
 	{
+		let prefix = prefix.as_ref();
 		if let Ok(guard) = self.inner.lock() {
 			guard.iter().filter(|(k, _)| k.starts_with(prefix)).for_each(|(k, v)| f(k, v));
 		}

@@ -71,7 +71,8 @@ where
 	/// or a gossip application payload toward an ingress servlet.
 	///
 	/// [`ClusterRequest::Work`]: crate::colony::common::ClusterRequest::Work
-	pub(crate) async fn deliver_envelope(self, message: Vec<u8>) -> Result<Vec<u8>, ClusterError> {
+	pub(crate) async fn deliver_envelope(self, message: impl Into<Vec<u8>>) -> Result<Vec<u8>, ClusterError> {
+		let message: Vec<u8> = message.into();
 		let frame = Frame::v0(b"work-forward", message);
 		let response = self.emit(frame).await?;
 		Ok(response.into_message())

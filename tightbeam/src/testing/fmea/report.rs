@@ -49,13 +49,16 @@ pub struct FailureMode {
 impl FailureMode {
 	/// Create new failure mode with calculated RPN
 	pub fn new(
-		component: String,
-		failure: String,
-		effects: Vec<String>,
+		component: impl Into<String>,
+		failure: impl Into<String>,
+		effects: impl IntoIterator<Item = String>,
 		severity: u8,
 		occurrence: u16,
 		detection: u8,
 	) -> Self {
+		let component: String = component.into();
+		let failure: String = failure.into();
+		let effects: Vec<String> = effects.into_iter().collect();
 		let rpn = (severity as u32) * (occurrence as u32) * (detection as u32);
 		Self { component, failure, effects, severity, occurrence, detection, rpn }
 	}
@@ -72,7 +75,12 @@ pub struct FmeaReport {
 
 impl FmeaReport {
 	/// Create new FMEA report with calculated totals
-	pub fn new(failure_modes: Vec<FailureMode>, severity_scale: SeverityScale, rpn_threshold: u32) -> Self {
+	pub fn new(
+		failure_modes: impl IntoIterator<Item = FailureMode>,
+		severity_scale: SeverityScale,
+		rpn_threshold: u32,
+	) -> Self {
+		let failure_modes: Vec<FailureMode> = failure_modes.into_iter().collect();
 		let total_rpn: u32 = failure_modes.iter().map(|fm| fm.rpn).sum();
 		let critical_failures: Vec<usize> = failure_modes
 			.iter()
@@ -216,7 +224,9 @@ mod tests {
 	use crate::testing::specs::csp::{Event, Process, State};
 
 	// Test fixtures and helpers
-	fn create_fault(state: &str, event: &str) -> InjectedFaultRecord {
+	fn create_fault(state: impl AsRef<str>, event: impl AsRef<str>) -> InjectedFaultRecord {
+		let state = state.as_ref();
+		let event = event.as_ref();
 		InjectedFaultRecord {
 			csp_state: state.to_string(),
 			event_label: event.to_string(),
@@ -225,7 +235,10 @@ mod tests {
 		}
 	}
 
-	fn assert_effect_contains(effects: &[String], expected: &str, context: &str) {
+	fn assert_effect_contains(effects: impl AsRef<[String]>, expected: impl AsRef<str>, context: impl AsRef<str>) {
+		let effects = effects.as_ref();
+		let expected = expected.as_ref();
+		let context = context.as_ref();
 		assert!(!effects.is_empty(), "{}: Should identify effects", context);
 		assert!(
 			effects.iter().any(|e| e.contains(expected)),

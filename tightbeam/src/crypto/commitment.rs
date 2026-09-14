@@ -27,10 +27,11 @@ use crate::{DigestInfo, Message};
 /// `H(len(salt) || salt || data)` with an 8-byte big-endian length, so distinct
 /// `(salt, data)` pairs cannot collide into the same preimage and the binding
 /// property holds for variable-length salts.
-pub(crate) fn commit_digest<D>(salt: &[u8], data: &[u8]) -> Result<DigestInfo>
+pub(crate) fn commit_digest<D>(salt: &[u8], data: impl AsRef<[u8]>) -> Result<DigestInfo>
 where
 	D: Digest + AssociatedOid,
 {
+	let data = data.as_ref();
 	if salt.is_empty() {
 		return crate::utils::digest::<D>(data);
 	}

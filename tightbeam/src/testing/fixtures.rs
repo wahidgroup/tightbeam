@@ -224,7 +224,8 @@ impl TestCertificateChain {
 
 /// Single-AVA `CN=<cn>` distinguished name for test certificates.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-fn test_cn_name(cn: &str) -> TbResult<RdnSequence> {
+fn test_cn_name(cn: impl AsRef<str>) -> TbResult<RdnSequence> {
+	let cn = cn.as_ref();
 	let cn_oid = ObjectIdentifier::new_unwrap("2.5.4.3");
 	let cn_str = PrintableString::new(cn)?;
 	let attr = AttributeTypeAndValue { oid: cn_oid, value: Any::from(&cn_str) };
@@ -559,7 +560,8 @@ impl TestCertificate {
 	///
 	/// [`CertificateValidation::evaluate`]: crate::crypto::x509::policy::CertificateValidation::evaluate
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-	pub fn with_cn_and_uri_sans(signing_key: &SigningKey, cn: &str, uris: &[&str]) -> Certificate {
+	pub fn with_cn_and_uri_sans(signing_key: &SigningKey, cn: impl AsRef<str>, uris: &[&str]) -> Certificate {
+		let cn = cn.as_ref();
 		let name = test_cn_name(cn).expect("test common names satisfy PrintableString");
 		test_certificate_named_with_uri_sans(signing_key, name, uris)
 	}

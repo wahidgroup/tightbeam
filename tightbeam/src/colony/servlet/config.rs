@@ -119,7 +119,8 @@ where
 	}
 
 	/// Worker registered under `name`, downcast to `W`.
-	pub fn worker<W: 'static>(&self, name: &str) -> Option<&W> {
+	pub fn worker<W: 'static>(&self, name: impl AsRef<str>) -> Option<&W> {
+		let name = name.as_ref();
 		self.workers.get(name)?.downcast_ref()
 	}
 

@@ -103,7 +103,8 @@ fn mux_peering_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 
 /// [`advertising_cluster_conf`] with a mux offer, so the exporting
 /// gateway serves forwarded streams from its peer.
-fn mux_advertising_conf(certs: &ClusterTestCerts, peer: String) -> ClusterConfig {
+fn mux_advertising_conf(certs: &ClusterTestCerts, peer: impl Into<String>) -> ClusterConfig {
+	let peer: String = peer.into();
 	with_mux_offer(advertising_cluster_conf(certs, peer))
 }
 

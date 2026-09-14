@@ -109,12 +109,14 @@ trait DtnNode {
 
 	async fn handle_chain_gap(
 		&self,
-		current_head: Vec<u8>,
-		missing_hash: Vec<u8>,
+		current_head: impl Into<Vec<u8>>,
+		missing_hash: impl Into<Vec<u8>>,
 		pool: &Arc<ConnectionPool<TokioListener>>,
 		upstream_addr: TightBeamSocketAddr,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
+		let current_head: Vec<u8> = current_head.into();
+		let missing_hash: Vec<u8> = missing_hash.into();
 		trace.event(gap_recovery_event(self.node_name(), GapRecoveryStep::GapDetected))?;
 
 		let ctx = Arc::new(GapRecoveryContext {

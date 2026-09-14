@@ -163,12 +163,13 @@ where
 /// `transcript_hash` can commit to the exchange without circularity.
 fn exchange_challenge_hash<D>(
 	chain_hash: &[u8; 32],
-	request_der: &[u8],
+	request_der: impl AsRef<[u8]>,
 	server_random: &[u8; 32],
 ) -> Result<[u8; 32], HandshakeError>
 where
 	D: Digest,
 {
+	let request_der = request_der.as_ref();
 	let capacity = chain_hash.len() + request_der.len() + server_random.len();
 	let mut transcript = Vec::with_capacity(capacity);
 	transcript.extend_from_slice(chain_hash);
@@ -181,13 +182,16 @@ where
 /// `hash_next = H(hash_prev || request_der || response_der || ack_der)`.
 fn advance_chain_hash<D>(
 	chain_hash: &[u8; 32],
-	request_der: &[u8],
-	response_der: &[u8],
-	ack_der: &[u8],
+	request_der: impl AsRef<[u8]>,
+	response_der: impl AsRef<[u8]>,
+	ack_der: impl AsRef<[u8]>,
 ) -> Result<[u8; 32], HandshakeError>
 where
 	D: Digest,
 {
+	let request_der = request_der.as_ref();
+	let response_der = response_der.as_ref();
+	let ack_der = ack_der.as_ref();
 	let capacity = chain_hash.len() + request_der.len() + response_der.len() + ack_der.len();
 	let mut transcript = Vec::with_capacity(capacity);
 	transcript.extend_from_slice(chain_hash);

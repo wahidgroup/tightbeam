@@ -490,7 +490,11 @@ impl ClusterConfig {
 	/// One balancer draw over `entries`, guarding the untrusted index.
 	///
 	/// The balancer is operator-configurable, so its answer is untrusted.
-	pub(crate) fn pick_instance<'e>(&self, entries: &'e [Arc<ServletEntry>]) -> Option<&'e Arc<ServletEntry>> {
+	pub(crate) fn pick_instance<'e>(
+		&self,
+		entries: &'e (impl AsRef<[Arc<ServletEntry>]> + ?Sized),
+	) -> Option<&'e Arc<ServletEntry>> {
+		let entries = entries.as_ref();
 		// The key copy is deliberate. `InstanceMetrics` owns its key.
 		let metrics: Vec<InstanceMetrics> = entries
 			.iter()
@@ -646,13 +650,15 @@ mod tests {
 		HiveRegistry::new(Duration::from_secs(15))
 	}
 
-	fn servlet_urn(name: &str) -> crate::utils::urn::Urn<'static> {
+	fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> crate::utils::urn::Urn<'static> {
+		let name = name.as_ref();
 		ColonyNamespace::default()
 			.servlet(name)
 			.expect("test names satisfy the mint grammar")
 	}
 
-	fn type_key(name: &str) -> Vec<u8> {
+	fn type_key(name: impl AsRef<str>) -> Vec<u8> {
+		let name = name.as_ref();
 		servlet_urn(name).canonical_bytes()
 	}
 
@@ -662,7 +668,8 @@ mod tests {
 		Arc::from(b"test-signer".as_slice())
 	}
 
-	fn request(addr: &[u8], servlets: &[&str]) -> RegisterHiveRequest {
+	fn request(addr: impl AsRef<[u8]>, servlets: &[&str]) -> RegisterHiveRequest {
+		let addr = addr.as_ref();
 		RegisterHiveRequest {
 			hive_addr: addr.to_vec(),
 			metadata: None,
@@ -673,7 +680,9 @@ mod tests {
 		}
 	}
 
-	fn request_with_meta(addr: &[u8], servlets: &[&str], meta: &[u8]) -> RegisterHiveRequest {
+	fn request_with_meta(addr: impl AsRef<[u8]>, servlets: &[&str], meta: impl AsRef<[u8]>) -> RegisterHiveRequest {
+		let addr = addr.as_ref();
+		let meta = meta.as_ref();
 		let mut request = request(addr, servlets);
 		request.metadata = Some(meta.to_vec());
 		request
@@ -742,15 +751,15 @@ mod tests {
 		let registry = test_registry();
 		registry.register(request(b"127.0.0.1:8080", &["ping", "calc"]), test_signer())?;
 		// Registered types found
-		assert_eq!(registry.hives_for_type(&type_key("ping"))?.len(), 1);
-		assert_eq!(registry.hives_for_type(&type_key("calc"))?.len(), 1);
+		assert_eq!(registry.hives_for_type(type_key("ping"))?.len(), 1);
+		assert_eq!(registry.hives_for_type(type_key("calc"))?.len(), 1);
 		assert_eq!(
-			registry.hives_for_type(&type_key("ping"))?[0].address.as_ref(),
+			registry.hives_for_type(type_key("ping"))?[0].address.as_ref(),
 			b"127.0.0.1:8080"
 		);
 
 		// Unknown type not found
-		assert!(registry.hives_for_type(&type_key("unknown"))?.is_empty());
+		assert!(registry.hives_for_type(type_key("unknown"))?.is_empty());
 		Ok(())
 	}
 
@@ -761,7 +770,7 @@ mod tests {
 		assert_eq!(registry.len()?, 1);
 		assert!(registry.unregister(b"127.0.0.1:8080")?.is_some());
 		assert_eq!(registry.len()?, 0);
-		assert!(registry.hives_for_type(&type_key("ping"))?.is_empty());
+		assert!(registry.hives_for_type(type_key("ping"))?.is_empty());
 		Ok(())
 	}
 
@@ -770,7 +779,7 @@ mod tests {
 		let registry = test_registry();
 		registry.register(request(b"127.0.0.1:8080", &["ping"]), test_signer())?;
 		assert!(registry.update_utilization(b"127.0.0.1:8080", crate::bps!(5000))?);
-		assert_eq!(registry.hives_for_type(&type_key("ping"))?[0].utilization.get(), 5000);
+		assert_eq!(registry.hives_for_type(type_key("ping"))?[0].utilization.get(), 5000);
 		Ok(())
 	}
 
@@ -789,7 +798,7 @@ mod tests {
 		let registry = test_registry();
 		registry.register(request(b"hive1", &["ping"]), test_signer())?;
 		registry.register(request(b"hive2", &["ping"]), test_signer())?;
-		assert_eq!(registry.hives_for_type(&type_key("ping"))?.len(), 2);
+		assert_eq!(registry.hives_for_type(type_key("ping"))?.len(), 2);
 		Ok(())
 	}
 

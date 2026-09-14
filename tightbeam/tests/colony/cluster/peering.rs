@@ -998,7 +998,7 @@ tb_scenario! {
 			let over_cap: Vec<ServletInfo> = (0..=MAX_ADVERTISED_TYPES)
 				.map(|i| {
 					let addr = format!("127.0.0.1:{}", 20000 + i);
-					servlet_info(&format!("t{i}"), addr.as_bytes())
+					servlet_info(format!("t{i}"), addr.as_bytes())
 				})
 				.collect();
 			emit_servlet_update(
@@ -1064,7 +1064,8 @@ fn receiving_peer_conf(certs: &SplitPlaneCerts) -> ClusterConfig {
 
 /// Advertiser whose hive plane cannot validate the receiver: only
 /// `peer_trust` anchors the receiver's identity.
-fn cross_plane_advertising_conf(certs: &SplitPlaneCerts, peer: String) -> ClusterConfig {
+fn cross_plane_advertising_conf(certs: &SplitPlaneCerts, peer: impl Into<String>) -> ClusterConfig {
+	let peer: String = peer.into();
 	let tls = cluster_tls_config(&certs.exporter).with_peer_trust(Arc::clone(&certs.receiver_trust));
 
 	ClusterConfig::builder(tls)

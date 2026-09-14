@@ -280,7 +280,8 @@ impl SeenSignatures {
 	/// A record found past the window is dropped here, so an expired
 	/// signature returns its capacity on the next admission. The signer is
 	/// read through the index without copying it.
-	fn is_live_replay(&mut self, signature: &[u8], now_ms: u64, window_ms: u64) -> bool {
+	fn is_live_replay(&mut self, signature: impl AsRef<[u8]>, now_ms: u64, window_ms: u64) -> bool {
+		let signature = signature.as_ref();
 		let live = match self.owner.get(signature) {
 			Some(signer) => self
 				.partitions
@@ -299,7 +300,8 @@ impl SeenSignatures {
 
 	/// Drops `signer`'s expired records. Bounded by the per-signer
 	/// capacity, so each signer's history costs that signer alone.
-	fn expire(&mut self, signer: &[u8], now_ms: u64, window_ms: u64) {
+	fn expire(&mut self, signer: impl AsRef<[u8]>, now_ms: u64, window_ms: u64) {
+		let signer = signer.as_ref();
 		let Some(sigs) = self.partitions.get_mut(signer) else {
 			return;
 		};
@@ -318,7 +320,9 @@ impl SeenSignatures {
 		}
 	}
 
-	fn record(&mut self, signer: &[u8], signature: &[u8], now_ms: u64) {
+	fn record(&mut self, signer: impl AsRef<[u8]>, signature: impl AsRef<[u8]>, now_ms: u64) {
+		let signer = signer.as_ref();
+		let signature = signature.as_ref();
 		self.partitions
 			.entry(signer.to_vec())
 			.or_default()
@@ -326,7 +330,8 @@ impl SeenSignatures {
 		self.owner.insert(signature.to_vec(), signer.to_vec());
 	}
 
-	fn forget(&mut self, signature: &[u8]) {
+	fn forget(&mut self, signature: impl AsRef<[u8]>) {
+		let signature = signature.as_ref();
 		let Some(signer) = self.owner.remove(signature) else {
 			return;
 		};
@@ -340,7 +345,8 @@ impl SeenSignatures {
 		}
 	}
 
-	fn len_for(&self, signer: &[u8]) -> usize {
+	fn len_for(&self, signer: impl AsRef<[u8]>) -> usize {
+		let signer = signer.as_ref();
 		self.partitions.get(signer).map_or(0, HashMap::len)
 	}
 }
@@ -366,7 +372,9 @@ impl ReplayGuard {
 	/// Returns `true` when the signature is new (and now recorded).
 	/// Returns `false` for replays, and fails closed when the signer's
 	/// partition is at capacity or the lock is poisoned.
-	pub fn check_and_insert(&self, signer: &[u8], signature: &[u8], now_ms: u64) -> bool {
+	pub fn check_and_insert(&self, signer: impl AsRef<[u8]>, signature: impl AsRef<[u8]>, now_ms: u64) -> bool {
+		let signer = signer.as_ref();
+		let signature = signature.as_ref();
 		let Ok(mut seen) = self.seen.lock() else {
 			return false;
 		};
@@ -396,7 +404,8 @@ impl ReplayGuard {
 	/// that operation fails, the record must be released or a legitimate
 	/// retry of the same signed frame is rejected as a replay until the
 	/// window expires.
-	pub fn forget(&self, signature: &[u8]) {
+	pub fn forget(&self, signature: impl AsRef<[u8]>) {
+		let signature = signature.as_ref();
 		let Ok(mut seen) = self.seen.lock() else {
 			return;
 		};
@@ -729,7 +738,7 @@ mod tests {
 	#[test]
 	fn replay_guard_saturated_signer_does_not_block_others() {
 		let guard = ReplayGuard::new(30_000);
-		let seeded = (0..REPLAY_GUARD_CAPACITY).all(|i| guard.check_and_insert(b"signer-1", &i.to_be_bytes(), 1_000));
+		let seeded = (0..REPLAY_GUARD_CAPACITY).all(|i| guard.check_and_insert(b"signer-1", i.to_be_bytes(), 1_000));
 		assert!(seeded);
 		assert!(!guard.check_and_insert(b"signer-1", b"sig-overflow", 1_000));
 		assert!(guard.check_and_insert(b"signer-2", b"sig-a", 1_000));

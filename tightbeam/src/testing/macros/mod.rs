@@ -82,7 +82,8 @@ where
 /// than inside the `afl::fuzz!` expansion, where a mismatch reports against
 /// the macro.
 #[doc(hidden)]
-pub fn __tb_call_raw_fuzz<F: FnOnce(&[u8])>(target: F, data: &[u8]) {
+pub fn __tb_call_raw_fuzz<F: FnOnce(&[u8])>(target: F, data: impl AsRef<[u8]>) {
+	let data = data.as_ref();
 	target(data);
 }
 

@@ -100,9 +100,11 @@ impl ChainProcessor {
 	/// collecting all frames in between.
 	pub fn request_missing_frames(
 		&self,
-		requester_head: &[u8],
-		last_received_hash: &[u8],
+		requester_head: impl AsRef<[u8]>,
+		last_received_hash: impl AsRef<[u8]>,
 	) -> Result<Vec<Frame>, TightBeamError> {
+		let requester_head = requester_head.as_ref();
+		let last_received_hash = last_received_hash.as_ref();
 		// Find frame with hash matching last_received_hash (frame just before gap)
 		let mut store = self.store.write()?;
 		let mut current_frame = match store.retrieve_by_hash(last_received_hash)? {

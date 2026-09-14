@@ -153,11 +153,12 @@ impl RuntimeAead {
 /// algorithm OID.
 #[inline]
 fn build_encrypted_content_info(
-	ciphertext: Vec<u8>,
+	ciphertext: impl Into<Vec<u8>>,
 	nonce: &[u8],
 	content_type: Option<ObjectIdentifier>,
 	algorithm_oid: ObjectIdentifier,
 ) -> TbResult<EncryptedContentInfo> {
+	let ciphertext: Vec<u8> = ciphertext.into();
 	let content_type = content_type.unwrap_or(DATA);
 
 	// Store the nonce in the algorithm parameters as an OctetString

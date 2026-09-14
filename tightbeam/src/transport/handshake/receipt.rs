@@ -207,13 +207,14 @@ fn single_valued(oid: ObjectIdentifier, value: Any) -> Result<Attribute, Handsha
 /// the role tag, and the client's settlement answer when present.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn receipt_signed_attrs<D>(
-	receipt_der: &[u8],
+	receipt_der: impl AsRef<[u8]>,
 	role: ReceiptRole,
 	answer: Option<&[u8]>,
 ) -> Result<SignedAttributes, HandshakeError>
 where
 	D: Digest,
 {
+	let receipt_der = receipt_der.as_ref();
 	let message_digest = compute_transcript_digest::<D>(receipt_der)?;
 
 	let mut attributes = Vec::with_capacity(4);
@@ -300,7 +301,7 @@ fn signer_answer(signer: &SignerInfo) -> Result<Option<OctetString>, HandshakeEr
 /// standard signed attributes.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 async fn signer_info_over_receipt<D>(
-	receipt_der: &[u8],
+	receipt_der: impl AsRef<[u8]>,
 	role: ReceiptRole,
 	answer: Option<&[u8]>,
 	key_provider: &dyn SigningKeyProvider,
@@ -308,6 +309,7 @@ async fn signer_info_over_receipt<D>(
 where
 	D: Digest + AssociatedOid,
 {
+	let receipt_der = receipt_der.as_ref();
 	let signed_attrs = receipt_signed_attrs::<D>(receipt_der, role, answer)?;
 	let prehash = signed_attrs_prehash::<D>(&signed_attrs)?;
 	let signature_bytes = key_provider.sign_prehash(&prehash).await?;
@@ -337,10 +339,14 @@ where
 /// `digestAlgorithms` SET and inside the `SignerInfo`. The SET entry is
 /// built fresh from the compile-time OID.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-fn new_receipt_artifact<D>(receipt_der: &[u8], server_signer: SignerInfo) -> Result<SignedData, HandshakeError>
+fn new_receipt_artifact<D>(
+	receipt_der: impl AsRef<[u8]>,
+	server_signer: SignerInfo,
+) -> Result<SignedData, HandshakeError>
 where
 	D: AssociatedOid,
 {
+	let receipt_der = receipt_der.as_ref();
 	let body = OctetString::new(receipt_der)?;
 	let body_der = body.to_der()?;
 	let econtent = Any::from_der(&body_der)?;
@@ -414,7 +420,7 @@ where
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn verify_receipt_signer<D, S, V>(
-	receipt_der: &[u8],
+	receipt_der: impl AsRef<[u8]>,
 	signer: &SignerInfo,
 	role: ReceiptRole,
 	expected_sid: &SignerIdentifier,
@@ -425,6 +431,7 @@ where
 	S: for<'a> TryFrom<&'a [u8]>,
 	V: PrehashVerifier<S>,
 {
+	let receipt_der = receipt_der.as_ref();
 	let attrs = signer
 		.signed_attrs
 		.as_ref()

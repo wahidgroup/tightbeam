@@ -48,11 +48,12 @@ impl RoverTelemetry {
 	/// Create telemetry with typed instrument
 	pub fn new(
 		instrument: RoverInstrument,
-		data: Vec<u8>,
+		data: impl Into<Vec<u8>>,
 		mission_time_ms: u64,
 		battery_percent: u8,
 		temperature_c: i8,
 	) -> Self {
+		let data: Vec<u8> = data.into();
 		Self {
 			instrument: instrument as u8,
 			data,
@@ -237,7 +238,8 @@ pub struct MessageChainState {
 }
 
 impl MessageChainState {
-	pub fn new(node_id: String) -> Self {
+	pub fn new(node_id: impl Into<String>) -> Self {
+		let node_id: String = node_id.into();
 		Self { last_hash: [0u8; 32], sequence: 0, node_id }
 	}
 

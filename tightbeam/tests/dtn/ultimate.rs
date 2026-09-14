@@ -750,7 +750,7 @@ tb_scenario! {
 				max_events: 4096,
 			})
 			.with_logger(LoggerConfig::new(
-				Box::new(StdoutBackend),
+				StdoutBackend,
 				LogFilter::new(LogLevel::Error)
 			).with_default_level(LogLevel::Debug))
 			.build()

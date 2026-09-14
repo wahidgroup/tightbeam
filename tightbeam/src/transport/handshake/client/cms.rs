@@ -389,10 +389,11 @@ where
 	/// Verify the signature and content of the SignedData.
 	fn verify_signature(
 		&self,
-		signed_data_der: &[u8],
+		signed_data_der: impl AsRef<[u8]>,
 		server_verifying_key: P::VerifyingKey,
 		expected_sid: SignerIdentifier,
 	) -> Result<Vec<u8>, HandshakeError> {
+		let signed_data_der = signed_data_der.as_ref();
 		let verifier = EcdsaSignatureVerifier::<P::VerifyingKey, P::Signature, P::Digest>::from_verifying_key_with_sid(
 			server_verifying_key,
 			expected_sid,
@@ -459,7 +460,8 @@ where
 	///
 	/// # Returns
 	/// Verified transcript hash
-	pub fn process_server_finished(&mut self, signed_data_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	pub fn process_server_finished(&mut self, signed_data_der: impl AsRef<[u8]>) -> Result<Vec<u8>, HandshakeError> {
+		let signed_data_der = signed_data_der.as_ref();
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
@@ -824,7 +826,12 @@ where
 	/// Carrier for the confidential settlement answer in the client
 	/// Finished. The same KARI machinery as the key exchange, without
 	/// negotiation attributes.
-	fn encrypt_to_server(&self, content: &[u8], rng: &mut dyn CryptoRngCore) -> Result<Vec<u8>, HandshakeError> {
+	fn encrypt_to_server(
+		&self,
+		content: impl AsRef<[u8]>,
+		rng: &mut dyn CryptoRngCore,
+	) -> Result<Vec<u8>, HandshakeError> {
+		let content = content.as_ref();
 		let (server_public_key, sender_ephemeral, sender_pub_spki) = self.extract_key_exchange_crypto_material(rng)?;
 		let ukm = self.create_user_keying_material(rng)?;
 		let rid = self.build_recipient_identifier()?;
@@ -837,9 +844,10 @@ where
 	/// Finalize key exchange by updating transcript and state.
 	fn finalize_key_exchange(
 		&mut self,
-		enveloped_data_der: &[u8],
+		enveloped_data_der: impl AsRef<[u8]>,
 		session_key: ZeroizingBytes,
 	) -> Result<(), HandshakeError> {
+		let enveloped_data_der = enveloped_data_der.as_ref();
 		// Add to transcript if we're computing it internally
 		if self.transcript_hash.is_none() {
 			self.transcript_buffer.extend_from_slice(enveloped_data_der);
@@ -1154,7 +1162,7 @@ mod tests {
 			signature_alg,
 		)?;
 
-		let server_finished = server_finished_builder.build(&transcript_hash)?;
+		let server_finished = server_finished_builder.build(transcript_hash)?;
 		let server_finished = server_finished.to_der()?;
 		let verified = client.process_server_finished(&server_finished)?;
 		assert_eq!(verified, transcript_hash);
@@ -1268,7 +1276,7 @@ mod tests {
 		let mut client = TestCmsClientBuilder::new().build()?;
 
 		// When: Trying to process server finished before sending key exchange
-		let result = client.process_server_finished(&[]);
+		let result = client.process_server_finished([]);
 		assert!(result.is_err());
 
 		// When: Trying to build client finished before processing server finished
@@ -1297,7 +1305,7 @@ mod tests {
 				values: SetOfVec::try_from(accept_attr.attr_values)?,
 			};
 
-			let mut signed_data = builder.build(&[7u8; 32])?;
+			let mut signed_data = builder.build([7u8; 32])?;
 			let attrs = Attributes::try_from(vec![x509_attr])?;
 			let mut signer_infos: Vec<_> = signed_data.signer_infos.0.iter().cloned().collect();
 

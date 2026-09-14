@@ -170,7 +170,8 @@ where
 	/// supported profile from client's offer. If no profiles are configured or
 	/// client sends no offer, the server uses dealer's choice mode.
 	#[must_use]
-	pub fn with_supported_profiles(mut self, profiles: Vec<SecurityProfileDesc>) -> Self {
+	pub fn with_supported_profiles(mut self, profiles: impl IntoIterator<Item = SecurityProfileDesc>) -> Self {
+		let profiles: Vec<SecurityProfileDesc> = profiles.into_iter().collect();
 		self.supported_profiles = profiles;
 		self
 	}
@@ -355,10 +356,11 @@ where
 	/// Verify the signature and content of the SignedData.
 	fn verify_client_signature(
 		&self,
-		signed_data_der: &[u8],
+		signed_data_der: impl AsRef<[u8]>,
 		client_verifying_key: P::VerifyingKey,
 		expected_sid: SignerIdentifier,
 	) -> Result<Vec<u8>, HandshakeError> {
+		let signed_data_der = signed_data_der.as_ref();
 		let verifier = EcdsaSignatureVerifier::<P::VerifyingKey, P::Signature, P::Digest>::from_verifying_key_with_sid(
 			client_verifying_key,
 			expected_sid,
@@ -377,7 +379,8 @@ where
 	}
 
 	/// Decrypt the session key from EnvelopedData and store it securely.
-	async fn decrypt_session_key(&mut self, enveloped_data_der: &[u8]) -> Result<(), HandshakeError> {
+	async fn decrypt_session_key(&mut self, enveloped_data_der: impl AsRef<[u8]>) -> Result<(), HandshakeError> {
+		let enveloped_data_der = enveloped_data_der.as_ref();
 		let session_key_bytes = self.decrypt_enveloped_content(enveloped_data_der).await?;
 		self.session_key = Some(Secret::from(session_key_bytes));
 
@@ -389,7 +392,8 @@ where
 	///
 	/// Shared by the key exchange and the confidential settlement answer
 	/// carried in the client Finished.
-	async fn decrypt_enveloped_content(&self, enveloped_data_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	async fn decrypt_enveloped_content(&self, enveloped_data_der: impl AsRef<[u8]>) -> Result<Vec<u8>, HandshakeError> {
+		let enveloped_data_der = enveloped_data_der.as_ref();
 		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 		let kari = enveloped_data
 			.recip_infos
@@ -447,7 +451,8 @@ where
 	/// # Security
 	/// Session key is stored internally and zeroized on drop. Not returned to prevent
 	/// unnecessary copies of key material in memory.
-	pub async fn process_key_exchange(&mut self, enveloped_data_der: &[u8]) -> Result<(), HandshakeError> {
+	pub async fn process_key_exchange(&mut self, enveloped_data_der: impl AsRef<[u8]>) -> Result<(), HandshakeError> {
+		let enveloped_data_der = enveloped_data_der.as_ref();
 		// 1. Validation
 		self.validate_expected_state(ServerHandshakeState::Init)?;
 
@@ -606,7 +611,8 @@ where
 	}
 
 	/// Finalize server finished by updating transcript and transitioning state.
-	fn finalize_server_finished(&mut self, signed_data_der: &[u8]) -> Result<(), HandshakeError> {
+	fn finalize_server_finished(&mut self, signed_data_der: impl AsRef<[u8]>) -> Result<(), HandshakeError> {
+		let signed_data_der = signed_data_der.as_ref();
 		// Add to transcript if computing internally
 		if !self.transcript_buffer.is_empty() {
 			self.transcript_buffer.extend_from_slice(signed_data_der);
@@ -753,7 +759,8 @@ where
 	///
 	/// # Returns
 	/// Verified transcript hash
-	pub fn process_client_finished(&mut self, signed_data_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	pub fn process_client_finished(&mut self, signed_data_der: impl AsRef<[u8]>) -> Result<Vec<u8>, HandshakeError> {
+		let signed_data_der = signed_data_der.as_ref();
 		// 1. Validation
 		self.validate_expected_state(ServerHandshakeState::ServerFinishedSent)?;
 
@@ -790,11 +797,12 @@ where
 	/// a missing or invalid countersignature aborts the handshake, and a
 	/// settle refusal aborts with the application code. The completed
 	/// [`StoredReceipt`] is retained only after both.
-	pub async fn process_receipt_ack(&mut self, signed_data_der: &[u8]) -> Result<(), HandshakeError>
+	pub async fn process_receipt_ack(&mut self, signed_data_der: impl AsRef<[u8]>) -> Result<(), HandshakeError>
 	where
 		for<'a> P::Signature: TryFrom<&'a [u8]>,
 		P::VerifyingKey: PrehashVerifier<P::Signature>,
 	{
+		let signed_data_der = signed_data_der.as_ref();
 		// Taken, not cloned: the outcome owns the receipt (and its
 		// unbounded ancillary challenge). The fail-closed gate in
 		// `complete` keys on the negotiated budgets, not this field.
@@ -905,7 +913,8 @@ where
 /// unsigned attributes.
 ///
 /// The SignedData is parsed once and duplicate attributes fail closed.
-fn extract_receipt_ack_envelope(signed_data_der: &[u8]) -> Result<Option<OctetString>, HandshakeError> {
+fn extract_receipt_ack_envelope(signed_data_der: impl AsRef<[u8]>) -> Result<Option<OctetString>, HandshakeError> {
+	let signed_data_der = signed_data_der.as_ref();
 	let signed_data = SignedData::from_der(signed_data_der)?;
 	signed_data
 		.find_unsigned_attr(oids::RECEIPT_ACK)?
@@ -915,7 +924,8 @@ fn extract_receipt_ack_envelope(signed_data_der: &[u8]) -> Result<Option<OctetSt
 
 /// Extract the first X.509 certificate embedded in a Finished message's
 /// `certificates` field, if any.
-fn extract_embedded_certificate(signed_data_der: &[u8]) -> Result<Option<Certificate>, HandshakeError> {
+fn extract_embedded_certificate(signed_data_der: impl AsRef<[u8]>) -> Result<Option<Certificate>, HandshakeError> {
+	let signed_data_der = signed_data_der.as_ref();
 	use crate::cms::cert::CertificateChoices;
 
 	let signed_data = SignedData::from_der(signed_data_der)?;
@@ -1097,7 +1107,7 @@ mod tests {
 		async fn test_invalid_state_transitions() -> Result<(), Box<dyn Error>> {
 			let (mut server, _) = TestCmsServerBuilder::new().build();
 			assert!(server.build_server_finished().await.is_err());
-			assert!(server.process_client_finished(&[]).is_err());
+			assert!(server.process_client_finished([]).is_err());
 			Ok(())
 		}
 

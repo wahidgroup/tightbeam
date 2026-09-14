@@ -214,7 +214,8 @@ impl Violations {
 	///
 	/// `None` reports that every layer accepted the run, which is what keeps
 	/// a `Violations` non-empty by construction.
-	pub(crate) fn collected(found: Vec<SpecViolation>) -> Option<Self> {
+	pub(crate) fn collected(found: impl IntoIterator<Item = SpecViolation>) -> Option<Self> {
+		let found: Vec<SpecViolation> = found.into_iter().collect();
 		if found.is_empty() {
 			return None;
 		}

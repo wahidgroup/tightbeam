@@ -471,7 +471,8 @@ mod tests {
 		DEFAULT_REPELLENCY_THRESHOLD, MAX_PHEROMONE,
 	};
 
-	fn pool(pheromones: &[u64]) -> Vec<InstanceMetrics> {
+	fn pool(pheromones: impl AsRef<[u64]>) -> Vec<InstanceMetrics> {
+		let pheromones = pheromones.as_ref();
 		pheromones
 			.iter()
 			.enumerate()
@@ -480,10 +481,11 @@ mod tests {
 	}
 
 	fn uniform(count: usize) -> Vec<InstanceMetrics> {
-		pool(&vec![MAX_PHEROMONE / 2; count])
+		pool(vec![MAX_PHEROMONE / 2; count])
 	}
 
-	fn histogram(balancer: &dyn LoadBalancer, candidates: &[InstanceMetrics], draws: usize) -> Vec<usize> {
+	fn histogram(balancer: &dyn LoadBalancer, candidates: impl AsRef<[InstanceMetrics]>, draws: usize) -> Vec<usize> {
+		let candidates = candidates.as_ref();
 		let mut counts = vec![0usize; candidates.len()];
 		for _ in 0..draws {
 			if let Some(index) = balancer.select(candidates) {
@@ -526,7 +528,7 @@ mod tests {
 	#[test]
 	fn forager_favors_stronger_trail() {
 		let forager = StochasticForager::with_seed(0xA1);
-		let candidates = pool(&[MAX_PHEROMONE / 10, DEFAULT_REPELLENCY_THRESHOLD]);
+		let candidates = pool([MAX_PHEROMONE / 10, DEFAULT_REPELLENCY_THRESHOLD]);
 		let counts = histogram(&forager, &candidates, 8_000);
 		assert!(counts[1] > counts[0], "stronger trail must win more draws, got {counts:?}");
 	}
@@ -534,7 +536,7 @@ mod tests {
 	#[test]
 	fn forager_floor_keeps_zero_trail_reachable() {
 		let forager = StochasticForager::with_seed(0xB2);
-		let candidates = pool(&[0, MAX_PHEROMONE]);
+		let candidates = pool([0, MAX_PHEROMONE]);
 		let counts = histogram(&forager, &candidates, 8_000);
 		assert!(
 			counts[0] > 0,
@@ -545,7 +547,7 @@ mod tests {
 	#[test]
 	fn forager_repellency_caps_saturated_share() {
 		let forager = StochasticForager::with_seed(0xC3);
-		let saturated = pool(&[MAX_PHEROMONE, DEFAULT_REPELLENCY_THRESHOLD]);
+		let saturated = pool([MAX_PHEROMONE, DEFAULT_REPELLENCY_THRESHOLD]);
 		let counts = histogram(&forager, &saturated, 8_000);
 		assert!(
 			counts[1] >= counts[0],
@@ -556,7 +558,7 @@ mod tests {
 	#[test]
 	fn p2c_picks_stronger_of_two() {
 		let balancer = PowerOfTwoChoices::default();
-		let candidates = pool(&[100, MAX_PHEROMONE]);
+		let candidates = pool([100, MAX_PHEROMONE]);
 		assert_eq!(balancer.select(&candidates), Some(1));
 	}
 
@@ -601,7 +603,7 @@ mod tests {
 	#[test]
 	fn zero_floor_and_dead_trails_still_select_uniformly() {
 		let tuned = StochasticForager::with_seed(0xF6).with_exploration_floor(0);
-		let dead = pool(&[0, 0, 0]);
+		let dead = pool([0, 0, 0]);
 		let seen: HashSet<usize> = (0..256).filter_map(|_| tuned.select(&dead)).collect();
 		assert_eq!(seen.len(), dead.len());
 	}

@@ -46,7 +46,8 @@ fn colony_ns() -> ColonyNamespace {
 	ColonyNamespace::default()
 }
 
-fn servlet_urn(name: &str) -> Urn<'static> {
+fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+	let name = name.as_ref();
 	colony_ns().servlet(name).expect("test names satisfy the mint grammar")
 }
 
@@ -175,7 +176,8 @@ fn heartbeat_command() -> ClusterCommand {
 /// Builds a command frame with an integrity witness. The frame stays
 /// unsigned until the caller signs it. `metadata.order` is the freshness
 /// binding (CWE-294).
-fn command_frame_with_order(id: &[u8], cmd: ClusterCommand, order: u64) -> Result<Frame, TightBeamError> {
+fn command_frame_with_order(id: impl AsRef<[u8]>, cmd: ClusterCommand, order: u64) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	FrameBuilder::from(Version::V1)
 		.with_id(id)
 		.with_order(order)
@@ -184,13 +186,15 @@ fn command_frame_with_order(id: &[u8], cmd: ClusterCommand, order: u64) -> Resul
 		.build()
 }
 
-fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError> {
+fn command_frame(id: impl AsRef<[u8]>, cmd: ClusterCommand) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	command_frame_with_order(id, cmd, current_timestamp_ms())
 }
 
 /// Builds a manage command frame with a stop request. Each call site
 /// passes a unique id.
-fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
+fn stop_command_frame(id: impl AsRef<[u8]>) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let servlet_id = servlet_urn("none")
 		.servlet_instance("127.0.0.1:0")
 		.expect("a servlet type URN yields an instance URN");
@@ -202,7 +206,9 @@ fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 }
 
 /// Builds a manage command frame with a spawn request.
-fn spawn_command_frame(id: &[u8], servlet_type: &str) -> Result<Frame, TightBeamError> {
+fn spawn_command_frame(id: impl AsRef<[u8]>, servlet_type: impl AsRef<str>) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
+	let servlet_type = servlet_type.as_ref();
 	let manage_cmd = ClusterCommand {
 		heartbeat: None,
 		manage: Some(HiveManagementRequest {
@@ -241,7 +247,8 @@ impl TrustedSignerContext {
 	}
 }
 
-fn trusted_signer(subject: &str) -> TrustedSignerContext {
+fn trusted_signer(subject: impl AsRef<str>) -> TrustedSignerContext {
+	let subject = subject.as_ref();
 	let (certificate, signing_key) = create_test_cert_with_key(subject, 365).expect("signer material");
 	TrustedSignerContext { certificate, provider: Arc::new(Secp256k1KeyProvider::from(signing_key)) }
 }
@@ -341,13 +348,18 @@ fn manage_spawn_shape_status(response: &ClusterCommandResponse) -> Result<Transi
 	Ok(spawn.status)
 }
 
-async fn signed_heartbeat_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
+async fn signed_heartbeat_frame(
+	provider: &Secp256k1KeyProvider,
+	id: impl AsRef<[u8]>,
+) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let mut frame = command_frame(id, heartbeat_command())?;
 	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
 	Ok(frame)
 }
 
-async fn signed_stop_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
+async fn signed_stop_frame(provider: &Secp256k1KeyProvider, id: impl AsRef<[u8]>) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let mut frame = stop_command_frame(id)?;
 	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
 	Ok(frame)
@@ -355,9 +367,11 @@ async fn signed_stop_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result
 
 async fn signed_spawn_frame(
 	provider: &Secp256k1KeyProvider,
-	id: &[u8],
-	servlet_type: &str,
+	id: impl AsRef<[u8]>,
+	servlet_type: impl AsRef<str>,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
+	let servlet_type = servlet_type.as_ref();
 	let mut frame = spawn_command_frame(id, servlet_type)?;
 	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
 	Ok(frame)

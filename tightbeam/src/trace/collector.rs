@@ -186,13 +186,14 @@ impl<'a> EventBuilder<'a> {
 
 	/// Add payload data to the event
 	#[cfg(feature = "instrument")]
-	pub fn with_payload(mut self, payload: &'a [u8]) -> Self {
+	pub fn with_payload(mut self, payload: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
+		let payload = payload.as_ref();
 		self.payload = Some(payload);
 		self
 	}
 
 	#[cfg(not(feature = "instrument"))]
-	pub fn with_payload(self, _payload: &'a [u8]) -> Self {
+	pub fn with_payload(self, _payload: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
 		self
 	}
 
@@ -464,7 +465,8 @@ impl TraceState {
 	}
 
 	#[cfg(feature = "testing-fuzz")]
-	fn with_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
+	fn with_oracle(input: impl Into<Vec<u8>>, process: crate::testing::specs::csp::Process) -> Self {
+		let input: Vec<u8> = input.into();
 		Self {
 			// The testing-fuzz feature implies testing, so the field exists here
 			assertions: Mutex::new(Vec::new()),
@@ -526,7 +528,8 @@ impl TraceCollector {
 
 	/// Create a trace collector with fuzz oracle (CSP-guided fuzzing)
 	#[cfg(feature = "testing-fuzz")]
-	pub fn with_fuzz_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
+	pub fn with_fuzz_oracle(input: impl Into<Vec<u8>>, process: crate::testing::specs::csp::Process) -> Self {
+		let input: Vec<u8> = input.into();
 		Self { state: Arc::new(TraceState::with_oracle(input, process)) }
 	}
 
@@ -657,7 +660,8 @@ impl TraceCollector {
 	/// A failed step is ignored when the label is disabled or outside the
 	/// process alphabet. End-of-run CSP validation still owns hard acceptance.
 	#[cfg(feature = "testing-fuzz")]
-	fn dispatch_csp_event(&self, label: &str) {
+	fn dispatch_csp_event(&self, label: impl AsRef<str>) {
+		let label = label.as_ref();
 		let Some(oracle) = self.state.oracle.as_ref() else {
 			return;
 		};
@@ -876,7 +880,8 @@ impl From<TraceConfig> for TraceCollector {
 }
 
 #[cfg(feature = "instrument")]
-fn hash_payload(payload: &[u8]) -> [u8; 32] {
+fn hash_payload(payload: impl AsRef<[u8]>) -> [u8; 32] {
+	let payload = payload.as_ref();
 	let mut hasher = Sha3_256::new();
 	hasher.update(payload);
 	let out = hasher.finalize();
@@ -1081,7 +1086,7 @@ mod tests {
 
 	#[cfg(feature = "instrument")]
 	mod sink {
-		use std::sync::{Arc, Mutex};
+		use std::sync::Mutex;
 
 		use crate::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
 		use crate::trace::{TraceCollector, TraceConfig};
@@ -1118,7 +1123,7 @@ mod tests {
 			let collector = TraceCollector::from(
 				TraceConfig::builder()
 					.with_instrumentation(config)
-					.with_sink(Arc::new(UnboundedSink::default()))
+					.with_sink(UnboundedSink::default())
 					.build(),
 			);
 
@@ -1132,8 +1137,7 @@ mod tests {
 
 		#[test]
 		fn sink_without_instrumentation_config_still_receives_events() {
-			let collector =
-				TraceCollector::from(TraceConfig::builder().with_sink(Arc::new(UnboundedSink::default())).build());
+			let collector = TraceCollector::from(TraceConfig::builder().with_sink(UnboundedSink::default()).build());
 
 			collector.emit(events::START, "only");
 
@@ -1142,8 +1146,7 @@ mod tests {
 
 		#[test]
 		fn sink_events_carry_contiguous_seq() {
-			let collector =
-				TraceCollector::from(TraceConfig::builder().with_sink(Arc::new(UnboundedSink::default())).build());
+			let collector = TraceCollector::from(TraceConfig::builder().with_sink(UnboundedSink::default()).build());
 
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");

@@ -50,10 +50,11 @@ fn cluster_encryption<C: CryptoProvider>(
 }
 
 async fn build_control_frame(
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	message: impl Message,
 	hive_tls: Option<Arc<HiveTlsConfig>>,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	// `metadata.order` is the control freshness binding (CWE-294).
 	let order = current_timestamp_ms();
 
@@ -293,7 +294,7 @@ where
 }
 
 async fn fanout_scaling_update<P>(
-	gateways: &[P::Address],
+	gateways: impl AsRef<[P::Address]>,
 	frame: &Frame,
 	trust_store: Option<&Arc<dyn CertificateTrust>>,
 	client_identity: Option<&ClientIdentity>,
@@ -306,6 +307,7 @@ where
 	P::Error: Send,
 	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send,
 {
+	let gateways = gateways.as_ref();
 	let max_attempts = retry_policy.max_attempts();
 	let mut any_failed = false;
 

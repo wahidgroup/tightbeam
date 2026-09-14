@@ -40,8 +40,8 @@ impl WcetConfigBuilder {
 	}
 
 	/// Set the statistical analyzer.
-	pub fn with_analyzer(mut self, analyzer: Arc<dyn StatisticalAnalyzer>) -> Self {
-		self.analyzer = Some(analyzer);
+	pub fn with_analyzer(mut self, analyzer: impl StatisticalAnalyzer + 'static) -> Self {
+		self.analyzer = Some(Arc::new(analyzer));
 		self
 	}
 }
@@ -115,8 +115,7 @@ mod tests {
 		}
 
 		if case.has_analyzer {
-			let analyzer = Arc::new(DefaultStatisticalAnalyzer);
-			builder = builder.with_analyzer(analyzer);
+			builder = builder.with_analyzer(DefaultStatisticalAnalyzer);
 		}
 
 		let config = builder.build()?;

@@ -345,8 +345,8 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "aead")]
 impl<T: Message> FrameBuilder<T> {
-	pub fn with_rng(mut self, rng: Box<dyn rand_core::CryptoRngCore>) -> Self {
-		self.rng = Some(rng);
+	pub fn with_rng(mut self, rng: impl rand_core::CryptoRngCore + 'static) -> Self {
+		self.rng = Some(Box::new(rng));
 		self
 	}
 
@@ -854,7 +854,6 @@ mod tests {
 			// Create a previous message hash for linking
 			let previous_hash = crate::utils::digest::<Sha3_256>(b"previous-message-data")?;
 			let rng = rand_core::OsRng;
-			let rng = Box::new(rng);
 
 			builder
 				.with_message(msg)
@@ -1149,7 +1148,7 @@ mod tests {
 		// The requirement tuple selects the matching `compose!` invocation.
 		#[allow(clippy::too_many_arguments)]
 		fn compose_frame<T>(
-			test_name: &str,
+			test_name: impl AsRef<str>,
 			message: T,
 			cipher: Aes256Gcm,
 			signing_key: Secp256k1SigningKey,
@@ -1165,6 +1164,7 @@ mod tests {
 				+ crate::builder::CheckDigestOid<Sha3_256>
 				+ Clone,
 		{
+			let test_name = test_name.as_ref();
 			match (confidential, nonrepudiable, message_integrity, frame_integrity) {
 				(true, true, true, true) => compose! {
 					V2: id: test_name, order: 1u64, message: message.clone(),

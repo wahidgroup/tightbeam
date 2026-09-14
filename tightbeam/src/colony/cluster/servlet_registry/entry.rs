@@ -162,7 +162,9 @@ impl ServletEntry {
 	/// One construction shared by entry keys and slate reconciliation,
 	/// so the two can never drift apart.
 	#[must_use]
-	pub fn relay_bucket(origin_id: &[u8], relay_id: &[u8]) -> SharedId {
+	pub fn relay_bucket(origin_id: impl AsRef<[u8]>, relay_id: impl AsRef<[u8]>) -> SharedId {
+		let origin_id = origin_id.as_ref();
+		let relay_id = relay_id.as_ref();
 		let mut bucket = Vec::with_capacity(origin_id.len() + 1 + relay_id.len());
 		bucket.extend_from_slice(origin_id);
 		bucket.push(0);

@@ -166,7 +166,8 @@ impl RecvStream {
 	/// Account one accepted chunk against the granted limit and
 	/// buffer it. `false` means the sender overran its credit or the
 	/// hard reassembly byte ceiling.
-	fn accept_chunk(&mut self, payload: &[u8]) -> bool {
+	fn accept_chunk(&mut self, payload: impl AsRef<[u8]>) -> bool {
+		let payload = payload.as_ref();
 		self.received = self.received.saturating_add(1);
 		if self.received > self.limit {
 			return false;
@@ -664,7 +665,8 @@ where
 	/// Enforce the advertised chunk ceiling and debit the inbound
 	/// session budget for one chunk. Both overruns are protocol
 	/// violations: the sender knows the ceiling and its own grant.
-	fn charge_inbound_chunk(&mut self, payload: &[u8]) -> TransportResult<()> {
+	fn charge_inbound_chunk(&mut self, payload: impl AsRef<[u8]>) -> TransportResult<()> {
+		let payload = payload.as_ref();
 		if payload.len() > self.recv_chunk_size {
 			return Err(self.protocol_violation());
 		}
@@ -826,7 +828,8 @@ where
 	/// An empty payload is a message-less trailer. The frame decoder rejects a
 	/// frame that carries a field its version forbids, and this router answers
 	/// that refusal as a protocol violation.
-	fn decode_stream_frame(&mut self, payload: &[u8]) -> TransportResult<Option<Frame>> {
+	fn decode_stream_frame(&mut self, payload: impl AsRef<[u8]>) -> TransportResult<Option<Frame>> {
+		let payload = payload.as_ref();
 		if payload.is_empty() {
 			return Ok(None);
 		}
@@ -1033,7 +1036,12 @@ where
 	}
 
 	/// Append `payload` into `stream` or fail closed on credit overrun.
-	fn accept_chunk_or_violate(&mut self, mut stream: RecvStream, payload: &[u8]) -> TransportResult<RecvStream> {
+	fn accept_chunk_or_violate(
+		&mut self,
+		mut stream: RecvStream,
+		payload: impl AsRef<[u8]>,
+	) -> TransportResult<RecvStream> {
+		let payload = payload.as_ref();
 		if !stream.accept_chunk(payload) {
 			return Err(self.protocol_violation());
 		}
@@ -1051,7 +1059,13 @@ where
 
 	/// Accept a non-final chunk and raise credit when the grantor asks.
 	/// Caller parks the returned stream in the right reassembly map.
-	fn park_reassembly(&mut self, stream_id: u32, stream: RecvStream, payload: &[u8]) -> TransportResult<RecvStream> {
+	fn park_reassembly(
+		&mut self,
+		stream_id: u32,
+		stream: RecvStream,
+		payload: impl AsRef<[u8]>,
+	) -> TransportResult<RecvStream> {
+		let payload = payload.as_ref();
 		let mut stream = self.accept_chunk_or_violate(stream, payload)?;
 		self.maybe_grant(stream_id, &mut stream)?;
 
@@ -1159,7 +1173,8 @@ where
 	}
 
 	/// Decode a fully reassembled request and hand it to the responder.
-	async fn dispatch_request(&mut self, stream_id: u32, payload: &[u8]) -> TransportResult<()> {
+	async fn dispatch_request(&mut self, stream_id: u32, payload: impl AsRef<[u8]>) -> TransportResult<()> {
+		let payload = payload.as_ref();
 		let frame = match self.decode_stream_frame(payload)? {
 			Some(frame) => frame,
 			// A request stream must carry a message
@@ -1280,7 +1295,7 @@ mod tests {
 
 		let mut charged = 0usize;
 		for stream in &mut streams {
-			if stream.accept_chunk(&chunk) {
+			if stream.accept_chunk(chunk) {
 				charged += chunk.len();
 			}
 		}
@@ -1296,14 +1311,14 @@ mod tests {
 		let budget = Arc::new(ReassemblyBudget::with_ceiling(128));
 		{
 			let mut stream = RecvStream::new(u64::MAX, Arc::clone(&budget));
-			assert!(stream.accept_chunk(&[0u8; 128]));
+			assert!(stream.accept_chunk([0u8; 128]));
 			assert_eq!(budget.used.load(Ordering::Relaxed), 128);
 		}
 
 		assert_eq!(budget.used.load(Ordering::Relaxed), 0);
 
 		let mut reused = RecvStream::new(u64::MAX, Arc::clone(&budget));
-		assert!(reused.accept_chunk(&[0u8; 128]));
+		assert!(reused.accept_chunk([0u8; 128]));
 	}
 
 	// Unary reassembly must refuse past a hard byte ceiling even when
@@ -1318,7 +1333,7 @@ mod tests {
 			if stream.received >= stream.limit {
 				stream.limit = stream.received.saturating_add(1);
 			}
-			if !stream.accept_chunk(&chunk) {
+			if !stream.accept_chunk(chunk) {
 				break;
 			}
 
@@ -1371,7 +1386,8 @@ mod tests {
 
 	/// Reader driver over a scripted source whose outbound queue is
 	/// already full (single slot taken by a filler envelope).
-	fn reader_with_full_queue(envelopes: Vec<TransportEnvelope>) -> ReaderFixture {
+	fn reader_with_full_queue(envelopes: impl IntoIterator<Item = TransportEnvelope>) -> ReaderFixture {
+		let envelopes: Vec<TransportEnvelope> = envelopes.into_iter().collect();
 		let settings = MuxSettings::symmetric(4);
 		let (mut outbound_sender, outbound_receiver) = mpsc::channel(0);
 		let (inbound_sender, inbound_receiver) = mpsc::channel(4);

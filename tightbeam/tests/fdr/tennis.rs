@@ -16,12 +16,13 @@ pub(crate) const POINTA: Urn<'static> = tightbeam::urn!("test", "event:tennis/po
 pub(crate) const POINTB: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointb");
 
 fn build_fdr_config(
-	specs: Vec<Process>,
+	specs: impl IntoIterator<Item = Process>,
 	seeds: u32,
 	max_depth: usize,
 	max_internal_run: usize,
 	timeout_ms: u64,
 ) -> FdrConfig {
+	let specs: Vec<Process> = specs.into_iter().collect();
 	FdrConfig {
 		seeds,
 		max_depth,

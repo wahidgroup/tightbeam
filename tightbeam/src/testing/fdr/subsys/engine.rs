@@ -424,11 +424,17 @@ where
 	/// counterexample refutes nothing, and an unexhausted search proves
 	/// nothing. A truncated enumeration decides the same way, because
 	/// refinement quantifies over every trace of the subject.
-	fn check_refinement_for_specs<W, F, G>(&mut self, specs: &[Process], check: F, record_witness: G) -> Decision
+	fn check_refinement_for_specs<W, F, G>(
+		&mut self,
+		specs: impl AsRef<[Process]>,
+		check: F,
+		record_witness: G,
+	) -> Decision
 	where
 		F: Fn(&mut R, &Process) -> RefinementOutcome<W>,
 		G: Fn(&mut FdrVerdict, W),
 	{
+		let specs = specs.as_ref();
 		let mut decision = Decision::NotAsserted;
 		for spec in specs {
 			match check(&mut self.refinement, spec) {

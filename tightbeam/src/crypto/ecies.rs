@@ -231,7 +231,7 @@ pub trait EciesMessageOps: Sized {
 	const PUBKEY_SIZE: usize;
 
 	/// Parse from wire format: [ephemeral_pubkey || ciphertext_with_tag]
-	fn from_bytes(bytes: &[u8]) -> Result<Self>;
+	fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self>;
 
 	/// Serialize to wire format: [ephemeral_pubkey || ciphertext_with_tag]
 	fn to_bytes(&self) -> Vec<u8>;
@@ -301,7 +301,8 @@ impl Secp256k1EciesMessage {
 impl EciesMessageOps for Secp256k1EciesMessage {
 	const PUBKEY_SIZE: usize = EC_PUBKEY_COMPRESSED_SIZE;
 
-	fn from_bytes(bytes: &[u8]) -> Result<Self> {
+	fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+		let bytes = bytes.as_ref();
 		Self::from_bytes(bytes)
 	}
 
@@ -466,10 +467,11 @@ where
 }
 
 /// Borrow the ephemeral public key from raw ECIES wire bytes without copying.
-pub fn ephemeral_pubkey_bytes<M>(bytes: &[u8]) -> Result<&[u8]>
+pub fn ephemeral_pubkey_bytes<M>(bytes: &(impl AsRef<[u8]> + ?Sized)) -> Result<&[u8]>
 where
 	M: EciesMessageOps,
 {
+	let bytes = bytes.as_ref();
 	bytes.get(..M::PUBKEY_SIZE).ok_or(EciesError::InvalidCiphertext)
 }
 
@@ -660,7 +662,8 @@ mod tests {
 	}
 
 	// Helper for encryption roundtrip
-	fn roundtrip(plaintext: &[u8], aad: Option<&[u8]>) -> Result<()> {
+	fn roundtrip(plaintext: impl AsRef<[u8]>, aad: Option<&[u8]>) -> Result<()> {
+		let plaintext = plaintext.as_ref();
 		let (secret, public) = keypair();
 		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
 			&public,

@@ -61,7 +61,8 @@ const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client:
 /// Re-encode the client Finished with a second `RECEIPT_ACK` unsigned
 /// attribute carrying a forged value. No signature covers unsigned
 /// attributes, so the result stays signature-valid.
-fn inject_duplicate_receipt_ack(client_finished: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+fn inject_duplicate_receipt_ack(client_finished: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+	let client_finished = client_finished.as_ref();
 	let mut signed_data = SignedData::from_der(client_finished)?;
 	let mut signer_info = signed_data
 		.signer_infos

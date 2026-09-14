@@ -30,7 +30,10 @@ fn test_entry(pheromone: u64, abandonment_limit: u32) -> ServletEntry {
 }
 
 /// Create a named test entry for registry tests
-fn named_entry(addr: &[u8], servlet_type: &[u8], hive: &[u8]) -> ServletEntry {
+fn named_entry(addr: impl AsRef<[u8]>, servlet_type: impl AsRef<[u8]>, hive: impl AsRef<[u8]>) -> ServletEntry {
+	let addr = addr.as_ref();
+	let servlet_type = servlet_type.as_ref();
+	let hive = hive.as_ref();
 	ServletEntry::new(
 		Arc::from(addr),
 		Arc::from(servlet_type),
@@ -41,7 +44,9 @@ fn named_entry(addr: &[u8], servlet_type: &[u8], hive: &[u8]) -> ServletEntry {
 }
 
 /// Create a named test entry routed through a peer gateway
-fn peer_entry(servlet_type: &[u8], peer_id: &[u8]) -> ServletEntry {
+fn peer_entry(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>) -> ServletEntry {
+	let servlet_type = servlet_type.as_ref();
+	let peer_id = peer_id.as_ref();
 	ServletEntry::peer(
 		Arc::from(peer_id),
 		Arc::from(servlet_type),
@@ -51,7 +56,10 @@ fn peer_entry(servlet_type: &[u8], peer_id: &[u8]) -> ServletEntry {
 	)
 }
 
-fn peer_entry_dial(servlet_type: &[u8], peer_id: &[u8], dial: &[u8]) -> ServletEntry {
+fn peer_entry_dial(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, dial: impl AsRef<[u8]>) -> ServletEntry {
+	let servlet_type = servlet_type.as_ref();
+	let peer_id = peer_id.as_ref();
+	let dial = dial.as_ref();
 	ServletEntry::peer(
 		Arc::from(peer_id),
 		Arc::from(servlet_type),
@@ -363,11 +371,26 @@ fn slate_exceeds_caps_counts_gateways_and_routes() {
 	assert!(!routes(&registry).slate_exceeds_caps(b"fp1", 0, RouteKind::Peer, 1, 1));
 }
 
-fn admitted(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>) -> AdmittedPeerAd {
+fn admitted(
+	hive: impl AsRef<[u8]>,
+	dial: impl AsRef<[u8]>,
+	slate: impl IntoIterator<Item = ServletEntry>,
+) -> AdmittedPeerAd {
+	let hive = hive.as_ref();
+	let dial = dial.as_ref();
+	let slate: Vec<ServletEntry> = slate.into_iter().collect();
 	admitted_with_order(hive, dial, slate, 0)
 }
 
-fn admitted_with_order(hive: &[u8], dial: &[u8], slate: Vec<ServletEntry>, order: u64) -> AdmittedPeerAd {
+fn admitted_with_order(
+	hive: impl AsRef<[u8]>,
+	dial: impl AsRef<[u8]>,
+	slate: impl IntoIterator<Item = ServletEntry>,
+	order: u64,
+) -> AdmittedPeerAd {
+	let hive = hive.as_ref();
+	let dial = dial.as_ref();
+	let slate: Vec<ServletEntry> = slate.into_iter().collect();
 	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial_addr: Arc::from(dial), slate, order }
 }
 
@@ -409,7 +432,16 @@ fn racing_ads_leave_the_ledger_naming_the_installed_slate() {
 }
 
 /// Relay trail under the composite `origin NUL relay` bucket.
-fn relay_trail(origin: &[u8], relay: &[u8], servlet_type: &[u8], dial: &[u8]) -> RelayTrail {
+fn relay_trail(
+	origin: impl AsRef<[u8]>,
+	relay: impl AsRef<[u8]>,
+	servlet_type: impl AsRef<[u8]>,
+	dial: impl AsRef<[u8]>,
+) -> RelayTrail {
+	let origin = origin.as_ref();
+	let relay = relay.as_ref();
+	let servlet_type = servlet_type.as_ref();
+	let dial = dial.as_ref();
 	let slate = vec![ServletEntry::peer_relay(
 		Arc::from(origin),
 		Arc::from(relay),
@@ -772,7 +804,9 @@ fn weaken_peer_skips_local_routes() -> Result<(), ClusterError> {
 }
 
 /// Create a peer-routed test entry with a specific abandonment limit
-fn peer_entry_limit(servlet_type: &[u8], peer_id: &[u8], limit: u32) -> ServletEntry {
+fn peer_entry_limit(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, limit: u32) -> ServletEntry {
+	let servlet_type = servlet_type.as_ref();
+	let peer_id = peer_id.as_ref();
 	ServletEntry::peer(
 		Arc::from(peer_id),
 		Arc::from(servlet_type),
@@ -887,7 +921,7 @@ fn apply_address_update_ownership_and_atomicity() {
 		let registry = ServletRegistry::default();
 		registry.add(named_entry(case.seed.0, case.seed.1, case.seed.2)).ok();
 
-		let added = case.add.map(|(a, t, h)| named_entry(a, t, h)).into_iter().collect();
+		let added = case.add.map(|(a, t, h)| named_entry(a, t, h));
 		let result = registry.apply_address_update(case.caller_hive, added, case.remove);
 		assert_eq!(result.is_ok(), case.expect_ok);
 

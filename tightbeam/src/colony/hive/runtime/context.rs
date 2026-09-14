@@ -35,14 +35,25 @@ impl Routes {
 	///
 	/// `addr` moves into the instance map. The index takes an extra [`Arc`]
 	/// handle only for a new type, so it shares the address bytes.
-	fn insert(&mut self, key: Vec<u8>, addr: Arc<[u8]>, type_bytes: &[u8]) {
+	fn insert(&mut self, key: impl Into<Vec<u8>>, addr: Arc<[u8]>, type_bytes: impl AsRef<[u8]>) {
+		let key: Vec<u8> = key.into();
+		let type_bytes = type_bytes.as_ref();
 		self.by_type.entry(type_bytes.to_vec()).or_insert_with(|| Arc::clone(&addr));
 		self.instances.insert(key, addr);
 	}
 
 	/// Drops an instance and promotes a sibling of the same type into the
 	/// index when the departing instance held it.
-	fn remove(&mut self, key: &[u8], type_prefix: &[u8], type_bytes: &[u8], removed: &Arc<[u8]>) {
+	fn remove(
+		&mut self,
+		key: impl AsRef<[u8]>,
+		type_prefix: impl AsRef<[u8]>,
+		type_bytes: impl AsRef<[u8]>,
+		removed: &Arc<[u8]>,
+	) {
+		let key = key.as_ref();
+		let type_prefix = type_prefix.as_ref();
+		let type_bytes = type_bytes.as_ref();
 		self.instances.remove(key);
 
 		if self.by_type.get(type_bytes) != Some(removed) {
@@ -61,7 +72,8 @@ impl Routes {
 		};
 	}
 
-	fn resolve(&self, type_key: &[u8]) -> Option<Arc<[u8]>> {
+	fn resolve(&self, type_key: impl AsRef<[u8]>) -> Option<Arc<[u8]>> {
+		let type_key = type_key.as_ref();
 		self.by_type.get(type_key).cloned()
 	}
 }
@@ -78,7 +90,9 @@ impl<P: Protocol> HiveContextImpl<P> {
 		Self { routes: Arc::new(RwLock::new(Routes::default())), pool }
 	}
 
-	pub fn add_route(&self, key: Vec<u8>, addr: Arc<[u8]>, type_bytes: &[u8]) {
+	pub fn add_route(&self, key: impl Into<Vec<u8>>, addr: Arc<[u8]>, type_bytes: impl AsRef<[u8]>) {
+		let key: Vec<u8> = key.into();
+		let type_bytes = type_bytes.as_ref();
 		let Ok(mut routes) = self.routes.write() else {
 			return;
 		};
@@ -86,7 +100,15 @@ impl<P: Protocol> HiveContextImpl<P> {
 		routes.insert(key, addr, type_bytes);
 	}
 
-	pub fn remove_route(&self, key: &[u8], type_urn: &Urn<'_>, type_bytes: &[u8], removed_addr: &Arc<[u8]>) {
+	pub fn remove_route(
+		&self,
+		key: impl AsRef<[u8]>,
+		type_urn: &Urn<'_>,
+		type_bytes: impl AsRef<[u8]>,
+		removed_addr: &Arc<[u8]>,
+	) {
+		let key = key.as_ref();
+		let type_bytes = type_bytes.as_ref();
 		let type_prefix = type_urn.type_prefix_bytes();
 		let Ok(mut routes) = self.routes.write() else {
 			return;
@@ -190,7 +212,8 @@ mod tests {
 		Arc::from(bytes.as_bytes())
 	}
 
-	fn instance(tail: &str) -> Vec<u8> {
+	fn instance(tail: impl AsRef<str>) -> Vec<u8> {
+		let tail = tail.as_ref();
 		format!("urn:tb:servlet:echo/{tail}").into_bytes()
 	}
 
@@ -207,7 +230,7 @@ mod tests {
 		let mut routes = Routes::default();
 		routes.insert(instance("a"), addr("10.0.0.1"), TYPE);
 		routes.insert(instance("b"), addr("10.0.0.2"), TYPE);
-		routes.remove(&instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
+		routes.remove(instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
 		assert_eq!(routes.resolve(TYPE), Some(addr("10.0.0.2")));
 	}
 
@@ -215,7 +238,7 @@ mod tests {
 	fn removing_the_last_instance_clears_the_type() {
 		let mut routes = Routes::default();
 		routes.insert(instance("a"), addr("10.0.0.1"), TYPE);
-		routes.remove(&instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
+		routes.remove(instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
 		assert_eq!(routes.resolve(TYPE), None);
 	}
 
@@ -224,7 +247,7 @@ mod tests {
 		let mut routes = Routes::default();
 		routes.insert(instance("a"), addr("10.0.0.1"), TYPE);
 		routes.insert(instance("b"), addr("10.0.0.2"), TYPE);
-		routes.remove(&instance("b"), PREFIX, TYPE, &addr("10.0.0.2"));
+		routes.remove(instance("b"), PREFIX, TYPE, &addr("10.0.0.2"));
 		assert_eq!(routes.resolve(TYPE), Some(addr("10.0.0.1")));
 	}
 
@@ -255,7 +278,7 @@ mod tests {
 				remover
 					.write()
 					.expect("routes lock")
-					.remove(&instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
+					.remove(instance("a"), PREFIX, TYPE, &addr("10.0.0.1"));
 			}
 
 			done.send(()).expect("receiver alive");

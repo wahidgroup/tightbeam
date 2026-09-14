@@ -19,8 +19,9 @@ impl ServletRegistry {
 		&self,
 		hive_id: &SharedId,
 		hive_address: &SharedId,
-		servlet_types: &[SharedId],
+		servlet_types: impl AsRef<[SharedId]>,
 	) -> Result<(), ClusterError> {
+		let servlet_types = servlet_types.as_ref();
 		let mut routes = self.routes.write()?;
 		for servlet_type in servlet_types {
 			routes.insert(ServletEntry::new(
@@ -36,7 +37,8 @@ impl ServletRegistry {
 	}
 
 	/// Removes a servlet entry by address.
-	pub fn remove(&self, address: &[u8]) -> Result<Option<Arc<ServletEntry>>, ClusterError> {
+	pub fn remove(&self, address: impl AsRef<[u8]>) -> Result<Option<Arc<ServletEntry>>, ClusterError> {
+		let address = address.as_ref();
 		Ok(self.routes.write()?.remove(address))
 	}
 
@@ -45,7 +47,13 @@ impl ServletRegistry {
 	/// A local slate carries no advertisement order: the hive's own signed
 	/// registration gates it, and the order ledger belongs to the peer
 	/// advertisements that carry one.
-	pub fn reconcile_by_hive(&self, hive_id: &[u8], entries: Vec<ServletEntry>) -> Result<(), ClusterError> {
+	pub fn reconcile_by_hive(
+		&self,
+		hive_id: impl AsRef<[u8]>,
+		entries: impl IntoIterator<Item = ServletEntry>,
+	) -> Result<(), ClusterError> {
+		let hive_id = hive_id.as_ref();
+		let entries: Vec<ServletEntry> = entries.into_iter().collect();
 		self.routes.write()?.reconcile(hive_id, entries);
 		Ok(())
 	}
@@ -102,12 +110,14 @@ impl ServletRegistry {
 	}
 
 	/// Removes every relay trail learned for one origin identity.
-	pub fn remove_relay_trails_for_origin(&self, origin_id: &[u8]) -> Result<usize, ClusterError> {
+	pub fn remove_relay_trails_for_origin(&self, origin_id: impl AsRef<[u8]>) -> Result<usize, ClusterError> {
+		let origin_id = origin_id.as_ref();
 		Ok(self.routes.write()?.remove_relay_trails_for_origin(origin_id))
 	}
 
 	/// Removes every entry belonging to a hive.
-	pub fn remove_by_hive(&self, hive_id: &[u8]) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
+	pub fn remove_by_hive(&self, hive_id: impl AsRef<[u8]>) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
+		let hive_id = hive_id.as_ref();
 		let mut routes = self.routes.write()?;
 		let addresses = routes.addresses_in_bucket(hive_id).to_vec();
 
@@ -124,10 +134,12 @@ impl ServletRegistry {
 	/// Applies a batch of servlet address additions and removals for one hive.
 	pub fn apply_address_update(
 		&self,
-		hive_id: &[u8],
-		added: Vec<ServletEntry>,
+		hive_id: impl AsRef<[u8]>,
+		added: impl IntoIterator<Item = ServletEntry>,
 		removed: &[&[u8]],
 	) -> Result<(), ClusterError> {
+		let hive_id = hive_id.as_ref();
+		let added: Vec<ServletEntry> = added.into_iter().collect();
 		self.routes.write()?.apply_address_update(hive_id, added, removed)
 	}
 }

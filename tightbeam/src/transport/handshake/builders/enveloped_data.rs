@@ -67,7 +67,8 @@ where
 	}
 
 	/// Add multiple unprotected attributes.
-	pub fn with_unprotected_attrs(mut self, attrs: Vec<HandshakeAttribute>) -> Self {
+	pub fn with_unprotected_attrs(mut self, attrs: impl IntoIterator<Item = HandshakeAttribute>) -> Self {
+		let attrs: Vec<HandshakeAttribute> = attrs.into_iter().collect();
 		self.unprotected_attrs.extend(attrs);
 		self
 	}
@@ -132,9 +133,10 @@ where
 
 	fn encrypt_content_with_cipher(
 		cipher: &P::AeadCipher,
-		plaintext: &[u8],
+		plaintext: impl AsRef<[u8]>,
 		nonce: &[u8],
 	) -> Result<EncryptedContentInfo, HandshakeError> {
+		let plaintext = plaintext.as_ref();
 		Ok(cipher.encrypt_content(plaintext, nonce, Some(DATA))?)
 	}
 
@@ -153,10 +155,11 @@ where
 	/// - Optional unprotected attributes
 	pub fn build(
 		mut self,
-		plaintext: &[u8],
+		plaintext: impl AsRef<[u8]>,
 		_aad: Option<&[u8]>,
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<EnvelopedData, HandshakeError> {
+		let plaintext = plaintext.as_ref();
 		// 1. Validate builder state
 		self.validate_builder_state()?;
 
@@ -195,10 +198,11 @@ where
 	/// Build and wrap in ContentInfo structure.
 	pub fn build_content_info(
 		self,
-		plaintext: &[u8],
+		plaintext: impl AsRef<[u8]>,
 		aad: Option<&[u8]>,
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<ContentInfo, HandshakeError> {
+		let plaintext = plaintext.as_ref();
 		let enveloped_data = self.build(plaintext, aad, rng)?;
 		let content = Any::encode_from(&enveloped_data)?;
 		Ok(ContentInfo { content_type: ENVELOPED_DATA, content })

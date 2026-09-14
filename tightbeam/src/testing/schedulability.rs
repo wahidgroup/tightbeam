@@ -273,7 +273,8 @@ impl TaskSet {
 
 impl Task {
 	/// Solve the RTA recurrence for this task against its higher-priority set.
-	fn response_time(&self, higher_priority: &[Task]) -> Option<Duration> {
+	fn response_time(&self, higher_priority: impl AsRef<[Task]>) -> Option<Duration> {
+		let higher_priority = higher_priority.as_ref();
 		const MAX_ITERATIONS: u32 = 1000;
 
 		let mut r = self.wcet;

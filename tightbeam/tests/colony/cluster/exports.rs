@@ -86,7 +86,12 @@ fn mtls_split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> Clus
 /// Exporter with a static export list and no advertise beat.
 ///
 /// Used by the stream-boundary scenario, which injects route claims directly.
-fn exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported: Vec<Urn<'static>>) -> ClusterConfig {
+fn exporter_conf(
+	own: &ClusterTestCerts,
+	peer: &ClusterTestCerts,
+	exported: impl IntoIterator<Item = Urn<'static>>,
+) -> ClusterConfig {
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(split_plane_tls(own, peer))
 		.with_exported_types(exported)
 		.build()
@@ -96,7 +101,12 @@ fn exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported: Vec<
 ///
 /// The gateway can then recognize a first-party origin session on an
 /// unexported target.
-fn mtls_exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported: Vec<Urn<'static>>) -> ClusterConfig {
+fn mtls_exporter_conf(
+	own: &ClusterTestCerts,
+	peer: &ClusterTestCerts,
+	exported: impl IntoIterator<Item = Urn<'static>>,
+) -> ClusterConfig {
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(mtls_split_plane_tls(own, peer))
 		.with_exported_types(exported)
 		.build()
@@ -109,9 +119,10 @@ fn mtls_exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported:
 fn exporter_conf_with_gate(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
-	exported: Vec<Urn<'static>>,
+	exported: impl IntoIterator<Item = Urn<'static>>,
 	gate: Arc<dyn ExportGate>,
 ) -> ClusterConfig {
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(mtls_split_plane_tls(own, peer))
 		.with_exported_types(exported)
 		.with_export_gate(gate)
@@ -127,10 +138,12 @@ fn exporter_conf_with_gate(
 fn advertising_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
-	peer_addr: String,
-	exported: Vec<Urn<'static>>,
+	peer_addr: impl Into<String>,
+	exported: impl IntoIterator<Item = Urn<'static>>,
 	grant: Arc<dyn ExportGrant>,
 ) -> ClusterConfig {
+	let peer_addr: String = peer_addr.into();
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(split_plane_tls(own, peer))
 		.with_peers([peer_addr])
 		.with_advertise_interval(Duration::from_millis(100))
@@ -149,9 +162,10 @@ fn grant_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
 	extra: &ClusterTestCerts,
-	exported: Vec<Urn<'static>>,
+	exported: impl IntoIterator<Item = Urn<'static>>,
 	grant: Arc<dyn ExportGrant>,
 ) -> ClusterConfig {
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	let mut tls = split_plane_tls(own, peer);
 	tls.client_validators = vec![combined_validator(&[&own.cert, &peer.cert, &extra.cert])];
 
@@ -231,10 +245,12 @@ async fn record_echo(
 	trace: &TraceCollector,
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,
-	type_name: &str,
-	id: &[u8],
+	type_name: impl AsRef<str>,
+	id: impl AsRef<[u8]>,
 	marker: Urn<'static>,
 ) -> Result<(), TightBeamError> {
+	let type_name = type_name.as_ref();
+	let id = id.as_ref();
 	trace.event(WORK_SENT)?;
 	let servlet_frame = emit_typed_work(client, key, type_name, id).await?;
 	let ping_response = decode_ping_echo(&servlet_frame)?;

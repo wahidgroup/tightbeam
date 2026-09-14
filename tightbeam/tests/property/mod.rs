@@ -49,7 +49,16 @@ fn any_shape() -> impl Strategy<Value = (Version, bool, bool)> {
 }
 
 /// The frame a sender builds from these parts.
-fn built(version: Version, id: &[u8], order: u64, content: &str, witnessed: bool, signed: bool) -> Frame {
+fn built(
+	version: Version,
+	id: impl AsRef<[u8]>,
+	order: u64,
+	content: impl AsRef<str>,
+	witnessed: bool,
+	signed: bool,
+) -> Frame {
+	let id = id.as_ref();
+	let content = content.as_ref();
 	let builder = version
 		.compose()
 		.with_id(id)

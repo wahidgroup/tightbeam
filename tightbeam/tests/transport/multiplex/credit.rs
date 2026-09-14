@@ -316,8 +316,9 @@ tb_scenario! {
 
 async fn protocol_error_goaway_after(
 	link: ServerMuxClientRaw,
-	envelopes: Vec<TransportEnvelope>,
+	envelopes: impl IntoIterator<Item = TransportEnvelope>,
 ) -> Result<bool, TightBeamError> {
+	let envelopes: Vec<TransportEnvelope> = envelopes.into_iter().collect();
 	let ServerMuxClientRaw { server: _server, responder, mut client_reader, mut client_writer } = link;
 	let _serve = spawn_immediate_echo(responder);
 
