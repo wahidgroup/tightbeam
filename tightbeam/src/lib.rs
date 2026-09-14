@@ -81,7 +81,7 @@
 //!    │      V0: id: "msg-001", order: 1, message: MyMessage { .. }    │
 //!    │  }?;                                                           │
 //!    │                                                                │
-//!    │  let decode: MyMessage = tightbeam::decode(&frame.message)?;   │
+//!    │  let decode: MyMessage = tightbeam::decode(frame.message())?;  │
 //!    └────────────────────────────────────────────────────────────────┘
 //! ```
 //!

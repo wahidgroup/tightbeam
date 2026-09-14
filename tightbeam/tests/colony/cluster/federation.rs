@@ -116,27 +116,25 @@ pub async fn flood_ad_rumor(
 	let inner = signed_control_frame_with(signer, id, advertisement).await?;
 
 	let provider = Secp256k1KeyProvider::from(signer.to_owned());
-	let rumor = Version::V2
+	let mut rumor = Version::V2
 		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_message(GossipRumor::peer_advertisement(encode(&inner)?))
-		.build()?
-		.sign_with_provider::<Sha3_256, _>(&provider)
-		.await?;
+		.build()?;
+	rumor.sign_with_provider::<Sha3_256, _>(&provider).await?;
 
-	let frame = Version::V2
+	let mut frame = Version::V2
 		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
 		.with_lifetime(hop_ttl)
 		.with_message(ClusterRequest::Gossip(Box::new(rumor)))
-		.build()?
-		.sign_with_provider::<Sha3_256, _>(&provider)
-		.await?;
+		.build()?;
+	frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
 
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
-	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message)?;
+	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message())?;
 	Ok(response.status)
 }
 
@@ -451,7 +449,7 @@ tb_scenario! {
 			sink.close_with(b"efgh").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let echoed: PingResponse = decode(&reply.message)?;
+			let echoed: PingResponse = decode(reply.message())?;
 			trace.event_with(STREAM_ECHOED, &[], u64::from(echoed.doubled))?;
 
 			gateway_a.stop();

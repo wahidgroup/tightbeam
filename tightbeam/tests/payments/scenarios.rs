@@ -246,7 +246,7 @@ tb_scenario! {
 			// The gateway returns the servlet's complete response frame.
 			// Decoding the typed approval from inside it proves the
 			// response envelope survived the route back to the client.
-			let status: TransactionStatus = decode(&servlet_frame.message)?;
+			let status: TransactionStatus = decode(servlet_frame.message())?;
 			trace.event_with(CLIENT_AUTH_APPROVED, &[], status.status.is_success())?;
 
 			hive.stop();

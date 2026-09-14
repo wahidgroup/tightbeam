@@ -136,12 +136,12 @@ servlet! {
 		// on the assumption the presence probes cover fidelity.
 		let sig_valid = frame_signature_verifies(&frame, &probe_signing_key());
 
-		trace.event_with(PROBE_FRAME_CLIENT_ID, &[], u32::from(frame.metadata.id == b"client-signed-work"))?;
-		trace.event_with(PROBE_FRAME_SIGNED, &[], u32::from(frame.nonrepudiation.is_some()))?;
-		trace.event_with(PROBE_FRAME_PREVIOUS, &[], u32::from(frame.metadata.previous_frame.is_some()))?;
+		trace.event_with(PROBE_FRAME_CLIENT_ID, &[], u32::from(frame.metadata().id() == b"client-signed-work"))?;
+		trace.event_with(PROBE_FRAME_SIGNED, &[], u32::from(frame.nonrepudiation().is_some()))?;
+		trace.event_with(PROBE_FRAME_PREVIOUS, &[], u32::from(frame.metadata().previous_frame().is_some()))?;
 		trace.event_with(PROBE_FRAME_SIG_VALID, &[], u32::from(sig_valid))?;
 
-		let unsigned = Version::V0.compose()
+		let unsigned = Version::V1.compose()
 			.with_id(b"probe-response")
 			.with_message(PingResponse { doubled: req.value * 2 })
 			.build()?;
@@ -185,8 +185,12 @@ async fn record_frame_contract(
 
 	let inner = sign_frame(unsigned, &probe_signing_key()).await?;
 
-	trace.event_with(CLIENT_WORK_SIGNED, &[], u32::from(inner.nonrepudiation.is_some()))?;
-	trace.event_with(CLIENT_WORK_PREVIOUS, &[], u32::from(inner.metadata.previous_frame.is_some()))?;
+	trace.event_with(CLIENT_WORK_SIGNED, &[], u32::from(inner.nonrepudiation().is_some()))?;
+	trace.event_with(
+		CLIENT_WORK_PREVIOUS,
+		&[],
+		u32::from(inner.metadata().previous_frame().is_some()),
+	)?;
 
 	let mut client = connect_cluster(certs, gateway.addr()).await?;
 	trace.event(WORK_SENT)?;
@@ -199,12 +203,12 @@ async fn record_frame_contract(
 	trace.event_with(
 		CLIENT_GOT_SERVLET_ID,
 		&[],
-		u32::from(servlet_frame.metadata.id == b"probe-response"),
+		u32::from(servlet_frame.metadata().id() == b"probe-response"),
 	)?;
 	trace.event_with(
 		CLIENT_GOT_SERVLET_SIGNED,
 		&[],
-		u32::from(servlet_frame.nonrepudiation.is_some()),
+		u32::from(servlet_frame.nonrepudiation().is_some()),
 	)?;
 	trace.event_with(
 		CLIENT_GOT_SERVLET_SIG_VALID,
@@ -212,7 +216,7 @@ async fn record_frame_contract(
 		u32::from(frame_signature_verifies(&servlet_frame, &probe_signing_key())),
 	)?;
 
-	let ping_response: PingResponse = decode(&servlet_frame.message)?;
+	let ping_response: PingResponse = decode(servlet_frame.message())?;
 	trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 	Ok(())
 }
@@ -435,7 +439,7 @@ tb_scenario! {
 			trace.event(WORK_SENT)?;
 
 			let response_frame = emit_frame(&mut client, frame).await?;
-			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
+			let work_response: ClusterWorkResponse = decode(response_frame.message())?;
 			record_work_status(&trace, &work_response)?;
 
 			record_ping_echo(&trace, &certs, &cluster).await?;
@@ -511,7 +515,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, signed).await?;
-			let refusal: ClusterWorkResponse = decode(&response_frame.message)?;
+			let refusal: ClusterWorkResponse = decode(response_frame.message())?;
 
 			trace.event_with(EDGE_CONTROL_STATUS, &[], refusal.status)?;
 

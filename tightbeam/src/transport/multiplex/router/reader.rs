@@ -823,9 +823,9 @@ where
 
 	/// Decode a reassembled stream payload into its message frame.
 	///
-	/// Empty payload = message-less trailer. Version validation happens
-	/// here rather than at the io layer because chunked payloads only
-	/// become a frame after reassembly.
+	/// An empty payload is a message-less trailer. The frame decoder rejects a
+	/// frame that carries a field its version forbids, and this router answers
+	/// that refusal as a protocol violation.
 	fn decode_stream_frame(&mut self, payload: &[u8]) -> TransportResult<Option<Frame>> {
 		if payload.is_empty() {
 			return Ok(None);
@@ -835,9 +835,6 @@ where
 			Ok(frame) => frame,
 			Err(_) => return Err(self.protocol_violation()),
 		};
-		if !frame.validate_version_compatibility() {
-			return Err(self.protocol_violation());
-		}
 
 		Ok(Some(frame))
 	}

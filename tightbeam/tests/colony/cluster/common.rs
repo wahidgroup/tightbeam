@@ -276,9 +276,10 @@ pub fn record_work_status(trace: &TraceCollector, response: &ClusterWorkResponse
 ///
 /// One shared signer keeps every test frame on the same bytes-to-sign
 /// formula the gateways verify.
-pub async fn sign_frame(frame: Frame, key: &Secp256k1SigningKey) -> Result<Frame, TightBeamError> {
+pub async fn sign_frame(mut frame: Frame, key: &Secp256k1SigningKey) -> Result<Frame, TightBeamError> {
 	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	frame.sign_with_provider::<Sha3_256, _>(&provider).await
+	frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	Ok(frame)
 }
 
 /// Deterministic signing key for end-to-end work envelopes.
@@ -325,7 +326,7 @@ pub async fn signed_control_frame_with_order(
 	request: ClusterRequest,
 	order: u64,
 ) -> Result<Frame, TightBeamError> {
-	let unsigned = Version::V0
+	let unsigned = Version::V1
 		.compose()
 		.with_id(id)
 		.with_order(order)
@@ -459,7 +460,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: |req, frame, _ctx| async move {
 		Ok(Some(compose! {
-			V0: id: &frame.metadata.id,
+			V0: id: frame.metadata().id(),
 				message: PingResponse { doubled: req.value * 2 }
 		}?))
 	}
@@ -526,7 +527,7 @@ pub async fn record_ping_echo(
 	let mut client = connect_cluster(certs, cluster.addr()).await?;
 	let servlet_frame = client.submit_work_to(servlet_urn("ping"), &inner).await?;
 
-	let ping_response: PingResponse = decode(&servlet_frame.message)?;
+	let ping_response: PingResponse = decode(servlet_frame.message())?;
 	trace.event_with(WORK_ECHOED, &[], u64::from(ping_response.doubled))?;
 
 	Ok(())
@@ -539,7 +540,7 @@ pub async fn register_signed_hive(
 	addr: &[u8],
 ) -> Result<RegisterHiveResponse, TightBeamError> {
 	let frame = signed_control_frame_with(key, id, registration_request(addr)).await?;
-	decode(&emit_frame(client, frame).await?.message)
+	decode(&emit_frame(client, frame).await?.message())
 }
 
 pub async fn emit_servlet_update(
@@ -549,14 +550,14 @@ pub async fn emit_servlet_update(
 	request: ClusterRequest,
 ) -> Result<ServletAddressUpdateResponse, TightBeamError> {
 	let frame = signed_control_frame_with(key, id, request).await?;
-	decode(&emit_frame(client, frame).await?.message)
+	decode(&emit_frame(client, frame).await?.message())
 }
 
 /// Compose and sign one end-to-end client work frame whose message is
 /// the standard ping input. This is the frame gateways must deliver to
 /// the servlet byte-for-byte.
 pub async fn signed_work_frame(key: &Secp256k1SigningKey, id: &[u8]) -> Result<Frame, TightBeamError> {
-	let unsigned = Version::V0
+	let unsigned = Version::V1
 		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
@@ -568,7 +569,7 @@ pub async fn signed_work_frame(key: &Secp256k1SigningKey, id: &[u8]) -> Result<F
 
 /// Decode the servlet's typed ping echo from its response frame.
 pub fn decode_ping_echo(frame: &Frame) -> Result<PingResponse, TightBeamError> {
-	decode(&frame.message)
+	decode(frame.message())
 }
 
 /// Resolve a work submission a denial scenario expects the gateway to
@@ -645,7 +646,7 @@ pub async fn emit_relayed_ping_work(
 		.with_message(work_request)
 		.build()?;
 
-	decode(&emit_frame(client, frame).await?.message)
+	decode(&emit_frame(client, frame).await?.message())
 }
 
 /// Instance URN in a realm this gateway does not serve.
@@ -754,7 +755,7 @@ pub async fn send_advertisement_frame(
 	trace.event(PEER_ADVERTISE_SENT)?;
 
 	let response_frame = emit_frame(&mut client, frame).await?;
-	let response: PeerAdvertisementResponse = decode(&response_frame.message)?;
+	let response: PeerAdvertisementResponse = decode(response_frame.message())?;
 	trace.event_with(PEER_AD_STATUS, &[], response.status)?;
 	trace.event_with(PEER_ROUTES_AFTER, &[], cluster.peer_servlets().len() as u64)?;
 

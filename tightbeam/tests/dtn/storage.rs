@@ -60,7 +60,7 @@ impl FrameStore {
 	/// Persist a frame to storage and return its ID
 	pub fn persist(&mut self, frame: &Frame) -> Result<String, TightBeamError> {
 		// Use frame metadata ID from frame metadata
-		let frame_id = String::from_utf8_lossy(&frame.metadata.id).to_string();
+		let frame_id = String::from_utf8_lossy(frame.metadata().id()).to_string();
 		// Write to disk
 		let file_path = self.storage_dir.join(format!("{}.frame", frame_id));
 		let frame_bytes = frame.to_der()?;
@@ -135,7 +135,7 @@ impl FrameStore {
 				let prev_frame = &frames[i - 1];
 				let prev_hash = prev_frame.to_der().ok().map(|bytes| Sha3_256::digest(&bytes))?;
 
-				match frame.metadata.previous_frame.as_ref() {
+				match frame.metadata().previous_frame() {
 					Some(digest_info) if verify_digest(&prev_hash, digest_info) => None,
 					Some(_) => Some((i, "Hash mismatch".to_string())),
 					None => Some((i, "Missing previous_frame".to_string())),
@@ -208,7 +208,7 @@ mod tests {
 
 		// Retrieve
 		let retrieved = store.retrieve(&frame_id)?;
-		let retrieved_payload = DtnPayload::from_der(retrieved.message.as_slice())?;
+		let retrieved_payload = DtnPayload::from_der(retrieved.message())?;
 		assert_eq!(retrieved_payload.content, b"test payload");
 
 		// Cleanup
@@ -272,7 +272,13 @@ mod tests {
 		// Verify all frames were processed in correct order
 		assert_eq!(processed_frames.len(), 5, "All 5 frames should be processed");
 		for (i, frame) in processed_frames.iter().enumerate() {
-			assert_eq!(frame.metadata.order, (i + 1) as u64, "Frame {} should have order {}", i, i + 1);
+			assert_eq!(
+				frame.metadata().order(),
+				(i + 1) as u64,
+				"Frame {} should have order {}",
+				i,
+				i + 1
+			);
 		}
 
 		// Verify all frames were persisted

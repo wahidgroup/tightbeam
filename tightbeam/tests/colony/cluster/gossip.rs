@@ -10,6 +10,7 @@ use tightbeam::colony::common::{reply_frame, PeerGossip};
 use tightbeam::constants::MAX_PEX_SAMPLE;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
+use tightbeam::testing::TestFrame;
 use tightbeam::transport::handshake::HandshakeKeyManager;
 use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 
@@ -61,7 +62,7 @@ fn rumor_body(payload: Vec<u8>) -> GossipRumor {
 
 /// Mint an origin-signed rumor [`Frame`] (the nested gossip content).
 async fn mint_origin_rumor(key: &Secp256k1SigningKey, id: &[u8], body: GossipRumor) -> Result<Frame, TightBeamError> {
-	let unsigned = Version::V2
+	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
@@ -69,7 +70,8 @@ async fn mint_origin_rumor(key: &Secp256k1SigningKey, id: &[u8], body: GossipRum
 		.build()?;
 
 	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	Ok(signed)
 }
 
 /// Sign a [`Gossip`] relay frame carrying an unchanged origin rumor.
@@ -79,7 +81,7 @@ async fn signed_relay_gossip(
 	rumor: Frame,
 	hop_ttl: u64,
 ) -> Result<Frame, TightBeamError> {
-	let unsigned = Version::V2
+	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
@@ -88,7 +90,8 @@ async fn signed_relay_gossip(
 		.build()?;
 
 	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	Ok(signed)
 }
 
 /// Emit one signed gossip frame and record the decoded status on the
@@ -113,7 +116,7 @@ async fn send_gossip_frame_as(
 	marker: Urn<'static>,
 ) -> Result<(), TightBeamError> {
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
-	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message)?;
+	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message())?;
 	trace.event_with(marker, &[], response.status)?;
 	Ok(())
 }
@@ -145,7 +148,7 @@ async fn signed_reconcile_gossip(
 	id: &[u8],
 	held: Vec<Vec<u8>>,
 ) -> Result<Frame, TightBeamError> {
-	let unsigned = Version::V2
+	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
 		.with_order(current_timestamp_ms())
@@ -153,7 +156,8 @@ async fn signed_reconcile_gossip(
 		.build()?;
 
 	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	Ok(signed)
 }
 
 /// Emit one signed reconcile frame and record the want-list size under
@@ -167,7 +171,7 @@ async fn send_reconcile_frame_as(
 	marker: Urn<'static>,
 ) -> Result<(), TightBeamError> {
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
-	let response: GossipWant = decode(&emit_frame(&mut client, frame).await?.message)?;
+	let response: GossipWant = decode(&emit_frame(&mut client, frame).await?.message())?;
 	trace.event_with(marker, &[], response.want.len() as u64)?;
 	Ok(())
 }
@@ -612,7 +616,7 @@ tb_scenario! {
 			.await?;
 
 			let reply = mux_client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response: GossipResponse = decode(&reply.message)?;
+			let response: GossipResponse = decode(reply.message())?;
 			trace.event_with(GOSSIP_PUBLISH_STATUS, &[], response.status)?;
 
 			cluster.stop();
@@ -1302,13 +1306,15 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			install_ping_peer(&trace, &certs, &cluster).await?;
 
-			let mut rumor = mint_origin_rumor(
+			let signed_body = encode(&rumor_body(encode(&PingRequest { value: 21 })?))?;
+			let forged_body = encode(&rumor_body(encode(&PingRequest { value: 99 })?))?;
+			let signed = mint_origin_rumor(
 				&certs.key,
 				b"tamper-inner",
 				rumor_body(encode(&PingRequest { value: 21 })?),
 			)
 			.await?;
-			rumor.message = encode(&rumor_body(encode(&PingRequest { value: 99 })?))?;
+			let rumor = TestFrame::tamper(&signed, &signed_body, &forged_body);
 
 			let frame = signed_relay_gossip(&certs.key, b"tamper-relay", rumor, 0).await?;
 			send_gossip_frame_as(&trace, &certs, &cluster, frame, GOSSIP_RELAY_STATUS).await?;
@@ -1993,7 +1999,7 @@ async fn start_oversized_reconcile_server(
 		handle: move |frame: Frame| async move {
 			let entry = PeerGossip { peer_id: Vec::new(), gateway_addr: b"10.66.0.1:9000".to_vec() };
 			let pex = vec![entry; MAX_PEX_SAMPLE + 1];
-			reply_frame(&frame.metadata.id, GossipWant { want: Vec::new(), pex })
+			reply_frame(frame.metadata().id(), GossipWant { want: Vec::new(), pex })
 		}
 	};
 

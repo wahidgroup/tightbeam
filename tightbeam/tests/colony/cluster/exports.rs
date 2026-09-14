@@ -584,7 +584,7 @@ tb_scenario! {
 			sink.close_with(b"efgh").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let echoed: PingResponse = decode(&reply.message)?;
+			let echoed: PingResponse = decode(reply.message())?;
 			trace.event_with(STREAM_ECHOED, &[], u64::from(echoed.doubled))?;
 
 			gateway_b.stop();

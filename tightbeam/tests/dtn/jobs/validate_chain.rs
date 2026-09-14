@@ -37,7 +37,7 @@ job! {
 			let current_head = chain_state.read()?.last_hash.to_vec();
 			let missing_hash = frames
 				.first()
-				.and_then(|f| f.metadata.previous_frame.as_ref())
+				.and_then(|f| f.metadata().previous_frame())
 				.map(|d| d.digest.as_bytes().to_vec())
 				.unwrap_or_default();
 
@@ -52,8 +52,8 @@ job! {
 		if let Some(frame) = invalid_frame {
 			let current_head = chain_state_guard.last_hash.to_vec();
 			let missing_hash = frame
-				.metadata
-				.previous_frame
+				.metadata()
+				.previous_frame()
 				.as_ref()
 				.map(|d| d.digest.as_bytes().to_vec())
 				.unwrap_or_default();

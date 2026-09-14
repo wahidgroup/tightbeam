@@ -67,19 +67,19 @@ where
 	) -> Result<Option<Frame>, TightBeamError> {
 		let gate_status = self.config.evaluate_gates(Some(&frame), &session, &self.trace)?;
 		if gate_status != TransitStatus::Ok {
-			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(gate_status));
+			return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(gate_status));
 		}
 
-		let cluster_request = match decode::<ClusterRequest>(&frame.message) {
+		let cluster_request = match decode::<ClusterRequest>(frame.message()) {
 			Ok(request) => request,
 			Err(_) => {
-				return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::PermissionDenied));
+				return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::PermissionDenied));
 			}
 		};
 
 		// The edge plane is a work-submission surface only.
 		if plane == GatewayPlane::Edge && !matches!(cluster_request, ClusterRequest::Work(_)) {
-			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::PermissionDenied));
+			return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::PermissionDenied));
 		}
 
 		match cluster_request {
@@ -98,7 +98,7 @@ where
 
 				if export_status != TransitStatus::Ok {
 					let message = ClusterWorkResponse::err(export_status);
-					return reply_frame(&frame.metadata.id, message);
+					return reply_frame(frame.metadata().id(), message);
 				}
 
 				self.handle_work(frame, request, budget).await

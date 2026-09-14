@@ -1,9 +1,3 @@
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 // Re-exports
 pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::content_info::ContentInfo;
@@ -14,9 +8,8 @@ pub use crate::der::{Choice, Enumerated, Sequence};
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use pkcs12::digest_info::DigestInfo;
 
-use crate::der::TagNumber;
-use crate::matrix::MatrixDyn;
-use crate::wire::wire_sequence;
+pub use crate::frame::{BodyTransform, Frame, Metadata};
+pub use crate::version::GatedField;
 
 /// Protocol version determines metadata structure and features
 ///
@@ -75,93 +68,3 @@ pub enum MessagePriority {
 	Expedited = 4,
 	NetworkControl = 5,
 }
-
-/// Metadata structure for message handling
-/// Version determines which fields are present
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// Metadata ::= SEQUENCE {
-///     id               OCTET STRING,
-///     order            INTEGER,
-///     compactness      CompressedData OPTIONAL,
-///     integrity        [0] DigestInfo OPTIONAL,
-///     confidentiality  [1] EncryptedContentInfo OPTIONAL,
-///     priority         [2] MessagePriority OPTIONAL,
-///     lifetime         [3] INTEGER OPTIONAL,
-///     previousFrame    [4] DigestInfo OPTIONAL,
-///     matrix           [5] Matrix OPTIONAL
-/// }
-/// ```
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
-pub struct Metadata {
-	// Core fields (V0+)
-	pub id: Vec<u8>,
-	pub order: u64,
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub compactness: Option<CompressedData>,
-
-	// V1+ fields
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub integrity: Option<DigestInfo>,
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub confidentiality: Option<EncryptedContentInfo>,
-
-	// V2+ fields
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub priority: Option<MessagePriority>,
-	pub lifetime: Option<u64>,
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub previous_frame: Option<DigestInfo>,
-
-	// V3+ fields
-	pub matrix: Option<MatrixDyn>,
-}
-
-wire_sequence!(Metadata {
-	id: octets,
-	order: plain,
-	compactness: plain,
-	integrity: ctx(TagNumber::N0),
-	confidentiality: ctx(TagNumber::N1),
-	priority: ctx(TagNumber::N2),
-	lifetime: ctx(TagNumber::N3),
-	previous_frame: ctx(TagNumber::N4),
-	matrix: ctx(TagNumber::N5),
-});
-
-/// Core TightBeam message structure
-/// The version field explicitly determines which metadata variant to use
-/// The signature signs the entire message (version + metadata + body)
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// Frame ::= SEQUENCE {
-///     version        Version,
-///     metadata       Metadata,
-///     message        OCTET STRING,
-///     integrity      [0] DigestInfo OPTIONAL,
-///     nonrepudiation [1] SignerInfo OPTIONAL
-/// }
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
-pub struct Frame {
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub version: Version,
-	pub metadata: Metadata,
-	pub message: Vec<u8>,
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub integrity: Option<DigestInfo>,
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub nonrepudiation: Option<SignerInfo>,
-}
-
-wire_sequence!(Frame {
-	version: plain,
-	metadata: plain,
-	message: octets,
-	integrity: ctx(TagNumber::N0),
-	nonrepudiation: ctx(TagNumber::N1),
-});

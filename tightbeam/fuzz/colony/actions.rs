@@ -274,7 +274,7 @@ fn inner_ping_frame() -> Result<Frame, TightBeamError> {
 fn classify_work_message(message: &[u8], payload_ok: impl FnOnce(&[u8]) -> bool) -> AuthzClass {
 	match decode::<ClusterWorkResponse>(&message) {
 		Ok(response) if response.status == TransitStatus::Ok => match response.into_frame() {
-			Ok(Some(frame)) if payload_ok(&frame.message) => AuthzClass::Success,
+			Ok(Some(frame)) if payload_ok(frame.message()) => AuthzClass::Success,
 			Ok(_) | Err(_) => AuthzClass::InfraFail,
 		},
 		Ok(response) if is_authz_status(response.status) => AuthzClass::AuthzDenied,
@@ -375,7 +375,7 @@ async fn emit_cluster_work(
 
 	let outcome = tokio::time::timeout(CLIENT_IO_TIMEOUT, client.emit(frame, None)).await;
 	let class = match outcome {
-		Ok(Ok(Some(response))) => classify_work_message(&response.message, work.is_success),
+		Ok(Ok(Some(response))) => classify_work_message(response.message(), work.is_success),
 		_ => AuthzClass::InfraFail,
 	};
 
@@ -672,7 +672,7 @@ async fn stream_echo_roundtrip(
 
 	let reply = tokio::time::timeout(CLIENT_IO_TIMEOUT, response).await;
 	match reply {
-		Ok(Ok(Some(frame))) => match decode::<PingResponse>(&frame.message) {
+		Ok(Ok(Some(frame))) => match decode::<PingResponse>(frame.message()) {
 			Ok(PingResponse { doubled: 8 }) => Ok(true),
 			_ => Ok(false),
 		},

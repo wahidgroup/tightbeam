@@ -281,9 +281,9 @@ mod tests {
 		job: SpawnServletJob::run((worker_type(), None)),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata.id, b"spawn-req");
+			assert_eq!(frame.metadata().id(), b"spawn-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message)?;
+			let request: HiveManagementRequest = crate::decode(frame.message())?;
 			let Some(spawn) = request.spawn.as_ref() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
@@ -298,9 +298,9 @@ mod tests {
 		job: ListServletsJob::run(),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata.id, b"list-req");
+			assert_eq!(frame.metadata().id(), b"list-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message)?;
+			let request: HiveManagementRequest = crate::decode(frame.message())?;
 			assert!(request.list.is_some());
 			Ok(())
 		}
@@ -312,9 +312,9 @@ mod tests {
 		job: StopServletJob::run((worker_instance(),)),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata.id, b"stop-req");
+			assert_eq!(frame.metadata().id(), b"stop-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message)?;
+			let request: HiveManagementRequest = crate::decode(frame.message())?;
 			let Some(stop) = request.stop.as_ref() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
@@ -329,9 +329,9 @@ mod tests {
 		job: AsyncCalculationJob::run((10, 32)),
 		assertions: |frame| async move {
 			let frame = frame.await?;
-			assert_eq!(frame.metadata.id, b"calc-result");
+			assert_eq!(frame.metadata().id(), b"calc-result");
 
-			let result: crate::testing::TestMessage = crate::decode(&frame.message)?;
+			let result: crate::testing::TestMessage = crate::decode(frame.message())?;
 			assert_eq!(result.content, "42");
 			Ok(())
 		}

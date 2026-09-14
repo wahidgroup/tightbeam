@@ -80,7 +80,7 @@ servlet! {
 		let doubled = req.value * 2;
 		let message = BeamResponse { doubled };
 		let frame = compose! {
-			V0: id: &frame.metadata.id,
+			V0: id: frame.metadata().id(),
 				message: message
 		}?;
 		Ok(Some(frame))
@@ -174,7 +174,7 @@ async fn start_laser_hive(
 /// over any other protocol. A refusal surfaces as
 /// [`TightBeamError::WorkRefused`].
 async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame, TightBeamError> {
-	let unsigned = Version::V0
+	let mut inner = Version::V1
 		.compose()
 		.with_id(b"laser-beam")
 		.with_order(0)
@@ -182,7 +182,7 @@ async fn emit_beam_work(certs: &GatewayCerts, addr: &LaserAddr) -> Result<Frame,
 		.build()?;
 
 	let provider = Secp256k1KeyProvider::from(certs.key.to_owned());
-	let inner = unsigned.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	inner.sign_with_provider::<Sha3_256, _>(&provider).await?;
 
 	let mut client = ClientBuilder::<LaserListener>::builder()
 		.with_trust_store(Arc::clone(&certs.trust))
@@ -278,7 +278,7 @@ tb_scenario! {
 			sink.close_with(b"beam").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let decoded: BeamResponse = decode(&reply.message)?;
+			let decoded: BeamResponse = decode(reply.message())?;
 			let value = decoded.doubled == 8;
 
 			trace.event_with(LASER_SERVER_STREAM_REPORTS_LENGTH, &[], value)?;
@@ -328,7 +328,7 @@ tb_scenario! {
 			let servlet_frame = emit_beam_work(&certs, cluster.addr()).await?;
 			trace.event_with(LASER_WORK_STATUS, &[], TransitStatus::Ok)?;
 
-			let beam_response: BeamResponse = decode(&servlet_frame.message)?;
+			let beam_response: BeamResponse = decode(servlet_frame.message())?;
 			trace.event_with(LASER_WORK_ECHOED, &[], beam_response.doubled)?;
 
 			cluster.stop();

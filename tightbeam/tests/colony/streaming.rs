@@ -157,7 +157,7 @@ tb_scenario! {
 		client: |ServletEnv { trace, mut client, .. }| async move {
 			let request = reply_frame("unary-body")?;
 			let reply = client.emit(request.to_owned(), None).await?;
-			let value = reply.map(|frame| frame.message.to_owned()) == Some(request.message.to_owned());
+			let value = reply.map(|frame| frame.message().to_owned()) == Some(request.message().to_owned());
 
 			trace.event_with(UNARY_ECHOES, &[], value)?;
 
@@ -168,7 +168,7 @@ tb_scenario! {
 
 			let reply = response.await?;
 			let expected = reply_frame("8")?;
-			let value = reply.map(|frame| frame.message.to_owned()) == Some(expected.message.to_owned());
+			let value = reply.map(|frame| frame.message().to_owned()) == Some(expected.message().to_owned());
 
 			trace.event_with(STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
 
@@ -252,7 +252,7 @@ tb_scenario! {
 
 			let reply = response.await?;
 			let expected = reply_frame("5")?;
-			let value = reply.map(|frame| frame.message.to_owned()) == Some(expected.message.to_owned());
+			let value = reply.map(|frame| frame.message().to_owned()) == Some(expected.message().to_owned());
 
 			trace.event_with(STREAM_ONLY_REPLY_OK, &[], value)?;
 
@@ -331,7 +331,7 @@ tb_scenario! {
 			sink.close_with(b"beam").await?;
 
 			let reply = response.await?;
-			let label: StreamLabel = decode(&reply.message)?;
+			let label: StreamLabel = decode(reply.message())?;
 			let value = label.label == "9";
 
 			trace.event_with(HIVE_STREAM_REPLY_REPORTS_LENGTH, &[], value)?;

@@ -130,7 +130,7 @@ fn build_frame(
 	builder = builder.with_message_hasher::<Sha3_256>([]);
 
 	let frame = builder.build()?;
-	let digest = utils::digest::<Sha3_256>(&frame.message)?;
+	let digest = utils::digest::<Sha3_256>(frame.message())?;
 	Ok((frame, digest))
 }
 
@@ -156,21 +156,21 @@ impl ChainState {
 	fn record(&self, frame: &Frame) -> Result<(), TightBeamError> {
 		let mut guard = self.state.lock().expect("chain state mutex not poisoned");
 		let expected = guard.last_digest.to_owned();
-		let actual = frame.metadata.previous_frame.as_ref();
+		let actual = frame.metadata().previous_frame();
 		let prev_ok = match (expected.as_ref(), actual) {
 			(None, None) => true,
 			(Some(expected_digest), Some(actual_digest)) => expected_digest.value_cmp(actual_digest).is_ok(),
 			(None, Some(_)) | (Some(_), None) => false,
 		};
 
-		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata.order > prev);
+		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata().order() > prev);
 		let valid = prev_ok && order_ok;
 
 		self.trace.event_with(CHAIN_VALID, &[QUEUE_TAG], valid)?;
 
 		if valid {
-			guard.last_order = Some(frame.metadata.order);
-			let digest = utils::digest::<Sha3_256>(&frame.message)?;
+			guard.last_order = Some(frame.metadata().order());
+			let digest = utils::digest::<Sha3_256>(frame.message())?;
 			guard.last_digest = Some(digest);
 
 			self.trace.event_with(LAG_TIP, &[QUEUE_TAG], 0u64)?;
@@ -194,7 +194,7 @@ impl DedupBook {
 	}
 
 	fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		let key = (frame.metadata.id.to_owned(), frame.metadata.order);
+		let key = (frame.metadata().id().to_owned(), frame.metadata().order());
 		let mut guard = self.seen.lock().expect("seen-set mutex not poisoned");
 
 		let inserted = guard.insert(key);
@@ -219,7 +219,7 @@ impl PriorityLedger {
 	}
 
 	fn assign(&self, frame: &Frame) -> Result<u8, TightBeamError> {
-		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Standard);
+		let priority = frame.metadata().priority().unwrap_or(MessagePriority::Standard);
 		let worker = if priority >= MessagePriority::LowLatency {
 			0
 		} else {
@@ -286,8 +286,8 @@ impl GatePolicy for AdaptiveGate {
 
 		// Throttle Standard-or-lower priority frames on first encounter
 		// Subsequent attempts (same order) will be accepted
-		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Standard);
-		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata.order) {
+		let priority = frame.metadata().priority().unwrap_or(MessagePriority::Standard);
+		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata().order()) {
 			// Emit trace event for test verification
 			self.trace
 				.event_with(THROTTLE_ENGAGED, &[QUEUE_TAG], true)
@@ -328,7 +328,7 @@ impl QueueHarness {
 		let worker = self.priority.assign(frame)?;
 
 		self.trace.event_with(WORKER_COMMIT, &[QUEUE_TAG], worker as u64)?;
-		self.trace.event_with(RESPONSE_READY, &[QUEUE_TAG], frame.metadata.order)?;
+		self.trace.event_with(RESPONSE_READY, &[QUEUE_TAG], frame.metadata().order())?;
 		Ok(())
 	}
 }
@@ -424,7 +424,7 @@ tb_scenario! {
 					// For the second frame, emit it then immediately replay it
 					// Server will throttle on first attempt, restart policy will retry
 					client.emit(frame.to_owned(), None).await?;
-					trace.event_with(REPLAY_ATTEMPT, &[QUEUE_TAG], frame.metadata.order)?;
+					trace.event_with(REPLAY_ATTEMPT, &[QUEUE_TAG], frame.metadata().order())?;
 					client.emit(frame, None).await?;
 				} else {
 					// Server-side adaptive gate will throttle Normal+ priority frames

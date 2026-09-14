@@ -234,10 +234,13 @@ pub fn encode<T: der::Encode>(value: &T) -> Result<Vec<u8>, TightBeamError> {
 	Ok(der::Encode::to_der(value)?)
 }
 
-/// Decode a value from MessageContent
-/// This is used for decoding messages from frame content
+/// Decode a DER value, such as a typed message from a frame body.
+///
+/// `content` is any borrowed byte source, such as `&[u8]`, `&Vec<u8>`, or
+/// `&[u8; N]`. The borrow outlives the call so a decoded type may borrow from
+/// those bytes.
 #[inline]
-pub fn decode<'a, T: der::Decode<'a>>(content: &'a impl AsRef<[u8]>) -> Result<T, TightBeamError> {
+pub fn decode<'a, T: der::Decode<'a>>(content: &'a (impl AsRef<[u8]> + ?Sized)) -> Result<T, TightBeamError> {
 	Ok(der::Decode::from_der(content.as_ref())?)
 }
 

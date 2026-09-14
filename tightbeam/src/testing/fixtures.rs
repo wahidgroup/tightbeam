@@ -12,7 +12,7 @@ use crate::asn1::{
 };
 use crate::der::Sequence;
 use crate::oids::{HASH_SHA256, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
-use crate::{decode, Message};
+use crate::{decode, Message, Version};
 
 use crate::Beamable;
 
@@ -332,20 +332,20 @@ pub trait ExpectedMatcher {
 
 impl ExpectedMatcher for Frame {
 	fn matches(&self, frame: &Frame) -> bool {
-		frame.metadata.id == self.metadata.id
+		frame.metadata().id() == self.metadata().id()
 	}
 }
 
 impl ExpectedMatcher for Arc<Frame> {
 	fn matches(&self, frame: &Frame) -> bool {
-		self.metadata.id == frame.metadata.id
+		self.metadata().id() == frame.metadata().id()
 	}
 }
 
 impl<E> ExpectedMatcher for Result<Frame, E> {
 	fn matches(&self, frame: &Frame) -> bool {
 		match self {
-			Ok(f) => frame.metadata.id == f.metadata.id,
+			Ok(f) => frame.metadata().id() == f.metadata().id(),
 			Err(_) => false,
 		}
 	}
@@ -356,7 +356,7 @@ where
 	T: Message + PartialEq,
 {
 	fn matches(&self, frame: &Frame) -> bool {
-		if let Ok(decoded) = decode::<T>(&frame.message) {
+		if let Ok(decoded) = decode::<T>(frame.message()) {
 			decoded == *self
 		} else {
 			false
@@ -446,6 +446,66 @@ impl TestFrame {
 				frame_integrity: type Sha3_256
 		}
 		.expect("Failed to create frame with frame integrity")
+	}
+
+	/// A V2 frame that carries a priority, a field V0 and V1 forbid.
+	#[cfg(feature = "builder")]
+	pub fn prioritized() -> Frame {
+		let message = TestMessage::sample(None);
+		compose! {
+			V2: id: "prioritized",
+				order: 1u64,
+				message: message,
+				priority: crate::MessagePriority::Standard
+		}
+		.expect("a V2 frame carries a priority")
+	}
+
+	/// `frame` decoded again after the first copy of `original` in its DER
+	/// becomes `forged`.
+	///
+	/// A test models tampering in transit this way, because no method rewrites
+	/// a digested or signed field in place. The two byte strings MUST have one
+	/// length, so every DER length octet stays valid.
+	pub fn tamper(frame: &Frame, original: impl AsRef<[u8]>, forged: impl AsRef<[u8]>) -> Frame {
+		let original = original.as_ref();
+		let forged = forged.as_ref();
+		assert_eq!(original.len(), forged.len(), "a tamper keeps the DER lengths");
+
+		let mut encoded = crate::der::Encode::to_der(frame).expect("the frame encodes");
+		let start = encoded
+			.windows(original.len())
+			.position(|window| window == original)
+			.expect("the frame DER holds the original bytes");
+		encoded[start..start + forged.len()].copy_from_slice(forged);
+
+		crate::der::Decode::from_der(&encoded).expect("a same-length rewrite still decodes")
+	}
+
+	/// The DER of `container` with the version of its embedded `frame`
+	/// rewritten to `version`.
+	///
+	/// No constructor yields a frame whose version forbids a field it carries.
+	/// A test that feeds such a frame to a decoder forges the bytes here.
+	pub fn forge_version(container: &impl crate::der::Encode, frame: &Frame, version: Version) -> Vec<u8> {
+		let mut encoded = crate::der::Encode::to_der(container).expect("the container encodes");
+		let frame_der = crate::der::Encode::to_der(frame).expect("the frame encodes");
+
+		let start = encoded
+			.windows(frame_der.len())
+			.position(|window| window == frame_der.as_slice())
+			.expect("the container embeds the frame DER");
+
+		// A frame opens with its SEQUENCE header, then the `ENUMERATED` tag and
+		// length octets of its version.
+		let length_octets = match frame_der[1] {
+			short if short < 0x80 => 1,
+			long => 1 + usize::from(long & 0x7F),
+		};
+		let version_offset = start + 1 + length_octets + 2;
+		encoded[version_offset] = version as u8;
+
+		encoded
 	}
 }
 
@@ -763,9 +823,9 @@ mod tests {
 		},
 		assertions: |_msg, result| {
 			let metadata: Metadata = result?;
-			assert_eq!(metadata.id, b"test-id");
-			assert_eq!(metadata.order, 1696521600);
-			assert!(metadata.integrity.is_none());
+			assert_eq!(metadata.id(), b"test-id");
+			assert_eq!(metadata.order(), 1696521600);
+			assert!(metadata.integrity().is_none());
 			Ok(())
 		}
 	}

@@ -159,7 +159,7 @@ impl Frame {
 	{
 		self.prepare_typed(ctx)?;
 
-		let message: I = crate::decode(&self.message)?;
+		let message: I = crate::decode(self.message())?;
 		handler(message, self, ctx).await
 	}
 }

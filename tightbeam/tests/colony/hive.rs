@@ -96,7 +96,7 @@ servlet! {
 		trace.event(SERVLET_RESPOND)?;
 
 		Ok(Some(compose! {
-			V0: id: &frame.metadata.id,
+			V0: id: frame.metadata().id(),
 				message: HiveTestResponse { doubled: req.value * 2 }
 		}?))
 	}
@@ -283,7 +283,7 @@ async fn emit_command(
 	frame: Frame,
 ) -> Result<ClusterCommandResponse, TightBeamError> {
 	let response = client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-	decode(&response.message)
+	decode(response.message())
 }
 
 /// Requires the heartbeat CHOICE to be present and the manage CHOICE to
@@ -342,13 +342,15 @@ fn manage_spawn_shape_status(response: &ClusterCommandResponse) -> Result<Transi
 }
 
 async fn signed_heartbeat_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
-	command_frame(id, heartbeat_command())?
-		.sign_with_provider::<Sha3_256, _>(provider)
-		.await
+	let mut frame = command_frame(id, heartbeat_command())?;
+	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
+	Ok(frame)
 }
 
 async fn signed_stop_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
-	stop_command_frame(id)?.sign_with_provider::<Sha3_256, _>(provider).await
+	let mut frame = stop_command_frame(id)?;
+	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
+	Ok(frame)
 }
 
 async fn signed_spawn_frame(
@@ -356,9 +358,9 @@ async fn signed_spawn_frame(
 	id: &[u8],
 	servlet_type: &str,
 ) -> Result<Frame, TightBeamError> {
-	spawn_command_frame(id, servlet_type)?
-		.sign_with_provider::<Sha3_256, _>(provider)
-		.await
+	let mut frame = spawn_command_frame(id, servlet_type)?;
+	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
+	Ok(frame)
 }
 
 tb_assert_spec! {
@@ -432,12 +434,12 @@ tb_scenario! {
 			// signature transplanted from a different frame is the one failure
 			// class the breaker counts.
 			let now = current_timestamp_ms();
-			let donor_heartbeat = command_frame_with_order(b"hb-donor", heartbeat_command(), now)?;
-			let donor = donor_heartbeat.sign_with_provider::<Sha3_256, _>(&signer.provider).await?;
+			let mut donor = command_frame_with_order(b"hb-donor", heartbeat_command(), now)?;
+			donor.sign_with_provider::<Sha3_256, _>(&signer.provider).await?;
 
-			let mut forged =
-				command_frame_with_order(b"hb-forged", heartbeat_command(), now.saturating_add(1))?;
-			forged.nonrepudiation = donor.nonrepudiation.to_owned();
+			let transplanted = donor.nonrepudiation().cloned().ok_or(TightBeamError::MissingSignature)?;
+			let mut forged = command_frame_with_order(b"hb-forged", heartbeat_command(), now.saturating_add(1))?;
+			forged.attach_signer_info(transplanted)?;
 
 			let response = emit_command(&mut client, forged).await?;
 			trace.event_with(FORGED_HEARTBEAT_DENIED, &[], heartbeat_shape_status(&response, false)?)?;
@@ -719,9 +721,10 @@ fn contract_signing_key() -> Secp256k1SigningKey {
 
 /// Signs `frame` with the shared contract key under the canonical
 /// SHA3-256 convention.
-async fn sign_contract_frame(frame: Frame) -> Result<Frame, TightBeamError> {
+async fn sign_contract_frame(mut frame: Frame) -> Result<Frame, TightBeamError> {
 	let provider = Secp256k1KeyProvider::from(contract_signing_key());
-	frame.sign_with_provider::<Sha3_256, _>(&provider).await
+	frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	Ok(frame)
 }
 
 /// Returns true when the signature on `frame` verifies against the shared
@@ -749,12 +752,12 @@ servlet! {
 		// to-be-signed bytes.
 		let sig_valid = contract_signature_verifies(&frame);
 
-		trace.event_with(CONTRACT_FRAME_CLIENT_ID, &[], u32::from(frame.metadata.id == b"hive-signed-call"))?;
-		trace.event_with(CONTRACT_FRAME_SIGNED, &[], u32::from(frame.nonrepudiation.is_some()))?;
-		trace.event_with(CONTRACT_FRAME_PREVIOUS, &[], u32::from(frame.metadata.previous_frame.is_some()))?;
+		trace.event_with(CONTRACT_FRAME_CLIENT_ID, &[], u32::from(frame.metadata().id() == b"hive-signed-call"))?;
+		trace.event_with(CONTRACT_FRAME_SIGNED, &[], u32::from(frame.nonrepudiation().is_some()))?;
+		trace.event_with(CONTRACT_FRAME_PREVIOUS, &[], u32::from(frame.metadata().previous_frame().is_some()))?;
 		trace.event_with(CONTRACT_FRAME_SIG_VALID, &[], u32::from(sig_valid))?;
 
-		let unsigned = FrameBuilder::from(Version::V0)
+		let unsigned = FrameBuilder::from(Version::V1)
 			.with_id(b"hive-contract-reply")
 			.with_message(HiveTestResponse { doubled: req.value * 2 })
 			.build()?;
@@ -840,8 +843,8 @@ tb_scenario! {
 
 			let signed = sign_contract_frame(unsigned).await?;
 
-			trace.event_with(HIVE_CALL_SIGNED, &[], u32::from(signed.nonrepudiation.is_some()))?;
-			trace.event_with(HIVE_CALL_PREVIOUS, &[], u32::from(signed.metadata.previous_frame.is_some()))?;
+			trace.event_with(HIVE_CALL_SIGNED, &[], u32::from(signed.nonrepudiation().is_some()))?;
+			trace.event_with(HIVE_CALL_PREVIOUS, &[], u32::from(signed.metadata().previous_frame().is_some()))?;
 
 			// The public surface under test is `HiveContext::call`. The
 			// caller's complete signed frame goes out as composed, and the
@@ -850,11 +853,11 @@ tb_scenario! {
 			let contract = servlet_urn("contract");
 			let reply = ctx.call(&contract, signed).await?;
 
-			trace.event_with(HIVE_CALL_REPLY_ID, &[], u32::from(reply.metadata.id == b"hive-contract-reply"))?;
-			trace.event_with(HIVE_CALL_REPLY_SIGNED, &[], u32::from(reply.nonrepudiation.is_some()))?;
+			trace.event_with(HIVE_CALL_REPLY_ID, &[], u32::from(reply.metadata().id() == b"hive-contract-reply"))?;
+			trace.event_with(HIVE_CALL_REPLY_SIGNED, &[], u32::from(reply.nonrepudiation().is_some()))?;
 			trace.event_with(HIVE_CALL_REPLY_SIG_VALID, &[], u32::from(contract_signature_verifies(&reply)))?;
 
-			let response: HiveTestResponse = decode(&reply.message)?;
+			let response: HiveTestResponse = decode(reply.message())?;
 			trace.event_with(HIVE_CALL_ECHOED, &[], u64::from(response.doubled))?;
 
 			hive.stop();

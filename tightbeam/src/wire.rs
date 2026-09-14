@@ -161,6 +161,10 @@ pub(crate) fn octets_seq_refs(list: &[Vec<u8>]) -> Result<Vec<OctetStringRef<'_>
 /// - `default($value)`: trailing `T DEFAULT $value` for `Copy` scalars.
 ///   The field is omitted when equal to `$value`.
 ///
+/// A trailing `where $check` names a `fn(&Self) -> der::Result<()>` that the
+/// decoder runs on the assembled value. It rejects a cross-field constraint in
+/// the same pass that reads the fields, so no decoded value skips it.
+///
 /// # Sources
 ///
 /// - ITU-T X.680 (02/2021) § 23 / § 25 / § 31:
@@ -214,7 +218,7 @@ macro_rules! wire_sequence {
 	(@encodable $self:ident, $field:ident, default($value:expr)) => {
 		&$crate::wire::default_field(&$self.$field, $value)
 	};
-	($name:ident { $($field:ident : $kind:tt $(($tag:expr))?),+ $(,)? }) => {
+	($name:ident { $($field:ident : $kind:tt $(($tag:expr))?),+ $(,)? } $(where $check:path)?) => {
 		impl<'wire> ::der::DecodeValue<'wire> for $name {
 			fn decode_value<R: ::der::Reader<'wire>>(
 				reader: &mut R,
@@ -222,8 +226,10 @@ macro_rules! wire_sequence {
 			) -> ::der::Result<Self> {
 				reader.read_nested(header.length, |reader| {
 					$(let $field = wire_sequence!(@decode reader, $kind $(($tag))?);)+
+					let value = Self { $($field),+ };
+					$($check(&value)?;)?
 
-					::core::result::Result::Ok(Self { $($field),+ })
+					::core::result::Result::Ok(value)
 				})
 			}
 		}

@@ -240,7 +240,7 @@ tb_scenario! {
 			let v3_frame = build_version_frame(asn1::Version::V3, &message, &crypto, &message_hash)?;
 
 			// Roundtrip checks
-			let v0_roundtrip: TestMessage = tightbeam::decode(&v0_frame.message)?;
+			let v0_roundtrip: TestMessage = tightbeam::decode(v0_frame.message())?;
 			trace.event_with(ROUNDTRIP_OK, &["v0"], v0_roundtrip == message)?;
 
 			// V1+ signature checks (before decrypt, which consumes the frame)
@@ -249,38 +249,38 @@ tb_scenario! {
 			trace.event_with(SIG_VALID, &["v3"], v3_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
 
 			// V1+ integrity checks (before decrypt)
-			let v1_integrity = v1_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
-			let v2_integrity = v2_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
-			let v3_integrity = v3_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
+			let v1_integrity = v1_frame.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;
+			let v2_integrity = v2_frame.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;
+			let v3_integrity = v3_frame.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;
 			trace.event_with(INTEGRITY_OK, &["v1"], v1_integrity.value_cmp(&message_hash).is_ok())?;
 			trace.event_with(INTEGRITY_OK, &["v2"], v2_integrity.value_cmp(&message_hash).is_ok())?;
 			trace.event_with(INTEGRITY_OK, &["v3"], v3_integrity.value_cmp(&message_hash).is_ok())?;
 
 			// Frame-level fields (before decrypt)
-			trace.event_with(NONREPUDIATION, &["v0"], Presence::of_option(&v0_frame.nonrepudiation))?;
-			trace.event_with(NONREPUDIATION, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.nonrepudiation))?;
-			trace.event_with(INTEGRITY, &["v0"], Presence::of_option(&v0_frame.integrity))?;
-			trace.event_with(INTEGRITY, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.integrity))?;
+			trace.event_with(NONREPUDIATION, &["v0"], Presence::of_option(&v0_frame.nonrepudiation()))?;
+			trace.event_with(NONREPUDIATION, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.nonrepudiation()))?;
+			trace.event_with(INTEGRITY, &["v0"], Presence::of_option(&v0_frame.integrity()))?;
+			trace.event_with(INTEGRITY, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.integrity()))?;
 
 			// Metadata fields (before decrypt)
-			trace.event_with(CONFIDENTIALITY, &["v0"], Presence::of_option(&v0_frame.metadata.confidentiality))?;
-			trace.event_with(CONFIDENTIALITY, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.metadata.confidentiality))?;
-			trace.event_with(PRIORITY, &["v0", "v1"], v0_frame.metadata.priority)?;
-			trace.event_with(PRIORITY, &["v2"], v2_frame.metadata.priority)?;
-			trace.event_with(PRIORITY, &["v3"], v3_frame.metadata.priority)?;
-			trace.event_with(LIFETIME, &["v0", "v1"], v0_frame.metadata.lifetime)?;
-			trace.event_with(LIFETIME, &["v2"], v2_frame.metadata.lifetime)?;
-			trace.event_with(LIFETIME, &["v3"], v3_frame.metadata.lifetime)?;
-			trace.event_with(PREVIOUS_FRAME, &["v0", "v1"], Presence::of_option(&v0_frame.metadata.previous_frame))?;
-			trace.event_with(PREVIOUS_FRAME, &["v2", "v3"], Presence::of_option(&v2_frame.metadata.previous_frame))?;
-			trace.event_with(MATRIX, &["v0", "v1", "v2"], Presence::of_option(&v0_frame.metadata.matrix))?;
-			trace.event_with(MATRIX, &["v3"], Presence::of_option(&v3_frame.metadata.matrix))?;
+			trace.event_with(CONFIDENTIALITY, &["v0"], Presence::of_option(&v0_frame.metadata().confidentiality()))?;
+			trace.event_with(CONFIDENTIALITY, &["v1", "v2", "v3"], Presence::of_option(&v1_frame.metadata().confidentiality()))?;
+			trace.event_with(PRIORITY, &["v0", "v1"], v0_frame.metadata().priority())?;
+			trace.event_with(PRIORITY, &["v2"], v2_frame.metadata().priority())?;
+			trace.event_with(PRIORITY, &["v3"], v3_frame.metadata().priority())?;
+			trace.event_with(LIFETIME, &["v0", "v1"], v0_frame.metadata().lifetime())?;
+			trace.event_with(LIFETIME, &["v2"], v2_frame.metadata().lifetime())?;
+			trace.event_with(LIFETIME, &["v3"], v3_frame.metadata().lifetime())?;
+			trace.event_with(PREVIOUS_FRAME, &["v0", "v1"], Presence::of_option(&v0_frame.metadata().previous_frame()))?;
+			trace.event_with(PREVIOUS_FRAME, &["v2", "v3"], Presence::of_option(&v2_frame.metadata().previous_frame()))?;
+			trace.event_with(MATRIX, &["v0", "v1", "v2"], Presence::of_option(&v0_frame.metadata().matrix()))?;
+			trace.event_with(MATRIX, &["v3"], Presence::of_option(&v3_frame.metadata().matrix()))?;
 
 			// Version checks - each version is unique (before decrypt)
-			trace.event_with(VERSION, &["v0"], v0_frame.version)?;
-			trace.event_with(VERSION, &["v1"], v1_frame.version)?;
-			trace.event_with(VERSION, &["v2"], v2_frame.version)?;
-			trace.event_with(VERSION, &["v3"], v3_frame.version)?;
+			trace.event_with(VERSION, &["v0"], v0_frame.version())?;
+			trace.event_with(VERSION, &["v1"], v1_frame.version())?;
+			trace.event_with(VERSION, &["v2"], v2_frame.version())?;
+			trace.event_with(VERSION, &["v3"], v3_frame.version())?;
 
 			// Decrypt (consumes frames, so must be last)
 			let v1_roundtrip = v1_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;

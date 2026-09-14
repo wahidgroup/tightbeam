@@ -81,7 +81,7 @@ servlet! {
 		let issuer: &Arc<CsrIssuer> = ctx.env_config()?;
 		let response = issuer.try_issue(&req);
 		Ok(Some(compose! {
-			V0: id: &frame.metadata.id,
+			V0: id: frame.metadata().id(),
 				message: response
 		}?))
 	}

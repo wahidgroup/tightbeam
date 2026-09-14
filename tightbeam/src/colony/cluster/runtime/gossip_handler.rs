@@ -79,7 +79,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 		self.trace.event(CLUSTER_PEER_ADVERTISED)?;
 
-		reply_frame(&frame.metadata.id, PeerAdvertisementResponse { status: TransitStatus::Ok })
+		reply_frame(frame.metadata().id(), PeerAdvertisementResponse { status: TransitStatus::Ok })
 	}
 }
 
@@ -129,7 +129,7 @@ where
 		}
 
 		// Outer `lifetime` is hop-authenticated. Missing TTL is relay misbehavior.
-		let hop_ttl = match frame.metadata.lifetime {
+		let hop_ttl = match frame.metadata().lifetime() {
 			Some(hop_ttl) => hop_ttl,
 			None => {
 				self.weaken_invalid_relay(GossipOrigin::Relay, &frame)?;
@@ -183,30 +183,27 @@ where
 
 		// Clamp hop radius outside the rumor body so identity stays stable.
 		let radius_cap = u64::from(self.config.gossip.ttl.min(MAX_GOSSIP_TTL));
-		let hop_ttl = frame.metadata.lifetime.unwrap_or(radius_cap).min(radius_cap);
+		let hop_ttl = frame.metadata().lifetime().unwrap_or(radius_cap).min(radius_cap);
 
 		// Copy id/order from publish so replay remints an identical digest (CWE-294).
 		let rumor = FrameBuilder::from(Version::V2)
-			.with_id(&frame.metadata.id)
-			.with_order(frame.metadata.order)
+			.with_id(frame.metadata().id())
+			.with_order(frame.metadata().order())
 			.with_message(body)
 			.with_witness_hasher::<D>()
 			.build();
-		let rumor = match rumor {
+		let mut rumor = match rumor {
 			Ok(rumor) => rumor,
 			Err(_) => {
 				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 			}
 		};
-		let rumor = match rumor
+		let signing = rumor
 			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await
-		{
-			Ok(rumor) => rumor,
-			Err(_) => {
-				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
-			}
-		};
+			.await;
+		if signing.is_err() {
+			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
+		}
 
 		self.run::<D>(GossipOrigin::Origin, frame, rumor, hop_ttl).await
 	}
@@ -311,6 +308,6 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		// colony graph on its existing beat with no extra round trip.
 		let pex = self.config.pex_sample(&self.servlet_registry);
 
-		reply_frame(&frame.metadata.id, GossipWant { want, pex })
+		reply_frame(frame.metadata().id(), GossipWant { want, pex })
 	}
 }

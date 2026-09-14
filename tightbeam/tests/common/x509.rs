@@ -207,11 +207,11 @@ impl MutualAuthServer {
 				async move {
 					tx.send(message.to_owned()).await.map_err(|_| TightBeamError::InvalidBody)?;
 
-					let ping: PingMessage = decode(&message.message)?;
+					let ping: PingMessage = decode(message.message())?;
 					let pong = PongMessage { echo: ping.data };
 
 					Ok(Some(compose! {
-						V0: id: &message.metadata.id,
+						V0: id: message.metadata().id(),
 						message: pong
 					}?))
 				}

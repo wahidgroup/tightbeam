@@ -2,17 +2,17 @@
 
 use std::sync::Arc;
 
-use tightbeam::asn1::{MessagePriority, Metadata, Version};
+use tightbeam::asn1::Version;
 use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv};
+use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxStreamKind};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
-use tightbeam::{Frame, TightBeamError};
+use tightbeam::TightBeamError;
 
 use crate::common::security::expectation_failure;
 use crate::transport::support::{await_ok, join_task, mux_frame};
@@ -417,20 +417,9 @@ tb_scenario! {
 }
 
 /// V0 frame with V2-only field: mux router must reject.
-fn version_incompatible_frame_der() -> Result<Vec<u8>, TightBeamError> {
-	let mut metadata = Metadata::default();
-	metadata.priority = Some(MessagePriority::Standard);
-
-	let frame = Frame {
-		version: Version::V0,
-		metadata,
-		message: Vec::new(),
-		integrity: None,
-		nonrepudiation: None,
-	};
-
-	let der = frame.to_der()?;
-	Ok(der)
+fn version_incompatible_frame_der() -> Vec<u8> {
+	let frame = TestFrame::prioritized();
+	TestFrame::forge_version(&frame, &frame, Version::V0)
 }
 
 async fn violation_answered_with_goaway(
@@ -472,7 +461,7 @@ tb_scenario! {
 				// Open without a message (requests must carry one)
 				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, Vec::new())?.into(),
 				// Open whose frame claims fields its version forbids
-				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, version_incompatible_frame_der()?)?.into(),
+				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, version_incompatible_frame_der())?.into(),
 			];
 
 			for offender in offenders {

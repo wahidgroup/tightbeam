@@ -37,7 +37,7 @@ pub(crate) async fn signed_control_frame(
 	request: ClusterRequest,
 	order: u64,
 ) -> Result<tightbeam::Frame, TightBeamError> {
-	let unsigned = Version::V0
+	let mut signed = Version::V1
 		.compose()
 		.with_id(id)
 		.with_order(order)
@@ -45,7 +45,8 @@ pub(crate) async fn signed_control_frame(
 		.build()?;
 
 	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	Ok(signed)
 }
 
 async fn connect_as(
@@ -100,7 +101,7 @@ async fn emit_advertise(
 		Ok(Some(frame)) => frame,
 		Ok(None) | Err(_) => return Ok(AuthzClass::InfraFail),
 	};
-	let response: PeerAdvertisementResponse = match decode(&response_frame.message) {
+	let response: PeerAdvertisementResponse = match decode(response_frame.message()) {
 		Ok(response) => response,
 		Err(_) => return Ok(AuthzClass::InfraFail),
 	};

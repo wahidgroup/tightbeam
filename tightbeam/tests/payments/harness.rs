@@ -37,7 +37,7 @@ type IdempotencyKey = (Vec<u8>, u64);
 /// Extract idempotency key from frame (DRY helper)
 #[inline]
 fn frame_key(frame: &Frame) -> IdempotencyKey {
-	(frame.metadata.id.to_owned(), frame.metadata.order)
+	(frame.metadata().id().to_owned(), frame.metadata().order())
 }
 
 // ============================================================================
@@ -135,7 +135,7 @@ impl ChainState {
 		let mut guard = self.state.lock().map_err(|_| TightBeamError::LockPoisoned)?;
 
 		let expected = guard.last_digest.to_owned();
-		let actual = frame.metadata.previous_frame.as_ref();
+		let actual = frame.metadata().previous_frame();
 
 		// Validate previous frame linkage
 		let prev_ok = match (expected.as_ref(), actual) {
@@ -150,14 +150,14 @@ impl ChainState {
 		};
 
 		// Validate order is increasing
-		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata.order > prev);
+		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata().order() > prev);
 		let valid = prev_ok && order_ok;
 		if valid {
 			self.trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
 
-			guard.last_order = Some(frame.metadata.order);
+			guard.last_order = Some(frame.metadata().order());
 
-			let digest = utils::digest::<Sha3_256>(&frame.message)?;
+			let digest = utils::digest::<Sha3_256>(frame.message())?;
 			guard.last_digest = Some(digest);
 		} else {
 			self.trace.event_with(CHAIN_BROKEN, &[PAYMENT_TAG], true)?;
@@ -244,19 +244,18 @@ impl PaymentHarness {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use tightbeam::asn1::{Metadata, Version};
+	use tightbeam::asn1::Version;
+	use tightbeam::builder::TypeBuilder;
+	use tightbeam::testing::TestMessage;
 
 	fn test_frame(id: &[u8], order: u64) -> Frame {
-		let mut metadata = Metadata::default();
-		metadata.id = id.to_vec();
-		metadata.order = order;
-		Frame {
-			version: Version::V2,
-			metadata,
-			message: vec![1, 2, 3],
-			integrity: None,
-			nonrepudiation: None,
-		}
+		Version::V2
+			.compose()
+			.with_id(id)
+			.with_order(order)
+			.with_message(TestMessage::sample(None))
+			.build()
+			.expect("a V2 frame with an id and an order builds")
 	}
 
 	#[test]

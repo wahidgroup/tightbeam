@@ -256,7 +256,7 @@ impl MessageChainState {
 	/// 2. Frame's previous_frame hash matches our last_hash (if sequence > 0)
 	pub fn validate_frame(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		// Check sequence order
-		if frame.metadata.order != self.sequence + 1 {
+		if frame.metadata().order() != self.sequence + 1 {
 			return Ok(false);
 		}
 
@@ -266,7 +266,7 @@ impl MessageChainState {
 		}
 
 		// Verify previous_frame hash matches
-		if let Some(ref digest_info) = frame.metadata.previous_frame {
+		if let Some(digest_info) = frame.metadata().previous_frame() {
 			let expected_hash = digest_info.digest.as_bytes();
 			Ok(expected_hash == self.last_hash.as_slice())
 		} else {
@@ -284,7 +284,7 @@ impl MessageChainState {
 
 		// Copy hash into our buffer
 		self.last_hash.copy_from_slice(&frame_hash);
-		self.sequence = frame.metadata.order;
+		self.sequence = frame.metadata().order();
 
 		Ok(())
 	}

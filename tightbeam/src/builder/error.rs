@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use crate::asn1::GatedField;
 use crate::{Errorizable, Version};
 
 /// Errors specific to metadata validation
@@ -23,8 +24,8 @@ pub enum MetadataError {
 	MissingEncryption,
 
 	/// Field not supported in this protocol version
-	#[error("Field '{field}' is not supported in protocol version {version:?}")]
-	UnsupportedField { field: &'static str, version: Version },
+	#[error("Field {field} is not supported in protocol version {version:?}")]
+	UnsupportedField { field: GatedField, version: Version },
 }
 
 /// Errors that can occur during builder operations

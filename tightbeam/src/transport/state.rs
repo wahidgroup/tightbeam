@@ -726,10 +726,9 @@ pub trait EncryptedProtocolState: SealedProtocolState {
 #[cfg(all(test, feature = "x509", feature = "aead"))]
 mod tests {
 	use super::*;
-	use crate::asn1::{Frame, Metadata};
 	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::profiles::DefaultCryptoProvider;
-	use crate::Version;
+	use crate::testing::TestFrame;
 
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	use crate::testing::fixtures::{TestCertificate, TestKey};
@@ -888,13 +887,7 @@ mod tests {
 			encryption,
 			limits: TransportLimits::default(),
 		};
-		let frame = Frame {
-			version: Version::V0,
-			metadata: Metadata::default(),
-			message: Vec::new(),
-			integrity: None,
-			nonrepudiation: None,
-		};
+		let frame = TestFrame::v0(None, None);
 
 		let builder = EnvelopeBuilder::request(frame);
 		assert!(probe.apply_wire_mode(builder).is_ok());
@@ -1037,13 +1030,7 @@ mod tests {
 	#[test]
 	fn pending_session_refuses_to_apply_a_wire_mode() {
 		let probe = PhaseProbe::provisioned(handshaking());
-		let frame = Frame {
-			version: Version::V0,
-			metadata: Metadata::default(),
-			message: Vec::new(),
-			integrity: None,
-			nonrepudiation: None,
-		};
+		let frame = TestFrame::v0(None, None);
 
 		let builder = EnvelopeBuilder::request(frame);
 		let refusal = probe.apply_wire_mode(builder);

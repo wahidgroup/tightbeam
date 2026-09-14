@@ -190,7 +190,7 @@ macro_rules! servlet {
 				let mut $frame = $frame;
 				$frame.prepare_typed($ctx)?;
 
-				let $msg: $input = $crate::decode(&$frame.message)?;
+				let $msg: $input = $crate::decode($frame.message())?;
 				$handler_body
 			}
 			$(, stream: |$sbody, $sctx| async move $stream_body)?

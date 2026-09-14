@@ -149,11 +149,11 @@ impl AdmittedGossip {
 	where
 		D: Digest + OutputSizeUser<OutputSize = U32>,
 	{
-		let body: GossipRumor = decode(&rumor.message).map_err(|_| TransitStatus::PermissionDenied)?;
+		let body: GossipRumor = decode(rumor.message()).map_err(|_| TransitStatus::PermissionDenied)?;
 
 		let within_payload = body.payload.len() <= MAX_GOSSIP_PAYLOAD_BYTES;
 		let within_ttl = ttl <= u64::from(MAX_GOSSIP_TTL);
-		let fresh = gossip_fresh(rumor.metadata.order, seen_ttl_ms, now_ms);
+		let fresh = gossip_fresh(rumor.metadata().order(), seen_ttl_ms, now_ms);
 		if within_payload && within_ttl && fresh {
 			let digest = rumor.gossip_digest::<D>().map_err(|_| TransitStatus::PermissionDenied)?;
 			let admitted = Self { digest, payload: body.payload, kind: body.kind };
@@ -626,7 +626,8 @@ impl GossipJournal for MemoryGossipJournal {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::{Metadata, Version};
+	use crate::asn1::Version;
+	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::crypto::hash::Sha3_256;
 
 	fn digest(rumor: &Frame) -> GossipDigest {
@@ -635,23 +636,12 @@ mod tests {
 
 	fn rumor(order: u64, payload: Vec<u8>) -> Frame {
 		let body = GossipRumor::application(payload);
-		Frame {
-			version: Version::V0,
-			metadata: Metadata {
-				id: b"rumor".to_vec(),
-				order,
-				compactness: None,
-				integrity: None,
-				confidentiality: None,
-				priority: None,
-				lifetime: None,
-				previous_frame: None,
-				matrix: None,
-			},
-			message: encode(&body).expect("test rumor bodies encode"),
-			integrity: None,
-			nonrepudiation: None,
-		}
+		FrameBuilder::from(Version::V0)
+			.with_id("rumor")
+			.with_order(order)
+			.with_message(body)
+			.build()
+			.expect("test rumor frames build")
 	}
 
 	#[test]
@@ -718,8 +708,7 @@ mod tests {
 
 	#[test]
 	fn admit_refuses_undecodable_body() {
-		let mut frame = rumor(1_000, vec![1]);
-		frame.message = vec![0xFF, 0x00, 0xFF];
+		let frame = Frame::v0(b"rumor", vec![0xFF, 0x00, 0xFF]);
 		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, 30_000, 1_000);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}

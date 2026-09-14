@@ -3,7 +3,7 @@
 //! This module defines every message type in the protocol between the
 //! cluster and the hive.
 
-use crate::asn1::{Frame, Metadata, Version};
+use crate::asn1::Frame;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
@@ -76,16 +76,9 @@ impl ClusterWorkRequest {
 	///   does not encode.
 	pub(crate) fn transport_frame(servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError> {
 		let request = ClusterRequest::Work(Self::new(servlet_type, work)?);
-		let mut metadata = Metadata::default();
-		metadata.id = work.metadata.id.clone();
+		let message = encode(&request)?;
 
-		Ok(Frame {
-			version: Version::V0,
-			metadata,
-			message: encode(&request)?,
-			integrity: None,
-			nonrepudiation: None,
-		})
+		Ok(Frame::v0(work.metadata().id(), message))
 	}
 }
 
@@ -161,7 +154,7 @@ impl ClusterWorkResponse {
 	/// - Whatever [`Self::served`] reports for the decoded response.
 	pub(crate) fn served_reply(reply: Option<Frame>) -> Result<Frame, TightBeamError> {
 		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
-		let response: Self = decode(&reply.message)?;
+		let response: Self = decode(reply.message())?;
 
 		response.served()
 	}
@@ -703,7 +696,8 @@ impl ClusterCommandResponse {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::{Metadata, Version};
+	use crate::asn1::Version;
+	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::colony::common::ColonyNamespace;
 	use crate::error::Result;
 
@@ -727,16 +721,7 @@ mod tests {
 	}
 
 	fn work_frame() -> Frame {
-		let mut metadata = Metadata::default();
-		metadata.id = b"work-1".to_vec();
-
-		Frame {
-			version: Version::V0,
-			metadata,
-			message: vec![0x02, 0x01, 0x2A],
-			integrity: None,
-			nonrepudiation: None,
-		}
+		Frame::v0(b"work-1", vec![0x02, 0x01, 0x2A])
 	}
 
 	#[test]
@@ -814,23 +799,11 @@ mod tests {
 	#[test]
 	fn cluster_request_gossip_round_trips() -> Result<()> {
 		let rumor_body = GossipRumor::application(vec![0x02, 0x01, 0x2A]);
-		let rumor = Frame {
-			version: crate::asn1::Version::V0,
-			metadata: crate::asn1::Metadata {
-				id: b"rumor-1".to_vec(),
-				order: 1_000,
-				compactness: None,
-				integrity: None,
-				confidentiality: None,
-				priority: None,
-				lifetime: None,
-				previous_frame: None,
-				matrix: None,
-			},
-			message: crate::encode(&rumor_body)?,
-			integrity: None,
-			nonrepudiation: None,
-		};
+		let rumor = FrameBuilder::from(Version::V0)
+			.with_id("rumor-1")
+			.with_order(1_000)
+			.with_message(rumor_body)
+			.build()?;
 
 		round_trip(ClusterRequest::Gossip(Box::new(rumor)))
 	}

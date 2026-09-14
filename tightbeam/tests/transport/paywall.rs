@@ -267,7 +267,7 @@ async fn start_lottery_server(
 			with_transport_authorizer: [ Arc::clone(&authorizer) ]
 		},
 		handle: move |ticket: Frame| async move {
-			let pick: TestMessage = decode(&ticket.message)?;
+			let pick: TestMessage = decode(ticket.message())?;
 			let announced = rig.outcome(&pick.content);
 			Ok(Some(TestFrame::v0(Some(&announced), None)))
 		}
@@ -332,7 +332,7 @@ async fn start_ledger_lottery_server(
 				let account = session
 					.peer_public_key()
 					.ok_or_else(|| expectation_failure("mutual handshake left no client public key"))?;
-				let pick: TestMessage = decode(&ticket.message)?;
+				let pick: TestMessage = decode(ticket.message())?;
 				let announced = ledger.announce(account, rig, &pick.content);
 				Ok(Some(TestFrame::v0(Some(&announced), None)))
 			}
@@ -393,7 +393,7 @@ async fn draw(lease: &mut PooledClient<TokioListener>, pick: &str) -> Result<Str
 		return Err(expectation_failure("draw produced no announcement"));
 	};
 
-	let announced: TestMessage = decode(&announcement.message)?;
+	let announced: TestMessage = decode(announcement.message())?;
 	Ok(announced.content)
 }
 
@@ -750,7 +750,7 @@ tb_scenario! {
 							.ok_or_else(|| expectation_failure("metered session carried no receipt"))?;
 						books.note_receipt(receipt.receipt().transcript_hash.to_der()?);
 
-						let pick: TestMessage = decode(&ticket.message)?;
+						let pick: TestMessage = decode(ticket.message())?;
 						let announced = DrawRig::AlwaysWin.outcome(&pick.content);
 						Ok(Some(TestFrame::v0(Some(&announced), None)))
 					}

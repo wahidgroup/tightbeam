@@ -16,7 +16,7 @@ use crate::der::oid::ObjectIdentifier;
 use crate::error::Result;
 use crate::error::{ReceivedExpectedError, TightBeamError};
 use crate::matrix::{IntoMatrixDyn, MatrixDyn};
-use crate::{Frame, Message, Version};
+use crate::{DigestInfo, Frame, Message, Metadata, Version};
 
 #[cfg(feature = "compress")]
 use crate::compress::Compressor;
@@ -87,7 +87,7 @@ pub trait CheckSignatureOid<S: SignatureAlgorithmIdentifier>: private::SealedSig
 
 /// Zero-allocation error accumulator for FrameBuilder.
 /// Stores up to 5 errors inline, which covers the common case of one
-/// deferred error per builder method; spills to a Vec beyond that.
+/// deferred error per builder method. It spills to a Vec beyond that.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Default)]
 enum ErrorAccumulator {
@@ -137,9 +137,10 @@ impl ErrorAccumulator {
 		}
 	}
 
-	/// Collapse into the terminal build error: a single deferred error
-	/// surfaces bare so callers can match on it directly; only genuinely
-	/// multiple errors are wrapped in `Sequence`.
+	/// Collapse into the terminal build error.
+	///
+	/// A single deferred error surfaces bare so callers can match on it
+	/// directly. Only multiple errors are wrapped in `Sequence`.
 	fn into_error(self) -> Option<TightBeamError> {
 		match self {
 			Self::None => None,
@@ -584,23 +585,16 @@ impl<T: Message> FrameBuilder<T> {
 			encryptor,
 		)?;
 
-		// Final assembled frame
+		// 4. Optional witness: FI covers the version and the metadata, and never the message.
 		let metadata = metadata_builder.build()?;
-		let mut tbs = Frame { version, metadata, message: message_bytes, integrity: None, nonrepudiation: None };
-
-		// Runtime validation: ensure version is compatible with metadata fields
-		if !tbs.validate_version_compatibility() {
-			return Err(TightBeamError::UnsupportedVersion(ReceivedExpectedError::from((
-				version, version,
-			))));
-		}
-
-		// 4. Optional witness: compute FI over envelope only (version + metadata; excludes message)
-		Self::build_frame_integrity(
-			&mut tbs,
+		let integrity = Self::build_frame_integrity(
+			version,
+			&metadata,
 			#[cfg(feature = "digest")]
 			witness,
 		)?;
+
+		let tbs = Frame::assemble(version, metadata, message_bytes, integrity)?;
 
 		// 5. Optional signing
 		Self::build_signature(
@@ -675,34 +669,40 @@ impl<T: Message> FrameBuilder<T> {
 
 	/// Build frame integrity (FI) over envelope if witness is provided.
 	#[cfg(feature = "digest")]
-	fn build_frame_integrity(tbs: &mut Frame, witness: Option<Digestor>) -> Result<()> {
-		if let Some(witness_fn) = witness {
-			let scaffold = crate::frame::FrameIntegrityScaffold { version: &tbs.version, metadata: &tbs.metadata };
-			let scaffold_der = crate::encode(&scaffold)?;
-			let witness_info = witness_fn(&scaffold_der)?;
-			tbs.integrity = Some(witness_info);
-		}
-		Ok(())
+	fn build_frame_integrity(
+		version: Version,
+		metadata: &Metadata,
+		witness: Option<Digestor>,
+	) -> Result<Option<DigestInfo>> {
+		let Some(witness_fn) = witness else {
+			return Ok(None);
+		};
+
+		let scaffold = crate::frame::FrameIntegrityScaffold { version: &version, metadata };
+		let scaffold_der = crate::encode(&scaffold)?;
+		let witness_info = witness_fn(&scaffold_der)?;
+
+		Ok(Some(witness_info))
 	}
 
 	#[cfg(not(feature = "digest"))]
-	fn build_frame_integrity(_tbs: &mut Frame) -> Result<()> {
-		Ok(())
+	fn build_frame_integrity(_version: Version, _metadata: &Metadata) -> Result<Option<DigestInfo>> {
+		Ok(None)
 	}
 
 	/// Build signature (nonrepudiation) if signer is provided.
 	#[cfg(feature = "signature")]
-	fn build_signature(tbs: Frame, signer: Option<SignerFn>) -> Result<Frame> {
-		let tbs = tbs;
-		if let Some(signer) = signer {
-			crate::notarize! {
-				tbs: tbs,
-				position: nonrepudiation,
-				signer: signer
-			}
-		} else {
-			Ok(tbs)
-		}
+	fn build_signature(mut tbs: Frame, signer: Option<SignerFn>) -> Result<Frame> {
+		let Some(signer) = signer else {
+			return Ok(tbs);
+		};
+
+		let tbs_der = tbs.to_tbs()?;
+		let signer_info = signer(&tbs_der)?;
+
+		tbs.attach_signer_info(signer_info)?;
+
+		Ok(tbs)
 	}
 
 	#[cfg(not(feature = "signature"))]
@@ -737,8 +737,8 @@ mod tests {
 		},
 		assertions: |_msg, result| {
 			let tightbeam  = result?;
-			assert_eq!(tightbeam.version, Version::V0);
-			assert_eq!(str::from_utf8(&tightbeam.metadata.id), Ok("test_v0_basic"));
+			assert_eq!(tightbeam.version(), Version::V0);
+			assert_eq!(str::from_utf8(tightbeam.metadata().id()), Ok("test_v0_basic"));
 			Ok(())
 		}
 	}
@@ -766,12 +766,12 @@ mod tests {
 		},
 		assertions: |message, result| {
 			let tightbeam  = result?;
-			assert_eq!(tightbeam.version, Version::V1);
-			assert!(tightbeam.metadata.confidentiality.is_some());
-			assert!(tightbeam.nonrepudiation.is_some());
+			assert_eq!(tightbeam.version(), Version::V1);
+			assert!(tightbeam.metadata().confidentiality().is_some());
+			assert!(tightbeam.nonrepudiation().is_some());
 
 			// Body should be encrypted (not directly decodable)
-			let decode_result: Result<TestMessage> = crate::decode(&tightbeam.message);
+			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
 			assert!(decode_result.is_err(), "Body should be encrypted");
 
 			// Decrypt and verify
@@ -813,12 +813,12 @@ mod tests {
 		},
 		assertions: |message, result| {
 			let tightbeam = result?;
-			assert_eq!(tightbeam.version, Version::V1);
-			assert!(tightbeam.metadata.compactness.is_some());
-			assert!(tightbeam.metadata.confidentiality.is_some());
+			assert_eq!(tightbeam.version(), Version::V1);
+			assert!(tightbeam.metadata().compactness().is_some());
+			assert!(tightbeam.metadata().confidentiality().is_some());
 
 			// Body should be encrypted+compressed (not directly decodable)
-			let decode_result: Result<TestMessage> = crate::decode(&tightbeam.message);
+			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
 			assert!(decode_result.is_err(), "Body should be encrypted/compressed");
 
 			// Decrypt (automatically decompresses) and verify
@@ -876,35 +876,35 @@ mod tests {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let tightbeam = result?;
-			assert_eq!(tightbeam.version, Version::V2);
-			assert_eq!(tightbeam.metadata.id, b"test_v2_full");
-			assert_eq!(tightbeam.metadata.priority, Some(crate::MessagePriority::LowLatency));
-			assert_eq!(tightbeam.metadata.lifetime, Some(3600));
-			assert!(tightbeam.metadata.confidentiality.is_some());
-			assert!(tightbeam.metadata.compactness.is_some());
-			assert!(tightbeam.metadata.previous_frame.is_some());
-			assert!(tightbeam.metadata.matrix.is_none()); // Matrix is V3+ only
-			assert!(tightbeam.integrity.is_some());
-			assert!(tightbeam.nonrepudiation.is_some());
+			assert_eq!(tightbeam.version(), Version::V2);
+			assert_eq!(tightbeam.metadata().id(), b"test_v2_full");
+			assert_eq!(tightbeam.metadata().priority(), Some(crate::MessagePriority::LowLatency));
+			assert_eq!(tightbeam.metadata().lifetime(), Some(3600));
+			assert!(tightbeam.metadata().confidentiality().is_some());
+			assert!(tightbeam.metadata().compactness().is_some());
+			assert!(tightbeam.metadata().previous_frame().is_some());
+			assert!(tightbeam.metadata().matrix().is_none()); // Matrix is V3+ only
+			assert!(tightbeam.integrity().is_some());
+			assert!(tightbeam.nonrepudiation().is_some());
 
 			// Verify Message Integrity (MI): compute hash over original message and compare
 			let message_der = crate::encode(&message)?;
 			let expected_mi = crate::utils::digest::<Sha3_256>(&message_der)?;
-			let actual_mi = tightbeam.metadata.integrity.as_ref().ok_or(TightBeamError::MissingDigestInfo)?;
+			let actual_mi = tightbeam.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;
 			assert_eq!(actual_mi.digest.as_bytes(), expected_mi.digest.as_bytes());
 
 			// Verify Frame Integrity (FI): compute hash over envelope (version + metadata) and compare
 			let scaffold = crate::frame::FrameIntegrityScaffold {
-				version: &tightbeam.version,
-				metadata: &tightbeam.metadata,
+				version: &tightbeam.version(),
+				metadata: tightbeam.metadata(),
 			};
 			let scaffold_der = crate::encode(&scaffold)?;
 			let expected_fi = crate::utils::digest::<Sha3_256>(&scaffold_der)?;
-			let actual_fi = tightbeam.integrity.as_ref().ok_or(TightBeamError::MissingDigestInfo)?;
+			let actual_fi = tightbeam.integrity().ok_or(TightBeamError::MissingDigestInfo)?;
 			assert_eq!(actual_fi.digest.as_bytes(), expected_fi.digest.as_bytes());
 
 			// Body should be encrypted+compressed (not directly decodable)
-			let decode_result: Result<TestMessage> = crate::decode(&tightbeam.message);
+			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
 			assert!(decode_result.is_err());
 
 			// Verify signature before decrypting (decrypt consumes the frame)
@@ -932,9 +932,8 @@ mod tests {
 		assert!(result.is_err());
 	}
 
-	// Hashing before the message is set defers an `InvalidBody` error; a
-	// single deferred error surfaces bare rather than as a one-element
-	// `Sequence`.
+	// Hashing before the message is set defers an `InvalidBody` error. A single
+	// deferred error surfaces bare rather than as a one-element `Sequence`.
 	#[test]
 	#[cfg(feature = "sha3")]
 	fn test_single_deferred_error_surfaces_bare() {
@@ -962,8 +961,8 @@ mod tests {
 		assert!(matches!(result, Err(TightBeamError::Sequence(ref errors)) if errors.len() == 2));
 	}
 
-	// V1 is the first version whose metadata carries integrity info; V0 with
-	// `message_integrity` is rejected by `MetadataBuilder::build`.
+	// V1 is the first version whose metadata carries integrity info.
+	// `MetadataBuilder::build` rejects V0 with `message_integrity`.
 	#[test]
 	#[cfg(feature = "derive")]
 	fn test_compose_macro() -> Result<()> {
@@ -975,10 +974,10 @@ mod tests {
 				message: message,
 				message_integrity<Sha3_256>: [] // no salt
 		}?;
-		assert_eq!(frame.version, Version::V1);
-		assert_eq!(frame.metadata.id, b"test-id");
-		assert_eq!(frame.metadata.order, 1696521600);
-		assert!(frame.metadata.integrity.is_some());
+		assert_eq!(frame.version(), Version::V1);
+		assert_eq!(frame.metadata().id(), b"test-id");
+		assert_eq!(frame.metadata().order(), 1696521600);
+		assert!(frame.metadata().integrity().is_some());
 		Ok(())
 	}
 
@@ -1017,13 +1016,13 @@ mod tests {
 
 				// Test 3: Verify README semantics - MUST fields -> Frame fields MUST be present
 				// README line 363: MUST_BE_NON_REPUDIABLE=true -> Frame MUST include nonrepudiation field
-				assert_eq!(frame.nonrepudiation.is_some(), $nonrepudiable);
+				assert_eq!(frame.nonrepudiation().is_some(), $nonrepudiable);
 				// README line 364: MUST_BE_CONFIDENTIAL=true -> Frame MUST include confidentiality field
-				assert_eq!(frame.metadata.confidentiality.is_some(), $confidential);
+				assert_eq!(frame.metadata().confidentiality().is_some(), $confidential);
 				// MUST_HAVE_MESSAGE_INTEGRITY=true -> Frame metadata MUST include integrity field
-				assert_eq!(frame.metadata.integrity.is_some(), $message_integrity);
+				assert_eq!(frame.metadata().integrity().is_some(), $message_integrity);
 				// MUST_HAVE_FRAME_INTEGRITY=true -> Frame MUST include integrity field
-				assert_eq!(frame.integrity.is_some(), $frame_integrity);
+				assert_eq!(frame.integrity().is_some(), $frame_integrity);
 
 				// Test 4: Verify version enforcement
 				if $min_version > Version::V0 {
@@ -1146,8 +1145,8 @@ mod tests {
 			};
 		}
 
-		// Compose a frame satisfying the given security requirements; the
-		// requirement tuple selects the matching `compose!` invocation.
+		// Compose a frame that satisfies the given security requirements.
+		// The requirement tuple selects the matching `compose!` invocation.
 		#[allow(clippy::too_many_arguments)]
 		fn compose_frame<T>(
 			test_name: &str,

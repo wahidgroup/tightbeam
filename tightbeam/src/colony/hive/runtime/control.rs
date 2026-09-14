@@ -133,7 +133,7 @@ where
 		let ctx = self;
 		let _in_flight = ctx.in_flight.enter();
 
-		let is_heartbeat = decode::<ClusterCommand>(&frame.message)
+		let is_heartbeat = decode::<ClusterCommand>(frame.message())
 			.map(|cmd| cmd.heartbeat.is_some())
 			.unwrap_or(false);
 
@@ -145,7 +145,7 @@ where
 		// Refuse non-heartbeat manage while draining, in the manage CHOICE shape.
 		if ctx.drain.is_draining() && !is_heartbeat {
 			return reply_frame(
-				&frame.metadata.id,
+				frame.metadata().id(),
 				ClusterCommandResponse::manage(HiveManagementResponse::stop_err(TransitStatus::Unavailable)),
 			);
 		}
@@ -158,7 +158,7 @@ where
 			}
 		}
 
-		let Ok(cmd) = decode::<ClusterCommand>(&frame.message) else {
+		let Ok(cmd) = decode::<ClusterCommand>(frame.message()) else {
 			return Ok(None);
 		};
 
@@ -226,7 +226,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		// A mismatched shape counts as MalformedResponse and can evict the hive.
 		if is_heartbeat {
 			return reply_frame_with_priority(
-				&frame.metadata.id,
+				frame.metadata().id(),
 				MessagePriority::NetworkControl,
 				ClusterCommandResponse::heartbeat(security_status, BasisPoints::default(), 0),
 			);
@@ -234,7 +234,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 
 		let response = HiveManagementResponse::stop_err(security_status);
 		let response = ClusterCommandResponse::manage(response);
-		reply_frame(&frame.metadata.id, response)
+		reply_frame(frame.metadata().id(), response)
 	}
 
 	fn backpressure_reply(&self, frame: &Frame, session: &SessionContext) -> Result<Option<Frame>, TightBeamError>
@@ -248,7 +248,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 
 		let response = HiveManagementResponse::stop_err(TransitStatus::ResourceExhausted);
 		let response = ClusterCommandResponse::manage(response);
-		reply_frame(&frame.metadata.id, response)
+		reply_frame(frame.metadata().id(), response)
 	}
 
 	fn heartbeat_reply(&self, frame: &Frame) -> Result<Option<Frame>, TightBeamError>
@@ -264,7 +264,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		};
 
 		let response = ClusterCommandResponse::heartbeat(status, util, active_count);
-		reply_frame_with_priority(&frame.metadata.id, MessagePriority::NetworkControl, response)
+		reply_frame_with_priority(frame.metadata().id(), MessagePriority::NetworkControl, response)
 	}
 
 	async fn manage_spawn(
@@ -279,7 +279,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		let spawn_denied = || {
 			self.forget_replay(&frame);
 			reply_frame(
-				&frame.metadata.id,
+				frame.metadata().id(),
 				ClusterCommandResponse::manage(HiveManagementResponse::spawn_err(TransitStatus::PermissionDenied)),
 			)
 		};
@@ -302,7 +302,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		let address = addr_bytes.as_ref().to_vec();
 		let response = HiveManagementResponse::spawn_ok(address, instance);
 		let response = ClusterCommandResponse::manage(response);
-		reply_frame(&frame.metadata.id, response)
+		reply_frame(frame.metadata().id(), response)
 	}
 
 	fn manage_list(&self, frame: &Frame) -> Result<Option<Frame>, TightBeamError>
@@ -312,7 +312,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		let list = self.servlets.slate();
 		let response = HiveManagementResponse::list_ok(list);
 		let response = ClusterCommandResponse::manage(response);
-		reply_frame(&frame.metadata.id, response)
+		reply_frame(frame.metadata().id(), response)
 	}
 
 	fn manage_stop(self: Arc<Self>, frame: Frame, servlet_id: Urn<'static>) -> Result<Option<Frame>, TightBeamError>
@@ -323,7 +323,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		let instances = HiveInstances::new(&self.servlets, &self.hive_context);
 		if instances.remove(&id_bytes).is_some() {
 			return reply_frame(
-				&frame.metadata.id,
+				frame.metadata().id(),
 				ClusterCommandResponse::manage(HiveManagementResponse::stop_ok()),
 			);
 		}
@@ -332,14 +332,14 @@ impl<P: Protocol> HiveControlCtx<P> {
 
 		let response = HiveManagementResponse::stop_err(TransitStatus::PermissionDenied);
 		let response = ClusterCommandResponse::manage(response);
-		reply_frame(&frame.metadata.id, response)
+		reply_frame(frame.metadata().id(), response)
 	}
 
 	fn forget_replay(&self, frame: &Frame)
 	where
 		P: Protocol,
 	{
-		if let Some(signer_info) = frame.nonrepudiation.as_ref() {
+		if let Some(signer_info) = frame.nonrepudiation() {
 			self.replay_guard.forget(signer_info.signature.as_bytes());
 		}
 	}

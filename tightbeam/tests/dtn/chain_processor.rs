@@ -87,8 +87,8 @@ impl ChainProcessor {
 		// just sent. This ensures the ordering buffer is synchronized with
 		// the global chain
 		let mut order_buffer = self.order_buffer.write()?;
-		if frame.metadata.order >= order_buffer.next_expected() {
-			order_buffer.set_next_expected(frame.metadata.order + 1);
+		if frame.metadata().order() >= order_buffer.next_expected() {
+			order_buffer.set_next_expected(frame.metadata().order() + 1);
 		}
 
 		Ok(())
@@ -128,7 +128,7 @@ impl ChainProcessor {
 			collected_frames.push(current_frame.to_owned());
 
 			// Move to previous frame using previous_frame hash
-			match current_frame.metadata.previous_frame.as_ref() {
+			match current_frame.metadata().previous_frame() {
 				Some(digest_info) => {
 					let prev_hash = digest_info.digest.as_bytes();
 					match store.retrieve_by_hash(prev_hash)? {

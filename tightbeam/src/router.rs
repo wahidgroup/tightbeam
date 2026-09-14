@@ -129,7 +129,7 @@ macro_rules! routes {
 				$(
 					if core::any::TypeId::of::<T>() == core::any::TypeId::of::<$MsgTy>() {
 						let decoded: $MsgTy =
-							$crate::der::Decode::from_der(frame.frame().message.as_slice())?;
+							$crate::der::Decode::from_der(frame.frame().message())?;
 						let ($router, $frame, $msg) = (self, frame.into_shared(), decoded);
 						{ $handler }
 						return Ok(());
@@ -146,15 +146,8 @@ mod tests {
 	use std::sync::{mpsc, Arc};
 	use std::time::Duration;
 
-	use crate::cms::compressed_data::CompressedData;
-	use crate::cms::content_info::CmsVersion;
-	use crate::cms::enveloped_data::EncryptedContentInfo;
-	use crate::cms::signed_data::EncapsulatedContentInfo;
-	use crate::der::asn1::OctetString;
-	use crate::der::{Decode, Encode, Sequence};
-	use crate::oids::{COMPRESSION_ZSTD, DATA};
+	use crate::der::Sequence;
 	use crate::router::{RouterError, RouterPolicy};
-	use crate::spki::AlgorithmIdentifier;
 	use crate::Beamable;
 	use crate::Frame;
 
@@ -233,11 +226,11 @@ mod tests {
 		let timeout = Duration::from_millis(200);
 		for i in 0..n {
 			let (payment_frame, payment) = payment_rx.recv_timeout(timeout)?;
-			assert_eq!(&payment_frame.metadata.id, &format!("p-{i}").as_bytes());
+			assert_eq!(payment_frame.metadata().id(), format!("p-{i}").as_bytes());
 			assert_eq!(payment, Payment { from: "alice".into(), amount: i });
 
 			let (health_frame, health) = health_rx.recv_timeout(timeout)?;
-			assert_eq!(&health_frame.metadata.id, &format!("h-{i}").as_bytes());
+			assert_eq!(health_frame.metadata().id(), format!("h-{i}").as_bytes());
 			assert_eq!(health, HealthCheck { uptime: i });
 		}
 
@@ -286,27 +279,40 @@ mod tests {
 		}
 	}
 
-	fn confidential(mut frame: Frame) -> Result<Frame, Box<dyn std::error::Error>> {
-		frame.metadata.confidentiality = Some(EncryptedContentInfo {
-			content_type: DATA,
-			content_enc_alg: AlgorithmIdentifier { oid: DATA, parameters: None },
-			encrypted_content: Some(OctetString::new(vec![0; 16])?),
-		});
+	/// A V1 payment whose body is encrypted, so it still needs a decrypt before
+	/// a decode.
+	#[cfg(feature = "aead")]
+	fn confidential_payment(index: u64) -> Result<Frame, Box<dyn std::error::Error>> {
+		use crate::crypto::aead::Aes256GcmOid;
+		use crate::testing::TestKey;
+
+		let (_, cipher) = TestKey::cipher();
+		let frame = compose! {
+			V1: id: format!("p-{index}"),
+				order: 1u64,
+				message: Payment {
+					from: "alice".into(),
+					amount: index
+				},
+				confidentiality<Aes256GcmOid, _>: cipher
+		}?;
 		Ok(frame)
 	}
 
+	#[cfg(feature = "aead")]
 	#[test]
 	fn hand_written_policy_never_sees_a_confidential_frame() -> Result<(), Box<dyn std::error::Error>> {
 		let router = NaiveRouter { seen: std::sync::Mutex::new(0) };
-		let opaque = router.dispatch::<Payment>(Arc::new(confidential(compose_payment(0)?)?));
+		let opaque = router.dispatch::<Payment>(Arc::new(confidential_payment(0)?));
 		assert!(matches!(opaque, Err(RouterError::ConfidentialFrame)));
 		assert_eq!(*router.seen.lock().unwrap_or_else(|err| err.into_inner()), 0);
 		Ok(())
 	}
 
+	#[cfg(feature = "aead")]
 	#[test]
 	fn admit_refuses_a_confidential_body() -> Result<(), Box<dyn std::error::Error>> {
-		let frame = Arc::new(confidential(compose_payment(0)?)?);
+		let frame = Arc::new(confidential_payment(0)?);
 		assert!(matches!(
 			crate::router::CleartextFrame::admit(frame),
 			Err(RouterError::ConfidentialFrame)
@@ -314,17 +320,12 @@ mod tests {
 		Ok(())
 	}
 
+	#[cfg(feature = "aead")]
 	#[test]
 	fn dispatch_rejects_confidential_frame() -> Result<(), Box<dyn std::error::Error>> {
 		let (router, payment_rx, _health_rx) = build_router();
 
-		let mut frame = compose_payment(0)?;
-		frame.metadata.confidentiality = Some(EncryptedContentInfo {
-			content_type: DATA,
-			content_enc_alg: AlgorithmIdentifier { oid: DATA, parameters: None },
-			encrypted_content: Some(OctetString::new(vec![0; 16])?),
-		});
-
+		let frame = confidential_payment(0)?;
 		let result = router.dispatch::<Payment>(Arc::new(frame));
 		assert!(matches!(result, Err(RouterError::ConfidentialFrame)));
 		assert!(matches!(
@@ -334,18 +335,21 @@ mod tests {
 		Ok(())
 	}
 
+	#[cfg(feature = "zstd")]
 	#[test]
 	fn dispatch_rejects_compressed_frame() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::compress::ZstdCompression;
+
 		let (router, _payment_rx, _health_rx) = build_router();
-		let mut frame = compose_payment(0)?;
-		frame.metadata.compactness = Some(CompressedData {
-			version: CmsVersion::V0,
-			compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZSTD, parameters: None },
-			encap_content_info: EncapsulatedContentInfo {
-				econtent_type: DATA,
-				econtent: Some(crate::der::Any::from_der(&OctetString::new(vec![0; 8])?.to_der()?)?),
-			},
-		});
+		let frame = compose! {
+			V0: id: "p-compressed",
+				order: 1u64,
+				message: Payment {
+					from: "alice".into(),
+					amount: 0
+				},
+				compactness: ZstdCompression::default()
+		}?;
 
 		let result = router.dispatch::<Payment>(Arc::new(frame));
 		assert!(matches!(result, Err(RouterError::CompressedFrame)));

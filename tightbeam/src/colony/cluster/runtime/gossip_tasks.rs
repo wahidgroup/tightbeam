@@ -143,7 +143,7 @@ impl ClusterConfig {
 			advertised_types: types,
 		});
 
-		let frame = FrameBuilder::from(Version::V2)
+		let mut signed_frame = FrameBuilder::from(Version::V2)
 			.with_id(b"peer-advertise")
 			.with_order(current_timestamp_ms())
 			.with_message(request)
@@ -151,7 +151,9 @@ impl ClusterConfig {
 			.with_witness_hasher::<D>()
 			.build()?;
 
-		let signed_frame = frame.sign_with_provider::<D, _>(self.tls.identity().signing_provider()).await?;
+		signed_frame
+			.sign_with_provider::<D, _>(self.tls.identity().signing_provider())
+			.await?;
 		Ok(signed_frame)
 	}
 
@@ -172,7 +174,7 @@ impl ClusterConfig {
 
 		let minted_ms = current_timestamp_ms();
 		let body = GossipRumor::peer_advertisement(ad_bytes);
-		let rumor = FrameBuilder::from(Version::V2)
+		let mut rumor = FrameBuilder::from(Version::V2)
 			.with_id(b"peer-ad-rumor")
 			.with_order(minted_ms)
 			.with_message(body)
@@ -181,7 +183,7 @@ impl ClusterConfig {
 			.build()
 			.ok()?;
 
-		let rumor = rumor
+		rumor
 			.sign_with_provider::<D, _>(self.tls.identity().signing_provider())
 			.await
 			.ok()?;
@@ -295,7 +297,7 @@ where
 		// Splicing pre-encoded bytes would need an opaque passthrough field
 		// in the codec, a redesign that buys no correctness.
 		let request = ClusterRequest::Gossip(Box::new(rumor));
-		let frame = match FrameBuilder::from(Version::V2)
+		let mut signed_frame = match FrameBuilder::from(Version::V2)
 			.with_id(b"gossip-reflood")
 			.with_message(request)
 			.with_priority(MessagePriority::NetworkControl)
@@ -303,7 +305,7 @@ where
 			.with_witness_hasher::<D>()
 			.build()
 		{
-			Ok(frame) => frame,
+			Ok(signed_frame) => signed_frame,
 			Err(_unbuilt) => {
 				self.trace.event(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
 
@@ -311,17 +313,14 @@ where
 			}
 		};
 
-		let signed_frame = match frame
+		let signing = signed_frame
 			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await
-		{
-			Ok(signed) => signed,
-			Err(_unsigned) => {
-				self.trace.event(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
+			.await;
+		if signing.is_err() {
+			self.trace.event(CLUSTER_GOSSIP_REFLOOD_FAILED)?;
 
-				return Ok(());
-			}
-		};
+			return Ok(());
+		}
 
 		let mut fanout = tokio::task::JoinSet::new();
 		let mut unreached: u64 = 0;
@@ -373,7 +372,7 @@ where
 		let mut client = self.peer_pool.connect(peer_addr).await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
-		let decoded: PeerAdvertisementResponse = decode(&response.message)?;
+		let decoded: PeerAdvertisementResponse = decode(response.message())?;
 		Ok(decoded.status)
 	}
 
@@ -488,7 +487,7 @@ where
 		// Frame construction and signing are local. A fault here happened
 		// before the peer was asked anything, so the round is skipped rather
 		// than scored.
-		let Ok(frame) = FrameBuilder::from(Version::V2)
+		let Ok(mut signed_frame) = FrameBuilder::from(Version::V2)
 			.with_id(b"gossip-reconcile")
 			.with_order(now)
 			.with_message(request)
@@ -499,14 +498,14 @@ where
 			return Ok(());
 		};
 
-		let Ok(signed_frame) = frame
+		let signing = signed_frame
 			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
-			.await
-		else {
+			.await;
+		if signing.is_err() {
 			return Ok(());
-		};
+		}
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
-		let reply: GossipWant = decode(&response.message)?;
+		let reply: GossipWant = decode(response.message())?;
 
 		// An oversized want-list or PEX sample is abuse, so the round fails
 		// (CWE-770). The beat then scores the peer like any failed round, so an abuser
@@ -684,7 +683,7 @@ where
 		let missing = self.config.gossip.journal.fetch(wanted, now)?;
 		let admissible = missing
 			.into_iter()
-			.filter(|rumor| gossip_fresh(rumor.metadata.order, seen_ttl_ms, now));
+			.filter(|rumor| gossip_fresh(rumor.metadata().order(), seen_ttl_ms, now));
 
 		for rumor in admissible {
 			let Ok(pushed_digest) = rumor.gossip_digest::<D>() else {
@@ -692,7 +691,7 @@ where
 			};
 
 			let push = ClusterRequest::Gossip(Box::new(rumor));
-			let frame = FrameBuilder::from(Version::V2)
+			let mut signed = FrameBuilder::from(Version::V2)
 				.with_id(b"gossip-repair")
 				.with_message(push)
 				.with_priority(MessagePriority::NetworkControl)
@@ -700,14 +699,14 @@ where
 				.with_witness_hasher::<D>()
 				.build()?;
 
-			let signed = frame
+			signed
 				.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
 				.await?;
 			// Arm the grey-hole ledger only on an explicit Ok reply.
 			let Some(push_reply) = client.emit(signed, None).await? else {
 				continue;
 			};
-			let Ok(gossip_reply) = decode::<GossipResponse>(&push_reply.message) else {
+			let Ok(gossip_reply) = decode::<GossipResponse>(push_reply.message()) else {
 				continue;
 			};
 			if matches!(gossip_reply.status, TransitStatus::Ok) {
@@ -811,7 +810,7 @@ where
 		};
 
 		for rumor in pending {
-			let Ok(body) = decode::<GossipRumor>(&rumor.message) else {
+			let Ok(body) = decode::<GossipRumor>(rumor.message()) else {
 				continue;
 			};
 			let Ok(digest) = rumor.gossip_digest::<D>() else {
@@ -861,7 +860,7 @@ where
 		// Rate and journal keys use the verified origin signer, so a relay
 		// spends the origin's budget (CWE-770).
 		let attributed = origin.attributed(&frame, &rumor);
-		if attributed.nonrepudiation.is_none() {
+		if attributed.nonrepudiation().is_none() {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unauthenticated);
 		}
 		let Some(signer_id) = attributed.signer_id() else {
@@ -875,7 +874,7 @@ where
 		match self.config.gossip.journal.seen(&admitted.digest(), now) {
 			Ok(true) => {
 				self.trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
-				return reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok });
+				return reply_frame(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok });
 			}
 			Ok(false) => {}
 			Err(_) => {
@@ -909,7 +908,7 @@ where
 		match journaled {
 			Ok(Admission::Duplicate) => {
 				self.trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
-				return reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok });
+				return reply_frame(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok });
 			}
 			Ok(Admission::New) => {}
 			Err(_) => {
@@ -958,7 +957,7 @@ where
 			});
 		}
 
-		reply_frame(&frame.metadata.id, GossipResponse { status: TransitStatus::Ok })
+		reply_frame(frame.metadata().id(), GossipResponse { status: TransitStatus::Ok })
 	}
 
 	/// Verify, admit, and reconcile one advertisement rumor.
@@ -1009,11 +1008,11 @@ where
 		// The rumor path applies the same bound here, so every admitted order
 		// falls inside the withdrawal tombstone's window (CWE-294) and inside
 		// the ledger's prunable range (CWE-770).
-		if !self.config.ad_order_fresh(inner.metadata.order, current_timestamp_ms()) {
+		if !self.config.ad_order_fresh(inner.metadata().order(), current_timestamp_ms()) {
 			return Ok(None);
 		}
 
-		let Ok(ClusterRequest::AdvertisePeer(advertisement)) = decode::<ClusterRequest>(&inner.message) else {
+		let Ok(ClusterRequest::AdvertisePeer(advertisement)) = decode::<ClusterRequest>(inner.message()) else {
 			return Ok(None);
 		};
 		let Ok(admitted) = AdmittedPeerAd::admit(&inner, &advertisement, &self.config) else {
