@@ -184,7 +184,7 @@ impl AdmittedPeerAd {
 		let dial = Arc::clone(&dial_addr);
 		let slate = conf.pheromone.peer_slate(&peer_hive_id, dial, &ad.advertised_types);
 
-		Ok(Self { peer_hive_id, dial_addr, slate, order: frame.metadata.order })
+		Ok(Self { peer_hive_id, dial_addr, slate, order: frame.metadata().order() })
 	}
 
 	/// Relay trails through `relay_id`, the gateway that relayed this
@@ -312,7 +312,7 @@ fn peer_advertisement_wire_ok(
 #[must_use]
 pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Frame) -> Option<&'t Certificate> {
 	let trust = trust?;
-	let signer_info = frame.nonrepudiation.as_ref()?;
+	let signer_info = frame.nonrepudiation()?;
 
 	trust.find_by_signer_info(signer_info)
 }

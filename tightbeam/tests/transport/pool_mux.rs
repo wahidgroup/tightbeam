@@ -349,7 +349,7 @@ tb_scenario! {
 			trace.event_with(
 				POOLED_STREAM_RESPONSE_REPORTS_LENGTH,
 				&[],
-				reply.map(|frame| frame.message.to_owned()) == Some(mux_frame("8").message.to_owned()),
+				reply.map(|frame| frame.message().to_owned()) == Some(mux_frame("8").message().to_owned()),
 			)?;
 			Ok(())
 		}
@@ -450,8 +450,8 @@ tb_scenario! {
 				POOLED_MIXED_KINDS_SHARE_ONE_CONNECTION,
 				&[],
 				unary_reply? == Some(unary_frame)
-					&& stream_reply?.map(|frame| frame.message.to_owned())
-						== Some(mux_frame("8").message.to_owned())
+					&& stream_reply?.map(|frame| frame.message().to_owned())
+						== Some(mux_frame("8").message().to_owned())
 					&& echoed.as_deref() == Some(b"ping".as_ref())
 					&& terminal.is_none(),
 			)?;
@@ -502,7 +502,7 @@ tb_scenario! {
 			let (sink, response) = lease.open_stream()?;
 			sink.close_with(b"abcd").await?;
 
-			let served = response.await?.map(|frame| frame.message.to_owned()) == Some(mux_frame("4").message.to_owned());
+			let served = response.await?.map(|frame| frame.message().to_owned()) == Some(mux_frame("4").message().to_owned());
 			trace.event_with(
 				UNSERVED_KIND_ANSWERS_UNIMPLEMENTED,
 				&[],

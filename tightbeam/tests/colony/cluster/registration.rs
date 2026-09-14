@@ -143,7 +143,7 @@ tb_scenario! {
 				.build()?;
 
 			let response_frame = emit_frame(&mut client, unsigned).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			let response: RegisterHiveResponse = decode(response_frame.message())?;
 			record_register_response(&trace, &response, &cluster)?;
 
 			cluster.stop();
@@ -253,7 +253,7 @@ tb_scenario! {
 			trace.event(REGISTRATION_SENT)?;
 
 			let response_frame = emit_frame(&mut client, signed).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			let response: RegisterHiveResponse = decode(response_frame.message())?;
 			record_register_response(&trace, &response, &cluster)?;
 
 			cluster.stop();
@@ -329,7 +329,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, refused_reg).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			// A clean registration lands, then a mismatched add must refuse.
 			let ok_reg = signed_control_frame(
@@ -340,7 +340,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, ok_reg).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			let bad_add = servlet_address_update(
 				hive_addr,
@@ -350,7 +350,7 @@ tb_scenario! {
 
 			let refused_update = signed_control_frame(&certs, b"misalign-update", bad_add).await?;
 			let response_frame = emit_frame(&mut client, refused_update).await?;
-			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
 
 			cluster.stop();
 
@@ -423,11 +423,11 @@ tb_scenario! {
 			let replayed = fresh.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			// A byte-identical resend carries an already-seen signature.
 			let response_frame = emit_frame(&mut client, replayed).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			// The signature is valid but the order lies outside the
 			// freshness window.
@@ -441,7 +441,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, stale).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			// The same enforcement applies to servlet address updates.
 			let update = servlet_address_update(
@@ -453,10 +453,10 @@ tb_scenario! {
 			let replayed_update = fresh_update.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh_update).await?;
-			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
 
 			let response_frame = emit_frame(&mut client, replayed_update).await?;
-			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
 
 			cluster.stop();
 
@@ -566,7 +566,7 @@ tb_scenario! {
 
 			let mut client = connect_cluster(certs, cluster_addr).await?;
 			let response_frame = emit_frame(&mut client, registration).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			let response: RegisterHiveResponse = decode(response_frame.message())?;
 			record_register_response(&trace, &response, &cluster)?;
 
 			// Heartbeats run every 100ms with max_failures = 1, so the

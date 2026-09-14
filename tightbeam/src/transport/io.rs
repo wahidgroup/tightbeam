@@ -240,13 +240,14 @@ where
 	Ok(Some(MuxRekeyContext { driver, receipt: stored }))
 }
 
-/// Decode a `TransportEnvelope` from DER bytes with version validation.
+/// Decode a `TransportEnvelope` from DER bytes.
 ///
 /// Single decode path shared by `MessageIO::decode_envelope` and the split
-/// transport halves.
+/// transport halves. The frame decoder rejects a frame that carries a field its
+/// version forbids.
 pub(crate) fn decode_transport_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
 	let envelope = TransportEnvelope::from_der(buffer)?;
-	envelope.ensure_compatible_versions()
+	Ok(envelope)
 }
 
 /// Receive side of a split envelope link.
@@ -317,7 +318,7 @@ pub trait EnvelopeSink: MaybeSend {
 ///
 /// The read/write futures carry an explicit send bound so generic serving
 /// code (accept loops, single-flight serving) can hold them across task
-/// spawns; on wasm targets the bound is vacuous.
+/// spawns. On wasm targets the bound is vacuous.
 pub trait MessageIO {
 	/// Read raw DER-encoded bytes from the transport
 	fn read_envelope_bytes(&mut self) -> impl Future<Output = TransportResult<Vec<u8>>> + MaybeSend;
@@ -518,8 +519,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		};
 
 		match outcome {
-			// Multi-round server handshakes report Ok per round; only the
-			// completed state marks the session as established.
+			// Multi-round server handshakes report Ok per round.
+			// Only the completed state marks the session as established.
 			Ok(()) => {
 				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
 					return;
@@ -1270,39 +1271,6 @@ pub trait EncryptedMessageIO: MessageIO {
 }
 
 impl TransportEnvelope {
-	/// Whether every frame this envelope carries satisfies the same
-	/// version and metadata compatibility the builder enforces at
-	/// construction.
-	///
-	/// Mux payloads are chunked frame DER, so only the mux router can
-	/// validate their versions, after reassembly.
-	pub(crate) fn versions_compatible(&self) -> bool {
-		match self {
-			TransportEnvelope::Request(pkg) => pkg.message.validate_version_compatibility(),
-			TransportEnvelope::Response(pkg) => {
-				pkg.message.as_ref().is_none_or(|frame| frame.validate_version_compatibility())
-			}
-			#[cfg(feature = "x509")]
-			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => true,
-			#[cfg(feature = "transport-multiplex")]
-			TransportEnvelope::Mux(_) => true,
-		}
-	}
-
-	/// Reject an inbound envelope whose frames fail version validation.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::InvalidMessage`] -- a carried frame names
-	///   metadata its version does not admit.
-	pub(crate) fn ensure_compatible_versions(self) -> TransportResult<Self> {
-		if !self.versions_compatible() {
-			return Err(TransportError::InvalidMessage);
-		}
-
-		Ok(self)
-	}
-
 	/// The application request frame inside a single-flight envelope.
 	///
 	/// # Errors
@@ -1324,8 +1292,8 @@ impl TransportEnvelope {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::{MessagePriority, Metadata};
 	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::testing::TestFrame;
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::transport::handshake::EstablishedSession;
 	use crate::transport::state::{EncryptionConfig, SessionState};
@@ -1337,13 +1305,6 @@ mod tests {
 	use crate::transport::handshake::HandshakeInstant;
 	#[cfg(feature = "aead")]
 	use crate::transport::TransportLimits;
-
-	fn frame_with_priority(version: Version) -> Frame {
-		let mut metadata = Metadata::default();
-		metadata.priority = Some(MessagePriority::Standard);
-
-		Frame { version, metadata, message: Vec::new(), integrity: None, nonrepudiation: None }
-	}
 
 	/// Minimal `MessageIO` probe so ingress goes through `decode_envelope`.
 	struct DecodeProbe;
@@ -1451,46 +1412,34 @@ mod tests {
 		}
 	}
 
-	/// (label, envelope, must be version-compatible)
-	fn version_envelope_cases() -> Vec<(&'static str, TransportEnvelope, bool)> {
-		vec![
+	/// (label, envelope bytes, whether ingress accepts them)
+	fn version_envelope_cases() -> crate::error::Result<Vec<(&'static str, Vec<u8>, bool)>> {
+		let frame = TestFrame::prioritized();
+		let request = TransportEnvelope::Request(RequestPackage::new(frame.clone()));
+		let response = TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Ok, Some(frame.clone())));
+		let empty_response = TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Ok, None));
+
+		Ok(vec![
 			(
 				"request V0+priority",
-				TransportEnvelope::Request(RequestPackage::new(frame_with_priority(Version::V0))),
+				TestFrame::forge_version(&request, &frame, Version::V0),
 				false,
 			),
-			(
-				"request V2+priority",
-				TransportEnvelope::Request(RequestPackage::new(frame_with_priority(Version::V2))),
-				true,
-			),
+			("request V2+priority", crate::encode(&request)?, true),
 			(
 				"response V0+priority",
-				TransportEnvelope::Response(ResponsePackage::new(
-					TransitStatus::Ok,
-					Some(frame_with_priority(Version::V0)),
-				)),
+				TestFrame::forge_version(&response, &frame, Version::V0),
 				false,
 			),
-			(
-				"response without frame",
-				TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Ok, None)),
-				true,
-			),
-		]
+			("response without frame", crate::encode(&empty_response)?, true),
+		])
 	}
 
 	#[test]
-	fn envelope_version_compatibility_and_decode_ingress() -> crate::error::Result<()> {
-		for (_label, envelope, compatible) in version_envelope_cases() {
-			assert_eq!(envelope.versions_compatible(), compatible);
-
-			let bytes = crate::encode(&envelope)?;
+	fn decode_ingress_refuses_a_field_the_frame_version_forbids() -> crate::error::Result<()> {
+		for (label, bytes, accepted) in version_envelope_cases()? {
 			let decoded = <DecodeProbe as MessageIO>::decode_envelope(&bytes);
-			assert_eq!(decoded.is_ok(), compatible);
-			if !compatible {
-				assert!(matches!(decoded, Err(TransportError::InvalidMessage)));
-			}
+			assert_eq!(decoded.is_ok(), accepted, "{label}");
 		}
 		Ok(())
 	}

@@ -33,11 +33,11 @@ impl GatewayReplayGuard {
 	/// 3. Insert the signature in the ledger, refusing a duplicate.
 	pub(crate) fn admits(&self, frame: &Frame) -> TransitStatus {
 		let now = current_timestamp_ms();
-		if !self.0.is_fresh(frame.metadata.order, now) {
+		if !self.0.is_fresh(frame.metadata().order(), now) {
 			return TransitStatus::PermissionDenied;
 		}
 
-		let Some(signer_info) = frame.nonrepudiation.as_ref() else {
+		let Some(signer_info) = frame.nonrepudiation() else {
 			return TransitStatus::Unauthenticated;
 		};
 		let Some(signer_id) = frame.signer_id() else {
@@ -55,7 +55,7 @@ impl GatewayReplayGuard {
 	/// A gateway that refuses after admission would otherwise consume the
 	/// peer's one chance to send that frame (CWE-645).
 	pub(crate) fn release(&self, frame: &Frame) {
-		if let Some(signer_info) = frame.nonrepudiation.as_ref() {
+		if let Some(signer_info) = frame.nonrepudiation() {
 			self.0.forget(signer_info.signature.as_bytes());
 		}
 	}

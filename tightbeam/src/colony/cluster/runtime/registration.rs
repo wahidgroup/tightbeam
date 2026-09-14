@@ -61,7 +61,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 				self.trace.event_with(CLUSTER_HIVE_REGISTERED, &[], hive_count)?;
 
 				let response = RegisterHiveResponse { status: TransitStatus::Ok, hive_id: Some(hive_identity) };
-				reply_frame(&frame.metadata.id, response)
+				reply_frame(frame.metadata().id(), response)
 			}
 			Err(_) => {
 				// Forget replay so a legitimate retry of the same signed frame can proceed.
@@ -95,7 +95,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 				self.trace.event(CLUSTER_UPDATE_ACCEPTED)?;
 
 				let response = ServletAddressUpdateResponse { status: TransitStatus::Ok };
-				reply_frame(&frame.metadata.id, response)
+				reply_frame(frame.metadata().id(), response)
 			}
 			Err(_) => {
 				// Forget replay so the hive can resend the same signed update.
@@ -124,7 +124,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		self.trace.event(CLUSTER_REGISTER_REFUSED)?;
 
 		let response = RegisterHiveResponse { status, hive_id: None };
-		reply_frame(&frame.metadata.id, response)
+		reply_frame(frame.metadata().id(), response)
 	}
 
 	/// Refuse a registration and return the replay slot the frame spent, so
@@ -139,7 +139,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		self.trace.event(CLUSTER_UPDATE_REFUSED)?;
 
 		let response = ServletAddressUpdateResponse { status };
-		reply_frame(&frame.metadata.id, response)
+		reply_frame(frame.metadata().id(), response)
 	}
 
 	/// Refuse an address update and return the replay slot the frame spent,

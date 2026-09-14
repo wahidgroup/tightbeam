@@ -749,7 +749,7 @@ where
 
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 		match wire_envelope {
-			WireEnvelope::Cleartext(envelope) => envelope.ensure_compatible_versions(),
+			WireEnvelope::Cleartext(envelope) => Ok(envelope),
 			WireEnvelope::Encrypted(_) => Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed)),
 		}
 	}

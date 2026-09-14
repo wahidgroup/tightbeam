@@ -282,38 +282,28 @@ Which optional fields a version MAY emit is stated in [§5.6](#56-version-specif
 
 `Metadata` holds identity, order, and optional control fields. Version gates for each field are in [§5.6](#56-version-specific-constraints).
 
+The fields are private. Each field has a read accessor of the same name, such as `metadata.id()` and `metadata.priority()`. The ASN.1 tags are in [§5.3](#metadata-structure).
+
 ```rust
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Metadata {
 	// Core fields (V0+)
-	pub id: Vec<u8>,
-	pub order: u64,
-	#[asn1(optional = "true")]
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub compactness: Option<CompressedData>,
+	id: Vec<u8>,
+	order: u64,
+	compactness: Option<CompressedData>,
 
 	// V1+ fields
-	#[asn1(context_specific = "0", optional = "true")]
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub integrity: Option<DigestInfo>,
-	#[asn1(context_specific = "1", optional = "true")]
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub confidentiality: Option<EncryptedContentInfo>,
+	integrity: Option<DigestInfo>,
+	confidentiality: Option<EncryptedContentInfo>,
 
 	// V2+ fields
-	#[asn1(context_specific = "2", optional = "true")]
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub priority: Option<MessagePriority>,
-	#[asn1(context_specific = "3", optional = "true")]
-	pub lifetime: Option<u64>,
-	#[asn1(context_specific = "4", optional = "true")]
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub previous_frame: Option<DigestInfo>,
+	priority: Option<MessagePriority>,
+	lifetime: Option<u64>,
+	previous_frame: Option<DigestInfo>,
 
 	// V3+ fields
-	#[asn1(context_specific = "5", optional = "true")]
-	pub matrix: Option<Asn1Matrix>,
+	matrix: Option<MatrixDyn>,
 }
 ```
 
@@ -323,20 +313,17 @@ pub struct Metadata {
 
 `Frame` is the top-level envelope. It carries `version`, `metadata`, `message`, and optional FI and Nonrepudiation fields.
 
+The fields are private, and each has a read accessor of the same name. A `Frame` enters memory only through `FrameBuilder` or the DER decoder. Both reject a field that the Frame version forbids ([§5.6](#56-version-specific-constraints)), so no in-memory Frame carries one. The methods that change a Frame in place, such as `attach_signer_info` and `encrypt_with_provider`, apply the same rule.
+
 ```rust
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Frame {
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub version: Version,
-	pub metadata: Metadata,
-	pub message: Vec<u8>,
-	#[asn1(context_specific = "0", optional = "true")]
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub integrity: Option<DigestInfo>,
-	#[asn1(context_specific = "1", optional = "true")]
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub nonrepudiation: Option<SignerInfo>,
+	version: Version,
+	metadata: Metadata,
+	message: Vec<u8>,
+	integrity: Option<DigestInfo>,
+	nonrepudiation: Option<SignerInfo>,
 }
 ```
 
@@ -1425,7 +1412,7 @@ impl GatePolicy for IdPatternGate {
 		let Some(frame) = frame else {
 			return TransitStatus::PermissionDenied;
 		};
-		if frame.metadata.id.starts_with(b"api-") {
+		if frame.metadata().id().starts_with(b"api-") {
 			TransitStatus::Ok
 		} else {
 			TransitStatus::PermissionDenied
@@ -1496,7 +1483,7 @@ tightbeam::policy! {
 		let Some(frame) = frame else {
 			return TransitStatus::PermissionDenied;
 		};
-		if frame.metadata.id.starts_with(b"api-") {
+		if frame.metadata().id().starts_with(b"api-") {
 			TransitStatus::Ok
 		} else {
 			TransitStatus::PermissionDenied
@@ -2587,7 +2574,7 @@ tightbeam::servlet! {
 		trace.event_with(REQUEST_RECEIVED, &[], config.service_name.clone())?;
 
 		// Handler receives Frame, not decoded message
-		let decoded = decode::<RequestMessage, _>(&frame.message)?;
+		let decoded = decode::<RequestMessage>(frame.message())?;
 		let decoded_arc = Arc::new(decoded);
 
 		// Workers are accessed via ctx.relay
@@ -2737,7 +2724,7 @@ tb_scenario! {
 
 			let response_frame = client.emit(request, None).await?
 				.ok_or(TightBeamError::MissingResponse)?;
-			let response: CalcResponse = decode(&response_frame.message)?;
+			let response: CalcResponse = decode(response_frame.message())?;
 
 			trace.event_with(RESULT_VERIFIED, &[], response.result)?;
 			Ok(())
@@ -3257,12 +3244,12 @@ The unary work plane is request-reply with end-to-end envelopes. The client's co
 use tightbeam::colony::SubmitWork;
 
 // Sign the end-to-end frame so the servlet can verify the sender.
-let unsigned = compose(Version::V2)
+let mut work = compose(Version::V2)
 	.with_id(b"calc-001")
 	.with_order(current_timestamp_ms())
 	.with_message(CalcRequest { value: 42 })
 	.build()?;
-let work = unsigned.sign_with_provider::<Sha3_256, _>(&provider).await?;
+work.sign_with_provider::<Sha3_256, _>(&provider).await?;
 
 // One method call on a connected client: wraps the work frame in the
 // hop-local transport envelope and resolves the gateway's reply down
@@ -5069,7 +5056,7 @@ tb_scenario! {
 
 			// Decode response and emit value assertion
 			if let Some(resp_frame) = response {
-				let decoded: TestMessage = crate::decode(&resp_frame.message)?;
+				let decoded: TestMessage = crate::decode(resp_frame.message())?;
 				trace.event_with(MESSAGE_CONTENT, &[], decoded.content)?;
 			}
 

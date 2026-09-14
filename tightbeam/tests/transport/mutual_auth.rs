@@ -137,7 +137,7 @@ servlet! {
 		};
 
 		let response_frame = compose! {
-			V0: id: &frame.metadata.id,
+			V0: id: frame.metadata().id(),
 			message: response
 		}?;
 
@@ -204,7 +204,7 @@ tb_scenario! {
 			trace.event_with(RESPONSE_RECEIVED, &[], Presence::of_option(&response_frame))?;
 
 			let response_frame = response_frame.ok_or(TightBeamError::MissingResponse)?;
-			let response: AuthResponse = decode(&response_frame.message)?;
+			let response: AuthResponse = decode(response_frame.message())?;
 
 			trace.event_with(SERVER_ID, &[], response.server_id)?;
 			trace.event_with(AUTHENTICATED, &[], response.authenticated)?;

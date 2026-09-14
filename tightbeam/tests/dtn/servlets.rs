@@ -67,7 +67,7 @@ trait DtnNode {
 
 	/// Default trait methods (reusable across all nodes)
 	fn verify_signature(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		if frame.nonrepudiation.is_none() {
+		if frame.nonrepudiation().is_none() {
 			return Ok(false);
 		}
 
@@ -82,9 +82,9 @@ trait DtnNode {
 
 	/// Helper: Decrypt relay message
 	fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
-		if frame.metadata.confidentiality.is_some() {
+		if frame.metadata().confidentiality().is_some() {
 			let zstd = ZstdCompression::default();
-			let inflator: Option<&dyn Inflator> = if frame.metadata.compactness.is_some() {
+			let inflator: Option<&dyn Inflator> = if frame.metadata().compactness().is_some() {
 				Some(&zstd)
 			} else {
 				None
@@ -92,7 +92,7 @@ trait DtnNode {
 
 			frame.decrypt::<RelayMessage>(self.cipher(), inflator)
 		} else {
-			decode(&frame.message)
+			decode(frame.message())
 		}
 	}
 
@@ -180,7 +180,7 @@ servlet! {
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &MissionControlServletConfig = ctx.env_config()?;
-		let frame_order = frame.metadata.order;
+		let frame_order = frame.metadata().order();
 
 		// Verify signature using trait method
 		if !config.verify_signature(&frame)? {
@@ -344,7 +344,7 @@ servlet! {
 		let trace = ctx.trace();
 		let config: &EarthRelaySatelliteServletConfig = ctx.env_config()?;
 		// Verify signature and determine source
-		let from_mission_control = if frame.nonrepudiation.is_some() {
+		let from_mission_control = if frame.nonrepudiation().is_some() {
 			if frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_ok() {
 				true
 			} else if frame.verify::<Secp256k1Signature, Sha3_256>(&config.rover_verifying_key).is_ok() {
@@ -357,7 +357,7 @@ servlet! {
 		};
 
 		// Get frame order before processing
-		let frame_order = frame.metadata.order;
+		let frame_order = frame.metadata().order();
 		// Process frame through Earth Relay's chain
 		let process_result = match config.chain_processor.process_incoming(&frame) {
 			Ok(result) => {
@@ -455,7 +455,7 @@ servlet! {
 								return Ok(Some(stateless_ack));
 							} else {
 								// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
-								let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
+								let is_telemetry = frame.metadata().id().starts_with(b"relay-telem");
 								if is_telemetry {
 									trace.event(EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS)?;
 									trace.event(EARTH_RELAY_FORWARD_TELEMETRY_TO_MC)?;
@@ -558,7 +558,7 @@ servlet! {
 		let config: &MarsRelaySatelliteServletConfig = ctx.env_config()?;
 		// Verify signature and determine source
 		// Earth Relay forwards messages, so could be from Mission Control or Rover
-		let from_rover = if frame.nonrepudiation.is_some() {
+		let from_rover = if frame.nonrepudiation().is_some() {
 			if frame.verify::<Secp256k1Signature, Sha3_256>(&config.rover_verifying_key).is_ok() {
 				true
 			} else if frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_ok() {
@@ -571,7 +571,7 @@ servlet! {
 		};
 
 		// Get frame order before processing
-		let frame_order = frame.metadata.order;
+		let frame_order = frame.metadata().order();
 		// Process frame through Mars Relay's chain
 		match config.chain_processor.process_incoming(&frame)? {
 			ProcessResult::Processed(ordered_frames) => {
@@ -652,7 +652,7 @@ servlet! {
 
 				if from_rover {
 					// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
-					let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
+					let is_telemetry = frame.metadata().id().starts_with(b"relay-telem");
 					if is_telemetry {
 						trace.event(MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER)?;
 						trace.event(MARS_RELAY_FORWARD_TELEMETRY_TO_EARTH)?;
@@ -783,7 +783,7 @@ servlet! {
 		let trace = ctx.trace();
 		let config: &RoverServletConfig = ctx.env_config()?;
 		// Verify signature
-		if frame.nonrepudiation.is_some()
+		if frame.nonrepudiation().is_some()
 			&& frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_err()
 			&& frame.verify::<Secp256k1Signature, Sha3_256>(&config.mars_relay_verifying_key).is_err()
 		{
@@ -791,7 +791,7 @@ servlet! {
 		}
 
 		// Get command order before consuming frame
-		let command_order = frame.metadata.order;
+		let command_order = frame.metadata().order();
 		// Process frame through Rover's chain
 		match config.chain_processor.process_incoming(&frame)? {
 			ProcessResult::Processed(_) => {

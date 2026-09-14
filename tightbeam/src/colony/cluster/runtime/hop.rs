@@ -5,7 +5,6 @@
 //! chosen once at construction rather than re-paired at each call.
 
 use core::hash::Hash;
-use core::mem;
 use core::str::{self, FromStr};
 use std::sync::Arc;
 
@@ -17,7 +16,7 @@ use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol, X509ClientConfig};
-use crate::{encode, Frame, Metadata, Version};
+use crate::{encode, Frame};
 
 /// A pool and the address to dial on it.
 pub(crate) struct Hop<'p, P: Protocol> {
@@ -73,12 +72,9 @@ where
 	///
 	/// [`ClusterRequest::Work`]: crate::colony::common::ClusterRequest::Work
 	pub(crate) async fn deliver_envelope(self, message: Vec<u8>) -> Result<Vec<u8>, ClusterError> {
-		let mut metadata = Metadata::default();
-		metadata.id = b"work-forward".to_vec();
-
-		let frame = Frame { version: Version::V0, metadata, message, integrity: None, nonrepudiation: None };
-		let mut response = self.emit(frame).await?;
-		Ok(mem::take(&mut response.message))
+		let frame = Frame::v0(b"work-forward", message);
+		let response = self.emit(frame).await?;
+		Ok(response.into_message())
 	}
 
 	/// Parses the stored socket and opens a pooled connection to it.

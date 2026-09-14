@@ -327,7 +327,7 @@ mod tests {
 
 	/// A control frame signed by `key` under the canonical convention.
 	fn signed_control_frame(key: &Secp256k1SigningKey) -> Frame {
-		let frame = FrameBuilder::from(Version::V1)
+		let mut frame = FrameBuilder::from(Version::V1)
 			.with_id("verify-origin")
 			.with_order(1)
 			.with_message(TestMessage::sample(None))
@@ -342,7 +342,8 @@ mod tests {
 
 		frame
 			.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)
-			.expect("test signature attaches")
+			.expect("test signature attaches");
+		frame
 	}
 
 	#[test]

@@ -214,7 +214,7 @@ pub enum TrustVerification {
 /// [`ClusterSecurityGate`] (hive side) and the cluster gateway's
 /// registration authentication.
 pub fn verify_frame_signature(trust_store: &dyn CertificateTrust, frame: &Frame) -> TrustVerification {
-	let Some(signer_info) = frame.nonrepudiation.as_ref() else {
+	let Some(signer_info) = frame.nonrepudiation() else {
 		return TrustVerification::MissingSignature;
 	};
 
@@ -460,11 +460,11 @@ impl GatePolicy for ClusterSecurityGate {
 			return TransitStatus::Unauthenticated;
 		};
 
-		let Some(signer_info) = frame.nonrepudiation.as_ref() else {
+		let Some(signer_info) = frame.nonrepudiation() else {
 			return TransitStatus::Unauthenticated;
 		};
 
-		if frame.integrity.is_none() {
+		if frame.integrity().is_none() {
 			return TransitStatus::Unauthenticated;
 		}
 
@@ -503,12 +503,12 @@ impl GatePolicy for ClusterSecurityGate {
 
 		// Decode before freshness so replay capacity spends on well-formed
 		// frames (CWE-770).
-		let Ok(_command) = crate::decode::<ClusterCommand>(&frame.message) else {
+		let Ok(_command) = crate::decode::<ClusterCommand>(frame.message()) else {
 			return TransitStatus::PermissionDenied;
 		};
 
 		let now = current_timestamp_ms();
-		if !self.replay_guard.is_fresh(frame.metadata.order, now) {
+		if !self.replay_guard.is_fresh(frame.metadata().order(), now) {
 			return TransitStatus::PermissionDenied;
 		}
 
@@ -914,16 +914,14 @@ mod tests {
 		let certificate = crate::testing::fixtures::TestCertificate::self_signed(&signing_key);
 		let provider = crate::crypto::key::EcdsaKeyProvider::from(signing_key.clone());
 
-		let unsigned = crate::Version::V2
+		let mut signed = crate::Version::V2
 			.compose()
 			.with_id(b"control")
 			.with_order(current_timestamp_ms())
 			.with_message(crate::testing::TestMessage { content: "payload".into() })
 			.with_witness_hasher::<crate::crypto::hash::Sha3_256>()
 			.build()?;
-		let signed = unsigned
-			.sign_with_provider::<crate::crypto::hash::Sha3_256, _>(&provider)
-			.await?;
+		signed.sign_with_provider::<crate::crypto::hash::Sha3_256, _>(&provider).await?;
 
 		let signer_id = signed.signer_id().expect("the signed frame carries a signer id");
 		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 60_000));

@@ -75,7 +75,7 @@ servlet! {
 
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
-				V2: id: &frame.metadata.id,
+				V2: id: frame.metadata().id(),
 					message: cached
 			}?));
 		}
@@ -106,7 +106,7 @@ servlet! {
 		trace.event_with(AUTHORIZATION_APPROVED, &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
-			V2: id: &frame.metadata.id,
+			V2: id: frame.metadata().id(),
 				message: response
 		}?))
 	}
@@ -121,13 +121,13 @@ servlet! {
 
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
-				V2: id: &frame.metadata.id,
+				V2: id: frame.metadata().id(),
 					message: cached
 			}?));
 		}
 
 		// previous_frame should link back to the authorization frame.
-		if frame.metadata.previous_frame.is_some() {
+		if frame.metadata().previous_frame().is_some() {
 			trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
 		} else {
 			trace.event_with(CHAIN_BROKEN, &[PAYMENT_TAG], true)?;
@@ -147,7 +147,7 @@ servlet! {
 		trace.event_with(CAPTURE_COMPLETED, &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
-			V2: id: &frame.metadata.id,
+			V2: id: frame.metadata().id(),
 				message: response
 		}?))
 	}
@@ -177,7 +177,7 @@ servlet! {
 				};
 				trace.event_with(KEYMANAGER_PUBKEY_SERVED, &[PAYMENT_TAG], true)?;
 				Ok(Some(compose! {
-					V2: id: &frame.metadata.id,
+					V2: id: frame.metadata().id(),
 						message: response
 				}?))
 			}
@@ -188,7 +188,7 @@ servlet! {
 				let response = DecryptResponse { plaintext };
 				trace.event_with(KEYMANAGER_DECRYPT_SUCCESS, &[PAYMENT_TAG], true)?;
 				Ok(Some(compose! {
-					V2: id: &frame.metadata.id,
+					V2: id: frame.metadata().id(),
 						message: response
 				}?))
 			}

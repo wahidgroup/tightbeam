@@ -87,7 +87,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		status: TransitStatus,
 	) -> Result<Option<Frame>, TightBeamError> {
 		self.servlet_registry.work_trail_weaken(route_key, &self.config, &self.trace)?;
-		reply_frame(&frame.metadata.id, ClusterWorkResponse::err(status))
+		reply_frame(frame.metadata().id(), ClusterWorkResponse::err(status))
 	}
 }
 
@@ -161,7 +161,7 @@ where
 			ForwardOutcome::Local(response_payload) => {
 				self.servlet_registry
 					.work_trail_ok(&choice.route_key, &self.config, &self.trace)?;
-				reply_frame(&frame.metadata.id, ClusterWorkResponse::ok(response_payload))
+				reply_frame(frame.metadata().id(), ClusterWorkResponse::ok(response_payload))
 			}
 			ForwardOutcome::Peer(peer_response) => {
 				// Relay the peer's own envelope so the client sees one
@@ -176,7 +176,7 @@ where
 						.work_trail_weaken(&choice.route_key, &self.config, &self.trace)?;
 				}
 
-				reply_frame(&frame.metadata.id, peer_response)
+				reply_frame(frame.metadata().id(), peer_response)
 			}
 			ForwardOutcome::PeerGarbled => self.work_trail_fail(&choice.route_key, frame, TransitStatus::Unavailable),
 		}
@@ -198,7 +198,7 @@ where
 		// before the registry is consulted.
 		if !self.config.namespace.is_bare_servlet_type(&request.servlet_type) {
 			self.trace.event(CLUSTER_WORK_REFUSED)?;
-			return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::PermissionDenied));
+			return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::PermissionDenied));
 		}
 
 		// The payload must decode as the client's end-to-end frame. Bytes
@@ -211,7 +211,7 @@ where
 			Ok(client_frame) => client_frame,
 			Err(_) => {
 				self.trace.event(CLUSTER_WORK_REFUSED)?;
-				return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::InvalidArgument));
+				return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::InvalidArgument));
 			}
 		};
 
@@ -237,7 +237,7 @@ where
 					if excluded.is_none() {
 						self.trace.event(CLUSTER_WORK_UNAVAILABLE)?;
 					}
-					return reply_frame(&frame.metadata.id, ClusterWorkResponse::err(TransitStatus::Unavailable));
+					return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::Unavailable));
 				}
 			};
 

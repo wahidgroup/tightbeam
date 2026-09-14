@@ -485,10 +485,11 @@ pub type DuplexOpenFuture<'a> =
 /// # impl HiveContext for EchoSibling {
 /// #     fn call<'a>(&'a self, _servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a> {
 /// #         Box::pin(async move {
-/// #             let echoed: TestMessage = decode(&frame.message)?;
-/// #             let unsigned = FrameBuilder::from(Version::V0).with_id(b"km-reply").with_message(echoed).build()?;
+/// #             let echoed: TestMessage = decode(frame.message())?;
+/// #             let mut reply = FrameBuilder::from(Version::V1).with_id(b"km-reply").with_message(echoed).build()?;
 /// #             let provider = Secp256k1KeyProvider::from(TestKey::signing());
-/// #             unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+/// #             reply.sign_with_provider::<Sha3_256, _>(&provider).await?;
+/// #             Ok(reply)
 /// #         })
 /// #     }
 /// # }
@@ -501,17 +502,17 @@ pub type DuplexOpenFuture<'a> =
 /// # let sibling_key = TestKey::signing();
 /// let caller_provider = Secp256k1KeyProvider::from(TestKey::signing());
 ///
-/// let unsigned = FrameBuilder::from(Version::V0)
+/// let mut request = FrameBuilder::from(Version::V1)
 ///     .with_id(b"km-decrypt")
 ///     .with_message(TestMessage { content: "unwrap key 7".into() })
 ///     .build()?;
-/// let request = unsigned.sign_with_provider::<Sha3_256, _>(&caller_provider).await?;
+/// request.sign_with_provider::<Sha3_256, _>(&caller_provider).await?;
 ///
 /// let reply = ctx.call(&keymanager_urn, request).await?;
 ///
 /// // The reply is the sibling's complete envelope: verify, then decode.
 /// reply.verify::<Secp256k1Signature, Sha3_256>(sibling_key.verifying_key())?;
-/// let response: TestMessage = decode(&reply.message)?;
+/// let response: TestMessage = decode(reply.message())?;
 /// assert_eq!(response.content, "unwrap key 7");
 /// # Ok::<(), TightBeamError>(())
 /// # })

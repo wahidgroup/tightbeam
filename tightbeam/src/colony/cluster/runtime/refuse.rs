@@ -29,19 +29,19 @@ impl<'f> Refusal<'f> {
 	/// Answers a gossip rumor with `status`.
 	pub(crate) fn gossip(self, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
 		self.trace_gossip()?;
-		reply_frame(&self.frame.metadata.id, GossipResponse { status })
+		reply_frame(self.frame.metadata().id(), GossipResponse { status })
 	}
 
 	/// Answers a reconcile request with an empty want set.
 	pub(crate) fn reconcile(self) -> Result<Option<Frame>, TightBeamError> {
 		self.trace_gossip()?;
-		reply_frame(&self.frame.metadata.id, GossipWant { want: Vec::new(), pex: Vec::new() })
+		reply_frame(self.frame.metadata().id(), GossipWant { want: Vec::new(), pex: Vec::new() })
 	}
 
 	/// Answers a peer advertisement with `status`.
 	pub(crate) fn peer_ad(self, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
 		self.trace.event(CLUSTER_PEER_ADVERTISE_REFUSED)?;
-		reply_frame(&self.frame.metadata.id, PeerAdvertisementResponse { status })
+		reply_frame(self.frame.metadata().id(), PeerAdvertisementResponse { status })
 	}
 
 	/// Answers a peer advertisement and returns its freshness slot.

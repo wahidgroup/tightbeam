@@ -73,7 +73,7 @@ impl OutOfOrderBuffer {
 	/// - `Ok(None)` - Frame was buffered, waiting for missing frames
 	/// - `Err(_)` - Buffer full or invalid sequence
 	pub fn insert(&mut self, frame: Frame) -> Result<Option<Vec<Frame>>, TightBeamError> {
-		let order = frame.metadata.order;
+		let order = frame.metadata().order();
 
 		// Check if this is a duplicate
 		if order < self.next_expected {
@@ -255,8 +255,8 @@ mod tests {
 			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
 		};
 		assert_eq!(frames.len(), 2);
-		assert_eq!(frames[0].metadata.order, 2);
-		assert_eq!(frames[1].metadata.order, 3);
+		assert_eq!(frames[0].metadata().order(), 2);
+		assert_eq!(frames[1].metadata().order(), 3);
 		assert_eq!(buffer.next_expected(), 4);
 		assert_eq!(buffer.buffered_count(), 0);
 

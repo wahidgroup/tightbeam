@@ -37,7 +37,7 @@ mod tests {
 		relay!(RelayMessage { value: 7 }, tx)?;
 
 		let frame = rx.recv().map_err(|_| TightBeamError::ChannelClosed)?;
-		let decoded: RelayMessage = crate::decode(&frame.message)?;
+		let decoded: RelayMessage = crate::decode(frame.message())?;
 		assert_eq!(decoded, RelayMessage { value: 7 });
 
 		Ok(())

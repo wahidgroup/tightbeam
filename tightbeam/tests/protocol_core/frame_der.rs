@@ -136,8 +136,8 @@ tb_scenario! {
 
 			trace.event_with(DER_NONEMPTY, &[], !der_bytes.is_empty())?;
 			trace.event_with(ROUNDTRIP_OK, &[], decoded == frame)?;
-			trace.event_with(MATRIX_PRESENT, &[], frame.metadata.matrix.is_some())?;
-			trace.event_with(VERSION, &[], frame.version)?;
+			trace.event_with(MATRIX_PRESENT, &[], frame.metadata().matrix().is_some())?;
+			trace.event_with(VERSION, &[], frame.version())?;
 
 			Ok(())
 		}

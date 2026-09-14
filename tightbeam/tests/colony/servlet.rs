@@ -176,7 +176,7 @@ tb_scenario! {
 			}?;
 
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response: CalcResponse = decode(&response_frame.message)?;
+			let response: CalcResponse = decode(response_frame.message())?;
 
 			trace.event_with(VERIFY_DOUBLED, &[], response.doubled)?;
 			trace.event_with(VERIFY_SQUARED, &[], response.squared)?;
@@ -228,7 +228,7 @@ servlet! {
 		trace.event(SECURE_RECEIVE)?;
 		trace.event_with(SECURE_FRAME_CLEARTEXT,
 			&[],
-			u32::from(frame.metadata.confidentiality.is_none() && frame.metadata.compactness.is_none()),
+			u32::from(frame.metadata().confidentiality().is_none() && frame.metadata().compactness().is_none()),
 		)?;
 
 		let doubled = request.value * 2;
@@ -290,7 +290,7 @@ tb_scenario! {
 			}?;
 
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response: CalcResponse = decode(&response_frame.message)?;
+			let response: CalcResponse = decode(response_frame.message())?;
 
 			trace.event_with(VERIFY_SECURE_DOUBLED, &[], response.doubled)?;
 

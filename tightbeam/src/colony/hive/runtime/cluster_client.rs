@@ -59,13 +59,15 @@ async fn build_control_frame(
 
 	match hive_tls.as_ref() {
 		Some(hive_tls) => {
-			let unsigned = Version::V0
+			// A signature is a V1 field (§5.6), so a signed control frame is
+			// V1.
+			let mut signed = Version::V1
 				.compose()
 				.with_id(id)
 				.with_order(order)
 				.with_message(message)
 				.build()?;
-			let signed = unsigned
+			signed
 				.sign_with_provider::<Sha3_256, _>(hive_tls.identity().signing_provider())
 				.await?;
 			Ok(signed)
@@ -177,7 +179,7 @@ where
 
 		let frame = build_control_frame(b"hive-registration", request, hive_tls_for_frame).await?;
 		let response_frame = transport.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
-		decode::<RegisterHiveResponse>(&response_frame.message)
+		decode::<RegisterHiveResponse>(response_frame.message())
 	}
 
 	/// Re-announces the current slate to every registered gateway.
@@ -356,7 +358,7 @@ where
 		let mut transport = P::create_transport(stream).with_encryption(encryption.clone());
 		match transport.emit(frame.clone(), None).await {
 			Ok(Some(response)) => {
-				let decoded = decode::<ServletAddressUpdateResponse>(&response.message);
+				let decoded = decode::<ServletAddressUpdateResponse>(response.message());
 				if matches!(decoded, Ok(body) if body.status == TransitStatus::Ok) {
 					return true;
 				}

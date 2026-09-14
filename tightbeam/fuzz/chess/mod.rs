@@ -290,7 +290,7 @@ tb_scenario! {
 				};
 
 				// Decode response
-				let response: ChessMoveResponse = match decode(&response_frame.message) {
+				let response: ChessMoveResponse = match decode(response_frame.message()) {
 					Ok(r) => r,
 					Err(_) => {
 						trace.event(events::CLIENT_DECODE_ERROR)?;
@@ -301,7 +301,7 @@ tb_scenario! {
 
 				// Update client game state from response matrix if present
 				// Only update board, preserve client's own move tracking
-				if let Some(ref asn1_matrix) = response_frame.metadata.matrix {
+				if let Some(asn1_matrix) = response_frame.metadata().matrix() {
 					if client_game_state.update_board_from_matrix(asn1_matrix).is_err() {
 						// Invalid matrix format - ignore and continue
 					}

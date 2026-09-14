@@ -71,10 +71,10 @@ job! {
 	/// Transforms frame content by appending "_transformed".
 	name: TransformContent,
 	fn run((frame,): (Frame,)) -> Result<Frame, TightBeamError> {
-		let msg: TestMessage = tightbeam::decode(&frame.message)?;
+		let msg: TestMessage = tightbeam::decode(frame.message())?;
 
 		compose! {
-			V0: id: &frame.metadata.id,
+			V0: id: frame.metadata().id(),
 				message: TestMessage {
 					content: format!("{}_transformed", msg.content)
 				}

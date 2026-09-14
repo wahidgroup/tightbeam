@@ -496,8 +496,7 @@ mod tests {
 
 	#[test]
 	fn rejects_tampered_frame() {
-		let mut frame = TestFrame::with_integrity();
-		frame.metadata.id = b"tampered".to_vec();
+		let frame = TestFrame::tamper(&TestFrame::with_integrity(), b"fi-frame", b"tampered");
 
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
 		assert!(matches!(

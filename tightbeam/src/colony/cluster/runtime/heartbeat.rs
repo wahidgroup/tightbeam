@@ -76,7 +76,7 @@ where
 		// Priority is a V2+ metadata field. Composing it on V1 fails at
 		// build time and every heartbeat would count as a send failure.
 		// `metadata.order` is the command freshness binding (CWE-294).
-		let frame = FrameBuilder::from(Version::V2)
+		let mut signed_frame = FrameBuilder::from(Version::V2)
 			.with_id(b"heartbeat")
 			.with_order(current_timestamp_ms())
 			.with_message(cmd)
@@ -84,13 +84,13 @@ where
 			.with_witness_hasher::<D>()
 			.build()?;
 
-		let signed_frame = frame
+		signed_frame
 			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
 			.await?;
 		let mut client = self.pool.connect(addr).await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
-		let cmd_response: ClusterCommandResponse = decode(&response.message)?;
+		let cmd_response: ClusterCommandResponse = decode(response.message())?;
 		cmd_response.heartbeat.ok_or(ClusterError::MalformedResponse)
 	}
 }
