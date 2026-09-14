@@ -235,7 +235,8 @@ impl AssertSpecBuilder {
 		Ok(self)
 	}
 
-	pub fn ordering(mut self, labels: &[Urn<'static>]) -> Result<Self, SpecBuildError> {
+	pub fn ordering(mut self, labels: impl AsRef<[Urn<'static>]>) -> Result<Self, SpecBuildError> {
+		let labels = labels.as_ref();
 		for lbl in labels {
 			if !self.assertions.iter().any(|(l, _, _, _)| l == lbl) {
 				return Err(SpecBuildError::UnknownOrderingLabel(lbl.clone()));
@@ -248,7 +249,8 @@ impl AssertSpecBuilder {
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn required_events(mut self, kinds: &[crate::utils::urn::Urn<'static>]) -> Self {
+	pub fn required_events(mut self, kinds: impl AsRef<[crate::utils::urn::Urn<'static>]>) -> Self {
+		let kinds = kinds.as_ref();
 		use std::collections::HashSet;
 		let mut seen = HashSet::new();
 		for k in kinds {
@@ -339,11 +341,12 @@ impl BuiltAssertSpec {
 		version_major: u16,
 		version_minor: u16,
 		version_patch: u16,
-		contracts: &[AssertionContract],
+		contracts: impl AsRef<[AssertionContract]>,
 		tag_filter: Option<&[&'static str]>,
 		#[cfg(feature = "instrument")] events: &[crate::utils::urn::Urn<'static>],
 		#[cfg(feature = "testing-timing")] schedulability: Option<&SchedulabilityAssertion>,
 	) -> [u8; 32] {
+		let contracts = contracts.as_ref();
 		let mut h = Sha3_256::new();
 		// Domain tag + version triple
 		h.update(b"TBSP");

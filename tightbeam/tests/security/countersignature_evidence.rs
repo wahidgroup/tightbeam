@@ -197,7 +197,8 @@ mod cms {
 	/// Re-encode the client Finished without its `RECEIPT_ACK` unsigned
 	/// attribute. No signature covers unsigned attributes, so the
 	/// stripped message stays signature-valid.
-	fn strip_receipt_ack(client_finished: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+	fn strip_receipt_ack(client_finished: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+		let client_finished = client_finished.as_ref();
 		let mut signed_data = SignedData::from_der(client_finished)?;
 		let mut signer_info = signed_data
 			.signer_infos

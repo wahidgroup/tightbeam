@@ -257,7 +257,8 @@ impl ForwardedStream {
 	/// trailers, empty bodies) consume their credit but forward no
 	/// chunk event: the consumer sees data or the end, never a
 	/// phantom empty chunk.
-	pub fn accept_and_forward(&mut self, payload: &[u8]) -> bool {
+	pub fn accept_and_forward(&mut self, payload: impl AsRef<[u8]>) -> bool {
+		let payload = payload.as_ref();
 		if !self.accept_chunk() {
 			return false;
 		}
@@ -407,7 +408,7 @@ mod tests {
 	#[test]
 	fn test_forwarded_stream_skips_empty_payload_events() {
 		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
-		assert!(forwarder.accept_and_forward(&[]));
+		assert!(forwarder.accept_and_forward([]));
 		assert!(forwarder.forward(BodyEvent::End));
 		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 		assert!(matches!(forwarder.limits(), (4, 4)));

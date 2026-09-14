@@ -42,7 +42,8 @@ tb_assert_spec! {
 }
 
 /// Helper to build FDR config for timing tests
-fn build_timing_fdr_config(specs: Vec<Process>) -> FdrConfig {
+fn build_timing_fdr_config(specs: impl IntoIterator<Item = Process>) -> FdrConfig {
+	let specs: Vec<Process> = specs.into_iter().collect();
 	FdrConfig {
 		seeds: 2,
 		max_depth: 8,

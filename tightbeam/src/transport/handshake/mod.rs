@@ -298,7 +298,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		&self,
 		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<&'static [u8]>,
-		supported_profiles: Vec<SecurityProfileDesc>,
+		supported_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Result<BoxedServerHandshake>;
 
@@ -336,7 +336,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	fn create_cms_server(
 		&self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-		supported_profiles: Vec<SecurityProfileDesc>,
+		supported_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 	) -> Result<BoxedServerHandshake>;
 }
 
@@ -471,7 +471,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		&self,
 		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<&'static [u8]>,
-		supported_profiles: Vec<SecurityProfileDesc>,
+		supported_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 		transport_config: Option<TransportOffer>,
 		transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
@@ -486,6 +486,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 		P::Signature: SignatureEncoding,
 	{
+		let supported_profiles: Vec<SecurityProfileDesc> = supported_profiles.into_iter().collect();
 		let provider = Arc::clone(&self.provider);
 		let mut server = EciesHandshakeServer::<P>::new(provider, server_cert, aad_domain_tag, client_validators);
 		server = server.with_supported_profiles(supported_profiles);
@@ -588,7 +589,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	pub fn create_cms_server(
 		&self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-		supported_profiles: Vec<SecurityProfileDesc>,
+		supported_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		transport_config: Option<TransportOffer>,
 		transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
 		session_observer: Option<Arc<dyn SessionObserver>>,
@@ -602,6 +603,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::Digest: Send + 'static,
 		P::AeadCipher: Send + Sync + KeyInit + 'static,
 	{
+		let supported_profiles: Vec<SecurityProfileDesc> = supported_profiles.into_iter().collect();
 		let provider = Arc::clone(&self.provider);
 
 		let mut server = CmsHandshakeServer::<P>::new(provider, client_validators);

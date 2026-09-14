@@ -199,7 +199,8 @@ pub struct TransactionStatus {
 
 impl TransactionStatus {
 	/// Create an approved status
-	pub fn approved(original_payment_id: PaymentIdentification, authorization_code: Vec<u8>) -> Self {
+	pub fn approved(original_payment_id: PaymentIdentification, authorization_code: impl Into<Vec<u8>>) -> Self {
+		let authorization_code: Vec<u8> = authorization_code.into();
 		Self {
 			original_payment_id,
 			status: PaymentStatusCode::AcceptedCustomerProfile,
@@ -209,7 +210,8 @@ impl TransactionStatus {
 	}
 
 	/// Create a captured status
-	pub fn captured(original_payment_id: PaymentIdentification, authorization_code: Vec<u8>) -> Self {
+	pub fn captured(original_payment_id: PaymentIdentification, authorization_code: impl Into<Vec<u8>>) -> Self {
+		let authorization_code: Vec<u8> = authorization_code.into();
 		Self {
 			original_payment_id,
 			status: PaymentStatusCode::AcceptedSettlementCompleted,
@@ -219,7 +221,8 @@ impl TransactionStatus {
 	}
 
 	/// Create a rejected status
-	pub fn rejected(original_payment_id: PaymentIdentification, reason_code: Vec<u8>) -> Self {
+	pub fn rejected(original_payment_id: PaymentIdentification, reason_code: impl Into<Vec<u8>>) -> Self {
+		let reason_code: Vec<u8> = reason_code.into();
 		Self {
 			original_payment_id,
 			status: PaymentStatusCode::Rejected,

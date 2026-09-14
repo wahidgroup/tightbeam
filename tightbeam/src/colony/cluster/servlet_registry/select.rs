@@ -6,7 +6,8 @@ use super::{ClusterError, PheromoneConfig, RouteKind, ServletEntry, ServletRegis
 
 impl ServletRegistry {
 	/// Live routes for a servlet type, shared by Arc (no entry deep copy).
-	pub fn entries_for_type(&self, servlet_type: &[u8]) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
+	pub fn entries_for_type(&self, servlet_type: impl AsRef<[u8]>) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
+		let servlet_type = servlet_type.as_ref();
 		let routes = self.routes.read()?;
 		let addresses = routes.addresses_for_type(servlet_type);
 		let result = addresses
@@ -19,7 +20,11 @@ impl ServletRegistry {
 	}
 
 	/// Live local routes for a servlet type.
-	pub fn local_entries_for_type(&self, servlet_type: &[u8]) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
+	pub fn local_entries_for_type(
+		&self,
+		servlet_type: impl AsRef<[u8]>,
+	) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
+		let servlet_type = servlet_type.as_ref();
 		let routes = self.entries_for_type(servlet_type)?;
 		let local = routes
 			.into_iter()
@@ -59,7 +64,8 @@ impl ServletRegistry {
 	}
 
 	/// Reinforce pheromone for one servlet after success.
-	pub fn reinforce(&self, address: &[u8], quality: u64) -> Result<bool, ClusterError> {
+	pub fn reinforce(&self, address: impl AsRef<[u8]>, quality: u64) -> Result<bool, ClusterError> {
+		let address = address.as_ref();
 		let routes = self.routes.read()?;
 		let result = if let Some(entry) = routes.get(address) {
 			entry.reinforce(quality);
@@ -72,7 +78,8 @@ impl ServletRegistry {
 	}
 
 	/// Count one failure for the servlet at `address`.
-	pub fn weaken(&self, address: &[u8]) -> Result<bool, ClusterError> {
+	pub fn weaken(&self, address: impl AsRef<[u8]>) -> Result<bool, ClusterError> {
+		let address = address.as_ref();
 		let routes = self.routes.read()?;
 		let result = if let Some(entry) = routes.get(address) {
 			entry.weaken();
@@ -85,7 +92,8 @@ impl ServletRegistry {
 	}
 
 	/// Count one failure and apply a pheromone penalty.
-	pub fn weaken_with_penalty(&self, address: &[u8], penalty: u64) -> Result<bool, ClusterError> {
+	pub fn weaken_with_penalty(&self, address: impl AsRef<[u8]>, penalty: u64) -> Result<bool, ClusterError> {
+		let address = address.as_ref();
 		let routes = self.routes.read()?;
 		let result = if let Some(entry) = routes.get(address) {
 			entry.weaken_with_penalty(penalty);
@@ -100,7 +108,8 @@ impl ServletRegistry {
 	/// Weaken every live route attributed to a peer identity: direct
 	/// routes it advertised, relay trails learned for it, and relay
 	/// trails that forward through it.
-	pub fn weaken_peer(&self, peer_id: &[u8]) -> Result<usize, ClusterError> {
+	pub fn weaken_peer(&self, peer_id: impl AsRef<[u8]>) -> Result<usize, ClusterError> {
+		let peer_id = peer_id.as_ref();
 		let attributed = |entry: &ServletEntry| {
 			entry.owner_id().as_ref() == peer_id || entry.relay_id().is_some_and(|relay| relay.as_ref() == peer_id)
 		};
@@ -120,7 +129,8 @@ impl ServletRegistry {
 	/// Weaken every live peer route that dials `dial_addr`, relay
 	/// trails included: a misbehaving gateway weakens every trail
 	/// through it.
-	pub fn weaken_peer_by_dial(&self, dial_addr: &[u8]) -> Result<usize, ClusterError> {
+	pub fn weaken_peer_by_dial(&self, dial_addr: impl AsRef<[u8]>) -> Result<usize, ClusterError> {
+		let dial_addr = dial_addr.as_ref();
 		let routes = self.routes.read()?;
 		let weakened = routes
 			.values()

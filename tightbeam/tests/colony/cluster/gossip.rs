@@ -25,7 +25,11 @@ use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 /// The hive plane refuses a signer that `peer_trust` also holds, so the
 /// hive trust splits off the hive-plane identity (see
 /// [`hive_plane_certs`]) beside the shared gateway identity.
-fn gossip_cluster_conf(certs: &ClusterTestCerts, peers: Vec<String>) -> (ClusterConfig, Arc<MemoryGossipJournal>) {
+fn gossip_cluster_conf(
+	certs: &ClusterTestCerts,
+	peers: impl IntoIterator<Item = String>,
+) -> (ClusterConfig, Arc<MemoryGossipJournal>) {
+	let peers: Vec<String> = peers.into_iter().collect();
 	let journal = Arc::new(MemoryGossipJournal::default());
 	let mut conf = peering_cluster_conf_with_peers(certs, peers);
 	conf.tls.hive_trust = Some(split_hive_trust(certs));
@@ -42,7 +46,8 @@ fn gossip_cluster_conf(certs: &ClusterTestCerts, peers: Vec<String>) -> (Cluster
 ///
 /// Origin publishes verify against `hive_trust`, and a signer that
 /// `peer_trust` also holds is refused there.
-async fn hive_publish_gossip(id: &[u8], body: GossipRumor, ttl: u64) -> Result<Frame, TightBeamError> {
+async fn hive_publish_gossip(id: impl AsRef<[u8]>, body: GossipRumor, ttl: u64) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let publisher = hive_plane_certs();
 
 	signed_publish_gossip(&publisher.key, id, body, ttl).await
@@ -56,12 +61,18 @@ async fn hive_publish_gossip(id: &[u8], body: GossipRumor, ttl: u64) -> Result<F
 /// - Local delivery is the receiving gateway's ingress policy.
 /// - The outer frame's `metadata.lifetime` carries the hop radius,
 ///   never the body.
-fn rumor_body(payload: Vec<u8>) -> GossipRumor {
+fn rumor_body(payload: impl Into<Vec<u8>>) -> GossipRumor {
+	let payload: Vec<u8> = payload.into();
 	GossipRumor::application(payload)
 }
 
 /// Mint an origin-signed rumor [`Frame`] (the nested gossip content).
-async fn mint_origin_rumor(key: &Secp256k1SigningKey, id: &[u8], body: GossipRumor) -> Result<Frame, TightBeamError> {
+async fn mint_origin_rumor(
+	key: &Secp256k1SigningKey,
+	id: impl AsRef<[u8]>,
+	body: GossipRumor,
+) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
@@ -77,10 +88,11 @@ async fn mint_origin_rumor(key: &Secp256k1SigningKey, id: &[u8], body: GossipRum
 /// Sign a [`Gossip`] relay frame carrying an unchanged origin rumor.
 async fn signed_relay_gossip(
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	rumor: Frame,
 	hop_ttl: u64,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
@@ -132,8 +144,9 @@ pub async fn relay_application_rumor(
 	cluster: &ClusterGateway,
 	origin_key: &Secp256k1SigningKey,
 	relay_key: &Secp256k1SigningKey,
-	label: &str,
+	label: impl AsRef<str>,
 ) -> Result<(), TightBeamError> {
+	let label = label.as_ref();
 	let inner_id = format!("{label}-inner");
 	let relay_id = format!("{label}-relay");
 	let body = rumor_body(encode(&PingRequest { value: 21 })?);
@@ -145,9 +158,11 @@ pub async fn relay_application_rumor(
 /// Sign a [`ReconcileGossip`] control frame listing the sender's held digests.
 async fn signed_reconcile_gossip(
 	key: &Secp256k1SigningKey,
-	id: &[u8],
-	held: Vec<Vec<u8>>,
+	id: impl AsRef<[u8]>,
+	held: impl IntoIterator<Item = Vec<u8>>,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
+	let held: Vec<Vec<u8>> = held.into_iter().collect();
 	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
@@ -178,7 +193,8 @@ async fn send_reconcile_frame_as(
 
 /// One convergence probe over the public journal interface.
 /// Every journal holds exactly `held` rumors and none awaits local delivery.
-fn gossip_converged(journals: &[Arc<MemoryGossipJournal>], held: usize) -> bool {
+fn gossip_converged(journals: impl AsRef<[Arc<MemoryGossipJournal>]>, held: usize) -> bool {
+	let journals = journals.as_ref();
 	let now = current_timestamp_ms();
 	journals.iter().all(|journal| {
 		let held_now = journal.held_digests(now).is_ok_and(|digests| digests.len() == held);
@@ -194,11 +210,12 @@ fn gossip_converged(journals: &[Arc<MemoryGossipJournal>], held: usize) -> bool 
 ///
 /// - Branching lives here, not in scenarios.
 async fn wait_for_gossip_converged(
-	journals: &[Arc<MemoryGossipJournal>],
+	journals: impl AsRef<[Arc<MemoryGossipJournal>]>,
 	held: usize,
 	attempts: u32,
 	interval: Duration,
 ) -> bool {
+	let journals = journals.as_ref();
 	for _ in 0..attempts {
 		if gossip_converged(journals, held) {
 			return true;
@@ -1964,7 +1981,8 @@ tb_scenario! {
 /// Poll until `addr` leaves the beat targets or attempts exhaust.
 /// Eviction runs on the advertise beat's cadence, so the outcome is
 /// only observable by polling. Branching lives here, not in scenarios.
-async fn wait_for_target_dropped(table: &PeerTable, addr: &str, attempts: u32, interval: Duration) -> bool {
+async fn wait_for_target_dropped(table: &PeerTable, addr: impl AsRef<str>, attempts: u32, interval: Duration) -> bool {
+	let addr = addr.as_ref();
 	let dropped = |table: &PeerTable| {
 		table
 			.target_set()

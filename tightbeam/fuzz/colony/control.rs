@@ -33,10 +33,11 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Sign a cluster control request with a deterministic order.
 pub(crate) async fn signed_control_frame(
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	request: ClusterRequest,
 	order: u64,
 ) -> Result<tightbeam::Frame, TightBeamError> {
+	let id = id.as_ref();
 	let mut signed = Version::V1
 		.compose()
 		.with_id(id)
@@ -79,10 +80,12 @@ async fn emit_advertise(
 	trace: &TraceCollector,
 	signer: &OrgNode,
 	receiver: &OrgNode,
-	gateway_addr: Vec<u8>,
-	types: Vec<Urn<'static>>,
+	gateway_addr: impl Into<Vec<u8>>,
+	types: impl IntoIterator<Item = Urn<'static>>,
 	order: u64,
 ) -> Result<AuthzClass, TightBeamError> {
+	let gateway_addr: Vec<u8> = gateway_addr.into();
+	let types: Vec<Urn<'static>> = types.into_iter().collect();
 	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement { gateway_addr, advertised_types: types });
 	let frame = match signed_control_frame(&signer.certs.key, b"peer-advertise", request, order).await {
 		Ok(frame) => frame,
@@ -122,9 +125,10 @@ pub(crate) async fn advertise_peer_types(
 	trace: &TraceCollector,
 	advertiser: &OrgNode,
 	receiver: &OrgNode,
-	types: Vec<Urn<'static>>,
+	types: impl IntoIterator<Item = Urn<'static>>,
 	order: u64,
 ) -> Result<AuthzClass, TightBeamError> {
+	let types: Vec<Urn<'static>> = types.into_iter().collect();
 	let gateway_addr: Vec<u8> = (*advertiser.gateway.addr()).into();
 	emit_advertise(trace, advertiser, receiver, gateway_addr, types, order).await
 }
@@ -134,9 +138,11 @@ pub(crate) async fn advertise_peer_at(
 	trace: &TraceCollector,
 	signer: &OrgNode,
 	receiver: &OrgNode,
-	gateway_addr: &[u8],
-	types: Vec<Urn<'static>>,
+	gateway_addr: impl AsRef<[u8]>,
+	types: impl IntoIterator<Item = Urn<'static>>,
 	order: u64,
 ) -> Result<AuthzClass, TightBeamError> {
+	let gateway_addr = gateway_addr.as_ref();
+	let types: Vec<Urn<'static>> = types.into_iter().collect();
 	emit_advertise(trace, signer, receiver, gateway_addr.to_vec(), types, order).await
 }

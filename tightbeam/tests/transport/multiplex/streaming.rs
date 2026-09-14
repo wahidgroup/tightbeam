@@ -123,7 +123,8 @@ pub(crate) const UNARY_KIND_REFUSED_BY_DUPLEX_SERVER: Urn<'static> =
 	tightbeam::urn!("test", "event:streaming/unary-kind-refused-by-duplex-server");
 
 /// Whether a unary-kind emit is refused with `Unimplemented`.
-async fn emit_refused_unimplemented(endpoint: &MuxEndpoint, label: &str) -> bool {
+async fn emit_refused_unimplemented(endpoint: &MuxEndpoint, label: impl AsRef<str>) -> bool {
+	let label = label.as_ref();
 	matches!(
 		endpoint.handle.emit_on_stream(&large_mux_frame(label)).await,
 		Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
@@ -331,7 +332,7 @@ fn gated_streaming_echo(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(S
 
 			let drained = drain_body(&mut body).await;
 			if drained.failure.is_some() {
-				return echo_reassembled(&[]);
+				return echo_reassembled([]);
 			}
 
 			echo_reassembled(&drained.bytes)

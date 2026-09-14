@@ -102,9 +102,10 @@ async fn establish_renewal_session(hooks: MutualSessionHooks) -> Result<MutualTr
 	establish_mutual_transports(client_offer, server_offer, hooks).await
 }
 
-async fn emit_series(handle: &MuxHandle, label: &str, count: usize) -> Result<bool, TightBeamError> {
+async fn emit_series(handle: &MuxHandle, label: impl AsRef<str>, count: usize) -> Result<bool, TightBeamError> {
+	let label = label.as_ref();
 	for index in 0..count {
-		let frame = mux_frame(&format!("{label}-{index}"));
+		let frame = mux_frame(format!("{label}-{index}"));
 		let echoed = handle.emit_on_stream(&frame).await?;
 		if !is_echo(echoed, &frame) {
 			return Ok(false);
@@ -385,7 +386,7 @@ tb_scenario! {
 
 			let mut all_echoed = true;
 			for index in 0..20 {
-				let frame = large_mux_frame(&format!("rekey-streaming-{index}"));
+				let frame = large_mux_frame(format!("rekey-streaming-{index}"));
 				let payload = frame.to_der()?;
 				let (sink, response) = client_end.handle.open_stream()?;
 				push_split(sink, &payload).await?;
@@ -422,7 +423,7 @@ tb_scenario! {
 
 			let mut all_echoed = true;
 			for index in 0..20 {
-				let frame = large_mux_frame(&format!("rekey-record-{index}"));
+				let frame = large_mux_frame(format!("rekey-record-{index}"));
 				let echoed = pair.client.handle.emit_on_stream(&frame).await?;
 				all_echoed = all_echoed && is_echo(echoed, &frame);
 			}

@@ -199,11 +199,12 @@ pub fn skid_window(digest_bytes: &[u8]) -> Result<&[u8], CertificateValidationEr
 ///
 /// This is the byte-based variant for use with `KeyProvider::to_public_key_bytes()`.
 pub fn compute_signer_identifier_from_der<D>(
-	public_key_der: &[u8],
+	public_key_der: impl AsRef<[u8]>,
 ) -> Result<SignerIdentifier, CertificateValidationError>
 where
 	D: Digest,
 {
+	let public_key_der = public_key_der.as_ref();
 	let mut hasher = D::new();
 	Digest::update(&mut hasher, public_key_der);
 

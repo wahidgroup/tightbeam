@@ -97,10 +97,12 @@ impl<'a> CspmExporter<'a> {
 	fn write_datatype<W: Write, T: std::fmt::Display>(
 		&self,
 		writer: &mut W,
-		type_name: &str,
-		comment: &str,
+		type_name: impl AsRef<str>,
+		comment: impl AsRef<str>,
 		items: &std::collections::HashSet<T>,
 	) -> std::io::Result<()> {
+		let type_name = type_name.as_ref();
+		let comment = comment.as_ref();
 		writeln!(writer, "{comment}")?;
 		writeln!(writer, "datatype {type_name} = ")?;
 		let mut iter = items.iter();

@@ -706,7 +706,8 @@ mod tests {
 	use crate::crypto::sign::ecdsa::k256::ecdsa::SigningKey;
 	use crate::crypto::sign::PrehashVerifier;
 
-	fn prehash(data: &[u8]) -> Vec<u8> {
+	fn prehash(data: impl AsRef<[u8]>) -> Vec<u8> {
+		let data = data.as_ref();
 		let mut hasher = Sha3_256::new();
 		hasher.update(data);
 		hasher.finalize().to_vec()

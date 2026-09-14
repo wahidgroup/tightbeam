@@ -351,9 +351,10 @@ impl MuxHandle {
 	async fn send_request_chunks(
 		&self,
 		reservation: &mut StreamReservation,
-		payload: &[u8],
+		payload: impl AsRef<[u8]>,
 		total: u64,
 	) -> TransportResult<()> {
+		let payload = payload.as_ref();
 		let chunk_size = self.link.shared().send_chunk_size;
 		let mut chunks = payload.chunks(chunk_size);
 		let mut sent: u64 = 0;

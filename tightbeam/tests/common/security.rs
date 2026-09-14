@@ -189,7 +189,9 @@ mod receipt_fixtures {
 	use tightbeam::TightBeamError;
 
 	/// True when `needle` appears as a contiguous window inside `haystack`.
-	pub fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+	pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
+		let haystack = haystack.as_ref();
+		let needle = needle.as_ref();
 		haystack.windows(needle.len()).any(|window| window == needle)
 	}
 
@@ -206,7 +208,8 @@ mod receipt_fixtures {
 		}
 
 		/// Grant with the given settlement challenge attached.
-		pub fn challenging(challenge: &[u8]) -> Result<Self, TightBeamError> {
+		pub fn challenging(challenge: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+			let challenge = challenge.as_ref();
 			Ok(Self { challenge: Some(OctetString::new(challenge)?) })
 		}
 	}
@@ -231,7 +234,8 @@ mod receipt_fixtures {
 
 	impl SettleSpyAuthorizer {
 		/// Spy granting budgets with the given settlement challenge.
-		pub fn challenging(challenge: &[u8]) -> Result<Self, TightBeamError> {
+		pub fn challenging(challenge: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+			let challenge = challenge.as_ref();
 			Ok(Self {
 				challenge: OctetString::new(challenge)?,
 				settle_calls: Arc::new(AtomicUsize::new(0)),
@@ -272,7 +276,8 @@ mod receipt_fixtures {
 
 	impl PayingApprover {
 		/// Approver answering every challenge with `response`.
-		pub fn answering(response: &[u8]) -> Result<Self, TightBeamError> {
+		pub fn answering(response: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+			let response = response.as_ref();
 			Ok(Self { response: OctetString::new(response)? })
 		}
 	}
@@ -347,10 +352,12 @@ mod cms_pair {
 	/// certificate for mutual authentication.
 	pub fn cms_handshake_pair(
 		materials: &ServerMaterials,
-		client_profiles: Vec<SecurityProfileDesc>,
-		server_profiles: Vec<SecurityProfileDesc>,
+		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Result<CmsHandshakePair, TightBeamError> {
+		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
+		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
 		let client_materials = ClientMaterials::generate();
 		let client_certificate = Arc::clone(&client_materials.certificate);
 		let client_provider = Arc::clone(&client_materials.key_provider);

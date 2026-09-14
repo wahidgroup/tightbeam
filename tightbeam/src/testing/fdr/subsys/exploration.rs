@@ -348,8 +348,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 		rng: &mut SeededRng,
 		process: &'b Process,
 		process_state: State,
-		actions: &'b [Action],
+		actions: &'b (impl AsRef<[Action]> + ?Sized),
 	) -> &'b Action {
+		let actions = actions.as_ref();
 		if process.choice.contains(&process_state) {
 			// Nondeterministic choice point: use RNG to select
 			rng.choose(actions).unwrap_or(&actions[0])

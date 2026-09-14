@@ -123,7 +123,8 @@ pub fn cluster_certs() -> ClusterTestCerts {
 /// generated cert shares the fixed test signing key. All gateways would
 /// then resolve to one signer fingerprint, and a relay could never be
 /// told apart from an origin.
-pub fn colony_identity(cn: &str, colony: &Urn<'_>) -> (Certificate, Secp256k1SigningKey) {
+pub fn colony_identity(cn: impl AsRef<str>, colony: &Urn<'_>) -> (Certificate, Secp256k1SigningKey) {
+	let cn = cn.as_ref();
 	use tightbeam::random::OsRng;
 	use tightbeam::testing::fixtures::TestCertificate;
 
@@ -133,7 +134,8 @@ pub fn colony_identity(cn: &str, colony: &Urn<'_>) -> (Certificate, Secp256k1Sig
 }
 
 /// [`colony_identity`] in the colony every member gateway joins.
-pub fn member_identity(cn: &str) -> (Certificate, Secp256k1SigningKey) {
+pub fn member_identity(cn: impl AsRef<str>) -> (Certificate, Secp256k1SigningKey) {
+	let cn = cn.as_ref();
 	colony_identity(cn, &test_colony_urn())
 }
 
@@ -305,10 +307,11 @@ pub fn frame_signature_verifies(frame: &Frame, key: &Secp256k1SigningKey) -> boo
 /// order and hop radius.
 pub async fn signed_publish_gossip(
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	body: GossipRumor,
 	hop_ttl: u64,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let unsigned = Version::V2
 		.compose()
 		.with_id(id)
@@ -322,10 +325,11 @@ pub async fn signed_publish_gossip(
 
 pub async fn signed_control_frame_with_order(
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	request: ClusterRequest,
 	order: u64,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let unsigned = Version::V1
 		.compose()
 		.with_id(id)
@@ -338,17 +342,19 @@ pub async fn signed_control_frame_with_order(
 
 pub async fn signed_control_frame_with(
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	request: ClusterRequest,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	signed_control_frame_with_order(key, id, request, current_timestamp_ms()).await
 }
 
 pub async fn signed_control_frame(
 	certs: &ClusterTestCerts,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	request: ClusterRequest,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	signed_control_frame_with(&certs.key, id, request).await
 }
 
@@ -356,17 +362,20 @@ pub fn colony_ns() -> ColonyNamespace {
 	ColonyNamespace::default()
 }
 
-pub fn hive_urn(hive_addr: &[u8]) -> Urn<'static> {
+pub fn hive_urn(hive_addr: &(impl AsRef<[u8]> + ?Sized)) -> Urn<'static> {
+	let hive_addr = hive_addr.as_ref();
 	colony_ns()
 		.hive(String::from_utf8_lossy(hive_addr).as_ref())
 		.expect("test locators satisfy the mint grammar")
 }
 
-pub fn servlet_urn(name: &str) -> Urn<'static> {
+pub fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+	let name = name.as_ref();
 	colony_ns().servlet(name).expect("test names satisfy the mint grammar")
 }
 
-pub fn registration_request(hive_addr: &[u8]) -> ClusterRequest {
+pub fn registration_request(hive_addr: impl AsRef<[u8]>) -> ClusterRequest {
+	let hive_addr = hive_addr.as_ref();
 	ClusterRequest::RegisterHive(RegisterHiveRequest {
 		hive_addr: hive_addr.to_vec(),
 		servlet_addresses: vec![],
@@ -374,11 +383,20 @@ pub fn registration_request(hive_addr: &[u8]) -> ClusterRequest {
 	})
 }
 
-pub fn servlet_address_update(hive_addr: &[u8], added: Vec<ServletInfo>, removed: Vec<Urn<'static>>) -> ClusterRequest {
+pub fn servlet_address_update(
+	hive_addr: impl AsRef<[u8]>,
+	added: impl IntoIterator<Item = ServletInfo>,
+	removed: impl IntoIterator<Item = Urn<'static>>,
+) -> ClusterRequest {
+	let hive_addr = hive_addr.as_ref();
+	let added: Vec<ServletInfo> = added.into_iter().collect();
+	let removed: Vec<Urn<'static>> = removed.into_iter().collect();
 	ClusterRequest::ServletAddressUpdate(ServletAddressUpdate { hive_id: hive_urn(hive_addr), added, removed })
 }
 
-pub fn servlet_info(servlet_name: &str, address: &[u8]) -> ServletInfo {
+pub fn servlet_info(servlet_name: impl AsRef<str>, address: impl AsRef<[u8]>) -> ServletInfo {
+	let servlet_name = servlet_name.as_ref();
+	let address = address.as_ref();
 	ServletInfo {
 		servlet_id: servlet_urn(servlet_name)
 			.servlet_instance(String::from_utf8_lossy(address).as_ref())
@@ -388,7 +406,14 @@ pub fn servlet_info(servlet_name: &str, address: &[u8]) -> ServletInfo {
 }
 
 /// ServletInfo whose instance locator disagrees with the route address.
-pub fn servlet_info_mismatched(servlet_name: &str, urn_addr: &[u8], route_addr: &[u8]) -> ServletInfo {
+pub fn servlet_info_mismatched(
+	servlet_name: impl AsRef<str>,
+	urn_addr: impl AsRef<[u8]>,
+	route_addr: impl AsRef<[u8]>,
+) -> ServletInfo {
+	let servlet_name = servlet_name.as_ref();
+	let urn_addr = urn_addr.as_ref();
+	let route_addr = route_addr.as_ref();
 	ServletInfo {
 		servlet_id: servlet_urn(servlet_name)
 			.servlet_instance(String::from_utf8_lossy(urn_addr).as_ref())
@@ -536,9 +561,11 @@ pub async fn record_ping_echo(
 pub async fn register_signed_hive(
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,
-	id: &[u8],
-	addr: &[u8],
+	id: impl AsRef<[u8]>,
+	addr: impl AsRef<[u8]>,
 ) -> Result<RegisterHiveResponse, TightBeamError> {
+	let id = id.as_ref();
+	let addr = addr.as_ref();
 	let frame = signed_control_frame_with(key, id, registration_request(addr)).await?;
 	decode(&emit_frame(client, frame).await?.message())
 }
@@ -546,9 +573,10 @@ pub async fn register_signed_hive(
 pub async fn emit_servlet_update(
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	request: ClusterRequest,
 ) -> Result<ServletAddressUpdateResponse, TightBeamError> {
+	let id = id.as_ref();
 	let frame = signed_control_frame_with(key, id, request).await?;
 	decode(&emit_frame(client, frame).await?.message())
 }
@@ -556,7 +584,8 @@ pub async fn emit_servlet_update(
 /// Compose and sign one end-to-end client work frame whose message is
 /// the standard ping input. This is the frame gateways must deliver to
 /// the servlet byte-for-byte.
-pub async fn signed_work_frame(key: &Secp256k1SigningKey, id: &[u8]) -> Result<Frame, TightBeamError> {
+pub async fn signed_work_frame(key: &Secp256k1SigningKey, id: impl AsRef<[u8]>) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	let unsigned = Version::V1
 		.compose()
 		.with_id(id)
@@ -610,9 +639,11 @@ pub fn record_work_refusal(
 pub async fn emit_typed_work(
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,
-	type_name: &str,
-	id: &[u8],
+	type_name: impl AsRef<str>,
+	id: impl AsRef<[u8]>,
 ) -> Result<Frame, TightBeamError> {
+	let type_name = type_name.as_ref();
+	let id = id.as_ref();
 	let inner = signed_work_frame(key, id).await?;
 
 	client.submit_work_to(servlet_urn(type_name), &inner).await
@@ -621,8 +652,9 @@ pub async fn emit_typed_work(
 pub async fn emit_ping_work(
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 ) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
 	emit_typed_work(client, key, "ping", id).await
 }
 
@@ -634,8 +666,9 @@ pub async fn emit_ping_work(
 pub async fn emit_relayed_ping_work(
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 ) -> Result<ClusterWorkResponse, TightBeamError> {
+	let id = id.as_ref();
 	let inner = signed_work_frame(key, id).await?;
 	let work_request = ClusterRequest::Work(ClusterWorkRequest::new(servlet_urn("ping"), &inner)?.into_relayed(0));
 
@@ -650,7 +683,8 @@ pub async fn emit_relayed_ping_work(
 }
 
 /// Instance URN in a realm this gateway does not serve.
-pub fn foreign_realm_instance(addr: &str) -> Urn<'static> {
+pub fn foreign_realm_instance(addr: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+	let addr = addr.as_ref();
 	let namespace = ColonyNamespace::new("tightbeam", "elsewhere").expect("static namespace parts are valid");
 	namespace
 		.servlet("ping")
@@ -687,7 +721,11 @@ pub fn peering_peer_trust_only(certs: &ClusterTestCerts) -> ClusterConfig {
 	ClusterConfig::new(tls)
 }
 
-pub fn peering_with_dial_allowlist(certs: &ClusterTestCerts, allowlist: Vec<String>) -> ClusterConfig {
+pub fn peering_with_dial_allowlist(
+	certs: &ClusterTestCerts,
+	allowlist: impl IntoIterator<Item = String>,
+) -> ClusterConfig {
+	let allowlist: Vec<String> = allowlist.into_iter().collect();
 	let mut conf = peering_cluster_conf(certs);
 	conf.peer.peer_dial_allowlist = Some(allowlist);
 	conf
@@ -705,14 +743,19 @@ pub fn containment_cluster_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 /// Like [`peering_cluster_conf`] but dialing `peers` as beat anchors.
 /// Peers must pass through the builder, because the discovery table
 /// derives its un-evictable anchor set at build.
-pub fn peering_cluster_conf_with_peers(certs: &ClusterTestCerts, peers: Vec<String>) -> ClusterConfig {
+pub fn peering_cluster_conf_with_peers(
+	certs: &ClusterTestCerts,
+	peers: impl IntoIterator<Item = String>,
+) -> ClusterConfig {
+	let peers: Vec<String> = peers.into_iter().collect();
 	let tls = cluster_tls_config(certs).with_peer_trust(Arc::clone(&certs.trust));
 	ClusterConfig::builder(tls).with_peers(peers).build()
 }
 
 /// Gateway conf that advertises to `peer` on a fast beat. The slate is
 /// never configured, so each beat snapshots the hive registry.
-pub fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: String) -> ClusterConfig {
+pub fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: impl Into<String>) -> ClusterConfig {
+	let peer: String = peer.into();
 	ClusterConfig::builder(cluster_tls_config(certs))
 		.with_peers([peer])
 		.with_advertise_interval(Duration::from_millis(100))
@@ -728,9 +771,11 @@ pub async fn advertise_peer_signed(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
 	cluster: &ClusterGateway,
-	gateway_addr: &[u8],
-	types: Vec<Urn<'static>>,
+	gateway_addr: impl AsRef<[u8]>,
+	types: impl IntoIterator<Item = Urn<'static>>,
 ) -> Result<(), TightBeamError> {
+	let gateway_addr = gateway_addr.as_ref();
+	let types: Vec<Urn<'static>> = types.into_iter().collect();
 	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
 		gateway_addr: gateway_addr.to_vec(),
 		advertised_types: types,
@@ -767,9 +812,11 @@ pub async fn advertise_peer(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
-	gateway_addr: &[u8],
-	types: Vec<Urn<'static>>,
+	gateway_addr: impl AsRef<[u8]>,
+	types: impl IntoIterator<Item = Urn<'static>>,
 ) -> Result<(), TightBeamError> {
+	let gateway_addr = gateway_addr.as_ref();
+	let types: Vec<Urn<'static>> = types.into_iter().collect();
 	advertise_peer_signed(trace, certs, &certs.key, cluster, gateway_addr, types).await
 }
 

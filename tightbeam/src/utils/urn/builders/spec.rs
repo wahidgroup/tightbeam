@@ -29,7 +29,8 @@ pub enum Pattern {
 
 impl Pattern {
 	/// Check if a value matches this pattern
-	pub fn matches(&self, value: &str) -> bool {
+	pub fn matches(&self, value: impl AsRef<str>) -> bool {
+		let value = value.as_ref();
 		match self {
 			Pattern::Alpha => value.chars().all(|c| c.is_ascii_alphabetic()),
 			Pattern::Numeric => value.chars().all(|c| c.is_ascii_digit()),
@@ -60,7 +61,8 @@ pub enum Constraint {
 
 impl Constraint {
 	/// Check if a value matches this constraint
-	pub fn matches(&self, value: &str) -> bool {
+	pub fn matches(&self, value: impl AsRef<str>) -> bool {
+		let value = value.as_ref();
 		match self {
 			Constraint::Const(expected) => value == *expected,
 			Constraint::OneOf(options) => options.contains(&value),

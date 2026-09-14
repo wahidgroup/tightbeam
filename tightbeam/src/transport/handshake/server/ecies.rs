@@ -160,7 +160,8 @@ where
 	/// Set the server's supported security profiles for negotiation.
 	/// Server must have at least one supported profile configured.
 	#[must_use]
-	pub fn with_supported_profiles(mut self, profiles: Vec<SecurityProfileDesc>) -> Self {
+	pub fn with_supported_profiles(mut self, profiles: impl IntoIterator<Item = SecurityProfileDesc>) -> Self {
+		let profiles: Vec<SecurityProfileDesc> = profiles.into_iter().collect();
 		self.supported_profiles = profiles;
 		self
 	}
@@ -207,7 +208,11 @@ where
 	///
 	/// # Returns
 	/// DER-encoded ServerHandshake
-	pub async fn process_client_hello(&mut self, client_hello_der: &[u8]) -> Result<ServerHandshake, HandshakeError> {
+	pub async fn process_client_hello(
+		&mut self,
+		client_hello_der: impl AsRef<[u8]>,
+	) -> Result<ServerHandshake, HandshakeError> {
+		let client_hello_der = client_hello_der.as_ref();
 		// 1. Validate current state is Init
 		self.validate_expected_state(ServerHandshakeState::Init)?;
 
@@ -333,7 +338,7 @@ where
 	///
 	/// # Returns
 	/// Success (session key stored internally)
-	pub async fn process_client_key_exchange(&mut self, client_kex_der: &[u8]) -> Result<(), HandshakeError>
+	pub async fn process_client_key_exchange(&mut self, client_kex_der: impl AsRef<[u8]>) -> Result<(), HandshakeError>
 	where
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -341,6 +346,7 @@ where
 		for<'a> P::Signature: TryFrom<&'a [u8]>,
 		P::VerifyingKey: PrehashVerifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
+		let client_kex_der = client_kex_der.as_ref();
 		// 1. Validate current state is ServerHelloSent
 		self.validate_expected_state(ServerHandshakeState::ServerHelloSent)?;
 
@@ -448,7 +454,8 @@ where
 		validate_state(self.state.state(), expected)
 	}
 
-	fn decode_client_hello(&self, client_hello_der: &[u8]) -> Result<ClientHello, HandshakeError> {
+	fn decode_client_hello(&self, client_hello_der: impl AsRef<[u8]>) -> Result<ClientHello, HandshakeError> {
+		let client_hello_der = client_hello_der.as_ref();
 		Ok(ClientHello::from_der(client_hello_der)?)
 	}
 
@@ -517,11 +524,13 @@ where
 		Ok(EstablishedSession::new(keys, mux, receipt, peer, epoch))
 	}
 
-	pub fn decode_client_key_exchange(&self, der_bytes: &[u8]) -> Result<ClientKeyExchange, HandshakeError> {
+	pub fn decode_client_key_exchange(&self, der_bytes: impl AsRef<[u8]>) -> Result<ClientKeyExchange, HandshakeError> {
+		let der_bytes = der_bytes.as_ref();
 		ClientKeyExchange::from_der(der_bytes).map_err(Into::into)
 	}
 
-	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<ZeroizingBytes, HandshakeError> {
+	async fn decrypt_ecies_payload(&self, encrypted_bytes: impl AsRef<[u8]>) -> Result<ZeroizingBytes, HandshakeError> {
+		let encrypted_bytes = encrypted_bytes.as_ref();
 		// Parse the ECIES message using the negotiated curve's wire format.
 		let (ephemeral_pubkey, ciphertext_bytes) = {
 			let encrypted_message = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_bytes)?;
@@ -569,7 +578,11 @@ where
 
 	/// Parse the decrypted DER [`EciesSessionPayload`] into its parts,
 	/// enforcing the fixed 32-byte geometry of the key material.
-	fn extract_session_data_from_payload(&self, decrypted_payload: &[u8]) -> Result<SessionPayload, HandshakeError> {
+	fn extract_session_data_from_payload(
+		&self,
+		decrypted_payload: impl AsRef<[u8]>,
+	) -> Result<SessionPayload, HandshakeError> {
+		let decrypted_payload = decrypted_payload.as_ref();
 		let payload = EciesSessionPayload::from_der(decrypted_payload)
 			.map_err(|_| HandshakeError::InvalidDecryptedPayloadSize)?;
 
@@ -1083,7 +1096,7 @@ mod tests {
 		// Mode 1: Negotiation - client offers [A, B], server supports [B, C] -> selects B
 		{
 			let offer = SecurityOffer::new(vec![p_a, p_b]);
-			let selected = offer.select_profile(&[p_b, p_c])?;
+			let selected = offer.select_profile([p_b, p_c])?;
 			assert_eq!(selected, p_b);
 
 			let mut server = TestEciesServerBuilder::new().build()?.with_supported_profiles(vec![p_b, p_c]);
@@ -1106,7 +1119,7 @@ mod tests {
 		// Error case: No mutual profile
 		{
 			let offer = SecurityOffer::new(vec![p_a, p_b]);
-			let result = offer.select_profile(&[p_c]);
+			let result = offer.select_profile([p_c]);
 			assert!(result.is_err());
 		}
 
@@ -1214,7 +1227,7 @@ mod tests {
 		)?;
 
 		// Build ClientKeyExchange message
-		create_test_client_key_exchange(&encrypted_message.to_bytes())
+		create_test_client_key_exchange(encrypted_message.to_bytes())
 	}
 
 	/// Build an identified ClientKeyExchange: the encrypted payload plus

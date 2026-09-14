@@ -36,7 +36,11 @@ use tightbeam::{
 };
 
 /// Create a test certificate with signing key for a given subject and validity period
-pub fn create_test_cert_with_key(subject: &str, validity_days: u64) -> Result<(Certificate, Secp256k1SigningKey)> {
+pub fn create_test_cert_with_key(
+	subject: impl AsRef<str>,
+	validity_days: u64,
+) -> Result<(Certificate, Secp256k1SigningKey)> {
+	let subject = subject.as_ref();
 	let signing_key = TestKey::signing();
 	let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 	let sha3_signer = Sha3Signer::from(&signing_key);
@@ -77,7 +81,8 @@ pub struct GatewayCerts {
 
 impl GatewayCerts {
 	/// Generate a fresh self-signed gateway identity for `subject`.
-	pub fn generate(subject: &str) -> Self {
+	pub fn generate(subject: impl AsRef<str>) -> Self {
+		let subject = subject.as_ref();
 		let (cert, key) = create_test_cert_with_key(subject, 365).expect("Failed to create gateway cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
 			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)

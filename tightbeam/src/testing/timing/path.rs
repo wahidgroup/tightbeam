@@ -38,7 +38,9 @@ pub struct PathWcet {
 
 impl ExecutionPath {
 	/// Create a new execution path from events and durations
-	pub fn new(events: Vec<Event>, durations: Vec<Option<u64>>) -> Self {
+	pub fn new(events: impl IntoIterator<Item = Event>, durations: impl IntoIterator<Item = Option<u64>>) -> Self {
+		let events: Vec<Event> = events.into_iter().collect();
+		let durations: Vec<Option<u64>> = durations.into_iter().collect();
 		let total_duration = durations.iter().filter_map(|&d| d).sum();
 		Self { events, durations, total_duration }
 	}
@@ -47,7 +49,8 @@ impl ExecutionPath {
 	///
 	/// Returns true if the events in this path match the pattern in order.
 	/// Pattern can be shorter (prefix match) or exact match.
-	pub fn matches_pattern(&self, pattern: &[Event]) -> bool {
+	pub fn matches_pattern(&self, pattern: impl AsRef<[Event]>) -> bool {
+		let pattern = pattern.as_ref();
 		if pattern.is_empty() {
 			return false;
 		}
@@ -75,7 +78,8 @@ impl ExecutionPath {
 
 impl PathWcet {
 	/// Create a new path-based WCET constraint
-	pub fn new(path: Vec<Event>, max_duration: Duration) -> Self {
+	pub fn new(path: impl IntoIterator<Item = Event>, max_duration: Duration) -> Self {
+		let path: Vec<Event> = path.into_iter().collect();
 		Self { path, max_duration }
 	}
 
@@ -192,13 +196,13 @@ mod tests {
 		let durations = vec![Some(10_000_000), Some(20_000_000), Some(5_000_000)];
 		let path = ExecutionPath::new(events, durations);
 		// Exact match
-		assert!(path.matches_pattern(&[Event("start"), Event("process"), Event("end")]));
+		assert!(path.matches_pattern([Event("start"), Event("process"), Event("end")]));
 		// Prefix match
-		assert!(path.matches_pattern(&[Event("start"), Event("process")]));
+		assert!(path.matches_pattern([Event("start"), Event("process")]));
 		// No match
-		assert!(!path.matches_pattern(&[Event("start"), Event("wrong")]));
+		assert!(!path.matches_pattern([Event("start"), Event("wrong")]));
 		// Pattern too long
-		assert!(!path.matches_pattern(&[Event("start"), Event("process"), Event("end"), Event("extra")]));
+		assert!(!path.matches_pattern([Event("start"), Event("process"), Event("end"), Event("extra")]));
 	}
 
 	#[test]

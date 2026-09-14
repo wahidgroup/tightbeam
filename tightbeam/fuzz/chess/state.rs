@@ -232,8 +232,9 @@ impl ChessGameState {
 		from_row: u8,
 		from_col: u8,
 		piece: piece::Piece,
-		directions: &[(i8, i8)],
+		directions: impl AsRef<[(i8, i8)]>,
 	) {
+		let directions = directions.as_ref();
 		for &(row_step, col_step) in directions {
 			let mut current_row = from_row as i8;
 			let mut current_col = from_col as i8;

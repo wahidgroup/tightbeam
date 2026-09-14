@@ -205,7 +205,7 @@ struct LengthService;
 impl MuxService for LengthService {
 	async fn streaming(&self, body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		let bytes = body.into_bytes().await?;
-		Ok(Some(mux_frame(&bytes.len().to_string())))
+		Ok(Some(mux_frame(bytes.len().to_string())))
 	}
 }
 
@@ -234,7 +234,7 @@ impl MuxService for MixedService {
 
 	async fn streaming(&self, body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		let bytes = body.into_bytes().await?;
-		Ok(Some(mux_frame(&bytes.len().to_string())))
+		Ok(Some(mux_frame(bytes.len().to_string())))
 	}
 
 	async fn duplex(&self, mut body: StreamBody, mut reply: ReplySink, _cx: CallContext) -> Result<(), TightBeamError> {
@@ -274,7 +274,11 @@ fn mux_pool(
 	mux_pool_with_idle_timeout(materials, offer, max_connections, None, trace)
 }
 
-async fn echo_roundtrip(client: &mut PooledClient<TokioListener>, label: &str) -> Result<bool, TightBeamError> {
+async fn echo_roundtrip(
+	client: &mut PooledClient<TokioListener>,
+	label: impl AsRef<str>,
+) -> Result<bool, TightBeamError> {
+	let label = label.as_ref();
 	let frame = mux_frame(label);
 	let reply = client.emit(frame.to_owned(), None).await?;
 	Ok(reply == Some(frame))
@@ -839,7 +843,8 @@ impl ManualContext {
 		Self { materials: ServerMaterials::generate(), connection_tasks: Mutex::new(Vec::new()) }
 	}
 
-	fn register_tasks(&self, spawned: Vec<JoinHandle<Result<(), TransportError>>>) {
+	fn register_tasks(&self, spawned: impl IntoIterator<Item = JoinHandle<Result<(), TransportError>>>) {
+		let spawned: Vec<JoinHandle<Result<(), TransportError>>> = spawned.into_iter().collect();
 		let mut registry = match self.connection_tasks.lock() {
 			Ok(tasks) => tasks,
 			Err(poisoned) => poisoned.into_inner(),
@@ -1094,7 +1099,7 @@ impl MuxService for ProbeLengthService {
 	async fn streaming(&self, body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		self.gate.handler_invoked.store(true, Ordering::SeqCst);
 		let bytes = body.into_bytes().await?;
-		Ok(Some(mux_frame(&bytes.len().to_string())))
+		Ok(Some(mux_frame(bytes.len().to_string())))
 	}
 }
 

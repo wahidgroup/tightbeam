@@ -67,7 +67,8 @@ impl Members {
 	///
 	/// A registered hive accepts re-registration only from the signer bound
 	/// at its first registration. An unregistered id is free (CWE-639).
-	fn admits_signer(&self, hive_id: &[u8], incoming: &SharedId) -> bool {
+	fn admits_signer(&self, hive_id: impl AsRef<[u8]>, incoming: &SharedId) -> bool {
+		let hive_id = hive_id.as_ref();
 		let Some(existing) = self.hives.get(hive_id) else {
 			return true;
 		};
@@ -89,7 +90,8 @@ impl Members {
 		self.hives.insert(hive_id, entry);
 	}
 
-	fn remove(&mut self, hive_id: &[u8]) -> Option<HiveEntry> {
+	fn remove(&mut self, hive_id: impl AsRef<[u8]>) -> Option<HiveEntry> {
+		let hive_id = hive_id.as_ref();
 		let entry = self.hives.remove(hive_id)?;
 		for servlet_type in entry.servlet_types.iter() {
 			let Some(hive_ids) = self.by_type.get_mut(servlet_type) else {
@@ -105,7 +107,8 @@ impl Members {
 		Some(entry)
 	}
 
-	fn for_type(&self, servlet_type: &[u8]) -> Vec<HiveEntry> {
+	fn for_type(&self, servlet_type: impl AsRef<[u8]>) -> Vec<HiveEntry> {
+		let servlet_type = servlet_type.as_ref();
 		let Some(hive_ids) = self.by_type.get(servlet_type) else {
 			return Vec::new();
 		};
@@ -113,12 +116,14 @@ impl Members {
 		hive_ids.iter().filter_map(|id| self.hives.get(id.as_ref()).cloned()).collect()
 	}
 
-	fn signer_for(&self, hive_id: &[u8]) -> Option<SharedId> {
+	fn signer_for(&self, hive_id: impl AsRef<[u8]>) -> Option<SharedId> {
+		let hive_id = hive_id.as_ref();
 		self.hives.get(hive_id).map(|entry| Arc::clone(&entry.signer_id))
 	}
 
 	/// Records a heartbeat. `false` when the hive left the registry.
-	fn record_utilization(&mut self, hive_id: &[u8], utilization: BasisPoints) -> bool {
+	fn record_utilization(&mut self, hive_id: impl AsRef<[u8]>, utilization: BasisPoints) -> bool {
+		let hive_id = hive_id.as_ref();
 		let Some(entry) = self.hives.get_mut(hive_id) else {
 			return false;
 		};
@@ -129,7 +134,8 @@ impl Members {
 		true
 	}
 
-	fn increment_failure(&mut self, hive_id: &[u8]) -> u32 {
+	fn increment_failure(&mut self, hive_id: impl AsRef<[u8]>) -> u32 {
+		let hive_id = hive_id.as_ref();
 		let Some(entry) = self.hives.get_mut(hive_id) else {
 			return 0;
 		};
@@ -138,13 +144,15 @@ impl Members {
 		entry.failure_count
 	}
 
-	fn reset_failure(&mut self, hive_id: &[u8]) {
+	fn reset_failure(&mut self, hive_id: impl AsRef<[u8]>) {
+		let hive_id = hive_id.as_ref();
 		if let Some(entry) = self.hives.get_mut(hive_id) {
 			entry.failure_count = 0;
 		}
 	}
 
-	fn touch(&mut self, hive_id: &[u8], utilization: BasisPoints) {
+	fn touch(&mut self, hive_id: impl AsRef<[u8]>, utilization: BasisPoints) {
+		let hive_id = hive_id.as_ref();
 		if let Some(entry) = self.hives.get_mut(hive_id) {
 			entry.last_seen = Instant::now();
 			entry.utilization = utilization;
@@ -243,7 +251,8 @@ impl HiveRegistry {
 	}
 
 	/// Signer bound to `hive_id` at registration, if any
-	pub fn signer_for(&self, hive_id: &[u8]) -> Result<Option<SharedId>, ClusterError> {
+	pub fn signer_for(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<SharedId>, ClusterError> {
+		let hive_id = hive_id.as_ref();
 		let members = self.members.read()?;
 		Ok(members.signer_for(hive_id))
 	}
@@ -253,7 +262,8 @@ impl HiveRegistry {
 	/// An unsigned frame, an unregistered hive, and a hive registered with
 	/// no signer all answer `false`: each leaves an update unattributable to
 	/// the hive it claims to speak for (CWE-639).
-	pub(crate) fn signer_matches(&self, frame: &Frame, hive_id: &[u8]) -> bool {
+	pub(crate) fn signer_matches(&self, frame: &Frame, hive_id: impl AsRef<[u8]>) -> bool {
+		let hive_id = hive_id.as_ref();
 		match (frame.signer_id(), self.signer_for(hive_id)) {
 			(Some(claimed), Ok(Some(bound))) => claimed.as_slice() == bound.as_ref(),
 			_ => false,
@@ -261,33 +271,43 @@ impl HiveRegistry {
 	}
 
 	/// Unregister a hive and remove from indices
-	pub fn unregister(&self, hive_id: &[u8]) -> Result<Option<HiveEntry>, ClusterError> {
+	pub fn unregister(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<HiveEntry>, ClusterError> {
+		let hive_id = hive_id.as_ref();
 		Ok(self.members.write()?.remove(hive_id))
 	}
 
 	/// Find all hives that support a servlet type
-	pub fn hives_for_type(&self, servlet_type: &[u8]) -> Result<Vec<HiveEntry>, ClusterError> {
+	pub fn hives_for_type(&self, servlet_type: impl AsRef<[u8]>) -> Result<Vec<HiveEntry>, ClusterError> {
+		let servlet_type = servlet_type.as_ref();
 		Ok(self.members.read()?.for_type(servlet_type))
 	}
 
 	/// Update hive utilization from heartbeat
-	pub fn update_utilization(&self, hive_id: &[u8], utilization: BasisPoints) -> Result<bool, ClusterError> {
+	pub fn update_utilization(
+		&self,
+		hive_id: impl AsRef<[u8]>,
+		utilization: BasisPoints,
+	) -> Result<bool, ClusterError> {
+		let hive_id = hive_id.as_ref();
 		Ok(self.members.write()?.record_utilization(hive_id, utilization))
 	}
 
 	/// Increment failure count for a hive, returning the new count
-	pub fn increment_failure(&self, hive_id: &[u8]) -> Result<u32, ClusterError> {
+	pub fn increment_failure(&self, hive_id: impl AsRef<[u8]>) -> Result<u32, ClusterError> {
+		let hive_id = hive_id.as_ref();
 		Ok(self.members.write()?.increment_failure(hive_id))
 	}
 
 	/// Reset failure count for a hive
-	pub fn reset_failure(&self, hive_id: &[u8]) -> Result<(), ClusterError> {
+	pub fn reset_failure(&self, hive_id: impl AsRef<[u8]>) -> Result<(), ClusterError> {
+		let hive_id = hive_id.as_ref();
 		self.members.write()?.reset_failure(hive_id);
 		Ok(())
 	}
 
 	/// Touch a hive: update last_seen, utilization, and reset failure count
-	pub fn touch(&self, hive_id: &[u8], utilization: BasisPoints) -> Result<(), ClusterError> {
+	pub fn touch(&self, hive_id: impl AsRef<[u8]>, utilization: BasisPoints) -> Result<(), ClusterError> {
+		let hive_id = hive_id.as_ref();
 		self.members.write()?.touch(hive_id, utilization);
 		Ok(())
 	}
@@ -347,7 +367,8 @@ mod tests {
 		Arc::from(b"test-signer".as_slice())
 	}
 
-	fn request(addr: &[u8], servlets: &[&str]) -> RegisterHiveRequest {
+	fn request(addr: impl AsRef<[u8]>, servlets: &[&str]) -> RegisterHiveRequest {
+		let addr = addr.as_ref();
 		let namespace = ColonyNamespace::default();
 		RegisterHiveRequest {
 			hive_addr: addr.to_vec(),
@@ -362,7 +383,8 @@ mod tests {
 		}
 	}
 
-	fn type_key(name: &str) -> Vec<u8> {
+	fn type_key(name: impl AsRef<str>) -> Vec<u8> {
+		let name = name.as_ref();
 		let namespace = ColonyNamespace::default();
 		let urn = namespace.servlet(name).expect("test names satisfy the mint grammar");
 		urn.type_canonical_bytes()
@@ -373,7 +395,7 @@ mod tests {
 		let registry = HiveRegistry::default();
 		registry.register(request(b"hive1", &["ping", "ping"]), test_signer())?;
 
-		let hives = registry.hives_for_type(&type_key("ping"))?;
+		let hives = registry.hives_for_type(type_key("ping"))?;
 		assert_eq!(hives.len(), 1);
 		assert_eq!(hives[0].servlet_types.len(), 1);
 		Ok(())
@@ -471,7 +493,7 @@ mod tests {
 		let registry = HiveRegistry::default();
 		registry.register(request(b"hive-a", &["echo"]), test_signer())?;
 		registry.unregister(b"hive-a")?;
-		assert!(registry.hives_for_type(&type_key("echo"))?.is_empty());
+		assert!(registry.hives_for_type(type_key("echo"))?.is_empty());
 		assert!(registry.to_available_servlets()?.is_empty());
 		Ok(())
 	}

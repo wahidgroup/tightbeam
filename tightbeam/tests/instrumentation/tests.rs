@@ -41,7 +41,7 @@ tb_process_spec! {
 }
 
 mod sink {
-	use std::sync::{Arc, Mutex};
+	use std::sync::Mutex;
 
 	use tightbeam::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
 	use tightbeam::trace::{TraceCollector, TraceConfig};
@@ -72,7 +72,8 @@ mod sink {
 		}
 	}
 
-	fn count_urn(drained: &[TbEvent], urn: tightbeam::utils::urn::Urn<'static>) -> usize {
+	fn count_urn(drained: impl AsRef<[TbEvent]>, urn: tightbeam::utils::urn::Urn<'static>) -> usize {
+		let drained = drained.as_ref();
 		drained.iter().filter(|e| e.urn == urn).count()
 	}
 
@@ -82,7 +83,7 @@ mod sink {
 		let collector = TraceCollector::from(
 			TraceConfig::builder()
 				.with_instrumentation(config)
-				.with_sink(Arc::new(LossFreeSink::default()))
+				.with_sink(LossFreeSink::default())
 				.build(),
 		);
 

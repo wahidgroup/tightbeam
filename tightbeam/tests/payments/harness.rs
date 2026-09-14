@@ -248,7 +248,8 @@ mod tests {
 	use tightbeam::builder::TypeBuilder;
 	use tightbeam::testing::TestMessage;
 
-	fn test_frame(id: &[u8], order: u64) -> Frame {
+	fn test_frame(id: impl AsRef<[u8]>, order: u64) -> Frame {
+		let id = id.as_ref();
 		Version::V2
 			.compose()
 			.with_id(id)

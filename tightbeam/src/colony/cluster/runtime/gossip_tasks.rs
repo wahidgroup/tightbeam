@@ -111,7 +111,8 @@ impl ServletRegistry {
 	/// belongs to a further relay while a direct route holds `relay_id`'s
 	/// own. [`None`] means the relay reached this gateway through another
 	/// hop, so the direct trail from the rumor stands on its own.
-	fn relay_dial_addr(&self, relay_id: &[u8]) -> Option<Arc<[u8]>> {
+	fn relay_dial_addr(&self, relay_id: impl AsRef<[u8]>) -> Option<Arc<[u8]>> {
+		let relay_id = relay_id.as_ref();
 		let entries = self.peer_entries().ok()?;
 		entries
 			.iter()
@@ -133,9 +134,11 @@ impl ClusterConfig {
 	/// - Advertisement rumor through [`ClusterConfig::mint_slate_rumor`]
 	async fn mint_ad_frame<D: ClusterDigest>(
 		&self,
-		gateway_addr: &[u8],
-		types: Vec<Urn<'static>>,
+		gateway_addr: impl AsRef<[u8]>,
+		types: impl IntoIterator<Item = Urn<'static>>,
 	) -> Result<Frame, ClusterError> {
+		let gateway_addr = gateway_addr.as_ref();
+		let types: Vec<Urn<'static>> = types.into_iter().collect();
 		// The wire type owns its bytes, so the encode boundary takes an
 		// owned copy of the address.
 		let request = ClusterRequest::AdvertisePeer(PeerAdvertisement {
@@ -166,9 +169,11 @@ impl ClusterConfig {
 	/// caller records it, and a later beat re-publishes fresh.
 	async fn mint_slate_rumor<D: ClusterDigest>(
 		&self,
-		gateway_addr: &[u8],
-		types: Vec<Urn<'static>>,
+		gateway_addr: impl AsRef<[u8]>,
+		types: impl IntoIterator<Item = Urn<'static>>,
 	) -> Option<MintedAdRumor> {
+		let gateway_addr = gateway_addr.as_ref();
+		let types: Vec<Urn<'static>> = types.into_iter().collect();
 		let ad_frame = self.mint_ad_frame::<D>(gateway_addr, types).await.ok()?;
 		let ad_bytes = encode(&ad_frame).ok()?;
 
@@ -214,7 +219,8 @@ impl ClusterConfig {
 	/// An entry must parse as a discovery hint and pass the operator's
 	/// dial allowlist, so a later feeler probe dials only addresses the
 	/// operator allowed (CWE-284).
-	fn admissible_pex_hints(&self, pex: Vec<PeerGossip>) -> impl Iterator<Item = PeerHint> + '_ {
+	fn admissible_pex_hints(&self, pex: impl IntoIterator<Item = PeerGossip>) -> impl Iterator<Item = PeerHint> + '_ {
+		let pex: Vec<PeerGossip> = pex.into_iter().collect();
 		let allowlist = self.peer.peer_dial_allowlist.as_deref();
 
 		pex.into_iter()
@@ -395,8 +401,9 @@ where
 	async fn publish_slate_rumor<D: ClusterDigest>(
 		&self,
 		gateway_addr: Arc<[u8]>,
-		types: Vec<Urn<'static>>,
+		types: impl IntoIterator<Item = Urn<'static>>,
 	) -> Result<bool, TightBeamError> {
+		let types: Vec<Urn<'static>> = types.into_iter().collect();
 		let Some(minted) = self.config.mint_slate_rumor::<D>(gateway_addr.as_ref(), types).await else {
 			self.trace.event(CLUSTER_PEER_AD_PUBLISH_FAILED)?;
 			return Ok(false);
@@ -450,8 +457,9 @@ where
 		&self,
 		peer_addr: P::Address,
 		acked: &mut HashSet<GossipDigest>,
-		peer: &str,
+		peer: impl AsRef<str>,
 	) -> Result<(), ClusterError> {
+		let peer = peer.as_ref();
 		let now = current_timestamp_ms();
 		// A journal fault belongs to this gateway, so the round is skipped and
 		// scoring stays attributable to the peer.
@@ -536,9 +544,10 @@ where
 		client: &mut crate::transport::PooledClient<P, DefaultCryptoProvider>,
 		reply: GossipWant,
 		acked: &mut HashSet<GossipDigest>,
-		peer: &str,
+		peer: impl AsRef<str>,
 		now: u64,
 	) -> Result<(), ClusterError> {
+		let peer = peer.as_ref();
 		let round: Result<(), ClusterError> = async {
 			// Promotion waits for the reply because a pooled connection keeps
 			// its handshake certificate after the peer dies. Promoting on the
@@ -586,11 +595,12 @@ where
 	/// threshold.
 	async fn dial_targets<D: ClusterDigest>(
 		&self,
-		targets: &[String],
+		targets: impl AsRef<[String]>,
 		ad_frame: Option<&Frame>,
 		push_ledger: &mut HashMap<String, HashSet<GossipDigest>>,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
+		let targets = targets.as_ref();
 		let reconciling = self.config.colony_urn().is_some();
 		for peer in targets {
 			let Ok(peer_addr) = peer.parse::<P::Address>() else {
@@ -627,9 +637,10 @@ where
 	/// prefix bucket keeps holding live addresses.
 	async fn probe_candidates<D: ClusterDigest>(
 		&self,
-		probes: &[String],
+		probes: impl AsRef<[String]>,
 		push_ledger: &mut HashMap<String, HashSet<GossipDigest>>,
 	) {
+		let probes = probes.as_ref();
 		if self.config.colony_urn().is_none() {
 			return;
 		}
@@ -675,9 +686,10 @@ where
 	async fn push_repairs<D: ClusterDigest>(
 		&self,
 		client: &mut crate::transport::PooledClient<P, DefaultCryptoProvider>,
-		wanted: &[GossipDigest],
+		wanted: impl AsRef<[GossipDigest]>,
 		acked: &mut HashSet<GossipDigest>,
 	) -> Result<(), ClusterError> {
+		let wanted = wanted.as_ref();
 		let now = current_timestamp_ms();
 		let seen_ttl_ms = self.config.gossip.seen_ttl.as_millis() as u64;
 		let missing = self.config.gossip.journal.fetch(wanted, now)?;
@@ -774,7 +786,12 @@ where
 	/// A journal lock is poisoned only by a panic this crate forbids, so an
 	/// unrecorded ack leaves the digest pending and the next reconcile round
 	/// re-offers it.
-	async fn deliver_local(&self, payload: Vec<u8>, digest_value: GossipDigest) -> Result<(), TightBeamError> {
+	async fn deliver_local(
+		&self,
+		payload: impl Into<Vec<u8>>,
+		digest_value: GossipDigest,
+	) -> Result<(), TightBeamError> {
+		let payload: Vec<u8> = payload.into();
 		match self.config.gossip.ingress.as_ref() {
 			None => {
 				let _ = self.config.gossip.journal.ack_local(&digest_value);
@@ -978,8 +995,9 @@ where
 		&self,
 		rumor: &Frame,
 		relay: Option<&Frame>,
-		payload: &[u8],
+		payload: impl AsRef<[u8]>,
 	) -> Result<Option<Arc<[u8]>>, TightBeamError> {
+		let payload = payload.as_ref();
 		// `decode` borrows through `AsRef`, so the extra reference is the
 		// signature's requirement, not an indirection slip.
 		let Ok(inner) = decode::<Frame>(&payload) else {
@@ -1086,7 +1104,13 @@ where
 	/// A learned slate traces `CLUSTER_PEER_AD_LEARNED` with the origin
 	/// fingerprint. Every refusal traces `CLUSTER_PEER_AD_DROPPED` (ISO 27001
 	/// A.8.15), carrying the rumor signer when verifiable.
-	fn apply_peer_ad_rumor(&self, rumor: &Frame, relay: Option<&Frame>, payload: &[u8]) -> Result<(), TightBeamError> {
+	fn apply_peer_ad_rumor(
+		&self,
+		rumor: &Frame,
+		relay: Option<&Frame>,
+		payload: impl AsRef<[u8]>,
+	) -> Result<(), TightBeamError> {
+		let payload = payload.as_ref();
 		match self.try_apply_peer_ad_rumor(rumor, relay, payload)? {
 			Some(origin) => {
 				self.trace.event(CLUSTER_PEER_AD_LEARNED)?.with_payload(origin.as_ref()).emit();
@@ -1176,7 +1200,9 @@ impl AdPublishState {
 	/// `true` marks a publish in flight and leaves the baseline untouched
 	/// targets still match the baseline inside the refresh window, or a
 	/// publish already holds the claim.
-	fn take_due(&self, now: u64, slate: &[Urn<'static>], targets: &[String]) -> bool {
+	fn take_due(&self, now: u64, slate: impl AsRef<[Urn<'static>]>, targets: impl AsRef<[String]>) -> bool {
+		let slate = slate.as_ref();
+		let targets = targets.as_ref();
 		let Ok(mut inner) = self.inner.lock() else {
 			return false;
 		};
@@ -1198,7 +1224,14 @@ impl AdPublishState {
 	}
 
 	/// Record a completed publish as the new suppression baseline.
-	fn commit(&self, now: u64, slate: Vec<Urn<'static>>, targets: Vec<String>) {
+	fn commit(
+		&self,
+		now: u64,
+		slate: impl IntoIterator<Item = Urn<'static>>,
+		targets: impl IntoIterator<Item = String>,
+	) {
+		let slate: Vec<Urn<'static>> = slate.into_iter().collect();
+		let targets: Vec<String> = targets.into_iter().collect();
 		let Ok(mut inner) = self.inner.lock() else {
 			return;
 		};
@@ -1370,7 +1403,8 @@ mod tests {
 		config
 	}
 
-	fn config_allowing(allowlist: Vec<String>) -> ClusterConfig {
+	fn config_allowing(allowlist: impl IntoIterator<Item = String>) -> ClusterConfig {
+		let allowlist: Vec<String> = allowlist.into_iter().collect();
 		let mut config = test_config();
 		config.peer.peer_dial_allowlist = Some(allowlist);
 		config
@@ -1394,7 +1428,8 @@ mod tests {
 		}
 	}
 
-	fn pex_entry(addr: &str) -> PeerGossip {
+	fn pex_entry(addr: impl AsRef<str>) -> PeerGossip {
+		let addr = addr.as_ref();
 		PeerGossip { peer_id: Vec::new(), gateway_addr: addr.as_bytes().to_vec() }
 	}
 
@@ -1462,7 +1497,7 @@ mod tests {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
 		state.take_due(0, &[], &[]);
 		state.commit(0, Vec::new(), Vec::new());
-		assert!(state.take_due(1, &ad_slate(&["ping"]), &[]));
+		assert!(state.take_due(1, ad_slate(&["ping"]), &[]));
 	}
 
 	#[test]
@@ -1486,7 +1521,7 @@ mod tests {
 	fn ad_publish_claim_in_flight_blocks_reentry() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
 		state.take_due(0, &[], &[]);
-		assert!(!state.take_due(1, &ad_slate(&["ping"]), &[]));
+		assert!(!state.take_due(1, ad_slate(&["ping"]), &[]));
 	}
 
 	#[test]

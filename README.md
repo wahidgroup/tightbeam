@@ -3616,7 +3616,7 @@ let filter = LogFilter::new(LogLevel::Warning)
 use tightbeam::instrumentation::events;
 use tightbeam::trace::{TraceConfig, logging::*};
 
-let backend = Box::new(StdoutBackend);
+let backend = StdoutBackend;
 let filter = LogFilter::new(LogLevel::Warning);
 let config = LoggerConfig::new(backend, filter)
 	.with_default_level(LogLevel::Info);

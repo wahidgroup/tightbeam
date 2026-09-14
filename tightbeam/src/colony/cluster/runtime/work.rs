@@ -52,7 +52,8 @@ enum ForwardOutcome {
 
 impl ForwardOutcome {
 	/// Classify one answered forward by route kind.
-	fn classify(route_kind: RouteKind, response_payload: Vec<u8>) -> Self {
+	fn classify(route_kind: RouteKind, response_payload: impl Into<Vec<u8>>) -> Self {
+		let response_payload: Vec<u8> = response_payload.into();
 		match route_kind {
 			RouteKind::Local => Self::Local(response_payload),
 			RouteKind::Peer | RouteKind::PeerRelay => match decode::<ClusterWorkResponse>(&response_payload) {
@@ -121,10 +122,11 @@ where
 		&self,
 		choice: &RouteChoice,
 		servlet_type: &Urn<'static>,
-		payload: Vec<u8>,
+		payload: impl Into<Vec<u8>>,
 		budget: HopBudget,
 		frame_cache: &mut Option<Frame>,
 	) -> Result<Vec<u8>, ClusterError> {
+		let payload: Vec<u8> = payload.into();
 		let dial_addr = Arc::clone(&choice.dial_addr);
 
 		// Local hops deliver the client's frame on the hive
@@ -315,10 +317,11 @@ impl ServletRegistry {
 	pub(crate) fn select_route(
 		&self,
 		config: &ClusterConfig,
-		type_key: &[u8],
+		type_key: impl AsRef<[u8]>,
 		budget: HopBudget,
 		exclude: Option<&[u8]>,
 	) -> Option<RouteChoice> {
+		let type_key = type_key.as_ref();
 		let servlet_registry = self;
 		let entries = if budget.allows_forward() {
 			servlet_registry.entries_for_type(type_key)
@@ -408,7 +411,9 @@ mod tests {
 			.expect("test names satisfy the mint grammar")
 	}
 
-	fn peer_entry(peer: &[u8], dial: &[u8]) -> ServletEntry {
+	fn peer_entry(peer: impl AsRef<[u8]>, dial: impl AsRef<[u8]>) -> ServletEntry {
+		let peer = peer.as_ref();
+		let dial = dial.as_ref();
 		let servlet_type = ping_type().canonical_bytes();
 		ServletEntry::peer(
 			Arc::from(peer),
@@ -419,7 +424,10 @@ mod tests {
 		)
 	}
 
-	fn relay_entry(origin: &[u8], relay: &[u8], dial: &[u8]) -> ServletEntry {
+	fn relay_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>, dial: impl AsRef<[u8]>) -> ServletEntry {
+		let origin = origin.as_ref();
+		let relay = relay.as_ref();
+		let dial = dial.as_ref();
 		let servlet_type = ping_type().canonical_bytes();
 		ServletEntry::peer_relay(
 			Arc::from(origin),

@@ -42,7 +42,8 @@ mod tests {
 	use crate::testing::TestMessage;
 	use crate::{Frame, Metadata, Version};
 
-	fn compressed_frame(body: &[u8]) -> Result<Frame> {
+	fn compressed_frame(body: impl AsRef<[u8]>) -> Result<Frame> {
+		let body = body.as_ref();
 		let zstd = ZstdCompression::default();
 		let (compressed, compression_info) = zstd.compress(body, None)?;
 

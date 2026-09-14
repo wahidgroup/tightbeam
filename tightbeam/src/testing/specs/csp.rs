@@ -264,7 +264,8 @@ impl Process {
 	/// holds the steps this process models internally, so it is projected
 	/// before it is compared. Traces model only: hiding is not sound in `F`
 	/// or `FD`.
-	pub fn project(&self, trace: &[Event]) -> Vec<Event> {
+	pub fn project(&self, trace: impl AsRef<[Event]>) -> Vec<Event> {
+		let trace = trace.as_ref();
 		trace.iter().filter(|event| self.observable.contains(event)).copied().collect()
 	}
 
@@ -500,7 +501,8 @@ impl Process {
 
 	/// All states reachable from `states` via hidden (τ) transitions only,
 	/// including the input states. Worklist traversal, no recursion.
-	pub(crate) fn tau_closure(&self, states: &[State]) -> Vec<State> {
+	pub(crate) fn tau_closure(&self, states: impl AsRef<[State]>) -> Vec<State> {
+		let states = states.as_ref();
 		let mut closure: Vec<State> = states.to_vec();
 		let mut seen: HashSet<State> = states.iter().copied().collect();
 		let mut idx = 0;
@@ -521,7 +523,8 @@ impl Process {
 
 	/// Union of enabled actions across a state set, deduplicated and sorted
 	/// for reproducible violation reports
-	fn enabled_from_set(&self, states: &[State]) -> Vec<Action> {
+	fn enabled_from_set(&self, states: impl AsRef<[State]>) -> Vec<Action> {
+		let states = states.as_ref();
 		let mut actions: Vec<Action> = Vec::new();
 		for state in states {
 			for action in self.enabled(*state) {
@@ -664,8 +667,9 @@ impl ProcessBuilder {
 		event: Event,
 		to: State,
 		guard: Option<TimingGuard>,
-		reset_clocks: Vec<String>,
+		reset_clocks: impl IntoIterator<Item = String>,
 	) -> Self {
+		let reset_clocks: Vec<String> = reset_clocks.into_iter().collect();
 		if self.timed_transitions.is_none() {
 			self.timed_transitions = Some(HashMap::new());
 		}
@@ -765,7 +769,7 @@ mod tests {
 	fn project_keeps_only_what_the_spec_observes() -> Result<(), ProcessBuildError> {
 		let spec = alphabet_spec()?;
 		let recorded = [Event("start"), Event("prepare"), Event("audit"), Event("send")];
-		let projected = spec.project(&recorded);
+		let projected = spec.project(recorded);
 		assert_eq!(projected, vec![Event("start"), Event("send")]);
 		Ok(())
 	}

@@ -82,7 +82,8 @@ impl ProcessBuilder {
 	/// Copy the transitions leaving `process`'s initial state so they
 	/// originate from `from` instead, targeting the prefixed copies
 	/// (external choice's first-event commitment).
-	fn fan_out_initial(self, process: &Process, from: State, prefix: &str) -> Self {
+	fn fan_out_initial(self, process: &Process, from: State, prefix: impl AsRef<str>) -> Self {
+		let prefix = prefix.as_ref();
 		process
 			.enabled(process.initial)
 			.into_iter()
@@ -229,7 +230,8 @@ impl Process {
 impl State {
 	/// Create a renamed copy of a state under an operand prefix, used by the
 	/// composition operators to keep operand state spaces disjoint
-	pub fn prefixed(s: &State, prefix: &str) -> State {
+	pub fn prefixed(s: &State, prefix: impl AsRef<str>) -> State {
+		let prefix = prefix.as_ref();
 		State(intern(format!("{}_{}", prefix, s.0)))
 	}
 }

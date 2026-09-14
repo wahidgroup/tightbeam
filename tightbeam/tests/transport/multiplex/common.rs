@@ -50,11 +50,12 @@ pub type ServeTask = JoinHandle<Result<(), TransportError>>;
 pub type HandlerFuture = Pin<Box<dyn Future<Output = ResponsePackage> + Send>>;
 pub type StatusFuture = Pin<Box<dyn Future<Output = TransitStatus> + Send>>;
 
-pub fn large_mux_frame(label: &str) -> Frame {
+pub fn large_mux_frame(label: impl AsRef<str>) -> Frame {
+	let label = label.as_ref();
 	// Sized so the encoded frame spans roughly fifteen 1024-byte chunks,
 	// enough to cross the rekey record limits the drain scenarios configure.
 	let padding = "x".repeat(15000);
-	mux_frame(&format!("{label}-{padding}"))
+	mux_frame(format!("{label}-{padding}"))
 }
 
 pub fn chunked_offer(cap: u32) -> TransportOffer {
@@ -423,7 +424,8 @@ pub fn saw_multiple_chunks(counter: &AtomicUsize) -> bool {
 }
 
 /// Echo of a body reassembled from streamed chunks.
-pub fn echo_reassembled(buffer: &[u8]) -> ResponsePackage {
+pub fn echo_reassembled(buffer: impl AsRef<[u8]>) -> ResponsePackage {
+	let buffer = buffer.as_ref();
 	match Frame::from_der(buffer) {
 		Ok(frame) => ResponsePackage::new(TransitStatus::Ok, Some(frame)),
 		Err(_) => ResponsePackage::new(TransitStatus::InvalidArgument, None),
@@ -451,7 +453,8 @@ pub fn streaming_echo_handler(chunks_seen: Arc<AtomicUsize>) -> impl Fn(StreamBo
 
 /// Push a payload through a request sink as two chunks, then close:
 /// the smallest sequence exercising the held-back `last` framing.
-pub async fn push_split(mut sink: RequestSink, payload: &[u8]) -> Result<(), TransportError> {
+pub async fn push_split(mut sink: RequestSink, payload: impl AsRef<[u8]>) -> Result<(), TransportError> {
+	let payload = payload.as_ref();
 	let middle = payload.len() / 2;
 	sink.push(&payload[..middle]).await?;
 	sink.push(&payload[middle..]).await?;
@@ -652,8 +655,9 @@ pub async fn write_muxed_end(
 	writer: &mut SplitWriter,
 	stream_id: u32,
 	status: TransitStatus,
-	payload: Vec<u8>,
+	payload: impl Into<Vec<u8>>,
 ) -> Result<(), TightBeamError> {
+	let payload: Vec<u8> = payload.into();
 	let response = MuxEndPackage::new(stream_id, status, payload)?;
 	writer.write_envelope(response.into()).await?;
 	Ok(())
@@ -750,8 +754,9 @@ pub fn is_budget_exhausted(result: &Result<Option<Frame>, TransportError>) -> bo
 pub async fn read_remaining_chunks(
 	reader: &mut SplitReader,
 	stream_id: u32,
-	mut payload: Vec<u8>,
+	payload: impl Into<Vec<u8>>,
 ) -> Result<Vec<u8>, TightBeamError> {
+	let mut payload: Vec<u8> = payload.into();
 	loop {
 		let envelope = reader.read_envelope().await?;
 		let TransportEnvelope::Mux(MuxEnvelope::Data(package)) = envelope else {

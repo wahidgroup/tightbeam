@@ -49,7 +49,8 @@ pub(crate) const STREAM_REPLY_REPORTS_LENGTH: Urn<'static> =
 pub(crate) const DUPLEX_ECHOES_CHUNKS: Urn<'static> =
 	tightbeam::urn!("test", "event:colony-streaming/duplex-echoes-chunks");
 
-fn reply_frame(label: &str) -> Result<Frame, TightBeamError> {
+fn reply_frame(label: impl AsRef<str>) -> Result<Frame, TightBeamError> {
+	let label = label.as_ref();
 	Ok(compose! {
 		V0: id: b"colony-streaming-reply",
 			message: StreamLabel { label: label.to_string() }

@@ -79,7 +79,8 @@ pub async fn respond_echo<T: MessageCollector + Send>(mut transport: T) -> Resul
 }
 
 /// A small labeled frame for multiplexed exchanges.
-pub fn mux_frame(label: &str) -> Frame {
+pub fn mux_frame(label: impl AsRef<str>) -> Frame {
+	let label = label.as_ref();
 	TestFrame::v0(Some(label), None)
 }
 

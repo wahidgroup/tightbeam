@@ -436,7 +436,8 @@ wire_sequence!(ActivateServletResponse { status: plain, servlet_address: octets_
 impl ActivateServletResponse {
 	/// Create a successful activation response
 	#[inline]
-	pub fn ok(address: Vec<u8>) -> Self {
+	pub fn ok(address: impl Into<Vec<u8>>) -> Self {
+		let address: Vec<u8> = address.into();
 		Self { status: TransitStatus::Ok, servlet_address: Some(address) }
 	}
 
@@ -551,7 +552,8 @@ pub struct StopServletResult {
 impl HiveManagementResponse {
 	/// Create a spawn success response
 	#[inline]
-	pub fn spawn_ok(address: Vec<u8>, servlet_id: Urn<'static>) -> Self {
+	pub fn spawn_ok(address: impl Into<Vec<u8>>, servlet_id: Urn<'static>) -> Self {
+		let address: Vec<u8> = address.into();
 		Self {
 			spawn: Some(SpawnServletResult {
 				status: TransitStatus::Ok,
@@ -575,7 +577,8 @@ impl HiveManagementResponse {
 
 	/// Create a list response
 	#[inline]
-	pub fn list_ok(servlets: Vec<ServletInfo>) -> Self {
+	pub fn list_ok(servlets: impl IntoIterator<Item = ServletInfo>) -> Self {
+		let servlets: Vec<ServletInfo> = servlets.into_iter().collect();
 		Self {
 			spawn: None,
 			list: Some(ListServletsResult { status: TransitStatus::Ok, servlets }),

@@ -64,7 +64,8 @@ impl AsRef<[u8]> for WorkOrder {
 struct WorkId(Arc<[u8]>);
 
 impl WorkId {
-	fn new(value: &str) -> Self {
+	fn new(value: impl AsRef<str>) -> Self {
+		let value = value.as_ref();
 		Self(Arc::from(value.as_bytes()))
 	}
 
@@ -97,7 +98,8 @@ impl WorkBatch {
 		Self { work_id, next_order: start_order, entries: Vec::new() }
 	}
 
-	fn push(&mut self, payload: &[u8], priority: MessagePriority) {
+	fn push(&mut self, payload: impl AsRef<[u8]>, priority: MessagePriority) {
+		let payload = payload.as_ref();
 		let entry = WorkFrameSpec { order: self.next_order, payload: payload.to_vec(), priority };
 		self.next_order += 1;
 		self.entries.push(entry);

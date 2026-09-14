@@ -133,7 +133,8 @@ impl RequestSink {
 	/// Meter and send one payload, split to the peer's advertised
 	/// receive size, flagging the final wire chunk `last` when this
 	/// payload closes the body.
-	async fn send_payload(&mut self, payload: &[u8], closes: bool) -> TransportResult<()> {
+	async fn send_payload(&mut self, payload: impl AsRef<[u8]>, closes: bool) -> TransportResult<()> {
+		let payload = payload.as_ref();
 		let credits = payload_credits(
 			payload.len(),
 			self.link.shared().send_chunk_size,
@@ -165,7 +166,8 @@ impl RequestSink {
 
 	/// One wire record: the first chunk travels as the stream's
 	/// `Open` through the atomic open, every later chunk as `Data`.
-	async fn send_chunk(&mut self, chunk: &[u8], last: bool, records: u64) -> TransportResult<()> {
+	async fn send_chunk(&mut self, chunk: impl AsRef<[u8]>, last: bool, records: u64) -> TransportResult<()> {
+		let chunk = chunk.as_ref();
 		match &mut self.stream {
 			SinkStream::Reserved { reservation, duplex } => {
 				let mut request = OpenRequest {

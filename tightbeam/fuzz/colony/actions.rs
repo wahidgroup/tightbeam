@@ -271,7 +271,8 @@ fn inner_ping_frame() -> Result<Frame, TightBeamError> {
 	compose! { V0: id: "colony-fuzz-inner", order: 0u64, message: PingRequest { value: 21 } }
 }
 
-fn classify_work_message(message: &[u8], payload_ok: impl FnOnce(&[u8]) -> bool) -> AuthzClass {
+fn classify_work_message(message: impl AsRef<[u8]>, payload_ok: impl FnOnce(&[u8]) -> bool) -> AuthzClass {
+	let message = message.as_ref();
 	match decode::<ClusterWorkResponse>(&message) {
 		Ok(response) if response.status == TransitStatus::Ok => match response.into_frame() {
 			Ok(Some(frame)) if payload_ok(frame.message()) => AuthzClass::Success,
@@ -890,9 +891,11 @@ async fn failover_probe(
 fn pin_decoy_for(
 	gateway: &crate::topology::ColonyFuzzGateway,
 	pin: &std::sync::Mutex<Option<Vec<u8>>>,
-	type_name: &str,
-	dial_addr: &[u8],
+	type_name: impl AsRef<str>,
+	dial_addr: impl AsRef<[u8]>,
 ) {
+	let type_name = type_name.as_ref();
+	let dial_addr = dial_addr.as_ref();
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	let key = gateway.peer_routes().into_iter().find_map(|route| {
 		if route.dial_addr.as_ref() != dial_addr || route.servlet_type.as_ref() != canonical.as_slice() {

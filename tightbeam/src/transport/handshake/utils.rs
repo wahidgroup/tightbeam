@@ -59,13 +59,14 @@ pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), Hands
 /// Wider digests (e.g. SHA3-512) truncate to the leading 32 bytes.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub fn compute_transcript_digest<D>(data: &[u8]) -> Result<[u8; 32], HandshakeError>
+pub fn compute_transcript_digest<D>(data: impl AsRef<[u8]>) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
+	let data = data.as_ref();
 	use crate::transport::handshake::primitives::transcript::digest_output_to_array;
 
-	digest_output_to_array(&D::digest(data))
+	digest_output_to_array(D::digest(data))
 }
 
 /// Compute the ECIES handshake transcript hash from its ordered legs.
@@ -88,15 +89,19 @@ where
 /// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
 #[cfg(feature = "transport-ecies")]
 pub fn compute_ecies_transcript_hash<D>(
-	client_hello: &[u8],
+	client_hello: impl AsRef<[u8]>,
 	server_random: &[u8; 32],
-	spki_bytes: &[u8],
-	accept_der: &[u8],
-	transport_accept_der: &[u8],
+	spki_bytes: impl AsRef<[u8]>,
+	accept_der: impl AsRef<[u8]>,
+	transport_accept_der: impl AsRef<[u8]>,
 ) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
+	let client_hello = client_hello.as_ref();
+	let spki_bytes = spki_bytes.as_ref();
+	let accept_der = accept_der.as_ref();
+	let transport_accept_der = transport_accept_der.as_ref();
 	let mut data =
 		Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len() + transport_accept_der.len());
 	data.extend_from_slice(client_hello);
@@ -128,12 +133,14 @@ where
 #[cfg(feature = "transport-ecies")]
 pub fn compute_client_auth_digest<D>(
 	transcript_hash: &[u8; 32],
-	encrypted_data: &[u8],
-	client_cert_der: &[u8],
+	encrypted_data: impl AsRef<[u8]>,
+	client_cert_der: impl AsRef<[u8]>,
 ) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
+	let encrypted_data = encrypted_data.as_ref();
+	let client_cert_der = client_cert_der.as_ref();
 	let mut data = Vec::with_capacity(32 + encrypted_data.len() + client_cert_der.len());
 	data.extend_from_slice(transcript_hash);
 	data.extend_from_slice(encrypted_data);

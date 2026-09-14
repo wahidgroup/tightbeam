@@ -990,7 +990,8 @@ mod tests {
 	}
 
 	#[cfg(feature = "transport-multiplex")]
-	fn frame_payload(label: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+	fn frame_payload(label: impl AsRef<str>) -> Result<Vec<u8>, Box<dyn Error>> {
+		let label = label.as_ref();
 		let payload = TestFrame::v0(Some(label), None).to_der()?;
 		Ok(payload)
 	}

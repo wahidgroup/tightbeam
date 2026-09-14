@@ -350,7 +350,8 @@ mod tests {
 	}
 
 	impl ScriptedBytes {
-		fn new(data: &[u8]) -> Self {
+		fn new(data: impl AsRef<[u8]>) -> Self {
+			let data = data.as_ref();
 			Self { data: data.to_vec(), pos: 0, written: Vec::new() }
 		}
 	}
@@ -388,7 +389,7 @@ mod tests {
 	#[tokio::test]
 	async fn blanket_recovers_short_form_frame() -> Result<(), TransportError> {
 		let wire = [0x30, 0x03, 0x01, 0x02, 0x03];
-		let mut stream = ScriptedBytes::new(&wire);
+		let mut stream = ScriptedBytes::new(wire);
 		let frame = AsyncProtocolStream::read_frame(&mut stream, 64).await?;
 		assert_eq!(frame, wire);
 		Ok(())
@@ -407,21 +408,21 @@ mod tests {
 
 	#[tokio::test]
 	async fn blanket_rejects_non_canonical_length() {
-		let mut stream = ScriptedBytes::new(&[0x30, 0x81, 0x05]);
+		let mut stream = ScriptedBytes::new([0x30, 0x81, 0x05]);
 		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
 		assert!(matches!(result, Err(TransportError::InvalidMessage)));
 	}
 
 	#[tokio::test]
 	async fn blanket_rejects_indefinite_length() {
-		let mut stream = ScriptedBytes::new(&[0x30, 0x80]);
+		let mut stream = ScriptedBytes::new([0x30, 0x80]);
 		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
 		assert!(matches!(result, Err(TransportError::InvalidMessage)));
 	}
 
 	#[tokio::test]
 	async fn blanket_rejects_over_cap_before_reading_content() {
-		let mut stream = ScriptedBytes::new(&[0x30, 0x82, 0x01, 0x00]);
+		let mut stream = ScriptedBytes::new([0x30, 0x82, 0x01, 0x00]);
 		let result = AsyncProtocolStream::read_frame(&mut stream, 64).await;
 		assert!(matches!(
 			result,
@@ -434,7 +435,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn boundary_eof_maps_to_connection_closed() {
-		let mut stream = ScriptedBytes::new(&[]);
+		let mut stream = ScriptedBytes::new([]);
 		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
 		assert!(matches!(result, Err(TransportError::ConnectionClosed)));
 	}
@@ -443,14 +444,14 @@ mod tests {
 	async fn truncated_frame_maps_to_invalid_message() {
 		// Frame promises three content bytes, delivers one: EOF mid-frame
 		// is truncation, not a clean close.
-		let mut stream = ScriptedBytes::new(&[0x30, 0x03, 0x01]);
+		let mut stream = ScriptedBytes::new([0x30, 0x03, 0x01]);
 		let result = AsyncProtocolStream::read_frame(&mut stream, 1024).await;
 		assert!(matches!(result, Err(TransportError::InvalidMessage)));
 	}
 
 	#[tokio::test]
 	async fn blanket_write_frame_passes_bytes_through() -> Result<(), TransportError> {
-		let mut stream = ScriptedBytes::new(&[]);
+		let mut stream = ScriptedBytes::new([]);
 		AsyncProtocolStream::write_frame(&mut stream, &[0x30, 0x01, 0xFF]).await?;
 		assert_eq!(stream.written, vec![0x30, 0x01, 0xFF]);
 		Ok(())

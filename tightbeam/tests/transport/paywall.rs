@@ -135,7 +135,8 @@ enum DrawRig {
 
 impl DrawRig {
 	/// The number the house announces for `pick`.
-	fn outcome(self, pick: &str) -> String {
+	fn outcome(self, pick: impl AsRef<str>) -> String {
+		let pick = pick.as_ref();
 		match self {
 			Self::AlwaysWin => pick.to_owned(),
 			Self::HouseAlwaysWins => format!("house-keeps-{pick}"),
@@ -288,7 +289,9 @@ impl CreditLedger {
 	/// The house's announcement for one ticket: a rigged outcome while
 	/// the account holds credit (debiting one), [`ACCOUNT_EMPTY`] after.
 	/// The first ticket from a public key deposits the opening balance.
-	fn announce(&self, account: &[u8], rig: DrawRig, pick: &str) -> String {
+	fn announce(&self, account: impl AsRef<[u8]>, rig: DrawRig, pick: impl AsRef<str>) -> String {
+		let account = account.as_ref();
+		let pick = pick.as_ref();
 		let mut accounts = self.lock();
 		let balance = accounts.entry(account.to_vec()).or_insert(DRAW_CREDITS);
 		match balance {
@@ -387,7 +390,8 @@ fn pool_with_offer(
 
 /// One draw: emit the pick as a ticket, decode the announced number, and
 /// report whether the gambler won.
-async fn draw(lease: &mut PooledClient<TokioListener>, pick: &str) -> Result<String, TightBeamError> {
+async fn draw(lease: &mut PooledClient<TokioListener>, pick: impl AsRef<str>) -> Result<String, TightBeamError> {
+	let pick = pick.as_ref();
 	let ticket = TestFrame::v0(Some(pick), None);
 	let Some(announcement) = lease.emit(ticket, None).await? else {
 		return Err(expectation_failure("draw produced no announcement"));
@@ -690,7 +694,8 @@ impl HouseBooks {
 		Self { paywall: PaywallContext::generate(), receipts_seen: Mutex::new(HashSet::new()) }
 	}
 
-	fn note_receipt(&self, transcript: Vec<u8>) {
+	fn note_receipt(&self, transcript: impl Into<Vec<u8>>) {
+		let transcript: Vec<u8> = transcript.into();
 		self.lock().insert(transcript);
 	}
 

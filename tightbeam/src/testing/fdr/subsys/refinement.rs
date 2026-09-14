@@ -263,7 +263,12 @@ where
 
 	/// Check if an implementation failure exists in the specification failures.
 	/// Returns true if a matching spec failure is found where impl_refusal ⊆ spec_refusal.
-	fn failure_exists_in_spec(spec_failures: &[Failure], impl_trace: &Trace, impl_refusal: &HashSet<Event>) -> bool {
+	fn failure_exists_in_spec(
+		spec_failures: impl AsRef<[Failure]>,
+		impl_trace: &Trace,
+		impl_refusal: &HashSet<Event>,
+	) -> bool {
+		let spec_failures = spec_failures.as_ref();
 		for (spec_trace, spec_refusal) in spec_failures {
 			if spec_trace == impl_trace && impl_refusal.is_subset(spec_refusal) {
 				return true;

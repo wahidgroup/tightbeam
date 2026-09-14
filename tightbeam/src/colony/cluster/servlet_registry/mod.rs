@@ -61,14 +61,16 @@ impl Routes {
 		self.entries.insert(address, Arc::new(entry));
 	}
 
-	pub(super) fn remove(&mut self, address: &[u8]) -> Option<Arc<ServletEntry>> {
+	pub(super) fn remove(&mut self, address: impl AsRef<[u8]>) -> Option<Arc<ServletEntry>> {
+		let address = address.as_ref();
 		let entry = self.entries.remove(address)?;
 		self.drop_index_rows(&entry, address);
 		Some(entry)
 	}
 
 	/// Drops the index rows of whatever currently sits at `address`.
-	fn unindex(&mut self, address: &[u8]) {
+	fn unindex(&mut self, address: impl AsRef<[u8]>) {
+		let address = address.as_ref();
 		let Some(previous) = self.entries.get(address).map(Arc::clone) else {
 			return;
 		};
@@ -76,12 +78,14 @@ impl Routes {
 		self.drop_index_rows(&previous, address);
 	}
 
-	fn drop_index_rows(&mut self, entry: &ServletEntry, address: &[u8]) {
+	fn drop_index_rows(&mut self, entry: &ServletEntry, address: impl AsRef<[u8]>) {
+		let address = address.as_ref();
 		Self::retire(&mut self.by_type, entry.servlet_type(), address);
 		Self::retire(&mut self.by_bucket, entry.bucket(), address);
 	}
 
-	fn retire(index: &mut HashMap<SharedId, Vec<SharedId>>, key: &SharedId, address: &[u8]) {
+	fn retire(index: &mut HashMap<SharedId, Vec<SharedId>>, key: &SharedId, address: impl AsRef<[u8]>) {
+		let address = address.as_ref();
 		let Some(addresses) = index.get_mut(key) else {
 			return;
 		};
@@ -96,7 +100,9 @@ impl Routes {
 	///
 	/// The new entries land before the departed ones leave, so no reader
 	/// observes the bucket empty mid-swap and no rollback is required.
-	pub(super) fn reconcile(&mut self, bucket: &[u8], slate: Vec<ServletEntry>) {
+	pub(super) fn reconcile(&mut self, bucket: impl AsRef<[u8]>, slate: impl IntoIterator<Item = ServletEntry>) {
+		let bucket = bucket.as_ref();
+		let slate: Vec<ServletEntry> = slate.into_iter().collect();
 		let mut fresh: Vec<SharedId> = Vec::with_capacity(slate.len());
 		for entry in slate {
 			fresh.push(Arc::clone(entry.route_key()));
@@ -120,7 +126,8 @@ impl Routes {
 		}
 	}
 
-	pub(super) fn get(&self, address: &[u8]) -> Option<&Arc<ServletEntry>> {
+	pub(super) fn get(&self, address: impl AsRef<[u8]>) -> Option<&Arc<ServletEntry>> {
+		let address = address.as_ref();
 		self.entries.get(address)
 	}
 
@@ -129,17 +136,20 @@ impl Routes {
 	}
 
 	/// Route keys serving `servlet_type`, borrowed from the index.
-	pub(super) fn addresses_for_type(&self, servlet_type: &[u8]) -> &[SharedId] {
+	pub(super) fn addresses_for_type(&self, servlet_type: impl AsRef<[u8]>) -> &[SharedId] {
+		let servlet_type = servlet_type.as_ref();
 		self.by_type.get(servlet_type).map_or(&[], Vec::as_slice)
 	}
 
 	/// Route keys in `bucket`, borrowed from the index.
-	pub(super) fn addresses_in_bucket(&self, bucket: &[u8]) -> &[SharedId] {
+	pub(super) fn addresses_in_bucket(&self, bucket: impl AsRef<[u8]>) -> &[SharedId] {
+		let bucket = bucket.as_ref();
 		self.by_bucket.get(bucket).map_or(&[], Vec::as_slice)
 	}
 
 	/// Whether a local route already claims `hive_id` as its key or bucket.
-	pub(super) fn peer_key_conflicts_local(&self, hive_id: &[u8]) -> bool {
+	pub(super) fn peer_key_conflicts_local(&self, hive_id: impl AsRef<[u8]>) -> bool {
+		let hive_id = hive_id.as_ref();
 		if self.get(hive_id).is_some_and(|entry| entry.route_kind() == RouteKind::Local) {
 			return true;
 		}
@@ -151,7 +161,8 @@ impl Routes {
 	}
 
 	/// Whether a local route already dials `dial_addr`.
-	pub(super) fn peer_dial_conflicts_local(&self, dial_addr: &[u8]) -> bool {
+	pub(super) fn peer_dial_conflicts_local(&self, dial_addr: impl AsRef<[u8]>) -> bool {
+		let dial_addr = dial_addr.as_ref();
 		self.values()
 			.any(|entry| entry.route_kind() == RouteKind::Local && entry.route_key().as_ref() == dial_addr)
 	}
@@ -159,12 +170,13 @@ impl Routes {
 	/// Whether admitting `new_slate_len` routes for `bucket` would pass a cap.
 	pub(super) fn slate_exceeds_caps(
 		&self,
-		bucket: &[u8],
+		bucket: impl AsRef<[u8]>,
 		new_slate_len: usize,
 		count_kind: RouteKind,
 		max_identities: usize,
 		max_routes: usize,
 	) -> bool {
+		let bucket = bucket.as_ref();
 		if new_slate_len == 0 {
 			return false;
 		}
@@ -203,13 +215,14 @@ impl Routes {
 		&mut self,
 		bucket: &SharedId,
 		dial_addr: Option<&[u8]>,
-		slate: Vec<ServletEntry>,
+		slate: impl IntoIterator<Item = ServletEntry>,
 		count_kind: RouteKind,
 		max_identities: usize,
 		max_routes: usize,
 		order: u64,
 		tombstone_window_ms: u64,
 	) -> Result<(), ClusterError> {
+		let slate: Vec<ServletEntry> = slate.into_iter().collect();
 		if self.ad_orders.get(bucket.as_ref()).is_some_and(|&applied| order < applied) {
 			return Err(ClusterError::StalePeerAd);
 		}
@@ -239,7 +252,8 @@ impl Routes {
 	}
 
 	/// Drops every relay trail learned for one origin identity.
-	pub(super) fn remove_relay_trails_for_origin(&mut self, origin_id: &[u8]) -> usize {
+	pub(super) fn remove_relay_trails_for_origin(&mut self, origin_id: impl AsRef<[u8]>) -> usize {
+		let origin_id = origin_id.as_ref();
 		let stale: Vec<SharedId> = self
 			.values()
 			.filter(|entry| entry.route_kind() == RouteKind::PeerRelay)
@@ -289,10 +303,12 @@ impl Routes {
 	/// - [`ClusterError::ServletNotFound`] -- a removal names an absent address.
 	pub(super) fn apply_address_update(
 		&mut self,
-		hive_id: &[u8],
-		added: Vec<ServletEntry>,
+		hive_id: impl AsRef<[u8]>,
+		added: impl IntoIterator<Item = ServletEntry>,
 		removed: &[&[u8]],
 	) -> Result<(), ClusterError> {
+		let hive_id = hive_id.as_ref();
+		let added: Vec<ServletEntry> = added.into_iter().collect();
 		for entry in &added {
 			if entry.owner_id().as_ref() != hive_id {
 				return Err(ClusterError::ServletNotOwned);

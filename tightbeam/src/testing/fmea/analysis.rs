@@ -163,7 +163,8 @@ mod tests {
 	use super::*;
 	use crate::testing::specs::csp::{Event, Process, State};
 
-	fn create_fault(state: &str) -> InjectedFaultRecord {
+	fn create_fault(state: impl AsRef<str>) -> InjectedFaultRecord {
+		let state = state.as_ref();
 		InjectedFaultRecord {
 			csp_state: state.to_string(),
 			event_label: "test_event".to_string(),

@@ -5,9 +5,6 @@
 
 use core::fmt::Debug;
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::Certificate;
@@ -207,7 +204,7 @@ pub trait TrustBuilder: Sized {
 	///
 	/// Validates expiry and issuer/subject chaining. All certificates
 	/// in the chain are added to the trust store.
-	fn with_chain(self, chain: Vec<Certificate>) -> Result<Self, CertificateValidationError>;
+	fn with_chain(self, chain: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError>;
 
 	/// Add a single trusted certificate (leaf certificate).
 	fn with_certificate(self, cert: Certificate) -> Result<Self, CertificateValidationError>;
@@ -656,7 +653,8 @@ impl<D: Digest> CertificateTrustBuilder<D> {
 impl<D: Digest> TrustBuilder for CertificateTrustBuilder<D> {
 	type Store = CertificateTrustStore;
 
-	fn with_chain(mut self, chain: Vec<Certificate>) -> Result<Self, CertificateValidationError> {
+	fn with_chain(mut self, chain: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError> {
+		let chain: Vec<Certificate> = chain.into_iter().collect();
 		if chain.is_empty() {
 			return Err(CertificateValidationError::EmptyChain);
 		}
@@ -933,7 +931,8 @@ mod tests {
 	// ========================================================================
 
 	/// Wrap an empty payload in an extension with the given OID and criticality.
-	fn opaque_extension(oid: &str, critical: bool) -> crate::x509::ext::Extension {
+	fn opaque_extension(oid: impl AsRef<str>, critical: bool) -> crate::x509::ext::Extension {
+		let oid = oid.as_ref();
 		crate::x509::ext::Extension {
 			extn_id: crate::der::oid::ObjectIdentifier::new_unwrap(oid),
 			critical,

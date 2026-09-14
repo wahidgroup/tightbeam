@@ -244,7 +244,9 @@ fn session_key_bytes(
 
 /// True when `needle` appears as a contiguous window inside `haystack`.
 #[cfg(feature = "transport-cms")]
-fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
+	let haystack = haystack.as_ref();
+	let needle = needle.as_ref();
 	haystack.windows(needle.len()).any(|window| window == needle)
 }
 

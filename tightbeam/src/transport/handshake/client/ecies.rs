@@ -213,8 +213,9 @@ where
 	/// aborts the handshake.
 	fn validate_and_extract_server_handshake(
 		&self,
-		server_handshake_der: &[u8],
+		server_handshake_der: impl AsRef<[u8]>,
 	) -> Result<ServerHandshake, HandshakeError> {
+		let server_handshake_der = server_handshake_der.as_ref();
 		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
 		let validator = self.certificate_validator.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
 
@@ -314,8 +315,9 @@ where
 	/// The client key exchange to send next.
 	pub async fn process_server_handshake(
 		&mut self,
-		server_handshake_der: &[u8],
+		server_handshake_der: impl AsRef<[u8]>,
 	) -> Result<ClientKeyExchange, HandshakeError> {
+		let server_handshake_der = server_handshake_der.as_ref();
 		// 1. Validation: must have sent hello
 		self.validate_expected_state(ClientHandshakeState::HelloSent)?;
 		let _client_random_check = self.client_random.ok_or(HandshakeError::InvalidState)?;
@@ -518,8 +520,9 @@ where
 	async fn prepare_client_auth(
 		&self,
 		server_handshake: &ServerHandshake,
-		encrypted_data: &[u8],
+		encrypted_data: impl AsRef<[u8]>,
 	) -> Result<(Option<Certificate>, Option<OctetString>), HandshakeError> {
+		let encrypted_data = encrypted_data.as_ref();
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 		let identity = match (&self.identity, server_handshake.client_cert_required) {
 			(Some(identity), _) => identity,
@@ -844,7 +847,7 @@ mod tests {
 
 		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 		let server_handshake_der =
-			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
+			create_test_server_handshake(&test_cert.certificate, &server_random, signature_bytes.to_bytes())?;
 
 		// When: Client processes the server handshake. The test asserts on the
 		// state the call leaves behind, not on the message it returns.
@@ -886,7 +889,7 @@ mod tests {
 		);
 		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 		let server_handshake_der =
-			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
+			create_test_server_handshake(&test_cert.certificate, &server_random, signature_bytes.to_bytes())?;
 
 		let result = client.process_server_handshake(&server_handshake_der).await;
 		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));

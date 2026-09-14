@@ -16,7 +16,8 @@ pub const TRANSCRIPT_HASH_LEN: usize = 32;
 /// their leading 32 bytes, following the NIST SHA-512/256 construction: the
 /// wire format carries exactly 32 bytes and the leading bytes of a wider
 /// digest retain full 256-bit collision resistance (CWE-1240).
-pub(crate) fn digest_output_to_array(bytes: &[u8]) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+pub(crate) fn digest_output_to_array(bytes: impl AsRef<[u8]>) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+	let bytes = bytes.as_ref();
 	if bytes.len() < TRANSCRIPT_HASH_LEN {
 		return Err(HandshakeError::TranscriptDigestLength { expected: TRANSCRIPT_HASH_LEN, received: bytes.len() });
 	}
@@ -44,7 +45,7 @@ pub fn transcript_hash<P: CryptoProvider>(messages: &[&[u8]]) -> Result<[u8; TRA
 		hasher.update(message);
 	}
 
-	digest_output_to_array(&hasher.finalize())
+	digest_output_to_array(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -97,7 +98,7 @@ mod tests {
 	fn test_digest_output_narrow_rejected_wide_truncated() -> Result<(), HandshakeError> {
 		let narrow = [0u8; 28];
 		assert!(matches!(
-			digest_output_to_array(&narrow),
+			digest_output_to_array(narrow),
 			Err(HandshakeError::TranscriptDigestLength { expected: 32, received: 28 })
 		));
 
@@ -106,7 +107,7 @@ mod tests {
 			*byte = i as u8;
 		}
 
-		let truncated = digest_output_to_array(&wide)?;
+		let truncated = digest_output_to_array(wide)?;
 		assert_eq!(truncated, wide[..32]);
 		Ok(())
 	}

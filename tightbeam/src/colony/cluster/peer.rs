@@ -101,7 +101,8 @@ impl HopBudget {
 	/// client's encoded frame and travels opaquely, so a relay hop
 	/// re-encodes nothing.
 	#[must_use]
-	pub(crate) fn relayed_work(self, servlet_type: Urn<'static>, payload: Vec<u8>) -> ClusterWorkRequest {
+	pub(crate) fn relayed_work(self, servlet_type: Urn<'static>, payload: impl Into<Vec<u8>>) -> ClusterWorkRequest {
+		let payload: Vec<u8> = payload.into();
 		ClusterWorkRequest { servlet_type, payload, hops_remaining: self.spend().wire() }
 	}
 
@@ -259,7 +260,8 @@ impl AdmittedPeerAd {
 /// Refuses empty, non-UTF-8, NUL-bearing, or non-parseable sockets.
 /// The dial path parses UTF-8, and NUL would corrupt composite route keys.
 #[must_use]
-fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
+fn peer_gateway_addr_valid(gateway_addr: impl AsRef<[u8]>) -> bool {
+	let gateway_addr = gateway_addr.as_ref();
 	let nonempty = !gateway_addr.is_empty();
 	let no_nul = !gateway_addr.contains(&0);
 	let Ok(addr) = core::str::from_utf8(gateway_addr) else {
@@ -274,7 +276,8 @@ fn peer_gateway_addr_valid(gateway_addr: &[u8]) -> bool {
 ///
 /// `None` accepts any address that already passed [`peer_gateway_addr_valid`].
 #[must_use]
-pub(crate) fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]>) -> bool {
+pub(crate) fn peer_dial_allowed(gateway_addr: impl AsRef<[u8]>, allowlist: Option<&[String]>) -> bool {
+	let gateway_addr = gateway_addr.as_ref();
 	let Some(allowed) = allowlist else {
 		return true;
 	};
@@ -288,11 +291,13 @@ pub(crate) fn peer_dial_allowed(gateway_addr: &[u8], allowlist: Option<&[String]
 
 /// Wire-level advertisement checks. No registry lock.
 fn peer_advertisement_wire_ok(
-	gateway_addr: &[u8],
-	types: &[Urn<'static>],
+	gateway_addr: impl AsRef<[u8]>,
+	types: impl AsRef<[Urn<'static>]>,
 	namespace: &ColonyNamespace,
 	allowlist: Option<&[String]>,
 ) -> Result<(), TransitStatus> {
+	let gateway_addr = gateway_addr.as_ref();
+	let types = types.as_ref();
 	let dial_valid = peer_gateway_addr_valid(gateway_addr);
 	let dial_allowed = peer_dial_allowed(gateway_addr, allowlist);
 	let types_valid = namespace.all_bare_servlet_types(types);
@@ -456,7 +461,9 @@ mod tests {
 		assert_eq!(slate[0].route_key()[32], 0);
 	}
 
-	fn admitted_ad(origin: &SharedId, dial: &[u8], types: &[Urn<'static>]) -> AdmittedPeerAd {
+	fn admitted_ad(origin: &SharedId, dial: impl AsRef<[u8]>, types: impl AsRef<[Urn<'static>]>) -> AdmittedPeerAd {
+		let dial = dial.as_ref();
+		let types = types.as_ref();
 		let slate = test_pheromone().peer_slate(origin, Arc::from(dial), types);
 		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial_addr: Arc::from(dial), slate, order: 0 }
 	}

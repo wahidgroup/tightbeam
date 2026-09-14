@@ -98,7 +98,7 @@ where
 				let mut hive_load = TypeLoad::default();
 				for (servlet_type, spawner) in spawners.iter() {
 					let scale = task.config.scaling.scale_config(servlet_type);
-					let load = task.type_load(&servlet_type.type_prefix_bytes());
+					let load = task.type_load(servlet_type.type_prefix_bytes());
 					let metrics = ScalingMetrics {
 						servlet_type: servlet_type.clone(),
 						utilization: load.utilization(),
@@ -155,12 +155,14 @@ struct Cooldowns(HashMap<Vec<u8>, Instant>);
 
 impl Cooldowns {
 	/// Whether `type_key` scaled within the last `cooldown`.
-	fn active(&self, type_key: &[u8], cooldown: Duration) -> bool {
+	fn active(&self, type_key: impl AsRef<[u8]>, cooldown: Duration) -> bool {
+		let type_key = type_key.as_ref();
 		self.0.get(type_key).is_some_and(|stamp| stamp.elapsed() < cooldown)
 	}
 
 	/// Records a scale of `type_key` at this instant.
-	fn stamp(&mut self, type_key: Vec<u8>) {
+	fn stamp(&mut self, type_key: impl Into<Vec<u8>>) {
+		let type_key: Vec<u8> = type_key.into();
 		self.0.insert(type_key, Instant::now());
 	}
 }
@@ -205,7 +207,8 @@ where
 	///
 	/// An instance that reports no utilization falls back to its last
 	/// sample, then to [`UNKNOWN_SERVLET_UTILIZATION_BPS`].
-	fn type_load(&self, type_prefix: &[u8]) -> TypeLoad {
+	fn type_load(&self, type_prefix: impl AsRef<[u8]>) -> TypeLoad {
+		let type_prefix = type_prefix.as_ref();
 		let mut load = TypeLoad::default();
 		let util_guard = self.utilization_map.lock();
 

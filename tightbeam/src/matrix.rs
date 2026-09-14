@@ -79,7 +79,8 @@ impl Default for MatrixDyn {
 
 impl MatrixDyn {
 	/// Construct from row-major n-bytes. Length MUST be n*n.
-	pub fn from_row_major(n: u8, bytes: Vec<u8>) -> Option<Self> {
+	pub fn from_row_major(n: u8, bytes: impl Into<Vec<u8>>) -> Option<Self> {
+		let bytes: Vec<u8> = bytes.into();
 		if n == 0 {
 			return None;
 		}
@@ -221,7 +222,8 @@ impl<const N: usize> Matrix<N> {
 
 	/// Construct from row-major bytes; extra bytes are ignored, missing are
 	/// zeroed.
-	pub fn from_row_major(bytes: &[u8]) -> Self {
+	pub fn from_row_major(bytes: impl AsRef<[u8]>) -> Self {
+		let bytes = bytes.as_ref();
 		let mut m = Self::default();
 		let mut i = 0usize;
 		for r in 0..N {
@@ -478,7 +480,7 @@ mod tests {
 		}
 
 		// Test 6: Conversion consistency between Matrix<N> and MatrixDyn
-		let static_matrix: Matrix<3> = Matrix::from_row_major(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+		let static_matrix: Matrix<3> = Matrix::from_row_major([1, 2, 3, 4, 5, 6, 7, 8, 9]);
 		let dynamic_matrix = MatrixDyn::from_row_major(3, vec![1, 2, 3, 4, 5, 6, 7, 8, 9])
 			.ok_or(MatrixError::LengthMismatch { n: 3, len: 9 })?;
 		for r in 0..3 {

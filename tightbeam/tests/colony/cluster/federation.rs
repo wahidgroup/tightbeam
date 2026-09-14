@@ -54,9 +54,10 @@ fn federation_ctx() -> FederationCtx {
 pub fn federation_conf(
 	certs: &ClusterTestCerts,
 	peer_trust: Arc<dyn CertificateTrust>,
-	peers: Vec<String>,
+	peers: impl IntoIterator<Item = String>,
 	max_hops: u8,
 ) -> ClusterConfig {
+	let peers: Vec<String> = peers.into_iter().collect();
 	let tls = cluster_tls_config(certs).with_peer_trust(peer_trust);
 
 	ClusterConfig::builder(tls)
@@ -72,9 +73,10 @@ pub fn federation_conf(
 fn mux_federation_conf(
 	certs: &ClusterTestCerts,
 	peer_trust: Arc<dyn CertificateTrust>,
-	peers: Vec<String>,
+	peers: impl IntoIterator<Item = String>,
 	max_hops: u8,
 ) -> ClusterConfig {
+	let peers: Vec<String> = peers.into_iter().collect();
 	with_mux_offer(federation_conf(certs, peer_trust, peers, max_hops))
 }
 
@@ -106,11 +108,14 @@ pub async fn flood_ad_rumor(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
 	cluster: &ClusterGateway,
-	gateway_addr: &[u8],
-	advertised_types: Vec<Urn<'static>>,
+	gateway_addr: impl AsRef<[u8]>,
+	advertised_types: impl IntoIterator<Item = Urn<'static>>,
 	hop_ttl: u64,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 ) -> Result<TransitStatus, TightBeamError> {
+	let gateway_addr = gateway_addr.as_ref();
+	let advertised_types: Vec<Urn<'static>> = advertised_types.into_iter().collect();
+	let id = id.as_ref();
 	let advertisement =
 		ClusterRequest::AdvertisePeer(PeerAdvertisement { gateway_addr: gateway_addr.to_vec(), advertised_types });
 	let inner = signed_control_frame_with(signer, id, advertisement).await?;
@@ -139,7 +144,8 @@ pub async fn flood_ad_rumor(
 }
 
 /// Count the live peer routes for `type_name` on `cluster`.
-pub fn type_route_count(cluster: &ClusterGateway, type_name: &str) -> usize {
+pub fn type_route_count(cluster: &ClusterGateway, type_name: impl AsRef<str>) -> usize {
+	let type_name = type_name.as_ref();
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
@@ -152,11 +158,12 @@ pub fn type_route_count(cluster: &ClusterGateway, type_name: &str) -> usize {
 /// attempts exhaust. Branching lives here, not in scenarios.
 pub async fn wait_for_type_routes(
 	cluster: &ClusterGateway,
-	type_name: &str,
+	type_name: impl AsRef<str>,
 	want: usize,
 	attempts: u32,
 	interval: Duration,
 ) -> usize {
+	let type_name = type_name.as_ref();
 	for _ in 0..attempts {
 		let held = type_route_count(cluster, type_name);
 		if held >= want {
@@ -179,10 +186,12 @@ async fn flood_until_routes(
 	signer: &Secp256k1SigningKey,
 	relay: &ClusterGateway,
 	observer: &ClusterGateway,
-	claimed_addr: &[u8],
-	type_name: &str,
+	claimed_addr: impl AsRef<[u8]>,
+	type_name: impl AsRef<str>,
 	want: usize,
 ) -> Result<usize, TightBeamError> {
+	let claimed_addr = claimed_addr.as_ref();
+	let type_name = type_name.as_ref();
 	let mut installed = 0usize;
 	for attempt in 0u32..50 {
 		let id = format!("relay-ad-{type_name}-{attempt}");
@@ -207,7 +216,9 @@ async fn flood_until_routes(
 }
 
 /// Whether any route for `type_name` on `cluster` dials `dial_addr`.
-fn type_route_dials(cluster: &ClusterGateway, type_name: &str, dial_addr: &[u8]) -> bool {
+fn type_route_dials(cluster: &ClusterGateway, type_name: impl AsRef<str>, dial_addr: impl AsRef<[u8]>) -> bool {
+	let type_name = type_name.as_ref();
+	let dial_addr = dial_addr.as_ref();
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
@@ -567,7 +578,8 @@ impl LoadBalancer for DecoyFirstBalancer {
 
 /// Sets the balancer preference. The lock only poisons after a balancer
 /// panic, which fails the scenario anyway.
-fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: Vec<u8>) {
+fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: impl Into<Vec<u8>>) {
+	let key: Vec<u8> = key.into();
 	let mut preferred = cell.lock().expect("preference lock poisons only after a balancer panic");
 	*preferred = Some(key);
 }
@@ -575,7 +587,13 @@ fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: Vec<u8>) {
 /// Route key `cluster` holds for `type_name` toward `dial_addr`,
 /// rebuilt through the public [`ServletEntry::peer`] constructor so
 /// the key discipline stays in one place.
-fn peer_route_key_for_dial(cluster: &ClusterGateway, type_name: &str, dial_addr: &[u8]) -> Option<Vec<u8>> {
+fn peer_route_key_for_dial(
+	cluster: &ClusterGateway,
+	type_name: impl AsRef<str>,
+	dial_addr: impl AsRef<[u8]>,
+) -> Option<Vec<u8>> {
+	let type_name = type_name.as_ref();
+	let dial_addr = dial_addr.as_ref();
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()

@@ -176,7 +176,8 @@ impl core::fmt::Debug for LoggerConfig {
 
 impl LoggerConfig {
 	/// Create logger config with required fields
-	pub fn new(backend: Box<dyn LogBackend>, filter: LogFilter) -> Self {
+	pub fn new(backend: impl LogBackend + 'static, filter: LogFilter) -> Self {
+		let backend: Box<dyn LogBackend> = Box::new(backend);
 		Self { backend, filter, default_level: None }
 	}
 
@@ -351,8 +352,7 @@ mod tests {
 			let captured = Arc::clone(&captured);
 			CaptureBackend::with_captured(captured)
 		};
-		let config =
-			LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Info);
+		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Info);
 		let trace = TraceCollector::default().with_logger(config);
 
 		trace.event(TEST1)?.emit();
@@ -376,7 +376,7 @@ mod tests {
 			let captured = Arc::clone(&captured);
 			CaptureBackend::with_captured(captured)
 		};
-		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug));
+		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 
 		trace.event(NO_LOG)?.emit();
@@ -399,7 +399,7 @@ mod tests {
 			CaptureBackend::with_captured(captured)
 		};
 
-		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Warning));
+		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Warning));
 		let trace = TraceCollector::default().with_logger(config);
 
 		trace.event(EMERGENCY)?.with_log_level(LogLevel::Emergency).emit();
@@ -434,7 +434,7 @@ mod tests {
 		};
 
 		let multiplex = MultiplexBackend::new(vec![Box::new(backend1), Box::new(backend2)]);
-		let config = LoggerConfig::new(Box::new(multiplex), LogFilter::new(LogLevel::Debug));
+		let config = LoggerConfig::new(multiplex, LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 
 		trace.event(TEST)?.with_log_level(LogLevel::Info).emit();

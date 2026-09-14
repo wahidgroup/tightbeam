@@ -58,13 +58,13 @@ pub trait FdrTraceExt {
 	fn terminated_in_valid_state(&self) -> bool;
 
 	/// Get acceptance set after current trace
-	fn acceptance_at(&self, state_label: &str) -> Option<AcceptanceSet>;
+	fn acceptance_at(&self, state_label: impl AsRef<str>) -> Option<AcceptanceSet>;
 
 	/// Check if process can refuse event after state
-	fn can_refuse_after(&self, state_label: &str, event_label: &str) -> bool;
+	fn can_refuse_after(&self, state_label: impl AsRef<str>, event_label: impl AsRef<str>) -> bool;
 
 	/// Count assertion by label (convenience)
-	fn assertion_count(&self, label: &str) -> usize;
+	fn assertion_count(&self, label: impl AsRef<str>) -> usize;
 
 	/// Project trace to observable events only
 	#[cfg(feature = "instrument")]
@@ -130,7 +130,8 @@ impl FdrTraceExt for ConsumedTrace {
 		}
 	}
 
-	fn acceptance_at(&self, state_label: &str) -> Option<AcceptanceSet> {
+	fn acceptance_at(&self, state_label: impl AsRef<str>) -> Option<AcceptanceSet> {
+		let state_label = state_label.as_ref();
 		// Compute acceptance set based on trace structure at given state
 		// State labels in ConsumedTrace context:
 		// - "initial": before gate
@@ -164,7 +165,9 @@ impl FdrTraceExt for ConsumedTrace {
 		Some(acceptance)
 	}
 
-	fn can_refuse_after(&self, state_label: &str, event_label: &str) -> bool {
+	fn can_refuse_after(&self, state_label: impl AsRef<str>, event_label: impl AsRef<str>) -> bool {
+		let state_label = state_label.as_ref();
+		let event_label = event_label.as_ref();
 		// Event can be refused if it's not in the acceptance set at that state
 		if let Some(acceptance) = self.acceptance_at(state_label) {
 			// Check if the event label matches any in the acceptance set
@@ -175,7 +178,8 @@ impl FdrTraceExt for ConsumedTrace {
 		}
 	}
 
-	fn assertion_count(&self, label: &str) -> usize {
+	fn assertion_count(&self, label: impl AsRef<str>) -> usize {
+		let label = label.as_ref();
 		self.assertions
 			.iter()
 			.filter(|a| matches!(&a.label, AssertionLabel::Custom(l) if l.as_ref() == label))
