@@ -14,8 +14,7 @@ pub(crate) const MATRIX_PRESENT: Urn<'static> = tightbeam::urn!("test", "event:f
 pub(crate) const ROUNDTRIP_OK: Urn<'static> = tightbeam::urn!("test", "event:frame-der/roundtrip-ok");
 pub(crate) const VERSION: Urn<'static> = tightbeam::urn!("test", "event:frame-der/version");
 
-#[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
-#[derive(Clone, Debug, PartialEq, Sequence)]
+#[derive(tightbeam::Beamable, Clone, Debug, PartialEq, Sequence)]
 struct TestMessage {
 	content: String,
 }
@@ -26,16 +25,7 @@ impl AsRef<[u8]> for TestMessage {
 	}
 }
 
-#[cfg(not(feature = "derive"))]
-impl tightbeam::Message for TestMessage {
-	const MUST_BE_NON_REPUDIABLE: bool = false;
-	const MUST_BE_CONFIDENTIAL: bool = false;
-	const MUST_BE_COMPRESSED: bool = false;
-	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: asn1::Version = asn1::Version::V0;
-}
-
-#[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
+#[derive(tightbeam::Flaggable)]
 #[repr(u8)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum FlagTestDevelopmentMode {
@@ -44,41 +34,13 @@ enum FlagTestDevelopmentMode {
 	IsMaintenanceMode = 2,
 }
 
-#[cfg(not(feature = "derive"))]
-impl From<FlagTestDevelopmentMode> for u8 {
-	fn from(flag: FlagTestDevelopmentMode) -> u8 {
-		flag as u8
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl PartialEq<u8> for FlagTestDevelopmentMode {
-	fn eq(&self, other: &u8) -> bool {
-		(*self as u8) == *other
-	}
-}
-
-#[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
+#[derive(tightbeam::Flaggable)]
 #[repr(u8)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum FlagTestDebugLevel {
 	#[default]
 	Default = 0,
 	Basic = 1,
-}
-
-#[cfg(not(feature = "derive"))]
-impl From<FlagTestDebugLevel> for u8 {
-	fn from(flag: FlagTestDebugLevel) -> u8 {
-		flag as u8
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl PartialEq<u8> for FlagTestDebugLevel {
-	fn eq(&self, other: &u8) -> bool {
-		(*self as u8) == *other
-	}
 }
 
 tightbeam::flagset!(TestFlagSet: FlagTestDevelopmentMode, FlagTestDebugLevel);

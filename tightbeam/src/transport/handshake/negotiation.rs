@@ -10,12 +10,16 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use std::vec::Vec;
 
 use crate::constants::{
 	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_STREAM_CAP,
 };
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::Error as DerDecodeError;
@@ -24,14 +28,9 @@ use crate::transport::handshake::receipt::SessionReceipt;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 use crate::Beamable;
 
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::vec::Vec;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
 
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 
 /// Maximum number of profiles accepted in a [`SecurityOffer`].
@@ -45,8 +44,7 @@ pub const MAX_OFFER_PROFILES: usize = 32;
 /// Advertises algorithm combinations the client supports. Preference
 /// order is first-most-preferred, but the server selects in *its* local
 /// order (peer offer ordering carries no weight).
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
+#[derive(Clone, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct SecurityOffer {
 	/// Ordered list of security profile descriptors (preference: first is most preferred).
 	pub profiles: Vec<SecurityProfileDesc>,
@@ -69,8 +67,7 @@ impl SecurityOffer {
 ///
 /// Carries the profile selected from the client's [`SecurityOffer`]
 /// under local preference and any [`ProfileStrengthPolicy`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
+#[derive(Clone, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct SecurityAccept {
 	/// The selected security profile descriptor.
 	pub profile: SecurityProfileDesc,
@@ -92,8 +89,7 @@ impl SecurityAccept {
 ///
 /// Fixed per key epoch; only shrinks inside an epoch. Value semantics
 /// (free, fiat, or other) live outside the protocol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct MuxBudgets {
 	/// Credits spendable on client-to-server data chunks.
 	pub client_to_server: u64,
@@ -136,8 +132,7 @@ impl MuxBudgets {
 /// - `requested_budgets` - metering request (`None` = unmetered).
 /// - `authorization` - opaque token for [`TransportAuthorizer`] (never
 ///   parsed by TightBeam).
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
+#[derive(Clone, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct TransportOffer {
 	/// Sender supports stream multiplexing.
 	pub mux: bool,
@@ -223,10 +218,8 @@ impl TransportOffer {
 /// # Additionally
 ///
 /// - `credit_unit` - wins for both directions.
-/// - `granted_budgets` - metered terms (may be lower than requested per
-///   direction; absent = unmetered).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
+/// - `granted_budgets` - metered terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct TransportAccept {
 	/// Sender supports stream multiplexing.
 	pub mux: bool,

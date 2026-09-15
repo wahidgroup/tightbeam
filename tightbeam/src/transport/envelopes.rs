@@ -18,10 +18,7 @@ use crate::der::{Choice, Decode, Encode, EncodeValue, Length, Reader, Result as 
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportError;
 
-#[cfg(feature = "derive")]
 use crate::Beamable;
-#[cfg(not(feature = "derive"))]
-use crate::{Message, Version};
 
 #[cfg(feature = "transport-multiplex")]
 mod multiplex {
@@ -744,8 +741,7 @@ pub enum MuxEnvelope {
 
 /// Transport envelope wrapping all messages at the transport layer.
 /// This is transparent to users and handled internally.
-#[cfg_attr(feature = "derive", derive(Beamable))]
-#[derive(Choice, Clone, Debug, PartialEq)]
+#[derive(Beamable, Choice, Clone, Debug, PartialEq)]
 pub enum TransportEnvelope {
 	#[asn1(context_specific = "0", constructed = "true")]
 	Request(RequestPackage),
@@ -778,15 +774,6 @@ pub enum WireMode {
 	Cleartext,
 	/// Encrypt the encoded envelope prior to emission.
 	Encrypted,
-}
-
-#[cfg(not(feature = "derive"))]
-impl Message for TransportEnvelope {
-	const MUST_BE_NON_REPUDIABLE: bool = false;
-	const MUST_BE_CONFIDENTIAL: bool = false;
-	const MUST_BE_COMPRESSED: bool = false;
-	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: Version = Version::V0;
 }
 
 impl From<ResponsePackage> for TransportEnvelope {

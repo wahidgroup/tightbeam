@@ -17,7 +17,6 @@ use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::TransitStatus;
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulerType, TaskSet};
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 
 // ---------------------------------------------------------------------------
@@ -128,14 +127,13 @@ pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Error type for spec building operations
-#[derive(Debug)]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
+#[derive(Debug, Errorizable)]
 pub enum SpecBuildError {
-	#[cfg_attr(feature = "derive", error("Duplicate label: {0}"))]
+	#[error("Duplicate label: {0}")]
 	DuplicateLabel(Urn<'static>),
-	#[cfg_attr(feature = "derive", error("Unknown ordering label: {0}"))]
+	#[error("Unknown ordering label: {0}")]
 	UnknownOrderingLabel(Urn<'static>),
-	#[cfg_attr(feature = "derive", error("Invalid range: {0}"))]
+	#[error("Invalid range: {0}")]
 	InvalidRange(Urn<'static>),
 }
 

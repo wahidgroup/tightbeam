@@ -56,7 +56,6 @@ use crate::der::oid::AssociatedOid;
 use crate::spki::AlgorithmIdentifierOwned;
 #[cfg(feature = "transport")]
 use crate::transport::handshake::HandshakeError;
-#[cfg(feature = "derive")]
 use crate::Beamable;
 use crate::Errorizable;
 /// Macro to generate key wrapper implementations.
@@ -124,8 +123,7 @@ impl AeadKeySize for crate::crypto::aead::Aes256GcmOid {
 ///
 /// Every field is `Option`: `None` uniformly means "algorithm not part of
 /// this profile" (feature disabled on the producing side).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence)]
-#[cfg_attr(feature = "derive", derive(Beamable))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence, Beamable)]
 pub struct SecurityProfileDesc {
 	pub digest: Option<ObjectIdentifier>,
 	pub aead: Option<ObjectIdentifier>,

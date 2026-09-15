@@ -17,8 +17,6 @@ use crate::testing::result::ScenarioVerdict;
 use crate::testing::specs::{CspValidationResult, Layer, SpecViolation, TBSpec, Violations};
 use crate::trace::ConsumedTrace;
 use crate::transport::error::TransportError;
-
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 
 #[cfg(feature = "testing-fdr")]
@@ -49,40 +47,16 @@ impl Expect {
 }
 
 /// Why [`ScenarioConfigBuilder::build`] refused a configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Errorizable)]
 pub enum ScenarioConfigError {
 	/// Nothing this configuration names can reject a run.
-	#[cfg_attr(
-		feature = "derive",
-		error("no configured verifier can reject a run, so the scenario cannot fail")
-	)]
+	#[error("no configured verifier can reject a run, so the scenario cannot fail")]
 	NoEffectiveVerifier,
 
 	/// The expectation names a layer that cannot reject this configuration.
-	#[cfg_attr(
-		feature = "derive",
-		error("expected a violation from {0:?}, which cannot reject this configuration")
-	)]
+	#[error("expected a violation from {0:?}, which cannot reject this configuration")]
 	ExpectViolationWithoutVerifier(Layer),
 }
-
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for ScenarioConfigError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			Self::NoEffectiveVerifier => {
-				write!(f, "no configured verifier can reject a run, so the scenario cannot fail")
-			}
-			Self::ExpectViolationWithoutVerifier(layer) => {
-				write!(f, "expected a violation from {layer:?}, which cannot reject this configuration")
-			}
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl std::error::Error for ScenarioConfigError {}
 
 /// Unified configuration for tb_scenario! tests (zero-copy with Arc wrapping)
 #[derive(Clone)]

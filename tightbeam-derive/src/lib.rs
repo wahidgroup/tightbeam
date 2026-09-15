@@ -183,6 +183,30 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	expand_beamable(&input).unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
+/// A compile error that fires when a `#[beam]` requirement names a tightbeam
+/// feature the build disables.
+///
+/// The check runs through tightbeam's `shim` macro, so tightbeam's own feature
+/// state decides it. This crate carries no copy of tightbeam's features.
+fn feature_check(
+	name: &syn::Ident,
+	shim: impl AsRef<str>,
+	requirement: impl AsRef<str>,
+	feature: impl AsRef<str>,
+) -> proc_macro2::TokenStream {
+	let shim = syn::Ident::new(shim.as_ref(), name.span());
+	let message = format!(
+		"Message type `{name}` is marked as {} but the `{feature}` feature is not enabled. \
+		 Enable the feature in Cargo.toml: features = [\"{feature}\"]",
+		requirement.as_ref(),
+		feature = feature.as_ref(),
+	);
+
+	quote! {
+		::tightbeam::#shim! { else { compile_error!(#message); } }
+	}
+}
+
 fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 	let name = &input.ident;
 
@@ -226,45 +250,17 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 	let final_frame_integrity = frame_integrity;
 
 	let mut feature_checks = Vec::new();
-
-	if final_confidential && !cfg!(feature = "aead") {
-		feature_checks.push(quote! {
-			compile_error!(concat!(
-				"Message type `", stringify!(#name), "` is marked as confidential ",
-				"but the `aead` feature is not enabled. ",
-				"Enable the feature in Cargo.toml: features = [\"aead\"]"
-			));
-		});
+	if final_confidential {
+		feature_checks.push(feature_check(name, "__tb_if_aead", "confidential", "aead"));
 	}
-
-	if final_nonrep && !cfg!(feature = "signature") {
-		feature_checks.push(quote! {
-			compile_error!(concat!(
-				"Message type `", stringify!(#name), "` is marked as non-repudiable ",
-				"but the `signature` feature is not enabled. ",
-				"Enable the feature in Cargo.toml: features = [\"signature\"]"
-			));
-		});
+	if final_nonrep {
+		feature_checks.push(feature_check(name, "__tb_if_signature", "non-repudiable", "signature"));
 	}
-
-	if compressed && !cfg!(feature = "compress") {
-		feature_checks.push(quote! {
-			compile_error!(concat!(
-				"Message type `", stringify!(#name), "` is marked as compressed ",
-				"but the `compress` feature is not enabled. ",
-				"Enable the feature in Cargo.toml: features = [\"compress\"]"
-			));
-		});
+	if compressed {
+		feature_checks.push(feature_check(name, "__tb_if_compress", "compressed", "compress"));
 	}
-
-	if (final_message_integrity || final_frame_integrity) && !cfg!(feature = "digest") {
-		feature_checks.push(quote! {
-			compile_error!(concat!(
-				"Message type `", stringify!(#name), "` is marked as requiring message integrity ",
-				"but the `digest` feature is not enabled. ",
-				"Enable the feature in Cargo.toml: features = [\"digest\"]"
-			));
-		});
+	if final_message_integrity || final_frame_integrity {
+		feature_checks.push(feature_check(name, "__tb_if_digest", "requiring message integrity", "digest"));
 	}
 
 	let min_version_value = if let Some(version) = final_min_version {
@@ -290,7 +286,7 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 	};
 
 	// Generate checker trait implementations for compile-time OID validation
-	// When HAS_PROFILE = true: generates impls ONLY for the matching OID type from the profile (compile-time enforcement)
+	// When HAS_PROFILE = true: generates impls ONLY for the matching OID type from the profile
 	// When HAS_PROFILE = false: generates generic impls for all OID types (no enforcement, allows any)
 	// All types using #[derive(Beamable)] get these impls - types not using derive must implement manually
 	let oid_validation_helpers = if let Some(profile_ty) = &profile_type {

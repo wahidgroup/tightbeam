@@ -254,6 +254,7 @@ macro_rules! __tb_if_crypto {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_digest {
+	(else { $($absent:tt)* }) => {};
 	($($item:item)*) => { $($item)* };
 }
 
@@ -261,6 +262,7 @@ macro_rules! __tb_if_digest {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_digest {
+	(else { $($absent:tt)* }) => { $($absent)* };
 	($($item:item)*) => {};
 }
 
@@ -268,6 +270,7 @@ macro_rules! __tb_if_digest {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_aead {
+	(else { $($absent:tt)* }) => {};
 	($($item:item)*) => { $($item)* };
 }
 
@@ -275,6 +278,7 @@ macro_rules! __tb_if_aead {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_aead {
+	(else { $($absent:tt)* }) => { $($absent)* };
 	($($item:item)*) => {};
 }
 
@@ -282,6 +286,7 @@ macro_rules! __tb_if_aead {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_signature {
+	(else { $($absent:tt)* }) => {};
 	($($item:item)*) => { $($item)* };
 }
 
@@ -289,6 +294,23 @@ macro_rules! __tb_if_signature {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_signature {
+	(else { $($absent:tt)* }) => { $($absent)* };
+	($($item:item)*) => {};
+}
+
+#[cfg(feature = "compress")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_compress {
+	(else { $($absent:tt)* }) => {};
+	($($item:item)*) => { $($item)* };
+}
+
+#[cfg(not(feature = "compress"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_compress {
+	(else { $($absent:tt)* }) => { $($absent)* };
 	($($item:item)*) => {};
 }
 
