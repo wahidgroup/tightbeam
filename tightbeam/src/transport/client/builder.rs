@@ -209,6 +209,18 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 		self
 	}
 
+	/// Replace the domain-separation tag of the ECIES key exchange.
+	///
+	/// The ECIES handshake binds this tag into the associated data of the
+	/// encrypted key exchange, so an ECIES session completes only when both
+	/// endpoints hold the same tag. The CMS handshake and session records do
+	/// not read it.
+	#[cfg(feature = "x509")]
+	pub fn with_aad_domain_tag(mut self, tag: &'static [u8]) -> Self {
+		self.encryption.aad_domain_tag = tag;
+		self
+	}
+
 	/// Run this client without authenticating the server.
 	///
 	/// A client with no trust store verifies nobody, so [`Self::connect`]

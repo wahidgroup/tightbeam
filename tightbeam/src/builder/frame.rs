@@ -21,9 +21,7 @@ use crate::{DigestInfo, Frame, Message, Metadata, Version};
 #[cfg(feature = "compress")]
 use crate::compress::Compressor;
 #[cfg(feature = "aead")]
-use crate::crypto::aead::Aead;
-#[cfg(feature = "aead")]
-use crate::crypto::aead::Encryptor;
+use crate::crypto::aead::{AeadAlgorithm, Encryptor};
 #[cfg(feature = "digest")]
 use crate::crypto::hash::Digest;
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
@@ -43,47 +41,30 @@ type EncryptorFn = Box<dyn FnOnce(&[u8]) -> Result<crate::EncryptedContentInfo>>
 #[cfg(feature = "signature")]
 type SignerFn = Box<dyn FnOnce(&[u8]) -> Result<crate::SignerInfo>>;
 
-/// Sealed trait pattern for compile-time OID validation
-/// Prevents external impls while allowing conditional enforcement
-#[doc(hidden)]
-pub mod private {
-	#[cfg(any(feature = "digest", feature = "aead", feature = "ecdh", feature = "signature"))]
-	use super::*;
-
-	#[cfg(feature = "digest")]
-	pub trait SealedDigestOid<D: AssociatedOid> {}
-
-	#[cfg(feature = "aead")]
-	pub trait SealedAeadOid<C: AssociatedOid> {}
-
-	#[cfg(feature = "ecdh")]
-	pub trait SealedCurveOid<C: AssociatedOid> {}
-
-	#[cfg(feature = "signature")]
-	pub trait SealedSignatureOid<S: SignatureAlgorithmIdentifier> {}
-}
-
-/// Checker traits for compile-time OID validation
-/// Uses sealed trait pattern to prevent external impls and enable conditional enforcement
+/// A message type that admits digest `D`.
+///
+/// `#[derive(Beamable)]` implements it for every digest when the message names
+/// no profile, and only for the profile's digest when it names
+/// `profile(Type)`. A mismatched digest then fails to compile for a derived
+/// message. Any type can implement this trait, so [`FrameBuilder`] also
+/// compares the OID with the message profile at run time, and that comparison
+/// is the enforcement.
 #[cfg(feature = "digest")]
-pub trait CheckDigestOid<D: AssociatedOid>: private::SealedDigestOid<D> {
-	const RESULT: ();
-}
+pub trait CheckDigestOid<D: AssociatedOid> {}
 
+/// A message type that admits the AEAD algorithm `C`.
+///
+/// The derive implements it the same way as [`CheckDigestOid`], and
+/// [`FrameBuilder`] enforces the profile at run time.
 #[cfg(feature = "aead")]
-pub trait CheckAeadOid<C: AssociatedOid>: private::SealedAeadOid<C> {
-	const RESULT: ();
-}
+pub trait CheckAeadOid<C: AssociatedOid> {}
 
-#[cfg(feature = "ecdh")]
-pub trait CheckCurveOid<C: AssociatedOid>: private::SealedCurveOid<C> {
-	const RESULT: ();
-}
-
+/// A message type that admits the signature algorithm `S`.
+///
+/// The derive implements it the same way as [`CheckDigestOid`], and
+/// [`FrameBuilder`] enforces the profile at run time.
 #[cfg(feature = "signature")]
-pub trait CheckSignatureOid<S: SignatureAlgorithmIdentifier>: private::SealedSignatureOid<S> {
-	const RESULT: ();
-}
+pub trait CheckSignatureOid<S: SignatureAlgorithmIdentifier> {}
 
 /// Zero-allocation error accumulator for FrameBuilder.
 /// Stores up to 5 errors inline, which covers the common case of one
@@ -350,20 +331,21 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Set the AEAD cipher for symmetric encryption
-	pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
+	/// Set the AEAD cipher for symmetric encryption.
+	///
+	/// The cipher type names the algorithm identifier stamped on the frame.
+	pub fn with_aead<Cipher>(mut self, cipher: Cipher) -> Self
 	where
-		C: AssociatedOid,
-		Cipher: Aead + Encryptor<C> + 'static,
-		T: CheckAeadOid<C>,
+		Cipher: AeadAlgorithm + 'static,
+		T: CheckAeadOid<Cipher::Oid>,
 	{
-		// Runtime fallback validation
-		if T::HAS_PROFILE && C::OID != <T::Profile as SecurityProfile>::AeadOid::OID {
-			self.errors
-				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
-					C::OID,
-					<T::Profile as SecurityProfile>::AeadOid::OID,
-				))));
+		// A checker impl can admit any algorithm, so this comparison
+		// enforces the profile.
+		let received = <Cipher::Oid as AssociatedOid>::OID;
+		let expected = <T::Profile as SecurityProfile>::AeadOid::OID;
+		if T::HAS_PROFILE && received != expected {
+			let mismatch = ReceivedExpectedError::from((received, expected));
+			self.errors.push(TightBeamError::UnexpectedAlgorithm(mismatch));
 			return self;
 		}
 
@@ -379,7 +361,8 @@ impl<T: Message> FrameBuilder<T> {
 				None => &mut rand_core::OsRng,
 			};
 			let nonce = Cipher::generate_nonce(rng);
-			let encrypted_content = <Cipher as Encryptor<C>>::encrypt_content(&cipher, plaintext, &nonce, message_oid)?;
+			let encrypted_content =
+				<Cipher as Encryptor<Cipher::Oid>>::encrypt_content(&cipher, plaintext, &nonce, message_oid)?;
 			Ok(encrypted_content)
 		}));
 
@@ -392,11 +375,11 @@ impl<T: Message> FrameBuilder<T> {
 		C: AssociatedOid,
 		E: Encryptor<C> + 'static,
 	{
-		// Runtime validation: check either AEAD OID or Curve OID
+		// Enforce the profile: the encryptor must name its AEAD or its curve.
 		if T::HAS_PROFILE {
 			let aead_match = C::OID == <T::Profile as SecurityProfile>::AeadOid::OID;
 			#[cfg(feature = "ecdh")]
-			let curve_match = C::OID == <T::Profile as SecurityProfile>::CurveOid::OID;
+			let curve_match = C::OID == <T::Profile as SecurityProfile>::Curve::OID;
 			#[cfg(not(feature = "ecdh"))]
 			let curve_match = false;
 
@@ -430,12 +413,13 @@ impl<T: Message> FrameBuilder<T> {
 		D: Digest + AssociatedOid,
 		T: CheckDigestOid<D>,
 	{
-		// Runtime fallback validation
-		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
+		// A checker impl can admit any algorithm, so this comparison
+		// enforces the profile.
+		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::Digest::OID {
 			self.errors
 				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
 					D::OID,
-					<T::Profile as SecurityProfile>::DigestOid::OID,
+					<T::Profile as SecurityProfile>::Digest::OID,
 				))));
 			return self;
 		}
@@ -472,12 +456,13 @@ impl<T: Message> FrameBuilder<T> {
 		D: Digest + AssociatedOid + 'static,
 		T: CheckDigestOid<D>,
 	{
-		// Runtime fallback validation
-		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
+		// A checker impl can admit any algorithm, so this comparison
+		// enforces the profile.
+		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::Digest::OID {
 			self.errors
 				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
 					D::OID,
-					<T::Profile as SecurityProfile>::DigestOid::OID,
+					<T::Profile as SecurityProfile>::Digest::OID,
 				))));
 			return self;
 		}
@@ -500,7 +485,8 @@ impl<T: Message> FrameBuilder<T> {
 		X: Signatory<S> + 'static,
 		T: CheckSignatureOid<S>,
 	{
-		// Runtime fallback validation
+		// A checker impl can admit any algorithm, so this comparison
+		// enforces the profile.
 		if T::HAS_PROFILE && S::ALGORITHM_OID != <T::Profile as SecurityProfile>::SignatureAlg::ALGORITHM_OID {
 			self.errors
 				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
@@ -750,7 +736,6 @@ mod tests {
 		version: Version::V1,
 		message: TestMessage::sample(None),
 		setup: |builder, msg| {
-			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let (_, cipher) = TestKey::cipher();
@@ -760,7 +745,7 @@ mod tests {
 			.with_message(msg)
 			.with_id("test_v1_with_encryption")
 			.with_order(1696521600)
-			.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
+			.with_aead(cipher)
 			.with_signer::<Secp256k1Signature, _>(signing_key)
 			.build()
 		},
@@ -795,7 +780,6 @@ mod tests {
 		version: Version::V1,
 		message: TestMessage::sample(None),
 		setup: |builder, msg| {
-			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::compress::ZstdCompression;
 
@@ -807,7 +791,7 @@ mod tests {
 			.with_id("test_v1_with_compression")
 			.with_order(1696521600)
 			.with_compression(ZstdCompression::default())
-			.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
+			.with_aead(cipher)
 			.with_signer::<Secp256k1Signature, _>(signing_key)
 			.build()
 		},
@@ -845,7 +829,6 @@ mod tests {
 			TestMessage::sample(None)
 		},
 		setup: |builder, msg| {
-			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let (_, cipher) = TestKey::cipher();
@@ -863,7 +846,7 @@ mod tests {
 				.with_witness_hasher::<Sha3_256>()
 				.with_compression(ZstdCompression::default())
 				.with_rng(rng)
-				.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
+				.with_aead(cipher)
 				.with_signer::<Secp256k1Signature, _>(signing_key)
 				.with_priority(crate::MessagePriority::LowLatency)
 				.with_lifetime(3600)
@@ -1099,19 +1082,19 @@ mod tests {
 			match (confidential, nonrepudiable, message_integrity, frame_integrity) {
 				(true, true, true, true) => compose! {
 					V2: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity<Sha3_256>: [],
 					frame_integrity: type Sha3_256
 				},
 				(true, false, true, _) => compose! {
 					V1: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					message_integrity<Sha3_256>: []
 				},
 				(true, false, false, _) => compose! {
 					V1: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality<Aes256GcmOid, _>: cipher
+					confidentiality: cipher
 				},
 				(false, true, true, _) => compose! {
 					V1: id: test_name, order: 1u64, message: message.clone(),
@@ -1140,19 +1123,19 @@ mod tests {
 				},
 				(true, true, true, false) => compose! {
 					V2: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity<Sha3_256>: []
 				},
 				(true, true, false, true) => compose! {
 					V2: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					frame_integrity: type Sha3_256
 				},
 				(true, true, false, false) => compose! {
 					V1: id: test_name, order: 1u64, message: message.clone(),
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key
 				},
 			}

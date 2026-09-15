@@ -253,7 +253,6 @@ mod tests {
 			}?
 		},
 		tightbeam_v1_encrypted: {
-			use crate::crypto::aead::Aes256GcmOid;
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let message = TestMessage::sample(None);
@@ -264,12 +263,11 @@ mod tests {
 				V1: id: "test-003",
 					order: 1696521800,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key
 			}?
 		},
 		tightbeam_v2_full: {
-			use crate::crypto::aead::Aes256GcmOid;
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
@@ -281,7 +279,7 @@ mod tests {
 				V2: id: "test-004",
 					order: 1696521900,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::HighThroughput,
@@ -316,7 +314,6 @@ mod tests {
 			}?
 		} => Metadata,
 		tightbeam_to_protocol_version: {
-			use crate::crypto::aead::Aes256GcmOid;
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
@@ -329,7 +326,7 @@ mod tests {
 					id: "ver-001",
 					order: 2000,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::Expedited,
@@ -369,7 +366,6 @@ mod tests {
 	test_tightbeam_try_conversions! {
 		success:
 		tightbeam_v1_to_signature_info: {
-			use crate::crypto::aead::Aes256GcmOid;
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let message = TestMessage::sample(None);
@@ -380,12 +376,11 @@ mod tests {
 				V1: id: "sig-001",
 					order: 3000,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key
 			}?
 		} => SignerInfo,
 		tightbeam_v2_to_encryption_info: {
-			use crate::crypto::aead::Aes256GcmOid;
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
@@ -398,7 +393,7 @@ mod tests {
 					id: "enc-001",
 					order: 4000,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: cipher,
+					confidentiality: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::LowLatency,

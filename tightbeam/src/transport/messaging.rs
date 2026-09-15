@@ -43,7 +43,7 @@ use crate::TightBeamError;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod x509 {
-	pub use crate::crypto::aead::{Decryptor, KeyInit};
+	pub use crate::crypto::aead::{DecryptContent, KeyInit};
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};

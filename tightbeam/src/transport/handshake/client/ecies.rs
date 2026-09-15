@@ -28,7 +28,10 @@ use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::{client_mux_settings, MuxSettings, SecurityOffer, TransportOffer};
+use crate::transport::handshake::negotiation::{
+	client_mux_settings, MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityOffer, StrengthFloor,
+	TransportOffer,
+};
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
@@ -65,11 +68,12 @@ where
 	base_session_key: Option<ZeroizingArray<32>>,
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
-	aad_domain_tag: Option<&'static [u8]>,
+	aad_domain_tag: &'static [u8],
 	security_offer: Option<SecurityOffer>,
+	strength_floor: StrengthFloor,
 	transport_offer: Option<TransportOffer>,
 	mux_settings: Option<MuxSettings>,
-	selected_profile: Option<SecurityProfileDesc>,
+	selected_profile: Option<RunnableProfile<P>>,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
 	identity: Option<ClientIdentity<P>>,
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
@@ -112,8 +116,9 @@ where
 			base_session_key: None,
 			server_random: None,
 			transcript_hash: None,
-			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
+			aad_domain_tag: aad_domain_tag.unwrap_or(TIGHTBEAM_AAD_DOMAIN_TAG),
 			security_offer: None, // No offer = dealer's choice mode
+			strength_floor: StrengthFloor::default(),
 			transport_offer: None,
 			mux_settings: None,
 			selected_profile: None,
@@ -141,8 +146,9 @@ where
 			base_session_key: None,
 			server_random: None,
 			transcript_hash: None,
-			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
+			aad_domain_tag: aad_domain_tag.unwrap_or(TIGHTBEAM_AAD_DOMAIN_TAG),
 			security_offer: None, // No offer = dealer's choice mode
+			strength_floor: StrengthFloor::default(),
 			transport_offer: None,
 			mux_settings: None,
 			selected_profile: None,
@@ -179,6 +185,18 @@ where
 	#[must_use]
 	pub fn with_security_offer(mut self, offer: SecurityOffer) -> Self {
 		self.security_offer = Some(offer);
+		self
+	}
+
+	/// Override the minimum-strength policy applied to the server's selection.
+	///
+	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit
+	/// digest).
+	/// The client applies it with or without an offer. Pass `NoStrengthFloor`
+	/// only where weaker profiles must remain acceptable.
+	#[must_use]
+	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
+		self.strength_floor = StrengthFloor::with_policy(policy);
 		self
 	}
 
@@ -376,24 +394,22 @@ where
 		Ok(client_kex)
 	}
 
-	/// Validate server's profile selection against client's offer.
-	///
-	/// Handles both negotiation mode (client sent offer) and dealer's choice mode (no offer).
+	/// Validate the server's profile selection against the client's offer and
+	/// strength floor.
 	fn validate_profile_selection(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
 		let accept = server_handshake.security_accept.as_ref().ok_or(HandshakeError::InvalidState)?;
-		match &self.security_offer {
-			Some(offer) => {
-				// Mode 1: Negotiation - verify server's selection is from our offer
-				if !offer.profiles.contains(&accept.profile) {
-					return Err(HandshakeError::InvalidProfileSelection);
-				}
-				self.selected_profile = Some(accept.profile);
-			}
-			None => {
-				// Mode 2: Dealer's choice - accept whatever server picked
-				self.selected_profile = Some(accept.profile);
+
+		// With an offer, the server's selection must come from it. Without
+		// one, the server chooses, and the floor still bounds that choice.
+		if let Some(offer) = &self.security_offer {
+			if !offer.profiles.contains(&accept.profile) {
+				return Err(HandshakeError::InvalidProfileSelection);
 			}
 		}
+
+		let profile = RunnableProfile::<P>::try_from(accept.profile)?;
+		self.strength_floor.admit(&profile)?;
+		self.selected_profile = Some(profile);
 
 		Ok(())
 	}
@@ -430,7 +446,7 @@ where
 			&client_random,
 			receipt_ack,
 			&server_handshake.certificate,
-			self.aad_domain_tag,
+			Some(self.aad_domain_tag),
 		)?;
 
 		if let Some(artifact) = artifact {
@@ -631,13 +647,11 @@ where
 	where
 		P::AeadCipher: KeyInit + 'static,
 	{
-		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 		// Delegate to the inherent method: single source of truth for state
 		// validation, AEAD derivation, invariants, and cleanup.
 		let ciphers = self.complete()?;
 
-		let keys = SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
+		let keys = SessionKeys::for_client(ciphers);
 		let mux = self.mux_settings;
 		let receipt = self.stored_receipt.take().map(Arc::new);
 		let epoch = self.epoch_materials.take();
@@ -717,7 +731,7 @@ impl<P, M> HandshakeFinalization<P> for EciesHandshakeClient<P, M>
 where
 	P: CryptoProvider,
 {
-	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<RunnableProfile<P>> {
 		self.selected_profile
 	}
 }
@@ -783,7 +797,7 @@ where
 	}
 
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
-		self.selected_profile
+		self.selected_profile.map(|profile| profile.descriptor())
 	}
 }
 
@@ -806,13 +820,11 @@ mod tests {
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::PrehashSigner;
+	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::Encode;
-	use crate::oids::{
-		AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256, HASH_SHA3_384, HASH_SHA3_512,
-		SIGNER_ECDSA_WITH_SHA3_512,
-	};
+	use crate::oids::{HASH_SHA3_384, HASH_SHA3_512};
 	use crate::random::generate_nonce;
-	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
+	use crate::transport::handshake::negotiation::{NegotiationError, ProfileStrength, SecurityAccept, SecurityOffer};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::ServerHandshake;
 
@@ -916,100 +928,138 @@ mod tests {
 		Ok(())
 	}
 
-	/// Test client-side profile validation
+	/// A descriptor that names a digest the default provider does not run.
+	fn foreign_profile(digest: ObjectIdentifier) -> SecurityProfileDesc {
+		SecurityProfileDesc { digest: Some(digest), ..create_default_test_profile() }
+	}
+
+	type DefaultEciesClient = EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>;
+
+	/// A client that trusts `test_cert`, with its `ClientHello` DER.
+	fn profile_test_client(
+		test_cert: &TestCertificate,
+		offer: Option<SecurityOffer>,
+	) -> Result<(DefaultEciesClient, Vec<u8>), Box<dyn Error>> {
+		let mut client = TestEciesClientBuilder::new()
+			.with_trusted_certificate(test_cert.certificate.to_owned())
+			.build();
+		if let Some(offer) = offer {
+			client = client.with_security_offer(offer);
+		}
+
+		let hello = client.build_client_hello()?.to_der()?;
+		Ok((client, hello))
+	}
+
+	/// A `ServerHandshake` signed by `test_cert` that accepts `profile`.
+	fn signed_server_response(
+		test_cert: &TestCertificate,
+		client_hello_der: &[u8],
+		profile: SecurityProfileDesc,
+	) -> Result<Vec<u8>, Box<dyn Error>> {
+		let server_random = [2u8; 32];
+		let accept_der = SecurityAccept::new(profile).to_der()?;
+		let server_public_key = test_cert
+			.certificate
+			.tbs_certificate
+			.subject_public_key_info
+			.subject_public_key
+			.raw_bytes();
+		let transcript_hash =
+			compute_test_transcript_hash(client_hello_der, &server_random, server_public_key, &accept_der);
+
+		let signature: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
+		let response = ServerHandshake {
+			certificate: test_cert.certificate.to_owned(),
+			server_random: OctetString::new(server_random)?,
+			signature: OctetString::new(signature.to_bytes().to_vec())?,
+			security_accept: Some(SecurityAccept::new(profile)),
+			client_cert_required: false,
+			transport_accept: None,
+			session_receipt: None,
+		};
+		Ok(response.to_der()?)
+	}
+
 	#[tokio::test]
-	async fn test_client_profile_validation() -> Result<(), Box<dyn Error>> {
-		let mk_profile = |id: u8| SecurityProfileDesc {
-			digest: Some(match id {
-				1 => HASH_SHA3_256,
-				2 => HASH_SHA3_384,
-				_ => HASH_SHA3_512,
-			}),
-			aead: Some(AES_256_GCM),
-			aead_key_size: Some(32),
-			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
-			curve: Some(CURVE_SECP256K1),
-			key_wrap: Some(AES_256_WRAP),
-			kem: None,
-		};
-
-		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));
+	async fn a_client_accepts_an_offered_profile_it_runs() -> Result<(), Box<dyn Error>> {
 		let test_cert = create_test_certificate();
+		let native = create_default_test_profile();
+		let offer = SecurityOffer::new(vec![foreign_profile(HASH_SHA3_384), native]);
+		let (mut client, hello) = profile_test_client(&test_cert, Some(offer))?;
+		let response = signed_server_response(&test_cert, &hello, native)?;
 
-		// Helper to create client with security offer and build hello
-		#[allow(clippy::type_complexity)]
-		let setup_client = |offer: Option<SecurityOffer>| -> Result<
-			(EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>, Vec<u8>),
-			Box<dyn Error>,
-		> {
-			let mut client = TestEciesClientBuilder::new()
-				.with_trusted_certificate(test_cert.certificate.to_owned())
-				.build();
-			if let Some(offer) = offer {
-				client = client.with_security_offer(offer);
-			}
+		client.process_server_handshake(&response).await?;
 
-			let hello = client.build_client_hello()?.to_der()?;
-			Ok((client, hello))
-		};
+		assert_eq!(client.selected_profile.map(|profile| profile.descriptor()), Some(native));
+		Ok(())
+	}
 
-		// Helper to create signed server handshake
-		let create_server_response = |client_hello_der: &[u8],
-		                              server_random: [u8; 32],
-		                              accepted_profile: &SecurityProfileDesc|
-		 -> Result<Vec<u8>, Box<dyn Error>> {
-			let accept_der = SecurityAccept::new(*accepted_profile).to_der()?;
-			let transcript_hash = compute_test_transcript_hash(
-				client_hello_der,
-				&server_random,
-				test_cert
-					.certificate
-					.tbs_certificate
-					.subject_public_key_info
-					.subject_public_key
-					.raw_bytes(),
-				&accept_der,
-			);
-			let signature: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
-			let signature_bytes = signature.to_bytes().to_vec();
+	#[tokio::test]
+	async fn a_client_refuses_a_profile_it_did_not_offer() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let offer = SecurityOffer::new(vec![foreign_profile(HASH_SHA3_384)]);
+		let (mut client, hello) = profile_test_client(&test_cert, Some(offer))?;
+		let response = signed_server_response(&test_cert, &hello, create_default_test_profile())?;
 
-			let response = ServerHandshake {
-				certificate: test_cert.certificate.to_owned(),
-				server_random: OctetString::new(server_random)?,
-				signature: OctetString::new(signature_bytes)?,
-				security_accept: Some(SecurityAccept::new(*accepted_profile)),
-				client_cert_required: false,
-				transport_accept: None,
-				session_receipt: None,
-			};
-			Ok(response.to_der()?)
-		};
+		let result = client.process_server_handshake(&response).await;
 
-		// Test 1: Client offers [A, B], server accepts B -> OK
-		{
-			let (mut client, client_hello_der) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
-			let server_response = create_server_response(&client_hello_der, [2u8; 32], &p_b)?;
-			let _kex = client.process_server_handshake(&server_response).await?;
-			assert_eq!(client.selected_profile, Some(p_b));
+		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_dealers_choice_client_accepts_a_profile_it_runs() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let native = create_default_test_profile();
+		let (mut client, hello) = profile_test_client(&test_cert, None)?;
+		let response = signed_server_response(&test_cert, &hello, native)?;
+
+		client.process_server_handshake(&response).await?;
+
+		assert_eq!(client.selected_profile.map(|profile| profile.descriptor()), Some(native));
+		Ok(())
+	}
+
+	// A signed accept that names an algorithm the provider does not run is
+	// refused, so the session never runs under a false identity.
+	#[tokio::test]
+	async fn a_dealers_choice_client_refuses_a_profile_it_does_not_run() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let (mut client, hello) = profile_test_client(&test_cert, None)?;
+		let response = signed_server_response(&test_cert, &hello, foreign_profile(HASH_SHA3_512))?;
+
+		let result = client.process_server_handshake(&response).await;
+		assert!(matches!(
+			result,
+			Err(HandshakeError::NegotiationError(NegotiationError::UnrunnableProfile))
+		));
+		Ok(())
+	}
+
+	/// A policy that refuses every profile.
+	struct RefuseAll;
+
+	impl ProfileStrengthPolicy for RefuseAll {
+		fn meets_floor(&self, _strength: &ProfileStrength) -> bool {
+			false
 		}
+	}
 
-		// Test 2: Client offers [A, B], server accepts C (not in offer) -> FAIL
-		{
-			let (mut client, client_hello_der) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
-			let server_response = create_server_response(&client_hello_der, [3u8; 32], &p_c)?;
-			let result = client.process_server_handshake(&server_response).await;
-			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
-		}
+	// Without an offer the server chooses, and the client floor still bounds
+	// that choice.
+	#[tokio::test]
+	async fn a_dealers_choice_client_refuses_a_profile_below_its_floor() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let (client, hello) = profile_test_client(&test_cert, None)?;
+		let mut client = client.with_strength_policy(Arc::new(RefuseAll));
 
-		// Test 3: No offer, server picks -> OK (dealer's choice)
-		{
-			let (mut client, client_hello_der) = setup_client(None)?;
-			let server_response = create_server_response(&client_hello_der, [4u8; 32], &p_a)?;
-			let _kex = client.process_server_handshake(&server_response).await?;
-			assert_eq!(client.selected_profile, Some(p_a));
-		}
-
+		let response = signed_server_response(&test_cert, &hello, create_default_test_profile())?;
+		let result = client.process_server_handshake(&response).await;
+		assert!(matches!(
+			result,
+			Err(HandshakeError::NegotiationError(NegotiationError::BelowStrengthFloor))
+		));
 		Ok(())
 	}
 }

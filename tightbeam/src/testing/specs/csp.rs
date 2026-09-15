@@ -274,6 +274,7 @@ impl Process {
 	///
 	/// This process neither permits nor forbids them, so they are model
 	/// coverage rather than a violation.
+	#[cfg(any(test, feature = "testing-fdr"))]
 	pub(crate) fn unmodelled(&self, other: &Self) -> Vec<Event> {
 		let mut found: Vec<Event> = other
 			.observable
@@ -282,7 +283,6 @@ impl Process {
 			.copied()
 			.collect();
 		found.sort_unstable();
-
 		found
 	}
 

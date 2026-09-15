@@ -18,11 +18,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::builder::TypeBuilder;
+use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
-use crate::transport::framing::{parse_der_length, reconstruct_der_encoding, LengthForm};
+use crate::transport::framing::{FrameHeader, LengthForm};
 use crate::transport::handshake::{BoxedServerHandshake, HandshakeKeyManager};
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
@@ -124,8 +125,8 @@ where
 				.read_exact(&mut length_first)
 				.map_err(|e| (e.into()).inside_frame())?;
 
-			let (length_octets, content_length) = match LengthForm::from(length_first[0]) {
-				LengthForm::Short(length) => (vec![], length),
+			let length_octets = match LengthForm::from(length_first[0]) {
+				LengthForm::Short(_) => Vec::new(),
 				LengthForm::Long(octet_count) => {
 					let mut length_octets = vec![0u8; octet_count];
 
@@ -136,25 +137,21 @@ where
 						.read_exact(&mut length_octets)
 						.map_err(|e| (e.into()).inside_frame())?;
 
-					let length =
-						parse_der_length(length_first[0], &length_octets).ok_or(TransportError::InvalidMessage)?;
-					(length_octets, length)
+					length_octets
 				}
 			};
 
-			// Enforce size ceilings: unauthenticated handshake reads get the
-			// tight handshake cap, established sessions the envelope limits.
-			{
-				let max_allowed = if handshake_pending {
-					self.limits.handshake_wire
-				} else {
-					self.limits.max_envelope()
-				};
+			// Unauthenticated handshake reads get the tight handshake cap, and
+			// established sessions the envelope limits. The admitted header is
+			// the only source of a length to allocate with.
+			let cap = if handshake_pending {
+				self.limits.handshake_wire
+			} else {
+				self.limits.max_envelope()
+			};
 
-				if content_length > max_allowed {
-					return Err(TransportError::InvalidMessage);
-				}
-			}
+			let header = FrameHeader::parse(tag_byte[0], length_first[0], length_octets)?.admit(cap)?;
+			let content_length = header.content_len();
 
 			// Read content. Without a deadline one read suffices. With one,
 			// read in slices and re-check the remaining budget between them
@@ -187,7 +184,7 @@ where
 			#[cfg(not(feature = "std"))]
 			self.stream.read_exact(&mut content).map_err(|e| (e.into()).inside_frame())?;
 
-			let buffer = reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
+			let buffer = header.reconstruct(&content);
 			Ok(buffer)
 		})();
 
@@ -295,7 +292,7 @@ pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoPro
 	certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	aad_domain_tag: Option<&'static [u8]>,
+	aad_domain_tag: &'static [u8],
 	/// Every ceiling handed to each accepted transport.
 	limits: TransportLimits,
 	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
@@ -324,7 +321,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TcpListener<NetTcpL
 				certificate: None,
 				#[cfg(feature = "x509")]
 				client_validators: None,
-				aad_domain_tag: None,
+				aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 				limits: TransportLimits::default(),
 				key_manager: None,
 			},
@@ -353,7 +350,7 @@ where
 			certificate: None,
 			#[cfg(feature = "x509")]
 			client_validators: None,
-			aad_domain_tag: None,
+			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			limits: TransportLimits::default(),
 			key_manager: None,
 		}
@@ -370,9 +367,7 @@ where
 			if let Some(ref validators) = self.client_validators {
 				transport.encryption.client_validators = Some(Arc::clone(validators));
 			}
-			if let Some(aad) = self.aad_domain_tag {
-				transport.encryption.aad_domain_tag = Some(aad);
-			}
+			transport.encryption.aad_domain_tag = self.aad_domain_tag;
 
 			transport.limits = self.limits;
 			transport.provision();
@@ -407,7 +402,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListene
 				certificate: Some(certificate),
 				#[cfg(feature = "x509")]
 				client_validators,
-				aad_domain_tag: Some(config.aad_domain_tag),
+				aad_domain_tag: config.aad_domain_tag,
 				limits: config.limits,
 
 				key_manager: Some(key_manager),
@@ -477,6 +472,39 @@ mod tests {
 
 		assert!(result.is_err());
 		assert!(elapsed < Duration::from_secs(5));
+		Ok(())
+	}
+
+	// A header that declares more than the handshake cap is refused on the
+	// header alone, before any content is read or allocated (CWE-770).
+	#[cfg(feature = "x509")]
+	#[tokio::test]
+	async fn a_handshake_header_above_the_cap_is_refused() -> TransportResult<()> {
+		let listener = NetTcpListener::bind("127.0.0.1:0")?;
+		let addr = listener.local_addr()?;
+
+		let server_handle = thread::spawn(move || -> TransportResult<TransportResult<Vec<u8>>> {
+			let (stream, _) = listener.accept()?;
+			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::from(stream);
+			transport.encryption.client_validators = Some(Arc::new(Vec::new()));
+			transport.provision();
+			transport.limits.handshake_wire = 16;
+
+			let rt = tokio::runtime::Runtime::new()?;
+			Ok(rt.block_on(transport.read_envelope_bytes()))
+		});
+
+		// SEQUENCE header declaring 600 content bytes, with no content sent.
+		let mut stream = NetTcpStream::connect(addr)?;
+		Write::write_all(&mut stream, &[0x30, 0x82, 0x02, 0x58])?;
+
+		let result = server_handle
+			.join()
+			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;
+		assert!(matches!(
+			result,
+			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
+		));
 		Ok(())
 	}
 }

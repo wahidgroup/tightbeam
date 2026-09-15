@@ -8,11 +8,10 @@ use core::marker::PhantomData;
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo};
-use crate::crypto::aead::{Decryptor, KeyInit};
+use crate::crypto::aead::{DecryptContent, Decryptor, KeyInit};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::secret::SecretSlice;
-use crate::der::oid::AssociatedOid;
 use crate::transport::handshake::error::HandshakeError;
 
 /// Trait for processing RecipientInfo to extract the Content Encryption Key (CEK).
@@ -84,17 +83,6 @@ where
 		self.recipient_processor.process_recipient(recipient_info, self.recipient_index)
 	}
 
-	fn validate_encryption_algorithm(encrypted_content_info: &EncryptedContentInfo) -> Result<(), HandshakeError>
-	where
-		P::AeadOid: AssociatedOid,
-	{
-		if encrypted_content_info.content_enc_alg.oid != P::AeadOid::OID {
-			Err(HandshakeError::MissingContentEncryptionAlgorithm)
-		} else {
-			Ok(())
-		}
-	}
-
 	fn create_cipher_from_cek(cek: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
 		P::AeadCipher::new_from_slice(cek).map_err(|_| HandshakeError::InvalidKeySize {
 			expected: <P::AeadCipher as KeySizeUser>::KeySize::USIZE,
@@ -117,8 +105,7 @@ where
 	/// # Steps
 	/// 1. Validate recipient index
 	/// 2. Extract CEK using recipient processor
-	/// 3. Validate encryption algorithm
-	/// 4. Decrypt content
+	/// 3. Decrypt content, which refuses an algorithm other than the cipher's
 	///
 	/// # Parameters
 	/// - `enveloped_data`: The EnvelopedData structure to process
@@ -133,11 +120,8 @@ where
 		let recipient_info = &enveloped_data.recip_infos.0.as_ref()[self.recipient_index];
 		let cek = self.extract_cek(recipient_info)?;
 
-		// 3. Validate encryption algorithm
+		// 3. Decrypt content
 		let encrypted_content_info = &enveloped_data.encrypted_content;
-		Self::validate_encryption_algorithm(encrypted_content_info)?;
-
-		// 4. Decrypt content
 		let cipher = Self::create_cipher_from_cek(&cek)?;
 		Self::decrypt_content(&cipher, encrypted_content_info)
 	}

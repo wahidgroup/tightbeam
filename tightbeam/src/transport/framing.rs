@@ -39,7 +39,7 @@ impl From<u8> for LengthForm {
 /// Parse a DER length field into its numeric value.
 ///
 /// Returns `None` for non-canonical or indefinite-length encodings.
-pub(crate) fn parse_der_length(first_byte: u8, length_octets: impl AsRef<[u8]>) -> Option<usize> {
+fn parse_der_length(first_byte: u8, length_octets: impl AsRef<[u8]>) -> Option<usize> {
 	let length_octets = length_octets.as_ref();
 	let octet_count = match LengthForm::from(first_byte) {
 		LengthForm::Short(length) => return Some(length),
@@ -164,7 +164,7 @@ impl TransportError {
 }
 
 /// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
-pub(crate) fn reconstruct_der_encoding(
+fn reconstruct_der_encoding(
 	tag: u8,
 	length_first: u8,
 	length_octets: impl AsRef<[u8]>,

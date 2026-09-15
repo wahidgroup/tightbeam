@@ -19,7 +19,7 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EnvelopedData, OriginatorIdentifierOrKey, RecipientInfo};
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
-use crate::crypto::aead::{Decryptor, KeyInit, SessionKeys};
+use crate::crypto::aead::{DecryptContent, KeyInit, SessionKeys};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
@@ -43,8 +43,8 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::kari::HandshakeKek;
 use crate::transport::handshake::kari::{key_wrap_key_size, unwrap_and_verify_with_kek};
 use crate::transport::handshake::negotiation::{
-	authorize_transport, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept, SecurityOffer,
-	TransportAccept, TransportAuthorizer, TransportOffer,
+	authorize_transport, MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer,
+	StrengthFloor, TransportAccept, TransportAuthorizer, TransportOffer,
 };
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::ReceiptArtifact;
@@ -88,8 +88,8 @@ where
 	transcript_buffer: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
 	supported_profiles: Vec<SecurityProfileDesc>,
-	strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
-	selected_profile: Option<SecurityProfileDesc>,
+	strength_floor: StrengthFloor,
+	selected_profile: Option<RunnableProfile<P>>,
 	transport_config: Option<TransportOffer>,
 	transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
 	session_observer: Option<Arc<dyn SessionObserver>>,
@@ -132,7 +132,7 @@ where
 			transcript_buffer: Vec::new(),
 			session_key: None,
 			supported_profiles: Vec::new(),
-			strength_policy: None, // Defaults to DefaultStrengthFloor
+			strength_floor: StrengthFloor::default(),
 			selected_profile: None,
 			transport_config: None,
 			transport_authorizer: None,
@@ -182,7 +182,7 @@ where
 	/// Pass `NoStrengthFloor` only where weaker profiles must remain negotiable.
 	#[must_use]
 	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
-		self.strength_policy = Some(policy);
+		self.strength_floor = StrengthFloor::with_policy(policy);
 		self
 	}
 
@@ -244,7 +244,7 @@ where
 	///
 	/// Returns `None` if no negotiation occurred (no profiles configured).
 	pub fn selected_profile(&self) -> Option<SecurityProfileDesc> {
-		self.selected_profile
+		self.selected_profile.map(|profile| profile.descriptor())
 	}
 
 	/// Compute transcript hash from the accumulated buffer.
@@ -501,7 +501,7 @@ where
 		// Compute transcript hash if not already set
 		if self.transcript_hash.is_none() {
 			if let Some(profile) = self.selected_profile {
-				let accept_bytes = HandshakeAttribute::transcript_bytes(&SecurityAccept::new(profile))?;
+				let accept_bytes = HandshakeAttribute::transcript_bytes(&SecurityAccept::new(profile.descriptor()))?;
 				self.transcript_buffer.extend_from_slice(&accept_bytes);
 			}
 			if let Some(ref accept) = self.transport_accept {
@@ -551,7 +551,7 @@ where
 		let mut x509_attrs = Vec::new();
 
 		if let Some(profile) = self.selected_profile {
-			let accept_attr = HandshakeAttribute::encode(&SecurityAccept::new(profile))?;
+			let accept_attr = HandshakeAttribute::encode(&SecurityAccept::new(profile.descriptor()))?;
 			x509_attrs
 				.push(Attribute { oid: accept_attr.attr_type, values: SetOfVec::try_from(accept_attr.attr_values)? });
 		}
@@ -687,10 +687,8 @@ where
 			return Err(HandshakeError::CountersignatureMissing);
 		}
 
-		// 3. Get CEK (session_key) and profile
+		// 3. Get the CEK (session_key)
 		let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
-		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
 		let transcript = *self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
 		let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript))?;
@@ -707,14 +705,14 @@ where
 		// 5. Transition to complete
 		self.state.transition(ServerHandshakeState::Completed)?;
 
-		// 6. Role-map the directional ciphers with the negotiated OID. The
+		// 6. Role-map the directional ciphers. The
 		//    orchestrator is spent, so the receipt moves out rather than
 		//    copies. The client certificate is already shared, so the session
 		//    takes a handle to it.
 		#[cfg(feature = "x509")]
 		let peer = self.validated_client_cert.as_ref().map(Arc::clone);
 
-		let keys = SessionKeys::for_server(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
+		let keys = SessionKeys::for_server(ciphers);
 		let mux = self.mux_settings;
 		let receipt = self.stored_receipt.take().map(Arc::new);
 		let epoch = Some(materials);
@@ -944,7 +942,7 @@ fn extract_embedded_certificate(signed_data_der: impl AsRef<[u8]>) -> Result<Opt
 // Common Handshake Trait Implementations
 // ============================================================================
 
-impl<P> HandshakeNegotiation for CmsHandshakeServer<P>
+impl<P> HandshakeNegotiation<P> for CmsHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
@@ -953,11 +951,7 @@ where
 	}
 
 	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
-		if let Some(policy) = &self.strength_policy {
-			return policy.as_ref();
-		}
-
-		&DefaultStrengthFloor
+		self.strength_floor.policy()
 	}
 }
 
@@ -965,7 +959,7 @@ impl<P> HandshakeFinalization<P> for CmsHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
-	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<RunnableProfile<P>> {
 		self.selected_profile
 	}
 }
@@ -1031,7 +1025,7 @@ where
 	}
 
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
-		self.selected_profile
+		self.selected_profile.map(|profile| profile.descriptor())
 	}
 }
 
@@ -1049,10 +1043,7 @@ mod tests {
 		use crate::crypto::x509::name::Name;
 		use crate::crypto::x509::serial_number::SerialNumber;
 		use crate::der::{Decode, Encode};
-		use crate::oids::{
-			AES_128_GCM, AES_128_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA256, HASH_SHA3_256,
-			SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256,
-		};
+		use crate::oids::{AES_128_GCM, AES_128_WRAP, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 		use crate::random::{generate_nonce, OsRng};
 		use crate::spki::SubjectPublicKeyInfoOwned;
 		use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
@@ -1060,7 +1051,6 @@ mod tests {
 			TightBeamEnvelopedDataBuilder, TightBeamKariBuilder, TightBeamSignedDataBuilder,
 		};
 		use crate::transport::handshake::tests::*;
-		use crate::TightBeamError;
 
 		const TEST_TRANSCRIPT: [u8; 32] = [1u8; 32];
 		const TEST_SESSION_KEY: [u8; 32] = [2u8; 32];
@@ -1116,14 +1106,13 @@ mod tests {
 		async fn test_cms_end_to_end_with_profile_negotiation() -> Result<(), Box<dyn Error>> {
 			let (mut server, server_public_key) =
 				TestCmsServerBuilder::new().with_transcript_hash(TEST_TRANSCRIPT).build();
-			server = server.with_supported_profiles(vec![create_aes_gcm_profile(16), create_aes_gcm_profile(32)]);
+			let native = create_default_test_profile();
+			let foreign = SecurityProfileDesc { aead: Some(AES_128_GCM), ..native };
+			server = server.with_supported_profiles(vec![foreign, native]);
 
 			complete_handshake(&mut server, &server_public_key, &create_test_certificate(), &TEST_TRANSCRIPT).await?;
 
-			let Some(selected) = server.selected_profile.as_ref() else {
-				return Err(TightBeamError::MissingConfiguration.into());
-			};
-			assert!(selected.aead.is_some());
+			assert_eq!(server.selected_profile(), Some(native));
 			assert!(server.session_key().is_some());
 			Ok(())
 		}
@@ -1173,31 +1162,6 @@ mod tests {
 
 			let signed_data = builder.build(transcript_hash)?;
 			Ok(signed_data.to_der()?)
-		}
-
-		/// Create a test security profile with the given AEAD key size.
-		fn create_aes_gcm_profile(key_size: u16) -> SecurityProfileDesc {
-			let aead_oid = if key_size == 16 {
-				AES_128_GCM
-			} else {
-				AES_256_GCM
-			};
-			let key_wrap_oid = if key_size == 16 {
-				AES_128_WRAP
-			} else {
-				AES_256_WRAP
-			};
-
-			SecurityProfileDesc {
-				digest: Some(HASH_SHA256),
-				aead: Some(aead_oid),
-				aead_key_size: Some(key_size),
-				signature: Some(SIGNER_ECDSA_WITH_SHA256),
-				kdf: Some(HASH_SHA256), // HKDF-SHA256
-				curve: Some(CURVE_SECP256K1),
-				key_wrap: Some(key_wrap_oid),
-				kem: None,
-			}
 		}
 	}
 }

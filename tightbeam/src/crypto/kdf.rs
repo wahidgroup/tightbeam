@@ -26,9 +26,8 @@
 //!   [IEEE Std 1363a-2004](https://standards.ieee.org/standard/1363a-2004.html),
 //!   [ISO/IEC 18033-2:2006](https://www.iso.org/standard/37971.html))
 //!   mandate separate symmetric encryption and MAC keys. This module enforces
-//!   key separation by either (a) running two HKDF expansions with distinct
-//!   `info` labels or (b) performing one HKDF expansion and splitting the
-//!   output into two disjoint keys
+//!   key separation by performing one expansion and splitting the output into
+//!   two disjoint keys
 //!   ([SECG SEC 1 v2.0 §5.1.3](https://www.secg.org/sec1-v2.pdf#page=59)).
 //! - ECIES is parameterized by the KDF (see
 //!   [SECG SEC 1 v2.0 §5.1](https://www.secg.org/sec1-v2.pdf#page=57),
@@ -52,12 +51,17 @@ use alloc::vec::Vec;
 
 pub use crate::crypto::hkdf::Hkdf;
 
+use crate::crypto::hkdf::InvalidLength;
+
 use crate::constants::{
 	ECDH_SHARED_SECRET_SIZE, EC_PUBKEY_COMPRESSED_SIZE, EC_PUBKEY_UNCOMPRESSED_SIZE, MAX_HKDF_OUTPUT_SIZE,
 	MIN_KEY_SIZE, MIN_SALT_SIZE,
 };
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
+use crate::der::asn1::ObjectIdentifier;
+use crate::der::oid::AssociatedOid;
+use crate::oids::HASH_SHA3_256;
 use crate::zeroize::Zeroizing;
 use crate::Errorizable;
 use crate::{ZeroizingArray, ZeroizingBytes};
@@ -89,7 +93,13 @@ pub trait KdfFunction {
 	/// # Errors
 	/// Returns `KdfError::DerivationFailed` if key_size is outside valid range.
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes>;
+}
 
+/// Dual-key derivation through any [`KdfFunction`].
+///
+/// The blanket implementation is the only one, so a KDF identifier names one
+/// dual-key output whichever type implements it.
+pub trait DualKeyKdf: KdfFunction {
 	/// Derive two keys of the specified length (for ECIES encryption + MAC)
 	///
 	/// ECIES standards (e.g.,
@@ -100,20 +110,15 @@ pub trait KdfFunction {
 	/// encryption and for message authentication to avoid key reuse across
 	/// primitives.
 	///
-	/// Default behavior
-	/// - Performs two HKDF-Expand operations with different `info` labels:
-	///   `{info}-encryption` and `{info}-mac`.
-	/// - This yields two independent keys while preserving
-	///   [RFC 5869 §3.2](https://datatracker.ietf.org/doc/html/rfc5869#section-3.2)
-	///   domain separation.
+	/// One construction serves every KDF: a single expansion of `2 * N`
+	/// bytes through [`KdfFunction::derive_dynamic_key`], split into two
+	/// non-overlapping keys
+	/// ([SECG SEC 1 v2.0 §5.1.3](https://www.secg.org/sec1-v2.pdf#page=59)).
 	///
-	/// Provider override
-	/// - Implementations MAY override this with a single HKDF-Expand that
-	///   produces 2*N bytes and split the output into two keys, preserving
-	///   independence by non-overlapping segments
-	///   ([SECG SEC 1 v2.0 §5.1.3](https://www.secg.org/sec1-v2.pdf#page=59)).
-	///   This is equivalent in security if the underlying HKDF is robust and
-	///   the segments do not overlap.
+	/// # Errors
+	///
+	/// - [`KdfError::DerivationFailed`] when `N` is below [`MIN_KEY_SIZE`], or
+	///   when the KDF refuses `2 * N` bytes or returns another length.
 	///
 	/// References
 	/// - [RFC 5869 §3.2](https://datatracker.ietf.org/doc/html/rfc5869#section-3.2): `info` for context separation
@@ -123,33 +128,41 @@ pub trait KdfFunction {
 		ikm: &[u8],
 		info: &[u8],
 		salt: Option<&[u8]>,
+	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)>;
+}
+
+impl<K: KdfFunction> DualKeyKdf for K {
+	fn derive_dual_keys<const N: usize>(
+		ikm: &[u8],
+		info: &[u8],
+		salt: Option<&[u8]>,
 	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
-		// Use separate info strings for encryption and MAC keys as recommended
-		// by ECIES standards. This prevents key reuse between encryption and
-		// authentication operations.
-		let mut enc_info = Vec::with_capacity(info.len() + 11);
-		enc_info.extend_from_slice(info);
-		enc_info.extend_from_slice(b"-encryption");
+		assert_min_key_size(N)?;
 
-		let mut mac_info = Vec::with_capacity(info.len() + 4);
-		mac_info.extend_from_slice(info);
-		mac_info.extend_from_slice(b"-mac");
+		let combined_len = N.checked_mul(2).ok_or(KdfError::DerivationFailed(InvalidLength))?;
+		let combined = K::derive_dynamic_key(ikm, info, salt, combined_len)?;
+		let (enc_bytes, mac_bytes) = combined
+			.split_at_checked(N)
+			.filter(|(_, mac_bytes)| mac_bytes.len() == N)
+			.ok_or(KdfError::DerivationFailed(InvalidLength))?;
 
-		let k_enc = Self::derive_key::<N>(ikm, &enc_info, salt)?;
-		let k_mac = Self::derive_key::<N>(ikm, &mac_info, salt)?;
+		let mut k_enc = Zeroizing::new([0u8; N]);
+		let mut k_mac = Zeroizing::new([0u8; N]);
+		k_enc.copy_from_slice(enc_bytes);
+		k_mac.copy_from_slice(mac_bytes);
 
 		Ok((k_enc, k_mac))
 	}
 }
+
 /// Default HKDF-SHA3-256 provider
 pub struct HkdfSha3_256;
 
-crate::define_oid_wrapper!(
-	/// OID wrapper for HKDF-SHA3-256
-	/// Note: No standard OID exists for HKDF-SHA3-256, using NIST SHA3-256 base OID
-	HkdfSha3_256Oid,
-	"2.16.840.1.101.3.4.2.8"
-);
+/// No standard OID exists for HKDF-SHA3-256, so the profile negotiates it
+/// under the NIST SHA3-256 digest OID.
+impl AssociatedOid for HkdfSha3_256 {
+	const OID: ObjectIdentifier = HASH_SHA3_256;
+}
 
 /// Reject key sizes below `MIN_KEY_SIZE` (too weak for cryptographic use).
 ///
@@ -158,7 +171,7 @@ crate::define_oid_wrapper!(
 #[inline]
 fn assert_min_key_size(key_size: usize) -> Result<()> {
 	if key_size < MIN_KEY_SIZE {
-		return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
+		return Err(KdfError::DerivationFailed(InvalidLength));
 	}
 
 	Ok(())
@@ -171,7 +184,7 @@ fn assert_min_key_size(key_size: usize) -> Result<()> {
 #[inline]
 fn assert_hkdf_key_size(key_size: usize) -> Result<()> {
 	if !(MIN_KEY_SIZE..=MAX_HKDF_OUTPUT_SIZE).contains(&key_size) {
-		return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
+		return Err(KdfError::DerivationFailed(InvalidLength));
 	}
 
 	Ok(())
@@ -198,34 +211,6 @@ impl KdfFunction for HkdfSha3_256 {
 
 		Ok(Zeroizing::new(okm))
 	}
-
-	/// Optimized: single HKDF-Expand to 2*N bytes, then split into (enc, mac).
-	/// Note: bounded by `MAX_HKDF_OUTPUT_SIZE` for the temporary buffer.
-	fn derive_dual_keys<const N: usize>(
-		ikm: &[u8],
-		info: &[u8],
-		salt: Option<&[u8]>,
-	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
-		// Provider-specific safety bound for the temporary buffer used below.
-		if N * 2 > MAX_HKDF_OUTPUT_SIZE {
-			return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
-		}
-
-		// Single HKDF expansion, split into two distinct key portions. ECIES
-		// standards require separate encryption/MAC keys: one expansion of
-		// 2N bytes is functionally equivalent to two separate derivations
-		// while invoking HKDF once.
-		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
-		let mut combined = Zeroizing::new([0u8; MAX_HKDF_OUTPUT_SIZE]);
-		hk.expand(info, &mut combined[..N * 2]).map_err(KdfError::DerivationFailed)?;
-
-		let mut k_enc = Zeroizing::new([0u8; N]);
-		let mut k_mac = Zeroizing::new([0u8; N]);
-		k_enc[..].copy_from_slice(&combined[..N]);
-		k_mac[..].copy_from_slice(&combined[N..N * 2]);
-
-		Ok((k_enc, k_mac))
-	}
 }
 
 /// ANSI X9.63 Concatenation KDF using SHA3-256
@@ -251,9 +236,7 @@ impl KdfFunction for X963Sha3_256 {
 			out[offset..offset + take].copy_from_slice(&block[..take]);
 			offset += take;
 			if offset < N {
-				counter = counter
-					.checked_add(1)
-					.ok_or(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength))?;
+				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(InvalidLength))?;
 			}
 		}
 
@@ -279,9 +262,7 @@ impl KdfFunction for X963Sha3_256 {
 			out[offset..offset + take].copy_from_slice(&block[..take]);
 			offset += take;
 			if offset < key_size {
-				counter = counter
-					.checked_add(1)
-					.ok_or(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength))?;
+				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(InvalidLength))?;
 			}
 		}
 
@@ -294,7 +275,7 @@ impl KdfFunction for X963Sha3_256 {
 pub enum KdfError {
 	/// Key derivation failed (HKDF expansion error)
 	#[error("Key derivation failed: {0}")]
-	DerivationFailed(crate::crypto::hkdf::InvalidLength),
+	DerivationFailed(InvalidLength),
 
 	/// Invalid ephemeral public key length
 	#[error("Invalid ephemeral public key length: expected 33 or 65 bytes, got {0}")]
@@ -439,10 +420,8 @@ pub fn hkdf<P: KdfFunction, const N: usize>(
 /// - `(k_enc, k_mac)`, each `N` bytes
 ///
 /// Constraints
-/// - Provider-scoped bounds MAY apply. For example, the default HKDF provider
-///   performs an optimized single-expand-and-split and enforces `2*N` within its
-///   own internal temporary buffer limit. Other providers (e.g., X9.63) may not
-///   impose the same bound.
+/// - The KDF's own output bound applies to `2 * N`. HKDF caps it at
+///   `MAX_HKDF_OUTPUT_SIZE`, and X9.63 imposes no cap.
 ///
 /// References
 /// - [RFC 5869 §3.2](https://datatracker.ietf.org/doc/html/rfc5869#section-3.2): `info` context binding
@@ -769,5 +748,40 @@ mod tests {
 		assert_key_pair_lengths!(k_enc, k_mac, 32);
 		assert_keys_different!(k_enc, k_mac);
 		Ok(())
+	}
+
+	// The HKDF dual-key output is the ECIES wire key schedule: the halves of
+	// one RFC 5869 expansion.
+	#[test]
+	fn an_hkdf_dual_key_pair_is_one_expansion_split_in_half() -> crate::error::Result<()> {
+		let mut expected = [0u8; 64];
+		Hkdf::<Sha3_256>::new(Some(SALT), b"ikm")
+			.expand(INFO_V1, &mut expected)
+			.map_err(KdfError::DerivationFailed)?;
+
+		let (k_enc, k_mac) = HkdfSha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, Some(SALT))?;
+
+		assert_eq!(k_enc[..], expected[..32]);
+		assert_eq!(k_mac[..], expected[32..]);
+		Ok(())
+	}
+
+	// X9.63 dual keys split one expansion the same way.
+	#[test]
+	fn an_x963_dual_key_pair_is_one_expansion_split_in_half() -> crate::error::Result<()> {
+		let expected = X963Sha3_256::derive_dynamic_key(b"ikm", INFO_V1, None, 64)?;
+
+		let (k_enc, k_mac) = X963Sha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, None)?;
+
+		assert_eq!(k_enc[..], expected[..32]);
+		assert_eq!(k_mac[..], expected[32..]);
+		Ok(())
+	}
+
+	#[test]
+	fn a_dual_key_below_the_minimum_size_is_refused() {
+		let result = X963Sha3_256::derive_dual_keys::<8>(b"ikm", INFO_V1, None);
+
+		assert!(matches!(result, Err(KdfError::DerivationFailed(_))));
 	}
 }

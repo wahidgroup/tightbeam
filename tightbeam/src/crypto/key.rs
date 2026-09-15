@@ -1,11 +1,12 @@
 //! Pluggable key backend abstraction for tightbeam transport encryption.
 //!
-//! This module provides the [`SigningKeyProvider`] trait, which abstracts cryptographic
-//! key operations to enable flexible backend integration (in-memory, HSM, KMS, enclave).
+//! This module provides the [`SigningKeyProvider`] trait, which abstracts
+//! cryptographic key operations to enable flexible backend integration
+//! (in-memory, HSM, KMS, enclave).
 //!
 //! The trait is algorithm-agnostic, using byte representations for all values.
-//! Concrete implementations (e.g., [`InMemorySigningKeyProvider`]) handle algorithm-specific
-//! encoding/decoding.
+//! Concrete implementations (e.g., [`InMemorySigningKeyProvider`]) handle
+//! algorithm-specific encoding/decoding.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -17,7 +18,7 @@ use core::fmt::Debug;
 
 #[cfg(feature = "aead")]
 use core::future::Future;
-#[cfg(any(feature = "signature", feature = "aead"))]
+#[cfg(feature = "signature")]
 use core::marker::PhantomData;
 #[cfg(feature = "aead")]
 use core::pin::Pin;
@@ -26,7 +27,7 @@ use crate::Errorizable;
 
 #[cfg(feature = "signature")]
 use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
-#[cfg(feature = "ecdh")]
+#[cfg(all(feature = "signature", feature = "ecdh"))]
 use crate::zeroize::Zeroizing;
 #[cfg(all(feature = "std", any(feature = "signature", feature = "aead")))]
 use std::sync::Arc;
@@ -62,9 +63,7 @@ use signing::*;
 
 #[cfg(feature = "aead")]
 mod encryption {
-	pub use crate::crypto::aead::{
-		Aead, AeadCore, Aes128Gcm, Aes128GcmOid, Aes256Gcm, Aes256GcmOid, Error as AeadError, Nonce,
-	};
+	pub use crate::crypto::aead::{Aead, AeadAlgorithm, AeadCore, Aes128Gcm, Aes256Gcm, Error as AeadError, Nonce};
 }
 
 #[cfg(feature = "aead")]
@@ -564,54 +563,49 @@ pub trait EncryptingKeyProvider: Send + Sync + Debug {
 ///
 /// # Type Parameters
 ///
-/// * `A` - The AEAD cipher type (e.g., `Aes256Gcm`, `Aes128Gcm`)
-/// * `O` - The OID type associated with this cipher (e.g., `Aes256GcmOid`)
+/// * `A` - The AEAD cipher type (e.g., `Aes256Gcm`, `Aes128Gcm`). The cipher
+///   type names the algorithm identifier the provider reports.
 ///
 /// # Security
 ///
 /// For zeroization on drop, use keys that implement `ZeroizeOnDrop`.
 #[cfg(feature = "aead")]
-pub struct InMemoryEncryptingKeyProvider<A, O>
+pub struct InMemoryEncryptingKeyProvider<A>
 where
-	A: Aead + Send + Sync + 'static,
-	O: AssociatedOid + Send + Sync,
+	A: AeadAlgorithm + Send + Sync + 'static,
 {
 	cipher: A,
-	_oid: PhantomData<O>,
 }
 
 #[cfg(feature = "aead")]
-impl<A, O> From<A> for InMemoryEncryptingKeyProvider<A, O>
+impl<A> From<A> for InMemoryEncryptingKeyProvider<A>
 where
-	A: Aead + Send + Sync + 'static,
-	O: AssociatedOid + Send + Sync,
+	A: AeadAlgorithm + Send + Sync + 'static,
 {
 	fn from(cipher: A) -> Self {
-		InMemoryEncryptingKeyProvider { cipher, _oid: PhantomData }
+		InMemoryEncryptingKeyProvider { cipher }
 	}
 }
 
 #[cfg(feature = "aead")]
-impl<A, O> Debug for InMemoryEncryptingKeyProvider<A, O>
+impl<A> Debug for InMemoryEncryptingKeyProvider<A>
 where
-	A: Aead + Send + Sync + 'static,
-	O: AssociatedOid + Send + Sync,
+	A: AeadAlgorithm + Send + Sync + 'static,
 {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("InMemoryEncryptingKeyProvider")
-			.field("algorithm", &O::OID)
+			.field("algorithm", &<A::Oid as AssociatedOid>::OID)
 			.finish_non_exhaustive()
 	}
 }
 
 #[cfg(feature = "aead")]
-impl<A, O> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<A, O>
+impl<A> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<A>
 where
-	A: Aead + Send + Sync + 'static,
-	O: AssociatedOid + Send + Sync,
+	A: AeadAlgorithm + Send + Sync + 'static,
 {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: O::OID, parameters: None }
+		AlgorithmIdentifierOwned { oid: <A::Oid as AssociatedOid>::OID, parameters: None }
 	}
 
 	fn encrypt(
@@ -658,10 +652,9 @@ where
 }
 
 #[cfg(feature = "aead")]
-impl<A, O> EncryptingKeyProvider for Arc<InMemoryEncryptingKeyProvider<A, O>>
+impl<A> EncryptingKeyProvider for Arc<InMemoryEncryptingKeyProvider<A>>
 where
-	A: Aead + Send + Sync + 'static,
-	O: AssociatedOid + Send + Sync,
+	A: AeadAlgorithm + Send + Sync + 'static,
 {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		self.as_ref().algorithm()
@@ -690,11 +683,11 @@ where
 
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 /// Type alias for AES-256-GCM encryption key provider
-pub type Aes256GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes256Gcm, Aes256GcmOid>;
+pub type Aes256GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes256Gcm>;
 
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 /// Type alias for AES-128-GCM encryption key provider
-pub type Aes128GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes128Gcm, Aes128GcmOid>;
+pub type Aes128GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes128Gcm>;
 
 #[cfg(test)]
 mod tests {

@@ -33,8 +33,7 @@ use tightbeam::{
 };
 
 use crate::security::common::{
-	expectation_failure, tamper_payload, Direction, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness,
-	BACKEND_COUNT_U32,
+	expectation_failure, Direction, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
 pub(crate) const MITM_CAPTURE_HANDSHAKE: Urn<'static> =
@@ -130,7 +129,7 @@ job! {
 				.ok_or_else(|| expectation_failure("no server-to-client messages captured"))?;
 
 			// Tamper with the message (simulating MITM modification)
-			let tampered_payload = tamper_payload(&target.payload);
+			let tampered_payload = kind.tamper_server_message(&target.payload)?;
 
 			// Verify tampering actually changed the payload
 			if tampered_payload == target.payload {

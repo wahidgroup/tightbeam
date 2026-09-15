@@ -39,11 +39,11 @@ use futures::lock::Mutex as FuturesMutex;
 
 use crate::cms::signed_data::{SignedData, SignerIdentifier, SignerInfo};
 use crate::constants::TIGHTBEAM_EPOCH_KDF_INFO;
-use crate::crypto::aead::{KeyInit, RecvCipher, SendCipher, SessionKeys};
+use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::CryptoProvider;
-use crate::der::asn1::{ObjectIdentifier, OctetString};
+use crate::der::asn1::OctetString;
 use crate::der::Encode;
 use crate::random::generate_nonce;
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
@@ -55,24 +55,22 @@ use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
 };
 use crate::transport::handshake::HandshakeOctets;
-use crate::transport::handshake::{
-	compute_transcript_digest, derive_directional_from_oid, EpochMaterials, HandshakeError,
-};
+use crate::transport::handshake::{compute_transcript_digest, EpochMaterials, HandshakeError};
 use crate::transport::multiplex::MuxRole;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::x509::Certificate;
 
 /// Shared epoch state and identities for one session's rekey exchanges.
 ///
-/// Both roles hold one: the epoch secret chain, the negotiated AEAD
-/// OID, the initial receipt terms (the credit-match reference), the
-/// local signing identity, and the peer's verified receipt identity.
+/// Both roles hold one: the epoch secret chain, the initial receipt
+/// terms (the credit-match reference), the local signing identity, and
+/// the peer's verified receipt identity. The provider's cipher type
+/// names the AEAD.
 pub(crate) struct RekeyMaterials<P>
 where
 	P: CryptoProvider,
 {
 	epoch: EpochMaterials,
-	aead_oid: ObjectIdentifier,
 	reference: SessionReceipt,
 	signing_provider: Arc<dyn SigningKeyProvider>,
 	peer_verifying_key: P::VerifyingKey,
@@ -104,13 +102,12 @@ where
 {
 	pub(crate) fn new(
 		epoch: EpochMaterials,
-		aead_oid: ObjectIdentifier,
 		reference: SessionReceipt,
 		signing_provider: Arc<dyn SigningKeyProvider>,
 		peer_verifying_key: P::VerifyingKey,
 		peer_sid: SignerIdentifier,
 	) -> Self {
-		Self { epoch, aead_oid, reference, signing_provider, peer_verifying_key, peer_sid }
+		Self { epoch, reference, signing_provider, peer_verifying_key, peer_sid }
 	}
 
 	/// Current epoch number.
@@ -137,7 +134,7 @@ where
 
 		let stage = (self.epoch.secret.as_slice(), TIGHTBEAM_EPOCH_KDF_INFO);
 		let next_secret = kdf_chain::<P>(&[stage], &salt)?;
-		let directional = derive_directional_from_oid::<P>(&next_secret, &salt, self.aead_oid)?;
+		let directional = DirectionalCiphers::derive::<P>(&next_secret, &salt)?;
 
 		let next_epoch = self.epoch.epoch.checked_add(1).ok_or(HandshakeError::IntegerOutOfRange)?;
 		self.epoch.secret = next_secret;
@@ -145,12 +142,8 @@ where
 		self.epoch.transcript_hash = next_hash;
 
 		let keys = match role {
-			MuxRole::Client => {
-				SessionKeys::for_client(directional.client_to_server, directional.server_to_client, self.aead_oid)
-			}
-			MuxRole::Server => {
-				SessionKeys::for_server(directional.client_to_server, directional.server_to_client, self.aead_oid)
-			}
+			MuxRole::Client => SessionKeys::for_client(directional),
+			MuxRole::Server => SessionKeys::for_server(directional),
 		};
 		Ok(keys.into_parts())
 	}
@@ -640,13 +633,12 @@ impl RekeyDriver {
 #[cfg(all(test, feature = "secp256k1", feature = "aes-gcm"))]
 mod tests {
 	use super::*;
-	use crate::crypto::aead::Decryptor;
+	use crate::crypto::aead::DecryptContent;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::{InMemorySigningKeyProvider, Secp256k1Provider};
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::crypto::x509::utils::compute_signer_identifier;
-	use crate::oids::AES_256_GCM;
 	use crate::random::OsRng;
 	use crate::transport::handshake::negotiation::MuxBudgets;
 	use crate::zeroize::Zeroizing;
@@ -696,7 +688,6 @@ mod tests {
 
 		let client_materials = RekeyMaterials::new(
 			sample_epoch(),
-			AES_256_GCM,
 			reference.to_owned(),
 			client_identity.provider,
 			server_identity.verifying_key,
@@ -704,7 +695,6 @@ mod tests {
 		);
 		let server_materials = RekeyMaterials::new(
 			sample_epoch(),
-			AES_256_GCM,
 			reference,
 			server_identity.provider,
 			client_identity.verifying_key,

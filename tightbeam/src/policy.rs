@@ -72,6 +72,7 @@ impl TransitStatus {
 	/// fault. Call sites apply this before a gate status reaches the wire
 	/// or the export audit trail. The built-in export allowlist does not
 	/// use this helper.
+	#[cfg(feature = "transport-policy")]
 	#[must_use]
 	pub(crate) const fn normalized_verdict(self) -> Self {
 		match self {

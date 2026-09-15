@@ -9,7 +9,7 @@ use tightbeam::{
 	builder::{frame::FrameBuilder, TypeBuilder},
 	compress::ZstdCompression,
 	crypto::{
-		aead::{Aes256Gcm, Aes256GcmOid},
+		aead::Aes256Gcm,
 		hash::Sha3_256,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
 	},
@@ -36,7 +36,7 @@ macro_rules! apply_common_builder_patterns {
 			.with_message_hasher::<Sha3_256>([])
 			.with_witness_hasher::<Sha3_256>()
 			.with_compression(ZstdCompression::default())
-			.with_aead::<Aes256GcmOid, _>($cipher.to_owned())
+			.with_aead($cipher.to_owned())
 			.with_signer::<Secp256k1Signature, _>($signing_key.to_owned());
 
 		// Set previous_frame if not the first frame

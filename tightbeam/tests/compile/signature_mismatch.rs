@@ -22,15 +22,13 @@ impl SignatureAlgorithmIdentifier for OtherSignature {
 struct OtherSignatureProfile;
 
 impl SecurityProfile for OtherSignatureProfile {
-	type DigestOid = Sha3_256;
+	type Digest = Sha3_256;
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = OtherSignature; // Profile expects OtherSignature
 	#[cfg(feature = "kdf")]
-	type KdfOid = tightbeam::crypto::kdf::HkdfSha3_256Oid;
+	type Kdf = tightbeam::crypto::kdf::HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
-	type CurveOid = tightbeam::crypto::curves::Secp256k1Oid;
-	#[cfg(feature = "kem")]
-	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
+	type Curve = tightbeam::crypto::k256::Secp256k1;
 }
 
 // Create a message with a profile that expects OtherSignature

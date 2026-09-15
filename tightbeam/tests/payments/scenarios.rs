@@ -26,7 +26,7 @@ use tightbeam::{
 		SubmitWork,
 	},
 	crypto::{
-		aead::{Aes256Gcm, Aes256GcmOid, Key, KeyInit},
+		aead::{Aes256Gcm, Key, KeyInit},
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
 		profiles::DefaultCryptoProvider,
@@ -227,7 +227,7 @@ tb_scenario! {
 				.with_message(transaction)
 				.with_message_hasher::<Sha3_256>([])
 				.with_witness_hasher::<Sha3_256>()
-				.with_aead::<Aes256GcmOid, _>(shared_payment_cipher())
+				.with_aead(shared_payment_cipher())
 				.with_signer::<Secp256k1Signature, _>(certs.cluster_key.to_owned())
 				.build()?;
 

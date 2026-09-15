@@ -1,5 +1,5 @@
 use tightbeam::builder::FrameBuilder;
-use tightbeam::crypto::aead::{Aes128GcmOid, Aes256Gcm, Aes256GcmOid};
+use tightbeam::crypto::aead::Aes128GcmOid;
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::profiles::SecurityProfile;
 use tightbeam::crypto::sign::ecdsa::Secp256k1Signature;
@@ -11,15 +11,13 @@ use tightbeam::{Beamable, Version};
 struct Aes128Profile;
 
 impl SecurityProfile for Aes128Profile {
-	type DigestOid = Sha3_256;
+	type Digest = Sha3_256;
 	type AeadOid = Aes128GcmOid; // Profile expects AES-128-GCM
 	type SignatureAlg = Secp256k1Signature;
 	#[cfg(feature = "kdf")]
-	type KdfOid = tightbeam::crypto::kdf::HkdfSha3_256Oid;
+	type Kdf = tightbeam::crypto::kdf::HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
-	type CurveOid = tightbeam::crypto::curves::Secp256k1Oid;
-	#[cfg(feature = "kem")]
-	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
+	type Curve = tightbeam::crypto::k256::Secp256k1;
 }
 
 // Create a message with a profile that expects AES-128-GCM
@@ -41,5 +39,5 @@ fn main() {
 		.with_id("test_algorithm_mismatch")
 		.with_order(1696521600)
 		// ERROR: OID mismatch! Should fail to compile
-		.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher);
+		.with_aead(cipher);
 }

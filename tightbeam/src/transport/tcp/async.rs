@@ -30,16 +30,6 @@ use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportFailure;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-use crate::transport::handshake::negotiation::MuxSettings;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::io::decode_transport_envelope;
 use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
 use crate::transport::ResponsePackage;
@@ -50,8 +40,20 @@ use crate::transport::{
 use crate::Frame;
 use crate::TightBeamError;
 
+#[cfg(all(feature = "tokio", feature = "x509"))]
+use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::transport::handshake::negotiation::MuxSettings;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::transport::handshake::negotiation::TransportOffer;
 #[cfg(feature = "tokio")]
 use crate::transport::protocols::{AsyncByteRead, AsyncByteStream, AsyncByteWrite};
 #[cfg(all(
@@ -63,7 +65,7 @@ use crate::utils::marker::MaybeSend;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::aead::{Decryptor, RecvCipher, SendCipher};
+	pub use crate::crypto::aead::{DecryptContent, RecvCipher, SendCipher};
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::policy::CertificateValidation;
 	pub use crate::der::Decode;
@@ -190,7 +192,7 @@ pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
-	aad_domain_tag: Option<&'static [u8]>,
+	aad_domain_tag: &'static [u8],
 	/// Every ceiling handed to each accepted transport.
 	#[cfg(feature = "x509")]
 	limits: TransportLimits,
@@ -214,7 +216,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 			#[cfg(feature = "x509")]
 			client_validators: None,
 			#[cfg(feature = "x509")]
-			aad_domain_tag: None,
+			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			#[cfg(feature = "x509")]
 			limits: TransportLimits::default(),
 			#[cfg(feature = "x509")]
@@ -234,9 +236,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 		if let Some(ref validators) = self.client_validators {
 			transport.encryption.client_validators = Some(Arc::clone(validators));
 		}
-		if let Some(aad) = self.aad_domain_tag {
-			transport.encryption.aad_domain_tag = Some(aad);
-		}
+		transport.encryption.aad_domain_tag = self.aad_domain_tag;
 
 		transport.limits = self.limits;
 		transport.provision();
@@ -273,7 +273,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TokioListener<P> {
 				#[cfg(feature = "x509")]
 				client_validators: None,
 				#[cfg(feature = "x509")]
-				aad_domain_tag: None,
+				aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 				#[cfg(feature = "x509")]
 				limits: TransportLimits::default(),
 				#[cfg(feature = "x509")]
@@ -315,7 +315,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListe
 				listener,
 				certificate: Some(certificate),
 				client_validators,
-				aad_domain_tag: Some(config.aad_domain_tag),
+				aad_domain_tag: config.aad_domain_tag,
 				limits: config.limits,
 				key_manager: Some(key_manager),
 			},
@@ -1127,7 +1127,6 @@ mod tests {
 	mod cipher_install {
 		use super::super::*;
 		use crate::crypto::aead::RuntimeAead;
-		use crate::oids::AES_256_GCM;
 		use crate::testing::TestKey;
 
 		const PLAINTEXT: &[u8] = b"epoch boundary traffic";
@@ -1153,7 +1152,7 @@ mod tests {
 
 		fn test_runtime() -> RuntimeAead {
 			let (_key, cipher) = TestKey::cipher();
-			RuntimeAead::new(cipher, AES_256_GCM)
+			RuntimeAead::new(cipher)
 		}
 
 		fn encrypted_writer(rekey_limit: u64) -> TransportWriter<NullStream> {
@@ -1583,6 +1582,52 @@ mod tests {
 
 		let received = received_rx.recv().await;
 		assert_eq!(Some(request), received);
+
+		server_handle.await??;
+		Ok(())
+	}
+
+	// Both endpoints bind the domain tag into the key exchange's associated
+	// data, so a server tag the client does not share fails the session
+	// before the first frame is answered.
+	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[tokio::test]
+	async fn a_server_domain_tag_the_client_does_not_share_fails_the_session() -> TransportResult<()> {
+		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
+		let config = config.with_aad_domain_tag(b"tightbeam-test-other-domain");
+		let (listener, server_addr) = bind_encrypted(config).await?;
+		let server_handle = spawn_accept_handle_request(listener);
+
+		let trust_store = trust_store_for(cert)?;
+		let client_stream = TcpStream::connect(server_addr).await?;
+		let mut transport = tcp_transport_from(client_stream).with_encryption(client_encryption(trust_store));
+
+		// The server cannot authenticate the key exchange, so it refuses the
+		// handshake and closes the connection under the client's frame.
+		let emitted = transport.emit(TestFrame::v0(None, None), None).await;
+		let served = server_handle.await?;
+		assert!(matches!(emitted, Err(TransportError::ConnectionClosed)));
+		assert!(matches!(
+			served,
+			Err(TransportError::HandshakeError(HandshakeError::KeyDerivationFailed(_)))
+		));
+		Ok(())
+	}
+
+	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	#[tokio::test]
+	async fn endpoints_that_share_a_domain_tag_complete_the_session() -> TransportResult<()> {
+		const DOMAIN_TAG: &[u8] = b"tightbeam-test-other-domain";
+		let EncryptedTestServer { cert, config } = encrypted_test_server()?;
+		let (listener, server_addr) = bind_encrypted(config.with_aad_domain_tag(DOMAIN_TAG)).await?;
+		let server_handle = spawn_accept_handle_request(listener);
+
+		let trust_store = trust_store_for(cert)?;
+		let client_stream = TcpStream::connect(server_addr).await?;
+		let mut transport = tcp_transport_from(client_stream)
+			.with_encryption(client_encryption(trust_store))
+			.with_aad_domain_tag(DOMAIN_TAG);
+		transport.emit(TestFrame::v0(None, None), None).await?;
 
 		server_handle.await??;
 		Ok(())

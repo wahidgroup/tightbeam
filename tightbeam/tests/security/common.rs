@@ -7,15 +7,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
 use tightbeam::{
 	crypto::{
 		aead::{Aes128Gcm, Aes128GcmOid, Aes256Gcm},
-		curves::Secp256k1Oid,
 		ecies::{self, Secp256k1EciesMessage},
 		hash::Sha3_256,
-		kdf::{HkdfSha3_256, HkdfSha3_256Oid},
-		kem::Kyber1024Oid,
+		kdf::HkdfSha3_256,
 		profiles::{
 			AeadProvider, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
 			SecurityProfile, SecurityProfileDesc, SigningProvider,
@@ -30,11 +29,15 @@ use tightbeam::{
 		client::EciesHandshakeClient,
 		negotiation::{NoStrengthFloor, ProfileStrengthPolicy, SecurityOffer},
 		server::EciesHandshakeServer,
-		ClientKeyExchange,
+		ClientKeyExchange, ServerHandshake,
 	},
 	TightBeamError,
 };
 
+#[cfg(feature = "transport-cms")]
+use tightbeam::cms::signed_data::SignedData;
+#[cfg(feature = "transport-cms")]
+use tightbeam::der::Any;
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 
@@ -47,12 +50,11 @@ use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHan
 pub struct Aes128Profile;
 
 impl SecurityProfile for Aes128Profile {
-	type DigestOid = Sha3_256;
+	type Digest = Sha3_256;
 	type AeadOid = Aes128GcmOid;
 	type SignatureAlg = Secp256k1Signature;
-	type KdfOid = HkdfSha3_256Oid;
-	type CurveOid = Secp256k1Oid;
-	type KemOid = Kyber1024Oid;
+	type Kdf = HkdfSha3_256;
+	type Curve = k256::Secp256k1;
 
 	const KEY_WRAP_OID: Option<tightbeam::der::asn1::ObjectIdentifier> = Some(AES_128_WRAP);
 }
@@ -69,7 +71,6 @@ impl DigestProvider for Aes128CryptoProvider {
 
 impl AeadProvider for Aes128CryptoProvider {
 	type AeadCipher = Aes128Gcm;
-	type AeadOid = Aes128GcmOid;
 }
 
 impl SigningProvider for Aes128CryptoProvider {
@@ -272,7 +273,9 @@ pub use crate::common::security::{
 };
 
 #[cfg(feature = "transport-cms")]
-use crate::common::security::cms_handshake_pair;
+use crate::common::security::{pinning_trust_store, ClientMaterials};
+#[cfg(feature = "transport-cms")]
+use tightbeam::transport::{handshake::HandshakeKeyManager, state::ClientIdentity};
 
 // ============================================================================
 // Backend Kind
@@ -311,6 +314,48 @@ impl HandshakeBackendKind {
 		}
 		kinds
 	}
+
+	/// Flip one byte of the signed content in this backend's server message.
+	///
+	/// This simulates a MITM attacker modifying the message in transit. The
+	/// edit goes through the decoded message and re-encodes it, so the result
+	/// is well-formed DER and only a transcript or signature check can refuse
+	/// it. ECIES tampers the `ServerHandshake` server random, and CMS tampers
+	/// the transcript hash that the `ServerFinished` `SignedData` carries.
+	pub fn tamper_server_message(self, payload: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+		let payload = payload.as_ref();
+		match self {
+			Self::Ecies => {
+				let mut message = ServerHandshake::from_der(payload)?;
+				let server_random = flip_first_byte(message.server_random.as_bytes())?;
+				message.server_random = OctetString::new(server_random)?;
+				Ok(message.to_der()?)
+			}
+			#[cfg(feature = "transport-cms")]
+			Self::Cms => {
+				let mut signed_data = SignedData::from_der(payload)?;
+				let content = signed_data
+					.encap_content_info
+					.econtent
+					.as_ref()
+					.ok_or_else(|| expectation_failure("ServerFinished carries no content"))?;
+				let transcript_hash: OctetString = content.decode_as()?;
+				let tampered_hash = OctetString::new(flip_first_byte(transcript_hash.as_bytes())?)?;
+				signed_data.encap_content_info.econtent = Some(Any::encode_from(&tampered_hash)?);
+				Ok(signed_data.to_der()?)
+			}
+		}
+	}
+}
+
+/// Copy `bytes` with the first byte inverted.
+fn flip_first_byte(bytes: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+	let mut flipped = bytes.to_vec();
+	let first = flipped
+		.first_mut()
+		.ok_or_else(|| expectation_failure("tamper target is empty"))?;
+	*first ^= 0xFF;
+	Ok(flipped)
 }
 
 // ============================================================================
@@ -434,9 +479,10 @@ impl SecurityThreatHarness {
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
 				self.emit(Self::HARNESS_SPAWN_CMS_WEAK).ok();
-				// CMS with AES-128 would require Aes128CmsSession - use default for now.
-				// Weak profiles fail the default floor, so opt out explicitly.
-				Box::new(CmsSession::with_profiles(
+				// Deliberately weak session: opt out of the default
+				// strength floor so the downgrade harness can capture AES-128
+				// wire bytes.
+				Box::new(Aes128CmsSession::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
 					vec![weak_security_profile()],
@@ -458,39 +504,6 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 // ============================================================================
 // Message Tampering Helpers (for MITM Testing)
 // ============================================================================
-
-/// Tamper with a message payload by flipping bits deep in the trailing content.
-///
-/// This simulates a MITM attacker modifying message bytes in transit. The
-/// tampering targets bytes in the last quarter of the payload, which for a
-/// certificate-bearing handshake message lands inside the signature / signed
-/// content, ahead of the outer DER tag+length octets at the front.
-///
-/// # Parameters
-/// - `payload`: Original message bytes
-///
-/// # Returns
-/// Modified payload with flipped bits
-pub fn tamper_payload(payload: impl AsRef<[u8]>) -> Vec<u8> {
-	let payload = payload.as_ref();
-	let mut tampered = payload.to_vec();
-	if tampered.is_empty() {
-		return tampered;
-	}
-
-	// Anchor in the final quarter (past the front tag+length header) and flip
-	// a short run of content bytes so the DER framing stays intact.
-	let anchor = tampered.len().saturating_sub(tampered.len() / 4).min(tampered.len() - 1);
-	let positions = [anchor, anchor.saturating_add(1), anchor.saturating_add(2)];
-
-	for pos in positions {
-		if pos < tampered.len() {
-			tampered[pos] ^= 0xFF;
-		}
-	}
-
-	tampered
-}
 
 /// Tamper with a message by appending extra bytes.
 ///
@@ -651,7 +664,7 @@ macro_rules! ecies_session {
 				let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
 				let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
 				let validator = pinning_validator(&materials.certificate);
-				let client = EciesHandshakeClient::<$provider, Secp256k1EciesMessage>::new(None)
+				let mut client = EciesHandshakeClient::<$provider, Secp256k1EciesMessage>::new(None)
 					.with_security_offer(SecurityOffer::new(client_profiles))
 					.with_certificate_validator(validator);
 
@@ -664,6 +677,7 @@ macro_rules! ecies_session {
 				.with_supported_profiles(server_profiles);
 
 				if let Some(policy) = strength_policy {
+					client = client.with_strength_policy(Arc::clone(&policy));
 					server = server.with_strength_policy(policy);
 				}
 
@@ -713,39 +727,6 @@ ecies_session!(Aes128EciesSession, Aes128CryptoProvider);
 // CMS Session Implementation
 // ============================================================================
 
-/// CMS handshake session bundle.
-#[cfg(feature = "transport-cms")]
-pub struct CmsSession {
-	client: CmsHandshakeClient<DefaultCryptoProvider>,
-	server: CmsHandshakeServer<DefaultCryptoProvider>,
-}
-
-#[cfg(feature = "transport-cms")]
-impl CmsSession {
-	/// Create session with specific client and server profiles.
-	///
-	/// `strength_policy` overrides the server's default strength floor
-	/// (needed for deliberately weak downgrade-testing sessions).
-	fn with_profiles(
-		materials: &ServerMaterials,
-		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-		strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
-	) -> Self {
-		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
-		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
-		let pair = cms_handshake_pair(materials, client_profiles, server_profiles, None)
-			.expect("CMS pair fixture builds from generated materials");
-
-		let mut server = pair.server;
-		if let Some(policy) = strength_policy {
-			server = server.with_strength_policy(policy);
-		}
-
-		Self { client: pair.client, server }
-	}
-}
-
 /// The three messages a CMS handshake exchanges. The intervening odd steps are
 /// the receiving half of each, so they carry no message of their own.
 #[cfg(feature = "transport-cms")]
@@ -759,45 +740,108 @@ const CMS_FLOW: &[FlowStep] = &[
 #[cfg(feature = "transport-cms")]
 const CMS_SESSION_KEY: [u8; 32] = [0xA5; 32];
 
+/// Declare a CMS session over one crypto provider.
+///
+/// The provider bounds cannot be named once on stable, for the reason
+/// [`ecies_session`] gives, so the sequence is stated once here.
 #[cfg(feature = "transport-cms")]
-impl HandshakeFlow for CmsSession {
-	fn backend(&self) -> HandshakeBackendKind {
-		HandshakeBackendKind::Cms
-	}
+macro_rules! cms_session {
+	($name:ident, $provider:ty) => {
+		pub struct $name {
+			client: CmsHandshakeClient<$provider>,
+			server: CmsHandshakeServer<$provider>,
+		}
 
-	fn steps(&self) -> &'static [FlowStep] {
-		CMS_FLOW
-	}
+		impl $name {
+			/// Create a session with specific client and server profiles.
+			///
+			/// The client offers `client_profiles`, pins the server
+			/// certificate, and presents a fresh identity. `strength_policy`
+			/// overrides both endpoints' default strength floor, which a
+			/// deliberately weak downgrade session needs.
+			fn with_profiles(
+				materials: &ServerMaterials,
+				client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+				server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+				strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
+			) -> Self {
+				let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
+				let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
+				let client_materials = ClientMaterials::generate();
+				let trust_store = pinning_trust_store(&materials.certificate)
+					.expect("a trust store builds from the generated server certificate");
 
-	fn open(&mut self) -> FlowFuture<'_, Vec<u8>> {
-		Box::pin(async move {
-			let session_key = tightbeam::ZeroizingBytes::new(CMS_SESSION_KEY.to_vec());
-			Ok(self.client.build_key_exchange(session_key, None)?.to_der()?)
-		})
-	}
+				let client_key_manager = Arc::new(HandshakeKeyManager::<$provider>::new(Arc::clone(
+					&client_materials.key_provider,
+				)));
 
-	fn advance<'a>(
-		&'a mut self,
-		index: usize,
-		msg: &'a (impl AsRef<[u8]> + ?Sized + Sync),
-	) -> FlowFuture<'a, Option<Vec<u8>>> {
-		let msg = msg.as_ref();
-		Box::pin(async move {
-			match index {
-				0 => {
-					self.server.process_key_exchange(msg).await?;
-					Ok(Some(self.server.build_server_finished().await?.to_der()?))
+				let identity = ClientIdentity::new(Arc::clone(&client_materials.certificate), client_key_manager);
+				let mut client = CmsHandshakeClient::<$provider>::new(
+					<$provider>::default(),
+					Arc::clone(&client_materials.key_provider),
+					Arc::clone(&materials.certificate),
+				)
+				.with_security_offer(SecurityOffer::new(client_profiles))
+				.with_trust_store(trust_store)
+				.with_client_identity(identity);
+
+				let mut server = CmsHandshakeServer::<$provider>::new(Arc::clone(&materials.key_provider), None)
+					.with_supported_profiles(server_profiles);
+
+				if let Some(policy) = strength_policy {
+					client = client.with_strength_policy(Arc::clone(&policy));
+					server = server.with_strength_policy(policy);
 				}
-				2 => {
-					self.client.process_server_finished(msg)?;
-					Ok(Some(self.client.build_client_finished().await?.to_der()?))
-				}
-				4 => {
-					self.server.process_client_finished(msg)?;
-					Ok(None)
-				}
-				_ => Err(invalid_step_error("CMS steps are 0, 2, 4")),
+
+				Self { client, server }
 			}
-		})
-	}
+		}
+
+		impl HandshakeFlow for $name {
+			fn backend(&self) -> HandshakeBackendKind {
+				HandshakeBackendKind::Cms
+			}
+
+			fn steps(&self) -> &'static [FlowStep] {
+				CMS_FLOW
+			}
+
+			fn open(&mut self) -> FlowFuture<'_, Vec<u8>> {
+				Box::pin(async move {
+					let session_key = tightbeam::ZeroizingBytes::new(CMS_SESSION_KEY.to_vec());
+					Ok(self.client.build_key_exchange(session_key, None)?.to_der()?)
+				})
+			}
+
+			fn advance<'a>(
+				&'a mut self,
+				index: usize,
+				msg: &'a (impl AsRef<[u8]> + ?Sized + Sync),
+			) -> FlowFuture<'a, Option<Vec<u8>>> {
+				let msg = msg.as_ref();
+				Box::pin(async move {
+					match index {
+						0 => {
+							self.server.process_key_exchange(msg).await?;
+							Ok(Some(self.server.build_server_finished().await?.to_der()?))
+						}
+						2 => {
+							self.client.process_server_finished(msg)?;
+							Ok(Some(self.client.build_client_finished().await?.to_der()?))
+						}
+						4 => {
+							self.server.process_client_finished(msg)?;
+							Ok(None)
+						}
+						_ => Err(invalid_step_error("CMS steps are 0, 2, 4")),
+					}
+				})
+			}
+		}
+	};
 }
+
+#[cfg(feature = "transport-cms")]
+cms_session!(CmsSession, DefaultCryptoProvider);
+#[cfg(feature = "transport-cms")]
+cms_session!(Aes128CmsSession, Aes128CryptoProvider);

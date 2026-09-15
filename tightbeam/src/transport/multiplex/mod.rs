@@ -263,6 +263,7 @@ pub enum MuxRole {
 	Server,
 }
 
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
 impl MuxRole {
 	const fn first_local_stream_id(self) -> u32 {
 		match self {

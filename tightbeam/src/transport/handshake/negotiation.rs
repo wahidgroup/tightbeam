@@ -12,16 +12,27 @@
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+#[cfg(all(feature = "std", any(feature = "transport-cms", feature = "transport-ecies")))]
+use std::sync::Arc;
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
 use crate::constants::{
 	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_STREAM_CAP,
 };
-use crate::crypto::profiles::SecurityProfileDesc;
-use crate::der::asn1::{ObjectIdentifier, OctetString};
+use core::marker::PhantomData;
+
+use crate::crypto::common::KeySizeUser;
+use crate::crypto::hash::Digest;
+use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
+use crate::der::asn1::OctetString;
 use crate::der::Error as DerDecodeError;
 use crate::der::Sequence;
 use crate::transport::handshake::receipt::SessionReceipt;
@@ -773,6 +784,10 @@ pub enum NegotiationError {
 	#[error("No profile meets the minimum-strength policy")]
 	BelowStrengthFloor,
 
+	/// The profile names an algorithm the local provider does not run.
+	#[error("Security profile names an algorithm the provider does not run")]
+	UnrunnableProfile,
+
 	/// Offer exceeds the maximum accepted profile count.
 	#[error("Security offer too large: {count} profiles exceeds cap of {max}")]
 	OfferTooLarge { count: usize, max: usize },
@@ -828,13 +843,103 @@ impl From<DerDecodeError> for NegotiationError {
 	}
 }
 
-/// Minimum-strength filter applied to profiles before negotiation.
+/// A security profile that the provider `P` runs.
+///
+/// A peer's descriptor names algorithms, and `P` runs one fixed set of them.
+/// A descriptor becomes a `RunnableProfile` only when it names exactly the
+/// algorithms of `P`'s own profile. A handshake therefore signs and keys a
+/// session only under the identity its provider runs (CWE-345).
+pub struct RunnableProfile<P> {
+	descriptor: SecurityProfileDesc,
+	provider: PhantomData<fn() -> P>,
+}
+
+impl<P: CryptoProvider> RunnableProfile<P> {
+	/// The profile `P` runs.
+	pub fn native() -> Self {
+		let profile = <P::Profile as Default>::default();
+		let descriptor = SecurityProfileDesc::from(&profile);
+		Self { descriptor, provider: PhantomData }
+	}
+
+	/// The descriptor both endpoints negotiated.
+	pub fn descriptor(&self) -> SecurityProfileDesc {
+		self.descriptor
+	}
+
+	/// The strength a [`ProfileStrengthPolicy`] judges, read from the
+	/// provider's cipher and digest types.
+	pub fn strength(&self) -> ProfileStrength {
+		ProfileStrength {
+			descriptor: self.descriptor,
+			aead_key_bytes: <P::AeadCipher as KeySizeUser>::key_size(),
+			digest_bytes: <P::Digest as Digest>::output_size(),
+		}
+	}
+}
+
+impl<P: CryptoProvider> TryFrom<SecurityProfileDesc> for RunnableProfile<P> {
+	type Error = NegotiationError;
+
+	/// # Errors
+	///
+	/// - [`NegotiationError::UnrunnableProfile`] when `descriptor` names an
+	///   algorithm other than one of `P`'s.
+	fn try_from(descriptor: SecurityProfileDesc) -> Result<Self, Self::Error> {
+		let native = Self::native();
+		if descriptor != native.descriptor {
+			return Err(NegotiationError::UnrunnableProfile);
+		}
+
+		Ok(native)
+	}
+}
+
+impl<P> Clone for RunnableProfile<P> {
+	fn clone(&self) -> Self {
+		*self
+	}
+}
+
+impl<P> Copy for RunnableProfile<P> {}
+
+impl<P> PartialEq for RunnableProfile<P> {
+	fn eq(&self, other: &Self) -> bool {
+		self.descriptor == other.descriptor
+	}
+}
+
+impl<P> Eq for RunnableProfile<P> {}
+
+impl<P> core::fmt::Debug for RunnableProfile<P> {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_tuple("RunnableProfile").field(&self.descriptor).finish()
+	}
+}
+
+/// The strength of a runnable profile, as a [`ProfileStrengthPolicy`]
+/// judges it.
+///
+/// The sizes come from the provider's types, so a policy judges the
+/// algorithms the session runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ProfileStrength {
+	/// The negotiated descriptor.
+	pub descriptor: SecurityProfileDesc,
+	/// Key length in bytes of the provider's AEAD cipher.
+	pub aead_key_bytes: usize,
+	/// Output length in bytes of the provider's digest.
+	pub digest_bytes: usize,
+}
+
+/// Minimum-strength filter a handshake endpoint applies to profiles.
 ///
 /// Blocks downgrade (CWE-757): a mutually supported weak profile is
 /// still refused unless the policy admits it.
 pub trait ProfileStrengthPolicy {
 	/// `true` when the profile meets the policy floor.
-	fn meets_floor(&self, profile: &SecurityProfileDesc) -> bool;
+	fn meets_floor(&self, strength: &ProfileStrength) -> bool;
 }
 
 /// Default strength floor.
@@ -842,35 +947,56 @@ pub trait ProfileStrengthPolicy {
 /// # Requires
 ///
 /// - AEAD key size at least 256 bits.
-/// - Known digest OID of at least 256 bits.
-///
-/// # Fail closed
-///
-/// Unknown digest OIDs do not meet the floor.
+/// - Digest output at least 256 bits.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultStrengthFloor;
 
-/// Security strength in bits of a known digest OID. `0` for unknown OIDs (fail closed).
-fn digest_bits(oid: &ObjectIdentifier) -> u16 {
-	use crate::oids::{HASH_SHA256, HASH_SHA3_256, HASH_SHA3_384, HASH_SHA3_512};
-
-	if *oid == HASH_SHA256 || *oid == HASH_SHA3_256 {
-		return 256;
-	}
-	if *oid == HASH_SHA3_384 {
-		return 384;
-	}
-	if *oid == HASH_SHA3_512 {
-		return 512;
-	}
-	0
-}
+/// Minimum AEAD key and digest output length in bytes, 256 bits each.
+const DEFAULT_FLOOR_BYTES: usize = 32;
 
 impl ProfileStrengthPolicy for DefaultStrengthFloor {
-	fn meets_floor(&self, profile: &SecurityProfileDesc) -> bool {
-		let aead_ok = matches!(profile.aead_key_size, Some(size) if size >= 32);
-		let digest_ok = matches!(profile.digest.as_ref(), Some(oid) if digest_bits(oid) >= 256);
+	fn meets_floor(&self, strength: &ProfileStrength) -> bool {
+		let aead_ok = strength.aead_key_bytes >= DEFAULT_FLOOR_BYTES;
+		let digest_ok = strength.digest_bytes >= DEFAULT_FLOOR_BYTES;
 		aead_ok && digest_ok
+	}
+}
+
+/// The strength floor one handshake endpoint holds.
+///
+/// A server selects only a profile that meets its floor, and a client accepts
+/// only such a profile, whether or not it sent an offer. Without an explicit
+/// policy the floor is [`DefaultStrengthFloor`].
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[derive(Clone, Default)]
+pub(crate) struct StrengthFloor(Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>);
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl StrengthFloor {
+	/// A floor that applies `policy` in place of [`DefaultStrengthFloor`].
+	pub(crate) fn with_policy(policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
+		Self(Some(policy))
+	}
+
+	/// The policy this floor applies.
+	pub(crate) fn policy(&self) -> &dyn ProfileStrengthPolicy {
+		match &self.0 {
+			Some(policy) => policy.as_ref(),
+			None => &DefaultStrengthFloor,
+		}
+	}
+
+	/// Refuse `profile` when it falls below this floor.
+	///
+	/// # Errors
+	///
+	/// - [`NegotiationError::BelowStrengthFloor`] when the policy refuses the profile.
+	pub(crate) fn admit<P: CryptoProvider>(&self, profile: &RunnableProfile<P>) -> Result<(), NegotiationError> {
+		if !self.policy().meets_floor(&profile.strength()) {
+			return Err(NegotiationError::BelowStrengthFloor);
+		}
+
+		Ok(())
 	}
 }
 
@@ -883,7 +1009,7 @@ impl ProfileStrengthPolicy for DefaultStrengthFloor {
 pub struct NoStrengthFloor;
 
 impl ProfileStrengthPolicy for NoStrengthFloor {
-	fn meets_floor(&self, _profile: &SecurityProfileDesc) -> bool {
+	fn meets_floor(&self, _strength: &ProfileStrength) -> bool {
 		true
 	}
 }
@@ -940,6 +1066,7 @@ mod tests {
 
 	use super::*;
 	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::oids::{
 		AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
 		SIGNER_ECDSA_WITH_SHA3_512,
@@ -955,12 +1082,10 @@ mod tests {
 		SecurityProfileDesc {
 			digest: Some(HASH_SHA3_256),
 			aead: Some(AES_256_GCM),
-			aead_key_size: Some(32),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
 			kdf: Some(HASH_SHA3_256),
 			curve: Some(CURVE_SECP256K1),
 			key_wrap,
-			kem: None,
 		}
 	}
 
@@ -1553,38 +1678,64 @@ mod tests {
 		let aes128_gcm = SecurityProfileDesc {
 			digest: Some(HASH_SHA256),
 			aead: Some(AES_128_GCM),
-			aead_key_size: Some(16),
 			signature: Some(SIGNER_ECDSA_WITH_SHA256),
 			kdf: Some(HASH_SHA256),
 			curve: Some(CURVE_SECP256K1),
 			key_wrap: Some(AES_128_WRAP),
-			kem: None,
 		};
 		let aes256_gcm = SecurityProfileDesc {
 			digest: Some(HASH_SHA256),
 			aead: Some(AES_256_GCM),
-			aead_key_size: Some(32),
 			signature: Some(SIGNER_ECDSA_WITH_SHA256),
 			kdf: Some(HASH_SHA256),
 			curve: Some(CURVE_SECP256K1),
 			key_wrap: Some(AES_256_WRAP),
-			kem: None,
 		};
 
-		let cases: [(&[SecurityProfileDesc], &[SecurityProfileDesc], ObjectIdentifier, u16); 4] = [
-			(&[aes128_gcm, aes256_gcm], &[aes256_gcm, aes128_gcm], AES_256_GCM, 32),
-			(&[aes256_gcm, aes128_gcm], &[aes256_gcm, aes128_gcm], AES_256_GCM, 32),
-			(&[aes256_gcm, aes128_gcm], &[aes128_gcm, aes256_gcm], AES_128_GCM, 16),
-			(&[aes128_gcm, aes256_gcm], &[aes256_gcm], AES_256_GCM, 32),
-		];
+		let selected_aead = |client: &[SecurityProfileDesc], server: &[SecurityProfileDesc]| {
+			SecurityOffer::new(client.to_vec())
+				.select_profile(server)
+				.map(|selected| selected.aead)
+		};
 
-		for (client_profiles, server_profiles, expected_aead, expected_key_size) in cases {
-			let offer = SecurityOffer::new(client_profiles.to_vec());
-			let selected = offer.select_profile(server_profiles)?;
-			assert_eq!(selected.aead, Some(expected_aead));
-			assert_eq!(selected.aead_key_size, Some(expected_key_size));
-		}
-
+		assert_eq!(
+			selected_aead(&[aes128_gcm, aes256_gcm], &[aes256_gcm, aes128_gcm])?,
+			Some(AES_256_GCM)
+		);
+		assert_eq!(
+			selected_aead(&[aes256_gcm, aes128_gcm], &[aes256_gcm, aes128_gcm])?,
+			Some(AES_256_GCM)
+		);
+		assert_eq!(
+			selected_aead(&[aes256_gcm, aes128_gcm], &[aes128_gcm, aes256_gcm])?,
+			Some(AES_128_GCM)
+		);
+		assert_eq!(selected_aead(&[aes128_gcm, aes256_gcm], &[aes256_gcm])?, Some(AES_256_GCM));
 		Ok(())
+	}
+
+	#[test]
+	fn a_descriptor_that_names_a_foreign_algorithm_is_not_runnable() {
+		let native = RunnableProfile::<DefaultCryptoProvider>::native().descriptor();
+		let foreign = SecurityProfileDesc { digest: Some(crate::oids::HASH_SHA3_512), ..native };
+
+		let result = RunnableProfile::<DefaultCryptoProvider>::try_from(foreign);
+
+		assert!(matches!(result, Err(NegotiationError::UnrunnableProfile)));
+	}
+
+	#[test]
+	fn a_runnable_profile_reports_the_provider_key_and_digest_sizes() {
+		let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
+		assert_eq!(strength.aead_key_bytes, 32);
+		assert_eq!(strength.digest_bytes, 32);
+	}
+
+	#[test]
+	fn the_default_floor_refuses_a_128_bit_aead_key() {
+		let strength = RunnableProfile::<DefaultCryptoProvider>::native().strength();
+		let weak = ProfileStrength { aead_key_bytes: 16, ..strength };
+		assert!(DefaultStrengthFloor.meets_floor(&strength));
+		assert!(!DefaultStrengthFloor.meets_floor(&weak));
 	}
 }
