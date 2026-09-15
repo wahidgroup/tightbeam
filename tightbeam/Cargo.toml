@@ -112,7 +112,6 @@ full = [
 	"kdf",
 	"ecies",
 	"ecdh",
-	"derive",
 	"tokio",
 	"futures",
 	"constants",
@@ -126,7 +125,7 @@ full = [
 # Core features
 constants = ["hex"]
 crypto = ["random", "dep:crypto-common", "zeroize"]
-builder = ["derive", "x509-cert/builder", "crypto"]
+builder = ["x509-cert/builder", "crypto"]
 policy = []
 router = []
 transport = [
@@ -139,7 +138,7 @@ transport = [
 	"kdf",
 	"ecdh",
 ]
-compress = ["tightbeam-derive/compress"]
+compress = []
 transport-policy = ["transport", "policy"]
 transport-multiplex = ["transport", "std", "futures", "futures/std"]
 # UNSTABLE: PQXDH prekey/kdf-chain/hybrid-KEM primitives.
@@ -152,7 +151,6 @@ colony = [
 	"builder",
 	"policy",
 	"router",
-	"derive",
 	"transport",
 	"transport-ecies",
 	"transport-multiplex",
@@ -170,11 +168,9 @@ testing-schedulability = ["testing", "testing-timing"]
 testing-fault = ["testing", "testing-fdr"]
 testing-fmea = ["testing", "testing-fault", "instrument"]
 testing-fuzz = ["testing", "testing-csp", "dep:afl"]
-# Property-based tests over the wire types. Off by default: the strategies
-# only compile when a consumer asks for them.
 testing-property = ["testing", "dep:proptest"]
 testing-fuzz-ijon = ["testing-fuzz"]
-instrument = ["std", "sha3", "digest", "derive"]
+instrument = ["std", "sha3", "digest"]
 logging = []
 
 # TODO
@@ -188,7 +184,6 @@ aead = [
 	"dep:aead",
 	"dep:ecdsa",
 	"dep:crypto-common",
-	"tightbeam-derive/aead",
 	"aead/rand_core",
 	"dep:aes",
 	"dep:aes-kw",
@@ -203,12 +198,11 @@ signature = [
 	"dep:ecdsa",
 	"ecdsa/verifying",
 	"ecdsa/pem",
-	"tightbeam-derive/signature",
 	"dep:signature",
 	"cms/signature",
 	"x509-cert/signature",
 ]
-digest = ["crypto", "dep:digest", "tightbeam-derive/digest", "sha3"]
+digest = ["crypto", "dep:digest", "sha3"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "digest"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
 ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
@@ -254,10 +248,6 @@ transport-ecies = [
 	"x509",
 	"ecdh",
 ]
-
-# Gates the `Beamable` and `Flaggable` re-exports and the generated error and
-# URN implementations. `builder` and `instrument` both select it.
-derive = []
 
 # Standard library support
 std = [

@@ -221,7 +221,6 @@ mod tests {
 	use super::*;
 	use crate::utils::urn::builders::spec::Pattern;
 
-	#[cfg(feature = "derive")]
 	crate::urn_spec! {
 		/// Test URN spec for testing URN builder functionality
 		TestUrnSpec,
@@ -232,42 +231,6 @@ mod tests {
 			id: { pattern: Pattern::AlphaNumericHyphen }
 		},
 		nss_format: "{}:{}/{}"
-	}
-
-	#[cfg(not(feature = "derive"))]
-	use crate::utils::urn::{UrnComponents, UrnSpec, UrnSpecBuilder};
-
-	#[cfg(not(feature = "derive"))]
-	struct TestUrnSpec;
-
-	#[cfg(not(feature = "derive"))]
-	impl TestUrnSpec {
-		fn spec_builder() -> UrnSpecBuilder {
-			UrnSpecBuilder::from("test")
-				.field_required("category")
-				.field_const("category", "instrumentation")
-				.field_nss_separator("category", ":")
-				.field_required("type")
-				.field_oneof("type", &["trace", "event", "seed", "verdict"])
-				.field_nss_separator("type", "/")
-				.field_required("id")
-				.field_pattern("id", Pattern::AlphaNumericHyphen)
-				.nss_format("{}:{}/{}")
-		}
-	}
-
-	#[cfg(not(feature = "derive"))]
-	impl UrnSpec for TestUrnSpec {
-		const NID: &'static str = "test";
-
-		fn validate<'a>(components: &dyn UrnComponents<'a>) -> Result<(), UrnValidationError> {
-			Self::spec_builder().validate(components)
-		}
-
-		fn build_nss<'a>(components: &dyn UrnComponents<'a>) -> Result<Cow<'static, str>, UrnValidationError> {
-			let nss = Self::spec_builder().build_nss(components)?;
-			Ok(nss.into())
-		}
 	}
 
 	#[test]

@@ -15,20 +15,18 @@ use crate::Frame;
 
 #[cfg(feature = "tokio")]
 use crate::policy::TransitStatus;
-#[cfg(feature = "tokio")]
-use crate::transport::MessageCollector;
-#[cfg(feature = "tokio")]
-use crate::TightBeamError;
-
-#[cfg(all(feature = "tokio", feature = "x509"))]
-use crate::transport::state::EncryptedProtocolState;
-
 #[cfg(pooled_mux)]
 use crate::transport::multiplex::MuxAcceptor;
 #[cfg(pooled_mux)]
 use crate::transport::multiplex::{ReplySink, StreamBody, StreamRoute};
 #[cfg(pooled_mux)]
 use crate::transport::serve::{serve_mux, CallContext, MuxService};
+#[cfg(all(feature = "tokio", feature = "x509"))]
+use crate::transport::state::EncryptedProtocolState;
+#[cfg(feature = "tokio")]
+use crate::transport::MessageCollector;
+#[cfg(feature = "tokio")]
+use crate::TightBeamError;
 
 #[cfg(feature = "tokio")]
 use self::server_runtime::rt::{ErrorSender, OkSender};
@@ -666,7 +664,7 @@ macro_rules! __tightbeam_server_protocol_service_handle {
 macro_rules! __tightbeam_server_protocol_service_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $error_tx:expr, $ok_tx:expr, $service:expr) => {
 		compile_error!(
-			"server!(protocol ..., service: ...) requires the pooled multiplexing feature set (`tokio`, `x509`, `transport-policy`, `transport-multiplex`, and a handshake protocol)"
+			"server!(protocol ..., service: ...) requires the pooled multiplexing feature set that the `pooled_mux` alias in tightbeam's build.rs defines"
 		);
 	};
 }

@@ -44,7 +44,7 @@ const WORKER_1_TAG: &str = "worker:1";
 
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 struct WorkOrder {
-	#[cfg_attr(feature = "derive", beam(bytes))]
+	#[beam(bytes)]
 	payload: Vec<u8>,
 }
 

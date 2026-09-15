@@ -114,8 +114,7 @@ use x509::*;
 /// - `ancillary` is the server's settlement challenge (unsigned
 ///   transaction, invoice, or other opaque bytes). Public wire data,
 ///   never a secret; never parsed by TightBeam.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
+#[derive(Clone, Debug, Eq, PartialEq, Beamable, Sequence)]
 pub struct SessionReceipt {
 	/// Handshake transcript digest pinning the receipt to a session per
 	/// [RFC 8017 §9.2](https://datatracker.ietf.org/doc/html/rfc8017#section-9.2).

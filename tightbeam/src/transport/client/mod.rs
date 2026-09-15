@@ -5,7 +5,6 @@ use crate::transport::{MessageEmitter, Protocol, TransportResult};
 
 #[cfg(feature = "builder")]
 pub mod builder;
-#[cfg(feature = "derive")]
 pub mod macros;
 #[cfg(feature = "std")]
 pub mod pool;

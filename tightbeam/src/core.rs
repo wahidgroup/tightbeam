@@ -429,7 +429,6 @@ mod tests {
 		} => EncryptedContentInfo,
 	}
 
-	#[cfg(feature = "derive")]
 	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
 	#[beam(profile = 1)]
 	struct NumericProfileMessage {
@@ -437,7 +436,6 @@ mod tests {
 		data: String,
 	}
 
-	#[cfg(feature = "derive")]
 	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
 	#[beam(profile(crate::crypto::profiles::TightbeamProfile))]
 	struct TypeProfileMessage {
@@ -445,14 +443,12 @@ mod tests {
 		data: String,
 	}
 
-	#[cfg(feature = "derive")]
 	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
 	struct NoProfileMessage {
 		id: u64,
 		data: String,
 	}
 
-	#[cfg(feature = "derive")]
 	#[test]
 	#[allow(clippy::assertions_on_constants)]
 	fn test_profile_types() {

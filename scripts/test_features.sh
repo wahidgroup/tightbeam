@@ -38,7 +38,7 @@ echo "[4/16] Check: Transport Full + TCP + Async"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,transport-ecies,tcp,tokio,testing"
 
 echo "[5/16] Check: Transport CMS + Derive"
-cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,derive,testing"
+cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing"
 
 echo "[6/16] Check: Testing CSP/FDR"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,testing,testing-csp,testing-fdr"

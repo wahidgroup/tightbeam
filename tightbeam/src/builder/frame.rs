@@ -963,7 +963,6 @@ mod tests {
 	// V1 is the first version whose metadata carries integrity info.
 	// `MetadataBuilder::build` rejects V0 with `message_integrity`.
 	#[test]
-	#[cfg(feature = "derive")]
 	fn test_compose_macro() -> Result<()> {
 		let message = TestMessage::sample(None);
 		let frame = compose! {
@@ -1038,82 +1037,30 @@ mod tests {
 		macro_rules! test_msg_struct {
 			// BasicMessage: (false, false, false, false, V0)
 			(false, false, false, false, V0) => {
-				#[cfg(feature = "derive")]
 				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
 				#[beam(min_version = "V0")]
 				struct TestMsg {
 					content: String,
 				}
-				#[cfg(not(feature = "derive"))]
-				#[derive(Clone, Debug, PartialEq, der::Sequence)]
-				struct TestMsg {
-					content: String,
-				}
-				#[cfg(not(feature = "derive"))]
-				impl $crate::Message for TestMsg {
-					const MUST_BE_CONFIDENTIAL: bool = false;
-					const MUST_BE_NON_REPUDIABLE: bool = false;
-					const MUST_BE_COMPRESSED: bool = false;
-					const MUST_BE_PRIORITIZED: bool = false;
-					const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
-					const MUST_HAVE_FRAME_INTEGRITY: bool = false;
-					const MIN_VERSION: Version = Version::V0;
-					type Profile = $crate::crypto::profiles::TightbeamProfile;
-				}
 			};
 			// ConfidentialMessage: (true, false, false, false, V1)
 			(true, false, false, false, V1) => {
-				#[cfg(feature = "derive")]
 				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
 				#[beam(confidential, min_version = "V1")]
 				struct TestMsg {
 					content: String,
 				}
-				#[cfg(not(feature = "derive"))]
-				#[derive(Clone, Debug, PartialEq, der::Sequence)]
-				struct TestMsg {
-					content: String,
-				}
-				#[cfg(not(feature = "derive"))]
-				impl $crate::Message for TestMsg {
-					const MUST_BE_CONFIDENTIAL: bool = true;
-					const MUST_BE_NON_REPUDIABLE: bool = false;
-					const MUST_BE_COMPRESSED: bool = false;
-					const MUST_BE_PRIORITIZED: bool = false;
-					const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
-					const MUST_HAVE_FRAME_INTEGRITY: bool = false;
-					const MIN_VERSION: Version = Version::V1;
-					type Profile = $crate::crypto::profiles::TightbeamProfile;
-				}
 			};
 			// NonrepudiableMessage: (false, true, false, false, V1)
 			(false, true, false, false, V1) => {
-				#[cfg(feature = "derive")]
 				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
 				#[beam(nonrepudiable, min_version = "V1")]
 				struct TestMsg {
 					content: String,
 				}
-				#[cfg(not(feature = "derive"))]
-				#[derive(Clone, Debug, PartialEq, der::Sequence)]
-				struct TestMsg {
-					content: String,
-				}
-				#[cfg(not(feature = "derive"))]
-				impl $crate::Message for TestMsg {
-					const MUST_BE_CONFIDENTIAL: bool = false;
-					const MUST_BE_NON_REPUDIABLE: bool = true;
-					const MUST_BE_COMPRESSED: bool = false;
-					const MUST_BE_PRIORITIZED: bool = false;
-					const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
-					const MUST_HAVE_FRAME_INTEGRITY: bool = false;
-					const MIN_VERSION: Version = Version::V1;
-					type Profile = $crate::crypto::profiles::TightbeamProfile;
-				}
 			};
 			// FullSecurityMessage: (true, true, true, true, V2)
 			(true, true, true, true, V2) => {
-				#[cfg(feature = "derive")]
 				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
 				#[beam(
 					confidential,
@@ -1124,22 +1071,6 @@ mod tests {
 				)]
 				struct TestMsg {
 					content: String,
-				}
-				#[cfg(not(feature = "derive"))]
-				#[derive(Clone, Debug, PartialEq, der::Sequence)]
-				struct TestMsg {
-					content: String,
-				}
-				#[cfg(not(feature = "derive"))]
-				impl $crate::Message for TestMsg {
-					const MUST_BE_CONFIDENTIAL: bool = true;
-					const MUST_BE_NON_REPUDIABLE: bool = true;
-					const MUST_BE_COMPRESSED: bool = false;
-					const MUST_BE_PRIORITIZED: bool = false;
-					const MUST_HAVE_MESSAGE_INTEGRITY: bool = true;
-					const MUST_HAVE_FRAME_INTEGRITY: bool = true;
-					const MIN_VERSION: Version = Version::V2;
-					type Profile = $crate::crypto::profiles::TightbeamProfile;
 				}
 			};
 		}

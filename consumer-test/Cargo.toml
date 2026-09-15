@@ -12,7 +12,6 @@ workspace = true
 [dependencies]
 tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features = false, features = [
 	"std",
-	"derive",
 	"builder",
 	"crypto",
 	"digest",

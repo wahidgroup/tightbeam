@@ -184,7 +184,6 @@ pub use tightbeam_derive::Errorizable;
 
 #[cfg(feature = "hex")]
 pub use hex_literal::hex;
-#[cfg(feature = "derive")]
 pub use tightbeam_derive::{Beamable, Flaggable};
 #[cfg(feature = "time")]
 pub use time;

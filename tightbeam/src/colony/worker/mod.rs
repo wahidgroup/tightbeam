@@ -56,14 +56,13 @@ pub struct WorkerRequest<I: Send, O> {
 	pub trace: Arc<TraceCollector>,
 }
 
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug)]
+#[derive(Errorizable, Debug)]
 pub enum WorkerRelayError {
-	#[cfg_attr(feature = "derive", error("Worker queue closed"))]
+	#[error("Worker queue closed")]
 	QueueClosed,
-	#[cfg_attr(feature = "derive", error("Worker response channel dropped"))]
+	#[error("Worker response channel dropped")]
 	ResponseDropped,
-	#[cfg_attr(feature = "derive", error("Message rejected with status {:?}"))]
+	#[error("Message rejected with status {:?}")]
 	Rejected(TransitStatus),
 }
 
