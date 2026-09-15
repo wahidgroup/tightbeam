@@ -285,6 +285,11 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
+			fn with_aad_domain_tag(mut self, tag: &'static [u8]) -> Self {
+				self.encryption.aad_domain_tag = tag;
+				self
+			}
+
 			#[cfg(feature = "instrument")]
 			fn with_trace(mut self, trace: $crate::trace::TraceCollector) -> Self {
 				self.trace = Some(trace);

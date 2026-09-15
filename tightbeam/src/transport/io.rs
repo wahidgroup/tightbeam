@@ -70,7 +70,7 @@ use deadline::*;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::aead::Decryptor;
+	pub use crate::crypto::aead::DecryptContent;
 	pub use crate::transport::builders::EnvelopeBuilder;
 	pub use crate::transport::state::EncryptedProtocolState;
 
@@ -80,11 +80,12 @@ mod x509 {
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	mod handshake {
 		pub use crate::crypto::aead::KeyInit;
-		pub use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc, TightbeamProfile};
+		pub use crate::crypto::profiles::CryptoProvider;
 		pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 		pub use crate::crypto::sign::Verifier;
 		pub use crate::spki::EncodePublicKey;
+		pub use crate::transport::handshake::negotiation::RunnableProfile;
 		pub use crate::transport::handshake::{
 			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError, HandshakeMessage,
 			HandshakeProtocolKind, ServerHandshakeProtocol,
@@ -203,7 +204,6 @@ where
 		return Ok(None);
 	};
 
-	let aead_oid = state.session_state().encryptor()?.algorithm_oid();
 	let Some(peer_certificate) = state.session_state().peer_certificate_arc() else {
 		return Ok(None);
 	};
@@ -218,8 +218,7 @@ where
 	};
 
 	let reference_receipt = stored.receipt().clone();
-	let materials =
-		RekeyMaterials::<P>::new(epoch, aead_oid, reference_receipt, provider, peer_verifying_key, peer_sid);
+	let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, provider, peer_verifying_key, peer_sid);
 
 	let driver = match role {
 		MuxRole::Client => {
@@ -635,7 +634,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::EciesMessage: EciesMessageOps,
 	{
 		// Create client without mutual auth
-		let mut client = EciesHandshakeClient::<P, P::EciesMessage>::new(None);
+		let mut client = EciesHandshakeClient::<P, P::EciesMessage>::new(Some(self.encryption().aad_domain_tag));
 
 		// Use trust store for server certificate validation
 		#[cfg(all(feature = "x509", feature = "std"))]
@@ -760,7 +759,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		Ok(key.create_ecies_client::<Secp256k1EciesMessage>(
 			None,
 			client_cert,
-			None,
+			Some(self.encryption().aad_domain_tag),
 			validator,
 			transport_offer,
 			receipt_approver,
@@ -804,7 +803,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		let trust_store = Arc::clone(store);
 		let server_identity = Arc::clone(chain).into();
-		let security_offer = Some(SecurityOffer::new(vec![SecurityProfileDesc::from(&TightbeamProfile)]));
+		let security_offer = Some(SecurityOffer::new(vec![RunnableProfile::<P>::native().descriptor()]));
 		let client_certificate = self
 			.encryption()
 			.client_identity
@@ -1011,11 +1010,11 @@ pub trait EncryptedMessageIO: MessageIO {
 			.ok_or(TransportError::MissingEncryption)?;
 
 		let client_validators = self.encryption().client_validators.as_ref().map(Arc::clone);
-		let supported_profiles = vec![SecurityProfileDesc::from(&TightbeamProfile)];
+		let supported_profiles = vec![RunnableProfile::<P>::native().descriptor()];
 
 		Ok(key_manager.create_ecies_server(
 			cert_arc,
-			None,
+			Some(self.encryption().aad_domain_tag),
 			supported_profiles,
 			client_validators,
 			self.encryption().mux_offer.as_deref().cloned(),
@@ -1045,7 +1044,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			.ok_or(TransportError::MissingEncryption)?;
 
 		let client_validators = self.encryption().client_validators.as_ref().map(Arc::clone);
-		let supported_profiles = vec![SecurityProfileDesc::from(&TightbeamProfile)];
+		let supported_profiles = vec![RunnableProfile::<P>::native().descriptor()];
 
 		Ok(key_manager.create_cms_server(
 			client_validators,
@@ -1374,16 +1373,14 @@ mod tests {
 	#[cfg(feature = "aead")]
 	#[tokio::test]
 	async fn a_close_is_named_by_the_phase_it_interrupts() {
-		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
-		use crate::der::oid::AssociatedOid;
+		use crate::crypto::aead::{Aes256Gcm, DirectionalCiphers, KeyInit};
 
-		let keys = SessionKeys::for_client(
-			Aes256Gcm::new(&[0u8; 32].into()),
-			Aes256Gcm::new(&[1u8; 32].into()),
-			Aes256GcmOid::OID,
-		);
+		let keys = SessionKeys::for_client(DirectionalCiphers {
+			client_to_server: Aes256Gcm::new(&[0u8; 32].into()),
+			server_to_client: Aes256Gcm::new(&[1u8; 32].into()),
+		});
+
 		let encrypted = SessionPhase::Encrypted(Box::new(EstablishedSession::new(keys, None, None, None, None)));
-
 		let handshaking = SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() };
 		let cases = [
 			("cleartext session", SessionPhase::Cleartext, TransportError::ConnectionClosed),

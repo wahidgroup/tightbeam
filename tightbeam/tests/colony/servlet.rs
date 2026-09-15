@@ -7,7 +7,7 @@ use tightbeam::{
 	compose,
 	compress::ZstdCompression,
 	crypto::{
-		aead::{Aes256Gcm, Aes256GcmOid, KeyInit},
+		aead::{Aes256Gcm, KeyInit},
 		common::Key,
 		hash::Sha3_256,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
@@ -283,7 +283,7 @@ tb_scenario! {
 					order: 1u64,
 					message: CalcRequest { value: config.value },
 					compactness: ZstdCompression::default(),
-					confidentiality<Aes256GcmOid, _>: shared_cipher(),
+					confidentiality: shared_cipher(),
 					nonrepudiation<Secp256k1Signature, _>: TestKey::signing(),
 					message_integrity<Sha3_256>: [],
 					frame_integrity: type Sha3_256

@@ -17,30 +17,24 @@ use crate::der::asn1::ObjectIdentifier;
 use crate::der::Sequence;
 use crate::oids::AES_256_WRAP;
 
+#[cfg(feature = "aead")]
+use crate::crypto::aead::AeadAlgorithm;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::aead::Aes256Gcm;
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 use crate::crypto::aead::Aes256GcmOid;
-#[cfg(feature = "aead")]
-use crate::crypto::aead::{Aead, Encryptor};
-#[cfg(feature = "ecdh")]
-use crate::crypto::curves::Secp256k1Oid;
 #[cfg(feature = "digest")]
 use crate::crypto::hash::Digest;
 #[cfg(all(feature = "digest", feature = "sha3"))]
 use crate::crypto::hash::Sha3_256;
-#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-use crate::crypto::kdf::HkdfSha3_256;
 #[cfg(feature = "kdf")]
-use crate::crypto::kdf::{HkdfSha3_256Oid, KdfFunction};
+use crate::crypto::kdf::{HkdfSha3_256, KdfFunction};
 #[cfg(feature = "kem")]
-use crate::crypto::kem::{Decapsulator, EncappedKey, Encapsulator, Kyber1024Oid};
+use crate::crypto::kem::{Decapsulator, EncappedKey, Encapsulator};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::Secp256k1Signature;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
-#[cfg(feature = "ecdh")]
-use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{PrehashVerifier, Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
 #[cfg(any(
@@ -48,8 +42,7 @@ use crate::crypto::sign::{PrehashVerifier, Signatory, SignatureAlgorithmIdentifi
 	feature = "aead",
 	feature = "signature",
 	feature = "kdf",
-	feature = "ecdh",
-	feature = "kem"
+	feature = "ecdh"
 ))]
 use crate::der::oid::AssociatedOid;
 #[cfg(any(feature = "digest", feature = "aead", feature = "signature"))]
@@ -58,6 +51,8 @@ use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::handshake::HandshakeError;
 use crate::Beamable;
 use crate::Errorizable;
+#[cfg(feature = "ecdh")]
+use elliptic_curve::{Curve, CurveArithmetic};
 /// Macro to generate key wrapper implementations.
 /// Reduces duplication across AES-128/192/256 variants.
 #[cfg(all(feature = "aead", feature = "transport"))]
@@ -98,75 +93,60 @@ macro_rules! impl_key_unwrapper {
 	};
 }
 
-/// Trait to extract key size from AEAD OID types.
-///
-/// This enables compile-time association between algorithm OIDs and their key sizes,
-/// which is then captured in SecurityProfileDesc for runtime key derivation.
-#[cfg(feature = "aead")]
-pub trait AeadKeySize {
-	const KEY_SIZE: usize;
-}
-
-/// AES-128-GCM key size (16 bytes)
-#[cfg(all(feature = "aead", feature = "aes-gcm"))]
-impl AeadKeySize for crate::crypto::aead::Aes128GcmOid {
-	const KEY_SIZE: usize = 16;
-}
-
-/// AES-256-GCM key size (32 bytes)
-#[cfg(all(feature = "aead", feature = "aes-gcm"))]
-impl AeadKeySize for crate::crypto::aead::Aes256GcmOid {
-	const KEY_SIZE: usize = 32;
-}
-
 /// Negotiation descriptor: pure OID set for a security profile.
 ///
 /// Every field is `Option`: `None` uniformly means "algorithm not part of
-/// this profile" (feature disabled on the producing side).
+/// this profile" (feature disabled on the producing side). Each field carries
+/// its own context tag, so an absent algorithm cannot shift the next OID into
+/// its place on decode.
+///
+/// The AEAD OID names the cipher, and the cipher type fixes the key length.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence, Beamable)]
 pub struct SecurityProfileDesc {
+	/// Digest algorithm.
+	#[asn1(context_specific = "0", optional = "true")]
 	pub digest: Option<ObjectIdentifier>,
+	/// AEAD algorithm.
+	#[asn1(context_specific = "1", optional = "true")]
 	pub aead: Option<ObjectIdentifier>,
-	pub aead_key_size: Option<u16>,
+	/// Signature algorithm.
+	#[asn1(context_specific = "2", optional = "true")]
 	pub signature: Option<ObjectIdentifier>,
+	/// Key derivation function.
+	#[asn1(context_specific = "3", optional = "true")]
 	pub kdf: Option<ObjectIdentifier>,
+	/// Elliptic curve for key agreement.
+	#[asn1(context_specific = "4", optional = "true")]
 	pub curve: Option<ObjectIdentifier>,
+	/// Key-wrap algorithm.
+	#[asn1(context_specific = "5", optional = "true")]
 	pub key_wrap: Option<ObjectIdentifier>,
-	pub kem: Option<ObjectIdentifier>,
 }
 
 impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 	fn from(_p: &P) -> Self {
 		SecurityProfileDesc {
 			#[cfg(feature = "digest")]
-			digest: Some(<P::DigestOid as AssociatedOid>::OID),
+			digest: Some(<P::Digest as AssociatedOid>::OID),
 			#[cfg(not(feature = "digest"))]
 			digest: None,
 			#[cfg(feature = "aead")]
 			aead: Some(<P::AeadOid as AssociatedOid>::OID),
 			#[cfg(not(feature = "aead"))]
 			aead: None,
-			#[cfg(feature = "aead")]
-			aead_key_size: Some(<P::AeadOid as AeadKeySize>::KEY_SIZE as u16),
-			#[cfg(not(feature = "aead"))]
-			aead_key_size: None,
 			#[cfg(feature = "signature")]
 			signature: Some(<P::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID),
 			#[cfg(not(feature = "signature"))]
 			signature: None,
 			#[cfg(feature = "kdf")]
-			kdf: Some(<P::KdfOid as AssociatedOid>::OID),
+			kdf: Some(<P::Kdf as AssociatedOid>::OID),
 			#[cfg(not(feature = "kdf"))]
 			kdf: None,
 			#[cfg(feature = "ecdh")]
-			curve: Some(<P::CurveOid as AssociatedOid>::OID),
+			curve: Some(<P::Curve as AssociatedOid>::OID),
 			#[cfg(not(feature = "ecdh"))]
 			curve: None,
 			key_wrap: P::KEY_WRAP_OID,
-			#[cfg(feature = "kem")]
-			kem: Some(<P::KemOid as AssociatedOid>::OID),
-			#[cfg(not(feature = "kem"))]
-			kem: None,
 		}
 	}
 }
@@ -175,28 +155,36 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 /// negotiated security profile. No concrete key types or implementations.
 ///
 /// Rationale:
-/// - Allows negotiation over a compact descriptor (hash + aead + sig + wrap + kdf + curve + kem).
+/// - Allows negotiation over a compact descriptor (hash + aead + sig + wrap + kdf + curve).
 /// - Decouples compile-time algorithm implementation (CryptoProvider) from
 ///   protocol-visible identifiers (SecurityProfile).
 /// - Enables future dynamic dispatch / plugin loading without changing wire format.
-/// - KDF, curve, and KEM must be negotiated to ensure interoperability:
+/// - KDF and curve must be negotiated to ensure interoperability:
 ///   * Different KDFs produce different keys from the same inputs
 ///   * Curve choice affects ECDH operations (e.g., Ed25519 signatures typically use X25519 for ECDH)
-///   * KEM choice enables hybrid classical+PQ key agreement (e.g., ECDH + Kyber-1024)
 pub trait SecurityProfile {
+	/// Digest algorithm. A [`CryptoProvider`] for this profile MUST use this
+	/// type as its digest.
 	#[cfg(feature = "digest")]
-	type DigestOid: AssociatedOid;
+	type Digest: AssociatedOid;
+	/// AEAD algorithm identifier. A [`CryptoProvider`] for this profile MUST
+	/// use a cipher that names this identifier.
 	#[cfg(feature = "aead")]
-	type AeadOid: AssociatedOid + AeadKeySize;
+	type AeadOid: AssociatedOid;
+	/// Signature algorithm. A [`CryptoProvider`] for this profile MUST use
+	/// this type as its signature.
 	#[cfg(feature = "signature")]
 	type SignatureAlg: SignatureAlgorithmIdentifier;
+	/// Key derivation function. A [`CryptoProvider`] for this profile MUST
+	/// use this type as its KDF.
 	#[cfg(feature = "kdf")]
-	type KdfOid: AssociatedOid;
+	type Kdf: AssociatedOid;
+	/// Elliptic curve for key agreement. A [`CryptoProvider`] for this
+	/// profile MUST use this type as its curve.
 	#[cfg(feature = "ecdh")]
-	type CurveOid: AssociatedOid;
-	#[cfg(feature = "kem")]
-	type KemOid: AssociatedOid;
+	type Curve: AssociatedOid;
 
+	/// Key-wrap algorithm, or [`None`] when the profile wraps no keys.
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
 }
 
@@ -225,15 +213,17 @@ pub trait DigestProvider {
 ///
 /// Separates AEAD operations (encryption/decryption) from other crypto primitives.
 ///
-/// `AeadCipher` MUST implement [`Encryptor`] for
-/// `AeadOid` so the wire algorithm identifier cannot diverge from the cipher.
+/// The cipher type names its own algorithm identifier through
+/// [`AeadAlgorithm`].
 #[cfg(feature = "aead")]
 pub trait AeadProvider {
-	type AeadCipher: Aead + Encryptor<Self::AeadOid> + Send + Sync;
-	type AeadOid: AssociatedOid;
+	/// AEAD cipher, which names the algorithm identifier and key length the
+	/// profile negotiates.
+	type AeadCipher: AeadAlgorithm + Send + Sync;
 
 	fn to_aead_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: <Self::AeadOid as AssociatedOid>::OID, parameters: None }
+		let oid = <<Self::AeadCipher as AeadAlgorithm>::Oid as AssociatedOid>::OID;
+		AlgorithmIdentifierOwned { oid, parameters: None }
 	}
 
 	/// Convert this provider into a KeyWrapper function for AES-128 KEK (16 bytes).
@@ -322,10 +312,13 @@ pub trait SigningProvider {
 
 /// Provides key derivation functionality.
 ///
-/// Separates KDF operations (HKDF, etc.) for clearer trait bounds.
+/// Separates KDF operations (HKDF, etc.) for clearer trait bounds. The KDF
+/// type names the algorithm identifier a peer negotiates for it.
 #[cfg(feature = "kdf")]
 pub trait KdfProvider {
-	type Kdf: KdfFunction;
+	/// Key derivation function, which names the algorithm identifier the
+	/// profile negotiates.
+	type Kdf: KdfFunction + AssociatedOid;
 
 	/// Convert this provider into a KeyDeriver function for a specific output length.
 	///
@@ -344,10 +337,13 @@ pub trait KdfProvider {
 
 /// Provides elliptic curve operations.
 ///
-/// Isolates curve-specific functionality (ECDH, key generation).
+/// Isolates curve-specific functionality (ECDH, key generation). The curve
+/// type names the algorithm identifier a peer negotiates for it.
 #[cfg(feature = "ecdh")]
 pub trait CurveProvider {
-	type Curve: Curve + CurveArithmetic;
+	/// Elliptic curve for key agreement, which names the algorithm identifier
+	/// the profile negotiates.
+	type Curve: Curve + CurveArithmetic + AssociatedOid;
 	#[cfg(feature = "ecies")]
 	type EciesMessage: crate::crypto::ecies::EciesMessageOps;
 }
@@ -365,9 +361,13 @@ pub trait KemProvider {
 
 /// Binds concrete implementations to the metadata in a `SecurityProfile`.
 ///
-/// This is a convenience trait that composes all role-based provider traits.
-/// Components can use specific role traits (e.g., `SigningProvider + DigestProvider`)
-/// instead of requiring the full `CryptoProvider` to reduce trait bound complexity.
+/// This trait composes all role-based provider traits. Components can use
+/// specific role traits (e.g., `SigningProvider + DigestProvider`) instead of
+/// requiring the full `CryptoProvider` to reduce trait bound complexity.
+///
+/// Each role's algorithm type MUST be the type its profile names. The bounds
+/// enforce this, so a provider that runs one algorithm while its profile
+/// negotiates another does not compile.
 #[cfg(all(
 	feature = "digest",
 	feature = "aead",
@@ -378,28 +378,36 @@ pub trait KemProvider {
 pub trait CryptoProvider:
 	Default + Copy + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider // + KemProvider
 {
-	type Profile: SecurityProfile + Default;
+	/// The profile this provider runs. Each algorithm it names is the type the
+	/// matching role above uses.
+	type Profile: SecurityProfile<
+			Digest = Self::Digest,
+			AeadOid = <Self::AeadCipher as AeadAlgorithm>::Oid,
+			SignatureAlg = Self::Signature,
+			Kdf = Self::Kdf,
+			Curve = Self::Curve,
+		> + Default;
+
+	/// The profile this provider runs.
 	fn profile(&self) -> &Self::Profile;
 }
 
-/// Default profile: requires confidentiality and non-repudiation.
-/// Maps to numeric profile = 1.
+/// The profile [`DefaultCryptoProvider`] runs: SHA3-256, AES-256-GCM, ECDSA
+/// over secp256k1, HKDF-SHA3-256, and AES-256 key wrap.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TightbeamProfile;
 
 impl SecurityProfile for TightbeamProfile {
 	#[cfg(feature = "digest")]
-	type DigestOid = Sha3_256;
+	type Digest = Sha3_256;
 	#[cfg(feature = "aead")]
 	type AeadOid = Aes256GcmOid;
 	#[cfg(feature = "signature")]
 	type SignatureAlg = Secp256k1Signature;
 	#[cfg(feature = "kdf")]
-	type KdfOid = HkdfSha3_256Oid;
+	type Kdf = HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
-	type CurveOid = Secp256k1Oid;
-	#[cfg(feature = "kem")]
-	type KemOid = Kyber1024Oid;
+	type Curve = k256::Secp256k1;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
@@ -419,7 +427,6 @@ impl DigestProvider for DefaultCryptoProvider {
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl AeadProvider for DefaultCryptoProvider {
 	type AeadCipher = Aes256Gcm;
-	type AeadOid = Aes256GcmOid;
 }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
@@ -683,54 +690,53 @@ mod tests {
 		Ok(())
 	}
 
-	// =======================================================================
-	// AEAD Key Size Tests
-	// =======================================================================
-
-	#[cfg(feature = "aes-gcm")]
+	/// Each optional field carries its own tag, so an absent algorithm does not
+	/// shift the next OID into its place.
 	#[test]
-	fn test_aes128_gcm_key_size() {
-		use crate::crypto::aead::Aes128GcmOid;
+	fn a_profile_with_absent_algorithms_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::der::{Decode, Encode};
 
-		assert_eq!(<Aes128GcmOid as AeadKeySize>::KEY_SIZE, 16);
+		let desc = SecurityProfileDesc {
+			digest: None,
+			aead: Some(crate::oids::AES_256_GCM),
+			signature: None,
+			kdf: None,
+			curve: None,
+			key_wrap: Some(AES_256_WRAP),
+		};
+
+		let decoded = SecurityProfileDesc::from_der(&desc.to_der()?)?;
+		assert_eq!(decoded, desc);
+		Ok(())
 	}
 
-	#[cfg(feature = "aes-gcm")]
+	#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 	#[test]
-	fn test_aes256_gcm_key_size() {
-		use crate::crypto::aead::Aes256GcmOid;
-
-		assert_eq!(<Aes256GcmOid as AeadKeySize>::KEY_SIZE, 32);
-	}
-
-	#[cfg(all(
-		feature = "aes-gcm",
-		feature = "secp256k1",
-		feature = "sha3",
-		feature = "kdf",
-		feature = "kem"
-	))]
-	#[test]
-	fn test_profile_descriptor_aes128() {
-		// Define a test profile using AES-128-GCM
+	fn a_profile_descriptor_names_its_aead() {
 		#[derive(Debug, Default, Clone)]
 		struct Aes128Profile;
 
 		impl SecurityProfile for Aes128Profile {
-			type DigestOid = crate::crypto::hash::Sha3_256;
+			type Digest = crate::crypto::hash::Sha3_256;
 			type AeadOid = crate::crypto::aead::Aes128GcmOid;
 			type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
-			type KdfOid = crate::crypto::kdf::HkdfSha3_256Oid;
-			type CurveOid = crate::crypto::curves::Secp256k1Oid;
-			type KemOid = crate::crypto::kem::Kyber1024Oid;
+			type Kdf = crate::crypto::kdf::HkdfSha3_256;
+			type Curve = k256::Secp256k1;
 
 			const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 		}
 
-		// Verify the descriptor captures the 16-byte key size
-		let profile = Aes128Profile;
-		let desc = SecurityProfileDesc::from(&profile);
-		assert_eq!(desc.aead_key_size, Some(16));
+		let desc = SecurityProfileDesc::from(&Aes128Profile);
 		assert_eq!(desc.aead, Some(crate::crypto::aead::Aes128GcmOid::OID));
+	}
+
+	// The KDF and curve types carry the identifiers peers already negotiate,
+	// so the default descriptor keeps its wire values.
+	#[cfg(all(feature = "kdf", feature = "ecdh"))]
+	#[test]
+	fn the_default_profile_negotiates_its_kdf_and_curve_identifiers() {
+		let desc = SecurityProfileDesc::from(&TightbeamProfile);
+		assert_eq!(desc.kdf, Some(crate::oids::HASH_SHA3_256));
+		assert_eq!(desc.curve, Some(crate::oids::CURVE_SECP256K1));
 	}
 }

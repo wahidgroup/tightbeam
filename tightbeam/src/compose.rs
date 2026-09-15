@@ -1,28 +1,57 @@
 //! The [`compose!`] frame-builder macro.
 
-/// Builds a [`Frame`](crate::asn1::Frame) with a concise, named-argument syntax,
-/// expanding to a sequence of [`FrameBuilder`](crate::builder::FrameBuilder)
-/// calls followed by [`build`](crate::builder::TypeBuilder::build).
+/// Builds a [`Frame`](crate::asn1::Frame) from named arguments.
+///
+/// The macro expands to [`FrameBuilder`](crate::builder::FrameBuilder) calls
+/// followed by [`build`](crate::builder::TypeBuilder::build), and returns the
+/// [`Result`](crate::error::Result) that `build` produces.
 ///
 /// # Syntax
 ///
-/// The first token selects the [`Version`](crate::Version) variant; the
-/// remaining comma-separated `key: value` pairs configure the frame. Trailing
-/// commas are allowed and every field except the version is optional.
+/// The first token names the [`Version`](crate::Version) variant. Comma
+/// separated `key: value` pairs follow it, and a trailing comma is allowed.
+/// Each key calls one builder method:
 ///
-/// ```ignore
+/// | Key | Builder method |
+/// |---|---|
+/// | `id` | [`with_id`](crate::builder::FrameBuilder::with_id) |
+/// | `order` | [`with_order`](crate::builder::FrameBuilder::with_order) |
+/// | `message` | [`with_message`](crate::builder::FrameBuilder::with_message) |
+/// | `message_integrity<D>` | `with_message_hasher::<D>` |
+/// | `frame_integrity: type D` | `with_witness_hasher::<D>` |
+/// | `confidentiality` | `with_aead` |
+/// | `encryptor<C, _>` | `with_encryptor::<C, _>` |
+/// | `nonrepudiation<S, _>` | `with_signer::<S, _>` |
+/// | `compactness` | `with_compression` |
+/// | `priority` | `with_priority` |
+/// | `lifetime` | `with_lifetime` |
+/// | `previous_frame` | `with_previous_hash` |
+/// | `matrix` | `with_matrix` |
+///
+/// An unknown key fails to compile.
+///
+/// # Example
+///
+/// ```
+/// use tightbeam::der::Sequence;
+/// use tightbeam::{compose, Beamable};
+///
+/// #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+/// struct Ping {
+///     count: u32,
+/// }
+///
 /// let frame = compose! {
 ///     V0:
-///         id: message_id,
-///         order: sequence,
-///         message: payload,
+///         id: "ping-1",
+///         order: 1_696_521_600,
+///         message: Ping { count: 1 },
 /// }?;
+///
+/// assert_eq!(frame.metadata().id(), b"ping-1");
+/// assert_eq!(frame.metadata().order(), 1_696_521_600);
+/// # Ok::<(), tightbeam::TightBeamError>(())
 /// ```
-///
-/// # Returns
-///
-/// The [`Result`](crate::error::Result) produced by `build`; propagate it with
-/// `?` or match on it.
 #[macro_export(local_inner_macros)]
 macro_rules! compose {
 	(@call $builder:ident; $key:ident : type $ty:ty) => {
@@ -70,7 +99,6 @@ macro_rules! __compose_call {
 	($builder:ident; message_integrity < $($g:ty),+ > : $value:expr) => { $builder = $builder.with_message_hasher::<$($g),+>($value); };
 	($builder:ident; message_integrity : $value:expr) => { $builder = $builder.with_message_hasher($value); };
 	($builder:ident; frame_integrity : type $ty:ty) => { $builder = $builder.with_witness_hasher::<$ty>(); };
-	($builder:ident; confidentiality < $($g:ty),+ > : $value:expr) => { $builder = $builder.with_aead::<$($g),+>($value); };
 	($builder:ident; confidentiality : $value:expr) => { $builder = $builder.with_aead($value); };
 	($builder:ident; encryptor < $($g:ty),+ > : $value:expr) => { $builder = $builder.with_encryptor::<$($g),+>($value); };
 	($builder:ident; encryptor : $value:expr) => { $builder = $builder.with_encryptor($value); };

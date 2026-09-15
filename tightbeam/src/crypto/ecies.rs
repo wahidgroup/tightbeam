@@ -486,19 +486,29 @@ crate::define_oid_wrapper!(
 // Encryptor/Decryptor Trait Implementations
 // ============================================================================
 
-/// ECIES encryptor - encrypts messages to a recipient's public key.
+/// Encrypts messages to a recipient's secp256k1 public key with ECIES.
 ///
-/// This type implements the `Encryptor` trait, allowing it to be used
-/// with `FrameBuilder::with_encryptor()` for asymmetric message encryption.
+/// It implements [`Encryptor`](crate::crypto::aead::Encryptor), so
+/// [`FrameBuilder::with_encryptor`](crate::builder::FrameBuilder::with_encryptor)
+/// accepts it for asymmetric message encryption.
 ///
 /// # Example
-/// ```ignore
-/// let encryptor = EciesEncryptor::new(recipient_pubkey);
-/// let frame = compose! {
-///     V2: id: b"msg-001",
-///         message: payload,
-///         encryptor<EciesSecp256k1Oid, _>: encryptor
-/// }?;
+///
+/// ```
+/// use tightbeam::crypto::aead::{DecryptContent, Encryptor};
+/// use tightbeam::crypto::ecies::{EciesDecryptor, EciesEncryptor};
+/// use tightbeam::crypto::k256::SecretKey;
+/// use tightbeam::crypto::secret::ToInsecure;
+/// use tightbeam::random::OsRng;
+///
+/// let recipient = SecretKey::random(&mut OsRng);
+/// let encryptor = EciesEncryptor::new(recipient.public_key());
+/// let info = encryptor.encrypt_content(b"hello", [], None)?;
+///
+/// let decryptor = EciesDecryptor::new(recipient);
+/// let plaintext = decryptor.decrypt_content(&info)?.to_insecure()?;
+/// assert_eq!(&plaintext[..], b"hello");
+/// # Ok::<(), tightbeam::TightBeamError>(())
 /// ```
 #[cfg(feature = "x509")]
 pub struct EciesEncryptor {
@@ -547,16 +557,12 @@ impl crate::crypto::aead::Encryptor<EciesSecp256k1Oid> for EciesEncryptor {
 	}
 }
 
-/// ECIES decryptor - decrypts messages with recipient's secret key.
+/// Decrypts ECIES messages with the recipient's secp256k1 secret key.
 ///
-/// This type implements the `Decryptor` trait for decrypting ECIES-encrypted
-/// messages.
+/// It implements [`Decryptor`](crate::crypto::aead::Decryptor), so a frame
+/// decrypts with it through [`Frame::decrypt`](crate::Frame::decrypt).
 ///
-/// # Example
-/// ```ignore
-/// let decryptor = EciesDecryptor::new(my_secret_key);
-/// let plaintext = frame.decrypt(&decryptor)?;
-/// ```
+/// See [`EciesEncryptor`] for a round trip.
 #[cfg(feature = "x509")]
 pub struct EciesDecryptor {
 	secret_key: SecretKey,
@@ -572,9 +578,14 @@ impl EciesDecryptor {
 
 #[cfg(feature = "x509")]
 impl crate::crypto::aead::Decryptor for EciesDecryptor {
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>> {
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		EciesSecp256k1Oid::OID
+	}
+
+	fn open(&self, content: crate::crypto::aead::CheckedContent<'_>) -> crate::error::Result<SecretSlice<u8>> {
 		// Extract the encrypted bytes
-		let encrypted_bytes = info
+		let encrypted_bytes = content
+			.info()
 			.encrypted_content
 			.as_ref()
 			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
@@ -591,55 +602,38 @@ impl crate::crypto::aead::Decryptor for EciesDecryptor {
 ///
 /// Pairs with [`ephemeral_pubkey_bytes`] and an async key-agreement backend
 /// (`SigningKeyProvider::key_agreement`) so the recipient private key can stay
-/// inside an HSM/KMS/secure enclave.
-#[cfg(all(
-	feature = "digest",
-	feature = "aead",
-	feature = "signature",
-	feature = "kdf",
-	feature = "ecdh"
-))]
-pub struct EciesSharedSecretDecryptor<P> {
+/// inside an HSM/KMS/secure enclave. It opens the secp256k1, HKDF-SHA3-256,
+/// and AES-256-GCM suite that [`EciesSecp256k1Oid`] names.
+#[cfg(feature = "x509")]
+pub struct EciesSharedSecretDecryptor {
 	shared_secret: SecretSlice<u8>,
-	_provider: core::marker::PhantomData<P>,
 }
 
-#[cfg(all(
-	feature = "digest",
-	feature = "aead",
-	feature = "signature",
-	feature = "kdf",
-	feature = "ecdh"
-))]
-impl<P> EciesSharedSecretDecryptor<P> {
+#[cfg(feature = "x509")]
+impl EciesSharedSecretDecryptor {
 	/// Build a decryptor from a precomputed ECDH shared secret.
 	pub fn new(shared_secret: impl Into<SecretSlice<u8>>) -> Self {
-		Self { shared_secret: shared_secret.into(), _provider: core::marker::PhantomData }
+		Self { shared_secret: shared_secret.into() }
 	}
 }
 
-#[cfg(all(
-	feature = "digest",
-	feature = "aead",
-	feature = "signature",
-	feature = "kdf",
-	feature = "ecdh"
-))]
-impl<P> crate::crypto::aead::Decryptor for EciesSharedSecretDecryptor<P>
-where
-	P: crate::crypto::profiles::CryptoProvider,
-	P::AeadCipher: KeyInit,
-{
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>> {
-		let encrypted_bytes = info
+#[cfg(feature = "x509")]
+impl crate::crypto::aead::Decryptor for EciesSharedSecretDecryptor {
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		EciesSecp256k1Oid::OID
+	}
+
+	fn open(&self, content: crate::crypto::aead::CheckedContent<'_>) -> crate::error::Result<SecretSlice<u8>> {
+		let encrypted_bytes = content
+			.info()
 			.encrypted_content
 			.as_ref()
 			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
 			.as_bytes();
 
-		let ecies_msg = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_bytes)?;
+		let ecies_msg = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
 		let shared_secret = self.shared_secret.with(|bytes| SecretSlice::from(bytes.to_vec()))?;
-		Ok(decrypt_with_shared_secret::<P::EciesMessage, P::Kdf, P::AeadCipher>(
+		Ok(decrypt_with_shared_secret::<Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
 			&ecies_msg,
 			shared_secret,
 			None,
@@ -671,6 +665,7 @@ mod tests {
 			aad,
 			None::<&mut OsRng>,
 		)?;
+
 		let decrypted = decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&secret, &encrypted, aad)?;
 		assert_eq!(plaintext, &decrypted.to_insecure().map_err(EciesError::from)?[..]);
 		Ok(())
@@ -752,10 +747,8 @@ mod tests {
 
 		let secret2 = SecretKey::try_from(secret_bytes)?;
 		let public2 = PublicKey::from_bytes(&public_bytes)?;
-
 		assert_eq!(public.to_bytes(), public2.to_bytes());
 		assert_eq!(secret.public_key().to_bytes(), secret2.public_key().to_bytes());
-
 		Ok(())
 	}
 
@@ -842,9 +835,8 @@ mod tests {
 	#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh", feature = "tokio"))]
 	#[tokio::test]
 	async fn shared_secret_decryptor_via_provider() -> crate::error::Result<()> {
-		use crate::crypto::aead::{Decryptor, Encryptor};
+		use crate::crypto::aead::{DecryptContent, Encryptor};
 		use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
-		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 
 		let plaintext = b"hsm-backed ecies decryption";
@@ -860,9 +852,8 @@ mod tests {
 		let shared = provider.key_agreement(epk).await?;
 
 		// Open via the standard Decryptor (what Frame::decrypt_bytes calls).
-		let decryptor = EciesSharedSecretDecryptor::<DefaultCryptoProvider>::new(shared);
+		let decryptor = EciesSharedSecretDecryptor::new(shared);
 		let opened = decryptor.decrypt_content(&info)?.to_insecure()?;
-
 		assert_eq!(
 			&opened[..],
 			plaintext,

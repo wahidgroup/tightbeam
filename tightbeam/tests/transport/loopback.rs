@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tightbeam::{
 	crypto::{
-		aead::{Decryptor, SessionKeys},
+		aead::{DecryptContent, SessionKeys},
 		profiles::{DefaultCryptoProvider, SecurityProfileDesc},
 		secret::ToInsecure,
 	},

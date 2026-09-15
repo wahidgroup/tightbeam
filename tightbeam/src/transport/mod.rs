@@ -188,7 +188,7 @@ impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for crate::transport:
 		Self {
 			server_certificate: Some(config.certificate),
 			client_validators: config.client_validators,
-			aad_domain_tag: Some(config.aad_domain_tag),
+			aad_domain_tag: config.aad_domain_tag,
 			key_manager: Some(config.key_manager),
 			..Self::default()
 		}
@@ -238,10 +238,12 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		self
 	}
 
-	/// Replace the domain-separation tag bound into every AEAD block.
+	/// Replace the domain-separation tag of the ECIES key exchange.
 	///
-	/// Both endpoints derive their associated data from this tag, so a session
-	/// only completes when the two agree on it.
+	/// The ECIES handshake binds this tag into the associated data of the
+	/// encrypted key exchange, so an ECIES session completes only when both
+	/// endpoints hold the same tag. The CMS handshake and session records do
+	/// not read it.
 	#[must_use]
 	pub fn with_aad_domain_tag(mut self, tag: &'static [u8]) -> Self {
 		self.aad_domain_tag = tag;
@@ -348,8 +350,7 @@ mod tests {
 	#[cfg(feature = "aes-gcm")]
 	#[test]
 	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {
-		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit, RuntimeAead, SendCipher};
-		use crate::der::oid::AssociatedOid;
+		use crate::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};
 		use crate::der::Encode;
 
 		let frame = TestFrame::v0(None, None);
@@ -357,13 +358,12 @@ mod tests {
 		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32])
 			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))?;
 
-		let encryptor = SendCipher::new(RuntimeAead::new(cipher, Aes256GcmOid::OID));
+		let encryptor = SendCipher::new(RuntimeAead::new(cipher));
 		let result = builders::EnvelopeBuilder::request(frame)
 			.with_wire_mode(WireMode::Encrypted)
 			.with_encryptor(&encryptor)
 			.with_limits(TransportLimits { encrypted_envelope: plaintext_len, ..TransportLimits::default() })
 			.finish();
-
 		assert!(matches!(
 			result,
 			Err(TransportError::MessageNotSent(_, TransportFailure::SizeExceeded))
@@ -375,20 +375,18 @@ mod tests {
 	#[cfg(feature = "aes-gcm")]
 	#[test]
 	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn Error>> {
-		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit, RuntimeAead, SendCipher};
-		use crate::der::oid::AssociatedOid;
+		use crate::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};
 
 		let frame = TestFrame::v0(None, None);
 		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32])
 			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))?;
 
-		let encryptor = SendCipher::new(RuntimeAead::new(cipher, Aes256GcmOid::OID));
+		let encryptor = SendCipher::new(RuntimeAead::new(cipher));
 		let result = builders::EnvelopeBuilder::request(frame.clone())
 			.with_wire_mode(WireMode::Encrypted)
 			.with_encryptor(&encryptor)
 			.with_limits(TransportLimits { encrypted_envelope: 1, ..TransportLimits::default() })
 			.finish();
-
 		assert!(matches!(
 			result,
 			Err(TransportError::MessageNotSent(ref returned, TransportFailure::SizeExceeded)) if **returned == frame
@@ -403,7 +401,6 @@ mod tests {
 		let result = builders::EnvelopeBuilder::request(frame.clone())
 			.with_limits(TransportLimits { cleartext_envelope: 1, ..TransportLimits::default() })
 			.finish();
-
 		assert!(matches!(
 			result,
 			Err(TransportError::MessageNotSent(ref returned, TransportFailure::SizeExceeded)) if **returned == frame

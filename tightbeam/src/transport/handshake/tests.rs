@@ -33,7 +33,7 @@ use crate::oids::{
 };
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
-use crate::transport::handshake::negotiation::SecurityAccept;
+use crate::transport::handshake::negotiation::{RunnableProfile, SecurityAccept};
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake};
 use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Time;
@@ -64,16 +64,7 @@ use cms::*;
 
 /// Create a default test security profile for handshake tests.
 pub fn create_default_test_profile() -> SecurityProfileDesc {
-	SecurityProfileDesc {
-		digest: Some(HASH_SHA3_256),
-		aead: Some(AES_256_GCM),
-		aead_key_size: Some(32), // AES-256 uses 32-byte keys
-		signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-		kdf: Some(HASH_SHA3_256), // Use SHA3-256 OID for HKDF-SHA3-256
-		curve: Some(CURVE_SECP256K1),
-		key_wrap: None,
-		kem: None,
-	}
+	RunnableProfile::<DefaultCryptoProvider>::native().descriptor()
 }
 
 /// Test certificate data structure for consistent certificate creation across tests.

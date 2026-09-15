@@ -165,18 +165,20 @@ fn get_error_message(attrs: impl AsRef<[Attribute]>) -> Option<String> {
 ///   `message_integrity`, `frame_integrity` - set the corresponding
 ///   `MUST_*` constant to `true`
 /// - `min_version = "V1"` - minimum protocol version for the type
-/// - `profile(MyProfile)` - pin the type to a `SecurityProfile`; the digest,
-///   AEAD, and signature OIDs used by the builder are then enforced at
-///   compile time
-/// - `profile = N` - numeric shorthand for a predefined security level:
+/// - `profile(MyProfile)` - pin the type to a `SecurityProfile`. The builder
+///   refuses a digest, AEAD, or signature algorithm that the profile does not
+///   name. A mismatched algorithm type also fails to compile at the builder call.
+/// - `profile = N` - numeric shorthand for a set of requirement flags:
 ///
 ///   | N | Profile  | Effect                                          |
 ///   |---|----------|-------------------------------------------------|
 ///   | 1 | FIPS     | confidential + non-repudiable, `MIN_VERSION` V1 |
 ///   | 2 | Standard | confidential + non-repudiable, `MIN_VERSION` V1 |
 ///
-///   Any other number is rejected at compile time. `profile = N` and
-///   `profile(Type)` are mutually exclusive.
+///   A numeric profile constrains no algorithm, so a `profile = 1` message
+///   accepts any digest, AEAD, or signature algorithm. Use `profile(Type)` to
+///   constrain algorithms. Any other number is rejected at compile time.
+///   `profile = N` and `profile(Type)` are mutually exclusive.
 #[proc_macro_derive(Beamable, attributes(beam))]
 pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -285,100 +287,56 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 		}
 	};
 
-	// Generate checker trait implementations for compile-time OID validation
-	// When HAS_PROFILE = true: generates impls ONLY for the matching OID type from the profile
-	// When HAS_PROFILE = false: generates generic impls for all OID types (no enforcement, allows any)
-	// All types using #[derive(Beamable)] get these impls - types not using derive must implement manually
+	// The checker impls turn an algorithm that a `profile(Type)` message does
+	// not name into a compile error at the builder call. They are hints, not
+	// the enforcement: `FrameBuilder` compares each OID with the profile at
+	// run time, because a hand-written `Message` impl can admit any algorithm.
 	let oid_validation_helpers = if let Some(profile_ty) = &profile_type {
-		// We know the profile type, so we can reference its associated types directly
-		// ONLY implement for the exact OID types from the profile - wrong OIDs will fail to compile
+		// A profile message admits only the algorithms its profile names.
 		quote! {
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_digest! {
-				impl ::tightbeam::builder::private::SealedDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
+				impl ::tightbeam::builder::CheckDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::Digest> for #name
 				where
 					#name: ::tightbeam::Message,
 				{}
-
-				impl ::tightbeam::builder::CheckDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
-				where
-					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
 			} }
 
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_aead! {
-				impl ::tightbeam::builder::private::SealedAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl ::tightbeam::builder::CheckAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_signature! {
-				impl ::tightbeam::builder::private::SealedSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl ::tightbeam::builder::CheckSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 		}
 	} else {
-		// When HAS_PROFILE = false, generate generic impls for all OID types (no enforcement)
-		// These allow FrameBuilder methods to work for types without profiles
+		// A message without a profile admits every algorithm.
 		quote! {
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_digest! {
-				impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedDigestOid<D> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckDigestOid<D> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_aead! {
-				impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedAeadOid<C> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckAeadOid<C> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_signature! {
-				impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::private::SealedSignatureOid<S> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::CheckSignatureOid<S> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 		}
 	};

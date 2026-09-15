@@ -3,7 +3,7 @@ use alloc::vec;
 
 use crate::asn1::OctetString;
 use crate::core::{Inflator, Message};
-use crate::crypto::aead::Decryptor;
+use crate::crypto::aead::{CheckedContent, DecryptContent, Decryptor};
 use crate::crypto::key::EncryptingKeyProvider;
 use crate::crypto::secret::{SecretSlice, ToInsecure};
 use crate::der::Any;
@@ -198,17 +198,22 @@ impl Frame {
 	/// # Errors
 	///
 	/// - [`TightBeamError::MissingEncryptionInfo`] when the frame is not encrypted or names no nonce.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when the frame names an algorithm
+	///   other than the provider's.
 	/// - Decryption errors from the provider.
 	pub async fn decrypt_with_provider<P>(&mut self, provider: &P) -> Result<()>
 	where
 		P: EncryptingKeyProvider,
 	{
-		let encrypted_content_info = self
+		let confidentiality = self
 			.metadata
 			.confidentiality
 			.as_ref()
 			.ok_or(TightBeamError::MissingEncryptionInfo)?;
-		let nonce_any = encrypted_content_info
+
+		let content = CheckedContent::check(confidentiality, provider.algorithm().oid)?;
+		let nonce_any = content
+			.info()
 			.content_enc_alg
 			.parameters
 			.as_ref()
@@ -238,7 +243,6 @@ impl TryFrom<Frame> for EncryptedContentInfo {
 
 #[cfg(test)]
 mod tests {
-	use crate::crypto::aead::Aes256GcmOid;
 	use crate::error::Result;
 	use crate::testing::{TestKey, TestMessage};
 	use crate::{Frame, TightBeamError};
@@ -258,7 +262,7 @@ mod tests {
 				V1: id: "dip-001",
 					order: 1u64,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: cipher
+					confidentiality: cipher
 			}
 		}
 
@@ -385,6 +389,30 @@ mod tests {
 
 			let result = frame.encrypt_with_provider(&provider()?, 12).await;
 			assert!(matches!(result, Err(TightBeamError::UnsupportedVersion(_))));
+			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		// A frame that names another algorithm is refused before the provider
+		// decrypts it.
+		#[tokio::test]
+		async fn a_provider_refuses_a_frame_that_names_another_algorithm() -> Result<()> {
+			let message = TestMessage::sample(None);
+			let mut frame = compose! { V1: id: "test-relabel", order: 1u64, message: message }?;
+			let provider = provider()?;
+
+			frame.encrypt_with_provider(&provider, 12).await?;
+
+			let info = frame
+				.metadata
+				.confidentiality
+				.as_mut()
+				.ok_or(TightBeamError::MissingEncryptionInfo)?;
+			info.content_enc_alg.oid = crate::oids::AES_128_GCM;
+
+			let original = frame.clone();
+			let result = frame.decrypt_with_provider(&provider).await;
+			assert!(matches!(result, Err(TightBeamError::UnexpectedAlgorithm(_))));
 			assert_eq!(frame, original);
 			Ok(())
 		}

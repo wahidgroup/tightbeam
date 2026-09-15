@@ -250,16 +250,10 @@ pub enum HandshakeError {
 	UnsupportedOriginatorIdentifier,
 	#[error("KARI builder already consumed")]
 	KariBuilderConsumed,
-	#[error("Content encryption algorithm not set")]
-	MissingContentEncryptionAlgorithm,
 	#[error("Key wrap algorithm not configured in security profile")]
 	MissingKeyWrapAlgorithm,
 	#[error("Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)")]
 	UnsupportedKeyWrapAlgorithm,
-	#[error("Negotiated AEAD algorithm unsupported (expected AES-128/256 GCM)")]
-	UnsupportedAeadAlgorithm,
-	#[error("Peer aead_key_size {declared} does not match negotiated AEAD key size {expected}")]
-	AeadKeySizeMismatch { declared: usize, expected: usize },
 	#[cfg(all(feature = "builder", feature = "aead"))]
 	#[error("AES key wrap operation failed: {0}")]
 	#[from]

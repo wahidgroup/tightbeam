@@ -57,6 +57,10 @@ where
 /// Counterpart of [`sign_canonical`]: every tightbeam verifier must route
 /// through this function so producers and verifiers cannot diverge on the
 /// bytes-to-sign formula.
+///
+/// `verifier` MUST refuse a high-s ECDSA signature, so one signature has one
+/// valid encoding. The `k256` verifier refuses it. A custom verifier, such as
+/// an HSM binding, carries the same obligation.
 pub fn verify_canonical<D, S>(
 	verifier: &impl PrehashVerifier<S>,
 	content: impl AsRef<[u8]>,
@@ -365,6 +369,23 @@ mod tests {
 		let prehash = hasher.finalize();
 		let signature = Signature::from_slice(signer_info.signature.as_bytes())?;
 		signing_key.verifying_key().verify_prehash(&prehash, &signature)?;
+
+		Ok(())
+	}
+
+	// ECDSA accepts both (r, s) and (r, n - s) unless the verifier refuses the
+	// high form. One signature must have one valid encoding, so a relay cannot
+	// rewrite a signed frame into a second valid frame.
+	#[test]
+	fn a_high_s_signature_is_refused() -> crate::error::Result<()> {
+		let signing_key = SigningKey::random(&mut OsRng);
+		let low: Signature = sign_canonical::<Sha3_256, _>(&signing_key, CONTENT)?;
+		let (r, s) = low.split_scalars();
+		let high = Signature::from_scalars(r, -s)?;
+		assert!(low.normalize_s().is_none());
+		assert!(high.normalize_s().is_some());
+		assert!(verify_canonical::<Sha3_256, _>(signing_key.verifying_key(), CONTENT, &low).is_ok());
+		assert!(verify_canonical::<Sha3_256, _>(signing_key.verifying_key(), CONTENT, &high).is_err());
 
 		Ok(())
 	}

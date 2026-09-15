@@ -121,6 +121,14 @@ pub trait X509ClientConfig: Sized {
 	/// Approver consulted before countersigning a challenge-bearing receipt.
 	fn with_receipt_approver(self, approver: Arc<dyn ReceiptApprover>) -> Self;
 
+	/// Replace the domain-separation tag of the ECIES key exchange.
+	///
+	/// The ECIES handshake binds this tag into the associated data of the
+	/// encrypted key exchange, so an ECIES session completes only when both
+	/// endpoints hold the same tag. The CMS handshake and session records do
+	/// not read it.
+	fn with_aad_domain_tag(self, tag: &'static [u8]) -> Self;
+
 	/// Install the provisioning this endpoint was configured with.
 	///
 	/// The configuration moves in one piece, so a builder that accumulates it

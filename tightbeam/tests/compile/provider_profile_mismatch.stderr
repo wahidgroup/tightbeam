@@ -1,0 +1,19 @@
+error[E0271]: type mismatch resolving `<Aes128Profile as SecurityProfile>::AeadOid == Aes256GcmOid`
+  --> tests/compile/provider_profile_mismatch.rs:54:17
+   |
+54 |     type Profile = Aes128Profile;
+   |                    ^^^^^^^^^^^^^ type mismatch resolving `<Aes128Profile as SecurityProfile>::AeadOid == Aes256GcmOid`
+   |
+note: expected this to be `Aes256GcmOid`
+  --> tests/compile/provider_profile_mismatch.rs:17:17
+   |
+17 |     type AeadOid = Aes128GcmOid;
+   |                    ^^^^^^^^^^^^
+note: required by a bound in `tightbeam::crypto::profiles::CryptoProvider::Profile`
+  --> src/crypto/profiles.rs
+   |
+   |     type Profile: SecurityProfile<
+   |          ------- required by a bound in this associated type
+   |             Digest = Self::Digest,
+   |             AeadOid = <Self::AeadCipher as AeadAlgorithm>::Oid,
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `CryptoProvider::Profile`

@@ -35,7 +35,8 @@ use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, Tight
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
-	client_mux_settings, MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
+	client_mux_settings, MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer,
+	StrengthFloor, TransportAccept, TransportOffer,
 };
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::ReceiptArtifact;
@@ -121,9 +122,10 @@ where
 	transcript_buffer: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
 	security_offer: Option<SecurityOffer>,
+	strength_floor: StrengthFloor,
 	transport_offer: Option<TransportOffer>,
 	mux_settings: Option<MuxSettings>,
-	selected_profile: Option<SecurityProfileDesc>,
+	selected_profile: Option<RunnableProfile<P>>,
 	provider: P,
 	trust_store: Option<Arc<dyn CertificateTrust>>,
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
@@ -191,6 +193,7 @@ where
 			transcript_buffer: Vec::new(),
 			session_key: None,
 			security_offer: None,
+			strength_floor: StrengthFloor::default(),
 			transport_offer: None,
 			mux_settings: None,
 			selected_profile: None,
@@ -256,6 +259,18 @@ where
 		self
 	}
 
+	/// Override the minimum-strength policy applied to the server's selection.
+	///
+	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit
+	/// digest).
+	/// The client applies it with or without an offer. Pass `NoStrengthFloor`
+	/// only where weaker profiles must remain acceptable.
+	#[must_use]
+	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
+		self.strength_floor = StrengthFloor::with_policy(policy);
+		self
+	}
+
 	/// Configures the transport capability offer (multiplexing).
 	///
 	/// When configured, the offer travels as an unprotected attribute in the
@@ -281,7 +296,7 @@ where
 	///
 	/// Returns `None` if no negotiation occurred or not yet determined.
 	pub fn selected_profile(&self) -> Option<SecurityProfileDesc> {
-		self.selected_profile
+		self.selected_profile.map(|profile| profile.descriptor())
 	}
 
 	/// Validate that the current state matches the expected state.
@@ -517,7 +532,7 @@ where
 	///
 	/// # Validation
 	/// - Offer sent: accepted profile must be a member of the offer
-	/// - No offer (dealer's choice): any accepted profile is stored
+	/// - Offer or not: accepted profile must meet the strength floor
 	/// - No attribute present: selection stays `None` (trait-level `complete()`
 	///   then fails closed, which holds an unknown profile out of the session)
 	fn apply_security_accept(&mut self, accept: Option<SecurityAccept>) -> Result<(), HandshakeError> {
@@ -527,11 +542,15 @@ where
 					return Err(HandshakeError::InvalidProfileSelection);
 				}
 
-				self.selected_profile = Some(accept.profile);
+				let profile = RunnableProfile::<P>::try_from(accept.profile)?;
+				self.strength_floor.admit(&profile)?;
+				self.selected_profile = Some(profile);
 			}
 			(Some(accept), None) => {
-				// Dealer's choice: accept the server's selection
-				self.selected_profile = Some(accept.profile);
+				// Dealer's choice: the server chooses, bounded by the floor
+				let profile = RunnableProfile::<P>::try_from(accept.profile)?;
+				self.strength_floor.admit(&profile)?;
+				self.selected_profile = Some(profile);
 			}
 			(None, Some(_)) => {
 				// We offered profiles but the server did not answer
@@ -710,10 +729,8 @@ where
 			return Err(HandshakeError::InvalidState);
 		}
 
-		// 2. Get CEK (session_key) and profile
+		// 2. Get the CEK (session_key)
 		let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
-		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 		let transcript = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 		// 3. Derive directional session keys as P::AeadCipher
@@ -727,7 +744,7 @@ where
 		// 5. Transition to complete
 		self.state.transition(ClientHandshakeState::Completed)?;
 
-		// 6. Role-map the directional ciphers with the negotiated OID. The
+		// 6. Role-map the directional ciphers. The
 		//    orchestrator is spent, so the receipt moves out rather than
 		//    copies. Both identity forms already hold a shared handle to the
 		//    leaf, so the session takes a handle rather than a copy.
@@ -738,7 +755,7 @@ where
 			(None, None) => None,
 		};
 
-		let keys = SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
+		let keys = SessionKeys::for_client(ciphers);
 		let mux = self.mux_settings;
 		let receipt = self.stored_receipt.take().map(Arc::new);
 		let epoch = Some(materials);
@@ -1024,7 +1041,7 @@ impl<P> HandshakeFinalization<P> for CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
 {
-	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<RunnableProfile<P>> {
 		self.selected_profile
 	}
 }
@@ -1091,7 +1108,7 @@ where
 	}
 
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
-		self.selected_profile
+		self.selected_profile.map(|profile| profile.descriptor())
 	}
 }
 
@@ -1104,7 +1121,7 @@ mod tests {
 	use super::{extract_security_accept_attr, CmsHandshakeClient, SignedData};
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::policy::Secp256k1Policy;
-	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::sign::elliptic_curve::SecretKey;
@@ -1289,8 +1306,7 @@ mod tests {
 	#[test]
 	fn test_process_security_accept_rejects_unoffered_profile() -> Result<(), Box<dyn Error>> {
 		let offered = create_default_test_profile();
-		let mut unoffered = create_default_test_profile();
-		unoffered.aead_key_size = Some(16);
+		let unoffered = SecurityProfileDesc { digest: Some(crate::oids::HASH_SHA3_512), ..offered };
 
 		let build_finished_with_accept = |profile| -> Result<Vec<u8>, Box<dyn Error>> {
 			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
@@ -1320,12 +1336,56 @@ mod tests {
 
 		let accepted = SignedData::from_der(&build_finished_with_accept(offered)?)?;
 		client.apply_security_accept(extract_security_accept_attr(&accepted)?.map(|attr| attr.value))?;
-		assert_eq!(client.selected_profile, Some(offered));
+		assert_eq!(client.selected_profile(), Some(offered));
 
 		let rejected = SignedData::from_der(&build_finished_with_accept(unoffered)?)?;
 		let attrs = extract_security_accept_attr(&rejected)?;
 		let result = client.apply_security_accept(attrs.map(|attr| attr.value));
 		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
+
+		Ok(())
+	}
+
+	// Without an offer the server chooses, and the client floor still bounds
+	// that choice, so a 128-bit AEAD selection never reaches the session.
+	#[test]
+	fn a_dealers_choice_client_refuses_a_profile_below_its_floor() -> Result<(), Box<dyn Error>> {
+		use crate::transport::handshake::negotiation::{NegotiationError, ProfileStrength, ProfileStrengthPolicy};
+
+		struct RefuseAll;
+
+		impl ProfileStrengthPolicy for RefuseAll {
+			fn meets_floor(&self, _strength: &ProfileStrength) -> bool {
+				false
+			}
+		}
+
+		let mut client = TestCmsClientBuilder::new().build()?.with_strength_policy(Arc::new(RefuseAll));
+		let result = client.apply_security_accept(Some(SecurityAccept::new(create_default_test_profile())));
+		assert!(matches!(
+			result,
+			Err(HandshakeError::NegotiationError(NegotiationError::BelowStrengthFloor))
+		));
+		assert_eq!(client.selected_profile(), None);
+
+		Ok(())
+	}
+
+	// A signed accept that names an algorithm the provider does not run is
+	// refused, so the session never runs under a false identity.
+	#[test]
+	fn a_dealers_choice_client_refuses_a_profile_it_does_not_run() -> Result<(), Box<dyn Error>> {
+		use crate::transport::handshake::negotiation::NegotiationError;
+
+		let foreign = SecurityProfileDesc { aead: Some(crate::oids::AES_128_GCM), ..create_default_test_profile() };
+
+		let mut client = TestCmsClientBuilder::new().build()?;
+		let result = client.apply_security_accept(Some(SecurityAccept::new(foreign)));
+		assert!(matches!(
+			result,
+			Err(HandshakeError::NegotiationError(NegotiationError::UnrunnableProfile))
+		));
+		assert_eq!(client.selected_profile(), None);
 
 		Ok(())
 	}

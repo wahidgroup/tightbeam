@@ -9,6 +9,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
@@ -423,8 +424,9 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// Signing key manager backing this endpoint's identity and
 	/// countersignatures.
 	pub(crate) key_manager: Option<Arc<HandshakeKeyManager<P>>>,
-	/// Domain separation tag mixed into AEAD associated data.
-	pub(crate) aad_domain_tag: Option<&'static [u8]>,
+	/// Domain-separation tag of the ECIES key exchange. Both ECIES endpoints
+	/// MUST hold the same tag for a session to complete.
+	pub(crate) aad_domain_tag: &'static [u8],
 	/// Local multiplexing capability advertised in the handshake.
 	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
 	/// Budget-grant policy between the client's offer and the server's accept.
@@ -587,7 +589,7 @@ impl<P: CryptoProvider> Default for EncryptionConfig<P> {
 			client_identity: None,
 			client_validators: None,
 			key_manager: None,
-			aad_domain_tag: None,
+			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			mux_offer: None,
 			transport_authorizer: None,
 			receipt_approver: None,
@@ -932,14 +934,12 @@ mod tests {
 	/// A completed session carrying a peer identity, which authorization reads.
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	fn established_session() -> EstablishedSession {
-		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
-		use crate::der::oid::AssociatedOid;
+		use crate::crypto::aead::{Aes256Gcm, DirectionalCiphers, KeyInit};
 
-		let keys = SessionKeys::for_client(
-			Aes256Gcm::new(&[0u8; 32].into()),
-			Aes256Gcm::new(&[1u8; 32].into()),
-			Aes256GcmOid::OID,
-		);
+		let keys = SessionKeys::for_client(DirectionalCiphers {
+			client_to_server: Aes256Gcm::new(&[0u8; 32].into()),
+			server_to_client: Aes256Gcm::new(&[1u8; 32].into()),
+		});
 
 		EstablishedSession::new(keys, None, None, Some(Arc::new(fixture_certificate())), None)
 	}

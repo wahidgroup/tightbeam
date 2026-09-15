@@ -15,10 +15,9 @@
 use std::sync::Arc;
 
 use tightbeam::crypto::aead::{Aes128GcmOid, Aes256Gcm, Aes256GcmOid};
-use tightbeam::crypto::curves::Secp256k1Oid;
 use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 use tightbeam::crypto::hash::{Sha3_256, Sha3_512};
-use tightbeam::crypto::kdf::{HkdfSha3_256, HkdfSha3_256Oid};
+use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use tightbeam::crypto::profiles::{
 	AeadProvider, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, SecurityProfile, SecurityProfileDesc,
@@ -60,13 +59,11 @@ pub(crate) const SERVER_KEX_RECEIVED: Urn<'static> = tightbeam::urn!("test", "ev
 struct Aes256Sha3_512Profile;
 
 impl SecurityProfile for Aes256Sha3_512Profile {
-	type DigestOid = Sha3_512;
+	type Digest = Sha3_512;
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
-	type KdfOid = HkdfSha3_256Oid;
-	type CurveOid = Secp256k1Oid;
-	#[cfg(feature = "kem")]
-	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
+	type Kdf = HkdfSha3_256;
+	type Curve = k256::Secp256k1;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
 
@@ -81,7 +78,6 @@ impl DigestProvider for Aes256Sha3_512Provider {
 
 impl AeadProvider for Aes256Sha3_512Provider {
 	type AeadCipher = Aes256Gcm;
-	type AeadOid = Aes256GcmOid;
 }
 
 impl SigningProvider for Aes256Sha3_512Provider {
@@ -113,13 +109,11 @@ impl CryptoProvider for Aes256Sha3_512Provider {
 struct Aes128Sha3_256Profile;
 
 impl SecurityProfile for Aes128Sha3_256Profile {
-	type DigestOid = Sha3_256;
+	type Digest = Sha3_256;
 	type AeadOid = Aes128GcmOid;
 	type SignatureAlg = Secp256k1Signature;
-	type KdfOid = HkdfSha3_256Oid;
-	type CurveOid = Secp256k1Oid;
-	#[cfg(feature = "kem")]
-	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
+	type Kdf = HkdfSha3_256;
+	type Curve = k256::Secp256k1;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_128_WRAP);
 }
 
@@ -199,8 +193,8 @@ tb_scenario! {
 			let _server_cipher = server.complete()?;
 			trace.event(HANDSHAKE_COMPLETE)?;
 
-			let server_selected = server.selected_profile() == Some(preferred);
-			let client_selected = client.selected_profile() == Some(preferred);
+			let server_selected = server.selected_profile().map(|profile| profile.descriptor()) == Some(preferred);
+			let client_selected = client.selected_profile().map(|profile| profile.descriptor()) == Some(preferred);
 			trace.event_with(PROFILE_VERIFIED, &[], server_selected && client_selected)?;
 
 			Ok(())

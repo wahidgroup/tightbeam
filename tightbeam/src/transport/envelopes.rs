@@ -16,9 +16,14 @@ use crate::asn1::Frame;
 use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::der::{Choice, Decode, Encode, EncodeValue, Length, Reader, Result as DerResult, Tag, Tagged, Writer};
 use crate::policy::TransitStatus;
-use crate::transport::error::TransportError;
-
 use crate::Beamable;
+
+#[cfg(all(
+	feature = "transport-multiplex",
+	feature = "x509",
+	any(feature = "tokio", feature = "async-transport")
+))]
+use crate::transport::error::TransportError;
 
 #[cfg(feature = "transport-multiplex")]
 mod multiplex {
@@ -97,6 +102,7 @@ impl ResponsePackage {
 	/// The inverse of [`Self::resolve`]: a success carries the frame, and a
 	/// failure carries its status alone. The two together are the whole
 	/// round trip of one service call.
+	#[cfg(pooled_mux)]
 	pub(crate) fn from_outcome(outcome: Result<Option<Frame>, crate::TightBeamError>) -> Self {
 		match outcome {
 			Ok(message) => Self::new(TransitStatus::Ok, message),
@@ -115,6 +121,11 @@ impl ResponsePackage {
 	/// # Errors
 	///
 	/// - [`TransportError`] -- for any status other than [`TransitStatus::Ok`].
+	#[cfg(all(
+		feature = "transport-multiplex",
+		feature = "x509",
+		any(feature = "tokio", feature = "async-transport")
+	))]
 	pub(crate) fn resolve(self) -> Result<Option<Frame>, TransportError> {
 		match self.status {
 			TransitStatus::Ok => Ok(self

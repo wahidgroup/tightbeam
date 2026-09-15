@@ -11,15 +11,13 @@ use tightbeam::{Beamable, Version};
 struct Sha3_256Profile;
 
 impl SecurityProfile for Sha3_256Profile {
-	type DigestOid = Sha3_256; // Profile expects SHA3-256
+	type Digest = Sha3_256; // Profile expects SHA3-256
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	#[cfg(feature = "kdf")]
-	type KdfOid = tightbeam::crypto::kdf::HkdfSha3_256Oid;
+	type Kdf = tightbeam::crypto::kdf::HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
-	type CurveOid = tightbeam::crypto::curves::Secp256k1Oid;
-	#[cfg(feature = "kem")]
-	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
+	type Curve = tightbeam::crypto::k256::Secp256k1;
 }
 
 // Create a message with a profile that expects SHA3-256

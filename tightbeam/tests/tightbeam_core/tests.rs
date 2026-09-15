@@ -7,7 +7,7 @@
 #![allow(unexpected_cfgs)]
 
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
-use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid, Key, KeyInit};
+use tightbeam::crypto::aead::{Aes256Gcm, Key, KeyInit};
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey, VerifyingKey};
 use tightbeam::der::ValueOrd;
@@ -95,7 +95,7 @@ fn build_version_frame(
 	if version >= asn1::Version::V1 {
 		builder = builder
 			.with_message_hasher::<Sha3_256>([])
-			.with_aead::<Aes256GcmOid, _>(crypto.cipher.to_owned())
+			.with_aead(crypto.cipher.to_owned())
 			.with_signer::<Secp256k1Signature, _>(crypto.signing_key.to_owned());
 	}
 	if version >= asn1::Version::V2 {

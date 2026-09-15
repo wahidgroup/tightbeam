@@ -102,6 +102,8 @@
 //! - Server selects compatible profile from client's offer
 //! - Server responds with `SecurityAccept` in `ServerHandshake` message
 //! - Client validates server's selection matches offered profiles
+//! - Both endpoints admit a profile only when it names the algorithms their
+//!   provider runs ([`negotiation::RunnableProfile`])
 //!
 //! ### CMS Protocol Negotiation
 //!
@@ -111,8 +113,10 @@
 //! - Server stores selected profile (accessible via handshake state)
 //! - If no offer provided, server uses first configured profile
 //!
-//! The server uses `with_supported_profiles()` to configure acceptable profiles.
-//! If no profiles are configured when an offer is received, negotiation fails.
+//! The server uses `with_supported_profiles()` to configure acceptable
+//! profiles. Only a configured profile that names the provider's algorithms
+//! is eligible. If no profile is eligible when an offer is received,
+//! negotiation fails.
 //!
 //! ## State Machine
 //!
@@ -178,9 +182,8 @@ pub mod kari;
 #[cfg(feature = "transport-cms")]
 pub mod processors;
 
-pub use common::{
-	DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation,
-};
+pub use crate::crypto::aead::DirectionalCiphers;
+pub use common::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 pub use error::HandshakeError;
 pub(crate) use utils::aes_256_gcm_algorithm;
 
@@ -189,7 +192,6 @@ pub(crate) use utils::aes_256_gcm_algorithm;
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 mod mux {
-	pub(crate) use super::common::derive_directional_from_oid;
 	pub(crate) use super::utils::compute_transcript_digest;
 }
 
@@ -780,6 +782,7 @@ impl EstablishedSession {
 	/// session receipt and the peer identity. A session missing either can
 	/// never renew, so its epoch secret is released here rather than held,
 	/// unreachable, for as long as the session lives.
+	#[cfg(any(test, feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) fn new(
 		keys: SessionKeys,
 		mux: Option<MuxSettings>,

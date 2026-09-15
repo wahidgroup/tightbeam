@@ -37,8 +37,8 @@ use crate::random::generate_nonce;
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
-	authorize_transport, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept, TransportAccept,
-	TransportAuthorizer, TransportOffer,
+	authorize_transport, MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, StrengthFloor,
+	TransportAccept, TransportAuthorizer, TransportOffer,
 };
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
@@ -83,10 +83,10 @@ where
 	server_random: Option<[u8; 32]>,
 	base_session_key: Option<ZeroizingArray<32>>,
 	transcript_hash: Option<[u8; 32]>,
-	aad_domain_tag: Option<&'static [u8]>,
+	aad_domain_tag: &'static [u8],
 	supported_profiles: Vec<SecurityProfileDesc>,
-	strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
-	selected_profile: Option<SecurityProfileDesc>,
+	strength_floor: StrengthFloor,
+	selected_profile: Option<RunnableProfile<P>>,
 	transport_config: Option<TransportOffer>,
 	transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
 	session_observer: Option<Arc<dyn SessionObserver>>,
@@ -139,9 +139,9 @@ where
 			server_random: None,
 			base_session_key: None,
 			transcript_hash: None,
-			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
+			aad_domain_tag: aad_domain_tag.unwrap_or(TIGHTBEAM_AAD_DOMAIN_TAG),
 			supported_profiles: Vec::new(), // Must be set via with_supported_profiles()
-			strength_policy: None,          // Defaults to DefaultStrengthFloor
+			strength_floor: StrengthFloor::default(),
 			selected_profile: None,
 			transport_config: None,
 			transport_authorizer: None,
@@ -172,7 +172,7 @@ where
 	/// Pass `NoStrengthFloor` only where weaker profiles must remain negotiable.
 	#[must_use]
 	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
-		self.strength_policy = Some(policy);
+		self.strength_floor = StrengthFloor::with_policy(policy);
 		self
 	}
 
@@ -223,7 +223,7 @@ where
 		let selected = self.negotiate_profile(client_hello.security_offer.as_ref())?;
 		self.selected_profile = Some(selected);
 
-		let security_accept = SecurityAccept::new(selected);
+		let security_accept = SecurityAccept::new(selected.descriptor());
 
 		// 4. Transport capability negotiation: mux activates only when
 		// offered AND locally enabled. The authorizer (when configured)
@@ -507,8 +507,6 @@ where
 	where
 		P::AeadCipher: KeyInit + 'static,
 	{
-		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 		let ciphers = EciesHandshakeServer::complete(self)?;
 
 		// The orchestrator is spent, so the receipt moves out rather than
@@ -517,7 +515,7 @@ where
 		#[cfg(feature = "x509")]
 		let peer = self.validated_client_cert.as_ref().map(Arc::clone);
 
-		let keys = SessionKeys::for_server(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
+		let keys = SessionKeys::for_server(ciphers);
 		let mux = self.mux_settings;
 		let receipt = self.stored_receipt.take().map(Arc::new);
 		let epoch = self.epoch_materials.take();
@@ -565,11 +563,7 @@ where
 		let cipher = P::AeadCipher::new_from_slice(key_material)
 			.map_err(|_| HandshakeError::InvalidKeySize { expected: key_size, received: k_enc.len() })?;
 
-		let payload = match self.aad_domain_tag {
-			Some(aad) => Payload { msg: ciphertext_with_tag, aad },
-			None => Payload { msg: ciphertext_with_tag, aad: b"" },
-		};
-
+		let payload = Payload { msg: ciphertext_with_tag, aad: self.aad_domain_tag };
 		// The plaintext carries the base session key and the bearer
 		// settlement answer: wiped when the buffer drops
 		let plaintext = Zeroizing::new(cipher.decrypt(nonce, payload)?);
@@ -766,7 +760,7 @@ where
 // Common Handshake Trait Implementations
 // ============================================================================
 
-impl<P> HandshakeNegotiation for EciesHandshakeServer<P>
+impl<P> HandshakeNegotiation<P> for EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
@@ -775,11 +769,7 @@ where
 	}
 
 	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
-		if let Some(policy) = &self.strength_policy {
-			return policy.as_ref();
-		}
-
-		&DefaultStrengthFloor
+		self.strength_floor.policy()
 	}
 }
 
@@ -787,7 +777,7 @@ impl<P> HandshakeFinalization<P> for EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
-	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<RunnableProfile<P>> {
 		self.selected_profile
 	}
 }
@@ -841,7 +831,7 @@ where
 	}
 
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
-		self.selected_profile
+		self.selected_profile.map(|profile| profile.descriptor())
 	}
 
 	#[cfg(feature = "aead")]
@@ -858,10 +848,11 @@ mod tests {
 	use std::error::Error;
 
 	use super::*;
-	use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 	use crate::crypto::ecies::{encrypt, Secp256k1EciesMessage};
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::profiles::SecurityProfileDesc;
+	use crate::der::asn1::ObjectIdentifier;
+	use crate::oids::{HASH_SHA3_384, HASH_SHA3_512};
 	use crate::random::{generate_nonce, OsRng};
 	use crate::transport::handshake::negotiation::SecurityOffer;
 	use crate::transport::handshake::tests::*;
@@ -1064,65 +1055,35 @@ mod tests {
 		Ok(())
 	}
 
-	/// Test profile negotiation modes (negotiation vs dealer's choice).
-	///
-	/// Verifies that the server correctly handles both explicit client offers
-	/// and dealer's choice mode when no offer is present.
+	/// A descriptor that names a digest the default provider does not run.
+	fn foreign_profile(digest: ObjectIdentifier) -> SecurityProfileDesc {
+		SecurityProfileDesc { digest: Some(digest), ..create_default_test_profile() }
+	}
+
 	#[tokio::test]
-	async fn test_profile_negotiation() -> Result<(), Box<dyn Error>> {
-		use crate::oids::{
-			AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256, HASH_SHA3_384, HASH_SHA3_512,
-			SIGNER_ECDSA_WITH_SHA3_512,
-		};
+	async fn a_server_selects_the_offered_profile_it_runs() -> Result<(), Box<dyn Error>> {
+		let native = create_default_test_profile();
+		let offer = SecurityOffer::new(vec![foreign_profile(HASH_SHA3_384), native]);
+		let supported = vec![foreign_profile(HASH_SHA3_384), native];
+		let mut server = TestEciesServerBuilder::new().build()?.with_supported_profiles(supported);
+		let client_hello_der = create_test_client_hello_with_offer(&[0u8; 32], Some(offer))?;
 
-		let mk_profile = |id: u8| SecurityProfileDesc {
-			digest: Some(match id {
-				1 => HASH_SHA3_256,
-				2 => HASH_SHA3_384,
-				_ => HASH_SHA3_512,
-			}),
-			aead: Some(AES_256_GCM),
-			aead_key_size: Some(32),
-			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
-			curve: Some(CURVE_SECP256K1),
-			// Make key_wrap consistent so profiles only differ by digest
-			key_wrap: Some(AES_256_WRAP),
-			kem: None,
-		};
+		server.process_client_hello(&client_hello_der).await?;
 
-		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));
+		assert_eq!(server.selected_profile.map(|profile| profile.descriptor()), Some(native));
+		Ok(())
+	}
 
-		// Mode 1: Negotiation - client offers [A, B], server supports [B, C] -> selects B
-		{
-			let offer = SecurityOffer::new(vec![p_a, p_b]);
-			let selected = offer.select_profile([p_b, p_c])?;
-			assert_eq!(selected, p_b);
+	#[tokio::test]
+	async fn a_dealers_choice_server_skips_a_profile_it_does_not_run() -> Result<(), Box<dyn Error>> {
+		let native = create_default_test_profile();
+		let supported = vec![foreign_profile(HASH_SHA3_512), native];
+		let mut server = TestEciesServerBuilder::new().build()?.with_supported_profiles(supported);
+		let client_hello_der = create_test_client_hello(&[1u8; 32])?;
 
-			let mut server = TestEciesServerBuilder::new().build()?.with_supported_profiles(vec![p_b, p_c]);
-			let client_random = [0u8; 32];
-			let offer = Some(offer.to_owned());
-			let client_hello_der = create_test_client_hello_with_offer(&client_random, offer)?;
-			let _response = server.process_client_hello(&client_hello_der).await?;
-			assert_eq!(server.selected_profile, Some(p_b));
-		}
+		server.process_client_hello(&client_hello_der).await?;
 
-		// Mode 2: Dealer's choice - no client offer, server picks first
-		{
-			let mut server = TestEciesServerBuilder::new().build()?.with_supported_profiles(vec![p_a, p_b]);
-			let client_random = [1u8; 32];
-			let client_hello_der = create_test_client_hello(&client_random)?;
-			let _response = server.process_client_hello(&client_hello_der).await?;
-			assert_eq!(server.selected_profile, Some(p_a)); // First in list
-		}
-
-		// Error case: No mutual profile
-		{
-			let offer = SecurityOffer::new(vec![p_a, p_b]);
-			let result = offer.select_profile([p_c]);
-			assert!(result.is_err());
-		}
-
+		assert_eq!(server.selected_profile.map(|profile| profile.descriptor()), Some(native));
 		Ok(())
 	}
 
@@ -1216,8 +1177,7 @@ mod tests {
 		};
 
 		let plaintext = payload.to_der()?;
-		// Use server's AAD domain tag (or default if None)
-		let aad = server.aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG));
+		let aad = Some(server.aad_domain_tag);
 		// Encrypt with ECIES
 		let encrypted_message = encrypt::<_, _, _, Secp256k1EciesMessage, P::Kdf, P::AeadCipher>(
 			&server_pubkey,
@@ -1263,7 +1223,7 @@ mod tests {
 		};
 		let plaintext = payload.to_der()?;
 
-		let aad = server.aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG));
+		let aad = Some(server.aad_domain_tag);
 		let encrypted_message = encrypt::<_, _, _, Secp256k1EciesMessage, P::Kdf, P::AeadCipher>(
 			&server_pubkey,
 			&plaintext,

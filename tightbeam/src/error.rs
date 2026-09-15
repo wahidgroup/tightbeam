@@ -529,8 +529,9 @@ impl TightBeamError {
 	///
 	/// A failure already carrying a transit status keeps it. Anything else
 	/// answers [`TransitStatus::Internal`](crate::policy::TransitStatus::Internal),
-	/// so a peer tells a failure apart
-	/// from an accepted empty reply and the failure stays attributable.
+	/// so a peer tells a failure apart from an accepted empty reply and the
+	/// failure stays attributable.
+	#[cfg(pooled_mux)]
 	#[must_use]
 	pub(crate) fn failure_status(&self) -> crate::policy::TransitStatus {
 		use crate::policy::TransitStatus;

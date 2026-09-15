@@ -283,7 +283,6 @@ mod tests {
 	/// a decode.
 	#[cfg(feature = "aead")]
 	fn confidential_payment(index: u64) -> Result<Frame, Box<dyn std::error::Error>> {
-		use crate::crypto::aead::Aes256GcmOid;
 		use crate::testing::TestKey;
 
 		let (_, cipher) = TestKey::cipher();
@@ -294,7 +293,7 @@ mod tests {
 					from: "alice".into(),
 					amount: index
 				},
-				confidentiality<Aes256GcmOid, _>: cipher
+				confidentiality: cipher
 		}?;
 		Ok(frame)
 	}

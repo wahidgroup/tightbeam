@@ -15,7 +15,7 @@ use tightbeam::{
 		x509::policy::{CertificateValidation, DirectTrustValidator},
 		x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 	},
-	oids::{AES_128_GCM, AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256},
+	oids::{AES_128_GCM, AES_128_WRAP},
 	random::OsRng,
 	testing::{
 		error::{FdrConfigError, TestingError},
@@ -141,31 +141,19 @@ pub fn default_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc::from(&TightbeamProfile)
 }
 
-/// Strong profile (AES-256-GCM) for downgrade testing.
+/// Strong profile (AES-256-GCM) for downgrade testing, the profile the
+/// default provider runs.
 pub fn strong_security_profile() -> SecurityProfileDesc {
-	SecurityProfileDesc {
-		digest: Some(HASH_SHA3_256),
-		aead: Some(AES_256_GCM),
-		aead_key_size: Some(32),
-		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),
-		kdf: Some(HASH_SHA3_256),
-		curve: Some(CURVE_SECP256K1),
-		key_wrap: None,
-		kem: None,
-	}
+	default_security_profile()
 }
 
-/// Weak profile (AES-128-GCM) for downgrade testing.
+/// Weak profile (AES-128-GCM) for downgrade testing, the profile the AES-128
+/// test provider runs.
 pub fn weak_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		digest: Some(HASH_SHA3_256),
 		aead: Some(AES_128_GCM),
-		aead_key_size: Some(16),
-		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),
-		kdf: Some(HASH_SHA3_256),
-		curve: Some(CURVE_SECP256K1),
-		key_wrap: None,
-		kem: None,
+		key_wrap: Some(AES_128_WRAP),
+		..default_security_profile()
 	}
 }
 

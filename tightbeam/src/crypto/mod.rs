@@ -34,8 +34,6 @@ pub mod secret;
 pub mod aead;
 #[cfg(feature = "digest")]
 pub mod commitment;
-#[cfg(feature = "ecdh")]
-pub mod curves;
 #[cfg(feature = "ecies")]
 pub mod ecies;
 #[cfg(any(feature = "digest", feature = "sha3"))]

@@ -42,10 +42,30 @@ mod oid_wrappers {
 #[cfg(feature = "aes-gcm")]
 pub use oid_wrappers::*;
 
+/// An AEAD cipher and the algorithm identifier it runs under.
+///
+/// The cipher type is the one home for both facts a peer needs about it: the
+/// OID stamped on the wire and, through [`KeySizeUser`], the key length.
+/// Every other view of an AEAD algorithm reads them from here.
+pub trait AeadAlgorithm: Aead + KeySizeUser {
+	/// The algorithm identifier this cipher encrypts under.
+	type Oid: AssociatedOid;
+}
+
+#[cfg(feature = "aes-gcm")]
+impl AeadAlgorithm for Aes128Gcm {
+	type Oid = Aes128GcmOid;
+}
+
+#[cfg(feature = "aes-gcm")]
+impl AeadAlgorithm for Aes256Gcm {
+	type Oid = Aes256GcmOid;
+}
+
 /// Object-safe AEAD trait for runtime polymorphism.
 ///
 /// This trait provides a minimal object-safe interface for AEAD operations,
-/// allowing different cipher types to be stored in a single type (`RuntimeAead`).
+/// allowing different cipher types to be stored in a single type.
 trait AeadOps: Send + Sync {
 	/// Encrypt plaintext with the given nonce.
 	fn encrypt_bytes(&self, nonce: &[u8], plaintext: &[u8]) -> CoreResult<Vec<u8>, aead::Error>;
@@ -107,13 +127,17 @@ where
 /// `RuntimeAead` for storage in the transport layer.
 ///
 /// # Example
-/// ```ignore
-/// // In handshake orchestrator (knows P::AeadCipher at compile time)
-/// let cipher = Aes256Gcm::new_from_slice(&key_bytes)?;
-/// let runtime_aead = RuntimeAead::new(cipher, AES_256_GCM_OID);
 ///
-/// // Directional wrappers store RuntimeAead without knowing concrete type
+/// ```
+/// use tightbeam::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};
+/// use tightbeam::oids::AES_256_GCM;
+///
+/// let cipher = Aes256Gcm::new(&[0x42; 32].into());
+/// let runtime_aead = RuntimeAead::new(cipher);
+/// assert_eq!(runtime_aead.algorithm_oid(), AES_256_GCM);
+///
 /// let send_cipher = SendCipher::new(runtime_aead);
+/// assert_eq!(send_cipher.algorithm_oid(), AES_256_GCM);
 /// ```
 pub struct RuntimeAead {
 	cipher: Box<dyn AeadOps>,
@@ -121,15 +145,12 @@ pub struct RuntimeAead {
 }
 
 impl RuntimeAead {
-	/// Construct a new RuntimeAead from any RustCrypto AEAD cipher.
-	///
-	/// # Parameters
-	/// - `cipher`: The concrete AEAD cipher (e.g., `Aes256Gcm`)
-	/// - `oid`: The algorithm OID for this cipher
-	pub fn new<A>(cipher: A, oid: ObjectIdentifier) -> Self
+	/// Wrap `cipher`, taking its algorithm identifier from its type.
+	pub fn new<A>(cipher: A) -> Self
 	where
-		A: Aead + Send + Sync + 'static,
+		A: AeadAlgorithm + Send + Sync + 'static,
 	{
+		let oid = <A::Oid as AssociatedOid>::OID;
 		Self { cipher: Box::new(cipher), oid }
 	}
 
@@ -208,10 +229,9 @@ fn extract_nonce_and_ciphertext(info: &EncryptedContentInfo, expected_nonce_len:
 
 /// Trait for encrypting data and producing EncryptedContentInfo
 ///
-/// An impl binds a cipher type to the algorithm OID stamped on the wire:
-/// implement it only for canonically matched `(cipher, OID)` pairs (see the
-/// AES-GCM impls). The trait stays unsealed so custom encryptors such as
-/// ECIES remain possible.
+/// An impl binds an encryptor type to the algorithm OID stamped on the wire.
+/// Every [`AeadAlgorithm`] cipher implements it for its own OID and no other.
+/// The trait stays unsealed so custom encryptors such as ECIES remain possible.
 pub trait Encryptor<C>
 where
 	C: AssociatedOid,
@@ -225,68 +245,106 @@ where
 	) -> TbResult<EncryptedContentInfo>;
 }
 
-/// Trait for decrypting EncryptedContentInfo
-pub trait Decryptor {
-	/// Decrypt encrypted content info and return the plaintext bytes.
-	/// The nonce is extracted from the algorithm parameters in the
-	/// EncryptedContentInfo and validated against the cipher's nonce size.
-	///
-	/// Algorithm binding: [`RuntimeAead`] rejects a `content_enc_alg.oid`
-	/// that differs from its negotiated OID. Bare RustCrypto `Aead` decrypt
-	/// impls hold no OID to compare against. Concrete [`Encryptor`] impls
-	/// bind the encrypt side (cipher type -> canonical OID).
-	///
-	/// The plaintext is returned as a [`SecretSlice`] so it zeroizes on drop.
-	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>>;
+/// Encrypted content whose algorithm matches the decryptor that opens it.
+///
+/// Only this crate creates one, and only after it checks the algorithm, so a
+/// [`Decryptor::open`] call always follows that check (CWE-345).
+pub struct CheckedContent<'a> {
+	info: &'a EncryptedContentInfo,
 }
 
-/// Encrypt with a concrete AEAD and stamp the given algorithm OID.
-fn encrypt_aead_content<A: Aead>(
-	cipher: &A,
-	data: impl AsRef<[u8]>,
-	nonce: impl AsRef<[u8]>,
-	content_type: Option<ObjectIdentifier>,
-	algorithm_oid: ObjectIdentifier,
-) -> TbResult<EncryptedContentInfo> {
-	let nonce_bytes = nonce.as_ref();
-	let ciphertext = cipher.encrypt(cipher.sized_nonce(nonce_bytes)?, data.as_ref())?;
-	build_encrypted_content_info(ciphertext, nonce_bytes, content_type, algorithm_oid)
-}
+impl<'a> CheckedContent<'a> {
+	/// Admit `info` when it names the `expected` algorithm.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when `info` names another algorithm.
+	pub(crate) fn check(info: &'a EncryptedContentInfo, expected: ObjectIdentifier) -> TbResult<Self> {
+		let received = info.content_enc_alg.oid;
+		if received != expected {
+			return Err(TightBeamError::UnexpectedAlgorithm((received, expected).into()));
+		}
 
-// Concrete Encryptor impls bind each cipher to its canonical OID. A blanket
-// `impl<C, A> Encryptor<C> for A` would let callers stamp an arbitrary OID on
-// ciphertext from an unrelated cipher (CWE-345).
-#[cfg(feature = "aes-gcm")]
-impl Encryptor<Aes256GcmOid> for Aes256Gcm {
-	fn encrypt_content(
-		&self,
-		data: impl AsRef<[u8]>,
-		nonce: impl AsRef<[u8]>,
-		content_type: Option<ObjectIdentifier>,
-	) -> TbResult<EncryptedContentInfo> {
-		encrypt_aead_content(self, data, nonce, content_type, Aes256GcmOid::OID)
+		Ok(Self { info })
+	}
+
+	/// The encrypted content.
+	pub fn info(&self) -> &'a EncryptedContentInfo {
+		self.info
 	}
 }
 
-#[cfg(feature = "aes-gcm")]
-impl Encryptor<Aes128GcmOid> for Aes128Gcm {
+/// Trait for decrypting EncryptedContentInfo
+///
+/// Callers decrypt through [`DecryptContent::decrypt_content`], which checks
+/// the algorithm before it calls [`Decryptor::open`].
+pub trait Decryptor {
+	/// The algorithm identifier this decryptor opens.
+	fn algorithm_oid(&self) -> ObjectIdentifier;
+
+	/// Decrypt content that names this decryptor's algorithm.
+	///
+	/// The nonce is read from the algorithm parameters and validated against
+	/// the cipher's nonce size.
+	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>>;
+}
+
+/// Decryption of [`EncryptedContentInfo`] through any [`Decryptor`].
+///
+/// The blanket implementation is the only one, so every decryptor refuses a
+/// payload that names another algorithm.
+pub trait DecryptContent {
+	/// Decrypt `info` and return the plaintext bytes.
+	///
+	/// A payload that names an algorithm other than
+	/// [`Decryptor::algorithm_oid`] is refused before any decryption. The
+	/// plaintext is returned as a [`SecretSlice`] so it zeroizes on drop.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when `info` names another algorithm.
+	/// - Nonce and decryption errors from [`Decryptor::open`].
+	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>>;
+}
+
+impl<D: Decryptor + ?Sized> DecryptContent for D {
+	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
+		let content = CheckedContent::check(info, self.algorithm_oid())?;
+		self.open(content)
+	}
+}
+
+// The OID parameter is the cipher's own identifier, so a cipher cannot stamp
+// an arbitrary OID on its ciphertext (CWE-345).
+impl<A> Encryptor<A::Oid> for A
+where
+	A: AeadAlgorithm,
+{
 	fn encrypt_content(
 		&self,
 		data: impl AsRef<[u8]>,
 		nonce: impl AsRef<[u8]>,
 		content_type: Option<ObjectIdentifier>,
 	) -> TbResult<EncryptedContentInfo> {
-		encrypt_aead_content(self, data, nonce, content_type, Aes128GcmOid::OID)
+		let nonce_bytes = nonce.as_ref();
+		let ciphertext = self.encrypt(self.sized_nonce(nonce_bytes)?, data.as_ref())?;
+		build_encrypted_content_info(ciphertext, nonce_bytes, content_type, <A::Oid as AssociatedOid>::OID)
 	}
 }
 
 // Implement Decryptor for any AEAD cipher
 impl<A> Decryptor for A
 where
-	A: Aead,
+	A: AeadAlgorithm,
 {
-	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
-		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info, <A as AeadCore>::NonceSize::USIZE)?;
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		<A::Oid as AssociatedOid>::OID
+	}
+
+	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>> {
+		let content = content.info();
+		let nonce_size = <A as AeadCore>::NonceSize::USIZE;
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(content, nonce_size)?;
 		let plaintext = self.decrypt(self.sized_nonce(nonce_bytes)?, ciphertext)?;
 		Ok(SecretSlice::from(plaintext))
 	}
@@ -314,16 +372,13 @@ impl RuntimeAead {
 	}
 }
 
-// Implement Decryptor for RuntimeAead (see trait docs for algorithm binding)
 impl Decryptor for RuntimeAead {
-	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
-		// Bind the wire-declared algorithm to the negotiated cipher: a
-		// declared OID MUST match the negotiated cipher (CWE-345).
-		if info.content_enc_alg.oid != self.oid {
-			return Err(TightBeamError::UnexpectedAlgorithm((info.content_enc_alg.oid, self.oid).into()));
-		}
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		self.oid
+	}
 
-		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info, self.cipher.nonce_size())?;
+	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>> {
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(content.info(), self.cipher.nonce_size())?;
 		let plaintext = self.cipher.decrypt_bytes(nonce_bytes, ciphertext)?;
 		Ok(SecretSlice::from(plaintext))
 	}
@@ -524,8 +579,12 @@ impl RecvCipher {
 }
 
 impl Decryptor for RecvCipher {
-	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
-		let (nonce_bytes, _) = extract_nonce_and_ciphertext(info, self.aead.nonce_size())?;
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		self.aead.algorithm_oid()
+	}
+
+	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>> {
+		let (nonce_bytes, _) = extract_nonce_and_ciphertext(content.info(), self.aead.nonce_size())?;
 		let counter = parse_counter_nonce(nonce_bytes)?;
 
 		// Fail closed once the counter passes the AES-GCM per-key volume
@@ -543,7 +602,7 @@ impl Decryptor for RecvCipher {
 			return Err(TightBeamError::NonceReplayed((counter, expected).into()));
 		}
 
-		let plaintext = self.aead.decrypt_content(info)?;
+		let plaintext = self.aead.open(content)?;
 
 		// Advance only after successful authentication, otherwise a forged
 		// counter could block all future legitimate messages.
@@ -554,6 +613,18 @@ impl Decryptor for RecvCipher {
 
 		Ok(plaintext)
 	}
+}
+
+/// Directional session ciphers derived at handshake completion.
+///
+/// Field names use the canonical client-to-server and server-to-client
+/// directions. Role mapping into send and receive sides happens in
+/// [`SessionKeys`].
+pub struct DirectionalCiphers<C> {
+	/// Cipher for the client-to-server direction.
+	pub client_to_server: C,
+	/// Cipher for the server-to-client direction.
+	pub server_to_client: C,
 }
 
 /// Role-mapped directional session keys produced by handshake completion.
@@ -568,24 +639,24 @@ pub struct SessionKeys {
 
 impl SessionKeys {
 	/// Map directional ciphers for the client role (send = client-to-server).
-	pub fn for_client<A>(client_to_server: A, server_to_client: A, oid: ObjectIdentifier) -> Self
+	pub fn for_client<A>(ciphers: DirectionalCiphers<A>) -> Self
 	where
-		A: Aead + Send + Sync + 'static,
+		A: AeadAlgorithm + Send + Sync + 'static,
 	{
 		Self {
-			send: SendCipher::new(RuntimeAead::new(client_to_server, oid)),
-			recv: RecvCipher::new(RuntimeAead::new(server_to_client, oid)),
+			send: SendCipher::new(RuntimeAead::new(ciphers.client_to_server)),
+			recv: RecvCipher::new(RuntimeAead::new(ciphers.server_to_client)),
 		}
 	}
 
 	/// Map directional ciphers for the server role (send = server-to-client).
-	pub fn for_server<A>(client_to_server: A, server_to_client: A, oid: ObjectIdentifier) -> Self
+	pub fn for_server<A>(ciphers: DirectionalCiphers<A>) -> Self
 	where
-		A: Aead + Send + Sync + 'static,
+		A: AeadAlgorithm + Send + Sync + 'static,
 	{
 		Self {
-			send: SendCipher::new(RuntimeAead::new(server_to_client, oid)),
-			recv: RecvCipher::new(RuntimeAead::new(client_to_server, oid)),
+			send: SendCipher::new(RuntimeAead::new(ciphers.server_to_client)),
+			recv: RecvCipher::new(RuntimeAead::new(ciphers.client_to_server)),
 		}
 	}
 
@@ -609,7 +680,7 @@ mod tests {
 	use crate::der::asn1::OctetString;
 	use crate::der::Any;
 	use crate::error::ReceivedExpectedError;
-	use crate::oids::{AES_128_GCM, AES_256_GCM};
+	use crate::oids::AES_128_GCM;
 
 	const NONCE: [u8; 12] = [0x24; 12];
 	const PLAINTEXT: &[u8] = b"aead round trip";
@@ -686,7 +757,7 @@ mod tests {
 
 	#[test]
 	fn runtime_aead_round_trips() -> TbResult<()> {
-		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
+		let runtime = RuntimeAead::new(test_cipher());
 		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
 
 		let plaintext = runtime.decrypt_content(&info)?;
@@ -696,7 +767,7 @@ mod tests {
 
 	#[test]
 	fn runtime_aead_rejects_algorithm_oid_mismatch() -> TbResult<()> {
-		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
+		let runtime = RuntimeAead::new(test_cipher());
 		let mut info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
 		info.content_enc_alg.oid = AES_128_GCM;
 
@@ -707,7 +778,7 @@ mod tests {
 
 	#[test]
 	fn runtime_aead_rejects_wire_nonce_length() -> TbResult<()> {
-		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
+		let runtime = RuntimeAead::new(test_cipher());
 		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
 		let info = with_nonce_len(info, 8);
 
@@ -717,7 +788,7 @@ mod tests {
 	}
 
 	fn test_runtime() -> RuntimeAead {
-		RuntimeAead::new(test_cipher(), AES_256_GCM)
+		RuntimeAead::new(test_cipher())
 	}
 
 	#[test]
@@ -865,11 +936,15 @@ mod tests {
 	}
 
 	fn directional_pair() -> (SessionKeys, SessionKeys) {
-		let oid = AES_256_GCM;
 		let c2s_key = [0x11u8; 32];
 		let s2c_key = [0x22u8; 32];
-		let client = SessionKeys::for_client(Aes256Gcm::new(&c2s_key.into()), Aes256Gcm::new(&s2c_key.into()), oid);
-		let server = SessionKeys::for_server(Aes256Gcm::new(&c2s_key.into()), Aes256Gcm::new(&s2c_key.into()), oid);
+		let ciphers = || DirectionalCiphers {
+			client_to_server: Aes256Gcm::new(&c2s_key.into()),
+			server_to_client: Aes256Gcm::new(&s2c_key.into()),
+		};
+
+		let client = SessionKeys::for_client(ciphers());
+		let server = SessionKeys::for_server(ciphers());
 		(client, server)
 	}
 

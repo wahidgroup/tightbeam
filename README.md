@@ -635,15 +635,14 @@ A recipient decrypts the body and recovers the opening `(salt, DER(value))`. The
 When confidentiality is enabled, implementations MUST use Authenticated Encryption with Associated Data (AEAD). The type system enforces this requirement through trait bounds:
 
 ```rust
-pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
+pub fn with_aead<Cipher>(mut self, cipher: Cipher) -> Self
 where
-	C: AssociatedOid,
-	Cipher: Aead + Encryptor<C> + 'static, // AEAD + canonical OID binding required
-	T: CheckAeadOid<C>;
+	Cipher: AeadAlgorithm + 'static, // AEAD cipher that names its own OID
+	T: CheckAeadOid<Cipher::Oid>;
 ```
 
 - Non-AEAD ciphers cannot be selected. The compiler rejects them.
-- `Encryptor<C>` exists only for canonically matched cipher and OID pairs. The wire algorithm identifier cannot diverge from the cipher, even when the message type has no security profile.
+- The cipher type names the algorithm identifier stamped on the wire, so the identifier cannot diverge from the cipher, even when the message type has no security profile.
 - AEAD tags prove that ciphertext was not modified. Examples include AES-GCM ([FIPS 197][fips197]) and ChaCha20-Poly1305 ([RFC 8439][rfc8439]).
 - MI proves that decrypted plaintext matches the original message content.
 - AEAD protects ciphertext. MI proves plaintext. FI witnesses MI in metadata. Signatures cover the frame.
@@ -923,19 +922,21 @@ A `SecurityProfile` is a compile-time metadata type. It declares which algorithm
 
 #### Design Principles
 
-The `SecurityProfile` trait associates OID types with digest, AEAD, signature, curve, and KEM roles. An optional key-wrap OID MAY be set as a constant:
+The `SecurityProfile` trait names the digest, AEAD, signature, KDF, and curve algorithms. Each associated type carries its own OID. An optional key-wrap OID MAY be set as a constant:
 
 ```rust
 pub trait SecurityProfile {
-	type DigestOid: AssociatedOid;
-	type AeadOid: AssociatedOid + AeadKeySize;
+	type Digest: AssociatedOid;
+	type AeadOid: AssociatedOid;
 	type SignatureAlg: SignatureAlgorithmIdentifier;
-	type CurveOid: AssociatedOid;
-	type KemOid: AssociatedOid;
+	type Kdf: AssociatedOid;
+	type Curve: AssociatedOid;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
 }
 ```
+
+The AEAD OID names the cipher, and the cipher type fixes the key length.
 
 #### Role-Based Provider Traits
 
@@ -960,11 +961,11 @@ An application implements `SecurityProfile` to fix the algorithm set for a secur
 pub struct MyAppProfile;
 
 impl SecurityProfile for MyAppProfile {
-	type DigestOid = Sha3_256;
+	type Digest = Sha3_256;
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
-	type CurveOid = Secp256k1Oid;
-	type KemOid = Kyber1024Oid;
+	type Kdf = HkdfSha3_256;
+	type Curve = k256::Secp256k1;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
@@ -978,11 +979,11 @@ impl SecurityProfile for MyAppProfile {
 pub struct TightbeamProfile;
 
 impl SecurityProfile for TightbeamProfile {
-	type DigestOid = Sha3_256;
+	type Digest = Sha3_256;
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
-	type CurveOid = Secp256k1Oid;
-	type KemOid = Kyber1024Oid;
+	type Kdf = HkdfSha3_256;
+	type Curve = k256::Secp256k1;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
@@ -995,11 +996,11 @@ impl SecurityProfile for TightbeamProfile {
 Numeric security levels are a shorthand for common `Message` requirement flags. They do not replace a typed `SecurityProfile`.
 
 - Level 1 or level 2 sets confidential and nonrepudiable requirements and sets `min_version` to `V1`.
-- Numeric levels do **not** enable algorithm OID validation. Use a type-based `SecurityProfile` for OID checks ([§6.4](#64-message-level-security-requirements)).
+- Numeric levels constrain no algorithm. A level 1 ("FIPS") message accepts any digest, AEAD, or signature algorithm. Use a type-based `SecurityProfile` to constrain algorithms ([§6.4](#64-message-level-security-requirements)).
 
 ### 6.4 Message-Level Security Requirements
 
-The `Message` trait attaches security requirements to a message type. Composition paths enforce those requirements at compile time when a typed profile is active. Frame validation checks the resulting shape at run time.
+The `Message` trait attaches security requirements to a message type. `FrameBuilder` enforces a typed profile's algorithms when it composes a Frame. Frame validation checks the resulting shape at run time.
 
 ```rust
 pub trait Message: /* trait bounds */ {
@@ -1022,11 +1023,11 @@ pub trait Message: /* trait bounds */ {
 - When `HAS_PROFILE` is `false` (default), the associated `Profile` defaults to `TightbeamProfile`. Composition does not require OID matching against that profile.
 - When `HAS_PROFILE` is `true`, `FrameBuilder` and `compose!` require cryptographic operations to use algorithms from `Message::Profile`.
 
-The associated `Profile` type MAY be any type that implements `SecurityProfile`. It defaults to `TightbeamProfile` when the application does not set another type. OID validation runs at compile time only when `HAS_PROFILE` is `true`.
+The associated `Profile` type MAY be any type that implements `SecurityProfile`. It defaults to `TightbeamProfile` when the application does not set another type. OID validation runs only when `HAS_PROFILE` is `true`.
 
-When `HAS_PROFILE` is `true`, the following matches are required at compile time:
+When `HAS_PROFILE` is `true`, the following matches are required:
 
-- Digest algorithms MUST match `<Profile::DigestOid as AssociatedOid>::OID`.
+- Digest algorithms MUST match `<Profile::Digest as AssociatedOid>::OID`.
 - AEAD ciphers MUST match `<Profile::AeadOid as AssociatedOid>::OID`.
 - Signature algorithms MUST match `<Profile::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID`.
 
@@ -1044,7 +1045,7 @@ A message type with a typed profile therefore composes only with compatible algo
 
 #### Profile Validation in FrameBuilder
 
-When `HAS_PROFILE` is `true`, `FrameBuilder` and `compose!` enforce profile constraints at compile time.
+When `HAS_PROFILE` is `true`, `FrameBuilder` and `compose!` enforce profile constraints. For a `#[derive(Beamable)]` message, a mismatched algorithm type also fails to compile at the builder call.
 
 **Using the `compose!` macro:**
 
@@ -1059,7 +1060,7 @@ let frame = compose! {
 	V1: id: b"msg-001",
 		order: 1696521900,
 		message_integrity<Sha3_256>: salt,
-		confidentiality<Aes256GcmOid, _>: &cipher,
+		confidentiality: cipher,
 		nonrepudiation<Secp256k1Signature, _>: &signing_key,
 		message: message
 }?;
@@ -1073,8 +1074,8 @@ let frame = compose::<SecureMessage>(Version::V1)
 	.with_message(msg)
 	.with_id(b"msg-001")
 	.with_order(timestamp)
-	.with_message_hasher::<Sha3_256>(salt)          // ✓ Matches MyAppProfile::DigestOid
-	.with_aead::<Aes256GcmOid, _>(&cipher)          // ✓ Matches MyAppProfile::AeadOid
+	.with_message_hasher::<Sha3_256>(salt)          // ✓ Matches MyAppProfile::Digest
+	.with_aead(cipher)                              // ✓ Matches MyAppProfile::AeadOid
 	.with_signer::<Secp256k1Signature, _>(&signer)  // ✓ Matches MyAppProfile::SignatureAlg
 	.build()?;
 ```
@@ -1083,17 +1084,17 @@ let frame = compose::<SecureMessage>(Version::V1)
 
 **Validation rules** (when `HAS_PROFILE` is `true`):
 
-- `with_message_hasher::<D>(salt)` requires `D::OID == Profile::DigestOid::OID`.
-- `with_witness_hasher::<D>()` requires `D::OID == Profile::DigestOid::OID`.
-- `with_aead::<C, _>()` requires `C::OID == Profile::AeadOid::OID`. The `Encryptor<C>` bound also ties the cipher type to its canonical OID, even when no typed profile is active.
+- `with_message_hasher::<D>(salt)` requires `D::OID == Profile::Digest::OID`.
+- `with_witness_hasher::<D>()` requires `D::OID == Profile::Digest::OID`.
+- `with_aead(cipher)` requires `Cipher::Oid::OID == Profile::AeadOid::OID`. The cipher type names its own OID, even when no typed profile is active.
 - `with_signer::<S, _>()` requires `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`.
 
-An algorithm mismatch returns `TightBeamError::UnexpectedAlgorithmForProfile`. The error carries the expected OID and the received OID.
+An algorithm mismatch returns `TightBeamError::UnexpectedAlgorithm`. The error carries the received OID and the expected OID.
 
 #### Implementation Enforcement
 
-- **Compile time**: The type system rejects compositions that violate the active profile or requirement flags.
-- **Run time**: Frame validation checks that the Frame shape matches the message requirements.
+- **Compile time**: The derive implements the `CheckDigestOid`, `CheckAeadOid`, and `CheckSignatureOid` hints only for the profile's algorithms, so a derived message rejects a mismatched algorithm type. A hand-written `Message` impl can implement those hints for any algorithm, so they are not the enforcement.
+- **Run time**: `FrameBuilder` compares each algorithm OID with the profile, which enforces the profile for every `Message` impl. Frame validation checks that the Frame shape matches the message requirements.
 - **Profile binding**: A `SecurityProfile` type is attached through `Message::Profile` and the `#[beam(profile(...))]` attributes below.
 
 #### Derive Macro Usage
@@ -1110,7 +1111,7 @@ An algorithm mismatch returns `TightBeamError::UnexpectedAlgorithmForProfile`. T
 **Profile attributes:**
 
 - `#[beam(profile = 1)]` or `#[beam(profile = 2)]`: numeric levels. These set confidential and nonrepudiable requirements. They do not enable OID validation ([§6.3](#63-numeric-security-levels)).
-- `#[beam(profile(TypeName))]`: typed profile. This sets `HAS_PROFILE` and enables compile-time OID validation.
+- `#[beam(profile(TypeName))]`: typed profile. This sets `HAS_PROFILE` and enables OID validation.
 
 #### Example Message Types
 
@@ -1140,10 +1141,18 @@ pub trait CryptoProvider:
 	KdfProvider +
 	CurveProvider
 {
-	type Profile: SecurityProfile + Default;
+	type Profile: SecurityProfile<
+			Digest = Self::Digest,
+			AeadOid = <Self::AeadCipher as AeadAlgorithm>::Oid,
+			SignatureAlg = Self::Signature,
+			Kdf = Self::Kdf,
+			Curve = Self::Curve,
+		> + Default;
 	fn profile(&self) -> &Self::Profile;
 }
 ```
+
+Each provider role MUST use the algorithm its profile names. The `Profile` bound enforces this, so a provider that runs AES-256-GCM under a profile that negotiates AES-128-GCM does not compile.
 
 `DefaultCryptoProvider` is the reference provider. It uses:
 
