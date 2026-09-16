@@ -844,6 +844,7 @@ dependencies = [
  "sha3",
  "signature",
  "spki",
+ "subtle",
  "tightbeam-derive",
  "time",
  "x509-cert",

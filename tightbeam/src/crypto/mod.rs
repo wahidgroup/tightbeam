@@ -49,6 +49,7 @@ pub mod x509;
 
 // Re-exports
 pub use crypto_common as common;
+pub use subtle;
 
 #[cfg(feature = "kdf")]
 pub use hkdf;

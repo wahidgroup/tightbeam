@@ -286,11 +286,22 @@ pub fn decompress(data: impl AsRef<[u8]>, inflator: &impl Inflator) -> Result<Ve
 pub fn digest<D: digest::Digest + crate::der::oid::AssociatedOid>(
 	data: impl AsRef<[u8]>,
 ) -> Result<crate::asn1::DigestInfo, TightBeamError> {
-	let data = data.as_ref();
-
 	let mut hasher = D::new();
-	hasher.update(data);
+	hasher.update(data.as_ref());
+	digest_info::<D>(hasher)
+}
 
+/// Finalize `hasher` into the [`DigestInfo`] that names its algorithm.
+///
+/// Callers whose preimage arrives in pieces stream it into `hasher` and end
+/// here, so no caller has to concatenate a preimage into one buffer to get a
+/// `DigestInfo` back.
+///
+/// [`DigestInfo`]: crate::asn1::DigestInfo
+#[cfg(feature = "digest")]
+pub(crate) fn digest_info<D: digest::Digest + crate::der::oid::AssociatedOid>(
+	hasher: D,
+) -> Result<crate::asn1::DigestInfo, TightBeamError> {
 	let algorithm = crate::asn1::AlgorithmIdentifier { oid: D::OID, parameters: None };
 	let digest = hasher.finalize();
 	let digest_octet_string = crate::asn1::OctetString::new(&digest[..])?;

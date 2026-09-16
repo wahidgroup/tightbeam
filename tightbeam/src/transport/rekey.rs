@@ -40,7 +40,7 @@ use futures::lock::Mutex as FuturesMutex;
 use crate::cms::signed_data::{SignedData, SignerIdentifier, SignerInfo};
 use crate::constants::TIGHTBEAM_EPOCH_KDF_INFO;
 use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecvCipher, SendCipher, SessionKeys};
-use crate::crypto::hash::Digest;
+use crate::crypto::hash::{ConstantTimeDigest, Digest};
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::CryptoProvider;
 use crate::der::asn1::OctetString;
@@ -283,13 +283,12 @@ where
 			&self.materials.peer_verifying_key,
 		)?;
 
-		let challenge_hash = exchange_challenge_hash::<P::Digest>(
-			&self.materials.epoch.transcript_hash,
-			&pending.request_der,
-			&server_random,
-		)?;
+		let chain_hash = &self.materials.epoch.transcript_hash;
+		let challenge_hash = exchange_challenge_hash::<P::Digest>(chain_hash, &pending.request_der, &server_random)?;
 		let expected_pin = transcript_digest_info::<P::Digest>(challenge_hash)?;
-		let pin_matches = receipt.transcript_hash == expected_pin;
+		let pin_algorithm_matches = receipt.transcript_hash.algorithm == expected_pin.algorithm;
+
+		let pin_matches = pin_algorithm_matches && receipt.transcript_hash.digest_matches(&expected_pin);
 		let budgets_match = receipt.budgets == self.materials.reference.budgets;
 		let unit_matches = receipt.credit_unit == self.materials.reference.credit_unit;
 		if !pin_matches || !budgets_match || !unit_matches {

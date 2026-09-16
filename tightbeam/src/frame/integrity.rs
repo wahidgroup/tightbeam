@@ -58,6 +58,12 @@ impl Frame {
 	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch
 	/// alike. Callers that must distinguish those conditions use
 	/// [`Frame::message_commitment_verdict`].
+	///
+	/// # Errors
+	///
+	/// - [`InvalidSaltLength`](crate::TightBeamError::InvalidSaltLength) --
+	///   when a non-empty `salt` is too short to have hidden the body.
+	/// - Encoding errors from `message`.
 	pub fn verify_commitment_of<D, M>(&self, message: &M, salt: impl AsRef<[u8]>) -> Result<bool>
 	where
 		D: Digest + AssociatedOid,
@@ -107,9 +113,9 @@ impl Frame {
 	/// Verify this frame's frame-integrity (FI) digest.
 	///
 	/// Convenience over [`Frame::frame_integrity_verdict`]. Returns
-	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch alike.
-	/// Callers that must distinguish a stripped FI field from a tampered
-	/// envelope use the verdict method.
+	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch
+	/// alike. Callers that must distinguish a stripped FI field from a
+	/// tampered envelope use the verdict method.
 	pub fn verify_frame_integrity<D>(&self) -> Result<bool>
 	where
 		D: Digest + AssociatedOid,

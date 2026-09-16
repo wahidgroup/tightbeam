@@ -53,12 +53,9 @@ pub use crate::crypto::hkdf::Hkdf;
 
 use crate::crypto::hkdf::InvalidLength;
 
-use crate::constants::{
-	ECDH_SHARED_SECRET_SIZE, EC_PUBKEY_COMPRESSED_SIZE, EC_PUBKEY_UNCOMPRESSED_SIZE, MAX_HKDF_OUTPUT_SIZE,
-	MIN_KEY_SIZE, MIN_SALT_SIZE,
-};
+use crate::constants::{ECDH_SHARED_SECRET_SIZE, MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE, MIN_SALT_SIZE};
 use crate::crypto::hash::{Digest, Sha3_256};
-use crate::crypto::secret::{SecretSlice, ToInsecure};
+use crate::crypto::secret::{Secret, SecretSlice, ToInsecure};
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
 use crate::oids::HASH_SHA3_256;
@@ -277,10 +274,6 @@ pub enum KdfError {
 	#[error("Key derivation failed: {0}")]
 	DerivationFailed(InvalidLength),
 
-	/// Invalid ephemeral public key length
-	#[error("Invalid ephemeral public key length: expected 33 or 65 bytes, got {0}")]
-	InvalidPublicKeyLength(usize),
-
 	/// Invalid shared secret length
 	#[error("Invalid shared secret length: expected 32 bytes, got {0}")]
 	InvalidSharedSecretLength(usize),
@@ -296,18 +289,50 @@ pub enum KdfError {
 
 crate::impl_from!(crate::crypto::secret::SecretError => KdfError::SecretUnavailable);
 
+/// An ECDH shared secret on a 256-bit curve.
+///
+/// The length is part of the type, so a derivation that takes one runs no
+/// length check of its own. It wipes on drop like every [`Secret`].
+pub type EcdhSecret = Secret<[u8; ECDH_SHARED_SECRET_SIZE]>;
+
+impl TryFrom<SecretSlice<u8>> for EcdhSecret {
+	type Error = KdfError;
+
+	/// # Errors
+	///
+	/// - [`KdfError::InvalidSharedSecretLength`] when the secret is not [`ECDH_SHARED_SECRET_SIZE`] bytes.
+	/// - [`KdfError::SecretUnavailable`] when the secret was already taken.
+	fn try_from(secret: SecretSlice<u8>) -> Result<Self> {
+		let bytes = secret.to_insecure()?;
+		let sized: [u8; ECDH_SHARED_SECRET_SIZE] = bytes
+			.as_ref()
+			.try_into()
+			.map_err(|_| KdfError::InvalidSharedSecretLength(bytes.len()))?;
+
+		Ok(Secret::from(sized))
+	}
+}
+
 // ============================================================================
 // Input Validation Helpers
 // ============================================================================
 
-/// Validate shared secret length for 256-bit curves.
-#[inline]
-fn assert_valid_shared_secret(shared_secret: &[u8]) -> Result<()> {
-	if shared_secret.len() != ECDH_SHARED_SECRET_SIZE {
-		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
-	}
+/// Bind `info` and `ephemeral_pubkey` into one unambiguous ECIES SharedInfo.
+///
+/// Each part carries an 8-byte big-endian length, so no two distinct
+/// `(info, ephemeral_pubkey)` pairs produce the same SharedInfo and derive
+/// the same key. A separator byte string cannot promise that, because either
+/// part may contain the separator: `("ctx", "A|epk|B")` and
+/// `("ctx|epk|A", "B")` concatenate to the same bytes.
+fn shared_info(info: &[u8], ephemeral_pubkey: &[u8]) -> Vec<u8> {
+	const FRAME: usize = 2 * core::mem::size_of::<u64>();
 
-	Ok(())
+	let mut framed = Vec::with_capacity(FRAME + info.len() + ephemeral_pubkey.len());
+	framed.extend_from_slice(&(info.len() as u64).to_be_bytes());
+	framed.extend_from_slice(info);
+	framed.extend_from_slice(&(ephemeral_pubkey.len() as u64).to_be_bytes());
+	framed.extend_from_slice(ephemeral_pubkey);
+	framed
 }
 
 /// Validate salt length if provided (minimum 16 bytes for security).
@@ -322,30 +347,11 @@ fn assert_valid_salt(salt: Option<&[u8]>) -> Result<()> {
 	Ok(())
 }
 
-/// Validate ephemeral public key length (SEC1 format: compressed or uncompressed).
-#[inline]
-fn assert_valid_ephemeral_pubkey(ephemeral_pubkey: &[u8]) -> Result<()> {
-	if ephemeral_pubkey.len() != EC_PUBKEY_COMPRESSED_SIZE && ephemeral_pubkey.len() != EC_PUBKEY_UNCOMPRESSED_SIZE {
-		return Err(KdfError::InvalidPublicKeyLength(ephemeral_pubkey.len()));
-	}
-
-	Ok(())
-}
-
-/// Validate common KDF inputs (ephemeral pubkey, shared secret, and optional salt)
-#[inline]
-fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: Option<&[u8]>) -> Result<()> {
-	assert_valid_ephemeral_pubkey(ephemeral_pubkey)?;
-	assert_valid_shared_secret(shared_secret)?;
-	assert_valid_salt(salt)?;
-	Ok(())
-}
-
 /// Generic ECIES-style KDF using any `KdfProvider`.
 ///
 /// Inputs
-/// - `ephemeral_pubkey`: 33-byte compressed or 65-byte uncompressed
-/// - `shared_secret`: 32 bytes (e.g., ECDH result on a 256-bit curve)
+/// - `ephemeral_pubkey`: the sender's ephemeral public key, bound as context
+/// - `shared_secret`: the ECDH result on a 256-bit curve
 /// - `info`: application- or protocol-specific context string
 /// - `salt`: optional HKDF salt; if provided and non-empty, must be >= 16 bytes
 ///
@@ -353,7 +359,7 @@ fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: 
 /// - 32-byte key suitable for symmetric encryption or MAC, depending on use
 ///
 /// Errors
-/// - `InvalidPublicKeyLength`, `InvalidSharedSecretLength`, `InvalidSaltLength`
+/// - `InvalidSaltLength`
 /// - `DerivationFailed` if HKDF expansion fails
 ///
 /// Standards notes
@@ -363,22 +369,15 @@ fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: 
 ///   provide a custom `KdfProvider`.
 pub fn ecies_kdf<P: KdfFunction>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
-	shared_secret: SecretSlice<u8>,
+	shared_secret: EcdhSecret,
 	info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
 ) -> Result<ZeroizingArray<32>> {
-	let ephemeral_pubkey = ephemeral_pubkey.as_ref();
-	let shared_secret_bytes = shared_secret.to_insecure()?;
-	let shared_secret = shared_secret_bytes.as_ref();
+	assert_valid_salt(salt)?;
 
-	assert_valid_kdf_inputs(ephemeral_pubkey, shared_secret, salt)?;
-
-	// ECIES: IKM = Z; SharedInfo binds context and the ephemeral public key
-	let mut shared_info = Vec::with_capacity(info.as_ref().len() + 5 + ephemeral_pubkey.len());
-	shared_info.extend_from_slice(info.as_ref());
-	shared_info.extend_from_slice(b"|epk|");
-	shared_info.extend_from_slice(ephemeral_pubkey);
-	P::derive_key::<32>(shared_secret, &shared_info, salt)
+	// ECIES: IKM = Z; SharedInfo binds context and the ephemeral public key.
+	let shared_info = shared_info(info.as_ref(), ephemeral_pubkey.as_ref());
+	shared_secret.with(|secret| P::derive_key::<32>(secret, &shared_info, salt))?
 }
 
 /// General-purpose HKDF
@@ -429,42 +428,48 @@ pub fn hkdf<P: KdfFunction, const N: usize>(
 /// - [SECG SEC 1 v2.0 §5.1.3](https://www.secg.org/sec1-v2.pdf#page=59): ECIES encryption/MAC key separation
 pub fn ecies_kdf_with_size<P: KdfFunction, const N: usize>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
-	shared_secret: SecretSlice<u8>,
+	shared_secret: EcdhSecret,
 	info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
 ) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
-	let insecure_shared_secret = shared_secret.to_insecure()?;
-	let (ephemeral_pubkey, shared_secret, info) =
-		(ephemeral_pubkey.as_ref(), insecure_shared_secret.as_ref(), info.as_ref());
+	assert_valid_salt(salt)?;
 
-	assert_valid_kdf_inputs(ephemeral_pubkey, shared_secret, salt)?;
-
-	// ECIES: IKM = Z; SharedInfo binds context and the ephemeral public key
-	let mut shared_info = Vec::with_capacity(info.len() + 5 + ephemeral_pubkey.len());
-	shared_info.extend_from_slice(info);
-	shared_info.extend_from_slice(b"|epk|");
-	shared_info.extend_from_slice(ephemeral_pubkey);
-	P::derive_dual_keys::<N>(shared_secret, &shared_info, salt)
+	// ECIES: IKM = Z; SharedInfo binds context and the ephemeral public key.
+	let shared_info = shared_info(info.as_ref(), ephemeral_pubkey.as_ref());
+	shared_secret.with(|secret| P::derive_dual_keys::<N>(secret, &shared_info, salt))?
 }
 
-/// ECIES key derivation over a shared secret.
+/// ECIES key derivation over a shared secret, from SharedInfo the caller
+/// assembled.
+///
+/// [`ecies_kdf`] takes an `(info, ephemeral_pubkey)` pair and length-frames
+/// the two parts itself. These methods take the finished SharedInfo instead,
+/// for context that pair cannot express, so keeping it unambiguous belongs to
+/// the caller: two different inputs that concatenate to the same bytes derive
+/// the same key.
 pub trait EciesKdf {
-	/// Derive a 32-byte key with caller-supplied SharedInfo (no EPK append).
+	/// Derive a 32-byte key from SharedInfo the caller assembled.
 	///
 	/// # Errors
 	///
-	/// - Shared-secret or salt validation failures
+	/// - [`KdfError::InvalidSaltLength`] when a non-empty `salt` is shorter than [`MIN_SALT_SIZE`].
+	/// - [`KdfError::DerivationFailed`] when expansion fails.
+	/// - [`KdfError::SecretUnavailable`] when the secret was already taken.
 	fn ecies_kdf_with_shared_info<P: KdfFunction>(
 		self,
 		shared_info: impl AsRef<[u8]>,
 		salt: Option<&[u8]>,
 	) -> Result<ZeroizingArray<32>>;
 
-	/// Derive a dual key of `N` bytes with caller-supplied SharedInfo.
+	/// Derive an encryption and MAC key pair of `N` bytes each from SharedInfo
+	/// the caller assembled.
 	///
 	/// # Errors
 	///
-	/// - Shared-secret or salt validation failures
+	/// - [`KdfError::InvalidSaltLength`] when a non-empty `salt` is shorter than [`MIN_SALT_SIZE`].
+	/// - [`KdfError::DerivationFailed`] when `N` is outside
+	///   [`MIN_KEY_SIZE`]`..=`[`MAX_HKDF_OUTPUT_SIZE`], or expansion fails.
+	/// - [`KdfError::SecretUnavailable`] when the secret was already taken.
 	fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
 		self,
 		shared_info: impl AsRef<[u8]>,
@@ -472,18 +477,15 @@ pub trait EciesKdf {
 	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)>;
 }
 
-impl EciesKdf for SecretSlice<u8> {
+impl EciesKdf for EcdhSecret {
 	fn ecies_kdf_with_shared_info<P: KdfFunction>(
 		self,
 		shared_info: impl AsRef<[u8]>,
 		salt: Option<&[u8]>,
 	) -> Result<ZeroizingArray<32>> {
-		let insecure_shared_secret = self.to_insecure()?;
-		let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
-		assert_valid_shared_secret(shared_secret)?;
+		let shared_info = shared_info.as_ref();
 		assert_valid_salt(salt)?;
-
-		P::derive_key::<32>(shared_secret, shared_info, salt)
+		self.with(|secret| P::derive_key::<32>(secret, shared_info, salt))?
 	}
 
 	fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
@@ -491,12 +493,9 @@ impl EciesKdf for SecretSlice<u8> {
 		shared_info: impl AsRef<[u8]>,
 		salt: Option<&[u8]>,
 	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
-		let insecure_shared_secret = self.to_insecure()?;
-		let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
-		assert_valid_shared_secret(shared_secret)?;
+		let shared_info = shared_info.as_ref();
 		assert_valid_salt(salt)?;
-
-		P::derive_dual_keys::<N>(shared_secret, shared_info, salt)
+		self.with(|secret| P::derive_dual_keys::<N>(secret, shared_info, salt))?
 	}
 }
 
@@ -521,14 +520,6 @@ mod tests {
 		assert_ne!(key1[..], key2[..], "Keys should be different");
 	}
 
-	// Error assertion macros for cleaner test code
-	macro_rules! assert_kdf_error {
-		($result:expr, $variant:ident($value:expr)) => {
-			assert!(matches!($result, Err(KdfError::$variant(v)) if v == $value),
-				"Expected KdfError::{}({}), got {:?}", stringify!($variant), $value, $result);
-		};
-	}
-
 	// Key assertion macros for common test patterns
 	macro_rules! assert_key_pair_lengths {
 		($enc:expr, $mac:expr, $size:expr) => {
@@ -549,8 +540,8 @@ mod tests {
 		};
 	}
 
-	fn shared_secret_32() -> SecretSlice<u8> {
-		Secret::from(b"shared_secret_32_bytes__________".to_vec())
+	fn shared_secret_32() -> EcdhSecret {
+		Secret::from(*b"shared_secret_32_bytes__________")
 	}
 
 	// Test data constants
@@ -606,8 +597,6 @@ mod tests {
 		let (k_enc_16, k_mac_16) = keys_16;
 		let (k_enc_32, k_mac_32) = keys_32;
 		let (k_enc_64, k_mac_64) = keys_64;
-
-		// Check key lengths
 		assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
 		assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
 		assert_key_pair_lengths!(k_enc_64, k_mac_64, 64);
@@ -617,30 +606,36 @@ mod tests {
 		Ok(())
 	}
 
-	// Consolidated test for input validation
+	// A shared secret of the wrong length never becomes an `EcdhSecret`, so
+	// no derivation can run on it.
 	#[test]
-	fn test_ecies_kdf_input_validation() -> crate::error::Result<()> {
-		// Invalid input test cases
-		let short_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"short", shared_secret_32(), INFO_V1, None);
-		let wrong_size_pubkey_result =
-			ecies_kdf::<HkdfSha3_256>(b"wrong_size_ephemeral_key_34_bytes_", shared_secret_32(), INFO_V1, None);
-		let short_secret_result =
-			ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, Secret::from(b"short".to_vec()), INFO_V1, None);
-		let long_secret_result = ecies_kdf::<HkdfSha3_256>(
-			EPHEMERAL_PUBKEY_33,
-			Secret::from(b"shared_secret_that_is_too_long____".to_vec()),
-			INFO_V1,
-			None,
-		);
+	fn a_shared_secret_of_the_wrong_length_is_refused() {
+		let short = EcdhSecret::try_from(SecretSlice::from(b"short".to_vec()));
+		let long = EcdhSecret::try_from(SecretSlice::from(b"shared_secret_that_is_too_long____".to_vec()));
+		assert!(matches!(short, Err(KdfError::InvalidSharedSecretLength(5))));
+		assert!(matches!(long, Err(KdfError::InvalidSharedSecretLength(34))));
+	}
 
-		// Invalid public key lengths
-		assert_kdf_error!(short_pubkey_result, InvalidPublicKeyLength(5));
-		assert_kdf_error!(wrong_size_pubkey_result, InvalidPublicKeyLength(34));
-		// Invalid shared secret lengths
-		assert_kdf_error!(short_secret_result, InvalidSharedSecretLength(5));
-		assert_kdf_error!(long_secret_result, InvalidSharedSecretLength(34));
+	// A separator byte string let a caller shift the boundary between the two
+	// parts, so distinct inputs concatenated to one SharedInfo and derived one
+	// key. Length framing must keep them apart.
+	#[test]
+	fn a_shifted_context_boundary_derives_a_different_key() -> crate::error::Result<()> {
+		let mut shifted_into_info = INFO_V1.to_vec();
+		shifted_into_info.extend_from_slice(b"|epk|AAAA");
 
+		let in_pubkey = ecies_kdf::<HkdfSha3_256>(b"AAAA|epk|BBBB", shared_secret_32(), INFO_V1, None)?;
+		let in_info = ecies_kdf::<HkdfSha3_256>(b"BBBB", shared_secret_32(), &shifted_into_info, None)?;
+		assert_ne!(in_pubkey[..], in_info[..]);
 		Ok(())
+	}
+
+	// A salt shorter than the floor is refused, so a derivation never runs
+	// with weak salt entropy.
+	#[test]
+	fn a_short_salt_is_refused() {
+		let result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(b"short"));
+		assert!(matches!(result, Err(KdfError::InvalidSaltLength(5))));
 	}
 
 	// Consolidated test for general-purpose HKDF
@@ -683,6 +678,7 @@ mod tests {
 
 		// Maximum allowed size should work
 		assert!(max_size_result.is_ok());
+
 		let (k_enc, k_mac) = max_size_result?;
 		assert_key_pair_lengths!(k_enc, k_mac, 64);
 
@@ -760,7 +756,6 @@ mod tests {
 			.map_err(KdfError::DerivationFailed)?;
 
 		let (k_enc, k_mac) = HkdfSha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, Some(SALT))?;
-
 		assert_eq!(k_enc[..], expected[..32]);
 		assert_eq!(k_mac[..], expected[32..]);
 		Ok(())
@@ -770,9 +765,7 @@ mod tests {
 	#[test]
 	fn an_x963_dual_key_pair_is_one_expansion_split_in_half() -> crate::error::Result<()> {
 		let expected = X963Sha3_256::derive_dynamic_key(b"ikm", INFO_V1, None, 64)?;
-
 		let (k_enc, k_mac) = X963Sha3_256::derive_dual_keys::<32>(b"ikm", INFO_V1, None)?;
-
 		assert_eq!(k_enc[..], expected[..32]);
 		assert_eq!(k_mac[..], expected[32..]);
 		Ok(())
@@ -781,7 +774,6 @@ mod tests {
 	#[test]
 	fn a_dual_key_below_the_minimum_size_is_refused() {
 		let result = X963Sha3_256::derive_dual_keys::<8>(b"ikm", INFO_V1, None);
-
 		assert!(matches!(result, Err(KdfError::DerivationFailed(_))));
 	}
 }

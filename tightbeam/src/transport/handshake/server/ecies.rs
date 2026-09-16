@@ -24,13 +24,13 @@ use crate::crypto::aead::{Aead, AeadCore, KeyInit, Nonce, Payload, SessionKeys};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::ecies::EciesError;
 use crate::crypto::ecies::EciesMessageOps;
-use crate::crypto::kdf::ecies_kdf;
+use crate::crypto::kdf::{ecies_kdf, EcdhSecret};
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::{PrehashVerifier, SignatureEncoding};
+use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
@@ -540,7 +540,8 @@ where
 
 		// Use KeyProvider to perform ECDH. The shared secret arrives already
 		// wrapped in SecretSlice.
-		let shared_secret = self.server_key_provider.key_agreement(&ephemeral_pubkey).await?;
+		let agreed = self.server_key_provider.key_agreement(&ephemeral_pubkey).await?;
+		let shared_secret = EcdhSecret::try_from(agreed)?;
 		// Derive encryption key using the negotiated KDF.
 		let k_enc = ecies_kdf::<P::Kdf>(&ephemeral_pubkey, shared_secret, TIGHTBEAM_ECIES_KDF_INFO, None)?;
 
@@ -1215,14 +1216,13 @@ mod tests {
 
 		let stored_client_random = server.client_random.ok_or(HandshakeError::InvalidState)?;
 		let base_session_key = generate_nonce::<32>(None)?;
-
 		let payload = EciesSessionPayload {
 			base_key: OctetString::new(base_session_key)?,
 			client_random: OctetString::new(stored_client_random)?,
 			receipt_ack: None,
 		};
-		let plaintext = payload.to_der()?;
 
+		let plaintext = payload.to_der()?;
 		let aad = Some(server.aad_domain_tag);
 		let encrypted_message = encrypt::<_, _, _, Secp256k1EciesMessage, P::Kdf, P::AeadCipher>(
 			&server_pubkey,
@@ -1230,8 +1230,8 @@ mod tests {
 			aad,
 			Some(&mut OsRng),
 		)?;
-		let encrypted_bytes = encrypted_message.to_bytes();
 
+		let encrypted_bytes = encrypted_message.to_bytes();
 		let transcript_hash = server.transcript_hash().ok_or(HandshakeError::InvalidState)?;
 		let cert_der = client.certificate.to_der()?;
 		let auth_digest = match override_digest {
@@ -1241,7 +1241,6 @@ mod tests {
 
 		let provider = Secp256k1KeyProvider::from(client.signing_key.to_owned());
 		let signature = provider.sign_prehash(&auth_digest).await?;
-
 		let client_kex = ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
 			client_certificate: Some(client.certificate.to_owned()),

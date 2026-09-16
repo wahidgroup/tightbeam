@@ -584,17 +584,18 @@ Message Integrity (MI) and Frame Integrity (FI) bind different byte ranges. Rece
 
 ##### Optional Hiding Commitment (Salt)
 
-By default, MI is the bare digest `H(message)`. That digest is binding. It is not hiding. The digest travels in cleartext metadata. If the body has low entropy, an attacker who sees the digest MAY brute-force candidate preimages. Encrypting the body does not remove that risk by itself.
+By default, MI is a plain-mode commitment over the body. That commitment is binding. It is not hiding. The digest travels in cleartext metadata. If the body has low entropy, an attacker who sees the digest MAY brute-force candidate preimages. Encrypting the body does not remove that risk by itself.
 
 An application MAY store a hiding commitment in the same `Metadata.integrity` field. The commitment salts the body with a secret, high-entropy blinding value.
 
 **Commitment formula**
 
-`H(len(salt) || salt || DER(message))`
+`H(0x01 || len(salt) || salt || DER(message))` when hiding, and `H(0x00 || DER(message))` when not.
 
 - `len(salt)` is an 8-byte big-endian integer.
 - Distinct `(salt, message)` pairs cannot collide under concatenation ambiguity.
-- An empty salt is treated as the plain digest `H(message)`.
+- The leading mode byte separates the two forms, so neither verifies as the other, and neither equals `H(DER(message))`.
+- A salt MUST be empty or at least 16 bytes. A shorter salt is refused, because it would not hide the body.
 - Callers use `Opening::prove` and `Opening::verify`.
 - Disclosing `(salt, message)` proves the committed content in constant time.
 - The pattern matches the salted-hash disclose-then-verify construction in SD-JWT ([RFC 9901][rfc9901]) and ISO mdoc ([ISO/IEC 18013-5][iso-18013-5]).
@@ -603,12 +604,12 @@ An application MAY store a hiding commitment in the same `Metadata.integrity` fi
 
 The salt is not a tightbeam responsibility. tightbeam does not generate, encrypt, store, or transmit the salt.
 
-| Concern                 | Owner                              |
-| ----------------------- | ---------------------------------- |
-| Salt entropy            | Caller MUST provide it.            |
-| Opening retention       | Caller MUST decide where it lives. |
-| Disclosure              | Caller MUST control it.            |
-| Self-contained envelope | Caller MUST define it when needed. |
+| Concern                 | Owner                                  |
+| ----------------------- | -------------------------------------- |
+| Salt entropy            | Caller MUST provide at least 16 bytes. |
+| Opening retention       | Caller MUST decide where it lives.     |
+| Disclosure              | Caller MUST control it.                |
+| Self-contained envelope | Caller MUST define it when needed.     |
 
 One example of a caller-defined envelope is a credential that carries an encrypted salt beside the body for later selective disclosure.
 

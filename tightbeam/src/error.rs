@@ -372,6 +372,11 @@ pub enum TightBeamError {
 	#[error("Invalid AEAD nonce length: {0}")]
 	InvalidNonceLength(ReceivedExpectedError<usize, usize>),
 
+	/// Commitment salt shorter than the hiding floor
+	#[cfg(feature = "digest")]
+	#[error("Invalid commitment salt length: {0}")]
+	InvalidSaltLength(ReceivedExpectedError<usize, usize>),
+
 	/// Send-direction AEAD counter nonce space exhausted
 	#[cfg(feature = "aead")]
 	#[error("AEAD counter nonce space exhausted")]

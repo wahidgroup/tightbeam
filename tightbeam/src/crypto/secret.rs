@@ -2,7 +2,8 @@
 //!
 //! A minimal secret wrapper providing:
 //! - Strict ownership (no Clone/Copy)
-//! - Explicit access via ExposeSecret/ExposeSecretMut
+//! - Borrowed access through [`Secret::with`], and owned access through
+//!   [`ToInsecure::to_insecure`], which hands back a wiping buffer
 //! - Zeroize on drop for the inner value
 //! - Blanket `From<T>` for ergonomic construction
 #![forbid(unsafe_code)]
@@ -14,7 +15,7 @@ use core::{any, fmt};
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::der::{self, Decode, Encode, FixedTag};
-use crate::zeroize::{Zeroize, ZeroizeOnDrop};
+use crate::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::Errorizable;
 
 /// Error returned by [`Secret`] accessors when the wrapped value is
@@ -110,6 +111,26 @@ where
 	}
 }
 
+impl<T> SecretSlice<T>
+where
+	T: Zeroize,
+	[T]: Zeroize,
+{
+	/// Take ownership of the buffer, moving the allocation.
+	///
+	/// [`ToInsecure::to_insecure`] hands back a wiping buffer that cannot
+	/// release what it holds, so a caller who must own the bytes copies them
+	/// out of it. This moves the allocation instead and transfers the duty to
+	/// wipe it. Reach for it only where the copy is the thing being avoided.
+	///
+	/// # Errors
+	///
+	/// - [`SecretError::Unavailable`] when the secret was already taken.
+	pub fn into_boxed_slice(mut self) -> Result<Box<[T]>, SecretError> {
+		self.inner.take().ok_or(SecretError::Unavailable)
+	}
+}
+
 /// Secret string alias (owns `Box<str>`)
 pub type SecretString = Secret<str>;
 
@@ -133,22 +154,36 @@ impl FromStr for SecretString {
 	}
 }
 
-/// Convert a Secret into its raw underlying type (consumes the Secret).
+/// Move a secret out of its [`Secret`] wrapper, consuming the wrapper.
 ///
-/// - For sized inner types `S`, `to_insecure()` returns `S` by value.
+/// The value still holds key material, so it comes back in a [`Zeroizing`]
+/// buffer that wipes when it drops. [`Zeroizing`] dereferences to the value,
+/// so a caller reads, encodes, and sends it as it would the raw form. A copy
+/// that outlives the buffer, such as one an FFI boundary demands, is an
+/// explicit copy out of it.
+///
+/// - For sized inner types `S`, `to_insecure()` returns `Zeroizing<S>`.
 /// - For dynamically sized inner types like `[T]` and `str`, it returns a
-///   `Box<[T]>` or `Box<str>`.
+///   `Zeroizing<Box<[T]>>` or `Zeroizing<Box<str>>`.
 pub trait ToInsecure {
-	type Raw;
+	/// The wiping buffer that carries the exposed secret.
+	type Raw: ZeroizeOnDrop;
+
+	/// Take the secret out of its wrapper.
+	///
+	/// # Errors
+	///
+	/// - [`SecretError::Unavailable`] when the secret was already taken.
 	fn to_insecure(self) -> Result<Self::Raw, SecretError>;
 }
 
 impl<S: Zeroize> ToInsecure for Secret<S> {
-	type Raw = S;
-	fn to_insecure(self) -> Result<S, SecretError> {
+	type Raw = Zeroizing<S>;
+
+	fn to_insecure(self) -> Result<Self::Raw, SecretError> {
 		let mut this = self;
 		match this.inner.take() {
-			Some(inner_box) => Ok(*inner_box),
+			Some(inner_box) => Ok(Zeroizing::new(*inner_box)),
 			None => Err(SecretError::Unavailable),
 		}
 	}
@@ -159,24 +194,24 @@ where
 	T: Zeroize,
 	[T]: Zeroize,
 {
-	type Raw = Box<[T]>;
+	type Raw = Zeroizing<Box<[T]>>;
 
-	fn to_insecure(self) -> Result<Box<[T]>, SecretError> {
+	fn to_insecure(self) -> Result<Self::Raw, SecretError> {
 		let mut this = self;
 		match this.inner.take() {
-			Some(inner) => Ok(inner),
+			Some(inner) => Ok(Zeroizing::new(inner)),
 			None => Err(SecretError::Unavailable),
 		}
 	}
 }
 
 impl ToInsecure for Secret<str> {
-	type Raw = Box<str>;
+	type Raw = Zeroizing<Box<str>>;
 
-	fn to_insecure(self) -> Result<Box<str>, SecretError> {
+	fn to_insecure(self) -> Result<Self::Raw, SecretError> {
 		let mut this = self;
 		match this.inner.take() {
-			Some(inner) => Ok(inner),
+			Some(inner) => Ok(Zeroizing::new(inner)),
 			None => Err(SecretError::Unavailable),
 		}
 	}
@@ -189,7 +224,7 @@ mod tests {
 	#[test]
 	fn test_secret_string_from_str() -> Result<(), Box<dyn std::error::Error>> {
 		let s = SecretString::from_str("test")?;
-		assert_eq!(s.to_insecure()?, "test".into());
+		assert_eq!(&**s.to_insecure()?, "test");
 		Ok(())
 	}
 
@@ -197,20 +232,32 @@ mod tests {
 	fn test_to_insecure_sized() -> Result<(), Box<dyn std::error::Error>> {
 		let s: Secret<[u8; 2]> = Secret::from([1u8, 2u8]);
 		let raw = s.to_insecure()?;
-		assert_eq!(raw, [1, 2]);
+		assert_eq!(*raw, [1, 2]);
 		Ok(())
 	}
 
 	#[test]
 	fn test_to_insecure_dsts() -> Result<(), Box<dyn std::error::Error>> {
 		let s: SecretString = SecretString::from("abc");
-		let raw: Box<str> = s.to_insecure()?;
-		assert_eq!(&*raw, "abc");
+		let raw = s.to_insecure()?;
+		assert_eq!(&**raw, "abc");
 
 		let s2: SecretSlice<u8> = Vec::from([9u8, 8u8, 7u8]).into();
-		let raw2: Box<[u8]> = s2.to_insecure()?;
-		assert_eq!(&*raw2, &[9, 8, 7]);
+		let raw2 = s2.to_insecure()?;
+		assert_eq!(&**raw2, &[9, 8, 7]);
 		Ok(())
+	}
+
+	/// A type whose values wipe when they drop.
+	fn assert_wipes_on_drop<T: ZeroizeOnDrop>() {}
+
+	// An exposed secret still owns key material, so the value it hands back
+	// wipes when it drops.
+	#[test]
+	fn an_exposed_secret_wipes_on_drop() {
+		assert_wipes_on_drop::<<Secret<[u8; 2]> as ToInsecure>::Raw>();
+		assert_wipes_on_drop::<<SecretSlice<u8> as ToInsecure>::Raw>();
+		assert_wipes_on_drop::<<SecretString as ToInsecure>::Raw>();
 	}
 
 	#[test]
@@ -220,7 +267,7 @@ mod tests {
 		assert_eq!(len, 6);
 
 		let raw = s.to_insecure()?;
-		assert_eq!(&*raw, "abcdef");
+		assert_eq!(&**raw, "abcdef");
 		Ok(())
 	}
 }

@@ -82,7 +82,7 @@ mod common {
 #[cfg(any(feature = "signature", feature = "aead"))]
 use common::*;
 
-#[cfg(feature = "signature")]
+#[cfg(any(feature = "signature", feature = "aead"))]
 use crate::crypto::secret::SecretSlice;
 
 // =============================================================================
@@ -543,12 +543,12 @@ pub trait EncryptingKeyProvider: Send + Sync + Debug {
 	///
 	/// # Returns
 	///
-	/// Decrypted plaintext bytes.
+	/// The plaintext, which wipes when it drops.
 	fn decrypt(
 		&self,
 		nonce: &[u8],
 		ciphertext: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
+	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>>;
 }
 
 // =============================================================================
@@ -633,7 +633,7 @@ where
 		&self,
 		nonce: &[u8],
 		ciphertext: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
 		let nonce_size = <<A as AeadCore>::NonceSize as Unsigned>::USIZE;
 		let received_len = nonce.len();
 		if received_len != nonce_size {
@@ -646,7 +646,11 @@ where
 		}
 
 		let nonce_ref = Nonce::<A>::from_slice(nonce);
-		let result = self.cipher.decrypt(nonce_ref, ciphertext).map_err(KeyError::from);
+		let result = self
+			.cipher
+			.decrypt(nonce_ref, ciphertext)
+			.map(SecretSlice::from)
+			.map_err(KeyError::from);
 		Box::pin(async move { result })
 	}
 }
@@ -672,7 +676,7 @@ where
 		&self,
 		nonce: &[u8],
 		ciphertext: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
 		self.as_ref().decrypt(nonce, ciphertext)
 	}
 }
