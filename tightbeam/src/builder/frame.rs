@@ -23,6 +23,8 @@ use crate::compress::Compressor;
 #[cfg(feature = "aead")]
 use crate::crypto::aead::{AeadAlgorithm, Encryptor};
 #[cfg(feature = "digest")]
+use crate::crypto::commitment::{commit_digest, CommitmentSalt};
+#[cfg(feature = "digest")]
 use crate::crypto::hash::Digest;
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::crypto::profiles::SecurityProfile;
@@ -407,7 +409,18 @@ impl<T: Message> FrameBuilder<T> {
 impl<T: Message> FrameBuilder<T> {
 	/// Commit to the message body using the specified digest algorithm.
 	///
-	/// Computes `H(salt || DER(message))` and stores it as the integrity value.
+	/// Stores the commitment in the metadata integrity field. A salt of at
+	/// least [`MIN_SALT_SIZE`] bytes hides the body, and an empty salt commits
+	/// in plain-digest mode. [`crate::crypto::commitment`] owns the preimage.
+	///
+	/// A rejected salt or algorithm is recorded and surfaces from
+	/// [`FrameBuilder::build`]:
+	///
+	/// - [`TightBeamError::InvalidSaltLength`] when a non-empty salt is too short to hide the body.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when `D` is not the digest the message profile names.
+	/// - [`TightBeamError::InvalidBody`] when no message is set.
+	///
+	/// [`MIN_SALT_SIZE`]: crate::constants::MIN_SALT_SIZE
 	pub fn with_message_hasher<D>(mut self, salt: impl AsRef<[u8]>) -> Self
 	where
 		D: Digest + AssociatedOid,
@@ -440,7 +453,15 @@ impl<T: Message> FrameBuilder<T> {
 			}
 		};
 
-		match crate::crypto::commitment::commit_digest::<D>(salt.as_ref(), &encoded) {
+		let salt = match CommitmentSalt::parse(salt) {
+			Ok(salt) => salt,
+			Err(e) => {
+				self.errors.push(e);
+				return self;
+			}
+		};
+
+		match commit_digest::<D>(&salt, &encoded) {
 			Ok(hash_info) => {
 				self.metadata_builder = self.metadata_builder.with_integrity_info(hash_info);
 			}
@@ -868,12 +889,9 @@ mod tests {
 			assert!(tightbeam.metadata().matrix().is_none()); // Matrix is V3+ only
 			assert!(tightbeam.integrity().is_some());
 			assert!(tightbeam.nonrepudiation().is_some());
-
-			// Verify Message Integrity (MI): compute hash over original message and compare
-			let message_der = crate::encode(&message)?;
-			let expected_mi = crate::utils::digest::<Sha3_256>(&message_der)?;
-			let actual_mi = tightbeam.metadata().integrity().ok_or(TightBeamError::MissingDigestInfo)?;
-			assert_eq!(actual_mi.digest.as_bytes(), expected_mi.digest.as_bytes());
+			// Verify Message Integrity (MI): re-prove the commitment over the
+			// original message and compare.
+			assert!(tightbeam.verify_commitment_of::<Sha3_256, _>(&message, [])?);
 
 			// Verify Frame Integrity (FI): compute hash over envelope (version + metadata) and compare
 			let scaffold = crate::frame::FrameIntegrityScaffold {

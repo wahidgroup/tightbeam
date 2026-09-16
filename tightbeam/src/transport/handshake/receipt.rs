@@ -45,6 +45,8 @@ use core::fmt;
 
 use crate::asn1::DigestInfo;
 use crate::cms::signed_data::SignedData;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::hash::ConstantTimeDigest;
 use crate::der::asn1::OctetString;
 use crate::der::Sequence;
 use crate::transport::handshake::negotiation::MuxBudgets;
@@ -781,7 +783,9 @@ where
 
 	let credit_unit = accept_credit_unit.ok_or(HandshakeError::ReceiptMismatch)?;
 	let expected_hash = transcript_digest_info::<D>(*transcript_hash)?;
-	let transcript_matches = receipt.transcript_hash == expected_hash;
+	let algorithm_matches = receipt.transcript_hash.algorithm == expected_hash.algorithm;
+
+	let transcript_matches = algorithm_matches && receipt.transcript_hash.digest_matches(&expected_hash);
 	let budgets_match = receipt.budgets == granted_budgets;
 	let credit_unit_matches = receipt.credit_unit == credit_unit;
 	if !transcript_matches || !budgets_match || !credit_unit_matches {

@@ -38,6 +38,7 @@ x509-cert = { workspace = true, optional = true }
 hex-literal = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 elliptic-curve = { workspace = true }
+subtle = { workspace = true, optional = true }
 crypto-common = { workspace = true, optional = true }
 aead = { workspace = true, optional = true }
 signature = { workspace = true, optional = true }
@@ -124,7 +125,7 @@ full = [
 
 # Core features
 constants = ["hex"]
-crypto = ["random", "dep:crypto-common", "zeroize"]
+crypto = ["random", "dep:crypto-common", "dep:subtle", "zeroize"]
 builder = ["x509-cert/builder", "crypto"]
 policy = []
 router = []
@@ -255,6 +256,7 @@ std = [
 	"spki/std",
 	"cms/std",
 	"x509-cert/std",
+	"subtle?/std",
 	"kem?/std",
 	"crypto-common?/std",
 	"zeroize?/std",

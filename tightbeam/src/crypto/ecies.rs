@@ -37,13 +37,15 @@ use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::constants::{AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ECIES_KDF_INFO};
+use crate::constants::{
+	AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, ECDH_SHARED_SECRET_SIZE, EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ECIES_KDF_INFO,
+};
 use crate::crypto::aead::{Aead, AeadCore, Key, KeyInit, Nonce, Payload};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::k256::ecdh::{diffie_hellman, EphemeralSecret};
 use crate::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::k256::{PublicKey, SecretKey};
-use crate::crypto::kdf::{ecies_kdf, KdfError, KdfFunction};
+use crate::crypto::kdf::{ecies_kdf, EcdhSecret, KdfError, KdfFunction};
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::random::RngWrapper;
 
@@ -92,7 +94,7 @@ pub trait EciesSecretKeyOps: Clone {
 	fn public_key(&self) -> Self::PublicKey;
 
 	/// Perform ECDH key agreement with a public key, returning raw shared secret bytes
-	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> SecretSlice<u8>;
+	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> EcdhSecret;
 }
 
 /// Trait for ephemeral key generation in ECIES encryption
@@ -100,11 +102,12 @@ pub trait EciesEphemeral {
 	/// Associated public key type
 	type PublicKey: EciesPublicKeyOps;
 
-	/// Generate a new ephemeral keypair and return (public_key_bytes, shared_secret_bytes)
+	/// Generate a new ephemeral keypair and return its public key bytes with
+	/// the ECDH shared secret.
 	fn generate_ephemeral(
 		recipient_pubkey: &Self::PublicKey,
 		rng: &mut dyn rand_core::CryptoRngCore,
-	) -> Result<(Vec<u8>, SecretSlice<u8>)>;
+	) -> Result<(Vec<u8>, EcdhSecret)>;
 }
 
 // ============================================================================
@@ -181,10 +184,10 @@ impl EciesSecretKeyOps for SecretKey {
 		SecretKey::public_key(self)
 	}
 
-	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> SecretSlice<u8> {
+	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> EcdhSecret {
 		let shared_secret = diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
-		let v = shared_secret.raw_secret_bytes().to_vec().into_boxed_slice();
-		Secret::from(v)
+		let bytes: [u8; ECDH_SHARED_SECRET_SIZE] = (*shared_secret.raw_secret_bytes()).into();
+		Secret::from(bytes)
 	}
 }
 
@@ -210,7 +213,7 @@ impl EciesEphemeral for SecretKey {
 	fn generate_ephemeral(
 		recipient_pubkey: &Self::PublicKey,
 		rng: &mut dyn CryptoRngCore,
-	) -> Result<(Vec<u8>, SecretSlice<u8>)> {
+	) -> Result<(Vec<u8>, EcdhSecret)> {
 		let mut wrapper = RngWrapper(rng);
 		let ephemeral_secret = EphemeralSecret::random(&mut wrapper);
 		let ephemeral_pubkey = ephemeral_secret.public_key();
@@ -220,8 +223,8 @@ impl EciesEphemeral for SecretKey {
 
 		let ephemeral_point = ephemeral_pubkey.to_encoded_point(true);
 		let ephemeral_bytes = ephemeral_point.as_bytes().to_vec();
-		let shared_bytes = Secret::from(shared_secret.raw_secret_bytes().to_vec().into_boxed_slice());
-		Ok((ephemeral_bytes, shared_bytes))
+		let shared_bytes: [u8; ECDH_SHARED_SECRET_SIZE] = (*shared_secret.raw_secret_bytes()).into();
+		Ok((ephemeral_bytes, Secret::from(shared_bytes)))
 	}
 }
 
@@ -427,7 +430,7 @@ where
 /// pass it here for key derivation and AEAD opening.
 pub fn decrypt_with_shared_secret<M, K, A>(
 	message: &M,
-	shared_secret: SecretSlice<u8>,
+	shared_secret: EcdhSecret,
 	associated_data: Option<&[u8]>,
 ) -> Result<SecretSlice<u8>>
 where
@@ -606,14 +609,14 @@ impl crate::crypto::aead::Decryptor for EciesDecryptor {
 /// and AES-256-GCM suite that [`EciesSecp256k1Oid`] names.
 #[cfg(feature = "x509")]
 pub struct EciesSharedSecretDecryptor {
-	shared_secret: SecretSlice<u8>,
+	shared_secret: EcdhSecret,
 }
 
 #[cfg(feature = "x509")]
 impl EciesSharedSecretDecryptor {
 	/// Build a decryptor from a precomputed ECDH shared secret.
-	pub fn new(shared_secret: impl Into<SecretSlice<u8>>) -> Self {
-		Self { shared_secret: shared_secret.into() }
+	pub fn new(shared_secret: EcdhSecret) -> Self {
+		Self { shared_secret }
 	}
 }
 
@@ -632,7 +635,7 @@ impl crate::crypto::aead::Decryptor for EciesSharedSecretDecryptor {
 			.as_bytes();
 
 		let ecies_msg = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
-		let shared_secret = self.shared_secret.with(|bytes| SecretSlice::from(bytes.to_vec()))?;
+		let shared_secret = self.shared_secret.with(|bytes| Secret::from(*bytes))?;
 		Ok(decrypt_with_shared_secret::<Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
 			&ecies_msg,
 			shared_secret,
@@ -755,7 +758,6 @@ mod tests {
 	#[test]
 	fn test_security_properties() -> Result<()> {
 		let plaintext = b"Sensitive data";
-
 		// Wrong recipient cannot decrypt
 		let (_, public1) = keypair();
 		let (secret2, _) = keypair();
@@ -825,7 +827,6 @@ mod tests {
 		// Invalid key formats
 		assert!(PublicKey::from_bytes([0xFFu8; 33]).is_err());
 		assert!(SecretKey::try_from(Secret::from(vec![0x00u8; 32].into_boxed_slice())).is_err());
-
 		Ok(())
 	}
 
@@ -852,7 +853,7 @@ mod tests {
 		let shared = provider.key_agreement(epk).await?;
 
 		// Open via the standard Decryptor (what Frame::decrypt_bytes calls).
-		let decryptor = EciesSharedSecretDecryptor::new(shared);
+		let decryptor = EciesSharedSecretDecryptor::new(EcdhSecret::try_from(shared)?);
 		let opened = decryptor.decrypt_content(&info)?.to_insecure()?;
 		assert_eq!(
 			&opened[..],

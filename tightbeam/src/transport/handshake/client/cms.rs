@@ -14,10 +14,11 @@ use crate::crypto::aead::{KeyInit, SessionKeys};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
-use crate::crypto::secret::Secret;
+use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
 use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier};
+use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::utils::{compute_signer_identifier, compute_signer_identifier_from_der};
@@ -120,7 +121,7 @@ where
 	server_chain: Option<ServerChain>,
 	transcript_hash: Option<[u8; 32]>,
 	transcript_buffer: Vec<u8>,
-	session_key: Option<Secret<Vec<u8>>>,
+	session_key: Option<SecretSlice<u8>>,
 	security_offer: Option<SecurityOffer>,
 	strength_floor: StrengthFloor,
 	transport_offer: Option<TransportOffer>,
@@ -420,10 +421,12 @@ where
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
 
 		let expected_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
-		if verified_content.len() != 32 || verified_content.as_slice() != expected_hash {
-			Err(HandshakeError::SignatureVerificationFailed)
-		} else {
+
+		let transcript_matches: bool = verified_content.as_slice().ct_eq(&expected_hash[..]).into();
+		if transcript_matches {
 			Ok(verified_content)
+		} else {
+			Err(HandshakeError::SignatureVerificationFailed)
 		}
 	}
 
@@ -696,7 +699,7 @@ where
 	/// Get the session key (if available).
 	///
 	/// Returns a reference to the Secret-wrapped session key bytes.
-	pub fn session_key(&self) -> Option<&Secret<Vec<u8>>> {
+	pub fn session_key(&self) -> Option<&SecretSlice<u8>> {
 		self.session_key.as_ref()
 	}
 
@@ -873,7 +876,7 @@ where
 		// Store session key and transition state
 		// `Zeroizing` holds its buffer to the end of the scope, so the key
 		// reaches its long-term owner as a copy. Both buffers wipe.
-		self.session_key = Some(Secret::from(session_key.to_vec()));
+		self.session_key = Some(SecretSlice::from(session_key.to_vec()));
 		// Transition directly from Init -> KeyExchangeSent (CMS path) or HelloSent -> KeyExchangeSent
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
@@ -1367,7 +1370,6 @@ mod tests {
 			Err(HandshakeError::NegotiationError(NegotiationError::BelowStrengthFloor))
 		));
 		assert_eq!(client.selected_profile(), None);
-
 		Ok(())
 	}
 
@@ -1378,7 +1380,6 @@ mod tests {
 		use crate::transport::handshake::negotiation::NegotiationError;
 
 		let foreign = SecurityProfileDesc { aead: Some(crate::oids::AES_128_GCM), ..create_default_test_profile() };
-
 		let mut client = TestCmsClientBuilder::new().build()?;
 		let result = client.apply_security_accept(Some(SecurityAccept::new(foreign)));
 		assert!(matches!(
@@ -1386,7 +1387,6 @@ mod tests {
 			Err(HandshakeError::NegotiationError(NegotiationError::UnrunnableProfile))
 		));
 		assert_eq!(client.selected_profile(), None);
-
 		Ok(())
 	}
 }

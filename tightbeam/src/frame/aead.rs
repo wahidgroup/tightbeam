@@ -5,7 +5,7 @@ use crate::asn1::OctetString;
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::{CheckedContent, DecryptContent, Decryptor};
 use crate::crypto::key::EncryptingKeyProvider;
-use crate::crypto::secret::{SecretSlice, ToInsecure};
+use crate::crypto::secret::SecretSlice;
 use crate::der::Any;
 use crate::error::Result;
 use crate::spki::AlgorithmIdentifierOwned;
@@ -22,8 +22,11 @@ impl Frame {
 	/// # Returns
 	/// The decrypted plaintext as a [`SecretSlice`] that zeroizes on drop. If
 	/// the frame was compressed, these bytes are still compressed and need to
-	/// be decompressed separately. Callers that need a raw copy opt out
-	/// explicitly via [`ToInsecure`].
+	/// be decompressed separately. A caller who must own the bytes opts out
+	/// explicitly, through [`ToInsecure::to_insecure`] for a buffer that still
+	/// wipes, or [`SecretSlice::into_boxed_slice`] to take the allocation.
+	///
+	/// [`ToInsecure::to_insecure`]: crate::crypto::secret::ToInsecure::to_insecure
 	///
 	/// # Errors
 	/// Returns an error if:
@@ -111,10 +114,13 @@ impl Frame {
 		encrypted.encrypted_content = Some(OctetString::new(core::mem::take(&mut self.message))?);
 
 		let body = decryptor.decrypt_content(&encrypted).and_then(|plaintext| {
-			let plaintext = plaintext.to_insecure()?.into_vec();
+			// The frame owns its cleartext body once it is decrypted, so the
+			// buffer moves here. Exposing it as a wiping buffer instead would
+			// copy the whole body into the frame and leave the copy unwiped.
+			let plaintext = plaintext.into_boxed_slice()?;
 			match inflator {
 				Some(inflator) => inflator.decompress(&plaintext),
-				None => Ok(plaintext),
+				None => Ok(plaintext.into_vec()),
 			}
 		});
 
@@ -221,8 +227,10 @@ impl Frame {
 
 		let nonce_octet_string: OctetString = nonce_any.decode_as()?;
 		let nonce = nonce_octet_string.as_bytes();
+		// The frame owns its cleartext body once it is decrypted, so the
+		// buffer moves rather than being copied out of a wiping wrapper.
 		let plaintext = provider.decrypt(nonce, &self.message).await?;
-		self.message = plaintext;
+		self.message = plaintext.into_boxed_slice()?.into_vec();
 		self.metadata.confidentiality = None;
 
 		Ok(())

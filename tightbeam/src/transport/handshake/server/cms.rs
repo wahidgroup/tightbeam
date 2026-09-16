@@ -24,10 +24,11 @@ use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
-use crate::crypto::secret::{Secret, ToInsecure};
+use crate::crypto::secret::{SecretSlice, ToInsecure};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::{EcdsaSignatureVerifier, PrehashVerifier, SignatureAlgorithmIdentifier, Verifier};
+use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::{compute_signer_identifier, compute_signer_identifier_from_der};
 use crate::der::asn1::{OctetString, SetOfVec};
@@ -62,7 +63,6 @@ use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, 
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::Certificate;
-use crate::zeroize::Zeroizing;
 
 /// Server-side CMS handshake orchestrator.
 ///
@@ -86,7 +86,7 @@ where
 	validated_client_cert: Option<Arc<Certificate>>,
 	transcript_hash: Option<[u8; 32]>,
 	transcript_buffer: Vec<u8>,
-	session_key: Option<Secret<Vec<u8>>>,
+	session_key: Option<SecretSlice<u8>>,
 	supported_profiles: Vec<SecurityProfileDesc>,
 	strength_floor: StrengthFloor,
 	selected_profile: Option<RunnableProfile<P>>,
@@ -368,22 +368,21 @@ where
 
 		let processor = TightBeamSignedDataProcessor::new(verifier);
 		let digest_oid = P::Digest::OID;
-
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
 		let expected_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
-		if verified_content.len() != 32 || verified_content.as_slice() != expected_hash {
-			Err(HandshakeError::SignatureVerificationFailed)
-		} else {
+
+		let transcript_matches: bool = verified_content.as_slice().ct_eq(&expected_hash[..]).into();
+		if transcript_matches {
 			Ok(verified_content)
+		} else {
+			Err(HandshakeError::SignatureVerificationFailed)
 		}
 	}
 
 	/// Decrypt the session key from EnvelopedData and store it securely.
 	async fn decrypt_session_key(&mut self, enveloped_data_der: impl AsRef<[u8]>) -> Result<(), HandshakeError> {
 		let enveloped_data_der = enveloped_data_der.as_ref();
-		let session_key_bytes = self.decrypt_enveloped_content(enveloped_data_der).await?;
-		self.session_key = Some(Secret::from(session_key_bytes));
-
+		self.session_key = Some(self.decrypt_enveloped_content(enveloped_data_der).await?);
 		Ok(())
 	}
 
@@ -392,7 +391,10 @@ where
 	///
 	/// Shared by the key exchange and the confidential settlement answer
 	/// carried in the client Finished.
-	async fn decrypt_enveloped_content(&self, enveloped_data_der: impl AsRef<[u8]>) -> Result<Vec<u8>, HandshakeError> {
+	async fn decrypt_enveloped_content(
+		&self,
+		enveloped_data_der: impl AsRef<[u8]>,
+	) -> Result<SecretSlice<u8>, HandshakeError> {
 		let enveloped_data_der = enveloped_data_der.as_ref();
 		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 		let kari = enveloped_data
@@ -437,10 +439,7 @@ where
 			expected: <P::AeadCipher as KeySizeUser>::KeySize::USIZE,
 			received: cek.len(),
 		})?;
-
-		// Re-box the plaintext. The inner buffer moves, no copy is left behind.
-		let content_bytes = cipher.decrypt_content(&enveloped_data.encrypted_content)?;
-		Ok(content_bytes.to_insecure()?.into_vec())
+		Ok(cipher.decrypt_content(&enveloped_data.encrypted_content)?)
 	}
 
 	/// Process KeyExchange message (EnvelopedData with KARI containing session key).
@@ -818,7 +817,7 @@ where
 		// a bearer secret: the plaintext is wiped when the buffer drops.
 		let receipt_ack = match extract_receipt_ack_envelope(signed_data_der)? {
 			Some(envelope) => {
-				let plaintext = Zeroizing::new(self.decrypt_enveloped_content(envelope.as_bytes()).await?);
+				let plaintext = self.decrypt_enveloped_content(envelope.as_bytes()).await?.to_insecure()?;
 				Some(SignerInfo::from_der(&plaintext)?)
 			}
 			None => None,
@@ -895,7 +894,7 @@ where
 	/// Get the session key (if available).
 	///
 	/// Returns a reference to the Secret-wrapped session key bytes.
-	pub fn session_key(&self) -> Option<&Secret<Vec<u8>>> {
+	pub fn session_key(&self) -> Option<&SecretSlice<u8>> {
 		self.session_key.as_ref()
 	}
 
