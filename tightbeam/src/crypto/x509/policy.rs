@@ -11,12 +11,9 @@ use alloc::vec::Vec;
 use crate::crypto::hash::{Digest, U32};
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::utils::CertificateExt;
+use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
 use crate::crypto::x509::Certificate;
 use crate::der::Encode;
-
-#[cfg(feature = "std")]
-use crate::crypto::x509::utils::Fingerprint;
 
 /// Trait for certificate validation strategies.
 ///
