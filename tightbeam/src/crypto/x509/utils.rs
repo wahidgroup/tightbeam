@@ -1,20 +1,119 @@
 //! X.509 certificate utility functions and helpers.
 
-#[cfg(feature = "time")]
+use core::fmt::{self, Debug, Formatter};
+use core::hash::{Hash, Hasher};
+use core::marker::PhantomData;
 use core::time::Duration;
 
 use crate::cms::signed_data::SignerIdentifier;
-use crate::crypto::hash::Digest;
+use crate::crypto::hash::{Digest, U32};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
-use crate::der::asn1::OctetString;
+use crate::crypto::x509::Certificate;
+use crate::der::asn1::{GeneralizedTime, OctetString};
 use crate::der::oid::AssociatedOid;
-use crate::der::DecodeOwned;
+use crate::der::{DecodeOwned, Encode};
 use crate::spki::EncodePublicKey;
-
-#[cfg(feature = "time")]
-use crate::der::asn1::GeneralizedTime;
 use crate::x509::certificate::{CertificateInner, Profile};
+
+/// A 32-byte certificate fingerprint bound to the digest that produced it.
+///
+/// [`Fingerprint::from_certificate`] digests the certificate DER under `D`.
+pub struct Fingerprint<D> {
+	bytes: [u8; 32],
+	_digest: PhantomData<fn() -> D>,
+}
+
+impl<D> Copy for Fingerprint<D> {}
+
+impl<D> Clone for Fingerprint<D> {
+	fn clone(&self) -> Self {
+		*self
+	}
+}
+
+impl<D> Debug for Fingerprint<D> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Fingerprint").field("bytes", &self.bytes).finish()
+	}
+}
+
+impl<D> PartialEq for Fingerprint<D> {
+	fn eq(&self, other: &Self) -> bool {
+		self.bytes == other.bytes
+	}
+}
+
+impl<D> Eq for Fingerprint<D> {}
+
+impl<D> Hash for Fingerprint<D> {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.bytes.hash(state);
+	}
+}
+
+impl<D> Fingerprint<D> {
+	/// The fingerprint bytes.
+	pub fn as_slice(&self) -> &[u8] {
+		&self.bytes
+	}
+}
+
+impl<D> Fingerprint<D>
+where
+	D: Digest<OutputSize = U32>,
+{
+	/// Digest the certificate DER and bind the result to `D`.
+	///
+	/// # Errors
+	///
+	/// - DER encode failures from the certificate
+	pub fn from_certificate(cert: &Certificate) -> Result<Self, CertificateValidationError> {
+		let der_bytes = cert.to_der()?;
+		let hash = D::digest(&der_bytes);
+
+		let mut bytes = [0u8; 32];
+		bytes.copy_from_slice(hash.as_ref());
+
+		Ok(Self { bytes, _digest: PhantomData })
+	}
+}
+
+/// The 20-byte SubjectKeyIdentifier truncation of a digest (RFC 5280).
+///
+/// [`Skid::from_digest`] takes the first 20 bytes of a digest.
+/// [`Skid::parse`] reads an exact 20-byte window already on the wire.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Skid([u8; 20]);
+
+impl Skid {
+	/// Take the SKID window from digest output.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::DigestTooShort`] when `digest` is
+	///   shorter than 20 bytes.
+	pub fn from_digest(digest: impl AsRef<[u8]>) -> Result<Self, CertificateValidationError> {
+		let digest = digest.as_ref();
+		let window = digest.get(..20).ok_or(CertificateValidationError::DigestTooShort)?;
+
+		let mut bytes = [0u8; 20];
+		bytes.copy_from_slice(window);
+
+		Ok(Self(bytes))
+	}
+
+	/// Read a SKID that is already exactly 20 bytes.
+	pub fn parse(bytes: impl AsRef<[u8]>) -> Option<Self> {
+		let bytes: &[u8; 20] = bytes.as_ref().try_into().ok()?;
+		Some(Self(*bytes))
+	}
+
+	/// The SKID bytes.
+	pub fn as_bytes(&self) -> &[u8; 20] {
+		&self.0
+	}
+}
 
 #[macro_export]
 macro_rules! pem {
@@ -47,6 +146,21 @@ pub trait CertificateExt {
 	///   carries no clock, so a higher layer owns temporal validation
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError>;
 
+	/// Validate expiry against a caller-supplied Unix timestamp.
+	///
+	/// The same comparison [`CertificateExt::validate_expiry`] runs, with
+	/// `now_unix` in place of the local clock. A path that already knows
+	/// the time, such as receipt verification, uses this so the two cannot
+	/// diverge.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError::NotYetValid`] before `not_before`
+	/// - [`CertificateValidationError::Expired`] after `not_after`
+	/// - [`CertificateValidationError::InvalidTimestamp`] when `now_unix`
+	///   does not convert to a certificate time
+	fn validate_expiry_at(&self, now_unix: u64) -> Result<(), CertificateValidationError>;
+
 	/// Raw public key bytes from the certificate's SPKI.
 	fn verifying_key_bytes(&self) -> &[u8];
 
@@ -73,14 +187,10 @@ pub trait CertificateExt {
 }
 
 impl<P: Profile> CertificateExt for CertificateInner<P> {
-	#[cfg(feature = "time")]
-	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
-		use crate::time::OffsetDateTime;
-
-		let now = OffsetDateTime::now_utc();
+	fn validate_expiry_at(&self, now_unix: u64) -> Result<(), CertificateValidationError> {
 		let not_before = self.tbs_certificate.validity.not_before.to_unix_duration();
 		let not_after = self.tbs_certificate.validity.not_after.to_unix_duration();
-		let now_duration = GeneralizedTime::from_unix_duration(Duration::from_secs(now.unix_timestamp() as u64))
+		let now_duration = GeneralizedTime::from_unix_duration(Duration::from_secs(now_unix))
 			.map_err(|_| CertificateValidationError::InvalidTimestamp)?
 			.to_unix_duration();
 
@@ -94,19 +204,25 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "std", not(feature = "time")))]
+	#[cfg(feature = "time")]
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
-		let now = std::time::SystemTime::now();
-		let not_before = self.tbs_certificate.validity.not_before.to_system_time();
-		let not_after = self.tbs_certificate.validity.not_after.to_system_time();
-		if now < not_before {
-			return Err(CertificateValidationError::NotYetValid);
-		}
-		if now > not_after {
-			return Err(CertificateValidationError::Expired);
+		use crate::time::OffsetDateTime;
+
+		let now = OffsetDateTime::now_utc().unix_timestamp();
+		if now < 0 {
+			return Err(CertificateValidationError::InvalidTimestamp);
 		}
 
-		Ok(())
+		self.validate_expiry_at(now as u64)
+	}
+
+	#[cfg(all(feature = "std", not(feature = "time")))]
+	fn validate_expiry(&self) -> Result<(), CertificateValidationError> {
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_err(|_| CertificateValidationError::InvalidTimestamp)?;
+
+		self.validate_expiry_at(now.as_secs())
 	}
 
 	#[cfg(all(not(feature = "std"), not(feature = "time")))]
@@ -186,15 +302,6 @@ where
 	compute_signer_identifier_from_der::<D>(public_key_der.as_bytes())
 }
 
-/// Borrow the 20-byte SKID truncation window from digest output (RFC 5280
-/// SKID recommendation).
-///
-/// Fails with [`CertificateValidationError::DigestTooShort`] when the
-/// configured digest produces fewer than 20 bytes.
-pub fn skid_window(digest_bytes: &[u8]) -> Result<&[u8], CertificateValidationError> {
-	digest_bytes.get(..20).ok_or(CertificateValidationError::DigestTooShort)
-}
-
 /// Compute a SubjectKeyIdentifier-based SignerIdentifier from DER-encoded public key bytes.
 ///
 /// This is the byte-based variant for use with `KeyProvider::to_public_key_bytes()`.
@@ -209,7 +316,8 @@ where
 	Digest::update(&mut hasher, public_key_der);
 
 	let digest_bytes = Digest::finalize(hasher);
-	let skid_octets = OctetString::new(skid_window(digest_bytes.as_slice())?)?;
+	let skid = Skid::from_digest(digest_bytes.as_slice())?;
+	let skid_octets = OctetString::new(skid.as_bytes().as_slice())?;
 	let skid = SubjectKeyIdentifier::from(skid_octets);
 	Ok(SignerIdentifier::SubjectKeyIdentifier(skid))
 }

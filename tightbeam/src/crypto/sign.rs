@@ -19,15 +19,17 @@ pub use elliptic_curve;
 pub use signature::hazmat::{PrehashSigner, PrehashVerifier};
 pub use signature::{Error, Keypair, SignatureEncoding, Signer, Verifier};
 
+use core::marker::PhantomData;
+
 use crate::cms::content_info::CmsVersion;
 use crate::cms::signed_data::{SignatureValue, SignerIdentifier, SignerInfo};
 use crate::crypto::hash::Digest;
-use crate::der::asn1::{ObjectIdentifier, OctetString};
+use crate::crypto::x509::utils::compute_signer_identifier;
+use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
 use crate::error::{Result, TightBeamError};
 use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
-use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
-use crate::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::spki::AlgorithmIdentifierOwned;
 
 /// Trait for signature types that have an associated algorithm OID.
 ///
@@ -47,8 +49,40 @@ where
 {
 	let mut hasher = D::new();
 	hasher.update(content.as_ref());
-
 	signer.sign_prehash(&hasher.finalize())
+}
+
+/// A signature encoding that has one valid scalar form.
+///
+/// ECDSA accepts both `(r, s)` and `(r, n - s)` unless the verifier refuses
+/// the high form. Tightbeam verification requires the low form so a relay
+/// cannot rewrite one signed frame into a second valid frame.
+pub trait LowSEncoding {
+	/// `true` when `s` is already in the low half of the curve order.
+	fn is_low_s(&self) -> bool;
+
+	/// Refuse a high-s encoding, then verify `prehash` under `verifier`.
+	///
+	/// Paths that already hold a digest (receipt attributes, ECIES auth)
+	/// use this so they share the same low-s gate as [`verify_canonical`].
+	fn verify_prehash<V>(&self, verifier: &V, prehash: impl AsRef<[u8]>) -> core::result::Result<(), Error>
+	where
+		Self: Sized,
+		V: PrehashVerifier<Self>,
+	{
+		if !self.is_low_s() {
+			return Err(Error::new());
+		}
+
+		verifier.verify_prehash(prehash.as_ref(), self)
+	}
+}
+
+#[cfg(feature = "secp256k1")]
+impl LowSEncoding for ecdsa::Signature<ecdsa::Secp256k1> {
+	fn is_low_s(&self) -> bool {
+		self.normalize_s().is_none()
+	}
 }
 
 /// Verify a signature produced under the canonical convention: hash
@@ -58,9 +92,8 @@ where
 /// through this function so producers and verifiers cannot diverge on the
 /// bytes-to-sign formula.
 ///
-/// `verifier` MUST refuse a high-s ECDSA signature, so one signature has one
-/// valid encoding. The `k256` verifier refuses it. A custom verifier, such as
-/// an HSM binding, carries the same obligation.
+/// The signature MUST be low-s. [`LowSEncoding`] is the check.
+/// The `k256` verifier also refuses a high-s encoding.
 pub fn verify_canonical<D, S>(
 	verifier: &impl PrehashVerifier<S>,
 	content: impl AsRef<[u8]>,
@@ -68,11 +101,11 @@ pub fn verify_canonical<D, S>(
 ) -> core::result::Result<(), Error>
 where
 	D: Digest,
+	S: LowSEncoding,
 {
 	let mut hasher = D::new();
 	hasher.update(content.as_ref());
-
-	verifier.verify_prehash(&hasher.finalize(), signature)
+	signature.verify_prehash(verifier, hasher.finalize())
 }
 
 /// Signing key that can emit a CMS [`SignerInfo`] over content.
@@ -89,10 +122,8 @@ where
 		Self: Sized,
 	{
 		let signature: S = sign_canonical::<Self::DigestAlgorithm, S>(self, data)?;
-
 		// Build digest algorithm identifier
 		let digest_alg = AlgorithmIdentifierOwned { oid: Self::DigestAlgorithm::OID, parameters: None };
-
 		// Get signature algorithm
 		let signature_algorithm = self.signature_algorithm();
 		// Get signer identifier
@@ -155,16 +186,10 @@ impl Signatory<ecdsa::Signature<ecdsa::Secp256k1>> for ecdsa::SigningKey<ecdsa::
 
 	fn signer_identifier(&self) -> Result<SignerIdentifier> {
 		let verifying_key = self.verifying_key();
-		let public_key_der = verifying_key
-			.to_public_key_der()
+		let sid = compute_signer_identifier::<Self::DigestAlgorithm, _>(verifying_key)
 			.map_err(|_| TightBeamError::SignatureEncodingError)?;
 
-		let mut hasher = Self::DigestAlgorithm::new();
-		hasher.update(public_key_der.as_bytes());
-
-		let skid_bytes = hasher.finalize();
-		let octet_string = OctetString::new(&skid_bytes[..20])?;
-		Ok(SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier::from(octet_string)))
+		Ok(sid)
 	}
 }
 
@@ -210,16 +235,7 @@ impl<'a, S> From<&'a S> for Sha3Signer<'a, S> {
 /// Compute the SubjectKeyIdentifier-based SignerIdentifier for a Secp256k1 verifying key.
 #[cfg(feature = "secp256k1")]
 pub fn secp256k1_signer_identifier(verifying_key: &ecdsa::VerifyingKey<ecdsa::Secp256k1>) -> Result<SignerIdentifier> {
-	let public_key_der = verifying_key
-		.to_public_key_der()
-		.map_err(|_| TightBeamError::SignatureEncodingError)?;
-
-	let mut hasher = sha3::Sha3_256::new();
-	hasher.update(public_key_der.as_bytes());
-
-	let skid_bytes = hasher.finalize();
-	let octet_string = OctetString::new(&skid_bytes[..20]).map_err(TightBeamError::SerializationError)?;
-	Ok(SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier::from(octet_string)))
+	compute_signer_identifier::<sha3::Sha3_256, _>(verifying_key).map_err(|_| TightBeamError::SignatureEncodingError)
 }
 
 /// Trait for verifying signatures in SignedData structures.
@@ -249,7 +265,7 @@ where
 	D: Digest,
 {
 	verifying_key: V,
-	expected_sid: Option<SignerIdentifier>,
+	expected_sid: SignerIdentifier,
 	_phantom: core::marker::PhantomData<(S, D)>,
 }
 
@@ -273,12 +289,7 @@ where
 	{
 		let verifying_key = signing_key.verifying_key().into();
 		let expected_sid = signing_key.signer_identifier()?;
-
-		Ok(Self {
-			verifying_key,
-			expected_sid: Some(expected_sid),
-			_phantom: core::marker::PhantomData,
-		})
+		Ok(Self { verifying_key, expected_sid, _phantom: PhantomData })
 	}
 
 	/// Create a verifier from a verifying key with proper SID checking.
@@ -286,11 +297,7 @@ where
 	/// Constructs the expected SubjectKeyIdentifier from the verifying key.
 	/// This is the recommended method when you only have a verifying key.
 	pub fn from_verifying_key_with_sid(verifying_key: V, expected_sid: SignerIdentifier) -> Self {
-		Self {
-			verifying_key,
-			expected_sid: Some(expected_sid),
-			_phantom: core::marker::PhantomData,
-		}
+		Self { verifying_key, expected_sid, _phantom: PhantomData }
 	}
 }
 
@@ -298,15 +305,12 @@ where
 impl<V, S, D> SignatureVerifier for EcdsaSignatureVerifier<V, S, D>
 where
 	V: PrehashVerifier<S>,
-	S: SignatureEncoding,
+	S: SignatureEncoding + LowSEncoding,
 	D: Digest,
 {
 	fn verify_signature(&self, content: &[u8], signature_bytes: &[u8], signer_id: &SignerIdentifier) -> Result<()> {
-		// Validate SID if expected
-		if let Some(ref expected_sid) = self.expected_sid {
-			if signer_id != expected_sid {
-				return Err(TightBeamError::SignatureEncodingError);
-			}
+		if signer_id != &self.expected_sid {
+			return Err(TightBeamError::SignatureEncodingError);
 		}
 
 		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;

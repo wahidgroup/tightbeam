@@ -250,11 +250,6 @@ pub enum TightBeamError {
 	#[source]
 	EciesError(crate::crypto::ecies::EciesError),
 
-	#[cfg(feature = "crypto")]
-	#[error("Crypto policy error: {0}")]
-	#[source]
-	CryptoPolicyError(crate::crypto::policy::CryptoPolicyError),
-
 	/// Error during certificate validation
 	#[cfg(feature = "x509")]
 	#[error("Certificate validation error: {0}")]
@@ -455,8 +450,6 @@ crate::impl_from!(crate::utils::urn::UrnValidationError => TightBeamError::UrnVa
 crate::impl_from!(std::string::FromUtf8Error => TightBeamError::IoError via |err| std::io::Error::new(std::io::ErrorKind::InvalidData, err));
 #[cfg(feature = "std")]
 crate::impl_from!(std::net::AddrParseError => TightBeamError::IoError via |err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err));
-#[cfg(feature = "crypto")]
-crate::impl_from!(crate::crypto::policy::CryptoPolicyError => TightBeamError::CryptoPolicyError);
 #[cfg(feature = "kdf")]
 crate::impl_from!(crate::crypto::kdf::KdfError => TightBeamError::KeyDerivationError);
 #[cfg(feature = "crypto")]

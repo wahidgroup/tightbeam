@@ -20,6 +20,7 @@ use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+use crate::crypto::sign::LowSEncoding;
 use crate::crypto::sign::PrehashVerifier;
 use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::x509::policy::CertificateValidation;
@@ -97,7 +98,7 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EciesPublicKeyOps,
 	<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
-	P::Signature: SignatureEncoding,
+	P::Signature: SignatureEncoding + LowSEncoding,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
 	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey,
@@ -672,9 +673,7 @@ where
 		signature_bytes: &[u8],
 	) -> Result<(), HandshakeError> {
 		let signature = P::Signature::try_from(signature_bytes).map_err(|e| e.into())?;
-
-		verifying_key.verify_prehash(digest, &signature)?;
-
+		signature.verify_prehash(verifying_key, digest)?;
 		Ok(())
 	}
 
@@ -750,7 +749,7 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EciesPublicKeyOps,
 	<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
-	P::Signature: SignatureEncoding + Send + Sync,
+	P::Signature: SignatureEncoding + LowSEncoding + Send + Sync,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
 	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey + Send + Sync,

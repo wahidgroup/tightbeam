@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
-use crate::crypto::sign::{verify_canonical, PrehashVerifier, SignatureEncoding, SignerInfoExt};
+use crate::crypto::sign::{verify_canonical, LowSEncoding, PrehashVerifier, SignatureEncoding, SignerInfoExt};
 use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::der::Encode;
@@ -56,7 +56,7 @@ impl Frame {
 	/// - [`Frame::to_tbs`]: the exact bytes the signature covers
 	pub fn verify<S, D>(&self, verifier: &impl PrehashVerifier<S>) -> Result<()>
 	where
-		S: SignatureEncoding,
+		S: SignatureEncoding + LowSEncoding,
 		D: Digest + AssociatedOid,
 	{
 		let signature_info = self.nonrepudiation.as_ref().ok_or(TightBeamError::MissingSignature)?;

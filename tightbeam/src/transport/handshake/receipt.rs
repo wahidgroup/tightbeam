@@ -74,7 +74,7 @@ mod handshake {
 	};
 	pub use crate::crypto::hash::Digest;
 	pub use crate::crypto::key::SigningKeyProvider;
-	pub use crate::crypto::sign::PrehashVerifier;
+	pub use crate::crypto::sign::{LowSEncoding, PrehashVerifier};
 	pub use crate::crypto::x509::utils::{compute_signer_identifier, compute_signer_identifier_from_der};
 	pub use crate::der::asn1::{ObjectIdentifier, SetOfVec};
 	pub use crate::der::oid::AssociatedOid;
@@ -429,7 +429,7 @@ pub(crate) fn verify_receipt_signer<D, S, V>(
 ) -> Result<Option<OctetString>, HandshakeError>
 where
 	D: Digest + AssociatedOid,
-	S: for<'a> TryFrom<&'a [u8]>,
+	S: for<'a> TryFrom<&'a [u8]> + LowSEncoding,
 	V: PrehashVerifier<S>,
 {
 	let receipt_der = receipt_der.as_ref();
@@ -455,7 +455,8 @@ where
 	let prehash = signed_attrs_prehash::<D>(attrs)?;
 	let signature_bytes = signer.signature.as_bytes();
 	let signature = S::try_from(signature_bytes).map_err(|_| HandshakeError::SignatureVerificationFailed)?;
-	key.verify_prehash(&prehash, &signature)
+	signature
+		.verify_prehash(key, prehash)
 		.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
 
 	Ok(normalize_answer(answer))
@@ -552,7 +553,7 @@ impl StoredReceipt {
 	pub fn verify<D, S, V>(&self, server_key: &V, client_key: &V) -> Result<(), HandshakeError>
 	where
 		D: Digest + AssociatedOid,
-		S: for<'a> TryFrom<&'a [u8]>,
+		S: for<'a> TryFrom<&'a [u8]> + LowSEncoding,
 		V: PrehashVerifier<S> + EncodePublicKey,
 	{
 		let receipt_der = self.receipt.to_der()?;
@@ -997,7 +998,7 @@ impl SessionReceipt {
 	) -> Result<(SessionVerdict, Option<OctetString>), HandshakeError>
 	where
 		D: Digest + AssociatedOid,
-		S: for<'a> TryFrom<&'a [u8]>,
+		S: for<'a> TryFrom<&'a [u8]> + LowSEncoding,
 		V: PrehashVerifier<S>,
 	{
 		let Some(ack) = ack else {
