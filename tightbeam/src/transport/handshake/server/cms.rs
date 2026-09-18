@@ -27,7 +27,9 @@ use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-use crate::crypto::sign::{EcdsaSignatureVerifier, PrehashVerifier, SignatureAlgorithmIdentifier, Verifier};
+use crate::crypto::sign::{
+	EcdsaSignatureVerifier, LowSEncoding, PrehashVerifier, SignatureAlgorithmIdentifier, Verifier,
+};
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::{compute_signer_identifier, compute_signer_identifier_from_der};
@@ -44,8 +46,8 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::kari::HandshakeKek;
 use crate::transport::handshake::kari::{key_wrap_key_size, unwrap_and_verify_with_kek};
 use crate::transport::handshake::negotiation::{
-	authorize_transport, MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer,
-	StrengthFloor, TransportAccept, TransportAuthorizer, TransportOffer,
+	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer, StrengthFloor, TransportAccept,
+	TransportAuthorizer, TransportNegotiation, TransportOffer,
 };
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::ReceiptArtifact;
@@ -110,7 +112,7 @@ where
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-	P::Signature: 'static,
+	P::Signature: LowSEncoding + 'static,
 	P::Digest: Send + 'static + AssociatedOid,
 	P::AeadCipher: KeyInit + 'static,
 {
@@ -305,7 +307,8 @@ where
 
 		let local = self.transport_config.as_ref();
 		let authorizer = self.transport_authorizer.as_deref();
-		let authorized = authorize_transport(offer.as_ref(), local, authorizer).await?;
+		let negotiation = TransportNegotiation { offer: offer.as_ref(), local };
+		let authorized = negotiation.authorize(authorizer).await?;
 
 		self.transport_accept = authorized.as_ref().map(|authorized| authorized.accept);
 		self.settlement_challenge = authorized.and_then(|authorized| authorized.challenge);
@@ -978,7 +981,7 @@ where
 	P::VerifyingKey:
 		From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + PrehashVerifier<P::Signature> + 'static,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
-	P::Signature: 'static,
+	P::Signature: LowSEncoding + 'static,
 	P::Digest: Send + 'static,
 	P::AeadCipher: Send + Sync + KeyInit + 'static,
 {

@@ -46,15 +46,16 @@
 //! - [IEEE Std 1363a-2004](https://standards.ieee.org/standard/1363a-2004.html): Public-Key Cryptography - Amendment 1 (Additional Techniques)
 //! - [ISO/IEC 18033-2:2006](https://www.iso.org/standard/37971.html): Encryption algorithms - Part 2: Asymmetric ciphers
 
+use core::cmp::min;
+
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
 pub use crate::crypto::hkdf::Hkdf;
 
-use crate::crypto::hkdf::InvalidLength;
-
 use crate::constants::{ECDH_SHARED_SECRET_SIZE, MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE, MIN_SALT_SIZE};
 use crate::crypto::hash::{Digest, Sha3_256};
+use crate::crypto::hkdf::InvalidLength;
 use crate::crypto::secret::{Secret, SecretSlice, ToInsecure};
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
@@ -217,25 +218,8 @@ impl KdfFunction for X963Sha3_256 {
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], _salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
 		assert_min_key_size(N)?;
 
-		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
 		let mut out = Zeroizing::new([0u8; N]);
-		let mut offset = 0usize;
-		let mut counter: u32 = 1;
-		while offset < N {
-			let mut hasher = Sha3_256::new();
-
-			hasher.update(ikm); // Z only
-			hasher.update(counter.to_be_bytes());
-			hasher.update(info); // SharedInfo/OtherInfo
-
-			let block = hasher.finalize();
-			let take = core::cmp::min(block.len(), N - offset);
-			out[offset..offset + take].copy_from_slice(&block[..take]);
-			offset += take;
-			if offset < N {
-				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(InvalidLength))?;
-			}
-		}
+		Self::expand(&mut out[..], ikm, info)?;
 
 		Ok(out)
 	}
@@ -243,27 +227,40 @@ impl KdfFunction for X963Sha3_256 {
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], _salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes> {
 		assert_min_key_size(key_size)?;
 
-		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
 		let mut out = vec![0u8; key_size];
+		Self::expand(&mut out, ikm, info)?;
+
+		Ok(Zeroizing::new(out))
+	}
+}
+
+impl X963Sha3_256 {
+	/// ANSI X9.63 concatenation: `K(i) = Hash(Z || Counter_i || SharedInfo)`.
+	///
+	/// `Counter_i` starts at 1. A counter that would overflow `u32` is a
+	/// derivation failure, not a wrap.
+	fn expand(out: &mut [u8], ikm: &[u8], info: &[u8]) -> Result<()> {
 		let mut offset = 0usize;
 		let mut counter: u32 = 1;
-		while offset < key_size {
+		while offset < out.len() {
 			let mut hasher = Sha3_256::new();
-
 			hasher.update(ikm);
 			hasher.update(counter.to_be_bytes());
 			hasher.update(info);
 
 			let block = hasher.finalize();
-			let take = core::cmp::min(block.len(), key_size - offset);
+			let take = min(block.len(), out.len() - offset);
+
 			out[offset..offset + take].copy_from_slice(&block[..take]);
+
 			offset += take;
-			if offset < key_size {
+
+			if offset < out.len() {
 				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(InvalidLength))?;
 			}
 		}
 
-		Ok(Zeroizing::new(out))
+		Ok(())
 	}
 }
 

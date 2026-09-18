@@ -36,7 +36,7 @@ use crate::crypto::sign::ecdsa::Secp256k1Signature;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 #[cfg(feature = "signature")]
-use crate::crypto::sign::{PrehashVerifier, Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
+use crate::crypto::sign::{LowSEncoding, PrehashVerifier, Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
 #[cfg(any(
 	feature = "digest",
 	feature = "aead",
@@ -298,7 +298,7 @@ pub trait AeadProvider {
 /// Isolates signing operations to reduce generic bounds on types that only sign.
 #[cfg(feature = "signature")]
 pub trait SigningProvider {
-	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync;
+	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier + LowSEncoding + Send + Sync;
 	type SigningKey: Signatory<Self::Signature>;
 	type VerifyingKey: PrehashVerifier<Self::Signature> + Send + Sync;
 
@@ -376,7 +376,7 @@ pub trait KemProvider {
 	feature = "ecdh"
 ))]
 pub trait CryptoProvider:
-	Default + Copy + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider // + KemProvider
+	Default + Copy + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider
 {
 	/// The profile this provider runs. Each algorithm it names is the type the
 	/// matching role above uses.
@@ -447,13 +447,6 @@ impl CurveProvider for DefaultCryptoProvider {
 	#[cfg(feature = "ecies")]
 	type EciesMessage = crate::crypto::ecies::Secp256k1EciesMessage;
 }
-
-// TODO: KEM wiring deferred - RustCrypto lacks stable KEM provider traits.
-// #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
-// impl KemProvider for DefaultCryptoProvider {
-// 	type EncappedKey = Kyber1024EncappedKey;
-// 	type Kem = Kyber1024;
-// }
 
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl CryptoProvider for DefaultCryptoProvider {
@@ -540,18 +533,6 @@ impl UkmBuilder {
 	}
 }
 
-/// Helper to apply domain separation to key material.
-///
-/// Prepends a domain label to the material, ensuring KDF/signing operations
-/// are context-bound and cannot be replayed across different protocol phases.
-#[inline]
-pub fn apply_domain(label: &[u8], material: &[u8]) -> Vec<u8> {
-	let mut v = Vec::with_capacity(label.len() + material.len());
-	v.extend_from_slice(label);
-	v.extend_from_slice(material);
-	v
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -572,24 +553,6 @@ mod tests {
 		assert_eq!(TIGHTBEAM_SESSION_KDF_INFO, b"tb/session/kdf/v1");
 		assert_eq!(TIGHTBEAM_SIGNED_TRANSCRIPT_DOMAIN, b"tb/handshake/transcript/v1");
 		assert_eq!(TIGHTBEAM_UKM_PREFIX, b"tb/kari/ukm/v1|");
-	}
-
-	/// Verify apply_domain prepends correctly.
-	#[test]
-	fn test_apply_domain() {
-		let result = apply_domain(TIGHTBEAM_SESSION_KDF_INFO, b"test_material");
-		assert!(result.starts_with(TIGHTBEAM_SESSION_KDF_INFO));
-		assert!(result.ends_with(b"test_material"));
-		assert_eq!(result.len(), TIGHTBEAM_SESSION_KDF_INFO.len() + b"test_material".len());
-	}
-
-	/// Changing a domain constant should produce different output.
-	#[test]
-	fn test_domain_separation_effectiveness() {
-		let material = b"shared_material";
-		let with_kari = apply_domain(TIGHTBEAM_KARI_KDF_INFO, material);
-		let with_session = apply_domain(TIGHTBEAM_SESSION_KDF_INFO, material);
-		assert_ne!(with_kari, with_session, "Different domains must produce different outputs");
 	}
 
 	// =======================================================================

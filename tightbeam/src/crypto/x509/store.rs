@@ -10,30 +10,26 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::Certificate;
 
 #[cfg(feature = "std")]
-#[cfg(feature = "std")]
-use crate::der::Encode;
-
-#[cfg(feature = "std")]
 mod std_imports {
 	pub use std::collections::{HashMap, HashSet};
 	pub use std::sync::Arc;
 
 	pub use crate::cms::signed_data::SignerIdentifier;
-	pub use crate::crypto::hash::Digest;
-	pub use crate::crypto::hash::Sha3_256;
+	pub use crate::crypto::hash::{Digest, Sha3_256, U32};
 	pub use crate::crypto::policy::VerificationPolicy;
 	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::crypto::x509::name::Name;
+	pub use crate::crypto::x509::utils::{CertificateExt, Fingerprint, Skid};
 	pub use crate::der::oid::AssociatedOid;
+	pub use crate::der::Encode;
 }
 
 #[cfg(feature = "std")]
-use crate::crypto::x509::utils::CertificateExt;
-#[cfg(feature = "std")]
 use std_imports::*;
 
-/// Fingerprint type: SHA3-256 hash (32 bytes)
-pub type Fingerprint = [u8; 32];
+/// SHA3-256 certificate fingerprint used by the built-in trust store.
+#[cfg(feature = "std")]
+type Sha3Fingerprint = Fingerprint<Sha3_256>;
 
 /// Revocation status check for certificates within a certification path.
 ///
@@ -72,7 +68,7 @@ impl RevocationChecker for NoRevocation {
 #[cfg(feature = "std")]
 #[derive(Debug, Default)]
 pub struct StaticRevocationList {
-	fingerprints: HashSet<Fingerprint>,
+	fingerprints: HashSet<Sha3Fingerprint>,
 	/// Revoked serial numbers keyed by issuer DN DER: RFC 5280 §4.1.2.2
 	/// guarantees serial uniqueness only within one CA, so an unscoped
 	/// serial would falsely revoke unrelated certificates.
@@ -82,7 +78,7 @@ pub struct StaticRevocationList {
 #[cfg(feature = "std")]
 impl StaticRevocationList {
 	/// Revoke a certificate by its SHA3-256 DER fingerprint.
-	pub fn with_fingerprint(mut self, fingerprint: Fingerprint) -> Self {
+	pub fn with_fingerprint(mut self, fingerprint: Sha3Fingerprint) -> Self {
 		self.fingerprints.insert(fingerprint);
 		self
 	}
@@ -325,9 +321,6 @@ fn ensure_path_len(chain: &[&Certificate]) -> Result<(), CertificateValidationEr
 // CertificateTrustStore Implementation
 // ============================================================================
 
-/// SKID type: first 20 bytes of hash (RFC 5280)
-pub type Skid = [u8; 20];
-
 /// Built-in trust store with cryptographic signature verification.
 ///
 /// Uses a `VerificationPolicy` for runtime signature verification of
@@ -336,11 +329,11 @@ pub type Skid = [u8; 20];
 #[cfg(feature = "std")]
 pub struct CertificateTrustStore {
 	/// Trusted certificate fingerprints
-	fingerprints: HashSet<Fingerprint>,
+	fingerprints: HashSet<Sha3Fingerprint>,
 	/// Full certificates indexed by fingerprint
-	certificates: HashMap<Fingerprint, Certificate>,
+	certificates: HashMap<Sha3Fingerprint, Certificate>,
 	/// Pre-computed SKID
-	skid_index: HashMap<Skid, Fingerprint>,
+	skid_index: HashMap<Skid, Sha3Fingerprint>,
 	/// Verification policy for signature verification
 	policy: Arc<dyn VerificationPolicy>,
 	/// Revocation checker consulted during path validation
@@ -349,18 +342,16 @@ pub struct CertificateTrustStore {
 
 #[cfg(feature = "std")]
 impl CertificateTrustStore {
-	/// Compute the SHA3-256 fingerprint of a certificate's DER encoding.
-	pub fn to_fingerprint(cert: &Certificate) -> Result<Fingerprint, CertificateValidationError> {
-		let der_bytes = cert.to_der()?;
-		let hash = Sha3_256::digest(&der_bytes);
-		let mut fp = [0u8; 32];
-		fp.copy_from_slice(hash.as_ref());
-
-		Ok(fp)
+	/// Compute the certificate fingerprint for digest `D`.
+	pub fn to_fingerprint<D>(cert: &Certificate) -> Result<Fingerprint<D>, CertificateValidationError>
+	where
+		D: Digest<OutputSize = U32>,
+	{
+		Fingerprint::from_certificate(cert)
 	}
 
 	/// Get a certificate by its fingerprint.
-	pub fn to_certificate_ref(&self, fingerprint: &Fingerprint) -> Option<&Certificate> {
+	pub fn to_certificate_ref(&self, fingerprint: &Sha3Fingerprint) -> Option<&Certificate> {
 		self.certificates.get(fingerprint)
 	}
 
@@ -486,7 +477,7 @@ impl CertificateValidation for CertificateTrustStore {
 		// candidate cannot verify. Full RFC 4158 path building (backtracking
 		// across same-DN candidates) is intentionally not implemented.
 		let mut path: Vec<&Certificate> = Vec::new();
-		let mut visited: HashSet<Fingerprint> = HashSet::new();
+		let mut visited: HashSet<Sha3Fingerprint> = HashSet::new();
 
 		visited.insert(Self::to_fingerprint(cert)?);
 		path.push(cert);
@@ -555,16 +546,8 @@ impl CertificateTrust for CertificateTrustStore {
 				})
 			}
 			SignerIdentifier::SubjectKeyIdentifier(skid) => {
-				// O(1) lookup via pre-indexed SKID
-				let skid_bytes = skid.0.as_bytes();
-				(skid_bytes.len() == 20)
-					.then(|| {
-						let mut key = [0u8; 20];
-						key.copy_from_slice(skid_bytes);
-						key
-					})
-					.and_then(|key| self.skid_index.get(&key))
-					.and_then(|fp| self.certificates.get(fp))
+				let key = Skid::parse(skid.0.as_bytes())?;
+				self.skid_index.get(&key).and_then(|fp| self.certificates.get(fp))
 			}
 		}
 	}
@@ -585,9 +568,9 @@ impl CertificateTrust for CertificateTrustStore {
 /// The resulting store handles cryptographic verification at runtime.
 #[cfg(feature = "std")]
 pub struct CertificateTrustBuilder<D: Digest> {
-	fingerprints: HashSet<Fingerprint>,
-	certificates: HashMap<Fingerprint, Certificate>,
-	skid_index: HashMap<Skid, Fingerprint>,
+	fingerprints: HashSet<Sha3Fingerprint>,
+	certificates: HashMap<Sha3Fingerprint, Certificate>,
+	skid_index: HashMap<Skid, Sha3Fingerprint>,
 	policy: Arc<dyn VerificationPolicy>,
 	revocation: Arc<dyn RevocationChecker>,
 	_digest: core::marker::PhantomData<D>,
@@ -619,20 +602,18 @@ impl<D: Digest> CertificateTrustBuilder<D> {
 
 	/// Add a single certificate (internal helper).
 	fn add_certificate(&mut self, cert: Certificate) -> Result<(), CertificateValidationError> {
-		let fp = CertificateTrustStore::to_fingerprint(&cert)?;
+		let fp = CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?;
 
 		// Compute SKID from public key
 		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
 		let hash = D::digest(&spki_der);
 
-		let mut skid = [0u8; 20];
-		skid.copy_from_slice(crate::crypto::x509::utils::skid_window(hash.as_ref())?);
-
-		// Collision detection: same SKID but different fingerprint
+		let skid = Skid::from_digest(hash.as_ref())?;
 		if let Some(existing_fp) = self.skid_index.get(&skid) {
+			// Collision detection: same SKID but different fingerprint
 			if *existing_fp != fp {
 				return Err(CertificateValidationError::SkidCollision {
-					skid: skid.iter().fold(String::new(), |mut acc, byte| {
+					skid: skid.as_bytes().iter().fold(String::new(), |mut acc, byte| {
 						use core::fmt::Write;
 						let _ = write!(acc, "{byte:02x}");
 						acc
@@ -779,7 +760,7 @@ mod tests {
 	#[test]
 	fn fingerprint_is_32_bytes() -> TestResult {
 		let cert = TestCertificate::self_signed(&TestKey::signing());
-		assert_eq!(CertificateTrustStore::to_fingerprint(&cert)?.len(), 32);
+		assert_eq!(CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?.as_slice().len(), 32);
 		Ok(())
 	}
 
@@ -1137,8 +1118,8 @@ mod tests {
 			return Err(crate::testing::error::TestingError::InvariantViolated.into());
 		};
 		assert_eq!(
-			CertificateTrustStore::to_fingerprint(found)?,
-			CertificateTrustStore::to_fingerprint(&cert)?
+			CertificateTrustStore::to_fingerprint::<Sha3_256>(found)?,
+			CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?
 		);
 
 		Ok(())

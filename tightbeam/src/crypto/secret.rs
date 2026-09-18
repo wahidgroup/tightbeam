@@ -14,7 +14,7 @@ use core::{any, fmt};
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, vec::Vec};
 
-use crate::der::{self, Decode, Encode, FixedTag};
+use crate::der::{Decode, Encode};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::Errorizable;
 
@@ -89,13 +89,6 @@ impl<S: Zeroize + ?Sized> From<Box<S>> for Secret<S> {
 	fn from(b: Box<S>) -> Self {
 		Secret::new(b)
 	}
-}
-
-impl<S> FixedTag for Secret<S>
-where
-	S: Zeroize + FixedTag + ?Sized,
-{
-	const TAG: der::Tag = S::TAG;
 }
 
 /// Secret slice alias (owns `Box<[T]>`)

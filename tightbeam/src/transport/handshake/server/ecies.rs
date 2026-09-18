@@ -29,7 +29,7 @@ use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-use crate::crypto::sign::{PrehashVerifier, SignatureEncoding};
+use crate::crypto::sign::{LowSEncoding, PrehashVerifier, SignatureEncoding};
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
@@ -37,8 +37,8 @@ use crate::random::generate_nonce;
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
-	authorize_transport, MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, StrengthFloor,
-	TransportAccept, TransportAuthorizer, TransportOffer,
+	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, StrengthFloor, TransportAccept,
+	TransportAuthorizer, TransportNegotiation, TransportOffer,
 };
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
@@ -226,15 +226,13 @@ where
 		let security_accept = SecurityAccept::new(selected.descriptor());
 
 		// 4. Transport capability negotiation: mux activates only when
-		// offered AND locally enabled. The authorizer (when configured)
-		// decides the budget grant and the settlement challenge before
-		// the accept enters the transcript.
-		let authorized = authorize_transport(
-			client_hello.transport_offer.as_ref(),
-			self.transport_config.as_ref(),
-			self.transport_authorizer.as_deref(),
-		)
-		.await?;
+		//    offered AND locally enabled. The authorizer (when configured)
+		//    decides the budget grant and the settlement challenge before
+		//    the accept enters the transcript.
+		let offer = client_hello.transport_offer.as_ref();
+		let local = self.transport_config.as_ref();
+		let negotiation = TransportNegotiation { offer, local };
+		let authorized = negotiation.authorize(self.transport_authorizer.as_deref()).await?;
 
 		let transport_accept = authorized.as_ref().map(|authorized| authorized.accept);
 		let settlement_challenge = authorized.and_then(|authorized| authorized.challenge);
@@ -278,13 +276,14 @@ where
 		let signature_bytes = self.sign_transcript_hash(&transcript_digest).await?;
 
 		// 9. Issue the session receipt: the transcript hash pins it to
-		// this session, the server signature makes it third-party verifiable
+		//    this session, the server signature makes it third-party verifiable
 		self.issue_session_receipt(&transcript_digest, transport_accept.as_ref(), settlement_challenge)
 			.await?;
 
 		// 10. Build ServerHandshake
+		let security_accept = Some(security_accept);
 		let server_handshake =
-			self.build_server_handshake(server_random, signature_bytes, Some(security_accept), transport_accept)?;
+			self.build_server_handshake(server_random, signature_bytes, security_accept, transport_accept)?;
 
 		// 11. Transition state through ServerHelloReceived to ServerHelloSent
 		self.state.transition(ServerHandshakeState::ClientHelloReceived)?;
@@ -363,7 +362,7 @@ where
 		let decrypted_payload = self.decrypt_ecies_payload(encrypted_bytes).await?;
 
 		// 6. Extract base session key, client random, and the confidential
-		// receipt countersignature from the decrypted payload
+		//    receipt countersignature from the decrypted payload
 		let SessionPayload { base_session_key, client_random, receipt_ack } =
 			self.extract_session_data_from_payload(&decrypted_payload)?;
 
@@ -371,10 +370,10 @@ where
 		self.verify_client_random(&client_random)?;
 
 		// 8. Verify the receipt countersignature and settle, strictly
-		// after decrypt and replay verification: settlement is an
-		// irreversible external side effect, so it must be the last gate,
-		// downstream of every cheaper rejection. The countersignature
-		// arrives confidentially inside the decrypted payload.
+		//    after decrypt and replay verification: settlement is an
+		//    irreversible external side effect, so it must be the last gate,
+		//    downstream of every cheaper rejection. The countersignature
+		//    arrives confidentially inside the decrypted payload.
 		self.process_receipt_ack(receipt_ack).await?;
 
 		// 9. Store base session key
@@ -624,7 +623,7 @@ where
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		for<'a> P::Signature: TryFrom<&'a [u8]>,
+		for<'a> P::Signature: TryFrom<&'a [u8]> + LowSEncoding,
 		P::VerifyingKey: PrehashVerifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
 		let (client_cert, validators) = match (client_kex.client_certificate.take(), &self.client_validators) {
@@ -666,7 +665,7 @@ where
 			.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
 
 		let verifying_key = P::VerifyingKey::from(&public_key);
-		verifying_key.verify_prehash(&auth_digest, &signature)?;
+		signature.verify_prehash(&verifying_key, auth_digest)?;
 
 		// Storing the certificate locks the captured identity. This is
 		// the only write after construction.

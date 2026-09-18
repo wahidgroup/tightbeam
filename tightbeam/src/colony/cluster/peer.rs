@@ -7,6 +7,7 @@ use super::{ClusterConfig, PeerHint, PheromoneConfig, ServletEntry, SharedId};
 use crate::colony::common::ColonyResource;
 use crate::colony::common::{ClusterWorkRequest, ColonyNamespace, PeerAdvertisement};
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
+use crate::crypto::hash::Sha3_256;
 use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
 use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
@@ -391,7 +392,7 @@ pub(crate) trait ColonyCertificate {
 
 impl ColonyCertificate for Certificate {
 	fn fingerprint_id(&self) -> Option<SharedId> {
-		let fingerprint = CertificateTrustStore::to_fingerprint(self).ok()?;
+		let fingerprint = CertificateTrustStore::to_fingerprint::<Sha3_256>(self).ok()?;
 		Some(Arc::from(fingerprint.as_slice()))
 	}
 }

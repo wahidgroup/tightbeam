@@ -181,11 +181,6 @@ pub enum HandshakeError {
 	#[error("Profile negotiation required but no profiles configured on server")]
 	NegotiationRequired,
 
-	/// Certificate policy rejection
-	#[error("Certificate rejected by policy: {0}")]
-	#[from]
-	CertificatePolicyError(crate::crypto::policy::CryptoPolicyError),
-
 	// ---------------- Attribute / ASN.1 profile errors ----------------
 	#[error("Attribute must contain exactly one value")]
 	InvalidAttributeArity,
@@ -290,8 +285,6 @@ impl From<crate::error::TightBeamError> for HandshakeError {
 			TightBeamError::SpkiError(e) => HandshakeError::SpkiError(e),
 			#[cfg(feature = "x509")]
 			TightBeamError::CertificateValidationError(e) => HandshakeError::CertificateValidationError(e),
-			#[cfg(feature = "crypto")]
-			TightBeamError::CryptoPolicyError(e) => HandshakeError::CertificatePolicyError(e),
 			#[cfg(feature = "crypto")]
 			TightBeamError::KeyError(e) => HandshakeError::KeyError(e),
 			#[cfg(feature = "signature")]

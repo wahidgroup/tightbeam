@@ -17,7 +17,7 @@ use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDe
 use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
-use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier};
+use crate::crypto::sign::{EcdsaSignatureVerifier, LowSEncoding, SignatureAlgorithmIdentifier};
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::utils::CertificateExt;
@@ -150,7 +150,7 @@ where
 	PublicKey<P::Curve>: EncodePublicKey,
 	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
-	P::Signature: 'static,
+	P::Signature: LowSEncoding + 'static,
 	P::Digest: Send + 'static,
 	P::AeadCipher: KeyInit,
 {
@@ -414,14 +414,13 @@ where
 			server_verifying_key,
 			expected_sid,
 		);
-		let processor = TightBeamSignedDataProcessor::new(verifier);
 
 		// Verify content matches our transcript hash
+		let processor = TightBeamSignedDataProcessor::new(verifier);
 		let digest_oid = P::Digest::OID;
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
 
 		let expected_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
-
 		let transcript_matches: bool = verified_content.as_slice().ct_eq(&expected_hash[..]).into();
 		if transcript_matches {
 			Ok(verified_content)
@@ -1064,7 +1063,7 @@ where
 	PublicKey<P::Curve>: EncodePublicKey,
 	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
-	P::Signature: 'static,
+	P::Signature: LowSEncoding + 'static,
 	P::Digest: Send + 'static,
 	P::AeadCipher: Send + Sync + KeyInit,
 {
