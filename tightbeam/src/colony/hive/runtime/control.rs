@@ -4,16 +4,13 @@ use core::sync::atomic::{AtomicU16, Ordering};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::colony::common::{
-	reply_frame, reply_frame_with_priority, ClusterCommand, ClusterCommandResponse, DrainMode,
-};
+use crate::colony::common::{reply_frame, reply_frame_with_priority, ClusterCommandResponse, DrainMode};
+use crate::colony::hive::gates::{AdmitRefusal, AdmittedCommand};
 use crate::colony::hive::runtime::{HiveContextImpl, HiveInstances};
 use crate::colony::hive::{
-	BackpressureGate, HashMapRegistry, HiveManagementRequest, HiveManagementResponse, ServletRegistration,
-	ServletRegistry, SpawnerFn,
+	BackpressureGate, HashMapRegistry, HiveManagementResponse, ServletRegistration, ServletRegistry, SpawnerFn,
 };
 use crate::colony::servlet::servlet_runtime::rt;
-use crate::decode;
 use crate::macros::server::{serve_connection, AcceptedConnection, SharedHandler};
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
@@ -133,63 +130,49 @@ where
 		let ctx = self;
 		let _in_flight = ctx.in_flight.enter();
 
-		let is_heartbeat = decode::<ClusterCommand>(frame.message())
-			.map(|cmd| cmd.heartbeat.is_some())
-			.unwrap_or(false);
-
-		// Security gate runs before drain so drain state answers authenticated peers.
-		if let Some(reply) = ctx.security_gate_reply(&frame, &session, is_heartbeat)? {
-			return Ok(Some(reply));
-		}
+		// Security admission runs before drain so drain state answers authenticated peers.
+		let admitted = match ctx.admit(frame, &session) {
+			Ok(admitted) => admitted,
+			Err(refusal) => return ctx.security_refusal(&refusal),
+		};
 
 		// Refuse non-heartbeat manage while draining, in the manage CHOICE shape.
-		if ctx.drain.is_draining() && !is_heartbeat {
+		if ctx.drain.is_draining() && !admitted.is_heartbeat() {
 			return reply_frame(
-				frame.metadata().id(),
+				admitted.frame().metadata().id(),
 				ClusterCommandResponse::manage(HiveManagementResponse::stop_err(TransitStatus::Unavailable)),
 			);
 		}
 
 		// Authenticated heartbeats skip backpressure so health checks survive load.
-		// Exemption is after the security gate so unauthenticated peers get no bypass.
-		if !is_heartbeat {
-			if let Some(reply) = ctx.backpressure_reply(&frame, &session)? {
+		// Exemption is after admission so unauthenticated peers get no bypass.
+		if !admitted.is_heartbeat() {
+			if let Some(reply) = ctx.backpressure_reply(&admitted, &session)? {
 				return Ok(Some(reply));
 			}
 		}
-
-		let Ok(cmd) = decode::<ClusterCommand>(frame.message()) else {
-			return Ok(None);
-		};
-
-		if cmd.heartbeat.is_some() {
-			return ctx.heartbeat_reply(&frame);
+		if admitted.is_heartbeat() {
+			return ctx.heartbeat_reply(&admitted);
 		}
 
-		if let Some(manage) = cmd.manage {
-			return ctx.handle_manage(frame, manage).await;
-		}
-
-		Ok(None)
+		ctx.handle_manage(admitted).await
 	}
 
-	/// Spawn, list, or stop servlets for one management request.
-	pub async fn handle_manage(
-		self: Arc<Self>,
-		frame: Frame,
-		request: HiveManagementRequest,
-	) -> Result<Option<Frame>, TightBeamError> {
-		let ctx = self;
-		if let Some(spawn) = request.spawn {
-			return ctx.manage_spawn(frame, spawn.servlet_type).await;
+	/// Spawn, list, or stop servlets for one admitted management command.
+	async fn handle_manage(self: Arc<Self>, admitted: AdmittedCommand) -> Result<Option<Frame>, TightBeamError> {
+		let has_spawn = admitted.manage().is_some_and(|request| request.spawn.is_some());
+		if has_spawn {
+			return self.manage_spawn(admitted).await;
 		}
 
-		if request.list.is_some() {
-			return ctx.manage_list(&frame);
+		let has_list = admitted.manage().is_some_and(|request| request.list.is_some());
+		if has_list {
+			return self.manage_list(&admitted);
 		}
 
-		if let Some(stop) = request.stop {
-			return ctx.manage_stop(frame, stop.servlet_id);
+		let has_stop = admitted.manage().is_some_and(|request| request.stop.is_some());
+		if has_stop {
+			return self.manage_stop(admitted);
 		}
 
 		Ok(None)
@@ -197,34 +180,29 @@ where
 }
 
 impl<P: Protocol> HiveControlCtx<P> {
-	fn security_gate_reply(
-		&self,
-		frame: &Frame,
-		session: &SessionContext,
-		is_heartbeat: bool,
-	) -> Result<Option<Frame>, TightBeamError>
+	fn admit(&self, frame: Frame, session: &SessionContext) -> Result<AdmittedCommand, Box<AdmitRefusal>> {
+		let Some(store) = &self.trust_store else {
+			return Err(AdmitRefusal::denied(frame, TransitStatus::PermissionDenied));
+		};
+
+		let gate = ClusterSecurityGate::new(
+			Arc::clone(&self.circuit_breaker),
+			Arc::clone(store),
+			Arc::clone(&self.replay_guard),
+		);
+		gate.admit(frame, session)
+	}
+
+	fn security_refusal(&self, refusal: &AdmitRefusal) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol,
 	{
-		let security_status = match &self.trust_store {
-			Some(store) => {
-				let gate = ClusterSecurityGate::new(
-					Arc::clone(&self.circuit_breaker),
-					Arc::clone(store),
-					Arc::clone(&self.replay_guard),
-				);
-				GatePolicy::evaluate(&gate, Some(frame), session)
-			}
-			None => TransitStatus::PermissionDenied,
-		};
-
-		if security_status == TransitStatus::Ok {
-			return Ok(None);
-		}
+		let frame = refusal.frame();
+		let security_status = refusal.status();
 
 		// Reject in the CHOICE shape the sender decodes (heartbeat vs manage).
 		// A mismatched shape counts as MalformedResponse and can evict the hive.
-		if is_heartbeat {
+		if refusal.is_heartbeat() {
 			return reply_frame_with_priority(
 				frame.metadata().id(),
 				MessagePriority::NetworkControl,
@@ -237,10 +215,15 @@ impl<P: Protocol> HiveControlCtx<P> {
 		reply_frame(frame.metadata().id(), response)
 	}
 
-	fn backpressure_reply(&self, frame: &Frame, session: &SessionContext) -> Result<Option<Frame>, TightBeamError>
+	fn backpressure_reply(
+		&self,
+		admitted: &AdmittedCommand,
+		session: &SessionContext,
+	) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol,
 	{
+		let frame = admitted.frame();
 		let bp_gate = BackpressureGate::new(Arc::clone(&self.utilization), self.bp_threshold);
 		if GatePolicy::evaluate(&bp_gate, Some(frame), session) != TransitStatus::ResourceExhausted {
 			return Ok(None);
@@ -251,7 +234,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		reply_frame(frame.metadata().id(), response)
 	}
 
-	fn heartbeat_reply(&self, frame: &Frame) -> Result<Option<Frame>, TightBeamError>
+	fn heartbeat_reply(&self, admitted: &AdmittedCommand) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol,
 	{
@@ -264,22 +247,26 @@ impl<P: Protocol> HiveControlCtx<P> {
 		};
 
 		let response = ClusterCommandResponse::heartbeat(status, util, active_count);
-		reply_frame_with_priority(frame.metadata().id(), MessagePriority::NetworkControl, response)
+		reply_frame_with_priority(admitted.frame().metadata().id(), MessagePriority::NetworkControl, response)
 	}
 
-	async fn manage_spawn(
-		self: Arc<Self>,
-		frame: Frame,
-		servlet_type: Urn<'static>,
-	) -> Result<Option<Frame>, TightBeamError>
+	async fn manage_spawn(self: Arc<Self>, admitted: AdmittedCommand) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol + Send + Sync + 'static,
 		P::Transport: Send + Sync + 'static,
 	{
+		let Some(servlet_type) = admitted
+			.manage()
+			.and_then(|request| request.spawn.as_ref())
+			.map(|spawn| spawn.servlet_type.clone())
+		else {
+			return Ok(None);
+		};
+
 		let spawn_denied = || {
-			self.forget_replay(&frame);
+			self.forget_replay(&admitted);
 			reply_frame(
-				frame.metadata().id(),
+				admitted.frame().metadata().id(),
 				ClusterCommandResponse::manage(HiveManagementResponse::spawn_err(TransitStatus::PermissionDenied)),
 			)
 		};
@@ -302,45 +289,48 @@ impl<P: Protocol> HiveControlCtx<P> {
 		let address = addr_bytes.as_ref().to_vec();
 		let response = HiveManagementResponse::spawn_ok(address, instance);
 		let response = ClusterCommandResponse::manage(response);
-		reply_frame(frame.metadata().id(), response)
+		reply_frame(admitted.frame().metadata().id(), response)
 	}
 
-	fn manage_list(&self, frame: &Frame) -> Result<Option<Frame>, TightBeamError>
+	fn manage_list(&self, admitted: &AdmittedCommand) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol,
 	{
 		let list = self.servlets.slate();
 		let response = HiveManagementResponse::list_ok(list);
 		let response = ClusterCommandResponse::manage(response);
-		reply_frame(frame.metadata().id(), response)
+		reply_frame(admitted.frame().metadata().id(), response)
 	}
 
-	fn manage_stop(self: Arc<Self>, frame: Frame, servlet_id: Urn<'static>) -> Result<Option<Frame>, TightBeamError>
+	fn manage_stop(self: Arc<Self>, admitted: AdmittedCommand) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol,
 	{
+		let Some(servlet_id) = admitted
+			.manage()
+			.and_then(|request| request.stop.as_ref())
+			.map(|stop| stop.servlet_id.clone())
+		else {
+			return Ok(None);
+		};
+
 		let id_bytes = servlet_id.canonical_bytes();
 		let instances = HiveInstances::new(&self.servlets, &self.hive_context);
 		if instances.remove(&id_bytes).is_some() {
 			return reply_frame(
-				frame.metadata().id(),
+				admitted.frame().metadata().id(),
 				ClusterCommandResponse::manage(HiveManagementResponse::stop_ok()),
 			);
 		}
 
-		self.forget_replay(&frame);
+		self.forget_replay(&admitted);
 
 		let response = HiveManagementResponse::stop_err(TransitStatus::PermissionDenied);
 		let response = ClusterCommandResponse::manage(response);
-		reply_frame(frame.metadata().id(), response)
+		reply_frame(admitted.frame().metadata().id(), response)
 	}
 
-	fn forget_replay(&self, frame: &Frame)
-	where
-		P: Protocol,
-	{
-		if let Some(signer_info) = frame.nonrepudiation() {
-			self.replay_guard.forget(signer_info.signature.as_bytes());
-		}
+	fn forget_replay(&self, admitted: &AdmittedCommand) {
+		self.replay_guard.forget(admitted.signer().signature.as_bytes());
 	}
 }
