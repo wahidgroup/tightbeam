@@ -3,20 +3,20 @@
 //! Contains circuit breaker, replay guard, and security gate implementations
 //! for cluster command authentication and capacity management.
 
-use std::sync::Arc;
-
 use core::sync::atomic::{AtomicU16, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::colony::common::current_timestamp_ms;
 use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
 use crate::utils::BasisPoints;
 use crate::Frame;
 
-use crate::colony::common::ClusterCommand;
+use crate::colony::common::{ClusterCommand, HiveManagementRequest};
 use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use crate::SignerInfo;
 
 // ============================================================================
 // Circuit Breaker
@@ -447,6 +447,77 @@ pub struct ClusterSecurityGate {
 	replay_guard: Arc<ReplayGuard>,
 }
 
+/// A cluster command this gate has authenticated and decoded.
+///
+/// `signer` is the nonrepudiation signer the signature check accepted.
+#[derive(Debug)]
+pub(crate) struct AdmittedCommand {
+	command: ClusterCommand,
+	frame: Frame,
+	signer: SignerInfo,
+}
+
+impl AdmittedCommand {
+	/// Whether the admitted command is a heartbeat.
+	pub(crate) fn is_heartbeat(&self) -> bool {
+		self.command.heartbeat.is_some()
+	}
+
+	/// The frame the command arrived on.
+	pub(crate) fn frame(&self) -> &Frame {
+		&self.frame
+	}
+
+	/// The signer the signature check accepted.
+	pub(crate) fn signer(&self) -> &SignerInfo {
+		&self.signer
+	}
+
+	/// The management request, when the command carries one.
+	pub(crate) fn manage(&self) -> Option<&HiveManagementRequest> {
+		self.command.manage.as_ref()
+	}
+}
+
+/// A frame this gate refused, with the reply shape of its command body.
+#[derive(Debug)]
+pub(crate) struct AdmitRefusal {
+	frame: Frame,
+	status: TransitStatus,
+	heartbeat: bool,
+}
+
+impl AdmitRefusal {
+	/// Refuse `frame` with `status`.
+	///
+	/// The heartbeat flag comes from one decode of the command body.
+	pub(crate) fn denied(frame: Frame, status: TransitStatus) -> Box<Self> {
+		let heartbeat = crate::decode::<ClusterCommand>(frame.message())
+			.ok()
+			.is_some_and(|command| command.heartbeat.is_some());
+		Self::boxed(frame, status, heartbeat)
+	}
+
+	fn boxed(frame: Frame, status: TransitStatus, heartbeat: bool) -> Box<Self> {
+		Box::new(Self { frame, status, heartbeat })
+	}
+
+	/// The status the control plane answers with.
+	pub(crate) fn status(&self) -> TransitStatus {
+		self.status
+	}
+
+	/// Whether the refused body is a heartbeat.
+	pub(crate) fn is_heartbeat(&self) -> bool {
+		self.heartbeat
+	}
+
+	/// The frame the refusal answers.
+	pub(crate) fn frame(&self) -> &Frame {
+		&self.frame
+	}
+}
+
 impl ClusterSecurityGate {
 	/// Create a new security gate with certificate-based trust
 	///
@@ -461,27 +532,25 @@ impl ClusterSecurityGate {
 	) -> Self {
 		Self { circuit_breaker, trust_store, replay_guard }
 	}
-}
 
-impl GatePolicy for ClusterSecurityGate {
-	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus {
-		let Some(frame) = frame else {
-			return TransitStatus::Unauthenticated;
+	/// Authenticate `frame` and decode its cluster command once.
+	pub(crate) fn admit(&self, frame: Frame, session: &SessionContext) -> Result<AdmittedCommand, Box<AdmitRefusal>> {
+		let decoded = crate::decode::<ClusterCommand>(frame.message());
+		let heartbeat = decoded.as_ref().ok().is_some_and(|command| command.heartbeat.is_some());
+		let has_integrity = frame.integrity().is_some();
+		let Some(signer) = frame.nonrepudiation().cloned() else {
+			return Err(AdmitRefusal::boxed(frame, TransitStatus::Unauthenticated, heartbeat));
 		};
 
-		let Some(signer_info) = frame.nonrepudiation() else {
-			return TransitStatus::Unauthenticated;
-		};
-
-		if frame.integrity().is_none() {
-			return TransitStatus::Unauthenticated;
+		if !has_integrity {
+			return Err(AdmitRefusal::boxed(frame, TransitStatus::Unauthenticated, heartbeat));
 		}
 
 		// The replay partition keys on the signer, which the verification
 		// below proves. An unencodable identifier has no attribution, so
 		// it fails closed.
-		let Ok(signer_id) = signer_info.sid.to_der() else {
-			return TransitStatus::PermissionDenied;
+		let Ok(signer_id) = signer.sid.to_der() else {
+			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
 		};
 
 		// The breaker keys on the handshake-proven peer, because a failure
@@ -493,44 +562,56 @@ impl GatePolicy for ClusterSecurityGate {
 		// across every anonymous caller would let a single bad signature
 		// deny the rest, so this plane requires a proven peer (CWE-645).
 		let Some(breaker_key) = session.proven_peer() else {
-			return TransitStatus::Unauthenticated;
+			return Err(AdmitRefusal::boxed(frame, TransitStatus::Unauthenticated, heartbeat));
 		};
 
 		if !self.circuit_breaker.allow_request(breaker_key) {
-			return TransitStatus::PermissionDenied;
+			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
 		}
 
-		match verify_frame_signature(self.trust_store.as_ref(), frame) {
-			TrustVerification::MissingSignature => return TransitStatus::Unauthenticated,
-			TrustVerification::UnknownSigner => return TransitStatus::PermissionDenied,
+		match verify_frame_signature(self.trust_store.as_ref(), &frame) {
+			TrustVerification::MissingSignature => {
+				return Err(AdmitRefusal::boxed(frame, TransitStatus::Unauthenticated, heartbeat));
+			}
+			TrustVerification::UnknownSigner => {
+				return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
+			}
 			TrustVerification::Invalid => {
 				self.circuit_breaker.record_auth_failure(breaker_key);
-				return TransitStatus::PermissionDenied;
+				return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
 			}
 			TrustVerification::Verified => {}
 		}
 
-		// Decode before freshness so replay capacity spends on well-formed
-		// frames (CWE-770).
-		let Ok(_command) = crate::decode::<ClusterCommand>(frame.message()) else {
-			return TransitStatus::PermissionDenied;
+		// Replay capacity spends on well-formed frames (CWE-770).
+		let Ok(command) = decoded else {
+			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
 		};
 
 		let now = current_timestamp_ms();
 		if !self.replay_guard.is_fresh(frame.metadata().order(), now) {
-			return TransitStatus::PermissionDenied;
+			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
 		}
-
-		if !self
-			.replay_guard
-			.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now)
-		{
-			return TransitStatus::PermissionDenied;
+		if !self.replay_guard.check_and_insert(&signer_id, signer.signature.as_bytes(), now) {
+			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
 		}
 
 		self.circuit_breaker.record_success(breaker_key);
 
-		TransitStatus::Ok
+		Ok(AdmittedCommand { command, frame, signer })
+	}
+}
+
+impl GatePolicy for ClusterSecurityGate {
+	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus {
+		let Some(frame) = frame else {
+			return TransitStatus::Unauthenticated;
+		};
+
+		match self.admit(frame.clone(), session) {
+			Ok(_) => TransitStatus::Ok,
+			Err(refusal) => refusal.status(),
+		}
 	}
 }
 
