@@ -16,7 +16,6 @@ use crate::colony::common::{
 	current_timestamp_ms, reply_frame, GossipReconciliation, GossipRumor, GossipWant, PeerAdvertisement,
 	PeerAdvertisementResponse,
 };
-use crate::colony::hive::{verify_frame_signature, TrustVerification};
 use crate::constants::MAX_PEX_SAMPLE;
 use crate::constants::{MAX_GOSSIP_LOG, MAX_GOSSIP_TTL};
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -38,10 +37,12 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		frame: Frame,
 		advertisement: PeerAdvertisement,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let origin_status = self.config.verify_peer_origin(&frame);
-		if origin_status != TransitStatus::Ok {
-			return Refusal::to(&frame, &self.trace).peer_ad(origin_status);
-		}
+		let verified = match self.config.verify_peer(&frame) {
+			Ok(verified) => verified,
+			Err(status) => {
+				return Refusal::to(&frame, &self.trace).peer_ad(status);
+			}
+		};
 
 		let freshness_status = self.replay_guard.admits(&frame);
 		if freshness_status != TransitStatus::Ok {
@@ -49,7 +50,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		}
 
 		// `admit` binds signer fingerprint to dial address, so the pair holds together.
-		let admitted = match AdmittedPeerAd::admit(&frame, &advertisement, &self.config) {
+		let admitted = match AdmittedPeerAd::admit(&verified, &advertisement, &self.config) {
 			Ok(admitted) => admitted,
 			Err(status) => {
 				return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, status);
@@ -109,60 +110,54 @@ where
 		rumor: Box<Frame>,
 	) -> Result<Option<Frame>, TightBeamError> {
 		let rumor = *rumor;
-		let origin_status = self.config.verify_peer_origin(&frame);
-		if origin_status != TransitStatus::Ok {
-			return Refusal::to(&frame, &self.trace).gossip(origin_status);
-		}
-
 		// Colony flood scope (CWE-668): peer MUST share gateway's colony URN.
 		// Mismatch is policy refusal. Do not score the relay.
 		let Some(local_colony) = self.config.colony_urn() else {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		};
 
-		let peer_colony = self
-			.config
-			.namespace
-			.frame_colony_urn(self.config.tls.peer_trust.as_deref(), &frame);
-		if peer_colony.as_ref() != Some(local_colony) {
-			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
-		}
+		let relay_id = match self.config.verify_peer(&frame) {
+			Ok(verified) => {
+				let peer_colony = self.config.namespace.cert_colony_urn(verified.signer_cert());
+				if peer_colony.as_ref() != Some(local_colony) {
+					return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
+				}
+
+				verified.fingerprint()
+			}
+			Err(status) => {
+				return Refusal::to(&frame, &self.trace).gossip(status);
+			}
+		};
 
 		// Outer `lifetime` is hop-authenticated. Missing TTL is relay misbehavior.
 		let hop_ttl = match frame.metadata().lifetime() {
 			Some(hop_ttl) => hop_ttl,
 			None => {
-				self.weaken_invalid_relay(GossipOrigin::Relay, &frame)?;
+				self.weaken_invalid_relay(GossipOrigin::Relay, Some(&relay_id))?;
 				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 			}
 		};
 
-		// Origin signature on the peer trust plane (§5.7.5). Unverifiable rumor scores the relay.
-		let rumor_status = match self.config.tls.peer_trust.as_ref() {
-			Some(trust) => match verify_frame_signature(trust.as_ref(), &rumor) {
-				TrustVerification::Verified => TransitStatus::Ok,
-				TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
-				_ => TransitStatus::PermissionDenied,
-			},
-			None => TransitStatus::PermissionDenied,
+		// Origin signature on the peer trust plane. Unverifiable rumor scores the relay.
+		let (origin_colony, rumor_signer) = match self.config.verify_peer(&rumor) {
+			Ok(verified) => {
+				let colony = self.config.namespace.cert_colony_urn(verified.signer_cert());
+				let signer = verified.fingerprint();
+				(colony, signer)
+			}
+			Err(status) => {
+				self.weaken_invalid_relay(GossipOrigin::Relay, Some(&relay_id))?;
+				return Refusal::to(&frame, &self.trace).gossip(status);
+			}
 		};
-		if rumor_status != TransitStatus::Ok {
-			self.weaken_invalid_relay(GossipOrigin::Relay, &frame)?;
-			return Refusal::to(&frame, &self.trace).gossip(rumor_status);
-		}
-
-		// Origin colony comes from the signer cert (CWE-345). A mismatch
-		// refuses on policy, and relay scoring stays with wire faults.
-		let origin_colony = self
-			.config
-			.namespace
-			.frame_colony_urn(self.config.tls.peer_trust.as_deref(), &rumor);
 		if origin_colony.as_ref() != Some(local_colony) {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		}
 
 		// Freshness uses rumor issue time in `admit` (seen-ttl), not the control window.
-		self.run::<D>(GossipOrigin::Relay, frame, rumor, hop_ttl).await
+		self.run::<D>(GossipOrigin::Relay, frame, rumor, hop_ttl, Some(relay_id), Some(rumor_signer))
+			.await
 	}
 
 	/// Mint and flood origin-signed gossip from a local hive-plane publisher.
@@ -171,9 +166,8 @@ where
 		frame: Frame,
 		body: GossipRumor,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let origin_status = self.config.verify_hive_origin(&frame);
-		if origin_status != TransitStatus::Ok {
-			return Refusal::to(&frame, &self.trace).gossip(origin_status);
+		if let Err(status) = self.config.verify_hive(&frame) {
+			return Refusal::to(&frame, &self.trace).gossip(status);
 		}
 
 		// Origin mint scopes the flood by this gateway's colony SAN.
@@ -205,7 +199,18 @@ where
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 		}
 
-		self.run::<D>(GossipOrigin::Origin, frame, rumor, hop_ttl).await
+		// The mint signs under the gateway identity. Peer-plane verify
+		// names that signer for the rumor apply path so apply does not
+		// re-parse the same frame.
+		let rumor_signer = match self.config.verify_peer(&rumor) {
+			Ok(verified) => verified.fingerprint(),
+			Err(status) => {
+				return Refusal::to(&frame, &self.trace).gossip(status);
+			}
+		};
+
+		self.run::<D>(GossipOrigin::Origin, frame, rumor, hop_ttl, None, Some(rumor_signer))
+			.await
 	}
 }
 
@@ -272,17 +277,12 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		frame: Frame,
 		reconciliation: GossipReconciliation,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let origin_status = self.config.verify_peer_origin(&frame);
-		if origin_status != TransitStatus::Ok {
-			return Refusal::to(&frame, &self.trace).reconcile();
-		}
-
-		// Same-colony only before freshness (CWE-668). A policy refuse
-		// must not leave a replay record behind (CWE-772).
-		let requester_colony = self
-			.config
-			.namespace
-			.frame_colony_urn(self.config.tls.peer_trust.as_deref(), &frame);
+		let requester_colony = match self.config.verify_peer(&frame) {
+			Ok(verified) => self.config.namespace.cert_colony_urn(verified.signer_cert()),
+			Err(_) => {
+				return Refusal::to(&frame, &self.trace).reconcile();
+			}
+		};
 		if self.config.colony_urn().is_none() || requester_colony.as_ref() != self.config.colony_urn() {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}

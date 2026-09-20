@@ -25,9 +25,9 @@ use crate::colony::cluster::peer::{peer_dial_allowed, AdmittedPeerAd};
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::Hop;
 use crate::colony::cluster::runtime::refuse::Refusal;
+use crate::colony::cluster::runtime::VerifiedSignerId;
 use crate::colony::cluster::{
-	gossip_fresh, peer_signer_fingerprint, wanted_digests, Admission, AdmittedGossip, GossipDigest, PeerCaps, PeerHint,
-	RouteKind,
+	gossip_fresh, wanted_digests, Admission, AdmittedGossip, GossipDigest, PeerCaps, PeerHint, RouteKind,
 };
 use crate::colony::cluster::{ClusterConfig, ClusterError, ServletRegistry};
 use crate::colony::common::{
@@ -35,7 +35,6 @@ use crate::colony::common::{
 	GossipWant, PeerAdvertisement, PeerAdvertisementResponse, PeerGossip,
 };
 use crate::colony::common::{reply_frame, TaskGroup};
-use crate::colony::hive::{verify_frame_signature, TrustVerification};
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_GOSSIP_TTL, MAX_PEX_SAMPLE};
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -860,6 +859,8 @@ where
 		frame: Frame,
 		rumor: Frame,
 		hop_ttl: u64,
+		relay_id: Option<VerifiedSignerId>,
+		rumor_signer: Option<VerifiedSignerId>,
 	) -> Result<Option<Frame>, TightBeamError> {
 		let admitted = match AdmittedGossip::admit::<D>(
 			&rumor,
@@ -869,7 +870,7 @@ where
 		) {
 			Ok(admitted) => admitted,
 			Err(status) => {
-				self.weaken_invalid_relay(origin, &frame)?;
+				self.weaken_invalid_relay(origin, relay_id.as_ref())?;
 				return Refusal::to(&frame, &self.trace).gossip(status);
 			}
 		};
@@ -944,11 +945,7 @@ where
 			GossipRumorKind::PeerAdvertisement => {
 				// Only a relayed rumor names a relay hop to fall back on, and
 				// the origin already holds the slate it published.
-				let relay = match origin {
-					GossipOrigin::Relay => Some(&frame),
-					GossipOrigin::Origin => None,
-				};
-				self.apply_peer_ad_rumor(&rumor, relay, admitted.payload())?;
+				self.apply_peer_ad_rumor(relay_id, rumor_signer, admitted.payload())?;
 			}
 		}
 
@@ -993,31 +990,27 @@ where
 	/// 6. Best-effort relay-trail install when hops and dial address allow.
 	fn try_apply_peer_ad_rumor(
 		&self,
-		rumor: &Frame,
-		relay: Option<&Frame>,
+		relay_id: Option<VerifiedSignerId>,
+		rumor_signer: Option<VerifiedSignerId>,
 		payload: impl AsRef<[u8]>,
 	) -> Result<Option<Arc<[u8]>>, TightBeamError> {
+		let Some(rumor_signer) = rumor_signer else {
+			return Ok(None);
+		};
+
 		let payload = payload.as_ref();
 		// `decode` borrows through `AsRef`, so the extra reference is the
 		// signature's requirement, not an indirection slip.
 		let Ok(inner) = decode::<Frame>(&payload) else {
 			return Ok(None);
 		};
-		let Some(trust) = self.config.tls.peer_trust.as_ref() else {
+		let Ok(verified_inner) = self.config.verify_peer(&inner) else {
 			return Ok(None);
 		};
-		if !matches!(verify_frame_signature(trust.as_ref(), &inner), TrustVerification::Verified) {
-			return Ok(None);
-		}
 
 		// The same-origin bind means only the advertiser itself may rumor its
 		// ad, so a rumor's freshness always belongs to the ad it carries.
-		let Some(rumor_signer) = peer_signer_fingerprint(Some(trust.as_ref()), rumor) else {
-			return Ok(None);
-		};
-		let Some(inner_signer) = peer_signer_fingerprint(Some(trust.as_ref()), &inner) else {
-			return Ok(None);
-		};
+		let inner_signer = verified_inner.fingerprint();
 		if rumor_signer != inner_signer {
 			return Ok(None);
 		}
@@ -1033,7 +1026,7 @@ where
 		let Ok(ClusterRequest::AdvertisePeer(advertisement)) = decode::<ClusterRequest>(inner.message()) else {
 			return Ok(None);
 		};
-		let Ok(admitted) = AdmittedPeerAd::admit(&inner, &advertisement, &self.config) else {
+		let Ok(admitted) = AdmittedPeerAd::admit(&verified_inner, &advertisement, &self.config) else {
 			return Ok(None);
 		};
 		let origin = Arc::clone(&admitted.peer_hive_id);
@@ -1043,10 +1036,9 @@ where
 		// this gateway may spend the two forwards a relay needs and the
 		// relay's dial address is known, which is exactly when pheromone can
 		// fail over to it (CWE-772).
-		let relay_id = relay.and_then(|relay_frame| peer_signer_fingerprint(Some(trust.as_ref()), relay_frame));
 		let relay_trail = relay_id.filter(|_| self.config.peer.max_hops >= 2).and_then(|relay_id| {
-			let relay_dial = self.servlet_registry.relay_dial_addr(&relay_id)?;
-			admitted.relay_trail(&relay_id, relay_dial, &self.config.pheromone)
+			let relay_dial = self.servlet_registry.relay_dial_addr(relay_id.as_shared())?;
+			admitted.relay_trail(relay_id.as_shared(), relay_dial, &self.config.pheromone)
 		});
 
 		// The learned origin is also a discovery hint, exactly like a
@@ -1106,12 +1098,12 @@ where
 	/// A.8.15), carrying the rumor signer when verifiable.
 	fn apply_peer_ad_rumor(
 		&self,
-		rumor: &Frame,
-		relay: Option<&Frame>,
+		relay_id: Option<VerifiedSignerId>,
+		rumor_signer: Option<VerifiedSignerId>,
 		payload: impl AsRef<[u8]>,
 	) -> Result<(), TightBeamError> {
 		let payload = payload.as_ref();
-		match self.try_apply_peer_ad_rumor(rumor, relay, payload)? {
+		match self.try_apply_peer_ad_rumor(relay_id, rumor_signer.clone(), payload)? {
 			Some(origin) => {
 				self.trace.event(CLUSTER_PEER_AD_LEARNED)?.with_payload(origin.as_ref()).emit();
 			}
@@ -1119,10 +1111,9 @@ where
 				// The rumor signer is the closest identity a refusal can
 				// name for the audit trail. An unverifiable signer drops
 				// without attribution (ISO 27001 A.8.15).
-				let signer = peer_signer_fingerprint(self.config.tls.peer_trust.as_deref(), rumor);
 				let event = self.trace.event(CLUSTER_PEER_AD_DROPPED)?;
-				match signer {
-					Some(signer) => event.with_payload(signer.as_ref()).emit(),
+				match rumor_signer {
+					Some(signer) => event.with_payload(signer.as_shared().as_ref()).emit(),
 					None => event.emit(),
 				}
 			}
@@ -1135,24 +1126,28 @@ where
 	///
 	/// An origin publish has no relay to score, so it returns without
 	/// effect.
-	pub(crate) fn weaken_invalid_relay(&self, origin: GossipOrigin, frame: &Frame) -> Result<(), TightBeamError> {
+	pub(crate) fn weaken_invalid_relay(
+		&self,
+		origin: GossipOrigin,
+		relay_id: Option<&VerifiedSignerId>,
+	) -> Result<(), TightBeamError> {
 		if matches!(origin, GossipOrigin::Origin) {
 			return Ok(());
 		}
-		let Some(peer_id) = peer_signer_fingerprint(self.config.tls.peer_trust.as_deref(), frame) else {
+		let Some(peer_id) = relay_id else {
 			return Ok(());
 		};
 
 		// A poisoned registry lock is unreachable in a zero-panic crate, so
 		// an unscored trail leaves the refusal itself intact.
-		let Ok(weakened) = self.servlet_registry.weaken_peer(&peer_id) else {
+		let Ok(weakened) = self.servlet_registry.weaken_peer(peer_id.as_shared()) else {
 			return Ok(());
 		};
 		if weakened > 0 {
 			// Audit payload names the scored peer fingerprint.
 			self.trace
 				.event(CLUSTER_GOSSIP_RELAY_WEAKENED)?
-				.with_payload(peer_id.as_ref())
+				.with_payload(peer_id.as_shared().as_ref())
 				.emit();
 		}
 

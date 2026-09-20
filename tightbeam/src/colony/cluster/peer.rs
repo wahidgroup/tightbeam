@@ -3,12 +3,13 @@
 use core::str::FromStr;
 use std::sync::Arc;
 
-use super::{ClusterConfig, PeerHint, PheromoneConfig, ServletEntry, SharedId};
+use super::runtime::VerifiedControlFrame;
+use super::{ClusterConfig, Party, PeerHint, PheromoneConfig, ServletEntry, SharedId};
 use crate::colony::common::ColonyResource;
 use crate::colony::common::{ClusterWorkRequest, ColonyNamespace, PeerAdvertisement};
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
 use crate::crypto::hash::Sha3_256;
-use crate::crypto::x509::store::{CertificateTrust, CertificateTrustStore};
+use crate::crypto::x509::store::CertificateTrustStore;
 use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
 use crate::policy::TransitStatus;
@@ -17,7 +18,6 @@ use crate::transport::tcp::TightBeamSocketAddr;
 use crate::utils::urn::Urn;
 use crate::x509::ext::pkix::name::GeneralName;
 use crate::x509::ext::pkix::SubjectAltName;
-use crate::Frame;
 
 /// Forwards a work request or routed stream open may still spend.
 ///
@@ -116,7 +116,7 @@ impl HopBudget {
 
 /// Peer advertisement that passed signer resolution and wire checks.
 ///
-/// [`AdmittedPeerAd::admit`] is the only public path: the registry never
+/// [`AdmittedPeerAd::admit`] is the only path: the registry never
 /// receives an unvalidated slate, and signer identity cannot be
 /// transposed with the claimed dial address.
 pub struct AdmittedPeerAd {
@@ -154,13 +154,22 @@ impl AdmittedPeerAd {
 	/// must carry a colony URN SAN), then runs wire checks. Caps and
 	/// local-route conflicts are registry policy under
 	/// [`super::ServletRegistry::reconcile_peer_slate`].
-	pub fn admit(frame: &Frame, ad: &PeerAdvertisement, conf: &ClusterConfig) -> Result<Self, TransitStatus> {
+	pub(crate) fn admit(
+		verified: &VerifiedControlFrame<'_>,
+		ad: &PeerAdvertisement,
+		conf: &ClusterConfig,
+	) -> Result<Self, TransitStatus> {
+		if !matches!(verified.party(), Party::Peer) {
+			return Err(TransitStatus::PermissionDenied);
+		}
+
+		let frame = verified.frame();
 		let dial_addr: SharedId = Arc::from(ad.gateway_addr.as_slice());
 
-		// The signer certificate resolves exactly once. The slate key
-		// (fingerprint) and the membership gate both derive from it.
-		let signer_cert =
-			frame_signer_cert(conf.tls.peer_trust.as_deref(), frame).ok_or(TransitStatus::PermissionDenied)?;
+		// The signer certificate is the one the control-frame parse
+		// already resolved. The slate key (fingerprint) and the
+		// membership gate both derive from it.
+		let signer_cert = verified.signer_cert();
 		let peer_hive_id = signer_cert.fingerprint_id().ok_or(TransitStatus::PermissionDenied)?;
 
 		// Federation is a colony operation: both this gateway and the
@@ -195,12 +204,11 @@ impl AdmittedPeerAd {
 	/// Routing then holds two trails per type: the direct trail dialing
 	/// the origin, and a relay trail through the relaying peer.
 	/// Pheromone feedback can therefore fail over to the relay when
-	/// the origin is unreachable. The trails reconcile under their own
-	/// `origin NUL relay` bucket
+	/// the origin is unreachable.
+	///
+	/// The trails reconcile under their own `origin NUL relay` bucket
 	/// ([`super::ServletRegistry::reconcile_relay_trail`]), so the
 	/// origin's direct slate lifecycle never evicts the fallback.
-	/// Returns `None` when the relay is the origin itself (the direct
-	/// trail already dials it) or when the slate advertises nothing.
 	#[must_use]
 	pub fn relay_trail(
 		&self,
@@ -239,9 +247,8 @@ impl AdmittedPeerAd {
 	///
 	/// The advertiser dialed this gateway, so nothing proves the claimed
 	/// address dials back yet. The peer table holds the hint in `new`
-	/// until this gateway's own probe passes the colony gate. The
-	/// Bitcoin address manager holds a self-announced address the same
-	/// way.
+	/// until this gateway's own probe passes the colony gate. The Bitcoin
+	/// address manager holds a self-announced address the same way.
 	///
 	/// The hint owns its fields because it outlives this borrowed
 	/// advertisement inside the peer table.
@@ -310,29 +317,6 @@ fn peer_advertisement_wire_ok(
 	}
 }
 
-/// Resolve a frame's signer certificate on the given trust plane.
-///
-/// Single resolution for signer-derived facts: fingerprint and colony
-/// membership both start here so callers resolve the cert once.
-/// Missing trust, signer, or certificate fails closed with `None`.
-#[must_use]
-pub fn frame_signer_cert<'t>(trust: Option<&'t dyn CertificateTrust>, frame: &Frame) -> Option<&'t Certificate> {
-	let trust = trust?;
-	let signer_info = frame.nonrepudiation()?;
-
-	trust.find_by_signer_info(signer_info)
-}
-
-/// Peer identity from the signer's certificate fingerprint.
-///
-/// Slates reconcile and score misbehavior by fingerprint, never claimed
-/// `gateway_addr`. Missing trust, signer, or fingerprint fails closed.
-#[must_use]
-pub fn peer_signer_fingerprint(trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<SharedId> {
-	let cert = frame_signer_cert(trust, frame)?;
-	cert.fingerprint_id()
-}
-
 impl ColonyNamespace {
 	/// Colony URN a certificate asserts, when exactly one is present.
 	///
@@ -365,17 +349,6 @@ impl ColonyNamespace {
 		}
 
 		colony
-	}
-
-	/// Colony URN of a frame's signer on the given trust plane.
-	///
-	/// Membership travels in the signer certificate, never frame bytes:
-	/// unsigned scope would be weaker than the certificate binding
-	/// (CWE-345). Missing trust, signer, or certificate fails closed.
-	#[must_use]
-	pub fn frame_colony_urn(&self, trust: Option<&dyn CertificateTrust>, frame: &Frame) -> Option<Urn<'static>> {
-		let cert = frame_signer_cert(trust, frame)?;
-		self.cert_colony_urn(cert)
 	}
 }
 

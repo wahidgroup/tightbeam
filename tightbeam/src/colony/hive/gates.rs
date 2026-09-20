@@ -9,13 +9,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::colony::common::current_timestamp_ms;
+use crate::colony::common::{ClusterCommand, HiveManagementRequest};
+use crate::crypto::x509::store::{CertificateTrust, TrustVerification};
+use crate::der::Encode;
 use crate::policy::{GatePolicy, ProvenPeer, SessionContext, TransitStatus};
 use crate::utils::BasisPoints;
 use crate::Frame;
-
-use crate::colony::common::{ClusterCommand, HiveManagementRequest};
-use crate::crypto::x509::store::CertificateTrust;
-use crate::der::Encode;
 use crate::SignerInfo;
 
 // ============================================================================
@@ -182,62 +181,6 @@ impl ClusterCircuitBreaker {
 		};
 
 		signers.retain(|_, circuit| !circuit.is_quiescent());
-	}
-}
-
-// ============================================================================
-// Trust Verification
-// ============================================================================
-
-/// Outcome of verifying a frame signature against a trust store
-///
-/// Distinguishes "no identity claimed" and "unknown identity claimed"
-/// from "trusted identity claimed with a bad signature" so callers can
-/// apply different consequences (the circuit breaker only counts the
-/// last one).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrustVerification {
-	/// Frame carries no nonrepudiation signature
-	MissingSignature,
-	/// Signer is not present in the trust store
-	UnknownSigner,
-	/// Signer is trusted and the signature fails verification
-	Invalid,
-	/// Signature verified against a trusted certificate
-	Verified,
-}
-
-/// Verify a frame's nonrepudiation signature against a trust store
-///
-/// Looks up the signer certificate via the frame's `SignerInfo` and
-/// verifies the signature over the frame's to-be-signed bytes. Shared by
-/// [`ClusterSecurityGate`] (hive side) and the cluster gateway's
-/// registration authentication.
-pub fn verify_frame_signature(trust_store: &dyn CertificateTrust, frame: &Frame) -> TrustVerification {
-	let Some(signer_info) = frame.nonrepudiation() else {
-		return TrustVerification::MissingSignature;
-	};
-
-	let Some(cert) = trust_store.find_by_signer_info(signer_info) else {
-		return TrustVerification::UnknownSigner;
-	};
-
-	let algorithm_oid = signer_info.signature_algorithm.oid;
-	let signature = signer_info.signature.as_bytes();
-	let Ok(public_key_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
-		return TrustVerification::Invalid;
-	};
-
-	let Ok(message) = frame.to_tbs() else {
-		return TrustVerification::Invalid;
-	};
-
-	match trust_store
-		.to_policy_ref()
-		.verify_signature(&algorithm_oid, &public_key_der, &message, signature)
-	{
-		Ok(()) => TrustVerification::Verified,
-		Err(_) => TrustVerification::Invalid,
 	}
 }
 
@@ -569,7 +512,7 @@ impl ClusterSecurityGate {
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
 		}
 
-		match verify_frame_signature(self.trust_store.as_ref(), &frame) {
+		match self.trust_store.verify_frame(&frame) {
 			TrustVerification::MissingSignature => {
 				return Err(AdmitRefusal::boxed(frame, TransitStatus::Unauthenticated, heartbeat));
 			}
@@ -580,7 +523,7 @@ impl ClusterSecurityGate {
 				self.circuit_breaker.record_auth_failure(breaker_key);
 				return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, heartbeat));
 			}
-			TrustVerification::Verified => {}
+			TrustVerification::Verified(_) => {}
 		}
 
 		// Replay capacity spends on well-formed frames (CWE-770).
@@ -941,7 +884,8 @@ mod tests {
 	}
 
 	/// Trust store that resolves every signer and fails every signature,
-	/// which drives [`TrustVerification::Invalid`] deterministically.
+	/// which drives [`crate::crypto::x509::store::TrustVerification::Invalid`]
+	/// deterministically.
 	#[derive(Debug)]
 	struct AlwaysInvalid {
 		certificate: crate::crypto::x509::Certificate,

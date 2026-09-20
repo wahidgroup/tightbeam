@@ -123,6 +123,24 @@ impl RevocationChecker for StaticRevocationList {
 	}
 }
 
+/// Outcome of verifying a frame signature against a trust store.
+///
+/// Distinguishes "no identity claimed" and "unknown identity claimed"
+/// from "trusted identity claimed with a bad signature" so callers can
+/// apply different consequences.
+#[cfg(all(feature = "std", feature = "signature"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustVerification<'a> {
+	/// Frame carries no nonrepudiation signature.
+	MissingSignature,
+	/// Signer is not present in the trust store.
+	UnknownSigner,
+	/// Signer is trusted and the signature fails verification.
+	Invalid,
+	/// Signature verified against the certificate this store resolved.
+	Verified(&'a Certificate),
+}
+
 /// Trait for certificate trust verification.
 ///
 /// Extends `CertificateValidation` with trust-based operations.
@@ -171,6 +189,41 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 
 	/// Get the verification policy for signature operations.
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy;
+
+	/// Verify `frame`'s nonrepudiation signature against this store.
+	///
+	/// Looks up the signer certificate via the frame's `SignerInfo` and
+	/// verifies the signature over the frame's to-be-signed bytes. The
+	/// verified arm returns that certificate so a later step does not
+	/// resolve the signer again.
+	#[cfg(feature = "signature")]
+	fn verify_frame<'a>(&'a self, frame: &crate::Frame) -> TrustVerification<'a> {
+		let Some(signer_info) = frame.nonrepudiation() else {
+			return TrustVerification::MissingSignature;
+		};
+
+		let Some(cert) = self.find_by_signer_info(signer_info) else {
+			return TrustVerification::UnknownSigner;
+		};
+
+		let algorithm_oid = signer_info.signature_algorithm.oid;
+		let signature = signer_info.signature.as_bytes();
+		let Ok(public_key_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
+			return TrustVerification::Invalid;
+		};
+
+		let Ok(message) = frame.to_tbs() else {
+			return TrustVerification::Invalid;
+		};
+
+		match self
+			.to_policy_ref()
+			.verify_signature(&algorithm_oid, &public_key_der, &message, signature)
+		{
+			Ok(()) => TrustVerification::Verified(cert),
+			Err(_) => TrustVerification::Invalid,
+		}
+	}
 }
 
 /// Trait for certificate trust verification (no_std version without SignerIdentifier).

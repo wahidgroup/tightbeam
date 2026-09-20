@@ -106,10 +106,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 	/// Origin and freshness gate shared by register and address-update.
 	fn admit_hive_control(&self, frame: &Frame) -> Result<(), TransitStatus> {
-		let origin_status = self.config.verify_hive_origin(frame);
-		if origin_status != TransitStatus::Ok {
-			return Err(origin_status);
-		}
+		self.config.verify_hive(frame)?;
 
 		let freshness_status = self.replay_guard.admits(frame);
 		if freshness_status != TransitStatus::Ok {

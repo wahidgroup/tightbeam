@@ -20,16 +20,17 @@
 //!
 //! # Origin and freshness
 //!
-//! [`ClusterConfig::verify_hive_origin`] and [`ClusterConfig::verify_peer_origin`] verify frame signatures
-//! against the configured trust stores. [`GatewayReplayGuard`] rejects
+//! [`ClusterConfig::verify_hive`] and [`ClusterConfig::verify_peer`] verify one
+//! control frame and return [`VerifiedControlFrame`]. [`GatewayReplayGuard`] rejects
 //! stale or replayed signed control frames.
 //!
 //! [`GatewayReplayGuard`]: super::freshness::GatewayReplayGuard
 
-use crate::colony::cluster::export::{ExportDecision, ExportPolicy};
+use crate::colony::cluster::export::{ExportDecision, ExportPolicy, Party, TrustPlanes};
 use crate::colony::cluster::peer::ColonyCertificate;
-use crate::colony::cluster::ClusterConfig;
-use crate::colony::hive::{verify_frame_signature, TrustVerification};
+use crate::colony::cluster::{ClusterConfig, SharedId};
+use crate::crypto::x509::store::TrustVerification;
+use crate::crypto::x509::Certificate;
 use crate::instrumentation::events::{CLUSTER_EXPORT_GRANTED, CLUSTER_EXPORT_REFUSED, CLUSTER_GATE_BLOCKED};
 use crate::policy::{GatePolicy, SessionContext, TransitStatus};
 use crate::trace::TraceCollector;
@@ -66,17 +67,99 @@ impl ExportAudit<'_> {
 	}
 }
 
+/// Owned slate key minted with [`VerifiedControlFrame`].
+///
+/// Only [`ClusterConfig::verify_plane`] constructs this. Gossip may
+/// carry the id across `.await` without the borrowed certificate, and
+/// a bare [`SharedId`] cannot stand in for it.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedSignerId(SharedId);
+
+impl VerifiedSignerId {
+	/// Borrow the slate key for registry and audit payloads.
+	#[must_use]
+	pub(crate) fn as_shared(&self) -> &SharedId {
+		&self.0
+	}
+}
+
+/// One verified inbound control frame.
+///
+/// Minted only by [`ClusterConfig::verify_hive`] or
+/// [`ClusterConfig::verify_peer`]. The signature check runs once.
+/// [`Party`] comes from [`TrustPlanes::classify`] on the certificate
+/// that check resolved, so a later step does not verify or look the
+/// signer up again.
+pub(crate) struct VerifiedControlFrame<'a> {
+	frame: &'a Frame,
+	signer_cert: &'a Certificate,
+	party: Party,
+	fingerprint: VerifiedSignerId,
+}
+
+impl<'a> VerifiedControlFrame<'a> {
+	/// The frame this parse verified.
+	#[must_use]
+	pub(crate) fn frame(&self) -> &'a Frame {
+		self.frame
+	}
+
+	/// Certificate the signature verified against.
+	#[must_use]
+	pub(crate) fn signer_cert(&self) -> &'a Certificate {
+		self.signer_cert
+	}
+
+	/// Plane membership of [`Self::signer_cert`].
+	#[must_use]
+	pub(crate) fn party(&self) -> Party {
+		self.party
+	}
+
+	/// Slate key for [`Self::signer_cert`].
+	#[must_use]
+	pub(crate) fn fingerprint(&self) -> VerifiedSignerId {
+		self.fingerprint.clone()
+	}
+}
+
 impl ClusterConfig {
-	/// Whether the frame signer is also a member of `tls.peer_trust`.
+	/// Verify `frame` once on `required` and classify the resolved certificate.
 	///
-	/// Peer membership wins across the whole trust plane. A signer the peer
-	/// store trusts is an external peer, so it must not act on the hive
-	/// plane even where `hive_trust` also trusts it.
-	fn signer_is_peer(&self, frame: &Frame) -> bool {
-		self.tls
-			.peer_trust
-			.as_ref()
-			.is_some_and(|trust| matches!(verify_frame_signature(trust.as_ref(), frame), TrustVerification::Verified))
+	/// Peer membership wins: a certificate in both stores is
+	/// [`Party::Peer`], so a hive-plane parse refuses it. A missing
+	/// store or a failed signature refuses. A frame without a signature
+	/// is unauthenticated.
+	fn verify_plane<'a>(
+		&'a self,
+		frame: &'a Frame,
+		required: Party,
+	) -> Result<VerifiedControlFrame<'a>, TransitStatus> {
+		let store = match required {
+			Party::FirstParty => self.tls.hive_trust.as_deref(),
+			Party::Peer => self.tls.peer_trust.as_deref(),
+			Party::Untrusted => return Err(TransitStatus::PermissionDenied),
+		};
+		let Some(trust) = store else {
+			return Err(TransitStatus::PermissionDenied);
+		};
+		let signer_cert = match trust.verify_frame(frame) {
+			TrustVerification::Verified(cert) => cert,
+			TrustVerification::MissingSignature => return Err(TransitStatus::Unauthenticated),
+			TrustVerification::UnknownSigner | TrustVerification::Invalid => {
+				return Err(TransitStatus::PermissionDenied);
+			}
+		};
+		let party = TrustPlanes::from(&self.tls).classify(Some(signer_cert));
+		if party != required {
+			return Err(TransitStatus::PermissionDenied);
+		}
+		let fingerprint = signer_cert
+			.fingerprint_id()
+			.map(VerifiedSignerId)
+			.ok_or(TransitStatus::PermissionDenied)?;
+
+		Ok(VerifiedControlFrame { frame, signer_cert, party, fingerprint })
 	}
 
 	/// Run configured [`GatePolicy`] instances with no audit side effects.
@@ -168,48 +251,31 @@ impl ClusterConfig {
 		}
 	}
 
-	/// Verify hive-origin control frames against `tls.hive_trust`.
+	/// Verify one hive-plane control frame.
 	///
-	/// - A missing trust store or a failed signature yields [`TransitStatus::PermissionDenied`].
-	/// - A frame without a signature yields [`TransitStatus::Unauthenticated`].
-	///
-	/// A signer that `tls.peer_trust` also trusts is refused: peer membership
-	/// wins, so an identity held by both stores never acts on the hive plane.
+	/// The result carries the signer certificate and [`Party::FirstParty`].
+	/// A signer that `tls.peer_trust` also trusts is [`Party::Peer`] and
+	/// is refused: peer membership wins, so an identity held by both
+	/// stores never acts on the hive plane.
 	///
 	/// # Sources
 	///
 	/// - CWE-306, missing authentication for critical function:
 	///   <https://cwe.mitre.org/data/definitions/306.html>
-	pub(crate) fn verify_hive_origin(&self, frame: &Frame) -> TransitStatus {
-		match self.tls.hive_trust.as_ref() {
-			Some(trust) => match verify_frame_signature(trust.as_ref(), frame) {
-				TrustVerification::Verified if self.signer_is_peer(frame) => TransitStatus::PermissionDenied,
-				TrustVerification::Verified => TransitStatus::Ok,
-				TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
-				_ => TransitStatus::PermissionDenied,
-			},
-			None => TransitStatus::PermissionDenied,
-		}
+	pub(crate) fn verify_hive<'a>(&'a self, frame: &'a Frame) -> Result<VerifiedControlFrame<'a>, TransitStatus> {
+		self.verify_plane(frame, Party::FirstParty)
 	}
 
-	/// Verify peer-origin control frames against `tls.peer_trust`.
+	/// Verify one peer-plane control frame.
 	///
-	/// - A missing trust store or a failed signature yields [`TransitStatus::PermissionDenied`].
-	/// - A frame without a signature yields [`TransitStatus::Unauthenticated`].
+	/// The result carries the signer certificate and [`Party::Peer`].
 	///
 	/// # Sources
 	///
 	/// - CWE-306, missing authentication for critical function:
 	///   <https://cwe.mitre.org/data/definitions/306.html>
-	pub(crate) fn verify_peer_origin(&self, frame: &Frame) -> TransitStatus {
-		match self.tls.peer_trust.as_ref() {
-			Some(trust) => match verify_frame_signature(trust.as_ref(), frame) {
-				TrustVerification::Verified => TransitStatus::Ok,
-				TrustVerification::MissingSignature => TransitStatus::Unauthenticated,
-				_ => TransitStatus::PermissionDenied,
-			},
-			None => TransitStatus::PermissionDenied,
-		}
+	pub(crate) fn verify_peer<'a>(&'a self, frame: &'a Frame) -> Result<VerifiedControlFrame<'a>, TransitStatus> {
+		self.verify_plane(frame, Party::Peer)
 	}
 }
 
@@ -229,7 +295,7 @@ mod tests {
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use crate::crypto::sign::{secp256k1_signer_identifier, sign_canonical, SignatureAlgorithmIdentifier};
-	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, CertificateTrustStore, TrustBuilder};
 	use crate::crypto::x509::Certificate;
 	use crate::der::oid::AssociatedOid;
 	use crate::spki::AlgorithmIdentifierOwned;
@@ -453,10 +519,21 @@ mod tests {
 	fn hive_origin_passes_hive_only_signer() {
 		let key: Secp256k1SigningKey = TestKey::signing();
 		let frame = signed_control_frame(&key);
+		let cert = TestCertificate::self_signed(&key);
 
 		let mut config = exporting_config();
-		config.tls.hive_trust = Some(trust_of(&TestCertificate::self_signed(&key)));
-		assert_eq!(config.verify_hive_origin(&frame), TransitStatus::Ok);
+		config.tls.hive_trust = Some(trust_of(&cert));
+
+		let Ok(verified) = config.verify_hive(&frame) else {
+			assert!(false);
+			return;
+		};
+		assert_eq!(verified.party(), Party::FirstParty);
+		assert_eq!(verified.frame().metadata().id(), frame.metadata().id());
+		assert_eq!(
+			CertificateTrustStore::to_fingerprint::<Sha3_256>(verified.signer_cert()).ok(),
+			CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert).ok()
+		);
 	}
 
 	#[test]
@@ -468,6 +545,22 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
-		assert_eq!(config.verify_hive_origin(&frame), TransitStatus::PermissionDenied);
+		assert!(matches!(config.verify_hive(&frame), Err(TransitStatus::PermissionDenied)));
+	}
+
+	#[test]
+	fn peer_origin_accepts_dual_anchored_signer() {
+		let key: Secp256k1SigningKey = TestKey::signing();
+		let frame = signed_control_frame(&key);
+		let cert = TestCertificate::self_signed(&key);
+
+		let mut config = exporting_config();
+		config.tls.hive_trust = Some(trust_of(&cert));
+		config.tls.peer_trust = Some(trust_of(&cert));
+		let Ok(verified) = config.verify_peer(&frame) else {
+			assert!(false);
+			return;
+		};
+		assert_eq!(verified.party(), Party::Peer);
 	}
 }

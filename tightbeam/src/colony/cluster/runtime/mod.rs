@@ -18,6 +18,8 @@ mod refuse;
 mod registration;
 mod streaming;
 mod verify;
+
+pub(crate) use verify::{VerifiedControlFrame, VerifiedSignerId};
 mod work;
 
 use core::future::Future;

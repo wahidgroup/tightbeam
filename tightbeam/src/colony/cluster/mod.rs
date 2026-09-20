@@ -64,7 +64,7 @@ pub use gossip::{
 	GossipJournal, MemoryGossipJournal, TokenBucketAdmission,
 };
 
-pub use peer::{frame_signer_cert, peer_signer_fingerprint, AdmittedPeerAd, HopBudget, RelayTrail};
+pub use peer::{AdmittedPeerAd, HopBudget, RelayTrail};
 
 use core::future::Future;
 use core::time::Duration;

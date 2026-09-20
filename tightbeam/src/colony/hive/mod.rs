@@ -21,9 +21,7 @@ pub use crate::colony::common::{
 pub use error::HiveError;
 pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker};
 
-pub use gates::{
-	verify_frame_signature, ClusterSecurityGate, PeerListGate, PeerListMode, ReplayGuard, TrustVerification,
-};
+pub use gates::{ClusterSecurityGate, PeerListGate, PeerListMode, ReplayGuard};
 
 use core::future::Future;
 use core::pin::Pin;
