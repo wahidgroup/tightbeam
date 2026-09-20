@@ -172,10 +172,6 @@ impl HiveRegistry {
 
 	/// Register a hive and bind its control-plane signer.
 	///
-	/// Not public: a hive's entry and the routes it owns enter and leave
-	/// together, and this moves only one of them. `ColonyMembership` is
-	/// the door that moves both.
-	///
 	/// Returns the registration this call displaced, when the hive was
 	/// already registered. A caller that installs dependent state next
 	/// needs it to put the previous registration back if that install
@@ -186,13 +182,11 @@ impl HiveRegistry {
 	/// the same signer for this hive id, and re-registration is admitted
 	/// only from the signer bound first (CWE-639).
 	///
-	/// Takes ownership for zero-copy conversion to `Arc<[u8]>`.
-	///
 	/// # Errors
 	///
 	/// - [`ClusterError::SignerMismatch`] -- a different signer already holds this hive id.
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub fn register(
+	pub(crate) fn register(
 		&self,
 		request: RegisterHiveRequest,
 		signer_id: SharedId,

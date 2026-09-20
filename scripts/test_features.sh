@@ -13,13 +13,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # `cargo hack --no-dev-deps` strips `[dev-dependencies]` out of every
 # workspace manifest in place and puts them back when it finishes. A run
 # that dies first, including one a person interrupts, leaves them stripped,
-# and the next build fails on a missing dev-only crate rather than on
-# anything in the tree. Snapshot the manifests and restore them however
-# this script exits.
+# and the next build fails on a missing dev-only crate.
 MANIFEST_SNAPSHOT="$(mktemp -d)"
 
+# Runs from the EXIT trap, and from the signal traps before they exit.
 restore_manifests() {
 	local relative
+
+	[ -d "$MANIFEST_SNAPSHOT" ] || return 0
+
 	for relative in "${TRACKED_MANIFESTS[@]}"; do
 		if ! cmp -s "$MANIFEST_SNAPSHOT/$relative" "$ROOT/$relative"; then
 			cp "$MANIFEST_SNAPSHOT/$relative" "$ROOT/$relative"
@@ -30,13 +32,24 @@ restore_manifests() {
 	rm -rf "$MANIFEST_SNAPSHOT"
 }
 
+# A signal handler that returns lets the run carry on into the next step,
+# so each one restores and then leaves with the conventional code.
+on_signal() {
+	local signal_code="$1"
+
+	restore_manifests
+	exit "$signal_code"
+}
+
 mapfile -t TRACKED_MANIFESTS < <(cd "$ROOT" && git ls-files '*Cargo.toml')
 for manifest in "${TRACKED_MANIFESTS[@]}"; do
 	mkdir -p "$MANIFEST_SNAPSHOT/$(dirname "$manifest")"
 	cp "$ROOT/$manifest" "$MANIFEST_SNAPSHOT/$manifest"
 done
 
-trap restore_manifests EXIT INT TERM
+trap restore_manifests EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 if ! "$ROOT/scripts/tool-installed.sh" cargo-hack; then
 	HACK_VERSION="$("$ROOT/scripts/tool-version.sh" cargo-hack)"

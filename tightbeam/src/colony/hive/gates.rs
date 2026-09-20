@@ -669,10 +669,18 @@ impl ClusterSecurityGate {
 		};
 
 		let Authenticated { signer, signer_id, breaker_key } = authenticated;
-		if !self.circuit_breaker.admit_request(breaker_key) {
+		if !self.replay_guard.check_and_insert(&signer_id, signer.signature.as_bytes(), now) {
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, shape));
 		}
-		if !self.replay_guard.check_and_insert(&signer_id, signer.signature.as_bytes(), now) {
+
+		// The breaker's cooldown probe is taken last, immediately before
+		// the outcome it is waiting for. A probe spent on a path that then
+		// refuses leaves the circuit half-open with nothing recorded, and
+		// half-open admits every request after it.
+		if !self.circuit_breaker.admit_request(breaker_key) {
+			// This frame is not admitted, so its signature must not count
+			// as seen: a legitimate retry would be refused as a replay.
+			self.replay_guard.forget(signer.signature.as_bytes());
 			return Err(AdmitRefusal::boxed(frame, TransitStatus::PermissionDenied, shape));
 		}
 
@@ -1253,6 +1261,36 @@ mod tests {
 		assert!(gate.admit(signed, &sender).is_ok());
 		assert!(!gate.circuit_breaker.is_open(breaker_key()));
 
+		Ok(())
+	}
+
+	/// A refused admission leaves the breaker as it found it.
+	///
+	/// The cooldown probe admits exactly one request. Spending it on a
+	/// path that then refuses parks the circuit half-open with no outcome
+	/// recorded, and half-open admits everything that follows.
+	#[tokio::test]
+	async fn a_refused_admission_does_not_strand_the_breaker_half_open() -> Result<(), crate::TightBeamError> {
+		let (gate, sender, signed) = verified_gate_with_breaker(ClusterCircuitBreaker::new(1, 0)).await?;
+		let peer_key = sender.peer_public_key().expect("the session carries a peer key").to_vec();
+		let breaker_key = || ProvenPeer::for_test(&peer_key);
+
+		gate.circuit_breaker.record_auth_failure(breaker_key());
+		assert!(gate.circuit_breaker.is_open(breaker_key()));
+
+		// Fill this signer's replay partition, so the admission refuses
+		// after the checks that spend have started.
+		let signer_id = signed.signer_id().expect("the signed frame carries a signer id");
+		let now = current_timestamp_ms();
+		for index in 0..REPLAY_GUARD_CAPACITY {
+			let filler = index.to_be_bytes();
+			assert!(gate.replay_guard.check_and_insert(&signer_id, filler, now));
+		}
+
+		let refusal = gate.admit(signed, &sender).err().map(|refusal| refusal.status());
+
+		assert_eq!(refusal, Some(TransitStatus::PermissionDenied));
+		assert!(gate.circuit_breaker.is_open(breaker_key()));
 		Ok(())
 	}
 
