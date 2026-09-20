@@ -16,7 +16,6 @@ use crate::crypto::x509::Certificate;
 use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::Protocol;
-use crate::SignerInfo;
 use crate::TightBeamError;
 
 type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
@@ -93,10 +92,6 @@ impl CertificateTrust for ValidatedTrust {
 		self.store.is_trusted(cert)
 	}
 
-	fn trusts_public_key(&self, cert: &Certificate) -> bool {
-		self.store.trusts_public_key(cert)
-	}
-
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
 		self.store.verify_chain(chain)?;
 
@@ -107,8 +102,8 @@ impl CertificateTrust for ValidatedTrust {
 		self.validate_leaf(leaf)
 	}
 
-	fn find_by_signer_info(&self, signer_info: &SignerInfo) -> Option<&Certificate> {
-		self.store.find_by_signer_info(signer_info)
+	fn find_by_signer_identifier(&self, sid: &crate::cms::signed_data::SignerIdentifier) -> Option<&Certificate> {
+		self.store.find_by_signer_identifier(sid)
 	}
 
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy {

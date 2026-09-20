@@ -928,7 +928,10 @@ mod tests {
 			Ok(())
 		}
 
-		fn find_by_signer_info(&self, _signer_info: &crate::SignerInfo) -> Option<&crate::crypto::x509::Certificate> {
+		fn find_by_signer_identifier(
+			&self,
+			_sid: &crate::cms::signed_data::SignerIdentifier,
+		) -> Option<&crate::crypto::x509::Certificate> {
 			Some(&self.certificate)
 		}
 

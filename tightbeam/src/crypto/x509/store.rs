@@ -19,7 +19,7 @@ mod std_imports {
 	pub use crate::crypto::policy::VerificationPolicy;
 	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::crypto::x509::name::Name;
-	pub use crate::crypto::x509::utils::{CertificateExt, Fingerprint, Skid};
+	pub use crate::crypto::x509::utils::{compute_signer_identifier_from_der, CertificateExt, Fingerprint, Skid};
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::der::Encode;
 }
@@ -155,10 +155,19 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 
 	/// Whether this store holds any certificate for `cert`'s public key.
 	///
-	/// The default falls back to [`Self::is_trusted`]. Stores that index
-	/// by key override this.
+	/// Membership is the SubjectKeyIdentifier of the SPKI, resolved
+	/// through [`Self::find_by_signer_identifier`]. A rotated certificate
+	/// for an enrolled key still matches. Implementors that answer SID
+	/// lookup correctly get this behavior without an override.
 	fn trusts_public_key(&self, cert: &Certificate) -> bool {
-		self.is_trusted(cert)
+		let Ok(spki_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
+			return false;
+		};
+		let Ok(sid) = compute_signer_identifier_from_der::<Sha3_256>(spki_der.as_slice()) else {
+			return false;
+		};
+
+		self.find_by_signer_identifier(&sid).is_some()
 	}
 
 	/// Verify a certificate chain (partial RFC 5280 §6.1 path validation).
@@ -185,18 +194,20 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// - `Err(_)` if validation fails
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
 
+	/// Find a certificate by CMS [`SignerIdentifier`].
+	///
+	/// This is the key-identity lookup frame verification and plane
+	/// classification share. Issuer-and-serial and subject-key-identifier
+	/// forms both resolve here.
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate>;
+
 	/// Find a certificate by SignerInfo.
 	///
-	/// Used for frame signature verification - looks up the signer's certificate
-	/// using the SignerInfo's identifier and digest algorithm.
-	///
-	/// # Arguments
-	/// * `signer_info` - SignerInfo from the frame's nonrepudiation field
-	///
-	/// # Returns
-	/// - `Some(&Certificate)` if a matching certificate is found
-	/// - `None` if no certificate matches
-	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate>;
+	/// Used for frame signature verification. Resolves through
+	/// [`Self::find_by_signer_identifier`] on the info's `sid`.
+	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate> {
+		self.find_by_signer_identifier(&signer_info.sid)
+	}
 
 	/// Get the verification policy for signature operations.
 	fn to_policy_ref(&self) -> &dyn VerificationPolicy;
@@ -588,19 +599,6 @@ impl CertificateTrust for CertificateTrustStore {
 		}
 	}
 
-	fn trusts_public_key(&self, cert: &Certificate) -> bool {
-		let Ok(spki_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
-			return false;
-		};
-
-		let hash = Sha3_256::digest(&spki_der);
-		let Ok(skid) = Skid::from_digest(hash.as_slice()) else {
-			return false;
-		};
-
-		self.skid_index.contains_key(&skid)
-	}
-
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.1: the chain must terminate at a configured trust anchor.
 		let root = chain.first().ok_or(CertificateValidationError::EmptyChain)?;
@@ -614,14 +612,11 @@ impl CertificateTrust for CertificateTrustStore {
 		self.validate_path(&path)
 	}
 
-	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate> {
-		match &signer_info.sid {
-			SignerIdentifier::IssuerAndSerialNumber(ias) => {
-				// Find by issuer DN + serial number
-				self.certificates.values().find(|cert| {
-					cert.tbs_certificate.issuer == ias.issuer && cert.tbs_certificate.serial_number == ias.serial_number
-				})
-			}
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate> {
+		match sid {
+			SignerIdentifier::IssuerAndSerialNumber(ias) => self.certificates.values().find(|cert| {
+				cert.tbs_certificate.issuer == ias.issuer && cert.tbs_certificate.serial_number == ias.serial_number
+			}),
 			SignerIdentifier::SubjectKeyIdentifier(skid) => {
 				let key = Skid::parse(skid.0.as_bytes())?;
 				self.skid_index.get(&key).and_then(|fp| self.certificates.get(fp))
