@@ -198,8 +198,10 @@ fn gossip_converged(journals: impl AsRef<[Arc<MemoryGossipJournal>]>, held: usiz
 	let now = current_timestamp_ms();
 	journals.iter().all(|journal| {
 		let held_now = journal.held_digests(now).is_ok_and(|digests| digests.len() == held);
-		let none_pending = journal.pending_local(now).is_ok_and(|rumors| rumors.is_empty());
-		held_now && none_pending
+		// Delivery in flight still counts as undelivered, so convergence
+		// waits for the local ingress round trip rather than the claim.
+		let all_delivered = journal.undelivered_local(now).is_ok_and(|count| count == 0);
+		held_now && all_delivered
 	})
 }
 
@@ -805,6 +807,14 @@ impl GossipJournal for CountingJournal {
 		self.inner.pending_local(now_ms)
 	}
 
+	fn claim_local(&self, digest: &GossipDigest, now_ms: u64) -> Result<LocalClaim, ClusterError> {
+		self.inner.claim_local(digest, now_ms)
+	}
+
+	fn release_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
+		self.inner.release_local(digest)
+	}
+
 	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
 		self.acks.fetch_add(1, Ordering::SeqCst);
 		self.inner.ack_local(digest)
@@ -1061,6 +1071,126 @@ tb_scenario! {
 	}
 }
 
+/// Journal that reports every rumor as claimed by another task.
+///
+/// That is what the reconcile beat sees while an admission is mid-delivery,
+/// and what the admission sees while the beat is. Either way the second
+/// caller must not deliver.
+struct HeldJournal {
+	inner: MemoryGossipJournal,
+	acks: AtomicU64,
+}
+
+impl Default for HeldJournal {
+	fn default() -> Self {
+		Self { inner: MemoryGossipJournal::default(), acks: AtomicU64::new(0) }
+	}
+}
+
+impl GossipJournal for HeldJournal {
+	fn record(
+		&self,
+		signer: &[u8],
+		digest: GossipDigest,
+		rumor: &Frame,
+		now_ms: u64,
+	) -> Result<Admission, ClusterError> {
+		self.inner.record(signer, digest, rumor, now_ms)
+	}
+
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, now_ms)
+	}
+
+	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
+		self.inner.seen(digest, now_ms)
+	}
+
+	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
+		self.inner.held_digests(now_ms)
+	}
+
+	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.fetch(wanted, now_ms)
+	}
+
+	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.pending_local(now_ms)
+	}
+
+	fn claim_local(&self, _digest: &GossipDigest, _now_ms: u64) -> Result<LocalClaim, ClusterError> {
+		Ok(LocalClaim::Held)
+	}
+
+	fn release_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
+		self.inner.release_local(digest)
+	}
+
+	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
+		self.acks.fetch_add(1, Ordering::SeqCst);
+		self.inner.ack_local(digest)
+	}
+
+	fn retention_ms(&self) -> u64 {
+		self.inner.retention_ms()
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterGossipHeldClaimSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(GOSSIP_PUBLISH_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
+			(events::CLUSTER_GOSSIP_ACCEPTED, exactly!(0)),
+			(JOURNAL_ACKS, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// A rumor another task already claimed is not delivered a second time.
+//
+// The delivery path must take the claim before the ingress round trip. A
+// path that skipped the claim would deliver this rumor, ack it, and trace
+// CLUSTER_GOSSIP_ACCEPTED, which is the at-least-once behaviour the claim
+// exists to remove (CWE-362).
+tb_scenario! {
+	name: cluster_gossip_held_claim_is_not_delivered_twice,
+	spec: ClusterGossipHeldClaimSpec,
+	environment Hive {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: _ }| start_ping_hive(trace, hive_plane_certs(), None),
+		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let journal = Arc::new(HeldJournal::default());
+			let mut conf = peering_cluster_conf(&certs);
+			conf.tls.hive_trust = Some(split_hive_trust(&certs));
+			conf.gossip = GossipConfig {
+				journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
+				ingress: Some(servlet_urn("ping")),
+				..Default::default()
+			};
+
+			let gateway = start_cluster(&trace, conf).await?;
+			hive.register_with_cluster(gateway.addr()).await?;
+
+			let frame = hive_publish_gossip(
+				b"held-rumor",
+				rumor_body(encode(&PingRequest { value: 21 })?),
+				0,
+			)
+			.await?;
+			send_gossip_frame(&trace, &certs, &gateway, frame).await?;
+
+			trace.event_with(JOURNAL_ACKS, &[], journal.acks.load(Ordering::SeqCst))?;
+
+			gateway.stop();
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
 tb_assert_spec! {
 	pub ClusterGossipInvalidRelaySpec,
 	V(1,0,0): {
@@ -1186,6 +1316,15 @@ impl GossipJournal for AmnesiacJournal {
 
 	fn pending_local(&self, _now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
 		Ok(Vec::new())
+	}
+
+	// The grey hole retains nothing, so no rumor of its is ever retried.
+	fn claim_local(&self, _digest: &GossipDigest, _now_ms: u64) -> Result<LocalClaim, ClusterError> {
+		Ok(LocalClaim::Untracked)
+	}
+
+	fn release_local(&self, _digest: &GossipDigest) -> Result<(), ClusterError> {
+		Ok(())
 	}
 
 	fn ack_local(&self, _digest: &GossipDigest) -> Result<(), ClusterError> {
@@ -1756,10 +1895,12 @@ tb_scenario! {
 
 			let (mut conf_s, _journal_s) = gossip_cluster_conf(&certs, vec![gateway_p.addr().to_string()]);
 			conf_s.peer.advertise_interval = Some(Duration::from_millis(100));
+			let table_s = Arc::clone(conf_s.peer.table());
 			let gateway_s = start_cluster(&trace, conf_s).await?;
 
 			let (mut conf_x, journal_x) = gossip_cluster_conf(&certs, vec![gateway_s.addr().to_string()]);
 			conf_x.peer.advertise_interval = Some(Duration::from_millis(100));
+			let table_x = Arc::clone(conf_x.peer.table());
 			let gateway_x = start_cluster(&trace, conf_x).await?;
 
 			let hive_x = start_ping_hive(trace.share(), hive_plane_certs(), None).await?;
@@ -1777,6 +1918,12 @@ tb_scenario! {
 			let converged =
 				wait_for_gossip_converged(&[journal_p, journal_x], 1, 100, Duration::from_millis(100)).await;
 			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
+
+			// The spec counts promotions, and each one is a beat apart from
+			// convergence. Wait for the beats this scenario is about before
+			// taking the gateways away from them.
+			wait_for_promoted(&table_s, 1, 100, Duration::from_millis(100)).await;
+			wait_for_promoted(&table_x, 1, 100, Duration::from_millis(100)).await;
 
 			gateway_p.stop();
 			gateway_s.stop();
@@ -1824,18 +1971,18 @@ tb_scenario! {
 	environment Bare {
 		context: cluster_certs(),
 		exec: |SetupEnv { trace, context: certs }| {
-			let anchor = "127.0.0.1:9000".to_string();
-			let conf = peering_cluster_conf_with_peers(&certs, vec![anchor.clone()]);
-			let table = Arc::clone(&conf.peer.table);
-
+			let anchor = peer_addr("127.0.0.1:9000");
+			let conf = peering_cluster_conf_with_peers(&certs, vec![anchor.to_string()]);
+			let table = Arc::clone(conf.peer.table());
 			let flood: Vec<PeerHint> = (0..MAX_PEER_BUCKET + 8)
-				.map(|host| PeerHint { gateway_addr: format!("10.66.0.{}:9000", host + 1), peer_id: None })
+				.map(|host| PeerHint { gateway_addr: peer_addr(format!("10.66.0.{}:9000", host + 1)), peer_id: None })
 				.collect();
+
 			let admitted = table.learn(flood.clone()).unwrap_or_default();
 			trace.event_with(PEER_TABLE_FLOOD_ADMITTED, &[], admitted as u64)?;
 
 			for hint in &flood {
-				let _ = table.promote(&hint.gateway_addr, None, current_timestamp_ms());
+				let _ = table.promote(hint.gateway_addr, None, current_timestamp_ms());
 			}
 
 			let targets = table.target_set().unwrap_or_default();
@@ -1953,15 +2100,16 @@ tb_scenario! {
 			let member_conf = peering_cluster_conf_with_trust(&ctx.local, Arc::clone(&ctx.shared_trust));
 			let member = start_cluster(&trace, member_conf).await?;
 			let prober_conf = probing_cluster_conf(&ctx);
-			let table = Arc::clone(&prober_conf.peer.table);
+			let table = Arc::clone(prober_conf.peer.table());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let foreign_addr = cluster.addr().to_string();
-			let member_addr = member.addr().to_string();
+			let foreign_addr = peer_addr(cluster.addr().to_string());
+			let member_addr = peer_addr(member.addr().to_string());
 			let hints = vec![
-				PeerHint { gateway_addr: foreign_addr.clone(), peer_id: None },
-				PeerHint { gateway_addr: member_addr.clone(), peer_id: None },
+				PeerHint { gateway_addr: foreign_addr, peer_id: None },
+				PeerHint { gateway_addr: member_addr, peer_id: None },
 			];
+
 			let admitted = table.learn(hints).unwrap_or_default();
 			trace.event_with(PEER_PROBE_HINTS_ADMITTED, &[], admitted as u64)?;
 
@@ -1978,16 +2126,36 @@ tb_scenario! {
 	}
 }
 
+/// Parse a fixture dial address, which the peer table takes parsed.
+fn peer_addr(text: impl AsRef<str>) -> PeerAddress {
+	text.as_ref().parse().expect("fixture address parses as a socket")
+}
+
 /// Poll until `addr` leaves the beat targets or attempts exhaust.
 /// Eviction runs on the advertise beat's cadence, so the outcome is
 /// only observable by polling. Branching lives here, not in scenarios.
-async fn wait_for_target_dropped(table: &PeerTable, addr: impl AsRef<str>, attempts: u32, interval: Duration) -> bool {
-	let addr = addr.as_ref();
-	let dropped = |table: &PeerTable| {
-		table
-			.target_set()
-			.is_ok_and(|targets| !targets.iter().any(|target| target == addr))
-	};
+/// Waits until `table` has promoted at least `count` learned peers.
+///
+/// `CLUSTER_PEER_DISCOVERED` fires on that promotion, which the advertise
+/// beat drives. A scenario that stops its gateways the moment gossip
+/// converges can outrun the beat, so a spec asserting a discovery count
+/// needs this wait rather than the convergence one. Branching lives here,
+/// not in scenarios.
+async fn wait_for_promoted(table: &PeerTable, count: usize, attempts: u32, interval: Duration) -> bool {
+	let promoted = |table: &PeerTable| table.learned().is_ok_and(|(_, tried)| tried >= count);
+	for _ in 0..attempts {
+		if promoted(table) {
+			return true;
+		}
+
+		tokio::time::sleep(interval).await;
+	}
+
+	promoted(table)
+}
+
+async fn wait_for_target_dropped(table: &PeerTable, addr: PeerAddress, attempts: u32, interval: Duration) -> bool {
+	let dropped = |table: &PeerTable| table.target_set().is_ok_and(|targets| !targets.contains(&addr));
 	for _ in 0..attempts {
 		if dropped(table) {
 			return true;
@@ -2053,12 +2221,13 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let (rogue, rogue_addr) = start_oversized_reconcile_server(&certs).await?;
+			let rogue_addr = peer_addr(rogue_addr);
 
 			let prober_conf = fast_probing_conf(&certs, Arc::clone(&certs.trust));
-			let table = Arc::clone(&prober_conf.peer.table);
+			let table = Arc::clone(prober_conf.peer.table());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let _ = table.learn(vec![PeerHint { gateway_addr: rogue_addr.clone(), peer_id: None }]);
+			let _ = table.learn(vec![PeerHint { gateway_addr: rogue_addr, peer_id: None }]);
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
 			let targets = table.target_set().unwrap_or_default();
@@ -2112,11 +2281,11 @@ tb_scenario! {
 			// - The dropped listener refuses that dial, as a dead remote process would.
 			prober_conf.pool_config.idle_timeout = Some(Duration::from_millis(50));
 
-			let table = Arc::clone(&prober_conf.peer.table);
+			let table = Arc::clone(prober_conf.peer.table());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let member_addr = cluster.addr().to_string();
-			let _ = table.learn(vec![PeerHint { gateway_addr: member_addr.clone(), peer_id: None }]);
+			let member_addr = peer_addr(cluster.addr().to_string());
+			let _ = table.learn(vec![PeerHint { gateway_addr: member_addr, peer_id: None }]);
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
 			let targets = table.target_set().unwrap_or_default();
@@ -2124,7 +2293,7 @@ tb_scenario! {
 
 			cluster.stop();
 
-			let dropped = wait_for_target_dropped(&table, &member_addr, 50, Duration::from_millis(100)).await;
+			let dropped = wait_for_target_dropped(&table, member_addr, 50, Duration::from_millis(100)).await;
 			trace.event_with(PEER_EVICT_TARGET_DROPPED, &[], dropped)?;
 
 			prober.stop();
@@ -2191,6 +2360,14 @@ impl GossipJournal for FaultSwitchJournal {
 		self.inner.pending_local(now_ms)
 	}
 
+	fn claim_local(&self, digest: &GossipDigest, now_ms: u64) -> Result<LocalClaim, ClusterError> {
+		self.inner.claim_local(digest, now_ms)
+	}
+
+	fn release_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
+		self.inner.release_local(digest)
+	}
+
 	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
 		self.inner.ack_local(digest)
 	}
@@ -2234,11 +2411,11 @@ tb_scenario! {
 			let mut prober_conf = fast_probing_conf(&certs, Arc::clone(&certs.trust));
 			prober_conf.gossip.journal = Arc::clone(&journal) as Arc<dyn GossipJournal>;
 
-			let table = Arc::clone(&prober_conf.peer.table);
+			let table = Arc::clone(prober_conf.peer.table());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let member_addr = cluster.addr().to_string();
-			let _ = table.learn(vec![PeerHint { gateway_addr: member_addr.clone(), peer_id: None }]);
+			let member_addr = peer_addr(cluster.addr().to_string());
+			let _ = table.learn(vec![PeerHint { gateway_addr: member_addr, peer_id: None }]);
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
 			let targets = table.target_set().unwrap_or_default();
@@ -2248,7 +2425,7 @@ tb_scenario! {
 
 			// The poll window covers the eviction threshold several times
 			// over at the fast beat cadence, so a scored fault would show.
-			let dropped = wait_for_target_dropped(&table, &member_addr, 15, Duration::from_millis(100)).await;
+			let dropped = wait_for_target_dropped(&table, member_addr, 15, Duration::from_millis(100)).await;
 			trace.event_with(PEER_LOCAL_FAULT_MEMBER_RETAINED, &[], !dropped)?;
 
 			prober.stop();

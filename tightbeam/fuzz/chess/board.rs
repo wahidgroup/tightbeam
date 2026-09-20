@@ -190,7 +190,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: raw |message, ctx| async move {
 		let trace = ctx.trace();
-		let config: &ChessEngineServletConfig = ctx.env_config()?;
+		let config: &ChessEngineServletConfig = ctx.env_config();
 		let message_id = message.metadata().id().to_vec();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {

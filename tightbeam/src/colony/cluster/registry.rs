@@ -1,10 +1,11 @@
 //! Hive registry: membership, utilization, and servlet-type reverse index.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::error::ClusterError;
+use crate::colony::cluster::servlet_registry::{ServletEntry, ServletRegistry};
 use crate::colony::common::RegisterHiveRequest;
 use crate::utils::BasisPoints;
 use crate::Frame;
@@ -17,8 +18,6 @@ pub type SharedId = Arc<[u8]>;
 pub struct HiveEntry {
 	/// Hive control address
 	pub address: SharedId,
-	/// Available servlet types
-	pub servlet_types: Arc<[SharedId]>,
 	/// Last reported utilization
 	pub utilization: BasisPoints,
 	/// Timestamp of last successful heartbeat
@@ -50,16 +49,17 @@ impl HiveEntry {
 	}
 }
 
-/// Registered hives and the servlet-type index they produce.
+/// Registered hives, keyed by control address.
 ///
-/// The index is derived from each entry's `servlet_types`, so both live
-/// behind one lock and under one owner. A signer check and the insert it
-/// guards run under a single guard, and a type lookup sees hives the map
-/// still holds (CWE-362, CWE-367).
+/// Which servlet types a hive serves is not held here: [`ServletRegistry`]
+/// owns every route, and a hive's address update changes that registry alone.
+/// A second index here would answer from a picture no mutator kept current.
+///
+/// A signer check and the insert it guards run under a single guard
+/// (CWE-362, CWE-367).
 #[derive(Default)]
 struct Members {
 	hives: HashMap<SharedId, HiveEntry>,
-	by_type: HashMap<SharedId, Vec<SharedId>>,
 }
 
 impl Members {
@@ -76,44 +76,14 @@ impl Members {
 		existing.signer_id.as_ref() == incoming.as_ref()
 	}
 
-	/// Replaces any prior registration and reindexes its servlet types.
-	fn insert(&mut self, hive_id: SharedId, entry: HiveEntry) {
-		self.remove(hive_id.as_ref());
-
-		for servlet_type in entry.servlet_types.iter() {
-			self.by_type
-				.entry(Arc::clone(servlet_type))
-				.or_default()
-				.push(Arc::clone(&hive_id));
-		}
-
-		self.hives.insert(hive_id, entry);
+	/// Replaces any prior registration, returning the entry it displaced.
+	fn insert(&mut self, hive_id: SharedId, entry: HiveEntry) -> Option<HiveEntry> {
+		self.hives.insert(hive_id, entry)
 	}
 
 	fn remove(&mut self, hive_id: impl AsRef<[u8]>) -> Option<HiveEntry> {
 		let hive_id = hive_id.as_ref();
-		let entry = self.hives.remove(hive_id)?;
-		for servlet_type in entry.servlet_types.iter() {
-			let Some(hive_ids) = self.by_type.get_mut(servlet_type) else {
-				continue;
-			};
-
-			hive_ids.retain(|id| id.as_ref() != hive_id);
-			if hive_ids.is_empty() {
-				self.by_type.remove(servlet_type);
-			}
-		}
-
-		Some(entry)
-	}
-
-	fn for_type(&self, servlet_type: impl AsRef<[u8]>) -> Vec<HiveEntry> {
-		let servlet_type = servlet_type.as_ref();
-		let Some(hive_ids) = self.by_type.get(servlet_type) else {
-			return Vec::new();
-		};
-
-		hive_ids.iter().filter_map(|id| self.hives.get(id.as_ref()).cloned()).collect()
+		self.hives.remove(hive_id)
 	}
 
 	fn signer_for(&self, hive_id: impl AsRef<[u8]>) -> Option<SharedId> {
@@ -160,10 +130,6 @@ impl Members {
 		}
 	}
 
-	fn available_servlets(&self) -> Vec<SharedId> {
-		self.by_type.keys().map(Arc::clone).collect()
-	}
-
 	fn all(&self) -> Vec<HiveEntry> {
 		self.hives.values().cloned().collect()
 	}
@@ -181,10 +147,17 @@ impl Members {
 	}
 }
 
-/// Registry of hives with servlet type indexing
+/// Registry of hives keyed by control address.
 ///
-/// Maintains a mapping of hives and a reverse index from servlet types
-/// to hives that support them. Thread-safe for concurrent access.
+/// Which servlet types a hive serves is answered by [`ServletRegistry`],
+/// which owns every route.
+///
+/// # Lock order
+///
+/// This registry takes its one lock inside each method and never yields a
+/// guard or calls a caller-supplied closure while holding it, so no method
+/// here can be part of a nested acquisition. The membership view relies on
+/// that to touch this registry and [`ServletRegistry`] in sequence.
 pub struct HiveRegistry {
 	members: RwLock<Members>,
 	/// Heartbeat timeout for eviction
@@ -197,8 +170,16 @@ impl HiveRegistry {
 		Self { members: RwLock::new(Members::default()), timeout }
 	}
 
-	/// Register a hive, bind its control-plane signer, and index its
-	/// servlet types.
+	/// Register a hive and bind its control-plane signer.
+	///
+	/// Not public: a hive's entry and the routes it owns enter and leave
+	/// together, and this moves only one of them. `ColonyMembership` is
+	/// the door that moves both.
+	///
+	/// Returns the registration this call displaced, when the hive was
+	/// already registered. A caller that installs dependent state next
+	/// needs it to put the previous registration back if that install
+	/// fails, so dropping it forfeits the rollback.
 	///
 	/// `signer_id` is the DER-encoded `SignerIdentifier` from the
 	/// registration frame. Later `ServletAddressUpdate` calls must present
@@ -211,29 +192,18 @@ impl HiveRegistry {
 	///
 	/// - [`ClusterError::SignerMismatch`] -- a different signer already holds this hive id.
 	/// - [`ClusterError::LockPoisoned`] -- the member table is poisoned.
-	pub fn register(&self, request: RegisterHiveRequest, signer_id: SharedId) -> Result<(), ClusterError> {
+	pub fn register(
+		&self,
+		request: RegisterHiveRequest,
+		signer_id: SharedId,
+	) -> Result<Option<HiveEntry>, ClusterError> {
 		let hive_id: SharedId = request.hive_addr.into();
-
-		// Index by servlet TYPE: instance URNs collapse onto their type
-		// key so work routed by type finds every instance-bearing hive.
-		let mut seen = HashSet::new();
-		let servlet_types: Arc<[SharedId]> = request
-			.servlet_addresses
-			.iter()
-			.filter_map(|info| {
-				let type_key: SharedId = Arc::from(info.servlet_id.type_canonical_bytes().as_slice());
-				seen.insert(Arc::clone(&type_key)).then_some(type_key)
-			})
-			.collect();
-
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
 		let claimed = Arc::clone(&signer_id);
 
 		let address = Arc::clone(&hive_id);
-		let entry_servlet_types = Arc::clone(&servlet_types);
 		let entry = HiveEntry {
 			address,
-			servlet_types: entry_servlet_types,
 			utilization: BasisPoints::default(),
 			last_seen: Instant::now(),
 			metadata,
@@ -246,8 +216,29 @@ impl HiveRegistry {
 			return Err(ClusterError::SignerMismatch);
 		}
 
-		members.insert(hive_id, entry);
-		Ok(())
+		Ok(members.insert(hive_id, entry))
+	}
+
+	/// Put back a registration a rollback displaced.
+	///
+	/// The restored entry passes the same signer check its registration
+	/// passed, under one guard: this mutator is not a way around the
+	/// binding [`HiveRegistry::register`] enforces (CWE-639). A restore
+	/// the check refuses leaves the id unregistered, which is the state a
+	/// refused registration should leave behind anyway.
+	///
+	/// A poisoned lock is a panic this crate forbids, so a restore that
+	/// cannot take the lock leaves the failed registration removed rather
+	/// than failing the caller a second time.
+	pub(crate) fn restore(&self, hive_id: SharedId, entry: HiveEntry) {
+		let Ok(mut members) = self.members.write() else {
+			return;
+		};
+
+		let claimed = Arc::clone(&entry.signer_id);
+		if members.admits_signer(hive_id.as_ref(), &claimed) {
+			members.insert(hive_id, entry);
+		}
 	}
 
 	/// Signer bound to `hive_id` at registration, if any
@@ -270,16 +261,10 @@ impl HiveRegistry {
 		}
 	}
 
-	/// Unregister a hive and remove from indices
-	pub fn unregister(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<HiveEntry>, ClusterError> {
+	/// Unregister a hive and return the entry it held
+	pub(crate) fn unregister(&self, hive_id: impl AsRef<[u8]>) -> Result<Option<HiveEntry>, ClusterError> {
 		let hive_id = hive_id.as_ref();
 		Ok(self.members.write()?.remove(hive_id))
-	}
-
-	/// Find all hives that support a servlet type
-	pub fn hives_for_type(&self, servlet_type: impl AsRef<[u8]>) -> Result<Vec<HiveEntry>, ClusterError> {
-		let servlet_type = servlet_type.as_ref();
-		Ok(self.members.read()?.for_type(servlet_type))
 	}
 
 	/// Update hive utilization from heartbeat
@@ -316,19 +301,13 @@ impl HiveRegistry {
 	///
 	/// Returns the evicted entries so callers can retire dependent state
 	/// (e.g. servlet registry rows) for each evicted hive.
-	pub fn evict_stale(&self) -> Result<Vec<HiveEntry>, ClusterError> {
+	pub(crate) fn evict_stale(&self) -> Result<Vec<HiveEntry>, ClusterError> {
 		let now = Instant::now();
 		let mut members = self.members.write()?;
 
 		let stale_ids = members.stale(now, self.timeout);
 		let evicted = stale_ids.iter().filter_map(|id| members.remove(id.as_ref())).collect();
 		Ok(evicted)
-	}
-
-	/// List all available servlet types across all registered hives
-	pub fn to_available_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
-		let members = self.members.read()?;
-		Ok(members.available_servlets())
 	}
 
 	/// Get a snapshot of all registered hives
@@ -355,9 +334,79 @@ impl Default for HiveRegistry {
 	}
 }
 
+/// The two registries one hive's membership spans.
+///
+/// A hive's entry lives in [`HiveRegistry`] and its servlet routes live in
+/// [`ServletRegistry`]. The pair enters and leaves together, so admission
+/// and retirement are operations here rather than a sequence each caller
+/// repeats. A caller that retired only the hive entry would leave routes
+/// pointing at a hive the colony no longer beats.
+pub(crate) struct ColonyMembership<'a> {
+	hives: &'a HiveRegistry,
+	servlets: &'a ServletRegistry,
+}
+
+impl<'a> ColonyMembership<'a> {
+	/// Views the pair of registries a gateway serves.
+	pub(crate) fn new(hives: &'a HiveRegistry, servlets: &'a ServletRegistry) -> Self {
+		Self { hives, servlets }
+	}
+
+	/// Admits one hive with the servlet slate it registered.
+	///
+	/// A slate that fails to install rolls the hive entry back, so a
+	/// refused registration leaves neither registry holding half of it.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::SignerMismatch`] -- a different signer holds this hive id.
+	/// - [`ClusterError::LockPoisoned`] -- either registry is poisoned.
+	pub(crate) fn admit(
+		&self,
+		request: RegisterHiveRequest,
+		signer_id: SharedId,
+		slate: Vec<ServletEntry>,
+	) -> Result<(), ClusterError> {
+		let hive_addr: SharedId = Arc::from(request.hive_addr.as_slice());
+
+		let displaced = self.hives.register(request, signer_id)?;
+		self.servlets.reconcile_by_hive(&hive_addr, slate).inspect_err(|_| {
+			// Rolling back a re-registration means restoring what it
+			// replaced, not deleting a hive that was serving before this
+			// request arrived.
+			match displaced {
+				Some(ref previous) => self.hives.restore(Arc::clone(&hive_addr), previous.clone()),
+				None => self.retire(&hive_addr),
+			}
+		})
+	}
+
+	/// Retires one hive and every route it owned.
+	///
+	/// A poisoned lock is a panic the crate forbids, so a registry that
+	/// refuses the write leaves the other retirement in place rather than
+	/// failing the caller.
+	pub(crate) fn retire(&self, hive_addr: impl AsRef<[u8]>) {
+		let hive_addr = hive_addr.as_ref();
+		let _ = self.hives.unregister(hive_addr);
+		let _ = self.servlets.remove_by_hive(hive_addr);
+	}
+
+	/// Retires every hive whose lease expired, returning what left.
+	pub(crate) fn retire_stale(&self) -> Vec<HiveEntry> {
+		let stale = self.hives.evict_stale().unwrap_or_default();
+		for entry in &stale {
+			let _ = self.servlets.remove_by_hive(&entry.address);
+		}
+
+		stale
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::colony::cluster::servlet_registry::LocalRoute;
 	use crate::colony::common::ColonyNamespace;
 	use crate::colony::hive::ServletInfo;
 
@@ -383,21 +432,35 @@ mod tests {
 		}
 	}
 
-	fn type_key(name: impl AsRef<str>) -> Vec<u8> {
-		let name = name.as_ref();
+	/// One local route for `hive_addr`, the shape a registration installs.
+	fn slate(hive_addr: &SharedId, servlet: &str) -> Vec<ServletEntry> {
 		let namespace = ColonyNamespace::default();
-		let urn = namespace.servlet(name).expect("test names satisfy the mint grammar");
-		urn.type_canonical_bytes()
+		let urn = namespace.servlet(servlet).expect("test names satisfy the mint grammar");
+		vec![ServletEntry::local(
+			LocalRoute {
+				address: Arc::clone(hive_addr),
+				servlet_type: Arc::from(urn.type_canonical_bytes().as_slice()),
+				hive_id: Arc::clone(hive_addr),
+			},
+			1,
+			3,
+		)]
 	}
 
 	#[test]
-	fn register_deduplicates_type_index() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::default();
-		registry.register(request(b"hive1", &["ping", "ping"]), test_signer())?;
+	fn retiring_a_hive_drops_the_routes_it_owned() -> Result<(), ClusterError> {
+		let hives = HiveRegistry::default();
+		let servlets = ServletRegistry::default();
+		let membership = ColonyMembership::new(&hives, &servlets);
+		let hive_addr: SharedId = Arc::from(b"hive1".as_slice());
 
-		let hives = registry.hives_for_type(type_key("ping"))?;
-		assert_eq!(hives.len(), 1);
-		assert_eq!(hives[0].servlet_types.len(), 1);
+		membership.admit(request(b"hive1", &["ping"]), test_signer(), slate(&hive_addr, "ping"))?;
+		assert_eq!(hives.len()?, 1);
+		assert_eq!(servlets.len()?, 1);
+
+		membership.retire(&hive_addr);
+		assert_eq!(hives.len()?, 0);
+		assert_eq!(servlets.len()?, 0);
 		Ok(())
 	}
 
@@ -486,15 +549,55 @@ mod tests {
 		Ok(())
 	}
 
-	/// Removing a hive drops it from the type index in the same guard, so a
-	/// lookup names the hives the map holds.
+	/// Poison the route lock, so the next slate install refuses.
+	///
+	/// This is the only way `reconcile_by_hive` fails: a rollback is
+	/// otherwise unreachable, and an unreachable rollback is one nothing
+	/// can check.
+	fn poison_routes(servlets: &ServletRegistry) {
+		let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			let _held = servlets.routes.write().expect("the lock is live until this panic");
+			panic!("poison the route lock");
+		}));
+
+		assert!(refused.is_err());
+		assert!(servlets.local_servlets().is_err());
+	}
+
+	/// A re-registration whose slate will not install must leave the
+	/// registration it displaced serving, not delete a live hive.
 	#[test]
-	fn unregister_clears_the_type_index() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::default();
-		registry.register(request(b"hive-a", &["echo"]), test_signer())?;
-		registry.unregister(b"hive-a")?;
-		assert!(registry.hives_for_type(type_key("echo"))?.is_empty());
-		assert!(registry.to_available_servlets()?.is_empty());
+	fn a_refused_reregistration_restores_the_hive_it_displaced() -> Result<(), ClusterError> {
+		let hives = HiveRegistry::default();
+		let servlets = ServletRegistry::default();
+		let membership = ColonyMembership::new(&hives, &servlets);
+		let hive_addr: SharedId = Arc::from(b"hive-a".as_slice());
+
+		membership.admit(request(b"hive-a", &["echo"]), test_signer(), slate(&hive_addr, "echo"))?;
+		poison_routes(&servlets);
+
+		let refused = membership.admit(request(b"hive-a", &["ping"]), test_signer(), slate(&hive_addr, "ping"));
+
+		assert!(refused.is_err());
+		assert_eq!(hives.len()?, 1);
+		assert_eq!(hives.signer_for(&hive_addr)?, Some(test_signer()));
+		Ok(())
+	}
+
+	/// A first registration whose slate will not install must leave neither
+	/// registry holding half of it.
+	#[test]
+	fn a_refused_first_registration_leaves_no_half() -> Result<(), ClusterError> {
+		let hives = HiveRegistry::default();
+		let servlets = ServletRegistry::default();
+		let membership = ColonyMembership::new(&hives, &servlets);
+		let hive_addr: SharedId = Arc::from(b"hive-a".as_slice());
+
+		poison_routes(&servlets);
+		let refused = membership.admit(request(b"hive-a", &["echo"]), test_signer(), slate(&hive_addr, "echo"));
+
+		assert!(refused.is_err());
+		assert_eq!(hives.len()?, 0);
 		Ok(())
 	}
 }

@@ -25,7 +25,7 @@ pub use config::{
 	PeerCaps, PheromoneConfig, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_EVAPORATION_INTERVAL_SECS,
 	DEFAULT_EVAPORATION_RATE_BPS, DEFAULT_INITIAL_PHEROMONE, DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
 };
-pub use entry::{PeerRouteInfo, RouteKind, ServletEntry};
+pub use entry::{LocalRoute, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, ServletEntry};
 
 /// Servlet entries and the two reverse indexes derived from them.
 ///

@@ -13,15 +13,15 @@ pub use crate::colony::common::{
 	ActivateServletRequest, ActivateServletResponse, ClusterCommand, ClusterCommandResponse, ClusterStatus,
 	ColonyNamespace, ColonyResource, HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse,
 	InstanceMetrics, ListServletsParams, ListServletsResult, LoadBalancer, PowerOfTwoChoices, RegisterHiveRequest,
-	RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletAddressUpdate,
-	ServletAddressUpdateResponse, ServletInfo, ServletScaleConfig, SpawnServletParams, SpawnServletResult,
-	StochasticForager, StopServletParams, StopServletResult,
+	RegisterHiveResponse, RoundRobin, ScaleConfigRefusal, ScaleCooldowns, ScalingDecision, ScalingMetrics,
+	ServletAddressUpdate, ServletAddressUpdateResponse, ServletInfo, ServletScaleConfig, SpawnServletParams,
+	SpawnServletResult, StochasticForager, StopServletParams, StopServletResult,
 };
 
 pub use error::HiveError;
 pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker};
 
-pub use gates::{ClusterSecurityGate, PeerListGate, PeerListMode, ReplayGuard};
+pub use gates::{BackpressureReport, ClusterSecurityGate, PeerListGate, PeerListMode, ReplayGuard};
 
 use core::future::Future;
 use core::pin::Pin;
@@ -254,16 +254,16 @@ impl ServletRegistry for HashMapRegistry {
 /// // 1. Start servlets independently with their own configs
 /// let trace = Arc::new(TraceCollector::new());
 /// let auth_conf = auth_conf.clone();
-/// let auth = AuthServlet::start(Arc::clone(&trace), Some(auth_conf.clone())).await?;
-/// let capture = CaptureServlet::start(Arc::clone(&trace), None).await?;
+/// let auth = AuthServlet::start(Arc::clone(&trace), auth_conf.clone()).await?;
+/// let capture = CaptureServlet::start(Arc::clone(&trace), ServletConfig::default()).await?;
 ///
 /// // 2. Create hive
 /// let mut hive = PaymentHive::new(Some(hive_conf))?;
 ///
 /// // 3. Register with spawners for auto-scaling (types named by URN)
 /// let ns = ColonyNamespace::default();
-/// hive.register(ns.servlet("auth")?, auth, |t| AuthServlet::start(t, Some(auth_conf.clone())))?;
-/// hive.register(ns.servlet("capture")?, capture, |t| CaptureServlet::start(t, None))?;
+/// hive.register(ns.servlet("auth")?, auth, |t| AuthServlet::start(t, auth_conf.clone()))?;
+/// hive.register(ns.servlet("capture")?, capture, |t| CaptureServlet::start(t, ServletConfig::default()))?;
 ///
 /// // 4. Establish (starts control server + scaling task)
 /// hive.establish(trace).await?;

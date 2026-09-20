@@ -209,13 +209,13 @@ tb_scenario! {
 			let cluster_addr = cluster.addr();
 
 			let servlet_conf = servlet_tls_config(&certs)?;
-			let servlet = AuthorizationServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
+			let servlet = AuthorizationServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 
 			let mut hive_conf = hive_tls_config(&certs);
 			hive_conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 			let mut hive = PaymentProcessorHive::new(Some(hive_conf))?;
-			hive.register(authorization_urn(), servlet, |t| AuthorizationServlet::start(t, None))?;
+			hive.register(authorization_urn(), servlet, |t| AuthorizationServlet::start(t, ServletConfig::default()))?;
 			hive.establish(Arc::new(trace.share())).await?;
 
 			let _reg_response = hive.register_with_cluster(cluster_addr).await?;

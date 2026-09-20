@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{ClusterError, PeerRecord};
+use super::{ClusterError, PeerAddress, PeerRecord};
 
 #[derive(Debug, Clone)]
 pub struct PeerEntry {
@@ -23,15 +23,15 @@ pub struct PeerEntry {
 
 #[derive(Debug, Default)]
 pub struct TableState {
-	pub new: HashMap<String, PeerEntry>,
-	pub tried: HashMap<String, PeerEntry>,
+	pub new: HashMap<PeerAddress, PeerEntry>,
+	pub tried: HashMap<PeerAddress, PeerEntry>,
 	/// Anchors whose beat dial passed the colony gate.
 	///
 	/// A seed shares its verified anchors over PEX, which is how a
 	/// bootstrapping peer learns its first dial targets.
-	pub anchors_verified: HashMap<String, PeerEntry>,
+	pub anchors_verified: HashMap<PeerAddress, PeerEntry>,
 	/// This gateway's own advertised address, held out of peer admission.
-	pub local: Option<String>,
+	pub local: Option<PeerAddress>,
 	/// Mutations applied so far, minted inside the guard that applies them.
 	///
 	/// A snapshot taken at generation N holds every change below N, so the
@@ -90,7 +90,7 @@ impl GuardedTable {
 			.map(|(addr, entry)| (addr, entry, false))
 			.chain(state.tried.iter().map(|(addr, entry)| (addr, entry, true)))
 			.map(|(addr, entry, tried)| PeerRecord {
-				gateway_addr: addr.clone(),
+				gateway_addr: *addr,
 				peer_id: entry.peer_id.clone(),
 				tried,
 				last_probe_ms: entry.last_probe_ms,

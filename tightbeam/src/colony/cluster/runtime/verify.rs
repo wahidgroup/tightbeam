@@ -81,6 +81,12 @@ impl VerifiedSignerId {
 	pub(crate) fn as_shared(&self) -> &SharedId {
 		&self.0
 	}
+
+	/// Take the slate key for a registry entry that owns it.
+	#[must_use]
+	pub(crate) fn into_shared(self) -> SharedId {
+		self.0
+	}
 }
 
 /// One verified inbound control frame.

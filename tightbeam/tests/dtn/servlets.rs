@@ -181,7 +181,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &MissionControlServletConfig = ctx.env_config()?;
+		let config: &MissionControlServletConfig = ctx.env_config();
 		let frame_order = frame.metadata().order();
 
 		// Verify signature using trait method
@@ -344,7 +344,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &EarthRelaySatelliteServletConfig = ctx.env_config()?;
+		let config: &EarthRelaySatelliteServletConfig = ctx.env_config();
 		// Verify signature and determine source
 		let from_mission_control = if frame.nonrepudiation().is_some() {
 			if frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_ok() {
@@ -557,7 +557,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &MarsRelaySatelliteServletConfig = ctx.env_config()?;
+		let config: &MarsRelaySatelliteServletConfig = ctx.env_config();
 		// Verify signature and determine source
 		// Earth Relay forwards messages, so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation().is_some() {
@@ -783,7 +783,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &RoverServletConfig = ctx.env_config()?;
+		let config: &RoverServletConfig = ctx.env_config();
 		// Verify signature
 		if frame.nonrepudiation().is_some()
 			&& frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_err()

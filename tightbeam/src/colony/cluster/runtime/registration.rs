@@ -47,14 +47,9 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
 		let slate = self.config.pheromone.servlet_slate(&request.servlet_addresses, &hive_addr);
-		// Atomic: hive entry + full slate, or roll back. Re-register replaces prior rows.
-		let registered = self.registry.register(request, signer_id).and_then(|()| {
-			self.servlet_registry.reconcile_by_hive(&hive_addr, slate).inspect_err(|_| {
-				let _ = self.registry.unregister(&hive_addr);
-				let _ = self.servlet_registry.remove_by_hive(&hive_addr);
-			})
-		});
-
+		// Atomic: hive entry + full slate, or roll back.
+		// Re-register replaces prior rows.
+		let registered = self.membership().admit(request, signer_id, slate);
 		match registered {
 			Ok(()) => {
 				let hive_count = self.registry.len().unwrap_or_default() as u64;

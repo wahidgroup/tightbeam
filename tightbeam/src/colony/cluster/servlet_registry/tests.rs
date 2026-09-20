@@ -2,10 +2,12 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use super::{
-	ClusterError, PeerCaps, PheromoneConfig, RouteKind, Routes, ServletEntry, ServletRegistry,
-	DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+	ClusterError, LocalRoute, PeerCaps, PeerRoute, PheromoneConfig, RelayRoute, RouteKind, Routes, ServletEntry,
+	ServletRegistry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 };
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
+use crate::colony::cluster::PeerAddress;
+use crate::colony::common::ServletTypeKey;
 use crate::colony::common::{current_timestamp_ms, MAX_PHEROMONE};
 use crate::utils::BasisPoints;
 
@@ -20,10 +22,12 @@ fn routes(registry: &ServletRegistry) -> std::sync::RwLockReadGuard<'_, Routes> 
 }
 
 fn test_entry(pheromone: u64, abandonment_limit: u32) -> ServletEntry {
-	ServletEntry::new(
-		Arc::from(b"addr".as_slice()),
-		Arc::from(b"type".as_slice()),
-		Arc::from(b"hive".as_slice()),
+	ServletEntry::local(
+		LocalRoute {
+			address: Arc::from(b"addr".as_slice()),
+			servlet_type: Arc::from(b"type".as_slice()),
+			hive_id: Arc::from(b"hive".as_slice()),
+		},
 		pheromone,
 		abandonment_limit,
 	)
@@ -34,10 +38,12 @@ fn named_entry(addr: impl AsRef<[u8]>, servlet_type: impl AsRef<[u8]>, hive: imp
 	let addr = addr.as_ref();
 	let servlet_type = servlet_type.as_ref();
 	let hive = hive.as_ref();
-	ServletEntry::new(
-		Arc::from(addr),
-		Arc::from(servlet_type),
-		Arc::from(hive),
+	ServletEntry::local(
+		LocalRoute {
+			address: Arc::from(addr),
+			servlet_type: Arc::from(servlet_type),
+			hive_id: Arc::from(hive),
+		},
 		DEFAULT_INITIAL_PHEROMONE,
 		DEFAULT_ABANDONMENT_LIMIT,
 	)
@@ -48,9 +54,11 @@ fn peer_entry(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>) -> Serv
 	let servlet_type = servlet_type.as_ref();
 	let peer_id = peer_id.as_ref();
 	ServletEntry::peer(
-		Arc::from(peer_id),
-		Arc::from(servlet_type),
-		Arc::from(b"127.0.0.1:9000".as_slice()),
+		PeerRoute {
+			peer_id: Arc::from(peer_id),
+			servlet_type: Arc::from(servlet_type),
+			dial_addr: Arc::from(b"127.0.0.1:9000".as_slice()),
+		},
 		DEFAULT_INITIAL_PHEROMONE,
 		DEFAULT_ABANDONMENT_LIMIT,
 	)
@@ -61,9 +69,11 @@ fn peer_entry_dial(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, di
 	let peer_id = peer_id.as_ref();
 	let dial = dial.as_ref();
 	ServletEntry::peer(
-		Arc::from(peer_id),
-		Arc::from(servlet_type),
-		Arc::from(dial),
+		PeerRoute {
+			peer_id: Arc::from(peer_id),
+			servlet_type: Arc::from(servlet_type),
+			dial_addr: Arc::from(dial),
+		},
 		DEFAULT_INITIAL_PHEROMONE,
 		DEFAULT_ABANDONMENT_LIMIT,
 	)
@@ -189,9 +199,11 @@ fn peer_entries_excludes_abandoned() {
 	let registry = ServletRegistry::new(config);
 
 	let peer = ServletEntry::peer(
-		Arc::from(b"peer-colony".as_slice()),
-		Arc::from(b"calc".as_slice()),
-		Arc::from(b"127.0.0.1:9000".as_slice()),
+		PeerRoute {
+			peer_id: Arc::from(b"peer-colony".as_slice()),
+			servlet_type: Arc::from(b"calc".as_slice()),
+			dial_addr: Arc::from(b"127.0.0.1:9000".as_slice()),
+		},
 		DEFAULT_INITIAL_PHEROMONE,
 		limit,
 	);
@@ -213,7 +225,10 @@ fn local_entries_for_type_excludes_peer_routes() {
 	registry.add(named_entry(b"local", b"calc", b"hive1")).ok();
 	registry.add(peer_entry(b"calc", b"peer-colony")).ok();
 
-	let local = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
+	let local = registry
+		.local_entries_for_type(&ServletTypeKey::from_route_bytes(b"calc".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	assert_eq!(local.len(), 1);
 	assert_eq!(local[0].route_key().as_ref(), b"local");
 }
@@ -223,7 +238,10 @@ fn local_entries_for_type_empty_when_only_peer_routes() {
 	let registry = ServletRegistry::default();
 	registry.add(peer_entry(b"calc", b"peer-colony")).ok();
 
-	let local = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
+	let local = registry
+		.local_entries_for_type(&ServletTypeKey::from_route_bytes(b"calc".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	assert!(local.is_empty());
 }
 
@@ -276,6 +294,22 @@ fn local_servlets_dedups_and_excludes_peer_routes() {
 	assert_eq!(types.len(), 2);
 }
 
+/// Two hives serving one type both yield routes, and the type is named
+/// once. This is the fan-out the balancer picks from, and it is answered
+/// here now that the hive registry keeps no second index.
+#[test]
+fn two_hives_serving_one_type_both_yield_routes() {
+	let registry = ServletRegistry::default();
+	registry.add(named_entry(b"a1", b"calc", b"hive1")).ok();
+	registry.add(named_entry(b"a2", b"calc", b"hive2")).ok();
+
+	let calc = ServletTypeKey::from_route_bytes(b"calc".as_slice());
+	let routes = registry.entries_for_type(&calc).ok().unwrap_or_default();
+
+	assert_eq!(routes.len(), 2);
+	assert_eq!(registry.local_servlets().ok().unwrap_or_default().len(), 1);
+}
+
 #[test]
 fn local_servlets_tracks_adds_and_removes() {
 	let registry = ServletRegistry::default();
@@ -321,7 +355,10 @@ fn reconcile_by_hive_leaves_other_hives_untouched() {
 	registry.reconcile_by_hive(b"gw", vec![peer]).ok();
 	registry.reconcile_by_hive(b"gw", vec![]).ok();
 
-	let locals = registry.local_entries_for_type(b"urn:t:a").ok().unwrap_or_default();
+	let locals = registry
+		.local_entries_for_type(&ServletTypeKey::from_route_bytes(b"urn:t:a".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	assert_eq!(locals.len(), 1);
 	assert!(registry.peer_entries().ok().unwrap_or_default().is_empty());
 }
@@ -335,7 +372,10 @@ fn reconcile_by_hive_preserves_peer_trail_state() {
 	registry.reinforce(&route, 1_000).ok();
 	registry.weaken(&route).ok();
 
-	let before = registry.entries_for_type(b"urn:t:a").ok().unwrap_or_default();
+	let before = registry
+		.entries_for_type(&ServletTypeKey::from_route_bytes(b"urn:t:a".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	let pheromone_before = before[0].pheromone_level();
 	let trials_before = before[0].trial_count();
 
@@ -343,7 +383,10 @@ fn reconcile_by_hive_preserves_peer_trail_state() {
 		.reconcile_by_hive(b"fp", vec![peer_entry_dial(b"urn:t:a", b"fp", b"127.0.0.1:9001")])
 		.ok();
 
-	let after = registry.entries_for_type(b"urn:t:a").ok().unwrap_or_default();
+	let after = registry
+		.entries_for_type(&ServletTypeKey::from_route_bytes(b"urn:t:a".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	assert_eq!(after[0].pheromone_level(), pheromone_before);
 	assert_eq!(after[0].trial_count(), trials_before);
 	assert_eq!(after[0].dial_target().as_ref(), b"127.0.0.1:9001");
@@ -389,9 +432,13 @@ fn admitted_with_order(
 	order: u64,
 ) -> AdmittedPeerAd {
 	let hive = hive.as_ref();
-	let dial = dial.as_ref();
+	let dial: PeerAddress = core::str::from_utf8(dial.as_ref())
+		.expect("fixture dial addresses are UTF-8")
+		.parse()
+		.expect("fixture dial addresses name sockets");
+
 	let slate: Vec<ServletEntry> = slate.into_iter().collect();
-	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial_addr: Arc::from(dial), slate, order }
+	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial, slate, order }
 }
 
 // Two advertisements for one bucket race. The order ledger and the
@@ -443,10 +490,12 @@ fn relay_trail(
 	let servlet_type = servlet_type.as_ref();
 	let dial = dial.as_ref();
 	let slate = vec![ServletEntry::peer_relay(
-		Arc::from(origin),
-		Arc::from(relay),
-		Arc::from(servlet_type),
-		Arc::from(dial),
+		RelayRoute {
+			origin_id: Arc::from(origin),
+			relay_id: Arc::from(relay),
+			servlet_type: Arc::from(servlet_type),
+			dial_addr: Arc::from(dial),
+		},
 		DEFAULT_INITIAL_PHEROMONE,
 		DEFAULT_ABANDONMENT_LIMIT,
 	)];
@@ -689,7 +738,10 @@ fn reconcile_peer_slate_excludes_concurrent_local_install() {
 			});
 		});
 
-		let locals = registry.local_entries_for_type(b"calc").ok().unwrap_or_default();
+		let locals = registry
+			.local_entries_for_type(&ServletTypeKey::from_route_bytes(b"calc".as_slice()))
+			.ok()
+			.unwrap_or_default();
 		assert_eq!(locals.len(), 1);
 	}
 }
@@ -718,7 +770,10 @@ fn registry_add_and_lookup() {
 	let entry = named_entry(b"addr1", b"calculator", b"hive1");
 	registry.add(entry).ok();
 
-	let found = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
+	let found = registry
+		.entries_for_type(&ServletTypeKey::from_route_bytes(b"calculator".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	assert_eq!(found.len(), 1);
 	assert_eq!(found[0].route_key().as_ref(), b"addr1");
 }
@@ -733,7 +788,10 @@ fn seed_reregistered_registry() -> ServletRegistry {
 #[test]
 fn registry_reregistration_does_not_duplicate_indices() {
 	let registry = seed_reregistered_registry();
-	let found = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
+	let found = registry
+		.entries_for_type(&ServletTypeKey::from_route_bytes(b"calculator".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	assert_eq!(found.len(), 1);
 	assert!(matches!(registry.len().ok(), Some(1)));
 }
@@ -744,8 +802,14 @@ fn registry_reregistration_moves_entry_across_types() {
 	registry.add(named_entry(b"addr1", b"calculator", b"hive1")).ok();
 	registry.add(named_entry(b"addr1", b"auth", b"hive2")).ok();
 
-	let calculator = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
-	let auth = registry.entries_for_type(b"auth").ok().unwrap_or_default();
+	let calculator = registry
+		.entries_for_type(&ServletTypeKey::from_route_bytes(b"calculator".as_slice()))
+		.ok()
+		.unwrap_or_default();
+	let auth = registry
+		.entries_for_type(&ServletTypeKey::from_route_bytes(b"auth".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	assert!(calculator.is_empty());
 	assert_eq!(auth.len(), 1);
 
@@ -759,7 +823,10 @@ fn registry_remove_after_reregistration_clears_entry() {
 	let registry = seed_reregistered_registry();
 	registry.remove(b"addr1").ok();
 
-	let found = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
+	let found = registry
+		.entries_for_type(&ServletTypeKey::from_route_bytes(b"calculator".as_slice()))
+		.ok()
+		.unwrap_or_default();
 	assert!(found.is_empty());
 }
 
@@ -808,9 +875,11 @@ fn peer_entry_limit(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, l
 	let servlet_type = servlet_type.as_ref();
 	let peer_id = peer_id.as_ref();
 	ServletEntry::peer(
-		Arc::from(peer_id),
-		Arc::from(servlet_type),
-		Arc::from(b"127.0.0.1:9000".as_slice()),
+		PeerRoute {
+			peer_id: Arc::from(peer_id),
+			servlet_type: Arc::from(servlet_type),
+			dial_addr: Arc::from(b"127.0.0.1:9000".as_slice()),
+		},
 		DEFAULT_INITIAL_PHEROMONE,
 		limit,
 	)
@@ -925,7 +994,10 @@ fn apply_address_update_ownership_and_atomicity() {
 		let result = registry.apply_address_update(case.caller_hive, added, case.remove);
 		assert_eq!(result.is_ok(), case.expect_ok);
 
-		let found = registry.entries_for_type(b"calc").ok().unwrap_or_default();
+		let found = registry
+			.entries_for_type(&ServletTypeKey::from_route_bytes(b"calc".as_slice()))
+			.ok()
+			.unwrap_or_default();
 		assert_eq!(found.len(), case.expected_addrs.len());
 		for (entry, addr) in found.iter().zip(case.expected_addrs.iter()) {
 			assert_eq!(entry.route_key().as_ref(), *addr);

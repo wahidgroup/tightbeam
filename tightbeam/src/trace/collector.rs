@@ -533,23 +533,21 @@ impl TraceCollector {
 		Self { state: Arc::new(TraceState::with_oracle(input, process)) }
 	}
 
-	/// Get the fuzz oracle
+	/// The fuzz oracle, when this collector was built with one.
 	///
-	/// # Panics
+	/// [`TraceCollector::with_fuzz_oracle`] is the only constructor that
+	/// installs one, and [`TraceCollector::share`] carries it, so every
+	/// handle a scenario receives answers the same way its collector does.
+	/// Every other collector returns [`None`].
 	///
-	/// Testing suite functions MUST panic on error.
-	///
-	/// Panics when no oracle is configured. This accessor exists for
-	/// `tb_scenario!`-generated fuzz harnesses (feature `testing-fuzz`),
-	/// where a missing `csp:` parameter is a harness construction bug that
-	/// must abort the fuzz run rather than continue unguided.
-	#[allow(clippy::expect_used)]
+	/// A fuzz harness wants the oracle itself rather than an `Option`, and
+	/// a missing one is a harness construction bug it should abort on.
+	/// `OracleAccess::oracle`, in the test-support surface, is that
+	/// accessor. This one is the total answer the library owes a caller
+	/// that is not a harness.
 	#[cfg(feature = "testing-fuzz")]
-	pub fn oracle(&self) -> &crate::testing::fuzz::FuzzContext {
-		self.state
-			.oracle
-			.as_ref()
-			.expect("Oracle not configured - did you provide csp: parameter in tb_scenario!?")
+	pub fn try_oracle(&self) -> Option<&crate::testing::fuzz::FuzzContext> {
+		self.state.oracle.as_ref()
 	}
 
 	/// Check for runtime fault injection (certification-grade)
@@ -1026,6 +1024,40 @@ mod tests {
 
 	const ALPHA: Urn<'static> = crate::urn!("test", "event:collector/alpha");
 	const BETA: Urn<'static> = crate::urn!("test", "event:collector/beta");
+
+	/// A collector built without `csp:` has no oracle, and reading one
+	/// reports that rather than ending the process.
+	#[test]
+	#[cfg(feature = "testing-fuzz")]
+	fn a_collector_without_an_oracle_reports_its_absence() {
+		let collector = super::TraceCollector::default();
+
+		assert!(collector.try_oracle().is_none());
+	}
+
+	/// Every handle a scenario receives answers the way its collector does.
+	/// A `share` that dropped the oracle would disarm every fuzz harness
+	/// silently, because the harness reads the shared handle, not the one
+	/// the macro built.
+	#[test]
+	#[cfg(feature = "testing-fuzz")]
+	fn a_collector_built_with_an_oracle_hands_it_to_every_share(
+	) -> Result<(), crate::testing::specs::csp::ProcessBuildError> {
+		use crate::testing::specs::csp::{Event, Process, State};
+
+		let process = Process::builder("ShareSpec")
+			.initial_state(State("S0"))
+			.add_observable(Event("step"))
+			.add_transition(State("S0"), Event("step"), State("S1"))
+			.add_terminal(State("S1"))
+			.build()?;
+
+		let collector = super::TraceCollector::with_fuzz_oracle(Vec::new(), process);
+
+		assert!(collector.try_oracle().is_some());
+		assert!(collector.share().try_oracle().is_some());
+		Ok(())
+	}
 
 	tb_assert_spec! {
 		pub TraceCollectorSpec,

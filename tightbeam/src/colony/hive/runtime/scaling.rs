@@ -108,7 +108,7 @@ where
 
 					hive_load.absorb(&load);
 
-					match ScalingDecision::evaluate(&metrics) {
+					match metrics.decide() {
 						ScalingDecision::ScaleUp => task.scale_up(servlet_type, spawner, scale, &mut scaled_up).await,
 						ScalingDecision::ScaleDown => task.scale_down(servlet_type, scale, &mut scaled_down),
 						ScalingDecision::Hold => {}
@@ -234,7 +234,7 @@ where
 		cooldowns: &mut Cooldowns,
 	) {
 		let type_key = servlet_type.canonical_bytes();
-		if self.scale_blocked() || cooldowns.active(&type_key, scale.scale_up_cooldown) {
+		if self.scale_blocked() || cooldowns.active(&type_key, scale.scale_up_cooldown()) {
 			return;
 		}
 
@@ -262,7 +262,7 @@ where
 	/// Removes one instance of `servlet_type` and announces its departure.
 	fn scale_down(&self, servlet_type: &Urn<'static>, scale: ServletScaleConfig, cooldowns: &mut Cooldowns) {
 		let type_key = servlet_type.canonical_bytes();
-		if self.scale_blocked() || cooldowns.active(&type_key, scale.scale_down_cooldown) {
+		if self.scale_blocked() || cooldowns.active(&type_key, scale.scale_down_cooldown()) {
 			return;
 		}
 
@@ -281,8 +281,7 @@ where
 			return;
 		};
 
-		let removed = ServletInfo { servlet_id: instance, address: addr.as_ref().to_vec() };
-		self.announce(ServletChange::Removed(removed));
+		self.announce(ServletChange::Removed(instance));
 		cooldowns.stamp(type_key);
 	}
 

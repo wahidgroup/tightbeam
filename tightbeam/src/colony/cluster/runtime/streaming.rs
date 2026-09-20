@@ -121,11 +121,9 @@ where
 		budget: HopBudget,
 		exclude: Option<&[u8]>,
 	) -> Result<SplicePlan<P>, TransitStatus> {
-		if !self.config.namespace.is_bare_servlet_type(target) {
+		let Some(type_key) = self.config.namespace.servlet_type_key(target) else {
 			return Err(TransitStatus::PermissionDenied);
-		}
-
-		let type_key = target.canonical_bytes();
+		};
 		let RouteChoice { route_key, dial_addr, route_kind } = self
 			.servlet_registry
 			.select_route(&self.config, &type_key, budget, exclude)

@@ -362,8 +362,20 @@ pub trait GossipJournal: Send + Sync {
 	/// Retained rumor frames for digests a peer reported missing.
 	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError>;
 
-	/// Retained rumors not yet delivered locally (retry set).
+	/// Retained rumors awaiting local delivery, excluding those a task
+	/// already claimed through [`GossipJournal::claim_local`].
 	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError>;
+
+	/// Take one rumor's local delivery, so no second task delivers it.
+	///
+	/// A caller that gets [`LocalClaim::Taken`] MUST finish with
+	/// [`GossipJournal::ack_local`] on success or
+	/// [`GossipJournal::release_local`] on failure, or the rumor stays
+	/// unretried until retention drops it.
+	fn claim_local(&self, digest: &GossipDigest, now_ms: u64) -> Result<LocalClaim, ClusterError>;
+
+	/// Return a claimed rumor to the retry set after a failed delivery.
+	fn release_local(&self, digest: &GossipDigest) -> Result<(), ClusterError>;
 
 	/// Mark local delivery complete so the rumor stops being retried.
 	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError>;
@@ -391,8 +403,86 @@ struct JournalEntry {
 /// rumor is boxed so a witnessed entry costs one pointer, never a full
 /// inline [`Frame`].
 enum JournalBody {
-	Retained { rumor: Box<Frame>, delivered_local: bool },
+	Retained { rumor: Box<Frame>, local: LocalDelivery },
 	Witnessed,
+}
+
+/// The answer to one [`GossipJournal::claim_local`] request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalClaim {
+	/// This caller holds the delivery and answers for its outcome.
+	Taken,
+	/// Another task holds it, or it is already delivered.
+	Held,
+	/// The journal retains no rumor for this digest, so nothing retries it
+	/// and the caller delivers without a claim.
+	Untracked,
+}
+
+/// One local delivery in progress, released when this guard drops.
+///
+/// A claim taken by hand leaks when the delivery future is dropped: a
+/// cancelled task or a disconnected caller leaves the rumor claimed with
+/// nothing holding it, and no retry ever offers it again. Owning the
+/// claim removes that path, because dropping the future drops the guard.
+///
+/// [`Self::ack`] retires the entry instead of releasing it, and is the
+/// only exit that stops the rumor being retried.
+pub struct LocalClaimGuard<'a> {
+	journal: &'a dyn GossipJournal,
+	digest: &'a GossipDigest,
+	/// Whether dropping this guard returns the rumor to the retry set.
+	///
+	/// An untracked rumor has no retry entry to return it to.
+	retries: bool,
+}
+
+impl<'a> LocalClaimGuard<'a> {
+	/// Claim `digest` for one delivery, or [`None`] when another task holds
+	/// it.
+	///
+	/// A journal lock is poisoned only by a panic this crate forbids, so a
+	/// refused claim skips this round the way a held one does.
+	pub fn take(journal: &'a dyn GossipJournal, digest: &'a GossipDigest, now_ms: u64) -> Option<Self> {
+		match journal.claim_local(digest, now_ms) {
+			Ok(LocalClaim::Taken) => Some(Self { journal, digest, retries: true }),
+			Ok(LocalClaim::Untracked) => Some(Self { journal, digest, retries: false }),
+			Ok(LocalClaim::Held) | Err(_) => None,
+		}
+	}
+
+	/// Record the rumor as delivered, so it stops being retried.
+	pub fn ack(mut self) {
+		// An unrecorded ack leaves the digest claimed until retention drops
+		// it, which is the same outcome a poisoned lock gives every other
+		// journal call.
+		self.retries = false;
+		let _ = self.journal.ack_local(self.digest);
+	}
+}
+
+impl Drop for LocalClaimGuard<'_> {
+	fn drop(&mut self) {
+		if self.retries {
+			// The retry beat offers the rumor again. A poisoned lock leaves
+			// it claimed until retention drops it.
+			let _ = self.journal.release_local(self.digest);
+		}
+	}
+}
+
+/// How far one retained rumor has travelled toward its local ingress.
+///
+/// Delivery in flight is its own state, so a rumor a task is already
+/// delivering is not offered to a second one (CWE-362).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalDelivery {
+	/// Not delivered, and no task holds it.
+	Pending,
+	/// One task is delivering it now.
+	Claimed,
+	/// Delivered, so it is never offered again.
+	Delivered,
 }
 
 /// In-memory [`GossipJournal`] with per-signer partitioning.
@@ -430,6 +520,36 @@ impl MemoryGossipJournal {
 	#[must_use]
 	pub fn with_limits(retention_ms: u64, capacity: usize, per_signer_capacity: usize) -> Self {
 		Self { entries: Mutex::new(HashMap::new()), retention_ms, capacity, per_signer_capacity }
+	}
+
+	/// Retained rumors that have not reached local ingress, whether or not a
+	/// task has claimed one.
+	///
+	/// Zero means every retained rumor was delivered, which
+	/// [`GossipJournal::pending_local`] cannot say on its own: a claimed rumor
+	/// is in flight, so it leaves the retry set while its delivery is still
+	/// unfinished. That distinction is what a convergence assertion needs.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] when the journal lock is poisoned.
+	#[cfg(any(test, feature = "testing"))]
+	pub fn undelivered_local(&self, now_ms: u64) -> Result<usize, ClusterError> {
+		let mut entries = self.entries.lock()?;
+
+		Self::prune(&mut entries, self.retention_ms, now_ms);
+
+		let undelivered = entries
+			.values()
+			.filter(|entry| {
+				matches!(
+					entry.body,
+					JournalBody::Retained { local: LocalDelivery::Pending | LocalDelivery::Claimed, .. }
+				)
+			})
+			.count();
+
+		Ok(undelivered)
 	}
 
 	/// Drop entries whose age exceeds the retention window in either clock
@@ -548,7 +668,7 @@ impl GossipJournal for MemoryGossipJournal {
 		rumor: &Frame,
 		now_ms: u64,
 	) -> Result<Admission, ClusterError> {
-		let body = JournalBody::Retained { rumor: Box::new(rumor.clone()), delivered_local: false };
+		let body = JournalBody::Retained { rumor: Box::new(rumor.clone()), local: LocalDelivery::Pending };
 		self.admit(signer, digest, body, now_ms)
 	}
 
@@ -607,7 +727,7 @@ impl GossipJournal for MemoryGossipJournal {
 		let pending = entries
 			.values()
 			.filter_map(|entry| match &entry.body {
-				JournalBody::Retained { rumor, delivered_local: false } => Some(rumor.as_ref().clone()),
+				JournalBody::Retained { rumor, local: LocalDelivery::Pending } => Some(rumor.as_ref().clone()),
 				_ => None,
 			})
 			.collect();
@@ -615,11 +735,39 @@ impl GossipJournal for MemoryGossipJournal {
 		Ok(pending)
 	}
 
+	fn claim_local(&self, digest: &GossipDigest, _now_ms: u64) -> Result<LocalClaim, ClusterError> {
+		let mut entries = self.entries.lock()?;
+		let Some(entry) = entries.get_mut(digest) else {
+			return Ok(LocalClaim::Untracked);
+		};
+		let JournalBody::Retained { local, .. } = &mut entry.body else {
+			return Ok(LocalClaim::Untracked);
+		};
+
+		if *local != LocalDelivery::Pending {
+			return Ok(LocalClaim::Held);
+		}
+
+		*local = LocalDelivery::Claimed;
+		Ok(LocalClaim::Taken)
+	}
+
+	fn release_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
+		let mut entries = self.entries.lock()?;
+		if let Some(entry) = entries.get_mut(digest) {
+			if let JournalBody::Retained { local: local @ LocalDelivery::Claimed, .. } = &mut entry.body {
+				*local = LocalDelivery::Pending;
+			}
+		}
+
+		Ok(())
+	}
+
 	fn ack_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
 		let mut entries = self.entries.lock()?;
 		if let Some(entry) = entries.get_mut(digest) {
-			if let JournalBody::Retained { delivered_local, .. } = &mut entry.body {
-				*delivered_local = true;
+			if let JournalBody::Retained { local, .. } = &mut entry.body {
+				*local = LocalDelivery::Delivered;
 			}
 		}
 
@@ -736,9 +884,10 @@ mod tests {
 		let journal = MemoryGossipJournal::new(30_000);
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
-
 		let before = journal.seen(&digest, 1_000)?;
+
 		journal.record(b"signer-a", digest, &frame, 1_000)?;
+
 		let after = journal.seen(&digest, 1_000)?;
 		let expired = journal.seen(&digest, 90_000)?;
 		assert!(!before);
@@ -782,6 +931,7 @@ mod tests {
 		let digest = digest(&frame);
 
 		journal.witness(b"signer-a", digest, 1_000)?;
+
 		let replay = journal.record(b"signer-a", digest, &frame, 1_000)?;
 		assert_eq!(replay, Admission::Duplicate);
 		Ok(())
@@ -820,7 +970,6 @@ mod tests {
 
 		let hint = journal.witness(b"signer-a", digest(&witnessed), 1_000)?;
 		let application = journal.record(b"signer-a", digest(&retained), &retained, 1_000)?;
-
 		assert_eq!(hint, Admission::New);
 		assert_eq!(application, Admission::New);
 		Ok(())
@@ -868,6 +1017,78 @@ mod tests {
 		let after = journal.pending_local(1_000)?;
 		assert_eq!(before.len(), 1);
 		assert_eq!(after.len(), 0);
+		Ok(())
+	}
+
+	// A rumor whose delivery is in flight is not re-offered, so the beat
+	// and the admission path cannot both deliver it (CWE-362).
+	#[test]
+	fn a_claimed_rumor_is_not_offered_again() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::default();
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		journal.record(b"signer-a", digest, &frame, 1_000)?;
+
+		assert_eq!(journal.claim_local(&digest, 1_000)?, LocalClaim::Taken);
+		assert!(journal.pending_local(1_000)?.is_empty());
+		assert_eq!(journal.claim_local(&digest, 1_000)?, LocalClaim::Held);
+		Ok(())
+	}
+
+	/// Claim `digest` for one delivery, which an unclaimed rumor always
+	/// admits.
+	fn claim<'a>(journal: &'a MemoryGossipJournal, digest: &'a GossipDigest) -> LocalClaimGuard<'a> {
+		LocalClaimGuard::take(journal, digest, 1_000).expect("an unclaimed rumor is claimable")
+	}
+
+	// A delivery task that never finishes, because it was cancelled or its
+	// caller went away, must not strand the rumor as claimed forever.
+	#[test]
+	fn a_dropped_delivery_returns_its_rumor_to_the_retry_set() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::default();
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		journal.record(b"signer-a", digest, &frame, 1_000)?;
+
+		{
+			let _claim = claim(&journal, &digest);
+			assert!(journal.pending_local(1_000)?.is_empty());
+		}
+
+		assert_eq!(journal.pending_local(1_000)?.len(), 1);
+		Ok(())
+	}
+
+	// An acked delivery retires the rumor, so no later round retries it.
+	#[test]
+	fn an_acked_delivery_retires_its_rumor() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::default();
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		journal.record(b"signer-a", digest, &frame, 1_000)?;
+
+		claim(&journal, &digest).ack();
+
+		assert!(journal.pending_local(1_000)?.is_empty());
+		assert_eq!(journal.undelivered_local(1_000)?, 0);
+		Ok(())
+	}
+
+	// A delivery that failed releases its claim, so the next round retries it.
+	#[test]
+	fn a_released_rumor_is_offered_again() -> Result<(), ClusterError> {
+		let journal = MemoryGossipJournal::default();
+		let frame = rumor(1_000, vec![1, 2, 3]);
+		let digest = digest(&frame);
+
+		journal.record(b"signer-a", digest, &frame, 1_000)?;
+		assert_eq!(journal.claim_local(&digest, 1_000)?, LocalClaim::Taken);
+		journal.release_local(&digest)?;
+
+		assert_eq!(journal.pending_local(1_000)?.len(), 1);
 		Ok(())
 	}
 

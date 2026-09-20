@@ -86,11 +86,13 @@ pub async fn start_stream_hive(
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
 	let servlet_conf = servlet_tls_config(&certs)?;
-	let servlet = StreamEchoServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
+	let servlet = StreamEchoServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 
 	let conf = hive_tls_config(&certs);
 	let mut hive = ClusterTestHive::new(Some(conf))?;
-	hive.register(servlet_urn("stream-echo"), servlet, |t| StreamEchoServlet::start(t, None))?;
+	hive.register(servlet_urn("stream-echo"), servlet, |t| {
+		StreamEchoServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
@@ -328,9 +330,22 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(EDGE_STREAM_REFUSED, exactly!(1), equals!(true)),
-			(EDGE_DUPLEX_REFUSED, exactly!(1), equals!(true))
+			(EDGE_STREAM_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(EDGE_DUPLEX_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
 		]
+	}
+}
+
+/// The wire status a refused open carries.
+///
+/// A test that only asks whether the open failed goes green on any
+/// refusal, including the `Unimplemented` a plane with no route would
+/// give. The Edge policy names `PermissionDenied`, so that is what the
+/// scenario records.
+fn refusal_status<T>(outcome: Result<T, tightbeam::transport::TransportError>) -> Option<TransitStatus> {
+	match outcome {
+		Err(tightbeam::transport::TransportError::OperationFailed(failure)) => TransitStatus::try_from(failure).ok(),
+		_ => None,
 	}
 }
 
@@ -359,14 +374,14 @@ tb_scenario! {
 			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
 			sink.close_with(b"denied").await?;
 
-			let refused = response.await.is_err();
-			trace.event_with(EDGE_STREAM_REFUSED, &[], refused)?;
+			let refused = refusal_status(response.await);
+			trace.event_with(EDGE_STREAM_REFUSED, &[], refused.unwrap_or(TransitStatus::Ok))?;
 
 			let (sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
 			sink.close_with(b"denied").await?;
 
-			let refused = body.chunk().await.is_err();
-			trace.event_with(EDGE_DUPLEX_REFUSED, &[], refused)?;
+			let refused = refusal_status(body.chunk().await);
+			trace.event_with(EDGE_DUPLEX_REFUSED, &[], refused.unwrap_or(TransitStatus::Ok))?;
 
 			cluster.stop();
 			hive.stop();

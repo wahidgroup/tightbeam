@@ -388,7 +388,7 @@ tb_scenario! {
 				.with_collector_gate(adaptive_gate)
 				.build();
 
-			QueueServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
+			QueueServlet::start(Arc::clone(&trace), servlet_conf).await
 		},
 		setup: |env| async move {
 			// The servlet under test carries no encryption, so this link is

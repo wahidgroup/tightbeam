@@ -10,7 +10,8 @@ use crate::builder::TypeBuilder;
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
 use crate::colony::cluster::{ClusterConfig, ClusterError, HeartbeatEvent};
 use crate::colony::common::{
-	current_timestamp_ms, ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, HeartbeatResult,
+	current_timestamp_ms, ClusterCommand, ClusterCommandKind, ClusterCommandOutcome, ClusterCommandResponse,
+	ClusterStatus, HeartbeatParams, HeartbeatResult,
 };
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -68,10 +69,8 @@ where
 	/// - [`ClusterError::MalformedResponse`]: the answer carried no heartbeat result
 	/// - transport or signing failures from the dial and emit
 	pub(crate) async fn send<D: ClusterDigest>(self, addr: P::Address) -> Result<HeartbeatResult, ClusterError> {
-		let cmd = ClusterCommand {
-			heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
-			manage: None,
-		};
+		let probe = ClusterCommandKind::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
+		let cmd = ClusterCommand::from(probe);
 
 		// Priority is a V2+ metadata field. Composing it on V1 fails at
 		// build time and every heartbeat would count as a send failure.
@@ -91,7 +90,10 @@ where
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
 		let cmd_response: ClusterCommandResponse = decode(response.message())?;
-		cmd_response.heartbeat.ok_or(ClusterError::MalformedResponse)
+		match cmd_response.into_choice() {
+			Ok(ClusterCommandOutcome::Heartbeat(result)) => Ok(result),
+			Ok(ClusterCommandOutcome::Manage(_)) | Err(_) => Err(ClusterError::MalformedResponse),
+		}
 	}
 }
 
@@ -159,8 +161,7 @@ where
 					.increment_failure(&hive_addr)
 					.is_ok_and(|failures| failures >= max_failures);
 				if evicting {
-					let _ = self.registry.unregister(&hive_addr);
-					let _ = self.servlet_registry.remove_by_hive(&hive_addr);
+					self.membership().retire(&hive_addr);
 					self.trace.event(CLUSTER_HIVE_EVICTED)?;
 				}
 			}
@@ -190,7 +191,7 @@ where
 	/// only the concurrency slot is wanted.
 	pub(crate) fn spawn_heartbeat<D: ClusterDigest>(self) -> rt::JoinHandle {
 		let beat_ctx = self.clone();
-		let GatewayRuntimeCtx { registry, servlet_registry, config, trace, .. } = self;
+		let GatewayRuntimeCtx { registry, config, trace, .. } = self;
 
 		rt::spawn(async move {
 			let beat: Result<(), TightBeamError> = async move {
@@ -210,9 +211,10 @@ where
 
 					while set.join_next().await.is_some() {}
 
-					for entry in registry.evict_stale().unwrap_or_default() {
-						let _ = servlet_registry.remove_by_hive(&entry.address);
-						trace.event(CLUSTER_HIVE_EVICTED)?;
+					// One event per hive that lost its lease, naming the hive,
+					// so an expiry is attributable after the fact.
+					for retired in beat_ctx.membership().retire_stale() {
+						trace.event(CLUSTER_HIVE_EVICTED)?.with_payload(&retired.address).emit();
 					}
 
 					rt::sleep(config.heartbeat.interval).await;

@@ -28,6 +28,7 @@
 //! - CWE-770, allocation of resources without limits or throttling:
 //!   <https://cwe.mitre.org/data/definitions/770.html>
 
+use core::fmt;
 use core::net::{IpAddr, SocketAddr};
 use core::str::FromStr;
 use std::collections::{HashMap, HashSet};
@@ -37,11 +38,63 @@ mod guard;
 
 use guard::{GuardedTable, PeerEntry, TableState};
 
-use super::ClusterError;
+use super::{ClusterError, SharedId};
 use crate::colony::common::PeerGossip;
 use crate::constants::{
 	MAX_PEER_BUCKET, MAX_PEER_TABLE_NEW, MAX_PEER_TABLE_TRIED, MAX_PEER_TRIED_FAILURES, PEER_PROBE_PER_BEAT,
 };
+
+/// A dialable gateway address, parsed once where it enters.
+///
+/// Discovery carries this rather than a `String`, so the peer table, its
+/// diversity buckets, and the probe path share one canonical form and
+/// re-parse nothing. A wire entry that names no socket never becomes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PeerAddress(SocketAddr);
+
+impl PeerAddress {
+	/// The locality bucket this address spends capacity in.
+	#[must_use]
+	pub fn group(&self) -> AddressGroup {
+		AddressGroup::from(self.0.ip())
+	}
+
+	/// The bytes a route or a trace payload names this address by.
+	///
+	/// One home for the rendering, so a route installed under this address
+	/// and a later lookup by it cannot disagree about how one socket is
+	/// spelled.
+	#[must_use]
+	pub fn route_bytes(&self) -> SharedId {
+		SharedId::from(self.to_string().as_bytes())
+	}
+
+	/// The socket to dial.
+	#[must_use]
+	pub fn socket(&self) -> SocketAddr {
+		self.0
+	}
+}
+
+impl From<SocketAddr> for PeerAddress {
+	fn from(socket: SocketAddr) -> Self {
+		Self(socket)
+	}
+}
+
+impl FromStr for PeerAddress {
+	type Err = core::net::AddrParseError;
+
+	fn from_str(addr: &str) -> Result<Self, Self::Err> {
+		addr.parse::<SocketAddr>().map(Self)
+	}
+}
+
+impl fmt::Display for PeerAddress {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
 
 /// Network locality bucket of one peer address.
 ///
@@ -71,20 +124,11 @@ impl From<IpAddr> for AddressGroup {
 	}
 }
 
-impl FromStr for AddressGroup {
-	type Err = core::net::AddrParseError;
-
-	fn from_str(addr: &str) -> Result<Self, Self::Err> {
-		let socket: SocketAddr = addr.parse()?;
-		Ok(Self::from(socket.ip()))
-	}
-}
-
 /// One unverified discovery hint from peer exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerHint {
 	/// Dialable gateway address claimed by the sharer.
-	pub gateway_addr: String,
+	pub gateway_addr: PeerAddress,
 	/// Peer certificate fingerprint last seen with this address, when known.
 	///
 	/// The value is advisory until a probe verifies the peer.
@@ -103,8 +147,11 @@ impl TryFrom<PeerGossip> for PeerHint {
 	/// The conversion moves both buffers, and a refused address travels
 	/// back inside the error, so neither outcome copies wire bytes.
 	fn try_from(entry: PeerGossip) -> Result<Self, Self::Error> {
-		let gateway_addr =
+		let text =
 			String::from_utf8(entry.gateway_addr).map_err(|error| ClusterError::InvalidAddress(error.into_bytes()))?;
+		let gateway_addr = text
+			.parse::<PeerAddress>()
+			.map_err(|_| ClusterError::InvalidAddress(text.into_bytes()))?;
 
 		let mut peer_id = None;
 		if !entry.peer_id.is_empty() {
@@ -119,7 +166,7 @@ impl TryFrom<PeerGossip> for PeerHint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerRecord {
 	/// Dialable gateway address for this peer.
-	pub gateway_addr: String,
+	pub gateway_addr: PeerAddress,
 	/// Peer certificate fingerprint from the last verified probe.
 	pub peer_id: Option<Vec<u8>>,
 	/// Whether a colony-gated probe has verified this peer.
@@ -168,8 +215,8 @@ impl PeerStore for MemoryPeerStore {
 /// Interior mutability lets the advertise beat, reconcile rounds, and
 /// reflood tasks share one instance through configuration.
 pub struct PeerTable {
-	anchors: Vec<String>,
-	anchor_keys: HashSet<String>,
+	anchors: Vec<PeerAddress>,
+	anchor_keys: HashSet<PeerAddress>,
 	state: GuardedTable,
 	store: Arc<dyn PeerStore>,
 	/// Newest generation written, and the gate that orders driver writes.
@@ -182,7 +229,7 @@ pub struct PeerTable {
 
 impl Default for PeerTable {
 	fn default() -> Self {
-		Self::new(Vec::<String>::new(), Arc::new(MemoryPeerStore))
+		Self::new(Vec::<PeerAddress>::new(), Arc::new(MemoryPeerStore))
 	}
 }
 
@@ -196,22 +243,9 @@ impl core::fmt::Debug for PeerTable {
 	}
 }
 
-/// Canonical map key for an address.
-///
-/// The key is the parsed socket rendering so textual variants of one socket
-/// collapse to one entry.
-fn address_key(addr: impl AsRef<str>) -> Option<String> {
-	let addr = addr.as_ref();
-	let socket: SocketAddr = addr.parse().ok()?;
-	Some(socket.to_string())
-}
-
 /// Count entries in `map` that share the prefix bucket of `group`.
-fn bucket_len(map: &HashMap<String, PeerEntry>, group: AddressGroup) -> usize {
-	map.keys()
-		.filter_map(|addr| addr.parse::<AddressGroup>().ok())
-		.filter(|candidate| *candidate == group)
-		.count()
+fn bucket_len(map: &HashMap<PeerAddress, PeerEntry>, group: AddressGroup) -> usize {
+	map.keys().filter(|addr| addr.group() == group).count()
 }
 
 /// Round-robin sample across prefix buckets.
@@ -222,18 +256,16 @@ fn bucket_len(map: &HashMap<String, PeerEntry>, group: AddressGroup) -> usize {
 ///
 /// The walk holds borrowed pairs only. Solely the up-to-`cap` drawn
 /// addresses are cloned, because they outlive the table lock.
-fn diversity_sample<'t, I>(entries: I, cap: usize) -> Vec<String>
+fn diversity_sample<'t, I>(entries: I, cap: usize) -> Vec<PeerAddress>
 where
-	I: Iterator<Item = (&'t String, &'t PeerEntry)>,
+	I: Iterator<Item = (&'t PeerAddress, &'t PeerEntry)>,
 {
-	let mut buckets: HashMap<AddressGroup, Vec<(&String, &PeerEntry)>> = HashMap::new();
+	let mut buckets: HashMap<AddressGroup, Vec<(&PeerAddress, &PeerEntry)>> = HashMap::new();
 	for (addr, entry) in entries {
-		if let Ok(group) = addr.parse::<AddressGroup>() {
-			buckets.entry(group).or_default().push((addr, entry));
-		}
+		buckets.entry(addr.group()).or_default().push((addr, entry));
 	}
 
-	let mut lanes: Vec<Vec<(&String, &PeerEntry)>> = buckets.into_values().collect();
+	let mut lanes: Vec<Vec<(&PeerAddress, &PeerEntry)>> = buckets.into_values().collect();
 	for lane in &mut lanes {
 		lane.sort_by_key(|(_, entry)| entry.last_probe_ms);
 	}
@@ -249,7 +281,7 @@ where
 				break;
 			}
 			if let Some((addr, _)) = lane.get(depth) {
-				sample.push((*addr).clone());
+				sample.push(**addr);
 				drew = true;
 			}
 		}
@@ -265,30 +297,30 @@ where
 }
 
 /// Deterministic lane order key: the lane's front address, borrowed.
-fn lane_key<'t>(lane: &[(&'t String, &'t PeerEntry)]) -> Option<&'t String> {
+fn lane_key<'t>(lane: &[(&'t PeerAddress, &'t PeerEntry)]) -> Option<&'t PeerAddress> {
 	lane.first().map(|(addr, _)| *addr)
 }
 
 impl PeerTable {
 	/// Build a table around the given anchors and persistence driver.
 	///
-	/// Accepts any iterator of values convertible into [`String`].
+	/// Accepts any iterator of values convertible into [`String`]. An anchor
+	/// that names no socket is dropped, because nothing can dial it.
 	/// Hydration replays persisted records through the capped admission path.
 	/// A driver fault degrades to an anchors-only start. An empty table is
 	/// safe because discovery refills it. A driver seeds through the same
 	/// capped admission path every other record takes.
 	#[must_use]
-	pub fn new<I, S>(anchors: I, store: Arc<dyn PeerStore>) -> Self
+	pub fn new<I>(anchors: I, store: Arc<dyn PeerStore>) -> Self
 	where
-		I: IntoIterator<Item = S>,
-		S: Into<String>,
+		I: IntoIterator<Item = PeerAddress>,
 	{
-		let anchors: Vec<String> = anchors.into_iter().map(Into::into).collect();
-		let anchor_keys = anchors
-			.iter()
-			.map(|anchor| address_key(anchor).unwrap_or_else(|| anchor.clone()))
-			.collect();
+		// Anchors arrive parsed. `ClusterConfigBuilder::with_peers` refuses
+		// an entry that names no socket where the operator wrote it, so
+		// there is nothing to drop here.
+		let anchors: Vec<PeerAddress> = anchors.into_iter().collect();
 
+		let anchor_keys = anchors.iter().copied().collect();
 		let table = Self {
 			anchors,
 			anchor_keys,
@@ -347,24 +379,19 @@ impl PeerTable {
 	/// candidate in new. That is the test-before-evict discipline. Residents
 	/// re-verify on every beat, so a candidate waits for a freed slot
 	/// so a candidate waits for a freed slot.
-	pub fn promote(&self, addr: impl AsRef<str>, peer_id: Option<&[u8]>, now_ms: u64) -> Result<bool, ClusterError> {
-		let addr = addr.as_ref();
-		let Some(key) = address_key(addr) else {
-			return Ok(false);
-		};
-
+	pub fn promote(&self, addr: PeerAddress, peer_id: Option<&[u8]>, now_ms: u64) -> Result<bool, ClusterError> {
 		// Anchors are configured, so a verified anchor moves no learned row.
-		if self.anchor_keys.contains(&key) {
+		if self.anchor_keys.contains(&addr) {
 			return self.with_table(|state| {
 				let entry = PeerEntry { peer_id: peer_id.map(<[u8]>::to_vec), last_probe_ms: now_ms, failures: 0 };
-				state.anchors_verified.insert(key, entry);
+				state.anchors_verified.insert(addr, entry);
 
 				(false, false)
 			});
 		}
 
 		self.with_table(|state| {
-			if let Some(entry) = state.tried.get_mut(&key) {
+			if let Some(entry) = state.tried.get_mut(&addr) {
 				entry.last_probe_ms = now_ms;
 				entry.failures = 0;
 
@@ -376,7 +403,7 @@ impl PeerTable {
 			}
 
 			let record = PeerRecord {
-				gateway_addr: key,
+				gateway_addr: addr,
 				peer_id: peer_id.map(<[u8]>::to_vec),
 				tried: true,
 				last_probe_ms: now_ms,
@@ -393,14 +420,9 @@ impl PeerTable {
 	/// live addresses. A tried resident leaves through repeated beat failures
 	/// in [`Self::record_failure`].
 	/// Misbehavior is handled by relay scoring.
-	pub fn discard(&self, addr: impl AsRef<str>) -> Result<(), ClusterError> {
-		let addr = addr.as_ref();
-		let Some(key) = address_key(addr) else {
-			return Ok(());
-		};
-
+	pub fn discard(&self, addr: PeerAddress) -> Result<(), ClusterError> {
 		self.with_table(|state| {
-			let removed = state.new.remove(&key).is_some();
+			let removed = state.new.remove(&addr).is_some();
 			((), removed)
 		})
 	}
@@ -425,14 +447,9 @@ impl PeerTable {
 	///   Bitcoin's peer-to-peer network (feeler probes / tried eviction):
 	///   [USENIX Security '15](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
 	///   [ePrint 2015/263](https://eprint.iacr.org/2015/263)
-	pub fn record_failure(&self, addr: impl AsRef<str>) -> Result<bool, ClusterError> {
-		let addr = addr.as_ref();
-		let Some(key) = address_key(addr) else {
-			return Ok(false);
-		};
-
+	pub fn record_failure(&self, addr: PeerAddress) -> Result<bool, ClusterError> {
 		self.with_table(|state| {
-			let Some(entry) = state.tried.get_mut(&key) else {
+			let Some(entry) = state.tried.get_mut(&addr) else {
 				return (false, false);
 			};
 
@@ -441,7 +458,7 @@ impl PeerTable {
 				return (false, false);
 			}
 
-			state.tried.remove(&key);
+			state.tried.remove(&addr);
 
 			(true, true)
 		})
@@ -455,16 +472,10 @@ impl PeerTable {
 	/// - The address leaves discovery at once.
 	/// - The address leaves at once, ahead of the failure threshold.
 	/// - A re-keyed peer therefore stops receiving advertisements.
-	pub fn expel(&self, addr: impl AsRef<str>) -> Result<(), ClusterError> {
-		let addr = addr.as_ref();
-		let Some(key) = address_key(addr) else {
-			return Ok(());
-		};
-
+	pub fn expel(&self, addr: PeerAddress) -> Result<(), ClusterError> {
 		self.with_table(|state| {
-			let from_new = state.new.remove(&key).is_some();
-			let from_tried = state.tried.remove(&key).is_some();
-
+			let from_new = state.new.remove(&addr).is_some();
+			let from_tried = state.tried.remove(&addr).is_some();
 			((), from_new || from_tried)
 		})
 	}
@@ -477,8 +488,10 @@ impl PeerTable {
 	///
 	/// The returned targets outlive the table lock, so each beat draws
 	/// owned copies. The set is bounded by the anchor and tried caps.
-	pub fn target_set(&self) -> Result<Vec<String>, ClusterError> {
-		let mut learned = self.state.read(|state| state.tried.keys().cloned().collect::<Vec<String>>())?;
+	pub fn target_set(&self) -> Result<Vec<PeerAddress>, ClusterError> {
+		let mut learned = self
+			.state
+			.read(|state| state.tried.keys().copied().collect::<Vec<PeerAddress>>())?;
 		let mut targets = self.anchors.clone();
 
 		learned.sort();
@@ -493,7 +506,7 @@ impl PeerTable {
 	/// own share of probe capacity. Each bucket prefers its least recently
 	/// probed candidate. Sampled candidates are stamped with `now_ms` so
 	/// later beats rotate through the backlog.
-	pub fn probe_sample(&self, now_ms: u64) -> Result<Vec<String>, ClusterError> {
+	pub fn probe_sample(&self, now_ms: u64) -> Result<Vec<PeerAddress>, ClusterError> {
 		// A probe stamp rotates the backlog within a run. The next durable
 		// change carries whatever stamp is current, so the beat spends no
 		// driver write of its own.
@@ -548,18 +561,13 @@ impl PeerTable {
 	/// Peer exchange echoes installed routes, which include the requester's
 	/// own advertised address, so the table holds that address out of
 	/// admission. PEX replies therefore teach a gateway its peers alone.
-	pub fn exclude_self(&self, addr: impl AsRef<str>) -> Result<(), ClusterError> {
-		let addr = addr.as_ref();
-		let Some(key) = address_key(addr) else {
-			return Ok(());
-		};
-
+	pub fn exclude_self(&self, addr: PeerAddress) -> Result<(), ClusterError> {
 		// The advertise beat re-excludes on every start, so the local
 		// address needs no driver write to stay out of admission.
 		self.with_table(|state| {
-			state.new.remove(&key);
-			state.tried.remove(&key);
-			state.local = Some(key);
+			state.new.remove(&addr);
+			state.tried.remove(&addr);
+			state.local = Some(addr);
 
 			((), false)
 		})
@@ -583,16 +591,12 @@ impl PeerTable {
 	/// This is the single chokepoint for `learn`, `promote`, and hydration.
 	/// No path can bypass anchor exclusion or the prefix bounds.
 	fn admit_record(&self, state: &mut TableState, record: PeerRecord) -> bool {
-		let Some(key) = address_key(&record.gateway_addr) else {
-			return false;
-		};
-		let Ok(group) = key.parse::<AddressGroup>() else {
-			return false;
-		};
+		let key = record.gateway_addr;
+		let group = key.group();
 		if self.anchor_keys.contains(&key) || state.tried.contains_key(&key) {
 			return false;
 		}
-		if state.local.as_deref() == Some(key.as_str()) {
+		if state.local == Some(key) {
 			return false;
 		}
 
@@ -670,14 +674,18 @@ mod tests {
 	use core::time::Duration;
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-	fn hint(addr: impl AsRef<str>) -> PeerHint {
-		let addr = addr.as_ref();
-		PeerHint { gateway_addr: addr.to_string(), peer_id: None }
+	/// Parse a fixture address, which the table takes parsed.
+	fn addr(text: impl AsRef<str>) -> PeerAddress {
+		text.as_ref().parse().expect("fixture address parses as a socket")
+	}
+
+	fn hint(text: impl AsRef<str>) -> PeerHint {
+		PeerHint { gateway_addr: addr(text), peer_id: None }
 	}
 
 	fn table_with_anchor(anchor: impl AsRef<str>) -> PeerTable {
 		let anchor = anchor.as_ref();
-		PeerTable::new(vec![anchor.to_string()], Arc::new(MemoryPeerStore))
+		PeerTable::new(vec![addr(anchor)], Arc::new(MemoryPeerStore))
 	}
 
 	struct CountingStore {
@@ -703,18 +711,14 @@ mod tests {
 		}
 	}
 
-	fn record(addr: impl AsRef<str>, tried: bool) -> PeerRecord {
-		let addr = addr.as_ref();
-		PeerRecord { gateway_addr: addr.to_string(), peer_id: None, tried, last_probe_ms: 0 }
+	fn record(text: impl AsRef<str>, tried: bool) -> PeerRecord {
+		PeerRecord { gateway_addr: addr(text), peer_id: None, tried, last_probe_ms: 0 }
 	}
 
 	#[test]
-	fn address_group_prefixes_v4_and_v6() -> Result<(), core::net::AddrParseError> {
-		let v4: AddressGroup = "10.1.2.3:80".parse()?;
-		let v6: AddressGroup = "[2001:db8::1]:80".parse()?;
-		assert_eq!(v4, AddressGroup::V4([10, 1]));
-		assert_eq!(v6, AddressGroup::V6([0x20, 0x01, 0x0d, 0xb8]));
-		Ok(())
+	fn address_group_prefixes_v4_and_v6() {
+		assert_eq!(addr("10.1.2.3:80").group(), AddressGroup::V4([10, 1]));
+		assert_eq!(addr("[2001:db8::1]:80").group(), AddressGroup::V6([0x20, 0x01, 0x0d, 0xb8]));
 	}
 
 	#[test]
@@ -727,9 +731,11 @@ mod tests {
 	}
 
 	#[test]
-	fn learn_drops_unparsable_and_duplicate_hints() -> Result<(), ClusterError> {
+	// An address that names no socket never becomes a hint, so learning
+	// only has duplicates left to drop.
+	fn learn_drops_duplicate_hints() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		let admitted = table.learn(vec![hint("not-an-address"), hint("10.0.0.1:9000"), hint("10.0.0.1:9000")])?;
+		let admitted = table.learn(vec![hint("10.0.0.1:9000"), hint("10.0.0.1:9000")])?;
 		assert_eq!(admitted, 1);
 		Ok(())
 	}
@@ -740,10 +746,18 @@ mod tests {
 		for (wire_id, hint_id) in cases {
 			let entry = PeerGossip { peer_id: wire_id, gateway_addr: b"10.0.0.1:9000".to_vec() };
 			let converted = PeerHint::try_from(entry)?;
-			assert_eq!(converted.gateway_addr, "10.0.0.1:9000");
+			assert_eq!(converted.gateway_addr.to_string(), "10.0.0.1:9000");
 			assert_eq!(converted.peer_id, hint_id);
 		}
 		Ok(())
+	}
+
+	// Discovery dials the address, so an entry that names no socket is
+	// refused where it enters rather than dropped later.
+	#[test]
+	fn pex_entry_with_a_non_socket_address_is_refused() {
+		let entry = PeerGossip { peer_id: Vec::new(), gateway_addr: b"not-a-socket".to_vec() };
+		assert!(matches!(PeerHint::try_from(entry), Err(ClusterError::InvalidAddress(_))));
 	}
 
 	#[test]
@@ -768,8 +782,8 @@ mod tests {
 		let table = PeerTable::default();
 		table.learn(vec![hint("10.0.0.1:9000")])?;
 
-		let first = table.promote("10.0.0.1:9000", Some(b"fp-a"), 1_000)?;
-		let second = table.promote("10.0.0.1:9000", Some(b"fp-a"), 2_000)?;
+		let first = table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), 1_000)?;
+		let second = table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), 2_000)?;
 		assert!(first);
 		assert!(!second);
 		assert_eq!(table.learned()?, (0, 1));
@@ -779,7 +793,7 @@ mod tests {
 	#[test]
 	fn promote_never_tracks_anchors() -> Result<(), ClusterError> {
 		let table = table_with_anchor("127.0.0.1:9000");
-		let promoted = table.promote("127.0.0.1:9000", None, 1_000)?;
+		let promoted = table.promote(addr("127.0.0.1:9000"), None, 1_000)?;
 		assert!(!promoted);
 		assert_eq!(table.learned()?, (0, 0));
 		Ok(())
@@ -790,11 +804,11 @@ mod tests {
 		let table = table_with_anchor("127.0.0.1:9000");
 		assert!(table.sample_for_pex(8)?.is_empty());
 
-		table.promote("127.0.0.1:9000", Some(b"fp-a"), 1_000)?;
+		table.promote(addr("127.0.0.1:9000"), Some(b"fp-a"), 1_000)?;
 
 		let sample = table.sample_for_pex(8)?;
 		assert_eq!(sample.len(), 1);
-		assert_eq!(sample[0].gateway_addr, "127.0.0.1:9000");
+		assert_eq!(sample[0].gateway_addr.to_string(), "127.0.0.1:9000");
 		assert_eq!(sample[0].peer_id.as_deref(), Some(b"fp-a".as_slice()));
 		Ok(())
 	}
@@ -803,12 +817,12 @@ mod tests {
 	fn promote_keeps_residents_of_full_tried_bucket() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		for host in 0..MAX_PEER_BUCKET {
-			table.promote(format!("10.0.0.{}:9000", host + 1), None, 1_000)?;
+			table.promote(addr(format!("10.0.0.{}:9000", host + 1)), None, 1_000)?;
 		}
 
 		table.learn(vec![hint("10.0.9.9:9000")])?;
 
-		let promoted = table.promote("10.0.9.9:9000", None, 2_000)?;
+		let promoted = table.promote(addr("10.0.9.9:9000"), None, 2_000)?;
 		assert!(!promoted);
 		assert_eq!(table.learned()?, (1, MAX_PEER_BUCKET));
 		Ok(())
@@ -817,10 +831,10 @@ mod tests {
 	#[test]
 	fn exclude_self_blocks_learning_own_address() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.exclude_self("10.0.0.1:9000")?;
+		table.exclude_self(addr("10.0.0.1:9000"))?;
 
 		let admitted = table.learn(vec![hint("10.0.0.1:9000")])?;
-		let promoted = table.promote("10.0.0.1:9000", None, 1_000)?;
+		let promoted = table.promote(addr("10.0.0.1:9000"), None, 1_000)?;
 		assert_eq!(admitted, 0);
 		assert!(!promoted);
 		Ok(())
@@ -830,10 +844,10 @@ mod tests {
 	fn discard_prunes_only_the_new_table() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		table.learn(vec![hint("10.0.0.1:9000")])?;
-		table.promote("10.1.0.1:9000", None, 1_000)?;
+		table.promote(addr("10.1.0.1:9000"), None, 1_000)?;
 
-		table.discard("10.0.0.1:9000")?;
-		table.discard("10.1.0.1:9000")?;
+		table.discard(addr("10.0.0.1:9000"))?;
+		table.discard(addr("10.1.0.1:9000"))?;
 		assert_eq!(table.learned()?, (0, 1));
 		Ok(())
 	}
@@ -841,10 +855,10 @@ mod tests {
 	#[test]
 	fn record_failure_evicts_tried_peer_at_threshold() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.promote("10.0.0.1:9000", None, 1_000)?;
+		table.promote(addr("10.0.0.1:9000"), None, 1_000)?;
 
 		let evictions: Vec<bool> = (0..MAX_PEER_TRIED_FAILURES)
-			.map(|_| table.record_failure("10.0.0.1:9000").unwrap_or_default())
+			.map(|_| table.record_failure(addr("10.0.0.1:9000")).unwrap_or_default())
 			.collect();
 		assert_eq!(evictions, vec![false, false, true]);
 		assert_eq!(table.learned()?, (0, 0));
@@ -854,14 +868,14 @@ mod tests {
 	#[test]
 	fn verified_probe_resets_failure_count() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.promote("10.0.0.1:9000", None, 1_000)?;
-		table.record_failure("10.0.0.1:9000")?;
-		table.record_failure("10.0.0.1:9000")?;
+		table.promote(addr("10.0.0.1:9000"), None, 1_000)?;
+		table.record_failure(addr("10.0.0.1:9000"))?;
+		table.record_failure(addr("10.0.0.1:9000"))?;
 
-		table.promote("10.0.0.1:9000", None, 2_000)?;
+		table.promote(addr("10.0.0.1:9000"), None, 2_000)?;
 
-		table.record_failure("10.0.0.1:9000")?;
-		table.record_failure("10.0.0.1:9000")?;
+		table.record_failure(addr("10.0.0.1:9000"))?;
+		table.record_failure(addr("10.0.0.1:9000"))?;
 		assert_eq!(table.learned()?, (0, 1));
 		Ok(())
 	}
@@ -869,8 +883,8 @@ mod tests {
 	#[test]
 	fn record_failure_ignores_anchors_and_unknown_addresses() -> Result<(), ClusterError> {
 		let table = table_with_anchor("127.0.0.1:9000");
-		let anchor_evicted = table.record_failure("127.0.0.1:9000")?;
-		let unknown_evicted = table.record_failure("10.0.0.1:9000")?;
+		let anchor_evicted = table.record_failure(addr("127.0.0.1:9000"))?;
+		let unknown_evicted = table.record_failure(addr("10.0.0.1:9000"))?;
 		assert!(!anchor_evicted);
 		assert!(!unknown_evicted);
 		Ok(())
@@ -880,15 +894,16 @@ mod tests {
 	fn eviction_frees_the_prefix_bucket_slot() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		for host in 0..MAX_PEER_BUCKET {
-			table.promote(format!("10.0.0.{}:9000", host + 1), None, 1_000)?;
+			table.promote(addr(format!("10.0.0.{}:9000", host + 1)), None, 1_000)?;
 		}
-		assert!(!table.promote("10.0.9.9:9000", None, 2_000)?);
+
+		assert!(!table.promote(addr("10.0.9.9:9000"), None, 2_000)?);
 
 		for _ in 0..MAX_PEER_TRIED_FAILURES {
-			table.record_failure("10.0.0.1:9000")?;
+			table.record_failure(addr("10.0.0.1:9000"))?;
 		}
 
-		assert!(table.promote("10.0.9.9:9000", None, 3_000)?);
+		assert!(table.promote(addr("10.0.9.9:9000"), None, 3_000)?);
 		Ok(())
 	}
 
@@ -896,10 +911,9 @@ mod tests {
 	fn expel_clears_both_learned_tables() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
 		table.learn(vec![hint("10.0.0.1:9000")])?;
-		table.promote("10.1.0.1:9000", None, 1_000)?;
-
-		table.expel("10.0.0.1:9000")?;
-		table.expel("10.1.0.1:9000")?;
+		table.promote(addr("10.1.0.1:9000"), None, 1_000)?;
+		table.expel(addr("10.0.0.1:9000"))?;
+		table.expel(addr("10.1.0.1:9000"))?;
 		assert_eq!(table.learned()?, (0, 0));
 		Ok(())
 	}
@@ -908,10 +922,10 @@ mod tests {
 	fn target_set_leads_with_anchors_and_hides_new() -> Result<(), ClusterError> {
 		let table = table_with_anchor("127.0.0.1:9000");
 		table.learn(vec![hint("10.0.0.1:9000")])?;
-		table.promote("10.1.0.1:9000", None, 1_000)?;
+		table.promote(addr("10.1.0.1:9000"), None, 1_000)?;
 
 		let targets = table.target_set()?;
-		assert_eq!(targets, vec!["127.0.0.1:9000".to_string(), "10.1.0.1:9000".to_string()]);
+		assert_eq!(targets, vec![addr("127.0.0.1:9000"), addr("10.1.0.1:9000")]);
 		Ok(())
 	}
 
@@ -926,7 +940,7 @@ mod tests {
 
 		let sample = table.probe_sample(1_000)?;
 		assert_eq!(sample.len(), PEER_PROBE_PER_BEAT);
-		assert!(sample.contains(&"10.1.0.1:9000".to_string()));
+		assert!(sample.contains(&addr("10.1.0.1:9000")));
 		Ok(())
 	}
 
@@ -945,14 +959,14 @@ mod tests {
 	#[test]
 	fn sample_for_pex_caps_and_spans_buckets() -> Result<(), ClusterError> {
 		let table = PeerTable::default();
-		table.promote("10.0.0.1:9000", Some(b"fp-a"), 1_000)?;
-		table.promote("10.0.0.2:9000", Some(b"fp-b"), 1_000)?;
-		table.promote("10.1.0.1:9000", Some(b"fp-c"), 1_000)?;
+		table.promote(addr("10.0.0.1:9000"), Some(b"fp-a"), 1_000)?;
+		table.promote(addr("10.0.0.2:9000"), Some(b"fp-b"), 1_000)?;
+		table.promote(addr("10.1.0.1:9000"), Some(b"fp-c"), 1_000)?;
 
 		let sample = table.sample_for_pex(2)?;
-		let addrs: Vec<&str> = sample.iter().map(|record| record.gateway_addr.as_str()).collect();
+		let addrs: Vec<PeerAddress> = sample.iter().map(|record| record.gateway_addr).collect();
 		assert_eq!(sample.len(), 2);
-		assert!(addrs.contains(&"10.1.0.1:9000"));
+		assert!(addrs.contains(&addr("10.1.0.1:9000")));
 		Ok(())
 	}
 
@@ -973,7 +987,7 @@ mod tests {
 			.collect();
 		seed.push(record("10.1.0.1:9000", true));
 
-		let table = PeerTable::new(Vec::<String>::new(), Arc::new(CountingStore::seeded(seed)));
+		let table = PeerTable::new(Vec::<PeerAddress>::new(), Arc::new(CountingStore::seeded(seed)));
 		assert_eq!(table.learned()?, (MAX_PEER_BUCKET, 1));
 		Ok(())
 	}
@@ -982,10 +996,10 @@ mod tests {
 	fn mutations_persist_through_the_driver() -> Result<(), ClusterError> {
 		let store = Arc::new(CountingStore::seeded(Vec::new()));
 		let driver: Arc<dyn PeerStore> = store.clone();
-		let table = PeerTable::new(Vec::<String>::new(), driver);
+		let table = PeerTable::new(Vec::<PeerAddress>::new(), driver);
 
 		table.learn(vec![hint("10.0.0.1:9000")])?;
-		table.promote("10.0.0.1:9000", None, 1_000)?;
+		table.promote(addr("10.0.0.1:9000"), None, 1_000)?;
 		assert_eq!(store.persists.load(Ordering::SeqCst), 2);
 		Ok(())
 	}
@@ -1046,7 +1060,10 @@ mod tests {
 	#[test]
 	fn driver_writes_land_in_generation_order() -> Result<(), ClusterError> {
 		let store = Arc::new(StallingStore::default());
-		let table = Arc::new(PeerTable::new(Vec::<String>::new(), Arc::clone(&store) as Arc<dyn PeerStore>));
+		let table = Arc::new(PeerTable::new(
+			Vec::<PeerAddress>::new(),
+			Arc::clone(&store) as Arc<dyn PeerStore>,
+		));
 		let first = Arc::clone(&table);
 		let stalled = std::thread::spawn(move || first.learn(vec![hint("10.1.0.1:9000")]));
 
@@ -1095,7 +1112,11 @@ mod tests {
 	#[test]
 	fn the_table_lock_is_free_while_the_driver_writes() -> Result<(), ClusterError> {
 		let store = Arc::new(ReentrantStore { table: Mutex::new(None), observed: AtomicUsize::new(0) });
-		let table = Arc::new(PeerTable::new(vec!["10.0.0.1:9000"], Arc::clone(&store) as Arc<dyn PeerStore>));
+		let table = Arc::new(PeerTable::new(
+			vec![addr("10.0.0.1:9000")],
+			Arc::clone(&store) as Arc<dyn PeerStore>,
+		));
+
 		*store.table.lock().expect("driver handle") = Some(Arc::clone(&table));
 		table.learn(vec![hint("10.1.0.1:9000")])?;
 

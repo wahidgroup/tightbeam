@@ -557,7 +557,7 @@ tb_scenario! {
 			let mut conf = peering_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
 
-			let table = Arc::clone(&conf.peer.table);
+			let table = Arc::clone(conf.peer.table());
 			let cluster = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(cluster.addr()).await?;
 
@@ -1070,6 +1070,7 @@ fn cross_plane_advertising_conf(certs: &SplitPlaneCerts, peer: impl Into<String>
 
 	ClusterConfig::builder(tls)
 		.with_peers([peer])
+		.expect("fixture peers name sockets")
 		.with_advertise_interval(Duration::from_millis(100))
 		.build()
 }

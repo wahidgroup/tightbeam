@@ -54,7 +54,7 @@ pub use tightbeam::{
 		cluster::{
 			Admission, Cluster, ClusterConfig, ClusterError, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest,
 			ClusterWorkResponse, GossipAdmission, GossipConfig, GossipDigest, GossipJournal, HeartbeatConfig,
-			MemoryGossipJournal, PeerHint, PeerTable, TokenBucketAdmission,
+			LocalClaim, MemoryGossipJournal, PeerAddress, PeerHint, PeerTable, TokenBucketAdmission,
 		},
 		common::{
 			current_timestamp_ms, ColonyNamespace, GossipReconciliation, GossipResponse, GossipRumor, GossipWant,
@@ -509,13 +509,15 @@ pub async fn start_ping_hive(
 	mux_offer: Option<TransportOffer>,
 ) -> Result<ClusterTestHive, TightBeamError> {
 	let servlet_conf = servlet_tls_config(&certs)?;
-	let servlet = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
+	let servlet = ClusterTestServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 
 	let mut conf = hive_tls_config(&certs);
 	conf.pool.mux_offer = mux_offer.map(Arc::new);
 
 	let mut hive = ClusterTestHive::new(Some(conf))?;
-	hive.register(servlet_urn("ping"), servlet, |t| ClusterTestServlet::start(t, None))?;
+	hive.register(servlet_urn("ping"), servlet, |t| {
+		ClusterTestServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
@@ -725,10 +727,11 @@ pub fn peering_with_dial_allowlist(
 	certs: &ClusterTestCerts,
 	allowlist: impl IntoIterator<Item = String>,
 ) -> ClusterConfig {
-	let allowlist: Vec<String> = allowlist.into_iter().collect();
-	let mut conf = peering_cluster_conf(certs);
-	conf.peer.peer_dial_allowlist = Some(allowlist);
-	conf
+	let tls = cluster_tls_config(certs).with_peer_trust(Arc::clone(&certs.trust));
+	ClusterConfig::builder(tls)
+		.with_peer_dial_allowlist(allowlist)
+		.expect("fixture allowlist entries name sockets")
+		.build()
 }
 
 /// Importer conf whose peer trails abandon after a few failed forwards.
@@ -749,7 +752,10 @@ pub fn peering_cluster_conf_with_peers(
 ) -> ClusterConfig {
 	let peers: Vec<String> = peers.into_iter().collect();
 	let tls = cluster_tls_config(certs).with_peer_trust(Arc::clone(&certs.trust));
-	ClusterConfig::builder(tls).with_peers(peers).build()
+	ClusterConfig::builder(tls)
+		.with_peers(peers)
+		.expect("fixture peers name sockets")
+		.build()
 }
 
 /// Gateway conf that advertises to `peer` on a fast beat. The slate is
@@ -758,6 +764,7 @@ pub fn advertising_cluster_conf(certs: &ClusterTestCerts, peer: impl Into<String
 	let peer: String = peer.into();
 	ClusterConfig::builder(cluster_tls_config(certs))
 		.with_peers([peer])
+		.expect("fixture peers name sockets")
 		.with_advertise_interval(Duration::from_millis(100))
 		.build()
 }

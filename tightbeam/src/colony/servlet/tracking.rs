@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use crate::utils::BasisPoints;
 
-/// Lightweight metrics exposed by each servlet instance for auto-scaling
+/// Lightweight metrics a servlet instance keeps for auto-scaling.
 ///
-/// Used by hives to calculate utilization and make scaling decisions.
-/// Metrics are updated atomically for thread-safe concurrent access.
+/// A servlet author holds one, counts queued work with
+/// [`ServletMetrics::enqueue`], and reports the result through
+/// [`UtilizationReporter`], which the hive reads when it scales. Metrics
+/// are updated atomically for thread-safe concurrent access.
 #[derive(Debug, Default)]
 pub struct ServletMetrics {
 	/// Current pending messages in queue
@@ -21,19 +23,35 @@ impl ServletMetrics {
 		Self { queue_depth: AtomicU32::new(0) }
 	}
 
-	/// Increment queue depth when a message is enqueued
-	pub fn enqueue(&self) {
+	/// Counts one queued message for as long as the returned slot lives.
+	///
+	/// The slot releases the count on drop, so a handler that returns
+	/// early, panics, or is cancelled cannot leave the depth raised, and
+	/// no release can run without a matching count (the depth cannot wrap
+	/// below zero).
+	pub fn enqueue(self: &Arc<Self>) -> QueueSlot {
 		self.queue_depth.fetch_add(1, Ordering::Relaxed);
-	}
-
-	/// Decrement queue depth when a message is dequeued/processed
-	pub fn dequeue(&self) {
-		self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+		QueueSlot(Arc::clone(self))
 	}
 
 	/// Get the current queue depth
 	pub fn queue_depth(&self) -> u32 {
 		self.queue_depth.load(Ordering::Relaxed)
+	}
+}
+
+/// One queued message, counted while this slot lives.
+///
+/// Minted by [`ServletMetrics::enqueue`] and released on drop, so binding
+/// it is what counts the work. Dropping it in the same statement releases
+/// the count immediately and measures nothing.
+#[derive(Debug)]
+#[must_use = "the queue slot releases its count as soon as it is dropped"]
+pub struct QueueSlot(Arc<ServletMetrics>);
+
+impl Drop for QueueSlot {
+	fn drop(&mut self) {
+		self.0.queue_depth.fetch_sub(1, Ordering::Relaxed);
 	}
 }
 
@@ -48,7 +66,7 @@ pub struct LatencyTracker {
 	/// Exponential moving average in microseconds (stored as u64 for atomics)
 	ema_us: AtomicU64,
 	/// Smoothing factor in basis points (e.g., 2000 = 0.2 weight for new samples)
-	alpha_bps: u16,
+	alpha: BasisPoints,
 	/// Target latency threshold in microseconds (100% utilization point)
 	target_us: u64,
 }
@@ -57,12 +75,13 @@ impl LatencyTracker {
 	/// Create a new latency tracker
 	///
 	/// # Arguments
-	/// * `alpha_bps` - Smoothing factor (0-10000). Higher = more weight on new samples.
-	///   2000 (20%) is a good default for responsive tracking.
+	/// * `alpha` - Smoothing factor. A higher value gives new samples more
+	///   weight. 20% ([`crate::bps!(2000)`](crate::bps)) tracks
+	///   responsively.
 	/// * `target_us` - Target latency in microseconds. Latency at or above this
 	///   value reports 100% utilization.
-	pub const fn new(alpha_bps: u16, target_us: u64) -> Self {
-		Self { ema_us: AtomicU64::new(0), alpha_bps, target_us }
+	pub const fn new(alpha: BasisPoints, target_us: u64) -> Self {
+		Self { ema_us: AtomicU64::new(0), alpha, target_us }
 	}
 
 	/// Record a latency sample
@@ -74,7 +93,7 @@ impl LatencyTracker {
 	pub fn record(&self, latency_us: u64) {
 		// EMA formula: new = alpha * sample + (1 - alpha) * old
 		// Using basis points: new = (alpha * sample + (10000 - alpha) * old) / 10000
-		let alpha = self.alpha_bps as u64;
+		let alpha = self.alpha.get() as u64;
 		let one_minus_alpha = 10000u64.saturating_sub(alpha);
 
 		loop {
@@ -116,7 +135,7 @@ impl LatencyTracker {
 impl Default for LatencyTracker {
 	/// Default: 20% alpha, 100ms target
 	fn default() -> Self {
-		Self::new(2000, 100_000)
+		Self::new(crate::bps!(2000), 100_000)
 	}
 }
 
@@ -124,8 +143,28 @@ impl Default for LatencyTracker {
 // Utilization Reporter
 // ============================================================================
 
-/// Default latency weight in basis points (70%)
-const DEFAULT_LATENCY_WEIGHT_BPS: u16 = 7000;
+/// Default weight the combined utilization gives latency (70%)
+const DEFAULT_LATENCY_WEIGHT: BasisPoints = crate::bps!(7000);
+
+/// How a queue-aware reporter weighs its two inputs.
+///
+/// Both values are basis points, so a positional pair would let a caller
+/// swap them and silently reweight every utilization report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtilizationWeights {
+	/// Smoothing factor for the latency EMA. Higher favours new samples.
+	pub smoothing: BasisPoints,
+	/// Share of the combined utilization that latency accounts for. The
+	/// remainder is the queue's share.
+	pub latency_share: BasisPoints,
+}
+
+impl Default for UtilizationWeights {
+	/// 20% smoothing, 70% latency share.
+	fn default() -> Self {
+		Self { smoothing: crate::bps!(2000), latency_share: DEFAULT_LATENCY_WEIGHT }
+	}
+}
 
 /// Helper for servlets to track and report utilization.
 ///
@@ -171,21 +210,21 @@ pub struct UtilizationReporter {
 	/// Queue capacity for utilization percentage (default: 100)
 	queue_capacity: u32,
 	/// Weight for latency in basis points (default: 7000 = 70%)
-	latency_weight_bps: u16,
+	latency_weight: BasisPoints,
 }
 
 impl UtilizationReporter {
 	/// Create a new utilization reporter with custom parameters.
 	///
 	/// # Arguments
-	/// * `alpha_bps` - Smoothing factor (0-10000). Higher = more weight on new samples.
+	/// * `alpha` - Smoothing factor. Higher = more weight on new samples.
 	/// * `target_us` - Target latency in microseconds (100% utilization point).
-	pub const fn new(alpha_bps: u16, target_us: u64) -> Self {
+	pub const fn new(alpha: BasisPoints, target_us: u64) -> Self {
 		Self {
-			tracker: LatencyTracker::new(alpha_bps, target_us),
+			tracker: LatencyTracker::new(alpha, target_us),
 			queue: None,
 			queue_capacity: 100,
-			latency_weight_bps: DEFAULT_LATENCY_WEIGHT_BPS,
+			latency_weight: DEFAULT_LATENCY_WEIGHT,
 		}
 	}
 
@@ -197,24 +236,17 @@ impl UtilizationReporter {
 	/// where `queue_util = (queue_depth / capacity) * 10000`.
 	///
 	/// # Arguments
-	/// * `alpha_bps` - Smoothing factor for latency EMA (0-10000).
+	/// * `weights` - Smoothing factor and latency share. Naming them keeps
+	///   two basis-point values a caller could otherwise swap apart.
 	/// * `target_us` - Target latency in microseconds (100% utilization point).
 	/// * `queue` - Shared queue metrics to track.
 	/// * `capacity` - Queue capacity for utilization calculation.
-	/// * `latency_weight_bps` - Weight for latency component (0-10000).
-	///   7000 (70% latency, 30% queue) is a good default.
-	pub fn with_queue(
-		alpha_bps: u16,
-		target_us: u64,
-		queue: Arc<ServletMetrics>,
-		capacity: u32,
-		latency_weight_bps: u16,
-	) -> Self {
+	pub fn with_queue(weights: UtilizationWeights, target_us: u64, queue: Arc<ServletMetrics>, capacity: u32) -> Self {
 		Self {
-			tracker: LatencyTracker::new(alpha_bps, target_us),
+			tracker: LatencyTracker::new(weights.smoothing, target_us),
 			queue: Some(queue),
 			queue_capacity: capacity,
-			latency_weight_bps,
+			latency_weight: weights.latency_share,
 		}
 	}
 
@@ -247,7 +279,7 @@ impl UtilizationReporter {
 			.unwrap_or(0);
 
 		// Weighted average: (latency_weight * latency + queue_weight * queue) / 10000
-		let latency_weight = self.latency_weight_bps as u32;
+		let latency_weight = u32::from(self.latency_weight.get());
 		let queue_weight = 10000u32.saturating_sub(latency_weight);
 		let combined = (latency_weight.saturating_mul(latency_util) + queue_weight.saturating_mul(queue_util)) / 10000;
 
@@ -273,6 +305,37 @@ impl UtilizationReporter {
 impl Default for UtilizationReporter {
 	/// Default: 20% alpha, 100ms target latency, no queue tracking
 	fn default() -> Self {
-		Self::new(2000, 100_000)
+		Self::new(crate::bps!(2000), 100_000)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn a_queue_slot_releases_its_count_when_it_drops() {
+		let metrics = Arc::new(ServletMetrics::new());
+
+		{
+			let _first = metrics.enqueue();
+			let _second = metrics.enqueue();
+			assert_eq!(metrics.queue_depth(), 2);
+		}
+
+		assert_eq!(metrics.queue_depth(), 0);
+	}
+
+	#[test]
+	fn a_handler_that_returns_early_still_releases_its_slot() {
+		let metrics = Arc::new(ServletMetrics::new());
+
+		fn refuse(metrics: &Arc<ServletMetrics>) -> Option<u32> {
+			let _slot = metrics.enqueue();
+			None
+		}
+
+		assert_eq!(refuse(&metrics), None);
+		assert_eq!(metrics.queue_depth(), 0);
 	}
 }

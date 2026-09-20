@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{ClusterError, PeerCaps, RouteKind, ServletEntry, ServletRegistry, SharedId};
+use super::{ClusterError, LocalRoute, PeerCaps, RouteKind, ServletEntry, ServletRegistry, SharedId};
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
 
 impl ServletRegistry {
@@ -24,10 +24,12 @@ impl ServletRegistry {
 		let servlet_types = servlet_types.as_ref();
 		let mut routes = self.routes.write()?;
 		for servlet_type in servlet_types {
-			routes.insert(ServletEntry::new(
-				Arc::clone(hive_address),
-				Arc::clone(servlet_type),
-				Arc::clone(hive_id),
+			routes.insert(ServletEntry::local(
+				LocalRoute {
+					address: Arc::clone(hive_address),
+					servlet_type: Arc::clone(servlet_type),
+					hive_id: Arc::clone(hive_id),
+				},
 				self.config.initial_pheromone,
 				self.config.abandonment_limit,
 			));
@@ -66,11 +68,14 @@ impl ServletRegistry {
 	/// empty slate clears the origin's relay trails with its direct routes:
 	/// a fallback lasts as long as a claim it was learned from.
 	pub fn reconcile_peer_slate(&self, ad: AdmittedPeerAd, caps: PeerCaps) -> Result<(), ClusterError> {
-		let AdmittedPeerAd { peer_hive_id, dial_addr, slate, order } = ad;
+		let AdmittedPeerAd { peer_hive_id, dial, slate, order } = ad;
+		// The routes in `slate` carry this spelling, so the conflict probe
+		// compares the same bytes the entries hold.
+		let dial_addr = dial.route_bytes();
 
 		self.routes.write()?.admit_peer_ad(
 			&peer_hive_id,
-			Some(&dial_addr),
+			Some(dial_addr.as_ref()),
 			slate,
 			RouteKind::Peer,
 			caps.max_gateways,

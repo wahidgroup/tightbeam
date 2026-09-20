@@ -260,7 +260,7 @@ servlet! {
 	PoolEchoServlet<TestMessage, EnvConfig = PoolEchoServletConfig>,
 	protocol: TokioListener,
 	handle: |_msg, frame, ctx| async move {
-		let config: &PoolEchoServletConfig = ctx.env_config()?;
+		let config: &PoolEchoServletConfig = ctx.env_config();
 		config.message_count.fetch_add(1, Ordering::SeqCst);
 		Ok(Some(frame))
 	}
@@ -276,7 +276,15 @@ servlet! {
 ))]
 fn pool_echo_conf(
 	message_count: Arc<AtomicUsize>,
-) -> Result<ServletConfig<TokioListener, TestMessage>, TightBeamError> {
+) -> Result<
+	ServletConfig<
+		TokioListener,
+		TestMessage,
+		tightbeam::crypto::profiles::DefaultCryptoProvider,
+		PoolEchoServletConfig,
+	>,
+	TightBeamError,
+> {
 	let key = SERVER_KEY.to_provider::<Secp256k1>()?;
 	let validators = vec![Arc::new(CLIENT_PINNING) as Arc<dyn CertificateValidation>];
 
@@ -295,7 +303,7 @@ fn pool_echo_conf(
 	feature = "aead"
 ))]
 async fn start_pool_echo_servlet(message_count: Arc<AtomicUsize>) -> Result<PoolEchoServlet, TightBeamError> {
-	PoolEchoServlet::start(Arc::new(TraceCollector::default()), Some(pool_echo_conf(message_count)?)).await
+	PoolEchoServlet::start(Arc::new(TraceCollector::default()), pool_echo_conf(message_count)?).await
 }
 
 // ============================================================================

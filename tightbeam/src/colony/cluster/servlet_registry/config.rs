@@ -2,7 +2,7 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use crate::colony::cluster::registry::SharedId;
-use crate::colony::cluster::servlet_registry::entry::ServletEntry;
+use crate::colony::cluster::servlet_registry::entry::{LocalRoute, PeerRoute, ServletEntry};
 use crate::colony::common::ServletInfo;
 use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
 use crate::utils::urn::Urn;
@@ -49,10 +49,12 @@ impl PheromoneConfig {
 		servlets
 			.iter()
 			.map(|info| {
-				ServletEntry::new(
-					Arc::from(info.address.as_slice()),
-					Arc::from(info.servlet_id.type_canonical_bytes().as_slice()),
-					Arc::clone(hive_addr),
+				ServletEntry::local(
+					LocalRoute {
+						address: Arc::from(info.address.as_slice()),
+						servlet_type: Arc::from(info.servlet_id.type_canonical_bytes().as_slice()),
+						hive_id: Arc::clone(hive_addr),
+					},
 					self.initial_pheromone,
 					self.abandonment_limit,
 				)
@@ -75,9 +77,11 @@ impl PheromoneConfig {
 			.iter()
 			.map(|urn| {
 				ServletEntry::peer(
-					Arc::clone(peer_hive_id),
-					Arc::from(urn.type_canonical_bytes().as_slice()),
-					Arc::clone(&dial),
+					PeerRoute {
+						peer_id: Arc::clone(peer_hive_id),
+						servlet_type: Arc::from(urn.type_canonical_bytes().as_slice()),
+						dial_addr: Arc::clone(&dial),
+					},
 					self.initial_pheromone,
 					self.abandonment_limit,
 				)

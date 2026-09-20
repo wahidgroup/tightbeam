@@ -17,7 +17,7 @@ use crate::runtime::rt;
 
 pub use messages::*;
 pub use scaling::*;
-pub use urn::{ColonyNamespace, ColonyResource, COLONY_NID};
+pub use urn::{ColonyNamespace, ColonyResource, ServletTypeKey, COLONY_NID};
 
 // ============================================================================
 // Load Balancing

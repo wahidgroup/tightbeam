@@ -27,9 +27,7 @@ use core::marker::PhantomData;
 use core::time::Duration;
 use std::sync::Arc;
 
-use self::bounds::{
-	ClusterDigest, ClusterPool, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayPlane, GatewayRuntimeCtx,
-};
+use self::bounds::{ClusterDigest, ClusterPool, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
 use crate::colony::cluster::{
@@ -45,6 +43,7 @@ use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
 use crate::transport::accept::AcceptPlane;
+use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::serve::{unimplemented_error, CallContext, MuxService};
@@ -201,6 +200,9 @@ where
 				config.gossip.seen_ttl = retention;
 			}
 
+			// The certificate and the namespace stay writable until here,
+			// so membership binds to the pair this gateway actually serves.
+			config.bind_colony_membership();
 			config
 		};
 
@@ -260,13 +262,13 @@ where
 		config.warn_export_posture(&trace)?;
 
 		// The context is all Arc::clone
-		let server_handle = ctx.clone().serve::<P::Listener, D>(listener, GatewayPlane::Colony);
+		let server_handle = ctx.clone().serve_colony::<P::Listener, D>(listener);
 
-		// The edge plane serves the same mux service restricted to Work
-		// dispatch (see [`GatewayPlane`]).
+		// The edge plane serves [`EdgeMuxService`], which submits work and
+		// has no control or stream route to reach.
 		let edge_handle = edge_listener.map(|edge_listener| {
 			// The context is all Arc::clone
-			ctx.clone().serve::<E::Listener, D>(edge_listener, GatewayPlane::Edge)
+			ctx.clone().serve_edge::<E::Listener, D>(edge_listener)
 		});
 
 		tasks.adopt(ctx.clone().spawn_heartbeat::<D>());
@@ -276,8 +278,7 @@ where
 		// refresh interval floors the TTL, so an aggressive `rumor_refresh`
 		// keeps a healthy fallback in place.
 		let relay_trail_ttl = config
-			.peer
-			.rumor_refresh
+			.rumor_refresh()
 			.saturating_mul(3)
 			.max(Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS));
 
@@ -308,7 +309,10 @@ where
 	}
 
 	fn available_servlets(&self) -> Vec<SharedId> {
-		self.registry.to_available_servlets().unwrap_or_default()
+		// Routes are the one home for which types this gateway serves, so
+		// a hive scaling an instance in or out is reflected here without a
+		// second index to keep current.
+		self.servlet_registry.local_servlets().unwrap_or_default()
 	}
 
 	fn peer_servlets(&self) -> Vec<SharedId> {
@@ -390,7 +394,7 @@ where
 	}
 }
 
-/// Gateway implementation of [`MuxService`].
+/// Gateway implementation of [`MuxService`] for the colony accept plane.
 ///
 /// Unary frames route through cluster dispatch. Streamed and duplex opens route
 /// by the target [`Urn`] on their [`CallContext`].
@@ -404,9 +408,7 @@ where
 ///
 /// # Export boundary
 ///
-/// Stream and duplex opens refuse on [`GatewayPlane::Edge`] before any
-/// gate or route work. On the colony plane they share the Work-arm
-/// boundary order:
+/// Stream and duplex opens share the Work-arm boundary order:
 ///
 /// 1. [`ClusterConfig::evaluate_gates`] before routing.
 /// 2. Resolve the servlet target from the call context.
@@ -417,7 +419,21 @@ where
 	P: Protocol,
 {
 	ctx: GatewayRuntimeCtx<P>,
-	plane: GatewayPlane,
+	_digest: PhantomData<D>,
+}
+
+/// Gateway implementation of [`MuxService`] for an edge accept plane.
+///
+/// An edge plane serves external clients, so it submits work and nothing
+/// else. The type carries that boundary: it has no stream or duplex route
+/// to reach, and its unary arm narrows the envelope to a work request
+/// through [`GatewayRuntimeCtx::handle_edge_request`]. Registration, peer
+/// advertisement, and gossip stay on the colony plane.
+struct EdgeMuxService<P, D>
+where
+	P: Protocol,
+{
+	ctx: GatewayRuntimeCtx<P>,
 	_digest: PhantomData<D>,
 }
 
@@ -432,8 +448,7 @@ where
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
-		let plane = self.plane;
-		async move { ctx.handle_request::<D>(frame, cx.into_session(), plane).await }
+		async move { ctx.handle_request::<D>(frame, cx.into_session()).await }
 	}
 
 	fn streaming(
@@ -442,9 +457,8 @@ where
 		cx: CallContext,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
-		let plane = self.plane;
 		async move {
-			let (target, budget) = ctx.guard_stream_open(&cx, plane)?;
+			let (target, budget) = ctx.guard_stream_open(&cx)?;
 			ctx.splice_streaming(body, target, budget).await
 		}
 	}
@@ -456,20 +470,49 @@ where
 		cx: CallContext,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		let ctx = self.ctx.clone();
-		let plane = self.plane;
 		async move {
-			let (target, budget) = ctx.guard_stream_open(&cx, plane)?;
+			let (target, budget) = ctx.guard_stream_open(&cx)?;
 			ctx.splice_duplex(body, reply, target, budget).await
 		}
+	}
+}
+
+impl<P, D> MuxService for EdgeMuxService<P, D>
+where
+	P: GatewayColonyProtocol,
+	D: ClusterDigest,
+{
+	fn unary(
+		&self,
+		frame: Frame,
+		cx: CallContext,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		let ctx = self.ctx.clone();
+		async move { ctx.handle_edge_request(frame, cx.into_session()).await }
+	}
+
+	fn streaming(
+		&self,
+		_body: StreamBody,
+		_cx: CallContext,
+	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
+		core::future::ready(Err(TransitStatus::PermissionDenied.refusal()))
+	}
+
+	fn duplex(
+		&self,
+		_body: StreamBody,
+		_reply: ReplySink,
+		_cx: CallContext,
+	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
+		core::future::ready(Err(TransitStatus::PermissionDenied.refusal()))
 	}
 }
 
 impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// Boundary guard shared by the streaming and duplex open handlers.
 	///
-	/// The edge accept plane admits unary `Work` only, so stream and duplex
-	/// opens refuse there before any gate or route work. On the colony
-	/// plane the open passes the same boundary a unary request passes:
+	/// An open passes the same boundary a unary request passes:
 	///
 	/// 1. [`ClusterConfig::evaluate_gates`] with no request frame.
 	/// 2. Resolve the servlet target from the call context.
@@ -477,15 +520,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// 4. [`ClusterConfig::evaluate_export_gates`] on that target and session.
 	///
 	/// An unrouted open names no servlet type, so it fails with `Unimplemented`.
-	fn guard_stream_open(
-		&self,
-		cx: &CallContext,
-		plane: GatewayPlane,
-	) -> Result<(Urn<'static>, HopBudget), TightBeamError> {
-		if plane == GatewayPlane::Edge {
-			return Err(TransitStatus::PermissionDenied.refusal());
-		}
-
+	fn guard_stream_open(&self, cx: &CallContext) -> Result<(Urn<'static>, HopBudget), TightBeamError> {
 		let gate_status = self.config.evaluate_gates(None, cx.session(), &self.trace)?;
 		if gate_status != TransitStatus::Ok {
 			return Err(gate_status.refusal());
@@ -508,22 +543,46 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 }
 
 impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
-	/// Serves one accept plane, dispatching each connection through
-	/// [`GatewayMuxService`].
+	/// Serves the colony accept plane through [`GatewayMuxService`].
 	///
-	/// `L` is the listener actually bound: the colony protocol listener or
-	/// the edge protocol listener. Both feed the same service over the
-	/// colony pool protocol `P`. Each admitted transport shares one mux
-	/// offer by reference count.
-	pub(crate) fn serve<L, D>(self, listener: L, plane: GatewayPlane) -> rt::JoinHandle
+	/// `L` is the listener actually bound, which feeds the service over the
+	/// colony pool protocol `P`.
+	pub(crate) fn serve_colony<L, D>(self, listener: L) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
 		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 		D: ClusterDigest,
 	{
-		let ctx = self;
-		let mux_offer = ctx.config.pool_config.mux_offer.as_ref().map(Arc::clone);
-		let service = Arc::new(GatewayMuxService::<P, D> { ctx, plane, _digest: PhantomData });
+		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
+		let service = GatewayMuxService::<P, D> { ctx: self, _digest: PhantomData };
+		Self::accept_into(listener, mux_offer, service)
+	}
+
+	/// Serves an edge accept plane through [`EdgeMuxService`].
+	///
+	/// The service type is what restricts the plane to work submission, so
+	/// this path carries no plane flag into dispatch.
+	pub(crate) fn serve_edge<L, D>(self, listener: L) -> rt::JoinHandle
+	where
+		L: AsyncListenerTrait + Sync + 'static,
+		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
+		D: ClusterDigest,
+	{
+		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
+		let service = EdgeMuxService::<P, D> { ctx: self, _digest: PhantomData };
+		Self::accept_into(listener, mux_offer, service)
+	}
+
+	/// Accepts on `listener`, dispatching every connection through `service`.
+	///
+	/// Each admitted transport shares one mux offer by reference count.
+	fn accept_into<L, S>(listener: L, mux_offer: Option<Arc<TransportOffer>>, service: S) -> rt::JoinHandle
+	where
+		L: AsyncListenerTrait + Sync + 'static,
+		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
+		S: MuxService + Send + Sync + 'static,
+	{
+		let service = Arc::new(service);
 
 		rt::spawn(AcceptPlane::default().accept_on(listener, move |mut transport: L::Transport| {
 			// Clone the Arc so each accept shares the mux offer without

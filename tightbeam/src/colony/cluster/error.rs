@@ -15,6 +15,10 @@ pub enum ClusterError {
 	#[error("Lock poisoned")]
 	LockPoisoned,
 
+	/// A configured peer or allowlist entry names no socket address
+	#[error("Peer address does not parse")]
+	InvalidPeerAddress,
+
 	/// Unknown servlet type
 	#[error("Unknown servlet type: {:#?}")]
 	UnknownServletType(Vec<u8>),

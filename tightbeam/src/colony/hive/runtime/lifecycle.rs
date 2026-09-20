@@ -36,7 +36,7 @@ use crate::transport::{
 use crate::utils::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
-use crate::colony::hive::{ClusterCircuitBreaker, ReplayGuard};
+use crate::colony::hive::{BackpressureGate, ClusterCircuitBreaker, ReplayGuard};
 use crate::transport::TransportEncryptionConfig;
 
 /// The accept plane a cluster reaches this hive on.
@@ -119,12 +119,13 @@ impl<P: Protocol> HiveRuntime<P> {
 			servlets: Arc::clone(&self.servlets),
 			spawners: Arc::clone(&self.spawners),
 			trace: Arc::clone(&self.trace),
-			utilization: Arc::clone(&self.utilization),
-			utilization_map: Arc::clone(&self.utilization_map),
 			drain: self.drain.clone(),
 			in_flight: self.in_flight.clone(),
 			hive_context: Arc::clone(&self.hive_context),
-			bp_threshold: self.config.control.backpressure_threshold,
+			backpressure: BackpressureGate::new(
+				Arc::clone(&self.utilization),
+				self.config.control.backpressure_threshold,
+			),
 			circuit_breaker: Arc::new(ClusterCircuitBreaker::new(
 				self.config.control.circuit_breaker_threshold,
 				self.config.control.circuit_breaker_cooldown_ms,

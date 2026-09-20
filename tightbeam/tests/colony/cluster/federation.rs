@@ -7,7 +7,7 @@
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
-use tightbeam::colony::cluster::{ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
+use tightbeam::colony::cluster::{PeerRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
 
 /// Dial address nothing listens on: a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
@@ -62,6 +62,29 @@ pub fn federation_conf(
 
 	ClusterConfig::builder(tls)
 		.with_peers(peers)
+		.expect("fixture peers name sockets")
+		.with_advertise_interval(Duration::from_millis(100))
+		.with_rumor_refresh(Duration::from_millis(200))
+		.with_max_hops(max_hops)
+		.build()
+}
+
+/// [`federation_conf`] that also restricts inbound ads to the peers it
+/// dials, so a claimed address outside the list is refused.
+pub fn federation_conf_allowing(
+	certs: &ClusterTestCerts,
+	peer_trust: Arc<dyn CertificateTrust>,
+	peers: impl IntoIterator<Item = String>,
+	max_hops: u8,
+) -> ClusterConfig {
+	let peers: Vec<String> = peers.into_iter().collect();
+	let tls = cluster_tls_config(certs).with_peer_trust(peer_trust);
+
+	ClusterConfig::builder(tls)
+		.with_peers(peers.clone())
+		.expect("fixture peers name sockets")
+		.with_peer_dial_allowlist(peers)
+		.expect("fixture allowlist entries name sockets")
 		.with_advertise_interval(Duration::from_millis(100))
 		.with_rumor_refresh(Duration::from_millis(200))
 		.with_max_hops(max_hops)
@@ -88,10 +111,12 @@ async fn start_beacon_hive(
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
 	let servlet_conf = servlet_tls_config(&certs)?;
-	let servlet = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
+	let servlet = ClusterTestServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
-	hive.register(servlet_urn("beacon"), servlet, |t| ClusterTestServlet::start(t, None))?;
+	hive.register(servlet_urn("beacon"), servlet, |t| {
+		ClusterTestServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
@@ -260,8 +285,12 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: ctx, hive }| async move {
 			let gateway_b = start_cluster(&trace, federation_conf(&ctx.b, Arc::clone(&ctx.peers_of_b), vec![], 1)).await?;
 
-			let mut conf_c = federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![gateway_b.addr().to_string()], 1);
-			conf_c.peer.peer_dial_allowlist = Some(vec![gateway_b.addr().to_string()]);
+			let conf_c = federation_conf_allowing(
+				&ctx.c,
+				Arc::clone(&ctx.peers_of_c),
+				vec![gateway_b.addr().to_string()],
+				1,
+			);
 
 			let gateway_c = start_cluster(&trace, conf_c).await?;
 			let gateway_a = start_cluster(&trace, federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![gateway_b.addr().to_string()], 1)).await?;
@@ -601,9 +630,11 @@ fn peer_route_key_for_dial(
 		.find(|route| route.dial_addr.as_ref() == dial_addr && route.servlet_type.as_ref() == canonical.as_slice())
 		.map(|route| {
 			ServletEntry::peer(
-				route.peer_id,
-				route.servlet_type,
-				route.dial_addr,
+				PeerRoute {
+					peer_id: route.peer_id,
+					servlet_type: route.servlet_type,
+					dial_addr: route.dial_addr,
+				},
 				DEFAULT_INITIAL_PHEROMONE,
 				DEFAULT_ABANDONMENT_LIMIT,
 			)

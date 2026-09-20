@@ -241,7 +241,14 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 	}
 
 	if !peers.is_empty() {
-		builder = builder.with_peers(peers);
+		builder = match builder.with_peers(peers) {
+			Ok(builder) => builder,
+			// A topology that cannot dial its own peers is a harness
+			// construction bug, and the refusal names which entry is
+			// wrong. Flattening it into the crate error would throw that
+			// away, and the two error hierarchies do not convert.
+			Err(refusal) => panic!("fuzz topology peers must name sockets: {refusal}"),
+		};
 	}
 
 	let conf = builder.build();
@@ -304,7 +311,7 @@ async fn register_ping(
 ) -> Result<(), TightBeamError> {
 	let trace = share_trace(trace);
 	let config = ping_servlet_config(certs)?;
-	let servlet = ColonyPingServlet::start(trace, Some(config)).await?;
+	let servlet = ColonyPingServlet::start(trace, config).await?;
 
 	// Scale-out rebuilds with the same org TLS identity, so respawned
 	// instances stay dialable by the gateway's forward pool.
@@ -314,7 +321,7 @@ async fn register_ping(
 
 		async move {
 			let config = ping_servlet_config(&certs)?;
-			ColonyPingServlet::start(t, Some(config)).await
+			ColonyPingServlet::start(t, config).await
 		}
 	};
 
@@ -334,7 +341,7 @@ async fn register_csr(
 	let csr_type = servlet_urn("csr");
 	let trace = share_trace(trace);
 	let config = csr_servlet_config(Arc::clone(&issuer), certs)?;
-	let servlet = CsrServlet::start(trace, Some(config)).await?;
+	let servlet = CsrServlet::start(trace, config).await?;
 
 	// Spawner owns its issuer clone; OrgNode keeps the returned handle.
 	let spawn_issuer = Arc::clone(&issuer);
@@ -345,7 +352,7 @@ async fn register_csr(
 
 		async move {
 			let config = csr_servlet_config(issuer, &certs)?;
-			CsrServlet::start(t, Some(config)).await
+			CsrServlet::start(t, config).await
 		}
 	};
 

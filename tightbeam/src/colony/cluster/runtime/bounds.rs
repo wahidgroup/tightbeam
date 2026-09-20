@@ -7,6 +7,7 @@ use std::sync::Arc;
 use digest::consts::U32;
 use digest::{Digest, OutputSizeUser};
 
+use crate::colony::cluster::registry::ColonyMembership;
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
 use crate::colony::common::TaskGroup;
@@ -22,18 +23,6 @@ use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
 
 pub(crate) type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
-
-/// Accept plane a gateway connection arrived on.
-///
-/// The colony plane serves hives and peers with full control dispatch.
-/// The edge plane serves external clients and admits `Work` frames only,
-/// so registration, peer advertisement, and gossip stay on the colony
-/// plane.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum GatewayPlane {
-	Colony,
-	Edge,
-}
 
 /// Protocol that can bind a gateway accept plane (colony or edge).
 ///
@@ -126,6 +115,16 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 	pub(crate) replay_guard: GatewayReplayGuard,
 	/// Owner of the background work a request handler starts.
 	pub(crate) tasks: TaskGroup,
+}
+
+impl<P: Protocol> GatewayRuntimeCtx<P> {
+	/// The two registries one hive's membership spans.
+	///
+	/// Admission and retirement move both, so they run here rather than as
+	/// a sequence each call site repeats.
+	pub(crate) fn membership(&self) -> ColonyMembership<'_> {
+		ColonyMembership::new(&self.registry, &self.servlet_registry)
+	}
 }
 
 impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {

@@ -185,17 +185,16 @@ macro_rules! job {
 
 #[cfg(test)]
 mod tests {
-	#[cfg(any(feature = "colony", feature = "tokio"))]
-	use crate::error::Result;
-	#[cfg(any(feature = "colony", feature = "tokio"))]
-	use crate::Frame;
-
 	#[cfg(feature = "colony")]
-	use crate::colony::common::ColonyNamespace;
+	use crate::colony::common::{ColonyNamespace, HiveManagement};
 	#[cfg(feature = "colony")]
 	use crate::colony::hive::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
+	#[cfg(any(feature = "colony", feature = "tokio"))]
+	use crate::error::Result;
 	#[cfg(feature = "colony")]
 	use crate::utils::urn::Urn;
+	#[cfg(any(feature = "colony", feature = "tokio"))]
+	use crate::Frame;
 
 	// Sync job with tuple input - implements Job trait
 	#[cfg(feature = "colony")]
@@ -284,7 +283,7 @@ mod tests {
 			assert_eq!(frame.metadata().id(), b"spawn-req");
 
 			let request: HiveManagementRequest = crate::decode(frame.message())?;
-			let Some(spawn) = request.spawn.as_ref() else {
+			let Ok(HiveManagement::Spawn(spawn)) = request.into_choice() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
 			assert_eq!(spawn.servlet_type, worker_type());
@@ -301,7 +300,9 @@ mod tests {
 			assert_eq!(frame.metadata().id(), b"list-req");
 
 			let request: HiveManagementRequest = crate::decode(frame.message())?;
-			assert!(request.list.is_some());
+			if !matches!(request.into_choice(), Ok(HiveManagement::List(_))) {
+				return Err(crate::testing::error::TestingError::InvariantViolated.into());
+			}
 			Ok(())
 		}
 	}
@@ -315,7 +316,7 @@ mod tests {
 			assert_eq!(frame.metadata().id(), b"stop-req");
 
 			let request: HiveManagementRequest = crate::decode(frame.message())?;
-			let Some(stop) = request.stop.as_ref() else {
+			let Ok(HiveManagement::Stop(stop)) = request.into_choice() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
 			assert_eq!(stop.servlet_id, worker_instance());

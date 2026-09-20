@@ -9,6 +9,7 @@
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
+use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
@@ -52,10 +53,11 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Oracle-guided fuzzing: interprets AFL input as event choices
-			trace.oracle().fuzz_from_bytes()?;
+			let oracle = trace.oracle();
+			oracle.fuzz_from_bytes()?;
 
 			// Make assertions based on execution trace
-			for event in trace.oracle().trace() {
+			for event in oracle.trace() {
 				trace.event(event)?;
 			}
 

@@ -18,9 +18,9 @@ use crate::{Frame, TightBeamError};
 /// Handlers receive [`ServletContext`], and collector gates enforce peer
 /// identity before dispatch. Session-aware or route-aware logic belongs on
 /// [`MuxService`], which keeps the transport [`CallContext`].
-struct ContextService<S> {
+struct ContextService<S: ServletService> {
 	service: Arc<S>,
-	ctx: Arc<ServletContext>,
+	ctx: Arc<ServletContext<S::Env>>,
 }
 
 impl<S: ServletService> MuxService for ContextService<S> {
@@ -68,7 +68,7 @@ pub fn serve_servlet<L, S>(
 	gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	mux_offer: Option<Arc<TransportOffer>>,
 	service: S,
-	ctx: Arc<ServletContext>,
+	ctx: Arc<ServletContext<S::Env>>,
 ) -> rt::JoinHandle
 where
 	L: AsyncListenerTrait + Sync + 'static,

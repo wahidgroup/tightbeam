@@ -75,10 +75,10 @@ impl CsrIssuer {
 }
 
 servlet! {
-	pub CsrServlet<CsrRequest, EnvConfig = Arc<CsrIssuer>>,
+	pub CsrServlet<CsrRequest, EnvConfig = CsrIssuer>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
-		let issuer: &Arc<CsrIssuer> = ctx.env_config()?;
+		let issuer: &CsrIssuer = ctx.env_config();
 		let response = issuer.try_issue(&req);
 		Ok(Some(compose! {
 			V0: id: frame.metadata().id(),
@@ -87,7 +87,7 @@ servlet! {
 	}
 }
 
-pub(crate) type CsrServletConfig = ServletConfig<TokioListener, CsrRequest, DefaultCryptoProvider>;
+pub(crate) type CsrServletConfig = ServletConfig<TokioListener, CsrRequest, DefaultCryptoProvider, CsrIssuer>;
 
 /// Servlet TLS identity is the org identity, anchored in the org trust
 /// the gateway's forward pool validates against (see

@@ -150,7 +150,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			let conf = streaming_servlet_conf(&materials)?;
-			StreamingEchoServlet::start(Arc::new(trace), Some(conf)).await
+			StreamingEchoServlet::start(Arc::new(trace), conf).await
 		},
 		setup: |ClientEnv { trace, context: materials, addr }| async move {
 			pooled_lease(&trace, &materials, addr).await
@@ -233,7 +233,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			let conf = streaming_servlet_conf(&materials)?;
-			StreamOnlyServlet::start(Arc::new(trace), Some(conf)).await
+			StreamOnlyServlet::start(Arc::new(trace), conf).await
 		},
 		setup: |ClientEnv { trace, context: materials, addr }| async move {
 			pooled_lease(&trace, &materials, addr).await
@@ -286,7 +286,7 @@ async fn start_streaming_hive(
 	trace: TraceCollector,
 	materials: &ServerMaterials,
 ) -> Result<StreamingHive, TightBeamError> {
-	let config = Some(streaming_servlet_conf(materials)?);
+	let config = streaming_servlet_conf(materials)?;
 	let trace = Arc::new(trace.share());
 	let servlet = StreamingEchoServlet::start(Arc::clone(&trace), config).await?;
 
@@ -295,7 +295,9 @@ async fn start_streaming_hive(
 	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 	let mut hive = StreamingHive::new(Some(conf))?;
-	hive.register(stream_echo_urn(), servlet, |t| StreamingEchoServlet::start(t, None))?;
+	hive.register(stream_echo_urn(), servlet, |t| {
+		StreamingEchoServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(trace).await?;
 	Ok(hive)
 }

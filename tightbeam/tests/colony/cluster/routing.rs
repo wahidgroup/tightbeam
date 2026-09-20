@@ -156,10 +156,12 @@ async fn start_probe_hive(
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
 	let servlet_conf = servlet_tls_config(&certs)?;
-	let servlet = FrameProbeServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
+	let servlet = FrameProbeServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
-	hive.register(servlet_urn("ping"), servlet, |t| FrameProbeServlet::start(t, None))?;
+	hive.register(servlet_urn("ping"), servlet, |t| {
+		FrameProbeServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }

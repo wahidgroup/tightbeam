@@ -1,10 +1,12 @@
 //! Hive control-plane accept loop and cluster command handlers.
 
-use core::sync::atomic::{AtomicU16, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::colony::common::{reply_frame, reply_frame_with_priority, ClusterCommandResponse, DrainMode};
+use crate::colony::common::{
+	reply_frame, reply_frame_with_priority, ClusterCommandKind, ClusterCommandResponse, DrainMode, HiveManagement,
+	ReplyShape, SpawnServletParams, StopServletParams,
+};
 use crate::colony::hive::gates::{AdmitRefusal, AdmittedCommand};
 use crate::colony::hive::runtime::{HiveContextImpl, HiveInstances};
 use crate::colony::hive::{
@@ -64,18 +66,15 @@ pub struct HiveControlCtx<P: Protocol> {
 	pub spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
 	/// Trace handle shared with spawned servlets and control-plane events.
 	pub trace: Arc<TraceCollector>,
-	/// Hive-wide utilization in basis points for heartbeats and backpressure.
-	pub utilization: Arc<AtomicU16>,
-	/// Per-instance utilization cache for a servlet that reports none.
-	pub utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
+	/// The one decider for whether this hive is taking work, and the one
+	/// home for the utilization it reads.
+	pub backpressure: BackpressureGate,
 	/// Drain state. Draining refuses every manage command but the heartbeat.
 	pub drain: DrainMode,
 	/// Commands in flight, which a drain waits to reach zero.
 	pub in_flight: InFlight,
 	/// Intra-hive routing context updated as instances are inserted or removed.
 	pub hive_context: Arc<HiveContextImpl<P>>,
-	/// Utilization threshold that trips [`BackpressureGate`] on manage traffic.
-	pub bp_threshold: BasisPoints,
 	/// Circuit breaker shared with [`ClusterSecurityGate`] for auth failures.
 	pub circuit_breaker: Arc<ClusterCircuitBreaker>,
 	/// Freshness window and replay set for signed cluster commands.
@@ -151,31 +150,17 @@ where
 				return Ok(Some(reply));
 			}
 		}
-		if admitted.is_heartbeat() {
-			return ctx.heartbeat_reply(&admitted);
-		}
-
-		ctx.handle_manage(admitted).await
+		ctx.dispatch(admitted).await
 	}
 
-	/// Spawn, list, or stop servlets for one admitted management command.
-	async fn handle_manage(self: Arc<Self>, admitted: AdmittedCommand) -> Result<Option<Frame>, TightBeamError> {
-		let has_spawn = admitted.manage().is_some_and(|request| request.spawn.is_some());
-		if has_spawn {
-			return self.manage_spawn(admitted).await;
+	/// Answer one admitted command in the shape its body names.
+	async fn dispatch(self: Arc<Self>, admitted: AdmittedCommand) -> Result<Option<Frame>, TightBeamError> {
+		match admitted.body() {
+			ClusterCommandKind::Heartbeat(_) => self.heartbeat_reply(&admitted),
+			ClusterCommandKind::Manage(HiveManagement::Spawn(spawn)) => self.manage_spawn(spawn, &admitted).await,
+			ClusterCommandKind::Manage(HiveManagement::List(_)) => self.manage_list(&admitted),
+			ClusterCommandKind::Manage(HiveManagement::Stop(stop)) => self.manage_stop(stop, &admitted),
 		}
-
-		let has_list = admitted.manage().is_some_and(|request| request.list.is_some());
-		if has_list {
-			return self.manage_list(&admitted);
-		}
-
-		let has_stop = admitted.manage().is_some_and(|request| request.stop.is_some());
-		if has_stop {
-			return self.manage_stop(admitted);
-		}
-
-		Ok(None)
 	}
 }
 
@@ -202,17 +187,17 @@ impl<P: Protocol> HiveControlCtx<P> {
 
 		// Reject in the CHOICE shape the sender decodes (heartbeat vs manage).
 		// A mismatched shape counts as MalformedResponse and can evict the hive.
-		if refusal.is_heartbeat() {
-			return reply_frame_with_priority(
+		match refusal.shape() {
+			ReplyShape::Heartbeat => reply_frame_with_priority(
 				frame.metadata().id(),
 				MessagePriority::NetworkControl,
 				ClusterCommandResponse::heartbeat(security_status, BasisPoints::default(), 0),
-			);
+			),
+			ReplyShape::Manage => {
+				let response = HiveManagementResponse::stop_err(security_status);
+				reply_frame(frame.metadata().id(), ClusterCommandResponse::manage(response))
+			}
 		}
-
-		let response = HiveManagementResponse::stop_err(security_status);
-		let response = ClusterCommandResponse::manage(response);
-		reply_frame(frame.metadata().id(), response)
 	}
 
 	fn backpressure_reply(
@@ -224,8 +209,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 		P: Protocol,
 	{
 		let frame = admitted.frame();
-		let bp_gate = BackpressureGate::new(Arc::clone(&self.utilization), self.bp_threshold);
-		if GatePolicy::evaluate(&bp_gate, Some(frame), session) != TransitStatus::ResourceExhausted {
+		if GatePolicy::evaluate(&self.backpressure, Some(frame), session) != TransitStatus::ResourceExhausted {
 			return Ok(None);
 		}
 
@@ -238,33 +222,25 @@ impl<P: Protocol> HiveControlCtx<P> {
 	where
 		P: Protocol,
 	{
-		let util = BasisPoints::new_saturating(self.utilization.load(Ordering::Relaxed));
+		let load = self.backpressure.report();
 		let active_count = self.servlets.count() as u32;
-		let status = if util.get() >= self.bp_threshold.get() {
-			TransitStatus::ResourceExhausted
-		} else {
-			TransitStatus::Ok
-		};
 
-		let response = ClusterCommandResponse::heartbeat(status, util, active_count);
+		let response = ClusterCommandResponse::heartbeat(load.status, load.utilization, active_count);
 		reply_frame_with_priority(admitted.frame().metadata().id(), MessagePriority::NetworkControl, response)
 	}
 
-	async fn manage_spawn(self: Arc<Self>, admitted: AdmittedCommand) -> Result<Option<Frame>, TightBeamError>
+	async fn manage_spawn(
+		&self,
+		spawn: &SpawnServletParams,
+		admitted: &AdmittedCommand,
+	) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol + Send + Sync + 'static,
 		P::Transport: Send + Sync + 'static,
 	{
-		let Some(servlet_type) = admitted
-			.manage()
-			.and_then(|request| request.spawn.as_ref())
-			.map(|spawn| spawn.servlet_type.clone())
-		else {
-			return Ok(None);
-		};
-
+		let servlet_type = spawn.servlet_type.clone();
 		let spawn_denied = || {
-			self.forget_replay(&admitted);
+			self.forget_replay(admitted);
 			reply_frame(
 				admitted.frame().metadata().id(),
 				ClusterCommandResponse::manage(HiveManagementResponse::spawn_err(TransitStatus::PermissionDenied)),
@@ -302,19 +278,11 @@ impl<P: Protocol> HiveControlCtx<P> {
 		reply_frame(admitted.frame().metadata().id(), response)
 	}
 
-	fn manage_stop(self: Arc<Self>, admitted: AdmittedCommand) -> Result<Option<Frame>, TightBeamError>
+	fn manage_stop(&self, stop: &StopServletParams, admitted: &AdmittedCommand) -> Result<Option<Frame>, TightBeamError>
 	where
 		P: Protocol,
 	{
-		let Some(servlet_id) = admitted
-			.manage()
-			.and_then(|request| request.stop.as_ref())
-			.map(|stop| stop.servlet_id.clone())
-		else {
-			return Ok(None);
-		};
-
-		let id_bytes = servlet_id.canonical_bytes();
+		let id_bytes = stop.servlet_id.canonical_bytes();
 		let instances = HiveInstances::new(&self.servlets, &self.hive_context);
 		if instances.remove(&id_bytes).is_some() {
 			return reply_frame(
@@ -323,7 +291,7 @@ impl<P: Protocol> HiveControlCtx<P> {
 			);
 		}
 
-		self.forget_replay(&admitted);
+		self.forget_replay(admitted);
 
 		let response = HiveManagementResponse::stop_err(TransitStatus::PermissionDenied);
 		let response = ClusterCommandResponse::manage(response);

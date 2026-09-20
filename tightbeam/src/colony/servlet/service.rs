@@ -15,22 +15,39 @@ use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 
 use crate::colony::servlet::servlet_runtime::rt;
 
+/// A servlet configuration, and the application env it carries.
+///
+/// [`Servlet`] bounds its `Conf` on this so its `Env` parameter names the
+/// env the configuration actually holds, rather than a second type a
+/// caller could set independently.
+pub trait ServletConf {
+	/// Application configuration this carries to the handlers.
+	type Env;
+}
+
 /// Lifecycle interface for named servlets and [`crate::colony::servlet::ServletRuntime`].
 ///
 /// Generic over input message type `I`. Workers attached to a servlet share
 /// that same input type. `servlet!` implements this for the generated type;
 /// macro-free code uses [`crate::colony::servlet::ServletRuntime`] with [`RuntimeServletConf`].
-pub trait Servlet<I> {
+pub trait Servlet<I, Env = ()> {
 	/// Configuration type (typically [`ServletConfig`]).
-	type Conf;
+	///
+	/// Bound to `Env`, so a servlet cannot name one env and be configured
+	/// with another.
+	type Conf: ServletConf<Env = Env>;
 
 	/// Protocol-specific listen address.
 	type Address: TightBeamAddress;
 
 	/// Bind, start workers, and spawn the accept loop.
+	///
+	/// The config is taken by value: a servlet whose env has no default
+	/// cannot be started without one, so the env a handler reads and the
+	/// env the caller supplied are the same type.
 	fn start(
 		trace: Arc<TraceCollector>,
-		config: Option<Self::Conf>,
+		config: Self::Conf,
 	) -> impl Future<Output = Result<Self, TightBeamError>> + Send
 	where
 		Self: Sized;
@@ -60,6 +77,13 @@ pub trait Servlet<I> {
 /// `Unimplemented`. Build with [`ServletHandlers`], or implement this trait
 /// and pass it to [`crate::colony::servlet::ServletRuntime::start`].
 pub trait ServletService: Send + Sync + 'static {
+	/// Application configuration the handlers read from their context.
+	///
+	/// [`crate::colony::servlet::ServletRuntime::start`] binds this to the
+	/// `Env` its [`ServletConfig`] carries, so a handler that names a
+	/// different env is a compile error.
+	type Env: Send + Sync + 'static;
+
 	/// Handle one request/response exchange on a unary stream.
 	///
 	/// # Errors
@@ -68,7 +92,7 @@ pub trait ServletService: Send + Sync + 'static {
 	fn unary(
 		&self,
 		frame: Frame,
-		ctx: Arc<ServletContext>,
+		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let _ = (frame, ctx);
 		async { Err(unimplemented_error()) }
@@ -82,7 +106,7 @@ pub trait ServletService: Send + Sync + 'static {
 	fn streaming(
 		&self,
 		body: StreamBody,
-		ctx: Arc<ServletContext>,
+		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let _ = (body, ctx);
 		async { Err(unimplemented_error()) }
@@ -97,7 +121,7 @@ pub trait ServletService: Send + Sync + 'static {
 		&self,
 		body: StreamBody,
 		reply: ReplySink,
-		ctx: Arc<ServletContext>,
+		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		let _ = (body, reply, ctx);
 		async { Err(unimplemented_error()) }
@@ -107,26 +131,33 @@ pub trait ServletService: Send + Sync + 'static {
 /// Boxed handler future used by [`ServletHandlers`].
 pub type ServletFuture<T> = Pin<Box<dyn Future<Output = Result<T, TightBeamError>> + Send>>;
 
-type UnaryHandler = Box<dyn Fn(Frame, Arc<ServletContext>) -> ServletFuture<Option<Frame>> + Send + Sync>;
-type StreamingHandler = Box<dyn Fn(StreamBody, Arc<ServletContext>) -> ServletFuture<Option<Frame>> + Send + Sync>;
-type DuplexHandler = Box<dyn Fn(StreamBody, ReplySink, Arc<ServletContext>) -> ServletFuture<()> + Send + Sync>;
+type UnaryHandler<Env> = Box<dyn Fn(Frame, Arc<ServletContext<Env>>) -> ServletFuture<Option<Frame>> + Send + Sync>;
+type StreamingHandler<Env> =
+	Box<dyn Fn(StreamBody, Arc<ServletContext<Env>>) -> ServletFuture<Option<Frame>> + Send + Sync>;
+type DuplexHandler<Env> =
+	Box<dyn Fn(StreamBody, ReplySink, Arc<ServletContext<Env>>) -> ServletFuture<()> + Send + Sync>;
 
 /// Closure-built [`ServletService`]. Absent kinds refuse with `Unimplemented`.
 ///
 /// Assembled by `servlet!` handler arms. Hand-written services implement
 /// [`ServletService`] directly instead.
-#[derive(Default)]
-pub struct ServletHandlers {
-	unary: Option<UnaryHandler>,
-	streaming: Option<StreamingHandler>,
-	duplex: Option<DuplexHandler>,
+pub struct ServletHandlers<Env = ()> {
+	unary: Option<UnaryHandler<Env>>,
+	streaming: Option<StreamingHandler<Env>>,
+	duplex: Option<DuplexHandler<Env>>,
 }
 
-impl ServletHandlers {
+impl<Env> Default for ServletHandlers<Env> {
+	fn default() -> Self {
+		Self { unary: None, streaming: None, duplex: None }
+	}
+}
+
+impl<Env: Send + Sync + 'static> ServletHandlers<Env> {
 	/// Set the unary handler used by [`ServletService::unary`].
 	pub fn on_unary<F, Fut>(mut self, handler: F) -> Self
 	where
-		F: Fn(Frame, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
+		F: Fn(Frame, Arc<ServletContext<Env>>) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + Send + 'static,
 	{
 		self.unary = Some(Box::new(move |frame, ctx| Box::pin(handler(frame, ctx))));
@@ -136,7 +167,7 @@ impl ServletHandlers {
 	/// Set the streaming handler used by [`ServletService::streaming`].
 	pub fn on_streaming<F, Fut>(mut self, handler: F) -> Self
 	where
-		F: Fn(StreamBody, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
+		F: Fn(StreamBody, Arc<ServletContext<Env>>) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + Send + 'static,
 	{
 		self.streaming = Some(Box::new(move |body, ctx| Box::pin(handler(body, ctx))));
@@ -146,7 +177,7 @@ impl ServletHandlers {
 	/// Set the duplex handler used by [`ServletService::duplex`].
 	pub fn on_duplex<F, Fut>(mut self, handler: F) -> Self
 	where
-		F: Fn(StreamBody, ReplySink, Arc<ServletContext>) -> Fut + Send + Sync + 'static,
+		F: Fn(StreamBody, ReplySink, Arc<ServletContext<Env>>) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = Result<(), TightBeamError>> + Send + 'static,
 	{
 		self.duplex = Some(Box::new(move |body, reply, ctx| Box::pin(handler(body, reply, ctx))));
@@ -157,7 +188,7 @@ impl ServletHandlers {
 	pub fn on_typed_unary<I, F, Fut>(self, handler: F) -> Self
 	where
 		I: Message + Send + 'static,
-		F: Fn(I, Frame, &ServletContext) -> Fut + Send + Sync + 'static,
+		F: Fn(I, Frame, &ServletContext<Env>) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = Result<Option<Frame>, TightBeamError>> + Send + 'static,
 	{
 		let handler = Arc::new(handler);
@@ -172,11 +203,13 @@ impl ServletHandlers {
 	}
 }
 
-impl ServletService for ServletHandlers {
+impl<Env: Send + Sync + 'static> ServletService for ServletHandlers<Env> {
+	type Env = Env;
+
 	fn unary(
 		&self,
 		frame: Frame,
-		ctx: Arc<ServletContext>,
+		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		match self.unary.as_ref() {
 			Some(handler) => handler(frame, ctx),
@@ -187,7 +220,7 @@ impl ServletService for ServletHandlers {
 	fn streaming(
 		&self,
 		body: StreamBody,
-		ctx: Arc<ServletContext>,
+		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		match self.streaming.as_ref() {
 			Some(handler) => handler(body, ctx),
@@ -199,7 +232,7 @@ impl ServletService for ServletHandlers {
 		&self,
 		body: StreamBody,
 		reply: ReplySink,
-		ctx: Arc<ServletContext>,
+		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		match self.duplex.as_ref() {
 			Some(handler) => handler(body, reply, ctx),
@@ -213,22 +246,35 @@ impl ServletService for ServletHandlers {
 /// Use this when a call site needs [`Servlet::start`] without `servlet!`.
 /// Hive registration only needs [`crate::colony::hive::ServletBox`], which [`crate::colony::servlet::ServletRuntime`]
 /// already implements.
-pub struct RuntimeServletConf<P, M, C: CryptoProvider = DefaultCryptoProvider>
+pub struct RuntimeServletConf<P, M, C: CryptoProvider = DefaultCryptoProvider, Env = ()>
 where
 	P: Protocol,
 	M: Message,
 {
 	/// Bind, workers, gates, and env for the accept loop.
-	pub config: ServletConfig<P, M, C>,
+	pub config: ServletConfig<P, M, C, Env>,
 	/// Request handlers installed on the runtime.
-	pub service: ServletHandlers,
+	///
+	/// The handlers read the same `Env` the config carries, so the pair
+	/// cannot disagree about what a handler's context holds.
+	pub service: ServletHandlers<Env>,
 }
 
-impl<P, M, C> Default for RuntimeServletConf<P, M, C>
+impl<P, M, C, Env> ServletConf for RuntimeServletConf<P, M, C, Env>
+where
+	P: Protocol,
+	M: Message,
+	C: CryptoProvider,
+{
+	type Env = Env;
+}
+
+impl<P, M, C, Env> Default for RuntimeServletConf<P, M, C, Env>
 where
 	P: Protocol,
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
+	Env: Default,
 {
 	fn default() -> Self {
 		Self { config: ServletConfig::default(), service: ServletHandlers::default() }

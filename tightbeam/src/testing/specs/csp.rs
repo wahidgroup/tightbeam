@@ -1453,7 +1453,7 @@ mod tests {
 		environment ServiceClient {
 			worker_threads: 1,
 			server: |SetupEnv { trace, .. }| async move {
-				let servlet = TestServletForScenario::start(Arc::new(trace), None).await?;
+				let servlet = TestServletForScenario::start(Arc::new(trace), crate::colony::servlet::ServletConfig::default()).await?;
 				let addr = servlet.addr().to_owned();
 				let server_handle = tokio::spawn(async move {
 					let _ = servlet.join().await;

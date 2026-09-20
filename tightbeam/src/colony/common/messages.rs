@@ -10,7 +10,7 @@ use crate::policy::TransitStatus;
 use crate::utils::urn::Urn;
 use crate::utils::{decode, encode, BasisPoints};
 use crate::wire::wire_sequence;
-use crate::{Beamable, TightBeamError};
+use crate::{Beamable, Errorizable, TightBeamError};
 
 /// Work request envelope for cluster routing.
 ///
@@ -242,8 +242,8 @@ pub struct ServletAddressUpdate {
 pub(crate) enum ServletChange {
 	/// An instance that has joined the slate, with the address to reach it.
 	Added(ServletInfo),
-	/// An instance that has left the slate.
-	Removed(ServletInfo),
+	/// An instance that has left the slate, named by its instance URN.
+	Removed(Urn<'static>),
 }
 
 impl ServletChange {
@@ -251,9 +251,7 @@ impl ServletChange {
 	pub(crate) fn into_update(self, hive_id: Urn<'static>) -> ServletAddressUpdate {
 		match self {
 			Self::Added(servlet) => ServletAddressUpdate { hive_id, added: vec![servlet], removed: vec![] },
-			Self::Removed(servlet) => {
-				ServletAddressUpdate { hive_id, added: vec![], removed: vec![servlet.servlet_id] }
-			}
+			Self::Removed(servlet_id) => ServletAddressUpdate { hive_id, added: vec![], removed: vec![servlet_id] },
 		}
 	}
 }
@@ -458,6 +456,98 @@ pub struct ServletInfo {
 }
 
 wire_sequence!(ServletInfo { servlet_id: plain, address: octets });
+
+/// Why a CHOICE-shaped product named no single alternative.
+///
+/// DER CHOICE admits exactly one alternative. These products spell a choice
+/// as tagged optional fields, so the wire can carry none or several, and a
+/// reader refuses both rather than guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Errorizable)]
+pub enum ChoiceRefusal {
+	/// No alternative was set.
+	#[error("the product named no alternative")]
+	NoneSet,
+	/// More than one alternative was set.
+	#[error("the product named more than one alternative")]
+	ManySet,
+}
+
+/// The single request a [`HiveManagementRequest`] names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HiveManagement {
+	/// Spawn one servlet instance.
+	Spawn(SpawnServletParams),
+	/// List the active servlets.
+	List(ListServletsParams),
+	/// Stop one servlet instance.
+	Stop(StopServletParams),
+}
+
+/// The single result a [`HiveManagementResponse`] names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HiveManagementOutcome {
+	/// Result of a spawn.
+	Spawn(SpawnServletResult),
+	/// Result of a list.
+	List(ListServletsResult),
+	/// Result of a stop.
+	Stop(StopServletResult),
+}
+
+/// The single command a [`ClusterCommand`] names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClusterCommandKind {
+	/// A liveness probe.
+	Heartbeat(HeartbeatParams),
+	/// A management request.
+	Manage(HiveManagement),
+}
+
+/// The reply shape a cluster command is answered in.
+///
+/// A sender decodes the response in the shape it asked in, so a refusal
+/// answered in the other one reads as a malformed response and counts
+/// toward eviction. The shape is a property of the command body, so it
+/// lives here rather than being re-derived per refusal site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyShape {
+	/// Answer in the heartbeat alternative.
+	Heartbeat,
+	/// Answer in the management alternative.
+	Manage,
+}
+
+impl ClusterCommandKind {
+	/// The shape a reply to this command must use.
+	#[must_use]
+	pub fn reply_shape(&self) -> ReplyShape {
+		match self {
+			Self::Heartbeat(_) => ReplyShape::Heartbeat,
+			Self::Manage(_) => ReplyShape::Manage,
+		}
+	}
+}
+
+impl ReplyShape {
+	/// The shape a reply to `body` must use.
+	///
+	/// A body that named no single alternative has no shape of its own, so
+	/// it is answered in the management shape: that is the one a sender of
+	/// an unreadable command can still decode.
+	#[must_use]
+	pub fn of(body: Option<&ClusterCommandKind>) -> Self {
+		body.map_or(Self::Manage, ClusterCommandKind::reply_shape)
+	}
+}
+
+/// The single answer a [`ClusterCommandResponse`] names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClusterCommandOutcome {
+	/// Answer to a liveness probe.
+	Heartbeat(HeartbeatResult),
+	/// Answer to a management request.
+	Manage(HiveManagementOutcome),
+}
 
 /// Hive management request message.
 ///
@@ -668,6 +758,106 @@ pub struct ClusterCommandResponse {
 	pub manage: Option<HiveManagementResponse>,
 }
 
+impl From<HiveManagement> for HiveManagementRequest {
+	/// Spell one management alternative as the tagged-optional product the
+	/// wire carries.
+	///
+	/// This is the send-side counterpart of
+	/// [`HiveManagementRequest::into_choice`]: a request built here names
+	/// exactly one alternative, so no sender has to remember the rule.
+	fn from(request: HiveManagement) -> Self {
+		match request {
+			HiveManagement::Spawn(spawn) => Self { spawn: Some(spawn), list: None, stop: None },
+			HiveManagement::List(list) => Self { spawn: None, list: Some(list), stop: None },
+			HiveManagement::Stop(stop) => Self { spawn: None, list: None, stop: Some(stop) },
+		}
+	}
+}
+
+impl From<ClusterCommandKind> for ClusterCommand {
+	/// Spell one command alternative as the tagged-optional product the
+	/// wire carries.
+	fn from(command: ClusterCommandKind) -> Self {
+		match command {
+			ClusterCommandKind::Heartbeat(heartbeat) => Self { heartbeat: Some(heartbeat), manage: None },
+			ClusterCommandKind::Manage(manage) => Self { heartbeat: None, manage: Some(manage.into()) },
+		}
+	}
+}
+
+impl HiveManagementRequest {
+	/// Consume this product for the one request it names.
+	///
+	/// # Errors
+	///
+	/// - [`ChoiceRefusal::NoneSet`] when the product names no request.
+	/// - [`ChoiceRefusal::ManySet`] when it names several.
+	pub fn into_choice(self) -> Result<HiveManagement, ChoiceRefusal> {
+		match (self.spawn, self.list, self.stop) {
+			(Some(spawn), None, None) => Ok(HiveManagement::Spawn(spawn)),
+			(None, Some(list), None) => Ok(HiveManagement::List(list)),
+			(None, None, Some(stop)) => Ok(HiveManagement::Stop(stop)),
+			(None, None, None) => Err(ChoiceRefusal::NoneSet),
+			_ => Err(ChoiceRefusal::ManySet),
+		}
+	}
+}
+
+impl HiveManagementResponse {
+	/// Consume this product for the one result it names.
+	///
+	/// # Errors
+	///
+	/// - [`ChoiceRefusal::NoneSet`] when the product names no result.
+	/// - [`ChoiceRefusal::ManySet`] when it names several.
+	pub fn into_choice(self) -> Result<HiveManagementOutcome, ChoiceRefusal> {
+		match (self.spawn, self.list, self.stop) {
+			(Some(spawn), None, None) => Ok(HiveManagementOutcome::Spawn(spawn)),
+			(None, Some(list), None) => Ok(HiveManagementOutcome::List(list)),
+			(None, None, Some(stop)) => Ok(HiveManagementOutcome::Stop(stop)),
+			(None, None, None) => Err(ChoiceRefusal::NoneSet),
+			_ => Err(ChoiceRefusal::ManySet),
+		}
+	}
+}
+
+impl ClusterCommand {
+	/// Consume this product for the one command it names.
+	///
+	/// A management command proves its own alternative here as well, so a
+	/// dispatcher matches an exhaustive body rather than reading fields.
+	///
+	/// # Errors
+	///
+	/// - [`ChoiceRefusal::NoneSet`] when the product names no command.
+	/// - [`ChoiceRefusal::ManySet`] when it names both.
+	pub fn into_choice(self) -> Result<ClusterCommandKind, ChoiceRefusal> {
+		match (self.heartbeat, self.manage) {
+			(Some(heartbeat), None) => Ok(ClusterCommandKind::Heartbeat(heartbeat)),
+			(None, Some(manage)) => Ok(ClusterCommandKind::Manage(manage.into_choice()?)),
+			(None, None) => Err(ChoiceRefusal::NoneSet),
+			(Some(_), Some(_)) => Err(ChoiceRefusal::ManySet),
+		}
+	}
+}
+
+impl ClusterCommandResponse {
+	/// Consume this product for the one answer it names.
+	///
+	/// # Errors
+	///
+	/// - [`ChoiceRefusal::NoneSet`] when the product names no answer.
+	/// - [`ChoiceRefusal::ManySet`] when it names both.
+	pub fn into_choice(self) -> Result<ClusterCommandOutcome, ChoiceRefusal> {
+		match (self.heartbeat, self.manage) {
+			(Some(heartbeat), None) => Ok(ClusterCommandOutcome::Heartbeat(heartbeat)),
+			(None, Some(manage)) => Ok(ClusterCommandOutcome::Manage(manage.into_choice()?)),
+			(None, None) => Err(ChoiceRefusal::NoneSet),
+			(Some(_), Some(_)) => Err(ChoiceRefusal::ManySet),
+		}
+	}
+}
+
 /// Heartbeat response with hive health status
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HeartbeatResult {
@@ -855,5 +1045,65 @@ mod tests {
 		let decoded = decode::<ClusterRequest>(&bare);
 		assert!(decoded.is_err());
 		Ok(())
+	}
+
+	fn stop_request() -> HiveManagementRequest {
+		HiveManagementRequest {
+			spawn: None,
+			list: None,
+			stop: Some(StopServletParams {
+				servlet_id: ping_type()
+					.servlet_instance("127.0.0.1:9001")
+					.expect("a servlet type URN yields an instance URN"),
+			}),
+		}
+	}
+
+	#[test]
+	fn a_command_naming_no_alternative_is_refused() {
+		let empty = ClusterCommand { heartbeat: None, manage: None };
+		assert_eq!(empty.into_choice(), Err(ChoiceRefusal::NoneSet));
+	}
+
+	#[test]
+	fn a_command_naming_both_alternatives_is_refused() {
+		let both = ClusterCommand {
+			heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
+			manage: Some(stop_request()),
+		};
+		assert_eq!(both.into_choice(), Err(ChoiceRefusal::ManySet));
+	}
+
+	#[test]
+	fn a_management_request_naming_several_alternatives_is_refused() {
+		let mut several = stop_request();
+		several.list = Some(ListServletsParams { filter: None });
+		let command = ClusterCommand { heartbeat: None, manage: Some(several) };
+		assert_eq!(command.into_choice(), Err(ChoiceRefusal::ManySet));
+	}
+
+	/// Every alternative survives the trip out to the wire product and
+	/// back, so the send side and the receive side agree on which field
+	/// names which command.
+	#[test]
+	fn a_command_round_trips_through_its_choice() {
+		let alternatives = [
+			ClusterCommandKind::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
+			ClusterCommandKind::Manage(HiveManagement::Spawn(SpawnServletParams {
+				servlet_type: ping_type(),
+				config: None,
+			})),
+			ClusterCommandKind::Manage(HiveManagement::List(ListServletsParams { filter: None })),
+			ClusterCommandKind::Manage(HiveManagement::Stop(StopServletParams {
+				servlet_id: ping_type()
+					.servlet_instance("127.0.0.1:9001")
+					.expect("a servlet type URN yields an instance URN"),
+			})),
+		];
+
+		for alternative in alternatives {
+			let wire = ClusterCommand::from(alternative.clone());
+			assert_eq!(wire.into_choice(), Ok(alternative));
+		}
 	}
 }

@@ -27,10 +27,13 @@
 //! # Build-time derivation
 //!
 //! [`ClusterConfigBuilder::build`] derives colony membership from the
-//! certificate, rebuilds the peer discovery table from the dial list,
-//! and clamps rumor refresh to the gossip freshness window.
+//! certificate and rebuilds the peer discovery table from the dial list.
+//! The effective rumor refresh interval is derived on every read by
+//! [`ClusterConfig::rumor_refresh`], because the gossip freshness window
+//! it clamps to narrows again at startup.
 
 use core::time::Duration;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{
@@ -42,8 +45,8 @@ use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
 
 use crate::colony::cluster::{
-	ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore, PeerStore, PeerTable,
-	StaticExportList,
+	ClusterError, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
+	PeerAddress, PeerStore, PeerTable, StaticExportList,
 };
 use crate::utils::urn::Urn;
 
@@ -326,13 +329,25 @@ impl ClusterConfigBuilder {
 	/// example `&str` arrays). The dial list is not an identity gate.
 	/// Partial or asymmetric federation graphs are expected. An empty
 	/// list disables outbound advertisement.
-	pub fn with_peers<I, S>(mut self, peers: I) -> Self
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidPeerAddress`] -- an entry names no socket.
+	///   Refusing here is what stops a typo becoming federation with no
+	///   anchors and no diagnostic.
+	pub fn with_peers<I, S>(mut self, peers: I) -> Result<Self, ClusterError>
 	where
 		I: IntoIterator<Item = S>,
 		S: Into<String>,
 	{
-		self.peer.peers = peers.into_iter().map(Into::into).collect();
-		self
+		let mut parsed = Vec::new();
+		for peer in peers {
+			let peer: String = peer.into();
+			parsed.push(peer.parse::<PeerAddress>().map_err(|_| ClusterError::InvalidPeerAddress)?);
+		}
+
+		self.peer.peers = parsed;
+		Ok(self)
 	}
 
 	/// Set the re-advertise beat cadence and enable the advertise beat.
@@ -341,18 +356,30 @@ impl ClusterConfigBuilder {
 		self
 	}
 
-	/// Restrict claimed peer dial addresses to this exact-match allowlist.
+	/// Restrict claimed peer dial addresses to this allowlist.
 	///
 	/// Accepts any iterator of values convertible into [`String`].
 	/// Peer-exchange hints pass the same gate before the discovery table
-	/// learns them.
-	pub fn with_peer_dial_allowlist<I, S>(mut self, allowlist: I) -> Self
+	/// learns them. Entries are compared as parsed sockets, so a peer
+	/// cannot slip past by spelling one address two ways.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidPeerAddress`] -- an entry names no socket.
+	pub fn with_peer_dial_allowlist<I, S>(mut self, allowlist: I) -> Result<Self, ClusterError>
 	where
 		I: IntoIterator<Item = S>,
 		S: Into<String>,
 	{
-		self.peer.peer_dial_allowlist = Some(allowlist.into_iter().map(Into::into).collect());
-		self
+		let mut parsed = HashSet::new();
+		for entry in allowlist {
+			let entry: String = entry.into();
+			let address: PeerAddress = entry.parse().map_err(|_| ClusterError::InvalidPeerAddress)?;
+			parsed.insert(address);
+		}
+
+		self.peer.peer_dial_allowlist = Some(Arc::new(parsed));
+		Ok(self)
 	}
 
 	/// Cap the relay budget honored on inbound work and routed stream opens.
@@ -376,9 +403,11 @@ impl ClusterConfigBuilder {
 	/// The beat floods the slate rumor when the slate or flood target set
 	/// changed, plus one refresh on this interval.
 	///
-	/// [`ClusterConfigBuilder::build`] clamps the interval to
-	/// [`GossipConfig::seen_ttl`], because a refresh slower than the
-	/// freshness window would re-publish rumors that peers refuse as stale.
+	/// This sets the configured interval. The effective one is
+	/// [`ClusterConfig::rumor_refresh`], which clamps it to
+	/// [`GossipConfig::seen_ttl`] on every read, because a refresh slower
+	/// than the freshness window would re-publish rumors that peers refuse
+	/// as stale.
 	pub fn with_rumor_refresh(mut self, rumor_refresh: Duration) -> Self {
 		self.peer.rumor_refresh = rumor_refresh;
 		self
@@ -416,24 +445,27 @@ impl ClusterConfigBuilder {
 	/// Defaults to `None`: the gateway journals and refloods only. The
 	/// ingress sink sits outside the export boundary (see
 	/// [`GossipConfig::ingress`](super::GossipConfig::ingress)).
-	pub fn with_gossip_ingress(mut self, ingress: Urn<'static>) -> Self {
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::UnknownServletType`] -- the URN is not a bare
+	///   servlet type in this colony's namespace, so no route could ever
+	///   answer it. Refusing here is what stops a gateway admitting gossip
+	///   and delivering none of it.
+	pub fn with_gossip_ingress(mut self, ingress: Urn<'static>) -> Result<Self, ClusterError> {
+		if self.namespace.servlet_type_key(&ingress).is_none() {
+			return Err(ClusterError::UnknownServletType(ingress.canonical_bytes()));
+		}
+
 		self.gossip.ingress = Some(ingress);
-		self
+		Ok(self)
 	}
 
 	/// Build the cluster configuration.
 	///
-	/// Derives colony membership from the certificate, rebuilds the peer
-	/// discovery table from the dial list, and clamps rumor refresh to the
-	/// gossip freshness window.
+	/// Derives colony membership from the certificate and rebuilds the peer
+	/// discovery table from the dial list.
 	pub fn build(self) -> ClusterConfig {
-		// Colony membership is derived from the certificate exactly once:
-		// the colony URN binds to the cert's URI SAN, and every per-frame
-		// membership check compares against this cached value. A cert
-		// that fails to decode or carries no valid colony URN leaves the
-		// gateway a non-member, fail closed.
-		let colony_urn = self.namespace.cert_colony_urn(self.tls.identity().certificate());
-
 		// The discovery table derives from the dial list at build, so the
 		// configured peers are always its un-evictable anchors. The
 		// injected driver rehydrates learned peers through the capped
@@ -442,12 +474,13 @@ impl ClusterConfigBuilder {
 		let mut peer = self.peer;
 		peer.table = Arc::new(PeerTable::new(peer.peers.clone(), self.peer_store));
 
-		// A refresh slower than the gossip freshness window would
-		// re-publish advertisement rumors that peers refuse as stale,
-		// so the interval clamps to the window.
-		peer.rumor_refresh = peer.rumor_refresh.min(self.gossip.seen_ttl);
-
-		ClusterConfig {
+		// Colony membership binds to the certificate's URI SAN, and every
+		// per-frame membership check compares against the cached value. A
+		// cert that fails to decode or carries no valid colony URN leaves
+		// the gateway a non-member, fail closed. The gateway binds it
+		// again at startup, so a later certificate change cannot leave a
+		// stale colony behind.
+		let mut config = ClusterConfig {
 			namespace: self.namespace,
 			load_balancer: self.load_balancer,
 			heartbeat: self.heartbeat,
@@ -461,8 +494,12 @@ impl ClusterConfigBuilder {
 			edge_bind_addr: self.edge_bind_addr,
 			peer,
 			gossip: self.gossip,
-			colony_urn,
+			colony_urn: None,
 			tls: self.tls,
-		}
+		};
+
+		config.bind_colony_membership();
+
+		config
 	}
 }

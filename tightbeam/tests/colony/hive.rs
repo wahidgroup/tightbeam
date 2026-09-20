@@ -12,8 +12,9 @@ use tightbeam::{
 	builder::{frame::FrameBuilder, TypeBuilder},
 	colony::{
 		common::{
-			current_timestamp_ms, ClusterCommand, ClusterCommandResponse, ClusterStatus, ColonyNamespace,
-			HeartbeatParams, HiveManagementRequest, SpawnServletParams, StopServletParams,
+			current_timestamp_ms, ClusterCommand, ClusterCommandOutcome, ClusterCommandResponse, ClusterStatus,
+			ColonyNamespace, HeartbeatParams, HiveManagementOutcome, HiveManagementRequest, SpawnServletParams,
+			StopServletParams,
 		},
 		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
 		servlet::ServletConfig,
@@ -57,6 +58,9 @@ pub(crate) const BACKPRESSURE_MANAGE_MANAGE_SHAPE: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/backpressure-manage-manage-shape");
 pub(crate) const DRAINING_MANAGE_MANAGE_SHAPE: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/draining-manage-manage-shape");
+pub(crate) const AMBIGUOUS_COMMAND_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/ambiguous-command-refused");
+pub(crate) const EMPTY_COMMAND_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:hive/empty-command-refused");
 pub(crate) const FIRST_SPAWN_FORBIDDEN: Urn<'static> = tightbeam::urn!("test", "event:hive/first-spawn-forbidden");
 pub(crate) const FORGED_HEARTBEAT_DENIED: Urn<'static> = tightbeam::urn!("test", "event:hive/forged-heartbeat-denied");
 pub(crate) const HIVE_ESTABLISHED: Urn<'static> = tightbeam::urn!("test", "event:hive/hive-established");
@@ -128,9 +132,11 @@ async fn establish_registered_hive(
 ) -> Result<HiveX509Test, TightBeamError> {
 	trace.event(HIVE_STARTED)?;
 
-	let servlet = HiveTestServlet::start(Arc::new(trace.share()), None).await?;
+	let servlet = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::default()).await?;
 	let mut hive = HiveX509Test::new(conf)?;
-	hive.register(servlet_urn("test_servlet"), servlet, |t| HiveTestServlet::start(t, None))?;
+	hive.register(servlet_urn("test_servlet"), servlet, |t| {
+		HiveTestServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 
 	trace.event_with(HIVE_ESTABLISHED, &[], hive.servlet_addresses().len() as u64)?;
@@ -293,22 +299,22 @@ async fn emit_command(
 	decode(response.message())
 }
 
-/// Requires the heartbeat CHOICE to be present and the manage CHOICE to
-/// be absent. When `sealed_capacity` is set, the reply must not leak
-/// capacity before authentication. Returns the status for the caller to
-/// record as a valued event the spec asserts.
+/// Requires the response to name the heartbeat alternative. When
+/// `sealed_capacity` is set, the reply must not leak capacity before
+/// authentication. Returns the status for the caller to record as a
+/// valued event the spec asserts.
 fn heartbeat_shape_status(
-	response: &ClusterCommandResponse,
+	response: ClusterCommandResponse,
 	sealed_capacity: bool,
 ) -> Result<TransitStatus, TightBeamError> {
-	if response.manage.is_some() {
-		return Err(expectation_failure("heartbeat response must not use the manage shape"));
-	}
+	let heartbeat = match response.into_choice() {
+		Ok(ClusterCommandOutcome::Heartbeat(heartbeat)) => heartbeat,
+		Ok(ClusterCommandOutcome::Manage(_)) => {
+			return Err(expectation_failure("heartbeat response must not use the manage shape"));
+		}
+		Err(_) => return Err(expectation_failure("heartbeat CHOICE required")),
+	};
 
-	let heartbeat = response
-		.heartbeat
-		.as_ref()
-		.ok_or_else(|| expectation_failure("heartbeat CHOICE required"))?;
 	if sealed_capacity && (heartbeat.utilization.get() != 0 || heartbeat.active_servlets != 0) {
 		return Err(expectation_failure("pre-auth reject must not leak capacity"));
 	}
@@ -316,36 +322,28 @@ fn heartbeat_shape_status(
 	Ok(heartbeat.status)
 }
 
-/// Requires the manage/stop CHOICE to be present and the heartbeat CHOICE
-/// to be absent. Returns the stop status for the caller to record as a
-/// valued event.
-fn manage_stop_shape_status(response: &ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
-	if response.heartbeat.is_some() {
-		return Err(expectation_failure("manage response must not use the heartbeat shape"));
+/// Requires the response to name the manage/stop alternative. Returns the
+/// stop status for the caller to record as a valued event.
+fn manage_stop_shape_status(response: ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
+	match response.into_choice() {
+		Ok(ClusterCommandOutcome::Manage(HiveManagementOutcome::Stop(stop))) => Ok(stop.status),
+		Ok(ClusterCommandOutcome::Heartbeat(_)) => {
+			Err(expectation_failure("manage response must not use the heartbeat shape"))
+		}
+		Ok(ClusterCommandOutcome::Manage(_)) | Err(_) => Err(expectation_failure("manage/stop CHOICE required")),
 	}
-
-	let stop = response
-		.manage
-		.as_ref()
-		.and_then(|manage| manage.stop.as_ref())
-		.ok_or_else(|| expectation_failure("manage/stop CHOICE required"))?;
-	Ok(stop.status)
 }
 
-/// Requires the manage/spawn CHOICE to be present and the heartbeat CHOICE
-/// to be absent. Returns the spawn status for the caller to record as a
-/// valued event.
-fn manage_spawn_shape_status(response: &ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
-	if response.heartbeat.is_some() {
-		return Err(expectation_failure("manage response must not use the heartbeat shape"));
+/// Requires the response to name the manage/spawn alternative. Returns the
+/// spawn status for the caller to record as a valued event.
+fn manage_spawn_shape_status(response: ClusterCommandResponse) -> Result<TransitStatus, TightBeamError> {
+	match response.into_choice() {
+		Ok(ClusterCommandOutcome::Manage(HiveManagementOutcome::Spawn(spawn))) => Ok(spawn.status),
+		Ok(ClusterCommandOutcome::Heartbeat(_)) => {
+			Err(expectation_failure("manage response must not use the heartbeat shape"))
+		}
+		Ok(ClusterCommandOutcome::Manage(_)) | Err(_) => Err(expectation_failure("manage/spawn CHOICE required")),
 	}
-
-	let spawn = response
-		.manage
-		.as_ref()
-		.and_then(|manage| manage.spawn.as_ref())
-		.ok_or_else(|| expectation_failure("manage/spawn CHOICE required"))?;
-	Ok(spawn.status)
 }
 
 async fn signed_heartbeat_frame(
@@ -361,6 +359,30 @@ async fn signed_heartbeat_frame(
 async fn signed_stop_frame(provider: &Secp256k1KeyProvider, id: impl AsRef<[u8]>) -> Result<Frame, TightBeamError> {
 	let id = id.as_ref();
 	let mut frame = stop_command_frame(id)?;
+	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
+	Ok(frame)
+}
+
+/// Signs a command body the CHOICE cannot read: `alternatives` chooses
+/// whether the body names none of its alternatives or both of them.
+async fn signed_unreadable_command_frame(
+	provider: &Secp256k1KeyProvider,
+	id: impl AsRef<[u8]>,
+	both: bool,
+) -> Result<Frame, TightBeamError> {
+	let id = id.as_ref();
+	let manage = both.then(|| HiveManagementRequest {
+		spawn: None,
+		list: None,
+		stop: Some(StopServletParams {
+			servlet_id: servlet_urn("none")
+				.servlet_instance("127.0.0.1:0")
+				.expect("a servlet type URN yields an instance URN"),
+		}),
+	});
+
+	let heartbeat = both.then_some(HeartbeatParams { cluster_status: ClusterStatus::Healthy });
+	let mut frame = command_frame(id, ClusterCommand { heartbeat, manage })?;
 	frame.sign_with_provider::<Sha3_256, _>(provider).await?;
 	Ok(frame)
 }
@@ -423,18 +445,18 @@ tb_scenario! {
 			// with no capacity data before authentication.
 			let unsigned_heartbeat = command_frame(b"hb-unsigned", heartbeat_command())?;
 			let response = emit_command(&mut client, unsigned_heartbeat).await?;
-			trace.event_with(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(&response, true)?)?;
+			trace.event_with(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(response, true)?)?;
 
 			// An unsigned manage command must come back in the manage CHOICE
 			// as a security verdict, not a drain probe.
 			let unsigned_stop = stop_command_frame(b"manage-unsigned")?;
 			let response = emit_command(&mut client, unsigned_stop).await?;
-			trace.event_with(UNSIGNED_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(&response)?)?;
+			trace.event_with(UNSIGNED_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
 			// A signed heartbeat must be accepted end to end.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-signed").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			trace.event_with(SIGNED_HEARTBEAT_ACCEPTED, &[], heartbeat_shape_status(&response, false)?)?;
+			trace.event_with(SIGNED_HEARTBEAT_ACCEPTED, &[], heartbeat_shape_status(response, false)?)?;
 
 			// A signed manage command during drain must come back
 			// Unavailable in the manage CHOICE.
@@ -442,7 +464,7 @@ tb_scenario! {
 
 			let signed_stop = signed_stop_frame(&signer.provider, b"manage-draining").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
-			trace.event_with(DRAINING_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(&response)?)?;
+			trace.event_with(DRAINING_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
 			// Trip the breaker at threshold 1. A trusted signer identity with a
 			// signature transplanted from a different frame is the one failure
@@ -456,14 +478,14 @@ tb_scenario! {
 			forged.attach_signer_info(transplanted)?;
 
 			let response = emit_command(&mut client, forged).await?;
-			trace.event_with(FORGED_HEARTBEAT_DENIED, &[], heartbeat_shape_status(&response, false)?)?;
+			trace.event_with(FORGED_HEARTBEAT_DENIED, &[], heartbeat_shape_status(response, false)?)?;
 
 			// With the breaker open, a valid heartbeat is rejected during
 			// cooldown but keeps the heartbeat CHOICE, so the cluster records
 			// a reply instead of MalformedResponse eviction pressure.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-open").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			trace.event_with(OPEN_BREAKER_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(&response, true)?)?;
+			trace.event_with(OPEN_BREAKER_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(response, true)?)?;
 
 			hive.stop();
 
@@ -504,14 +526,14 @@ tb_scenario! {
 
 			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
-			trace.event_with(BACKPRESSURE_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(&response)?)?;
+			trace.event_with(BACKPRESSURE_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
 			// A signed heartbeat is exempt from the gate. It replies in the
 			// heartbeat CHOICE with real capacity data, and the
 			// ResourceExhausted status reflects saturation.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-bp").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			trace.event_with(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(&response, false)?)?;
+			trace.event_with(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, &[], heartbeat_shape_status(response, false)?)?;
 
 			hive.stop();
 
@@ -566,6 +588,47 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
+	pub HiveChoiceRefusalSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(EMPTY_COMMAND_REFUSED, exactly!(1), equals!(TransitStatus::InvalidArgument)),
+			(AMBIGUOUS_COMMAND_REFUSED, exactly!(1), equals!(TransitStatus::InvalidArgument))
+		]
+	}
+}
+
+// A command body spells its CHOICE as tagged optional fields, so the wire
+// can carry none or several. Both forms must draw a refusal the sender can
+// decode. Answering with silence would hang the cluster until its own
+// timeout and count as a lost hive, and answering PermissionDenied would
+// tell a correctly authorized sender its credentials were the problem.
+tb_scenario! {
+	name: hive_refuses_a_command_without_one_alternative,
+	spec: HiveChoiceRefusalSpec,
+	environment Hive {
+		context: trusted_signer("CN=Hive Choice Refusal"),
+		start: |SetupEnv { trace, context: signer }| async move {
+			start_trusted_hive(&trace, &signer, HiveConfig::default()).await
+		},
+		client: |HiveEnv { trace, context: signer, hive }| async move {
+			let mut client = connect_hive(&hive, &signer).await?;
+
+			let empty = signed_unreadable_command_frame(&signer.provider, b"cmd-empty", false).await?;
+			let response = emit_command(&mut client, empty).await?;
+			trace.event_with(EMPTY_COMMAND_REFUSED, &[], manage_stop_shape_status(response)?)?;
+
+			let ambiguous = signed_unreadable_command_frame(&signer.provider, b"cmd-both", true).await?;
+			let response = emit_command(&mut client, ambiguous).await?;
+			trace.event_with(AMBIGUOUS_COMMAND_REFUSED, &[], manage_stop_shape_status(response)?)?;
+
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
 	pub HiveSpawnRetrySpec,
 	V(1,0,0): {
 		mode: Accept,
@@ -587,7 +650,7 @@ tb_scenario! {
 			use core::sync::atomic::{AtomicBool, Ordering};
 
 			let fail_once = Arc::new(AtomicBool::new(true));
-			let seed = HiveTestServlet::start(Arc::new(trace.share()), None).await?;
+			let seed = HiveTestServlet::start(Arc::new(trace.share()), ServletConfig::default()).await?;
 			let trust_store = pinning_trust_store(&signer.certificate)?;
 			let conf = HiveConfig {
 				trust_store: Some(trust_store),
@@ -603,7 +666,7 @@ tb_scenario! {
 						return Err(TightBeamError::MissingResponse);
 					}
 
-					HiveTestServlet::start(t, None).await
+					HiveTestServlet::start(t, ServletConfig::default()).await
 				}
 			})?;
 
@@ -616,10 +679,10 @@ tb_scenario! {
 			let replay = signed.to_owned();
 
 			let first = emit_command(&mut client, signed).await?;
-			trace.event_with(FIRST_SPAWN_FORBIDDEN, &[], manage_spawn_shape_status(&first)?)?;
+			trace.event_with(FIRST_SPAWN_FORBIDDEN, &[], manage_spawn_shape_status(first)?)?;
 
 			let second = emit_command(&mut client, replay).await?;
-			trace.event_with(RETRY_SPAWN_ACCEPTED, &[], manage_spawn_shape_status(&second)?)?;
+			trace.event_with(RETRY_SPAWN_ACCEPTED, &[], manage_spawn_shape_status(second)?)?;
 
 			hive.stop();
 			Ok(())
@@ -698,7 +761,7 @@ tb_scenario! {
 			let mut client = connect_hive(&hive, &signer).await?;
 			let signed = signed_spawn_frame(&signer.provider, b"spawn-orphan", "orphan").await?;
 			let response = emit_command(&mut client, signed).await?;
-			trace.event_with(SPAWN_NON_UTF8_FORBIDDEN, &[], manage_spawn_shape_status(&response)?)?;
+			trace.event_with(SPAWN_NON_UTF8_FORBIDDEN, &[], manage_spawn_shape_status(response)?)?;
 
 			hive.stop();
 			Ok(())
@@ -800,7 +863,7 @@ async fn start_contract_hive(
 	trace: TraceCollector,
 	materials: &ServerMaterials,
 ) -> Result<HiveX509Test, TightBeamError> {
-	let config = Some(contract_servlet_conf(materials)?);
+	let config = contract_servlet_conf(materials)?;
 	let trace = Arc::new(trace.share());
 	let servlet = FrameContractServlet::start(Arc::clone(&trace), config).await?;
 
@@ -809,7 +872,9 @@ async fn start_contract_hive(
 	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 	let mut hive = HiveX509Test::new(Some(conf))?;
-	hive.register(servlet_urn("contract"), servlet, |t| FrameContractServlet::start(t, None))?;
+	hive.register(servlet_urn("contract"), servlet, |t| {
+		FrameContractServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(trace).await?;
 	Ok(hive)
 }

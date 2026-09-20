@@ -168,7 +168,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
-		let secret_key: &Arc<SecretKey> = ctx.env_config()?;
+		let secret_key: &Arc<SecretKey> = ctx.env_config();
 
 		match req {
 			KeyManagerRequest::GetPublicKey(_) => {

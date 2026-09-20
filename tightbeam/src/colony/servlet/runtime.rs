@@ -5,7 +5,6 @@
 //! - Address bytes are encoded once at start and shared as [`Arc<[u8]>`].
 //! - Callers borrow [`addr`](ServletRuntime::addr) instead of cloning it.
 
-use core::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -31,8 +30,8 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::transport::EncryptedProtocol;
 
 /// Config fields [`ServletRuntime::start`] needs after the listener binds.
-pub(crate) struct ServletRuntimeParts {
-	pub(crate) env_config: Arc<dyn Any + Send + Sync>,
+pub(crate) struct ServletRuntimeParts<Env> {
+	pub(crate) env_config: Arc<Env>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
@@ -64,39 +63,40 @@ where
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 {
 	/// Bind, start workers, build context, and spawn the accept loop.
-	pub async fn start<M, C, S>(
+	pub async fn start<M, C, Env, S>(
 		trace: Arc<TraceCollector>,
-		mut servlet_conf: ServletConfig<P, M, C>,
+		servlet_conf: ServletConfig<P, M, C, Env>,
 		service: S,
 	) -> Result<Self, TightBeamError>
 	where
 		M: Message,
 		C: CryptoProvider + Send + Sync + 'static,
-		S: ServletService,
+		S: ServletService<Env = Env>,
+		Env: Send + Sync + 'static,
 		P: EncryptedProtocol<CryptoProvider = C>,
 	{
 		let bind_addr = P::default_bind_address().map_err(protocol_error)?;
-		let encryption = servlet_conf.take_encryption_config();
+		let (encryption, parts) = servlet_conf.into_bind_parts();
 		let (listener, addr) = if let Some(encryption_config) = encryption {
 			P::bind_with(bind_addr, encryption_config).await.map_err(protocol_error)?
 		} else {
 			P::bind(bind_addr).await.map_err(protocol_error)?
 		};
 
-		let parts = servlet_conf.into_runtime_parts()?;
 		let runtime = Self::spawn_loop(trace, parts, service, listener, addr).await?;
 		Ok(runtime)
 	}
 
-	async fn spawn_loop<S>(
+	async fn spawn_loop<Env, S>(
 		trace: Arc<TraceCollector>,
-		parts: ServletRuntimeParts,
+		parts: ServletRuntimeParts<Env>,
 		service: S,
 		listener: P::Listener,
 		addr: P::Address,
 	) -> Result<Self, TightBeamError>
 	where
-		S: ServletService,
+		S: ServletService<Env = Env>,
+		Env: Send + Sync + 'static,
 	{
 		let ServletRuntimeParts {
 			env_config,
@@ -192,19 +192,20 @@ where
 ///
 /// Prefer inherent [`ServletRuntime::start`] when you already have a
 /// [`ServletService`]. Use this impl when an API bounds on [`Servlet`].
-impl<P, M, C> Servlet<M> for ServletRuntime<P>
+impl<P, M, C, Env> Servlet<M, Env> for ServletRuntime<P>
 where
 	P: Protocol + EncryptedProtocol<CryptoProvider = C> + Send + Sync + 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 	M: Message + Send + Sync + 'static,
 	C: CryptoProvider + Send + Sync + 'static,
+	Env: Send + Sync + 'static,
 {
-	type Conf = RuntimeServletConf<P, M, C>;
+	type Conf = RuntimeServletConf<P, M, C, Env>;
 	type Address = P::Address;
 
-	async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, TightBeamError> {
-		let RuntimeServletConf { config, service } = config.unwrap_or_default();
+	async fn start(trace: Arc<TraceCollector>, config: Self::Conf) -> Result<Self, TightBeamError> {
+		let RuntimeServletConf { config, service } = config;
 		// Three-argument inherent start (not this trait method).
 		ServletRuntime::start(trace, config, service).await
 	}

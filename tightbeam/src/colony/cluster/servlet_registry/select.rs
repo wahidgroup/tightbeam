@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::{ClusterError, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, SharedId};
+use crate::colony::common::ServletTypeKey;
 
 impl ServletRegistry {
 	/// Live routes for a servlet type, shared by Arc (no entry deep copy).
-	pub fn entries_for_type(&self, servlet_type: impl AsRef<[u8]>) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
+	pub fn entries_for_type(&self, servlet_type: &ServletTypeKey) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
 		let servlet_type = servlet_type.as_ref();
 		let routes = self.routes.read()?;
 		let addresses = routes.addresses_for_type(servlet_type);
@@ -22,9 +23,8 @@ impl ServletRegistry {
 	/// Live local routes for a servlet type.
 	pub fn local_entries_for_type(
 		&self,
-		servlet_type: impl AsRef<[u8]>,
+		servlet_type: &ServletTypeKey,
 	) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
-		let servlet_type = servlet_type.as_ref();
 		let routes = self.entries_for_type(servlet_type)?;
 		let local = routes
 			.into_iter()

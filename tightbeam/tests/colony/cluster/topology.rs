@@ -73,9 +73,9 @@ async fn drive_topology_routes(
 	routes: usize,
 ) -> Result<(), TightBeamError> {
 	let trace = Arc::new(trace.share());
-	let config = Some(servlet_tls_config(ctx.certs.as_ref())?);
+	let config = servlet_tls_config(ctx.certs.as_ref())?;
 	let servlet_a = ClusterTestServlet::start(Arc::clone(&trace), config).await?;
-	let config = Some(servlet_tls_config(ctx.certs.as_ref())?);
+	let config = servlet_tls_config(ctx.certs.as_ref())?;
 	let servlet_b = ClusterTestServlet::start(Arc::clone(&trace), config).await?;
 	let addr_a = servlet_a.addr().to_string();
 	let addr_b = servlet_b.addr().to_string();

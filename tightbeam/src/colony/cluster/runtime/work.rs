@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
 use crate::colony::cluster::runtime::hop::Hop;
 use crate::colony::cluster::{ClusterConfig, ClusterError, ClusterWorkResponse, HopBudget, RouteKind, ServletRegistry};
-use crate::colony::common::{reply_frame, ClusterRequest, ClusterWorkRequest};
+use crate::colony::common::{reply_frame, ClusterRequest, ClusterWorkRequest, ServletTypeKey};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
 use crate::encode;
@@ -198,10 +198,10 @@ where
 		// A work target must be a servlet URN in this gateway's
 		// namespace. Foreign authorities and realms are refused
 		// before the registry is consulted.
-		if !self.config.namespace.is_bare_servlet_type(&request.servlet_type) {
+		let Some(type_key) = self.config.namespace.servlet_type_key(&request.servlet_type) else {
 			self.trace.event(CLUSTER_WORK_REFUSED)?;
 			return reply_frame(frame.metadata().id(), ClusterWorkResponse::err(TransitStatus::PermissionDenied));
-		}
+		};
 
 		// The payload must decode as the client's end-to-end frame. Bytes
 		// that do not are a permanent caller fault, refused before route
@@ -218,7 +218,6 @@ where
 		};
 
 		let mut frame_cache = Some(client_frame);
-		let type_key = request.servlet_type.canonical_bytes();
 		let servlet_type = request.servlet_type;
 		let mut attempt_payload = request.payload;
 		let mut excluded: Option<Arc<[u8]>> = None;
@@ -317,11 +316,10 @@ impl ServletRegistry {
 	pub(crate) fn select_route(
 		&self,
 		config: &ClusterConfig,
-		type_key: impl AsRef<[u8]>,
+		type_key: &ServletTypeKey,
 		budget: HopBudget,
 		exclude: Option<&[u8]>,
 	) -> Option<RouteChoice> {
-		let type_key = type_key.as_ref();
 		let servlet_registry = self;
 		let entries = if budget.allows_forward() {
 			servlet_registry.entries_for_type(type_key)
@@ -396,7 +394,9 @@ impl ServletRegistry {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::cluster::{ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
+	use crate::colony::cluster::{
+		PeerRoute, RelayRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+	};
 	use crate::colony::common::{ColonyNamespace, InstanceMetrics, LoadBalancer};
 	use crate::constants::{DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS};
 
@@ -411,14 +411,23 @@ mod tests {
 			.expect("test names satisfy the mint grammar")
 	}
 
+	/// The route key for the fixture servlet type, minted as production does.
+	fn ping_key() -> ServletTypeKey {
+		ColonyNamespace::default()
+			.servlet_type_key(&ping_type())
+			.expect("the fixture type is bare in the default namespace")
+	}
+
 	fn peer_entry(peer: impl AsRef<[u8]>, dial: impl AsRef<[u8]>) -> ServletEntry {
 		let peer = peer.as_ref();
 		let dial = dial.as_ref();
 		let servlet_type = ping_type().canonical_bytes();
 		ServletEntry::peer(
-			Arc::from(peer),
-			Arc::from(servlet_type.as_slice()),
-			Arc::from(dial),
+			PeerRoute {
+				peer_id: Arc::from(peer),
+				servlet_type: Arc::from(servlet_type.as_slice()),
+				dial_addr: Arc::from(dial),
+			},
 			DEFAULT_INITIAL_PHEROMONE,
 			DEFAULT_ABANDONMENT_LIMIT,
 		)
@@ -430,10 +439,12 @@ mod tests {
 		let dial = dial.as_ref();
 		let servlet_type = ping_type().canonical_bytes();
 		ServletEntry::peer_relay(
-			Arc::from(origin),
-			Arc::from(relay),
-			Arc::from(servlet_type.as_slice()),
-			Arc::from(dial),
+			RelayRoute {
+				origin_id: Arc::from(origin),
+				relay_id: Arc::from(relay),
+				servlet_type: Arc::from(servlet_type.as_slice()),
+				dial_addr: Arc::from(dial),
+			},
 			DEFAULT_INITIAL_PHEROMONE,
 			DEFAULT_ABANDONMENT_LIMIT,
 		)
@@ -604,7 +615,7 @@ mod tests {
 		let registry = ServletRegistry::default();
 		registry.add(relay_entry(b"origin", b"relay", b"relay:1"))?;
 
-		let type_key = ping_type().canonical_bytes();
+		let type_key = ping_key();
 		let below = registry.select_route(&config, &type_key, HopBudget::for_test(1), None);
 		let at_gate = registry.select_route(&config, &type_key, HopBudget::for_test(2), None);
 		assert!(below.is_none());
@@ -619,7 +630,7 @@ mod tests {
 		registry.add(peer_entry(b"first", b"first:1"))?;
 		registry.add(peer_entry(b"second", b"second:1"))?;
 
-		let type_key = ping_type().canonical_bytes();
+		let type_key = ping_key();
 		let failed = registry
 			.select_route(&config, &type_key, HopBudget::for_test(1), None)
 			.map(|choice| choice.route_key);

@@ -155,12 +155,12 @@ async fn start_laser_hive(
 	certs: Arc<GatewayCerts>,
 	conf: HiveConfig,
 ) -> Result<LaserHive, TightBeamError> {
-	let config = Some(laser_servlet_conf(&certs)?);
+	let config = laser_servlet_conf(&certs)?;
 	let trace = Arc::new(trace.share());
 	let servlet = LaserServlet::start(Arc::clone(&trace), config).await?;
 
 	let mut hive = LaserHive::new(Some(conf))?;
-	hive.register(beam_urn(), servlet, |t| LaserServlet::start(t, None))?;
+	hive.register(beam_urn(), servlet, |t| LaserServlet::start(t, ServletConfig::default()))?;
 	hive.establish(trace).await?;
 	Ok(hive)
 }

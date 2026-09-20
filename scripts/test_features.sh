@@ -10,6 +10,34 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# `cargo hack --no-dev-deps` strips `[dev-dependencies]` out of every
+# workspace manifest in place and puts them back when it finishes. A run
+# that dies first, including one a person interrupts, leaves them stripped,
+# and the next build fails on a missing dev-only crate rather than on
+# anything in the tree. Snapshot the manifests and restore them however
+# this script exits.
+MANIFEST_SNAPSHOT="$(mktemp -d)"
+
+restore_manifests() {
+	local relative
+	for relative in "${TRACKED_MANIFESTS[@]}"; do
+		if ! cmp -s "$MANIFEST_SNAPSHOT/$relative" "$ROOT/$relative"; then
+			cp "$MANIFEST_SNAPSHOT/$relative" "$ROOT/$relative"
+			echo "  restored $relative (a stripped manifest was left behind)" >&2
+		fi
+	done
+
+	rm -rf "$MANIFEST_SNAPSHOT"
+}
+
+mapfile -t TRACKED_MANIFESTS < <(cd "$ROOT" && git ls-files '*Cargo.toml')
+for manifest in "${TRACKED_MANIFESTS[@]}"; do
+	mkdir -p "$MANIFEST_SNAPSHOT/$(dirname "$manifest")"
+	cp "$ROOT/$manifest" "$MANIFEST_SNAPSHOT/$manifest"
+done
+
+trap restore_manifests EXIT INT TERM
+
 if ! "$ROOT/scripts/tool-installed.sh" cargo-hack; then
 	HACK_VERSION="$("$ROOT/scripts/tool-version.sh" cargo-hack)"
 	echo "Installing cargo-hack $HACK_VERSION..."

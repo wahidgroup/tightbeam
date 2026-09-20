@@ -1,10 +1,11 @@
 //! Peer-advertisement admission for the cluster gateway.
 
-use core::str::FromStr;
 use std::sync::Arc;
 
 use super::runtime::VerifiedControlFrame;
-use super::{ClusterConfig, Party, PeerHint, PheromoneConfig, ServletEntry, SharedId};
+use super::{
+	ClusterConfig, Party, PeerAddress, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, ServletEntry, SharedId,
+};
 use crate::colony::common::ColonyResource;
 use crate::colony::common::{ClusterWorkRequest, ColonyNamespace, PeerAdvertisement};
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
@@ -14,7 +15,6 @@ use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
 use crate::policy::TransitStatus;
 use crate::transport::multiplex::StreamRoute;
-use crate::transport::tcp::TightBeamSocketAddr;
 use crate::utils::urn::Urn;
 use crate::x509::ext::pkix::name::GeneralName;
 use crate::x509::ext::pkix::SubjectAltName;
@@ -121,8 +121,12 @@ impl HopBudget {
 pub struct AdmittedPeerAd {
 	/// Signer cert fingerprint (claimed address when x509 is off)
 	pub(super) peer_hive_id: SharedId,
-	/// Claimed gateway socket every slate entry dials
-	pub(super) dial_addr: SharedId,
+	/// Claimed gateway socket every slate entry dials, parsed once.
+	///
+	/// The route bytes the slate carries are rendered from this, so a
+	/// scoring lookup and a stored route agree on one spelling of one
+	/// socket.
+	pub(super) dial: PeerAddress,
 	/// Peer-routed entries keyed by `peer_hive_id NUL type`
 	pub(super) slate: Vec<ServletEntry>,
 	/// Issue order of the signed advertisement frame. Reconciliation
@@ -163,13 +167,11 @@ impl AdmittedPeerAd {
 		}
 
 		let frame = verified.frame();
-		let dial_addr: SharedId = Arc::from(ad.gateway_addr.as_slice());
-
-		// The signer certificate is the one the control-frame parse
-		// already resolved. The slate key (fingerprint) and the
-		// membership gate both derive from it.
+		// The control-frame parse already resolved the signer certificate
+		// and keyed its slate, so the membership gate reads that
+		// certificate and the slate key comes from that parse.
 		let signer_cert = verified.signer_cert();
-		let peer_hive_id = signer_cert.fingerprint_id().ok_or(TransitStatus::PermissionDenied)?;
+		let peer_hive_id = verified.fingerprint().into_shared();
 
 		// Federation is a colony operation: both this gateway and the
 		// advertising peer must carry a valid colony URN SAN. A cert
@@ -184,17 +186,14 @@ impl AdmittedPeerAd {
 			}
 		}
 
-		peer_advertisement_wire_ok(
-			&ad.gateway_addr,
-			&ad.advertised_types,
-			&conf.namespace,
-			conf.peer.peer_dial_allowlist.as_deref(),
-		)?;
+		let dial = peer_advertisement_wire_ok(&ad.gateway_addr, &ad.advertised_types, &conf.namespace, &conf.peer)?;
 
-		let dial = Arc::clone(&dial_addr);
-		let slate = conf.pheromone.peer_slate(&peer_hive_id, dial, &ad.advertised_types);
+		// Routes carry the parsed socket's own spelling, so a later lookup
+		// by address finds them whatever the peer wrote on the wire.
+		let route_addr = dial.route_bytes();
+		let slate = conf.pheromone.peer_slate(&peer_hive_id, route_addr, &ad.advertised_types);
 
-		Ok(Self { peer_hive_id, dial_addr, slate, order: frame.metadata().order() })
+		Ok(Self { peer_hive_id, dial, slate, order: frame.metadata().order() })
 	}
 
 	/// Relay trails through `relay_id`, the gateway that relayed this
@@ -228,10 +227,12 @@ impl AdmittedPeerAd {
 			.iter()
 			.map(|entry| {
 				ServletEntry::peer_relay(
-					Arc::clone(&self.peer_hive_id),
-					Arc::clone(relay_id),
-					Arc::clone(entry.servlet_type()),
-					Arc::clone(&relay_dial),
+					RelayRoute {
+						origin_id: Arc::clone(&self.peer_hive_id),
+						relay_id: Arc::clone(relay_id),
+						servlet_type: Arc::clone(entry.servlet_type()),
+						dial_addr: Arc::clone(&relay_dial),
+					},
 					pheromone.initial_pheromone,
 					pheromone.abandonment_limit,
 				)
@@ -252,48 +253,9 @@ impl AdmittedPeerAd {
 	/// The hint owns its fields because it outlives this borrowed
 	/// advertisement inside the peer table.
 	#[must_use]
-	pub fn discovery_hint(&self) -> Option<PeerHint> {
-		let gateway_addr = core::str::from_utf8(&self.dial_addr).ok()?;
-
-		Some(PeerHint {
-			gateway_addr: gateway_addr.to_string(),
-			peer_id: Some(self.peer_hive_id.to_vec()),
-		})
+	pub fn discovery_hint(&self) -> PeerHint {
+		PeerHint { gateway_addr: self.dial, peer_id: Some(self.peer_hive_id.to_vec()) }
 	}
-}
-
-/// Whether a claimed peer gateway address is safe dial data.
-///
-/// Refuses empty, non-UTF-8, NUL-bearing, or non-parseable sockets.
-/// The dial path parses UTF-8, and NUL would corrupt composite route keys.
-#[must_use]
-fn peer_gateway_addr_valid(gateway_addr: impl AsRef<[u8]>) -> bool {
-	let gateway_addr = gateway_addr.as_ref();
-	let nonempty = !gateway_addr.is_empty();
-	let no_nul = !gateway_addr.contains(&0);
-	let Ok(addr) = core::str::from_utf8(gateway_addr) else {
-		return false;
-	};
-
-	let parseable = TightBeamSocketAddr::from_str(addr).is_ok();
-	nonempty && no_nul && parseable
-}
-
-/// Whether `gateway_addr` is on an optional exact-match allowlist.
-///
-/// `None` accepts any address that already passed [`peer_gateway_addr_valid`].
-#[must_use]
-pub(crate) fn peer_dial_allowed(gateway_addr: impl AsRef<[u8]>, allowlist: Option<&[String]>) -> bool {
-	let gateway_addr = gateway_addr.as_ref();
-	let Some(allowed) = allowlist else {
-		return true;
-	};
-	let Ok(addr) = core::str::from_utf8(gateway_addr) else {
-		return false;
-	};
-
-	let matched = allowed.iter().any(|entry| entry.as_str() == addr);
-	matched
 }
 
 /// Wire-level advertisement checks. No registry lock.
@@ -301,16 +263,22 @@ fn peer_advertisement_wire_ok(
 	gateway_addr: impl AsRef<[u8]>,
 	types: impl AsRef<[Urn<'static>]>,
 	namespace: &ColonyNamespace,
-	allowlist: Option<&[String]>,
-) -> Result<(), TransitStatus> {
+	peer: &PeerConfig,
+) -> Result<PeerAddress, TransitStatus> {
 	let gateway_addr = gateway_addr.as_ref();
 	let types = types.as_ref();
-	let dial_valid = peer_gateway_addr_valid(gateway_addr);
-	let dial_allowed = peer_dial_allowed(gateway_addr, allowlist);
+	// One parse is the whole check on the claimed address. A socket that
+	// parses is non-empty, carries no NUL, and is dialable, so the parsed
+	// value is both the proof and what the caller keeps.
+	let dial = core::str::from_utf8(gateway_addr)
+		.ok()
+		.and_then(|raw| raw.parse::<PeerAddress>().ok())
+		.ok_or(TransitStatus::PermissionDenied)?;
+
 	let types_valid = namespace.all_bare_servlet_types(types);
 	let within_type_cap = types.len() <= MAX_ADVERTISED_TYPES;
-	if dial_valid && dial_allowed && types_valid && within_type_cap {
-		Ok(())
+	if peer.dial_allowed(&dial) && types_valid && within_type_cap {
+		Ok(dial)
 	} else {
 		Err(TransitStatus::PermissionDenied)
 	}
@@ -382,8 +350,10 @@ mod tests {
 		nestmate_ns().servlet("ping").expect("static servlet name")
 	}
 
+	/// The claimed address is safe dial data exactly when it parses, so
+	/// these are the refusals the one parse gives.
 	#[test]
-	fn peer_gateway_addr_valid_cases() {
+	fn an_unparsable_claimed_address_is_refused() {
 		let cases: &[(&[u8], bool)] = &[
 			(b"127.0.0.1:9000", true),
 			(b"", false),
@@ -391,17 +361,51 @@ mod tests {
 			(&[0xff, 0xfe], false),
 			(b"not-a-socket", false),
 		];
-		for &(addr, expected) in cases {
-			assert_eq!(peer_gateway_addr_valid(addr), expected);
+
+		for &(addr, parses) in cases {
+			let parsed = core::str::from_utf8(addr).ok().and_then(|raw| raw.parse::<PeerAddress>().ok());
+			assert_eq!(parsed.is_some(), parses);
 		}
 	}
 
+	/// A plane restricted to an allowlist dials only what it names.
+	fn plane_allowing(entries: &[&str]) -> PeerConfig {
+		let allowlist: std::collections::HashSet<PeerAddress> = entries.iter().map(|entry| address(entry)).collect();
+		let mut peer = PeerConfig::default();
+		peer.set_dial_allowlist(allowlist);
+		peer
+	}
+
+	/// A parsed dial address, which every fixture spelling names.
+	fn address(spelling: &str) -> PeerAddress {
+		spelling.parse().expect("fixture addresses name sockets")
+	}
+
 	#[test]
-	fn peer_dial_allowed_respects_allowlist() {
-		let addr = b"127.0.0.1:9000";
-		assert!(peer_dial_allowed(addr, None));
-		assert!(peer_dial_allowed(addr, Some(&[String::from("127.0.0.1:9000")])));
-		assert!(!peer_dial_allowed(addr, Some(&[String::from("10.0.0.1:9000")])));
+	fn dial_allowed_respects_allowlist() {
+		let addr = address("127.0.0.1:9000");
+		assert!(PeerConfig::default().dial_allowed(&addr));
+		assert!(plane_allowing(&["127.0.0.1:9000"]).dial_allowed(&addr));
+		assert!(!plane_allowing(&["10.0.0.1:9000"]).dial_allowed(&addr));
+	}
+
+	/// One socket spelled two ways is one entry, so a peer cannot pass the
+	/// hint gate and fail the advertisement gate with the same address.
+	/// An ad spelling its socket verbosely installs routes under the
+	/// canonical key, so a later scoring or eviction lookup by that address
+	/// finds them.
+	#[test]
+	fn an_ad_spelling_its_socket_verbosely_routes_under_the_canonical_key() {
+		let verbose = address("[0:0:0:0:0:0:0:1]:9000");
+		let canonical = address("[::1]:9000");
+		assert_eq!(verbose.route_bytes(), canonical.route_bytes());
+		assert_eq!(verbose.route_bytes().as_ref(), b"[::1]:9000");
+	}
+
+	#[test]
+	fn dial_allowed_compares_sockets_not_spellings() {
+		let verbose = address("[0:0:0:0:0:0:0:1]:9000");
+		assert!(plane_allowing(&["[::1]:9000"]).dial_allowed(&verbose));
 	}
 
 	#[test]
@@ -434,11 +438,11 @@ mod tests {
 		assert_eq!(slate[0].route_key()[32], 0);
 	}
 
-	fn admitted_ad(origin: &SharedId, dial: impl AsRef<[u8]>, types: impl AsRef<[Urn<'static>]>) -> AdmittedPeerAd {
-		let dial = dial.as_ref();
+	fn admitted_ad(origin: &SharedId, dial: impl AsRef<str>, types: impl AsRef<[Urn<'static>]>) -> AdmittedPeerAd {
+		let dial = address(dial.as_ref());
 		let types = types.as_ref();
-		let slate = test_pheromone().peer_slate(origin, Arc::from(dial), types);
-		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial_addr: Arc::from(dial), slate, order: 0 }
+		let slate = test_pheromone().peer_slate(origin, dial.route_bytes(), types);
+		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial, slate, order: 0 }
 	}
 
 	fn some_trail(trail: Option<RelayTrail>) -> RelayTrail {
@@ -448,7 +452,7 @@ mod tests {
 	#[test]
 	fn relay_trail_none_for_self_relay() {
 		let origin: SharedId = Arc::from([1u8; 32].as_slice());
-		let ad = admitted_ad(&origin, b"127.0.0.1:9000", &[ping_type()]);
+		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[ping_type()]);
 		let trail = ad.relay_trail(&origin, Arc::from(b"127.0.0.1:9001".as_slice()), &PheromoneConfig::default());
 		assert!(trail.is_none());
 	}
@@ -457,7 +461,7 @@ mod tests {
 	fn relay_trail_none_for_empty_slate() {
 		let origin: SharedId = Arc::from([1u8; 32].as_slice());
 		let relay: SharedId = Arc::from([2u8; 32].as_slice());
-		let ad = admitted_ad(&origin, b"127.0.0.1:9000", &[]);
+		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[]);
 		let trail = ad.relay_trail(&relay, Arc::from(b"127.0.0.1:9001".as_slice()), &PheromoneConfig::default());
 		assert!(trail.is_none());
 	}
@@ -466,7 +470,7 @@ mod tests {
 	fn relay_trail_buckets_by_origin_and_relay() {
 		let origin: SharedId = Arc::from([1u8; 32].as_slice());
 		let relay: SharedId = Arc::from([2u8; 32].as_slice());
-		let ad = admitted_ad(&origin, b"127.0.0.1:9000", &[ping_type()]);
+		let ad = admitted_ad(&origin, "127.0.0.1:9000", &[ping_type()]);
 
 		let trail =
 			some_trail(ad.relay_trail(&relay, Arc::from(b"127.0.0.1:9001".as_slice()), &PheromoneConfig::default()));
@@ -484,15 +488,15 @@ mod tests {
 	#[test]
 	fn peer_advertisement_wire_ok_refuses_bad_dial() {
 		let ns = nestmate_ns();
-		let status = peer_advertisement_wire_ok(b"", &[ping_type()], &ns, None);
+		let status = peer_advertisement_wire_ok(b"", &[ping_type()], &ns, &PeerConfig::default());
 		assert_eq!(status, Err(TransitStatus::PermissionDenied));
 	}
 
 	#[test]
 	fn peer_advertisement_wire_ok_refuses_allowlist_miss() {
 		let ns = nestmate_ns();
-		let allow = [String::from("10.0.0.1:9000")];
-		let status = peer_advertisement_wire_ok(b"127.0.0.1:9000", &[ping_type()], &ns, Some(&allow));
+		let allow = plane_allowing(&["10.0.0.1:9000"]);
+		let status = peer_advertisement_wire_ok(b"127.0.0.1:9000", &[ping_type()], &ns, &allow);
 		assert_eq!(status, Err(TransitStatus::PermissionDenied));
 	}
 

@@ -840,7 +840,7 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let trace = Arc::new(trace.share());
-			let config = Some(servlet_tls_config(&certs)?);
+			let config = servlet_tls_config(&certs)?;
 			let servlet = ClusterTestServlet::start(trace, config).await?;
 			let servlet_addr = servlet.addr().to_string();
 			let hive_addr = b"127.0.0.1:65200".as_slice();

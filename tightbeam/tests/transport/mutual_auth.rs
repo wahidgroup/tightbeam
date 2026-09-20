@@ -174,7 +174,7 @@ tb_scenario! {
 				.with_config(Arc::new(()))
 				.build();
 
-			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
+			MutualAuthServlet::start(Arc::clone(&trace), servlet_conf).await
 		},
 		setup: |env| async move {
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
@@ -262,7 +262,7 @@ tb_scenario! {
 				.with_config(Arc::new(()))
 				.build();
 
-			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
+			MutualAuthServlet::start(Arc::clone(&trace), servlet_conf).await
 		},
 		setup: |env| async move {
 			use tightbeam::crypto::key::Secp256k1KeyProvider;
@@ -332,7 +332,7 @@ tb_scenario! {
 				.with_config(Arc::new(()))
 				.build();
 
-			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
+			MutualAuthServlet::start(Arc::clone(&trace), servlet_conf).await
 		},
 		setup: |env| async move {
 			// Client trusts only SERVER_CERT; the presented certificate

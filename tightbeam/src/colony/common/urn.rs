@@ -324,11 +324,60 @@ impl Urn<'_> {
 	}
 }
 
-impl ColonyNamespace {
-	/// Whether `urn` is a bare servlet type in this namespace (no tail).
+/// A URN proven to be a bare servlet type in one namespace.
+///
+/// Route selection keys on the canonical bytes this carries, so it cannot
+/// run on an instance locator or a foreign realm: the namespace check runs
+/// where the key is minted, once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServletTypeKey(Vec<u8>);
+
+impl ServletTypeKey {
+	/// The registry's route key for this type.
 	#[must_use]
-	pub fn is_bare_servlet_type(&self, urn: &Urn<'_>) -> bool {
-		matches!(self.validate(urn), Ok(ColonyResource::Servlet { instance: None, .. }))
+	pub fn as_bytes(&self) -> &[u8] {
+		&self.0
+	}
+
+	/// A key from bytes a registry fixture already holds.
+	///
+	/// Production mints every key through
+	/// [`ColonyNamespace::servlet_type_key`], which is what proves the URN
+	/// is a bare servlet type in this colony. Registry fixtures exercise
+	/// the map rather than the parse, so they name their rows directly.
+	#[cfg(test)]
+	pub(crate) fn from_route_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+		Self(bytes.into())
+	}
+}
+
+impl AsRef<[u8]> for ServletTypeKey {
+	fn as_ref(&self) -> &[u8] {
+		self.as_bytes()
+	}
+}
+
+impl ColonyNamespace {
+	/// The route key for `urn`, when it is a bare servlet type here.
+	///
+	/// [`None`] for an instance locator, a foreign authority, or another
+	/// realm, none of which name a routable servlet type.
+	#[must_use]
+	pub fn servlet_type_key(&self, urn: &Urn<'_>) -> Option<ServletTypeKey> {
+		match self.validate(urn) {
+			Ok(ColonyResource::Servlet { instance: None, .. }) => Some(ServletTypeKey(urn.canonical_bytes())),
+			_ => None,
+		}
+	}
+
+	/// Whether `urn` is a bare servlet type in this namespace (no tail).
+	///
+	/// [`ColonyNamespace::servlet_type_key`] answers the same question and
+	/// hands back the route key the answer is about, so it is what a
+	/// caller that goes on to use the value should ask.
+	#[must_use]
+	pub(crate) fn is_bare_servlet_type(&self, urn: &Urn<'_>) -> bool {
+		self.servlet_type_key(urn).is_some()
 	}
 }
 
@@ -343,6 +392,42 @@ mod tests {
 	fn servlet(namespace: &ColonyNamespace, name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
 		let name = name.as_ref();
 		namespace.servlet(name).expect("test names satisfy the mint grammar")
+	}
+
+	// Route selection keys on the minted value, so an instance locator or a
+	// foreign realm never yields one.
+	/// An instance locator in this namespace, which names a servlet but is
+	/// not a bare type.
+	fn instance_of(bare: &Urn<'static>) -> Urn<'static> {
+		bare.servlet_instance("10.0.0.5:9100")
+			.expect("a servlet type URN yields an instance URN")
+	}
+
+	/// The same servlet name in another realm.
+	fn foreign_servlet() -> Urn<'static> {
+		let other = ColonyNamespace::new("tightbeam", "staging-eu").expect("the fixture realm is valid");
+		servlet(&other, "beam")
+	}
+
+	#[test]
+	fn a_bare_servlet_type_yields_its_route_key() {
+		let prod = prod();
+		let bare = servlet(&prod, "beam");
+		let key = prod.servlet_type_key(&bare);
+		assert_eq!(key.map(|key| key.as_bytes().to_vec()), Some(bare.canonical_bytes()));
+	}
+
+	#[test]
+	fn an_instance_locator_yields_no_route_key() {
+		let prod = prod();
+		let instance = instance_of(&servlet(&prod, "beam"));
+		assert!(prod.servlet_type_key(&instance).is_none());
+	}
+
+	#[test]
+	fn a_foreign_realm_yields_no_route_key() {
+		let prod = prod();
+		assert!(prod.servlet_type_key(&foreign_servlet()).is_none());
 	}
 
 	fn hive(namespace: &ColonyNamespace, addr: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {

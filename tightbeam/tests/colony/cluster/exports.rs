@@ -146,6 +146,7 @@ fn advertising_exporter_conf(
 	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(split_plane_tls(own, peer))
 		.with_peers([peer_addr])
+		.expect("fixture peers name sockets")
 		.with_advertise_interval(Duration::from_millis(100))
 		.with_rumor_refresh(Duration::from_millis(200))
 		.with_exported_types(exported)
@@ -212,12 +213,16 @@ async fn start_split_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
-	let exported = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_tls_config(&certs)?)).await?;
-	let hidden = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_tls_config(&certs)?)).await?;
+	let exported = ClusterTestServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+	let hidden = ClusterTestServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
-	hive.register(servlet_urn("ping"), exported, |t| ClusterTestServlet::start(t, None))?;
-	hive.register(servlet_urn("ledger"), hidden, |t| ClusterTestServlet::start(t, None))?;
+	hive.register(servlet_urn("ping"), exported, |t| {
+		ClusterTestServlet::start(t, ServletConfig::default())
+	})?;
+	hive.register(servlet_urn("ledger"), hidden, |t| {
+		ClusterTestServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
@@ -230,12 +235,16 @@ async fn start_split_stream_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
-	let exported = StreamEchoServlet::start(Arc::new(trace.share()), Some(servlet_tls_config(&certs)?)).await?;
-	let hidden = StreamEchoServlet::start(Arc::new(trace.share()), Some(servlet_tls_config(&certs)?)).await?;
+	let exported = StreamEchoServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+	let hidden = StreamEchoServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
-	hive.register(servlet_urn("stream-echo"), exported, |t| StreamEchoServlet::start(t, None))?;
-	hive.register(servlet_urn("vault"), hidden, |t| StreamEchoServlet::start(t, None))?;
+	hive.register(servlet_urn("stream-echo"), exported, |t| {
+		StreamEchoServlet::start(t, ServletConfig::default())
+	})?;
+	hive.register(servlet_urn("vault"), hidden, |t| {
+		StreamEchoServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }

@@ -93,7 +93,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: |request, frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &CalcServletConfig = ctx.env_config()?;
+		let config: &CalcServletConfig = ctx.env_config();
 
 		trace.event(SERVLET_RECEIVE)?;
 
@@ -162,7 +162,7 @@ tb_scenario! {
 				.with_worker(squarer)
 				.build();
 
-			CalcServlet::start(trace, Some(servlet_conf)).await
+			CalcServlet::start(trace, servlet_conf).await
 		},
 		setup: |ClientEnv { addr, .. }| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
@@ -270,7 +270,7 @@ tb_scenario! {
 				.with_message_inflator(ZstdCompression::default())
 				.build();
 
-			SecureCalcServlet::start(trace, Some(servlet_conf)).await
+			SecureCalcServlet::start(trace, servlet_conf).await
 		},
 		setup: |ClientEnv { addr, .. }| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();

@@ -21,6 +21,9 @@ tightbeam is a Layer-5 messaging framework. Frames use Abstract Syntax Notation 
 
 > Zero-Copy, Zero-Panic, no_std-Ready
 
+Upgrading from 0.13? [docs/upgrading-0.14.md](docs/upgrading-0.14.md) lists
+every breaking change and what to write instead.
+
 ## Table of Contents
 
 1. [Introduction](#1-introduction)
@@ -2580,7 +2583,7 @@ tightbeam::servlet! {
 	handle: |frame, ctx| async move {
 		// Access context members
 		let trace = ctx.trace();
-		let config: &PingPongServletConfig = ctx.env_config()?;
+		let config: &PingPongServletConfig = ctx.env_config();
 		trace.event_with(REQUEST_RECEIVED, &[], config.service_name.clone())?;
 
 		// Handler receives Frame, not decoded message
@@ -2631,7 +2634,7 @@ let servlet_conf = ServletConfig::<TokioListener, RequestMessage>::builder()
 	.build();
 
 // Start the servlet (workers are auto-started with servlet's trace)
-PingPongServletWithWorker::start(trace, Some(servlet_conf)).await?
+PingPongServletWithWorker::start(trace, servlet_conf).await?
 ```
 
 **Macro-free path**
@@ -2640,7 +2643,7 @@ PingPongServletWithWorker::start(trace, Some(servlet_conf)).await?
 
 1. Build handlers with `ServletHandlers` (typed unary via `on_typed_unary` or `dispatch_typed_unary`).
 2. Call `ServletRuntime::start(trace, servlet_conf, handlers)`.
-3. For APIs bounded on `Servlet<I>`, pass `RuntimeServletConf { config, service }` into `Servlet::start`.
+3. For APIs bounded on `Servlet<I, Env>`, pass `RuntimeServletConf { config, service }` into `Servlet::start`. Both halves carry the same `Env`, so the handlers and the config cannot disagree about what the context holds.
 
 Omitting `with_config` defaults the servlet env to `()`.
 
@@ -2718,7 +2721,7 @@ tb_scenario! {
 				.with_worker(worker)
 				.build();
 
-			CalcServlet::start(Arc::new(env.trace), Some(servlet_conf)).await
+			CalcServlet::start(Arc::new(env.trace), servlet_conf).await
 		},
 		setup: |env| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
@@ -2795,8 +2798,8 @@ A typical hive lifecycle with cluster integration:
 let mut hive = MyHive::new(Some(HiveConfig::default()))?;
 
 // 2. Register servlet types with spawners for auto-scale
-hive.register(ping_urn(), ping_servlet, |t| PingServlet::start(t, None))?;
-hive.register(calc_urn(), calc_servlet, |t| CalculatorServlet::start(t, None))?;
+hive.register(ping_urn(), ping_servlet, |t| PingServlet::start(t, ServletConfig::default()))?;
+hive.register(calc_urn(), calc_servlet, |t| CalculatorServlet::start(t, ServletConfig::default()))?;
 
 // 3. Establish: bind control plane and spawn registered servlets
 hive.establish(trace).await?;
@@ -2877,6 +2880,13 @@ pub struct HiveScalingConfig {
 	pub overrides: HashMap<Urn<'static>, ServletScaleConfig>,
 	pub cooldown: Duration, // Default: 5s
 }
+
+// A ServletScaleConfig comes from its checking constructor or its default,
+// never a struct literal: the bounds and the thresholds are pairs, and a
+// pair that cannot be acted on is refused where it is written.
+ServletScaleConfig::new(min, max, scale_up, scale_down)?  // -> ScaleConfigRefusal
+ServletScaleConfig::DEFAULT                               // 1..=10, up 80%, down 20%
+	.with_cooldowns(ScaleCooldowns { after_scale_up, after_scale_down })
 
 pub struct HiveControlConfig {
 	pub backpressure_threshold: BasisPoints,         // Default: 9000 (90%)
@@ -3041,10 +3051,10 @@ Configure outbound advertisement with a dial list and beat cadence:
 
 ```rust
 let conf = ClusterConfig::builder(tls)
-	.with_peers([peer_addr.to_string()])
+	.with_peers([peer_addr.to_string()])?
 	.with_advertise_interval(Duration::from_secs(5))
 	// Optional: only accept peer ads that claim dial addresses in this list
-	.with_peer_dial_allowlist([peer_addr.to_string()])
+	.with_peer_dial_allowlist([peer_addr.to_string()])?
 	.build();
 ```
 
@@ -3061,7 +3071,7 @@ Behavior:
 
 Member gateways also flood their slate as an advertisement rumor, so peers of peers learn exported types transitively. A relayed rumor installs two soft-state trails. The direct trail dials the origin's claimed address. The relay trail dials the delivering peer and reconciles under its own composite bucket.
 
-The relay trail competes for selection only when the remaining hop budget covers the extra hop (`max_hops >= 2`). A dead direct address then fails over to it by pheromone weakening. The rumor refloods on change, or every `PeerConfig::rumor_refresh` while unchanged.
+The relay trail competes for selection only when the remaining hop budget covers the extra hop (`max_hops >= 2`). A dead direct address then fails over to it by pheromone weakening. The rumor refloods on change, or every `ClusterConfig::rumor_refresh()` while unchanged, which is the configured interval clamped to the gossip freshness window.
 
 ##### Servlet Export Boundary
 
@@ -3082,7 +3092,7 @@ The enforcement pipeline layers these checks in order:
 
 ```rust
 let conf = ClusterConfig::builder(tls)
-	.with_peers([peer_addr.to_string()])
+	.with_peers([peer_addr.to_string()])?
 	.with_advertise_interval(Duration::from_secs(5))
 	// Advertise and export only these types to external peers
 	.with_exported_types([namespace.servlet("ping")?])
@@ -3218,7 +3228,7 @@ Colony gossip floods origin-signed rumors across member gateways: the pheromone 
 
 ```rust
 let conf = ClusterConfig::builder(tls)
-	.with_peers([peer_addr.to_string()])
+	.with_peers([peer_addr.to_string()])?
 	.with_advertise_interval(Duration::from_secs(5))
 	.with_gossip_ingress(servlet_type_urn) // optional local delivery target
 	.with_gossip_config(GossipConfig {
@@ -3287,24 +3297,51 @@ Stream chunks are not individually framed or signed. Their integrity rests on tr
 
 ##### ClusterConfig Reference
 
+Four of this type's fields are private, because each one is derived from
+another or parsed on the way in. Set them through `ClusterConfigBuilder`
+and read them through the accessors below.
+
 ```rust
 pub struct PeerConfig {
-	/// Peer dial list for advertise/gossip reflood (empty = no outbound federation)
-	pub peers: Vec<String>,
 	/// Re-advertise beat cadence (`None` disables the beat)
 	pub advertise_interval: Option<Duration>,
-	/// Optional exact-match allowlist for claimed peer dial addresses
-	pub peer_dial_allowlist: Option<Vec<String>>,
 	/// Hop budget honored on inbound work and routed stream opens
 	/// (default 1; `0` disables forwarding; `2` enables relay fallback)
 	pub max_hops: u8,
-	/// Advertisement rumor reflood interval while the slate is unchanged
-	/// (keep it under the gossip freshness window)
-	pub rumor_refresh: Duration,
 	/// Servlet types disclosed to and reachable by external peers.
 	/// `None` exports every locally served type. `Some` drives both the
 	/// advertise filter and the fail-closed allowlist.
-	pub exported_types: Option<Vec<Urn<'static>>>,
+	pub exported_types: Option<Arc<dyn ExportAllowlist>>,
+	// peers, table, peer_dial_allowlist and rumor_refresh are private.
+}
+
+impl PeerConfig {
+	/// Peer dial list for advertise/gossip reflood, as parsed sockets.
+	/// These are the discovery table's un-evictable anchors.
+	/// Set with `ClusterConfigBuilder::with_peers`, which refuses an entry
+	/// that names no socket.
+	pub fn peers(&self) -> &[PeerAddress];
+
+	/// Discovery table: the anchors above plus bounded learned peers.
+	/// Derived from `peers` at build.
+	pub fn table(&self) -> &Arc<PeerTable>;
+
+	/// Allowlist for claimed peer dial addresses, compared as parsed
+	/// sockets rather than as strings, so one address spelled two ways is
+	/// one entry. Set with
+	/// `ClusterConfigBuilder::with_peer_dial_allowlist`.
+	pub fn peer_dial_allowlist(&self) -> Option<&Arc<HashSet<PeerAddress>>>;
+
+	/// Whether this plane may dial `address`. An unrestricted plane admits
+	/// any address that parsed.
+	pub fn dial_allowed(&self, address: &PeerAddress) -> bool;
+}
+
+impl ClusterConfig {
+	/// Advertisement rumor reflood interval while the slate is unchanged.
+	/// The configured value, clamped to the gossip freshness window on
+	/// every read, because that window narrows again at startup.
+	pub fn rumor_refresh(&self) -> Duration;
 }
 
 pub struct ClusterConfig {
@@ -3342,7 +3379,8 @@ pub struct ClusterConfig {
 	pub gossip: GossipConfig,
 }
 
-// Colony URN is derived from the gateway cert URI SAN at build time.
+// Colony URN is derived from the gateway cert URI SAN, and bound again
+// when the gateway takes the config. It is read, never set.
 // Read it with ClusterConfig::colony_urn(); it is not a settable field.
 ```
 
@@ -3383,10 +3421,10 @@ tb_scenario! {
 		// Optional: awaited and registered with the cluster.
 		// Omit when driving registration from the client.
 		hives: |SetupEnv { context: certs, .. }| vec![async move {
-			let servlet = PingServlet::start(Arc::new(TraceCollector::new()), None).await?;
+			let servlet = PingServlet::start(Arc::new(TraceCollector::new()), ServletConfig::default()).await?;
 			// hive_tls_config sets pool.mux_offer for multiplexed hive <-> servlet
 			let mut hive = TestHive::new(Some(hive_tls_config(&certs)))?;
-			hive.register(ping_type(), servlet, |t| PingServlet::start(t, None))?;
+			hive.register(ping_type(), servlet, |t| PingServlet::start(t, ServletConfig::default()))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 			Ok(hive)
 		}],
@@ -5136,9 +5174,10 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// AFL provides random bytes, oracle navigates state machine
-			match trace.oracle().fuzz_from_bytes() {
+			let oracle = trace.oracle();
+			match oracle.fuzz_from_bytes() {
 				Ok(()) => {
-					for event in trace.oracle().trace() {
+					for event in oracle.trace() {
 						trace.event(event.0)?;
 					}
 					Ok(())
@@ -5213,9 +5252,10 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// AFL provides bytes, oracle interprets as state machine choices
-			match trace.oracle().fuzz_from_bytes() {
+			let oracle = trace.oracle();
+			match oracle.fuzz_from_bytes() {
 				Ok(()) => {
-					for event in trace.oracle().trace() {
+					for event in oracle.trace() {
 						trace.event(event.0)?;
 					}
 					Ok(())
@@ -5679,7 +5719,7 @@ tb_scenario! {
 		.build(),
 	environment Servlet {
 		start: |env| async move {
-			PingPongServletWithWorker::start(Arc::new(env.trace), None).await
+			PingPongServletWithWorker::start(Arc::new(env.trace), ServletConfig::default()).await
 		},
 		client: |env| async move {
 			let (trace, mut client) = (env.trace, env.client);

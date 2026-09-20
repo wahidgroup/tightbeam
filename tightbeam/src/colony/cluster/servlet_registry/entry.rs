@@ -84,15 +84,54 @@ struct PeerIdentity {
 	route_kind: RouteKind,
 }
 
+/// The three identities a local route names.
+///
+/// Named rather than positional: all three are [`SharedId`], so a caller
+/// transposing any pair would install a route that dials the wrong place
+/// and nothing would refuse it.
+#[derive(Debug, Clone)]
+pub struct LocalRoute {
+	/// Address the servlet instance is reached at.
+	pub address: SharedId,
+	/// Bare servlet type this route answers.
+	pub servlet_type: SharedId,
+	/// Hive that owns the instance.
+	pub hive_id: SharedId,
+}
+
+/// The three identities a peer route names.
+///
+/// Named for the same reason as [`LocalRoute`].
+#[derive(Debug, Clone)]
+pub struct PeerRoute {
+	/// Peer gateway that advertised the type.
+	pub peer_id: SharedId,
+	/// Bare servlet type this route answers.
+	pub servlet_type: SharedId,
+	/// Gateway socket every entry in the slate dials.
+	pub dial_addr: SharedId,
+}
+
+/// The four identities a relay trail names.
+///
+/// Named for the same reason as [`LocalRoute`].
+#[derive(Debug, Clone)]
+pub struct RelayRoute {
+	/// Peer whose type this trail reaches.
+	pub origin_id: SharedId,
+	/// Peer the traffic is forwarded through.
+	pub relay_id: SharedId,
+	/// Bare servlet type this route answers.
+	pub servlet_type: SharedId,
+	/// Gateway socket the relay is dialed at.
+	pub dial_addr: SharedId,
+}
+
 impl ServletEntry {
 	/// Creates a local servlet reachable at `address`, owned by `hive_id`.
-	pub fn local(
-		address: SharedId,
-		servlet_type: SharedId,
-		hive_id: SharedId,
-		initial_pheromone: u64,
-		abandonment_limit: u32,
-	) -> Self {
+	pub fn local(route: LocalRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
+		let LocalRoute { address, servlet_type, hive_id } = route;
+
 		Self {
 			route_key: Arc::clone(&address),
 			servlet_type,
@@ -110,13 +149,8 @@ impl ServletEntry {
 	}
 
 	/// Creates a peer route whose key is `peer_id NUL servlet_type`.
-	pub fn peer(
-		peer_id: SharedId,
-		servlet_type: SharedId,
-		dial_addr: SharedId,
-		initial_pheromone: u64,
-		abandonment_limit: u32,
-	) -> Self {
+	pub fn peer(route: PeerRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
+		let PeerRoute { peer_id, servlet_type, dial_addr } = route;
 		let identity = PeerIdentity {
 			bucket: Arc::clone(&peer_id),
 			owner_id: peer_id,
@@ -139,14 +173,8 @@ impl ServletEntry {
 	/// Forwarding through this trail spends a hop at the relay, so
 	/// selection requires a budget that lets the relay forward once
 	/// more.
-	pub fn peer_relay(
-		origin_id: SharedId,
-		relay_id: SharedId,
-		servlet_type: SharedId,
-		dial_addr: SharedId,
-		initial_pheromone: u64,
-		abandonment_limit: u32,
-	) -> Self {
+	pub fn peer_relay(route: RelayRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
+		let RelayRoute { origin_id, relay_id, servlet_type, dial_addr } = route;
 		let identity = PeerIdentity {
 			bucket: Self::relay_bucket(&origin_id, &relay_id),
 			owner_id: origin_id,
@@ -201,17 +229,6 @@ impl ServletEntry {
 			abandonment_limit,
 			installed_at: Instant::now(),
 		}
-	}
-
-	/// Creates a local entry. This is an alias of [`Self::local`].
-	pub fn new(
-		address: SharedId,
-		servlet_type: SharedId,
-		hive_id: SharedId,
-		initial_pheromone: u64,
-		abandonment_limit: u32,
-	) -> Self {
-		Self::local(address, servlet_type, hive_id, initial_pheromone, abandonment_limit)
 	}
 
 	/// Registry map key and pheromone trail identity.

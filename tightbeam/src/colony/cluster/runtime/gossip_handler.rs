@@ -59,14 +59,10 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 		// A verified advertiser is also a discovery hint: without it the
 		// beat graph stays unidirectional and a seed-bootstrapped node is
-		// dialed on this gateway's own probe. The hint sits in the capped new table until
-		// this gateway's own probe passes the colony gate.
-		//
-		// Learning precedes slate reconciliation because the hint depends
-		// only on the admitted identity and dial address, not on routing
-		// state, so graph connectivity survives a slate refusal below.
+		// dialed on this gateway's own probe. The hint sits in the capped
+		// new table until this gateway's own probe passes the colony gate.
 		let hint = admitted.discovery_hint();
-		let _ = self.config.peer.table.learn(hint);
+		let _ = self.config.peer.table.learn([hint]);
 
 		if let Err(error) = self.servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
 			let status = match error {
@@ -238,7 +234,7 @@ impl ClusterConfig {
 			.into_iter()
 			.map(|record| PeerGossip {
 				peer_id: record.peer_id.unwrap_or_default(),
-				gateway_addr: record.gateway_addr.into_bytes(),
+				gateway_addr: record.gateway_addr.to_string().into_bytes(),
 			});
 
 		// Registry entries are borrowed, so the wire message copies them once.

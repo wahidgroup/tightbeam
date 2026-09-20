@@ -3,6 +3,7 @@
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-fuzz"))]
 
+use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
@@ -75,10 +76,11 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| {
 			// Oracle-guided fuzzing through complex 6-state workflow
 			// IJON state tracking is automatic
-			trace.oracle().fuzz_from_bytes()?;
+			let oracle = trace.oracle();
+			oracle.fuzz_from_bytes()?;
 
 			// Make assertions based on execution trace
-			for event in trace.oracle().trace() {
+			for event in oracle.trace() {
 				trace.event(event)?;
 			}
 

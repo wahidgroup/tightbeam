@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tightbeam::colony::cluster::{
-	Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, ServletEntry, DEFAULT_ABANDONMENT_LIMIT,
-	DEFAULT_INITIAL_PHEROMONE,
+	Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, PeerRoute, ServletEntry,
+	DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 };
 use tightbeam::compose;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
@@ -14,6 +14,7 @@ use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::decode;
 use tightbeam::policy::TransitStatus;
+use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::routes::{relayed_to, RoutedOpens};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::client::pool::{ConnectionPool, PoolConfig};
@@ -59,14 +60,16 @@ pub(crate) async fn run_actions(trace: &TraceCollector, topo: &mut ColonyTopolog
 		if actions >= MAX_ACTIONS {
 			break;
 		}
-		if !trace.oracle().fuzz_has_bytes(2).unwrap_or(false) {
+
+		let oracle = trace.oracle();
+		if !oracle.fuzz_has_bytes(2).unwrap_or(false) {
 			break;
 		}
 
-		let Ok(opcode) = trace.oracle().fuzz_u8() else {
+		let Ok(opcode) = oracle.fuzz_u8() else {
 			break;
 		};
-		let Ok(selector) = trace.oracle().fuzz_u8() else {
+		let Ok(selector) = oracle.fuzz_u8() else {
 			break;
 		};
 
@@ -903,9 +906,11 @@ fn pin_decoy_for(
 		}
 
 		let entry = ServletEntry::peer(
-			route.peer_id,
-			route.servlet_type,
-			route.dial_addr,
+			PeerRoute {
+				peer_id: route.peer_id,
+				servlet_type: route.servlet_type,
+				dial_addr: route.dial_addr,
+			},
 			DEFAULT_INITIAL_PHEROMONE,
 			DEFAULT_ABANDONMENT_LIMIT,
 		);

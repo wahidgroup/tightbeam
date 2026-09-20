@@ -9,11 +9,12 @@
 macro_rules! __servlet_handlers {
 	(
 		@arms
+		$env_config:ty
 		$(, handle: |$frame:ident, $ctx:ident| $handler_body:block)?
 		$(, stream: |$sbody:ident, $sctx:ident| $stream_body:block)?
 		$(, duplex: |$dbody:ident, $dreply:ident, $dctx:ident| $duplex_body:block)?
 	) => {{
-		$crate::colony::servlet::ServletHandlers::default()
+		$crate::colony::servlet::ServletHandlers::<$env_config>::default()
 			$(.on_unary(move |$frame, __ctx| async move {
 				let $ctx = __ctx.as_ref();
 				$handler_body
@@ -61,9 +62,14 @@ macro_rules! __servlet_define {
 			#[allow(dead_code)]
 			$vis async fn start(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-				config: Option<$crate::colony::servlet::ServletConfig<$protocol, $input>>,
+				config: $crate::colony::servlet::ServletConfig<
+					$protocol,
+					$input,
+					$crate::crypto::profiles::DefaultCryptoProvider,
+					$env_config,
+				>,
 			) -> Result<Self, $crate::TightBeamError> {
-				<Self as $crate::colony::servlet::Servlet<$input>>::start(trace, config).await
+				<Self as $crate::colony::servlet::Servlet<$input, $env_config>>::start(trace, config).await
 			}
 
 			/// Stop convenience for by-value calls without the [`Servlet`] trait in scope.
@@ -81,26 +87,27 @@ macro_rules! __servlet_define {
 			}
 		}
 
-		impl $crate::colony::servlet::Servlet<$input> for $servlet_name {
-			type Conf = $crate::colony::servlet::ServletConfig<$protocol, $input>;
+		impl $crate::colony::servlet::Servlet<$input, $env_config> for $servlet_name {
+			type Conf = $crate::colony::servlet::ServletConfig<
+				$protocol,
+				$input,
+				$crate::crypto::profiles::DefaultCryptoProvider,
+				$env_config,
+			>;
 			type Address = <$protocol as $crate::transport::Protocol>::Address;
 
 			async fn start(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-				config: Option<Self::Conf>,
+				config: Self::Conf,
 			) -> Result<Self, $crate::TightBeamError> {
 				let service = $crate::__servlet_handlers!(
 					@arms
+					$env_config
 					$(, handle: |$frame, $ctx| $handler_body)?
 					$(, stream: |$sbody, $sctx| $stream_body)?
 					$(, duplex: |$dbody, $dreply, $dctx| $duplex_body)?
 				);
-				let runtime = $crate::colony::servlet::ServletRuntime::<$protocol>::start(
-					trace,
-					config.unwrap_or_default(),
-					service,
-				)
-				.await?;
+				let runtime = $crate::colony::servlet::ServletRuntime::<$protocol>::start(trace, config, service).await?;
 				Ok(Self {
 					runtime,
 					_phantom: ::core::marker::PhantomData,
@@ -131,7 +138,7 @@ macro_rules! __servlet_define {
 
 			fn utilization(&self) -> Option<$crate::utils::BasisPoints> {
 				use $crate::colony::servlet::Servlet;
-				<Self as Servlet<_>>::utilization(self)
+				<Self as Servlet<_, _>>::utilization(self)
 			}
 		}
 	};
