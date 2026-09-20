@@ -116,9 +116,8 @@ impl HopBudget {
 
 /// Peer advertisement that passed signer resolution and wire checks.
 ///
-/// [`AdmittedPeerAd::admit`] is the only path: the registry never
-/// receives an unvalidated slate, and signer identity cannot be
-/// transposed with the claimed dial address.
+/// The registry receives this type only after those checks, so signer
+/// identity cannot be transposed with the claimed dial address.
 pub struct AdmittedPeerAd {
 	/// Signer cert fingerprint (claimed address when x509 is off)
 	pub(super) peer_hive_id: SharedId,
