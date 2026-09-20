@@ -496,7 +496,7 @@ impl TestCmsClientBuilder {
 			None => create_test_certificate_from_key(&create_test_certificate().signing_key)?,
 		};
 
-		let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		let trust_store = CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(server_cert.to_owned())?
 			.build();
 

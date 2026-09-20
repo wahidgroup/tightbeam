@@ -606,7 +606,7 @@ fn dual_hive_certs() -> DualHiveCerts {
 	let key_a = Secp256k1SigningKey::from(raw_a);
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(cert_a.to_owned())
 			.expect("hive A trust")
 			.with_certificate(cert_b.to_owned())

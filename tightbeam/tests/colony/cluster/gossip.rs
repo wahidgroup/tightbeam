@@ -546,7 +546,7 @@ fn gossip_plane_ctx() -> GossipPlaneCtx {
 	let peer_cert = TestCertificate::self_signed(&raw);
 	let peer_key = Secp256k1SigningKey::from(raw);
 	let peer_trust: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(peer_cert)
 			.expect("peer trust")
 			.build(),

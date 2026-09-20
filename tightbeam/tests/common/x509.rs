@@ -9,7 +9,6 @@
 use core::time::Duration;
 use std::sync::Arc;
 
-use sha3::Sha3_256;
 use tightbeam::{
 	cert,
 	crypto::{
@@ -85,7 +84,7 @@ impl GatewayCerts {
 		let subject = subject.as_ref();
 		let (cert, key) = create_test_cert_with_key(subject, 365).expect("Failed to create gateway cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			CertificateTrustBuilder::from(Secp256k1Policy)
 				.with_chain(vec![cert.to_owned()])
 				.expect("Failed to build trust")
 				.build(),
@@ -109,8 +108,8 @@ impl GatewayCerts {
 }
 
 /// Trust builder anchoring several independent identities at once.
-fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder<Sha3_256> {
-	let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
+fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
+	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy);
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())

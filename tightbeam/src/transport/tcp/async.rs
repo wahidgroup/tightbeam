@@ -1083,7 +1083,6 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
-	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey, SigningKey};
@@ -1307,15 +1306,13 @@ mod tests {
 
 	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	fn trust_store_for(cert: Certificate) -> TransportResult<Arc<dyn CertificateTrust>> {
-		let trust = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-			.with_certificate(cert)?
-			.build();
+		let trust = CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(cert)?.build();
 		Ok(Arc::new(trust))
 	}
 
 	#[cfg(all(feature = "x509", feature = "transport-cms"))]
 	fn empty_trust_store() -> Arc<dyn CertificateTrust> {
-		let trust = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy).build();
+		let trust = CertificateTrustBuilder::from(Secp256k1Policy).build();
 		Arc::new(trust)
 	}
 

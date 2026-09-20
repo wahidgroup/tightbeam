@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tightbeam::{
 	crypto::profiles::DefaultCryptoProvider,
 	crypto::{
-		hash::Sha3_256,
 		key::{Secp256k1KeyProvider, SigningKeyProvider},
 		policy::Secp256k1Policy,
 		profiles::{SecurityProfileDesc, TightbeamProfile},
@@ -115,7 +114,7 @@ pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValida
 
 /// Trust store pinning the given server certificate (for CMS clients).
 pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
-	let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+	let store = CertificateTrustBuilder::from(Secp256k1Policy)
 		.with_certificate(certificate.to_owned())?
 		.build();
 	Ok(Arc::new(store))

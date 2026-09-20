@@ -64,7 +64,7 @@ where
 	) -> Result<Self, HandshakeError> {
 		// Generate SKID from public key
 		let verifying_key = signer.verifying_key();
-		let signer_id = compute_signer_identifier::<P::Digest, _>(&verifying_key)?;
+		let signer_id = compute_signer_identifier(&verifying_key)?;
 
 		Ok(Self {
 			signer,

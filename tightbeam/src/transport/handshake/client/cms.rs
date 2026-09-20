@@ -392,7 +392,7 @@ where
 
 	/// Compute the signer identifier from the server's verifying key.
 	fn compute_signer_identifier(&self, verifying_key: &P::VerifyingKey) -> Result<SignerIdentifier, HandshakeError> {
-		Ok(compute_signer_identifier::<P::Digest, _>(verifying_key)?)
+		Ok(compute_signer_identifier(verifying_key)?)
 	}
 
 	/// Compute transcript hash from the accumulated buffer.
@@ -921,7 +921,7 @@ where
 	/// Build cryptographic components needed for SignedData.
 	async fn build_finished_crypto_components(&self) -> Result<FinishedSigner, HandshakeError> {
 		let public_key_bytes = self.signing_provider().to_public_key_bytes().await?;
-		let id = compute_signer_identifier_from_der::<P::Digest>(&public_key_bytes)?;
+		let id = compute_signer_identifier_from_der(&public_key_bytes)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 
@@ -1121,7 +1121,6 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::{extract_security_accept_attr, CmsHandshakeClient, SignedData};
-	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::secret::ToInsecure;
@@ -1201,7 +1200,7 @@ mod tests {
 	const TEST_SESSION_KEY: [u8; 32] = [2u8; 32];
 
 	fn trust_store(root: Option<Certificate>) -> Result<Arc<dyn CertificateTrust>, Box<dyn Error>> {
-		let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
+		let mut builder = CertificateTrustBuilder::from(Secp256k1Policy);
 		if let Some(root) = root {
 			builder = builder.with_certificate(root)?;
 		}

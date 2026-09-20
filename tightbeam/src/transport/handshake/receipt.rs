@@ -315,7 +315,7 @@ where
 	let prehash = signed_attrs_prehash::<D>(&signed_attrs)?;
 	let signature_bytes = key_provider.sign_prehash(&prehash).await?;
 	let public_key_der = key_provider.to_public_key_bytes().await?;
-	let sid = compute_signer_identifier_from_der::<D>(&public_key_der)?;
+	let sid = compute_signer_identifier_from_der(&public_key_der)?;
 
 	// SubjectKeyIdentifier identification demands SignerInfo version 3
 	// (RFC 5652 §5.3).
@@ -563,7 +563,7 @@ impl StoredReceipt {
 			.artifact
 			.signer_for_role(server_role)?
 			.ok_or(HandshakeError::ReceiptMissing)?;
-		let server_sid = compute_signer_identifier::<D, V>(server_key)?;
+		let server_sid = compute_signer_identifier(server_key)?;
 		verify_receipt_signer::<D, S, V>(&receipt_der, server_signer, server_role, &server_sid, server_key)?;
 
 		let client_role = ReceiptRole::Client;
@@ -571,7 +571,7 @@ impl StoredReceipt {
 			.artifact
 			.signer_for_role(client_role)?
 			.ok_or(HandshakeError::CountersignatureMissing)?;
-		let client_sid = compute_signer_identifier::<D, V>(client_key)?;
+		let client_sid = compute_signer_identifier(client_key)?;
 		verify_receipt_signer::<D, S, V>(&receipt_der, client_signer, client_role, &client_sid, client_key)?;
 
 		Ok(())
@@ -1040,7 +1040,7 @@ pub(crate) trait ReceiptSigner {
 impl ReceiptSigner for Certificate {
 	fn signer_identifier<D: Digest>(&self) -> Result<SignerIdentifier, HandshakeError> {
 		let spki_der = self.tbs_certificate.subject_public_key_info.to_der()?;
-		let sid = compute_signer_identifier_from_der::<D>(&spki_der)?;
+		let sid = compute_signer_identifier_from_der(&spki_der)?;
 		Ok(sid)
 	}
 }
@@ -1247,7 +1247,7 @@ mod tests {
 			let server_role = ReceiptRole::Server;
 			let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
 			let receipt_der = receipt.to_der()?;
-			let sid = compute_signer_identifier::<Sha3_256, _>(&server_key)?;
+			let sid = compute_signer_identifier(&server_key)?;
 			let client_role = ReceiptRole::Client;
 
 			let spliced = verify_receipt_signer::<Sha3_256, Secp256k1Signature, _>(
@@ -1327,7 +1327,7 @@ mod tests {
 			forged[0] ^= 0x01;
 			ack.signature = OctetString::new(forged)?;
 
-			let sid = compute_signer_identifier::<Sha3_256, _>(&client_key)?;
+			let sid = compute_signer_identifier(&client_key)?;
 			let (verdict, answer) = receipt
 				.settle_ack::<Sha3_256, Secp256k1Signature, _>(Some(&ack), &sid, &client_key, None)
 				.await?;

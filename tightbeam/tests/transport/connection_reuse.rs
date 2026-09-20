@@ -36,7 +36,6 @@ use tightbeam::{
 #[cfg(feature = "x509")]
 use tightbeam::{
 	crypto::{
-		hash::Sha3_256,
 		key::SigningKeySpec,
 		policy::Secp256k1Policy,
 		sign::ecdsa::Secp256k1,
@@ -113,7 +112,7 @@ const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KE
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(server_cert)?
 			.build(),
 	))

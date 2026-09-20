@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use sha3::Sha3_256;
 use tightbeam::colony::cluster::ClusterTlsConfig;
 use tightbeam::colony::common::ColonyNamespace;
 use tightbeam::colony::hive::{HiveConfig, HiveTlsConfig};
@@ -103,8 +102,8 @@ pub(crate) fn colony_identity(
 	(cert, Secp256k1SigningKey::from(raw))
 }
 
-fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder<Sha3_256> {
-	let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
+fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
+	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy);
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())

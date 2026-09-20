@@ -186,8 +186,7 @@ impl Signatory<ecdsa::Signature<ecdsa::Secp256k1>> for ecdsa::SigningKey<ecdsa::
 
 	fn signer_identifier(&self) -> Result<SignerIdentifier> {
 		let verifying_key = self.verifying_key();
-		let sid = compute_signer_identifier::<Self::DigestAlgorithm, _>(verifying_key)
-			.map_err(|_| TightBeamError::SignatureEncodingError)?;
+		let sid = compute_signer_identifier(verifying_key).map_err(|_| TightBeamError::SignatureEncodingError)?;
 
 		Ok(sid)
 	}
@@ -235,7 +234,7 @@ impl<'a, S> From<&'a S> for Sha3Signer<'a, S> {
 /// Compute the SubjectKeyIdentifier-based SignerIdentifier for a Secp256k1 verifying key.
 #[cfg(feature = "secp256k1")]
 pub fn secp256k1_signer_identifier(verifying_key: &ecdsa::VerifyingKey<ecdsa::Secp256k1>) -> Result<SignerIdentifier> {
-	compute_signer_identifier::<sha3::Sha3_256, _>(verifying_key).map_err(|_| TightBeamError::SignatureEncodingError)
+	compute_signer_identifier(verifying_key).map_err(|_| TightBeamError::SignatureEncodingError)
 }
 
 /// Trait for verifying signatures in SignedData structures.

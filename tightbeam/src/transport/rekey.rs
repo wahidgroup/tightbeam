@@ -657,7 +657,7 @@ mod tests {
 	fn test_identity() -> Result<Identity, HandshakeError> {
 		let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 		let verifying_key = *signing_key.verifying_key();
-		let sid = compute_signer_identifier::<Sha3_256, _>(&verifying_key)?;
+		let sid = compute_signer_identifier(&verifying_key)?;
 		let provider: Secp256k1Provider = InMemorySigningKeyProvider::from(signing_key);
 		Ok(Identity { provider: Arc::new(provider), verifying_key, sid })
 	}

@@ -386,7 +386,7 @@ mod tests {
 	}
 
 	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(cert.clone())
 			.expect("test certificates satisfy the trust builder")
 			.build();

@@ -524,7 +524,6 @@ pub(crate) fn export_verdict(
 mod tests {
 	use super::*;
 	use crate::colony::common::ColonyNamespace;
-	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
 	use crate::testing::{TestCertificate, TestKey};
@@ -549,7 +548,7 @@ mod tests {
 	}
 
 	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(cert.clone())
 			.expect("test certificates satisfy the trust builder")
 			.build();

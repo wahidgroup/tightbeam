@@ -18,7 +18,6 @@ use tokio::task::JoinHandle;
 #[cfg(feature = "transport-multiplex")]
 use tokio::time::{sleep, timeout};
 
-use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
@@ -284,7 +283,7 @@ pub async fn connect_pinned_client(
 	server_certificate: &Certificate,
 ) -> Result<TcpTransport<TokioStream>, TightBeamError> {
 	let trust_store: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(server_certificate.to_owned())?
 			.build(),
 	);

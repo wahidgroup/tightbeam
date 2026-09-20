@@ -6,7 +6,7 @@ use core::marker::PhantomData;
 use core::time::Duration;
 
 use crate::cms::signed_data::SignerIdentifier;
-use crate::crypto::hash::{Digest, U32};
+use crate::crypto::hash::{Digest, Sha3_256, U32};
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
 use crate::crypto::x509::Certificate;
@@ -79,28 +79,33 @@ where
 	}
 }
 
+/// The digest a tightbeam SubjectKeyIdentifier is taken from.
+///
+/// RFC 5280 leaves the derivation to the issuer, so the protocol fixes one:
+/// every SKID this crate computes, indexes, or resolves is
+/// `SHA3-256(SPKI)[..20]`. A signer and a trust store that chose their own
+/// digests would never resolve each other.
+pub type SkidDigest = Sha3_256;
+
 /// The 20-byte SubjectKeyIdentifier truncation of a digest (RFC 5280).
 ///
-/// [`Skid::from_digest`] takes the first 20 bytes of a digest.
+/// [`Skid::of_public_key`] takes the window from a public key's digest.
 /// [`Skid::parse`] reads an exact 20-byte window already on the wire.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Skid([u8; 20]);
 
 impl Skid {
-	/// Take the SKID window from digest output.
+	/// The SubjectKeyIdentifier of a DER-encoded public key.
 	///
-	/// # Errors
-	///
-	/// - [`CertificateValidationError::DigestTooShort`] when `digest` is
-	///   shorter than 20 bytes.
-	pub fn from_digest(digest: impl AsRef<[u8]>) -> Result<Self, CertificateValidationError> {
-		let digest = digest.as_ref();
-		let window = digest.get(..20).ok_or(CertificateValidationError::DigestTooShort)?;
-
+	/// The digest is [`SkidDigest`], a protocol constant: a signer stamps
+	/// this value into the `SignerInfo` it puts on the wire, and a trust
+	/// store indexes by it, so neither side may choose its own digest.
+	pub fn of_public_key(public_key_der: impl AsRef<[u8]>) -> Self {
+		let digest: [u8; 32] = <SkidDigest as Digest>::digest(public_key_der.as_ref()).into();
 		let mut bytes = [0u8; 20];
-		bytes.copy_from_slice(window);
+		bytes.copy_from_slice(&digest[..20]);
 
-		Ok(Self(bytes))
+		Self(bytes)
 	}
 
 	/// Read a SKID that is already exactly 20 bytes.
@@ -291,32 +296,23 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 /// # Example
 /// ```ignore
 /// use sha3::Sha3_256;
-/// let signer_id = compute_signer_identifier::<Sha3_256, _>(&verifying_key)?;
+/// let signer_id = compute_signer_identifier(&verifying_key)?;
 /// ```
-pub fn compute_signer_identifier<D, V>(verifying_key: &V) -> Result<SignerIdentifier, CertificateValidationError>
+pub fn compute_signer_identifier<V>(verifying_key: &V) -> Result<SignerIdentifier, CertificateValidationError>
 where
-	D: Digest,
 	V: EncodePublicKey,
 {
 	let public_key_der = verifying_key.to_public_key_der()?;
-	compute_signer_identifier_from_der::<D>(public_key_der.as_bytes())
+	compute_signer_identifier_from_der(public_key_der.as_bytes())
 }
 
 /// Compute a SubjectKeyIdentifier-based SignerIdentifier from DER-encoded public key bytes.
 ///
 /// This is the byte-based variant for use with `KeyProvider::to_public_key_bytes()`.
-pub fn compute_signer_identifier_from_der<D>(
+pub fn compute_signer_identifier_from_der(
 	public_key_der: impl AsRef<[u8]>,
-) -> Result<SignerIdentifier, CertificateValidationError>
-where
-	D: Digest,
-{
-	let public_key_der = public_key_der.as_ref();
-	let mut hasher = D::new();
-	Digest::update(&mut hasher, public_key_der);
-
-	let digest_bytes = Digest::finalize(hasher);
-	let skid = Skid::from_digest(digest_bytes.as_slice())?;
+) -> Result<SignerIdentifier, CertificateValidationError> {
+	let skid = Skid::of_public_key(public_key_der);
 	let skid_octets = OctetString::new(skid.as_bytes().as_slice())?;
 	let skid = SubjectKeyIdentifier::from(skid_octets);
 	Ok(SignerIdentifier::SubjectKeyIdentifier(skid))
@@ -396,16 +392,6 @@ mod tests {
 			}
 			other => panic!("Expected Expired error, got: {other:?}"),
 		}
-	}
-
-	#[cfg(all(feature = "digest", feature = "sha3"))]
-	#[test]
-	fn signer_identifier_rejects_short_digest() {
-		use crate::crypto::x509::utils::compute_signer_identifier_from_der;
-		use crate::testing::fixtures::SixteenByteDigest;
-
-		let result = compute_signer_identifier_from_der::<SixteenByteDigest>(b"any-public-key-der");
-		assert!(matches!(result, Err(CertificateValidationError::DigestTooShort)));
 	}
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]

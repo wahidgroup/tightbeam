@@ -353,7 +353,7 @@ where
 		&self,
 		client_verifying_key: &P::VerifyingKey,
 	) -> Result<SignerIdentifier, HandshakeError> {
-		Ok(compute_signer_identifier::<P::Digest, _>(client_verifying_key)?)
+		Ok(compute_signer_identifier(client_verifying_key)?)
 	}
 
 	/// Verify the signature and content of the SignedData.
@@ -534,7 +534,7 @@ where
 		&self,
 	) -> Result<(SignerIdentifier, AlgorithmIdentifierOwned, AlgorithmIdentifierOwned), HandshakeError> {
 		let public_key_bytes = self.server_key_provider.to_public_key_bytes().await?;
-		let signer_id = compute_signer_identifier_from_der::<P::Digest>(&public_key_bytes)?;
+		let signer_id = compute_signer_identifier_from_der(&public_key_bytes)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 

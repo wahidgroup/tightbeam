@@ -83,7 +83,7 @@ impl TestCerts {
 		let (cluster_cert, cluster_key) =
 			create_test_cert_with_key("CN=Payment Gateway", 365).expect("Failed to create cluster cert");
 		let cluster_trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			CertificateTrustBuilder::from(Secp256k1Policy)
 				.with_chain(vec![cluster_cert.to_owned()])
 				.expect("Failed to build cluster trust")
 				.build(),
@@ -92,7 +92,7 @@ impl TestCerts {
 		let (hive_cert, hive_key) =
 			create_test_cert_with_key("CN=Payment Hive", 365).expect("Failed to create hive cert");
 		let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			CertificateTrustBuilder::from(Secp256k1Policy)
 				.with_chain(vec![hive_cert.to_owned()])
 				.expect("Failed to build hive trust")
 				.build(),

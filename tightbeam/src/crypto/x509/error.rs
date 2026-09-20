@@ -90,10 +90,6 @@ pub enum CertificateValidationError {
 	#[error("SKID collision: two certificates share key identifier {skid}")]
 	SkidCollision { skid: String },
 
-	/// Configured digest produces fewer than the 20 bytes required for a SKID
-	#[error("Digest output too short for SKID")]
-	DigestTooShort,
-
 	/// Issuer certificate is not a CA (RFC 5280 §6.1.4(k))
 	#[error("Issuer certificate is not a CA")]
 	IssuerNotCa,

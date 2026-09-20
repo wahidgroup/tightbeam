@@ -37,7 +37,6 @@ use tightbeam::{
 	builder::TypeBuilder,
 	crypto::{
 		aead::Aes256Gcm,
-		hash::Sha3_256,
 		key::SigningKeySpec,
 		policy::Secp256k1Policy,
 		sign::ecdsa::{Secp256k1, Secp256k1SigningKey},
@@ -167,9 +166,7 @@ use crate::dtn::{
 fn make_trust_store(cert_spec: CertificateSpec) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let cert = Certificate::try_from(cert_spec)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-			.with_certificate(cert)?
-			.build(),
+		CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(cert)?.build(),
 	))
 }
 
