@@ -13,8 +13,8 @@ use crate::colony::cluster::{gossip_want, RouteKind};
 use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry};
 use crate::colony::common::PeerGossip;
 use crate::colony::common::{
-	current_timestamp_ms, reply_frame, GossipReconciliation, GossipRumor, GossipWant, PeerAdvertisement,
-	PeerAdvertisementResponse,
+	current_timestamp_ms, reply_frame, GossipReconciliation, GossipRumor, GossipRumorKind, GossipWant,
+	PeerAdvertisement, PeerAdvertisementResponse,
 };
 use crate::constants::MAX_PEX_SAMPLE;
 use crate::constants::{MAX_GOSSIP_LOG, MAX_GOSSIP_TTL};
@@ -180,6 +180,7 @@ where
 		let hop_ttl = frame.metadata().lifetime().unwrap_or(radius_cap).min(radius_cap);
 
 		// Copy id/order from publish so replay remints an identical digest (CWE-294).
+		let peer_ad = matches!(body.kind, GossipRumorKind::PeerAdvertisement);
 		let rumor = FrameBuilder::from(Version::V2)
 			.with_id(frame.metadata().id())
 			.with_order(frame.metadata().order())
@@ -199,17 +200,15 @@ where
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 		}
 
-		// The mint signs under the gateway identity. Peer-plane verify
-		// names that signer for the rumor apply path so apply does not
-		// re-parse the same frame.
-		let rumor_signer = match self.config.verify_peer(&rumor) {
-			Ok(verified) => verified.fingerprint(),
-			Err(status) => {
-				return Refusal::to(&frame, &self.trace).gossip(status);
-			}
+		// Local peer-ad apply names the signer this mint proved.
+		// Hive-plane publish still floods when peer trust has no self anchor.
+		let rumor_signer = if peer_ad {
+			self.config.verify_peer(&rumor).map(|verified| verified.fingerprint()).ok()
+		} else {
+			None
 		};
 
-		self.run::<D>(GossipOrigin::Origin, frame, rumor, hop_ttl, None, Some(rumor_signer))
+		self.run::<D>(GossipOrigin::Origin, frame, rumor, hop_ttl, None, rumor_signer)
 			.await
 	}
 }

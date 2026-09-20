@@ -524,16 +524,15 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 
-		let Ok(verified) = config.verify_hive(&frame) else {
-			assert!(false);
-			return;
-		};
-		assert_eq!(verified.party(), Party::FirstParty);
-		assert_eq!(verified.frame().metadata().id(), frame.metadata().id());
-		assert_eq!(
-			CertificateTrustStore::to_fingerprint::<Sha3_256>(verified.signer_cert()).ok(),
-			CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert).ok()
-		);
+		let verified = config.verify_hive(&frame);
+		assert!(matches!(
+			verified,
+			Ok(ref proof)
+				if proof.party() == Party::FirstParty
+					&& proof.frame().metadata().id() == frame.metadata().id()
+					&& CertificateTrustStore::to_fingerprint::<Sha3_256>(proof.signer_cert()).ok()
+						== CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert).ok()
+		));
 	}
 
 	#[test]
@@ -557,10 +556,6 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
-		let Ok(verified) = config.verify_peer(&frame) else {
-			assert!(false);
-			return;
-		};
-		assert_eq!(verified.party(), Party::Peer);
+		assert!(matches!(config.verify_peer(&frame), Ok(verified) if verified.party() == Party::Peer));
 	}
 }
