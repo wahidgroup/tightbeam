@@ -21,9 +21,6 @@ tightbeam is a Layer-5 messaging framework. Frames use Abstract Syntax Notation 
 
 > Zero-Copy, Zero-Panic, no_std-Ready
 
-Upgrading from 0.13? [docs/upgrading-0.14.md](docs/upgrading-0.14.md) lists
-every breaking change and what to write instead.
-
 ## Table of Contents
 
 1. [Introduction](#1-introduction)
