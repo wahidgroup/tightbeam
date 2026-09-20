@@ -126,8 +126,9 @@ impl<'a> VerifiedControlFrame<'a> {
 impl ClusterConfig {
 	/// Verify `frame` once on `required` and classify the resolved certificate.
 	///
-	/// Peer membership wins: a certificate in both stores is
-	/// [`Party::Peer`], so a hive-plane parse refuses it. A missing
+	/// Peer membership wins: a public key enrolled in `tls.peer_trust`
+	/// is [`Party::Peer`], so a hive-plane parse refuses it even when the
+	/// presented certificate object lives only in `hive_trust`. A missing
 	/// store or a failed signature refuses. A frame without a signature
 	/// is unauthenticated.
 	fn verify_plane<'a>(
@@ -254,9 +255,9 @@ impl ClusterConfig {
 	/// Verify one hive-plane control frame.
 	///
 	/// The result carries the signer certificate and [`Party::FirstParty`].
-	/// A signer that `tls.peer_trust` also trusts is [`Party::Peer`] and
-	/// is refused: peer membership wins, so an identity held by both
-	/// stores never acts on the hive plane.
+	/// A public key that `tls.peer_trust` also enrolls is [`Party::Peer`]
+	/// and is refused: peer membership wins by key identity, so a rotated
+	/// certificate for a peer key never acts on the hive plane.
 	///
 	/// # Sources
 	///
@@ -544,6 +545,19 @@ mod tests {
 		let mut config = exporting_config();
 		config.tls.hive_trust = Some(trust_of(&cert));
 		config.tls.peer_trust = Some(trust_of(&cert));
+		assert!(matches!(config.verify_hive(&frame), Err(TransitStatus::PermissionDenied)));
+	}
+
+	#[test]
+	fn hive_origin_refuses_peer_key_under_rotated_certificate() {
+		let key: Secp256k1SigningKey = TestKey::signing();
+		let frame = signed_control_frame(&key);
+		let hive_cert = TestCertificate::with_cn_and_uri_sans(&key, "hive", &["urn:tightbeam:colony:test"]);
+		let peer_cert = TestCertificate::with_cn_and_uri_sans(&key, "peer", &["urn:tightbeam:colony:test"]);
+
+		let mut config = exporting_config();
+		config.tls.hive_trust = Some(trust_of(&hive_cert));
+		config.tls.peer_trust = Some(trust_of(&peer_cert));
 		assert!(matches!(config.verify_hive(&frame), Err(TransitStatus::PermissionDenied)));
 	}
 

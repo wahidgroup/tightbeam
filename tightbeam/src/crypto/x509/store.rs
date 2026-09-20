@@ -147,8 +147,19 @@ pub enum TrustVerification<'a> {
 /// Implementations can use fingerprints, PKI chains, or custom logic.
 #[cfg(feature = "std")]
 pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
-	/// Check if a certificate is trusted.
+	/// Check if a certificate is trusted by fingerprint.
+	///
+	/// This is certificate-object identity. Plane membership that must
+	/// survive key re-issuance uses [`Self::trusts_public_key`].
 	fn is_trusted(&self, cert: &Certificate) -> bool;
+
+	/// Whether this store holds any certificate for `cert`'s public key.
+	///
+	/// The default falls back to [`Self::is_trusted`]. Stores that index
+	/// by key override this.
+	fn trusts_public_key(&self, cert: &Certificate) -> bool {
+		self.is_trusted(cert)
+	}
 
 	/// Verify a certificate chain (partial RFC 5280 §6.1 path validation).
 	///
@@ -577,6 +588,19 @@ impl CertificateTrust for CertificateTrustStore {
 		}
 	}
 
+	fn trusts_public_key(&self, cert: &Certificate) -> bool {
+		let Ok(spki_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
+			return false;
+		};
+
+		let hash = Sha3_256::digest(&spki_der);
+		let Ok(skid) = Skid::from_digest(hash.as_slice()) else {
+			return false;
+		};
+
+		self.skid_index.contains_key(&skid)
+	}
+
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.1: the chain must terminate at a configured trust anchor.
 		let root = chain.first().ok_or(CertificateValidationError::EmptyChain)?;
@@ -824,6 +848,19 @@ mod tests {
 		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 		assert!(store.is_trusted(&cert));
 		assert!(!store.is_trusted(&TestCertificate::self_signed(&SigningKey::from_bytes(&[2u8; 32].into())?)));
+		Ok(())
+	}
+
+	#[test]
+	fn trusts_public_key_matches_rotated_certificate() -> TestResult {
+		let key = TestKey::signing();
+		let enrolled = TestCertificate::with_cn_and_uri_sans(&key, "enrolled", &["urn:tightbeam:colony:test"]);
+		let rotated = TestCertificate::with_cn_and_uri_sans(&key, "rotated", &["urn:tightbeam:colony:test"]);
+		let store = TestBuilder::from(Secp256k1Policy).with_certificate(enrolled.clone())?.build();
+		assert!(store.is_trusted(&enrolled));
+		assert!(!store.is_trusted(&rotated));
+		assert!(store.trusts_public_key(&rotated));
+		assert!(!store.trusts_public_key(&TestCertificate::self_signed(&SigningKey::from_bytes(&[2u8; 32].into())?)));
 		Ok(())
 	}
 

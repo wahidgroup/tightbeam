@@ -93,6 +93,10 @@ impl CertificateTrust for ValidatedTrust {
 		self.store.is_trusted(cert)
 	}
 
+	fn trusts_public_key(&self, cert: &Certificate) -> bool {
+		self.store.trusts_public_key(cert)
+	}
+
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
 		self.store.verify_chain(chain)?;
 

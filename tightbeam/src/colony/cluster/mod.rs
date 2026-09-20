@@ -181,14 +181,14 @@ pub struct ClusterTlsConfig {
 	/// 2. Hive-origin control frames (registration, spawn results)
 	///    verify their signature against it.
 	/// 3. The export boundary classifies a caller as first-party when
-	///    the store holds the caller certificate and `peer_trust` does
+	///    the store holds the caller's public key and `peer_trust` does
 	///    not (see [`TrustPlanes`]).
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 	/// Trust anchor for peer-gateway advertisements and relayed gossip.
 	///
 	/// Separate from `hive_trust`: peer certificates cannot register as
 	/// hives, and hive certificates cannot forge peer ads. Membership
-	/// here wins over `hive_trust` on every plane, so a certificate held
+	/// here wins over `hive_trust` on every plane, so a public key held
 	/// by both stores stays an external peer. `None` disables inbound
 	/// federation (advertisements are refused).
 	pub peer_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,

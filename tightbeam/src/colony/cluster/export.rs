@@ -446,18 +446,19 @@ impl<'a> TrustPlanes<'a> {
 
 	/// Classify `cert` against the two planes.
 	///
-	/// Peer membership wins: a certificate in both stores is
-	/// [`Party::Peer`]. Anonymous (`None`) and unknown certificates are
-	/// [`Party::Untrusted`].
+	/// Peer membership wins and is public-key identity: a caller whose
+	/// key is enrolled in `peer_trust` is [`Party::Peer`], even when the
+	/// presented certificate object lives only in `hive_trust`. Anonymous
+	/// (`None`) and unknown certificates are [`Party::Untrusted`].
 	#[must_use]
 	pub fn classify(&self, cert: Option<&Certificate>) -> Party {
 		let Some(cert) = cert else {
 			return Party::Untrusted;
 		};
-		if self.peer.is_some_and(|trust| trust.is_trusted(cert)) {
+		if self.peer.is_some_and(|trust| trust.trusts_public_key(cert)) {
 			return Party::Peer;
 		}
-		if self.hive.is_some_and(|trust| trust.is_trusted(cert)) {
+		if self.hive.is_some_and(|trust| trust.trusts_public_key(cert)) {
 			return Party::FirstParty;
 		}
 
@@ -592,6 +593,19 @@ mod tests {
 		let peer = trust_of(&cert);
 		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
 		assert_eq!(planes.classify(Some(&cert)), Party::Peer);
+	}
+
+	#[test]
+	fn peer_wins_when_same_key_has_distinct_certificates() {
+		let key = TestKey::signing();
+		let hive_cert = TestCertificate::with_cn_and_uri_sans(&key, "hive", &["urn:tightbeam:colony:test"]);
+		let peer_cert = TestCertificate::with_cn_and_uri_sans(&key, "peer", &["urn:tightbeam:colony:test"]);
+
+		let hive = trust_of(&hive_cert);
+		let peer = trust_of(&peer_cert);
+		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
+		assert_eq!(planes.classify(Some(&hive_cert)), Party::Peer);
+		assert_eq!(planes.classify(Some(&peer_cert)), Party::Peer);
 	}
 
 	#[test]
