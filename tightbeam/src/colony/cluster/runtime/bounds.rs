@@ -2,7 +2,7 @@
 
 use core::hash::Hash;
 use core::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use digest::consts::U32;
 use digest::{Digest, OutputSizeUser};
@@ -103,6 +103,8 @@ pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
 	pub(crate) registry: Arc<HiveRegistry>,
 	/// Servlet routes, both local and peer-learned, with their trails.
 	pub(crate) servlet_registry: Arc<ServletRegistry>,
+	/// Serialises one hive's membership move across both registries.
+	pub(crate) admission: Arc<Mutex<()>>,
 	/// Colony identity, gates, peer caps, and gossip policy.
 	pub(crate) config: Arc<ClusterConfig>,
 	/// Connection pool this gateway dials hives on.
@@ -123,7 +125,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// Admission and retirement move both, so they run here rather than as
 	/// a sequence each call site repeats.
 	pub(crate) fn membership(&self) -> ColonyMembership<'_> {
-		ColonyMembership::new(&self.registry, &self.servlet_registry)
+		ColonyMembership::new(&self.registry, &self.servlet_registry, &self.admission)
 	}
 }
 
@@ -132,6 +134,7 @@ impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
 		Self {
 			registry: Arc::clone(&self.registry),
 			servlet_registry: Arc::clone(&self.servlet_registry),
+			admission: Arc::clone(&self.admission),
 			config: Arc::clone(&self.config),
 			pool: Arc::clone(&self.pool),
 			peer_pool: self.peer_pool.as_ref().map(Arc::clone),

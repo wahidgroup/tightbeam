@@ -25,7 +25,7 @@ mod work;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use self::bounds::{ClusterDigest, ClusterPool, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
 use self::freshness::GatewayReplayGuard;
@@ -234,6 +234,7 @@ where
 		let ctx = GatewayRuntimeCtx {
 			registry: Arc::clone(&registry),
 			servlet_registry: Arc::clone(&servlet_registry),
+			admission: Arc::new(Mutex::new(())),
 			config: Arc::clone(&config),
 			pool: Arc::clone(&pool),
 			peer_pool: peer_pool.as_ref().map(Arc::clone),

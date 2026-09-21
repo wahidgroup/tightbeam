@@ -1,7 +1,7 @@
 //! Hive registry: membership, utilization, and servlet-type reverse index.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use super::error::ClusterError;
@@ -338,12 +338,27 @@ impl Default for HiveRegistry {
 pub(crate) struct ColonyMembership<'a> {
 	hives: &'a HiveRegistry,
 	servlets: &'a ServletRegistry,
+	/// Held by every operation here, so the pair moves as one step even
+	/// though each registry takes its own lock.
+	admission: &'a Mutex<()>,
 }
 
 impl<'a> ColonyMembership<'a> {
 	/// Views the pair of registries a gateway serves.
-	pub(crate) fn new(hives: &'a HiveRegistry, servlets: &'a ServletRegistry) -> Self {
-		Self { hives, servlets }
+	///
+	/// `admission` is the gateway's own, so every view it hands out shares
+	/// one serialised path.
+	pub(crate) fn new(hives: &'a HiveRegistry, servlets: &'a ServletRegistry, admission: &'a Mutex<()>) -> Self {
+		Self { hives, servlets, admission }
+	}
+
+	/// Holds the admission path for one whole membership move.
+	///
+	/// The guarded value is `()`, so a poisoned lock carries no damaged
+	/// state and this lock recovers the guard instead of refusing the
+	/// caller.
+	fn hold_admission(&self) -> MutexGuard<'_, ()> {
+		self.admission.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
 	/// Admits one hive with the servlet slate it registered.
@@ -362,6 +377,7 @@ impl<'a> ColonyMembership<'a> {
 		slate: Vec<ServletEntry>,
 	) -> Result<(), ClusterError> {
 		let hive_addr: SharedId = Arc::from(request.hive_addr.as_slice());
+		let _admission = self.hold_admission();
 
 		let displaced = self.hives.register(request, signer_id)?;
 		self.servlets.reconcile_by_hive(&hive_addr, slate).inspect_err(|_| {
@@ -370,7 +386,7 @@ impl<'a> ColonyMembership<'a> {
 			// request arrived.
 			match displaced {
 				Some(ref previous) => self.hives.restore(Arc::clone(&hive_addr), previous.clone()),
-				None => self.retire(&hive_addr),
+				None => self.drop_membership(&hive_addr),
 			}
 		})
 	}
@@ -381,13 +397,23 @@ impl<'a> ColonyMembership<'a> {
 	/// refuses the write leaves the other retirement in place rather than
 	/// failing the caller.
 	pub(crate) fn retire(&self, hive_addr: impl AsRef<[u8]>) {
+		let _admission = self.hold_admission();
+
+		self.drop_membership(hive_addr);
+	}
+
+	/// Retires one hive for a caller already holding `admission`.
+	fn drop_membership(&self, hive_addr: impl AsRef<[u8]>) {
 		let hive_addr = hive_addr.as_ref();
+
 		let _ = self.hives.unregister(hive_addr);
 		let _ = self.servlets.remove_by_hive(hive_addr);
 	}
 
 	/// Retires every hive whose lease expired, returning what left.
 	pub(crate) fn retire_stale(&self) -> Vec<HiveEntry> {
+		let _admission = self.hold_admission();
+
 		let stale = self.hives.evict_stale().unwrap_or_default();
 		for entry in &stale {
 			let _ = self.servlets.remove_by_hive(&entry.address);
@@ -445,7 +471,8 @@ mod tests {
 	fn retiring_a_hive_drops_the_routes_it_owned() -> Result<(), ClusterError> {
 		let hives = HiveRegistry::default();
 		let servlets = ServletRegistry::default();
-		let membership = ColonyMembership::new(&hives, &servlets);
+		let admission = Mutex::new(());
+		let membership = ColonyMembership::new(&hives, &servlets, &admission);
 		let hive_addr: SharedId = Arc::from(b"hive1".as_slice());
 
 		membership.admit(request(b"hive1", &["ping"]), test_signer(), slate(&hive_addr, "ping"))?;
@@ -512,6 +539,70 @@ mod tests {
 		Ok(())
 	}
 
+	/// One admission request and the slate it installs, tagged so the
+	/// hive row names the request its routes came from.
+	fn tagged_admission(hive_addr: &SharedId, servlet: &str) -> (RegisterHiveRequest, Vec<ServletEntry>) {
+		let mut request = request(hive_addr, &[servlet]);
+		request.metadata = Some(servlet.as_bytes().to_vec());
+		(request, slate(hive_addr, servlet))
+	}
+
+	/// The canonical type bytes a tagged admission installs as its route.
+	fn servlet_type_bytes(servlet: &str) -> SharedId {
+		let namespace = ColonyNamespace::default();
+		let urn = namespace.servlet(servlet).expect("test names satisfy the mint grammar");
+		Arc::from(urn.type_canonical_bytes().as_slice())
+	}
+
+	/// Two admissions of one hive never split the row from its routes.
+	///
+	/// Admission writes the hive row and installs the slate in two
+	/// separately locked registries. Interleaved without a shared hold,
+	/// the last row to land can sit beside the other request's routes, so
+	/// the gateway serves a type set the registered hive never claimed.
+	#[test]
+	fn concurrent_admissions_never_split_a_hive_from_its_routes() -> Result<(), ClusterError> {
+		use std::thread;
+
+		let contested = b"hive-contested";
+		let hive_addr: SharedId = Arc::from(contested.as_slice());
+
+		for _ in 0..500 {
+			let hives = Arc::new(HiveRegistry::default());
+			let servlets = Arc::new(ServletRegistry::default());
+			let admission = Arc::new(Mutex::new(()));
+			let admitters: Vec<_> = ["echo", "ping"]
+				.into_iter()
+				.map(|servlet| {
+					let hives = Arc::clone(&hives);
+					let servlets = Arc::clone(&servlets);
+					let admission = Arc::clone(&admission);
+					let (request, slate) = tagged_admission(&hive_addr, servlet);
+					thread::spawn(move || {
+						ColonyMembership::new(&hives, &servlets, &admission).admit(request, test_signer(), slate)
+					})
+				})
+				.collect();
+
+			for admitter in admitters {
+				admitter.join().expect("thread joins")?;
+			}
+
+			let rows = hives.all_hives()?;
+			assert_eq!(rows.len(), 1);
+
+			let tag = rows[0]
+				.metadata
+				.clone()
+				.expect("a tagged admission always carries its metadata");
+
+			let winner = core::str::from_utf8(&tag).expect("the tag is the servlet name the fixture wrote");
+			assert_eq!(servlets.local_servlets()?, vec![servlet_type_bytes(winner)]);
+		}
+
+		Ok(())
+	}
+
 	/// Two signers race to claim one hive id. Exactly one binds, because the
 	/// check and the insert share a guard (CWE-639).
 	#[test]
@@ -564,7 +655,8 @@ mod tests {
 	fn a_refused_reregistration_restores_the_hive_it_displaced() -> Result<(), ClusterError> {
 		let hives = HiveRegistry::default();
 		let servlets = ServletRegistry::default();
-		let membership = ColonyMembership::new(&hives, &servlets);
+		let admission = Mutex::new(());
+		let membership = ColonyMembership::new(&hives, &servlets, &admission);
 		let hive_addr: SharedId = Arc::from(b"hive-a".as_slice());
 
 		membership.admit(request(b"hive-a", &["echo"]), test_signer(), slate(&hive_addr, "echo"))?;
@@ -584,7 +676,8 @@ mod tests {
 	fn a_refused_first_registration_leaves_no_half() -> Result<(), ClusterError> {
 		let hives = HiveRegistry::default();
 		let servlets = ServletRegistry::default();
-		let membership = ColonyMembership::new(&hives, &servlets);
+		let admission = Mutex::new(());
+		let membership = ColonyMembership::new(&hives, &servlets, &admission);
 		let hive_addr: SharedId = Arc::from(b"hive-a".as_slice());
 
 		poison_routes(&servlets);
