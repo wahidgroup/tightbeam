@@ -8,7 +8,6 @@ use super::error::ClusterError;
 use crate::colony::cluster::servlet_registry::{ServletEntry, ServletRegistry};
 use crate::colony::common::RegisterHiveRequest;
 use crate::utils::BasisPoints;
-use crate::Frame;
 
 /// Shared byte slice for hive and servlet identifiers
 pub type SharedId = Arc<[u8]>;
@@ -242,15 +241,16 @@ impl HiveRegistry {
 		Ok(members.signer_for(hive_id))
 	}
 
-	/// Whether `frame` carries the signer bound to `hive_id` at registration.
+	/// Whether `claimed` is the signer bound to `hive_id` at registration.
 	///
-	/// An unsigned frame, an unregistered hive, and a hive registered with
-	/// no signer all answer `false`: each leaves an update unattributable to
-	/// the hive it claims to speak for (CWE-639).
-	pub(crate) fn signer_matches(&self, frame: &Frame, hive_id: impl AsRef<[u8]>) -> bool {
+	/// An unregistered hive answers `false`, unlike
+	/// [`Members::admits_signer`], which is asked about a free id. An
+	/// update names a hive that is already serving, so a claim on an id
+	/// nobody holds is unattributable (CWE-639).
+	pub(crate) fn binds_signer(&self, hive_id: impl AsRef<[u8]>, claimed: &SharedId) -> bool {
 		let hive_id = hive_id.as_ref();
-		match (frame.signer_id(), self.signer_for(hive_id)) {
-			(Some(claimed), Ok(Some(bound))) => claimed.as_slice() == bound.as_ref(),
+		match self.signer_for(hive_id) {
+			Ok(Some(bound)) => bound.as_ref() == claimed.as_ref(),
 			_ => false,
 		}
 	}
@@ -389,6 +389,33 @@ impl<'a> ColonyMembership<'a> {
 				None => self.drop_membership(&hive_addr),
 			}
 		})
+	}
+
+	/// Applies one hive's servlet address delta under its signer bind.
+	///
+	/// The signer check and the route write share the admission hold, so a
+	/// retirement running beside this update cannot lose the race and have
+	/// the routes it dropped reinstalled behind it (CWE-362, CWE-367).
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::SignerMismatch`] -- `signer_id` is not the signer bound at registration.
+	/// - [`ClusterError::LockPoisoned`] -- the servlet registry is poisoned.
+	pub(crate) fn update_addresses(
+		&self,
+		hive_id: impl AsRef<[u8]>,
+		signer_id: &SharedId,
+		added: impl IntoIterator<Item = ServletEntry>,
+		removed: &[&[u8]],
+	) -> Result<(), ClusterError> {
+		let hive_id = hive_id.as_ref();
+		let _admission = self.hold_admission();
+
+		if !self.hives.binds_signer(hive_id, signer_id) {
+			return Err(ClusterError::SignerMismatch);
+		}
+
+		self.servlets.apply_address_update(hive_id, added, removed)
 	}
 
 	/// Retires one hive and every route it owned.
@@ -552,6 +579,56 @@ mod tests {
 		let namespace = ColonyNamespace::default();
 		let urn = namespace.servlet(servlet).expect("test names satisfy the mint grammar");
 		Arc::from(urn.type_canonical_bytes().as_slice())
+	}
+
+	/// An address update writes its routes behind the admission hold.
+	///
+	/// The update reads the signer bind from one registry and writes
+	/// routes to another. A retirement that lands between those steps
+	/// would drop routes the update then reinstalls, leaving them pointed
+	/// at a hive that has left, so the write waits for the hold like
+	/// every other membership move.
+	#[test]
+	fn an_address_update_waits_for_the_admission_hold() -> Result<(), ClusterError> {
+		use std::thread;
+
+		let addr = b"hive-updating";
+		let hive_addr: SharedId = Arc::from(addr.as_slice());
+		let hives = Arc::new(HiveRegistry::default());
+		let servlets = Arc::new(ServletRegistry::default());
+		let admission = Arc::new(Mutex::new(()));
+
+		ColonyMembership::new(&hives, &servlets, &admission).admit(
+			request(addr, &["ping"]),
+			test_signer(),
+			slate(&hive_addr, "ping"),
+		)?;
+
+		let held = admission.lock().unwrap_or_else(PoisonError::into_inner);
+		let updating = {
+			let (hives, servlets, admission) = (Arc::clone(&hives), Arc::clone(&servlets), Arc::clone(&admission));
+			let hive_addr = Arc::clone(&hive_addr);
+			let added = slate(&hive_addr, "echo");
+			thread::spawn(move || {
+				ColonyMembership::new(&hives, &servlets, &admission).update_addresses(
+					&hive_addr,
+					&test_signer(),
+					added,
+					&[],
+				)
+			})
+		};
+
+		// Long enough for an unheld write to land, so the route set still
+		// reading `ping` is evidence the update is waiting.
+		thread::sleep(Duration::from_millis(50));
+		assert_eq!(servlets.local_servlets()?, vec![servlet_type_bytes("ping")]);
+
+		drop(held);
+		updating.join().expect("thread joins")?;
+		assert_eq!(servlets.local_servlets()?, vec![servlet_type_bytes("echo")]);
+
+		Ok(())
 	}
 
 	/// Two admissions of one hive never split the row from its routes.

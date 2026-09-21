@@ -65,7 +65,6 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		}
 	}
 
-	/// Admit a servlet address update and apply the delta under signer bind.
 	/// Apply one hive's servlet address additions and removals.
 	pub(crate) async fn handle_address_update(
 		&self,
@@ -80,12 +79,16 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_update(&frame, TransitStatus::PermissionDenied);
 		};
 
-		// Signer MUST match the hive bound at registration (CWE-639).
-		if !self.registry.signer_matches(&frame, &hive_id) {
+		// A hive registered with no signer is claimable by the next signer
+		// that names it, so an unsigned update refuses here rather than
+		// reaching the bind check (CWE-639).
+		let Some(signer_id) = frame.signer_id().map(Arc::from) else {
 			return self.refuse_update_release(&frame, TransitStatus::PermissionDenied);
-		}
+		};
 
-		match self.servlet_registry.apply_address_update(&hive_id, added, &removed) {
+		// The signer bind and the route write are one membership step, so
+		// a retirement cannot land between them (CWE-362).
+		match self.membership().update_addresses(&hive_id, &signer_id, added, &removed) {
 			Ok(()) => {
 				self.trace.event(CLUSTER_UPDATE_ACCEPTED)?;
 
