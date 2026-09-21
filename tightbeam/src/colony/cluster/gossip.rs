@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use super::ClusterError;
 use crate::asn1::Frame;
-use crate::colony::common::{GossipRumor, GossipRumorKind};
+use crate::colony::common::{GossipRumor, GossipRumorKind, ServletTypeKey};
 use crate::constants::{
 	DEFAULT_GOSSIP_RATE_BURST, DEFAULT_GOSSIP_RATE_REFILL_MS, DEFAULT_GOSSIP_RETENTION_MS, DEFAULT_GOSSIP_SEEN_TTL_MS,
 	DEFAULT_GOSSIP_TTL, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER, MAX_GOSSIP_PAYLOAD_BYTES, MAX_GOSSIP_RATE_SIGNERS,
@@ -38,7 +38,6 @@ use crate::constants::{
 };
 use crate::crypto::hash::{Digest, OutputSizeUser, U32};
 use crate::policy::TransitStatus;
-use crate::utils::urn::Urn;
 use crate::{decode, encode};
 
 /// Fixed 32-byte content digest of a gossip rumor.
@@ -571,11 +570,15 @@ pub struct GossipConfig {
 	pub seen_ttl: Duration,
 	/// Origin publish hop radius, clamped to [`MAX_GOSSIP_TTL`].
 	pub ttl: u8,
-	/// Servlet type URN admitted rumors are delivered to on this gateway.
+	/// Route key admitted rumors are delivered to on this gateway.
 	///
-	/// Local delivery is receiving-gateway policy, never rumor content.
-	/// `None` journals and refloods only. The record is marked delivered
-	/// so it never enters the pending retry set.
+	/// The key is minted by [`ColonyNamespace::servlet_type_key`], so a
+	/// configured ingress always names a servlet type this colony can
+	/// route. Local delivery is receiving-gateway policy, never rumor
+	/// content. `None` journals and refloods only. The record is marked
+	/// delivered so it never enters the pending retry set.
+	///
+	/// [`ColonyNamespace::servlet_type_key`]: crate::colony::common::ColonyNamespace::servlet_type_key
 	///
 	/// # Export boundary
 	///
@@ -585,7 +588,7 @@ pub struct GossipConfig {
 	/// allowlist does not apply here. An operator who restricts exports
 	/// should treat the ingress type as an intentional local delivery
 	/// channel for admitted colony gossip.
-	pub ingress: Option<Urn<'static>>,
+	pub ingress: Option<ServletTypeKey>,
 	/// Dedup and retention store. Owns its own retention window.
 	pub journal: Arc<dyn GossipJournal>,
 	/// Per-signer rate admission before record or reflood.

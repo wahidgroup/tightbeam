@@ -453,11 +453,11 @@ impl ClusterConfigBuilder {
 	///   answer it. Refusing here is what stops a gateway admitting gossip
 	///   and delivering none of it.
 	pub fn with_gossip_ingress(mut self, ingress: Urn<'static>) -> Result<Self, ClusterError> {
-		if self.namespace.servlet_type_key(&ingress).is_none() {
+		let Some(type_key) = self.namespace.servlet_type_key(&ingress) else {
 			return Err(ClusterError::UnknownServletType(ingress.canonical_bytes()));
-		}
+		};
 
-		self.gossip.ingress = Some(ingress);
+		self.gossip.ingress = Some(type_key);
 		Ok(self)
 	}
 

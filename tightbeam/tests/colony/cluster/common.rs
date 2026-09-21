@@ -58,7 +58,8 @@ pub use tightbeam::{
 		},
 		common::{
 			current_timestamp_ms, ColonyNamespace, GossipReconciliation, GossipResponse, GossipRumor, GossipWant,
-			InstanceMetrics, LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin, StochasticForager,
+			InstanceMetrics, LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin, ServletTypeKey,
+			StochasticForager,
 		},
 		hive::{
 			Hive, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
@@ -372,6 +373,16 @@ pub fn hive_urn(hive_addr: &(impl AsRef<[u8]> + ?Sized)) -> Urn<'static> {
 pub fn servlet_urn(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
 	let name = name.as_ref();
 	colony_ns().servlet(name).expect("test names satisfy the mint grammar")
+}
+
+/// The gossip ingress key for `name`, minted the way the builder mints it.
+///
+/// [`GossipConfig::ingress`] holds a route key rather than a URN, so a
+/// fixture names its ingress through the same namespace check production
+/// passes.
+pub fn servlet_ingress(name: &(impl AsRef<str> + ?Sized)) -> ServletTypeKey {
+	let urn = servlet_urn(name);
+	colony_ns().servlet_type_key(&urn).expect("test names mint a bare servlet type")
 }
 
 pub fn registration_request(hive_addr: impl AsRef<[u8]>) -> ClusterRequest {

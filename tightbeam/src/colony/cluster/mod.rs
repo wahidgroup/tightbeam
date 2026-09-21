@@ -913,4 +913,28 @@ mod tests {
 
 		Ok(())
 	}
+
+	/// The builder mints the ingress route key, so an unroutable URN is
+	/// refused where it is configured.
+	///
+	/// Delivery reads the minted key, so a gateway holding an ingress no
+	/// route can answer is not a state the runtime reaches. A rumor
+	/// therefore stays in the retry set only for a fault that can clear.
+	#[test]
+	fn gossip_ingress_refuses_a_urn_no_route_can_answer() -> Result<(), ClusterError> {
+		let bare = servlet_urn("ping");
+		let instance = bare
+			.servlet_instance("10.0.0.5:9100")
+			.expect("a servlet type URN yields an instance URN");
+
+		let refused = ClusterConfig::builder(test_tls_config()).with_gossip_ingress(instance);
+		assert!(matches!(refused, Err(ClusterError::UnknownServletType(_))));
+
+		let conf = ClusterConfig::builder(test_tls_config())
+			.with_gossip_ingress(bare.clone())?
+			.build();
+		assert_eq!(conf.gossip.ingress, ColonyNamespace::default().servlet_type_key(&bare));
+
+		Ok(())
+	}
 }

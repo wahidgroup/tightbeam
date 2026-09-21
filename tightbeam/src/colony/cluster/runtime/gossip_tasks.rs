@@ -43,8 +43,8 @@ use crate::decode;
 use crate::encode;
 use crate::instrumentation::events::{
 	CLUSTER_GOSSIP_ACCEPTED, CLUSTER_GOSSIP_DROP_SIGNAL, CLUSTER_GOSSIP_DUPLICATE, CLUSTER_GOSSIP_FANOUT_UNREACHED,
-	CLUSTER_GOSSIP_REFLOOD_FAILED, CLUSTER_GOSSIP_REFUSED, CLUSTER_GOSSIP_RELAY_WEAKENED,
-	CLUSTER_GOSSIP_WITNESS_REFUSED, CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
+	CLUSTER_GOSSIP_REFLOOD_FAILED, CLUSTER_GOSSIP_RELAY_WEAKENED, CLUSTER_GOSSIP_WITNESS_REFUSED,
+	CLUSTER_PEER_DISCOVERED, CLUSTER_PEER_EVICTED,
 };
 use crate::instrumentation::events::{
 	CLUSTER_PEER_AD_DROPPED, CLUSTER_PEER_AD_LEARNED, CLUSTER_PEER_AD_PUBLISH_FAILED, CLUSTER_RELAY_TRAIL_REFUSED,
@@ -802,7 +802,7 @@ where
 	) -> Result<(), TightBeamError> {
 		let payload: Vec<u8> = payload.into();
 		let journal = &self.config.gossip.journal;
-		let Some(ingress) = self.config.gossip.ingress.as_ref() else {
+		let Some(type_key) = self.config.gossip.ingress.as_ref() else {
 			// Nothing consumes the rumor here, so it leaves the retry set.
 			let _ = journal.ack_local(&digest_value);
 			return Ok(());
@@ -815,17 +815,7 @@ where
 			return Ok(());
 		};
 
-		// The ingress target is a configured URN, so it passes the same
-		// namespace check a work request's target does before it can name
-		// a route. A configured type this colony cannot route delivers
-		// nothing, so the refusal is traced rather than silent: without it
-		// a gateway admits gossip and drops every rumor with no signal.
-		let Some(type_key) = self.config.namespace.servlet_type_key(ingress) else {
-			self.trace.event(CLUSTER_GOSSIP_REFUSED)?;
-			return Ok(());
-		};
-
-		let entries = self.servlet_registry.local_entries_for_type(&type_key).unwrap_or_default();
+		let entries = self.servlet_registry.local_entries_for_type(type_key).unwrap_or_default();
 		// An out-of-range balancer answer skips delivery instead
 		// of panicking the gossip task (see [`ClusterConfig::pick_instance`]).
 		let Some(entry) = self.config.pick_instance(&entries) else {

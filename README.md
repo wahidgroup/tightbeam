@@ -3227,7 +3227,7 @@ Colony gossip floods origin-signed rumors across member gateways: the pheromone 
 let conf = ClusterConfig::builder(tls)
 	.with_peers([peer_addr.to_string()])?
 	.with_advertise_interval(Duration::from_secs(5))
-	.with_gossip_ingress(servlet_type_urn) // optional local delivery target
+	.with_gossip_ingress(servlet_type_urn)? // optional local delivery target
 	.with_gossip_config(GossipConfig {
 		ttl: 4, // hop radius cap (clamped to MAX_GOSSIP_TTL)
 		..GossipConfig::default()
@@ -3240,7 +3240,7 @@ Flow:
 1. **Publish**: A hive-plane signed `PublishGossip` carries `GossipRumor { payload }`. The accepting origin gateway must be a colony member. It creates an origin-signed rumor Frame (id and issue time from the publish frame) and starts the flood.
 2. **Relay**: Peers carry `ClusterRequest::Gossip` with an outer relay Frame. Hop radius lives only in the outer `metadata.lifetime`. The inner rumor stays byte-identical under the origin signature. Relays verify on the peer trust plane; the origin colony URN MUST equal the local gateway's colony URN.
 3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice. An application rumor is recorded for repair and delivery retry. A peer advertisement rumor is only witnessed (`GossipJournal::witness`, a required trait method). Its digest deduplicates and breaks flood loops, but the bytes are never retained, repaired, or delivered locally.
-4. **Local ingress**: `GossipConfig.ingress` names a servlet type on the receiving gateway. `None` means journal and reflood only (immediate local ack).
+4. **Local ingress**: `GossipConfig.ingress` holds the route key of a servlet type on the receiving gateway. `with_gossip_ingress` mints that key, so a URN no route could answer is refused with `ClusterError::UnknownServletType` at configuration time rather than retried on every beat. `None` means journal and reflood only (immediate local ack).
 5. **Reflood**: Remaining hop TTL and a non-empty `peers` list continue the flood.
 6. **Reconcile**: `ReconcileGossip` exchanges held digests; the peer answers with `GossipWant`. The advertise beat also runs anti-entropy repair and pending-local retry.
 
@@ -3372,7 +3372,7 @@ pub struct ClusterConfig {
 	pub peer: PeerConfig,
 
 	// --- Colony gossip ---
-	/// Gossip freshness, hop TTL, ingress URN, journal, and admission
+	/// Gossip freshness, hop TTL, ingress route key, journal, and admission
 	pub gossip: GossipConfig,
 }
 

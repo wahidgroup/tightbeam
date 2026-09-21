@@ -35,7 +35,7 @@ fn gossip_cluster_conf(
 	conf.tls.hive_trust = Some(split_hive_trust(certs));
 	conf.gossip = GossipConfig {
 		journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
-		ingress: Some(servlet_urn("ping")),
+		ingress: Some(servlet_ingress("ping")),
 		..Default::default()
 	};
 
@@ -869,7 +869,7 @@ tb_scenario! {
 			conf.gossip = GossipConfig {
 				admission: Arc::new(TokenBucketAdmission::new(1, Duration::from_secs(3_600)))
 					as Arc<dyn GossipAdmission>,
-				ingress: Some(servlet_urn("ping")),
+				ingress: Some(servlet_ingress("ping")),
 				..Default::default()
 			};
 			let gateway = start_cluster(&trace, conf).await?;
@@ -939,7 +939,7 @@ tb_scenario! {
 			conf.gossip = GossipConfig {
 				journal: Arc::new(MemoryGossipJournal::new(1_000)) as Arc<dyn GossipJournal>,
 				seen_ttl: Duration::from_secs(3_600),
-				ingress: Some(servlet_urn("ping")),
+				ingress: Some(servlet_ingress("ping")),
 				..Default::default()
 			};
 			let gateway = start_cluster(&trace, conf).await?;
@@ -999,7 +999,7 @@ tb_scenario! {
 			conf.gossip = GossipConfig {
 				admission: Arc::new(TokenBucketAdmission::new(2, Duration::from_secs(3_600)))
 					as Arc<dyn GossipAdmission>,
-				ingress: Some(servlet_urn("ping")),
+				ingress: Some(servlet_ingress("ping")),
 				..Default::default()
 			};
 			let gateway = start_cluster(&trace, conf).await?;
@@ -1047,7 +1047,7 @@ tb_scenario! {
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
 			conf.gossip = GossipConfig {
 				journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
-				ingress: Some(servlet_urn("ping")),
+				ingress: Some(servlet_ingress("ping")),
 				..Default::default()
 			};
 			let gateway = start_cluster(&trace, conf).await?;
@@ -1167,7 +1167,7 @@ tb_scenario! {
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
 			conf.gossip = GossipConfig {
 				journal: Arc::clone(&journal) as Arc<dyn GossipJournal>,
-				ingress: Some(servlet_urn("ping")),
+				ingress: Some(servlet_ingress("ping")),
 				..Default::default()
 			};
 
@@ -1228,7 +1228,7 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: certs, hive }| async move {
 			let mut conf = containment_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
-			conf.gossip.ingress = Some(servlet_urn("ping"));
+			conf.gossip.ingress = Some(servlet_ingress("ping"));
 
 			let gateway = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(gateway.addr()).await?;
