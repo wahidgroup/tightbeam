@@ -72,11 +72,6 @@ pub mod rt {
 		handle.await
 	}
 
-	/// Sleep for a duration
-	pub async fn sleep(duration: core::time::Duration) {
-		tokio::time::sleep(duration).await;
-	}
-
 	// =========================================================================
 	// Channels
 	// =========================================================================
@@ -222,11 +217,6 @@ pub mod rt {
 	/// Wait for a response on a oneshot channel (blocking)
 	pub fn wait_response<T>(receiver: OneshotReceiver<T>) -> Result<T, ()> {
 		receiver.recv().map_err(|_| ())
-	}
-
-	/// Sleep for a duration (blocking)
-	pub fn sleep(duration: core::time::Duration) {
-		thread::sleep(duration);
 	}
 
 	// =========================================================================

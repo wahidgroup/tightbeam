@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::{
 	at_least,
 	colony::servlet::ServletConfig,
@@ -180,7 +181,7 @@ tb_scenario! {
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(CLIENT_CERT, key)?
+				.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
 
 			let client = builder.connect(env.addr).await?;
@@ -278,7 +279,7 @@ tb_scenario! {
 			let provider = Arc::new(Secp256k1KeyProvider::from(invalid_key));
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(certificate, provider)?
+				.with_client_identity(ClientIdentity::from_spec(certificate, provider)?)
 				.build();
 
 			// The pinning server must refuse this identity during the
@@ -340,7 +341,7 @@ tb_scenario! {
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(CLIENT_CERT, key)?
+				.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
 
 			// A successful exchange records `false` and fails the spec,

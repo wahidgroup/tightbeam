@@ -23,22 +23,17 @@ use crate::transport::MessageEmitter;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::transport::handshake::HandshakeProtocolKind;
 	pub use crate::transport::state::{DialableEncryption, EncryptionConfig};
-	pub use crate::transport::X509ClientConfig;
+	pub use crate::transport::EndpointConfig;
+	pub use crate::utils::time::Clock;
 	pub use crate::x509::Certificate;
 
 	#[cfg(feature = "std")]
-	pub use crate::crypto::key::SigningKeyProvider;
-	#[cfg(feature = "aes-gcm")]
-	pub use crate::crypto::profiles::DefaultCryptoProvider;
-	#[cfg(feature = "std")]
-	pub use crate::crypto::x509::CertificateSpec;
-	#[cfg(feature = "std")]
-	#[cfg(feature = "std")]
 	pub use crate::transport::state::ClientIdentity;
+	#[cfg(host_clock)]
+	pub use crate::utils::time::SystemClock;
 }
 
 #[cfg(feature = "x509")]
@@ -141,20 +136,32 @@ impl ClientPolicies {
 	}
 }
 
-pub struct ClientBuilder<P: Protocol, C: CryptoProvider + 'static = DefaultCryptoProvider> {
+pub struct ClientBuilder<P: Protocol> {
 	policies: ClientPolicies,
 	/// Provisioning this builder accumulates, handed to the transport whole.
 	#[cfg(feature = "x509")]
-	encryption: EncryptionConfig<C>,
-	_ph: PhantomData<(P, C)>,
+	encryption: EncryptionConfig<P::CryptoProvider>,
+	/// The clock the transport measures deadlines and backoff against.
+	#[cfg(feature = "x509")]
+	clock: Arc<dyn Clock>,
+	_ph: PhantomData<P>,
 }
 
-impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
+impl<P: Protocol> ClientBuilder<P> {
+	/// A builder on the operating system's clocks.
+	#[cfg(host_clock)]
 	pub fn builder() -> Self {
+		Self::on_clock(Arc::new(SystemClock))
+	}
+
+	/// A builder whose transport measures deadlines and backoff against
+	/// `clock`.
+	#[cfg(feature = "x509")]
+	pub fn on_clock(clock: Arc<dyn Clock>) -> Self {
 		Self {
 			policies: ClientPolicies::default(),
-			#[cfg(feature = "x509")]
-			encryption: EncryptionConfig::default(),
+			encryption: EncryptionConfig::unconfigured(),
+			clock,
 			_ph: PhantomData,
 		}
 	}
@@ -223,24 +230,45 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 
 	/// Run this client without authenticating the server.
 	///
-	/// A client with no trust store verifies nobody, so [`Self::connect`]
-	/// refuses it until this names that as the intent. Frames then travel in
-	/// the clear and any peer answering the address is accepted, which suits a
-	/// loopback fixture or a link a lower layer already secures.
+	/// A client with no trust store verifies nobody, so [`Self::connect`] and
+	/// [`Self::adopt`] refuse it until this names that as the intent. Frames
+	/// then travel in the clear and any peer answering the address is
+	/// accepted, which suits a loopback fixture or a link a lower layer
+	/// already secures.
 	#[cfg(feature = "x509")]
 	pub fn allow_cleartext(mut self) -> Self {
 		self.encryption.allow_cleartext = true;
 		self
 	}
+
+	/// Everything the transport is built from, once the dialer rule has
+	/// answered.
+	///
+	/// # Errors
+	///
+	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
+	///   the client holds no trust store and did not call [`Self::allow_cleartext`],
+	///   so it would have accepted any peer.
+	#[cfg(feature = "x509")]
+	fn endpoint(
+		encryption: EncryptionConfig<P::CryptoProvider>,
+		clock: Arc<dyn Clock>,
+	) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
+		let encryption = DialableEncryption::new(encryption)?;
+		Ok(EndpointConfig::new(encryption, clock))
+	}
 }
 
 #[cfg(feature = "x509")]
-impl<P: Protocol + Send, C: CryptoProvider + Send + Sync + 'static> ClientBuilder<P, C>
+impl<P: Protocol + Send> ClientBuilder<P>
 where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
 	P::Address: Send,
 {
 	/// Connect and configure the client.
+	///
+	/// The dialer rule answers before the connection opens, so a refused
+	/// client never reaches the address.
 	///
 	/// # Errors
 	///
@@ -248,22 +276,38 @@ where
 	///   the client holds no trust store and did not call [`Self::allow_cleartext`],
 	///   so it would have accepted any peer.
 	pub async fn connect(self, addr: impl Into<P::Address>) -> TransportResult<GenericClient<P>> {
-		let encryption = DialableEncryption::new(self.encryption)?;
+		let endpoint = Self::endpoint(self.encryption, self.clock)?;
 		let destination = addr.into();
 		let stream = P::connect(destination).await.map_err(|e| e.into())?;
 
-		// The provisioning moves to the transport whole, so nothing this
-		// builder accumulated can be left behind.
-		let transport = P::create_transport(stream).with_encryption(encryption);
+		let transport = P::create_transport(stream, endpoint);
+		let configured = self.policies.apply::<P>(transport);
+		Ok(GenericClient::from_transport(configured))
+	}
+
+	/// Configure a client over a stream the caller already opened.
+	///
+	/// The stream answers the same dialer rule as [`Self::connect`], so a
+	/// client adopted this way is no less authenticated than one this builder
+	/// dialed.
+	///
+	/// # Errors
+	///
+	/// - [`crate::transport::error::TransportError::PeerAuthenticationUnconfigured`] --
+	///   the client holds no trust store and did not call [`Self::allow_cleartext`].
+	pub fn adopt(self, stream: P::Stream) -> TransportResult<GenericClient<P>> {
+		let endpoint = Self::endpoint(self.encryption, self.clock)?;
+
+		let transport = P::create_transport(stream, endpoint);
 		let configured = self.policies.apply::<P>(transport);
 		Ok(GenericClient::from_transport(configured))
 	}
 }
 
 #[cfg(all(feature = "std", feature = "x509"))]
-impl<P: Protocol + Send, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P> for ClientBuilder<P, C>
+impl<P: Protocol + Send> ConnectionBuilder<P> for ClientBuilder<P>
 where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig,
 	P::Address: Send,
 {
 	type Output = Self;
@@ -278,14 +322,9 @@ where
 		self
 	}
 
-	fn with_client_identity(
-		mut self,
-		cert: CertificateSpec,
-		key: Arc<dyn SigningKeyProvider>,
-	) -> TransportResult<Self> {
-		ClientIdentity::<C>::from_spec(cert, key)?.install(&mut self.encryption);
-
-		Ok(self)
+	fn with_client_identity(mut self, identity: ClientIdentity<P::CryptoProvider>) -> Self {
+		identity.install(&mut self.encryption);
+		self
 	}
 
 	fn build(self) -> Self::Output {
@@ -310,8 +349,9 @@ mod tests {
 	use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 	use super::*;
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::transport::error::TransportError;
-	use crate::transport::tcp::r#async::TokioListener;
+	use crate::transport::tcp::r#async::{TokioListener, TokioStream};
 	use crate::transport::tcp::TightBeamSocketAddr;
 
 	/// Port 1 on loopback, where a connection attempt fails fast. The refusal
@@ -326,6 +366,32 @@ mod tests {
 	async fn a_client_without_a_trust_store_is_refused() {
 		let refused = ClientBuilder::<TokioListener>::builder().connect(UNREACHABLE).await;
 		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
+	}
+
+	/// The shortest `client!` form reaches the wire only through the same
+	/// rule, so a bare dial is refused before it opens a connection
+	/// (CWE-295).
+	#[tokio::test]
+	async fn a_bare_client_macro_is_refused_before_it_dials() {
+		async fn bare_client() -> TransportResult<GenericClient<TokioListener>> {
+			let client = crate::client!(connect TokioListener: UNREACHABLE);
+			Ok(client)
+		}
+
+		let refused = bare_client().await;
+		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
+	}
+
+	/// A stream the caller opened answers the same rule as a dial, so no
+	/// path reaches the wire without it.
+	#[tokio::test]
+	async fn an_adopted_stream_without_a_peer_authority_is_refused() -> TransportResult<()> {
+		let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
+		let stream = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+
+		let refused = ClientBuilder::<TokioListener>::builder().adopt(TokioStream::from(stream));
+		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
+		Ok(())
 	}
 
 	/// Naming cleartext is what lets the same client through, so it reaches

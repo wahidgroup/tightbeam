@@ -15,7 +15,7 @@ use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::trace::TraceCollector;
-use crate::transport::{MessageEmitter, Protocol, X509ClientConfig};
+use crate::transport::{MessageEmitter, Protocol};
 use crate::utils::urn::Urn;
 use crate::utils::BasisPoints;
 use crate::TightBeamError;
@@ -49,11 +49,12 @@ pub struct ScalingLoop<P: Protocol> {
 
 impl<P> ScalingLoop<P>
 where
+	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+	P::Transport: MessageEmitter + Send + Sync + 'static,
 	TightBeamError: From<P::Error>,
 {
 	/// Runs the cooling loop that scales servlet instances per type.
@@ -187,11 +188,12 @@ struct ScalingTask<P: Protocol> {
 
 impl<P> ScalingTask<P>
 where
+	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+	P::Transport: MessageEmitter + Send + Sync + 'static,
 	TightBeamError: From<P::Error>,
 {
 	/// Whether local scaling must hold off.

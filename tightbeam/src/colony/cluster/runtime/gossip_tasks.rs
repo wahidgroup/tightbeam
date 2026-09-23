@@ -57,7 +57,7 @@ use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
+use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
 use crate::utils::time::UnixMillis;
 use crate::utils::urn::Urn;
 use crate::Frame;
@@ -278,7 +278,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send
@@ -545,7 +544,7 @@ where
 	/// and leaves the peer scored on the answer it already gave.
 	async fn settle_round<D: ClusterDigest>(
 		&self,
-		client: &mut crate::transport::PooledClient<P, DefaultCryptoProvider>,
+		client: &mut crate::transport::PooledClient<P>,
 		reply: GossipWant,
 		acked: &mut HashSet<GossipDigest>,
 		peer: PeerAddress,
@@ -699,7 +698,7 @@ where
 	/// and only an explicit `Ok` reply arms the grey-hole ledger.
 	async fn push_repairs<D: ClusterDigest>(
 		&self,
-		client: &mut crate::transport::PooledClient<P, DefaultCryptoProvider>,
+		client: &mut crate::transport::PooledClient<P>,
 		wanted: impl AsRef<[GossipDigest]>,
 		acked: &mut HashSet<GossipDigest>,
 	) -> Result<(), ClusterError> {
@@ -788,7 +787,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send
@@ -1276,7 +1274,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send
@@ -1320,8 +1317,7 @@ where
 				let mut push_ledger: HashMap<PeerAddress, HashSet<GossipDigest>> = HashMap::new();
 				let ad_publish = Arc::new(AdPublishState::new(config.rumor_refresh()));
 				loop {
-					rt::sleep(interval).await;
-
+					config.clock.sleep(interval).await;
 					delivery.retry_pending_local::<D>().await?;
 
 					// Beat targets are anchors plus verified tried peers.

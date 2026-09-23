@@ -28,6 +28,7 @@ use super::federation::{type_route_count, wait_for_type_routes};
 use super::streaming::{pooled_cluster_client, StreamEchoServlet};
 use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
 use tightbeam::der::Encode;
+use tightbeam::transport::state::ClientIdentity;
 
 /// Two organizations under split trust planes.
 ///
@@ -276,10 +277,10 @@ async fn connect_with_identity(
 ) -> Result<GenericClient<TokioListener>, TightBeamError> {
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_trust_store(server_trust)
-		.with_client_identity(
+		.with_client_identity(ClientIdentity::from_spec(
 			CertificateSpec::Built(Box::new(identity.cert.to_owned())),
 			Arc::new(Secp256k1KeyProvider::from(identity.key.to_owned())),
-		)?
+		)?)
 		.build()
 		.connect(addr.to_owned())
 		.await?)

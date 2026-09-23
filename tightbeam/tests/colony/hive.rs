@@ -4,6 +4,7 @@
 
 use core::time::Duration;
 use std::sync::Arc;
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::utils::time::UnixMillis;
 
 use tightbeam::crypto::key::SigningKeyProvider;
@@ -286,7 +287,10 @@ async fn connect_hive(
 	let identity = CertificateSpec::Built(Box::new(ctx.certificate.to_owned()));
 	let client = ClientBuilder::<TokioListener>::builder()
 		.with_trust_store(pinning_trust_store(&ctx.certificate)?)
-		.with_client_identity(identity, Arc::clone(&ctx.provider) as Arc<dyn SigningKeyProvider>)?
+		.with_client_identity(ClientIdentity::from_spec(
+			identity,
+			Arc::clone(&ctx.provider) as Arc<dyn SigningKeyProvider>,
+		)?)
 		.build();
 
 	let addr = hive.addr().ok_or(TightBeamError::NotEstablished)?;
@@ -615,13 +619,14 @@ tb_scenario! {
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive, &signer).await?;
-
 			let empty = signed_unreadable_command_frame(&signer.provider, b"cmd-empty", false).await?;
 			let response = emit_command(&mut client, empty).await?;
+
 			trace.event_with(EMPTY_COMMAND_REFUSED, &[], manage_stop_shape_status(response)?)?;
 
 			let ambiguous = signed_unreadable_command_frame(&signer.provider, b"cmd-both", true).await?;
 			let response = emit_command(&mut client, ambiguous).await?;
+
 			trace.event_with(AMBIGUOUS_COMMAND_REFUSED, &[], manage_stop_shape_status(response)?)?;
 
 			hive.stop();

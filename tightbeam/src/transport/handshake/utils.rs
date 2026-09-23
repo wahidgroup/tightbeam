@@ -50,22 +50,17 @@ pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), Hands
 	}
 }
 
-/// Parse the certificate SPKI into a curve `PublicKey` for
-/// signature verification.
-/// Fixed 32-byte view of an ECIES wire nonce.
-/// Wrong length fails closed.
 /// 32-byte transcript digest under digest algorithm `D`.
 ///
 /// Wider digests (e.g. SHA3-512) truncate to the leading 32 bytes.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub fn compute_transcript_digest<D>(data: impl AsRef<[u8]>) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
-	let data = data.as_ref();
 	use crate::transport::handshake::primitives::transcript::digest_output_to_array;
 
+	let data = data.as_ref();
 	digest_output_to_array(D::digest(data))
 }
 
@@ -102,8 +97,9 @@ where
 	let spki_bytes = spki_bytes.as_ref();
 	let accept_der = accept_der.as_ref();
 	let transport_accept_der = transport_accept_der.as_ref();
-	let mut data =
-		Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len() + transport_accept_der.len());
+
+	let len = client_hello.len() + 32 + spki_bytes.len() + accept_der.len() + transport_accept_der.len();
+	let mut data = Vec::with_capacity(len);
 	data.extend_from_slice(client_hello);
 	data.extend_from_slice(server_random);
 	data.extend_from_slice(spki_bytes);

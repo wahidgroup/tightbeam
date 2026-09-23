@@ -5,7 +5,6 @@
 //! familiar Result methods.
 
 #[cfg(any(test, feature = "testing"))]
-#[cfg(any(test, feature = "testing"))]
 use std::sync::Arc;
 
 #[cfg(any(test, feature = "testing"))]

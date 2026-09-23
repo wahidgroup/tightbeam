@@ -31,8 +31,8 @@ use tightbeam::transport::state::EncryptedProtocolState;
 use tightbeam::transport::state::SessionPhase;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
-	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO, TransportEncryptionConfig, TransportError,
-	TransportLimits, WireEnvelope, X509ClientConfig,
+	ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageIO,
+	TransportEncryptionConfig, TransportError, TransportLimits, WireEnvelope,
 };
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
@@ -167,8 +167,11 @@ pub async fn connect_mutual_client(
 	server_certificate: &Certificate,
 	client: &ClientMaterials,
 ) -> Result<TcpTransport<TokioStream>, TightBeamError> {
-	let transport = connect_pinned_client(addr, server_certificate).await?;
-	Ok(transport.with_client_identity(client.identity()))
+	let builder = pinned_client(server_certificate)?.with_client_identity(client.identity());
+	let stream = TcpStream::connect(addr).await?;
+	let adopted = builder.adopt(TokioStream::from(stream))?;
+
+	Ok(adopted.into_transport())
 }
 
 /// Optional per-session hooks for mutual-auth handshakes.
@@ -295,14 +298,20 @@ pub async fn connect_pinned_client(
 	addr: SocketAddr,
 	server_certificate: &Certificate,
 ) -> Result<TcpTransport<TokioStream>, TightBeamError> {
+	let builder = pinned_client(server_certificate)?;
+	let stream = TcpStream::connect(addr).await?;
+
+	let adopted = builder.adopt(TokioStream::from(stream))?;
+	Ok(adopted.into_transport())
+}
+
+/// A client builder that trusts exactly `server_certificate`.
+fn pinned_client(server_certificate: &Certificate) -> Result<ClientBuilder<TokioListener>, TightBeamError> {
 	let trust_store: Arc<dyn CertificateTrust> = Arc::new(
 		CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(server_certificate.to_owned())?
 			.build(),
 	);
 
-	let stream = TcpStream::connect(addr).await?;
-	let client_stream = TokioStream::from(stream);
-	let transport = TcpTransport::from(client_stream).with_trust_store(trust_store);
-	Ok(transport)
+	Ok(ClientBuilder::<TokioListener>::builder().with_trust_store(trust_store))
 }

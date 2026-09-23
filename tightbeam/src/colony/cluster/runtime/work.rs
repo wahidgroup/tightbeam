@@ -21,7 +21,7 @@ use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
+use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
 use crate::utils::urn::Urn;
 use crate::{Frame, TightBeamError};
 
@@ -104,7 +104,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send

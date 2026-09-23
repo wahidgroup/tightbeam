@@ -8,17 +8,21 @@
 	feature = "testing"
 ))]
 
+use std::sync::Arc;
+
 use tokio::net::TcpStream;
 
+use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::exactly;
 use tightbeam::policy::TransitStatus;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::{SetupEnv, TestFrame};
-use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
+use tightbeam::transport::tcp::r#async::{TokioListener, TokioStream};
 use tightbeam::transport::{
-	EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError, TransportFailure,
+	ClientBuilder, EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError, TransportFailure,
 };
 use tightbeam::utils::urn::Urn;
 use tightbeam::{Frame, TightBeamError};
@@ -118,11 +122,14 @@ tb_scenario! {
 	spec: SplitRejectsPreHandshakeSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
+			// A provisioned client whose handshake has not run, so it holds no
+			// keys to split.
 			let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
 			let listen_addr = listener.local_addr()?;
 			let client_stream = TcpStream::connect(listen_addr).await?;
-			let tokio_stream = TokioStream::from(client_stream);
-			let transport: TcpTransport<TokioStream> = TcpTransport::from(tokio_stream);
+			let trust_store: Arc<dyn CertificateTrust> = Arc::new(CertificateTrustBuilder::from(Secp256k1Policy).build());
+			let client = ClientBuilder::<TokioListener>::builder().with_trust_store(trust_store);
+			let transport = client.adopt(TokioStream::from(client_stream))?.into_transport();
 
 			let into_split = transport.into_split();
 			trace.event_with( INTO_SPLIT_REPORTS_INVALID_STATE, &[], matches!(into_split, Err(TransportError::InvalidState)))?;

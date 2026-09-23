@@ -11,7 +11,7 @@ use crate::router::RouterError;
 use crate::transport::client::pool::ConnectionPool;
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
-use crate::transport::{MessageCollector, MessageEmitter, PersistentConnection, Protocol, X509ClientConfig};
+use crate::transport::{MessageCollector, MessageEmitter, PersistentConnection, Protocol};
 use crate::utils::urn::Urn;
 use crate::{Frame, TightBeamError};
 
@@ -147,16 +147,10 @@ impl<P: Protocol> HiveContextImpl<P> {
 
 impl<P> HiveContext for HiveContextImpl<P>
 where
+	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + PersistentConnection + Send + Sync + 'static,
 	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
-		+ MuxConnector
-		+ Send
-		+ Sync
-		+ 'static,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + MuxConnector + Send + Sync + 'static,
 {
 	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a> {
 		Box::pin(async move {

@@ -26,6 +26,7 @@ use std::{
 	time::Duration,
 };
 
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::{
 	colony::servlet::ServletConfig,
 	der::Sequence,
@@ -333,7 +334,7 @@ tb_scenario! {
 				ConnectionPool::<TokioListener>::builder()
 					.with_config(PoolConfig::default())
 					.with_trust_store(make_server_trust_store()?)
-					.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+					.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
 					.with_timeout(Duration::from_millis(1000))
 					.with_trace(trace.share())
 					.build(),
@@ -385,7 +386,7 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_trust_store(make_server_trust_store()?)
-			.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+			.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
 			.build(),
 	);
 
@@ -437,7 +438,7 @@ async fn envelope_ceiling_refuses_oversize_locally() -> Result<(), Box<dyn std::
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_trust_store(make_server_trust_store()?)
-			.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+			.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
 			.with_timeout(Duration::from_millis(3000))
 			.build(),
 	);
@@ -497,7 +498,7 @@ tb_scenario! {
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
 					.with_trust_store(make_server_trust_store()?)
-					.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+					.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
 					.with_trace(trace.share())
 					.build(),
 			);
@@ -548,7 +549,7 @@ tb_scenario! {
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
 					.with_trust_store(make_server_trust_store()?)
-					.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+					.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
 					.with_trace(trace.share())
 					.build(),
 			);

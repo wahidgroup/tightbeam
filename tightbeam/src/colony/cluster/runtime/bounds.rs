@@ -20,9 +20,9 @@ use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
+use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol};
 
-pub(crate) type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
+pub(crate) type ClusterPool<P> = ConnectionPool<P>;
 
 /// Protocol that can bind a gateway accept plane (colony or edge).
 ///
@@ -69,7 +69,6 @@ pub(crate) trait GatewayColonyProtocol:
 		Transport: MessageEmitter
 		               + MessageCollector
 		               + PolicyConfig
-		               + X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		               + MuxConnector
 		               + EncryptedProtocolState
 		               + Send
@@ -87,7 +86,6 @@ impl<T> GatewayColonyProtocol for T where
 			Transport: MessageEmitter
 			               + MessageCollector
 			               + PolicyConfig
-			               + X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 			               + MuxConnector
 			               + EncryptedProtocolState
 			               + Send

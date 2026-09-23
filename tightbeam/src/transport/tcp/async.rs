@@ -1,13 +1,14 @@
+use std::sync::Arc;
+
+#[cfg(feature = "tokio")]
 use core::time::Duration;
 #[cfg(feature = "tokio")]
 use std::io::Error as IoError;
-use std::sync::Arc;
 
 #[cfg(feature = "tokio")]
 mod tokio_rt {
 	pub use std::io::ErrorKind;
 	pub use std::net::SocketAddr;
-	pub use std::time::Instant;
 
 	pub use crate::transport::protocols::PersistentConnection;
 	pub use crate::transport::tcp::TightBeamSocketAddr;
@@ -40,8 +41,6 @@ use crate::transport::{
 use crate::Frame;
 use crate::TightBeamError;
 
-#[cfg(all(feature = "tokio", feature = "x509"))]
-use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 #[cfg(all(
@@ -67,22 +66,18 @@ use crate::utils::marker::MaybeSend;
 mod x509 {
 	pub use crate::crypto::aead::{DecryptContent, RecvCipher, SendCipher};
 	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::crypto::x509::policy::CertificateValidation;
 	pub use crate::der::Decode;
 	pub use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 	pub use crate::transport::handshake::BoxedServerHandshake;
-	// Only the listener holds a key manager, and it exists under tokio.
-	#[cfg(feature = "tokio")]
-	pub use crate::transport::handshake::HandshakeKeyManager;
 	pub use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 	pub use crate::transport::state::{EncryptedProtocolState, SessionPhase};
-	pub use crate::transport::{EncryptedMessageIO, TransportEncryptionConfig};
-	#[cfg(any(
-		feature = "tokio",
-		all(
-			feature = "transport-multiplex",
-			any(feature = "transport-cms", feature = "transport-ecies")
-		)
+	pub use crate::transport::EncryptedMessageIO;
+	#[cfg(feature = "tokio")]
+	pub use crate::transport::{EndpointConfig, TransportEncryptionConfig};
+	pub use crate::utils::time::Clock;
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-ecies")
 	))]
 	pub use crate::x509::Certificate;
 
@@ -184,20 +179,13 @@ impl From<TcpStream> for TokioStream {
 	}
 }
 
+/// A tokio TCP listener that builds every accepted transport from one
+/// [`EndpointConfig`].
 #[cfg(feature = "tokio")]
 pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	listener: TcpListener,
-	#[cfg(feature = "x509")]
-	certificate: Option<Arc<Certificate>>,
-	#[cfg(feature = "x509")]
-	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	#[cfg(feature = "x509")]
-	aad_domain_tag: &'static [u8],
-	/// Every ceiling handed to each accepted transport.
-	#[cfg(feature = "x509")]
-	limits: TransportLimits,
-	#[cfg(feature = "x509")]
-	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
+	/// What every accepted transport is built from.
+	config: EndpointConfig<P>,
 }
 
 #[cfg(feature = "tokio")]
@@ -206,45 +194,24 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 		self.listener.local_addr()
 	}
 
-	/// `addr` accepts any type that converts via [`AsRef<str>`].
+	/// Bind a cleartext listener. `addr` accepts any type that converts via
+	/// [`AsRef<str>`].
+	///
+	/// Accepted transports carry no confidentiality, integrity, or peer
+	/// authentication. See [`EndpointConfig::cleartext`].
 	pub async fn bind(addr: impl AsRef<str>) -> Result<Self, IoError> {
 		let listener = TcpListener::bind(addr.as_ref()).await?;
-		Ok(Self {
-			listener,
-			#[cfg(feature = "x509")]
-			certificate: None,
-			#[cfg(feature = "x509")]
-			client_validators: None,
-			#[cfg(feature = "x509")]
-			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
-			#[cfg(feature = "x509")]
-			limits: TransportLimits::default(),
-			#[cfg(feature = "x509")]
-			key_manager: None,
-		})
+		let config = EndpointConfig::cleartext();
+
+		Ok(Self { listener, config })
 	}
 
-	#[cfg(feature = "x509")]
+	/// Accept one connection as a transport built from this listener's
+	/// configuration.
 	pub async fn accept(&self) -> Result<(TcpTransport<TokioStream, P>, SocketAddr), IoError> {
 		let (stream, peer_addr) = self.listener.accept().await?;
 		let tokio_stream = TokioStream::from(stream);
-		let mut transport = TcpTransport::from(tokio_stream);
-
-		if let Some(cert) = &self.certificate {
-			transport.encryption.server_certificate = Some(Arc::clone(cert));
-		}
-		if let Some(ref validators) = self.client_validators {
-			transport.encryption.client_validators = Some(Arc::clone(validators));
-		}
-		transport.encryption.aad_domain_tag = self.aad_domain_tag;
-
-		transport.limits = self.limits;
-		transport.provision();
-
-		#[cfg(feature = "x509")]
-		if let Some(signatory) = &self.key_manager {
-			transport.encryption.key_manager = Some(Arc::clone(signatory));
-		}
+		let transport = TcpTransport::new(tokio_stream, self.config.clone());
 
 		Ok((transport, peer_addr))
 	}
@@ -257,6 +224,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TokioListener<P> {
 	type Error = IoError;
 	type Transport = TcpTransport<TokioStream, P>;
 	type Address = TightBeamSocketAddr;
+	type CryptoProvider = P;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
 		"127.0.0.1:0".parse().map_err(|e| IoError::new(ErrorKind::InvalidInput, e))
@@ -265,22 +233,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TokioListener<P> {
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
-		Ok((
-			Self {
-				listener,
-				#[cfg(feature = "x509")]
-				certificate: None,
-				#[cfg(feature = "x509")]
-				client_validators: None,
-				#[cfg(feature = "x509")]
-				aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
-				#[cfg(feature = "x509")]
-				limits: TransportLimits::default(),
-				#[cfg(feature = "x509")]
-				key_manager: None,
-			},
-			TightBeamSocketAddr(bound_addr),
-		))
+		let config = EndpointConfig::cleartext();
+
+		Ok((Self { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
@@ -289,16 +244,15 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TokioListener<P> {
 		Ok(tokio_stream)
 	}
 
-	fn create_transport(stream: Self::Stream) -> Self::Transport {
-		TcpTransport::from(stream)
+	fn create_transport(stream: Self::Stream, config: EndpointConfig<P>) -> Self::Transport {
+		TcpTransport::new(stream, config)
 	}
 }
 
-#[cfg(all(feature = "tokio", feature = "x509"))]
+#[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListener<P> {
 	type Encryptor = SendCipher;
 	type Decryptor = RecvCipher;
-	type CryptoProvider = P;
 
 	async fn bind_with(
 		addr: Self::Address,
@@ -306,21 +260,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListe
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
-		let certificate = config.certificate;
-		let client_validators = config.client_validators.as_ref().map(Arc::clone);
-		let key_manager = Arc::clone(&config.key_manager);
+		let config = EndpointConfig::from(config);
 
-		Ok((
-			Self {
-				listener,
-				certificate: Some(certificate),
-				client_validators,
-				aad_domain_tag: config.aad_domain_tag,
-				limits: config.limits,
-				key_manager: Some(key_manager),
-			},
-			TightBeamSocketAddr(bound_addr),
-		))
+		Ok((Self { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
 }
 
@@ -339,20 +281,6 @@ where
 	/// for pooled connections; the stream itself is not exposed.
 	pub fn is_alive(&self) -> bool {
 		AsyncProtocolStream::is_alive(&self.stream)
-	}
-}
-
-#[cfg(feature = "x509")]
-impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync + 'static> TcpTransport<S, P>
-where
-	TransportError: From<S::Error>,
-{
-	/// Configure this transport as an encrypted server endpoint.
-	pub fn with_server_encryption(mut self, config: TransportEncryptionConfig<P>) -> Self {
-		use crate::transport::X509ClientConfig;
-
-		self.limits = config.limits;
-		self.with_encryption(config.into())
 	}
 }
 
@@ -394,7 +322,7 @@ where
 {
 	/// Local mux advertisement bound into the handshake transcript; `None` advertises nothing.
 	pub fn with_mux_offer(mut self, offer: impl IntoMuxOffer) -> Self {
-		self.encryption.mux_offer = offer.into_mux_offer();
+		self.state.offer_mux(offer.into_mux_offer());
 		self
 	}
 }
@@ -556,17 +484,39 @@ where
 	}
 }
 
-/// Exclusive receive half of a split encrypted transport.
+/// The wire mode a split receive half reads, with the cipher an encrypted
+/// session needs.
+#[cfg(feature = "x509")]
+enum SplitRecv {
+	/// The transport was named cleartext, so envelopes carry NO
+	/// confidentiality, integrity, replay, or deletion protection.
+	Cleartext,
+	/// The receive-direction cipher of the established session.
+	Encrypted(RecvCipher),
+}
+
+/// The wire mode a split send half writes, with the cipher an encrypted
+/// session needs.
+#[cfg(feature = "x509")]
+enum SplitSend {
+	/// The transport was named cleartext.
+	Cleartext,
+	/// The send-direction cipher of the established session.
+	Encrypted(SendCipher),
+}
+
+/// Exclusive receive half of a split transport.
 ///
-/// Owns the receive-direction cipher, so decryption needs no locks and can
-/// run concurrently with a [`TransportWriter`] on the same connection.
+/// Carries the wire mode its session held when it split. An encrypted half
+/// owns the receive-direction cipher, so decryption needs no locks and can run
+/// concurrently with a [`TransportWriter`] on the same connection.
 #[cfg(feature = "x509")]
 pub struct TransportReader<R>
 where
 	R: AsyncReadStream,
 {
 	stream: R,
-	recv_key: RecvCipher,
+	mode: SplitRecv,
 	limits: TransportLimits,
 	/// Connection collector carried across the split (see
 	/// [`EnvelopeSource::trace`])
@@ -585,9 +535,13 @@ where
 	///
 	/// Trigger policy only: decryption refuses records at the AES-GCM volume bound
 	/// ([`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT))
-	/// regardless of this value.
+	/// regardless of this value. A cleartext half never rekeys, so the limit
+	/// does not apply to it.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
-		self.recv_key = self.recv_key.with_rekey_limit(limit);
+		if let SplitRecv::Encrypted(cipher) = self.mode {
+			self.mode = SplitRecv::Encrypted(cipher.with_rekey_limit(limit));
+		}
+
 		self
 	}
 }
@@ -598,9 +552,15 @@ where
 	R: AsyncReadStream,
 	TransportError: From<R::Error>,
 {
-	/// Decrypt one envelope (post-handshake split: wire must be encrypted).
+	/// Read one envelope in the wire mode this half was split in.
+	///
+	/// The operation deadline bounds the read in either mode, so a peer that
+	/// stops mid-frame cannot pin the reader task (CWE-400).
 	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let max_len = self.limits.encrypted_envelope;
+		let max_len = match &self.mode {
+			SplitRecv::Cleartext => self.limits.cleartext_envelope,
+			SplitRecv::Encrypted(_) => self.limits.encrypted_envelope,
+		};
 
 		#[cfg(all(feature = "tokio", feature = "std", feature = "transport-policy"))]
 		let wire_bytes = timeout(self.limits.operation_timeout, self.stream.read_frame(max_len)).await??;
@@ -608,10 +568,14 @@ where
 		let wire_bytes = self.stream.read_frame(max_len).await?;
 
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-		match wire_envelope {
-			WireEnvelope::Cleartext(_) => Err(TransportError::MissingEncryption),
-			WireEnvelope::Encrypted(encrypted_info) => {
-				let decrypted_bytes = self.recv_key.decrypt_content(&encrypted_info)?;
+		match (&self.mode, wire_envelope) {
+			(SplitRecv::Cleartext, WireEnvelope::Cleartext(envelope)) => Ok(envelope),
+			(SplitRecv::Cleartext, WireEnvelope::Encrypted(_)) => {
+				Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed))
+			}
+			(SplitRecv::Encrypted(_), WireEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
+			(SplitRecv::Encrypted(recv_key), WireEnvelope::Encrypted(encrypted_info)) => {
+				let decrypted_bytes = recv_key.decrypt_content(&encrypted_info)?;
 				let decoded = decrypted_bytes.with(decode_transport_envelope).map_err(TightBeamError::from)?;
 
 				let envelope = decoded?;
@@ -620,17 +584,28 @@ where
 		}
 	}
 
-	/// Records still readable before the receive cipher demands a rekey.
+	/// Records still readable before the receive cipher demands a rekey. A
+	/// cleartext half never demands one.
 	fn remaining_records(&self) -> u64 {
-		self.recv_key.remaining_records()
+		match &self.mode {
+			SplitRecv::Cleartext => u64::MAX,
+			SplitRecv::Encrypted(recv_key) => recv_key.remaining_records(),
+		}
 	}
 
 	/// Swap in the new epoch's receive cipher; its fresh counter resets
 	/// the sequence discipline (NIST SP 800-38D § 8.2.1: counter nonces
 	/// restart only with a fresh key). The configured renewal threshold
 	/// carries over so a tightened rekey cadence survives every epoch.
+	///
+	/// A cleartext half holds no keys, so it refuses the install.
 	fn install_recv_cipher(&mut self, cipher: RecvCipher) -> TransportResult<()> {
-		self.recv_key = cipher.with_rekey_limit(self.recv_key.rekey_limit());
+		let SplitRecv::Encrypted(current) = &self.mode else {
+			return Err(TransportError::MissingEncryption);
+		};
+
+		let renewed = cipher.with_rekey_limit(current.rekey_limit());
+		self.mode = SplitRecv::Encrypted(renewed);
 		Ok(())
 	}
 
@@ -640,9 +615,10 @@ where
 	}
 }
 
-/// Exclusive send half of a split encrypted transport.
+/// Exclusive send half of a split transport.
 ///
-/// Owns the send-direction cipher and its counter nonce, so encryption needs
+/// Carries the wire mode its session held when it split. An encrypted half
+/// owns the send-direction cipher and its counter nonce, so encryption needs
 /// no locks and can run concurrently with a [`TransportReader`] on the same
 /// connection.
 #[cfg(feature = "x509")]
@@ -651,7 +627,7 @@ where
 	W: AsyncWriteStream,
 {
 	stream: W,
-	send_key: SendCipher,
+	mode: SplitSend,
 	/// Every ceiling carried across the split, matching the unsplit path: a
 	/// peer that never drains its receive buffer cannot pin the writer task
 	/// forever (CWE-400).
@@ -670,8 +646,12 @@ where
 {
 	/// Override the send cipher's rekey record limit
 	/// ([RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5)).
+	/// A cleartext half never rekeys, so the limit does not apply to it.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
-		self.send_key = self.send_key.with_rekey_limit(limit);
+		if let SplitSend::Encrypted(cipher) = self.mode {
+			self.mode = SplitSend::Encrypted(cipher.with_rekey_limit(limit));
+		}
+
 		self
 	}
 }
@@ -682,10 +662,14 @@ where
 	W: AsyncWriteStream,
 	TransportError: From<W::Error>,
 {
+	/// Write one envelope in the wire mode this half was split in, bounded
+	/// by the operation deadline in either mode.
 	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
-		let mut builder = EnvelopeBuilder::transport(envelope).with_limits(self.limits);
-		builder = builder.with_wire_mode(WireMode::Encrypted);
-		builder = builder.with_encryptor(&self.send_key);
+		let builder = EnvelopeBuilder::transport(envelope).with_limits(self.limits);
+		let builder = match &self.mode {
+			SplitSend::Cleartext => builder.with_wire_mode(WireMode::Cleartext),
+			SplitSend::Encrypted(send_key) => builder.with_wire_mode(WireMode::Encrypted).with_encryptor(send_key),
+		};
 
 		let wire_envelope = builder.finish()?;
 		let wire_bytes = wire_envelope.to_der()?;
@@ -699,104 +683,29 @@ where
 		Ok(())
 	}
 
-	/// Records still writable before the send cipher demands a rekey.
+	/// Records still writable before the send cipher demands a rekey. A
+	/// cleartext half never demands one.
 	fn remaining_records(&self) -> u64 {
-		self.send_key.remaining_records()
+		match &self.mode {
+			SplitSend::Cleartext => u64::MAX,
+			SplitSend::Encrypted(send_key) => send_key.remaining_records(),
+		}
 	}
 
 	/// Swap in the new epoch's send cipher; its fresh counter resets
 	/// the sequence discipline (NIST SP 800-38D § 8.2.1: counter nonces
 	/// restart only with a fresh key). The configured record limit
 	/// carries over so a tightened rekey cadence survives every epoch.
+	///
+	/// A cleartext half holds no keys, so it refuses the install.
 	fn install_send_cipher(&mut self, cipher: SendCipher) -> TransportResult<()> {
-		self.send_key = cipher.with_rekey_limit(self.send_key.rekey_limit());
+		let SplitSend::Encrypted(current) = &self.mode else {
+			return Err(TransportError::MissingEncryption);
+		};
+
+		let renewed = cipher.with_rekey_limit(current.rekey_limit());
+		self.mode = SplitSend::Encrypted(renewed);
 		Ok(())
-	}
-
-	#[cfg(feature = "instrument")]
-	fn trace(&self) -> Option<TraceCollector> {
-		self.trace.as_ref().map(TraceCollector::share)
-	}
-}
-
-/// Exclusive receive half of a split cleartext transport.
-///
-/// Carries envelopes with NO confidentiality, integrity, replay, or deletion
-/// protection. Only the size cap and frame version checks apply. Use only on
-/// links trusted by other means.
-#[cfg(feature = "x509")]
-pub struct CleartextReader<R>
-where
-	R: AsyncReadStream,
-{
-	stream: R,
-	limits: TransportLimits,
-	/// Connection collector carried across the split (see
-	/// [`EnvelopeSource::trace`])
-	#[cfg(feature = "instrument")]
-	trace: Option<TraceCollector>,
-}
-
-#[cfg(feature = "x509")]
-impl<R> EnvelopeSource for CleartextReader<R>
-where
-	R: AsyncReadStream,
-	TransportError: From<R::Error>,
-{
-	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let max_len = self.limits.cleartext_envelope;
-		let wire_bytes = self.stream.read_frame(max_len).await?;
-
-		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-		match wire_envelope {
-			WireEnvelope::Cleartext(envelope) => Ok(envelope),
-			WireEnvelope::Encrypted(_) => Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed)),
-		}
-	}
-
-	#[cfg(feature = "instrument")]
-	fn trace(&self) -> Option<TraceCollector> {
-		self.trace.as_ref().map(TraceCollector::share)
-	}
-}
-
-/// Exclusive send half of a split cleartext transport.
-///
-/// Writes envelopes with NO confidentiality, integrity, replay, or deletion
-/// protection. See [`CleartextReader`] for the trust prerequisites.
-#[cfg(feature = "x509")]
-pub struct CleartextWriter<W>
-where
-	W: AsyncWriteStream,
-{
-	stream: W,
-	limits: TransportLimits,
-	/// Connection collector carried across the split (see
-	/// [`EnvelopeSink::trace`])
-	#[cfg(feature = "instrument")]
-	trace: Option<TraceCollector>,
-}
-
-#[cfg(feature = "x509")]
-impl<W> EnvelopeSink for CleartextWriter<W>
-where
-	W: AsyncWriteStream,
-	TransportError: From<W::Error>,
-{
-	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
-		let builder = EnvelopeBuilder::transport(envelope)
-			.with_limits(self.limits)
-			.with_wire_mode(WireMode::Cleartext);
-
-		let wire_envelope = builder.finish()?;
-		let wire_bytes = wire_envelope.to_der()?;
-
-		self.stream.write_frame(&wire_bytes).await?;
-		Ok(())
-	}
-
-	fn remaining_records(&self) -> u64 {
-		u64::MAX
 	}
 
 	#[cfg(feature = "instrument")]
@@ -812,13 +721,6 @@ pub type SplitTransport<S> = (
 	TransportWriter<<S as SplittableStream>::WriteHalf>,
 );
 
-/// Read/write halves produced by [`TcpTransport::into_split_cleartext`].
-#[cfg(feature = "x509")]
-pub type CleartextSplitTransport<S> = (
-	CleartextReader<<S as SplittableStream>::ReadHalf>,
-	CleartextWriter<<S as SplittableStream>::WriteHalf>,
-);
-
 #[cfg(feature = "x509")]
 impl<S, P> TcpTransport<S, P>
 where
@@ -826,26 +728,37 @@ where
 	P: CryptoProvider + Send + Sync + 'static,
 	TransportError: From<S::Error>,
 {
-	/// Split a fully handshaken transport into exclusive read and write halves.
+	/// Split the transport into exclusive read and write halves in the wire
+	/// mode its session holds.
 	///
-	/// The receive key moves into the [`TransportReader`] and the send key
-	/// into the [`TransportWriter`]. Directional keys (M0) make this a clean
-	/// ownership transfer with no shared mutable crypto state.
+	/// - An established session moves its receive key into the
+	///   [`TransportReader`] and its send key into the [`TransportWriter`].
+	///   Directional keys make this a clean ownership transfer with no shared
+	///   mutable crypto state.
+	/// - A transport named cleartext splits into cleartext halves, which carry
+	///   NO confidentiality, integrity, replay, or deletion protection.
 	///
-	/// A configured `with_timeout` deadline carries onto both halves and
-	/// bounds every read and write, exactly like the unsplit path: an idle
-	/// or byte-dripping peer surfaces as `DeadlineExceeded` instead of
-	/// pinning the driver task forever.
+	/// The operation deadline carries onto both halves and bounds every read
+	/// and write, exactly like the unsplit path: an idle or byte-dripping peer
+	/// surfaces as `DeadlineExceeded` instead of pinning the driver task.
 	///
 	/// # Errors
-	/// - `InvalidState`: handshake has not completed
-	/// - `OperationFailed(EncryptorUnavailable)`: no session keys present
+	///
+	/// - `InvalidState`: the session is provisioned for encryption and its
+	///   handshake has not completed.
 	pub fn into_split(mut self) -> TransportResult<SplitTransport<S>> {
-		let SessionPhase::Encrypted(session) = core::mem::take(&mut self.state).into_phase() else {
-			return Err(TransportError::InvalidState);
+		let (recv_mode, send_mode) = match self.state.phase() {
+			SessionPhase::Cleartext => (SplitRecv::Cleartext, SplitSend::Cleartext),
+			SessionPhase::Encrypted(_) => {
+				let session = self.state.take_established().ok_or(TransportError::InvalidState)?;
+				let (send_key, recv_key) = session.into_keys().into_parts();
+				(SplitRecv::Encrypted(recv_key), SplitSend::Encrypted(send_key))
+			}
+			SessionPhase::Provisioned | SessionPhase::Handshaking { .. } => {
+				return Err(TransportError::InvalidState);
+			}
 		};
 
-		let (send_key, recv_key) = session.into_keys().into_parts();
 		let limits = self.limits;
 
 		#[cfg(feature = "instrument")]
@@ -854,52 +767,14 @@ where
 		let (read_half, write_half) = self.stream.into_split();
 		let reader = TransportReader {
 			stream: read_half,
-			recv_key,
+			mode: recv_mode,
 			limits,
 			#[cfg(feature = "instrument")]
 			trace: trace.as_ref().map(TraceCollector::share),
 		};
 		let writer = TransportWriter {
 			stream: write_half,
-			send_key,
-			limits,
-			#[cfg(feature = "instrument")]
-			trace,
-		};
-		Ok((reader, writer))
-	}
-
-	/// Split a never-handshaken transport into exclusive cleartext halves.
-	///
-	/// The halves carry envelopes with NO confidentiality, integrity, replay,
-	/// or deletion protection. See [`CleartextReader`].
-	///
-	/// # Errors
-	/// - `InvalidState`: handshake started or completed.
-	/// - `MissingEncryption`: encryption material is configured.
-	pub fn into_split_cleartext(self) -> TransportResult<CleartextSplitTransport<S>> {
-		if !matches!(self.state.phase(), SessionPhase::Cleartext) {
-			return Err(TransportError::InvalidState);
-		}
-
-		if self.encryption.has_encryption_material() {
-			return Err(TransportError::MissingEncryption);
-		}
-
-		let limits = self.limits;
-
-		#[cfg(feature = "instrument")]
-		let trace = self.trace.as_ref().map(TraceCollector::share);
-
-		let (read_half, write_half) = self.stream.into_split();
-		let reader = CleartextReader {
-			stream: read_half,
-			limits,
-			#[cfg(feature = "instrument")]
-			trace: trace.as_ref().map(TraceCollector::share),
-		};
-		let writer = CleartextWriter {
-			stream: write_half,
+			mode: send_mode,
 			limits,
 			#[cfg(feature = "instrument")]
 			trace,
@@ -928,6 +803,10 @@ impl<S: AsyncProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
+	fn clock(&self) -> &dyn Clock {
+		self.clock.as_ref()
+	}
+
 	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 		// An unauthenticated handshake read gets the tight handshake ceiling.
 		// An established session gets the larger of the two envelope ceilings,
@@ -944,15 +823,18 @@ where
 			#[cfg(feature = "x509")]
 			let timeout_duration: Option<Duration> = {
 				match self.state.phase().initiated_at() {
-					Some(initiated_at) => {
-						let now = Instant::now();
-						let deadline = initiated_at.deadline(self.limits.handshake_timeout);
-						if now >= deadline {
-							return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
-						}
+					Some(initiated_at) => match initiated_at.checked_add(self.limits.handshake_timeout) {
+						Some(deadline) => {
+							let now = self.clock.monotonic();
+							if now >= deadline {
+								return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
+							}
 
-						Some(deadline.saturating_duration_since(now))
-					}
+							Some(deadline.saturating_duration_since(now))
+						}
+						// A deadline past every reading never arrives.
+						None => None,
+					},
 					_ if self.is_handshake_pending() => Some(self.limits.handshake_timeout),
 					_ => {
 						#[cfg(feature = "transport-policy")]
@@ -1094,7 +976,9 @@ mod tests {
 	use crate::transport::handshake::{HandshakeError, HandshakeKeyManager, HandshakeProtocolKind};
 	use crate::transport::io::EncryptedMessageIO;
 	use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
-	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig, X509ClientConfig};
+	use crate::transport::{MessageCollector, MessageEmitter, TransportEncryptionConfig};
+	use crate::utils::time::SystemClock;
+	use std::time::Instant;
 
 	#[cfg(feature = "x509")]
 	use crate::policy::TransitStatus;
@@ -1126,7 +1010,7 @@ mod tests {
 	mod cipher_install {
 		use super::super::*;
 		use crate::crypto::aead::RuntimeAead;
-		use crate::testing::TestKey;
+		use crate::testing::{TestFrame, TestKey};
 
 		const PLAINTEXT: &[u8] = b"epoch boundary traffic";
 
@@ -1154,49 +1038,49 @@ mod tests {
 			RuntimeAead::new(cipher)
 		}
 
-		fn encrypted_writer(rekey_limit: u64) -> TransportWriter<NullStream> {
+		fn writer(mode: SplitSend) -> TransportWriter<NullStream> {
 			TransportWriter {
 				stream: NullStream,
-				send_key: SendCipher::new(test_runtime()).with_rekey_limit(rekey_limit),
+				mode,
 				limits: TransportLimits::default(),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
 		}
 
-		fn encrypted_reader() -> TransportReader<NullStream> {
+		fn reader(mode: SplitRecv) -> TransportReader<NullStream> {
 			TransportReader {
 				stream: NullStream,
-				recv_key: RecvCipher::new(test_runtime()),
+				mode,
 				limits: TransportLimits::default(),
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
 		}
 
-		fn cleartext_writer() -> CleartextWriter<NullStream> {
-			CleartextWriter {
-				stream: NullStream,
-				limits: TransportLimits::default(),
-				#[cfg(feature = "instrument")]
-				trace: None,
+		/// The send cipher of an encrypted half. A cleartext half has none, so
+		/// a test that reaches for one names the wrong fixture.
+		fn send_key(writer: &TransportWriter<NullStream>) -> &SendCipher {
+			match &writer.mode {
+				SplitSend::Encrypted(send_key) => send_key,
+				SplitSend::Cleartext => panic!("the fixture must be an encrypted half"),
 			}
 		}
 
-		fn cleartext_reader() -> CleartextReader<NullStream> {
-			CleartextReader {
-				stream: NullStream,
-				limits: TransportLimits::default(),
-				#[cfg(feature = "instrument")]
-				trace: None,
+		/// The receive cipher of an encrypted half.
+		fn recv_key(reader: &TransportReader<NullStream>) -> &RecvCipher {
+			match &reader.mode {
+				SplitRecv::Encrypted(recv_key) => recv_key,
+				SplitRecv::Cleartext => panic!("the fixture must be an encrypted half"),
 			}
 		}
 
 		#[test]
 		fn writer_install_swaps_cipher_and_preserves_limit() -> Result<(), TightBeamError> {
-			let mut writer = encrypted_writer(1);
+			let send_cipher = SendCipher::new(test_runtime()).with_rekey_limit(1);
+			let mut writer = writer(SplitSend::Encrypted(send_cipher));
 
-			writer.send_key.encrypt_next(PLAINTEXT, None)?;
+			send_key(&writer).encrypt_next(PLAINTEXT, None)?;
 			assert_eq!(writer.remaining_records(), 0);
 
 			// Fresh key, reset counter, preserved record policy: the
@@ -1205,7 +1089,7 @@ mod tests {
 			writer.install_send_cipher(fresh_send)?;
 			assert_eq!(writer.remaining_records(), 1);
 
-			writer.send_key.encrypt_next(PLAINTEXT, None)?;
+			send_key(&writer).encrypt_next(PLAINTEXT, None)?;
 			Ok(())
 		}
 
@@ -1213,12 +1097,12 @@ mod tests {
 		fn reader_install_swaps_cipher_and_preserves_threshold() -> Result<(), TightBeamError> {
 			let sender = SendCipher::new(test_runtime());
 			let record_zero = sender.encrypt_next(PLAINTEXT, None)?;
-			let mut reader = encrypted_reader();
-			reader.recv_key = reader.recv_key.with_rekey_limit(2);
+			let recv_cipher = RecvCipher::new(test_runtime()).with_rekey_limit(2);
+			let mut reader = reader(SplitRecv::Encrypted(recv_cipher));
 
-			reader.recv_key.decrypt_content(&record_zero)?;
+			recv_key(&reader).decrypt_content(&record_zero)?;
 
-			let replay = reader.recv_key.decrypt_content(&record_zero);
+			let replay = recv_key(&reader).decrypt_content(&record_zero);
 			assert!(replay.is_err());
 			assert_eq!(reader.remaining_records(), 1);
 
@@ -1230,8 +1114,70 @@ mod tests {
 
 			assert_eq!(reader.remaining_records(), 2);
 
-			reader.recv_key.decrypt_content(&record_zero)?;
+			recv_key(&reader).decrypt_content(&record_zero)?;
 			Ok(())
+		}
+
+		/// A frame stream whose peer never sends and never drains.
+		struct StalledStream;
+
+		impl AsyncReadStream for StalledStream {
+			type Error = IoError;
+
+			async fn read_frame(&mut self, _cap: usize) -> Result<Vec<u8>, Self::Error> {
+				core::future::pending().await
+			}
+		}
+
+		impl AsyncWriteStream for StalledStream {
+			type Error = IoError;
+
+			async fn write_frame(&mut self, _buffer: &[u8]) -> Result<(), Self::Error> {
+				core::future::pending().await
+			}
+		}
+
+		fn one_second_deadline() -> TransportLimits {
+			TransportLimits { operation_timeout: Duration::from_secs(1), ..TransportLimits::default() }
+		}
+
+		/// A cleartext half is bounded by the operation deadline like an
+		/// encrypted one, so a stalled peer cannot pin its task (CWE-400).
+		#[cfg(feature = "transport-policy")]
+		#[tokio::test(start_paused = true)]
+		async fn a_cleartext_reader_gives_up_at_the_operation_deadline() {
+			let mut reader = TransportReader {
+				stream: StalledStream,
+				mode: SplitRecv::Cleartext,
+				limits: one_second_deadline(),
+				#[cfg(feature = "instrument")]
+				trace: None,
+			};
+
+			let outcome = reader.read_envelope().await;
+			assert!(matches!(
+				outcome,
+				Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+			));
+		}
+
+		#[cfg(feature = "transport-policy")]
+		#[tokio::test(start_paused = true)]
+		async fn a_cleartext_writer_gives_up_at_the_operation_deadline() {
+			let mut writer = TransportWriter {
+				stream: StalledStream,
+				mode: SplitSend::Cleartext,
+				limits: one_second_deadline(),
+				#[cfg(feature = "instrument")]
+				trace: None,
+			};
+
+			let envelope = TransportEnvelope::from(TestFrame::v0(None, None));
+			let outcome = writer.write_envelope(envelope).await;
+			assert!(matches!(
+				outcome,
+				Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))
+			));
 		}
 
 		#[test]
@@ -1239,10 +1185,10 @@ mod tests {
 			let send_cipher = SendCipher::new(test_runtime());
 			let recv_cipher = RecvCipher::new(test_runtime());
 
-			let writer_install = cleartext_writer().install_send_cipher(send_cipher);
+			let writer_install = writer(SplitSend::Cleartext).install_send_cipher(send_cipher);
 			assert!(matches!(writer_install, Err(TransportError::MissingEncryption)));
 
-			let reader_install = cleartext_reader().install_recv_cipher(recv_cipher);
+			let reader_install = reader(SplitRecv::Cleartext).install_recv_cipher(recv_cipher);
 			assert!(matches!(reader_install, Err(TransportError::MissingEncryption)));
 		}
 	}
@@ -1343,38 +1289,58 @@ mod tests {
 		Ok((listener, client_stream))
 	}
 
-	#[cfg(feature = "x509")]
-	/// Provisioning a test client dials with, stated in one place.
-	fn client_encryption(trust_store: Arc<dyn CertificateTrust>) -> DialableEncryption<DefaultCryptoProvider> {
-		let encryption = EncryptionConfig { trust_store: Some(trust_store), ..EncryptionConfig::default() };
+	/// A client over `stream` built from `encryption`, which must answer the
+	/// dialer rule.
+	fn client_over(
+		stream: TcpStream,
+		encryption: EncryptionConfig<DefaultCryptoProvider>,
+	) -> TcpTransport<TokioStream> {
+		let encryption = DialableEncryption::new(encryption).expect("the fixture names a peer authority or cleartext");
+		let endpoint = EndpointConfig::new(encryption, Arc::new(SystemClock));
+		TcpTransport::new(TokioStream::from(stream), endpoint)
+	}
 
-		DialableEncryption::new(encryption).expect("a trust store answers for the peer")
+	/// A client that validates the server against `trust_store`.
+	#[cfg(feature = "x509")]
+	fn trusting_client(stream: TcpStream, trust_store: Arc<dyn CertificateTrust>) -> TcpTransport<TokioStream> {
+		client_over(
+			stream,
+			EncryptionConfig { trust_store: Some(trust_store), ..EncryptionConfig::unconfigured() },
+		)
 	}
 
 	fn tcp_transport_from(stream: TcpStream) -> TcpTransport<TokioStream> {
-		let tokio_stream = TokioStream::from(stream);
-		TcpTransport::from(tokio_stream)
+		TcpTransport::new(TokioStream::from(stream), EndpointConfig::cleartext())
 	}
 
+	/// A CMS client holding a signing key, and `trust_store` if one is given.
 	#[cfg(all(feature = "x509", feature = "transport-cms"))]
-	fn cms_test_client(stream: TcpStream) -> TcpTransport<TokioStream> {
+	fn cms_test_client(stream: TcpStream, trust_store: Option<Arc<dyn CertificateTrust>>) -> TcpTransport<TokioStream> {
 		let signing_key = Secp256k1SigningKey::from(TestKey::signing());
 		let key_provider = Secp256k1KeyProvider::from(signing_key);
 		let provider = Arc::new(key_provider);
 		let key_manager = HandshakeKeyManager::new(provider);
 
-		let mut transport = tcp_transport_from(stream);
-		transport.encryption.handshake_protocol = HandshakeProtocolKind::Cms;
-		transport.encryption.key_manager = Some(Arc::new(key_manager));
-		transport.provision();
-		transport
+		// Without a trust store the client names cleartext, which is the only
+		// way to build it, and the handshake it is then driven through must
+		// still refuse to run blind.
+		let allow_cleartext = trust_store.is_none();
+		let encryption = EncryptionConfig {
+			trust_store,
+			key_manager: Some(Arc::new(key_manager)),
+			handshake_protocol: HandshakeProtocolKind::Cms,
+			allow_cleartext,
+			..EncryptionConfig::unconfigured()
+		};
+
+		client_over(stream, encryption)
 	}
 
 	#[cfg(all(feature = "x509", feature = "transport-cms"))]
 	#[tokio::test]
 	async fn cms_client_without_trust_store_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
-		let mut transport = cms_test_client(client_stream);
+		let mut transport = cms_test_client(client_stream, None);
 		let handshake = transport.perform_client_handshake().await;
 		assert!(matches!(
 			handshake,
@@ -1388,7 +1354,7 @@ mod tests {
 	async fn cms_client_without_server_chain_fails_closed() -> TransportResult<()> {
 		let (_listener, client_stream) = bind_and_connect().await?;
 		let trust_store = empty_trust_store();
-		let mut transport = cms_test_client(client_stream).with_trust_store(trust_store);
+		let mut transport = cms_test_client(client_stream, Some(trust_store));
 
 		let handshake = transport.perform_client_handshake().await;
 		assert!(matches!(handshake, Err(TransportError::MissingServerCertificateChain)));
@@ -1407,8 +1373,8 @@ mod tests {
 		let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(1);
 		let response_frame = expected_response.to_owned();
 		let server_handle = tokio::spawn(async move {
-			let (mut transport, _peer) = listener.accept().await?;
-			transport.encryption.handshake_protocol = HandshakeProtocolKind::Cms;
+			let (transport, _peer) = listener.accept().await?;
+			let mut transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
 
 			respond_with(&mut transport, move |msg: Frame| {
 				let _ = received_tx.try_send(msg);
@@ -1427,13 +1393,15 @@ mod tests {
 		let trust_store = trust_store_for(server_cert)?;
 
 		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut encryption = EncryptionConfig { trust_store: Some(trust_store), ..EncryptionConfig::default() };
+		let mut encryption = EncryptionConfig {
+			trust_store: Some(trust_store),
+			server_certificate_chain: Some(server_chain),
+			handshake_protocol: HandshakeProtocolKind::Cms,
+			..EncryptionConfig::unconfigured()
+		};
 		ClientIdentity::new(client_cert, client_keys).install(&mut encryption);
-		encryption.server_certificate_chain = Some(server_chain);
-		encryption.handshake_protocol = HandshakeProtocolKind::Cms;
 
-		let encryption = DialableEncryption::new(encryption).expect("a trust store answers for the peer");
-		let mut transport = tcp_transport_from(client_stream).with_encryption(encryption);
+		let mut transport = client_over(client_stream, encryption);
 		let response = transport.emit(request.to_owned(), None).await?;
 		let received = received_rx.recv().await;
 		assert_eq!(Some(request), received);
@@ -1527,7 +1495,7 @@ mod tests {
 
 		let trust_store = trust_store_for(cert)?;
 		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut transport = tcp_transport_from(client_stream).with_encryption(client_encryption(trust_store));
+		let mut transport = trusting_client(client_stream, trust_store);
 		let first_emit = transport.emit(request.to_owned(), None).await;
 		assert!(matches!(
 			first_emit,
@@ -1567,7 +1535,7 @@ mod tests {
 
 		let trust_store = trust_store_for(cert)?;
 		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut transport = tcp_transport_from(client_stream).with_encryption(client_encryption(trust_store));
+		let mut transport = trusting_client(client_stream, trust_store);
 		assert!(transport.session_state().peer_certificate().is_none());
 
 		transport.ensure_handshake_complete().await?;
@@ -1597,7 +1565,7 @@ mod tests {
 
 		let trust_store = trust_store_for(cert)?;
 		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut transport = tcp_transport_from(client_stream).with_encryption(client_encryption(trust_store));
+		let mut transport = trusting_client(client_stream, trust_store);
 
 		// The server cannot authenticate the key exchange, so it refuses the
 		// handshake and closes the connection under the client's frame.
@@ -1621,9 +1589,12 @@ mod tests {
 
 		let trust_store = trust_store_for(cert)?;
 		let client_stream = TcpStream::connect(server_addr).await?;
-		let mut transport = tcp_transport_from(client_stream)
-			.with_encryption(client_encryption(trust_store))
-			.with_aad_domain_tag(DOMAIN_TAG);
+		let encryption = EncryptionConfig {
+			trust_store: Some(trust_store),
+			aad_domain_tag: DOMAIN_TAG,
+			..EncryptionConfig::unconfigured()
+		};
+		let mut transport = client_over(client_stream, encryption);
 		transport.emit(TestFrame::v0(None, None), None).await?;
 
 		server_handle.await??;

@@ -21,7 +21,8 @@ use crate::transport::envelopes::WireMode;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
-use crate::transport::handshake::{HandshakeInstant, HandshakeKeyManager, HandshakeProtocolKind};
+use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
+use crate::utils::time::MonotonicInstant;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::BoxedServerHandshake;
@@ -46,17 +47,15 @@ use crate::transport::handshake::{EpochMaterials, EstablishedSession};
 /// - CWE-311, missing encryption of sensitive data:
 ///   <https://cwe.mitre.org/data/definitions/311.html>
 #[cfg(feature = "x509")]
-#[derive(Default)]
 pub enum SessionPhase {
-	/// The endpoint carries no encryption provisioning, so frames travel in
-	/// the clear as a configured choice.
-	#[default]
+	/// The endpoint carries no encryption provisioning and named cleartext,
+	/// so frames travel in the clear as a configured choice.
 	Cleartext,
 	/// Encryption is provisioned and no handshake has started. A write in
 	/// this phase fails with [`TransportFailure::EncryptorUnavailable`].
 	Provisioned,
 	/// A handshake is in flight, measured against `initiated_at`.
-	Handshaking { initiated_at: HandshakeInstant },
+	Handshaking { initiated_at: MonotonicInstant },
 	/// The handshake completed. The phase carries everything it agreed, so a
 	/// session's keys and the terms that go with them cannot be separated, and
 	/// leaving this phase drops all of them together.
@@ -65,6 +64,20 @@ pub enum SessionPhase {
 
 #[cfg(feature = "x509")]
 impl SessionPhase {
+	/// The phase an endpoint provisioned with `encryption` starts in, and
+	/// returns to when its session breaks.
+	///
+	/// The one place that pairs provisioning with a phase. An endpoint holding
+	/// encryption material never starts in `Cleartext`, which would write
+	/// application data in the clear (CWE-311).
+	fn start_for<P: CryptoProvider>(encryption: &EncryptionConfig<P>) -> Self {
+		if encryption.is_provisioned() {
+			return Self::Provisioned;
+		}
+
+		Self::Cleartext
+	}
+
 	/// A pooled connection is leased only in a writable phase, so a peer that
 	/// stalls its handshake keeps that connection out of the pool. A phase
 	/// added later stays unwritable until it is named here.
@@ -75,19 +88,15 @@ impl SessionPhase {
 	/// Whether this phase admits `event`.
 	///
 	/// The alphabet is small and each event names one move, so two events that
-	/// happen to land on the same phase keep their own legality. Provisioning
-	/// and a reset both reach [`Self::Provisioned`], and only the reset may
-	/// leave an established session.
+	/// land on the same phase keep their own legality.
 	const fn admits(&self, event: &SessionEvent) -> bool {
 		matches!(
 			(self, event),
-			// A session is provisioned once, before any handshake runs.
-			(Self::Cleartext, SessionEvent::Provision)
-				// The handshake, which may take several rounds.
-				| (Self::Provisioned | Self::Handshaking { .. }, SessionEvent::BeginHandshake)
+			// The handshake, which may take several rounds.
+			(Self::Provisioned | Self::Handshaking { .. }, SessionEvent::BeginHandshake(_))
 				| (Self::Handshaking { .. }, SessionEvent::Install(_))
 				// The circuit breaker, from wherever the session got to.
-				| (_, SessionEvent::Reset { .. })
+				| (_, SessionEvent::Reset)
 		)
 	}
 
@@ -105,7 +114,7 @@ impl SessionPhase {
 	}
 
 	/// When the in-flight handshake began, if one is in flight.
-	pub const fn initiated_at(&self) -> Option<HandshakeInstant> {
+	pub const fn initiated_at(&self) -> Option<MonotonicInstant> {
 		match self {
 			Self::Handshaking { initiated_at } => Some(*initiated_at),
 			_ => None,
@@ -113,66 +122,62 @@ impl SessionPhase {
 	}
 }
 
-/// Restricts [`EncryptedProtocolState`] to this crate.
+/// Restricts [`EncryptedProtocolState`] and [`ServerHandshakeSlot`] to this
+/// crate.
 ///
-/// The trait hands out session ciphers and the server handshake slot, which an
-/// outside implementation could supply from anywhere. Implementing it is kept
-/// in-crate so those come from a handshake this crate ran.
+/// The traits hand out session ciphers and the server handshake slot, which an
+/// outside implementation could supply from anywhere. Each in-crate transport
+/// implements [`sealed::Sealed`] by name, and no blanket implementation
+/// exists, so those come from a handshake this crate ran.
 #[cfg(feature = "x509")]
-mod sealed {
+pub(crate) mod sealed {
+	/// Implemented by name for each in-crate transport.
 	pub trait Sealed {}
 }
 
-/// Marks a type as an in-crate transport state, which is what
-/// [`EncryptedProtocolState`] requires.
-#[cfg(feature = "x509")]
-pub trait SealedProtocolState: sealed::Sealed {}
-
-#[cfg(feature = "x509")]
-impl<T: SealedProtocolState> sealed::Sealed for T {}
-
 /// What can happen to a session, which is the alphabet the phase table reads.
-///
-/// Naming the move rather than the destination keeps provisioning distinct
-/// from a reset that lands on the same phase.
 #[cfg(feature = "x509")]
 pub(crate) enum SessionEvent {
-	/// Encryption material is installed, so a handshake is now expected.
-	Provision,
-	/// A handshake round starts, timed from now.
-	BeginHandshake,
+	/// A handshake round starts at the given reading.
+	BeginHandshake(MonotonicInstant),
 	/// A handshake completed and hands over everything it agreed.
 	Install(Box<EstablishedSession>),
 	/// The circuit breaker drops any session and returns to the start.
-	Reset { expects_encryption: bool },
+	Reset,
 }
 
-#[cfg(feature = "x509")]
-impl SessionEvent {
-	/// The phase this event lands the session in.
-	fn destination(self) -> SessionPhase {
-		match self {
-			Self::Provision => SessionPhase::Provisioned,
-			Self::BeginHandshake => SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() },
-			Self::Install(session) => SessionPhase::Encrypted(session),
-			Self::Reset { expects_encryption: true } => SessionPhase::Provisioned,
-			Self::Reset { expects_encryption: false } => SessionPhase::Cleartext,
-		}
-	}
-}
-
-/// A session's phase, which moves only along the transition table.
+/// A session's phase and the provisioning it was built for.
 ///
-/// The phase is private and every move below consults the table, so a caller
-/// cannot place a session in a phase the table does not name.
+/// Both are private and one constructor sets them together, so the phase an
+/// endpoint starts in, and returns to on a reset, always follows from the
+/// provisioning it holds. Every move afterwards consults the transition
+/// table, so a caller cannot place a session in a phase the table does not
+/// name.
 #[cfg(feature = "x509")]
-#[derive(Default)]
-pub struct SessionState {
+pub struct SessionState<P: CryptoProvider> {
+	encryption: EncryptionConfig<P>,
 	phase: SessionPhase,
 }
 
 #[cfg(feature = "x509")]
-impl SessionState {
+impl<P: CryptoProvider> SessionState<P> {
+	/// A session for `encryption`, at the phase that provisioning starts in.
+	///
+	/// [`DialableEncryption`] guarantees the endpoint either holds a peer
+	/// authority or named cleartext, so the start is `Provisioned` or a
+	/// chosen `Cleartext`.
+	pub fn new(encryption: DialableEncryption<P>) -> Self {
+		let encryption = encryption.0;
+		let phase = SessionPhase::start_for(&encryption);
+
+		Self { encryption, phase }
+	}
+
+	/// What this endpoint was provisioned with.
+	pub fn encryption(&self) -> &EncryptionConfig<P> {
+		&self.encryption
+	}
+
 	/// Where this session currently sits.
 	pub fn phase(&self) -> &SessionPhase {
 		&self.phase
@@ -188,30 +193,19 @@ impl SessionState {
 			return false;
 		}
 
-		self.phase = event.destination();
+		self.phase = match event {
+			SessionEvent::BeginHandshake(initiated_at) => SessionPhase::Handshaking { initiated_at },
+			SessionEvent::Install(session) => SessionPhase::Encrypted(session),
+			SessionEvent::Reset => SessionPhase::start_for(&self.encryption),
+		};
 
 		true
 	}
 
-	/// Move to `Provisioned` when `encryption` holds material a handshake
-	/// needs.
-	///
-	/// The one place that pairs the configuration's answer with the phase it
-	/// implies. A transport holding a certificate but still claiming
-	/// `Cleartext` would write application data in the clear (CWE-311).
-	pub fn provision_for<P: CryptoProvider>(&mut self, encryption: &EncryptionConfig<P>) {
-		if !encryption.is_provisioned() {
-			return;
-		}
-
-		// Only a session still at `Cleartext` has anything to provision.
-		let _provisioned = self.apply(SessionEvent::Provision);
-	}
-
-	/// Record that a handshake has started, timed from now.
+	/// Record that a handshake started at `now`.
 	#[must_use]
-	pub fn begin_handshake(&mut self) -> bool {
-		self.apply(SessionEvent::BeginHandshake)
+	pub fn begin_handshake(&mut self, now: MonotonicInstant) -> bool {
+		self.apply(SessionEvent::BeginHandshake(now))
 	}
 
 	/// Install everything a completed handshake agreed.
@@ -223,15 +217,68 @@ impl SessionState {
 		self.apply(SessionEvent::Install(Box::new(session)))
 	}
 
-	/// Drop any session and return to the phase this endpoint starts in.
+	/// Drop any session and return to the phase this endpoint's provisioning
+	/// starts in.
 	///
-	/// The circuit breaker. `expects_encryption` names which start that is:
-	/// an endpoint holding encryption material returns to `Provisioned`, one
-	/// without it to `Cleartext`.
-	pub fn reset(&mut self, expects_encryption: bool) {
+	/// This is the circuit breaker. It reads the destination from the
+	/// provisioning this state holds, so no caller names it.
+	pub fn reset(&mut self) {
 		// The breaker is admitted from every phase, so its answer carries no
 		// information a caller could act on.
-		let _returned_to_start = self.apply(SessionEvent::Reset { expects_encryption });
+		let _returned_to_start = self.apply(SessionEvent::Reset);
+	}
+
+	/// Detach the established session, returning this state to its start.
+	///
+	/// For a caller that splits the endpoint into halves: the halves take the
+	/// keys, and the state they leave behind holds none.
+	pub(crate) fn take_established(&mut self) -> Option<Box<EstablishedSession>> {
+		if !self.phase.requires_encryption() {
+			return None;
+		}
+
+		let start = SessionPhase::start_for(&self.encryption);
+		let SessionPhase::Encrypted(session) = core::mem::replace(&mut self.phase, start) else {
+			return None;
+		};
+
+		Some(session)
+	}
+
+	/// Replace the multiplexing capability this endpoint offers.
+	///
+	/// This and the setters below change negotiation input, never a peer
+	/// authority, so the phase this state starts in does not depend on them.
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
+	pub(crate) fn offer_mux(&mut self, offer: Option<Arc<TransportOffer>>) {
+		self.encryption.mux_offer = offer;
+	}
+
+	/// Replace the budget-grant policy a server consults.
+	pub(crate) fn authorize_transport(&mut self, authorizer: Arc<dyn TransportAuthorizer>) {
+		self.encryption.transport_authorizer = Some(authorizer);
+	}
+
+	/// Replace the observer of budget-bearing handshake outcomes.
+	pub(crate) fn observe_sessions(&mut self, observer: Arc<dyn SessionObserver>) {
+		self.encryption.session_observer = Some(observer);
+	}
+
+	/// Replace the approver consulted before countersigning a
+	/// challenge-bearing receipt.
+	pub(crate) fn approve_receipts(&mut self, approver: Arc<dyn ReceiptApprover>) {
+		self.encryption.receipt_approver = Some(approver);
+	}
+
+	/// Replace the handshake protocol a provisioned endpoint runs.
+	///
+	/// The protocol decides how a handshake runs, not whether one is
+	/// expected, so the phase this state starts in does not depend on it.
+	pub(crate) fn select_handshake(&mut self, kind: HandshakeProtocolKind) {
+		self.encryption.handshake_protocol = kind;
 	}
 
 	/// Detach the epoch rekey materials the handshake left, once.
@@ -305,16 +352,11 @@ impl SessionState {
 		self.established()?.receipt_arc()
 	}
 
-	/// Take the phase out, for a caller that consumes the endpoint.
-	pub fn into_phase(self) -> SessionPhase {
-		self.phase
-	}
-
 	/// Place a probe directly in `phase`, so a test of the table does not have
 	/// to walk the table to reach its starting point.
 	#[cfg(test)]
-	pub(crate) fn at(phase: SessionPhase) -> Self {
-		Self { phase }
+	pub(crate) fn at(encryption: EncryptionConfig<P>, phase: SessionPhase) -> Self {
+		Self { encryption, phase }
 	}
 }
 
@@ -445,35 +487,6 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 
 #[cfg(feature = "x509")]
 impl<P: CryptoProvider> EncryptionConfig<P> {
-	/// Whether this endpoint can establish who its peer is.
-	///
-	/// A server presents its own certificate and validates a client through
-	/// `client_validators`. A client validates the server through its trust
-	/// store. A client certificate proves who this endpoint is, so it answers
-	/// a different question and is absent here.
-	pub fn authenticates_peer(&self) -> bool {
-		// Destructured without `..` for the same reason as
-		// [`Self::is_provisioned`]: a new kind of peer authority must be
-		// classified here rather than silently ignored (CWE-295).
-		let Self {
-			trust_store,
-			client_validators,
-			server_certificate,
-			server_certificate_chain: _,
-			client_identity: _,
-			key_manager: _,
-			aad_domain_tag: _,
-			mux_offer: _,
-			transport_authorizer: _,
-			receipt_approver: _,
-			session_observer: _,
-			handshake_protocol: _,
-			allow_cleartext: _,
-		} = self;
-
-		trust_store.is_some() || client_validators.is_some() || server_certificate.is_some()
-	}
-
 	/// Trust store that validates the peer's certificate.
 	pub fn trust_store(&self) -> Option<&Arc<dyn CertificateTrust>> {
 		self.trust_store.as_ref()
@@ -494,11 +507,17 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		self.handshake_protocol
 	}
 
-	/// Whether this endpoint is provisioned to encrypt.
+	/// Whether this endpoint is provisioned to encrypt, which is the same as
+	/// whether it can establish who its peer is.
 	///
-	/// A server certificate, a trust store, or client validators each mean a
-	/// handshake is expected. This is the one definition the handshake
-	/// dispatcher, the inbound collector, and the cleartext split all read.
+	/// Each of these means a handshake is expected and names a peer authority:
+	///
+	/// - a server certificate this endpoint presents
+	/// - client validators a server checks a client certificate against
+	/// - a trust store a client checks the server certificate against
+	///
+	/// A client certificate proves who this endpoint is, so it answers a
+	/// different question and is absent here.
 	pub fn is_provisioned(&self) -> bool {
 		// Destructured without `..`, so a field added to this configuration
 		// stops compiling here until someone says whether it implies a
@@ -528,60 +547,30 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 		self.client_identity.is_some()
 	}
 
-	/// Whether any encryption material is installed at all.
+	/// Whether this endpoint may reach a peer it cannot authenticate.
 	///
-	/// Broader than [`Self::is_provisioned`]: a client identity alone starts
-	/// no handshake, yet it means this endpoint was configured for a secured
-	/// link, so handing it a cleartext path is a configuration error.
-	pub fn has_encryption_material(&self) -> bool {
-		self.is_provisioned() || self.has_client_identity() || self.key_manager.is_some()
-	}
-
-	/// Whether this endpoint may dial a peer it cannot authenticate.
-	///
-	/// A dialer picks the address, so it decides who it is willing to reach.
 	/// An endpoint that can establish nothing about its peer reaches whoever
 	/// answered (CWE-295), and naming cleartext is the only way to accept that.
-	///
-	/// The companion rule is [`Self::check_cleartext_write`], which every
-	/// endpoint passes. This one is stricter and applies to dialers alone: a
-	/// server never chooses its peer, so it is not asked this question.
+	/// Every transport is built from provisioning that passed this rule, so a
+	/// cleartext phase always carries a named choice.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the dialer
+	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the endpoint
 	///   authenticates no peer and did not name cleartext.
 	pub fn check_dial_permitted(&self) -> TransportResult<()> {
-		if !self.authenticates_peer() && !self.allow_cleartext {
+		if !self.is_provisioned() && !self.allow_cleartext {
 			return Err(TransportError::PeerAuthenticationUnconfigured);
 		}
 
 		Ok(())
 	}
 
-	/// Whether this endpoint may put a cleartext frame on the wire.
+	/// Provisioning with nothing installed, which a builder accumulates into.
 	///
-	/// An endpoint carrying a client identity would hand that identity, and
-	/// its traffic, to a peer it has not authenticated (CWE-295). An endpoint
-	/// carrying no identity reveals nothing about itself, so plain cleartext
-	/// stays available to a deployment that wants it.
-	///
-	/// # Errors
-	///
-	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- a client
-	///   identity is provisioned with no means of authenticating the peer.
-	pub fn check_cleartext_write(&self) -> TransportResult<()> {
-		if self.has_client_identity() && !self.authenticates_peer() && !self.allow_cleartext {
-			return Err(TransportError::PeerAuthenticationUnconfigured);
-		}
-
-		Ok(())
-	}
-}
-
-#[cfg(feature = "x509")]
-impl<P: CryptoProvider> Default for EncryptionConfig<P> {
-	fn default() -> Self {
+	/// It authenticates no peer and names no cleartext, so it becomes a
+	/// transport only after [`DialableEncryption::new`] accepts what was added.
+	pub(crate) fn unconfigured() -> Self {
 		Self {
 			trust_store: None,
 			server_certificate: None,
@@ -603,7 +592,7 @@ impl<P: CryptoProvider> Default for EncryptionConfig<P> {
 /// An endpoint that accepts handshakes, and so keeps the orchestrator driving
 /// the one in flight.
 #[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
-pub trait ServerHandshakeSlot: SealedProtocolState {
+pub trait ServerHandshakeSlot: sealed::Sealed {
 	/// The orchestrator carrying this endpoint's in-flight server handshake.
 	///
 	/// `None` before the first client message arrives, and again once the
@@ -613,13 +602,8 @@ pub trait ServerHandshakeSlot: SealedProtocolState {
 
 /// Provisioning that has passed [`EncryptionConfig::check_dial_permitted`].
 ///
-/// A transport takes its provisioning only in this form, so no path installs
-/// provisioning that was never asked the question.
-///
-/// Passing stays true. The per-field setters a transport exposes only add
-/// material, and no kind of material removes a peer authority. The wire rule,
-/// [`EncryptionConfig::check_cleartext_write`], does not behave that way, so it
-/// stays where every write reaches it.
+/// A transport is built only from this form, through [`SessionState::new`],
+/// so no path installs provisioning that was never asked the question.
 #[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct DialableEncryption<P: CryptoProvider>(EncryptionConfig<P>);
@@ -638,12 +622,23 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 		Ok(Self(encryption))
 	}
 
+	/// Cleartext as a named choice: no peer authority and no encryption.
+	///
+	/// Frames travel with no confidentiality, integrity, or peer
+	/// authentication, which suits a loopback fixture or a link a lower layer
+	/// already secures.
+	pub fn cleartext() -> Self {
+		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
+
+		Self(encryption)
+	}
+
 	/// Accept provisioning that carries a peer authority by construction.
 	///
 	/// [`TransportEncryptionConfig`] holds a server certificate rather than an
-	/// `Option` of one, so [`EncryptionConfig::authenticates_peer`] holds for
-	/// every value it converts to and the rule has no work to do. It is the
-	/// only caller. Everything else goes through [`Self::new`].
+	/// `Option` of one, so [`EncryptionConfig::is_provisioned`] holds for every
+	/// value it converts to and the rule has no work to do. It is the only
+	/// caller. Everything else goes through [`Self::new`].
 	///
 	/// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
 	pub(crate) fn from_peer_authority(encryption: EncryptionConfig<P>) -> Self {
@@ -651,38 +646,52 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 	}
 
 	/// The provisioning this answer was given for.
-	pub fn into_inner(self) -> EncryptionConfig<P> {
-		self.0
+	pub fn encryption(&self) -> &EncryptionConfig<P> {
+		&self.0
 	}
 }
 
 /// State accessors for encrypted transports, separate from I/O.
+///
+/// The trait is sealed: only this crate's transports implement it, so the
+/// session ciphers it hands out come from a handshake this crate ran.
+///
+/// ```compile_fail,E0277
+/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// use tightbeam::transport::state::{EncryptedProtocolState, SessionState};
+/// use tightbeam::transport::TransportLimits;
+///
+/// struct Forged;
+///
+/// impl EncryptedProtocolState for Forged {
+///     type CryptoProvider = DefaultCryptoProvider;
+///
+///     fn session_state(&self) -> &SessionState<DefaultCryptoProvider> {
+///         unimplemented!()
+///     }
+///
+///     fn session_state_mut(&mut self) -> &mut SessionState<DefaultCryptoProvider> {
+///         unimplemented!()
+///     }
+///
+///     fn limits(&self) -> &TransportLimits {
+///         unimplemented!()
+///     }
+/// }
+/// ```
 #[cfg(feature = "x509")]
-pub trait EncryptedProtocolState: SealedProtocolState {
+pub trait EncryptedProtocolState: sealed::Sealed {
 	/// Crypto provider bound to this transport.
 	type CryptoProvider: CryptoProvider + Send + Sync + 'static;
 
 	/// This endpoint's session state.
-	fn session_state(&self) -> &SessionState;
+	fn session_state(&self) -> &SessionState<Self::CryptoProvider>;
 
 	/// Mutable access to this endpoint's session state.
 	///
 	/// The state guards its own phase, so a caller reaching this still cannot
 	/// place the session in a phase the transition table does not name.
-	fn session_state_mut(&mut self) -> &mut SessionState;
-
-	/// A server certificate, a trust store, or client validators each imply a
-	/// handshake, so the dispatcher and the wire-mode decision agree on what
-	/// counts as provisioned.
-	fn expects_encryption(&self) -> bool {
-		self.encryption().is_provisioned()
-	}
-
-	/// Drop any session and return to the phase this endpoint starts in.
-	fn reset_session(&mut self) {
-		let expects_encryption = self.expects_encryption();
-		self.session_state_mut().reset(expects_encryption);
-	}
+	fn session_state_mut(&mut self) -> &mut SessionState<Self::CryptoProvider>;
 
 	/// Every envelope this endpoint writes passes through here, so the wire
 	/// mode is decided once per session rather than once per call site.
@@ -697,10 +706,7 @@ pub trait EncryptedProtocolState: SealedProtocolState {
 			SessionPhase::Encrypted(session) => Ok(builder
 				.with_wire_mode(WireMode::Encrypted)
 				.with_encryptor(session.keys().send())),
-			SessionPhase::Cleartext => {
-				self.encryption().check_cleartext_write()?;
-				Ok(builder.with_wire_mode(WireMode::Cleartext))
-			}
+			SessionPhase::Cleartext => Ok(builder.with_wire_mode(WireMode::Cleartext)),
 			SessionPhase::Provisioned | SessionPhase::Handshaking { .. } => {
 				Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
 			}
@@ -708,7 +714,9 @@ pub trait EncryptedProtocolState: SealedProtocolState {
 	}
 
 	/// What this endpoint was provisioned with.
-	fn encryption(&self) -> &EncryptionConfig<Self::CryptoProvider>;
+	fn encryption(&self) -> &EncryptionConfig<Self::CryptoProvider> {
+		self.session_state().encryption()
+	}
 
 	/// Every ceiling this endpoint enforces.
 	fn limits(&self) -> &TransportLimits;
@@ -731,36 +739,33 @@ mod tests {
 	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::testing::TestFrame;
+	use crate::utils::time::{Clock, ManualClock};
 
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	use crate::testing::fixtures::{TestCertificate, TestKey};
 
 	/// Holds the phase the trait reads back.
 	struct PhaseProbe {
-		state: SessionState,
-		encryption: EncryptionConfig<DefaultCryptoProvider>,
+		state: SessionState<DefaultCryptoProvider>,
 		limits: TransportLimits,
 	}
 
 	impl PhaseProbe {
-		/// Client validators alone make the probe expect encryption, which is
-		/// what `provision` reads.
+		/// Client validators alone make the probe expect encryption.
 		fn provisioned(phase: SessionPhase) -> Self {
-			let client_validators = Some(Arc::new(Vec::new()));
-			let encryption = EncryptionConfig { client_validators, ..EncryptionConfig::default() };
-			Self { state: SessionState::at(phase), encryption, limits: TransportLimits::default() }
+			Self::holding(provisioned_encryption(), phase)
 		}
 
-		fn unprovisioned(phase: SessionPhase) -> Self {
-			Self {
-				state: SessionState::at(phase),
-				encryption: EncryptionConfig::default(),
-				limits: TransportLimits::default(),
-			}
+		fn cleartext(phase: SessionPhase) -> Self {
+			Self::holding(DialableEncryption::cleartext().0, phase)
+		}
+
+		fn holding(encryption: EncryptionConfig<DefaultCryptoProvider>, phase: SessionPhase) -> Self {
+			Self { state: SessionState::at(encryption, phase), limits: TransportLimits::default() }
 		}
 	}
 
-	impl SealedProtocolState for PhaseProbe {}
+	impl sealed::Sealed for PhaseProbe {}
 
 	impl EncryptedProtocolState for PhaseProbe {
 		type CryptoProvider = DefaultCryptoProvider;
@@ -769,80 +774,148 @@ mod tests {
 			&self.limits
 		}
 
-		fn encryption(&self) -> &EncryptionConfig<DefaultCryptoProvider> {
-			&self.encryption
-		}
-
-		fn session_state(&self) -> &SessionState {
+		fn session_state(&self) -> &SessionState<DefaultCryptoProvider> {
 			&self.state
 		}
 
-		fn session_state_mut(&mut self) -> &mut SessionState {
+		fn session_state_mut(&mut self) -> &mut SessionState<DefaultCryptoProvider> {
 			&mut self.state
 		}
 	}
 
+	fn provisioned_encryption() -> EncryptionConfig<DefaultCryptoProvider> {
+		let client_validators = Some(Arc::new(Vec::new()));
+
+		EncryptionConfig { client_validators, ..EncryptionConfig::unconfigured() }
+	}
+
 	fn handshaking() -> SessionPhase {
-		SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() }
+		SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
+	}
+
+	/// A provisioned endpoint starts where a handshake is expected, and a
+	/// cleartext one only where cleartext was named (CWE-311).
+	#[test]
+	fn a_session_starts_where_its_provisioning_says() -> TransportResult<()> {
+		let provisioned = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
+		assert!(matches!(provisioned.phase(), SessionPhase::Provisioned));
+
+		let cleartext = SessionState::<DefaultCryptoProvider>::new(DialableEncryption::cleartext());
+		assert!(matches!(cleartext.phase(), SessionPhase::Cleartext));
+		Ok(())
+	}
+
+	/// Provisioning that neither authenticates a peer nor names cleartext
+	/// never becomes a session (CWE-295).
+	#[test]
+	fn provisioning_without_a_peer_authority_or_cleartext_is_refused() {
+		let refused = DialableEncryption::<DefaultCryptoProvider>::new(EncryptionConfig::unconfigured());
+		assert!(matches!(refused, Err(TransportError::PeerAuthenticationUnconfigured)));
+	}
+
+	/// The breaker returns a provisioned session to `Provisioned` whatever
+	/// phase it reached, so a broken session never writes in the clear
+	/// (CWE-311).
+	#[test]
+	fn resetting_a_provisioned_session_returns_it_to_provisioned() {
+		let mut probe = PhaseProbe::provisioned(handshaking());
+		probe.session_state_mut().reset();
+		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
 	}
 
 	#[test]
-	fn an_unprovisioned_session_is_cleartext() {
-		let probe = PhaseProbe::unprovisioned(SessionPhase::Cleartext);
+	fn resetting_a_cleartext_session_returns_it_to_cleartext() {
+		let mut probe = PhaseProbe::cleartext(SessionPhase::Cleartext);
+		probe.session_state_mut().reset();
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Cleartext));
 	}
 
-	/// Every event a session can raise from every phase it can sit in, checked
-	/// against the table. `SessionState::apply` is the only writer of the
-	/// phase, so a pair the table omits is a move no caller can make.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	#[test]
-	fn the_table_admits_exactly_the_events_a_session_may_raise() {
-		let phases = ["cleartext", "provisioned", "handshaking", "encrypted"];
-		let phase_for = |name: &str| match name {
+	fn only_cleartext_and_encrypted_phases_are_writable() {
+		assert!(SessionPhase::Cleartext.is_writable());
+		assert!(!SessionPhase::Provisioned.is_writable());
+		assert!(!handshaking().is_writable());
+	}
+
+	/// Every envelope path applies the wire mode here, so this refusal is the
+	/// one that keeps a stalled session from writing in the clear (CWE-311).
+	#[test]
+	fn pending_session_refuses_to_apply_a_wire_mode() {
+		let probe = PhaseProbe::provisioned(handshaking());
+		let frame = TestFrame::v0(None, None);
+
+		let builder = EnvelopeBuilder::request(frame);
+		let refusal = probe.apply_wire_mode(builder);
+		assert!(matches!(
+			refusal,
+			Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
+		));
+	}
+
+	/// A provisioned session that is reset from anywhere writes nothing in the
+	/// clear, which is what CB-001 reached through a public reset flag.
+	#[test]
+	fn a_reset_provisioned_session_refuses_a_cleartext_write() -> TransportResult<()> {
+		let mut state = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
+		state.reset();
+
+		let probe = PhaseProbe { state, limits: TransportLimits::default() };
+		let builder = EnvelopeBuilder::request(TestFrame::v0(None, None));
+		let refusal = probe.apply_wire_mode(builder);
+		assert!(matches!(
+			refusal,
+			Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
+		));
+		Ok(())
+	}
+
+	// Every event a session can raise from every phase it can sit in, checked
+	// against the table. `SessionState::apply` is the only writer of the
+	// phase, so a pair the table omits is a move no caller can make. A refused
+	// event leaves the session where it was.
+	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	crate::tb_cases! {
+		fn the_phase_table((phase, event, admitted, landing): (&str, &str, bool, &str)) {
+			let mut state = SessionState::at(provisioned_encryption(), phase_named(phase));
+			assert_eq!(state.apply(event_named(event)), admitted, "{phase} on {event}");
+			assert_eq!(
+				core::mem::discriminant(state.phase()),
+				core::mem::discriminant(&phase_named(landing)),
+				"{phase} on {event} must land in {landing}"
+			);
+		}
+		cases {
+			cleartext_refuses_begin => ("cleartext", "begin", false, "cleartext"),
+			cleartext_refuses_install => ("cleartext", "install", false, "cleartext"),
+			cleartext_resets_to_start => ("cleartext", "reset", true, "provisioned"),
+			provisioned_begins => ("provisioned", "begin", true, "handshaking"),
+			provisioned_refuses_install => ("provisioned", "install", false, "provisioned"),
+			provisioned_resets_to_start => ("provisioned", "reset", true, "provisioned"),
+			handshaking_begins_again => ("handshaking", "begin", true, "handshaking"),
+			handshaking_installs => ("handshaking", "install", true, "encrypted"),
+			handshaking_resets_to_start => ("handshaking", "reset", true, "provisioned"),
+			encrypted_refuses_begin => ("encrypted", "begin", false, "encrypted"),
+			encrypted_refuses_install => ("encrypted", "install", false, "encrypted"),
+			encrypted_resets_to_start => ("encrypted", "reset", true, "provisioned"),
+		}
+	}
+
+	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	fn phase_named(name: &str) -> SessionPhase {
+		match name {
 			"cleartext" => SessionPhase::Cleartext,
 			"provisioned" => SessionPhase::Provisioned,
 			"handshaking" => handshaking(),
 			_ => SessionPhase::Encrypted(Box::new(established_session())),
-		};
+		}
+	}
 
-		let events = ["provision", "begin", "install", "reset"];
-		let event_for = |name: &str| match name {
-			"provision" => SessionEvent::Provision,
-			"begin" => SessionEvent::BeginHandshake,
+	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	fn event_named(name: &str) -> SessionEvent {
+		match name {
+			"begin" => SessionEvent::BeginHandshake(ManualClock::default().monotonic()),
 			"install" => SessionEvent::Install(Box::new(established_session())),
-			_ => SessionEvent::Reset { expects_encryption: false },
-		};
-
-		// A session is provisioned once, walks the handshake, and may reset
-		// from anywhere. Provisioning an established session is refused, so
-		// reconfiguring a live transport keeps the keys it agreed.
-		let landing = |phase: &str, event: &str| -> Option<&'static str> {
-			match (phase, event) {
-				("cleartext", "provision") => Some("provisioned"),
-				("provisioned" | "handshaking", "begin") => Some("handshaking"),
-				("handshaking", "install") => Some("encrypted"),
-				(_, "reset") => Some("cleartext"),
-				_ => None,
-			}
-		};
-
-		for phase in phases {
-			for event in events {
-				let mut state = SessionState::at(phase_for(phase));
-				let moved = state.apply(event_for(event));
-				let expected = landing(phase, event);
-				assert_eq!(moved, expected.is_some(), "{phase} on {event}");
-
-				// A refused event leaves the session where it was, so a caller
-				// that ignores the answer still cannot corrupt the phase.
-				let landed = expected.unwrap_or(phase);
-				assert_eq!(
-					core::mem::discriminant(state.phase()),
-					core::mem::discriminant(&phase_for(landed)),
-					"{phase} on {event} must land in {landed}"
-				);
-			}
+			_ => SessionEvent::Reset,
 		}
 	}
 
@@ -853,7 +926,9 @@ mod tests {
 	fn the_phase_table_refuses_restarting_a_handshake_on_a_live_session() {
 		let mut probe = PhaseProbe::provisioned(handshaking());
 		assert!(probe.session_state_mut().install_session(established_session()));
-		assert!(!probe.session_state_mut().begin_handshake());
+
+		let now = ManualClock::default().monotonic();
+		assert!(!probe.session_state_mut().begin_handshake(now));
 		assert!(probe.session_state().peer_certificate().is_some());
 	}
 
@@ -865,34 +940,6 @@ mod tests {
 		let mut probe = PhaseProbe::provisioned(handshaking());
 		assert!(probe.session_state_mut().install_session(established_session()));
 		assert!(probe.session_state().phase().requires_encryption());
-
-		// The breaker returns the session to its start, so the peer the dead
-		// session established is no longer readable.
-		probe.reset_session();
-		assert!(probe.session_state().peer_certificate().is_none());
-	}
-
-	/// A caller that names cleartext and also presents an identity reaches the
-	/// wire. The decision the caller made and the check that guards the wire
-	/// read one value, so they cannot disagree.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
-	#[test]
-	fn a_named_cleartext_client_with_an_identity_reaches_the_wire() {
-		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			client_identity: Some(fixture_client_identity()),
-			allow_cleartext: true,
-			..EncryptionConfig::default()
-		};
-
-		let probe = PhaseProbe {
-			state: SessionState::at(SessionPhase::Cleartext),
-			encryption,
-			limits: TransportLimits::default(),
-		};
-		let frame = TestFrame::v0(None, None);
-
-		let builder = EnvelopeBuilder::request(frame);
-		assert!(probe.apply_wire_mode(builder).is_ok());
 	}
 
 	/// A completed handshake and the terms it agreed enter the phase together.
@@ -918,17 +965,20 @@ mod tests {
 		assert!(probe.session_state_mut().install_session(established_session()));
 		assert!(probe.session_state().peer_certificate().is_some());
 
-		probe.reset_session();
+		probe.session_state_mut().reset();
 		assert!(probe.session_state().peer_certificate().is_none());
 	}
 
-	/// The circuit breaker returns a provisioned endpoint to a phase whose
-	/// writes stay encrypted, in one transition (CWE-311).
+	/// Splitting takes the keys out, and the state left behind holds none.
+	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	#[test]
-	fn resetting_a_provisioned_session_returns_it_to_provisioned() {
+	fn taking_the_established_session_returns_the_state_to_its_start() {
 		let mut probe = PhaseProbe::provisioned(handshaking());
-		probe.reset_session();
+		assert!(probe.session_state_mut().install_session(established_session()));
+
+		assert!(probe.session_state_mut().take_established().is_some());
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
+		assert!(probe.session_state_mut().take_established().is_none());
 	}
 
 	/// A completed session carrying a peer identity, which authorization reads.
@@ -947,96 +997,5 @@ mod tests {
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	fn fixture_certificate() -> Certificate {
 		TestCertificate::self_signed(&TestKey::signing())
-	}
-
-	/// Client identity over the fixture certificate and the key that signed it.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
-	fn fixture_client_identity() -> ClientIdentity<DefaultCryptoProvider> {
-		let signing_key = TestKey::signing();
-		let certificate = Arc::new(TestCertificate::self_signed(&signing_key));
-		let key = Arc::new(HandshakeKeyManager::from(signing_key));
-		ClientIdentity::new(certificate, key)
-	}
-
-	/// A client identity proves who this endpoint is and says nothing about the
-	/// peer, so a cleartext write carrying one is refused wherever the
-	/// transport was built (CWE-295).
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
-	#[test]
-	fn a_client_identity_without_peer_authentication_refuses_to_write() {
-		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			client_identity: Some(fixture_client_identity()),
-			..EncryptionConfig::default()
-		};
-		assert!(matches!(
-			encryption.check_cleartext_write(),
-			Err(TransportError::PeerAuthenticationUnconfigured)
-		));
-	}
-
-	/// Naming cleartext accepts the unauthenticated peer, so the same
-	/// configuration is admitted.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
-	#[test]
-	fn naming_cleartext_admits_a_client_identity() {
-		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			client_identity: Some(fixture_client_identity()),
-			allow_cleartext: true,
-			..EncryptionConfig::default()
-		};
-		assert!(encryption.check_cleartext_write().is_ok());
-	}
-
-	/// A trust store answers for the peer, so the pairing is complete.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
-	#[test]
-	fn a_trust_store_admits_a_client_identity() {
-		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			client_identity: Some(fixture_client_identity()),
-			client_validators: Some(Arc::new(Vec::new())),
-			..EncryptionConfig::default()
-		};
-		assert!(encryption.check_cleartext_write().is_ok());
-	}
-
-	/// A server presents its own certificate rather than a client identity, so
-	/// it is untouched by the pairing rule.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
-	#[test]
-	fn a_server_without_client_validators_still_writes() {
-		let encryption = EncryptionConfig::<DefaultCryptoProvider> {
-			server_certificate: Some(Arc::new(fixture_certificate())),
-			..EncryptionConfig::default()
-		};
-		assert!(encryption.check_cleartext_write().is_ok());
-	}
-
-	#[test]
-	fn resetting_an_unprovisioned_session_returns_it_to_cleartext() {
-		let mut probe = PhaseProbe::unprovisioned(handshaking());
-		probe.reset_session();
-		assert!(matches!(probe.session_state().phase(), SessionPhase::Cleartext));
-	}
-
-	#[test]
-	fn only_cleartext_and_encrypted_phases_are_writable() {
-		assert!(SessionPhase::Cleartext.is_writable());
-		assert!(!SessionPhase::Provisioned.is_writable());
-		assert!(!handshaking().is_writable());
-	}
-
-	/// Every envelope path applies the wire mode here, so this refusal is the
-	/// one that keeps a stalled session from writing in the clear (CWE-311).
-	#[test]
-	fn pending_session_refuses_to_apply_a_wire_mode() {
-		let probe = PhaseProbe::provisioned(handshaking());
-		let frame = TestFrame::v0(None, None);
-
-		let builder = EnvelopeBuilder::request(frame);
-		let refusal = probe.apply_wire_mode(builder);
-		assert!(matches!(
-			refusal,
-			Err(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
-		));
 	}
 }

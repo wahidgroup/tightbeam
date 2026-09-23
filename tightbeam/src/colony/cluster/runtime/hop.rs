@@ -15,7 +15,7 @@ use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol, X509ClientConfig};
+use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol};
 use crate::{encode, Frame};
 
 /// A pool and the address to dial on it.
@@ -36,7 +36,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send
@@ -82,7 +81,7 @@ where
 	///
 	/// This is the only place dial bytes become a protocol address, so a
 	/// stream open and a unary emit reach a peer through one parse.
-	pub(crate) async fn connect(self) -> Result<PooledClient<P, DefaultCryptoProvider>, ClusterError> {
+	pub(crate) async fn connect(self) -> Result<PooledClient<P>, ClusterError> {
 		let addr_str = str::from_utf8(&self.addr).map_err(|_| ClusterError::InvalidAddress(self.addr.to_vec()))?;
 		let parsed_addr: P::Address = addr_str.parse().map_err(|_| ClusterError::InvalidAddress(self.addr.to_vec()))?;
 		self.pool.connect(parsed_addr).await.map_err(|_| ClusterError::ConnectFailed)

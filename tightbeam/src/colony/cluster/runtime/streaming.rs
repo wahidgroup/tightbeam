@@ -29,7 +29,7 @@ use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::{MuxConnector, ReplySink, StreamBody, StreamRoute};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol, X509ClientConfig};
+use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol};
 use crate::utils::urn::Urn;
 use crate::{Frame, TightBeamError};
 
@@ -68,7 +68,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send
@@ -77,7 +76,7 @@ where
 {
 	/// Dial this plan's socket on its pool: the shared connect step of
 	/// both splices. A failed dial refuses as `Unavailable`.
-	async fn dial(&self) -> Result<PooledClient<P, DefaultCryptoProvider>, TightBeamError> {
+	async fn dial(&self) -> Result<PooledClient<P>, TightBeamError> {
 		Hop::new(&self.pool, Arc::clone(&self.dial_addr))
 			.connect()
 			.await
@@ -97,7 +96,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send
@@ -159,7 +157,7 @@ where
 		&self,
 		target: &Urn<'static>,
 		budget: HopBudget,
-	) -> Result<(SplicePlan<P>, PooledClient<P, DefaultCryptoProvider>), TightBeamError> {
+	) -> Result<(SplicePlan<P>, PooledClient<P>), TightBeamError> {
 		let plan = self.plan_splice(target, budget, None).map_err(TransitStatus::refusal)?;
 		let dial_error = match plan.dial().await {
 			Ok(client) => {

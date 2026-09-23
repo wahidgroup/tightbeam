@@ -18,7 +18,7 @@ use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::Protocol;
 use crate::TightBeamError;
 
-type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
+type ClusterPool<P> = ConnectionPool<P>;
 type ClusterKey = HandshakeKeyManager<DefaultCryptoProvider>;
 
 /// Hive pool plus the optional peer-plane pool
@@ -136,7 +136,7 @@ impl PoolConfig {
 		trust: Option<Arc<dyn CertificateTrust>>,
 	) -> Arc<ClusterPool<P>>
 	where
-		P: Protocol + Send + Sync + 'static,
+		P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{
@@ -155,7 +155,7 @@ impl PoolConfig {
 
 	pub fn build_cluster_pools<P>(&self, tls: &ClusterTlsConfig) -> Result<ClusterPools<P>, TightBeamError>
 	where
-		P: Protocol + Send + Sync + 'static,
+		P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{

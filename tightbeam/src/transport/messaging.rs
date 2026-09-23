@@ -165,24 +165,6 @@ impl From<Frame> for Letter {
 	}
 }
 
-/// Observe a restart policy's backoff.
-///
-/// A tokio build yields the worker so other connections keep running. A
-/// std build without a reactor parks the calling thread, which is the only
-/// timer it has.
-#[cfg(feature = "transport-policy")]
-async fn await_retry_delay(delay: core::time::Duration) {
-	if delay.is_zero() {
-		return;
-	}
-
-	#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-	tokio::time::sleep(delay).await;
-
-	#[cfg(all(feature = "std", not(feature = "tokio"), not(target_arch = "wasm32")))]
-	std::thread::sleep(delay);
-}
-
 /// One restart-policy evaluation over a failed send: `Ok` carries the
 /// frame to resend and the delay to observe first, `Err` the terminal
 /// error. An error carrying no frame passes through unchanged.
@@ -274,7 +256,7 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 			Ok(result) => result,
 			Err(e) => {
 				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), e, current_attempt)?;
-				await_retry_delay(delay).await;
+				emitter.clock().sleep(delay).await;
 
 				// Unbox to put back into Letter
 				letter.try_return_to_sender(*frame)?;
@@ -305,7 +287,7 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 		match result {
 			Err(error) => {
 				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), error, current_attempt)?;
-				await_retry_delay(delay).await;
+				emitter.clock().sleep(delay).await;
 				// Unbox to put back into Letter
 				letter.try_return_to_sender(*frame)?;
 				current_attempt += 1;
@@ -537,13 +519,13 @@ where
 	// is admitted on it. Before that, a provisioned endpoint admits only the
 	// handshake containers, and an unprovisioned one admits traffic.
 	let established = transport.session_state().phase().requires_encryption();
-	let expects_encryption = transport.encryption().is_provisioned();
+	let expects_encryption = transport.session_state().phase().is_handshake_pending();
 	match wire_envelope {
 		WireEnvelope::Cleartext(envelope) => {
 			if established {
 				// Circuit breaker: a cleartext frame on an agreed session is
 				// not the peer this session established (CWE-319).
-				transport.reset_session();
+				transport.session_state_mut().reset();
 				return Err(TransportError::MissingEncryption);
 			}
 
@@ -555,7 +537,7 @@ where
 					// Circuit breaker: once encryption is configured, application
 					// traffic arrives encrypted.
 					_ => {
-						transport.reset_session();
+						transport.session_state_mut().reset();
 						Err(TransportError::MissingEncryption)
 					}
 				}
@@ -565,14 +547,14 @@ where
 		}
 		WireEnvelope::Encrypted(encrypted_info) => {
 			if !matches!(transport.session_state().phase(), SessionPhase::Encrypted(_)) {
-				transport.reset_session();
+				transport.session_state_mut().reset();
 				return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 			}
 
 			let decrypted_bytes = match transport.session_state().decryptor()?.decrypt_content(&encrypted_info) {
 				Ok(bytes) => bytes,
 				Err(_) => {
-					transport.reset_session();
+					transport.session_state_mut().reset();
 					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 				}
 			};
@@ -612,9 +594,12 @@ impl<T> Transport for T where T: MessageEmitter + MessageCollector {}
 mod tests {
 	use super::*;
 	use crate::instrumentation::events;
-	use crate::policy::GatePolicy;
+	use crate::policy::{GateChain, GatePolicy};
 	use crate::testing::TestFrame;
 	use crate::trace::TraceCollector;
+	use crate::transport::policy::RestartLinearBackoff;
+	use crate::utils::marker::MaybeSendFuture;
+	use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 	use crate::TightBeamError;
 
 	struct DenyGate;
@@ -626,6 +611,90 @@ mod tests {
 	}
 
 	struct AuditProbe(TraceCollector);
+
+	/// A clock that records every sleep and resolves it at once.
+	#[derive(Debug, Default)]
+	struct RecordingClock {
+		sleeps: std::sync::Mutex<Vec<core::time::Duration>>,
+	}
+
+	impl Clock for RecordingClock {
+		fn unix(&self) -> UnixMillis {
+			UnixMillis::new(0)
+		}
+
+		fn monotonic(&self) -> MonotonicInstant {
+			MonotonicInstant::from_std(std::time::Instant::now())
+		}
+
+		fn sleep(&self, span: core::time::Duration) -> MaybeSendFuture<'_, ()> {
+			self.sleeps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(span);
+			Box::pin(core::future::ready(()))
+		}
+	}
+
+	/// An emitter whose every send fails, so every attempt reaches the
+	/// restart policy.
+	struct FailingEmitter {
+		clock: RecordingClock,
+		gate: GateChain,
+		restart: RestartLinearBackoff,
+	}
+
+	impl MessageIO for FailingEmitter {
+		fn clock(&self) -> &dyn Clock {
+			&self.clock
+		}
+
+		async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		async fn write_envelope_bytes(&mut self, _buffer: &[u8]) -> TransportResult<()> {
+			Ok(())
+		}
+	}
+
+	impl MessageEmitter for FailingEmitter {
+		type EmitterGate = GateChain;
+		type RestartPolicy = RestartLinearBackoff;
+
+		fn to_restart_policy_ref(&self) -> &RestartLinearBackoff {
+			&self.restart
+		}
+
+		fn to_emitter_gate_policy_ref(&self) -> &GateChain {
+			&self.gate
+		}
+
+		async fn perform_send_receive(
+			&mut self,
+			message: Frame,
+		) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)> {
+			Err(TransportError::from_failure(message, TransportFailure::DeadlineExceeded))
+		}
+	}
+
+	/// Every restart waits out its backoff on the transport's clock, so no
+	/// target retries hot, and the waits follow the policy's schedule.
+	#[tokio::test]
+	async fn a_restart_backoff_waits_on_the_transport_clock() {
+		let restart = RestartLinearBackoff::new(3, core::time::Duration::from_secs(1), 1, None);
+		let mut emitter = FailingEmitter { clock: RecordingClock::default(), gate: GateChain::default(), restart };
+
+		let outcome = emitter.emit(TestFrame::v0(None, None), None).await;
+		assert!(outcome.is_err());
+
+		let sleeps = emitter
+			.clock
+			.sleeps
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.clone();
+
+		let schedule = [1, 2, 3].map(core::time::Duration::from_secs);
+		assert_eq!(sleeps, schedule);
+	}
 
 	impl GateAudit for AuditProbe {
 		fn audit_trace(&self) -> Option<&TraceCollector> {

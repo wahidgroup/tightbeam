@@ -25,5 +25,14 @@ fn main() {
 				any(feature = "transport-cms", feature = "transport-ecies")
 			)
 		},
+		// The standard library's clocks work: `std` is linked and the
+		// target is not `wasm32-unknown-unknown`, where reading
+		// `SystemTime` or `Instant` panics.
+		host_clock: {
+			all(
+				feature = "std",
+				not(all(target_arch = "wasm32", target_os = "unknown"))
+			)
+		},
 	}
 }

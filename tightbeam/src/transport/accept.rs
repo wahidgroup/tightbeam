@@ -8,8 +8,8 @@ use core::future::Future;
 use std::sync::Arc;
 
 use crate::constants::{DEFAULT_ACCEPT_RETRY_DELAY, DEFAULT_MAX_SERVER_CONNECTIONS};
-use crate::runtime::rt;
 use crate::transport::protocols::AsyncListenerTrait;
+use crate::utils::time::{Clock, SystemClock};
 
 /// Accepts connections under a fixed cap, owning what it admits.
 ///
@@ -21,6 +21,8 @@ use crate::transport::protocols::AsyncListenerTrait;
 pub struct AcceptPlane {
 	permits: Arc<tokio::sync::Semaphore>,
 	connections: tokio::task::JoinSet<()>,
+	/// The clock an accept failure waits out its retry delay on.
+	clock: Arc<dyn Clock>,
 }
 
 impl Default for AcceptPlane {
@@ -40,7 +42,15 @@ impl AcceptPlane {
 		Self {
 			permits: Arc::new(tokio::sync::Semaphore::new(max_connections)),
 			connections: tokio::task::JoinSet::new(),
+			clock: Arc::new(SystemClock),
 		}
+	}
+
+	/// Replace the clock an accept failure waits out its retry delay on.
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
+		self
 	}
 
 	/// Waits for a free connection slot, reaping finished handlers first.
@@ -68,7 +78,7 @@ impl AcceptPlane {
 	/// descriptor shortage or a refused peer. The plane paces the retry and
 	/// keeps accepting. The task's owner ends the loop.
 	async fn absorb_failure(&self) {
-		rt::sleep(DEFAULT_ACCEPT_RETRY_DELAY).await;
+		self.clock.sleep(DEFAULT_ACCEPT_RETRY_DELAY).await;
 	}
 
 	/// Accepts on `listener` until the plane closes, running each admitted

@@ -35,7 +35,7 @@ use tightbeam::transport::handshake::receipt::{
 };
 use tightbeam::transport::handshake::HandshakeError;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
-use tightbeam::transport::{EncryptedMessageIO, MessageIO, TransportError, X509ClientConfig};
+use tightbeam::transport::{EncryptedMessageIO, MessageIO, TransportError};
 use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::attr::Attribute;
 use tightbeam::x509::Certificate;

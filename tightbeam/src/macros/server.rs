@@ -705,6 +705,17 @@ pub mod server_runtime {
 	}
 }
 
+/// Serves a listener: accepts each connection, applies the policies, and
+/// runs the handler or service on it.
+///
+/// # Policies
+///
+/// - `name: [ expr, .. ]` calls `name(expr)` on every accepted transport.
+/// - Each expression is evaluated once per accepted connection, inside the
+///   accept loop, so every connection receives its own value.
+/// - An expression that shares one value across connections clones it, as
+///   `with_trace: [ trace.share() ]` does.
+/// - `max_connections: [ n ]` sets the accept plane's connection cap instead.
 #[macro_export]
 macro_rules! server {
 	(@apply_policy $transport:ident, $policy_name:ident, [ $( $policy_expr:expr ),* $(,)? ]) => {{

@@ -1,13 +1,13 @@
 //! HTTP/2-style multiplexing: concurrent request/response streams over a
 //! single connection.
 //!
-//! A [`MuxTransport`] is built from split envelope halves plus
-//! [`MuxSettings`]. Encrypted halves come from
+//! A [`MuxTransport`] is built from the halves
 //! [`TcpTransport::into_split`](crate::transport::TcpTransport::into_split)
-//! with handshake-negotiated settings. Cleartext halves come from
-//! [`TcpTransport::into_split_cleartext`](crate::transport::TcpTransport::into_split_cleartext)
-//! with out-of-band symmetric settings and NO confidentiality, integrity,
-//! replay, or deletion protection. It decomposes into four parts:
+//! yields, plus [`MuxSettings`]: negotiated for an encrypted session, and
+//! out-of-band for a transport named cleartext, which has NO
+//! confidentiality, integrity, replay, or deletion protection.
+//!
+//! # Parts
 //!
 //! - [`MuxWriterDriver`]: single serialization point. Drains an outbound
 //!   queue and writes each envelope through the send half.
@@ -20,12 +20,18 @@
 //! - [`MuxResponder`]: serves peer-initiated streams with a caller-supplied
 //!   handler, enforcing the advertised concurrency cap.
 //!
-//! Streaming layers over the same wire: [`MuxHandle::open_stream`] and
-//! [`MuxHandle::open_duplex`] push request chunks through a [`RequestSink`].
-//! Each initiating call stamps its interaction kind on the stream's Open
-//! record ([`MuxStreamKind`](crate::transport::envelopes::MuxStreamKind)),
-//! and [`MuxResponder::serve_with`] routes every peer stream to the matching
-//! [`MuxDispatch`] method.
+//! # Streaming
+//!
+//! Streaming layers over the same wire:
+//!
+//! - [`MuxHandle::open_stream`] and [`MuxHandle::open_duplex`] push request
+//!   chunks through a [`RequestSink`].
+//! - Each initiating call stamps its interaction kind on the stream's Open
+//!   record ([`MuxStreamKind`](crate::transport::envelopes::MuxStreamKind)).
+//! - [`MuxResponder::serve_with`] routes every peer stream to the matching
+//!   [`MuxDispatch`] method.
+//!
+//! # Stream IDs
 //!
 //! Stream ID rules follow:
 //! - [RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1)

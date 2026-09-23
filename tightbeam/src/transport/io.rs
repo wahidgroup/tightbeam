@@ -13,15 +13,6 @@ use core::future::Future;
 
 #[cfg(feature = "std")]
 use std::sync::Arc;
-// `remaining_handshake_deadline` is the only consumer, so this carries that
-// function's gate.
-#[cfg(all(
-	feature = "tokio",
-	feature = "std",
-	not(target_arch = "wasm32"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-use std::time::Instant;
 
 use crate::asn1::Frame;
 use crate::der::{Decode, Encode};
@@ -31,6 +22,7 @@ use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 use crate::transport::error::TransportError;
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
+use crate::utils::time::Clock;
 use crate::TightBeamError;
 
 #[cfg(feature = "aead")]
@@ -153,12 +145,20 @@ use x509::*;
 	not(target_arch = "wasm32"),
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
-fn remaining_handshake_deadline<T: EncryptedProtocolState>(state: &T) -> Duration {
+fn remaining_handshake_deadline<T: EncryptedProtocolState + MessageIO>(state: &T) -> Duration {
 	let allowance = state.to_handshake_timeout();
-	match state.session_state().phase().initiated_at() {
-		Some(initiated_at) => initiated_at.deadline(allowance).saturating_duration_since(Instant::now()),
-		None => allowance,
-	}
+	let Some(initiated_at) = state.session_state().phase().initiated_at() else {
+		return allowance;
+	};
+
+	// A deadline past every reading never arrives, so the full allowance
+	// stands.
+	let Some(deadline) = initiated_at.checked_add(allowance) else {
+		return allowance;
+	};
+
+	let now = state.clock().monotonic();
+	deadline.saturating_duration_since(now)
 }
 
 /// Harvest the in-band rekey wiring from a completed receipt-bearing handshake
@@ -319,6 +319,9 @@ pub trait EnvelopeSink: MaybeSend {
 /// code (accept loops, single-flight serving) can hold them across task
 /// spawns. On wasm targets the bound is vacuous.
 pub trait MessageIO {
+	/// The clock this transport measures deadlines and backoff against.
+	fn clock(&self) -> &dyn Clock;
+
 	/// Read raw DER-encoded bytes from the transport
 	fn read_envelope_bytes(&mut self) -> impl Future<Output = TransportResult<Vec<u8>>> + MaybeSend;
 
@@ -406,24 +409,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 	}
 
-	/// Send a cleartext or encrypted envelope based on encryption flag
-	#[allow(async_fn_in_trait)]
-	async fn send_envelope(&mut self, envelope: TransportEnvelope, encrypt: bool) -> TransportResult<()>
-	where
-		Self: EncryptedProtocolState,
-	{
-		let wire_envelope = if encrypt {
-			let envelope_bytes = Self::encode_envelope(&envelope)?;
-			let encrypted_info = self.session_state().encryptor()?.encrypt_next(&envelope_bytes, None)?;
-			WireEnvelope::Encrypted(encrypted_info)
-		} else {
-			WireEnvelope::Cleartext(envelope)
-		};
-
-		let wire_bytes = wire_envelope.to_der()?;
-		self.write_envelope_bytes(&wire_bytes).await
-	}
-
 	/// Wrap a message in a TransportEnvelope
 	/// Protocol-agnostic default implementation
 	fn wrap_message(message: Frame) -> TransportEnvelope {
@@ -489,7 +474,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				// accepting unauthenticated content (CWE-319). The session is
 				// broken here, as the inbound collector does.
 				if self.session_state().phase().requires_encryption() {
-					self.reset_session();
+					self.session_state_mut().reset();
 					return Err(TransportError::MissingEncryption);
 				}
 
@@ -665,7 +650,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		if !self.session_state_mut().begin_handshake() {
+		let now = self.clock().monotonic();
+		if !self.session_state_mut().begin_handshake(now) {
 			return Err(TransportError::InvalidState);
 		}
 
@@ -840,7 +826,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope_bytes(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		if !self.session_state_mut().begin_handshake() {
+		let now = self.clock().monotonic();
+		if !self.session_state_mut().begin_handshake(now) {
 			return Err(TransportError::InvalidState);
 		}
 
@@ -1077,7 +1064,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			// The transition is attempted first, so a refused move emits
 			// nothing. Writing before the refusal would put a handshake
 			// response on the wire of a session that already agreed one.
-			if !self.session_state_mut().begin_handshake() {
+			let now = self.clock().monotonic();
+			if !self.session_state_mut().begin_handshake(now) {
 				return Err(TransportError::InvalidState);
 			}
 
@@ -1299,19 +1287,25 @@ mod tests {
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::transport::handshake::EstablishedSession;
 	use crate::transport::state::{EncryptionConfig, SessionState};
+	use crate::utils::time::ManualClock;
 	use crate::Version;
 
 	#[cfg(feature = "aead")]
 	use crate::crypto::aead::SessionKeys;
 	#[cfg(feature = "aead")]
-	use crate::transport::handshake::HandshakeInstant;
-	#[cfg(feature = "aead")]
 	use crate::transport::TransportLimits;
 
 	/// Minimal `MessageIO` probe so ingress goes through `decode_envelope`.
-	struct DecodeProbe;
+	#[derive(Default)]
+	struct DecodeProbe {
+		clock: ManualClock,
+	}
 
 	impl MessageIO for DecodeProbe {
+		fn clock(&self) -> &dyn Clock {
+			&self.clock
+		}
+
 		async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 			Err(TransportError::ConnectionClosed)
 		}
@@ -1324,13 +1318,32 @@ mod tests {
 	/// Reads EOF on every call, with the session phase the case under test sets.
 	#[cfg(feature = "aead")]
 	struct ClosedStreamProbe {
-		state: SessionState,
-		encryption: EncryptionConfig<DefaultCryptoProvider>,
+		state: SessionState<DefaultCryptoProvider>,
 		limits: TransportLimits,
+		clock: ManualClock,
+	}
+
+	#[cfg(feature = "aead")]
+	impl ClosedStreamProbe {
+		/// A provisioned endpoint placed directly in `phase`.
+		fn at(phase: SessionPhase) -> Self {
+			let validators = Some(Arc::new(Vec::new()));
+			let encryption = EncryptionConfig { client_validators: validators, ..EncryptionConfig::unconfigured() };
+
+			Self {
+				state: SessionState::at(encryption, phase),
+				limits: TransportLimits::default(),
+				clock: ManualClock::default(),
+			}
+		}
 	}
 
 	#[cfg(feature = "aead")]
 	impl MessageIO for ClosedStreamProbe {
+		fn clock(&self) -> &dyn Clock {
+			&self.clock
+		}
+
 		async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 			Err(TransportError::ConnectionClosed)
 		}
@@ -1344,35 +1357,27 @@ mod tests {
 	impl EncryptedMessageIO for ClosedStreamProbe {}
 
 	#[cfg(feature = "aead")]
-	impl crate::transport::state::SealedProtocolState for ClosedStreamProbe {}
+	impl crate::transport::state::sealed::Sealed for ClosedStreamProbe {}
 
+	#[cfg(feature = "aead")]
 	impl EncryptedProtocolState for ClosedStreamProbe {
-		type CryptoProvider = crate::crypto::profiles::DefaultCryptoProvider;
+		type CryptoProvider = DefaultCryptoProvider;
 
 		fn limits(&self) -> &TransportLimits {
 			&self.limits
 		}
 
-		fn encryption(&self) -> &EncryptionConfig<DefaultCryptoProvider> {
-			&self.encryption
-		}
-
-		fn session_state(&self) -> &SessionState {
+		fn session_state(&self) -> &SessionState<DefaultCryptoProvider> {
 			&self.state
 		}
 
-		fn session_state_mut(&mut self) -> &mut SessionState {
+		fn session_state_mut(&mut self) -> &mut SessionState<DefaultCryptoProvider> {
 			&mut self.state
 		}
 	}
 
-	/// An end of stream reads differently either side of a handshake, and the
-	/// session phase is what separates the two. A session that already agreed
-	/// its terms reports an ordinary close, so a pool evicts the connection
-	/// rather than recording a handshake failure.
 	#[cfg(feature = "aead")]
-	#[tokio::test]
-	async fn a_close_is_named_by_the_phase_it_interrupts() {
+	fn encrypted_phase() -> SessionPhase {
 		use crate::crypto::aead::{Aes256Gcm, DirectionalCiphers, KeyInit};
 
 		let keys = SessionKeys::for_client(DirectionalCiphers {
@@ -1380,35 +1385,37 @@ mod tests {
 			server_to_client: Aes256Gcm::new(&[1u8; 32].into()),
 		});
 
-		let encrypted = SessionPhase::Encrypted(Box::new(EstablishedSession::new(keys, None, None, None, None)));
-		let handshaking = SessionPhase::Handshaking { initiated_at: HandshakeInstant::now() };
-		let cases = [
-			("cleartext session", SessionPhase::Cleartext, TransportError::ConnectionClosed),
-			(
-				"provisioned, handshake not started",
-				SessionPhase::Provisioned,
-				TransportError::PeerClosedBeforeHandshake,
-			),
-			("handshake in flight", handshaking, TransportError::PeerClosedBeforeHandshake),
-			("established session", encrypted, TransportError::ConnectionClosed),
-		];
+		SessionPhase::Encrypted(Box::new(EstablishedSession::new(keys, None, None, None, None)))
+	}
 
-		for (label, phase, expected) in cases {
-			let mut probe = ClosedStreamProbe {
-				state: SessionState::at(phase),
-				encryption: EncryptionConfig::default(),
-				limits: TransportLimits::default(),
-			};
-			let error = probe
-				.read_session_bytes()
-				.await
-				.expect_err("the probe always reads an end of stream");
+	#[cfg(feature = "aead")]
+	fn handshaking_phase() -> SessionPhase {
+		SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
+	}
 
-			assert_eq!(
-				core::mem::discriminant(&error),
-				core::mem::discriminant(&expected),
-				"{label}: expected {expected:?}, got {error:?}"
+	// An end of stream reads differently either side of a handshake, and the
+	// session phase is what separates the two. A session that already agreed
+	// its terms reports an ordinary close, so a pool evicts the connection
+	// rather than recording a handshake failure.
+	#[cfg(feature = "aead")]
+	crate::tb_cases! {
+		fn a_close_is_named_by_the_phase_it_interrupts((phase, expected): (SessionPhase, TransportError))
+			-> TransportResult<()>
+		{
+			let mut probe = ClosedStreamProbe::at(phase);
+			let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+			let outcome = runtime.block_on(probe.read_session_bytes());
+			assert!(
+				matches!(&outcome, Err(error) if core::mem::discriminant(error) == core::mem::discriminant(&expected)),
+				"expected {expected:?}, got {outcome:?}"
 			);
+			Ok(())
+		}
+		cases {
+			cleartext_session => (SessionPhase::Cleartext, TransportError::ConnectionClosed),
+			provisioned_before_the_handshake => (SessionPhase::Provisioned, TransportError::PeerClosedBeforeHandshake),
+			handshake_in_flight => (handshaking_phase(), TransportError::PeerClosedBeforeHandshake),
+			established_session => (encrypted_phase(), TransportError::ConnectionClosed),
 		}
 	}
 

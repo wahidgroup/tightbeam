@@ -42,7 +42,7 @@ pub fn compose_arm() -> tightbeam::error::Result<tightbeam::Frame> {
 	}
 }
 
-/// Both `client!` `identity:` arms, and the `connect` arm without one.
+/// Every `client!` form, and every option it takes.
 ///
 /// Never called: the point is that each arm expands and type-checks outside
 /// this crate, which is where a leaked `#[cfg(feature = ...)]` would bite.
@@ -51,16 +51,24 @@ async fn client_arms(
 	addr: tightbeam::transport::tcp::TightBeamSocketAddr,
 	cert: tightbeam::crypto::x509::CertificateSpec,
 	key: std::sync::Arc<dyn tightbeam::crypto::key::SigningKeyProvider>,
+	trust: std::sync::Arc<dyn tightbeam::crypto::x509::store::CertificateTrust>,
+	stream: tightbeam::transport::tcp::r#async::TokioStream,
 ) -> tightbeam::error::Result<()> {
 	type P = tightbeam::transport::tcp::r#async::TokioListener;
 
-	let _identity = tightbeam::client!(connect P: addr, identity: (cert.clone(), std::sync::Arc::clone(&key)));
+	let _identity = tightbeam::client!(
+		connect P: addr,
+		trust_store: std::sync::Arc::clone(&trust),
+		identity: (cert.clone(), std::sync::Arc::clone(&key))
+	);
 	let _identity_with_policies = tightbeam::client!(
 		connect P: addr,
+		trust_store: trust,
 		identity: (cert, key),
 		policies: { timeout: core::time::Duration::from_secs(5) }
 	);
-	let _plain = tightbeam::client!(connect P: addr);
+	let _cleartext = tightbeam::client!(connect P: addr, cleartext);
+	let _adopted = tightbeam::client!(P: stream, cleartext)?;
 
 	Ok(())
 }

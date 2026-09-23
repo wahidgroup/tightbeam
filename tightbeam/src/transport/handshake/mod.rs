@@ -270,9 +270,6 @@ mod ecies {
 #[cfg(feature = "transport-ecies")]
 use ecies::*;
 
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-use std::time::Instant;
-
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
@@ -622,52 +619,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		}
 
 		Ok(Box::new(server))
-	}
-}
-
-/// The clock a handshake deadline is measured against.
-///
-/// Targets without a monotonic clock carry a `u64` stand-in. The alias is
-/// the one place that choice is made, so a type naming it needs no `#[cfg]`
-/// of its own.
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-pub type HandshakeClock = Instant;
-
-/// The clock a handshake deadline is measured against.
-#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
-pub type HandshakeClock = u64;
-
-/// When a handshake began, for measuring its deadline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandshakeInstant(HandshakeClock);
-
-impl HandshakeInstant {
-	/// The current instant, or zero where no clock exists.
-	#[must_use]
-	pub fn now() -> Self {
-		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-		{
-			Self(Instant::now())
-		}
-
-		#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
-		{
-			Self(0)
-		}
-	}
-
-	/// The deadline reached by adding `allowance` to this instant.
-	#[must_use]
-	pub fn deadline(self, allowance: core::time::Duration) -> HandshakeClock {
-		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-		{
-			self.0 + allowance
-		}
-
-		#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
-		{
-			self.0.saturating_add(allowance.as_millis() as u64)
-		}
 	}
 }
 

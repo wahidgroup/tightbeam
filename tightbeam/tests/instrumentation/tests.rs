@@ -7,7 +7,7 @@
 use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestMessage};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
-use tightbeam::transport::{MessageEmitter, Protocol};
+use tightbeam::transport::{EndpointConfig, MessageEmitter, Protocol};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{compose, exactly, server, tb_assert_spec, tb_process_spec, tb_scenario};
 
@@ -138,7 +138,7 @@ tb_scenario! {
 		},
 		client: |ClientEnv { trace, addr, .. }| async move {
 			let stream = <TokioListener as Protocol>::connect(addr).await?;
-			let mut client = <TokioListener as Protocol>::create_transport(stream);
+			let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
 
 			let test_message = TestMessage::sample(None);
 			let test_frame = compose! {

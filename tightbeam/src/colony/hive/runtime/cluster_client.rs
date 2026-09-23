@@ -23,19 +23,21 @@ use crate::trace::TraceCollector;
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::state::ClientIdentity;
 use crate::transport::state::{DialableEncryption, EncryptionConfig};
-use crate::transport::TransportResult;
-use crate::transport::{MessageEmitter, Protocol, X509ClientConfig};
+use crate::transport::{EndpointConfig, MessageEmitter, Protocol, TransportResult};
+use crate::utils::time::SystemClock;
 use crate::utils::urn::Urn;
 use crate::{Frame, Message, TightBeamError, Version};
 
-/// Build a hive-to-cluster control frame, signed when hive TLS is configured.
-/// Provisioning a cluster dial starts from.
+/// Everything a cluster dial is built from.
+///
+/// The hive side still reads the operating system's clocks. Injecting a hive
+/// clock is recorded as open work in the remediation plan.
 #[cfg(feature = "x509")]
-fn cluster_encryption<C: CryptoProvider>(
+fn cluster_endpoint<C: CryptoProvider>(
 	trust_store: Option<&Arc<dyn CertificateTrust>>,
 	identity: Option<&ClientIdentity<C>>,
-) -> TransportResult<DialableEncryption<C>> {
-	let mut encryption = EncryptionConfig::default();
+) -> TransportResult<EndpointConfig<C>> {
+	let mut encryption = EncryptionConfig::unconfigured();
 	if let Some(store) = trust_store {
 		encryption.trust_store = Some(Arc::clone(store));
 	}
@@ -47,9 +49,11 @@ fn cluster_encryption<C: CryptoProvider>(
 	// rather than at the first frame it tries to write. A hive identity with
 	// no trust store would present that identity to whoever answered the
 	// cluster address (CWE-295).
-	DialableEncryption::new(encryption)
+	let encryption = DialableEncryption::new(encryption)?;
+	Ok(EndpointConfig::new(encryption, Arc::new(SystemClock)))
 }
 
+/// Build a hive-to-cluster control frame, signed when hive TLS is configured.
 async fn build_control_frame(
 	id: impl AsRef<[u8]>,
 	message: impl Message,
@@ -115,11 +119,11 @@ where
 
 impl<P> ClusterLink<P>
 where
-	P: Protocol + Send + Sync + 'static,
+	P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + 'static,
+	P::Transport: MessageEmitter + Send + 'static,
 	TightBeamError: From<P::Error>,
 {
 	/// Binds the hive's slate and control address to its gateway list.
@@ -282,17 +286,17 @@ async fn dial_cluster<P>(
 	hive_tls: Option<&Arc<HiveTlsConfig>>,
 ) -> Result<P::Transport, TightBeamError>
 where
-	P: Protocol + Send + Sync,
+	P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync,
 	P::Address: Clone + Send + Sync,
 	P::Stream: Send,
 	P::Error: Send,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send,
+	P::Transport: MessageEmitter + Send,
 	TightBeamError: From<P::Error>,
 {
-	let stream = P::connect(cluster_addr).await?;
 	let identity = hive_tls.map(|tls| tls.identity().clone());
-	let encryption = cluster_encryption(trust_store, identity.as_ref())?;
-	Ok(P::create_transport(stream).with_encryption(encryption))
+	let endpoint = cluster_endpoint(trust_store, identity.as_ref())?;
+	let stream = P::connect(cluster_addr).await?;
+	Ok(P::create_transport(stream, endpoint))
 }
 
 async fn fanout_scaling_update<P>(
@@ -303,11 +307,11 @@ async fn fanout_scaling_update<P>(
 	retry_policy: &dyn CoreRetryPolicy,
 ) -> bool
 where
-	P: Protocol + Send + Sync,
+	P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync,
 	P::Address: Clone + Copy + Send + Sync,
 	P::Stream: Send,
 	P::Error: Send,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send,
+	P::Transport: MessageEmitter + Send,
 {
 	let gateways = gateways.as_ref();
 	let max_attempts = retry_policy.max_attempts();
@@ -340,15 +344,15 @@ async fn emit_scaling_update_with_retry<P>(
 	max_attempts: usize,
 ) -> bool
 where
-	P: Protocol + Send + Sync,
+	P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync,
 	P::Address: Clone + Copy + Send + Sync,
 	P::Stream: Send,
 	P::Error: Send,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send,
+	P::Transport: MessageEmitter + Send,
 {
 	// The provisioning does not change between attempts, and a refused dial is
 	// a configuration this loop cannot retry its way out of.
-	let Ok(encryption) = cluster_encryption(trust_store, client_identity) else {
+	let Ok(endpoint) = cluster_endpoint(trust_store, client_identity) else {
 		return false;
 	};
 
@@ -360,7 +364,7 @@ where
 
 		// Transport Ok is not acceptance: require TransitStatus::Ok in the
 		// body.
-		let mut transport = P::create_transport(stream).with_encryption(encryption.clone());
+		let mut transport = P::create_transport(stream, endpoint.clone());
 		match transport.emit(frame.clone(), None).await {
 			Ok(Some(response)) => {
 				let decoded = decode::<ServletAddressUpdateResponse>(response.message());

@@ -7,37 +7,29 @@ use alloc::sync::Arc;
 use core::str::FromStr;
 
 #[cfg(feature = "std")]
-use core::time::Duration;
-#[cfg(feature = "std")]
 use std::io::{Error as IoError, ErrorKind};
 #[cfg(feature = "std")]
 use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 #[cfg(feature = "std")]
 use std::sync::Arc;
-#[cfg(feature = "std")]
-use std::time::Instant;
 
 use crate::builder::TypeBuilder;
-use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{RecvCipher, SendCipher};
-use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
 use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
-use crate::transport::handshake::{BoxedServerHandshake, HandshakeKeyManager};
+use crate::transport::handshake::BoxedServerHandshake;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
-use crate::transport::TransportLimits;
 use crate::transport::{
-	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageEmitter, MessageIO, Protocol, ResponsePackage,
-	TransportEncryptionConfig, TransportResult,
+	EncryptedMessageIO, EncryptedProtocol, EndpointConfig, MessageCollector, MessageEmitter, MessageIO, Protocol,
+	ResponsePackage, TransportEncryptionConfig, TransportResult,
 };
-use crate::x509::Certificate;
+use crate::utils::time::{Clock, MonotonicInstant};
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(feature = "aead")]
 #[cfg(feature = "transport-policy")]
 mod policy {
 	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
@@ -70,12 +62,12 @@ where
 {
 	/// Re-arm the stream's per-recv timeout with the budget remaining until
 	/// `deadline`, failing with `Timeout` once the budget is exhausted.
-	fn arm_read_deadline(&mut self, deadline: Option<Instant>) -> TransportResult<()> {
+	fn arm_read_deadline(&mut self, deadline: Option<MonotonicInstant>) -> TransportResult<()> {
 		let Some(deadline) = deadline else {
 			return Ok(());
 		};
 
-		let remaining = deadline.saturating_duration_since(Instant::now());
+		let remaining = deadline.saturating_duration_since(self.clock.monotonic());
 		if remaining.is_zero() {
 			return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 		}
@@ -89,21 +81,27 @@ impl<S: ProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
+	fn clock(&self) -> &dyn Clock {
+		self.clock.as_ref()
+	}
+
 	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 		let handshake_pending = self.is_handshake_pending();
 
 		// Absolute deadline for the whole envelope read. Every stage below
 		// re-arms the per-recv timeout with the *remaining* budget. Handshake
 		// reads face an unauthenticated peer, so the handshake deadline
-		// applies from the first byte onward.
+		// applies from the first byte onward. A deadline past every reading
+		// never arrives, so it is absent.
 		#[cfg(feature = "std")]
-		let deadline = if handshake_pending {
-			match self.state.phase().initiated_at() {
-				Some(initiated_at) => Some(initiated_at.deadline(self.limits.handshake_timeout)),
-				None => Some(Instant::now() + self.limits.handshake_timeout),
-			}
-		} else {
-			Some(Instant::now() + self.limits.operation_timeout)
+		let deadline = {
+			let (started, allowance) = match self.state.phase().initiated_at() {
+				Some(initiated_at) if handshake_pending => (initiated_at, self.limits.handshake_timeout),
+				_ if handshake_pending => (self.clock.monotonic(), self.limits.handshake_timeout),
+				_ => (self.clock.monotonic(), self.limits.operation_timeout),
+			};
+
+			started.checked_add(allowance)
 		};
 
 		let result = (|| -> TransportResult<Vec<u8>> {
@@ -287,16 +285,12 @@ where
 // EncryptedMessageIO: operation methods only
 impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
-/// TCP server using abstract listener trait
+/// TCP server using abstract listener trait. Every accepted transport is
+/// built from one [`EndpointConfig`].
 pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoProvider> {
 	listener: L,
-	certificate: Option<Arc<Certificate>>,
-	#[cfg(feature = "x509")]
-	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	aad_domain_tag: &'static [u8],
-	/// Every ceiling handed to each accepted transport.
-	limits: TransportLimits,
-	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
+	/// What every accepted transport is built from.
+	config: EndpointConfig<P>,
 }
 
 #[cfg(feature = "std")]
@@ -306,6 +300,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TcpListener<NetTcpL
 	type Error = IoError;
 	type Transport = TcpTransport<NetTcpStream, P>;
 	type Address = TightBeamSocketAddr;
+	type CryptoProvider = P;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
 		SocketAddr::from_str("127.0.0.1:0")
@@ -316,26 +311,17 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TcpListener<NetTcpL
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		Ok((
-			TcpListener {
-				listener,
-				certificate: None,
-				#[cfg(feature = "x509")]
-				client_validators: None,
-				aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
-				limits: TransportLimits::default(),
-				key_manager: None,
-			},
-			TightBeamSocketAddr(bound_addr),
-		))
+		let config = EndpointConfig::cleartext();
+
+		Ok((TcpListener { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
 		NetTcpStream::connect(addr.0)
 	}
 
-	fn create_transport(stream: Self::Stream) -> Self::Transport {
-		TcpTransport::from(stream)
+	fn create_transport(stream: Self::Stream, config: EndpointConfig<P>) -> Self::Transport {
+		TcpTransport::new(stream, config)
 	}
 }
 
@@ -345,39 +331,21 @@ where
 	TransportError: From<<L::Stream as ProtocolStream>::Error>,
 	L::Stream: ProtocolStream,
 {
+	/// Serve `listener` in the clear.
+	///
+	/// Accepted transports carry no confidentiality, integrity, or peer
+	/// authentication. See [`EndpointConfig::cleartext`].
+	#[cfg(feature = "std")]
 	pub fn from_listener(listener: L) -> Self {
-		Self {
-			listener,
-			certificate: None,
-			#[cfg(feature = "x509")]
-			client_validators: None,
-			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
-			limits: TransportLimits::default(),
-			key_manager: None,
-		}
+		let config = EndpointConfig::cleartext();
+		Self { listener, config }
 	}
 
+	/// Accept one connection as a transport built from this listener's
+	/// configuration.
 	pub fn accept(&self) -> TransportResult<TcpTransport<L::Stream, P>> {
 		let (stream, _) = self.listener.accept()?;
-		let mut transport = TcpTransport::from(stream);
-
-		{
-			if let Some(ref cert) = self.certificate {
-				transport.encryption.server_certificate = Some(Arc::clone(cert));
-			}
-			if let Some(ref validators) = self.client_validators {
-				transport.encryption.client_validators = Some(Arc::clone(validators));
-			}
-			transport.encryption.aad_domain_tag = self.aad_domain_tag;
-
-			transport.limits = self.limits;
-			transport.provision();
-		}
-
-		if let Some(ref signatory) = self.key_manager {
-			transport.encryption.key_manager = Some(Arc::clone(signatory));
-		}
-
+		let transport = TcpTransport::new(stream, self.config.clone());
 		Ok(transport)
 	}
 }
@@ -385,7 +353,6 @@ where
 impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListener<NetTcpListener, P> {
 	type Encryptor = SendCipher;
 	type Decryptor = RecvCipher;
-	type CryptoProvider = P;
 
 	async fn bind_with(
 		addr: <Self as Protocol>::Address,
@@ -393,23 +360,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListene
 	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
 		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		let certificate = config.certificate;
-		let client_validators = config.client_validators.as_ref().map(Arc::clone);
-		let key_manager = Arc::clone(&config.key_manager);
+		let config = EndpointConfig::from(config);
 
-		Ok((
-			TcpListener {
-				listener,
-				certificate: Some(certificate),
-				#[cfg(feature = "x509")]
-				client_validators,
-				aad_domain_tag: config.aad_domain_tag,
-				limits: config.limits,
-
-				key_manager: Some(key_manager),
-			},
-			TightBeamSocketAddr(bound_addr),
-		))
+		Ok((TcpListener { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
 }
 
@@ -420,11 +373,25 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::mpsc;
 	use std::thread;
+	use std::time::{Duration, Instant};
 
 	use super::*;
 	use crate::policy::TransitStatus;
 	use crate::testing::*;
 	use crate::transport::policy::PolicyConfig;
+	use crate::transport::state::{DialableEncryption, EncryptionConfig};
+	use crate::transport::TransportLimits;
+	use crate::utils::time::SystemClock;
+
+	/// A server that validates client certificates, so its reads face an
+	/// unauthenticated peer under the handshake ceilings in `limits`.
+	fn validating_server(limits: TransportLimits) -> EndpointConfig<DefaultCryptoProvider> {
+		let validators = Some(Arc::new(Vec::new()));
+		let encryption = EncryptionConfig { client_validators: validators, ..EncryptionConfig::unconfigured() };
+		let encryption = DialableEncryption::new(encryption).expect("client validators answer for the peer");
+
+		EndpointConfig::new(encryption, Arc::new(SystemClock)).with_limits(limits)
+	}
 
 	/// Under the per-recv-only scheme this read complete after ~6s of dripping
 	/// the absolute deadline aborts it at the first slice boundary past
@@ -437,10 +404,9 @@ mod tests {
 
 		let server_handle = thread::spawn(move || -> TransportResult<(TransportResult<Vec<u8>>, Duration)> {
 			let (stream, _) = listener.accept()?;
-			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::from(stream);
-			transport.encryption.client_validators = Some(Arc::new(Vec::new()));
-			transport.provision();
-			transport.limits.handshake_timeout = Duration::from_millis(250);
+			let deadline = Duration::from_millis(250);
+			let limits = TransportLimits { handshake_timeout: deadline, ..TransportLimits::default() };
+			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::new(stream, validating_server(limits));
 
 			let rt = tokio::runtime::Runtime::new()?;
 			let started = Instant::now();
@@ -486,10 +452,8 @@ mod tests {
 
 		let server_handle = thread::spawn(move || -> TransportResult<TransportResult<Vec<u8>>> {
 			let (stream, _) = listener.accept()?;
-			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::from(stream);
-			transport.encryption.client_validators = Some(Arc::new(Vec::new()));
-			transport.provision();
-			transport.limits.handshake_wire = 16;
+			let limits = TransportLimits { handshake_wire: 16, ..TransportLimits::default() };
+			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::new(stream, validating_server(limits));
 
 			let rt = tokio::runtime::Runtime::new()?;
 			Ok(rt.block_on(transport.read_envelope_bytes()))

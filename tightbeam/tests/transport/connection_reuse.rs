@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const CLIENT_CONNECT: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/client-connect");
@@ -238,11 +239,12 @@ tb_scenario! {
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(CLIENT_CERT, key)?
+				.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
-			let mut client = builder.connect(addr).await?;
 
-			// Send 3 messages using the same TLS client (no re-handshake, session reuse)
+			// Send 3 messages using the same TLS client
+			// (no re-handshake, session reuse)
+			let mut client = builder.connect(addr).await?;
 			for i in 1..=3 {
 				trace.event(SEND_MESSAGE)?;
 

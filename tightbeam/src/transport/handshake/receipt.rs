@@ -195,11 +195,8 @@ where
 	Ok(digest_info)
 }
 
-/// SubjectKeyIdentifier-based signer identity of a certificate's public key,
-/// matching what [`sign_receipt`] and [`SessionReceipt::countersign`] derive
-/// from their key providers. Build a single-valued attribute.
+/// Build a single-valued attribute.
 #[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn single_valued(oid: ObjectIdentifier, value: Any) -> Result<Attribute, HandshakeError> {
 	let values = SetOfVec::try_from(vec![value])?;
 	let attribute = Attribute { oid, values };
@@ -416,7 +413,6 @@ where
 /// Returns the normalized settlement answer for the client role. Parse and
 /// verify failures collapse to one variant, so both carriages report the same
 /// error.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn verify_receipt_signer<D, S, V>(
 	receipt_der: impl AsRef<[u8]>,
@@ -849,7 +845,6 @@ pub(crate) async fn approve_or_fail_closed(
 ///
 /// - The abort [`HandshakeError`] that matches the verdict, for every verdict other than
 ///   [`SessionVerdict::Activated`].
-#[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
 #[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
 pub(crate) async fn record_receipt_outcome(
 	observer: Option<&dyn SessionObserver>,

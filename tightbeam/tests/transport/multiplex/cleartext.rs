@@ -127,7 +127,7 @@ tb_scenario! {
 			let settings = MuxSettings::symmetric(8);
 			let (_server_end, responder) =
 				spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, Some(cancel_budget), trace.share())?;
-			let (client_reader, client_writer) = client.into_split_cleartext()?;
+			let (client_reader, client_writer) = client.into_split()?;
 
 			let rejected = run_cancel_abuse(client_reader, client_writer, responder, cancel_budget).await?;
 			trace.event_with(RESPONDER_POLICY_REJECTION, &[], rejected)?;

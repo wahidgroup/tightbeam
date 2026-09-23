@@ -744,6 +744,7 @@ mod tests {
 	use crate::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestHooks};
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
+	use crate::transport::EndpointConfig;
 	use crate::transport::MessageEmitter;
 	use crate::transport::Protocol;
 	use crate::utils::urn::Urn;
@@ -1386,7 +1387,7 @@ mod tests {
 			},
 			client: |ClientEnv { trace, addr, .. }| async move {
 				let stream = <TokioListener as Protocol>::connect(addr).await?;
-				let mut client = <TokioListener as Protocol>::create_transport(stream);
+				let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
 
 				// Client-side assertion before sending
 				trace.event(RESPONDED)?;
@@ -1441,7 +1442,7 @@ mod tests {
 			},
 			client: |ClientEnv { trace, addr, .. }| async move {
 				let stream = <TokioListener as Protocol>::connect(addr).await?;
-				let mut client = <TokioListener as Protocol>::create_transport(stream);
+				let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
 
 				// Client-side assertion before sending
 				trace.event(RESPONDED)?;

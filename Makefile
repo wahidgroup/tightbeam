@@ -114,7 +114,7 @@ build: setup
 clean:
 	@echo "Cleaning build artifacts..."
 	cargo clean
-	rm -rf built target .make
+	rm -rf built target .make consumers/*/target
 
 test: setup
 	@echo "Running tests..."

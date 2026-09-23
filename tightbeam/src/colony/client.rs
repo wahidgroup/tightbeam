@@ -20,12 +20,11 @@ use crate::utils::urn::Urn;
 
 use core::hash::Hash;
 
-use crate::crypto::profiles::CryptoProvider;
 use crate::transport::client::PooledClient;
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::protocols::PersistentConnection;
-use crate::transport::{MessageCollector, X509ClientConfig};
+use crate::transport::MessageCollector;
 
 /// Submit unary work to a cluster gateway and receive the servlet's
 /// complete response frame.
@@ -59,18 +58,11 @@ where
 	}
 }
 
-impl<P, C> SubmitWork for PooledClient<P, C>
+impl<P> SubmitWork for PooledClient<P>
 where
 	P: Protocol + PersistentConnection + Send + Sync,
-	C: CryptoProvider + Send + Sync + 'static,
 	P::Address: Hash + Eq + Clone + Send + Sync,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = C>
-		+ MuxConnector
-		+ Send
-		+ Sync,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + MuxConnector + Send + Sync,
 {
 	async fn submit_work_to(&mut self, servlet_type: Urn<'static>, work: &Frame) -> Result<Frame, TightBeamError> {
 		let frame = ClusterWorkRequest::transport_frame(servlet_type, work)?;

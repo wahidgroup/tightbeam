@@ -31,7 +31,6 @@ use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{
 	AsyncListenerTrait, EncryptedProtocol, MessageCollector, MessageEmitter, PersistentConnection, Protocol,
-	X509ClientConfig,
 };
 use crate::utils::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
@@ -142,7 +141,7 @@ where
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + 'static,
+	P::Transport: MessageEmitter + Send + 'static,
 	TightBeamError: From<P::Error>,
 {
 	/// Binds this hive's slate, gateways, address, and configuration.
@@ -192,14 +191,7 @@ where
 	P::Address: Hash + Eq + Clone + Copy + Send + Sync + FromStr + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
-		+ MuxConnector
-		+ Send
-		+ Sync
-		+ 'static,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + MuxConnector + Send + Sync + 'static,
 	TightBeamError: From<P::Error>,
 {
 	type Protocol = P;

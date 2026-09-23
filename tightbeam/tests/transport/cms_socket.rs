@@ -27,8 +27,9 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::HandshakeProtocolKind;
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::transport::{ClientBuilder, ConnectionBuilder, X509ClientConfig};
+use tightbeam::transport::{ClientBuilder, ConnectionBuilder};
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
@@ -107,7 +108,7 @@ tb_scenario! {
 
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(trust_store)
-				.with_client_identity(identity, Arc::clone(&ctx.client_provider))?
+				.with_client_identity(ClientIdentity::from_spec(identity, Arc::clone(&ctx.client_provider))?)
 				.with_server_certificate_chain(server_chain)
 				.with_handshake_protocol(HandshakeProtocolKind::Cms)
 				.build();

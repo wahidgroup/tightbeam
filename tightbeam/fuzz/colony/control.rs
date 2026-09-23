@@ -14,6 +14,7 @@ use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::decode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Protocol};
 use tightbeam::utils::urn::Urn;
@@ -61,7 +62,7 @@ async fn connect_as(
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_timeout(CLIENT_IO_TIMEOUT)
 		.with_trust_store(server_trust)
-		.with_client_identity(cert, key)?
+		.with_client_identity(ClientIdentity::from_spec(cert, key)?)
 		.build()
 		.connect(addr.to_owned())
 		.await?)

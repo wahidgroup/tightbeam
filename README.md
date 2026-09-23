@@ -1954,10 +1954,10 @@ Mux is an application-layer stream router over the envelope transport. It does n
 
 **Assembly modes:**
 
-| Mode      | Session                                                | Settings source                                                 | Split API                | Security properties                                                 |
-| --------- | ------------------------------------------------------ | --------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------- |
-| Encrypted | CMS or ECIES handshake with matching `TransportOffer`s | `negotiated_mux()`                                              | `into_split()`           | Handshake authentication + AEAD as configured for the session       |
-| Cleartext | None (handshake MUST NOT have started)                 | Out-of-band `MuxSettings::symmetric(cap)`. Both ends MUST agree | `into_split_cleartext()` | NONE: no confidentiality, integrity, replay, or deletion protection |
+| Mode      | Session                                                     | Settings source                                                 | Split API      | Security properties                                                 |
+| --------- | ----------------------------------------------------------- | --------------------------------------------------------------- | -------------- | ------------------------------------------------------------------- |
+| Encrypted | CMS or ECIES handshake with matching `TransportOffer`s      | `negotiated_mux()`                                              | `into_split()` | Handshake authentication + AEAD as configured for the session       |
+| Cleartext | None: the transport was built as a named cleartext endpoint | Out-of-band `MuxSettings::symmetric(cap)`. Both ends MUST agree | `into_split()` | NONE: no confidentiality, integrity, replay, or deletion protection |
 
 Cleartext mux is for controlled environments and tests. It MUST NOT replace an encrypted session on a hostile network.
 
@@ -2189,7 +2189,7 @@ handle.shutdown().await?;
 
 **Cleartext path:**
 
-Use cleartext only when both endpoints intentionally forgo the handshake. Settings are not negotiated. Divergent caps cause asymmetric refuse/accept behavior. `into_split_cleartext` requires a never-handshaken transport with no server identity or key manager configured.
+Use cleartext only when both endpoints intentionally forgo the handshake. Settings are not negotiated. Divergent caps cause asymmetric refuse/accept behavior. `into_split` splits in the wire mode the session holds, so a transport built from `EndpointConfig::cleartext()` yields cleartext halves and a provisioned transport refuses to split until its handshake completes.
 
 ```rust
 use tightbeam::transport::handshake::negotiation::MuxSettings;
@@ -2197,7 +2197,7 @@ use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
 
 // Both ends MUST share this value. Cleartext mux has no negotiation.
 let settings = MuxSettings::symmetric(32);
-let (reader, writer) = transport.into_split_cleartext()?;
+let (reader, writer) = transport.into_split()?;
 let mux = MuxTransport::new(reader, writer, MuxRole::Client, settings);
 let (handle, reader_drv, writer_drv, responder) = mux.into_parts();
 ```
@@ -2307,7 +2307,7 @@ With an offer configured, `connect` shares one multiplexed connection per destin
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 	.with_config(PoolConfig { mux_offer: Some(offer.with_budgets(budgets)), ..Default::default() })
 	.with_trust_store(trust_store)
-	.with_client_identity(client_cert, client_key)?  // budgets REQUIRE mutual auth
+	.with_client_identity(ClientIdentity::from_spec(client_cert, client_key)?)  // budgets REQUIRE mutual auth
 	.with_receipt_approver(approver)                 // answers settlement challenges
 	.build());
 
@@ -2345,7 +2345,7 @@ let receipt = lease.session_receipt();  // Option<Arc<StoredReceipt>>
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 	.with_config(PoolConfig { max_connections: 3, ..Default::default() })
 	.with_trust_store(trust_store)
-	.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+	.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?)
 	.with_timeout(Duration::from_millis(5000))
 	.build());
 
@@ -5086,7 +5086,7 @@ tb_scenario! {
 		},
 		client: |ClientEnv { trace, addr, .. }| async move {
 			let stream = <TokioListener as Protocol>::connect(addr).await?;
-			let mut client = <TokioListener as Protocol>::create_transport(stream);
+			let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
 
 			trace.event(RESPONSE)?;
 			let frame = compose! {

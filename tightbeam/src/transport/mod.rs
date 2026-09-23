@@ -61,7 +61,6 @@ pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO};
 pub use messaging::{MessageCollector, Transport};
 pub use protocols::{
 	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
-	X509ClientConfig,
 };
 
 #[cfg(feature = "builder")]
@@ -82,7 +81,7 @@ pub use tcp::r#async::TcpTransport;
 #[cfg(all(feature = "tcp", feature = "tokio"))]
 pub use tcp::r#async::TokioListener;
 #[cfg(all(any(feature = "tokio", feature = "async-transport"), feature = "x509"))]
-pub use tcp::r#async::{CleartextReader, CleartextWriter, TransportReader, TransportWriter};
+pub use tcp::r#async::{TransportReader, TransportWriter};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -91,7 +90,14 @@ pub type TransportResult<T> = Result<T, TransportError>;
 mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::transport::state::{DialableEncryption, EncryptionConfig};
+	pub use crate::utils::time::Clock;
 	pub use crate::x509::Certificate;
+
+	#[cfg(feature = "instrument")]
+	pub use crate::trace::TraceCollector;
+	#[cfg(host_clock)]
+	pub use crate::utils::time::SystemClock;
 }
 
 #[cfg(feature = "x509")]
@@ -169,29 +175,119 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 }
 
 #[cfg(feature = "x509")]
-impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for crate::transport::state::DialableEncryption<P> {
-	/// A server presents a certificate, which is one of the things that answers
-	/// for the peer, so the dialer rule holds for every configuration of this
-	/// shape and is discharged by the type rather than by a check.
-	fn from(config: TransportEncryptionConfig<P>) -> Self {
-		let encryption = crate::transport::state::EncryptionConfig::from(config);
-		Self::from_peer_authority(encryption)
-	}
-}
-
-#[cfg(feature = "x509")]
-impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for crate::transport::state::EncryptionConfig<P> {
+impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for DialableEncryption<P> {
 	/// The one place a server's configuration becomes provisioning.
 	///
-	/// `limits` is not provisioning, so it stays on the caller to install.
+	/// A server presents a certificate, which is one of the things that answers
+	/// for the peer, so the dialer rule holds for every configuration of this
+	/// shape and is discharged by the type rather than by a check. `limits` is
+	/// not provisioning, so [`EndpointConfig`] carries it beside this value.
 	fn from(config: TransportEncryptionConfig<P>) -> Self {
-		Self {
+		let encryption = EncryptionConfig {
 			server_certificate: Some(config.certificate),
 			client_validators: config.client_validators,
 			aad_domain_tag: config.aad_domain_tag,
 			key_manager: Some(config.key_manager),
-			..Self::default()
+			..EncryptionConfig::unconfigured()
+		};
+
+		Self::from_peer_authority(encryption)
+	}
+}
+
+/// Everything a transport is built from: provisioning that answered the
+/// dialer rule, the ceilings it enforces, and the clock it measures against.
+///
+/// Listeners, clients, and pools each build one of these, and every transport
+/// constructor takes it whole, so no transport exists without all three. A
+/// clone bumps refcounts and copies no certificate.
+#[cfg(feature = "x509")]
+pub struct EndpointConfig<P: CryptoProvider> {
+	pub(crate) encryption: DialableEncryption<P>,
+	pub(crate) limits: TransportLimits,
+	pub(crate) clock: Arc<dyn Clock>,
+	#[cfg(feature = "instrument")]
+	pub(crate) trace: Option<TraceCollector>,
+}
+
+#[cfg(feature = "x509")]
+impl<P: CryptoProvider> EndpointConfig<P> {
+	/// An endpoint for `encryption` that measures time against `clock`, with
+	/// the default ceilings.
+	pub fn new(encryption: impl Into<DialableEncryption<P>>, clock: Arc<dyn Clock>) -> Self {
+		Self {
+			encryption: encryption.into(),
+			limits: TransportLimits::default(),
+			clock,
+			#[cfg(feature = "instrument")]
+			trace: None,
 		}
+	}
+
+	/// A cleartext endpoint on the operating system's clocks.
+	///
+	/// Frames travel with no confidentiality, integrity, or peer
+	/// authentication. See [`DialableEncryption::cleartext`].
+	#[cfg(host_clock)]
+	pub fn cleartext() -> Self {
+		Self::new(DialableEncryption::cleartext(), Arc::new(SystemClock))
+	}
+
+	/// Replace every ceiling this endpoint enforces.
+	#[must_use]
+	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
+		self.limits = limits;
+		self
+	}
+
+	/// Replace the clock this endpoint measures deadlines and backoff against.
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
+		self
+	}
+
+	/// Attach the production instrumentation collector each transport built
+	/// from this configuration shares.
+	#[cfg(feature = "instrument")]
+	#[must_use]
+	pub fn with_trace(mut self, trace: TraceCollector) -> Self {
+		self.trace = Some(trace);
+		self
+	}
+
+	/// The provisioning this endpoint was given.
+	pub fn encryption(&self) -> &EncryptionConfig<P> {
+		self.encryption.encryption()
+	}
+
+	/// Every ceiling this endpoint enforces.
+	pub fn limits(&self) -> &TransportLimits {
+		&self.limits
+	}
+}
+
+#[cfg(feature = "x509")]
+impl<P: CryptoProvider> Clone for EndpointConfig<P> {
+	fn clone(&self) -> Self {
+		Self {
+			encryption: self.encryption.clone(),
+			limits: self.limits,
+			clock: Arc::clone(&self.clock),
+			#[cfg(feature = "instrument")]
+			trace: self.trace.as_ref().map(TraceCollector::share),
+		}
+	}
+}
+
+/// A server endpoint on the operating system's clocks, enforcing the
+/// ceilings `config` names.
+#[cfg(all(feature = "x509", host_clock))]
+impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for EndpointConfig<P> {
+	fn from(config: TransportEncryptionConfig<P>) -> Self {
+		let limits = config.limits;
+
+		Self::new(config, Arc::new(SystemClock)).with_limits(limits)
 	}
 }
 
@@ -274,7 +370,7 @@ mod tests {
 		use std::sync::{mpsc, Arc};
 
 		use crate::asn1::Frame;
-		use crate::transport::policy::{RestartConfig, RestartLinearBackoff};
+		use crate::transport::policy::RestartLinearBackoff;
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::tcp::TightBeamSocketAddr;
 
@@ -299,6 +395,7 @@ mod tests {
 		// Create client using client! macro
 		let mut client = crate::client! {
 			connect TokioListener: addr,
+			cleartext,
 			policies: {
 				restart_policy: RestartLinearBackoff::default(),
 			}

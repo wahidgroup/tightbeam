@@ -15,6 +15,7 @@ use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::utils::time::{Clock, ManualClock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -1598,7 +1599,7 @@ fn metered_pool(
 	let builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)
-		.with_client_identity(identity, client_provider)?
+		.with_client_identity(ClientIdentity::from_spec(identity, client_provider)?)
 		.with_receipt_approver(receipt_approver)
 		.with_trace(trace.share());
 	let pool = Arc::new(builder.build());

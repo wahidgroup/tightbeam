@@ -32,8 +32,6 @@ use crate::Frame;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use super::flow::renewal_floor;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use super::shared::RekeyPhase;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::DEFAULT_REKEY_MIN_SPEND_RECORDS;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::aead::RecvCipher;
@@ -543,7 +541,10 @@ where
 	/// quiesce). The receive-side install waits for `RekeyDone`.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	async fn route_rekey_response(&mut self, package: MuxRekeyResponsePackage) -> TransportResult<()> {
-		if self.shared.rekey_phase() != RekeyPhase::AwaitingResponse {
+		// Admitting the response parks new c2s admissions before it is
+		// verified, so no admission can debit the old epoch once the ack
+		// is in motion.
+		if !self.shared.admit_rekey_response() {
 			return Err(self.protocol_violation());
 		}
 		let Some(RekeyDriver::Client(exchange)) = self.rekey.as_ref() else {
@@ -564,9 +565,6 @@ where
 				let EpochInstall { send_cipher, recv_cipher, receipt, epoch: _ } = install;
 
 				self.pending_install = Some(PendingDone { recv_cipher, receipt });
-				// Park before the ack is queued: no admission can
-				// debit the old epoch once the ack is in motion
-				self.shared.begin_ack_flush();
 
 				let ack_envelope = TransportEnvelope::from(ack);
 				let install = Outbound::EnvelopeThenInstall(ack_envelope, Box::new(send_cipher));
@@ -635,16 +633,22 @@ where
 	/// parked admissions resume.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	fn route_rekey_done(&mut self, _package: MuxRekeyDonePackage) -> TransportResult<()> {
-		if self.shared.rekey_phase() != RekeyPhase::AwaitingDone {
-			return Err(self.protocol_violation());
-		}
 		let Some(PendingDone { recv_cipher, receipt }) = self.pending_install.take() else {
 			return Err(self.protocol_violation());
 		};
 
+		// The new epoch's receive cipher and budget take over before the
+		// renewal closes, so an admission it releases debits the new
+		// epoch. A `RekeyDone` out of order closes nothing and ends the
+		// connection.
 		self.reader.install_recv_cipher(recv_cipher)?;
-		self.renew_epoch_terms(receipt);
-		self.shared.finish_renewal();
+		self.recv_budget = self.initial_recv_budget;
+		if !self.shared.complete_renewal(receipt) {
+			return Err(self.protocol_violation());
+		}
+
+		#[cfg(feature = "instrument")]
+		self.shared.emit_event(events::MUX_REKEY_RENEWED);
 
 		Ok(())
 	}

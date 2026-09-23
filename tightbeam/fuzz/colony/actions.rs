@@ -21,6 +21,7 @@ use tightbeam::transport::client::pool::{ConnectionPool, PoolConfig};
 use tightbeam::transport::error::{TransportError, TransportFailure};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::multiplex::RequestSink;
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, PooledClient, Protocol};
 use tightbeam::utils::urn::Urn;
@@ -221,7 +222,7 @@ async fn connect_with_identity(
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_timeout(CLIENT_IO_TIMEOUT)
 		.with_trust_store(server_trust)
-		.with_client_identity(cert, key)?
+		.with_client_identity(ClientIdentity::from_spec(cert, key)?)
 		.build()
 		.connect(addr.to_owned())
 		.await?)
@@ -259,7 +260,7 @@ async fn pooled_client(
 			.with_config(config)
 			.with_timeout(CLIENT_IO_TIMEOUT)
 			.with_trust_store(Arc::clone(&identity.trust))
-			.with_client_identity(cert, key)?
+			.with_client_identity(ClientIdentity::from_spec(cert, key)?)
 			.with_trace(trace.share())
 			.build(),
 	);

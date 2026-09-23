@@ -20,8 +20,8 @@ use tightbeam::crypto::aead::RuntimeAead;
 use tightbeam::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use tightbeam::transport::tcp::r#async::TcpTransport;
 use tightbeam::transport::{
-	AsyncByteRead, AsyncByteStream, AsyncByteWrite, AsyncListenerTrait, EncryptedProtocol, PersistentConnection,
-	Protocol, SplittableStream, TightBeamAddress, TransportEncryptionConfig, TransportError,
+	AsyncByteRead, AsyncByteStream, AsyncByteWrite, AsyncListenerTrait, EncryptedProtocol, EndpointConfig,
+	PersistentConnection, Protocol, SplittableStream, TightBeamAddress, TransportEncryptionConfig, TransportError,
 };
 
 /// Buffered capacity of one laser link direction.
@@ -145,10 +145,11 @@ fn poisoned() -> TransportError {
 	TransportError::InvalidState
 }
 
-/// Listener half of a laser endpoint, with optional server encryption.
+/// Listener half of a laser endpoint. Every accepted beam is built from one
+/// endpoint configuration, encrypted or cleartext.
 pub struct LaserListener<P: CryptoProvider = DefaultCryptoProvider> {
 	incoming: AsyncMutex<mpsc::UnboundedReceiver<DuplexStream>>,
-	config: Option<TransportEncryptionConfig<P>>,
+	config: EndpointConfig<P>,
 }
 
 impl<P: CryptoProvider + Send + Sync + 'static> LaserListener<P> {
@@ -164,7 +165,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> LaserListener<P> {
 		Ok((rx, LaserAddr(id)))
 	}
 
-	/// Accept one beam, applying server encryption when configured.
+	/// Accept one beam as a transport built from this listener's
+	/// configuration.
 	pub async fn accept(&self) -> Result<(LaserTransport<P>, LaserAddr), TransportError> {
 		let stream = self
 			.incoming
@@ -174,10 +176,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> LaserListener<P> {
 			.await
 			.ok_or(TransportError::ConnectionClosed)?;
 
-		let mut transport = LaserTransport::from(LaserStream(stream));
-		if let Some(config) = &self.config {
-			transport = transport.with_server_encryption(config.clone());
-		}
+		let transport = LaserTransport::new(LaserStream(stream), self.config.clone());
 
 		Ok((transport, LaserAddr(0)))
 	}
@@ -189,6 +188,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for LaserListener<P> {
 	type Transport = LaserTransport<P>;
 	type Error = TransportError;
 	type Address = LaserAddr;
+	type CryptoProvider = P;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
 		Ok(LaserAddr::ANY)
@@ -197,7 +197,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for LaserListener<P> {
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let (incoming, bound) = Self::bind_airspace(addr)?;
 		let incoming = AsyncMutex::new(incoming);
-		Ok((Self { incoming, config: None }, bound))
+		Ok((Self { incoming, config: EndpointConfig::cleartext() }, bound))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
@@ -213,15 +213,14 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for LaserListener<P> {
 		Ok(LaserStream(client_end))
 	}
 
-	fn create_transport(stream: Self::Stream) -> Self::Transport {
-		LaserTransport::from(stream)
+	fn create_transport(stream: Self::Stream, config: EndpointConfig<P>) -> Self::Transport {
+		LaserTransport::new(stream, config)
 	}
 }
 
 impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for LaserListener<P> {
 	type Encryptor = RuntimeAead;
 	type Decryptor = RuntimeAead;
-	type CryptoProvider = P;
 
 	async fn bind_with(
 		addr: Self::Address,
@@ -229,7 +228,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for LaserListe
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let (incoming, bound) = Self::bind_airspace(addr)?;
 		let incoming = AsyncMutex::new(incoming);
-		Ok((Self { incoming, config: Some(config) }, bound))
+		Ok((Self { incoming, config: EndpointConfig::from(config) }, bound))
 	}
 }
 

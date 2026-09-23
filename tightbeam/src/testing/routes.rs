@@ -11,11 +11,10 @@
 use core::future::Future;
 use core::hash::Hash;
 
-use crate::crypto::profiles::CryptoProvider;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::{MuxConnector, RequestSink, StreamBody, StreamRoute};
 use crate::transport::policy::PolicyConfig;
-use crate::transport::{PersistentConnection, PooledClient, Protocol, TransportResult, X509ClientConfig};
+use crate::transport::{PersistentConnection, PooledClient, Protocol, TransportResult};
 use crate::utils::marker::MaybeSend;
 use crate::utils::urn::Urn;
 use crate::Frame;
@@ -59,18 +58,11 @@ pub trait RoutedOpens {
 	fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)>;
 }
 
-impl<P, C> RoutedOpens for PooledClient<P, C>
+impl<P> RoutedOpens for PooledClient<P>
 where
 	P: Protocol + PersistentConnection + Send + Sync,
-	C: CryptoProvider + Send + Sync + 'static,
 	P::Address: Hash + Eq + Clone + Send + Sync,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = C>
-		+ MuxConnector
-		+ Send
-		+ Sync,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + MuxConnector + Send + Sync,
 {
 	fn open_stream_with_route(
 		&self,

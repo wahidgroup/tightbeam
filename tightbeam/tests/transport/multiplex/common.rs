@@ -26,6 +26,7 @@ use tightbeam::transport::multiplex::{
 use tightbeam::transport::tcp::r#async::{
 	TcpTransport, TokioListener, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader, TransportWriter,
 };
+use tightbeam::transport::EndpointConfig;
 use tightbeam::transport::{
 	EncryptedMessageIO, EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError,
 	TransportFailure,
@@ -178,7 +179,7 @@ pub fn spawn_cleartext_mux_endpoint(
 	cancel_budget: Option<u32>,
 	trace: TraceCollector,
 ) -> Result<(MuxEndpoint, MuxResponder), TightBeamError> {
-	let (reader, writer) = transport.with_trace(trace).into_split_cleartext()?;
+	let (reader, writer) = transport.with_trace(trace).into_split()?;
 	let mux = MuxTransport::new(reader, writer, role, settings);
 	let endpoint_pair = spawn_mux_tasks(mux, cancel_budget);
 	Ok(endpoint_pair)
@@ -196,7 +197,7 @@ pub async fn establish_cleartext_transports(
 
 	let stream = TcpStream::connect(addr).await?;
 	let client_stream = TokioStream::from(stream);
-	let client = TcpTransport::from(client_stream);
+	let client = TcpTransport::new(client_stream, EndpointConfig::cleartext());
 
 	let server = await_ok(accept_task, "cleartext accept task must not panic").await?;
 	Ok((client, server))

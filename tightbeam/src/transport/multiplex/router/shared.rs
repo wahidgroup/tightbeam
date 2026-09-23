@@ -766,18 +766,23 @@ impl MuxShared {
 		false
 	}
 
-	/// Park new c2s admissions while owed chunks flush ahead of the
-	/// `RekeyAck` (client, on a verified `RekeyResponse`).
+	/// Admit a `RekeyResponse` (client), parking new c2s admissions while
+	/// owed chunks flush ahead of the `RekeyAck`.
+	///
+	/// The phase check and the move are one step under the lock, so a
+	/// response arriving out of order moves nothing and admits nothing.
+	/// Returns whether the response was admitted.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub fn begin_ack_flush(&self) {
+	pub fn admit_rekey_response(&self) -> bool {
 		let mut state = self.lock();
 		if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingResponse, RekeyPhase::FlushingAck) {
-			return;
+			return false;
 		}
 
 		// Owed chunks may already be quiescent: give the writer its
 		// wake now, ahead of the next ledger transition
 		Self::wake_on_quiesce(&mut state);
+		true
 	}
 
 	/// The send cipher is active after the Ack, which lifts the
@@ -793,12 +798,46 @@ impl MuxShared {
 		state.wake_rekey_waiters();
 	}
 
-	/// Close the renewal (fresh epoch active, or the attempt died):
-	/// admissions resume, hard floor lifts, parked tasks wake.
+	/// Close a renewal that completed (client, on `RekeyDone`): the send
+	/// budget resets, the epoch receipt rotates, and parked admissions
+	/// resume.
+	///
+	/// The phase check and the close are one step under the lock, so a
+	/// `RekeyDone` that arrives before the `RekeyAck` was written closes
+	/// nothing. Returns whether the renewal closed.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	pub fn complete_renewal(&self, receipt: StoredReceipt) -> bool {
+		{
+			let mut state = self.lock();
+			if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingDone, RekeyPhase::Idle) {
+				return false;
+			}
+
+			state.send_budget = self.initial_send_budget;
+			Self::release_renewal(&mut state);
+		}
+
+		self.rotate_receipt(receipt);
+		true
+	}
+
+	/// Abandon the renewal from wherever it got to (the attempt died or was
+	/// refused): admissions resume, hard floor lifts, parked tasks wake.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub fn finish_renewal(&self) {
 		let mut state = self.lock();
+		Self::abandon_renewal(&mut state);
+	}
+
+	/// Return the renewal to `Idle` from any phase. Apart from a completed
+	/// renewal, this is the only write of `Idle`.
+	fn abandon_renewal(state: &mut MuxState) {
 		state.rekey = RekeyPhase::Idle;
+		Self::release_renewal(state);
+	}
+
+	/// Lift the hard floor and wake everything parked on the renewal.
+	fn release_renewal(state: &mut MuxState) {
 		state.rekey_hard_floor = false;
 		state.wake_rekey_waiters();
 	}
@@ -1067,11 +1106,9 @@ impl MuxShared {
 		}
 
 		state.unsent_chunks = 0;
-		state.rekey = RekeyPhase::Idle;
-		state.rekey_hard_floor = false;
+		Self::abandon_renewal(&mut state);
 		state.wake_drain_waiters();
 		state.wake_slot_waiters();
-		state.wake_rekey_waiters();
 	}
 
 	/// Resolve pending streams above `last_stream_id` as draining
@@ -1895,7 +1932,7 @@ mod tests {
 
 		// The renewal reaches the Ack write through the flush phase, the same
 		// order the reader and writer drive it in.
-		shared.begin_ack_flush();
+		assert!(shared.admit_rekey_response());
 		shared.mark_ack_written();
 		assert!(flag.woken());
 

@@ -9,7 +9,7 @@ use tightbeam::server;
 use tightbeam::testing::TestFrame;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::sync::{TcpListener, TcpTransport};
-use tightbeam::transport::{MessageEmitter, TransportResult};
+use tightbeam::transport::{EndpointConfig, MessageEmitter, TransportResult};
 use tightbeam::Frame;
 
 /// One frame round-trips through the sync accept loop: the server thread
@@ -28,7 +28,7 @@ fn sync_server_echoes_over_std_tcp() -> TransportResult<()> {
 	});
 
 	let stream = NetTcpStream::connect(addr)?;
-	let mut client = TcpTransport::from(stream);
+	let mut client = TcpTransport::new(stream, EndpointConfig::cleartext());
 
 	let frame = TestFrame::v0(Some("sync-echo"), None);
 	let echoed = rt::block_on(client.emit(frame.to_owned(), None))?;
@@ -55,7 +55,7 @@ fn sync_server_audits_gate_verdicts() -> TransportResult<()> {
 	});
 
 	let stream = NetTcpStream::connect(addr)?;
-	let mut client = TcpTransport::from(stream);
+	let mut client = TcpTransport::new(stream, EndpointConfig::cleartext());
 
 	let frame = TestFrame::v0(Some("sync-audit"), None);
 	let echoed = rt::block_on(client.emit(frame.to_owned(), None))?;

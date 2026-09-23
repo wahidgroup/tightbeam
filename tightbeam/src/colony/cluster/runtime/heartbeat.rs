@@ -22,7 +22,7 @@ use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
+use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol};
 use crate::TightBeamError;
 use crate::{MessagePriority, Version};
 
@@ -51,7 +51,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send
@@ -87,6 +86,7 @@ where
 		signed_frame
 			.sign_with_provider::<D, _>(self.config.tls.identity().signing_provider())
 			.await?;
+
 		let mut client = self.pool.connect(addr).await?;
 		let response = client.emit(signed_frame, None).await?.ok_or(ClusterError::NoResponse)?;
 
@@ -110,7 +110,6 @@ where
 	P::Transport: MessageEmitter
 		+ MessageCollector
 		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		+ MuxConnector
 		+ EncryptedProtocolState
 		+ Send
@@ -217,7 +216,7 @@ where
 						trace.event(CLUSTER_HIVE_EVICTED)?.with_payload(&retired.address).emit();
 					}
 
-					rt::sleep(config.heartbeat.interval).await;
+					config.clock.sleep(config.heartbeat.interval).await;
 				}
 			}
 			.await;
@@ -237,12 +236,13 @@ where
 	/// loop.
 	pub(crate) fn spawn_evaporation(self, relay_trail_ttl: Duration) -> rt::JoinHandle {
 		let evaporation_interval = self.config.pheromone.evaporation_interval;
+		let clock = Arc::clone(&self.config.clock);
 		let GatewayRuntimeCtx { servlet_registry, trace, .. } = self;
 
 		rt::spawn(async move {
 			let sweep: Result<(), TightBeamError> = async move {
 				loop {
-					rt::sleep(evaporation_interval).await;
+					clock.sleep(evaporation_interval).await;
 					let _ = servlet_registry.evaporate();
 					let _ = servlet_registry.remove_abandoned();
 

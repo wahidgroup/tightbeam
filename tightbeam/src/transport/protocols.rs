@@ -7,17 +7,11 @@ use core::time::Duration;
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
-#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::sync::Arc;
 
 use crate::transport::error::TransportError;
 use crate::utils::marker::MaybeSend;
 
-#[cfg(all(feature = "x509", feature = "instrument"))]
-use crate::trace::TraceCollector;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
@@ -26,12 +20,7 @@ use crate::transport::TransportResult;
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::transport::handshake::receipt::ReceiptApprover;
-	pub use crate::transport::handshake::HandshakeProtocolKind;
-	pub use crate::transport::state::{ClientIdentity, DialableEncryption};
-	pub use crate::transport::TransportEncryptionConfig;
-	pub use crate::x509::Certificate;
+	pub use crate::transport::{EndpointConfig, TransportEncryptionConfig};
 }
 
 #[cfg(feature = "x509")]
@@ -67,6 +56,8 @@ pub trait Protocol {
 	type Transport: Send;
 	type Error: Into<TransportError>;
 	type Address: TightBeamAddress;
+	/// Crypto provider every transport of this protocol is built with.
+	type CryptoProvider: CryptoProvider + Send + Sync + 'static;
 
 	/// Get a default address for binding to any available port/endpoint
 	/// This is protocol-specific (e.g., "127.0.0.1:0" for TCP)
@@ -78,70 +69,24 @@ pub trait Protocol {
 	/// Connect to an address
 	fn connect(addr: Self::Address) -> impl Future<Output = Result<Self::Stream, Self::Error>> + Send;
 
-	/// Create transport from stream
-	fn create_transport(stream: Self::Stream) -> Self::Transport;
+	/// Build a transport over `stream` from `config`.
+	///
+	/// The configuration carries provisioning that already answered the
+	/// dialer rule, so every transport this protocol builds either holds a
+	/// peer authority or was named cleartext.
+	fn create_transport(stream: Self::Stream, config: EndpointConfig<Self::CryptoProvider>) -> Self::Transport;
 }
 
 #[cfg(feature = "x509")]
 pub trait EncryptedProtocol: Protocol {
 	type Encryptor: Send;
 	type Decryptor: Send;
-	type CryptoProvider: CryptoProvider;
 
 	/// Bind to an address with transport encryption configuration
 	fn bind_with(
 		addr: Self::Address,
 		config: TransportEncryptionConfig<Self::CryptoProvider>,
 	) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
-}
-
-/// Trait for configuring client-side X.509 mutual authentication.
-#[cfg(feature = "x509")]
-pub trait X509ClientConfig: Sized {
-	type CryptoProvider: CryptoProvider;
-
-	/// Trust store against which the peer server certificate is validated.
-	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
-
-	/// Client certificate and the signing key that proves it.
-	///
-	/// [`ClientIdentity`] owns the binding contract.
-	fn with_client_identity(self, identity: ClientIdentity<Self::CryptoProvider>) -> Self;
-
-	/// Provision the expected server certificate chain, ordered root to leaf.
-	///
-	/// Required for key-transport handshakes (CMS), where the client encrypts
-	/// the session key to the server's public key before the server presents a
-	/// certificate on the wire.
-	fn with_server_certificate_chain(self, chain: Arc<[Certificate]>) -> Self;
-
-	/// Handshake protocol used once encryption is provisioned.
-	fn with_handshake_protocol(self, kind: HandshakeProtocolKind) -> Self;
-
-	/// Approver consulted before countersigning a challenge-bearing receipt.
-	fn with_receipt_approver(self, approver: Arc<dyn ReceiptApprover>) -> Self;
-
-	/// Replace the domain-separation tag of the ECIES key exchange.
-	///
-	/// The ECIES handshake binds this tag into the associated data of the
-	/// encrypted key exchange, so an ECIES session completes only when both
-	/// endpoints hold the same tag. The CMS handshake and session records do
-	/// not read it.
-	fn with_aad_domain_tag(self, tag: &'static [u8]) -> Self;
-
-	/// Install the provisioning this endpoint was configured with.
-	///
-	/// The configuration moves in one piece, so a builder that accumulates it
-	/// cannot hand over some fields and forget others. Taking it checked means
-	/// no path reaches a transport without answering the dialer rule.
-	///
-	/// Replaces whatever provisioning this endpoint already held.
-	fn with_encryption(self, encryption: DialableEncryption<Self::CryptoProvider>) -> Self;
-
-	/// Production instrumentation collector, propagated downstream
-	/// (handshake, mux plane) by the transport.
-	#[cfg(feature = "instrument")]
-	fn with_trace(self, trace: TraceCollector) -> Self;
 }
 
 /// Async listener trait
