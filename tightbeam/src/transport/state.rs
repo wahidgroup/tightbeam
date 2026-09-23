@@ -194,7 +194,13 @@ impl<P: CryptoProvider> SessionState<P> {
 		}
 
 		self.phase = match event {
-			SessionEvent::BeginHandshake(initiated_at) => SessionPhase::Handshaking { initiated_at },
+			// The deadline runs from the first round, so a later round keeps
+			// the instant the exchange began and a slow peer cannot stretch
+			// the handshake by one allowance per round.
+			SessionEvent::BeginHandshake(now) => {
+				let initiated_at = self.phase.initiated_at().unwrap_or(now);
+				SessionPhase::Handshaking { initiated_at }
+			}
 			SessionEvent::Install(session) => SessionPhase::Encrypted(session),
 			SessionEvent::Reset => SessionPhase::start_for(&self.encryption),
 		};
@@ -202,7 +208,10 @@ impl<P: CryptoProvider> SessionState<P> {
 		true
 	}
 
-	/// Record that a handshake started at `now`.
+	/// Record a handshake round at `now`.
+	///
+	/// The first round starts the deadline. A later round keeps the instant
+	/// the first one recorded.
 	#[must_use]
 	pub fn begin_handshake(&mut self, now: MonotonicInstant) -> bool {
 		self.apply(SessionEvent::BeginHandshake(now))
@@ -917,6 +926,21 @@ mod tests {
 			"install" => SessionEvent::Install(Box::new(established_session())),
 			_ => SessionEvent::Reset,
 		}
+	}
+
+	/// A later handshake round keeps the instant the first round recorded, so
+	/// the deadline covers the whole exchange rather than one round.
+	#[test]
+	fn a_later_handshake_round_keeps_the_first_rounds_deadline() {
+		let clock = ManualClock::default();
+		let started = clock.monotonic();
+		let mut state = SessionState::at(provisioned_encryption(), SessionPhase::Provisioned);
+		assert!(state.begin_handshake(started));
+
+		clock.advance(Duration::from_secs(5));
+
+		assert!(state.begin_handshake(clock.monotonic()));
+		assert_eq!(state.phase().initiated_at(), Some(started));
 	}
 
 	/// Restarting a handshake under a live session would drop its keys, so the

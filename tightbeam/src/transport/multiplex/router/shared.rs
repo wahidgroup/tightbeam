@@ -802,22 +802,24 @@ impl MuxShared {
 	/// budget resets, the epoch receipt rotates, and parked admissions
 	/// resume.
 	///
-	/// The phase check and the close are one step under the lock, so a
-	/// `RekeyDone` that arrives before the `RekeyAck` was written closes
-	/// nothing. Returns whether the renewal closed.
+	/// The phase check, the budget reset, and the receipt rotation happen
+	/// under the lock before any admission wakes, so an admission that debits
+	/// the new epoch also reads its receipt. A `RekeyDone` that arrives before
+	/// the `RekeyAck` was written closes nothing. Returns whether the renewal
+	/// closed.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub fn complete_renewal(&self, receipt: StoredReceipt) -> bool {
-		{
-			let mut state = self.lock();
-			if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingDone, RekeyPhase::Idle) {
-				return false;
-			}
-
-			state.send_budget = self.initial_send_budget;
-			Self::release_renewal(&mut state);
+		let mut state = self.lock();
+		if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingDone, RekeyPhase::Idle) {
+			return false;
 		}
 
+		state.send_budget = self.initial_send_budget;
+
+		// The receipt slot is never held while this lock is taken, so taking
+		// it here cannot invert the lock order.
 		self.rotate_receipt(receipt);
+		Self::release_renewal(&mut state);
 		true
 	}
 
@@ -1912,6 +1914,49 @@ mod tests {
 		let mut cx = noop_cx();
 		let admitted = shared.poll_admit_debit(1, false, &mut cx);
 		assert!(matches!(admitted, Poll::Ready(Ok(BudgetStanding::Healthy))));
+	}
+
+	/// A waker that records whether the epoch receipt had rotated when it
+	/// woke.
+	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
+	struct ReceiptWitness {
+		shared: Arc<MuxShared>,
+		rotated: core::sync::atomic::AtomicBool,
+	}
+
+	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
+	impl futures::task::ArcWake for ReceiptWitness {
+		fn wake_by_ref(arc_self: &Arc<Self>) {
+			let rotated = arc_self.shared.session_receipt().is_some();
+			arc_self.rotated.store(rotated, core::sync::atomic::Ordering::SeqCst);
+		}
+	}
+
+	/// An admission released by a completed renewal debits the new epoch, so
+	/// it must find the new epoch's receipt already in place when it wakes.
+	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
+	#[tokio::test]
+	async fn test_a_released_admission_reads_the_new_epoch_receipt(
+	) -> Result<(), crate::transport::handshake::HandshakeError> {
+		use crate::transport::rekey::tests::{rekey_pair, run_exchange};
+
+		let (mut client, mut server) = rekey_pair()?;
+		let (client_install, _) = run_exchange(&mut client, &mut server).await?;
+
+		let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
+		begin_client_renewal(&shared);
+		assert!(shared.admit_rekey_response());
+
+		shared.mark_ack_written();
+
+		let witness = Arc::new(ReceiptWitness { shared: Arc::clone(&shared), rotated: Default::default() });
+		let waker = futures::task::waker(Arc::clone(&witness));
+		let parked = shared.poll_admit_debit(1, false, &mut Context::from_waker(&waker));
+		assert!(matches!(parked, Poll::Pending));
+
+		assert!(shared.complete_renewal(client_install.receipt));
+		assert!(witness.rotated.load(core::sync::atomic::Ordering::SeqCst));
+		Ok(())
 	}
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]

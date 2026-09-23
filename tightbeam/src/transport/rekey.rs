@@ -636,7 +636,7 @@ impl RekeyDriver {
 }
 
 #[cfg(all(test, feature = "secp256k1", feature = "aes-gcm"))]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 	use crate::crypto::aead::DecryptContent;
 	use crate::crypto::hash::Sha3_256;
@@ -685,8 +685,9 @@ mod tests {
 		})
 	}
 
-	fn rekey_pair() -> Result<(ClientRekey<DefaultCryptoProvider>, ServerRekey<DefaultCryptoProvider>), HandshakeError>
-	{
+	/// A client and server holding matched epoch materials, ready to renew.
+	pub(crate) fn rekey_pair(
+	) -> Result<(ClientRekey<DefaultCryptoProvider>, ServerRekey<DefaultCryptoProvider>), HandshakeError> {
 		let client_identity = test_identity()?;
 		let server_identity = test_identity()?;
 		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
@@ -711,7 +712,8 @@ mod tests {
 		Ok((client, server))
 	}
 
-	async fn run_exchange(
+	/// Run one renewal to completion, answering both endpoints' installs.
+	pub(crate) async fn run_exchange(
 		client: &mut ClientRekey<DefaultCryptoProvider>,
 		server: &mut ServerRekey<DefaultCryptoProvider>,
 	) -> Result<(EpochInstall, EpochInstall), HandshakeError> {
