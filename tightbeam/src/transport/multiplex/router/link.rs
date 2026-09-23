@@ -63,12 +63,14 @@ impl MuxLink {
 		outbound_handle(&self.outbound)
 	}
 
-	/// Send a response on a peer-initiated stream, chunking when it
-	/// exceeds the peer's advertised receive size: full chunks travel as
-	/// `Data(last = false)` and the final chunk travels inline in the `End`
-	/// trailer (responder grammar). Every payload-bearing record is gated
-	/// by the peer's stream credit. A response the session budget cannot
-	/// carry degrades to a payload-free `ResourceExhausted` refusal.
+	/// Send a response on a peer-initiated stream, chunking when it exceeds the
+	/// peer's advertised receive size.
+	///
+	/// - Full chunks travel as `Data(last = false)`, and the final chunk travels inline in the
+	///   `End` trailer (responder grammar).
+	/// - Every payload-bearing record is gated by the peer's stream credit.
+	/// - A response the session budget cannot carry degrades to a payload-free `ResourceExhausted`
+	///   refusal.
 	///
 	/// # Errors
 	///
@@ -105,7 +107,7 @@ impl MuxLink {
 		self.shared.register_send_stream(stream_id, total);
 
 		let mut sent: u64 = 0;
-		for chunk in payload.chunks(chunk_size) {
+		for chunk in payload.chunks(chunk_size.get()) {
 			sent += 1;
 
 			let envelope = if sent == total {

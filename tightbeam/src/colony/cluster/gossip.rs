@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use super::ClusterError;
 use crate::asn1::Frame;
+use crate::colony::common::IssuedAt;
 use crate::colony::common::{GossipRumor, GossipRumorKind, ServletTypeKey};
 use crate::constants::{
 	DEFAULT_GOSSIP_RATE_BURST, DEFAULT_GOSSIP_RATE_REFILL_MS, DEFAULT_GOSSIP_RETENTION_MS, DEFAULT_GOSSIP_SEEN_TTL_MS,
@@ -38,6 +39,7 @@ use crate::constants::{
 };
 use crate::crypto::hash::{Digest, OutputSizeUser, U32};
 use crate::policy::TransitStatus;
+use crate::utils::time::UnixMillis;
 use crate::{decode, encode};
 
 /// Fixed 32-byte content digest of a gossip rumor.
@@ -122,8 +124,8 @@ pub fn wanted_digests(want: impl AsRef<[Vec<u8>]>) -> Vec<GossipDigest> {
 /// Shared by admission and anti-entropy repair. Journals retain by record
 /// time, so a relayed rumor may still be fetchable after the issue window.
 #[must_use]
-pub fn gossip_fresh(order_ms: u64, seen_ttl_ms: u64, now_ms: u64) -> bool {
-	now_ms.abs_diff(order_ms) <= seen_ttl_ms
+pub fn gossip_fresh(order: UnixMillis, seen_ttl: Duration, now: UnixMillis) -> bool {
+	now.abs_diff(order) <= seen_ttl
 }
 
 /// Rumor that passed payload, hop-radius, and freshness checks.
@@ -147,7 +149,7 @@ impl AdmittedGossip {
 	/// Refuse decode failure, oversized payload, `ttl` above
 	/// [`MAX_GOSSIP_TTL`], or a stale issue time. Cap hop radius here at
 	/// the trust boundary (CWE-770).
-	pub fn admit<D>(rumor: &Frame, ttl: u64, seen_ttl_ms: u64, now_ms: u64) -> Result<Self, TransitStatus>
+	pub fn admit<D>(rumor: &Frame, ttl: u64, seen_ttl: Duration, now: UnixMillis) -> Result<Self, TransitStatus>
 	where
 		D: Digest + OutputSizeUser<OutputSize = U32>,
 	{
@@ -155,7 +157,7 @@ impl AdmittedGossip {
 
 		let within_payload = body.payload.len() <= MAX_GOSSIP_PAYLOAD_BYTES;
 		let within_ttl = ttl <= u64::from(MAX_GOSSIP_TTL);
-		let fresh = gossip_fresh(rumor.metadata().order(), seen_ttl_ms, now_ms);
+		let fresh = gossip_fresh(rumor.issued_at(), seen_ttl, now);
 		if within_payload && within_ttl && fresh {
 			let digest = rumor.gossip_digest::<D>().map_err(|_| TransitStatus::PermissionDenied)?;
 			let admitted = Self { digest, payload: body.payload, kind: body.kind };
@@ -204,17 +206,17 @@ impl AdmittedGossip {
 /// The token-bucket default bounds burst and sustained rate. A custom
 /// implementation may meter on any signer-derived dimension.
 pub trait GossipAdmission: Send + Sync {
-	/// Admit one rumor from `signer` at `now_ms`.
+	/// Admit one rumor from `signer` at `now`.
 	///
 	/// `false` means over limit. An error reports a backend fault.
 	/// The gateway refuses in both cases.
-	fn allow(&self, signer: &[u8], now_ms: u64) -> Result<bool, ClusterError>;
+	fn allow(&self, signer: &[u8], now: UnixMillis) -> Result<bool, ClusterError>;
 }
 
 /// One signer's bucket: remaining tokens and the last refill instant.
 struct TokenBucket {
 	tokens: u32,
-	refilled_ms: u64,
+	refilled_at: UnixMillis,
 }
 
 /// In-memory token-bucket [`GossipAdmission`] keyed on the signer.
@@ -230,7 +232,7 @@ struct TokenBucket {
 pub struct TokenBucketAdmission {
 	buckets: Mutex<HashMap<Vec<u8>, TokenBucket>>,
 	burst: u32,
-	refill_interval_ms: u64,
+	refill_interval: Duration,
 	capacity: usize,
 }
 
@@ -249,16 +251,16 @@ impl TokenBucketAdmission {
 		Self {
 			buckets: Mutex::new(HashMap::new()),
 			burst,
-			refill_interval_ms: (refill_interval.as_millis() as u64).max(1),
+			refill_interval: Duration::from_millis((refill_interval.as_millis() as u64).max(1)),
 			capacity,
 		}
 	}
 
 	/// Drop buckets that have regained full capacity in either clock direction.
 	/// A full bucket is indistinguishable from an absent one.
-	fn prune(buckets: &mut HashMap<Vec<u8>, TokenBucket>, burst: u32, refill_interval_ms: u64, now_ms: u64) {
-		let full_after_ms = u64::from(burst).saturating_mul(refill_interval_ms);
-		buckets.retain(|_, bucket| now_ms.abs_diff(bucket.refilled_ms) < full_after_ms);
+	fn prune(buckets: &mut HashMap<Vec<u8>, TokenBucket>, burst: u32, refill_interval: Duration, now: UnixMillis) {
+		let full_after = refill_interval.saturating_mul(burst);
+		buckets.retain(|_, bucket| now.abs_diff(bucket.refilled_at) < full_after);
 	}
 }
 
@@ -269,9 +271,9 @@ impl Default for TokenBucketAdmission {
 }
 
 impl GossipAdmission for TokenBucketAdmission {
-	fn allow(&self, signer: &[u8], now_ms: u64) -> Result<bool, ClusterError> {
+	fn allow(&self, signer: &[u8], now: UnixMillis) -> Result<bool, ClusterError> {
 		let mut buckets = self.buckets.lock()?;
-		Self::prune(&mut buckets, self.burst, self.refill_interval_ms, now_ms);
+		Self::prune(&mut buckets, self.burst, self.refill_interval, now);
 
 		if !buckets.contains_key(signer) && buckets.len() >= self.capacity {
 			return Ok(false);
@@ -279,22 +281,25 @@ impl GossipAdmission for TokenBucketAdmission {
 
 		let bucket = buckets
 			.entry(signer.to_vec())
-			.or_insert(TokenBucket { tokens: self.burst, refilled_ms: now_ms });
+			.or_insert(TokenBucket { tokens: self.burst, refilled_at: now });
 
 		// Refill advances by whole intervals so the fractional remainder
 		// keeps accruing toward the next token instead of being dropped.
-		let elapsed_ms = now_ms.saturating_sub(bucket.refilled_ms);
-		let regained = elapsed_ms / self.refill_interval_ms;
+		let elapsed = now.saturating_since(bucket.refilled_at);
+		let interval_ms = self.refill_interval.as_millis().max(1);
+		let regained = u64::try_from(elapsed.as_millis() / interval_ms).unwrap_or(u64::MAX);
 		let tokens = u64::from(bucket.tokens).saturating_add(regained);
 
 		if tokens >= u64::from(self.burst) {
 			bucket.tokens = self.burst;
-			bucket.refilled_ms = now_ms;
+			bucket.refilled_at = now;
 		} else {
+			// Below the burst, the regained count fits the bucket's own width.
+			let regained_tokens = u32::try_from(regained).unwrap_or(u32::MAX);
+			let advanced = self.refill_interval.saturating_mul(regained_tokens);
+
 			bucket.tokens = tokens as u32;
-			bucket.refilled_ms = bucket
-				.refilled_ms
-				.saturating_add(regained.saturating_mul(self.refill_interval_ms));
+			bucket.refilled_at = bucket.refilled_at.saturating_add(advanced);
 		}
 
 		if bucket.tokens == 0 {
@@ -324,7 +329,7 @@ pub trait GossipJournal: Send + Sync {
 		signer: &[u8],
 		digest: GossipDigest,
 		rumor: &Frame,
-		now_ms: u64,
+		now: UnixMillis,
 	) -> Result<Admission, ClusterError>;
 
 	/// Deduplicate one ephemeral rumor digest without retaining the rumor.
@@ -343,7 +348,7 @@ pub trait GossipJournal: Send + Sync {
 	///
 	/// Returns [`Admission::New`] when unseen and now witnessed, or
 	/// [`Admission::Duplicate`] when already seen. Fails closed at capacity.
-	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError>;
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError>;
 
 	/// Whether a digest is already retained or witnessed, without recording it.
 	///
@@ -353,17 +358,17 @@ pub trait GossipJournal: Send + Sync {
 	/// Advisory only. [`GossipJournal::record`] and
 	/// [`GossipJournal::witness`] remain the atomic dedup steps for races
 	/// past the probe.
-	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError>;
+	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError>;
 
 	/// Digests still inside the retention window, for reconciliation summaries.
-	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError>;
+	fn held_digests(&self, now: UnixMillis) -> Result<Vec<GossipDigest>, ClusterError>;
 
 	/// Retained rumor frames for digests a peer reported missing.
-	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError>;
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError>;
 
 	/// Retained rumors awaiting local delivery, excluding those a task
 	/// already claimed through [`GossipJournal::claim_local`].
-	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError>;
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError>;
 
 	/// Take one rumor's local delivery, so no second task delivers it.
 	///
@@ -371,7 +376,7 @@ pub trait GossipJournal: Send + Sync {
 	/// [`GossipJournal::ack_local`] on success or
 	/// [`GossipJournal::release_local`] on failure, or the rumor stays
 	/// unretried until retention drops it.
-	fn claim_local(&self, digest: &GossipDigest, now_ms: u64) -> Result<LocalClaim, ClusterError>;
+	fn claim_local(&self, digest: &GossipDigest, now: UnixMillis) -> Result<LocalClaim, ClusterError>;
 
 	/// Return a claimed rumor to the retry set after a failed delivery.
 	fn release_local(&self, digest: &GossipDigest) -> Result<(), ClusterError>;
@@ -385,13 +390,13 @@ pub trait GossipJournal: Send + Sync {
 	/// at start, because a rumor older than retention has no digest left
 	/// to deduplicate against. A wider window would re-admit a replayed
 	/// rumor as new (CWE-294).
-	fn retention_ms(&self) -> u64;
+	fn retention(&self) -> Duration;
 }
 
 /// One deduplicated digest and the bookkeeping the journal tracks for it.
 struct JournalEntry {
 	signer: Vec<u8>,
-	recorded_ms: u64,
+	recorded_at: UnixMillis,
 	body: JournalBody,
 }
 
@@ -425,8 +430,11 @@ pub enum LocalClaim {
 /// nothing holding it, and no retry ever offers it again. Owning the
 /// claim removes that path, because dropping the future drops the guard.
 ///
-/// [`Self::ack`] retires the entry instead of releasing it, and is the
-/// only exit that stops the rumor being retried.
+/// # Exits
+///
+/// - Dropping the guard releases the claim, so the rumor returns to the retry set.
+/// - [`Self::ack`] retires the entry instead, and is the only exit that stops the rumor being
+///   retried.
 pub struct LocalClaimGuard<'a> {
 	journal: &'a dyn GossipJournal,
 	digest: &'a GossipDigest,
@@ -442,8 +450,8 @@ impl<'a> LocalClaimGuard<'a> {
 	///
 	/// A journal lock is poisoned only by a panic this crate forbids, so a
 	/// refused claim skips this round the way a held one does.
-	pub fn take(journal: &'a dyn GossipJournal, digest: &'a GossipDigest, now_ms: u64) -> Option<Self> {
-		match journal.claim_local(digest, now_ms) {
+	pub fn take(journal: &'a dyn GossipJournal, digest: &'a GossipDigest, now: UnixMillis) -> Option<Self> {
+		match journal.claim_local(digest, now) {
 			Ok(LocalClaim::Taken) => Some(Self { journal, digest, retries: true }),
 			Ok(LocalClaim::Untracked) => Some(Self { journal, digest, retries: false }),
 			Ok(LocalClaim::Held) | Err(_) => None,
@@ -503,22 +511,45 @@ enum LocalDelivery {
 /// an aged-out rumor is never returned.
 pub struct MemoryGossipJournal {
 	entries: Mutex<HashMap<GossipDigest, JournalEntry>>,
-	retention_ms: u64,
+	retention: Duration,
 	capacity: usize,
 	per_signer_capacity: usize,
+}
+
+/// The two capacity bounds a journal holds.
+///
+/// Both are counts of retained rumors, so a positional pair lets a caller
+/// exchange them and give every signer the whole log. The named fields are
+/// what the call site binds (CWE-770).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalLimits {
+	/// Rumors the journal retains across every signer.
+	pub total: usize,
+	/// Rumors the journal retains for any one signer.
+	pub per_signer: usize,
 }
 
 impl MemoryGossipJournal {
 	/// Retention window with default capacity caps.
 	#[must_use]
-	pub fn new(retention_ms: u64) -> Self {
-		Self::with_limits(retention_ms, MAX_GOSSIP_LOG, MAX_GOSSIP_LOG_PER_SIGNER)
+	pub fn new(retention: Duration) -> Self {
+		Self::with_limits(
+			retention,
+			JournalLimits { total: MAX_GOSSIP_LOG, per_signer: MAX_GOSSIP_LOG_PER_SIGNER },
+		)
 	}
 
 	/// Retention window and capacity bounds.
 	#[must_use]
-	pub fn with_limits(retention_ms: u64, capacity: usize, per_signer_capacity: usize) -> Self {
-		Self { entries: Mutex::new(HashMap::new()), retention_ms, capacity, per_signer_capacity }
+	pub fn with_limits(retention: Duration, limits: JournalLimits) -> Self {
+		let JournalLimits { total, per_signer } = limits;
+
+		Self {
+			entries: Mutex::new(HashMap::new()),
+			retention,
+			capacity: total,
+			per_signer_capacity: per_signer,
+		}
 	}
 
 	/// Retained rumors that have not reached local ingress, whether or not a
@@ -533,10 +564,10 @@ impl MemoryGossipJournal {
 	///
 	/// - [`ClusterError::LockPoisoned`] when the journal lock is poisoned.
 	#[cfg(any(test, feature = "testing"))]
-	pub fn undelivered_local(&self, now_ms: u64) -> Result<usize, ClusterError> {
+	pub fn undelivered_local(&self, now: UnixMillis) -> Result<usize, ClusterError> {
 		let mut entries = self.entries.lock()?;
 
-		Self::prune(&mut entries, self.retention_ms, now_ms);
+		Self::prune(&mut entries, self.retention, now);
 
 		let undelivered = entries
 			.values()
@@ -553,14 +584,14 @@ impl MemoryGossipJournal {
 
 	/// Drop entries whose age exceeds the retention window in either clock
 	/// direction. One pruning rule keeps reads and writes consistent.
-	fn prune(entries: &mut HashMap<GossipDigest, JournalEntry>, retention_ms: u64, now_ms: u64) {
-		entries.retain(|_, entry| now_ms.abs_diff(entry.recorded_ms) <= retention_ms);
+	fn prune(entries: &mut HashMap<GossipDigest, JournalEntry>, retention: Duration, now: UnixMillis) {
+		entries.retain(|_, entry| now.abs_diff(entry.recorded_at) <= retention);
 	}
 }
 
 impl Default for MemoryGossipJournal {
 	fn default() -> Self {
-		Self::new(DEFAULT_GOSSIP_RETENTION_MS)
+		Self::new(Duration::from_millis(DEFAULT_GOSSIP_RETENTION_MS))
 	}
 }
 
@@ -572,22 +603,24 @@ pub struct GossipConfig {
 	pub ttl: u8,
 	/// Route key admitted rumors are delivered to on this gateway.
 	///
-	/// The key is minted by [`ColonyNamespace::servlet_type_key`], so a
-	/// configured ingress always names a servlet type this colony can
-	/// route. Local delivery is receiving-gateway policy, never rumor
-	/// content. `None` journals and refloods only. The record is marked
-	/// delivered so it never enters the pending retry set.
+	/// - [`ColonyNamespace::servlet_type_key`] creates the key, so a configured ingress always
+	///   names a servlet type this colony can route.
+	/// - Local delivery is receiving-gateway policy, never rumor content.
+	/// - `None` journals and refloods only, and marks the record delivered so it never enters the
+	///   pending retry set.
 	///
-	/// [`ColonyNamespace::servlet_type_key`]: crate::colony::common::ColonyNamespace::servlet_type_key
+	/// [`ColonyNamespace::servlet_type_key`]:
+	/// crate::colony::common::ColonyNamespace::servlet_type_key
 	///
 	/// # Export boundary
 	///
-	/// The ingress sink sits outside the export boundary. Colony scope and
-	/// the origin signature already gate which peers may flood a rumor, and
-	/// the operator, not the peer, chooses the delivery type, so the export
-	/// allowlist does not apply here. An operator who restricts exports
-	/// should treat the ingress type as an intentional local delivery
-	/// channel for admitted colony gossip.
+	/// The ingress sink sits outside the export boundary. Colony scope and the
+	/// origin signature already gate which peers may flood a rumor, and the
+	/// operator chooses the delivery type, so the export allowlist does not
+	/// apply here.
+	///
+	/// An operator who restricts exports should treat the ingress type as an
+	/// intentional local delivery channel for admitted colony gossip.
 	pub ingress: Option<ServletTypeKey>,
 	/// Dedup and retention store. Owns its own retention window.
 	pub journal: Arc<dyn GossipJournal>,
@@ -633,11 +666,11 @@ impl MemoryGossipJournal {
 		signer: impl AsRef<[u8]>,
 		digest: GossipDigest,
 		body: JournalBody,
-		now_ms: u64,
+		now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
 		let signer = signer.as_ref();
 		let mut entries = self.entries.lock()?;
-		Self::prune(&mut entries, self.retention_ms, now_ms);
+		Self::prune(&mut entries, self.retention, now);
 
 		if entries.contains_key(&digest) {
 			return Ok(Admission::Duplicate);
@@ -653,7 +686,7 @@ impl MemoryGossipJournal {
 		let within_signer = signer_held < self.per_signer_capacity;
 
 		if within_global && within_signer {
-			let entry = JournalEntry { signer: signer.to_vec(), recorded_ms: now_ms, body };
+			let entry = JournalEntry { signer: signer.to_vec(), recorded_at: now, body };
 			entries.insert(digest, entry);
 
 			Ok(Admission::New)
@@ -669,32 +702,32 @@ impl GossipJournal for MemoryGossipJournal {
 		signer: &[u8],
 		digest: GossipDigest,
 		rumor: &Frame,
-		now_ms: u64,
+		now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
 		let body = JournalBody::Retained { rumor: Box::new(rumor.clone()), local: LocalDelivery::Pending };
-		self.admit(signer, digest, body, now_ms)
+		self.admit(signer, digest, body, now)
 	}
 
-	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError> {
-		self.admit(signer, digest, JournalBody::Witnessed, now_ms)
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError> {
+		self.admit(signer, digest, JournalBody::Witnessed, now)
 	}
 
-	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
+	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError> {
 		let mut entries = self.entries.lock()?;
 
-		Self::prune(&mut entries, self.retention_ms, now_ms);
+		Self::prune(&mut entries, self.retention, now);
 
 		Ok(entries.contains_key(digest))
 	}
 
-	fn retention_ms(&self) -> u64 {
-		self.retention_ms
+	fn retention(&self) -> Duration {
+		self.retention
 	}
 
-	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
+	fn held_digests(&self, now: UnixMillis) -> Result<Vec<GossipDigest>, ClusterError> {
 		let mut entries = self.entries.lock()?;
 
-		Self::prune(&mut entries, self.retention_ms, now_ms);
+		Self::prune(&mut entries, self.retention, now);
 
 		let digests = entries
 			.iter()
@@ -705,10 +738,10 @@ impl GossipJournal for MemoryGossipJournal {
 		Ok(digests)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
 		let mut entries = self.entries.lock()?;
 
-		Self::prune(&mut entries, self.retention_ms, now_ms);
+		Self::prune(&mut entries, self.retention, now);
 
 		let found = wanted
 			.iter()
@@ -722,10 +755,10 @@ impl GossipJournal for MemoryGossipJournal {
 		Ok(found)
 	}
 
-	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
 		let mut entries = self.entries.lock()?;
 
-		Self::prune(&mut entries, self.retention_ms, now_ms);
+		Self::prune(&mut entries, self.retention, now);
 
 		let pending = entries
 			.values()
@@ -738,7 +771,7 @@ impl GossipJournal for MemoryGossipJournal {
 		Ok(pending)
 	}
 
-	fn claim_local(&self, digest: &GossipDigest, _now_ms: u64) -> Result<LocalClaim, ClusterError> {
+	fn claim_local(&self, digest: &GossipDigest, _now: UnixMillis) -> Result<LocalClaim, ClusterError> {
 		let mut entries = self.entries.lock()?;
 		let Some(entry) = entries.get_mut(digest) else {
 			return Ok(LocalClaim::Untracked);
@@ -785,6 +818,12 @@ mod tests {
 	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::crypto::hash::Sha3_256;
 
+	/// The reference instant the fixture rumors are issued at.
+	const T0: UnixMillis = UnixMillis::new(1_000);
+
+	/// The freshness and retention window the fixtures run under.
+	const WINDOW: Duration = Duration::from_millis(30_000);
+
 	fn digest(rumor: &Frame) -> GossipDigest {
 		rumor.gossip_digest::<Sha3_256>().expect("test rumor frames encode")
 	}
@@ -826,7 +865,7 @@ mod tests {
 	#[test]
 	fn admit_accepts_valid_rumor() -> Result<(), TransitStatus> {
 		let frame = rumor(1_000, vec![1, 2, 3]);
-		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, 30_000, 1_000)?;
+		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0)?;
 		assert_eq!(admitted.digest(), digest(&frame));
 		assert_eq!(admitted.payload(), &[1, 2, 3]);
 		Ok(())
@@ -835,7 +874,7 @@ mod tests {
 	#[test]
 	fn into_payload_yields_the_admitted_body() -> Result<(), TransitStatus> {
 		let frame = rumor(1_000, vec![1, 2, 3]);
-		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, 30_000, 1_000)?;
+		let admitted = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0)?;
 		assert_eq!(admitted.into_payload(), vec![1, 2, 3]);
 		Ok(())
 	}
@@ -843,7 +882,7 @@ mod tests {
 	#[test]
 	fn admit_refuses_oversized_payload() {
 		let frame = rumor(1_000, vec![0u8; MAX_GOSSIP_PAYLOAD_BYTES + 1]);
-		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, 30_000, 1_000);
+		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
@@ -851,21 +890,21 @@ mod tests {
 	fn admit_refuses_excessive_ttl() {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let over = u64::from(MAX_GOSSIP_TTL) + 1;
-		let status = AdmittedGossip::admit::<Sha3_256>(&frame, over, 30_000, 1_000);
+		let status = AdmittedGossip::admit::<Sha3_256>(&frame, over, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
 	#[test]
 	fn admit_refuses_stale_rumor() {
 		let frame = rumor(1_000, vec![1, 2, 3]);
-		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, 30_000, 100_000);
+		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, UnixMillis::new(100_000));
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
 	#[test]
 	fn admit_refuses_undecodable_body() {
 		let frame = Frame::v0(b"rumor", vec![0xFF, 0x00, 0xFF]);
-		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, 30_000, 1_000);
+		let status = AdmittedGossip::admit::<Sha3_256>(&frame, 4, WINDOW, T0);
 		assert_eq!(status.err(), Some(TransitStatus::PermissionDenied));
 	}
 
@@ -875,8 +914,8 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		let first = journal.record(b"signer-a", digest, &frame, 1_000)?;
-		let second = journal.record(b"signer-a", digest, &frame, 1_000)?;
+		let first = journal.record(b"signer-a", digest, &frame, T0)?;
+		let second = journal.record(b"signer-a", digest, &frame, T0)?;
 		assert_eq!(first, Admission::New);
 		assert_eq!(second, Admission::Duplicate);
 		Ok(())
@@ -884,15 +923,15 @@ mod tests {
 
 	#[test]
 	fn seen_tracks_retention_window() -> Result<(), ClusterError> {
-		let journal = MemoryGossipJournal::new(30_000);
+		let journal = MemoryGossipJournal::new(WINDOW);
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
-		let before = journal.seen(&digest, 1_000)?;
+		let before = journal.seen(&digest, T0)?;
 
-		journal.record(b"signer-a", digest, &frame, 1_000)?;
+		journal.record(b"signer-a", digest, &frame, T0)?;
 
-		let after = journal.seen(&digest, 1_000)?;
-		let expired = journal.seen(&digest, 90_000)?;
+		let after = journal.seen(&digest, T0)?;
+		let expired = journal.seen(&digest, UnixMillis::new(90_000))?;
 		assert!(!before);
 		assert!(after);
 		assert!(!expired);
@@ -905,8 +944,8 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		let first = journal.witness(b"signer-a", digest, 1_000)?;
-		let second = journal.witness(b"signer-a", digest, 1_000)?;
+		let first = journal.witness(b"signer-a", digest, T0)?;
+		let second = journal.witness(b"signer-a", digest, T0)?;
 		assert_eq!(first, Admission::New);
 		assert_eq!(second, Admission::Duplicate);
 		Ok(())
@@ -918,12 +957,12 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		journal.witness(b"signer-a", digest, 1_000)?;
+		journal.witness(b"signer-a", digest, T0)?;
 
-		assert!(journal.seen(&digest, 1_000)?);
-		assert!(journal.held_digests(1_000)?.is_empty());
-		assert!(journal.fetch(&[digest], 1_000)?.is_empty());
-		assert!(journal.pending_local(1_000)?.is_empty());
+		assert!(journal.seen(&digest, T0)?);
+		assert!(journal.held_digests(T0)?.is_empty());
+		assert!(journal.fetch(&[digest], T0)?.is_empty());
+		assert!(journal.pending_local(T0)?.is_empty());
 		Ok(())
 	}
 
@@ -933,46 +972,46 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		journal.witness(b"signer-a", digest, 1_000)?;
+		journal.witness(b"signer-a", digest, T0)?;
 
-		let replay = journal.record(b"signer-a", digest, &frame, 1_000)?;
+		let replay = journal.record(b"signer-a", digest, &frame, T0)?;
 		assert_eq!(replay, Admission::Duplicate);
 		Ok(())
 	}
 
 	#[test]
 	fn witness_expires_with_retention() -> Result<(), ClusterError> {
-		let journal = MemoryGossipJournal::new(30_000);
+		let journal = MemoryGossipJournal::new(WINDOW);
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		journal.witness(b"signer-a", digest, 1_000)?;
-		assert!(journal.seen(&digest, 1_000)?);
-		assert!(!journal.seen(&digest, 90_000)?);
+		journal.witness(b"signer-a", digest, T0)?;
+		assert!(journal.seen(&digest, T0)?);
+		assert!(!journal.seen(&digest, UnixMillis::new(90_000))?);
 		Ok(())
 	}
 
 	#[test]
 	fn witness_fails_closed_at_signer_capacity() -> Result<(), ClusterError> {
-		let journal = MemoryGossipJournal::with_limits(30_000, 8, 1);
+		let journal = MemoryGossipJournal::with_limits(WINDOW, JournalLimits { total: 8, per_signer: 1 });
 		let first = rumor(1_000, vec![1]);
 		let second = rumor(1_000, vec![2]);
 
-		journal.witness(b"signer-a", digest(&first), 1_000)?;
+		journal.witness(b"signer-a", digest(&first), T0)?;
 
-		let overflow = journal.witness(b"signer-a", digest(&second), 1_000);
+		let overflow = journal.witness(b"signer-a", digest(&second), T0);
 		assert!(matches!(overflow, Err(ClusterError::GossipJournalAtCapacity)));
 		Ok(())
 	}
 
 	#[test]
 	fn witness_and_record_spend_separate_signer_budgets() -> Result<(), ClusterError> {
-		let journal = MemoryGossipJournal::with_limits(30_000, 8, 1);
+		let journal = MemoryGossipJournal::with_limits(WINDOW, JournalLimits { total: 8, per_signer: 1 });
 		let witnessed = rumor(1_000, vec![1]);
 		let retained = rumor(1_000, vec![2]);
 
-		let hint = journal.witness(b"signer-a", digest(&witnessed), 1_000)?;
-		let application = journal.record(b"signer-a", digest(&retained), &retained, 1_000)?;
+		let hint = journal.witness(b"signer-a", digest(&witnessed), T0)?;
+		let application = journal.record(b"signer-a", digest(&retained), &retained, T0)?;
 		assert_eq!(hint, Admission::New);
 		assert_eq!(application, Admission::New);
 		Ok(())
@@ -980,28 +1019,28 @@ mod tests {
 
 	#[test]
 	fn record_fails_closed_at_global_capacity() -> Result<(), ClusterError> {
-		let journal = MemoryGossipJournal::with_limits(30_000, 1, 8);
+		let journal = MemoryGossipJournal::with_limits(WINDOW, JournalLimits { total: 1, per_signer: 8 });
 		let first = rumor(1_000, vec![1]);
 		let second = rumor(1_000, vec![2]);
 
-		journal.record(b"signer-a", digest(&first), &first, 1_000)?;
+		journal.record(b"signer-a", digest(&first), &first, T0)?;
 
-		let overflow = journal.record(b"signer-a", digest(&second), &second, 1_000);
+		let overflow = journal.record(b"signer-a", digest(&second), &second, T0);
 		assert!(matches!(overflow, Err(ClusterError::GossipJournalAtCapacity)));
 		Ok(())
 	}
 
 	#[test]
 	fn record_fails_closed_at_per_signer_capacity() -> Result<(), ClusterError> {
-		let journal = MemoryGossipJournal::with_limits(30_000, 8, 1);
+		let journal = MemoryGossipJournal::with_limits(WINDOW, JournalLimits { total: 8, per_signer: 1 });
 		let first = rumor(1_000, vec![1]);
 		let second = rumor(1_000, vec![2]);
 		let other = rumor(1_000, vec![3]);
 
-		journal.record(b"signer-a", digest(&first), &first, 1_000)?;
+		journal.record(b"signer-a", digest(&first), &first, T0)?;
 
-		let over = journal.record(b"signer-a", digest(&second), &second, 1_000);
-		let other_signer = journal.record(b"signer-b", digest(&other), &other, 1_000)?;
+		let over = journal.record(b"signer-a", digest(&second), &second, T0);
+		let other_signer = journal.record(b"signer-b", digest(&other), &other, T0)?;
 		assert!(matches!(over, Err(ClusterError::GossipJournalAtCapacity)));
 		assert_eq!(other_signer, Admission::New);
 		Ok(())
@@ -1013,11 +1052,11 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		journal.record(b"signer-a", digest, &frame, 1_000)?;
-		let before = journal.pending_local(1_000)?;
+		journal.record(b"signer-a", digest, &frame, T0)?;
+		let before = journal.pending_local(T0)?;
 		journal.ack_local(&digest)?;
 
-		let after = journal.pending_local(1_000)?;
+		let after = journal.pending_local(T0)?;
 		assert_eq!(before.len(), 1);
 		assert_eq!(after.len(), 0);
 		Ok(())
@@ -1031,18 +1070,18 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		journal.record(b"signer-a", digest, &frame, 1_000)?;
+		journal.record(b"signer-a", digest, &frame, T0)?;
 
-		assert_eq!(journal.claim_local(&digest, 1_000)?, LocalClaim::Taken);
-		assert!(journal.pending_local(1_000)?.is_empty());
-		assert_eq!(journal.claim_local(&digest, 1_000)?, LocalClaim::Held);
+		assert_eq!(journal.claim_local(&digest, T0)?, LocalClaim::Taken);
+		assert!(journal.pending_local(T0)?.is_empty());
+		assert_eq!(journal.claim_local(&digest, T0)?, LocalClaim::Held);
 		Ok(())
 	}
 
 	/// Claim `digest` for one delivery, which an unclaimed rumor always
 	/// admits.
 	fn claim<'a>(journal: &'a MemoryGossipJournal, digest: &'a GossipDigest) -> LocalClaimGuard<'a> {
-		LocalClaimGuard::take(journal, digest, 1_000).expect("an unclaimed rumor is claimable")
+		LocalClaimGuard::take(journal, digest, T0).expect("an unclaimed rumor is claimable")
 	}
 
 	// A delivery task that never finishes, because it was cancelled or its
@@ -1053,14 +1092,14 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		journal.record(b"signer-a", digest, &frame, 1_000)?;
+		journal.record(b"signer-a", digest, &frame, T0)?;
 
 		{
 			let _claim = claim(&journal, &digest);
-			assert!(journal.pending_local(1_000)?.is_empty());
+			assert!(journal.pending_local(T0)?.is_empty());
 		}
 
-		assert_eq!(journal.pending_local(1_000)?.len(), 1);
+		assert_eq!(journal.pending_local(T0)?.len(), 1);
 		Ok(())
 	}
 
@@ -1071,12 +1110,12 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		journal.record(b"signer-a", digest, &frame, 1_000)?;
+		journal.record(b"signer-a", digest, &frame, T0)?;
 
 		claim(&journal, &digest).ack();
 
-		assert!(journal.pending_local(1_000)?.is_empty());
-		assert_eq!(journal.undelivered_local(1_000)?, 0);
+		assert!(journal.pending_local(T0)?.is_empty());
+		assert_eq!(journal.undelivered_local(T0)?, 0);
 		Ok(())
 	}
 
@@ -1087,11 +1126,11 @@ mod tests {
 		let frame = rumor(1_000, vec![1, 2, 3]);
 		let digest = digest(&frame);
 
-		journal.record(b"signer-a", digest, &frame, 1_000)?;
-		assert_eq!(journal.claim_local(&digest, 1_000)?, LocalClaim::Taken);
+		journal.record(b"signer-a", digest, &frame, T0)?;
+		assert_eq!(journal.claim_local(&digest, T0)?, LocalClaim::Taken);
 		journal.release_local(&digest)?;
 
-		assert_eq!(journal.pending_local(1_000)?.len(), 1);
+		assert_eq!(journal.pending_local(T0)?.len(), 1);
 		Ok(())
 	}
 
@@ -1102,10 +1141,10 @@ mod tests {
 		let second = rumor(1_000, vec![2]);
 		let first_digest = digest(&first);
 
-		journal.record(b"signer-a", first_digest, &first, 1_000)?;
-		journal.record(b"signer-a", digest(&second), &second, 1_000)?;
+		journal.record(b"signer-a", first_digest, &first, T0)?;
+		journal.record(b"signer-a", digest(&second), &second, T0)?;
 
-		let fetched = journal.fetch(&[first_digest], 1_000)?;
+		let fetched = journal.fetch(&[first_digest], T0)?;
 		assert_eq!(fetched, vec![first]);
 		Ok(())
 	}
@@ -1161,84 +1200,88 @@ mod tests {
 	#[test]
 	fn admission_spends_burst_then_refuses() -> Result<(), ClusterError> {
 		let admission = TokenBucketAdmission::new(2, Duration::from_millis(1_000));
-		assert!(admission.allow(b"signer", 1_000)?);
-		assert!(admission.allow(b"signer", 1_000)?);
-		assert!(!admission.allow(b"signer", 1_000)?);
+		assert!(admission.allow(b"signer", T0)?);
+		assert!(admission.allow(b"signer", T0)?);
+		assert!(!admission.allow(b"signer", T0)?);
 		Ok(())
 	}
 
 	#[test]
 	fn admission_refills_one_token_per_interval() -> Result<(), ClusterError> {
 		let admission = TokenBucketAdmission::new(1, Duration::from_millis(1_000));
-		assert!(admission.allow(b"signer", 1_000)?);
-		assert!(!admission.allow(b"signer", 1_500)?);
-		assert!(admission.allow(b"signer", 2_000)?);
+		assert!(admission.allow(b"signer", T0)?);
+		assert!(!admission.allow(b"signer", UnixMillis::new(1_500))?);
+		assert!(admission.allow(b"signer", UnixMillis::new(2_000))?);
 		Ok(())
 	}
 
 	#[test]
 	fn admission_isolates_signers() -> Result<(), ClusterError> {
 		let admission = TokenBucketAdmission::new(1, Duration::from_millis(1_000));
-		assert!(admission.allow(b"first", 1_000)?);
-		assert!(!admission.allow(b"first", 1_000)?);
-		assert!(admission.allow(b"second", 1_000)?);
+		assert!(admission.allow(b"first", T0)?);
+		assert!(!admission.allow(b"first", T0)?);
+		assert!(admission.allow(b"second", T0)?);
 		Ok(())
 	}
 
 	#[test]
 	fn admission_refuses_unseen_signer_at_capacity() -> Result<(), ClusterError> {
 		let admission = TokenBucketAdmission::with_limits(2, Duration::from_millis(1_000), 1);
-		assert!(admission.allow(b"first", 1_000)?);
-		assert!(!admission.allow(b"second", 1_000)?);
+		assert!(admission.allow(b"first", T0)?);
+		assert!(!admission.allow(b"second", T0)?);
 		Ok(())
 	}
 
 	#[test]
 	fn admission_prunes_refilled_buckets() -> Result<(), ClusterError> {
 		let admission = TokenBucketAdmission::with_limits(1, Duration::from_millis(1_000), 1);
-		assert!(admission.allow(b"first", 1_000)?);
-		assert!(admission.allow(b"second", 3_000)?);
+		assert!(admission.allow(b"first", T0)?);
+		assert!(admission.allow(b"second", UnixMillis::new(3_000))?);
 		Ok(())
 	}
 
 	#[test]
 	fn fresh_accepts_issue_time_inside_window() {
-		assert!(gossip_fresh(1_000, 30_000, 1_000));
-		assert!(gossip_fresh(1_000, 30_000, 31_000));
-		assert!(gossip_fresh(31_000, 30_000, 1_000));
+		assert!(gossip_fresh(T0, WINDOW, T0));
+		assert!(gossip_fresh(T0, WINDOW, UnixMillis::new(31_000)));
+		assert!(gossip_fresh(UnixMillis::new(31_000), WINDOW, T0));
 	}
 
 	#[test]
 	fn fresh_rejects_issue_time_outside_window() {
-		assert!(!gossip_fresh(1_000, 30_000, 31_001));
-		assert!(!gossip_fresh(31_001, 30_000, 1_000));
+		assert!(!gossip_fresh(T0, WINDOW, UnixMillis::new(31_001)));
+		assert!(!gossip_fresh(UnixMillis::new(31_001), WINDOW, T0));
 	}
 
 	#[test]
 	fn record_prunes_expired_entries() -> Result<(), ClusterError> {
-		let journal = MemoryGossipJournal::with_limits(100, 8, 8);
+		let short_retention = Duration::from_millis(100);
+		let roomy = JournalLimits { total: 8, per_signer: 8 };
+		let journal = MemoryGossipJournal::with_limits(short_retention, roomy);
 		let early = rumor(1_000, vec![1]);
 		let late = rumor(1_000, vec![2]);
 
-		journal.record(b"signer-a", digest(&early), &early, 0)?;
-		journal.record(b"signer-a", digest(&late), &late, 200)?;
+		journal.record(b"signer-a", digest(&early), &early, UnixMillis::new(0))?;
+		journal.record(b"signer-a", digest(&late), &late, UnixMillis::new(200))?;
 
-		let held = journal.held_digests(200)?;
+		let held = journal.held_digests(UnixMillis::new(200))?;
 		assert_eq!(held, vec![digest(&late)]);
 		Ok(())
 	}
 
 	#[test]
 	fn reads_prune_expired_entries_without_a_write() -> Result<(), ClusterError> {
-		let journal = MemoryGossipJournal::with_limits(100, 8, 8);
+		let short_retention = Duration::from_millis(100);
+		let roomy = JournalLimits { total: 8, per_signer: 8 };
+		let journal = MemoryGossipJournal::with_limits(short_retention, roomy);
 		let frame = rumor(1_000, vec![1]);
 		let rumor_digest = digest(&frame);
 
-		journal.record(b"signer-a", rumor_digest, &frame, 0)?;
+		journal.record(b"signer-a", rumor_digest, &frame, UnixMillis::new(0))?;
 
-		let held = journal.held_digests(1_000)?;
-		let fetched = journal.fetch(&[rumor_digest], 1_000)?;
-		let pending = journal.pending_local(1_000)?;
+		let held = journal.held_digests(T0)?;
+		let fetched = journal.fetch(&[rumor_digest], T0)?;
+		let pending = journal.pending_local(T0)?;
 		assert_eq!(held.len(), 0);
 		assert_eq!(fetched.len(), 0);
 		assert_eq!(pending.len(), 0);

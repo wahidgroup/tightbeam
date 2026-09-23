@@ -35,11 +35,11 @@ use tightbeam::{Frame, TightBeamError};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{
-	await_ok, bind_encrypted_listener, connect_pinned_client, join_task, mux_frame, mux_offer,
+	await_ok, await_transport, bind_encrypted_listener, connect_pinned_client, join_task, mux_frame, mux_offer,
 	serve_one_handshake_message,
 };
 
@@ -556,7 +556,7 @@ pub fn order_forcing_echo(held_frame: Frame, gate: Arc<Notify>) -> impl Fn(Arc<F
 	}
 }
 
-/// Cancel-abort fixture; drop witness records handler abort.
+/// Cancel-abort fixture. Its drop witness records the handler abort.
 pub struct AbortContext {
 	pub materials: ServerMaterials,
 	pub started: Notify,
@@ -790,14 +790,7 @@ pub async fn read_until_goaway(reader: &mut SplitReader, reason: GoAwayReason) -
 
 /// Poll `goaway_reason()` until `reason` or timeout.
 pub async fn await_goaway_reason(handle: &MuxHandle, reason: GoAwayReason) -> bool {
-	let observed = timeout(Duration::from_secs(2), async {
-		while handle.goaway_reason() != Some(reason) {
-			sleep(Duration::from_millis(5)).await;
-		}
-	})
-	.await;
-
-	observed.is_ok()
+	await_transport(|| handle.goaway_reason() == Some(reason)).await
 }
 
 /// Receiver policy that never raises a stream's limit, pinning the
@@ -903,7 +896,8 @@ impl RekeyCase {
 	}
 }
 
-/// Budget + 1 Rapid Reset pairs -> GoAway(EnhanceYourCalm) + PolicyRejection.
+/// One Rapid Reset pair past the budget draws GoAway(EnhanceYourCalm) and a
+/// PolicyRejection.
 ///
 /// Verifies the wire answer (reason and abuse watermark) inline and returns
 /// whether the responder surfaced a policy rejection.

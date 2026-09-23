@@ -12,14 +12,12 @@ use tightbeam::colony::cluster::{PeerRoute, ServletEntry, DEFAULT_ABANDONMENT_LI
 /// Dial address nothing listens on: a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
 
-/// Three distinct colony-member identities (see [`member_identity`]
-/// for why [`cluster_certs`] cannot serve here: relay trails refuse
-/// self-relay).
+/// Three distinct colony-member identities. [`cluster_certs`] cannot serve
+/// here, because relay trails refuse self-relay (see [`member_identity`]).
 ///
-/// The combined store on `.trust` serves the hive and dial planes.
-/// Each gateway's peer store excludes its own identity: peer membership
-/// wins on the hive plane, so a member's hive registrations must not
-/// verify on its own peer store.
+/// - The combined store on `.trust` serves the hive and dial planes.
+/// - Each gateway's peer store excludes its own identity. Peer membership wins on the hive plane,
+///   so a member's hive registrations must not verify on its own peer store.
 struct FederationCtx {
 	a: Arc<ClusterTestCerts>,
 	b: Arc<ClusterTestCerts>,
@@ -121,14 +119,16 @@ async fn start_beacon_hive(
 	Ok(hive)
 }
 
-/// Flood one origin-signed advertisement rumor for `gateway_addr` to
-/// `cluster`, exactly as a peer gateway would. The rumor frame carries
-/// the origin's signature inside a `Gossip` relay envelope with
-/// `hop_ttl` reflood hops, so the same-origin bind holds at every hop.
-/// `PublishGossip` cannot serve here: the publish plane re-creates the
-/// rumor under the receiving gateway's own key. Each call creates a
-/// fresh rumor, so every call floods anew (ads dedup on digest and are
-/// never repaired). Returns the admission status the gateway replied.
+/// Flood one origin-signed advertisement rumor for `gateway_addr` to `cluster`,
+/// exactly as a peer gateway would, and answer the admission status the gateway
+/// replied.
+///
+/// - The rumor frame carries the origin's signature inside a `Gossip` relay envelope with `hop_ttl`
+///   reflood hops, so the same-origin bind holds at every hop.
+/// - `PublishGossip` cannot serve here, because the publish plane re-creates the rumor under the
+///   receiving gateway's own key.
+/// - Each call creates a fresh rumor, so every call floods anew. Ads dedup on digest and are never
+///   repaired.
 pub async fn flood_ad_rumor(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
@@ -149,7 +149,7 @@ pub async fn flood_ad_rumor(
 	let mut rumor = Version::V2
 		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_message(GossipRumor::peer_advertisement(encode(&inner)?))
 		.build()?;
 	rumor.sign_with_provider::<Sha3_256, _>(&provider).await?;
@@ -157,7 +157,7 @@ pub async fn flood_ad_rumor(
 	let mut frame = Version::V2
 		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_lifetime(hop_ttl)
 		.with_message(ClusterRequest::Gossip(Box::new(rumor)))
 		.build()?;
@@ -179,8 +179,8 @@ pub fn type_route_count(cluster: &ClusterGateway, type_name: impl AsRef<str>) ->
 		.count()
 }
 
-/// Poll until `cluster` holds `want` routes for `type_name` or
-/// attempts exhaust. Branching lives here, not in scenarios.
+/// Poll until `cluster` holds `want` routes for `type_name` or attempts
+/// exhaust, and answer the count it holds.
 pub async fn wait_for_type_routes(
 	cluster: &ClusterGateway,
 	type_name: impl AsRef<str>,
@@ -189,14 +189,7 @@ pub async fn wait_for_type_routes(
 	interval: Duration,
 ) -> usize {
 	let type_name = type_name.as_ref();
-	for _ in 0..attempts {
-		let held = type_route_count(cluster, type_name);
-		if held >= want {
-			return held;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
+	poll_until(attempts, interval, || type_route_count(cluster, type_name) >= want).await;
 
 	type_route_count(cluster, type_name)
 }
@@ -563,7 +556,7 @@ tb_scenario! {
 			let config = PoolConfig {
 				idle_timeout: None,
 				max_connections: 1,
-				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
+				mux_offer: Some(Arc::new(TransportOffer::mux(8))), ..PoolConfig::default()
 			};
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()

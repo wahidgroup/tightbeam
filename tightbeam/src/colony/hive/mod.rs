@@ -55,8 +55,8 @@ pub type SpawnerFn = Arc<
 
 /// Trait for type-erased servlet storage in hives.
 ///
-/// This enables hives to store servlets of different types in a single collection.
-/// Servlets implement this trait to be registerable with a hive.
+/// This enables hives to store servlets of different types in a single
+/// collection. Servlets implement this trait to be registerable with a hive.
 pub trait ServletBox: Send + Sync {
 	/// Shared bound-address bytes (encoded once at servlet start).
 	fn addr_bytes(&self) -> Arc<[u8]>;
@@ -286,19 +286,10 @@ pub trait Hive: Sized + Send + Sync {
 
 	/// Register an already-started servlet with the hive.
 	///
-	/// The spawner function enables auto-scaling: when the hive needs to spawn
-	/// additional instances, it calls the spawner with a trace collector.
-	///
-	/// # Arguments
-	/// * `servlet_type` - Type URN for this servlet, used for intra-hive
-	///   and cluster routing. Create it with [`ColonyNamespace::servlet`].
-	/// * `servlet` - An already-started servlet instance
-	/// * `spawner` - Function to spawn additional instances of this servlet type
-	///
-	/// # Type Parameters
-	/// * `S` - The servlet type (must implement `ServletBox`)
-	/// * `F` - The spawner function type
-	/// * `Fut` - The future returned by the spawner
+	/// `servlet_type` routes the servlet inside the hive and across the
+	/// cluster. Create it with [`ColonyNamespace::servlet`]. The spawner
+	/// enables auto-scaling: when the hive needs more instances of this type,
+	/// it calls the spawner with a trace collector.
 	fn register<S, F, Fut>(&mut self, servlet_type: Urn<'static>, servlet: S, spawner: F) -> Result<(), TightBeamError>
 	where
 		S: ServletBox + 'static,
@@ -307,23 +298,21 @@ pub trait Hive: Sized + Send + Sync {
 
 	/// Establish the hive.
 	///
-	/// Sets up intra-hive routing (HiveContext), starts the control server
-	/// for cluster commands, and begins the auto-scaling task.
-	/// All servlets should be registered before calling this.
-	///
-	/// # Arguments
-	/// * `trace` - Trace collector for hive-level events
+	/// Sets up intra-hive routing (HiveContext), starts the control server for
+	/// cluster commands, and begins the auto-scaling task. `trace` records
+	/// hive-level events. Register every servlet before calling this.
 	fn establish(&mut self, trace: Arc<TraceCollector>) -> impl Future<Output = Result<(), TightBeamError>> + Send;
 
 	/// Shared intra-hive communication context.
 	///
-	/// Created at `new` and populated with servlet addresses at
-	/// `establish`. The same `Arc` is live-updated as servlets scale.
-	/// Hand it to
-	/// [`ServletConfigBuilder::with_hive_context`](crate::colony::servlet::ServletConfigBuilder::with_hive_context)
-	/// so servlet handlers can reach siblings, or use it directly for
-	/// [`HiveContext::call`], [`HiveContext::open_stream`], and
-	/// [`HiveContext::open_duplex`].
+	/// Created at `new` and populated with servlet addresses at `establish`.
+	/// The same `Arc` is live-updated as servlets scale.
+	///
+	/// - Hand it to
+	///   [`ServletConfigBuilder::with_hive_context`](crate::colony::servlet::ServletConfigBuilder::with_hive_context)
+	///   so servlet handlers can reach siblings.
+	/// - Or use it directly for [`HiveContext::call`], [`HiveContext::open_stream`], and
+	///   [`HiveContext::open_duplex`].
 	fn context(&self) -> Arc<dyn HiveContext>;
 
 	/// The address a cluster dials this hive on.
@@ -348,17 +337,14 @@ pub trait Hive: Sized + Send + Sync {
 	/// Wait for the hive to complete (joins control server handle).
 	fn join(self) -> impl Future<Output = Result<(), TightBeamError>> + Send;
 
-	/// Register this hive with a cluster.
+	/// Register this hive with the cluster controller at `cluster_addr`.
 	///
-	/// Sends `RegisterHiveRequest` with all servlet addresses to the cluster.
-	/// The cluster will then route work to the servlets and send management
-	/// commands (heartbeat, spawn, stop) to this hive's control server.
+	/// Sends `RegisterHiveRequest` with all servlet addresses. The cluster then
+	/// routes work to the servlets and sends management commands (heartbeat,
+	/// spawn, stop) to this hive's control server.
 	///
-	/// Must be called after [`Hive::establish`]. A provisional address from
+	/// Call this after [`Hive::establish`], because a provisional address from
 	/// [`Hive::new`] is not a live control socket.
-	///
-	/// # Arguments
-	/// * `cluster_addr` - The address of the cluster controller
 	fn register_with_cluster(
 		&self,
 		cluster_addr: &<Self::Protocol as Protocol>::Address,
@@ -453,16 +439,19 @@ pub type DuplexOpenFuture<'a> =
 
 /// Context for intra-hive servlet communication.
 ///
-/// This trait enables servlets within the same hive to call each other
-/// without going through the cluster. This is useful for patterns like
-/// a KeyManager servlet that provides encryption/decryption services
-/// to other servlets in the hive.
+/// Servlets in one hive call each other through this without going through the
+/// cluster, for patterns such as a KeyManager servlet that serves encryption
+/// and decryption to its siblings.
 ///
-/// Every verb is envelope-preserving. The caller's complete [`Frame`]
-/// travels to the sibling unmodified, and the sibling's complete reply
-/// frame travels back unmodified. Callers compose their own envelope
-/// with [`compose!`](crate::compose), sign it when the sibling is
-/// signature-gated, and verify or decode the reply themselves.
+/// # Envelopes
+///
+/// Every verb is envelope-preserving: the caller's complete [`Frame`] travels
+/// to the sibling unmodified, and the sibling's complete reply frame travels
+/// back unmodified.
+///
+/// Callers compose their own envelope with [`compose!`](crate::compose), sign
+/// it when the sibling is signature-gated, and verify or decode the reply
+/// themselves.
 ///
 /// # Example
 ///
@@ -523,16 +512,14 @@ pub trait HiveContext: Send + Sync {
 	/// Call a sibling servlet with a complete, caller-built [`Frame`]
 	/// and get the servlet's complete reply frame.
 	///
-	/// The frame emits as-is, so a `nonrepudiation` signature the caller
-	/// applied stays verifiable at the servlet. The reply is the
-	/// servlet's complete envelope. Callers verify it with
-	/// [`Frame::verify`] before trusting the message body. A servlet
-	/// answering with no frame is `MissingResponse`.
+	/// `servlet_type` is the target's type URN, such as
+	/// `urn:tightbeam::servlet:keymanager`.
 	///
-	/// # Arguments
-	/// * `servlet_type` - Type URN of the target servlet (e.g.,
-	///   `urn:tightbeam::servlet:keymanager`)
-	/// * `frame` - The complete command frame to deliver unmodified
+	/// - The frame emits as-is, so a `nonrepudiation` signature the caller applied stays verifiable
+	///   at the servlet.
+	/// - The reply is the servlet's complete envelope. Verify it with [`Frame::verify`] before
+	///   trusting the message body.
+	/// - A servlet answering with no frame is `MissingResponse`.
 	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a>;
 
 	/// Open a request stream to a sibling servlet. Push chunks through the
@@ -594,22 +581,24 @@ impl Default for HiveScalingConfig {
 pub struct HiveControlConfig {
 	/// Utilization threshold that trips manage-path backpressure.
 	pub backpressure_threshold: BasisPoints,
-	/// Maximum wait for graceful drain before force-stopping remaining servlets.
+	/// Maximum wait for graceful drain before force-stopping remaining
+	/// servlets.
 	pub drain_timeout: Duration,
 	/// Anti-entropy interval for re-announcing the servlet slate to gateways.
 	///
 	/// Every interval the hive re-announces its full servlet slate, freshly
-	/// signed, to every gateway it has registered with. `None` disables the beat.
+	/// signed, to every gateway it has registered with. `None` disables the
+	/// beat.
 	pub reregister_interval: Option<Duration>,
 	/// Consecutive auth failures that open the cluster circuit breaker.
 	pub circuit_breaker_threshold: u8,
-	/// Milliseconds the circuit breaker stays open before a half-open probe.
-	pub circuit_breaker_cooldown_ms: u64,
-	/// Freshness window for signed cluster commands in milliseconds.
+	/// Time the circuit breaker stays open before a half-open probe.
+	pub circuit_breaker_cooldown: Duration,
+	/// Freshness window for signed cluster commands.
 	///
 	/// Commands whose `Frame.metadata.order` is outside this window, or whose
 	/// signature was already seen inside it, are rejected. See [`ReplayGuard`].
-	pub command_freshness_window_ms: u64,
+	pub command_freshness_window: Duration,
 	/// Retry policy used when fanning out scaling updates to gateways.
 	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
 }
@@ -621,8 +610,8 @@ impl core::fmt::Debug for HiveControlConfig {
 			.field("drain_timeout", &self.drain_timeout)
 			.field("reregister_interval", &self.reregister_interval)
 			.field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
-			.field("circuit_breaker_cooldown_ms", &self.circuit_breaker_cooldown_ms);
-		d.field("command_freshness_window_ms", &self.command_freshness_window_ms);
+			.field("circuit_breaker_cooldown", &self.circuit_breaker_cooldown);
+		d.field("command_freshness_window", &self.command_freshness_window);
 		d.field("notify_retry", &"<RetryPolicy>");
 		d.finish()
 	}
@@ -635,8 +624,8 @@ impl Default for HiveControlConfig {
 			drain_timeout: Duration::from_secs(30),
 			reregister_interval: Some(Duration::from_secs(5)),
 			circuit_breaker_threshold: 3,
-			circuit_breaker_cooldown_ms: 30_000,
-			command_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
+			circuit_breaker_cooldown: Duration::from_secs(30),
+			command_freshness_window: Duration::from_millis(crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS),
 			notify_retry: Arc::new(crate::transport::policy::RestartExponentialBackoff {
 				max_attempts: 3,
 				scale_factor: 500,
@@ -653,8 +642,8 @@ impl Default for HiveControlConfig {
 /// See [`ClusterConfig`](crate::colony::cluster::ClusterConfig).
 #[derive(Clone)]
 pub struct HiveConfig {
-	/// Naming scope resource URNs are validated against.
-	/// Registrations with a foreign authority or realm fail at [`Hive::register`].
+	/// Naming scope resource URNs are validated against. Registrations with a
+	/// foreign authority or realm fail at [`Hive::register`].
 	pub namespace: ColonyNamespace,
 	/// Auto-scale evaluation and per-type overrides.
 	pub scaling: HiveScalingConfig,
@@ -705,7 +694,11 @@ impl Default for HiveConfig {
 			namespace: ColonyNamespace::default(),
 			scaling: HiveScalingConfig::default(),
 			control: HiveControlConfig::default(),
-			pool: PoolConfig { max_connections: 8, idle_timeout: Some(Duration::from_secs(30)), mux_offer: None },
+			pool: PoolConfig {
+				max_connections: 8,
+				idle_timeout: Some(Duration::from_secs(30)),
+				..PoolConfig::default()
+			},
 			trust_store: None,
 			hive_tls: None,
 		}

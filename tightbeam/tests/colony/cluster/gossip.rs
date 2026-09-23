@@ -14,10 +14,6 @@ use tightbeam::testing::TestFrame;
 use tightbeam::transport::handshake::HandshakeKeyManager;
 use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 
-// ============================================================================
-// Gossip Flood (rumor plane)
-// ============================================================================
-
 /// Peering conf that refloods to `peers`.
 /// Returns the journal handle so scenarios can poll flood convergence
 /// through the public journal trait.
@@ -76,7 +72,7 @@ async fn mint_origin_rumor(
 	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_message(body)
 		.build()?;
 
@@ -96,7 +92,7 @@ async fn signed_relay_gossip(
 	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_lifetime(hop_ttl)
 		.with_message(ClusterRequest::Gossip(Box::new(rumor)))
 		.build()?;
@@ -166,7 +162,7 @@ async fn signed_reconcile_gossip(
 	let mut signed = Version::V2
 		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_message(ClusterRequest::ReconcileGossip(GossipReconciliation { held }))
 		.build()?;
 
@@ -195,7 +191,7 @@ async fn send_reconcile_frame_as(
 /// Every journal holds exactly `held` rumors and none awaits local delivery.
 fn gossip_converged(journals: impl AsRef<[Arc<MemoryGossipJournal>]>, held: usize) -> bool {
 	let journals = journals.as_ref();
-	let now = current_timestamp_ms();
+	let now = UnixMillis::now();
 	journals.iter().all(|journal| {
 		let held_now = journal.held_digests(now).is_ok_and(|digests| digests.len() == held);
 		// Delivery in flight still counts as undelivered, so convergence
@@ -209,8 +205,6 @@ fn gossip_converged(journals: impl AsRef<[Arc<MemoryGossipJournal>]>, held: usiz
 ///
 /// Refloods run detached from the publish reply.
 /// Convergence is therefore only observable by polling.
-///
-/// - Branching lives here, not in scenarios.
 async fn wait_for_gossip_converged(
 	journals: impl AsRef<[Arc<MemoryGossipJournal>]>,
 	held: usize,
@@ -218,15 +212,7 @@ async fn wait_for_gossip_converged(
 	interval: Duration,
 ) -> bool {
 	let journals = journals.as_ref();
-	for _ in 0..attempts {
-		if gossip_converged(journals, held) {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	gossip_converged(journals, held)
+	poll_until(attempts, interval, || gossip_converged(journals, held)).await
 }
 
 /// Poll until the journal holds exactly `count` rumors awaiting local delivery.
@@ -234,27 +220,18 @@ async fn wait_for_gossip_converged(
 /// Attempts exhaust if the count never matches.
 ///
 /// - A rumor accepted before the ingress servlet registers stays pending for beat retry.
-/// - Branching lives here, not in scenarios.
 async fn wait_for_pending_local(
 	journal: &Arc<MemoryGossipJournal>,
 	count: usize,
 	attempts: u32,
 	interval: Duration,
 ) -> bool {
-	for _ in 0..attempts {
-		let pending = journal
-			.pending_local(current_timestamp_ms())
-			.is_ok_and(|rumors| rumors.len() == count);
-		if pending {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	journal
-		.pending_local(current_timestamp_ms())
-		.is_ok_and(|rumors| rumors.len() == count)
+	let pending = || {
+		journal
+			.pending_local(UnixMillis::now())
+			.is_ok_and(|rumors| rumors.len() == count)
+	};
+	poll_until(attempts, interval, pending).await
 }
 
 tb_assert_spec! {
@@ -303,9 +280,9 @@ tb_scenario! {
 			hive_b.register_with_cluster(gateway_b.addr()).await?;
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
-			// One signed publish frame is resent byte-identical.
-			// The origin gateway re-mints the same rumor (same id, order, body).
-			// The journal absorbs the second as a Duplicate.
+			// One signed publish frame is resent byte-identical. The origin
+			// gateway re-mints the same rumor (same id, order, body). The
+			// journal absorbs the second as a Duplicate.
 			let frame = hive_publish_gossip(
 				b"flood-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
@@ -346,9 +323,8 @@ tb_assert_spec! {
 	}
 }
 
-// Partial topology A -> B -> C.
-//
-// A is not peered to C. The rumor therefore reaches C only through B's reflood.
+// Partial topology: A peers to B and B peers to C, but A is not peered to C.
+// The rumor therefore reaches C only through the reflood at B.
 //
 // - The publish starts at ttl 2 and arrives at C with ttl 0.
 // - The hop budget is exactly consumed.
@@ -415,8 +391,8 @@ tb_assert_spec! {
 
 // Hive-trust-only propagation.
 //
-// A configures a peer but no peer_trust, so it builds no peer pool.
-// The reflood falls back to the hive pool (same preference as the advertise beat).
+// A configures a peer but no peer_trust, so it builds no peer pool. The reflood
+// falls back to the hive pool (same preference as the advertise beat).
 //
 // - The rumor still reaches B.
 // - B verifies A's relay on its own peer plane.
@@ -609,9 +585,11 @@ tb_scenario! {
 			.await?;
 			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
 
-			// A rumor past the gossip bound exceeds what one single-flight envelope carries.
+			// A rumor past the gossip bound exceeds what one single-flight
+			// envelope carries.
 			//
-			// - It crosses a pooled mux link (the same chunked path reflood uses) to reach admission.
+			// - It crosses a pooled mux link (the same chunked path reflood uses) to reach
+			//   admission.
 			// - The payload bound then refuses it on the correct plane.
 			let pool_config = PoolConfig {
 				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
@@ -781,34 +759,34 @@ impl GossipJournal for CountingJournal {
 		signer: &[u8],
 		digest: GossipDigest,
 		rumor: &Frame,
-		now_ms: u64,
+		now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
 		self.records.fetch_add(1, Ordering::SeqCst);
-		self.inner.record(signer, digest, rumor, now_ms)
+		self.inner.record(signer, digest, rumor, now)
 	}
 
-	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError> {
-		self.inner.witness(signer, digest, now_ms)
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, now)
 	}
 
-	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
-		self.inner.seen(digest, now_ms)
+	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError> {
+		self.inner.seen(digest, now)
 	}
 
-	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
-		self.inner.held_digests(now_ms)
+	fn held_digests(&self, now: UnixMillis) -> Result<Vec<GossipDigest>, ClusterError> {
+		self.inner.held_digests(now)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
-		self.inner.fetch(wanted, now_ms)
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.fetch(wanted, now)
 	}
 
-	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
-		self.inner.pending_local(now_ms)
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.pending_local(now)
 	}
 
-	fn claim_local(&self, digest: &GossipDigest, now_ms: u64) -> Result<LocalClaim, ClusterError> {
-		self.inner.claim_local(digest, now_ms)
+	fn claim_local(&self, digest: &GossipDigest, now: UnixMillis) -> Result<LocalClaim, ClusterError> {
+		self.inner.claim_local(digest, now)
 	}
 
 	fn release_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
@@ -820,8 +798,8 @@ impl GossipJournal for CountingJournal {
 		self.inner.ack_local(digest)
 	}
 
-	fn retention_ms(&self) -> u64 {
-		self.inner.retention_ms()
+	fn retention(&self) -> Duration {
+		self.inner.retention()
 	}
 }
 
@@ -934,14 +912,17 @@ tb_scenario! {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: _ }| start_ping_hive(trace, hive_plane_certs(), None),
 		client: |HiveEnv { trace, context: certs, hive }| async move {
+			let clock = Arc::new(ManualClock::default());
 			let mut conf = peering_cluster_conf(&certs);
 			conf.tls.hive_trust = Some(split_hive_trust(&certs));
+			conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
 			conf.gossip = GossipConfig {
-				journal: Arc::new(MemoryGossipJournal::new(1_000)) as Arc<dyn GossipJournal>,
+				journal: Arc::new(MemoryGossipJournal::new(Duration::from_millis(1_000))) as Arc<dyn GossipJournal>,
 				seen_ttl: Duration::from_secs(3_600),
 				ingress: Some(servlet_ingress("ping")),
 				..Default::default()
 			};
+
 			let gateway = start_cluster(&trace, conf).await?;
 			hive.register_with_cluster(gateway.addr()).await?;
 
@@ -953,7 +934,9 @@ tb_scenario! {
 			.await?;
 			send_gossip_frame(&trace, &certs, &gateway, frame.clone()).await?;
 
-			tokio::time::sleep(Duration::from_millis(3_000)).await;
+			// Past the one-second retention, so the journal has pruned the
+			// entry and only the clamped freshness window can refuse it.
+			clock.advance(Duration::from_secs(2));
 			send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_REPLAY_STATUS).await?;
 
 			gateway.stop();
@@ -1093,32 +1076,32 @@ impl GossipJournal for HeldJournal {
 		signer: &[u8],
 		digest: GossipDigest,
 		rumor: &Frame,
-		now_ms: u64,
+		now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
-		self.inner.record(signer, digest, rumor, now_ms)
+		self.inner.record(signer, digest, rumor, now)
 	}
 
-	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError> {
-		self.inner.witness(signer, digest, now_ms)
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, now)
 	}
 
-	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
-		self.inner.seen(digest, now_ms)
+	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError> {
+		self.inner.seen(digest, now)
 	}
 
-	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
-		self.inner.held_digests(now_ms)
+	fn held_digests(&self, now: UnixMillis) -> Result<Vec<GossipDigest>, ClusterError> {
+		self.inner.held_digests(now)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
-		self.inner.fetch(wanted, now_ms)
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.fetch(wanted, now)
 	}
 
-	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
-		self.inner.pending_local(now_ms)
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.pending_local(now)
 	}
 
-	fn claim_local(&self, _digest: &GossipDigest, _now_ms: u64) -> Result<LocalClaim, ClusterError> {
+	fn claim_local(&self, _digest: &GossipDigest, _now: UnixMillis) -> Result<LocalClaim, ClusterError> {
 		Ok(LocalClaim::Held)
 	}
 
@@ -1131,8 +1114,8 @@ impl GossipJournal for HeldJournal {
 		self.inner.ack_local(digest)
 	}
 
-	fn retention_ms(&self) -> u64 {
-		self.inner.retention_ms()
+	fn retention(&self) -> Duration {
+		self.inner.retention()
 	}
 }
 
@@ -1215,7 +1198,7 @@ tb_assert_spec! {
 // flood request) weakens its own advertised work routes.
 //
 // - Weakening is one trial per refusal until the trail is abandoned.
-// - `peer_routes` then no longer exposes it.
+// - `peer_routes` then stops exposing it.
 // - The fourth refusal scores nothing once the trail is gone.
 // - An honest relay from the same signer still delivers.
 // - Flooding is untouched by work-route abandonment.
@@ -1291,35 +1274,35 @@ impl GossipJournal for AmnesiacJournal {
 		_signer: &[u8],
 		_digest: GossipDigest,
 		_rumor: &Frame,
-		_now_ms: u64,
+		_now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
 		Ok(Admission::New)
 	}
 
-	fn witness(&self, _signer: &[u8], _digest: GossipDigest, _now_ms: u64) -> Result<Admission, ClusterError> {
+	fn witness(&self, _signer: &[u8], _digest: GossipDigest, _now: UnixMillis) -> Result<Admission, ClusterError> {
 		Ok(Admission::New)
 	}
 
 	// Retaining nothing, the grey hole never reports a digest as seen.
 	// Every repair push therefore reaches record and is re-acknowledged.
-	fn seen(&self, _digest: &GossipDigest, _now_ms: u64) -> Result<bool, ClusterError> {
+	fn seen(&self, _digest: &GossipDigest, _now: UnixMillis) -> Result<bool, ClusterError> {
 		Ok(false)
 	}
 
-	fn held_digests(&self, _now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
+	fn held_digests(&self, _now: UnixMillis) -> Result<Vec<GossipDigest>, ClusterError> {
 		Ok(Vec::new())
 	}
 
-	fn fetch(&self, _wanted: &[GossipDigest], _now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+	fn fetch(&self, _wanted: &[GossipDigest], _now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
 		Ok(Vec::new())
 	}
 
-	fn pending_local(&self, _now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+	fn pending_local(&self, _now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
 		Ok(Vec::new())
 	}
 
 	// The grey hole retains nothing, so no rumor of its is ever retried.
-	fn claim_local(&self, _digest: &GossipDigest, _now_ms: u64) -> Result<LocalClaim, ClusterError> {
+	fn claim_local(&self, _digest: &GossipDigest, _now: UnixMillis) -> Result<LocalClaim, ClusterError> {
 		Ok(LocalClaim::Untracked)
 	}
 
@@ -1335,8 +1318,8 @@ impl GossipJournal for AmnesiacJournal {
 	//
 	// - A misbehaving journal lies.
 	// - The start-time seen-ttl clamp only defends against honest misconfiguration.
-	fn retention_ms(&self) -> u64 {
-		DEFAULT_GOSSIP_RETENTION_MS
+	fn retention(&self) -> Duration {
+		Duration::from_millis(DEFAULT_GOSSIP_RETENTION_MS)
 	}
 }
 
@@ -1358,8 +1341,8 @@ tb_assert_spec! {
 
 // Grey-hole containment over the beat.
 //
-// B acknowledges every repair push with `Ok` and retains nothing.
-// Each reconciliation round therefore re-wants a digest A already saw acknowledged.
+// B acknowledges every repair push with `Ok` and retains nothing. Each
+// reconciliation round therefore re-wants a digest A already saw acknowledged.
 //
 // - A's beat reads the reappearance as a drop signal.
 // - It weakens B's advertised work route once per round.
@@ -1498,7 +1481,8 @@ struct ForeignColonyCtx {
 
 /// Fresh gateway identity in colony "other".
 ///
-/// A random key keeps its subject key id distinct from every "main"-colony identity.
+/// A random key keeps its subject key id distinct from every "main"-colony
+/// identity.
 ///
 /// - Its own `CN` keeps trust-store issuer resolution unambiguous.
 /// - One trust store can therefore anchor both identities.
@@ -1757,7 +1741,8 @@ tb_assert_spec! {
 
 // Reconciliation is gated on colony EQUALITY, matching the flood scope.
 //
-// A want list names local rumor state. The follow-up repair push carries rumor bytes.
+// A want list names local rumor state. The follow-up repair push carries rumor
+// bytes.
 //
 // - Only a same-colony member receives the want-list for a digest this gateway lacks.
 // - A foreign-colony member is refused with an empty want.
@@ -1846,7 +1831,7 @@ tb_scenario! {
 			.await?;
 			send_gossip_frame(&trace, &ctx.certs, &cluster, frame).await?;
 
-			let now = current_timestamp_ms();
+			let now = UnixMillis::now();
 			let held_one = ctx.journal.held_digests(now).is_ok_and(|digests| digests.len() == 1);
 			let none_pending = ctx.journal.pending_local(now).is_ok_and(|rumors| rumors.is_empty());
 			trace.event_with(GOSSIP_HELD_NO_INGRESS, &[], u64::from(held_one))?;
@@ -1982,7 +1967,7 @@ tb_scenario! {
 			trace.event_with(PEER_TABLE_FLOOD_ADMITTED, &[], admitted as u64)?;
 
 			for hint in &flood {
-				let _ = table.promote(hint.gateway_addr, None, current_timestamp_ms());
+				let _ = table.promote(hint.gateway_addr, None, UnixMillis::now());
 			}
 
 			let targets = table.target_set().unwrap_or_default();
@@ -2045,19 +2030,9 @@ fn probing_cluster_conf(ctx: &ForeignGatewayCtx) -> ClusterConfig {
 ///
 /// Feeler probes run on the advertise beat's cadence.
 /// Their outcome is therefore only observable by polling.
-///
-/// - Branching lives here, not in scenarios.
 async fn wait_for_new_candidates_drained(table: &PeerTable, attempts: u32, interval: Duration) -> bool {
-	let drained = |table: &PeerTable| table.learned().is_ok_and(|(new_count, _)| new_count == 0);
-	for _ in 0..attempts {
-		if drained(table) {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	drained(table)
+	let drained = || table.learned().is_ok_and(|(new_count, _)| new_count == 0);
+	poll_until(attempts, interval, drained).await
 }
 
 tb_assert_spec! {
@@ -2075,8 +2050,8 @@ tb_assert_spec! {
 
 // Feeler probes gate on colony equality.
 //
-// One learned hint names a same-colony member. The other names a
-// TLS-trusted gateway from a foreign colony. Both probes complete the handshake.
+// One learned hint names a same-colony member. The other names a TLS-trusted
+// gateway from a foreign colony. Both probes complete the handshake.
 //
 // - Only the member passes the gate (CLUSTER_PEER_DISCOVERED exactly once).
 // - Only the member joins the beat targets.
@@ -2131,40 +2106,24 @@ fn peer_addr(text: impl AsRef<str>) -> PeerAddress {
 	text.as_ref().parse().expect("fixture address parses as a socket")
 }
 
-/// Poll until `addr` leaves the beat targets or attempts exhaust.
-/// Eviction runs on the advertise beat's cadence, so the outcome is
-/// only observable by polling. Branching lives here, not in scenarios.
 /// Waits until `table` has promoted at least `count` learned peers.
 ///
-/// `CLUSTER_PEER_DISCOVERED` fires on that promotion, which the advertise
-/// beat drives. A scenario that stops its gateways the moment gossip
-/// converges can outrun the beat, so a spec asserting a discovery count
-/// needs this wait rather than the convergence one. Branching lives here,
-/// not in scenarios.
+/// `CLUSTER_PEER_DISCOVERED` fires on that promotion, which the advertise beat
+/// drives. A scenario that stops its gateways the moment gossip converges can
+/// outrun the beat, so a spec asserting a discovery count needs this wait
+/// rather than the convergence one.
 async fn wait_for_promoted(table: &PeerTable, count: usize, attempts: u32, interval: Duration) -> bool {
-	let promoted = |table: &PeerTable| table.learned().is_ok_and(|(_, tried)| tried >= count);
-	for _ in 0..attempts {
-		if promoted(table) {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	promoted(table)
+	let promoted = || table.learned().is_ok_and(|(_, tried)| tried >= count);
+	poll_until(attempts, interval, promoted).await
 }
 
+/// Poll until `addr` leaves the beat targets or attempts exhaust.
+///
+/// Eviction runs on the advertise beat's cadence, so the outcome is only
+/// observable by polling.
 async fn wait_for_target_dropped(table: &PeerTable, addr: PeerAddress, attempts: u32, interval: Duration) -> bool {
-	let dropped = |table: &PeerTable| table.target_set().is_ok_and(|targets| !targets.contains(&addr));
-	for _ in 0..attempts {
-		if dropped(table) {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	dropped(table)
+	let dropped = || table.target_set().is_ok_and(|targets| !targets.contains(&addr));
+	poll_until(attempts, interval, dropped).await
 }
 
 /// Same-colony gateway that answers every frame with an oversized
@@ -2274,8 +2233,8 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let mut prober_conf = fast_probing_conf(&certs, Arc::clone(&certs.trust));
-			// The stopped member's accepted-connection tasks outlive its listener
-			// inside this test process.
+			// The stopped member's accepted-connection tasks outlive its
+			// listener inside this test process.
 			//
 			// - Expiring idle pool leases forces every beat onto a fresh dial.
 			// - The dropped listener refuses that dial, as a dead remote process would.
@@ -2333,35 +2292,35 @@ impl GossipJournal for FaultSwitchJournal {
 		signer: &[u8],
 		digest: GossipDigest,
 		rumor: &Frame,
-		now_ms: u64,
+		now: UnixMillis,
 	) -> Result<Admission, ClusterError> {
-		self.inner.record(signer, digest, rumor, now_ms)
+		self.inner.record(signer, digest, rumor, now)
 	}
 
-	fn witness(&self, signer: &[u8], digest: GossipDigest, now_ms: u64) -> Result<Admission, ClusterError> {
-		self.inner.witness(signer, digest, now_ms)
+	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError> {
+		self.inner.witness(signer, digest, now)
 	}
 
-	fn seen(&self, digest: &GossipDigest, now_ms: u64) -> Result<bool, ClusterError> {
-		self.inner.seen(digest, now_ms)
+	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError> {
+		self.inner.seen(digest, now)
 	}
 
-	fn held_digests(&self, now_ms: u64) -> Result<Vec<GossipDigest>, ClusterError> {
+	fn held_digests(&self, now: UnixMillis) -> Result<Vec<GossipDigest>, ClusterError> {
 		self.guard()?;
-		self.inner.held_digests(now_ms)
+		self.inner.held_digests(now)
 	}
 
-	fn fetch(&self, wanted: &[GossipDigest], now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
+	fn fetch(&self, wanted: &[GossipDigest], now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
 		self.guard()?;
-		self.inner.fetch(wanted, now_ms)
+		self.inner.fetch(wanted, now)
 	}
 
-	fn pending_local(&self, now_ms: u64) -> Result<Vec<Frame>, ClusterError> {
-		self.inner.pending_local(now_ms)
+	fn pending_local(&self, now: UnixMillis) -> Result<Vec<Frame>, ClusterError> {
+		self.inner.pending_local(now)
 	}
 
-	fn claim_local(&self, digest: &GossipDigest, now_ms: u64) -> Result<LocalClaim, ClusterError> {
-		self.inner.claim_local(digest, now_ms)
+	fn claim_local(&self, digest: &GossipDigest, now: UnixMillis) -> Result<LocalClaim, ClusterError> {
+		self.inner.claim_local(digest, now)
 	}
 
 	fn release_local(&self, digest: &GossipDigest) -> Result<(), ClusterError> {
@@ -2372,8 +2331,8 @@ impl GossipJournal for FaultSwitchJournal {
 		self.inner.ack_local(digest)
 	}
 
-	fn retention_ms(&self) -> u64 {
-		self.inner.retention_ms()
+	fn retention(&self) -> Duration {
+		self.inner.retention()
 	}
 }
 

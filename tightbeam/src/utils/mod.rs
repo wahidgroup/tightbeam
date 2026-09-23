@@ -23,6 +23,7 @@ pub mod marker;
 pub mod math;
 pub mod statistics;
 pub mod task;
+pub mod time;
 pub mod urn;
 
 pub use basis_points::{BasisPoints, BasisPointsOutOfRange};
@@ -103,7 +104,8 @@ macro_rules! impl_from {
 		}
 	};
 
-	// Pattern for extracting inner value from enum variant with fallback (conditional)
+	// Pattern for extracting inner value from enum variant with fallback
+	// (conditional)
 	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident extract $enum_variant:pat => $inner:ident else $fallback:expr) => {
 		#[cfg($feature)]
 		impl From<$from_type> for $target {

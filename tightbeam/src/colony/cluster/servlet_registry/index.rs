@@ -81,7 +81,7 @@ impl ServletRegistry {
 			caps.max_gateways,
 			caps.max_routes,
 			order,
-			self.ad_tombstone_window_ms,
+			self.tombstone(),
 		)
 	}
 
@@ -90,15 +90,15 @@ impl ServletRegistry {
 	/// The bucket is `origin NUL relay`, so an origin's direct slate and its
 	/// relay fallback reconcile independently.
 	///
-	/// Relay buckets spend the separate budget in
-	/// [`PeerCaps::max_relay_buckets`] and [`PeerCaps::max_relay_routes`],
-	/// which bounds what a member relaying many origins can claim and leaves
-	/// direct-gateway admission its own headroom (CWE-770).
+	/// # Bounds
 	///
-	/// The relay dial address comes from this registry's recorded value for
-	/// the relay, which the direct reconcile's dial-conflict probe has
-	/// already gated. Each bucket refuses stale advertisements on its own
-	/// order ledger, as direct slates do (CWE-294).
+	/// - Relay buckets spend the separate budget in [`PeerCaps::max_relay_buckets`] and
+	///   [`PeerCaps::max_relay_routes`], which bounds what a member relaying many origins can claim
+	///   and leaves direct-gateway admission its own headroom (CWE-770).
+	/// - The relay dial address comes from this registry's recorded value for the relay, which the
+	///   direct reconcile's dial-conflict probe has already gated.
+	/// - Each bucket refuses stale advertisements on its own order ledger, as direct slates do
+	///   (CWE-294).
 	pub fn reconcile_relay_trail(&self, trail: RelayTrail, caps: PeerCaps) -> Result<(), ClusterError> {
 		let RelayTrail { bucket, slate, order } = trail;
 
@@ -110,7 +110,7 @@ impl ServletRegistry {
 			caps.max_relay_buckets,
 			caps.max_relay_routes,
 			order,
-			self.ad_tombstone_window_ms,
+			self.tombstone(),
 		)
 	}
 

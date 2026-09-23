@@ -1,12 +1,13 @@
 //! Three-org live topology for the colony AFL harness.
 //!
-//! Alpha is the federation seed: beta and gamma peer to alpha's gateway
-//! address. The Cluster scenario `start` returns this topology as the
-//! owned program; the client dials any org gateway for work and CSR.
-//! Advertise beats stay disabled; routes install only via one-shot
+//! Alpha is the federation seed, and beta and gamma peer to alpha's gateway
+//! address. The Cluster scenario `start` returns this topology as the owned
+//! program, and the client dials any org gateway for work and CSR. Advertise
+//! beats stay disabled, so routes install only through one-shot
 //! [`tightbeam::colony::cluster::ClusterRequest::AdvertisePeer`] actions.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tightbeam::cluster;
 use tightbeam::colony::cluster::{Cluster, ClusterConfig, DynamicExportList, ExportAllowlist, ExportGate, ExportGrant};
@@ -83,8 +84,8 @@ impl OrgNode {
 
 /// Full multi-org program under test.
 ///
-/// Owned by `ClusterEnv.cluster` for the colony AFL target. `alpha` is
-/// the seed gateway; peer orgs dial it during [`ColonyTopology::boot`].
+/// Owned by `ClusterEnv.cluster` for the colony AFL target. `alpha` is the seed
+/// gateway, and peer orgs dial it during [`ColonyTopology::boot`].
 pub(crate) struct ColonyTopology {
 	/// Federation entry / peer seed.
 	pub alpha: OrgNode,
@@ -220,11 +221,12 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 		idle_timeout: None,
 		max_connections: 32,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
+		..PoolConfig::default()
 	};
 
 	// Leave advertise_interval at None so the gossip beat never races the
-	// action loop. Local export/ACL enforcement still covers the boundary;
-	// live discovery races belong in integration tests.
+	// action loop. Local export and ACL enforcement still cover the boundary,
+	// and live discovery races belong in integration tests.
 	let mut builder = ClusterConfig::builder(tls)
 		.with_export_allowlist(Arc::clone(&exports) as Arc<dyn ExportAllowlist>)
 		.with_export_grant(Arc::clone(&export_grant))
@@ -232,7 +234,7 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 		.with_gate_policy(Arc::clone(&policy_gate) as Arc<dyn GatePolicy + Send + Sync>)
 		.with_max_hops(max_hops)
 		.with_pool_config(pool)
-		.with_control_freshness_window_ms(u64::MAX / 4);
+		.with_control_freshness_window(Duration::from_millis(u64::MAX / 4));
 
 	if let Some(pin) = decoy_pin {
 		builder = builder.with_load_balancer(DecoyFirstBalancer { preferred: pin });
@@ -302,7 +304,8 @@ fn share_trace(trace: &TraceCollector) -> Arc<TraceCollector> {
 	Arc::new(trace.share())
 }
 
-/// Boot a ping servlet and register it; the spawner rebuilds a fresh instance on scale-out.
+/// Boot a ping servlet and register it. The spawner rebuilds a fresh instance
+/// on scale-out.
 async fn register_ping(
 	hive: &mut ColonyFuzzHive,
 	trace: &TraceCollector,
@@ -328,7 +331,8 @@ async fn register_ping(
 	hive.register(servlet_type, servlet, respawn)
 }
 
-/// Boot the CSR servlet. Returns the issuer so the org node can observe mint counts.
+/// Boot the CSR servlet. Returns the issuer so the org node can observe mint
+/// counts.
 async fn register_csr(
 	hive: &mut ColonyFuzzHive,
 	trace: &TraceCollector,
@@ -343,7 +347,8 @@ async fn register_csr(
 	let config = csr_servlet_config(Arc::clone(&issuer), certs)?;
 	let servlet = CsrServlet::start(trace, config).await?;
 
-	// Spawner owns its issuer clone; OrgNode keeps the returned handle.
+	// The spawner owns its issuer clone, and `OrgNode` keeps the returned
+	// handle.
 	let spawn_issuer = Arc::clone(&issuer);
 	let spawn_certs = Arc::clone(certs);
 	let respawn = move |t| {

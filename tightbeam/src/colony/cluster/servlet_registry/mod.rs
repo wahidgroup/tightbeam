@@ -12,11 +12,11 @@ mod select;
 #[cfg(test)]
 mod tests;
 
+use crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
+use crate::utils::time::{Clock, SystemClock, UnixMillis};
+use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-
-use crate::colony::common::current_timestamp_ms;
-use crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
 
 pub(super) use super::error::ClusterError;
 pub(super) use super::SharedId;
@@ -38,7 +38,7 @@ pub(super) struct Routes {
 	entries: HashMap<SharedId, Arc<ServletEntry>>,
 	by_type: HashMap<SharedId, Vec<SharedId>>,
 	by_bucket: HashMap<SharedId, Vec<SharedId>>,
-	ad_orders: HashMap<SharedId, u64>,
+	ad_orders: HashMap<SharedId, UnixMillis>,
 }
 
 impl Routes {
@@ -219,8 +219,8 @@ impl Routes {
 		count_kind: RouteKind,
 		max_identities: usize,
 		max_routes: usize,
-		order: u64,
-		tombstone_window_ms: u64,
+		order: UnixMillis,
+		tombstone: Tombstone,
 	) -> Result<(), ClusterError> {
 		let slate: Vec<ServletEntry> = slate.into_iter().collect();
 		if self.ad_orders.get(bucket.as_ref()).is_some_and(|&applied| order < applied) {
@@ -246,7 +246,7 @@ impl Routes {
 			self.remove_relay_trails_for_origin(bucket.as_ref());
 		}
 
-		self.record_ad_order(Arc::clone(bucket), order, tombstone_window_ms);
+		self.record_ad_order(Arc::clone(bucket), order, tombstone);
 
 		Ok(())
 	}
@@ -274,16 +274,15 @@ impl Routes {
 	/// empties, the row survives one freshness window as a tombstone, so a
 	/// replayed older advertisement still loses to the withdrawal it would
 	/// otherwise undo (CWE-294).
-	fn record_ad_order(&mut self, bucket: SharedId, order: u64, tombstone_window_ms: u64) {
+	fn record_ad_order(&mut self, bucket: SharedId, order: UnixMillis, tombstone: Tombstone) {
 		self.ad_orders.insert(bucket, order);
 
 		// Disjoint field borrows: the ledger prunes against the live index
 		// without copying its keys.
-		let now = current_timestamp_ms();
+		let Tombstone { window, now } = tombstone;
 		let by_bucket = &self.by_bucket;
-		self.ad_orders.retain(|bucket, applied| {
-			by_bucket.contains_key(bucket) || now.saturating_sub(*applied) <= tombstone_window_ms
-		});
+		self.ad_orders
+			.retain(|bucket, applied| by_bucket.contains_key(bucket) || now.saturating_since(*applied) <= window);
 	}
 
 	/// Rows the order ledger holds.
@@ -333,6 +332,19 @@ impl Routes {
 	}
 }
 
+/// When an emptied bucket's order row may be dropped: once `window` has
+/// passed since it applied, as of `now`.
+///
+/// The two travel together so an admission cannot pair a window with an
+/// instant from another clock.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Tombstone {
+	/// How long the row survives after its bucket empties.
+	pub(super) window: Duration,
+	/// The instant the admission happens at.
+	pub(super) now: UnixMillis,
+}
+
 /// Registry of servlet entries with pheromone-based routing.
 ///
 /// Tracks servlet instances across hives and peer gateways.
@@ -341,8 +353,10 @@ impl Routes {
 pub struct ServletRegistry {
 	/// Entries and the two reverse indexes derived from them.
 	pub(super) routes: RwLock<Routes>,
-	/// Milliseconds a dead bucket's order tombstone survives.
-	pub(super) ad_tombstone_window_ms: u64,
+	/// How long a dead bucket's order tombstone survives.
+	pub(super) ad_tombstone_window: Duration,
+	/// The clock tombstones age against.
+	pub(super) clock: Arc<dyn Clock>,
 	/// Scoring and lifecycle configuration.
 	pub(super) config: PheromoneConfig,
 }
@@ -352,17 +366,30 @@ impl ServletRegistry {
 	pub fn new(config: PheromoneConfig) -> Self {
 		Self {
 			routes: RwLock::new(Routes::default()),
-			ad_tombstone_window_ms: DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
+			ad_tombstone_window: Duration::from_millis(DEFAULT_COMMAND_FRESHNESS_WINDOW_MS),
+			clock: Arc::new(SystemClock),
 			config,
 		}
+	}
+
+	/// Sets the clock tombstones age against. Defaults to [`SystemClock`].
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
+		self
+	}
+
+	/// The tombstone bound for an advertisement admitted now.
+	pub(super) fn tombstone(&self) -> Tombstone {
+		Tombstone { window: self.ad_tombstone_window, now: self.clock.unix() }
 	}
 
 	/// Sets the advertisement tombstone window, normally the gateway's
 	/// signed-control freshness window, so the two replay bounds stay
 	/// aligned.
 	#[must_use]
-	pub fn with_ad_tombstone_window_ms(mut self, window_ms: u64) -> Self {
-		self.ad_tombstone_window_ms = window_ms;
+	pub fn with_ad_tombstone_window(mut self, window: Duration) -> Self {
+		self.ad_tombstone_window = window;
 		self
 	}
 }

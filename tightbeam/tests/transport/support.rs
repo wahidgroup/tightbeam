@@ -16,8 +16,6 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "transport-multiplex")]
-use tokio::time::{sleep, timeout};
-
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
@@ -44,25 +42,38 @@ use tightbeam::TightBeamError;
 #[cfg(feature = "transport-multiplex")]
 use tightbeam::transport::handshake::receipt::StoredReceipt;
 
+#[cfg(feature = "transport-multiplex")]
+use crate::common::poll::poll_until;
 use crate::common::security::{expectation_failure, pinning_validator, ClientMaterials, ServerMaterials};
 
-/// Poll until epoch receipt differs from `previous` (timeout-bounded).
+/// Reads a transport wait takes: every 5 ms for 2 s.
+#[cfg(feature = "transport-multiplex")]
+const TRANSPORT_WAIT_ATTEMPTS: u32 = 400;
+
+/// Interval between the reads of a transport wait.
+#[cfg(feature = "transport-multiplex")]
+const TRANSPORT_WAIT_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Polls `ready` on the transport cadence and answers whether it held.
+#[cfg(feature = "transport-multiplex")]
+pub async fn await_transport(ready: impl FnMut() -> bool) -> bool {
+	poll_until(TRANSPORT_WAIT_ATTEMPTS, TRANSPORT_WAIT_INTERVAL, ready).await
+}
+
+/// Poll until epoch receipt differs from `previous`, and answer the new one.
 #[cfg(feature = "transport-multiplex")]
 pub async fn await_receipt_rotation<F>(current: F, previous: Option<&StoredReceipt>) -> Option<Arc<StoredReceipt>>
 where
 	F: Fn() -> Option<Arc<StoredReceipt>>,
 {
-	let rotated = timeout(Duration::from_secs(2), async {
-		loop {
-			match current() {
-				Some(receipt) if Some(receipt.as_ref()) != previous => return receipt,
-				_ => sleep(Duration::from_millis(5)).await,
-			}
-		}
+	let mut rotated = None;
+	let settled = await_transport(|| {
+		rotated = current().filter(|receipt| Some(receipt.as_ref()) != previous);
+		rotated.is_some()
 	})
 	.await;
 
-	rotated.ok()
+	settled.then_some(rotated).flatten()
 }
 
 /// Serve one single-flight request by echoing the accepted frame back,
@@ -88,9 +99,9 @@ pub fn mux_offer(cap: u32) -> TransportOffer {
 	TransportOffer::mux(cap)
 }
 
-/// Record an event outcome from a spawned task, where no `Result`
-/// return exists for `?`. A recording failure panics the task; the
-/// spec then surfaces it as the missing event.
+/// Record an event outcome from a spawned task, where no `Result` return exists
+/// for `?`. A recording failure panics the task, and the spec then surfaces it
+/// as the missing event.
 pub fn record_spawned_event(trace: &TraceCollector, urn: Urn<'static>, value: bool) {
 	trace.event_with(urn, &[], value).expect("spawned task must record its event");
 }
@@ -171,7 +182,8 @@ pub struct MutualSessionHooks {
 	pub trace: Option<TraceCollector>,
 }
 
-/// Established mutual-auth transports plus peer identities for receipt verification.
+/// Established mutual-auth transports plus peer identities for receipt
+/// verification.
 pub struct MutualTransports {
 	pub client: TcpTransport<TokioStream>,
 	pub server: TcpTransport<TokioStream>,
@@ -179,7 +191,8 @@ pub struct MutualTransports {
 	pub client_certificate: Arc<Certificate>,
 }
 
-/// Budget-bearing sessions require client countersignature over session receipt.
+/// Budget-bearing sessions require client countersignature over session
+/// receipt.
 pub async fn establish_mutual_transports(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,

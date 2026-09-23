@@ -44,11 +44,12 @@ use crate::transport::handshake::attributes::{self, HandshakeAttribute};
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::kari::HandshakeKek;
-use crate::transport::handshake::kari::{key_wrap_key_size, unwrap_and_verify_with_kek};
+use crate::transport::handshake::kari::{key_wrap_key_size, unwrap_and_verify_with_kek, Kek};
 use crate::transport::handshake::negotiation::{
 	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer, StrengthFloor, TransportAccept,
 	TransportAuthorizer, TransportNegotiation, TransportOffer,
 };
+use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
@@ -77,7 +78,8 @@ use crate::x509::Certificate;
 /// 2. Sends server Finished (SignedData)
 /// 3. Receives and verifies client Finished (SignedData)
 ///
-/// Supports cryptographic profile negotiation via `supported_profiles` configuration.
+/// Supports cryptographic profile negotiation via `supported_profiles`
+/// configuration.
 pub struct CmsHandshakeServer<P>
 where
 	P: CryptoProvider,
@@ -116,11 +118,10 @@ where
 	P::Digest: Send + 'static + AssociatedOid,
 	P::AeadCipher: KeyInit + 'static,
 {
-	/// Create a new CMS handshake server.
+	/// Create a CMS handshake server.
 	///
-	/// # Parameters
-	/// - `server_key_provider`: The key provider for cryptographic operations
-	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
+	/// `client_validators`, when present, authenticate the client certificate
+	/// for mutual authentication.
 	pub fn new(
 		server_key_provider: Arc<dyn SigningKeyProvider>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
@@ -180,8 +181,9 @@ where
 
 	/// Override the minimum-strength policy applied during negotiation.
 	///
-	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit digest).
-	/// Pass `NoStrengthFloor` only where weaker profiles must remain negotiable.
+	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit
+	/// digest). Pass `NoStrengthFloor` only where weaker profiles must remain
+	/// negotiable.
 	#[must_use]
 	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
 		self.strength_floor = StrengthFloor::with_policy(policy);
@@ -220,7 +222,8 @@ where
 	/// processed. Runs the configured validator chain and refuses a
 	/// certificate that differs from one an earlier round already locked in.
 	pub(crate) fn set_client_certificate(&mut self, cert: Certificate) -> Result<(), HandshakeError> {
-		// Check for identity immutability - reject if cert changes on re-handshake
+		// Check for identity immutability - reject if cert changes on
+		// re-handshake
 		if let Some(existing_cert) = &self.validated_client_cert {
 			if existing_cert.as_ref() != &cert {
 				return Err(HandshakeError::PeerIdentityMismatch);
@@ -261,18 +264,14 @@ where
 		validate_state(self.state.state(), expected)
 	}
 
-	/// Process SecurityOffer from unprotected attributes and perform profile negotiation.
+	/// Negotiate the security profile from the SecurityOffer in the
+	/// EnvelopedData's unprotected attributes.
 	///
-	/// Handles the complex logic of:
-	/// 1. Converting x509_cert attributes to HandshakeAttributes
-	/// 2. Finding SecurityOffer in the attributes
-	/// 3. Performing profile negotiation or dealer's choice selection
+	/// The steps apply in order:
 	///
-	/// # Parameters
-	/// - `unprotected_attrs`: Optional unprotected attributes from EnvelopedData
-	///
-	/// # Returns
-	/// Success if negotiation completed (profile selected or dealer's choice applied)
+	/// 1. Convert the `x509_cert` attributes to `HandshakeAttributes`.
+	/// 2. Find the SecurityOffer among them.
+	/// 3. Negotiate a profile, or apply dealer's choice.
 	fn process_security_offer(&mut self, unprotected_attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		// If no attributes and no profiles configured, nothing to do
 		if unprotected_attrs.is_none() && self.supported_profiles.is_empty() {
@@ -327,7 +326,8 @@ where
 		attrs
 			.iter()
 			.map(|attr| {
-				// HandshakeAttribute owns its value set; Attributes keeps the source.
+				// HandshakeAttribute owns its value set, and `Attributes` keeps
+				// the source.
 				Ok(attributes::HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() })
 			})
 			.collect()
@@ -425,17 +425,19 @@ where
 		let provider = P::default();
 
 		let key_size = key_wrap_key_size::<P>()?;
-		let kek = shared_secret.derive_kek::<P>(ukm.as_bytes(), TIGHTBEAM_KARI_KDF_INFO, key_size)?;
+		let ukm_salt = KdfSalt::new(ukm.as_bytes());
+		let kari_label = KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO);
+		let kek = shared_secret.derive_kek::<P>(ukm_salt, kari_label, key_size)?;
 
-		// Unwrap CEK. `recipient_enc_keys` is an unauthenticated DER
-		// SEQUENCE OF that decodes empty; index only after a length check.
+		// `recipient_enc_keys` is an unauthenticated DER SEQUENCE OF that can
+		// decode empty, so index it only after a length check.
 		let wrapped_key = kari
 			.recipient_enc_keys
 			.first()
 			.ok_or(HandshakeError::InvalidClientKeyExchange)?
 			.enc_key
 			.as_bytes();
-		let cek = unwrap_and_verify_with_kek(&provider, kek.as_slice(), wrapped_key)?;
+		let cek = unwrap_and_verify_with_kek(&provider, Kek::new(kek.as_slice()), wrapped_key)?;
 
 		// Open the encrypted content under the unwrapped CEK
 		let cipher = P::AeadCipher::new_from_slice(&cek).map_err(|_| HandshakeError::InvalidKeySize {
@@ -445,14 +447,13 @@ where
 		Ok(cipher.decrypt_content(&enveloped_data.encrypted_content)?)
 	}
 
-	/// Process KeyExchange message (EnvelopedData with KARI containing session key).
-	///
-	/// # Parameters
-	/// - `enveloped_data_der`: DER-encoded EnvelopedData from client
+	/// Process the KeyExchange message: EnvelopedData with a KARI that carries
+	/// the session key.
 	///
 	/// # Security
-	/// Session key is stored internally and zeroized on drop. Not returned to prevent
-	/// unnecessary copies of key material in memory.
+	///
+	/// The session key stays inside the server and is zeroized on drop. It is
+	/// not returned, so key material is never copied out.
 	pub async fn process_key_exchange(&mut self, enveloped_data_der: impl AsRef<[u8]>) -> Result<(), HandshakeError> {
 		let enveloped_data_der = enveloped_data_der.as_ref();
 		// 1. Validation
@@ -480,11 +481,6 @@ where
 
 		// 8. Decrypt and store session key
 		self.decrypt_session_key(enveloped_data_der).await?;
-
-		// 9. Lock transcript and mark AEAD derivation now that session key
-		// material is available. For CMS, transcript is locked here (after key
-		// exchange processed) rather than during server finished preparation,
-		// since session key derivation happens at this point.
 
 		Ok(())
 	}
@@ -544,11 +540,11 @@ where
 	/// Build the SecurityAccept, TransportAccept, and session receipt
 	/// unsigned attributes for the server Finished.
 	///
-	/// The accepts are advisory like TLS ServerHello extensions
-	/// pre-Finished: unauthenticated on the attribute, but tampering
-	/// yields a client-side transcript mismatch and the handshake fails
-	/// closed. The receipt travels as a server-signed `SignedData`
-	/// artifact, third-party verifiable on its own.
+	/// - The accepts are advisory, like TLS ServerHello extensions before Finished: unauthenticated
+	///   on the attribute, but tampering yields a client-side transcript mismatch and the handshake
+	///   fails closed.
+	/// - The receipt travels as a server-signed `SignedData` artifact, verifiable by a third party
+	///   on its own.
 	fn build_security_accept_attrs(&self) -> Result<Option<Attributes>, HandshakeError> {
 		let mut x509_attrs = Vec::new();
 
@@ -589,7 +585,8 @@ where
 		let signer_info = SignerInfo {
 			version: CmsVersion::V1,
 			sid: signer_id,
-			// Same OID lives in SignerInfo and the SignedData digestAlgorithms SET.
+			// Same OID lives in SignerInfo and the SignedData digestAlgorithms
+			// SET.
 			digest_alg: digest_alg.clone(),
 			signed_attrs: None,
 			signature_algorithm: signature_alg,
@@ -693,7 +690,7 @@ where
 		let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
 
 		let transcript = *self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
-		let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript))?;
+		let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, KdfSalt::new(&transcript)))?;
 		let ciphers = directional?;
 
 		// 4. Derive the epoch-0 rekey materials alongside the traffic
@@ -701,15 +698,15 @@ where
 		//    from this secret without touching the handshake again. CMS
 		//    salts key derivation with the transcript hash, so it doubles
 		//    as the epoch salt here.
-		let epoch_derived = cek.with(|input_key| derive_epoch_materials::<P>(input_key, &transcript, transcript))?;
+		let epoch_salt = KdfSalt::new(&transcript);
+		let epoch_derived = cek.with(|input_key| derive_epoch_materials::<P>(input_key, epoch_salt, transcript))?;
 		let materials = epoch_derived?;
 
 		// 5. Transition to complete
 		self.state.transition(ServerHandshakeState::Completed)?;
 
-		// 6. Role-map the directional ciphers. The
-		//    orchestrator is spent, so the receipt moves out rather than
-		//    copies. The client certificate is already shared, so the session
+		// 6. Role-map the directional ciphers. The orchestrator is spent, so the receipt moves out
+		//    rather than being copied. The client certificate is already shared, so the session
 		//    takes a handle to it.
 		#[cfg(feature = "x509")]
 		let peer = self.validated_client_cert.as_ref().map(Arc::clone);
@@ -752,13 +749,8 @@ where
 		Ok(signed_data)
 	}
 
-	/// Process client Finished message (SignedData over transcript hash).
-	///
-	/// # Parameters
-	/// - `signed_data_der`: DER-encoded SignedData from client
-	///
-	/// # Returns
-	/// Verified transcript hash
+	/// Process the client Finished message, SignedData over the transcript
+	/// hash, and answer the verified transcript hash.
 	pub fn process_client_finished(&mut self, signed_data_der: impl AsRef<[u8]>) -> Result<Vec<u8>, HandshakeError> {
 		let signed_data_der = signed_data_der.as_ref();
 		// 1. Validation
@@ -849,9 +841,8 @@ where
 		// outcome even when the SignerInfo folds into the artifact.
 		let countersignature = receipt_ack.as_ref().map(SignerInfo::to_der).transpose()?;
 
-		// A verified countersignature completes the artifact; a failed
-		// one stays out of it but its DER remains in the outcome as
-		// evidence.
+		// A verified countersignature completes the artifact. A failed one
+		// stays out of it, but its DER remains in the outcome as evidence.
 		let artifact = match (verdict, receipt_ack) {
 			(SessionVerdict::Activated | SessionVerdict::SettlementRejected { .. }, Some(ack)) => {
 				server_artifact.complete(ack)?
@@ -931,7 +922,8 @@ fn extract_embedded_certificate(signed_data_der: impl AsRef<[u8]>) -> Result<Opt
 	let signed_data = SignedData::from_der(signed_data_der)?;
 	let certificate = signed_data.certificates.as_ref().and_then(|set| {
 		set.0.iter().find_map(|choice| match choice {
-			// Caller needs an owned cert; the parsed SignedData keeps its copy.
+			// The caller needs an owned certificate, and the parsed SignedData
+			// keeps its copy.
 			CertificateChoices::Certificate(cert) => Some(cert.to_owned()),
 			CertificateChoices::Other(_) => None,
 		})
@@ -939,10 +931,6 @@ fn extract_embedded_certificate(signed_data_der: impl AsRef<[u8]>) -> Result<Opt
 
 	Ok(certificate)
 }
-
-// ============================================================================
-// Common Handshake Trait Implementations
-// ============================================================================
 
 impl<P> HandshakeNegotiation<P> for CmsHandshakeServer<P>
 where
@@ -967,10 +955,6 @@ where
 }
 
 impl<P> HandshakeAlertHandler for CmsHandshakeServer<P> where P: CryptoProvider {}
-
-// ============================================================================
-// ServerHandshakeProtocol Implementation
-// ============================================================================
 
 impl<P> ServerHandshakeProtocol for CmsHandshakeServer<P>
 where
@@ -1057,7 +1041,7 @@ mod tests {
 		const TEST_TRANSCRIPT: [u8; 32] = [1u8; 32];
 		const TEST_SESSION_KEY: [u8; 32] = [2u8; 32];
 
-		/// Drive Init -> Complete for a mutual-auth CMS server handshake.
+		/// Drive a mutual-auth CMS server handshake from Init to Complete.
 		async fn complete_handshake(
 			server: &mut CmsHandshakeServer<DefaultCryptoProvider>,
 			server_public_key: &PublicKey<k256::Secp256k1>,
@@ -1080,12 +1064,14 @@ mod tests {
 			assert_eq!(server.state(), ServerHandshakeState::ClientFinishedReceived);
 
 			// The terminal transition belongs to the real completion, which
-			// derives the keys; the machine is at its last pre-terminal state.
+			// derives the keys, so the machine rests at its last pre-terminal
+			// state.
 			assert!(!server.is_complete());
 			Ok(())
 		}
 
-		/// Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> Complete
+		/// The server moves from Init through KeyExchangeReceived,
+		/// ServerFinishedSent and ClientFinishedReceived to Complete.
 		#[tokio::test]
 		async fn test_server_state_flow() -> Result<(), Box<dyn Error>> {
 			let (mut server, server_public_key) =
@@ -1103,7 +1089,8 @@ mod tests {
 			Ok(())
 		}
 
-		/// Dealer's choice: no client SecurityOffer; server picks from its list.
+		/// Dealer's choice: with no client SecurityOffer, the server picks from
+		/// its own list.
 		#[tokio::test]
 		async fn test_cms_end_to_end_with_profile_negotiation() -> Result<(), Box<dyn Error>> {
 			let (mut server, server_public_key) =

@@ -1,6 +1,7 @@
 //! DTN Servlets: 4-Tier Architecture
 //!
-//! This module contains the servlet definitions for the 4-tier DTN architecture:
+//! This module contains the servlet definitions for the 4-tier DTN
+//! architecture:
 //! - Mission Control: Receives telemetry, sends commands, validates ACKs
 //! - Earth Relay Satellite: Forwards messages between Mission Control and Mars Relay
 //! - Mars Relay Satellite: Forwards messages between Earth Relay and Rover
@@ -25,6 +26,8 @@ use tightbeam::{
 	utils::task::Pipeline,
 };
 
+use crate::common::poll::poll_until;
+use crate::common::security::expectation_failure;
 use crate::dtn::{
 	chain_processor::{ChainProcessor, ProcessResult},
 	clock::mission_time_ms,
@@ -52,10 +55,7 @@ use crate::dtn::{
 	},
 };
 
-// ============================================================================
-// DTN Node Trait - Shared behavior for all nodes
-// ============================================================================
-
+/// Behavior every node on the DTN path shares.
 trait DtnNode {
 	// Abstract methods (each servlet config implements)
 	fn node_name(&self) -> &str;
@@ -142,26 +142,18 @@ trait DtnNode {
 	}
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Helper: Wait for an address to be set (with timeout)
+/// Wait for the upstream servlet to publish its address, for up to 5 s.
 async fn wait_for_address(
 	addr_lock: &Arc<RwLock<Option<TightBeamSocketAddr>>>,
 ) -> Result<TightBeamSocketAddr, TightBeamError> {
-	loop {
-		if let Some(addr) = *addr_lock.read()? {
-			break Ok(addr);
-		}
-
-		tokio::time::sleep(Duration::from_millis(10)).await;
+	let published = || addr_lock.read().is_ok_and(|addr| addr.is_some());
+	if !poll_until(500, Duration::from_millis(10), published).await {
+		return Err(expectation_failure("the upstream servlet never published its address"));
 	}
-}
 
-// ============================================================================
-// Mission Control Servlet
-// ============================================================================
+	let addr = (*addr_lock.read()?).ok_or_else(|| expectation_failure("the published address vanished"))?;
+	Ok(addr)
+}
 
 #[derive(Clone)]
 pub struct MissionControlServletConfig {
@@ -176,7 +168,8 @@ pub struct MissionControlServletConfig {
 }
 
 servlet! {
-	/// Mission Control receives telemetry and sends commands to Rover via relays
+	/// Mission Control receives telemetry and sends commands to Rover via
+	/// relays
 	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConfig>,
 	protocol: TokioListener,
 	handle: raw |frame, ctx| async move {
@@ -197,7 +190,8 @@ servlet! {
 					let relay_message = config.decrypt_relay_message(ordered_frame)?;
 					match relay_message {
 						RelayMessage::Telemetry(telemetry) => {
-							// WORKER: Handle telemetry analysis and command decision
+							// WORKER: Handle telemetry analysis and command
+							// decision
 							let request = TelemetryHandlerRequest { telemetry };
 							let result = ctx.relay::<MissionControlTelemetryHandlerWorker>(Arc::new(request)).await??;
 							if result.should_send_command {
@@ -252,7 +246,8 @@ servlet! {
 									return Ok(Some(response_frame));
 								},
 								_ => {
-									// NoAction or Cascade (but MC can't cascade)
+									// NoAction or Cascade (but MC can't
+									// cascade)
 								}
 							}
 						},
@@ -318,10 +313,6 @@ impl DtnNode for MissionControlServletConfig {
 		&self.frame_builder
 	}
 }
-
-// ============================================================================
-// Earth Relay Satellite Servlet
-// ============================================================================
 
 #[derive(Clone)]
 pub struct EarthRelaySatelliteServletConfig {
@@ -400,10 +391,12 @@ servlet! {
 								FrameRequestAction::Cascade(_) => {
 									// Servlet builds and sends cascade frame
 									let (cascade_pool, cascade_addr) = if from_mission_control {
-										// Request from MC, cascade to Mars Relay
+										// Request from MC, cascade to Mars
+										// Relay
 										(&config.mars_relay_pool, config.mars_relay_addr)
 									} else {
-										// Request from Mars, cascade to MC (rare but possible)
+										// Request from Mars, cascade to MC
+										// (rare but possible)
 										match *config.mission_control_addr.read()? {
 											Some(mc_addr) => (&config.mission_control_pool, mc_addr),
 											None => return Ok(None),
@@ -456,7 +449,8 @@ servlet! {
 								let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
 								return Ok(Some(stateless_ack));
 							} else {
-								// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
+								// Determine message type from frame ID
+								// (relay-telem-NNN vs relay-ack-NNN)
 								let is_telemetry = frame.metadata().id().starts_with(b"relay-telem");
 								if is_telemetry {
 									trace.event(EARTH_RELAY_RECEIVE_TELEMETRY_FROM_MARS)?;
@@ -466,7 +460,8 @@ servlet! {
 									trace.event(EARTH_RELAY_FORWARD_ACK_TO_MC)?;
 								}
 
-								// Get Mission Control address (wait if not set yet)
+								// Get Mission Control address (wait if not set
+								// yet)
 								let mc_addr = wait_for_address(&config.mission_control_addr).await?;
 
 								// Use pooled client
@@ -532,10 +527,6 @@ impl DtnNode for EarthRelaySatelliteServletConfig {
 	}
 }
 
-// ============================================================================
-// Mars Relay Satellite Servlet
-// ============================================================================
-
 #[derive(Clone)]
 pub struct MarsRelaySatelliteServletConfig {
 	pub mars_relay_signing_key: Secp256k1SigningKey,
@@ -558,8 +549,8 @@ servlet! {
 	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &MarsRelaySatelliteServletConfig = ctx.env_config();
-		// Verify signature and determine source
-		// Earth Relay forwards messages, so could be from Mission Control or Rover
+		// Verify signature and determine source Earth Relay forwards messages,
+		// so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation().is_some() {
 			if frame.verify::<Secp256k1Signature, Sha3_256>(&config.rover_verifying_key).is_ok() {
 				true
@@ -605,7 +596,8 @@ servlet! {
 								FrameRequestAction::Cascade(_) => {
 									// Servlet builds and sends cascade frame
 									let (cascade_pool, cascade_addr) = if from_rover {
-										// Request from Rover, cascade to Earth Relay
+										// Request from Rover, cascade to Earth
+										// Relay
 										match *config.earth_relay_addr.read()? {
 											Some(earth_addr) => (&config.earth_relay_pool, earth_addr),
 											None => return Ok(None),
@@ -653,7 +645,8 @@ servlet! {
 				}
 
 				if from_rover {
-					// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
+					// Determine message type from frame ID (relay-telem-NNN vs
+					// relay-ack-NNN)
 					let is_telemetry = frame.metadata().id().starts_with(b"relay-telem");
 					if is_telemetry {
 						trace.event(MARS_RELAY_RECEIVE_TELEMETRY_FROM_ROVER)?;
@@ -683,10 +676,12 @@ servlet! {
 
 					let response = config.send_frame(&config.rover_pool, config.rover_addr, frame).await?;
 					if let Some(ack_frame) = response {
-						// Process Rover's ACK into chain and forward to Earth Relay
+						// Process Rover's ACK into chain and forward to Earth
+						// Relay
 						config.chain_processor.process_incoming(&ack_frame)?;
 
-						// Emit trace event for receiving ACK from Rover (stateful ACK for command)
+						// Emit trace event for receiving ACK from Rover
+						// (stateful ACK for command)
 						trace.event(MARS_RELAY_RECEIVE_ACK_FROM_ROVER)?;
 						trace.event(MARS_RELAY_FORWARD_ACK_TO_EARTH)?;
 
@@ -757,10 +752,6 @@ impl DtnNode for MarsRelaySatelliteServletConfig {
 		&self.frame_builder
 	}
 }
-
-// ============================================================================
-// Rover Servlet
-// ============================================================================
 
 #[derive(Clone)]
 pub struct RoverServletConfig {
@@ -911,10 +902,7 @@ impl DtnNode for RoverServletConfig {
 	}
 }
 
-// ============================================================================
-// Mission State (shared across nodes for coordination)
-// ============================================================================
-
+/// Mission progress, shared across the nodes so they coordinate.
 #[derive(Default)]
 pub struct MissionState {
 	pub completed_rounds: usize,

@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features = false }
+tightbeam = { package = "tightbeam-rs", path = "../../tightbeam", default-features = false }
 
 # One `tb_scenario!` body has to compile under both selections.
 [features]

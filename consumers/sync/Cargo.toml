@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features = false, features = [
+tightbeam = { package = "tightbeam-rs", path = "../../tightbeam", default-features = false, features = [
 	"std",
 	"tcp",
 	"transport-ecies",

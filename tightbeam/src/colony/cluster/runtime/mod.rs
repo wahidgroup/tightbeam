@@ -2,10 +2,11 @@
 //!
 //! [`ClusterGateway`] owns the listener, heartbeat, evaporation, and advertise
 //! tasks. Incoming connections are served through [`GatewayMuxService`], which
-//! routes unary control frames to dispatch and splices streamed or duplex
-//! opens by servlet target. Each sibling module owns one of the surfaces a
-//! request reaches: dispatch, registration, work, streaming, gossip, and
-//! heartbeat.
+//! routes unary control frames to dispatch and splices streamed or duplex opens
+//! by servlet target.
+//!
+//! Each sibling module owns one of the surfaces a request reaches: dispatch,
+//! registration, work, streaming, gossip, and heartbeat.
 
 mod bounds;
 mod dispatch;
@@ -30,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use self::bounds::{ClusterDigest, ClusterPool, GatewayAcceptProtocol, GatewayColonyProtocol, GatewayRuntimeCtx};
 use self::freshness::GatewayReplayGuard;
 use self::heartbeat::HiveBeat;
+use crate::colony::cluster::peer::WireHopBudget;
 use crate::colony::cluster::{
 	Cluster, ClusterConfig, ClusterError, ClusterHeartbeat, HeartbeatConfig, HiveRegistry, HopBudget, PeerRouteInfo,
 	ServletRegistry, SharedId,
@@ -126,12 +128,12 @@ fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
 ///
 /// # Edge accept plane
 ///
-/// `E` defaults to `P`, so a gateway without an edge declaration uses a
-/// single accept plane. When [`ClusterConfig::edge_bind_addr`] is set, the
-/// gateway binds a second listener over `E` with the same TLS material.
-/// Edge connections share the colony mux service but dispatch on the
-/// edge plane, which admits `Work` frames only. Hives and peers keep
-/// using the colony plane at [`Cluster::addr`].
+/// - `E` defaults to `P`, so a gateway without an edge declaration uses a single accept plane.
+/// - When [`ClusterConfig::edge_bind_addr`] is set, the gateway binds a second listener over `E`
+///   with the same TLS material.
+/// - Edge connections share the colony mux service but dispatch on the edge plane, which admits
+///   `Work` frames only.
+/// - Hives and peers keep using the colony plane at [`Cluster::addr`].
 pub struct ClusterGateway<P, D = Sha3_256, E = P>
 where
 	P: Protocol,
@@ -195,7 +197,7 @@ where
 		// config is wrapped in Arc, which fixes the window for its lifetime.
 		let config = {
 			let mut config = config;
-			let retention = Duration::from_millis(config.gossip.journal.retention_ms());
+			let retention = config.gossip.journal.retention();
 			if config.gossip.seen_ttl > retention {
 				config.gossip.seen_ttl = retention;
 			}
@@ -219,17 +221,18 @@ where
 			.await
 			.map_err(protocol_error)?;
 
+		let control_window = config.control_freshness_window;
 		let registry = Arc::new(HiveRegistry::new(config.heartbeat.timeout));
-		let servlet_registry = Arc::new(
-			ServletRegistry::new(config.pheromone.clone())
-				.with_ad_tombstone_window_ms(config.control_freshness_window_ms),
-		);
+		let routes = ServletRegistry::new(config.pheromone.clone())
+			.with_ad_tombstone_window(control_window)
+			.with_clock(Arc::clone(&config.clock));
 
+		let servlet_registry = Arc::new(routes);
 		let pools = config.pool_config.build_cluster_pools::<P>(&config.tls)?;
 		let pool = pools.hive;
 		let peer_pool = pools.peer;
 
-		let replay_guard_for_server = GatewayReplayGuard::new(config.control_freshness_window_ms);
+		let replay_guard_for_server = GatewayReplayGuard::new(control_window, Arc::clone(&config.clock));
 		let tasks = TaskGroup::default();
 		let ctx = GatewayRuntimeCtx {
 			registry: Arc::clone(&registry),
@@ -520,7 +523,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	/// 3. Derive `relayed` from [`HopBudget::is_relayed`].
 	/// 4. [`ClusterConfig::evaluate_export_gates`] on that target and session.
 	///
-	/// An unrouted open names no servlet type, so it fails with `Unimplemented`.
+	/// An unrouted open names no servlet type, so it fails with
+	/// `Unimplemented`.
 	fn guard_stream_open(&self, cx: &CallContext) -> Result<(Urn<'static>, HopBudget), TightBeamError> {
 		let gate_status = self.config.evaluate_gates(None, cx.session(), &self.trace)?;
 		if gate_status != TransitStatus::Ok {
@@ -531,7 +535,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return Err(unimplemented_error());
 		};
 
-		let budget = HopBudget::from_wire(cx.hops_remaining(), self.config.peer.max_hops);
+		let budget = HopBudget::from_wire(WireHopBudget::new(cx.hops_remaining()), self.config.peer.max_hops);
 		let is_relayed = budget.is_relayed();
 		let session = cx.session();
 		let export_status = self.config.evaluate_export_gates(&target, session, is_relayed, &self.trace)?;

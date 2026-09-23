@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use futures::channel::{mpsc, oneshot};
 
 use super::body::{BodyEvent, ForwardedStream};
-use super::flow::{cap_as_usize, chunk_records, payload_credits};
+use super::flow::{cap_as_usize, chunk_records, payload_credits, ChunkSize};
 use super::outbound::Outbound;
 use crate::transport::envelopes::{
 	CancelReason, GoAwayReason, MuxOpenPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
@@ -42,14 +42,13 @@ pub fn park_waker(waiters: &mut Vec<Waker>, cx: &Context<'_>) {
 	waiters.push(cx.waker().clone());
 }
 
-/// Identity of a locally-initiated stream whose ID is assigned at
-/// first send (atomic open): vacant until the Open record enqueues,
-/// the assigned ID afterwards. Stream IDs start at 1 (client) or 2
-/// (server), so zero unambiguously means "not opened yet".
+/// Identity of a locally-initiated stream whose ID is assigned at first send
+/// (atomic open).
 ///
-/// Shared between the parts that outlive the open (sinks, response
-/// futures, reply bodies, cancel guards) so each can act on the real
-/// ID once it exists and stand down when the open was refused.
+/// - It is vacant until the Open record enqueues, and holds the assigned ID afterwards. Stream IDs
+///   start at 1 (client) or 2 (server), so zero unambiguously means "not opened yet".
+/// - The parts that outlive the open (sinks, response futures, reply bodies, cancel guards) share
+///   it, so each can act on the real ID once it exists and stand down when the open was refused.
 pub struct OpenSlot(AtomicU32);
 
 impl OpenSlot {
@@ -77,12 +76,15 @@ impl OpenSlot {
 	}
 }
 
-/// A cap slot held for a stream that has not sent its Open record
-/// yet. The stream ID is assigned inside [`MuxShared::poll_open_enqueue`],
-/// in the same critical section that enqueues the Open, so Opens hit
-/// the wire in strictly increasing ID order
+/// A cap slot held for a stream that has not sent its Open record yet.
+///
+/// The stream ID is assigned inside [`MuxShared::poll_open_enqueue`], in the
+/// same critical section that enqueues the Open, so Opens hit the wire in
+/// strictly increasing ID order
 /// ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1))
 /// no matter how initiations interleave.
+///
+/// # Drop
 ///
 /// Dropping an unopened reservation releases the cap slot and resolves the
 /// response future as locally cancelled. Once opened, the pending table owns
@@ -193,9 +195,10 @@ pub enum PeerStream {
 /// Sender-side flow-control ledger for one stream direction (QUIC
 /// MAX_STREAM_DATA,
 /// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
-/// Requests and responses on the same stream stay distinct here: an
-/// endpoint sends request chunks only on IDs it allocated and response
-/// chunks only on IDs the peer allocated.
+///
+/// Requests and responses on the same stream stay distinct here: an endpoint
+/// sends request chunks only on IDs it allocated, and response chunks only on
+/// IDs the peer allocated.
 struct SendStream {
 	/// Chunks already permitted onto the outbound queue
 	sent: u64,
@@ -315,7 +318,7 @@ pub struct MuxShared {
 	/// Concurrent streams this endpoint admits from the peer.
 	pub local_cap: u32,
 	/// Largest chunk payload this endpoint may send (peer-advertised)
-	pub send_chunk_size: usize,
+	pub send_chunk_size: ChunkSize,
 	/// Bytes per session-budget credit (negotiated, both directions)
 	pub credit_unit: u32,
 	/// Initial per-stream chunk limit for outbound data
@@ -329,17 +332,17 @@ pub struct MuxShared {
 	/// (see [`crate::instrumentation::events`]).
 	#[cfg(feature = "instrument")]
 	pub trace: Option<TraceCollector>,
-	/// Reply forwarders for locally-initiated duplex streams,
-	/// registered by
-	/// [`MuxHandle::open_duplex`](super::handle::MuxHandle::open_duplex)
-	/// and driven by the reader (response chunks forward as they arrive)
-	/// reassembling).
+	/// Reply forwarders for locally-initiated duplex streams, registered by
+	/// [`MuxHandle::open_duplex`](super::handle::MuxHandle::open_duplex) and
+	/// driven by the reader, which forwards response chunks as they arrive
+	/// rather than reassembling them.
 	///
-	/// Forwarder registries partition by initiator: this map holds
-	/// only locally-initiated stream IDs, the reader's
-	/// `peer_bodies` only peer-initiated ones. Every teardown path
-	/// (cancel, GoAway, connection failure) must clear its side of
-	/// both registries.
+	/// # Partition
+	///
+	/// Forwarder registries partition by initiator: this map holds only
+	/// locally-initiated stream IDs, and the reader's `peer_bodies` only
+	/// peer-initiated ones. Every teardown path (cancel, GoAway, connection
+	/// failure) must clear its side of both registries.
 	duplex_recv: Mutex<HashMap<u32, ForwardedStream>>,
 	/// Credits reserved so owed traffic can flush during a budget
 	/// drain. See [`MuxSettings::send_budget_reserve`]
@@ -359,7 +362,7 @@ impl MuxShared {
 		Self {
 			role,
 			local_cap: settings.local_initiated_cap,
-			send_chunk_size: cap_as_usize(settings.send_chunk_size).max(1),
+			send_chunk_size: ChunkSize::new(cap_as_usize(settings.send_chunk_size)),
 			credit_unit: settings.credit_unit.max(1),
 			initial_send_credit: settings.initial_send_credit.max(1),
 			initial_recv_credit: settings.initial_recv_credit.max(1),
@@ -573,15 +576,18 @@ impl MuxShared {
 		Self::take_chunk_credit(&mut state, stream_id, cx)
 	}
 
-	/// Consume one unit of stream credit and enqueue the chunk's
-	/// envelope in one critical section, so no data envelope can
-	/// slip into the queue behind a rekey `RekeyAck` boundary
-	/// (strict park). The caller MUST have reserved queue
-	/// capacity via `poll_ready` on `outbound` first.
+	/// Consume one unit of stream credit and enqueue the chunk's envelope in
+	/// one critical section, so no data envelope can slip into the queue behind
+	/// a rekey `RekeyAck` boundary (strict park).
 	///
-	/// Chunks additionally park on the rekey hard floor: send
-	/// records at the drain headroom with a renewal in flight are
-	/// reserved for control and the exchange legs.
+	/// The caller MUST have reserved queue capacity via `poll_ready` on
+	/// `outbound` first.
+	///
+	/// # Rekey floor
+	///
+	/// Chunks also park on the rekey hard floor: send records at the drain
+	/// headroom with a renewal in flight are reserved for control and the
+	/// exchange legs.
 	pub fn poll_send_enqueue(
 		&self,
 		stream_id: u32,
@@ -910,11 +916,14 @@ impl MuxShared {
 		Ok(StreamReservation { shared: Arc::clone(self), sender: Some(sender), slot: OpenSlot::vacant() })
 	}
 
-	/// Atomic open: assign the next stream ID and enqueue the
-	/// stream's Open record in one critical section, so Opens hit
-	/// the wire in strictly increasing ID order no matter how
-	/// concurrent initiations interleave. The caller MUST have
-	/// reserved queue capacity via `poll_ready` on `outbound` first.
+	/// Atomic open: assign the next stream ID and enqueue the stream's Open
+	/// record in one critical section, so Opens hit the wire in strictly
+	/// increasing ID order no matter how concurrent initiations interleave.
+	///
+	/// The caller MUST have reserved queue capacity via `poll_ready` on
+	/// `outbound` first.
+	///
+	/// # Preconditions
 	///
 	/// Every precondition (rekey hard floor) is checked before the
 	/// ID is consumed, so a `Pending` leaves the ID and the wire slot
@@ -1104,8 +1113,7 @@ impl MuxShared {
 	}
 
 	/// Validate and record an incoming peer-initiated stream ID
-	/// ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1):
-	/// odd/even role match, nonzero, strictly increasing).
+	/// ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1): odd/even role match, nonzero, strictly increasing).
 	pub fn register_peer_stream(&self, stream_id: u32) -> TransportResult<PeerStream> {
 		let mut state = self.lock();
 		if !self.role.peer().initiates(stream_id) || stream_id <= state.last_peer_stream_id {

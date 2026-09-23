@@ -343,8 +343,8 @@ impl ServletRegistry {
 			return None;
 		}
 
-		// An out-of-range balancer answer degrades to `Unavailable`
-		// instead of panicking the request path (see [`ClusterConfig::pick_instance`]).
+		// An out-of-range balancer answer degrades to `Unavailable` instead of
+		// panicking the request path (see [`ClusterConfig::pick_instance`]).
 		let selected_entry = config.pick_instance(&entries)?;
 		Some(RouteChoice {
 			route_key: Arc::clone(selected_entry.route_key()),
@@ -394,6 +394,7 @@ impl ServletRegistry {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::colony::cluster::peer::WireHopBudget;
 	use crate::colony::cluster::{
 		PeerRoute, RelayRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 	};
@@ -570,17 +571,17 @@ mod tests {
 
 	#[test]
 	fn hop_budget_clamps_the_origin_sentinel_to_policy() {
-		assert_eq!(HopBudget::from_wire(DEFAULT_HOP_BUDGET, 1).wire(), 1);
+		assert_eq!(HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), 1).wire(), 1);
 	}
 
 	#[test]
 	fn hop_budget_honors_a_relayed_value_below_policy() {
-		assert_eq!(HopBudget::from_wire(1, 3).wire(), 1);
+		assert_eq!(HopBudget::from_wire(WireHopBudget::new(1), 3).wire(), 1);
 	}
 
 	#[test]
 	fn hop_budget_zero_policy_disables_forwarding() {
-		let budget = HopBudget::from_wire(DEFAULT_HOP_BUDGET, 0);
+		let budget = HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), 0);
 		assert_eq!(budget.wire(), 0);
 		assert!(!budget.allows_forward());
 	}
@@ -589,8 +590,8 @@ mod tests {
 	/// reached this gateway through a relay.
 	#[test]
 	fn an_origin_budget_reads_as_direct() {
-		assert!(!HopBudget::from_wire(DEFAULT_HOP_BUDGET, DEFAULT_HOP_BUDGET).is_relayed());
-		assert!(HopBudget::from_wire(2, 4).is_relayed());
+		assert!(!HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), DEFAULT_HOP_BUDGET).is_relayed());
+		assert!(HopBudget::from_wire(WireHopBudget::new(2), 4).is_relayed());
 	}
 
 	// The relayed fact comes from the wire count, not the clamped one.
@@ -598,15 +599,15 @@ mod tests {
 	// caller relayed and refuse it at the export boundary.
 	#[test]
 	fn a_clamped_origin_budget_still_reads_as_direct() {
-		assert!(!HopBudget::from_wire(DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS).is_relayed());
+		assert!(!HopBudget::from_wire(WireHopBudget::new(DEFAULT_HOP_BUDGET), DEFAULT_MAX_HOPS).is_relayed());
 	}
 
 	/// A relay trail spends one hop at the relay, so a shorter budget
 	/// could never select it.
 	#[test]
 	fn a_relay_trail_needs_two_forwards() {
-		assert!(!HopBudget::from_wire(1, 4).allows_relay_trail());
-		assert!(HopBudget::from_wire(2, 4).allows_relay_trail());
+		assert!(!HopBudget::from_wire(WireHopBudget::new(1), 4).allows_relay_trail());
+		assert!(HopBudget::from_wire(WireHopBudget::new(2), 4).allows_relay_trail());
 	}
 
 	#[test]

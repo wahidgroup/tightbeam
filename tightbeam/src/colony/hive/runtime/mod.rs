@@ -11,9 +11,9 @@ mod instances;
 mod lifecycle;
 mod scaling;
 
-pub use cluster_client::ClusterLink;
+pub(crate) use cluster_client::ClusterLink;
 pub use context::HiveContextImpl;
-pub use control::HiveControlCtx;
-pub use instances::HiveInstances;
+pub(crate) use control::HiveControlCtx;
+pub(crate) use instances::HiveInstances;
 pub use lifecycle::HiveRuntime;
-pub use scaling::ScalingLoop;
+pub(crate) use scaling::ScalingLoop;

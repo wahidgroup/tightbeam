@@ -12,7 +12,7 @@ use futures::future::{select, Either};
 use futures::{pin_mut, SinkExt, StreamExt};
 
 use super::body::{BodyEvent, DrainNote, ForwardedStream, StreamBody};
-use super::flow::{cap_as_usize, payload_credits, BufferedGrantor, CreditGrantor};
+use super::flow::{cap_as_usize, payload_credits, BufferedGrantor, ChunkSize, CreditGrantor};
 use super::link::MuxLink;
 use super::outbound::outbound_handle;
 use super::outbound::Outbound;
@@ -190,13 +190,14 @@ impl RecvStream {
 
 /// Reader driver: routes inbound envelopes off the read half.
 ///
-/// Responses resolve their pending stream (unknown IDs silently
-/// discarded: cancel/response races are benign). Requests flow to the
-/// [`crate::transport::multiplex::MuxResponder`]. Chunked payloads reassemble here, bounded by the
-/// credit this endpoint granted. The [`CreditGrantor`] decides when to
-/// raise a stream's limit. Protocol violations answer with a GoAway
-/// and fail the driver. Spawn [`MuxReaderDriver::drive`] on the
-/// caller's executor.
+/// Spawn [`MuxReaderDriver::drive`] on the caller's executor.
+///
+/// - Responses resolve their pending stream. Unknown IDs are discarded silently, because cancel and
+///   response races are benign.
+/// - Requests flow to the [`crate::transport::multiplex::MuxResponder`].
+/// - Chunked payloads reassemble here, bounded by the credit this endpoint granted. The
+///   [`CreditGrantor`] decides when to raise a stream's limit.
+/// - Protocol violations answer with a GoAway and fail the driver.
 pub struct MuxReaderDriver<R>
 where
 	R: EnvelopeSource,
@@ -206,14 +207,12 @@ where
 	inbound: mpsc::Sender<InboundEvent>,
 	outbound: mpsc::Sender<Outbound>,
 	grantor: Arc<dyn CreditGrantor>,
-	/// Concurrent peer-initiated streams accepted (locally advertised).
-	/// Bounds `peer_reassembly` so partial opens cannot hold state
-	/// beyond the cap
-	/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)
-	/// stream accounting).
+	/// Concurrent peer-initiated streams accepted (locally advertised). Bounds
+	/// `peer_reassembly` so partial opens cannot hold state beyond the cap
+	/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2) stream accounting).
 	peer_cap: u32,
 	/// Largest chunk payload accepted inbound (locally advertised)
-	recv_chunk_size: usize,
+	recv_chunk_size: ChunkSize,
 	/// Initial chunk limit granted to each inbound stream direction
 	initial_recv_credit: u64,
 	/// Credits the peer may still spend inbound. `None` = unmetered
@@ -341,7 +340,7 @@ where
 			outbound,
 			grantor: Arc::new(BufferedGrantor::default()),
 			peer_cap: settings.peer_initiated_cap,
-			recv_chunk_size: cap_as_usize(settings.recv_chunk_size).max(1),
+			recv_chunk_size: ChunkSize::new(cap_as_usize(settings.recv_chunk_size)),
 			initial_recv_credit: settings.initial_recv_credit.max(1),
 			recv_budget: settings.recv_budget,
 			reassembly_budget: Arc::new(ReassemblyBudget::default()),
@@ -435,8 +434,8 @@ where
 			MuxEnvelope::GoAway(package) => {
 				self.shared.fail_pending_above(package.last_stream_id(), package.reason());
 				self.shared.fail_duplex_above(package.last_stream_id());
-				// Responses to streams the peer will never answer
-				// are no longer coming: drop their partial buffers
+				// The peer will never answer these streams, so their partial
+				// response buffers are dropped.
 				self.local_reassembly.retain(|id, _| self.shared.is_pending(*id));
 				Ok(())
 			}
@@ -481,10 +480,12 @@ where
 	/// preserving the connection long enough for owed traffic and
 	/// the recorded evidence to survive the disagreement.
 	///
-	/// Runs on the read loop, so the GoAway buffers through
-	/// [`Self::queue_command`] rather than awaiting a full outbound
-	/// queue (RFC 9113 §5.2: reads must continue under write
-	/// backpressure or mutually saturated peers deadlock).
+	/// # Backpressure
+	///
+	/// This runs on the read loop, so the GoAway buffers through
+	/// [`Self::queue_command`] rather than awaiting a full outbound queue.
+	/// Reads must continue under write backpressure, or mutually saturated
+	/// peers deadlock (RFC 9113 §5.2).
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	fn drain_refused(&mut self, code: u32) -> TransportResult<()> {
 		#[cfg(feature = "instrument")]
@@ -667,7 +668,7 @@ where
 	/// violations: the sender knows the ceiling and its own grant.
 	fn charge_inbound_chunk(&mut self, payload: impl AsRef<[u8]>) -> TransportResult<()> {
 		let payload = payload.as_ref();
-		if payload.len() > self.recv_chunk_size {
+		if payload.len() > self.recv_chunk_size.get() {
 			return Err(self.protocol_violation());
 		}
 		let Some(balance) = self.recv_budget else {
@@ -714,16 +715,20 @@ where
 	}
 
 	/// Replenish a streaming stream's credit from consumer progress.
+	///
 	/// Whether this endpoint initiated the stream picks the ledger:
-	/// peer-initiated request bodies live in `peer_bodies`,
+	/// peer-initiated request bodies live in `peer_bodies`, and
 	/// locally-initiated duplex reply bodies in the shared duplex registry.
 	///
-	/// Grants clamp to `consumed + window` - the body channel's
-	/// absorption ceiling. Thus, no [`CreditGrantor`] implementation
-	/// can grant a conforming peer past the channel's capacity. The
-	/// clamp is also what bounds the unbounded drain-note channel:
-	/// notes only arise from chunks this grant ceiling admitted, so
-	/// outstanding notes never exceed the per-stream windows.
+	/// # Clamp
+	///
+	/// Grants clamp to `consumed + window`, the body channel's absorption
+	/// ceiling, so no [`CreditGrantor`] implementation can grant a conforming
+	/// peer past the channel's capacity.
+	///
+	/// The clamp also bounds the unbounded drain-note channel: notes only arise
+	/// from chunks this grant ceiling admitted, so outstanding notes never
+	/// exceed the per-stream windows.
 	fn grant_streaming(&mut self, note: DrainNote) -> TransportResult<()> {
 		let limits = if self.shared.role.initiates(note.stream_id) {
 			self.shared.duplex_limits(note.stream_id)
@@ -1107,12 +1112,11 @@ where
 	}
 
 	/// Forward one streaming request chunk into its body channel.
-	/// Overrunning the granted limit is a violation exactly as in
-	/// reassembly. A dropped body (refused at the cap or abandoned
-	/// by its handler) evicts the forwarder: the stream's remaining
-	/// flushes route through the tolerated refused-stream path
-	/// instead of being copied into a dead channel, and consumed
-	/// credit stays consumed (no refunds).
+	///
+	/// - Overrunning the granted limit is a violation exactly as in reassembly.
+	/// - A dropped body, refused at the cap or abandoned by its handler, evicts the forwarder. The
+	///   stream's remaining flushes then route through the tolerated refused-stream path instead of
+	///   being copied into a dead channel, and consumed credit stays consumed (no refunds).
 	fn forward_request_chunk(&mut self, package: &MuxDataPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
 		let Some(stream) = self.peer_bodies.get_mut(&stream_id) else {
@@ -1459,9 +1463,10 @@ mod tests {
 		Ok(())
 	}
 
-	// The h2 deadlock lesson ([RFC 9113 § 5.2.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2)): a full outbound
-	// queue must never park the read loop, or two mutually parked
-	// endpoints deadlock. Credit grants and ping acks buffer locally
+	// The h2 deadlock lesson
+	// ([RFC 9113 § 5.2.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2)):
+	// a full outbound queue must never park the read loop, or two mutually
+	// parked endpoints deadlock. Credit grants and ping acks buffer locally
 	// instead.
 	#[test]
 	fn test_reader_reads_while_outbound_queue_full() {

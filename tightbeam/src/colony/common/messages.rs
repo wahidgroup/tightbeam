@@ -7,6 +7,7 @@ use crate::asn1::Frame;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
+use crate::utils::time::UnixMillis;
 use crate::utils::urn::Urn;
 use crate::utils::{decode, encode, BasisPoints};
 use crate::wire::wire_sequence;
@@ -31,13 +32,12 @@ pub struct ClusterWorkRequest {
 	/// The relay budget, counting how many gateway forwards this work
 	/// may still spend.
 	///
-	/// A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel
-	/// ([`ClusterWorkRequest::new`]), which defers the budget to gateway
-	/// policy. Each gateway clamps the inbound value to its own `max_hops`,
-	/// so one clamp rule covers the origin sentinel and a relayed value.
-	///
-	/// A gateway that selects a peer route re-emits with the clamped budget
-	/// decremented ([`ClusterWorkRequest::into_relayed`]).
+	/// - A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel ([`ClusterWorkRequest::new`]),
+	///   which defers the budget to gateway policy.
+	/// - Each gateway clamps the inbound value to its own `max_hops`, so one clamp rule covers the
+	///   origin sentinel and a relayed value.
+	/// - A gateway that selects a peer route re-emits with the clamped budget decremented
+	///   ([`ClusterWorkRequest::into_relayed`]).
 	pub hops_remaining: u8,
 }
 
@@ -90,10 +90,10 @@ pub struct ClusterWorkResponse {
 	/// DER bytes of the servlet's complete response [`Frame`] on
 	/// success, absent on refusal.
 	///
-	/// Gateways return the servlet's reply frame unmodified, so its
-	/// signature and metadata stay verifiable at the client
-	/// ([`Frame::verify`]). Decode with
-	/// [`ClusterWorkResponse::into_frame`], or resolve success and
+	/// Gateways return the servlet's reply frame unmodified, so its signature
+	/// and metadata stay verifiable at the client ([`Frame::verify`]).
+	///
+	/// Decode with [`ClusterWorkResponse::into_frame`], or resolve success and
 	/// refusal in one step with [`ClusterWorkResponse::served`].
 	pub payload: Option<Vec<u8>>,
 }
@@ -214,7 +214,8 @@ wire_sequence!(RegisterHiveRequest { hive_addr: octets, servlet_addresses: plain
 pub struct RegisterHiveResponse {
 	/// The status of the registration request
 	pub status: TransitStatus,
-	/// Cluster-assigned hive identity URN (e.g., `urn:tightbeam::hive:10.0.0.5:9000`)
+	/// Cluster-assigned hive identity URN (e.g.,
+	/// `urn:tightbeam::hive:10.0.0.5:9000`)
 	pub hive_id: Option<Urn<'static>>,
 }
 
@@ -303,25 +304,31 @@ pub enum GossipRumorKind {
 
 /// The signed content of one gossip rumor, which is its opaque payload.
 ///
-/// This one structure serves both gossip roles. A publisher sends it as
-/// [`ClusterRequest::PublishGossip`] to request a flood. The accepting
-/// origin gateway then embeds the identical DER bytes as the `message` of
-/// a rumor [`Frame`] it signs with its cluster key, so the payload is
-/// bound under the origin signature at every later hop (see §5.7.5:
-/// the signature covers version, metadata, and message).
+/// # Roles
 ///
-/// The rumor names no destination. Flood scope is colony membership,
-/// carried in the origin certificate's colony URN SAN and never in rumor
-/// bytes, because unsigned scope bytes would be weaker than the
-/// certificate binding (CWE-345). Local delivery is receiving-gateway
-/// policy, the optional gossip ingress servlet type.
+/// This one structure serves both gossip roles:
 ///
-/// The rumor frame's `metadata.id` is the rumor identity and its
-/// `metadata.order` is the issue time in unix milliseconds (§5.7.1 permits
-/// a time-based order), both copied from the publish frame. Hop state such
-/// as the remaining flood radius MUST stay outside the rumor frame. It
-/// travels in the `metadata.lifetime` of the outer relay frame, which each
-/// relay rebuilds and re-signs.
+/// - A publisher sends it as [`ClusterRequest::PublishGossip`] to request a flood.
+/// - The accepting origin gateway embeds the identical DER bytes as the `message` of a rumor
+///   [`Frame`] it signs with its cluster key, so the payload is bound under the origin signature at
+///   every later hop (see §5.7.5: the signature covers version, metadata, and message).
+///
+/// # Scope
+///
+/// The rumor names no destination. Flood scope is colony membership, carried in
+/// the origin certificate's colony URN SAN and never in rumor bytes, because
+/// unsigned scope bytes would be weaker than the certificate binding (CWE-345).
+///
+/// Local delivery is receiving-gateway policy, the optional gossip ingress
+/// servlet type.
+///
+/// # Frame fields
+///
+/// - The rumor frame's `metadata.id` is the rumor identity, and its `metadata.order` is the issue
+///   time in unix milliseconds (§5.7.1 permits a time-based order). Both are copied from the
+///   publish frame.
+/// - Hop state such as the remaining flood radius MUST stay outside the rumor frame. It travels in
+///   the `metadata.lifetime` of the outer relay frame, which each relay rebuilds and re-signs.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipRumor {
 	/// Opaque application payload delivered through the ingress policy.
@@ -356,16 +363,17 @@ impl GossipRumor {
 /// Response to a gossip rumor
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct GossipResponse {
-	/// Status of the rumor (Ok = accepted, delivered, and considered for reflood)
+	/// Status of the rumor (Ok = accepted, delivered, and considered for
+	/// reflood)
 	pub status: TransitStatus,
 }
 
 /// Summary of rumors a gateway retains, sent so a peer can pull missing ones.
 ///
-/// This is the anti-entropy backstop to best-effort flooding.
-/// Reconciliation is a set difference over content digests.
-/// There is no cursor or ordering.
-/// A receiver refuses a wrong-length entry rather than treating it as a digest (CWE-20).
+/// This is the anti-entropy backstop to best-effort flooding. Reconciliation is
+/// a set difference over content digests. There is no cursor or ordering. A
+/// receiver refuses a wrong-length entry rather than treating it as a digest
+/// (CWE-20).
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipReconciliation {
 	/// Content digests the sender currently retains.
@@ -376,12 +384,14 @@ wire_sequence!(GossipReconciliation { held: octets_seq });
 
 /// One peer shared over peer exchange, as an identity and where to dial it.
 ///
-/// A sharer only exchanges peers it verified itself, yet the entry is
-/// still an unverified hint to its receiver. Admission is bounded per
-/// address prefix, and only a probe dial whose handshake certificate
-/// proves the local colony makes the peer a dial target. The
-/// fingerprint is advisory identity for deduplication, and trust never
-/// derives from exchanged bytes (CWE-345).
+/// A sharer only exchanges peers it verified itself, yet the entry is still an
+/// unverified hint to its receiver:
+///
+/// - Admission is bounded per address prefix.
+/// - Only a probe dial whose handshake certificate proves the local colony makes the peer a dial
+///   target.
+/// - The fingerprint is advisory identity for deduplication, and trust never derives from exchanged
+///   bytes (CWE-345).
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerGossip {
 	/// Certificate fingerprint the sharer verified the peer under.
@@ -617,7 +627,8 @@ pub struct SpawnServletResult {
 	pub status: TransitStatus,
 	/// The address of the newly spawned servlet (if successful)
 	pub servlet_address: Option<Vec<u8>>,
-	/// Instance URN of the spawned servlet (e.g., `urn:tightbeam::servlet:worker/127.0.0.1:8080`)
+	/// Instance URN of the spawned servlet (e.g.,
+	/// `urn:tightbeam::servlet:worker/127.0.0.1:8080`)
 	pub servlet_id: Option<Urn<'static>>,
 }
 
@@ -696,7 +707,8 @@ impl HiveManagementResponse {
 /// Status reported by the cluster in a heartbeat.
 ///
 /// Clusters report their current operational status to hives during heartbeat.
-/// Hives may use this to adjust their behavior (e.g., reduce capacity during draining).
+/// Hives may use this to adjust their behavior (e.g., reduce capacity during
+/// draining).
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ClusterStatus {
@@ -711,16 +723,17 @@ pub enum ClusterStatus {
 	Draining = 3,
 }
 
-/// Cluster command message - ASN.1 CHOICE
+/// Cluster command message, an ASN.1 CHOICE.
 ///
-/// Commands from cluster to hive. Uses context-specific tags for
-/// CHOICE discrimination. Only one field should be set per message.
+/// It carries commands from the cluster to a hive. Context-specific tags
+/// discriminate the CHOICE, and exactly one field is set per message.
 ///
-/// **Security**: Requires nonrepudiation signature and frame integrity.
-/// Frames without proper authentication will be rejected and may trigger
-/// the circuit breaker. Freshness binds to `Frame.metadata.order` (unix
-/// milliseconds), so hives reject commands outside their freshness window
-/// and replays of already-seen signatures within it (CWE-294).
+/// # Security
+///
+/// - A command requires a nonrepudiation signature and frame integrity. A frame without them is
+///   rejected and may trip the circuit breaker.
+/// - Freshness binds to `Frame.metadata.order` (unix milliseconds), so hives reject commands
+///   outside their freshness window and replays of already-seen signatures within it (CWE-294).
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 #[beam(frame_integrity)]
 pub struct ClusterCommand {
@@ -883,6 +896,24 @@ impl ClusterCommandResponse {
 	#[inline]
 	pub fn manage(response: HiveManagementResponse) -> Self {
 		Self { heartbeat: None, manage: Some(response) }
+	}
+}
+
+/// The issue time a colony frame states.
+///
+/// The frame layer leaves `metadata.order` protocol-opaque. Colony control
+/// frames, rumors and advertisements all put their issue time there as unix
+/// milliseconds (§5.7.1 permits a time-based order). This is the one place
+/// that reading is made, so every freshness and replay decision compares the
+/// same instant.
+pub(crate) trait IssuedAt {
+	/// The instant this frame says it was issued.
+	fn issued_at(&self) -> UnixMillis;
+}
+
+impl IssuedAt for Frame {
+	fn issued_at(&self) -> UnixMillis {
+		UnixMillis::new(self.metadata().order())
 	}
 }
 

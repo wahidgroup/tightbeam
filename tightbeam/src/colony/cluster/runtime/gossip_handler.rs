@@ -13,8 +13,8 @@ use crate::colony::cluster::{gossip_want, RouteKind};
 use crate::colony::cluster::{ClusterConfig, ClusterError, PeerCaps, ServletRegistry};
 use crate::colony::common::PeerGossip;
 use crate::colony::common::{
-	current_timestamp_ms, reply_frame, GossipReconciliation, GossipRumor, GossipRumorKind, GossipWant,
-	PeerAdvertisement, PeerAdvertisementResponse,
+	reply_frame, GossipReconciliation, GossipRumor, GossipRumorKind, GossipWant, PeerAdvertisement,
+	PeerAdvertisementResponse,
 };
 use crate::constants::MAX_PEX_SAMPLE;
 use crate::constants::{MAX_GOSSIP_LOG, MAX_GOSSIP_TTL};
@@ -49,7 +49,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return Refusal::to(&frame, &self.trace).peer_ad(freshness_status);
 		}
 
-		// `admit` binds signer fingerprint to dial address, so the pair holds together.
+		// `admit` binds signer fingerprint to dial address, so the pair holds
+		// together.
 		let admitted = match AdmittedPeerAd::admit(&verified, &advertisement, &self.config) {
 			Ok(admitted) => admitted,
 			Err(status) => {
@@ -126,7 +127,8 @@ where
 			}
 		};
 
-		// Outer `lifetime` is hop-authenticated. Missing TTL is relay misbehavior.
+		// Outer `lifetime` is hop-authenticated. Missing TTL is relay
+		// misbehavior.
 		let hop_ttl = match frame.metadata().lifetime() {
 			Some(hop_ttl) => hop_ttl,
 			None => {
@@ -135,7 +137,8 @@ where
 			}
 		};
 
-		// Origin signature on the peer trust plane. Unverifiable rumor scores the relay.
+		// Origin signature on the peer trust plane. Unverifiable rumor scores
+		// the relay.
 		let (origin_colony, rumor_signer) = match self.config.verify_peer(&rumor) {
 			Ok(verified) => {
 				let colony = self.config.namespace.cert_colony_urn(verified.signer_cert());
@@ -151,7 +154,8 @@ where
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		}
 
-		// Freshness uses rumor issue time in `admit` (seen-ttl), not the control window.
+		// Freshness uses rumor issue time in `admit` (seen-ttl), not the
+		// control window.
 		self.run::<D>(GossipOrigin::Relay, frame, rumor, hop_ttl, Some(relay_id), Some(rumor_signer))
 			.await
 	}
@@ -175,7 +179,8 @@ where
 		let radius_cap = u64::from(self.config.gossip.ttl.min(MAX_GOSSIP_TTL));
 		let hop_ttl = frame.metadata().lifetime().unwrap_or(radius_cap).min(radius_cap);
 
-		// Copy id/order from publish so replay remints an identical digest (CWE-294).
+		// Copy id/order from publish so replay remints an identical digest
+		// (CWE-294).
 		let peer_ad = matches!(body.kind, GossipRumorKind::PeerAdvertisement);
 		let rumor = FrameBuilder::from(Version::V2)
 			.with_id(frame.metadata().id())
@@ -293,7 +298,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		}
 
 		// A journal fault yields an empty want. Repair waits for a later beat.
-		let want = match self.config.gossip.journal.held_digests(current_timestamp_ms()) {
+		let want = match self.config.gossip.journal.held_digests(self.config.clock.unix()) {
 			Ok(held) => gossip_want(&reconciliation.held, &held),
 			Err(_) => Vec::new(),
 		};

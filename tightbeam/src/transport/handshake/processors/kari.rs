@@ -1,6 +1,7 @@
 //! KeyAgreeRecipientInfo recipient processor for TightBeam CMS handshake.
 //!
-//! Processes received KARI structures to extract the content-encryption key (CEK).
+//! Processes received KARI structures to extract the content-encryption key
+//! (CEK).
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -12,6 +13,7 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::kari::kari_unwrap;
+use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 
 /// Recipient-side processor for `KeyAgreeRecipientInfo`.
 ///
@@ -21,7 +23,8 @@ use crate::transport::handshake::kari::kari_unwrap;
 /// 3. Derive KEK using same KDF and UKM
 /// 4. Unwrap encrypted key to get CEK
 ///
-/// Generic over `P: CryptoProvider` which defines the complete cryptographic suite.
+/// Generic over `P: CryptoProvider` which defines the complete cryptographic
+/// suite.
 pub struct TightBeamKariRecipient<P>
 where
 	P: CryptoProvider,
@@ -40,26 +43,17 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	FieldBytesSize<P::Curve>: ModulusSize,
 {
-	/// Create a new KARI recipient processor.
-	///
-	/// Uses default TightBeam KDF info string (`TIGHTBEAM_KARI_KDF_INFO`).
-	///
-	/// # Parameters
-	/// - `provider`: The cryptographic provider defining the security profile
-	/// - `recipient_priv`: Recipient's private key for ECDH
+	/// Create a KARI recipient processor that uses `recipient_priv` for the
+	/// ECDH and the default `TIGHTBEAM_KARI_KDF_INFO` label.
 	pub fn new(provider: P, recipient_priv: SecretKey<P::Curve>) -> Self {
 		Self::with_kdf_info(provider, recipient_priv, TIGHTBEAM_KARI_KDF_INFO)
 	}
 
-	/// Create a new KARI recipient processor with custom KDF info.
+	/// Create a KARI recipient processor with a custom KDF label.
 	///
-	/// This allows interoperability with senders using different KDF parameters
-	/// while maintaining the provider's KDF algorithm.
-	///
-	/// # Parameters
-	/// - `provider`: The cryptographic provider defining the security profile
-	/// - `recipient_priv`: Recipient's private key for ECDH
-	/// - `kdf_info`: Info string for HKDF (must match sender's)
+	/// `kdf_info` MUST match the sender's. A custom label interoperates with
+	/// senders that use other KDF parameters while the provider's KDF algorithm
+	/// stays fixed.
 	///
 	/// # Example
 	/// ```ignore
@@ -73,14 +67,10 @@ where
 		Self { recipient_priv, kdf_info, provider }
 	}
 
-	/// Process a KeyAgreeRecipientInfo to extract the CEK.
+	/// Process a KeyAgreeRecipientInfo and answer the unwrapped
+	/// content-encryption key (CEK).
 	///
-	/// # Parameters
-	/// - `kari`: The received KeyAgreeRecipientInfo structure
-	/// - `recipient_index`: Index of the recipient in recipient_enc_keys (usually 0)
-	///
-	/// # Returns
-	/// The unwrapped content-encryption key (CEK)
+	/// `recipient_index` selects the entry in `recipient_enc_keys`, usually 0.
 	pub fn process_kari(
 		&self,
 		kari: &KeyAgreeRecipientInfo,
@@ -94,15 +84,15 @@ where
 		// 2. Extract originator's public key
 		let originator_pub = self.extract_originator_public_key(kari)?;
 
-		// 3-6. Centralized unwrap (ECDH + HKDF + integrity re-wrap)
+		// 3-6. Unwrap through `kari_unwrap` (ECDH, HKDF and integrity re-wrap)
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let wrapped_key = kari.recipient_enc_keys[recipient_index].enc_key.as_bytes();
 		kari_unwrap(
 			&self.provider,
 			&self.recipient_priv,
 			&originator_pub,
-			ukm.as_bytes(),
-			self.kdf_info,
+			KdfSalt::new(ukm.as_bytes()),
+			KdfInfo::new(self.kdf_info),
 			wrapped_key,
 		)
 	}

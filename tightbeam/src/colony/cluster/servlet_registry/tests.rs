@@ -1,3 +1,5 @@
+use crate::tb_cases;
+use crate::utils::basis_points::BasisPointsOutOfRange;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -8,12 +10,9 @@ use super::{
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
 use crate::colony::cluster::PeerAddress;
 use crate::colony::common::ServletTypeKey;
-use crate::colony::common::{current_timestamp_ms, MAX_PHEROMONE};
+use crate::colony::common::MAX_PHEROMONE;
+use crate::utils::time::UnixMillis;
 use crate::utils::BasisPoints;
-
-// =========================================================================
-// Test Helpers
-// =========================================================================
 
 /// Create a test entry with specified pheromone and abandonment limit
 /// Read guard over the registry's routes, where the admission logic lives.
@@ -79,41 +78,37 @@ fn peer_entry_dial(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, di
 	)
 }
 
-// =========================================================================
-// ServletEntry Tests - Data-Driven
-// =========================================================================
-
-/// Test cases: (initial_pheromone, reinforce_amount, expected_result)
-const REINFORCE_CASES: &[(u64, u64, u64)] = &[
-	(5000, 1000, 6000),                  // normal add
-	(9500, 1000, MAX_PHEROMONE),         // caps at max
-	(0, 500, 500),                       // from zero
-	(MAX_PHEROMONE, 100, MAX_PHEROMONE), // already at max
-];
-
-#[test]
-fn entry_reinforce_pheromone() {
-	for &(initial, amount, expected) in REINFORCE_CASES {
+// Reinforcement adds to the level and stops at the ceiling.
+tb_cases! {
+	fn entry_reinforce_pheromone((initial, amount, expected): (u64, u64, u64)) {
 		let entry = test_entry(initial, 5);
 		entry.reinforce(amount);
+
 		assert_eq!(entry.pheromone_level(), expected);
+	}
+	cases {
+		normal_add => (5000, 1000, 6000),
+		caps_at_max => (9500, 1000, MAX_PHEROMONE),
+		from_zero => (0, 500, 500),
+		already_at_max => (MAX_PHEROMONE, 100, MAX_PHEROMONE),
 	}
 }
 
-/// Test cases: (initial_pheromone, decay_rate_bps, expected_result)
-const EVAPORATE_CASES: &[(u64, u16, u64)] = &[
-	(10000, 1000, 9000), // 10% decay
-	(5000, 2000, 4000),  // 20% decay
-	(100, 5000, 50),     // 50% decay
-	(0, 1000, 0),        // already zero
-];
-
-#[test]
-fn entry_evaporate_pheromone() {
-	for &(initial, rate, expected) in EVAPORATE_CASES {
+// Evaporation removes the configured share of the level.
+tb_cases! {
+	fn entry_evaporate_pheromone((initial, rate, expected): (u64, u16, u64)) -> Result<(), BasisPointsOutOfRange> {
 		let entry = test_entry(initial, 5);
-		entry.evaporate(BasisPoints::try_from(rate).expect("test rates are within 0-10000 basis points"));
+		entry.evaporate(BasisPoints::try_from(rate)?);
+
 		assert_eq!(entry.pheromone_level(), expected);
+
+		Ok(())
+	}
+	cases {
+		ten_percent => (10000, 1000, 9000),
+		twenty_percent => (5000, 2000, 4000),
+		half => (100, 5000, 50),
+		already_zero => (0, 1000, 0),
 	}
 }
 
@@ -149,10 +144,6 @@ fn entry_reinforce_resets_trials() {
 	entry.reinforce(100);
 	assert_eq!(entry.trial_count(), 0);
 }
-
-// =========================================================================
-// ServletRegistry Tests
-// =========================================================================
 
 #[test]
 fn entry_route_kind_defaults_local() {
@@ -438,7 +429,7 @@ fn admitted_with_order(
 		.expect("fixture dial addresses name sockets");
 
 	let slate: Vec<ServletEntry> = slate.into_iter().collect();
-	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial, slate, order }
+	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial, slate, order: UnixMillis::new(order) }
 }
 
 // Two advertisements for one bucket race. The order ledger and the
@@ -500,7 +491,11 @@ fn relay_trail(
 		DEFAULT_ABANDONMENT_LIMIT,
 	)];
 
-	RelayTrail { bucket: ServletEntry::relay_bucket(origin, relay), slate, order: 0 }
+	RelayTrail {
+		bucket: ServletEntry::relay_bucket(origin, relay),
+		slate,
+		order: UnixMillis::new(0),
+	}
 }
 
 // The relay bucket lives independently of the origin's direct slate:
@@ -607,11 +602,11 @@ fn stale_ad_order_is_refused_per_bucket() {
 	assert!(matches!(refused, Err(ClusterError::StalePeerAd)));
 
 	let mut trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9001");
-	trail.order = 20;
+	trail.order = UnixMillis::new(20);
 	assert!(matches!(registry.reconcile_relay_trail(trail, PeerCaps::default()), Ok(())));
 
 	let mut replayed_trail = relay_trail(b"origin", b"relay", b"calc", b"127.0.0.1:9666");
-	replayed_trail.order = 10;
+	replayed_trail.order = UnixMillis::new(10);
 
 	let refused_trail = registry.reconcile_relay_trail(replayed_trail, PeerCaps::default());
 	assert!(matches!(refused_trail, Err(ClusterError::StalePeerAd)));
@@ -639,8 +634,8 @@ fn equal_ad_order_reconciles_idempotently() {
 fn withdrawal_tombstone_refuses_older_ad_reinstall() {
 	// The unbounded window pins the retain rule itself: the outcome
 	// must not depend on how much clock elapses between statements.
-	let registry = ServletRegistry::new(PheromoneConfig::default()).with_ad_tombstone_window_ms(u64::MAX);
-	let issued = current_timestamp_ms();
+	let registry = ServletRegistry::new(PheromoneConfig::default()).with_ad_tombstone_window(Duration::MAX);
+	let issued = UnixMillis::now().get();
 	let install = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], issued);
 	registry.reconcile_peer_slate(install, PeerCaps::default()).ok();
 
@@ -657,8 +652,8 @@ fn withdrawal_tombstone_refuses_older_ad_reinstall() {
 // bounded.
 #[test]
 fn expired_tombstone_prunes_from_the_ledger() {
-	let registry = ServletRegistry::new(PheromoneConfig::default()).with_ad_tombstone_window_ms(0);
-	let issued = current_timestamp_ms().saturating_sub(10);
+	let registry = ServletRegistry::new(PheromoneConfig::default()).with_ad_tombstone_window(Duration::ZERO);
+	let issued = UnixMillis::now().get().saturating_sub(10);
 	let install = admitted_with_order(b"origin", b"127.0.0.1:9000", vec![peer_entry(b"calc", b"origin")], issued);
 	registry.reconcile_peer_slate(install, PeerCaps::default()).ok();
 

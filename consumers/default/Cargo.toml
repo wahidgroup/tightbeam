@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-tightbeam = { package = "tightbeam-rs", path = "../tightbeam" }
+tightbeam = { package = "tightbeam-rs", path = "../../tightbeam" }
 
 [dev-dependencies]
 trybuild = { version = "=1.0.118", features = ["diff"] }

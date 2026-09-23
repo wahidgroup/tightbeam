@@ -245,10 +245,15 @@ async fn pooled_client(
 	addr: &<TokioListener as Protocol>::Address,
 ) -> Result<PooledClient<TokioListener>, TightBeamError> {
 	let offer = Arc::new(TransportOffer::mux(8));
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: Some(offer) };
+	let config = PoolConfig {
+		idle_timeout: None,
+		max_connections: 1,
+		mux_offer: Some(offer),
+		..PoolConfig::default()
+	};
+
 	let cert = CertificateSpec::Built(Box::new(identity.cert.as_ref().clone()));
 	let key = Arc::new(Secp256k1KeyProvider::from(identity.key.to_owned()));
-
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)

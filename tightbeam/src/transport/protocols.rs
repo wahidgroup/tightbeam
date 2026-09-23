@@ -19,7 +19,7 @@ use crate::utils::marker::MaybeSend;
 #[cfg(all(feature = "x509", feature = "instrument"))]
 use crate::trace::TraceCollector;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
-use crate::transport::framing::{FrameHeader, LengthForm};
+use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 use crate::transport::TransportResult;
 
@@ -227,11 +227,11 @@ pub trait AsyncByteWrite: MaybeSend + Unpin {
 
 /// Full-duplex async byte-level transport.
 ///
-/// Byte-oriented transports implement this (plus the half traits) and
-/// receive the frame-oriented traits through the blanket impls below;
-/// message-delimited transports implement [`AsyncProtocolStream`]
-/// directly instead. Trait coherence makes the two paths mutually
-/// exclusive, so a byte transport cannot supply its own framing.
+/// Byte-oriented transports implement this, plus the half traits, and receive
+/// the frame-oriented traits through the blanket impls below. Message-delimited
+/// transports implement [`AsyncProtocolStream`] directly instead. Trait
+/// coherence makes the two paths mutually exclusive, so a byte transport cannot
+/// supply its own framing.
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub trait AsyncByteStream: AsyncByteRead + AsyncByteWrite {
 	/// Report whether the underlying transport still appears connected.
@@ -283,8 +283,8 @@ async fn read_der_frame<R>(stream: &mut R, cap: usize) -> TransportResult<Vec<u8
 where
 	R: AsyncByteRead + ?Sized,
 {
-	// EOF before the tag is the peer closing between frames; EOF anywhere
-	// after it is a truncated frame.
+	// EOF before the tag is the peer closing between frames. EOF anywhere after
+	// it is a truncated frame.
 	let mut tag = [0u8; 1];
 	stream.read_exact(&mut tag).await.map_err(|e| (e.into()).at_frame_boundary())?;
 
@@ -311,7 +311,8 @@ where
 	// Refuse before allocating or reading the content (CWE-400). `content_len`
 	// exists only on an admitted header, so the buffer below cannot be sized
 	// by a length this cap has not seen.
-	let header = FrameHeader::parse(tag[0], length_first[0], length_octets)?.admit(cap)?;
+	let prefix = HeaderPrefix { tag: tag[0], length_first: length_first[0] };
+	let header = FrameHeader::parse(prefix, length_octets)?.admit(cap)?;
 
 	let mut content = vec![0u8; header.content_len()];
 	stream.read_exact(&mut content).await.map_err(|e| (e.into()).inside_frame())?;
@@ -347,10 +348,9 @@ mod tests {
 	use super::*;
 	use crate::transport::error::TransportFailure;
 
-	/// Byte-level fixture replaying a scripted wire image; implements
-	/// only the byte traits, so every frame below is recovered by the
-	/// blanket impls. Exhaustion surfaces as `UnexpectedEof`, matching
-	/// real byte transports.
+	/// Byte-level fixture that replays a scripted wire image. It implements
+	/// only the byte traits, so the blanket impls recover every frame below.
+	/// Exhaustion surfaces as `UnexpectedEof`, matching real byte transports.
 	struct ScriptedBytes {
 		data: Vec<u8>,
 		pos: usize,

@@ -22,13 +22,15 @@ enum SinkStream {
 	Opened(u32),
 }
 
-/// Producer half of a streamed request: pushes chunks on a
-/// locally-initiated stream, closed by flagging the final chunk
-/// `last` (see [`crate::transport::multiplex::MuxHandle::open_stream`] and [`crate::transport::multiplex::MuxHandle::open_duplex`]).
+/// Producer half of a streamed request: pushes chunks on a locally-initiated
+/// stream, closed by flagging the final chunk `last`.
 ///
-/// Pushes reach the wire eagerly, so a duplex conversation can await
-/// reply chunks between pushes. [`close_with`](RequestSink::close_with)
-/// carries a known final chunk on the `last` record for free.
+/// - Pushes reach the wire eagerly, so a duplex conversation can await reply chunks between pushes.
+/// - [`close_with`](RequestSink::close_with) carries a known final chunk on the `last` record for
+///   free.
+///
+/// See [`crate::transport::multiplex::MuxHandle::open_stream`] and
+/// [`crate::transport::multiplex::MuxHandle::open_duplex`].
 pub struct RequestSink {
 	stream: SinkStream,
 	kind: MuxStreamKind,
@@ -66,11 +68,10 @@ impl RequestSink {
 	/// Stream one request chunk to the peer, splitting to the peer's
 	/// advertised receive size. Empty pushes send nothing.
 	///
-	/// Chunks go out eagerly: on a duplex stream, awaiting reply
-	/// chunks between pushes (a chunk-for-chunk conversation) is
-	/// sound. The body still ends only at [`close`](Self::close) /
-	/// [`close_with`](Self::close_with), so a unary response cannot
-	/// resolve before the close.
+	/// - Chunks go out eagerly, so on a duplex stream, awaiting reply chunks between pushes (a
+	///   chunk-for-chunk conversation) is sound.
+	/// - The body still ends only at [`close`](Self::close) or [`close_with`](Self::close_with), so
+	///   a unary response cannot resolve before the close.
 	///
 	/// # Errors
 	/// - `OperationFailed(Cancelled)`: the stream resolved underneath the sink
@@ -150,7 +151,7 @@ impl RequestSink {
 			self.link.shared().add_send_records(stream_id, records);
 		}
 
-		let chunk_size = self.link.shared().send_chunk_size;
+		let chunk_size = self.link.shared().send_chunk_size.get();
 		let mut chunks = payload.chunks(chunk_size).peekable();
 		while let Some(chunk) = chunks.next() {
 			let last = closes && chunks.peek().is_none();
@@ -253,7 +254,7 @@ impl ReplySink {
 			return Ok(());
 		}
 
-		let chunk_size = self.link.shared().send_chunk_size;
+		let chunk_size = self.link.shared().send_chunk_size.get();
 		// Reply pushes draw on the reserve like reassembled
 		// responses: owed traffic must flush through a drain
 		let standing = self.link.shared().debit_push(self.stream_id, payload.len(), true).await?;

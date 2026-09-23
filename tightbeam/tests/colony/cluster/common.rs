@@ -35,6 +35,7 @@
 //!   itself, because its pre-spent hop budget is the wire shape under
 //!   test.
 
+pub use crate::common::poll::poll_until;
 use crate::common::security::expectation_failure;
 use tightbeam::{cluster, compose, hive, servlet};
 
@@ -57,9 +58,8 @@ pub use tightbeam::{
 			LocalClaim, MemoryGossipJournal, PeerAddress, PeerHint, PeerTable, TokenBucketAdmission,
 		},
 		common::{
-			current_timestamp_ms, ColonyNamespace, GossipReconciliation, GossipResponse, GossipRumor, GossipWant,
-			InstanceMetrics, LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin, ServletTypeKey,
-			StochasticForager,
+			ColonyNamespace, GossipReconciliation, GossipResponse, GossipRumor, GossipWant, InstanceMetrics,
+			LoadBalancer, PeerAdvertisement, PeerAdvertisementResponse, RoundRobin, ServletTypeKey, StochasticForager,
 		},
 		hive::{
 			Hive, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
@@ -92,6 +92,7 @@ pub use tightbeam::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 		ConnectionPool, GenericClient, PoolConfig,
 	},
+	utils::time::{Clock, ManualClock, UnixMillis},
 	utils::urn::Urn,
 	Beamable, Frame, TightBeamError, Version,
 };
@@ -143,14 +144,13 @@ pub fn member_identity(cn: impl AsRef<str>) -> (Certificate, Secp256k1SigningKey
 /// Deterministic hive-plane identity, disjoint from the shared gateway
 /// identity.
 ///
-/// The hive plane refuses a signer that `peer_trust` also holds (peer
-/// membership wins). Fixtures that put the shared gateway certificate in
-/// `peer_trust` for relay verification therefore register hives and sign
-/// origin publishes with this identity instead. The fixed scalar keeps
-/// the identity stable across closures, like [`cluster_certs`].
+/// The hive plane refuses a signer that `peer_trust` also holds, because peer
+/// membership wins. Fixtures that put the shared gateway certificate in
+/// `peer_trust` for relay verification therefore register hives and sign origin
+/// publishes with this identity instead.
 ///
-/// The bundled trust store covers the shared gateway identity so the
-/// hive can dial its gateway.
+/// - The fixed scalar keeps the identity stable across closures, like [`cluster_certs`].
+/// - The bundled trust store covers the shared gateway identity, so the hive can dial its gateway.
 pub fn hive_plane_certs() -> Arc<ClusterTestCerts> {
 	use tightbeam::testing::fixtures::TestCertificate;
 
@@ -165,10 +165,10 @@ pub fn hive_plane_certs() -> Arc<ClusterTestCerts> {
 
 /// Gateway hive trust for shared [`cluster_certs`] fixtures.
 ///
-/// Combines the gateway identity (hive-pool dials between gateways) with
-/// the hive-plane identity (registration, address updates, and origin
-/// publishes). Do not pass a [`member_identity`] gateway here; federation
-/// and organization scenarios exclude self from `peer_trust` instead.
+/// Combines the gateway identity (hive-pool dials between gateways) with the
+/// hive-plane identity (registration, address updates, and origin publishes).
+/// Do not pass a [`member_identity`] gateway here. Federation and organization
+/// scenarios exclude self from `peer_trust` instead.
 pub fn split_hive_trust(gateway: &ClusterTestCerts) -> Arc<dyn CertificateTrust> {
 	combined_trust(&[&gateway.cert, &hive_plane_certs().cert])
 }
@@ -316,7 +316,7 @@ pub async fn signed_publish_gossip(
 	let unsigned = Version::V2
 		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_lifetime(hop_ttl)
 		.with_message(ClusterRequest::PublishGossip(body))
 		.build()?;
@@ -347,7 +347,7 @@ pub async fn signed_control_frame_with(
 	request: ClusterRequest,
 ) -> Result<Frame, TightBeamError> {
 	let id = id.as_ref();
-	signed_control_frame_with_order(key, id, request, current_timestamp_ms()).await
+	signed_control_frame_with_order(key, id, request, UnixMillis::now().get()).await
 }
 
 pub async fn signed_control_frame(
@@ -440,45 +440,22 @@ pub async fn wait_for_peer_types(
 	attempts: u32,
 	interval: Duration,
 ) -> Vec<tightbeam::colony::cluster::SharedId> {
-	for _ in 0..attempts {
-		let types = cluster.peer_servlets();
-		if !types.is_empty() {
-			return types;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
+	poll_until(attempts, interval, || !cluster.peer_servlets().is_empty()).await;
 
 	cluster.peer_servlets()
 }
 
 /// Poll until the gateway exposes no live peer routes or attempts exhaust.
+///
 /// Abandonment happens on the advertise beat's cadence, so it is only
-/// observable by polling. Branching lives here, not in scenarios.
+/// observable by polling.
 pub async fn wait_for_no_peer_routes(cluster: &ClusterGateway, attempts: u32, interval: Duration) -> bool {
-	for _ in 0..attempts {
-		if cluster.peer_routes().is_empty() {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	cluster.peer_routes().is_empty()
+	poll_until(attempts, interval, || cluster.peer_routes().is_empty()).await
 }
 
-/// Poll until the registry is empty or attempts exhaust. Branching lives here, not in scenarios.
+/// Poll until the registry is empty or attempts exhaust.
 pub async fn wait_for_empty_registry(cluster: &ClusterGateway, attempts: u32, interval: Duration) -> bool {
-	for _ in 0..attempts {
-		let empty = cluster.hive_count() == 0;
-		if empty {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	cluster.hive_count() == 0
+	poll_until(attempts, interval, || cluster.hive_count() == 0).await
 }
 
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -602,7 +579,7 @@ pub async fn signed_work_frame(key: &Secp256k1SigningKey, id: impl AsRef<[u8]>) 
 	let unsigned = Version::V1
 		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_message(PingRequest { value: 21 })
 		.build()?;
 

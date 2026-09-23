@@ -54,7 +54,7 @@ pub use gossip::{
 	gossip_fresh, gossip_want, wanted_digests, Admission, AdmittedGossip, GossipAdmission, GossipConfig, GossipDigest,
 	GossipJournal, LocalClaim, LocalClaimGuard, MemoryGossipJournal, TokenBucketAdmission,
 };
-pub use peer::{AdmittedPeerAd, HopBudget, RelayTrail};
+pub use peer::{AdmittedPeerAd, HopBudget, RelayTrail, WireHopBudget};
 pub use peer_table::{AddressGroup, MemoryPeerStore, PeerAddress, PeerHint, PeerRecord, PeerStore, PeerTable};
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use runtime::ClusterGateway;
@@ -77,14 +77,11 @@ use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
 use crate::transport::state::ClientIdentity;
 use crate::transport::{Protocol, TightBeamAddress};
+use crate::utils::time::Clock;
 use crate::utils::urn::Urn;
 use crate::TightBeamError;
 
 use super::common::{ColonyNamespace, ColonyResource, InstanceMetrics, LoadBalancer, ServletAddressUpdate};
-
-// =============================================================================
-// Configuration
-// =============================================================================
 
 pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
@@ -293,12 +290,11 @@ impl core::fmt::Debug for ClusterTlsConfig {
 pub struct PeerConfig {
 	/// Peer gateway addresses dialed to advertise exported types.
 	///
-	/// The dial list is not an identity gate. Partial or asymmetric
-	/// federation graphs are expected. An empty list disables outbound
-	/// advertisement.
-	///
-	/// The slate is never configured directly: each beat snapshots the
-	/// local servlet registry so peers learn types currently served.
+	/// - The dial list is not an identity gate, and partial or asymmetric federation graphs are
+	///   expected.
+	/// - An empty list disables outbound advertisement.
+	/// - The slate is never configured directly: each beat snapshots the local servlet registry, so
+	///   peers learn the types currently served.
 	///
 	/// Private because [`PeerConfig::table`] derives its anchor set from
 	/// this list at build. Set it with
@@ -309,10 +305,10 @@ pub struct PeerConfig {
 	pub advertise_interval: Option<Duration>,
 	/// Inbound peer ads may only claim dial addresses in this list.
 	///
-	/// Entries are parsed sockets, so one address spelled two ways is one
-	/// entry. `None` accepts any parseable socket. Peer-exchange hints pass
-	/// the same gate before the table learns them, so discovery never dials
-	/// an address outside the list.
+	/// - Entries are parsed sockets, so one address spelled two ways is one entry.
+	/// - `None` accepts any parseable socket.
+	/// - Peer-exchange hints pass the same gate before the table learns them, so discovery never
+	///   dials an address outside the list.
 	///
 	/// Private because the parse is the point. Set it with
 	/// [`ClusterConfigBuilder::with_peer_dial_allowlist`] and read it with
@@ -338,17 +334,14 @@ pub struct PeerConfig {
 	/// - `0` disables forwarding entirely.
 	/// - `2` enables relay-trail fallback.
 	pub max_hops: u8,
-	/// Advertisement-rumor refresh interval.
+	/// Advertisement-rumor refresh interval, as configured.
 	///
 	/// The beat floods the slate rumor when the slate or flood target set
 	/// changed, plus one refresh on this interval.
 	///
-	/// This is the configured interval. A refreshed rumor must still admit
-	/// as fresh, so the effective interval is this value clamped to
-	/// [`GossipConfig::seen_ttl`]. Private because the clamped value is the
-	/// one every caller wants: set it with
-	/// [`ClusterConfigBuilder::with_rumor_refresh`] and read it with
-	/// [`ClusterConfig::rumor_refresh`].
+	/// Private because the clamped value is the one every caller wants. Set it
+	/// with [`ClusterConfigBuilder::with_rumor_refresh`] and read the effective
+	/// interval with [`ClusterConfig::rumor_refresh`].
 	rumor_refresh: Duration,
 	/// Servlet types disclosed to and reachable by external peers.
 	///
@@ -405,7 +398,7 @@ impl PeerConfig {
 
 	/// Restrict claimed dial addresses to `allowlist`.
 	///
-	/// The builder is the configuration path;
+	/// The builder is the configuration path:
 	/// [`ClusterConfigBuilder::with_peer_dial_allowlist`] parses operator
 	/// strings into the set this takes. Tests that already hold parsed
 	/// addresses install them here.
@@ -480,10 +473,10 @@ pub struct ClusterConfig {
 	pub export_grants: Vec<Arc<dyn ExportGrant>>,
 	/// Outbound connection pool settings for hive and peer dials.
 	pub pool_config: PoolConfig,
-	/// Freshness window (ms) for signed hive control frames.
+	/// Freshness window for signed hive control frames.
 	///
 	/// Stale or replayed registration/update frames are rejected (CWE-294).
-	pub control_freshness_window_ms: u64,
+	pub control_freshness_window: Duration,
 	/// Gateway bind address via the protocol address `FromStr`.
 	///
 	/// `None` binds the protocol default. A stable address lets hives
@@ -501,11 +494,17 @@ pub struct ClusterConfig {
 	pub peer: PeerConfig,
 	/// Gossip freshness, origin TTL, ingress, journal, and admission.
 	pub gossip: GossipConfig,
+	/// The clock every freshness, replay, retention and lease decision on
+	/// this gateway reads. Defaults to
+	/// [`SystemClock`](crate::utils::time::SystemClock).
+	pub clock: Arc<dyn Clock>,
 	/// Colony URN from the gateway certificate URI SAN.
 	///
-	/// `None` means not a colony member: gossip publish/relay/reconcile
-	/// and peer ads are refused, and the advertise beat skips gossip
-	/// reconciliation. Work and hive registration never require membership.
+	/// `None` means the gateway is not a colony member:
+	///
+	/// - Gossip publish, relay and reconcile are refused, and so are peer ads.
+	/// - The advertise beat skips gossip reconciliation.
+	/// - Work and hive registration never require membership.
 	///
 	/// Private so membership cannot drift from the certificate.
 	/// [`ClusterConfig::bind_colony_membership`] derives it, last at
@@ -593,12 +592,17 @@ impl ClusterConfig {
 
 	/// Binds colony membership to the certificate this config now holds.
 	///
-	/// Unlike [`ClusterConfig::rumor_refresh`], which derives on read, this
-	/// one is cached: deriving it means decoding the certificate's URI SAN,
-	/// and every inbound gossip frame asks. It is bound again at startup
-	/// because the certificate and the namespace stay writable until the
-	/// gateway takes the config, and a value derived from an earlier
-	/// certificate would claim the wrong colony.
+	/// # Caching
+	///
+	/// Unlike [`ClusterConfig::rumor_refresh`], which derives on read, this one
+	/// is cached: deriving it means decoding the certificate's URI SAN, and
+	/// every inbound gossip frame asks.
+	///
+	/// # Rebinding at startup
+	///
+	/// The certificate and the namespace stay writable until the gateway takes
+	/// the config, so a value derived from an earlier certificate would claim
+	/// the wrong colony. Startup binds it again for that reason.
 	pub(crate) fn bind_colony_membership(&mut self) {
 		self.colony_urn = self.namespace.cert_colony_urn(self.tls.identity().certificate());
 	}
@@ -614,26 +618,19 @@ impl core::fmt::Debug for ClusterConfig {
 			.field("export_gates", &format!("[{} gates]", self.export_gates.len()))
 			.field("export_grants", &format!("[{} grants]", self.export_grants.len()))
 			.field("pool_config", &self.pool_config)
-			.field("control_freshness_window_ms", &self.control_freshness_window_ms)
+			.field("control_freshness_window", &self.control_freshness_window)
 			.field("bind_addr", &self.bind_addr)
 			.field("edge_bind_addr", &self.edge_bind_addr)
 			.field("peer", &self.peer)
 			.field("gossip", &self.gossip)
+			.field("clock", &self.clock)
 			.field("colony_urn", &self.colony_urn)
 			.field("tls", &self.tls)
 			.finish()
 	}
 }
 
-// =============================================================================
-// Work Request/Response Messages
-// =============================================================================
-
 pub use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
-
-// =============================================================================
-// Cluster Trait
-// =============================================================================
 
 /// Trait for cluster gateway implementations.
 ///
@@ -701,10 +698,6 @@ pub trait ClusterHeartbeat: Cluster {
 	) -> impl Future<Output = Result<super::common::HeartbeatResult, ClusterError>> + Send;
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -714,10 +707,6 @@ mod tests {
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::policy::TransitStatus;
 	use crate::testing::{TestCertificate, TestKey};
-
-	// =========================================================================
-	// Test Helpers
-	// =========================================================================
 
 	fn test_tls_config() -> ClusterTlsConfig {
 		let key: Secp256k1SigningKey = TestKey::signing();
@@ -764,10 +753,6 @@ mod tests {
 		request.metadata = Some(meta.to_vec());
 		request
 	}
-
-	// =========================================================================
-	// ClusterConfig Tests
-	// =========================================================================
 
 	#[test]
 	fn cluster_config_defaults() {
@@ -836,10 +821,6 @@ mod tests {
 		assert!(matches!(refusal, Err(ClusterError::InvalidPeerAddress)));
 	}
 
-	// =========================================================================
-	// ClusterWorkResponse Tests
-	// =========================================================================
-
 	#[test]
 	fn work_response_ok() {
 		let response = ClusterWorkResponse::ok(b"test".to_vec());
@@ -860,10 +841,6 @@ mod tests {
 		assert_eq!(response.status, TransitStatus::PermissionDenied);
 		assert!(response.payload.is_none());
 	}
-
-	// =========================================================================
-	// HiveRegistry Tests
-	// =========================================================================
 
 	#[test]
 	fn registry_register_and_lookup() -> Result<(), ClusterError> {

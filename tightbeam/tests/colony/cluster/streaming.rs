@@ -12,14 +12,17 @@ use tightbeam::{compose, servlet};
 use super::common::*;
 use crate::common::security::expectation_failure;
 
-/// Set by the duplex cancel probe so the cancel scenario can wait for
+/// Set by the duplex cancel probe, so the cancel scenario can wait for
 /// propagation deterministically instead of sleeping a fixed time.
 ///
-/// Shared by every scenario in this binary, yet only a genuine
-/// mid-stream abort can set it. A completing duplex handler disarms
-/// its probe before the responder sends the End trailer the client
-/// waits on. A new scenario that cancels this servlet MUST NOT run
-/// beside [`cluster_duplex_cancel_propagates_to_peer`].
+/// # Sharing
+///
+/// Every scenario in this binary shares it, yet only a genuine mid-stream abort
+/// can set it: a completing duplex handler disarms its probe before the
+/// responder sends the End trailer the client waits on.
+///
+/// A new scenario that cancels this servlet MUST NOT run beside
+/// [`cluster_duplex_cancel_propagates_to_peer`].
 static DUPLEX_CANCEL_SEEN: AtomicBool = AtomicBool::new(false);
 
 /// Observes a propagated cancel from inside the duplex servlet handler.
@@ -110,8 +113,8 @@ fn mux_advertising_conf(certs: &ClusterTestCerts, peer: impl Into<String>) -> Cl
 	with_mux_offer(advertising_cluster_conf(certs, peer))
 }
 
-/// Pooled mux lease against a gateway, for the routed stream entry
-/// points ([`PooledClient::open_stream_to`] / [`PooledClient::open_duplex_to`]).
+/// Pooled mux lease against a gateway, for the routed stream entry points
+/// ([`PooledClient::open_stream_to`] / [`PooledClient::open_duplex_to`]).
 pub async fn pooled_cluster_client(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
@@ -121,6 +124,7 @@ pub async fn pooled_cluster_client(
 		idle_timeout: None,
 		max_connections: 1,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
+		..PoolConfig::default()
 	};
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
@@ -153,18 +157,9 @@ async fn start_spliced_clusters(
 	Ok((importer, exporter))
 }
 
-/// Poll until the servlet-side cancel probe reports or attempts
-/// exhaust. Branching lives here, not in scenarios.
+/// Poll until the servlet-side cancel probe reports or attempts exhaust.
 async fn wait_for_cancel_probe(attempts: u32, interval: Duration) -> bool {
-	for _ in 0..attempts {
-		if DUPLEX_CANCEL_SEEN.load(Ordering::SeqCst) {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	DUPLEX_CANCEL_SEEN.load(Ordering::SeqCst)
+	poll_until(attempts, interval, || DUPLEX_CANCEL_SEEN.load(Ordering::SeqCst)).await
 }
 
 tb_assert_spec! {

@@ -1,6 +1,7 @@
 //! Common traits for handshake orchestrators.
 //!
-//! Provides shared functionality across CMS and ECIES client/server implementations:
+//! Provides shared functionality across CMS and ECIES client/server
+//! implementations:
 //! - Profile negotiation (server-side)
 //! - AEAD session key finalization (all orchestrators)
 //! - Alert attribute processing (all orchestrators)
@@ -22,6 +23,7 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	DefaultStrengthFloor, NegotiationError, ProfileStrengthPolicy, RunnableProfile, SecurityOffer,
 };
+use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use crate::ZeroizingBytes;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -41,9 +43,9 @@ use crate::transport::handshake::attributes::HandshakeAlertAttribute;
 ///   profile that meets the strength policy
 ///
 /// # Security
-/// Both modes filter profiles through [`ProfileStrengthPolicy`] before selection,
-/// so a weak profile left in `supported_profiles()` for compatibility cannot be
-/// negotiated (CWE-757 downgrade resistance).
+/// Both modes filter profiles through [`ProfileStrengthPolicy`] before
+/// selection, so a weak profile left in `supported_profiles()` for
+/// compatibility cannot be negotiated (CWE-757 downgrade resistance).
 pub trait HandshakeNegotiation<P>
 where
 	P: CryptoProvider,
@@ -53,7 +55,8 @@ where
 
 	/// Minimum-strength policy applied before selection.
 	///
-	/// Defaults to [`DefaultStrengthFloor`] (256-bit AEAD key, >= 256-bit digest).
+	/// Defaults to [`DefaultStrengthFloor`] (256-bit AEAD key, >= 256-bit
+	/// digest).
 	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
 		&DefaultStrengthFloor
 	}
@@ -112,7 +115,7 @@ pub struct EpochMaterials {
 	pub(crate) secret: ZeroizingBytes,
 	/// Epoch counter: 0 at handshake, incremented per rekey install.
 	pub(crate) epoch: u32,
-	/// Chained transcript hash; `hash_0` is the handshake transcript.
+	/// Chained transcript hash. `hash_0` is the handshake transcript.
 	pub(crate) transcript_hash: [u8; 32],
 }
 
@@ -147,13 +150,14 @@ impl fmt::Debug for EpochMaterials {
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn derive_epoch_materials<P>(
 	input_key: &[u8],
-	salt: &[u8],
+	salt: KdfSalt<'_>,
 	transcript_hash: [u8; 32],
 ) -> Result<EpochMaterials, HandshakeError>
 where
 	P: CryptoProvider,
 {
-	let secret = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_EPOCH_KDF_INFO, Some(salt), EPOCH_SECRET_SIZE)?;
+	let salt_bytes = salt.as_bytes();
+	let secret = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_EPOCH_KDF_INFO, Some(salt_bytes), EPOCH_SECRET_SIZE)?;
 	let materials = EpochMaterials { secret, epoch: 0, transcript_hash };
 	Ok(materials)
 }
@@ -182,7 +186,8 @@ where
 	/// Negotiated profile after offer/accept, if any.
 	fn selected_profile(&self) -> Option<RunnableProfile<P>>;
 
-	/// Derive directional AEAD ciphers from input key material and context salt.
+	/// Derive directional AEAD ciphers from input key material and context
+	/// salt.
 	///
 	/// # Salt contract
 	/// - **CMS**: transcript hash (32 bytes)
@@ -195,7 +200,7 @@ where
 	fn derive_directional_aead(
 		&self,
 		input_key: &[u8],
-		salt: &[u8],
+		salt: KdfSalt<'_>,
 	) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError>
 	where
 		P::AeadCipher: KeyInit,
@@ -217,18 +222,20 @@ where
 	/// Single derivation path shared by handshake finalization and epoch
 	/// rotation. The provider's cipher type fixes the key length, and the
 	/// salt floor applies at every derivation.
-	pub(crate) fn derive<P>(input_key: &[u8], salt: &[u8]) -> Result<Self, HandshakeError>
+	pub(crate) fn derive<P>(input_key: &[u8], salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider<AeadCipher = C>,
 	{
 		let key_size = <C as KeySizeUser>::key_size();
-		let salt_len = salt.len();
+		let salt_len = salt.as_bytes().len();
 		if salt_len < MIN_SALT_ENTROPY_BYTES {
 			return Err(HandshakeError::InsufficientSaltEntropy { actual: salt_len, minimum: MIN_SALT_ENTROPY_BYTES });
 		}
 
-		let client_to_server = derive_labeled_cipher::<P>(input_key, salt, TIGHTBEAM_C2S_KDF_INFO, key_size)?;
-		let server_to_client = derive_labeled_cipher::<P>(input_key, salt, TIGHTBEAM_S2C_KDF_INFO, key_size)?;
+		let c2s_label = KdfInfo::new(TIGHTBEAM_C2S_KDF_INFO);
+		let s2c_label = KdfInfo::new(TIGHTBEAM_S2C_KDF_INFO);
+		let client_to_server = derive_labeled_cipher::<P>(input_key, salt, c2s_label, key_size)?;
+		let server_to_client = derive_labeled_cipher::<P>(input_key, salt, s2c_label, key_size)?;
 		Ok(Self { client_to_server, server_to_client })
 	}
 }
@@ -236,15 +243,15 @@ where
 /// Derive one direction's cipher under the given KDF info label.
 fn derive_labeled_cipher<P>(
 	input_key: &[u8],
-	salt: &[u8],
-	info: &[u8],
+	salt: KdfSalt<'_>,
+	info: KdfInfo<'_>,
 	key_size: usize,
 ) -> Result<P::AeadCipher, HandshakeError>
 where
 	P: CryptoProvider,
 	P::AeadCipher: KeyInit,
 {
-	let key_bytes = P::Kdf::derive_dynamic_key(input_key, info, Some(salt), key_size)?;
+	let key_bytes = P::Kdf::derive_dynamic_key(input_key, info.as_bytes(), Some(salt.as_bytes()), key_size)?;
 	let cipher = P::AeadCipher::new_from_slice(&key_bytes[..])?;
 	Ok(cipher)
 }
@@ -391,7 +398,7 @@ mod tests {
 		input_key: &[u8],
 		salt: &[u8],
 	) -> Result<DirectionalCiphers<<DefaultCryptoProvider as AeadProvider>::AeadCipher>, HandshakeError> {
-		client.derive_directional_aead(input_key, salt)
+		client.derive_directional_aead(input_key, KdfSalt::new(salt))
 	}
 
 	#[test]
@@ -484,7 +491,7 @@ mod tests {
 		let salt = [0x99u8; 32];
 		let transcript = [0x07u8; 32];
 
-		let materials = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &salt, transcript)?;
+		let materials = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
 		assert_eq!(materials.epoch(), 0);
 		assert_eq!(materials.transcript_hash(), transcript);
 		assert_eq!(materials.secret.len(), EPOCH_SECRET_SIZE);
@@ -498,8 +505,8 @@ mod tests {
 		let salt = [0x99u8; 32];
 		let transcript = [0x07u8; 32];
 
-		let first = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &salt, transcript)?;
-		let second = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &salt, transcript)?;
+		let first = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
+		let second = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
 		assert_eq!(first.secret, second.secret);
 
 		Ok(())
@@ -513,9 +520,11 @@ mod tests {
 		let other_salt = [0x9Au8; 32];
 		let transcript = [0x07u8; 32];
 
-		let base = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &salt, transcript)?;
-		let keyed = derive_epoch_materials::<DefaultCryptoProvider>(&other_key, &salt, transcript)?;
-		let salted = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &other_salt, transcript)?;
+		let shared_salt = KdfSalt::new(&salt);
+		let changed_salt = KdfSalt::new(&other_salt);
+		let base = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, shared_salt, transcript)?;
+		let keyed = derive_epoch_materials::<DefaultCryptoProvider>(&other_key, shared_salt, transcript)?;
+		let salted = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, changed_salt, transcript)?;
 		assert_ne!(base.secret, keyed.secret);
 		assert_ne!(base.secret, salted.secret);
 

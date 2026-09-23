@@ -43,16 +43,13 @@ use super::{
 use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
 use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
+use crate::utils::time::{Clock, SystemClock};
 
 use crate::colony::cluster::{
 	ClusterError, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
 	PeerAddress, PeerStore, PeerTable, StaticExportList,
 };
 use crate::utils::urn::Urn;
-
-// ============================================================================
-// HeartbeatConfigBuilder
-// ============================================================================
 
 /// Builder for [`HeartbeatConfig`].
 pub struct HeartbeatConfigBuilder {
@@ -125,10 +122,6 @@ impl HeartbeatConfigBuilder {
 	}
 }
 
-// ============================================================================
-// ClusterConfigBuilder
-// ============================================================================
-
 /// Builder for [`ClusterConfig`].
 ///
 /// Start from TLS material via [`ClusterConfig::builder`], then chain
@@ -143,12 +136,13 @@ pub struct ClusterConfigBuilder {
 	export_gates: Vec<Arc<dyn ExportGate>>,
 	export_grants: Vec<Arc<dyn ExportGrant>>,
 	pool_config: PoolConfig,
-	control_freshness_window_ms: u64,
+	control_freshness_window: Duration,
 	bind_addr: Option<String>,
 	edge_bind_addr: Option<String>,
 	peer: PeerConfig,
 	peer_store: Arc<dyn PeerStore>,
 	gossip: GossipConfig,
+	clock: Arc<dyn Clock>,
 	tls: ClusterTlsConfig,
 }
 
@@ -164,12 +158,13 @@ impl ClusterConfig {
 			export_gates: Vec::new(),
 			export_grants: Vec::new(),
 			pool_config: PoolConfig::default(),
-			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
+			control_freshness_window: Duration::from_millis(crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS),
 			bind_addr: None,
 			edge_bind_addr: None,
 			peer: PeerConfig::default(),
 			peer_store: Arc::new(MemoryPeerStore),
 			gossip: GossipConfig::default(),
+			clock: Arc::new(SystemClock),
 			tls,
 		}
 	}
@@ -267,13 +262,11 @@ impl ClusterConfigBuilder {
 
 	/// Add a positive export grant for selected caller identities.
 	///
-	/// Grants compose as union with the exported list and the
-	/// first-party origin rule, so a grant may only widen access to the
-	/// granted target. Deny gates from
-	/// [`ClusterConfigBuilder::with_export_gate`] still override.
-	///
-	/// Grants do not advertise. A granted type stays off the slate and
-	/// the grantee learns its URN out of band.
+	/// - Grants compose as union with the exported list and the first-party origin rule, so a grant
+	///   only widens access to the granted target.
+	/// - Deny gates from [`ClusterConfigBuilder::with_export_gate`] still override.
+	/// - Grants do not advertise. A granted type stays off the slate, and the grantee learns its
+	///   URN out of band.
 	pub fn with_export_grant(mut self, grant: Arc<dyn ExportGrant>) -> Self {
 		self.export_grants.push(grant);
 		self
@@ -286,8 +279,8 @@ impl ClusterConfigBuilder {
 	}
 
 	/// Set the freshness window for signed hive control frames.
-	pub fn with_control_freshness_window_ms(mut self, window_ms: u64) -> Self {
-		self.control_freshness_window_ms = window_ms;
+	pub fn with_control_freshness_window(mut self, window: Duration) -> Self {
+		self.control_freshness_window = window;
 		self
 	}
 
@@ -303,11 +296,14 @@ impl ClusterConfigBuilder {
 	/// Bind a second accept plane for external clients on the edge
 	/// protocol declared by the `cluster!` macro.
 	///
-	/// The edge plane serves the same TLS material and gate policies as
-	/// the colony plane but admits `Work` frames only: registration,
-	/// updates, peer ads, and gossip are refused with `PermissionDenied`.
-	/// Use this to expose the gateway to a browser transport while the
-	/// colony keeps its internal protocol.
+	/// Use this to expose the gateway to a browser transport while the colony
+	/// keeps its internal protocol.
+	///
+	/// # Edge plane
+	///
+	/// - It serves the same TLS material and gate policies as the colony plane.
+	/// - It admits `Work` frames only. Registration, updates, peer ads, and gossip are refused with
+	///   `PermissionDenied`.
 	pub fn with_edge_bind_addr(mut self, addr: impl Into<String>) -> Self {
 		self.edge_bind_addr = Some(addr.into());
 		self
@@ -402,12 +398,8 @@ impl ClusterConfigBuilder {
 	///
 	/// The beat floods the slate rumor when the slate or flood target set
 	/// changed, plus one refresh on this interval.
-	///
-	/// This sets the configured interval. The effective one is
-	/// [`ClusterConfig::rumor_refresh`], which clamps it to
-	/// [`GossipConfig::seen_ttl`] on every read, because a refresh slower
-	/// than the freshness window would re-publish rumors that peers refuse
-	/// as stale.
+	/// [`ClusterConfig::rumor_refresh`] reads the effective interval, which it
+	/// clamps to the freshness window.
 	pub fn with_rumor_refresh(mut self, rumor_refresh: Duration) -> Self {
 		self.peer.rumor_refresh = rumor_refresh;
 		self
@@ -429,6 +421,12 @@ impl ClusterConfigBuilder {
 	/// Defaults to [`GossipConfig::default`].
 	pub fn with_gossip_config(mut self, config: GossipConfig) -> Self {
 		self.gossip = config;
+		self
+	}
+
+	/// Set the clock the gateway reads. Defaults to [`SystemClock`].
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
 		self
 	}
 
@@ -489,11 +487,12 @@ impl ClusterConfigBuilder {
 			export_gates: self.export_gates,
 			export_grants: self.export_grants,
 			pool_config: self.pool_config,
-			control_freshness_window_ms: self.control_freshness_window_ms,
+			control_freshness_window: self.control_freshness_window,
 			bind_addr: self.bind_addr,
 			edge_bind_addr: self.edge_bind_addr,
 			peer,
 			gossip: self.gossip,
+			clock: self.clock,
 			colony_urn: None,
 			tls: self.tls,
 		};

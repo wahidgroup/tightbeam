@@ -1,17 +1,19 @@
-//! Layer 2: CSP (Communicating Sequential Processes)
+//! Layer 2: CSP (Communicating Sequential Processes).
 //!
-//! Implementation of CSP-style process algebra for tightbeam testing.
+//! This module implements CSP-style process algebra for tightbeam testing. It
+//! follows Hoare's theory:
 //!
-//! Based on Hoare's Communicating Sequential Processes theory:
-//! - Processes communicate through events (message passing)
-//! - Observable events are visible; hidden events (τ) are internal
-//! - Nondeterministic choice allows multiple possible behaviors
-//! - Labeled Transition Systems (LTS) represent process behavior
+//! - Processes communicate through events (message passing).
+//! - Observable events are visible, and hidden events (τ) are internal.
+//! - Nondeterministic choice allows several possible behaviors.
+//! - Labeled Transition Systems (LTS) represent process behavior.
 //!
-//! Reference: C.A.R. Hoare, "Communicating Sequential Processes" (1978)
-//! <https://www.cs.cmu.edu/~crary/819-f09/Hoare78.pdf>
+//! Requires the `testing-csp` feature.
 //!
-//! Feature gated: requires `testing-csp`
+//! # Sources
+//!
+//! - C.A.R. Hoare, "Communicating Sequential Processes" (1978):
+//!   <https://www.cs.cmu.edu/~crary/819-f09/Hoare78.pdf>
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -108,7 +110,7 @@ impl<'a> Decode<'a> for Event {
 	}
 }
 
-/// CSP transition: state --\[event\]--> state
+/// A CSP transition: an event that takes one state to another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition {
 	pub from: State,
@@ -116,11 +118,12 @@ pub struct Transition {
 	pub to: State,
 }
 
-/// Transition relation mapping (state, event) -> target state(s)
-/// Supports nondeterminism (multiple targets per state+event)
+/// The transition relation, from a state and an event to its target states.
+///
+/// A state and event may have several targets, which is nondeterminism.
 #[derive(Debug, Clone)]
 pub struct TransitionRelation {
-	/// Maps (from_state, event) -> Vec<to_state>
+	/// Target states for each source state and event.
 	transitions: HashMap<(State, Event), Vec<State>>,
 }
 
@@ -129,17 +132,17 @@ impl TransitionRelation {
 		Self { transitions: HashMap::new() }
 	}
 
-	/// Add transition: from --\[event\]--> to
+	/// Add a transition that takes `from` to `to` on `event`.
 	pub fn add(&mut self, from: State, event: Event, to: State) {
 		self.transitions.entry((from, event)).or_default().push(to);
 	}
 
-	/// Get all target states: from --\[event\]--> ?
+	/// Every state that `event` takes `from` to.
 	pub fn targets(&self, from: State, event: &Event) -> Option<&[State]> {
 		self.transitions.get(&(from, *event)).map(|v| v.as_slice())
 	}
 
-	/// Check if nondeterministic: from --\[event\]--> {s1, s2, ...}
+	/// Whether `event` takes `from` to more than one state.
 	pub fn is_nondeterministic(&self, from: State, event: &Event) -> bool {
 		self.transitions.get(&(from, *event)).map(|v| v.len() > 1).unwrap_or(false)
 	}
@@ -159,7 +162,7 @@ impl Default for TransitionRelation {
 /// What a process is evidence of.
 ///
 /// The stable failures and failures-divergences models need the subject's
-/// refusals. A specification states them; a log does not.
+/// refusals, which a specification states and a log does not.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Observation {
 	/// A process written as a specification.
@@ -286,7 +289,7 @@ impl Process {
 		found
 	}
 
-	/// Execute transition: s --\[e\]--> ?
+	/// The states that `event` takes `state` to.
 	pub fn step(&self, state: State, event: &Event) -> Vec<State> {
 		self.transitions.targets(state, event).map(|v| v.to_vec()).unwrap_or_default()
 	}
@@ -330,13 +333,11 @@ impl Process {
 	/// Structural digest over the LTS: initial state, sorted states,
 	/// terminals, choice points, alphabets, and transition triples.
 	///
-	/// Two processes share a digest iff they have identical structure, so
-	/// it is a sound memoization key where `name` is not (algebra
-	/// operators such as `hide`/`rename` produce constant names for
-	/// structurally different results).
-	///
-	/// The digest is only stable within one program run (`DefaultHasher`
-	/// seeds vary across runs); do not persist it.
+	/// - Two processes share a digest iff they have identical structure, so it is a sound
+	///   memoization key where `name` is not. Algebra operators such as `hide` and `rename` produce
+	///   constant names for structurally different results.
+	/// - The digest is stable only within one program run, because `DefaultHasher` seeds vary
+	///   across runs. Do not persist it.
 	pub fn structure_digest(&self) -> u64 {
 		use core::hash::{Hash, Hasher};
 		use std::collections::hash_map::DefaultHasher;
@@ -409,16 +410,16 @@ pub trait ProcessSpec {
 }
 
 impl Process {
-	/// Validate a consumed trace against this CSP process
+	/// Validate a consumed trace against this CSP process.
 	///
-	/// A trace is a sequence over the observable alphabet, so each event is
-	/// matched there and τ transitions are taken silently by τ-closure first.
-	/// An event only enabled as hidden is [`CspViolation::EventNotEnabled`].
-	///
-	/// Candidate states are tracked as a set, so every branch of a
-	/// nondeterministic choice is followed at once. Multiple targets are legal
-	/// only at a state registered via [`ProcessBuilder::add_choice`];
-	/// elsewhere they are [`CspViolation::NondeterministicChoice`].
+	/// - A trace is a sequence over the observable alphabet, so each event is matched there, and τ
+	///   transitions are taken silently by τ-closure first. An event only enabled as hidden is
+	///   [`CspViolation::EventNotEnabled`].
+	/// - Candidate states are tracked as a set, so every branch of a nondeterministic choice is
+	///   followed at once.
+	/// - Multiple targets are legal only at a state registered through
+	///   [`ProcessBuilder::add_choice`]. Elsewhere they are
+	///   [`CspViolation::NondeterministicChoice`].
 	pub fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		let mut violations = Vec::new();
 		let mut current_states = vec![self.initial];
@@ -1067,7 +1068,8 @@ mod tests {
 		Ok(())
 	}
 
-	// Test CSP process spec integration with assert spec and ServiceClient environment
+	// Test CSP process spec integration with assert spec and ServiceClient
+	// environment
 	#[test]
 	fn test_csp_process_spec_structure() {
 		// Define CSP process using tb_process_spec! macro
@@ -1096,12 +1098,12 @@ mod tests {
 
 		let proc = ComprehensiveHandshake::process();
 
-		// ===== Test 1: Basic process properties =====
+		// 1. Basic process properties.
 		assert_eq!(proc.name, "ComprehensiveHandshake");
 		assert_eq!(proc.description, Some("Comprehensive handshake with queued or direct send"));
 		assert_eq!(proc.initial, State("S0"));
 
-		// ===== Test 2: State space =====
+		// 2. State space.
 		assert_eq!(proc.states.len(), 9); // S0, S1, S1s, S1e, S1q, S1d, S2, S3, S3f
 		assert!(proc.states.contains(&State("S0")));
 		assert!(proc.states.contains(&State("S1")));
@@ -1113,77 +1115,68 @@ mod tests {
 		assert!(proc.states.contains(&State("S3")));
 		assert!(proc.states.contains(&State("S3f")));
 
-		// ===== Test 3: Observable alphabet (Σ) =====
+		// 3. Observable alphabet (Σ).
 		assert_eq!(proc.observable_alphabet().len(), 4);
 		assert!(proc.observable_alphabet().contains(&Event("start")));
 		assert!(proc.observable_alphabet().contains(&Event("send")));
 		assert!(proc.observable_alphabet().contains(&Event("ack")));
 		assert!(proc.observable_alphabet().contains(&Event("fail")));
 
-		// ===== Test 4: Hidden alphabet (τ) =====
+		// 4. Hidden alphabet (τ).
 		assert_eq!(proc.hidden_alphabet().len(), 4);
 		assert!(proc.hidden_alphabet().contains(&Event("serialize")));
 		assert!(proc.hidden_alphabet().contains(&Event("encrypt")));
 		assert!(proc.hidden_alphabet().contains(&Event("queue")));
 		assert!(proc.hidden_alphabet().contains(&Event("dispatch")));
 
-		// ===== Test 5: Terminal states (STOP) =====
+		// 5. Terminal states (STOP).
 		assert_eq!(proc.terminal.len(), 2);
 		assert!(proc.is_terminal(State("S3"))); // Success terminal
 		assert!(proc.is_terminal(State("S3f"))); // Failure terminal
 
-		// ===== Test 6: Nondeterministic choice points (□) =====
+		// 6. Nondeterministic choice points (□).
 		assert_eq!(proc.choice.len(), 1);
 		assert!(proc.is_choice(State("S1"))); // S1 has choice: serialize OR queue
 
-		// ===== Test 7: Transition relation - observable transitions =====
-		// S0 --[start]--> S1
+		// 7. Transition relation: observable transitions.
 		let s0_start = proc.step(State("S0"), &Event("start"));
 		assert_eq!(s0_start.len(), 1);
 		assert_eq!(s0_start[0], State("S1"));
 
-		// S1e --[send]--> S2
 		let s1e_send = proc.step(State("S1e"), &Event("send"));
 		assert_eq!(s1e_send.len(), 1);
 		assert_eq!(s1e_send[0], State("S2"));
 
-		// S1d --[send]--> S2
 		let s1d_send = proc.step(State("S1d"), &Event("send"));
 		assert_eq!(s1d_send.len(), 1);
 		assert_eq!(s1d_send[0], State("S2"));
 
-		// S2 --[ack]--> S3
 		let s2_ack = proc.step(State("S2"), &Event("ack"));
 		assert_eq!(s2_ack.len(), 1);
 		assert_eq!(s2_ack[0], State("S3"));
 
-		// S2 --[fail]--> S3f
 		let s2_fail = proc.step(State("S2"), &Event("fail"));
 		assert_eq!(s2_fail.len(), 1);
 		assert_eq!(s2_fail[0], State("S3f"));
 
-		// ===== Test 8: Transition relation - hidden (τ) transitions =====
-		// S1 --[serialize]--> S1s (hidden)
+		// 8. Transition relation: hidden (τ) transitions.
 		let s1_serialize = proc.step(State("S1"), &Event("serialize"));
 		assert_eq!(s1_serialize.len(), 1);
 		assert_eq!(s1_serialize[0], State("S1s"));
 
-		// S1 --[queue]--> S1q (hidden, nondeterministic choice)
 		let s1_queue = proc.step(State("S1"), &Event("queue"));
 		assert_eq!(s1_queue.len(), 1);
 		assert_eq!(s1_queue[0], State("S1q"));
 
-		// S1s --[encrypt]--> S1e (hidden)
 		let s1s_encrypt = proc.step(State("S1s"), &Event("encrypt"));
 		assert_eq!(s1s_encrypt.len(), 1);
 		assert_eq!(s1s_encrypt[0], State("S1e"));
 
-		// S1q --[dispatch]--> S1d (hidden)
 		let s1q_dispatch = proc.step(State("S1q"), &Event("dispatch"));
 		assert_eq!(s1q_dispatch.len(), 1);
 		assert_eq!(s1q_dispatch[0], State("S1d"));
 
-		// ===== Test 9: Enabled actions at each state =====
+		// 9. Enabled actions at each state.
 		// S0: only "start" observable
 		let s0_enabled = proc.enabled(State("S0"));
 		assert_eq!(s0_enabled.len(), 1);
@@ -1205,81 +1198,66 @@ mod tests {
 		let s3_enabled = proc.enabled(State("S3"));
 		assert_eq!(s3_enabled.len(), 0);
 
-		// ===== Test 10: Trace execution - success path (direct) =====
+		// 10. Trace execution: success path (direct).
 		let mut current = proc.initial;
 
-		// S0 --[start]--> S1
 		current = proc.step(current, &Event("start"))[0];
 		assert_eq!(current, State("S1"));
-		assert!(proc.is_choice(current)); // Choice point
+		assert!(proc.is_choice(current));
 
-		// S1 --[serialize]--> S1s (direct path)
 		current = proc.step(current, &Event("serialize"))[0];
 		assert_eq!(current, State("S1s"));
 
-		// S1s --[encrypt]--> S1e
 		current = proc.step(current, &Event("encrypt"))[0];
 		assert_eq!(current, State("S1e"));
 
-		// S1e --[send]--> S2
 		current = proc.step(current, &Event("send"))[0];
 		assert_eq!(current, State("S2"));
 
-		// S2 --[ack]--> S3
-		current = proc.step(current, &Event("ack"))[0];
-		assert_eq!(current, State("S3"));
-		assert!(proc.is_terminal(current)); // Terminal state
-
-		// ===== Test 11: Trace execution - success path (queued) =====
-		let mut current = proc.initial;
-
-		// S0 --[start]--> S1
-		current = proc.step(current, &Event("start"))[0];
-		assert_eq!(current, State("S1"));
-
-		// S1 --[queue]--> S1q (queued path)
-		current = proc.step(current, &Event("queue"))[0];
-		assert_eq!(current, State("S1q"));
-
-		// S1q --[dispatch]--> S1d
-		current = proc.step(current, &Event("dispatch"))[0];
-		assert_eq!(current, State("S1d"));
-
-		// S1d --[send]--> S2
-		current = proc.step(current, &Event("send"))[0];
-		assert_eq!(current, State("S2"));
-
-		// S2 --[ack]--> S3
 		current = proc.step(current, &Event("ack"))[0];
 		assert_eq!(current, State("S3"));
 		assert!(proc.is_terminal(current));
 
-		// ===== Test 12: Trace execution - failure path =====
+		// 11. Trace execution: success path (queued).
 		let mut current = proc.initial;
 
-		// S0 --[start]--> S1
+		current = proc.step(current, &Event("start"))[0];
+		assert_eq!(current, State("S1"));
+
+		current = proc.step(current, &Event("queue"))[0];
+		assert_eq!(current, State("S1q"));
+
+		current = proc.step(current, &Event("dispatch"))[0];
+		assert_eq!(current, State("S1d"));
+
+		current = proc.step(current, &Event("send"))[0];
+		assert_eq!(current, State("S2"));
+
+		current = proc.step(current, &Event("ack"))[0];
+		assert_eq!(current, State("S3"));
+		assert!(proc.is_terminal(current));
+
+		// 12. Trace execution: failure path.
+		let mut current = proc.initial;
+
 		current = proc.step(current, &Event("start"))[0];
 
-		// S1 --[serialize]--> S1s
 		current = proc.step(current, &Event("serialize"))[0];
 
-		// S1s --[encrypt]--> S1e
 		current = proc.step(current, &Event("encrypt"))[0];
 
-		// S1e --[send]--> S2
 		current = proc.step(current, &Event("send"))[0];
 
-		// S2 --[fail]--> S3f (failure terminal)
 		current = proc.step(current, &Event("fail"))[0];
 		assert_eq!(current, State("S3f"));
-		assert!(proc.is_terminal(current)); // Terminal state
+		assert!(proc.is_terminal(current));
 
-		// ===== Test 13: Invalid transitions return empty =====
+		// 13. An invalid transition yields no successor states.
 		assert_eq!(proc.step(State("S0"), &Event("send")).len(), 0);
 		assert_eq!(proc.step(State("S1"), &Event("ack")).len(), 0);
 		assert_eq!(proc.step(State("S3"), &Event("start")).len(), 0); // Terminal has no transitions
 
-		// ===== Test 14: Observable vs Hidden classification =====
+		// 14. Each event classifies as observable or hidden.
 		for action in proc.enabled(State("S0")) {
 			if action.event.0 == "start" {
 				assert!(action.is_observable());

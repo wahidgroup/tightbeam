@@ -1,6 +1,6 @@
 //! In-band rekey exchange logic.
 //!
-//! Pure message-level build/verify for the three-leg renewal:
+//! Builds and verifies the messages of the three-leg renewal:
 //! - `RekeyRequest`
 //! - `RekeyResponse`
 //! - `RekeyAck`
@@ -15,10 +15,9 @@
 //!                                <----  RekeyDone
 //! ```
 //!
-//! Fresh keys per direction from the epoch KDF chain
-//! ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)
-//! with an explicit exchange); the prior epoch secret drops the
-//! moment the next one installs
+//! Each direction takes fresh keys from the epoch KDF chain
+//! ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3), with an explicit exchange).
+//! The prior epoch secret drops the moment the next one installs
 //! ([RFC 9846 § 7.2](https://datatracker.ietf.org/doc/html/rfc9846#section-7.2)).
 //!
 //! # Bindings
@@ -29,9 +28,8 @@
 //!   `hash_next = H(hash_prev || request_der || response_der || ack_der)`,
 //!   so every epoch receipt transitively commits to the whole session
 //!   history back to the handshake transcript.
-//! - Credit-match invariant: epoch receipt budgets and credit unit must
-//!   equal the initial receipt terms byte-for-byte; only the settlement
-//!   challenge may vary per epoch.
+//! - Credit-match invariant: epoch receipt budgets and credit unit MUST equal the initial receipt
+//!   terms byte for byte. Only the settlement challenge MAY vary per epoch.
 
 use std::sync::Arc;
 
@@ -48,7 +46,7 @@ use crate::der::Encode;
 use crate::random::generate_nonce;
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
 use crate::transport::handshake::negotiation::TransportAuthorizer;
-use crate::transport::handshake::primitives::kdf_chain;
+use crate::transport::handshake::primitives::{kdf_chain, KdfInfo, KdfSalt, KdfStage};
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::{
 	approve_or_fail_closed, record_receipt_outcome, sign_receipt, transcript_digest_info, verify_receipt_signer,
@@ -89,8 +87,8 @@ pub(crate) struct EpochInstall {
 	pub(crate) recv_cipher: RecvCipher,
 	/// The new epoch's dual-signed receipt.
 	pub(crate) receipt: StoredReceipt,
-	/// Epoch number the install activates. Read by unit tests; the
-	/// driver installs positionally at the wire boundary.
+	/// Epoch number the install activates. Unit tests read it, and the driver
+	/// installs positionally at the wire boundary.
 	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) epoch: u32,
 }
@@ -132,9 +130,12 @@ where
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 
-		let stage = (self.epoch.secret.as_slice(), TIGHTBEAM_EPOCH_KDF_INFO);
-		let next_secret = kdf_chain::<P>(&[stage], &salt)?;
-		let directional = DirectionalCiphers::derive::<P>(&next_secret, &salt)?;
+		let stage = KdfStage {
+			input: self.epoch.secret.as_slice(),
+			info: KdfInfo::new(TIGHTBEAM_EPOCH_KDF_INFO),
+		};
+		let next_secret = kdf_chain::<P>(&[stage], KdfSalt::new(&salt))?;
+		let directional = DirectionalCiphers::derive::<P>(&next_secret, KdfSalt::new(&salt))?;
 
 		let next_epoch = self.epoch.epoch.checked_add(1).ok_or(HandshakeError::IntegerOutOfRange)?;
 		self.epoch.secret = next_secret;
@@ -413,9 +414,9 @@ where
 		)
 		.await?;
 
-		// Dual ownership by design: this copy is DER-encoded onto the
-		// wire and dropped; the retained artifact absorbs the client
-		// SignerInfo at settlement.
+		// Two owners by design: this copy is DER-encoded onto the wire and
+		// dropped, and the retained artifact absorbs the client SignerInfo at
+		// settlement.
 		let response = MuxRekeyResponsePackage::new(server_random, Some(artifact.clone()))?;
 		let response_der = response.to_der()?;
 		self.pending =
@@ -426,12 +427,15 @@ where
 	/// Settle the client's countersignature, record the outcome, and
 	/// rotate the epoch chain.
 	///
-	/// A verified countersignature rotates the chain **even when the
-	/// authorizer refuses settlement**: the client switched its send
-	/// cipher at the Ack boundary, so the server must install the new
-	/// receive cipher to keep the refusal's GoAway drain decryptable.
-	/// The refusal code surfaces in [`ServerAckOutcome::rejection`]
-	/// for the driver to drain on.
+	/// # Refused settlement
+	///
+	/// A verified countersignature rotates the chain **even when the authorizer
+	/// refuses settlement**. The client switched its send cipher at the Ack
+	/// boundary, so the server installs the new receive cipher to keep the
+	/// refusal's GoAway drain decryptable.
+	///
+	/// The refusal code surfaces in [`ServerAckOutcome::rejection`] for the
+	/// driver to drain on.
 	///
 	/// # Fail closed (after the observer records the evidence)
 	/// - No exchange in flight: [`HandshakeError::InvalidState`]
@@ -455,9 +459,8 @@ where
 
 		let countersignature_der = countersignature.as_ref().map(SignerInfo::to_der).transpose()?;
 
-		// A verified countersignature completes the artifact; a failed
-		// one stays out of it but its DER remains in the outcome as
-		// evidence.
+		// A verified countersignature completes the artifact. A failed one
+		// stays out of it, but its DER remains in the outcome as evidence.
 		let artifact = match (verdict, countersignature) {
 			(SessionVerdict::Activated | SessionVerdict::SettlementRejected { .. }, Some(signer)) => {
 				pending.artifact.complete(signer)?
@@ -594,12 +597,15 @@ where
 
 /// Role-fixed rekey exchange handed to the mux plane.
 ///
-/// The client half sits behind an async mutex: the reader driver holds
-/// it across the exchange's hook awaits, while the trigger paths
-/// (writer record watermark, emit budget watermark) `try_lock` for the
-/// synchronous [`ClientRekeyExchange::start_renewal`] only. A contended
-/// try-lock means an exchange is already being processed, which makes
-/// initiation moot.
+/// # Locking
+///
+/// The client half sits behind an async mutex. The reader driver holds it
+/// across the exchange's hook awaits, while the trigger paths (writer record
+/// watermark, emit budget watermark) `try_lock` for the synchronous
+/// [`ClientRekeyExchange::start_renewal`] only.
+///
+/// A contended try-lock means an exchange is already being processed, which
+/// makes initiation moot.
 pub(crate) enum RekeyDriver {
 	/// Renewal initiator (mux client role).
 	Client(Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>),
@@ -832,7 +838,7 @@ mod tests {
 		let replay = response.to_owned();
 
 		client.process_response(response).await.map(|_| ())?;
-		// A replay targets the advanced chain: the pin no longer matches.
+		// A replay targets the advanced chain, where the pin fails to match.
 		client.pending = Some(PendingRenewal { client_random: [3u8; 32], request_der: request.to_der()? });
 
 		let replayed = client.process_response(replay).await;

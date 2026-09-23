@@ -2,7 +2,9 @@
 //!
 //! The tests drive the Hive lifecycle through its public interface with TLS.
 
+use core::time::Duration;
 use std::sync::Arc;
+use tightbeam::utils::time::UnixMillis;
 
 use tightbeam::crypto::key::SigningKeyProvider;
 use tightbeam::crypto::x509::policy::DirectTrustValidator;
@@ -12,9 +14,8 @@ use tightbeam::{
 	builder::{frame::FrameBuilder, TypeBuilder},
 	colony::{
 		common::{
-			current_timestamp_ms, ClusterCommand, ClusterCommandOutcome, ClusterCommandResponse, ClusterStatus,
-			ColonyNamespace, HeartbeatParams, HiveManagementOutcome, HiveManagementRequest, SpawnServletParams,
-			StopServletParams,
+			ClusterCommand, ClusterCommandOutcome, ClusterCommandResponse, ClusterStatus, ColonyNamespace,
+			HeartbeatParams, HiveManagementOutcome, HiveManagementRequest, SpawnServletParams, StopServletParams,
 		},
 		hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox},
 		servlet::ServletConfig,
@@ -194,7 +195,7 @@ fn command_frame_with_order(id: impl AsRef<[u8]>, cmd: ClusterCommand, order: u6
 
 fn command_frame(id: impl AsRef<[u8]>, cmd: ClusterCommand) -> Result<Frame, TightBeamError> {
 	let id = id.as_ref();
-	command_frame_with_order(id, cmd, current_timestamp_ms())
+	command_frame_with_order(id, cmd, UnixMillis::now().get())
 }
 
 /// Builds a manage command frame with a stop request. Each call site
@@ -259,7 +260,8 @@ fn trusted_signer(subject: impl AsRef<str>) -> TrustedSignerContext {
 	TrustedSignerContext { certificate, provider: Arc::new(Secp256k1KeyProvider::from(signing_key)) }
 }
 
-/// Starts an established hive with the context signer pinned in its trust store.
+/// Starts an established hive with the context signer pinned in its trust
+/// store.
 async fn start_trusted_hive(
 	trace: &TraceCollector,
 	ctx: &TrustedSignerContext,
@@ -435,7 +437,7 @@ tb_scenario! {
 		start: |SetupEnv { trace, context: signer }| async move {
 			let mut conf = HiveConfig::default();
 			conf.control.circuit_breaker_threshold = 1;
-			conf.control.circuit_breaker_cooldown_ms = 60_000;
+			conf.control.circuit_breaker_cooldown = Duration::from_secs(60);
 			start_trusted_hive(&trace, &signer, conf).await
 		},
 		client: |HiveEnv { trace, context: signer, hive }| async move {
@@ -469,12 +471,12 @@ tb_scenario! {
 			// Trip the breaker at threshold 1. A trusted signer identity with a
 			// signature transplanted from a different frame is the one failure
 			// class the breaker counts.
-			let now = current_timestamp_ms();
-			let mut donor = command_frame_with_order(b"hb-donor", heartbeat_command(), now)?;
+			let now = UnixMillis::now();
+			let mut donor = command_frame_with_order(b"hb-donor", heartbeat_command(), now.get())?;
 			donor.sign_with_provider::<Sha3_256, _>(&signer.provider).await?;
 
 			let transplanted = donor.nonrepudiation().cloned().ok_or(TightBeamError::MissingSignature)?;
-			let mut forged = command_frame_with_order(b"hb-forged", heartbeat_command(), now.saturating_add(1))?;
+			let mut forged = command_frame_with_order(b"hb-forged", heartbeat_command(), now.saturating_add(Duration::from_millis(1)).get())?;
 			forged.attach_signer_info(transplanted)?;
 
 			let response = emit_command(&mut client, forged).await?;
@@ -505,9 +507,9 @@ tb_assert_spec! {
 	}
 }
 
-// Backpressure ResourceExhausted must also come back in the sender's CHOICE. Only manage
-// commands hit the gate (heartbeats are exempt), so the ResourceExhausted verdict must
-// use the manage shape.
+// Backpressure ResourceExhausted must also come back in the sender's CHOICE.
+// Only manage commands hit the gate (heartbeats are exempt), so the
+// ResourceExhausted verdict must use the manage shape.
 tb_scenario! {
 	name: hive_backpressure_reply_shape,
 	spec: HiveBackpressureShapeSpec,
@@ -814,11 +816,15 @@ fn contract_signature_verifies(frame: &Frame) -> bool {
 
 servlet! {
 	/// Records what the handler observes about the frame it receives for an
-	/// intra-hive call. The probes cover the caller's frame id, the
-	/// nonrepudiation block, the previous-frame linkage, and whether the
-	/// caller's signature verifies over the received bytes. The handler
-	/// responds with a signed frame so the caller can verify the response
-	/// envelope the same way.
+	/// intra-hive call, and responds with a signed frame so the caller can
+	/// verify the response envelope the same way.
+	///
+	/// The probes cover:
+	///
+	/// - the caller's frame id,
+	/// - the nonrepudiation block,
+	/// - the previous-frame linkage,
+	/// - whether the caller's signature verifies over the received bytes.
 	FrameContractServlet<HiveTestRequest, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
@@ -915,7 +921,7 @@ tb_scenario! {
 		client: |HiveEnv { trace, hive, .. }| async move {
 			let unsigned = FrameBuilder::from(Version::V2)
 				.with_id(b"hive-signed-call")
-				.with_order(current_timestamp_ms())
+				.with_order(UnixMillis::now().get())
 				.with_previous_hash(TestDigest::info())
 				.with_message(HiveTestRequest { value: 21 })
 				.build()?;

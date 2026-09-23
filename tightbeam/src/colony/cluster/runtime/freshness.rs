@@ -8,20 +8,26 @@
 //! - CWE-294, authentication bypass by capture-replay:
 //!   <https://cwe.mitre.org/data/definitions/294.html>
 
-use std::sync::Arc;
-
-use crate::colony::common::current_timestamp_ms;
+use crate::colony::common::IssuedAt;
 use crate::colony::hive::ReplayGuard;
 use crate::policy::TransitStatus;
+use crate::utils::time::Clock;
 use crate::Frame;
+use core::time::Duration;
+use std::sync::Arc;
 
 /// Ledger that admits each signed control frame once.
-pub(crate) struct GatewayReplayGuard(Arc<ReplayGuard>);
+pub(crate) struct GatewayReplayGuard {
+	ledger: Arc<ReplayGuard>,
+	/// The gateway's clock, which freshness is judged against.
+	clock: Arc<dyn Clock>,
+}
 
 impl GatewayReplayGuard {
-	/// Admits a frame once inside `window_ms` of its stated order.
-	pub(crate) fn new(window_ms: u64) -> Self {
-		Self(Arc::new(ReplayGuard::new(window_ms)))
+	/// Admits a frame once inside `window` of its stated issue time, as
+	/// `clock` reads it.
+	pub(crate) fn new(window: Duration, clock: Arc<dyn Clock>) -> Self {
+		Self { ledger: Arc::new(ReplayGuard::new(window)), clock }
 	}
 
 	/// Whether `frame` is a fresh, first-seen signed control frame.
@@ -32,8 +38,8 @@ impl GatewayReplayGuard {
 	/// 2. Require non-repudiation (`signer_info`) on the frame.
 	/// 3. Insert the signature in the ledger, refusing a duplicate.
 	pub(crate) fn admits(&self, frame: &Frame) -> TransitStatus {
-		let now = current_timestamp_ms();
-		if !self.0.is_fresh(frame.metadata().order(), now) {
+		let now = self.clock.unix();
+		if !self.ledger.is_fresh(frame.issued_at(), now) {
 			return TransitStatus::PermissionDenied;
 		}
 
@@ -43,7 +49,7 @@ impl GatewayReplayGuard {
 		let Some(signer_id) = frame.signer_id() else {
 			return TransitStatus::PermissionDenied;
 		};
-		if !self.0.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now) {
+		if !self.ledger.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now) {
 			return TransitStatus::PermissionDenied;
 		}
 
@@ -56,13 +62,13 @@ impl GatewayReplayGuard {
 	/// peer's one chance to send that frame (CWE-645).
 	pub(crate) fn release(&self, frame: &Frame) {
 		if let Some(signer_info) = frame.nonrepudiation() {
-			self.0.forget(signer_info.signature.as_bytes());
+			self.ledger.forget(signer_info.signature.as_bytes());
 		}
 	}
 }
 
 impl Clone for GatewayReplayGuard {
 	fn clone(&self) -> Self {
-		Self(Arc::clone(&self.0))
+		Self { ledger: Arc::clone(&self.ledger), clock: Arc::clone(&self.clock) }
 	}
 }

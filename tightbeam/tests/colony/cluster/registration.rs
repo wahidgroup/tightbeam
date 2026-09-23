@@ -138,7 +138,7 @@ tb_scenario! {
 			let unsigned = Version::V0
 				.compose()
 				.with_id(b"unsigned-reg")
-				.with_order(current_timestamp_ms())
+				.with_order(UnixMillis::now().get())
 				.with_message(registration_request(b"127.0.0.1:65200"))
 				.build()?;
 
@@ -431,7 +431,7 @@ tb_scenario! {
 
 			// The signature is valid but the order lies outside the
 			// freshness window.
-			let stale_ts = current_timestamp_ms() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
+			let stale_ts = UnixMillis::now().get() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
 			let stale = signed_control_frame_with_order(
 				&certs.key,
 				b"stale-reg",
@@ -863,8 +863,8 @@ tb_scenario! {
 			let request = servlet_address_update(hive_addr, vec![], removed);
 			emit_servlet_update(&mut client, &certs.key, b"removal-remove", request).await?;
 
-			// The removed instance no longer routes, so the submission
-			// must resolve to a refusal.
+			// The removed instance has stopped routing, so the submission must
+			// resolve to a refusal.
 			let refused_work = emit_ping_work(&mut client, &certs.key, b"post-removal-work").await;
 			work_refusal_status(refused_work)?;
 

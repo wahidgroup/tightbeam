@@ -23,7 +23,7 @@ use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
-use crate::transport::framing::{FrameHeader, LengthForm};
+use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
 use crate::transport::handshake::{BoxedServerHandshake, HandshakeKeyManager};
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
@@ -110,7 +110,7 @@ where
 			#[cfg(feature = "std")]
 			self.arm_read_deadline(deadline)?;
 
-			// EOF before the tag is the peer closing between frames; EOF
+			// EOF before the tag is the peer closing between frames. EOF
 			// anywhere after it is a truncated frame.
 			let mut tag_byte = [0u8; 1];
 			self.stream
@@ -150,7 +150,8 @@ where
 				self.limits.max_envelope()
 			};
 
-			let header = FrameHeader::parse(tag_byte[0], length_first[0], length_octets)?.admit(cap)?;
+			let prefix = HeaderPrefix { tag: tag_byte[0], length_first: length_first[0] };
+			let header = FrameHeader::parse(prefix, length_octets)?.admit(cap)?;
 			let content_length = header.content_len();
 
 			// Read content. Without a deadline one read suffices. With one,

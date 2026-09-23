@@ -8,9 +8,9 @@ pub mod urn;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
+use crate::utils::time::UnixMillis;
 use crate::utils::BasisPoints;
 
 use crate::runtime::rt;
@@ -18,10 +18,6 @@ use crate::runtime::rt;
 pub use messages::*;
 pub use scaling::*;
 pub use urn::{ColonyNamespace, ColonyResource, ServletTypeKey, COLONY_NID};
-
-// ============================================================================
-// Load Balancing
-// ============================================================================
 
 /// Pheromone signal one servlet instance carries into a balancing round.
 ///
@@ -79,7 +75,7 @@ static BALANCER_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Balancers constructed in the same instant still diverge.
 fn fresh_seed() -> u64 {
 	let sequence = BALANCER_SEED_SEQUENCE.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed);
-	sequence ^ current_timestamp_ms()
+	sequence ^ UnixMillis::now().get()
 }
 
 /// Advance SplitMix64 state and return the mixed output.
@@ -164,7 +160,8 @@ impl StochasticForager {
 
 	/// Set the exploration floor (default [`DEFAULT_EXPLORATION_FLOOR`]).
 	///
-	/// A higher floor spreads more. A lower floor exploits strong trails harder.
+	/// A higher floor spreads more. A lower floor exploits strong trails
+	/// harder.
 	pub fn with_exploration_floor(mut self, floor: u64) -> Self {
 		self.exploration_floor = floor;
 		self
@@ -284,24 +281,6 @@ impl LoadBalancer for RoundRobin {
 	}
 }
 
-// ============================================================================
-// Timestamp
-// ============================================================================
-
-/// Current time in milliseconds since the UNIX epoch.
-///
-/// Uses the system clock (`colony` implies `std`).
-pub fn current_timestamp_ms() -> u64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.map(|d| d.as_millis() as u64)
-		.unwrap_or(0)
-}
-
-// ============================================================================
-// Utilization
-// ============================================================================
-
 /// Mean utilization across a hive's servlet instances, in basis points.
 ///
 /// - `total_utilization`: sum of per-instance basis points.
@@ -316,10 +295,6 @@ pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> B
 		n => BasisPoints::new_saturating((total_utilization / n as u64) as u16),
 	}
 }
-
-// ============================================================================
-// Control-Plane Replies
-// ============================================================================
 
 /// Build a V0 response frame that echoes the request id.
 pub fn reply_frame<M: crate::Message>(
@@ -360,10 +335,6 @@ pub fn reply_frame_with_priority<M: crate::Message>(
 	Ok(Some(frame))
 }
 
-// ============================================================================
-// Task Lifecycle
-// ============================================================================
-
 /// Whether a runtime has entered drain, and since when.
 ///
 /// Drain is one fact read from several places: the control plane refuses
@@ -394,14 +365,15 @@ impl DrainMode {
 
 /// The background tasks one runtime started.
 ///
-/// A runtime keeps one group and puts every task it spawns in it, so
-/// stopping the runtime stops that work with a single call. Spawning
-/// without the group leaves a task running past the stop that was meant to
-/// end it (CWE-772), which is why the group is the only spawn path these
-/// runtimes offer.
+/// A runtime keeps one group and puts every task it spawns in it, so stopping
+/// the runtime stops that work with a single call. The handle is shared, so a
+/// context handed to a request handler can adopt work the handler starts.
 ///
-/// The handle is shared, so a context handed to a request handler can adopt
-/// work the handler starts.
+/// # Single spawn path
+///
+/// Spawning without the group leaves a task running past the stop that was
+/// meant to end it (CWE-772), which is why the group is the only spawn path
+/// these runtimes offer.
 #[derive(Clone, Default)]
 pub struct TaskGroup(std::sync::Arc<std::sync::Mutex<TaskGroupState>>);
 

@@ -1,11 +1,6 @@
 # tightbeam
 
-[![Crate][crate-image]][crate-link]
-[![Docs][docs-image]][docs-link]
-[![Build Status][build-image]][build-link]
-![Apache2/MIT licensed][license-image]
-![Rust Version][rustc-image]
-[![Project Chat][chat-image]][chat-link]
+[![Crate][crate-image]][crate-link] [![Docs][docs-image]][docs-link] [![Build Status][build-image]][build-link] ![Apache2/MIT licensed][license-image] ![Rust Version][rustc-image] [![Project Chat][chat-image]][chat-link]
 
 ## Status
 
@@ -211,7 +206,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 This document adheres to the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322] for structure and editorial style:
 
-- **Section pattern**: Normative sections progress through concept -> specification -> implementation -> testing.
+- **Section pattern**: Normative sections progress through concept, then specification, then implementation, then testing.
 - **Requirements language**: Key words are interpreted per [RFC 2119][rfc2119] (see [§1.2 Requirements Language](#12-requirements-language)).
 - **Terminology**: Project terms are defined once in [§2 Terminology](#2-terminology) and used consistently thereafter.
 - **Citations**: External standards are cited by name and linked on their first mention within a section. Full references are recorded in [§14 References](#14-references). Every entry there is cited at least once in the text, and every in-text citation resolves to an entry there.
@@ -273,7 +268,7 @@ Every Frame MUST carry these elements:
 A Frame MAY also carry:
 
 - Message Integrity (MI) in `Metadata.integrity` ([§5.7.3](#573-integrity-semantics-order-of-operations))
-- Frame Integrity (FI) in `Frame.integrity`: digest over `version` and `metadata`; MUST exclude `message` ([§5.7.3](#573-integrity-semantics-order-of-operations))
+- Frame Integrity (FI) in `Frame.integrity`: digest over `version` and `metadata`. It MUST exclude `message` ([§5.7.3](#573-integrity-semantics-order-of-operations))
 - Nonrepudiation in `Frame.nonrepudiation` ([§5.7.5](#575-nonrepudiation-coverage-and-binding))
 
 Which optional fields a version MAY emit is stated in [§5.6](#56-version-specific-constraints). The Rust shapes follow in [§4.3](#43-metadata-specification) and [§4.4](#44-frame-encapsulation).
@@ -2821,7 +2816,7 @@ let hive_conf = HiveConfig {
 
 Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores) for building trust stores from cluster certificates.
 
-Signed commands are additionally checked for freshness: each `ClusterCommand` carries an `issued_at_ms` timestamp, and the hive rejects commands outside `control.command_freshness_window_ms` of its clock or whose signature was already seen inside that window (replay protection).
+Signed commands are additionally checked for freshness: each signed command frame states its issue time in `metadata.order` (unix milliseconds), and the hive rejects commands outside `control.command_freshness_window` of its clock or whose signature was already seen inside that window (replay protection).
 
 ##### Resilience Features
 
@@ -2838,7 +2833,7 @@ let hive_conf = HiveConfig {
 	control: HiveControlConfig {
 		backpressure_threshold: BasisPoints::new(8000), // 80%
 		circuit_breaker_threshold: 5,                   // Open after 5 failures
-		circuit_breaker_cooldown_ms: 60_000,            // 1 minute cooldown
+		circuit_breaker_cooldown: Duration::from_secs(60), // 1 minute cooldown
 		..Default::default()
 	},
 	..Default::default()
@@ -2890,8 +2885,8 @@ pub struct HiveControlConfig {
 	pub drain_timeout: Duration,                     // Default: 30s
 	pub reregister_interval: Option<Duration>,       // Default: 5s; None disables
 	pub circuit_breaker_threshold: u8,               // Default: 3
-	pub circuit_breaker_cooldown_ms: u64,            // Default: 30_000
-	pub command_freshness_window_ms: u64,            // Default: 30_000 (replay window)
+	pub circuit_breaker_cooldown: Duration,          // Default: 30s
+	pub command_freshness_window: Duration,          // Default: 30s (replay window)
 	pub notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
 }
 
@@ -3026,7 +3021,7 @@ let tls = ClusterTlsConfig {
 The two trust stores are separate planes and MUST NOT cross:
 
 - **`hive_trust`**: Validates hive-origin control frames (registration, servlet address updates) and origin gossip publish (`PublishGossip`). Missing signatures reply `TransitStatus::Unauthenticated`. Failed verification replies `TransitStatus::PermissionDenied`. `None` fails closed for those frames.
-- **`peer_trust`**: Validates peer advertisements and relayed gossip. `None` disables inbound federation (peer ads and relayed gossip are refused). Hive certificates cannot forge peer ads; peer certificates cannot publish origin gossip.
+- **`peer_trust`**: Validates peer advertisements and relayed gossip. `None` disables inbound federation (peer ads and relayed gossip are refused). Hive certificates cannot forge peer ads, and peer certificates cannot publish origin gossip.
 
 For hives to trust cluster commands (like heartbeats), they must have the cluster's certificate in their trust store. See [Trust Stores](#trust-stores) for details.
 
@@ -3238,11 +3233,11 @@ let conf = ClusterConfig::builder(tls)
 Flow:
 
 1. **Publish**: A hive-plane signed `PublishGossip` carries `GossipRumor { payload }`. The accepting origin gateway must be a colony member. It creates an origin-signed rumor Frame (id and issue time from the publish frame) and starts the flood.
-2. **Relay**: Peers carry `ClusterRequest::Gossip` with an outer relay Frame. Hop radius lives only in the outer `metadata.lifetime`. The inner rumor stays byte-identical under the origin signature. Relays verify on the peer trust plane; the origin colony URN MUST equal the local gateway's colony URN.
+2. **Relay**: Peers carry `ClusterRequest::Gossip` with an outer relay Frame. Hop radius lives only in the outer `metadata.lifetime`. The inner rumor stays byte-identical under the origin signature. Relays verify on the peer trust plane, and the origin colony URN MUST equal the local gateway's colony URN.
 3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice. An application rumor is recorded for repair and delivery retry. A peer advertisement rumor is only witnessed (`GossipJournal::witness`, a required trait method). Its digest deduplicates and breaks flood loops, but the bytes are never retained, repaired, or delivered locally.
 4. **Local ingress**: `GossipConfig.ingress` holds the route key of a servlet type on the receiving gateway. `with_gossip_ingress` mints that key, so a URN no route could answer is refused with `ClusterError::UnknownServletType` at configuration time rather than retried on every beat. `None` means journal and reflood only (immediate local ack).
 5. **Reflood**: Remaining hop TTL and a non-empty `peers` list continue the flood.
-6. **Reconcile**: `ReconcileGossip` exchanges held digests; the peer answers with `GossipWant`. The advertise beat also runs anti-entropy repair and pending-local retry.
+6. **Reconcile**: `ReconcileGossip` exchanges held digests, and the peer answers with `GossipWant`. The advertise beat also runs anti-entropy repair and pending-local retry.
 
 Misbehavior on tampered or lifetime-missing relays weakens peer trails. A foreign-colony refuse does not.
 
@@ -3263,7 +3258,7 @@ use tightbeam::colony::SubmitWork;
 // Sign the end-to-end frame so the servlet can verify the sender.
 let mut work = compose(Version::V2)
 	.with_id(b"calc-001")
-	.with_order(current_timestamp_ms())
+	.with_order(UnixMillis::now().get())
 	.with_message(CalcRequest { value: 42 })
 	.build()?;
 work.sign_with_provider::<Sha3_256, _>(&provider).await?;
@@ -3294,9 +3289,7 @@ Stream chunks are not individually framed or signed. Their integrity rests on tr
 
 ##### ClusterConfig Reference
 
-Four of this type's fields are private, because each one is derived from
-another or parsed on the way in. Set them through `ClusterConfigBuilder`
-and read them through the accessors below.
+Four of this type's fields are private, because each one is derived from another or parsed on the way in. Set them through `ClusterConfigBuilder` and read them through the accessors below.
 
 ```rust
 pub struct PeerConfig {
@@ -3347,8 +3340,8 @@ pub struct ClusterConfig {
 	pub namespace: ColonyNamespace,
 	/// Optional stable gateway bind address
 	pub bind_addr: Option<String>,
-	/// Freshness/replay window for signed hive control frames (ms)
-	pub control_freshness_window_ms: u64,
+	/// Freshness/replay window for signed hive control frames
+	pub control_freshness_window: Duration,
 	/// TLS configuration, including `hive_trust` and `peer_trust`
 	pub tls: ClusterTlsConfig,
 
@@ -3374,6 +3367,8 @@ pub struct ClusterConfig {
 	// --- Colony gossip ---
 	/// Gossip freshness, hop TTL, ingress route key, journal, and admission
 	pub gossip: GossipConfig,
+	/// Clock for freshness, replay, retention and lease decisions
+	pub clock: Arc<dyn Clock>,
 }
 
 // Colony URN is derived from the gateway cert URI SAN, and bound again
@@ -3384,6 +3379,8 @@ pub struct ClusterConfig {
 ##### Cluster Testing
 
 Clusters can be tested using `environment Cluster`:
+
+A scenario that depends on time passing (a retention window pruning, a lease expiring, an idle connection closing) installs a `ManualClock` through `ClusterConfig::clock` or `PoolConfig::clock` and advances it, instead of sleeping until the real clock gets there.
 
 ```rust
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, cluster, hive};
@@ -3460,7 +3457,7 @@ The `environment Cluster` syntax provides:
 
 Adversarial registration scenarios (unsigned, replayed, stale, hijacked) omit `hives:` and drive registration from the client, asserting the rejection and the registry count on the owned instance.
 
-Peer federation and gossip use the same `environment Cluster` shape with peer trust, dial lists, and signed `AdvertisePeer` / `PublishGossip` frames from the client. Two multi-gateway patterns apply: (1) when the federation is under test, boot the full topology in `start` (see `fuzz/colony/`); (2) when peering itself is the stimulus, own the seed in `start` with optional seed-side `hives:` and boot peer gateways in `client`. Do not wrap a cluster under test in `environment Hive` only for lifecycle. See `tests/colony/cluster/` (`registration.rs`, `routing.rs`, `topology.rs`, `peering.rs`, `gossip.rs`).
+Peer federation and gossip use the same `environment Cluster` shape with peer trust, dial lists, and signed `AdvertisePeer` / `PublishGossip` frames from the client. Two multi-gateway patterns apply. When the federation is under test, boot the full topology in `start` (see `fuzz/colony/`). When peering itself is the stimulus, own the seed in `start` with optional seed-side `hives:` and boot peer gateways in `client`. Do not wrap a cluster under test in `environment Hive` only for lifecycle. See `tests/colony/cluster/` (`registration.rs`, `routing.rs`, `topology.rs`, `peering.rs`, `gossip.rs`).
 
 ##### Conclusion
 
@@ -3673,7 +3670,7 @@ let trace: TraceCollector = TraceConfig::builder()
 trace.event(events::ERROR)?.with_log_level(LogLevel::Error).emit();
 ```
 
-> Note: The event emit may be elided; events are emitted on drop.
+> Note: The event emit may be elided, because events are emitted on drop.
 
 ## 11. Misc
 
@@ -3859,7 +3856,7 @@ PipelineBuilder::new(trace)
 
 **Testing integration:**
 
-Assert the full job URNs (exact string match; see [§10.2](#102-event-kind-taxonomy)):
+Assert the full job URNs, as an exact string match (see [§10.2](#102-event-kind-taxonomy)):
 
 ```rust
 const CREATE_HS_START: Urn<'static> =
@@ -3956,7 +3953,7 @@ Two formal-methods ideas underpin the stack:
 
 #### Communicating Sequential Processes (CSP)
 
-CSP describes concurrent interaction patterns (Hoare; Roscoe).[^hoare1978][^roscoe2010] In tightbeam, CSP models protocol behavior as a labeled transition system (LTS). Each process specification defines:
+CSP describes concurrent interaction patterns (Hoare, Roscoe).[^hoare1978][^roscoe2010] In tightbeam, CSP models protocol behavior as a labeled transition system (LTS). Each process specification defines:
 
 - **Alphabet (Σ, τ)**: Observable events visible to the environment (Σ) and hidden internal events (τ)
 - **State Space**: Named states representing protocol phases
@@ -4019,7 +4016,7 @@ Progressive flags (each builds on the previous where noted):
 - `testing-schedulability`: RMA/EDF analysis (requires `testing-timing`)
 - `testing-fault`: Deterministic/probabilistic fault injection (requires `testing-fdr`)
 - `testing-fmea`: FMEA campaign helpers (requires `testing-fault` + `instrument`)
-- `testing-fuzz` / `testing-fuzz-ijon`: AFL fuzzing (+ optional IJON; requires `testing-csp`)
+- `testing-fuzz` / `testing-fuzz-ijon`: AFL fuzzing with optional IJON. Both require `testing-csp`, which `testing-fuzz` enables
 
 ### 12.2 Layer 1: Assertion Specifications
 
@@ -4137,7 +4134,7 @@ impl MySpec {
 }
 ```
 
-Assertion labels in the `assertions:` list are ordinary Rust expressions (typically `Urn<'static>` constants in scope). The macro does not invent associated constants on the spec type. Emit sites and the spec MUST use the same rendered URN string (exact match; see [§10.2](#102-event-kind-taxonomy)).
+Assertion labels in the `assertions:` list are ordinary Rust expressions (typically `Urn<'static>` constants in scope). The macro does not invent associated constants on the spec type. Emit sites and the spec MUST use the same rendered URN string, as an exact match (see [§10.2](#102-event-kind-taxonomy)).
 
 #### 12.2.5 Cardinality Helpers
 
@@ -4901,12 +4898,12 @@ Faults are injected during CSP exploration before state transitions. Injected fa
 
 ### 12.7 Unified Testing: tb_scenario! Macro
 
-`tb_scenario!` is the single entry point for L1–L3 under a chosen environment.
+`tb_scenario!` is the single entry point for L1 to L3 under a chosen environment.
 
 **Design principles:**
 
 - One syntax for all verification layers
-- Progressive enhancement (L1 → L1+L2 → L1+L2+L3)
+- Progressive enhancement: L1, then L1+L2, then L1+L2+L3
 - Environments: `Bare`, `Worker`, `ServiceClient`, `Servlet`, `Pipeline`, `Cluster`, `Hive`
 - Optional `TraceConfig` / hooks / fault models
 
@@ -5502,14 +5499,14 @@ tightbeam automatically calculates Severity, Occurrence, and Detection ratings f
      - 1: Minor (>80% states reachable)
 
 2. **Occurrence** (converted from `BasisPoints` injection probability):
-   - MIL-STD-1629: `probability_bps / 1000` (0-10000 -> 1-10)
-   - ISO 26262: `probability_bps / 2500` (0-10000 -> 1-4)
+   - MIL-STD-1629: `probability_bps / 1000` (maps 0-10000 onto 1-10)
+   - ISO 26262: `probability_bps / 2500` (maps 0-10000 onto 1-4)
 
 3. **Detection** (calculated from error recovery statistics):
    - Based on `FdrVerdict::error_recovery_successful` vs `error_recovery_failed` counts
    - Inverted success rate: high recovery = low detection number (easily detected)
-   - 100% recovery success -> Detection = 1 (easily detected/recoverable)
-   - 0% recovery success -> Detection = max scale (undetectable/unrecoverable)
+   - 100% recovery success gives Detection = 1 (easily detected/recoverable)
+   - 0% recovery success gives Detection = max scale (undetectable/unrecoverable)
 
 **FMEA Report Structure**:
 

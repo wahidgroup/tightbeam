@@ -89,7 +89,7 @@ cargo check --package tightbeam-rs --no-default-features --features "std,transpo
 
 echo "[8/16] Test: Consumer expansion under a narrow and a wide selection"
 for selection in narrow wide; do
-	cargo test --manifest-path "$ROOT/consumer-expansion-test/Cargo.toml" \
+	cargo test --manifest-path "$ROOT/consumers/expansion/Cargo.toml" \
 		--target-dir "$ROOT/target/probe-expansion" \
 		--no-default-features --features "$selection"
 done
@@ -98,7 +98,7 @@ echo "[9/16] Test: Consumer macro expansions"
 cargo test --package tightbeam-consumer-test
 
 echo "[10/16] Test: Consumer on tightbeam default features"
-cargo test --manifest-path "$ROOT/consumer-default-test/Cargo.toml" \
+cargo test --manifest-path "$ROOT/consumers/default/Cargo.toml" \
 	--target-dir "$ROOT/target/probe-default"
 
 echo "[11/16] Check: Transport CMS"
@@ -111,7 +111,7 @@ echo "[13/16] Check: Transport CMS-only + TCP + Async"
 cargo check --package tightbeam-rs --no-default-features --features "std,transport-cms,tcp,tokio,testing"
 
 echo "[14/16] Test: Sync server stack (std + tcp + ECIES, no tokio)"
-cargo test --manifest-path "$ROOT/consumer-sync-test/Cargo.toml" \
+cargo test --manifest-path "$ROOT/consumers/sync/Cargo.toml" \
 	--target-dir "$ROOT/target/probe-sync"
 
 echo "[15/16] Test: Crate defaults plus the dev feature set"

@@ -39,6 +39,7 @@ use crate::transport::handshake::negotiation::{
 	client_mux_settings, MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer,
 	StrengthFloor, TransportAccept, TransportOffer,
 };
+use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
@@ -57,10 +58,6 @@ use crate::x509::attr::{Attribute, Attributes};
 use crate::zeroize::Zeroizing;
 use crate::ZeroizingBytes;
 
-/// Client-side CMS handshake orchestrator.
-///
-/// Generic over `P: CryptoProvider` which defines the complete cryptographic
-/// suite (curve, signature algorithm, digest, AEAD, KDF). Supports
 /// A server certificate path and a shared handle to the leaf it ends with.
 ///
 /// A session records the leaf as its peer, and `Arc<[Certificate]>` cannot
@@ -102,12 +99,18 @@ impl From<Arc<[Certificate]>> for ServerChain {
 	}
 }
 
-/// cryptographic profile negotiation via optional `security_offer` field.
+/// Client-side CMS handshake orchestrator.
 ///
-/// Manages the complete client handshake flow:
-/// 1. Sends KeyExchange (EnvelopedData with KARI)
-/// 2. Receives and verifies server Finished (SignedData)
-/// 3. Sends client Finished (SignedData)
+/// Generic over `P: CryptoProvider`, which defines the complete cryptographic
+/// suite (curve, signature algorithm, digest, AEAD, KDF). It supports
+/// cryptographic profile negotiation through the optional `security_offer`
+/// field.
+///
+/// The client handshake runs in order:
+///
+/// 1. Send KeyExchange (EnvelopedData with KARI).
+/// 2. Receive and verify the server Finished (SignedData).
+/// 3. Send the client Finished (SignedData).
 pub struct CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
@@ -154,12 +157,11 @@ where
 	P::Digest: Send + 'static,
 	P::AeadCipher: KeyInit,
 {
-	/// Create a new CMS handshake client.
+	/// Create a CMS handshake client.
 	///
-	/// # Parameters
-	/// - `provider`: The cryptographic provider defining the security profile
-	/// - `client_key_provider`: The client's key provider for authentication
-	/// - `server_cert`: The server's certificate (for key agreement)
+	/// `provider` fixes the security profile, `client_key_provider`
+	/// authenticates the client, and the key agreement runs against
+	/// `server_cert`.
 	pub fn new(provider: P, client_key_provider: Arc<dyn SigningKeyProvider>, server_cert: Arc<Certificate>) -> Self {
 		Self::with_identity(provider, client_key_provider, Some(server_cert), None)
 	}
@@ -232,7 +234,9 @@ where
 	/// Provision the server certificate chain, ordered root to leaf.
 	///
 	/// When set, server authentication validates the full chain against the
-	/// trust store ([RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1)), which covers every certificate in the path.
+	/// trust store
+	/// ([RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1)),
+	/// which covers every certificate in the path.
 	#[must_use]
 	pub fn with_server_certificate_chain(mut self, chain: Arc<[Certificate]>) -> Self {
 		self.server_chain = Some(ServerChain::from(chain));
@@ -320,8 +324,12 @@ where
 
 	/// Validate state and server certificate for key exchange.
 	///
-	/// Fail-closed (CWE-295): a configured trust store is mandatory. Expiry
-	/// alone authenticates nobody, so a missing store aborts the handshake.
+	/// # Fail closed
+	///
+	/// A configured trust store is mandatory (CWE-295). Expiry alone
+	/// authenticates nobody, so a missing store aborts the handshake.
+	///
+	/// # Paths
 	///
 	/// With a provisioned chain, the full path is validated
 	/// ([RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1))
@@ -429,13 +437,12 @@ where
 		}
 	}
 
-	/// Build KeyExchange message (EnvelopedData with KARI containing session key).
+	/// Build the KeyExchange message: EnvelopedData with a KARI that carries
+	/// the session key.
 	///
-	/// # Parameters
-	/// - `session_key`: The session key to wrap and send
-	/// - `rng`: Optional CSPRNG for the ephemeral key, UKM, CEK, and content
-	///   nonce. `None` defaults to `OsRng`. Supply one on `no_std` targets
-	///   without an OS-backed `getrandom`.
+	/// `rng` draws the ephemeral key, the UKM, the CEK and the content nonce.
+	/// `None` uses `OsRng`. Supply one on a `no_std` target without an
+	/// OS-backed `getrandom`.
 	pub fn build_key_exchange(
 		&mut self,
 		session_key: ZeroizingBytes,
@@ -470,13 +477,8 @@ where
 		Ok(enveloped_data)
 	}
 
-	/// Process server Finished message (SignedData over transcript hash).
-	///
-	/// # Parameters
-	/// - `signed_data_der`: DER-encoded SignedData from server
-	///
-	/// # Returns
-	/// Verified transcript hash
+	/// Process the server Finished message, SignedData over the transcript
+	/// hash, and answer the verified transcript hash.
 	pub fn process_server_finished(&mut self, signed_data_der: impl AsRef<[u8]>) -> Result<Vec<u8>, HandshakeError> {
 		let signed_data_der = signed_data_der.as_ref();
 		// 1. Validation
@@ -517,14 +519,13 @@ where
 		self.apply_security_accept(accept.map(|attr| attr.value))?;
 		self.mux_settings = client_mux_settings(self.transport_offer.as_ref(), transport_accept.as_ref())?;
 
-		// 6. Validate the session receipt (countersigned later, in the
-		// client Finished)
+		// 6. Validate the session receipt (countersigned later, in the client Finished)
 		self.process_session_receipt(&signed_data, transport_accept.as_ref())?;
 
 		// 7. Add server finished to transcript AFTER verification
 		self.transcript_buffer.extend_from_slice(signed_data_der);
 
-		// 8. Transition state & lock transcript (transcript hash verified)
+		// 8. Transition state and lock the transcript (transcript hash verified)
 		self.state.transition(ClientHandshakeState::ServerFinishedReceived)?;
 
 		Ok(verified_content)
@@ -672,8 +673,8 @@ where
 		// 4. Build cryptographic components
 		let signer = self.build_finished_crypto_components().await?;
 
-		// 5. Countersign the session receipt: signature and settlement
-		// answer travel as SignerInfo unsigned attributes
+		// 5. Countersign the session receipt: signature and settlement answer travel as SignerInfo
+		//    unsigned attributes
 		let receipt_attrs = self.countersign_pending_receipt().await?;
 
 		// 6. Build SignedData structure
@@ -707,7 +708,8 @@ where
 		self.stored_receipt.as_ref()
 	}
 
-	/// Server peer identity: pinned certificate or chain leaf used for encryption.
+	/// Server peer identity: pinned certificate or chain leaf used for
+	/// encryption.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
 		self.server_leaf().ok()
 	}
@@ -736,19 +738,19 @@ where
 		let transcript = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 		// 3. Derive directional session keys as P::AeadCipher
-		let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript))?;
+		let directional = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, KdfSalt::new(&transcript)))?;
 		let ciphers = directional?;
 
 		// 4. Seed epoch materials for post-handshake renewal
-		let epoch_derived = cek.with(|input_key| derive_epoch_materials::<P>(input_key, &transcript, transcript))?;
+		let epoch_salt = KdfSalt::new(&transcript);
+		let epoch_derived = cek.with(|input_key| derive_epoch_materials::<P>(input_key, epoch_salt, transcript))?;
 		let materials = epoch_derived?;
 
 		// 5. Transition to complete
 		self.state.transition(ClientHandshakeState::Completed)?;
 
-		// 6. Role-map the directional ciphers. The
-		//    orchestrator is spent, so the receipt moves out rather than
-		//    copies. Both identity forms already hold a shared handle to the
+		// 6. Role-map the directional ciphers. The orchestrator is spent, so the receipt moves out
+		//    rather than being copied. Both identity forms already hold a shared handle to the
 		//    leaf, so the session takes a handle rather than a copy.
 		#[cfg(feature = "x509")]
 		let peer = match (&self.server_cert, &self.server_chain) {
@@ -872,11 +874,11 @@ where
 			self.transcript_buffer.extend_from_slice(enveloped_data_der);
 		}
 
-		// Store session key and transition state
 		// `Zeroizing` holds its buffer to the end of the scope, so the key
 		// reaches its long-term owner as a copy. Both buffers wipe.
 		self.session_key = Some(SecretSlice::from(session_key.to_vec()));
-		// Transition directly from Init -> KeyExchangeSent (CMS path) or HelloSent -> KeyExchangeSent
+		// KeyExchangeSent is reachable directly from Init on the CMS path, or
+		// from HelloSent.
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
 		Ok(())
@@ -943,7 +945,8 @@ where
 		let signer_info = SignerInfo {
 			version: CmsVersion::V1,
 			sid: id,
-			// Same OID lives in SignerInfo and the SignedData digestAlgorithms SET.
+			// Same OID lives in SignerInfo and the SignedData digestAlgorithms
+			// SET.
 			digest_alg: digest_alg.clone(),
 			signed_attrs: None,
 			signature_algorithm: signature_alg,
@@ -1026,18 +1029,14 @@ impl<T> ReceivedAttribute<T> {
 	}
 }
 
-/// Extract the server's receipt `SignedData` artifact from a Finished message's unsigned
-/// attributes, if present.
+/// Extract the server's receipt `SignedData` artifact from a Finished message's
+/// unsigned attributes, if present.
 fn extract_session_receipt_attr(signed_data: &SignedData) -> Result<Option<SignedData>, HandshakeError> {
 	signed_data
 		.find_unsigned_attr(SESSION_RECEIPT)?
 		.map(|attr| attr.decode::<SignedData>())
 		.transpose()
 }
-
-// ============================================================================
-// Common Handshake Trait Implementations
-// ============================================================================
 
 impl<P> HandshakeFinalization<P> for CmsHandshakeClient<P>
 where
@@ -1049,10 +1048,6 @@ where
 }
 
 impl<P> HandshakeAlertHandler for CmsHandshakeClient<P> where P: CryptoProvider {}
-
-// ============================================================================
-// ClientHandshakeProtocol Implementation
-// ============================================================================
 
 impl<P> ClientHandshakeProtocol for CmsHandshakeClient<P>
 where
@@ -1162,7 +1157,8 @@ mod tests {
 		// Verify session key is stored
 		assert!(client.session_key().is_some());
 
-		// Then: Server should be able to decrypt it using the matching private key
+		// Then: Server should be able to decrypt it using the matching private
+		// key
 		let server_secret = SecretKey::from(server_test_cert.signing_key.to_owned());
 		let provider = DefaultCryptoProvider::default();
 		let kari_processor = TightBeamKariRecipient::new(provider, server_secret);
@@ -1191,7 +1187,7 @@ mod tests {
 		assert_eq!(client.state(), ClientHandshakeState::ClientFinishedSent);
 
 		// The terminal transition belongs to the real completion, which derives
-		// the keys; the machine is at its last pre-terminal state.
+		// the keys, so the machine rests at its last pre-terminal state.
 		assert!(!client.is_complete());
 
 		Ok(())
@@ -1297,7 +1293,8 @@ mod tests {
 		let result = client.process_server_finished([]);
 		assert!(result.is_err());
 
-		// When: Trying to build client finished before processing server finished
+		// When: Trying to build client finished before processing server
+		// finished
 		let result = client.build_client_finished().await;
 		assert!(result.is_err());
 

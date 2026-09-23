@@ -10,8 +10,8 @@ use crate::builder::TypeBuilder;
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, ClusterPool, GatewayRuntimeCtx};
 use crate::colony::cluster::{ClusterConfig, ClusterError, HeartbeatEvent};
 use crate::colony::common::{
-	current_timestamp_ms, ClusterCommand, ClusterCommandKind, ClusterCommandOutcome, ClusterCommandResponse,
-	ClusterStatus, HeartbeatParams, HeartbeatResult,
+	ClusterCommand, ClusterCommandKind, ClusterCommandOutcome, ClusterCommandResponse, ClusterStatus, HeartbeatParams,
+	HeartbeatResult,
 };
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -32,7 +32,8 @@ use crate::{MessagePriority, Version};
 /// reach a hive through this one composer, so a probe from either side
 /// carries the same command, version, and freshness binding.
 ///
-/// [`ClusterHeartbeat::send_heartbeat`]: crate::colony::cluster::ClusterHeartbeat::send_heartbeat
+/// [`ClusterHeartbeat::send_heartbeat`]:
+/// crate::colony::cluster::ClusterHeartbeat::send_heartbeat
 pub(crate) struct HiveBeat<P: Protocol> {
 	config: Arc<ClusterConfig>,
 	pool: Arc<ClusterPool<P>>,
@@ -77,7 +78,7 @@ where
 		// `metadata.order` is the command freshness binding (CWE-294).
 		let mut signed_frame = FrameBuilder::from(Version::V2)
 			.with_id(b"heartbeat")
-			.with_order(current_timestamp_ms())
+			.with_order(self.config.clock.unix().get())
 			.with_message(cmd)
 			.with_priority(MessagePriority::NetworkControl)
 			.with_witness_hasher::<D>()
@@ -127,11 +128,10 @@ where
 
 	/// Settles one heartbeat outcome against the registries.
 	///
-	/// A live answer refreshes the hive's lease and utilization. A dead or
-	/// refused answer counts one failure. At the configured `max_failures`
-	/// the hive unregisters, its servlet routes drop, and the eviction traces
-	/// as [`CLUSTER_HIVE_EVICTED`]. The configured heartbeat callback fires
-	/// for both outcomes.
+	/// - A live answer refreshes the hive's lease and utilization.
+	/// - A dead or refused answer counts one failure. At the configured `max_failures` the hive
+	///   unregisters, its servlet routes drop, and the eviction traces as [`CLUSTER_HIVE_EVICTED`].
+	/// - The configured heartbeat callback fires for both outcomes.
 	///
 	/// A registry lock is poisoned only by a panic the crate forbids, so
 	/// a skipped lease or route update leaves the beat itself intact.

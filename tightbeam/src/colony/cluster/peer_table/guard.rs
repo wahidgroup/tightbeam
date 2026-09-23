@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use super::{ClusterError, PeerAddress, PeerRecord};
+use crate::utils::time::UnixMillis;
 
 #[derive(Debug, Clone)]
 pub struct PeerEntry {
 	pub peer_id: Option<Vec<u8>>,
-	pub last_probe_ms: u64,
+	pub last_probe: UnixMillis,
 	/// Consecutive failed beat dials since the last verified probe.
 	///
 	/// The count lives in memory only. A restart starts the count at
@@ -93,7 +94,7 @@ impl GuardedTable {
 				gateway_addr: *addr,
 				peer_id: entry.peer_id.clone(),
 				tried,
-				last_probe_ms: entry.last_probe_ms,
+				last_probe: entry.last_probe,
 			})
 			.collect()
 	}

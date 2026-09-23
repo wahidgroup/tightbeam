@@ -14,6 +14,7 @@ pub type SharedId = Arc<[u8]>;
 
 /// Entry for a registered hive in the cluster
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HiveEntry {
 	/// Hive control address
 	pub address: SharedId,
@@ -176,6 +177,8 @@ impl HiveRegistry {
 	/// needs it to put the previous registration back if that install
 	/// fails, so dropping it forfeits the rollback.
 	///
+	/// # Signer binding
+	///
 	/// `signer_id` is the DER-encoded `SignerIdentifier` from the
 	/// registration frame. Later `ServletAddressUpdate` calls must present
 	/// the same signer for this hive id, and re-registration is admitted
@@ -214,11 +217,15 @@ impl HiveRegistry {
 
 	/// Put back a registration a rollback displaced.
 	///
-	/// The restored entry passes the same signer check its registration
-	/// passed, under one guard: this mutator is not a way around the
-	/// binding [`HiveRegistry::register`] enforces (CWE-639). A restore
-	/// the check refuses leaves the id unregistered, which is the state a
-	/// refused registration should leave behind anyway.
+	/// # Signer check
+	///
+	/// The restored entry passes the same signer check its registration passed,
+	/// under one guard, so this mutator is no way around the binding
+	/// [`HiveRegistry::register`] enforces (CWE-639). A restore the check
+	/// refuses leaves the id unregistered, which is the state a refused
+	/// registration leaves behind anyway.
+	///
+	/// # Poisoned lock
 	///
 	/// A poisoned lock is a panic this crate forbids, so a restore that
 	/// cannot take the lock leaves the failed registration removed rather
@@ -296,7 +303,11 @@ impl HiveRegistry {
 	/// Returns the evicted entries so callers can retire dependent state
 	/// (e.g. servlet registry rows) for each evicted hive.
 	pub(crate) fn evict_stale(&self) -> Result<Vec<HiveEntry>, ClusterError> {
-		let now = Instant::now();
+		self.evict_stale_at(Instant::now())
+	}
+
+	/// Eviction judged against `now`, for a caller that owns the instant.
+	fn evict_stale_at(&self, now: Instant) -> Result<Vec<HiveEntry>, ClusterError> {
 		let mut members = self.members.write()?;
 
 		let stale_ids = members.stale(now, self.timeout);
@@ -331,10 +342,10 @@ impl Default for HiveRegistry {
 /// The two registries one hive's membership spans.
 ///
 /// A hive's entry lives in [`HiveRegistry`] and its servlet routes live in
-/// [`ServletRegistry`]. The pair enters and leaves together, so admission
-/// and retirement are operations here rather than a sequence each caller
-/// repeats. A caller that retired only the hive entry would leave routes
-/// pointing at a hive the colony no longer beats.
+/// [`ServletRegistry`]. The pair enters and leaves together, so admission and
+/// retirement are operations here rather than a sequence each caller repeats.
+/// Retiring only the hive entry would leave routes that point at a hive the
+/// colony has stopped beating.
 pub(crate) struct ColonyMembership<'a> {
 	hives: &'a HiveRegistry,
 	servlets: &'a ServletRegistry,
@@ -456,6 +467,7 @@ mod tests {
 	use crate::colony::cluster::servlet_registry::LocalRoute;
 	use crate::colony::common::ColonyNamespace;
 	use crate::colony::hive::ServletInfo;
+	use crate::tb_cases;
 
 	/// The signer every fixture registration binds. Registration always
 	/// names one, so the tests name one too.
@@ -512,23 +524,25 @@ mod tests {
 		Ok(())
 	}
 
-	/// (ttl, expected_evicted_len, expected_remaining_len)
-	const EVICT_STALE_CASES: &[(Duration, usize, usize)] = &[(Duration::ZERO, 1, 0), (Duration::from_secs(3600), 0, 1)];
-
-	#[test]
-	fn evict_stale_behavior() -> Result<(), ClusterError> {
-		for &(ttl, evicted_len, remaining_len) in EVICT_STALE_CASES {
+	// A lease outlives its ttl or it does not, judged at an instant the
+	// test names rather than one it waits for.
+	tb_cases! {
+		fn evict_stale((ttl, evicted_len, remaining_len): (Duration, usize, usize)) -> Result<(), ClusterError> {
 			let registry = HiveRegistry::new(ttl);
 			registry.register(request(b"hive1", &["ping"]), test_signer())?;
 
-			std::thread::sleep(Duration::from_millis(1));
+			let a_second_later = Instant::now() + Duration::from_secs(1);
+			let evicted = registry.evict_stale_at(a_second_later)?;
 
-			let evicted = registry.evict_stale()?;
 			assert_eq!(evicted.len(), evicted_len);
 			assert_eq!(registry.len()?, remaining_len);
-		}
 
-		Ok(())
+			Ok(())
+		}
+		cases {
+			expires_immediately => (Duration::ZERO, 1, 0),
+			outlives_the_probe => (Duration::from_secs(3600), 0, 1),
+		}
 	}
 
 	struct SignerRebindCase {
@@ -537,18 +551,11 @@ mod tests {
 		expect_ok: bool,
 	}
 
-	/// An unbound hive is absent from this table because it is absent from
-	/// the type: every registration binds a signer.
-	fn signer_rebind_cases() -> Vec<SignerRebindCase> {
-		vec![
-			SignerRebindCase { first: b"sid-a", second: b"sid-b", expect_ok: false },
-			SignerRebindCase { first: b"sid-a", second: b"sid-a", expect_ok: true },
-		]
-	}
-
-	#[test]
-	fn register_rejects_cross_signer_hijack() -> Result<(), ClusterError> {
-		for case in signer_rebind_cases() {
+	// A hive id stays bound to the signer that first claimed it. An unbound
+	// hive is absent from this table because it is absent from the type:
+	// every registration binds a signer.
+	tb_cases! {
+		fn register_signer_rebind(case: SignerRebindCase) -> Result<(), ClusterError> {
 			let registry = HiveRegistry::new(Duration::from_secs(3600));
 			registry.register(request(b"hive1", &["ping"]), Arc::from(case.first))?;
 
@@ -561,123 +568,13 @@ mod tests {
 			// The signer bound first always survives the attempt.
 			let bound = registry.signer_for(b"hive1")?;
 			assert_eq!(bound.as_deref(), Some(case.first));
+
+			Ok(())
 		}
-
-		Ok(())
-	}
-
-	/// One admission request and the slate it installs, tagged so the
-	/// hive row names the request its routes came from.
-	fn tagged_admission(hive_addr: &SharedId, servlet: &str) -> (RegisterHiveRequest, Vec<ServletEntry>) {
-		let mut request = request(hive_addr, &[servlet]);
-		request.metadata = Some(servlet.as_bytes().to_vec());
-		(request, slate(hive_addr, servlet))
-	}
-
-	/// The canonical type bytes a tagged admission installs as its route.
-	fn servlet_type_bytes(servlet: &str) -> SharedId {
-		let namespace = ColonyNamespace::default();
-		let urn = namespace.servlet(servlet).expect("test names satisfy the mint grammar");
-		Arc::from(urn.type_canonical_bytes().as_slice())
-	}
-
-	/// An address update writes its routes behind the admission hold.
-	///
-	/// The update reads the signer bind from one registry and writes
-	/// routes to another. A retirement that lands between those steps
-	/// would drop routes the update then reinstalls, leaving them pointed
-	/// at a hive that has left, so the write waits for the hold like
-	/// every other membership move.
-	#[test]
-	fn an_address_update_waits_for_the_admission_hold() -> Result<(), ClusterError> {
-		use std::thread;
-
-		let addr = b"hive-updating";
-		let hive_addr: SharedId = Arc::from(addr.as_slice());
-		let hives = Arc::new(HiveRegistry::default());
-		let servlets = Arc::new(ServletRegistry::default());
-		let admission = Arc::new(Mutex::new(()));
-
-		ColonyMembership::new(&hives, &servlets, &admission).admit(
-			request(addr, &["ping"]),
-			test_signer(),
-			slate(&hive_addr, "ping"),
-		)?;
-
-		let held = admission.lock().unwrap_or_else(PoisonError::into_inner);
-		let updating = {
-			let (hives, servlets, admission) = (Arc::clone(&hives), Arc::clone(&servlets), Arc::clone(&admission));
-			let hive_addr = Arc::clone(&hive_addr);
-			let added = slate(&hive_addr, "echo");
-			thread::spawn(move || {
-				ColonyMembership::new(&hives, &servlets, &admission).update_addresses(
-					&hive_addr,
-					&test_signer(),
-					added,
-					&[],
-				)
-			})
-		};
-
-		// Long enough for an unheld write to land, so the route set still
-		// reading `ping` is evidence the update is waiting.
-		thread::sleep(Duration::from_millis(50));
-		assert_eq!(servlets.local_servlets()?, vec![servlet_type_bytes("ping")]);
-
-		drop(held);
-		updating.join().expect("thread joins")?;
-		assert_eq!(servlets.local_servlets()?, vec![servlet_type_bytes("echo")]);
-
-		Ok(())
-	}
-
-	/// Two admissions of one hive never split the row from its routes.
-	///
-	/// Admission writes the hive row and installs the slate in two
-	/// separately locked registries. Interleaved without a shared hold,
-	/// the last row to land can sit beside the other request's routes, so
-	/// the gateway serves a type set the registered hive never claimed.
-	#[test]
-	fn concurrent_admissions_never_split_a_hive_from_its_routes() -> Result<(), ClusterError> {
-		use std::thread;
-
-		let contested = b"hive-contested";
-		let hive_addr: SharedId = Arc::from(contested.as_slice());
-
-		for _ in 0..500 {
-			let hives = Arc::new(HiveRegistry::default());
-			let servlets = Arc::new(ServletRegistry::default());
-			let admission = Arc::new(Mutex::new(()));
-			let admitters: Vec<_> = ["echo", "ping"]
-				.into_iter()
-				.map(|servlet| {
-					let hives = Arc::clone(&hives);
-					let servlets = Arc::clone(&servlets);
-					let admission = Arc::clone(&admission);
-					let (request, slate) = tagged_admission(&hive_addr, servlet);
-					thread::spawn(move || {
-						ColonyMembership::new(&hives, &servlets, &admission).admit(request, test_signer(), slate)
-					})
-				})
-				.collect();
-
-			for admitter in admitters {
-				admitter.join().expect("thread joins")?;
-			}
-
-			let rows = hives.all_hives()?;
-			assert_eq!(rows.len(), 1);
-
-			let tag = rows[0]
-				.metadata
-				.clone()
-				.expect("a tagged admission always carries its metadata");
-
-			let winner = core::str::from_utf8(&tag).expect("the tag is the servlet name the fixture wrote");
-			assert_eq!(servlets.local_servlets()?, vec![servlet_type_bytes(winner)]);
+		cases {
+			refuses_a_different_signer => SignerRebindCase { first: b"sid-a", second: b"sid-b", expect_ok: false },
+			admits_the_bound_signer => SignerRebindCase { first: b"sid-a", second: b"sid-a", expect_ok: true },
 		}
-
-		Ok(())
 	}
 
 	/// Two signers race to claim one hive id. Exactly one binds, because the

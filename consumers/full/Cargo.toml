@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-tightbeam = { package = "tightbeam-rs", path = "../tightbeam", default-features = false, features = [
+tightbeam = { package = "tightbeam-rs", path = "../../tightbeam", default-features = false, features = [
 	"std",
 	"builder",
 	"crypto",

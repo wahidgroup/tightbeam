@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+use core::time::Duration;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -350,7 +351,8 @@ servlet! {
 	handle: |_msg, frame, ctx| async move {
 		let trace = ctx.trace();
 
-		// Process the frame - collector gate handles back-pressure automatically
+		// Process the frame - collector gate handles back-pressure
+		// automatically
 		let harness = QueueHarness::new(Arc::clone(trace));
 		harness.handle(&frame)?;
 
@@ -393,7 +395,7 @@ tb_scenario! {
 		setup: |env| async move {
 			// The servlet under test carries no encryption, so this link is
 			// cleartext and the scenario exercises back pressure over it.
-			let restart_policy = RestartLinearBackoff::new(3, 50, 1, None);
+			let restart_policy = RestartLinearBackoff::new(3, Duration::from_millis(50), 1, None);
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.allow_cleartext()
 				.with_restart(restart_policy)
@@ -424,13 +426,15 @@ tb_scenario! {
 
 				if index == 1 {
 					// For the second frame, emit it then immediately replay it
-					// Server will throttle on first attempt, restart policy will retry
+					// Server will throttle on first attempt, restart policy
+					// will retry
 					client.emit(frame.to_owned(), None).await?;
 					trace.event_with(REPLAY_ATTEMPT, &[QUEUE_TAG], frame.metadata().order())?;
 					client.emit(frame, None).await?;
 				} else {
-					// Server-side adaptive gate will throttle Normal+ priority frames
-					// Restart policy will automatically retry throttled frames
+					// Server-side adaptive gate will throttle Normal+ priority
+					// frames Restart policy will automatically retry throttled
+					// frames
 					client.emit(frame, None).await?;
 				}
 			}

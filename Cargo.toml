@@ -3,12 +3,12 @@ resolver = "2"
 members = [
 	"tightbeam",
 	"tightbeam-derive",
-	"consumer-test",
+	"consumers/full",
 ]
 exclude = [
-	"consumer-default-test",
-	"consumer-expansion-test",
-	"consumer-sync-test",
+	"consumers/default",
+	"consumers/expansion",
+	"consumers/sync",
 ]
 
 [workspace.package]

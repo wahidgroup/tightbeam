@@ -115,7 +115,9 @@ fn doorman_pool(
 		idle_timeout: None,
 		max_connections: 1,
 		mux_offer: Some(Arc::new(TransportOffer::mux(1))),
+		..PoolConfig::default()
 	};
+
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
@@ -124,7 +126,6 @@ fn doorman_pool(
 			.with_trace(trace.share())
 			.build(),
 	);
-
 	Ok(pool)
 }
 

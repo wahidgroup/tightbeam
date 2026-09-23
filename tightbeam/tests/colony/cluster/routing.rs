@@ -120,11 +120,15 @@ tb_assert_spec! {
 
 servlet! {
 	/// Records what the handler observes about the frame it receives for
-	/// cluster-routed work. The probes cover the client's frame id, the
-	/// nonrepudiation block, the previous-frame linkage, and whether the
-	/// client's signature verifies over the received bytes. The handler
-	/// responds with a signed frame so the client can verify the response
-	/// envelope the same way.
+	/// cluster-routed work, and responds with a signed frame so the client can
+	/// verify the response envelope the same way.
+	///
+	/// The probes cover:
+	///
+	/// - the client's frame id,
+	/// - the nonrepudiation block,
+	/// - the previous-frame linkage,
+	/// - whether the client's signature verifies over the received bytes.
 	pub FrameProbeServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
@@ -180,7 +184,7 @@ async fn record_frame_contract(
 	let unsigned = Version::V2
 		.compose()
 		.with_id(b"client-signed-work")
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_previous_hash(TestDigest::info())
 		.with_message(PingRequest { value: 21 })
 		.build()?;

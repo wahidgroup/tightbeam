@@ -94,9 +94,10 @@ impl Drop for ForgetPingOnDrop {
 
 /// Cloneable client handle for a multiplexed connection.
 ///
-/// Shares pending-stream state and the outbound queue across clones
-/// (`Arc` + channel refcount bumps only). Does not drive I/O: spawn
-/// [`crate::transport::multiplex::MuxReaderDriver`] and [`crate::transport::multiplex::MuxWriterDriver`] on the caller's executor.
+/// Shares pending-stream state and the outbound queue across clones (`Arc` +
+/// channel refcount bumps only). Does not drive I/O: spawn
+/// [`crate::transport::multiplex::MuxReaderDriver`] and
+/// [`crate::transport::multiplex::MuxWriterDriver`] on the caller's executor.
 /// See [`MuxHandle::emit_on_stream`] and [`MuxHandle::ping`].
 #[derive(Clone)]
 pub struct MuxHandle {
@@ -124,10 +125,13 @@ impl MuxHandle {
 		Self { link, drain_feedback }
 	}
 
-	/// Send a request on a freshly allocated stream and await its
-	/// response. Frames beyond the peer's advertised chunk size are
-	/// segmented into `Open(first) Data(...)* Data(last)`, each chunk
-	/// gated by the peer's stream credit.
+	/// Send a request on a freshly allocated stream and await its response.
+	///
+	/// Frames beyond the peer's advertised chunk size are segmented into
+	/// `Open(first) Data(...)* Data(last)`, each chunk gated by the peer's
+	/// stream credit.
+	///
+	/// # Cancellation
 	///
 	/// Dropping the returned future before it resolves cancels the
 	/// stream: the pending entry is removed, the cap slot freed, and a
@@ -187,11 +191,11 @@ impl MuxHandle {
 	/// Open a streaming request: push chunks through the returned
 	/// [`RequestSink`], then await the returned response future.
 	///
-	/// Every push debits the session budget and parks on the peer's
-	/// stream credit exactly like [`emit_on_stream`](Self::emit_on_stream)
-	/// chunks. Streamed requests are metered and paid, not a side
-	/// channel. Dropping the sink before [`RequestSink::close`], or
-	/// the response future before it resolves, cancels the stream.
+	/// - Every push debits the session budget and parks on the peer's stream credit exactly like
+	///   [`emit_on_stream`](Self::emit_on_stream) chunks. Streamed requests are metered and paid,
+	///   not a side channel.
+	/// - Dropping the sink before [`RequestSink::close`], or the response future before it
+	///   resolves, cancels the stream.
 	///
 	/// # Errors
 	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
@@ -262,23 +266,25 @@ impl MuxHandle {
 		Ok((sink, response))
 	}
 
-	/// Open a duplex stream: push request chunks through the
-	/// returned [`RequestSink`] while consuming the streamed reply
-	/// from the returned [`StreamBody`] - both directions flow
-	/// concurrently on one stream.
+	/// Open a duplex stream: push request chunks through the returned
+	/// [`RequestSink`] while consuming the streamed reply from the returned
+	/// [`StreamBody`]. Both directions flow concurrently on one stream.
 	///
-	/// Pushes reach the wire eagerly (see [`RequestSink::push`]), so
-	/// a push-one-await-one conversation with the handler is sound.
-	/// The reply's pace stays the handler's choice: only its trailer
-	/// is guaranteed, so an exchange that must not park awaits reply
-	/// chunks it knows the handler sends.
+	/// # Pacing
 	///
-	/// The reply ends with the responder's trailer: `Ok(None)` on an
-	/// Ok status, otherwise the status mapped to its transport error.
-	/// Consuming reply chunks replenishes the peer's stream credit,
-	/// so a slow reader parks the responder (end-to-end backpressure).
-	/// Dropping the sink before [`RequestSink::close`], or the reply
-	/// body before its terminal event, cancels the stream.
+	/// - Pushes reach the wire eagerly (see [`RequestSink::push`]), so a push-one-await-one
+	///   conversation with the handler is sound.
+	/// - The reply's pace stays the handler's choice: only its trailer is guaranteed, so an
+	///   exchange that must not park awaits reply chunks it knows the handler sends.
+	/// - Consuming reply chunks replenishes the peer's stream credit, so a slow reader parks the
+	///   responder (end-to-end backpressure).
+	///
+	/// # Ending
+	///
+	/// The reply ends with the responder's trailer: `Ok(None)` on an Ok status,
+	/// otherwise the status mapped to its transport error. Dropping the sink
+	/// before [`RequestSink::close`], or the reply body before its terminal
+	/// event, cancels the stream.
 	///
 	/// # Errors
 	/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
@@ -355,7 +361,7 @@ impl MuxHandle {
 		total: u64,
 	) -> TransportResult<()> {
 		let payload = payload.as_ref();
-		let chunk_size = self.link.shared().send_chunk_size;
+		let chunk_size = self.link.shared().send_chunk_size.get();
 		let mut chunks = payload.chunks(chunk_size);
 		let mut sent: u64 = 0;
 		let first = chunks.next().unwrap_or(&[]);

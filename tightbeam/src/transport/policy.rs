@@ -6,6 +6,9 @@ use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "std")]
+use core::time::Duration;
+
 use crate::policy::GatePolicy;
 use crate::transport::error::TransportFailure;
 use crate::Frame;
@@ -68,7 +71,8 @@ impl<T> PolicyConfig for T where T: RestartConfig + EmitterGateConfig + Collecto
 /// This is the foundation trait for all retry behavior, providing
 /// max attempts and delay calculation without transport-specific details.
 pub trait CoreRetryPolicy: Send + Sync {
-	/// Maximum number of retry attempts (0 means no retries, just initial attempt).
+	/// Maximum number of retry attempts (0 means no retries, just initial
+	/// attempt).
 	fn max_attempts(&self) -> usize;
 
 	/// Delay in milliseconds before the given attempt (0-indexed).
@@ -80,15 +84,10 @@ pub trait CoreRetryPolicy: Send + Sync {
 /// Restart policies are stateless procedures that determine retry behavior
 /// after a transport operation. Requires `CoreRetryPolicy` for basic config.
 pub trait RestartPolicy: CoreRetryPolicy {
-	/// Evaluate whether to restart after a transport operation.
+	/// Decide whether to restart after a failed transport operation.
 	///
-	/// # Arguments
-	/// * `frame` - Boxed frame from the failed operation
-	/// * `failure` - The failure reason
-	/// * `attempt` - The current attempt number (0-indexed)
-	///
-	/// # Returns
-	/// * `RetryAction` - What action to take (retry with frame, or no retry)
+	/// `frame` is the frame the operation failed on, and `attempt` counts from
+	/// zero. The answer either retries with a frame or stops.
 	fn evaluate(&self, frame: Box<Frame>, failure: &TransportFailure, attempt: usize) -> RetryAction;
 }
 
@@ -153,8 +152,8 @@ pub struct RestartExponentialBackoff {
 	pub max_attempts: usize,
 	/// Base delay in milliseconds, doubled per attempt.
 	pub scale_factor: u64,
-	/// Randomization applied to each computed delay; `None` retries on
-	/// the exact schedule.
+	/// Randomization applied to each computed delay. `None` retries on the
+	/// exact schedule.
 	pub jitter: Option<Box<dyn JitterStrategy>>,
 }
 
@@ -175,18 +174,20 @@ impl Default for RestartExponentialBackoff {
 /// Linear backoff restart policy.
 ///
 /// Retries on errors with linearly increasing delays.
-/// The delay increases by: scale_factor * interval_ms * (attempt + 1)
-/// milliseconds.
+/// The delay increases by: `scale_factor * interval * (attempt + 1)`.
 #[cfg(feature = "std")]
 pub struct RestartLinearBackoff {
 	/// Attempts after which the policy answers [`RetryAction::NoRetry`].
 	pub max_attempts: usize,
-	/// Delay increment per attempt, in milliseconds.
-	pub interval_ms: u64,
+	/// Delay increment per attempt.
+	///
+	/// A [`Duration`] rather than a bare count, so it cannot be exchanged
+	/// with `scale_factor` at a call site that passes both.
+	pub interval: Duration,
 	/// Multiplier applied to the linear delay.
 	pub scale_factor: u64,
-	/// Randomization applied to each computed delay; `None` retries on
-	/// the exact schedule.
+	/// Randomization applied to each computed delay. `None` retries on the
+	/// exact schedule.
 	pub jitter: Option<Box<dyn JitterStrategy>>,
 }
 
@@ -194,11 +195,11 @@ pub struct RestartLinearBackoff {
 impl RestartLinearBackoff {
 	pub fn new(
 		max_attempts: usize,
-		interval_ms: u64,
+		interval: Duration,
 		scale_factor: u64,
 		jitter: Option<Box<dyn JitterStrategy>>,
 	) -> Self {
-		Self { max_attempts, interval_ms, scale_factor, jitter }
+		Self { max_attempts, interval, scale_factor, jitter }
 	}
 }
 
@@ -207,7 +208,7 @@ impl Default for RestartLinearBackoff {
 	fn default() -> Self {
 		Self {
 			max_attempts: 5,
-			interval_ms: 1000,
+			interval: Duration::from_secs(1),
 			scale_factor: 1,
 			jitter: Some(Box::new(DecorrelatedJitter)),
 		}
@@ -252,7 +253,7 @@ impl_timed_backoff_policy!(
 impl_timed_backoff_policy!(RestartLinearBackoff, |policy: &RestartLinearBackoff, attempt: usize| {
 	policy
 		.scale_factor
-		.saturating_mul(policy.interval_ms)
+		.saturating_mul(policy.interval.as_millis() as u64)
 		.saturating_mul(attempt as u64 + 1)
 });
 
@@ -284,7 +285,7 @@ impl CoreRetryPolicy for RestartLinearBackoff {
 	fn delay_ms(&self, attempt: usize) -> u64 {
 		let base_delay = self
 			.scale_factor
-			.saturating_mul(self.interval_ms)
+			.saturating_mul(self.interval.as_millis() as u64)
 			.saturating_mul(attempt as u64 + 1);
 
 		match &self.jitter {

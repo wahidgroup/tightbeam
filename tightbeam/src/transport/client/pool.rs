@@ -21,6 +21,7 @@ use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::protocols::{PersistentConnection, Protocol};
 use crate::transport::MessageCollector;
 use crate::transport::{TransportResult, X509ClientConfig};
+use crate::utils::time::{Clock, SystemClock};
 
 #[cfg(feature = "aes-gcm")]
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -83,7 +84,8 @@ pooled_mux! {
 
 /// Shared builder surface for direct clients and connection pools.
 ///
-/// [`crate::transport::client::ClientBuilder`] and [`ConnectionPoolBuilder`] both implement this trait
+/// [`crate::transport::client::ClientBuilder`] and [`ConnectionPoolBuilder`]
+/// both implement this trait
 /// so callers configure timeouts and identity the same way.
 pub trait ConnectionBuilder<P: Protocol>: Sized {
 	/// Built client or pool produced by [`ConnectionBuilder::build`].
@@ -109,7 +111,8 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 pub struct PoolConfig {
 	/// Drop idle exclusive leases after this duration.
 	///
-	/// `None` keeps idle connections until the pool evicts them for other reasons.
+	/// `None` keeps idle connections until the pool evicts them for other
+	/// reasons.
 	pub idle_timeout: Option<Duration>,
 	/// Hard cap on live connections across all destinations (default: 64).
 	pub max_connections: usize,
@@ -119,11 +122,19 @@ pub struct PoolConfig {
 	/// until stream caps fill. The value is shared by refcount across dials.
 	/// The handshake still clones the offer once into the orchestrator.
 	pub mux_offer: Option<Arc<TransportOffer>>,
+	/// The clock idle time is measured against. Defaults to
+	/// [`SystemClock`].
+	pub clock: Arc<dyn Clock>,
 }
 
 impl Default for PoolConfig {
 	fn default() -> Self {
-		Self { idle_timeout: None, max_connections: 64, mux_offer: None }
+		Self {
+			idle_timeout: None,
+			max_connections: 64,
+			mux_offer: None,
+			clock: Arc::new(SystemClock),
+		}
 	}
 }
 
@@ -314,6 +325,36 @@ struct AvailableEntry<P: Protocol> {
 }
 
 pooled_mux! {
+	/// When a mux entry last carried traffic, read against the pool's clock.
+	///
+	/// The entry and every lease drawn from it share one stamp, so an emit
+	/// through any lease keeps the entry from idling out.
+	struct ActivityStamp {
+		at: Mutex<Instant>,
+		clock: Arc<dyn Clock>,
+	}
+
+	impl ActivityStamp {
+		/// A stamp set to the clock's current instant.
+		fn new(clock: Arc<dyn Clock>) -> Self {
+			let at = Mutex::new(clock.monotonic());
+
+			Self { at, clock }
+		}
+
+		/// Record activity now.
+		fn touch(&self) {
+			*self.at.lock().unwrap_or_else(PoisonError::into_inner) = self.clock.monotonic();
+		}
+
+		/// The instant of the last recorded activity.
+		fn at(&self) -> Instant {
+			*self.at.lock().unwrap_or_else(PoisonError::into_inner)
+		}
+	}
+}
+
+pooled_mux! {
 	/// One shared multiplexed connection to a destination.
 	///
 	/// The handle is cloneable, so entries are never leased exclusively and
@@ -330,7 +371,7 @@ pooled_mux! {
 		/// The mux core does not read a clock. Each lease updates this stamp
 		/// when emit starts, outside the pool lock. An entry with pending
 		/// streams stays active even if the stamp is old.
-		last_used: Arc<Mutex<Instant>>,
+		last_used: Arc<ActivityStamp>,
 		/// Validated peer certificate pinned at the eager mux handshake.
 		///
 		/// The mux drivers consume the transport, so the certificate is
@@ -451,7 +492,7 @@ where
 	{
 		let mut pools = self.write_pools()?;
 		if let Some(dest_pool) = pools.get_mut(addr) {
-			self.prune_idle_locked(dest_pool, Instant::now());
+			self.prune_idle_locked(dest_pool, self.config.clock.monotonic());
 
 			while let Some(entry) = dest_pool.available.pop_front() {
 				if <P as PersistentConnection>::is_connected(entry.client.transport()) {
@@ -501,7 +542,7 @@ where
 		};
 
 		let dest_pool = pools.entry(addr.clone()).or_default();
-		self.prune_idle_locked(dest_pool, Instant::now());
+		self.prune_idle_locked(dest_pool, self.config.clock.monotonic());
 
 		Ok(SlotGuard::new(Arc::clone(self)))
 	}
@@ -534,7 +575,7 @@ where
 				return true;
 			}
 
-			let last_used = *entry.last_used.lock().unwrap_or_else(PoisonError::into_inner);
+			let last_used = entry.last_used.at();
 			let expired = now.duration_since(last_used) >= timeout;
 			if expired {
 				// GoAway before close (RFC 9113 § 6.8): the reader task
@@ -736,7 +777,7 @@ pooled_mux! {
 			drop(responder);
 
 			let id = self.mux_ids.fetch_add(1, Ordering::Relaxed);
-			let last_used = Arc::new(Mutex::new(Instant::now()));
+			let last_used = Arc::new(ActivityStamp::new(Arc::clone(&self.config.clock)));
 
 			{
 				// A failed lock must not leak the spawned drivers: aborting
@@ -781,7 +822,7 @@ pooled_mux! {
 				None => return Ok(None),
 			};
 
-			self.prune_idle_locked(dest_pool, Instant::now());
+			self.prune_idle_locked(dest_pool, self.config.clock.monotonic());
 
 			dest_pool.mux.retain(|entry| {
 				let alive = !entry.reader_task.is_finished();
@@ -810,7 +851,8 @@ pooled_mux! {
 				MuxSelection::RequireHeadroom => None,
 			};
 
-			// Handle clone is a refcount bump: the entry stays pooled for other callers.
+			// Handle clone is a refcount bump: the entry stays pooled for other
+			// callers.
 			let selected = with_headroom.or(fallback).map(MuxLease::from);
 
 			#[cfg(feature = "instrument")]
@@ -860,7 +902,7 @@ pooled_mux! {
 		/// Shared with the pool entry: the lease stamps it on each emit
 		/// so the pruner can read idle time without a clock in the mux
 		/// core (see [`MuxEntry::last_used`]).
-		last_used: Arc<Mutex<Instant>>,
+		last_used: Arc<ActivityStamp>,
 		/// Shared handle to the entry's pinned peer certificate
 		/// (see [`MuxEntry::peer_certificate`]).
 		peer_certificate: Option<Arc<Certificate>>,
@@ -871,7 +913,7 @@ pooled_mux! {
 		/// stream itself is covered by `has_pending_streams` while in
 		/// flight.
 		fn stamp(&self) {
-			*self.last_used.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+			self.last_used.touch();
 		}
 	}
 
@@ -1198,7 +1240,7 @@ where
 				if is_healthy {
 					dest_pool
 						.available
-						.push_back(AvailableEntry { client, last_used: Instant::now() });
+						.push_back(AvailableEntry { client, last_used: self.pool.config.clock.monotonic() });
 
 					returned_to_pool = true;
 				}
@@ -1246,7 +1288,8 @@ where
 			return;
 		}
 
-		// The reserved connection never materialized, so it leaves the live set.
+		// The reserved connection never materialized, so it leaves the live
+		// set.
 		self.pool.release_connection_count();
 	}
 }

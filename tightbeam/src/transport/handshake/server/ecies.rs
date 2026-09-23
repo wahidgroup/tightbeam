@@ -40,6 +40,7 @@ use crate::transport::handshake::negotiation::{
 	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, StrengthFloor, TransportAccept,
 	TransportAuthorizer, TransportNegotiation, TransportOffer,
 };
+use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
@@ -118,13 +119,12 @@ where
 	P::AeadCipher: KeyInit,
 	P::Signature: SignatureEncoding,
 {
-	/// Create a new ECIES handshake server.
+	/// Create an ECIES handshake server that presents `server_cert` to the
+	/// client.
 	///
-	/// # Parameters
-	/// - `server_key_provider`: The key provider for cryptographic operations
-	/// - `server_cert`: The server's certificate to send to client
-	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
-	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
+	/// `aad_domain_tag` defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`.
+	/// `client_validators`, when present, authenticate the client certificate
+	/// for mutual authentication.
 	pub fn new(
 		server_key_provider: Arc<dyn SigningKeyProvider>,
 		server_cert: Arc<Certificate>,
@@ -168,8 +168,9 @@ where
 
 	/// Override the minimum-strength policy applied during negotiation.
 	///
-	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit digest).
-	/// Pass `NoStrengthFloor` only where weaker profiles must remain negotiable.
+	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit
+	/// digest). Pass `NoStrengthFloor` only where weaker profiles must remain
+	/// negotiable.
 	#[must_use]
 	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
 		self.strength_floor = StrengthFloor::with_policy(policy);
@@ -201,13 +202,7 @@ where
 		self
 	}
 
-	/// Process ClientHello and build ServerHandshake message.
-	///
-	/// # Parameters
-	/// - `client_hello_der`: DER-encoded ClientHello from client
-	///
-	/// # Returns
-	/// DER-encoded ServerHandshake
+	/// Process the ClientHello and build the ServerHandshake message.
 	pub async fn process_client_hello(
 		&mut self,
 		client_hello_der: impl AsRef<[u8]>,
@@ -285,7 +280,7 @@ where
 		let server_handshake =
 			self.build_server_handshake(server_random, signature_bytes, security_accept, transport_accept)?;
 
-		// 11. Transition state through ServerHelloReceived to ServerHelloSent
+		// 11. Transition state through ClientHelloReceived to ServerHelloSent
 		self.state.transition(ServerHandshakeState::ClientHelloReceived)?;
 		self.state.transition(ServerHandshakeState::ServerHelloSent)?;
 
@@ -330,13 +325,8 @@ where
 		Ok(())
 	}
 
-	/// Process ClientKeyExchange message (decrypt ECIES-encrypted session key).
-	///
-	/// # Parameters
-	/// - `client_kex_der`: DER-encoded ClientKeyExchange from client
-	///
-	/// # Returns
-	/// Success (session key stored internally)
+	/// Process the ClientKeyExchange message and decrypt the ECIES-encrypted
+	/// session key, which stays stored inside the server.
 	pub async fn process_client_key_exchange(&mut self, client_kex_der: impl AsRef<[u8]>) -> Result<(), HandshakeError>
 	where
 		P::Curve: Curve + CurveArithmetic,
@@ -385,10 +375,8 @@ where
 		Ok(())
 	}
 
-	/// Complete the handshake and derive the directional session keys.
-	///
-	/// # Returns
-	/// Client-to-server and server-to-client AEAD ciphers from the provider
+	/// Complete the handshake and derive the provider's client-to-server and
+	/// server-to-client AEAD ciphers.
 	pub fn complete(&mut self) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError> {
 		// 1. Validate current state is KeyExchangeReceived
 		self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
@@ -405,15 +393,14 @@ where
 
 		let salt_bytes = salt.as_slice();
 		let input_key_material = base_session_key.as_slice();
-		let session_ciphers = self.derive_directional_aead(input_key_material, salt_bytes)?;
+		let session_ciphers = self.derive_directional_aead(input_key_material, KdfSalt::new(salt_bytes))?;
 
-		// 4. Derive the epoch-0 rekey materials alongside the traffic
-		// keys, from the same inputs plus the transcript hash: an in-band
-		// renewal later chains from this secret without touching the
-		// handshake again
+		// 4. Derive the epoch-0 rekey materials alongside the traffic keys, from the same inputs
+		//    plus the transcript hash: an in-band renewal later chains from this secret without
+		//    touching the handshake again
 		if let Some(transcript_hash) = self.transcript_hash {
 			let input_key_material = base_session_key.as_slice();
-			let materials = derive_epoch_materials::<P>(input_key_material, salt_bytes, transcript_hash)?;
+			let materials = derive_epoch_materials::<P>(input_key_material, KdfSalt::new(salt_bytes), transcript_hash)?;
 			self.epoch_materials = Some(materials);
 		}
 
@@ -611,12 +598,10 @@ where
 	/// Validate and capture the offered client identity when mutual auth
 	/// is configured.
 	///
-	/// When `client_validators` is set, a client certificate is required.
-	/// Every validator MUST pass before the possession check, and only
-	/// then is the identity stored. When validators are absent
-	/// (server-auth only), the session stays anonymous: an offered
-	/// certificate is discarded, and
-	/// [`SessionContext`](crate::policy::SessionContext) reports no peer.
+	/// - With `client_validators` set, a client certificate is required. Every validator MUST pass
+	///   before the possession check, and only then is the identity stored.
+	/// - Without validators (server-auth only), the session stays anonymous: an offered certificate
+	///   is discarded, and [`SessionContext`](crate::policy::SessionContext) reports no peer.
 	#[cfg(feature = "x509")]
 	fn validate_client_certificate(&mut self, client_kex: &mut ClientKeyExchange) -> Result<(), HandshakeError>
 	where
@@ -676,10 +661,10 @@ where
 
 	/// Verify the client's receipt countersignature and settle with the
 	/// authorizer.
+	///
 	/// A handshake that issued no receipt completes here. An issued receipt
 	/// fails closed: a missing or invalid countersignature aborts the
-	/// handshake, and a [`StoredReceipt`] is retained once both hold.
-	/// [`StoredReceipt`] is retained only after both.
+	/// handshake, and a [`StoredReceipt`] is retained only after both hold.
 	#[cfg(feature = "x509")]
 	async fn process_receipt_ack(&mut self, receipt_ack: Option<SignerInfo>) -> Result<(), HandshakeError>
 	where
@@ -756,10 +741,6 @@ where
 	}
 }
 
-// ============================================================================
-// Common Handshake Trait Implementations
-// ============================================================================
-
 impl<P> HandshakeNegotiation<P> for EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
@@ -783,10 +764,6 @@ where
 }
 
 impl<P> HandshakeAlertHandler for EciesHandshakeServer<P> where P: CryptoProvider {}
-
-// ============================================================================
-// ServerHandshakeProtocol Implementation
-// ============================================================================
 
 impl<P> ServerHandshakeProtocol for EciesHandshakeServer<P>
 where
@@ -883,8 +860,8 @@ mod tests {
 
 	/// Test the full server state flow through a complete handshake.
 	///
-	/// Verifies that the server correctly transitions through all states:
-	/// Init -> ServerHelloSent -> KeyExchangeReceived -> Complete
+	/// The server moves from Init through ServerHelloSent and
+	/// KeyExchangeReceived to Complete.
 	#[tokio::test]
 	async fn test_server_state_flow() -> Result<(), Box<dyn Error>> {
 		let mut server = TestEciesServerBuilder::new().build()?;
@@ -1143,10 +1120,6 @@ mod tests {
 
 		Ok(())
 	}
-
-	// ========================================================================
-	// Test Helper Functions
-	// ========================================================================
 
 	/// Build a test ClientKeyExchange with ECIES-encrypted session key.
 	///

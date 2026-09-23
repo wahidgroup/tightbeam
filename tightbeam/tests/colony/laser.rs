@@ -266,7 +266,7 @@ tb_scenario! {
 					.with_config(PoolConfig {
 						idle_timeout: None,
 						max_connections: 1,
-						mux_offer: Some(Arc::new(TransportOffer::mux(8))),
+						mux_offer: Some(Arc::new(TransportOffer::mux(8))), ..PoolConfig::default()
 					})
 					.with_trust_store(Arc::clone(&certs.trust))
 					.build(),

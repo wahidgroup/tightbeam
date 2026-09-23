@@ -7,7 +7,8 @@
 //! # Planes
 //!
 //! - **Direct advertisement**: one signed frame dials every verified target.
-//! - **Rumor flood**: the same signed frame wraps in a gossip rumor for members beyond direct reach.
+//! - **Rumor flood**: the same signed frame wraps in a gossip rumor for members beyond direct
+//!   reach.
 //! - **Pipeline**: admit, rate-limit, journal, deliver locally, and reflood inbound rumors.
 //! - **Reconcile**: anti-entropy repair and peer-exchange hint learning.
 
@@ -31,11 +32,12 @@ use crate::colony::cluster::{
 	gossip_fresh, wanted_digests, Admission, AdmittedGossip, GossipDigest, PeerCaps, PeerHint, RouteKind,
 };
 use crate::colony::cluster::{ClusterConfig, ClusterError, PeerAddress, ServletRegistry};
-use crate::colony::common::{
-	current_timestamp_ms, ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipRumorKind,
-	GossipWant, PeerAdvertisement, PeerAdvertisementResponse, PeerGossip,
-};
+use crate::colony::common::IssuedAt;
 use crate::colony::common::{reply_frame, TaskGroup};
+use crate::colony::common::{
+	ClusterRequest, GossipReconciliation, GossipResponse, GossipRumor, GossipRumorKind, GossipWant, PeerAdvertisement,
+	PeerAdvertisementResponse, PeerGossip,
+};
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::{MAX_ADVERTISED_TYPES, MAX_GOSSIP_LOG, MAX_GOSSIP_TTL, MAX_PEX_SAMPLE};
 use crate::crypto::profiles::DefaultCryptoProvider;
@@ -56,6 +58,7 @@ use crate::transport::multiplex::MuxConnector;
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
+use crate::utils::time::UnixMillis;
 use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
@@ -101,7 +104,7 @@ struct MintedAdRumor {
 	rumor: Frame,
 	digest: GossipDigest,
 	signer_id: Vec<u8>,
-	minted_ms: u64,
+	minted_at: UnixMillis,
 }
 
 impl ServletRegistry {
@@ -148,7 +151,7 @@ impl ClusterConfig {
 
 		let mut signed_frame = FrameBuilder::from(Version::V2)
 			.with_id(b"peer-advertise")
-			.with_order(current_timestamp_ms())
+			.with_order(self.clock.unix().get())
 			.with_message(request)
 			.with_priority(MessagePriority::NetworkControl)
 			.with_witness_hasher::<D>()
@@ -177,11 +180,11 @@ impl ClusterConfig {
 		let ad_frame = self.mint_ad_frame::<D>(gateway_addr, types).await.ok()?;
 		let ad_bytes = encode(&ad_frame).ok()?;
 
-		let minted_ms = current_timestamp_ms();
+		let minted_at = self.clock.unix();
 		let body = GossipRumor::peer_advertisement(ad_bytes);
 		let mut rumor = FrameBuilder::from(Version::V2)
 			.with_id(b"peer-ad-rumor")
-			.with_order(minted_ms)
+			.with_order(minted_at.get())
 			.with_message(body)
 			.with_priority(MessagePriority::NetworkControl)
 			.with_witness_hasher::<D>()
@@ -195,7 +198,7 @@ impl ClusterConfig {
 		let digest = rumor.gossip_digest::<D>().ok()?;
 		let signer_id = rumor.signer_id()?;
 
-		Some(MintedAdRumor { rumor, digest, signer_id, minted_ms })
+		Some(MintedAdRumor { rumor, digest, signer_id, minted_at })
 	}
 
 	/// Whether `order` sits inside this colony's control freshness window.
@@ -210,8 +213,8 @@ impl ClusterConfig {
 	///   tombstone covers every replay that reaches reconcile (CWE-294).
 	/// - A far-future order is refused, so every ledger row stays prunable
 	///   (CWE-770).
-	fn ad_order_fresh(&self, order: u64, now: u64) -> bool {
-		now.abs_diff(order) <= self.control_freshness_window_ms
+	fn ad_order_fresh(&self, order: UnixMillis, now: UnixMillis) -> bool {
+		now.abs_diff(order) <= self.control_freshness_window
 	}
 
 	/// Peer-exchange hints this gateway may learn.
@@ -395,8 +398,9 @@ where
 	///
 	/// # Failures
 	///
-	/// A creation fault returns `false`, traces `CLUSTER_PEER_AD_PUBLISH_FAILED`,
-	/// and leaves the caller's publish baseline intact so the next beat retries.
+	/// A creation fault returns `false`, traces
+	/// `CLUSTER_PEER_AD_PUBLISH_FAILED`, and leaves the caller's publish
+	/// baseline intact so the next beat retries.
 	async fn publish_slate_rumor<D: ClusterDigest>(
 		&self,
 		gateway_addr: Arc<[u8]>,
@@ -418,7 +422,7 @@ where
 			.config
 			.gossip
 			.journal
-			.witness(&minted.signer_id, minted.digest, minted.minted_ms)
+			.witness(&minted.signer_id, minted.digest, minted.minted_at)
 			.is_err()
 		{
 			self.trace.event(CLUSTER_GOSSIP_WITNESS_REFUSED)?;
@@ -433,7 +437,8 @@ where
 		Ok(true)
 	}
 
-	/// One anti-entropy reconcile round with a peer, including grey-hole scoring.
+	/// One anti-entropy reconcile round with a peer, including grey-hole
+	/// scoring.
 	///
 	/// An `Err` from this function is peer-attributable, so the beat loops
 	/// score it toward eviction or probe discard. A local fault skips its own
@@ -458,7 +463,7 @@ where
 		acked: &mut HashSet<GossipDigest>,
 		peer: PeerAddress,
 	) -> Result<(), ClusterError> {
-		let now = current_timestamp_ms();
+		let now = self.config.clock.unix();
 		// A journal fault belongs to this gateway, so the round is skipped and
 		// scoring stays attributable to the peer.
 		let Ok(held_digests) = self.config.gossip.journal.held_digests(now) else {
@@ -495,7 +500,7 @@ where
 		// than scored.
 		let Ok(mut signed_frame) = FrameBuilder::from(Version::V2)
 			.with_id(b"gossip-reconcile")
-			.with_order(now)
+			.with_order(now.get())
 			.with_message(request)
 			.with_priority(MessagePriority::NetworkControl)
 			.with_witness_hasher::<D>()
@@ -514,8 +519,9 @@ where
 		let reply: GossipWant = decode(response.message())?;
 
 		// An oversized want-list or PEX sample is abuse, so the round fails
-		// (CWE-770). The beat then scores the peer like any failed round, so an abuser
-		// is discarded from `new` or counted toward eviction from `tried`.
+		// (CWE-770). The beat then scores the peer like any failed round, so an
+		// abuser is discarded from `new` or counted toward eviction from
+		// `tried`.
 		if reply.is_oversized() {
 			return Err(ClusterError::OversizedReconcileReply);
 		}
@@ -543,7 +549,7 @@ where
 		reply: GossipWant,
 		acked: &mut HashSet<GossipDigest>,
 		peer: PeerAddress,
-		now: u64,
+		now: UnixMillis,
 	) -> Result<(), ClusterError> {
 		let round: Result<(), ClusterError> = async {
 			// Promotion waits for the reply because a pooled connection keeps
@@ -603,11 +609,11 @@ where
 		let targets = targets.as_ref();
 		let reconciling = self.config.colony_urn().is_some();
 		for peer in targets {
-			// A discovery peer is a socket; a gateway dials `P::Address`,
-			// which is whatever the protocol addresses with (the laser
-			// test protocol addresses by airspace slot). Rendering and
-			// re-parsing is the bridge between the two, so this is a
-			// conversion rather than a repeated parse of one value.
+			// A discovery peer is a socket, and a gateway dials `P::Address`,
+			// which is whatever the protocol addresses with (the laser test
+			// protocol addresses by airspace slot). Rendering and re-parsing
+			// bridges the two, so this is a conversion rather than a repeated
+			// parse of one value.
 			let Ok(peer_addr) = peer.socket().to_string().parse::<P::Address>() else {
 				continue;
 			};
@@ -698,12 +704,12 @@ where
 		acked: &mut HashSet<GossipDigest>,
 	) -> Result<(), ClusterError> {
 		let wanted = wanted.as_ref();
-		let now = current_timestamp_ms();
-		let seen_ttl_ms = self.config.gossip.seen_ttl.as_millis() as u64;
+		let now = self.config.clock.unix();
+		let seen_ttl = self.config.gossip.seen_ttl;
 		let missing = self.config.gossip.journal.fetch(wanted, now)?;
 		let admissible = missing
 			.into_iter()
-			.filter(|rumor| gossip_fresh(rumor.metadata().order(), seen_ttl_ms, now));
+			.filter(|rumor| gossip_fresh(rumor.issued_at(), seen_ttl, now));
 
 		for rumor in admissible {
 			let Ok(pushed_digest) = rumor.gossip_digest::<D>() else {
@@ -789,7 +795,8 @@ where
 		+ Sync
 		+ 'static,
 {
-	/// Deliver one admitted rumor payload to the configured local ingress servlet.
+	/// Deliver one admitted rumor payload to the configured local ingress
+	/// servlet.
 	///
 	/// The claim is taken before the round trip and owned by a guard, so
 	/// the admission path and the reconcile beat never deliver one rumor
@@ -811,7 +818,7 @@ where
 		// Taking the claim before the round trip keeps the reconcile beat
 		// off this rumor. Every exit below drops the guard, which returns
 		// the rumor to the retry set.
-		let Some(claim) = LocalClaimGuard::take(journal.as_ref(), &digest_value, current_timestamp_ms()) else {
+		let Some(claim) = LocalClaimGuard::take(journal.as_ref(), &digest_value, self.config.clock.unix()) else {
 			return Ok(());
 		};
 
@@ -839,7 +846,7 @@ where
 	/// or when a delivery hit a transient fault. Application rumors are the
 	/// retained kind, so delivery accepts that kind alone.
 	async fn retry_pending_local<D: ClusterDigest>(&self) -> Result<(), TightBeamError> {
-		let Ok(pending) = self.config.gossip.journal.pending_local(current_timestamp_ms()) else {
+		let Ok(pending) = self.config.gossip.journal.pending_local(self.config.clock.unix()) else {
 			return Ok(());
 		};
 
@@ -880,18 +887,14 @@ where
 		relay_id: Option<VerifiedSignerId>,
 		rumor_signer: Option<VerifiedSignerId>,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let admitted = match AdmittedGossip::admit::<D>(
-			&rumor,
-			hop_ttl,
-			self.config.gossip.seen_ttl.as_millis() as u64,
-			current_timestamp_ms(),
-		) {
-			Ok(admitted) => admitted,
-			Err(status) => {
-				self.weaken_invalid_relay(origin, relay_id.as_ref())?;
-				return Refusal::to(&frame, &self.trace).gossip(status);
-			}
-		};
+		let admitted =
+			match AdmittedGossip::admit::<D>(&rumor, hop_ttl, self.config.gossip.seen_ttl, self.config.clock.unix()) {
+				Ok(admitted) => admitted,
+				Err(status) => {
+					self.weaken_invalid_relay(origin, relay_id.as_ref())?;
+					return Refusal::to(&frame, &self.trace).gossip(status);
+				}
+			};
 
 		// Rate and journal keys use the verified origin signer, so a relay
 		// spends the origin's budget (CWE-770).
@@ -903,10 +906,9 @@ where
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		};
 
-		let now = current_timestamp_ms();
-
 		// Drop known duplicates before rate admission so the bucket spends on
 		// new rumors only.
+		let now = self.config.clock.unix();
 		match self.config.gossip.journal.seen(&admitted.digest(), now) {
 			Ok(true) => {
 				self.trace.event(CLUSTER_GOSSIP_DUPLICATE)?;
@@ -1037,7 +1039,7 @@ where
 		// The rumor path applies the same bound here, so every admitted order
 		// falls inside the withdrawal tombstone's window (CWE-294) and inside
 		// the ledger's prunable range (CWE-770).
-		if !self.config.ad_order_fresh(inner.metadata().order(), current_timestamp_ms()) {
+		if !self.config.ad_order_fresh(inner.issued_at(), self.config.clock.unix()) {
 			return Ok(None);
 		}
 
@@ -1189,23 +1191,23 @@ where
 /// 4. [`Self::abort`] releases a failed claim with the old baseline
 ///    intact, so the next beat retries.
 ///
-/// [`DEFAULT_AD_RUMOR_REFRESH_MS`]: crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS
+/// [`DEFAULT_AD_RUMOR_REFRESH_MS`]:
+/// crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS
 struct AdPublishState {
 	inner: Mutex<AdPublishInner>,
-	refresh_ms: u64,
+	refresh: Duration,
 }
 
 /// Baseline and claim flag behind the [`AdPublishState`] lock.
 #[derive(Default)]
 struct AdPublishInner {
-	last: Option<(u64, Vec<Urn<'static>>, Vec<PeerAddress>)>,
+	last: Option<(UnixMillis, Vec<Urn<'static>>, Vec<PeerAddress>)>,
 	in_flight: bool,
 }
 
 impl AdPublishState {
 	fn new(refresh: Duration) -> Self {
-		let refresh_ms = u64::try_from(refresh.as_millis()).unwrap_or(u64::MAX);
-		Self { inner: Mutex::new(AdPublishInner::default()), refresh_ms }
+		Self { inner: Mutex::new(AdPublishInner::default()), refresh }
 	}
 
 	/// Claim one due publish slot.
@@ -1214,7 +1216,7 @@ impl AdPublishState {
 	/// `true` marks a publish in flight and leaves the baseline untouched
 	/// targets still match the baseline inside the refresh window, or a
 	/// publish already holds the claim.
-	fn take_due(&self, now: u64, slate: impl AsRef<[Urn<'static>]>, targets: impl AsRef<[PeerAddress]>) -> bool {
+	fn take_due(&self, now: UnixMillis, slate: impl AsRef<[Urn<'static>]>, targets: impl AsRef<[PeerAddress]>) -> bool {
 		let slate = slate.as_ref();
 		let targets = targets.as_ref();
 		let Ok(mut inner) = self.inner.lock() else {
@@ -1226,10 +1228,8 @@ impl AdPublishState {
 
 		let due = match &inner.last {
 			None => true,
-			Some((at_ms, published_slate, published_targets)) => {
-				published_slate != slate
-					|| published_targets != targets
-					|| now.saturating_sub(*at_ms) >= self.refresh_ms
+			Some((at, published_slate, published_targets)) => {
+				published_slate != slate || published_targets != targets || now.saturating_since(*at) >= self.refresh
 			}
 		};
 
@@ -1240,7 +1240,7 @@ impl AdPublishState {
 	/// Record a completed publish as the new suppression baseline.
 	fn commit(
 		&self,
-		now: u64,
+		now: UnixMillis,
 		slate: impl IntoIterator<Item = Urn<'static>>,
 		targets: impl IntoIterator<Item = PeerAddress>,
 	) {
@@ -1328,7 +1328,7 @@ where
 					// Probes are unverified candidates awaiting their feeler
 					// dial.
 					let targets = config.peer.table.target_set().unwrap_or_default();
-					let probes = config.peer.table.probe_sample(current_timestamp_ms()).unwrap_or_default();
+					let probes = config.peer.table.probe_sample(config.clock.unix()).unwrap_or_default();
 
 					push_ledger.retain(|peer, _| targets.contains(peer) || probes.contains(peer));
 
@@ -1341,7 +1341,7 @@ where
 					// The slate also floods as an origin-signed rumor, so
 					// members its own task so the direct advertisements below
 					// dial at this gateway's pace.
-					let now = current_timestamp_ms();
+					let now = config.clock.unix();
 					if config.colony_urn().is_some() && ad_publish.take_due(now, &slate, &targets) {
 						let publish_state = Arc::clone(&ad_publish);
 						let publish_beat = beat.clone();
@@ -1360,7 +1360,11 @@ where
 							// the next beat retries it.
 							match published {
 								Ok(true) => {
-									publish_state.commit(current_timestamp_ms(), publish_slate, publish_targets);
+									publish_state.commit(
+										publish_beat.config.clock.unix(),
+										publish_slate,
+										publish_targets,
+									);
 								}
 								Ok(false) | Err(_) => publish_state.abort(),
 							}
@@ -1413,7 +1417,7 @@ mod tests {
 
 	fn config_with_window(window_ms: u64) -> ClusterConfig {
 		let mut config = test_config();
-		config.control_freshness_window_ms = window_ms;
+		config.control_freshness_window = Duration::from_millis(window_ms);
 		config
 	}
 
@@ -1485,82 +1489,82 @@ mod tests {
 
 	#[test]
 	fn ad_order_inside_window_is_fresh() {
-		assert!(config_with_window(500).ad_order_fresh(1_500, 2_000));
-		assert!(config_with_window(500).ad_order_fresh(2_500, 2_000));
+		assert!(config_with_window(500).ad_order_fresh(UnixMillis::new(1_500), UnixMillis::new(2_000)));
+		assert!(config_with_window(500).ad_order_fresh(UnixMillis::new(2_500), UnixMillis::new(2_000)));
 	}
 
 	#[test]
 	fn ad_order_older_than_window_is_stale() {
-		assert!(!config_with_window(500).ad_order_fresh(1_499, 2_000));
+		assert!(!config_with_window(500).ad_order_fresh(UnixMillis::new(1_499), UnixMillis::new(2_000)));
 	}
 
 	#[test]
 	fn ad_order_past_future_window_is_stale() {
-		assert!(!config_with_window(500).ad_order_fresh(2_501, 2_000));
-		assert!(!config_with_window(500).ad_order_fresh(u64::MAX, 2_000));
+		assert!(!config_with_window(500).ad_order_fresh(UnixMillis::new(2_501), UnixMillis::new(2_000)));
+		assert!(!config_with_window(500).ad_order_fresh(UnixMillis::new(u64::MAX), UnixMillis::new(2_000)));
 	}
 
 	#[test]
 	fn ad_publish_first_beat_is_due() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
-		assert!(state.take_due(0, [], []));
+		assert!(state.take_due(UnixMillis::new(0), [], []));
 	}
 
 	#[test]
 	fn ad_publish_unchanged_state_suppresses_until_refresh() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(0, [], []);
-		state.commit(0, Vec::new(), Vec::new());
-		assert!(!state.take_due(999, [], []));
-		assert!(state.take_due(1_000, [], []));
+		state.take_due(UnixMillis::new(0), [], []);
+		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
+		assert!(!state.take_due(UnixMillis::new(999), [], []));
+		assert!(state.take_due(UnixMillis::new(1_000), [], []));
 	}
 
 	#[test]
 	fn ad_publish_slate_change_fires_before_refresh() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(0, [], []);
-		state.commit(0, Vec::new(), Vec::new());
-		assert!(state.take_due(1, ad_slate(&["ping"]), []));
+		state.take_due(UnixMillis::new(0), [], []);
+		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
+		assert!(state.take_due(UnixMillis::new(1), ad_slate(&["ping"]), []));
 	}
 
 	#[test]
 	fn ad_publish_target_change_fires_before_refresh() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(0, [], []);
-		state.commit(0, Vec::new(), Vec::new());
-		assert!(state.take_due(1, [], [peer_addr("10.0.0.1:9000")]));
+		state.take_due(UnixMillis::new(0), [], []);
+		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
+		assert!(state.take_due(UnixMillis::new(1), [], [peer_addr("10.0.0.1:9000")]));
 	}
 
 	#[test]
 	fn ad_publish_suppressed_beat_keeps_the_refresh_baseline() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(0, [], []);
-		state.commit(0, Vec::new(), Vec::new());
-		state.take_due(500, [], []);
-		assert!(state.take_due(1_000, [], []));
+		state.take_due(UnixMillis::new(0), [], []);
+		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
+		state.take_due(UnixMillis::new(500), [], []);
+		assert!(state.take_due(UnixMillis::new(1_000), [], []));
 	}
 
 	#[test]
 	fn ad_publish_claim_in_flight_blocks_reentry() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(0, [], []);
-		assert!(!state.take_due(1, ad_slate(&["ping"]), []));
+		state.take_due(UnixMillis::new(0), [], []);
+		assert!(!state.take_due(UnixMillis::new(1), ad_slate(&["ping"]), []));
 	}
 
 	#[test]
 	fn ad_publish_aborted_claim_retries_on_the_next_beat() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(0, [], []);
+		state.take_due(UnixMillis::new(0), [], []);
 		state.abort();
-		assert!(state.take_due(1, [], []));
+		assert!(state.take_due(UnixMillis::new(1), [], []));
 	}
 
 	#[test]
 	fn ad_publish_commit_settles_the_claim_and_the_baseline() {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
-		state.take_due(0, [], []);
-		state.commit(500, Vec::new(), Vec::new());
-		assert!(!state.take_due(1_499, [], []));
-		assert!(state.take_due(1_500, [], []));
+		state.take_due(UnixMillis::new(0), [], []);
+		state.commit(UnixMillis::new(500), Vec::new(), Vec::new());
+		assert!(!state.take_due(UnixMillis::new(1_499), [], []));
+		assert!(state.take_due(UnixMillis::new(1_500), [], []));
 	}
 }

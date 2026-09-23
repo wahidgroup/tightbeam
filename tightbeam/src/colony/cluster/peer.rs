@@ -7,6 +7,7 @@ use super::{
 	ClusterConfig, Party, PeerAddress, PeerConfig, PeerHint, PheromoneConfig, RelayRoute, ServletEntry, SharedId,
 };
 use crate::colony::common::ColonyResource;
+use crate::colony::common::IssuedAt;
 use crate::colony::common::{ClusterWorkRequest, ColonyNamespace, PeerAdvertisement};
 use crate::constants::{DEFAULT_HOP_BUDGET, MAX_ADVERTISED_TYPES};
 use crate::crypto::hash::Sha3_256;
@@ -15,6 +16,7 @@ use crate::crypto::x509::utils::CertificateExt;
 use crate::crypto::x509::Certificate;
 use crate::policy::TransitStatus;
 use crate::transport::multiplex::StreamRoute;
+use crate::utils::time::UnixMillis;
 use crate::utils::urn::Urn;
 use crate::x509::ext::pkix::name::GeneralName;
 use crate::x509::ext::pkix::SubjectAltName;
@@ -36,14 +38,40 @@ pub struct HopBudget {
 	relayed: bool,
 }
 
+/// The hop budget octet as a peer sent it, before the local clamp.
+///
+/// It is what separates an origin request from a relayed one, so it is a
+/// distinct type from the operator's cap it gets clamped against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WireHopBudget(u8);
+
+impl WireHopBudget {
+	/// The budget octet a peer sent.
+	#[must_use]
+	pub const fn new(hops: u8) -> Self {
+		Self(hops)
+	}
+
+	/// The octet, for the clamp that consumes it.
+	#[must_use]
+	pub const fn get(self) -> u8 {
+		self.0
+	}
+}
+
 impl HopBudget {
 	/// Clamps a wire budget to the operator's cap.
 	///
 	/// An origin request carries the sentinel budget, so the clamp also
-	/// stamps the origin with the local cap.
+	/// stamps the origin with the local cap. The wire value decides
+	/// whether a peer already relayed the request, so it arrives as its
+	/// own type rather than as one of two bare octets a call site could
+	/// exchange (CWE-639).
 	#[must_use]
-	pub fn from_wire(wire: u8, max_hops: u8) -> Self {
-		Self { remaining: wire.min(max_hops), relayed: wire != DEFAULT_HOP_BUDGET }
+	pub fn from_wire(wire: WireHopBudget, max_hops: u8) -> Self {
+		let hops = wire.get();
+
+		Self { remaining: hops.min(max_hops), relayed: hops != DEFAULT_HOP_BUDGET }
 	}
 
 	/// Spends one forward, saturating at zero.
@@ -54,12 +82,15 @@ impl HopBudget {
 
 	/// Whether a peer already spent part of this budget.
 	///
-	/// An origin request arrives carrying the sentinel, so anything below
-	/// it reached this gateway through at least one relay. The answer is
-	/// read from the wire count before the cap clamps it, because a cap
-	/// below the sentinel would otherwise make every origin request look
-	/// relayed. The export boundary reads this to tell a direct caller
-	/// from a relayed one.
+	/// An origin request arrives carrying the sentinel, so anything below it
+	/// reached this gateway through at least one relay. The export boundary
+	/// reads this to tell a direct caller from a relayed one.
+	///
+	/// # Wire count
+	///
+	/// The answer is read from the wire count before the cap clamps it, because
+	/// a cap below the sentinel would otherwise make every origin request look
+	/// relayed.
 	#[must_use]
 	pub fn is_relayed(&self) -> bool {
 		self.relayed
@@ -110,7 +141,7 @@ impl HopBudget {
 	/// A budget clamped to the default cap, for tests that pick a wire count.
 	#[cfg(test)]
 	pub(crate) fn for_test(wire: u8) -> Self {
-		Self::from_wire(wire, DEFAULT_HOP_BUDGET)
+		Self::from_wire(WireHopBudget::new(wire), DEFAULT_HOP_BUDGET)
 	}
 }
 
@@ -131,7 +162,7 @@ pub struct AdmittedPeerAd {
 	pub(super) slate: Vec<ServletEntry>,
 	/// Issue order of the signed advertisement frame. Reconciliation
 	/// refuses an order older than the newest applied (CWE-294).
-	pub(super) order: u64,
+	pub(super) order: UnixMillis,
 }
 
 /// Fallback trails for one admitted advertisement through one relay.
@@ -146,7 +177,7 @@ pub struct RelayTrail {
 	/// Relay-routed entries keyed by `bucket NUL type`.
 	pub(super) slate: Vec<ServletEntry>,
 	/// Issue order of the advertisement the trails derive from.
-	pub(super) order: u64,
+	pub(super) order: UnixMillis,
 }
 
 impl AdmittedPeerAd {
@@ -193,16 +224,20 @@ impl AdmittedPeerAd {
 		let route_addr = dial.route_bytes();
 		let slate = conf.pheromone.peer_slate(&peer_hive_id, route_addr, &ad.advertised_types);
 
-		Ok(Self { peer_hive_id, dial, slate, order: frame.metadata().order() })
+		Ok(Self { peer_hive_id, dial, slate, order: frame.issued_at() })
 	}
 
 	/// Relay trails through `relay_id`, the gateway that relayed this
 	/// advertisement: one per advertised type, dialing `relay_dial`.
 	///
+	/// # Failover
+	///
 	/// Routing then holds two trails per type: the direct trail dialing
 	/// the origin, and a relay trail through the relaying peer.
 	/// Pheromone feedback can therefore fail over to the relay when
 	/// the origin is unreachable.
+	///
+	/// # Bucket
 	///
 	/// The trails reconcile under their own `origin NUL relay` bucket
 	/// ([`super::ServletRegistry::reconcile_relay_trail`]), so the
@@ -245,13 +280,15 @@ impl AdmittedPeerAd {
 	/// Discovery hint from this admitted advertisement: the verified
 	/// signer's claimed dial address plus its certificate fingerprint.
 	///
-	/// The advertiser dialed this gateway, so nothing proves the claimed
-	/// address dials back yet. The peer table holds the hint in `new`
-	/// until this gateway's own probe passes the colony gate. The Bitcoin
-	/// address manager holds a self-announced address the same way.
-	///
 	/// The hint owns its fields because it outlives this borrowed
 	/// advertisement inside the peer table.
+	///
+	/// # Unproven address
+	///
+	/// The advertiser dialed this gateway, so nothing proves the claimed
+	/// address dials back yet. The peer table holds the hint in `new` until
+	/// this gateway's own probe passes the colony gate, the way the Bitcoin
+	/// address manager holds a self-announced address.
 	#[must_use]
 	pub fn discovery_hint(&self) -> PeerHint {
 		PeerHint { gateway_addr: self.dial, peer_id: Some(self.peer_hive_id.to_vec()) }
@@ -442,7 +479,7 @@ mod tests {
 		let dial = address(dial.as_ref());
 		let types = types.as_ref();
 		let slate = test_pheromone().peer_slate(origin, dial.route_bytes(), types);
-		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial, slate, order: 0 }
+		AdmittedPeerAd { peer_hive_id: Arc::clone(origin), dial, slate, order: UnixMillis::new(0) }
 	}
 
 	fn some_trail(trail: Option<RelayTrail>) -> RelayTrail {

@@ -18,7 +18,7 @@ use core::hash::Hash;
 use core::str::FromStr;
 
 use crate::colony::cluster::runtime::bounds::{ClusterDigest, GatewayRuntimeCtx};
-use crate::colony::cluster::{ClusterWorkRequest, ClusterWorkResponse, HopBudget};
+use crate::colony::cluster::{ClusterWorkRequest, ClusterWorkResponse, HopBudget, WireHopBudget};
 use crate::colony::common::{reply_frame, ClusterRequest};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
@@ -142,7 +142,7 @@ where
 		session: SessionContext,
 		request: ClusterWorkRequest,
 	) -> Result<Option<Frame>, TightBeamError> {
-		let budget = HopBudget::from_wire(request.hops_remaining, self.config.peer.max_hops);
+		let budget = HopBudget::from_wire(WireHopBudget::new(request.hops_remaining), self.config.peer.max_hops);
 		let export_status =
 			self.config
 				.evaluate_export_gates(&request.servlet_type, &session, budget.is_relayed(), &self.trace)?;

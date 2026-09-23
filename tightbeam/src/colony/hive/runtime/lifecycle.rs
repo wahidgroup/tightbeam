@@ -128,9 +128,9 @@ impl<P: Protocol> HiveRuntime<P> {
 			),
 			circuit_breaker: Arc::new(ClusterCircuitBreaker::new(
 				self.config.control.circuit_breaker_threshold,
-				self.config.control.circuit_breaker_cooldown_ms,
+				self.config.control.circuit_breaker_cooldown,
 			)),
-			replay_guard: Arc::new(ReplayGuard::new(self.config.control.command_freshness_window_ms)),
+			replay_guard: Arc::new(ReplayGuard::new(self.config.control.command_freshness_window)),
 			trust_store: self.config.trust_store.as_ref().map(Arc::clone),
 		}
 	}
@@ -209,7 +209,8 @@ where
 		let config = config.unwrap_or_default();
 		let pool_builder = ConnectionPool::<P>::builder().with_config(config.pool.clone());
 
-		// Intra-hive calls validate servlet certificates against the hive trust store.
+		// Intra-hive calls validate servlet certificates against the hive trust
+		// store.
 		let pool_builder = match config.trust_store.as_ref() {
 			Some(store) => pool_builder.with_trust_store(Arc::clone(store)),
 			None => pool_builder,
@@ -244,7 +245,8 @@ where
 			return Err(TightBeamError::AlreadyEstablished);
 		}
 
-		// Refuse type URNs outside this hive namespace or carrying an instance tail.
+		// Refuse type URNs outside this hive namespace or carrying an instance
+		// tail.
 		match self.config.namespace.validate(&servlet_type)? {
 			ColonyResource::Servlet { instance: None, .. } => {}
 			_ => {
@@ -263,7 +265,8 @@ where
 			}) as Pin<Box<dyn Future<Output = Result<Box<dyn ServletBox>, TightBeamError>> + Send>>
 		});
 
-		// Key by instance URN bytes so manage stop and scaling share one lookup.
+		// Key by instance URN bytes so manage stop and scaling share one
+		// lookup.
 		let key = servlet_type.instance_urn(servlet.addr_bytes())?.canonical_bytes();
 		let registration = ServletRegistration { servlet: Box::new(servlet), spawner, servlet_type };
 
@@ -362,7 +365,8 @@ where
 
 		let cluster_addr = *cluster_addr;
 		let response = link.register(cluster_addr).await?;
-		// Remember the gateway only after acceptance so refused peers are not polled.
+		// Remember the gateway only after acceptance so refused peers are not
+		// polled.
 		if response.status == TransitStatus::Ok {
 			link.remember(cluster_addr);
 		}

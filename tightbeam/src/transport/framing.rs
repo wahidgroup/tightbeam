@@ -90,6 +90,19 @@ pub(crate) struct AdmittedHeader {
 	header: FrameHeader,
 }
 
+/// The two leading octets of a DER frame, in the order the link reads them.
+///
+/// Both are bare octets, so a reader holding them loose can exchange them
+/// and parse a header the peer never sent. The named fields are what the
+/// call site binds, so the exchange has no site at which to occur.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeaderPrefix {
+	/// The identifier octet naming the frame's ASN.1 tag.
+	pub(crate) tag: u8,
+	/// The first length octet, which decides the short or long form.
+	pub(crate) length_first: u8,
+}
+
 impl FrameHeader {
 	/// Parse a tag and length field into a header.
 	///
@@ -97,7 +110,8 @@ impl FrameHeader {
 	///
 	/// [`TransportError::InvalidMessage`] when the length field is
 	/// non-canonical or uses the BER indefinite form.
-	pub(crate) fn parse(tag: u8, length_first: u8, length_octets: impl Into<Vec<u8>>) -> TransportResult<Self> {
+	pub(crate) fn parse(prefix: HeaderPrefix, length_octets: impl Into<Vec<u8>>) -> TransportResult<Self> {
+		let HeaderPrefix { tag, length_first } = prefix;
 		let length_octets: Vec<u8> = length_octets.into();
 		let declared_len = parse_der_length(length_first, &length_octets).ok_or(TransportError::InvalidMessage)?;
 		Ok(Self { tag, length_first, length_octets, declared_len })
@@ -163,7 +177,8 @@ impl TransportError {
 	}
 }
 
-/// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
+/// Reconstruct a full DER encoding from its parsed tag, length, and content
+/// parts.
 fn reconstruct_der_encoding(
 	tag: u8,
 	length_first: u8,

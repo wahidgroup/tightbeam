@@ -3,10 +3,11 @@
 //! Registration, anti-entropy re-announce, and scaling fan-out share one
 //! signed control frame shape and the same transport identity rules.
 
+use crate::utils::time::UnixMillis;
 use std::sync::{Arc, RwLock};
 
 use crate::builder::TypeBuilder;
-use crate::colony::common::{current_timestamp_ms, ClusterRequest, ServletChange, TaskGroup};
+use crate::colony::common::{ClusterRequest, ServletChange, TaskGroup};
 use crate::colony::hive::{
 	HashMapRegistry, HiveConfig, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse,
 	ServletAddressUpdateResponse, ServletRegistry,
@@ -56,7 +57,7 @@ async fn build_control_frame(
 ) -> Result<Frame, TightBeamError> {
 	let id = id.as_ref();
 	// `metadata.order` is the control freshness binding (CWE-294).
-	let order = current_timestamp_ms();
+	let order = UnixMillis::now();
 
 	match hive_tls.as_ref() {
 		Some(hive_tls) => {
@@ -65,7 +66,7 @@ async fn build_control_frame(
 			let mut signed = Version::V1
 				.compose()
 				.with_id(id)
-				.with_order(order)
+				.with_order(order.get())
 				.with_message(message)
 				.build()?;
 			signed
@@ -77,7 +78,7 @@ async fn build_control_frame(
 			let frame = Version::V0
 				.compose()
 				.with_id(id)
-				.with_order(order)
+				.with_order(order.get())
 				.with_message(message)
 				.build()?;
 			Ok(frame)
@@ -255,7 +256,8 @@ where
 				return;
 			};
 
-			// A TLS-registered hive must not fall back to cleartext for scaling updates (CWE-319).
+			// A TLS-registered hive must not fall back to cleartext for scaling
+			// updates (CWE-319).
 			let client_identity = hive_tls.as_ref().map(|tls| tls.identity().clone());
 			let retry_policy = link.config.control.notify_retry.as_ref();
 			let any_failed = fanout_scaling_update::<P>(
@@ -356,7 +358,8 @@ where
 			continue;
 		};
 
-		// Transport Ok is not acceptance: require TransitStatus::Ok in the body.
+		// Transport Ok is not acceptance: require TransitStatus::Ok in the
+		// body.
 		let mut transport = P::create_transport(stream).with_encryption(encryption.clone());
 		match transport.emit(frame.clone(), None).await {
 			Ok(Some(response)) => {

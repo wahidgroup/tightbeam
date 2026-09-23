@@ -15,9 +15,9 @@ use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tightbeam::utils::time::{Clock, ManualClock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 
 use tightbeam::at_least;
 use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
@@ -245,15 +245,26 @@ impl MuxService for MixedService {
 	}
 }
 
+/// Idle pruning for a test pool: the timeout, and the clock it is judged
+/// against.
+struct IdlePrune {
+	timeout: Duration,
+	clock: Arc<dyn Clock>,
+}
+
 fn mux_pool_with_idle_timeout(
 	materials: &ServerMaterials,
 	offer: Option<TransportOffer>,
 	max_connections: usize,
-	idle_timeout: Option<Duration>,
+	idle: Option<IdlePrune>,
 	trace: &TraceCollector,
 ) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
 	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let config = PoolConfig { idle_timeout, max_connections, mux_offer: offer.map(Arc::new) };
+	let mut config = PoolConfig { max_connections, mux_offer: offer.map(Arc::new), ..PoolConfig::default() };
+	if let Some(IdlePrune { timeout, clock }) = idle {
+		config.idle_timeout = Some(timeout);
+		config.clock = clock;
+	}
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
@@ -423,7 +434,7 @@ tb_scenario! {
 		server: |env| async move { start_service_server(&env.context, MixedService).await },
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
-			// Leases are exclusive per in-flight interaction; one pooled
+			// Leases are exclusive per in-flight interaction, and one pooled
 			// connection carries all three.
 			let mut unary_lease = pool.connect(addr).await?;
 			let stream_lease = pool.connect(addr).await?;
@@ -690,7 +701,8 @@ tb_assert_spec! {
 	}
 }
 
-// Pool at max_connections: failover reuses headroom instead of dialing (ResourceExhausted).
+// Pool at max_connections: failover reuses headroom instead of dialing
+// (ResourceExhausted).
 tb_scenario! {
 	name: pooled_mux_failover_reuses_pooled_headroom,
 	spec: MuxFailoverReuseSpec,
@@ -810,7 +822,8 @@ tb_assert_spec! {
 	}
 }
 
-// Cap 1: reuse idle exclusive connection instead of dialing (ResourceExhausted).
+// Cap 1: reuse the idle exclusive connection instead of dialing
+// (ResourceExhausted).
 tb_scenario! {
 	name: pooled_mux_declined_reuses_idle_exclusive_lease,
 	spec: MuxDeclinedIdleReuseSpec,
@@ -972,7 +985,8 @@ tb_assert_spec! {
 	}
 }
 
-// idle_timeout prune frees cap-1 slot; manual server registers 3 tasks per connection.
+// The idle_timeout prune frees the cap-1 slot. The manual server registers
+// 3 tasks per connection.
 tb_scenario! {
 	name: pooled_mux_prunes_idle_connection,
 	spec: MuxIdlePruneSpec,
@@ -981,14 +995,16 @@ tb_scenario! {
 		server: |env| async move { start_manual_mux_echo_server(&env.context).await },
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let idle_timeout = Duration::from_millis(50);
-			let pool = mux_pool_with_idle_timeout(&ctx.materials, Some(mux_offer(4)), 1, Some(idle_timeout), &trace)?;
+			let clock = Arc::new(ManualClock::default());
+			let idle = IdlePrune { timeout: idle_timeout, clock: Arc::clone(&clock) as Arc<dyn Clock> };
+			let pool = mux_pool_with_idle_timeout(&ctx.materials, Some(mux_offer(4)), 1, Some(idle), &trace)?;
 
 			let mut lease = pool.connect(addr).await?;
 			let echoed_before = echo_roundtrip(&mut lease, "mux-idle-before").await?;
 			trace.event_with(EMIT_ECHOES_BEFORE_IDLE, &[], echoed_before)?;
-			drop(lease);
 
-			sleep(idle_timeout * 2).await;
+			drop(lease);
+			clock.advance(idle_timeout * 2);
 
 			let mut fresh = pool.connect(addr).await?;
 			let echoed_after = echo_roundtrip(&mut fresh, "mux-idle-after").await?;
@@ -1482,7 +1498,7 @@ fn metered_offer() -> Option<TransportOffer> {
 	Some(offer)
 }
 
-/// Settlement at handshake and renewal; unanswered challenge fails closed.
+/// Settlement at handshake and renewal. An unanswered challenge fails closed.
 struct MeteredAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -1573,7 +1589,12 @@ fn metered_pool(
 	let identity = CertificateSpec::Built(Box::new(client_certificate));
 	let client_provider = Arc::clone(&ctx.client_provider);
 	let receipt_approver = Arc::new(PayingApprover::answering(METERED_RESPONSE)?);
-	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: metered_offer().map(Arc::new) };
+	let config = PoolConfig {
+		idle_timeout: None,
+		max_connections: 1,
+		mux_offer: metered_offer().map(Arc::new),
+		..PoolConfig::default()
+	};
 	let builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)

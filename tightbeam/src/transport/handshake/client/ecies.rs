@@ -33,6 +33,7 @@ use crate::transport::handshake::negotiation::{
 	client_mux_settings, MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityOffer, StrengthFloor,
 	TransportOffer,
 };
+use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
@@ -105,10 +106,9 @@ where
 	P::AeadCipher: KeyInit,
 	M: EciesMessageOps,
 {
-	/// Create a new ECIES handshake client.
+	/// Create an ECIES handshake client.
 	///
-	/// # Parameters
-	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
+	/// `aad_domain_tag` defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`.
 	pub fn new(aad_domain_tag: Option<&'static [u8]>) -> Self {
 		Self {
 			state: ClientStateMachine::<Ecies>::default(),
@@ -134,11 +134,8 @@ where
 		}
 	}
 
-	/// Create a new ECIES handshake client with optional client identity.
-	///
-	/// # Parameters
-	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption
-	/// - `identity`: Client identity presented for mutual authentication
+	/// Create an ECIES handshake client that presents `identity`, when one is
+	/// given, for mutual authentication.
 	pub fn new_with_identity(aad_domain_tag: Option<&'static [u8]>, identity: Option<ClientIdentity<P>>) -> Self {
 		Self {
 			state: ClientStateMachine::<Ecies>::default(),
@@ -171,10 +168,8 @@ where
 		self
 	}
 
-	/// Set client identity for mutual authentication.
-	///
-	/// # Parameters
-	/// - `identity`: The client's certificate and the key that proves it
+	/// Present `identity`, the client's certificate and the key that proves it,
+	/// for mutual authentication.
 	#[must_use]
 	pub fn with_client_identity(mut self, identity: ClientIdentity<P>) -> Self {
 		self.identity = Some(identity);
@@ -296,10 +291,7 @@ where
 		Ok(())
 	}
 
-	/// Build ClientHello message.
-	///
-	/// # Returns
-	/// DER-encoded ClientHello
+	/// Build the ClientHello message.
 	pub fn build_client_hello(&mut self) -> Result<ClientHello, HandshakeError> {
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::Init)?;
@@ -325,13 +317,8 @@ where
 		Ok(client_hello)
 	}
 
-	/// Process ServerHandshake message and build ClientKeyExchange.
-	///
-	/// # Parameters
-	/// - `server_handshake_der`: DER-encoded ServerHandshake from server
-	///
-	/// # Returns
-	/// The client key exchange to send next.
+	/// Process the ServerHandshake message and build the ClientKeyExchange to
+	/// send next.
 	pub async fn process_server_handshake(
 		&mut self,
 		server_handshake_der: impl AsRef<[u8]>,
@@ -350,8 +337,8 @@ where
 		// 4. Validate profile negotiation
 		self.validate_profile_selection(&server_handshake)?;
 
-		// 5. Validate transport capability negotiation (fails closed on an
-		// accept the client offered)
+		// 5. Validate transport capability negotiation (fails closed on an accept the client never
+		//    offered)
 		let offer = self.transport_offer.as_ref();
 		let accept = server_handshake.transport_accept.as_ref();
 		self.mux_settings = client_mux_settings(offer, accept)?;
@@ -362,15 +349,14 @@ where
 		// 7. Verify server signature
 		self.verify_server_handshake_signature(&server_handshake)?;
 
-		// 8. Validate, approve, and countersign the session receipt
-		// (fails closed on mismatch). Consumes the receipt artifact out
-		// of the decoded message: its owner is the stored receipt.
+		// 8. Validate, approve, and countersign the session receipt (fails closed on mismatch).
+		//    Consumes the receipt artifact out of the decoded message: its owner is the stored
+		//    receipt.
 		let pending_receipt = self.process_session_receipt(&mut server_handshake).await?;
 
-		// 9. Generate and encrypt session key. The countersignature (and
-		// the settlement answer bound inside it) folds into the ECIES
-		// payload, which keeps it confidential. After encoding it
-		// moves into the completed stored artifact (zero copy).
+		// 9. Generate and encrypt session key. The countersignature (and the settlement answer
+		//    bound inside it) folds into the ECIES payload, which keeps it confidential. After
+		//    encoding it moves into the completed stored artifact (zero copy).
 		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake, pending_receipt)?;
 
 		// 10. Handle mutual authentication (signature commits to encrypted_bytes)
@@ -461,17 +447,19 @@ where
 
 	/// Validate, approve, and countersign the server's session receipt.
 	///
-	/// Budget-bearing accepts demand a receipt artifact whose body
-	/// matches the negotiated session and whose server `SignerInfo`
-	/// verifies. Anything else fails closed. The approver (or the
-	/// fail-closed default) answers the settlement challenge, and the
-	/// client `SignerInfo` binds receipt body plus answer under the
-	/// client identity (non-repudiation).
+	/// Budget-bearing accepts demand a receipt artifact whose body matches the
+	/// negotiated session and whose server `SignerInfo` verifies. Anything else
+	/// fails closed.
 	///
-	/// Returns the pending artifact plus the countersignature destined
-	/// for the confidential key-exchange payload. Completion is
-	/// deferred until after payload encoding so the `SignerInfo` moves
-	/// into the stored artifact by move.
+	/// - The approver, or the fail-closed default, answers the settlement challenge.
+	/// - The client `SignerInfo` binds the receipt body plus the answer under the client identity
+	///   (non-repudiation).
+	///
+	/// # Completion
+	///
+	/// It answers the pending artifact plus the countersignature destined for
+	/// the confidential key-exchange payload. Completion waits until after
+	/// payload encoding, so the `SignerInfo` moves into the stored artifact.
 	async fn process_session_receipt(
 		&mut self,
 		server_handshake: &mut ServerHandshake,
@@ -530,8 +518,8 @@ where
 
 	/// Prepare client authentication materials if required or available.
 	///
-	/// The signature covers `Digest(transcript_hash || encrypted_data || cert_der)`
-	/// so it binds to this key exchange and this identity alone.
+	/// The signature covers `Digest(transcript_hash || encrypted_data ||
+	/// cert_der)` so it binds to this key exchange and this identity alone.
 	///
 	/// Returns tuple of (optional certificate, optional signature).
 	async fn prepare_client_auth(
@@ -556,10 +544,8 @@ where
 		let signature = OctetString::new(signature_bytes)?;
 		Ok((Some(cert), Some(signature)))
 	}
-	/// Complete the handshake and derive the directional session keys.
-	///
-	/// # Returns
-	/// Client-to-server and server-to-client AEAD ciphers from the provider
+	/// Complete the handshake and derive the provider's client-to-server and
+	/// server-to-client AEAD ciphers.
 	pub fn complete(&mut self) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError> {
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
@@ -569,19 +555,22 @@ where
 		let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 		let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 
-		// Concatenate client_random || server_random as salt for AEAD derivation
+		// Concatenate client_random || server_random as salt for AEAD
+		// derivation
 		let mut salt = Zeroizing::new([0u8; 64]);
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 
 		let salt_bytes = salt.as_slice();
-		let session_ciphers = self.derive_directional_aead(base_key.as_slice(), salt_bytes)?;
+		let session_ciphers = self.derive_directional_aead(base_key.as_slice(), KdfSalt::new(salt_bytes))?;
 
-		// Invariant: AEAD key derivation occurs exactly once after transcript locked
+		// Invariant: AEAD key derivation occurs exactly once after transcript
+		// locked
 
 		// 3. Seed epoch materials for post-handshake renewal
 		if let Some(transcript_hash) = self.transcript_hash {
-			let materials = derive_epoch_materials::<P>(base_key.as_slice(), salt_bytes, transcript_hash)?;
+			let epoch_salt = KdfSalt::new(salt_bytes);
+			let materials = derive_epoch_materials::<P>(base_key.as_slice(), epoch_salt, transcript_hash)?;
 			self.epoch_materials = Some(materials);
 		}
 
@@ -709,8 +698,8 @@ where
 				.raw_bytes(),
 		)?;
 
-		// Ephemeral ECIES randomness comes straight from the OS CSPRNG;
-		// the provider abstraction covers KDF/AEAD, not entropy.
+		// Ephemeral ECIES randomness comes straight from the OS CSPRNG, because
+		// the provider abstraction covers the KDF and the AEAD and not entropy.
 		let encrypted_message = encrypt::<_, _, _, M, P::Kdf, P::AeadCipher>(
 			&recipient_pubkey,
 			plaintext.as_slice(),
@@ -722,10 +711,6 @@ where
 	}
 }
 
-// ============================================================================
-// Common Handshake Trait Implementations
-// ============================================================================
-
 impl<P, M> HandshakeFinalization<P> for EciesHandshakeClient<P, M>
 where
 	P: CryptoProvider,
@@ -736,10 +721,6 @@ where
 }
 
 impl<P, M> HandshakeAlertHandler for EciesHandshakeClient<P, M> where P: CryptoProvider {}
-
-// ============================================================================
-// ClientHandshakeProtocol Implementation
-// ============================================================================
 
 impl<P, M> ClientHandshakeProtocol for EciesHandshakeClient<P, M>
 where

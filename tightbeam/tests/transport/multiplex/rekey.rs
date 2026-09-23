@@ -23,11 +23,12 @@ use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
 use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 use crate::common::security::expectation_failure;
 use crate::transport::support::{
-	await_receipt_rotation, establish_mutual_transports, mux_frame, mux_offer, MutualSessionHooks, MutualTransports,
+	await_receipt_rotation, await_transport, establish_mutual_transports, mux_frame, mux_offer, MutualSessionHooks,
+	MutualTransports,
 };
 
 use super::common::*;
@@ -86,7 +87,8 @@ const SETTLE_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 31;
 /// Application code for a renewal approval refusal.
 const APPROVAL_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 32;
 
-/// Fifth single-chunk emit tips budget into drain reserve (caps 1/1, 1 KiB chunk).
+/// Fifth single-chunk emit tips budget into drain reserve (caps 1/1, 1 KiB
+/// chunk).
 const RENEWAL_TRIGGER_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 10, server_to_client: 4096 };
 
 /// Record watermark drives renewal, not budget.
@@ -121,14 +123,7 @@ async fn await_rotation(handle: &MuxHandle, previous: Option<&StoredReceipt>) ->
 }
 
 async fn await_matching_receipt(handle: &MuxHandle, expected: &StoredReceipt) -> bool {
-	let matched = timeout(Duration::from_secs(2), async {
-		while handle.session_receipt().as_deref() != Some(expected) {
-			sleep(Duration::from_millis(5)).await;
-		}
-	})
-	.await;
-
-	matched.is_ok()
+	await_transport(|| handle.session_receipt().as_deref() == Some(expected)).await
 }
 
 fn verifying_key_from(certificate: &Certificate) -> Result<Secp256k1VerifyingKey, TightBeamError> {
@@ -177,7 +172,8 @@ async fn read_until_rekey_response(reader: &mut SplitReader) -> Result<(), Tight
 	.map_err(|_| expectation_failure("server must answer the renewal request before the read timeout"))?
 }
 
-/// Settlement challenge on every renewal; counts `settle` consultations.
+/// Poses a settlement challenge on every renewal and counts the `settle`
+/// consultations.
 struct RenewalAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -237,7 +233,8 @@ impl TransportAuthorizer for RenewalAuthorizer {
 	}
 }
 
-/// Answers challenge-bearing receipts; handshake receipts pass without answer.
+/// Answers challenge-bearing receipts. Handshake receipts pass without an
+/// answer.
 struct RenewalApprover {
 	response: OctetString,
 }
@@ -298,7 +295,8 @@ tb_assert_spec! {
 	}
 }
 
-// Without renewal this session drains at the fifth emit (mux_budget_exhaustion_drains).
+// Without renewal this session drains at the fifth emit
+// (mux_budget_exhaustion_drains).
 tb_scenario! {
 	name: mux_rekey_budget_renewal_extends_session,
 	spec: MuxRekeyBudgetRenewalSpec,
@@ -405,7 +403,8 @@ tb_scenario! {
 	}
 }
 
-// 20 × 6 records = 120 against limit 100; traffic straddles key switch.
+// 20 × 6 records = 120 against a limit of 100, so the traffic straddles the key
+// switch.
 tb_scenario! {
 	name: mux_rekey_record_renewal_survives_chunked_traffic,
 	spec: MuxRekeyRecordRenewalSpec,
@@ -567,7 +566,8 @@ tb_assert_spec! {
 	}
 }
 
-// Client switched at Ack; server installs receive cipher then drains with refusal code.
+// The client switched at the Ack. The server installs the receive cipher, then
+// drains with a refusal code.
 tb_scenario! {
 	name: mux_rekey_settlement_refusal_drains,
 	spec: MuxRekeySettleRefusalSpec,
@@ -592,7 +592,8 @@ tb_scenario! {
 				await_goaway_reason(&pair.client.handle, GoAwayReason::Application(SETTLE_REFUSAL_CODE)).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// Stimulus only: the refusal itself emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-late")).await;
 
 			Ok(())
@@ -639,7 +640,8 @@ tb_scenario! {
 				await_goaway_reason(&pair.server.handle, GoAwayReason::Application(APPROVAL_REFUSAL_CODE)).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// Stimulus only: the refusal itself emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-late")).await;
 
 			Ok(())
@@ -660,7 +662,8 @@ tb_assert_spec! {
 	}
 }
 
-// CWE-400: RekeyRequest below minimum-spend floor -> GoAway(ProtocolError).
+// CWE-400: a RekeyRequest below the minimum-spend floor draws
+// GoAway(ProtocolError).
 tb_scenario! {
 	name: mux_rekey_request_below_min_spend_violates,
 	spec: MuxRekeyMinSpendSpec,
@@ -698,7 +701,8 @@ tb_assert_spec! {
 	}
 }
 
-// CWE-400: duplicate RekeyRequest while exchange in flight -> GoAway(ProtocolError).
+// CWE-400: a duplicate RekeyRequest while an exchange is in flight draws
+// GoAway(ProtocolError).
 tb_scenario! {
 	name: mux_rekey_duplicate_request_violates,
 	spec: MuxRekeyDuplicateRequestSpec,
@@ -747,7 +751,7 @@ tb_assert_spec! {
 	}
 }
 
-// Renewal deadline bounds stalled exchange -> GoAway(Shutdown).
+// The renewal deadline bounds a stalled exchange with GoAway(Shutdown).
 tb_scenario! {
 	name: mux_rekey_timeout_drains_clean,
 	spec: MuxRekeyTimeoutSpec,
@@ -757,7 +761,8 @@ tb_scenario! {
 			let server_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
 			let session = establish_mutual_transports(client_offer, server_offer, MutualSessionHooks::default()).await?;
 
-			// Record limit below renewal floor: first write opens renewal server never answers
+			// Record limit below renewal floor: first write opens renewal
+			// server never answers
 			let client_config = MuxEndpointConfig {
 				rekey_limit: Some(80),
 				renewal_deadline: Some(Duration::from_millis(200)),
@@ -804,7 +809,8 @@ tb_assert_spec! {
 	}
 }
 
-// Receiptless/cleartext: no rekey wiring; record limit -> GoAway(Shutdown).
+// Receiptless or cleartext sessions have no rekey path, so the record limit
+// draws GoAway(Shutdown).
 tb_scenario! {
 	name: mux_rekey_inert_paths_keep_todays_behavior,
 	spec: MuxRekeyInertPathsSpec,
@@ -843,7 +849,8 @@ tb_scenario! {
 				await_goaway_reason(&pair.client.handle, GoAwayReason::Shutdown).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// Stimulus only: the refusal itself emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-inert-late")).await;
 
 			Ok(())
