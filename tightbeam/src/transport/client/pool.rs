@@ -52,9 +52,9 @@ use crate::trace::TraceCollector;
 #[cfg(any(feature = "instrument", pooled_mux))]
 use crate::utils::urn::Urn;
 
-/// Item gate for the pooled-mux path: multiplexed pooling needs the mux
-/// engine, the serve module's connector, and a tokio executor for the
-/// driver tasks.
+/// Item gate for the pooled-mux path. Multiplexed pooling needs the mux
+/// engine, the serve module's connector, and a tokio executor for the driver
+/// tasks.
 macro_rules! pooled_mux {
 	($($item:item)*) => {
 		$(
@@ -82,8 +82,8 @@ pooled_mux! {
 /// Shared builder surface for direct clients and connection pools.
 ///
 /// [`crate::transport::client::ClientBuilder`] and [`ConnectionPoolBuilder`]
-/// both implement this trait
-/// so callers configure timeouts and identity the same way.
+/// both implement this trait, so callers configure timeouts and identity the
+/// same way.
 pub trait ConnectionBuilder<P: Protocol>: Sized {
 	/// Built client or pool produced by [`ConnectionBuilder::build`].
 	type Output;
@@ -115,7 +115,7 @@ pub struct PoolConfig {
 	/// `None` keeps idle connections until the pool evicts them for other
 	/// reasons.
 	pub idle_timeout: Option<Duration>,
-	/// Hard cap on live connections across all destinations (default: 64).
+	/// Hard cap on live connections across all destinations, 64 by default.
 	pub max_connections: usize,
 	/// Multiplexing advertisement for pooled dials.
 	///
@@ -123,13 +123,14 @@ pub struct PoolConfig {
 	/// until stream caps fill. The value is shared by refcount across dials.
 	/// The handshake still clones the offer once into the orchestrator.
 	pub mux_offer: Option<Arc<TransportOffer>>,
-	/// The clock idle time, deadlines and backoff are measured against.
+	/// Clock that idle time, deadlines, and backoff are measured against.
 	/// Defaults to [`SystemClock`] where the standard library's clocks work.
 	pub clock: Arc<dyn Clock>,
 }
 
-/// Absent on `wasm32-unknown-unknown`, which has no [`SystemClock`], so a
-/// pool built there names the clock it reads.
+/// Available where the standard library's clocks work. A pool on
+/// `wasm32-unknown-unknown`, which has no [`SystemClock`], names the clock it
+/// reads.
 #[cfg(host_clock)]
 impl Default for PoolConfig {
 	fn default() -> Self {
@@ -172,6 +173,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 		self.encryption.handshake_protocol = kind;
 	}
 
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	fn set_receipt_approver(&mut self, approver: Arc<dyn ReceiptApprover>) {
 		self.encryption.receipt_approver = Some(approver);
 	}
@@ -193,7 +195,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 	}
 }
 
-/// Builder for creating a configured ConnectionPool
+/// Builder for a configured [`ConnectionPool`].
 pub struct ConnectionPoolBuilder<P: Protocol> {
 	config: PoolConfig,
 	timeout: Option<Duration>,
@@ -222,7 +224,7 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	}
 }
 
-/// Absent where [`PoolConfig`] has no default clock.
+/// Available where [`PoolConfig`] has a default clock.
 #[cfg(host_clock)]
 impl<P: Protocol> Default for ConnectionPoolBuilder<P> {
 	fn default() -> Self {
@@ -234,20 +236,21 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	/// Run this pool's connections without authenticating the peer.
 	///
 	/// Every dial carries the decision, so a pool with no trust store states it
-	/// once rather than each connection failing at its first write.
+	/// once instead of each connection failing at its first write.
 	#[cfg(feature = "x509")]
 	pub fn allow_cleartext(mut self) -> Self {
 		self.tls.encryption.allow_cleartext = true;
 		self
 	}
 
+	/// Replace the pool configuration.
 	pub fn with_config(mut self, config: PoolConfig) -> Self {
 		self.config = config;
 		self
 	}
 
-	/// Production instrumentation collector: the single clientside
-	/// entrypoint. The pool emits its own lifecycle events and
+	/// Attach the production instrumentation collector, which is the single
+	/// client-side entry point. The pool emits its own lifecycle events and
 	/// propagates the collector to every dialed transport.
 	#[cfg(feature = "instrument")]
 	#[must_use]
@@ -271,16 +274,19 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 		self
 	}
 
-	/// Receipt approver for every dialed transport: consulted before
-	/// countersigning at the handshake and each in-band epoch renewal.
-	/// Without one, pooled clients fail closed on challenge-bearing receipts.
-	#[cfg(feature = "x509")]
+	/// Install the receipt approver for every dialed transport.
+	///
+	/// A transport consults it before it countersigns at the handshake and at
+	/// each in-band epoch renewal. Without one, pooled clients fail closed on
+	/// challenge-bearing receipts.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub fn with_receipt_approver(mut self, approver: Arc<dyn ReceiptApprover>) -> Self {
 		self.tls.set_receipt_approver(approver);
 		self
 	}
 
-	/// Install a pre-shared client identity (zero extra cert materialization)
+	/// Install a pre-shared client identity that every dial shares without
+	/// another certificate copy.
 	#[cfg(feature = "x509")]
 	pub fn with_shared_client_identity(
 		mut self,
@@ -368,8 +374,8 @@ pooled_mux! {
 pooled_mux! {
 	/// One shared multiplexed connection to a destination.
 	///
-	/// The handle is cloneable, so entries are never leased exclusively and
-	/// leave the pool only through eviction.
+	/// The handle is cloneable, so every caller shares the entry, and the entry
+	/// leaves the pool only through eviction.
 	struct MuxEntry {
 		id: u64,
 		handle: MuxHandle,
@@ -379,7 +385,7 @@ pooled_mux! {
 		reader_task: rt::JoinHandle,
 		/// Shared activity stamp used by idle pruning for this mux entry.
 		///
-		/// The mux core does not read a clock. Each lease updates this stamp
+		/// The mux core reads no clock. Each lease updates this stamp
 		/// when emit starts, outside the pool lock. An entry with pending
 		/// streams stays active even if the stamp is old.
 		last_used: Arc<ActivityStamp>,
@@ -392,12 +398,12 @@ pooled_mux! {
 	}
 }
 
-/// Per-destination connection pool
+/// Per-destination connection pool.
 #[cfg(feature = "std")]
 struct DestinationPool<P: Protocol> {
-	/// Available connections ready for reuse
+	/// Available connections ready for reuse.
 	available: VecDeque<AvailableEntry<P>>,
-	/// Shared multiplexed connections (never leased exclusively)
+	/// Shared multiplexed connections, which every caller shares.
 	#[cfg(pooled_mux)]
 	mux: Vec<MuxEntry>,
 }
@@ -413,30 +419,32 @@ impl<P: Protocol> Default for DestinationPool<P> {
 	}
 }
 
-/// Connection pool for protocol P with global connection limit
+/// Connection pool for protocol `P` with a global connection limit.
 ///
 /// # Invariants
+///
 /// - `total_connections` counts live connections and stays within
-///   `0..=config.max_connections`: +1 when a socket is created.
-/// - Idle connections exceeding `PoolConfig::idle_timeout` are pruned lazily
-/// - Lock poisoning never panics. Callers receive `TransportFailure::Internal` instead
+///   `0..=config.max_connections`. It gains 1 when a socket is created.
+/// - Idle connections past `PoolConfig::idle_timeout` are pruned lazily.
+/// - Lock poisoning never panics. Callers receive `TransportFailure::Internal` instead.
 #[cfg(feature = "std")]
 pub struct ConnectionPool<P: Protocol> {
-	/// Per-destination sub-pools
+	/// Per-destination sub-pools.
 	pools: Arc<RwLock<HashMap<P::Address, DestinationPool<P>>>>,
-	/// Pool configuration
+	/// Limits and multiplexing policy this pool enforces.
 	config: PoolConfig,
-	/// Shared timeout for all connections
+	/// Shared timeout for all connections.
 	timeout: Option<Duration>,
-	/// Total connections across all destinations
+	/// Total live connections across all destinations.
 	total_connections: Arc<AtomicUsize>,
-	/// Monotonic IDs correlating mux pool entries with their leases
+	/// Monotonic IDs that correlate mux pool entries with their leases.
 	#[cfg(pooled_mux)]
 	mux_ids: AtomicU64,
-	/// Shared TLS assets reused across pooled connections
+	/// Shared TLS assets reused across pooled connections.
 	#[cfg(feature = "x509")]
 	tls: PoolTlsConfig<P::CryptoProvider>,
-	/// Production instrumentation collector (single clientside entrypoint)
+	/// Production instrumentation collector, the single client-side entry
+	/// point.
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
 }
@@ -475,9 +483,9 @@ impl<P: Protocol> ConnectionPool<P> {
 		Ok(endpoint)
 	}
 
-	/// Dual-write a pool lifecycle event: core kind URN into the
-	/// instrument log, plus the stable label for spec assertions and
-	/// CSP alphabets.
+	/// Write a pool lifecycle event twice: the core kind URN into the
+	/// instrument log, and the stable label for spec assertions and CSP
+	/// alphabets.
 	#[cfg(feature = "instrument")]
 	fn emit_event(&self, event: Urn<'static>) {
 		let Some(trace) = self.trace.as_ref() else {
@@ -566,7 +574,7 @@ where
 			return Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted));
 		}
 
-		// A poisoned pool map must not leak the reservation: give the
+		// A poisoned pool map must not leak the reservation, so give the
 		// counter back before surfacing the failure.
 		let mut pools = match self.write_pools() {
 			Ok(pools) => pools,
@@ -600,10 +608,8 @@ where
 			}
 		}
 
-		// Shared mux entries are stamped by their leases at emit time
-		// (emits bypass the pool lock), so the pruner only reads. An
-		// in-flight stream pins the entry as active no matter how old
-		// the stamp is.
+		// The pruner only reads the stamp that leases write at emit time,
+		// outside the pool lock (see `MuxEntry::last_used`).
 		#[cfg(pooled_mux)]
 		dest_pool.mux.retain(|entry| {
 			if entry.handle.has_pending_streams() {
@@ -613,10 +619,10 @@ where
 			let last_used = entry.last_used.at();
 			let expired = now.saturating_duration_since(last_used) >= timeout;
 			if expired {
-				// GoAway before close (RFC 9113 § 6.8): the reader task
-				// ends on the resulting EOF. A stream racing this drain
-				// observes `Draining`, which the lease lifecycle already
-				// maps to eviction.
+				// Send GoAway before close (RFC 9113 § 6.8), so the reader
+				// task ends on the resulting EOF. A stream that races this
+				// drain observes `Draining`, which the lease lifecycle maps
+				// to eviction.
 				let handle = entry.handle.clone();
 				rt::spawn(async move {
 					let _ = handle.shutdown().await;
@@ -662,6 +668,7 @@ where
 		Ok(self.wrap_client(client, addr.clone()))
 	}
 
+	/// Connect to a destination and hold the connection exclusively.
 	#[cfg(all(
 		feature = "x509",
 		not(all(
@@ -680,6 +687,8 @@ where
 		self.connect_single_flight(&destination).await
 	}
 
+	/// Lease a ready pooled connection to `addr` without dialing, or return
+	/// `None` when none is ready.
 	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P>>>
 	where
 		P: PersistentConnection + Send + Sync,
@@ -719,11 +728,13 @@ pooled_mux! {
 			self.acquire_mux(&destination, MuxSelection::PreferHeadroom).await
 		}
 
-		/// Acquire a mux lease through the reuse tiers, in order.
+		/// Acquire a mux lease through the reuse tiers, in order:
 		///
-		/// Tries a pooled mux entry first. Next tries an idle exclusive lease
-		/// left when a peer declined multiplexing. Finally opens a fresh dial.
-		/// All mux-offering callers share this path so no tier is skipped.
+		/// 1. A pooled mux entry.
+		/// 2. An idle exclusive lease left when a peer declined multiplexing.
+		/// 3. A fresh dial.
+		///
+		/// Every mux-offering caller shares this path, so no tier is skipped.
 		async fn acquire_mux(
 			self: &Arc<Self>,
 			addr: &P::Address,
@@ -796,16 +807,16 @@ pooled_mux! {
 			let (reader, writer) = transport.into_envelope_halves()?;
 			let (handle, responder, reader_task) = drive_mux(reader, writer, MuxRole::Client, settings, None, rekey);
 
-			// Pool endpoints never serve peer-initiated streams: dropping
-			// the responder auto-refuses them.
+			// Pool endpoints serve no peer-initiated streams, so dropping the
+			// responder refuses them.
 			drop(responder);
 
 			let id = self.mux_ids.fetch_add(1, Ordering::Relaxed);
 			let last_used = Arc::new(ActivityStamp::new(Arc::clone(&self.config.clock)));
 
 			{
-				// A failed lock must not leak the spawned drivers: aborting
-				// the reader closes the connection and ends the writer.
+				// A failed lock must not leak the spawned drivers, so abort the
+				// reader, which closes the connection and ends the writer.
 				let mut pools = match self.write_pools() {
 					Ok(pools) => pools,
 					Err(err) => {
@@ -814,8 +825,8 @@ pooled_mux! {
 					}
 				};
 
-				// Handle clone is a refcount bump: pool entry and lease
-				// co-own the connection.
+				// The handle clone is a refcount bump, so the pool entry and
+				// the lease co-own the connection.
 				let dest_pool = pools.entry(addr.clone()).or_default();
 				dest_pool.mux.push(MuxEntry {
 					id,
@@ -832,9 +843,10 @@ pooled_mux! {
 			Ok(self.wrap_mux_client(lease, addr))
 		}
 
-		/// Round-robin a live mux entry for the destination: prunes idle
-		/// entries, evicts those whose reader driver already ended, and
-		/// prefers entries with stream headroom over saturated ones.
+		/// Round-robin a live mux entry for the destination.
+		///
+		/// It prunes idle entries, evicts entries whose reader driver ended,
+		/// and prefers entries with stream headroom over saturated ones.
 		fn try_take_mux_handle(
 			self: &Arc<Self>,
 			addr: &P::Address,
@@ -867,16 +879,16 @@ pooled_mux! {
 
 			let with_headroom = dest_pool.mux.iter().find(|entry| entry.handle.has_stream_headroom());
 			let fallback = match selection {
-				// A saturated entry stays shareable: an in-flight stream
-				// may finish before the caller emits.
+				// A saturated entry stays shareable, because an in-flight
+				// stream may finish before the caller emits.
 				MuxSelection::PreferHeadroom => dest_pool.mux.first(),
 				// Cap-exhaustion failover must not land back on a
 				// saturated entry, so it falls through to a fresh dial.
 				MuxSelection::RequireHeadroom => None,
 			};
 
-			// Handle clone is a refcount bump: the entry stays pooled for other
-			// callers.
+			// The handle clone is a refcount bump, so the entry stays pooled
+			// for other callers.
 			let selected = with_headroom.or(fallback).map(MuxLease::from);
 
 			#[cfg(feature = "instrument")]
@@ -888,7 +900,8 @@ pooled_mux! {
 		}
 
 		/// Remove a mux entry after a terminal failure (`ConnectionClosed`
-		/// or rekey `Draining`). The next connect re-establishes.
+		/// or rekey `Draining`). The next connect re-establishes the
+		/// connection.
 		fn evict_mux(&self, addr: &P::Address, id: u64) {
 			let mut pools = match self.pools.write() {
 				Ok(pools) => pools,
@@ -923,19 +936,18 @@ pooled_mux! {
 	struct MuxLease {
 		id: u64,
 		handle: MuxHandle,
-		/// Shared with the pool entry: the lease stamps it on each emit
-		/// so the pruner can read idle time without a clock in the mux
-		/// core (see [`MuxEntry::last_used`]).
+		/// Stamp shared with the pool entry. The lease stamps it on each emit,
+		/// so the pruner can read idle time without a clock in the mux core
+		/// (see [`MuxEntry::last_used`]).
 		last_used: Arc<ActivityStamp>,
-		/// Shared handle to the entry's pinned peer certificate
-		/// (see [`MuxEntry::peer_certificate`]).
+		/// Shared handle to the entry's pinned peer certificate (see
+		/// [`MuxEntry::peer_certificate`]).
 		peer_certificate: Option<Arc<Certificate>>,
 	}
 
 	impl MuxLease {
-		/// Record activity for the pruner. Stamped at emit start: the
-		/// stream itself is covered by `has_pending_streams` while in
-		/// flight.
+		/// Record activity for the pruner at emit start. While the stream is
+		/// in flight, `has_pending_streams` covers it.
 		fn stamp(&self) {
 			self.last_used.touch();
 		}
@@ -955,15 +967,15 @@ pooled_mux! {
 	/// Mux entry selection policy for the acquisition funnel.
 	#[derive(Clone, Copy)]
 	enum MuxSelection {
-		/// Prefer an entry with stream headroom, fall back to a saturated
-		/// one (a slot may free before the caller emits)
+		/// Prefer an entry with stream headroom, and fall back to a saturated
+		/// one, because a slot may free before the caller emits.
 		PreferHeadroom,
-		/// Only an entry with stream headroom, `None` otherwise
+		/// Take only an entry with stream headroom, or `None`.
 		RequireHeadroom,
 	}
 }
 
-/// A pooled client connection that returns to the pool on drop
+/// A pooled client connection that returns to the pool on drop.
 ///
 /// Exclusive leases hold the connection alone. Multiplexed leases share
 /// one connection with every other caller and return nothing on drop.
@@ -984,16 +996,17 @@ impl<P: Protocol + PersistentConnection> PooledClient<P>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
-	/// Returns a mutable reference to the underlying connection
+	/// Returns a mutable reference to the underlying connection.
 	///
 	/// # Errors
-	/// - `InvalidState`: multiplexed lease. There is no exclusive
-	///   connection to hand out. Use [`PooledClient::emit`]
+	///
+	/// - [`TransportError::InvalidState`] -- the lease is multiplexed and holds
+	///   no exclusive connection. Use [`PooledClient::emit`] instead.
 	pub fn conn(&mut self) -> TransportResult<&mut GenericClient<P>> {
 		self.client.as_mut().ok_or(TransportError::InvalidState)
 	}
 
-	/// Validated TLS peer certificate pinned by this connection's handshake
+	/// Validated TLS peer certificate pinned by this connection's handshake.
 	///
 	/// A mux lease answers from the certificate pinned at its eager dial
 	/// handshake. An exclusive lease reads its transport, so the answer
@@ -1049,27 +1062,28 @@ pooled_mux! {
 			+ Send
 			+ Sync,
 	{
-		/// Current epoch's dual-signed session receipt on a multiplexed
-		/// lease, shared per connection across every lease and rotated
-		/// in place by each completed in-band renewal. `None` on
-		/// exclusive leases and on sessions without receipt-bearing
-		/// rekey materials.
+		/// Current epoch's dual-signed session receipt on a multiplexed lease.
+		///
+		/// Every lease on the connection shares it, and each completed in-band
+		/// renewal rotates it in place. It is `None` on an exclusive lease and
+		/// on a session without receipt-bearing rekey materials.
 		pub fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
 			self.mux.as_ref().and_then(|lease| lease.handle.session_receipt())
 		}
 
-		/// Emit a message through the pooled connection: a stream on the
-		/// shared mux connection, or the exclusive lease.
+		/// Emit a message through the pooled connection, as a stream on the
+		/// shared mux connection or on the exclusive lease.
 		///
-		/// Mux lifecycle handling:
-		/// - `StreamsExhausted` (local stream cap full): moves to a pooled
-		///   connection with stream headroom, or an additional one up to
-		///   `max_connections`, and retries there once
-		/// - `ConnectionClosed` / `Draining` (rekey GoAway): evicts the entry
-		///   so the next connect re-establishes, then reports the failure
+		/// The mux lifecycle is handled per failure:
+		///
+		/// - `StreamsExhausted` (local stream cap full) moves the lease to a
+		///   pooled connection with stream headroom, or an additional one up to
+		///   `max_connections`, and retries there once.
+		/// - `ConnectionClosed` or `Draining` (rekey GoAway) evicts the entry
+		///   so the next connect re-establishes it, then reports the failure.
 		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-			// Handle clone is a refcount bump, releasing the `self.mux` borrow
-			// before the failover arm takes `&mut self`.
+			// The handle clone is a refcount bump that releases the `self.mux`
+			// borrow before the failover arm takes `&mut self`.
 			let (lease_id, handle) = match self.mux.as_ref() {
 				Some(lease) => {
 					lease.stamp();
@@ -1098,8 +1112,7 @@ pooled_mux! {
 		/// is populated.
 		///
 		/// - A mux lease already handshook eagerly at dial, so it returns at once.
-		/// - A single-flight lease defers its handshake to the first
-		///   [`emit`](Self::emit).
+		/// - A single-flight lease defers its handshake to the first [`emit`](Self::emit).
 		#[cfg(feature = "colony")]
 		pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()> {
 			if self.mux.is_some() {
@@ -1116,36 +1129,41 @@ pooled_mux! {
 		/// lease as active.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		fn stamped_handle(&self) -> TransportResult<&MuxHandle> {
 			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
 			lease.stamp();
-
 			Ok(&lease.handle)
 		}
 
-		/// Open a streamed request on the shared mux connection: push
-		/// chunks through the sink, then await the unary response.
+		/// Open a streamed request on the shared mux connection. The caller
+		/// pushes chunks through the sink, then awaits the unary response.
 		///
 		/// The stream counts as pending on the connection, so the pruner
 		/// keeps the entry alive while it is in flight.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		pub fn open_stream(
 			&self,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
 			self.stamped_handle()?.open_stream()
 		}
 
-		/// Open a streamed request routed to `target`: the peer gateway
-		/// reads the grpc-style route to dispatch locally or splice the
-		/// stream to a further peer.
+		/// Open a streamed request routed to `target`. The peer gateway reads
+		/// the grpc-style route to dispatch locally or to splice the stream to
+		/// a further peer.
 		///
 		/// Otherwise identical to [`open_stream`](Self::open_stream).
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		pub fn open_stream_to(
 			&self,
 			target: impl Into<Urn<'static>>,
@@ -1155,9 +1173,8 @@ pooled_mux! {
 
 		/// Open a streamed request carrying a fully-formed [`StreamRoute`].
 		///
-		/// Use cases:
-		/// - [`StreamRoute::to`] for an origin open
-		/// - [`StreamRoute::relayed_to`] when re-emitting a spent hop budget
+		/// - [`StreamRoute::to`] builds the route for an origin open.
+		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
 		///
 		/// Prefer [`open_stream_to`](Self::open_stream_to) when the
 		/// route is a plain origin target. Otherwise identical to
@@ -1165,7 +1182,9 @@ pooled_mux! {
 		/// pass a fully formed route when the origin helpers are not enough.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_stream_with_route(
 			&self,
@@ -1174,33 +1193,36 @@ pooled_mux! {
 			self.stamped_handle()?.open_stream_with_route(route)
 		}
 
-		/// Open a duplex stream on the shared mux connection: push request
-		/// chunks through the sink while the peer's reply arrives
+		/// Open a duplex stream on the shared mux connection. The caller pushes
+		/// request chunks through the sink while the peer's reply arrives
 		/// incrementally through the body.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex()
 		}
 
-		/// Open a duplex stream routed to `target`: the peer gateway
-		/// reads the grpc-style route to dispatch locally or splice
-		/// both directions to a further peer.
+		/// Open a duplex stream routed to `target`. The peer gateway reads the
+		/// grpc-style route to dispatch locally or to splice both directions to
+		/// a further peer.
 		///
 		/// Otherwise identical to [`open_duplex`](Self::open_duplex).
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_to(target)
 		}
 
 		/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
 		///
-		/// Use cases:
-		/// - [`StreamRoute::to`] for an origin open
-		/// - [`StreamRoute::relayed_to`] when re-emitting a spent hop budget
+		/// - [`StreamRoute::to`] builds the route for an origin open.
+		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
 		///
 		/// Prefer [`open_duplex_to`](Self::open_duplex_to) when the
 		/// route is a plain origin target. Otherwise identical to
@@ -1208,17 +1230,19 @@ pooled_mux! {
 		/// pass a fully formed route when the origin helpers are not enough.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
 			self.stamped_handle()?.open_duplex_with_route(route)
 		}
 
-		/// Cap-exhaustion failover: move the lease through the acquisition
-		/// funnel (pooled headroom before a fresh dial) and retry there once.
+		/// Fail over on cap exhaustion. The lease moves through the acquisition
+		/// funnel, pooled headroom before a fresh dial, and retries there once.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 			if self.pool.config.mux_offer.is_none() {
-				// A mux lease exists only when an offer is configured
+				// A mux lease exists only when an offer is configured.
 				return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
 			}
 

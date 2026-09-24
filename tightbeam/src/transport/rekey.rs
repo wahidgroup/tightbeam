@@ -1,6 +1,6 @@
 //! In-band rekey exchange logic.
 //!
-//! Builds and verifies the messages of the three-leg renewal:
+//! This module builds and verifies the messages of the three-leg renewal:
 //! - `RekeyRequest`
 //! - `RekeyResponse`
 //! - `RekeyAck`
@@ -15,21 +15,25 @@
 //!                                <----  RekeyDone
 //! ```
 //!
-//! Each direction takes fresh keys from the epoch KDF chain
-//! ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3), with an explicit exchange).
-//! The prior epoch secret drops the moment the next one installs
-//! ([RFC 9846 § 7.2](https://datatracker.ietf.org/doc/html/rfc9846#section-7.2)).
+//! Each direction takes fresh keys from the epoch KDF chain, which follows
+//! [RFC 9846 § 4.7.3][rfc9846-4.7.3] with an explicit exchange. The prior
+//! epoch secret drops the moment the next one installs
+//! ([RFC 9846 § 7.2][rfc9846-7.2]).
 //!
 //! # Bindings
 //!
-//! - The epoch receipt's `transcript_hash` pins the exchange:
-//!   `H(hash_prev || request_der || server_random)`.
-//! - The chain root advances over the full exchange:
-//!   `hash_next = H(hash_prev || request_der || response_der || ack_der)`,
-//!   so every epoch receipt transitively commits to the whole session
-//!   history back to the handshake transcript.
-//! - Credit-match invariant: epoch receipt budgets and credit unit MUST equal the initial receipt
-//!   terms byte for byte. Only the settlement challenge MAY vary per epoch.
+//! - The epoch receipt's `transcript_hash` pins the exchange: `H(hash_prev ||
+//!   request_der || server_random)`.
+//! - The chain root advances over the full exchange: `hash_next = H(hash_prev
+//!   || request_der || response_der || ack_der)`, so every epoch receipt
+//!   transitively commits to the whole session history back to the handshake
+//!   transcript.
+//! - Credit-match invariant: the epoch receipt budgets and credit unit MUST
+//!   equal the initial receipt terms byte for byte. Only the settlement
+//!   challenge MAY vary per epoch.
+//!
+//! [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
+//! [rfc9846-7.2]: https://datatracker.ietf.org/doc/html/rfc9846#section-7.2
 
 use std::sync::Arc;
 
@@ -60,10 +64,14 @@ use crate::x509::Certificate;
 
 /// Shared epoch state and identities for one session's rekey exchanges.
 ///
-/// Both roles hold one: the epoch secret chain, the initial receipt
-/// terms (the credit-match reference), the local signing identity, and
-/// the peer's verified receipt identity. The provider's cipher type
-/// names the AEAD.
+/// Both roles hold one, and it carries:
+///
+/// - the epoch secret chain,
+/// - the initial receipt terms, which are the credit-match reference,
+/// - the local signing identity, and
+/// - the peer's verified receipt identity.
+///
+/// The provider's cipher type names the AEAD.
 pub(crate) struct RekeyMaterials<P>
 where
 	P: CryptoProvider,
@@ -77,18 +85,19 @@ where
 
 /// Fresh per-direction state produced by a completed exchange.
 ///
-/// The mux driver installs each cipher at its wire boundary:
-/// - client: send at `RekeyAck`, receive at `RekeyDone`
-/// - server: receive after a verified `RekeyAck`, send at `RekeyDone`
+/// The mux driver installs each cipher at its message boundary:
+///
+/// - The client installs send at `RekeyAck` and receive at `RekeyDone`.
+/// - The server installs receive after a verified `RekeyAck` and send at `RekeyDone`.
 pub(crate) struct EpochInstall {
-	/// Send-direction cipher for the new epoch (fresh counter).
+	/// The send-direction cipher for the new epoch, with a fresh counter.
 	pub(crate) send_cipher: SendCipher,
-	/// Receive-direction cipher for the new epoch (fresh counter).
+	/// The receive-direction cipher for the new epoch, with a fresh counter.
 	pub(crate) recv_cipher: RecvCipher,
 	/// The new epoch's dual-signed receipt.
 	pub(crate) receipt: StoredReceipt,
-	/// Epoch number the install activates. Unit tests read it, and the driver
-	/// installs positionally at the wire boundary.
+	/// The epoch number that the install activates. Unit tests read it, and
+	/// the driver installs by position at the message boundary.
 	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) epoch: u32,
 }
@@ -108,17 +117,20 @@ where
 		Self { epoch, reference, signing_provider, peer_verifying_key, peer_sid }
 	}
 
-	/// Current epoch number.
+	/// The current epoch number.
 	pub(crate) fn epoch(&self) -> u32 {
 		self.epoch.epoch
 	}
 
 	/// Rotate the epoch chain and derive the new directional ciphers.
 	///
-	/// `secret_next = KDF(secret_prev, epoch-label, salt = client_random || server_random)`,
-	/// traffic keys from `secret_next` under the directional labels the
-	/// handshake finalization uses. Assigning the next secret drops the
-	/// prior one (zeroized on drop, RFC 9846 § 7.2).
+	/// ```text
+	/// secret_next = KDF(secret_prev, epoch-label, salt = client_random || server_random)
+	/// ```
+	///
+	/// The traffic keys come from `secret_next` under the directional labels
+	/// that the handshake finalization uses. Assigning the next secret drops
+	/// the prior one, which zeroizes on drop (RFC 9846 § 7.2).
 	fn rotate(
 		&mut self,
 		role: MuxRole,
@@ -150,11 +162,11 @@ where
 	}
 }
 
-/// Exchange pin the epoch receipt commits to:
+/// The exchange pin that the epoch receipt commits to,
 /// `H(hash_prev || request_der || server_random)`.
 ///
-/// Computable before the receipt exists, so the receipt's
-/// `transcript_hash` can commit to the exchange without circularity.
+/// The pin is computable before the receipt exists, so the receipt's
+/// `transcript_hash` commits to the exchange without circularity.
 fn exchange_challenge_hash<D>(
 	chain_hash: &[u8; 32],
 	request_der: impl AsRef<[u8]>,
@@ -195,15 +207,17 @@ where
 	compute_transcript_digest::<D>(&transcript)
 }
 
-/// Client randomness and request DER retained between the request and
+/// The client randomness and the request DER, held between the request and
 /// the server's response.
 struct PendingRenewal {
 	client_random: [u8; 32],
 	request_der: Vec<u8>,
 }
 
-/// Client half of the rekey exchange: opens renewals, verifies and
-/// countersigns epoch receipts, rotates the chain.
+/// The client half of the rekey exchange.
+///
+/// It opens renewals, verifies and countersigns epoch receipts, and rotates
+/// the chain.
 pub(crate) struct ClientRekey<P>
 where
 	P: CryptoProvider,
@@ -223,23 +237,24 @@ where
 		Self { materials, approver, pending: None }
 	}
 
-	/// Current epoch number (unit-test observability).
+	/// The current epoch number, which unit tests observe.
 	#[cfg(test)]
 	pub(crate) fn epoch(&self) -> u32 {
 		self.materials.epoch()
 	}
 
-	/// Whether a renewal is awaiting the server's response
-	/// (unit-test observability).
+	/// Whether a renewal awaits the server's response, which unit tests
+	/// observe.
 	#[cfg(test)]
 	pub(crate) fn renewal_in_flight(&self) -> bool {
 		self.pending.is_some()
 	}
 
-	/// Open a renewal: fresh client randomness, first leg on the wire.
+	/// Open a renewal with fresh client randomness and build the first leg.
 	///
 	/// # Errors
-	/// - A renewal already in flight: [`HandshakeError::InvalidState`]
+	///
+	/// - [`HandshakeError::InvalidState`] when a renewal is already in flight.
 	pub(crate) fn start_renewal(&mut self) -> Result<MuxRekeyRequestPackage, HandshakeError> {
 		if self.pending.is_some() {
 			return Err(HandshakeError::InvalidState);
@@ -256,11 +271,12 @@ where
 	/// and rotate the epoch chain.
 	///
 	/// # Fail closed
-	/// - No renewal in flight: [`HandshakeError::InvalidState`]
-	/// - Response without an epoch receipt: [`HandshakeError::ReceiptMissing`]
-	/// - Exchange pin or credit-match violation: [`HandshakeError::ReceiptMismatch`]
-	/// - Server `SignerInfo` invalid: [`HandshakeError::SignatureVerificationFailed`]
-	/// - The approver refused the renewal: [`HandshakeError::ApprovalRefused`]
+	///
+	/// - [`HandshakeError::InvalidState`] when no renewal is in flight.
+	/// - [`HandshakeError::ReceiptMissing`] when the response has no epoch receipt.
+	/// - [`HandshakeError::ReceiptMismatch`] when the exchange pin or the credit match fails.
+	/// - [`HandshakeError::SignatureVerificationFailed`] when the server `SignerInfo` is invalid.
+	/// - [`HandshakeError::ApprovalRefused`] when the approver refuses the renewal.
 	pub(crate) async fn process_response(
 		&mut self,
 		response: MuxRekeyResponsePackage,
@@ -301,8 +317,8 @@ where
 		let provider = self.materials.signing_provider.as_ref();
 		let countersignature = receipt.countersign::<P::Digest>(answer_bytes, provider).await?;
 
-		// Dual ownership by design: one copy folds into the retained
-		// artifact, the other is DER-encoded onto the wire in the ack.
+		// The countersignature has two owners by design. One copy folds into
+		// the retained artifact, and the other is DER-encoded into the ack.
 		let completed = artifact.complete(countersignature.clone())?;
 		let stored = StoredReceipt::try_from(completed)?;
 
@@ -323,8 +339,8 @@ where
 	}
 }
 
-/// Receipt, artifact, randoms, and exchange DERs retained between the
-/// response and the client's acknowledgement.
+/// The receipt, the artifact, the randoms, and the exchange DERs, held
+/// between the response and the client's acknowledgement.
 struct PendingSettlement {
 	receipt: SessionReceipt,
 	artifact: SignedData,
@@ -334,8 +350,10 @@ struct PendingSettlement {
 	server_random: [u8; 32],
 }
 
-/// Server half of the rekey exchange: issues epoch receipts, settles
-/// countersignatures, records outcomes, rotates the chain.
+/// The server half of the rekey exchange.
+///
+/// It issues epoch receipts, settles countersignatures, records outcomes, and
+/// rotates the chain.
 pub(crate) struct ServerRekey<P>
 where
 	P: CryptoProvider,
@@ -362,26 +380,27 @@ where
 		Self { materials, authorizer, observer, client_certificate, pending: None }
 	}
 
-	/// Current epoch number (unit-test observability).
+	/// The current epoch number, which unit tests observe.
 	#[cfg(test)]
 	pub(crate) fn epoch(&self) -> u32 {
 		self.materials.epoch()
 	}
 
-	/// Whether an exchange is awaiting the client's acknowledgement.
+	/// Whether an exchange awaits the client's acknowledgement.
 	pub(crate) fn exchange_in_flight(&self) -> bool {
 		self.pending.is_some()
 	}
 
-	/// Issue the epoch receipt for a renewal request: second leg on the wire.
+	/// Issue the epoch receipt for a renewal request as the second leg.
 	///
 	/// The receipt inherits the initial budgets and credit unit. The
 	/// authorizer may attach a fresh settlement challenge for the epoch.
 	///
 	/// # Fail closed
-	/// - An exchange already in flight (the mux driver bounds request
-	///   flooding before this): [`HandshakeError::InvalidState`]
-	/// - The authorizer refused the renewal: [`HandshakeError::SettlementRejected`]
+	///
+	/// - [`HandshakeError::InvalidState`] when an exchange is already in
+	///   flight. The mux driver bounds request flooding before this check.
+	/// - [`HandshakeError::SettlementRejected`] when the authorizer refuses the renewal.
 	pub(crate) async fn process_request(
 		&mut self,
 		request: &MuxRekeyRequestPackage,
@@ -414,9 +433,9 @@ where
 		)
 		.await?;
 
-		// Two owners by design: this copy is DER-encoded onto the wire and
-		// dropped, and the retained artifact absorbs the client SignerInfo at
-		// settlement.
+		// The artifact has two owners by design. This copy is DER-encoded into
+		// the response and dropped, and the retained artifact absorbs the
+		// client SignerInfo at settlement.
 		let response = MuxRekeyResponsePackage::new(server_random, Some(artifact.clone()))?;
 		let response_der = response.to_der()?;
 		self.pending =
@@ -437,10 +456,13 @@ where
 	/// The refusal code surfaces in [`ServerAckOutcome::rejection`] for the
 	/// driver to drain on.
 	///
-	/// # Fail closed (after the observer records the evidence)
-	/// - No exchange in flight: [`HandshakeError::InvalidState`]
-	/// - Absent countersignature: [`HandshakeError::CountersignatureMissing`]
-	/// - Invalid countersignature: [`HandshakeError::SignatureVerificationFailed`]
+	/// # Fail closed
+	///
+	/// Each error returns after the observer records the evidence.
+	///
+	/// - [`HandshakeError::InvalidState`] when no exchange is in flight.
+	/// - [`HandshakeError::CountersignatureMissing`] when the ack carries no countersignature.
+	/// - [`HandshakeError::SignatureVerificationFailed`] when the countersignature is invalid.
 	pub(crate) async fn process_ack(&mut self, ack: MuxRekeyAckPackage) -> Result<ServerAckOutcome, HandshakeError> {
 		let pending = self.pending.take().ok_or(HandshakeError::InvalidState)?;
 		let ack_der = ack.to_der()?;
@@ -508,22 +530,22 @@ where
 	}
 }
 
-/// Server verdict on a settled acknowledgement: fresh epoch state plus
-/// the settlement refusal code when the authorizer said no.
+/// The server verdict on a settled acknowledgement.
 ///
-/// The install is unconditional for a verified countersignature (the
-/// chain already advanced on both endpoints).
+/// It holds the fresh epoch state and, when the authorizer refused, the
+/// settlement refusal code. A verified countersignature always installs,
+/// because the chain already advanced on both endpoints.
 pub(crate) struct ServerAckOutcome {
-	/// Fresh per-direction state for the new epoch.
+	/// The fresh per-direction state for the new epoch.
 	pub(crate) install: EpochInstall,
-	/// Application refusal code when settlement was rejected.
+	/// The application refusal code when the authorizer rejected settlement.
 	pub(crate) rejection: Option<u32>,
 }
 
 /// Object-safe client half of the rekey exchange, erasing the crypto
 /// provider so the mux driver stays non-generic.
 pub(crate) trait ClientRekeyExchange: MaybeSend {
-	/// Open a renewal: first leg on the wire.
+	/// Open a renewal and build the first leg.
 	fn start_renewal(&mut self) -> Result<MuxRekeyRequestPackage, HandshakeError>;
 
 	/// Verify, countersign, and rotate on the server's response.
@@ -554,16 +576,16 @@ where
 /// Object-safe server half of the rekey exchange, erasing the crypto
 /// provider so the mux driver stays non-generic.
 pub(crate) trait ServerRekeyExchange: MaybeSend {
-	/// Whether an exchange is awaiting the client's acknowledgement.
+	/// Whether an exchange awaits the client's acknowledgement.
 	fn exchange_in_flight(&self) -> bool;
 
-	/// Second leg on the wire.
+	/// Issue the epoch receipt as the second leg.
 	fn process_request<'a>(
 		&'a mut self,
 		request: &'a MuxRekeyRequestPackage,
 	) -> MaybeSendFuture<'a, Result<MuxRekeyResponsePackage, HandshakeError>>;
 
-	/// Settle countersignature, record outcome, rotate chain.
+	/// Settle the countersignature, record the outcome, and rotate the chain.
 	fn process_ack<'a>(
 		&'a mut self,
 		ack: MuxRekeyAckPackage,
@@ -607,14 +629,14 @@ where
 /// A contended try-lock means an exchange is already being processed, which
 /// makes initiation moot.
 pub(crate) enum RekeyDriver {
-	/// Renewal initiator (mux client role).
+	/// The renewal initiator, in the mux client role.
 	Client(Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>),
-	/// Receipt issuer (mux server role).
+	/// The receipt issuer, in the mux server role.
 	Server(Box<dyn ServerRekeyExchange>),
 }
 
 impl RekeyDriver {
-	/// Type-erased wrapper for the mux driver.
+	/// Wrap a client rekey half, type-erased, for the mux driver.
 	pub(crate) fn client<P>(rekey: ClientRekey<P>) -> Self
 	where
 		P: CryptoProvider + 'static,
@@ -624,7 +646,7 @@ impl RekeyDriver {
 		RekeyDriver::Client(Arc::new(FuturesMutex::new(Box::new(rekey))))
 	}
 
-	/// Type-erased wrapper for the mux driver.
+	/// Wrap a server rekey half, type-erased, for the mux driver.
 	pub(crate) fn server<P>(rekey: ServerRekey<P>) -> Self
 	where
 		P: CryptoProvider + 'static,
@@ -640,7 +662,7 @@ pub(crate) mod tests {
 	use super::*;
 	use crate::crypto::aead::DecryptContent;
 	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::key::{InMemorySigningKeyProvider, Secp256k1Provider};
+	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::crypto::x509::utils::compute_signer_identifier;
@@ -664,7 +686,7 @@ pub(crate) mod tests {
 		let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 		let verifying_key = *signing_key.verifying_key();
 		let sid = compute_signer_identifier(&verifying_key)?;
-		let provider: Secp256k1Provider = InMemorySigningKeyProvider::from(signing_key);
+		let provider = Secp256k1KeyProvider::from(signing_key);
 		Ok(Identity { provider: Arc::new(provider), verifying_key, sid })
 	}
 
@@ -712,7 +734,7 @@ pub(crate) mod tests {
 		Ok((client, server))
 	}
 
-	/// Run one renewal to completion, answering both endpoints' installs.
+	/// Run one renewal to completion and return both endpoints' installs.
 	pub(crate) async fn run_exchange(
 		client: &mut ClientRekey<DefaultCryptoProvider>,
 		server: &mut ServerRekey<DefaultCryptoProvider>,
@@ -740,11 +762,11 @@ pub(crate) mod tests {
 
 		let uplink = client_install.send_cipher.encrypt_next(PLAINTEXT, None)?;
 		let received = server_install.recv_cipher.decrypt_content(&uplink)?;
-		assert!(received.with(|plain| plain == PLAINTEXT)?);
+		assert!(received.with(|plain| plain == PLAINTEXT));
 
 		let downlink = server_install.send_cipher.encrypt_next(PLAINTEXT, None)?;
 		let received = client_install.recv_cipher.decrypt_content(&downlink)?;
-		assert!(received.with(|plain| plain == PLAINTEXT)?);
+		assert!(received.with(|plain| plain == PLAINTEXT));
 		Ok(())
 	}
 
@@ -759,7 +781,7 @@ pub(crate) mod tests {
 
 		let uplink = client_install.send_cipher.encrypt_next(PLAINTEXT, None)?;
 		let received = server_install.recv_cipher.decrypt_content(&uplink)?;
-		assert!(received.with(|plain| plain == PLAINTEXT)?);
+		assert!(received.with(|plain| plain == PLAINTEXT));
 		Ok(())
 	}
 

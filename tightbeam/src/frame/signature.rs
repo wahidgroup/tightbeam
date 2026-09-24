@@ -5,22 +5,22 @@ use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::sign::{verify_canonical, LowSEncoding, PrehashVerifier, SignatureEncoding, SignerInfoExt};
-use crate::der::asn1::OctetString;
+use crate::crypto::x509::utils::compute_signer_identifier_from_der;
 use crate::der::oid::AssociatedOid;
 use crate::der::Encode;
 use crate::error::{ReceivedExpectedError, Result};
 use crate::frame::scaffold::TbsScaffold;
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::version::GatedField;
-use crate::x509::ext::pkix::SubjectKeyIdentifier;
 use crate::{Frame, SignerInfo, TightBeamError};
 
 impl Frame {
-	/// Encode the Frame for signature verification (TBS - to-be-signed).
+	/// Encode the frame as its to-be-signed (TBS) bytes for signature
+	/// verification.
 	///
-	/// Excludes `nonrepudiation` without cloning the frame. The borrowing
-	/// `TbsScaffold` reuses the derived field encoders, so these bytes
-	/// are bit-identical to the DER encoding of the frame with
+	/// The encoding excludes `nonrepudiation` without cloning the frame. The
+	/// borrowing `TbsScaffold` reuses the derived field encoders, so these
+	/// bytes are bit-identical to the DER encoding of the frame with
 	/// `nonrepudiation` set to `None`.
 	pub fn to_tbs(&self) -> Result<Vec<u8>> {
 		let scaffold = TbsScaffold {
@@ -35,23 +35,21 @@ impl Frame {
 
 	/// Verify the signature of the TightBeam message.
 	///
-	/// This verifies the signature against the entire TightBeam structure
-	/// under the canonical convention. The TBS encoding is hashed once with
-	/// `D` and the signature is checked against that prehash.
-	///
-	/// # Arguments
-	/// * `verifier` - The verifier to use for signature verification
-	///
-	/// # Returns
-	/// Ok(()) if the signature is valid
+	/// The method verifies the signature with `verifier` against the entire
+	/// TightBeam structure under the canonical convention. It hashes the TBS
+	/// encoding once with `D` and checks the signature against that prehash. It
+	/// returns `Ok(())` when the signature is valid.
 	///
 	/// # Errors
-	/// Returns an error if:
-	/// - The TightBeam doesn't contain a signature
-	/// - The SignerInfo advertises a digest other than `D`
-	/// - Signature verification fails
+	///
+	/// The method returns an error when:
+	///
+	/// - the TightBeam holds no signature,
+	/// - the SignerInfo advertises a digest other than `D`, or
+	/// - signature verification fails.
 	///
 	/// # See also
+	///
 	/// - [`Frame::sign_with_provider`]: the signing counterpart under the same canonical convention
 	/// - [`Frame::to_tbs`]: the exact bytes the signature covers
 	pub fn verify<S, D>(&self, verifier: &impl PrehashVerifier<S>) -> Result<()>
@@ -62,8 +60,8 @@ impl Frame {
 		let signature_info = self.nonrepudiation.as_ref().ok_or(TightBeamError::MissingSignature)?;
 
 		// The canonical convention binds the signature to the digest declared
-		// in the SignerInfo. A mismatch is algorithm confusion, not merely a
-		// bad signature.
+		// in the SignerInfo. A mismatch is algorithm confusion, which this
+		// check reports apart from a bad signature.
 		if signature_info.digest_alg.oid != D::OID {
 			return Err(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
 				signature_info.digest_alg.oid,
@@ -78,23 +76,18 @@ impl Frame {
 		Ok(())
 	}
 
-	/// Sign the frame with the provided key provider.
+	/// Sign the frame through an asynchronous key provider, such as an HSM or
+	/// a KMS, and store the signature in the `nonrepudiation` field.
 	///
-	/// This method encodes the frame (without the signature field) and signs
-	/// it using the provided key provider. The signature is stored in the
-	/// `nonrepudiation` field. It is useful if you require an async
-	/// `KeyProvider` and cannot sign the frame synchronously (HSM, KMS, etc.).
-	///
-	/// # Parameters
-	/// - `provider`: A key provider implementing the `KeyProvider` trait
-	/// - `digest`: The digest algorithm to use for computing the message digest
-	///
-	/// On any error the frame is unchanged.
+	/// - `D` digests the frame encoded without its signature field.
+	/// - The signer identifier is the key identifier of the provider's public
+	///   key whatever `D` is, so a trust store indexed by it resolves the
+	///   signer.
+	/// - On any error the frame is unchanged.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::UnsupportedVersion`] when the frame version predates signatures.
-	/// - [`TightBeamError::InvalidAlgorithm`] when `D` is shorter than the 20-byte key identifier.
 	/// - Signing errors from the provider.
 	///
 	/// # See also
@@ -119,16 +112,7 @@ impl Frame {
 		let signature_algorithm = provider.algorithm();
 
 		let public_key_der = provider.to_public_key_bytes().await?;
-		let mut hasher = D::new();
-		hasher.update(&public_key_der);
-
-		// RFC 5280 s4.2.1.2 method (1): SKID is a 160-bit (20-byte) hash of the
-		// public key. Digests shorter than the window are a caller error.
-		let skid_digest = hasher.finalize();
-		let skid_bytes = skid_digest.as_slice().get(..20).ok_or(TightBeamError::InvalidAlgorithm)?;
-		let skid_octets = OctetString::new(skid_bytes)?;
-		let skid = SubjectKeyIdentifier::from(skid_octets);
-		let sid = SignerIdentifier::SubjectKeyIdentifier(skid);
+		let sid = compute_signer_identifier_from_der(&public_key_der)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: D::OID, parameters: None };
 
 		let signer_info = SignerInfo::from_parts(signature_bytes, signature_algorithm, digest_alg, sid)?;
@@ -138,9 +122,9 @@ impl Frame {
 	/// Attach a precomputed [`SignerInfo`] to the frame's `nonrepudiation`
 	/// field.
 	///
-	/// Completes detached / two-phase signing: pair with `Frame::to_tbs` to
-	/// sign the canonical to-be-signed bytes with any external backend, then
-	/// reattach the result here.
+	/// The method completes detached, two-phase signing. Pair it with
+	/// [`Frame::to_tbs`] to sign the canonical to-be-signed bytes with any
+	/// external backend, then reattach the result here.
 	///
 	/// On any error the frame is unchanged.
 	///
@@ -239,17 +223,26 @@ mod tests {
 	#[cfg(all(feature = "secp256k1", feature = "tokio"))]
 	mod sign {
 		use super::*;
-		use crate::crypto::key::Secp256k1KeyProvider;
-		use crate::testing::fixtures::SixteenByteDigest;
+		use crate::crypto::hash::Sha3_512;
+		use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+		use crate::crypto::x509::utils::compute_signer_identifier_from_der;
 
+		/// The digest prehashes the TBS bytes only. The signer identifier is
+		/// the protocol key identifier whatever the digest, so a trust store
+		/// that indexes by it resolves the signer.
 		#[tokio::test]
-		async fn rejects_digest_shorter_than_skid_window() -> Result<()> {
+		async fn the_signer_identifier_does_not_follow_the_prehash_digest() -> Result<()> {
 			let mut frame = unsigned_frame(Version::V1)?;
-			let signing_key = TestKey::signing();
-			let provider = Secp256k1KeyProvider::from(signing_key);
+			let provider = Secp256k1KeyProvider::from(TestKey::signing());
 
-			let result = frame.sign_with_provider::<SixteenByteDigest, _>(&provider).await;
-			assert!(matches!(result, Err(TightBeamError::InvalidAlgorithm)));
+			frame.sign_with_provider::<Sha3_512, _>(&provider).await?;
+
+			let public_key_der = provider.to_public_key_bytes().await?;
+			let expected = compute_signer_identifier_from_der(&public_key_der)?;
+			let Some(signer_info) = frame.nonrepudiation.as_ref() else {
+				return Err(TightBeamError::MissingSignatureInfo);
+			};
+			assert_eq!(signer_info.sid, expected);
 			Ok(())
 		}
 
@@ -262,6 +255,7 @@ mod tests {
 			let provider = Secp256k1KeyProvider::from(signing_key);
 
 			frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
+
 			let Some(signer_info) = frame.nonrepudiation.as_ref() else {
 				return Err(TightBeamError::MissingSignatureInfo);
 			};

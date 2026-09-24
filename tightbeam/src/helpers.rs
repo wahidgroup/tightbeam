@@ -3,10 +3,10 @@ extern crate alloc;
 
 #[cfg(all(
 	not(feature = "std"),
-	any(feature = "signature", feature = "digest", feature = "kdf", feature = "aead")
+	any(feature = "signature", feature = "digest", feature = "aead")
 ))]
 use alloc::boxed::Box;
-#[cfg(all(not(feature = "std"), any(feature = "kdf", feature = "aead")))]
+#[cfg(all(not(feature = "std"), feature = "aead"))]
 use alloc::vec::Vec;
 
 #[cfg(feature = "zeroize")]
@@ -18,15 +18,13 @@ use crate::Frame;
 use crate::error::Result;
 #[cfg(feature = "signature")]
 use crate::SignerInfo;
-#[cfg(any(feature = "signature", feature = "digest", feature = "kdf", feature = "aead"))]
+#[cfg(any(feature = "signature", feature = "digest", feature = "aead"))]
 use crate::TightBeamError;
 
 #[cfg(feature = "signature")]
 pub type SignatureVerifier<E = TightBeamError> = Box<dyn FnOnce(&[u8], &SignerInfo) -> core::result::Result<(), E>>;
 #[cfg(feature = "digest")]
 pub type Digestor<E = TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::Result<crate::DigestInfo, E>>;
-#[cfg(feature = "kdf")]
-pub type KeyDeriver<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8], &[u8], usize) -> core::result::Result<Vec<u8>, E>>;
 #[cfg(feature = "aead")]
 pub type KeyWrapper<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8]) -> core::result::Result<Vec<u8>, E>>;
 
@@ -49,7 +47,7 @@ macro_rules! sign {
 #[cfg(feature = "std")]
 #[macro_export]
 macro_rules! rwlock {
-	// Single declaration with default
+	// This arm takes a single declaration with a default.
 	($name:ident: $ty:ty = $default:expr) => {
 		paste::paste! {
 			static [<$name _CELL>]: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
@@ -63,7 +61,8 @@ macro_rules! rwlock {
 		}
 	};
 
-	// Single declaration without default (uses Default trait)
+	// This arm takes a single declaration without a default, so it uses
+	// `Default`.
 	($name:ident: $ty:ty) => {
 		paste::paste! {
 			static [<$name _CELL>]: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
@@ -77,7 +76,7 @@ macro_rules! rwlock {
 		}
 	};
 
-	// Multiple declarations
+	// This arm takes several declarations.
 	($($name:ident: $ty:ty $(= $default:expr)?),+ $(,)?) => {
 		$(
 			$crate::rwlock!($name: $ty $(= $default)?);
@@ -88,7 +87,7 @@ macro_rules! rwlock {
 #[cfg(feature = "std")]
 #[macro_export]
 macro_rules! mutex {
-	// Single declaration with default
+	// This arm takes a single declaration with a default.
 	($name:ident: $ty:ty = $default:expr) => {
 		paste::paste! {
 			static [<$name _CELL>]: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
@@ -102,7 +101,8 @@ macro_rules! mutex {
 		}
 	};
 
-	// Single declaration without default (uses Default trait)
+	// This arm takes a single declaration without a default, so it uses
+	// `Default`.
 	($name:ident: $ty:ty) => {
 		paste::paste! {
 			static [<$name _CELL>]: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
@@ -116,7 +116,7 @@ macro_rules! mutex {
 		}
 	};
 
-	// Multiple declarations
+	// This arm takes several declarations.
 	($($name:ident: $ty:ty $(= $default:expr)?),+ $(,)?) => {
 		$(
 			$crate::mutex!($name: $ty $(= $default)?);
@@ -127,7 +127,7 @@ macro_rules! mutex {
 /// Extension trait for `Frame` that adds the `compute_hash` method.
 #[cfg(feature = "digest")]
 pub trait FrameHashExt {
-	/// Compute the hash of the frame using the specified digest algorithm.
+	/// Compute the hash of the frame with the digest algorithm `D`.
 	fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
 	where
 		D: digest::Digest + crate::der::oid::AssociatedOid;

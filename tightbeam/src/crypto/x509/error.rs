@@ -7,123 +7,120 @@ use alloc::string::String;
 
 use crate::Errorizable;
 
-/// Errors specific to X.509 certificate validation
+/// Errors that X.509 certificate validation returns.
 #[derive(Errorizable, Debug)]
 #[non_exhaustive]
 pub enum CertificateValidationError {
-	/// Certificate has expired
+	/// The certificate has expired.
 	#[error("Certificate has expired")]
 	Expired,
 
-	/// Certificate is not yet valid
+	/// The certificate is not yet valid.
 	#[error("Certificate is not yet valid")]
 	NotYetValid,
 
-	/// Certificate has an empty subject public key
+	/// The certificate has an empty subject public key.
 	#[error("Certificate has empty subject public key")]
 	EmptyPublicKey,
 
-	/// Certificate has an empty signature
+	/// The certificate has an empty signature.
 	#[error("Certificate has empty signature")]
 	EmptySignature,
 
-	/// Invalid timestamp provided for validation
+	/// The timestamp provided for validation is invalid.
 	#[error("Invalid timestamp")]
 	InvalidTimestamp,
 
-	/// Signature algorithm not supported
+	/// The signature algorithm is not supported.
 	#[error("Unsupported signature algorithm: {0}")]
 	UnsupportedAlgorithm(der::asn1::ObjectIdentifier),
 
-	/// DER encoding/decoding error
+	/// DER encoding or decoding failed.
 	#[error("DER encoding error: {0}")]
 	EncodingError(der::Error),
 
-	/// Signature algorithm mismatch between TBS and certificate
+	/// The signature algorithm of the TBS certificate differs from the one on
+	/// the certificate.
 	#[error("Signature algorithm mismatch between TBS certificate and certificate")]
 	AlgorithmMismatch,
 
-	/// SPKI error
+	/// The SubjectPublicKeyInfo (SPKI) layer reported an error.
 	#[error("SPKI error: {0}")]
 	SpkiError(spki::Error),
 
-	/// Public key not in pinned set
+	/// The public key is not in the pinned set.
 	#[error("Public key not in pinned set")]
 	PublicKeyNotPinned,
 
-	/// Certificate fingerprint not in pinned set
+	/// The certificate fingerprint is not in the pinned set.
 	#[error("Certificate fingerprint not in pinned set")]
 	CertificateNotPinned,
 
-	/// Certificate is in denylist
+	/// The certificate is in the denylist.
 	#[error("Certificate is denied")]
 	CertificateDenied,
 
-	/// Invalid certificate encoding
+	/// The certificate encoding is invalid.
 	#[error("Invalid certificate encoding")]
 	InvalidCertificateEncoding,
 
-	/// Trust store is sealed and cannot be modified
-	#[error("Trust store is sealed")]
-	StoreSealed,
-
-	/// Certificate not found in trust store
+	/// The trust store does not hold the certificate.
 	#[error("Certificate not trusted")]
 	CertificateNotTrusted,
 
-	/// Invalid certificate chain: a certificate's issuer does not name the
-	/// subject of the certificate above it.
+	/// The certificate chain is invalid, because a certificate's issuer does
+	/// not name the subject of the certificate above it.
 	#[error("Certificate chain broken: issuer {issuer} does not match subject {subject}")]
 	InvalidChain { issuer: String, subject: String },
 
-	/// Empty certificate chain provided
+	/// The certificate chain is empty.
 	#[error("Empty certificate chain")]
 	EmptyChain,
 
-	/// Operation not supported by this validator
-	#[error("Operation not supported")]
-	UnsupportedOperation,
-
-	/// Certificates with different fingerprints have the same SKID
+	/// Two certificates with different fingerprints have the same SKID.
 	///
-	/// Carries the colliding key identifier, so the store entry can be found.
+	/// The error carries the colliding key identifier, so the store entry can
+	/// be found.
 	#[error("SKID collision: two certificates share key identifier {skid}")]
 	SkidCollision { skid: String },
 
-	/// Issuer certificate is not a CA (RFC 5280 §6.1.4(k))
+	/// The issuer certificate is not a CA (RFC 5280 §6.1.4(k)).
 	#[error("Issuer certificate is not a CA")]
 	IssuerNotCa,
 
-	/// Issuer keyUsage extension does not assert keyCertSign (RFC 5280 §6.1.4(n))
+	/// The issuer keyUsage extension does not assert keyCertSign
+	/// (RFC 5280 §6.1.4(n)).
 	#[error("Issuer keyUsage does not permit certificate signing")]
 	MissingKeyCertSign,
 
-	/// Certification path exceeds an issuer's pathLenConstraint (RFC 5280 §6.1.4(m))
+	/// The certification path exceeds the pathLenConstraint of an issuer
+	/// (RFC 5280 §6.1.4(m)).
 	#[error("Certification path length constraint exceeded")]
 	PathLenExceeded,
 
-	/// Certificate carries a critical extension this validator does not process (RFC 5280 §4.2)
+	/// The certificate carries a critical extension that this validator does
+	/// not process (RFC 5280 §4.2).
 	#[error("Unprocessed critical extension: {0}")]
 	UnprocessedCriticalExtension(der::asn1::ObjectIdentifier),
 
-	/// End-entity certificate asserts `basicConstraints.cA`
+	/// The end-entity certificate asserts `basicConstraints.cA`.
 	#[error("End-entity certificate asserts the CA basic constraint")]
 	EndEntityIsCa,
 
-	/// Certificate is revoked (RFC 5280 §6.1.3(a)(3))
+	/// The certificate is revoked (RFC 5280 §6.1.3(a)(3)).
 	#[error("Certificate is revoked")]
 	CertificateRevoked,
 
-	/// Revocation status could not be established
+	/// The revocation status could not be established.
 	#[error("Certificate revocation status could not be established")]
 	RevocationStatusUnknown,
 
-	/// Invalid public key
+	/// The public key is invalid.
 	#[cfg(feature = "signature")]
 	#[error("Invalid public key: {0}")]
 	PublicKeyError(crate::crypto::sign::elliptic_curve::Error),
 
-	/// Signature verification failed
+	/// Signature verification failed.
 	#[cfg(feature = "signature")]
 	#[error("Signature verification failed: {0}")]
 	SignatureVerificationFailed(signature::Error),

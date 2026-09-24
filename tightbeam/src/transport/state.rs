@@ -1,11 +1,11 @@
-//! Protocol state management traits
+//! Protocol state management traits.
 //!
-//! Separates encrypted-transport state accessors from I/O.
+//! The module separates encrypted-transport state accessors from I/O.
 
 use core::time::Duration;
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
@@ -13,31 +13,32 @@ use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
-use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::CertificateSpec;
 use crate::transport::builders::EnvelopeBuilder;
 use crate::transport::envelopes::WireMode;
 use crate::transport::error::{TransportError, TransportFailure};
-use crate::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
-use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
-use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
-use crate::utils::time::MonotonicInstant;
-
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::BoxedServerHandshake;
+use crate::transport::handshake::receipt::StoredReceipt;
+use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind, PeerAuthentication};
 use crate::transport::TransportLimits;
 use crate::transport::TransportResult;
+use crate::utils::time::MonotonicInstant;
 use crate::x509::Certificate;
 
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::BoxedServerHandshake;
 #[cfg(feature = "aead")]
 use crate::transport::handshake::{EpochMaterials, EstablishedSession};
 
 /// Which wire mode a session is entitled to write, and the state backing it.
 ///
-/// The phase is stored rather than derived, and each arm carries what that
+/// The phase is stored instead of derived, and each arm carries what that
 /// phase needs. Session keys live in [`SessionPhase::Encrypted`], so a
 /// completed handshake without keys, or keys without a completed handshake,
 /// cannot be built.
@@ -67,9 +68,9 @@ impl SessionPhase {
 	/// The phase an endpoint provisioned with `encryption` starts in, and
 	/// returns to when its session breaks.
 	///
-	/// The one place that pairs provisioning with a phase. An endpoint holding
-	/// encryption material never starts in `Cleartext`, which would write
-	/// application data in the clear (CWE-311).
+	/// It is the one place that pairs provisioning with a phase. An endpoint
+	/// that holds encryption material never starts in `Cleartext`, which would
+	/// write application data in the clear (CWE-311).
 	fn start_for<P: CryptoProvider>(encryption: &EncryptionConfig<P>) -> Self {
 		if encryption.is_provisioned() {
 			return Self::Provisioned;
@@ -78,6 +79,8 @@ impl SessionPhase {
 		Self::Cleartext
 	}
 
+	/// Whether this phase may write application traffic.
+	///
 	/// A pooled connection is leased only in a writable phase, so a peer that
 	/// stalls its handshake keeps that connection out of the pool. A phase
 	/// added later stays unwritable until it is named here.
@@ -185,18 +188,15 @@ impl<P: CryptoProvider> SessionState<P> {
 
 	/// Apply `event`, reporting whether the table admitted it.
 	///
-	/// The one writer of the phase, private so that the named moves below are
-	/// the only events a caller can raise. A refused event leaves the session
-	/// where it was.
+	/// It is the one writer of the phase, and it is private, so the named moves
+	/// below are the only events a caller can raise. A refused event leaves the
+	/// session where it was.
 	fn apply(&mut self, event: SessionEvent) -> bool {
 		if !self.phase.admits(&event) {
 			return false;
 		}
 
 		self.phase = match event {
-			// The deadline runs from the first round, so a later round keeps
-			// the instant the exchange began and a slow peer cannot stretch
-			// the handshake by one allowance per round.
 			SessionEvent::BeginHandshake(now) => {
 				let initiated_at = self.phase.initiated_at().unwrap_or(now);
 				SessionPhase::Handshaking { initiated_at }
@@ -211,7 +211,8 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// Record a handshake round at `now`.
 	///
 	/// The first round starts the deadline. A later round keeps the instant
-	/// the first one recorded.
+	/// the first one recorded, so a slow peer cannot stretch the handshake by
+	/// one allowance per round.
 	#[must_use]
 	pub fn begin_handshake(&mut self, now: MonotonicInstant) -> bool {
 		self.apply(SessionEvent::BeginHandshake(now))
@@ -239,8 +240,9 @@ impl<P: CryptoProvider> SessionState<P> {
 
 	/// Detach the established session, returning this state to its start.
 	///
-	/// For a caller that splits the endpoint into halves: the halves take the
-	/// keys, and the state they leave behind holds none.
+	/// A caller that splits the endpoint into halves uses it. The halves take
+	/// the keys, and the state they leave behind holds none.
+	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	pub(crate) fn take_established(&mut self) -> Option<Box<EstablishedSession>> {
 		if !self.phase.requires_encryption() {
 			return None;
@@ -256,8 +258,9 @@ impl<P: CryptoProvider> SessionState<P> {
 
 	/// Replace the multiplexing capability this endpoint offers.
 	///
-	/// This and the setters below change negotiation input, never a peer
-	/// authority, so the phase this state starts in does not depend on them.
+	/// This setter and the ones below change negotiation input and leave the
+	/// peer authority alone, so the phase this state starts in is independent
+	/// of them.
 	#[cfg(all(
 		feature = "transport-multiplex",
 		any(feature = "transport-cms", feature = "transport-ecies")
@@ -267,32 +270,46 @@ impl<P: CryptoProvider> SessionState<P> {
 	}
 
 	/// Replace the budget-grant policy a server consults.
+	#[cfg(all(
+		any(feature = "tcp", feature = "async-transport"),
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
 	pub(crate) fn authorize_transport(&mut self, authorizer: Arc<dyn TransportAuthorizer>) {
 		self.encryption.transport_authorizer = Some(authorizer);
 	}
 
 	/// Replace the observer of budget-bearing handshake outcomes.
+	#[cfg(all(
+		any(feature = "tcp", feature = "async-transport"),
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
 	pub(crate) fn observe_sessions(&mut self, observer: Arc<dyn SessionObserver>) {
 		self.encryption.session_observer = Some(observer);
 	}
 
 	/// Replace the approver consulted before countersigning a
 	/// challenge-bearing receipt.
+	#[cfg(all(
+		any(feature = "tcp", feature = "async-transport"),
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
 	pub(crate) fn approve_receipts(&mut self, approver: Arc<dyn ReceiptApprover>) {
 		self.encryption.receipt_approver = Some(approver);
 	}
 
 	/// Replace the handshake protocol a provisioned endpoint runs.
 	///
-	/// The protocol decides how a handshake runs, not whether one is
-	/// expected, so the phase this state starts in does not depend on it.
+	/// The protocol decides how a handshake runs, and provisioning decides
+	/// whether one is expected, so the phase this state starts in is
+	/// independent of the protocol.
+	#[cfg(any(feature = "tcp", feature = "async-transport"))]
 	pub(crate) fn select_handshake(&mut self, kind: HandshakeProtocolKind) {
 		self.encryption.handshake_protocol = kind;
 	}
 
 	/// Detach the epoch rekey materials the handshake left, once.
 	///
-	/// The only write into an installed session. Handing out the session
+	/// It is the only write into an installed session. Handing out the session
 	/// itself would let a caller swap the keys under a phase that already
 	/// reports the terms it agreed.
 	#[cfg(feature = "aead")]
@@ -337,11 +354,11 @@ impl<P: CryptoProvider> SessionState<P> {
 		Ok(session.keys().recv())
 	}
 
-	/// Validated peer certificate: client identity on a mutual-auth server,
-	/// trust-store-validated server identity on a client.
+	/// Validated peer certificate. It is the client identity on a mutual-auth
+	/// server, and the trust-store-validated server identity on a client.
 	///
-	/// Read from the established session, so it is present exactly while that
-	/// session is.
+	/// It comes from the established session, so it is present exactly while
+	/// that session is.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
 		self.established()?.peer()
 	}
@@ -389,14 +406,14 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 
 	/// Decode `certificate` and bind it to the key that proves it.
 	///
-	/// The one place a [`CertificateSpec`] becomes an endpoint identity, so
-	/// every builder that accepts one decodes it the same way and holds the
+	/// It is the one place a [`CertificateSpec`] becomes an endpoint identity,
+	/// so every builder that accepts one decodes it the same way and holds the
 	/// result as shared handles.
 	///
 	/// # Errors
 	///
-	/// - [`SerializationError`] -- `certificate` holds PEM or DER that does
-	///   not decode as a certificate.
+	/// - [`SerializationError`] -- `certificate` holds PEM or DER that does not
+	///   decode as a certificate.
 	///
 	/// [`SerializationError`]: crate::TightBeamError::SerializationError
 	pub fn from_spec(
@@ -419,8 +436,8 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 
 	/// Shared handle to the certificate this identity presents.
 	///
-	/// The half a caller takes when it needs the certificate alone, so it pays
-	/// one refcount rather than the two [`Self::parts`] charges for a pair.
+	/// A caller that needs the certificate alone takes this half, so it pays
+	/// one refcount instead of the two that [`Self::parts`] charges for a pair.
 	pub fn certificate_arc(&self) -> Arc<Certificate> {
 		Arc::clone(&self.certificate)
 	}
@@ -430,10 +447,8 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 		&self.certificate
 	}
 
-	/// The signing key provider behind this identity.
-	///
-	/// The key manager holds the provider, so an endpoint that signs control
-	/// frames reads it from here rather than keeping a second handle to it.
+	/// The signing key provider behind this identity, read from its key
+	/// manager through [`HandshakeKeyManager::provider`].
 	pub fn signing_provider(&self) -> &dyn SigningKeyProvider {
 		self.key.provider()
 	}
@@ -451,15 +466,15 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 /// Everything an endpoint was provisioned with before any handshake runs.
 ///
 /// Provisioning is decided once, when the endpoint is built, so it travels as
-/// one value. A transport supplies it through a single accessor and every
-/// field is then present, rather than each being asked for separately.
+/// one value. A transport supplies it through a single accessor, so every
+/// field is present at once instead of each being asked for separately.
 #[cfg(feature = "x509")]
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct EncryptionConfig<P: CryptoProvider> {
-	/// Trust store that validates the peer's certificate. `None` leaves the peer
-	/// identity to a lower layer, which [`Self::check_peer_authentication`]
-	/// requires the endpoint to have named.
+	/// Trust store that validates the peer's certificate. `None` leaves the
+	/// peer identity to a lower layer, which
+	/// [`Self::check_peer_authentication`] requires the endpoint to have named.
 	pub(crate) trust_store: Option<Arc<dyn CertificateTrust>>,
 	/// Local server certificate this endpoint presents.
 	pub(crate) server_certificate: Option<Arc<Certificate>>,
@@ -469,9 +484,8 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// Client identity presented for mutual authentication: the certificate
 	/// and the key that proves it, bound as one value.
 	pub(crate) client_identity: Option<ClientIdentity<P>>,
-	/// Validators applied to a peer client certificate under mutual
-	/// authentication.
-	pub(crate) client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	/// How a server endpoint authenticates its client.
+	pub(crate) peer_authentication: PeerAuthentication,
 	/// Signing key manager backing this endpoint's identity and
 	/// countersignatures.
 	pub(crate) key_manager: Option<Arc<HandshakeKeyManager<P>>>,
@@ -479,14 +493,18 @@ pub struct EncryptionConfig<P: CryptoProvider> {
 	/// MUST hold the same tag for a session to complete.
 	pub(crate) aad_domain_tag: &'static [u8],
 	/// Local multiplexing capability advertised in the handshake.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
 	/// Budget-grant policy between the client's offer and the server's accept.
 	/// `None` grants the local configuration ceiling.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
 	/// Approver consulted for a challenge-bearing session receipt. `None`
 	/// fails closed when a challenge is present.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	/// Observer recording budget-bearing handshake outcomes.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) session_observer: Option<Arc<dyn SessionObserver>>,
 	/// Handshake protocol used once encryption is provisioned.
 	pub(crate) handshake_protocol: HandshakeProtocolKind,
@@ -521,34 +539,38 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	///
 	/// Each of these means a handshake is expected and names a peer authority:
 	///
-	/// - a server certificate this endpoint presents
-	/// - client validators a server checks a client certificate against
-	/// - a trust store a client checks the server certificate against
+	/// - A server certificate this endpoint presents.
+	/// - Mutual authentication a server demands of its client.
+	/// - A trust store a client checks the server certificate against.
 	///
 	/// A client certificate proves who this endpoint is, so it answers a
 	/// different question and is absent here.
 	pub fn is_provisioned(&self) -> bool {
-		// Destructured without `..`, so a field added to this configuration
-		// stops compiling here until someone says whether it implies a
-		// handshake. The alternative is a new kind of encryption material
-		// that silently leaves the endpoint in `Cleartext` (CWE-311).
+		// The binding destructures without `..`, so a field added to this
+		// configuration stops compiling here until someone says whether it
+		// implies a handshake. The alternative is a new kind of encryption
+		// material that silently leaves the endpoint in `Cleartext` (CWE-311).
 		let Self {
 			server_certificate,
 			trust_store,
-			client_validators,
+			peer_authentication,
 			server_certificate_chain: _,
 			client_identity: _,
 			key_manager: _,
 			aad_domain_tag: _,
-			mux_offer: _,
-			transport_authorizer: _,
-			receipt_approver: _,
-			session_observer: _,
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				mux_offer: _,
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				transport_authorizer: _,
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				receipt_approver: _,
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+				session_observer: _,
 			handshake_protocol: _,
 			allow_cleartext: _,
 		} = self;
 
-		server_certificate.is_some() || trust_store.is_some() || client_validators.is_some()
+		server_certificate.is_some() || trust_store.is_some() || peer_authentication.requires_certificate()
 	}
 
 	/// Whether this endpoint carries a client identity.
@@ -585,12 +607,16 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 			server_certificate: None,
 			server_certificate_chain: None,
 			client_identity: None,
-			client_validators: None,
+			peer_authentication: PeerAuthentication::Anonymous,
 			key_manager: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 			mux_offer: None,
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 			transport_authorizer: None,
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 			receipt_approver: None,
+			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 			session_observer: None,
 			handshake_protocol: HandshakeProtocolKind::default(),
 			allow_cleartext: false,
@@ -604,22 +630,22 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 pub trait ServerHandshakeSlot: sealed::Sealed {
 	/// The orchestrator carrying this endpoint's in-flight server handshake.
 	///
-	/// `None` before the first client message arrives, and again once the
-	/// handshake completes and its terms are installed.
+	/// It is `None` before the first client message arrives, and again once
+	/// the handshake completes and its terms are installed.
 	fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake>;
 }
 
 /// Provisioning that has passed [`EncryptionConfig::check_dial_permitted`].
 ///
 /// A transport is built only from this form, through [`SessionState::new`],
-/// so no path installs provisioning that was never asked the question.
+/// so every installed provisioning has answered the dialer rule.
 #[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct DialableEncryption<P: CryptoProvider>(EncryptionConfig<P>);
 
 #[cfg(feature = "x509")]
 impl<P: CryptoProvider> DialableEncryption<P> {
-	/// Ask the dialer rule of `encryption`.
+	/// Check `encryption` against the dialer rule.
 	///
 	/// # Errors
 	///
@@ -627,7 +653,6 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 	///   authenticates no peer and did not name cleartext.
 	pub fn new(encryption: EncryptionConfig<P>) -> TransportResult<Self> {
 		encryption.check_dial_permitted()?;
-
 		Ok(Self(encryption))
 	}
 
@@ -638,13 +663,12 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 	/// already secures.
 	pub fn cleartext() -> Self {
 		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
-
 		Self(encryption)
 	}
 
 	/// Accept provisioning that carries a peer authority by construction.
 	///
-	/// [`TransportEncryptionConfig`] holds a server certificate rather than an
+	/// [`TransportEncryptionConfig`] holds a server certificate instead of an
 	/// `Option` of one, so [`EncryptionConfig::is_provisioned`] holds for every
 	/// value it converts to and the rule has no work to do. It is the only
 	/// caller. Everything else goes through [`Self::new`].
@@ -702,8 +726,10 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 	/// place the session in a phase the transition table does not name.
 	fn session_state_mut(&mut self) -> &mut SessionState<Self::CryptoProvider>;
 
+	/// Apply this session's wire mode to `builder`.
+	///
 	/// Every envelope this endpoint writes passes through here, so the wire
-	/// mode is decided once per session rather than once per call site.
+	/// mode is decided once per session instead of once per call site.
 	///
 	/// # Errors
 	///
@@ -747,6 +773,7 @@ mod tests {
 	use super::*;
 	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::testing::TestFrame;
 	use crate::utils::time::{Clock, ManualClock};
 
@@ -760,7 +787,7 @@ mod tests {
 	}
 
 	impl PhaseProbe {
-		/// Client validators alone make the probe expect encryption.
+		/// Mutual authentication alone makes the probe expect encryption.
 		fn provisioned(phase: SessionPhase) -> Self {
 			Self::holding(provisioned_encryption(), phase)
 		}
@@ -793,9 +820,9 @@ mod tests {
 	}
 
 	fn provisioned_encryption() -> EncryptionConfig<DefaultCryptoProvider> {
-		let client_validators = Some(Arc::new(Vec::new()));
-
-		EncryptionConfig { client_validators, ..EncryptionConfig::unconfigured() }
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let peer_authentication = PeerAuthentication::mutual([validator]);
+		EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() }
 	}
 
 	fn handshaking() -> SessionPhase {
@@ -861,8 +888,8 @@ mod tests {
 		));
 	}
 
-	/// A provisioned session that is reset from anywhere writes nothing in the
-	/// clear, which is what CB-001 reached through a public reset flag.
+	/// A provisioned session that is reset from any phase writes nothing in
+	/// the clear, including a reset that a public reset flag triggers.
 	#[test]
 	fn a_reset_provisioned_session_refuses_a_cleartext_write() -> TransportResult<()> {
 		let mut state = SessionState::new(DialableEncryption::new(provisioned_encryption())?);
@@ -878,10 +905,9 @@ mod tests {
 		Ok(())
 	}
 
-	// Every event a session can raise from every phase it can sit in, checked
-	// against the table. `SessionState::apply` is the only writer of the
-	// phase, so a pair the table omits is a move no caller can make. A refused
-	// event leaves the session where it was.
+	// The cases check every event a session can raise from every phase it can
+	// sit in against the table. `SessionState::apply` is the only writer of
+	// the phase, so a pair the table omits is a move no caller can make.
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	crate::tb_cases! {
 		fn the_phase_table((phase, event, admitted, landing): (&str, &str, bool, &str)) {
@@ -929,7 +955,7 @@ mod tests {
 	}
 
 	/// A later handshake round keeps the instant the first round recorded, so
-	/// the deadline covers the whole exchange rather than one round.
+	/// the deadline covers the whole exchange instead of one round.
 	#[test]
 	fn a_later_handshake_round_keeps_the_first_rounds_deadline() {
 		let clock = ManualClock::default();
@@ -994,12 +1020,15 @@ mod tests {
 	}
 
 	/// Splitting takes the keys out, and the state left behind holds none.
-	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[cfg(all(
+		feature = "testing",
+		feature = "secp256k1",
+		any(feature = "tcp", feature = "async-transport")
+	))]
 	#[test]
 	fn taking_the_established_session_returns_the_state_to_its_start() {
 		let mut probe = PhaseProbe::provisioned(handshaking());
 		assert!(probe.session_state_mut().install_session(established_session()));
-
 		assert!(probe.session_state_mut().take_established().is_some());
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
 		assert!(probe.session_state_mut().take_established().is_none());

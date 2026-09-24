@@ -2,14 +2,17 @@
 //!
 //! [`AcceptPlane`] is the crate's accept loop. The servlet, hive, gateway,
 //! and `server!` planes each drive one, so the connection cap, the permit
-//! lifetime, the handler task set, and the accept retry pace stated once.
+//! lifetime, the handler task set, and the accept retry pace are stated once.
 
 use core::future::Future;
 use std::sync::Arc;
 
 use crate::constants::{DEFAULT_ACCEPT_RETRY_DELAY, DEFAULT_MAX_SERVER_CONNECTIONS};
 use crate::transport::protocols::AsyncListenerTrait;
-use crate::utils::time::{Clock, SystemClock};
+use crate::utils::time::Clock;
+
+#[cfg(host_clock)]
+use crate::utils::time::SystemClock;
 
 /// Accepts connections under a fixed cap, owning what it admits.
 ///
@@ -25,32 +28,30 @@ pub struct AcceptPlane {
 	clock: Arc<dyn Clock>,
 }
 
+/// Present only where [`SystemClock`] exists. A plane on any other target
+/// names its clock.
+#[cfg(host_clock)]
 impl Default for AcceptPlane {
-	/// A plane admitting [`DEFAULT_MAX_SERVER_CONNECTIONS`] live handlers.
+	/// A plane admitting [`DEFAULT_MAX_SERVER_CONNECTIONS`] live handlers,
+	/// pacing accept retries on the operating system's clock.
 	fn default() -> Self {
-		Self::new(DEFAULT_MAX_SERVER_CONNECTIONS)
+		Self::new(DEFAULT_MAX_SERVER_CONNECTIONS, Arc::new(SystemClock))
 	}
 }
 
 impl AcceptPlane {
-	/// Creates a plane admitting `max_connections` live handlers.
+	/// Creates a plane admitting `max_connections` live handlers, pacing
+	/// accept retries on `clock`.
 	///
-	/// [`AcceptPlane::default`] carries the cap every accept plane uses
+	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`] is the cap every accept plane uses
 	/// unless a policy names its own.
 	#[must_use]
-	pub fn new(max_connections: usize) -> Self {
+	pub fn new(max_connections: usize, clock: Arc<dyn Clock>) -> Self {
 		Self {
 			permits: Arc::new(tokio::sync::Semaphore::new(max_connections)),
 			connections: tokio::task::JoinSet::new(),
-			clock: Arc::new(SystemClock),
+			clock,
 		}
-	}
-
-	/// Replace the clock an accept failure waits out its retry delay on.
-	#[must_use]
-	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-		self.clock = clock;
-		self
 	}
 
 	/// Waits for a free connection slot, reaping finished handlers first.
@@ -132,13 +133,35 @@ impl AcceptPlane {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use core::future::Future;
+	use core::task::{Context, Waker};
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::Duration;
 
+	use super::*;
+	use crate::utils::time::ManualClock;
+
+	fn plane(max_connections: usize) -> AcceptPlane {
+		AcceptPlane::new(max_connections, Arc::new(ManualClock::default()))
+	}
+
+	/// A failed accept waits out its retry delay on the plane's clock, so a
+	/// runtime that installs its own clock paces the retry too.
+	#[tokio::test]
+	async fn a_failed_accept_waits_on_the_planes_clock() {
+		let clock = Arc::new(ManualClock::default());
+		let plane = AcceptPlane::new(1, Arc::clone(&clock) as Arc<dyn Clock>);
+		let mut context = Context::from_waker(Waker::noop());
+		let mut wait = core::pin::pin!(plane.absorb_failure());
+		assert!(wait.as_mut().poll(&mut context).is_pending());
+
+		clock.advance(DEFAULT_ACCEPT_RETRY_DELAY);
+		assert!(wait.as_mut().poll(&mut context).is_ready());
+	}
+
 	#[tokio::test(start_paused = true)]
 	async fn a_full_plane_admits_no_further_connection() {
-		let mut plane = AcceptPlane::new(1);
+		let mut plane = plane(1);
 		let _held = plane.reserve().await;
 		let blocked = tokio::time::timeout(Duration::from_secs(1), plane.reserve()).await;
 		assert!(blocked.is_err());
@@ -146,7 +169,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn a_finished_connection_returns_its_slot() {
-		let mut plane = AcceptPlane::new(1);
+		let mut plane = plane(1);
 		let permit = plane.reserve().await.expect("a free slot");
 		plane.serve(permit, async {});
 		tokio::task::yield_now().await;
@@ -157,7 +180,7 @@ mod tests {
 	async fn dropping_the_plane_aborts_its_connections() {
 		static FINISHED: AtomicBool = AtomicBool::new(false);
 
-		let mut plane = AcceptPlane::new(1);
+		let mut plane = plane(1);
 		let permit = plane.reserve().await.expect("a free slot");
 		plane.serve(permit, async {
 			tokio::time::sleep(Duration::from_secs(30)).await;

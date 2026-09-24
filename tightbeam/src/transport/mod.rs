@@ -1,4 +1,4 @@
-//! Transport layer for TightBeam protocol
+//! Transport layer for the TightBeam protocol.
 
 // Cargo features express "any of" alone, so a protocol-less TCP transport
 // would compile without a handshake or message collection. Fail the build
@@ -16,14 +16,11 @@ extern crate alloc;
 
 #[cfg(all(feature = "x509", not(feature = "std")))]
 use alloc::sync::Arc;
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
 #[cfg(feature = "x509")]
 use core::time::Duration;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-// Module declarations
 pub mod builders;
 pub mod client;
 pub mod envelopes;
@@ -33,6 +30,7 @@ pub mod io;
 pub mod messaging;
 pub mod protocols;
 pub mod state;
+pub mod wire_der;
 
 #[cfg(feature = "tokio")]
 pub mod accept;
@@ -52,7 +50,6 @@ pub mod serve;
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
 
-// Re-exports from submodules
 pub use builders::EnvelopeBuilder;
 pub use client::GenericClient;
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
@@ -83,13 +80,14 @@ pub use tcp::r#async::TokioListener;
 #[cfg(all(any(feature = "tokio", feature = "async-transport"), feature = "x509"))]
 pub use tcp::r#async::{TransportReader, TransportWriter};
 
-/// Transport-agnostic result type
+/// Transport-agnostic result type.
 pub type TransportResult<T> = Result<T, TransportError>;
 
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::transport::handshake::PeerAuthentication;
 	pub use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	pub use crate::utils::time::Clock;
 	pub use crate::x509::Certificate;
@@ -166,8 +164,8 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub(crate) certificate: Arc<Certificate>,
 	/// Signing and key-agreement material backing the certificate.
 	pub(crate) key_manager: Arc<HandshakeKeyManager<P>>,
-	/// Peer-certificate checks; `Some` demands mutual authentication.
-	pub(crate) client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	/// How this server authenticates its client.
+	pub(crate) peer_authentication: PeerAuthentication,
 	/// Domain-separation tag bound into every AEAD associated-data block.
 	pub(crate) aad_domain_tag: &'static [u8],
 	/// Every ceiling this endpoint enforces.
@@ -185,7 +183,7 @@ impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for DialableEncryptio
 	fn from(config: TransportEncryptionConfig<P>) -> Self {
 		let encryption = EncryptionConfig {
 			server_certificate: Some(config.certificate),
-			client_validators: config.client_validators,
+			peer_authentication: config.peer_authentication,
 			aad_domain_tag: config.aad_domain_tag,
 			key_manager: Some(config.key_manager),
 			..EncryptionConfig::unconfigured()
@@ -256,12 +254,12 @@ impl<P: CryptoProvider> EndpointConfig<P> {
 		self
 	}
 
-	/// The provisioning this endpoint was given.
+	/// Return the provisioning this endpoint was given.
 	pub fn encryption(&self) -> &EncryptionConfig<P> {
 		self.encryption.encryption()
 	}
 
-	/// Every ceiling this endpoint enforces.
+	/// Return every ceiling this endpoint enforces.
 	pub fn limits(&self) -> &TransportLimits {
 		&self.limits
 	}
@@ -293,37 +291,44 @@ impl<P: CryptoProvider> From<TransportEncryptionConfig<P>> for EndpointConfig<P>
 
 #[cfg(feature = "x509")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
-	/// Accepts an owned certificate or a handle to a shared one, so a caller
-	/// that already parsed its identity hands it over without copying it.
+	/// Create a server configuration from its certificate and key manager.
+	///
+	/// `certificate` accepts an owned certificate or a handle to a shared one,
+	/// so a caller that already parsed its identity hands it over without
+	/// copying it.
 	pub fn new(certificate: impl Into<Arc<Certificate>>, key_manager: impl Into<Arc<HandshakeKeyManager<P>>>) -> Self {
 		let certificate = certificate.into();
 		let key_manager = key_manager.into();
 		Self {
 			certificate,
 			key_manager,
-			client_validators: None,
+			peer_authentication: PeerAuthentication::Anonymous,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			limits: TransportLimits::default(),
 		}
 	}
 
-	/// Accepts any iterator of shared [`CertificateValidation`] values.
+	/// Name the validators that authenticate the client.
 	///
-	/// Naming validators demands mutual authentication. An empty set names no
-	/// check to run, so it demands nothing and leaves the endpoint where it
-	/// was. This is the one definition of that, so a caller holding a possibly
-	/// empty collection hands it over rather than deciding for itself.
+	/// `validators` accepts any iterator of shared [`CertificateValidation`]
+	/// values. Naming validators demands mutual authentication, and the set
+	/// replaces any set named before.
+	///
+	/// # Empty set
+	///
+	/// [`PeerAuthentication::mutual`] decides that an empty set demands
+	/// nothing, so an empty set leaves the endpoint where it was and never
+	/// turns mutual authentication off.
 	#[must_use]
 	pub fn with_client_validators(
 		mut self,
 		validators: impl IntoIterator<Item = Arc<dyn CertificateValidation>>,
 	) -> Self {
-		let validators = validators.into_iter().collect::<Vec<_>>();
-		if validators.is_empty() {
-			return self;
+		let demanded = PeerAuthentication::mutual(validators);
+		if demanded.requires_certificate() {
+			self.peer_authentication = demanded;
 		}
 
-		self.client_validators = Some(Arc::new(validators));
 		self
 	}
 
@@ -346,12 +351,13 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 		self
 	}
 
-	/// Every ceiling this endpoint enforces.
+	/// Return every ceiling this endpoint enforces.
 	pub fn limits(&self) -> &TransportLimits {
 		&self.limits
 	}
 
-	/// Identity certificate this endpoint presents during the handshake.
+	/// Return the identity certificate this endpoint presents during the
+	/// handshake.
 	pub fn certificate(&self) -> &Certificate {
 		&self.certificate
 	}
@@ -363,6 +369,26 @@ mod tests {
 	use crate::testing::TestFrame;
 	use crate::transport::error::TransportFailure;
 	use std::error::Error;
+
+	/// An empty validator set demands nothing, so it leaves an endpoint that
+	/// already demands mutual authentication where it was.
+	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[test]
+	fn an_empty_validator_set_keeps_the_configured_authentication() {
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::crypto::x509::policy::ExpiryValidator;
+		use crate::testing::fixtures::{TestCertificate, TestKey};
+		use crate::transport::handshake::HandshakeKeyManager;
+
+		let key = TestKey::signing();
+		let certificate = TestCertificate::self_signed(&key);
+		let key_manager = HandshakeKeyManager::<DefaultCryptoProvider>::from(key);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let mutual = TransportEncryptionConfig::new(certificate, key_manager).with_client_validators([validator]);
+
+		let config = mutual.with_client_validators([]);
+		assert!(config.peer_authentication.requires_certificate());
+	}
 
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -380,7 +406,6 @@ mod tests {
 		let (tx, rx) = mpsc::channel();
 		let tx = Arc::new(tx);
 
-		// Spawn server using server! macro
 		let server_handle = crate::server! {
 			protocol TokioListener: listener,
 			handle: move |message: Frame| {
@@ -392,7 +417,6 @@ mod tests {
 			}
 		};
 
-		// Create client using client! macro
 		let mut client = crate::client! {
 			connect TokioListener: addr,
 			cleartext,
@@ -417,9 +441,8 @@ mod tests {
 
 	/// A builder that was told nothing about limits still has them.
 	///
-	/// The transport previously carried `Option<usize>` ceilings defaulted to
-	/// `None`, so a default endpoint read cleartext with no bound at all. Every
-	/// other limit test sets a ceiling explicitly and would not have noticed.
+	/// A default endpoint reads cleartext under a bound. Every other limit test
+	/// sets a ceiling explicitly, so only this test covers the default.
 	#[test]
 	fn default_limits_bound_a_cleartext_envelope() {
 		let limits = TransportLimits::default();
@@ -438,12 +461,13 @@ mod tests {
 		));
 	}
 
-	/// The encrypted ceiling names the sealed wire form, not the plaintext.
+	/// The encrypted ceiling measures the sealed wire form instead of the
+	/// plaintext.
 	///
 	/// With a ceiling set to exactly the plaintext length, the payload must
-	/// still be refused: the AEAD tag, the nonce, and the `WireEnvelope`
-	/// wrapper are all added after encoding, and measuring before them let an
-	/// oversized envelope reach the peer as a connection reset.
+	/// still be refused. The AEAD tag, the nonce, and the `WireEnvelope`
+	/// wrapper are all added after encoding, so a measurement before them would
+	/// let an oversized envelope reach the peer as a connection reset.
 	#[cfg(feature = "aes-gcm")]
 	#[test]
 	fn encrypted_ceiling_measures_the_sealed_wire_form() -> Result<(), Box<dyn Error>> {

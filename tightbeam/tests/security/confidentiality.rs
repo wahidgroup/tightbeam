@@ -18,8 +18,7 @@
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data
 //!   <https://cwe.mitre.org/data/definitions/311.html>
-//! - CAPEC-157: Sniffing Attacks
-//!   <https://capec.mitre.org/data/definitions/157.html>
+//! - CAPEC-157: Sniffing Attacks <https://capec.mitre.org/data/definitions/157.html>
 //! - RFC 9180 (HPKE): ECDH + KDF + AEAD construction
 
 use std::sync::Arc;

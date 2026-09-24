@@ -1,6 +1,7 @@
-//! Payment Servlets
+//! Payment servlets.
 //!
-//! Defines servlets for authorization, capture, and key management.
+//! The module defines servlets for authorization, capture, and key
+//! management.
 
 use std::sync::Arc;
 
@@ -82,7 +83,8 @@ servlet! {
 
 		// The message-integrity commitment must recompute over the
 		// decrypted transaction body, so this event proves cryptographic
-		// verification of what the client committed to, not presence.
+		// verification of what the client committed to. The presence of a
+		// commitment alone does not satisfy it.
 		let commitment_verified = frame.verify_commitment_of::<Sha3_256, _>(&req, [])?;
 		trace.event_with(INTEGRITY_VERIFIED, &[PAYMENT_TAG], commitment_verified)?;
 
@@ -184,9 +186,11 @@ servlet! {
 			KeyManagerRequest::Decrypt(decrypt_req) => {
 				let ecies_msg = Secp256k1EciesMessage::from_bytes(&decrypt_req.ciphertext)?;
 				let plaintext_secret = ecies_decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(secret_key.as_ref(), &ecies_msg, None)?;
-				let plaintext = plaintext_secret.to_insecure()?.to_vec();
+				let plaintext = plaintext_secret.to_insecure().to_vec();
 				let response = DecryptResponse { plaintext };
+
 				trace.event_with(KEYMANAGER_DECRYPT_SUCCESS, &[PAYMENT_TAG], true)?;
+
 				Ok(Some(compose! {
 					V2: id: frame.metadata().id(),
 						message: response

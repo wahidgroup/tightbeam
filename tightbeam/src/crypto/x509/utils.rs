@@ -1,4 +1,5 @@
-//! X.509 certificate utility functions and helpers.
+//! X.509 certificate fingerprints, SubjectKeyIdentifiers, and certificate
+//! checks.
 
 use core::fmt::{self, Debug, Formatter};
 use core::hash::{Hash, Hasher};
@@ -53,7 +54,7 @@ impl<D> Hash for Fingerprint<D> {
 }
 
 impl<D> Fingerprint<D> {
-	/// The fingerprint bytes.
+	/// Return the fingerprint bytes.
 	pub fn as_slice(&self) -> &[u8] {
 		&self.bytes
 	}
@@ -67,7 +68,7 @@ where
 	///
 	/// # Errors
 	///
-	/// - DER encode failures from the certificate
+	/// - [`CertificateValidationError::EncodingError`] -- the certificate fails to DER-encode.
 	pub fn from_certificate(cert: &Certificate) -> Result<Self, CertificateValidationError> {
 		let der_bytes = cert.to_der()?;
 		let hash = D::digest(&der_bytes);
@@ -97,9 +98,9 @@ pub struct Skid([u8; 20]);
 impl Skid {
 	/// The SubjectKeyIdentifier of a DER-encoded public key.
 	///
-	/// The digest is [`SkidDigest`], a protocol constant: a signer stamps
-	/// this value into the `SignerInfo` it puts on the wire, and a trust
-	/// store indexes by it, so neither side may choose its own digest.
+	/// The digest is the protocol constant [`SkidDigest`]. A signer stamps this
+	/// value into the `SignerInfo` it puts on the wire, and a trust store
+	/// indexes by it.
 	pub fn of_public_key(public_key_der: impl AsRef<[u8]>) -> Self {
 		let digest: [u8; 32] = <SkidDigest as Digest>::digest(public_key_der.as_ref()).into();
 		let mut bytes = [0u8; 20];
@@ -114,7 +115,7 @@ impl Skid {
 		Some(Self(*bytes))
 	}
 
-	/// The SKID bytes.
+	/// Return the SKID bytes.
 	pub fn as_bytes(&self) -> &[u8; 20] {
 		&self.0
 	}
@@ -133,22 +134,26 @@ macro_rules! pem {
 
 /// Certificate checks this crate runs before trusting a peer.
 ///
-/// `Certificate` is defined in `x509-cert`, so these are trait methods
-/// rather than inherent ones. Every check still reaches the certificate
-/// through the certificate itself.
+/// `Certificate` is defined in `x509-cert`, so the checks are trait methods.
+/// Every check still reaches the certificate through the certificate itself.
 pub trait CertificateExt {
 	/// Validate certificate expiry (`not_before <= now <= not_after`).
-	/// Implements the validity-period check of RFC 5280 §6.1.3(a)(2) over
-	/// the `Validity` field (§4.1.2.5):
-	/// <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3>.
-	/// Temporal validity only. Signature and trust chains belong to the
-	/// `CertificateValidation` trait.
+	///
+	/// The method implements the validity-period check of RFC 5280 §6.1.3(a)(2)
+	/// over the `Validity` field (§4.1.2.5). It covers temporal validity only.
+	/// Signature and trust chains belong to the `CertificateValidation` trait.
 	///
 	/// # Errors
+	///
 	/// - [`CertificateValidationError::NotYetValid`] before `not_before`
 	/// - [`CertificateValidationError::Expired`] after `not_after`
 	/// - [`CertificateValidationError::InvalidTimestamp`] when the build
 	///   carries no clock, so a higher layer owns temporal validation
+	///
+	/// # Sources
+	///
+	/// - RFC 5280 §6.1.3, basic certificate processing:
+	///   <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3>
 	fn validate_expiry(&self) -> Result<(), CertificateValidationError>;
 
 	/// Validate expiry against a caller-supplied Unix timestamp.
@@ -162,30 +167,44 @@ pub trait CertificateExt {
 	///
 	/// - [`CertificateValidationError::NotYetValid`] before `not_before`
 	/// - [`CertificateValidationError::Expired`] after `not_after`
-	/// - [`CertificateValidationError::InvalidTimestamp`] when `now_unix`
-	///   does not convert to a certificate time
+	/// - [`CertificateValidationError::InvalidTimestamp`] when `now_unix` does
+	///   not convert to a certificate time
 	fn validate_expiry_at(&self, now_unix: u64) -> Result<(), CertificateValidationError>;
 
 	/// Raw public key bytes from the certificate's SPKI.
 	fn verifying_key_bytes(&self) -> &[u8];
 
 	/// Enforce algorithm-identifier consistency within the certificate.
-	/// RFC 5280 §4.1.1.2: the outer `signatureAlgorithm` field MUST carry
-	/// the same algorithm identifier as `tbsCertificate.signature`
-	/// (§4.1.2.3).
-	/// <https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2>.
+	///
+	/// Per RFC 5280 §4.1.1.2, the outer `signatureAlgorithm` field MUST carry
+	/// the same algorithm identifier (OID and parameters) as
+	/// `tbsCertificate.signature` (§4.1.2.3).
 	///
 	/// # Errors
+	///
 	/// - [`CertificateValidationError::AlgorithmMismatch`] on disagreement
+	///
+	/// # Sources
+	///
+	/// - RFC 5280 §4.1.1.2, signatureAlgorithm:
+	///   <https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2>
 	fn ensure_signature_algorithm_consistency(&self) -> Result<(), CertificateValidationError>;
 
 	/// Decode a typed X.509 extension by its associated OID, if present.
-	/// Locates the extension (RFC 5280 §4.2) whose `extnID` matches the
-	/// requested type's [`AssociatedOid`] and decodes its `extnValue`.
-	/// `Ok(None)` when the certificate carries no such extension.
+	///
+	/// The method locates the extension (RFC 5280 §4.2) whose `extnID` matches
+	/// the requested type's [`AssociatedOid`] and decodes its `extnValue`. It
+	/// returns `Ok(None)` when the certificate carries no such extension.
 	///
 	/// # Errors
-	/// - Decode failures from the extension's `extnValue`
+	///
+	/// - [`CertificateValidationError::EncodingError`] -- the extension's
+	///   `extnValue` fails to decode.
+	///
+	/// # Sources
+	///
+	/// - RFC 5280 §4.2, certificate extensions:
+	///   <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>
 	fn extension<T>(&self) -> Result<Option<T>, CertificateValidationError>
 	where
 		T: AssociatedOid + DecodeOwned;
@@ -245,9 +264,8 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 
 	/// Enforce algorithm-identifier consistency within a certificate.
 	///
-	/// RFC 5280 §4.1.1.2: the outer `signatureAlgorithm` field MUST contain the
-	/// same algorithm identifier (OID and parameters) as `tbsCertificate.signature`
-	/// (§4.1.2.3). <https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2>.
+	/// [`CertificateExt::ensure_signature_algorithm_consistency`] owns the RFC
+	/// 5280 §4.1.1.2 contract.
 	fn ensure_signature_algorithm_consistency(&self) -> Result<(), CertificateValidationError> {
 		if self.signature_algorithm != self.tbs_certificate.signature {
 			return Err(CertificateValidationError::AlgorithmMismatch);
@@ -258,10 +276,7 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 
 	/// Decode a typed X.509 extension by its associated OID, if present.
 	///
-	/// Locates the certificate extension (RFC 5280 §4.2) whose `extnID` matches the
-	/// requested type's [`AssociatedOid`] and decodes its `extnValue`. Returns
-	/// `Ok(None)` when the certificate carries no such extension.
-	/// <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>.
+	/// [`CertificateExt::extension`] owns the RFC 5280 §4.2 contract.
 	fn extension<T>(&self) -> Result<Option<T>, CertificateValidationError>
 	where
 		T: AssociatedOid + DecodeOwned,
@@ -282,21 +297,25 @@ impl<P: Profile> CertificateExt for CertificateInner<P> {
 
 /// Compute a SubjectKeyIdentifier-based SignerIdentifier from a verifying key.
 ///
-/// This helper extracts the public key DER encoding, hashes it with the provided
-/// digest algorithm, truncates to 20 bytes (RFC 5280 recommendation), and wraps
-/// it in a SignerIdentifier::SubjectKeyIdentifier variant.
+/// The identifier is [`Skid::of_public_key`] of the key's DER encoding, the
+/// one definition every signer and trust store in this crate uses, wrapped
+/// as `SignerIdentifier::SubjectKeyIdentifier` for CMS SignedData.
 ///
-/// # Type Parameters
-/// - `D`: Digest algorithm (e.g., SHA3-256)
-/// - `V`: Verifying key type that can be DER-encoded
+/// # Examples
 ///
-/// # Returns
-/// `SignerIdentifier::SubjectKeyIdentifier` for use in CMS SignedData structures
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use tightbeam::cms::signed_data::SignerIdentifier;
+/// use tightbeam::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
+/// use tightbeam::crypto::x509::utils::compute_signer_identifier;
 ///
-/// # Example
-/// ```ignore
-/// use sha3::Sha3_256;
+/// let signing_key = Secp256k1SigningKey::from_slice(&[7u8; 32])?;
+/// let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 /// let signer_id = compute_signer_identifier(&verifying_key)?;
+///
+/// assert!(matches!(signer_id, SignerIdentifier::SubjectKeyIdentifier(_)));
+/// # Ok(())
+/// # }
 /// ```
 pub fn compute_signer_identifier<V>(verifying_key: &V) -> Result<SignerIdentifier, CertificateValidationError>
 where
@@ -306,9 +325,11 @@ where
 	compute_signer_identifier_from_der(public_key_der.as_bytes())
 }
 
-/// Compute a SubjectKeyIdentifier-based SignerIdentifier from DER-encoded public key bytes.
+/// Compute a SubjectKeyIdentifier-based SignerIdentifier from DER-encoded
+/// public key bytes.
 ///
-/// This is the byte-based variant for use with `KeyProvider::to_public_key_bytes()`.
+/// This byte-based variant accepts the output of
+/// `KeyProvider::to_public_key_bytes()`.
 pub fn compute_signer_identifier_from_der(
 	public_key_der: impl AsRef<[u8]>,
 ) -> Result<SignerIdentifier, CertificateValidationError> {
@@ -381,11 +402,12 @@ mod tests {
 		let expired_cert = TestCertificate::expired();
 		let validator = ExpiryValidator;
 
-		// This certificate expired on August 17, 2019, so it should be rejected
+		// This certificate expired on August 17, 2019, so the validator rejects
+		// it.
 		let result = validator.evaluate(&expired_cert);
 		assert!(result.is_err(), "Expired certificate should be rejected");
 
-		// Verify it's specifically an expiry error
+		// The rejection is specifically an expiry error.
 		match result {
 			Err(CertificateValidationError::Expired) => {
 				// Expected error

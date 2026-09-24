@@ -1,7 +1,13 @@
-//! Transcript hashing utilities for handshake protocols.
+//! Transcript hashing for handshake protocols.
 //!
-//! Provides functions for computing cryptographic hashes over handshake
-//! message sequences, ensuring transcript integrity.
+//! The module computes cryptographic hashes over handshake message
+//! sequences, which protects transcript integrity.
+
+#[cfg(all(not(feature = "std"), feature = "transport-cms"))]
+use alloc::vec::Vec;
+
+#[cfg(feature = "transport-cms")]
+use crate::constants::{TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
 
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::CryptoProvider;
@@ -29,16 +35,12 @@ pub(crate) fn digest_output_to_array(bytes: impl AsRef<[u8]>) -> Result<[u8; TRA
 
 /// Compute a transcript hash over a sequence of messages.
 ///
-/// Hashes all messages in order using the provider's digest algorithm.
-///
-/// # Parameters
-/// - `messages`: Array of message slices in chronological order
-///
-/// # Returns
-/// 32-byte transcript hash
+/// The function hashes `messages` in chronological order with the digest
+/// algorithm of the provider and returns the 32-byte transcript hash.
 ///
 /// # Errors
-/// - `TranscriptDigestLength`: The provider digest produces fewer than 32 bytes
+///
+/// - `TranscriptDigestLength` -- the provider digest produces fewer than 32 bytes.
 pub fn transcript_hash<P: CryptoProvider>(messages: &[&[u8]]) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
 	let mut hasher = P::Digest::default();
 	for message in messages {
@@ -48,10 +50,141 @@ pub fn transcript_hash<P: CryptoProvider>(messages: &[&[u8]]) -> Result<[u8; TRA
 	digest_output_to_array(hasher.finalize())
 }
 
+/// The bytes a CMS handshake binds, and then their hash once sealed.
+///
+/// Only an open transcript accepts bytes, so nothing reaches the transcript
+/// after both Finished messages fixed their hash. The state stays private, so
+/// a hash exists only where [`Transcript::seal`] computed it.
+#[cfg(feature = "transport-cms")]
+pub(crate) struct Transcript(State);
+
+#[cfg(feature = "transport-cms")]
+enum State {
+	/// The messages exchanged so far, in the order both endpoints hash them.
+	Open(Vec<u8>),
+	/// The transcript hash both Finished messages sign.
+	Sealed([u8; TRANSCRIPT_HASH_LEN]),
+}
+
+#[cfg(feature = "transport-cms")]
+impl Transcript {
+	/// Create an open transcript that holds no bytes.
+	pub(crate) const fn new() -> Self {
+		Self(State::Open(Vec::new()))
+	}
+
+	/// Append the next message to an open transcript.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the transcript is sealed.
+	pub(crate) fn append(&mut self, bytes: impl AsRef<[u8]>) -> Result<(), HandshakeError> {
+		match &mut self.0 {
+			State::Open(buffer) => {
+				buffer.extend_from_slice(bytes.as_ref());
+				Ok(())
+			}
+			State::Sealed(_) => Err(HandshakeError::InvalidState),
+		}
+	}
+
+	/// Fix the hash over the bytes appended so far under digest `D`, and
+	/// return it.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the transcript is already sealed.
+	/// - [`HandshakeError::TranscriptDigestLength`] -- `D` produces fewer than 32 bytes.
+	pub(crate) fn seal<D: Digest>(&mut self) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+		let State::Open(buffer) = &self.0 else {
+			return Err(HandshakeError::InvalidState);
+		};
+
+		let hash = digest_output_to_array(D::digest(buffer))?;
+		self.0 = State::Sealed(hash);
+		Ok(hash)
+	}
+
+	/// Return the sealed transcript hash.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidTranscriptHash`] -- the transcript is still open.
+	pub(crate) fn hash(&self) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+		match &self.0 {
+			State::Sealed(hash) => Ok(*hash),
+			State::Open(_) => Err(HandshakeError::InvalidTranscriptHash),
+		}
+	}
+}
+
+/// The endpoint that signed a CMS Finished.
+///
+/// Both Finished messages sign the same transcript hash, so the signed content
+/// names its role ahead of the hash. A Finished one endpoint signed then cannot
+/// verify as the other endpoint's, and a peer cannot reflect a Finished back.
+#[cfg(feature = "transport-cms")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinishedRole {
+	/// The server Finished, signed with the server certificate's key.
+	Server,
+	/// The client Finished, signed with the client's key.
+	Client,
+}
+
+#[cfg(feature = "transport-cms")]
+impl FinishedRole {
+	/// Return the domain label this role signs ahead of the transcript hash.
+	const fn domain(self) -> &'static [u8] {
+		match self {
+			Self::Server => TIGHTBEAM_SERVER_FINISHED_DOMAIN,
+			Self::Client => TIGHTBEAM_CLIENT_FINISHED_DOMAIN,
+		}
+	}
+
+	/// Build the content a Finished of this role signs, which is the role's
+	/// domain label followed by the transcript hash.
+	pub(crate) fn content(self, transcript_hash: &[u8; TRANSCRIPT_HASH_LEN]) -> Vec<u8> {
+		[self.domain(), transcript_hash.as_slice()].concat()
+	}
+
+	/// Read the transcript hash that a Finished of this role signed.
+	///
+	/// Content that names another role, or carries a hash of another length,
+	/// yields `None`.
+	pub(crate) fn transcript_hash(self, content: &[u8]) -> Option<[u8; TRANSCRIPT_HASH_LEN]> {
+		let hash = content.strip_prefix(self.domain())?;
+		hash.try_into().ok()
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::crypto::profiles::DefaultCryptoProvider;
+
+	#[cfg(feature = "transport-cms")]
+	use crate::crypto::hash::Sha3_256;
+
+	#[cfg(feature = "transport-cms")]
+	#[test]
+	fn a_sealed_transcript_refuses_more_bytes() -> Result<(), HandshakeError> {
+		let mut transcript = Transcript::new();
+		transcript.append(b"key exchange")?;
+
+		let sealed = transcript.seal::<Sha3_256>()?;
+		let refusal = transcript.append(b"server finished");
+		assert!(matches!(refusal, Err(HandshakeError::InvalidState)));
+		assert_eq!(transcript.hash()?, sealed);
+		Ok(())
+	}
+
+	#[cfg(feature = "transport-cms")]
+	#[test]
+	fn an_open_transcript_has_no_hash() {
+		let transcript = Transcript::new();
+		assert!(matches!(transcript.hash(), Err(HandshakeError::InvalidTranscriptHash)));
+	}
 
 	#[test]
 	fn test_transcript_hash_single_message() -> Result<(), HandshakeError> {

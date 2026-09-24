@@ -1,15 +1,18 @@
 //! Hiding message commitments.
 //!
-//! A bare `H(message)` digest is *binding* but not *hiding*: a low-entropy body
-//! can be recovered by brute-forcing candidate preimages against the digest that
-//! travels in cleartext metadata. A commitment salts the body with a secret
-//! blinding value so the published digest reveals nothing about the body until
-//! the opening `(salt, message)` is disclosed.
+//! A bare `H(message)` digest is *binding* only. It is not *hiding*, because
+//! an attacker can recover a low-entropy body by brute-forcing candidate
+//! preimages against the digest that travels in cleartext metadata.
+//!
+//! A commitment salts the body with a secret blinding value, so the published
+//! digest reveals nothing about the body until the opening `(salt, message)`
+//! is disclosed.
+//!
+//! # Wire format
 //!
 //! The commitment value goes in the existing message integrity field, so the
-//! wire format is unchanged. Its preimage starts with a mode byte, so a
-//! hiding commitment and a plain digest of the same body are different values
-//! and neither verifies as the other.
+//! wire format is unchanged. `commit_digest` owns the preimage layout and its
+//! mode byte.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -31,33 +34,31 @@ const HIDING_MODE: u8 = 0x01;
 
 /// A blinding salt carrying at least [`MIN_SALT_SIZE`] bytes.
 ///
-/// The field is private and [`CommitmentSalt::parse`] is the only thing that
-/// mints one, so a salt too short to hide a body has no representation. A
-/// public payload here would put the length rule back at every call site.
+/// The field is private and [`CommitmentSalt::parse`] is the only
+/// constructor, so a salt too short to hide a body has no representation. A
+/// public payload would repeat the length rule at every call site.
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 #[derive(Debug)]
 pub struct HidingSalt(SecretSlice<u8>);
 
 impl HidingSalt {
 	/// Read the salt bytes for the duration of `read`.
-	///
-	/// # Errors
-	///
-	/// - [`TightBeamError::SecretUnavailable`] when the salt was already taken.
-	pub fn with<R>(&self, read: impl FnOnce(&[u8]) -> R) -> Result<R> {
-		Ok(self.0.with(read)?)
+	pub fn with<R>(&self, read: impl FnOnce(&[u8]) -> R) -> R {
+		self.0.with(|salt| read(salt))
 	}
 }
 
 /// The blinding salt of a message commitment.
 ///
 /// A commitment hides its body only when the salt carries enough entropy, so
-/// a salt below [`MIN_SALT_SIZE`] never becomes one. An empty salt names the
-/// plain-digest mode, which binds the body without hiding it.
+/// only a salt of at least [`MIN_SALT_SIZE`] bytes becomes a hiding salt. An
+/// empty salt names the plain-digest mode, which binds the body without
+/// hiding it.
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 #[derive(Debug)]
 pub enum CommitmentSalt {
-	/// No salt. The commitment binds the body and reveals a digest of it.
+	/// The commitment has no salt, so it binds the body and reveals a digest of
+	/// it.
 	Plain,
 	/// A blinding salt of at least [`MIN_SALT_SIZE`] bytes.
 	Hiding(HidingSalt),
@@ -71,8 +72,8 @@ impl CommitmentSalt {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::InvalidSaltLength`] when a non-empty salt is
-	///   shorter than [`MIN_SALT_SIZE`], which would not hide the body.
+	/// - [`TightBeamError::InvalidSaltLength`] when a non-empty salt is shorter
+	///   than [`MIN_SALT_SIZE`], which would not hide the body.
 	pub fn parse(salt: impl AsRef<[u8]>) -> Result<Self> {
 		let salt = salt.as_ref();
 		if salt.is_empty() {
@@ -88,13 +89,17 @@ impl CommitmentSalt {
 
 /// Compute the commitment digest over `salt` and `data`.
 ///
-/// The preimage is `H(mode || data)` for [`CommitmentSalt::Plain`] and
-/// `H(mode || len(salt) || salt || data)` for a hiding salt, with an 8-byte
-/// big-endian length. The mode byte separates the two, and the length frame
-/// keeps distinct `(salt, data)` pairs from sharing a preimage.
+/// # Preimage
 ///
-/// The preimage is streamed into the hasher, so no copy of the body is made
-/// to prepend the prefix to it.
+/// - [`CommitmentSalt::Plain`]: `H(mode || data)`.
+/// - Hiding salt: `H(mode || len(salt) || salt || data)`, where `len(salt)` is
+///   an 8-byte big-endian length.
+///
+/// The mode byte separates the two forms, so a hiding commitment and a plain
+/// digest of the same body are different values and neither verifies as the
+/// other. The length frame keeps distinct `(salt, data)` pairs from sharing a
+/// preimage. The preimage streams into the hasher, so prepending the prefix
+/// costs no copy of the body.
 pub(crate) fn commit_digest<D>(salt: &CommitmentSalt, data: impl AsRef<[u8]>) -> Result<DigestInfo>
 where
 	D: Digest + AssociatedOid,
@@ -106,7 +111,7 @@ where
 			hasher.update([HIDING_MODE]);
 			hasher.update((salt.len() as u64).to_be_bytes());
 			hasher.update(salt);
-		})?,
+		}),
 	}
 
 	hasher.update(data.as_ref());
@@ -163,7 +168,7 @@ impl Opening {
 		Ok(recomputed.digest_matches(commitment))
 	}
 
-	/// The blinding salt.
+	/// Return the blinding salt of this opening.
 	pub fn salt(&self) -> &CommitmentSalt {
 		&self.salt
 	}
@@ -205,8 +210,8 @@ mod tests {
 		Ok(())
 	}
 
-	// The hasher is fed in pieces, so the preimage layout is no longer
-	// visible as one buffer. These pin the documented bytes against a
+	// The hasher reads the preimage in pieces, so the layout exists in no
+	// single buffer. These tests pin the documented bytes against a
 	// concatenation built by hand.
 	#[test]
 	fn a_plain_preimage_is_the_mode_byte_then_the_body() -> Result<()> {

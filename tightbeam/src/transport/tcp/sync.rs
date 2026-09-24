@@ -251,7 +251,8 @@ where
 		&self.emitter_gate
 	}
 
-	/// Protocol-specific send/receive with handshake and timeout
+	/// Run the protocol-specific send and receive with the handshake and the
+	/// timeout.
 	async fn perform_send_receive(
 		&mut self,
 		message: Frame,
@@ -282,10 +283,10 @@ where
 	}
 }
 
-// EncryptedMessageIO: operation methods only
+// The EncryptedMessageIO impl uses the default operation methods.
 impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
-/// TCP server using abstract listener trait. Every accepted transport is
+/// TCP server over the abstract listener trait. Every accepted transport is
 /// built from one [`EndpointConfig`].
 pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoProvider> {
 	listener: L,
@@ -376,8 +377,10 @@ mod tests {
 	use std::time::{Duration, Instant};
 
 	use super::*;
+	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::policy::TransitStatus;
 	use crate::testing::*;
+	use crate::transport::handshake::PeerAuthentication;
 	use crate::transport::policy::PolicyConfig;
 	use crate::transport::state::{DialableEncryption, EncryptionConfig};
 	use crate::transport::TransportLimits;
@@ -386,16 +389,17 @@ mod tests {
 	/// A server that validates client certificates, so its reads face an
 	/// unauthenticated peer under the handshake ceilings in `limits`.
 	fn validating_server(limits: TransportLimits) -> EndpointConfig<DefaultCryptoProvider> {
-		let validators = Some(Arc::new(Vec::new()));
-		let encryption = EncryptionConfig { client_validators: validators, ..EncryptionConfig::unconfigured() };
-		let encryption = DialableEncryption::new(encryption).expect("client validators answer for the peer");
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let peer_authentication = PeerAuthentication::mutual([validator]);
 
+		let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
+		let encryption = DialableEncryption::new(encryption).expect("mutual authentication answers for the peer");
 		EndpointConfig::new(encryption, Arc::new(SystemClock)).with_limits(limits)
 	}
 
-	/// Under the per-recv-only scheme this read complete after ~6s of dripping
-	/// the absolute deadline aborts it at the first slice boundary past
-	/// the budget.
+	/// A peer that drips bytes cannot stretch the read. A per-recv timeout
+	/// alone would let this read complete after about 6s of dripping, and the
+	/// absolute deadline aborts it at the first slice boundary past the budget.
 	#[cfg(feature = "x509")]
 	#[tokio::test]
 	async fn handshake_read_deadline_bounds_byte_drip() -> TransportResult<()> {

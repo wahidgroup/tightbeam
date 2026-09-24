@@ -1,7 +1,7 @@
-//! Utility functions for handshake operations.
+//! Shared functions for handshake operations.
 //!
-//! Provides common cryptographic and state management utilities used across
-//! handshake builders, processors, and orchestrators.
+//! Handshake builders, processors, and orchestrators share these
+//! cryptographic and state management helpers.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -35,10 +35,6 @@ pub fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None }
 }
 
-// ============================================================================
-// Orchestrator utilities
-// ============================================================================
-
 /// Enforce a single expected handshake state. A mismatch yields `InvalidState`.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[inline]
@@ -50,9 +46,9 @@ pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), Hands
 	}
 }
 
-/// 32-byte transcript digest under digest algorithm `D`.
+/// Compute the 32-byte transcript digest under digest algorithm `D`.
 ///
-/// Wider digests (e.g. SHA3-512) truncate to the leading 32 bytes.
+/// A wider digest, such as SHA3-512, truncates to its leading 32 bytes.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub fn compute_transcript_digest<D>(data: impl AsRef<[u8]>) -> Result<[u8; 32], HandshakeError>
 where
@@ -67,21 +63,25 @@ where
 /// Compute the ECIES handshake transcript hash from its ordered legs.
 ///
 /// Both roles derive this identically. A divergence here is a protocol break,
-/// so the concatenation order lives in one place. Binds the client hello,
-/// server random, server SPKI, and both accept encodings (CWE-347).
+/// so the concatenation order lives in one place. The hash binds the client
+/// hello, the server random, the server SPKI, and both accept encodings
+/// (CWE-347).
 ///
-/// # Type Parameters
-/// - `D`: The digest algorithm (e.g., `Sha3_256`)
+/// # Type parameters
+///
+/// - `D`: the digest algorithm, such as `Sha3_256`.
 ///
 /// # Parameters
-/// - `client_hello`: DER of the client hello message
-/// - `server_random`: The 32-byte server random
-/// - `spki_bytes`: DER of the server SubjectPublicKeyInfo
-/// - `accept_der`: DER of the handshake accept
-/// - `transport_accept_der`: DER of the transport accept
+///
+/// - `client_hello`: the DER of the client hello message.
+/// - `server_random`: the 32-byte server random.
+/// - `spki_bytes`: the DER of the server SubjectPublicKeyInfo.
+/// - `accept_der`: the DER of the handshake accept.
+/// - `transport_accept_der`: the DER of the transport accept.
 ///
 /// # Errors
-/// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
+///
+/// - `TranscriptDigestLength` -- `D` produces fewer than 32 bytes.
 #[cfg(feature = "transport-ecies")]
 pub fn compute_ecies_transcript_hash<D>(
 	client_hello: impl AsRef<[u8]>,
@@ -111,21 +111,24 @@ where
 
 /// Compute the ECIES client mutual-auth digest.
 ///
-/// Binds the transcript hash, the ECIES-encrypted key exchange payload, and
-/// the client certificate into a single digest that the client signs. This
-/// prevents splicing a valid client signature onto a different key exchange
-/// or a different identity (CWE-347).
+/// The digest binds the transcript hash, the ECIES-encrypted key exchange
+/// payload, and the client certificate into a single value that the client
+/// signs. A valid client signature therefore cannot be spliced onto a
+/// different key exchange or a different identity (CWE-347).
 ///
-/// # Type Parameters
-/// - `D`: The digest algorithm (e.g., `Sha3_256`)
+/// # Type parameters
+///
+/// - `D`: the digest algorithm, such as `Sha3_256`.
 ///
 /// # Parameters
-/// - `transcript_hash`: The 32-byte handshake transcript hash
-/// - `encrypted_data`: The ECIES-encrypted key exchange bytes
-/// - `client_cert_der`: DER encoding of the client certificate
+///
+/// - `transcript_hash`: the 32-byte handshake transcript hash.
+/// - `encrypted_data`: the ECIES-encrypted key exchange bytes.
+/// - `client_cert_der`: the DER encoding of the client certificate.
 ///
 /// # Errors
-/// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
+///
+/// - `TranscriptDigestLength` -- `D` produces fewer than 32 bytes.
 #[cfg(feature = "transport-ecies")]
 pub fn compute_client_auth_digest<D>(
 	transcript_hash: &[u8; 32],
@@ -151,13 +154,21 @@ where
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 pub trait HandshakeOctets {
-	/// Fixed 32-byte view of an ECIES wire nonce.
+	/// Fixed 32-byte view of an ECIES wire nonce or other public value.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::OctetStringLengthError`] on any other length,
-	///   so a short or long nonce fails closed
+	/// - [`HandshakeError::OctetStringLengthError`] on any other length, so a
+	///   short or long nonce fails closed
 	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError>;
+
+	/// Copy the 32 bytes into `out`, which may be a wiping buffer, so a key
+	/// never passes through a plain array on the way.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::OctetStringLengthError`] on any other length
+	fn copy_to_32_byte_array(&self, out: &mut [u8; 32]) -> Result<(), HandshakeError>;
 }
 
 #[cfg(any(
@@ -166,14 +177,19 @@ pub trait HandshakeOctets {
 ))]
 impl HandshakeOctets for OctetString {
 	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError> {
+		let mut out = [0u8; 32];
+		self.copy_to_32_byte_array(&mut out)?;
+		Ok(out)
+	}
+
+	fn copy_to_32_byte_array(&self, out: &mut [u8; 32]) -> Result<(), HandshakeError> {
 		let bytes = self.as_bytes();
-		if bytes.len() != 32 {
-			return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
+		if bytes.len() != out.len() {
+			return Err(HandshakeError::OctetStringLengthError((bytes.len(), out.len()).into()));
 		}
 
-		let mut out = [0u8; 32];
 		out.copy_from_slice(bytes);
-		Ok(out)
+		Ok(())
 	}
 }
 

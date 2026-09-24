@@ -19,12 +19,11 @@
 //! mismatch and signature-verification failure.
 //!
 //! ## References
-//! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm Downgrade')
-//!   <https://cwe.mitre.org/data/definitions/757.html>
+//! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
+//!   Downgrade') <https://cwe.mitre.org/data/definitions/757.html>
 //! - CAPEC-220: Client-Server Protocol Manipulation
 //!   <https://capec.mitre.org/data/definitions/220.html>
-//! - CAPEC-620: Drop Encryption Level
-//!   <https://capec.mitre.org/data/definitions/620.html>
+//! - CAPEC-620: Drop Encryption Level <https://capec.mitre.org/data/definitions/620.html>
 //! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection
 
 use std::sync::Arc;

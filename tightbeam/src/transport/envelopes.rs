@@ -1,4 +1,4 @@
-//! Wire protocol data structures for transport layer envelopes
+//! The DER data structures of the transport-layer envelopes.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -43,22 +43,25 @@ use multiplex::*;
 mod x509 {
 	pub use crate::cms::enveloped_data::EnvelopedData;
 	pub use crate::cms::signed_data::SignedData;
+	pub use crate::transport::wire_der::WireDer;
 }
 
 #[cfg(feature = "x509")]
 use x509::*;
 
-/// Request package containing the message frame
+/// A request package that carries the message frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestPackage {
 	pub(crate) message: Arc<Frame>,
 }
 
 impl RequestPackage {
+	/// A request that carries `message`.
 	pub fn new(message: Frame) -> Self {
 		Self { message: Arc::new(message) }
 	}
 
+	/// The request frame, shared so a reader takes a handle rather than a copy.
 	pub fn message(&self) -> &Arc<Frame> {
 		&self.message
 	}
@@ -89,7 +92,7 @@ impl<'a> Decode<'a> for RequestPackage {
 	}
 }
 
-/// Response package containing status and optional message
+/// A response package that carries a status and an optional message.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResponsePackage {
 	pub(crate) status: TransitStatus,
@@ -135,14 +138,17 @@ impl ResponsePackage {
 		}
 	}
 
+	/// A response with `status` and the optional `message`.
 	pub fn new(status: TransitStatus, message: Option<Frame>) -> Self {
 		Self { status, message: message.map(Arc::new) }
 	}
 
+	/// The status the responder reported.
 	pub fn status(&self) -> TransitStatus {
 		self.status
 	}
 
+	/// The response frame, present when the responder sent one.
 	pub fn message(&self) -> Option<&Arc<Frame>> {
 		self.message.as_ref()
 	}
@@ -185,33 +191,42 @@ impl<'a> Decode<'a> for ResponsePackage {
 	}
 }
 
-/// First u32 code owned by applications in the multiplexing reason-code
-/// space. Codes below the floor are reserved for the TightBeam protocol
-/// (HTTP/2 error-code and QUIC application-close precedent:
+/// The first u32 code that applications own in the multiplexing reason-code
+/// space.
+///
+/// Codes below the floor are reserved for the TightBeam protocol. HTTP/2
+/// error codes and QUIC application-close codes set the precedent.
+///
+/// # Sources
+///
 /// - [RFC 9113 § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
-/// - [RFC 9000 § 20.2](https://datatracker.ietf.org/doc/html/rfc9000#section-20.2))
+/// - [RFC 9000 § 20.2](https://datatracker.ietf.org/doc/html/rfc9000#section-20.2)
 #[cfg(feature = "transport-multiplex")]
 pub const MUX_APPLICATION_CODE_FLOOR: u32 = 0x1000;
 
-/// Reason a single stream was cancelled
-/// ([RFC 9113 § 6.4](https://datatracker.ietf.org/doc/html/rfc9113#section-6.4)).
+/// The reason a single stream was cancelled
+/// ([RFC 9113 § 6.4][rfc9113-6.4]).
 ///
-/// Open u32 code space: TB-reserved codes decode to named variants,
-/// everything else round-trips through [`CancelReason::Application`] so
-/// unknown codes never kill a connection. `Application(code)` with a
-/// TB-reserved `code` canonicalizes to the named variant on decode.
+/// The u32 code space is open:
+///
+/// - A known TB-reserved code decodes to its named variant.
+/// - Every other code round-trips through [`CancelReason::Application`], so an
+///   unknown code never kills a connection.
+/// - `Application(code)` with a TB-reserved `code` canonicalizes to the named variant on decode.
+///
+/// [rfc9113-6.4]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.4
 #[cfg(feature = "transport-multiplex")]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
-	/// Requester is no longer interested in the response
+	/// The requester withdrew its interest in the response.
 	#[default]
 	Cancelled,
-	/// Per-stream deadline elapsed before a response arrived
+	/// The per-stream deadline elapsed before a response arrived.
 	Timeout,
-	/// Responder refused to process the stream
+	/// The responder refused to process the stream.
 	Rejected,
-	/// Application-defined code (at or above
-	/// [`MUX_APPLICATION_CODE_FLOOR`]) or a TB code this build predates
+	/// An application-defined code at or above
+	/// [`MUX_APPLICATION_CODE_FLOOR`], or a TB code newer than this build.
 	Application(u32),
 }
 
@@ -239,37 +254,42 @@ impl From<u32> for CancelReason {
 	}
 }
 
-/// Reason the connection is shutting down
-/// ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8)).
+/// The reason the connection is shutting down
+/// ([RFC 9113 § 6.8][rfc9113-6.8]).
 ///
-/// Same open u32 code space rules as [`CancelReason`].
+/// The open u32 code space follows the rules of [`CancelReason`].
+///
+/// [rfc9113-6.8]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.8
 #[cfg(feature = "transport-multiplex")]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoAwayReason {
-	/// Orderly shutdown initiated by the sender
+	/// The sender initiated an orderly shutdown.
 	#[default]
 	Shutdown,
-	/// Peer violated the multiplexing protocol
+	/// The peer violated the multiplexing protocol.
 	ProtocolError,
-	/// Peer exceeded the cancel budget
-	/// ([RFC 9113 § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
-	/// ENHANCE_YOUR_CALM, CVE-2023-44487 hardening)
+	/// The peer exceeded the cancel budget. This is the ENHANCE_YOUR_CALM code
+	/// of [RFC 9113 § 7][rfc9113-7], and it hardens against CVE-2023-44487.
+	///
+	/// [rfc9113-7]: https://datatracker.ietf.org/doc/html/rfc9113#section-7
 	EnhanceYourCalm,
-	/// Session budget spent down to the drain headroom: the epoch's
-	/// negotiated data volume is exhausted and the sender is draining
+	/// The session budget is spent down to the drain headroom. The epoch's
+	/// negotiated data volume is exhausted, and the sender is draining.
 	BudgetExhausted,
-	/// Settlement of the session agreement failed or was revoked after
-	/// activation
+	/// Settlement of the session agreement failed, or was revoked after
+	/// activation.
 	SettlementFailed,
-	/// Application-defined code (at or above
-	/// [`MUX_APPLICATION_CODE_FLOOR`]) or a TB code this build predates
+	/// An application-defined code at or above
+	/// [`MUX_APPLICATION_CODE_FLOOR`], or a TB code newer than this build.
 	Application(u32),
 }
 
 #[cfg(feature = "transport-multiplex")]
 impl GoAwayReason {
-	/// Stable kebab-case name for audit labels. Application codes share
-	/// one label and stay distinguishable by their wire code.
+	/// The stable kebab-case name for audit labels.
+	///
+	/// Application codes share one label and stay distinguishable by their
+	/// numeric code.
 	pub fn as_str(&self) -> &'static str {
 		match self {
 			Self::Shutdown => "shutdown",
@@ -310,8 +330,8 @@ impl From<u32> for GoAwayReason {
 	}
 }
 
-/// Chunk-bearing stream packages share one wire shape. Only the CHOICE
-/// tag on [`MuxEnvelope`] distinguishes them.
+/// Chunk-bearing stream packages share one DER shape, and only the CHOICE
+/// tag on [`MuxEnvelope`] tells them apart.
 #[cfg(feature = "transport-multiplex")]
 macro_rules! mux_chunk_package {
 	($(#[$outer:meta])* $name:ident, last: $last_doc:literal) => {
@@ -324,13 +344,17 @@ macro_rules! mux_chunk_package {
 		}
 
 		impl $name {
+			/// Build a chunk package.
+			///
 			/// # Errors
-			/// `payload` longer than the DER length cap
+			///
+			/// - A DER length error when `payload` is longer than the DER length cap.
 			pub fn new(stream_id: u32, last: bool, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
 				let payload = OctetString::new(payload)?;
 				Ok(Self { stream_id, last, payload })
 			}
 
+			/// The stream this chunk belongs to.
 			pub fn stream_id(&self) -> u32 {
 				self.stream_id
 			}
@@ -340,6 +364,7 @@ macro_rules! mux_chunk_package {
 				self.last
 			}
 
+			/// The chunk payload bytes.
 			pub fn payload(&self) -> &[u8] {
 				self.payload.as_bytes()
 			}
@@ -347,28 +372,29 @@ macro_rules! mux_chunk_package {
 	};
 }
 
-/// Interaction shape of a mux stream, stamped on the Open record by
-/// the initiating call. It tells the responder whether the body
-/// reassembles into one [`Frame`] and which reply shape the initiator
-/// awaits, so dispatch needs no heuristics.
+/// The interaction shape of a mux stream, which the initiating call stamps
+/// on the Open record.
+///
+/// It tells the responder whether the body reassembles into one [`Frame`]
+/// and which reply shape the initiator awaits, so dispatch needs no
+/// heuristics.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MuxStreamKind {
-	/// Body reassembles into one frame. The reply is a unary `End`.
+	/// The body reassembles into one frame, and the reply is a unary `End`.
 	#[default]
 	Unary = 0,
-	/// Body is consumed incrementally. The reply is a unary `End`.
+	/// The body is consumed incrementally, and the reply is a unary `End`.
 	Streaming = 1,
-	/// Body is consumed incrementally. The reply streams back as
+	/// The body is consumed incrementally, and the reply streams back as
 	/// `Data*` records ahead of the closing trailer.
 	Duplex = 2,
 }
 
 /// Open a stream and carry its first payload chunk inline.
 ///
-/// One unified stream grammar
-/// ([RFC 9113 § 8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1)):
+/// All streams share one grammar ([RFC 9113 § 8.1][rfc9113-8.1]):
 ///
 /// ```text
 /// initiator:  Open(kind, last?)  Data(...)*  Data(last)
@@ -376,11 +402,13 @@ pub enum MuxStreamKind {
 /// either:     Cancel(code)       Credit(limit)
 /// ```
 ///
-/// A unary request whose frame fits one chunk is a single `Open(last = true)`
-/// record. Chunks concatenate in arrival order into the message frame DER.
-/// The ordered AEAD channel with strict counter sequencing already proves
-/// order and completeness, so chunks carry no sequence numbers. Stream
-/// correlation metadata travels inside the encrypted envelope payload.
+/// - A unary request whose frame fits one chunk is a single `Open(last = true)` record.
+/// - Chunks concatenate in arrival order into the message frame DER. The
+///   ordered AEAD channel with strict counter sequencing already proves order
+///   and completeness, so chunks carry no sequence numbers.
+/// - Stream correlation metadata travels inside the encrypted envelope payload.
+///
+/// [rfc9113-8.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-8.1
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct MuxOpenPackage {
@@ -388,23 +416,26 @@ pub struct MuxOpenPackage {
 	pub(crate) last: bool,
 	pub(crate) kind: MuxStreamKind,
 	pub(crate) payload: OctetString,
-	/// Optional grpc-style route (`:path`) selecting the responder's
-	/// dispatch target. Absent for a local stream whose address is
-	/// already resolved. Present when a gateway must route or splice
-	/// the open by servlet type.
+	/// The optional grpc-style route (`:path`) that selects the responder's
+	/// dispatch target. It is absent for a local stream whose address is
+	/// already resolved, and present when a gateway must route or splice the
+	/// open by servlet type.
 	pub(crate) target: Option<Urn<'static>>,
-	/// Relay budget with the same contract as the unary
-	/// `hops_remaining` field: the number of gateway forwards the
-	/// stream may still spend, decremented per hop. The origin stamps
-	/// the [`DEFAULT_HOP_BUDGET`] sentinel and every gateway clamps to
-	/// its own `max_hops`. A gateway serves a `0` open locally and
-	/// never re-forwards it. DER-omitted on the common origin open.
+	/// The relay budget, with the same contract as the unary `hops_remaining`
+	/// field.
+	///
+	/// - The value is the number of gateway forwards the stream may still
+	///   spend, and each hop decrements it.
+	/// - The origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel, and every
+	///   gateway clamps to its own `max_hops`.
+	/// - A gateway serves a `0` open locally and never re-forwards it.
+	/// - DER omits the field on the common origin open.
 	#[asn1(default = "default_hop_budget")]
 	pub(crate) hops_remaining: u8,
 }
 
-/// DER DEFAULT for [`MuxOpenPackage::hops_remaining`]: the origin
-/// sentinel, so unrouted and origin-routed opens omit the field.
+/// The DER DEFAULT for [`MuxOpenPackage::hops_remaining`], which is the
+/// origin sentinel, so unrouted and origin-routed opens omit the field.
 #[cfg(feature = "transport-multiplex")]
 fn default_hop_budget() -> u8 {
 	DEFAULT_HOP_BUDGET
@@ -412,8 +443,11 @@ fn default_hop_budget() -> u8 {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxOpenPackage {
+	/// Build an unrouted open with the origin hop budget.
+	///
 	/// # Errors
-	/// `payload` longer than the DER length cap
+	///
+	/// - A DER length error when `payload` is longer than the DER length cap.
 	pub fn new(stream_id: u32, last: bool, kind: MuxStreamKind, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
 		let payload = OctetString::new(payload)?;
 		Ok(Self { stream_id, last, kind, payload, target: None, hops_remaining: DEFAULT_HOP_BUDGET })
@@ -421,42 +455,43 @@ impl MuxOpenPackage {
 
 	/// Stamp a grpc-style route and relay budget on this open.
 	///
-	/// A `None` target with the default budget reproduces an
-	/// unrouted local open, so the routed and unrouted paths share
-	/// one wire shape.
+	/// A `None` target with the default budget reproduces an unrouted local
+	/// open, so the routed and unrouted paths share one DER shape.
 	pub fn with_route(mut self, target: Option<Urn<'static>>, hops_remaining: u8) -> Self {
 		self.target = target;
 		self.hops_remaining = hops_remaining;
 		self
 	}
 
+	/// The stream this open allocates.
 	pub fn stream_id(&self) -> u32 {
 		self.stream_id
 	}
 
-	/// Whether this is the initiator's final chunk on the stream
+	/// Whether this is the initiator's final chunk on the stream.
 	pub fn last(&self) -> bool {
 		self.last
 	}
 
-	/// Interaction shape the initiating call stamped on the stream.
+	/// The interaction shape that the initiating call stamped on the stream.
 	pub fn kind(&self) -> MuxStreamKind {
 		self.kind
 	}
 
+	/// The first chunk of the initiator's payload.
 	pub fn payload(&self) -> &[u8] {
 		self.payload.as_bytes()
 	}
 
-	/// Grpc-style route selecting the responder's dispatch target, or
+	/// The grpc-style route that selects the responder's dispatch target, or
 	/// `None` for an already-resolved local stream.
 	pub fn target(&self) -> Option<&Urn<'static>> {
 		self.target.as_ref()
 	}
 
-	/// Relay budget left on this open: the number of gateway forwards
-	/// it may still spend. A `0` open is served locally and never
-	/// re-forwarded.
+	/// The relay budget left on this open, which is the number of gateway
+	/// forwards it may still spend. A gateway serves a `0` open locally and
+	/// never re-forwards it.
 	pub fn hops_remaining(&self) -> u8 {
 		self.hops_remaining
 	}
@@ -464,20 +499,20 @@ impl MuxOpenPackage {
 
 #[cfg(feature = "transport-multiplex")]
 mux_chunk_package! {
-	/// Continuation chunk on an open stream, either direction.
+	/// A continuation chunk on an open stream, in either direction.
 	///
 	/// See [`MuxOpenPackage`] for the stream grammar.
 	MuxDataPackage,
 	last: "Whether this is the sender's final chunk on the stream"
 }
 
-/// Responder trailer ending a stream: status plus the final payload
-/// chunk inline.
+/// The responder trailer that ends a stream, with the status and the final
+/// payload chunk inline.
 ///
-/// A unary response whose frame fits one chunk is a single `End` record.
-/// An empty payload after zero `Data` chunks means a message-less
-/// response (a frame never encodes to zero bytes, so emptiness is
-/// unambiguous). See [`MuxOpenPackage`] for the stream grammar.
+/// A unary response whose frame fits one chunk is a single `End` record. An
+/// empty payload after zero `Data` chunks means a message-less response. A
+/// frame never encodes to zero bytes, so emptiness is unambiguous. See
+/// [`MuxOpenPackage`] for the stream grammar.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct MuxEndPackage {
@@ -488,32 +523,40 @@ pub struct MuxEndPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxEndPackage {
+	/// Build a trailer with `status` and the final `payload` chunk.
+	///
 	/// # Errors
-	/// `payload` longer than the DER length cap
+	///
+	/// - A DER length error when `payload` is longer than the DER length cap.
 	pub fn new(stream_id: u32, status: TransitStatus, payload: impl Into<Vec<u8>>) -> DerResult<Self> {
 		let payload = OctetString::new(payload)?;
 		Ok(Self { stream_id, status, payload })
 	}
 
+	/// The stream this trailer ends.
 	pub fn stream_id(&self) -> u32 {
 		self.stream_id
 	}
 
+	/// The status the responder reported for the stream.
 	pub fn status(&self) -> TransitStatus {
 		self.status
 	}
 
+	/// The final payload chunk, which is empty for a message-less response.
 	pub fn payload(&self) -> &[u8] {
 		self.payload.as_bytes()
 	}
 }
 
-/// Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA,
-/// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
+/// Grant absolute cumulative chunk credit on a stream, as QUIC
+/// MAX_STREAM_DATA does ([RFC 9000 § 4.1][rfc9000-4.1]).
 ///
-/// `limit` is the total chunk count the sender may have emitted on the
-/// stream, not a delta. Grants are idempotent and monotonic, so duplicated
-/// or reordered grants never corrupt the flow-control ledger.
+/// `limit` is the absolute total chunk count that the sender may have emitted
+/// on the stream. Grants are idempotent and monotonic, so duplicated or
+/// reordered grants never corrupt the flow-control ledger.
+///
+/// [rfc9000-4.1]: https://datatracker.ietf.org/doc/html/rfc9000#section-4.1
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxCreditPackage {
@@ -523,14 +566,18 @@ pub struct MuxCreditPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxCreditPackage {
+	/// A grant that raises the chunk credit on `stream_id` to `limit`.
 	pub fn new(stream_id: u32, limit: u64) -> Self {
 		Self { stream_id, limit }
 	}
 
+	/// The stream the grant applies to.
 	pub fn stream_id(&self) -> u32 {
 		self.stream_id
 	}
 
+	/// The absolute total chunk count the sender may have emitted on the
+	/// stream.
 	pub fn limit(&self) -> u64 {
 		self.limit
 	}
@@ -546,25 +593,29 @@ pub struct MuxCancelPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxCancelPackage {
+	/// A cancel of `stream_id` for `reason`.
 	pub fn new(stream_id: u32, reason: impl Into<u32>) -> Self {
 		Self { stream_id, code: reason.into() }
 	}
 
+	/// The stream to cancel.
 	pub fn stream_id(&self) -> u32 {
 		self.stream_id
 	}
 
+	/// Why the sender cancelled the stream.
 	pub fn reason(&self) -> CancelReason {
 		CancelReason::from(self.code)
 	}
 }
 
-/// Connection-level liveness probe
-/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)).
+/// A connection-level liveness probe ([RFC 9113 § 6.7][rfc9113-6.7]).
 ///
-/// `opaque` is an initiator-chosen correlation value echoed unchanged in
-/// the ack. Pings never allocate a stream and never reach the application
+/// `opaque` is an initiator-chosen correlation value that the ack echoes
+/// unchanged. Pings never allocate a stream and never reach the application
 /// handler, so they keep idle connections alive through intermediaries.
+///
+/// [rfc9113-6.7]: https://datatracker.ietf.org/doc/html/rfc9113#section-6.7
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxPingPackage {
@@ -574,23 +625,26 @@ pub struct MuxPingPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxPingPackage {
+	/// A probe that carries `opaque`, or its answer when `ack` is true.
 	pub fn new(ack: bool, opaque: u64) -> Self {
 		Self { ack, opaque }
 	}
 
-	/// Whether this ping answers a peer probe
+	/// Whether this ping answers a peer probe.
 	pub fn ack(&self) -> bool {
 		self.ack
 	}
 
-	/// Correlation value chosen by the probe initiator
+	/// The correlation value that the probe initiator chose.
 	pub fn opaque(&self) -> u64 {
 		self.opaque
 	}
 }
 
-/// Graceful connection shutdown: streams at or below `last_stream_id`
-/// drain to completion, newer ones are rejected.
+/// A graceful connection shutdown.
+///
+/// Streams at or below `last_stream_id` drain to completion, and newer
+/// streams are rejected.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GoAwayPackage {
@@ -600,22 +654,30 @@ pub struct GoAwayPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl GoAwayPackage {
+	/// A shutdown that drains the streams up to `last_stream_id`, for
+	/// `reason`.
 	pub fn new(last_stream_id: u32, reason: impl Into<u32>) -> Self {
 		Self { last_stream_id, code: reason.into() }
 	}
 
+	/// The highest stream id that drains to completion.
 	pub fn last_stream_id(&self) -> u32 {
 		self.last_stream_id
 	}
 
+	/// Why the sender is shutting the connection down.
 	pub fn reason(&self) -> GoAwayReason {
 		GoAwayReason::from(self.code)
 	}
 }
 
-/// First leg, client -> server: client randomness opening an epoch renewal
-/// ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)
-/// with an explicit three-leg exchange).
+/// The first rekey leg, client to server, which carries the client
+/// randomness that opens an epoch renewal.
+///
+/// The renewal follows [RFC 9846 § 4.7.3][rfc9846-4.7.3] with an explicit
+/// three-leg exchange.
+///
+/// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct MuxRekeyRequestPackage {
@@ -624,26 +686,31 @@ pub struct MuxRekeyRequestPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyRequestPackage {
+	/// Build a request that carries `client_random`.
+	///
 	/// # Errors
-	/// - `client_random` longer than the DER length cap
+	///
+	/// - A DER length error when `client_random` is longer than the DER length cap.
 	pub fn new(client_random: impl Into<Vec<u8>>) -> DerResult<Self> {
 		let client_random = OctetString::new(client_random)?;
 		Ok(Self { client_random })
 	}
 
+	/// The client randomness that opens the renewal.
 	pub fn client_random(&self) -> &[u8] {
 		self.client_random.as_bytes()
 	}
 }
 
-/// Second rekey leg, server to client: server randomness plus the
-/// server-signed epoch receipt.
+/// The second rekey leg, server to client, which carries the server
+/// randomness and the server-signed epoch receipt.
 ///
-/// `epoch_receipt` is DER-optional for a future keys-only renewal
-/// (TLS KeyUpdate shape,
-/// [RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)),
-/// but on a budget-bearing session its absence is a protocol violation:
-/// receipt required iff budgets present.
+/// `epoch_receipt` is DER-optional for a future keys-only renewal in the TLS
+/// KeyUpdate shape ([RFC 9846 § 4.7.3][rfc9846-4.7.3]). On a budget-bearing
+/// session its absence is a protocol violation, because a receipt is
+/// required if and only if budgets are present.
+///
+/// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq)]
 pub struct MuxRekeyResponsePackage {
@@ -653,24 +720,32 @@ pub struct MuxRekeyResponsePackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyResponsePackage {
+	/// Build a response that carries `server_random` and the optional
+	/// `epoch_receipt`.
+	///
 	/// # Errors
-	/// `server_random` longer than the DER length cap
+	///
+	/// - A DER length error when `server_random` is longer than the DER length cap.
 	pub fn new(server_random: impl Into<Vec<u8>>, epoch_receipt: Option<SignedData>) -> DerResult<Self> {
 		let server_random = OctetString::new(server_random)?;
 		Ok(Self { server_random, epoch_receipt: epoch_receipt.map(Box::new) })
 	}
 
+	/// The server randomness for the renewal.
 	pub fn server_random(&self) -> &[u8] {
 		self.server_random.as_bytes()
 	}
 
+	/// The server-signed epoch receipt, which a budget-bearing session
+	/// requires.
 	pub fn epoch_receipt(&self) -> Option<&SignedData> {
 		self.epoch_receipt.as_deref()
 	}
 }
 
-/// Third rekey leg, client to server: the client `SignerInfo` the
-/// server appends to complete the dual-signed epoch receipt.
+/// The third rekey leg, client to server, which carries the client
+/// `SignerInfo` that the server appends to complete the dual-signed epoch
+/// receipt.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, PartialEq)]
 pub struct MuxRekeyAckPackage {
@@ -679,20 +754,23 @@ pub struct MuxRekeyAckPackage {
 
 #[cfg(feature = "transport-multiplex")]
 impl MuxRekeyAckPackage {
+	/// An acknowledgement that carries the client countersignature, if any.
 	pub fn new(countersignature: Option<SignerInfo>) -> Self {
 		Self { countersignature: countersignature.map(Box::new) }
 	}
 
+	/// The client `SignerInfo` that completes the dual-signed epoch receipt,
+	/// present when the response carried a receipt.
 	pub fn countersignature(&self) -> Option<&SignerInfo> {
 		self.countersignature.as_deref()
 	}
 }
 
-/// Server-to-client key-switch marker closing a rekey exchange: the
-/// server has settled the epoch receipt and switched its send cipher.
+/// The server-to-client key-switch marker that closes a rekey exchange.
 ///
-/// Encodes as an empty SEQUENCE. The derive macro cannot produce one,
-/// so the DER traits are written by hand.
+/// It means the server settled the epoch receipt and switched its send
+/// cipher. It encodes as an empty SEQUENCE, which the derive macro cannot
+/// produce, so this file implements the DER traits directly.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MuxRekeyDonePackage {}
@@ -720,70 +798,92 @@ impl FixedTag for MuxRekeyDonePackage {
 	const TAG: Tag = Tag::Sequence;
 }
 
-/// Every multiplexing message, nested under one [`TransportEnvelope`]
-/// arm so the mux plane evolves without touching the top-level envelope
-/// grammar and non-mux code never sees mux variants.
+/// Every multiplexing message, nested under one [`TransportEnvelope`] arm.
+///
+/// The nesting lets the mux plane evolve with no change to the top-level
+/// envelope grammar, and non-mux code never sees a mux variant.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Choice, Clone, Debug, PartialEq)]
 pub enum MuxEnvelope {
+	/// Opens a stream and carries its first chunk.
 	#[asn1(context_specific = "0", constructed = "true")]
 	Open(MuxOpenPackage),
+	/// A continuation chunk on an open stream.
 	#[asn1(context_specific = "1", constructed = "true")]
 	Data(MuxDataPackage),
+	/// The responder trailer that ends a stream.
 	#[asn1(context_specific = "2", constructed = "true")]
 	End(MuxEndPackage),
+	/// A grant of chunk credit on a stream.
 	#[asn1(context_specific = "3", constructed = "true")]
 	Credit(MuxCreditPackage),
+	/// Cancels one stream and leaves the connection open.
 	#[asn1(context_specific = "4", constructed = "true")]
 	Cancel(MuxCancelPackage),
+	/// Starts a graceful connection shutdown.
 	#[asn1(context_specific = "5", constructed = "true")]
 	GoAway(GoAwayPackage),
+	/// A liveness probe or its answer.
 	#[asn1(context_specific = "6", constructed = "true")]
 	Ping(MuxPingPackage),
+	/// The first rekey leg, client to server.
 	#[asn1(context_specific = "7", constructed = "true")]
 	RekeyRequest(MuxRekeyRequestPackage),
+	/// The second rekey leg, server to client.
 	#[asn1(context_specific = "8", constructed = "true")]
 	RekeyResponse(MuxRekeyResponsePackage),
+	/// The third rekey leg, client to server.
 	#[asn1(context_specific = "9", constructed = "true")]
 	RekeyAck(MuxRekeyAckPackage),
+	/// The server marker that closes a rekey exchange.
 	#[asn1(context_specific = "10", constructed = "true")]
 	RekeyDone(MuxRekeyDonePackage),
 }
 
-/// Transport envelope wrapping all messages at the transport layer.
-/// This is transparent to users and handled internally.
+/// The transport envelope that wraps every message at the transport layer.
+///
+/// The transport handles it internally, so it stays transparent to users.
 #[derive(Beamable, Choice, Clone, Debug, PartialEq)]
 pub enum TransportEnvelope {
+	/// A single-flight request.
 	#[asn1(context_specific = "0", constructed = "true")]
 	Request(RequestPackage),
+	/// The response to a single-flight request.
 	#[asn1(context_specific = "1", constructed = "true")]
 	Response(ResponsePackage),
+	/// A key-transport handshake container, kept with the bytes that
+	/// carried it.
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "2", constructed = "true")]
-	EnvelopedData(Box<EnvelopedData>),
+	EnvelopedData(Box<WireDer<EnvelopedData>>),
+	/// A signed handshake container, kept with the bytes that carried it.
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "3", constructed = "true")]
-	SignedData(Box<SignedData>),
+	SignedData(Box<WireDer<SignedData>>),
+	/// A multiplexing message.
 	#[cfg(feature = "transport-multiplex")]
 	#[asn1(context_specific = "4", constructed = "true")]
 	Mux(MuxEnvelope),
 }
 
-/// Wire-level envelope that can be either cleartext or encrypted
+/// The outermost envelope, in cleartext or in encrypted form.
 #[derive(Choice, Clone, Debug, PartialEq)]
 pub enum WireEnvelope {
+	/// A transport envelope sent without encryption, as handshake containers
+	/// and cleartext endpoints send it.
 	#[asn1(context_specific = "0", constructed = "true")]
 	Cleartext(TransportEnvelope),
+	/// A transport envelope sealed under the session's send cipher.
 	#[asn1(context_specific = "1", constructed = "true")]
 	Encrypted(EncryptedContentInfo),
 }
 
-/// Determines whether an envelope should be emitted as cleartext or encrypted bytes.
+/// Whether an envelope goes out as cleartext or as encrypted bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireMode {
 	/// Emit raw `TransportEnvelope` bytes.
 	Cleartext,
-	/// Encrypt the encoded envelope prior to emission.
+	/// Encrypt the encoded envelope before emission.
 	Encrypted,
 }
 
@@ -841,7 +941,7 @@ impl_mux_envelope_from! {
 }
 
 impl TransportEnvelope {
-	/// Create a new request envelope from a message
+	/// Create a request envelope that carries `msg`.
 	pub fn new_request(msg: Frame) -> Self {
 		Self::Request(RequestPackage { message: Arc::new(msg) })
 	}
@@ -942,14 +1042,13 @@ mod tests {
 		let original = RequestPackage::new(TestFrame::v0(None, None));
 		let mut encoded = original.to_der()?;
 
-		// Corrupt the length field by manipulating bytes after encoding
-		// The length is encoded as a Uint at the beginning of the sequence
+		// Corrupt one byte after encoding. The length is encoded as a Uint at
+		// the start of the sequence.
 		if encoded.len() > 10 {
-			// Corrupt a byte in the middle to simulate wrong length
 			let corrupt_pos = 5;
 			encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
 
-			// Decoding should fail due to length mismatch
+			// The length mismatch must fail the decode.
 			let result = RequestPackage::from_der(&encoded);
 			assert!(result.is_err(), "Should fail with corrupted length");
 		}
@@ -962,13 +1061,13 @@ mod tests {
 		let original =
 			ResponsePackage { status: TransitStatus::Ok, message: Some(Arc::new(TestFrame::v0(None, None))) };
 
-		// Corrupt the length field
+		// Corrupt one byte of the length field.
 		let mut encoded = original.to_der()?;
 		if encoded.len() > 10 {
 			let corrupt_pos = 8;
 			encoded[corrupt_pos] = encoded[corrupt_pos].wrapping_add(1);
 
-			// Decoding should fail due to length mismatch
+			// The length mismatch must fail the decode.
 			let result = ResponsePackage::from_der(&encoded);
 			assert!(result.is_err(), "Should fail with corrupted length");
 		}
@@ -1021,8 +1120,8 @@ mod tests {
 		])
 	}
 
-	// The kind is the dispatch discriminator: every variant must
-	// survive the wire unchanged.
+	// The kind is the dispatch discriminator, so every variant must survive
+	// encoding unchanged.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_open_package_kind_round_trips_every_variant() -> Result<(), Box<dyn Error>> {
@@ -1036,8 +1135,8 @@ mod tests {
 		Ok(())
 	}
 
-	// An unrouted open carries no target and the origin budget, and
-	// the grpc-style route with a spent budget survives the wire.
+	// An unrouted open carries no target and the origin budget, and the
+	// grpc-style route with a spent budget survives encoding.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_open_package_route_round_trips() -> Result<(), Box<dyn Error>> {
@@ -1055,9 +1154,9 @@ mod tests {
 		Ok(())
 	}
 
-	// A default open must encode to the exact bytes of the pre-route
-	// wire shape: the DER-optional target and DEFAULT-budget hops
-	// add nothing, so existing peers decode it unchanged.
+	// A default open must encode to the exact bytes of the unrouted shape.
+	// The DER-optional target and the DEFAULT-budget hops add nothing, so
+	// existing peers decode it unchanged.
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_mux_open_package_unrouted_is_wire_stable() -> Result<(), Box<dyn Error>> {
@@ -1123,9 +1222,9 @@ mod tests {
 		])
 	}
 
-	/// Structurally valid `SignerInfo` for wire round-trips. The
-	/// signature bytes are arbitrary because envelope tests exercise
-	/// encoding, not verification.
+	/// A structurally valid `SignerInfo` for encoding round trips. The
+	/// signature bytes are arbitrary, because envelope tests exercise encoding
+	/// and skip verification.
 	#[cfg(feature = "transport-multiplex")]
 	fn sample_signer_info() -> Result<SignerInfo, Box<dyn Error>> {
 		use crate::cms::cert::x509::ext::pkix::SubjectKeyIdentifier;
@@ -1145,7 +1244,8 @@ mod tests {
 		Ok(signer)
 	}
 
-	/// Structurally valid single-signer `SignedData` for wire round-trips.
+	/// A structurally valid single-signer `SignedData` for encoding round
+	/// trips.
 	#[cfg(feature = "transport-multiplex")]
 	fn sample_signed_data() -> Result<SignedData, Box<dyn Error>> {
 		use crate::cms::content_info::CmsVersion;

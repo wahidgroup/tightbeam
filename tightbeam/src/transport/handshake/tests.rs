@@ -1,7 +1,7 @@
 //! Shared test utilities for handshake protocol tests.
 //!
-//! This module provides common test fixtures, helper functions, and data structures
-//! used across all handshake test modules to reduce duplication and improve maintainability.
+//! The module holds the fixtures, helper functions, and data structures that
+//! every handshake test module shares, so the tests carry no duplicate setup.
 #![allow(unused)]
 
 #[cfg(not(feature = "std"))]
@@ -22,6 +22,7 @@ use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use crate::der::asn1::BitString;
 use crate::der::asn1::GeneralizedTime;
@@ -34,7 +35,8 @@ use crate::oids::{
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::negotiation::{RunnableProfile, SecurityAccept};
-use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake};
+use crate::transport::handshake::{ClientHello, ClientKeyExchange, PeerAuthentication, ServerHandshake};
+use crate::transport::wire_der::WireDer;
 use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Time;
 use crate::x509::time::Validity;
@@ -54,7 +56,9 @@ use ecies::*;
 
 #[cfg(feature = "transport-cms")]
 mod cms {
+	pub use crate::cms::signed_data::SignedData;
 	pub use crate::crypto::sign::elliptic_curve::PublicKey;
+	pub use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	pub use crate::transport::handshake::client::CmsHandshakeClient;
 	pub use crate::transport::handshake::server::CmsHandshakeServer;
 }
@@ -67,26 +71,33 @@ pub fn create_default_test_profile() -> SecurityProfileDesc {
 	RunnableProfile::<DefaultCryptoProvider>::native().descriptor()
 }
 
-/// Test certificate data structure for consistent certificate creation across tests.
+/// Test certificate data, so every test creates certificates the same way.
 #[derive(Debug, Clone)]
 pub struct TestCertificate {
+	/// The signing key whose public key the certificate carries.
 	pub signing_key: Secp256k1SigningKey,
+	/// The certificate over the public key of `signing_key`.
 	pub certificate: Certificate,
 }
 
-/// Test handshake data structure containing all the random values and keys used in a handshake.
+/// Test handshake data that holds every random value and key a handshake
+/// uses.
 #[derive(Debug, Clone)]
 pub struct TestHandshakeData {
+	/// The random value the client contributes.
 	pub client_random: [u8; 32],
+	/// The random value the server contributes.
 	pub server_random: [u8; 32],
+	/// The random base session key.
 	pub base_session_key: [u8; 32],
+	/// The transcript hash computed over the test handshake messages.
 	pub transcript_hash: [u8; 32],
 }
 
 /// Create a test certificate with a secp256k1 keypair.
 ///
-/// This provides a consistent way to create test certificates across all handshake tests.
-/// The certificate uses minimal valid data and a long validity period for testing.
+/// Every handshake test creates its certificate this way. The certificate
+/// uses minimal valid data and a long validity period.
 pub fn create_test_certificate() -> TestCertificate {
 	let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 	let certificate = create_test_certificate_inner(&signing_key).expect("Test certificate creation should succeed");
@@ -95,13 +106,14 @@ pub fn create_test_certificate() -> TestCertificate {
 
 /// Create a test certificate with the provided secp256k1 keypair.
 ///
-/// This creates a certificate using the provided signing key, ensuring the
-/// certificate's public key matches the private key.
+/// The certificate uses the provided signing key, so its public key matches
+/// the private key.
 pub fn create_test_certificate_from_key(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn Error>> {
 	create_test_certificate_inner(signing_key)
 }
 
-/// Internal function to create a certificate from a signing key.
+/// Create a certificate from a signing key. The public certificate helpers
+/// share this body.
 fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn Error>> {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key.to_public_key_der()?;
@@ -131,8 +143,9 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 
 /// Generate random test handshake data.
 ///
-/// Creates cryptographically random values for client random, server random,
-/// and base session key, then computes the transcript hash.
+/// The function creates cryptographically random values for the client
+/// random, the server random, and the base session key, then computes the
+/// transcript hash.
 pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn Error>> {
 	let client_random = generate_nonce::<32>(None)?;
 	let server_random = generate_nonce::<32>(None)?;
@@ -187,7 +200,7 @@ pub fn create_test_server_handshake(
 		certificate: certificate.to_owned(),
 		server_random: OctetString::new(*server_random)?,
 		signature: OctetString::new(signature)?,
-		security_accept: Some(SecurityAccept::new(create_default_test_profile())),
+		security_accept: Some(WireDer::new(SecurityAccept::new(create_default_test_profile()))?),
 		client_cert_required: false,
 		transport_accept: None,
 		session_receipt: None,
@@ -197,7 +210,7 @@ pub fn create_test_server_handshake(
 }
 
 /// Create a test ClientKeyExchange message with the given encrypted data.
-pub fn create_test_client_key_exchange(encrypted_data: impl AsRef<[u8]>) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn create_test_client_key_exchange(encrypted_data: impl AsRef<[u8]>) -> Result<ClientKeyExchange, Box<dyn Error>> {
 	let encrypted_data = encrypted_data.as_ref();
 	let client_kex = ClientKeyExchange {
 		encrypted_data: OctetString::new(encrypted_data)?,
@@ -207,29 +220,46 @@ pub fn create_test_client_key_exchange(encrypted_data: impl AsRef<[u8]>) -> Resu
 		client_signature: None,
 	};
 
-	Ok(client_kex.to_der()?)
+	Ok(client_kex)
 }
 
-/// Create a test signing key for cryptographic operations.
-///
-/// Generates a random secp256k1 signing key for use in tests.
+/// Generate a random secp256k1 signing key for tests.
 pub fn create_test_signing_key() -> Secp256k1SigningKey {
 	Secp256k1SigningKey::random(&mut OsRng)
 }
 
-/// Create SHA3-256 digest algorithm identifier for CMS operations.
+/// Create the SHA3-256 digest algorithm identifier for CMS operations.
 pub fn create_sha3_256_digest_alg() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None }
 }
 
-/// Create ECDSA with SHA3-256 signature algorithm identifier for CMS operations.
+/// Create the ECDSA with SHA3-256 signature algorithm identifier for CMS
+/// operations.
 pub fn create_ecdsa_sha3_256_signature_alg() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 }
 
+/// A SignedData over `content` by a fresh test key, for a step that refuses
+/// it by state before reading it.
+#[cfg(feature = "transport-cms")]
+pub fn create_test_signed_data(content: impl AsRef<[u8]>) -> SignedData {
+	let signing_key = create_test_signing_key();
+	let digest_alg = create_sha3_256_digest_alg();
+	let signature_alg = create_ecdsa_sha3_256_signature_alg();
+	let builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(&signing_key, digest_alg, signature_alg)
+		.expect("the builder accepts a test key");
+
+	builder.build(content).expect("the SignedData signs")
+}
+
 /// Create test key pairs for cryptographic operations.
 ///
-/// Returns a tuple of (sender_private_key, sender_spki, recipient_private_key, recipient_public_key).
+/// The function returns a tuple with these parts, in order:
+///
+/// 1. the sender private key,
+/// 2. the sender SPKI,
+/// 3. the recipient private key, and
+/// 4. the recipient public key.
 pub fn create_test_keypair() -> (
 	SecretKey,
 	SubjectPublicKeyInfoOwned,
@@ -268,19 +298,21 @@ pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None }
 }
 
-/// Helper function to convert a SigningKey into an Arc<dyn KeyProvider>.
+/// Convert a signing key into an `Arc<dyn SigningKeyProvider>`.
 ///
-/// This is a convenience function for tests and simple use cases where
-/// you want to quickly wrap a signing key in a KeyProvider trait object.
+/// Tests and simple use cases use it to wrap a signing key in a provider
+/// trait object.
 pub fn into_provider(signing_key: Secp256k1SigningKey) -> Arc<dyn SigningKeyProvider> {
 	Arc::new(Secp256k1KeyProvider::from(signing_key))
 }
 
-// ============================================================================
-// Test Fixture Builders
-// ============================================================================
+/// Mutual authentication against `validator` alone.
+pub fn mutual_with(validator: impl CertificateValidation + 'static) -> PeerAuthentication {
+	let validator: Arc<dyn CertificateValidation> = Arc::new(validator);
+	PeerAuthentication::mutual([validator])
+}
 
-/// Builder for creating test ECIES handshake servers with sensible defaults.
+/// Builder for test ECIES handshake servers with default settings.
 #[cfg(feature = "transport-ecies")]
 pub struct TestEciesServerBuilder {
 	key: Option<Secp256k1SigningKey>,
@@ -333,7 +365,7 @@ impl TestEciesServerBuilder {
 			into_provider(test_cert_data.signing_key),
 			Arc::new(test_cert_data.certificate),
 			self.aad_domain,
-			None, // No client validators in tests by default
+			PeerAuthentication::Anonymous,
 		)
 		.with_supported_profiles(vec![default_profile]))
 	}
@@ -346,7 +378,7 @@ impl Default for TestEciesServerBuilder {
 	}
 }
 
-/// Builder for creating test ECIES handshake clients with sensible defaults.
+/// Builder for test ECIES handshake clients with default settings.
 #[cfg(feature = "transport-ecies")]
 pub struct TestEciesClientBuilder {
 	aad_domain: Option<&'static [u8]>,
@@ -394,21 +426,18 @@ impl Default for TestEciesClientBuilder {
 	}
 }
 
-/// Builder for creating test CMS handshake servers with sensible defaults.
+/// Builder for test CMS handshake servers with default settings.
 #[cfg(feature = "transport-cms")]
 pub struct TestCmsServerBuilder {
 	key: Option<Secp256k1SigningKey>,
-	transcript_hash: Option<[u8; 32]>,
+	peer_authentication: PeerAuthentication,
 }
 
 #[cfg(feature = "transport-cms")]
 impl TestCmsServerBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
-		Self {
-			key: None,
-			transcript_hash: None, // Let CMS compute it internally by default
-		}
+		Self { key: None, peer_authentication: PeerAuthentication::Anonymous }
 	}
 
 	/// Set a specific signing key for the server.
@@ -417,25 +446,20 @@ impl TestCmsServerBuilder {
 		self
 	}
 
-	/// Set a specific transcript hash.
-	pub fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
-		self.transcript_hash = Some(hash);
+	/// Set how the server authenticates its client.
+	pub fn with_peer_authentication(mut self, peer_authentication: PeerAuthentication) -> Self {
+		self.peer_authentication = peer_authentication;
 		self
 	}
 
 	/// Build the CMS handshake server.
 	pub fn build(self) -> (CmsHandshakeServer<DefaultCryptoProvider>, PublicKey<k256::Secp256k1>) {
-		use CmsHandshakeServer;
-
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let verifying_key = *test_key.verifying_key();
 
-		// Apply transcript hash if explicitly set
 		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
-		let mut server = CmsHandshakeServer::<DefaultCryptoProvider>::new(into_provider(test_key), None);
-		if let Some(hash) = self.transcript_hash {
-			server = server.with_transcript_hash(hash);
-		}
+		let provider = into_provider(test_key);
+		let server = CmsHandshakeServer::<DefaultCryptoProvider>::new(provider, self.peer_authentication);
 
 		(server, public_key)
 	}
@@ -448,23 +472,18 @@ impl Default for TestCmsServerBuilder {
 	}
 }
 
-/// Builder for creating test CMS handshake clients with sensible defaults.
+/// Builder for test CMS handshake clients with default settings.
 #[cfg(feature = "transport-cms")]
 pub struct TestCmsClientBuilder {
 	client_key: Option<Secp256k1SigningKey>,
 	server_cert: Option<Certificate>,
-	transcript_hash: Option<[u8; 32]>,
 }
 
 #[cfg(feature = "transport-cms")]
 impl TestCmsClientBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
-		Self {
-			client_key: None,
-			server_cert: None,
-			transcript_hash: None, // Let CMS compute it internally by default
-		}
+		Self { client_key: None, server_cert: None }
 	}
 
 	/// Set a specific client signing key.
@@ -479,16 +498,10 @@ impl TestCmsClientBuilder {
 		self
 	}
 
-	/// Set a specific transcript hash.
-	pub fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
-		self.transcript_hash = Some(hash);
-		self
-	}
-
 	/// Build the CMS handshake client.
 	///
-	/// A trust store pinning the server certificate is attached
-	/// automatically: the client fails closed without one.
+	/// The build attaches a trust store that pins the server certificate,
+	/// because the client fails closed without one.
 	pub fn build(self) -> Result<CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn Error>> {
 		let client_key = self.client_key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let server_cert = match self.server_cert {
@@ -500,17 +513,12 @@ impl TestCmsClientBuilder {
 			.with_certificate(server_cert.to_owned())?
 			.build();
 
-		let mut client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
+		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
 			DefaultCryptoProvider::default(),
 			into_provider(client_key),
 			Arc::new(server_cert),
 		)
 		.with_trust_store(Arc::new(trust_store) as Arc<dyn CertificateTrust>);
-
-		// Apply transcript hash if explicitly set
-		if let Some(hash) = self.transcript_hash {
-			client = client.with_transcript_hash(hash);
-		}
 
 		Ok(client)
 	}

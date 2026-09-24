@@ -33,7 +33,6 @@ use std::sync::Arc;
 use tightbeam::asn1::{Any, OctetString};
 use tightbeam::cms::signed_data::SignedData;
 use tightbeam::der::asn1::SetOfVec;
-use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
 use tightbeam::oids::RECEIPT_ACK;
 use tightbeam::tb_assert_spec;
@@ -58,12 +57,11 @@ use crate::common::security::{
 
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-/// Re-encode the client Finished with a second `RECEIPT_ACK` unsigned
-/// attribute carrying a forged value. No signature covers unsigned
-/// attributes, so the result stays signature-valid.
-fn inject_duplicate_receipt_ack(client_finished: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let client_finished = client_finished.as_ref();
-	let mut signed_data = SignedData::from_der(client_finished)?;
+/// The client Finished with a second `RECEIPT_ACK` unsigned attribute
+/// carrying a forged value. No signature covers unsigned attributes, so the
+/// result stays signature-valid.
+fn inject_duplicate_receipt_ack(client_finished: &SignedData) -> Result<SignedData, TightBeamError> {
+	let mut signed_data = client_finished.to_owned();
 	let mut signer_info = signed_data
 		.signer_infos
 		.0
@@ -84,7 +82,7 @@ fn inject_duplicate_receipt_ack(client_finished: impl AsRef<[u8]>) -> Result<Vec
 
 	signer_info.unsigned_attrs = Some(attrs);
 	signed_data.signer_infos = vec![signer_info].try_into()?;
-	Ok(signed_data.to_der()?)
+	Ok(signed_data)
 }
 
 tb_assert_spec! {
@@ -115,14 +113,14 @@ tb_scenario! {
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?.to_der()?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
-			let server_finished = server.build_server_finished().await?.to_der()?;
+			let server_finished = server.build_server_finished().await?;
 			client.process_server_finished(&server_finished)?;
 
 			// The MITM injects the duplicate on the wire.
-			let client_finished = client.build_client_finished().await?.to_der()?;
+			let client_finished = client.build_client_finished().await?;
 			let tampered = inject_duplicate_receipt_ack(&client_finished)?;
 
 			// Signature verification covers the signed attributes, so the

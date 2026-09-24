@@ -1,7 +1,8 @@
 //! Common helpers and fixtures for security threat integration tests.
 //!
-//! This module provides a protocol-agnostic abstraction for testing security threats
-//! across multiple handshake backends (ECIES, CMS) without code duplication.
+//! The module gives one protocol-agnostic interface for testing security
+//! threats across the handshake backends (ECIES, CMS), so each threat test
+//! runs against every backend from one body.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -29,7 +30,7 @@ use tightbeam::{
 		client::EciesHandshakeClient,
 		negotiation::{NoStrengthFloor, ProfileStrengthPolicy, SecurityOffer},
 		server::EciesHandshakeServer,
-		ClientKeyExchange, ServerHandshake,
+		ClientKeyExchange, PeerAuthentication, ServerHandshake,
 	},
 	TightBeamError,
 };
@@ -40,10 +41,8 @@ use tightbeam::cms::signed_data::SignedData;
 use tightbeam::der::Any;
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
-
-// ============================================================================
-// AES-128 Crypto Provider for Downgrade Attack Testing
-// ============================================================================
+#[cfg(feature = "transport-cms")]
+use tightbeam::transport::wire_der::WireDer;
 
 /// Security profile using AES-128-GCM (weaker than default AES-256-GCM).
 #[derive(Debug, Default, Clone, Copy)]
@@ -96,10 +95,6 @@ impl CryptoProvider for Aes128CryptoProvider {
 	}
 }
 
-// ============================================================================
-// Core Types for Protocol Abstraction
-// ============================================================================
-
 /// Direction of a handshake message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -128,17 +123,17 @@ pub struct CapturedHandshake {
 }
 
 impl CapturedHandshake {
-	/// Get the last client-to-server message (common replay target).
+	/// Return the last client-to-server message, the common replay target.
 	pub fn final_client_message(&self) -> Option<&CapturedMessage> {
 		self.messages.iter().rev().find(|m| m.direction == Direction::ClientToServer)
 	}
 
-	/// Get all client-to-server messages.
+	/// Return every client-to-server message.
 	pub fn client_messages(&self) -> impl Iterator<Item = &CapturedMessage> {
 		self.messages.iter().filter(|m| m.direction == Direction::ClientToServer)
 	}
 
-	/// Get message at a specific step.
+	/// Return the message at a specific step.
 	#[allow(dead_code)]
 	pub fn message_at(&self, step: usize) -> Option<&CapturedMessage> {
 		self.messages.iter().find(|m| m.step == step)
@@ -149,9 +144,10 @@ impl CapturedHandshake {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum InjectionOutcome {
-	/// Handshake continued/completed (bad for replay attack tests).
+	/// The handshake continued or completed, which fails a replay attack test.
 	Accepted,
-	/// Handshake was rejected with an error (good for replay attack tests).
+	/// The handshake rejected the message with an error, which passes a replay
+	/// attack test.
 	Rejected(TightBeamError),
 }
 
@@ -197,14 +193,16 @@ pub trait HandshakeFlow: Send {
 /// its sequence once and gets capture and injection from it.
 #[allow(dead_code)]
 pub trait HandshakeProtocol: Send {
-	/// Returns the backend kind for this session.
+	/// Return the backend kind for this session.
 	fn kind(&self) -> HandshakeBackendKind;
 
 	/// Run a complete handshake, capturing all exchanged messages.
 	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake>;
 
-	/// Run handshake up to step N, then inject a different message at step N.
-	/// Returns the outcome of the injection attempt.
+	/// Run the handshake up to step N, then inject a different message at step
+	/// N.
+	///
+	/// The method returns the outcome of the injection attempt.
 	fn inject_at_step(&mut self, step: usize, msg: &[u8]) -> FlowFuture<'_, InjectionOutcome>;
 }
 
@@ -262,10 +260,6 @@ impl<F: HandshakeFlow> HandshakeProtocol for F {
 	}
 }
 
-// ============================================================================
-// Server Materials & Profiles
-// ============================================================================
-
 // Shared fixtures live in the crate-wide `common` module so threat suites do
 // not depend on one another's helpers.
 pub use crate::common::security::{
@@ -277,13 +271,9 @@ use crate::common::security::{pinning_trust_store, ClientMaterials};
 #[cfg(feature = "transport-cms")]
 use tightbeam::transport::{handshake::HandshakeKeyManager, state::ClientIdentity};
 
-// ============================================================================
-// Backend Kind
-// ============================================================================
-
 /// Total number of handshake backends exercised by the security harness.
 pub const BACKEND_COUNT: usize = 1 + cfg!(feature = "transport-cms") as usize;
-/// Same as [`BACKEND_COUNT`] but with a `u32` representation for spec macros.
+/// [`BACKEND_COUNT`] as a `u32`, for the spec macros.
 pub const BACKEND_COUNT_U32: u32 = BACKEND_COUNT as u32;
 
 /// Supported backend identifiers.
@@ -295,7 +285,7 @@ pub enum HandshakeBackendKind {
 }
 
 impl HandshakeBackendKind {
-	/// Human-readable backend label (useful for logging/trace events).
+	/// Human-readable backend label for logging and trace events.
 	#[allow(dead_code)]
 	pub fn label(self) -> &'static str {
 		match self {
@@ -339,6 +329,7 @@ impl HandshakeBackendKind {
 					.econtent
 					.as_ref()
 					.ok_or_else(|| expectation_failure("ServerFinished carries no content"))?;
+
 				let transcript_hash: OctetString = content.decode_as()?;
 				let tampered_hash = OctetString::new(flip_first_byte(transcript_hash.as_bytes())?)?;
 				signed_data.encap_content_info.econtent = Some(Any::encode_from(&tampered_hash)?);
@@ -354,21 +345,20 @@ fn flip_first_byte(bytes: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 	let first = flipped
 		.first_mut()
 		.ok_or_else(|| expectation_failure("tamper target is empty"))?;
+
 	*first ^= 0xFF;
+
 	Ok(flipped)
 }
-
-// ============================================================================
-// Security Threat Harness
-// ============================================================================
 
 use tightbeam::trace::TraceCollector;
 use tightbeam::utils::urn::Urn;
 
 /// Harness that can spawn handshake sessions across all enabled backends.
 ///
-/// Optionally holds a `TraceCollector` to emit internal (hidden) events during
-/// handshake operations, enabling process spec validation of internal state.
+/// The harness can hold a `TraceCollector` that emits internal (hidden)
+/// events during handshake operations, so a process spec can validate
+/// internal state.
 #[derive(Clone)]
 pub struct SecurityThreatHarness {
 	materials: ServerMaterials,
@@ -401,12 +391,12 @@ impl SecurityThreatHarness {
 		Self { materials: ServerMaterials::generate(), trace: Some(trace) }
 	}
 
-	/// Get access to the server materials for test verification.
+	/// Return the server materials for test verification.
 	pub fn materials(&self) -> &ServerMaterials {
 		&self.materials
 	}
 
-	/// Emit a hidden event if trace is configured.
+	/// Emit a hidden event when a trace collector is configured.
 	fn emit(&self, event: Urn<'static>) -> Result<(), TightBeamError> {
 		if let Some(ref trace) = self.trace {
 			trace.event(event)?;
@@ -414,7 +404,8 @@ impl SecurityThreatHarness {
 		Ok(())
 	}
 
-	/// Spawn a protocol session for the given backend kind with default profiles.
+	/// Spawn a protocol session for the given backend kind with default
+	/// profiles.
 	pub fn spawn(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
 		let client_profiles = vec![default_security_profile()];
 		let server_profiles = vec![default_security_profile()];
@@ -423,9 +414,10 @@ impl SecurityThreatHarness {
 
 	/// Spawn a protocol session with specific client and server profiles.
 	///
-	/// This enables cross-session downgrade attack testing where:
-	/// - Client offers certain profiles (client_profiles)
-	/// - Server accepts certain profiles (server_profiles)
+	/// The method supports cross-session downgrade attack tests:
+	///
+	/// - The client offers `client_profiles`.
+	/// - The server accepts `server_profiles`.
 	pub fn spawn_with_profiles(
 		&self,
 		kind: HandshakeBackendKind,
@@ -434,7 +426,9 @@ impl SecurityThreatHarness {
 	) -> Box<dyn HandshakeProtocol> {
 		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
 		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
+
 		self.emit(Self::HARNESS_SPAWN_SESSION).ok();
+
 		match kind {
 			HandshakeBackendKind::Ecies => {
 				self.emit(Self::HARNESS_SPAWN_ECIES).ok();
@@ -458,17 +452,19 @@ impl SecurityThreatHarness {
 		}
 	}
 
-	/// Spawn a session using the WEAK cipher (AES-128-GCM) for downgrade testing.
+	/// Spawn a session with the WEAK cipher (AES-128-GCM) for downgrade
+	/// testing.
 	///
-	/// This uses `Aes128CryptoProvider` which actually uses AES-128 at the cipher level,
-	/// not just in the profile descriptor OIDs.
+	/// `Aes128CryptoProvider` runs AES-128 at the cipher level as well as
+	/// naming it in the profile descriptor OIDs.
 	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
 		self.emit(Self::HARNESS_SPAWN_WEAK).ok();
 		match kind {
 			HandshakeBackendKind::Ecies => {
 				self.emit(Self::HARNESS_SPAWN_ECIES_WEAK).ok();
-				// Deliberately weak session: opt out of the default strength
-				// floor so the downgrade harness can capture AES-128 wire bytes.
+				// Deliberately weak session: opt out of the default
+				// strength floor so the downgrade harness can capture AES-128
+				// wire bytes.
 				Box::new(Aes128EciesSession::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
@@ -493,7 +489,7 @@ impl SecurityThreatHarness {
 	}
 }
 
-/// Helper to create an error for invalid injection step.
+/// Create the error for an invalid injection step.
 fn invalid_step_error(msg: &'static str) -> TightBeamError {
 	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
 		field: "inject_at_step",
@@ -501,13 +497,9 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 	}))
 }
 
-// ============================================================================
-// Message Tampering Helpers (for MITM Testing)
-// ============================================================================
-
 /// Tamper with a message by appending extra bytes.
 ///
-/// This simulates a MITM attacker adding data to a message.
+/// The function simulates a MITM attacker that adds data to a message.
 #[allow(dead_code)]
 pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>) -> Vec<u8> {
 	let payload = payload.as_ref();
@@ -519,33 +511,25 @@ pub fn tamper_payload_append(payload: impl AsRef<[u8]>, extra: impl AsRef<[u8]>)
 
 /// Tamper with a message by truncating bytes.
 ///
-/// This simulates a MITM attacker truncating a message.
+/// The function simulates a MITM attacker that truncates a message.
 #[allow(dead_code)]
 pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> Vec<u8> {
 	let payload = payload.as_ref();
 	payload.iter().take(keep_bytes).copied().collect()
 }
 
-// ============================================================================
-// ECIES Decryption Helpers (for Confidentiality Testing)
-// ============================================================================
-
 /// Result of attempting to decrypt an ECIES payload.
 #[derive(Debug)]
 pub enum DecryptionResult {
-	/// Decryption succeeded, plaintext has expected size (64 bytes for session material).
+	/// Decryption succeeded, and the plaintext has the expected size (64 bytes
+	/// for session material).
 	Success { plaintext_len: usize },
-	/// Decryption failed (wrong key, corrupted ciphertext, etc.).
+	/// Decryption failed, for example on a wrong key or a corrupted ciphertext.
 	Failed,
 }
 
-/// Extract the ECIES encrypted data from a ClientKeyExchange message.
-///
-/// # Parameters
-/// - `client_kex_der`: DER-encoded ClientKeyExchange message
-///
-/// # Returns
-/// The encrypted ECIES blob bytes
+/// Extract the ECIES encrypted data from a DER-encoded ClientKeyExchange
+/// message and return the encrypted ECIES blob bytes.
 pub fn extract_ecies_ciphertext(client_kex_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 	let client_kex_der = client_kex_der.as_ref();
 	let client_kex = ClientKeyExchange::from_der(client_kex_der)?;
@@ -554,17 +538,12 @@ pub fn extract_ecies_ciphertext(client_kex_der: impl AsRef<[u8]>) -> Result<Vec<
 
 /// Extract the ephemeral public key from an ECIES ciphertext.
 ///
-/// The ephemeral public key is the first 33 bytes (compressed secp256k1 point)
-/// of the ECIES message.
-///
-/// # Parameters
-/// - `ecies_ciphertext`: The raw ECIES blob
-///
-/// # Returns
-/// The 33-byte ephemeral public key
+/// The ephemeral public key is the first 33 bytes (compressed secp256k1
+/// point) of the raw ECIES blob, so the function returns those 33 bytes.
 pub fn extract_ephemeral_pubkey(ecies_ciphertext: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 	let ecies_ciphertext = ecies_ciphertext.as_ref();
-	// ECIES message format: [ephemeral_pubkey (33 bytes) || nonce+ciphertext+tag]
+	// The ECIES message format is
+	// [ephemeral_pubkey (33 bytes) || nonce+ciphertext+tag].
 	const EPHEMERAL_PUBKEY_SIZE: usize = 33;
 
 	if ecies_ciphertext.len() < EPHEMERAL_PUBKEY_SIZE {
@@ -580,38 +559,30 @@ pub fn extract_ephemeral_pubkey(ecies_ciphertext: impl AsRef<[u8]>) -> Result<Ve
 /// Default AAD used by the handshake for ECIES encryption.
 pub const HANDSHAKE_AAD: &[u8] = b"tb/aead/v1";
 
-/// Attempt to decrypt an ECIES ciphertext using the provided secret key.
+/// Attempt to decrypt an ECIES ciphertext with the recipient's secret key.
 ///
-/// # Parameters
-/// - `ciphertext`: The ECIES encrypted blob
-/// - `secret_key`: The recipient's secret key
-/// - `aad`: Optional AAD (defaults to HANDSHAKE_AAD if None)
+/// `aad` defaults to [`HANDSHAKE_AAD`] when it is `None`.
 ///
 /// # Returns
-/// `DecryptionResult::Success` with plaintext length if decryption worked,
-/// `DecryptionResult::Failed` if decryption failed (wrong key, invalid data, etc.)
+///
+/// - `DecryptionResult::Success` with the plaintext length when decryption worked.
+/// - `DecryptionResult::Failed` when decryption failed, for example on a wrong key or invalid data.
 pub fn try_decrypt_ecies(
 	ciphertext: impl AsRef<[u8]>,
 	secret_key: &k256::SecretKey,
 	aad: Option<&[u8]>,
 ) -> DecryptionResult {
 	let ciphertext = ciphertext.as_ref();
-	// Parse the ECIES message
 	let message = match Secp256k1EciesMessage::from_bytes(ciphertext) {
 		Ok(m) => m,
 		Err(_) => return DecryptionResult::Failed,
 	};
 
-	// Use provided AAD or default to handshake AAD
 	let aad = aad.or(Some(HANDSHAKE_AAD));
 
-	// Attempt decryption
 	match ecies::decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(secret_key, &message, aad) {
 		Ok(plaintext) => {
-			let plaintext_bytes = match plaintext.to_insecure() {
-				Ok(b) => b,
-				Err(_) => return DecryptionResult::Failed,
-			};
+			let plaintext_bytes = plaintext.to_insecure();
 			DecryptionResult::Success { plaintext_len: plaintext_bytes.len() }
 		}
 		Err(_) => DecryptionResult::Failed,
@@ -622,14 +593,6 @@ pub fn try_decrypt_ecies(
 pub fn generate_wrong_secret_key() -> k256::SecretKey {
 	k256::SecretKey::random(&mut rand_core::OsRng)
 }
-
-// ============================================================================
-// ECIES Session Implementation
-// ============================================================================
-
-// ============================================================================
-// ECIES Session Implementation
-// ============================================================================
 
 /// The three messages an ECIES handshake exchanges.
 const ECIES_FLOW: &[FlowStep] = &[
@@ -672,7 +635,7 @@ macro_rules! ecies_session {
 					Arc::clone(&materials.key_provider),
 					Arc::clone(&materials.certificate),
 					None,
-					None,
+					PeerAuthentication::Anonymous,
 				)
 				.with_supported_profiles(server_profiles);
 
@@ -709,7 +672,9 @@ macro_rules! ecies_session {
 						0 => Ok(Some(self.server.process_client_hello(msg).await?.to_der()?)),
 						1 => Ok(Some(self.client.process_server_handshake(msg).await?.to_der()?)),
 						2 => {
-							self.server.process_client_key_exchange(msg).await?;
+							self.server
+								.process_client_key_exchange(ClientKeyExchange::from_der(msg)?)
+								.await?;
 							Ok(None)
 						}
 						_ => Err(invalid_step_error("ECIES has only 3 steps (0-2)")),
@@ -722,10 +687,6 @@ macro_rules! ecies_session {
 
 ecies_session!(EciesSession, DefaultCryptoProvider);
 ecies_session!(Aes128EciesSession, Aes128CryptoProvider);
-
-// ============================================================================
-// CMS Session Implementation
-// ============================================================================
 
 /// The three messages a CMS handshake exchanges. The intervening odd steps are
 /// the receiving half of each, so they carry no message of their own.
@@ -785,8 +746,11 @@ macro_rules! cms_session {
 				.with_trust_store(trust_store)
 				.with_client_identity(identity);
 
-				let mut server = CmsHandshakeServer::<$provider>::new(Arc::clone(&materials.key_provider), None)
-					.with_supported_profiles(server_profiles);
+				let mut server = CmsHandshakeServer::<$provider>::new(
+					Arc::clone(&materials.key_provider),
+					PeerAuthentication::Anonymous,
+				)
+				.with_supported_profiles(server_profiles);
 
 				if let Some(policy) = strength_policy {
 					client = client.with_strength_policy(Arc::clone(&policy));
@@ -822,15 +786,16 @@ macro_rules! cms_session {
 				Box::pin(async move {
 					match index {
 						0 => {
-							self.server.process_key_exchange(msg).await?;
+							let key_exchange = WireDer::try_from(msg)?;
+							self.server.process_key_exchange(&key_exchange).await?;
 							Ok(Some(self.server.build_server_finished().await?.to_der()?))
 						}
 						2 => {
-							self.client.process_server_finished(msg)?;
+							self.client.process_server_finished(&SignedData::from_der(msg)?)?;
 							Ok(Some(self.client.build_client_finished().await?.to_der()?))
 						}
 						4 => {
-							self.server.process_client_finished(msg)?;
+							self.server.process_client_finished(&SignedData::from_der(msg)?)?;
 							Ok(None)
 						}
 						_ => Err(invalid_step_error("CMS steps are 0, 2, 4")),

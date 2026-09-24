@@ -8,9 +8,8 @@
 //! the victim's random.
 //!
 //! ## Attack
-//! 1. A MITM captures a victim's `ClientKeyExchange` (certificate + signature).
-//! 2. The MITM encrypts `[attacker_key || victim_client_random]` to the
-//!    server's public key.
+//! 1. A MITM captures a victim's `ClientKeyExchange` (certificate and signature).
+//! 2. The MITM encrypts `[attacker_key || victim_client_random]` to the server's public key.
 //! 3. The MITM splices its `encrypted_data` into the victim's message, keeping
 //!    the victim's certificate and signature intact.
 //! 4. A transcript-only signature still verifies: the server would attribute an
@@ -24,10 +23,8 @@
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
 //!   <https://cwe.mitre.org/data/definitions/347.html>
-//! - CWE-300: Channel Accessible by Non-Endpoint
-//!   <https://cwe.mitre.org/data/definitions/300.html>
-//! - CAPEC-94: Adversary in the Middle (AiTM)
-//!   <https://capec.mitre.org/data/definitions/94.html>
+//! - CWE-300: Channel Accessible by Non-Endpoint <https://cwe.mitre.org/data/definitions/300.html>
+//! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 
 use std::sync::Arc;
 
@@ -49,6 +46,7 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::handshake::{
 		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
+		PeerAuthentication,
 	},
 	utils::urn::Urn,
 	TightBeamError,
@@ -124,12 +122,12 @@ job! {
 			.with_client_identity(client_identity);
 
 		// Server requires client authentication (validators present).
-		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
 		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 			Arc::clone(&materials.key_provider),
 			Arc::clone(&materials.certificate),
 			None,
-			Some(validators),
+			PeerAuthentication::mutual([validator]),
 		)
 		.with_supported_profiles(vec![profile]);
 
@@ -146,9 +144,9 @@ job! {
 			&victim_message,
 			Some(crate::security::common::HANDSHAKE_AAD),
 		)?
-		.to_insecure()?;
+		.to_insecure();
 
-		// Attacker forges a payload with its own key under the server's
+		// The attacker forges a payload with its own key under the server's
 		// public key and splices it into the victim's message, preserving
 		// the victim's client_random and the DER framing.
 		let victim_payload = SplicedPayload::from_der(&victim_plain)?;
@@ -177,7 +175,7 @@ job! {
 			return Err(expectation_failure("splice produced identical ClientKeyExchange bytes"));
 		}
 
-		match server.process_client_key_exchange(&spliced_der).await {
+		match server.process_client_key_exchange(spliced).await {
 			Err(_) => {
 				trace.event(SPLICED_KEX_REJECTED)?;
 			}

@@ -1,12 +1,13 @@
 //! Loopback end-to-end tests for handshake orchestrators.
 //!
-//! Drives the ECIES and CMS client/server orchestrators against each other
-//! entirely through the `ClientHandshakeProtocol`/`ServerHandshakeProtocol`
-//! trait surface (the same surface `io.rs` consumes) and verifies:
+//! The tests drive the ECIES and CMS client and server orchestrators against
+//! each other entirely through the `ClientHandshakeProtocol` and
+//! `ServerHandshakeProtocol` trait surface (the same surface `io.rs`
+//! consumes) and verify:
 //!
-//! - Both sides complete and agree on the negotiated profile
-//! - The derived directional `SessionKeys` are complementary
-//! - CMS session keys are random per handshake, never constant (CWE-321)
+//! - Both sides complete and agree on the negotiated profile.
+//! - The derived directional `SessionKeys` are complementary.
+//! - CMS session keys are random per handshake, never constant (CWE-321).
 
 #![cfg(all(feature = "transport", feature = "x509", feature = "aead", feature = "tokio"))]
 
@@ -30,7 +31,7 @@ use tightbeam::{
 use tightbeam::{
 	crypto::ecies::Secp256k1EciesMessage,
 	transport::handshake::negotiation::SecurityOffer,
-	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer},
+	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer, PeerAuthentication},
 };
 
 #[cfg(feature = "transport-cms")]
@@ -110,28 +111,30 @@ fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
 	SecurityOffer::new(vec![profile])
 }
 
-/// Probe both directions. Return whether plaintexts match the probes.
+/// Probe both directions and return whether the plaintexts match the
+/// probes.
 ///
 /// Each direction has its own key and counter nonce, so no `(key, nonce)`
 /// pair can repeat across the two probes.
 fn bidirectional_roundtrip_ok(client_keys: &SessionKeys, server_keys: &SessionKeys) -> Result<bool, TightBeamError> {
 	let c2s_probe = b"client->server probe";
 	let c2s_ciphertext = client_keys.send().encrypt_next(c2s_probe, None)?;
-	let c2s_plaintext = server_keys.recv().decrypt_content(&c2s_ciphertext)?.to_insecure()?;
+	let c2s_plaintext = server_keys.recv().decrypt_content(&c2s_ciphertext)?.to_insecure();
 	let c2s_ok = &c2s_plaintext[..] == c2s_probe;
 
 	let s2c_probe = b"server->client probe";
 	let s2c_ciphertext = server_keys.send().encrypt_next(s2c_probe, None)?;
-	let s2c_plaintext = client_keys.recv().decrypt_content(&s2c_ciphertext)?.to_insecure()?;
+	let s2c_plaintext = client_keys.recv().decrypt_content(&s2c_ciphertext)?.to_insecure();
 	let s2c_ok = &s2c_plaintext[..] == s2c_probe;
 
 	Ok(c2s_ok && s2c_ok)
 }
 
-/// Complete both peers, prove AEAD key agreement, and record negotiated profile.
+/// Complete both peers, prove AEAD key agreement, and record the negotiated
+/// profile.
 ///
-/// Emits the three named booleans for `HandshakeLoopbackSpec` to verify via
-/// `equals!(true)`.
+/// The function emits the three named booleans that `HandshakeLoopbackSpec`
+/// verifies with `equals!(true)`.
 async fn emit_session_ready<C, S>(
 	client: Box<C>,
 	server: Box<S>,
@@ -168,13 +171,14 @@ where
 	Ok(())
 }
 
-/// Require a handshake reply and convert a missing reply into an expectation failure.
+/// Require a handshake reply and convert a missing reply into an
+/// expectation failure.
 fn require_reply(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<HandshakeMessage, TightBeamError> {
 	let message = reply.ok_or_else(|| expectation_failure(msg))?;
 	Ok(message)
 }
 
-/// Protocol step that must produce no further reply.
+/// Require that a protocol step produce no further reply.
 fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<(), TightBeamError> {
 	if reply.is_some() {
 		return Err(expectation_failure(msg));
@@ -196,10 +200,16 @@ async fn ecies_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> 
 
 	let key_provider = Arc::clone(&materials.key_provider);
 	let certificate = Arc::clone(&materials.certificate);
-	let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(key_provider, certificate, None, None)
-		.with_supported_profiles(vec![profile]);
+	let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
+		key_provider,
+		certificate,
+		None,
+		PeerAuthentication::Anonymous,
+	)
+	.with_supported_profiles(vec![profile]);
 
-	// ClientHello -> ServerHandshake -> ClientKeyExchange -> (no reply)
+	// The flow is ClientHello, then ServerHandshake, then ClientKeyExchange,
+	// which draws no reply.
 	let client_hello = ClientHandshakeProtocol::start(&mut client).await?;
 	let server_reply = server.handle_request(client_hello).await?;
 	let server_handshake = require_reply(server_reply, "ECIES server must answer ClientHello")?;
@@ -227,7 +237,7 @@ fn build_cms_pair(
 	TightBeamError,
 > {
 	let profile = default_security_profile();
-	let pair = cms_handshake_pair(materials, vec![profile], vec![profile], None)?;
+	let pair = cms_handshake_pair(materials, vec![profile], vec![profile], PeerAuthentication::Anonymous)?;
 	Ok((pair.client, pair.server))
 }
 
@@ -238,7 +248,7 @@ fn session_key_bytes(
 	missing_msg: &'static str,
 ) -> Result<Vec<u8>, TightBeamError> {
 	let secret = client.session_key().ok_or_else(|| expectation_failure(missing_msg))?;
-	let bytes = secret.with(|bytes| bytes.to_owned())?;
+	let bytes = secret.with(|bytes| bytes.to_owned());
 	Ok(bytes)
 }
 
@@ -252,24 +262,25 @@ fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool
 
 /// CMS loopback through the orchestrator trait surface.
 ///
-/// Regression coverage for random session key lets both sides derive a working
-/// AEAD and client learns the negotiated profile from the server-Finished
+/// The test covers the random session key. Both sides derive a working AEAD,
+/// and the client learns the negotiated profile from the server-Finished
 /// `SecurityAccept` attribute and can `complete()`.
 #[cfg(feature = "transport-cms")]
 async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
 	let profile = default_security_profile();
 	let (mut client, mut server) = build_cms_pair(materials)?;
 
-	// KeyExchange -> ServerFinished -> ClientFinished -> (no reply)
+	// The flow is KeyExchange, then ServerFinished, then ClientFinished,
+	// which draws no reply.
 	let key_exchange = ClientHandshakeProtocol::start(&mut client).await?;
 
 	// Confidentiality (CWE-311): the CMS backend transports the session key
 	// wrapped inside the KeyExchange EnvelopedData, so the raw key MUST NOT
 	// appear anywhere in the cleartext wire bytes. This is the CMS equivalent
 	// of the ECIES `confidentiality` threat test, exercised on the real
-	// random-key path (not the fixture's constant test key).
+	// random-key path in place of the fixture's constant test key.
 	let session_key = session_key_bytes(&client, "CMS client must hold a session key after start")?;
-	if contains_window(&key_exchange.to_der()?, &session_key) {
+	if contains_window(key_exchange.der(), &session_key) {
 		return Err(expectation_failure(
 			"CMS session key must not appear in cleartext KeyExchange wire bytes",
 		));

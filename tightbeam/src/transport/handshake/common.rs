@@ -1,10 +1,10 @@
 //! Common traits for handshake orchestrators.
 //!
-//! Provides shared functionality across CMS and ECIES client/server
-//! implementations:
-//! - Profile negotiation (server-side)
-//! - AEAD session key finalization (all orchestrators)
-//! - Alert attribute processing (all orchestrators)
+//! The CMS and ECIES client and server implementations share these traits:
+//!
+//! - [`HandshakeNegotiation`] negotiates the profile on the server side.
+//! - [`HandshakeFinalization`] finalizes the AEAD session keys for every orchestrator.
+//! - [`HandshakeAlertHandler`] processes alert attributes for every orchestrator.
 
 use core::fmt;
 
@@ -32,17 +32,19 @@ use crate::transport::handshake::attributes::HandshakeAlertAttribute;
 
 /// Provides profile negotiation logic for server-side handshake orchestrators.
 ///
-/// Servers must implement `supported_profiles()` to expose their configured
-/// security profiles. The trait provides default negotiation logic handling
-/// both client-offered and dealer's choice modes.
+/// A server must implement `supported_profiles()` to expose its configured
+/// security profiles. The trait provides the default negotiation logic for
+/// both the client-offered mode and the dealer's choice mode.
 ///
 /// # Usage
-/// - **Negotiation mode**: Client sends `SecurityOffer`, server selects the first mutual
-///   profile in *server* preference order
-/// - **Dealer's choice mode**: Client sends no offer, server uses its first configured
-///   profile that meets the strength policy
+///
+/// - **Negotiation mode**: the client sends a `SecurityOffer`, and the server
+///   selects the first mutual profile in *server* preference order.
+/// - **Dealer's choice mode**: the client sends no offer, and the server uses
+///   its first configured profile that meets the strength policy.
 ///
 /// # Security
+///
 /// Both modes filter profiles through [`ProfileStrengthPolicy`] before
 /// selection, so a weak profile left in `supported_profiles()` for
 /// compatibility cannot be negotiated (CWE-757 downgrade resistance).
@@ -50,7 +52,7 @@ pub trait HandshakeNegotiation<P>
 where
 	P: CryptoProvider,
 {
-	/// Server preference order (first = most preferred).
+	/// Return the profiles in server preference order, most preferred first.
 	fn supported_profiles(&self) -> &[SecurityProfileDesc];
 
 	/// Minimum-strength policy applied before selection.
@@ -67,10 +69,11 @@ where
 	/// never names an algorithm the provider does not run.
 	///
 	/// # Errors
-	/// - `NoSupportedProfiles`: No profiles configured on server
-	/// - `NegotiationError(UnrunnableProfile)`: No configured profile names `P`'s algorithms
-	/// - `NegotiationError(BelowStrengthFloor)`: No runnable profile meets the policy
-	/// - `NegotiationError`: No mutually supported profile found
+	///
+	/// - `NoSupportedProfiles` -- the server has no configured profile.
+	/// - `NegotiationError(UnrunnableProfile)` -- no configured profile names the algorithms of `P`.
+	/// - `NegotiationError(BelowStrengthFloor)` -- no runnable profile meets the policy.
+	/// - `NegotiationError` -- no mutually supported profile exists.
 	fn negotiate_profile(&self, offer: Option<&SecurityOffer>) -> Result<RunnableProfile<P>, HandshakeError> {
 		let supported = self.supported_profiles();
 		if supported.is_empty() {
@@ -103,14 +106,14 @@ where
 
 /// Epoch state retained past handshake completion for in-band rekeying.
 ///
-/// Produced by each orchestrator's `complete()` alongside the session
-/// keys: the epoch secret seeds the rekey KDF chain and the transcript
-/// hash is the chain root `hash_0`. The raw handshake secret itself
-/// keeps its zeroize-at-complete lifecycle.
+/// Each orchestrator's `complete()` produces it alongside the session keys.
+/// The epoch secret seeds the rekey KDF chain, and the transcript hash is
+/// the chain root `hash_0`. The raw handshake secret keeps its
+/// zeroize-at-complete lifecycle.
 pub struct EpochMaterials {
 	/// Current epoch secret, zeroized on drop and on rotation
-	/// (RFC 9846, 7.2). Only read by transport::rekey, which builds
-	/// with a handshake but without `transport-multiplex` consumers.
+	/// (RFC 9846, 7.2). Only `transport::rekey` reads it, and a build can
+	/// include the handshake without the `transport-multiplex` consumers.
 	#[allow(dead_code)]
 	pub(crate) secret: ZeroizingBytes,
 	/// Epoch counter: 0 at handshake, incremented per rekey install.
@@ -120,18 +123,18 @@ pub struct EpochMaterials {
 }
 
 impl EpochMaterials {
-	/// Current epoch number.
+	/// Return the current epoch number.
 	pub fn epoch(&self) -> u32 {
 		self.epoch
 	}
 
-	/// Current chained transcript hash.
+	/// Return the current chained transcript hash.
 	pub fn transcript_hash(&self) -> [u8; 32] {
 		self.transcript_hash
 	}
 }
 
-/// The epoch secret never appears in diagnostics.
+/// Debug output redacts the epoch secret.
 impl fmt::Debug for EpochMaterials {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("EpochMaterials")
@@ -144,9 +147,10 @@ impl fmt::Debug for EpochMaterials {
 /// Derive the epoch-0 secret from handshake key material under the
 /// dedicated epoch info label.
 ///
-/// Same `input_key`/`salt` pair as the directional traffic keys. The
-/// distinct label yields an independent secret (RFC 5869 domain
-/// separation), so retaining it never weakens the traffic keys.
+/// The derivation uses the same `input_key` and `salt` pair as the
+/// directional traffic keys. The distinct label yields an independent secret
+/// (RFC 5869 domain separation), so retaining it never weakens the traffic
+/// keys.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn derive_epoch_materials<P>(
 	input_key: &[u8],
@@ -168,35 +172,39 @@ const EPOCH_SECRET_SIZE: usize = 32;
 
 /// Provides session key finalization logic for all handshake orchestrators.
 ///
-/// Orchestrators must implement `selected_profile()` to expose the negotiated
-/// security profile. The trait provides default HKDF-based key derivation with
-/// entropy validation.
+/// An orchestrator must implement `selected_profile()` to expose the
+/// negotiated security profile. The trait provides the default HKDF-based key
+/// derivation with entropy validation.
 ///
-/// # Security Properties
-/// - Enforces minimum `MIN_SALT_ENTROPY_BYTES` salt entropy
-/// - Uses HKDF with per-direction domain separation (`TIGHTBEAM_C2S_KDF_INFO`,
-///   `TIGHTBEAM_S2C_KDF_INFO`), the RFC 5869 info-label pattern behind the
-///   TLS 1.3 directional traffic secrets (RFC 9846, § 7.3)
-/// - Derives key size dynamically from negotiated AEAD cipher profile
-/// - Constant-time operations via underlying crypto primitives
+/// # Security properties
+///
+/// - The derivation enforces at least `MIN_SALT_ENTROPY_BYTES` of salt entropy.
+/// - HKDF runs with per-direction domain separation (`TIGHTBEAM_C2S_KDF_INFO`,
+///   `TIGHTBEAM_S2C_KDF_INFO`), the RFC 5869 info-label pattern behind the TLS
+///   1.3 directional traffic secrets (RFC 9846, § 7.3).
+/// - The key size follows the negotiated AEAD cipher profile.
+/// - The underlying crypto primitives supply constant-time operations.
 pub trait HandshakeFinalization<P>
 where
 	P: CryptoProvider,
 {
-	/// Negotiated profile after offer/accept, if any.
+	/// Return the profile negotiated through offer and accept, if any.
 	fn selected_profile(&self) -> Option<RunnableProfile<P>>;
 
 	/// Derive directional AEAD ciphers from input key material and context
 	/// salt.
 	///
 	/// # Salt contract
-	/// - **CMS**: transcript hash (32 bytes)
-	/// - **ECIES**: `client_random || server_random` (64 bytes)
+	///
+	/// - **CMS**: the transcript hash (32 bytes).
+	/// - **ECIES**: `client_random || server_random` (64 bytes).
 	///
 	/// # Errors
-	/// - `InvalidState`: No profile selected
-	/// - `InsufficientSaltEntropy`: Salt shorter than `MIN_SALT_ENTROPY_BYTES`
-	/// - `KeyDerivationFailed`: HKDF or cipher initialization failed
+	///
+	/// - `InvalidState` -- no profile is selected.
+	/// - `InsufficientSaltEntropy` -- the salt is shorter than `MIN_SALT_ENTROPY_BYTES`.
+	/// - `KdfError` -- the KDF refused the key length.
+	/// - `InvalidKeyMaterialLength` -- the cipher refused the derived key.
 	fn derive_directional_aead(
 		&self,
 		input_key: &[u8],
@@ -219,8 +227,8 @@ where
 	/// Derive the directional AEAD ciphers of provider `P` from input key
 	/// material.
 	///
-	/// Single derivation path shared by handshake finalization and epoch
-	/// rotation. The provider's cipher type fixes the key length, and the
+	/// This is the single derivation path that handshake finalization and epoch
+	/// rotation share. The provider's cipher type fixes the key length, and the
 	/// salt floor applies at every derivation.
 	pub(crate) fn derive<P>(input_key: &[u8], salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
@@ -258,23 +266,28 @@ where
 
 /// Provides alert attribute processing for all handshake orchestrators.
 ///
-/// All orchestrators automatically implement this trait via blanket impl.
-/// Call `check_for_alert()` early in message processing to detect peer-sent
-/// abort alerts.
+/// Every orchestrator implements this trait through a blanket impl. Call
+/// `check_for_alert()` early in message processing to detect an abort alert
+/// that the peer sent.
 ///
-/// # Alert Types
-/// - `AuthRequired`: Peer requires mutual authentication
-/// - `VersionMismatch`: Protocol version incompatible
-/// - `AlgorithmMismatch`: No mutual cryptographic algorithms
-/// - `DecryptFail`: Decryption or signature verification failed
-/// - `FinishedIntegrityFail`: Transcript hash mismatch
+/// # Alert types
+///
+/// - `AuthRequired`: the peer requires mutual authentication.
+/// - `VersionMismatch`: the protocol version is incompatible.
+/// - `AlgorithmMismatch`: no mutual cryptographic algorithm exists.
+/// - `DecryptFail`: decryption or signature verification failed.
+/// - `FinishedIntegrityFail`: the transcript hash does not match.
 pub trait HandshakeAlertHandler {
-	/// Abort alerts live in unprotected attributes (advisory, unauthenticated).
+	/// Check `attrs` for an abort alert from the peer.
+	///
+	/// Abort alerts live in unprotected attributes, so they are advisory and
+	/// unauthenticated.
 	///
 	/// # Errors
-	/// - `AbortReceived`: Alert detected with specific alert code
-	/// - `InvalidAttributeArity`: Alert attribute malformed
-	/// - `InvalidIntegerEncoding`: Alert code not valid INTEGER
+	///
+	/// - `AbortReceived` -- an alert with a specific alert code is present.
+	/// - `InvalidAttributeArity` -- the alert attribute is malformed.
+	/// - `InvalidIntegerEncoding` -- the alert code is not a valid INTEGER.
 	fn check_for_alert(&self, attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		if let Some(attrs) = attrs {
 			let attr_refs: Vec<&Attribute> = attrs.iter().collect();

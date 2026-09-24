@@ -3,45 +3,47 @@
 //! ## Weakness
 //! `TransportAuthorizer::settle` is the hook where an application performs
 //! an irreversible external side effect (crediting an account, releasing a
-//! good, marking an invoice paid). If the server verifies the client's
-//! receipt countersignature and settles *before* it has decrypted the key
-//! exchange and confirmed the client random, an attacker can drive
-//! settlement with a key exchange the server will then reject: the payload
-//! never establishes a session, but the side effect already fired.
+//! good, marking an invoice paid).
+//!
+//! Suppose the server verifies the client's receipt countersignature and
+//! settles *before* it has decrypted the key exchange and confirmed the
+//! client random. An attacker can then drive settlement with a key exchange
+//! the server will reject. The payload never establishes a session, but the
+//! side effect already fired.
 //!
 //! ## Attack
 //! A network attacker captures a victim's budget-bearing
 //! `ClientKeyExchange` (certificate, transcript-bound auth signature, and
 //! the receipt countersignature). The countersignature covers only the
-//! receipt body and settlement answer, not the ECIES `encrypted_data`, so
-//! the attacker splices in a corrupted ciphertext. If the server settles
-//! before decrypting, the corrupted payload triggers settlement and only
-//! afterwards fails the AEAD check. The attacker has forced a settlement
-//! against a session that never activates.
+//! receipt body and the settlement answer, so the attacker splices in a
+//! corrupted ECIES ciphertext (`encrypted_data`).
+//!
+//! If the server settles before decrypting, the corrupted payload triggers
+//! settlement and only afterwards fails the AEAD check. The attacker has
+//! forced a settlement against a session that never activates.
 //!
 //! ## Expected control
-//! Two layers, defense in depth:
-//! 1. Primary: the ECIES client auth signature covers
-//!    `Digest(transcript_hash || encrypted_data || cert_der)`, so any
-//!    corruption of `encrypted_data` is rejected at certificate validation
-//!    before decryption and before settlement.
-//! 2. Ordering: `settle` runs strictly after decryption and the client
-//!    random replay check, so it is the last gate and no external side
-//!    effect can be provoked by a key exchange the server will reject.
+//! Two layers give defense in depth:
+//!
+//! 1. Primary: the ECIES client auth signature covers `Digest(transcript_hash
+//!    || encrypted_data || cert_der)`, so any corruption of `encrypted_data` is
+//!    rejected at certificate validation before decryption and before
+//!    settlement.
+//! 2. Ordering: `settle` runs strictly after decryption and the client random
+//!    replay check, so it is the last gate and no external side effect can be
+//!    provoked by a key exchange the server will reject.
 //!
 //! This test proves the observable end-to-end property: a corrupted
 //! budget-bearing key exchange is rejected and the authorizer's `settle`
-//! hook never fires. The corruption is caught by layer 1, so the property
-//! holds independent of the ordering. The ordering is retained as hygiene
-//! (settlement, being irreversible, is the final validation step).
+//! hook never fires. Layer 1 catches the corruption, so the property holds
+//! independent of the ordering. The ordering stays as hygiene, because
+//! settlement is irreversible and so is the final validation step.
 //!
 //! ## References
-//! - CWE-696: Incorrect Behavior Order
-//!   <https://cwe.mitre.org/data/definitions/696.html>
+//! - CWE-696: Incorrect Behavior Order <https://cwe.mitre.org/data/definitions/696.html>
 //! - CWE-347: Improper Verification of Cryptographic Signature
 //!   <https://cwe.mitre.org/data/definitions/347.html>
-//! - CAPEC-94: Adversary in the Middle (AiTM)
-//!   <https://capec.mitre.org/data/definitions/94.html>
+//! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -62,7 +64,7 @@ use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
 use tightbeam::transport::handshake::{
-	client::EciesHandshakeClient, server::EciesHandshakeServer, ClientKeyExchange, HandshakeError,
+	client::EciesHandshakeClient, server::EciesHandshakeServer, ClientKeyExchange, HandshakeError, PeerAuthentication,
 };
 use tightbeam::utils::urn::Urn;
 use tightbeam::TightBeamError;
@@ -117,12 +119,12 @@ tb_scenario! {
 				.with_receipt_approver(Arc::new(PayingApprover::answering(RESPONSE)?));
 
 			let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
-			let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
+			let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
 			let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 				Arc::clone(&materials.key_provider),
 				Arc::clone(&materials.certificate),
 				None,
-				Some(validators),
+				PeerAuthentication::mutual([validator]),
 			)
 			.with_supported_profiles(vec![profile])
 			.with_transport_config(TransportOffer::mux(4))
@@ -157,11 +159,10 @@ tb_scenario! {
 			// The mutual-auth signature commits to the exact ciphertext
 			// (the anti-splice control), so the corruption is caught as a
 			// signature failure before any decrypt or settlement side effect.
-			let corrupted = kex.to_der()?;
-			let kex_result = server.process_client_key_exchange(&corrupted).await;
+			let kex_result = server.process_client_key_exchange(kex).await;
 			let rejected = matches!(kex_result, Err(HandshakeError::SignatureError(_)));
-			trace.event_with(CORRUPTED_KEY_EXCHANGE_REJECTED, &[], rejected)?;
 
+			trace.event_with(CORRUPTED_KEY_EXCHANGE_REJECTED, &[], rejected)?;
 			trace.event_with(SETTLE_NEVER_FIRED, &[], authorizer.settle_calls() == 0)?;
 
 			Ok::<(), TightBeamError>(())

@@ -15,10 +15,8 @@
 //! `ServerHandshake`; CMS: tampered `Finished` `SignedData`).
 //!
 //! ## References
-//! - CWE-300: Channel Accessible by Non-Endpoint
-//!   <https://cwe.mitre.org/data/definitions/300.html>
-//! - CAPEC-94: Adversary in the Middle (AiTM)
-//!   <https://capec.mitre.org/data/definitions/94.html>
+//! - CWE-300: Channel Accessible by Non-Endpoint <https://cwe.mitre.org/data/definitions/300.html>
+//! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 //! - RFC 9846 (TLS 1.3) §4.4.3: transcript-bound CertificateVerify/Finished
 
 use std::sync::Arc;

@@ -1,47 +1,10 @@
 //! State machine infrastructure for TightBeam handshake protocol.
 //!
-//! This redesigned module provides role-specific handshake state machines
-//! with explicit terminal states, granular failure classification, and
-//! invariant enforcement hooks.
+//! Each role has its own states, and each protocol its own transition table.
+//! `Completed` is the one terminal state. A failed handshake is the error the
+//! orchestrator returns, and the transport's session reset discards it.
 
 use crate::transport::handshake::error::HandshakeError;
-
-// ---------------------------------------------------------------------------
-// Failure and Abort Classification
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-	Hello,
-	KeyExchange,
-	Finished,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AbortReason {
-	LocalPolicy,
-	Timeout(Phase),
-	PeerAbort,
-	Shutdown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureKind {
-	ProtocolViolation,
-	ReplayDetected,
-	DowngradeAttempt,
-	CertificateInvalid,
-	SignatureInvalid,
-	IntegrityMismatch,
-	DerDecodeError,
-	KeyDerivationError,
-	UnsupportedAlgorithm,
-	InternalError,
-}
-
-// ---------------------------------------------------------------------------
-// Role-Specific States
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ClientHandshakeState {
@@ -53,22 +16,12 @@ pub enum ClientHandshakeState {
 	ServerFinishedReceived,
 	ClientFinishedSent,
 	Completed,
-	Aborted(AbortReason),
-	Failed(FailureKind),
 }
 
 impl ClientHandshakeState {
+	/// Whether the handshake reached its one terminal state.
 	pub fn is_completed(&self) -> bool {
 		matches!(self, Self::Completed)
-	}
-	pub fn is_failed(&self) -> bool {
-		matches!(self, Self::Failed(_))
-	}
-	pub fn is_aborted(&self) -> bool {
-		matches!(self, Self::Aborted(_))
-	}
-	pub fn is_terminal(&self) -> bool {
-		self.is_completed() || self.is_failed() || self.is_aborted()
 	}
 }
 
@@ -82,28 +35,14 @@ pub enum ServerHandshakeState {
 	ServerFinishedSent,
 	ClientFinishedReceived,
 	Completed,
-	Aborted(AbortReason),
-	Failed(FailureKind),
 }
 
 impl ServerHandshakeState {
+	/// Whether the handshake reached its one terminal state.
 	pub fn is_completed(&self) -> bool {
 		matches!(self, Self::Completed)
 	}
-	pub fn is_failed(&self) -> bool {
-		matches!(self, Self::Failed(_))
-	}
-	pub fn is_aborted(&self) -> bool {
-		matches!(self, Self::Aborted(_))
-	}
-	pub fn is_terminal(&self) -> bool {
-		self.is_completed() || self.is_failed() || self.is_aborted()
-	}
 }
-
-// ---------------------------------------------------------------------------
-// Client State Machine
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct ClientStateMachine<F: HandshakeFlow> {
@@ -123,12 +62,12 @@ mod sealed {
 
 /// The handshake flow whose transition table a state machine enforces.
 ///
-/// One table per protocol, rather than their union. An ECIES machine cannot
-/// take a CMS-only transition and a CMS machine cannot take an ECIES-only one,
-/// so protocol confusion is refused by the type rather than avoided by the
-/// orchestrator driving a fixed sequence.
+/// Each protocol has its own table. An ECIES machine cannot take a CMS-only
+/// transition and a CMS machine cannot take an ECIES-only one, so the type
+/// refuses protocol confusion before the orchestrator has to avoid it by
+/// driving a fixed sequence.
 ///
-/// Sealed: the flows are the two this crate implements.
+/// The trait is sealed, because the flows are the two this crate implements.
 pub trait HandshakeFlow: sealed::Sealed {
 	/// Whether this flow permits a client to move `from` to `to`.
 	fn client_permits(from: ClientHandshakeState, to: ClientHandshakeState) -> bool;
@@ -157,8 +96,6 @@ impl HandshakeFlow for Cms {
 				| (KeyExchangeSent, ServerFinishedReceived)
 				| (ServerFinishedReceived, ClientFinishedSent)
 				| (ClientFinishedSent, Completed)
-				| (_, Aborted(_))
-				| (_, Failed(_))
 		)
 	}
 
@@ -170,8 +107,6 @@ impl HandshakeFlow for Cms {
 				| (KeyExchangeReceived, ServerFinishedSent)
 				| (ServerFinishedSent, ClientFinishedReceived)
 				| (ClientFinishedReceived, Completed)
-				| (_, Aborted(_))
-				| (_, Failed(_))
 		)
 	}
 }
@@ -185,8 +120,6 @@ impl HandshakeFlow for Ecies {
 				| (HelloSent, ServerHelloReceived)
 				| (ServerHelloReceived, KeyExchangeSent)
 				| (KeyExchangeSent, Completed)
-				| (_, Aborted(_))
-				| (_, Failed(_))
 		)
 	}
 
@@ -198,8 +131,6 @@ impl HandshakeFlow for Ecies {
 				| (ClientHelloReceived, ServerHelloSent)
 				| (ServerHelloSent, KeyExchangeReceived)
 				| (KeyExchangeReceived, Completed)
-				| (_, Aborted(_))
-				| (_, Failed(_))
 		)
 	}
 }
@@ -210,7 +141,7 @@ impl<F: HandshakeFlow> ClientStateMachine<F> {
 	}
 
 	pub fn transition(&mut self, to: ClientHandshakeState) -> Result<(), HandshakeError> {
-		if self.state.is_terminal() {
+		if self.state.is_completed() {
 			return Err(HandshakeError::InvalidState);
 		}
 		if F::client_permits(self.state, to) {
@@ -221,10 +152,6 @@ impl<F: HandshakeFlow> ClientStateMachine<F> {
 		}
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Server State Machine
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct ServerStateMachine<F: HandshakeFlow> {
@@ -244,7 +171,7 @@ impl<F: HandshakeFlow> ServerStateMachine<F> {
 	}
 
 	pub fn transition(&mut self, to: ServerHandshakeState) -> Result<(), HandshakeError> {
-		if self.state.is_terminal() {
+		if self.state.is_completed() {
 			return Err(HandshakeError::InvalidState);
 		}
 		if F::server_permits(self.state, to) {
@@ -255,10 +182,6 @@ impl<F: HandshakeFlow> ServerStateMachine<F> {
 		}
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -306,9 +229,8 @@ mod tests {
 		assert!(sm.transition(ServerHandshakeState::Completed).is_ok());
 	}
 
-	/// The union table accepted either protocol's moves from either machine.
-	/// A CMS client skipping its Finished exchange, or an ECIES client sending
-	/// a Finished it has no message for, is now refused by the table itself.
+	/// A CMS client that skips its Finished exchange, or an ECIES client that
+	/// sends a Finished it has no message for, is refused by the table itself.
 	#[test]
 	fn a_flow_refuses_the_other_protocols_transitions() {
 		let mut cms = ClientStateMachine::<Cms>::default();
@@ -334,18 +256,15 @@ mod tests {
 		assert!(ecies.transition(ServerHandshakeState::KeyExchangeReceived).is_err());
 	}
 
+	/// A completed handshake admits no further move, so a replayed message
+	/// cannot restart it.
 	#[test]
-	fn abort_and_failure_are_terminal() {
-		let mut sm = ClientStateMachine::<Ecies>::default();
-		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
-		assert!(sm.transition(ClientHandshakeState::Aborted(AbortReason::PeerAbort)).is_ok());
-		assert!(sm.state().is_aborted());
-		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_err());
-
-		let mut sm2 = ServerStateMachine::<Cms>::default();
-		assert!(sm2
-			.transition(ServerHandshakeState::Failed(FailureKind::ProtocolViolation))
-			.is_ok());
-		assert!(sm2.state().is_failed());
+	fn a_completed_handshake_is_terminal() {
+		let mut sm = ClientStateMachine::<Cms>::default();
+		assert!(sm.transition(ClientHandshakeState::KeyExchangeSent).is_ok());
+		assert!(sm.transition(ClientHandshakeState::ServerFinishedReceived).is_ok());
+		assert!(sm.transition(ClientHandshakeState::ClientFinishedSent).is_ok());
+		assert!(sm.transition(ClientHandshakeState::Completed).is_ok());
+		assert!(sm.transition(ClientHandshakeState::KeyExchangeSent).is_err());
 	}
 }

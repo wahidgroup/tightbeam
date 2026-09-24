@@ -1,7 +1,7 @@
-//! EnvelopedData builder for TightBeam CMS handshake.
+//! EnvelopedData builder for the TightBeam CMS handshake.
 //!
-//! Constructs complete CMS EnvelopedData messages with encrypted content using
-//! KeyAgreeRecipientInfo for key transport.
+//! The builder constructs complete CMS EnvelopedData messages with encrypted
+//! content, and uses KeyAgreeRecipientInfo for key transport.
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -19,22 +19,24 @@ use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::der::asn1::{Any, SetOfVec};
 use crate::oids::{DATA, ENVELOPED_DATA};
-use crate::random::{CryptoRngCore, OsRng};
+use crate::random::{generate_random_bytes, CryptoRngCore, OsRng};
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
 
 /// Builder for constructing CMS EnvelopedData messages.
 ///
-/// This combines:
-/// - KeyAgreeRecipientInfo (built via TightBeamKariBuilder)
-/// - Encrypted content (using AEAD cipher from provider)
-/// - Authenticated attributes
+/// The builder combines:
 ///
-/// # Example Flow
-/// 1. Generate or derive a CEK (content-encryption key)
-/// 2. Build KARI using TightBeamKariBuilder to wrap the CEK
-/// 3. Encrypt plaintext content with CEK using provider's AEAD
-/// 4. Wrap everything into EnvelopedData structure
+/// - a KeyAgreeRecipientInfo, built through [`TightBeamKariBuilder`],
+/// - content encrypted with the AEAD cipher of the provider, and
+/// - unprotected attributes.
+///
+/// # Example flow
+///
+/// 1. Generate or derive a CEK (content-encryption key).
+/// 2. Build the KARI with [`TightBeamKariBuilder`] to wrap the CEK.
+/// 3. Encrypt the plaintext content with the CEK through the AEAD of the provider.
+/// 4. Wrap everything into an EnvelopedData structure.
 pub struct TightBeamEnvelopedDataBuilder<P>
 where
 	P: CryptoProvider,
@@ -52,15 +54,16 @@ where
 {
 	/// Create a new EnvelopedData builder with the given KARI builder.
 	///
-	/// The KARI builder should be fully configured before passing it here,
-	/// including any custom KDF info via `with_kdf_info()` for interoperability.
+	/// Configure the KARI builder fully before passing it here, including any
+	/// custom KDF info through `with_kdf_info()` for interoperability.
 	pub fn new(kari_builder: TightBeamKariBuilder<P>) -> Self {
 		Self { kari_builder: Some(kari_builder), unprotected_attrs: Vec::new() }
 	}
 
 	/// Add an unprotected attribute to the EnvelopedData.
 	///
-	/// These attributes are not encrypted or authenticated.
+	/// The EnvelopedData carries these attributes without encryption or
+	/// authentication.
 	pub fn with_unprotected_attr(mut self, attr: HandshakeAttribute) -> Self {
 		self.unprotected_attrs.push(attr);
 		self
@@ -72,8 +75,6 @@ where
 		self.unprotected_attrs.extend(attrs);
 		self
 	}
-
-	// Helper methods
 
 	fn validate_builder_state(&self) -> Result<(), HandshakeError> {
 		if self.kari_builder.is_none() {
@@ -97,7 +98,7 @@ where
 		// Sort attributes for canonical DER encoding
 		self.unprotected_attrs.sort();
 
-		// Take ownership and convert to
+		// Take ownership and convert each attribute to an X.509 `Attribute`.
 		let attrs = core::mem::take(&mut self.unprotected_attrs);
 		let x509_attrs: Result<Vec<_>, der::Error> = attrs
 			.into_iter()
@@ -111,17 +112,26 @@ where
 		Ok(RecipientInfos::try_from(vec![recipient_info])?)
 	}
 
-	fn generate_nonce(rng: &mut dyn CryptoRngCore) -> Vec<u8> {
+	/// A content nonce sized to the negotiated AEAD cipher.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
+	fn generate_nonce(rng: &mut dyn CryptoRngCore) -> Result<Vec<u8>, HandshakeError> {
 		let mut nonce_bytes = vec![0u8; <P::AeadCipher as AeadCore>::NonceSize::USIZE];
-		rng.fill_bytes(&mut nonce_bytes);
-		nonce_bytes
+		generate_random_bytes(&mut nonce_bytes, Some(rng))?;
+		Ok(nonce_bytes)
 	}
 
-	/// Generate a random CEK sized to the negotiated AEAD cipher key length.
-	fn generate_cek(rng: &mut dyn CryptoRngCore) -> SecretSlice<u8> {
+	/// A random CEK sized to the negotiated AEAD cipher key length.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
+	fn generate_cek(rng: &mut dyn CryptoRngCore) -> Result<SecretSlice<u8>, HandshakeError> {
 		let mut cek = vec![0u8; <P::AeadCipher as KeySizeUser>::KeySize::USIZE];
-		rng.fill_bytes(&mut cek);
-		cek.into()
+		generate_random_bytes(&mut cek, Some(rng))?;
+		Ok(cek.into())
 	}
 
 	fn create_cipher_from_cek(cek_bytes: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
@@ -143,16 +153,20 @@ where
 	/// Build the complete EnvelopedData structure.
 	///
 	/// # Parameters
-	/// - `plaintext`: The content to encrypt
-	/// - `aad`: Optional additional authenticated data for AEAD cipher (currently unused)
-	/// - `rng`: Optional random number generator
+	///
+	/// - `plaintext`: the content to encrypt.
+	/// - `aad`: optional additional authenticated data for the AEAD cipher,
+	///   which the build ignores.
+	/// - `rng`: an optional random number generator.
 	///
 	/// # Returns
+	///
 	/// A complete CMS EnvelopedData structure with:
-	/// - Wrapped CEK in RecipientInfo
-	/// - Encrypted content
-	/// - Content encryption algorithm identifier
-	/// - Optional unprotected attributes
+	///
+	/// - the wrapped CEK in a RecipientInfo,
+	/// - the encrypted content,
+	/// - the content encryption algorithm identifier, and
+	/// - optional unprotected attributes.
 	pub fn build(
 		mut self,
 		plaintext: impl AsRef<[u8]>,
@@ -164,20 +178,21 @@ where
 		self.validate_builder_state()?;
 
 		// 2. Resolve the RNG once (defaulting to OsRng) then generate the CEK
-		//    sized to the negotiated AEAD cipher key length and a content nonce.
+		//    sized to the negotiated AEAD cipher key length and a content
+		//    nonce.
 		let mut os = OsRng;
 		let rng: &mut dyn CryptoRngCore = rng.unwrap_or(&mut os);
-		let cek = Self::generate_cek(rng);
-		let nonce = Self::generate_nonce(rng);
+		let cek = Self::generate_cek(rng)?;
+		let nonce = Self::generate_nonce(rng)?;
 
 		// 3. Build KARI with wrapped CEK
-		let recipient_info = cek.with(|cek_bytes| self.build_kari_with_cek(cek_bytes))??;
+		let recipient_info = cek.with(|cek_bytes| self.build_kari_with_cek(cek_bytes))?;
 
 		// 4. Encrypt plaintext with CEK
 		let encrypted_content = cek.with(|cek_bytes| {
 			let cipher = Self::create_cipher_from_cek(cek_bytes)?;
 			Self::encrypt_content_with_cipher(&cipher, plaintext, &nonce)
-		})??;
+		})?;
 
 		// 5. Build unprotected attributes
 		let unprotected_attrs = self.build_unprotected_attributes()?;
@@ -195,7 +210,7 @@ where
 		})
 	}
 
-	/// Build and wrap in ContentInfo structure.
+	/// Build the EnvelopedData and wrap it in a ContentInfo structure.
 	pub fn build_content_info(
 		self,
 		plaintext: impl AsRef<[u8]>,
@@ -209,15 +224,16 @@ where
 	}
 }
 
-/// Default implementation for secp256k1 + AES-256-GCM.
+/// Default implementation for secp256k1 and AES-256-GCM.
 impl TightBeamEnvelopedDataBuilder<DefaultCryptoProvider> {
 	/// Create a builder with default TightBeam settings.
 	///
-	/// Uses:
-	/// - secp256k1 for ECDH
-	/// - HKDF-SHA3-256 for KDF
-	/// - AES-256 key wrap for KEK
-	/// - AES-256-GCM for content encryption
+	/// The defaults are:
+	///
+	/// - secp256k1 for ECDH,
+	/// - HKDF-SHA3-256 for the KDF,
+	/// - AES-256 key wrap for the KEK, and
+	/// - AES-256-GCM for content encryption.
 	pub fn with_defaults(kari_builder: TightBeamKariBuilder<DefaultCryptoProvider>) -> Self {
 		Self::new(kari_builder)
 	}
@@ -228,6 +244,8 @@ mod tests {
 	use super::*;
 
 	mod enveloped_data {
+		use rand_core::{CryptoRng, Error as RandomError, RngCore};
+
 		use super::*;
 		use crate::der::asn1::OctetString;
 		use crate::der::{Decode, Encode};
@@ -259,6 +277,37 @@ mod tests {
 				.with_key_enc_alg(key_enc_alg)
 		}
 
+		/// A random source that refuses every draw. No real source can be made
+		/// to refuse on demand, so the refusal path needs this double.
+		struct DrainedRng;
+
+		impl RngCore for DrainedRng {
+			fn next_u32(&mut self) -> u32 {
+				0
+			}
+
+			fn next_u64(&mut self) -> u64 {
+				0
+			}
+
+			fn fill_bytes(&mut self, _dest: &mut [u8]) {}
+
+			fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), RandomError> {
+				Err(RandomError::new("the source is drained"))
+			}
+		}
+
+		impl CryptoRng for DrainedRng {}
+
+		/// A draw the random source refuses fails the build, rather than
+		/// leaving a zero key.
+		#[test]
+		fn a_refused_random_draw_fails_the_build() {
+			let builder = TightBeamEnvelopedDataBuilder::with_defaults(create_test_kari_builder());
+			let refused = builder.build(b"payload", None, Some(&mut DrainedRng));
+			assert!(matches!(refused, Err(HandshakeError::RandomGenerationFailed)));
+		}
+
 		#[test]
 		fn test_basic_enveloped_data() -> Result<(), Box<dyn core::error::Error>> {
 			// 1. Create test KARI builder
@@ -266,6 +315,7 @@ mod tests {
 			// 2. Build EnvelopedData
 			let plaintext = b"Hello, TightBeam!";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
+
 			// 3. Verify structure
 			let enveloped_data = builder.build(plaintext, None, None)?;
 			assert_eq!(enveloped_data.version, CmsVersion::V3);

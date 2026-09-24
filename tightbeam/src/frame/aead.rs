@@ -13,25 +13,25 @@ use crate::version::GatedField;
 use crate::{EncryptedContentInfo, Frame, TightBeamError};
 
 impl Frame {
-	/// Decrypt the message body and return the plaintext bytes.
-	/// This will consume the frame.
+	/// Decrypt the message body with `decryptor` and return the plaintext
+	/// bytes, consuming the frame.
 	///
-	/// # Arguments
-	/// * `decryptor` - The AEAD decryptor to use for decryption
+	/// # Plaintext
 	///
-	/// # Returns
-	/// The decrypted plaintext as a [`SecretSlice`] that zeroizes on drop. If
-	/// the frame was compressed, these bytes are still compressed and need to
-	/// be decompressed separately. A caller who must own the bytes opts out
-	/// explicitly, through [`ToInsecure::to_insecure`] for a buffer that still
-	/// wipes, or [`SecretSlice::into_boxed_slice`] to take the allocation.
+	/// The plaintext comes back as a [`SecretSlice`] that zeroizes on drop.
+	/// When the frame was compressed, these bytes are still compressed, and the
+	/// caller decompresses them separately. A caller who must own the bytes
+	/// takes them through [`ToInsecure::to_insecure`], a buffer that still
+	/// wipes.
 	///
 	/// [`ToInsecure::to_insecure`]: crate::crypto::secret::ToInsecure::to_insecure
 	///
 	/// # Errors
-	/// Returns an error if:
-	/// - The metadata doesn't contain encryption info (V0 metadata)
-	/// - Decryption fails
+	///
+	/// The method returns an error when:
+	///
+	/// - the metadata holds no encryption info (V0 metadata), or
+	/// - decryption fails.
 	pub fn decrypt_bytes(mut self, decryptor: &(impl Decryptor + ?Sized)) -> Result<SecretSlice<u8>> {
 		let mut encrypted_content_info = self
 			.metadata
@@ -47,23 +47,20 @@ impl Frame {
 		decryptor.decrypt_content(&encrypted_content_info)
 	}
 
-	/// Decrypt, decompress (if needed), and decode the message body into a
-	/// typed message T. This is a convenience method that combines
-	/// `decrypt_bytes`, `decompress`, and `decode`.
+	/// Decrypt, decompress when needed, and decode the message body into a
+	/// typed message `T`.
 	///
-	/// # Arguments
-	/// * `decryptor` - The AEAD decryptor to use for decryption
-	/// * `inflator` - Optional inflator for decompressing the data (required if compressed)
-	///
-	/// # Returns
-	/// The decrypted, decompressed, and decoded message of type T
+	/// The method combines [`Frame::decrypt_bytes`], `decompress`, and
+	/// `decode`. A compressed body requires an `inflator`.
 	///
 	/// # Errors
-	/// Returns an error if:
-	/// - The metadata doesn't contain encryption info (V0 metadata)
-	/// - Decryption fails
-	/// - Decompression fails (if compressed)
-	/// - Deserialization of the decrypted data fails
+	///
+	/// The method returns an error when:
+	///
+	/// - the metadata holds no encryption info (V0 metadata),
+	/// - decryption fails,
+	/// - decompression of a compressed body fails, or
+	/// - the decrypted data fails to deserialize.
 	pub fn decrypt<T>(mut self, decryptor: &(impl Decryptor + ?Sized), inflator: Option<&dyn Inflator>) -> Result<T>
 	where
 		T: Message,
@@ -73,16 +70,15 @@ impl Frame {
 	}
 
 	/// Decrypt the message body in place, turning an encrypted frame into
-	/// its cleartext equivalent.
+	/// its cleartext equivalent. On any error the frame is unchanged.
 	///
-	/// Frame-level `integrity` and `nonrepudiation` cover the encrypted
-	/// body and are left untouched. Verify them *before* calling
-	/// ([`Frame::verify_frame_integrity`], [`Frame::verify`]), because
-	/// they will no longer match afterwards. The message commitment in
-	/// `metadata.integrity` is the check that survives decryption
-	/// ([`Frame::verify_commitment_of`]).
+	/// # Verify first
 	///
-	/// On any error the frame is unchanged.
+	/// Frame-level `integrity` and `nonrepudiation` cover the encrypted body,
+	/// and this method leaves them untouched. Verify them *before* the call
+	/// ([`Frame::verify_frame_integrity`], [`Frame::verify`]), because they
+	/// stop matching afterwards. The message commitment in `metadata.integrity`
+	/// is the check that survives decryption ([`Frame::verify_commitment_of`]).
 	///
 	/// # Errors
 	///
@@ -113,15 +109,13 @@ impl Frame {
 			.ok_or(TightBeamError::MissingEncryptionInfo)?;
 		encrypted.encrypted_content = Some(OctetString::new(core::mem::take(&mut self.message))?);
 
-		let body = decryptor.decrypt_content(&encrypted).and_then(|plaintext| {
+		let body = decryptor.decrypt_content(&encrypted).and_then(|plaintext| match inflator {
+			// A compressed plaintext is inflated in place, so its buffer stays
+			// in the wrapper that wipes it.
+			Some(inflator) => plaintext.with(|compressed| inflator.decompress(compressed)),
 			// The frame owns its cleartext body once it is decrypted, so the
-			// buffer moves here. Exposing it as a wiping buffer instead would
-			// copy the whole body into the frame and leave the copy unwiped.
-			let plaintext = plaintext.into_boxed_slice()?;
-			match inflator {
-				Some(inflator) => inflator.decompress(&plaintext),
-				None => Ok(plaintext.into_vec()),
-			}
+			// buffer moves here and the frame wipes it when it drops.
+			None => Ok(plaintext.release()),
 		});
 
 		match body {
@@ -143,17 +137,17 @@ impl Frame {
 
 	/// Encrypt the frame message with the provided encryption key provider.
 	///
-	/// This method encrypts the message bytes using the provided encryption key
-	/// provider and stores the encrypted content info in the `confidentiality`
-	/// field. The encrypted bytes are stored in the `message` field. It is
-	/// useful if you require an async `EncryptingKeyProvider` and cannot
-	/// encrypt the frame synchronously (HSM, KMS, etc.).
+	/// Use it when an async `EncryptingKeyProvider`, such as an HSM or a KMS,
+	/// cannot encrypt the frame synchronously. On any error the frame is
+	/// unchanged. On success the method stores:
 	///
-	/// On any error the frame is unchanged.
+	/// - the encrypted content info in the `confidentiality` field, and
+	/// - the encrypted bytes in the `message` field.
 	///
 	/// # Parameters
-	/// - `provider`: An encryption key provider implementing the `EncryptingKeyProvider` trait
-	/// - `nonce_size`: The size of the nonce in bytes (e.g., 12 for AES-GCM)
+	///
+	/// - `provider`: an encryption key provider that implements the `EncryptingKeyProvider` trait.
+	/// - `nonce_size`: the size of the nonce in bytes, such as 12 for AES-GCM.
 	///
 	/// # Errors
 	///
@@ -189,23 +183,25 @@ impl Frame {
 
 	/// Decrypt the frame message with the provided encryption key provider.
 	///
-	/// This method extracts the nonce from the `confidentiality` field's
-	/// algorithm parameters and decrypts the message bytes using the provided
-	/// encryption key provider. The decrypted bytes are stored back in the
-	/// `message` field, and the `confidentiality` field is cleared. It is
-	/// useful if you require an async `EncryptingKeyProvider` and cannot
-	/// decrypt the frame synchronously (HSM, KMS, etc.).
+	/// Use it when an async `EncryptingKeyProvider`, such as an HSM or a KMS,
+	/// cannot decrypt the frame synchronously. On any error the frame is
+	/// unchanged. On success the method:
 	///
-	/// On any error the frame is unchanged.
+	/// 1. reads the nonce from the algorithm parameters of the `confidentiality` field,
+	/// 2. decrypts the message bytes with the provider,
+	/// 3. stores the plaintext back in the `message` field, and
+	/// 4. clears the `confidentiality` field.
 	///
 	/// # Parameters
-	/// - `provider`: An encryption key provider implementing the `EncryptingKeyProvider` trait
+	///
+	/// - `provider`: an encryption key provider that implements the `EncryptingKeyProvider` trait.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::MissingEncryptionInfo`] when the frame is not encrypted or names no nonce.
-	/// - [`TightBeamError::UnexpectedAlgorithm`] when the frame names an algorithm
-	///   other than the provider's.
+	/// - [`TightBeamError::MissingEncryptionInfo`] when the frame is not
+	///   encrypted or names no nonce.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when the frame names an
+	///   algorithm other than the provider's.
 	/// - Decryption errors from the provider.
 	pub async fn decrypt_with_provider<P>(&mut self, provider: &P) -> Result<()>
 	where
@@ -228,9 +224,10 @@ impl Frame {
 		let nonce_octet_string: OctetString = nonce_any.decode_as()?;
 		let nonce = nonce_octet_string.as_bytes();
 		// The frame owns its cleartext body once it is decrypted, so the
-		// buffer moves rather than being copied out of a wiping wrapper.
+		// buffer moves in without a copy out of a wiping wrapper.
 		let plaintext = provider.decrypt(nonce, &self.message).await?;
-		self.message = plaintext.into_boxed_slice()?.into_vec();
+
+		self.message = plaintext.release();
 		self.metadata.confidentiality = None;
 
 		Ok(())

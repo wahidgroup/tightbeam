@@ -10,8 +10,7 @@
 //!    through a frame-aware TCP relay.
 //! 2. The relay tampers with the client-to-server direction after the
 //!    handshake: either drops or duplicates the first encrypted envelope.
-//! 3. The server decrypts subsequent envelopes under the exact-next counter
-//!    discipline.
+//! 3. The server decrypts subsequent envelopes under the exact-next counter discipline.
 //!
 //! ## Expected control
 //! Exact-next counter nonces (RFC 9846 § 5.3) MUST fail closed:

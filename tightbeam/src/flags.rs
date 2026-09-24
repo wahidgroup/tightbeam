@@ -3,7 +3,7 @@
 //! [`Flags<N>`] stores N position-stable flag bytes and presents them through
 //! [`MatrixLike`] as the diagonal (r == c) of an N×N matrix, matching the
 //! profile convention documented on [`MatrixDyn`](crate::matrix::MatrixDyn):
-//! off-diagonal cells read as 0 and writes to them are no-ops.
+//! off-diagonal cells read as 0 and writes to them do nothing.
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -14,6 +14,8 @@ use crate::Errorizable;
 /// Why a byte slice could not become a [`Flags<N>`].
 #[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlagsError {
+	/// The slice length differs from `N`.
+	///
 	/// Flags are position-stable, so a slice of the wrong length names
 	/// different flags than the caller meant. Padding or truncating it would
 	/// silently change which flag each byte sets.
@@ -21,14 +23,13 @@ pub enum FlagsError {
 	LengthMismatch { expected: usize, len: usize },
 }
 
-/// A fixed-size array of flags, where each flag is a `u8`
+/// A fixed-size array of flags, where each flag is a `u8`.
 ///
-/// This struct provides a compile-time sized container for storing flag values.
-/// Each position in the array can hold a single `u8` flag value. The size `N`
-/// is determined at compile time, ensuring zero-cost abstractions.
+/// Each position in the array holds a single `u8` flag value. The size `N` is
+/// fixed at compile time, so the container is a zero-cost abstraction.
 ///
-/// The wire format bounds the dimension to 1..=255; constructing a flag set
-/// with `N` outside that range is rejected at compile time:
+/// The wire format bounds the dimension to 1..=255. A flag set with `N`
+/// outside that range fails to compile:
 ///
 /// ```compile_fail
 /// use tightbeam::flags::Flags;
@@ -39,11 +40,6 @@ pub enum FlagsError {
 pub struct Flags<const N: usize>([u8; N]);
 
 impl<const N: usize> Flags<N> {
-	/// Compile-time guard: the wire format bounds the dimension to 1..=255
-	/// (`MatrixLike::n` returns `u8`). Evaluated by every constructor so an
-	/// out-of-range `N` is rejected at monomorphization.
-	const VALID_N: () = assert!(N >= 1 && N <= 255, "Flags dimension must be 1..=255");
-
 	pub fn set_at(&mut self, pos: usize, value: u8) {
 		if pos < N {
 			self.0[pos] = value;
@@ -61,7 +57,7 @@ impl<const N: usize> Flags<N> {
 
 impl<const N: usize> Default for Flags<N> {
 	fn default() -> Self {
-		const { Self::VALID_N };
+		const { crate::matrix::assert_wire_dimension::<N>() };
 		Self([0u8; N])
 	}
 }
@@ -77,7 +73,7 @@ where
 	T: Into<u8>,
 {
 	fn from(arr: [T; N]) -> Self {
-		const { Self::VALID_N };
+		const { crate::matrix::assert_wire_dimension::<N>() };
 		let mut bytes = [0u8; N];
 		for (i, item) in arr.into_iter().enumerate() {
 			bytes[i] = item.into();
@@ -95,7 +91,7 @@ impl<const N: usize> TryFrom<&[u8]> for Flags<N> {
 	///   bytes. A shorter slice cannot say which flags it omits and a longer
 	///   one cannot say which to drop.
 	fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-		const { Self::VALID_N };
+		const { crate::matrix::assert_wire_dimension::<N>() };
 
 		let array: [u8; N] = bytes
 			.try_into()
@@ -111,27 +107,17 @@ impl<const N: usize> AsRef<[u8]> for Flags<N> {
 	}
 }
 
-/// Trait for types that can store and query flags of type T.
-///
-/// This trait provides a common interface for flag storage containers
-/// that can hold flags of a specific type and query their presence.
+/// Common interface for a flag store that sets, unsets, and queries flags of
+/// type `T`.
 pub trait FlagSet<T> {
-	/// Set a flag of type T in the flag set
-	///
-	/// # Arguments
-	/// * `flag` - The flag value to store
+	/// Store `flag` in the flag set.
 	fn set(&mut self, flag: T);
 
 	/// Unset a flag of type T by setting it to its default value.
 	fn unset(&mut self);
 
-	/// Check if a flag of type T is present in the flag set
-	///
-	/// # Arguments
-	/// * `flag` - The flag value to check for
-	///
-	/// # Returns
-	/// `true` if the flag is present, `false` otherwise
+	/// Return `true` when `flag` is present in the flag set, and `false`
+	/// otherwise.
 	fn contains(&self, flag: T) -> bool;
 }
 

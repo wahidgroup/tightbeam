@@ -39,7 +39,6 @@ use crate::transport::{
 	WireMode,
 };
 use crate::Frame;
-use crate::TightBeamError;
 
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
@@ -190,12 +189,12 @@ pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
+	/// The local address that the listener is bound to.
 	pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
 		self.listener.local_addr()
 	}
 
-	/// Bind a cleartext listener. `addr` accepts any type that converts via
-	/// [`AsRef<str>`].
+	/// Bind a cleartext listener on `addr`.
 	///
 	/// Accepted transports carry no confidentiality, integrity, or peer
 	/// authentication. See [`EndpointConfig::cleartext`].
@@ -266,7 +265,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TokioListe
 	}
 }
 
-// EncryptedMessageIO: operation methods only
+// `TcpTransport` takes the default of every `EncryptedMessageIO` method.
 #[cfg(feature = "x509")]
 impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
@@ -276,9 +275,9 @@ where
 {
 	/// Report whether the underlying stream still appears connected.
 	///
-	/// The liveness hook external protocols need to implement
-	/// [`PersistentConnection`]
-	/// for pooled connections; the stream itself is not exposed.
+	/// External protocols need this liveness hook to implement
+	/// [`PersistentConnection`] for pooled connections, and the stream itself
+	/// stays private.
 	pub fn is_alive(&self) -> bool {
 		AsyncProtocolStream::is_alive(&self.stream)
 	}
@@ -308,9 +307,9 @@ mod mux {
 ))]
 use mux::*;
 
-/// Async transports only: the mux plane needs split halves and spawned
-/// drivers, so advertising multiplexing anywhere else would negotiate a
-/// capability the endpoint cannot honor.
+/// Only async transports advertise multiplexing. The mux plane needs split
+/// halves and spawned drivers, so an advertisement anywhere else would
+/// negotiate a capability that the endpoint cannot honor.
 #[cfg(all(
 	feature = "x509",
 	feature = "transport-multiplex",
@@ -320,14 +319,16 @@ impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
-	/// Local mux advertisement bound into the handshake transcript; `None` advertises nothing.
+	/// Set the local mux advertisement, which the handshake transcript binds.
+	///
+	/// A `None` offer advertises nothing.
 	pub fn with_mux_offer(mut self, offer: impl IntoMuxOffer) -> Self {
 		self.state.offer_mux(offer.into_mux_offer());
 		self
 	}
 }
 
-/// Multiplexed plane assembled by [`TcpTransport::into_mux`].
+/// The multiplexed plane that [`TcpTransport::into_mux`] assembles.
 #[cfg(all(
 	feature = "x509",
 	feature = "transport-multiplex",
@@ -348,20 +349,24 @@ where
 	S: SplittableStream,
 	TransportError: From<S::Error>,
 {
-	/// Consume a handshaken transport into its multiplexed plane:
-	/// negotiated settings drive the assembly, in-band rekey wiring
-	/// attaches when the session carries a dual-signed receipt, and
-	/// the halves split for the mux drivers.
+	/// Consume a handshaken transport into its multiplexed plane.
 	///
-	/// Role-fixed: callers pass the endpoint role they are assembling.
-	/// Unlike the [`MuxConnector`] / `MuxAcceptor` pool traits, this
-	/// works for either role without the policy plane, so WebSocket
-	/// transports (native and wasm) assemble the same way.
+	/// - The negotiated settings drive the assembly.
+	/// - The in-band rekey context attaches when the session carries a dual-signed receipt.
+	/// - The halves split for the mux drivers.
+	///
+	/// # Role
+	///
+	/// The caller passes the endpoint role that it assembles. Unlike the
+	/// [`MuxConnector`] and `MuxAcceptor` pool traits, this method works for
+	/// either role without the policy plane, so WebSocket transports, native
+	/// and wasm, assemble the same way.
 	///
 	/// # Errors
-	/// - `InvalidState`: the peer did not negotiate multiplexing, or
-	///   the handshake has not completed
-	/// - rekey harvest / split failures from the underlying transport
+	///
+	/// - `InvalidState` when the peer did not negotiate multiplexing, or the
+	///   handshake has not completed.
+	/// - A rekey harvest or split failure from the underlying transport.
 	pub fn into_mux(mut self, role: MuxRole) -> TransportResult<SplitMuxTransport<S>> {
 		let Some(settings) = self.negotiated_mux() else {
 			return Err(TransportError::InvalidState);
@@ -444,8 +449,8 @@ where
 	type EnvelopeReader = TransportReader<S::ReadHalf>;
 	type EnvelopeWriter = TransportWriter<S::WriteHalf>;
 
-	/// Cleartext servers (no certificate) never handshake and never mux:
-	/// `Ok(None)` without touching the wire.
+	/// A cleartext server, which has no certificate, never handshakes and
+	/// never multiplexes, so it returns `Ok(None)` with no I/O.
 	async fn negotiate_mux(&mut self) -> TransportResult<Option<MuxSettings>> {
 		if !self.encryption().is_provisioned() {
 			return Ok(None);
@@ -453,8 +458,8 @@ where
 
 		while !matches!(self.state.phase(), SessionPhase::Encrypted(_)) {
 			match collect_step(self).await? {
-				CollectStep::Handshake(handshake_bytes) => {
-					self.perform_server_handshake(&handshake_bytes).await?;
+				CollectStep::Handshake(request) => {
+					self.perform_server_handshake(request).await?;
 				}
 				CollectStep::Envelope(_) => return Err(TransportError::InvalidState),
 			}
@@ -505,11 +510,12 @@ enum SplitSend {
 	Encrypted(SendCipher),
 }
 
-/// Exclusive receive half of a split transport.
+/// The exclusive receive half of a split transport.
 ///
-/// Carries the wire mode its session held when it split. An encrypted half
-/// owns the receive-direction cipher, so decryption needs no locks and can run
-/// concurrently with a [`TransportWriter`] on the same connection.
+/// It carries the wire mode that its session held when it split. An
+/// encrypted half owns the receive-direction cipher, so decryption needs no
+/// locks and can run concurrently with a [`TransportWriter`] on the same
+/// connection.
 #[cfg(feature = "x509")]
 pub struct TransportReader<R>
 where
@@ -518,8 +524,8 @@ where
 	stream: R,
 	mode: SplitRecv,
 	limits: TransportLimits,
-	/// Connection collector carried across the split (see
-	/// [`EnvelopeSource::trace`])
+	/// The connection collector carried across the split. See
+	/// [`EnvelopeSource::trace`].
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
 }
@@ -530,13 +536,16 @@ where
 	R: AsyncReadStream,
 	TransportError: From<R::Error>,
 {
-	/// Override the receive-direction renewal threshold counted down by
-	/// `remaining_records` ([RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5)).
+	/// Override the receive-direction renewal threshold that
+	/// `remaining_records` counts down ([RFC 9846 § 5.5][rfc9846-5.5]).
 	///
-	/// Trigger policy only: decryption refuses records at the AES-GCM volume bound
-	/// ([`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT))
-	/// regardless of this value. A cleartext half never rekeys, so the limit
-	/// does not apply to it.
+	/// The value sets trigger policy only. Decryption refuses records at the
+	/// AES-GCM volume bound ([`DEFAULT_REKEY_RECORD_LIMIT`]) whatever this
+	/// value is. A cleartext half never rekeys, so the limit does not apply to
+	/// it.
+	///
+	/// [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
+	/// [`DEFAULT_REKEY_RECORD_LIMIT`]: crate::constants::DEFAULT_REKEY_RECORD_LIMIT
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		if let SplitRecv::Encrypted(cipher) = self.mode {
 			self.mode = SplitRecv::Encrypted(cipher.with_rekey_limit(limit));
@@ -576,16 +585,14 @@ where
 			(SplitRecv::Encrypted(_), WireEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
 			(SplitRecv::Encrypted(recv_key), WireEnvelope::Encrypted(encrypted_info)) => {
 				let decrypted_bytes = recv_key.decrypt_content(&encrypted_info)?;
-				let decoded = decrypted_bytes.with(decode_transport_envelope).map_err(TightBeamError::from)?;
-
-				let envelope = decoded?;
+				let envelope = decrypted_bytes.with(|bytes| decode_transport_envelope(bytes))?;
 				Ok(envelope)
 			}
 		}
 	}
 
-	/// Records still readable before the receive cipher demands a rekey. A
-	/// cleartext half never demands one.
+	/// The number of records still readable before the receive cipher demands
+	/// a rekey. A cleartext half never demands one, so it reports `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
 		match &self.mode {
 			SplitRecv::Cleartext => u64::MAX,
@@ -593,12 +600,13 @@ where
 		}
 	}
 
-	/// Swap in the new epoch's receive cipher; its fresh counter resets
-	/// the sequence discipline (NIST SP 800-38D § 8.2.1: counter nonces
-	/// restart only with a fresh key). The configured renewal threshold
-	/// carries over so a tightened rekey cadence survives every epoch.
+	/// Swap in the new epoch's receive cipher.
 	///
-	/// A cleartext half holds no keys, so it refuses the install.
+	/// The fresh counter resets the sequence discipline, because counter
+	/// nonces restart only with a fresh key (NIST SP 800-38D § 8.2.1). The
+	/// configured renewal threshold carries over, so a tightened rekey cadence
+	/// survives every epoch. A cleartext half holds no keys, so it refuses the
+	/// install.
 	fn install_recv_cipher(&mut self, cipher: RecvCipher) -> TransportResult<()> {
 		let SplitRecv::Encrypted(current) = &self.mode else {
 			return Err(TransportError::MissingEncryption);
@@ -615,12 +623,12 @@ where
 	}
 }
 
-/// Exclusive send half of a split transport.
+/// The exclusive send half of a split transport.
 ///
-/// Carries the wire mode its session held when it split. An encrypted half
-/// owns the send-direction cipher and its counter nonce, so encryption needs
-/// no locks and can run concurrently with a [`TransportReader`] on the same
-/// connection.
+/// It carries the wire mode that its session held when it split. An
+/// encrypted half owns the send-direction cipher and its counter nonce, so
+/// encryption needs no locks and can run concurrently with a
+/// [`TransportReader`] on the same connection.
 #[cfg(feature = "x509")]
 pub struct TransportWriter<W>
 where
@@ -628,12 +636,12 @@ where
 {
 	stream: W,
 	mode: SplitSend,
-	/// Every ceiling carried across the split, matching the unsplit path: a
-	/// peer that never drains its receive buffer cannot pin the writer task
-	/// forever (CWE-400).
+	/// Every ceiling carried across the split, as on the unsplit path. A peer
+	/// that never drains its receive buffer cannot pin the writer task forever
+	/// (CWE-400).
 	limits: TransportLimits,
-	/// Connection collector carried across the split (see
-	/// [`EnvelopeSink::trace`])
+	/// The connection collector carried across the split. See
+	/// [`EnvelopeSink::trace`].
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
 }
@@ -645,8 +653,11 @@ where
 	TransportError: From<W::Error>,
 {
 	/// Override the send cipher's rekey record limit
-	/// ([RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5)).
+	/// ([RFC 9846 § 5.5][rfc9846-5.5]).
+	///
 	/// A cleartext half never rekeys, so the limit does not apply to it.
+	///
+	/// [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		if let SplitSend::Encrypted(cipher) = self.mode {
 			self.mode = SplitSend::Encrypted(cipher.with_rekey_limit(limit));
@@ -683,8 +694,8 @@ where
 		Ok(())
 	}
 
-	/// Records still writable before the send cipher demands a rekey. A
-	/// cleartext half never demands one.
+	/// The number of records still writable before the send cipher demands a
+	/// rekey. A cleartext half never demands one, so it reports `u64::MAX`.
 	fn remaining_records(&self) -> u64 {
 		match &self.mode {
 			SplitSend::Cleartext => u64::MAX,
@@ -692,12 +703,13 @@ where
 		}
 	}
 
-	/// Swap in the new epoch's send cipher; its fresh counter resets
-	/// the sequence discipline (NIST SP 800-38D § 8.2.1: counter nonces
-	/// restart only with a fresh key). The configured record limit
-	/// carries over so a tightened rekey cadence survives every epoch.
+	/// Swap in the new epoch's send cipher.
 	///
-	/// A cleartext half holds no keys, so it refuses the install.
+	/// The fresh counter resets the sequence discipline, because counter
+	/// nonces restart only with a fresh key (NIST SP 800-38D § 8.2.1). The
+	/// configured record limit carries over, so a tightened rekey cadence
+	/// survives every epoch. A cleartext half holds no keys, so it refuses the
+	/// install.
 	fn install_send_cipher(&mut self, cipher: SendCipher) -> TransportResult<()> {
 		let SplitSend::Encrypted(current) = &self.mode else {
 			return Err(TransportError::MissingEncryption);
@@ -714,7 +726,7 @@ where
 	}
 }
 
-/// Read/write halves produced by [`TcpTransport::into_split`].
+/// The read and write halves that [`TcpTransport::into_split`] produces.
 #[cfg(feature = "x509")]
 pub type SplitTransport<S> = (
 	TransportReader<<S as SplittableStream>::ReadHalf>,
@@ -739,12 +751,12 @@ where
 	///   NO confidentiality, integrity, replay, or deletion protection.
 	///
 	/// The operation deadline carries onto both halves and bounds every read
-	/// and write, exactly like the unsplit path: an idle or byte-dripping peer
+	/// and write, as on the unsplit path. An idle or byte-dripping peer
 	/// surfaces as `DeadlineExceeded` instead of pinning the driver task.
 	///
 	/// # Errors
 	///
-	/// - `InvalidState`: the session is provisioned for encryption and its
+	/// - `InvalidState` when the session is provisioned for encryption and its
 	///   handshake has not completed.
 	pub fn into_split(mut self) -> TransportResult<SplitTransport<S>> {
 		let (recv_mode, send_mode) = match self.state.phase() {
@@ -785,8 +797,8 @@ where
 
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioListener<P> {
-	/// Delegates to the inherent accept so both entry points install the
-	/// full listener state.
+	/// This delegates to the inherent accept, so both entry points install
+	/// the full listener state.
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		#[cfg(feature = "x509")]
 		{
@@ -796,7 +808,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for TokioList
 	}
 }
 
-// Generates the TcpTransport struct definition and common implementations
+// The macro generates the `TcpTransport` struct and its common
+// implementations.
 crate::impl_tcp_common!(TcpTransport, AsyncProtocolStream);
 
 impl<S: AsyncProtocolStream> MessageIO for TcpTransport<S>
@@ -810,7 +823,7 @@ where
 	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 		// An unauthenticated handshake read gets the tight handshake ceiling.
 		// An established session gets the larger of the two envelope ceilings,
-		// because the wire form is not known until the bytes are parsed.
+		// because the encoded form is unknown until the bytes are parsed.
 		#[cfg(feature = "x509")]
 		let cap = if self.is_handshake_pending() {
 			self.limits.handshake_wire
@@ -920,7 +933,8 @@ where
 		&self.emitter_gate
 	}
 
-	/// Protocol-specific send/receive with handshake and timeout
+	/// Complete the handshake, then run one emit cycle under the operation
+	/// deadline.
 	async fn perform_send_receive(
 		&mut self,
 		message: Frame,
@@ -949,9 +963,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for TokioLi
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {
-		// Best-effort graceful shutdown
-		// TCP connections will be fully closed when transport drops
-		// tokio TcpStream doesn't provide a shutdown method and relies on Drop
+		// Shutdown is best-effort. The tokio `TcpStream` relies on `Drop`, so
+		// the connection closes fully when the transport drops.
 	}
 }
 
@@ -983,8 +996,10 @@ mod tests {
 	#[cfg(feature = "x509")]
 	use crate::policy::TransitStatus;
 
-	/// Serve one single-flight request: collect, apply `reply` to an
-	/// accepted frame, answer with the gate's status.
+	/// Serve one single-flight request.
+	///
+	/// The helper collects the request, applies `reply` to an accepted frame,
+	/// and answers with the gate's status.
 	#[cfg(feature = "x509")]
 	async fn respond_with<T, F>(transport: &mut T, reply: F) -> TransportResult<()>
 	where
@@ -1002,6 +1017,8 @@ mod tests {
 	}
 
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
+	use crate::crypto::ecies::EciesError;
+	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	use crate::policy::SessionContext;
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	use crate::transport::policy::CollectorGateConfig;
@@ -1011,10 +1028,11 @@ mod tests {
 		use super::super::*;
 		use crate::crypto::aead::RuntimeAead;
 		use crate::testing::{TestFrame, TestKey};
+		use crate::TightBeamError;
 
 		const PLAINTEXT: &[u8] = b"epoch boundary traffic";
 
-		/// Frame stream that discards writes and yields nothing.
+		/// A frame stream that discards writes and yields nothing.
 		struct NullStream;
 
 		impl AsyncReadStream for NullStream {
@@ -1083,8 +1101,8 @@ mod tests {
 			send_key(&writer).encrypt_next(PLAINTEXT, None)?;
 			assert_eq!(writer.remaining_records(), 0);
 
-			// Fresh key, reset counter, preserved record policy: the
-			// configured limit survives the install.
+			// The install brings a fresh key and a reset counter, and the
+			// configured record limit survives it.
 			let fresh_send = SendCipher::new(test_runtime());
 			writer.install_send_cipher(fresh_send)?;
 			assert_eq!(writer.remaining_records(), 1);
@@ -1106,9 +1124,9 @@ mod tests {
 			assert!(replay.is_err());
 			assert_eq!(reader.remaining_records(), 1);
 
-			// Fresh key is the only restart of the exact-next counter
-			// (NIST SP 800-38D § 8.2.1). The renewal threshold survives
-			// the install.
+			// Only a fresh key restarts the exact-next counter
+			// (NIST SP 800-38D § 8.2.1). The renewal threshold survives the
+			// install.
 			let fresh_recv = RecvCipher::new(test_runtime());
 			reader.install_recv_cipher(fresh_recv)?;
 
@@ -1514,8 +1532,8 @@ mod tests {
 
 	// The gossip colony gate reads the peer certificate before any
 	// request is disclosed (CWE-668), so the deferred single-flight
-	// handshake must be drivable on its own: it populates the peer
-	// certificate, sends no application frame, and repeats as a no-op.
+	// handshake must be drivable on its own. It populates the peer
+	// certificate and sends no application frame, and a repeat does nothing.
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	#[tokio::test]
 	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {
@@ -1574,7 +1592,9 @@ mod tests {
 		assert!(matches!(emitted, Err(TransportError::ConnectionClosed)));
 		assert!(matches!(
 			served,
-			Err(TransportError::HandshakeError(HandshakeError::KeyDerivationFailed(_)))
+			Err(TransportError::HandshakeError(HandshakeError::EciesError(
+				EciesError::DecryptionFailed(_)
+			)))
 		));
 		Ok(())
 	}
@@ -1594,6 +1614,7 @@ mod tests {
 			aad_domain_tag: DOMAIN_TAG,
 			..EncryptionConfig::unconfigured()
 		};
+
 		let mut transport = client_over(client_stream, encryption);
 		transport.emit(TestFrame::v0(None, None), None).await?;
 

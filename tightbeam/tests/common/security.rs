@@ -26,8 +26,8 @@ use tightbeam::{
 	TightBeamError,
 };
 
-/// Build the standard testing error used by threat scenarios to signal that an
-/// insecure outcome was observed (turns into a spec `ModeMismatch`).
+/// Build the standard testing error that threat scenarios use to signal an
+/// observed insecure outcome, which becomes a spec `ModeMismatch`.
 pub fn expectation_failure(reason: &'static str) -> TightBeamError {
 	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
 		field: "security_threat",
@@ -229,7 +229,7 @@ mod receipt_fixtures {
 			})
 		}
 
-		/// Calls the `settle` hook has received so far.
+		/// Return the number of calls the `settle` hook has received so far.
 		pub fn settle_calls(&self) -> usize {
 			self.settle_calls.load(Ordering::SeqCst)
 		}
@@ -308,16 +308,16 @@ mod receipt_fixtures {
 ))]
 pub use receipt_fixtures::*;
 
-/// Baseline mutually authenticated CMS pair shared by the loopback,
-/// receipt, and security threat suites: each layers its own offers,
-/// hooks, or policies on top instead of re-wiring the identities.
+/// Baseline mutually authenticated CMS pair that the loopback, receipt, and
+/// security threat suites share. Each suite layers its own offers, hooks,
+/// or policies on top and reuses the identities.
 #[cfg(feature = "transport-cms")]
 mod cms_pair {
 	use std::sync::Arc;
 
 	use tightbeam::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
-	use tightbeam::crypto::x509::policy::CertificateValidation;
 	use tightbeam::transport::handshake::negotiation::SecurityOffer;
+	use tightbeam::transport::handshake::PeerAuthentication;
 	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 	use tightbeam::x509::Certificate;
 	use tightbeam::TightBeamError;
@@ -333,15 +333,17 @@ mod cms_pair {
 		pub client_certificate: Arc<Certificate>,
 	}
 
-	/// Build the pair: the client offers `client_profiles` and pins the
-	/// server certificate; the server supports `server_profiles`, runs
-	/// `validators` against the fresh client certificate, and holds that
-	/// certificate for mutual authentication.
+	/// Build the pair.
+	///
+	/// - The client offers `client_profiles` and pins the server certificate.
+	/// - The server supports `server_profiles`, runs `validators` against the
+	///   fresh client certificate, and holds that certificate for mutual
+	///   authentication.
 	pub fn cms_handshake_pair(
 		materials: &ServerMaterials,
 		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		peer_authentication: PeerAuthentication,
 	) -> Result<CmsHandshakePair, TightBeamError> {
 		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
 		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
@@ -363,7 +365,7 @@ mod cms_pair {
 		// processes, as it does in production. Seeding it here would test a
 		// server that already knows what the handshake is meant to establish.
 		let provider = Arc::clone(&materials.key_provider);
-		let server = CmsHandshakeServer::<DefaultCryptoProvider>::new(provider, validators)
+		let server = CmsHandshakeServer::<DefaultCryptoProvider>::new(provider, peer_authentication)
 			.with_supported_profiles(server_profiles);
 
 		Ok(CmsHandshakePair { client, server, client_certificate })
@@ -371,7 +373,8 @@ mod cms_pair {
 }
 
 // Consumers (loopback, receipt fixtures, security threats) sit behind
-// wider feature gates, so lean combos compile the fixture unused.
+// wider feature gates, so a narrow feature combination compiles the
+// fixture unused.
 #[allow(unused_imports)]
 #[cfg(feature = "transport-cms")]
 pub use cms_pair::*;
@@ -385,6 +388,7 @@ mod cms_fixtures {
 	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportAuthorizer, TransportOffer};
 	use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
+	use tightbeam::transport::handshake::PeerAuthentication;
 	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 	use tightbeam::TightBeamError;
 
@@ -414,8 +418,9 @@ mod cms_fixtures {
 	) -> Result<CmsSessionPair, TightBeamError> {
 		let profile = default_security_profile();
 		let offer = TransportOffer::mux(4).with_budgets(request);
-		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
-		let pair = cms_handshake_pair(materials, vec![profile], vec![profile], Some(validators))?;
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let pair =
+			cms_handshake_pair(materials, vec![profile], vec![profile], PeerAuthentication::mutual([validator]))?;
 
 		let mut client = pair.client.with_transport_offer(offer.to_owned());
 		if let Some(approver) = hooks.approver {

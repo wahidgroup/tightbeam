@@ -12,9 +12,9 @@
 //!
 //! ## Expected control
 //! The answer MUST travel in an `EnvelopedData` encrypted to the server
-//! certificate (RFC 5652 s6), which keeps it off the cleartext wire. The server MUST
-//! decrypt it, verify the countersignature over the plaintext, settle,
-//! and retain the identical dual-signed receipt on both endpoints.
+//! certificate (RFC 5652 s6), which keeps it off the cleartext wire. The
+//! server MUST decrypt it, verify the countersignature over the plaintext,
+//! settle, and retain the identical dual-signed receipt on both endpoints.
 //!
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data
@@ -135,20 +135,20 @@ tb_scenario! {
 
 			// Full budget-bearing handshake including the receipt
 			// acknowledgement.
-			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?.to_der()?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
-			let server_finished = server.build_server_finished().await?.to_der()?;
+			let server_finished = server.build_server_finished().await?;
 			client.process_server_finished(&server_finished)?;
 
-			let client_finished = client.build_client_finished().await?.to_der()?;
+			let client_finished = client.build_client_finished().await?;
 			server.process_client_finished(&client_finished)?;
 			server.process_receipt_ack(&client_finished).await?;
 
 			// The plaintext answer MUST stay out of the cleartext
 			// client Finished bytes: it travels in an EnvelopedData encrypted
 			// to the server certificate.
-			let response_leaked = contains_window(&client_finished, RESPONSE);
+			let response_leaked = contains_window(client_finished.to_der()?, RESPONSE);
 			trace.event_with(
 				RESPONSE_CONFIDENTIAL_ON_WIRE,
 				&[],

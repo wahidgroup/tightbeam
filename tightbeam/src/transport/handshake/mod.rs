@@ -1,15 +1,16 @@
-//! TightBeam handshake protocols for establishing secure communication channels.
+//! TightBeam handshake protocols that establish secure communication channels.
 //!
 //! This module implements two handshake protocols:
-//! - **ECIES-based**: Lightweight elliptic curve integrated encryption
-//! - **CMS-based**: Full X.509 PKI with signed/enveloped data
 //!
-//! Both protocols establish authenticated, encrypted sessions and support
-//! cryptographic algorithm negotiation between client and server.
+//! - **ECIES-based**: lightweight elliptic curve integrated encryption.
+//! - **CMS-based**: full X.509 PKI with signed and enveloped data.
+//!
+//! Both protocols establish authenticated, encrypted sessions and negotiate
+//! the cryptographic algorithms between client and server.
 //!
 //! # Protocol Capabilities
 //!
-//! TightBeam provides security with flexible deployment options:
+//! The handshake provides these capabilities:
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────────────────────────────┐
@@ -86,53 +87,58 @@
 //! (Trait Obj) = Runtime dispatch
 //! ```
 //!
-//! ## Cryptographic Negotiation
+//! ## Cryptographic negotiation
 //!
-//! Both protocols support negotiation via `SecurityOffer` (client) and
-//! `SecurityAccept` (server) messages. This allows endpoints to agree on:
-//! - Digest algorithm (e.g., SHA3-256)
-//! - AEAD cipher (e.g., AES-256-GCM)
-//! - Signature algorithm (e.g., ECDSA-with-SHA3-256)
-//! - Key wrapping algorithm (for CMS)
+//! Both protocols negotiate through a `SecurityOffer` from the client and a
+//! `SecurityAccept` from the server. The endpoints agree on these algorithms:
 //!
-//! ### ECIES Protocol Negotiation
+//! - The digest algorithm, such as SHA3-256.
+//! - The AEAD cipher, such as AES-256-GCM.
+//! - The signature algorithm, such as ECDSA-with-SHA3-256.
+//! - The key wrapping algorithm, for CMS.
 //!
-//! ECIES implements full wire-level negotiation:
-//! - Client sends `SecurityOffer` in `ClientHello` message
-//! - Server selects compatible profile from client's offer
-//! - Server responds with `SecurityAccept` in `ServerHandshake` message
-//! - Client validates server's selection matches offered profiles
-//! - Both endpoints admit a profile only when it names the algorithms their
-//!   provider runs ([`negotiation::RunnableProfile`])
+//! ### ECIES negotiation
 //!
-//! ### CMS Protocol Negotiation
+//! ECIES negotiates inside its handshake messages:
 //!
-//! CMS implements wire-level negotiation via EnvelopedData unprotected attributes:
-//! - Client sends `SecurityOffer` in KeyExchange EnvelopedData unprotected attributes
-//! - Server extracts offer and selects compatible profile using `select_profile()`
-//! - Server stores selected profile (accessible via handshake state)
-//! - If no offer provided, server uses first configured profile
+//! 1. The client sends a `SecurityOffer` in the `ClientHello` message.
+//! 2. The server selects a compatible profile from the client's offer.
+//! 3. The server responds with a `SecurityAccept` in the `ServerHandshake` message.
+//! 4. The client validates that the server's selection matches an offered profile.
 //!
-//! The server uses `with_supported_profiles()` to configure acceptable
-//! profiles. Only a configured profile that names the provider's algorithms
-//! is eligible. If no profile is eligible when an offer is received,
-//! negotiation fails.
+//! Both endpoints admit a profile only when it names the algorithms their
+//! provider runs ([`negotiation::RunnableProfile`]).
 //!
-//! ## State Machine
+//! ### CMS negotiation
 //!
-//! Handshakes follow a strict state machine to prevent protocol violations.
+//! CMS negotiates through the `EnvelopedData` unprotected attributes:
+//!
+//! 1. The client sends a `SecurityOffer` in the unprotected attributes of its key exchange.
+//! 2. The server extracts the offer and selects a compatible profile with `select_profile()`.
+//! 3. The server stores the selected profile, which the handshake state exposes.
+//!
+//! Without an offer, the server uses its first configured profile. The server
+//! configures acceptable profiles with `with_supported_profiles()`, and only a
+//! configured profile that names the provider's algorithms is eligible. When
+//! an offer arrives and no profile is eligible, negotiation fails.
+//!
+//! ## State machine
+//!
+//! Handshakes follow a strict state machine that refuses protocol violations.
 //! Each role machine is deliberately the *union* of the ECIES and CMS message
-//! flows. The orchestrator owns selecting the correct sequence for its
-//! protocol (see [`state`]):
-//! - **Client**: Init -> HelloSent -> ServerHelloReceived -> KeyExchangeSent ->
-//!   ServerFinishedReceived -> ClientFinishedSent -> Completed, with ECIES
-//!   short-circuits Init -> KeyExchangeSent and KeyExchangeSent -> Completed
-//! - **Server**: Init -> ClientHelloReceived -> ServerHelloSent ->
-//!   KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived ->
-//!   Completed, with the matching ECIES short-circuits
-//! - Any non-terminal state may classify to the Aborted or Failed terminals
+//! flows, and the orchestrator selects the correct sequence for its protocol
+//! (see [`state`]). An invalid state transition returns
+//! `HandshakeError::InvalidState`.
 //!
-//! Invalid state transitions return `HandshakeError::InvalidState`.
+//! ```text
+//! Client: Init -> HelloSent -> ServerHelloReceived -> KeyExchangeSent
+//!           -> ServerFinishedReceived -> ClientFinishedSent -> Completed
+//!         ECIES short-circuits: Init -> KeyExchangeSent, KeyExchangeSent -> Completed
+//!
+//! Server: Init -> ClientHelloReceived -> ServerHelloSent -> KeyExchangeReceived
+//!           -> ServerFinishedSent -> ClientFinishedReceived -> Completed
+//!         ECIES short-circuits: the matching server transitions
+//! ```
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -148,6 +154,7 @@ pub(crate) use std::sync::Arc;
 mod attributes;
 mod common;
 mod error;
+mod peer;
 mod utils;
 #[cfg(all(
 	feature = "transport-multiplex",
@@ -185,6 +192,9 @@ pub mod processors;
 pub use crate::crypto::aead::DirectionalCiphers;
 pub use common::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 pub use error::HandshakeError;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) use peer::AdmittedPeer;
+pub use peer::PeerAuthentication;
 pub(crate) use utils::aes_256_gcm_algorithm;
 
 #[cfg(all(
@@ -222,7 +232,8 @@ use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
 use crate::crypto::aead::SessionKeys;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
-use crate::crypto::x509::policy::CertificateValidation;
+#[cfg(feature = "transport-ecies")]
+use crate::der::asn1::OctetStringRef;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Any, Decode, Encode, Enumerated, Sequence, Tag};
 use crate::oids::{CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA};
@@ -232,6 +243,7 @@ use crate::transport::handshake::negotiation::{
 	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
 use crate::transport::handshake::receipt::StoredReceipt;
+use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::Beamable;
 
@@ -261,9 +273,7 @@ use cms::*;
 #[cfg(feature = "transport-ecies")]
 mod ecies {
 	pub use crate::cms::signed_data::SignerInfo;
-	pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
 	pub use crate::crypto::sign::SignatureEncoding;
-	pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
 	pub use crate::transport::handshake::server::EciesHandshakeServer;
 }
 
@@ -277,79 +287,25 @@ mod x509 {
 
 	#[cfg(feature = "secp256k1")]
 	pub use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[cfg(feature = "transport-cms")]
 	pub use crate::transport::state::ClientIdentity;
 }
 
 #[cfg(feature = "x509")]
 use x509::*;
 
-/// Server-side key operations for handshake protocols.
-///
-/// This trait provides a factory interface for creating protocol-specific
-/// handshake orchestrators. Each implementation encapsulates a signing key
-/// and creates concrete servers that borrow the key, ensuring zero-copy key
-/// management and proper encapsulation.
-#[cfg(feature = "x509")]
-pub trait ServerHandshakeKey: Send + Sync {
-	/// ECIES server orchestrator borrowing the encapsulated signing key.
-	fn create_ecies_server(
-		&self,
-		server_cert: Arc<Certificate>,
-		aad_domain_tag: Option<&'static [u8]>,
-		supported_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<BoxedServerHandshake>;
-
-	/// ECIES client orchestrator borrowing the encapsulated signing key.
-	fn create_ecies_client(
-		self: &Arc<Self>,
-		server_cert: Option<Arc<Certificate>>,
-		client_cert: Option<Arc<Certificate>>,
-		aad_domain_tag: Option<&'static [u8]>,
-		validator: Option<Arc<dyn CertificateValidation>>,
-	) -> Result<BoxedClientHandshake>;
-
-	/// Create a CMS client handshake orchestrator.
-	///
-	/// The orchestrator borrows the encapsulated signing key, ensuring zero-copy
-	/// key management and proper encapsulation.
-	///
-	/// # Returns
-	/// A CMS client handshake orchestrator that borrows the encapsulated key
-	#[cfg(feature = "transport-cms")]
-	fn create_cms_client(self: &Arc<Self>, config: CmsClientConfig) -> Result<BoxedClientHandshake>;
-
-	/// Create a CMS server handshake orchestrator.
-	///
-	/// The orchestrator borrows the encapsulated signing key, ensuring zero-copy
-	/// key management and proper encapsulation.
-	///
-	/// # Parameters
-	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
-	/// - `supported_profiles`: Security profiles for negotiation
-	///
-	/// # Returns
-	/// A CMS server handshake orchestrator that borrows the encapsulated key
-	#[cfg(feature = "transport-cms")]
-	fn create_cms_server(
-		&self,
-		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-		supported_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-	) -> Result<BoxedServerHandshake>;
-}
-
 /// Provisioned server identity for a CMS client handshake.
 ///
-/// The session key is encrypted to the identity's leaf certificate, so it
-/// must be supplied up front rather than learned from the wire.
+/// The client encrypts the session key to the identity's leaf certificate.
 #[cfg(feature = "transport-cms")]
 pub enum CmsServerIdentity {
 	/// A bare server certificate, evaluated directly against the trust store.
 	Certificate(Arc<Certificate>),
 	/// Full server chain, ordered root to leaf. Path validation runs over the
-	/// chain ([RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1))
-	/// and the leaf becomes the encryption target.
+	/// chain per [RFC 5280 §6.1][rfc5280-6.1], and the leaf becomes the
+	/// encryption target.
+	///
+	/// [rfc5280-6.1]: https://datatracker.ietf.org/doc/html/rfc5280#section-6.1
 	Chain(Arc<[Certificate]>),
 }
 
@@ -369,15 +325,15 @@ impl From<Arc<[Certificate]>> for CmsServerIdentity {
 
 /// Configuration for a CMS client handshake orchestrator.
 ///
-/// CMS is a key-transport handshake: the client encrypts the session key to
+/// CMS is a key-transport handshake. The client encrypts the session key to
 /// the server's public key in its first message, so the server identity must
-/// be provisioned up front rather than learned from the wire.
+/// be provisioned up front instead of learned from the peer.
 #[cfg(feature = "transport-cms")]
 pub struct CmsClientConfig {
 	/// The provisioned server identity the session key is encrypted to.
 	pub server_identity: CmsServerIdentity,
-	/// Trust store that authenticates the server identity. Mandatory:
-	/// a CMS handshake without a trust store cannot authenticate anyone
+	/// Trust store that authenticates the server identity. It is mandatory,
+	/// because a CMS handshake without a trust store authenticates no one
 	/// (CWE-295).
 	pub trust_store: Arc<dyn CertificateTrust>,
 	/// Profiles offered to the server for negotiation.
@@ -394,12 +350,12 @@ pub struct CmsClientConfig {
 
 /// Encapsulated server key manager for handshake protocols.
 ///
-/// This struct encapsulates a key provider and provides factory methods to create
-/// handshake orchestrators that use the provider for cryptographic operations,
-/// ensuring proper encapsulation and enabling HSM/KMS integration.
+/// The manager holds a key provider and creates the handshake orchestrators
+/// that use it for cryptographic operations, so the provider can sit on an
+/// HSM or a KMS.
 ///
-/// The key material is never exposed through the public API - orchestrators
-/// get shared ownership via Arc cloning.
+/// The key material stays behind the provider, and orchestrators share the
+/// provider through `Arc` clones.
 #[cfg(feature = "x509")]
 pub struct HandshakeKeyManager<P: CryptoProvider> {
 	provider: Arc<dyn SigningKeyProvider>,
@@ -440,7 +396,7 @@ impl<P: CryptoProvider> HandshakeKeyManager<P> {
 	/// The signing key provider this manager was built from.
 	///
 	/// An endpoint that signs control frames reads the provider from the
-	/// manager that already holds it, rather than keeping a second handle.
+	/// manager that already holds it, instead of keeping a second handle.
 	pub fn provider(&self) -> &dyn SigningKeyProvider {
 		self.provider.as_ref()
 	}
@@ -452,9 +408,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		Self { provider, _phantom: PhantomData }
 	}
 
-	/// Shared handle to the encapsulated signing provider, for
-	/// post-handshake signers (in-band epoch renewals). The key
-	/// material itself stays behind the provider abstraction.
+	/// Shared handle to the encapsulated signing provider for post-handshake
+	/// signers, such as in-band epoch renewals. The key material stays behind
+	/// the provider abstraction.
 	#[cfg(all(
 		feature = "transport-multiplex",
 		any(feature = "transport-cms", feature = "transport-ecies")
@@ -463,7 +419,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		Arc::clone(&self.provider)
 	}
 
-	/// ECIES server orchestrator via the encapsulated key provider.
+	/// Creates an ECIES server orchestrator on the encapsulated key provider.
 	#[cfg(feature = "transport-ecies")]
 	#[allow(clippy::too_many_arguments)]
 	pub fn create_ecies_server(
@@ -471,7 +427,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<&'static [u8]>,
 		supported_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
-		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		peer_authentication: PeerAuthentication,
 		transport_config: Option<TransportOffer>,
 		transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
 		session_observer: Option<Arc<dyn SessionObserver>>,
@@ -487,7 +443,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	{
 		let supported_profiles: Vec<SecurityProfileDesc> = supported_profiles.into_iter().collect();
 		let provider = Arc::clone(&self.provider);
-		let mut server = EciesHandshakeServer::<P>::new(provider, server_cert, aad_domain_tag, client_validators);
+		let mut server = EciesHandshakeServer::<P>::new(provider, server_cert, aad_domain_tag, peer_authentication);
 		server = server.with_supported_profiles(supported_profiles);
 
 		if let Some(config) = transport_config {
@@ -503,46 +459,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		Ok(Box::new(server))
 	}
 
-	/// ECIES client orchestrator via the encapsulated key provider.
-	#[cfg(feature = "transport-ecies")]
-	pub fn create_ecies_client<M>(
-		self: &Arc<Self>,
-		_server_cert: Option<Arc<Certificate>>,
-		client_cert: Option<Arc<Certificate>>,
-		aad_domain_tag: Option<&'static [u8]>,
-		validator: Option<Arc<dyn CertificateValidation>>,
-		transport_offer: Option<TransportOffer>,
-		receipt_approver: Option<Arc<dyn ReceiptApprover>>,
-	) -> Result<BoxedClientHandshake>
-	where
-		M: EciesMessageOps + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EciesPublicKeyOps,
-		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
-		P::Signature: SignatureEncoding + Send + Sync + 'static,
-		for<'b> P::Signature: TryFrom<&'b [u8]>,
-		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
-		P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + Send + Sync + 'static,
-		P::AeadCipher: KeyInit + Send + Sync + 'static,
-	{
-		let identity = client_cert.map(|cert| ClientIdentity::new(cert, Arc::clone(self)));
-		let mut client = EciesHandshakeClient::<P, M>::new_with_identity(aad_domain_tag, identity);
-		if let Some(validator) = validator {
-			client = client.with_certificate_validator(validator);
-		}
-		if let Some(offer) = transport_offer {
-			client = client.with_transport_offer(offer);
-		}
-		if let Some(approver) = receipt_approver {
-			client = client.with_receipt_approver(approver);
-		}
-
-		Ok(Box::new(client))
-	}
-
-	/// CMS client orchestrator via the encapsulated key provider (HSM/KMS-safe).
+	/// Creates a CMS client orchestrator on the encapsulated key provider, so
+	/// it works with an HSM or a KMS key.
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_client(self: &Arc<Self>, config: CmsClientConfig) -> Result<BoxedClientHandshake>
 	where
@@ -583,11 +501,12 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		Ok(Box::new(client))
 	}
 
-	/// CMS server orchestrator via the encapsulated key provider (HSM/KMS-safe).
+	/// Creates a CMS server orchestrator on the encapsulated key provider, so
+	/// it works with an HSM or a KMS key.
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_server(
 		&self,
-		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		peer_authentication: PeerAuthentication,
 		supported_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
 		transport_config: Option<TransportOffer>,
 		transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
@@ -605,7 +524,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		let supported_profiles: Vec<SecurityProfileDesc> = supported_profiles.into_iter().collect();
 		let provider = Arc::clone(&self.provider);
 
-		let mut server = CmsHandshakeServer::<P>::new(provider, client_validators);
+		let mut server = CmsHandshakeServer::<P>::new(provider, peer_authentication);
 		server = server.with_supported_profiles(supported_profiles);
 
 		if let Some(config) = transport_config {
@@ -622,25 +541,28 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	}
 }
 
+/// Alert code an endpoint sends to abort a handshake.
 #[derive(Enumerated, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HandshakeAlert {
-	/// Client authentication required but missing certificate/signature
+	/// The server requires client authentication, and the certificate or
+	/// signature is missing.
 	AuthRequired = 1,
-	/// Protocol version mismatch between client and server
+	/// The client and server protocol versions differ.
 	VersionMismatch = 2,
-	/// Algorithm (profile OID) mismatch
+	/// The algorithms (profile OIDs) of the two endpoints differ.
 	AlgorithmMismatch = 3,
-	/// Decryption failure (ECIES / AEAD)
+	/// Decryption failed (ECIES or AEAD).
 	DecryptFail = 4,
-	/// Finished (transcript hash) MAC/signature verification failure
+	/// The MAC or signature over the Finished transcript hash failed
+	/// verification.
 	FinishedIntegrityFail = 5,
-	// Code 6 is burned: it briefly named a settlement-rejected alert that
-	// never shipped. Do not reuse. The next alert takes 7 so archived
-	// captures never decode a stale meaning
+	// Code 6 is reserved, because an unreleased build used it for a
+	// settlement-rejected alert. Do not reuse it. The next alert takes 7, so
+	// archived captures never decode a stale meaning.
 }
 
-/// A handshake message travels the wire in one of two CMS containers.
+/// A handshake message travels in one of two CMS containers.
 ///
 /// ECIES carries its own message types inside a container, so its messages
 /// are decoded from one. The CMS handshake exchanges the containers
@@ -648,57 +570,65 @@ pub enum HandshakeAlert {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HandshakeMessage {
 	/// Carries an ECIES `ClientHello` or `ServerHandshake`, or a CMS Finished.
-	SignedData(Box<SignedData>),
+	SignedData(Box<WireDer<SignedData>>),
 	/// Carries an ECIES `ClientKeyExchange`, or a CMS key exchange.
-	EnvelopedData(Box<EnvelopedData>),
+	EnvelopedData(Box<WireDer<EnvelopedData>>),
 }
 
 impl HandshakeMessage {
-	/// The signed container.
+	/// Returns the signed container.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds the
 	///   key-transport container, which this step refuses.
-	pub fn signed(self) -> CoreResult<SignedData, HandshakeError> {
+	pub fn signed(self) -> CoreResult<WireDer<SignedData>, HandshakeError> {
 		match self {
 			Self::SignedData(signed) => Ok(*signed),
 			Self::EnvelopedData(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
-	/// The key-transport container.
+	/// Returns the key-transport container.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::UnexpectedContainer`] -- the message holds the
 	///   signed container, which this step refuses.
-	pub fn enveloped(self) -> CoreResult<EnvelopedData, HandshakeError> {
+	pub fn enveloped(self) -> CoreResult<WireDer<EnvelopedData>, HandshakeError> {
 		match self {
 			Self::EnvelopedData(enveloped) => Ok(*enveloped),
 			Self::SignedData(_) => Err(HandshakeError::UnexpectedContainer),
 		}
 	}
 
-	/// The DER form of the message, as the transport puts it on the wire.
-	pub fn to_der(&self) -> CoreResult<Vec<u8>, HandshakeError> {
+	/// The DER bytes of the message, exactly as sent or received.
+	pub fn der(&self) -> &[u8] {
 		match self {
-			Self::SignedData(signed) => Ok(signed.to_der()?),
-			Self::EnvelopedData(enveloped) => Ok(enveloped.to_der()?),
+			Self::SignedData(signed) => signed.der(),
+			Self::EnvelopedData(enveloped) => enveloped.der(),
 		}
 	}
+}
 
-	/// Length of the DER form, computed without building the buffer.
-	///
-	/// A length beyond the target's `usize` range saturates to [`usize::MAX`],
-	/// so it exceeds every ceiling and the message is refused.
-	pub fn encoded_len(&self) -> CoreResult<usize, HandshakeError> {
-		let len = match self {
-			Self::SignedData(signed) => signed.encoded_len()?,
-			Self::EnvelopedData(enveloped) => enveloped.encoded_len()?,
-		};
+/// Wraps a signed container this endpoint built, encoded once for sending.
+impl TryFrom<SignedData> for HandshakeMessage {
+	type Error = HandshakeError;
 
-		Ok(usize::try_from(u32::from(len)).unwrap_or(usize::MAX))
+	fn try_from(signed: SignedData) -> CoreResult<Self, Self::Error> {
+		let signed = WireDer::new(signed)?;
+		Ok(Self::SignedData(Box::new(signed)))
+	}
+}
+
+/// Wraps a key-transport container this endpoint built, encoded once for
+/// sending.
+impl TryFrom<EnvelopedData> for HandshakeMessage {
+	type Error = HandshakeError;
+
+	fn try_from(enveloped: EnvelopedData) -> CoreResult<Self, Self::Error> {
+		let enveloped = WireDer::new(enveloped)?;
+		Ok(Self::EnvelopedData(Box::new(enveloped)))
 	}
 }
 
@@ -731,8 +661,8 @@ impl EstablishedSession {
 	///
 	/// Epoch materials serve a rekey alone, and a rekey re-signs against the
 	/// session receipt and the peer identity. A session missing either can
-	/// never renew, so its epoch secret is released here rather than held,
-	/// unreachable, for as long as the session lives.
+	/// never renew, so this constructor releases its epoch secret instead of
+	/// holding it, unreachable, for the life of the session.
 	#[cfg(any(test, feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) fn new(
 		keys: SessionKeys,
@@ -807,9 +737,10 @@ impl EstablishedSession {
 /// `Send` is required on every target except `wasm32`, where the
 /// single-threaded executor lets JS-backed signing providers participate.
 pub trait ClientHandshakeProtocol: MaybeSend {
+	/// Error the orchestrator returns, convertible into a [`TransportError`].
 	type Error: Into<TransportError> + Send;
 
-	/// Start the handshake, returns the first message to send to the server.
+	/// Start the handshake and return the first message for the server.
 	#[allow(clippy::type_complexity)]
 	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<HandshakeMessage, Self::Error>>;
 
@@ -832,9 +763,11 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 	#[cfg(feature = "aead")]
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
+	/// Returns `true` when the handshake is complete.
 	fn is_complete(&self) -> bool;
 
-	/// Negotiated algorithm OIDs after profile negotiation; `None` before accept.
+	/// Negotiated algorithm OIDs after profile negotiation, or `None` before
+	/// the accept.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
 }
 
@@ -846,6 +779,7 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 /// `Send` is required on every target except `wasm32`, where the
 /// single-threaded executor lets JS-backed signing providers participate.
 pub trait ServerHandshakeProtocol: MaybeSend {
+	/// Error the orchestrator returns, convertible into a [`TransportError`].
 	type Error: Into<TransportError> + Send;
 
 	/// Handle a request from the client.
@@ -867,10 +801,11 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 	#[cfg(feature = "aead")]
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
-	/// Returns true if the handshake is complete.
+	/// Returns `true` when the handshake is complete.
 	fn is_complete(&self) -> bool;
 
-	/// Negotiated algorithm OIDs after profile negotiation; `None` before accept.
+	/// Negotiated algorithm OIDs after profile negotiation, or `None` before
+	/// the accept.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
 }
 
@@ -882,7 +817,7 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 #[cfg(not(target_arch = "wasm32"))]
 pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>;
 
-/// Boxed client handshake orchestrator (`wasm32`: `Send` relaxed).
+/// Boxed client handshake orchestrator for `wasm32`, which relaxes `Send`.
 #[cfg(target_arch = "wasm32")]
 pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + 'static>;
 
@@ -894,23 +829,22 @@ pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol<Error = Handshak
 #[cfg(not(target_arch = "wasm32"))]
 pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>;
 
-/// Boxed server handshake orchestrator (`wasm32`: `Send + Sync` relaxed).
+/// Boxed server handshake orchestrator for `wasm32`, which relaxes
+/// `Send + Sync`.
 #[cfg(target_arch = "wasm32")]
 pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + 'static>;
 
 /// Specifies which handshake protocol to use (ECIES or CMS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HandshakeProtocolKind {
-	/// Use ECIES-based handshake (default, lighter weight)
+	/// ECIES-based handshake, the default and the lighter option.
 	#[default]
 	Ecies,
 	/// CMS-based handshake (X.509 signed/enveloped data).
 	///
-	/// Key-transport handshake: the client encrypts the session key to the
-	/// server's leaf certificate in its first message, so a trust store and
-	/// a provisioned server certificate chain are mandatory on the client.
-	/// Missing either fails closed, as does selecting this kind without the
-	/// `transport-cms` feature.
+	/// It is a key-transport handshake, so the client MUST provision a trust
+	/// store and the server certificate chain. A missing one fails closed, and
+	/// so does this kind without the `transport-cms` feature.
 	Cms,
 }
 
@@ -919,10 +853,11 @@ pub enum HandshakeProtocolKind {
 pub struct ClientHello {
 	/// 32-byte anti-replay nonce mixed into the key derivation.
 	pub client_random: OctetString,
+	/// Security profiles the client offers for negotiation.
 	#[asn1(optional = "true")]
 	pub security_offer: Option<SecurityOffer>,
-	/// Transport capability offer (multiplexing). Context-tagged so it can
-	/// never be confused with the preceding optional SEQUENCE.
+	/// Transport capability offer for multiplexing. The context tag keeps it
+	/// distinct from the preceding optional SEQUENCE.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub transport_offer: Option<TransportOffer>,
 }
@@ -939,31 +874,37 @@ pub struct ServerHandshake {
 	/// Server signature over the transcript so far, proving possession
 	/// of the certificate's private key.
 	pub signature: OctetString,
+	/// Profile the server selected. It travels with the bytes the server
+	/// encoded, so both endpoints bind one encoding into the transcript.
 	#[asn1(optional = "true")]
-	pub security_accept: Option<SecurityAccept>,
-	/// Indicates if the server requires client certificate for mutual authentication.
-	/// When true, client must provide certificate in ClientKeyExchange.
+	pub security_accept: Option<WireDer<SecurityAccept>>,
+	/// `true` when the server requires a client certificate for mutual
+	/// authentication. The client must then provide its certificate in the
+	/// [`ClientKeyExchange`].
 	pub client_cert_required: bool,
-	/// Transport capability accept (multiplexing). Present only when the
-	/// client offered and the server enabled multiplexing locally.
+	/// Transport capability accept for multiplexing. Present only when the
+	/// client offered and the server enabled multiplexing locally. It travels
+	/// with the bytes the server encoded, so both endpoints bind one encoding
+	/// into the transcript.
 	#[asn1(context_specific = "0", optional = "true")]
-	pub transport_accept: Option<TransportAccept>,
-	/// Server-signed session receipt artifact for budget-bearing
-	/// sessions: a CMS `SignedData`
-	/// ([RFC 5652 §5](https://datatracker.ietf.org/doc/html/rfc5652#section-5))
-	/// whose `eContent` is the receipt body (transcript hash, granted
-	/// budgets, settlement challenge) and whose single `SignerInfo` is
-	/// the server's signature over it.
+	pub transport_accept: Option<WireDer<TransportAccept>>,
+	/// Server-signed session receipt artifact for a budget-bearing session.
+	///
+	/// The artifact is a CMS `SignedData` ([RFC 5652 §5][rfc5652-5]). Its
+	/// `eContent` is the receipt body with the transcript hash, the granted
+	/// budgets, and the settlement challenge. Its single `SignerInfo` is the
+	/// server's signature over that body.
+	///
+	/// [rfc5652-5]: https://datatracker.ietf.org/doc/html/rfc5652#section-5
 	#[asn1(context_specific = "1", optional = "true")]
 	pub session_receipt: Option<SignedData>,
 }
 
 /// Confidential plaintext of the ECIES key exchange.
 ///
-/// Decrypted only by the server: carries the base session key, the
-/// anti-replay client random, and the client's receipt
-/// countersignature (whose signed attributes bind the bearer
-/// settlement answer).
+/// Only the server decrypts it. It carries the base session key, the
+/// anti-replay client random, and the client's receipt countersignature,
+/// whose signed attributes bind the bearer settlement answer.
 #[cfg(feature = "transport-ecies")]
 #[derive(Clone, Sequence)]
 pub(crate) struct EciesSessionPayload {
@@ -983,13 +924,15 @@ pub struct ClientKeyExchange {
 	/// Key-exchange payload encrypted to the server: the ECIES session
 	/// payload or a CMS `EnvelopedData`, per the negotiated protocol.
 	pub encrypted_data: OctetString,
-	/// Optional client certificate for mutual authentication.
-	/// Included when server indicates client_cert in ServerHandshake.
+	/// Client certificate for mutual authentication. The client includes it
+	/// when the [`ServerHandshake`] sets `client_cert_required`.
 	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]
 	pub client_certificate: Option<Certificate>,
-	/// Signature over the handshake transcript (ClientHello || ServerHandshake || encrypted_data)
-	/// proving possession of the client certificate's private key.
+	/// Signature over the handshake transcript, which proves possession of
+	/// the client certificate's private key.
+	///
+	/// The transcript is `ClientHello || ServerHandshake || encrypted_data`.
 	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]
 	pub client_signature: Option<OctetString>,
@@ -998,7 +941,6 @@ pub struct ClientKeyExchange {
 fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 	let message_der = message.to_der()?;
 	let octet_string = OctetString::new(message_der)?;
-	// Create der::Any directly from the OctetString's DER encoding
 	let econtent = Any::new(Tag::OctetString, octet_string.to_der()?)?;
 
 	Ok(SignedData {
@@ -1011,19 +953,37 @@ fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 	})
 }
 
-fn signed_data_to_decodable<T: for<'a> Decode<'a>>(signed_data: &SignedData) -> Result<T> {
-	let econtent_any = signed_data
-		.encap_content_info
-		.econtent
-		.as_ref()
-		.ok_or(HandshakeError::InvalidServerKeyExchange)?;
-
-	let octet_string_der = econtent_any.value();
-	let octet_string = OctetString::from_der(octet_string_der)?;
-	Ok(T::from_der(octet_string.as_bytes())?)
+/// Access to the ECIES message a `SignedData` tunnels.
+///
+/// The step that reads the message decodes it from these bytes and binds the
+/// same bytes into its transcript, so the message is parsed once and hashed as
+/// it arrived.
+#[cfg(feature = "transport-ecies")]
+pub(crate) trait TunneledMessage {
+	/// The DER of the tunneled message, as it arrived.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidServerKeyExchange`] -- the container carries no content.
+	/// - [`HandshakeError`] -- the content is not an OCTET STRING, so decoding failed.
+	fn tunneled_der(&self) -> Result<&[u8]>;
 }
 
-/// Convert ClientHello to SignedData (opaque wrapper)
+#[cfg(feature = "transport-ecies")]
+impl TunneledMessage for SignedData {
+	fn tunneled_der(&self) -> Result<&[u8]> {
+		let econtent = self
+			.encap_content_info
+			.econtent
+			.as_ref()
+			.ok_or(HandshakeError::InvalidServerKeyExchange)?;
+		let octets = OctetStringRef::from_der(econtent.value())?;
+
+		Ok(octets.as_bytes())
+	}
+}
+
+/// Wraps a [`ClientHello`] in an opaque `SignedData`.
 impl TryFrom<&ClientHello> for SignedData {
 	type Error = HandshakeError;
 
@@ -1032,30 +992,12 @@ impl TryFrom<&ClientHello> for SignedData {
 	}
 }
 
-/// Extract ClientHello from SignedData
-impl TryFrom<&SignedData> for ClientHello {
-	type Error = HandshakeError;
-
-	fn try_from(signed_data: &SignedData) -> CoreResult<Self, Self::Error> {
-		signed_data_to_decodable(signed_data)
-	}
-}
-
-/// Convert ServerHandshake to SignedData (opaque wrapper)
+/// Wraps a [`ServerHandshake`] in an opaque `SignedData`.
 impl TryFrom<&ServerHandshake> for SignedData {
 	type Error = HandshakeError;
 
 	fn try_from(handshake: &ServerHandshake) -> CoreResult<Self, Self::Error> {
 		encodable_to_signed_data(handshake)
-	}
-}
-
-/// Extract ServerHandshake from SignedData
-impl TryFrom<&SignedData> for ServerHandshake {
-	type Error = HandshakeError;
-
-	fn try_from(signed_data: &SignedData) -> CoreResult<Self, Self::Error> {
-		signed_data_to_decodable(signed_data)
 	}
 }
 
@@ -1128,7 +1070,8 @@ struct ClientKeyExchangeAttrs {
 	signature: Option<OctetString>,
 }
 
-/// Convert ClientKeyExchange to EnvelopedData (opaque wrapper for ECIES ciphertext)
+/// Wraps a [`ClientKeyExchange`] in an opaque `EnvelopedData` that carries
+/// the ECIES ciphertext.
 impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 	type Error = HandshakeError;
 
@@ -1150,7 +1093,7 @@ impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 	}
 }
 
-/// Extract ClientKeyExchange from EnvelopedData
+/// Extracts a [`ClientKeyExchange`] from an `EnvelopedData`.
 impl TryFrom<&EnvelopedData> for ClientKeyExchange {
 	type Error = HandshakeError;
 

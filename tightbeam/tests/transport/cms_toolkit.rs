@@ -1,9 +1,11 @@
 //! Integration tests for the public CMS toolkit.
 //!
-//! Exercises the toolkit end to end through public interfaces only:
-//! KARI CEK wrap/unwrap, `EnvelopedData` sealing and decryption via the
-//! builder/processor pair, and `SignedData` signing and verification,
-//! including the failure paths a consumer relies on.
+//! The tests exercise the toolkit end to end through public interfaces
+//! only, including the failure paths a consumer relies on:
+//!
+//! - KARI CEK wrap and unwrap,
+//! - `EnvelopedData` sealing and decryption through the builder and processor pair, and
+//! - `SignedData` signing and verification.
 
 #![cfg(all(
 	feature = "transport-cms",
@@ -100,7 +102,7 @@ tb_scenario! {
 
 			let unwrapped =
 				kari_unwrap(&provider, &recipient, &sender.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &wrapped)?;
-			assert_eq!(unwrapped.as_slice(), cek.as_slice(), "recipient must recover the exact CEK");
+			assert_eq!(unwrapped.to_insecure().as_slice(), cek.as_slice(), "recipient must recover the exact CEK");
 
 			trace.event(CEK_RECOVERED)?;
 
@@ -171,7 +173,7 @@ tb_scenario! {
 
 			let kari = TightBeamKariRecipient::with_defaults(recipient);
 			let processor = TightBeamEnvelopedDataProcessor::with_defaults(kari);
-			let recovered = processor.process(&envelope)?.to_insecure()?;
+			let recovered = processor.process(&envelope)?.to_insecure();
 			assert_eq!(&recovered[..], plaintext.as_slice(), "recipient must recover the sealed plaintext");
 
 			trace.event(CONTENT_RECOVERED)?;

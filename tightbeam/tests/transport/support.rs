@@ -1,4 +1,4 @@
-//! Transport integration test plumbing.
+//! Shared helpers for the transport integration tests.
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -15,18 +15,16 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
-#[cfg(feature = "transport-multiplex")]
-use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-use tightbeam::der::{Decode, Encode};
+use tightbeam::der::Decode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::TestFrame;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
 use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
-use tightbeam::transport::handshake::HandshakeKeyManager;
+use tightbeam::transport::handshake::{HandshakeKeyManager, HandshakeMessage};
 use tightbeam::transport::state::EncryptedProtocolState;
 use tightbeam::transport::state::SessionPhase;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
@@ -40,13 +38,15 @@ use tightbeam::Frame;
 use tightbeam::TightBeamError;
 
 #[cfg(feature = "transport-multiplex")]
+use tightbeam::crypto::policy::Secp256k1Policy;
+#[cfg(feature = "transport-multiplex")]
 use tightbeam::transport::handshake::receipt::StoredReceipt;
 
 #[cfg(feature = "transport-multiplex")]
 use crate::common::poll::poll_until;
 use crate::common::security::{expectation_failure, pinning_validator, ClientMaterials, ServerMaterials};
 
-/// Reads a transport wait takes: every 5 ms for 2 s.
+/// Number of reads a transport wait takes, one every 5 ms for 2 s.
 #[cfg(feature = "transport-multiplex")]
 const TRANSPORT_WAIT_ATTEMPTS: u32 = 400;
 
@@ -99,9 +99,9 @@ pub fn mux_offer(cap: u32) -> TransportOffer {
 	TransportOffer::mux(cap)
 }
 
-/// Record an event outcome from a spawned task, where no `Result` return exists
-/// for `?`. A recording failure panics the task, and the spec then surfaces it
-/// as the missing event.
+/// Record an event outcome from a spawned task, where no `Result` return
+/// exists for `?`. A recording failure panics the task, and the spec then
+/// surfaces it as the missing event.
 pub fn record_spawned_event(trace: &TraceCollector, urn: Urn<'static>, value: bool) {
 	trace.event_with(urn, &[], value).expect("spawned task must record its event");
 }
@@ -177,25 +177,34 @@ pub async fn connect_mutual_client(
 /// Optional per-session hooks for mutual-auth handshakes.
 #[derive(Default)]
 pub struct MutualSessionHooks {
+	/// Transport authorizer that the server installs, when set.
 	pub authorizer: Option<Arc<dyn TransportAuthorizer>>,
+	/// Receipt approver that the client installs, when set.
 	pub approver: Option<Arc<dyn ReceiptApprover>>,
+	/// Session observer that the server notifies, when set.
 	pub observer: Option<Arc<dyn SessionObserver>>,
-	/// Attached to both endpoints: production instrumentation emits
-	/// session labels for spec assertions.
+	/// Trace collector attached to both endpoints, whose production
+	/// instrumentation emits session labels for spec assertions.
 	pub trace: Option<TraceCollector>,
 }
 
 /// Established mutual-auth transports plus peer identities for receipt
 /// verification.
 pub struct MutualTransports {
+	/// Established client transport.
 	pub client: TcpTransport<TokioStream>,
+	/// Established server transport.
 	pub server: TcpTransport<TokioStream>,
+	/// Certificate the server presented.
 	pub server_certificate: Arc<Certificate>,
+	/// Certificate the client presented.
 	pub client_certificate: Arc<Certificate>,
 }
 
-/// Budget-bearing sessions require client countersignature over session
-/// receipt.
+/// Establish a mutual-auth client and server transport pair.
+///
+/// A budget-bearing session requires a client countersignature over the
+/// session receipt.
 pub async fn establish_mutual_transports(
 	client_offer: TransportOffer,
 	server_offer: TransportOffer,
@@ -259,8 +268,8 @@ pub async fn serve_one_handshake_message(transport: &mut TcpTransport<TokioStrea
 		WireEnvelope::Encrypted(_) => return Err(expectation_failure("handshake containers must be cleartext")),
 	};
 
-	let handshake_bytes = envelope.to_der()?;
-	transport.perform_server_handshake(&handshake_bytes).await?;
+	let request = HandshakeMessage::try_from(envelope)?;
+	transport.perform_server_handshake(request).await?;
 	Ok(())
 }
 

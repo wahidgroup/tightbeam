@@ -128,7 +128,8 @@ macro_rules! flagset {
 		impl ::core::convert::TryFrom<Option<Vec<u8>>> for $name {
 			type Error = $crate::flags::FlagsError;
 
-			/// Absence is the default set. Present bytes must name the set exactly.
+			/// Absence is the default set. Present bytes must name the set
+			/// exactly.
 			///
 			/// # Errors
 			///
@@ -162,26 +163,37 @@ macro_rules! flagset {
 			}
 		}
 
-		// MatrixDyn -> FlagSet (read diagonal; ignore off-diagonals; clamp to min(n, N))
-		impl From<$crate::matrix::MatrixDyn> for $name {
-			fn from(m: $crate::matrix::MatrixDyn) -> Self {
-				Self::from(&m)
+		// A flag set reads a matrix's diagonal. Each flag is positional, so a
+		// matrix whose dimension is not the flag count is refused.
+		impl ::core::convert::TryFrom<$crate::matrix::MatrixDyn> for $name {
+			type Error = $crate::matrix::MatrixError;
+
+			fn try_from(m: $crate::matrix::MatrixDyn) -> ::core::result::Result<Self, Self::Error> {
+				Self::try_from(&m)
 			}
 		}
 
-		impl From<&$crate::matrix::MatrixDyn> for $name {
-			fn from(m: &$crate::matrix::MatrixDyn) -> Self {
+		impl ::core::convert::TryFrom<&$crate::matrix::MatrixDyn> for $name {
+			type Error = $crate::matrix::MatrixError;
+
+			fn try_from(m: &$crate::matrix::MatrixDyn) -> ::core::result::Result<Self, Self::Error> {
+				let expected = $crate::flagset!(@count $first $(, $rest)*);
 				let n = $crate::matrix::MatrixLike::n(m);
-				let dim = ::core::cmp::min(n as usize, $crate::flagset!(@count $first $(, $rest)*));
-				let mut flags = $crate::flags::Flags::<{ $crate::flagset!(@count $first $(, $rest)*) }>::default();
-				for __idx in 0..dim {
-					flags.set_at(__idx, $crate::matrix::MatrixLike::get(m, __idx as u8, __idx as u8));
+				if n as usize != expected {
+					return ::core::result::Result::Err($crate::matrix::MatrixError::DimensionMismatch { expected, n });
 				}
-				Self { flags }
+
+				let mut flags = $crate::flags::Flags::<{ $crate::flagset!(@count $first $(, $rest)*) }>::default();
+				for __idx in 0..n {
+					flags.set_at(__idx as usize, $crate::matrix::MatrixLike::get(m, __idx, __idx));
+				}
+
+				::core::result::Result::Ok(Self { flags })
 			}
 		}
 
-		// Matrix<N> -> FlagSet (exact size; read diagonal)
+		// A `Matrix<N>` of the exact flag count converts into the flag set,
+		// which reads its diagonal.
 		impl From<$crate::matrix::Matrix<{ $crate::flagset!(@count $first $(, $rest)*) }>> for $name {
 			fn from(m: $crate::matrix::Matrix<{ $crate::flagset!(@count $first $(, $rest)*) }>) -> Self {
 				Self::from(&m)
@@ -216,7 +228,7 @@ macro_rules! flagset {
 			}
 		}
 
-		// Add TryFrom for MatrixDyn
+		// The flag set converts back into a `MatrixDyn` through its flags.
 		impl TryFrom<$name> for $crate::matrix::MatrixDyn {
 			type Error = $crate::matrix::MatrixError;
 
@@ -276,6 +288,7 @@ macro_rules! flagset {
 #[cfg(test)]
 mod tests {
 	use crate::flags::FlagSet;
+	use crate::matrix::{MatrixDyn, MatrixError};
 
 	#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 	enum Status {
@@ -328,6 +341,16 @@ mod tests {
 
 		assert!(FlagSet::contains(&set, Status::Enabled));
 		assert!(FlagSet::contains(&set, SubStatus::Active));
+	}
+
+	/// Each flag is positional, so a matrix of another dimension is refused
+	/// rather than clamped.
+	#[test]
+	fn a_flagset_refuses_a_matrix_of_another_dimension() -> Result<(), MatrixError> {
+		let four_by_four = MatrixDyn::try_from(4u8)?;
+		let refused = SuffixFlags::try_from(&four_by_four);
+		assert!(matches!(refused, Err(MatrixError::DimensionMismatch { expected: 2, n: 4 })));
+		Ok(())
 	}
 
 	#[test]

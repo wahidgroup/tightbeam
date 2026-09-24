@@ -88,10 +88,14 @@ where
 	}
 }
 
-/// Everything one accepted async server connection must already be:
-/// message collection for the single-flight loop, mux negotiation for
-/// the takeover, and handshake state for session capture. Satisfied
-/// blanket-wise, so a caller reaches it through the supertraits.
+/// The capabilities that one accepted async server connection provides.
+///
+/// - Message collection serves the single-flight loop.
+/// - Mux negotiation serves the takeover.
+/// - Handshake state serves session capture.
+///
+/// A blanket impl satisfies the trait, so a caller reaches it through the
+/// supertraits.
 #[cfg(pooled_mux)]
 #[doc(hidden)]
 pub trait AcceptedConnection: MessageCollector + MuxAcceptor + EncryptedProtocolState + Send {}
@@ -106,9 +110,11 @@ pub trait AcceptedConnection: MessageCollector + EncryptedProtocolState + Send {
 #[cfg(all(feature = "tokio", not(pooled_mux), feature = "x509"))]
 impl<T: MessageCollector + EncryptedProtocolState + Send> AcceptedConnection for T {}
 
-/// [`SharedHandler`] as a unary-only service: the closure grammar of
-/// `server!` serves unary interactions, streaming kinds answer
-/// `Unimplemented` through the [`MuxService`] defaults.
+/// Adapter that runs a [`SharedHandler`] as a unary-only service.
+///
+/// The closure grammar of `server!` serves unary interactions, and the
+/// streaming kinds answer `Unimplemented` through the [`MuxService`]
+/// defaults.
 #[cfg(pooled_mux)]
 struct SharedHandlerService(SharedHandler);
 
@@ -196,12 +202,15 @@ impl<S: MuxService> MuxService for ReportedService<S> {
 	}
 }
 
-/// Serve one accepted connection with a [`MuxService`]: mux takeover
-/// when the peer negotiated multiplexing (every stream kind routed by
-/// the service), single-flight unary loop otherwise.
+/// Serve one accepted connection with a [`MuxService`].
 ///
-/// Generic over the accepted transport ([`AcceptedConnection`]), so
-/// every protocol's connections serve identically.
+/// - When the peer negotiated multiplexing, the mux takes over and the service
+///   routes every stream kind.
+/// - Otherwise a single-flight unary loop serves the connection.
+///
+/// The function is generic over the accepted transport
+/// ([`AcceptedConnection`]), so every protocol's connections serve
+/// identically.
 #[cfg(pooled_mux)]
 #[doc(hidden)]
 pub async fn serve_connection_service<T, S>(
@@ -249,9 +258,10 @@ pub async fn serve_connection_service<T, S>(
 	serve_single_flight(transport, respond, error_tx, ok_tx).await;
 }
 
-/// Serve one accepted connection with a closure-form handler:
-/// [`serve_connection_service`] over the unary-only adapter when the
-/// mux plane is compiled in, the single-flight loop alone otherwise.
+/// Serve one accepted connection with a closure-form handler.
+///
+/// When the mux plane is compiled in, [`serve_connection_service`] runs
+/// over the unary-only adapter. Otherwise the single-flight loop runs alone.
 #[cfg(feature = "tokio")]
 #[doc(hidden)]
 pub async fn serve_connection<T>(
@@ -275,10 +285,12 @@ pub async fn serve_connection<T>(
 	}
 }
 
-/// Single-flight request/response loop over one connection: collect,
-/// answer through `respond`, send. A handler failure answers
-/// `Internal` so the peer can tell it apart from an accepted empty
-/// reply. The original error goes to the channel.
+/// Single-flight request and response loop over one connection.
+///
+/// Each turn collects a frame, answers it through `respond`, and sends the
+/// reply. A handler failure answers `Internal` so the peer can tell it
+/// apart from an accepted empty reply. The original error goes to the
+/// channel.
 #[cfg(feature = "tokio")]
 async fn serve_single_flight<T, F, Fut>(
 	mut transport: T,
@@ -290,8 +302,8 @@ async fn serve_single_flight<T, F, Fut>(
 	F: Fn(Frame, SessionContext) -> Fut,
 	Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
 {
-	// Session context filled after the first collected frame: the
-	// lazy handshake is complete by then.
+	// The session context fills after the first collected frame,
+	// because the lazy handshake is complete by then.
 	let mut session_slot: Option<SessionContext> = None;
 	loop {
 		let (frame, status) = match transport.collect_message().await {
@@ -669,35 +681,36 @@ macro_rules! __tightbeam_server_protocol_service_handle {
 	};
 }
 
-/// Server-specific runtime extensions
+/// Server-specific runtime extensions.
 ///
-/// Re-exports unified runtime and adds server-specific channel helpers.
+/// The module re-exports the unified runtime and adds server-specific
+/// channel helpers.
 #[cfg(any(feature = "tokio", feature = "std"))]
 #[doc(hidden)]
 pub mod server_runtime {
-	/// Runtime primitives (re-exported from unified runtime)
+	/// Runtime primitives, re-exported from the unified runtime.
 	pub mod rt {
 		pub use crate::runtime::rt::*;
-		/// Accept-loop connection plane for the async `server!` expansion
-		/// (macro plumbing, not part of the public surface).
+		/// Accept-loop connection plane for the async `server!` expansion. It
+		/// exists for the macro expansion and sits outside the public surface.
 		#[cfg(feature = "tokio")]
 		pub use crate::transport::accept::AcceptPlane;
 
 		use crate::transport::error::TransportError;
 
-		/// Error notification channel sender type
+		/// Sender half of the error notification channel.
 		pub type ErrorSender = crate::runtime::rt::Sender<TransportError>;
 
-		/// Success notification channel sender type
+		/// Sender half of the success notification channel.
 		pub type OkSender = crate::runtime::rt::Sender<()>;
 
-		/// Returns None for optional error channel
+		/// Return `None` for the optional error channel.
 		#[allow(dead_code)]
 		pub fn empty_error_channel() -> Option<ErrorSender> {
 			None
 		}
 
-		/// Returns None for optional success channel
+		/// Return `None` for the optional success channel.
 		#[allow(dead_code)]
 		pub fn empty_ok_channel() -> Option<OkSender> {
 			None
@@ -724,8 +737,8 @@ macro_rules! server {
 		)*
 	}};
 
-	// Accept-loop knob, not a transport policy: consumed by
-	// `@extract_max_connections`, so application is a no-op here.
+	// `max_connections` is an accept-loop knob. `@extract_max_connections`
+	// consumes it, so applying it to a transport does nothing.
 	(@apply_one_policy $transport:ident, max_connections, $policy_expr:expr) => {{
 		$transport
 	}};
@@ -742,7 +755,7 @@ macro_rules! server {
 		$crate::server!(@extract_max_connections $($rest_name: [ $( $rest_expr ),* ]),*)
 	};
 
-	// Generic fallback
+	// Any other policy name calls the transport method of that name.
 	(@apply_one_policy $transport:ident, $other:ident, $policy_expr:expr) => {{
 		$transport.$other($policy_expr)
 	}};
@@ -764,11 +777,11 @@ macro_rules! server {
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(move || {
 						let mut __transport = __transport;
-						// Session context filled after the first collected
-						// frame: the lazy handshake is complete by then.
+						// The session context fills after the first collected
+						// frame, because the lazy handshake is complete by
+						// then.
 						let mut __session_slot = ::core::option::Option::None;
 						loop {
-							// Read message
 							let (frame, status) = match $crate::macros::server::server_runtime::rt::block_on(__transport.collect_message()) {
 								Ok(result) => result,
 								Err(_err) => {
@@ -776,7 +789,9 @@ macro_rules! server {
 								}
 							};
 
-							// Unwrap Arc<Frame> to Frame for handler (clone only if Arc has multiple owners)
+							// Move the frame out of the Arc for the handler.
+							// The clone runs only when the Arc has more than
+							// one owner.
 							let frame_owned = ::std::sync::Arc::try_unwrap(frame)
 								.unwrap_or_else(|arc| (*arc).clone());
 							let (status, response) = if status == $crate::policy::TransitStatus::Ok {
@@ -795,7 +810,6 @@ macro_rules! server {
 								(status, ::core::option::Option::None)
 							};
 
-							// Send response
 							match $crate::macros::server::server_runtime::rt::block_on(__transport.send_response(status, response)) {
 								Ok(()) => continue,
 								Err(_err) => {
@@ -818,6 +832,7 @@ macro_rules! server {
 		let __accept_errors = $error_tx.clone();
 		$crate::macros::server::server_runtime::rt::AcceptPlane::new(
 			$crate::server!(@extract_max_connections $($policy_name: [ $( $policy_expr ),* ]),*),
+			::std::sync::Arc::new($crate::utils::time::SystemClock),
 		)
 		.accept_on_reporting(
 			$listener,

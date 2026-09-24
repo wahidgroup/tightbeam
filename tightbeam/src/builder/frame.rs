@@ -45,12 +45,15 @@ type SignerFn = Box<dyn FnOnce(&[u8]) -> Result<crate::SignerInfo>>;
 
 /// A message type that admits digest `D`.
 ///
-/// `#[derive(Beamable)]` implements it for every digest when the message names
-/// no profile, and only for the profile's digest when it names
-/// `profile(Type)`. A mismatched digest then fails to compile for a derived
-/// message. Any type can implement this trait, so [`FrameBuilder`] also
-/// compares the OID with the message profile at run time, and that comparison
-/// is the enforcement.
+/// `#[derive(Beamable)]` implements it as follows:
+///
+/// - A message that names no profile admits every digest.
+/// - A message that names `profile(Type)` admits only the digest of that
+///   profile, so a mismatched digest fails to compile for a derived message.
+///
+/// Any type can implement this trait, so [`FrameBuilder`] also compares the
+/// OID with the message profile at run time. That comparison is the
+/// enforcement.
 #[cfg(feature = "digest")]
 pub trait CheckDigestOid<D: AssociatedOid> {}
 
@@ -68,20 +71,22 @@ pub trait CheckAeadOid<C: AssociatedOid> {}
 #[cfg(feature = "signature")]
 pub trait CheckSignatureOid<S: SignatureAlgorithmIdentifier> {}
 
-/// Zero-allocation error accumulator for FrameBuilder.
-/// Stores up to 5 errors inline, which covers the common case of one
-/// deferred error per builder method. It spills to a Vec beyond that.
+/// Zero-allocation error accumulator for [`FrameBuilder`].
+///
+/// The accumulator stores up to 5 errors inline, which covers the common case
+/// of one deferred error per builder method. Beyond 5 errors it spills to a
+/// `Vec`.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Default)]
 enum ErrorAccumulator {
-	/// No errors (zero allocation)
+	/// The accumulator holds no errors and allocates nothing.
 	#[default]
 	None,
-	/// 1 error stored inline (zero allocation)
+	/// One error, stored inline without allocation.
 	One(TightBeamError),
-	/// 2-5 errors stored inline (zero allocation)
+	/// Two to five errors, stored inline without allocation.
 	Many([Option<TightBeamError>; 5], u8),
-	/// 6+ errors (heap allocation)
+	/// Six or more errors, stored on the heap.
 	Heap(Vec<TightBeamError>),
 }
 
@@ -101,7 +106,6 @@ impl ErrorAccumulator {
 					arr[len_usize] = Some(error);
 					*self = Self::Many(arr, len + 1);
 				} else {
-					// Convert to heap storage
 					let mut vec = Vec::with_capacity(6);
 					for item in arr.iter_mut().take(len_usize) {
 						if let Some(err) = core::mem::take(item) {
@@ -153,7 +157,8 @@ impl From<ErrorAccumulator> for Vec<TightBeamError> {
 	}
 }
 
-/// A fluent builder for creating tightbeam messages with metadata generation
+/// Fluent builder that creates a tightbeam [`Frame`] and generates its
+/// metadata.
 pub struct FrameBuilder<T: Message> {
 	version: Version,
 	message: Option<T>,
@@ -197,7 +202,7 @@ impl<T: Message> From<Version> for FrameBuilder<T> {
 }
 
 impl<T: Message> FrameBuilder<T> {
-	/// Set the message ID
+	/// Set the message ID.
 	pub fn with_id(mut self, id: impl AsRef<[u8]>) -> Self {
 		self.metadata_builder = self.metadata_builder.with_id(id);
 		self
@@ -218,34 +223,35 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Set the message body
+	/// Set the message body.
 	pub fn with_message(mut self, message: T) -> Self {
 		self.message = Some(message);
 		self
 	}
 
-	/// Set the message priority (V2+ only)
+	/// Set the message priority, which requires V2 or later.
 	pub fn with_priority(mut self, priority: crate::MessagePriority) -> Self {
 		self.metadata_builder = self.metadata_builder.with_priority(priority);
 		self
 	}
 
-	/// Set the TTL in seconds (V2+ only)
+	/// Set the TTL in seconds, which requires V2 or later.
 	pub fn with_lifetime(mut self, seconds: u64) -> Self {
 		self.metadata_builder = self.metadata_builder.with_lifetime(seconds);
 		self
 	}
 
-	/// Set the parent message hash (V2+ only)
-	/// Links this message to a parent message by including the parent's
-	/// message hash. This creates a cryptographic chain of messages where
-	/// each message references the hash of its parent's content.
+	/// Set the parent message hash, which requires V2 or later.
+	///
+	/// The hash links this message to its parent, so the messages form a
+	/// cryptographic chain in which each message references the hash of its
+	/// parent's content.
 	pub fn with_previous_hash(mut self, parent_hash: crate::DigestInfo) -> Self {
 		self.metadata_builder = self.metadata_builder.previous_frame(parent_hash);
 		self
 	}
 
-	/// Set the routing matrix (V3+ only)
+	/// Set the routing matrix, which requires V3 or later.
 	pub fn with_matrix<M>(mut self, matrix: M) -> Self
 	where
 		M: IntoMatrixDyn,
@@ -262,14 +268,13 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Set the routing matrix (V3+ only) - convenience method for MatrixDyn
+	/// Set the routing matrix from a [`MatrixDyn`], which requires V3 or later.
 	pub fn with_matrix_dyn(mut self, matrix: MatrixDyn) -> Self {
 		self.metadata_builder = self.metadata_builder.with_matrix(matrix);
 		self
 	}
 
 	fn validate(&self) -> Result<()> {
-		// Check minimum version requirement
 		if self.version < T::MIN_VERSION {
 			return Err(TightBeamError::UnsupportedVersion(ReceivedExpectedError::from((
 				self.version,
@@ -277,40 +282,41 @@ impl<T: Message> FrameBuilder<T> {
 			))));
 		}
 
-		// Check if encryption is set when required
+		// Each marker names the builder call that satisfies it, so a refusal
+		// tells the caller what to add.
 		#[cfg(feature = "aead")]
 		if T::MUST_BE_CONFIDENTIAL && self.encryptor.is_none() {
-			return Err(TightBeamError::MissingEncryptionInfo);
+			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_CONFIDENTIAL", call: "with_aead" });
 		}
 
-		// Check if signature is set when required
 		#[cfg(feature = "signature")]
 		if T::MUST_BE_NON_REPUDIABLE && self.signer.is_none() {
-			return Err(TightBeamError::MissingSignatureInfo);
+			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_NON_REPUDIABLE", call: "with_signer" });
 		}
 
-		// Check if compression is set when required
 		#[cfg(feature = "compress")]
 		if T::MUST_BE_COMPRESSED && self.compressor.is_none() {
-			return Err(TightBeamError::MissingCompressedData);
+			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_COMPRESSED", call: "with_compression" });
 		}
 
 		#[cfg(feature = "digest")]
-		{
-			let has_message_integrity = self.metadata_builder.has_integrity();
-			if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
-				return Err(TightBeamError::MissingDigestInfo);
-			}
+		if T::MUST_HAVE_MESSAGE_INTEGRITY && !self.metadata_builder.has_integrity() {
+			return Err(TightBeamError::MissingProtection {
+				marker: "MUST_HAVE_MESSAGE_INTEGRITY",
+				call: "with_message_hasher",
+			});
 		}
 
 		#[cfg(feature = "digest")]
 		if T::MUST_HAVE_FRAME_INTEGRITY && self.witness.is_none() {
-			return Err(TightBeamError::MissingDigestInfo);
+			return Err(TightBeamError::MissingProtection {
+				marker: "MUST_HAVE_FRAME_INTEGRITY",
+				call: "with_witness_hasher",
+			});
 		}
 
-		// Check if priority is set when required
 		if T::MUST_BE_PRIORITIZED && !self.metadata_builder.has_priority() {
-			return Err(TightBeamError::MissingPriority);
+			return Err(TightBeamError::MissingProtection { marker: "MUST_BE_PRIORITIZED", call: "with_priority" });
 		}
 
 		Ok(())
@@ -319,7 +325,7 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "compress")]
 impl<T: Message> FrameBuilder<T> {
-	/// Set the compression algorithm (all versions)
+	/// Set the compression algorithm. Every version supports compression.
 	pub fn with_compression(mut self, compressor: impl Compressor + 'static) -> Self {
 		self.compressor = Some(Box::new(compressor));
 		self
@@ -351,9 +357,9 @@ impl<T: Message> FrameBuilder<T> {
 			return self;
 		}
 
-		// The nonce is generated inside the closure so it is bound to the
-		// encryption, not to the builder configuration: a builder that is
-		// ever made reusable must not reuse a captured nonce.
+		// The closure generates the nonce, so each nonce binds to one
+		// encryption call. A builder that becomes reusable MUST NOT reuse a
+		// captured nonce.
 		let rng = self.rng.take();
 		let message_oid = self.message_oid;
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
@@ -362,6 +368,7 @@ impl<T: Message> FrameBuilder<T> {
 				Some(boxed_rng) => &mut **boxed_rng,
 				None => &mut rand_core::OsRng,
 			};
+
 			let nonce = Cipher::generate_nonce(rng);
 			let encrypted_content =
 				<Cipher as Encryptor<Cipher::Oid>>::encrypt_content(&cipher, plaintext, &nonce, message_oid)?;
@@ -371,13 +378,13 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Use a custom encryptor for asymmetric encryption (e.g., ECIES).
+	/// Use a custom encryptor for asymmetric encryption, such as ECIES.
 	pub fn with_encryptor<C, E>(mut self, encryptor: E) -> Self
 	where
 		C: AssociatedOid,
 		E: Encryptor<C> + 'static,
 	{
-		// Enforce the profile: the encryptor must name its AEAD or its curve.
+		// The profile admits an encryptor that names its AEAD or its curve.
 		if T::HAS_PROFILE {
 			let aead_match = C::OID == <T::Profile as SecurityProfile>::AeadOid::OID;
 			#[cfg(feature = "ecdh")]
@@ -397,7 +404,7 @@ impl<T: Message> FrameBuilder<T> {
 
 		let message_oid = self.message_oid;
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
-			// Encryptor handles nonce generation internally (e.g., ECIES)
+			// The encryptor generates its own nonce, as ECIES does.
 			encryptor.encrypt_content(plaintext, [], message_oid)
 		}));
 
@@ -407,17 +414,18 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "digest")]
 impl<T: Message> FrameBuilder<T> {
-	/// Commit to the message body using the specified digest algorithm.
+	/// Commit to the message body using the digest algorithm `D`.
 	///
-	/// Stores the commitment in the metadata integrity field. A salt of at
-	/// least [`MIN_SALT_SIZE`] bytes hides the body, and an empty salt commits
-	/// in plain-digest mode. [`crate::crypto::commitment`] owns the preimage.
+	/// The commitment goes in the metadata integrity field. A salt of at least
+	/// [`MIN_SALT_SIZE`] bytes hides the body, and an empty salt commits in
+	/// plain-digest mode. [`crate::crypto::commitment`] owns the preimage.
 	///
 	/// A rejected salt or algorithm is recorded and surfaces from
 	/// [`FrameBuilder::build`]:
 	///
 	/// - [`TightBeamError::InvalidSaltLength`] when a non-empty salt is too short to hide the body.
-	/// - [`TightBeamError::UnexpectedAlgorithm`] when `D` is not the digest the message profile names.
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when `D` is not the digest the
+	///   message profile names.
 	/// - [`TightBeamError::InvalidBody`] when no message is set.
 	///
 	/// [`MIN_SALT_SIZE`]: crate::constants::MIN_SALT_SIZE
@@ -495,11 +503,11 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "signature")]
 impl<T: Message> FrameBuilder<T> {
-	/// Set the signer for message signing
+	/// Set the signer that signs the frame.
 	///
-	/// The signature will be computed during `build()` over the complete
-	/// message structure. This method captures the signer and signing
-	/// algorithm to be used later.
+	/// This method captures the signer and its signing algorithm.
+	/// [`FrameBuilder::build`] computes the signature over the complete message
+	/// structure.
 	pub fn with_signer<S, X>(mut self, signer: X) -> Self
 	where
 		S: SignatureEncoding + SignatureAlgorithmIdentifier,
@@ -525,32 +533,32 @@ impl<T: Message> FrameBuilder<T> {
 impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 	type Error = TightBeamError;
 
-	/// Build the final TightBeam message
+	/// Build the final TightBeam message.
 	///
-	/// If a signer was provided via `with_signer()`, the entire message
-	/// structure (version + metadata + body) will be signed after
-	/// construction. The signature is computed over the DER-encoded TightBeam
-	/// structure minus the signature field.
+	/// When [`FrameBuilder::with_signer`] set a signer, the build signs the
+	/// entire message structure (version, metadata, and body) after
+	/// construction. The signature covers the DER-encoded TightBeam structure
+	/// without the signature field.
 	///
 	/// # Errors
-	/// Returns an error if:
-	/// - Any validation errors occurred during building
-	/// - Required fields are missing
-	/// - Metadata validation fails
-	/// - Signing fails (if signer was provided)
+	///
+	/// The build returns an error when:
+	///
+	/// - a builder method recorded a validation error,
+	/// - a required field is missing,
+	/// - metadata validation fails, or
+	/// - signing fails for the configured signer.
 	fn build(mut self) -> Result<Frame> {
 		if let Some(error) = core::mem::take(&mut self.errors).into_error() {
 			return Err(error);
 		}
 
-		// 0. Validate message restrictions
+		// 0. Validate the message restrictions.
 		self.validate()?;
 
 		let version = self.version;
 		let message = self.message.ok_or(TightBeamError::InvalidBody)?;
 		let metadata_builder = self.metadata_builder;
-
-		// Delegate to helper methods for better organization
 
 		FrameBuilder::build_impl(
 			version,
@@ -569,7 +577,8 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 }
 
 impl<T: Message> FrameBuilder<T> {
-	/// Internal build implementation - extracted for cognitive complexity reduction.
+	/// Run the build stages in order after [`FrameBuilder::build`] validates
+	/// the message.
 	fn build_impl(
 		version: Version,
 		message: T,
@@ -579,10 +588,9 @@ impl<T: Message> FrameBuilder<T> {
 		#[cfg(feature = "digest")] witness: Option<Digestor>,
 		#[cfg(feature = "signature")] signer: Option<SignerFn>,
 	) -> Result<Frame> {
-		// Auto-set current time if order is omitted
 		metadata_builder = Self::ensure_order_set(metadata_builder)?;
 
-		// 1-3. Build message bytes (encode, compress, encrypt)
+		// 1-3. Encode, compress, and encrypt the message bytes.
 		let (message_bytes, metadata_builder) = Self::build_message_bytes(
 			message,
 			metadata_builder,
@@ -592,7 +600,8 @@ impl<T: Message> FrameBuilder<T> {
 			encryptor,
 		)?;
 
-		// 4. Optional witness: FI covers the version and the metadata, and never the message.
+		// 4. Build the optional witness. FI covers only the version and the
+		// metadata, so the message stays outside it.
 		let metadata = metadata_builder.build()?;
 		let integrity = Self::build_frame_integrity(
 			version,
@@ -603,7 +612,7 @@ impl<T: Message> FrameBuilder<T> {
 
 		let tbs = Frame::assemble(version, metadata, message_bytes, integrity)?;
 
-		// 5. Optional signing
+		// 5. Sign the frame when a signer is set.
 		Self::build_signature(
 			tbs,
 			#[cfg(feature = "signature")]
@@ -611,7 +620,8 @@ impl<T: Message> FrameBuilder<T> {
 		)
 	}
 
-	/// Ensure order is set in metadata builder, auto-setting current time if omitted.
+	/// Set the order to the current Unix time in seconds when the caller
+	/// omitted it.
 	#[cfg(feature = "std")]
 	fn ensure_order_set(mut metadata_builder: MetadataBuilder) -> Result<MetadataBuilder> {
 		if !metadata_builder.has_order() {
@@ -630,7 +640,7 @@ impl<T: Message> FrameBuilder<T> {
 		Ok(metadata_builder)
 	}
 
-	/// Build message bytes through encoding, compression, and encryption pipeline.
+	/// Encode the message, then compress and encrypt it when configured.
 	fn build_message_bytes(
 		message: T,
 		metadata_builder: MetadataBuilder,
@@ -641,10 +651,10 @@ impl<T: Message> FrameBuilder<T> {
 		#[cfg(any(feature = "compress", feature = "aead"))]
 		let mut metadata_builder = metadata_builder;
 
-		// 1. Encode ASN.1
+		// 1. Encode the message in ASN.1.
 		let bytes = crate::encode(&message)?;
 
-		// 2. Optional compression
+		// 2. Compress the bytes when a compressor is set.
 		#[cfg(feature = "compress")]
 		let bytes = if let Some(compressor) = compressor {
 			let (compressed, compression_info) = compressor.compress(&bytes, None)?;
@@ -654,7 +664,7 @@ impl<T: Message> FrameBuilder<T> {
 			bytes
 		};
 
-		// 3. Optional encryption
+		// 3. Encrypt the bytes when an encryptor is set.
 		#[cfg(feature = "aead")]
 		let message_bytes = if let Some(enc) = encryptor {
 			let mut encrypted_content = enc(&bytes)?;
@@ -674,7 +684,7 @@ impl<T: Message> FrameBuilder<T> {
 		Ok((message_bytes, metadata_builder))
 	}
 
-	/// Build frame integrity (FI) over envelope if witness is provided.
+	/// Build frame integrity (FI) over the envelope when a witness is set.
 	#[cfg(feature = "digest")]
 	fn build_frame_integrity(
 		version: Version,
@@ -697,7 +707,7 @@ impl<T: Message> FrameBuilder<T> {
 		Ok(None)
 	}
 
-	/// Build signature (nonrepudiation) if signer is provided.
+	/// Build the signature (nonrepudiation) when a signer is set.
 	#[cfg(feature = "signature")]
 	fn build_signature(mut tbs: Frame, signer: Option<SignerFn>) -> Result<Frame> {
 		let Some(signer) = signer else {
@@ -855,7 +865,6 @@ mod tests {
 			let (_, cipher) = TestKey::cipher();
 			let signing_key = TestKey::signing();
 
-			// Create a previous message hash for linking
 			let previous_hash = crate::utils::digest::<Sha3_256>(b"previous-message-data")?;
 			let rng = rand_core::OsRng;
 
@@ -872,7 +881,7 @@ mod tests {
 				.with_priority(crate::MessagePriority::LowLatency)
 				.with_lifetime(3600)
 				.with_previous_hash(previous_hash)
-				// Matrix removed - V2 doesn't support it (V3+ only)
+				// The matrix requires V3 or later, so this V2 frame omits it.
 				.build()
 		},
 		assertions: |message, result| {
@@ -893,7 +902,8 @@ mod tests {
 			// original message and compare.
 			assert!(tightbeam.verify_commitment_of::<Sha3_256, _>(&message, [])?);
 
-			// Verify Frame Integrity (FI): compute hash over envelope (version + metadata) and compare
+			// Verify Frame Integrity (FI): hash the envelope (version and
+			// metadata) and compare.
 			let scaffold = crate::frame::FrameIntegrityScaffold {
 				version: &tightbeam.version(),
 				metadata: tightbeam.metadata(),
@@ -907,7 +917,8 @@ mod tests {
 			let decode_result: Result<TestMessage> = crate::decode(tightbeam.message());
 			assert!(decode_result.is_err());
 
-			// Verify signature before decrypting (decrypt consumes the frame)
+			// Verify the signature first, because decryption consumes the
+			// frame.
 			let signing_key = TestKey::signing();
 			let verifying_key = signing_key.verifying_key();
 			assert!(tightbeam.verify::<Secp256k1Signature, Sha3_256>(verifying_key).is_ok());
@@ -933,7 +944,7 @@ mod tests {
 	}
 
 	// Hashing before the message is set defers an `InvalidBody` error. A single
-	// deferred error surfaces bare rather than as a one-element `Sequence`.
+	// deferred error surfaces bare, outside a one-element `Sequence`.
 	#[test]
 	#[cfg(feature = "sha3")]
 	fn test_single_deferred_error_surfaces_bare() {
@@ -980,6 +991,43 @@ mod tests {
 		Ok(())
 	}
 
+	/// The refusal a message type draws when built with nothing its markers
+	/// require.
+	#[cfg(all(feature = "aead", feature = "digest", feature = "signature"))]
+	fn unprotected_refusal<T: Message>(message: T) -> TightBeamError {
+		let built = FrameBuilder::from(Version::V2)
+			.with_id("unprotected")
+			.with_order(1)
+			.with_message(message)
+			.build();
+
+		built.expect_err("the fixture's markers require a protection it was not given")
+	}
+
+	// A marker refusal names the marker and the builder call that satisfies
+	// it, so the caller knows what to add.
+	#[cfg(all(feature = "aead", feature = "digest", feature = "signature"))]
+	crate::tb_cases! {
+		fn a_marker_refusal_names_its_call((refusal, marker, call): (TightBeamError, &str, &str)) {
+			assert!(
+				matches!(&refusal, TightBeamError::MissingProtection { marker: m, call: c } if *m == marker && *c == call),
+				"expected {marker} / {call}, got {refusal:?}"
+			);
+		}
+		cases {
+			confidential => (
+				unprotected_refusal(crate::testing::fixtures::ConfidentialNote { content: "x".into() }),
+				"MUST_BE_CONFIDENTIAL",
+				"with_aead"
+			),
+			message_integrity => (
+				unprotected_refusal(crate::testing::fixtures::IntegralNote { content: "x".into() }),
+				"MUST_HAVE_MESSAGE_INTEGRITY",
+				"with_message_hasher"
+			),
+		}
+	}
+
 	mod validation {
 		use super::*;
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
@@ -988,7 +1036,7 @@ mod tests {
 		use crate::testing::TestKey;
 		use crate::Version;
 
-		// Helper macro to run shared test logic after struct definition
+		// Run the shared assertions after the struct definition.
 		macro_rules! run_tests {
 			($name:expr, $confidential:expr, $nonrepudiable:expr, $message_integrity:expr, $frame_integrity:expr, $min_version:expr, $cipher:expr, $signing_key:expr) => {
 				let message = TestMsg { content: format!("test {}", $name) };
@@ -1013,14 +1061,19 @@ mod tests {
 				);
 				let frame = result?;
 
-				// Test 3: Verify README semantics - MUST fields -> Frame fields MUST be present
-				// README line 363: MUST_BE_NON_REPUDIABLE=true -> Frame MUST include nonrepudiation field
+				// Test 3: Verify the README semantics. Each MUST flag requires
+				// the matching frame field.
+				// README line 363: MUST_BE_NON_REPUDIABLE=true requires the
+				// nonrepudiation field.
 				assert_eq!(frame.nonrepudiation().is_some(), $nonrepudiable);
-				// README line 364: MUST_BE_CONFIDENTIAL=true -> Frame MUST include confidentiality field
+				// README line 364: MUST_BE_CONFIDENTIAL=true requires the
+				// confidentiality field.
 				assert_eq!(frame.metadata().confidentiality().is_some(), $confidential);
-				// MUST_HAVE_MESSAGE_INTEGRITY=true -> Frame metadata MUST include integrity field
+				// MUST_HAVE_MESSAGE_INTEGRITY=true requires the metadata
+				// integrity field.
 				assert_eq!(frame.metadata().integrity().is_some(), $message_integrity);
-				// MUST_HAVE_FRAME_INTEGRITY=true -> Frame MUST include integrity field
+				// MUST_HAVE_FRAME_INTEGRITY=true requires the frame integrity
+				// field.
 				assert_eq!(frame.integrity().is_some(), $frame_integrity);
 
 				// Test 4: Verify version enforcement
@@ -1033,8 +1086,8 @@ mod tests {
 			};
 		}
 
-		// Helper macro to generate test message struct with correct attributes
-		// Only matches the 4 test cases actually used in the test
+		// Generate the test message struct with the attributes of one case. The
+		// macro matches only the four cases that the test uses.
 		macro_rules! test_msg_struct {
 			// BasicMessage: (false, false, false, false, V0)
 			(false, false, false, false, V0) => {
@@ -1159,9 +1212,9 @@ mod tests {
 			}
 		}
 
-		// One named test per requirement combination: the struct definition
-		// and the shared assertions are both driven by the same flag tuple,
-		// so no dispatch logic is needed inside the tests themselves.
+		// Each requirement combination gets one named test. The same flag tuple
+		// drives the struct definition and the shared assertions, so each test
+		// body stays free of dispatch logic.
 		macro_rules! message_trait_test {
 			($test:ident, $name:expr, $confidential:tt, $nonrepudiable:tt, $message_integrity:tt, $frame_integrity:tt, $version:ident) => {
 				#[test]

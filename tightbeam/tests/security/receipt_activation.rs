@@ -2,14 +2,19 @@
 //!
 //! ## Weakness
 //! A budget-bearing session is only accountable if the dual-signed receipt
-//! is completed: the server issues and signs it, the client countersigns,
-//! and the server verifies the countersignature and settles. The trait
-//! driver runs that acknowledgement automatically, but the orchestrator
-//! also exposes an inherent `complete()` for manual drivers. If
-//! `complete()` activates a metered session whenever the client Finished
-//! merely verified, without confirming the countersigned receipt settled,
-//! a driver that forgets the acknowledgement step activates a budget the
-//! client left uncountersigned, defeating non-repudiation.
+//! is completed:
+//!
+//! 1. The server issues and signs the receipt.
+//! 2. The client countersigns it.
+//! 3. The server verifies the countersignature and settles.
+//!
+//! The trait driver runs that acknowledgement automatically, but the
+//! orchestrator also exposes an inherent `complete()` for manual drivers.
+//!
+//! Suppose `complete()` activates a metered session whenever the client
+//! Finished merely verified, without a check that the countersigned receipt
+//! settled. A driver that forgets the acknowledgement step then activates a
+//! budget the client left uncountersigned, which defeats non-repudiation.
 //!
 //! ## Attack
 //! A server integration processes the client Finished and calls
@@ -24,8 +29,7 @@
 //! issued but no stored (dual-signed, settled) receipt was retained.
 //!
 //! ## References
-//! - CWE-696: Incorrect Behavior Order
-//!   <https://cwe.mitre.org/data/definitions/696.html>
+//! - CWE-696: Incorrect Behavior Order <https://cwe.mitre.org/data/definitions/696.html>
 //! - CWE-306: Missing Authentication for Critical Function
 //!   <https://cwe.mitre.org/data/definitions/306.html>
 
@@ -33,7 +37,6 @@
 
 use std::sync::Arc;
 
-use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
@@ -83,19 +86,20 @@ tb_scenario! {
 
 			// Drive the handshake manually through the client Finished, then
 			// deliberately skip process_receipt_ack.
-			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?.to_der()?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
-			let server_finished = server.build_server_finished().await?.to_der()?;
+			let server_finished = server.build_server_finished().await?;
 			client.process_server_finished(&server_finished)?;
 
-			let client_finished = client.build_client_finished().await?.to_der()?;
+			let client_finished = client.build_client_finished().await?;
 			server.process_client_finished(&client_finished)?;
 
 			// The countersigned receipt reached no acknowledgement, so the
 			// metered session must not activate.
 			let complete_result = server.take_established();
 			let activation_refused = matches!(complete_result, Err(HandshakeError::CountersignatureMissing));
+
 			trace.event_with(
 				COMPLETE_FAILS_WITHOUT_SETTLEMENT,
 				&[],

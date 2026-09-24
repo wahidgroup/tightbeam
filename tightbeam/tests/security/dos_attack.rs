@@ -13,12 +13,10 @@
 //! messages before full processing; normal-sized messages MUST still work.
 //!
 //! ## References
-//! - CWE-400: Uncontrolled Resource Consumption
-//!   <https://cwe.mitre.org/data/definitions/400.html>
+//! - CWE-400: Uncontrolled Resource Consumption <https://cwe.mitre.org/data/definitions/400.html>
 //! - CWE-770: Allocation of Resources Without Limits or Throttling
 //!   <https://cwe.mitre.org/data/definitions/770.html>
-//! - CAPEC-130: Excessive Allocation
-//!   <https://capec.mitre.org/data/definitions/130.html>
+//! - CAPEC-130: Excessive Allocation <https://capec.mitre.org/data/definitions/130.html>
 
 use std::sync::Arc;
 

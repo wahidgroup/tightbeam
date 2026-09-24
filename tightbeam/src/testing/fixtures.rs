@@ -1,8 +1,7 @@
 //! Test material the suite builds scenarios from.
 //!
-//! Each owner type names the material it makes, so a reader looking for a
-//! certificate, a frame, or a key has one place to look rather than a list of
-//! `create_*` functions in a grab-bag.
+//! Each owner type names the material it makes, so a reader who looks for a
+//! certificate, a frame, or a key finds one place for it.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,7 +55,7 @@ mod x509_certs {
 #[cfg(feature = "x509")]
 use x509_certs::*;
 
-/// Simple test message
+/// A simple message that the tests encode and send.
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 pub struct TestMessage {
 	pub content: String,
@@ -134,8 +133,8 @@ fn test_signature_algorithm() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 }
 
-/// Shared body of the URI-SAN fixtures: `name` as both subject and
-/// issuer (self-signed shape), each of `uris` as a SAN entry.
+/// Shared body of the URI-SAN fixtures. `name` is both the subject and the
+/// issuer (a self-signed shape), and each of `uris` becomes a SAN entry.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_named_with_uri_sans(signing_key: &SigningKey, name: RdnSequence, uris: &[&str]) -> Certificate {
 	let names = uris
@@ -145,20 +144,20 @@ fn test_certificate_named_with_uri_sans(signing_key: &SigningKey, name: RdnSeque
 			GeneralName::UniformResourceIdentifier(uri)
 		})
 		.collect();
-	let san = SubjectAltName(names);
 
+	let san = SubjectAltName(names);
 	test_certificate_named(signing_key, name, Some(vec![test_extension(&san)]))
 }
 
-/// Shared body of the placeholder-signed test certificate fixtures:
-/// empty subject and issuer, fixed serial, caller-chosen extensions.
+/// Shared body of the placeholder-signed test certificate fixtures, with an
+/// empty subject and issuer, a fixed serial, and caller-chosen extensions.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_with_extensions(signing_key: &SigningKey, extensions: Option<Vec<Extension>>) -> Certificate {
 	test_certificate_named(signing_key, RdnSequence::default(), extensions)
 }
 
-/// Placeholder-signed test certificate with `name` as both subject and
-/// issuer, fixed serial, and caller-chosen extensions.
+/// Placeholder-signed test certificate with `name` as both the subject and
+/// the issuer, a fixed serial, and caller-chosen extensions.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 fn test_certificate_named(
 	signing_key: &SigningKey,
@@ -171,6 +170,7 @@ fn test_certificate_named(
 		.expect("test verifying key encodes to SPKI DER");
 	let subject_public_key_info =
 		SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).expect("freshly encoded SPKI re-decodes");
+
 	let algorithm = test_signature_algorithm();
 	let validity = test_validity().expect("fixed test validity window is valid");
 	let serial_number = SerialNumber::new(&[1]).expect("single-byte serial is valid");
@@ -203,7 +203,8 @@ where
 	Extension { extn_id: T::OID, critical: true, extn_value }
 }
 
-/// A certificate chain with root -> intermediate -> leaf certificates.
+/// A certificate chain in which a root signs an intermediate and the
+/// intermediate signs a leaf.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub struct TestCertificateChain {
 	pub root: Certificate,
@@ -216,7 +217,8 @@ pub struct TestCertificateChain {
 
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 impl TestCertificateChain {
-	/// Shared `[root, intermediate, leaf]` slice for handshake chain plumbing.
+	/// Return the chain as a shared `[root, intermediate, leaf]` slice for the
+	/// handshake.
 	pub fn to_arc(&self) -> Arc<[Certificate]> {
 		Arc::from([self.root.to_owned(), self.intermediate.to_owned(), self.leaf.to_owned()])
 	}
@@ -253,15 +255,16 @@ fn sign_test_certificate(
 	Ok(certificate)
 }
 
-/// Generic builder test macro
+/// Generic builder test macro.
 ///
-/// Similar to test_case! but specifically designed for testing builders.
-/// Automatically provides a base builder instance and allows customization.
-/// Passes both the input message and the resulting frame to assertions.
+/// The macro works like `test_case!` for builders. It provides a base
+/// builder instance, allows customization, and passes both the input message
+/// and the resulting frame to the assertions.
 ///
 /// The `message` parameter supports two forms:
-/// - Direct value: `message: TestMessage::sample(None)`
-/// - Closure: `message: || { TestMessage::sample(None) }`
+///
+/// - A direct value: `message: TestMessage::sample(None)`
+/// - A closure: `message: || { TestMessage::sample(None) }`
 #[macro_export]
 macro_rules! test_builder {
 	// Closure form: message: || { ... }
@@ -302,7 +305,7 @@ macro_rules! test_builder {
 		);
 	};
 
-	// Internal implementation (not exposed to users)
+	// Internal arm that the two public forms expand into.
 	(@impl
 		$test_name:ident,
 		$builder_type:ty,
@@ -323,10 +326,11 @@ macro_rules! test_builder {
 	};
 }
 
-// Helper: match a Frame against various "expected" forms.
-// - Frame => compare metadata.id
-// - Result<Frame, E> => compare metadata.id from Ok(frame)
-// - Any T: Beamable + PartialEq => decode T from frame.message and compare
+/// Match a [`Frame`] against one of several expected forms.
+///
+/// - A `Frame` compares `metadata.id`.
+/// - A `Result<Frame, E>` compares `metadata.id` of the `Ok` frame.
+/// - Any `T: Beamable + PartialEq` decodes `T` from `frame.message` and compares.
 pub trait ExpectedMatcher {
 	fn matches(&self, frame: &Frame) -> bool;
 }
@@ -365,10 +369,10 @@ where
 	}
 }
 
-/// Async test macro with worker setup
+/// Async test macro with worker setup.
 ///
-/// Automatically starts a worker and passes it to the assertions block for testing.
-/// Properly manages worker lifecycle with shutdown.
+/// The macro starts a worker, passes it to the assertions block, and shuts
+/// the worker down afterwards.
 #[macro_export]
 macro_rules! test_worker {
 	(
@@ -581,9 +585,11 @@ impl TestCertificate {
 		vec![test_extension(&basic_constraints), test_extension(&key_usage)]
 	}
 
-	/// Create a valid certificate chain: root -> intermediate -> leaf.
+	/// Create a valid certificate chain in which a root signs an intermediate
+	/// and the intermediate signs a leaf.
 	///
-	/// All certificates have proper issuer/subject chaining and valid signatures.
+	/// Every certificate has proper issuer and subject chaining and a valid
+	/// signature.
 	///
 	/// # Errors
 	///
@@ -614,7 +620,8 @@ impl TestCertificate {
 			subject_public_key_info,
 			issuer_unique_id: None,
 			subject_unique_id: None,
-			// RFC 5280 §6.1.4(k),(n): root is a CA permitted to sign certificates.
+			// RFC 5280 §6.1.4(k),(n): the root is a CA permitted to sign
+			// certificates.
 			extensions: Some(TestCertificate::ca_extensions(true, true, None)),
 		};
 		let root = sign_test_certificate(root_tbs, &algorithm, &root_key)?;
@@ -632,7 +639,8 @@ impl TestCertificate {
 			subject_public_key_info,
 			issuer_unique_id: None,
 			subject_unique_id: None,
-			// RFC 5280 §6.1.4(k),(n): intermediate is a CA permitted to sign certificates.
+			// RFC 5280 §6.1.4(k),(n): the intermediate is a CA permitted to
+			// sign certificates.
 			extensions: Some(TestCertificate::ca_extensions(true, true, None)),
 		};
 		let intermediate = sign_test_certificate(inter_tbs, &algorithm, &root_key)?;
@@ -659,8 +667,8 @@ impl TestCertificate {
 
 	/// Create an expired test certificate for validation testing.
 	///
-	/// This certificate (from ssl.com) expired on August 17, 2019.
-	/// Useful for testing certificate expiry validation logic.
+	/// This certificate from ssl.com expired on August 17, 2019, so it
+	/// exercises the expiry validation logic.
 	#[cfg(feature = "x509")]
 	pub fn expired() -> Certificate {
 		crate::pem! {"
@@ -705,7 +713,8 @@ impl TestCertificate {
 
 /// Signer material for CMS structures.
 ///
-/// Fixed placeholder bytes: the subject is the encoding, not the signature.
+/// The material is fixed placeholder bytes, because these tests exercise the
+/// encoding and leave the signature unchecked.
 pub struct TestSigner;
 
 impl TestSigner {
@@ -732,57 +741,6 @@ impl TestSigner {
 			signature,
 			unsigned_attrs,
 		}
-	}
-}
-
-/// Digest whose output (16 bytes) is shorter than the 20-byte SKID
-/// truncation window.
-#[cfg(all(feature = "digest", feature = "sha3"))]
-#[derive(Clone, Default)]
-pub struct SixteenByteDigest(Sha3_256);
-
-#[cfg(all(feature = "digest", feature = "sha3"))]
-mod sixteen_byte_digest_impls {
-	use super::SixteenByteDigest;
-	use crate::asn1::ObjectIdentifier;
-	use crate::der::oid::AssociatedOid;
-	use crate::oids::HASH_SHA256;
-	use digest::{FixedOutput, FixedOutputReset, HashMarker, Output, OutputSizeUser, Reset, Update};
-
-	impl Update for SixteenByteDigest {
-		fn update(&mut self, data: &[u8]) {
-			Update::update(&mut self.0, data);
-		}
-	}
-
-	impl OutputSizeUser for SixteenByteDigest {
-		type OutputSize = digest::consts::U16;
-	}
-
-	impl FixedOutput for SixteenByteDigest {
-		fn finalize_into(self, out: &mut Output<Self>) {
-			let full = FixedOutput::finalize_fixed(self.0);
-			out.copy_from_slice(&full[..16]);
-		}
-	}
-
-	impl Reset for SixteenByteDigest {
-		fn reset(&mut self) {
-			Reset::reset(&mut self.0);
-		}
-	}
-
-	impl FixedOutputReset for SixteenByteDigest {
-		fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
-			let full = FixedOutputReset::finalize_fixed_reset(&mut self.0);
-			out.copy_from_slice(&full[..16]);
-		}
-	}
-
-	impl HashMarker for SixteenByteDigest {}
-
-	impl AssociatedOid for SixteenByteDigest {
-		const OID: ObjectIdentifier = HASH_SHA256;
 	}
 }
 

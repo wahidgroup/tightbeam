@@ -8,8 +8,9 @@
 //!
 //! - One derivation path, audited in one place.
 //! - The KEK is zeroized after use when the `zeroize` feature is on.
-//! - A recipient confirms each unwrapped CEK by re-wrapping it and comparing the result with the
-//!   original wrapped bytes in constant time (`unwrap_and_verify_with_kek`).
+//! - A recipient confirms each unwrapped CEK by re-wrapping it and comparing
+//!   the result with the original wrapped bytes in constant time
+//!   (`unwrap_and_verify_with_kek`).
 //!
 //! # Hybrid Key Agreement
 //!
@@ -45,8 +46,8 @@ where
 	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
 {
 	let shared = diffie_hellman(priv_key.to_nonzero_scalar(), peer_pub.as_affine());
-	// Move the copy straight into SecretSlice so no plain binding outlives this
-	// line
+	// Move the copy straight into a SecretSlice so that no plain binding
+	// outlives this line.
 	Ok(SecretSlice::from(shared.raw_secret_bytes().as_ref().to_vec()))
 }
 
@@ -99,19 +100,19 @@ macro_rules! dispatch_aes_kw {
 
 /// A derived key-encryption key, ready to wrap or unwrap a CEK.
 ///
-/// The KEK and the bytes it protects are both byte slices, so a caller
-/// holding them loose can exchange them and still compile. The key travels
-/// as its own type and the exchange has no call site at which to occur.
+/// The KEK and the bytes it protects are both byte slices, so a caller that
+/// holds them loose can swap them and still compile. The key travels as its
+/// own type, so no call site can swap it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Kek<'a>(&'a [u8]);
 
 impl<'a> Kek<'a> {
-	/// The key-encryption key for one wrap or unwrap.
+	/// Wrap `kek` as the key-encryption key for one wrap or unwrap.
 	pub(crate) fn new(kek: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
 		Self(kek.as_ref())
 	}
 
-	/// The key bytes, for the provider call that consumes them.
+	/// Return the key bytes for the provider call that consumes them.
 	pub(crate) fn as_bytes(&self) -> &'a [u8] {
 		self.0
 	}
@@ -130,20 +131,26 @@ pub(crate) fn wrap_with_kek<P: CryptoProvider>(
 
 /// Unwrap a wrapped CEK with a KEK, dispatching to the AES-KW variant matching
 /// the KEK length.
+///
+/// The key wrap hands back a plain buffer, so the CEK enters its wiping
+/// wrapper on the line it is produced and travels no further unwiped
+/// (CWE-226).
 pub(crate) fn unwrap_with_kek<P: CryptoProvider>(
 	provider: &P,
 	kek: Kek<'_>,
 	wrapped: &[u8],
-) -> Result<Vec<u8>, HandshakeError> {
+) -> Result<SecretSlice<u8>, HandshakeError> {
 	let kek = kek.as_bytes();
-	dispatch_aes_kw!(
+	let cek: Vec<u8> = dispatch_aes_kw!(
 		provider,
 		kek,
 		wrapped,
 		as_key_unwrapper_16,
 		as_key_unwrapper_24,
 		as_key_unwrapper_32
-	)
+	)?;
+
+	Ok(SecretSlice::from(cek))
 }
 
 /// Unwrap a CEK under an already-derived KEK and confirm integrity by
@@ -157,9 +164,9 @@ pub(crate) fn unwrap_and_verify_with_kek<P: CryptoProvider>(
 	provider: &P,
 	kek: Kek<'_>,
 	wrapped: &[u8],
-) -> Result<Vec<u8>, HandshakeError> {
+) -> Result<SecretSlice<u8>, HandshakeError> {
 	let cek = unwrap_with_kek(provider, kek, wrapped)?;
-	let rewrapped = wrap_with_kek(provider, kek, &cek)?;
+	let rewrapped = cek.with(|cek| wrap_with_kek(provider, kek, cek))?;
 
 	let valid: bool = rewrapped.as_slice().ct_eq(wrapped).into();
 	if !valid {
@@ -171,7 +178,7 @@ pub(crate) fn unwrap_and_verify_with_kek<P: CryptoProvider>(
 	Ok(cek)
 }
 
-/// Wrap a CEK (sender side) producing RFC 3394 wrapped bytes.
+/// Wrap a CEK on the sender side, producing RFC 3394 wrapped bytes.
 pub fn kari_wrap<P, C>(
 	provider: &P,
 	sender_priv: &SecretKey<C>,
@@ -193,7 +200,8 @@ where
 	wrap_with_kek(provider, Kek::new(kek.as_slice()), cek)
 }
 
-/// Unwrap a wrapped CEK (recipient side) verifying integrity constant-time.
+/// Unwrap a wrapped CEK on the recipient side and verify its integrity in
+/// constant time.
 pub fn kari_unwrap<P, C>(
 	provider: &P,
 	recipient_priv: &SecretKey<C>,
@@ -201,7 +209,7 @@ pub fn kari_unwrap<P, C>(
 	ukm: KdfSalt<'_>,
 	kdf_info: KdfInfo<'_>,
 	wrapped: &[u8],
-) -> Result<Vec<u8>, HandshakeError>
+) -> Result<SecretSlice<u8>, HandshakeError>
 where
 	P: CryptoProvider,
 	C: Curve + CurveArithmetic,
@@ -219,9 +227,9 @@ where
 /// Wrap a CEK under combined ECDH and KEM shared secrets.
 ///
 /// A multi-input KDF combines the ECDH secret from the sender's ephemeral key
-/// with the post-quantum secret from KEM encapsulation, the hybrid construction
-/// PQXDH uses. `ukm` salts that KDF and `kdf_info` labels it. The result is RFC
-/// 3394 wrapped bytes.
+/// with the post-quantum secret from KEM encapsulation, the hybrid
+/// construction PQXDH uses. `ukm` salts that KDF and `kdf_info` labels it.
+/// The result is RFC 3394 wrapped bytes.
 #[cfg(all(feature = "kem", feature = "unstable-pqxdh"))]
 pub fn kari_wrap_hybrid<P, C>(
 	provider: &P,
@@ -243,7 +251,7 @@ where
 	let ecdh_secret = derive_shared_secret(sender_ec_priv, recipient_ec_pub)?;
 	let key_size = key_wrap_key_size::<P>()?;
 	let derived = ecdh_secret.with(|ecdh| multi_input_kdf::<P>(&[ecdh, kem_shared_secret], ukm, kdf_info, key_size));
-	let combined_key = derived??;
+	let combined_key = derived?;
 
 	wrap_with_kek(provider, Kek::new(combined_key.as_slice()), cek)
 }
@@ -262,7 +270,7 @@ pub fn kari_unwrap_hybrid<P, C>(
 	ukm: KdfSalt<'_>,
 	kdf_info: KdfInfo<'_>,
 	wrapped: &[u8],
-) -> Result<Vec<u8>, HandshakeError>
+) -> Result<SecretSlice<u8>, HandshakeError>
 where
 	P: CryptoProvider,
 	C: Curve + CurveArithmetic,
@@ -274,11 +282,11 @@ where
 	let ecdh_secret = derive_shared_secret(recipient_ec_priv, originator_ec_pub)?;
 	let key_size = key_wrap_key_size::<P>()?;
 	let derived = ecdh_secret.with(|ecdh| multi_input_kdf::<P>(&[ecdh, kem_shared_secret], ukm, kdf_info, key_size));
-	let combined_key = derived??;
+	let combined_key = derived?;
 
 	let combined_kek = Kek::new(combined_key.as_slice());
 	let cek = unwrap_with_kek(provider, combined_kek, wrapped)?;
-	let rewrapped = wrap_with_kek(provider, combined_kek, &cek)?;
+	let rewrapped = cek.with(|cek| wrap_with_kek(provider, combined_kek, cek))?;
 
 	let valid: bool = rewrapped.as_slice().ct_eq(wrapped).into();
 	if !valid {
@@ -316,9 +324,8 @@ impl HandshakeKek for SecretSlice<u8> {
 			return Err(HandshakeError::MissingUkm);
 		}
 
-		let derived = self
+		let kek = self
 			.with(|shared| P::Kdf::derive_dynamic_key(shared, kdf_info.as_bytes(), Some(ukm.as_bytes()), key_size))?;
-		let kek = derived?;
 		Ok(kek)
 	}
 }
@@ -326,6 +333,8 @@ impl HandshakeKek for SecretSlice<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::secret::ToInsecure;
+
 	use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
@@ -347,7 +356,7 @@ mod tests {
 		assert!(wrapped.len() > cek.len());
 
 		let unwrapped = kari_unwrap(&provider, &recipient, &sender_pub, ukm_salt, label, &wrapped)?;
-		assert_eq!(unwrapped, cek);
+		assert_eq!(unwrapped.to_insecure().as_slice(), cek.as_slice());
 		Ok(())
 	}
 
@@ -365,7 +374,7 @@ mod tests {
 		let label = KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO);
 		let wrapped = kari_wrap(&provider, &sender, &recipient_pub, ukm_salt, label, &cek)?;
 
-		// Attempt unwrap with wrong recipient key should fail
+		// An unwrap with the wrong recipient key fails.
 		let bad = kari_unwrap(&provider, &wrong_recipient, &sender_pub, ukm_salt, label, &wrapped);
 		assert!(bad.is_err());
 		Ok(())
@@ -390,16 +399,28 @@ mod tests {
 		assert!(matches!(result, Err(HandshakeError::UnsupportedKeyWrapAlgorithm)));
 	}
 
-	#[test]
-	fn wrap_unwrap_roundtrip_all_kek_sizes() -> Result<(), Box<dyn std::error::Error>> {
+	const ROUND_TRIP_CEK: [u8; 32] = [0x42u8; 32];
+
+	/// The CEK after a wrap and unwrap under a KEK of `kek_size` bytes.
+	fn round_trip_under_kek(kek_size: usize) -> SecretSlice<u8> {
 		let provider = DefaultCryptoProvider::default();
-		let cek = [0x42u8; 32];
-		for size in [16usize, 24, 32] {
-			let kek = vec![0x11u8; size];
-			let wrapped = wrap_with_kek(&provider, Kek::new(&kek), &cek)?;
-			let unwrapped = unwrap_with_kek(&provider, Kek::new(&kek), &wrapped)?;
-			assert_eq!(unwrapped, cek);
-		}
-		Ok(())
+		let kek = vec![0x11u8; kek_size];
+		let wrapped = wrap_with_kek(&provider, Kek::new(&kek), &ROUND_TRIP_CEK).expect("the CEK wraps");
+		unwrap_with_kek(&provider, Kek::new(&kek), &wrapped).expect("the wrapped CEK unwraps")
+	}
+
+	#[test]
+	fn a_128_bit_kek_round_trips_the_cek() {
+		assert_eq!(round_trip_under_kek(16).to_insecure().as_slice(), ROUND_TRIP_CEK);
+	}
+
+	#[test]
+	fn a_192_bit_kek_round_trips_the_cek() {
+		assert_eq!(round_trip_under_kek(24).to_insecure().as_slice(), ROUND_TRIP_CEK);
+	}
+
+	#[test]
+	fn a_256_bit_kek_round_trips_the_cek() {
+		assert_eq!(round_trip_under_kek(32).to_insecure().as_slice(), ROUND_TRIP_CEK);
 	}
 }

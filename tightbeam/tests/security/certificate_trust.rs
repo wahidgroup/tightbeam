@@ -15,10 +15,8 @@
 //! does not chain to a configured trust anchor.
 //!
 //! ## References
-//! - CWE-295: Improper Certificate Validation
-//!   <https://cwe.mitre.org/data/definitions/295.html>
-//! - CAPEC-94: Adversary in the Middle (AiTM)
-//!   <https://capec.mitre.org/data/definitions/94.html>
+//! - CWE-295: Improper Certificate Validation <https://cwe.mitre.org/data/definitions/295.html>
+//! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 //! - RFC 5280 §6: Certification Path Validation
 
 use std::sync::Arc;

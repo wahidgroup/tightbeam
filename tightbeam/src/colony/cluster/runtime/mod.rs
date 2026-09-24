@@ -38,7 +38,7 @@ use crate::colony::cluster::{
 };
 use crate::colony::common::{HeartbeatResult, TaskGroup};
 use crate::colony::servlet::servlet_runtime::rt;
-use crate::constants::DEFAULT_AD_RUMOR_REFRESH_MS;
+use crate::constants::{DEFAULT_AD_RUMOR_REFRESH_MS, DEFAULT_MAX_SERVER_CONNECTIONS};
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::macros::server::{serve_connection_service, AcceptedConnection};
@@ -50,6 +50,7 @@ use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::serve::{unimplemented_error, CallContext, MuxService};
 use crate::transport::{AsyncListenerTrait, Protocol, TransportEncryptionConfig, TransportError};
+use crate::utils::time::Clock;
 use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
@@ -68,8 +69,8 @@ impl ClusterConfig {
 	/// - Federated gateway with no export list: serves and advertises every
 	///   local type to external peers ([`CLUSTER_EXPORT_UNBOUNDED`]).
 	/// - Export list without captured client identity: every session stays
-	///   anonymous, so unexported targets are unreachable from the origin
-	///   plane as well ([`CLUSTER_EXPORT_IDENTITY_UNAVAILABLE`]).
+	///   anonymous, so unexported targets are unreachable from the origin plane
+	///   as well ([`CLUSTER_EXPORT_IDENTITY_UNAVAILABLE`]).
 	///
 	/// # Sources
 	///
@@ -99,12 +100,12 @@ impl ClusterConfig {
 	///
 	/// Both planes present the same certificate and key so an external edge
 	/// client pins the same gateway identity that hives already trust. An
-	/// empty `client_validators` list means server-auth only.
+	/// empty `client_validators` list means server-auth only, so the gateway
+	/// captures no client identity.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::SerializationError`] -- the configured
-	///   certificate does not decode.
+	/// - [`TightBeamError::SerializationError`] -- the configured certificate does not decode.
 	fn accept_encryption_config(&self) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
 		let (certificate, key_manager) = self.tls.identity().parts();
 		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
@@ -129,10 +130,10 @@ fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
 /// # Edge accept plane
 ///
 /// - `E` defaults to `P`, so a gateway without an edge declaration uses a single accept plane.
-/// - When [`ClusterConfig::edge_bind_addr`] is set, the gateway binds a second listener over `E`
-///   with the same TLS material.
-/// - Edge connections share the colony mux service but dispatch on the edge plane, which admits
-///   `Work` frames only.
+/// - When [`ClusterConfig::edge_bind_addr`] is set, the gateway binds a second
+///   listener over `E` with the same TLS material.
+/// - Edge connections share the colony mux service but dispatch on the edge
+///   plane, which admits `Work` frames only.
 /// - Hives and peers keep using the colony plane at [`Cluster::addr`].
 pub struct ClusterGateway<P, D = Sha3_256, E = P>
 where
@@ -210,8 +211,7 @@ where
 
 		let config = Arc::new(config);
 
-		// When x509 is enabled, the gateway always serves TLS. An empty
-		// client_validators list means server-auth only (no captured identity).
+		// When x509 is enabled, the gateway always serves TLS.
 		let bind_addr = match config.bind_addr.as_deref() {
 			Some(raw) => raw.parse().map_err(|_| TransportError::InvalidMessage)?,
 			None => P::default_bind_address().map_err(protocol_error)?,
@@ -262,16 +262,16 @@ where
 		};
 
 		// Export posture is colony-wide configuration, so the one startup
-		// path reports it once rather than each accept plane.
+		// path reports it once for all accept planes.
 		config.warn_export_posture(&trace)?;
 
-		// The context is all Arc::clone
+		// Every field of the context is an `Arc`, so the clone is cheap.
 		let server_handle = ctx.clone().serve_colony::<P::Listener, D>(listener);
 
-		// The edge plane serves [`EdgeMuxService`], which submits work and
-		// has no control or stream route to reach.
+		// The edge plane serves [`EdgeMuxService`], whose only route is work
+		// submission.
 		let edge_handle = edge_listener.map(|edge_listener| {
-			// The context is all Arc::clone
+			// Every field of the context is an `Arc`, so the clone is cheap.
 			ctx.clone().serve_edge::<E::Listener, D>(edge_listener)
 		});
 
@@ -428,11 +428,11 @@ where
 
 /// Gateway implementation of [`MuxService`] for an edge accept plane.
 ///
-/// An edge plane serves external clients, so it submits work and nothing
-/// else. The type carries that boundary: it has no stream or duplex route
-/// to reach, and its unary arm narrows the envelope to a work request
-/// through [`GatewayRuntimeCtx::handle_edge_request`]. Registration, peer
-/// advertisement, and gossip stay on the colony plane.
+/// An edge plane serves external clients, so work submission is its only
+/// route. The type carries that boundary. Its unary arm narrows the envelope
+/// to a work request through [`GatewayRuntimeCtx::handle_edge_request`], and
+/// it offers no stream or duplex route. Registration, peer advertisement,
+/// and gossip stay on the colony plane.
 struct EdgeMuxService<P, D>
 where
 	P: Protocol,
@@ -559,8 +559,9 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		D: ClusterDigest,
 	{
 		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
+		let clock = Arc::clone(&self.config.clock);
 		let service = GatewayMuxService::<P, D> { ctx: self, _digest: PhantomData };
-		Self::accept_into(listener, mux_offer, service)
+		Self::accept_into(listener, mux_offer, clock, service)
 	}
 
 	/// Serves an edge accept plane through [`EdgeMuxService`].
@@ -574,14 +575,21 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 		D: ClusterDigest,
 	{
 		let mux_offer = self.config.pool_config.mux_offer.as_ref().map(Arc::clone);
+		let clock = Arc::clone(&self.config.clock);
 		let service = EdgeMuxService::<P, D> { ctx: self, _digest: PhantomData };
-		Self::accept_into(listener, mux_offer, service)
+		Self::accept_into(listener, mux_offer, clock, service)
 	}
 
 	/// Accepts on `listener`, dispatching every connection through `service`.
 	///
-	/// Each admitted transport shares one mux offer by reference count.
-	fn accept_into<L, S>(listener: L, mux_offer: Option<Arc<TransportOffer>>, service: S) -> rt::JoinHandle
+	/// Each admitted transport shares one mux offer by reference count, and
+	/// accept retries wait on `clock`, the gateway's own.
+	fn accept_into<L, S>(
+		listener: L,
+		mux_offer: Option<Arc<TransportOffer>>,
+		clock: Arc<dyn Clock>,
+		service: S,
+	) -> rt::JoinHandle
 	where
 		L: AsyncListenerTrait + Sync + 'static,
 		L::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
@@ -589,7 +597,8 @@ impl<P: GatewayColonyProtocol> GatewayRuntimeCtx<P> {
 	{
 		let service = Arc::new(service);
 
-		rt::spawn(AcceptPlane::default().accept_on(listener, move |mut transport: L::Transport| {
+		let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, clock);
+		rt::spawn(plane.accept_on(listener, move |mut transport: L::Transport| {
 			// Clone the Arc so each accept shares the mux offer without
 			// copying authorization octets.
 			transport = transport.with_mux_offer(mux_offer.clone());

@@ -17,7 +17,9 @@ pub type CompressionResult<T> = core::result::Result<T, CompressionError>;
 /// Error indicating a mismatch between received and expected values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ReceivedExpectedError<Received, Expected> {
+	/// The value that arrived.
 	pub received: Received,
+	/// The value that the check expected.
 	pub expected: Expected,
 }
 
@@ -35,6 +37,7 @@ impl<Received: core::fmt::Debug, Expected: core::fmt::Debug> core::fmt::Display
 	}
 }
 
+/// Errors that compression and decompression return.
 #[cfg(feature = "compress")]
 #[derive(Errorizable, Debug)]
 pub enum CompressionError {
@@ -68,11 +71,13 @@ pub enum CompressionError {
 	#[error("zstd decoder stalled without consuming input")]
 	Stalled,
 
+	/// An I/O operation failed during compression or decompression.
 	#[cfg(feature = "std")]
 	#[error("I/O error during compression/decompression: {0}")]
 	#[source]
 	IO(std::io::Error),
 
+	/// The decompressed output exceeds the byte limit that the variant carries.
 	#[cfg(feature = "zstd")]
 	#[error("decompressed output exceeds the {0}-byte limit")]
 	OutputLimitExceeded(usize),
@@ -82,7 +87,6 @@ pub enum CompressionError {
 #[cfg(feature = "testing-fault")]
 pub trait InjectedError: core::fmt::Debug + core::fmt::Display + Send + Sync {}
 
-// Blanket implementation for any type meeting the requirements.
 #[cfg(feature = "testing-fault")]
 impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Send + Sync {}
 
@@ -133,212 +137,216 @@ impl core::fmt::Display for ErrorChain {
 	}
 }
 
+/// The top-level error type of the crate.
 #[derive(Errorizable, Debug)]
 #[non_exhaustive]
 pub enum TightBeamError {
-	/// Error from the matrix implementation
+	/// The matrix implementation reported an error.
 	#[error("Matrix error: {0}")]
 	#[source]
 	MatrixError(crate::matrix::MatrixError),
 
+	/// The router reported an error.
 	#[cfg(feature = "router")]
 	#[error("Route error: {0}")]
 	#[source]
 	RouterError(crate::router::RouterError),
 
-	/// Error from the message builder
+	/// The message builder reported an error.
 	#[cfg(feature = "builder")]
 	#[error("Build error: {0}")]
 	#[source]
 	BuildError(crate::builder::error::BuildError),
 
-	/// Error from the standards module.
+	/// The standards module reported an error.
 	#[cfg(feature = "standards")]
 	#[error("Standard error: {0}")]
 	#[source]
 	StandardError(crate::standards::error::StandardError),
 
+	/// A hive reported an error.
 	#[cfg(feature = "colony")]
 	#[error("Hive error: {0}")]
 	#[source]
 	HiveError(crate::colony::hive::HiveError),
 
+	/// A worker relay reported an error.
 	#[cfg(feature = "colony")]
 	#[error("Worker relay error: {0}")]
 	#[source]
 	WorkerRelay(crate::colony::worker::WorkerRelayError),
 
 	#[cfg(feature = "std")]
-	/// I/O error
+	/// An I/O operation failed.
 	#[error("I/O error: {0}")]
 	#[source]
 	IoError(std::io::Error),
 
 	#[cfg(feature = "std")]
-	/// Lock poisoned
+	/// A lock is poisoned.
 	#[error("Lock poisoned")]
 	LockPoisoned,
 
-	/// Invalid or unsupported algorithm identifier
+	/// The algorithm identifier is invalid or unsupported.
 	#[error("Invalid or unsupported object identifier: {0}")]
 	InvalidOID(crate::der::oid::Error),
 
-	/// Error during signature verification or generation
+	/// Signature verification or generation failed.
 	#[cfg(feature = "signature")]
 	#[error("Signature verification or generation error: {0}")]
 	#[source]
 	SignatureError(crate::crypto::sign::Error),
 
-	/// Error from elliptic curve operations
+	/// An elliptic curve operation failed.
 	#[cfg(feature = "signature")]
 	#[error("Elliptic curve error: {0}")]
 	#[source]
 	EllipticCurveError(crate::crypto::sign::elliptic_curve::Error),
 
-	/// Error during serialization
+	/// Serialization failed.
 	#[error("Serialization error: {0}")]
 	#[source]
 	SerializationError(crate::der::Error),
 
-	/// Error during compression or decompression
+	/// Compression or decompression failed.
 	#[cfg(feature = "compress")]
 	#[error("Compression error: {0}")]
 	#[source]
 	CompressionError(CompressionError),
 
-	/// Error during handshake operations
+	/// A handshake operation failed.
 	#[cfg(feature = "transport")]
 	#[error("Handshake error: {0}")]
 	#[source]
 	HandshakeError(crate::transport::handshake::HandshakeError),
 
+	/// The transport reported an error.
 	#[cfg(feature = "transport")]
 	#[error("Transport error: {0}")]
 	#[source]
 	TransportError(crate::transport::error::TransportError),
 
-	/// Unsupported protocol version
+	/// The protocol version is not supported.
 	#[error("Unsupported protocol version: {0}")]
 	UnsupportedVersion(ReceivedExpectedError<Version, Version>),
 
-	/// Error during testing operations
+	/// A testing operation failed.
 	#[cfg(feature = "testing")]
 	#[error("Testing error: {0}")]
 	#[source]
 	TestingError(crate::testing::error::TestingError),
 
-	/// Error during URN validation
+	/// URN validation failed.
 	#[error("URN validation error: {0}")]
 	#[source]
 	UrnValidationError(crate::utils::urn::UrnValidationError),
 
-	/// Error during encryption or decryption
+	/// Encryption or decryption failed.
 	#[cfg(feature = "aead")]
 	#[error("Encryption or decryption error: {0}")]
 	#[source]
 	EncryptionError(crate::crypto::aead::Error),
 
-	/// Invalid key length for cryptographic operations
+	/// The key length is invalid for the cryptographic operation.
 	#[cfg(feature = "aead")]
 	#[error("Invalid key length: {0}")]
 	#[source]
 	InvalidKeyLength(crypto_common::InvalidLength),
 
-	/// Error during ECIES operations
+	/// An ECIES operation failed.
 	#[cfg(feature = "ecies")]
 	#[error("ECIES error: {0}")]
 	#[source]
 	EciesError(crate::crypto::ecies::EciesError),
 
-	/// Error during certificate validation
+	/// Certificate validation failed.
 	#[cfg(feature = "x509")]
 	#[error("Certificate validation error: {0}")]
 	#[source]
 	CertificateValidationError(crate::crypto::x509::error::CertificateValidationError),
 
+	/// Key derivation failed.
 	#[cfg(feature = "kdf")]
 	#[error("Key derivation error: {0}")]
 	#[source]
 	KeyDerivationError(crate::crypto::kdf::KdfError),
 
-	/// Error from key provider operations
+	/// A key provider operation failed.
 	#[cfg(feature = "crypto")]
 	#[error("Key provider error: {0}")]
 	#[source]
 	KeyError(crate::crypto::key::KeyError),
 
-	/// Secret material was unavailable
-	#[cfg(feature = "crypto")]
-	#[error("Secret unavailable: {0}")]
-	#[source]
-	SecretUnavailable(crate::crypto::secret::SecretError),
-
-	/// Error obtaining random bytes from the OS
+	/// The OS failed to provide random bytes.
 	#[cfg(feature = "random")]
 	#[error("OS random number generator error: {0}")]
 	#[source]
 	OsRngError(rand_core::Error),
 
-	/// Error during SPKI operations
+	/// An SPKI operation failed.
 	#[cfg(feature = "x509")]
 	#[error("SPKI error: {0}")]
 	#[source]
 	SpkiError(crate::spki::Error),
 
-	/// Error during X.509 certificate building
+	/// Building an X.509 certificate failed.
 	#[cfg(feature = "builder")]
 	#[error("X.509 builder error: {0}")]
 	#[source]
 	X509BuilderError(x509_cert::builder::Error),
 
-	/// Error receiving from channel with timeout
+	/// A channel receive with a timeout failed.
 	#[cfg(feature = "std")]
 	#[error("Channel receive timeout error")]
 	RecvTimeoutError,
 
-	/// Error decoding signature from bytes
+	/// The signature bytes failed to decode.
 	#[cfg(feature = "signature")]
 	#[error("Signature encoding error")]
 	SignatureEncodingError,
 
-	/// Invalid metadata
+	/// The metadata is invalid.
 	#[error("Invalid metadata")]
 	InvalidMetadata,
 
-	/// Invalid message body
+	/// The message body is invalid.
 	#[error("Invalid message body")]
 	InvalidBody,
 
-	/// Invalid overflow value
+	/// The overflow value is invalid.
 	#[error("Invalid overflow value")]
 	InvalidOverflowValue,
 
-	/// Invalid order
+	/// The order is invalid.
 	#[error("Invalid order")]
 	InvalidOrder,
 
-	/// Missing order
+	/// The order is missing.
 	#[error("Missing order")]
 	MissingOrder,
 
-	/// Missing inflator
+	/// The inflator is missing.
 	#[error("Missing inflator")]
 	MissingInflator,
 
-	/// Missing feature
+	/// A required feature is missing.
 	#[error("Missing feature: {0}")]
 	MissingFeature(&'static str),
 
-	/// Missing priority
-	#[error("Missing priority")]
-	MissingPriority,
+	/// A message type's marker requires a protection the builder was not
+	/// given.
+	///
+	/// `marker` names the [`Message`](crate::core::Message) constant and
+	/// `call` the builder method that satisfies it.
+	#[error("{marker} requires {call} before build")]
+	MissingProtection { marker: &'static str, call: &'static str },
 
-	/// Missing response
+	/// The response is missing.
 	#[error("Missing response")]
 	MissingResponse,
 
-	/// Work refused by the cluster. The gateway reported a non-`Ok`
-	/// transit status instead of a servlet response frame.
+	/// The cluster refused the work. The gateway reported a non-`Ok` transit
+	/// status in place of a servlet response frame.
 	#[cfg(feature = "policy")]
 	#[error("Work refused: {0:?}")]
 	WorkRefused(crate::policy::TransitStatus),
@@ -347,96 +355,89 @@ pub enum TightBeamError {
 	#[error("Channel closed")]
 	ChannelClosed,
 
-	/// Signature is missing
+	/// The signature is missing.
 	#[cfg(feature = "signature")]
 	#[error("Missing signature")]
 	MissingSignature,
 
-	/// Signature info is missing
+	/// The signature info is missing.
 	#[cfg(feature = "signature")]
 	#[error("Missing signature info")]
 	MissingSignatureInfo,
 
-	/// Missing Encryption Info
+	/// The encryption info is missing.
 	#[cfg(feature = "aead")]
 	#[error("Missing encryption info")]
 	MissingEncryptionInfo,
 
-	/// AEAD nonce length does not match the cipher's nonce size
+	/// The AEAD nonce length does not match the nonce size of the cipher.
 	#[cfg(feature = "aead")]
 	#[error("Invalid AEAD nonce length: {0}")]
 	InvalidNonceLength(ReceivedExpectedError<usize, usize>),
 
-	/// Commitment salt shorter than the hiding floor
+	/// The commitment salt is shorter than the hiding floor.
 	#[cfg(feature = "digest")]
 	#[error("Invalid commitment salt length: {0}")]
 	InvalidSaltLength(ReceivedExpectedError<usize, usize>),
 
-	/// Send-direction AEAD counter nonce space exhausted
+	/// The send-direction AEAD counter nonce space is exhausted.
 	#[cfg(feature = "aead")]
 	#[error("AEAD counter nonce space exhausted")]
 	NonceExhausted,
 
-	/// Send-direction AEAD record limit reached (RFC 9846 § 5.5)
+	/// The send-direction AEAD record limit is reached (RFC 9846 § 5.5).
 	#[cfg(feature = "aead")]
 	#[error("AEAD record limit reached: reestablish the session to rekey")]
 	RekeyRequired,
 
-	/// Received AEAD counter nonce is not the exact next in sequence
-	/// (replay, reorder, or deletion)
+	/// The received AEAD counter nonce is not the exact next in sequence, which
+	/// signals a replay, a reorder, or a deletion.
 	#[cfg(feature = "aead")]
 	#[error("Out-of-sequence AEAD nonce: {0}")]
 	NonceReplayed(ReceivedExpectedError<u64, u64>),
 
-	/// Missing Integrity Info
+	/// The integrity info is missing.
 	#[cfg(feature = "digest")]
 	#[error("Missing integrity info")]
 	MissingDigestInfo,
 
-	/// Missing Compression Info
-	#[error("Missing compression info")]
-	MissingCompressedData,
-
-	/// Invalid algorithm for the message profile
+	/// The algorithm is invalid for the message profile.
 	#[error("Invalid algorithm for message profile")]
 	InvalidAlgorithm,
 
-	/// Unexpected algorithm for the message profile
+	/// The algorithm is unexpected for the message profile.
 	#[error("Unexpected algorithm for message profile: {0}")]
 	UnexpectedAlgorithm(ReceivedExpectedError<ObjectIdentifier, ObjectIdentifier>),
 
-	/// Missing or invalid configuration
+	/// The configuration is missing or invalid.
 	#[error("Missing configuration")]
 	MissingConfiguration,
 
-	/// Operation not supported by this implementation
-	#[error("Unsupported operation")]
-	UnsupportedOperation,
-
-	/// Hive already established
+	/// The hive is already established.
 	#[cfg(feature = "colony")]
 	#[error("Hive already established")]
 	AlreadyEstablished,
 
-	/// Hive has not been established yet
+	/// The hive is not established yet.
 	///
-	/// Cluster registration and other control-plane operations require a
-	/// bound control listener. Call [`Hive::establish`](crate::colony::hive::Hive::establish)
-	/// first so the registered address matches the live accept socket.
+	/// Cluster registration and other control-plane operations require a bound
+	/// control listener. Call
+	/// [`Hive::establish`](crate::colony::hive::Hive::establish) first so the
+	/// registered address matches the live accept socket.
 	#[cfg(feature = "colony")]
 	#[error("Hive not established")]
 	NotEstablished,
 
-	/// Task join error
+	/// A task join failed.
 	#[cfg(feature = "colony")]
 	#[error("Task join failed")]
 	JoinError,
 
-	/// Multiple errors collected together
+	/// Several errors were collected together.
 	#[error("Multiple errors occurred: {0}")]
 	Sequence(ErrorChain),
 
-	/// Injected fault for testing (any error type)
+	/// A fault injected for testing, which can wrap any error type.
 	#[cfg(feature = "testing-fault")]
 	#[error("Injected fault: {0}")]
 	InjectedFault(Box<dyn InjectedError>),
@@ -454,8 +455,6 @@ crate::impl_from!(std::net::AddrParseError => TightBeamError::IoError via |err| 
 crate::impl_from!(crate::crypto::kdf::KdfError => TightBeamError::KeyDerivationError);
 #[cfg(feature = "crypto")]
 crate::impl_from!(crate::crypto::key::KeyError => TightBeamError::KeyError);
-#[cfg(feature = "crypto")]
-crate::impl_from!(crate::crypto::secret::SecretError => TightBeamError::SecretUnavailable);
 #[cfg(feature = "std")]
 crate::impl_from!(std::io::Error => TightBeamError::IoError);
 #[cfg(feature = "router")]
@@ -526,8 +525,9 @@ impl TightBeamError {
 	/// Terminal status a service failure answers a peer with.
 	///
 	/// A failure already carrying a transit status keeps it. Anything else
-	/// answers [`TransitStatus::Internal`](crate::policy::TransitStatus::Internal),
-	/// so a peer tells a failure apart from an accepted empty reply and the
+	/// answers
+	/// [`TransitStatus::Internal`](crate::policy::TransitStatus::Internal), so
+	/// a peer tells a failure apart from an accepted empty reply and the
 	/// failure stays attributable.
 	#[cfg(pooled_mux)]
 	#[must_use]

@@ -2,12 +2,12 @@ error[E0308]: mismatched types
   --> tests/compile/commitment_salt_bypass.rs:10:46
    |
 10 |     let _wrong_payload = CommitmentSalt::Hiding(too_short);
-   |                          ---------------------- ^^^^^^^^^ expected `HidingSalt`, found `Secret<[u8]>`
+   |                          ---------------------- ^^^^^^^^^ expected `HidingSalt`, found `Secret<Vec<u8>>`
    |                          |
    |                          arguments to this enum variant are incorrect
    |
    = note: expected struct `HidingSalt`
-              found struct `Secret<[u8]>`
+              found struct `Secret<Vec<u8>>`
 note: tuple variant defined here
   --> src/crypto/commitment.rs
    |
