@@ -5,11 +5,11 @@
 //! chosen once at construction rather than re-paired at each call.
 
 use core::hash::Hash;
-use core::str::{self, FromStr};
+use core::str::FromStr;
 use std::sync::Arc;
 
 use crate::colony::cluster::runtime::bounds::ClusterPool;
-use crate::colony::cluster::ClusterError;
+use crate::colony::cluster::{ClusterError, DialTarget};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::MuxConnector;
@@ -18,10 +18,10 @@ use crate::transport::state::EncryptedProtocolState;
 use crate::transport::{EncryptedProtocol, PersistentConnection, PooledClient, Protocol};
 use crate::{encode, Frame};
 
-/// A pool and the address to dial on it.
+/// A pool and the target to dial on it.
 pub(crate) struct Hop<'p, P: Protocol> {
 	pool: &'p Arc<ClusterPool<P>>,
-	addr: Arc<[u8]>,
+	dial: DialTarget,
 }
 
 impl<'p, P> Hop<'p, P>
@@ -42,9 +42,9 @@ where
 		+ Sync
 		+ 'static,
 {
-	/// Targets `addr` on `pool`.
-	pub(crate) fn new(pool: &'p Arc<ClusterPool<P>>, addr: Arc<[u8]>) -> Self {
-		Self { pool, addr }
+	/// Targets `dial` on `pool`.
+	pub(crate) fn new(pool: &'p Arc<ClusterPool<P>>, dial: DialTarget) -> Self {
+		Self { pool, dial }
 	}
 
 	/// Delivers a client's end-to-end frame and returns the peer's
@@ -77,14 +77,14 @@ where
 		Ok(response.into_message())
 	}
 
-	/// Parses the stored socket and opens a pooled connection to it.
+	/// Opens a pooled connection to the target.
 	///
-	/// This is the only place dial bytes become a protocol address, so a
-	/// stream open and a unary emit reach a peer through one parse.
+	/// The target becomes a protocol address through
+	/// [`DialTarget::protocol_address`], so a stream open and a unary emit
+	/// reach a peer through the one conversion every dial uses.
 	pub(crate) async fn connect(self) -> Result<PooledClient<P>, ClusterError> {
-		let addr_str = str::from_utf8(&self.addr).map_err(|_| ClusterError::InvalidAddress(self.addr.to_vec()))?;
-		let parsed_addr: P::Address = addr_str.parse().map_err(|_| ClusterError::InvalidAddress(self.addr.to_vec()))?;
-		self.pool.connect(parsed_addr).await.map_err(|_| ClusterError::ConnectFailed)
+		let address: P::Address = self.dial.protocol_address()?;
+		self.pool.connect(address).await.map_err(|_| ClusterError::ConnectFailed)
 	}
 
 	/// Dials the target, emits `frame`, and returns the reply frame.

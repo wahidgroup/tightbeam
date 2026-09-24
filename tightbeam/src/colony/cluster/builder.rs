@@ -336,13 +336,8 @@ impl ClusterConfigBuilder {
 		I: IntoIterator<Item = S>,
 		S: Into<String>,
 	{
-		let mut parsed = Vec::new();
-		for peer in peers {
-			let peer: String = peer.into();
-			parsed.push(peer.parse::<PeerAddress>().map_err(|_| ClusterError::InvalidPeerAddress)?);
-		}
-
-		self.peer.peers = parsed;
+		let spellings: Vec<String> = peers.into_iter().map(Into::into).collect();
+		self.peer.set_anchors(spellings)?;
 		Ok(self)
 	}
 
@@ -350,6 +345,25 @@ impl ClusterConfigBuilder {
 	pub fn with_advertise_interval(mut self, interval: Duration) -> Self {
 		self.peer.advertise_interval = Some(interval);
 		self
+	}
+
+	/// Set the socket this gateway advertises as its own gateway address.
+	///
+	/// The beat advertises the bound address by default. A gateway bound to
+	/// the wildcard address (`0.0.0.0` or `[::]`) would advertise a socket
+	/// every peer refuses, so it names the address peers dial here.
+	/// [`Cluster::start`] refuses a federating gateway that binds the
+	/// wildcard and sets no advertise address.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidPeerAddress`] -- the address names no socket.
+	///
+	/// [`Cluster::start`]: super::Cluster::start
+	pub fn with_advertise_addr(mut self, addr: impl AsRef<str>) -> Result<Self, ClusterError> {
+		let address: PeerAddress = addr.as_ref().parse()?;
+		self.peer.advertise_addr = Some(address);
+		Ok(self)
 	}
 
 	/// Restrict claimed peer dial addresses to this allowlist.
@@ -370,7 +384,7 @@ impl ClusterConfigBuilder {
 		let mut parsed = HashSet::new();
 		for entry in allowlist {
 			let entry: String = entry.into();
-			let address: PeerAddress = entry.parse().map_err(|_| ClusterError::InvalidPeerAddress)?;
+			let address: PeerAddress = entry.parse()?;
 			parsed.insert(address);
 		}
 
@@ -470,7 +484,7 @@ impl ClusterConfigBuilder {
 		// admission path. The anchor list is a one-time copy because
 		// `peers` stays readable configuration beside the table.
 		let mut peer = self.peer;
-		peer.table = Arc::new(PeerTable::new(peer.peers.clone(), self.peer_store));
+		peer.table = Arc::new(PeerTable::new(&peer, self.peer_store));
 
 		// Colony membership binds to the certificate's URI SAN, and every
 		// per-frame membership check compares against the cached value. A

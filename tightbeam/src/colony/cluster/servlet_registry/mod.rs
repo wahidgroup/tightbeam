@@ -26,7 +26,7 @@ pub use config::{
 	PeerCaps, PheromoneConfig, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_EVAPORATION_INTERVAL_SECS,
 	DEFAULT_EVAPORATION_RATE_BPS, DEFAULT_INITIAL_PHEROMONE, DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
 };
-pub use entry::{LocalRoute, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, ServletEntry};
+pub use entry::{DialTarget, LocalRoute, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, ServletEntry};
 
 use entry::Owner;
 
@@ -84,17 +84,10 @@ pub(super) struct Routes {
 impl Routes {
 	/// Whether `entry` may be placed at its key.
 	///
-	/// This is the one decider for route ownership, and it checks both axes
-	/// a route claims:
-	///
-	/// - Its key: a key no route holds, or that `entry`'s owner already
-	///   holds, admits it. A key another owner holds refuses it, so one hive
-	///   cannot take over the address another hive registered (CWE-639).
-	/// - Its dial address: a socket the other plane already dials refuses
-	///   it, so a hive cannot register a peer gateway's socket as a servlet
-	///   and a peer cannot advertise a local servlet's socket as its gateway.
-	///   Trails on one plane may share a socket, which is how a relay trail
-	///   dials the relay's own gateway.
+	/// This is the one decider for route ownership. `entry` is admitted when
+	/// its key is free or already held by its owner, and when its endpoint is
+	/// free or dialed by that owner alone (CWE-639). Peers may share an
+	/// endpoint, because a relay trail dials the relay's own gateway.
 	///
 	/// # Errors
 	///
@@ -109,11 +102,12 @@ impl Routes {
 			return Err(Self::refusal(owner));
 		}
 
-		let dial = entry.dial_target().as_ref();
-		let dialed_by_other_plane = self
-			.values()
-			.any(|held| held.owner().is_peer() != owner.is_peer() && held.dial_target().as_ref() == dial);
-		if dialed_by_other_plane {
+		let dial = entry.dial_target();
+		let dialed_by_other = self.values().any(|held| {
+			let both_peers = held.owner().is_peer() && owner.is_peer();
+			!both_peers && !held.owner().same(owner) && held.dial_target().same_endpoint(dial)
+		});
+		if dialed_by_other {
 			return Err(Self::refusal(owner));
 		}
 

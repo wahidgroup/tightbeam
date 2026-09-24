@@ -319,6 +319,11 @@ where
 		// submission.
 		let edge_handle = edge_listener.map(|edge_listener| ctx.clone().serve_edge::<E::Listener, D>(edge_listener));
 
+		// The advertised address is decided before any task spawns, so a
+		// federating gateway on the wildcard address refuses to start.
+		let gateway_bytes: Vec<u8> = addr.clone().into();
+		let gateway_addr = config.peer.advertised_address(gateway_bytes)?;
+
 		tasks.adopt(ctx.clone().spawn_heartbeat::<D>());
 
 		// Three refresh intervals of silence retire a relay trail: one missed
@@ -331,11 +336,7 @@ where
 			.max(Duration::from_millis(DEFAULT_AD_RUMOR_REFRESH_MS));
 
 		tasks.adopt(ctx.clone().spawn_evaporation(relay_trail_ttl));
-
-		{
-			let gateway_bytes: Vec<u8> = addr.clone().into();
-			tasks.adopt(ctx.clone().spawn_advertise::<D>(Arc::from(gateway_bytes)));
-		}
+		tasks.adopt(ctx.clone().spawn_advertise::<D>(gateway_addr));
 
 		Ok(Self {
 			registry,

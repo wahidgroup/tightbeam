@@ -85,6 +85,9 @@ pub(crate) const PEER_PROBE_FOREIGN_REFUSED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-probe-foreign-refused");
 pub(crate) const PEER_HINT_LEARNED_ON_REFUSE: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-hint-learned-on-refuse");
+pub(crate) const WILDCARD_START_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/wildcard-start-refused");
+pub(crate) const PEER_ROUTE_DIALS_ADVERTISED_ADDR: Urn<'static> =
+	tightbeam::urn!("test", "event:cluster/peer-route-dials-advertised-addr");
 pub(crate) const PEER_ABUSE_CANDIDATE_DISCARDED: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/peer-abuse-candidate-discarded");
 pub(crate) const PEER_EVICT_MEMBER_PROMOTED: Urn<'static> =

@@ -988,3 +988,38 @@ tb_scenario! {
 		}
 	}
 }
+
+tb_assert_spec! {
+	pub ClusterUndialableHiveSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(REGISTRY_HIVES, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// Admitting a hive the heartbeat cannot dial would leave it to expire at the
+// lease timeout with no refusal to show for it.
+tb_scenario! {
+	name: cluster_refuses_a_hive_whose_control_address_the_protocol_cannot_dial,
+	spec: ClusterUndialableHiveSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+
+			let response = register_signed_hive(&mut client, &certs.key, b"reg-undialable", b"hive.example:9000").await?;
+			trace.event_with(REGISTER_STATUS, &[], response.status)?;
+			trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count()? as u64)?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}

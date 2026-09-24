@@ -2,6 +2,7 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use super::{ClusterError, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, SharedId};
+use crate::colony::cluster::PeerAddress;
 use crate::colony::common::ServletTypeKey;
 
 impl ServletRegistry {
@@ -167,21 +168,21 @@ impl ServletRegistry {
 		Ok(weakened)
 	}
 
-	/// Weakens every live peer route that dials `dial_addr`, relay trails
+	/// Weakens every live peer route that dials `gateway`, relay trails
 	/// included, and returns how many it weakened. A misbehaving gateway
 	/// therefore weakens every trail through it.
 	///
 	/// # Errors
 	///
 	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
-	pub fn weaken_peer_by_dial(&self, dial_addr: impl AsRef<[u8]>) -> Result<usize, ClusterError> {
-		let dial_addr = dial_addr.as_ref();
+	pub fn weaken_peer_by_dial(&self, gateway: impl Into<PeerAddress>) -> Result<usize, ClusterError> {
+		let gateway: PeerAddress = gateway.into();
 		let routes = self.routes.read()?;
 		let weakened = routes
 			.values()
 			.filter(|entry| entry.route_kind().is_peer())
 			.filter(|entry| entry.is_live())
-			.filter(|entry| entry.dial_target().as_ref() == dial_addr)
+			.filter(|entry| entry.dial_target().socket() == Some(gateway))
 			.map(|entry| entry.weaken())
 			.count();
 

@@ -1959,18 +1959,21 @@ tb_scenario! {
 			let conf = peering_cluster_conf_with_peers(&certs, vec![anchor.to_string()]);
 			let table = Arc::clone(conf.peer.table());
 			let flood: Vec<PeerHint> = (0..MAX_PEER_BUCKET + 8)
-				.map(|host| PeerHint { gateway_addr: peer_addr(format!("10.66.0.{}:9000", host + 1)), peer_id: None })
+				.map(|host| PeerHint {
+					dial: dial_admitted_by(&conf, format!("10.66.0.{}:9000", host + 1)),
+					peer_id: None,
+				})
 				.collect();
 
 			let admitted = table.learn(flood.clone()).unwrap_or_default();
 			trace.event_with(PEER_TABLE_FLOOD_ADMITTED, &[], admitted as u64)?;
 
 			for hint in &flood {
-				let _ = table.promote(hint.gateway_addr, None, UnixMillis::now());
+				let _ = table.promote(hint.dial, None, UnixMillis::now());
 			}
 
 			let targets = table.target_set().unwrap_or_default();
-			trace.event_with(PEER_TABLE_ANCHOR_RETAINED, &[], targets.first() == Some(&anchor))?;
+			trace.event_with(PEER_TABLE_ANCHOR_RETAINED, &[], targets.first().map(AdmittedDial::address) == Some(anchor))?;
 			trace.event_with(PEER_TABLE_TARGETS_BOUNDED, &[], targets.len() <= MAX_PEER_BUCKET + 1)?;
 			Ok(())
 		}
@@ -2075,13 +2078,13 @@ tb_scenario! {
 			let member = start_cluster(&trace, member_conf).await?;
 			let prober_conf = probing_cluster_conf(&ctx);
 			let table = Arc::clone(prober_conf.peer.table());
+			let foreign_addr = dial_admitted_by(&prober_conf, cluster.addr().to_string());
+			let member_addr = dial_admitted_by(&prober_conf, member.addr().to_string());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let foreign_addr = peer_addr(cluster.addr().to_string());
-			let member_addr = peer_addr(member.addr().to_string());
 			let hints = vec![
-				PeerHint { gateway_addr: foreign_addr, peer_id: None },
-				PeerHint { gateway_addr: member_addr, peer_id: None },
+				PeerHint { dial: foreign_addr, peer_id: None },
+				PeerHint { dial: member_addr, peer_id: None },
 			];
 
 			let admitted = table.learn(hints).unwrap_or_default();
@@ -2105,6 +2108,14 @@ fn peer_addr(text: impl AsRef<str>) -> PeerAddress {
 	text.as_ref().parse().expect("fixture address parses as a socket")
 }
 
+/// The fixture dial address `text`, admitted by `conf`'s dial policy the
+/// way a peer-exchange entry is admitted before the table learns it.
+fn dial_admitted_by(conf: &ClusterConfig, text: impl AsRef<str>) -> AdmittedDial {
+	let socket = peer_addr(text);
+	let admitted = conf.peer.admit_dial(socket);
+	admitted.expect("the fixture plane admits every fixture socket")
+}
+
 /// Waits until `table` has promoted at least `count` learned peers.
 ///
 /// `CLUSTER_PEER_DISCOVERED` fires on that promotion, which the advertise beat
@@ -2120,7 +2131,7 @@ async fn wait_for_promoted(table: &PeerTable, count: usize, attempts: u32, inter
 ///
 /// Eviction runs on the advertise beat's cadence, so only a poll can observe
 /// the outcome.
-async fn wait_for_target_dropped(table: &PeerTable, addr: PeerAddress, attempts: u32, interval: Duration) -> bool {
+async fn wait_for_target_dropped(table: &PeerTable, addr: AdmittedDial, attempts: u32, interval: Duration) -> bool {
 	let dropped = || table.target_set().is_ok_and(|targets| !targets.contains(&addr));
 	poll_until(attempts, interval, dropped).await
 }
@@ -2179,13 +2190,13 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let (rogue, rogue_addr) = start_oversized_reconcile_server(&certs).await?;
-			let rogue_addr = peer_addr(rogue_addr);
 
 			let prober_conf = fast_probing_conf(&certs, Arc::clone(&certs.trust));
 			let table = Arc::clone(prober_conf.peer.table());
+			let rogue_addr = dial_admitted_by(&prober_conf, rogue_addr);
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let _ = table.learn(vec![PeerHint { gateway_addr: rogue_addr, peer_id: None }]);
+			let _ = table.learn(vec![PeerHint { dial: rogue_addr, peer_id: None }]);
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
 			let targets = table.target_set().unwrap_or_default();
@@ -2240,10 +2251,10 @@ tb_scenario! {
 			prober_conf.pool_config.idle_timeout = Some(Duration::from_millis(50));
 
 			let table = Arc::clone(prober_conf.peer.table());
+			let member_addr = dial_admitted_by(&prober_conf, cluster.addr().to_string());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let member_addr = peer_addr(cluster.addr().to_string());
-			let _ = table.learn(vec![PeerHint { gateway_addr: member_addr, peer_id: None }]);
+			let _ = table.learn(vec![PeerHint { dial: member_addr, peer_id: None }]);
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
 			let targets = table.target_set().unwrap_or_default();
@@ -2370,10 +2381,10 @@ tb_scenario! {
 			prober_conf.gossip.journal = Arc::clone(&journal) as Arc<dyn GossipJournal>;
 
 			let table = Arc::clone(prober_conf.peer.table());
+			let member_addr = dial_admitted_by(&prober_conf, cluster.addr().to_string());
 			let prober = start_cluster(&trace, prober_conf).await?;
 
-			let member_addr = peer_addr(cluster.addr().to_string());
-			let _ = table.learn(vec![PeerHint { gateway_addr: member_addr, peer_id: None }]);
+			let _ = table.learn(vec![PeerHint { dial: member_addr, peer_id: None }]);
 
 			let drained = wait_for_new_candidates_drained(&table, 50, Duration::from_millis(100)).await;
 			let targets = table.target_set().unwrap_or_default();

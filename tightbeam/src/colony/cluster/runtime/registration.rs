@@ -1,9 +1,10 @@
 //! Hive registration and servlet address-update request handlers.
 
+use core::str::FromStr;
 use std::sync::Arc;
 
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
-use crate::colony::cluster::ClusterError;
+use crate::colony::cluster::{ClusterError, DialTarget};
 use crate::colony::common::{reply_frame, RegisterHiveRequest, ServletAddressUpdate};
 use crate::colony::hive::{RegisterHiveResponse, ServletAddressUpdateResponse};
 use crate::instrumentation::events::{
@@ -20,7 +21,10 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		&self,
 		frame: Frame,
 		request: RegisterHiveRequest,
-	) -> Result<Option<Frame>, TightBeamError> {
+	) -> Result<Option<Frame>, TightBeamError>
+	where
+		P::Address: FromStr,
+	{
 		if let Err(status) = self.admit_hive_control(&frame) {
 			return self.refuse_register(&frame, status);
 		}
@@ -39,6 +43,14 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
 
+		// The heartbeat dials the control address, so a hive the protocol
+		// cannot parse would register, go unbeaten, and leave by silent
+		// eviction. The check runs before anything is installed.
+		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
+		if DialTarget::of_registered(&hive_addr).protocol_address::<P::Address>().is_err() {
+			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
+		}
+
 		// A hive registered with no signer is claimable by the next signer
 		// that names it, so an identifier that does not encode refuses here
 		// rather than installing an unbound entry (CWE-639).
@@ -46,7 +58,6 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
 
-		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
 		let slate = self.config.pheromone.servlet_slate(&request.servlet_addresses, &hive_addr);
 		// The membership step installs the hive entry and its full slate
 		// atomically, or rolls both back. A re-registration replaces the

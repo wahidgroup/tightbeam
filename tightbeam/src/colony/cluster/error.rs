@@ -1,5 +1,7 @@
 //! Cluster gateway error types.
 
+use core::net::AddrParseError;
+
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportError;
 use crate::{Errorizable, TightBeamError};
@@ -18,6 +20,11 @@ pub enum ClusterError {
 	/// A configured peer or allowlist entry names no socket address
 	#[error("Peer address does not parse")]
 	InvalidPeerAddress,
+
+	/// A federating gateway bound the wildcard address and configured no
+	/// advertise address, so every peer would refuse its advertisement.
+	#[error("A wildcard bind needs an advertise address to federate")]
+	AdvertiseAddressRequired,
 
 	/// Unknown servlet type
 	#[error("Unknown servlet type: {:#?}")]
@@ -92,6 +99,12 @@ pub enum ClusterError {
 	/// Reconcile reply exceeded the want-list or peer-exchange cap
 	#[error("Oversized reconcile reply")]
 	OversizedReconcileReply,
+}
+
+impl From<AddrParseError> for ClusterError {
+	fn from(_: AddrParseError) -> Self {
+		Self::InvalidPeerAddress
+	}
 }
 
 impl ClusterError {

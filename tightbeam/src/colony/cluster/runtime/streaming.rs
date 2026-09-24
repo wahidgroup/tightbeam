@@ -20,7 +20,7 @@ use futures::future::try_join;
 use crate::colony::cluster::runtime::bounds::{ClusterPool, GatewayRuntimeCtx};
 use crate::colony::cluster::runtime::hop::Hop;
 use crate::colony::cluster::runtime::work::RouteChoice;
-use crate::colony::cluster::{HopBudget, RouteKind};
+use crate::colony::cluster::{DialTarget, HopBudget, RouteKind};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::instrumentation::events::CLUSTER_WORK_FORWARDED;
 use crate::policy::TransitStatus;
@@ -35,13 +35,13 @@ use crate::{Frame, TightBeamError};
 
 /// The dialing plan a splice follows once a route is chosen.
 ///
-/// - `pool` and `dial_addr` name the socket to open on.
+/// - `pool` and `dial` name the endpoint to open on.
 /// - `route` is stamped on that open.
 /// - `route_key` is the pheromone key the outcome reinforces or
 ///   weakens.
 struct SplicePlan<P: Protocol> {
 	pool: Arc<ClusterPool<P>>,
-	dial_addr: Arc<[u8]>,
+	dial: DialTarget,
 	route: StreamRoute,
 	route_key: Arc<[u8]>,
 	is_peer: bool,
@@ -77,7 +77,7 @@ where
 	/// Dial this plan's socket on its pool: the shared connect step of
 	/// both splices. A failed dial refuses as `Unavailable`.
 	async fn dial(&self) -> Result<PooledClient<P>, TightBeamError> {
-		Hop::new(&self.pool, Arc::clone(&self.dial_addr))
+		Hop::new(&self.pool, self.dial.clone())
 			.connect()
 			.await
 			.map_err(|_| TransitStatus::Unavailable.refusal())
@@ -122,7 +122,7 @@ where
 		let Some(type_key) = self.config.namespace.servlet_type_key(target) else {
 			return Err(TransitStatus::PermissionDenied);
 		};
-		let RouteChoice { route_key, dial_addr, route_kind } = self
+		let RouteChoice { route_key, dial, route_kind } = self
 			.servlet_registry
 			.select_route(&self.config, &type_key, budget, exclude)
 			.ok_or(TransitStatus::Unavailable)?;
@@ -130,7 +130,7 @@ where
 		match route_kind {
 			RouteKind::Local => Ok(SplicePlan {
 				pool: Arc::clone(&self.pool),
-				dial_addr,
+				dial,
 				route: StreamRoute::local(),
 				route_key,
 				is_peer: false,
@@ -139,7 +139,7 @@ where
 				let peer_pool = self.peer_pool.as_ref().ok_or(TransitStatus::Unavailable)?;
 				Ok(SplicePlan {
 					pool: Arc::clone(peer_pool),
-					dial_addr,
+					dial,
 					route: budget.relayed_route(target),
 					route_key,
 					is_peer: true,

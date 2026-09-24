@@ -53,9 +53,9 @@ pub use tightbeam::{
 	builder::TypeBuilder,
 	colony::{
 		cluster::{
-			Admission, Cluster, ClusterConfig, ClusterError, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest,
-			ClusterWorkResponse, GossipAdmission, GossipConfig, GossipDigest, GossipJournal, HeartbeatConfig,
-			LocalClaim, MemoryGossipJournal, PeerAddress, PeerHint, PeerTable, TokenBucketAdmission,
+			Admission, AdmittedDial, Cluster, ClusterConfig, ClusterError, ClusterRequest, ClusterTlsConfig,
+			ClusterWorkRequest, ClusterWorkResponse, GossipAdmission, GossipConfig, GossipDigest, GossipJournal,
+			HeartbeatConfig, LocalClaim, MemoryGossipJournal, PeerAddress, PeerHint, PeerTable, TokenBucketAdmission,
 		},
 		common::{
 			ColonyNamespace, GossipReconciliation, GossipResponse, GossipRumor, GossipWant, InstanceMetrics,

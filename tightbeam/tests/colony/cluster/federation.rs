@@ -7,7 +7,6 @@
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
-use tightbeam::colony::cluster::{PeerRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
 
 /// A dial address nothing listens on, so a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
@@ -609,9 +608,8 @@ fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: impl Into<Vec<u8>>) {
 	*preferred = Some(key);
 }
 
-/// Route key `cluster` holds for `type_name` toward `dial_addr`,
-/// rebuilt through the public [`ServletEntry::peer`] constructor so
-/// the key discipline stays in one place.
+/// Route key `cluster` holds for `type_name` toward `dial_addr`, read from
+/// the operator view so the key discipline stays with the registry.
 fn peer_route_key_for_dial(
 	cluster: &ClusterGateway,
 	type_name: impl AsRef<str>,
@@ -625,18 +623,7 @@ fn peer_route_key_for_dial(
 		.expect("the gateway under test holds no poisoned lock")
 		.into_iter()
 		.find(|route| route.dial_addr.as_ref() == dial_addr && route.servlet_type.as_ref() == canonical.as_slice())
-		.map(|route| {
-			ServletEntry::peer(
-				PeerRoute {
-					peer_id: route.peer_id,
-					servlet_type: route.servlet_type,
-					dial_addr: route.dial_addr,
-				},
-				DEFAULT_INITIAL_PHEROMONE,
-				DEFAULT_ABANDONMENT_LIMIT,
-			)
-		})
-		.map(|entry| entry.route_key().to_vec())
+		.map(|route| route.route_key.to_vec())
 }
 
 tb_assert_spec! {

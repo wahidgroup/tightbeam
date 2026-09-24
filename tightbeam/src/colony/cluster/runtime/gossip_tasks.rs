@@ -31,7 +31,7 @@ use crate::colony::cluster::runtime::{LoopFault, VerifiedSignerId};
 use crate::colony::cluster::{
 	gossip_fresh, wanted_digests, Admission, AdmittedGossip, GossipDigest, PeerCaps, PeerHint, RouteKind,
 };
-use crate::colony::cluster::{ClusterConfig, ClusterError, PeerAddress, ServletRegistry};
+use crate::colony::cluster::{AdmittedDial, ClusterConfig, ClusterError, PeerAddress, ServletRegistry};
 use crate::colony::common::IssuedAt;
 use crate::colony::common::{reply_frame, TaskGroup};
 use crate::colony::common::{
@@ -108,20 +108,20 @@ struct MintedAdRumor {
 }
 
 impl ServletRegistry {
-	/// The dial address of a relaying peer, from its live direct routes.
+	/// The dial socket of a relaying peer, from its live direct routes.
 	///
 	/// Only direct routes qualify, because a relay entry's dial address
 	/// belongs to a further relay while a direct route holds `relay_id`'s
 	/// own. [`None`] means the relay reached this gateway through another
 	/// hop, so the direct trail from the rumor stands on its own.
-	fn relay_dial_addr(&self, relay_id: impl AsRef<[u8]>) -> Option<Arc<[u8]>> {
+	fn relay_dial_addr(&self, relay_id: impl AsRef<[u8]>) -> Option<PeerAddress> {
 		let relay_id = relay_id.as_ref();
 		let entries = self.peer_entries().ok()?;
 		entries
 			.iter()
 			.filter(|entry| entry.route_kind() == RouteKind::Peer)
 			.find(|entry| entry.owner_id().as_ref() == relay_id)
-			.map(|entry| Arc::clone(entry.dial_target()))
+			.and_then(|entry| entry.dial_target().socket())
 	}
 }
 
@@ -219,15 +219,15 @@ impl ClusterConfig {
 
 	/// Peer-exchange hints this gateway may learn.
 	///
-	/// An entry must parse as a discovery hint and pass the operator's
-	/// dial allowlist, so a later feeler probe dials only addresses the
-	/// operator allowed (CWE-284).
+	/// An entry becomes a hint through [`PeerConfig::admit_hint`], so a
+	/// later feeler probe dials only addresses the operator's dial policy
+	/// admitted (CWE-284).
+	///
+	/// [`PeerConfig::admit_hint`]: crate::colony::cluster::PeerConfig::admit_hint
 	fn admissible_pex_hints(&self, pex: impl IntoIterator<Item = PeerGossip>) -> impl Iterator<Item = PeerHint> + '_ {
 		let pex: Vec<PeerGossip> = pex.into_iter().collect();
 
-		pex.into_iter()
-			.filter_map(|entry| PeerHint::try_from(entry).ok())
-			.filter(move |hint| self.peer.dial_allowed(&hint.gateway_addr))
+		pex.into_iter().filter_map(move |entry| self.peer.admit_hint(entry).ok())
 	}
 }
 
@@ -330,7 +330,7 @@ where
 		let mut fanout = tokio::task::JoinSet::new();
 		let mut unreached: u64 = 0;
 		for peer in targets.iter() {
-			let Ok(peer_addr) = peer.socket().to_string().parse::<P::Address>() else {
+			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
 				unreached += 1;
 				continue;
 			};
@@ -459,7 +459,7 @@ where
 		&self,
 		peer_addr: P::Address,
 		acked: &mut HashSet<GossipDigest>,
-		peer: PeerAddress,
+		peer: AdmittedDial,
 	) -> Result<(), ClusterError> {
 		let now = self.config.clock.unix();
 		// A journal fault belongs to this gateway, so the round is skipped and
@@ -546,7 +546,7 @@ where
 		client: &mut crate::transport::PooledClient<P>,
 		reply: GossipWant,
 		acked: &mut HashSet<GossipDigest>,
-		peer: PeerAddress,
+		peer: AdmittedDial,
 		now: UnixMillis,
 	) -> Result<(), ClusterError> {
 		let round: Result<(), ClusterError> = async {
@@ -558,7 +558,7 @@ where
 			if self.config.peer.table.promote(peer, peer_id.as_deref(), now)? {
 				self.trace
 					.event(CLUSTER_PEER_DISCOVERED)?
-					.with_payload(peer.route_bytes().as_ref())
+					.with_payload(peer.address().route_bytes().as_ref())
 					.emit();
 			}
 
@@ -576,7 +576,7 @@ where
 			// while retained, is a drop. One weaken per round scores it.
 			let dropped = wanted.iter().any(|digest| acked.contains(digest));
 			if dropped {
-				self.servlet_registry.weaken_peer_by_dial(peer.route_bytes())?;
+				self.servlet_registry.weaken_peer_by_dial(peer.address())?;
 				self.trace.event(CLUSTER_GOSSIP_DROP_SIGNAL)?;
 			}
 
@@ -599,20 +599,17 @@ where
 	/// threshold.
 	async fn dial_targets<D: ClusterDigest>(
 		&self,
-		targets: impl AsRef<[PeerAddress]>,
+		targets: impl AsRef<[AdmittedDial]>,
 		ad_frame: Option<&Frame>,
-		push_ledger: &mut HashMap<PeerAddress, HashSet<GossipDigest>>,
+		push_ledger: &mut HashMap<AdmittedDial, HashSet<GossipDigest>>,
 		trace: &TraceCollector,
 	) -> Result<(), LoopFault> {
 		let targets = targets.as_ref();
 		let reconciling = self.config.colony_urn().is_some();
 		for peer in targets {
-			// A discovery peer is a socket, and a gateway dials `P::Address`,
-			// which is whatever the protocol addresses with (the laser test
-			// protocol addresses by airspace slot). Rendering and re-parsing
-			// bridges the two, so this is a conversion rather than a repeated
-			// parse of one value.
-			let Ok(peer_addr) = peer.socket().to_string().parse::<P::Address>() else {
+			// A protocol that cannot address this peer is this gateway's
+			// choice, so the peer is skipped rather than scored.
+			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
 				continue;
 			};
 
@@ -636,7 +633,7 @@ where
 			if round.is_err() && self.config.peer.table.record_failure(*peer)? {
 				trace
 					.event(CLUSTER_PEER_EVICTED)?
-					.with_payload(peer.route_bytes().as_ref())
+					.with_payload(peer.address().route_bytes().as_ref())
 					.emit();
 			}
 		}
@@ -651,8 +648,8 @@ where
 	/// prefix bucket keeps holding live addresses.
 	async fn probe_candidates<D: ClusterDigest>(
 		&self,
-		probes: impl AsRef<[PeerAddress]>,
-		push_ledger: &mut HashMap<PeerAddress, HashSet<GossipDigest>>,
+		probes: impl AsRef<[AdmittedDial]>,
+		push_ledger: &mut HashMap<AdmittedDial, HashSet<GossipDigest>>,
 	) -> Result<(), LoopFault> {
 		let probes = probes.as_ref();
 		if self.config.colony_urn().is_none() {
@@ -660,7 +657,7 @@ where
 		}
 
 		for peer in probes {
-			let Ok(peer_addr) = peer.socket().to_string().parse::<P::Address>() else {
+			let Ok(peer_addr) = peer.protocol_address::<P::Address>() else {
 				self.config.peer.table.discard(*peer)?;
 				continue;
 			};
@@ -828,8 +825,8 @@ where
 			return Ok(());
 		};
 
-		let dial_addr = Arc::clone(entry.dial_target());
-		let Ok(_response) = Hop::new(&self.pool, dial_addr).deliver_envelope(payload).await else {
+		let dial = entry.dial_target().clone();
+		let Ok(_response) = Hop::new(&self.pool, dial).deliver_envelope(payload).await else {
 			return Ok(());
 		};
 
@@ -1069,7 +1066,8 @@ where
 		// relay's dial address is known, which is exactly when pheromone can
 		// fail over to it (CWE-772).
 		let relay_trail = relay_id.filter(|_| self.config.peer.max_hops >= 2).and_then(|relay_id| {
-			let relay_dial = self.servlet_registry.relay_dial_addr(relay_id.as_shared())?;
+			let relay_socket = self.servlet_registry.relay_dial_addr(relay_id.as_shared())?;
+			let relay_dial = self.config.peer.admit_dial(relay_socket).ok()?;
 			admitted.relay_trail(relay_id.as_shared(), relay_dial, &self.config.pheromone)
 		});
 
@@ -1218,7 +1216,7 @@ struct AdPublishState {
 /// The baseline and the claim flag behind the [`AdPublishState`] lock.
 #[derive(Default)]
 struct AdPublishInner {
-	last: Option<(UnixMillis, Vec<Urn<'static>>, Vec<PeerAddress>)>,
+	last: Option<(UnixMillis, Vec<Urn<'static>>, Vec<AdmittedDial>)>,
 	in_flight: bool,
 }
 
@@ -1233,7 +1231,12 @@ impl AdPublishState {
 	/// until [`Self::commit`] or [`Self::abort`] settles the claim. `false`
 	/// means that the slate and the targets still match the baseline inside
 	/// the refresh window, or that a publish already holds the claim.
-	fn take_due(&self, now: UnixMillis, slate: impl AsRef<[Urn<'static>]>, targets: impl AsRef<[PeerAddress]>) -> bool {
+	fn take_due(
+		&self,
+		now: UnixMillis,
+		slate: impl AsRef<[Urn<'static>]>,
+		targets: impl AsRef<[AdmittedDial]>,
+	) -> bool {
 		let slate = slate.as_ref();
 		let targets = targets.as_ref();
 		let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1257,10 +1260,10 @@ impl AdPublishState {
 		&self,
 		now: UnixMillis,
 		slate: impl IntoIterator<Item = Urn<'static>>,
-		targets: impl IntoIterator<Item = PeerAddress>,
+		targets: impl IntoIterator<Item = AdmittedDial>,
 	) {
 		let slate: Vec<Urn<'static>> = slate.into_iter().collect();
-		let targets: Vec<PeerAddress> = targets.into_iter().collect();
+		let targets: Vec<AdmittedDial> = targets.into_iter().collect();
 		let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
 		inner.last = Some((now, slate, targets));
@@ -1319,7 +1322,7 @@ where
 
 				// PEX replies echo installed routes, which include this
 				// gateway's own address, so the table excludes it up front.
-				let local = from_utf8(&gateway_addr).ok().and_then(|text| text.parse::<PeerAddress>().ok());
+				let local = PeerAddress::try_from(gateway_addr.as_ref()).ok();
 				if let Some(local) = local {
 					config.peer.table.exclude_self(local)?;
 				}
@@ -1327,7 +1330,7 @@ where
 				// The per-peer ledger of `Ok` replies feeds grey-hole
 				// detection. Each beat keeps only the live target and probe
 				// addresses, so the table's own caps bound the map (CWE-770).
-				let mut push_ledger: HashMap<PeerAddress, HashSet<GossipDigest>> = HashMap::new();
+				let mut push_ledger: HashMap<AdmittedDial, HashSet<GossipDigest>> = HashMap::new();
 				let ad_publish = Arc::new(AdPublishState::new(config.rumor_refresh()));
 				loop {
 					config.clock.sleep(interval).await;
@@ -1417,7 +1420,7 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig};
+	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, PeerConfig};
 	use crate::colony::common::ColonyNamespace;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -1444,12 +1447,7 @@ mod tests {
 
 	fn config_allowing(allowlist: impl IntoIterator<Item = String>) -> ClusterConfig {
 		let mut config = test_config();
-		let parsed: HashSet<PeerAddress> = allowlist
-			.into_iter()
-			.map(|entry| entry.parse().expect("fixture allowlist entries name sockets"))
-			.collect();
-
-		config.peer.set_dial_allowlist(parsed);
+		config.peer = PeerConfig::allowing(allowlist);
 		config
 	}
 
@@ -1489,12 +1487,12 @@ mod tests {
 		let pex = vec![pex_entry("10.0.0.1:9000"), pex_entry("10.66.0.1:9000")];
 		let admitted: Vec<PeerHint> = config.admissible_pex_hints(pex).collect();
 		assert_eq!(admitted.len(), 1);
-		assert_eq!(admitted[0].gateway_addr.to_string(), "10.0.0.1:9000");
+		assert_eq!(admitted[0].dial.to_string(), "10.0.0.1:9000");
 	}
 
-	/// Parses a fixture dial address, which the beat carries parsed.
-	fn peer_addr(text: &str) -> PeerAddress {
-		text.parse().expect("fixture address parses as a socket")
+	/// A fixture dial target, which the beat carries admitted.
+	fn dial(text: &str) -> AdmittedDial {
+		AdmittedDial::fixture(text)
 	}
 
 	fn ad_slate(names: &[&str]) -> Vec<Urn<'static>> {
@@ -1553,7 +1551,7 @@ mod tests {
 		let state = AdPublishState::new(Duration::from_millis(1_000));
 		state.take_due(UnixMillis::new(0), [], []);
 		state.commit(UnixMillis::new(0), Vec::new(), Vec::new());
-		assert!(state.take_due(UnixMillis::new(1), [], [peer_addr("10.0.0.1:9000")]));
+		assert!(state.take_due(UnixMillis::new(1), [], [dial("10.0.0.1:9000")]));
 	}
 
 	#[test]

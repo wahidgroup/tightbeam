@@ -1,9 +1,103 @@
+use core::str::{from_utf8, FromStr};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::colony::cluster::SharedId;
+use crate::colony::cluster::{AdmittedDial, ClusterError, NotASocket, PeerAddress, SharedId};
 use crate::colony::common::MAX_PHEROMONE;
 use crate::utils::BasisPoints;
+
+/// The endpoint a route dials, parsed once where the route is built.
+///
+/// Two targets are equal when they name one endpoint, so two spellings of
+/// one socket compare equal wherever routes are compared (CWE-706). The
+/// rendering a dial or a gossip entry carries is derived from the endpoint
+/// on demand, so no second field can disagree with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialTarget {
+	/// A socket, claimed by a peer gateway or registered by a hive.
+	Socket(PeerAddress),
+	/// A servlet or control address a hive registered that names no socket,
+	/// such as an address of a protocol with its own address scheme. It
+	/// compares by its bytes.
+	Named(SharedId),
+}
+
+impl DialTarget {
+	/// An address a hive registered, for one of its servlets or for its own
+	/// control plane.
+	///
+	/// An address that spells a socket is stored as that socket, so it
+	/// compares with a claimed peer socket. Any other address is a name the
+	/// dialing protocol resolves, kept as the hive wrote it.
+	pub(in crate::colony::cluster) fn of_registered(address: &SharedId) -> Self {
+		match PeerAddress::try_from(address.as_ref()) {
+			Ok(socket) => Self::Socket(socket),
+			Err(NotASocket) => Self::Named(Arc::clone(address)),
+		}
+	}
+
+	/// The bytes a caller gossips or displays this target by.
+	///
+	/// A socket renders through [`PeerAddress::route_bytes`], the one home
+	/// for the spelling, and a name renders as the hive wrote it.
+	#[must_use]
+	pub fn route_bytes(&self) -> SharedId {
+		match self {
+			Self::Socket(socket) => socket.route_bytes(),
+			Self::Named(name) => Arc::clone(name),
+		}
+	}
+
+	/// This target as the dialing protocol's address type.
+	///
+	/// This is the one place a dial becomes a protocol address:
+	///
+	/// - The protocol's [`FromStr`] is its only constructor, so the rendering is parsed here, once
+	///   per dial, from the same bytes every other reader of this target sees.
+	/// - A protocol may address by something other than a socket, as the laser test protocol does
+	///   by airspace slot, and then a socket target does not parse.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidAddress`] -- the protocol does not address by this rendering.
+	pub fn protocol_address<A: FromStr>(&self) -> Result<A, ClusterError> {
+		let rendered = self.route_bytes();
+		let text = from_utf8(&rendered).map_err(|_| ClusterError::InvalidAddress(rendered.to_vec()))?;
+		text.parse().map_err(|_| ClusterError::InvalidAddress(rendered.to_vec()))
+	}
+
+	/// Whether a connect to `other` reaches the endpoint this target names.
+	///
+	/// Equal targets do. So do two sockets on one port when either address
+	/// is unspecified, because a listener on the wildcard answers a connect
+	/// to any of the host's addresses on that port.
+	pub(super) fn same_endpoint(&self, other: &Self) -> bool {
+		let wildcard_on_one_port = match (self, other) {
+			(Self::Socket(this), Self::Socket(that)) => {
+				let either_unspecified = this.is_unspecified() || that.is_unspecified();
+				either_unspecified && this.socket().port() == that.socket().port()
+			}
+			_ => false,
+		};
+
+		self == other || wildcard_on_one_port
+	}
+
+	/// The socket this target names, when it names one.
+	#[must_use]
+	pub fn socket(&self) -> Option<PeerAddress> {
+		match self {
+			Self::Socket(socket) => Some(*socket),
+			Self::Named(_) => None,
+		}
+	}
+}
+
+impl From<AdmittedDial> for DialTarget {
+	fn from(dial: AdmittedDial) -> Self {
+		Self::Socket(dial.address())
+	}
+}
 
 /// How the load balancer reaches an entry.
 ///
@@ -54,9 +148,9 @@ pub struct ServletEntry {
 	/// The certificate fingerprint of the relaying gateway this entry dials,
 	/// when the route is a relay trail.
 	relay_id: Option<SharedId>,
-	/// The socket dialed when forwarding. A local entry dials its
-	/// `route_key`.
-	dial_addr: SharedId,
+	/// The endpoint dialed when forwarding. A local entry dials the endpoint
+	/// its `route_key` names, in canonical form.
+	dial: DialTarget,
 	route_kind: RouteKind,
 	pheromone: AtomicU64,
 	trial_count: AtomicU32,
@@ -99,9 +193,12 @@ impl<'a> Owner<'a> {
 /// Operator view of one learned peer route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerRouteInfo {
+	/// The registry key, which is also the pheromone trail identity.
+	pub route_key: SharedId,
 	/// Canonical servlet type bytes.
 	pub servlet_type: SharedId,
-	/// Claimed peer gateway dial address.
+	/// The gateway socket this route dials, in its canonical spelling: the
+	/// origin's for a direct route and the relay's for a relay trail.
 	pub dial_addr: SharedId,
 	/// Advertising peer identity certificate fingerprint.
 	pub peer_id: SharedId,
@@ -134,19 +231,22 @@ pub struct LocalRoute {
 /// The three identities a peer route names.
 ///
 /// The fields are named for the same reason as those of [`LocalRoute`].
+/// The dial is an [`AdmittedDial`], so a peer route exists only for a
+/// gateway socket the dial policy admitted (CWE-918).
 #[derive(Debug, Clone)]
 pub struct PeerRoute {
 	/// Peer gateway that advertised the type.
 	pub peer_id: SharedId,
 	/// Bare servlet type this route answers.
 	pub servlet_type: SharedId,
-	/// Gateway socket every entry in the slate dials.
-	pub dial_addr: SharedId,
+	/// Admitted gateway socket every entry in the slate dials.
+	pub dial: AdmittedDial,
 }
 
 /// The four identities a relay trail names.
 ///
-/// The fields are named for the same reason as those of [`LocalRoute`].
+/// The fields are named for the same reason as those of [`LocalRoute`], and
+/// the dial is admitted for the same reason as that of [`PeerRoute`].
 #[derive(Debug, Clone)]
 pub struct RelayRoute {
 	/// Peer whose type this trail reaches.
@@ -155,22 +255,26 @@ pub struct RelayRoute {
 	pub relay_id: SharedId,
 	/// Bare servlet type this route answers.
 	pub servlet_type: SharedId,
-	/// Gateway socket the relay is dialed at.
-	pub dial_addr: SharedId,
+	/// Admitted gateway socket the relay is dialed at.
+	pub dial: AdmittedDial,
 }
 
 impl ServletEntry {
 	/// Creates a local servlet reachable at `address`, owned by `hive_id`.
+	///
+	/// The address is parsed here, once, so the entry carries a typed dial
+	/// target from the moment it exists.
 	pub fn local(route: LocalRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
 		let LocalRoute { address, servlet_type, hive_id } = route;
+		let dial = DialTarget::of_registered(&address);
 
 		Self {
-			route_key: Arc::clone(&address),
+			route_key: address,
 			servlet_type,
 			bucket: Arc::clone(&hive_id),
 			owner_id: hive_id,
 			relay_id: None,
-			dial_addr: address,
+			dial,
 			route_kind: RouteKind::Local,
 			pheromone: AtomicU64::new(initial_pheromone),
 			trial_count: AtomicU32::new(0),
@@ -180,7 +284,7 @@ impl ServletEntry {
 
 	/// Creates a peer route whose key is `peer_id NUL servlet_type`.
 	pub fn peer(route: PeerRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
-		let PeerRoute { peer_id, servlet_type, dial_addr } = route;
+		let PeerRoute { peer_id, servlet_type, dial } = route;
 		let identity = PeerIdentity {
 			bucket: Arc::clone(&peer_id),
 			owner_id: peer_id,
@@ -188,7 +292,7 @@ impl ServletEntry {
 			route_kind: RouteKind::Peer,
 		};
 
-		Self::peer_kind(identity, servlet_type, dial_addr, initial_pheromone, abandonment_limit)
+		Self::peer_kind(identity, servlet_type, dial, initial_pheromone, abandonment_limit)
 	}
 
 	/// Creates a relay trail for `origin_id`'s type, dialing the
@@ -205,7 +309,7 @@ impl ServletEntry {
 	/// - Forwarding through this trail spends a hop at the relay, so selection
 	///   requires a budget that lets the relay forward once more.
 	pub fn peer_relay(route: RelayRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
-		let RelayRoute { origin_id, relay_id, servlet_type, dial_addr } = route;
+		let RelayRoute { origin_id, relay_id, servlet_type, dial } = route;
 		let identity = PeerIdentity {
 			bucket: Self::relay_bucket(&origin_id, &relay_id),
 			owner_id: origin_id,
@@ -213,7 +317,7 @@ impl ServletEntry {
 			route_kind: RouteKind::PeerRelay,
 		};
 
-		Self::peer_kind(identity, servlet_type, dial_addr, initial_pheromone, abandonment_limit)
+		Self::peer_kind(identity, servlet_type, dial, initial_pheromone, abandonment_limit)
 	}
 
 	/// Builds the composite `origin NUL relay` reconcile bucket for relay
@@ -238,7 +342,7 @@ impl ServletEntry {
 	fn peer_kind(
 		identity: PeerIdentity,
 		servlet_type: SharedId,
-		dial_addr: SharedId,
+		dial: AdmittedDial,
 		initial_pheromone: u64,
 		abandonment_limit: u32,
 	) -> Self {
@@ -254,7 +358,7 @@ impl ServletEntry {
 			bucket,
 			owner_id,
 			relay_id,
-			dial_addr,
+			dial: DialTarget::from(dial),
 			route_kind,
 			pheromone: AtomicU64::new(initial_pheromone),
 			trial_count: AtomicU32::new(0),
@@ -269,10 +373,10 @@ impl ServletEntry {
 		&self.route_key
 	}
 
-	/// Socket address dialed when forwarding through this entry.
+	/// The endpoint dialed when forwarding through this entry.
 	#[must_use]
-	pub fn dial_target(&self) -> &SharedId {
-		&self.dial_addr
+	pub fn dial_target(&self) -> &DialTarget {
+		&self.dial
 	}
 
 	/// Returns the owning identity, which is the local hive address or the
@@ -328,8 +432,9 @@ impl ServletEntry {
 		match self.route_kind {
 			RouteKind::Local => None,
 			RouteKind::Peer | RouteKind::PeerRelay => Some(PeerRouteInfo {
+				route_key: Arc::clone(&self.route_key),
 				servlet_type: Arc::clone(&self.servlet_type),
-				dial_addr: Arc::clone(&self.dial_addr),
+				dial_addr: self.dial.route_bytes(),
 				peer_id: Arc::clone(&self.owner_id),
 			}),
 		}
@@ -413,7 +518,7 @@ impl Clone for ServletEntry {
 			bucket: Arc::clone(&self.bucket),
 			owner_id: Arc::clone(&self.owner_id),
 			relay_id: self.relay_id.as_ref().map(Arc::clone),
-			dial_addr: Arc::clone(&self.dial_addr),
+			dial: self.dial.clone(),
 			route_kind: self.route_kind,
 			pheromone: AtomicU64::new(self.pheromone.load(Ordering::Relaxed)),
 			trial_count: AtomicU32::new(self.trial_count.load(Ordering::Relaxed)),

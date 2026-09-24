@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::colony::cluster::registry::SharedId;
 use crate::colony::cluster::servlet_registry::entry::{LocalRoute, PeerRoute, ServletEntry};
+use crate::colony::cluster::AdmittedDial;
 use crate::colony::common::ServletInfo;
 use crate::constants::{MAX_PEER_GATEWAYS, MAX_PEER_ROUTES, MAX_RELAY_BUCKETS, MAX_RELAY_ROUTES};
 use crate::utils::urn::Urn;
@@ -99,12 +100,12 @@ impl PheromoneConfig {
 	/// Builds the peer-routed slate, with each entry keyed by `peer_hive_id`
 	/// NUL type.
 	///
-	/// `dial` is the claimed gateway socket stored on every entry, so every
+	/// `dial` is the admitted gateway socket stored on every entry, so every
 	/// type this peer advertises resolves to the one gateway that owns it.
 	pub(crate) fn peer_slate(
 		&self,
 		peer_hive_id: &SharedId,
-		dial: SharedId,
+		dial: AdmittedDial,
 		types: impl AsRef<[Urn<'static>]>,
 	) -> Vec<ServletEntry> {
 		let types = types.as_ref();
@@ -115,7 +116,7 @@ impl PheromoneConfig {
 					PeerRoute {
 						peer_id: Arc::clone(peer_hive_id),
 						servlet_type: Arc::from(urn.type_canonical_bytes().as_slice()),
-						dial_addr: Arc::clone(&dial),
+						dial,
 					},
 					self.initial_pheromone,
 					self.abandonment_limit,

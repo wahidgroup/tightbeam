@@ -4,10 +4,7 @@ use core::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tightbeam::colony::cluster::{
-	Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse, PeerRoute, ServletEntry,
-	DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
-};
+use tightbeam::colony::cluster::{Cluster, ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
 use tightbeam::compose;
 use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::x509::store::CertificateTrust;
@@ -906,22 +903,10 @@ fn pin_decoy_for(
 	let dial_addr = dial_addr.as_ref();
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	let routes = gateway.peer_routes().expect("the gateway under test holds no poisoned lock");
-	let key = routes.into_iter().find_map(|route| {
-		if route.dial_addr.as_ref() != dial_addr || route.servlet_type.as_ref() != canonical.as_slice() {
-			return None;
-		}
-
-		let entry = ServletEntry::peer(
-			PeerRoute {
-				peer_id: route.peer_id,
-				servlet_type: route.servlet_type,
-				dial_addr: route.dial_addr,
-			},
-			DEFAULT_INITIAL_PHEROMONE,
-			DEFAULT_ABANDONMENT_LIMIT,
-		);
-		Some(entry.route_key().to_vec())
-	});
+	let key = routes
+		.into_iter()
+		.find(|route| route.dial_addr.as_ref() == dial_addr && route.servlet_type.as_ref() == canonical.as_slice())
+		.map(|route| route.route_key.to_vec());
 
 	if let Ok(mut guard) = pin.lock() {
 		*guard = key;

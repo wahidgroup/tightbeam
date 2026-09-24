@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
 use crate::colony::cluster::runtime::hop::Hop;
-use crate::colony::cluster::{ClusterConfig, ClusterError, ClusterWorkResponse, HopBudget, RouteKind, ServletRegistry};
+use crate::colony::cluster::{
+	ClusterConfig, ClusterError, ClusterWorkResponse, DialTarget, HopBudget, RouteKind, ServletRegistry,
+};
 use crate::colony::common::{reply_frame, ClusterRequest, ClusterWorkRequest, ServletTypeKey};
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::decode;
@@ -28,12 +30,11 @@ use crate::{Frame, TightBeamError};
 /// A route the load balancer chose for a servlet type.
 ///
 /// - `route_key` is the pheromone key to reinforce or weaken.
-/// - `dial_addr` is the socket to dial.
-/// - `route_kind` picks the dial plane: hive for local, peer
-///   otherwise.
+/// - `dial` is the endpoint to dial.
+/// - `route_kind` picks the dial plane: hive for local, peer otherwise.
 pub(crate) struct RouteChoice {
 	pub(crate) route_key: Arc<[u8]>,
-	pub(crate) dial_addr: Arc<[u8]>,
+	pub(crate) dial: DialTarget,
 	pub(crate) route_kind: RouteKind,
 }
 
@@ -126,7 +127,7 @@ where
 		frame_cache: &mut Option<Frame>,
 	) -> Result<Vec<u8>, ClusterError> {
 		let payload: Vec<u8> = payload.into();
-		let dial_addr = Arc::clone(&choice.dial_addr);
+		let dial = choice.dial.clone();
 
 		// Local hops deliver the client's frame on the hive
 		// trust plane. Peer hops re-enter the peer gateway as Work with
@@ -137,13 +138,13 @@ where
 					Some(frame) => frame,
 					None => decode(&payload)?,
 				};
-				Hop::new(&self.pool, dial_addr).deliver_frame(frame).await
+				Hop::new(&self.pool, dial).deliver_frame(frame).await
 			}
 			RouteKind::Peer | RouteKind::PeerRelay => match self.peer_pool.as_ref() {
 				Some(peer_pool) => {
 					let work = budget.relayed_work(servlet_type.clone(), payload);
 					let envelope = encode(&ClusterRequest::Work(work))?;
-					Hop::new(peer_pool, dial_addr).deliver_envelope(envelope).await
+					Hop::new(peer_pool, dial).deliver_envelope(envelope).await
 				}
 				None => Err(ClusterError::ConnectFailed),
 			},
@@ -349,7 +350,7 @@ impl ServletRegistry {
 		let selected_entry = config.pick_instance(&entries)?;
 		Some(RouteChoice {
 			route_key: Arc::clone(selected_entry.route_key()),
-			dial_addr: Arc::clone(selected_entry.dial_target()),
+			dial: selected_entry.dial_target().clone(),
 			route_kind: selected_entry.route_kind(),
 		})
 	}
@@ -397,7 +398,7 @@ mod tests {
 	use super::*;
 	use crate::colony::cluster::peer::WireHopBudget;
 	use crate::colony::cluster::{
-		PeerRoute, RelayRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
+		AdmittedDial, PeerRoute, RelayRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 	};
 	use crate::colony::common::{ColonyNamespace, InstanceMetrics, LoadBalancer};
 	use crate::constants::{DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS};
@@ -427,32 +428,30 @@ mod tests {
 			.expect("the fixture type is bare in the default namespace")
 	}
 
-	fn peer_entry(peer: impl AsRef<[u8]>, dial: impl AsRef<[u8]>) -> ServletEntry {
+	fn peer_entry(peer: impl AsRef<[u8]>, dial: impl AsRef<str>) -> ServletEntry {
 		let peer = peer.as_ref();
-		let dial = dial.as_ref();
 		let servlet_type = ping_type().canonical_bytes();
 		ServletEntry::peer(
 			PeerRoute {
 				peer_id: Arc::from(peer),
 				servlet_type: Arc::from(servlet_type.as_slice()),
-				dial_addr: Arc::from(dial),
+				dial: AdmittedDial::fixture(dial),
 			},
 			DEFAULT_INITIAL_PHEROMONE,
 			DEFAULT_ABANDONMENT_LIMIT,
 		)
 	}
 
-	fn relay_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>, dial: impl AsRef<[u8]>) -> ServletEntry {
+	fn relay_entry(origin: impl AsRef<[u8]>, relay: impl AsRef<[u8]>, dial: impl AsRef<str>) -> ServletEntry {
 		let origin = origin.as_ref();
 		let relay = relay.as_ref();
-		let dial = dial.as_ref();
 		let servlet_type = ping_type().canonical_bytes();
 		ServletEntry::peer_relay(
 			RelayRoute {
 				origin_id: Arc::from(origin),
 				relay_id: Arc::from(relay),
 				servlet_type: Arc::from(servlet_type.as_slice()),
-				dial_addr: Arc::from(dial),
+				dial: AdmittedDial::fixture(dial),
 			},
 			DEFAULT_INITIAL_PHEROMONE,
 			DEFAULT_ABANDONMENT_LIMIT,
@@ -564,17 +563,17 @@ mod tests {
 
 	#[test]
 	fn a_draw_refuses_an_out_of_range_index() {
-		let entries = vec![Arc::new(peer_entry(b"first", b"first:1"))];
+		let entries = vec![Arc::new(peer_entry(b"first", "192.0.2.1:9001"))];
 		let config = config_balancing_with(Arc::new(RogueBalancer));
 		assert!(config.pick_instance(&entries).is_none());
 	}
 
 	#[test]
 	fn a_draw_returns_the_selected_entry() {
-		let entries = vec![Arc::new(peer_entry(b"first", b"first:1"))];
+		let entries = vec![Arc::new(peer_entry(b"first", "192.0.2.1:9001"))];
 		let config = config_balancing_with(Arc::new(FirstBalancer));
 		let picked = config.pick_instance(&entries);
-		assert!(matches!(picked, Some(entry) if entry.dial_target().as_ref() == b"first:1"));
+		assert!(matches!(picked, Some(entry) if entry.dial_target().route_bytes().as_ref() == b"192.0.2.1:9001"));
 	}
 
 	#[test]
@@ -622,7 +621,7 @@ mod tests {
 	fn select_route_withholds_relay_trails_below_two_hops() -> Result<(), ClusterError> {
 		let config = test_config();
 		let registry = registry();
-		registry.add(relay_entry(b"origin", b"relay", b"relay:1"))?;
+		registry.add(relay_entry(b"origin", b"relay", "192.0.2.3:9001"))?;
 
 		let type_key = ping_key();
 		let below = registry.select_route(&config, &type_key, HopBudget::for_test(1), None);
@@ -636,8 +635,8 @@ mod tests {
 	fn select_route_excludes_the_failed_route_key() -> Result<(), ClusterError> {
 		let config = test_config();
 		let registry = registry();
-		registry.add(peer_entry(b"first", b"first:1"))?;
-		registry.add(peer_entry(b"second", b"second:1"))?;
+		registry.add(peer_entry(b"first", "192.0.2.1:9001"))?;
+		registry.add(peer_entry(b"second", "192.0.2.2:9001"))?;
 
 		let type_key = ping_key();
 		let failed = registry

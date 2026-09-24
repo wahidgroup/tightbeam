@@ -1,5 +1,7 @@
 use crate::tb_cases;
 use crate::utils::basis_points::BasisPointsOutOfRange;
+use core::mem::discriminant;
+use core::str::from_utf8;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLockReadGuard};
@@ -10,7 +12,7 @@ use super::{
 	ServletEntry, ServletRegistry, SharedId, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE,
 };
 use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
-use crate::colony::cluster::PeerAddress;
+use crate::colony::cluster::{AdmittedDial, PeerAddress};
 use crate::colony::common::ServletTypeKey;
 use crate::colony::common::MAX_PHEROMONE;
 use crate::utils::time::{Clock, ManualClock, UnixMillis};
@@ -52,6 +54,13 @@ fn owner_of(registry: &ServletRegistry, key: impl AsRef<[u8]>) -> Option<SharedI
 fn type_key(servlet_type: impl AsRef<[u8]>) -> ServletTypeKey {
 	let servlet_type = servlet_type.as_ref();
 	ServletTypeKey::from_route_bytes(servlet_type)
+}
+
+/// The fixture gateway socket spelled as `dial`, admitted the way a peer's
+/// claim is admitted in production.
+fn admitted_dial(dial: impl AsRef<[u8]>) -> AdmittedDial {
+	let dial = dial.as_ref();
+	AdmittedDial::fixture(from_utf8(dial).expect("fixture dial addresses are UTF-8"))
 }
 
 /// One local entry with the given pheromone and abandonment limit.
@@ -97,12 +106,11 @@ fn peer_entry(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>) -> Serv
 fn peer_entry_dial(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, dial: impl AsRef<[u8]>) -> ServletEntry {
 	let servlet_type = servlet_type.as_ref();
 	let peer_id = peer_id.as_ref();
-	let dial = dial.as_ref();
 	ServletEntry::peer(
 		PeerRoute {
 			peer_id: Arc::from(peer_id),
 			servlet_type: Arc::from(servlet_type),
-			dial_addr: Arc::from(dial),
+			dial: admitted_dial(dial),
 		},
 		DEFAULT_INITIAL_PHEROMONE,
 		DEFAULT_ABANDONMENT_LIMIT,
@@ -117,7 +125,7 @@ fn peer_entry_limit(servlet_type: impl AsRef<[u8]>, peer_id: impl AsRef<[u8]>, l
 		PeerRoute {
 			peer_id: Arc::from(peer_id),
 			servlet_type: Arc::from(servlet_type),
-			dial_addr: Arc::from(b"127.0.0.1:9000".as_slice()),
+			dial: admitted_dial(b"127.0.0.1:9000"),
 		},
 		DEFAULT_INITIAL_PHEROMONE,
 		limit,
@@ -144,11 +152,7 @@ fn admitted_with_order(
 	order: u64,
 ) -> AdmittedPeerAd {
 	let hive = hive.as_ref();
-	let dial: PeerAddress = core::str::from_utf8(dial.as_ref())
-		.expect("fixture dial addresses are UTF-8")
-		.parse()
-		.expect("fixture dial addresses name sockets");
-
+	let dial = admitted_dial(dial);
 	let slate: Vec<ServletEntry> = slate.into_iter().collect();
 	AdmittedPeerAd { peer_hive_id: Arc::from(hive), dial, slate, order: UnixMillis::new(order) }
 }
@@ -173,13 +177,12 @@ fn relay_trail(
 	let origin = origin.as_ref();
 	let relay = relay.as_ref();
 	let servlet_type = servlet_type.as_ref();
-	let dial = dial.as_ref();
 	let slate = vec![ServletEntry::peer_relay(
 		RelayRoute {
 			origin_id: Arc::from(origin),
 			relay_id: Arc::from(relay),
 			servlet_type: Arc::from(servlet_type),
-			dial_addr: Arc::from(dial),
+			dial: admitted_dial(dial),
 		},
 		DEFAULT_INITIAL_PHEROMONE,
 		DEFAULT_ABANDONMENT_LIMIT,
@@ -259,7 +262,6 @@ fn weaken_entry_times(entry: &ServletEntry, times: u32) {
 tb_cases! {
 	fn entry_trials_count_toward_the_limit((weakened, expected_trials, abandoned): (u32, u32, bool)) {
 		let entry = test_entry(5000, 3);
-
 		weaken_entry_times(&entry, weakened);
 
 		assert_eq!(entry.trial_count(), expected_trials);
@@ -288,17 +290,26 @@ fn entry_route_kind_defaults_local() {
 	assert_eq!(entry.route_kind(), RouteKind::Local);
 }
 
-#[test]
-fn entry_local_dials_own_address() {
-	let entry = named_entry(b"addr1", b"calculator", b"hive1");
-	assert_eq!(entry.dial_target().as_ref(), entry.route_key().as_ref());
+// A local entry dials the endpoint its key names: a name as the hive wrote
+// it, and a socket in canonical form however the hive spelled it (CWE-706).
+tb_cases! {
+	fn entry_local_dials_the_endpoint_its_key_names((address, dialed): (&[u8], &[u8])) {
+		let entry = named_entry(address, b"calculator", b"hive1");
+		assert_eq!(entry.route_key().as_ref(), address);
+		assert_eq!(entry.dial_target().route_bytes().as_ref(), dialed);
+	}
+	cases {
+		named => (b"addr1", b"addr1"),
+		socket => (b"127.0.0.1:9000", b"127.0.0.1:9000"),
+		mapped_socket => (b"[::ffff:127.0.0.1]:9000", b"127.0.0.1:9000"),
+	}
 }
 
 #[test]
 fn entry_peer_dials_gateway_not_route_key() {
 	let entry = peer_entry(b"calc", b"fp");
-	assert_eq!(entry.dial_target().as_ref(), b"127.0.0.1:9000");
-	assert_ne!(entry.dial_target().as_ref(), entry.route_key().as_ref());
+	assert_eq!(entry.dial_target().route_bytes().as_ref(), b"127.0.0.1:9000");
+	assert_ne!(entry.dial_target().route_bytes().as_ref(), entry.route_key().as_ref());
 	assert_eq!(entry.route_key().first(), Some(&b'f'));
 	assert_eq!(entry.route_key().get(2), Some(&0));
 }
@@ -505,7 +516,7 @@ fn reconcile_peer_slate_preserves_peer_trail_state() -> Result<(), ClusterError>
 		.iter()
 		.map(|entry| (entry.pheromone_level(), entry.trial_count()))
 		.collect();
-	let dials: Vec<SharedId> = after.iter().map(|entry| Arc::clone(entry.dial_target())).collect();
+	let dials: Vec<SharedId> = after.iter().map(|entry| entry.dial_target().route_bytes()).collect();
 	assert_eq!(scored_after, scored_before);
 	assert_eq!(dials, vec![SharedId::from(b"127.0.0.1:9001".as_slice())]);
 	Ok(())
@@ -545,6 +556,42 @@ fn a_hive_cannot_register_a_peer_gateways_socket() -> Result<(), ClusterError> {
 	assert!(matches!(refused, Err(ClusterError::ServletNotOwned)));
 	assert_eq!(registry.len()?, 1);
 	Ok(())
+}
+
+/// A second owner's claim on `claimed`, placed against the registry.
+type Claim = fn(&ServletRegistry, &[u8]) -> Result<(), ClusterError>;
+
+/// A peer `gw` claiming `claimed` as its gateway socket.
+fn claimed_by_a_peer(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), ClusterError> {
+	let claim = admitted(b"gw", claimed, vec![peer_entry_dial(b"calc", b"gw", claimed)]);
+	registry.reconcile_peer_slate(claim, PeerCaps::default())
+}
+
+/// A second hive registering a servlet at `claimed`.
+fn claimed_by_another_hive(registry: &ServletRegistry, claimed: &[u8]) -> Result<(), ClusterError> {
+	registry.reconcile_by_hive(hive_slate(b"hive2", vec![named_entry(claimed, b"calc", b"hive2")]))
+}
+
+// Another owner's socket is refused under any spelling, and to a second
+// hive as to a peer, because a dual-stack host, a scope id, and a wildcard
+// listener each reach one socket by several spellings (CWE-706, CWE-639).
+tb_cases! {
+	fn a_socket_another_owner_holds_is_refused_under_any_spelling((local, claimed, claim, expected): (&[u8], &[u8], Claim, ClusterError)) -> Result<(), ClusterError> {
+		let registry = registry();
+		registry.reconcile_by_hive(hive_slate(b"hive1", vec![named_entry(local, b"calc", b"hive1")]))?;
+
+		let refused = claim(&registry, claimed);
+		assert_eq!(refused.map_err(|error| discriminant(&error)), Err(discriminant(&expected)));
+		assert_eq!(registry.len()?, 1);
+		Ok(())
+	}
+	cases {
+		peer_by_the_mapped_spelling => (b"127.0.0.1:9000", b"[::ffff:127.0.0.1]:9000", claimed_by_a_peer, ClusterError::PeerSlateConflict),
+		peer_by_a_scoped_spelling => (b"[::1]:9000", b"[::1%7]:9000", claimed_by_a_peer, ClusterError::PeerSlateConflict),
+		peer_at_the_loopback_of_a_wildcard_servlet => (b"0.0.0.0:9000", b"127.0.0.1:9000", claimed_by_a_peer, ClusterError::PeerSlateConflict),
+		hive_by_the_mapped_spelling => (b"127.0.0.1:9000", b"[::ffff:127.0.0.1]:9000", claimed_by_another_hive, ClusterError::ServletNotOwned),
+		hive_by_a_scoped_spelling => (b"[::1]:9000", b"[::1%7]:9000", claimed_by_another_hive, ClusterError::ServletNotOwned),
+	}
 }
 
 #[test]
@@ -1149,7 +1196,7 @@ fn weaken_peer_by_dial_targets_matching_gateway() -> Result<(), ClusterError> {
 	registry.add(peer_entry_dial(b"urn:t:b", b"fp-a", b"127.0.0.1:9100"))?;
 	registry.add(peer_entry_dial(b"urn:t:a", b"fp-b", b"127.0.0.1:9200"))?;
 
-	let weakened = registry.weaken_peer_by_dial(b"127.0.0.1:9100")?;
+	let weakened = registry.weaken_peer_by_dial(PeerAddress::fixture("127.0.0.1:9100"))?;
 	assert_eq!(weakened, 2);
 	Ok(())
 }
@@ -1159,7 +1206,7 @@ fn weaken_peer_by_dial_ignores_unknown_gateway() -> Result<(), ClusterError> {
 	let registry = registry();
 	registry.add(peer_entry_dial(b"urn:t:a", b"fp-a", b"127.0.0.1:9100"))?;
 
-	let weakened = registry.weaken_peer_by_dial(b"127.0.0.1:9999")?;
+	let weakened = registry.weaken_peer_by_dial(PeerAddress::fixture("127.0.0.1:9999"))?;
 	assert_eq!(weakened, 0);
 	Ok(())
 }

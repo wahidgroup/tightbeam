@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use super::error::ClusterError;
-use crate::colony::cluster::servlet_registry::{HiveSlate, ServletRegistry};
+use crate::colony::cluster::servlet_registry::{DialTarget, HiveSlate, ServletRegistry};
 use crate::colony::common::RegisterHiveRequest;
 use crate::utils::time::{Clock, MonotonicInstant};
 use crate::utils::BasisPoints;
@@ -46,10 +46,8 @@ impl HiveEntry {
 	/// only an address this entry holds.
 	pub fn dial_target<A: core::str::FromStr>(&self) -> Option<(SharedId, A)> {
 		let address = Arc::clone(&self.address);
-		core::str::from_utf8(&address)
-			.ok()
-			.and_then(|raw| raw.parse().ok())
-			.map(|parsed| (address, parsed))
+		let parsed = DialTarget::of_registered(&address).protocol_address().ok()?;
+		Some((address, parsed))
 	}
 }
 

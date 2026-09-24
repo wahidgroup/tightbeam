@@ -255,7 +255,10 @@ impl ClusterConfig {
 		let routes = peer_entries
 			.into_iter()
 			.filter(|entry| entry.route_kind() == RouteKind::Peer)
-			.map(|entry| PeerGossip { peer_id: entry.owner_id().to_vec(), gateway_addr: entry.dial_target().to_vec() });
+			.map(|entry| PeerGossip {
+				peer_id: entry.owner_id().to_vec(),
+				gateway_addr: entry.dial_target().route_bytes().to_vec(),
+			});
 
 		// The sample holds to MAX_PEX_SAMPLE, so a linear scan dedupes
 		// by dial address without a set allocation per entry.

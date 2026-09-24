@@ -1,6 +1,8 @@
 //! Peer federation tests for the advertisement control plane.
 
 use super::common::*;
+use tightbeam::colony::cluster::ClusterConfigBuilder;
+use tightbeam::transport::Protocol;
 
 tb_assert_spec! {
 	pub ClusterPeerAdvertisedSpec,
@@ -1113,6 +1115,103 @@ tb_scenario! {
 			advertiser.stop();
 			receiver.stop();
 			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterWildcardBindRefusedSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(WILDCARD_START_REFUSED, exactly!(1), equals!(true))
+		]
+	}
+}
+
+/// A federating builder bound to the IPv4 wildcard, which a scenario
+/// finishes with or without an advertise address.
+fn wildcard_advertising_builder(certs: &ClusterTestCerts, peer: impl Into<String>) -> ClusterConfigBuilder {
+	let peer: String = peer.into();
+	ClusterConfig::builder(cluster_tls_config(certs))
+		.with_bind_addr("0.0.0.0:0")
+		.with_peers([peer])
+		.expect("fixture peers name sockets")
+		.with_advertise_interval(Duration::from_millis(100))
+}
+
+// A gateway bound to the wildcard address would advertise `0.0.0.0`, which
+// every peer refuses as unspecified, so a federating gateway with no
+// advertise address refuses to start rather than federating silently.
+tb_scenario! {
+	name: cluster_refuses_to_federate_from_a_wildcard_bind_without_an_advertise_address,
+	spec: ClusterWildcardBindRefusedSpec,
+	environment Bare {
+		context: cluster_certs(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			let conf = wildcard_advertising_builder(&certs, "127.0.0.1:65210").build();
+			let refused = start_cluster(&trace, conf).await;
+			let advertise_required = matches!(refused, Err(TightBeamError::ClusterError(error)) if matches!(*error, ClusterError::AdvertiseAddressRequired));
+
+			trace.event_with(WILDCARD_START_REFUSED, &[], advertise_required)?;
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterAdvertiseAddrSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
+			(PEER_ROUTE_DIALS_ADVERTISED_ADDR, exactly!(1), equals!(true))
+		]
+	}
+}
+
+/// The socket a wildcard-bound advertiser tells its peers to dial.
+const ADVERTISED_GATEWAY_ADDR: &[u8] = b"127.0.0.1:65211";
+
+/// The loopback spelling of a gateway's bound socket, for a client on the
+/// same host to dial a wildcard-bound gateway.
+fn loopback_of(cluster: &ClusterGateway) -> <TokioListener as Protocol>::Address {
+	let spelling = format!("127.0.0.1:{}", cluster.addr().port());
+	spelling.parse().expect("a loopback socket spelling parses")
+}
+
+// A wildcard-bound gateway advertises the address the operator configured,
+// so the peer's learned route dials that address and never the bound one.
+tb_scenario! {
+	name: cluster_advertises_the_configured_address_over_a_wildcard_bind,
+	spec: ClusterAdvertiseAddrSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, peering_cluster_conf(&certs)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster: receiver }| async move {
+			let advertised = String::from_utf8_lossy(ADVERTISED_GATEWAY_ADDR).into_owned();
+			let conf = wildcard_advertising_builder(&certs, receiver.addr().to_string())
+				.with_advertise_addr(advertised)?
+				.build();
+			let advertiser = start_cluster(&trace, conf).await?;
+
+			let mut client = connect_cluster(&certs, &loopback_of(&advertiser)).await?;
+			let hive_addr = b"127.0.0.1:65212";
+			let servlets = vec![servlet_info("ping", hive_addr)];
+			register_signed_hive_serving(&mut client, &certs.key, b"reg-wildcard", hive_addr, servlets).await?;
+
+			let learned = wait_for_peer_types(&receiver, 50, Duration::from_millis(100)).await;
+			let routes = receiver.peer_routes()?;
+			let learned_any = !learned.is_empty();
+			let all_dial_advertised = routes.iter().all(|route| route.dial_addr.as_ref() == ADVERTISED_GATEWAY_ADDR);
+			trace.event_with(PEER_ROUTE_DIALS_ADVERTISED_ADDR, &[], learned_any && all_dial_advertised)?;
+
+			advertiser.stop();
+			receiver.stop();
 			Ok(())
 		}
 	}

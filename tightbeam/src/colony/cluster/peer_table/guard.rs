@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{ClusterError, PeerAddress, PeerRecord};
+use super::{AdmittedDial, ClusterError, PeerAddress, PeerRecord};
 use crate::utils::time::UnixMillis;
 
 /// What the table knows about one peer address.
@@ -29,14 +29,14 @@ pub struct PeerEntry {
 #[derive(Debug, Default)]
 pub struct TableState {
 	/// Learned peers that no probe has verified yet.
-	pub new: HashMap<PeerAddress, PeerEntry>,
+	pub new: HashMap<AdmittedDial, PeerEntry>,
 	/// Learned peers that a probe has verified.
-	pub tried: HashMap<PeerAddress, PeerEntry>,
+	pub tried: HashMap<AdmittedDial, PeerEntry>,
 	/// Anchors whose beat dial passed the colony gate.
 	///
 	/// A seed shares its verified anchors over PEX, which is how a
 	/// bootstrapping peer learns its first dial targets.
-	pub anchors_verified: HashMap<PeerAddress, PeerEntry>,
+	pub anchors_verified: HashMap<AdmittedDial, PeerEntry>,
 	/// This gateway's own advertised address, held out of peer admission.
 	pub local: Option<PeerAddress>,
 	/// Count of durable mutations applied so far, each one taken inside the
@@ -111,7 +111,7 @@ impl GuardedTable {
 			.map(|(addr, entry)| (addr, entry, false))
 			.chain(state.tried.iter().map(|(addr, entry)| (addr, entry, true)))
 			.map(|(addr, entry, tried)| PeerRecord {
-				gateway_addr: *addr,
+				gateway_addr: addr.address(),
 				peer_id: entry.peer_id.clone(),
 				tried,
 				last_probe: entry.last_probe,

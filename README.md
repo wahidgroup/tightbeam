@@ -570,16 +570,13 @@ Message Integrity (MI) and Frame Integrity (FI) bind different byte ranges. Rece
 | Message Integrity (MI) | Message payload bytes                | When `Metadata.integrity` is present, MI MUST bind the message body.        |
 | Frame Integrity (FI)   | DER-canonical `version` + `metadata` | FI MUST exclude `message`. FI MUST bind the frame envelope around the body. |
 
-- FI alone MUST NOT prove message-content correctness. FI proves only that `version` and `metadata` are intact.
-- MI MUST prove message-content correctness.
-- MI lives in metadata. FI commits to the frame that contains that metadata, so FI witnesses MI.
-- When FI is authenticated (for example by nonrepudiation or consensus), tampering with MI MUST fail authenticated FI validation.
-- Receivers SHOULD treat the pair (valid MI, authenticated FI) as enough evidence that both frame and message are intact.
-- An in-band, unsigned FI MUST NOT be trusted against an active attacker who changes both MI and FI.
+- FI proves only that `version` and `metadata` are intact. MI proves the message content.
+- MI lives in the metadata that FI covers, so an authenticated FI (signed or consensus-backed) detects a change to MI.
+- An unsigned FI MUST NOT be trusted against an attacker who can rewrite both MI and FI.
 
 ##### Optional Hiding Commitment (Salt)
 
-By default, MI is a plain-mode commitment over the body. That commitment is binding. It is not hiding. The digest travels in cleartext metadata. If the body has low entropy, an attacker who sees the digest MAY brute-force candidate preimages. Encrypting the body does not remove that risk by itself.
+By default, MI is a plain-mode commitment over the body. That commitment is binding. It is not hiding. The digest travels in cleartext metadata. If the body has low entropy, an attacker who sees the digest MAY brute-force candidate preimages.
 
 An application MAY store a hiding commitment in the same `Metadata.integrity` field. The commitment salts the body with a secret, high-entropy blinding value.
 
@@ -641,7 +638,6 @@ where
 - The cipher type names the algorithm identifier stamped on the wire, so the identifier cannot diverge from the cipher, even when the message type has no security profile.
 - AEAD tags prove that ciphertext was not modified. Examples include AES-GCM ([FIPS 197][fips197]) and ChaCha20-Poly1305 ([RFC 8439][rfc8439]).
 - MI proves that decrypted plaintext matches the original message content.
-- AEAD protects ciphertext. MI proves plaintext. FI witnesses MI in metadata. Signatures cover the frame.
 
 When AEAD is enforced, the construction is cryptographically equivalent to Encrypt-then-MAC for ciphertext authenticity. An attacker cannot modify the ciphertext without failing AEAD authentication. An attacker cannot modify MI without breaking authenticated FI when signing is present. An attacker cannot decrypt without the key.
 
@@ -650,7 +646,7 @@ When AEAD is enforced, the construction is cryptographically equivalent to Encry
 The `previous_frame` field links Frames through a cryptographic hash chain. Each digest commits to prior history by transitive hashing.
 
 - **Causal ordering**: A Frame carries proof of its position in the sequence.
-- **Tamper detection**: A change to an earlier Frame breaks every later digest that depends on it.
+- **Tamper detection**: A change to an earlier Frame breaks every later digest.
 - **Replay protection**: Receivers can detect out-of-sequence or duplicate Frames.
 - **Fork detection**: Two Frames that share one `previous_frame` digest indicate a branch.
 - **Stateless verification**: Ancestry can be checked without storing the entire chain.
@@ -708,10 +704,10 @@ The `Matrix` type carries compact application state inside a Frame. It is an **n
 
 Applications use the matrix when they need dense, version-tolerant control state on the wire.
 
-- A matrix holds up to 255x255 cell values in the range 0-255. The maximum encoded size is about 63.5 KB.
-- Newer senders MAY set cells that older receivers do not understand. Receivers SHOULD ignore those cells.
+- A matrix holds up to 255x255 cell values in the range 0-255 (max ~63.5 KB).
+- Newer senders MAY set cells that older receivers SHOULD ignore.
 - Deterministic DER encoding and length checks keep invalid grids off the wire.
-- Applications MAY combine the matrix with `previous_frame` to bind successive state snapshots.
+- Applications MAY combine the matrix with `previous_frame` to bind successive state.
 
 The matrix does not replace the message payload. It carries structured control or status data that benefits from a fixed grid layout.
 
@@ -772,7 +768,7 @@ The following rules constrain matrix handling so that frames remain within **I(t
 - Decoders MUST reject a matrix when `data.len != n²`.
 - Decoders MUST reject a matrix when a decoded cell value falls outside 0-255.
 - Applications MUST define the meaning of every cell they use.
-- Receivers SHOULD ignore non-zero values in cells that the local application has not defined.
+- Receivers SHOULD ignore non-zero values in cells the local application has not defined.
 - If `Metadata.matrix` is omitted, the application MAY assume a default matrix state.
 
 #### 5.8.5 Example: Flag System
@@ -1021,12 +1017,6 @@ pub trait Message: /* trait bounds */ {
 
 The associated `Profile` type MAY be any type that implements `SecurityProfile`. It defaults to `TightbeamProfile` when the application does not set another type. OID validation runs only when `HAS_PROFILE` is `true`.
 
-When `HAS_PROFILE` is `true`, the following matches are required:
-
-- Digest algorithms MUST match `<Profile::Digest as AssociatedOid>::OID`.
-- AEAD ciphers MUST match `<Profile::AeadOid as AssociatedOid>::OID`.
-- Signature algorithms MUST match `<Profile::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID`.
-
 A message type with a typed profile therefore composes only with compatible algorithms.
 
 #### Security Requirement Semantics
@@ -1034,7 +1024,7 @@ A message type with a typed profile therefore composes only with compatible algo
 - When `MUST_BE_NON_REPUDIABLE` is `true`, the Frame MUST include `nonrepudiation`.
 - When `MUST_BE_CONFIDENTIAL` is `true`, `Metadata` MUST include `confidentiality`.
 - When `MUST_BE_COMPRESSED` is `true`, `Metadata.compactness` MUST be present (not absent).
-- When `MUST_BE_PRIORITIZED` is `true`, `Metadata` MUST include `priority`. This requirement applies only for V2 and later.
+- When `MUST_BE_PRIORITIZED` is `true`, `Metadata` MUST include `priority`.
 - When `MUST_HAVE_MESSAGE_INTEGRITY` is `true`, `Metadata.integrity` (MI) MUST be present.
 - When `MUST_HAVE_FRAME_INTEGRITY` is `true`, `Frame.integrity` (FI) MUST be present.
 - `Frame.version` MUST be greater than or equal to `Message::MIN_VERSION`.
@@ -1078,18 +1068,9 @@ let frame = compose::<SecureMessage>(Version::V1)
 
 > Note: tightbeam macros are optional. The same behavior is available through the underlying builders and traits for direct use.
 
-**Validation rules** (when `HAS_PROFILE` is `true`):
-
-- `with_message_hasher::<D>(salt)` requires `D::OID == Profile::Digest::OID`.
-- `with_witness_hasher::<D>()` requires `D::OID == Profile::Digest::OID`.
-- `with_aead(cipher)` requires `Cipher::Oid::OID == Profile::AeadOid::OID`. The cipher type names its own OID, even when no typed profile is active.
-- `with_signer::<S, _>()` requires `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`.
-
-An algorithm mismatch returns `TightBeamError::UnexpectedAlgorithm`. The error carries the received OID and the expected OID.
-
 #### Implementation Enforcement
 
-- **Compile time**: The derive implements the `CheckDigestOid`, `CheckAeadOid`, and `CheckSignatureOid` hints only for the profile's algorithms, so a derived message rejects a mismatched algorithm type. A hand-written `Message` impl can implement those hints for any algorithm, so they are not the enforcement.
+- **Compile time**: The derive implements the `CheckDigestOid`, `CheckAeadOid`, and `CheckSignatureOid` hints only for the profile's algorithms, so a derived message rejects a mismatched algorithm type.
 - **Run time**: `FrameBuilder` compares each algorithm OID with the profile, which enforces the profile for every `Message` impl. Frame validation checks that the Frame shape matches the message requirements.
 - **Profile binding**: A `SecurityProfile` type is attached through `Message::Profile` and the `#[beam(profile(...))]` attributes below.
 
@@ -1215,7 +1196,7 @@ Implementations MUST enforce `Message` security requirements at compile time and
 #### Runtime Validation
 
 - Frame encode and decode paths MUST validate the Frame shape against the message type requirements.
-- Requirement violations MUST surface as errors. Implementations MUST NOT panic for ordinary validation failures.
+- Requirement violations MUST surface as errors.
 
 ### 7.2 Transport Layer
 
@@ -1265,8 +1246,8 @@ Transport behavior is split across traits so applications can plug in a byte pro
 #### 8.1.1 Design Principles
 
 - Bind and connect live on protocol traits. Frame read and write live on I/O traits.
-- Gate and retry policies attach to emitter and collector wrappers. They do not rewrite the byte protocol.
-- Encryption extends the same trait family. Cleartext and encrypted paths share the Frame API.
+- Gate and retry policies attach to emitter and collector wrappers.
+- Encryption extends the same trait family.
 
 #### 8.1.2 Core Transport Traits
 
@@ -1284,7 +1265,7 @@ Frames use ASN.1 DER with two envelope layers:
 - **`WireEnvelope`**: Outer cleartext or encrypted container
 - **`TransportEnvelope`**: Inner request, response, CMS, or mux payload
 
-With the `transport-multiplex` feature, `TransportEnvelope` includes a `Mux` arm (ASN.1 context tag 4). That arm nests a `MuxEnvelope` CHOICE with Open, Data, End, Credit, Cancel, GoAway, and Ping (inner context tags 0 through 6). Multiplex stream correlation metadata travels inside the `TransportEnvelope` payload. When `WireEnvelope` is encrypted, that metadata is not cleartext on the wire.
+With the `transport-multiplex` feature, `TransportEnvelope` also carries mux stream envelopes. Stream metadata travels inside that envelope, so encryption hides it.
 
 DER tag-length-value encoding supplies framing. Default size limits:
 
@@ -1330,9 +1311,9 @@ pub trait GatePolicy: Send + Sync {
 }
 ```
 
-Every evaluation receives the connection `SessionContext`. Identity-blind gates ignore it. Identity gates key on it. Cleartext connections, client emit paths, and in-process evaluation pass the default empty context. Accessors on that context all return `None`.
+Every evaluation receives the connection's `SessionContext`. On cleartext and client-side paths its accessors return `None`.
 
-`frame` is `None` for mux streaming and duplex opens that have no request Frame at dispatch. Session and capacity gates still run. Optional integrity gates that need a Frame SHOULD return `Ok` when `frame` is `None`. Auth that needs a signed or intact Frame MUST fail closed. Stream authorization SHOULD use session facts (mutual TLS, peer lists), not Frame-content rules alone.
+`frame` is `None` when a mux stream opens without a request Frame. An optional check that needs a Frame SHOULD return `Ok`, and authentication that needs one MUST fail closed. Authorize streams on session facts such as mutual TLS.
 
 **ReceptorPolicy trait:**
 
@@ -1869,14 +1850,10 @@ Client                              Server
 
 **Transport validation:**
 
-- Each side advertises how many streams its peer MAY initiate at once (`max_peer_initiated_streams`), matching [RFC 9113 §5.1.2][rfc9113-5.1.2] directional semantics.
-- Multiplexing MUST activate only when both sides offered it. If either side omits the offer, the connection stays single-flight.
-- Caps are directional. There is no symmetric min-collapse of the two advertisements.
-- Both endpoints MUST clamp each advertised cap to `MAX_MUX_STREAM_CAP` (1024) when deriving `MuxSettings`.
-- A peer that accepts multiplexing without a matching local offer MUST fail closed (`UnsolicitedTransportAccept`).
-- Offer and accept also carry flow-control values (`chunk_payload_size`, `credit_unit`, `initial_stream_credit`) with the same directional rule: the sender advertises what it will receive. Accept fixes `credit_unit` for both directions.
-- The offer MAY request per-direction session budgets (`requested_budgets`) and MAY attach an opaque `authorization` token. Accept answers with `granted_budgets`. Grants are opt-in on the server. Without a local budget ceiling or an authorizer verdict, nothing is granted. A server-side `TransportAuthorizer` MAY refuse the session (`AuthorizationRefused`). See [§8.6.2](#862-specification-stream-rules-envelopes-and-runtime).
-- The client MUST fail closed on every grant that diverges from its request: a grant without a request (`UnsolicitedTransportAccept`), a grant beyond `MAX_MUX_SESSION_BUDGET` (`BudgetBeyondCap`), a grant beyond the request (`BudgetBeyondRequest`), or a grant withheld against a request (`BudgetGrantWithheld`). Grants at or below the request activate metering and the receipt exchange.
+- Multiplexing MUST activate only when both sides offer it. Otherwise the connection stays single-flight.
+- Each side advertises the limits it will receive: how many streams its peer MAY open, chunk size, and stream credit. Stream caps are clamped to `MAX_MUX_STREAM_CAP` (1024).
+- The offer MAY request session budgets ([§8.6.2](#862-specification-stream-rules-envelopes-and-runtime)).
+- The client MUST fail closed on an accept it did not ask for, or on a budget grant that differs from its request.
 
 Stream identifier rules, envelope types, and runtime assembly are in [§8.6 Multiplexing](#86-multiplexing).
 
@@ -1945,10 +1922,10 @@ Mux is an application-layer stream router over the envelope transport. It does n
 - **Concurrency**: Many outstanding request/response pairs per connection without head-of-line blocking
 - **Correlation**: Stream identifiers travel inside the `TransportEnvelope` payload
 - **Fair limits**: Directional concurrency caps are negotiated per connection and clamped
-- **Fair sharing**: Mandatory chunking bounds record size. Per-stream credit windows bound reassembly memory. One stream cannot monopolize the shared writer
-- **Metered sessions**: Optional handshake-granted per-direction budgets bound encrypted-session volume before renewal
-- **Accountable sessions**: Budget-bearing sessions produce a dual-signed `SessionReceipt`. The receipt binds transcript, budgets, and settlement terms under both identities. A third party verifies it from the certificates alone
-- **Epoch renewal**: Budget-bearing sessions renew keys, counters, budgets, and receipts in band before the cipher record limit ([RFC 9846 §5.5][rfc9846-5.5])
+- **Fair sharing**: Chunking bounds record size. Credit windows bound reassembly memory.
+- **Metered sessions**: Optional handshake-granted per-direction budgets bound encrypted-session volume
+- **Accountable sessions**: Budget-bearing sessions produce a dual-signed `SessionReceipt`.
+- **Epoch renewal**: Budget-bearing sessions renew in band before the cipher record limit ([RFC 9846 §5.5][rfc9846-5.5])
 - **Graceful drain**: `GoAway` completes in-flight streams at or below a threshold and rejects newer ones
 - **Abuse resistance**: Rapid reset (CVE-2023-44487) exhausts a cancel budget and draws GoAway(`EnhanceYourCalm`)
 
@@ -1970,7 +1947,8 @@ Stream IDs identify one logical stream on one physical connection:
 - Client-initiated streams use odd IDs. Server-initiated streams use even IDs.
 - Stream ID 0 is reserved and MUST NOT be allocated.
 - Each endpoint MUST allocate locally-initiated IDs strictly monotonically.
-- `MuxRole::Client` is the handshake initiator (odd IDs). `MuxRole::Server` is the responder (even IDs). The role passed to `MuxTransport::new` MUST match the endpoint's connection role.
+- `MuxRole::Client` is the handshake initiator (odd IDs).
+- `MuxRole::Server` is the responder (even IDs).
 
 **Stream states:**
 
@@ -1984,10 +1962,10 @@ Streams in `Open`, `HalfClosedLocal`, or `HalfClosedRemote` count toward the pee
 
 `MuxSettings` carries two directional values:
 
-- `local_initiated_cap`: how many streams this endpoint may initiate (the value the peer advertised)
-- `peer_initiated_cap`: how many streams the peer may initiate (the value this endpoint advertised)
+- `local_initiated_cap`: how many streams this endpoint may initiate
+- `peer_initiated_cap`: how many streams the peer may initiate
 
-Each endpoint MUST enforce the cap it advertised against peer-initiated streams. It MUST respect the peer-advertised cap when allocating locally. Exhausting the local-initiated cap MUST return `ResourceExhausted` without allocating a stream. Advertised caps MUST be clamped to `MAX_MUX_STREAM_CAP` (1024) when deriving settings. An absurd wire advertisement MUST NOT inflate bookkeeping bounds (CWE-770).
+Each endpoint MUST enforce the cap it advertised and respect the cap its peer advertised. A local open past the cap returns `ResourceExhausted`.
 
 **Envelope types** (`TransportEnvelope` context tag 4 nests the `MuxEnvelope` CHOICE, inner context tags 0-10):
 
@@ -2015,32 +1993,17 @@ either:     Cancel(code)  Credit(limit)
 
 **Chunking** (mandatory, no opt-out): Every message segments at the peer-advertised `chunk_payload_size` (1-64 KiB, default 16 KiB, [RFC 9113 §4.2][rfc9113-4.2]). Reassembly follows arrival order. The ordered AEAD channel already proves order and completeness. Chunks carry no sequence numbers. An oversize chunk is a protocol violation: GoAway(`ProtocolError`). A unary message still travels in one record.
 
-**Stream credit** (per-stream flow control, QUIC MAX_STREAM_DATA-like, [RFC 9000 §4.1][rfc9000-4.1]): Receivers grant inbound streams a chunk allowance (default 64). They replenish it with `Credit` grants. A sender out of credit parks. Control envelopes bypass the gate. The reader never blocks on the writer, so saturated endpoints cannot deadlock ([RFC 9113 §5.2.2][rfc9113-5.2.2]). Credit and concurrency-cap overruns are protocol violations. Those rules bound reassembly memory (CWE-770). Grant policy is pluggable via `CreditGrantor`.
+**Stream credit**: Each inbound stream gets a chunk allowance (default 64) that the receiver refills with `Credit`. A sender out of credit waits. An overrun is a protocol violation, so reassembly memory stays bounded ([RFC 9000 §4.1][rfc9000-4.1]).
 
-**Session budgets** (optional metering, encrypted sessions only): The handshake MAY grant each direction a spendable volume. The grant is transcript-bound so peers cannot forge it. Data chunks debit `ceil(payload_len / credit_unit)`. Control is free. Budgets never grow within an epoch. Exhaustion fails the emit fast (`BudgetExhausted`) and drains the connection gracefully. Both sides run the accounting. An inbound overspend is a protocol violation. No budgets, and always under cleartext mux, means unmetered.
+**Session budgets** (optional, encrypted sessions only): The handshake MAY grant each direction a volume of data. When a budget runs out, the emit fails with `BudgetExhausted` and the connection drains.
 
-**Session authorization** (server hook between offer and accept): The offer MAY carry an opaque `authorization` token. tightbeam never parses that token. A `TransportAuthorizer` decides the budgets to grant. It MAY attach a settlement challenge. It MAY refuse the session (`AuthorizationRefused { code }`). The hook fires before authentication. Keep it cheap and rate-limit it upstream.
+**Session authorization**: A server-side `TransportAuthorizer` reads the offer's opaque `authorization` token. It grants budgets, attaches a settlement challenge, or refuses the session. It runs before authentication, so keep it cheap.
 
-**Session receipts** (budget-bearing sessions only): Every metered session produces a CMS `SignedData` artifact ([RFC 5652 §5][rfc5652-5]). Its `eContent` is the `SessionReceipt` body. That body binds the handshake transcript (as a self-describing `DigestInfo`, [RFC 8017 §9.2][rfc8017-9.2]), budgets, and settlement terms. Each peer contributes one role-tagged `SignerInfo`. A third party that holds the two certificates verifies the agreement from the stored artifact alone.
+**Session receipts**: Every metered session produces a receipt that both peers sign, as CMS `SignedData` ([RFC 5652 §5][rfc5652-5]). The receipt binds the handshake transcript, the budgets, and the settlement answer, so a third party with both certificates can verify the agreement. Budgets REQUIRE mutual authentication. Read the receipt with `session_receipt()`.
 
-- The server signs first. The client validates against the negotiated session. The client answers the challenge via its `ReceiptApprover` and countersigns. Its `SignerInfo` signed attributes ([RFC 5652 §11][rfc5652-11]) bind the answer and the role. Neither answer nor role can be swapped or spliced (CWE-347).
-- The client's `SignerInfo` travels only encrypted to the server (inside the ECIES key-exchange payload, or an `EnvelopedData` [RFC 5652 §6][rfc5652-6] attribute on the CMS Finished). The settlement answer is a bearer secret. It MUST NOT travel on the cleartext wire.
-- The server's `TransportAuthorizer::settle` accepts or refuses the answer. The session MUST NOT activate before it accepts. Every step fails closed. Budgets REQUIRE mutual authentication.
-- A server-side `SessionObserver` records every concluded outcome, including refused and forged acknowledgements. It never vetoes.
-- Both endpoints retain the completed artifact (`session_receipt()`). The settlement answer is application truth: never parsed, never price-checked, never persisted. The receipt makes the agreement non-repudiable. It does not prove the answer is correct.
+**Epoch renewal**: Metered sessions renew keys, budgets, and receipts in band before the cipher record limit ([RFC 9846 §5.5][rfc9846-5.5]). A renewal keeps the negotiated terms. A failed renewal drains the connection. Sessions without receipts drain via GoAway, and the caller reconnects.
 
-**Epoch renewal (rekey)** (budget-bearing sessions only): Renew the AEAD epoch in band instead of draining at a watermark. The client opens `RekeyRequest` / `RekeyResponse` / `RekeyAck`. The server finishes with `RekeyDone`. Renewal starts when send budget hits the drain reserve, or when send records approach the rekey limit. Endpoints MUST rekey before that limit ([RFC 9846 §5.5][rfc9846-5.5]), with `DEFAULT_REKEY_RENEWAL_ALLOWANCE` slack.
-
-- Fresh keys derive via `kdf_chain` from the retained epoch secret and both exchanged nonces. The prior secret is zeroized once its successor exists ([RFC 9846 §7.2][rfc9846-7.2]).
-- Each direction switches keys at its marker on the ordered AEAD channel ([RFC 9846 §4.7.3][rfc9846-4.7.3] per-direction precedent). Client-to-server switches at the `RekeyAck` record. Server-to-client switches at the `RekeyDone` record. Record counters reset only with the fresh keys ([NIST SP 800-38D][nist-800-38d] §8.2.1).
-- Budgets reset to the negotiated terms at `RekeyDone`. The epoch receipt MUST carry the same credit terms as the initial one (credit-match invariant, absolute-limits [RFC 9000 §4.1][rfc9000-4.1]-like). A renewal never renegotiates.
-- Every epoch produces a fresh dual-signed receipt chained to its predecessor by transcript hash. A third party verifies it from the original certificates. `session_receipt()` rotates to the current epoch's artifact.
-- The authorizer MAY attach a settlement challenge to the renewal (`TransportAuthorizer::challenge_renewal`). The client's `ReceiptApprover` answers inside the encrypted `RekeyAck`. `settle` accepts or refuses, as at the handshake.
-- Failures fail closed into a graceful drain. Settlement or approval refusal drains with the refusal's code. A stalled exchange drains at the renewal deadline (default `DEFAULT_REKEY_DEADLINE_SECS`, override via `MuxTransport::with_renewal_deadline`). A premature (below the minimum-spend floor) or duplicate `RekeyRequest` is a protocol violation: GoAway(`ProtocolError`).
-- A renewal still in flight at the drain threshold parks data chunks on the hard floor. Control and the exchange legs keep the remaining records. Parked chunks resume on the fresh cipher.
-- Sessions without rekey materials (receiptless or cleartext) drain via GoAway near the watermark. The caller re-establishes.
-
-**Reason code space** (open u32, HTTP/2 error-code and QUIC application-close precedent: [RFC 9113 §7][rfc9113-7], [RFC 9000 §20.2][rfc9000-20.2]): Codes below `MUX_APPLICATION_CODE_FLOOR` (0x1000) are reserved for the tightbeam protocol. Applications own the rest. Unknown codes decode to `Application(code)` and MUST NOT kill the connection.
+**Reason codes**: Codes below `MUX_APPLICATION_CODE_FLOOR` (0x1000) belong to tightbeam, and applications own the rest, as in HTTP/2 ([RFC 9113 §7][rfc9113-7]). An unknown code decodes to `Application(code)` and MUST NOT close the connection.
 
 **Cancel reasons:**
 
@@ -2079,12 +2042,10 @@ Client (MuxHandle)                         Server (MuxResponder)
 
 **Lifecycle rules:**
 
-- Dropping an in-flight `emit_on_stream` future MUST cancel the stream: remove the pending entry, free the cap slot, and best-effort send `MuxCancel`.
-- Per-stream timeouts compose externally. Wrap the emit future in the caller's timer. Expiry cancels via the drop guard.
-- A non-mux peer MUST reject muxed envelopes as invalid.
-- A mux peer that receives a non-mux application envelope (plain `Request`/`Response` where muxed traffic is required) MUST send GoAway(`ProtocolError`) and fail pending streams.
-- Cancels that abort in-flight handlers draw on a per-connection budget (`DEFAULT_MUX_CANCEL_BUDGET` = 1024). Exhaustion MUST end the connection with GoAway(`EnhanceYourCalm`). Override via `MuxTransport::with_cancel_budget`.
-- Near the AEAD send-record limit ([RFC 9846 §5.5][rfc9846-5.5]), a rekey-capable session opens an in-band epoch renewal (see Epoch renewal above). Otherwise the writer MUST begin a graceful drain via GoAway while `2 * (local_cap + peer_cap) + 1` records plus every registered-but-unsent chunk remain. Queued chunked responses, cancels, and the GoAway itself must still fit under the cipher limit.
+- Dropping an in-flight `emit_on_stream` future cancels the stream. Wrap the future in a timer for a per-stream timeout.
+- A mux peer that receives a non-mux envelope MUST send GoAway(`ProtocolError`). A non-mux peer MUST reject muxed envelopes.
+- Cancels that abort in-flight handlers draw on a per-connection budget (default 1024). Exhaustion ends the connection with GoAway(`EnhanceYourCalm`).
+- Near the cipher record limit, the session renews its epoch or drains via GoAway.
 
 **Runtime architecture:**
 
@@ -2111,10 +2072,10 @@ Client (MuxHandle)                         Server (MuxResponder)
         (encrypt or cleartext write)  (decrypt or cleartext read)
 ```
 
-- **MuxWriterDriver**: Single serialization point for the connection. It drains the outbound queue and writes each envelope through the send half. Spawn `drive()` on the caller's executor.
-- **MuxReaderDriver**: Reads envelopes from the receive half. It routes responses to pending stream slots and forwards peer-initiated requests to the responder. Unknown response IDs are discarded. Cancel/response races are benign.
-- **MuxHandle**: Cloneable client handle. It allocates stream IDs, registers pending slots, and awaits correlated responses.
-- **MuxResponder**: Serves peer-initiated streams with a caller-supplied handler. Handlers for distinct streams run concurrently. Cap exhaustion answers with `TransitStatus::ResourceExhausted`.
+- **MuxWriterDriver**: Writes every outbound envelope. Spawn `drive()` on your executor.
+- **MuxReaderDriver**: Routes responses to waiting streams and peer requests to the responder.
+- **MuxHandle**: Opens streams and awaits their responses.
+- **MuxResponder**: Serves peer-initiated streams concurrently with your handler.
 
 **MultiplexedProtocol trait:**
 
@@ -2185,11 +2146,11 @@ let response = handle.emit_on_stream(&frame).await?;
 handle.shutdown().await?;
 ```
 
-`MuxHandle::shutdown` sends GoAway(`Shutdown`). It halts new stream allocation, waits for the pending table to drain, then closes the writer driver. A drain deadline composes by wrapping `shutdown()` in the caller's timer. Per-stream timeouts compose the same way around `emit_on_stream`. Override the cancel budget with `MuxTransport::with_cancel_budget` when the default (`DEFAULT_MUX_CANCEL_BUDGET`) is wrong for the deployment.
+`shutdown` sends GoAway(`Shutdown`) and waits for open streams to finish. Wrap it in a timer to bound the drain.
 
 **Cleartext path:**
 
-Use cleartext only when both endpoints intentionally forgo the handshake. Settings are not negotiated. Divergent caps cause asymmetric refuse/accept behavior. `into_split` splits in the wire mode the session holds, so a transport built from `EndpointConfig::cleartext()` yields cleartext halves and a provisioned transport refuses to split until its handshake completes.
+Use cleartext only when both endpoints deliberately skip the handshake. Nothing is negotiated, so both sides SHOULD configure the same caps. A provisioned transport refuses `into_split` until its handshake completes.
 
 ```rust
 use tightbeam::transport::handshake::negotiation::MuxSettings;
@@ -2270,10 +2231,9 @@ let server_handle = server! {
 };
 ```
 
-- `with_mux_offer` takes an `Option<TransportOffer>`. `None` advertises nothing.
-- `servlet!`, `hive!`, and `cluster!` servers inherit the branch through their `server!` delegation. `HiveConfig::pool.mux_offer` and `ClusterConfig::pool_config.mux_offer` carry the advertisement to their listeners and pools.
-- The sync (`std`-thread) serving path never multiplexes. Mux drivers need an async executor.
-- Serving mux requires `transport-multiplex` (plus `x509`, `tokio`, `transport-policy`). A server built without it never advertises and keeps serving single-flight peers.
+- `None` advertises nothing, so the server stays single-flight.
+- `servlet!`, `hive!`, and `cluster!` inherit the option from `server!`. Hives and clusters set it with `mux_offer` in their pool config.
+- Serving mux requires the `transport-multiplex` feature and an async executor.
 
 ```rust
 let server_handle = server! {
@@ -2315,9 +2275,9 @@ let lease = pool.connect(server_addr).await?;
 let receipt = lease.session_receipt();  // Option<Arc<StoredReceipt>>
 ```
 
-- `ConnectionPoolBuilder::with_receipt_approver` forwards the approver to every dialed transport (handshake and epoch renewal). Without one, pooled clients fail closed on challenge-bearing receipts.
-- `PooledClient::session_receipt()` exposes the connection dual-signed receipt shared across leases. Epoch renewal rotates that receipt in place. Exclusive leases and receiptless sessions return `None`.
-- Size invoices with the public watermark math on `MuxSettings`. `usable_send_budget()` returns credits spendable on application data before the budget watermark opens an in-band renewal. That value is `send_budget` minus `send_budget_reserve()` (credits reserved so owed traffic can flush during a drain).
+- `with_receipt_approver` answers settlement challenges for every pooled connection. Without one, a session that carries a challenge fails.
+- `session_receipt()` returns the connection's current receipt, or `None` for an unmetered session.
+- `MuxSettings::usable_send_budget()` returns the credits left for application data, which is what an invoice should size against.
 
 **Fallback semantics** (automatic, per connection):
 
@@ -2361,7 +2321,7 @@ client.emit(frame, None).await?;
 - `PoolConfig::max_connections`: Max connections per destination (default: 64)
 - `PoolConfig::idle_timeout`: Optional connection expiration (default: None)
 - `PoolConfig::mux_offer`: Optional multiplexing advertisement. See [§8.6.5](#865-serving-and-pooling) (default: None)
-- `ConnectionPoolBuilder::with_clock`: The clock that idle time, deadlines, and backoff are measured against (default: `SystemClock`). `ConnectionPoolBuilder::new(config, clock)` takes it at construction. `PoolConfig` holds limits only, and a hive or gateway passes its own clock to its pools.
+- `ConnectionPoolBuilder::new(config, clock)`: The clock measures idle time, deadlines, and backoff. `with_clock` replaces it.
 
 ### 8.8 Audit
 
@@ -2825,9 +2785,9 @@ Hives include built-in resilience mechanisms:
 
 **Backpressure**: When utilization exceeds the threshold (default: 90%), the hive signals to the cluster that it is overloaded. The cluster can then route new work to less-loaded hives.
 
-**Circuit Breaker**: After consecutive authentication failures from one known signer (default: 3), that signer's circuit opens and the hive refuses its commands. When the cooldown has passed, the circuit lets one probe through. The cooldown runs on the monotonic reading of `HiveConfig::clock`, so a step of the system time neither shortens nor stretches it.
+**Circuit Breaker**: After consecutive authentication failures from one signer (default: 3), the hive refuses that signer's commands. After a cooldown, it lets one probe through.
 
-**Drain**: `Hive::drain` refuses every new command except the heartbeat and stops the background beats. It then waits until no command is in flight, or until `drain_timeout` passes on `HiveConfig::clock`, and stops the registered servlets. The hive then announces its emptied slate, so gateways retire its routes before a heartbeat misses. An idle hive drains at once.
+**Drain**: `Hive::drain` refuses new commands, waits for in-flight work (up to `drain_timeout`), and stops its servlets. It then tells gateways to drop its routes.
 
 These are configured via nested `HiveControlConfig`:
 
@@ -2843,7 +2803,7 @@ let hive_conf = HiveConfig {
 };
 ```
 
-**Refused commands**: A refused command is answered in the alternative it was sent in, so a refused spawn gets a spawn response and a refused heartbeat gets a heartbeat response. A command body that names no single alternative is answered in the stop alternative, which carries only a status. A signed command spends its replay slot when the hive admits it. A refusal that a retry of the same signed frame could change releases the slot, and every other refusal keeps it spent, so a resend of that frame is refused as a replay.
+**Refused commands**: The hive answers a refused command with a response of the same kind, so a refused spawn gets a spawn response. The table shows whether a resend of the same signed frame can succeed (slot released) or is refused as a replay (slot kept).
 
 | Management refusal                                       | Status              | Replay slot |
 | -------------------------------------------------------- | ------------------- | ----------- |
@@ -2980,27 +2940,19 @@ Cluster-hive communication (registration, heartbeats, routing) is covered under 
 
 #### 9.3.4 C: Clusters
 
-Clusters are the "ant colonies" of the EEIC--centralized gateways that coordinate distributed hives. Hives manage individual servlets. Clusters own higher-level orchestration: route work, monitor hive health, balance load, federate with peer gateways, and flood colony gossip across the swarm.
+Clusters are the "ant colonies" of the EEIC: gateways that coordinate hives. A hive manages servlets. A cluster routes work across hives, watches their health, and federates with peer gateways.
 
 ##### Architecture
 
-A cluster operates as a gateway server with five primary responsibilities:
+A cluster gateway has five jobs:
 
-1. **Hive Registry**: Maintains a dynamic registry of connected hives and their available servlet types. Hives register on startup and announce which servlet types they can handle. Each route belongs to the hive or peer gateway that installed it. A hive cannot register, update, or remove a route that another hive or a peer holds, and it cannot claim a socket that a peer gateway route dials. The gateway refuses such a registration or address update with `PermissionDenied`.
+1. **Hive Registry**: Tracks connected hives and the servlet types each one registers. A route belongs to the hive or peer that installed it, and no other party can change it. Only two peer routes may share a socket.
+2. **Work Routing**: Forwards each `ClusterWorkRequest` to a local or peer route chosen by the load balancer.
+3. **Health Monitoring**: Sends heartbeats to every hive and evicts hives that stop answering.
+4. **Peer Federation** (optional): Shares servlet types with peer gateways, so work can hop one step to another colony.
+5. **Colony Gossip** (optional): Floods signed rumors across the colony's gateways.
 
-2. **Work Routing**: Receives `ClusterWorkRequest` messages from external clients (or peer gateways), looks up Local and Peer routes for the servlet type, selects one via load balancing, and forwards the request.
-
-3. **Health Monitoring**: Periodically sends heartbeats to registered hives. Unresponsive hives are evicted after consecutive failures so clients are not routed to dead endpoints.
-
-4. **Peer Federation**: Optionally advertises local servlet types to peer gateways and installs soft-state Peer routes from their advertisements. Work can then hop one step to a peer colony that exports the type.
-
-5. **Colony Gossip**: Optionally floods origin-signed rumors across colony member gateways, with journal deduplication and anti-entropy repair.
-
-A panic that holds the hive registry, the route table, the peer table, or the gossip journal can leave it half-written, so the gateway propagates a poisoned lock on any of the four as `ClusterError::LockPoisoned`:
-
-- A background loop (the heartbeat, the pheromone evaporation sweep, the advertise beat, or a gossip reflood) ends and traces `CLUSTER_LOOP_POISONED` with the fault as its payload. A poisoned lock never clears, so the loop stays ended until the gateway restarts.
-- A registration, an address update, a peer advertisement, or a gossip frame is answered `Unavailable`.
-- The `Cluster` views `available_servlets`, `peer_servlets`, `peer_routes`, and `hive_count` return the error.
+A poisoned internal lock surfaces as `ClusterError::LockPoisoned`. The affected background loop stops and traces `CLUSTER_LOOP_POISONED`, and it stays stopped until the gateway restarts.
 
 ##### The `cluster!` Macro
 
@@ -3046,20 +2998,16 @@ let tls = ClusterTlsConfig {
 
 The two trust stores are separate planes and MUST NOT cross:
 
-- **`hive_trust`**: Validates hive-origin control frames (registration, servlet address updates) and origin gossip publish (`PublishGossip`). Missing signatures reply `TransitStatus::Unauthenticated`. Failed verification replies `TransitStatus::PermissionDenied`. `None` fails closed for those frames.
-- **`peer_trust`**: Validates peer advertisements and relayed gossip. `None` disables inbound federation (peer ads and relayed gossip are refused). Hive certificates cannot forge peer ads, and peer certificates cannot publish origin gossip.
+- **`hive_trust`**: Verifies hive frames: registration, address updates, and `PublishGossip`. `None` refuses them.
+- **`peer_trust`**: Verifies peer advertisements and relayed gossip. `None` turns off inbound federation.
 
-For hives to trust cluster commands (like heartbeats), they must have the cluster's certificate in their trust store. See [Trust Stores](#trust-stores) for details.
+A hive certificate cannot act as a peer, and a peer certificate cannot publish as a hive.
+
+Hives must also trust the cluster's certificate to accept its heartbeats. See [Trust Stores](#trust-stores) for details.
 
 ##### Colony Membership
 
-Federation and gossip are colony operations. Membership is the colony URN in the gateway certificate's URI Subject Alternative Name, validated against `ClusterConfig::namespace` and exposed read-only as `ClusterConfig::colony_urn()`. Ambiguous or missing SAN entries leave the gateway a non-member.
-
-- Non-members still register hives and route work.
-- Non-members refuse peer advertisements, gossip publish, gossip relay, and gossip reconciliation.
-- The advertise beat skips gossip repair when the local gateway is not a member.
-
-Flood scope is that certificate binding. Rumor bytes never carry a destination colony.
+A gateway belongs to the colony named by the URN in its certificate's URI Subject Alternative Name, checked against `ClusterConfig::namespace`. A non-member still registers hives and routes work, but it refuses federation and gossip.
 
 ##### Peer Federation
 
@@ -3078,18 +3026,29 @@ let conf = ClusterConfig::builder(tls)
 
 Behavior:
 
-1. Each advertise beat snapshots the **local hive registry** (never a static configured slate) and dials peers with a signed `AdvertisePeer` (`PeerAdvertisement`).
-2. The receiver admits on the peer trust plane: signature, freshness, colony membership on both sides, parseable dial address, optional allowlist, and namespace-scoped servlet types.
-3. Installed routes are soft-state and keyed by the peer's signer certificate fingerprint. The claimed `gateway_addr` is the dial target. An advertisement whose `gateway_addr` is a socket that a local hive route dials is refused with `PermissionDenied`. An empty advertisement clears that peer's routes.
-4. The load balancer selects among Local and Peer trails together. Locality emerges from pheromone strength rather than a hard preference flag.
-5. A peer hop re-emits `ClusterWorkRequest` with a decremented `hops_remaining` budget. The origin stamps the sentinel `u8::MAX`, which means forward as far as policy allows. The first gateway clamps that to its `PeerConfig::max_hops` (default 1). A default topology therefore forwards exactly once, and peer graphs cannot bounce work forever. A spent budget refuses `Unavailable` instead of forwarding.
-6. Peer dials prefer the peer connection pool when `peer_trust` is set. Peer failures weaken trails and can abandon a grey-hole peer while local routes keep serving.
+1. Each beat sends peers a signed `AdvertisePeer` that lists the servlet types local hives serve.
+2. The receiver checks the signature, freshness, colony membership, and claimed dial address, then installs peer routes.
+3. Peer routes are soft state. An empty advertisement withdraws them, repeated failures abandon them, and relay trails also expire by age.
+4. A hive route and a peer route never share a socket. The gateway refuses whichever claim arrives second with `PermissionDenied`. Sockets compare as parsed addresses, so any spelling of one socket is the same socket.
+5. The load balancer chooses among local and peer routes together.
+6. Each forward spends a hop budget (`PeerConfig::max_hops`, default 1), so work cannot bounce between peers.
 
-`peers` is a dial list, not an identity mesh. Partial or asymmetric peer graphs are expected.
+A gateway with an advertise beat that binds a wildcard address (`0.0.0.0` or `[::]`) MUST set `with_advertise_addr`, or it refuses to start with `ClusterError::AdvertiseAddressRequired`.
 
-Member gateways also flood their slate as an advertisement rumor, so peers of peers learn exported types transitively. A relayed rumor installs two soft-state trails. The direct trail dials the origin's claimed address. The relay trail dials the delivering peer and reconciles under its own composite bucket.
+**Claimed dial addresses.** `PeerConfig::admit_dial` decides which addresses a peer may ask this gateway to dial. The rules apply in this order:
 
-The relay trail competes for selection only when the remaining hop budget covers the extra hop (`max_hops >= 2`). A dead direct address then fails over to it by pheromone weakening. The rumor refloods on change, or every `ClusterConfig::rumor_refresh()` while unchanged, which is the configured interval clamped to the gossip freshness window.
+| Setting | Rule |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Every plane | The unspecified address (`0.0.0.0`, `[::]`) is refused, because a connect to it lands on loopback. |
+| Every plane | A multicast, broadcast, reserved (`240.0.0.0/4`), or `0.0.0.0/8` address is refused. It names no unicast peer. |
+| `with_peer_dial_allowlist`, when set | The list decides alone. |
+| No allowlist | Every other address is admitted, including private and loopback addresses. |
+
+Without an allowlist, a verified peer can point this gateway at any unicast address, including services on its own host (CWE-918). A gateway reachable from an internal network SHOULD set `with_peer_dial_allowlist`.
+
+Hive registrations skip this policy, because `hive_trust` signs them. A hive may register a loopback address. A servlet at `0.0.0.0:P` counts as the same socket as every address on port P.
+
+Member gateways also flood their advertisement as a rumor, so peers of peers learn exported types. With `max_hops` of 2 or more, work can reach such a type through the relaying peer when the direct address fails.
 
 ##### Servlet Export Boundary
 
@@ -3097,16 +3056,16 @@ By default a federated gateway advertises and serves every locally registered se
 
 **Planes**
 
-- **Discoverability**: each advertise beat filters the slate through `PeerConfig::exported_types` (`ExportAllowlist::export_keys`), so direct ads and slate rumors never disclose unexported types.
-- **Enforcement**: unary Work requests and routed stream opens evaluate the export boundary where the servlet target is known (`ExportAllowlist::contains`). A peer that guesses a type name is refused unless a grant opens that target (`PermissionDenied`, traced as `CLUSTER_EXPORT_REFUSED`).
+- **Discoverability**: Advertisements list only exported types.
+- **Enforcement**: A work or stream request for an unexported type is refused with `PermissionDenied`, unless a grant opens it.
 
-The enforcement pipeline layers these checks in order:
+Checks run in this order:
 
-1. Session gate policies (`with_gate_policy`) before the request envelope is decoded.
-2. Built-in allowlist from `exported_types`.
-3. Positive `ExportGrant` widening when the allowlist refuses.
-4. Custom `ExportGate` intersection (a deny gate overrides a grant).
-5. The servlet handles the request.
+1. Gate policies (`with_gate_policy`)
+2. The `exported_types` allowlist
+3. `ExportGrant` grants, when the allowlist refuses
+4. `ExportGate` deny gates, which override a grant
+5. The servlet
 
 ```rust
 let conf = ClusterConfig::builder(tls)
@@ -3119,14 +3078,11 @@ let conf = ClusterConfig::builder(tls)
 
 **Allowlist**
 
-`with_exported_types` drives a fail-closed built-in allowlist. Enforcement reads the live configuration on each request, so the two planes never drift. The allowlist rules apply in order:
+`with_exported_types` sets a fail-closed allowlist:
 
-1. An exported target passes for everyone.
-2. An unexported relayed request is refused. The hop marker (`hops_remaining` below the origin sentinel) is unauthenticated defense in depth. The identity rule below is the control that holds against a forged budget.
-3. An unexported origin request passes only for a first-party session: not relayed, a member of `hive_trust`, and not of `peer_trust`.
-4. Any other unexported request is refused (external peers, sessions in neither store, and anonymous sessions).
-
-When the allowlist refuses, a matching `ExportGrant` may still allow the target before deny gates run.
+1. An exported type passes for every caller.
+2. An unexported type passes only for a first-party caller: a direct session whose certificate is in `hive_trust` and not in `peer_trust`.
+3. Every other request is refused, unless a grant opens the type.
 
 **Grants**
 
@@ -3153,17 +3109,13 @@ let conf = ClusterConfig::builder(tls)
 
 Grant semantics:
 
-- The granted subject is the adjacent authenticated principal. On a relayed request that principal is the relaying peer gateway, so a grant matching a relayed request expresses federation-level trust in that gateway. Conservative grants test `!relayed`.
-- A granted type never appears on the advertised slate. It is a private interface whose URN the grantee learns out of band.
-- Do not emulate a grant by exporting the type and denying everyone except the partner. That workaround is fail-open (a forgotten gate opens the type to every peer) and it advertises the type to the whole federation.
+- On a relayed request, the grant sees the relaying gateway, not the original caller. A conservative grant checks `!relayed`.
+- A granted type is never advertised. The partner learns its URN out of band.
+- Use a grant, not an exported type with a deny-everyone-else gate. That workaround fails open and advertises the type.
 
 **Custom gates**
 
-Granular per-identity rules compose through custom gates:
-
-1. Every gate must pass (intersection with the allow sources).
-2. A deny gate overrides a grant.
-3. `TrustPlanes`, handed to every gate, exposes the built-in first-party classifier for reuse.
+Custom gates add per-identity deny rules. Every gate must pass, and a deny overrides a grant. Each gate receives `TrustPlanes` so it can reuse the built-in first-party check.
 
 ```rust
 struct DenyPeerKeyGate {
@@ -3189,26 +3141,22 @@ let conf = ClusterConfig::builder(tls)
 
 **Mutual TLS**
 
-First-party recognition requires mutual TLS. The accept plane stores a session certificate only when `ClusterTlsConfig::client_validators` is configured. Without that, every session is anonymous, so an export list also blocks unexported targets on the origin plane. The gateway traces `CLUSTER_EXPORT_IDENTITY_UNAVAILABLE` once at start when an export list is set but client identity is not captured (`client_validators` empty or `hive_trust` missing).
+First-party checks need mutual TLS. Without `client_validators`, every session is anonymous, so peers reach exported types only.
 
 **Configuration**
 
-- `None` (the default) exports every locally served type. A federated gateway (`peer_trust` set or a non-empty peer dial list) in that posture traces `CLUSTER_EXPORT_UNBOUNDED` once at start.
-- An empty list advertises nothing and leaves unexported targets to first-party origin callers only.
-
-**Advertisements and peer precedence**
-
-- Advertisements are filtered only by the static `exported_types` list. Custom gates and grants cannot alter ads, because ads are created per beat rather than per session.
-- Peer membership wins. A certificate in `peer_trust` is never first-party, even when `hive_trust` also holds it, so an identity in both stores cannot escalate to unexported targets.
-- The same precedence guards the hive plane. A control frame whose signer is in `peer_trust` is refused there, so a certificate in both stores cannot register hives.
+- `None` (the default) exports every type.
+- An empty list exports nothing.
+- Only `exported_types` filters advertisements. Gates and grants do not.
+- A certificate in `peer_trust` is never first-party, even when `hive_trust` also holds it.
 
 **Auditing**
 
-A refusal traces `CLUSTER_EXPORT_REFUSED` with the caller certificate fingerprint as payload and the relayed flag as value. Audits attribute the refusal to a principal and can infer hop-marker versus origin-plane refusal from that flag. A deciding grant traces `CLUSTER_EXPORT_GRANTED` under the same convention, so widened access stays attributable.
+A refusal traces `CLUSTER_EXPORT_REFUSED` and a grant traces `CLUSTER_EXPORT_GRANTED`, each with the caller's certificate fingerprint.
 
 **Gossip ingress**
 
-The gossip ingress sink (`GossipConfig::ingress`) sits outside the export boundary. Colony scope and the origin signature gate which peers may flood a rumor, and the operator, not the peer, chooses the delivery type.
+Gossip delivery (`GossipConfig::ingress`) is outside the export boundary. The operator chooses the delivery type, not the peer.
 
 ##### Heartbeat Mechanism
 
@@ -3238,7 +3186,7 @@ The `on_heartbeat` callback enables monitoring and metrics collection:
 
 ##### Load Balancing
 
-When multiple instances support the same servlet type, the cluster uses a `LoadBalancer` to select one among Local hive routes and Peer gateway routes. The default `StochasticForager` is a pheromone-based swarm strategy: it draws each instance with probability proportional to its trail strength, keeps an exploration floor so no instance is starved, and applies termite-style repellency so no instance is monopolized. Alternative strategies (`RoundRobin`, `PowerOfTwoChoices`) and any custom `LoadBalancer` are pluggable via `ClusterConfig::builder(..).with_load_balancer(..)`.
+When several instances serve one type, a `LoadBalancer` picks one across local and peer routes. The default `StochasticForager` picks in proportion to each route's pheromone strength, and it never starves or monopolizes an instance. Swap it with `with_load_balancer` for `RoundRobin`, `PowerOfTwoChoices`, or your own.
 
 ##### Colony Gossip
 
@@ -3258,25 +3206,23 @@ let conf = ClusterConfig::builder(tls)
 
 Flow:
 
-1. **Publish**: A hive-plane signed `PublishGossip` carries `GossipRumor { payload }`. The accepting origin gateway must be a colony member. It creates an origin-signed rumor Frame (id and issue time from the publish frame) and starts the flood.
-2. **Relay**: Peers carry `ClusterRequest::Gossip` with an outer relay Frame. Hop radius lives only in the outer `metadata.lifetime`. The inner rumor stays byte-identical under the origin signature. Relays verify on the peer trust plane, and the origin colony URN MUST equal the local gateway's colony URN.
-3. **Admit and journal**: Payload size, freshness (`seen_ttl`), hop TTL, per-signer rate admission, and content-digest dedup run before delivery. Duplicates are acknowledged without spending rate tokens twice. An application rumor is recorded for repair and delivery retry. A peer advertisement rumor is only witnessed (`GossipJournal::witness`, a required trait method). Its digest deduplicates and breaks flood loops, but the bytes are never retained, repaired, or delivered locally.
-4. **Local ingress**: `GossipConfig.ingress` holds the route key of a servlet type on the receiving gateway. `with_gossip_ingress` mints that key, so a URN no route could answer is refused with `ClusterError::UnknownServletType` at configuration time rather than retried on every beat. `None` means journal and reflood only (immediate local ack).
-5. **Reflood**: Remaining hop TTL and a non-empty `peers` list continue the flood.
-6. **Reconcile**: `ReconcileGossip` exchanges held digests, and the peer answers with `GossipWant`. The advertise beat also runs anti-entropy repair and pending-local retry.
+1. **Publish**: A hive sends a signed `PublishGossip`. The origin gateway signs the rumor and starts the flood.
+2. **Relay**: Peers forward the rumor unchanged under the origin's signature. A gateway accepts only rumors from its own colony.
+3. **Admit**: Each gateway checks size, freshness, hop limit, and sender rate, and drops duplicates.
+4. **Deliver**: `GossipConfig.ingress` names the local servlet type that receives rumors. `None` only relays.
+5. **Reflood**: The rumor continues to peers while hops remain.
+6. **Repair**: `ReconcileGossip` compares held digests, so peers fill gaps.
 
-Misbehavior on tampered or lifetime-missing relays weakens peer trails. A foreign-colony refuse does not.
+A tampered relay weakens that peer's routes.
 
 ##### Work Request Flow
 
-The unary work plane is request-reply with end-to-end envelopes. The client's complete frame reaches the servlet byte-for-byte, and the servlet's complete response frame comes back the same way. Outer transport frames are hop-local wrappers, so end-to-end signatures, integrity, and previous-frame linkage survive the route in both directions.
+The work plane is request-reply. The client's frame reaches the servlet unchanged, and the servlet's response comes back unchanged, so end-to-end signatures and integrity survive the route.
 
-1. Client composes its complete end-to-end frame (typed message, plus whatever the message profile requires: signature, integrity, encryption)
-2. Client submits it with `SubmitWork::submit_work_to`, which nests the frame in a `ClusterWorkRequest` under a hop-local transport wrapper
-3. The gateway validates that the payload decodes as a frame (a malformed payload refuses `InvalidArgument` before route selection), then looks up Local and Peer routes for the servlet type
-4. Load balancer selects an instance. A local route delivers the client frame to the servlet byte-for-byte. A peer route re-emits the envelope with a decremented `hops_remaining` budget
-5. The servlet handler receives the client's frame, verifies what it must (`Frame::verify`, `Frame::verify_commitment_of`), and responds with its own complete frame
-6. The gateway returns the servlet's frame unmodified inside `ClusterWorkResponse`. `submit_work_to` resolves it via `ClusterWorkResponse::served`, which yields the frame on success and `TightBeamError::WorkRefused(status)` on refusal
+1. The client builds its frame and sends it with `SubmitWork::submit_work_to`.
+2. The gateway chooses a local or peer route for the servlet type.
+3. The servlet verifies the frame and answers with its own frame.
+4. `submit_work_to` returns the servlet's frame, or `TightBeamError::WorkRefused(status)` on refusal.
 
 ```rust
 use tightbeam::colony::SubmitWork;
@@ -3311,112 +3257,44 @@ A refusal surfaces as `Err(TightBeamError::WorkRefused(status))`. For example, t
 | `open_stream_to` | raw chunks, hop-protected only             | complete `Frame` back (relayed unchanged)       |
 | `open_duplex_to` | raw chunks, hop-protected only             | raw chunks, hop-protected only                  |
 
-Stream chunks are not individually framed or signed. Their integrity rests on transport encryption per hop plus the gateway splice, not on the end-to-end envelope contract of unary work. The terminal reply frame of a routed stream is a complete frame and can carry a signature the client verifies with `Frame::verify`. Work that must be nonrepudiable end to end in both directions belongs on the unary plane.
+Stream chunks are not signed. Each hop's transport encryption protects them. The final reply of a stream is a complete frame and can carry a signature. Use unary work when both directions must be non-repudiable.
 
 ##### ClusterConfig Reference
 
-Four of this type's fields are private, because each one is derived from another or parsed on the way in. Set them through `ClusterConfigBuilder` and read them through the accessors below.
+Build a `ClusterConfig` with `ClusterConfig::builder(tls)`. Each setting has one builder method:
 
-```rust
-pub struct PeerConfig {
-	/// Re-advertise beat cadence (`None` disables the beat)
-	pub advertise_interval: Option<Duration>,
-	/// Hop budget honored on inbound work and routed stream opens
-	/// (default 1; `0` disables forwarding; `2` enables relay fallback)
-	pub max_hops: u8,
-	/// Servlet types disclosed to and reachable by external peers.
-	/// `None` exports every locally served type. `Some` drives both the
-	/// advertise filter and the fail-closed allowlist.
-	pub exported_types: Option<Arc<dyn ExportAllowlist>>,
-	// peers, table, peer_dial_allowlist and rumor_refresh are private.
-}
+| Setting                                  | Builder method                                                       | Default                      |
+| ---------------------------------------- | -------------------------------------------------------------------- | ---------------------------- |
+| Resource URN namespace                   | `with_namespace`                                                     | `ColonyNamespace::default()` |
+| Gateway bind address                     | `with_bind_addr`                                                     | `None`                       |
+| Edge bind address (admits `Work` only)   | `with_edge_bind_addr`                                                | `None`                       |
+| Freshness window for hive control frames | `with_control_freshness_window`                                      | 30 s                         |
+| Load balancer                            | `with_load_balancer`                                                 | `StochasticForager`          |
+| Heartbeats                               | `with_heartbeat_config`                                              | `HeartbeatConfig::default()` |
+| Pheromone trails                         | `with_pheromone_config`                                              | `PheromoneConfig::default()` |
+| Gate policies                            | `with_gate_policy`                                                   | None                         |
+| Exported types                           | `with_exported_types`, `with_export_allowlist`                       | Every type                   |
+| Export grants and gates                  | `with_export_grant`, `with_export_gate`                              | None                         |
+| Connection pools                         | `with_pool_config`                                                   | `PoolConfig::default()`      |
+| Peer dial list                           | `with_peers`                                                         | Empty                        |
+| Advertise beat                           | `with_advertise_interval`                                            | Off                          |
+| Advertised address                       | `with_advertise_addr`                                                | The bound address            |
+| Claimed-address allowlist                | `with_peer_dial_allowlist`                                           | None                         |
+| Hop budget                               | `with_max_hops`                                                      | 1                            |
+| Advertisement rumor refresh              | `with_rumor_refresh`                                                 | 30 s                         |
+| Learned-peer store                       | `with_peer_store`                                                    | `MemoryPeerStore`            |
+| Gossip                                   | `with_gossip_config`, `with_gossip_admission`, `with_gossip_ingress` | `GossipConfig::default()`    |
+| Clock                                    | `with_clock`                                                         | `SystemClock`                |
 
-impl PeerConfig {
-	/// Peer dial list for advertise/gossip reflood, as parsed sockets.
-	/// These are the discovery table's un-evictable anchors.
-	/// Set with `ClusterConfigBuilder::with_peers`, which refuses an entry
-	/// that names no socket.
-	pub fn peers(&self) -> &[PeerAddress];
-
-	/// Discovery table: the anchors above plus bounded learned peers.
-	/// Derived from `peers` at build.
-	pub fn table(&self) -> &Arc<PeerTable>;
-
-	/// Allowlist for claimed peer dial addresses, compared as parsed
-	/// sockets rather than as strings, so one address spelled two ways is
-	/// one entry. Set with
-	/// `ClusterConfigBuilder::with_peer_dial_allowlist`.
-	pub fn peer_dial_allowlist(&self) -> Option<&Arc<HashSet<PeerAddress>>>;
-
-	/// Whether this plane may dial `address`. An unrestricted plane admits
-	/// any address that parsed.
-	pub fn dial_allowed(&self, address: &PeerAddress) -> bool;
-}
-
-impl ClusterConfig {
-	/// Advertisement rumor reflood interval while the slate is unchanged.
-	/// The configured value, clamped to the gossip freshness window on
-	/// every read, because that window narrows again at startup.
-	pub fn rumor_refresh(&self) -> Duration;
-}
-
-pub struct ClusterConfig {
-	// --- Identity and local gateway ---
-	/// Naming scope for inbound resource URNs (authority/realm gate)
-	pub namespace: ColonyNamespace,
-	/// Optional stable gateway bind address
-	pub bind_addr: Option<String>,
-	/// Optional edge bind address, which admits `Work` frames only
-	pub edge_bind_addr: Option<String>,
-	/// Freshness/replay window for signed hive control frames
-	pub control_freshness_window: Duration,
-	/// TLS configuration, including `hive_trust` and `peer_trust`
-	pub tls: ClusterTlsConfig,
-
-	// --- Work routing ---
-	/// Load balancing strategy (defaults to `StochasticForager`)
-	pub load_balancer: Arc<dyn LoadBalancer>,
-	pub heartbeat: HeartbeatConfig,
-	pub pheromone: PheromoneConfig,
-	/// Gate policies evaluated on every gateway frame before decoding
-	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
-	/// Custom export gates evaluated where the servlet target is known.
-	/// They compose with the allow sources as intersection.
-	pub export_gates: Vec<Arc<dyn ExportGate>>,
-	/// Positive export grants evaluated when the allowlist refuses.
-	/// Allow sources compose as union. Deny gates still override.
-	pub export_grants: Vec<Arc<dyn ExportGrant>>,
-	/// Connection pool configuration for hive (and peer) connections.
-	/// The pools read `clock`.
-	pub pool_config: PoolConfig,
-
-	// --- Peer federation ---
-	pub peer: PeerConfig,
-
-	// --- Colony gossip ---
-	/// Gossip freshness, hop TTL, ingress route key, journal, and admission
-	pub gossip: GossipConfig,
-	/// Clock for freshness, replay, retention and lease decisions
-	pub clock: Arc<dyn Clock>,
-}
-
-// Colony URN is derived from the gateway cert URI SAN, and bound again
-// when the gateway takes the config. It is read, never set.
-// Read it with ClusterConfig::colony_urn(); it is not a settable field.
-```
+The colony URN comes from the gateway certificate. Read it with `ClusterConfig::colony_urn()`.
 
 ##### Cluster Testing
 
 Clusters can be tested using `environment Cluster`:
 
-A scenario that depends on time passing (a retention window pruning, a lease expiring, an idle connection closing) installs a `ManualClock` (`tightbeam::utils::time`, feature `testing`) and advances it, instead of sleeping until the real clock gets there. Each owner takes its clock in one place:
+A scenario that depends on elapsed time installs a `ManualClock` (`tightbeam::utils::time`, feature `testing`) and advances it instead of sleeping. Pass the clock to each owner: `ClusterConfig::clock`, `HiveConfig::clock`, `ServletConfigBuilder::with_clock`, or `ConnectionPoolBuilder::new`.
 
-- A gateway reads `ClusterConfig::clock`, and its hive and peer pools read the same clock.
-- A hive reads `HiveConfig::clock`, and its servlet pool reads the same clock.
-- A servlet's accept loop reads the clock set with `ServletConfigBuilder::with_clock`.
-- A standalone pool reads the clock passed to `ConnectionPoolBuilder::new` or set with `ConnectionPoolBuilder::with_clock`.
-
-An advance wakes every beat that sleeps on the clock, but the work a beat starts runs on its own task. The scenario polls `TraceCollector::recorded` for the event that work traces. When the event has not landed, the scenario advances again, because a beat that begins its sleep after an advance waits a full interval from that point.
+An advance wakes sleeping beats, but their work runs on separate tasks. Poll `TraceCollector::recorded` for the expected event, and advance again if it has not landed.
 
 ```rust
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, cluster, hive};
@@ -3486,14 +3364,12 @@ tb_scenario! {
 
 The `environment Cluster` syntax provides:
 
-- `context`: Scenario fixture (certificates, flags) shared as `Arc<C>` with every closure
-- `start`: Configures and starts the program under test from a `SetupEnv`, and returns it. Usually one gateway. When the federation itself is under test, `start` may return a multi-org topology (seed plus peers already peered)
-- `hives` (OPTIONAL): Returns hive futures from a `SetupEnv`. Each is awaited and registered with the value returned by `start` when that value exposes `addr()` (typically one seed gateway). Omit when registration itself is the stimulus, or when hives register inside topology boot
-- `client`: Owns that program through `ClusterEnv.cluster`, dials gateways, asserts registry state, and runs the consuming stop
+- `context`: Scenario fixture shared as `Arc<C>` with every closure
+- `start`: Starts the gateway (or a peered topology) under test and returns it
+- `hives` (optional): Hive futures to register with the gateway `start` returned
+- `client`: Owns the cluster through `ClusterEnv.cluster`, asserts behavior, and stops it
 
-Adversarial registration scenarios (unsigned, replayed, stale, hijacked) omit `hives:` and drive registration from the client, asserting the rejection and the registry count on the owned instance.
-
-Peer federation and gossip use the same `environment Cluster` shape with peer trust, dial lists, and signed `AdvertisePeer` / `PublishGossip` frames from the client. Two multi-gateway patterns apply. When the federation is under test, boot the full topology in `start` (see `fuzz/colony/`). When peering itself is the stimulus, own the seed in `start` with optional seed-side `hives:` and boot peer gateways in `client`. Do not wrap a cluster under test in `environment Hive` only for lifecycle. See `tests/colony/cluster/` (`registration.rs`, `routing.rs`, `topology.rs`, `peering.rs`, `gossip.rs`).
+Omit `hives:` when registration itself is under test. For federation and gossip scenarios, see `tests/colony/cluster/` and `fuzz/colony/`.
 
 ##### Conclusion
 
@@ -3524,19 +3400,9 @@ Each emitted event carries a kind URN from the closed inventory in `tightbeam::i
 urn:tightbeam:event:<domain>/<event-name>
 ```
 
-Domains (see `tightbeam::instrumentation::events` for the full set):
+Domains include `core`, `gate`, `transport`, `connection`, `assert`, `mux`, `pool`, `session`, `hive`, and `cluster`. The `process` and `fdr` domains need the `testing-csp` and `testing-fdr` features. `tightbeam::instrumentation::events` lists every event.
 
-- **Core / meta**: `core/start`, `core/end`, `core/warn`, `core/error`, `trace/clock-origin`
-- **External**: `gate/accept`, `gate/reject`, `transport/request-recv`, `transport/response-send`
-- **Connection**: `connection/accepted`, `connection/closed`, `connection/stale`, `connection/reconnected`
-- **Assertion**: `assert/label`, `assert/payload`
-- **Internal** (detail-gated): `handler/enter`, `handler/exit`, `crypto/step`, `compress/step`, `route/step`, `policy/eval`
-- **Process** (requires `testing-csp`): `process/transition`, `process/hidden`
-- **Exploration** (requires `testing-fdr`): `fdr/seed-start`, `fdr/seed-end`, `fdr/state-expand`, `fdr/state-prune`, `fdr/divergence-detect`, `fdr/refusal-snapshot`, `fdr/enabled-set-sample`
-- **Mux / pool / session**: `mux/*`, `pool/*`, `session/*` (handshake, receipts, rekey, drain)
-- **Colony**: `hive/reregistered`, `cluster/hive-registered`, `cluster/work-routed`, `cluster/work-forwarded`, `cluster/peer-advertised`, `cluster/gossip-accepted`, `cluster/gossip-refused`, `cluster/loop-poisoned`, and related accept/refuse pairs
-
-Hidden/internal detail MUST stay behind `enable_internal_detail` (and related sampling flags). Control-plane accept/refuse events (gates, cluster, gossip) fire when the subsystem decides, independent of that detail flag.
+Internal events (`handler`, `crypto`, `route`, and similar) fire only when `enable_internal_detail` is set. Accept and refuse events always fire.
 
 > Note: `TightbeamUrnSpec` (`urn:tightbeam:instrumentation:<resource_type>/<resource_id>`) is a separate helper for application/test labeling. Production control-plane events use the `event:<domain>/<name>` inventory above. See [§11.1.1](#1111-urns).
 
@@ -5172,13 +5038,7 @@ This test verifies:
 
 #### 12.7.3 Hook Semantics
 
-Hooks provide optional callbacks that can observe and override test outcomes:
-
-- Configured via `.with_hooks(TestHooks { on_pass: Some(...), on_fail: Some(...) })` in the `ScenarioConfig` builder.
-- Each hook is a closure wrapped in `Arc`, of type `Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>` for `on_pass` and `Arc<dyn Fn(&HookContext, &SpecViolation) -> Result<(), TightBeamError> + Send + Sync>` for `on_fail`.
-- `Ok(())` means the hook accepts the outcome and the test passes.
-- `Err(e)` means the hook rejects the outcome and the test fails
-- Hooks receive `HookContext` containing the consumed trace, FDR verdict (if enabled), process spec, timing constraints, and assertion spec, allowing inspection of all verification results.
+Hooks observe a test outcome and can override it. Set them with `.with_hooks(TestHooks { on_pass, on_fail })` on the `ScenarioConfig` builder. Each hook receives a `HookContext` with the trace and every verification result. Return `Ok(())` to pass the test, or `Err(e)` to fail it.
 
 ### 12.8 Coverage-Guided Fuzzing with AFL
 
@@ -5906,14 +5766,11 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [rfc5480]: https://datatracker.ietf.org/doc/html/rfc5480
 [rfc5652]: https://datatracker.ietf.org/doc/html/rfc5652
 [rfc5652-5]: https://datatracker.ietf.org/doc/html/rfc5652#section-5
-[rfc5652-6]: https://datatracker.ietf.org/doc/html/rfc5652#section-6
-[rfc5652-11]: https://datatracker.ietf.org/doc/html/rfc5652#section-11
 [rfc5753]: https://datatracker.ietf.org/doc/html/rfc5753
 [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
 [rfc6960]: https://datatracker.ietf.org/doc/html/rfc6960
 [rfc7322]: https://datatracker.ietf.org/doc/html/rfc7322
 [rfc7748]: https://datatracker.ietf.org/doc/html/rfc7748
-[rfc8017-9.2]: https://datatracker.ietf.org/doc/html/rfc8017#section-9.2
 [rfc8032]: https://datatracker.ietf.org/doc/html/rfc8032
 [rfc8141]: https://datatracker.ietf.org/doc/html/rfc8141
 [rfc8174]: https://datatracker.ietf.org/doc/html/rfc8174
@@ -5921,19 +5778,16 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [rfc8622]: https://datatracker.ietf.org/doc/html/rfc8622
 [rfc9000]: https://datatracker.ietf.org/doc/html/rfc9000
 [rfc9000-4.1]: https://datatracker.ietf.org/doc/html/rfc9000#section-4.1
-[rfc9000-20.2]: https://datatracker.ietf.org/doc/html/rfc9000#section-20.2
 [rfc9113]: https://datatracker.ietf.org/doc/html/rfc9113
 [rfc9113-4.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-4.2
 [rfc9113-5.1.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1
 [rfc9113-5.1.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2
-[rfc9113-5.2.2]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2
 [rfc9113-7]: https://datatracker.ietf.org/doc/html/rfc9113#section-7
 [rfc9113-8.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-8.1
 [rfc9846]: https://datatracker.ietf.org/doc/html/rfc9846
 [rfc9846-4.1.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.1.3
 [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
-[rfc9846-7.2]: https://datatracker.ietf.org/doc/html/rfc9846#section-7.2
 [rfc9901]: https://datatracker.ietf.org/doc/html/rfc9901
 [itu-x680]: https://www.itu.int/rec/T-REC-X.680
 [itu-x690]: https://www.itu.int/rec/T-REC-X.690
@@ -5944,7 +5798,6 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [fips186-5]: https://csrc.nist.gov/pubs/fips/186-5/final
 [fips197]: https://csrc.nist.gov/publications/detail/fips/197/final
 [fips202]: https://csrc.nist.gov/publications/detail/fips/202/final
-[nist-800-38d]: https://csrc.nist.gov/publications/detail/sp/800-38d/final
 [nist-800-56a]: https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final
 [nist-800-57]: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final
 [iso-18013-5]: https://www.iso.org/standard/69084.html

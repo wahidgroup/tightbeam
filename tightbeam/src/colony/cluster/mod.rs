@@ -14,7 +14,9 @@
 //!
 //! Gateways advertise exported servlet types to peer gateways, honor relay
 //! budgets, and learn remote routes through gossip. Trust anchors live on
-//! [`ClusterTlsConfig::peer_trust`].
+//! [`ClusterTlsConfig::peer_trust`]. Every address a peer claims passes
+//! [`PeerConfig::admit_dial`], and the [`AdmittedDial`] it returns is the one
+//! form a claimed address takes on the way to a dial.
 //!
 //! # Export boundary
 //!
@@ -36,6 +38,7 @@ pub mod registry;
 mod runtime;
 pub mod servlet_registry;
 
+mod dial;
 pub mod export;
 pub(crate) mod outbound;
 pub(crate) mod peer;
@@ -44,6 +47,7 @@ pub(crate) mod gossip;
 pub(crate) mod peer_table;
 
 pub use builder::{ClusterConfigBuilder, HeartbeatConfigBuilder};
+pub use dial::{AdmittedDial, DialRefusal};
 pub use error::ClusterError;
 pub use export::{
 	DynamicExportList, ExportAllowlist, ExportGate, ExportGrant, Party, StaticExportList, TrustPlaneStores, TrustPlanes,
@@ -53,12 +57,14 @@ pub use gossip::{
 	GossipJournal, JournalLimits, LocalClaim, LocalClaimGuard, MemoryGossipJournal, TokenBucketAdmission,
 };
 pub use peer::{AdmittedPeerAd, HopBudget, RelayTrail, WireHopBudget};
-pub use peer_table::{AddressGroup, MemoryPeerStore, PeerAddress, PeerHint, PeerRecord, PeerStore, PeerTable};
+pub use peer_table::{
+	AddressGroup, MemoryPeerStore, NotASocket, PeerAddress, PeerHint, PeerRecord, PeerStore, PeerTable,
+};
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
 pub use runtime::ClusterGateway;
 pub(crate) use servlet_registry::HiveSlate;
 pub use servlet_registry::{
-	LocalRoute, PeerCaps, PeerRoute, PeerRouteInfo, PheromoneConfig, RelayRoute, RouteKind, ServletEntry,
+	DialTarget, LocalRoute, PeerCaps, PeerRoute, PeerRouteInfo, PheromoneConfig, RelayRoute, RouteKind, ServletEntry,
 	ServletRegistry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_EVAPORATION_INTERVAL_SECS, DEFAULT_EVAPORATION_RATE_BPS,
 	DEFAULT_INITIAL_PHEROMONE, DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
 };
@@ -292,7 +298,8 @@ impl core::fmt::Debug for ClusterTlsConfig {
 	}
 }
 
-/// Peer-federation dial list, advertise beat, and inbound dial allowlist.
+/// Peer-federation dial list, advertise beat and address, and the policy that
+/// admits the dial addresses peers claim.
 ///
 /// Trust anchors stay on [`ClusterTlsConfig::peer_trust`]. Export
 /// discoverability and enforcement share [`PeerConfig::exported_types`].
@@ -310,9 +317,17 @@ pub struct PeerConfig {
 	/// set from this list at build. Set it with
 	/// [`ClusterConfigBuilder::with_peers`], which parses each entry, and
 	/// read it with [`PeerConfig::peers`].
-	peers: Vec<PeerAddress>,
+	peers: Vec<AdmittedDial>,
 	/// Cadence of the re-advertise beat, where `None` disables the beat.
 	pub advertise_interval: Option<Duration>,
+	/// The socket this gateway advertises as its own, when the operator set
+	/// one.
+	///
+	/// - `None` advertises the bound address, which is what a gateway bound to
+	///   one interface is dialed at.
+	/// - A gateway bound to the wildcard address sets this, because every peer
+	///   refuses a claim of `0.0.0.0`.
+	advertise_addr: Option<PeerAddress>,
 	/// Inbound peer ads may only claim dial addresses in this list.
 	///
 	/// - Entries are parsed sockets, so one address spelled two ways is one entry.
@@ -374,9 +389,10 @@ pub struct PeerConfig {
 impl PeerConfig {
 	/// Peer gateway addresses this plane dials to advertise exported types.
 	///
-	/// These are the table's un-evictable anchors.
+	/// These are the table's un-evictable anchors, admitted as operator
+	/// configuration.
 	#[must_use]
-	pub fn peers(&self) -> &[PeerAddress] {
+	pub fn peers(&self) -> &[AdmittedDial] {
 		&self.peers
 	}
 
@@ -391,39 +407,16 @@ impl PeerConfig {
 	pub fn peer_dial_allowlist(&self) -> Option<&Arc<HashSet<PeerAddress>>> {
 		self.peer_dial_allowlist.as_ref()
 	}
-
-	/// Whether this plane may dial `address`.
-	///
-	/// Both sides are parsed sockets, so one address spelled two ways
-	/// cannot pass one caller's check and fail another's. An unrestricted
-	/// plane admits any address that parsed at all.
-	#[must_use]
-	pub fn dial_allowed(&self, address: &PeerAddress) -> bool {
-		match &self.peer_dial_allowlist {
-			Some(allowed) => allowed.contains(address),
-			None => true,
-		}
-	}
-
-	/// Restrict claimed dial addresses to `allowlist`.
-	///
-	/// The builder is the configuration path:
-	/// [`ClusterConfigBuilder::with_peer_dial_allowlist`] parses operator
-	/// strings into the set this takes. Tests that already hold parsed
-	/// addresses install them here.
-	#[cfg(test)]
-	pub(crate) fn set_dial_allowlist(&mut self, allowlist: HashSet<PeerAddress>) {
-		self.peer_dial_allowlist = Some(Arc::new(allowlist));
-	}
 }
 
-/// The default peer plane: no peers, no beat, no allowlist, and the
-/// single-forward relay cap.
+/// The default peer plane: no peers, no beat, the bound address advertised,
+/// no allowlist, and the single-forward relay cap.
 impl Default for PeerConfig {
 	fn default() -> Self {
 		Self {
 			peers: Vec::new(),
 			advertise_interval: None,
+			advertise_addr: None,
 			peer_dial_allowlist: None,
 			table: Arc::default(),
 			max_hops: DEFAULT_MAX_HOPS,
@@ -439,6 +432,7 @@ impl core::fmt::Debug for PeerConfig {
 		debug
 			.field("peers", &self.peers)
 			.field("advertise_interval", &self.advertise_interval)
+			.field("advertise_addr", &self.advertise_addr)
 			.field("peer_dial_allowlist", &self.peer_dial_allowlist)
 			.field("table", &self.table)
 			.field("max_hops", &self.max_hops)
@@ -502,7 +496,7 @@ pub struct ClusterConfig {
 	/// refused with `PermissionDenied`, so an edge client can never join the
 	/// colony control plane. Hives keep registering on `bind_addr`.
 	pub edge_bind_addr: Option<String>,
-	/// Peer-federation dial list, advertise beat, and dial allowlist.
+	/// Peer-federation dial list, advertise beat and address, and dial policy.
 	pub peer: PeerConfig,
 	/// Gossip freshness, origin TTL, ingress, journal, and admission.
 	pub gossip: GossipConfig,
@@ -814,11 +808,6 @@ mod tests {
 		assert!(config.peer.peer_dial_allowlist.is_none());
 	}
 
-	/// A parsed dial address, which every fixture spelling names.
-	fn address(spelling: &str) -> PeerAddress {
-		spelling.parse().expect("fixture addresses name sockets")
-	}
-
 	/// A config whose configured refresh and gossip window are set apart,
 	/// so each side of the clamp can be asserted on its own.
 	fn config_refreshing(refresh: Duration, seen_ttl: Duration) -> ClusterConfig {
@@ -852,14 +841,14 @@ mod tests {
 			.with_peer_dial_allowlist(["127.0.0.1:9000"])?
 			.build();
 
-		let anchors: Vec<String> = config.peer.peers().iter().map(PeerAddress::to_string).collect();
+		let anchors: Vec<String> = config.peer.peers().iter().map(AdmittedDial::to_string).collect();
 		assert_eq!(anchors, ["127.0.0.1:9000", "127.0.0.1:9001"]);
 
-		let allowed = address("127.0.0.1:9000");
-		assert!(config.peer.dial_allowed(&allowed));
+		let allowed = config.peer.admit_dial(PeerAddress::fixture("127.0.0.1:9000"));
+		assert_eq!(allowed.map(|dial| dial.address()), Ok(PeerAddress::fixture("127.0.0.1:9000")));
 
-		let refused = address("127.0.0.1:9001");
-		assert!(!config.peer.dial_allowed(&refused));
+		let refused = config.peer.admit_dial(PeerAddress::fixture("127.0.0.1:9001"));
+		assert_eq!(refused, Err(DialRefusal::OffAllowlist));
 		Ok(())
 	}
 
@@ -869,6 +858,27 @@ mod tests {
 	fn cluster_config_refuses_a_peer_that_names_no_socket() {
 		let refusal = ClusterConfig::builder(test_tls_config()).with_peers(["not-an-address"]);
 
+		assert!(matches!(refusal, Err(ClusterError::InvalidPeerAddress)));
+	}
+
+	// The advertise address is parsed once where the operator writes it, so
+	// the beat advertises the canonical socket and a typo is refused at
+	// build rather than advertised to every peer.
+	#[test]
+	fn with_advertise_addr_stores_the_canonical_socket() -> Result<(), ClusterError> {
+		let config = ClusterConfig::builder(test_tls_config())
+			.with_advertise_addr("[::ffff:192.0.2.1]:9000")?
+			.with_advertise_interval(Duration::from_secs(5))
+			.build();
+
+		let advertised = config.peer.advertised_address(b"0.0.0.0:9000")?;
+		assert_eq!(advertised.as_ref(), b"192.0.2.1:9000");
+		Ok(())
+	}
+
+	#[test]
+	fn with_advertise_addr_refuses_a_spelling_that_names_no_socket() {
+		let refusal = ClusterConfig::builder(test_tls_config()).with_advertise_addr("gateway.example");
 		assert!(matches!(refusal, Err(ClusterError::InvalidPeerAddress)));
 	}
 
