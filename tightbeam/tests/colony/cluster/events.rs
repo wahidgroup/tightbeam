@@ -6,9 +6,9 @@
 //!
 //! # Export boundary
 //!
-//! Markers from `EXPORT_HIDDEN_ROUTES` through `EXPORT_GRANT_ECHOED` pair
-//! with `CLUSTER_EXPORT_*` events (including grants) in the servlet export
-//! scenarios.
+//! The markers from [`EXPORT_HIDDEN_ROUTES`] through [`EXPORT_GRANT_ECHOED`]
+//! pair with the `CLUSTER_EXPORT_*` events, grants included, in the servlet
+//! export scenarios.
 
 use tightbeam::utils::urn::Urn;
 
@@ -43,6 +43,8 @@ pub(crate) const EDGE_CONTROL_STATUS: Urn<'static> = tightbeam::urn!("test", "ev
 pub(crate) const REGISTRY_HIVES: Urn<'static> = tightbeam::urn!("test", "event:cluster/registry-hives");
 pub(crate) const REGISTER_ASSIGNED_ID: Urn<'static> = tightbeam::urn!("test", "event:cluster/register-assigned-id");
 pub(crate) const REGISTRY_EMPTIED: Urn<'static> = tightbeam::urn!("test", "event:cluster/registry-emptied");
+pub(crate) const OWNER_UPDATE_STATUS: Urn<'static> = tightbeam::urn!("test", "event:cluster/owner-update-status");
+pub(crate) const BEAT_REREGISTERED: Urn<'static> = tightbeam::urn!("test", "event:cluster/beat-reregistered");
 pub(crate) const LOCAL_SERVLETS_AFTER_INSTALLS: Urn<'static> =
 	tightbeam::urn!("test", "event:cluster/local-servlets-after-installs");
 pub(crate) const PEER_ROUTE_EXPOSED: Urn<'static> = tightbeam::urn!("test", "event:cluster/peer-route-exposed");

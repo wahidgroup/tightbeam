@@ -38,15 +38,47 @@ pub struct PheromoneConfig {
 	pub weakening_penalty: u64,
 }
 
+/// The local routes one hive registered, every one owned by that hive.
+///
+/// [`PheromoneConfig::servlet_slate`] is the one constructor and stamps
+/// `hive_id` on each entry it builds, so every entry a registry receives
+/// through this type names that hive as its owner by construction
+/// (CWE-639).
+pub(crate) struct HiveSlate {
+	hive_id: SharedId,
+	entries: Vec<ServletEntry>,
+}
+
+impl HiveSlate {
+	/// The hive every route in this slate belongs to.
+	pub(crate) fn hive_id(&self) -> &SharedId {
+		&self.hive_id
+	}
+
+	/// Splits the slate into the hive and its routes for the registry that
+	/// installs them.
+	pub(super) fn into_parts(self) -> (SharedId, Vec<ServletEntry>) {
+		(self.hive_id, self.entries)
+	}
+
+	/// A slate of already built entries, for tests that seed a registry
+	/// with routes the fixtures name directly.
+	#[cfg(test)]
+	pub(super) fn of(hive_id: impl AsRef<[u8]>, entries: impl IntoIterator<Item = ServletEntry>) -> Self {
+		let hive_id = hive_id.as_ref();
+		Self { hive_id: Arc::from(hive_id), entries: entries.into_iter().collect() }
+	}
+}
+
 impl PheromoneConfig {
-	/// Route entries for one hive's advertised servlets.
+	/// Builds the route entries for one hive's advertised servlets.
 	///
 	/// Every entry starts on this colony's pheromone level and abandonment
 	/// limit, so a freshly registered route competes on the same terms as
 	/// the routes already in the registry.
-	pub(crate) fn servlet_slate(&self, servlets: impl AsRef<[ServletInfo]>, hive_addr: &SharedId) -> Vec<ServletEntry> {
+	pub(crate) fn servlet_slate(&self, servlets: impl AsRef<[ServletInfo]>, hive_addr: &SharedId) -> HiveSlate {
 		let servlets = servlets.as_ref();
-		servlets
+		let entries = servlets
 			.iter()
 			.map(|info| {
 				ServletEntry::local(
@@ -59,10 +91,13 @@ impl PheromoneConfig {
 					self.abandonment_limit,
 				)
 			})
-			.collect()
+			.collect();
+
+		HiveSlate { hive_id: Arc::clone(hive_addr), entries }
 	}
 
-	/// Peer-routed slate keyed by `peer_hive_id` NUL type.
+	/// Builds the peer-routed slate, with each entry keyed by `peer_hive_id`
+	/// NUL type.
 	///
 	/// `dial` is the claimed gateway socket stored on every entry, so every
 	/// type this peer advertises resolves to the one gateway that owns it.
@@ -105,9 +140,9 @@ impl Default for PheromoneConfig {
 
 /// Storage caps for peer-learned routes (CWE-770).
 ///
-/// Named fields prevent callers from silently transposing adjacent
-/// limits. Direct slates and relay trails hold separate budgets so
-/// relay fan-in can never starve direct-gateway admission.
+/// The named fields keep a caller from silently transposing adjacent
+/// limits. Direct slates and relay trails hold separate budgets, so relay
+/// fan-in can never starve direct-gateway admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCaps {
 	/// Maximum distinct peer gateways holding installed direct slates.

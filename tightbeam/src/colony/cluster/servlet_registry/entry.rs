@@ -1,6 +1,5 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::colony::cluster::SharedId;
 use crate::colony::common::MAX_PHEROMONE;
@@ -8,16 +7,18 @@ use crate::utils::BasisPoints;
 
 /// How the load balancer reaches an entry.
 ///
-/// `Local` resolves to a servlet this gateway owns. `Peer` resolves to
-/// a peer gateway that owns the servlet, reached by forwarding.
-/// `PeerRelay` resolves to a relaying peer gateway that must forward
-/// once more to reach the owner, so selection requires a relay budget
-/// of at least two. All kinds share the same pheromone scoring tables.
+/// All kinds share the same pheromone scoring tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RouteKind {
+	/// The route resolves to a servlet this gateway owns.
 	#[default]
 	Local,
+	/// The route resolves to a peer gateway that owns the servlet, reached
+	/// by forwarding.
 	Peer,
+	/// The route resolves to a relaying peer gateway that must forward once
+	/// more to reach the owner, so selection requires a relay budget of at
+	/// least two.
 	PeerRelay,
 }
 
@@ -31,7 +32,7 @@ impl RouteKind {
 
 /// A servlet instance tracked with pheromone score and trial count.
 ///
-/// Fields are private so the route-key discipline holds by
+/// The fields are private, so the route-key discipline holds by
 /// construction:
 ///
 /// - [`ServletEntry::local`] keys by the servlet address it dials.
@@ -39,30 +40,60 @@ impl RouteKind {
 /// - [`ServletEntry::peer_relay`] keys by `origin NUL relay NUL type`.
 #[derive(Debug)]
 pub struct ServletEntry {
-	/// Registry map key and pheromone trail identity.
+	/// The registry map key, which is also the pheromone trail identity.
 	route_key: SharedId,
 	servlet_type: SharedId,
-	/// Reconcile bucket: the hive-index key one slate replaces atomically.
-	/// Local entries bucket by hive, peer entries by origin, relay
-	/// entries by the composite `origin NUL relay`.
+	/// The reconcile bucket, which is the hive-index key one slate replaces
+	/// atomically. Local entries bucket by hive, peer entries by origin, and
+	/// relay entries by the composite `origin NUL relay`.
 	bucket: SharedId,
-	/// Owning identity: local hive address, or the certificate
-	/// fingerprint of the origin gateway that advertised the type.
+	/// The owning identity, which is the local hive address or the
+	/// certificate fingerprint of the origin gateway that advertised the
+	/// type.
 	owner_id: SharedId,
-	/// Certificate fingerprint of the relaying gateway this entry
-	/// dials, when the route is a relay trail.
+	/// The certificate fingerprint of the relaying gateway this entry dials,
+	/// when the route is a relay trail.
 	relay_id: Option<SharedId>,
-	/// Socket dialed when forwarding. Local entries use `route_key`.
+	/// The socket dialed when forwarding. A local entry dials its
+	/// `route_key`.
 	dial_addr: SharedId,
 	route_kind: RouteKind,
 	pheromone: AtomicU64,
-	last_reinforced: Instant,
 	trial_count: AtomicU32,
 	abandonment_limit: u32,
-	/// When this entry was last built by a reconcile, for staleness
-	/// pruning. Never preserved across replacement, because a refresh
-	/// must advance it.
-	installed_at: Instant,
+}
+
+/// The identity a route belongs to, on the plane that identity lives on.
+///
+/// A hive control address and a peer certificate fingerprint are different
+/// owners even when their bytes agree, so the plane travels with the bytes
+/// and two owners are the same only when both agree (CWE-639).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Owner<'a> {
+	id: &'a [u8],
+	kind: RouteKind,
+}
+
+impl<'a> Owner<'a> {
+	/// The hive at `id`, owner of the local routes it registered.
+	pub(super) fn hive(id: &'a [u8]) -> Self {
+		Self { id, kind: RouteKind::Local }
+	}
+
+	/// The peer gateway whose certificate fingerprint is `id`.
+	pub(super) fn peer(id: &'a [u8]) -> Self {
+		Self { id, kind: RouteKind::Peer }
+	}
+
+	/// Whether `other` names this owner.
+	pub(super) fn same(self, other: Owner<'_>) -> bool {
+		self.id == other.id && self.kind.is_peer() == other.kind.is_peer()
+	}
+
+	/// Whether this owner lives on the peer plane.
+	pub(super) fn is_peer(self) -> bool {
+		self.kind.is_peer()
+	}
 }
 
 /// Operator view of one learned peer route.
@@ -76,7 +107,8 @@ pub struct PeerRouteInfo {
 	pub peer_id: SharedId,
 }
 
-/// Identity fields one peer-routed constructor hands to [`ServletEntry::peer_kind`].
+/// The identity fields one peer-routed constructor hands to
+/// [`ServletEntry::peer_kind`].
 struct PeerIdentity {
 	bucket: SharedId,
 	owner_id: SharedId,
@@ -86,9 +118,9 @@ struct PeerIdentity {
 
 /// The three identities a local route names.
 ///
-/// Named rather than positional: all three are [`SharedId`], so a caller
-/// transposing any pair would install a route that dials the wrong place
-/// and nothing would refuse it.
+/// The fields are named rather than positional because all three are
+/// [`SharedId`]. A caller that transposed a pair would install a route that
+/// dials the wrong place, and no check would refuse it.
 #[derive(Debug, Clone)]
 pub struct LocalRoute {
 	/// Address the servlet instance is reached at.
@@ -101,7 +133,7 @@ pub struct LocalRoute {
 
 /// The three identities a peer route names.
 ///
-/// Named for the same reason as [`LocalRoute`].
+/// The fields are named for the same reason as those of [`LocalRoute`].
 #[derive(Debug, Clone)]
 pub struct PeerRoute {
 	/// Peer gateway that advertised the type.
@@ -114,7 +146,7 @@ pub struct PeerRoute {
 
 /// The four identities a relay trail names.
 ///
-/// Named for the same reason as [`LocalRoute`].
+/// The fields are named for the same reason as those of [`LocalRoute`].
 #[derive(Debug, Clone)]
 pub struct RelayRoute {
 	/// Peer whose type this trail reaches.
@@ -141,10 +173,8 @@ impl ServletEntry {
 			dial_addr: address,
 			route_kind: RouteKind::Local,
 			pheromone: AtomicU64::new(initial_pheromone),
-			last_reinforced: Instant::now(),
 			trial_count: AtomicU32::new(0),
 			abandonment_limit,
-			installed_at: Instant::now(),
 		}
 	}
 
@@ -164,15 +194,16 @@ impl ServletEntry {
 	/// Creates a relay trail for `origin_id`'s type, dialing the
 	/// relaying gateway `relay_id` instead of the origin.
 	///
-	/// The entry buckets under the composite [`Self::relay_bucket`], so
-	/// the key is `origin NUL relay NUL servlet_type`. That key is
-	/// distinct from the direct `origin NUL servlet_type` trail, so
-	/// the two score independently. Reconciling under its own bucket
-	/// means the origin's direct slate lifecycle never evicts the
-	/// fallback.
-	/// Forwarding through this trail spends a hop at the relay, so
-	/// selection requires a budget that lets the relay forward once
-	/// more.
+	/// The entry buckets under the composite [`Self::relay_bucket`], so the
+	/// key is `origin NUL relay NUL servlet_type`. Three rules follow:
+	///
+	/// - The key is distinct from the direct `origin NUL servlet_type` trail,
+	///   so the two score independently.
+	/// - The trail reconciles under its own bucket, so a replacement of the
+	///   origin's direct slate leaves the fallback in place. A withdrawn,
+	///   empty direct slate removes it with the direct routes.
+	/// - Forwarding through this trail spends a hop at the relay, so selection
+	///   requires a budget that lets the relay forward once more.
 	pub fn peer_relay(route: RelayRoute, initial_pheromone: u64, abandonment_limit: u32) -> Self {
 		let RelayRoute { origin_id, relay_id, servlet_type, dial_addr } = route;
 		let identity = PeerIdentity {
@@ -185,10 +216,11 @@ impl ServletEntry {
 		Self::peer_kind(identity, servlet_type, dial_addr, initial_pheromone, abandonment_limit)
 	}
 
-	/// Composite `origin NUL relay` reconcile bucket for relay trails.
+	/// Builds the composite `origin NUL relay` reconcile bucket for relay
+	/// trails.
 	///
-	/// One construction shared by entry keys and slate reconciliation,
-	/// so the two can never drift apart.
+	/// Entry keys and slate reconciliation share this one construction, so
+	/// the two cannot drift apart.
 	#[must_use]
 	pub fn relay_bucket(origin_id: impl AsRef<[u8]>, relay_id: impl AsRef<[u8]>) -> SharedId {
 		let origin_id = origin_id.as_ref();
@@ -201,7 +233,8 @@ impl ServletEntry {
 		Arc::from(bucket.as_slice())
 	}
 
-	/// One key discipline for both peer-routed kinds: `bucket NUL type`.
+	/// Builds a peer-routed entry. Both peer-routed kinds key as
+	/// `bucket NUL type`.
 	fn peer_kind(
 		identity: PeerIdentity,
 		servlet_type: SharedId,
@@ -224,14 +257,13 @@ impl ServletEntry {
 			dial_addr,
 			route_kind,
 			pheromone: AtomicU64::new(initial_pheromone),
-			last_reinforced: Instant::now(),
 			trial_count: AtomicU32::new(0),
 			abandonment_limit,
-			installed_at: Instant::now(),
 		}
 	}
 
-	/// Registry map key and pheromone trail identity.
+	/// Returns the registry map key, which is also the pheromone trail
+	/// identity.
 	#[must_use]
 	pub fn route_key(&self) -> &SharedId {
 		&self.route_key
@@ -243,8 +275,9 @@ impl ServletEntry {
 		&self.dial_addr
 	}
 
-	/// Owning identity: local hive address, or the certificate
-	/// fingerprint of the origin gateway that advertised the type.
+	/// Returns the owning identity, which is the local hive address or the
+	/// certificate fingerprint of the origin gateway that advertised the
+	/// type.
 	#[must_use]
 	pub fn owner_id(&self) -> &SharedId {
 		&self.owner_id
@@ -256,16 +289,16 @@ impl ServletEntry {
 		&self.bucket
 	}
 
-	/// Certificate fingerprint of the relaying gateway this entry
-	/// dials. `None` for local and direct peer routes.
+	/// The identity this route belongs to, on its plane.
+	pub(super) fn owner(&self) -> Owner<'_> {
+		Owner { id: &self.owner_id, kind: self.route_kind }
+	}
+
+	/// Returns the certificate fingerprint of the relaying gateway this entry
+	/// dials. It is `None` for local and direct peer routes.
 	#[must_use]
 	pub fn relay_id(&self) -> Option<&SharedId> {
 		self.relay_id.as_ref()
-	}
-
-	/// When the last reconcile built this entry, for staleness pruning.
-	pub fn installed_at(&self) -> Instant {
-		self.installed_at
 	}
 
 	/// Servlet type key bytes used for type-index lookup.
@@ -295,7 +328,6 @@ impl ServletEntry {
 		match self.route_kind {
 			RouteKind::Local => None,
 			RouteKind::Peer | RouteKind::PeerRelay => Some(PeerRouteInfo {
-				// Shared identity bytes: Arc clone only.
 				servlet_type: Arc::clone(&self.servlet_type),
 				dial_addr: Arc::clone(&self.dial_addr),
 				peer_id: Arc::clone(&self.owner_id),
@@ -303,13 +335,13 @@ impl ServletEntry {
 		}
 	}
 
-	/// True when consecutive failures reached the abandonment limit.
+	/// Whether consecutive failures reached the abandonment limit.
 	#[must_use]
 	pub fn is_abandoned(&self) -> bool {
 		self.trial_count.load(Ordering::Relaxed) >= self.abandonment_limit
 	}
 
-	/// True when the entry remains selectable for routing.
+	/// Whether the entry remains selectable for routing.
 	#[must_use]
 	pub fn is_live(&self) -> bool {
 		!self.is_abandoned()
@@ -321,7 +353,8 @@ impl ServletEntry {
 		self.pheromone.load(Ordering::Relaxed)
 	}
 
-	/// Raise pheromone after a successful request and clear the failure streak.
+	/// Raises the pheromone after a successful request and clears the
+	/// failure streak.
 	///
 	/// One `fetch_update` keeps concurrent evaporation from discarding the
 	/// reinforcement.
@@ -332,12 +365,13 @@ impl ServletEntry {
 		self.trial_count.store(0, Ordering::Relaxed);
 	}
 
-	/// Count one failure toward abandonment.
+	/// Counts one failure toward abandonment.
 	pub fn weaken(&self) {
 		self.trial_count.fetch_add(1, Ordering::Relaxed);
 	}
 
-	/// Count one failure and optionally subtract pheromone.
+	/// Counts one failure and subtracts `penalty` from the pheromone when the
+	/// penalty is nonzero.
 	pub fn weaken_with_penalty(&self, penalty: u64) {
 		self.trial_count.fetch_add(1, Ordering::Relaxed);
 		if penalty > 0 {
@@ -347,7 +381,7 @@ impl ServletEntry {
 		}
 	}
 
-	/// Decay pheromone by `rate` basis points.
+	/// Decays the pheromone by `rate` basis points.
 	pub fn evaporate(&self, rate: BasisPoints) {
 		let _ = self.pheromone.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
 			let decay = current.saturating_mul(rate.get() as u64) / 10000;
@@ -355,10 +389,11 @@ impl ServletEntry {
 		});
 	}
 
-	/// Carries pheromone and trial state across a peer-route replacement.
+	/// Carries pheromone and trial state across a replacement when both the
+	/// old and the new route are peer-routed.
 	///
-	/// `installed_at` is deliberately not carried: a replacement is a
-	/// fresh reconcile, and staleness pruning must see it as one.
+	/// The install instant stays with the registry's map value, so a
+	/// replacement ages from the reconcile that placed it.
 	pub fn preserve_peer_trail_from(&mut self, prev: &Self) {
 		let both_peer = self.route_kind.is_peer() && prev.route_kind.is_peer();
 		if !both_peer {
@@ -367,7 +402,6 @@ impl ServletEntry {
 
 		self.pheromone = AtomicU64::new(prev.pheromone.load(Ordering::Relaxed));
 		self.trial_count = AtomicU32::new(prev.trial_count.load(Ordering::Relaxed));
-		self.last_reinforced = prev.last_reinforced;
 	}
 }
 
@@ -382,10 +416,8 @@ impl Clone for ServletEntry {
 			dial_addr: Arc::clone(&self.dial_addr),
 			route_kind: self.route_kind,
 			pheromone: AtomicU64::new(self.pheromone.load(Ordering::Relaxed)),
-			last_reinforced: self.last_reinforced,
 			trial_count: AtomicU32::new(self.trial_count.load(Ordering::Relaxed)),
 			abandonment_limit: self.abandonment_limit,
-			installed_at: self.installed_at,
 		}
 	}
 }

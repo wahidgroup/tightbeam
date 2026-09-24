@@ -1,4 +1,4 @@
-//! Cross-cluster streaming and duplex forwarding (gateway splice).
+//! Cross-cluster streaming and duplex forwarding through the gateway splice.
 //!
 //! The stream-echo servlet lives only in cluster B. A client opens a
 //! routed stream against cluster A (`open_stream_to` / `open_duplex_to`),
@@ -55,9 +55,9 @@ impl Drop for CancelProbe {
 }
 
 servlet! {
-	/// Streaming and duplex arms only: stream reports the collected body
-	/// length, duplex echoes every request chunk back through the reply
-	/// sink. The duplex arm carries the cancel probe.
+	/// A servlet with streaming and duplex arms only. The stream arm reports
+	/// the collected body length, and the duplex arm echoes every request
+	/// chunk back through the reply sink and carries the cancel probe.
 	pub StreamEchoServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
 	stream: |body, ctx| async move {
@@ -82,7 +82,7 @@ servlet! {
 	}
 }
 
-/// Hive hosting one stream-echo servlet, muxed on both the servlet
+/// A hive hosting one stream-echo servlet, muxed on both the servlet
 /// server and the hive-to-cluster pool.
 pub async fn start_stream_hive(
 	trace: TraceCollector,
@@ -113,8 +113,8 @@ fn mux_advertising_conf(certs: &ClusterTestCerts, peer: impl Into<String>) -> Cl
 	with_mux_offer(advertising_cluster_conf(certs, peer))
 }
 
-/// Pooled mux lease against a gateway, for the routed stream entry points
-/// ([`PooledClient::open_stream_to`] / [`PooledClient::open_duplex_to`]).
+/// A pooled mux lease against a gateway, for the routed stream entry points
+/// [`PooledClient::open_stream_to`] and [`PooledClient::open_duplex_to`].
 pub async fn pooled_cluster_client(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
@@ -124,7 +124,6 @@ pub async fn pooled_cluster_client(
 		idle_timeout: None,
 		max_connections: 1,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
-		..PoolConfig::default()
 	};
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
@@ -138,9 +137,9 @@ pub async fn pooled_cluster_client(
 	Ok(client)
 }
 
-/// Two peered gateways with the stream-echo hive registered in the
-/// exporter: the shared preamble for every splice scenario. Returns
-/// the importer the client dials first, the exporter second.
+/// Starts two peered gateways with the stream-echo hive registered in the
+/// exporter. This is the shared preamble for every splice scenario, and it
+/// returns the importer the client dials first and the exporter second.
 async fn start_spliced_clusters(
 	trace: &TraceCollector,
 	certs: &Arc<ClusterTestCerts>,
@@ -157,7 +156,8 @@ async fn start_spliced_clusters(
 	Ok((importer, exporter))
 }
 
-/// Poll until the servlet-side cancel probe reports or attempts exhaust.
+/// Polls until the servlet-side cancel probe reports or the attempts run
+/// out.
 async fn wait_for_cancel_probe(attempts: u32, interval: Duration) -> bool {
 	poll_until(attempts, interval, || DUPLEX_CANCEL_SEEN.load(Ordering::SeqCst)).await
 }
@@ -230,7 +230,7 @@ tb_assert_spec! {
 }
 
 // Duplex cross-cluster forward: both directions relay concurrently
-// across the splice - request chunks reach the exporter's servlet as
+// across the splice: request chunks reach the exporter's servlet as
 // they are pushed, and its echoes arrive before the request closes.
 tb_scenario! {
 	name: cluster_forwards_duplex_to_peer_gateway,

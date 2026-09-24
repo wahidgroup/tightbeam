@@ -36,22 +36,22 @@ use crate::servlets::{PingRequest, PingResponse};
 use crate::shadow::{AccessAttempt, Prediction};
 use crate::topology::{ColonyTopology, OrgNode};
 
-/// Client I/O budget. Sized above typical local emit latency so allowed
-/// work resolves as success/deny rather than timeout races.
+/// The client I/O budget, sized above typical local emit latency so allowed
+/// work resolves as success or deny rather than racing a timeout.
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(2000);
 
-/// Classified unary/stream outcome for the security oracle.
+/// The classified unary or stream outcome for the security oracle.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthzClass {
-	/// Authz allowed and application payload succeeded.
+	/// Authorization allowed the call, and the application payload succeeded.
 	Success = 1,
-	/// Explicit authorization refusal from the gateway.
+	/// The gateway refused authorization explicitly.
 	AuthzDenied = 2,
-	/// Timeout, TLS, routing, decode, or other non-authz failure.
+	/// A timeout, TLS, routing, decode, or other non-authorization failure.
 	InfraFail = 3,
 }
 
-/// Run oracle-selected actions until bytes or action caps are hit.
+/// Runs oracle-selected actions until the byte or action caps are hit.
 pub(crate) async fn run_actions(trace: &TraceCollector, topo: &mut ColonyTopology) -> Result<(), TightBeamError> {
 	let mut actions = 0u64;
 	let mut order = 1u64;
@@ -246,12 +246,7 @@ async fn pooled_client(
 	addr: &<TokioListener as Protocol>::Address,
 ) -> Result<PooledClient<TokioListener>, TightBeamError> {
 	let offer = Arc::new(TransportOffer::mux(8));
-	let config = PoolConfig {
-		idle_timeout: None,
-		max_connections: 1,
-		mux_offer: Some(offer),
-		..PoolConfig::default()
-	};
+	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: Some(offer) };
 
 	let cert = CertificateSpec::Built(Box::new(identity.cert.as_ref().clone()));
 	let key = Arc::new(Secp256k1KeyProvider::from(identity.key.to_owned()));
@@ -272,7 +267,7 @@ pub(crate) fn is_authz_status(status: TransitStatus) -> bool {
 	matches!(status, TransitStatus::PermissionDenied | TransitStatus::Unauthenticated)
 }
 
-/// Build the client's end-to-end work frame around a typed ping request.
+/// Builds the client's end-to-end work frame around a typed ping request.
 ///
 /// Gateways deliver this frame to the servlet, so the fuzz harness exercises
 /// the same frame-in-frame contract as real clients.
@@ -292,10 +287,10 @@ fn classify_work_message(message: impl AsRef<[u8]>, payload_ok: impl FnOnce(&[u8
 	}
 }
 
-/// Compare a shadow prediction against the wire outcome and emit the
+/// Compares a shadow prediction against the wire outcome and emits the
 /// outcome plus any oracle divergence.
 ///
-/// Only `Allow`/`Deny` participate in the oracle. A predicted `Deny` that
+/// Only `Allow` and `Deny` take part in the oracle. A predicted `Deny` that
 /// the wire allowed is a `SHADOW_VIOLATION`, and a predicted `Allow` that
 /// the wire refused is `SHADOW_TOO_CLOSED`. `Unmodeled` skips both
 /// directions while the plain outcome event still emits.
@@ -344,7 +339,8 @@ fn classify_stream_outcome(outcome: Result<bool, TightBeamError>) -> AuthzClass 
 	}
 }
 
-/// One gateway work emit: request, frame id, shadow expectation, and outcome events.
+/// One gateway work emit, which carries the request, the frame id, the
+/// shadow expectation, and the outcome events.
 struct ClusterWork<F> {
 	request: ClusterWorkRequest,
 	frame_id: &'static str,
@@ -392,7 +388,7 @@ async fn emit_cluster_work(
 	record_authz_oracle(trace, work.predicted, class, work.ok, work.denied)
 }
 
-/// Predict one hop against `org`'s export boundary through its shadow.
+/// Predicts one hop against `org`'s export boundary through its shadow.
 ///
 /// SPKI DER is borrowed from the identity bundle, encoded once in the
 /// fixtures rather than re-encoded per prediction.
@@ -410,7 +406,7 @@ fn shadow_predict(
 	})
 }
 
-/// Compose per-hop predictions along a path.
+/// Composes per-hop predictions along a path.
 ///
 /// The composed prediction is [`Prediction::Allow`] only when every hop
 /// allows. It is [`Prediction::Deny`] only when every hop denies. Any mix,
@@ -564,14 +560,17 @@ async fn advertise_live_peer(
 	record_authz_oracle(trace, predicted, class, events::PEER_AD_OK, events::PEER_AD_DENIED)
 }
 
-/// Drive the peer-advertisement deny path with `Prediction::Deny`.
+/// Drives the peer-advertisement deny path with `Prediction::Deny`.
 ///
-/// The oracle byte selects one of two hostile shapes, either an
-/// advertisement signed by an identity outside the receiver's peer-trust
-/// set or a replayed `control_order`. The freshness/replay stage is not
-/// modeled by the shadow (see [`crate::shadow`]), so the replay case
-/// asserts `Deny` only when the priming advertisement landed. Each shape
-/// expects the wire to refuse into `PEER_AD_DENIED`, never `SHADOW_VIOLATION`.
+/// The oracle byte selects one of two hostile shapes:
+///
+/// - An advertisement signed by an identity outside the receiver's peer-trust set.
+/// - A replayed `control_order`. The shadow does not model the freshness and
+///   replay stage (see [`crate::shadow`]), so this case asserts `Deny` only
+///   when the priming advertisement landed.
+///
+/// Each shape expects the wire to refuse into `PEER_AD_DENIED`, never
+/// `SHADOW_VIOLATION`.
 async fn negative_peer_ad(
 	trace: &TraceCollector,
 	topo: &mut ColonyTopology,
@@ -641,7 +640,7 @@ async fn cross_org_work(
 	// Model the full cross-org path per hop. Alpha is the dial org and
 	// does not serve peer-ping locally, so the request relays to the
 	// downstream orgs that do (beta and gamma) with the dial org's
-	// gateway certificate as caller and relayed = true. A mixed
+	// gateway certificate as caller and `relayed = true`. A mixed
 	// composition yields Unmodeled.
 	let dial_hop = shadow_predict(&topo.alpha, &target, Some(&topo.alpha.certs), relayed);
 	let beta_hop = shadow_predict(&topo.beta, &target, Some(&topo.alpha.certs), true);
@@ -906,7 +905,8 @@ fn pin_decoy_for(
 	let type_name = type_name.as_ref();
 	let dial_addr = dial_addr.as_ref();
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
-	let key = gateway.peer_routes().into_iter().find_map(|route| {
+	let routes = gateway.peer_routes().expect("the gateway under test holds no poisoned lock");
+	let key = routes.into_iter().find_map(|route| {
 		if route.dial_addr.as_ref() != dial_addr || route.servlet_type.as_ref() != canonical.as_slice() {
 			return None;
 		}

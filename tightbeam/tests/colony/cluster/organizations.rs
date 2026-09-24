@@ -1,4 +1,5 @@
-//! Multi-organization federation (colony boundary at the gateway edge).
+//! Multi-organization federation tests for the colony boundary at the
+//! gateway edge.
 //!
 //! One transport trust store, two colonies: "main" runs the entry and origin
 //! gateways, "other" holds one trusted gateway identity, and a third identity
@@ -11,6 +12,8 @@
 use super::common::*;
 use super::federation::{federation_conf, flood_ad_rumor, type_route_count};
 use super::gossip::relay_application_rumor;
+use crate::common::security::expectation_failure;
+use tightbeam::utils::time::{Clock, ManualClock};
 
 #[cfg(feature = "testing-fdr")]
 use tightbeam::testing::fdr::FdrConfig;
@@ -19,13 +22,15 @@ use tightbeam::testing::{Expect, Layer};
 
 /// Two organizations and one drifter under a single transport trust store.
 struct MultiOrgCtx {
-	/// Member gateway of colony "main", see [`member_identity`].
+	/// The entry member gateway of colony "main", built by
+	/// [`member_identity`].
 	entry: Arc<ClusterTestCerts>,
-	/// Member gateway of colony "main", see [`member_identity`].
+	/// The origin member gateway of colony "main", built by
+	/// [`member_identity`].
 	origin: Arc<ClusterTestCerts>,
-	/// Gateway identity of colony "other". Transport admits it and the colony
-	/// gate must not. Carries full gateway certs, so a scenario can also run
-	/// it as a live gateway.
+	/// The gateway identity of colony "other". Transport admits it and the
+	/// colony gate must not. It carries full gateway certs, so a scenario can
+	/// also run it as a live gateway.
 	foreign: Arc<ClusterTestCerts>,
 	/// A "main" member whose advertisement claims a type from a foreign realm.
 	/// The outer relay gate admits it and the inner advertisement admission
@@ -33,13 +38,13 @@ struct MultiOrgCtx {
 	rogue_key: Secp256k1SigningKey,
 	/// A trusted transport identity with no colony SAN.
 	stranger_key: Secp256k1SigningKey,
-	/// Peer-plane store for `entry`, excluding its own identity: peer
+	/// The peer-plane store for `entry`, excluding its own identity: peer
 	/// membership wins on the hive plane, so a member's hive registrations
 	/// must not verify on its own peer store.
 	peers_of_entry: Arc<dyn CertificateTrust>,
-	/// Peer-plane store for `origin`, excluding its own identity.
+	/// The peer-plane store for `origin`, excluding its own identity.
 	peers_of_origin: Arc<dyn CertificateTrust>,
-	/// Peer-plane store for `foreign`, excluding its own identity.
+	/// The peer-plane store for `foreign`, excluding its own identity.
 	peers_of_foreign: Arc<dyn CertificateTrust>,
 }
 
@@ -82,6 +87,44 @@ fn quiet_member_conf(certs: &ClusterTestCerts, peer_trust: Arc<dyn CertificateTr
 	let mut conf = federation_conf(certs, peer_trust, vec![], 1);
 	conf.peer.advertise_interval = None;
 	conf
+}
+
+/// One advertise beat of the gateway [`federation_conf`] builds.
+const FOREIGN_BEAT: Duration = Duration::from_millis(100);
+
+/// Beats the foreign gateway drives before the scenario gives up.
+///
+/// Twenty beats move its clock two seconds, well inside the entry gateway's
+/// freshness window, so every frame they sign stays admissible.
+const FOREIGN_BEATS: u32 = 20;
+
+/// Drives the foreign gateway one beat at a time until a beat has both
+/// advertised and been refused at the entry gateway's colony gate. The
+/// branching lives here, not in the scenario.
+///
+/// - The beat task may not be sleeping yet when the scenario starts, and a
+///   sleep begun after an advance waits a whole beat from there, so each
+///   round advances again.
+/// - The two events come from two tasks on the foreign gateway: the direct
+///   advertisement and the rumor flood it spawns.
+/// - The refusal changes no public state, so the trace is the one place both
+///   events land. Each round reads it once the round's socket work has had a
+///   moment to run.
+async fn drive_until_refused(clock: &ManualClock, trace: &TraceCollector) -> Result<(), TightBeamError> {
+	let landed = || {
+		let advertised = trace.recorded(events::CLUSTER_PEER_ADVERTISED);
+		let refused = trace.recorded(events::CLUSTER_GOSSIP_REFUSED);
+		advertised > 0 && refused > 0
+	};
+
+	for _ in 0..FOREIGN_BEATS {
+		clock.advance(FOREIGN_BEAT);
+		if poll_until(5, Duration::from_millis(20), landed).await {
+			return Ok(());
+		}
+	}
+
+	Err(expectation_failure("the entry gateway never refused the foreign beat"))
 }
 
 tb_assert_spec! {
@@ -177,7 +220,7 @@ tb_scenario! {
 
 			hive.register_with_cluster(gateway_origin.addr()).await?;
 
-			// Stands in for the origin's own publish beat.
+			// This publish stands in for the origin's own publish beat.
 			let origin_addr = gateway_origin.addr().to_string();
 			let status = flood_ad_rumor(
 				&ctx.entry,
@@ -272,14 +315,15 @@ tb_scenario! {
 			start_cluster(&trace, quiet_member_conf(&ctx.entry, Arc::clone(&ctx.peers_of_entry))).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			let foreign_conf = federation_conf(&ctx.foreign, Arc::clone(&ctx.peers_of_foreign), vec![cluster.addr().to_string()], 1);
+			// The foreign gateway beats on a clock only this test moves.
+			let clock = Arc::new(ManualClock::default());
+			let mut foreign_conf = federation_conf(&ctx.foreign, Arc::clone(&ctx.peers_of_foreign), vec![cluster.addr().to_string()], 1);
+			foreign_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
 			let gateway_foreign = start_cluster(&trace, foreign_conf).await?;
 
-			// A refusal changes no public state, so there is nothing
-			// to poll: hold the window open for a dozen 100 ms beats.
-			tokio::time::sleep(Duration::from_millis(1500)).await;
+			drive_until_refused(&clock, &trace).await?;
 
-			trace.event_with(PEER_ROUTES_AFTER, &[], cluster.peer_routes().len() as u64)?;
+			trace.event_with(PEER_ROUTES_AFTER, &[], cluster.peer_routes()?.len() as u64)?;
 
 			gateway_foreign.stop();
 			cluster.stop();

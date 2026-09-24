@@ -58,12 +58,20 @@ pub(crate) const BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/backpressure-heartbeat-heartbeat-shape");
 pub(crate) const BACKPRESSURE_MANAGE_MANAGE_SHAPE: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/backpressure-manage-manage-shape");
+pub(crate) const BACKPRESSURE_SPAWN_SPAWN_SHAPE: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/backpressure-spawn-spawn-shape");
 pub(crate) const DRAINING_MANAGE_MANAGE_SHAPE: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/draining-manage-manage-shape");
+pub(crate) const DRAINING_SPAWN_SPAWN_SHAPE: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/draining-spawn-spawn-shape");
 pub(crate) const AMBIGUOUS_COMMAND_REFUSED: Urn<'static> =
 	tightbeam::urn!("test", "event:hive/ambiguous-command-refused");
 pub(crate) const EMPTY_COMMAND_REFUSED: Urn<'static> = tightbeam::urn!("test", "event:hive/empty-command-refused");
-pub(crate) const FIRST_SPAWN_FORBIDDEN: Urn<'static> = tightbeam::urn!("test", "event:hive/first-spawn-forbidden");
+pub(crate) const DRAIN_REFUSAL_UNAVAILABLE: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/drain-refusal-unavailable");
+pub(crate) const DRAIN_REFUSAL_REPLAY_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:hive/drain-refusal-replay-refused");
+pub(crate) const FIRST_SPAWN_UNAVAILABLE: Urn<'static> = tightbeam::urn!("test", "event:hive/first-spawn-unavailable");
 pub(crate) const FORGED_HEARTBEAT_DENIED: Urn<'static> = tightbeam::urn!("test", "event:hive/forged-heartbeat-denied");
 pub(crate) const HIVE_ESTABLISHED: Urn<'static> = tightbeam::urn!("test", "event:hive/hive-established");
 pub(crate) const HIVE_STARTED: Urn<'static> = tightbeam::urn!("test", "event:hive/hive-started");
@@ -423,6 +431,7 @@ tb_assert_spec! {
 			(UNSIGNED_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unauthenticated)),
 			(SIGNED_HEARTBEAT_ACCEPTED, exactly!(1), equals!(TransitStatus::Ok)),
 			(DRAINING_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(DRAINING_SPAWN_SPAWN_SHAPE, exactly!(1), equals!(TransitStatus::Unavailable)),
 			(FORGED_HEARTBEAT_DENIED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(OPEN_BREAKER_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::PermissionDenied))
 		]
@@ -472,6 +481,12 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_stop).await?;
 			trace.event_with(DRAINING_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
+			// A spawn refused by the drain answers in the spawn alternative,
+			// which is the one its sender decodes.
+			let signed_spawn = signed_spawn_frame(&signer.provider, b"spawn-draining", "orphan").await?;
+			let response = emit_command(&mut client, signed_spawn).await?;
+			trace.event_with(DRAINING_SPAWN_SPAWN_SHAPE, &[], manage_spawn_shape_status(response)?)?;
+
 			// Trip the breaker at threshold 1. A trusted signer identity with a
 			// signature transplanted from a different frame is the one failure
 			// class the breaker counts.
@@ -480,7 +495,8 @@ tb_scenario! {
 			donor.sign_with_provider::<Sha3_256, _>(&signer.provider).await?;
 
 			let transplanted = donor.nonrepudiation().cloned().ok_or(TightBeamError::MissingSignature)?;
-			let mut forged = command_frame_with_order(b"hb-forged", heartbeat_command(), now.saturating_add(Duration::from_millis(1)).get())?;
+			let forged_order = now.saturating_add(Duration::from_millis(1)).get();
+			let mut forged = command_frame_with_order(b"hb-forged", heartbeat_command(), forged_order)?;
 			forged.attach_signer_info(transplanted)?;
 
 			let response = emit_command(&mut client, forged).await?;
@@ -506,6 +522,7 @@ tb_assert_spec! {
 		mode: Accept,
 		assertions: [
 			(BACKPRESSURE_MANAGE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
+			(BACKPRESSURE_SPAWN_SPAWN_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted)),
 			(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted))
 		]
 	}
@@ -533,6 +550,10 @@ tb_scenario! {
 			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
 			trace.event_with(BACKPRESSURE_MANAGE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
+
+			let signed_spawn = signed_spawn_frame(&signer.provider, b"spawn-bp", "orphan").await?;
+			let response = emit_command(&mut client, signed_spawn).await?;
+			trace.event_with(BACKPRESSURE_SPAWN_SPAWN_SHAPE, &[], manage_spawn_shape_status(response)?)?;
 
 			// A signed heartbeat is exempt from the gate. It replies in the
 			// heartbeat CHOICE with real capacity data, and the
@@ -640,14 +661,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(FIRST_SPAWN_FORBIDDEN, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(FIRST_SPAWN_UNAVAILABLE, exactly!(1), equals!(TransitStatus::Unavailable)),
 			(RETRY_SPAWN_ACCEPTED, exactly!(1), equals!(TransitStatus::Ok))
 		]
 	}
 }
 
-// A manage handler failure forgets the replay guard, so the same signed
-// frame may be submitted again and succeed on the retry.
+// A spawner that fails is a refusal a retry can change, so the hive answers
+// Unavailable and releases the replay slot. The same signed frame is then
+// admitted again and succeeds on the retry.
 tb_scenario! {
 	name: hive_manage_failure_allows_signed_retry,
 	spec: HiveSpawnRetrySpec,
@@ -686,10 +708,52 @@ tb_scenario! {
 			let replay = signed.to_owned();
 
 			let first = emit_command(&mut client, signed).await?;
-			trace.event_with(FIRST_SPAWN_FORBIDDEN, &[], manage_spawn_shape_status(first)?)?;
+			trace.event_with(FIRST_SPAWN_UNAVAILABLE, &[], manage_spawn_shape_status(first)?)?;
 
 			let second = emit_command(&mut client, replay).await?;
 			trace.event_with(RETRY_SPAWN_ACCEPTED, &[], manage_spawn_shape_status(second)?)?;
+
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub HivePermanentRefusalKeepsSlotSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(DRAIN_REFUSAL_UNAVAILABLE, exactly!(1), equals!(TransitStatus::Unavailable)),
+			(DRAIN_REFUSAL_REPLAY_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
+		]
+	}
+}
+
+// A drain refusal holds for every resubmission, so it keeps the replay slot
+// spent. The same signed frame submitted again is refused as a replay
+// (PermissionDenied) rather than answered as a fresh drain refusal
+// (Unavailable), so a captured frame buys its holder nothing.
+tb_scenario! {
+	name: hive_permanent_refusal_keeps_the_replay_slot,
+	spec: HivePermanentRefusalKeepsSlotSpec,
+	environment Hive {
+		context: trusted_signer("CN=Hive Permanent Refusal"),
+		start: |SetupEnv { trace, context: signer }| async move {
+			start_trusted_hive(&trace, &signer, HiveConfig::default()).await
+		},
+		client: |HiveEnv { trace, context: signer, hive }| async move {
+			let mut client = connect_hive(&hive, &signer).await?;
+			hive.drain().await?;
+
+			let signed = signed_stop_frame(&signer.provider, b"stop-draining").await?;
+			let replay = signed.to_owned();
+
+			let first = emit_command(&mut client, signed).await?;
+			trace.event_with(DRAIN_REFUSAL_UNAVAILABLE, &[], manage_stop_shape_status(first)?)?;
+
+			let second = emit_command(&mut client, replay).await?;
+			trace.event_with(DRAIN_REFUSAL_REPLAY_REFUSED, &[], manage_stop_shape_status(second)?)?;
 
 			hive.stop();
 			Ok(())

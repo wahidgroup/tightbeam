@@ -14,8 +14,9 @@ use tightbeam::testing::TestFrame;
 use tightbeam::transport::handshake::HandshakeKeyManager;
 use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 
-/// Peering conf that refloods to `peers`.
-/// Returns the journal handle so scenarios can poll flood convergence
+/// A peering conf that refloods to `peers`.
+///
+/// It returns the journal handle, so scenarios can poll flood convergence
 /// through the public journal trait.
 ///
 /// The hive plane refuses a signer that `peer_trust` also holds, so the
@@ -38,7 +39,7 @@ fn gossip_cluster_conf(
 	(conf, journal)
 }
 
-/// Publish frame signed on the hive-plane identity.
+/// A publish frame signed on the hive-plane identity.
 ///
 /// Origin publishes verify against `hive_trust`, and a signer that
 /// `peer_trust` also holds is refused there.
@@ -49,20 +50,19 @@ async fn hive_publish_gossip(id: impl AsRef<[u8]>, body: GossipRumor, ttl: u64) 
 	signed_publish_gossip(&publisher.key, id, body, ttl).await
 }
 
-/// Payload-only rumor body.
+/// A payload-only rumor body.
 ///
 /// The rumor names no destination.
 ///
 /// - Flood scope is the origin certificate's colony URN.
 /// - Local delivery is the receiving gateway's ingress policy.
-/// - The outer frame's `metadata.lifetime` carries the hop radius,
-///   never the body.
+/// - The outer frame's `metadata.lifetime` carries the hop radius, and the body carries none.
 fn rumor_body(payload: impl Into<Vec<u8>>) -> GossipRumor {
 	let payload: Vec<u8> = payload.into();
 	GossipRumor::application(payload)
 }
 
-/// Mint an origin-signed rumor [`Frame`] (the nested gossip content).
+/// Creates an origin-signed rumor [`Frame`], the nested gossip content.
 async fn mint_origin_rumor(
 	key: &Secp256k1SigningKey,
 	id: impl AsRef<[u8]>,
@@ -81,7 +81,7 @@ async fn mint_origin_rumor(
 	Ok(signed)
 }
 
-/// Sign a [`Gossip`] relay frame carrying an unchanged origin rumor.
+/// Signs a [`Gossip`] relay frame that carries an unchanged origin rumor.
 async fn signed_relay_gossip(
 	key: &Secp256k1SigningKey,
 	id: impl AsRef<[u8]>,
@@ -102,7 +102,7 @@ async fn signed_relay_gossip(
 	Ok(signed)
 }
 
-/// Emit one signed gossip frame and record the decoded status on the
+/// Emits one signed gossip frame and records the decoded status on the
 /// trace as `GOSSIP_PUBLISH_STATUS`.
 async fn send_gossip_frame(
 	trace: &TraceCollector,
@@ -113,9 +113,8 @@ async fn send_gossip_frame(
 	send_gossip_frame_as(trace, connect_certs, cluster, frame, GOSSIP_PUBLISH_STATUS).await
 }
 
-/// Emit one signed gossip frame and record the decoded status under the
-/// given marker.
-/// One scenario can thereby distinguish per-publish outcomes.
+/// Emits one signed gossip frame and records the decoded status under
+/// `marker`, so one scenario can tell its publish outcomes apart.
 async fn send_gossip_frame_as(
 	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
@@ -129,11 +128,12 @@ async fn send_gossip_frame_as(
 	Ok(())
 }
 
-/// Mint a ping application rumor signed by `origin_key`, wrap it in a
-/// zero-hop relay envelope signed by `relay_key`, and emit it to
-/// `cluster`. The decoded status records as `GOSSIP_RELAY_STATUS`.
-/// Frame ids derive from `label`, so each call floods a distinct
-/// digest.
+/// Relays one ping application rumor to `cluster` and records the status.
+///
+/// The rumor is signed by `origin_key` and wrapped in a zero-hop relay
+/// envelope signed by `relay_key`. The decoded status records as
+/// `GOSSIP_RELAY_STATUS`. Frame ids derive from `label`, so each call floods
+/// a distinct digest.
 pub async fn relay_application_rumor(
 	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
@@ -151,7 +151,8 @@ pub async fn relay_application_rumor(
 	send_gossip_frame_as(trace, connect_certs, cluster, frame, GOSSIP_RELAY_STATUS).await
 }
 
-/// Sign a [`ReconcileGossip`] control frame listing the sender's held digests.
+/// Signs a [`ReconcileGossip`] control frame that lists the sender's held
+/// digests.
 async fn signed_reconcile_gossip(
 	key: &Secp256k1SigningKey,
 	id: impl AsRef<[u8]>,
@@ -171,9 +172,8 @@ async fn signed_reconcile_gossip(
 	Ok(signed)
 }
 
-/// Emit one signed reconcile frame and record the want-list size under
-/// the given marker.
-/// A refused reconciliation answers an empty want.
+/// Emits one signed reconcile frame and records the want-list size under
+/// `marker`. A refused reconciliation answers with an empty want.
 async fn send_reconcile_frame_as(
 	trace: &TraceCollector,
 	connect_certs: &ClusterTestCerts,
@@ -187,8 +187,8 @@ async fn send_reconcile_frame_as(
 	Ok(())
 }
 
-/// One convergence probe over the public journal interface.
-/// Every journal holds exactly `held` rumors and none awaits local delivery.
+/// One convergence probe over the public journal interface: every journal
+/// holds exactly `held` rumors, and none awaits local delivery.
 fn gossip_converged(journals: impl AsRef<[Arc<MemoryGossipJournal>]>, held: usize) -> bool {
 	let journals = journals.as_ref();
 	let now = UnixMillis::now();
@@ -201,10 +201,10 @@ fn gossip_converged(journals: impl AsRef<[Arc<MemoryGossipJournal>]>, held: usiz
 	})
 }
 
-/// Poll until every journal converged or attempts exhaust.
+/// Polls until every journal converges, or the attempts run out.
 ///
-/// Refloods run detached from the publish reply.
-/// Convergence is therefore only observable by polling.
+/// Refloods run detached from the publish reply, so only a poll can observe
+/// convergence.
 async fn wait_for_gossip_converged(
 	journals: impl AsRef<[Arc<MemoryGossipJournal>]>,
 	held: usize,
@@ -215,11 +215,11 @@ async fn wait_for_gossip_converged(
 	poll_until(attempts, interval, || gossip_converged(journals, held)).await
 }
 
-/// Poll until the journal holds exactly `count` rumors awaiting local delivery.
+/// Polls until the journal holds exactly `count` rumors that await local
+/// delivery, or the attempts run out.
 ///
-/// Attempts exhaust if the count never matches.
-///
-/// - A rumor accepted before the ingress servlet registers stays pending for beat retry.
+/// A rumor accepted before the ingress servlet registers stays pending for
+/// the beat to retry.
 async fn wait_for_pending_local(
 	journal: &Arc<MemoryGossipJournal>,
 	count: usize,
@@ -281,8 +281,8 @@ tb_scenario! {
 			hive_c.register_with_cluster(gateway_c.addr()).await?;
 
 			// One signed publish frame is resent byte-identical. The origin
-			// gateway re-mints the same rumor (same id, order, body). The
-			// journal absorbs the second as a Duplicate.
+			// gateway re-creates the same rumor, with the same id, order, and
+			// body, and the journal absorbs the second as a Duplicate.
 			let frame = hive_publish_gossip(
 				b"flood-rumor",
 				rumor_body(encode(&PingRequest { value: 21 })?),
@@ -507,9 +507,9 @@ tb_scenario! {
 /// The gateway's own certs anchor the hive plane. A distinct random identity
 /// anchors the peer plane.
 ///
-/// - [`GatewayCerts::generate`] cannot serve here.
-/// - Every generated cert shares the fixed test signing key.
-/// - Two "identities" would therefore verify interchangeably.
+/// [`GatewayCerts::generate`] cannot serve here, because every generated
+/// cert shares the fixed test signing key, so two "identities" would verify
+/// interchangeably.
 struct GossipPlaneCtx {
 	gateway: ClusterTestCerts,
 	peer_key: Secp256k1SigningKey,
@@ -557,16 +557,15 @@ tb_scenario! {
 	environment Cluster {
 		context: gossip_plane_ctx(),
 		start: |SetupEnv { trace, context: ctx }| async move {
-			// The oversized rumor exceeds a single-flight envelope.
-			//
-			// - The gateway therefore offers mux.
-			// - The frame must chunk across the link to reach gossip admission at all.
+			// The oversized rumor exceeds a single-flight envelope, so the
+			// gateway offers mux, and the frame must chunk across the link to
+			// reach gossip admission at all.
 			let conf = with_mux_offer(peering_cluster_conf_with_trust(&ctx.gateway, Arc::clone(&ctx.peer_trust)));
 			start_cluster(&trace, conf).await
 		},
 		client: |ClusterEnv { trace, context: ctx, cluster }| async move {
-			// Outer frame signed on the hive plane.
-			// Peer trust refuses it before the nested rumor is examined.
+			// The outer frame is signed on the hive plane, so peer trust
+			// refuses it before the nested rumor is examined.
 			let dummy = mint_origin_rumor(
 				&ctx.gateway.key,
 				b"cross-plane-inner",
@@ -586,11 +585,9 @@ tb_scenario! {
 			send_gossip_frame(&trace, &ctx.gateway, &cluster, frame).await?;
 
 			// A rumor past the gossip bound exceeds what one single-flight
-			// envelope carries.
-			//
-			// - It crosses a pooled mux link (the same chunked path reflood uses) to reach
-			//   admission.
-			// - The payload bound then refuses it on the correct plane.
+			// envelope carries. It crosses a pooled mux link, the same chunked
+			// path that reflood uses, to reach admission, and the payload bound
+			// then refuses it on the correct plane.
 			let pool_config = PoolConfig {
 				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 				..Default::default()
@@ -700,7 +697,7 @@ tb_assert_spec! {
 // The rumor reaches R before R's ping servlet registers, so it stays pending.
 //
 // - After registration, R's beat delivers from the pending set and acks.
-// - R has no peers, so the beat runs solely for pending_local retry.
+// - R has no peers, so the beat runs solely for the `pending_local` retry.
 tb_scenario! {
 	name: cluster_gossip_retries_pending_local_delivery,
 	spec: ClusterGossipRetrySpec,
@@ -743,9 +740,10 @@ tb_scenario! {
 	}
 }
 
-/// Counting [`GossipJournal`] wrapping the in-memory default.
-/// Counters show the gateway records and acks through the injected trait
-/// object. A durable backend swaps in the same way.
+/// A counting [`GossipJournal`] that wraps the in-memory default.
+///
+/// The counters show that the gateway records and acks through the injected
+/// trait object. A durable backend swaps in the same way.
 #[derive(Default)]
 struct CountingJournal {
 	inner: MemoryGossipJournal,
@@ -934,8 +932,9 @@ tb_scenario! {
 			.await?;
 			send_gossip_frame(&trace, &certs, &gateway, frame.clone()).await?;
 
-			// Past the one-second retention, so the journal has pruned the
-			// entry and only the clamped freshness window can refuse it.
+			// The clock moves past the one-second retention, so the journal
+			// has pruned the entry and only the clamped freshness window can
+			// refuse it.
 			clock.advance(Duration::from_secs(2));
 			send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_REPLAY_STATUS).await?;
 
@@ -1054,7 +1053,7 @@ tb_scenario! {
 	}
 }
 
-/// Journal that reports every rumor as claimed by another task.
+/// A journal that reports every rumor as claimed by another task.
 ///
 /// That is what the reconcile beat sees while an admission is mid-delivery,
 /// and what the admission sees while the beat is. Either way the second
@@ -1217,7 +1216,7 @@ tb_scenario! {
 			hive.register_with_cluster(gateway.addr()).await?;
 			install_ping_peer(&trace, &certs, &gateway).await?;
 
-			// One more relay than the abandonment budget.
+			// The loop sends one more relay than the abandonment budget.
 			//
 			// - The last refusal must find the trail already abandoned and weaken nothing.
 			// - Each relay carries a valid origin-signed rumor.
@@ -1241,7 +1240,7 @@ tb_scenario! {
 				send_gossip_frame_as(&trace, &certs, &gateway, frame, GOSSIP_RELAY_STATUS).await?;
 			}
 
-			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], gateway.peer_routes().len() as u64)?;
+			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], gateway.peer_routes()?.len() as u64)?;
 
 			let honest = mint_origin_rumor(
 				&certs.key,
@@ -1259,7 +1258,7 @@ tb_scenario! {
 	}
 }
 
-/// Grey-hole [`GossipJournal`].
+/// A grey-hole [`GossipJournal`].
 ///
 /// Every rumor is recorded as new and retained nowhere.
 ///
@@ -1391,9 +1390,8 @@ tb_scenario! {
 			.await?;
 			send_gossip_frame(&trace, &certs, &gateway_a, frame).await?;
 
-			// Honest convergence first.
-			// A holds its own publish and C is repaired over the beat.
-			// B never converges by design.
+			// Honest convergence comes first: A holds its own publish, and C
+			// is repaired over the beat. B never converges by design.
 			let converged =
 				wait_for_gossip_converged(&[journal_a, journal_c], 1, 50, Duration::from_millis(100)).await;
 			trace.event_with(GOSSIP_CONVERGED, &[], u64::from(converged))?;
@@ -1464,7 +1462,7 @@ tb_scenario! {
 	}
 }
 
-/// Fixture for colony-membership refusals.
+/// The fixture for colony-membership refusals.
 ///
 /// The gateway belongs to colony "main".
 ///
@@ -1479,7 +1477,7 @@ struct ForeignColonyCtx {
 	peer_trust: Arc<dyn CertificateTrust>,
 }
 
-/// Fresh gateway identity in colony "other".
+/// A fresh gateway identity in colony "other".
 ///
 /// A random key keeps its subject key id distinct from every "main"-colony
 /// identity.
@@ -1575,7 +1573,7 @@ tb_scenario! {
 			relay_application_rumor(&trace, &ctx.gateway, &cluster, &ctx.stranger_key, &ctx.stranger_key, "stranger")
 				.await?;
 
-			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], cluster.peer_routes().len() as u64)?;
+			trace.event_with(GOSSIP_ROUTES_AFTER_SCORING, &[], cluster.peer_routes()?.len() as u64)?;
 
 			cluster.stop();
 			Ok(())
@@ -1583,10 +1581,10 @@ tb_scenario! {
 	}
 }
 
-/// Fixture for origin-budget keying.
+/// The fixture for origin-budget keying.
 ///
-/// One origin identity and two relay identities, all members of the
-/// gateway's colony.
+/// It holds one origin identity and two relay identities, all members of
+/// the gateway's colony.
 ///
 /// - Every identity uses a random key so no two share a subject key id
 ///   (see [`gossip_plane_ctx`]).
@@ -1775,9 +1773,10 @@ tb_scenario! {
 	}
 }
 
-/// Fixture for the ingress-None delivery policy.
-/// The scenario needs the journal handle to observe retention and the
-/// retry set from outside.
+/// The fixture for the ingress-None delivery policy.
+///
+/// The scenario needs the journal handle to observe retention and the retry
+/// set from outside.
 struct IngressNoneCtx {
 	certs: ClusterTestCerts,
 	journal: Arc<MemoryGossipJournal>,
@@ -1945,9 +1944,9 @@ tb_assert_spec! {
 // Sources:
 //
 // - Heilman, Kendler, Zohar & Goldberg (2015), eclipse attacks on
-//   Bitcoin's peer-to-peer network:
-//   [USENIX Security '15](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
-//   [ePrint 2015/263](https://eprint.iacr.org/2015/263)
+//   Bitcoin's peer-to-peer network, USENIX Security '15
+//   (https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman),
+//   and ePrint 2015/263 (https://eprint.iacr.org/2015/263)
 // - CWE-770, allocation of resources without limits or throttling:
 //   <https://cwe.mitre.org/data/definitions/770.html>
 tb_scenario! {
@@ -1978,11 +1977,10 @@ tb_scenario! {
 	}
 }
 
-/// Fixture for the feeler-probe colony gate.
+/// The fixture for the feeler-probe colony gate.
 ///
-/// A gateway from colony "other" is TLS-trusted by the prober.
-///
-/// - Only the colony gate can tell it apart from a member of colony "main".
+/// The prober TLS-trusts a gateway from colony "other", so only the colony
+/// gate can tell it apart from a member of colony "main".
 struct ForeignGatewayCtx {
 	local: ClusterTestCerts,
 	foreign: ClusterTestCerts,
@@ -1996,7 +1994,8 @@ fn foreign_gateway_ctx() -> ForeignGatewayCtx {
 	ForeignGatewayCtx { local, foreign, shared_trust }
 }
 
-/// Running gateway from colony "other", TLS-anchored both ways.
+/// A running gateway from colony "other", TLS-anchored both ways.
+///
 /// A probe against it completes the handshake and fails only the gate.
 fn foreign_gateway_conf(ctx: &ForeignGatewayCtx) -> ClusterConfig {
 	let tls = cluster_tls_config_with_trust(&ctx.foreign, None)
@@ -2005,7 +2004,7 @@ fn foreign_gateway_conf(ctx: &ForeignGatewayCtx) -> ClusterConfig {
 	ClusterConfig::new(tls)
 }
 
-/// Prober with no anchors and a fast beat.
+/// A prober with no anchors and a fast beat.
 ///
 /// Discovery runs on feeler probes alone.
 ///
@@ -2019,17 +2018,17 @@ fn fast_probing_conf(certs: &ClusterTestCerts, peer_trust: Arc<dyn CertificateTr
 		.build()
 }
 
-/// Prober whose trust anchors both colony identities of
-/// [`ForeignGatewayCtx`]. Only the colony gate separates them.
+/// A prober whose trust anchors both colony identities of
+/// [`ForeignGatewayCtx`], so only the colony gate separates them.
 fn probing_cluster_conf(ctx: &ForeignGatewayCtx) -> ClusterConfig {
 	fast_probing_conf(&ctx.local, Arc::clone(&ctx.shared_trust))
 }
 
-/// Poll until the discovery table holds no new-bucket candidates or
-/// attempts exhaust.
+/// Polls until the discovery table holds no new-bucket candidates, or the
+/// attempts run out.
 ///
-/// Feeler probes run on the advertise beat's cadence.
-/// Their outcome is therefore only observable by polling.
+/// Feeler probes run on the advertise beat's cadence, so only a poll can
+/// observe their outcome.
 async fn wait_for_new_candidates_drained(table: &PeerTable, attempts: u32, interval: Duration) -> bool {
 	let drained = || table.learned().is_ok_and(|(new_count, _)| new_count == 0);
 	poll_until(attempts, interval, drained).await
@@ -2101,7 +2100,7 @@ tb_scenario! {
 	}
 }
 
-/// Parse a fixture dial address, which the peer table takes parsed.
+/// Parses a fixture dial address, which the peer table takes parsed.
 fn peer_addr(text: impl AsRef<str>) -> PeerAddress {
 	text.as_ref().parse().expect("fixture address parses as a socket")
 }
@@ -2117,16 +2116,16 @@ async fn wait_for_promoted(table: &PeerTable, count: usize, attempts: u32, inter
 	poll_until(attempts, interval, promoted).await
 }
 
-/// Poll until `addr` leaves the beat targets or attempts exhaust.
+/// Polls until `addr` leaves the beat targets, or the attempts run out.
 ///
-/// Eviction runs on the advertise beat's cadence, so the outcome is only
-/// observable by polling.
+/// Eviction runs on the advertise beat's cadence, so only a poll can observe
+/// the outcome.
 async fn wait_for_target_dropped(table: &PeerTable, addr: PeerAddress, attempts: u32, interval: Duration) -> bool {
 	let dropped = || table.target_set().is_ok_and(|targets| !targets.contains(&addr));
 	poll_until(attempts, interval, dropped).await
 }
 
-/// Same-colony gateway that answers every frame with an oversized
+/// A same-colony gateway that answers every frame with an oversized
 /// peer-exchange sample.
 ///
 /// The TLS identity is honest, so the prober's colony gate passes.
@@ -2261,7 +2260,7 @@ tb_scenario! {
 	}
 }
 
-/// [`GossipJournal`] that serves normally until switched faulty, then fails
+/// A [`GossipJournal`] that serves normally until switched faulty, then fails
 /// [`GossipJournal::held_digests`] and [`GossipJournal::fetch`].
 ///
 /// The switch models a storage fault appearing on a live gateway whose

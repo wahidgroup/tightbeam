@@ -1,8 +1,13 @@
-//! Protocol messages for cluster-hive communication.
+//! The protocol messages of the colony control and work planes.
 //!
-//! This module defines every message type in the protocol between the
-//! cluster and the hive.
+//! - [`ClusterRequest`] is the envelope of every frame sent to a cluster
+//!   gateway: hive registration, scaling updates, client work, peer
+//!   advertisements, and gossip.
+//! - [`ClusterCommand`] carries a heartbeat or a management request from a
+//!   cluster to a hive, and [`ClusterCommandResponse`] answers it.
+//! - [`ReplyShape`] decides the alternative and the priority of a command's reply.
 
+use super::{reply_frame, reply_frame_with_priority};
 use crate::asn1::Frame;
 use crate::constants::DEFAULT_HOP_BUDGET;
 use crate::der::{Choice, Enumerated, Sequence};
@@ -11,18 +16,18 @@ use crate::utils::time::UnixMillis;
 use crate::utils::urn::Urn;
 use crate::utils::{decode, encode, BasisPoints};
 use crate::wire::wire_sequence;
-use crate::{Beamable, Errorizable, TightBeamError};
+use crate::{Beamable, Errorizable, MessagePriority, TightBeamError};
 
-/// Work request envelope for cluster routing.
+/// The work request envelope for cluster routing.
 ///
 /// Clients send this to the cluster gateway. The gateway selects a local
 /// servlet or peer gateway by `servlet_type`, then delivers the client
 /// frame in `payload` to the servlet byte-for-byte.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ClusterWorkRequest {
-	/// Target servlet type URN (e.g., `urn:tightbeam::servlet:ping`).
+	/// The target servlet type URN, such as `urn:tightbeam::servlet:ping`.
 	pub servlet_type: Urn<'static>,
-	/// DER bytes of the client's complete end-to-end [`Frame`].
+	/// The DER bytes of the client's complete end-to-end [`Frame`].
 	///
 	/// The frame's `message` is the servlet's typed input. Gateways
 	/// forward these bytes unmodified, so the client's signature,
@@ -32,12 +37,12 @@ pub struct ClusterWorkRequest {
 	/// The relay budget, counting how many gateway forwards this work
 	/// may still spend.
 	///
-	/// - A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel ([`ClusterWorkRequest::new`]),
-	///   which defers the budget to gateway policy.
-	/// - Each gateway clamps the inbound value to its own `max_hops`, so one clamp rule covers the
-	///   origin sentinel and a relayed value.
-	/// - A gateway that selects a peer route re-emits with the clamped budget decremented
-	///   ([`ClusterWorkRequest::into_relayed`]).
+	/// - A client origin stamps the [`DEFAULT_HOP_BUDGET`] sentinel through
+	///   [`ClusterWorkRequest::new`], so gateway policy decides the budget.
+	/// - Each gateway clamps the inbound value to its own `max_hops`, so one
+	///   clamp rule covers the origin sentinel and a relayed value.
+	/// - A gateway that selects a peer route re-emits with the clamped budget
+	///   decremented ([`ClusterWorkRequest::into_relayed`]).
 	pub hops_remaining: u8,
 }
 
@@ -55,7 +60,7 @@ impl ClusterWorkRequest {
 		Ok(Self { servlet_type, payload: encode(frame)?, hops_remaining: DEFAULT_HOP_BUDGET })
 	}
 
-	/// Re-emit toward a peer with the remaining relay budget. A `0`
+	/// Re-emits the work toward a peer with the remaining relay budget. A `0`
 	/// budget is the terminal hop, so the receiver serves locally only.
 	#[must_use]
 	pub fn into_relayed(mut self, hops_remaining: u8) -> Self {
@@ -63,9 +68,9 @@ impl ClusterWorkRequest {
 		self
 	}
 
-	/// Wrap `work` in the hop-local transport frame the gateway expects.
+	/// Wraps `work` in the hop-local transport frame the gateway expects.
 	///
-	/// The wrapper is routing plumbing only. It reuses the work frame's id
+	/// The wrapper serves routing only. It reuses the work frame's id
 	/// for correlation and carries the encoded [`ClusterRequest::Work`]
 	/// envelope as its message, so the client's own frame travels inside
 	/// unmodified.
@@ -82,13 +87,13 @@ impl ClusterWorkRequest {
 	}
 }
 
-/// Work response from the cluster.
+/// The work response from the cluster.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ClusterWorkResponse {
-	/// Status of the routing and execution.
+	/// The status of the routing and the execution.
 	pub status: TransitStatus,
-	/// DER bytes of the servlet's complete response [`Frame`] on
-	/// success, absent on refusal.
+	/// The DER bytes of the servlet's complete response [`Frame`] on
+	/// success, and [`None`] on a refusal.
 	///
 	/// Gateways return the servlet's reply frame unmodified, so its signature
 	/// and metadata stay verifiable at the client ([`Frame::verify`]).
@@ -101,7 +106,7 @@ pub struct ClusterWorkResponse {
 wire_sequence!(ClusterWorkResponse { status: plain, payload: octets_opt });
 
 impl ClusterWorkResponse {
-	/// Create a successful response carrying the servlet's encoded
+	/// Creates a successful response that carries the servlet's encoded
 	/// response frame.
 	///
 	/// `payload` accepts any value convertible into [`Vec<u8>`].
@@ -110,16 +115,16 @@ impl ClusterWorkResponse {
 		Self { status: TransitStatus::Ok, payload: Some(payload.into()) }
 	}
 
-	/// Create an error response with the given status.
+	/// Creates an error response with `status`.
 	#[inline]
 	pub fn err(status: TransitStatus) -> Self {
 		Self { status, payload: None }
 	}
 
-	/// Decode the servlet's complete response frame from the payload.
+	/// Decodes the servlet's complete response frame from the payload.
 	///
-	/// Refusals carry no payload and yield `None`. Callers that treat a
-	/// refusal as an error use [`ClusterWorkResponse::served`] instead.
+	/// A refusal carries no payload and yields [`None`]. A caller that treats
+	/// a refusal as an error uses [`ClusterWorkResponse::served`] instead.
 	pub fn into_frame(self) -> Result<Option<Frame>, TightBeamError> {
 		match self.payload {
 			Some(payload) => Ok(Some(decode(&payload)?)),
@@ -127,13 +132,17 @@ impl ClusterWorkResponse {
 		}
 	}
 
-	/// Resolve the response into the servlet's frame or a typed error.
+	/// Resolves the response into the servlet's frame or a typed error.
 	///
 	/// The unary work plane is request-reply, so a served request always
-	/// carries the servlet's complete response frame. A non-`Ok` status
-	/// is a refusal and maps to [`TightBeamError::WorkRefused`]. An `Ok`
-	/// status without a payload violates the plane contract and maps to
-	/// [`TightBeamError::MissingResponse`].
+	/// carries the servlet's complete response frame.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::WorkRefused`] -- the status is not `Ok`, so the work was refused.
+	/// - [`TightBeamError::MissingResponse`] -- the status is `Ok` with no
+	///   payload, which violates the plane contract.
+	/// - [`TightBeamError::SerializationError`] -- the payload does not decode as a frame.
 	pub fn served(self) -> Result<Frame, TightBeamError> {
 		if self.status != TransitStatus::Ok {
 			return Err(TightBeamError::WorkRefused(self.status));
@@ -142,7 +151,7 @@ impl ClusterWorkResponse {
 		self.into_frame()?.ok_or(TightBeamError::MissingResponse)
 	}
 
-	/// Unwrap a gateway reply down to the servlet's response frame.
+	/// Unwraps a gateway reply down to the servlet's response frame.
 	///
 	/// The inverse of [`ClusterWorkRequest::transport_frame`]: the reply is
 	/// the hop-local wrapper, and the servlet's own frame travels inside it.
@@ -151,7 +160,7 @@ impl ClusterWorkResponse {
 	///
 	/// - [`TightBeamError::MissingResponse`] -- the gateway answered with
 	///   no frame at all.
-	/// - Whatever [`Self::served`] reports for the decoded response.
+	/// - Any error that [`Self::served`] reports for the decoded response.
 	pub(crate) fn served_reply(reply: Option<Frame>) -> Result<Frame, TightBeamError> {
 		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
 		let response: Self = decode(reply.message())?;
@@ -160,83 +169,84 @@ impl ClusterWorkResponse {
 	}
 }
 
-/// Inbound message envelope for the cluster gateway - ASN.1 CHOICE.
+/// The inbound message envelope for the cluster gateway, an ASN.1 CHOICE.
 ///
 /// Every frame sent to a cluster carries exactly one of these variants.
-/// The context-specific tag discriminates the type on the wire, so the
+/// The context-specific tag discriminates the type in the encoding, so the
 /// gateway decodes once and matches.
 #[derive(Debug, Beamable, Choice, Clone, PartialEq)]
 pub enum ClusterRequest {
-	/// Hive announcing its servlets [context 0]
+	/// A hive's announcement of its servlets [context 0].
 	#[asn1(context_specific = "0", constructed = "true")]
 	RegisterHive(RegisterHiveRequest),
-	/// Hive scaling notification [context 1]
+	/// A hive's scaling notification [context 1].
 	#[asn1(context_specific = "1", constructed = "true")]
 	ServletAddressUpdate(ServletAddressUpdate),
-	/// Client work submission [context 2]
+	/// A client's work submission [context 2].
 	#[asn1(context_specific = "2", constructed = "true")]
 	Work(ClusterWorkRequest),
-	/// Peer gateway advertising exported servlet types [context 3]
+	/// A peer gateway's advertisement of its exported servlet types
+	/// [context 3].
 	#[asn1(context_specific = "3", constructed = "true")]
 	AdvertisePeer(PeerAdvertisement),
-	/// Relayed origin-signed rumor frame from a peer gateway [context 4]
+	/// A relayed, origin-signed rumor frame from a peer gateway [context 4].
 	///
-	/// Boxed because a nested [`Frame`] is far larger than the other
-	/// variants. The wire encoding is unchanged.
+	/// The frame is boxed because a nested [`Frame`] is far larger than the
+	/// other variants. The box leaves the DER encoding as it is.
 	#[asn1(context_specific = "4", constructed = "true")]
 	Gossip(Box<Frame>),
-	/// Origin gossip rumor from a local publisher [context 5]
+	/// An origin gossip rumor from a local publisher [context 5].
 	#[asn1(context_specific = "5", constructed = "true")]
 	PublishGossip(GossipRumor),
-	/// Anti-entropy digest summary from a peer gateway [context 6]
+	/// An anti-entropy digest summary from a peer gateway [context 6].
 	#[asn1(context_specific = "6", constructed = "true")]
 	ReconcileGossip(GossipReconciliation),
 }
 
-/// Message type for registering a hive with a cluster.
+/// The request that registers a hive with a cluster.
 ///
-/// This message is sent from a hive to a cluster controller to announce
-/// its availability and capabilities, including actual servlet addresses.
+/// A hive sends it to a cluster controller to announce its availability and
+/// its servlets, with the address of each one.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct RegisterHiveRequest {
-	/// The address where this hive can be reached (for heartbeats)
+	/// The address that the cluster reaches this hive on for heartbeats.
 	pub hive_addr: Vec<u8>,
-	/// Servlet type-to-address mappings for direct routing
+	/// The hive's servlet instances and their addresses, for direct routing.
 	pub servlet_addresses: Vec<ServletInfo>,
-	/// Optional metadata about the hive
+	/// Opaque metadata about the hive, when the hive sends any.
 	pub metadata: Option<Vec<u8>>,
 }
 
 wire_sequence!(RegisterHiveRequest { hive_addr: octets, servlet_addresses: plain, metadata: octets_opt });
 
-/// Response message for hive registration
+/// The response to a hive registration.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct RegisterHiveResponse {
-	/// The status of the registration request
+	/// The status of the registration request.
 	pub status: TransitStatus,
-	/// Cluster-assigned hive identity URN (e.g.,
-	/// `urn:tightbeam::hive:10.0.0.5:9000`)
+	/// The hive identity URN that the cluster assigned, such as
+	/// `urn:tightbeam::hive:10.0.0.5:9000`.
 	pub hive_id: Option<Urn<'static>>,
 }
 
-/// Notification from hive to cluster about servlet address changes
+/// A hive's notice to the cluster that its servlet addresses changed.
 ///
-/// Sent by hives when auto-scaling spawns or stops servlet instances.
-/// Enables push-based cluster registry updates.
+/// A hive sends it when auto-scaling spawns or stops a servlet instance, so
+/// the cluster registry updates by push.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ServletAddressUpdate {
-	/// Hive identity URN (matches the identity assigned at registration)
+	/// The hive identity URN, which matches the one assigned at registration.
 	pub hive_id: Urn<'static>,
-	/// Newly spawned servlet addresses
+	/// The newly spawned servlet instances and their addresses.
 	pub added: Vec<ServletInfo>,
-	/// Removed servlet instance URNs. Instance identities travel in
-	/// both directions of an update, matching `added`.
+	/// The instance URNs of the removed servlets. An update names instances
+	/// in both directions, matching `added`.
 	pub removed: Vec<Urn<'static>>,
 }
 
 /// One servlet instance entering or leaving a hive's slate.
 ///
-/// The wire update carries an instance under `added` and a bare URN under
+/// The encoded update carries an instance under `added` and a bare URN under
 /// `removed`, so the direction picks which field the instance lands in.
 /// Naming the direction as a variant keeps that choice with the value it
 /// applies to.
@@ -248,7 +258,7 @@ pub(crate) enum ServletChange {
 }
 
 impl ServletChange {
-	/// Wire update announcing this change on behalf of `hive_id`.
+	/// The address update that announces this change on behalf of `hive_id`.
 	pub(crate) fn into_update(self, hive_id: Urn<'static>) -> ServletAddressUpdate {
 		match self {
 			Self::Added(servlet) => ServletAddressUpdate { hive_id, added: vec![servlet], removed: vec![] },
@@ -257,33 +267,33 @@ impl ServletChange {
 	}
 }
 
-/// Response to servlet address update notification
+/// The response to a servlet address update.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ServletAddressUpdateResponse {
-	/// Status of the update (Ok = success)
+	/// The status of the update, where `Ok` means the update applied.
 	pub status: TransitStatus,
 }
 
 /// A peer gateway advertising the servlet types its colony exports.
 ///
-/// Sent gateway-to-gateway so a receiving colony can learn which types a
-/// peer serves and forward work there. It carries only type URNs, never
-/// instance addresses. The peer is reached at `gateway_addr`, which
-/// resolves the whole peer colony rather than a single servlet.
+/// A gateway sends it to a peer gateway, so the receiving colony learns
+/// which types the peer serves and forwards work there. It carries type URNs
+/// only, and no instance addresses. The peer is reached at `gateway_addr`,
+/// which resolves the whole peer colony rather than a single servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerAdvertisement {
-	/// Address peers dial to reach the advertising gateway
+	/// The address that peers dial to reach the advertising gateway.
 	pub gateway_addr: Vec<u8>,
-	/// Servlet type URNs the advertising colony exports
+	/// The servlet type URNs that the advertising colony exports.
 	pub advertised_types: Vec<Urn<'static>>,
 }
 
 wire_sequence!(PeerAdvertisement { gateway_addr: octets, advertised_types: plain });
 
-/// Response to a peer advertisement
+/// The response to a peer advertisement.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct PeerAdvertisementResponse {
-	/// Status of the advertisement (Ok = installed)
+	/// The status of the advertisement. `Ok` means the routes installed.
 	pub status: TransitStatus,
 }
 
@@ -309,40 +319,42 @@ pub enum GossipRumorKind {
 /// This one structure serves both gossip roles:
 ///
 /// - A publisher sends it as [`ClusterRequest::PublishGossip`] to request a flood.
-/// - The accepting origin gateway embeds the identical DER bytes as the `message` of a rumor
-///   [`Frame`] it signs with its cluster key, so the payload is bound under the origin signature at
-///   every later hop (see §5.7.5: the signature covers version, metadata, and message).
+/// - The accepting origin gateway embeds the identical DER bytes as the
+///   `message` of a rumor [`Frame`] it signs with its cluster key, so the
+///   payload is bound under the origin signature at every later hop. The
+///   signature covers the version, the metadata, and the message (§5.7.5).
 ///
 /// # Scope
 ///
-/// The rumor names no destination. Flood scope is colony membership, carried in
-/// the origin certificate's colony URN SAN and never in rumor bytes, because
-/// unsigned scope bytes would be weaker than the certificate binding (CWE-345).
+/// Flood scope is colony membership, which the origin certificate's colony
+/// URN SAN carries. The rumor names no destination and its bytes carry no
+/// scope, because unsigned scope bytes would be weaker than the certificate
+/// binding (CWE-345).
 ///
-/// Local delivery is receiving-gateway policy, the optional gossip ingress
-/// servlet type.
+/// Local delivery follows the receiving gateway's policy, which is the
+/// optional gossip ingress servlet type.
 ///
 /// # Frame fields
 ///
-/// - The rumor frame's `metadata.id` is the rumor identity, and its `metadata.order` is the issue
-///   time in unix milliseconds (§5.7.1 permits a time-based order). Both are copied from the
-///   publish frame.
-/// - Hop state such as the remaining flood radius MUST stay outside the rumor frame. It travels in
-///   the `metadata.lifetime` of the outer relay frame, which each relay rebuilds and re-signs.
+/// - The rumor frame's `metadata.id` is the rumor identity, and its
+///   `metadata.order` is the issue time in unix milliseconds (§5.7.1 permits
+///   a time-based order). Both are copied from the publish frame.
+/// - Hop state such as the remaining flood radius MUST stay outside the rumor
+///   frame. It travels in the `metadata.lifetime` of the outer relay frame,
+///   which each relay rebuilds and re-signs.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipRumor {
 	/// Opaque application payload delivered through the ingress policy.
 	pub payload: Vec<u8>,
 	/// How the receiving gateway consumes `payload`. The common
-	/// application kind is the DER DEFAULT, so it is omitted on the
-	/// wire.
+	/// application kind is the DER DEFAULT, so the encoding omits it.
 	pub kind: GossipRumorKind,
 }
 
 wire_sequence!(GossipRumor { payload: octets, kind: default(GossipRumorKind::Application) });
 
 impl GossipRumor {
-	/// Application rumor delivered through the ingress policy.
+	/// An application rumor, delivered through the ingress policy.
 	///
 	/// `payload` accepts any value convertible into [`Vec<u8>`].
 	#[must_use]
@@ -350,7 +362,7 @@ impl GossipRumor {
 		Self { payload: payload.into(), kind: GossipRumorKind::Application }
 	}
 
-	/// Advertisement rumor carrying an origin-signed ad frame's DER
+	/// An advertisement rumor that carries an origin-signed ad frame's DER
 	/// bytes for transitive peer discovery.
 	///
 	/// `ad_frame` accepts any value convertible into [`Vec<u8>`].
@@ -360,18 +372,19 @@ impl GossipRumor {
 	}
 }
 
-/// Response to a gossip rumor
+/// The response to a gossip rumor.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct GossipResponse {
-	/// Status of the rumor (Ok = accepted, delivered, and considered for
-	/// reflood)
+	/// The status of the rumor, where `Ok` means the rumor was accepted,
+	/// delivered, and considered for a reflood.
 	pub status: TransitStatus,
 }
 
-/// Summary of rumors a gateway retains, sent so a peer can pull missing ones.
+/// A summary of the rumors a gateway retains, sent so a peer can pull the
+/// missing ones.
 ///
-/// This is the anti-entropy backstop to best-effort flooding. Reconciliation is
-/// a set difference over content digests. There is no cursor or ordering. A
+/// This is the anti-entropy backstop to best-effort flooding. Reconciliation
+/// is an unordered set difference over content digests, with no cursor. A
 /// receiver refuses a wrong-length entry rather than treating it as a digest
 /// (CWE-20).
 #[derive(Debug, Beamable, Clone, PartialEq)]
@@ -388,80 +401,82 @@ wire_sequence!(GossipReconciliation { held: octets_seq });
 /// unverified hint to its receiver:
 ///
 /// - Admission is bounded per address prefix.
-/// - Only a probe dial whose handshake certificate proves the local colony makes the peer a dial
-///   target.
-/// - The fingerprint is advisory identity for deduplication, and trust never derives from exchanged
-///   bytes (CWE-345).
+/// - Only a probe dial whose handshake certificate proves the local colony
+///   makes the peer a dial target.
+/// - The fingerprint is advisory identity for deduplication, and trust never
+///   derives from exchanged bytes (CWE-345).
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct PeerGossip {
-	/// Certificate fingerprint the sharer verified the peer under.
+	/// The certificate fingerprint that the sharer verified the peer under.
 	pub peer_id: Vec<u8>,
-	/// Address the peer gateway was dialed at.
+	/// The address that the sharer dialed the peer gateway at.
 	pub gateway_addr: Vec<u8>,
 }
 
 wire_sequence!(PeerGossip { peer_id: octets, gateway_addr: octets });
 
-/// Reply to a [`GossipReconciliation`] naming the digests the peer lacks
-/// and wants as `Gossip` rumors.
+/// The reply to a [`GossipReconciliation`], which names the digests the
+/// peer lacks and wants as [`ClusterRequest::Gossip`] rumors.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct GossipWant {
-	/// Content digests the replier lacks and is requesting.
+	/// The content digests that the replier lacks and requests.
 	pub want: Vec<Vec<u8>>,
-	/// Peer-exchange sample of verified peers the replier shares so a
-	/// seed-bootstrapped requester can discover the colony graph.
-	/// Capped at `MAX_PEX_SAMPLE` in both directions.
+	/// A peer-exchange sample of verified peers, which the replier shares so
+	/// a seed-bootstrapped requester can discover the colony graph. It holds
+	/// at most [`MAX_PEX_SAMPLE`] peers in both directions.
+	///
+	/// [`MAX_PEX_SAMPLE`]: crate::constants::MAX_PEX_SAMPLE
 	pub pex: Vec<PeerGossip>,
 }
 
 wire_sequence!(GossipWant { want: octets_seq, pex: plain });
 
-/// Message type for activating a servlet on a hive.
+/// The request that activates a servlet on a hive.
 ///
-/// This message is sent from a cluster controller to a hive to instruct
-/// it to morph into a specific servlet configuration.
+/// A cluster controller sends it to instruct a hive to take on a specific
+/// servlet configuration.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ActivateServletRequest {
-	/// Instance URN of the servlet to activate
+	/// The instance URN of the servlet to activate.
 	pub servlet_id: Urn<'static>,
-	/// Optional configuration data for the servlet
+	/// The servlet's configuration data, when the request carries any.
 	pub config: Option<Vec<u8>>,
 }
 
 wire_sequence!(ActivateServletRequest { servlet_id: plain, config: octets_opt });
 
-/// Response message for servlet activation
+/// The response to a servlet activation.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ActivateServletResponse {
-	/// The status of the activation request
+	/// The status of the activation request.
 	pub status: TransitStatus,
-	/// The address of the activated servlet (if successful)
+	/// The address of the activated servlet, on success.
 	pub servlet_address: Option<Vec<u8>>,
 }
 
 wire_sequence!(ActivateServletResponse { status: plain, servlet_address: octets_opt });
 
 impl ActivateServletResponse {
-	/// Create a successful activation response
+	/// Creates a successful activation response.
 	#[inline]
 	pub fn ok(address: impl Into<Vec<u8>>) -> Self {
 		let address: Vec<u8> = address.into();
 		Self { status: TransitStatus::Ok, servlet_address: Some(address) }
 	}
 
-	/// Create a failed activation response
+	/// Creates a failed activation response.
 	#[inline]
 	pub fn err(status: TransitStatus) -> Self {
 		Self { status, servlet_address: None }
 	}
 }
 
-/// Servlet information entry.
+/// One servlet instance and the address that reaches it.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ServletInfo {
-	/// Servlet instance URN (type URN with a `/{addr}` tail)
+	/// The servlet instance URN, which is the type URN with a `/{addr}` tail.
 	pub servlet_id: Urn<'static>,
-	/// The servlet's address
+	/// The address that reaches the servlet.
 	pub address: Vec<u8>,
 }
 
@@ -470,7 +485,7 @@ wire_sequence!(ServletInfo { servlet_id: plain, address: octets });
 /// Why a CHOICE-shaped product named no single alternative.
 ///
 /// DER CHOICE admits exactly one alternative. These products spell a choice
-/// as tagged optional fields, so the wire can carry none or several, and a
+/// as tagged optional fields, so the encoding can carry none or several, and a
 /// reader refuses both rather than guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Errorizable)]
 pub enum ChoiceRefusal {
@@ -496,11 +511,11 @@ pub enum HiveManagement {
 /// The single result a [`HiveManagementResponse`] names.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HiveManagementOutcome {
-	/// Result of a spawn.
+	/// The result of a spawn.
 	Spawn(SpawnServletResult),
-	/// Result of a list.
+	/// The result of a list.
 	List(ListServletsResult),
-	/// Result of a stop.
+	/// The result of a stop.
 	Stop(StopServletResult),
 }
 
@@ -513,18 +528,44 @@ pub enum ClusterCommandKind {
 	Manage(HiveManagement),
 }
 
+/// The management alternative a manage command is answered in.
+///
+/// The cluster decodes a management response in the alternative it asked
+/// in, so a refusal to a spawn answers in the spawn alternative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManageShape {
+	/// Answer in the spawn alternative.
+	Spawn,
+	/// Answer in the list alternative.
+	List,
+	/// Answer in the stop alternative.
+	Stop,
+}
+
 /// The reply shape a cluster command is answered in.
 ///
 /// A sender decodes the response in the shape it asked in, so a refusal
-/// answered in the other one reads as a malformed response and counts
-/// toward eviction. The shape is a property of the command body, so it
-/// lives here rather than being re-derived per refusal site.
+/// answered in another one reads as a malformed response and counts toward
+/// eviction. The shape is a property of the command body, so it lives here
+/// rather than being re-derived per refusal site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyShape {
 	/// Answer in the heartbeat alternative.
 	Heartbeat,
-	/// Answer in the management alternative.
-	Manage,
+	/// Answer in the named management alternative.
+	Manage(ManageShape),
+}
+
+impl HiveManagement {
+	/// The management alternative a reply to this request must use.
+	#[must_use]
+	pub fn reply_shape(&self) -> ManageShape {
+		match self {
+			Self::Spawn(_) => ManageShape::Spawn,
+			Self::List(_) => ManageShape::List,
+			Self::Stop(_) => ManageShape::Stop,
+		}
+	}
 }
 
 impl ClusterCommandKind {
@@ -533,7 +574,7 @@ impl ClusterCommandKind {
 	pub fn reply_shape(&self) -> ReplyShape {
 		match self {
 			Self::Heartbeat(_) => ReplyShape::Heartbeat,
-			Self::Manage(_) => ReplyShape::Manage,
+			Self::Manage(manage) => ReplyShape::Manage(manage.reply_shape()),
 		}
 	}
 }
@@ -542,116 +583,154 @@ impl ReplyShape {
 	/// The shape a reply to `body` must use.
 	///
 	/// A body that named no single alternative has no shape of its own, so
-	/// it is answered in the management shape: that is the one a sender of
-	/// an unreadable command can still decode.
+	/// it is answered in the stop alternative. That alternative carries only
+	/// a status, which is the one thing a refusal of an unreadable command
+	/// can report.
 	#[must_use]
 	pub fn of(body: Option<&ClusterCommandKind>) -> Self {
-		body.map_or(Self::Manage, ClusterCommandKind::reply_shape)
+		body.map_or(Self::Manage(ManageShape::Stop), ClusterCommandKind::reply_shape)
+	}
+
+	/// Answers the frame `id` with `response` in this shape.
+	///
+	/// This is the one place that decides how a reply travels. A heartbeat
+	/// reply travels on a V2 frame at [`MessagePriority::NetworkControl`], so
+	/// a health check answered under load still leads the queue. A management
+	/// reply travels on a V0 frame at the default priority.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::BuildError`] -- the reply frame did not build.
+	pub fn reply(
+		self,
+		id: impl AsRef<[u8]>,
+		response: ClusterCommandResponse,
+	) -> Result<Option<Frame>, TightBeamError> {
+		match self {
+			Self::Heartbeat => reply_frame_with_priority(id, MessagePriority::NetworkControl, response),
+			Self::Manage(_) => reply_frame(id, response),
+		}
+	}
+
+	/// Refuses the frame `id` with `status` in this shape.
+	///
+	/// The refusal body is [`ClusterCommandResponse::refusal`] and the
+	/// frame is [`ReplyShape::reply`], so every refusal site shares one
+	/// body and one priority rule.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::BuildError`] -- the reply frame did not build.
+	pub fn refuse(self, id: impl AsRef<[u8]>, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
+		self.reply(id, ClusterCommandResponse::refusal(self, status))
 	}
 }
 
 /// The single answer a [`ClusterCommandResponse`] names.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClusterCommandOutcome {
-	/// Answer to a liveness probe.
+	/// The answer to a liveness probe.
 	Heartbeat(HeartbeatResult),
-	/// Answer to a management request.
+	/// The answer to a management request.
 	Manage(HiveManagementOutcome),
 }
 
-/// Hive management request message.
+/// The hive management request, a CHOICE spelled as tagged optional fields.
 ///
-/// Uses context-specific tags to distinguish between different request types.
-/// Only one field should be set per request.
+/// Context-specific tags tell the request types apart. Exactly one field is
+/// set per request, and [`HiveManagementRequest::into_choice`] refuses a
+/// request that sets none or several.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HiveManagementRequest {
-	/// Spawn a new servlet instance [context 0]
+	/// A request to spawn a new servlet instance [context 0].
 	#[asn1(context_specific = "0", optional = "true")]
 	pub spawn: Option<SpawnServletParams>,
-	/// List all active servlets [context 1]
+	/// A request to list all active servlets [context 1].
 	#[asn1(context_specific = "1", optional = "true")]
 	pub list: Option<ListServletsParams>,
-	/// Stop a specific servlet instance [context 2]
+	/// A request to stop a specific servlet instance [context 2].
 	#[asn1(context_specific = "2", optional = "true")]
 	pub stop: Option<StopServletParams>,
 }
 
-/// Parameters for spawning a new servlet
+/// The parameters for spawning a new servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct SpawnServletParams {
-	/// Type URN of the servlet to spawn (e.g., `urn:tightbeam::servlet:worker`)
+	/// The type URN of the servlet to spawn, such as
+	/// `urn:tightbeam::servlet:worker`.
 	pub servlet_type: Urn<'static>,
-	/// Optional configuration data for the servlet
+	/// The servlet's configuration data, when the request carries any.
 	pub config: Option<Vec<u8>>,
 }
 
 wire_sequence!(SpawnServletParams { servlet_type: plain, config: octets_opt });
 
-/// Parameters for listing servlets
+/// The parameters for listing servlets.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct ListServletsParams {
-	/// Optional filter (reserved for future use)
+	/// A filter that is reserved for future use.
 	pub filter: Option<Vec<u8>>,
 }
 
 wire_sequence!(ListServletsParams { filter: octets_opt });
 
-/// Parameters for stopping a servlet
+/// The parameters for stopping a servlet.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct StopServletParams {
-	/// Instance URN of the servlet to stop
+	/// The instance URN of the servlet to stop.
 	pub servlet_id: Urn<'static>,
 }
 
-/// Hive management response message
+/// The hive management response, a CHOICE spelled as tagged optional fields.
 ///
-/// Uses context-specific tags to distinguish between different response types.
-/// Only one field should be set per response.
+/// Context-specific tags tell the response types apart. Exactly one field is
+/// set per response, and [`HiveManagementResponse::into_choice`] refuses a
+/// response that sets none or several.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HiveManagementResponse {
-	/// Response to spawn request [context 0]
+	/// The answer to a spawn request [context 0].
 	#[asn1(context_specific = "0", optional = "true")]
 	pub spawn: Option<SpawnServletResult>,
-	/// Response to list request [context 1]
+	/// The answer to a list request [context 1].
 	#[asn1(context_specific = "1", optional = "true")]
 	pub list: Option<ListServletsResult>,
-	/// Response to stop request [context 2]
+	/// The answer to a stop request [context 2].
 	#[asn1(context_specific = "2", optional = "true")]
 	pub stop: Option<StopServletResult>,
 }
 
-/// Result of spawning a servlet
+/// The result of spawning a servlet.
 #[derive(Debug, Beamable, Clone, PartialEq)]
 pub struct SpawnServletResult {
-	/// The status of the spawn request
+	/// The status of the spawn request.
 	pub status: TransitStatus,
-	/// The address of the newly spawned servlet (if successful)
+	/// The address of the newly spawned servlet, on success.
 	pub servlet_address: Option<Vec<u8>>,
-	/// Instance URN of the spawned servlet (e.g.,
-	/// `urn:tightbeam::servlet:worker/127.0.0.1:8080`)
+	/// The instance URN of the spawned servlet, such as
+	/// `urn:tightbeam::servlet:worker/127.0.0.1:8080`.
 	pub servlet_id: Option<Urn<'static>>,
 }
 
 wire_sequence!(SpawnServletResult { status: plain, servlet_address: octets_opt, servlet_id: plain });
 
-/// Result of listing servlets
+/// The result of listing servlets.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ListServletsResult {
-	/// The status of the request
+	/// The status of the request.
 	pub status: TransitStatus,
-	/// List of active servlets
+	/// The servlets that are active on the hive.
 	pub servlets: Vec<ServletInfo>,
 }
 
-/// Result of stopping a servlet
+/// The result of stopping a servlet.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct StopServletResult {
-	/// The status of the stop request
+	/// The status of the stop request.
 	pub status: TransitStatus,
 }
 
 impl HiveManagementResponse {
-	/// Create a spawn success response
+	/// Creates a spawn success response.
 	#[inline]
 	pub fn spawn_ok(address: impl Into<Vec<u8>>, servlet_id: Urn<'static>) -> Self {
 		let address: Vec<u8> = address.into();
@@ -666,17 +745,7 @@ impl HiveManagementResponse {
 		}
 	}
 
-	/// Create a spawn failure response
-	#[inline]
-	pub fn spawn_err(status: TransitStatus) -> Self {
-		Self {
-			spawn: Some(SpawnServletResult { status, servlet_address: None, servlet_id: None }),
-			list: None,
-			stop: None,
-		}
-	}
-
-	/// Create a list response
+	/// Creates a list response.
 	#[inline]
 	pub fn list_ok(servlets: impl IntoIterator<Item = ServletInfo>) -> Self {
 		let servlets: Vec<ServletInfo> = servlets.into_iter().collect();
@@ -687,7 +756,7 @@ impl HiveManagementResponse {
 		}
 	}
 
-	/// Create a stop success response
+	/// Creates a stop success response.
 	#[inline]
 	pub fn stop_ok() -> Self {
 		Self {
@@ -697,83 +766,101 @@ impl HiveManagementResponse {
 		}
 	}
 
-	/// Create a stop failure response
-	#[inline]
-	pub fn stop_err(status: TransitStatus) -> Self {
-		Self { spawn: None, list: None, stop: Some(StopServletResult { status }) }
+	/// Refuses a management request with `status` in the alternative that
+	/// `shape` names.
+	///
+	/// A spawn refusal names no address and no instance, and a list refusal
+	/// names no servlets, so the sender reads the status and nothing else.
+	#[must_use]
+	pub fn refusal(shape: ManageShape, status: TransitStatus) -> Self {
+		match shape {
+			ManageShape::Spawn => Self {
+				spawn: Some(SpawnServletResult { status, servlet_address: None, servlet_id: None }),
+				list: None,
+				stop: None,
+			},
+			ManageShape::List => Self {
+				spawn: None,
+				list: Some(ListServletsResult { status, servlets: Vec::new() }),
+				stop: None,
+			},
+			ManageShape::Stop => Self { spawn: None, list: None, stop: Some(StopServletResult { status }) },
+		}
 	}
 }
 
-/// Status reported by the cluster in a heartbeat.
+/// The status that a cluster reports in a heartbeat.
 ///
-/// Clusters report their current operational status to hives during heartbeat.
-/// Hives may use this to adjust their behavior (e.g., reduce capacity during
-/// draining).
+/// A cluster reports its operational status to its hives in each heartbeat.
+/// A hive may use it to adjust its behavior, such as reducing capacity while
+/// the cluster drains.
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ClusterStatus {
-	/// Normal operation
+	/// The cluster operates normally.
 	#[default]
 	Healthy = 0,
-	/// Partial degradation (some services unavailable)
+	/// The cluster is partly degraded, and some services are unavailable.
 	Degraded = 1,
-	/// Overloaded (high utilization)
+	/// The cluster is overloaded, with high utilization.
 	Overloaded = 2,
-	/// Draining (preparing for shutdown)
+	/// The cluster is draining in preparation for shutdown.
 	Draining = 3,
 }
 
-/// Cluster command message, an ASN.1 CHOICE.
+/// The cluster command message, a CHOICE spelled as tagged optional fields.
 ///
 /// It carries commands from the cluster to a hive. Context-specific tags
 /// discriminate the CHOICE, and exactly one field is set per message.
 ///
 /// # Security
 ///
-/// - A command requires a nonrepudiation signature and frame integrity. A frame without them is
-///   rejected and may trip the circuit breaker.
-/// - Freshness binds to `Frame.metadata.order` (unix milliseconds), so hives reject commands
-///   outside their freshness window and replays of already-seen signatures within it (CWE-294).
+/// - A command requires a nonrepudiation signature and frame integrity. A
+///   frame without them is refused as `Unauthenticated`. Only a signature
+///   that fails to verify counts toward the circuit breaker.
+/// - Freshness binds to `Frame.metadata.order` (unix milliseconds), so hives
+///   reject commands outside their freshness window and replays of
+///   already-seen signatures within it (CWE-294).
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 #[beam(frame_integrity)]
 pub struct ClusterCommand {
-	/// Heartbeat request [context 0]
+	/// A heartbeat request [context 0].
 	#[asn1(context_specific = "0", optional = "true")]
 	pub heartbeat: Option<HeartbeatParams>,
 
-	/// Hive management request [context 1]
+	/// A hive management request [context 1].
 	#[asn1(context_specific = "1", optional = "true")]
 	pub manage: Option<HiveManagementRequest>,
 }
 
-/// Heartbeat parameters.
+/// The parameters of a heartbeat.
 ///
 /// The payload is minimal because the certificate in the frame's
 /// nonrepudiation signature establishes identity.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HeartbeatParams {
-	/// Cluster's current operational status
+	/// The cluster's current operational status.
 	pub cluster_status: ClusterStatus,
 }
 
-/// Cluster command response - ASN.1 CHOICE
+/// The cluster command response, a CHOICE spelled as tagged optional fields.
 ///
-/// Responses from hive to cluster. Uses context-specific tags for
-/// CHOICE discrimination. Only one field should be set per response.
+/// A hive answers a cluster command with it. Context-specific tags
+/// discriminate the CHOICE, and exactly one field is set per response.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ClusterCommandResponse {
-	/// Heartbeat response [context 0]
+	/// The heartbeat answer [context 0].
 	#[asn1(context_specific = "0", optional = "true")]
 	pub heartbeat: Option<HeartbeatResult>,
 
-	/// Management response [context 1]
+	/// The management answer [context 1].
 	#[asn1(context_specific = "1", optional = "true")]
 	pub manage: Option<HiveManagementResponse>,
 }
 
 impl From<HiveManagement> for HiveManagementRequest {
-	/// Spell one management alternative as the tagged-optional product the
-	/// wire carries.
+	/// Spells one management alternative as the tagged-optional product that
+	/// the encoding carries.
 	///
 	/// This is the send-side counterpart of
 	/// [`HiveManagementRequest::into_choice`]: a request built here names
@@ -788,8 +875,8 @@ impl From<HiveManagement> for HiveManagementRequest {
 }
 
 impl From<ClusterCommandKind> for ClusterCommand {
-	/// Spell one command alternative as the tagged-optional product the
-	/// wire carries.
+	/// Spells one command alternative as the tagged-optional product that
+	/// the encoding carries.
 	fn from(command: ClusterCommandKind) -> Self {
 		match command {
 			ClusterCommandKind::Heartbeat(heartbeat) => Self { heartbeat: Some(heartbeat), manage: None },
@@ -799,12 +886,12 @@ impl From<ClusterCommandKind> for ClusterCommand {
 }
 
 impl HiveManagementRequest {
-	/// Consume this product for the one request it names.
+	/// Consumes this product for the one request it names.
 	///
 	/// # Errors
 	///
-	/// - [`ChoiceRefusal::NoneSet`] when the product names no request.
-	/// - [`ChoiceRefusal::ManySet`] when it names several.
+	/// - [`ChoiceRefusal::NoneSet`] -- the product names no request.
+	/// - [`ChoiceRefusal::ManySet`] -- the product names several requests.
 	pub fn into_choice(self) -> Result<HiveManagement, ChoiceRefusal> {
 		match (self.spawn, self.list, self.stop) {
 			(Some(spawn), None, None) => Ok(HiveManagement::Spawn(spawn)),
@@ -817,12 +904,12 @@ impl HiveManagementRequest {
 }
 
 impl HiveManagementResponse {
-	/// Consume this product for the one result it names.
+	/// Consumes this product for the one result it names.
 	///
 	/// # Errors
 	///
-	/// - [`ChoiceRefusal::NoneSet`] when the product names no result.
-	/// - [`ChoiceRefusal::ManySet`] when it names several.
+	/// - [`ChoiceRefusal::NoneSet`] -- the product names no result.
+	/// - [`ChoiceRefusal::ManySet`] -- the product names several results.
 	pub fn into_choice(self) -> Result<HiveManagementOutcome, ChoiceRefusal> {
 		match (self.spawn, self.list, self.stop) {
 			(Some(spawn), None, None) => Ok(HiveManagementOutcome::Spawn(spawn)),
@@ -835,15 +922,16 @@ impl HiveManagementResponse {
 }
 
 impl ClusterCommand {
-	/// Consume this product for the one command it names.
+	/// Consumes this product for the one command it names.
 	///
 	/// A management command proves its own alternative here as well, so a
 	/// dispatcher matches an exhaustive body rather than reading fields.
 	///
 	/// # Errors
 	///
-	/// - [`ChoiceRefusal::NoneSet`] when the product names no command.
-	/// - [`ChoiceRefusal::ManySet`] when it names both.
+	/// - [`ChoiceRefusal::NoneSet`] -- the product names no command.
+	/// - [`ChoiceRefusal::ManySet`] -- the product names both commands, or its
+	///   management request names several.
 	pub fn into_choice(self) -> Result<ClusterCommandKind, ChoiceRefusal> {
 		match (self.heartbeat, self.manage) {
 			(Some(heartbeat), None) => Ok(ClusterCommandKind::Heartbeat(heartbeat)),
@@ -855,12 +943,13 @@ impl ClusterCommand {
 }
 
 impl ClusterCommandResponse {
-	/// Consume this product for the one answer it names.
+	/// Consumes this product for the one answer it names.
 	///
 	/// # Errors
 	///
-	/// - [`ChoiceRefusal::NoneSet`] when the product names no answer.
-	/// - [`ChoiceRefusal::ManySet`] when it names both.
+	/// - [`ChoiceRefusal::NoneSet`] -- the product names no answer.
+	/// - [`ChoiceRefusal::ManySet`] -- the product names both answers, or its
+	///   management response names several.
 	pub fn into_choice(self) -> Result<ClusterCommandOutcome, ChoiceRefusal> {
 		match (self.heartbeat, self.manage) {
 			(Some(heartbeat), None) => Ok(ClusterCommandOutcome::Heartbeat(heartbeat)),
@@ -871,19 +960,20 @@ impl ClusterCommandResponse {
 	}
 }
 
-/// Heartbeat response with hive health status
+/// The heartbeat answer, with the hive's health status.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HeartbeatResult {
-	/// Overall status (Ok = healthy, ResourceExhausted = at capacity)
+	/// The overall status: `Ok` when the hive is healthy, and
+	/// `ResourceExhausted` when it is at capacity.
 	pub status: TransitStatus,
-	/// Current aggregate utilization across all servlets
+	/// The current aggregate utilization across all servlets.
 	pub utilization: BasisPoints,
-	/// Number of active servlet instances
+	/// The number of active servlet instances.
 	pub active_servlets: u32,
 }
 
 impl ClusterCommandResponse {
-	/// Create a heartbeat response.
+	/// Creates a heartbeat response.
 	#[inline]
 	pub fn heartbeat(status: TransitStatus, utilization: BasisPoints, active_servlets: u32) -> Self {
 		Self {
@@ -892,17 +982,31 @@ impl ClusterCommandResponse {
 		}
 	}
 
-	/// Create a management response wrapper
+	/// Creates a management response wrapper.
 	#[inline]
 	pub fn manage(response: HiveManagementResponse) -> Self {
 		Self { heartbeat: None, manage: Some(response) }
+	}
+
+	/// Refuses a command with `status` in the alternative that `shape` names.
+	///
+	/// This is the one refusal constructor, so a refusal answers in the
+	/// alternative its sender decodes. A heartbeat refusal reports no
+	/// capacity, and a management refusal is
+	/// [`HiveManagementResponse::refusal`] in its own alternative.
+	#[must_use]
+	pub fn refusal(shape: ReplyShape, status: TransitStatus) -> Self {
+		match shape {
+			ReplyShape::Heartbeat => Self::heartbeat(status, BasisPoints::default(), 0),
+			ReplyShape::Manage(manage) => Self::manage(HiveManagementResponse::refusal(manage, status)),
+		}
 	}
 }
 
 /// The issue time a colony frame states.
 ///
 /// The frame layer leaves `metadata.order` protocol-opaque. Colony control
-/// frames, rumors and advertisements all put their issue time there as unix
+/// frames, rumors, and advertisements all put their issue time there as unix
 /// milliseconds (§5.7.1 permits a time-based order). This is the one place
 /// that reading is made, so every freshness and replay decision compares the
 /// same instant.
@@ -924,6 +1028,7 @@ mod tests {
 	use crate::builder::{FrameBuilder, TypeBuilder};
 	use crate::colony::common::ColonyNamespace;
 	use crate::error::Result;
+	use crate::tb_cases;
 
 	fn round_trip(original: ClusterRequest) -> Result<()> {
 		let encoded = crate::encode(&original)?;
@@ -936,6 +1041,12 @@ mod tests {
 		ColonyNamespace::default()
 			.servlet("ping")
 			.expect("test names satisfy the mint grammar")
+	}
+
+	fn ping_instance() -> Urn<'static> {
+		ping_type()
+			.servlet_instance("127.0.0.1:9001")
+			.expect("a servlet type URN yields an instance URN")
 	}
 
 	fn hive_id() -> crate::utils::urn::Urn<'static> {
@@ -1113,7 +1224,7 @@ mod tests {
 		assert_eq!(command.into_choice(), Err(ChoiceRefusal::ManySet));
 	}
 
-	/// Every alternative survives the trip out to the wire product and
+	/// Every alternative survives the trip out to the tagged product and
 	/// back, so the send side and the receive side agree on which field
 	/// names which command.
 	#[test]
@@ -1136,5 +1247,106 @@ mod tests {
 			let wire = ClusterCommand::from(alternative.clone());
 			assert_eq!(wire.into_choice(), Ok(alternative));
 		}
+	}
+
+	/// The shape a sender would read `response` in, with the status it
+	/// carries.
+	fn answered_shape(
+		response: ClusterCommandResponse,
+	) -> core::result::Result<(ReplyShape, TransitStatus), ChoiceRefusal> {
+		let answered = match response.into_choice()? {
+			ClusterCommandOutcome::Heartbeat(heartbeat) => (ReplyShape::Heartbeat, heartbeat.status),
+			ClusterCommandOutcome::Manage(HiveManagementOutcome::Spawn(spawn)) => {
+				(ReplyShape::Manage(ManageShape::Spawn), spawn.status)
+			}
+			ClusterCommandOutcome::Manage(HiveManagementOutcome::List(list)) => {
+				(ReplyShape::Manage(ManageShape::List), list.status)
+			}
+			ClusterCommandOutcome::Manage(HiveManagementOutcome::Stop(stop)) => {
+				(ReplyShape::Manage(ManageShape::Stop), stop.status)
+			}
+		};
+
+		Ok(answered)
+	}
+
+	// A refusal answers in the one alternative its shape names, so the
+	// sender decodes it in the shape it asked in.
+	tb_cases! {
+		fn a_refusal_answers_in_the_alternative_its_shape_names(shape: ReplyShape) {
+			let status = TransitStatus::ResourceExhausted;
+
+			let refusal = ClusterCommandResponse::refusal(shape, status);
+
+			assert_eq!(answered_shape(refusal), Ok((shape, status)));
+		}
+		cases {
+			heartbeat => ReplyShape::Heartbeat,
+			spawn => ReplyShape::Manage(ManageShape::Spawn),
+			list => ReplyShape::Manage(ManageShape::List),
+			stop => ReplyShape::Manage(ManageShape::Stop),
+		}
+	}
+
+	// A command names its own alternative, so a refusal of it answers
+	// where the sender reads its result.
+	tb_cases! {
+		fn a_command_names_its_own_alternative((command, shape): (ClusterCommandKind, ReplyShape)) {
+			assert_eq!(ReplyShape::of(Some(&command)), shape);
+		}
+		cases {
+			heartbeat => (
+				ClusterCommandKind::Heartbeat(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
+				ReplyShape::Heartbeat,
+			),
+			spawn => (
+				ClusterCommandKind::Manage(HiveManagement::Spawn(SpawnServletParams {
+					servlet_type: ping_type(),
+					config: None,
+				})),
+				ReplyShape::Manage(ManageShape::Spawn),
+			),
+			list => (
+				ClusterCommandKind::Manage(HiveManagement::List(ListServletsParams { filter: None })),
+				ReplyShape::Manage(ManageShape::List),
+			),
+			stop => (
+				ClusterCommandKind::Manage(HiveManagement::Stop(StopServletParams { servlet_id: ping_instance() })),
+				ReplyShape::Manage(ManageShape::Stop),
+			),
+		}
+	}
+
+	/// A body that named no single alternative is answered in the stop
+	/// alternative, which carries only the status a refusal has to report.
+	#[test]
+	fn an_unreadable_command_is_answered_in_the_stop_alternative() {
+		assert_eq!(ReplyShape::of(None), ReplyShape::Manage(ManageShape::Stop));
+	}
+
+	/// A heartbeat reply travels on a V2 frame at network-control priority,
+	/// so a health check answered under load still leads the queue.
+	#[test]
+	fn a_heartbeat_reply_travels_at_network_control_priority() -> Result<()> {
+		let response = ClusterCommandResponse::heartbeat(TransitStatus::Ok, BasisPoints::default(), 0);
+
+		let reply = ReplyShape::Heartbeat
+			.reply(b"hb", response)?
+			.ok_or(TightBeamError::MissingResponse)?;
+
+		assert_eq!(reply.metadata().priority(), Some(MessagePriority::NetworkControl));
+		Ok(())
+	}
+
+	/// A management reply travels on a V0 frame, which has no priority field.
+	#[test]
+	fn a_manage_reply_travels_at_the_default_priority() -> Result<()> {
+		let response = ClusterCommandResponse::manage(HiveManagementResponse::stop_ok());
+
+		let reply = ReplyShape::Manage(ManageShape::Stop).reply(b"stop", response)?;
+		let reply = reply.ok_or(TightBeamError::MissingResponse)?;
+
+		assert_eq!(reply.metadata().priority(), None);
+		Ok(())
 	}
 }

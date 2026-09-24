@@ -1,9 +1,9 @@
 //! Guarded ownership of the peer table's mutable state.
 //!
-//! The `Mutex` lives here and nowhere else, so a mutation reaches the
-//! state through [`GuardedTable::change`] alone. Every mutation therefore
-//! mints its generation inside the guard that applied it, which is what
-//! lets the driver drop a snapshot a newer one superseded (CWE-362).
+//! [`GuardedTable`] owns the one `Mutex` over the table, so every mutation
+//! reaches the state through [`GuardedTable::change`]. Each mutation
+//! therefore takes its generation inside the guard that applied it, which
+//! lets the driver drop a snapshot that a newer one superseded (CWE-362).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -11,20 +11,26 @@ use std::sync::Mutex;
 use super::{ClusterError, PeerAddress, PeerRecord};
 use crate::utils::time::UnixMillis;
 
+/// What the table knows about one peer address.
 #[derive(Debug, Clone)]
 pub struct PeerEntry {
+	/// Peer certificate fingerprint, advisory until a probe verifies the peer.
 	pub peer_id: Option<Vec<u8>>,
+	/// Time of the last probe attempt, which orders the probe backlog.
 	pub last_probe: UnixMillis,
 	/// Consecutive failed beat dials since the last verified probe.
 	///
-	/// The count lives in memory only. A restart starts the count at
-	/// zero because the following beats re-verify every resident.
+	/// The count lives in memory only. A restart sets the count to zero
+	/// because the following beats re-verify every resident.
 	pub failures: usize,
 }
 
+/// The peer table's mutable state, reachable only through [`GuardedTable`].
 #[derive(Debug, Default)]
 pub struct TableState {
+	/// Learned peers that no probe has verified yet.
 	pub new: HashMap<PeerAddress, PeerEntry>,
+	/// Learned peers that a probe has verified.
 	pub tried: HashMap<PeerAddress, PeerEntry>,
 	/// Anchors whose beat dial passed the colony gate.
 	///
@@ -33,7 +39,8 @@ pub struct TableState {
 	pub anchors_verified: HashMap<PeerAddress, PeerEntry>,
 	/// This gateway's own advertised address, held out of peer admission.
 	pub local: Option<PeerAddress>,
-	/// Mutations applied so far, minted inside the guard that applies them.
+	/// Count of durable mutations applied so far, each one taken inside the
+	/// guard that applied it.
 	///
 	/// A snapshot taken at generation N holds every change below N, so the
 	/// newest snapshot to reach the driver is always the complete one.
@@ -42,7 +49,7 @@ pub struct TableState {
 
 /// One durable change, and the generation it applied at.
 pub struct PendingWrite {
-	/// Generation minted inside the guard that produced `records`.
+	/// Generation taken inside the guard that produced `records`.
 	pub generation: u64,
 	/// Table contents as of that generation.
 	pub records: Vec<PeerRecord>,
@@ -55,7 +62,16 @@ pub struct GuardedTable {
 }
 
 impl GuardedTable {
+	/// Puts a table built before any caller could reach it behind the guard.
+	pub fn new(state: TableState) -> Self {
+		Self { state: Mutex::new(state) }
+	}
+
 	/// Reads the table under the guard.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
 	pub fn read<T>(&self, view: impl FnOnce(&TableState) -> T) -> Result<T, ClusterError> {
 		let state = self.state.lock()?;
 
@@ -68,6 +84,10 @@ impl GuardedTable {
 	/// the snapshot at that generation. The caller hands it to the driver
 	/// after the guard is released, so a slow driver delays no reader
 	/// (CWE-667).
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the table lock is poisoned.
 	pub fn change<T>(
 		&self,
 		change: impl FnOnce(&mut TableState) -> (T, bool),

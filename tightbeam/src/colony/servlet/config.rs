@@ -12,6 +12,7 @@ use crate::policy::GatePolicy;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::IntoMuxOffer;
 use crate::transport::Protocol;
+use crate::utils::time::{Clock, SystemClock};
 use crate::TightBeamError;
 
 use crate::crypto::key::SigningKeyProvider;
@@ -24,22 +25,22 @@ use crate::transport::TransportEncryptionConfig;
 /// How a servlet accepts connections.
 ///
 /// A multiplexing advertisement is bound into the handshake transcript, so
-/// it exists only where there is a handshake. Carrying it in the encrypted
-/// arm is what makes "cleartext servlet advertising mux" unrepresentable
+/// it exists only where there is a handshake. The encrypted arm carries it,
+/// so a cleartext servlet that advertises multiplexing is unrepresentable
 /// rather than silently ignored.
 pub enum ServletAccept<C: CryptoProvider> {
-	/// Accepts cleartext, and never negotiates multiplexing.
+	/// The servlet accepts cleartext connections without multiplexing.
 	Cleartext,
-	/// Presents a certificate, and may advertise multiplexing.
+	/// The servlet presents a certificate and may advertise multiplexing.
 	Encrypted {
-		/// Certificate, keys, and peer checks for the handshake.
+		/// The certificate, keys, and peer checks for the handshake.
 		encryption: Box<TransportEncryptionConfig<C>>,
-		/// Multiplexing advertised to accepted connections.
+		/// The multiplexing offer advertised to accepted connections.
 		mux_offer: Option<Arc<TransportOffer>>,
 	},
 }
 
-/// Servlet bind and handler configuration (includes transport encryption).
+/// Servlet bind and handler configuration, transport encryption included.
 ///
 /// `Env` is the application configuration the handlers read. It is a type
 /// parameter rather than an erased value, so the config a servlet is
@@ -60,6 +61,7 @@ where
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
+	pub(crate) clock: Arc<dyn Clock>,
 }
 
 pub(crate) mod sealed {
@@ -81,12 +83,13 @@ pub(crate) mod sealed {
 /// the state rather than re-deriving it.
 pub trait AcceptState<C: CryptoProvider>: sealed::Sealed<C> {}
 
-/// Builder state: no certificate, so no handshake to bind an offer to.
+/// The builder state with no certificate, and so with no handshake to bind
+/// an offer to.
 #[derive(Default)]
 pub struct NoCertificate;
 
-/// Builder state: a certificate is set, so the servlet may also advertise
-/// multiplexing.
+/// The builder state with a certificate set, in which the servlet may also
+/// advertise multiplexing.
 pub struct WithCertificate<C: CryptoProvider> {
 	encryption: TransportEncryptionConfig<C>,
 	mux_offer: Option<Arc<TransportOffer>>,
@@ -127,6 +130,7 @@ where
 	collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
+	clock: Arc<dyn Clock>,
 	_phantom: PhantomData<(P, M, C)>,
 }
 
@@ -145,18 +149,19 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Start a [`ServletConfigBuilder`].
+	/// Starts a [`ServletConfigBuilder`].
 	pub fn builder() -> ServletConfigBuilder<P, M, C, (), NoCertificate> {
 		ServletConfigBuilder::default()
 	}
 
-	/// Worker registered under `name`, downcast to `W`.
+	/// Returns the worker registered under `name`, downcast to `W`.
 	pub fn worker<W: 'static>(&self, name: impl AsRef<str>) -> Option<&W> {
 		let name = name.as_ref();
 		self.workers.get(name)?.downcast_ref()
 	}
 
-	/// Transport encryption config, when this servlet presents a certificate.
+	/// Returns the transport encryption config when this servlet presents a
+	/// certificate.
 	pub fn to_encryption_config_ref(&self) -> Option<&TransportEncryptionConfig<C>> {
 		match &self.accept {
 			ServletAccept::Cleartext => None,
@@ -164,10 +169,11 @@ where
 		}
 	}
 
-	/// Multiplexing advertisement applied to accepted connections.
+	/// Returns the multiplexing advertisement applied to accepted
+	/// connections.
 	///
-	/// Always [`None`] on a cleartext servlet, which has no handshake to
-	/// bind an offer into.
+	/// It is always [`None`] on a cleartext servlet, which has no handshake
+	/// to bind an offer into.
 	pub fn mux_offer(&self) -> Option<Arc<TransportOffer>> {
 		match &self.accept {
 			ServletAccept::Cleartext => None,
@@ -175,46 +181,47 @@ where
 		}
 	}
 
-	/// Application env config this servlet serves.
+	/// Returns the application env config this servlet serves.
 	#[must_use]
 	pub fn env_config(&self) -> &Arc<Env> {
 		&self.servlet_config
 	}
 
-	/// Take ownership of registered workers for servlet startup.
+	/// Takes ownership of the registered workers for servlet startup.
 	pub fn to_workers(self) -> HashMap<String, Box<dyn WorkerBox>> {
 		self.workers
 	}
 
-	/// Take ownership of collector gates for the accept loop.
+	/// Takes ownership of the collector gates for the accept loop.
 	pub fn to_collector_gates(self) -> Vec<Arc<dyn GatePolicy + Send + Sync>> {
 		self.collector_gates
 	}
 
-	/// Collector gates by reference.
+	/// Borrows the collector gates.
 	pub fn collector_gates_ref(&self) -> &[Arc<dyn GatePolicy + Send + Sync>] {
 		&self.collector_gates
 	}
 
-	/// Intra-hive communication handle, when set.
+	/// Returns the intra-hive communication handle, when one is set.
 	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
 		self.hive_context.as_ref()
 	}
 
-	/// Frame-body decryptor clone, when configured.
+	/// Returns a clone of the frame-body decryptor, when one is configured.
 	pub fn to_message_decryptor(&self) -> Option<Arc<dyn Decryptor + Send + Sync>> {
 		self.message_decryptor.as_ref().map(Arc::clone)
 	}
 
-	/// Frame-body inflator clone, when configured.
+	/// Returns a clone of the frame-body inflator, when one is configured.
 	pub fn to_message_inflator(&self) -> Option<Arc<dyn Inflator + Send + Sync>> {
 		self.message_inflator.as_ref().map(Arc::clone)
 	}
 
-	/// Split into the material `bind` needs and the parts the accept loop keeps.
+	/// Splits the config into the material `bind` needs and the parts the
+	/// accept loop keeps.
 	///
-	/// One split, so the encryption cannot be taken while the offer it was
-	/// paired with stays behind.
+	/// The split happens once, so the encryption and the offer it was paired
+	/// with always leave together.
 	pub(crate) fn into_bind_parts(self) -> (Option<TransportEncryptionConfig<C>>, runtime::ServletRuntimeParts<Env>) {
 		let (encryption, mux_offer) = match self.accept {
 			ServletAccept::Cleartext => (None, None),
@@ -229,6 +236,7 @@ where
 			message_decryptor: self.message_decryptor,
 			message_inflator: self.message_inflator,
 			workers: self.workers,
+			clock: self.clock,
 		};
 
 		(encryption, parts)
@@ -257,12 +265,13 @@ where
 			collector_gates: Vec::new(),
 			message_decryptor: None,
 			message_inflator: None,
+			clock: Arc::new(SystemClock),
 		}
 	}
 }
 
-/// A fresh builder serves no env and presents no certificate. Both are
-/// states the builder can supply on its own, and they are the only ones:
+/// A fresh builder serves the unit env and presents no certificate. These
+/// are the only states the builder can supply on its own, and
 /// [`ServletConfigBuilder::with_config`] and
 /// [`ServletConfigBuilder::with_certificate`] are the way to leave them.
 impl<P, M, C> Default for ServletConfigBuilder<P, M, C, (), NoCertificate>
@@ -280,6 +289,7 @@ where
 			collector_gates: Vec::new(),
 			message_decryptor: None,
 			message_inflator: None,
+			clock: Arc::new(SystemClock),
 			_phantom: PhantomData,
 		}
 	}
@@ -291,7 +301,7 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Set the application env config.
+	/// Sets the application env config.
 	///
 	/// This names the servlet's env type, so the handlers that read it and
 	/// the config that carries it are checked against each other.
@@ -305,11 +315,21 @@ where
 			collector_gates: self.collector_gates,
 			message_decryptor: self.message_decryptor,
 			message_inflator: self.message_inflator,
+			clock: self.clock,
 			_phantom: PhantomData,
 		}
 	}
 
-	/// Register a worker under its [`WorkerMetadata`] name.
+	/// Sets the clock the servlet's accept loop paces its retries on.
+	///
+	/// A builder that never sets one uses [`SystemClock`].
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
+		self
+	}
+
+	/// Registers a worker under its [`WorkerMetadata`] name.
 	pub fn with_worker<W>(mut self, worker: W) -> Self
 	where
 		W: Worker + WorkerMetadata + 'static,
@@ -319,7 +339,7 @@ where
 		self
 	}
 
-	/// Append a collector gate policy.
+	/// Appends a collector gate policy.
 	pub fn with_collector_gate<G>(mut self, gate: G) -> Self
 	where
 		G: GatePolicy + Send + Sync + 'static,
@@ -328,14 +348,14 @@ where
 		self
 	}
 
-	/// Attach the hive context for intra-hive calls.
+	/// Attaches the hive context for intra-hive calls.
 	#[must_use]
 	pub fn with_hive_context(mut self, ctx: Arc<dyn HiveContext>) -> Self {
 		self.hive_context = Some(ctx);
 		self
 	}
 
-	/// Enable typed delivery of encrypted frame bodies.
+	/// Enables typed delivery of encrypted frame bodies.
 	pub fn with_message_decryptor<D>(mut self, decryptor: D) -> Self
 	where
 		D: Decryptor + Send + Sync + 'static,
@@ -344,7 +364,7 @@ where
 		self
 	}
 
-	/// Enable typed delivery of compressed frame bodies.
+	/// Enables typed delivery of compressed frame bodies.
 	pub fn with_message_inflator<I>(mut self, inflator: I) -> Self
 	where
 		I: Inflator + Send + Sync + 'static,
@@ -353,7 +373,7 @@ where
 		self
 	}
 
-	/// Finish the builder into a [`ServletConfig`].
+	/// Finishes the builder into a [`ServletConfig`].
 	///
 	/// The accept state carries the certificate and the offer, so this
 	/// reads the state rather than re-deriving which one the builder is in.
@@ -372,6 +392,7 @@ where
 			collector_gates: self.collector_gates,
 			message_decryptor: self.message_decryptor,
 			message_inflator: self.message_inflator,
+			clock: self.clock,
 		}
 	}
 }
@@ -382,17 +403,19 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Enable encrypted transport with the given server certificate.
+	/// Enables encrypted transport with the given server certificate.
 	///
-	/// - Non-empty `validators`: mutual auth. Every validator must accept the client cert.
-	/// - Empty `validators`: no client authentication.
+	/// - A non-empty `validators` turns on mutual authentication, and every
+	///   validator must accept the client certificate.
+	/// - An empty `validators` turns off client authentication.
 	///
-	/// `validators` accepts any iterator of shared [`CertificateValidation`] values.
+	/// `validators` accepts any iterator of shared [`CertificateValidation`]
+	/// values.
 	///
 	/// # Errors
 	///
-	/// - The [`ClientIdentity`] set, when the certificate or key does not
-	///   decode.
+	/// - [`TightBeamError`] -- the certificate or key does not decode, as
+	///   [`ClientIdentity::from_spec`] reports it.
 	pub fn with_certificate(
 		self,
 		cert: CertificateSpec,
@@ -410,6 +433,7 @@ where
 			collector_gates: self.collector_gates,
 			message_decryptor: self.message_decryptor,
 			message_inflator: self.message_inflator,
+			clock: self.clock,
 			_phantom: PhantomData,
 		})
 	}
@@ -421,7 +445,7 @@ where
 	M: Message,
 	C: CryptoProvider + Send + Sync + 'static,
 {
-	/// Advertise multiplexing on accepted connections.
+	/// Advertises multiplexing on accepted connections.
 	///
 	/// The offer is bound into the handshake transcript, so this exists
 	/// only after [`ServletConfigBuilder::with_certificate`] has put the

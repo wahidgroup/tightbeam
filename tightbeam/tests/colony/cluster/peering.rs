@@ -1,4 +1,4 @@
-//! Peer federation (advertisement control plane).
+//! Peer federation tests for the advertisement control plane.
 
 use super::common::*;
 
@@ -11,8 +11,9 @@ tb_assert_spec! {
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1))
 		]
 	},
-	// 1.1.0: the wire outcome joins the contract so accepting scenarios
-	// prove the peer saw Ok, not merely that the install event fired.
+	// Version 1.1.0 adds the wire outcome to the contract, so accepting
+	// scenarios prove the peer saw Ok, not merely that the install event
+	// fired.
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
@@ -21,8 +22,8 @@ tb_assert_spec! {
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok))
 		]
 	},
-	// 1.2.0: the surviving route count joins the contract. One advertised
-	// type must leave exactly one installed peer route.
+	// Version 1.2.0 adds the surviving route count to the contract. One
+	// advertised type must leave exactly one installed peer route.
 	V(1,2,0): {
 		mode: Accept,
 		assertions: [
@@ -43,8 +44,8 @@ tb_assert_spec! {
 			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1))
 		]
 	},
-	// 1.1.0: the refusal contract pins the wire status and the security
-	// property that a refusal installs zero peer routes.
+	// Version 1.1.0 pins the wire status and the security property that a
+	// refusal installs zero peer routes.
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
@@ -56,7 +57,7 @@ tb_assert_spec! {
 	}
 }
 
-// Claimed dial outside the optional allowlist is refused before install.
+// A claimed dial outside the optional allowlist is refused before install.
 tb_scenario! {
 	name: cluster_refuses_peer_dial_outside_allowlist,
 	spec: ClusterPeerRefusedSpec,
@@ -74,7 +75,7 @@ tb_scenario! {
 	}
 }
 
-// Allowlisted dial installs normally.
+// An allowlisted dial installs normally.
 tb_scenario! {
 	name: cluster_accepts_peer_dial_on_allowlist,
 	spec: ClusterPeerAdvertisedSpec,
@@ -122,12 +123,12 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			install_ping_peer(&trace, &certs, &cluster).await?;
 
-			trace.event_with(LOCAL_SERVLETS_AFTER_INSTALLS, &[], cluster.available_servlets().len() as u64)?;
+			trace.event_with(LOCAL_SERVLETS_AFTER_INSTALLS, &[], cluster.available_servlets()?.len() as u64)?;
 
-			// One learned route keyed by the advertised type, exposing the
-			// claimed dial path and the signer fingerprint.
+			// Exactly one learned route is keyed by the advertised type, and
+			// it exposes the claimed dial path and the signer fingerprint.
 			let ping_canonical = servlet_urn("ping").type_canonical_bytes();
-			let routes = cluster.peer_routes();
+			let routes = cluster.peer_routes()?;
 			let exposed = routes.len() == 1
 				&& routes.first().is_some_and(|route| {
 					let servlet_type: &[u8] = route.servlet_type.as_ref();
@@ -171,7 +172,7 @@ tb_scenario! {
 			let slate = vec![servlet_urn("ping"), servlet_urn("echo")];
 			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, slate).await?;
 
-			let mut peers = cluster.peer_servlets();
+			let mut peers = cluster.peer_servlets()?;
 			peers.sort_unstable();
 
 			let mut expected: Vec<std::sync::Arc<[u8]>> = vec![
@@ -248,11 +249,11 @@ tb_scenario! {
 			advertise_peer_signed(&trace, gateway, &certs.peer_b.1, &cluster, PEER_GATEWAY_ADDR, vec![servlet_urn("echo")])
 				.await?;
 
-			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets().len() as u64)?;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets()?.len() as u64)?;
 
 			advertise_peer_signed(&trace, gateway, &certs.peer_b.1, &cluster, PEER_GATEWAY_ADDR, vec![]).await?;
 
-			let survivors = cluster.peer_servlets();
+			let survivors = cluster.peer_servlets()?;
 			trace.event_with(PEER_ROUTES_AFTER_WITHDRAWAL, &[], survivors.len() as u64)?;
 
 			let ping_type = servlet_urn("ping").type_canonical_bytes();
@@ -393,7 +394,7 @@ tb_scenario! {
 			.await?;
 
 			send_advertisement_frame(&trace, &certs, &cluster, frame).await?;
-			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets().len() as u64)?;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets()?.len() as u64)?;
 
 			cluster.stop();
 			Ok(())
@@ -493,8 +494,9 @@ tb_scenario! {
 	}
 }
 
-// Peer hops dial on peer_trust: an importer with hive_trust=None still
-// forwards when the peer gateway cert is anchored only in peer_trust.
+// Peer hops dial on `peer_trust`: an importer with `hive_trust = None`
+// still forwards when the peer gateway cert is anchored only in
+// `peer_trust`.
 tb_scenario! {
 	name: cluster_forwards_on_peer_trust_plane,
 	spec: ClusterPeerForwardEchoSpec,
@@ -543,7 +545,7 @@ tb_assert_spec! {
 	}
 }
 
-// Claimed gateway_addr that matches a local servlet address is refused.
+// A claimed `gateway_addr` that matches a local servlet address is refused.
 // The refusal gates routing state only: the admitted identity still
 // lands in the discovery new table, where the probe gate decides its
 // fate. A slate refusal therefore never erases graph connectivity.
@@ -660,8 +662,9 @@ tb_scenario! {
 				work_refusal_status(refused_work)?;
 			}
 
-			// Trail abandoned: selection drops it, so the peer-only type
-			// is Unavailable and no further forward is attempted.
+			// Once the trail is abandoned, selection drops it, so the
+			// peer-only type is Unavailable and no further forward is
+			// attempted.
 			trace.event(WORK_SENT)?;
 			let refused_work = emit_ping_work(&mut client, &certs.key, b"gone").await;
 			work_refusal_status(refused_work)?;
@@ -856,10 +859,10 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			install_ping_peer(&trace, &certs, &cluster).await?;
-			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets().len() as u64)?;
+			trace.event_with(PEER_ROUTES_AFTER_INSTALLS, &[], cluster.peer_servlets()?.len() as u64)?;
 
 			advertise_peer(&trace, &certs, &cluster, PEER_GATEWAY_ADDR, vec![]).await?;
-			trace.event_with(PEER_ROUTES_AFTER_WITHDRAWAL, &[], cluster.peer_servlets().len() as u64)?;
+			trace.event_with(PEER_ROUTES_AFTER_WITHDRAWAL, &[], cluster.peer_servlets()?.len() as u64)?;
 
 			cluster.stop();
 			Ok(())
@@ -1019,9 +1022,10 @@ tb_scenario! {
 	}
 }
 
-/// Exporter (advertiser + hive) identity on one trust plane, receiver on
-/// another: only `peer_trust` can validate the receiver's TLS identity,
-/// so the advertise beat must dial on the peer plane, never the hive one.
+/// The exporter identity, which serves the advertiser and the hive, sits on
+/// one trust plane, and the receiver sits on another. Only `peer_trust` can
+/// validate the receiver's TLS identity, so the advertise beat must dial on
+/// the peer plane, never the hive one.
 struct SplitPlaneCerts {
 	exporter: ClusterTestCerts,
 	receiver: (Certificate, Secp256k1SigningKey),

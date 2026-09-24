@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
+use crate::colony::cluster::ClusterError;
 use crate::colony::common::{reply_frame, RegisterHiveRequest, ServletAddressUpdate};
 use crate::colony::hive::{RegisterHiveResponse, ServletAddressUpdateResponse};
 use crate::instrumentation::events::{
@@ -24,7 +25,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_register(&frame, status);
 		}
 
-		// Instance URN locator MUST equal route address (CWE-639).
+		// Each instance URN locator MUST equal its route address (CWE-639).
 		let locators_ok = request
 			.servlet_addresses
 			.iter()
@@ -33,7 +34,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		}
 
-		// Admit addresses that mint an exact hive identity URN.
+		// Admit only a hive address that yields an exact hive identity URN.
 		let Some(hive_identity) = self.config.namespace.hive_from_bytes(&request.hive_addr) else {
 			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		};
@@ -47,20 +48,23 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
 		let slate = self.config.pheromone.servlet_slate(&request.servlet_addresses, &hive_addr);
-		// Atomic: hive entry + full slate, or roll back.
-		// Re-register replaces prior rows.
+		// The membership step installs the hive entry and its full slate
+		// atomically, or rolls both back. A re-registration replaces the
+		// prior rows.
 		let registered = self.membership().admit(request, signer_id, slate);
-		match registered {
-			Ok(()) => {
-				let hive_count = self.registry.len().unwrap_or_default() as u64;
+		let counted = registered.and_then(|()| self.registry.len());
+		match counted {
+			Ok(hive_count) => {
+				let hive_count = u64::try_from(hive_count).unwrap_or(u64::MAX);
 				self.trace.event_with(CLUSTER_HIVE_REGISTERED, &[], hive_count)?;
 
 				let response = RegisterHiveResponse { status: TransitStatus::Ok, hive_id: Some(hive_identity) };
 				reply_frame(frame.metadata().id(), response)
 			}
-			Err(_) => {
-				// Forget replay so a legitimate retry of the same signed frame can proceed.
-				self.refuse_register_release(&frame, TransitStatus::PermissionDenied)
+			Err(error) => {
+				// Releasing the replay slot lets a legitimate retry of the
+				// same signed frame proceed.
+				self.refuse_register_release(&frame, refusal_status(&error))
 			}
 		}
 	}
@@ -75,7 +79,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return self.refuse_update(&frame, status);
 		}
 
-		let Some((hive_id, added, removed)) = self.config.parse_address_update(&update) else {
+		let Some((added, removed)) = self.config.parse_address_update(&update) else {
 			return self.refuse_update(&frame, TransitStatus::PermissionDenied);
 		};
 
@@ -88,16 +92,17 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 
 		// The signer bind and the route write are one membership step, so
 		// a retirement cannot land between them (CWE-362).
-		match self.membership().update_addresses(&hive_id, &signer_id, added, &removed) {
+		match self.membership().update_addresses(&signer_id, added, &removed) {
 			Ok(()) => {
 				self.trace.event(CLUSTER_UPDATE_ACCEPTED)?;
 
 				let response = ServletAddressUpdateResponse { status: TransitStatus::Ok };
 				reply_frame(frame.metadata().id(), response)
 			}
-			Err(_) => {
-				// Forget replay so the hive can resend the same signed update.
-				self.refuse_update_release(&frame, TransitStatus::PermissionDenied)
+			Err(error) => {
+				// Releasing the replay slot lets the hive resend the same
+				// signed update.
+				self.refuse_update_release(&frame, refusal_status(&error))
 			}
 		}
 	}
@@ -142,5 +147,17 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 	fn refuse_update_release(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
 		self.replay_guard.release(frame);
 		self.refuse_update(frame, status)
+	}
+}
+
+/// The status a refused membership move answers with.
+///
+/// A poisoned registry is this gateway's fault, so the hive is told the
+/// gateway is unavailable rather than that it lacks the right to register.
+/// Every other refusal is a claim the gateway judged and denied.
+fn refusal_status(error: &ClusterError) -> TransitStatus {
+	match error {
+		ClusterError::LockPoisoned => TransitStatus::Unavailable,
+		_ => TransitStatus::PermissionDenied,
 	}
 }

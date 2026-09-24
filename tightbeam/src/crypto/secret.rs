@@ -18,9 +18,9 @@ use crate::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// A secret wrapper that zeroizes its inner value on drop.
 ///
-/// The value lives in a [`Zeroizing`] buffer for its whole life, so no state
-/// exists in which the secret is missing and every accessor is total. The
-/// type does not implement Clone or Copy, which keeps ownership strict.
+/// The value lives in a [`Zeroizing`] buffer for its whole life, so the
+/// secret is present in every state and every accessor is total. The type
+/// implements neither `Clone` nor `Copy`, which keeps ownership strict.
 pub struct Secret<S: Zeroize>(Zeroizing<S>);
 
 impl<S: Zeroize> Secret<S> {
@@ -32,8 +32,10 @@ impl<S: Zeroize> Secret<S> {
 
 	/// Move the value into a frame body, which wipes it when the frame drops.
 	///
-	/// The allocation moves, so no copy is made. The exit is crate-private, so
-	/// every owner that receives a secret this way wipes it.
+	/// The allocation moves without a copy. The exit is crate-private, so
+	/// every owner that receives a secret this way wipes it. A frame body is
+	/// the only such owner, so the exit exists where frame encryption does.
+	#[cfg(feature = "aead")]
 	pub(crate) fn release(mut self) -> S
 	where
 		S: Default,
@@ -50,9 +52,8 @@ impl<S: Zeroize> fmt::Debug for Secret<S> {
 	}
 }
 
-/// Wrap an owned value. A `Vec` keeps its allocation, so no copy of the
-/// secret is made on the way in, and the wipe on drop covers the whole
-/// capacity.
+/// Wraps an owned value. A `Vec` keeps its allocation, so wrapping copies
+/// no secret bytes, and the wipe on drop covers the whole capacity.
 impl<S: Zeroize> From<S> for Secret<S> {
 	fn from(src: S) -> Self {
 		Self(Zeroizing::new(src))
@@ -143,6 +144,7 @@ mod tests {
 	}
 
 	/// Releasing moves the allocation out without a copy.
+	#[cfg(feature = "aead")]
 	#[test]
 	fn releasing_a_buffer_moves_its_allocation() {
 		let plaintext = vec![0x5Au8; 32];
@@ -152,7 +154,7 @@ mod tests {
 		assert_eq!(released.as_ptr(), address);
 	}
 
-	/// A type whose values wipe when they drop.
+	/// Compiles only for a type whose values wipe when they drop.
 	fn assert_wipes_on_drop<T: ZeroizeOnDrop>() {}
 
 	// An exposed secret still owns key material, so the value it hands back

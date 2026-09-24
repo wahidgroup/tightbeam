@@ -1,7 +1,7 @@
-//! Outbound connection-pool construction for cluster gateways
+//! Outbound connection-pool construction for cluster gateways.
 //!
-//! Hive and peer hops use separate pools so each trust plane stays
-//! attached to the dials it authorizes. Client identity is materialized
+//! Hive and peer hops use separate pools, so each trust plane stays
+//! attached to the dials it authorizes. The client identity is materialized
 //! once and shared by `Arc` across both pools.
 
 use std::sync::Arc;
@@ -16,37 +16,35 @@ use crate::crypto::x509::Certificate;
 use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool, PoolConfig};
 use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::Protocol;
+use crate::utils::time::Clock;
 use crate::TightBeamError;
 
 type ClusterPool<P> = ConnectionPool<P>;
 type ClusterKey = HandshakeKeyManager<DefaultCryptoProvider>;
 
-/// Hive pool plus the optional peer-plane pool
+/// The hive pool plus the optional peer-plane pool.
 ///
-/// Named fields because both pools share one type: a tuple would let a
-/// hive/peer transposition compile, crossing the two trust planes.
+/// The fields are named because both pools share one type, so a tuple would
+/// let a hive and peer transposition compile and cross the two trust planes.
 pub struct ClusterPools<P: Protocol> {
-	/// Outbound dials to this gateway's own hives (`hive_trust` plane)
+	/// Outbound dials to this gateway's own hives, on the `hive_trust` plane.
 	pub hive: Arc<ClusterPool<P>>,
-	/// Outbound dials to federated peer gateways (`peer_trust` plane);
-	/// `None` when federation is disabled
+	/// Outbound dials to federated peer gateways, on the `peer_trust` plane.
+	/// The value is `None` when federation is disabled.
 	pub peer: Option<Arc<ClusterPool<P>>>,
 }
 
-/// Build hive and optional peer outbound pools from one client identity
-///
-/// Takes the whole TLS config: `hive_trust` and `peer_trust` share a
-/// type, so passing them positionally would let a swap compile and
-/// cross the trust planes.
-#[doc(hidden)]
 /// Outbound trust store composed with the operator validator chain.
 ///
 /// The handshake client validates the server identity through the pool
-/// trust store on two paths: [`CertificateValidation::evaluate`] for a
-/// bare certificate and [`CertificateTrust::verify_chain`] for a
-/// provisioned chain. This composite appends
-/// `ClusterTlsConfig::validators` to both paths, so each outbound dial
-/// enforces the operator's extra checks (pinning, expiry, policy).
+/// trust store on two paths:
+///
+/// - [`CertificateValidation::evaluate`] for a bare certificate.
+/// - [`CertificateTrust::verify_chain`] for a provisioned chain.
+///
+/// This composite appends `ClusterTlsConfig::validators` to both paths, so
+/// each outbound dial enforces the operator's extra checks (pinning,
+/// expiry, policy).
 ///
 /// # Evaluation order
 ///
@@ -95,9 +93,10 @@ impl CertificateTrust for ValidatedTrust {
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
 		self.store.verify_chain(chain)?;
 
-		// Anchor-first ordering: the dialed server identity is the last
-		// entry. Operator validators target that leaf, not intermediates,
-		// so a pin on the server certificate cannot false-fail on a CA.
+		// The chain is anchor-first, so the dialed server identity is the
+		// last entry. Operator validators target that leaf rather than an
+		// intermediate, so a pin on the server certificate cannot false-fail
+		// on a CA.
 		let leaf = chain.last().ok_or(CertificateValidationError::EmptyChain)?;
 		self.validate_leaf(leaf)
 	}
@@ -128,9 +127,11 @@ fn validated_trust(
 
 impl PoolConfig {
 	/// One outbound pool on this configuration, presenting `certificate`
-	/// and `key` and validating servers against `trust`.
+	/// and `key`, validating servers against `trust`, and measuring time on
+	/// `clock`.
 	fn build_one<P>(
 		&self,
+		clock: &Arc<dyn Clock>,
 		certificate: Arc<Certificate>,
 		key: Arc<ClusterKey>,
 		trust: Option<Arc<dyn CertificateTrust>>,
@@ -140,10 +141,11 @@ impl PoolConfig {
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
 		P::Transport: Send + Sync,
 	{
-		// `with_config` takes the config by value. `PoolConfig` is two scalars
-		// and a refcounted mux offer, so the copy is a pointer bump.
+		// `with_config` takes the config by value, so the copy costs a
+		// refcount bump on the mux offer.
 		let mut builder = ClusterPool::<P>::builder()
 			.with_config(self.clone())
+			.with_clock(Arc::clone(clock))
 			.with_shared_client_identity(certificate, key);
 
 		if let Some(store) = trust {
@@ -153,7 +155,18 @@ impl PoolConfig {
 		Arc::new(builder.build())
 	}
 
-	pub fn build_cluster_pools<P>(&self, tls: &ClusterTlsConfig) -> Result<ClusterPools<P>, TightBeamError>
+	/// Builds the hive pool and, when peer trust is configured, the peer
+	/// pool from one client identity. Both pools measure time on the
+	/// gateway's `clock`.
+	///
+	/// The method takes the whole TLS config because `hive_trust` and
+	/// `peer_trust` share a type, so passing them positionally would let a
+	/// swap compile and cross the trust planes.
+	pub(crate) fn build_cluster_pools<P>(
+		&self,
+		tls: &ClusterTlsConfig,
+		clock: &Arc<dyn Clock>,
+	) -> Result<ClusterPools<P>, TightBeamError>
 	where
 		P: Protocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
 		P::Address: core::hash::Hash + Eq + Clone + Send + Sync,
@@ -161,6 +174,7 @@ impl PoolConfig {
 	{
 		let (certificate, key) = tls.identity().parts();
 		let hive_pool = self.build_one::<P>(
+			clock,
 			Arc::clone(&certificate),
 			Arc::clone(&key),
 			tls.hive_trust
@@ -169,6 +183,7 @@ impl PoolConfig {
 		);
 		let peer_pool = tls.peer_trust.as_ref().map(|trust| {
 			self.build_one::<P>(
+				clock,
 				Arc::clone(&certificate),
 				Arc::clone(&key),
 				Some(validated_trust(Arc::clone(trust), &tls.validators)),

@@ -3,8 +3,8 @@
 //! [`PeerAuthentication`] is the one decision both handshake servers consult,
 //! and [`AdmittedPeer`] is the only value that carries a certificate a
 //! validator chain accepted. A session records a peer only through
-//! [`AdmittedPeer::proven`], so a certificate that no validator saw cannot
-//! become a session identity.
+//! [`AdmittedPeer::proven`], so every session identity is a certificate a
+//! validator chain accepted.
 
 #[cfg(not(feature = "std"))]
 use alloc::{sync::Arc, vec::Vec};
@@ -32,9 +32,13 @@ pub enum PeerAuthentication {
 /// The validators a mutual server runs, which always hold at least one.
 ///
 /// The field stays private and only [`PeerAuthentication::mutual`] builds a
-/// chain, so a mutual server cannot be configured to run no check.
+/// chain, so every mutual server runs at least one check. A build without a
+/// handshake protocol has no server to evaluate the chain, so the chain keeps
+/// only the decision that mutual authentication was demanded.
 #[derive(Clone)]
-pub struct ValidatorChain(Arc<[Arc<dyn CertificateValidation>]>);
+pub struct ValidatorChain(
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))] Arc<[Arc<dyn CertificateValidation>]>,
+);
 
 impl ValidatorChain {
 	/// Run every validator against `certificate`, stopping at the first
@@ -50,7 +54,7 @@ impl ValidatorChain {
 }
 
 impl PeerAuthentication {
-	/// Mutual authentication against `validators`.
+	/// Builds mutual authentication against `validators`.
 	///
 	/// An empty set names no check to run, so it demands nothing and yields
 	/// [`Self::Anonymous`]. This is the one definition of that rule, so a
@@ -62,7 +66,12 @@ impl PeerAuthentication {
 			return Self::Anonymous;
 		}
 
-		Self::Mutual(ValidatorChain(validators.into()))
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		let chain = ValidatorChain(validators.into());
+		#[cfg(not(any(feature = "transport-cms", feature = "transport-ecies")))]
+		let chain = ValidatorChain();
+
+		Self::Mutual(chain)
 	}
 
 	/// Whether the client MUST present a certificate.
@@ -73,7 +82,7 @@ impl PeerAuthentication {
 	/// Decide what the handshake may do with the certificate the client
 	/// offered.
 	///
-	/// Both handshake servers call this, and nothing else creates an
+	/// Both handshake servers call this, and it is the one constructor of
 	/// [`AdmittedPeer`].
 	///
 	/// # Errors

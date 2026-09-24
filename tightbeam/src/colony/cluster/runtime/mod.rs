@@ -55,7 +55,53 @@ use crate::utils::urn::Urn;
 use crate::Frame;
 use crate::TightBeamError;
 
-use crate::instrumentation::events::{CLUSTER_EXPORT_IDENTITY_UNAVAILABLE, CLUSTER_EXPORT_UNBOUNDED};
+use crate::instrumentation::events::{
+	CLUSTER_EXPORT_IDENTITY_UNAVAILABLE, CLUSTER_EXPORT_UNBOUNDED, CLUSTER_LOOP_POISONED,
+};
+
+/// Why one background loop of the gateway ended.
+///
+/// Every loop reads registries and tables and records to the trace, and
+/// either can refuse. The two refusals are kept apart so the exit records
+/// a poisoned lock by name and lets a trace fault end the loop silently,
+/// which is the effect a `testing-fault` injection observes.
+pub(crate) enum LoopFault {
+	/// The trace refused an event, or a task the loop awaited did not join.
+	Runtime(TightBeamError),
+	/// A registry, table or journal this loop reads is poisoned.
+	Registry(ClusterError),
+}
+
+impl LoopFault {
+	/// Records a registry fault on `trace`, the one observer a detached
+	/// loop has. A runtime fault is the trace's own refusal, so the trace
+	/// already holds it.
+	pub(crate) fn record(self, trace: &TraceCollector) {
+		let Self::Registry(error) = self else {
+			return;
+		};
+
+		// A trace that refuses this record has refused the loop already,
+		// so nothing else can carry the fault.
+		let fault = error.to_string();
+		let recorded = trace
+			.event(CLUSTER_LOOP_POISONED)
+			.map(|event| event.with_payload(&fault).emit());
+		drop(recorded);
+	}
+}
+
+impl From<TightBeamError> for LoopFault {
+	fn from(error: TightBeamError) -> Self {
+		Self::Runtime(error)
+	}
+}
+
+impl From<ClusterError> for LoopFault {
+	fn from(error: ClusterError) -> Self {
+		Self::Registry(error)
+	}
+}
 
 impl ClusterConfig {
 	/// Emit one-time export-posture warnings when the gateway starts.
@@ -66,11 +112,11 @@ impl ClusterConfig {
 	///
 	/// # Warnings
 	///
-	/// - Federated gateway with no export list: serves and advertises every
+	/// - A federated gateway with no export list serves and advertises every
 	///   local type to external peers ([`CLUSTER_EXPORT_UNBOUNDED`]).
-	/// - Export list without captured client identity: every session stays
-	///   anonymous, so unexported targets are unreachable from the origin plane
-	///   as well ([`CLUSTER_EXPORT_IDENTITY_UNAVAILABLE`]).
+	/// - An export list with no captured client identity leaves every session
+	///   anonymous, so unexported targets are unreachable from the origin
+	///   plane as well ([`CLUSTER_EXPORT_IDENTITY_UNAVAILABLE`]).
 	///
 	/// # Sources
 	///
@@ -85,7 +131,8 @@ impl ClusterConfig {
 				}
 			}
 			Some(_) => {
-				let identity_captured = !self.tls.client_validators.is_empty() && self.tls.hive_trust.is_some();
+				let requires_certificate = self.tls.peer_authentication().requires_certificate();
+				let identity_captured = requires_certificate && self.tls.hive_trust.is_some();
 				if !identity_captured {
 					trace.event(CLUSTER_EXPORT_IDENTITY_UNAVAILABLE)?.emit();
 				}
@@ -95,17 +142,16 @@ impl ClusterConfig {
 		Ok(())
 	}
 
-	/// Assemble the accept-side TLS configuration shared by the colony and
-	/// edge listeners.
+	/// Builds the accept-side TLS config the colony and edge listeners share.
 	///
 	/// Both planes present the same certificate and key so an external edge
-	/// client pins the same gateway identity that hives already trust. An
-	/// empty `client_validators` list means server-auth only, so the gateway
-	/// captures no client identity.
+	/// client pins the same gateway identity that hives already trust. The
+	/// client authentication is [`ClusterTlsConfig::peer_authentication`].
 	///
-	/// # Errors
+	/// `ClusterTlsConfig::new` already decoded the certificate, so assembly
+	/// here always returns `Ok`.
 	///
-	/// - [`TightBeamError::SerializationError`] -- the configured certificate does not decode.
+	/// [`ClusterTlsConfig::peer_authentication`]: crate::colony::cluster::ClusterTlsConfig::peer_authentication
 	fn accept_encryption_config(&self) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>, TightBeamError> {
 		let (certificate, key_manager) = self.tls.identity().parts();
 		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
@@ -132,8 +178,8 @@ fn protocol_error<E: Into<TransportError>>(error: E) -> TightBeamError {
 /// - `E` defaults to `P`, so a gateway without an edge declaration uses a single accept plane.
 /// - When [`ClusterConfig::edge_bind_addr`] is set, the gateway binds a second
 ///   listener over `E` with the same TLS material.
-/// - Edge connections share the colony mux service but dispatch on the edge
-///   plane, which admits `Work` frames only.
+/// - Edge connections are served by a separate edge mux service, whose one
+///   route is `Work` submission.
 /// - Hives and peers keep using the colony plane at [`Cluster::addr`].
 pub struct ClusterGateway<P, D = Sha3_256, E = P>
 where
@@ -211,7 +257,8 @@ where
 
 		let config = Arc::new(config);
 
-		// When x509 is enabled, the gateway always serves TLS.
+		// The `colony` feature enables `x509`, so the gateway always serves
+		// TLS.
 		let bind_addr = match config.bind_addr.as_deref() {
 			Some(raw) => raw.parse().map_err(|_| TransportError::InvalidMessage)?,
 			None => P::default_bind_address().map_err(protocol_error)?,
@@ -222,13 +269,12 @@ where
 			.map_err(protocol_error)?;
 
 		let control_window = config.control_freshness_window;
-		let registry = Arc::new(HiveRegistry::new(config.heartbeat.timeout));
-		let routes = ServletRegistry::new(config.pheromone.clone())
-			.with_ad_tombstone_window(control_window)
-			.with_clock(Arc::clone(&config.clock));
+		let registry = Arc::new(HiveRegistry::new(config.heartbeat.timeout, Arc::clone(&config.clock)));
+		let routes = ServletRegistry::new(config.pheromone.clone(), Arc::clone(&config.clock))
+			.with_ad_tombstone_window(control_window);
 
 		let servlet_registry = Arc::new(routes);
-		let pools = config.pool_config.build_cluster_pools::<P>(&config.tls)?;
+		let pools = config.pool_config.build_cluster_pools::<P>(&config.tls, &config.clock)?;
 		let pool = pools.hive;
 		let peer_pool = pools.peer;
 
@@ -247,8 +293,9 @@ where
 		};
 
 		// Bind every configured accept plane before spawning any accept
-		// loop. An edge parse or bind failure returns Err with the colony
-		// listener still local, so no detached accept task remains.
+		// loop. An edge parse or bind failure returns `Err` while the colony
+		// listener is still local, so a failed start leaves every accept
+		// task unspawned.
 		let (edge_listener, edge_addr) = match config.edge_bind_addr.as_deref() {
 			Some(raw) => {
 				let edge_bind: E::Address = raw.parse().map_err(|_| TransportError::InvalidMessage)?;
@@ -270,10 +317,7 @@ where
 
 		// The edge plane serves [`EdgeMuxService`], whose only route is work
 		// submission.
-		let edge_handle = edge_listener.map(|edge_listener| {
-			// Every field of the context is an `Arc`, so the clone is cheap.
-			ctx.clone().serve_edge::<E::Listener, D>(edge_listener)
-		});
+		let edge_handle = edge_listener.map(|edge_listener| ctx.clone().serve_edge::<E::Listener, D>(edge_listener));
 
 		tasks.adopt(ctx.clone().spawn_heartbeat::<D>());
 
@@ -312,37 +356,31 @@ where
 		&self.addr
 	}
 
-	fn available_servlets(&self) -> Vec<SharedId> {
+	fn available_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
 		// Routes are the one home for which types this gateway serves, so
 		// a hive scaling an instance in or out is reflected here without a
 		// second index to keep current.
-		self.servlet_registry.local_servlets().unwrap_or_default()
+		self.servlet_registry.local_servlets()
 	}
 
-	fn peer_servlets(&self) -> Vec<SharedId> {
-		let mut types: Vec<SharedId> = self
-			.servlet_registry
-			.peer_entries()
-			.unwrap_or_default()
-			.into_iter()
-			.map(|entry| Arc::clone(entry.servlet_type()))
-			.collect();
+	fn peer_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
+		let entries = self.servlet_registry.peer_entries()?;
+		let mut types: Vec<SharedId> = entries.iter().map(|entry| Arc::clone(entry.servlet_type())).collect();
 		types.sort_unstable();
 		types.dedup();
-		types
+
+		Ok(types)
 	}
 
-	fn peer_routes(&self) -> Vec<PeerRouteInfo> {
-		self.servlet_registry
-			.peer_entries()
-			.unwrap_or_default()
-			.into_iter()
-			.filter_map(|entry| entry.peer_route_info())
-			.collect()
+	fn peer_routes(&self) -> Result<Vec<PeerRouteInfo>, ClusterError> {
+		let entries = self.servlet_registry.peer_entries()?;
+		let routes = entries.iter().filter_map(|entry| entry.peer_route_info()).collect();
+
+		Ok(routes)
 	}
 
-	fn hive_count(&self) -> usize {
-		self.registry.len().unwrap_or(0)
+	fn hive_count(&self) -> Result<usize, ClusterError> {
+		self.registry.len()
 	}
 
 	fn trace(&self) -> Arc<TraceCollector> {
@@ -431,8 +469,8 @@ where
 /// An edge plane serves external clients, so work submission is its only
 /// route. The type carries that boundary. Its unary arm narrows the envelope
 /// to a work request through [`GatewayRuntimeCtx::handle_edge_request`], and
-/// it offers no stream or duplex route. Registration, peer advertisement,
-/// and gossip stay on the colony plane.
+/// its stream and duplex arms refuse with `PermissionDenied`. Registration,
+/// peer advertisement, and gossip stay on the colony plane.
 struct EdgeMuxService<P, D>
 where
 	P: Protocol,

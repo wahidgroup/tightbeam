@@ -25,8 +25,8 @@ use crate::events;
 use crate::fixtures::ClusterTestCerts;
 use crate::topology::OrgNode;
 
-/// Fixed control order base. Paired with a wide freshness window so AFL
-/// signatures stay byte-stable across runs.
+/// The fixed base for control-frame orders. A wide freshness window pairs
+/// with it, so AFL signatures stay byte-stable across runs.
 pub(crate) const CONTROL_ORDER_BASE: u64 = 1_700_000_000_000;
 
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -68,15 +68,14 @@ async fn connect_as(
 		.await?)
 }
 
-/// Send one signed advertisement and classify the wire outcome.
+/// Sends one signed advertisement and classifies the answer.
 ///
-/// The dial validates the receiver's server certificate with the
-/// receiver's own trust. Connect failures classify as
-/// [`AuthzClass::InfraFail`], matching the work-path absorption rule.
-///
-/// The `PEER_AD_OK` / `PEER_AD_DENIED` outcome events stay the caller's
-/// responsibility through `record_authz_oracle`, so every advertise path
-/// emits them exactly once beside the shadow comparison.
+/// - The dial validates the receiver's server certificate with the receiver's own trust.
+/// - A connect failure classifies as [`AuthzClass::InfraFail`], which matches
+///   the work-path absorption rule.
+/// - The caller emits the `PEER_AD_OK` and `PEER_AD_DENIED` outcome events
+///   through `record_authz_oracle`, so every advertise path emits them exactly
+///   once beside the shadow comparison.
 async fn emit_advertise(
 	trace: &TraceCollector,
 	signer: &OrgNode,
@@ -110,7 +109,7 @@ async fn emit_advertise(
 		Err(_) => return Ok(AuthzClass::InfraFail),
 	};
 	if response.status == TransitStatus::Ok {
-		trace.event_with(events::PEER_ROUTES_AFTER, &[], receiver.gateway.peer_servlets().len() as u64)?;
+		trace.event_with(events::PEER_ROUTES_AFTER, &[], receiver.gateway.peer_servlets()?.len() as u64)?;
 		return Ok(AuthzClass::Success);
 	}
 

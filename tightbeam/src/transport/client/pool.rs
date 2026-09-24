@@ -123,23 +123,11 @@ pub struct PoolConfig {
 	/// until stream caps fill. The value is shared by refcount across dials.
 	/// The handshake still clones the offer once into the orchestrator.
 	pub mux_offer: Option<Arc<TransportOffer>>,
-	/// Clock that idle time, deadlines, and backoff are measured against.
-	/// Defaults to [`SystemClock`] where the standard library's clocks work.
-	pub clock: Arc<dyn Clock>,
 }
 
-/// Available where the standard library's clocks work. A pool on
-/// `wasm32-unknown-unknown`, which has no [`SystemClock`], names the clock it
-/// reads.
-#[cfg(host_clock)]
 impl Default for PoolConfig {
 	fn default() -> Self {
-		Self {
-			idle_timeout: None,
-			max_connections: 64,
-			mux_offer: None,
-			clock: Arc::new(SystemClock),
-		}
+		Self { idle_timeout: None, max_connections: 64, mux_offer: None }
 	}
 }
 
@@ -198,6 +186,7 @@ impl<C: CryptoProvider> PoolTlsConfig<C> {
 /// Builder for a configured [`ConnectionPool`].
 pub struct ConnectionPoolBuilder<P: Protocol> {
 	config: PoolConfig,
+	clock: Arc<dyn Clock>,
 	timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
 	tls: PoolTlsConfig<P::CryptoProvider>,
@@ -207,13 +196,12 @@ pub struct ConnectionPoolBuilder<P: Protocol> {
 }
 
 impl<P: Protocol> ConnectionPoolBuilder<P> {
-	/// A builder for a pool configured by `config`.
-	///
-	/// The pool measures idle time and backoff against the clock `config`
-	/// names.
-	pub fn new(config: PoolConfig) -> Self {
+	/// A builder for a pool configured by `config` that measures idle time,
+	/// deadlines, and backoff against `clock`.
+	pub fn new(config: PoolConfig, clock: Arc<dyn Clock>) -> Self {
 		Self {
 			config,
+			clock,
 			timeout: None,
 			#[cfg(feature = "x509")]
 			tls: PoolTlsConfig::unconfigured(),
@@ -224,11 +212,13 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	}
 }
 
-/// Available where [`PoolConfig`] has a default clock.
+/// Available where the standard library's clocks work. A pool on
+/// `wasm32-unknown-unknown`, which has no [`SystemClock`], names the clock it
+/// reads through [`ConnectionPoolBuilder::new`].
 #[cfg(host_clock)]
 impl<P: Protocol> Default for ConnectionPoolBuilder<P> {
 	fn default() -> Self {
-		Self::new(PoolConfig::default())
+		Self::new(PoolConfig::default(), Arc::new(SystemClock))
 	}
 }
 
@@ -246,6 +236,13 @@ impl<P: Protocol> ConnectionPoolBuilder<P> {
 	/// Replace the pool configuration.
 	pub fn with_config(mut self, config: PoolConfig) -> Self {
 		self.config = config;
+		self
+	}
+
+	/// Replace the clock idle time, deadlines, and backoff are measured
+	/// against.
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
 		self
 	}
 
@@ -323,6 +320,7 @@ impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
 		ConnectionPool {
 			pools: Arc::new(RwLock::new(HashMap::new())),
 			config: self.config,
+			clock: self.clock,
 			timeout: self.timeout,
 			total_connections: Arc::new(AtomicUsize::new(0)),
 			#[cfg(pooled_mux)]
@@ -426,13 +424,18 @@ impl<P: Protocol> Default for DestinationPool<P> {
 /// - `total_connections` counts live connections and stays within
 ///   `0..=config.max_connections`. It gains 1 when a socket is created.
 /// - Idle connections past `PoolConfig::idle_timeout` are pruned lazily.
-/// - Lock poisoning never panics. Callers receive `TransportFailure::Internal` instead.
+/// - A poisoned pool map fails the acquiring call with
+///   `TransportFailure::Internal`, and eviction and the drop-time return skip
+///   their write. An activity stamp recovers from poison, because it holds
+///   one instant.
 #[cfg(feature = "std")]
 pub struct ConnectionPool<P: Protocol> {
 	/// Per-destination sub-pools.
 	pools: Arc<RwLock<HashMap<P::Address, DestinationPool<P>>>>,
 	/// Limits and multiplexing policy this pool enforces.
 	config: PoolConfig,
+	/// Clock that idle time, deadlines, and backoff are measured against.
+	clock: Arc<dyn Clock>,
 	/// Shared timeout for all connections.
 	timeout: Option<Duration>,
 	/// Total live connections across all destinations.
@@ -463,8 +466,8 @@ impl<P: Protocol> ConnectionPool<P> {
 	/// Everything one dial from this pool is built from: the shared
 	/// provisioning, the pool's clock, and its instrumentation collector.
 	///
-	/// Built before the dial opens a socket, so a pool that answers the
-	/// dialer rule with a refusal never connects.
+	/// The endpoint is built before the dial opens a socket, so a pool that
+	/// answers the dialer rule with a refusal never connects.
 	///
 	/// # Errors
 	///
@@ -472,7 +475,7 @@ impl<P: Protocol> ConnectionPool<P> {
 	///   authenticates no peer and did not name cleartext.
 	#[cfg(feature = "x509")]
 	fn dial_endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
-		let endpoint = self.tls.endpoint(&self.config.clock)?;
+		let endpoint = self.tls.endpoint(&self.clock)?;
 
 		#[cfg(feature = "instrument")]
 		let endpoint = match self.trace.as_ref() {
@@ -535,7 +538,7 @@ where
 	{
 		let mut pools = self.write_pools()?;
 		if let Some(dest_pool) = pools.get_mut(addr) {
-			self.prune_idle_locked(dest_pool, self.config.clock.monotonic());
+			self.prune_idle_locked(dest_pool, self.clock.monotonic());
 
 			while let Some(entry) = dest_pool.available.pop_front() {
 				if <P as PersistentConnection>::is_connected(entry.client.transport()) {
@@ -545,7 +548,8 @@ where
 					return Ok(Some(entry.client));
 				}
 
-				// Dead candidate is discarded here, so it leaves the live set.
+				// A dead candidate is discarded here, so it leaves the live
+				// set.
 				self.release_connection_count();
 
 				#[cfg(feature = "instrument")]
@@ -556,8 +560,8 @@ where
 	}
 
 	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P>> {
-		// Single atomic check-and-increment so concurrent callers cannot all
-		// pass a separate limit check and overshoot max_connections.
+		// One atomic check-and-increment means concurrent callers cannot all
+		// pass a separate limit check and overshoot `max_connections`.
 		let reserved = self
 			.total_connections
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -585,7 +589,7 @@ where
 		};
 
 		let dest_pool = pools.entry(addr.clone()).or_default();
-		self.prune_idle_locked(dest_pool, self.config.clock.monotonic());
+		self.prune_idle_locked(dest_pool, self.clock.monotonic());
 
 		Ok(SlotGuard::new(Arc::clone(self)))
 	}
@@ -598,7 +602,8 @@ where
 		while let Some(entry) = dest_pool.available.front() {
 			if now.saturating_duration_since(entry.last_used) >= timeout {
 				dest_pool.available.pop_front();
-				// Pruned idle connection is closed, so it leaves the live set.
+				// A pruned idle connection is closed, so it leaves the live
+				// set.
 				self.release_connection_count();
 
 				#[cfg(feature = "instrument")]
@@ -628,7 +633,7 @@ where
 					let _ = handle.shutdown().await;
 				});
 
-				// Pruned idle connection leaves the live set.
+				// A pruned idle connection leaves the live set.
 				self.release_connection_count();
 				#[cfg(feature = "instrument")]
 				self.emit_event(events::POOL_PRUNED_IDLE);
@@ -749,7 +754,7 @@ pooled_mux! {
 			}
 
 			let offer = match &self.config.mux_offer {
-				// One shared PoolConfig offer for every dial.
+				// Every dial shares the one `PoolConfig` offer.
 				Some(offer) => Arc::clone(offer),
 				None => {
 					return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
@@ -786,8 +791,8 @@ pooled_mux! {
 			let settings = match transport.negotiated_mux() {
 				Some(settings) => settings,
 				None => {
-					// Peer declined the mux offer: the connection pools as
-					// an exclusive lease instead.
+					// The peer declined the mux offer, so the connection
+					// pools as an exclusive lease instead.
 					#[cfg(feature = "instrument")]
 					self.emit_event(events::POOL_MUX_DECLINED);
 
@@ -812,7 +817,7 @@ pooled_mux! {
 			drop(responder);
 
 			let id = self.mux_ids.fetch_add(1, Ordering::Relaxed);
-			let last_used = Arc::new(ActivityStamp::new(Arc::clone(&self.config.clock)));
+			let last_used = Arc::new(ActivityStamp::new(Arc::clone(&self.clock)));
 
 			{
 				// A failed lock must not leak the spawned drivers, so abort the
@@ -858,12 +863,12 @@ pooled_mux! {
 				None => return Ok(None),
 			};
 
-			self.prune_idle_locked(dest_pool, self.config.clock.monotonic());
+			self.prune_idle_locked(dest_pool, self.clock.monotonic());
 
 			dest_pool.mux.retain(|entry| {
 				let alive = !entry.reader_task.is_finished();
 				if !alive {
-					// Dead mux connection is discarded here, so it leaves
+					// A dead mux connection is discarded here, so it leaves
 					// the live set.
 					self.release_connection_count();
 
@@ -901,7 +906,7 @@ pooled_mux! {
 
 		/// Remove a mux entry after a terminal failure (`ConnectionClosed`
 		/// or rekey `Draining`). The next connect re-establishes the
-		/// connection.
+		/// connection, and a poisoned pool map skips the eviction.
 		fn evict_mux(&self, addr: &P::Address, id: u64) {
 			let mut pools = match self.pools.write() {
 				Ok(pools) => pools,
@@ -913,7 +918,7 @@ pooled_mux! {
 				dest_pool.mux.retain(|entry| entry.id != id);
 
 				if dest_pool.mux.len() < live_before {
-					// Evicted mux connection leaves the live set.
+					// An evicted mux connection leaves the live set.
 					self.release_connection_count();
 
 					#[cfg(feature = "instrument")]
@@ -1287,7 +1292,7 @@ where
 				if is_healthy {
 					dest_pool
 						.available
-						.push_back(AvailableEntry { client, last_used: self.pool.config.clock.monotonic() });
+						.push_back(AvailableEntry { client, last_used: self.pool.clock.monotonic() });
 
 					returned_to_pool = true;
 				}

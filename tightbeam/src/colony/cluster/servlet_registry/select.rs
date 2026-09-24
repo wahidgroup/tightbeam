@@ -1,12 +1,16 @@
 use core::time::Duration;
 use std::sync::Arc;
-use std::time::Instant;
 
 use super::{ClusterError, PheromoneConfig, RouteKind, ServletEntry, ServletRegistry, SharedId};
 use crate::colony::common::ServletTypeKey;
 
 impl ServletRegistry {
-	/// Live routes for a servlet type, shared by Arc (no entry deep copy).
+	/// Returns the live routes for a servlet type as shared [`Arc`] handles,
+	/// so the call deep-copies no entry.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn entries_for_type(&self, servlet_type: &ServletTypeKey) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
 		let servlet_type = servlet_type.as_ref();
 		let routes = self.routes.read()?;
@@ -20,7 +24,11 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
-	/// Live local routes for a servlet type.
+	/// Returns the live local routes for a servlet type.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn local_entries_for_type(
 		&self,
 		servlet_type: &ServletTypeKey,
@@ -34,7 +42,11 @@ impl ServletRegistry {
 		Ok(local)
 	}
 
-	/// Distinct live servlet types owned by this gateway.
+	/// Returns the distinct live servlet types this gateway owns, sorted.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn local_servlets(&self) -> Result<Vec<SharedId>, ClusterError> {
 		let routes = self.routes.read()?;
 		let mut types = routes
@@ -50,7 +62,12 @@ impl ServletRegistry {
 		Ok(types)
 	}
 
-	/// Live routes reached through peer gateways, relay trails included.
+	/// Returns the live routes reached through peer gateways, relay trails
+	/// included.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn peer_entries(&self) -> Result<Vec<Arc<ServletEntry>>, ClusterError> {
 		let routes = self.routes.read()?;
 		let result = routes
@@ -63,7 +80,12 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
-	/// Reinforce pheromone for one servlet after success.
+	/// Reinforces the pheromone of the servlet at `address` after a success,
+	/// and reports whether a route sits at `address`.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn reinforce(&self, address: impl AsRef<[u8]>, quality: u64) -> Result<bool, ClusterError> {
 		let address = address.as_ref();
 		let routes = self.routes.read()?;
@@ -77,7 +99,12 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
-	/// Count one failure for the servlet at `address`.
+	/// Counts one failure for the servlet at `address`, and reports whether a
+	/// route sits at `address`.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn weaken(&self, address: impl AsRef<[u8]>) -> Result<bool, ClusterError> {
 		let address = address.as_ref();
 		let routes = self.routes.read()?;
@@ -91,7 +118,12 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
-	/// Count one failure and apply a pheromone penalty.
+	/// Counts one failure and applies a pheromone penalty to the servlet at
+	/// `address`, and reports whether a route sits at `address`.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn weaken_with_penalty(&self, address: impl AsRef<[u8]>, penalty: u64) -> Result<bool, ClusterError> {
 		let address = address.as_ref();
 		let routes = self.routes.read()?;
@@ -105,9 +137,18 @@ impl ServletRegistry {
 		Ok(result)
 	}
 
-	/// Weaken every live route attributed to a peer identity: direct
-	/// routes it advertised, relay trails learned for it, and relay
-	/// trails that forward through it.
+	/// Weakens every live route attributed to a peer identity and returns how
+	/// many it weakened.
+	///
+	/// A route is attributed to the peer when it is one of these:
+	///
+	/// - A direct route the peer advertised.
+	/// - A relay trail learned for the peer.
+	/// - A relay trail that forwards through the peer.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn weaken_peer(&self, peer_id: impl AsRef<[u8]>) -> Result<usize, ClusterError> {
 		let peer_id = peer_id.as_ref();
 		let attributed = |entry: &ServletEntry| {
@@ -126,9 +167,13 @@ impl ServletRegistry {
 		Ok(weakened)
 	}
 
-	/// Weaken every live peer route that dials `dial_addr`, relay
-	/// trails included: a misbehaving gateway weakens every trail
-	/// through it.
+	/// Weakens every live peer route that dials `dial_addr`, relay trails
+	/// included, and returns how many it weakened. A misbehaving gateway
+	/// therefore weakens every trail through it.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn weaken_peer_by_dial(&self, dial_addr: impl AsRef<[u8]>) -> Result<usize, ClusterError> {
 		let dial_addr = dial_addr.as_ref();
 		let routes = self.routes.read()?;
@@ -143,7 +188,11 @@ impl ServletRegistry {
 		Ok(weakened)
 	}
 
-	/// Evaporate pheromone on every tracked entry.
+	/// Evaporates pheromone on every tracked entry at the configured rate.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn evaporate(&self) -> Result<(), ClusterError> {
 		let routes = self.routes.read()?;
 		let rate = self.config.evaporation_rate;
@@ -154,7 +203,7 @@ impl ServletRegistry {
 		Ok(())
 	}
 
-	/// Drop relay trails whose last reconcile is older than `max_age`.
+	/// Drops the relay trails whose last reconcile is older than `max_age`.
 	///
 	/// A relay trail refreshes only when a relayed advertisement rumor
 	/// reconciles its bucket, so a trail past `max_age` lost its refresh
@@ -165,28 +214,17 @@ impl ServletRegistry {
 	///
 	/// - CWE-772, missing release of resource after effective lifetime:
 	///   <https://cwe.mitre.org/data/definitions/772.html>
-	pub fn prune_stale_relay_trails(&self, max_age: Duration) -> Result<usize, ClusterError> {
-		let now = Instant::now();
-		let stale = {
-			let routes = self.routes.read()?;
-			routes
-				.values()
-				.filter(|entry| entry.route_kind() == RouteKind::PeerRelay)
-				.filter(|entry| now.duration_since(entry.installed_at()) > max_age)
-				.map(|entry| Arc::clone(entry.route_key()))
-				.collect::<Vec<_>>()
-		};
-
-		let count = stale.len();
-		for route_key in &stale {
-			self.remove(route_key)?;
-		}
-
-		Ok(count)
+	pub(in crate::colony::cluster) fn prune_stale_relay_trails(
+		&self,
+		max_age: Duration,
+	) -> Result<usize, ClusterError> {
+		let now = self.clock.monotonic();
+		Ok(self.routes.write()?.prune_stale_relay_trails(now, max_age))
 	}
 
-	/// Drop every entry that reached its abandonment limit.
-	pub fn remove_abandoned(&self) -> Result<usize, ClusterError> {
+	/// Drops every entry that reached its abandonment limit and returns how
+	/// many it dropped.
+	pub(in crate::colony::cluster) fn remove_abandoned(&self) -> Result<usize, ClusterError> {
 		let mut routes = self.routes.write()?;
 		let abandoned: Vec<SharedId> = routes
 			.values()
@@ -202,18 +240,26 @@ impl ServletRegistry {
 		Ok(count)
 	}
 
-	/// Pheromone scoring and lifecycle configuration.
+	/// Returns the pheromone scoring and lifecycle configuration.
 	pub fn config(&self) -> &PheromoneConfig {
 		&self.config
 	}
 
-	/// Number of tracked servlet routes.
+	/// Returns the number of tracked servlet routes.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn len(&self) -> Result<usize, ClusterError> {
 		let routes = self.routes.read()?;
 		Ok(routes.values().count())
 	}
 
-	/// True when the registry holds no routes.
+	/// Whether the registry holds no routes.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the route lock is poisoned.
 	pub fn is_empty(&self) -> Result<bool, ClusterError> {
 		let is_empty = self.len()? == 0;
 		Ok(is_empty)

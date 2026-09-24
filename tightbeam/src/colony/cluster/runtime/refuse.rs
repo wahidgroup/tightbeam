@@ -2,10 +2,10 @@
 //!
 //! A refusal answers one inbound frame and records it against the same
 //! collector that saw the frame arrive. [`Refusal`] holds that pair, so
-//! a reply cannot be minted for one frame while the refusal is traced
-//! against another.
+//! the reply and its trace event always name the same frame.
 
 use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
+use crate::colony::cluster::runtime::LoopFault;
 use crate::colony::common::{reply_frame, GossipResponse, GossipWant, PeerAdvertisementResponse};
 use crate::instrumentation::events::{CLUSTER_GOSSIP_REFUSED, CLUSTER_PEER_ADVERTISE_REFUSED};
 use crate::policy::TransitStatus;
@@ -21,7 +21,7 @@ pub(crate) struct Refusal<'f> {
 }
 
 impl<'f> Refusal<'f> {
-	/// Refuses `frame`, tracing against `trace`.
+	/// Binds a refusal of `frame` to the collector that saw it arrive.
 	pub(crate) fn to(frame: &'f Frame, trace: &'f TraceCollector) -> Self {
 		Self { frame, trace }
 	}
@@ -30,6 +30,36 @@ impl<'f> Refusal<'f> {
 	pub(crate) fn gossip(self, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
 		self.trace_gossip()?;
 		reply_frame(self.frame.metadata().id(), GossipResponse { status })
+	}
+
+	/// Answers a gossip rumor after a scoring step that may itself have
+	/// faulted.
+	///
+	/// A poisoned registry is this gateway's fault, so the reply carries
+	/// [`TransitStatus::Unavailable`] in place of `status`, the verdict on
+	/// the rumor itself.
+	pub(crate) fn gossip_scored(
+		self,
+		scored: Result<(), LoopFault>,
+		status: TransitStatus,
+	) -> Result<Option<Frame>, TightBeamError> {
+		match scored {
+			Ok(()) => self.gossip(status),
+			Err(fault) => self.gossip_fault(fault),
+		}
+	}
+
+	/// Answers a gossip rumor whose handling hit a fault of this gateway's.
+	///
+	/// A poisoned registry, table, or journal is this gateway's fault, so it
+	/// answers [`TransitStatus::Unavailable`] rather than a verdict on the
+	/// rumor. A trace fault is the trace's own refusal and propagates
+	/// unchanged.
+	pub(crate) fn gossip_fault(self, fault: LoopFault) -> Result<Option<Frame>, TightBeamError> {
+		match fault {
+			LoopFault::Registry(_) => self.gossip(TransitStatus::Unavailable),
+			LoopFault::Runtime(error) => Err(error),
+		}
 	}
 
 	/// Answers a reconcile request with an empty want set.
@@ -46,9 +76,9 @@ impl<'f> Refusal<'f> {
 
 	/// Answers a peer advertisement and returns its freshness slot.
 	///
-	/// A refused advertisement never applied, so holding its signature
-	/// would spend the peer's one admission on a frame this gateway
-	/// declined (CWE-645).
+	/// A refused advertisement did not apply. Releasing its signature keeps
+	/// the peer's one admission for a frame this gateway accepts, where
+	/// holding it would spend that admission on a refusal (CWE-645).
 	pub(crate) fn peer_ad_release(
 		self,
 		replay_guard: &GatewayReplayGuard,
@@ -58,7 +88,8 @@ impl<'f> Refusal<'f> {
 		self.peer_ad(status)
 	}
 
-	/// Records the refusal, attributed to the frame's signer when signed.
+	/// Records the refusal, attributed to the frame's signer when the frame
+	/// is signed.
 	fn trace_gossip(self) -> Result<(), TightBeamError> {
 		let event = self.trace.event(CLUSTER_GOSSIP_REFUSED)?;
 		match self.frame.signer_id() {

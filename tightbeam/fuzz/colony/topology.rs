@@ -47,53 +47,53 @@ cluster! {
 
 /// One organization's gateway, hive, and mutable ACL handles.
 pub(crate) struct OrgNode {
-	/// Short org label used in traces and CSR issuer naming.
+	/// The short org label used in traces and CSR issuer naming.
 	pub name: &'static str,
-	/// Deterministic gateway identity for this organization.
+	/// The deterministic gateway identity for this organization.
 	pub certs: Arc<ClusterTestCerts>,
-	/// Live export allowlist mutated by oracle actions.
+	/// The live export allowlist that oracle actions mutate.
 	pub exports: Arc<DynamicExportList>,
-	/// Shared grant and deny tables for this gateway.
+	/// The shared grant and deny tables for this gateway.
 	pub acl: Arc<DynamicAclState>,
-	/// Pre-decode gate the oracle can arm or disarm.
+	/// The pre-decode gate the oracle can arm or disarm.
 	pub policy_gate: Arc<DynamicPolicyGate>,
-	/// Live cluster gateway under test.
+	/// The live cluster gateway under test.
 	pub gateway: ColonyFuzzGateway,
-	/// Local hive registered to the gateway.
+	/// The local hive registered to the gateway.
 	pub hive: ColonyFuzzHive,
-	/// Optional CSR issuer handle when this org serves CSR.
+	/// The CSR issuer handle, when this org serves CSR.
 	pub csr_issuer: Option<Arc<CsrIssuer>>,
 	/// Independent oracle over harness-owned state. Drift against the
 	/// live wire is the detection mechanism, never a source of truth.
 	pub shadow: GatewayShadow,
-	/// Soft-state instance counter for lifecycle opcodes after establish.
+	/// The soft-state instance counter for lifecycle opcodes after establish.
 	pub soft_instances: usize,
 }
 
 impl OrgNode {
-	/// Predict against this org's export boundary through the shadow.
+	/// Predicts against this org's export boundary through the shadow.
 	pub fn predict(&self, attempt: &AccessAttempt<'_>) -> Prediction {
 		self.shadow.predict(attempt)
 	}
 
-	/// Predict whether a signed peer advertisement from `signer` admits.
+	/// Predicts whether a signed peer advertisement from `signer` is admitted.
 	pub fn predict_peer_ad(&self, signer: &Certificate) -> Prediction {
 		self.shadow.predict_peer_ad(signer)
 	}
 }
 
-/// Full multi-org program under test.
+/// The full multi-org program under test.
 ///
-/// Owned by `ClusterEnv.cluster` for the colony AFL target. `alpha` is the seed
-/// gateway, and peer orgs dial it during [`ColonyTopology::boot`].
+/// `ClusterEnv.cluster` owns it for the colony AFL target. `alpha` is the
+/// seed gateway, and peer orgs dial it during [`ColonyTopology::boot`].
 pub(crate) struct ColonyTopology {
-	/// Federation entry / peer seed.
+	/// The federation entry and peer seed.
 	pub alpha: OrgNode,
-	/// Peer organization that dials the federation seed.
+	/// The peer organization that dials the federation seed.
 	pub beta: OrgNode,
-	/// Second peer organization in the three-org mesh.
+	/// The second peer organization in the three-org mesh.
 	pub gamma: OrgNode,
-	/// Shared decoy pin for alpha's failover balancer.
+	/// The shared decoy pin for alpha's failover balancer.
 	pub decoy_pin: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -103,7 +103,8 @@ impl ColonyTopology {
 		let beta_urn = colony_urn("beta");
 		let gamma_urn = colony_urn("gamma");
 
-		// Fixed distinct seeds: identical inputs MUST mint identical SPKIs.
+		// The seeds are fixed and distinct, because identical inputs MUST
+		// create identical SPKIs.
 		let (cert_a, key_a) = colony_identity("Alpha Gateway", &alpha_urn, 1);
 		let (cert_b, key_b) = colony_identity("Beta Gateway", &beta_urn, 2);
 		let (cert_c, key_c) = colony_identity("Gamma Gateway", &gamma_urn, 3);
@@ -113,8 +114,8 @@ impl ColonyTopology {
 		let gamma_certs = Arc::new(gateway_bundle(cert_c, key_c));
 
 		let decoy_pin = Arc::new(Mutex::new(None));
-		// Full-mesh peer trust so one-shot ads and foreign-identity dials
-		// reach the export/gate planes instead of dying at TLS.
+		// Full-mesh peer trust lets one-shot ads and foreign-identity dials
+		// reach the export and gate planes instead of dying at TLS.
 		let alpha_peers = combined_trust(&[beta_certs.cert.as_ref(), gamma_certs.cert.as_ref()]);
 		let beta_peers = combined_trust(&[alpha_certs.cert.as_ref(), gamma_certs.cert.as_ref()]);
 		let gamma_peers = combined_trust(&[alpha_certs.cert.as_ref(), beta_certs.cert.as_ref()]);
@@ -221,10 +222,9 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 		idle_timeout: None,
 		max_connections: 32,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
-		..PoolConfig::default()
 	};
 
-	// Leave advertise_interval at None so the gossip beat never races the
+	// `advertise_interval` stays `None`, so the gossip beat never races the
 	// action loop. Local export and ACL enforcement still cover the boundary,
 	// and live discovery races belong in integration tests.
 	let mut builder = ClusterConfig::builder(tls)
@@ -257,7 +257,8 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 	let gateway = ColonyFuzzGateway::start(share_trace(trace), conf).await?;
 	let mut hive = ColonyFuzzHive::new(Some(hive_tls_config(&own)))?;
 
-	// Local work surfaces. peer-ping is only on orgs that advertise it.
+	// These are the local work surfaces, and `peer-ping` runs only on orgs
+	// that advertise it.
 	let mut local_types = vec![servlet_urn("public"), servlet_urn("private"), servlet_urn("stream-echo")];
 	if with_peer_ping {
 		local_types.push(servlet_urn("peer-ping"));
@@ -277,7 +278,7 @@ async fn boot_org(trace: &TraceCollector, cfg: BootOrg) -> Result<OrgNode, Tight
 
 	// The shadow reads the same handles the gateway config holds: the
 	// dynamic export list, ACL, and policy gate, plus this org's own
-	// trust as hive_trust and the fixed peer set as peer_trust.
+	// trust as `hive_trust` and the fixed peer set as `peer_trust`.
 	let shadow = GatewayShadow {
 		exports: Arc::clone(&exports),
 		acl: Arc::clone(&acl),
@@ -304,8 +305,8 @@ fn share_trace(trace: &TraceCollector) -> Arc<TraceCollector> {
 	Arc::new(trace.share())
 }
 
-/// Boot a ping servlet and register it. The spawner rebuilds a fresh instance
-/// on scale-out.
+/// Boots a ping servlet and registers it. The spawner rebuilds a fresh
+/// instance on scale-out.
 async fn register_ping(
 	hive: &mut ColonyFuzzHive,
 	trace: &TraceCollector,
@@ -331,8 +332,8 @@ async fn register_ping(
 	hive.register(servlet_type, servlet, respawn)
 }
 
-/// Boot the CSR servlet. Returns the issuer so the org node can observe mint
-/// counts.
+/// Boots the CSR servlet and returns the issuer, so the org node can observe
+/// how many certificates it issues.
 async fn register_csr(
 	hive: &mut ColonyFuzzHive,
 	trace: &TraceCollector,

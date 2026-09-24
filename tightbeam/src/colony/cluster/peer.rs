@@ -40,8 +40,8 @@ pub struct HopBudget {
 
 /// The hop budget octet as a peer sent it, before the local clamp.
 ///
-/// It is what separates an origin request from a relayed one, so it is a
-/// distinct type from the operator's cap it gets clamped against.
+/// The wire octet separates an origin request from a relayed one, so it is
+/// a distinct type from the operator's cap that clamps it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WireHopBudget(u8);
 
@@ -119,9 +119,9 @@ impl HopBudget {
 
 	/// Relayed stream route for one peer hop out of this budget.
 	///
-	/// The route reaches the same `target` with one forward spent. Minting
-	/// it through the budget is what spends the hop, so a relay cannot
-	/// stamp a route it did not pay for (CWE-834).
+	/// The route reaches the same `target` with one forward spent. Building
+	/// it through the budget spends the hop, so a relay cannot stamp a route
+	/// it did not pay for (CWE-834).
 	#[must_use]
 	pub(crate) fn relayed_route(self, target: &Urn<'static>) -> StreamRoute {
 		StreamRoute::relayed_to(target.clone(), self.spend().wire())
@@ -150,7 +150,7 @@ impl HopBudget {
 /// The registry receives this type only after those checks, so signer
 /// identity cannot be transposed with the claimed dial address.
 pub struct AdmittedPeerAd {
-	/// Signer cert fingerprint (claimed address when x509 is off)
+	/// Fingerprint of the signer certificate, which keys the slate.
 	pub(super) peer_hive_id: SharedId,
 	/// Claimed gateway socket every slate entry dials, parsed once.
 	///
@@ -158,7 +158,7 @@ pub struct AdmittedPeerAd {
 	/// scoring lookup and a stored route agree on one spelling of one
 	/// socket.
 	pub(super) dial: PeerAddress,
-	/// Peer-routed entries keyed by `peer_hive_id NUL type`
+	/// Peer-routed entries keyed by `peer_hive_id NUL type`.
 	pub(super) slate: Vec<ServletEntry>,
 	/// Issue order of the signed advertisement frame. Reconciliation
 	/// refuses an order older than the newest applied (CWE-294).
@@ -174,6 +174,9 @@ pub struct AdmittedPeerAd {
 pub struct RelayTrail {
 	/// The composite `origin NUL relay` bucket this slate reconciles under.
 	pub(super) bucket: SharedId,
+	/// The origin whose types the trails reach, and the owner of every
+	/// route in the bucket.
+	pub(super) origin: SharedId,
 	/// Relay-routed entries keyed by `bucket NUL type`.
 	pub(super) slate: Vec<ServletEntry>,
 	/// Issue order of the advertisement the trails derive from.
@@ -181,12 +184,16 @@ pub struct RelayTrail {
 }
 
 impl AdmittedPeerAd {
-	/// Admit a wire advertisement. Fail closed with a refusal status.
+	/// Admits a wire advertisement, failing closed with a refusal status.
 	///
-	/// Resolves the signer (slates key by cert fingerprint, never claimed
-	/// `gateway_addr`), gates colony membership (local and peer certs
-	/// must carry a colony URN SAN), then runs wire checks. Caps and
-	/// local-route conflicts are registry policy under
+	/// The checks run in this order:
+	///
+	/// - The signer MUST resolve on the peer plane, and the slate keys by its
+	///   certificate fingerprint rather than the claimed `gateway_addr`.
+	/// - The local and the peer certificate MUST both carry a colony URN SAN.
+	/// - The wire checks run on the claimed address and advertised types.
+	///
+	/// Caps and local-route conflicts are registry policy under
 	/// [`super::ServletRegistry::reconcile_peer_slate`].
 	pub(crate) fn admit(
 		verified: &VerifiedControlFrame<'_>,
@@ -204,11 +211,10 @@ impl AdmittedPeerAd {
 		let signer_cert = verified.signer_cert();
 		let peer_hive_id = verified.fingerprint().into_shared();
 
-		// Federation is a colony operation: both this gateway and the
-		// advertising peer must carry a valid colony URN SAN. A cert
-		// without one still serves general transport and work, never
-		// membership. Without x509 there is no certificate to carry
-		// membership, so no gate applies.
+		// Federation is a colony operation, so both this gateway and the
+		// advertising peer must carry a valid colony URN SAN. A certificate
+		// without one still serves general transport and work, but it grants
+		// no membership.
 		{
 			let local_member = conf.colony_urn().is_some();
 			let peer_member = conf.namespace.cert_colony_urn(signer_cert).is_some();
@@ -228,7 +234,11 @@ impl AdmittedPeerAd {
 	}
 
 	/// Relay trails through `relay_id`, the gateway that relayed this
-	/// advertisement: one per advertised type, dialing `relay_dial`.
+	/// advertisement, with one trail per advertised type dialing
+	/// `relay_dial`.
+	///
+	/// Returns `None` when the relay is the origin itself or the slate is
+	/// empty.
 	///
 	/// # Failover
 	///
@@ -240,8 +250,8 @@ impl AdmittedPeerAd {
 	/// # Bucket
 	///
 	/// The trails reconcile under their own `origin NUL relay` bucket
-	/// ([`super::ServletRegistry::reconcile_relay_trail`]), so the
-	/// origin's direct slate lifecycle never evicts the fallback.
+	/// (`ServletRegistry::reconcile_relay_trail`), so the origin's direct
+	/// slate lifecycle never evicts the fallback.
 	#[must_use]
 	pub fn relay_trail(
 		&self,
@@ -274,7 +284,7 @@ impl AdmittedPeerAd {
 			})
 			.collect();
 
-		Some(RelayTrail { bucket, slate, order: self.order })
+		Some(RelayTrail { bucket, origin: Arc::clone(&self.peer_hive_id), slate, order: self.order })
 	}
 
 	/// Discovery hint from this admitted advertisement: the verified
@@ -295,7 +305,7 @@ impl AdmittedPeerAd {
 	}
 }
 
-/// Wire-level advertisement checks. No registry lock.
+/// Wire-level advertisement checks, which run without the registry lock.
 fn peer_advertisement_wire_ok(
 	gateway_addr: impl AsRef<[u8]>,
 	types: impl AsRef<[Urn<'static>]>,
@@ -324,11 +334,16 @@ fn peer_advertisement_wire_ok(
 impl ColonyNamespace {
 	/// Colony URN a certificate asserts, when exactly one is present.
 	///
-	/// Membership binds to the URI SAN (RFC 5280 §4.2.1.6), never the
-	/// Subject DN. Non-URI SANs and URIs that fail colony validation in
-	/// this namespace are ignored. `None` when the extension is absent or
-	/// malformed, when no entry validates, or when more than one distinct
-	/// colony URN is present: ambiguous identity fails closed (CWE-706).
+	/// Membership binds to the URI SAN (RFC 5280 §4.2.1.6) rather than the
+	/// Subject DN. Non-URI SANs and URIs that fail colony validation in this
+	/// namespace are ignored.
+	///
+	/// The answer is `None` in each case below, so an ambiguous identity
+	/// fails closed (CWE-706):
+	///
+	/// - The extension is absent or malformed.
+	/// - No entry validates.
+	/// - More than one distinct colony URN is present.
 	#[must_use]
 	pub fn cert_colony_urn(&self, cert: &Certificate) -> Option<Urn<'static>> {
 		let mut colony: Option<Urn<'static>> = None;

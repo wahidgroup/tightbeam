@@ -1,17 +1,21 @@
-//! Shared colony types: load balancers, pheromone metrics, control-plane
-//! helpers, and scaling utilities used by cluster and hive.
+//! This module holds the shared colony types: load balancers, pheromone
+//! metrics, control-plane helpers, and scaling utilities used by cluster and
+//! hive.
 
 pub mod messages;
 pub mod scaling;
 pub mod urn;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::future::Future;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::builder::TypeBuilder;
 use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
-use crate::utils::time::UnixMillis;
+use crate::random::generate_nonce;
 use crate::utils::BasisPoints;
+use crate::{Frame, Message, MessagePriority, TightBeamError, Version};
 
 use crate::runtime::rt;
 
@@ -20,23 +24,21 @@ pub use scaling::*;
 pub use urn::{ColonyNamespace, ColonyResource, ServletTypeKey, COLONY_NID};
 
 /// Pheromone signal one servlet instance carries into a balancing round.
-///
-/// - `pheromone`: stigmergic trail strength in `0..=`[`MAX_PHEROMONE`].
-///   The registry raises it on a successful forward and lowers it on
-///   failure or evaporation. Balancers use it as the sole selection signal.
-/// - `instance_key`: opaque identity (canonical instance-URN bytes).
-///   Balancers treat these bytes as opaque.
 #[derive(Debug, Clone)]
 pub struct InstanceMetrics {
-	/// Opaque instance handle for the balancing round.
+	/// Opaque instance handle for the balancing round, which holds the
+	/// canonical instance-URN bytes. Balancers treat these bytes as opaque.
 	///
 	/// The key is owned on purpose. A borrowed key would put a lifetime
 	/// on the public [`LoadBalancer`] trait and every implementor.
 	/// Canonical instance-URN bytes are short, so the per-round copy is
 	/// bounded and cheaper than that API cost.
 	pub instance_key: Vec<u8>,
-	/// Stigmergic trail strength in `0..=`[`MAX_PHEROMONE`]. Higher is
+	/// Stigmergic trail strength in `0..=`[`MAX_PHEROMONE`], where higher is
 	/// stronger.
+	///
+	/// The registry raises it on a successful forward and lowers it on
+	/// failure or evaporation. Balancers use it as the sole selection signal.
 	pub pheromone: u64,
 }
 
@@ -47,40 +49,47 @@ pub const MAX_PHEROMONE: u64 = 10_000;
 
 /// Default [`StochasticForager`] exploration floor.
 ///
-/// Baseline weight every live instance keeps so a cold instance stays
-/// selectable.
+/// It is the baseline weight every live instance keeps, so a cold instance
+/// stays selectable.
 pub const DEFAULT_EXPLORATION_FLOOR: u64 = MAX_PHEROMONE / 20;
 
 /// Default [`StochasticForager`] repellency threshold.
 ///
-/// Trail strength past which extra pheromone stops attracting and begins
-/// to repel. See [`StochasticForager`] sources.
+/// It is the trail strength past which extra pheromone stops attracting and
+/// begins to repel. See the [`StochasticForager`] sources.
 pub const DEFAULT_REPELLENCY_THRESHOLD: u64 = (MAX_PHEROMONE * 4) / 5;
 
 /// Strategy that selects one instance among candidates of a servlet type.
 ///
-/// Object-safe so [`ClusterConfig`](crate::colony::cluster::ClusterConfig)
-/// can hold `Arc<dyn LoadBalancer>`. The default strategy is
-/// [`StochasticForager`].
+/// The trait is object-safe, so
+/// [`ClusterConfig`](crate::colony::cluster::ClusterConfig) can hold
+/// `Arc<dyn LoadBalancer>`. The default strategy is [`StochasticForager`].
 pub trait LoadBalancer: Send + Sync {
-	/// Choose an index into `candidates`, or `None` when the slice is empty.
+	/// Chooses an index into `candidates`, or returns `None` when the slice
+	/// is empty.
 	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize>;
 }
 
-/// Gamma-stepped sequence so each balancer gets a distinct SplitMix64 stream.
+/// The gamma-stepped sequence that gives each balancer a distinct SplitMix64
+/// stream.
 static BALANCER_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Build the next balancer seed from the sequence XOR the clock.
+/// Builds the next balancer seed from the sequence XOR fresh OS entropy.
 ///
-/// Balancers constructed in the same instant still diverge.
+/// The sequence alone already gives each balancer its own stream, so an
+/// entropy source that fails leaves the streams distinct. The entropy only
+/// keeps two gateways that started together from choosing alike, and a
+/// balancer needs no secret.
 fn fresh_seed() -> u64 {
 	let sequence = BALANCER_SEED_SEQUENCE.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed);
-	sequence ^ UnixMillis::now().get()
+	let entropy = generate_nonce::<8>(None).map_or(0, u64::from_le_bytes);
+	sequence ^ entropy
 }
 
-/// Advance SplitMix64 state and return the mixed output.
+/// Advances the SplitMix64 state and returns the mixed output.
 ///
-/// Reference: Vigna, `splitmix64.c` (2015). See [`SPLITMIX64_GAMMA`].
+/// The mix follows Vigna, `splitmix64.c` (2015). See [`SPLITMIX64_GAMMA`].
+///
 /// One `fetch_add` claims a unique state, so concurrent callers each draw
 /// their own value.
 fn splitmix64_next(state: &AtomicU64) -> u64 {
@@ -96,16 +105,17 @@ fn splitmix64_next(state: &AtomicU64) -> u64 {
 /// Default balancer: stochastic, pheromone-proportional instance selection.
 ///
 /// Each instance is drawn with probability proportional to its foraging
-/// weight, the faithful realization of the stigmergic model the registry
-/// maintains. Unlike a deterministic argmax, equal trails split the load
-/// which spreads load across the eligible instances.
+/// weight, which follows the stigmergic model the registry maintains. A
+/// deterministic argmax would send every call to one of two equal trails,
+/// and the draw splits that load across the eligible instances instead.
 ///
 /// # Behavior
 ///
 /// - **Exploitation**: higher pheromone raises an instance's draw probability.
 /// - **Exploration**: the exploration floor keeps every live instance reachable.
 /// - **Repellency**: past the repellency threshold, additional pheromone
-///   *lowers* the draw weight, stopping any instance from monopolizing the wheel.
+///   *lowers* the draw weight, which stops any instance from monopolizing
+///   the wheel.
 ///
 /// # Configuration
 ///
@@ -151,14 +161,17 @@ impl Default for StochasticForager {
 }
 
 impl StochasticForager {
-	/// Build with a fixed RNG seed for reproducible selection streams.
+	/// Builds a forager with a fixed RNG seed for reproducible selection
+	/// streams.
 	///
-	/// Other knobs keep their defaults. Chain setters to override them.
+	/// The other knobs keep their defaults, and the chained setters override
+	/// them.
 	pub fn with_seed(seed: u64) -> Self {
 		Self { rng: Arc::new(AtomicU64::new(seed)), ..Self::default() }
 	}
 
-	/// Set the exploration floor (default [`DEFAULT_EXPLORATION_FLOOR`]).
+	/// Sets the exploration floor, which defaults to
+	/// [`DEFAULT_EXPLORATION_FLOOR`].
 	///
 	/// A higher floor spreads more. A lower floor exploits strong trails
 	/// harder.
@@ -167,7 +180,8 @@ impl StochasticForager {
 		self
 	}
 
-	/// Set the repellency threshold (default [`DEFAULT_REPELLENCY_THRESHOLD`]).
+	/// Sets the repellency threshold, which defaults to
+	/// [`DEFAULT_REPELLENCY_THRESHOLD`].
 	///
 	/// Trails above the threshold lose pull.
 	pub fn with_repellency_threshold(mut self, threshold: u64) -> Self {
@@ -175,7 +189,8 @@ impl StochasticForager {
 		self
 	}
 
-	/// Roulette-wheel weight: exploration floor plus attractive pheromone.
+	/// Returns the roulette-wheel weight, which is the exploration floor plus
+	/// the attractive pheromone.
 	///
 	/// The pheromone term declines once it crosses the repellency threshold.
 	fn forage_weight(&self, pheromone: u64) -> u64 {
@@ -198,8 +213,9 @@ impl LoadBalancer for StochasticForager {
 				let total: u64 = candidates.iter().map(|c| self.forage_weight(c.pheromone)).sum();
 				let raw = splitmix64_next(&self.rng);
 
-				// Zero floor and dead trails: every weight is zero. Draw
-				// uniformly, which also covers a zero count.
+				// A zero floor with dead trails makes every weight zero, so the
+				// draw is uniform, and the modulo below never sees a zero
+				// total.
 				if total == 0 {
 					return Some((raw as usize) % last_plus_one);
 				}
@@ -221,8 +237,8 @@ impl LoadBalancer for StochasticForager {
 /// Power of Two Choices: probe two distinct random instances and keep the
 /// stronger trail.
 ///
-/// - Spreads concurrent routers across the pool.
-/// - Still favors instances with a stronger pheromone trail.
+/// - The probe spreads concurrent routers across the pool.
+/// - The probe still favors instances with a stronger pheromone trail.
 ///
 /// # Sources
 ///
@@ -247,8 +263,8 @@ impl LoadBalancer for PowerOfTwoChoices {
 			1 => Some(0),
 			2 => Some(usize::from(candidates[1].pheromone > candidates[0].pheromone)),
 			n => {
-				// Split one 64-bit draw into a uniformly distinct pair:
-				// second is drawn from [0, n-1) and shifted past first.
+				// One 64-bit draw splits into a uniform distinct pair: `second`
+				// comes from `[0, n-1)` and shifts past `first`.
 				let draw = splitmix64_next(&self.rng);
 				let first = ((draw >> 32) as usize) % n;
 				let offset = ((draw & u64::from(u32::MAX)) as usize) % (n - 1);
@@ -264,7 +280,8 @@ impl LoadBalancer for PowerOfTwoChoices {
 	}
 }
 
-/// Round-robin: cycle instances in order and ignore pheromone.
+/// Round-robin balancer that cycles through instances in order and ignores
+/// pheromone.
 #[derive(Debug, Clone, Default)]
 pub struct RoundRobin {
 	counter: Arc<AtomicU64>,
@@ -283,8 +300,8 @@ impl LoadBalancer for RoundRobin {
 
 /// Mean utilization across a hive's servlet instances, in basis points.
 ///
-/// - `total_utilization`: sum of per-instance basis points.
-/// - `instance_count`: number of instances in that sum.
+/// - `total_utilization` is the sum of per-instance basis points.
+/// - `instance_count` is the number of instances in that sum.
 ///
 /// A hive with zero instances returns [`BasisPoints::MAX`] so backpressure
 /// and heartbeats report saturation. Per-type scaling still sees the zero
@@ -296,35 +313,23 @@ pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> B
 	}
 }
 
-/// Build a V0 response frame that echoes the request id.
-pub fn reply_frame<M: crate::Message>(
-	id: impl AsRef<[u8]>,
-	message: M,
-) -> Result<Option<crate::Frame>, crate::TightBeamError> {
-	use crate::builder::TypeBuilder;
-
-	let frame = crate::Version::V0
-		.compose()
-		.with_id(id)
-		.with_order(0)
-		.with_message(message)
-		.build()?;
+/// Builds a V0 response frame that echoes the request id.
+pub fn reply_frame<M: Message>(id: impl AsRef<[u8]>, message: M) -> Result<Option<Frame>, TightBeamError> {
+	let frame = Version::V0.compose().with_id(id).with_order(0).with_message(message).build()?;
 
 	Ok(Some(frame))
 }
 
-/// Build a V2 response frame with an explicit priority.
+/// Builds a V2 response frame with an explicit priority.
 ///
 /// Heartbeat replies use `NetworkControl` so monitoring stays distinct
 /// from work traffic.
-pub fn reply_frame_with_priority<M: crate::Message>(
+pub fn reply_frame_with_priority<M: Message>(
 	id: impl AsRef<[u8]>,
-	priority: crate::MessagePriority,
+	priority: MessagePriority,
 	message: M,
-) -> Result<Option<crate::Frame>, crate::TightBeamError> {
-	use crate::builder::TypeBuilder;
-
-	let frame = crate::Version::V2
+) -> Result<Option<Frame>, TightBeamError> {
+	let frame = Version::V2
 		.compose()
 		.with_id(id)
 		.with_order(0)
@@ -335,31 +340,27 @@ pub fn reply_frame_with_priority<M: crate::Message>(
 	Ok(Some(frame))
 }
 
-/// Whether a runtime has entered drain, and since when.
+/// Whether a runtime has entered drain.
 ///
 /// Drain is one fact read from several places: the control plane refuses
 /// new manage work, the scaling loop stops changing the slate, and the
-/// re-announce loop stops advertising a hive that is going away. Each
-/// reading the same handle keeps those decisions from disagreeing.
+/// re-announce loop stops advertising a hive that is going away. Every
+/// reader holds the same handle, so those decisions agree.
 ///
 /// Drain is terminal. A runtime that has entered it stays in it.
 #[derive(Clone, Default)]
-pub struct DrainMode(std::sync::Arc<std::sync::RwLock<Option<std::time::Instant>>>);
+pub struct DrainMode(Arc<AtomicBool>);
 
 impl DrainMode {
-	/// Enters drain, keeping the instant of the first entry.
+	/// Enters drain.
 	pub fn begin(&self) {
-		let Ok(mut since) = self.0.write() else {
-			return;
-		};
-
-		since.get_or_insert_with(std::time::Instant::now);
+		self.0.store(true, Ordering::Release);
 	}
 
 	/// Whether drain has begun.
 	#[must_use]
 	pub fn is_draining(&self) -> bool {
-		self.0.read().is_ok_and(|since| since.is_some())
+		self.0.load(Ordering::Acquire)
 	}
 }
 
@@ -375,7 +376,7 @@ impl DrainMode {
 /// meant to end it (CWE-772), which is why the group is the only spawn path
 /// these runtimes offer.
 #[derive(Clone, Default)]
-pub struct TaskGroup(std::sync::Arc<std::sync::Mutex<TaskGroupState>>);
+pub struct TaskGroup(Arc<Mutex<TaskGroupState>>);
 
 /// Running handles, and whether the group has stopped.
 #[derive(Default)]
@@ -411,7 +412,7 @@ impl TaskGroup {
 	/// Runs `task` under this group's ownership.
 	pub fn spawn<F>(&self, task: F)
 	where
-		F: core::future::Future<Output = ()> + Send + 'static,
+		F: Future<Output = ()> + Send + 'static,
 	{
 		self.adopt(rt::spawn(task));
 	}
@@ -434,13 +435,14 @@ impl TaskGroup {
 
 #[cfg(test)]
 mod tests {
-	use super::{DrainMode, TaskGroup};
+	use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+	use core::time::Duration;
+
 	use std::collections::HashSet;
-	use std::time::Duration;
 
 	use super::{
-		InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager, DEFAULT_EXPLORATION_FLOOR,
-		DEFAULT_REPELLENCY_THRESHOLD, MAX_PHEROMONE,
+		DrainMode, InstanceMetrics, LoadBalancer, PowerOfTwoChoices, RoundRobin, StochasticForager, TaskGroup,
+		DEFAULT_EXPLORATION_FLOOR, DEFAULT_REPELLENCY_THRESHOLD, MAX_PHEROMONE,
 	};
 
 	fn pool(pheromones: impl AsRef<[u64]>) -> Vec<InstanceMetrics> {
@@ -580,13 +582,13 @@ mod tests {
 		assert_eq!(seen.len(), dead.len());
 	}
 
-	/// Cases: (total_utilization, instance_count, expected_bps)
+	/// Each case is a `(total_utilization, instance_count, expected_bps)` row.
 	const AGGREGATE_CASES: &[(u64, usize, u16)] = &[
-		(0, 0, 10000),     // no instances -> saturated, route elsewhere
-		(0, 4, 0),         // all idle
-		(20000, 4, 5000),  // uniform mean
-		(10000, 2, 5000),  // one loaded type + one idle type
-		(40000, 4, 10000), // fully loaded
+		(0, 0, 10000),     // With no instances, the hive reports saturation so work routes elsewhere.
+		(0, 4, 0),         // Every instance is idle.
+		(20000, 4, 5000),  // The instances share one uniform mean.
+		(10000, 2, 5000),  // One loaded type and one idle type average to half.
+		(40000, 4, 10000), // Every instance is fully loaded.
 	];
 
 	#[test]
@@ -609,73 +611,93 @@ mod tests {
 		assert!(reader.is_draining());
 	}
 
-	/// Handles the group is still holding.
+	/// Counts the handles the group still holds.
 	fn owned(group: &TaskGroup) -> usize {
 		group.0.lock().expect("task group lock").running.len()
 	}
 
-	#[tokio::test]
+	/// A span longer than any test moves its clock. A task that sleeps it out
+	/// and then finishes was never stopped.
+	const LONG_RUN: Duration = Duration::from_secs(30);
+
+	/// The pause between two beats of the running task.
+	const BEAT: Duration = Duration::from_millis(5);
+
+	/// Moves the paused test clock forward by `span` and lets every task it
+	/// woke run.
+	///
+	/// The test runtime runs on one thread, so the yield hands that thread to
+	/// each task the advance made ready before the test reads what it did.
+	async fn advance_past(span: Duration) {
+		tokio::time::advance(span).await;
+		tokio::task::yield_now().await;
+	}
+
+	#[tokio::test(start_paused = true)]
 	async fn stopping_a_group_aborts_the_work_it_owns() {
-		static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+		static FINISHED: AtomicBool = AtomicBool::new(false);
 
 		let group = TaskGroup::default();
 		group.spawn(async {
-			tokio::time::sleep(Duration::from_secs(30)).await;
-			FINISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+			tokio::time::sleep(LONG_RUN).await;
+			FINISHED.store(true, Ordering::SeqCst);
 		});
 
 		tokio::task::yield_now().await;
 		group.abort_all();
-		tokio::time::sleep(Duration::from_millis(50)).await;
-		assert!(!FINISHED.load(std::sync::atomic::Ordering::SeqCst));
+		advance_past(LONG_RUN * 2).await;
+		assert!(!FINISHED.load(Ordering::SeqCst));
 	}
 
 	/// A beat already past its own checks is ended by the group that owns
 	/// it, so work cannot outlast the stop that withdrew its routes
 	/// (CWE-362).
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn a_running_task_ends_when_its_group_stops() {
-		static BEATS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+		static BEATS: AtomicUsize = AtomicUsize::new(0);
 
 		let group = TaskGroup::default();
 		group.spawn(async {
 			loop {
-				BEATS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-				tokio::time::sleep(Duration::from_millis(5)).await;
+				BEATS.fetch_add(1, Ordering::SeqCst);
+				tokio::time::sleep(BEAT).await;
 			}
 		});
 
-		tokio::time::sleep(Duration::from_millis(30)).await;
+		tokio::task::yield_now().await;
 		group.abort_all();
-		let settled = BEATS.load(std::sync::atomic::Ordering::SeqCst);
+		let settled = BEATS.load(Ordering::SeqCst);
+		assert_ne!(settled, 0);
 
-		tokio::time::sleep(Duration::from_millis(40)).await;
-		assert_eq!(BEATS.load(std::sync::atomic::Ordering::SeqCst), settled);
+		advance_past(BEAT * 8).await;
+		assert_eq!(BEATS.load(Ordering::SeqCst), settled);
 	}
 
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn work_started_after_the_stop_does_not_outlive_it() {
-		static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+		static FINISHED: AtomicBool = AtomicBool::new(false);
 
 		let group = TaskGroup::default();
 		group.abort_all();
 		group.spawn(async {
-			tokio::time::sleep(Duration::from_millis(10)).await;
-			FINISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+			tokio::time::sleep(BEAT).await;
+			FINISHED.store(true, Ordering::SeqCst);
 		});
 
-		tokio::time::sleep(Duration::from_millis(50)).await;
-		assert!(!FINISHED.load(std::sync::atomic::Ordering::SeqCst));
+		advance_past(BEAT * 8).await;
+		assert!(!FINISHED.load(Ordering::SeqCst));
 		assert_eq!(owned(&group), 0);
 	}
 
+	/// The test runtime runs on one thread, so the yield runs the empty task
+	/// to its end before the second spawn sweeps the group.
 	#[tokio::test]
 	async fn a_finished_task_leaves_the_group_on_the_next_spawn() {
 		let group = TaskGroup::default();
 		group.spawn(async {});
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		tokio::task::yield_now().await;
 
-		group.spawn(std::future::pending());
+		group.spawn(core::future::pending());
 		assert_eq!(owned(&group), 1);
 	}
 }

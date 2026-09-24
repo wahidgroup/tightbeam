@@ -56,7 +56,11 @@ pub enum SessionPhase {
 	/// this phase fails with [`TransportFailure::EncryptorUnavailable`].
 	Provisioned,
 	/// A handshake is in flight, measured against `initiated_at`.
-	Handshaking { initiated_at: MonotonicInstant },
+	Handshaking {
+		/// The instant the handshake began, on the endpoint's clock. The
+		/// handshake deadline counts from it.
+		initiated_at: MonotonicInstant,
+	},
 	/// The handshake completed. The phase carries everything it agreed, so a
 	/// session's keys and the terms that go with them cannot be separated, and
 	/// leaving this phase drops all of them together.
@@ -241,8 +245,9 @@ impl<P: CryptoProvider> SessionState<P> {
 	/// Detach the established session, returning this state to its start.
 	///
 	/// A caller that splits the endpoint into halves uses it. The halves take
-	/// the keys, and the state they leave behind holds none.
-	#[cfg(any(feature = "tcp", feature = "async-transport"))]
+	/// the keys, and the state they leave behind holds none. Only the async
+	/// transport splits, so the method exists where that transport does.
+	#[cfg(any(feature = "tokio", feature = "async-transport"))]
 	pub(crate) fn take_established(&mut self) -> Option<Box<EstablishedSession>> {
 		if !self.phase.requires_encryption() {
 			return None;
@@ -473,8 +478,8 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 #[derive(Clone)]
 pub struct EncryptionConfig<P: CryptoProvider> {
 	/// Trust store that validates the peer's certificate. `None` leaves the
-	/// peer identity to a lower layer, which
-	/// [`Self::check_peer_authentication`] requires the endpoint to have named.
+	/// peer identity to a lower layer, which [`Self::check_dial_permitted`]
+	/// requires the endpoint to have named.
 	pub(crate) trust_store: Option<Arc<dyn CertificateTrust>>,
 	/// Local server certificate this endpoint presents.
 	pub(crate) server_certificate: Option<Arc<Certificate>>,
@@ -548,8 +553,8 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	pub fn is_provisioned(&self) -> bool {
 		// The binding destructures without `..`, so a field added to this
 		// configuration stops compiling here until someone says whether it
-		// implies a handshake. The alternative is a new kind of encryption
-		// material that silently leaves the endpoint in `Cleartext` (CWE-311).
+		// implies a handshake. Without that break, a new kind of encryption
+		// material would silently leave the endpoint in `Cleartext` (CWE-311).
 		let Self {
 			server_certificate,
 			trust_store,
@@ -670,8 +675,8 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 	///
 	/// [`TransportEncryptionConfig`] holds a server certificate instead of an
 	/// `Option` of one, so [`EncryptionConfig::is_provisioned`] holds for every
-	/// value it converts to and the rule has no work to do. It is the only
-	/// caller. Everything else goes through [`Self::new`].
+	/// value it converts to and the rule has no work to do. That conversion is
+	/// the only caller, and every other path goes through [`Self::new`].
 	///
 	/// [`TransportEncryptionConfig`]: crate::transport::TransportEncryptionConfig
 	pub(crate) fn from_peer_authority(encryption: EncryptionConfig<P>) -> Self {
@@ -1023,7 +1028,7 @@ mod tests {
 	#[cfg(all(
 		feature = "testing",
 		feature = "secp256k1",
-		any(feature = "tcp", feature = "async-transport")
+		any(feature = "tokio", feature = "async-transport")
 	))]
 	#[test]
 	fn taking_the_established_session_returns_the_state_to_its_start() {

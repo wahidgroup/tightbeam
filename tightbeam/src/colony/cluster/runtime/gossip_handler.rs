@@ -49,8 +49,8 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return Refusal::to(&frame, &self.trace).peer_ad(freshness_status);
 		}
 
-		// `admit` binds signer fingerprint to dial address, so the pair holds
-		// together.
+		// `admit` binds the signer fingerprint to the dial address, so the
+		// rest of this handler reads one bound pair.
 		let admitted = match AdmittedPeerAd::admit(&verified, &advertisement, &self.config) {
 			Ok(admitted) => admitted,
 			Err(status) => {
@@ -58,12 +58,14 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			}
 		};
 
-		// A verified advertiser is also a discovery hint: without it the
-		// beat graph stays unidirectional and a seed-bootstrapped node is
-		// dialed on this gateway's own probe. The hint sits in the capped
-		// new table until this gateway's own probe passes the colony gate.
+		// A verified advertiser is also a discovery hint, so the beat graph
+		// runs in both directions and this gateway's own probe dials a
+		// seed-bootstrapped node. The hint sits in the capped new table until
+		// that probe passes the colony gate.
 		let hint = admitted.discovery_hint();
-		let _ = self.config.peer.table.learn([hint]);
+		if self.config.peer.table.learn([hint]).is_err() {
+			return Refusal::to(&frame, &self.trace).peer_ad_release(&self.replay_guard, TransitStatus::Unavailable);
+		}
 
 		if let Err(error) = self.servlet_registry.reconcile_peer_slate(admitted, PeerCaps::default()) {
 			let status = match error {
@@ -106,8 +108,9 @@ where
 		rumor: Box<Frame>,
 	) -> Result<Option<Frame>, TightBeamError> {
 		let rumor = *rumor;
-		// Colony flood scope (CWE-668): peer MUST share gateway's colony URN.
-		// Mismatch is policy refusal. Do not score the relay.
+		// The flood is scoped to one colony (CWE-668), so the relaying peer
+		// MUST share this gateway's colony URN. A mismatch is a policy
+		// refusal, so the relay's score stays as it is.
 		let Some(local_colony) = self.config.colony_urn() else {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		};
@@ -126,18 +129,18 @@ where
 			}
 		};
 
-		// Outer `lifetime` is hop-authenticated. Missing TTL is relay
-		// misbehavior.
+		// The outer `lifetime` is hop-authenticated, so a missing TTL is relay
+		// misbehavior and scores the relay.
 		let hop_ttl = match frame.metadata().lifetime() {
 			Some(hop_ttl) => hop_ttl,
 			None => {
-				self.weaken_invalid_relay(GossipOrigin::Relay, Some(&relay_id))?;
-				return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
+				let scored = self.weaken_invalid_relay(GossipOrigin::Relay, Some(&relay_id));
+				return Refusal::to(&frame, &self.trace).gossip_scored(scored, TransitStatus::PermissionDenied);
 			}
 		};
 
-		// Origin signature on the peer trust plane. Unverifiable rumor scores
-		// the relay.
+		// The origin signature verifies on the peer trust plane, and an
+		// unverifiable rumor scores the relay.
 		let (origin_colony, rumor_signer) = match self.config.verify_peer(&rumor) {
 			Ok(verified) => {
 				let colony = self.config.namespace.cert_colony_urn(verified.signer_cert());
@@ -145,21 +148,22 @@ where
 				(colony, signer)
 			}
 			Err(status) => {
-				self.weaken_invalid_relay(GossipOrigin::Relay, Some(&relay_id))?;
-				return Refusal::to(&frame, &self.trace).gossip(status);
+				let scored = self.weaken_invalid_relay(GossipOrigin::Relay, Some(&relay_id));
+				return Refusal::to(&frame, &self.trace).gossip_scored(scored, status);
 			}
 		};
 		if origin_colony.as_ref() != Some(local_colony) {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		}
 
-		// Freshness uses rumor issue time in `admit` (seen-ttl), not the
-		// control window.
+		// Freshness for a relayed rumor is its issue time, which `admit`
+		// checks against the seen TTL (seen-ttl) rather than the control
+		// window.
 		self.run::<D>(GossipOrigin::Relay, frame, rumor, hop_ttl, Some(relay_id), Some(rumor_signer))
 			.await
 	}
 
-	/// Mint and flood origin-signed gossip from a local hive-plane publisher.
+	/// Signs and floods origin gossip from a local hive-plane publisher.
 	pub(crate) async fn publish<D: ClusterDigest>(
 		self,
 		frame: Frame,
@@ -169,17 +173,19 @@ where
 			return Refusal::to(&frame, &self.trace).gossip(status);
 		}
 
-		// Origin mint scopes the flood by this gateway's colony SAN.
+		// An origin rumor is scoped by this gateway's colony SAN, which the
+		// gateway MUST hold to publish.
 		if self.config.colony_urn().is_none() {
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::PermissionDenied);
 		}
 
-		// Clamp hop radius outside the rumor body so identity stays stable.
+		// The hop radius is clamped outside the rumor body, so the rumor
+		// identity stays stable.
 		let radius_cap = u64::from(self.config.gossip.ttl.min(MAX_GOSSIP_TTL));
 		let hop_ttl = frame.metadata().lifetime().unwrap_or(radius_cap).min(radius_cap);
 
-		// Copy id/order from publish so replay remints an identical digest
-		// (CWE-294).
+		// The rumor copies the id and order of the publish frame, so a
+		// replayed publish rebuilds an identical digest (CWE-294).
 		let peer_ad = matches!(body.kind, GossipRumorKind::PeerAdvertisement);
 		let rumor = FrameBuilder::from(Version::V2)
 			.with_id(frame.metadata().id())
@@ -200,8 +206,9 @@ where
 			return Refusal::to(&frame, &self.trace).gossip(TransitStatus::Unavailable);
 		}
 
-		// Local peer-ad apply names the signer this mint proved.
-		// Hive-plane publish still floods when peer trust has no self anchor.
+		// A local peer-ad apply names the signer that this signing step
+		// proved. A hive-plane publish floods even when peer trust holds no
+		// anchor for this gateway, and the signer is then `None`.
 		let rumor_signer = if peer_ad {
 			self.config.verify_peer(&rumor).map(|verified| verified.fingerprint()).ok()
 		} else {
@@ -229,25 +236,23 @@ impl ClusterConfig {
 	///
 	/// - CWE-770, allocation of resources without limits or throttling:
 	///   <https://cwe.mitre.org/data/definitions/770.html>
-	fn pex_sample(&self, servlet_registry: &ServletRegistry) -> Vec<PeerGossip> {
-		let verified = self
-			.peer
-			.table
-			.sample_for_pex(MAX_PEX_SAMPLE)
-			.unwrap_or_default()
-			.into_iter()
-			.map(|record| PeerGossip {
-				peer_id: record.peer_id.unwrap_or_default(),
-				gateway_addr: record.gateway_addr.to_string().into_bytes(),
-			});
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::LockPoisoned`] -- the discovery table or the route registry is poisoned.
+	fn pex_sample(&self, servlet_registry: &ServletRegistry) -> Result<Vec<PeerGossip>, ClusterError> {
+		let sampled = self.peer.table.sample_for_pex(MAX_PEX_SAMPLE)?;
+		let verified = sampled.into_iter().map(|record| PeerGossip {
+			peer_id: record.peer_id.unwrap_or_default(),
+			gateway_addr: record.gateway_addr.to_string().into_bytes(),
+		});
 
 		// Registry entries are borrowed, so the wire message copies them once.
-		// Only direct routes qualify: a relay trail pairs the origin's
-		// identity with the relay's dial address, which is not a dialable
-		// hint.
-		let routes = servlet_registry
-			.peer_entries()
-			.unwrap_or_default()
+		// Only direct routes qualify, because a relay trail pairs the origin's
+		// identity with the relay's dial address, and that pair names no
+		// dialable peer.
+		let peer_entries = servlet_registry.peer_entries()?;
+		let routes = peer_entries
 			.into_iter()
 			.filter(|entry| entry.route_kind() == RouteKind::Peer)
 			.map(|entry| PeerGossip { peer_id: entry.owner_id().to_vec(), gateway_addr: entry.dial_target().to_vec() });
@@ -264,7 +269,7 @@ impl ClusterConfig {
 			}
 		}
 
-		pex
+		Ok(pex)
 	}
 }
 
@@ -291,21 +296,24 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}
 
-		// Cap held digests at journal capacity (CWE-770).
+		// The held digest list is capped at journal capacity (CWE-770).
 		if reconciliation.held.len() > MAX_GOSSIP_LOG {
 			return Refusal::to(&frame, &self.trace).reconcile();
 		}
 
-		// A journal fault yields an empty want. Repair waits for a later beat.
-		let want = match self.config.gossip.journal.held_digests(self.config.clock.unix()) {
-			Ok(held) => gossip_want(&reconciliation.held, &held),
-			Err(_) => Vec::new(),
+		// A journal, table or registry this gateway cannot read refuses the
+		// round, so the requester repairs from a member that can answer.
+		let Ok(held) = self.config.gossip.journal.held_digests(self.config.clock.unix()) else {
+			return Refusal::to(&frame, &self.trace).reconcile();
 		};
+		let want = gossip_want(&reconciliation.held, &held);
 
 		// The reply carries the peer-exchange sample, the GossipSub v1.1 PX
 		// piggyback shape. A seed-bootstrapped requester discovers the
 		// colony graph on its existing beat with no extra round trip.
-		let pex = self.config.pex_sample(&self.servlet_registry);
+		let Ok(pex) = self.config.pex_sample(&self.servlet_registry) else {
+			return Refusal::to(&frame, &self.trace).reconcile();
+		};
 
 		reply_frame(frame.metadata().id(), GossipWant { want, pex })
 	}

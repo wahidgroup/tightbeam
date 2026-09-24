@@ -114,7 +114,6 @@ async fn pooled_lease(
 		idle_timeout: None,
 		max_connections: 1,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
-		..PoolConfig::default()
 	};
 
 	let pool = Arc::new(

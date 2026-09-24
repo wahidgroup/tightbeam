@@ -43,7 +43,7 @@ pub(crate) const DENY_LIST_BARS_THE_DOOR: Urn<'static> =
 	tightbeam::urn!("test", "event:peer-list/deny-list-bars-the-door");
 pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = tightbeam::urn!("test", "event:peer-list/handler-never-invoked");
 
-/// Mutual-auth doorman fixture: server materials, the client identity
+/// A mutual-auth doorman fixture: the server materials, the client identity
 /// the gate lists, and whether any frame got past the door.
 struct DoormanContext {
 	materials: ServerMaterials,
@@ -72,8 +72,8 @@ impl DoormanContext {
 	}
 }
 
-/// Echo server with a peer-list door gate ahead of the handler; verdicts
-/// audit into `trace`.
+/// An echo server with a peer-list door gate ahead of the handler. The gate
+/// verdicts audit into `trace`.
 async fn start_doorman_server(
 	ctx: &Arc<DoormanContext>,
 	gate: PeerListGate,
@@ -103,7 +103,7 @@ async fn start_doorman_server(
 	Ok((handle, addr))
 }
 
-/// Pool dialing with the client identity the gate lists.
+/// Builds a pool that dials with the client identity the gate lists.
 fn doorman_pool(
 	ctx: &DoormanContext,
 	trace: &TraceCollector,
@@ -116,7 +116,6 @@ fn doorman_pool(
 		idle_timeout: None,
 		max_connections: 1,
 		mux_offer: Some(Arc::new(TransportOffer::mux(1))),
-		..PoolConfig::default()
 	};
 
 	let pool = Arc::new(
@@ -130,7 +129,7 @@ fn doorman_pool(
 	Ok(pool)
 }
 
-/// One knock on the door: emit a frame and report whether it echoed.
+/// Knocks once on the door: emits a frame and reports whether it echoed.
 async fn knock(lease: &mut PooledClient<TokioListener>) -> Result<bool, TightBeamError> {
 	let frame = TestFrame::v0(Some("door-knock"), None);
 	let reply = lease.emit(frame.to_owned(), None).await?;

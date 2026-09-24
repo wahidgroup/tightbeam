@@ -14,8 +14,8 @@
 //!
 //! A rumor is an origin-signed [`Frame`]. The accepting gateway signs
 //! once. Later hops and anti-entropy repair carry those same signed bytes.
-//! Hop radius lives in OUTER relay-frame `metadata.lifetime`, not in the
-//! content digest.
+//! Hop radius lives in the OUTER relay frame's `metadata.lifetime` rather
+//! than in the content digest.
 //!
 //! # Admission path
 //!
@@ -44,16 +44,18 @@ use crate::{decode, encode};
 
 /// Fixed 32-byte content digest of a gossip rumor.
 ///
-/// Algorithm is the deployment crypto-profile digest. Every gateway MUST
-/// derive the same digest for the same rumor.
+/// The algorithm is the deployment crypto-profile digest. Every gateway
+/// MUST derive the same digest for the same rumor.
 pub type GossipDigest = [u8; 32];
 
 /// Whether a recorded rumor is newly seen or a suppressed duplicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
-	/// Digest was unseen and is now recorded. Deliver and forward it.
+	/// The digest was unseen and is now recorded, so the caller delivers and
+	/// forwards the rumor.
 	New,
-	/// Digest was already recorded in the window. Drop the rumor.
+	/// The digest was already recorded in the window, so the caller drops
+	/// the rumor.
 	Duplicate,
 }
 
@@ -106,7 +108,7 @@ pub fn gossip_want(advertised: impl AsRef<[Vec<u8>]>, held: impl AsRef<[GossipDi
 /// Digests from a peer want-list that decode to a fixed 32-byte digest.
 ///
 /// Wrong-length entries cannot be retained digests and are dropped
-/// (CWE-20). Duplicates collapse to one so a peer MUST NOT multiply
+/// (CWE-20). Duplicates collapse to one, because a peer MUST NOT multiply
 /// repair pushes (CWE-770).
 #[must_use]
 pub fn wanted_digests(want: impl AsRef<[Vec<u8>]>) -> Vec<GossipDigest> {
@@ -139,16 +141,20 @@ pub struct AdmittedGossip {
 }
 
 impl AdmittedGossip {
-	/// Admit one rumor frame. Fail closed with a refusal status.
+	/// Admits one rumor frame, failing closed with a refusal status.
 	///
-	/// `ttl` is the remaining hop radius from OUTER `metadata.lifetime`.
-	/// Freshness uses rumor `metadata.order` as the signed issue time.
+	/// `ttl` is the remaining hop radius from the OUTER `metadata.lifetime`.
+	/// Freshness uses the rumor's `metadata.order` as the signed issue time.
 	///
 	/// # Refusal
 	///
-	/// Refuse decode failure, oversized payload, `ttl` above
-	/// [`MAX_GOSSIP_TTL`], or a stale issue time. Cap hop radius here at
-	/// the trust boundary (CWE-770).
+	/// Each of these refuses the rumor:
+	///
+	/// - The rumor body does not decode.
+	/// - The payload exceeds [`MAX_GOSSIP_PAYLOAD_BYTES`].
+	/// - `ttl` exceeds [`MAX_GOSSIP_TTL`], which caps the hop radius here at
+	///   the trust boundary (CWE-770).
+	/// - The issue time is stale.
 	pub fn admit<D>(rumor: &Frame, ttl: u64, seen_ttl: Duration, now: UnixMillis) -> Result<Self, TransitStatus>
 	where
 		D: Digest + OutputSizeUser<OutputSize = U32>,
@@ -208,8 +214,8 @@ impl AdmittedGossip {
 pub trait GossipAdmission: Send + Sync {
 	/// Admit one rumor from `signer` at `now`.
 	///
-	/// `false` means over limit. An error reports a backend fault.
-	/// The gateway refuses in both cases.
+	/// `false` means the signer is over its limit, and an error reports a
+	/// backend fault. The gateway refuses in both cases.
 	fn allow(&self, signer: &[u8], now: UnixMillis) -> Result<bool, ClusterError>;
 }
 
@@ -237,13 +243,15 @@ pub struct TokenBucketAdmission {
 }
 
 impl TokenBucketAdmission {
-	/// Burst and refill interval with the default tracked-signer ceiling.
+	/// Builds an admission from `burst` and `refill_interval` with the default
+	/// tracked-signer ceiling.
 	#[must_use]
 	pub fn new(burst: u32, refill_interval: Duration) -> Self {
 		Self::with_limits(burst, refill_interval, MAX_GOSSIP_RATE_SIGNERS)
 	}
 
-	/// Burst, refill, and signer ceiling.
+	/// Builds an admission from `burst`, `refill_interval`, and a
+	/// tracked-signer ceiling of `capacity`.
 	///
 	/// A zero interval refills once per millisecond.
 	#[must_use]
@@ -256,8 +264,9 @@ impl TokenBucketAdmission {
 		}
 	}
 
-	/// Drop buckets that have regained full capacity in either clock direction.
-	/// A full bucket is indistinguishable from an absent one.
+	/// Drop buckets that have regained full capacity in either clock
+	/// direction, because a full bucket is indistinguishable from an absent
+	/// one.
 	fn prune(buckets: &mut HashMap<Vec<u8>, TokenBucket>, burst: u32, refill_interval: Duration, now: UnixMillis) {
 		let full_after = refill_interval.saturating_mul(burst);
 		buckets.retain(|_, bucket| now.abs_diff(bucket.refilled_at) < full_after);
@@ -313,17 +322,18 @@ impl GossipAdmission for TokenBucketAdmission {
 
 /// Deduplication and retention store for delivery and anti-entropy.
 ///
-/// The gateway calls only this interface. The in-memory default gives
-/// bounded-window eventual delivery. A durable backend can retain across
-/// restarts. Errors are typed [`ClusterError`] variants.
+/// The gateway reaches the journal through this interface alone. The
+/// in-memory default gives bounded-window eventual delivery, and a durable
+/// backend can retain across restarts. Errors are typed [`ClusterError`]
+/// variants.
 pub trait GossipJournal: Send + Sync {
 	/// Deduplicate and retain one origin-signed rumor in a single step.
 	///
 	/// The rumor is retained unchanged so anti-entropy repair can
 	/// forward identical origin-signed bytes. Returns
 	/// [`Admission::New`] when unseen and now recorded, and
-	/// [`Admission::Duplicate`] when already retained. Fails closed at
-	/// capacity.
+	/// [`Admission::Duplicate`] when already retained. The call fails closed
+	/// at capacity.
 	fn record(
 		&self,
 		signer: &[u8],
@@ -347,7 +357,8 @@ pub trait GossipJournal: Send + Sync {
 	///   [`GossipJournal::fetch`], or [`GossipJournal::pending_local`].
 	///
 	/// Returns [`Admission::New`] when unseen and now witnessed, or
-	/// [`Admission::Duplicate`] when already seen. Fails closed at capacity.
+	/// [`Admission::Duplicate`] when already seen. The call fails closed at
+	/// capacity.
 	fn witness(&self, signer: &[u8], digest: GossipDigest, now: UnixMillis) -> Result<Admission, ClusterError>;
 
 	/// Whether a digest is already retained or witnessed, without recording it.
@@ -355,9 +366,9 @@ pub trait GossipJournal: Send + Sync {
 	/// Probed before rate admission so a duplicate does not spend a signer's
 	/// token: relay echoes are normal and MUST NOT drain the bucket.
 	///
-	/// Advisory only. [`GossipJournal::record`] and
+	/// The probe is advisory. [`GossipJournal::record`] and
 	/// [`GossipJournal::witness`] remain the atomic dedup steps for races
-	/// past the probe.
+	/// past it.
 	fn seen(&self, digest: &GossipDigest, now: UnixMillis) -> Result<bool, ClusterError>;
 
 	/// Digests still inside the retention window, for reconciliation summaries.
@@ -404,7 +415,7 @@ struct JournalEntry {
 ///
 /// A retained rumor serves anti-entropy repair and local delivery retry.
 /// A witnessed digest serves dedup only and holds no bytes. The retained
-/// rumor is boxed so a witnessed entry costs one pointer, never a full
+/// rumor is boxed so a witnessed entry costs one pointer rather than a full
 /// inline [`Frame`].
 enum JournalBody {
 	Retained { rumor: Box<Frame>, local: LocalDelivery },
@@ -433,8 +444,8 @@ pub enum LocalClaim {
 /// # Exits
 ///
 /// - Dropping the guard releases the claim, so the rumor returns to the retry set.
-/// - [`Self::ack`] retires the entry instead, and is the only exit that stops the rumor being
-///   retried.
+/// - [`Self::ack`] retires the entry instead, and is the only exit that
+///   stops the rumor being retried.
 pub struct LocalClaimGuard<'a> {
 	journal: &'a dyn GossipJournal,
 	digest: &'a GossipDigest,
@@ -448,31 +459,47 @@ impl<'a> LocalClaimGuard<'a> {
 	/// Claim `digest` for one delivery, or [`None`] when another task holds
 	/// it.
 	///
-	/// A journal lock is poisoned only by a panic this crate forbids, so a
-	/// refused claim skips this round the way a held one does.
-	pub fn take(journal: &'a dyn GossipJournal, digest: &'a GossipDigest, now: UnixMillis) -> Option<Self> {
-		match journal.claim_local(digest, now) {
-			Ok(LocalClaim::Taken) => Some(Self { journal, digest, retries: true }),
-			Ok(LocalClaim::Untracked) => Some(Self { journal, digest, retries: false }),
-			Ok(LocalClaim::Held) | Err(_) => None,
-		}
+	/// # Errors
+	///
+	/// - [`ClusterError`] -- the journal's own fault, which the caller
+	///   propagates, because a journal that cannot answer the claim cannot
+	///   answer the ack either.
+	pub fn take(
+		journal: &'a dyn GossipJournal,
+		digest: &'a GossipDigest,
+		now: UnixMillis,
+	) -> Result<Option<Self>, ClusterError> {
+		let claim = match journal.claim_local(digest, now)? {
+			LocalClaim::Taken => Some(Self { journal, digest, retries: true }),
+			LocalClaim::Untracked => Some(Self { journal, digest, retries: false }),
+			LocalClaim::Held => None,
+		};
+
+		Ok(claim)
 	}
 
 	/// Record the rumor as delivered, so it stops being retried.
-	pub fn ack(mut self) {
-		// An unrecorded ack leaves the digest claimed until retention drops
-		// it, which is the same outcome a poisoned lock gives every other
-		// journal call.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError`] -- the journal's own fault. The claim is released
+	///   to the retry set on the way out, so an unrecorded delivery is offered
+	///   again rather than stranded.
+	pub fn ack(mut self) -> Result<(), ClusterError> {
+		self.journal.ack_local(self.digest)?;
 		self.retries = false;
-		let _ = self.journal.ack_local(self.digest);
+
+		Ok(())
 	}
 }
 
 impl Drop for LocalClaimGuard<'_> {
 	fn drop(&mut self) {
 		if self.retries {
-			// The retry beat offers the rumor again. A poisoned lock leaves
-			// it claimed until retention drops it.
+			// The retry beat offers the rumor again. A destructor has no
+			// caller to answer, and a journal that refuses the release
+			// refuses the next claim the same way, so the fault is seen
+			// there.
 			let _ = self.journal.release_local(self.digest);
 		}
 	}
@@ -484,11 +511,11 @@ impl Drop for LocalClaimGuard<'_> {
 /// delivering is not offered to a second one (CWE-362).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalDelivery {
-	/// Not delivered, and no task holds it.
+	/// Awaiting delivery, with no task holding it.
 	Pending,
 	/// One task is delivering it now.
 	Claimed,
-	/// Delivered, so it is never offered again.
+	/// Delivered, so the retry set drops it for good.
 	Delivered,
 }
 
@@ -530,7 +557,8 @@ pub struct JournalLimits {
 }
 
 impl MemoryGossipJournal {
-	/// Retention window with default capacity caps.
+	/// Builds a journal with the `retention` window and the default capacity
+	/// caps.
 	#[must_use]
 	pub fn new(retention: Duration) -> Self {
 		Self::with_limits(
@@ -539,7 +567,8 @@ impl MemoryGossipJournal {
 		)
 	}
 
-	/// Retention window and capacity bounds.
+	/// Builds a journal with the `retention` window and the given capacity
+	/// bounds.
 	#[must_use]
 	pub fn with_limits(retention: Duration, limits: JournalLimits) -> Self {
 		let JournalLimits { total, per_signer } = limits;
@@ -562,7 +591,7 @@ impl MemoryGossipJournal {
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::LockPoisoned`] when the journal lock is poisoned.
+	/// - [`ClusterError::LockPoisoned`] -- the journal lock is poisoned.
 	#[cfg(any(test, feature = "testing"))]
 	pub fn undelivered_local(&self, now: UnixMillis) -> Result<usize, ClusterError> {
 		let mut entries = self.entries.lock()?;
@@ -603,11 +632,11 @@ pub struct GossipConfig {
 	pub ttl: u8,
 	/// Route key admitted rumors are delivered to on this gateway.
 	///
-	/// - [`ColonyNamespace::servlet_type_key`] creates the key, so a configured ingress always
-	///   names a servlet type this colony can route.
-	/// - Local delivery is receiving-gateway policy, never rumor content.
-	/// - `None` journals and refloods only, and marks the record delivered so it never enters the
-	///   pending retry set.
+	/// - [`ColonyNamespace::servlet_type_key`] creates the key, so a
+	///   configured ingress always names a servlet type this colony can route.
+	/// - Local delivery is receiving-gateway policy rather than rumor content.
+	/// - `None` journals and refloods only, and marks the record delivered so
+	///   it stays out of the pending retry set.
 	///
 	/// [`ColonyNamespace::servlet_type_key`]:
 	/// crate::colony::common::ColonyNamespace::servlet_type_key
@@ -622,7 +651,7 @@ pub struct GossipConfig {
 	/// An operator who restricts exports should treat the ingress type as an
 	/// intentional local delivery channel for admitted colony gossip.
 	pub ingress: Option<ServletTypeKey>,
-	/// Dedup and retention store. Owns its own retention window.
+	/// Dedup and retention store, which owns its own retention window.
 	pub journal: Arc<dyn GossipJournal>,
 	/// Per-signer rate admission before record or reflood.
 	pub admission: Arc<dyn GossipAdmission>,
@@ -1081,7 +1110,9 @@ mod tests {
 	/// Claim `digest` for one delivery, which an unclaimed rumor always
 	/// admits.
 	fn claim<'a>(journal: &'a MemoryGossipJournal, digest: &'a GossipDigest) -> LocalClaimGuard<'a> {
-		LocalClaimGuard::take(journal, digest, T0).expect("an unclaimed rumor is claimable")
+		LocalClaimGuard::take(journal, digest, T0)
+			.expect("the journal lock is live")
+			.expect("an unclaimed rumor is claimable")
 	}
 
 	// A delivery task that never finishes, because it was cancelled or its
@@ -1112,7 +1143,7 @@ mod tests {
 
 		journal.record(b"signer-a", digest, &frame, T0)?;
 
-		claim(&journal, &digest).ack();
+		claim(&journal, &digest).ack()?;
 
 		assert!(journal.pending_local(T0)?.is_empty());
 		assert_eq!(journal.undelivered_local(T0)?, 0);

@@ -1,7 +1,7 @@
-//! Multi-hop federation (transitive discovery and relay fallback).
+//! Multi-hop federation tests for transitive discovery and relay fallback.
 //!
-//! Three member gateways with distinct identities: rumors teach a
-//! gateway about origins it never dialed, relay trails carry work
+//! The scenarios run three member gateways with distinct identities. Rumors
+//! teach a gateway about origins it never dialed, relay trails carry work
 //! around a dead direct address, and the `max_hops` clamp bounds the
 //! origin's sentinel budget.
 
@@ -9,15 +9,16 @@ use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
 use tightbeam::colony::cluster::{PeerRoute, ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
 
-/// Dial address nothing listens on: a dead direct trail fails fast.
+/// A dial address nothing listens on, so a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
 
 /// Three distinct colony-member identities. [`cluster_certs`] cannot serve
 /// here, because relay trails refuse self-relay (see [`member_identity`]).
 ///
 /// - The combined store on `.trust` serves the hive and dial planes.
-/// - Each gateway's peer store excludes its own identity. Peer membership wins on the hive plane,
-///   so a member's hive registrations must not verify on its own peer store.
+/// - Each gateway's peer store excludes its own identity. Peer membership
+///   wins on the hive plane, so a member's hive registrations must not verify
+///   on its own peer store.
 struct FederationCtx {
 	a: Arc<ClusterTestCerts>,
 	b: Arc<ClusterTestCerts>,
@@ -119,16 +120,17 @@ async fn start_beacon_hive(
 	Ok(hive)
 }
 
-/// Flood one origin-signed advertisement rumor for `gateway_addr` to `cluster`,
-/// exactly as a peer gateway would, and answer the admission status the gateway
-/// replied.
+/// Floods one origin-signed advertisement rumor for `gateway_addr` to
+/// `cluster`, exactly as a peer gateway would, and answers the admission
+/// status the gateway replied.
 ///
-/// - The rumor frame carries the origin's signature inside a `Gossip` relay envelope with `hop_ttl`
-///   reflood hops, so the same-origin bind holds at every hop.
-/// - `PublishGossip` cannot serve here, because the publish plane re-creates the rumor under the
-///   receiving gateway's own key.
-/// - Each call creates a fresh rumor, so every call floods anew. Ads dedup on digest and are never
-///   repaired.
+/// - The rumor frame carries the origin's signature inside a `Gossip` relay
+///   envelope with `hop_ttl` reflood hops, so the same-origin bind holds at
+///   every hop.
+/// - `PublishGossip` cannot serve here, because the publish plane re-creates
+///   the rumor under the receiving gateway's own key.
+/// - Each call creates a fresh rumor, so every call floods anew. Ads dedup
+///   on digest and are never repaired.
 pub async fn flood_ad_rumor(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
@@ -168,19 +170,20 @@ pub async fn flood_ad_rumor(
 	Ok(response.status)
 }
 
-/// Count the live peer routes for `type_name` on `cluster`.
+/// Counts the live peer routes for `type_name` on `cluster`.
 pub fn type_route_count(cluster: &ClusterGateway, type_name: impl AsRef<str>) -> usize {
 	let type_name = type_name.as_ref();
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
+		.expect("the gateway under test holds no poisoned lock")
 		.iter()
 		.filter(|route| route.servlet_type.as_ref() == canonical.as_slice())
 		.count()
 }
 
-/// Poll until `cluster` holds `want` routes for `type_name` or attempts
-/// exhaust, and answer the count it holds.
+/// Polls until `cluster` holds `want` routes for `type_name` or the attempts
+/// run out, and answers the count it holds.
 pub async fn wait_for_type_routes(
 	cluster: &ClusterGateway,
 	type_name: impl AsRef<str>,
@@ -194,11 +197,10 @@ pub async fn wait_for_type_routes(
 	type_route_count(cluster, type_name)
 }
 
-/// Flood fresh advertisement rumors claiming `claimed_addr` for
-/// `type_name` through `relay` until `observer` holds `want` routes or
-/// attempts exhaust. Fresh instances flood until the relay has
-/// promoted the observer as a flood target. Branching lives here, not
-/// in scenarios.
+/// Floods fresh advertisement rumors claiming `claimed_addr` for `type_name`
+/// through `relay` until `observer` holds `want` routes or the attempts run
+/// out. Fresh instances flood until the relay has promoted the observer as a
+/// flood target. The branching lives here, not in scenarios.
 async fn flood_until_routes(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
@@ -240,6 +242,7 @@ fn type_route_dials(cluster: &ClusterGateway, type_name: impl AsRef<str>, dial_a
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
+		.expect("the gateway under test holds no poisoned lock")
 		.iter()
 		.any(|route| route.servlet_type.as_ref() == canonical.as_slice() && route.dial_addr.as_ref() == dial_addr)
 }
@@ -497,8 +500,8 @@ tb_scenario! {
 
 // A zero-hop gateway clamps the origin sentinel: the client's "as far
 // as policy allows" budget becomes zero, so a peer-only type refuses
-// Unavailable instead of forwarding. Reuses the loop-guard spec: the
-// same contract as a spent wire budget.
+// Unavailable instead of forwarding. The scenario reuses the loop-guard
+// spec, because the contract is the same as for a spent wire budget.
 tb_scenario! {
 	name: cluster_zero_hop_gateway_clamps_origin_sentinel,
 	spec: super::peering::ClusterPeerForwardLoopGuardSpec,
@@ -556,7 +559,7 @@ tb_scenario! {
 			let config = PoolConfig {
 				idle_timeout: None,
 				max_connections: 1,
-				mux_offer: Some(Arc::new(TransportOffer::mux(8))), ..PoolConfig::default()
+				mux_offer: Some(Arc::new(TransportOffer::mux(8)))
 			};
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -619,6 +622,7 @@ fn peer_route_key_for_dial(
 	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
+		.expect("the gateway under test holds no poisoned lock")
 		.into_iter()
 		.find(|route| route.dial_addr.as_ref() == dial_addr && route.servlet_type.as_ref() == canonical.as_slice())
 		.map(|route| {

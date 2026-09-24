@@ -151,8 +151,8 @@ async fn start_echo_server(
 	Ok((handle, addr))
 }
 
-/// Serve every accepted connection with `service` through the `server!`
-/// service form: mux takeover routes all stream kinds, non-mux peers get
+/// Serves every accepted connection with `service` through the `server!`
+/// service form. Mux takeover routes all stream kinds, and non-mux peers get
 /// the single-flight unary loop.
 async fn start_service_server<S>(
 	materials: &ServerMaterials,
@@ -182,8 +182,9 @@ where
 	G: GatePolicy + Clone + 'static,
 {
 	let (listener, addr) = bind_pool_listener(materials).await?;
-	// Accept-loop re-applies policies per connection: share/clone must
-	// stay as expressions so each accept gets a fresh value.
+	// The accept loop re-applies policies per connection, so the share
+	// and clone calls must stay expressions that give each accept a
+	// fresh value.
 	let acceptor = server! {
 		protocol TokioListener: listener,
 		policies: {
@@ -197,9 +198,9 @@ where
 	Ok((acceptor, addr))
 }
 
-/// Streaming-only service: answers with the collected body length as
-/// a frame label. Unary and duplex kinds refuse with `Unimplemented`
-/// through the [`MuxService`] defaults.
+/// A streaming-only service that answers with the collected body length as
+/// a frame label. Unary and duplex kinds refuse with `Unimplemented` through
+/// the [`MuxService`] defaults.
 #[derive(Clone)]
 struct LengthService;
 
@@ -210,7 +211,8 @@ impl MuxService for LengthService {
 	}
 }
 
-/// Duplex-only service: echoes every request chunk back through the reply sink.
+/// A duplex-only service that echoes every request chunk back through the
+/// reply sink.
 #[derive(Clone)]
 struct DuplexEchoService;
 
@@ -223,8 +225,8 @@ impl MuxService for DuplexEchoService {
 	}
 }
 
-/// Full-service handler: unary echoes the frame, streaming reports
-/// the collected length, duplex echoes chunk by chunk.
+/// A full-service handler. Unary echoes the frame, streaming reports the
+/// collected length, and duplex echoes chunk by chunk.
 #[derive(Clone)]
 struct MixedService;
 
@@ -262,12 +264,13 @@ fn mux_pool_with_idle_timeout(
 ) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
 	let trust_store = pinning_trust_store(&materials.certificate)?;
 	let mut config = PoolConfig { max_connections, mux_offer: offer.map(Arc::new), ..PoolConfig::default() };
+	let mut builder = ConnectionPool::<TokioListener>::builder();
 	if let Some(IdlePrune { timeout, clock }) = idle {
 		config.idle_timeout = Some(timeout);
-		config.clock = clock;
+		builder = builder.with_clock(clock);
 	}
 	let pool = Arc::new(
-		ConnectionPool::<TokioListener>::builder()
+		builder
 			.with_config(config)
 			.with_trust_store(trust_store)
 			.with_trace(trace.share())
@@ -345,8 +348,8 @@ tb_assert_spec! {
 	}
 }
 
-// Streaming reaches through the orchestration layer: pooled lease opens
-// the stream, the streaming-only service collects and answers.
+// Streaming reaches through the orchestration layer: a pooled lease opens
+// the stream, and the streaming-only service collects and answers.
 tb_scenario! {
 	name: pooled_open_stream_reaches_streaming_server,
 	spec: PooledStreamSpec,
@@ -383,8 +386,8 @@ tb_assert_spec! {
 	}
 }
 
-// Duplex reaches through the orchestration layer: pooled lease opens
-// the duplex, the duplex-only service echoes chunk by chunk.
+// Duplex reaches through the orchestration layer: a pooled lease opens the
+// duplex, and the duplex-only service echoes chunk by chunk.
 tb_scenario! {
 	name: pooled_open_duplex_echoes_through_serve_wrapper,
 	spec: PooledDuplexSpec,
@@ -394,11 +397,14 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: materials, addr }| async move {
 			let pool = mux_pool(&materials, Some(mux_offer(8)), 1, &trace)?;
 			let lease = pool.connect(addr).await?;
-
 			let (mut sink, mut body) = lease.open_duplex()?;
+
 			sink.push(b"ping").await?;
+
 			let first = body.chunk().await?;
+
 			sink.close_with(b"pong").await?;
+
 			let second = body.chunk().await?;
 			let terminal = body.chunk().await?;
 
@@ -425,7 +431,7 @@ tb_assert_spec! {
 	}
 }
 
-// The point of stream kinds: unary, streaming, and duplex interactions run
+// Stream kinds exist so unary, streaming, and duplex interactions run
 // concurrently on one pooled connection against one service.
 tb_scenario! {
 	name: pooled_mixed_kinds_share_one_connection,
@@ -702,8 +708,8 @@ tb_assert_spec! {
 	}
 }
 
-// Pool at max_connections: failover reuses headroom instead of dialing
-// (ResourceExhausted).
+// At `max_connections`, failover reuses headroom instead of dialing, which
+// would fail with ResourceExhausted.
 tb_scenario! {
 	name: pooled_mux_failover_reuses_pooled_headroom,
 	spec: MuxFailoverReuseSpec,
@@ -713,13 +719,13 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = mux_pool(&ctx.materials, Some(mux_offer(4)), 2, &trace)?;
 
-			// Three leases on connection one (only pool entry).
+			// Three leases land on connection one, the only pool entry.
 			let held_lease = pool.connect(addr).await?;
 			let mut fill_lease = pool.connect(addr).await?;
 			let mut reuse_lease = pool.connect(addr).await?;
 			let held_task = spawn_held_emit(&ctx, held_lease).await;
 
-			// Saturated: failover dials connection two.
+			// Once connection one saturates, failover dials connection two.
 			let filled = echo_roundtrip(&mut fill_lease, "mux-fill").await?;
 			trace.event_with(FIRST_FAILOVER_ECHOES_ON_NEW_DIAL, &[], filled)?;
 
@@ -823,8 +829,8 @@ tb_assert_spec! {
 	}
 }
 
-// Cap 1: reuse the idle exclusive connection instead of dialing
-// (ResourceExhausted).
+// With a cap of 1, the pool reuses the idle exclusive connection instead
+// of dialing, which would fail with ResourceExhausted.
 tb_scenario! {
 	name: pooled_mux_declined_reuses_idle_exclusive_lease,
 	spec: MuxDeclinedIdleReuseSpec,
@@ -873,7 +879,7 @@ impl ManualContext {
 		}
 	}
 
-	/// Abort connection tasks so split halves drop and TCP closes.
+	/// Aborts the connection tasks so the split halves drop and TCP closes.
 	async fn abort_connections(&self) {
 		let drained: Vec<_> = {
 			let mut tasks = match self.connection_tasks.lock() {
@@ -986,8 +992,8 @@ tb_assert_spec! {
 	}
 }
 
-// The idle_timeout prune frees the cap-1 slot. The manual server registers
-// 3 tasks per connection.
+// The `idle_timeout` prune frees the cap-1 slot. The manual server
+// registers 3 tasks per connection.
 tb_scenario! {
 	name: pooled_mux_prunes_idle_connection,
 	spec: MuxIdlePruneSpec,
@@ -1049,7 +1055,7 @@ tb_scenario! {
 	}
 }
 
-/// Single-flight client against `materials`' pinned server.
+/// A single-flight client against the pinned server of `materials`.
 async fn single_flight_client(
 	materials: &ServerMaterials,
 	addr: TightBeamSocketAddr,
@@ -1107,7 +1113,7 @@ impl GateContext {
 	}
 }
 
-/// Streaming service that records whether the handler body ran.
+/// A streaming service that records whether the handler body ran.
 struct ProbeLengthService {
 	gate: Arc<GateContext>,
 }
@@ -1115,12 +1121,13 @@ struct ProbeLengthService {
 impl MuxService for ProbeLengthService {
 	async fn streaming(&self, body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		self.gate.handler_invoked.store(true, Ordering::SeqCst);
+
 		let bytes = body.into_bytes().await?;
 		Ok(Some(mux_frame(bytes.len().to_string())))
 	}
 }
 
-/// Duplex service that records whether the handler body ran.
+/// A duplex service that records whether the handler body ran.
 struct ProbeDuplexService {
 	gate: Arc<GateContext>,
 }
@@ -1128,9 +1135,11 @@ struct ProbeDuplexService {
 impl MuxService for ProbeDuplexService {
 	async fn duplex(&self, mut body: StreamBody, mut reply: ReplySink, _cx: CallContext) -> Result<(), TightBeamError> {
 		self.gate.handler_invoked.store(true, Ordering::SeqCst);
+
 		while let Some(chunk) = body.chunk().await? {
 			reply.push(&chunk).await?;
 		}
+
 		Ok(())
 	}
 }
@@ -1195,14 +1204,13 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), 1, &trace)?;
 			let mut client = pool.connect(addr).await?;
-
 			let outcome = client.emit(mux_frame("gated"), None).await;
+
 			trace.event_with(
 				GATE_STATUS_SURFACES_TO_CLIENT,
 				&[],
 				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))),
 			)?;
-
 			trace.event_with(HANDLER_NEVER_INVOKED, &[], !ctx.handler_invoked.load(Ordering::SeqCst))?;
 			Ok(())
 		}
@@ -1236,17 +1244,17 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), 1, &trace)?;
 			let lease = pool.connect(addr).await?;
-
 			let (sink, response) = lease.open_stream()?;
+
 			sink.close_with(b"gated-stream").await?;
 
 			let outcome = response.await;
+
 			trace.event_with(
 				GATE_STREAM_STATUS_SURFACES_TO_CLIENT,
 				&[],
 				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))),
 			)?;
-
 			trace.event_with(
 				STREAM_HANDLER_NEVER_INVOKED,
 				&[],
@@ -1348,14 +1356,13 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), 1, &trace)?;
 			let mut client = pool.connect(addr).await?;
-
 			let outcome = client.emit(mux_frame("gate-list"), None).await;
+
 			trace.event_with(
 				GATE_LIST_FIRST_REFUSAL_WINS,
 				&[],
 				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))),
 			)?;
-
 			trace.event_with(HANDLER_NEVER_INVOKED, &[], !ctx.handler_invoked.load(Ordering::SeqCst))?;
 			Ok(())
 		}
@@ -1376,7 +1383,8 @@ tb_assert_spec! {
 }
 
 // `Unknown` from a gate is a local bug, not a peer-attributable verdict:
-// the seam normalizes it to `Internal` so both planes answer identically.
+// the mux serve path normalizes it to `Internal`, so both planes answer
+// identically.
 tb_scenario! {
 	name: mux_serve_unknown_gate_answers_internal,
 	spec: MuxUnknownGateSpec,
@@ -1405,14 +1413,13 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), 1, &trace)?;
 			let mut client = pool.connect(addr).await?;
-
 			let outcome = client.emit(mux_frame("unknown-gate"), None).await;
+
 			trace.event_with(
 				GATE_UNKNOWN_ANSWERS_INTERNAL,
 				&[],
 				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::Internal))),
 			)?;
-
 			trace.event_with(HANDLER_NEVER_INVOKED, &[], !ctx.handler_invoked.load(Ordering::SeqCst))?;
 			Ok(())
 		}
@@ -1449,8 +1456,8 @@ tb_scenario! {
 				handle: move |frame: Frame| {
 					let ctx = Arc::clone(&handler_ctx);
 					async move {
-						// First frame fails, later frames echo: the same
-						// connection must survive a handler failure.
+						// The first frame fails and later frames echo, so the
+						// same connection must survive a handler failure.
 						if ctx.handler_invoked.swap(true, Ordering::SeqCst) {
 							Ok(Some(frame))
 						} else {
@@ -1464,8 +1471,8 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = mux_pool(&ctx.materials, Some(mux_offer(8)), 1, &trace)?;
 			let mut client = pool.connect(addr).await?;
-
 			let failed = client.emit(mux_frame("poison"), None).await;
+
 			trace.event_with(
 				HANDLER_FAILURE_SURFACES_INTERNAL,
 				&[],
@@ -1474,22 +1481,25 @@ tb_scenario! {
 
 			let follow_up = mux_frame("recovery");
 			let echoed = client.emit(follow_up.to_owned(), None).await?;
+
 			trace.event_with(HANDLER_RECOVERS_AFTER_FAILURE, &[], echoed == Some(follow_up))?;
 			Ok(())
 		}
 	}
 }
 
-/// Settlement challenge the metering authorizer binds into every receipt.
+/// The settlement challenge the metering authorizer binds into every
+/// receipt.
 const METERED_CHALLENGE: &[u8] = b"pool-invoice-1";
 
-/// Settlement answer the pool-forwarded approver countersigns.
+/// The settlement answer the pool-forwarded approver countersigns.
 const METERED_RESPONSE: &[u8] = b"pool-preimage-1";
 
-/// Application code for an unanswered metering settlement.
+/// The application code for an unanswered metering settlement.
 const METERED_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 33;
 
-/// Fifth single-chunk emit triggers in-band renewal (caps 1/1, 1 KiB chunk).
+/// The budgets under which the fifth single-chunk emit triggers in-band
+/// renewal, with caps of 1/1 and a 1 KiB chunk.
 const METERED_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 10, server_to_client: 4096 };
 
 fn metered_offer() -> Option<TransportOffer> {
@@ -1499,7 +1509,8 @@ fn metered_offer() -> Option<TransportOffer> {
 	Some(offer)
 }
 
-/// Settlement at handshake and renewal. An unanswered challenge fails closed.
+/// An authorizer that settles at handshake and at renewal. An unanswered
+/// challenge fails closed.
 struct MeteredAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -1590,12 +1601,7 @@ fn metered_pool(
 	let identity = CertificateSpec::Built(Box::new(client_certificate));
 	let client_provider = Arc::clone(&ctx.client_provider);
 	let receipt_approver = Arc::new(PayingApprover::answering(METERED_RESPONSE)?);
-	let config = PoolConfig {
-		idle_timeout: None,
-		max_connections: 1,
-		mux_offer: metered_offer().map(Arc::new),
-		..PoolConfig::default()
-	};
+	let config = PoolConfig { idle_timeout: None, max_connections: 1, mux_offer: metered_offer().map(Arc::new) };
 	let builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)
@@ -1642,14 +1648,16 @@ tb_scenario! {
 		client: |ClientEnv { trace, context: ctx, addr }| async move {
 			let pool = metered_pool(&ctx, &trace)?;
 			let mut lease = pool.connect(addr).await?;
-
 			let initial = lease.session_receipt();
+
 			trace.event_with(LEASE_EXPOSES_SETTLED_RECEIPT, &[], initial.is_some())?;
 
 			let echoed = metered_series(&mut lease, 8).await?;
+
 			trace.event_with(EMITS_SURVIVE_RENEWAL, &[], echoed)?;
 
 			let rotated = await_receipt_rotation(|| lease.session_receipt(), initial.as_deref()).await;
+
 			trace.event_with(LEASE_OBSERVES_ROTATED_RECEIPT, &[], rotated.is_some())?;
 			Ok(())
 		}

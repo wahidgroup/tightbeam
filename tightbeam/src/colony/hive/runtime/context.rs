@@ -1,7 +1,9 @@
 //! Intra-hive routing context backed by a servlet connection pool.
 
+use core::hash::Hash;
+use core::str::{from_utf8, FromStr};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::colony::hive::{
 	CallFuture, DuplexOpenFuture, HashMapRegistry, HiveContext, ServletRegistry, StreamOpenFuture, StreamResponseFuture,
@@ -15,15 +17,24 @@ use crate::transport::{MessageCollector, MessageEmitter, PersistentConnection, P
 use crate::utils::urn::Urn;
 use crate::{Frame, TightBeamError};
 
-/// Instance or type key to shared servlet address bytes.
+/// Maps an instance key or a type key to shared servlet address bytes.
 type AddressMap = HashMap<Vec<u8>, Arc<[u8]>>;
 
 /// Instance routes and the type index they produce.
+///
+/// # One lock
 ///
 /// The index is derived from the instances, so both live behind one lock
 /// and under one owner. A reader sees an index that names an address the
 /// instance map still holds, and no caller can order two acquisitions
 /// against another caller (CWE-362).
+///
+/// # Poison recovery
+///
+/// Every write under the lock is a `HashMap` insert or remove, which
+/// completes or aborts the process, so a thread that panicked while
+/// holding the guard left whole maps behind it. The owner therefore
+/// recovers a poisoned lock and keeps routing.
 #[derive(Default)]
 struct Routes {
 	instances: AddressMap,
@@ -78,7 +89,8 @@ impl Routes {
 	}
 }
 
-/// Shared routes and pool used for sibling servlet calls.
+/// The routes and the connection pool that a servlet uses to call its sibling
+/// servlets in the same hive.
 pub struct HiveContextImpl<P: Protocol> {
 	routes: Arc<RwLock<Routes>>,
 	pool: Arc<ConnectionPool<P>>,
@@ -90,16 +102,27 @@ impl<P: Protocol> HiveContextImpl<P> {
 		Self { routes: Arc::new(RwLock::new(Routes::default())), pool }
 	}
 
+	/// The routes for writing, recovered from a poisoned lock because every
+	/// write under the guard leaves whole maps.
+	fn routes_mut(&self) -> RwLockWriteGuard<'_, Routes> {
+		self.routes.write().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// The routes for reading, recovered the same way.
+	fn routes(&self) -> RwLockReadGuard<'_, Routes> {
+		self.routes.read().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Routes `key` to `addr` and indexes `type_bytes` on it when the type
+	/// has no route yet.
 	pub fn add_route(&self, key: impl Into<Vec<u8>>, addr: Arc<[u8]>, type_bytes: impl AsRef<[u8]>) {
 		let key: Vec<u8> = key.into();
 		let type_bytes = type_bytes.as_ref();
-		let Ok(mut routes) = self.routes.write() else {
-			return;
-		};
-
-		routes.insert(key, addr, type_bytes);
+		self.routes_mut().insert(key, addr, type_bytes);
 	}
 
+	/// Drops the route under `key` and re-indexes `type_urn` on a sibling
+	/// when the departing instance held the index.
 	pub fn remove_route(
 		&self,
 		key: impl AsRef<[u8]>,
@@ -110,11 +133,7 @@ impl<P: Protocol> HiveContextImpl<P> {
 		let key = key.as_ref();
 		let type_bytes = type_bytes.as_ref();
 		let type_prefix = type_urn.type_prefix_bytes();
-		let Ok(mut routes) = self.routes.write() else {
-			return;
-		};
-
-		routes.remove(key, &type_prefix, type_bytes, removed_addr);
+		self.routes_mut().remove(key, &type_prefix, type_bytes, removed_addr);
 	}
 
 	/// Adds a route to every instance already in `servlets`.
@@ -125,20 +144,25 @@ impl<P: Protocol> HiveContextImpl<P> {
 		servlets.for_each(|key, reg| {
 			let addr_bytes = reg.servlet.addr_bytes();
 			let type_key = reg.servlet_type.canonical_bytes();
-			// for_each borrows the registry key, and add_route needs an owned copy.
+			// `for_each` lends the key, and `add_route` needs an owned copy.
 			self.add_route(key.clone(), addr_bytes, &type_key);
 		});
 	}
 
+	/// The address this hive dials for `servlet_type`.
+	///
+	/// # Errors
+	///
+	/// - [`RouterError::UnknownRoute`] -- no instance of the type is routed,
+	///   or the routed address is not a locator `P` can parse.
 	fn resolve_addr(&self, servlet_type: &Urn<'_>) -> Result<P::Address, TightBeamError>
 	where
-		P::Address: core::str::FromStr,
+		P::Address: FromStr,
 	{
 		let route_err = || TightBeamError::RouterError(RouterError::UnknownRoute);
-		let routes = self.routes.read().map_err(|_| TightBeamError::LockPoisoned)?;
 		let type_key = servlet_type.canonical_bytes();
-		let addr_bytes = routes.resolve(&type_key).ok_or_else(route_err)?;
-		let addr_str = core::str::from_utf8(addr_bytes.as_ref()).map_err(|_| route_err())?;
+		let addr_bytes = self.routes().resolve(&type_key).ok_or_else(route_err)?;
+		let addr_str = from_utf8(addr_bytes.as_ref()).map_err(|_| route_err())?;
 
 		let parsed = addr_str.parse().map_err(|_| route_err())?;
 		Ok(parsed)
@@ -149,7 +173,7 @@ impl<P> HiveContext for HiveContextImpl<P>
 where
 	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + PersistentConnection + Send + Sync + 'static,
-	P::Address: core::hash::Hash + Eq + Clone + Send + Sync + core::str::FromStr + 'static,
+	P::Address: Hash + Eq + Clone + Send + Sync + FromStr + 'static,
 	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + MuxConnector + Send + Sync + 'static,
 {
 	fn call<'a>(&'a self, servlet_type: &'a Urn<'a>, frame: Frame) -> CallFuture<'a> {
@@ -169,9 +193,9 @@ where
 			let pooled_conn = self.pool.connect(addr).await?;
 			let (sink, response) = pooled_conn.open_stream()?;
 
-			// The lease returns to the pool here. The sink and response live
-			// on the shared mux plane independently. The pool-level future
-			// already yields the servlet's complete trailer reply frame.
+			// The lease returns to the pool here, and the sink and the response
+			// live on the shared mux plane independently of it. The pool-level
+			// future already yields the complete trailer frame of the reply.
 			let response: StreamResponseFuture = Box::pin(async move {
 				let reply = response.await?;
 				reply.ok_or(TightBeamError::MissingResponse)

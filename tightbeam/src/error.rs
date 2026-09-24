@@ -92,9 +92,9 @@ impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Sen
 
 /// Several errors collected from one operation.
 ///
-/// Rendering the list is behavior of the collection, so the chain owns it.
-/// That keeps every [`TightBeamError`] message a single format string, and
-/// the one Display block below stays the only home for all of them.
+/// Rendering the list is behavior of the collection, so the chain owns it
+/// through its `Display` impl. Every [`TightBeamError`] message therefore
+/// stays a single format string.
 #[derive(Debug)]
 pub struct ErrorChain(Vec<TightBeamError>);
 
@@ -169,6 +169,15 @@ pub enum TightBeamError {
 	#[error("Hive error: {0}")]
 	#[source]
 	HiveError(crate::colony::hive::HiveError),
+
+	/// A cluster gateway reported an error.
+	///
+	/// The error is boxed because a cluster error can carry a frame error in
+	/// turn. `From<ClusterError>` boxes a cluster error into this variant.
+	#[cfg(feature = "colony")]
+	#[error("Cluster error: {0}")]
+	#[source]
+	ClusterError(Box<crate::colony::cluster::ClusterError>),
 
 	/// A worker relay reported an error.
 	#[cfg(feature = "colony")]
@@ -351,7 +360,8 @@ pub enum TightBeamError {
 	#[error("Work refused: {0:?}")]
 	WorkRefused(crate::policy::TransitStatus),
 
-	/// Channel closed because the receiving end was dropped before the send.
+	/// The channel closed because the receiving end was dropped before the
+	/// send.
 	#[error("Channel closed")]
 	ChannelClosed,
 
@@ -467,6 +477,13 @@ crate::impl_from!(crate::standards::error::StandardError => TightBeamError::Stan
 crate::impl_from!(crate::colony::hive::HiveError => TightBeamError::HiveError);
 #[cfg(feature = "colony")]
 crate::impl_from!(crate::colony::worker::WorkerRelayError => TightBeamError::WorkerRelay);
+
+#[cfg(feature = "colony")]
+impl From<crate::colony::cluster::ClusterError> for TightBeamError {
+	fn from(error: crate::colony::cluster::ClusterError) -> Self {
+		Self::ClusterError(Box::new(error))
+	}
+}
 #[cfg(feature = "transport")]
 crate::impl_from!(crate::transport::handshake::HandshakeError => TightBeamError::HandshakeError);
 #[cfg(feature = "transport")]
@@ -525,10 +542,10 @@ impl TightBeamError {
 	/// Terminal status a service failure answers a peer with.
 	///
 	/// A failure already carrying a transit status keeps it. Anything else
-	/// answers
-	/// [`TransitStatus::Internal`](crate::policy::TransitStatus::Internal), so
-	/// a peer tells a failure apart from an accepted empty reply and the
-	/// failure stays attributable.
+	/// answers [`TransitStatus::Internal`], so a peer tells a failure apart
+	/// from an accepted empty reply and the failure stays attributable.
+	///
+	/// [`TransitStatus::Internal`]: crate::policy::TransitStatus::Internal
 	#[cfg(pooled_mux)]
 	#[must_use]
 	pub(crate) fn failure_status(&self) -> crate::policy::TransitStatus {

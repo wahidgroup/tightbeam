@@ -63,13 +63,13 @@ impl ForwardOutcome {
 		}
 	}
 
-	/// `true` when a live route reported it cannot serve the type.
+	/// Whether a live route reported that it cannot serve the type.
 	///
 	/// This is the same failover class as a transport fault mapped to
-	/// [`TransitStatus::Unavailable`]. The trail is useless for this
-	/// type right now, and a garbled peer reply proves nothing better.
-	/// Every other refusal relays unchanged so the caller keeps its
-	/// retryability contract.
+	/// [`TransitStatus::Unavailable`]. The trail is useless for this type
+	/// right now, and a garbled peer reply joins the class because it proves
+	/// nothing better. Every other refusal relays unchanged so the caller
+	/// keeps its retryability contract.
 	fn is_unavailable(&self) -> bool {
 		match self {
 			Self::Local(_) => false,
@@ -150,8 +150,8 @@ where
 		}
 	}
 
-	/// Settle an answered forward. This reinforces or weakens the trail and
-	/// replies to the caller with one envelope.
+	/// Settles an answered forward by reinforcing or weakening the trail and
+	/// replying to the caller with one envelope.
 	fn settle_forward(
 		&self,
 		frame: &Frame,
@@ -262,7 +262,8 @@ where
 
 					// A live peer that reports it cannot serve the type
 					// joins the same bounded failover as a transport
-					// fault. Weaken the trail and retry the next-best one.
+					// fault, so the trail weakens and the next-best one
+					// gets the retry.
 					if outcome.is_unavailable() && excluded.is_none() {
 						if let Some(retry) = retry_payload {
 							self.servlet_registry
@@ -279,7 +280,7 @@ where
 				Err(error) => {
 					let status = error.forward_status();
 
-					// Fast failover. An unavailable trail weakens now and
+					// Failover is fast: an unavailable trail weakens now and
 					// the next-best trail gets the single retry.
 					if status == TransitStatus::Unavailable && excluded.is_none() {
 						if let Some(retry) = retry_payload {
@@ -310,8 +311,9 @@ impl ServletRegistry {
 	///   so it selects only when the budget affords at least two forwards.
 	///
 	/// `exclude` removes one just-failed route key so a bounded retry picks the
-	/// next-best trail. `None` means no entry serves the type or the balancer
-	/// declined, which the caller answers as [`TransitStatus::Unavailable`].
+	/// next-best trail. `None` means no entry serves the type, the balancer
+	/// declined, or the route registry is poisoned. The caller answers each
+	/// case as [`TransitStatus::Unavailable`].
 	pub(crate) fn select_route(
 		&self,
 		config: &ClusterConfig,
@@ -400,10 +402,16 @@ mod tests {
 	use crate::colony::common::{ColonyNamespace, InstanceMetrics, LoadBalancer};
 	use crate::constants::{DEFAULT_HOP_BUDGET, DEFAULT_MAX_HOPS};
 
-	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig};
+	use crate::colony::cluster::{CertificateSpec, ClusterTlsConfig, PheromoneConfig};
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::testing::{TestCertificate, TestKey};
+	use crate::utils::time::ManualClock;
+
+	/// A registry on a clock only the test moves.
+	fn registry() -> ServletRegistry {
+		ServletRegistry::new(PheromoneConfig::default(), Arc::new(ManualClock::default()))
+	}
 
 	fn ping_type() -> Urn<'static> {
 		ColonyNamespace::default()
@@ -411,7 +419,8 @@ mod tests {
 			.expect("test names satisfy the mint grammar")
 	}
 
-	/// The route key for the fixture servlet type, minted as production does.
+	/// The route key for the fixture servlet type, created as production
+	/// creates it.
 	fn ping_key() -> ServletTypeKey {
 		ColonyNamespace::default()
 			.servlet_type_key(&ping_type())
@@ -515,7 +524,7 @@ mod tests {
 		assert_eq!(work.hops_remaining, 0);
 	}
 
-	// Pins the on-wire budget. Dropping the decrement in
+	// This test pins the on-wire budget. A missing decrement in
 	// `HopBudget::relayed_work` fails here even when integration
 	// topologies mask it with a clamp.
 	#[test]
@@ -593,8 +602,8 @@ mod tests {
 		assert!(HopBudget::from_wire(WireHopBudget::new(2), 4).is_relayed());
 	}
 
-	// The relayed fact comes from the wire count, not the clamped one.
-	// A cap below the origin sentinel would otherwise mark every direct
+	// The relayed fact comes from the wire count rather than the clamped
+	// one. A cap below the origin sentinel would otherwise mark every direct
 	// caller relayed and refuse it at the export boundary.
 	#[test]
 	fn a_clamped_origin_budget_still_reads_as_direct() {
@@ -612,7 +621,7 @@ mod tests {
 	#[test]
 	fn select_route_withholds_relay_trails_below_two_hops() -> Result<(), ClusterError> {
 		let config = test_config();
-		let registry = ServletRegistry::default();
+		let registry = registry();
 		registry.add(relay_entry(b"origin", b"relay", b"relay:1"))?;
 
 		let type_key = ping_key();
@@ -626,7 +635,7 @@ mod tests {
 	#[test]
 	fn select_route_excludes_the_failed_route_key() -> Result<(), ClusterError> {
 		let config = test_config();
-		let registry = ServletRegistry::default();
+		let registry = registry();
 		registry.add(peer_entry(b"first", b"first:1"))?;
 		registry.add(peer_entry(b"second", b"second:1"))?;
 

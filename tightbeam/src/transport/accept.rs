@@ -7,12 +7,9 @@
 use core::future::Future;
 use std::sync::Arc;
 
-use crate::constants::{DEFAULT_ACCEPT_RETRY_DELAY, DEFAULT_MAX_SERVER_CONNECTIONS};
+use crate::constants::DEFAULT_ACCEPT_RETRY_DELAY;
 use crate::transport::protocols::AsyncListenerTrait;
 use crate::utils::time::Clock;
-
-#[cfg(host_clock)]
-use crate::utils::time::SystemClock;
 
 /// Accepts connections under a fixed cap, owning what it admits.
 ///
@@ -28,23 +25,14 @@ pub struct AcceptPlane {
 	clock: Arc<dyn Clock>,
 }
 
-/// Present only where [`SystemClock`] exists. A plane on any other target
-/// names its clock.
-#[cfg(host_clock)]
-impl Default for AcceptPlane {
-	/// A plane admitting [`DEFAULT_MAX_SERVER_CONNECTIONS`] live handlers,
-	/// pacing accept retries on the operating system's clock.
-	fn default() -> Self {
-		Self::new(DEFAULT_MAX_SERVER_CONNECTIONS, Arc::new(SystemClock))
-	}
-}
-
 impl AcceptPlane {
 	/// Creates a plane admitting `max_connections` live handlers, pacing
 	/// accept retries on `clock`.
 	///
 	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`] is the cap every accept plane uses
 	/// unless a policy names its own.
+	///
+	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`]: crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS
 	#[must_use]
 	pub fn new(max_connections: usize, clock: Arc<dyn Clock>) -> Self {
 		Self {
@@ -134,15 +122,22 @@ impl AcceptPlane {
 #[cfg(test)]
 mod tests {
 	use core::future::Future;
+	use core::pin::pin;
+	use core::sync::atomic::{AtomicBool, Ordering};
 	use core::task::{Context, Waker};
-	use std::sync::atomic::{AtomicBool, Ordering};
-	use std::time::Duration;
+	use core::time::Duration;
 
 	use super::*;
 	use crate::utils::time::ManualClock;
 
 	fn plane(max_connections: usize) -> AcceptPlane {
 		AcceptPlane::new(max_connections, Arc::new(ManualClock::default()))
+	}
+
+	/// Serves `handler` on a slot the plane is known to have free.
+	async fn serve_on_free_slot(plane: &mut AcceptPlane, handler: impl Future<Output = ()> + Send + 'static) {
+		let permit = plane.reserve().await.expect("the plane under test has a free slot");
+		plane.serve(permit, handler);
 	}
 
 	/// A failed accept waits out its retry delay on the plane's clock, so a
@@ -152,7 +147,7 @@ mod tests {
 		let clock = Arc::new(ManualClock::default());
 		let plane = AcceptPlane::new(1, Arc::clone(&clock) as Arc<dyn Clock>);
 		let mut context = Context::from_waker(Waker::noop());
-		let mut wait = core::pin::pin!(plane.absorb_failure());
+		let mut wait = pin!(plane.absorb_failure());
 		assert!(wait.as_mut().poll(&mut context).is_pending());
 
 		clock.advance(DEFAULT_ACCEPT_RETRY_DELAY);
@@ -170,26 +165,28 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn a_finished_connection_returns_its_slot() {
 		let mut plane = plane(1);
-		let permit = plane.reserve().await.expect("a free slot");
-		plane.serve(permit, async {});
+		serve_on_free_slot(&mut plane, async {}).await;
 		tokio::task::yield_now().await;
-		assert!(tokio::time::timeout(Duration::from_secs(1), plane.reserve()).await.is_ok());
+
+		let reserved = tokio::time::timeout(Duration::from_secs(1), plane.reserve()).await;
+		assert!(reserved.is_ok());
 	}
 
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn dropping_the_plane_aborts_its_connections() {
 		static FINISHED: AtomicBool = AtomicBool::new(false);
 
 		let mut plane = plane(1);
-		let permit = plane.reserve().await.expect("a free slot");
-		plane.serve(permit, async {
+		serve_on_free_slot(&mut plane, async {
 			tokio::time::sleep(Duration::from_secs(30)).await;
 			FINISHED.store(true, Ordering::SeqCst);
-		});
+		})
+		.await;
 
 		tokio::task::yield_now().await;
 		drop(plane);
-		tokio::time::sleep(Duration::from_millis(50)).await;
+		tokio::time::advance(Duration::from_secs(60)).await;
+		tokio::task::yield_now().await;
 		assert!(!FINISHED.load(Ordering::SeqCst));
 	}
 }

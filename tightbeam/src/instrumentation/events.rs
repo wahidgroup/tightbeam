@@ -10,8 +10,8 @@
 //!
 //! # Organization
 //!
-//! Short section headers group related constants by plane. Names are
-//! self-explanatory; section blocks do not restate each symbol.
+//! Short section headers group related constants by plane. Each constant
+//! name states its event, so a section header names the plane alone.
 
 use crate::utils::urn::Urn;
 
@@ -137,6 +137,11 @@ pub const CLUSTER_WORK_UNAVAILABLE: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "e
 pub const CLUSTER_WORK_FAILED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/work-failed");
 pub const CLUSTER_WORK_FORWARDED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/work-forwarded");
 pub const CLUSTER_HIVE_EVICTED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/hive-evicted");
+/// A registry, table, or journal lock a gateway loop read is poisoned, so
+/// that loop has ended. The payload names the fault. A poisoned std lock
+/// never clears, and the loop's task returns nothing its owner reads, so
+/// this event is the one place the end is visible.
+pub const CLUSTER_LOOP_POISONED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/loop-poisoned");
 
 // Cluster export events
 pub const CLUSTER_EXPORT_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/export-refused");
@@ -167,12 +172,13 @@ pub const CLUSTER_GOSSIP_REFUSED: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "eve
 pub const CLUSTER_GOSSIP_RELAY_WEAKENED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-relay-weakened");
 pub const CLUSTER_GOSSIP_DROP_SIGNAL: Urn<'static> = crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-drop-signal");
-/// A rumor this gateway could not build or sign, so no peer received it.
+/// Marks a rumor this gateway could not build or sign, so no peer received
+/// it.
 pub const CLUSTER_GOSSIP_REFLOOD_FAILED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-reflood-failed");
-/// Count of flood targets one reflood round failed to reach.
+/// Carries the count of flood targets one reflood round failed to reach.
 pub const CLUSTER_GOSSIP_FANOUT_UNREACHED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-fanout-unreached");
-/// A journal that refused to witness a digest this gateway published.
+/// Marks a journal that refused to witness a digest this gateway published.
 pub const CLUSTER_GOSSIP_WITNESS_REFUSED: Urn<'static> =
 	crate::urn!(TIGHTBEAM_NID, "event:cluster/gossip-witness-refused");

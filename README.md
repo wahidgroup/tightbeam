@@ -2361,6 +2361,7 @@ client.emit(frame, None).await?;
 - `PoolConfig::max_connections`: Max connections per destination (default: 64)
 - `PoolConfig::idle_timeout`: Optional connection expiration (default: None)
 - `PoolConfig::mux_offer`: Optional multiplexing advertisement. See [§8.6.5](#865-serving-and-pooling) (default: None)
+- `ConnectionPoolBuilder::with_clock`: The clock that idle time, deadlines, and backoff are measured against (default: `SystemClock`). `ConnectionPoolBuilder::new(config, clock)` takes it at construction. `PoolConfig` holds limits only, and a hive or gateway passes its own clock to its pools.
 
 ### 8.8 Audit
 
@@ -2816,7 +2817,7 @@ let hive_conf = HiveConfig {
 
 Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores) for building trust stores from cluster certificates.
 
-Signed commands are additionally checked for freshness: each signed command frame states its issue time in `metadata.order` (unix milliseconds), and the hive rejects commands outside `control.command_freshness_window` of its clock or whose signature was already seen inside that window (replay protection).
+Signed commands are additionally checked for freshness: each signed command frame states its issue time in `metadata.order` (unix milliseconds), and the hive rejects commands outside `control.command_freshness_window` of `HiveConfig::clock` or whose signature was already seen inside that window (replay protection).
 
 ##### Resilience Features
 
@@ -2824,7 +2825,9 @@ Hives include built-in resilience mechanisms:
 
 **Backpressure**: When utilization exceeds the threshold (default: 90%), the hive signals to the cluster that it is overloaded. The cluster can then route new work to less-loaded hives.
 
-**Circuit Breaker**: After consecutive failures (default: 3), the circuit opens and the hive temporarily stops accepting work, allowing time for recovery before resuming.
+**Circuit Breaker**: After consecutive authentication failures from one known signer (default: 3), that signer's circuit opens and the hive refuses its commands. When the cooldown has passed, the circuit lets one probe through. The cooldown runs on the monotonic reading of `HiveConfig::clock`, so a step of the system time neither shortens nor stretches it.
+
+**Drain**: `Hive::drain` refuses every new command except the heartbeat and stops the background beats. It then waits until no command is in flight, or until `drain_timeout` passes on `HiveConfig::clock`, and stops the registered servlets. The hive then announces its emptied slate, so gateways retire its routes before a heartbeat misses. An idle hive drains at once.
 
 These are configured via nested `HiveControlConfig`:
 
@@ -2839,6 +2842,18 @@ let hive_conf = HiveConfig {
 	..Default::default()
 };
 ```
+
+**Refused commands**: A refused command is answered in the alternative it was sent in, so a refused spawn gets a spawn response and a refused heartbeat gets a heartbeat response. A command body that names no single alternative is answered in the stop alternative, which carries only a status. A signed command spends its replay slot when the hive admits it. A refusal that a retry of the same signed frame could change releases the slot, and every other refusal keeps it spent, so a resend of that frame is refused as a replay.
+
+| Management refusal                                       | Status              | Replay slot |
+| -------------------------------------------------------- | ------------------- | ----------- |
+| The hive is at or over its backpressure threshold        | `ResourceExhausted` | Released    |
+| The spawner produced no servlet                          | `Unavailable`       | Released    |
+| The servlet registry refused the spawned servlet         | `Unavailable`       | Released    |
+| The hive is draining                                     | `Unavailable`       | Kept        |
+| No spawner is registered for the servlet type            | `PermissionDenied`  | Kept        |
+| The spawned servlet's address is not an instance locator | `PermissionDenied`  | Kept        |
+| The stop names no running instance                       | `PermissionDenied`  | Kept        |
 
 ##### Load Balancing
 
@@ -2895,10 +2910,14 @@ pub struct HiveConfig {
 	pub namespace: ColonyNamespace,
 	pub scaling: HiveScalingConfig,
 	pub control: HiveControlConfig,
-	/// Intra-hive servlet pool + control-server mux (`pool.mux_offer`, default None)
+	/// Intra-hive servlet pool + control-server mux (`pool.mux_offer`, default None).
+	/// The pool reads `clock`.
 	pub pool: PoolConfig,
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+	/// Clock for freshness, cooldown, drain, scaling, and retry decisions
+	/// (default: SystemClock)
+	pub clock: Arc<dyn Clock>,
 }
 ```
 
@@ -2916,7 +2935,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(BACKPRESSURE_MANAGE_SHAPE, exactly!(1))
+			(BACKPRESSURE_MANAGE_SHAPE, exactly!(1), equals!(TransitStatus::ResourceExhausted))
 		]
 	}
 }
@@ -2935,13 +2954,14 @@ tb_scenario! {
 		},
 		// Owns the hive for drain, registry checks, and stop
 		client: |HiveEnv { trace, context: signer, hive }| async move {
-			let mut client = connect_hive(&hive).await?;
+			let mut client = connect_hive(&hive, &signer).await?;
 
 			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
-			assert_manage_stop_shape(&response, TransitStatus::ResourceExhausted);
 
-			trace.event(BACKPRESSURE_MANAGE_SHAPE)?;
+			// The status is read from the stop alternative, so a reply in
+			// any other alternative fails the scenario.
+			trace.event_with(BACKPRESSURE_MANAGE_SHAPE, &[], manage_stop_shape_status(response)?)?;
 
 			hive.stop();
 			Ok(())
@@ -2966,7 +2986,7 @@ Clusters are the "ant colonies" of the EEIC--centralized gateways that coordinat
 
 A cluster operates as a gateway server with five primary responsibilities:
 
-1. **Hive Registry**: Maintains a dynamic registry of connected hives and their available servlet types. Hives register on startup and announce which servlet types they can handle.
+1. **Hive Registry**: Maintains a dynamic registry of connected hives and their available servlet types. Hives register on startup and announce which servlet types they can handle. Each route belongs to the hive or peer gateway that installed it. A hive cannot register, update, or remove a route that another hive or a peer holds, and it cannot claim a socket that a peer gateway route dials. The gateway refuses such a registration or address update with `PermissionDenied`.
 
 2. **Work Routing**: Receives `ClusterWorkRequest` messages from external clients (or peer gateways), looks up Local and Peer routes for the servlet type, selects one via load balancing, and forwards the request.
 
@@ -2975,6 +2995,12 @@ A cluster operates as a gateway server with five primary responsibilities:
 4. **Peer Federation**: Optionally advertises local servlet types to peer gateways and installs soft-state Peer routes from their advertisements. Work can then hop one step to a peer colony that exports the type.
 
 5. **Colony Gossip**: Optionally floods origin-signed rumors across colony member gateways, with journal deduplication and anti-entropy repair.
+
+A panic that holds the hive registry, the route table, the peer table, or the gossip journal can leave it half-written, so the gateway propagates a poisoned lock on any of the four as `ClusterError::LockPoisoned`:
+
+- A background loop (the heartbeat, the pheromone evaporation sweep, the advertise beat, or a gossip reflood) ends and traces `CLUSTER_LOOP_POISONED` with the fault as its payload. A poisoned lock never clears, so the loop stays ended until the gateway restarts.
+- A registration, an address update, a peer advertisement, or a gossip frame is answered `Unavailable`.
+- The `Cluster` views `available_servlets`, `peer_servlets`, `peer_routes`, and `hive_count` return the error.
 
 ##### The `cluster!` Macro
 
@@ -3054,7 +3080,7 @@ Behavior:
 
 1. Each advertise beat snapshots the **local hive registry** (never a static configured slate) and dials peers with a signed `AdvertisePeer` (`PeerAdvertisement`).
 2. The receiver admits on the peer trust plane: signature, freshness, colony membership on both sides, parseable dial address, optional allowlist, and namespace-scoped servlet types.
-3. Installed routes are soft-state and keyed by the peer's signer certificate fingerprint. The claimed `gateway_addr` is the dial target. An empty advertisement clears that peer's routes.
+3. Installed routes are soft-state and keyed by the peer's signer certificate fingerprint. The claimed `gateway_addr` is the dial target. An advertisement whose `gateway_addr` is a socket that a local hive route dials is refused with `PermissionDenied`. An empty advertisement clears that peer's routes.
 4. The load balancer selects among Local and Peer trails together. Locality emerges from pheromone strength rather than a hard preference flag.
 5. A peer hop re-emits `ClusterWorkRequest` with a decremented `hops_remaining` budget. The origin stamps the sentinel `u8::MAX`, which means forward as far as policy allows. The first gateway clamps that to its `PeerConfig::max_hops` (default 1). A default topology therefore forwards exactly once, and peer graphs cannot bounce work forever. A spent budget refuses `Unavailable` instead of forwarding.
 6. Peer dials prefer the peer connection pool when `peer_trust` is set. Peer failures weaken trails and can abandon a grey-hole peer while local routes keep serving.
@@ -3196,7 +3222,7 @@ Configure heartbeat behavior via `HeartbeatConfig`:
 ```rust
 let heartbeat_conf = HeartbeatConfig::builder()
 	.with_interval(Duration::from_secs(5))   // Check every 5 seconds
-	.with_timeout(Duration::from_secs(15))   // Response deadline
+	.with_timeout(Duration::from_secs(15))   // Evict a hive silent this long
 	.with_max_failures(3)                    // Evict after 3 failures
 	.with_max_concurrent(10)                 // Parallel heartbeat limit
 	.build();
@@ -3340,6 +3366,8 @@ pub struct ClusterConfig {
 	pub namespace: ColonyNamespace,
 	/// Optional stable gateway bind address
 	pub bind_addr: Option<String>,
+	/// Optional edge bind address, which admits `Work` frames only
+	pub edge_bind_addr: Option<String>,
 	/// Freshness/replay window for signed hive control frames
 	pub control_freshness_window: Duration,
 	/// TLS configuration, including `hive_trust` and `peer_trust`
@@ -3358,7 +3386,8 @@ pub struct ClusterConfig {
 	/// Positive export grants evaluated when the allowlist refuses.
 	/// Allow sources compose as union. Deny gates still override.
 	pub export_grants: Vec<Arc<dyn ExportGrant>>,
-	/// Connection pool configuration for hive (and peer) connections
+	/// Connection pool configuration for hive (and peer) connections.
+	/// The pools read `clock`.
 	pub pool_config: PoolConfig,
 
 	// --- Peer federation ---
@@ -3380,7 +3409,14 @@ pub struct ClusterConfig {
 
 Clusters can be tested using `environment Cluster`:
 
-A scenario that depends on time passing (a retention window pruning, a lease expiring, an idle connection closing) installs a `ManualClock` through `ClusterConfig::clock` or `PoolConfig::clock` and advances it, instead of sleeping until the real clock gets there.
+A scenario that depends on time passing (a retention window pruning, a lease expiring, an idle connection closing) installs a `ManualClock` (`tightbeam::utils::time`, feature `testing`) and advances it, instead of sleeping until the real clock gets there. Each owner takes its clock in one place:
+
+- A gateway reads `ClusterConfig::clock`, and its hive and peer pools read the same clock.
+- A hive reads `HiveConfig::clock`, and its servlet pool reads the same clock.
+- A servlet's accept loop reads the clock set with `ServletConfigBuilder::with_clock`.
+- A standalone pool reads the clock passed to `ConnectionPoolBuilder::new` or set with `ConnectionPoolBuilder::with_clock`.
+
+An advance wakes every beat that sleeps on the clock, but the work a beat starts runs on its own task. The scenario polls `TraceCollector::recorded` for the event that work traces. When the event has not landed, the scenario advances again, because a beat that begins its sleep after an advance waits a full interval from that point.
 
 ```rust
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, cluster, hive};
@@ -3498,7 +3534,7 @@ Domains (see `tightbeam::instrumentation::events` for the full set):
 - **Process** (requires `testing-csp`): `process/transition`, `process/hidden`
 - **Exploration** (requires `testing-fdr`): `fdr/seed-start`, `fdr/seed-end`, `fdr/state-expand`, `fdr/state-prune`, `fdr/divergence-detect`, `fdr/refusal-snapshot`, `fdr/enabled-set-sample`
 - **Mux / pool / session**: `mux/*`, `pool/*`, `session/*` (handshake, receipts, rekey, drain)
-- **Colony**: `hive/reregistered`, `cluster/hive-registered`, `cluster/work-routed`, `cluster/work-forwarded`, `cluster/peer-advertised`, `cluster/gossip-accepted`, `cluster/gossip-refused`, and related accept/refuse pairs
+- **Colony**: `hive/reregistered`, `cluster/hive-registered`, `cluster/work-routed`, `cluster/work-forwarded`, `cluster/peer-advertised`, `cluster/gossip-accepted`, `cluster/gossip-refused`, `cluster/loop-poisoned`, and related accept/refuse pairs
 
 Hidden/internal detail MUST stay behind `enable_internal_detail` (and related sampling flags). Control-plane accept/refuse events (gates, cluster, gossip) fire when the subsystem decides, independent of that detail flag.
 
@@ -4183,6 +4219,7 @@ Assertions can be tagged with arbitrary string labels for flexible categorizatio
 
 - `trace.event(URN)` records a label-only assertion and, with `instrument`, also emits `ASSERT_LABEL`.
 - `trace.event_with(URN, &["tag"], value)` adds tags plus an optional value (`Into<AssertionValue>`).
+- `trace.recorded(URN)` (feature `testing`) counts the recorded assertions that carry that label, without draining them. A scenario that waits on a background task polls it for the event the task traces.
 
 ```rust
 use tightbeam::utils::urn::Urn;

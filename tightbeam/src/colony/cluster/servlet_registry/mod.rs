@@ -13,7 +13,7 @@ mod select;
 mod tests;
 
 use crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
-use crate::utils::time::{Clock, SystemClock, UnixMillis};
+use crate::utils::time::{Clock, MonotonicInstant, UnixMillis};
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -21,11 +21,51 @@ use std::sync::{Arc, RwLock};
 pub(super) use super::error::ClusterError;
 pub(super) use super::SharedId;
 
+pub(crate) use config::HiveSlate;
 pub use config::{
 	PeerCaps, PheromoneConfig, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_EVAPORATION_INTERVAL_SECS,
 	DEFAULT_EVAPORATION_RATE_BPS, DEFAULT_INITIAL_PHEROMONE, DEFAULT_REINFORCEMENT_BOOST, DEFAULT_WEAKENING_PENALTY,
 };
 pub use entry::{LocalRoute, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, ServletEntry};
+
+use entry::Owner;
+
+/// One route as the registry holds it: the entry and when it was placed.
+///
+/// The install instant belongs to the placement, not to the entry, so an
+/// entry outside the map has none and an entry inside always has one. A
+/// replacement is a fresh placement and ages from it.
+struct Installed {
+	entry: Arc<ServletEntry>,
+	at: MonotonicInstant,
+}
+
+/// One owner's claim on one route key, for the removal arm.
+///
+/// Both fields are byte slices, so a positional pair could be transposed
+/// and the decider would look an owner up as a key, find nothing, and
+/// admit the removal. Named fields make the question unmistakable
+/// (CWE-639).
+struct RouteClaim<'a> {
+	/// The identity that must hold the route.
+	owner: Owner<'a>,
+	/// The route key the owner claims.
+	key: &'a [u8],
+}
+
+/// The bucket one slate replaces and the identity every route in it must
+/// belong to.
+///
+/// A slate swap removes what the bucket held before, so the sweep is an
+/// ownership question too: a bucket whose bytes another owner's routes
+/// landed under is not this owner's to clear (CWE-639).
+#[derive(Clone, Copy)]
+struct Bucket<'a> {
+	/// The hive-index key the slate reconciles under.
+	id: &'a [u8],
+	/// The identity that owns every route in the bucket.
+	owner: Owner<'a>,
+}
 
 /// Servlet entries and the two reverse indexes derived from them.
 ///
@@ -35,21 +75,108 @@ pub use entry::{LocalRoute, PeerRoute, PeerRouteInfo, RelayRoute, RouteKind, Ser
 /// (CWE-362).
 #[derive(Default)]
 pub(super) struct Routes {
-	entries: HashMap<SharedId, Arc<ServletEntry>>,
+	entries: HashMap<SharedId, Installed>,
 	by_type: HashMap<SharedId, Vec<SharedId>>,
 	by_bucket: HashMap<SharedId, Vec<SharedId>>,
 	ad_orders: HashMap<SharedId, UnixMillis>,
 }
 
 impl Routes {
-	/// Stores `entry`, replacing any route already at its key.
+	/// Whether `entry` may be placed at its key.
+	///
+	/// This is the one decider for route ownership, and it checks both axes
+	/// a route claims:
+	///
+	/// - Its key: a key no route holds, or that `entry`'s owner already
+	///   holds, admits it. A key another owner holds refuses it, so one hive
+	///   cannot take over the address another hive registered (CWE-639).
+	/// - Its dial address: a socket the other plane already dials refuses
+	///   it, so a hive cannot register a peer gateway's socket as a servlet
+	///   and a peer cannot advertise a local servlet's socket as its gateway.
+	///   Trails on one plane may share a socket, which is how a relay trail
+	///   dials the relay's own gateway.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::ServletNotOwned`] -- a local route's key or socket
+	///   belongs to another owner.
+	/// - [`ClusterError::PeerSlateConflict`] -- a peer route's key or socket
+	///   belongs to another owner.
+	fn admits(&self, entry: &ServletEntry) -> Result<(), ClusterError> {
+		let owner = entry.owner();
+		let key_held_by_other = self.owner_of(entry.route_key()).is_some_and(|held| !held.same(owner));
+		if key_held_by_other {
+			return Err(Self::refusal(owner));
+		}
+
+		let dial = entry.dial_target().as_ref();
+		let dialed_by_other_plane = self
+			.values()
+			.any(|held| held.owner().is_peer() != owner.is_peer() && held.dial_target().as_ref() == dial);
+		if dialed_by_other_plane {
+			return Err(Self::refusal(owner));
+		}
+
+		Ok(())
+	}
+
+	/// Whether `claim.owner` holds the route at `claim.key`.
+	///
+	/// This is the removal side of [`Self::admits`]: the route must exist and
+	/// must belong to the claimant.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::ServletNotFound`] -- nothing is routed at the key.
+	/// - [`ClusterError::ServletNotOwned`] -- another owner holds a route a hive claims.
+	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a route a peer claims.
+	fn held_by(&self, claim: RouteClaim<'_>) -> Result<(), ClusterError> {
+		let held = self.owner_of(claim.key).ok_or(ClusterError::ServletNotFound)?;
+		if held.same(claim.owner) {
+			Ok(())
+		} else {
+			Err(Self::refusal(claim.owner))
+		}
+	}
+
+	/// The owner of whatever is routed at `key`.
+	fn owner_of(&self, key: impl AsRef<[u8]>) -> Option<Owner<'_>> {
+		let key = key.as_ref();
+		self.entries.get(key).map(|installed| installed.entry.owner())
+	}
+
+	/// The refusal a claim by `owner` answers with, named for the plane the
+	/// claim came from.
+	fn refusal(owner: Owner<'_>) -> ClusterError {
+		if owner.is_peer() {
+			ClusterError::PeerSlateConflict
+		} else {
+			ClusterError::ServletNotOwned
+		}
+	}
+
+	/// Stores `entry`, replacing a route its owner already holds at its key.
 	///
 	/// A replaced peer route keeps its pheromone and trial state, so a
 	/// re-advertisement leaves a route's earned standing in place.
-	pub(super) fn insert(&mut self, mut entry: ServletEntry) {
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::ServletNotOwned`] -- another owner holds the key or socket.
+	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a peer route's key or socket.
+	#[cfg(test)]
+	pub(super) fn insert(&mut self, entry: ServletEntry, now: MonotonicInstant) -> Result<(), ClusterError> {
+		self.admits(&entry)?;
+		self.place(entry, now);
+		Ok(())
+	}
+
+	/// Stores an entry [`Self::admits`] already admitted, installed at `now`
+	/// on the registry's clock.
+	fn place(&mut self, mut entry: ServletEntry, now: MonotonicInstant) {
 		let address = Arc::clone(entry.route_key());
 		if let Some(previous) = self.entries.get(address.as_ref()) {
-			entry.preserve_peer_trail_from(previous);
+			entry.preserve_peer_trail_from(&previous.entry);
 		}
 
 		self.unindex(address.as_ref());
@@ -58,20 +185,20 @@ impl Routes {
 		let bucket = Arc::clone(entry.bucket());
 		self.by_type.entry(servlet_type).or_default().push(Arc::clone(&address));
 		self.by_bucket.entry(bucket).or_default().push(Arc::clone(&address));
-		self.entries.insert(address, Arc::new(entry));
+		self.entries.insert(address, Installed { entry: Arc::new(entry), at: now });
 	}
 
 	pub(super) fn remove(&mut self, address: impl AsRef<[u8]>) -> Option<Arc<ServletEntry>> {
 		let address = address.as_ref();
-		let entry = self.entries.remove(address)?;
-		self.drop_index_rows(&entry, address);
-		Some(entry)
+		let installed = self.entries.remove(address)?;
+		self.drop_index_rows(&installed.entry, address);
+		Some(installed.entry)
 	}
 
 	/// Drops the index rows of whatever currently sits at `address`.
 	fn unindex(&mut self, address: impl AsRef<[u8]>) {
 		let address = address.as_ref();
-		let Some(previous) = self.entries.get(address).map(Arc::clone) else {
+		let Some(previous) = self.entries.get(address).map(|installed| Arc::clone(&installed.entry)) else {
 			return;
 		};
 
@@ -98,41 +225,76 @@ impl Routes {
 
 	/// Replaces `bucket`'s slate in one step.
 	///
-	/// The new entries land before the departed ones leave, so no reader
-	/// observes the bucket empty mid-swap and no rollback is required.
-	pub(super) fn reconcile(&mut self, bucket: impl AsRef<[u8]>, slate: impl IntoIterator<Item = ServletEntry>) {
-		let bucket = bucket.as_ref();
+	/// Every entry is admitted and every route the swap would remove is
+	/// checked against `bucket.owner` before any map moves, so a refusal
+	/// leaves the bucket as it was. The new entries land before the
+	/// departed ones leave, so no reader observes the bucket empty mid-swap.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::ServletNotOwned`] -- another owner holds a key or
+	///   socket a local slate claims, or a route under the bucket.
+	/// - [`ClusterError::PeerSlateConflict`] -- another owner holds a key or
+	///   socket a peer slate claims.
+	fn reconcile(
+		&mut self,
+		bucket: Bucket<'_>,
+		slate: impl IntoIterator<Item = ServletEntry>,
+		now: MonotonicInstant,
+	) -> Result<(), ClusterError> {
 		let slate: Vec<ServletEntry> = slate.into_iter().collect();
+		for entry in &slate {
+			self.admits(entry)?;
+		}
+
+		// The sweep below removes what the bucket held, so every route in
+		// it must be this owner's to remove.
+		for address in self.addresses_in_bucket(bucket.id) {
+			self.held_by(RouteClaim { owner: bucket.owner, key: address.as_ref() })?;
+		}
+
 		let mut fresh: Vec<SharedId> = Vec::with_capacity(slate.len());
 		for entry in slate {
 			fresh.push(Arc::clone(entry.route_key()));
-			self.insert(entry);
+			self.place(entry, now);
 		}
 
 		let stale: Vec<SharedId> = self
-			.by_bucket
-			.get(bucket)
-			.map(|addresses| {
-				addresses
-					.iter()
-					.filter(|address| !fresh.iter().any(|kept| kept.as_ref() == address.as_ref()))
-					.map(Arc::clone)
-					.collect()
-			})
-			.unwrap_or_default();
+			.addresses_in_bucket(bucket.id)
+			.iter()
+			.filter(|address| !fresh.iter().any(|kept| kept.as_ref() == address.as_ref()))
+			.map(Arc::clone)
+			.collect();
 
 		for address in &stale {
 			self.remove(address.as_ref());
 		}
+
+		Ok(())
+	}
+
+	/// Removes every route in `bucket` that `bucket.owner` holds.
+	///
+	/// A retiring owner takes its own routes with it and nothing else, so a
+	/// route another owner landed under the same bucket bytes stays.
+	fn remove_owned(&mut self, bucket: Bucket<'_>) -> Vec<Arc<ServletEntry>> {
+		let owned: Vec<SharedId> = self
+			.addresses_in_bucket(bucket.id)
+			.iter()
+			.filter(|address| self.owner_of(address.as_ref()).is_some_and(|held| held.same(bucket.owner)))
+			.map(Arc::clone)
+			.collect();
+
+		owned.iter().filter_map(|address| self.remove(address.as_ref())).collect()
 	}
 
 	pub(super) fn get(&self, address: impl AsRef<[u8]>) -> Option<&Arc<ServletEntry>> {
 		let address = address.as_ref();
-		self.entries.get(address)
+		self.entries.get(address).map(|installed| &installed.entry)
 	}
 
 	pub(super) fn values(&self) -> impl Iterator<Item = &Arc<ServletEntry>> {
-		self.entries.values()
+		self.entries.values().map(|installed| &installed.entry)
 	}
 
 	/// Route keys serving `servlet_type`, borrowed from the index.
@@ -147,35 +309,10 @@ impl Routes {
 		self.by_bucket.get(bucket).map_or(&[], Vec::as_slice)
 	}
 
-	/// Whether a local route already claims `hive_id` as its key or bucket.
-	pub(super) fn peer_key_conflicts_local(&self, hive_id: impl AsRef<[u8]>) -> bool {
-		let hive_id = hive_id.as_ref();
-		if self.get(hive_id).is_some_and(|entry| entry.route_kind() == RouteKind::Local) {
-			return true;
-		}
-
-		self.addresses_in_bucket(hive_id).iter().any(|address| {
-			self.get(address.as_ref())
-				.is_some_and(|entry| entry.route_kind() == RouteKind::Local)
-		})
-	}
-
-	/// Whether a local route already dials `dial_addr`.
-	pub(super) fn peer_dial_conflicts_local(&self, dial_addr: impl AsRef<[u8]>) -> bool {
-		let dial_addr = dial_addr.as_ref();
-		self.values()
-			.any(|entry| entry.route_kind() == RouteKind::Local && entry.route_key().as_ref() == dial_addr)
-	}
-
-	/// Whether admitting `new_slate_len` routes for `bucket` would pass a cap.
-	pub(super) fn slate_exceeds_caps(
-		&self,
-		bucket: impl AsRef<[u8]>,
-		new_slate_len: usize,
-		count_kind: RouteKind,
-		max_identities: usize,
-		max_routes: usize,
-	) -> bool {
+	/// Whether admitting `new_slate_len` routes for `bucket` would pass one
+	/// of the caps `caps` sets for its kind.
+	fn slate_exceeds_caps(&self, bucket: impl AsRef<[u8]>, new_slate_len: usize, caps: KindCaps) -> bool {
+		let KindCaps { kind: count_kind, max_identities, max_routes } = caps;
 		let bucket = bucket.as_ref();
 		if new_slate_len == 0 {
 			return false;
@@ -203,52 +340,69 @@ impl Routes {
 		identities.len().saturating_add(usize::from(identity_is_new)) > max_identities
 	}
 
-	/// Admits one advertisement: freshness, conflicts, caps, the swap, and
-	/// the order it applied at.
+	/// Admits one advertisement under the guard the caller already holds.
 	///
-	/// Every step reads and writes under the guard the caller already
-	/// holds, so concurrent advertisements for one bucket apply in a
-	/// single order and the ledger always names the slate installed
-	/// (CWE-294, CWE-367).
-	#[allow(clippy::too_many_arguments)]
-	pub(super) fn admit_peer_ad(
+	/// The checks and writes run in this order:
+	///
+	/// - A slate older than the bucket's last applied order is refused.
+	/// - A slate that would pass the kind's caps is refused.
+	/// - [`Self::reconcile`] asks the one decider about every key, socket, and swept route.
+	/// - An emptied direct slate also withdraws the relay trails learned from it.
+	/// - The ledger records the order the slate applied at.
+	///
+	/// Every step reads and writes under that one guard, so concurrent
+	/// advertisements for one bucket apply in a single order and the ledger
+	/// always names the slate installed (CWE-294, CWE-367).
+	fn admit_peer_ad(
 		&mut self,
-		bucket: &SharedId,
-		dial_addr: Option<&[u8]>,
+		bucket: Bucket<'_>,
 		slate: impl IntoIterator<Item = ServletEntry>,
-		count_kind: RouteKind,
-		max_identities: usize,
-		max_routes: usize,
+		caps: KindCaps,
 		order: UnixMillis,
 		tombstone: Tombstone,
+		now: MonotonicInstant,
 	) -> Result<(), ClusterError> {
 		let slate: Vec<ServletEntry> = slate.into_iter().collect();
-		if self.ad_orders.get(bucket.as_ref()).is_some_and(|&applied| order < applied) {
+		if self.ad_orders.get(bucket.id).is_some_and(|&applied| order < applied) {
 			return Err(ClusterError::StalePeerAd);
 		}
-		if self.peer_key_conflicts_local(bucket.as_ref()) {
-			return Err(ClusterError::PeerSlateConflict);
-		}
-		if dial_addr.is_some_and(|addr| self.peer_dial_conflicts_local(addr)) {
-			return Err(ClusterError::PeerSlateConflict);
-		}
-		if self.slate_exceeds_caps(bucket.as_ref(), slate.len(), count_kind, max_identities, max_routes) {
+		if self.slate_exceeds_caps(bucket.id, slate.len(), caps) {
 			return Err(ClusterError::PeerCapExceeded);
 		}
 
 		let clearing = slate.is_empty();
 
-		self.reconcile(bucket.as_ref(), slate);
+		self.reconcile(bucket, slate, now)?;
 
 		// A withdrawn direct slate withdraws the relay fallbacks learned
 		// from it, in the same step that withdraws the direct routes.
-		if clearing && count_kind == RouteKind::Peer {
-			self.remove_relay_trails_for_origin(bucket.as_ref());
+		if clearing && caps.kind == RouteKind::Peer {
+			self.remove_relay_trails_for_origin(bucket.id);
 		}
 
-		self.record_ad_order(Arc::clone(bucket), order, tombstone);
+		self.record_ad_order(Arc::from(bucket.id), order, tombstone);
 
 		Ok(())
+	}
+
+	/// Drops the relay trails installed more than `max_age` before `now`.
+	///
+	/// The filter and the removal run under the one guard the caller holds,
+	/// so a trail that a reconcile refreshes is judged on its refreshed age.
+	pub(super) fn prune_stale_relay_trails(&mut self, now: MonotonicInstant, max_age: Duration) -> usize {
+		let stale: Vec<SharedId> = self
+			.entries
+			.values()
+			.filter(|installed| installed.entry.route_kind() == RouteKind::PeerRelay)
+			.filter(|installed| now.saturating_duration_since(installed.at) > max_age)
+			.map(|installed| Arc::clone(installed.entry.route_key()))
+			.collect();
+
+		for route_key in &stale {
+			self.remove(route_key.as_ref());
+		}
+
+		stale.len()
 	}
 
 	/// Drops every relay trail learned for one origin identity.
@@ -277,15 +431,15 @@ impl Routes {
 	fn record_ad_order(&mut self, bucket: SharedId, order: UnixMillis, tombstone: Tombstone) {
 		self.ad_orders.insert(bucket, order);
 
-		// Disjoint field borrows: the ledger prunes against the live index
-		// without copying its keys.
+		// The closure borrows `by_bucket` apart from `ad_orders`, so the ledger
+		// prunes against the live index without copying its keys.
 		let Tombstone { window, now } = tombstone;
 		let by_bucket = &self.by_bucket;
 		self.ad_orders
 			.retain(|bucket, applied| by_bucket.contains_key(bucket) || now.saturating_since(*applied) <= window);
 	}
 
-	/// Rows the order ledger holds.
+	/// Returns the number of rows the order ledger holds.
 	#[cfg(test)]
 	pub(super) fn ad_order_rows(&self) -> usize {
 		self.ad_orders.len()
@@ -294,35 +448,31 @@ impl Routes {
 	/// Applies one hive's additions and removals in a single step.
 	///
 	/// Every entry is checked before any map moves, so a refusal leaves the
-	/// registry as it was and the caller needs no compensating undo.
+	/// registry as it was and the caller needs no compensating undo. The
+	/// slate names its hive, so every added route is that hive's by
+	/// construction and only the registry's own ownership question remains.
 	///
 	/// # Errors
 	///
-	/// - [`ClusterError::ServletNotOwned`] -- an address belongs to another hive.
+	/// - [`ClusterError::ServletNotOwned`] -- an address belongs to another owner.
 	/// - [`ClusterError::ServletNotFound`] -- a removal names an absent address.
 	pub(super) fn apply_address_update(
 		&mut self,
-		hive_id: impl AsRef<[u8]>,
-		added: impl IntoIterator<Item = ServletEntry>,
+		added: HiveSlate,
 		removed: &[&[u8]],
+		now: MonotonicInstant,
 	) -> Result<(), ClusterError> {
-		let hive_id = hive_id.as_ref();
-		let added: Vec<ServletEntry> = added.into_iter().collect();
+		let (hive_id, added) = added.into_parts();
+		let owner = Owner::hive(hive_id.as_ref());
 		for entry in &added {
-			if entry.owner_id().as_ref() != hive_id {
-				return Err(ClusterError::ServletNotOwned);
-			}
+			self.admits(entry)?;
 		}
 		for address in removed {
-			match self.get(address) {
-				Some(entry) if entry.owner_id().as_ref() == hive_id => {}
-				Some(_) => return Err(ClusterError::ServletNotOwned),
-				None => return Err(ClusterError::ServletNotFound),
-			}
+			self.held_by(RouteClaim { owner, key: address })?;
 		}
 
 		for entry in added {
-			self.insert(entry);
+			self.place(entry, now);
 		}
 		for address in removed {
 			self.remove(address);
@@ -330,6 +480,20 @@ impl Routes {
 
 		Ok(())
 	}
+}
+
+/// The peer-routed kind a slate installs and the two storage caps it spends.
+///
+/// The fields are named so a caller cannot hand the identity cap to the
+/// route slot or the reverse (CWE-770).
+#[derive(Clone, Copy, Debug)]
+struct KindCaps {
+	/// The kind whose routes the caps count.
+	kind: RouteKind,
+	/// The most distinct buckets this kind may hold.
+	max_identities: usize,
+	/// The most routes this kind may hold across every bucket.
+	max_routes: usize,
 }
 
 /// When an emptied bucket's order row may be dropped: once `window` has
@@ -347,36 +511,34 @@ pub(super) struct Tombstone {
 
 /// Registry of servlet entries with pheromone-based routing.
 ///
-/// Tracks servlet instances across hives and peer gateways.
-/// Reinforcement and evaporation steer selection, and trial limits
-/// abandon dead routes.
+/// The registry tracks servlet instances across hives and peer gateways.
+/// Reinforcement and evaporation steer selection, and trial limits abandon
+/// dead routes.
 pub struct ServletRegistry {
 	/// Entries and the two reverse indexes derived from them.
 	pub(super) routes: RwLock<Routes>,
 	/// How long a dead bucket's order tombstone survives.
 	pub(super) ad_tombstone_window: Duration,
-	/// The clock tombstones age against.
+	/// The clock that tombstones, route installs, and relay-trail age are
+	/// measured on.
 	pub(super) clock: Arc<dyn Clock>,
 	/// Scoring and lifecycle configuration.
 	pub(super) config: PheromoneConfig,
 }
 
 impl ServletRegistry {
-	/// Creates a registry with the supplied pheromone configuration.
-	pub fn new(config: PheromoneConfig) -> Self {
+	/// Creates a registry that scores on `config` and measures tombstones,
+	/// route installs, and relay-trail age on `clock`.
+	///
+	/// The clock is the gateway's own, so a registry cannot age its rows on
+	/// a clock the gateway beside it does not read.
+	pub fn new(config: PheromoneConfig, clock: Arc<dyn Clock>) -> Self {
 		Self {
 			routes: RwLock::new(Routes::default()),
 			ad_tombstone_window: Duration::from_millis(DEFAULT_COMMAND_FRESHNESS_WINDOW_MS),
-			clock: Arc::new(SystemClock),
+			clock,
 			config,
 		}
-	}
-
-	/// Sets the clock tombstones age against. Defaults to [`SystemClock`].
-	#[must_use]
-	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-		self.clock = clock;
-		self
 	}
 
 	/// The tombstone bound for an advertisement admitted now.
@@ -391,11 +553,5 @@ impl ServletRegistry {
 	pub fn with_ad_tombstone_window(mut self, window: Duration) -> Self {
 		self.ad_tombstone_window = window;
 		self
-	}
-}
-
-impl Default for ServletRegistry {
-	fn default() -> Self {
-		Self::new(PheromoneConfig::default())
 	}
 }
