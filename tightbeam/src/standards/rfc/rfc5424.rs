@@ -1,6 +1,10 @@
-use crate::der::Enumerated;
+#[cfg(not(feature = "std"))]
+extern crate alloc;
 
-#[cfg(feature = "derive")]
+#[cfg(not(feature = "std"))]
+use alloc::string::{String, ToString};
+
+use crate::der::Enumerated;
 use crate::Errorizable;
 
 /// Syslog Severity (RFC 5424, § 6.2.1)
@@ -68,16 +72,10 @@ impl core::str::FromStr for SyslogSeverity {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RFC5424Error {
-	#[cfg_attr(feature = "derive", error("invalid RFC5424 severity value: {0}"))]
+	#[error("invalid RFC5424 severity value: {0}")]
 	InvalidSeverityValue(u8),
-	#[cfg_attr(feature = "derive", error("invalid RFC5424 severity name: {0}"))]
+	#[error("invalid RFC5424 severity name: {0}")]
 	InvalidSeverityName(String),
 }
-
-crate::impl_error_display!(RFC5424Error {
-	InvalidSeverityValue(v) => "invalid RFC5424 severity value: {v}",
-	InvalidSeverityName(s) => "invalid RFC5424 severity name: {s}",
-});

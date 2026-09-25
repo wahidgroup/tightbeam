@@ -1,7 +1,7 @@
 //! V3 frame DER encode/decode roundtrip via the public builder API.
 
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
-use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid, Key, KeyInit};
+use tightbeam::crypto::aead::{Aes256Gcm, Key, KeyInit};
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::prelude::*;
@@ -9,13 +9,12 @@ use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
-pub(crate) const DER_NONEMPTY: Urn<'static> = Urn::new("test", "event:frame-der/der-nonempty");
-pub(crate) const MATRIX_PRESENT: Urn<'static> = Urn::new("test", "event:frame-der/matrix-present");
-pub(crate) const ROUNDTRIP_OK: Urn<'static> = Urn::new("test", "event:frame-der/roundtrip-ok");
-pub(crate) const VERSION: Urn<'static> = Urn::new("test", "event:frame-der/version");
+pub(crate) const DER_NONEMPTY: Urn<'static> = tightbeam::urn!("test", "event:frame-der/der-nonempty");
+pub(crate) const MATRIX_PRESENT: Urn<'static> = tightbeam::urn!("test", "event:frame-der/matrix-present");
+pub(crate) const ROUNDTRIP_OK: Urn<'static> = tightbeam::urn!("test", "event:frame-der/roundtrip-ok");
+pub(crate) const VERSION: Urn<'static> = tightbeam::urn!("test", "event:frame-der/version");
 
-#[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
-#[derive(Clone, Debug, PartialEq, Sequence)]
+#[derive(tightbeam::Beamable, Clone, Debug, PartialEq, Sequence)]
 struct TestMessage {
 	content: String,
 }
@@ -26,16 +25,8 @@ impl AsRef<[u8]> for TestMessage {
 	}
 }
 
-#[cfg(not(feature = "derive"))]
-impl tightbeam::Message for TestMessage {
-	const MUST_BE_NON_REPUDIABLE: bool = false;
-	const MUST_BE_CONFIDENTIAL: bool = false;
-	const MUST_BE_COMPRESSED: bool = false;
-	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: tb::Version = tb::Version::V0;
-}
-
-#[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
+#[derive(tightbeam::Flaggable)]
+#[repr(u8)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum FlagTestDevelopmentMode {
 	#[default]
@@ -43,40 +34,13 @@ enum FlagTestDevelopmentMode {
 	IsMaintenanceMode = 2,
 }
 
-#[cfg(not(feature = "derive"))]
-impl From<FlagTestDevelopmentMode> for u8 {
-	fn from(flag: FlagTestDevelopmentMode) -> u8 {
-		flag as u8
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl PartialEq<u8> for FlagTestDevelopmentMode {
-	fn eq(&self, other: &u8) -> bool {
-		(*self as u8) == *other
-	}
-}
-
-#[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
+#[derive(tightbeam::Flaggable)]
+#[repr(u8)]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum FlagTestDebugLevel {
 	#[default]
 	Default = 0,
 	Basic = 1,
-}
-
-#[cfg(not(feature = "derive"))]
-impl From<FlagTestDebugLevel> for u8 {
-	fn from(flag: FlagTestDebugLevel) -> u8 {
-		flag as u8
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl PartialEq<u8> for FlagTestDebugLevel {
-	fn eq(&self, other: &u8) -> bool {
-		(*self as u8) == *other
-	}
 }
 
 tightbeam::flagset!(TestFlagSet: FlagTestDevelopmentMode, FlagTestDebugLevel);
@@ -87,14 +51,14 @@ fn build_v3_frame(message: &TestMessage) -> Result<tightbeam::Frame, TightBeamEr
 	let signing_key = Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
 	let previous_hash = tightbeam::utils::digest::<Sha3_256>(message)?;
 
-	FrameBuilder::from(tb::Version::V3)
+	FrameBuilder::from(asn1::Version::V3)
 		.with_id("frame-der")
 		.with_order(1_696_521_700)
 		.with_message(message.to_owned())
 		.with_message_hasher::<Sha3_256>([])
-		.with_aead::<Aes256GcmOid, _>(cipher)
+		.with_aead(cipher)
 		.with_signer::<Secp256k1Signature, _>(signing_key)
-		.with_priority(tb::MessagePriority::Expedited)
+		.with_priority(asn1::MessagePriority::Expedited)
 		.with_lifetime(3_600)
 		.with_previous_hash(previous_hash)
 		.with_matrix(tightbeam::flags![
@@ -109,12 +73,11 @@ tb_assert_spec! {
 	pub FrameDerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DER_NONEMPTY, exactly!(1), equals!(true)),
 			(ROUNDTRIP_OK, exactly!(1), equals!(true)),
 			(MATRIX_PRESENT, exactly!(1), equals!(true)),
-			(VERSION, exactly!(1), equals!(tb::Version::V3))
+			(VERSION, exactly!(1), equals!(asn1::Version::V3))
 		]
 	}
 }
@@ -135,8 +98,8 @@ tb_scenario! {
 
 			trace.event_with(DER_NONEMPTY, &[], !der_bytes.is_empty())?;
 			trace.event_with(ROUNDTRIP_OK, &[], decoded == frame)?;
-			trace.event_with(MATRIX_PRESENT, &[], frame.metadata.matrix.is_some())?;
-			trace.event_with(VERSION, &[], frame.version)?;
+			trace.event_with(MATRIX_PRESENT, &[], frame.metadata().matrix().is_some())?;
+			trace.event_with(VERSION, &[], frame.version())?;
 
 			Ok(())
 		}

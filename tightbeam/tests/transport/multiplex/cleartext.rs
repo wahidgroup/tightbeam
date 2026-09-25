@@ -21,18 +21,18 @@ use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const CLEARTEXT_BUDGETS_UNMETERED: Urn<'static> =
-	Urn::new("test", "event:cleartext/cleartext-budgets-unmetered");
-pub(crate) const CLEARTEXT_CHUNKED_ECHO: Urn<'static> = Urn::new("test", "event:cleartext/cleartext-chunked-echo");
-pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:cleartext/first-stream-echoed");
+	tightbeam::urn!("test", "event:cleartext/cleartext-budgets-unmetered");
+pub(crate) const CLEARTEXT_CHUNKED_ECHO: Urn<'static> =
+	tightbeam::urn!("test", "event:cleartext/cleartext-chunked-echo");
+pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cleartext/first-stream-echoed");
 pub(crate) const RESPONDER_POLICY_REJECTION: Urn<'static> =
-	Urn::new("test", "event:cleartext/responder-policy-rejection");
-pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:cleartext/second-stream-echoed");
+	tightbeam::urn!("test", "event:cleartext/responder-policy-rejection");
+pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cleartext/second-stream-echoed");
 
 tb_assert_spec! {
 	pub MuxCleartextInterleavedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FIRST_STREAM_ECHOED, exactly!(1), equals!(true)),
 			(SECOND_STREAM_ECHOED, exactly!(1), equals!(true))
@@ -85,7 +85,6 @@ tb_assert_spec! {
 	pub MuxCleartextCancelBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_CANCEL_BUDGET, exactly!(1)),
 			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::EnhanceYourCalm))),
@@ -128,7 +127,7 @@ tb_scenario! {
 			let settings = MuxSettings::symmetric(8);
 			let (_server_end, responder) =
 				spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, Some(cancel_budget), trace.share())?;
-			let (client_reader, client_writer) = client.into_split_cleartext()?;
+			let (client_reader, client_writer) = client.into_split()?;
 
 			let rejected = run_cancel_abuse(client_reader, client_writer, responder, cancel_budget).await?;
 			trace.event_with(RESPONDER_POLICY_REJECTION, &[], rejected)?;
@@ -142,7 +141,6 @@ tb_assert_spec! {
 	pub MuxCleartextChunkedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLEARTEXT_BUDGETS_UNMETERED, exactly!(1), equals!(true)),
 			(CLEARTEXT_CHUNKED_ECHO, exactly!(1), equals!(true))
@@ -184,15 +182,15 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const CLEARTEXT_STREAMING_ECHO: Urn<'static> = Urn::new("test", "event:cleartext/cleartext-streaming-echo");
+pub(crate) const CLEARTEXT_STREAMING_ECHO: Urn<'static> =
+	tightbeam::urn!("test", "event:cleartext/cleartext-streaming-echo");
 pub(crate) const CLEARTEXT_STREAMING_CHUNKED: Urn<'static> =
-	Urn::new("test", "event:cleartext/cleartext-streaming-chunked");
+	tightbeam::urn!("test", "event:cleartext/cleartext-streaming-chunked");
 
 tb_assert_spec! {
 	pub MuxCleartextStreamingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLEARTEXT_STREAMING_ECHO, exactly!(1), equals!(true)),
 			(CLEARTEXT_STREAMING_CHUNKED, exactly!(1), equals!(true))

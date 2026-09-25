@@ -8,6 +8,7 @@ use crate::colony::hive::HiveContext;
 use crate::colony::worker::{Worker, WorkerMetadata};
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
+use crate::frame::BodyTransform;
 use crate::router::RouterError;
 use crate::trace::TraceCollector;
 use crate::{Frame, TightBeamError};
@@ -37,20 +38,24 @@ impl dyn WorkerBox {
 
 /// Handler context: trace, env config, workers, optional hive link, and
 /// message-body decryptor/inflator.
-pub struct ServletContext {
+///
+/// `Env` is the application configuration the servlet was started with.
+/// The config carries it by type, so a handler reads it without a downcast
+/// and without a per-request failure path.
+pub struct ServletContext<Env = ()> {
 	trace: Arc<TraceCollector>,
-	env_config: Arc<dyn Any + Send + Sync>,
+	env_config: Arc<Env>,
 	workers: HashMap<String, Box<dyn WorkerBox>>,
 	hive_context: Option<Arc<dyn HiveContext>>,
 	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 }
 
-impl ServletContext {
+impl<Env> ServletContext<Env> {
 	/// Build a context without message-body crypto or compression.
 	pub fn new(
 		trace: Arc<TraceCollector>,
-		env_config: Arc<dyn Any + Send + Sync>,
+		env_config: Arc<Env>,
 		workers: HashMap<String, Box<dyn WorkerBox>>,
 		hive_context: Option<Arc<dyn HiveContext>>,
 	) -> Self {
@@ -93,9 +98,9 @@ impl ServletContext {
 		&self.trace
 	}
 
-	/// Environment configuration downcast to `T`.
-	pub fn env_config<T: 'static>(&self) -> Result<&T, TightBeamError> {
-		self.env_config.downcast_ref().ok_or(TightBeamError::MissingConfiguration)
+	/// Environment configuration this servlet was started with.
+	pub fn env_config(&self) -> &Env {
+		&self.env_config
 	}
 
 	/// Intra-hive communication handle, when this servlet runs inside a hive.
@@ -104,7 +109,8 @@ impl ServletContext {
 	}
 
 	/// Worker registered under `name`, downcast to `W`.
-	pub fn worker<W: 'static>(&self, name: &str) -> Option<&W> {
+	pub fn worker<W: 'static>(&self, name: impl AsRef<str>) -> Option<&W> {
+		let name = name.as_ref();
 		self.workers.get(name)?.downcast_ref()
 	}
 
@@ -118,51 +124,47 @@ impl ServletContext {
 		worker.relay(input).await.map_err(|error| error.into())
 	}
 }
+impl Frame {
+	/// Decrypt or inflate this frame's body in place for typed dispatch.
+	///
+	/// # Errors
+	///
+	/// - [`RouterError::ConfidentialFrame`]: encrypted body, no decryptor.
+	/// - [`RouterError::CompressedFrame`]: compressed body, no inflator.
+	/// - Decryption or decompression errors from the configured implementations.
+	pub fn prepare_typed<Env>(&mut self, ctx: &ServletContext<Env>) -> Result<(), TightBeamError> {
+		match self.body_transform() {
+			Some(BodyTransform::Decrypt) => {
+				let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
+				self.decrypt_in_place(decryptor, ctx.message_inflator())?;
+			}
+			Some(BodyTransform::Inflate) => {
+				let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
+				self.inflate_in_place(inflator)?;
+			}
+			None => {}
+		}
 
-/// Normalize a frame to cleartext before typed delivery.
-///
-/// Fail-closed and in place: encrypted bodies without a decryptor, and
-/// compressed bodies without an inflator, are rejected before decode.
-/// On success the body is cleartext for the servlet's declared input type.
-///
-/// # Errors
-///
-/// - [`RouterError::ConfidentialFrame`]: encrypted body, no decryptor.
-/// - [`RouterError::CompressedFrame`]: compressed body, no inflator.
-/// - Decryption or decompression errors from the configured implementations.
-pub fn prepare_typed_frame(frame: &mut Frame, ctx: &ServletContext) -> Result<(), TightBeamError> {
-	if frame.metadata.confidentiality.is_some() {
-		let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
-		frame.decrypt_in_place(decryptor, ctx.message_inflator())?;
-
-		return Ok(());
+		Ok(())
 	}
 
-	if frame.metadata.compactness.is_some() {
-		let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
-		frame.inflate_in_place(inflator)?;
+	/// Prepare, decode, and invoke a typed unary handler.
+	///
+	/// Runs [`Frame::prepare_typed`] first, so an encrypted or compressed
+	/// body without the matching transform fails closed before decode.
+	pub async fn dispatch_typed_unary<I, Env, F, Fut>(
+		mut self,
+		ctx: &ServletContext<Env>,
+		handler: F,
+	) -> Result<Option<Frame>, TightBeamError>
+	where
+		I: Message,
+		F: FnOnce(I, Frame, &ServletContext<Env>) -> Fut,
+		Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
+	{
+		self.prepare_typed(ctx)?;
+
+		let message: I = crate::decode(self.message())?;
+		handler(message, self, ctx).await
 	}
-
-	Ok(())
-}
-
-/// Prepare, decode, and invoke a typed unary handler.
-///
-/// Runs [`prepare_typed_frame`] first. Encrypted or compressed bodies
-/// without the matching transform fail closed before decode.
-pub async fn dispatch_typed_unary<I, F, Fut>(
-	mut frame: Frame,
-	ctx: &ServletContext,
-	handler: F,
-) -> Result<Option<Frame>, TightBeamError>
-where
-	I: Message,
-	F: FnOnce(I, Frame, &ServletContext) -> Fut,
-	Fut: Future<Output = Result<Option<Frame>, TightBeamError>>,
-{
-	prepare_typed_frame(&mut frame, ctx)?;
-
-	let message: I = crate::decode(&frame.message)?;
-	let response = handler(message, frame, ctx).await?;
-	Ok(response)
 }

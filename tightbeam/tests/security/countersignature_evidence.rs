@@ -2,30 +2,32 @@
 //!
 //! ## Weakness
 //! The [`SessionObserver`] contract promises the server a record of every
-//! budget-bearing session whose receipt exchange concluded. If a
-//! countersignature that arrived but failed verification (or never
-//! arrived at all) aborts the handshake before the observer fires, the
-//! most suspicious terminal states, forged-countersignature probes and
-//! withheld countersignatures, are invisible to the application ledger.
+//! budget-bearing session whose receipt exchange concluded.
+//!
+//! A countersignature can fail verification or be withheld. If either case
+//! aborts the handshake before the observer fires, the most suspicious
+//! terminal states, forged-countersignature probes and withheld
+//! countersignatures, are invisible to the application ledger.
 //!
 //! ## Attack
 //! An attacker tampers with the carriage of a budget-bearing receipt
 //! acknowledgement, or strips the acknowledgement attribute from the
 //! client Finished. The handshake correctly aborts, but the operator's
-//! ledger shows nothing: repeated probes leave no evidence.
+//! ledger stays silent: repeated probes leave no evidence.
 //!
 //! ## Expected control
 //! Every concluded receipt exchange MUST reach the observer before the
-//! abort: an absent acknowledgement records
-//! `SessionVerdict::CountersignatureMissing` (a failing one records
-//! `SessionVerdict::CountersignatureInvalid`). Settlement MUST never
-//! fire and the session MUST never activate. A tamper rejected before
-//! the exchange concludes is not a concluded exchange and records
-//! nothing.
+//! abort:
+//!
+//! - An absent acknowledgement records `SessionVerdict::CountersignatureMissing`.
+//! - A failing acknowledgement records `SessionVerdict::CountersignatureInvalid`.
+//! - Settlement MUST stay unfired and the session MUST stay inactive.
+//!
+//! The observer records a concluded exchange, so a tamper rejected before the
+//! exchange concludes leaves the ledger unchanged.
 //!
 //! ## References
-//! - CWE-778: Insufficient Logging
-//!   <https://cwe.mitre.org/data/definitions/778.html>
+//! - CWE-778: Insufficient Logging <https://cwe.mitre.org/data/definitions/778.html>
 //! - CWE-347: Improper Verification of Cryptographic Signature
 //!   <https://cwe.mitre.org/data/definitions/347.html>
 
@@ -34,21 +36,21 @@
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const MISSING_COUNTERSIGNATURE_FAILS_CLOSED: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/missing-countersignature-fails-closed");
+	tightbeam::urn!("test", "event:countersignature-evidence/missing-countersignature-fails-closed");
 pub(crate) const NO_OUTCOME_BEFORE_CONCLUSION: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/no-outcome-before-conclusion");
-pub(crate) const OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE: Urn<'static> = Urn::new(
+	tightbeam::urn!("test", "event:countersignature-evidence/no-outcome-before-conclusion");
+pub(crate) const OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE: Urn<'static> = tightbeam::urn!(
 	"test",
 	"event:countersignature-evidence/outcome-records-missing-countersignature",
 );
 pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/session-never-activates");
+	tightbeam::urn!("test", "event:countersignature-evidence/session-never-activates");
 pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/settle-never-fired");
+	tightbeam::urn!("test", "event:countersignature-evidence/settle-never-fired");
 pub(crate) const STRIPPED_FINISHED_STILL_AUTHENTICATES: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/stripped-finished-still-authenticates");
+	tightbeam::urn!("test", "event:countersignature-evidence/stripped-finished-still-authenticates");
 pub(crate) const TAMPERED_CIPHERTEXT_REJECTED: Urn<'static> =
-	Urn::new("test", "event:countersignature-evidence/tampered-ciphertext-rejected");
+	tightbeam::urn!("test", "event:countersignature-evidence/tampered-ciphertext-rejected");
 
 #[cfg(feature = "transport-ecies")]
 mod ecies {
@@ -58,26 +60,23 @@ mod ecies {
 
 	use tightbeam::asn1::OctetString;
 	use tightbeam::crypto::ecies::Secp256k1EciesMessage;
-	use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 	use tightbeam::crypto::profiles::DefaultCryptoProvider;
-	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use tightbeam::der::{Decode, Encode};
 	use tightbeam::exactly;
 	use tightbeam::tb_assert_spec;
 	use tightbeam::tb_scenario;
-	use tightbeam::testing::utils::{create_test_certificate, create_test_signing_key};
 	use tightbeam::testing::SetupEnv;
 	use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
 	use tightbeam::transport::handshake::receipt::SessionObserver;
 	use tightbeam::transport::handshake::{
-		client::EciesHandshakeClient, server::EciesHandshakeServer, ClientKeyExchange,
+		client::EciesHandshakeClient, server::EciesHandshakeServer, ClientKeyExchange, PeerAuthentication,
 	};
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
-		default_security_profile, pinning_validator, PayingApprover, RecordingObserver, ServerMaterials,
-		SettleSpyAuthorizer,
+		default_security_profile, pinning_validator, ClientMaterials, PayingApprover, RecordingObserver,
+		ServerMaterials, SettleSpyAuthorizer,
 	};
 
 	const CHALLENGE: &[u8] = b"evidence-invoice";
@@ -88,7 +87,6 @@ mod ecies {
 		pub CountersignatureTamperSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(TAMPERED_CIPHERTEXT_REJECTED, exactly!(1), equals!(true)),
 				(SETTLE_NEVER_FIRED, exactly!(1), equals!(true)),
@@ -104,47 +102,44 @@ mod ecies {
 			exec: |SetupEnv { trace, .. }| async move {
 				let materials = ServerMaterials::generate();
 				let profile = default_security_profile();
-
-				let client_signing = create_test_signing_key();
-				let client_cert = Arc::new(create_test_certificate(&client_signing));
-				let signing_key = Secp256k1SigningKey::from(client_signing);
-				let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+				let client_materials = ClientMaterials::deterministic();
+				let client_identity = client_materials.identity();
 
 				let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
 					.with_security_offer(SecurityOffer::new(vec![profile]))
 					.with_certificate_validator(pinning_validator(&materials.certificate))
-					.with_client_identity(Arc::clone(&client_cert), client_provider)
+					.with_client_identity(client_identity)
 					.with_transport_offer(TransportOffer::mux(4).with_budgets(REQUEST))
 					.with_receipt_approver(Arc::new(PayingApprover::answering(RESPONSE)?));
 
 				let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
 				let observer = Arc::new(RecordingObserver::default());
-				let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
+				let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
 				let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 					Arc::clone(&materials.key_provider),
 					Arc::clone(&materials.certificate),
 					None,
-					Some(validators),
+					PeerAuthentication::mutual([validator]),
 				)
 				.with_supported_profiles(vec![profile])
 				.with_transport_config(TransportOffer::mux(4))
 				.with_transport_authorizer(Arc::clone(&authorizer) as _)
 				.with_session_observer(Arc::clone(&observer) as Arc<dyn SessionObserver>);
 
-				let client_hello = client.build_client_hello()?;
-				let server_handshake = server.process_client_hello(&client_hello).await?;
-				let client_kex_der = client.process_server_handshake(&server_handshake).await?;
+				let client_hello = client.build_client_hello()?.to_der()?;
+				let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
+				let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
 
-				// Auth signature covers encrypted_data; flip a ciphertext
-				// byte - the only wire handle a MITM has on the sealed ack.
+				// The auth signature covers encrypted_data. Flip a ciphertext
+				// byte, which is the only wire handle a MITM has on the sealed
+				// ack.
 				let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
 				let mut forged = kex.encrypted_data.as_bytes().to_vec();
 				let middle = forged.len() / 2;
 				forged[middle] ^= 0xFF;
 				kex.encrypted_data = OctetString::new(forged)?;
-				let tampered = kex.to_der()?;
 
-				let kex_result = server.process_client_key_exchange(&tampered).await;
+				let kex_result = server.process_client_key_exchange(kex).await;
 				trace.event_with(
 					TAMPERED_CIPHERTEXT_REJECTED,
 					&[],
@@ -156,8 +151,8 @@ mod ecies {
 					authorizer.settle_calls() == 0,
 				)?;
 
-				// Nothing concluded: the receipt exchange never reached a
-				// verdict, so the observer records nothing.
+				// The receipt exchange reached no verdict, so the observer
+				// ledger stays empty.
 				let outcomes = observer.recorded();
 				trace.event_with(
 					NO_OUTCOME_BEFORE_CONCLUSION,
@@ -181,7 +176,6 @@ mod cms {
 	};
 
 	use tightbeam::cms::signed_data::SignedData;
-	use tightbeam::der::{Decode, Encode};
 	use tightbeam::exactly;
 	use tightbeam::oids::RECEIPT_ACK;
 	use tightbeam::tb_assert_spec;
@@ -201,11 +195,11 @@ mod cms {
 	const RESPONSE: &[u8] = b"evidence-cms-preimage";
 	const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-	/// Re-encode the client Finished without its `RECEIPT_ACK` unsigned
-	/// attribute. No signature covers unsigned attributes, so the
-	/// stripped message stays signature-valid.
-	fn strip_receipt_ack(client_finished: &[u8]) -> Result<Vec<u8>, TightBeamError> {
-		let mut signed_data = SignedData::from_der(client_finished)?;
+	/// The client Finished without its `RECEIPT_ACK` unsigned attribute. No
+	/// signature covers unsigned attributes, so the stripped message stays
+	/// signature-valid.
+	fn strip_receipt_ack(client_finished: &SignedData) -> Result<SignedData, TightBeamError> {
+		let mut signed_data = client_finished.to_owned();
 		let mut signer_info = signed_data
 			.signer_infos
 			.0
@@ -218,18 +212,17 @@ mod cms {
 			.unsigned_attrs
 			.take()
 			.ok_or_else(|| expectation_failure("client Finished must carry unsigned attributes"))?;
+
 		let retained: Vec<_> = attrs.iter().filter(|attribute| attribute.oid != RECEIPT_ACK).cloned().collect();
 		signer_info.unsigned_attrs = Some(retained.try_into()?);
-
 		signed_data.signer_infos = vec![signer_info].try_into()?;
-		Ok(signed_data.to_der()?)
+		Ok(signed_data)
 	}
 
 	tb_assert_spec! {
 		pub CountersignatureMissingSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(STRIPPED_FINISHED_STILL_AUTHENTICATES, exactly!(1), equals!(true)),
 				(MISSING_COUNTERSIGNATURE_FAILS_CLOSED, exactly!(1), equals!(true)),
@@ -254,7 +247,7 @@ mod cms {
 				let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 				let (mut client, mut server) = (pair.client, pair.server);
 
-				let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
+				let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 				server.process_key_exchange(&key_exchange).await?;
 
 				let server_finished = server.build_server_finished().await?;
@@ -290,7 +283,7 @@ mod cms {
 					missing_recorded,
 				)?;
 
-				let activation = server.complete();
+				let activation = server.take_established();
 				let activation_refused = matches!(activation, Err(HandshakeError::CountersignatureMissing));
 				trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 

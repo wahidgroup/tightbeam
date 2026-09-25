@@ -1,53 +1,55 @@
 //! Protocol-generic servlet accept-loop state.
 //!
-//! - `servlet!` builds [`crate::colony::servlet::ServletHandlers`] and calls [`ServletRuntime::start`].
+//! - `servlet!` builds [`crate::colony::servlet::ServletHandlers`] and
+//!   calls [`ServletRuntime::start`].
 //! - Hand-written [`ServletService`]s use the same entry point.
 //! - Address bytes are encoded once at start and shared as [`Arc<[u8]>`].
 //! - Callers borrow [`addr`](ServletRuntime::addr) instead of cloning it.
 
-use core::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::colony::common::take_and_abort;
 use crate::colony::hive::{HiveContext, ServletBox};
+use crate::colony::servlet::serve::ContextService;
 use crate::colony::servlet::servlet_runtime::rt;
-use crate::colony::servlet::{
-	serve_servlet, RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, WorkerBox,
-};
+use crate::colony::servlet::{RuntimeServletConf, Servlet, ServletConfig, ServletContext, ServletService, WorkerBox};
+use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::core::{Inflator, Message};
 use crate::crypto::aead::Decryptor;
-use crate::macros::server::AcceptedConnection;
+use crate::macros::server::{serve_connection_service, AcceptedConnection};
 use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
+use crate::transport::accept::AcceptPlane;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::MuxCapable;
-use crate::transport::policy::PolicyConfig;
+use crate::transport::policy::{CollectorGateConfig, PolicyConfig};
 use crate::transport::AsyncListenerTrait;
 use crate::transport::Protocol;
 use crate::transport::TransportError;
+use crate::utils::time::Clock;
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
 use crate::crypto::profiles::CryptoProvider;
-#[cfg(feature = "x509")]
 use crate::transport::EncryptedProtocol;
 
-/// Config fields [`ServletRuntime::start`] needs after the listener binds.
-pub(crate) struct ServletRuntimeParts {
-	pub(crate) env_config: Arc<dyn Any + Send + Sync>,
+/// The config fields [`ServletRuntime::start`] needs after the listener
+/// binds.
+pub(crate) struct ServletRuntimeParts<Env> {
+	pub(crate) env_config: Arc<Env>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pub(crate) mux_offer: Option<Arc<TransportOffer>>,
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
 	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
+	/// The accept loop paces its retries on this clock.
+	pub(crate) clock: Arc<dyn Clock>,
 }
 
-/// Running accept loop and bound address for protocol `P`.
+/// A running accept loop and its bound address for protocol `P`.
 ///
-/// - Owns the accept-loop task handle and a replaceable trace handle.
-/// - Retains address bytes as [`Arc<[u8]>`] for hive registration and scaling.
+/// - The runtime owns the accept-loop task handle and a replaceable trace handle.
+/// - The runtime retains the address bytes as [`Arc<[u8]>`] for hive registration and scaling.
 pub struct ServletRuntime<P: Protocol> {
 	server_handle: Option<rt::JoinHandle>,
 	addr: P::Address,
@@ -66,59 +68,46 @@ where
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 {
-	/// Bind, start workers, build context, and spawn the accept loop.
-	#[cfg(feature = "x509")]
-	pub async fn start<M, C, S>(
+	/// Binds the listener, starts the workers, builds the servlet context,
+	/// and spawns the accept loop.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the listener fails to bind, or a worker fails to start.
+	pub async fn start<M, C, Env, S>(
 		trace: Arc<TraceCollector>,
-		mut servlet_conf: ServletConfig<P, M, C>,
+		servlet_conf: ServletConfig<P, M, C, Env>,
 		service: S,
 	) -> Result<Self, TightBeamError>
 	where
 		M: Message,
 		C: CryptoProvider + Send + Sync + 'static,
-		S: ServletService,
+		S: ServletService<Env = Env>,
+		Env: Send + Sync + 'static,
 		P: EncryptedProtocol<CryptoProvider = C>,
 	{
 		let bind_addr = P::default_bind_address().map_err(protocol_error)?;
-		let encryption = servlet_conf.take_encryption_config();
+		let (encryption, parts) = servlet_conf.into_bind_parts();
 		let (listener, addr) = if let Some(encryption_config) = encryption {
 			P::bind_with(bind_addr, encryption_config).await.map_err(protocol_error)?
 		} else {
 			P::bind(bind_addr).await.map_err(protocol_error)?
 		};
 
-		let parts = servlet_conf.into_runtime_parts()?;
 		let runtime = Self::spawn_loop(trace, parts, service, listener, addr).await?;
 		Ok(runtime)
 	}
 
-	/// Bind, start workers, build context, and spawn the accept loop.
-	#[cfg(not(feature = "x509"))]
-	pub async fn start<M, S>(
+	async fn spawn_loop<Env, S>(
 		trace: Arc<TraceCollector>,
-		servlet_conf: ServletConfig<P, M>,
-		service: S,
-	) -> Result<Self, TightBeamError>
-	where
-		M: Message,
-		S: ServletService,
-	{
-		let bind_addr = P::default_bind_address().map_err(protocol_error)?;
-		let (listener, addr) = P::bind(bind_addr).await.map_err(protocol_error)?;
-		let parts = servlet_conf.into_runtime_parts()?;
-		let runtime = Self::spawn_loop(trace, parts, service, listener, addr).await?;
-		Ok(runtime)
-	}
-
-	async fn spawn_loop<S>(
-		trace: Arc<TraceCollector>,
-		parts: ServletRuntimeParts,
+		parts: ServletRuntimeParts<Env>,
 		service: S,
 		listener: P::Listener,
 		addr: P::Address,
 	) -> Result<Self, TightBeamError>
 	where
-		S: ServletService,
+		S: ServletService<Env = Env>,
+		Env: Send + Sync + 'static,
 	{
 		let ServletRuntimeParts {
 			env_config,
@@ -128,6 +117,7 @@ where
 			message_decryptor,
 			message_inflator,
 			workers,
+			clock,
 		} = parts;
 
 		let mut started_workers = HashMap::new();
@@ -142,7 +132,23 @@ where
 				.with_message_inflator(message_inflator),
 		);
 
-		let server_handle = serve_servlet(listener, collector_gates, mux_offer, service, servlet_context);
+		let service = Arc::new(ContextService::new(service, servlet_context));
+		let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, clock);
+
+		// The gates go on each connection before it dispatches, so a peer the
+		// collector gates refuse never reaches a handler.
+		let accept_loop = plane.accept_on(listener, move |mut transport: <P::Listener as Protocol>::Transport| {
+			for gate in &collector_gates {
+				transport = transport.with_collector_gate(Arc::clone(gate));
+			}
+
+			transport = transport.with_mux_offer(mux_offer.clone());
+
+			let service = Arc::clone(&service);
+			async move { serve_connection_service(transport, service, None, None).await }
+		});
+
+		let server_handle = rt::spawn(accept_loop);
 		let addr_bytes: Arc<[u8]> = Arc::from(addr.clone().into());
 		let trace_handle = Arc::new(Mutex::new(trace));
 
@@ -152,49 +158,39 @@ where
 }
 
 impl<P: Protocol> ServletRuntime<P> {
-	/// Bound listen address (borrowed; no clone).
+	/// Returns the bound listen address by reference, so the call clones
+	/// nothing.
 	pub fn addr(&self) -> &P::Address {
 		&self.addr
 	}
 
-	/// Shared address bytes encoded once at start.
+	/// Returns the shared address bytes, encoded once at start.
 	pub fn addr_bytes(&self) -> Arc<[u8]> {
 		Arc::clone(&self.addr_bytes)
 	}
 
-	/// Address bytes without bumping the refcount.
+	/// Borrows the address bytes without bumping the reference count.
 	pub fn addr_bytes_ref(&self) -> &[u8] {
 		&self.addr_bytes
 	}
 
-	/// Replace the live trace collector behind the shared handle.
+	/// Replaces the live trace collector behind the shared handle. A
+	/// poisoned handle keeps its old collector.
 	pub fn set_trace(&self, trace: Arc<TraceCollector>) {
 		if let Ok(mut guard) = self.trace_handle.lock() {
 			*guard = trace;
 		}
 	}
 
-	/// Abort the accept loop.
+	/// Aborts the accept loop.
 	pub fn stop(mut self) {
-		take_and_abort(&mut self.server_handle);
+		rt::take_and_abort(&mut self.server_handle);
 	}
 
-	/// Wait for the accept loop to finish after stop or peer close.
-	#[cfg(feature = "tokio")]
+	/// Waits for the accept loop task to finish.
 	pub async fn join(mut self) -> Result<(), rt::JoinError> {
 		if let Some(handle) = self.server_handle.take() {
 			let joined = rt::join(handle).await;
-			return joined;
-		}
-
-		Ok(())
-	}
-
-	/// Wait for the accept loop to finish after stop or peer close.
-	#[cfg(all(not(feature = "tokio"), feature = "std"))]
-	pub fn join(mut self) -> Result<(), rt::JoinError> {
-		if let Some(handle) = self.server_handle.take() {
-			let joined = rt::join(handle);
 			return joined;
 		}
 
@@ -204,7 +200,7 @@ impl<P: Protocol> ServletRuntime<P> {
 
 impl<P: Protocol> Drop for ServletRuntime<P> {
 	fn drop(&mut self) {
-		take_and_abort(&mut self.server_handle);
+		rt::take_and_abort(&mut self.server_handle);
 	}
 }
 
@@ -222,54 +218,27 @@ where
 	}
 }
 
-/// [`Servlet`] entry that takes [`RuntimeServletConf`] (config + handlers).
+/// The [`Servlet`] entry point, which takes a [`RuntimeServletConf`] that
+/// bundles the config and the handlers.
 ///
-/// Prefer inherent [`ServletRuntime::start`] when you already have a
+/// Prefer the inherent [`ServletRuntime::start`] when you already have a
 /// [`ServletService`]. Use this impl when an API bounds on [`Servlet`].
-#[cfg(feature = "x509")]
-impl<P, M, C> Servlet<M> for ServletRuntime<P>
+impl<P, M, C, Env> Servlet<M, Env> for ServletRuntime<P>
 where
 	P: Protocol + EncryptedProtocol<CryptoProvider = C> + Send + Sync + 'static,
 	P::Listener: AsyncListenerTrait + Sync + 'static,
 	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
 	M: Message + Send + Sync + 'static,
 	C: CryptoProvider + Send + Sync + 'static,
+	Env: Send + Sync + 'static,
 {
-	type Conf = RuntimeServletConf<P, M, C>;
+	type Conf = RuntimeServletConf<P, M, C, Env>;
 	type Address = P::Address;
 
-	async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, TightBeamError> {
-		let RuntimeServletConf { config, service } = config.unwrap_or_default();
-		// Three-argument inherent start (not this trait method).
-		ServletRuntime::start(trace, config, service).await
-	}
-
-	fn addr(&self) -> &Self::Address {
-		ServletRuntime::addr(self)
-	}
-
-	fn stop(self) {
-		ServletRuntime::stop(self);
-	}
-
-	async fn join(self) -> Result<(), rt::JoinError> {
-		ServletRuntime::join(self).await
-	}
-}
-
-#[cfg(not(feature = "x509"))]
-impl<P, M> Servlet<M> for ServletRuntime<P>
-where
-	P: Protocol + Send + Sync + 'static,
-	P::Listener: AsyncListenerTrait + Sync + 'static,
-	<P::Listener as Protocol>::Transport: AcceptedConnection + PolicyConfig + MuxCapable + 'static,
-	M: Message + Send + Sync + 'static,
-{
-	type Conf = RuntimeServletConf<P, M>;
-	type Address = P::Address;
-
-	async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, TightBeamError> {
-		let RuntimeServletConf { config, service } = config.unwrap_or_default();
+	async fn start(trace: Arc<TraceCollector>, config: Self::Conf) -> Result<Self, TightBeamError> {
+		let RuntimeServletConf { config, service } = config;
+		// The path names the three-argument inherent `start`, so the call
+		// reaches that method and not this trait method.
 		ServletRuntime::start(trace, config, service).await
 	}
 

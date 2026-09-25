@@ -56,14 +56,20 @@ pub mod rt {
 		handle.abort();
 	}
 
+	/// Take an optional join handle and abort it when present.
+	///
+	/// Servlet, hive, and cluster `stop` and `Drop` paths all release a
+	/// task the same way, so the take and the abort stay one step and a
+	/// stopped runtime cannot keep a live handle.
+	pub fn take_and_abort(handle: &mut Option<JoinHandle>) {
+		if let Some(handle) = handle.take() {
+			abort(&handle);
+		}
+	}
+
 	/// Wait for a task to complete
 	pub async fn join(handle: JoinHandle) -> Result<(), JoinError> {
 		handle.await
-	}
-
-	/// Sleep for a duration
-	pub async fn sleep(duration: core::time::Duration) {
-		tokio::time::sleep(duration).await;
 	}
 
 	// =========================================================================
@@ -166,6 +172,16 @@ pub mod rt {
 		// No cooperative cancellation for std threads
 	}
 
+	/// Take an optional join handle and drop it when present.
+	///
+	/// Dropping detaches a std thread, so the handle is released and the
+	/// thread runs to its own end.
+	pub fn take_and_abort(handle: &mut Option<JoinHandle>) {
+		if let Some(handle) = handle.take() {
+			abort(&handle);
+		}
+	}
+
 	/// Wait for a thread to complete
 	pub fn join(handle: JoinHandle) -> Result<(), JoinError> {
 		handle.join().map_err(|_| Error::new(ErrorKind::Other, "thread panicked"))
@@ -201,11 +217,6 @@ pub mod rt {
 	/// Wait for a response on a oneshot channel (blocking)
 	pub fn wait_response<T>(receiver: OneshotReceiver<T>) -> Result<T, ()> {
 		receiver.recv().map_err(|_| ())
-	}
-
-	/// Sleep for a duration (blocking)
-	pub fn sleep(duration: core::time::Duration) {
-		thread::sleep(duration);
 	}
 
 	// =========================================================================

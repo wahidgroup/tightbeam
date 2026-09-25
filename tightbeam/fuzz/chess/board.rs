@@ -2,11 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use tightbeam::asn1::Frame;
 use tightbeam::der::Enumerated;
+use tightbeam::der::Sequence;
 use tightbeam::error::TightBeamError;
 use tightbeam::matrix::{MatrixDyn, MatrixError};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::{compose, decode, servlet, Beamable, Sequence};
+use tightbeam::{compose, decode, servlet, Beamable};
 
 use super::events;
 use super::r#move::ChessMove;
@@ -169,7 +170,8 @@ pub(crate) enum GameStatusCode {
 // ============================================================================
 
 /// Helper function to create an invalid move response
-pub(crate) fn create_invalid_move_response(id: Vec<u8>, order: u64) -> Result<Frame, TightBeamError> {
+pub(crate) fn create_invalid_move_response(id: impl Into<Vec<u8>>, order: u64) -> Result<Frame, TightBeamError> {
+	let id: Vec<u8> = id.into();
 	let response = ChessMoveResponse { game_status: GameStatusCode::InvalidMove };
 	compose! {
 		V0: id: id,
@@ -188,8 +190,8 @@ servlet! {
 	protocol: TokioListener,
 	handle: raw |message, ctx| async move {
 		let trace = ctx.trace();
-		let config: &ChessEngineServletConfig = ctx.env_config()?;
-		let message_id = message.metadata.id.clone();
+		let config: &ChessEngineServletConfig = ctx.env_config();
+		let message_id = message.metadata().id().to_vec();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {
 			trace.event(events::SERVER_RESPONSE_EMITTED)?;
@@ -199,18 +201,18 @@ servlet! {
 		trace.event(events::SERVER_MOVE_RECEIVED)?;
 
 		// Decode ChessMoveRequest from message
-		let move_req: ChessMoveRequest = match decode(&message.message) {
+		let move_req: ChessMoveRequest = match decode(message.message()) {
 			Ok(req) => req,
 			Err(_) => {
 				// Invalid message format - return invalid move response
 				trace.event(events::SERVER_DECODE_FAILURE)?;
-				return invalid_move(Arc::clone(trace), message_id, message.metadata.order);
+				return invalid_move(Arc::clone(trace), message_id, message.metadata().order());
 			}
 		};
 
 		// Use order field as move count (monotonically incrementing)
 		// Process move through manager (handles validation, moves, and game status)
-		let move_count = message.metadata.order;
+		let move_count = message.metadata().order();
 		let game_status = match config.manager.process_move(&move_req, move_count, trace) {
 			Ok(status) => status,
 		Err(_e) => {

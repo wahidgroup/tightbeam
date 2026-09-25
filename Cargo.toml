@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["tightbeam", "tightbeam-derive", "consumer-test"]
+members = [
+	"tightbeam",
+	"tightbeam-derive",
+	"consumers/full",
+]
+exclude = [
+	"consumers/default",
+	"consumers/expansion",
+	"consumers/sync",
+]
 
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
@@ -14,6 +23,14 @@ documentation = "https://docs.rs/tightbeam-rs"
 readme = "README.md"
 keywords = ["cryptography", "security", "messaging", "protocol"]
 categories = ["cryptography", "network-programming"]
+
+# Developer tools installed by scripts/setup.sh.
+[workspace.metadata.tools]
+cargo-deny = "0.20.2"
+cargo-hack = "0.6.45"
+cargo-semver-checks = "0.50.0"
+typos-cli = "1.49.0"
+cargo-afl = "0.18.2"
 
 [workspace.lints.rust]
 # Catch dead imports under cfg-gated paths that `--all-features` never compiles.
@@ -42,6 +59,7 @@ x509-cert = { version = "=0.2.5", default-features = false, features = [
 ] }
 hex-literal = { version = "=1.1.0", default-features = false }
 elliptic-curve = { version = "=0.13.8", default-features = false }
+subtle = { version = "=2.6.1", default-features = false }
 zeroize = { version = "=1.9.0", features = ["alloc", "zeroize_derive"] }
 crypto-common = { version = "=0.1.7", default-features = false, features = [
 	"getrandom",
@@ -95,7 +113,7 @@ time = { version = "=0.3.47", default-features = false, features = [
 futures = { version = "=0.3.33", default-features = false, features = ["alloc"] }
 
 # Compression dependencies
-zeekstd = { version = "=0.6.2", default-features = false }
+zstd-safe = { version = "=7.2.4", default-features = false }
 
 # Dev dependencies
 husky-rs = { version = "=0.3.3" }
@@ -109,3 +127,4 @@ syn = { version = "=2.0.119", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
 afl = { version = "=0.17.1" }
+proptest = { version = "1.8.0", default-features = false, features = ["std"] }

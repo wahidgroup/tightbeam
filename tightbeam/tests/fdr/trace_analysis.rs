@@ -7,24 +7,23 @@
 
 #![cfg(feature = "testing-fdr")]
 
-use std::sync::Arc;
-
 use tightbeam::testing::fdr::{FdrConfig, FdrTraceExt};
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-pub(crate) const CONNECT: Urn<'static> = Urn::new("test", "event:trace-analysis/connect");
-pub(crate) const DECRYPT: Urn<'static> = Urn::new("test", "event:trace-analysis/decrypt");
-pub(crate) const DESERIALIZE: Urn<'static> = Urn::new("test", "event:trace-analysis/deserialize");
-pub(crate) const DISCONNECT: Urn<'static> = Urn::new("test", "event:trace-analysis/disconnect");
-pub(crate) const ENCRYPT: Urn<'static> = Urn::new("test", "event:trace-analysis/encrypt");
-pub(crate) const REQUEST: Urn<'static> = Urn::new("test", "event:trace-analysis/request");
-pub(crate) const RESPONSE: Urn<'static> = Urn::new("test", "event:trace-analysis/response");
-pub(crate) const SERIALIZE: Urn<'static> = Urn::new("test", "event:trace-analysis/serialize");
+pub(crate) const CONNECT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/connect");
+pub(crate) const DECRYPT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/decrypt");
+pub(crate) const DESERIALIZE: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/deserialize");
+pub(crate) const DISCONNECT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/disconnect");
+pub(crate) const ENCRYPT: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/encrypt");
+pub(crate) const REQUEST: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/request");
+pub(crate) const RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/response");
+pub(crate) const SERIALIZE: Urn<'static> = tightbeam::urn!("test", "event:trace-analysis/serialize");
 
-fn build_fdr_config(specs: Vec<Process>) -> FdrConfig {
+fn build_fdr_config(specs: impl IntoIterator<Item = Process>) -> FdrConfig {
+	let specs: Vec<Process> = specs.into_iter().collect();
 	FdrConfig {
 		seeds: 2,
 		max_depth: 8,
@@ -32,7 +31,6 @@ fn build_fdr_config(specs: Vec<Process>) -> FdrConfig {
 		timeout_ms: 5000,
 		specs,
 		fail_fast: true,
-		expect_failure: false,
 		..Default::default()
 	}
 }
@@ -43,7 +41,6 @@ tb_assert_spec! {
 	pub TraceAnalysisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CONNECT, exactly!(1)),
 			(SERIALIZE, exactly!(1)),
@@ -87,16 +84,15 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(TraceAnalysisSpec::latest())
 		.with_fdr(build_fdr_config(vec![SimpleRequestResponse::process()]))
-		.with_hooks(TestHooks {
-			on_pass: Some(Arc::new(|context| {
+		.with_hooks(TestHooks::on_pass(|context| {
 				// Acceptance queries: Check what events are accepted at
 				// specific states.
-				if let Some(acceptance) = context.trace.acceptance_at("Connected") {
+				if let Some(acceptance) = context.trace().acceptance_at("Connected") {
 					// At Connected state, process accepts "serialize"
 					assert!(acceptance.iter().any(|e| e.0 == "serialize"));
 				}
 
-				if let Some(acceptance) = context.trace.acceptance_at("Sent") {
+				if let Some(acceptance) = context.trace().acceptance_at("Sent") {
 					// At Sent state, process accepts "decrypt"
 					assert!(acceptance.iter().any(|e| e.0 == "decrypt"));
 				}
@@ -104,13 +100,9 @@ tb_scenario! {
 				// Refusal queries: Verify process can refuse events not in
 				// acceptance set. At Connected, process must do "serialize"
 				// before "request"
-				assert!(context.trace.can_refuse_after("Connected", "request"));
-				assert!(context.trace.can_refuse_after("Connected", "disconnect"));
-
-				Ok(())
-			})),
-			on_fail: None,
-		})
+				assert!(context.trace().can_refuse_after("Connected", "request"));
+				assert!(context.trace().can_refuse_after("Connected", "disconnect"));
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {

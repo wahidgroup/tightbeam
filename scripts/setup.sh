@@ -6,6 +6,8 @@ set -euo pipefail
 # stamped under .make/ so unchanged re-runs are skipped.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TOOL_VERSION="$ROOT/scripts/tool-version.sh"
+TOOL_INSTALLED="$ROOT/scripts/tool-installed.sh"
 STAMP_DIR="$ROOT/.make"
 SETUP_HASH_FILE="$STAMP_DIR/setup.hash"
 LOCK_FILE="$STAMP_DIR/setup.lock"
@@ -31,20 +33,41 @@ compute_setup_hash() {
 			"$ROOT/rust-toolchain.toml" \
 			"$ROOT/typos.toml" \
 			"$ROOT/scripts/setup.sh" \
+			"$ROOT/scripts/tool-version.sh" \
+			"$ROOT/scripts/tool-installed.sh" \
 			2>/dev/null
 	} | "${SHA256_CMD[@]}" | awk '{ print $1 }'
 }
 
+pinned() {
+	"$TOOL_VERSION" "$1"
+}
+
+pinned_crates() {
+	"$TOOL_VERSION" --list
+}
+
+install_pinned() {
+	local crate="$1"
+	local version
+
+	if "$TOOL_INSTALLED" "$crate"; then
+		return 0
+	fi
+
+	version="$(pinned "$crate")"
+	echo "Installing $crate $version..."
+	cargo install "$crate" --version "$version" --locked --force
+}
+
 setup_required() {
-	if ! command -v cargo-audit >/dev/null 2>&1; then
-		return 0
-	fi
-	if ! command -v typos >/dev/null 2>&1; then
-		return 0
-	fi
-	if ! command -v cargo-afl >/dev/null 2>&1; then
-		return 0
-	fi
+	local crate
+	while read -r crate; do
+		if ! "$TOOL_INSTALLED" "$crate"; then
+			return 0
+		fi
+	done < <(pinned_crates)
+
 	if [ ! -f "$SETUP_HASH_FILE" ]; then
 		return 0
 	fi
@@ -99,18 +122,10 @@ install_rust_tooling() {
 	rustup toolchain install
 	rustup component add rustfmt clippy
 
-	if ! command -v cargo-audit >/dev/null 2>&1; then
-		echo "Installing cargo-audit..."
-		cargo install cargo-audit --locked
-	fi
-	if ! command -v typos >/dev/null 2>&1; then
-		echo "Installing typos..."
-		cargo install typos-cli --locked
-	fi
-	if ! command -v cargo-afl >/dev/null 2>&1; then
-		echo "Installing cargo-afl..."
-		cargo install cargo-afl --locked
-	fi
+	local crate
+	while read -r crate; do
+		install_pinned "$crate"
+	done < <(pinned_crates)
 }
 
 main() {

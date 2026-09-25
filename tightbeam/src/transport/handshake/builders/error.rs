@@ -39,7 +39,6 @@ pub enum KariBuilderError {
 
 	/// CMS builder error
 	#[error("CMS builder error: {0}")]
-	#[from]
 	CmsBuilderError(crate::cms::builder::Error),
 }
 

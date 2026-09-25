@@ -13,7 +13,6 @@ use crate::utils::statistics::{DefaultStatisticalAnalyzer, Percentile, Statistic
 
 use super::constraints::{TimingConstraint, TimingConstraints};
 use super::deadline::Deadline;
-use super::path::extract_paths;
 use super::violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 
 /// Timing verification result (DER-encodable core)
@@ -31,22 +30,6 @@ pub struct TimingVerificationResult {
 	pub slack_violations: Vec<TimingSlackViolation>,
 	/// Path WCET violations found
 	pub path_wcet_violations: Vec<PathWcetViolation>,
-}
-
-impl TimingVerificationResult {
-	/// Get task set (if schedulability analysis was performed)
-	#[cfg(feature = "testing-schedulability")]
-	pub fn task_set(&self) -> Option<&crate::testing::schedulability::TaskSet> {
-		// This will be stored in ScenarioResult instead
-		None
-	}
-
-	/// Get schedulability result (if analysis was performed)
-	#[cfg(feature = "testing-schedulability")]
-	pub fn schedulability_result(&self) -> Option<&crate::testing::schedulability::SchedulabilityResult> {
-		// This will be stored in ScenarioResult instead
-		None
-	}
 }
 
 impl TimingConstraints {
@@ -381,7 +364,7 @@ impl TimingConstraints {
 	) {
 		// Extract execution paths from trace
 		// For each path-based WCET constraint
-		let execution_paths = extract_paths(trace, process);
+		let execution_paths = trace.execution_paths(process);
 		for path_wcet in constraints.path_wcets() {
 			// Find matching execution paths
 			let max_duration_ns = path_wcet.max_duration_ns();
@@ -664,7 +647,8 @@ mod tests {
 
 	/// Create a timing event; deadline markers carry the value as a
 	/// timestamp, every other timing URN carries it as a duration
-	fn timing_event(event_urn: Urn<'static>, label: &str, value_ns: u64, seq: u32) -> TbEvent {
+	fn timing_event(event_urn: Urn<'static>, label: impl AsRef<str>, value_ns: u64, seq: u32) -> TbEvent {
+		let label = label.as_ref();
 		let is_deadline = event_urn == events::TIMING_DEADLINE;
 		TbEvent {
 			seq,
@@ -687,7 +671,8 @@ mod tests {
 	}
 
 	/// Create a trace with timing events
-	fn trace_with_events(events: Vec<TbEvent>) -> ConsumedTrace {
+	fn trace_with_events(events: impl IntoIterator<Item = TbEvent>) -> ConsumedTrace {
+		let events: Vec<TbEvent> = events.into_iter().collect();
 		let mut trace = ConsumedTrace::new();
 		#[cfg(feature = "instrument")]
 		{

@@ -40,7 +40,9 @@ impl<L: LoadBalancer> RecordingBalancer<L> {
 impl<L: LoadBalancer> LoadBalancer for RecordingBalancer<L> {
 	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize> {
 		let value = candidates.len() as u64;
-		let _ = self.trace.event_with(BALANCER_OFFERED, &[], value);
+		self.trace
+			.event_with(BALANCER_OFFERED, &[], value)
+			.expect("the spec grades the offered count, so losing it would pass a stale run");
 		let pick = self.inner.select(candidates);
 		if let (Some(index), Ok(mut chosen)) = (pick, self.selected.lock()) {
 			chosen.insert(index);
@@ -71,9 +73,9 @@ async fn drive_topology_routes(
 	routes: usize,
 ) -> Result<(), TightBeamError> {
 	let trace = Arc::new(trace.share());
-	let config = Some(servlet_tls_config(ctx.certs.as_ref())?);
+	let config = servlet_tls_config(ctx.certs.as_ref())?;
 	let servlet_a = ClusterTestServlet::start(Arc::clone(&trace), config).await?;
-	let config = Some(servlet_tls_config(ctx.certs.as_ref())?);
+	let config = servlet_tls_config(ctx.certs.as_ref())?;
 	let servlet_b = ClusterTestServlet::start(Arc::clone(&trace), config).await?;
 	let addr_a = servlet_a.addr().to_string();
 	let addr_b = servlet_b.addr().to_string();
@@ -125,7 +127,6 @@ tb_assert_spec! {
 	pub TopologySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),

@@ -12,7 +12,8 @@ use core::time::Duration;
 #[cfg(feature = "testing-timing")]
 use std::collections::HashMap;
 
-use super::config::{Failure, FdrConfig, Trace};
+use super::config::FdrConfig;
+use super::verdict::{Failure, Trace};
 use crate::testing::specs::csp::{Event, Process, State};
 
 #[cfg(feature = "testing-fault")]
@@ -171,19 +172,19 @@ pub trait MemoizationCache {
 	fn get_cached_traces(&self, structure: u64) -> Option<(Vec<Trace>, bool)>;
 
 	/// Cache traces for a process structure
-	fn cache_traces(&mut self, structure: u64, traces: Vec<Trace>, complete: bool);
+	fn cache_traces(&mut self, structure: u64, traces: impl IntoIterator<Item = Trace>, complete: bool);
 
 	/// Get cached failures for a process structure, or None if not cached
 	fn get_cached_failures(&self, structure: u64) -> Option<(Vec<Failure>, bool)>;
 
 	/// Cache failures for a process structure
-	fn cache_failures(&mut self, structure: u64, failures: Vec<Failure>, complete: bool);
+	fn cache_failures(&mut self, structure: u64, failures: impl IntoIterator<Item = Failure>, complete: bool);
 
 	/// Get cached divergences for a process structure, or None if not cached
 	fn get_cached_divergences(&self, structure: u64) -> Option<(Vec<Trace>, bool)>;
 
 	/// Cache divergences for a process structure
-	fn cache_divergences(&mut self, structure: u64, divergences: Vec<Trace>, complete: bool);
+	fn cache_divergences(&mut self, structure: u64, divergences: impl IntoIterator<Item = Trace>, complete: bool);
 }
 
 /// Result of exploring a single seed
@@ -306,7 +307,8 @@ impl ExplorationState {
 
 	/// Reset specific clocks to zero
 	#[cfg(feature = "testing-timing")]
-	pub fn reset_clocks(&mut self, clock_names: &[String]) {
+	pub fn reset_clocks(&mut self, clock_names: impl AsRef<[String]>) {
+		let clock_names = clock_names.as_ref();
 		for name in clock_names {
 			self.clock_values.insert(name.clone(), Duration::ZERO);
 		}
@@ -336,7 +338,8 @@ impl SeededRng {
 	}
 
 	/// Choose an item from slice using current RNG state
-	pub fn choose<'a, T>(&mut self, items: &'a [T]) -> Option<&'a T> {
+	pub fn choose<'a, T>(&mut self, items: &'a (impl AsRef<[T]> + ?Sized)) -> Option<&'a T> {
+		let items = items.as_ref();
 		if items.is_empty() {
 			None
 		} else {

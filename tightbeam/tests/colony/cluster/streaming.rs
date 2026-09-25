@@ -1,4 +1,4 @@
-//! Cross-cluster streaming and duplex forwarding (gateway splice).
+//! Cross-cluster streaming and duplex forwarding through the gateway splice.
 //!
 //! The stream-echo servlet lives only in cluster B. A client opens a
 //! routed stream against cluster A (`open_stream_to` / `open_duplex_to`),
@@ -12,14 +12,17 @@ use tightbeam::{compose, servlet};
 use super::common::*;
 use crate::common::security::expectation_failure;
 
-/// Set by the duplex cancel probe so the cancel scenario can wait for
+/// Set by the duplex cancel probe, so the cancel scenario can wait for
 /// propagation deterministically instead of sleeping a fixed time.
 ///
-/// Shared by every scenario in this binary, yet only a genuine
-/// mid-stream abort can set it. A completing duplex handler disarms
-/// its probe before the responder sends the End trailer the client
-/// waits on. A new scenario that cancels this servlet MUST NOT run
-/// beside [`cluster_duplex_cancel_propagates_to_peer`].
+/// # Sharing
+///
+/// Every scenario in this binary shares it, yet only a genuine mid-stream abort
+/// can set it: a completing duplex handler disarms its probe before the
+/// responder sends the End trailer the client waits on.
+///
+/// A new scenario that cancels this servlet MUST NOT run beside
+/// [`cluster_duplex_cancel_propagates_to_peer`].
 static DUPLEX_CANCEL_SEEN: AtomicBool = AtomicBool::new(false);
 
 /// Observes a propagated cancel from inside the duplex servlet handler.
@@ -42,15 +45,19 @@ impl Drop for CancelProbe {
 	fn drop(&mut self) {
 		if self.armed {
 			DUPLEX_CANCEL_SEEN.store(true, Ordering::SeqCst);
-			let _ = self.trace.event(SERVLET_DUPLEX_CANCELLED);
+			if let Err(error) = self.trace.event(SERVLET_DUPLEX_CANCELLED) {
+				// Panicking inside a drop that is itself unwinding aborts the
+				// process, so let the first failure be the one reported.
+				assert!(std::thread::panicking(), "recording the duplex cancel failed: {error}");
+			}
 		}
 	}
 }
 
 servlet! {
-	/// Streaming and duplex arms only: stream reports the collected body
-	/// length, duplex echoes every request chunk back through the reply
-	/// sink. The duplex arm carries the cancel probe.
+	/// A servlet with streaming and duplex arms only. The stream arm reports
+	/// the collected body length, and the duplex arm echoes every request
+	/// chunk back through the reply sink and carries the cancel probe.
 	pub StreamEchoServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
 	stream: |body, ctx| async move {
@@ -75,18 +82,20 @@ servlet! {
 	}
 }
 
-/// Hive hosting one stream-echo servlet, muxed on both the servlet
+/// A hive hosting one stream-echo servlet, muxed on both the servlet
 /// server and the hive-to-cluster pool.
-pub(super) async fn start_stream_hive(
+pub async fn start_stream_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
 	let servlet_conf = servlet_tls_config(&certs)?;
-	let servlet = StreamEchoServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
+	let servlet = StreamEchoServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 
 	let conf = hive_tls_config(&certs);
 	let mut hive = ClusterTestHive::new(Some(conf))?;
-	hive.register(servlet_urn("stream-echo"), servlet, |t| StreamEchoServlet::start(t, None))?;
+	hive.register(servlet_urn("stream-echo"), servlet, |t| {
+		StreamEchoServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
@@ -99,13 +108,14 @@ fn mux_peering_conf(certs: &ClusterTestCerts) -> ClusterConfig {
 
 /// [`advertising_cluster_conf`] with a mux offer, so the exporting
 /// gateway serves forwarded streams from its peer.
-fn mux_advertising_conf(certs: &ClusterTestCerts, peer: String) -> ClusterConfig {
+fn mux_advertising_conf(certs: &ClusterTestCerts, peer: impl Into<String>) -> ClusterConfig {
+	let peer: String = peer.into();
 	with_mux_offer(advertising_cluster_conf(certs, peer))
 }
 
-/// Pooled mux lease against a gateway, for the routed stream entry
-/// points ([`PooledClient::open_stream_to`] / [`PooledClient::open_duplex_to`]).
-pub(super) async fn pooled_cluster_client(
+/// A pooled mux lease against a gateway, for the routed stream entry points
+/// [`PooledClient::open_stream_to`] and [`PooledClient::open_duplex_to`].
+pub async fn pooled_cluster_client(
 	trace: &TraceCollector,
 	certs: &ClusterTestCerts,
 	addr: &<TokioListener as Protocol>::Address,
@@ -127,9 +137,9 @@ pub(super) async fn pooled_cluster_client(
 	Ok(client)
 }
 
-/// Two peered gateways with the stream-echo hive registered in the
-/// exporter: the shared preamble for every splice scenario. Returns
-/// the importer the client dials first, the exporter second.
+/// Starts two peered gateways with the stream-echo hive registered in the
+/// exporter. This is the shared preamble for every splice scenario, and it
+/// returns the importer the client dials first and the exporter second.
 async fn start_spliced_clusters(
 	trace: &TraceCollector,
 	certs: &Arc<ClusterTestCerts>,
@@ -146,25 +156,16 @@ async fn start_spliced_clusters(
 	Ok((importer, exporter))
 }
 
-/// Poll until the servlet-side cancel probe reports or attempts
-/// exhaust. Branching lives here, not in scenarios.
+/// Polls until the servlet-side cancel probe reports or the attempts run
+/// out.
 async fn wait_for_cancel_probe(attempts: u32, interval: Duration) -> bool {
-	for _ in 0..attempts {
-		if DUPLEX_CANCEL_SEEN.load(Ordering::SeqCst) {
-			return true;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
-
-	DUPLEX_CANCEL_SEEN.load(Ordering::SeqCst)
+	poll_until(attempts, interval, || DUPLEX_CANCEL_SEEN.load(Ordering::SeqCst)).await
 }
 
 tb_assert_spec! {
 	pub ClusterStreamForwardSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -200,7 +201,7 @@ tb_scenario! {
 			sink.close_with(b"efgh").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let echoed: PingResponse = decode(&reply.message)?;
+			let echoed: PingResponse = decode(reply.message())?;
 			trace.event_with(STREAM_ECHOED, &[], u64::from(echoed.doubled))?;
 
 			exporter.stop();
@@ -215,7 +216,6 @@ tb_assert_spec! {
 	pub ClusterDuplexForwardSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -230,7 +230,7 @@ tb_assert_spec! {
 }
 
 // Duplex cross-cluster forward: both directions relay concurrently
-// across the splice - request chunks reach the exporter's servlet as
+// across the splice: request chunks reach the exporter's servlet as
 // they are pushed, and its echoes arrive before the request closes.
 tb_scenario! {
 	name: cluster_forwards_duplex_to_peer_gateway,
@@ -271,7 +271,6 @@ tb_assert_spec! {
 	pub ClusterStreamGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
 			(events::CLUSTER_GATE_BLOCKED, exactly!(2)),
@@ -324,12 +323,24 @@ tb_assert_spec! {
 	pub ClusterEdgePlaneStreamRefuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
-			(EDGE_STREAM_REFUSED, exactly!(1), equals!(true)),
-			(EDGE_DUPLEX_REFUSED, exactly!(1), equals!(true))
+			(EDGE_STREAM_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(EDGE_DUPLEX_REFUSED, exactly!(1), equals!(TransitStatus::PermissionDenied))
 		]
+	}
+}
+
+/// The wire status a refused open carries.
+///
+/// A test that only asks whether the open failed goes green on any
+/// refusal, including the `Unimplemented` a plane with no route would
+/// give. The Edge policy names `PermissionDenied`, so that is what the
+/// scenario records.
+fn refusal_status<T>(outcome: Result<T, tightbeam::transport::TransportError>) -> Option<TransitStatus> {
+	match outcome {
+		Err(tightbeam::transport::TransportError::OperationFailed(failure)) => TransitStatus::try_from(failure).ok(),
+		_ => None,
 	}
 }
 
@@ -358,14 +369,14 @@ tb_scenario! {
 			let (sink, response) = client.open_stream_to(servlet_urn("stream-echo"))?;
 			sink.close_with(b"denied").await?;
 
-			let refused = response.await.is_err();
-			trace.event_with(EDGE_STREAM_REFUSED, &[], refused)?;
+			let refused = refusal_status(response.await);
+			trace.event_with(EDGE_STREAM_REFUSED, &[], refused.unwrap_or(TransitStatus::Ok))?;
 
 			let (sink, mut body) = client.open_duplex_to(servlet_urn("stream-echo"))?;
 			sink.close_with(b"denied").await?;
 
-			let refused = body.chunk().await.is_err();
-			trace.event_with(EDGE_DUPLEX_REFUSED, &[], refused)?;
+			let refused = refusal_status(body.chunk().await);
+			trace.event_with(EDGE_DUPLEX_REFUSED, &[], refused.unwrap_or(TransitStatus::Ok))?;
 
 			cluster.stop();
 			hive.stop();
@@ -378,7 +389,6 @@ tb_assert_spec! {
 	pub ClusterDuplexCancelSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ROUTES_AFTER_INSTALLS, exactly!(1), equals!(1u64)),

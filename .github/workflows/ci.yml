@@ -9,8 +9,6 @@ on:
       - "releases/v*"
       - "releases/derive/v*"
   pull_request:
-    branches:
-      - master
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -26,7 +24,7 @@ env:
 jobs:
   ci:
     name: CI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-l
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,11 +62,5 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Resolve MSRV-compatible dependencies
-        run: |
-          mkdir -p .cargo
-          printf '[resolver]\nincompatible-rust-versions = "fallback"\n' > .cargo/config.toml
-          cargo +${{ steps.msrv.outputs.version }} update
-
       - name: Check workspace on MSRV
-        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-features
+        run: cargo +${{ steps.msrv.outputs.version }} check --locked --workspace --all-features

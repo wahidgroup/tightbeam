@@ -1,25 +1,23 @@
-//! Multi-hop federation (transitive discovery and relay fallback).
+//! Multi-hop federation tests for transitive discovery and relay fallback.
 //!
-//! Three member gateways with distinct identities: rumors teach a
-//! gateway about origins it never dialed, relay trails carry work
+//! The scenarios run three member gateways with distinct identities. Rumors
+//! teach a gateway about origins it never dialed, relay trails carry work
 //! around a dead direct address, and the `max_hops` clamp bounds the
 //! origin's sentinel budget.
 
 use super::common::*;
 use super::streaming::{pooled_cluster_client, start_stream_hive};
-use tightbeam::colony::cluster::{ServletEntry, DEFAULT_ABANDONMENT_LIMIT, DEFAULT_INITIAL_PHEROMONE};
 
-/// Dial address nothing listens on: a dead direct trail fails fast.
+/// A dial address nothing listens on, so a dead direct trail fails fast.
 const DEAD_GATEWAY_ADDR: &[u8] = b"127.0.0.1:9";
 
-/// Three distinct colony-member identities (see [`member_identity`]
-/// for why [`cluster_certs`] cannot serve here: relay trails refuse
-/// self-relay).
+/// Three distinct colony-member identities. [`cluster_certs`] cannot serve
+/// here, because relay trails refuse self-relay (see [`member_identity`]).
 ///
-/// The combined store on `.trust` serves the hive and dial planes.
-/// Each gateway's peer store excludes its own identity: peer membership
-/// wins on the hive plane, so a member's hive registrations must not
-/// verify on its own peer store.
+/// - The combined store on `.trust` serves the hive and dial planes.
+/// - Each gateway's peer store excludes its own identity. Peer membership
+///   wins on the hive plane, so a member's hive registrations must not verify
+///   on its own peer store.
 struct FederationCtx {
 	a: Arc<ClusterTestCerts>,
 	b: Arc<ClusterTestCerts>,
@@ -51,16 +49,40 @@ fn federation_ctx() -> FederationCtx {
 /// Member gateway conf on a fast beat: `peers` as anchors, the given
 /// peer-plane store, and a fast rumor refresh so late-promoted flood
 /// targets still learn the slate within the test window.
-pub(super) fn federation_conf(
+pub fn federation_conf(
 	certs: &ClusterTestCerts,
 	peer_trust: Arc<dyn CertificateTrust>,
-	peers: Vec<String>,
+	peers: impl IntoIterator<Item = String>,
 	max_hops: u8,
 ) -> ClusterConfig {
-	let tls = ClusterTlsConfig { peer_trust: Some(peer_trust), ..cluster_tls_config(certs) };
+	let peers: Vec<String> = peers.into_iter().collect();
+	let tls = cluster_tls_config(certs).with_peer_trust(peer_trust);
 
 	ClusterConfig::builder(tls)
 		.with_peers(peers)
+		.expect("fixture peers name sockets")
+		.with_advertise_interval(Duration::from_millis(100))
+		.with_rumor_refresh(Duration::from_millis(200))
+		.with_max_hops(max_hops)
+		.build()
+}
+
+/// [`federation_conf`] that also restricts inbound ads to the peers it
+/// dials, so a claimed address outside the list is refused.
+pub fn federation_conf_allowing(
+	certs: &ClusterTestCerts,
+	peer_trust: Arc<dyn CertificateTrust>,
+	peers: impl IntoIterator<Item = String>,
+	max_hops: u8,
+) -> ClusterConfig {
+	let peers: Vec<String> = peers.into_iter().collect();
+	let tls = cluster_tls_config(certs).with_peer_trust(peer_trust);
+
+	ClusterConfig::builder(tls)
+		.with_peers(peers.clone())
+		.expect("fixture peers name sockets")
+		.with_peer_dial_allowlist(peers)
+		.expect("fixture allowlist entries name sockets")
 		.with_advertise_interval(Duration::from_millis(100))
 		.with_rumor_refresh(Duration::from_millis(200))
 		.with_max_hops(max_hops)
@@ -72,9 +94,10 @@ pub(super) fn federation_conf(
 fn mux_federation_conf(
 	certs: &ClusterTestCerts,
 	peer_trust: Arc<dyn CertificateTrust>,
-	peers: Vec<String>,
+	peers: impl IntoIterator<Item = String>,
 	max_hops: u8,
 ) -> ClusterConfig {
+	let peers: Vec<String> = peers.into_iter().collect();
 	with_mux_offer(federation_conf(certs, peer_trust, peers, max_hops))
 }
 
@@ -86,103 +109,108 @@ async fn start_beacon_hive(
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
 	let servlet_conf = servlet_tls_config(&certs)?;
-	let servlet = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
+	let servlet = ClusterTestServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
-	hive.register(servlet_urn("beacon"), servlet, |t| ClusterTestServlet::start(t, None))?;
+	hive.register(servlet_urn("beacon"), servlet, |t| {
+		ClusterTestServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
 
-/// Flood one origin-signed advertisement rumor for `gateway_addr` to
-/// `cluster`, exactly as a peer gateway would. The rumor frame carries
-/// the origin's signature inside a `Gossip` relay envelope with
-/// `hop_ttl` reflood hops, so the same-origin bind holds at every hop.
-/// `PublishGossip` cannot serve here: the publish plane re-creates the
-/// rumor under the receiving gateway's own key. Each call creates a
-/// fresh rumor, so every call floods anew (ads dedup on digest and are
-/// never repaired). Returns the admission status the gateway replied.
-pub(super) async fn flood_ad_rumor(
+/// Floods one origin-signed advertisement rumor for `gateway_addr` to
+/// `cluster`, exactly as a peer gateway would, and answers the admission
+/// status the gateway replied.
+///
+/// - The rumor frame carries the origin's signature inside a `Gossip` relay
+///   envelope with `hop_ttl` reflood hops, so the same-origin bind holds at
+///   every hop.
+/// - `PublishGossip` cannot serve here, because the publish plane re-creates
+///   the rumor under the receiving gateway's own key.
+/// - Each call creates a fresh rumor, so every call floods anew. Ads dedup
+///   on digest and are never repaired.
+pub async fn flood_ad_rumor(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
 	cluster: &ClusterGateway,
-	gateway_addr: &[u8],
-	advertised_types: Vec<Urn<'static>>,
+	gateway_addr: impl AsRef<[u8]>,
+	advertised_types: impl IntoIterator<Item = Urn<'static>>,
 	hop_ttl: u64,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 ) -> Result<TransitStatus, TightBeamError> {
+	let gateway_addr = gateway_addr.as_ref();
+	let advertised_types: Vec<Urn<'static>> = advertised_types.into_iter().collect();
+	let id = id.as_ref();
 	let advertisement =
 		ClusterRequest::AdvertisePeer(PeerAdvertisement { gateway_addr: gateway_addr.to_vec(), advertised_types });
 	let inner = signed_control_frame_with(signer, id, advertisement).await?;
 
 	let provider = Secp256k1KeyProvider::from(signer.to_owned());
-	let rumor = frame_compose(Version::V2)
+	let mut rumor = Version::V2
+		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_message(GossipRumor::peer_advertisement(encode(&inner)?))
-		.build()?
-		.sign_with_provider::<Sha3_256, _>(&provider)
-		.await?;
+		.build()?;
+	rumor.sign_with_provider::<Sha3_256, _>(&provider).await?;
 
-	let frame = frame_compose(Version::V2)
+	let mut frame = Version::V2
+		.compose()
 		.with_id(id)
-		.with_order(current_timestamp_ms())
+		.with_order(UnixMillis::now().get())
 		.with_lifetime(hop_ttl)
 		.with_message(ClusterRequest::Gossip(Box::new(rumor)))
-		.build()?
-		.sign_with_provider::<Sha3_256, _>(&provider)
-		.await?;
+		.build()?;
+	frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
 
 	let mut client = connect_cluster(connect_certs, cluster.addr()).await?;
-	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message)?;
+	let response: GossipResponse = decode(&emit_frame(&mut client, frame).await?.message())?;
 	Ok(response.status)
 }
 
-/// Count the live peer routes for `type_name` on `cluster`.
-pub(super) fn type_route_count(cluster: &ClusterGateway, type_name: &str) -> usize {
-	let canonical = type_canonical_bytes(&servlet_urn(type_name));
+/// Counts the live peer routes for `type_name` on `cluster`.
+pub fn type_route_count(cluster: &ClusterGateway, type_name: impl AsRef<str>) -> usize {
+	let type_name = type_name.as_ref();
+	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
+		.expect("the gateway under test holds no poisoned lock")
 		.iter()
 		.filter(|route| route.servlet_type.as_ref() == canonical.as_slice())
 		.count()
 }
 
-/// Poll until `cluster` holds `want` routes for `type_name` or
-/// attempts exhaust. Branching lives here, not in scenarios.
-pub(super) async fn wait_for_type_routes(
+/// Polls until `cluster` holds `want` routes for `type_name` or the attempts
+/// run out, and answers the count it holds.
+pub async fn wait_for_type_routes(
 	cluster: &ClusterGateway,
-	type_name: &str,
+	type_name: impl AsRef<str>,
 	want: usize,
 	attempts: u32,
 	interval: Duration,
 ) -> usize {
-	for _ in 0..attempts {
-		let held = type_route_count(cluster, type_name);
-		if held >= want {
-			return held;
-		}
-
-		tokio::time::sleep(interval).await;
-	}
+	let type_name = type_name.as_ref();
+	poll_until(attempts, interval, || type_route_count(cluster, type_name) >= want).await;
 
 	type_route_count(cluster, type_name)
 }
 
-/// Flood fresh advertisement rumors claiming `claimed_addr` for
-/// `type_name` through `relay` until `observer` holds `want` routes or
-/// attempts exhaust. Fresh instances flood until the relay has
-/// promoted the observer as a flood target. Branching lives here, not
-/// in scenarios.
+/// Floods fresh advertisement rumors claiming `claimed_addr` for `type_name`
+/// through `relay` until `observer` holds `want` routes or the attempts run
+/// out. Fresh instances flood until the relay has promoted the observer as a
+/// flood target. The branching lives here, not in scenarios.
 async fn flood_until_routes(
 	connect_certs: &ClusterTestCerts,
 	signer: &Secp256k1SigningKey,
 	relay: &ClusterGateway,
 	observer: &ClusterGateway,
-	claimed_addr: &[u8],
-	type_name: &str,
+	claimed_addr: impl AsRef<[u8]>,
+	type_name: impl AsRef<str>,
 	want: usize,
 ) -> Result<usize, TightBeamError> {
+	let claimed_addr = claimed_addr.as_ref();
+	let type_name = type_name.as_ref();
 	let mut installed = 0usize;
 	for attempt in 0u32..50 {
 		let id = format!("relay-ad-{type_name}-{attempt}");
@@ -207,10 +235,13 @@ async fn flood_until_routes(
 }
 
 /// Whether any route for `type_name` on `cluster` dials `dial_addr`.
-fn type_route_dials(cluster: &ClusterGateway, type_name: &str, dial_addr: &[u8]) -> bool {
-	let canonical = type_canonical_bytes(&servlet_urn(type_name));
+fn type_route_dials(cluster: &ClusterGateway, type_name: impl AsRef<str>, dial_addr: impl AsRef<[u8]>) -> bool {
+	let type_name = type_name.as_ref();
+	let dial_addr = dial_addr.as_ref();
+	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
+		.expect("the gateway under test holds no poisoned lock")
 		.iter()
 		.any(|route| route.servlet_type.as_ref() == canonical.as_slice() && route.dial_addr.as_ref() == dial_addr)
 }
@@ -219,7 +250,6 @@ tb_assert_spec! {
 	pub ClusterTransitiveDiscoverySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_AD_LEARNED, at_least!(2)),
@@ -250,8 +280,12 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: ctx, hive }| async move {
 			let gateway_b = start_cluster(&trace, federation_conf(&ctx.b, Arc::clone(&ctx.peers_of_b), vec![], 1)).await?;
 
-			let mut conf_c = federation_conf(&ctx.c, Arc::clone(&ctx.peers_of_c), vec![gateway_b.addr().to_string()], 1);
-			conf_c.peer.peer_dial_allowlist = Some(vec![gateway_b.addr().to_string()]);
+			let conf_c = federation_conf_allowing(
+				&ctx.c,
+				Arc::clone(&ctx.peers_of_c),
+				vec![gateway_b.addr().to_string()],
+				1,
+			);
 
 			let gateway_c = start_cluster(&trace, conf_c).await?;
 			let gateway_a = start_cluster(&trace, federation_conf(&ctx.a, Arc::clone(&ctx.peers_of_a), vec![gateway_b.addr().to_string()], 1)).await?;
@@ -281,7 +315,6 @@ tb_assert_spec! {
 	pub ClusterRelayFallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(events::CLUSTER_PEER_AD_LEARNED, at_least!(1)),
@@ -367,7 +400,6 @@ tb_assert_spec! {
 	pub ClusterStreamRelayFallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2), equals!(1u64)),
 			(events::CLUSTER_PEER_AD_LEARNED, at_least!(1)),
@@ -452,7 +484,7 @@ tb_scenario! {
 			sink.close_with(b"efgh").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let echoed: PingResponse = decode(&reply.message)?;
+			let echoed: PingResponse = decode(reply.message())?;
 			trace.event_with(STREAM_ECHOED, &[], u64::from(echoed.doubled))?;
 
 			gateway_a.stop();
@@ -467,8 +499,8 @@ tb_scenario! {
 
 // A zero-hop gateway clamps the origin sentinel: the client's "as far
 // as policy allows" budget becomes zero, so a peer-only type refuses
-// Unavailable instead of forwarding. Reuses the loop-guard spec: the
-// same contract as a spent wire budget.
+// Unavailable instead of forwarding. The scenario reuses the loop-guard
+// spec, because the contract is the same as for a spent wire budget.
 tb_scenario! {
 	name: cluster_zero_hop_gateway_clamps_origin_sentinel,
 	spec: super::peering::ClusterPeerForwardLoopGuardSpec,
@@ -498,7 +530,6 @@ tb_assert_spec! {
 	pub ClusterStreamBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PEER_ADVERTISE_SENT, exactly!(1)),
 			(PEER_AD_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -527,7 +558,7 @@ tb_scenario! {
 			let config = PoolConfig {
 				idle_timeout: None,
 				max_connections: 1,
-				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
+				mux_offer: Some(Arc::new(TransportOffer::mux(8)))
 			};
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -571,37 +602,34 @@ impl LoadBalancer for DecoyFirstBalancer {
 
 /// Sets the balancer preference. The lock only poisons after a balancer
 /// panic, which fails the scenario anyway.
-fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: Vec<u8>) {
+fn pin_preference(cell: &Mutex<Option<Vec<u8>>>, key: impl Into<Vec<u8>>) {
+	let key: Vec<u8> = key.into();
 	let mut preferred = cell.lock().expect("preference lock poisons only after a balancer panic");
 	*preferred = Some(key);
 }
 
-/// Route key `cluster` holds for `type_name` toward `dial_addr`,
-/// rebuilt through the public [`ServletEntry::peer`] constructor so
-/// the key discipline stays in one place.
-fn peer_route_key_for_dial(cluster: &ClusterGateway, type_name: &str, dial_addr: &[u8]) -> Option<Vec<u8>> {
-	let canonical = type_canonical_bytes(&servlet_urn(type_name));
+/// Route key `cluster` holds for `type_name` toward `dial_addr`, read from
+/// the operator view so the key discipline stays with the registry.
+fn peer_route_key_for_dial(
+	cluster: &ClusterGateway,
+	type_name: impl AsRef<str>,
+	dial_addr: impl AsRef<[u8]>,
+) -> Option<Vec<u8>> {
+	let type_name = type_name.as_ref();
+	let dial_addr = dial_addr.as_ref();
+	let canonical = servlet_urn(type_name).type_canonical_bytes();
 	cluster
 		.peer_routes()
+		.expect("the gateway under test holds no poisoned lock")
 		.into_iter()
 		.find(|route| route.dial_addr.as_ref() == dial_addr && route.servlet_type.as_ref() == canonical.as_slice())
-		.map(|route| {
-			ServletEntry::peer(
-				route.peer_id,
-				route.servlet_type,
-				route.dial_addr,
-				DEFAULT_INITIAL_PHEROMONE,
-				DEFAULT_ABANDONMENT_LIMIT,
-			)
-		})
-		.map(|entry| entry.route_key().to_vec())
+		.map(|route| route.route_key.to_vec())
 }
 
 tb_assert_spec! {
 	pub ClusterLiveDecoyFailoverSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_AD_STATUS, exactly!(2), equals!(TransitStatus::Ok)),

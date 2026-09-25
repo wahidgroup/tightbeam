@@ -14,10 +14,11 @@ use syn::{parse_macro_input, Attribute, DeriveInput, Meta, Token};
 /// `#[beam(...)]` mixes bare identifiers (`confidential`) with name-value
 /// pairs (`min_version = "V1"`) and lists (`profile(MyProfile)`), so every
 /// reader shares this parse-and-walk shell instead of re-implementing it.
-fn for_each_beam_meta<F>(attrs: &[Attribute], mut f: F) -> syn::Result<()>
+fn for_each_beam_meta<F>(attrs: impl AsRef<[Attribute]>, mut f: F) -> syn::Result<()>
 where
 	F: FnMut(Meta) -> syn::Result<()>,
 {
+	let attrs = attrs.as_ref();
 	for attr in attrs {
 		if !attr.path().is_ident("beam") {
 			continue;
@@ -36,7 +37,9 @@ where
 	Ok(())
 }
 
-fn has_flag(attrs: &[Attribute], name: &str) -> syn::Result<bool> {
+fn has_flag(attrs: impl AsRef<[Attribute]>, name: impl AsRef<str>) -> syn::Result<bool> {
+	let attrs = attrs.as_ref();
+	let name = name.as_ref();
 	let mut found = false;
 	for_each_beam_meta(attrs, |meta| {
 		if let Meta::Path(path) = &meta {
@@ -51,7 +54,8 @@ fn has_flag(attrs: &[Attribute], name: &str) -> syn::Result<bool> {
 	Ok(found)
 }
 
-fn get_version_value(attrs: &[Attribute]) -> syn::Result<Option<syn::Ident>> {
+fn get_version_value(attrs: impl AsRef<[Attribute]>) -> syn::Result<Option<syn::Ident>> {
+	let attrs = attrs.as_ref();
 	let mut version = None;
 	for_each_beam_meta(attrs, |meta| {
 		let Meta::NameValue(nv) = &meta else {
@@ -83,7 +87,8 @@ fn get_version_value(attrs: &[Attribute]) -> syn::Result<Option<syn::Ident>> {
 	Ok(version)
 }
 
-fn get_profile_value(attrs: &[Attribute]) -> syn::Result<Option<(u8, proc_macro2::Span)>> {
+fn get_profile_value(attrs: impl AsRef<[Attribute]>) -> syn::Result<Option<(u8, proc_macro2::Span)>> {
+	let attrs = attrs.as_ref();
 	let mut profile = None;
 	for_each_beam_meta(attrs, |meta| {
 		let Meta::NameValue(nv) = &meta else {
@@ -108,7 +113,8 @@ fn get_profile_value(attrs: &[Attribute]) -> syn::Result<Option<(u8, proc_macro2
 	Ok(profile)
 }
 
-fn get_profile_type(attrs: &[Attribute]) -> syn::Result<Option<syn::Type>> {
+fn get_profile_type(attrs: impl AsRef<[Attribute]>) -> syn::Result<Option<syn::Type>> {
+	let attrs = attrs.as_ref();
 	let mut profile = None;
 	for_each_beam_meta(attrs, |meta| {
 		let Meta::List(profile_list) = &meta else {
@@ -126,11 +132,14 @@ fn get_profile_type(attrs: &[Attribute]) -> syn::Result<Option<syn::Type>> {
 	Ok(profile)
 }
 
-fn has_attr(attrs: &[Attribute], name: &str) -> bool {
+fn has_attr(attrs: impl AsRef<[Attribute]>, name: impl AsRef<str>) -> bool {
+	let attrs = attrs.as_ref();
+	let name = name.as_ref();
 	attrs.iter().any(|attr| attr.path().is_ident(name))
 }
 
-fn get_error_message(attrs: &[Attribute]) -> Option<String> {
+fn get_error_message(attrs: impl AsRef<[Attribute]>) -> Option<String> {
+	let attrs = attrs.as_ref();
 	for attr in attrs {
 		if attr.path().is_ident("error") {
 			if let Meta::List(list) = &attr.meta {
@@ -156,22 +165,48 @@ fn get_error_message(attrs: &[Attribute]) -> Option<String> {
 ///   `message_integrity`, `frame_integrity` - set the corresponding
 ///   `MUST_*` constant to `true`
 /// - `min_version = "V1"` - minimum protocol version for the type
-/// - `profile(MyProfile)` - pin the type to a `SecurityProfile`; the digest,
-///   AEAD, and signature OIDs used by the builder are then enforced at
-///   compile time
-/// - `profile = N` - numeric shorthand for a predefined security level:
+/// - `profile(MyProfile)` - pin the type to a `SecurityProfile`. The builder
+///   refuses a digest, AEAD, or signature algorithm that the profile does not
+///   name. A mismatched algorithm type also fails to compile at the builder call.
+/// - `profile = N` - numeric shorthand for a set of requirement flags:
 ///
 ///   | N | Profile  | Effect                                          |
 ///   |---|----------|-------------------------------------------------|
 ///   | 1 | FIPS     | confidential + non-repudiable, `MIN_VERSION` V1 |
 ///   | 2 | Standard | confidential + non-repudiable, `MIN_VERSION` V1 |
 ///
-///   Any other number is rejected at compile time. `profile = N` and
-///   `profile(Type)` are mutually exclusive.
+///   A numeric profile constrains no algorithm, so a `profile = 1` message
+///   accepts any digest, AEAD, or signature algorithm. Use `profile(Type)` to
+///   constrain algorithms. Any other number is rejected at compile time.
+///   `profile = N` and `profile(Type)` are mutually exclusive.
 #[proc_macro_derive(Beamable, attributes(beam))]
 pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
 	expand_beamable(&input).unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+/// A compile error that fires when a `#[beam]` requirement names a tightbeam
+/// feature the build disables.
+///
+/// The check runs through tightbeam's `shim` macro, so tightbeam's own feature
+/// state decides it. This crate carries no copy of tightbeam's features.
+fn feature_check(
+	name: &syn::Ident,
+	shim: impl AsRef<str>,
+	requirement: impl AsRef<str>,
+	feature: impl AsRef<str>,
+) -> proc_macro2::TokenStream {
+	let shim = syn::Ident::new(shim.as_ref(), name.span());
+	let message = format!(
+		"Message type `{name}` is marked as {} but the `{feature}` feature is not enabled. \
+		 Enable the feature in Cargo.toml: features = [\"{feature}\"]",
+		requirement.as_ref(),
+		feature = feature.as_ref(),
+	);
+
+	quote! {
+		::tightbeam::#shim! { else { compile_error!(#message); } }
+	}
 }
 
 fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -217,45 +252,17 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 	let final_frame_integrity = frame_integrity;
 
 	let mut feature_checks = Vec::new();
-
-	if final_confidential && !cfg!(feature = "aead") {
-		feature_checks.push(quote! {
-			compile_error!(concat!(
-				"Message type `", stringify!(#name), "` is marked as confidential ",
-				"but the `aead` feature is not enabled. ",
-				"Enable the feature in Cargo.toml: features = [\"aead\"]"
-			));
-		});
+	if final_confidential {
+		feature_checks.push(feature_check(name, "__tb_if_aead", "confidential", "aead"));
 	}
-
-	if final_nonrep && !cfg!(feature = "signature") {
-		feature_checks.push(quote! {
-			compile_error!(concat!(
-				"Message type `", stringify!(#name), "` is marked as non-repudiable ",
-				"but the `signature` feature is not enabled. ",
-				"Enable the feature in Cargo.toml: features = [\"signature\"]"
-			));
-		});
+	if final_nonrep {
+		feature_checks.push(feature_check(name, "__tb_if_signature", "non-repudiable", "signature"));
 	}
-
-	if compressed && !cfg!(feature = "compress") {
-		feature_checks.push(quote! {
-			compile_error!(concat!(
-				"Message type `", stringify!(#name), "` is marked as compressed ",
-				"but the `compress` feature is not enabled. ",
-				"Enable the feature in Cargo.toml: features = [\"compress\"]"
-			));
-		});
+	if compressed {
+		feature_checks.push(feature_check(name, "__tb_if_compress", "compressed", "compress"));
 	}
-
-	if (final_message_integrity || final_frame_integrity) && !cfg!(feature = "digest") {
-		feature_checks.push(quote! {
-			compile_error!(concat!(
-				"Message type `", stringify!(#name), "` is marked as requiring message integrity ",
-				"but the `digest` feature is not enabled. ",
-				"Enable the feature in Cargo.toml: features = [\"digest\"]"
-			));
-		});
+	if final_message_integrity || final_frame_integrity {
+		feature_checks.push(feature_check(name, "__tb_if_digest", "requiring message integrity", "digest"));
 	}
 
 	let min_version_value = if let Some(version) = final_min_version {
@@ -280,100 +287,56 @@ fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
 		}
 	};
 
-	// Generate checker trait implementations for compile-time OID validation
-	// When HAS_PROFILE = true: generates impls ONLY for the matching OID type from the profile (compile-time enforcement)
-	// When HAS_PROFILE = false: generates generic impls for all OID types (no enforcement, allows any)
-	// All types using #[derive(Beamable)] get these impls - types not using derive must implement manually
+	// The checker impls turn an algorithm that a `profile(Type)` message does
+	// not name into a compile error at the builder call. They are hints, not
+	// the enforcement: `FrameBuilder` compares each OID with the profile at
+	// run time, because a hand-written `Message` impl can admit any algorithm.
 	let oid_validation_helpers = if let Some(profile_ty) = &profile_type {
-		// We know the profile type, so we can reference its associated types directly
-		// ONLY implement for the exact OID types from the profile - wrong OIDs will fail to compile
+		// A profile message admits only the algorithms its profile names.
 		quote! {
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_digest! {
-				impl ::tightbeam::builder::private::SealedDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
+				impl ::tightbeam::builder::CheckDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::Digest> for #name
 				where
 					#name: ::tightbeam::Message,
 				{}
-
-				impl ::tightbeam::builder::CheckDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
-				where
-					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
 			} }
 
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_aead! {
-				impl ::tightbeam::builder::private::SealedAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl ::tightbeam::builder::CheckAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_signature! {
-				impl ::tightbeam::builder::private::SealedSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl ::tightbeam::builder::CheckSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 		}
 	} else {
-		// When HAS_PROFILE = false, generate generic impls for all OID types (no enforcement)
-		// These allow FrameBuilder methods to work for types without profiles
+		// A message without a profile admits every algorithm.
 		quote! {
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_digest! {
-				impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedDigestOid<D> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckDigestOid<D> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_aead! {
-				impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedAeadOid<C> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckAeadOid<C> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 
 			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_signature! {
-				impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::private::SealedSignatureOid<S> for #name
-				where
-					#name: ::tightbeam::Message,
-				{}
-
 				impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::CheckSignatureOid<S> for #name
 				where
 					#name: ::tightbeam::Message,
-				{
-					const RESULT: () = ();
-				}
+				{}
 			} }
 		}
 	};
@@ -431,6 +394,18 @@ fn expand_flaggable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream
 		}
 	}
 
+	// `as u8` truncates a discriminant above 255 without a word. `repr(u8)`
+	// makes the compiler reject such a discriminant where it is written, so
+	// the cast below cannot lose a flag.
+	let has_repr_u8 = input
+		.attrs
+		.iter()
+		.any(|attr| attr.path().is_ident("repr") && attr.parse_args::<syn::Ident>().is_ok_and(|repr| repr == "u8"));
+	if !has_repr_u8 {
+		let message = "Flaggable requires #[repr(u8)]: a discriminant above 255 is silently truncated by `as u8`";
+		return Err(syn::Error::new_spanned(input, message));
+	}
+
 	Ok(quote! {
 		impl From<#name> for u8 {
 			fn from(val: #name) -> u8 {
@@ -469,9 +444,10 @@ fn is_received_expected_error(ty: &syn::Type) -> bool {
 ///
 /// # Attributes
 ///
-/// - `#[error("format string")]` - Specifies the display format for the variant
-/// - `#[from]` - Automatically implements `From` for the wrapped type
-/// - `#[source]` - Reports the wrapped value through `Error::source`
+/// - `#[error("format string")]` -- Specifies the display format for the variant
+/// - `#[from]` -- Implements `From` for the wrapped type and reports that value
+///   through `Error::source`, so the payload must implement `core::error::Error`
+/// - `#[source]` -- Reports the wrapped value through `Error::source`
 #[proc_macro_derive(Errorizable, attributes(error, from, source))]
 pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -497,6 +473,22 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 		let error_msg = get_error_message(&variant.attrs);
 		let has_from = has_attr(&variant.attrs, "from");
 		let has_source = has_attr(&variant.attrs, "source");
+
+		// A variant that carries data must render it. A message with no
+		// placeholder drops the payload, and the caller sees a bare
+		// description where the values it needed used to be.
+		if !matches!(&variant.fields, syn::Fields::Unit) {
+			if let Some(msg) = error_msg.as_deref() {
+				let literal_braces_removed = msg.replace("{{", "").replace("}}", "");
+				if !literal_braces_removed.contains('{') {
+					return Err(syn::Error::new_spanned(
+						variant,
+						"a variant carrying fields must reference at least one of them in \
+						 #[error(\"...\")]: a message with no placeholder drops the payload",
+					));
+				}
+			}
+		}
 
 		if has_source && !matches!(&variant.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1) {
 			return Err(syn::Error::new_spanned(
@@ -544,12 +536,11 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 						});
 					}
 				} else {
-					display_arms.push(quote! {
-						#(#variant_cfgs)*
-						#name::#variant_name(#(ref #field_bindings),*) => {
-							write!(f, "{}", stringify!(#variant_name))
-						}
-					});
+					return Err(syn::Error::new_spanned(
+						variant,
+						"Errorizable requires #[error(\"...\")] on every variant: a missing message \
+						 would print the variant name and drop the payload",
+					));
 				}
 
 				// Generate From impl if #[from] is present and there's exactly one field
@@ -567,8 +558,11 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 					}
 				}
 
-				// Wrapper variants preserve their cause chain (C-GOOD-ERR).
-				if has_source {
+				// Wrapper variants preserve their cause chain (C-GOOD-ERR). A
+				// single-field `#[from]` variant is a cause, so it joins the
+				// `#[source]` arm.
+				let wraps_cause = has_source || (has_from && field_count == 1);
+				if wraps_cause {
 					source_arms.push(quote! {
 						#(#variant_cfgs)*
 						#name::#variant_name(ref f0) => Some(f0),
@@ -586,12 +580,11 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 						}
 					});
 				} else {
-					display_arms.push(quote! {
-						#(#variant_cfgs)*
-						#name::#variant_name { .. } => {
-							write!(f, "{}", stringify!(#variant_name))
-						}
-					});
+					return Err(syn::Error::new_spanned(
+						variant,
+						"Errorizable requires #[error(\"...\")] on every variant: a missing message \
+						 would print the variant name and drop the payload",
+					));
 				}
 			}
 			syn::Fields::Unit => {
@@ -601,10 +594,11 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 						#name::#variant_name => write!(f, #msg)
 					});
 				} else {
-					display_arms.push(quote! {
-						#(#variant_cfgs)*
-						#name::#variant_name => write!(f, "{}", stringify!(#variant_name))
-					});
+					return Err(syn::Error::new_spanned(
+						variant,
+						"Errorizable requires #[error(\"...\")] on every variant: a missing message \
+						 would print the variant name and drop the payload",
+					));
 				}
 			}
 		}

@@ -47,8 +47,8 @@ impl TraceConfigBuilder {
 	/// Inject a custom event sink; replaces the default bounded in-memory
 	/// buffer entirely (retention policy becomes the sink's decision).
 	#[cfg(feature = "instrument")]
-	pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
-		self.sink = Some(sink);
+	pub fn with_sink(mut self, sink: impl EventSink + 'static) -> Self {
+		self.sink = Some(Arc::new(sink));
 		self
 	}
 

@@ -21,20 +21,11 @@
 //! Use [`WorkerRuntime`] and implement [`Worker`] + [`WorkerMetadata`] on a
 //! thin wrapper. See the [`Worker`] trait docs.
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
-
-#[cfg(feature = "std")]
 use std::sync::Arc;
 
 use core::future::Future;
 use core::pin::Pin;
 
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 
 use crate::policy::{ReceptorPolicy, TransitStatus};
@@ -65,31 +56,15 @@ pub struct WorkerRequest<I: Send, O> {
 	pub trace: Arc<TraceCollector>,
 }
 
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug)]
+#[derive(Errorizable, Debug)]
 pub enum WorkerRelayError {
-	#[cfg_attr(feature = "derive", error("Worker queue closed"))]
+	#[error("Worker queue closed")]
 	QueueClosed,
-	#[cfg_attr(feature = "derive", error("Worker response channel dropped"))]
+	#[error("Worker response channel dropped")]
 	ResponseDropped,
-	#[cfg_attr(feature = "derive", error("Message rejected with status {:?}"))]
-	#[cfg_attr(feature = "derive", from)]
+	#[error("Message rejected with status {:?}")]
 	Rejected(TransitStatus),
 }
-
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for WorkerRelayError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			Self::QueueClosed => f.write_str("worker queue closed"),
-			Self::ResponseDropped => f.write_str("worker response channel dropped"),
-			Self::Rejected(status) => write!(f, "message rejected with status {:?}", status),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl std::error::Error for WorkerRelayError {}
 
 pub type WorkerRelayFuture<O> = Pin<Box<dyn Future<Output = Result<O, WorkerRelayError>> + Send + 'static>>;
 pub type WorkerStartFuture<W> = Pin<Box<dyn Future<Output = Result<W, crate::error::TightBeamError>> + Send>>;
@@ -232,6 +207,28 @@ impl<I: Send> WorkerPolicies<I> {
 	pub fn receptor_gates(&self) -> &[Arc<dyn ReceptorPolicy<I> + Send + Sync>] {
 		&self.receptor_gates
 	}
+
+	/// Run every configured receptor gate over `message`.
+	///
+	/// The first refusal short-circuits, so a gate reached by the sweep
+	/// answers on a message the gates before it already admitted.
+	///
+	/// # Errors
+	///
+	/// The refusing gate's own [`TransitStatus`].
+	pub(crate) fn admits(&self, message: &I) -> Result<(), TransitStatus>
+	where
+		I: Message,
+	{
+		for gate in self.receptor_gates.iter() {
+			let status = gate.evaluate(message);
+			if status != TransitStatus::Ok {
+				return Err(status);
+			}
+		}
+
+		Ok(())
+	}
 }
 
 impl<I: Send> Default for WorkerPolicies<I> {
@@ -324,7 +321,6 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "std")]
 	crate::test_worker! {
 		name: lucky_number_worker_checks_winner,
 		setup: || {
@@ -349,7 +345,6 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "std")]
 	crate::test_worker! {
 		name: test_ping_pong_worker,
 		setup: || {

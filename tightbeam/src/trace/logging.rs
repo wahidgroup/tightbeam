@@ -6,6 +6,7 @@
 
 use core::fmt;
 
+use crate::Errorizable;
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, collections::BTreeMap as HashMap, vec::Vec};
 #[cfg(feature = "std")]
@@ -67,29 +68,20 @@ pub struct LogRecord<'a> {
 }
 
 /// Errors that can occur during logging operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogError {
 	/// I/O error occurred
+	#[error("I/O error")]
 	IoError,
 	/// Log buffer is full
+	#[error("buffer full")]
 	BufferFull,
 	/// Backend is unavailable
+	#[error("backend unavailable")]
 	BackendUnavailable,
 }
 
-impl fmt::Display for LogError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			LogError::IoError => write!(f, "I/O error"),
-			LogError::BufferFull => write!(f, "buffer full"),
-			LogError::BackendUnavailable => write!(f, "backend unavailable"),
-		}
-	}
-}
-
 #[cfg(feature = "std")]
-impl std::error::Error for LogError {}
-
 /// Trait for logging backends
 ///
 /// Implementations can output logs to various targets (stdout, files, SIEM systems, etc.)
@@ -184,7 +176,8 @@ impl core::fmt::Debug for LoggerConfig {
 
 impl LoggerConfig {
 	/// Create logger config with required fields
-	pub fn new(backend: Box<dyn LogBackend>, filter: LogFilter) -> Self {
+	pub fn new(backend: impl LogBackend + 'static, filter: LogFilter) -> Self {
+		let backend: Box<dyn LogBackend> = Box::new(backend);
 		Self { backend, filter, default_level: None }
 	}
 
@@ -274,17 +267,17 @@ mod tests {
 	use crate::trace::TraceCollector;
 	use crate::utils::urn::Urn;
 
-	const TEST1: Urn<'static> = Urn::new("test", "event:log/test1");
-	const TEST2: Urn<'static> = Urn::new("test", "event:log/test2");
-	const NO_LOG: Urn<'static> = Urn::new("test", "event:log/no-log");
-	const SHOULD_LOG: Urn<'static> = Urn::new("test", "event:log/should-log");
-	const EMERGENCY: Urn<'static> = Urn::new("test", "event:log/emergency");
-	const ERROR: Urn<'static> = Urn::new("test", "event:log/error");
-	const WARNING: Urn<'static> = Urn::new("test", "event:log/warning");
-	const NOTICE: Urn<'static> = Urn::new("test", "event:log/notice");
-	const INFO: Urn<'static> = Urn::new("test", "event:log/info");
-	const DEBUG: Urn<'static> = Urn::new("test", "event:log/debug");
-	const TEST: Urn<'static> = Urn::new("test", "event:log/test");
+	const TEST1: Urn<'static> = crate::urn!("test", "event:log/test1");
+	const TEST2: Urn<'static> = crate::urn!("test", "event:log/test2");
+	const NO_LOG: Urn<'static> = crate::urn!("test", "event:log/no-log");
+	const SHOULD_LOG: Urn<'static> = crate::urn!("test", "event:log/should-log");
+	const EMERGENCY: Urn<'static> = crate::urn!("test", "event:log/emergency");
+	const ERROR: Urn<'static> = crate::urn!("test", "event:log/error");
+	const WARNING: Urn<'static> = crate::urn!("test", "event:log/warning");
+	const NOTICE: Urn<'static> = crate::urn!("test", "event:log/notice");
+	const INFO: Urn<'static> = crate::urn!("test", "event:log/info");
+	const DEBUG: Urn<'static> = crate::urn!("test", "event:log/debug");
+	const TEST: Urn<'static> = crate::urn!("test", "event:log/test");
 
 	#[test]
 	fn test_log_level_ordering() {
@@ -359,8 +352,7 @@ mod tests {
 			let captured = Arc::clone(&captured);
 			CaptureBackend::with_captured(captured)
 		};
-		let config =
-			LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Info);
+		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Info);
 		let trace = TraceCollector::default().with_logger(config);
 
 		trace.event(TEST1)?.emit();
@@ -384,7 +376,7 @@ mod tests {
 			let captured = Arc::clone(&captured);
 			CaptureBackend::with_captured(captured)
 		};
-		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug));
+		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 
 		trace.event(NO_LOG)?.emit();
@@ -407,7 +399,7 @@ mod tests {
 			CaptureBackend::with_captured(captured)
 		};
 
-		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Warning));
+		let config = LoggerConfig::new(backend, LogFilter::new(LogLevel::Warning));
 		let trace = TraceCollector::default().with_logger(config);
 
 		trace.event(EMERGENCY)?.with_log_level(LogLevel::Emergency).emit();
@@ -442,7 +434,7 @@ mod tests {
 		};
 
 		let multiplex = MultiplexBackend::new(vec![Box::new(backend1), Box::new(backend2)]);
-		let config = LoggerConfig::new(Box::new(multiplex), LogFilter::new(LogLevel::Debug));
+		let config = LoggerConfig::new(multiplex, LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 
 		trace.event(TEST)?.with_log_level(LogLevel::Info).emit();

@@ -3,16 +3,17 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc};
 
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
 use crate::asn1::Frame;
 use crate::builder::TypeBuilder;
+use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::der::Encode;
 use crate::transport::error::{TransportError, TransportFailure};
-use crate::transport::{ResponsePackage, TransportEnvelope, TransportResult, WireEnvelope, WireMode};
+use crate::transport::{ResponsePackage, TransportEnvelope, TransportLimits, TransportResult, WireEnvelope, WireMode};
 use crate::TightBeamError;
 
 #[cfg(feature = "x509")]
@@ -40,50 +41,8 @@ impl EnvelopePayload {
 pub struct EnvelopeBuilder<'a> {
 	pub(crate) payload: EnvelopePayload,
 	pub(crate) encryptor: Option<&'a SendCipher>,
-	pub(crate) max_cleartext_envelope: Option<usize>,
-	pub(crate) max_encrypted_envelope: Option<usize>,
+	pub(crate) limits: TransportLimits,
 	pub(crate) wire_mode: WireMode,
-}
-
-/// Size limits for cleartext and encrypted envelopes.
-#[derive(Clone, Copy, Default)]
-pub struct EnvelopeLimits {
-	cleartext: Option<usize>,
-	encrypted: Option<usize>,
-}
-
-impl EnvelopeLimits {
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	pub fn from_pair(cleartext: Option<usize>, encrypted: Option<usize>) -> Self {
-		Self { cleartext, encrypted }
-	}
-
-	pub fn with_cleartext(mut self, limit: Option<usize>) -> Self {
-		self.cleartext = limit;
-		self
-	}
-
-	pub fn with_encrypted(mut self, limit: Option<usize>) -> Self {
-		self.encrypted = limit;
-		self
-	}
-
-	pub fn apply<'a>(self, builder: EnvelopeBuilder<'a>) -> EnvelopeBuilder<'a> {
-		let builder = if let Some(max) = self.cleartext {
-			builder.with_max_cleartext_envelope(max)
-		} else {
-			builder
-		};
-
-		if let Some(max) = self.encrypted {
-			builder.with_max_encrypted_envelope(max)
-		} else {
-			builder
-		}
-	}
 }
 
 impl<'a> EnvelopeBuilder<'a> {
@@ -91,8 +50,7 @@ impl<'a> EnvelopeBuilder<'a> {
 		Self {
 			payload,
 			encryptor: None,
-			max_cleartext_envelope: None,
-			max_encrypted_envelope: None,
+			limits: TransportLimits::default(),
 			wire_mode: WireMode::Cleartext,
 		}
 	}
@@ -117,13 +75,9 @@ impl<'a> EnvelopeBuilder<'a> {
 		self
 	}
 
-	pub fn with_max_cleartext_envelope(mut self, max: usize) -> Self {
-		self.max_cleartext_envelope = Some(max);
-		self
-	}
-
-	pub fn with_max_encrypted_envelope(mut self, max: usize) -> Self {
-		self.max_encrypted_envelope = Some(max);
+	/// Replace every ceiling this envelope is measured against.
+	pub fn with_limits(mut self, limits: TransportLimits) -> Self {
+		self.limits = limits;
 		self
 	}
 
@@ -134,25 +88,38 @@ impl<'a> EnvelopeBuilder<'a> {
 
 	/// Finalize the builder, returning a `WireEnvelope`.
 	pub fn finish(self) -> TransportResult<WireEnvelope> {
-		let EnvelopeBuilder { payload, encryptor, max_cleartext_envelope, max_encrypted_envelope, wire_mode } = self;
+		let EnvelopeBuilder { payload, encryptor, limits, wire_mode } = self;
 
 		let envelope = payload.materialize();
-		match wire_mode {
-			WireMode::Cleartext => Self::build_cleartext(envelope, max_cleartext_envelope),
-			WireMode::Encrypted => Self::build_encrypted(envelope, max_encrypted_envelope, encryptor),
+		let with_frame = Self::frame_error_context(&envelope);
+
+		let (wire, ceiling) = match wire_mode {
+			WireMode::Cleartext => (WireEnvelope::Cleartext(envelope), limits.cleartext_envelope),
+			WireMode::Encrypted => {
+				let encrypted = Self::encrypt(envelope, encryptor, &with_frame)?;
+				(WireEnvelope::Encrypted(encrypted), limits.encrypted_envelope)
+			}
+		};
+
+		// The ceiling names the wire form, so the tag and wrapper are inside the
+		// measurement. `encoded_len` computes it without building a buffer.
+		let wire_len = u32::from(wire.encoded_len().map_err(|_| with_frame(TransportFailure::EncodingFailed))?);
+		if wire_len as usize > ceiling {
+			return Err(with_frame(TransportFailure::SizeExceeded));
 		}
+
+		Ok(wire)
 	}
 
-	fn encode_and_validate(
-		envelope: &TransportEnvelope,
-		max_size: Option<usize>,
-	) -> TransportResult<(Vec<u8>, impl Fn(TransportFailure) -> TransportError + '_)> {
+	/// Error constructor that returns the caller's frame with the failure, so a
+	/// refused request need not be reconstructed to retry.
+	fn frame_error_context(envelope: &TransportEnvelope) -> impl Fn(TransportFailure) -> TransportError {
 		let request_frame = match envelope {
 			TransportEnvelope::Request(pkg) => Some(Arc::clone(&pkg.message)),
 			_ => None,
 		};
 
-		let with_frame = move |failure: TransportFailure| -> TransportError {
+		move |failure: TransportFailure| -> TransportError {
 			request_frame
 				.as_ref()
 				.map(Arc::clone)
@@ -162,33 +129,20 @@ impl<'a> EnvelopeBuilder<'a> {
 					failure.with_frame(frame)
 				})
 				.unwrap_or_else(|| failure.into())
-		};
-
-		let encoded = envelope.to_der().map_err(|_| with_frame(TransportFailure::EncodingFailed))?;
-		if let Some(max) = max_size {
-			if encoded.len() > max {
-				return Err(with_frame(TransportFailure::SizeExceeded));
-			}
 		}
-
-		Ok((encoded, with_frame))
 	}
 
-	fn build_cleartext(envelope: TransportEnvelope, max_cleartext: Option<usize>) -> TransportResult<WireEnvelope> {
-		let _ = Self::encode_and_validate(&envelope, max_cleartext)?;
-		Ok(WireEnvelope::Cleartext(envelope))
-	}
-
-	fn build_encrypted(
+	/// Encode and seal one envelope with the session's send cipher.
+	fn encrypt(
 		envelope: TransportEnvelope,
-		max_encrypted: Option<usize>,
 		encryptor: Option<&'a SendCipher>,
-	) -> TransportResult<WireEnvelope> {
-		let (encoded, with_frame) = Self::encode_and_validate(&envelope, max_encrypted)?;
+		with_frame: &impl Fn(TransportFailure) -> TransportError,
+	) -> TransportResult<EncryptedContentInfo> {
+		let encoded = envelope.to_der().map_err(|_| with_frame(TransportFailure::EncodingFailed))?;
 
 		// The send cipher owns the counter nonce. No random nonce is drawn.
 		let encryptor = encryptor.ok_or_else(|| with_frame(TransportFailure::EncryptorUnavailable))?;
-		let encrypted = encryptor.encrypt_next(&encoded, None).map_err(|error| {
+		encryptor.encrypt_next(&encoded, None).map_err(|error| {
 			// Rekey exhaustion stays distinguishable: the caller must
 			// reestablish the session, not retry the write.
 			let failure = match error {
@@ -197,9 +151,7 @@ impl<'a> EnvelopeBuilder<'a> {
 				_ => TransportFailure::EncryptionFailed,
 			};
 			with_frame(failure)
-		})?;
-
-		Ok(WireEnvelope::Encrypted(encrypted))
+		})
 	}
 }
 

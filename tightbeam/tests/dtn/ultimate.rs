@@ -1,43 +1,51 @@
-//! DTN Test - Mission-Critical Framework Demonstration
+//! DTN test: a mission-critical framework demonstration.
 //!
-//! ## Scenario: Mission Control ↔ Earth Relay ↔ Mars Relay ↔ Rover
+//! # Scenario
 //!
-//! This test demonstrates a realistic 4-tier DTN architecture with:
+//! A four-tier DTN path links Mission Control, two relay satellites and a Mars
+//! rover:
+//!
 //! - Mission Control (Earth-based command center)
 //! - Earth Relay Satellite (orbiting Earth)
 //! - Mars Relay Satellite (orbiting Mars)
 //! - Mars Rover (surface operations)
 //!
-//! Features:
+//! # Features
+//!
 //! - Realistic NASA-inspired rover telemetry (APXS, ChemCam, Mastcam)
 //! - Simulated mission clock with realistic Mars-Earth delays
 //! - Cryptographic chain validation using previous_frame hash chains
 //! - Matrix bit field for rover fault flags
-//! - Graceful fault handling (low power -> recharge -> resume)
+//! - Graceful fault handling: low power, then recharge, then resume
 //! - Cascading gap recovery
 //!
-//! ## Realistic Timeline
-//! - T+0: Mission Control sends command
-//! - T+1.5s: Earth Relay forwards
-//! - T+12.5min: Mars Relay forwards
-//! - T+13min: Rover receives, executes, sends stateful ACK
-//! - T+25min: Mission Control receives ACK
-//! - T+0: Rover sends telemetry
-//! - T+1.5s: Mars Relay forwards
-//! - T+12.5min: Earth Relay forwards
-//! - T+13min: Mission Control receives, sends next command
+//! # Timeline
+//!
+//! Each leg restarts its clock at T+0.
+//!
+//! | Leg | Step | Mission time |
+//! | --- | --- | --- |
+//! | Command | Mission Control sends the command | T+0 |
+//! | Command | Earth Relay forwards | T+1.5s |
+//! | Command | Mars Relay forwards | T+12.5min |
+//! | Command | Rover receives, executes, and sends a stateful ACK | T+13min |
+//! | Command | Mission Control receives the ACK | T+25min |
+//! | Telemetry | Rover sends telemetry | T+0 |
+//! | Telemetry | Mars Relay forwards | T+1.5s |
+//! | Telemetry | Earth Relay forwards | T+12.5min |
+//! | Telemetry | Mission Control receives it and sends the next command | T+13min |
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::{
 	asn1::MessagePriority,
 	at_most,
 	builder::TypeBuilder,
 	crypto::{
 		aead::Aes256Gcm,
-		hash::Sha3_256,
 		key::SigningKeySpec,
 		policy::Secp256k1Policy,
 		sign::ecdsa::{Secp256k1, Secp256k1SigningKey},
@@ -61,6 +69,8 @@ use tightbeam::{
 	wcet,
 };
 
+use crate::common::poll::poll_until;
+use crate::common::security::expectation_failure;
 use crate::dtn::events::*;
 use crate::dtn::messages::RoverInstrument;
 
@@ -160,35 +170,23 @@ use crate::dtn::{
 	},
 };
 
-// ============================================================================
-// Test Helpers
-// ============================================================================
-
 fn make_trust_store(cert_spec: CertificateSpec) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let cert = Certificate::try_from(cert_spec)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-			.with_certificate(cert)?
-			.build(),
+		CertificateTrustBuilder::from(Secp256k1Policy).with_certificate(cert)?.build(),
 	))
 }
-
-// ============================================================================
-// DTN Scenario Configuration
-// ============================================================================
 
 /// Configuration for 4-tier DTN scenario
 /// Only contains state that is SHARED between multiple components or accessed
 /// by test client
 pub struct DtnScenarioConfig {
-	// === SHARED CRYPTOGRAPHIC MATERIAL ===
 	/// Rover's signing key (shared: RoverServlet + mission loop client)
 	pub rover_signing_key: Secp256k1SigningKey,
 	/// Shared AES-256-GCM cipher (Mission Control ↔ Rover end-to-end
 	/// encryption)
 	pub shared_cipher: Aes256Gcm,
 
-	// === ROVER STATE (SHARED WITH CLIENT) ===
 	/// Battery Management System (mission loop monitors battery)
 	pub bms: RwLock<BatteryManagementSystem>,
 	/// Fault handler for recovery logic
@@ -198,7 +196,6 @@ pub struct DtnScenarioConfig {
 	/// Rover's chain processor (shared: RoverServlet + mission loop client)
 	pub rover_chain_processor: Arc<ChainProcessor>,
 
-	// === COORDINATION ===
 	/// Node addresses (for dynamic servlet coordination)
 	pub mission_control_addr: RwLock<Option<TightBeamSocketAddr>>,
 	pub earth_relay_addr: RwLock<Option<TightBeamSocketAddr>>,
@@ -208,7 +205,6 @@ pub struct DtnScenarioConfig {
 	/// Shared mission state (RoverServlet + mission loop synchronization)
 	pub mission_state: Arc<RwLock<MissionState>>,
 
-	// === SERVLET LIFECYCLE ===
 	/// Servlet handles (keeps servlets alive for test duration)
 	pub _mission_control_servlet: RwLock<Option<MissionControlServlet>>,
 	pub _earth_relay_servlet: RwLock<Option<EarthRelaySatelliteServlet>>,
@@ -228,8 +224,8 @@ impl Default for DtnScenarioConfig {
 			_ => panic!("ROVER_KEY must be KeySpec::Bytes"),
 		};
 
-		// Create Rover's chain processor (shared between RoverServlet and mission loop
-		// client)
+		// Create Rover's chain processor (shared between RoverServlet and
+		// mission loop client)
 		let rover_chain_proc = Arc::new(ChainProcessor::new(
 			Arc::clone(&rover_store),
 			Arc::new(RwLock::new(MessageChainState::new("Rover".to_string()))),
@@ -278,18 +274,11 @@ impl Drop for DtnScenarioConfig {
 	}
 }
 
-// ============================================================================
-// Test Configuration
-// ============================================================================
-
 /// Number of command/response round-trips for the test.
 const COMMAND_ROUND_TRIPS: usize = 6;
 
-// ============================================================================
-// DTN Process Specifications - Parallel Composition
-// ============================================================================
-
-// Telemetry Flow: Rover -> Mars Relay -> Earth Relay -> Mission Control
+// Telemetry flows from the rover through the Mars relay and the Earth relay to
+// Mission Control.
 tb_process_spec! {
 	pub DtnTelemetryFlow,
 	events {
@@ -341,7 +330,8 @@ tb_process_spec! {
 	}
 }
 
-// Command Flow: Mission Control -> Earth Relay -> Mars Relay -> Rover -> ACK back
+// Commands flow from Mission Control through the Earth relay and the Mars relay
+// to the rover, and the ACK travels back.
 tb_process_spec! {
 	pub DtnCommandFlow,
 	events {
@@ -507,7 +497,6 @@ tb_assert_spec! {
 	pub DtnEventCountSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			// Lifecycle
 			(MISSION_START, exactly!(1)),
@@ -575,10 +564,6 @@ tb_assert_spec! {
 	}
 }
 
-// ============================================================================
-// Mission Loop Helpers
-// ============================================================================
-
 /// Build and send telemetry to Relay (one-way, no response expected)
 /// Relay will forward to Earth Ground Station
 async fn send_telemetry_to_mars_relay(
@@ -615,13 +600,14 @@ async fn send_telemetry_to_mars_relay(
 	Ok(())
 }
 
-/// Run the rover mission loop: sends telemetry periodically
+/// Run the rover mission loop, which sends telemetry periodically.
 ///
-/// Fully async architecture:
-/// - Rover sends telemetry -> Satellite -> Earth
-/// - Earth responds with command -> Satellite -> Rover
-/// - Rover sends ACK -> Satellite -> Earth
-/// - Rover executes command and sends next telemetry
+/// Each round is fully async:
+///
+/// - The rover sends telemetry through a satellite to Earth.
+/// - Earth answers with a command through a satellite to the rover.
+/// - The rover sends an ACK through a satellite to Earth.
+/// - The rover executes the command and sends the next telemetry.
 #[allow(clippy::too_many_arguments)]
 async fn run_mission_loop(
 	trace: &TraceCollector,
@@ -633,19 +619,12 @@ async fn run_mission_loop(
 	shared_cipher: &Aes256Gcm,
 	shared_mission_state: &Arc<RwLock<MissionState>>,
 ) -> Result<(), TightBeamError> {
-	let mut wait_iterations = 0;
-	const MAX_WAIT_ITERATIONS: usize = 100;
-	while shared_mission_state.read()?.completed_rounds < 1 {
-		tokio::time::sleep(Duration::from_millis(100)).await;
-		wait_iterations += 1;
-		if wait_iterations >= MAX_WAIT_ITERATIONS {
-			panic!("Timeout waiting for first command to arrive");
-		}
+	if !await_completed_rounds(shared_mission_state, 1).await {
+		return Err(expectation_failure("the first command never reached the rover"));
 	}
 
-	// Loop exactly COMMAND_ROUND_TRIPS times (6 rounds)
-	// We start from round 0 since we've completed command 0 and need to send its
-	// telemetry
+	// Loop exactly COMMAND_ROUND_TRIPS times (6 rounds) We start from round 0
+	// since we've completed command 0 and need to send its telemetry
 	for round in 0..COMMAND_ROUND_TRIPS {
 		// Update battery state and check for faults
 		let battery_update = fault_manager.update_battery_state()?;
@@ -672,8 +651,8 @@ async fn run_mission_loop(
 			}
 		}
 
-		// Send telemetry to Mars Relay (which forwards to Earth Relay -> Mission
-		// Control)
+		// Send telemetry to the Mars relay, which forwards it through the Earth
+		// relay to Mission Control.
 		send_telemetry_to_mars_relay(
 			trace,
 			rover_client,
@@ -693,14 +672,8 @@ async fn run_mission_loop(
 		// (except for the last round where there's no next command)
 		if round < COMMAND_ROUND_TRIPS - 1 {
 			let target_completed = round + 2; // We've done command `round`, waiting for command `round+1`
-			let mut wait_iterations = 0;
-			const MAX_WAIT_ITERATIONS: usize = 100;
-			while shared_mission_state.read()?.completed_rounds < target_completed {
-				tokio::time::sleep(Duration::from_millis(100)).await;
-				wait_iterations += 1;
-				if wait_iterations >= MAX_WAIT_ITERATIONS {
-					break;
-				}
+			if !await_completed_rounds(shared_mission_state, target_completed).await {
+				return Err(expectation_failure("the rover never executed the next command"));
 			}
 		}
 	}
@@ -708,9 +681,11 @@ async fn run_mission_loop(
 	Ok(())
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+/// Wait up to 10 s for the rover servlet to complete `rounds` commands.
+async fn await_completed_rounds(state: &RwLock<MissionState>, rounds: usize) -> bool {
+	let reached = || state.read().is_ok_and(|mission| mission.completed_rounds >= rounds);
+	poll_until(100, Duration::from_millis(100), reached).await
+}
 
 /// Build FDR configuration for DTN testing
 ///
@@ -725,7 +700,6 @@ fn build_dtn_fdr_config_refinement() -> FdrConfig {
 		timeout_ms: 15000,
 		specs: vec![DtnComposedSystem::process()], // Triggers trace refinement checking
 		fail_fast: true,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -752,7 +726,7 @@ tb_scenario! {
 				max_events: 4096,
 			})
 			.with_logger(LoggerConfig::new(
-				Box::new(StdoutBackend),
+				StdoutBackend,
 				LogFilter::new(LogLevel::Error)
 			).with_default_level(LogLevel::Debug))
 			.build()
@@ -763,15 +737,11 @@ tb_scenario! {
 		context: DtnScenarioConfig::default(),
 		start: |env| async move {
 			let (trace, config) = (Arc::new(env.trace), env.context);
-			// ================================================================
-			// 4-TIER DTN ARCHITECTURE SETUP
-			// Start: Rover -> Mars Relay -> Earth Relay -> Mission Control
-			// This ensures each servlet has the addresses it needs to connect
-			// ================================================================
+			// Servlets start from the rover outward: the Mars relay, then the
+			// Earth relay, then mission control. Each one then holds the
+			// address it connects to.
 
-			// ================================================================
-			// SHARED COMPONENTS (from scenario config)
-			// ================================================================
+			// Components the scenario config shares with every servlet.
 			let shared_cipher = config.shared_cipher.to_owned();
 			let rover_signing_key = config.rover_signing_key.to_owned();
 			let shared_mission_state = Arc::clone(&config.mission_state);
@@ -783,11 +753,9 @@ tb_scenario! {
 			let mars_relay_verifying_key_val = mars_relay_verifying_key();
 			let rover_verifying_key_val = rover_verifying_key();
 
-			// ================================================================
-			// SERVLET-SPECIFIC COMPONENTS (local to start block)
-			// ================================================================
 
-			// Mission Control: store, signing key, chain processor, frame builder
+			// Mission Control: store, signing key, chain processor, frame
+			// builder
 			let mc_key_bytes = match MISSION_CONTROL_KEY {
 				SigningKeySpec::Bytes(bytes) => bytes,
 				_ => panic!("MISSION_CONTROL_KEY must be KeySpec::Bytes"),
@@ -828,59 +796,54 @@ tb_scenario! {
 			// Rover: frame builder (processor already created in Default)
 			let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
 
-			// ================================================================
-			// CONNECTION POOLS (per-destination with TLS and mutual auth)
-			// ================================================================
-
-			// Pool configuration for relay connections (max 3 per destination)
+			// Relay pools dial each destination over TLS with mutual
+			// authentication, holding at most 3 connections per destination.
 			let pool_config = PoolConfig { max_connections: 3, ..PoolConfig::default() };
 
-			// Mission Control -> Earth Relay pool
+			// Pool from Mission Control to the Earth relay.
 			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
-				.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(ClientIdentity::from_spec(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
-			// Earth Relay -> Mission Control pool
+			// Pool from the Earth relay to Mission Control.
 			let earth_mc_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(MISSION_CONTROL_CERT)?)
-				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(ClientIdentity::from_spec(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
-			// Earth Relay -> Mars Relay pool
+			// Pool from the Earth relay to the Mars relay.
 			let earth_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
-				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(ClientIdentity::from_spec(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
-			// Mars Relay -> Earth Relay pool
+			// Pool from the Mars relay to the Earth relay.
 			let mars_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
-				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(ClientIdentity::from_spec(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
-			// Mars Relay -> Rover pool
+			// Pool from the Mars relay to the rover.
 			let mars_rover_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(ROVER_CERT)?)
-				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(ClientIdentity::from_spec(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
-			// Rover -> Mars Relay pool
+			// Pool from the rover to the Mars relay.
 			let rover_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config)
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
-				.with_client_identity(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(ClientIdentity::from_spec(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?)
 				.build());
 
-			// ================================================================
-			// 1. START ROVER SERVLET
-			// ================================================================
 
+			// 1. Start the rover servlet
 			let rover_fault_manager = Arc::new(FaultManager::from_refs(
 				&config.bms,
 				&config.fault_matrix,
@@ -929,16 +892,14 @@ tb_scenario! {
 				.with_worker(rover_frame_request_handler_worker)
 				.with_worker(rover_frame_response_handler_worker)
 				.build();
-			let rover_servlet = RoverServlet::start(Arc::clone(&trace), Some(rover_servlet_conf)).await?;
+			let rover_servlet = RoverServlet::start(Arc::clone(&trace), rover_servlet_conf).await?;
 			let rover_addr = rover_servlet.addr().to_owned();
 
 			// Store rover address
 			config.rover_addr.write()?.replace(rover_addr);
 
-			// ================================================================
-			// 2. START MARS RELAY SERVLET
-			// ================================================================
 
+			// 2. Start the Mars relay servlet
 			// Extract Mars Relay signing key
 			let mars_relay_key_bytes = match MARS_RELAY_KEY {
 				SigningKeySpec::Bytes(bytes) => bytes,
@@ -946,8 +907,9 @@ tb_scenario! {
 			};
 			let mars_relay_signing_key = Secp256k1SigningKey::from_slice(mars_relay_key_bytes)?;
 
-			// Mars Relay needs earth_relay_addr which we don't have yet
-			// We'll use an Arc<RwLock<Option<>>> pattern and update it after Earth Relay starts
+			// Mars Relay needs earth_relay_addr which we don't have yet We'll
+			// use an Arc<RwLock<Option<>>> pattern and update it after Earth
+			// Relay starts
 			let mars_earth_relay_addr = Arc::new(RwLock::new(None));
 			let mars_relay_config = MarsRelaySatelliteServletConfig {
 				mars_relay_signing_key: mars_relay_signing_key.to_owned(),
@@ -981,7 +943,6 @@ tb_scenario! {
 				.with_worker(mars_frame_response_handler_worker)
 				.build();
 
-			let mars_relay_servlet_conf = Some(mars_relay_servlet_conf);
 			let mars_relay_servlet = MarsRelaySatelliteServlet::start(Arc::clone(&trace), mars_relay_servlet_conf).await?;
 			let mars_relay_addr = mars_relay_servlet.addr().to_owned();
 
@@ -989,10 +950,8 @@ tb_scenario! {
 			config._mars_relay_servlet.write()?.replace(mars_relay_servlet);
 			config.mars_relay_addr.write()?.replace(mars_relay_addr);
 
-			// ================================================================
-			// 3. START EARTH RELAY SERVLET
-			// ================================================================
 
+			// 3. Start the Earth relay servlet
 			// Extract Earth Relay signing key
 			let earth_relay_key_bytes = match EARTH_RELAY_KEY {
 				SigningKeySpec::Bytes(bytes) => bytes,
@@ -1031,7 +990,6 @@ tb_scenario! {
 				.with_worker(earth_frame_request_handler_worker)
 				.with_worker(earth_frame_response_handler_worker)
 				.build();
-			let earth_relay_servlet_conf = Some(earth_relay_servlet_conf);
 			let earth_relay_servlet = EarthRelaySatelliteServlet::start(Arc::clone(&trace), earth_relay_servlet_conf).await?;
 			let earth_relay_addr = earth_relay_servlet.addr().to_owned();
 
@@ -1042,10 +1000,8 @@ tb_scenario! {
 			config._earth_relay_servlet.write()?.replace(earth_relay_servlet);
 			config.earth_relay_addr.write()?.replace(earth_relay_addr);
 
-			// ================================================================
-			// 4. START MISSION CONTROL SERVLET
-			// ================================================================
 
+			// 4. Start the Mission Control servlet
 			let mc_config = MissionControlServletConfig {
 				mission_control_signing_key: mission_control_signing_key.to_owned(),
 				rover_verifying_key: rover_verifying_key_val,
@@ -1082,7 +1038,7 @@ tb_scenario! {
 				.with_worker(command_ack_handler_worker)
 				.build();
 
-			let mc_servlet = MissionControlServlet::start(Arc::clone(&trace), Some(mc_servlet_conf)).await?;
+			let mc_servlet = MissionControlServlet::start(Arc::clone(&trace), mc_servlet_conf).await?;
 			let mc_addr = mc_servlet.addr().to_owned();
 
 			// Update Earth Relay's mission_control_addr
@@ -1092,17 +1048,13 @@ tb_scenario! {
 			config._mission_control_servlet.write()?.replace(mc_servlet);
 			config.mission_control_addr.write()?.replace(mc_addr);
 
-			// ================================================================
-			// 5. INITIALIZE MISSION CLOCK
-			// ================================================================
 
+			// 5. Initialize the mission clock
 			init_mission_clock();
 			trace.event(MISSION_START)?;
 
-			// ================================================================
-			// 6. SEND INITIAL COMMAND FROM MISSION CONTROL
-			// ================================================================
 
+			// 6. Send the initial command from Mission Control
 			{
 				let initial_cmd = RoverCommand::ProbeLocation { x: 100, y: 200 };
 				let (next_order, previous_digest) = mc_processor.prepare_outgoing()?;
@@ -1121,7 +1073,7 @@ tb_scenario! {
 				// Connect to Earth Relay and send initial command
 				let mut earth_relay_client = ClientBuilder::<TokioListener>::builder()
 					.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
-					.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?
+					.with_client_identity(ClientIdentity::from_spec(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?)
 					.with_timeout(Duration::from_millis(5000))
 					.build()
 					.connect(earth_relay_addr)
@@ -1139,7 +1091,7 @@ tb_scenario! {
 			// Connect Rover client to Mars Relay
 			let client = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
-				.with_client_identity(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?
+				.with_client_identity(ClientIdentity::from_spec(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?)
 				.with_timeout(Duration::from_millis(5000))
 				.build()
 				.connect(mars_relay_addr)

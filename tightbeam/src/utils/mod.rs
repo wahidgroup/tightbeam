@@ -23,6 +23,7 @@ pub mod marker;
 pub mod math;
 pub mod statistics;
 pub mod task;
+pub mod time;
 pub mod urn;
 
 pub use basis_points::{BasisPoints, BasisPointsOutOfRange};
@@ -103,7 +104,8 @@ macro_rules! impl_from {
 		}
 	};
 
-	// Pattern for extracting inner value from enum variant with fallback (conditional)
+	// Pattern for extracting inner value from enum variant with fallback
+	// (conditional)
 	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident extract $enum_variant:pat => $inner:ident else $fallback:expr) => {
 		#[cfg($feature)]
 		impl From<$from_type> for $target {
@@ -234,10 +236,13 @@ pub fn encode<T: der::Encode>(value: &T) -> Result<Vec<u8>, TightBeamError> {
 	Ok(der::Encode::to_der(value)?)
 }
 
-/// Decode a value from MessageContent
-/// This is used for decoding messages from frame content
+/// Decode a DER value, such as a typed message from a frame body.
+///
+/// `content` is any borrowed byte source, such as `&[u8]`, `&Vec<u8>`, or
+/// `&[u8; N]`. The borrow outlives the call so a decoded type may borrow from
+/// those bytes.
 #[inline]
-pub fn decode<'a, T: der::Decode<'a>>(content: &'a impl AsRef<[u8]>) -> Result<T, TightBeamError> {
+pub fn decode<'a, T: der::Decode<'a>>(content: &'a (impl AsRef<[u8]> + ?Sized)) -> Result<T, TightBeamError> {
 	Ok(der::Decode::from_der(content.as_ref())?)
 }
 
@@ -247,8 +252,14 @@ pub fn decode<'a, T: der::Decode<'a>>(content: &'a impl AsRef<[u8]>) -> Result<T
 /// `compose!` macro. Useful in contexts where macros cannot be used
 /// (e.g., within other macro definitions).
 #[cfg(feature = "builder")]
-pub fn compose<T: Message>(version: Version) -> FrameBuilder<T> {
-	FrameBuilder::from(version)
+impl Version {
+	/// Start a [`FrameBuilder`] for message type `T` at this version.
+	///
+	/// This is the method form of the `compose!` macro, for contexts
+	/// where a macro cannot be used (inside another macro definition).
+	pub fn compose<T: Message>(self) -> FrameBuilder<T> {
+		FrameBuilder::from(self)
+	}
 }
 
 /// Compress data using the specified algorithm.
@@ -277,11 +288,22 @@ pub fn decompress(data: impl AsRef<[u8]>, inflator: &impl Inflator) -> Result<Ve
 pub fn digest<D: digest::Digest + crate::der::oid::AssociatedOid>(
 	data: impl AsRef<[u8]>,
 ) -> Result<crate::asn1::DigestInfo, TightBeamError> {
-	let data = data.as_ref();
-
 	let mut hasher = D::new();
-	hasher.update(data);
+	hasher.update(data.as_ref());
+	digest_info::<D>(hasher)
+}
 
+/// Finalize `hasher` into the [`DigestInfo`] that names its algorithm.
+///
+/// Callers whose preimage arrives in pieces stream it into `hasher` and end
+/// here, so no caller has to concatenate a preimage into one buffer to get a
+/// `DigestInfo` back.
+///
+/// [`DigestInfo`]: crate::asn1::DigestInfo
+#[cfg(feature = "digest")]
+pub(crate) fn digest_info<D: digest::Digest + crate::der::oid::AssociatedOid>(
+	hasher: D,
+) -> Result<crate::asn1::DigestInfo, TightBeamError> {
 	let algorithm = crate::asn1::AlgorithmIdentifier { oid: D::OID, parameters: None };
 	let digest = hasher.finalize();
 	let digest_octet_string = crate::asn1::OctetString::new(&digest[..])?;

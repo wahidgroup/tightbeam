@@ -30,7 +30,9 @@ impl DelaySimulator {
 	/// This is an async function that sleeps for the configured duration.
 	/// In a real DTN scenario, this represents the time for signal propagation
 	/// plus any store-and-forward delays.
-	pub async fn simulate_hop(&self, from: &str, to: &str) -> Result<(), TightBeamError> {
+	pub async fn simulate_hop(&self, from: impl AsRef<str>, to: impl AsRef<str>) -> Result<(), TightBeamError> {
+		let from = from.as_ref();
+		let to = to.as_ref();
 		let hop_key = format!("{}->{}",from, to);
 
 		if let Some(delay) = self.delays.get(&hop_key) {
@@ -41,7 +43,9 @@ impl DelaySimulator {
 	}
 
 	/// Get configured delay for a hop
-	pub fn delay_for(&self, from: &str, to: &str) -> Option<Duration> {
+	pub fn delay_for(&self, from: impl AsRef<str>, to: impl AsRef<str>) -> Option<Duration> {
+		let from = from.as_ref();
+		let to = to.as_ref();
 		let hop_key = format!("{}->{}",from, to);
 		self.delays.get(&hop_key).copied()
 	}

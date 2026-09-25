@@ -3,16 +3,15 @@
 use core::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
-use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Event;
 use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
-use tightbeam::{exactly, wcet, TightBeamError};
+use tightbeam::{exactly, wcet};
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario};
 
-pub(crate) const TASK1: Urn<'static> = Urn::new("test", "event:rma-basic/task1");
-pub(crate) const TASK2: Urn<'static> = Urn::new("test", "event:rma-basic/task2");
+pub(crate) const TASK1: Urn<'static> = tightbeam::urn!("test", "event:rma-basic/task1");
+pub(crate) const TASK2: Urn<'static> = tightbeam::urn!("test", "event:rma-basic/task2");
 
 // Define a real-time process with timing and schedulability constraints
 tb_process_spec! {
@@ -49,7 +48,6 @@ tb_assert_spec! {
 	pub RmaAssertSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(TASK1, exactly!(1)),
 			(TASK2, exactly!(1))
@@ -69,24 +67,16 @@ tb_scenario! {
 			timeout_ms: 500,
 			specs: vec![RmaSchedulableProcess::process()],
 			fail_fast: true,
-			expect_failure: false,
 			..Default::default()
 		})
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				assert!(result.assert_spec.is_some(), "Assert spec should be present");
-				assert!(result.process.is_some(), "Process should be present");
+		.with_hooks(TestHooks::on_pass(|context| {
+				assert!(context.assert_spec().is_some(), "Assert spec should be present");
+				assert!(context.process().is_some(), "Process should be present");
 
-				let constraints = result
-					.timing_constraints
-					.as_ref()
-					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
+				let constraints = context.timing_constraints().expect("the spec test declares timing constraints");
 				assert!(constraints.has_constraint(&Event::from(TASK1)), "Should have task1 constraint");
 				assert!(constraints.has_constraint(&Event::from(TASK2)), "Should have task2 constraint");
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {

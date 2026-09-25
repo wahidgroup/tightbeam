@@ -1,6 +1,7 @@
 //! ECIES-based client handshake orchestrator.
 //!
-//! Implements the client side of the TightBeam ECIES handshake protocol.
+//! This module implements the client side of the TightBeam ECIES handshake
+//! protocol.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -10,81 +11,86 @@ use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use core::marker::PhantomData;
 
 use crate::asn1::OctetString;
+use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::{SignedData, SignerInfo};
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{KeyInit, SessionKeys};
 use crate::crypto::ecies::EciesEphemeral;
 use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
-use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+use crate::crypto::sign::LowSEncoding;
 use crate::crypto::sign::PrehashVerifier;
 use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::utils::{extract_verifying_key_bytes, validate_certificate_expiry};
+use crate::crypto::x509::utils::CertificateExt;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::{client_mux_settings, MuxSettings, SecurityOffer, TransportOffer};
+use crate::transport::handshake::negotiation::{
+	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityOffer, StrengthFloor, TransportOffer,
+};
+use crate::transport::handshake::primitives::KdfSalt;
+use crate::transport::handshake::receipt::ReceiptArtifact;
+use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, certificate_signer_identifier, complete_receipt_artifact, countersign_receipt,
-	match_receipt_to_accept, receipt_from_artifact, signer_for_role, verify_receipt_signer, ReceiptApprover,
-	ReceiptRole, StoredReceipt,
+	approve_or_fail_closed, match_receipt_to_accept, verify_receipt_signer, ReceiptApprover, ReceiptRole, StoredReceipt,
 };
-use crate::transport::handshake::state::HandshakeInvariant;
-use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
-use crate::transport::handshake::utils::{
-	compute_client_auth_digest, compute_ecies_transcript_hash, octet_string_to_32_byte_array, validate_state,
-};
+use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Ecies};
+use crate::transport::handshake::utils::HandshakeOctets;
+use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake,
 };
 use crate::transport::handshake::{DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization};
+use crate::transport::handshake::{EstablishedSession, HandshakeMessage, TunneledMessage};
+use crate::transport::state::ClientIdentity;
+use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
+use crate::ZeroizingArray;
 
 /// Client-side ECIES handshake orchestrator.
 ///
-/// Generic over:
-/// - `P: CryptoProvider` which defines the complete cryptographic suite
-/// - `M`: ECIES message type (curve-specific)
+/// It is generic over two parameters:
+///
+/// - `P: CryptoProvider`, which defines the complete cryptographic suite.
+/// - `M`, the curve-specific ECIES message type.
 pub struct EciesHandshakeClient<P, M>
 where
 	P: CryptoProvider,
 {
-	state: ClientStateMachine,
+	state: ClientStateMachine<Ecies>,
 	client_random: Option<[u8; 32]>,
-	/// Exact DER bytes of the sent `ClientHello`, bound into the transcript
-	/// so a MITM cannot rewrite the offer undetected (CWE-757).
+	/// The exact DER bytes of the sent `ClientHello`. The transcript binds
+	/// them, so a rewritten offer changes the transcript hash (CWE-757).
 	client_hello: Option<Vec<u8>>,
-	base_session_key: Option<[u8; 32]>,
+	base_session_key: Option<ZeroizingArray<32>>,
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
-	aad_domain_tag: Option<&'static [u8]>,
+	aad_domain_tag: &'static [u8],
 	security_offer: Option<SecurityOffer>,
+	strength_floor: StrengthFloor,
 	transport_offer: Option<TransportOffer>,
 	mux_settings: Option<MuxSettings>,
-	selected_profile: Option<SecurityProfileDesc>,
+	selected_profile: Option<RunnableProfile<P>>,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
-	client_certificate: Option<Arc<Certificate>>,
-	client_key_provider: Option<Arc<dyn SigningKeyProvider>>,
+	identity: Option<ClientIdentity<P>>,
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	stored_receipt: Option<StoredReceipt>,
 	epoch_materials: Option<EpochMaterials>,
-	/// Server certificate validated against the trust store, retained
-	/// as the peer identity for post-handshake epoch renewals.
-	server_certificate: Option<Certificate>,
+	server_certificate: Option<Arc<Certificate>>,
 	_phantom_provider: PhantomData<P>,
 	_phantom_message: PhantomData<M>,
-	invariants: HandshakeInvariant,
 }
 
-/// Helper trait for extracting verifying keys from certificates.
+/// Extraction of a verifying key from a certificate.
 pub trait ExtractVerifyingKey: Sized {
+	/// Extract the verifying key from `cert`.
 	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError>;
 }
 
@@ -96,74 +102,63 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EciesPublicKeyOps,
 	<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
-	P::Signature: SignatureEncoding,
+	P::Signature: SignatureEncoding + LowSEncoding,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
 	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey,
 	P::AeadCipher: KeyInit,
 	M: EciesMessageOps,
 {
-	/// Create a new ECIES handshake client.
+	/// Create an ECIES handshake client.
 	///
-	/// # Parameters
-	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
+	/// `aad_domain_tag` defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`.
 	pub fn new(aad_domain_tag: Option<&'static [u8]>) -> Self {
 		Self {
-			state: ClientStateMachine::default(),
+			state: ClientStateMachine::<Ecies>::default(),
 			client_random: None,
 			client_hello: None,
 			base_session_key: None,
 			server_random: None,
 			transcript_hash: None,
-			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
+			aad_domain_tag: aad_domain_tag.unwrap_or(TIGHTBEAM_AAD_DOMAIN_TAG),
 			security_offer: None, // No offer = dealer's choice mode
+			strength_floor: StrengthFloor::default(),
 			transport_offer: None,
 			mux_settings: None,
 			selected_profile: None,
 			certificate_validator: None,
-			client_certificate: None,
-			client_key_provider: None,
+			identity: None,
 			receipt_approver: None,
 			stored_receipt: None,
 			epoch_materials: None,
 			server_certificate: None,
-			invariants: HandshakeInvariant::default(),
 			_phantom_provider: PhantomData,
 			_phantom_message: PhantomData,
 		}
 	}
 
-	/// Create a new ECIES handshake client with optional client identity.
-	///
-	/// # Parameters
-	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption
-	/// - `client_certificate`: Optional client certificate for mutual auth
-	/// - `client_key_provider`: Optional client key provider for mutual auth
-	pub fn new_with_identity(
-		aad_domain_tag: Option<&'static [u8]>,
-		client_certificate: Option<Arc<Certificate>>,
-		client_key_provider: Option<Arc<dyn SigningKeyProvider>>,
-	) -> Self {
+	/// Create an ECIES handshake client that presents `identity`, when one is
+	/// given, for mutual authentication.
+	pub fn new_with_identity(aad_domain_tag: Option<&'static [u8]>, identity: Option<ClientIdentity<P>>) -> Self {
 		Self {
-			state: ClientStateMachine::default(),
+			state: ClientStateMachine::<Ecies>::default(),
 			client_random: None,
 			client_hello: None,
 			base_session_key: None,
 			server_random: None,
 			transcript_hash: None,
-			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
+			aad_domain_tag: aad_domain_tag.unwrap_or(TIGHTBEAM_AAD_DOMAIN_TAG),
 			security_offer: None, // No offer = dealer's choice mode
+			strength_floor: StrengthFloor::default(),
 			transport_offer: None,
 			mux_settings: None,
 			selected_profile: None,
 			certificate_validator: None,
-			client_certificate,
-			client_key_provider,
+			identity,
 			receipt_approver: None,
 			stored_receipt: None,
 			epoch_materials: None,
 			server_certificate: None,
-			invariants: HandshakeInvariant::default(),
 			_phantom_provider: PhantomData,
 			_phantom_message: PhantomData,
 		}
@@ -176,32 +171,39 @@ where
 		self
 	}
 
-	/// Set client identity for mutual authentication.
-	///
-	/// # Parameters
-	/// - `certificate`: The client's X.509 certificate
-	/// - `key_provider`: The client's key provider
+	/// Present `identity`, the client's certificate and the key that proves it,
+	/// for mutual authentication.
 	#[must_use]
-	pub fn with_client_identity(
-		mut self,
-		certificate: Arc<Certificate>,
-		key_provider: Arc<dyn SigningKeyProvider>,
-	) -> Self {
-		self.client_certificate = Some(certificate);
-		self.client_key_provider = Some(key_provider);
+	pub fn with_client_identity(mut self, identity: ClientIdentity<P>) -> Self {
+		self.identity = Some(identity);
 		self
 	}
 
 	/// Set the security profile offer for negotiation.
-	/// If not set, server will pick default profile (dealer's choice mode).
+	///
+	/// Without an offer, the server picks its default profile (dealer's
+	/// choice).
 	#[must_use]
 	pub fn with_security_offer(mut self, offer: SecurityOffer) -> Self {
 		self.security_offer = Some(offer);
 		self
 	}
 
-	/// Set the transport capability offer (multiplexing).
-	/// If not set, the connection stays single-flight.
+	/// Override the minimum-strength policy applied to the server's selection.
+	///
+	/// The default is `DefaultStrengthFloor`, which requires a 256-bit AEAD key
+	/// and a digest of 256 bits or more. The client applies it with or without
+	/// an offer. Pass `NoStrengthFloor` only where weaker profiles must remain
+	/// acceptable.
+	#[must_use]
+	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
+		self.strength_floor = StrengthFloor::with_policy(policy);
+		self
+	}
+
+	/// Set the transport capability offer for multiplexing.
+	///
+	/// Without an offer, the connection stays single-flight.
 	#[must_use]
 	pub fn with_transport_offer(mut self, offer: TransportOffer) -> Self {
 		self.transport_offer = Some(offer);
@@ -211,8 +213,8 @@ where
 	/// Set the receipt approver deciding whether to countersign a
 	/// session receipt and answering its settlement challenge.
 	///
-	/// Without one the client fails closed: challenge-free receipts are
-	/// countersigned, challenge-bearing receipts abort the handshake.
+	/// Without one the client fails closed. It countersigns a challenge-free
+	/// receipt, and a challenge-bearing receipt aborts the handshake.
 	#[must_use]
 	pub fn with_receipt_approver(mut self, approver: Arc<dyn ReceiptApprover>) -> Self {
 		self.receipt_approver = Some(approver);
@@ -224,33 +226,34 @@ where
 		validate_state(self.state.state(), expected)
 	}
 
-	/// Validate server handshake and extract components.
+	/// Decode and validate the server handshake.
 	///
-	/// Fail-closed (CWE-295): a configured certificate validator is
-	/// mandatory. Expiry alone authenticates nobody, so a missing validator
-	/// aborts the handshake instead of silently degrading.
+	/// # Fail closed
+	///
+	/// A configured certificate validator is mandatory (CWE-295). Expiry alone
+	/// authenticates nobody, so a missing validator aborts the handshake.
 	fn validate_and_extract_server_handshake(
 		&self,
-		server_handshake_der: &[u8],
+		server_handshake_der: impl AsRef<[u8]>,
 	) -> Result<ServerHandshake, HandshakeError> {
+		let server_handshake_der = server_handshake_der.as_ref();
 		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
 		let validator = self.certificate_validator.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
 
-		validate_certificate_expiry(&server_handshake.certificate)?;
+		server_handshake.certificate.validate_expiry()?;
 		validator.evaluate(&server_handshake.certificate)?;
 
 		Ok(server_handshake)
 	}
 
-	/// Extract and store server random from handshake.
+	/// Extract and store the server random from the handshake.
 	fn extract_server_random(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
-		let server_random = octet_string_to_32_byte_array(&server_handshake.server_random)?;
+		let server_random = server_handshake.server_random.to_32_byte_array()?;
 		self.server_random = Some(server_random);
-
 		Ok(())
 	}
 
-	/// Compute and store transcript hash.
+	/// Compute and store the transcript hash.
 	fn compute_and_store_transcript_hash(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
 		let client_hello = self.client_hello.as_deref().ok_or(HandshakeError::InvalidState)?;
 		let server_random = self.server_random.ok_or(HandshakeError::InvalidState)?;
@@ -261,119 +264,109 @@ where
 			.subject_public_key
 			.raw_bytes();
 
-		// Bind the negotiated profile and transport capabilities into the
-		// transcript. A tampered security_accept or transport_accept yields
-		// a different hash and fails signature verification.
-		let accept_der = match &server_handshake.security_accept {
-			Some(accept) => accept.to_der()?,
-			None => Vec::new(),
-		};
-		let transport_accept_der = match &server_handshake.transport_accept {
-			Some(accept) => accept.to_der()?,
-			None => Vec::new(),
-		};
+		// The transcript binds the negotiated profile and the transport
+		// capabilities as the bytes that arrived. A tampered `security_accept`
+		// or `transport_accept` yields a different hash and fails signature
+		// verification.
+		let accept_der = server_handshake.security_accept.as_ref().map(WireDer::der).unwrap_or_default();
+		let transport_accept_der = server_handshake.transport_accept.as_ref().map(WireDer::der).unwrap_or_default();
 
 		let transcript_digest = compute_ecies_transcript_hash::<P::Digest>(
 			client_hello,
 			&server_random,
 			spki_bytes,
-			&accept_der,
-			&transport_accept_der,
+			accept_der,
+			transport_accept_der,
 		)?;
 		self.transcript_hash = Some(transcript_digest);
 
-		// Invariant: transcript becomes immutable after hash computed
-		self.invariants.lock_transcript()?;
+		// Invariant: the transcript is immutable once its hash is computed.
 
 		Ok(())
 	}
 
-	/// Generate and store base session key.
+	/// Generate and store the base session key.
 	fn generate_base_session_key(&mut self) -> Result<(), HandshakeError> {
 		let base_key = generate_nonce::<32>(None)?;
-		self.base_session_key = Some(base_key);
+		self.base_session_key = Some(ZeroizingArray::new(base_key));
 
 		Ok(())
 	}
 
-	/// Build ClientHello message.
-	///
-	/// # Returns
-	/// DER-encoded ClientHello
-	pub fn build_client_hello(&mut self) -> Result<Vec<u8>, HandshakeError> {
-		// 1. Validation
+	/// Build the ClientHello message.
+	pub fn build_client_hello(&mut self) -> Result<ClientHello, HandshakeError> {
+		// 1. Validate the state.
 		self.validate_expected_state(ClientHandshakeState::Init)?;
 
-		// 2. Generate client random
+		// 2. Generate the client random.
 		let client_random = generate_nonce::<32>(None)?;
 		self.client_random = Some(client_random);
 
-		// 3. Build ClientHello
+		// 3. Build the ClientHello.
 		let client_hello = ClientHello {
 			client_random: OctetString::new(client_random)?,
 			security_offer: self.security_offer.to_owned(),
 			transport_offer: self.transport_offer.to_owned(),
 		};
 
-		// Retain the exact DER for transcript binding: the full
-		// ClientHello (offer included) is hashed on both sides.
+		// Retain the exact DER for transcript binding, because both sides
+		// hash the full ClientHello with its offers.
 		let client_hello_der = client_hello.to_der()?;
 		self.client_hello = Some(client_hello_der.to_owned());
 
-		// Transition: mark hello sent
+		// The hello is sent, so the state moves to HelloSent.
 		self.state.transition(ClientHandshakeState::HelloSent)?;
-		Ok(client_hello_der)
+		Ok(client_hello)
 	}
 
-	/// Process ServerHandshake message and build ClientKeyExchange.
-	///
-	/// # Parameters
-	/// - `server_handshake_der`: DER-encoded ServerHandshake from server
-	///
-	/// # Returns
-	/// DER-encoded ClientKeyExchange
-	pub async fn process_server_handshake(&mut self, server_handshake_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		// 1. Validation: must have sent hello
+	/// Process the ServerHandshake message and build the ClientKeyExchange to
+	/// send next.
+	pub async fn process_server_handshake(
+		&mut self,
+		server_handshake_der: impl AsRef<[u8]>,
+	) -> Result<ClientKeyExchange, HandshakeError> {
+		let server_handshake_der = server_handshake_der.as_ref();
+		// 1. Validate that the hello was sent.
 		self.validate_expected_state(ClientHandshakeState::HelloSent)?;
 		let _client_random_check = self.client_random.ok_or(HandshakeError::InvalidState)?;
 
-		// 2. Transition to ServerHelloReceived
+		// 2. Transition to ServerHelloReceived.
 		self.state.transition(ClientHandshakeState::ServerHelloReceived)?;
 
-		// 3. Decode and validate server handshake
+		// 3. Decode and validate the server handshake.
 		let mut server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
 
-		// 4. Validate profile negotiation
+		// 4. Validate the profile negotiation.
 		self.validate_profile_selection(&server_handshake)?;
 
-		// 5. Validate transport capability negotiation (fails closed on an
-		// accept the client never offered)
+		// 5. Validate the transport capability negotiation. An accept that the
+		//    client never offered fails closed.
 		let offer = self.transport_offer.as_ref();
-		let accept = server_handshake.transport_accept.as_ref();
-		self.mux_settings = client_mux_settings(offer, accept)?;
+		let accept = server_handshake.transport_accept.as_ref().map(WireDer::value);
+		self.mux_settings = MuxSettings::for_client(offer, accept)?;
 
-		// 6. Extract server random
+		// 6. Extract the server random.
 		self.extract_server_random(&server_handshake)?;
 
-		// 7. Verify server signature
+		// 7. Verify the server signature.
 		self.verify_server_handshake_signature(&server_handshake)?;
 
-		// 8. Validate, approve, and countersign the session receipt
-		// (fails closed on mismatch). Consumes the receipt artifact out
-		// of the decoded message: its owner is the stored receipt.
+		// 8. Validate, approve, and countersign the session receipt, which
+		//    fails closed on a mismatch. The step consumes the receipt artifact
+		//    out of the decoded message, because the stored receipt owns it.
 		let pending_receipt = self.process_session_receipt(&mut server_handshake).await?;
 
-		// 9. Generate and encrypt session key. The countersignature (and
-		// the settlement answer bound inside it) folds into the ECIES
-		// payload, never onto the cleartext wire. After encoding it
-		// moves into the completed stored artifact (zero copy).
+		// 9. Generate and encrypt the session key. The countersignature, with
+		//    the settlement answer bound inside it, folds into the ECIES
+		//    payload, which keeps it confidential. After encoding it moves into
+		//    the completed stored artifact with zero copies.
 		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake, pending_receipt)?;
 
-		// 10. Handle mutual authentication (signature commits to encrypted_bytes)
+		// 10. Handle mutual authentication. The signature commits to `encrypted_bytes`.
 		let (client_certificate, client_signature) =
 			self.prepare_client_auth(&server_handshake, &encrypted_bytes).await?;
 
-		// 11. Build and encode ClientKeyExchange
+		// 11. Build and encode the ClientKeyExchange.
 		let client_kex = ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
 			#[cfg(feature = "x509")]
@@ -382,38 +375,37 @@ where
 			client_signature,
 		};
 
-		// 12. Retain the validated server certificate for post-handshake renewals
-		self.server_certificate = Some(server_handshake.certificate);
+		// 12. Retain the validated server certificate for post-handshake renewals.
+		self.server_certificate = Some(Arc::new(server_handshake.certificate));
 
-		// 13. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
+		// 13. Advance to KeyExchangeSent. Step 2 entered ServerHelloReceived.
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
-		Ok(client_kex.to_der()?)
+		Ok(client_kex)
 	}
 
-	/// Validate server's profile selection against client's offer.
-	///
-	/// Handles both negotiation mode (client sent offer) and dealer's choice mode (no offer).
+	/// Validate the server's profile selection against the client's offer and
+	/// the strength floor.
 	fn validate_profile_selection(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
-		let accept = server_handshake.security_accept.as_ref().ok_or(HandshakeError::InvalidState)?;
-		match &self.security_offer {
-			Some(offer) => {
-				// Mode 1: Negotiation - verify server's selection is from our offer
-				if !offer.profiles.contains(&accept.profile) {
-					return Err(HandshakeError::InvalidProfileSelection);
-				}
-				self.selected_profile = Some(accept.profile);
-			}
-			None => {
-				// Mode 2: Dealer's choice - accept whatever server picked
-				self.selected_profile = Some(accept.profile);
+		let security_accept = server_handshake.security_accept.as_ref();
+		let accept = security_accept.map(WireDer::value).ok_or(HandshakeError::InvalidState)?;
+
+		// With an offer, the server's selection must come from it. Without
+		// one, the server chooses, and the floor still bounds that choice.
+		if let Some(offer) = &self.security_offer {
+			if !offer.profiles.contains(&accept.profile) {
+				return Err(HandshakeError::InvalidProfileSelection);
 			}
 		}
+
+		let profile = RunnableProfile::<P>::try_from(accept.profile)?;
+		self.strength_floor.admit(&profile)?;
+		self.selected_profile = Some(profile);
 
 		Ok(())
 	}
 
-	/// Verify server's signature over the transcript hash.
+	/// Verify the server's signature over the transcript hash.
 	fn verify_server_handshake_signature(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
 		let verifying_key = self.extract_verifying_key(&server_handshake.certificate)?;
 		self.compute_and_store_transcript_hash(server_handshake)?;
@@ -422,35 +414,35 @@ where
 		self.verify_server_signature(&verifying_key, &transcript_digest, server_handshake.signature.as_bytes())
 	}
 
-	/// Generate base session key and ECIES-encrypt it to the server.
+	/// Generate the base session key and ECIES-encrypt it to the server.
 	///
-	/// Pending receipt ack passes through encryption by value so
-	/// `SignerInfo` is not cloned into the stored receipt.
+	/// The pending receipt ack passes through encryption by value, so its
+	/// `SignerInfo` moves into the stored receipt without a clone.
 	fn generate_and_encrypt_session_key(
 		&mut self,
 		server_handshake: &ServerHandshake,
 		pending_receipt: Option<(SignedData, SignerInfo)>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		self.generate_base_session_key()?;
-		let base_key = self.base_session_key.ok_or(HandshakeError::InvalidState)?;
-		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
 
+		let base_key = self.base_session_key.as_deref().ok_or(HandshakeError::InvalidState)?;
+		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
 		let (artifact, receipt_ack) = match pending_receipt {
 			Some((artifact, ack)) => (Some(artifact), Some(ack)),
 			None => (None, None),
 		};
 
 		let (encrypted_bytes, receipt_ack) = self.perform_ecies_encryption(
-			&base_key,
+			base_key,
 			&client_random,
 			receipt_ack,
 			&server_handshake.certificate,
-			self.aad_domain_tag,
+			Some(self.aad_domain_tag),
 		)?;
 
 		if let Some(artifact) = artifact {
 			let countersignature = receipt_ack.ok_or(HandshakeError::InvalidState)?;
-			let completed = complete_receipt_artifact(artifact, countersignature)?;
+			let completed = artifact.complete(countersignature)?;
 			self.stored_receipt = Some(StoredReceipt::try_from(completed)?);
 		}
 
@@ -459,46 +451,47 @@ where
 
 	/// Validate, approve, and countersign the server's session receipt.
 	///
-	/// Budget-bearing accepts demand a receipt artifact whose body
-	/// matches the negotiated session and whose server `SignerInfo`
-	/// verifies. Anything else fails closed. The approver (or the
-	/// fail-closed default) answers the settlement challenge, and the
-	/// client `SignerInfo` binds receipt body plus answer under the
-	/// client identity (non-repudiation).
+	/// Budget-bearing accepts demand a receipt artifact whose body matches the
+	/// negotiated session and whose server `SignerInfo` verifies. Anything else
+	/// fails closed.
 	///
-	/// Returns the pending artifact plus the countersignature destined
-	/// for the confidential key-exchange payload. Completion is
-	/// deferred until after payload encoding so the `SignerInfo` moves
-	/// (never copies) into the stored artifact.
+	/// - The approver, or the fail-closed default, answers the settlement challenge.
+	/// - The client `SignerInfo` binds the receipt body plus the answer under
+	///   the client identity (non-repudiation).
+	///
+	/// # Completion
+	///
+	/// It returns the pending artifact plus the countersignature destined for
+	/// the confidential key-exchange payload. Completion waits until after
+	/// payload encoding, so the `SignerInfo` moves into the stored artifact.
 	async fn process_session_receipt(
 		&mut self,
 		server_handshake: &mut ServerHandshake,
 	) -> Result<Option<(SignedData, SignerInfo)>, HandshakeError> {
-		let granted = server_handshake
-			.transport_accept
-			.as_ref()
-			.and_then(|accept| accept.granted_budgets);
-
-		let credit_unit = server_handshake.transport_accept.as_ref().map(|accept| accept.credit_unit);
+		let accepted = server_handshake.transport_accept.as_ref().map(WireDer::value);
+		let granted = accepted.and_then(|accept| accept.granted_budgets);
+		let credit_unit = accepted.map(|accept| accept.credit_unit);
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
-		// Consume the artifact: the completed copy this function stores
-		// is its only owner from here on.
+		// Consume the artifact, because the completed copy that this function
+		// stores is its only owner from here on.
 		let artifact = server_handshake.session_receipt.take();
-		let parsed_receipt = artifact.as_ref().map(receipt_from_artifact).transpose()?;
+		let parsed_receipt = artifact.as_ref().map(ReceiptArtifact::receipt).transpose()?;
 		let Some(receipt) =
 			match_receipt_to_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
 		else {
 			return Ok(None);
 		};
 
-		// Server SignerInfo over the receipt body: third-party verifiable
-		// agreement, so an unsigned receipt is no receipt at all.
+		// The server SignerInfo over the receipt body makes the agreement
+		// verifiable by a third party, so an unsigned receipt is no receipt.
 		let artifact = artifact.ok_or(HandshakeError::ReceiptMissing)?;
-		let server_signer = signer_for_role(&artifact, ReceiptRole::Server)?.ok_or(HandshakeError::ReceiptMissing)?;
+		let server_signer = artifact
+			.signer_for_role(ReceiptRole::Server)?
+			.ok_or(HandshakeError::ReceiptMissing)?;
 
 		let receipt_der = receipt.to_der()?;
-		let expected_sid = certificate_signer_identifier::<P::Digest>(&server_handshake.certificate)?;
+		let expected_sid = server_handshake.certificate.signer_identifier::<P::Digest>()?;
 		let verifying_key = self.extract_verifying_key(&server_handshake.certificate)?;
 		verify_receipt_signer::<P::Digest, P::Signature, _>(
 			&receipt_der,
@@ -508,122 +501,117 @@ where
 			&verifying_key,
 		)?;
 
-		// Countersigning demands a full client identity (certificate for
-		// the server's verification plus signing key): budgets without
-		// mutual authentication fail closed. Checked before approval:
-		// approving can spend an irreversible settlement answer, so every
-		// local precondition must already hold.
-		if self.client_certificate.is_none() {
-			return Err(HandshakeError::MutualAuthRequired);
-		}
+		// Countersigning demands a client identity, so a budget-bearing
+		// session without mutual authentication fails closed. The check runs
+		// before approval, because approving can spend an irreversible
+		// settlement answer, so every local precondition must already hold.
+		let identity = self.identity.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+		let key_provider = identity.signing_provider();
 
-		let key_provider: &Arc<dyn SigningKeyProvider> =
-			self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-
-		// Approve the receipt and answer its challenge (fail-closed
-		// without an approver).
+		// With no approver, approval fails closed.
 		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), &receipt).await?;
 		let answer = response.as_ref().map(OctetString::as_bytes);
-		let countersignature = countersign_receipt::<P::Digest>(&receipt, answer, key_provider.as_ref()).await?;
+		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider).await?;
 
 		Ok(Some((artifact, countersignature)))
 	}
 
-	/// Prepare client authentication materials if required or available.
+	/// Prepare the client authentication materials when the server requires
+	/// them or the client holds an identity.
 	///
-	/// The signature covers `Digest(transcript_hash || encrypted_data || cert_der)`
-	/// so it cannot be spliced onto a different key exchange or identity.
-	///
-	/// Returns tuple of (optional certificate, optional signature).
+	/// The signature covers `Digest(transcript_hash || encrypted_data ||
+	/// cert_der)`, so it binds to this key exchange and this identity alone.
+	/// The result is the optional certificate and the optional signature.
 	async fn prepare_client_auth(
 		&self,
 		server_handshake: &ServerHandshake,
-		encrypted_data: &[u8],
+		encrypted_data: impl AsRef<[u8]>,
 	) -> Result<(Option<Certificate>, Option<OctetString>), HandshakeError> {
+		let encrypted_data = encrypted_data.as_ref();
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
-
-		let cert = match (&self.client_certificate, server_handshake.client_cert_required) {
-			(Some(cert), _) => cert,
+		let identity = match (&self.identity, server_handshake.client_cert_required) {
+			(Some(identity), _) => identity,
 			(None, true) => return Err(HandshakeError::MutualAuthRequired),
 			(None, false) => return Ok((None, None)),
 		};
-		let key_provider = match (&self.client_key_provider, server_handshake.client_cert_required) {
-			(Some(provider), _) => provider,
-			(None, true) => return Err(HandshakeError::MutualAuthRequired),
-			(None, false) => return Err(HandshakeError::InvalidState),
-		};
 
+		let cert = identity.certificate();
 		let cert_der = cert.to_der()?;
 		let auth_digest = compute_client_auth_digest::<P::Digest>(&transcript_digest, encrypted_data, &cert_der)?;
-		let signature_bytes = key_provider.sign_prehash(&auth_digest).await?;
+		let signature_bytes = identity.signing_provider().sign_prehash(&auth_digest).await?;
 
 		let cert = Certificate::clone(cert);
 		let signature = OctetString::new(signature_bytes)?;
 		Ok((Some(cert), Some(signature)))
 	}
-	/// Complete the handshake and derive the directional session keys.
-	///
-	/// # Returns
-	/// Client-to-server and server-to-client AEAD ciphers from the provider
+	/// Complete the handshake and derive the provider's client-to-server and
+	/// server-to-client AEAD ciphers.
 	pub fn complete(&mut self) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError> {
-		// 1. Validation
+		// 1. Validate the state.
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
-		// 2. Derive final session keys
+		// 2. Derive the final session keys.
 		let base_key = self.base_session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
 		let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 		let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 
-		// Concatenate client_random || server_random as salt for AEAD derivation
+		// The AEAD derivation salt is `client_random || server_random`.
 		let mut salt = Zeroizing::new([0u8; 64]);
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 
 		let salt_bytes = salt.as_slice();
-		let session_ciphers = self.derive_directional_aead(base_key, salt_bytes)?;
+		let session_ciphers = self.derive_directional_aead(base_key.as_slice(), KdfSalt::new(salt_bytes))?;
 
-		// Invariant: AEAD key derivation occurs exactly once after transcript locked
-		self.invariants.derive_aead_once()?;
+		// Invariant: AEAD key derivation runs exactly once, after the
+		// transcript locks.
 
-		// 3. Seed epoch materials for post-handshake renewal
+		// 3. Seed the epoch materials for post-handshake renewal.
 		if let Some(transcript_hash) = self.transcript_hash {
-			let materials = derive_epoch_materials::<P>(base_key, salt_bytes, transcript_hash)?;
+			let epoch_salt = KdfSalt::new(salt_bytes);
+			let materials = derive_epoch_materials::<P>(base_key.as_slice(), epoch_salt, transcript_hash)?;
 			self.epoch_materials = Some(materials);
 		}
 
-		// 4. Transition to complete
+		// 4. Transition to the complete state.
 		self.state.transition(ClientHandshakeState::Completed)?;
 
-		// 5. Clear sensitive data in place (Option impl zeroes payload, then None)
-		self.base_session_key.zeroize();
-		self.client_random.zeroize();
-		self.server_random.zeroize();
+		// 5. Clear the sensitive data in place.
+		self.clear_sensitive_data();
 
 		Ok(session_ciphers)
 	}
 
-	/// Get the current handshake state.
+	/// Erase the ephemeral ECIES key material after session establishment
+	/// (CWE-226).
+	fn clear_sensitive_data(&mut self) {
+		self.base_session_key.zeroize();
+		self.client_random.zeroize();
+		self.server_random.zeroize();
+	}
+
+	/// The current handshake state.
 	pub fn state(&self) -> ClientHandshakeState {
 		self.state.state()
 	}
 
-	/// Check if handshake is complete.
+	/// Whether the handshake is complete.
 	pub fn is_complete(&self) -> bool {
 		self.state.state().is_completed()
 	}
 
-	/// Get the transcript hash (if available).
+	/// The transcript hash, once the server handshake sets it.
 	pub fn transcript_hash(&self) -> Option<[u8; 32]> {
 		self.transcript_hash
 	}
 
-	/// Get the negotiated multiplexing settings (if any).
+	/// The negotiated multiplexing settings, if any.
 	pub fn negotiated_mux(&self) -> Option<MuxSettings> {
 		self.mux_settings
 	}
 
-	/// Get the dual-signed session receipt (if the completed handshake
-	/// carried budgets).
+	/// The dual-signed session receipt, when the completed handshake carried
+	/// budgets.
 	pub fn session_receipt(&self) -> Option<&StoredReceipt> {
 		self.stored_receipt.as_ref()
 	}
@@ -633,12 +621,40 @@ where
 		self.epoch_materials.take()
 	}
 
-	/// Validated server certificate retained for post-handshake epoch renewals.
+	/// The validated server certificate, retained for post-handshake epoch
+	/// renewals.
 	pub fn peer_certificate(&self) -> Option<&Certificate> {
-		self.server_certificate.as_ref()
+		self.server_certificate.as_deref()
 	}
 
-	// Helper methods
+	/// Complete the handshake and take everything it agreed.
+	///
+	/// The mutual-auth path reaches this through [`ClientHandshakeProtocol`],
+	/// and the client-identity-free path calls it directly, so both read the
+	/// session terms the same way.
+	///
+	/// [`ClientHandshakeProtocol`]: crate::transport::handshake::ClientHandshakeProtocol
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the handshake has no negotiated
+	///   profile, so it agreed no AEAD algorithm.
+	#[cfg(feature = "aead")]
+	pub fn take_established(&mut self) -> Result<EstablishedSession, HandshakeError>
+	where
+		P::AeadCipher: KeyInit + 'static,
+	{
+		// The inherent method is the one home for state validation, AEAD
+		// derivation, invariants, and cleanup.
+		let ciphers = self.complete()?;
+
+		let keys = SessionKeys::for_client(ciphers);
+		let mux = self.mux_settings;
+		let receipt = self.stored_receipt.take().map(Arc::new);
+		let epoch = self.epoch_materials.take();
+		let peer = self.server_certificate.as_ref().map(Arc::clone);
+		Ok(EstablishedSession::new(keys, mux, receipt, peer, epoch))
+	}
 
 	fn extract_verifying_key(&self, cert: &Certificate) -> Result<P::VerifyingKey, HandshakeError> {
 		P::VerifyingKey::extract_from_certificate(cert)
@@ -651,16 +667,14 @@ where
 		signature_bytes: &[u8],
 	) -> Result<(), HandshakeError> {
 		let signature = P::Signature::try_from(signature_bytes).map_err(|e| e.into())?;
-
-		verifying_key.verify_prehash(digest, &signature)?;
-
+		signature.verify_prehash(verifying_key, digest)?;
 		Ok(())
 	}
 
 	/// Encrypt the session payload to the server's public key.
 	///
-	/// Hands the `receipt_ack` back after encoding: the caller moves it
-	/// into the completed stored artifact instead of cloning it.
+	/// It hands the `receipt_ack` back after encoding, and the caller moves it
+	/// into the completed stored artifact.
 	fn perform_ecies_encryption(
 		&self,
 		base_key: &[u8; 32],
@@ -675,7 +689,7 @@ where
 			receipt_ack,
 		};
 
-		// The DER buffer holds the base session key: wiped when dropped,
+		// The DER buffer holds the base session key, so it wipes when dropped,
 		// along with the transient OCTET STRING copy inside the payload.
 		let plaintext = Zeroizing::new(payload.to_der()?);
 		payload.base_key.into_bytes().zeroize();
@@ -689,8 +703,8 @@ where
 				.raw_bytes(),
 		)?;
 
-		// Ephemeral ECIES randomness comes straight from the OS CSPRNG;
-		// the provider abstraction covers KDF/AEAD, not entropy.
+		// Ephemeral ECIES randomness comes straight from the OS CSPRNG, because
+		// the provider abstraction covers the KDF and the AEAD and not entropy.
 		let encrypted_message = encrypt::<_, _, _, M, P::Kdf, P::AeadCipher>(
 			&recipient_pubkey,
 			plaintext.as_slice(),
@@ -702,71 +716,64 @@ where
 	}
 }
 
-// ============================================================================
-// Common Handshake Trait Implementations
-// ============================================================================
-
 impl<P, M> HandshakeFinalization<P> for EciesHandshakeClient<P, M>
 where
 	P: CryptoProvider,
 {
-	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<RunnableProfile<P>> {
 		self.selected_profile
 	}
 }
 
 impl<P, M> HandshakeAlertHandler for EciesHandshakeClient<P, M> where P: CryptoProvider {}
 
-// ============================================================================
-// ClientHandshakeProtocol Implementation
-// ============================================================================
-
 impl<P, M> ClientHandshakeProtocol for EciesHandshakeClient<P, M>
 where
-	P: CryptoProvider + Send + Sync,
+	P: CryptoProvider + Send + Sync + 'static,
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EciesPublicKeyOps,
 	<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
-	P::Signature: SignatureEncoding + Send + Sync,
+	P::Signature: SignatureEncoding + LowSEncoding + Send + Sync,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
 	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey + Send + Sync,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
-	M: EciesMessageOps + Send + Sync,
+	M: EciesMessageOps + Send + Sync + 'static,
 {
 	type Error = HandshakeError;
 
-	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<Vec<u8>, Self::Error>> {
-		Box::pin(async move { self.build_client_hello() })
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<HandshakeMessage, Self::Error>> {
+		Box::pin(async move {
+			// ECIES tunnels its own messages: the hello travels signed.
+			let client_hello = self.build_client_hello()?;
+			let signed_data = SignedData::try_from(&client_hello)?;
+			HandshakeMessage::try_from(signed_data)
+		})
 	}
 
-	fn handle_response<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
-	where
-		'b: 'a,
-	{
+	fn handle_response<'a>(
+		&'a mut self,
+		msg: HandshakeMessage,
+	) -> MaybeSendFuture<'a, Result<Option<HandshakeMessage>, Self::Error>> {
 		Box::pin(async move {
-			// Process server handshake and build client key exchange
-			let client_kex = self.process_server_handshake(msg).await?;
-			Ok(Some(client_kex))
+			// ECIES tunnels its messages inside the containers.
+			// The server handshake is read from the bytes it arrived as.
+			let signed_data = msg.signed()?;
+			let server_handshake = signed_data.value().tunneled_der()?;
+
+			let client_kex = self.process_server_handshake(server_handshake).await?;
+			let enveloped_data = EnvelopedData::try_from(&client_kex)?;
+			Ok(Some(HandshakeMessage::try_from(enveloped_data)?))
 		})
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
+	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, Result<EstablishedSession, Self::Error>> {
 		Box::pin(async move {
-			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
-			// Delegate to the inherent method: single source of truth for state
-			// validation, AEAD derivation, invariants, and cleanup.
-			let ciphers = EciesHandshakeClient::complete(self)?;
-
-			Ok(SessionKeys::for_client(
-				ciphers.client_to_server,
-				ciphers.server_to_client,
-				aead_oid,
-			))
+			let mut client = self;
+			EciesHandshakeClient::take_established(&mut client)
 		})
 	}
 
@@ -775,33 +782,14 @@ where
 	}
 
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
-		self.selected_profile
-	}
-
-	fn negotiated_mux(&self) -> Option<MuxSettings> {
-		EciesHandshakeClient::negotiated_mux(self)
-	}
-
-	fn session_receipt(&self) -> Option<&StoredReceipt> {
-		EciesHandshakeClient::session_receipt(self)
-	}
-
-	#[cfg(feature = "x509")]
-	fn peer_certificate(&self) -> Option<&Certificate> {
-		EciesHandshakeClient::peer_certificate(self)
-	}
-
-	#[cfg(feature = "aead")]
-	fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
-		EciesHandshakeClient::take_epoch_materials(self)
+		self.selected_profile.map(|profile| profile.descriptor())
 	}
 }
 
-// Implement helper trait for secp256k1 verifying key
 #[cfg(feature = "secp256k1")]
 impl ExtractVerifyingKey for Secp256k1VerifyingKey {
 	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError> {
-		let public_key_bytes = extract_verifying_key_bytes(cert);
+		let public_key_bytes = cert.verifying_key_bytes();
 		let public_key = k256::PublicKey::from_sec1_bytes(public_key_bytes)?;
 		Ok(Self::from(public_key))
 	}
@@ -816,13 +804,11 @@ mod tests {
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::PrehashSigner;
+	use crate::der::asn1::ObjectIdentifier;
 	use crate::der::Encode;
-	use crate::oids::{
-		AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256, HASH_SHA3_384, HASH_SHA3_512,
-		SIGNER_ECDSA_WITH_SHA3_512,
-	};
+	use crate::oids::{HASH_SHA3_384, HASH_SHA3_512};
 	use crate::random::generate_nonce;
-	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
+	use crate::transport::handshake::negotiation::{NegotiationError, ProfileStrength, SecurityAccept, SecurityOffer};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::ServerHandshake;
 
@@ -836,7 +822,7 @@ mod tests {
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 
 		// When: Client builds client hello
-		let client_hello_der = client.build_client_hello()?;
+		let client_hello_der = client.build_client_hello()?.to_der()?;
 		assert_eq!(client.state(), ClientHandshakeState::HelloSent); // Hello sent
 		assert!(client.client_random.is_some());
 
@@ -857,16 +843,15 @@ mod tests {
 
 		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 		let server_handshake_der =
-			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
+			create_test_server_handshake(&test_cert.certificate, &server_random, signature_bytes.to_bytes())?;
 
-		// When: Client processes the server handshake
-		let client_kex_der = client.process_server_handshake(&server_handshake_der).await?;
+		// When: Client processes the server handshake. The test asserts on the
+		// state the call leaves behind, not on the message it returns.
+		client.process_server_handshake(&server_handshake_der).await?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		assert!(client.base_session_key.is_some());
 		assert!(client.transcript_hash.is_some());
 
-		// And: Client key exchange message is valid
-		let _client_kex = ClientKeyExchange::from_der(&client_kex_der)?;
 		// When: Client completes the handshake
 		let _session_key = client.complete()?;
 
@@ -877,12 +862,12 @@ mod tests {
 		Ok(())
 	}
 
-	/// A client without a certificate validator must abort instead of
+	/// A client without a certificate validator aborts, ahead of
 	/// degrading to expiry-only server authentication (CWE-295).
 	#[tokio::test]
 	async fn test_missing_validator_fails_closed() -> Result<(), Box<dyn Error>> {
 		let mut client = TestEciesClientBuilder::new().build();
-		let client_hello_der = client.build_client_hello()?;
+		let client_hello_der = client.build_client_hello()?.to_der()?;
 
 		let test_cert = create_test_certificate();
 		let server_random = generate_nonce::<32>(None)?;
@@ -900,7 +885,7 @@ mod tests {
 		);
 		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 		let server_handshake_der =
-			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
+			create_test_server_handshake(&test_cert.certificate, &server_random, signature_bytes.to_bytes())?;
 
 		let result = client.process_server_handshake(&server_handshake_der).await;
 		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
@@ -927,100 +912,138 @@ mod tests {
 		Ok(())
 	}
 
-	/// Test client-side profile validation
+	/// A descriptor that names a digest the default provider does not run.
+	fn foreign_profile(digest: ObjectIdentifier) -> SecurityProfileDesc {
+		SecurityProfileDesc { digest: Some(digest), ..create_default_test_profile() }
+	}
+
+	type DefaultEciesClient = EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>;
+
+	/// A client that trusts `test_cert`, with its `ClientHello` DER.
+	fn profile_test_client(
+		test_cert: &TestCertificate,
+		offer: Option<SecurityOffer>,
+	) -> Result<(DefaultEciesClient, Vec<u8>), Box<dyn Error>> {
+		let mut client = TestEciesClientBuilder::new()
+			.with_trusted_certificate(test_cert.certificate.to_owned())
+			.build();
+		if let Some(offer) = offer {
+			client = client.with_security_offer(offer);
+		}
+
+		let hello = client.build_client_hello()?.to_der()?;
+		Ok((client, hello))
+	}
+
+	/// A `ServerHandshake` signed by `test_cert` that accepts `profile`.
+	fn signed_server_response(
+		test_cert: &TestCertificate,
+		client_hello_der: &[u8],
+		profile: SecurityProfileDesc,
+	) -> Result<Vec<u8>, Box<dyn Error>> {
+		let server_random = [2u8; 32];
+		let accept_der = SecurityAccept::new(profile).to_der()?;
+		let server_public_key = test_cert
+			.certificate
+			.tbs_certificate
+			.subject_public_key_info
+			.subject_public_key
+			.raw_bytes();
+		let transcript_hash =
+			compute_test_transcript_hash(client_hello_der, &server_random, server_public_key, &accept_der);
+
+		let signature: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
+		let response = ServerHandshake {
+			certificate: test_cert.certificate.to_owned(),
+			server_random: OctetString::new(server_random)?,
+			signature: OctetString::new(signature.to_bytes().to_vec())?,
+			security_accept: Some(WireDer::new(SecurityAccept::new(profile))?),
+			client_cert_required: false,
+			transport_accept: None,
+			session_receipt: None,
+		};
+		Ok(response.to_der()?)
+	}
+
 	#[tokio::test]
-	async fn test_client_profile_validation() -> Result<(), Box<dyn Error>> {
-		let mk_profile = |id: u8| SecurityProfileDesc {
-			digest: Some(match id {
-				1 => HASH_SHA3_256,
-				2 => HASH_SHA3_384,
-				_ => HASH_SHA3_512,
-			}),
-			aead: Some(AES_256_GCM),
-			aead_key_size: Some(32),
-			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
-			curve: Some(CURVE_SECP256K1),
-			key_wrap: Some(AES_256_WRAP),
-			kem: None,
-		};
-
-		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));
+	async fn a_client_accepts_an_offered_profile_it_runs() -> Result<(), Box<dyn Error>> {
 		let test_cert = create_test_certificate();
+		let native = create_default_test_profile();
+		let offer = SecurityOffer::new(vec![foreign_profile(HASH_SHA3_384), native]);
+		let (mut client, hello) = profile_test_client(&test_cert, Some(offer))?;
+		let response = signed_server_response(&test_cert, &hello, native)?;
 
-		// Helper to create client with security offer and build hello
-		#[allow(clippy::type_complexity)]
-		let setup_client = |offer: Option<SecurityOffer>| -> Result<
-			(EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>, Vec<u8>),
-			Box<dyn Error>,
-		> {
-			let mut client = TestEciesClientBuilder::new()
-				.with_trusted_certificate(test_cert.certificate.to_owned())
-				.build();
-			if let Some(offer) = offer {
-				client = client.with_security_offer(offer);
-			}
+		client.process_server_handshake(&response).await?;
 
-			let hello = client.build_client_hello()?;
-			Ok((client, hello))
-		};
+		assert_eq!(client.selected_profile.map(|profile| profile.descriptor()), Some(native));
+		Ok(())
+	}
 
-		// Helper to create signed server handshake
-		let create_server_response = |client_hello_der: &[u8],
-		                              server_random: [u8; 32],
-		                              accepted_profile: &SecurityProfileDesc|
-		 -> Result<Vec<u8>, Box<dyn Error>> {
-			let accept_der = SecurityAccept::new(*accepted_profile).to_der()?;
-			let transcript_hash = compute_test_transcript_hash(
-				client_hello_der,
-				&server_random,
-				test_cert
-					.certificate
-					.tbs_certificate
-					.subject_public_key_info
-					.subject_public_key
-					.raw_bytes(),
-				&accept_der,
-			);
-			let signature: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
-			let signature_bytes = signature.to_bytes().to_vec();
+	#[tokio::test]
+	async fn a_client_refuses_a_profile_it_did_not_offer() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let offer = SecurityOffer::new(vec![foreign_profile(HASH_SHA3_384)]);
+		let (mut client, hello) = profile_test_client(&test_cert, Some(offer))?;
+		let response = signed_server_response(&test_cert, &hello, create_default_test_profile())?;
 
-			let response = ServerHandshake {
-				certificate: test_cert.certificate.to_owned(),
-				server_random: OctetString::new(server_random)?,
-				signature: OctetString::new(signature_bytes)?,
-				security_accept: Some(SecurityAccept::new(*accepted_profile)),
-				client_cert_required: false,
-				transport_accept: None,
-				session_receipt: None,
-			};
-			Ok(response.to_der()?)
-		};
+		let result = client.process_server_handshake(&response).await;
 
-		// Test 1: Client offers [A, B], server accepts B -> OK
-		{
-			let (mut client, client_hello_der) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
-			let server_response = create_server_response(&client_hello_der, [2u8; 32], &p_b)?;
-			let _kex = client.process_server_handshake(&server_response).await?;
-			assert_eq!(client.selected_profile, Some(p_b));
+		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_dealers_choice_client_accepts_a_profile_it_runs() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let native = create_default_test_profile();
+		let (mut client, hello) = profile_test_client(&test_cert, None)?;
+		let response = signed_server_response(&test_cert, &hello, native)?;
+
+		client.process_server_handshake(&response).await?;
+
+		assert_eq!(client.selected_profile.map(|profile| profile.descriptor()), Some(native));
+		Ok(())
+	}
+
+	// A signed accept that names an algorithm the provider does not run is
+	// refused, so the session never runs under a false identity.
+	#[tokio::test]
+	async fn a_dealers_choice_client_refuses_a_profile_it_does_not_run() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let (mut client, hello) = profile_test_client(&test_cert, None)?;
+		let response = signed_server_response(&test_cert, &hello, foreign_profile(HASH_SHA3_512))?;
+
+		let result = client.process_server_handshake(&response).await;
+		assert!(matches!(
+			result,
+			Err(HandshakeError::NegotiationError(NegotiationError::UnrunnableProfile))
+		));
+		Ok(())
+	}
+
+	/// A policy that refuses every profile.
+	struct RefuseAll;
+
+	impl ProfileStrengthPolicy for RefuseAll {
+		fn meets_floor(&self, _strength: &ProfileStrength) -> bool {
+			false
 		}
+	}
 
-		// Test 2: Client offers [A, B], server accepts C (not in offer) -> FAIL
-		{
-			let (mut client, client_hello_der) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
-			let server_response = create_server_response(&client_hello_der, [3u8; 32], &p_c)?;
-			let result = client.process_server_handshake(&server_response).await;
-			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
-		}
+	// Without an offer the server chooses, and the client floor still bounds
+	// that choice.
+	#[tokio::test]
+	async fn a_dealers_choice_client_refuses_a_profile_below_its_floor() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let (client, hello) = profile_test_client(&test_cert, None)?;
+		let mut client = client.with_strength_policy(Arc::new(RefuseAll));
 
-		// Test 3: No offer, server picks -> OK (dealer's choice)
-		{
-			let (mut client, client_hello_der) = setup_client(None)?;
-			let server_response = create_server_response(&client_hello_der, [4u8; 32], &p_a)?;
-			let _kex = client.process_server_handshake(&server_response).await?;
-			assert_eq!(client.selected_profile, Some(p_a));
-		}
-
+		let response = signed_server_response(&test_cert, &hello, create_default_test_profile())?;
+		let result = client.process_server_handshake(&response).await;
+		assert!(matches!(
+			result,
+			Err(HandshakeError::NegotiationError(NegotiationError::BelowStrengthFloor))
+		));
 		Ok(())
 	}
 }

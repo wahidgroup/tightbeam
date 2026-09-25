@@ -33,44 +33,50 @@ use crate::transport::support::{
 use super::common::*;
 
 pub(crate) const BUDGET_OVERRUN_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	Urn::new("test", "event:credit/budget-overrun-answered-with-goaway");
+	tightbeam::urn!("test", "event:credit/budget-overrun-answered-with-goaway");
 pub(crate) const CHUNKED_TRANSFER_SURVIVES_DRAIN: Urn<'static> =
-	Urn::new("test", "event:credit/chunked-transfer-survives-drain");
-pub(crate) const CLIENT_FAILS_CLOSED: Urn<'static> = Urn::new("test", "event:credit/client-fails-closed");
-pub(crate) const CLIENT_VIEWS_REDUCED_GRANT: Urn<'static> = Urn::new("test", "event:credit/client-views-reduced-grant");
-pub(crate) const CONTROL_STILL_FLOWS: Urn<'static> = Urn::new("test", "event:credit/control-still-flows");
+	tightbeam::urn!("test", "event:credit/chunked-transfer-survives-drain");
+pub(crate) const CLIENT_FAILS_CLOSED: Urn<'static> = tightbeam::urn!("test", "event:credit/client-fails-closed");
+pub(crate) const CLIENT_VIEWS_REDUCED_GRANT: Urn<'static> =
+	tightbeam::urn!("test", "event:credit/client-views-reduced-grant");
+pub(crate) const CONTROL_STILL_FLOWS: Urn<'static> = tightbeam::urn!("test", "event:credit/control-still-flows");
 pub(crate) const CREDIT_OVERRUN_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	Urn::new("test", "event:credit/credit-overrun-answered-with-goaway");
-pub(crate) const DRAIN_COMPLETES_CLEAN: Urn<'static> = Urn::new("test", "event:credit/drain-completes-clean");
-pub(crate) const DRAIN_REASON_SURFACES: Urn<'static> = Urn::new("test", "event:credit/drain-reason-surfaces");
+	tightbeam::urn!("test", "event:credit/credit-overrun-answered-with-goaway");
+pub(crate) const DRAIN_COMPLETES_CLEAN: Urn<'static> = tightbeam::urn!("test", "event:credit/drain-completes-clean");
+pub(crate) const DRAIN_REASON_SURFACES: Urn<'static> = tightbeam::urn!("test", "event:credit/drain-reason-surfaces");
 pub(crate) const EXHAUSTING_EMIT_STILL_ECHOES: Urn<'static> =
-	Urn::new("test", "event:credit/exhausting-emit-still-echoes");
-pub(crate) const FIRST_LARGE_FRAME_ECHOED: Urn<'static> = Urn::new("test", "event:credit/first-large-frame-echoed");
+	tightbeam::urn!("test", "event:credit/exhausting-emit-still-echoes");
+pub(crate) const FIRST_LARGE_FRAME_ECHOED: Urn<'static> =
+	tightbeam::urn!("test", "event:credit/first-large-frame-echoed");
 pub(crate) const OPEN_CHUNK_SPENDS_INITIAL_CREDIT: Urn<'static> =
-	Urn::new("test", "event:credit/open-chunk-spends-initial-credit");
+	tightbeam::urn!("test", "event:credit/open-chunk-spends-initial-credit");
 pub(crate) const OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	Urn::new("test", "event:credit/oversize-chunk-answered-with-goaway");
+	tightbeam::urn!("test", "event:credit/oversize-chunk-answered-with-goaway");
 pub(crate) const PEER_OBSERVES_BUDGET_EXHAUSTED: Urn<'static> =
-	Urn::new("test", "event:credit/peer-observes-budget-exhausted");
+	tightbeam::urn!("test", "event:credit/peer-observes-budget-exhausted");
 pub(crate) const REASSEMBLY_FLOOD_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	Urn::new("test", "event:credit/reassembly-flood-answered-with-goaway");
-pub(crate) const SECOND_LARGE_FRAME_ECHOED: Urn<'static> = Urn::new("test", "event:credit/second-large-frame-echoed");
+	tightbeam::urn!("test", "event:credit/reassembly-flood-answered-with-goaway");
+pub(crate) const SECOND_LARGE_FRAME_ECHOED: Urn<'static> =
+	tightbeam::urn!("test", "event:credit/second-large-frame-echoed");
 pub(crate) const SENDER_STALLS_AT_INITIAL_CREDIT: Urn<'static> =
-	Urn::new("test", "event:credit/sender-stalls-at-initial-credit");
+	tightbeam::urn!("test", "event:credit/sender-stalls-at-initial-credit");
 pub(crate) const SERVER_BOUNDS_HUNG_AUTHORIZER: Urn<'static> =
-	Urn::new("test", "event:credit/server-bounds-hung-authorizer");
-pub(crate) const SERVER_REFUSES_WITH_CODE: Urn<'static> = Urn::new("test", "event:credit/server-refuses-with-code");
-pub(crate) const SERVER_VIEWS_REDUCED_GRANT: Urn<'static> = Urn::new("test", "event:credit/server-views-reduced-grant");
+	tightbeam::urn!("test", "event:credit/server-bounds-hung-authorizer");
+pub(crate) const SERVER_REFUSES_WITH_CODE: Urn<'static> =
+	tightbeam::urn!("test", "event:credit/server-refuses-with-code");
+pub(crate) const SERVER_VIEWS_REDUCED_GRANT: Urn<'static> =
+	tightbeam::urn!("test", "event:credit/server-views-reduced-grant");
 pub(crate) const STALLED_STREAM_STILL_ECHOES: Urn<'static> =
-	Urn::new("test", "event:credit/stalled-stream-still-echoes");
-pub(crate) const TRANSFER_RESUMES_ON_GRANT: Urn<'static> = Urn::new("test", "event:credit/transfer-resumes-on-grant");
-pub(crate) const ZERO_BUDGET_EMIT_REFUSED: Urn<'static> = Urn::new("test", "event:credit/zero-budget-emit-refused");
+	tightbeam::urn!("test", "event:credit/stalled-stream-still-echoes");
+pub(crate) const TRANSFER_RESUMES_ON_GRANT: Urn<'static> =
+	tightbeam::urn!("test", "event:credit/transfer-resumes-on-grant");
+pub(crate) const ZERO_BUDGET_EMIT_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:credit/zero-budget-emit-refused");
 
 tb_assert_spec! {
 	pub MuxChunkedRoundtripSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FIRST_LARGE_FRAME_ECHOED, exactly!(1), equals!(true)),
 			(SECOND_LARGE_FRAME_ECHOED, exactly!(1), equals!(true))
@@ -112,7 +118,6 @@ tb_assert_spec! {
 	pub MuxCreditStallSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(OPEN_CHUNK_SPENDS_INITIAL_CREDIT, exactly!(1), equals!(true)),
 			(SENDER_STALLS_AT_INITIAL_CREDIT, exactly!(1), equals!(true)),
@@ -197,7 +202,6 @@ tb_assert_spec! {
 	pub MuxZeroBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(ZERO_BUDGET_EMIT_REFUSED, exactly!(1), equals!(true)),
@@ -264,7 +268,6 @@ tb_assert_spec! {
 	pub MuxBudgetExhaustionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
@@ -313,8 +316,9 @@ tb_scenario! {
 
 async fn protocol_error_goaway_after(
 	link: ServerMuxClientRaw,
-	envelopes: Vec<TransportEnvelope>,
+	envelopes: impl IntoIterator<Item = TransportEnvelope>,
 ) -> Result<bool, TightBeamError> {
+	let envelopes: Vec<TransportEnvelope> = envelopes.into_iter().collect();
 	let ServerMuxClientRaw { server: _server, responder, mut client_reader, mut client_writer } = link;
 	let _serve = spawn_immediate_echo(responder);
 
@@ -392,7 +396,6 @@ tb_assert_spec! {
 	pub MuxFlowViolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(4)),
 			(OVERSIZE_CHUNK_ANSWERED_WITH_GOAWAY, exactly!(1), equals!(true)),
@@ -429,7 +432,6 @@ tb_assert_spec! {
 	pub MuxAuthorizerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLIENT_VIEWS_REDUCED_GRANT, exactly!(1), equals!(true)),
 			(SERVER_VIEWS_REDUCED_GRANT, exactly!(1), equals!(true))
@@ -477,7 +479,6 @@ tb_assert_spec! {
 	pub MuxAuthorizerRefusalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVER_REFUSES_WITH_CODE, exactly!(1), equals!(true)),
 			(CLIENT_FAILS_CLOSED, exactly!(1), equals!(true))
@@ -534,7 +535,6 @@ tb_assert_spec! {
 	pub MuxAuthorizerDeadlineSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVER_BOUNDS_HUNG_AUTHORIZER, exactly!(1), equals!(true)),
 			(CLIENT_FAILS_CLOSED, exactly!(1), equals!(true))
@@ -598,7 +598,6 @@ tb_assert_spec! {
 	pub MuxRekeyChunkedDrainSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(events::MUX_GOAWAY_RECV, exactly!(1)),

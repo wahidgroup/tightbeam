@@ -8,8 +8,8 @@ use rand_core::CryptoRng;
 /// Adapts a `&mut dyn CryptoRngCore` to the `Sized` `CryptoRng + RngCore`
 /// bounds required by generic constructors such as `SecretKey::random`.
 ///
-/// A `dyn` RNG is unsized, so it cannot satisfy `impl CryptoRngCore` bounds
-/// directly. This wrapper forwards every method to the underlying trait object,
+/// A `dyn` RNG is unsized, so `impl CryptoRngCore` bounds take this sized
+/// wrapper. It forwards every method to the underlying trait object,
 /// letting callers inject their own CSPRNG.
 #[cfg(any(feature = "ecies", feature = "transport-cms"))]
 pub(crate) struct RngWrapper<'a>(pub(crate) &'a mut dyn CryptoRngCore);
@@ -59,13 +59,14 @@ pub fn generate_nonce<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Re
 		&mut rand_core::OsRng
 	};
 
-	rng.fill_bytes(&mut nonce);
-
+	rng.try_fill_bytes(&mut nonce)?;
 	Ok(nonce)
 }
 
-/// Generate a random number of specified byte size
-pub fn generate_random_number<const N: usize>(rng: Option<&mut dyn RngCore>) -> Result<usize> {
+/// Generate a random number of specified byte size.
+///
+/// `None` draws from the OS CSPRNG, as [`generate_nonce`] does.
+pub fn generate_random_number<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Result<usize> {
 	const USIZE_BYTES: usize = core::mem::size_of::<usize>();
 	if N > USIZE_BYTES {
 		return Err(crate::TightBeamError::InvalidOverflowValue);
@@ -73,22 +74,22 @@ pub fn generate_random_number<const N: usize>(rng: Option<&mut dyn RngCore>) -> 
 
 	let mut bytes = [0u8; USIZE_BYTES];
 	generate_random_bytes(&mut bytes[..N], rng)?;
-
 	Ok(usize::from_le_bytes(bytes))
 }
 
 /// Fill the provided byte slice with random bytes.
-/// If `rng` is `None`, uses OS-level CSPRNG (`OsRng`). If an RNG is provided,
-/// its security properties depend on the RNG you pass.
+///
+/// `None` draws from the OS CSPRNG, and a supplied RNG must be
+/// cryptographically secure, so no caller can weaken the source.
 #[inline]
-pub fn generate_random_bytes(bytes: &mut [u8], rng: Option<&mut dyn RngCore>) -> Result<()> {
+pub fn generate_random_bytes(bytes: &mut [u8], rng: Option<&mut dyn CryptoRngCore>) -> Result<()> {
 	let rng = if let Some(rng) = rng {
 		rng
 	} else {
 		&mut rand_core::OsRng
 	};
 
-	rng.fill_bytes(bytes);
+	rng.try_fill_bytes(bytes)?;
 	Ok(())
 }
 

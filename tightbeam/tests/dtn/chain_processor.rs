@@ -9,10 +9,9 @@
 
 use std::sync::{Arc, RwLock};
 
-use tightbeam::asn1::{AlgorithmIdentifier, Frame, OctetString};
+use tightbeam::asn1::{AlgorithmIdentifier, DigestInfo, Frame, OctetString};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::der::{oid::AssociatedOid, Encode};
-use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::TightBeamError;
 
 use crate::dtn::jobs::{PersistAndBufferFrame, ValidateChain};
@@ -88,8 +87,8 @@ impl ChainProcessor {
 		// just sent. This ensures the ordering buffer is synchronized with
 		// the global chain
 		let mut order_buffer = self.order_buffer.write()?;
-		if frame.metadata.order >= order_buffer.next_expected() {
-			order_buffer.set_next_expected(frame.metadata.order + 1);
+		if frame.metadata().order() >= order_buffer.next_expected() {
+			order_buffer.set_next_expected(frame.metadata().order() + 1);
 		}
 
 		Ok(())
@@ -101,9 +100,11 @@ impl ChainProcessor {
 	/// collecting all frames in between.
 	pub fn request_missing_frames(
 		&self,
-		requester_head: &[u8],
-		last_received_hash: &[u8],
+		requester_head: impl AsRef<[u8]>,
+		last_received_hash: impl AsRef<[u8]>,
 	) -> Result<Vec<Frame>, TightBeamError> {
+		let requester_head = requester_head.as_ref();
+		let last_received_hash = last_received_hash.as_ref();
 		// Find frame with hash matching last_received_hash (frame just before gap)
 		let mut store = self.store.write()?;
 		let mut current_frame = match store.retrieve_by_hash(last_received_hash)? {
@@ -129,7 +130,7 @@ impl ChainProcessor {
 			collected_frames.push(current_frame.to_owned());
 
 			// Move to previous frame using previous_frame hash
-			match current_frame.metadata.previous_frame.as_ref() {
+			match current_frame.metadata().previous_frame() {
 				Some(digest_info) => {
 					let prev_hash = digest_info.digest.as_bytes();
 					match store.retrieve_by_hash(prev_hash)? {

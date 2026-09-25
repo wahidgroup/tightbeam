@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: malformed URN literal: the NSS must not be empty
+ --> tests/compile/urn_nss_empty.rs:4:32
+  |
+4 | const REJECTED: Urn<'static> = tightbeam::urn!("test", "");
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `REJECTED::{constant#0}` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `tightbeam::urn` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/compile/urn_nss_empty.rs:4:32
+  |
+4 | const REJECTED: Urn<'static> = tightbeam::urn!("test", "");
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the macro `tightbeam::urn` (in Nightly builds, run with -Z macro-backtrace for more info)

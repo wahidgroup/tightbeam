@@ -189,7 +189,12 @@ impl LivelockChecker {
 	}
 
 	/// Check if SCC forms a hidden cycle (livelock)
-	fn is_hidden_cycle(scc: &[State], _hidden_graph: &HashMap<State, HashSet<State>>, process: &Process) -> bool {
+	fn is_hidden_cycle(
+		scc: impl AsRef<[State]>,
+		_hidden_graph: &HashMap<State, HashSet<State>>,
+		process: &Process,
+	) -> bool {
+		let scc = scc.as_ref();
 		// If cycle has any observable events that lead out of SCC, it's not a livelock
 		!scc.iter().any(|&state| {
 			process

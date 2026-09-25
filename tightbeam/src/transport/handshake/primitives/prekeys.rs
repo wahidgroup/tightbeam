@@ -26,8 +26,7 @@ use crate::Beamable;
 /// - `onetime_prekey`: Optional single-use prekey (EC)
 /// - `pq_prekey`: Optional post-quantum KEM public key
 /// - `prekey_ids`: Identifiers for retrieving/referencing keys
-#[derive(Sequence, Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Beamable))]
+#[derive(Sequence, Clone, Debug, PartialEq, Beamable)]
 pub struct PrekeyBundle {
 	/// Identity public key (long-term)
 	pub identity_key: SubjectPublicKeyInfoOwned,
@@ -55,8 +54,7 @@ pub struct PrekeyBundle {
 ///
 /// Used to reference specific prekeys when constructing initial messages,
 /// and for tracking/rotating prekeys on the server.
-#[derive(Sequence, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "derive", derive(Beamable))]
+#[derive(Sequence, Clone, Debug, PartialEq, Eq, Beamable)]
 pub struct PrekeyIdentifiers {
 	/// Signed prekey ID
 	pub signed_prekey_id: u32,
@@ -83,8 +81,7 @@ pub struct PrekeyIdentifiers {
 /// - `used_prekeys`: Identifiers of which prekeys from bundle were used
 /// - `kem_ciphertext`: KEM encapsulation output (if using PQ prekey)
 /// - `encrypted_payload`: Initial message encrypted under derived session key
-#[derive(Sequence, Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "derive", derive(Beamable))]
+#[derive(Sequence, Clone, Debug, PartialEq, Beamable)]
 pub struct PrekeyInitialMessage {
 	/// Sender's identity key
 	pub sender_identity: SubjectPublicKeyInfoOwned,

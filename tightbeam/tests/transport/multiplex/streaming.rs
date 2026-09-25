@@ -38,15 +38,15 @@ async fn streaming_endpoints(
 	Ok((client_end, responder))
 }
 
-pub(crate) const OPEN_STREAM_ECHO_MATCHES: Urn<'static> = Urn::new("test", "event:streaming/open-stream-echo-matches");
+pub(crate) const OPEN_STREAM_ECHO_MATCHES: Urn<'static> =
+	tightbeam::urn!("test", "event:streaming/open-stream-echo-matches");
 pub(crate) const OPEN_STREAM_SERVER_SAW_CHUNKS: Urn<'static> =
-	Urn::new("test", "event:streaming/open-stream-server-saw-chunks");
+	tightbeam::urn!("test", "event:streaming/open-stream-server-saw-chunks");
 
 tb_assert_spec! {
 	pub MuxOpenStreamSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(OPEN_STREAM_ECHO_MATCHES, exactly!(1), equals!(true)),
 			(OPEN_STREAM_SERVER_SAW_CHUNKS, exactly!(1), equals!(true))
@@ -78,15 +78,14 @@ tb_scenario! {
 }
 
 pub(crate) const OPEN_DUPLEX_REPLY_MATCHES: Urn<'static> =
-	Urn::new("test", "event:streaming/open-duplex-reply-matches");
+	tightbeam::urn!("test", "event:streaming/open-duplex-reply-matches");
 pub(crate) const OPEN_DUPLEX_REPLY_CHUNKED: Urn<'static> =
-	Urn::new("test", "event:streaming/open-duplex-reply-chunked");
+	tightbeam::urn!("test", "event:streaming/open-duplex-reply-chunked");
 
 tb_assert_spec! {
 	pub MuxOpenDuplexSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(OPEN_DUPLEX_REPLY_MATCHES, exactly!(1), equals!(true)),
 			(OPEN_DUPLEX_REPLY_CHUNKED, exactly!(1), equals!(true))
@@ -119,12 +118,13 @@ tb_scenario! {
 }
 
 pub(crate) const UNARY_KIND_REFUSED_BY_STREAMING_SERVER: Urn<'static> =
-	Urn::new("test", "event:streaming/unary-kind-refused-by-streaming-server");
+	tightbeam::urn!("test", "event:streaming/unary-kind-refused-by-streaming-server");
 pub(crate) const UNARY_KIND_REFUSED_BY_DUPLEX_SERVER: Urn<'static> =
-	Urn::new("test", "event:streaming/unary-kind-refused-by-duplex-server");
+	tightbeam::urn!("test", "event:streaming/unary-kind-refused-by-duplex-server");
 
 /// Whether a unary-kind emit is refused with `Unimplemented`.
-async fn emit_refused_unimplemented(endpoint: &MuxEndpoint, label: &str) -> bool {
+async fn emit_refused_unimplemented(endpoint: &MuxEndpoint, label: impl AsRef<str>) -> bool {
+	let label = label.as_ref();
 	matches!(
 		endpoint.handle.emit_on_stream(&large_mux_frame(label)).await,
 		Err(TransportError::OperationFailed(TransportFailure::Unimplemented))
@@ -135,7 +135,6 @@ tb_assert_spec! {
 	pub MuxUnaryKindVsDuplexSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNARY_KIND_REFUSED_BY_DUPLEX_SERVER, exactly!(1), equals!(true))
 		]
@@ -166,7 +165,6 @@ tb_assert_spec! {
 	pub MuxUnaryKindVsStreamingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNARY_KIND_REFUSED_BY_STREAMING_SERVER, exactly!(1), equals!(true))
 		]
@@ -219,14 +217,14 @@ fn hanging_streaming_handler(started: Arc<Notify>, unwound: Arc<Notify>) -> impl
 }
 
 pub(crate) const CANCELLED_RESPONSE_SURFACES: Urn<'static> =
-	Urn::new("test", "event:streaming/cancelled-response-surfaces");
-pub(crate) const CANCEL_UNWINDS_HANDLER: Urn<'static> = Urn::new("test", "event:streaming/cancel-unwinds-handler");
+	tightbeam::urn!("test", "event:streaming/cancelled-response-surfaces");
+pub(crate) const CANCEL_UNWINDS_HANDLER: Urn<'static> =
+	tightbeam::urn!("test", "event:streaming/cancel-unwinds-handler");
 
 tb_assert_spec! {
 	pub MuxStreamingCancelSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CANCELLED_RESPONSE_SURFACES, exactly!(1), equals!(true)),
 			(CANCEL_UNWINDS_HANDLER, exactly!(1), equals!(true))
@@ -275,13 +273,12 @@ tb_scenario! {
 }
 
 pub(crate) const DUPLEX_CANCEL_FAILS_REPLY: Urn<'static> =
-	Urn::new("test", "event:streaming/duplex-cancel-fails-reply");
+	tightbeam::urn!("test", "event:streaming/duplex-cancel-fails-reply");
 
 tb_assert_spec! {
 	pub MuxDuplexCancelSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DUPLEX_CANCEL_FAILS_REPLY, exactly!(1), equals!(true))
 		]
@@ -335,7 +332,7 @@ fn gated_streaming_echo(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(S
 
 			let drained = drain_body(&mut body).await;
 			if drained.failure.is_some() {
-				return echo_reassembled(&[]);
+				return echo_reassembled([]);
 			}
 
 			echo_reassembled(&drained.bytes)
@@ -344,15 +341,14 @@ fn gated_streaming_echo(started: Arc<Notify>, release: Arc<Notify>) -> impl Fn(S
 }
 
 pub(crate) const PUSH_STALLS_WITHOUT_DRAIN: Urn<'static> =
-	Urn::new("test", "event:streaming/push-stalls-without-drain");
+	tightbeam::urn!("test", "event:streaming/push-stalls-without-drain");
 pub(crate) const PUSH_RESUMES_ON_CONSUMPTION: Urn<'static> =
-	Urn::new("test", "event:streaming/push-resumes-on-consumption");
+	tightbeam::urn!("test", "event:streaming/push-resumes-on-consumption");
 
 tb_assert_spec! {
 	pub MuxStreamingBackpressureSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PUSH_STALLS_WITHOUT_DRAIN, exactly!(1), equals!(true)),
 			(PUSH_RESUMES_ON_CONSUMPTION, exactly!(1), equals!(true))
@@ -405,14 +401,14 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const PING_PONG_REPLIES_MATCH: Urn<'static> = Urn::new("test", "event:streaming/ping-pong-replies-match");
-pub(crate) const PING_PONG_ENDS_CLEAN: Urn<'static> = Urn::new("test", "event:streaming/ping-pong-ends-clean");
+pub(crate) const PING_PONG_REPLIES_MATCH: Urn<'static> =
+	tightbeam::urn!("test", "event:streaming/ping-pong-replies-match");
+pub(crate) const PING_PONG_ENDS_CLEAN: Urn<'static> = tightbeam::urn!("test", "event:streaming/ping-pong-ends-clean");
 
 tb_assert_spec! {
 	pub MuxDuplexPingPongSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PING_PONG_REPLIES_MATCH, exactly!(1), equals!(true)),
 			(PING_PONG_ENDS_CLEAN, exactly!(1), equals!(true))
@@ -460,13 +456,13 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const INTO_FRAME_DECODES_REPLY: Urn<'static> = Urn::new("test", "event:streaming/into-frame-decodes-reply");
+pub(crate) const INTO_FRAME_DECODES_REPLY: Urn<'static> =
+	tightbeam::urn!("test", "event:streaming/into-frame-decodes-reply");
 
 tb_assert_spec! {
 	pub MuxDuplexIntoFrameSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(INTO_FRAME_DECODES_REPLY, exactly!(1), equals!(true))
 		]

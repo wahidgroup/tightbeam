@@ -8,8 +8,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::testing::fdr::config::{Failure, FdrConfig, Trace};
+use crate::testing::fdr::config::FdrConfig;
 use crate::testing::fdr::explorer::{MemoizationCache, RefinementChecker, RefinementOutcome};
+use crate::testing::fdr::verdict::{Failure, Trace};
 use crate::testing::specs::csp::{Event, Process, State};
 
 /// Result of searching for a single trace in a specification
@@ -262,7 +263,12 @@ where
 
 	/// Check if an implementation failure exists in the specification failures.
 	/// Returns true if a matching spec failure is found where impl_refusal ⊆ spec_refusal.
-	fn failure_exists_in_spec(spec_failures: &[Failure], impl_trace: &Trace, impl_refusal: &HashSet<Event>) -> bool {
+	fn failure_exists_in_spec(
+		spec_failures: impl AsRef<[Failure]>,
+		impl_trace: &Trace,
+		impl_refusal: &HashSet<Event>,
+	) -> bool {
+		let spec_failures = spec_failures.as_ref();
 		for (spec_trace, spec_refusal) in spec_failures {
 			if spec_trace == impl_trace && impl_refusal.is_subset(spec_refusal) {
 				return true;
@@ -342,9 +348,15 @@ where
 		// Reference: Roscoe (1998, 2010)
 		let (impl_traces, impl_complete) = self.compute_traces(impl_process, self.config.max_depth);
 
+		// Each trace is projected onto the spec's observable alphabet, because
+		// a trace is a sequence over that alphabet and an implementation
+		// recorded from a running system carries the steps the spec models
+		// internally as well. See `Process::project`.
+		let projected: HashSet<Trace> = impl_traces.iter().map(|trace| spec.project(trace)).collect();
+
 		// Sorted iteration keeps the reported witness deterministic
 		// regardless of HashSet ordering.
-		let mut ordered: Vec<&Trace> = impl_traces.iter().collect();
+		let mut ordered: Vec<&Trace> = projected.iter().collect();
 		ordered.sort_unstable();
 
 		// One time budget covers the whole membership scan so a large

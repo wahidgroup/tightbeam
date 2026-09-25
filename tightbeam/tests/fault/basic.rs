@@ -16,19 +16,18 @@
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
-use tightbeam::utils::BasisPoints;
 use tightbeam::TightBeamError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
 use fault_tolerant_process::States;
 
-pub(crate) const FAILURE: Urn<'static> = Urn::new("test", "event:fault-basic/failure");
-pub(crate) const FALLBACK: Urn<'static> = Urn::new("test", "event:fault-basic/fallback");
-pub(crate) const INTERNAL_RETRY: Urn<'static> = Urn::new("test", "event:fault-basic/internal-retry");
-pub(crate) const REQUEST: Urn<'static> = Urn::new("test", "event:fault-basic/request");
-pub(crate) const RESPONSE: Urn<'static> = Urn::new("test", "event:fault-basic/response");
-pub(crate) const RETRY: Urn<'static> = Urn::new("test", "event:fault-basic/retry");
-pub(crate) const SUCCESS: Urn<'static> = Urn::new("test", "event:fault-basic/success");
+pub(crate) const FAILURE: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/failure");
+pub(crate) const FALLBACK: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/fallback");
+pub(crate) const INTERNAL_RETRY: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/internal-retry");
+pub(crate) const REQUEST: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/request");
+pub(crate) const RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/response");
+pub(crate) const RETRY: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/retry");
+pub(crate) const SUCCESS: Urn<'static> = tightbeam::urn!("test", "event:fault-basic/success");
 
 // ============================================================================
 // ACADEMIC DEMONSTRATION: State-based fault injection with formal verification
@@ -139,11 +138,8 @@ tb_assert_spec! {
 	pub DeterministicSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
-			(REQUEST, at_least!(1)),
-			(RESPONSE, at_least!(0)),
-			(RETRY, at_least!(0))
+			(REQUEST, at_least!(1))
 		]
 	}
 }
@@ -153,7 +149,7 @@ fn build_deterministic_config() -> FdrConfig {
 		States::Sending,
 		RESPONSE,
 		|| NetworkTimeoutError { duration_ms: 3000, attempt: 1 },
-		BasisPoints::new(10000), // 100% - always inject (deterministic)
+		tightbeam::bps!(10000), // 100% - always inject (deterministic)
 	);
 
 	FdrConfig {
@@ -163,7 +159,6 @@ fn build_deterministic_config() -> FdrConfig {
 		timeout_ms: 2000,
 		specs: vec![FaultTolerantProcess::process()],
 		fail_fast: false,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -178,9 +173,8 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(DeterministicSpec::latest())
 		.with_fdr(build_deterministic_config())
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-			if let Some(verdict) = &result.fdr_verdict {
+		.with_hooks(TestHooks::on_pass(|context| {
+			if let Some(verdict) = context.verdict().fdr() {
 				// Academic requirement: Deterministic = same faults every run
 				assert!(!verdict.faults_injected.is_empty(), "Deterministic injection must be reproducible");
 				// Note: Each seed explores multiple paths, so we get multiple faults per seed
@@ -198,10 +192,7 @@ tb_scenario! {
 				println!("✓ Deterministic fault injection verified: {} faults across {} seeds",
 					verdict.faults_injected.len(), verdict.seeds_completed);
 			}
-			Ok(())
-		})),
-		on_fail: None,
-	})
+		}))
 	.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -221,10 +212,8 @@ tb_assert_spec! {
 	pub ProbabilisticSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
-			(REQUEST, at_least!(1)),
-			(RESPONSE, at_least!(0))
+			(REQUEST, at_least!(1))
 		]
 	}
 }
@@ -237,7 +226,7 @@ fn build_probabilistic_config() -> FdrConfig {
 		States::Sending,
 		RESPONSE,
 		|| NetworkTimeoutError { duration_ms: 5000, attempt: 1 },
-		BasisPoints::new(500), // 5% probability (realistic network timeout rate)
+		tightbeam::bps!(500), // 5% probability (realistic network timeout rate)
 	);
 
 	FdrConfig {
@@ -247,7 +236,6 @@ fn build_probabilistic_config() -> FdrConfig {
 		timeout_ms: 5000,
 		specs: vec![FaultTolerantProcess::process()],
 		fail_fast: false,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -262,9 +250,8 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(ProbabilisticSpec::latest())
 		.with_fdr(build_probabilistic_config())
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = &result.fdr_verdict {
+		.with_hooks(TestHooks::on_pass(|context| {
+				if let Some(verdict) = context.verdict().fdr() {
 					let fault_count = verdict.faults_injected.len();
 
 					// Industry standard: Statistical validation
@@ -281,10 +268,7 @@ tb_scenario! {
 						(fault_count as f64 / 100.0) * 100.0
 					);
 				}
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -304,11 +288,8 @@ tb_assert_spec! {
 	pub MultiFaultSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
-			(REQUEST, at_least!(1)),
-			(RETRY, at_least!(0)),
-			(FALLBACK, at_least!(0))
+			(REQUEST, at_least!(1))
 		]
 	}
 }
@@ -321,19 +302,19 @@ fn build_multi_fault_config() -> FdrConfig {
 			States::Sending,
 			RESPONSE,
 			|| NetworkTimeoutError { duration_ms: 3000, attempt: 1 },
-			BasisPoints::new(5000), // 50% - transient failure
+			tightbeam::bps!(5000), // 50% - transient failure
 		)
 		.with_fault(
 			States::Sending,
 			RETRY,
 			|| MessageCorruptionError { corrupted_bytes: 42 },
-			BasisPoints::new(3000), // 30% - permanent failure
+			tightbeam::bps!(3000), // 30% - permanent failure
 		)
 		.with_fault(
 			States::Retrying,
 			INTERNAL_RETRY,
 			|| ResourceExhaustionError { resource: "memory" },
-			BasisPoints::new(2000), // 20% - system failure
+			tightbeam::bps!(2000), // 20% - system failure
 		);
 
 	FdrConfig {
@@ -343,7 +324,6 @@ fn build_multi_fault_config() -> FdrConfig {
 		timeout_ms: 3000,
 		specs: vec![FaultTolerantProcess::process()],
 		fail_fast: false,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -358,9 +338,8 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(MultiFaultSpec::latest())
 		.with_fdr(build_multi_fault_config())
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = &result.fdr_verdict {
+		.with_hooks(TestHooks::on_pass(|context| {
+				if let Some(verdict) = context.verdict().fdr() {
 					// Academic: Verify fault diversity (multiple injection points triggered)
 					let unique_states: std::collections::HashSet<_> = verdict
 						.faults_injected
@@ -373,10 +352,7 @@ tb_scenario! {
 						unique_states.len()
 					);
 				}
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -396,14 +372,8 @@ tightbeam::tb_assert_spec! {
 	pub CoverageSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
-			(REQUEST, exactly!(1)),
-			(RESPONSE, at_least!(0)),
-			(RETRY, at_least!(0)),
-			(FALLBACK, at_least!(0)),
-			(SUCCESS, at_least!(0)),
-			(FAILURE, at_least!(0))
+			(REQUEST, exactly!(1))
 		]
 	}
 }
@@ -415,31 +385,31 @@ fn build_coverage_config() -> FdrConfig {
 			States::Idle,
 			REQUEST,
 			|| NetworkTimeoutError { duration_ms: 100, attempt: 1 },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		)
 		.with_fault(
 			States::Sending,
 			RESPONSE,
 			|| NetworkTimeoutError { duration_ms: 200, attempt: 1 },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		)
 		.with_fault(
 			States::Sending,
 			RETRY,
 			|| MessageCorruptionError { corrupted_bytes: 10 },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		)
 		.with_fault(
 			States::Retrying,
 			INTERNAL_RETRY,
 			|| ResourceExhaustionError { resource: "cpu" },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		)
 		.with_fault(
 			States::Sending,
 			FALLBACK,
 			|| ResourceExhaustionError { resource: "disk" },
-			BasisPoints::new(2000),
+			tightbeam::bps!(2000),
 		);
 
 	FdrConfig {
@@ -449,7 +419,6 @@ fn build_coverage_config() -> FdrConfig {
 		timeout_ms: 5000,
 		specs: vec![FaultTolerantProcess::process()],
 		fail_fast: false,
-		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
 		scheduler_model: None,
@@ -464,9 +433,8 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(CoverageSpec::latest())
 		.with_fdr(build_coverage_config())
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				if let Some(verdict) = &result.fdr_verdict {
+		.with_hooks(TestHooks::on_pass(|context| {
+				if let Some(verdict) = context.verdict().fdr() {
 					// Industry standard: Calculate fault coverage metrics
 					let total_injection_points = 5; // Configured in fault_model
 					let unique_injection_points: std::collections::HashSet<_> = verdict
@@ -490,10 +458,7 @@ tb_scenario! {
 						coverage_percent
 					);
 				}
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {

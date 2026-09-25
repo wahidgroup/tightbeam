@@ -72,12 +72,22 @@ impl TransitStatus {
 	/// fault. Call sites apply this before a gate status reaches the wire
 	/// or the export audit trail. The built-in export allowlist does not
 	/// use this helper.
+	#[cfg(feature = "transport-policy")]
 	#[must_use]
 	pub(crate) const fn normalized_verdict(self) -> Self {
 		match self {
 			Self::Unknown => Self::Internal,
 			verdict => verdict,
 		}
+	}
+
+	/// This status as a terminal stream refusal.
+	///
+	/// The mux responder maps the failure onto the stream's `End` trailer.
+	#[cfg(all(feature = "transport", feature = "colony"))]
+	#[must_use]
+	pub(crate) fn refusal(self) -> crate::TightBeamError {
+		crate::transport::error::TransportError::from(self).into()
 	}
 
 	/// Canonical variant name, e.g. as an audit-event label.
@@ -139,15 +149,11 @@ impl SessionContext {
 	/// Snapshot the peer identity and settled receipt off an encrypted
 	/// transport after its handshake completed.
 	pub fn capture<T: EncryptedProtocolState>(transport: &T) -> Self {
-		let peer_certificate = transport.to_peer_certificate_arc();
-		// Capture encodes SPKI once per session snapshot. Transport
-		// admission does not yet share a cached Arc for this field.
+		// Capture encodes SPKI once per session snapshot.
+		let peer_certificate = transport.session_state().peer_certificate_arc();
 		let peer_public_key = peer_certificate.as_deref().and_then(spki_der);
-		Self {
-			peer_certificate,
-			peer_public_key,
-			session_receipt: transport.to_session_receipt_arc(),
-		}
+		let session_receipt = transport.session_state().receipt_arc();
+		Self { peer_certificate, peer_public_key, session_receipt }
 	}
 
 	/// The same identity with the receipt replaced when a live one exists.
@@ -179,19 +185,70 @@ impl SessionContext {
 		self.peer_public_key.as_deref()
 	}
 
+	/// Session bound to `certificate` as its authenticated peer.
+	#[cfg(all(test, feature = "colony"))]
+	pub(crate) fn for_peer(certificate: Arc<Certificate>) -> Self {
+		let peer_public_key = spki_der(&certificate);
+		Self { peer_certificate: Some(certificate), peer_public_key, session_receipt: None }
+	}
+
+	/// The identity this session's handshake proved.
+	///
+	/// [`None`] where the transport authenticated no peer.
+	///
+	/// A per-identity budget MUST NOT fall back to a shared stand-in:
+	/// every unauthenticated caller would key on the same row, so one
+	/// caller's failures would deny all the others (CWE-645). Each caller
+	/// decides what an unauthenticated transport may do instead.
+	#[cfg(feature = "transport")]
+	pub fn proven_peer(&self) -> Option<ProvenPeer<'_>> {
+		self.peer_public_key.as_deref().map(ProvenPeer)
+	}
+
 	/// Dual-signed session receipt, when the session is budget-bearing.
 	pub fn session_receipt(&self) -> Option<&Arc<StoredReceipt>> {
 		self.session_receipt.as_ref()
 	}
 }
 
+/// An identity the transport handshake proved.
+///
+/// A gate that counts failures before it checks a frame's signature MUST
+/// key those counts on something the sender could not choose. Minting is
+/// [`SessionContext::proven_peer`] alone, so frame-carried bytes stay out
+/// of a per-identity budget (CWE-345).
+///
+/// A session whose transport proved no peer yields no `ProvenPeer` at all,
+/// so a budget keyed on this type is always attributable to one caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProvenPeer<'a>(&'a [u8]);
+
+impl<'a> ProvenPeer<'a> {
+	/// Key bytes for the identity.
+	///
+	/// A gate keys its per-identity state on these bytes. They come from
+	/// the transport handshake, so a sender cannot pick which budget its
+	/// frames are counted against.
+	#[must_use]
+	pub fn as_key(&self) -> &'a [u8] {
+		self.0
+	}
+
+	/// Mint an identity for a test that stands in for a handshake.
+	#[cfg(all(test, feature = "colony"))]
+	pub(crate) fn for_test(key: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
+		let key = key.as_ref();
+		Self(key)
+	}
+}
+
 /// Policy trait a user implements to decide message acceptance.
 ///
 /// Gate policies are stateless procedures that evaluate whether a message
-/// should be accepted or rejected. Every evaluation carries the
-/// connection's [`SessionContext`]: identity-blind gates ignore it,
-/// identity gates (black/white lists, receipt checks) key on it. Sites
-/// without authenticated facts pass the empty context.
+/// should be accepted or rejected. Every evaluation carries the connection's
+/// [`SessionContext`]: identity-blind gates ignore it, identity gates
+/// (black/white lists, receipt checks) key on it. Sites without authenticated
+/// facts pass the empty context.
 ///
 /// `message` is [`None`] when the stream kind has no request frame at dispatch
 /// (mux streaming / duplex). Choose the `None` verdict by gate class:
@@ -363,9 +420,7 @@ where
 {
 	fn evaluate(&self, message: Option<&Frame>, session: &SessionContext) -> TransitStatus {
 		let status = self.inner.evaluate(message, session);
-
 		(self.observer)(message, &status);
-
 		status
 	}
 }
@@ -377,7 +432,7 @@ mod tests {
 
 	use super::*;
 	use crate::crypto::hash::Sha3_256;
-	use crate::testing::{create_frame_with_frame_integrity, create_test_message};
+	use crate::testing::{TestFrame, TestMessage};
 
 	struct StaticGate(TransitStatus);
 
@@ -400,7 +455,7 @@ mod tests {
 	fn empty_chain_accepts() {
 		let chain = GateChain::default();
 		assert!(matches!(
-			chain.evaluate(Some(&create_frame_with_frame_integrity()), &SessionContext::default()),
+			chain.evaluate(Some(&TestFrame::with_integrity()), &SessionContext::default()),
 			TransitStatus::Ok
 		));
 	}
@@ -412,7 +467,7 @@ mod tests {
 			.with(StaticGate(TransitStatus::ResourceExhausted))
 			.with(StaticGate(TransitStatus::PermissionDenied));
 
-		let frame = create_frame_with_frame_integrity();
+		let frame = TestFrame::with_integrity();
 		assert!(matches!(
 			chain.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::ResourceExhausted
@@ -426,7 +481,7 @@ mod tests {
 			.with(StaticGate(TransitStatus::PermissionDenied))
 			.with(ProbeGate(Arc::clone(&evaluated)));
 
-		let frame = create_frame_with_frame_integrity();
+		let frame = TestFrame::with_integrity();
 		let _ = chain.evaluate(Some(&frame), &SessionContext::default());
 		assert!(!evaluated.load(Ordering::SeqCst));
 	}
@@ -434,8 +489,7 @@ mod tests {
 	#[test]
 	fn accepts_intact_frame() {
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
-
-		let frame = create_frame_with_frame_integrity();
+		let frame = TestFrame::with_integrity();
 		assert!(matches!(
 			gate.evaluate(Some(&frame), &SessionContext::default()),
 			TransitStatus::Ok
@@ -444,8 +498,7 @@ mod tests {
 
 	#[test]
 	fn rejects_tampered_frame() {
-		let mut frame = create_frame_with_frame_integrity();
-		frame.metadata.id = b"tampered".to_vec();
+		let frame = TestFrame::tamper(&TestFrame::with_integrity(), b"fi-frame", b"tampered");
 
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
 		assert!(matches!(
@@ -456,9 +509,8 @@ mod tests {
 
 	#[test]
 	fn rejects_frame_without_integrity() -> crate::error::Result<()> {
-		let message = create_test_message(None);
+		let message = TestMessage::sample(None);
 		let frame = compose! { V0: id: "gate-no-fi", order: 1u64, message: message }?;
-
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
 		assert!(matches!(
 			gate.evaluate(Some(&frame), &SessionContext::default()),

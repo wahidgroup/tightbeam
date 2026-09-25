@@ -31,7 +31,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: |req, frame, _ctx| async move {
 		Ok(Some(compose! {
-			V0: id: &frame.metadata.id,
+			V0: id: frame.metadata().id(),
 				message: PingResponse { doubled: req.value * 2 }
 		}?))
 	},

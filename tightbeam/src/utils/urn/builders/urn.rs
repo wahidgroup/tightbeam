@@ -171,11 +171,12 @@ impl<'a> UrnBuilder<'a> {
 	/// - Both `with_nss()` and `with_spec()` were called (mutually exclusive)
 	/// - NSS cannot be constructed (empty components when using default mode)
 	pub fn build(mut self) -> Result<Urn<'a>, UrnValidationError> {
-		// Validate NID format first
+		// A spec's own validation runs before assembly and may compare the
+		// NID, so a malformed NID is reported first with its own error.
 		let nid_ref = self.nid.as_ref().ok_or(UrnValidationError::RequiredFieldMissing("nid"))?;
-
 		Urn::validate_nid(nid_ref)?;
 
+		// Validate NID format first
 		// Take the mode out so the Spec closure can borrow the builder,
 		// and match exhaustively: no mode leaves an unhandled case.
 		let nss = match core::mem::replace(&mut self.nss_mode, NssMode::Unset) {
@@ -202,7 +203,7 @@ impl<'a> UrnBuilder<'a> {
 		};
 
 		let nid = self.nid.ok_or(UrnValidationError::RequiredFieldMissing("nid"))?;
-		Ok(Urn { nid, nss })
+		Urn::checked(nid, nss)
 	}
 }
 
@@ -220,7 +221,6 @@ mod tests {
 	use super::*;
 	use crate::utils::urn::builders::spec::Pattern;
 
-	#[cfg(feature = "derive")]
 	crate::urn_spec! {
 		/// Test URN spec for testing URN builder functionality
 		TestUrnSpec,
@@ -231,42 +231,6 @@ mod tests {
 			id: { pattern: Pattern::AlphaNumericHyphen }
 		},
 		nss_format: "{}:{}/{}"
-	}
-
-	#[cfg(not(feature = "derive"))]
-	use crate::utils::urn::{UrnComponents, UrnSpec, UrnSpecBuilder};
-
-	#[cfg(not(feature = "derive"))]
-	struct TestUrnSpec;
-
-	#[cfg(not(feature = "derive"))]
-	impl TestUrnSpec {
-		fn spec_builder() -> UrnSpecBuilder {
-			UrnSpecBuilder::from("test")
-				.field_required("category")
-				.field_const("category", "instrumentation")
-				.field_nss_separator("category", ":")
-				.field_required("type")
-				.field_oneof("type", &["trace", "event", "seed", "verdict"])
-				.field_nss_separator("type", "/")
-				.field_required("id")
-				.field_pattern("id", Pattern::AlphaNumericHyphen)
-				.nss_format("{}:{}/{}")
-		}
-	}
-
-	#[cfg(not(feature = "derive"))]
-	impl UrnSpec for TestUrnSpec {
-		const NID: &'static str = "test";
-
-		fn validate<'a>(components: &dyn UrnComponents<'a>) -> Result<(), UrnValidationError> {
-			Self::spec_builder().validate(components)
-		}
-
-		fn build_nss<'a>(components: &dyn UrnComponents<'a>) -> Result<Cow<'static, str>, UrnValidationError> {
-			let nss = Self::spec_builder().build_nss(components)?;
-			Ok(nss.into())
-		}
 	}
 
 	#[test]
@@ -416,5 +380,34 @@ mod tests {
 			let result = UrnBuilder::default().with_nid(nid).build();
 			assert!(matches!(result, Err(UrnValidationError::RequiredFieldMissing(_))));
 		}
+	}
+
+	// The builder assembled a `Urn` with a struct literal, so an NSS the
+	// constructors refuse reached a value through it. Each row is one way
+	// the builder can end up holding an empty NSS.
+	#[test]
+	fn the_builder_refuses_an_empty_nss() {
+		let direct = UrnBuilder::default().with_nid("test").with_nss("").build();
+		assert!(
+			matches!(direct, Err(UrnValidationError::RequiredFieldMissing("nss"))),
+			"direct: {direct:?}"
+		);
+
+		let mut with_empty_component = UrnBuilder::default().with_nid("test");
+		with_empty_component.set_component("only", Cow::Borrowed(""));
+
+		let empty_component = with_empty_component.build();
+		assert!(
+			matches!(empty_component, Err(UrnValidationError::RequiredFieldMissing("nss"))),
+			"one empty component: {empty_component:?}"
+		);
+	}
+
+	// Error ordering: a malformed NID is named as such before anything
+	// about the NSS is considered.
+	#[test]
+	fn the_builder_names_a_malformed_nid_before_an_empty_nss() {
+		let result = UrnBuilder::default().with_nid("9bad").with_nss("").build();
+		assert!(matches!(result, Err(UrnValidationError::InvalidNidStart)), "got {result:?}");
 	}
 }

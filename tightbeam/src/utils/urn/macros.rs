@@ -4,6 +4,46 @@
 //! transformation, and NSS construction logic based on a declarative
 //! specification.
 
+/// A [`Urn`](crate::utils::urn::Urn) from a static NID and NSS, checked at
+/// compile time.
+///
+/// The check runs in a `const` block, so a malformed literal is a build error
+/// and there is no run-time panic path. In a `const` item `cargo check`
+/// reports it. In a function body the build does. Use
+/// [`Urn::from_parts`](crate::utils::urn::Urn::from_parts) for parts known
+/// only at run time.
+///
+/// ## Examples
+///
+/// ```
+/// const EVENT: tightbeam::utils::urn::Urn<'static> = tightbeam::urn!("example", "test:resource");
+/// ```
+///
+/// ```compile_fail
+/// const REJECTED: tightbeam::utils::urn::Urn<'static> = tightbeam::urn!("9bad", "resource");
+/// ```
+#[macro_export]
+macro_rules! urn {
+	($nid:expr, $nss:expr $(,)?) => {
+		const {
+			let nid: &'static str = $nid;
+			let nss: &'static str = $nss;
+
+			if $crate::utils::urn::Urn::validate_nid(nid).is_err() {
+				::core::panic!(
+					"malformed URN literal: the NID must be 2-32 ASCII alphanumerics or hyphens starting with a letter"
+				);
+			}
+
+			if $crate::utils::urn::Urn::validate_nss(nss).is_err() {
+				::core::panic!("malformed URN literal: the NSS must not be empty");
+			}
+
+			$crate::utils::urn::Urn::new_unchecked(nid, nss)
+		}
+	};
+}
+
 /// Define a URN specification with validation and NSS structure
 ///
 /// Field configuration supports:

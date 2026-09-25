@@ -26,7 +26,7 @@ use tightbeam::{
 		SubmitWork,
 	},
 	crypto::{
-		aead::{Aes256Gcm, Aes256GcmOid, Key, KeyInit},
+		aead::{Aes256Gcm, Key, KeyInit},
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
 		profiles::DefaultCryptoProvider,
@@ -44,7 +44,7 @@ use tightbeam::{
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 	},
-	utils::{compose, urn::Urn},
+	utils::urn::Urn,
 	TightBeamError, Version,
 };
 
@@ -57,10 +57,10 @@ use super::messages::{CreditTransferTransaction, PaymentIdentification, Transact
 use super::servlets::{AuthorizationServlet, AUTHORIZATION_APPROVED, INTEGRITY_VERIFIED};
 
 /// Client-observed work reply status (`TransitStatus` on the wire response).
-pub(crate) const WORK_STATUS: Urn<'static> = Urn::new("test", "event:scenarios/work-status");
+pub(crate) const WORK_STATUS: Urn<'static> = tightbeam::urn!("test", "event:scenarios/work-status");
 
 /// Client-observed approval decoded from inside the servlet's response frame.
-pub(crate) const CLIENT_AUTH_APPROVED: Urn<'static> = Urn::new("test", "event:scenarios/client-auth-approved");
+pub(crate) const CLIENT_AUTH_APPROVED: Urn<'static> = tightbeam::urn!("test", "event:scenarios/client-auth-approved");
 
 /// Type URN the payment scenario registers and targets.
 fn authorization_urn() -> Urn<'static> {
@@ -83,7 +83,7 @@ impl TestCerts {
 		let (cluster_cert, cluster_key) =
 			create_test_cert_with_key("CN=Payment Gateway", 365).expect("Failed to create cluster cert");
 		let cluster_trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			CertificateTrustBuilder::from(Secp256k1Policy)
 				.with_chain(vec![cluster_cert.to_owned()])
 				.expect("Failed to build cluster trust")
 				.build(),
@@ -92,7 +92,7 @@ impl TestCerts {
 		let (hive_cert, hive_key) =
 			create_test_cert_with_key("CN=Payment Hive", 365).expect("Failed to create hive cert");
 		let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			CertificateTrustBuilder::from(Secp256k1Policy)
 				.with_chain(vec![hive_cert.to_owned()])
 				.expect("Failed to build hive trust")
 				.build(),
@@ -103,22 +103,23 @@ impl TestCerts {
 }
 
 fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
-	ClusterTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cluster_cert.to_owned())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.cluster_key.to_owned())),
-		validators: vec![],
-		client_validators: vec![],
-		hive_trust: Some(Arc::clone(&certs.hive_trust)),
-		peer_trust: None,
-	}
+	ClusterTlsConfig::new(
+		CertificateSpec::Built(Box::new(certs.cluster_cert.to_owned())),
+		Arc::new(Secp256k1KeyProvider::from(certs.cluster_key.to_owned())),
+	)
+	.expect("the test certificate must decode")
+	.with_hive_trust(Some(Arc::clone(&certs.hive_trust)))
 }
 
 fn hive_tls_config(certs: &TestCerts) -> HiveConfig {
-	let hive_tls = Arc::new(HiveTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
-		validators: vec![],
-	});
+	let hive_tls = Arc::new(
+		HiveTlsConfig::new(
+			CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
+			Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
+			vec![],
+		)
+		.expect("the hive TLS material must decode"),
+	);
 	HiveConfig {
 		hive_tls: Some(hive_tls),
 		trust_store: Some(Arc::clone(&certs.cluster_trust)),
@@ -153,7 +154,8 @@ fn shared_payment_cipher() -> Aes256Gcm {
 	Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[0x42u8; 32]))
 }
 
-fn create_auth_transaction(end_to_end_id: &[u8], amount: MonetaryAmount) -> CreditTransferTransaction {
+fn create_auth_transaction(end_to_end_id: impl AsRef<[u8]>, amount: MonetaryAmount) -> CreditTransferTransaction {
+	let end_to_end_id = end_to_end_id.as_ref();
 	let timestamp = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.map(|d| d.as_millis() as u64)
@@ -177,7 +179,6 @@ tb_assert_spec! {
 	pub PaymentGatewaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(1)),
@@ -208,25 +209,25 @@ tb_scenario! {
 			let cluster_addr = cluster.addr();
 
 			let servlet_conf = servlet_tls_config(&certs)?;
-			let servlet = AuthorizationServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
+			let servlet = AuthorizationServlet::start(Arc::new(trace.share()), servlet_conf).await?;
 
 			let mut hive_conf = hive_tls_config(&certs);
 			hive_conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 			let mut hive = PaymentProcessorHive::new(Some(hive_conf))?;
-			hive.register(authorization_urn(), servlet, |t| AuthorizationServlet::start(t, None))?;
+			hive.register(authorization_urn(), servlet, |t| AuthorizationServlet::start(t, ServletConfig::default()))?;
 			hive.establish(Arc::new(trace.share())).await?;
 
 			let _reg_response = hive.register_with_cluster(cluster_addr).await?;
 
 			let transaction = create_auth_transaction(b"E2E-001", MonetaryAmount::new(10000, *b"USD"));
-			let inner = compose(Version::V1)
+			let inner = Version::V1.compose()
 				.with_id(b"payment-auth-txn")
 				.with_order(0)
 				.with_message(transaction)
 				.with_message_hasher::<Sha3_256>([])
 				.with_witness_hasher::<Sha3_256>()
-				.with_aead::<Aes256GcmOid, _>(shared_payment_cipher())
+				.with_aead(shared_payment_cipher())
 				.with_signer::<Secp256k1Signature, _>(certs.cluster_key.to_owned())
 				.build()?;
 
@@ -239,14 +240,14 @@ tb_scenario! {
 			// to the servlet's response frame. `served` admits only an
 			// `Ok` gateway status, so reaching the next line pins the
 			// wire status the spec asserts.
-			let mut client = builder.connect(cluster_addr).await?;
+			let mut client = builder.connect(cluster_addr.to_owned()).await?;
 			let servlet_frame = client.submit_work_to(authorization_urn(), &inner).await?;
 			trace.event_with(WORK_STATUS, &[], TransitStatus::Ok)?;
 
 			// The gateway returns the servlet's complete response frame.
 			// Decoding the typed approval from inside it proves the
 			// response envelope survived the route back to the client.
-			let status: TransactionStatus = decode(&servlet_frame.message)?;
+			let status: TransactionStatus = decode(servlet_frame.message())?;
 			trace.event_with(CLIENT_AUTH_APPROVED, &[], status.status.is_success())?;
 
 			hive.stop();

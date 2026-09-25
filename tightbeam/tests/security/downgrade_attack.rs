@@ -19,12 +19,11 @@
 //! mismatch and signature-verification failure.
 //!
 //! ## References
-//! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm Downgrade')
-//!   <https://cwe.mitre.org/data/definitions/757.html>
+//! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
+//!   Downgrade') <https://cwe.mitre.org/data/definitions/757.html>
 //! - CAPEC-220: Client-Server Protocol Manipulation
 //!   <https://capec.mitre.org/data/definitions/220.html>
-//! - CAPEC-620: Drop Encryption Level
-//!   <https://capec.mitre.org/data/definitions/620.html>
+//! - CAPEC-620: Drop Encryption Level <https://capec.mitre.org/data/definitions/620.html>
 //! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection
 
 use std::sync::Arc;
@@ -42,19 +41,18 @@ use crate::security::common::{
 };
 
 pub(crate) const DOWNGRADE_CAPTURE_STRONG: Urn<'static> =
-	Urn::new("test", "event:downgrade-attack/downgrade-capture-strong");
+	tightbeam::urn!("test", "event:downgrade-attack/downgrade-capture-strong");
 pub(crate) const DOWNGRADE_CAPTURE_WEAK: Urn<'static> =
-	Urn::new("test", "event:downgrade-attack/downgrade-capture-weak");
+	tightbeam::urn!("test", "event:downgrade-attack/downgrade-capture-weak");
 pub(crate) const DOWNGRADE_PROFILES_DIFFER: Urn<'static> =
-	Urn::new("test", "event:downgrade-attack/downgrade-profiles-differ");
+	tightbeam::urn!("test", "event:downgrade-attack/downgrade-profiles-differ");
 pub(crate) const DOWNGRADE_SUBSTITUTION_REJECTED: Urn<'static> =
-	Urn::new("test", "event:downgrade-attack/downgrade-substitution-rejected");
+	tightbeam::urn!("test", "event:downgrade-attack/downgrade-substitution-rejected");
 
 tb_assert_spec! {
 	pub DowngradeAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DOWNGRADE_CAPTURE_STRONG, exactly!(BACKEND_COUNT_U32)),
 			(DOWNGRADE_CAPTURE_WEAK, exactly!(BACKEND_COUNT_U32)),

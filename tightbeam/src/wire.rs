@@ -124,7 +124,8 @@ pub(crate) fn decode_octets_seq<'a, R: Reader<'a>>(reader: &mut R) -> Result<Vec
 }
 
 /// Borrow bytes as an encodable `OCTET STRING`.
-pub(crate) fn octets_ref(bytes: &[u8]) -> Result<OctetStringRef<'_>> {
+pub(crate) fn octets_ref(bytes: &(impl AsRef<[u8]> + ?Sized)) -> Result<OctetStringRef<'_>> {
+	let bytes = bytes.as_ref();
 	OctetStringRef::new(bytes)
 }
 
@@ -142,7 +143,8 @@ pub(crate) fn octets_opt_ref(bytes: &Option<Vec<u8>>) -> Result<Option<OctetStri
 /// Gated on `colony` with its only consumers, the colony message codecs,
 /// so minimal builds carry no dead helper.
 #[cfg(feature = "colony")]
-pub(crate) fn octets_seq_refs(list: &[Vec<u8>]) -> Result<Vec<OctetStringRef<'_>>> {
+pub(crate) fn octets_seq_refs(list: &(impl AsRef<[Vec<u8>]> + ?Sized)) -> Result<Vec<OctetStringRef<'_>>> {
+	let list = list.as_ref();
 	list.iter().map(|bytes| OctetStringRef::new(bytes)).collect()
 }
 
@@ -160,6 +162,10 @@ pub(crate) fn octets_seq_refs(list: &[Vec<u8>]) -> Result<Vec<OctetStringRef<'_>
 /// - `ctx($tag)`: `Option<T>` as EXPLICIT `[$tag] T OPTIONAL`.
 /// - `default($value)`: trailing `T DEFAULT $value` for `Copy` scalars.
 ///   The field is omitted when equal to `$value`.
+///
+/// A trailing `where $check` names a `fn(&Self) -> der::Result<()>` that the
+/// decoder runs on the assembled value. It rejects a cross-field constraint in
+/// the same pass that reads the fields, so no decoded value skips it.
 ///
 /// # Sources
 ///
@@ -214,7 +220,7 @@ macro_rules! wire_sequence {
 	(@encodable $self:ident, $field:ident, default($value:expr)) => {
 		&$crate::wire::default_field(&$self.$field, $value)
 	};
-	($name:ident { $($field:ident : $kind:tt $(($tag:expr))?),+ $(,)? }) => {
+	($name:ident { $($field:ident : $kind:tt $(($tag:expr))?),+ $(,)? } $(where $check:path)?) => {
 		impl<'wire> ::der::DecodeValue<'wire> for $name {
 			fn decode_value<R: ::der::Reader<'wire>>(
 				reader: &mut R,
@@ -222,8 +228,10 @@ macro_rules! wire_sequence {
 			) -> ::der::Result<Self> {
 				reader.read_nested(header.length, |reader| {
 					$(let $field = wire_sequence!(@decode reader, $kind $(($tag))?);)+
+					let value = Self { $($field),+ };
+					$($check(&value)?;)?
 
-					::core::result::Result::Ok(Self { $($field),+ })
+					::core::result::Result::Ok(value)
 				})
 			}
 		}
@@ -253,57 +261,33 @@ macro_rules! wire_sequence {
 
 pub(crate) use wire_sequence;
 
-// The probe exercises every field kind, including the `colony`-gated
-// optional and sequence helpers, so the tests share that gate.
-#[cfg(all(test, feature = "colony"))]
+#[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::der::{Encode, TagNumber};
+	use crate::der::Encode;
+
+	#[cfg(feature = "colony")]
+	use crate::der::TagNumber;
+	#[cfg(feature = "colony")]
 	use crate::DigestInfo;
 
 	#[derive(Debug, Clone, PartialEq, Eq)]
 	struct Probe {
 		count: u64,
 		body: Vec<u8>,
-		note: Option<Vec<u8>>,
-		digests: Vec<Vec<u8>>,
-		tagged: Option<DigestInfo>,
 	}
 
-	wire_sequence!(Probe {
-		count: plain,
-		body: octets,
-		note: octets_opt,
-		digests: octets_seq,
-		tagged: ctx(TagNumber::N0),
-	});
+	wire_sequence!(Probe { count: plain, body: octets });
 
 	fn probe() -> Probe {
-		Probe {
-			count: 7,
-			body: vec![0x78; 4],
-			note: Some(vec![0xAA, 0xBB]),
-			digests: vec![vec![1, 2], vec![3]],
-			tagged: None,
-		}
+		Probe { count: 7, body: Vec::from([0x78; 4]) }
 	}
 
 	#[test]
-	fn round_trips_all_field_kinds() -> Result<()> {
+	fn round_trips_plain_and_octet_fields() -> Result<()> {
 		let original = probe();
 		let encoded = original.to_der()?;
 		let decoded = Probe::from_der(&encoded)?;
-
-		assert_eq!(original, decoded);
-		Ok(())
-	}
-
-	#[test]
-	fn round_trips_absent_optionals() -> Result<()> {
-		let original = Probe { note: None, digests: Vec::new(), ..probe() };
-		let encoded = original.to_der()?;
-		let decoded = Probe::from_der(&encoded)?;
-
 		assert_eq!(original, decoded);
 		Ok(())
 	}
@@ -311,7 +295,6 @@ mod tests {
 	#[test]
 	fn encodes_bytes_as_octet_string() -> Result<()> {
 		let encoded = probe().to_der()?;
-
 		// The body must cost one wire byte per payload byte plus the two-byte
 		// OCTET STRING header, never the SEQUENCE OF INTEGER form.
 		let body = [0x04, 0x04, 0x78, 0x78, 0x78, 0x78];
@@ -319,40 +302,87 @@ mod tests {
 		Ok(())
 	}
 
+	// The optional, sequence-of, context-tagged, and default field kinds are
+	// gated with the helpers they expand to, so their probes share that gate.
+	#[cfg(feature = "colony")]
+	#[derive(Debug, Clone, PartialEq, Eq)]
+	struct ColonyProbe {
+		count: u64,
+		note: Option<Vec<u8>>,
+		digests: Vec<Vec<u8>>,
+		tagged: Option<DigestInfo>,
+	}
+
+	#[cfg(feature = "colony")]
+	wire_sequence!(ColonyProbe { count: plain, note: octets_opt, digests: octets_seq, tagged: ctx(TagNumber::N0) });
+
+	#[cfg(feature = "colony")]
+	fn colony_probe() -> ColonyProbe {
+		ColonyProbe {
+			count: 7,
+			note: Some(Vec::from([0xAA, 0xBB])),
+			digests: Vec::from([Vec::from([1, 2]), Vec::from([3])]),
+			tagged: None,
+		}
+	}
+
+	#[cfg(feature = "colony")]
+	#[test]
+	fn round_trips_all_field_kinds() -> Result<()> {
+		let original = colony_probe();
+		let encoded = original.to_der()?;
+		let decoded = ColonyProbe::from_der(&encoded)?;
+		assert_eq!(original, decoded);
+		Ok(())
+	}
+
+	#[cfg(feature = "colony")]
+	#[test]
+	fn round_trips_absent_optionals() -> Result<()> {
+		let original = ColonyProbe { note: None, digests: Vec::new(), ..colony_probe() };
+		let encoded = original.to_der()?;
+		let decoded = ColonyProbe::from_der(&encoded)?;
+		assert_eq!(original, decoded);
+		Ok(())
+	}
+
+	#[cfg(feature = "colony")]
 	#[derive(Debug, Clone, PartialEq, Eq)]
 	struct BudgetProbe {
 		budget: u8,
 	}
 
+	#[cfg(feature = "colony")]
 	const BUDGET_DEFAULT: u8 = 7;
 
+	#[cfg(feature = "colony")]
 	wire_sequence!(BudgetProbe { budget: default(BUDGET_DEFAULT) });
 
+	#[cfg(feature = "colony")]
 	#[test]
 	fn default_field_is_omitted_on_the_wire() -> Result<()> {
 		let encoded = BudgetProbe { budget: BUDGET_DEFAULT }.to_der()?;
 		let decoded = BudgetProbe::from_der(&encoded)?;
-
 		assert_eq!(encoded, [0x30, 0x00]);
 		assert_eq!(decoded.budget, BUDGET_DEFAULT);
 		Ok(())
 	}
 
+	#[cfg(feature = "colony")]
 	#[test]
 	fn non_default_field_round_trips() -> Result<()> {
 		let decoded = BudgetProbe::from_der(&BudgetProbe { budget: 5 }.to_der()?)?;
-
 		assert_eq!(decoded.budget, 5);
 		Ok(())
 	}
 
+	#[cfg(feature = "colony")]
 	#[test]
 	fn present_default_value_is_refused_as_noncanonical() {
 		// SEQUENCE { INTEGER 7 }: an encoder violating ITU-T X.690 § 11.5 by
 		// writing the schema default instead of omitting the field.
 		// See the module-level `# Sources` for the recommendation link.
 		let encoded = [0x30, 0x03, 0x02, 0x01, 0x07];
-
 		assert!(BudgetProbe::from_der(&encoded).is_err());
 	}
 }

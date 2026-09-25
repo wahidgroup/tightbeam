@@ -15,7 +15,7 @@ pub mod transcript;
 #[doc(hidden)]
 pub mod prekeys;
 
-pub use kdf::{kdf_chain, multi_input_kdf};
+pub use kdf::{kdf_chain, multi_input_kdf, KdfInfo, KdfSalt, KdfStage};
 pub use transcript::transcript_hash;
 
 #[cfg(feature = "unstable-pqxdh")]

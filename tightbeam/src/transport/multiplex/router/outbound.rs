@@ -3,12 +3,12 @@
 
 use futures::channel::mpsc;
 
-use crate::transport::envelopes::TransportEnvelope;
+use crate::transport::envelopes::{MuxEnvelope, TransportEnvelope};
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::aead::SendCipher;
 
-pub(super) enum Outbound {
+pub enum Outbound {
 	Envelope(TransportEnvelope),
 	/// Write the envelope, then switch the send direction to the new
 	/// epoch cipher (client `RekeyAck` / server `RekeyDone` boundary,
@@ -22,8 +22,24 @@ pub(super) enum Outbound {
 	Close,
 }
 
+impl Outbound {
+	/// Whether this command is a buffered credit grant for `stream_id`.
+	pub(crate) fn is_credit_grant_for(&self, stream_id: u32) -> bool {
+		matches!(
+			self,
+			Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package)))
+				if package.stream_id() == stream_id
+		)
+	}
+
+	/// Whether this command is a buffered ping ack.
+	pub(crate) fn is_ping_ack(&self) -> bool {
+		matches!(self, Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Ping(_))))
+	}
+}
+
 /// Exclusive outbound handle for `SinkExt::send` / `try_send`.
 /// `mpsc::Sender` is Arc-backed so this is a refcount bump.
-pub(super) fn outbound_handle(outbound: &mpsc::Sender<Outbound>) -> mpsc::Sender<Outbound> {
+pub fn outbound_handle(outbound: &mpsc::Sender<Outbound>) -> mpsc::Sender<Outbound> {
 	outbound.clone()
 }

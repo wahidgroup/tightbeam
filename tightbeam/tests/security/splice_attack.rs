@@ -8,9 +8,8 @@
 //! the victim's random.
 //!
 //! ## Attack
-//! 1. A MITM captures a victim's `ClientKeyExchange` (certificate + signature).
-//! 2. The MITM encrypts `[attacker_key || victim_client_random]` to the
-//!    server's public key.
+//! 1. A MITM captures a victim's `ClientKeyExchange` (certificate and signature).
+//! 2. The MITM encrypts `[attacker_key || victim_client_random]` to the server's public key.
 //! 3. The MITM splices its `encrypted_data` into the victim's message, keeping
 //!    the victim's certificate and signature intact.
 //! 4. A transcript-only signature still verifies: the server would attribute an
@@ -24,10 +23,8 @@
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
 //!   <https://cwe.mitre.org/data/definitions/347.html>
-//! - CWE-300: Channel Accessible by Non-Endpoint
-//!   <https://cwe.mitre.org/data/definitions/300.html>
-//! - CAPEC-94: Adversary in the Middle (AiTM)
-//!   <https://capec.mitre.org/data/definitions/94.html>
+//! - CWE-300: Channel Accessible by Non-Endpoint <https://cwe.mitre.org/data/definitions/300.html>
+//! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 
 use std::sync::Arc;
 
@@ -37,31 +34,30 @@ use tightbeam::{
 		aead::Aes256Gcm,
 		ecies::{encrypt, Secp256k1EciesMessage},
 		kdf::HkdfSha3_256,
-		key::{Secp256k1KeyProvider, SigningKeyProvider},
 		profiles::DefaultCryptoProvider,
 		secret::ToInsecure,
-		sign::ecdsa::Secp256k1SigningKey,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
 	der::{Decode, Encode, Sequence},
 	exactly, job,
 	random::OsRng,
 	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{
-		utils::{create_test_certificate, create_test_signing_key},
-		ScenarioConfig, SetupEnv,
-	},
+	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{
 		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
+		PeerAuthentication,
 	},
 	utils::urn::Urn,
 	TightBeamError,
 };
 
-use crate::common::security::{default_security_profile, expectation_failure, pinning_validator, ServerMaterials};
+use crate::common::security::{
+	default_security_profile, expectation_failure, pinning_validator, ClientMaterials, ServerMaterials,
+};
 
-pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> = Urn::new("test", "event:splice-attack/spliced-kex-rejected");
+pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
+	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
 
 /// Attacker's-eye view of the DER key-exchange plaintext: the two
 /// leading OCTET STRINGs are all a splice needs (the trailing receipt
@@ -76,7 +72,6 @@ tb_assert_spec! {
 	pub SpliceAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SPLICED_KEX_REJECTED, exactly!(1u32))
 		]
@@ -117,30 +112,28 @@ job! {
 		let profile = default_security_profile();
 
 		// Victim client with an authenticated identity.
-		let client_signing = create_test_signing_key();
-		let client_cert = Arc::new(create_test_certificate(&client_signing));
-		let signing_key = Secp256k1SigningKey::from(client_signing);
-		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let client_materials = ClientMaterials::deterministic();
+		let client_identity = client_materials.identity();
 		let validator = pinning_validator(&materials.certificate);
 
 		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
 			.with_security_offer(SecurityOffer::new(vec![profile]))
 			.with_certificate_validator(validator)
-			.with_client_identity(Arc::clone(&client_cert), client_provider);
+			.with_client_identity(client_identity);
 
 		// Server requires client authentication (validators present).
-		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
 		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 			Arc::clone(&materials.key_provider),
 			Arc::clone(&materials.certificate),
 			None,
-			Some(validators),
+			PeerAuthentication::mutual([validator]),
 		)
 		.with_supported_profiles(vec![profile]);
 
-		let client_hello = client.build_client_hello()?;
-		let server_handshake = server.process_client_hello(&client_hello).await?;
-		let client_kex_der = client.process_server_handshake(&server_handshake).await?;
+		let client_hello = client.build_client_hello()?.to_der()?;
+		let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
+		let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
 
 		// Recover the victim's client_random from the legitimate payload so the
 		// spliced ciphertext still passes the server's replay check.
@@ -151,9 +144,9 @@ job! {
 			&victim_message,
 			Some(crate::security::common::HANDSHAKE_AAD),
 		)?
-		.to_insecure()?;
+		.to_insecure();
 
-		// Attacker forges a payload with its own key under the server's
+		// The attacker forges a payload with its own key under the server's
 		// public key and splices it into the victim's message, preserving
 		// the victim's client_random and the DER framing.
 		let victim_payload = SplicedPayload::from_der(&victim_plain)?;
@@ -182,7 +175,7 @@ job! {
 			return Err(expectation_failure("splice produced identical ClientKeyExchange bytes"));
 		}
 
-		match server.process_client_key_exchange(&spliced_der).await {
+		match server.process_client_key_exchange(spliced).await {
 			Err(_) => {
 				trace.event(SPLICED_KEX_REJECTED)?;
 			}

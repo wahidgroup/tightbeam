@@ -63,7 +63,8 @@ impl TimedTransition {
 	}
 
 	/// Add clock resets to transition
-	pub fn with_reset_clocks(mut self, clocks: Vec<String>) -> Self {
+	pub fn with_reset_clocks(mut self, clocks: impl IntoIterator<Item = String>) -> Self {
+		let clocks: Vec<String> = clocks.into_iter().collect();
 		self.reset_clocks = clocks;
 		self
 	}

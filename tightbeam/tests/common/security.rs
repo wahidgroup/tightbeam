@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tightbeam::{
 	crypto::profiles::DefaultCryptoProvider,
 	crypto::{
-		hash::Sha3_256,
 		key::{Secp256k1KeyProvider, SigningKeyProvider},
 		policy::Secp256k1Policy,
 		profiles::{SecurityProfileDesc, TightbeamProfile},
@@ -15,19 +14,20 @@ use tightbeam::{
 		x509::policy::{CertificateValidation, DirectTrustValidator},
 		x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 	},
-	oids::{AES_128_GCM, AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256},
+	oids::{AES_128_GCM, AES_128_WRAP},
 	random::OsRng,
 	testing::{
 		error::{FdrConfigError, TestingError},
-		utils::{create_test_certificate, create_test_signing_key},
+		fixtures::{TestCertificate, TestKey},
 	},
 	transport::handshake::HandshakeKeyManager,
+	transport::state::ClientIdentity,
 	x509::Certificate,
 	TightBeamError,
 };
 
-/// Build the standard testing error used by threat scenarios to signal that an
-/// insecure outcome was observed (turns into a spec `ModeMismatch`).
+/// Build the standard testing error that threat scenarios use to signal an
+/// observed insecure outcome, which becomes a spec `ModeMismatch`.
 pub fn expectation_failure(reason: &'static str) -> TightBeamError {
 	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
 		field: "security_threat",
@@ -47,8 +47,8 @@ pub struct ServerMaterials {
 
 impl ServerMaterials {
 	pub fn generate() -> Self {
-		let signing_key = create_test_signing_key();
-		let certificate = Arc::new(create_test_certificate(&signing_key));
+		let signing_key = TestKey::insecure_fixed_signing();
+		let certificate = Arc::new(TestCertificate::self_signed(&signing_key));
 
 		let secret_key_bytes = signing_key.to_bytes();
 		let secret_key = k256::SecretKey::from_bytes(&secret_key_bytes).expect("valid secret key");
@@ -69,15 +69,36 @@ impl ServerMaterials {
 pub struct ClientMaterials {
 	pub certificate: Arc<Certificate>,
 	pub key_manager: Arc<HandshakeKeyManager<DefaultCryptoProvider>>,
+	/// The same provider the key manager holds, for a handshake client that
+	/// takes the provider directly.
+	pub key_provider: Arc<dyn SigningKeyProvider>,
 }
 
 impl ClientMaterials {
 	/// Fresh random identity, distinct from any server materials.
 	pub fn generate() -> Self {
 		let signing_key = random_signing_key();
+		Self::from_signing_key(signing_key)
+	}
+
+	/// Fixed-seed identity, for a scenario whose outcome names the client.
+	pub fn deterministic() -> Self {
+		let signing_key = deterministic_signing_key();
+		Self::from_signing_key(signing_key)
+	}
+
+	/// Self-signed certificate over `signing_key`, bound to the key manager
+	/// that proves it.
+	fn from_signing_key(signing_key: Secp256k1SigningKey) -> Self {
 		let certificate = Arc::new(test_certificate(&signing_key));
-		let key_manager = Arc::new(HandshakeKeyManager::from(signing_key));
-		Self { certificate, key_manager }
+		let key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let key_manager = Arc::new(HandshakeKeyManager::new(Arc::clone(&key_provider)));
+		Self { certificate, key_manager, key_provider }
+	}
+
+	/// The certificate and its key as the one value a handshake client takes.
+	pub fn identity(&self) -> ClientIdentity<DefaultCryptoProvider> {
+		ClientIdentity::new(Arc::clone(&self.certificate), Arc::clone(&self.key_manager))
 	}
 }
 
@@ -88,13 +109,12 @@ impl ClientMaterials {
 pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
 	let trust_chain = vec![certificate.to_owned()];
 	let data = DirectTrustValidator::default().with_trust_chain(trust_chain);
-
 	Arc::new(data)
 }
 
 /// Trust store pinning the given server certificate (for CMS clients).
 pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
-	let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+	let store = CertificateTrustBuilder::from(Secp256k1Policy)
 		.with_certificate(certificate.to_owned())?
 		.build();
 	Ok(Arc::new(store))
@@ -102,7 +122,7 @@ pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn Certific
 
 /// Deterministic signing key (fixed seed) for stable single-identity fixtures.
 pub fn deterministic_signing_key() -> Secp256k1SigningKey {
-	create_test_signing_key()
+	TestKey::insecure_fixed_signing()
 }
 
 /// Fresh random signing key for distinct, unrelated identities.
@@ -112,7 +132,7 @@ pub fn random_signing_key() -> Secp256k1SigningKey {
 
 /// Self-signed test certificate for the given signing key.
 pub fn test_certificate(signing_key: &Secp256k1SigningKey) -> Certificate {
-	create_test_certificate(signing_key)
+	TestCertificate::self_signed(signing_key)
 }
 
 /// Default profile descriptor shared across threats.
@@ -120,31 +140,19 @@ pub fn default_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc::from(&TightbeamProfile)
 }
 
-/// Strong profile (AES-256-GCM) for downgrade testing.
+/// Strong profile (AES-256-GCM) for downgrade testing, the profile the
+/// default provider runs.
 pub fn strong_security_profile() -> SecurityProfileDesc {
-	SecurityProfileDesc {
-		digest: Some(HASH_SHA3_256),
-		aead: Some(AES_256_GCM),
-		aead_key_size: Some(32),
-		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),
-		kdf: Some(HASH_SHA3_256),
-		curve: Some(CURVE_SECP256K1),
-		key_wrap: None,
-		kem: None,
-	}
+	default_security_profile()
 }
 
-/// Weak profile (AES-128-GCM) for downgrade testing.
+/// Weak profile (AES-128-GCM) for downgrade testing, the profile the AES-128
+/// test provider runs.
 pub fn weak_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		digest: Some(HASH_SHA3_256),
 		aead: Some(AES_128_GCM),
-		aead_key_size: Some(16),
-		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),
-		kdf: Some(HASH_SHA3_256),
-		curve: Some(CURVE_SECP256K1),
-		key_wrap: None,
-		kem: None,
+		key_wrap: Some(AES_128_WRAP),
+		..default_security_profile()
 	}
 }
 
@@ -168,7 +176,9 @@ mod receipt_fixtures {
 	use tightbeam::TightBeamError;
 
 	/// True when `needle` appears as a contiguous window inside `haystack`.
-	pub fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+	pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
+		let haystack = haystack.as_ref();
+		let needle = needle.as_ref();
 		haystack.windows(needle.len()).any(|window| window == needle)
 	}
 
@@ -185,7 +195,8 @@ mod receipt_fixtures {
 		}
 
 		/// Grant with the given settlement challenge attached.
-		pub fn challenging(challenge: &[u8]) -> Result<Self, TightBeamError> {
+		pub fn challenging(challenge: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+			let challenge = challenge.as_ref();
 			Ok(Self { challenge: Some(OctetString::new(challenge)?) })
 		}
 	}
@@ -210,14 +221,15 @@ mod receipt_fixtures {
 
 	impl SettleSpyAuthorizer {
 		/// Spy granting budgets with the given settlement challenge.
-		pub fn challenging(challenge: &[u8]) -> Result<Self, TightBeamError> {
+		pub fn challenging(challenge: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+			let challenge = challenge.as_ref();
 			Ok(Self {
 				challenge: OctetString::new(challenge)?,
 				settle_calls: Arc::new(AtomicUsize::new(0)),
 			})
 		}
 
-		/// Calls the `settle` hook has received so far.
+		/// Return the number of calls the `settle` hook has received so far.
 		pub fn settle_calls(&self) -> usize {
 			self.settle_calls.load(Ordering::SeqCst)
 		}
@@ -251,7 +263,8 @@ mod receipt_fixtures {
 
 	impl PayingApprover {
 		/// Approver answering every challenge with `response`.
-		pub fn answering(response: &[u8]) -> Result<Self, TightBeamError> {
+		pub fn answering(response: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+			let response = response.as_ref();
 			Ok(Self { response: OctetString::new(response)? })
 		}
 	}
@@ -295,24 +308,21 @@ mod receipt_fixtures {
 ))]
 pub use receipt_fixtures::*;
 
-/// Baseline mutually authenticated CMS pair shared by the loopback,
-/// receipt, and security threat suites: each layers its own offers,
-/// hooks, or policies on top instead of re-wiring the identities.
+/// Baseline mutually authenticated CMS pair that the loopback, receipt, and
+/// security threat suites share. Each suite layers its own offers, hooks,
+/// or policies on top and reuses the identities.
 #[cfg(feature = "transport-cms")]
 mod cms_pair {
 	use std::sync::Arc;
 
-	use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 	use tightbeam::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
-	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
-	use tightbeam::crypto::x509::policy::CertificateValidation;
-	use tightbeam::testing::utils::create_test_certificate;
 	use tightbeam::transport::handshake::negotiation::SecurityOffer;
+	use tightbeam::transport::handshake::PeerAuthentication;
 	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 	use tightbeam::x509::Certificate;
 	use tightbeam::TightBeamError;
 
-	use super::{pinning_trust_store, random_signing_key, ServerMaterials};
+	use super::{pinning_trust_store, ClientMaterials, ServerMaterials};
 
 	/// Mutually authenticated CMS client/server pair over the fixture
 	/// server identity, plus the fresh client certificate the server
@@ -323,20 +333,23 @@ mod cms_pair {
 		pub client_certificate: Arc<Certificate>,
 	}
 
-	/// Build the pair: the client offers `client_profiles` and pins the
-	/// server certificate; the server supports `server_profiles`, runs
-	/// `validators` against the fresh client certificate, and holds that
-	/// certificate for mutual authentication.
+	/// Build the pair.
+	///
+	/// - The client offers `client_profiles` and pins the server certificate.
+	/// - The server supports `server_profiles`, runs `validators` against the
+	///   fresh client certificate, and holds that certificate for mutual
+	///   authentication.
 	pub fn cms_handshake_pair(
 		materials: &ServerMaterials,
-		client_profiles: Vec<SecurityProfileDesc>,
-		server_profiles: Vec<SecurityProfileDesc>,
-		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+		server_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
+		peer_authentication: PeerAuthentication,
 	) -> Result<CmsHandshakePair, TightBeamError> {
-		let client_signing = random_signing_key();
-		let client_certificate = Arc::new(create_test_certificate(&client_signing));
-		let signing_key = Secp256k1SigningKey::from(client_signing);
-		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let client_profiles: Vec<SecurityProfileDesc> = client_profiles.into_iter().collect();
+		let server_profiles: Vec<SecurityProfileDesc> = server_profiles.into_iter().collect();
+		let client_materials = ClientMaterials::generate();
+		let client_certificate = Arc::clone(&client_materials.certificate);
+		let client_provider = Arc::clone(&client_materials.key_provider);
 		let trust_store = pinning_trust_store(&materials.certificate)?;
 
 		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
@@ -345,19 +358,23 @@ mod cms_pair {
 			Arc::clone(&materials.certificate),
 		)
 		.with_security_offer(SecurityOffer::new(client_profiles))
-		.with_trust_store(trust_store);
+		.with_trust_store(trust_store)
+		.with_client_identity(client_materials.identity());
 
-		let mut server =
-			CmsHandshakeServer::<DefaultCryptoProvider>::new(Arc::clone(&materials.key_provider), validators)
-				.with_supported_profiles(server_profiles);
-		server.set_client_certificate((*client_certificate).to_owned())?;
+		// The server learns the client certificate from the KeyExchange it
+		// processes, as it does in production. Seeding it here would test a
+		// server that already knows what the handshake is meant to establish.
+		let provider = Arc::clone(&materials.key_provider);
+		let server = CmsHandshakeServer::<DefaultCryptoProvider>::new(provider, peer_authentication)
+			.with_supported_profiles(server_profiles);
 
 		Ok(CmsHandshakePair { client, server, client_certificate })
 	}
 }
 
 // Consumers (loopback, receipt fixtures, security threats) sit behind
-// wider feature gates, so lean combos compile the fixture unused.
+// wider feature gates, so a narrow feature combination compiles the
+// fixture unused.
 #[allow(unused_imports)]
 #[cfg(feature = "transport-cms")]
 pub use cms_pair::*;
@@ -371,6 +388,7 @@ mod cms_fixtures {
 	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportAuthorizer, TransportOffer};
 	use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
+	use tightbeam::transport::handshake::PeerAuthentication;
 	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 	use tightbeam::TightBeamError;
 
@@ -400,14 +418,11 @@ mod cms_fixtures {
 	) -> Result<CmsSessionPair, TightBeamError> {
 		let profile = default_security_profile();
 		let offer = TransportOffer::mux(4).with_budgets(request);
-		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let pair =
+			cms_handshake_pair(materials, vec![profile], vec![profile], PeerAuthentication::mutual([validator]))?;
 
-		let pair = cms_handshake_pair(materials, vec![profile], vec![profile], Some(validators))?;
-
-		let mut client = pair
-			.client
-			.with_client_certificate(Arc::clone(&pair.client_certificate))
-			.with_transport_offer(offer.to_owned());
+		let mut client = pair.client.with_transport_offer(offer.to_owned());
 		if let Some(approver) = hooks.approver {
 			client = client.with_receipt_approver(approver);
 		}

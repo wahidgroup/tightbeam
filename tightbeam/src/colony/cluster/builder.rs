@@ -27,10 +27,13 @@
 //! # Build-time derivation
 //!
 //! [`ClusterConfigBuilder::build`] derives colony membership from the
-//! certificate, rebuilds the peer discovery table from the dial list,
-//! and clamps rumor refresh to the gossip freshness window.
+//! certificate and rebuilds the peer discovery table from the dial list.
+//! The effective rumor refresh interval is derived on every read by
+//! [`ClusterConfig::rumor_refresh`], because the gossip freshness window
+//! it clamps to narrows again at startup.
 
 use core::time::Duration;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{
@@ -40,23 +43,13 @@ use super::{
 use crate::colony::common::{ColonyNamespace, LoadBalancer, StochasticForager};
 use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
+use crate::utils::time::{Clock, SystemClock};
 
-#[cfg(feature = "x509")]
-mod x509 {
-	pub(crate) use crate::colony::cluster::{
-		cert_colony_urn, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
-		PeerStore, PeerTable, StaticExportList,
-	};
-	pub(crate) use crate::crypto::x509::Certificate;
-	pub(crate) use crate::utils::urn::Urn;
-}
-
-#[cfg(feature = "x509")]
-use x509::*;
-
-// ============================================================================
-// HeartbeatConfigBuilder
-// ============================================================================
+use crate::colony::cluster::{
+	ClusterError, ExportAllowlist, ExportGate, ExportGrant, GossipAdmission, GossipConfig, MemoryPeerStore,
+	PeerAddress, PeerStore, PeerTable, StaticExportList,
+};
+use crate::utils::urn::Urn;
 
 /// Builder for [`HeartbeatConfig`].
 pub struct HeartbeatConfigBuilder {
@@ -129,16 +122,11 @@ impl HeartbeatConfigBuilder {
 	}
 }
 
-// ============================================================================
-// ClusterConfigBuilder
-// ============================================================================
-
 /// Builder for [`ClusterConfig`].
 ///
 /// Start from TLS material via [`ClusterConfig::builder`], then chain
 /// federation, export, gossip, and routing options before
 /// [`ClusterConfigBuilder::build`].
-#[cfg(feature = "x509")]
 pub struct ClusterConfigBuilder {
 	namespace: ColonyNamespace,
 	load_balancer: Arc<dyn LoadBalancer>,
@@ -148,16 +136,16 @@ pub struct ClusterConfigBuilder {
 	export_gates: Vec<Arc<dyn ExportGate>>,
 	export_grants: Vec<Arc<dyn ExportGrant>>,
 	pool_config: PoolConfig,
-	control_freshness_window_ms: u64,
+	control_freshness_window: Duration,
 	bind_addr: Option<String>,
 	edge_bind_addr: Option<String>,
 	peer: PeerConfig,
 	peer_store: Arc<dyn PeerStore>,
 	gossip: GossipConfig,
+	clock: Arc<dyn Clock>,
 	tls: ClusterTlsConfig,
 }
 
-#[cfg(feature = "x509")]
 impl ClusterConfig {
 	/// Create a builder seeded with the given TLS material.
 	pub fn builder(tls: ClusterTlsConfig) -> ClusterConfigBuilder {
@@ -170,18 +158,18 @@ impl ClusterConfig {
 			export_gates: Vec::new(),
 			export_grants: Vec::new(),
 			pool_config: PoolConfig::default(),
-			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
+			control_freshness_window: Duration::from_millis(crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS),
 			bind_addr: None,
 			edge_bind_addr: None,
 			peer: PeerConfig::default(),
 			peer_store: Arc::new(MemoryPeerStore),
 			gossip: GossipConfig::default(),
+			clock: Arc::new(SystemClock),
 			tls,
 		}
 	}
 }
 
-#[cfg(feature = "x509")]
 impl ClusterConfigBuilder {
 	/// Replace the hive heartbeat configuration.
 	pub fn with_heartbeat_config(mut self, config: HeartbeatConfig) -> Self {
@@ -274,13 +262,11 @@ impl ClusterConfigBuilder {
 
 	/// Add a positive export grant for selected caller identities.
 	///
-	/// Grants compose as union with the exported list and the
-	/// first-party origin rule, so a grant may only widen access to the
-	/// granted target. Deny gates from
-	/// [`ClusterConfigBuilder::with_export_gate`] still override.
-	///
-	/// Grants do not advertise. A granted type stays off the slate and
-	/// the grantee learns its URN out of band.
+	/// - Grants compose as union with the exported list and the first-party origin rule, so a grant
+	///   only widens access to the granted target.
+	/// - Deny gates from [`ClusterConfigBuilder::with_export_gate`] still override.
+	/// - Grants do not advertise. A granted type stays off the slate, and the grantee learns its
+	///   URN out of band.
 	pub fn with_export_grant(mut self, grant: Arc<dyn ExportGrant>) -> Self {
 		self.export_grants.push(grant);
 		self
@@ -293,8 +279,8 @@ impl ClusterConfigBuilder {
 	}
 
 	/// Set the freshness window for signed hive control frames.
-	pub fn with_control_freshness_window_ms(mut self, window_ms: u64) -> Self {
-		self.control_freshness_window_ms = window_ms;
+	pub fn with_control_freshness_window(mut self, window: Duration) -> Self {
+		self.control_freshness_window = window;
 		self
 	}
 
@@ -310,11 +296,14 @@ impl ClusterConfigBuilder {
 	/// Bind a second accept plane for external clients on the edge
 	/// protocol declared by the `cluster!` macro.
 	///
-	/// The edge plane serves the same TLS material and gate policies as
-	/// the colony plane but admits `Work` frames only: registration,
-	/// updates, peer ads, and gossip are refused with `PermissionDenied`.
-	/// Use this to expose the gateway to a browser transport while the
-	/// colony keeps its internal protocol.
+	/// Use this to expose the gateway to a browser transport while the colony
+	/// keeps its internal protocol.
+	///
+	/// # Edge plane
+	///
+	/// - It serves the same TLS material and gate policies as the colony plane.
+	/// - It admits `Work` frames only. Registration, updates, peer ads, and gossip are refused with
+	///   `PermissionDenied`.
 	pub fn with_edge_bind_addr(mut self, addr: impl Into<String>) -> Self {
 		self.edge_bind_addr = Some(addr.into());
 		self
@@ -336,13 +325,20 @@ impl ClusterConfigBuilder {
 	/// example `&str` arrays). The dial list is not an identity gate.
 	/// Partial or asymmetric federation graphs are expected. An empty
 	/// list disables outbound advertisement.
-	pub fn with_peers<I, S>(mut self, peers: I) -> Self
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidPeerAddress`] -- an entry names no socket.
+	///   Refusing here is what stops a typo becoming federation with no
+	///   anchors and no diagnostic.
+	pub fn with_peers<I, S>(mut self, peers: I) -> Result<Self, ClusterError>
 	where
 		I: IntoIterator<Item = S>,
 		S: Into<String>,
 	{
-		self.peer.peers = peers.into_iter().map(Into::into).collect();
-		self
+		let spellings: Vec<String> = peers.into_iter().map(Into::into).collect();
+		self.peer.set_anchors(spellings)?;
+		Ok(self)
 	}
 
 	/// Set the re-advertise beat cadence and enable the advertise beat.
@@ -351,18 +347,49 @@ impl ClusterConfigBuilder {
 		self
 	}
 
-	/// Restrict claimed peer dial addresses to this exact-match allowlist.
+	/// Set the socket this gateway advertises as its own gateway address.
+	///
+	/// The beat advertises the bound address by default. A gateway bound to
+	/// the wildcard address (`0.0.0.0` or `[::]`) would advertise a socket
+	/// every peer refuses, so it names the address peers dial here.
+	/// [`Cluster::start`] refuses a federating gateway that binds the
+	/// wildcard and sets no advertise address.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidPeerAddress`] -- the address names no socket.
+	///
+	/// [`Cluster::start`]: super::Cluster::start
+	pub fn with_advertise_addr(mut self, addr: impl AsRef<str>) -> Result<Self, ClusterError> {
+		let address: PeerAddress = addr.as_ref().parse()?;
+		self.peer.advertise_addr = Some(address);
+		Ok(self)
+	}
+
+	/// Restrict claimed peer dial addresses to this allowlist.
 	///
 	/// Accepts any iterator of values convertible into [`String`].
 	/// Peer-exchange hints pass the same gate before the discovery table
-	/// learns them.
-	pub fn with_peer_dial_allowlist<I, S>(mut self, allowlist: I) -> Self
+	/// learns them. Entries are compared as parsed sockets, so a peer
+	/// cannot slip past by spelling one address two ways.
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::InvalidPeerAddress`] -- an entry names no socket.
+	pub fn with_peer_dial_allowlist<I, S>(mut self, allowlist: I) -> Result<Self, ClusterError>
 	where
 		I: IntoIterator<Item = S>,
 		S: Into<String>,
 	{
-		self.peer.peer_dial_allowlist = Some(allowlist.into_iter().map(Into::into).collect());
-		self
+		let mut parsed = HashSet::new();
+		for entry in allowlist {
+			let entry: String = entry.into();
+			let address: PeerAddress = entry.parse()?;
+			parsed.insert(address);
+		}
+
+		self.peer.peer_dial_allowlist = Some(Arc::new(parsed));
+		Ok(self)
 	}
 
 	/// Cap the relay budget honored on inbound work and routed stream opens.
@@ -385,10 +412,8 @@ impl ClusterConfigBuilder {
 	///
 	/// The beat floods the slate rumor when the slate or flood target set
 	/// changed, plus one refresh on this interval.
-	///
-	/// [`ClusterConfigBuilder::build`] clamps the interval to
-	/// [`GossipConfig::seen_ttl`], because a refresh slower than the
-	/// freshness window would re-publish rumors that peers refuse as stale.
+	/// [`ClusterConfig::rumor_refresh`] reads the effective interval, which it
+	/// clamps to the freshness window.
 	pub fn with_rumor_refresh(mut self, rumor_refresh: Duration) -> Self {
 		self.peer.rumor_refresh = rumor_refresh;
 		self
@@ -413,6 +438,12 @@ impl ClusterConfigBuilder {
 		self
 	}
 
+	/// Set the clock the gateway reads. Defaults to [`SystemClock`].
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
+		self
+	}
+
 	/// Set per-signer gossip rate admission.
 	///
 	/// Defaults to the token bucket in [`GossipConfig::default`].
@@ -426,40 +457,42 @@ impl ClusterConfigBuilder {
 	/// Defaults to `None`: the gateway journals and refloods only. The
 	/// ingress sink sits outside the export boundary (see
 	/// [`GossipConfig::ingress`](super::GossipConfig::ingress)).
-	pub fn with_gossip_ingress(mut self, ingress: Urn<'static>) -> Self {
-		self.gossip.ingress = Some(ingress);
-		self
+	///
+	/// # Errors
+	///
+	/// - [`ClusterError::UnknownServletType`] -- the URN is not a bare
+	///   servlet type in this colony's namespace, so no route could ever
+	///   answer it. Refusing here is what stops a gateway admitting gossip
+	///   and delivering none of it.
+	pub fn with_gossip_ingress(mut self, ingress: Urn<'static>) -> Result<Self, ClusterError> {
+		let Some(type_key) = self.namespace.servlet_type_key(&ingress) else {
+			return Err(ClusterError::UnknownServletType(ingress.canonical_bytes()));
+		};
+
+		self.gossip.ingress = Some(type_key);
+		Ok(self)
 	}
 
 	/// Build the cluster configuration.
 	///
-	/// Derives colony membership from the certificate, rebuilds the peer
-	/// discovery table from the dial list, and clamps rumor refresh to the
-	/// gossip freshness window.
+	/// Derives colony membership from the certificate and rebuilds the peer
+	/// discovery table from the dial list.
 	pub fn build(self) -> ClusterConfig {
-		// Colony membership is derived from the certificate exactly once:
-		// the colony URN binds to the cert's URI SAN, and every per-frame
-		// membership check compares against this cached value. A cert
-		// that fails to decode or carries no valid colony URN leaves the
-		// gateway a non-member, fail closed.
-		let colony_urn = Certificate::try_from(self.tls.certificate.clone())
-			.ok()
-			.and_then(|cert| cert_colony_urn(&self.namespace, &cert));
-
 		// The discovery table derives from the dial list at build, so the
 		// configured peers are always its un-evictable anchors. The
 		// injected driver rehydrates learned peers through the capped
 		// admission path. The anchor list is a one-time copy because
 		// `peers` stays readable configuration beside the table.
 		let mut peer = self.peer;
-		peer.table = Arc::new(PeerTable::new(peer.peers.clone(), self.peer_store));
+		peer.table = Arc::new(PeerTable::new(&peer, self.peer_store));
 
-		// A refresh slower than the gossip freshness window would
-		// re-publish advertisement rumors that peers refuse as stale,
-		// so the interval clamps to the window.
-		peer.rumor_refresh = peer.rumor_refresh.min(self.gossip.seen_ttl);
-
-		ClusterConfig {
+		// Colony membership binds to the certificate's URI SAN, and every
+		// per-frame membership check compares against the cached value. A
+		// cert that fails to decode or carries no valid colony URN leaves
+		// the gateway a non-member, fail closed. The gateway binds it
+		// again at startup, so a later certificate change cannot leave a
+		// stale colony behind.
+		let mut config = ClusterConfig {
 			namespace: self.namespace,
 			load_balancer: self.load_balancer,
 			heartbeat: self.heartbeat,
@@ -468,13 +501,18 @@ impl ClusterConfigBuilder {
 			export_gates: self.export_gates,
 			export_grants: self.export_grants,
 			pool_config: self.pool_config,
-			control_freshness_window_ms: self.control_freshness_window_ms,
+			control_freshness_window: self.control_freshness_window,
 			bind_addr: self.bind_addr,
 			edge_bind_addr: self.edge_bind_addr,
 			peer,
 			gossip: self.gossip,
-			colony_urn,
+			clock: self.clock,
+			colony_urn: None,
 			tls: self.tls,
-		}
+		};
+
+		config.bind_colony_membership();
+
+		config
 	}
 }

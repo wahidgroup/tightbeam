@@ -9,7 +9,7 @@ extend-exclude = [
 	"Cargo.lock",
 	# Embedded base64 / DER fixtures (not prose).
 	"tightbeam/src/crypto/x509/utils.rs",
-	"tightbeam/src/testing/utils.rs",
+	"tightbeam/src/testing/fixtures.rs",
 ]
 
 [default]

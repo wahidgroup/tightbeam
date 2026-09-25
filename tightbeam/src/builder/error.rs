@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use crate::asn1::GatedField;
 use crate::{Errorizable, Version};
 
 /// Errors specific to metadata validation
@@ -23,8 +24,8 @@ pub enum MetadataError {
 	MissingEncryption,
 
 	/// Field not supported in this protocol version
-	#[error("Field '{field}' is not supported in protocol version {version:?}")]
-	UnsupportedField { field: &'static str, version: Version },
+	#[error("Field {field} is not supported in protocol version {version:?}")]
+	UnsupportedField { field: GatedField, version: Version },
 }
 
 /// Errors that can occur during builder operations
@@ -33,33 +34,28 @@ pub enum BuildError {
 	/// Invalid metadata configuration
 	#[error("Invalid metadata: {0}")]
 	#[from]
-	#[source]
 	InvalidMetadata(MetadataError),
 
 	/// Invalid matrix dimensions or contents
 	#[error("Matrix error: {0}")]
 	#[from]
-	#[source]
 	MatrixError(crate::matrix::MatrixError),
 
 	/// Error during serialization
 	#[error("Serialization error: {0}")]
 	#[from]
-	#[source]
 	Serialization(der::Error),
 
 	/// Error during encryption
 	#[cfg(feature = "aead")]
 	#[error("Encryption error: {0}")]
 	#[from]
-	#[source]
 	Encryption(aead::Error),
 
 	/// Error during signing
 	#[cfg(feature = "signature")]
 	#[error("Signature error: {0}")]
 	#[from]
-	#[source]
 	Signature(signature::Error),
 
 	/// Error during compression
@@ -71,7 +67,6 @@ pub enum BuildError {
 	#[cfg(feature = "random")]
 	#[error("Random number generation error: {0}")]
 	#[from]
-	#[source]
 	Random(rand_core::Error),
 
 	/// Missing message body

@@ -10,6 +10,7 @@ use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 use crate::der::asn1::BitString;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::kari::kari_wrap;
+use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 
 #[cfg(all(feature = "builder", feature = "aead"))]
 use crate::cms::builder::{Error as CmsBuilderError, RecipientInfoBuilder, RecipientInfoType};
@@ -35,7 +36,8 @@ use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic};
 /// 3. Key wrapping (e.g., AES Key Wrap RFC 3394) of the content-encryption key.
 /// 4. Construction of CMS `KeyAgreeRecipientInfo` structure.
 ///
-/// Generic over `P: CryptoProvider` to allow pluggable cryptographic implementations.
+/// Generic over `P: CryptoProvider` to allow pluggable cryptographic
+/// implementations.
 #[cfg(all(feature = "builder", feature = "aead"))]
 pub struct TightBeamKariBuilder<P>
 where
@@ -67,12 +69,11 @@ where
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 {
-	/// Create a new KARI builder with default KDF (HKDF-SHA3-256) and key wrapper (AES-KW).
+	/// Create a KARI builder with HKDF-SHA3-256 as the KDF and AES Key Wrap
+	/// (RFC 3394) as the key wrapper.
 	///
-	/// This constructor provides a generic implementation that works for any curve type.
-	/// The KDF uses SHA3-256 for HKDF derivation, and the key wrapper uses AES Key Wrap (RFC 3394).
-	///
-	/// Use `with_kdf_info()` to customize the KDF info string for interoperability.
+	/// It works for any curve type. Use `with_kdf_info()` to set a custom KDF
+	/// info string for interoperability.
 	#[cfg(all(feature = "kdf", feature = "sha3"))]
 	pub fn new(provider: P) -> Self {
 		Self {
@@ -125,11 +126,8 @@ where
 
 	/// Set the HKDF info string for KEK derivation.
 	///
-	/// This allows interoperability with other CMS implementations by using
-	/// custom KDF parameters while maintaining HKDF-SHA3-256 algorithm.
-	///
-	/// # Parameters
-	/// - `kdf_info`: Custom info string for HKDF (default: `TIGHTBEAM_KARI_KDF_INFO`)
+	/// A custom label interoperates with other CMS implementations while the
+	/// algorithm stays HKDF-SHA3-256. The default is `TIGHTBEAM_KARI_KDF_INFO`.
 	///
 	/// # Example
 	/// ```ignore
@@ -177,7 +175,8 @@ where
 	}
 }
 
-/// Default implementation for DefaultCryptoProvider (secp256k1 + HKDF-SHA3-256 + AES Key Wrap).
+/// Default implementation for DefaultCryptoProvider (secp256k1 + HKDF-SHA3-256
+/// + AES Key Wrap).
 #[cfg(all(
 	feature = "builder",
 	feature = "aead",
@@ -220,7 +219,7 @@ where
 		// 0. Validate required fields
 		self.validate()?;
 
-		// 1-3. Perform ECDH + HKDF + AES Key Wrap via centralized core
+		// 1-3. Perform ECDH, HKDF and AES Key Wrap through `kari_wrap`
 		let sender_priv = self.sender_priv.as_ref().ok_or(KariBuilderError::MissingSenderPrivateKey)?;
 		let recipient_pub = self.recipient_pub.as_ref().ok_or(KariBuilderError::MissingRecipientPublicKey)?;
 		let ukm = self.ukm.as_ref().ok_or(KariBuilderError::MissingUkm)?;
@@ -228,8 +227,8 @@ where
 			&self.provider,
 			sender_priv,
 			recipient_pub,
-			ukm.as_bytes(),
-			self.kdf_info,
+			KdfSalt::new(ukm.as_bytes()),
+			KdfInfo::new(self.kdf_info),
 			content_encryption_key,
 		)?;
 
@@ -327,7 +326,8 @@ mod tests {
 		assert_eq!(kari.version, CmsVersion::V3);
 		assert_eq!(kari.recipient_enc_keys.len(), 1);
 
-		// Verify originator is set (should always be OriginatorKey for our builder)
+		// Verify originator is set (should always be OriginatorKey for our
+		// builder)
 		let orig_key = match kari.originator {
 			OriginatorIdentifierOrKey::OriginatorKey(k) => k,
 			_ => unreachable!("Kari builder should always create OriginatorKey"),
@@ -339,7 +339,8 @@ mod tests {
 		assert!(matches!(kari.ukm.as_ref(), Some(ukm) if ukm.as_bytes().len() == 64));
 		// Verify key encryption algorithm
 		assert_eq!(kari.key_enc_alg.oid, ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"));
-		// Verify encrypted key is present and longer than CEK (due to RFC 3394 wrapping)
+		// Verify encrypted key is present and longer than CEK (due to RFC 3394
+		// wrapping)
 		assert!(kari.recipient_enc_keys[0].enc_key.as_bytes().len() > cek.len());
 
 		Ok(())

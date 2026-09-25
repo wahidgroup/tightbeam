@@ -1,51 +1,59 @@
-//! EnvelopedData processor for TightBeam CMS handshake.
+//! EnvelopedData processor for the TightBeam CMS handshake.
 //!
-//! Processes received EnvelopedData structures to decrypt content.
+//! The processor decrypts the content of a received EnvelopedData structure.
 
 use core::marker::PhantomData;
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::boxed::Box;
 
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo};
-use crate::crypto::aead::{Decryptor, KeyInit};
+use crate::crypto::aead::{DecryptContent, Decryptor, KeyInit};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::secret::SecretSlice;
-use crate::der::oid::AssociatedOid;
 use crate::transport::handshake::error::HandshakeError;
 
-/// Trait for processing RecipientInfo to extract the Content Encryption Key (CEK).
+/// Trait for processing a RecipientInfo to extract the Content Encryption
+/// Key (CEK).
 ///
-/// Implementations should handle specific recipient types (KARI, KTRI, etc.)
-/// and extract the CEK from the RecipientInfo structure.
+/// An implementation handles one recipient type, such as KARI or KTRI, and
+/// extracts the CEK from the RecipientInfo structure.
 pub trait RecipientProcessor {
 	/// Process a RecipientInfo to extract the CEK.
 	///
 	/// # Parameters
-	/// - `info`: The RecipientInfo structure
-	/// - `recipient_index`: Index of this recipient in the RecipientInfos set
+	///
+	/// - `info`: the RecipientInfo structure.
+	/// - `recipient_index`: the index of this recipient in the RecipientInfos set.
 	///
 	/// # Returns
-	/// The extracted CEK (Content Encryption Key)
-	fn process_recipient(&self, info: &RecipientInfo, recipient_index: usize) -> Result<Vec<u8>, HandshakeError>;
+	///
+	/// The extracted CEK (Content Encryption Key), wrapped so it zeroizes on
+	/// drop.
+	fn process_recipient(
+		&self,
+		info: &RecipientInfo,
+		recipient_index: usize,
+	) -> Result<SecretSlice<u8>, HandshakeError>;
 }
 
 /// Processor for CMS `EnvelopedData` structures.
 ///
-/// This delegates recipient info processing to a `RecipientProcessor` implementation
-/// and uses the standard `Decryptor` trait from `crypto::aead` for content decryption.
+/// The processor delegates recipient info processing to a
+/// [`RecipientProcessor`] implementation and uses the standard `Decryptor`
+/// trait from `crypto::aead` for content decryption.
 pub struct TightBeamEnvelopedDataProcessor<P = DefaultCryptoProvider>
 where
 	P: CryptoProvider,
 {
-	/// Processor to extract CEK from RecipientInfo
+	/// Processor that extracts the CEK from a RecipientInfo.
 	recipient_processor: Box<dyn RecipientProcessor>,
 
-	/// Recipient index to use (default: 0)
+	/// Index of the recipient to use, which defaults to 0.
 	recipient_index: usize,
 
-	/// Phantom data for crypto provider
+	/// Marker for the crypto provider type.
 	_phantom: PhantomData<P>,
 }
 
@@ -80,19 +88,8 @@ where
 		}
 	}
 
-	fn extract_cek(&self, recipient_info: &RecipientInfo) -> Result<Vec<u8>, HandshakeError> {
+	fn extract_cek(&self, recipient_info: &RecipientInfo) -> Result<SecretSlice<u8>, HandshakeError> {
 		self.recipient_processor.process_recipient(recipient_info, self.recipient_index)
-	}
-
-	fn validate_encryption_algorithm(encrypted_content_info: &EncryptedContentInfo) -> Result<(), HandshakeError>
-	where
-		P::AeadOid: AssociatedOid,
-	{
-		if encrypted_content_info.content_enc_alg.oid != P::AeadOid::OID {
-			Err(HandshakeError::MissingContentEncryptionAlgorithm)
-		} else {
-			Ok(())
-		}
 	}
 
 	fn create_cipher_from_cek(cek: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
@@ -112,39 +109,32 @@ where
 		Ok(cipher.decrypt_content(encrypted_content_info)?)
 	}
 
-	/// Process an EnvelopedData structure to extract and decrypt content.
+	/// Process an EnvelopedData structure to extract and decrypt its content.
 	///
 	/// # Steps
-	/// 1. Validate recipient index
-	/// 2. Extract CEK using recipient processor
-	/// 3. Validate encryption algorithm
-	/// 4. Decrypt content
 	///
-	/// # Parameters
-	/// - `enveloped_data`: The EnvelopedData structure to process
+	/// 1. Validate the recipient index.
+	/// 2. Extract the CEK through the recipient processor.
+	/// 3. Decrypt the content, which refuses an algorithm other than the cipher's.
 	///
 	/// # Returns
-	/// The decrypted plaintext content, wrapped so it zeroizes on drop
+	///
+	/// The decrypted plaintext content, wrapped so it zeroizes on drop.
 	pub fn process(&self, enveloped_data: &EnvelopedData) -> Result<SecretSlice<u8>, HandshakeError> {
-		// 1. Validate recipient index
+		// 1. Validate the recipient index.
 		self.validate_recipient_index(enveloped_data)?;
 
-		// 2. Extract CEK
+		// 2. Extract the CEK.
 		let recipient_info = &enveloped_data.recip_infos.0.as_ref()[self.recipient_index];
 		let cek = self.extract_cek(recipient_info)?;
 
-		// 3. Validate encryption algorithm
+		// 3. Decrypt the content.
 		let encrypted_content_info = &enveloped_data.encrypted_content;
-		Self::validate_encryption_algorithm(encrypted_content_info)?;
-
-		// 4. Decrypt content
-		let cipher = Self::create_cipher_from_cek(&cek)?;
+		let cipher = cek.with(|cek| Self::create_cipher_from_cek(cek))?;
 		Self::decrypt_content(&cipher, encrypted_content_info)
 	}
 
-	/// Extract unprotected attributes from the EnvelopedData.
-	///
-	/// Returns the unprotected attributes if present.
+	/// Return the unprotected attributes of the EnvelopedData, if present.
 	pub fn extract_unprotected_attributes<'a>(
 		&self,
 		enveloped_data: &'a EnvelopedData,
@@ -170,6 +160,7 @@ mod tests {
 
 	mod processor {
 		use super::*;
+		use crate::crypto::secret::ToInsecure;
 		use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
 		use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 		use crate::spki::SubjectPublicKeyInfoOwned;
@@ -181,7 +172,7 @@ mod tests {
 			create_test_key_enc_alg, create_test_keypair, create_test_recipient_id, create_test_ukm,
 		};
 
-		/// Helper function to create a test KARI builder with all required fields
+		/// Create a test KARI builder with every required field.
 		fn create_test_kari_builder(
 			sender_key: K256SecretKey,
 			sender_spki: SubjectPublicKeyInfoOwned,
@@ -200,15 +191,15 @@ mod tests {
 				.with_key_enc_alg(key_enc_alg)
 		}
 
-		/// Dummy recipient processor for testing
+		/// Stub recipient processor for testing.
 		struct DummyRecipientProcessor;
 		impl RecipientProcessor for DummyRecipientProcessor {
 			fn process_recipient(
 				&self,
 				_info: &RecipientInfo,
 				_recipient_index: usize,
-			) -> Result<Vec<u8>, HandshakeError> {
-				Ok(vec![0u8; 32])
+			) -> Result<SecretSlice<u8>, HandshakeError> {
+				Ok(SecretSlice::from(vec![0u8; 32]))
 			}
 		}
 
@@ -235,7 +226,7 @@ mod tests {
 
 			// 7. Verify roundtrip success
 			let decrypted = processor.process(&enveloped_data)?;
-			let decrypted = crate::crypto::secret::ToInsecure::to_insecure(decrypted)?;
+			let decrypted = decrypted.to_insecure();
 			assert_eq!(&decrypted[..], &plaintext[..]);
 
 			Ok(())
@@ -255,7 +246,7 @@ mod tests {
 			let processor =
 				TightBeamEnvelopedDataProcessor::with_defaults(DummyRecipientProcessor).with_recipient_index(99);
 
-			// 4. Attempt to process with invalid index; the error MUST be
+			// 4. Process with the invalid index. The error MUST be
 			// InvalidRecipientIndex specifically.
 			let result = processor.process(&enveloped_data);
 			assert!(matches!(result, Err(HandshakeError::InvalidRecipientIndex)));

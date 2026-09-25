@@ -85,29 +85,49 @@ use crate::der::{DecodeValue, EncodeValue, FixedTag, Tag};
 pub struct Urn<'a> {
 	/// Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with letter)
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
-	pub nid: Cow<'a, str>,
+	nid: Cow<'a, str>,
 
 	/// Namespace-Specific String (structure defined by namespace)
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.2>`
-	pub nss: Cow<'a, str>,
+	nss: Cow<'a, str>,
 }
 
 impl<'a> Urn<'a> {
-	/// Create an unchecked URN from static strings
+	/// A URN from static parts, with no checks.
 	///
-	/// This can be used in const contexts to define constant URNs.
-	/// No validation is performed - use `verify::<Spec>()` at runtime
-	/// to validate against a spec.
-	///
-	/// # Example
-	///
-	/// ```rust
-	/// # use tightbeam::utils::urn::Urn;
-	/// const EXAMPLE_URN: Urn<'static> = Urn::new("example", "test:resource");
-	/// ```
-	#[inline]
-	pub const fn new(nid: &'static str, nss: &'static str) -> Urn<'static> {
+	/// Exists for [`urn!`](crate::urn), which validates both parts in a
+	/// `const` block before calling it, and has to be `pub` because the
+	/// macro expands in downstream crates. Write `urn!` instead.
+	#[doc(hidden)]
+	pub const fn new_unchecked(nid: &'static str, nss: &'static str) -> Urn<'static> {
 		Urn { nid: Cow::Borrowed(nid), nss: Cow::Borrowed(nss) }
+	}
+
+	/// Build a URN from parts that are not known until run time.
+	///
+	/// [`urn!`](crate::urn) is the compile-time path for literals. This one
+	/// takes the same rules to values a caller assembles.
+	///
+	/// # Errors
+	///
+	/// - [`UrnValidationError::InvalidNidLength`], [`UrnValidationError::InvalidNidStart`]
+	///   or [`UrnValidationError::InvalidNidCharacters`] when `nid` is outside
+	///   RFC 8141's formal-namespace-identifier shape.
+	/// - [`UrnValidationError::RequiredFieldMissing`] when `nss` is empty.
+	pub fn from_parts(nid: impl AsRef<str>, nss: impl AsRef<str>) -> Result<Urn<'static>, UrnValidationError> {
+		let nid = Cow::Owned(String::from(nid.as_ref()));
+		let nss = Cow::Owned(String::from(nss.as_ref()));
+		Urn::checked(nid, nss)
+	}
+
+	/// Namespace Identifier.
+	pub fn nid(&self) -> &str {
+		&self.nid
+	}
+
+	/// Namespace-Specific String.
+	pub fn nss(&self) -> &str {
+		&self.nss
 	}
 
 	/// Verify this URN against a spec
@@ -137,26 +157,57 @@ impl<'a> Urn<'a> {
 	///
 	/// NID must be 2-32 characters, alphanumeric plus hyphens, starting with a letter.
 	/// This implements the formal-namespace-identifier production from RFC 8141.
-	pub fn validate_nid(nid: &str) -> Result<(), UrnValidationError> {
-		let len = nid.len();
-		if !(2..=32).contains(&len) {
+	pub const fn validate_nid(nid: &str) -> Result<(), UrnValidationError> {
+		// Byte-wise because `str::chars` is not available in a `const fn`.
+		// The production is ASCII, so bytes and characters agree here.
+		let bytes = nid.as_bytes();
+		if bytes.len() < 2 || bytes.len() > 32 {
 			return Err(UrnValidationError::InvalidNidLength);
 		}
 
-		let mut chars = nid.chars();
-		if let Some(first) = chars.next() {
-			if !first.is_ascii_alphabetic() {
-				return Err(UrnValidationError::InvalidNidStart);
-			}
+		if !bytes[0].is_ascii_alphabetic() {
+			return Err(UrnValidationError::InvalidNidStart);
 		}
 
-		for ch in chars {
-			if !ch.is_ascii_alphanumeric() && ch != '-' {
+		let mut index = 1;
+		while index < bytes.len() {
+			let byte = bytes[index];
+			if !byte.is_ascii_alphanumeric() && byte != b'-' {
 				return Err(UrnValidationError::InvalidNidCharacters);
 			}
+
+			index += 1;
 		}
 
 		Ok(())
+	}
+
+	/// Validate a Namespace-Specific String.
+	///
+	/// RFC 8141 s2 requires at least one NSS character: `urn:nid:` names
+	/// nothing, and an empty NSS would collide with every other empty one.
+	///
+	/// # Errors
+	///
+	/// - [`UrnValidationError::RequiredFieldMissing`] when `nss` is empty.
+	pub const fn validate_nss(nss: &str) -> Result<(), UrnValidationError> {
+		if nss.is_empty() {
+			return Err(UrnValidationError::RequiredFieldMissing("nss"));
+		}
+
+		Ok(())
+	}
+
+	/// The one runtime path that assembles a `Urn`.
+	///
+	/// [`urn!`](crate::urn) checks literals in const context. Every other
+	/// constructor, the parser and the builder included, comes through here,
+	/// so no path can produce a URN the constructors would refuse.
+	pub(super) fn checked(nid: Cow<'a, str>, nss: Cow<'a, str>) -> Result<Urn<'a>, UrnValidationError> {
+		Self::validate_nid(&nid)?;
+		Self::validate_nss(&nss)?;
+
+		Ok(Urn { nid, nss })
 	}
 
 	/// Convert the URN to an owned version with 'static lifetime
@@ -183,15 +234,7 @@ impl FromStr for Urn<'static> {
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		let rest = s.strip_prefix("urn:").ok_or(UrnValidationError::InvalidUrnSyntax)?;
 		let (nid, nss) = rest.split_once(':').ok_or(UrnValidationError::InvalidUrnSyntax)?;
-		Self::validate_nid(nid)?;
-
-		// RFC 8141 §2 requires at least one NSS character: "urn:nid:"
-		// names nothing and would collide with every empty-NSS parse.
-		if nss.is_empty() {
-			return Err(UrnValidationError::InvalidUrnSyntax);
-		}
-
-		Ok(Urn { nid: Cow::Owned(nid.to_string()), nss: Cow::Owned(nss.to_string()) })
+		Urn::checked(Cow::Owned(nid.to_string()), Cow::Owned(nss.to_string()))
 	}
 }
 

@@ -11,23 +11,12 @@
 use core::future::Future;
 use core::hash::Hash;
 
-use crate::crypto::profiles::CryptoProvider;
 use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::{MuxConnector, RequestSink, StreamBody, StreamRoute};
 use crate::transport::policy::PolicyConfig;
-use crate::transport::{PersistentConnection, PooledClient, Protocol, TransportResult, X509ClientConfig};
+use crate::transport::{PersistentConnection, PooledClient, Protocol, TransportResult};
 use crate::utils::marker::MaybeSend;
-use crate::utils::urn::Urn;
 use crate::Frame;
-
-/// Build a relayed [`StreamRoute`] for harness opens that must spend hop
-/// budget before the first gateway.
-///
-/// The origin sentinel is excluded by construction: hop budget is clamped
-/// below the origin open budget.
-pub fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> StreamRoute {
-	StreamRoute::relayed_to(target, hops_remaining)
-}
 
 /// Harness-facing stream opens on [`PooledClient`] that carry a fully
 /// formed [`StreamRoute`].
@@ -59,18 +48,11 @@ pub trait RoutedOpens {
 	fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)>;
 }
 
-impl<P, C> RoutedOpens for PooledClient<P, C>
+impl<P> RoutedOpens for PooledClient<P>
 where
 	P: Protocol + PersistentConnection + Send + Sync,
-	C: CryptoProvider + Send + Sync + 'static,
 	P::Address: Hash + Eq + Clone + Send + Sync,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = C>
-		+ MuxConnector
-		+ Send
-		+ Sync,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + MuxConnector + Send + Sync,
 {
 	fn open_stream_with_route(
 		&self,

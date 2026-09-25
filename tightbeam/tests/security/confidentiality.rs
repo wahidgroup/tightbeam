@@ -18,8 +18,7 @@
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data
 //!   <https://cwe.mitre.org/data/definitions/311.html>
-//! - CAPEC-157: Sniffing Attacks
-//!   <https://capec.mitre.org/data/definitions/157.html>
+//! - CAPEC-157: Sniffing Attacks <https://capec.mitre.org/data/definitions/157.html>
 //! - RFC 9180 (HPKE): ECDH + KDF + AEAD construction
 
 use std::sync::Arc;
@@ -38,21 +37,20 @@ use crate::security::common::{
 };
 
 pub(crate) const CONF_CAPTURE_HANDSHAKE: Urn<'static> =
-	Urn::new("test", "event:confidentiality/conf-capture-handshake");
+	tightbeam::urn!("test", "event:confidentiality/conf-capture-handshake");
 pub(crate) const CONF_CIPHERTEXTS_DIFFER: Urn<'static> =
-	Urn::new("test", "event:confidentiality/conf-ciphertexts-differ");
+	tightbeam::urn!("test", "event:confidentiality/conf-ciphertexts-differ");
 pub(crate) const CONF_DECRYPT_CORRECT_KEY: Urn<'static> =
-	Urn::new("test", "event:confidentiality/conf-decrypt-correct-key");
+	tightbeam::urn!("test", "event:confidentiality/conf-decrypt-correct-key");
 pub(crate) const CONF_DECRYPT_WRONG_KEY_FAILS: Urn<'static> =
-	Urn::new("test", "event:confidentiality/conf-decrypt-wrong-key-fails");
+	tightbeam::urn!("test", "event:confidentiality/conf-decrypt-wrong-key-fails");
 pub(crate) const CONF_EXTRACT_CIPHERTEXT: Urn<'static> =
-	Urn::new("test", "event:confidentiality/conf-extract-ciphertext");
+	tightbeam::urn!("test", "event:confidentiality/conf-extract-ciphertext");
 
 tb_assert_spec! {
 	pub ConfidentialitySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CONF_CAPTURE_HANDSHAKE, exactly!(1u32)),
 			(CONF_EXTRACT_CIPHERTEXT, exactly!(1u32)),

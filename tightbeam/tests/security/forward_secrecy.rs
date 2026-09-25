@@ -33,9 +33,11 @@ use crate::security::common::{
 };
 
 pub(crate) const FS_ALL_EPHEMERAL_UNIQUE: Urn<'static> =
-	Urn::new("test", "event:forward-secrecy/fs-all-ephemeral-unique");
-pub(crate) const FS_CAPTURE_HANDSHAKE: Urn<'static> = Urn::new("test", "event:forward-secrecy/fs-capture-handshake");
-pub(crate) const FS_EXTRACT_EPHEMERAL: Urn<'static> = Urn::new("test", "event:forward-secrecy/fs-extract-ephemeral");
+	tightbeam::urn!("test", "event:forward-secrecy/fs-all-ephemeral-unique");
+pub(crate) const FS_CAPTURE_HANDSHAKE: Urn<'static> =
+	tightbeam::urn!("test", "event:forward-secrecy/fs-capture-handshake");
+pub(crate) const FS_EXTRACT_EPHEMERAL: Urn<'static> =
+	tightbeam::urn!("test", "event:forward-secrecy/fs-extract-ephemeral");
 
 /// Number of handshakes to perform for forward secrecy verification.
 const HANDSHAKE_COUNT: usize = 5;
@@ -44,7 +46,6 @@ tb_assert_spec! {
 	pub ForwardSecrecySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FS_CAPTURE_HANDSHAKE, exactly!(HANDSHAKE_COUNT as u32)),
 			(FS_EXTRACT_EPHEMERAL, exactly!(HANDSHAKE_COUNT as u32)),

@@ -37,17 +37,20 @@ pub struct StreamLabel {
 	pub label: String,
 }
 
-pub(crate) const SERVLET_UNARY_HANDLED: Urn<'static> = Urn::new("test", "event:colony-streaming/servlet-unary-handled");
+pub(crate) const SERVLET_UNARY_HANDLED: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/servlet-unary-handled");
 pub(crate) const SERVLET_STREAM_HANDLED: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/servlet-stream-handled");
+	tightbeam::urn!("test", "event:colony-streaming/servlet-stream-handled");
 pub(crate) const SERVLET_DUPLEX_HANDLED: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/servlet-duplex-handled");
-pub(crate) const UNARY_ECHOES: Urn<'static> = Urn::new("test", "event:colony-streaming/unary-echoes");
+	tightbeam::urn!("test", "event:colony-streaming/servlet-duplex-handled");
+pub(crate) const UNARY_ECHOES: Urn<'static> = tightbeam::urn!("test", "event:colony-streaming/unary-echoes");
 pub(crate) const STREAM_REPLY_REPORTS_LENGTH: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/stream-reply-reports-length");
-pub(crate) const DUPLEX_ECHOES_CHUNKS: Urn<'static> = Urn::new("test", "event:colony-streaming/duplex-echoes-chunks");
+	tightbeam::urn!("test", "event:colony-streaming/stream-reply-reports-length");
+pub(crate) const DUPLEX_ECHOES_CHUNKS: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/duplex-echoes-chunks");
 
-fn reply_frame(label: &str) -> Result<Frame, TightBeamError> {
+fn reply_frame(label: impl AsRef<str>) -> Result<Frame, TightBeamError> {
+	let label = label.as_ref();
 	Ok(compose! {
 		V0: id: b"colony-streaming-reply",
 			message: StreamLabel { label: label.to_string() }
@@ -112,6 +115,7 @@ async fn pooled_lease(
 		max_connections: 1,
 		mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 	};
+
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
@@ -119,7 +123,6 @@ async fn pooled_lease(
 			.with_trace(trace.share())
 			.build(),
 	);
-
 	Ok(pool.connect(addr).await?)
 }
 
@@ -127,7 +130,6 @@ tb_assert_spec! {
 	pub ColonyStreamingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVLET_UNARY_HANDLED, exactly!(1)),
 			(SERVLET_STREAM_HANDLED, exactly!(1)),
@@ -148,7 +150,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			let conf = streaming_servlet_conf(&materials)?;
-			StreamingEchoServlet::start(Arc::new(trace), Some(conf)).await
+			StreamingEchoServlet::start(Arc::new(trace), conf).await
 		},
 		setup: |ClientEnv { trace, context: materials, addr }| async move {
 			pooled_lease(&trace, &materials, addr).await
@@ -156,7 +158,7 @@ tb_scenario! {
 		client: |ServletEnv { trace, mut client, .. }| async move {
 			let request = reply_frame("unary-body")?;
 			let reply = client.emit(request.to_owned(), None).await?;
-			let value = reply.map(|frame| frame.message.to_owned()) == Some(request.message.to_owned());
+			let value = reply.map(|frame| frame.message().to_owned()) == Some(request.message().to_owned());
 
 			trace.event_with(UNARY_ECHOES, &[], value)?;
 
@@ -167,7 +169,7 @@ tb_scenario! {
 
 			let reply = response.await?;
 			let expected = reply_frame("8")?;
-			let value = reply.map(|frame| frame.message.to_owned()) == Some(expected.message.to_owned());
+			let value = reply.map(|frame| frame.message().to_owned()) == Some(expected.message().to_owned());
 
 			trace.event_with(STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
 
@@ -192,9 +194,10 @@ tb_scenario! {
 	}
 }
 
-pub(crate) const STREAM_ONLY_REPLY_OK: Urn<'static> = Urn::new("test", "event:colony-streaming/stream-only-reply-ok");
+pub(crate) const STREAM_ONLY_REPLY_OK: Urn<'static> =
+	tightbeam::urn!("test", "event:colony-streaming/stream-only-reply-ok");
 pub(crate) const STREAM_ONLY_UNARY_REFUSED: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/stream-only-unary-refused");
+	tightbeam::urn!("test", "event:colony-streaming/stream-only-unary-refused");
 
 servlet! {
 	/// A streaming-only servlet with no `handle:` arm at all. Unary requests
@@ -214,7 +217,6 @@ tb_assert_spec! {
 	pub StreamOnlyServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(STREAM_ONLY_REPLY_OK, exactly!(1), equals!(true)),
 			(STREAM_ONLY_UNARY_REFUSED, exactly!(1), equals!(true))
@@ -231,7 +233,7 @@ tb_scenario! {
 		context: ServerMaterials::generate(),
 		start: |SetupEnv { trace, context: materials }| async move {
 			let conf = streaming_servlet_conf(&materials)?;
-			StreamOnlyServlet::start(Arc::new(trace), Some(conf)).await
+			StreamOnlyServlet::start(Arc::new(trace), conf).await
 		},
 		setup: |ClientEnv { trace, context: materials, addr }| async move {
 			pooled_lease(&trace, &materials, addr).await
@@ -251,7 +253,7 @@ tb_scenario! {
 
 			let reply = response.await?;
 			let expected = reply_frame("5")?;
-			let value = reply.map(|frame| frame.message.to_owned()) == Some(expected.message.to_owned());
+			let value = reply.map(|frame| frame.message().to_owned()) == Some(expected.message().to_owned());
 
 			trace.event_with(STREAM_ONLY_REPLY_OK, &[], value)?;
 
@@ -266,9 +268,9 @@ hive! {
 }
 
 pub(crate) const HIVE_STREAM_REPLY_REPORTS_LENGTH: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/hive-stream-reply-reports-length");
+	tightbeam::urn!("test", "event:colony-streaming/hive-stream-reply-reports-length");
 pub(crate) const HIVE_DUPLEX_ECHOES_CHUNKS: Urn<'static> =
-	Urn::new("test", "event:colony-streaming/hive-duplex-echoes-chunks");
+	tightbeam::urn!("test", "event:colony-streaming/hive-duplex-echoes-chunks");
 
 /// Returns the type URN that every hive scenario in this file registers
 /// and targets.
@@ -284,7 +286,7 @@ async fn start_streaming_hive(
 	trace: TraceCollector,
 	materials: &ServerMaterials,
 ) -> Result<StreamingHive, TightBeamError> {
-	let config = Some(streaming_servlet_conf(materials)?);
+	let config = streaming_servlet_conf(materials)?;
 	let trace = Arc::new(trace.share());
 	let servlet = StreamingEchoServlet::start(Arc::clone(&trace), config).await?;
 
@@ -293,7 +295,9 @@ async fn start_streaming_hive(
 	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 
 	let mut hive = StreamingHive::new(Some(conf))?;
-	hive.register(stream_echo_urn(), servlet, |t| StreamingEchoServlet::start(t, None))?;
+	hive.register(stream_echo_urn(), servlet, |t| {
+		StreamingEchoServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(trace).await?;
 	Ok(hive)
 }
@@ -302,7 +306,6 @@ tb_assert_spec! {
 	pub HiveStreamingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVLET_STREAM_HANDLED, exactly!(1)),
 			(HIVE_STREAM_REPLY_REPORTS_LENGTH, exactly!(1), equals!(true))
@@ -331,7 +334,7 @@ tb_scenario! {
 			sink.close_with(b"beam").await?;
 
 			let reply = response.await?;
-			let label: StreamLabel = decode(&reply.message)?;
+			let label: StreamLabel = decode(reply.message())?;
 			let value = label.label == "9";
 
 			trace.event_with(HIVE_STREAM_REPLY_REPORTS_LENGTH, &[], value)?;
@@ -346,7 +349,6 @@ tb_assert_spec! {
 	pub HiveDuplexSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVLET_DUPLEX_HANDLED, exactly!(1)),
 			(HIVE_DUPLEX_ECHOES_CHUNKS, exactly!(1), equals!(true))

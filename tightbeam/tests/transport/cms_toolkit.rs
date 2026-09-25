@@ -1,9 +1,11 @@
 //! Integration tests for the public CMS toolkit.
 //!
-//! Exercises the toolkit end to end through public interfaces only:
-//! KARI CEK wrap/unwrap, `EnvelopedData` sealing and decryption via the
-//! builder/processor pair, and `SignedData` signing and verification,
-//! including the failure paths a consumer relies on.
+//! The tests exercise the toolkit end to end through public interfaces
+//! only, including the failure paths a consumer relies on:
+//!
+//! - KARI CEK wrap and unwrap,
+//! - `EnvelopedData` sealing and decryption through the builder and processor pair, and
+//! - `SignedData` signing and verification.
 
 #![cfg(all(
 	feature = "transport-cms",
@@ -36,6 +38,7 @@ use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::builders::{
 	TightBeamEnvelopedDataBuilder, TightBeamKariBuilder, TightBeamSignedDataBuilder,
 };
+use tightbeam::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use tightbeam::transport::handshake::processors::{
 	TightBeamEnvelopedDataProcessor, TightBeamKariRecipient, TightBeamSignedDataProcessor,
 };
@@ -45,17 +48,17 @@ use tightbeam::x509::serial_number::SerialNumber;
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const ATTRIBUTE_EXTRACTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/attribute-extracted");
-pub(crate) const CEK_RECOVERED: Urn<'static> = Urn::new("test", "event:cms-toolkit/cek-recovered");
-pub(crate) const CEK_WRAPPED: Urn<'static> = Urn::new("test", "event:cms-toolkit/cek-wrapped");
-pub(crate) const CONTENT_RECOVERED: Urn<'static> = Urn::new("test", "event:cms-toolkit/content-recovered");
-pub(crate) const CONTENT_SIGNED: Urn<'static> = Urn::new("test", "event:cms-toolkit/content-signed");
-pub(crate) const ENVELOPE_SEALED: Urn<'static> = Urn::new("test", "event:cms-toolkit/envelope-sealed");
-pub(crate) const FOREIGN_KEY_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/foreign-key-rejected");
-pub(crate) const SIGNATURE_VERIFIED: Urn<'static> = Urn::new("test", "event:cms-toolkit/signature-verified");
-pub(crate) const TAMPER_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/tamper-rejected");
-pub(crate) const WIRE_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:cms-toolkit/wire-roundtrip");
-pub(crate) const WRONG_KEY_REJECTED: Urn<'static> = Urn::new("test", "event:cms-toolkit/wrong-key-rejected");
+pub(crate) const ATTRIBUTE_EXTRACTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/attribute-extracted");
+pub(crate) const CEK_RECOVERED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/cek-recovered");
+pub(crate) const CEK_WRAPPED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/cek-wrapped");
+pub(crate) const CONTENT_RECOVERED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/content-recovered");
+pub(crate) const CONTENT_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/content-signed");
+pub(crate) const ENVELOPE_SEALED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/envelope-sealed");
+pub(crate) const FOREIGN_KEY_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/foreign-key-rejected");
+pub(crate) const SIGNATURE_VERIFIED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/signature-verified");
+pub(crate) const TAMPER_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/tamper-rejected");
+pub(crate) const WIRE_ROUNDTRIP: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/wire-roundtrip");
+pub(crate) const WRONG_KEY_REJECTED: Urn<'static> = tightbeam::urn!("test", "event:cms-toolkit/wrong-key-rejected");
 
 /// OID for the test-only unprotected attribute carried through the envelope.
 const TOOLKIT_ATTR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1");
@@ -68,15 +71,10 @@ fn recipient_identifier() -> Result<KeyAgreeRecipientIdentifier, HandshakeError>
 	}))
 }
 
-// ============================================================================
-// KARI: CEK wrap/unwrap
-// ============================================================================
-
 tb_assert_spec! {
 	pub KariCekSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CEK_WRAPPED, exactly!(1)),
 			(CEK_RECOVERED, exactly!(1)),
@@ -98,18 +96,18 @@ tb_scenario! {
 			let ukm = generate_nonce::<64>(None)?;
 			let cek = [0x42u8; 32];
 
-			let wrapped = kari_wrap(&provider, &sender, &recipient.public_key(), &ukm, TIGHTBEAM_KARI_KDF_INFO, &cek)?;
+			let wrapped = kari_wrap(&provider, &sender, &recipient.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &cek)?;
 			assert_ne!(wrapped.as_slice(), cek.as_slice(), "wrapped CEK must not expose the plaintext CEK");
 			trace.event(CEK_WRAPPED)?;
 
 			let unwrapped =
-				kari_unwrap(&provider, &recipient, &sender.public_key(), &ukm, TIGHTBEAM_KARI_KDF_INFO, &wrapped)?;
-			assert_eq!(unwrapped.as_slice(), cek.as_slice(), "recipient must recover the exact CEK");
+				kari_unwrap(&provider, &recipient, &sender.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &wrapped)?;
+			assert_eq!(unwrapped.to_insecure().as_slice(), cek.as_slice(), "recipient must recover the exact CEK");
 
 			trace.event(CEK_RECOVERED)?;
 
 			let wrong =
-				kari_unwrap(&provider, &intruder, &sender.public_key(), &ukm, TIGHTBEAM_KARI_KDF_INFO, &wrapped);
+				kari_unwrap(&provider, &intruder, &sender.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &wrapped);
 			assert!(wrong.is_err(), "a foreign recipient key must fail the unwrap integrity check");
 
 			trace.event(WRONG_KEY_REJECTED)?;
@@ -117,7 +115,7 @@ tb_scenario! {
 			let mut tampered = wrapped;
 			tampered[0] ^= 0x01;
 			let forged =
-				kari_unwrap(&provider, &recipient, &sender.public_key(), &ukm, TIGHTBEAM_KARI_KDF_INFO, &tampered);
+				kari_unwrap(&provider, &recipient, &sender.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &tampered);
 			assert!(forged.is_err(), "a tampered wrapped CEK must fail the unwrap integrity check");
 
 			trace.event(TAMPER_REJECTED)?;
@@ -127,15 +125,10 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// EnvelopedData: builder -> wire -> processor
-// ============================================================================
-
 tb_assert_spec! {
 	pub EnvelopeRoundTripSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(ENVELOPE_SEALED, exactly!(1)),
 			(WIRE_ROUNDTRIP, exactly!(1)),
@@ -180,7 +173,7 @@ tb_scenario! {
 
 			let kari = TightBeamKariRecipient::with_defaults(recipient);
 			let processor = TightBeamEnvelopedDataProcessor::with_defaults(kari);
-			let recovered = processor.process(&envelope)?.to_insecure()?;
+			let recovered = processor.process(&envelope)?.to_insecure();
 			assert_eq!(&recovered[..], plaintext.as_slice(), "recipient must recover the sealed plaintext");
 
 			trace.event(CONTENT_RECOVERED)?;
@@ -198,15 +191,10 @@ tb_scenario! {
 	}
 }
 
-// ============================================================================
-// SignedData: builder -> processor
-// ============================================================================
-
 tb_assert_spec! {
 	pub SignedContentSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CONTENT_SIGNED, exactly!(1)),
 			(SIGNATURE_VERIFIED, exactly!(1)),

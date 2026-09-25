@@ -6,17 +6,26 @@ on:
       - "releases/v*"
       - "releases/derive/v*"
 
+# Read-only by default. Each job widens only what it needs.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   NO_HUSKY_HOOKS: "1"
 
 jobs:
-  release:
-    name: Publish & Release
+  # Everything that compiles, installs, or runs project code lives here, where
+  # no registry credential can be minted. A build script or proc macro that
+  # runs in this job has no OIDC endpoint to reach.
+  verify:
+    name: Verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      title: ${{ steps.version.outputs.title }}
+      derive: ${{ steps.version.outputs.derive }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,66 +46,99 @@ jobs:
         run: make ci
 
       - name: Verify version matches tag
+        id: version
         run: |
+          set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           if [[ "$tag" == releases/derive/* ]]; then
             VERSION="${tag#releases/derive/v}"
-            CURRENT=$(awk -F'"' '/^\[package\]/{f=1;next} f&&/^\[/{f=0} f&&/^version/{print $2;exit}' tightbeam-derive/Cargo.toml)
             CRATE="tightbeam-derive"
+            DERIVE=1
           else
             VERSION="${tag#releases/v}"
-            CURRENT=$(awk -F'"' '/^\[workspace\.package\]/{f=1;next} f&&/^\[/{f=0} f&&/^version/{print $2;exit}' Cargo.toml)
-            CRATE="tightbeam"
+            CRATE="tightbeam-rs"
+            DERIVE=0
           fi
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "TAG=$tag" >> "$GITHUB_ENV"
-          echo "TITLE=${CRATE} v${VERSION}" >> "$GITHUB_ENV"
+          CURRENT="$(./scripts/crate-version.sh "$CRATE")"
           if [ "$CURRENT" != "$VERSION" ]; then
             echo "${CRATE} version (${CURRENT}) does not match tag (${VERSION})"
             echo "Bump on master via make release version=v${VERSION} before tagging."
             exit 1
           fi
+          echo "derive=$DERIVE" >> "$GITHUB_OUTPUT"
+          echo "title=${CRATE} v${VERSION}" >> "$GITHUB_OUTPUT"
 
+      # One flag selects the crate for both registry checks, so a derive-only
+      # tag is never graded against tightbeam-rs.
       - name: Refuse yanked versions
-        run: |
-          if [[ "${GITHUB_REF_NAME}" == releases/derive/* ]]; then
-            ./scripts/check-yanked.sh --derive
-          else
-            ./scripts/check-yanked.sh
-          fi
+        run: make check-yanked derive=${{ steps.version.outputs.derive }}
+
+      - name: Verify the version bump covers the API change
+        run: make check-semver derive=${{ steps.version.outputs.derive }}
+
+  publish:
+    name: Publish
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      # Trusted Publishing exchanges the OIDC token for a short-lived registry
+      # token, so no long-lived CARGO_REGISTRY_TOKEN is stored.
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
 
       - name: Publish tightbeam-derive
-        if: startsWith(github.ref, 'refs/tags/releases/derive/')
-        run: cargo publish --package tightbeam-derive
+        if: needs.verify.outputs.derive == '1'
+        run: cargo publish --locked --package tightbeam-derive
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      # tightbeam-rs depends on tightbeam-derive, so the dependency must be
+      # resolvable on the registry before the dependent publish starts.
       - name: Publish tightbeam-derive (if needed)
-        if: startsWith(github.ref, 'refs/tags/releases/v')
+        if: needs.verify.outputs.derive == '0'
         run: |
-          local_version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "tightbeam-derive") | .version')
-          published_version=$(cargo search tightbeam-derive --limit 1 \
-            | head -1 | sed 's/.*= "\(.*\)".*/\1/')
-          if [ "$local_version" = "$published_version" ]; then
-            echo "tightbeam-derive ${local_version} already on crates.io, skipping"
+          set -euo pipefail
+          derive_version="$(./scripts/crate-version.sh tightbeam-derive)"
+          if [ "$(./scripts/crates-io.sh tightbeam-derive "$derive_version")" = "published" ]; then
+            echo "tightbeam-derive ${derive_version} already on crates.io, skipping"
           else
-            echo "Publishing tightbeam-derive ${local_version} (crates.io has ${published_version})"
-            cargo publish --package tightbeam-derive
-            echo "Waiting for crates.io index..."
-            sleep 30
+            cargo publish --locked --package tightbeam-derive
+            ./scripts/await-publish.sh tightbeam-derive "$derive_version"
           fi
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish tightbeam-rs
-        if: startsWith(github.ref, 'refs/tags/releases/v')
-        run: cargo publish --package tightbeam-rs
+        if: needs.verify.outputs.derive == '0'
+        run: cargo publish --locked --package tightbeam-rs
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          name: ${{ env.TITLE }}
+          subject-path: target/package/*.crate
+
+  release:
+    name: GitHub Release
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: ${{ needs.verify.outputs.title }}
           generate_release_notes: true

@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run a RustSec advisory audit over the workspace dependency tree.
-# Installs cargo-audit on demand so the target works in clean CI images.
+# Check the dependency tree against deny.toml: RustSec advisories, the licence
+# allow-list, banned and wildcard dependencies, and the permitted sources.
+# Installs cargo-deny on demand so the target works in clean CI images.
 
-if ! command -v cargo-audit >/dev/null 2>&1; then
-	echo "Installing cargo-audit..."
-	cargo install cargo-audit --locked
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if ! "$ROOT/scripts/tool-installed.sh" cargo-deny; then
+	VERSION="$("$ROOT/scripts/tool-version.sh" cargo-deny)"
+	echo "Installing cargo-deny $VERSION..."
+	cargo install cargo-deny --version "$VERSION" --locked --force
 fi
 
-echo "Running security audit..."
-cargo audit
+echo "Running dependency audit..."
+cargo deny --manifest-path "$ROOT/Cargo.toml" check

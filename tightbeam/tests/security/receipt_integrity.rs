@@ -1,26 +1,23 @@
 //! # Session-receipt integrity threats
 //!
 //! ## Weakness
-//! A [`SessionReceipt`] is a dual-signed, third-party-verifiable artifact
-//! attesting the budgets granted for a metered session. Enforcement clamps
-//! every direction to [`MAX_MUX_SESSION_BUDGET`] (CWE-770). If the server
-//! signs the raw request into the receipt instead of the enforced value,
-//! the artifact attests a fact the system does not implement. Both parties
-//! then countersign a budget neither endpoint will honour.
+//! A [`SessionReceipt`] is a dual-signed artifact that a third party can
+//! verify, and it attests the budgets granted for a metered session.
+//! Enforcement clamps each direction to [`MAX_MUX_SESSION_BUDGET`] (CWE-770).
+//! A server that signs the raw request instead of the enforced value makes
+//! both parties countersign a budget that neither endpoint honours.
 //!
 //! ## Attack
-//! A client offers `requested_budgets` far above the enforcement ceiling
-//! against a server with no local budget ceiling configured. The server
-//! grants the request, signs a receipt over the raw figure, and the client
-//! countersigns. The resulting third-party-verifiable artifact states a
-//! credit volume the session will never admit.
+//! A client offers `requested_budgets` far above the enforcement ceiling to a
+//! server with no local budget ceiling. The server signs a receipt over the
+//! raw figure, and the client countersigns an artifact that states a credit
+//! volume the session never admits.
 //!
 //! ## Expected control
-//! The budgets and credit unit bound into the receipt MUST be the same
-//! values the transport enforces. The grant is clamped once, at the choke
-//! point, before it enters both the transcript and the receipt. The wire
-//! accept, the receipt body, and the enforced budget are then
-//! byte-identical (SSOT).
+//! The receipt MUST bind the budgets and credit unit the transport enforces.
+//! The grant is clamped once, before it enters the transcript and the
+//! receipt, so the transport accept, the receipt body, and the enforced
+//! budget are byte-identical.
 //!
 //! ## References
 //! - CWE-770: Allocation of Resources Without Limits or Throttling
@@ -50,9 +47,9 @@ use crate::common::security::expectation_failure;
 use crate::transport::support::{establish_mutual_transports, MutualSessionHooks};
 
 pub(crate) const RECEIPT_BUDGETS_WITHIN_CEILING: Urn<'static> =
-	Urn::new("test", "event:receipt-integrity/receipt-budgets-within-ceiling");
+	tightbeam::urn!("test", "event:receipt-integrity/receipt-budgets-within-ceiling");
 pub(crate) const RECEIPT_MATCHES_ENFORCED_BUDGET: Urn<'static> =
-	Urn::new("test", "event:receipt-integrity/receipt-matches-enforced-budget");
+	tightbeam::urn!("test", "event:receipt-integrity/receipt-matches-enforced-budget");
 
 /// Client request that overshoots the enforcement ceiling in both
 /// directions, so a faithful receipt must reflect the clamp.
@@ -65,7 +62,6 @@ tb_assert_spec! {
 	pub ReceiptBudgetClampSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RECEIPT_BUDGETS_WITHIN_CEILING, exactly!(1), equals!(true)),
 			(RECEIPT_MATCHES_ENFORCED_BUDGET, exactly!(1), equals!(true))

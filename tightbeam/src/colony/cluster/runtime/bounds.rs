@@ -2,12 +2,15 @@
 
 use core::hash::Hash;
 use core::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use digest::consts::U32;
 use digest::{Digest, OutputSizeUser};
 
+use crate::colony::cluster::registry::ColonyMembership;
+use crate::colony::cluster::runtime::freshness::GatewayReplayGuard;
 use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletRegistry};
+use crate::colony::common::TaskGroup;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::der::oid::AssociatedOid;
 use crate::macros::server::AcceptedConnection;
@@ -17,29 +20,9 @@ use crate::transport::messaging::{MessageCollector, MessageEmitter};
 use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, X509ClientConfig};
+use crate::transport::{AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol};
 
-#[cfg(feature = "x509")]
-use crate::colony::hive::ReplayGuard;
-
-pub(crate) type ClusterPool<P> = ConnectionPool<P, DefaultCryptoProvider>;
-
-#[cfg(feature = "x509")]
-pub(crate) type GatewayReplayGuard = Arc<ReplayGuard>;
-#[cfg(not(feature = "x509"))]
-pub(crate) type GatewayReplayGuard = ();
-
-/// Accept plane a gateway connection arrived on.
-///
-/// The colony plane serves hives and peers with full control dispatch.
-/// The edge plane serves external clients and admits `Work` frames only,
-/// so an edge client can never register hives, advertise peers, or
-/// inject gossip.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum GatewayPlane {
-	Colony,
-	Edge,
-}
+pub(crate) type ClusterPool<P> = ConnectionPool<P>;
 
 /// Protocol that can bind a gateway accept plane (colony or edge).
 ///
@@ -86,7 +69,6 @@ pub(crate) trait GatewayColonyProtocol:
 		Transport: MessageEmitter
 		               + MessageCollector
 		               + PolicyConfig
-		               + X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 		               + MuxConnector
 		               + EncryptedProtocolState
 		               + Send
@@ -104,7 +86,6 @@ impl<T> GatewayColonyProtocol for T where
 			Transport: MessageEmitter
 			               + MessageCollector
 			               + PolicyConfig
-			               + X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
 			               + MuxConnector
 			               + EncryptedProtocolState
 			               + Send
@@ -116,13 +97,34 @@ impl<T> GatewayColonyProtocol for T where
 
 /// Shared gateway state passed into accept-loop request handling.
 pub(crate) struct GatewayRuntimeCtx<P: Protocol> {
+	/// Registered hives and the servlet types each advertises.
 	pub(crate) registry: Arc<HiveRegistry>,
+	/// Servlet routes, both local and peer-learned, with their trails.
 	pub(crate) servlet_registry: Arc<ServletRegistry>,
+	/// Serialises one hive's membership move across both registries.
+	pub(crate) admission: Arc<Mutex<()>>,
+	/// Colony identity, gates, peer caps, and gossip policy.
 	pub(crate) config: Arc<ClusterConfig>,
+	/// Connection pool this gateway dials hives on.
 	pub(crate) pool: Arc<ClusterPool<P>>,
+	/// Connection pool reserved for peer gateways, when one is configured.
 	pub(crate) peer_pool: Option<Arc<ClusterPool<P>>>,
+	/// Instrumentation collector for gateway control-plane events.
 	pub(crate) trace: Arc<TraceCollector>,
+	/// Freshness ledger that admits each signed control frame once.
 	pub(crate) replay_guard: GatewayReplayGuard,
+	/// Owner of the background work a request handler starts.
+	pub(crate) tasks: TaskGroup,
+}
+
+impl<P: Protocol> GatewayRuntimeCtx<P> {
+	/// The two registries one hive's membership spans.
+	///
+	/// Admission and retirement move both, so they run here rather than as
+	/// a sequence each call site repeats.
+	pub(crate) fn membership(&self) -> ColonyMembership<'_> {
+		ColonyMembership::new(&self.registry, &self.servlet_registry, &self.admission)
+	}
 }
 
 impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
@@ -130,14 +132,13 @@ impl<P: Protocol> Clone for GatewayRuntimeCtx<P> {
 		Self {
 			registry: Arc::clone(&self.registry),
 			servlet_registry: Arc::clone(&self.servlet_registry),
+			admission: Arc::clone(&self.admission),
 			config: Arc::clone(&self.config),
 			pool: Arc::clone(&self.pool),
 			peer_pool: self.peer_pool.as_ref().map(Arc::clone),
 			trace: Arc::clone(&self.trace),
-			#[cfg(feature = "x509")]
-			replay_guard: Arc::clone(&self.replay_guard),
-			#[cfg(not(feature = "x509"))]
-			replay_guard: (),
+			tasks: self.tasks.clone(),
+			replay_guard: self.replay_guard.clone(),
 		}
 	}
 }

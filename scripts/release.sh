@@ -205,13 +205,11 @@ run_release_fsm() {
 
 # Cargo workspaces version from [workspace.package] in the root Cargo.toml.
 CARGO_VERSION_SECTION="workspace.package"
+CARGO_PACKAGE="tightbeam-rs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cargo_read_version() {
-	awk -v section="$CARGO_VERSION_SECTION" -F'"' '
-		$0 ~ "^\\[" section "\\]" { in_section = 1; next }
-		in_section && /^\[/ { in_section = 0 }
-		in_section && /^version[[:space:]]*=/ { print $2; exit }
-	' Cargo.toml 2>/dev/null || true
+	"$SCRIPT_DIR/crate-version.sh" "$CARGO_PACKAGE" 2>/dev/null || true
 }
 
 cargo_write_version() {
@@ -330,7 +328,6 @@ working_tree_clean() {
 		&& git diff --cached --quiet --ignore-submodules
 }
 
-# Version recorded at <ref> (Cargo.toml, package.json, or VERSION); empty if none.
 version_at_ref() {
 	local ref="$1"
 	if git cat-file -e "${ref}:Cargo.toml" 2>/dev/null; then
@@ -954,16 +951,16 @@ require_signing_key() {
 		return 0
 	fi
 	cat >&2 <<-SIGNING
-	
+
 	  ${RED}No signing key configured.${RESET}
-	
+
 	  Configure GPG signing:
 	    git config --global user.signingkey <GPG-KEY-ID>
-	
+
 	  Or configure SSH signing:
 	    git config --global gpg.format ssh
 	    git config --global user.signingkey ~/.ssh/id_ed25519.pub
-	
+
 	SIGNING
 	fail "Signing key is required for releases"
 }

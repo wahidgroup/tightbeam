@@ -1,77 +1,121 @@
-//! Hive lifecycle runtime for protocol `P`.
+//! The hive lifecycle runtime for a protocol `P`.
 //!
-//! - Owns control, scaling, and re-registration task handles.
-//! - Exposes lifecycle through [`Hive`] only.
-//! - `hive!` names a type alias of [`HiveRuntime`].
+//! - [`HiveRuntime`] owns the control, scaling, and re-registration task handles.
+//! - Callers reach the lifecycle through the [`Hive`] trait only.
+//! - The `hive!` macro names a type alias of [`HiveRuntime`].
 
 use core::future::Future;
 use core::hash::Hash;
 use core::pin::Pin;
 use core::str::FromStr;
 use core::sync::atomic::AtomicU16;
-use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
 
-use crate::colony::common::{canonical_bytes, take_and_abort, ColonyResource};
-use crate::colony::hive::runtime::{
-	instance_urn, register_once, spawn_control_server, spawn_reregister_task, spawn_scaling_task, HiveContextImpl,
-	HiveControlCtx, ScalingTaskCtx,
-};
+use crate::colony::common::{ColonyResource, DrainMode, TaskGroup};
+use crate::colony::hive::runtime::control::{InFlight, Settled};
+use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveControlCtx, ScalingLoop};
 use crate::colony::hive::{
 	HashMapRegistry, Hive, HiveConfig, HiveContext, RegisterHiveResponse, ServletBox, ServletRegistration,
 	ServletRegistry, SpawnerFn,
 };
 use crate::colony::servlet::servlet_runtime::rt;
+use crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::macros::server::AcceptedConnection;
 use crate::policy::TransitStatus;
 use crate::trace::TraceCollector;
+use crate::transport::accept::AcceptPlane;
 use crate::transport::client::pool::{ConnectionBuilder, ConnectionPool};
 use crate::transport::multiplex::{MuxCapable, MuxConnector};
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{
 	AsyncListenerTrait, EncryptedProtocol, MessageCollector, MessageEmitter, PersistentConnection, Protocol,
-	X509ClientConfig,
 };
 use crate::utils::urn::{Urn, UrnValidationError};
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
-use crate::colony::hive::{ClusterCircuitBreaker, ReplayGuard};
-#[cfg(feature = "x509")]
-use crate::crypto::x509::Certificate;
-#[cfg(feature = "x509")]
-use crate::transport::handshake::HandshakeKeyManager;
-#[cfg(feature = "x509")]
+use crate::colony::hive::{BackpressureGate, ClusterSecurityGate, GateLimits};
+use crate::crypto::x509::store::CertificateTrust;
 use crate::transport::TransportEncryptionConfig;
 
-/// Running hive for protocol `P`.
+/// The accept plane a cluster reaches this hive on.
 ///
-/// Owns accept, scaling, and anti-entropy tasks. Callers reach state only
-/// through [`Hive`].
+/// Binding it needs the TLS identity that signs registrations. A cluster
+/// refuses an unsigned hive, so a hive with no identity never publishes
+/// this address, and an unauthenticated control listener would answer
+/// nobody but an attacker (CWE-306).
+struct ControlPlane<P: Protocol> {
+	/// The accept loop, which [`Hive::join`] awaits.
+	handle: rt::JoinHandle,
+	/// The address a cluster dials, and the hive's own identity locator.
+	addr: P::Address,
+}
+
+/// Where a hive sits in its lifecycle.
+///
+/// Servlet registration closes when the hive establishes, so the two
+/// phases hold different things rather than one nullable handle that
+/// every guard has to read the same way.
+enum Lifecycle<P: Protocol> {
+	/// Servlet registration is open, and the control plane is unbound.
+	Provisional,
+	/// Servlets are running. `control` is present for a hive that holds a
+	/// TLS identity, and absent for one that can never join a cluster.
+	Established { control: Option<ControlPlane<P>> },
+}
+
+impl<P: Protocol> Lifecycle<P> {
+	/// The control plane, for a hive that established one.
+	fn control(&self) -> Option<&ControlPlane<P>> {
+		match self {
+			Self::Established { control } => control.as_ref(),
+			Self::Provisional => None,
+		}
+	}
+
+	/// Whether servlet registration is still open.
+	fn is_provisional(&self) -> bool {
+		matches!(self, Self::Provisional)
+	}
+}
+
+/// A running hive for a protocol `P`.
+///
+/// The runtime owns the accept, scaling, and anti-entropy tasks, and callers
+/// reach its state only through [`Hive`].
 pub struct HiveRuntime<P: Protocol> {
 	servlets: Arc<HashMapRegistry>,
 	spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
 	config: HiveConfig,
 	trace: Arc<TraceCollector>,
-	control_server_handle: Option<rt::JoinHandle>,
-	addr: P::Address,
-	scaling_handle: Option<rt::JoinHandle>,
+	lifecycle: Lifecycle<P>,
+	/// Every background task this runtime started.
+	tasks: TaskGroup,
 	utilization: Arc<AtomicU16>,
 	utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
-	draining_since: Arc<RwLock<Option<Instant>>>,
+	drain: DrainMode,
+	/// Commands in flight, which a drain waits to reach zero.
+	in_flight: InFlight,
 	cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
-	reregister_handle: Option<rt::JoinHandle>,
 	hive_context: Arc<HiveContextImpl<P>>,
 }
 
 impl<P: Protocol> HiveRuntime<P> {
-	fn abort_tasks(&mut self) {
-		take_and_abort(&mut self.scaling_handle);
-		take_and_abort(&mut self.reregister_handle);
-		take_and_abort(&mut self.control_server_handle);
+	/// Aborts the hive's tasks and stops every registered servlet. Both
+	/// `stop` and `Drop` run it, so a dropped hive leaks no servlet.
+	fn release(&mut self) {
+		self.tasks.abort_all();
+		if let Lifecycle::Established { control } = &mut self.lifecycle {
+			if let Some(plane) = control.take() {
+				rt::abort(&plane.handle);
+			}
+		}
+
+		self.servlets
+			.drain_all()
+			.into_iter()
+			.for_each(|(_, reg)| reg.servlet.stop_boxed());
 	}
 
 	fn build_control_ctx(&self) -> HiveControlCtx<P> {
@@ -79,78 +123,72 @@ impl<P: Protocol> HiveRuntime<P> {
 			servlets: Arc::clone(&self.servlets),
 			spawners: Arc::clone(&self.spawners),
 			trace: Arc::clone(&self.trace),
-			utilization: Arc::clone(&self.utilization),
-			utilization_map: Arc::clone(&self.utilization_map),
-			draining_since: Arc::clone(&self.draining_since),
+			drain: self.drain.clone(),
+			in_flight: self.in_flight.clone(),
 			hive_context: Arc::clone(&self.hive_context),
-			bp_threshold: self.config.control.backpressure_threshold,
-			#[cfg(feature = "x509")]
-			circuit_breaker: Arc::new(ClusterCircuitBreaker::new(
-				self.config.control.circuit_breaker_threshold,
-				self.config.control.circuit_breaker_cooldown_ms,
-			)),
-			#[cfg(feature = "x509")]
-			replay_guard: Arc::new(ReplayGuard::new(self.config.control.command_freshness_window_ms)),
-			#[cfg(feature = "x509")]
-			trust_store: self.config.trust_store.as_ref().map(Arc::clone),
+			backpressure: BackpressureGate::new(
+				Arc::clone(&self.utilization),
+				self.config.control.backpressure_threshold,
+			),
+			security: self.config.trust_store.as_ref().map(|store| self.security_gate(store)),
 		}
+	}
+
+	/// The control plane's one admission gate, trusting `store` and reading
+	/// the hive clock.
+	fn security_gate(&self, store: &Arc<dyn CertificateTrust>) -> ClusterSecurityGate {
+		let control = &self.config.control;
+		let limits = GateLimits {
+			failure_threshold: control.circuit_breaker_threshold,
+			cooldown: control.circuit_breaker_cooldown,
+			freshness_window: control.command_freshness_window,
+		};
+
+		ClusterSecurityGate::new(Arc::clone(store), limits, Arc::clone(&self.config.clock))
 	}
 }
 
 impl<P> HiveRuntime<P>
 where
 	P: Protocol + EncryptedProtocol<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
-	P::Address: Clone + Send + Sync + 'static,
+	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
+	P::Transport: MessageEmitter + Send + 'static,
 	TightBeamError: From<P::Error>,
 {
-	/// Encrypt the control plane when hive_tls is set (spawn/stop must not travel cleartext).
-	async fn bind_control_listener(config: &HiveConfig) -> Result<(P::Listener, P::Address), TightBeamError> {
-		let bind_addr = P::default_bind_address()?;
+	/// Binds this hive's slate, gateways, address, and configuration.
+	///
+	/// It returns [`None`] for a hive with no control plane, which has no
+	/// address to register and which no cluster can reach.
+	fn cluster_link(&self) -> Option<ClusterLink<P>> {
+		let addr = self.lifecycle.control().map(|plane| plane.addr)?;
 
-		#[cfg(feature = "x509")]
-		{
-			match config.hive_tls.as_ref() {
-				Some(hive_tls) => {
-					let certificate = Certificate::try_from(hive_tls.certificate.clone())?;
-					let key_manager = HandshakeKeyManager::new(Arc::clone(&hive_tls.key));
-					let mut encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
-					if !hive_tls.validators.is_empty() {
-						let validators: Vec<_> = hive_tls.validators.iter().map(Arc::clone).collect();
-						encryption_config = encryption_config.with_client_validators(validators);
-					}
-
-					Ok(P::bind_with(bind_addr, encryption_config).await?)
-				}
-				None => Ok(P::bind(bind_addr).await?),
-			}
-		}
-
-		#[cfg(not(feature = "x509"))]
-		{
-			let _ = config;
-			Ok(P::bind(bind_addr).await?)
-		}
+		Some(ClusterLink::new(
+			Arc::clone(&self.servlets),
+			Arc::clone(&self.cluster_addrs),
+			addr,
+			Arc::new(self.config.clone()),
+		))
 	}
-}
 
-fn collect_spawners(servlets: &HashMapRegistry) -> HashMap<Urn<'static>, SpawnerFn> {
-	let mut spawners = HashMap::new();
-	servlets.for_each(|_key, reg| {
-		spawners.insert(reg.servlet_type.clone(), Arc::clone(&reg.spawner));
-	});
+	/// Binds the control plane, for a hive that has an identity to present.
+	///
+	/// It returns [`None`] when `hive_tls` is unset. Spawn and stop MUST NOT
+	/// travel cleartext, and a hive with no identity signs no registration,
+	/// so no cluster can learn this address to dial it.
+	async fn bind_control_listener(config: &HiveConfig) -> Result<Option<(P::Listener, P::Address)>, TightBeamError> {
+		let Some(hive_tls) = config.hive_tls.as_ref() else {
+			return Ok(None);
+		};
 
-	spawners
-}
+		let bind_addr = P::default_bind_address()?;
+		let (certificate, key_manager) = hive_tls.identity().parts();
+		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+		let encryption_config = encryption_config.with_client_validators(hive_tls.validators.iter().map(Arc::clone));
 
-fn seed_hive_routes<P: Protocol>(servlets: &HashMapRegistry, hive_context: &HiveContextImpl<P>) {
-	servlets.for_each(|key, reg| {
-		let addr_bytes = reg.servlet.addr_bytes();
-		let type_key = canonical_bytes(&reg.servlet_type);
-		// for_each borrows the registry key; add_route needs an owned copy.
-		hive_context.add_route(key.clone(), addr_bytes, &type_key);
-	});
+		Ok(Some(P::bind_with(bind_addr, encryption_config).await?))
+	}
 }
 
 impl<P> Hive for HiveRuntime<P>
@@ -166,14 +204,7 @@ where
 	P::Address: Hash + Eq + Clone + Copy + Send + Sync + FromStr + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter
-		+ MessageCollector
-		+ PolicyConfig
-		+ X509ClientConfig<CryptoProvider = DefaultCryptoProvider>
-		+ MuxConnector
-		+ Send
-		+ Sync
-		+ 'static,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConfig + MuxConnector + Send + Sync + 'static,
 	TightBeamError: From<P::Error>,
 {
 	type Protocol = P;
@@ -181,11 +212,12 @@ where
 
 	fn new(config: Option<HiveConfig>) -> Result<Self, TightBeamError> {
 		let config = config.unwrap_or_default();
+		let pool_builder = ConnectionPool::<P>::builder()
+			.with_config(config.pool.clone())
+			.with_clock(Arc::clone(&config.clock));
 
-		let pool_builder = ConnectionPool::<P>::builder().with_config(config.pool.clone());
-
-		// Intra-hive calls validate servlet certificates against the hive trust store.
-		#[cfg(feature = "x509")]
+		// Intra-hive calls validate each servlet certificate with the hive's
+		// trust store, when the hive has one.
 		let pool_builder = match config.trust_store.as_ref() {
 			Some(store) => pool_builder.with_trust_store(Arc::clone(store)),
 			None => pool_builder,
@@ -193,21 +225,19 @@ where
 
 		let servlet_pool = Arc::new(pool_builder.build());
 		let hive_context = Arc::new(HiveContextImpl::new(servlet_pool));
-		let addr = P::default_bind_address()?;
 
 		Ok(Self {
 			servlets: Arc::new(HashMapRegistry::default()),
 			spawners: Arc::new(HashMap::new()),
 			config,
 			trace: Arc::new(TraceCollector::default()),
-			control_server_handle: None,
-			addr,
-			scaling_handle: None,
+			lifecycle: Lifecycle::Provisional,
+			tasks: TaskGroup::default(),
 			utilization: Arc::new(AtomicU16::new(0)),
 			utilization_map: Arc::new(Mutex::new(HashMap::new())),
-			draining_since: Arc::new(RwLock::new(None)),
+			drain: DrainMode::default(),
+			in_flight: InFlight::default(),
 			cluster_addrs: Arc::new(RwLock::new(Vec::new())),
-			reregister_handle: None,
 			hive_context,
 		})
 	}
@@ -218,11 +248,12 @@ where
 		F: Fn(Arc<TraceCollector>) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = Result<S, TightBeamError>> + Send + 'static,
 	{
-		if self.control_server_handle.is_some() {
+		if !self.lifecycle.is_provisional() {
 			return Err(TightBeamError::AlreadyEstablished);
 		}
 
-		// Refuse type URNs outside this hive namespace or carrying an instance tail.
+		// A registration names a servlet type, so its URN MUST sit in this
+		// hive's namespace and carry no instance tail.
 		match self.config.namespace.validate(&servlet_type)? {
 			ColonyResource::Servlet { instance: None, .. } => {}
 			_ => {
@@ -241,53 +272,61 @@ where
 			}) as Pin<Box<dyn Future<Output = Result<Box<dyn ServletBox>, TightBeamError>> + Send>>
 		});
 
-		// Key by instance URN bytes so manage stop and scaling share one lookup.
-		let key = canonical_bytes(&instance_urn(&servlet_type, servlet.addr_bytes())?);
+		// The key is the instance URN bytes, so a manage stop and scaling
+		// share one lookup.
+		let key = servlet_type.instance_urn(servlet.addr_bytes())?.canonical_bytes();
 		let registration = ServletRegistration { servlet: Box::new(servlet), spawner, servlet_type };
 
-		self.servlets.insert(key, registration)?;
-		Ok(())
+		self.servlets
+			.insert(key, registration)
+			.map_err(|refused| refused.stop_servlet())
 	}
 
 	async fn establish(&mut self, trace: Arc<TraceCollector>) -> Result<(), TightBeamError> {
-		if self.control_server_handle.is_some() {
+		if !self.lifecycle.is_provisional() {
 			return Err(TightBeamError::AlreadyEstablished);
 		}
 
 		self.trace = trace;
+		self.spawners = Arc::new(self.servlets.spawners());
 
-		let (listener, addr) = Self::bind_control_listener(&self.config).await?;
+		self.hive_context.seed_routes(&self.servlets);
 
-		self.addr = addr;
-		self.spawners = Arc::new(collect_spawners(&self.servlets));
+		let control = match Self::bind_control_listener(&self.config).await? {
+			Some((listener, addr)) => {
+				let mux_offer = self.config.pool.mux_offer.as_ref().map(Arc::clone);
+				let plane = AcceptPlane::new(DEFAULT_MAX_SERVER_CONNECTIONS, Arc::clone(&self.config.clock));
+				let handle = self.build_control_ctx().serve(listener, plane, mux_offer);
 
-		seed_hive_routes(&self.servlets, &self.hive_context);
+				Some(ControlPlane { handle, addr })
+			}
+			None => None,
+		};
 
-		// Share the configured mux offer with the control accept loop.
-		let mux_offer = self.config.pool.mux_offer.as_ref().map(Arc::clone);
-		let control_ctx = self.build_control_ctx();
+		let hive_addr = control.as_ref().map(|plane| plane.addr);
+		self.lifecycle = Lifecycle::Established { control };
 
-		self.control_server_handle = Some(spawn_control_server::<P>(listener, mux_offer, control_ctx));
-		self.scaling_handle = Some(spawn_scaling_task::<P>(ScalingTaskCtx {
-			servlets: Arc::clone(&self.servlets),
-			spawners: Arc::clone(&self.spawners),
-			trace: Arc::clone(&self.trace),
-			utilization: Arc::clone(&self.utilization),
-			utilization_map: Arc::clone(&self.utilization_map),
-			cluster_addrs: Arc::clone(&self.cluster_addrs),
-			hive_context: Arc::clone(&self.hive_context),
-			hive_addr: self.addr,
-			config: self.config.clone(),
-		}));
+		self.tasks.adopt(
+			ScalingLoop {
+				servlets: Arc::clone(&self.servlets),
+				spawners: Arc::clone(&self.spawners),
+				trace: Arc::clone(&self.trace),
+				utilization: Arc::clone(&self.utilization),
+				utilization_map: Arc::clone(&self.utilization_map),
+				cluster_addrs: Arc::clone(&self.cluster_addrs),
+				hive_context: Arc::clone(&self.hive_context),
+				hive_addr,
+				config: self.config.clone(),
+				tasks: self.tasks.clone(),
+			}
+			.spawn(),
+		);
 
-		// Re-announce the slate each interval; gateway registries are soft state.
-		self.reregister_handle = Some(spawn_reregister_task::<P>(
-			Arc::clone(&self.servlets),
-			Arc::clone(&self.trace),
-			Arc::clone(&self.cluster_addrs),
-			self.addr,
-			self.config.clone(),
-		));
+		// Gateway registries are soft state, so the hive re-announces its slate
+		// each interval. A hive with no control plane has nothing to announce.
+		if let Some(link) = self.cluster_link() {
+			self.tasks.adopt(link.spawn_reregister(Arc::clone(&self.trace)));
+		}
 
 		Ok(())
 	}
@@ -296,8 +335,8 @@ where
 		Arc::clone(&self.hive_context) as Arc<dyn HiveContext>
 	}
 
-	fn addr(&self) -> &Self::Address {
-		&self.addr
+	fn addr(&self) -> Option<&Self::Address> {
+		self.lifecycle.control().map(|plane| &plane.addr)
 	}
 
 	fn servlet_addresses(&self) -> Vec<(Urn<'static>, Vec<u8>)> {
@@ -305,16 +344,13 @@ where
 	}
 
 	fn stop(mut self) {
-		self.abort_tasks();
-		self.servlets
-			.drain_all()
-			.into_iter()
-			.for_each(|(_, reg)| reg.servlet.stop_boxed());
+		self.release();
 	}
 
 	async fn join(mut self) -> Result<(), TightBeamError> {
-		if let Some(handle) = self.control_server_handle.take() {
-			rt::join(handle).await.map_err(|_| TightBeamError::JoinError)?;
+		let settled = core::mem::replace(&mut self.lifecycle, Lifecycle::Provisional);
+		if let Lifecycle::Established { control: Some(plane) } = settled {
+			rt::join(plane.handle).await.map_err(|_| TightBeamError::JoinError)?;
 		}
 
 		Ok(())
@@ -324,66 +360,62 @@ where
 		&self,
 		cluster_addr: &<Self::Protocol as Protocol>::Address,
 	) -> Result<RegisterHiveResponse, TightBeamError> {
-		// Control addr is provisional until establish binds the listener.
-		// Registering early would install a wrong heartbeat/manage target.
-		if self.control_server_handle.is_none() {
+		// A hive registers the address a cluster dials it back on, so it
+		// needs an established control plane. Without one there is no
+		// heartbeat or manage target to install.
+		let Some(link) = self.cluster_link() else {
 			return Err(TightBeamError::NotEstablished);
-		}
+		};
 
 		let cluster_addr = *cluster_addr;
-		let response = register_once::<P>(&*self.servlets, self.addr, cluster_addr, &self.config).await?;
-
-		// Remember the gateway only after acceptance so refused peers are not polled.
+		let response = link.register(cluster_addr).await?;
+		// The hive remembers a gateway only after the gateway accepts, so a
+		// peer that refused stays unpolled.
 		if response.status == TransitStatus::Ok {
-			if let Ok(mut addrs) = self.cluster_addrs.write() {
-				let incoming: Vec<u8> = cluster_addr.into();
-				let known = addrs.iter().any(|addr| {
-					let bytes: Vec<u8> = (*addr).into();
-					bytes == incoming
-				});
-				if !known {
-					addrs.push(cluster_addr);
-				}
-			}
+			link.remember(cluster_addr);
 		}
 
 		Ok(response)
 	}
 
 	async fn drain(&self) -> Result<(), TightBeamError> {
-		{
-			let mut guard = self.draining_since.write().map_err(|_| TightBeamError::LockPoisoned)?;
-			*guard = Some(Instant::now());
-		}
+		self.drain.begin();
 
+		// Stop the beats before waiting on commands. A re-announce or a
+		// scale-up that outlived the wait would reinstall the very routes
+		// this drain withdraws (CWE-362).
+		self.tasks.abort_all();
+
+		// Wait on commands, not on open connections: a control connection
+		// idles between commands by design. The timeout is the backstop for
+		// work that outlasts it.
 		let drain_timeout = self.config.control.drain_timeout;
-		let start = Instant::now();
+		let settled = self.in_flight.settle(self.config.clock.as_ref(), drain_timeout).await;
 
-		loop {
-			let timed_out = start.elapsed() >= drain_timeout;
-			if self.servlets.count() == 0 || timed_out {
-				if timed_out {
-					self.servlets
-						.drain_all()
-						.into_iter()
-						.for_each(|(_, reg)| reg.servlet.stop_boxed());
-				}
-				break;
-			}
+		// Either outcome ends drained, so a caller that awaited this call
+		// holds a hive with no running servlets.
+		let (Settled::Idle | Settled::TimedOut) = settled;
+		self.servlets
+			.drain_all()
+			.into_iter()
+			.for_each(|(_, reg)| reg.servlet.stop_boxed());
 
-			tokio::time::sleep(Duration::from_millis(100)).await;
+		// Announce the emptied slate so gateways retire this hive's routes
+		// now, ahead of the heartbeat that would eventually miss.
+		if let Some(link) = self.cluster_link() {
+			link.announce_slate().await;
 		}
 
 		Ok(())
 	}
 
 	fn is_draining(&self) -> bool {
-		self.draining_since.read().map(|g| g.is_some()).unwrap_or(false)
+		self.drain.is_draining()
 	}
 }
 
 impl<P: Protocol> Drop for HiveRuntime<P> {
 	fn drop(&mut self) {
-		self.abort_tasks();
+		self.release();
 	}
 }

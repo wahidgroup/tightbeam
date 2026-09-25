@@ -6,25 +6,48 @@ use crate::transport::multiplex::StreamId;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::DEFAULT_REKEY_RENEWAL_ALLOWANCE;
 
-pub(super) fn cap_as_usize(cap: u32) -> usize {
+pub fn cap_as_usize(cap: u32) -> usize {
 	usize::try_from(cap).unwrap_or(usize::MAX)
 }
 
-pub(super) fn len_as_u64(len: usize) -> u64 {
+pub fn len_as_u64(len: usize) -> u64 {
 	u64::try_from(len).unwrap_or(u64::MAX)
 }
 
-/// Chunk records a payload occupies at `chunk_size` bytes per chunk.
+/// Bytes carried per mux chunk.
+///
+/// A payload length and a chunk size are both byte counts, so a call site
+/// holding them loose can exchange them and still compile while the credit
+/// arithmetic silently inverts. The chunk size travels as its own type.
+/// The floor of one applies once here rather than at every call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkSize(usize);
+
+impl ChunkSize {
+	/// The chunk size for one direction of a link, floored at one byte.
+	#[must_use]
+	pub fn new(bytes: usize) -> Self {
+		Self(bytes.max(1))
+	}
+
+	/// The size in bytes, for arithmetic that needs the count.
+	#[must_use]
+	pub fn get(self) -> usize {
+		self.0
+	}
+}
+
+/// Chunk records a payload occupies at `chunk` bytes per chunk.
 /// An empty payload travels inline in its trailer and occupies none.
-pub(super) fn chunk_records(payload_len: usize, chunk_size: usize) -> u64 {
-	len_as_u64(payload_len).div_ceil(len_as_u64(chunk_size.max(1)))
+pub fn chunk_records(payload_len: usize, chunk: ChunkSize) -> u64 {
+	len_as_u64(payload_len).div_ceil(len_as_u64(chunk.get()))
 }
 
 /// Session-budget credits a payload debits: `ceil(len / credit_unit)`
 /// summed per chunk, so the sender's whole-frame debit equals the sum
 /// of the receiver's per-chunk debits.
-pub(super) fn payload_credits(payload_len: usize, chunk_size: usize, credit_unit: u32) -> u64 {
-	let chunk_size = len_as_u64(chunk_size.max(1));
+pub fn payload_credits(payload_len: usize, chunk: ChunkSize, credit_unit: u32) -> u64 {
+	let chunk_size = len_as_u64(chunk.get());
 	let unit = u64::from(credit_unit.max(1));
 	let len = len_as_u64(payload_len);
 
@@ -41,7 +64,7 @@ pub(super) fn payload_credits(payload_len: usize, chunk_size: usize, credit_unit
 /// plus fixed slack so the exchange legs land before the drain
 /// threshold would trip ([`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]).
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(super) fn renewal_floor(drain_floor: u64) -> u64 {
+pub fn renewal_floor(drain_floor: u64) -> u64 {
 	drain_floor.saturating_add(DEFAULT_REKEY_RENEWAL_ALLOWANCE)
 }
 
@@ -53,10 +76,12 @@ pub(super) fn renewal_floor(drain_floor: u64) -> u64 {
 /// at `limit * chunk size`. Withholding grants applies backpressure
 /// to the sender, which parks until the limit rises.
 ///
-/// Every grant travels as one `MuxCredit` envelope. It is a control-plane
-/// AEAD record outside the session budget, so implementations SHOULD batch
-/// grants rather than raise the limit per chunk, or a long transfer spends
-/// the cipher's record limit on control traffic.
+/// # Batching
+///
+/// Every grant travels as one `MuxCredit` envelope, a control-plane AEAD record
+/// outside the session budget. Implementations SHOULD batch grants rather than
+/// raise the limit per chunk, or a long transfer spends the cipher's record
+/// limit on control traffic.
 pub trait CreditGrantor: Send + Sync {
 	/// New absolute chunk limit for a stream that has accepted
 	/// `received` chunks under `limit`, or `None` to leave the limit
@@ -67,6 +92,8 @@ pub trait CreditGrantor: Send + Sync {
 /// Default grantor: replenishes a fixed chunk window in batches,
 /// bounding per-stream reassembly memory at `window * chunk size`
 /// while letting frames of any length flow.
+///
+/// # Low-water mark
 ///
 /// Grants fire only once remaining credit falls to the half-window
 /// low-water mark, then top the limit back up to a full window ahead
@@ -124,7 +151,7 @@ mod tests {
 			(2048, 1024, 2),
 			(2049, 1024, 3),
 		] {
-			assert_eq!(chunk_records(len, chunk), expect);
+			assert_eq!(chunk_records(len, ChunkSize::new(chunk)), expect);
 		}
 	}
 
@@ -139,7 +166,7 @@ mod tests {
 			// per-chunk sum, not the naive whole-frame ceil (3)
 			(2500, 1024, 1000, 5),
 		] {
-			assert_eq!(payload_credits(len, chunk, unit), expect);
+			assert_eq!(payload_credits(len, ChunkSize::new(chunk), unit), expect);
 		}
 	}
 

@@ -15,10 +15,8 @@
 //! `ServerHandshake`; CMS: tampered `Finished` `SignedData`).
 //!
 //! ## References
-//! - CWE-300: Channel Accessible by Non-Endpoint
-//!   <https://cwe.mitre.org/data/definitions/300.html>
-//! - CAPEC-94: Adversary in the Middle (AiTM)
-//!   <https://capec.mitre.org/data/definitions/94.html>
+//! - CWE-300: Channel Accessible by Non-Endpoint <https://cwe.mitre.org/data/definitions/300.html>
+//! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 //! - RFC 9846 (TLS 1.3) §4.4.3: transcript-bound CertificateVerify/Finished
 
 use std::sync::Arc;
@@ -33,20 +31,20 @@ use tightbeam::{
 };
 
 use crate::security::common::{
-	expectation_failure, tamper_payload, Direction, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness,
-	BACKEND_COUNT_U32,
+	expectation_failure, Direction, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
-pub(crate) const MITM_CAPTURE_HANDSHAKE: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-capture-handshake");
-pub(crate) const MITM_INJECT_TAMPERED: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-inject-tampered");
-pub(crate) const MITM_TAMPERING_DETECTED: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-tampering-detected");
-pub(crate) const MITM_TAMPER_MESSAGE: Urn<'static> = Urn::new("test", "event:mitm-attack/mitm-tamper-message");
+pub(crate) const MITM_CAPTURE_HANDSHAKE: Urn<'static> =
+	tightbeam::urn!("test", "event:mitm-attack/mitm-capture-handshake");
+pub(crate) const MITM_INJECT_TAMPERED: Urn<'static> = tightbeam::urn!("test", "event:mitm-attack/mitm-inject-tampered");
+pub(crate) const MITM_TAMPERING_DETECTED: Urn<'static> =
+	tightbeam::urn!("test", "event:mitm-attack/mitm-tampering-detected");
+pub(crate) const MITM_TAMPER_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:mitm-attack/mitm-tamper-message");
 
 tb_assert_spec! {
 	pub MitmAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(MITM_CAPTURE_HANDSHAKE, exactly!(BACKEND_COUNT_U32)),
 			(MITM_TAMPER_MESSAGE, exactly!(BACKEND_COUNT_U32)),
@@ -129,7 +127,7 @@ job! {
 				.ok_or_else(|| expectation_failure("no server-to-client messages captured"))?;
 
 			// Tamper with the message (simulating MITM modification)
-			let tampered_payload = tamper_payload(&target.payload);
+			let tampered_payload = kind.tamper_server_message(&target.payload)?;
 
 			// Verify tampering actually changed the payload
 			if tampered_payload == target.payload {

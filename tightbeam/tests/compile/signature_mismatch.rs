@@ -22,15 +22,13 @@ impl SignatureAlgorithmIdentifier for OtherSignature {
 struct OtherSignatureProfile;
 
 impl SecurityProfile for OtherSignatureProfile {
-	type DigestOid = Sha3_256;
+	type Digest = Sha3_256;
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = OtherSignature; // Profile expects OtherSignature
 	#[cfg(feature = "kdf")]
-	type KdfOid = tightbeam::crypto::kdf::HkdfSha3_256Oid;
+	type Kdf = tightbeam::crypto::kdf::HkdfSha3_256;
 	#[cfg(feature = "ecdh")]
-	type CurveOid = tightbeam::crypto::curves::Secp256k1Oid;
-	#[cfg(feature = "kem")]
-	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
+	type Curve = tightbeam::crypto::k256::Secp256k1;
 }
 
 // Create a message with a profile that expects OtherSignature
@@ -42,7 +40,7 @@ struct SignatureMessage {
 
 fn main() {
 	let message = SignatureMessage { content: "test".to_string() };
-	let signing_key = tightbeam::testing::create_test_signing_key();
+	let signing_key = tightbeam::testing::TestKey::insecure_fixed_signing();
 
 	// Try to sign with secp256k1 when the profile pins OtherSignature
 	// This should fail to compile with compile-time enforcement

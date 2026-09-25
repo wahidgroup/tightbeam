@@ -1,5 +1,3 @@
-#![allow(unexpected_cfgs)]
-
 use core::cell::Cell;
 use core::time::Duration;
 
@@ -13,6 +11,8 @@ use core::fmt;
 use std::collections::HashMap;
 #[cfg(any(test, feature = "testing", feature = "instrument", feature = "testing-fault"))]
 use std::sync::Mutex;
+#[cfg(any(test, feature = "testing"))]
+use std::sync::PoisonError;
 
 use crate::trace::{AssertionValue, TraceConfigBuilder};
 use crate::utils::urn::Urn;
@@ -21,6 +21,8 @@ use crate::utils::urn::Urn;
 use crate::constants::DEFAULT_FAULT_SEED;
 #[cfg(feature = "instrument")]
 use crate::crypto::hash::{Digest, Sha3_256};
+#[cfg(any(test, feature = "testing"))]
+use crate::error::TightBeamError;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::{events, BoundedMemorySink, EventSink, TbEvent, TbInstrumentationConfig};
 #[cfg(all(feature = "policy", any(test, feature = "testing")))]
@@ -33,17 +35,16 @@ use crate::testing::fdr::InjectionStrategy;
 use crate::trace::logging::LogRecord;
 #[cfg(any(test, feature = "testing"))]
 use crate::trace::{Assertion, AssertionLabel};
-#[cfg(all(feature = "transport", any(test, feature = "testing")))]
-use crate::transport::error::TransportError;
 #[cfg(any(test, feature = "testing"))]
 use crate::Frame;
 
-/// Trait for converting types into event labels.
+/// Converts a type into an event label.
 ///
-/// Event identity is a URN: only URN forms convert. Raw strings are
-/// rejected at compile time so every emitted label resolves to an entry
-/// in a URN inventory (crate: [`crate::instrumentation::events`]).
+/// Event identity is a URN, so only URN forms implement this trait. A raw
+/// string fails to compile, so every emitted label resolves to an entry in a
+/// URN inventory such as [`crate::instrumentation::events`].
 pub trait IntoEventLabel {
+	/// Renders the URN as the label text.
 	fn into_label(self) -> Cow<'static, str>;
 }
 
@@ -59,16 +60,18 @@ impl IntoEventLabel for &Urn<'_> {
 	}
 }
 
-/// Configuration for trace collection
+/// Configuration for trace collection.
 #[derive(Default)]
 pub struct TraceConfig {
+	/// Instrumentation settings. `None` uses the default settings.
 	#[cfg(feature = "instrument")]
 	pub instrumentation: Option<TbInstrumentationConfig>,
-	/// Event retention/export sink. `None` uses the default bounded
+	/// Event retention and export sink. `None` uses the default bounded
 	/// in-memory buffer ([`BoundedMemorySink`]) sized by
 	/// `instrumentation.max_events`.
 	#[cfg(feature = "instrument")]
 	pub sink: Option<Arc<dyn EventSink>>,
+	/// Log backend configuration. `None` leaves events off the log backend.
 	#[cfg(feature = "logging")]
 	pub logger: Option<super::logging::LoggerConfig>,
 }
@@ -119,16 +122,18 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 	}
 }
 
-/// Builder for constructing and emitting trace events
+/// Builder that constructs and emits one trace event.
 ///
-/// Allows optional chaining of timing and payload information.
-/// Example:
+/// Timing and payload information chain on optionally.
+///
+/// # Examples
+///
 /// ```rust
 /// # use core::time::Duration;
 /// # use tightbeam::error::TightBeamError;
 /// # use tightbeam::trace::{TraceCollector, EventValue};
 /// # use tightbeam::utils::urn::Urn;
-/// # const ROUTE_STEP: Urn<'static> = Urn::new("tightbeam", "event:route/step");
+/// # const ROUTE_STEP: Urn<'static> = tightbeam::urn!("tightbeam", "event:route/step");
 /// # fn example() -> Result<(), TightBeamError> {
 /// # let trace = TraceCollector::default();
 /// trace.event(ROUTE_STEP)?
@@ -143,7 +148,7 @@ pub struct EventBuilder<'a> {
 	label: Cow<'static, str>,
 	tags: Option<Cow<'static, [&'static str]>>,
 	value: Option<EventValue>,
-	#[cfg(feature = "instrument")]
+	#[cfg(any(feature = "instrument", feature = "logging"))]
 	duration_ns: Option<u64>,
 	#[cfg(feature = "instrument")]
 	payload: Option<&'a [u8]>,
@@ -164,7 +169,7 @@ impl<'a> EventBuilder<'a> {
 			label,
 			tags,
 			value,
-			#[cfg(feature = "instrument")]
+			#[cfg(any(feature = "instrument", feature = "logging"))]
 			duration_ns: None,
 			#[cfg(feature = "instrument")]
 			payload: None,
@@ -174,34 +179,35 @@ impl<'a> EventBuilder<'a> {
 		}
 	}
 
-	/// Add timing information to the event
-	#[cfg(feature = "instrument")]
+	/// Adds timing information to the event.
+	#[cfg(any(feature = "instrument", feature = "logging"))]
 	pub fn with_timing(mut self, duration: Duration) -> Self {
 		self.duration_ns = Some(duration.as_nanos() as u64);
 		self
 	}
 
-	#[cfg(not(feature = "instrument"))]
+	#[cfg(not(any(feature = "instrument", feature = "logging")))]
 	pub fn with_timing(self, _duration: Duration) -> Self {
 		self
 	}
 
-	/// Add payload data to the event
+	/// Adds payload data to the event.
 	#[cfg(feature = "instrument")]
-	pub fn with_payload(mut self, payload: &'a [u8]) -> Self {
+	pub fn with_payload(mut self, payload: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
+		let payload = payload.as_ref();
 		self.payload = Some(payload);
 		self
 	}
 
 	#[cfg(not(feature = "instrument"))]
-	pub fn with_payload(self, _payload: &'a [u8]) -> Self {
+	pub fn with_payload(self, _payload: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
 		self
 	}
 
-	/// Set log level for this event
+	/// Sets the log level for this event.
 	///
-	/// When a log level is set, the event will be emitted to the configured
-	/// log backend (if any) in addition to trace events.
+	/// With a log level set, the event also goes to the configured log
+	/// backend, when one is configured.
 	#[cfg(feature = "logging")]
 	pub fn with_log_level(mut self, level: super::logging::LogLevel) -> Self {
 		self.log_level = Some(level);
@@ -213,24 +219,23 @@ impl<'a> EventBuilder<'a> {
 		self
 	}
 
-	/// Emit the event (both assertion and instrumentation if enabled)
-	/// This is automatically called when the builder is dropped.
+	/// Emits the event to the assertion log and to instrumentation, when each
+	/// is enabled. Dropping the builder emits the event too.
 	pub fn emit(mut self) {
 		self.emit_internal();
 	}
 
 	fn emit_internal(&mut self) {
-		// Check if already emitted
+		// An event emits once, whether through `emit` or through drop.
 		if self.emitted.get() {
 			return;
 		}
 
 		self.emitted.set(true);
 
-		// Emit to log backend if configured and log level is set (before moving label)
+		// The log backend reads the label before the label moves out below.
 		#[cfg(feature = "logging")]
 		if let Some(logger_config) = &self.collector.state.logger_config {
-			// Use explicit log level, or fall back to default from config
 			let effective_level = self.log_level.or(logger_config.default_level);
 			if let Some(level) = effective_level {
 				if logger_config.filter.should_log(level, None) {
@@ -247,8 +252,11 @@ impl<'a> EventBuilder<'a> {
 						metadata: None, // TODO: Extract from value
 					};
 
-					// Ignore logging errors (don't fail trace collection)
-					let _ = logger_config.backend.emit(&record);
+					// The trace is the evidence and the log is a convenience,
+					// so a backend that refuses a record must not stop the
+					// event from being collected. Nothing above this reads a
+					// logging outcome.
+					let _unlogged = logger_config.backend.emit(&record);
 				}
 			}
 		}
@@ -259,7 +267,6 @@ impl<'a> EventBuilder<'a> {
 		#[cfg(feature = "instrument")]
 		match &value {
 			Some(EventValue::None) | None => {
-				// Use TIMING_WCET URN if duration is specified, otherwise ASSERT_LABEL
 				let urn = if self.duration_ns.is_some() {
 					events::TIMING_WCET
 				} else {
@@ -270,7 +277,7 @@ impl<'a> EventBuilder<'a> {
 					.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
 			}
 			Some(EventValue::Value(assertion_value)) => {
-				let value_str = format_assertion_value(assertion_value);
+				let value_str = assertion_value.render();
 				self.collector.emit_internal(
 					events::ASSERT_PAYLOAD,
 					Some(&label),
@@ -311,6 +318,9 @@ impl<'a> Drop for EventBuilder<'a> {
 	}
 }
 
+/// Collects the trace events and assertions of one run.
+///
+/// Every handle [`TraceCollector::share`] makes records into the same state.
 #[derive(Debug)]
 pub struct TraceCollector {
 	state: Arc<TraceState>,
@@ -334,12 +344,12 @@ impl Default for SinkHandle {
 	}
 }
 
-/// Monotonic trace clock: event timestamps count nanoseconds since the
+/// Monotonic trace clock whose event timestamps count nanoseconds since the
 /// collector's construction. The construction time origin is recorded once
-/// (`TRACE_CLOCK_ORIGIN`) so absolute times are reconstructible without a
+/// (`TRACE_CLOCK_ORIGIN`), so absolute times are reconstructible without a
 /// per-event syscall.
 ///
-/// `wasm` targets have no monotonic `Instant`; there the clock is inert
+/// `wasm` targets have no monotonic `Instant`, so there the clock is inert
 /// and events carry no timestamps.
 #[cfg(feature = "instrument")]
 #[derive(Debug)]
@@ -357,8 +367,8 @@ impl Default for TraceClock {
 		Self {
 			#[cfg(not(target_family = "wasm"))]
 			origin: Instant::now(),
-			// A wall clock before the epoch reads as origin zero rather
-			// than failing collector construction.
+			// A system clock set before the epoch reads as origin zero, so
+			// collector construction still succeeds.
 			#[cfg(not(target_family = "wasm"))]
 			origin_unix_ns: SystemTime::now()
 				.duration_since(UNIX_EPOCH)
@@ -387,9 +397,9 @@ impl TraceClock {
 struct TraceState {
 	#[cfg(any(test, feature = "testing"))]
 	assertions: Mutex<Vec<Assertion>>,
-	/// Owns event retention: the default is a bounded in-memory buffer
-	/// ([`BoundedMemorySink`]); consumers may inject their own via
-	/// [`TraceConfig::sink`]
+	/// The sink owns event retention. The default is a bounded in-memory
+	/// buffer ([`BoundedMemorySink`]), and consumers may inject their own
+	/// through [`TraceConfig::sink`].
 	#[cfg(feature = "instrument")]
 	sink: SinkHandle,
 	#[cfg(feature = "instrument")]
@@ -403,9 +413,9 @@ struct TraceState {
 	#[cfg(feature = "testing-fault")]
 	runtime_fault_model: Option<FaultModel>,
 	#[cfg(feature = "testing-fault")]
-	fault_rng_state: Mutex<u64>, // For Random strategy (seeded RNG)
+	fault_rng_state: Mutex<u64>, // The seeded RNG state for the random strategy.
 	#[cfg(feature = "testing-fault")]
-	fault_call_counters: Mutex<HashMap<Cow<'static, str>, u32>>, // For Deterministic strategy
+	fault_call_counters: Mutex<HashMap<Cow<'static, str>, u32>>, // The per-label call counters for the deterministic strategy.
 	#[cfg(feature = "logging")]
 	logger_config: Option<super::logging::LoggerConfig>,
 }
@@ -463,9 +473,11 @@ impl TraceState {
 	}
 
 	#[cfg(feature = "testing-fuzz")]
-	fn with_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
+	fn with_oracle(input: impl Into<Vec<u8>>, process: crate::testing::specs::csp::Process) -> Self {
+		let input: Vec<u8> = input.into();
 		Self {
-			// The testing-fuzz feature implies testing, so the field exists here
+			// The testing-fuzz feature implies testing, so the field exists
+			// here.
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
 			sink: SinkHandle::default(),
@@ -495,12 +507,13 @@ impl Default for TraceCollector {
 }
 
 impl TraceCollector {
-	/// Create a new empty trace collector with default config
+	/// Creates a new, empty trace collector with the default config.
 	pub fn new() -> Self {
 		Self::default()
 	}
 
-	/// Create an additional handle that observes and records the same state.
+	/// Creates an additional handle that observes and records the same
+	/// state.
 	pub fn share(&self) -> Self {
 		Self { state: Arc::clone(&self.state) }
 	}
@@ -510,11 +523,14 @@ impl TraceCollector {
 		Self { state: Arc::new(TraceState::with_config(config, sink)) }
 	}
 
-	/// Configure logging backend for this trace collector
+	/// Configures the logging backend for this trace collector.
 	///
-	/// Events can emit to the log backend by calling `.with_log_level()`.
-	/// If the logger config has a default level, it applies to all events
-	/// without an explicit log level.
+	/// An event reaches the log backend through `.with_log_level()`. When the
+	/// logger config has a default level, that level applies to every event
+	/// without an explicit one.
+	///
+	/// The config applies only while this handle is the sole owner of its
+	/// state, so call this before [`TraceCollector::share`].
 	#[cfg(feature = "logging")]
 	pub fn with_logger(mut self, config: super::logging::LoggerConfig) -> Self {
 		if let Some(state) = Arc::get_mut(&mut self.state) {
@@ -523,45 +539,47 @@ impl TraceCollector {
 		self
 	}
 
-	/// Create a trace collector with fuzz oracle (CSP-guided fuzzing)
+	/// Creates a trace collector with a fuzz oracle for CSP-guided fuzzing.
 	#[cfg(feature = "testing-fuzz")]
-	pub fn with_fuzz_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
+	pub fn with_fuzz_oracle(input: impl Into<Vec<u8>>, process: crate::testing::specs::csp::Process) -> Self {
+		let input: Vec<u8> = input.into();
 		Self { state: Arc::new(TraceState::with_oracle(input, process)) }
 	}
 
-	/// Get the fuzz oracle
+	/// The fuzz oracle, when this collector was built with one.
 	///
-	/// # Panics
+	/// [`TraceCollector::with_fuzz_oracle`] is the only constructor that
+	/// installs one, and [`TraceCollector::share`] carries it, so every
+	/// handle a scenario receives answers the same way its collector does.
+	/// Every other collector returns [`None`].
 	///
-	/// Panics when no oracle is configured. This accessor exists for
-	/// `tb_scenario!`-generated fuzz harnesses (feature `testing-fuzz`),
-	/// where a missing `csp:` parameter is a harness construction bug that
-	/// must abort the fuzz run rather than continue unguided.
-	// Test-harness surface: the documented abort is the contract, so the
-	// zero-panic deny is waived for this accessor alone.
-	#[allow(clippy::expect_used)]
+	/// A fuzz harness wants the oracle itself rather than an `Option`, and
+	/// a missing one is a harness construction bug it should abort on.
+	/// `OracleAccess::oracle`, in the test-support surface, is that
+	/// accessor. This one is the total answer the library owes a caller
+	/// that is not a harness.
 	#[cfg(feature = "testing-fuzz")]
-	pub fn oracle(&self) -> &crate::testing::fuzz::FuzzContext {
-		self.state
-			.oracle
-			.as_ref()
-			.expect("Oracle not configured - did you provide csp: parameter in tb_scenario!?")
+	pub fn try_oracle(&self) -> Option<&crate::testing::fuzz::FuzzContext> {
+		self.state.oracle.as_ref()
 	}
 
-	/// Check for runtime fault injection (certification-grade)
+	/// Checks whether the runtime fault model injects a fault at
+	/// `label_cow`.
 	///
-	/// # Returns
-	/// - Ok(()) if no fault should be injected
-	/// - Err if a fault is injected.
+	/// # Errors
+	///
+	/// - The injection point's error, when the model injects a fault.
+	/// - A lock error, when a fault-state lock is poisoned.
 	///
 	/// # Why `&Cow<'static, str>` instead of `&str`
 	///
-	/// This violates clippy's ptr_arg lint but is necessary for zero-copy:
-	/// - We must store the label in a HashMap<Cow<'static, str>, u32> for
-	///   fault injection counters
-	/// - `Cow::clone()` on `Cow::Borrowed` is zero-cost (just copies the pointer)
-	/// - Taking `&str` would force `Cow::Borrowed(label)` construction
-	/// - This maintains zero-allocation for static labels while supporting dynamic ones
+	/// The parameter trips clippy's `ptr_arg` lint, and the lint is allowed
+	/// because the zero-copy counters need the `Cow` itself:
+	///
+	/// - The fault injection counters key a `HashMap<Cow<'static, str>, u32>` by the label.
+	/// - `Cow::clone()` on `Cow::Borrowed` costs nothing, because it copies the pointer.
+	/// - Taking `&str` would force a `Cow::Borrowed(label)` construction.
+	/// - Static labels stay allocation-free, and dynamic labels still work.
 	#[allow(clippy::ptr_arg)]
 	#[cfg(feature = "testing-fault")]
 	fn check_runtime_fault_injection(&self, label_cow: &Cow<'static, str>) -> Result<(), crate::TightBeamError> {
@@ -570,23 +588,28 @@ impl TraceCollector {
 			if let Some(fault_injection) = fault_config.injection_points.get(&key) {
 				let should_inject = match fault_config.injection_strategy {
 					InjectionStrategy::Deterministic => {
-						// Counter-based injection for DO-178C/IEC 61508 reproducibility
-						// Clone Cow: zero-cost for static strings, one alloc for dynamic
+						// Counter-based injection keeps runs reproducible
+						// for DO-178C and IEC 61508. Cloning the `Cow` costs
+						// nothing for a static label and one allocation for
+						// a dynamic one.
 						let mut counters = self.state.fault_call_counters.lock()?;
 						let count = counters.entry(Cow::clone(label_cow)).or_insert(0);
 						*count += 1;
 
-						// Inject based on probability: e.g., 3000 bps (30%) = inject on calls 3,6,9 out of 10
+						// The count spreads injections by probability. For
+						// example, 3000 bps (30%) injects on calls 4, 7, and
+						// 10 out of 10.
 						(*count * fault_injection.probability_bps.get() as u32) % 10000
 							< fault_injection.probability_bps.get() as u32
 					}
 					InjectionStrategy::Random => {
-						// Seeded RNG for statistical coverage (like FDR)
+						// A seeded RNG gives statistical coverage, as FDR
+						// does.
 						let mut rng_state = self.state.fault_rng_state.lock()?;
 						if *rng_state == 0 {
 							*rng_state = fault_config.seed.wrapping_add(1);
 						}
-						// LCG algorithm (same as FDR's SeededRng)
+						// The LCG step matches FDR's `SeededRng`.
 						*rng_state = rng_state
 							.wrapping_mul(crate::constants::LCG_MULTIPLIER)
 							.wrapping_add(crate::constants::LCG_INCREMENT);
@@ -603,11 +626,12 @@ impl TraceCollector {
 		Ok(())
 	}
 
-	/// Record an event with no tags or value.
+	/// Records an event with no tags or value, and returns an
+	/// [`EventBuilder`] for optional chaining.
 	///
-	/// # Returns
-	/// - Ok(EventBuilder) for optional chaining
-	/// - Err if a fault is injected.
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `label`.
 	pub fn event(&self, label: impl IntoEventLabel) -> Result<EventBuilder<'_>, crate::TightBeamError> {
 		let label_cow = label.into_label();
 
@@ -617,18 +641,28 @@ impl TraceCollector {
 		Ok(EventBuilder::new(self, label_cow, None, None))
 	}
 
-	/// Record an event with explicit tags and optional value.
+	/// Records an event with explicit tags and an optional value, and returns
+	/// an [`EventBuilder`] for optional chaining.
 	///
-	/// # Returns
-	/// - Ok(EventBuilder) for optional chaining
-	/// - Err if a fault is injected.
+	/// # Errors
+	///
+	/// - The injected error, when the runtime fault model injects a fault at `label`.
 	///
 	/// # Zero-allocation option
-	/// Pass a static slice to avoid allocation:
 	///
-	/// ```ignore
+	/// A static slice of tags avoids an allocation:
+	///
+	/// ```rust
+	/// # use tightbeam::error::TightBeamError;
+	/// # use tightbeam::trace::TraceCollector;
+	/// # use tightbeam::utils::urn::Urn;
+	/// # const ROUTE_STEP: Urn<'static> = tightbeam::urn!("tightbeam", "event:route/step");
+	/// # fn main() -> Result<(), TightBeamError> {
+	/// # let trace = TraceCollector::default();
 	/// const TAGS: &[&str] = &["critical", "network"];
-	/// trace.event_with(events::ROUTE_STEP, TAGS, value)?
+	/// trace.event_with(ROUTE_STEP, TAGS, 3u64)?.emit();
+	/// # Ok(())
+	/// # }
 	/// ```
 	pub fn event_with<V>(
 		&self,
@@ -647,16 +681,19 @@ impl TraceCollector {
 		Ok(EventBuilder::new(self, label_cow, Some(tags.into()), Some(value.into())))
 	}
 
-	/// Live-step the fuzz CSP oracle when the recorded label is in alphabet.
+	/// Steps the fuzz CSP oracle live when the recorded label is in the
+	/// alphabet.
 	///
-	/// Labels are full URN renderings. Identity matches
-	/// [`crate::testing::specs::csp::Event`] via the shared intern pool so
-	/// structure-aware and simple harnesses all step without alias tables.
-	///
-	/// A failed step is ignored when the label is disabled or outside the
-	/// process alphabet. End-of-run CSP validation still owns hard acceptance.
+	/// - Labels are full URN renderings, and their identity matches
+	///   [`crate::testing::specs::csp::Event`] through the shared intern pool,
+	///   so structure-aware and simple harnesses both step without alias
+	///   tables.
+	/// - The step result is discarded, because a label that is disabled or
+	///   outside the process alphabet fails the step, and end-of-run CSP
+	///   validation owns hard acceptance.
 	#[cfg(feature = "testing-fuzz")]
-	fn dispatch_csp_event(&self, label: &str) {
+	fn dispatch_csp_event(&self, label: impl AsRef<str>) {
+		let label = label.as_ref();
 		let Some(oracle) = self.state.oracle.as_ref() else {
 			return;
 		};
@@ -719,7 +756,7 @@ impl TraceCollector {
 		self.emit_with_payload(event_urn, label.as_ref(), None);
 	}
 
-	/// Record the trace clock's time origin once per collector, so
+	/// Records the trace clock's time origin once per collector, so
 	/// relative `timestamp_ns` values reconstruct to absolute times.
 	#[cfg(feature = "instrument")]
 	fn record_clock_origin(&self) {
@@ -739,8 +776,8 @@ impl TraceCollector {
 		);
 	}
 
-	/// Dual-write a production control-plane event: the URN into the
-	/// instrument log, plus the same URN as assertion label for spec
+	/// Dual-writes a production control-plane event. The URN goes into the
+	/// instrument log, and the same URN becomes the assertion label for spec
 	/// assertions and CSP alphabets when the testing layer observes the
 	/// trace.
 	#[cfg(feature = "instrument")]
@@ -756,9 +793,9 @@ impl TraceCollector {
 		self.emit_internal(event, None, None, None, self.state.clock.now_ns());
 	}
 
-	/// Dual-write a production control-plane event carrying evidence: the
-	/// label records why (e.g. the refusing status) and the payload
-	/// records who (e.g. the peer's SPKI DER) as its SHA3-256 hash when
+	/// Dual-writes a production control-plane event that carries evidence.
+	/// The label records why, such as the refusing status. The payload
+	/// records who, such as the peer's SPKI DER, as its SHA3-256 hash when
 	/// payload capture is enabled.
 	///
 	/// `label` accepts any type that converts via [`AsRef<str>`].
@@ -776,9 +813,10 @@ impl TraceCollector {
 		self.emit_internal(event, Some(label), payload, None, self.state.clock.now_ns());
 	}
 
-	/// Dual-write a production control-plane event carrying a spec-assertable
-	/// value: the label records why (e.g. the GoAway reason name) and the
-	/// value carries its wire code for `equals!` assertions.
+	/// Dual-writes a production control-plane event that carries a
+	/// spec-assertable value. The label records why, such as the GoAway
+	/// reason name, and the value carries its wire code for `equals!`
+	/// assertions.
 	///
 	/// `label` accepts any type that converts via [`AsRef<str>`].
 	#[cfg(feature = "instrument")]
@@ -810,16 +848,29 @@ impl TraceCollector {
 		self.emit_internal(event_urn, Some(label.as_ref()), None, Some(duration.as_nanos() as u64), None);
 	}
 
-	/// Emit an event stamped with a point-in-time instant (relative to the
-	/// trace clock origin), e.g. deadline start/end markers. Durations and
-	/// timestamps are distinct `TbEvent` fields: a duration is a span length,
-	/// a timestamp is when the event occurred.
+	/// Emits an event stamped with a point-in-time instant relative to the
+	/// trace clock origin, such as a deadline start or end marker.
+	///
+	/// Durations and timestamps are distinct `TbEvent` fields. A duration is
+	/// a span length, and a timestamp is when the event occurred.
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_timestamp(&self, event_urn: Urn<'static>, label: impl AsRef<str>, timestamp: Duration) {
 		self.emit_internal(event_urn, Some(label.as_ref()), None, None, Some(timestamp.as_nanos() as u64));
 	}
 
-	/// Drain assertions into a vector
+	/// How many recorded events carry `label`, read without draining them.
+	///
+	/// A test waiting on a background task polls this, so the wait ends on
+	/// the event it expects rather than on elapsed time. Recording only
+	/// appends, so a poisoned lock holds a whole list and is read as is.
+	#[cfg(any(test, feature = "testing"))]
+	pub fn recorded(&self, label: impl IntoEventLabel) -> usize {
+		let label = AssertionLabel::Custom(label.into_label());
+		let assertions = self.state.assertions.lock().unwrap_or_else(PoisonError::into_inner);
+		assertions.iter().filter(|assertion| assertion.label.matches(&label)).count()
+	}
+
+	/// Drains the recorded assertions into a vector.
 	#[cfg(any(test, feature = "testing"))]
 	pub fn drain_assertions(&self) -> Vec<Assertion> {
 		if let Ok(mut assertions) = self.state.assertions.lock() {
@@ -829,17 +880,16 @@ impl TraceCollector {
 		}
 	}
 
-	/// Drain retained events from the configured sink
+	/// Drains the retained events from the configured sink.
 	#[cfg(feature = "instrument")]
 	pub fn drain_events(&self) -> Vec<TbEvent> {
 		self.state.sink.0.drain()
 	}
 
-	/// Whether the configured sink dropped any event (sticky)
+	/// Whether the configured sink dropped any event. The flag is sticky.
 	///
 	/// Feed this into
-	/// [`EvidenceArtifact::finalize`](crate::instrumentation::EvidenceArtifact::finalize)
-	/// so evidence
+	/// [`crate::instrumentation::EvidenceArtifact::finalize`], so evidence
 	/// built from a truncated trace reports `overflow = true`.
 	#[cfg(feature = "instrument")]
 	pub fn overflowed(&self) -> bool {
@@ -875,7 +925,8 @@ impl From<TraceConfig> for TraceCollector {
 }
 
 #[cfg(feature = "instrument")]
-fn hash_payload(payload: &[u8]) -> [u8; 32] {
+fn hash_payload(payload: impl AsRef<[u8]>) -> [u8; 32] {
+	let payload = payload.as_ref();
 	let mut hasher = Sha3_256::new();
 	hasher.update(payload);
 	let out = hasher.finalize();
@@ -885,44 +936,25 @@ fn hash_payload(payload: &[u8]) -> [u8; 32] {
 	arr
 }
 
-#[cfg(feature = "instrument")]
-fn format_assertion_value(value: &AssertionValue) -> String {
-	match value {
-		AssertionValue::String(s) => s.to_string(),
-		AssertionValue::Bool(b) => b.to_string(),
-		AssertionValue::U8(n) => n.to_string(),
-		AssertionValue::U32(n) => n.to_string(),
-		AssertionValue::U64(n) => n.to_string(),
-		AssertionValue::I32(n) => n.to_string(),
-		AssertionValue::I64(n) => n.to_string(),
-		AssertionValue::F64(n) => n.to_string(),
-		AssertionValue::MessagePriority(p) => format!("{p:?}"),
-		AssertionValue::Version(v) => format!("{v:?}"),
-		AssertionValue::Some(inner) => format!("Some({inner:?})"),
-		AssertionValue::IsNone => "none".to_string(),
-		AssertionValue::IsSome => "some".to_string(),
-		AssertionValue::RatioActual(n, d) => format!("{n}/{d}"),
-		AssertionValue::RatioLimit(n, d) => format!("≤{n}/{d}"),
-		#[cfg(feature = "policy")]
-		AssertionValue::TransitStatus(status) => format!("{status:?}"),
-	}
-}
-
-/// Consumed execution trace after await completion.
+/// The execution trace a scenario consumes once the awaited run completes.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct ConsumedTrace {
+	/// The assertions the run recorded.
 	pub assertions: Vec<Assertion>,
+	/// The frame the run accepted, when it recorded one.
 	pub accepted_frame: Option<Frame>,
+	/// The frame the run rejected, when it recorded one.
 	pub rejected_frame: Option<Frame>,
+	/// The response frame the run produced, if any.
 	pub response: Option<Frame>,
 
+	/// The instrumentation events the run emitted.
 	#[cfg(feature = "instrument")]
 	pub instrument_events: Vec<TbEvent>,
+	/// The gate's decision, when the run passed through a gate.
 	#[cfg(feature = "policy")]
 	pub gate_decision: Option<TransitStatus>,
-	#[cfg(feature = "transport")]
-	pub error: Option<TransportError>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -937,39 +969,16 @@ impl ConsumedTrace {
 			instrument_events: Vec::new(),
 			#[cfg(feature = "policy")]
 			gate_decision: None,
-			#[cfg(feature = "transport")]
-			error: None,
 		}
 	}
 
-	/// Populate trace from TraceCollector
+	/// Moves the collector's assertions and events into this trace.
 	pub fn populate_from_collector(&mut self, collector: &TraceCollector) {
 		self.assertions.extend(collector.drain_assertions());
 		#[cfg(feature = "instrument")]
 		{
 			self.instrument_events.extend(collector.drain_events());
 		}
-	}
-
-	/// Determine execution mode based on trace outcome
-	pub fn execution_mode(&self) -> ExecutionMode {
-		#[cfg(feature = "transport")]
-		if self.error.is_some() {
-			return ExecutionMode::Error;
-		}
-		#[cfg(feature = "policy")]
-		{
-			if matches!(self.gate_decision, Some(TransitStatus::Ok)) {
-				return ExecutionMode::Accept;
-			}
-			if self.gate_decision.is_some() {
-				return ExecutionMode::Reject;
-			}
-
-			ExecutionMode::Error
-		}
-		#[cfg(not(feature = "policy"))]
-		ExecutionMode::Accept
 	}
 
 	pub fn has_response(&self) -> bool {
@@ -980,7 +989,8 @@ impl ConsumedTrace {
 		self.assertions
 			.iter()
 			.filter(|a| {
-				// Use matches() for tightbeam URN shorthand support
+				// `matches` accepts the tightbeam URN shorthand, which
+				// plain equality would miss.
 				a.label.matches(label)
 					&& if let Some(filter_tags) = tags {
 						filter_tags.iter().all(|tag| a.tags.contains(tag))
@@ -997,9 +1007,12 @@ impl ConsumedTrace {
 	}
 }
 
+/// The value an event carries into its assertion.
 #[derive(Debug, Clone)]
 pub enum EventValue {
+	/// The event carries no value.
 	None,
+	/// The event carries an assertable value.
 	Value(AssertionValue),
 }
 
@@ -1018,17 +1031,39 @@ where
 	}
 }
 
-/// Execution mode classification for specs
+/// How a recorded run ended, as specs classify it.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
+	/// The body returned and no gate decision refused the run.
 	Accept,
+	/// A gate decision other than `Ok` refused the run.
 	Reject,
+	/// The body returned an error.
 	Error,
 }
 
 #[cfg(any(test, feature = "testing"))]
 impl ExecutionMode {
+	/// What the run did, read from the body's own result and the trace.
+	///
+	/// An error is what the body returned, and a rejection is a gate decision
+	/// other than `Ok`. A run with no gate decision took no gate, so it reads
+	/// as accepted.
+	#[cfg_attr(not(feature = "policy"), expect(unused_variables))]
+	pub fn of(execution: &Result<(), TightBeamError>, trace: &ConsumedTrace) -> Self {
+		if execution.is_err() {
+			return Self::Error;
+		}
+
+		#[cfg(feature = "policy")]
+		if matches!(trace.gate_decision, Some(status) if status != TransitStatus::Ok) {
+			return Self::Reject;
+		}
+
+		Self::Accept
+	}
+
 	pub fn as_str(&self) -> &'static str {
 		match self {
 			Self::Accept => "accept",
@@ -1043,14 +1078,47 @@ mod tests {
 	use crate::utils::urn::Urn;
 	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};
 
-	const ALPHA: Urn<'static> = Urn::new("test", "event:collector/alpha");
-	const BETA: Urn<'static> = Urn::new("test", "event:collector/beta");
+	const ALPHA: Urn<'static> = crate::urn!("test", "event:collector/alpha");
+	const BETA: Urn<'static> = crate::urn!("test", "event:collector/beta");
+
+	/// A collector built without `csp:` has no oracle, and reading one
+	/// reports that rather than ending the process.
+	#[test]
+	#[cfg(feature = "testing-fuzz")]
+	fn a_collector_without_an_oracle_reports_its_absence() {
+		let collector = super::TraceCollector::default();
+
+		assert!(collector.try_oracle().is_none());
+	}
+
+	/// Every handle a scenario receives answers the way its collector does.
+	/// A `share` that dropped the oracle would disarm every fuzz harness
+	/// silently, because the harness reads the shared handle, not the one
+	/// the macro built.
+	#[test]
+	#[cfg(feature = "testing-fuzz")]
+	fn a_collector_built_with_an_oracle_hands_it_to_every_share(
+	) -> Result<(), crate::testing::specs::csp::ProcessBuildError> {
+		use crate::testing::specs::csp::{Event, Process, State};
+
+		let process = Process::builder("ShareSpec")
+			.initial_state(State("S0"))
+			.add_observable(Event("step"))
+			.add_transition(State("S0"), Event("step"), State("S1"))
+			.add_terminal(State("S1"))
+			.build()?;
+
+		let collector = super::TraceCollector::with_fuzz_oracle(Vec::new(), process);
+
+		assert!(collector.try_oracle().is_some());
+		assert!(collector.share().try_oracle().is_some());
+		Ok(())
+	}
 
 	tb_assert_spec! {
 		pub TraceCollectorSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(ALPHA, exactly!(1)),
 				(BETA, exactly!(1)),
@@ -1106,12 +1174,12 @@ mod tests {
 
 	#[cfg(feature = "instrument")]
 	mod sink {
-		use std::sync::{Arc, Mutex};
+		use std::sync::Mutex;
 
 		use crate::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
 		use crate::trace::{TraceCollector, TraceConfig};
 
-		/// Loss-free sink: retains every event with no cap.
+		/// A loss-free sink that retains every event with no cap.
 		#[derive(Default)]
 		struct UnboundedSink {
 			events: Mutex<Vec<TbEvent>>,
@@ -1143,7 +1211,7 @@ mod tests {
 			let collector = TraceCollector::from(
 				TraceConfig::builder()
 					.with_instrumentation(config)
-					.with_sink(Arc::new(UnboundedSink::default()))
+					.with_sink(UnboundedSink::default())
 					.build(),
 			);
 
@@ -1157,8 +1225,7 @@ mod tests {
 
 		#[test]
 		fn sink_without_instrumentation_config_still_receives_events() {
-			let collector =
-				TraceCollector::from(TraceConfig::builder().with_sink(Arc::new(UnboundedSink::default())).build());
+			let collector = TraceCollector::from(TraceConfig::builder().with_sink(UnboundedSink::default()).build());
 
 			collector.emit(events::START, "only");
 
@@ -1167,8 +1234,7 @@ mod tests {
 
 		#[test]
 		fn sink_events_carry_contiguous_seq() {
-			let collector =
-				TraceCollector::from(TraceConfig::builder().with_sink(Arc::new(UnboundedSink::default())).build());
+			let collector = TraceCollector::from(TraceConfig::builder().with_sink(UnboundedSink::default()).build());
 
 			collector.emit(events::START, "first");
 			collector.emit(events::END, "second");

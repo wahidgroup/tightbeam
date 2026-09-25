@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fail if the current crate version has been yanked. Pass --derive to check
-# the tightbeam-derive crate instead of the workspace crate.
+# Refuse to proceed when the version about to be published is already yanked
+# on crates.io. Pass --derive to check tightbeam-derive instead of tightbeam-rs.
+#
+# The registry is the only authority on yank state, so this asks the registry
+# rather than a repository tag that a yank performed elsewhere never updates.
+# A registry that cannot answer stops the release: scripts/crates-io.sh exits
+# non-zero on every outcome short of a definite answer.
 
-CRATE_TOML="Cargo.toml"
-VERSION_SECTION="workspace.package"
-YANKED_PREFIX="yanked/v"
+PACKAGE="tightbeam-rs"
 
 for arg in "$@"; do
 	if [ "$arg" = "--derive" ]; then
-		CRATE_TOML="tightbeam-derive/Cargo.toml"
-		VERSION_SECTION="package"
-		YANKED_PREFIX="yanked/derive/v"
+		PACKAGE="tightbeam-derive"
 	fi
 done
 
-if [ "$VERSION_SECTION" = "package" ]; then
-	VERSION=$(awk -F'"' '/^\[package\]/{f=1;next} f&&/^\[/{f=0} f&&/^version/{print $2;exit}' "$CRATE_TOML" 2>/dev/null || echo "")
-else
-	VERSION=$(awk -F'"' '/^\[workspace\.package\]/{f=1;next} f&&/^\[/{f=0} f&&/^version/{print $2;exit}' "$CRATE_TOML" 2>/dev/null || echo "")
-fi
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VERSION="$("$ROOT/scripts/crate-version.sh" "$PACKAGE")"
+STATE="$("$ROOT/scripts/crates-io.sh" "$PACKAGE" "$VERSION")"
 
-if [ -n "$VERSION" ] && \
-   git ls-remote --tags origin "${YANKED_PREFIX}${VERSION}" 2>/dev/null | grep -q .; then
-	printf '  \033[0;31m[error]\033[0m Version %s has been yanked. Cannot proceed.\n' "$VERSION" >&2
+if [ "$STATE" = "yanked" ]; then
+	printf '  \033[0;31m[error]\033[0m %s %s has been yanked. Cannot proceed.\n' "$PACKAGE" "$VERSION" >&2
 	exit 1
 fi
+
+printf '  \033[0;32m[ok]\033[0m %s %s is %s on crates.io.\n' "$PACKAGE" "$VERSION" "$STATE"

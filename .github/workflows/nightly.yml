@@ -1,0 +1,70 @@
+name: Nightly
+
+# Time-based checks only. Everything that a change can invalidate runs in
+# `make ci` (see .github/workflows/ci.yml), which gates every pull request.
+# These two jobs fire without a change: a new RustSec advisory invalidates a
+# green build, and a fuzz campaign needs more wall time than a PR can hold.
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NO_HUSKY_HOOKS: "1"
+
+jobs:
+  audit:
+    name: Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup
+        run: make setup
+
+      - name: Security Audit
+        run: make audit
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup
+        run: make setup
+
+      # The runner exposes neither the crash-reporting sysctl nor the CPU
+      # governor, so both AFL preflight checks are waived here alone.
+      - name: Fuzz
+        run: make fuzz-test seconds=600 skip-missing-crashes=1 skip-cpu-freq=1
+
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-findings
+          path: built/fuzz/out/
+          retention-days: 14

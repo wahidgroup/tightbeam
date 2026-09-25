@@ -4,23 +4,23 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::builder::error::{BuildError, MetadataError};
+use crate::builder::error::BuildError;
 use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::matrix::MatrixDyn;
-use crate::{Asn1Matrix, CompressedData, DigestInfo, MessagePriority, Metadata, Version};
+use crate::{CompressedData, DigestInfo, MessagePriority, Metadata, Version};
 
 /// A fluent builder for TightBeam metadata.
 pub struct MetadataBuilder {
-	version: Version,
-	id: Option<Vec<u8>>,
-	order: Option<u64>,
-	integrity: Option<DigestInfo>,
-	compactness: Option<CompressedData>,
-	confidentiality: Option<EncryptedContentInfo>,
-	priority: Option<MessagePriority>,
-	lifetime: Option<u64>,
-	previous_frame: Option<DigestInfo>,
-	matrix: Option<MatrixDyn>,
+	pub(crate) version: Version,
+	pub(crate) id: Option<Vec<u8>>,
+	pub(crate) order: Option<u64>,
+	pub(crate) integrity: Option<DigestInfo>,
+	pub(crate) compactness: Option<CompressedData>,
+	pub(crate) confidentiality: Option<EncryptedContentInfo>,
+	pub(crate) priority: Option<MessagePriority>,
+	pub(crate) lifetime: Option<u64>,
+	pub(crate) previous_frame: Option<DigestInfo>,
+	pub(crate) matrix: Option<MatrixDyn>,
 }
 
 impl From<Version> for MetadataBuilder {
@@ -106,57 +106,7 @@ impl MetadataBuilder {
 	/// Returns an error if required fields are missing, or if a set field is
 	/// not permitted by the specified version
 	pub fn build(self) -> Result<Metadata, BuildError> {
-		let Self {
-			version,
-			id,
-			order,
-			integrity,
-			compactness,
-			confidentiality,
-			priority,
-			lifetime,
-			previous_frame,
-			matrix,
-		} = self;
-
-		let id = id.ok_or(BuildError::InvalidMetadata(MetadataError::MissingId))?;
-		let order = order.ok_or(BuildError::InvalidMetadata(MetadataError::MissingOrder))?;
-
-		macro_rules! reject_unsupported {
-			($value:ident, $allows:ident) => {
-				if $value.is_some() && !version.$allows() {
-					return Err(BuildError::InvalidMetadata(MetadataError::UnsupportedField {
-						field: stringify!($value),
-						version,
-					}));
-				}
-			};
-		}
-
-		reject_unsupported!(integrity, allows_integrity);
-		reject_unsupported!(confidentiality, allows_confidentiality);
-		reject_unsupported!(priority, allows_priority);
-		reject_unsupported!(lifetime, allows_lifetime);
-		reject_unsupported!(previous_frame, allows_previous_frame);
-		reject_unsupported!(matrix, allows_matrix);
-
-		let matrix = if let Some(m) = matrix {
-			Some(Asn1Matrix::try_from(m)?)
-		} else {
-			None
-		};
-
-		Ok(Metadata {
-			id,
-			order,
-			compactness,
-			integrity,
-			confidentiality,
-			priority,
-			lifetime,
-			previous_frame,
-			matrix,
-		})
+		Metadata::try_from(self)
 	}
 
 	/// Check if ID is set
@@ -203,7 +153,9 @@ impl MetadataBuilder {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::create_test_hash_info;
+	use crate::asn1::GatedField;
+	use crate::builder::error::MetadataError;
+	use crate::testing::TestDigest;
 
 	/// Fixture 2x2 zero matrix for builder chains.
 	fn fixture_matrix() -> MatrixDyn {
@@ -221,24 +173,24 @@ mod tests {
 				// X.509-style: single structure, validate based on version
 				match $version {
 					Version::V0 => {
-						assert!(metadata.priority.is_none());
-						assert!(metadata.lifetime.is_none());
-						assert!(metadata.previous_frame.is_none());
-						assert!(metadata.matrix.is_none());
+						assert!(metadata.priority().is_none());
+						assert!(metadata.lifetime().is_none());
+						assert!(metadata.previous_frame().is_none());
+						assert!(metadata.matrix().is_none());
 					}
 					Version::V1 => {
-						assert!(metadata.priority.is_none());
-						assert!(metadata.lifetime.is_none());
-						assert!(metadata.previous_frame.is_none());
-						assert!(metadata.matrix.is_none());
+						assert!(metadata.priority().is_none());
+						assert!(metadata.lifetime().is_none());
+						assert!(metadata.previous_frame().is_none());
+						assert!(metadata.matrix().is_none());
 					}
 					Version::V2 => {
-						assert!(metadata.priority.is_some());
-						assert!(metadata.matrix.is_none());
+						assert!(metadata.priority().is_some());
+						assert!(metadata.matrix().is_none());
 					}
 					Version::V3 => {
-						assert!(metadata.priority.is_some());
-						assert!(metadata.matrix.is_some());
+						assert!(metadata.priority().is_some());
+						assert!(metadata.matrix().is_some());
 					}
 				}
 			}
@@ -261,7 +213,7 @@ mod tests {
 		MetadataBuilder::from(Version::V1)
 			.with_id("test-id-v1")
 			.with_order(1696521600u64)
-			.with_integrity_info(create_test_hash_info())
+			.with_integrity_info(TestDigest::info())
 	);
 
 	test_metadata_builder!(
@@ -270,7 +222,7 @@ mod tests {
 		MetadataBuilder::from(Version::V2)
 			.with_id("test-id-v2")
 			.with_order(1696521600u64)
-			.with_integrity_info(create_test_hash_info())
+			.with_integrity_info(TestDigest::info())
 			.with_priority(MessagePriority::LowLatency)
 			.with_lifetime(3600)
 	);
@@ -281,7 +233,7 @@ mod tests {
 		MetadataBuilder::from(Version::V3)
 			.with_id("test-id-v3")
 			.with_order(1696521600u64)
-			.with_integrity_info(create_test_hash_info())
+			.with_integrity_info(TestDigest::info())
 			.with_priority(MessagePriority::LowLatency)
 			.with_lifetime(3600)
 			.with_matrix(fixture_matrix())
@@ -341,9 +293,12 @@ mod tests {
 						MetadataBuilder::from(Version::V0)
 							.with_id("test-id")
 							.with_order(1696521600)
-							.with_integrity_info(create_test_hash_info())
+							.with_integrity_info(TestDigest::info())
 					},
-					expected_error: MetadataError::UnsupportedField { field: "integrity", version: Version::V0 },
+					expected_error: MetadataError::UnsupportedField {
+						field: GatedField::MessageIntegrity,
+						version: Version::V0,
+					},
 				},
 				ErrorTestCase {
 					name: "V0 rejects priority",
@@ -353,7 +308,10 @@ mod tests {
 							.with_order(1696521600)
 							.with_priority(MessagePriority::LowLatency)
 					},
-					expected_error: MetadataError::UnsupportedField { field: "priority", version: Version::V0 },
+					expected_error: MetadataError::UnsupportedField {
+						field: GatedField::Priority,
+						version: Version::V0,
+					},
 				},
 				ErrorTestCase {
 					name: "V1 rejects lifetime",
@@ -363,7 +321,10 @@ mod tests {
 							.with_order(1696521600)
 							.with_lifetime(3600)
 					},
-					expected_error: MetadataError::UnsupportedField { field: "lifetime", version: Version::V1 },
+					expected_error: MetadataError::UnsupportedField {
+						field: GatedField::Lifetime,
+						version: Version::V1,
+					},
 				},
 				ErrorTestCase {
 					name: "V0 rejects previous_frame",
@@ -371,9 +332,12 @@ mod tests {
 						MetadataBuilder::from(Version::V0)
 							.with_id("test-id")
 							.with_order(1696521600)
-							.previous_frame(create_test_hash_info())
+							.previous_frame(TestDigest::info())
 					},
-					expected_error: MetadataError::UnsupportedField { field: "previous_frame", version: Version::V0 },
+					expected_error: MetadataError::UnsupportedField {
+						field: GatedField::PreviousFrame,
+						version: Version::V0,
+					},
 				},
 				ErrorTestCase {
 					name: "V2 rejects matrix",
@@ -383,7 +347,7 @@ mod tests {
 							.with_order(1696521600)
 							.with_matrix(MatrixDyn::default())
 					},
-					expected_error: MetadataError::UnsupportedField { field: "matrix", version: Version::V2 },
+					expected_error: MetadataError::UnsupportedField { field: GatedField::Matrix, version: Version::V2 },
 				},
 			];
 

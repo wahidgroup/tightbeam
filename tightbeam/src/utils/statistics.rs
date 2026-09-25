@@ -15,21 +15,13 @@ use alloc::{string::String, vec::Vec};
 /// Allows plugging in custom statistical models without modifying core
 /// verification logic. Similar to `JitterCalculator` pattern.
 pub trait StatisticalAnalyzer: Send + Sync + core::fmt::Debug {
-	/// Analyze a collection of observed durations.
-	///
-	/// Returns statistical measures (percentiles, confidence intervals, etc.)
-	///
-	/// # Arguments
-	/// * `durations` - Slice of observed durations in nanoseconds
-	///
-	/// # Returns
-	/// * `Ok(StatisticalMeasures)` - Statistical measures from analysis
-	/// * `Err(TightBeamError)` - If analysis fails (e.g., insufficient data)
+	/// Analyze observed durations, in nanoseconds, into statistical measures
+	/// such as percentiles and confidence intervals.
 	///
 	/// # Errors
-	/// Returns an error if:
-	/// * `durations` is empty
-	/// * Analysis requires more samples than available
+	///
+	/// - `durations` is empty.
+	/// - The analysis needs more samples than `durations` holds.
 	fn analyze(&self, durations: &[u64]) -> Result<StatisticalMeasures, TightBeamError>;
 }
 
@@ -64,8 +56,8 @@ impl Percentile {
 		}
 	}
 
-	/// Get percentile as fixed-point integer (multiplied by 10000).
-	/// Example: P95 -> 9500, P99.9 -> 9990
+	/// The percentile as a fixed-point integer, scaled by 10000, so P95 is 9500
+	/// and P99.9 is 9990.
 	pub fn as_fixed_point(self) -> u32 {
 		match self {
 			Percentile::P50 => 5000,
@@ -80,6 +72,7 @@ impl Percentile {
 
 /// Confidence intervals for statistical measures.
 #[derive(Debug, Clone, Sequence, PartialEq)]
+#[non_exhaustive]
 pub struct ConfidenceIntervals {
 	/// Confidence level (e.g., 9500 for 95% - stored as integer * 10000)
 	pub level: u32,
@@ -106,6 +99,7 @@ pub struct CustomMetric {
 
 /// Statistical measures from analysis.
 #[derive(Debug, Clone, Sequence, PartialEq)]
+#[non_exhaustive]
 pub struct StatisticalMeasures {
 	/// Sample count
 	pub count: u64,
@@ -189,7 +183,8 @@ impl StatisticalAnalyzer for DefaultStatisticalAnalyzer {
 			},
 		];
 
-		// Calculate confidence intervals (simple approximation for large samples)
+		// Calculate confidence intervals (simple approximation for large
+		// samples)
 		let confidence_intervals = if count >= 30 {
 			// Use standard error approximation
 			let variance: u64 = durations
@@ -347,7 +342,8 @@ mod tests {
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P99_9));
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P99_99));
 
-		// Percentiles should be monotonic (P50 <= P90 <= P95 <= P99 <= P99.9 <= P99.99)
+		// Percentiles should be monotonic (P50 <= P90 <= P95 <= P99 <= P99.9 <=
+		// P99.99)
 		let p50 = result
 			.percentiles
 			.iter()

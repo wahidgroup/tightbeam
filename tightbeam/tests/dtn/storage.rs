@@ -2,10 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tightbeam::asn1::Frame;
+use tightbeam::asn1::{DigestInfo, Frame};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::der::{Decode, Encode, Sequence};
-use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::{Beamable, TightBeamError};
 
 /// DTN payload for multi-hop communication (used in tests)
@@ -61,7 +60,7 @@ impl FrameStore {
 	/// Persist a frame to storage and return its ID
 	pub fn persist(&mut self, frame: &Frame) -> Result<String, TightBeamError> {
 		// Use frame metadata ID from frame metadata
-		let frame_id = String::from_utf8_lossy(&frame.metadata.id).to_string();
+		let frame_id = String::from_utf8_lossy(frame.metadata().id()).to_string();
 		// Write to disk
 		let file_path = self.storage_dir.join(format!("{}.frame", frame_id));
 		let frame_bytes = frame.to_der()?;
@@ -76,7 +75,8 @@ impl FrameStore {
 	}
 
 	/// Retrieve a frame by its ID
-	pub fn retrieve(&mut self, id: &str) -> Result<Frame, TightBeamError> {
+	pub fn retrieve(&mut self, id: impl AsRef<str>) -> Result<Frame, TightBeamError> {
+		let id = id.as_ref();
 		// Check memory cache first
 		if let Some(frame) = self.frames.get(id) {
 			return Ok(frame.to_owned());
@@ -93,7 +93,8 @@ impl FrameStore {
 	}
 
 	/// Retrieve a frame by its hash (searches all stored frames)
-	pub fn retrieve_by_hash(&mut self, hash: &[u8]) -> Result<Option<Frame>, TightBeamError> {
+	pub fn retrieve_by_hash(&mut self, hash: impl AsRef<[u8]>) -> Result<Option<Frame>, TightBeamError> {
+		let hash = hash.as_ref();
 		// Check memory cache first
 		let cached = self.frames.values().find_map(|frame| {
 			frame
@@ -127,7 +128,8 @@ impl FrameStore {
 	/// Validates that each frame's `previous_frame` hash matches the
 	/// actual hash of the previous frame, proving integrity without
 	/// requiring trusted intermediaries.
-	pub fn verify_chain(&self, frames: &[Frame]) -> Result<ChainVerdict, TightBeamError> {
+	pub fn verify_chain(&self, frames: impl AsRef<[Frame]>) -> Result<ChainVerdict, TightBeamError> {
+		let frames = frames.as_ref();
 		let broken_links: Vec<(usize, String)> = frames
 			.iter()
 			.enumerate()
@@ -136,8 +138,8 @@ impl FrameStore {
 				let prev_frame = &frames[i - 1];
 				let prev_hash = prev_frame.to_der().ok().map(|bytes| Sha3_256::digest(&bytes))?;
 
-				match frame.metadata.previous_frame.as_ref() {
-					Some(digest_info) if verify_digest(&prev_hash, digest_info) => None,
+				match frame.metadata().previous_frame() {
+					Some(digest_info) if verify_digest(prev_hash, digest_info) => None,
 					Some(_) => Some((i, "Hash mismatch".to_string())),
 					None => Some((i, "Missing previous_frame".to_string())),
 				}
@@ -174,7 +176,8 @@ impl FrameStore {
 }
 
 /// Verify that a computed hash matches the expected DigestInfo
-fn verify_digest(computed: &[u8], expected: &DigestInfo) -> bool {
+fn verify_digest(computed: impl AsRef<[u8]>, expected: &DigestInfo) -> bool {
+	let computed = computed.as_ref();
 	computed == expected.digest.as_bytes()
 }
 
@@ -209,7 +212,7 @@ mod tests {
 
 		// Retrieve
 		let retrieved = store.retrieve(&frame_id)?;
-		let retrieved_payload = DtnPayload::from_der(retrieved.message.as_slice())?;
+		let retrieved_payload = DtnPayload::from_der(retrieved.message())?;
 		assert_eq!(retrieved_payload.content, b"test payload");
 
 		// Cleanup
@@ -273,7 +276,13 @@ mod tests {
 		// Verify all frames were processed in correct order
 		assert_eq!(processed_frames.len(), 5, "All 5 frames should be processed");
 		for (i, frame) in processed_frames.iter().enumerate() {
-			assert_eq!(frame.metadata.order, (i + 1) as u64, "Frame {} should have order {}", i, i + 1);
+			assert_eq!(
+				frame.metadata().order(),
+				(i + 1) as u64,
+				"Frame {} should have order {}",
+				i,
+				i + 1
+			);
 		}
 
 		// Verify all frames were persisted

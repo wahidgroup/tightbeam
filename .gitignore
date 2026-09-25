@@ -17,3 +17,6 @@ temp
 
 # Setup lock
 .make
+
+# Audit artifacts
+.audit

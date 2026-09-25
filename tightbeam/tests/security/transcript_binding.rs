@@ -1,11 +1,14 @@
 //! # Transcript-binding downgrade threat
 //!
 //! ## Weakness
-//! If the ECIES handshake transcript omits the negotiated `security_accept` -
-//! covering only `client_random || server_random || server_spki` - the signed
-//! transcript does not authenticate the chosen profile, leaving negotiation
-//! unbound. Likewise, if only the client *random* (not the full `ClientHello`)
-//! is bound, the client's `SecurityOffer` can be rewritten in transit.
+//! Suppose the ECIES handshake transcript omits the negotiated
+//! `security_accept` and covers only
+//! `client_random || server_random || server_spki`. The signed transcript
+//! then leaves the chosen profile unauthenticated, so negotiation is unbound.
+//!
+//! Likewise, if the transcript binds only the client *random* and omits the
+//! full `ClientHello`, the client's `SecurityOffer` can be rewritten in
+//! transit.
 //!
 //! ## Attack
 //! 1. An adversary-in-the-middle rewrites `security_accept` to a weaker (still
@@ -14,7 +17,7 @@
 //!    adopts the weaker profile.
 //! 2. The MITM strips or rewrites the `SecurityOffer` inside `ClientHello`
 //!    while preserving `client_random`. The server signs a transcript over the
-//!    modified hello; if the client only bound its random, the signature still
+//!    modified hello. If the client bound only its random, the signature still
 //!    verifies and negotiation happened over an offer the client never made.
 //!
 //! ## Expected control
@@ -24,10 +27,9 @@
 //! differs from the exact DER bytes it sent (TLS-style full-message binding).
 //!
 //! ## References
-//! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm Downgrade')
-//!   <https://cwe.mitre.org/data/definitions/757.html>
-//! - CWE-300: Channel Accessible by Non-Endpoint
-//!   <https://cwe.mitre.org/data/definitions/300.html>
+//! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
+//!   Downgrade') <https://cwe.mitre.org/data/definitions/757.html>
+//! - CWE-300: Channel Accessible by Non-Endpoint <https://cwe.mitre.org/data/definitions/300.html>
 //! - CAPEC-220: Client-Server Protocol Manipulation
 //!   <https://capec.mitre.org/data/definitions/220.html>
 //! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection
@@ -44,8 +46,9 @@ use tightbeam::{
 		client::EciesHandshakeClient,
 		negotiation::{SecurityAccept, SecurityOffer},
 		server::EciesHandshakeServer,
-		ClientHello, ServerHandshake,
+		ClientHello, PeerAuthentication, ServerHandshake,
 	},
+	transport::wire_der::WireDer,
 	utils::urn::Urn,
 	TightBeamError,
 };
@@ -55,9 +58,9 @@ use crate::common::security::{
 };
 
 pub(crate) const STRIPPED_OFFER_REJECTED: Urn<'static> =
-	Urn::new("test", "event:transcript-binding/stripped-offer-rejected");
+	tightbeam::urn!("test", "event:transcript-binding/stripped-offer-rejected");
 pub(crate) const TAMPERED_ACCEPT_REJECTED: Urn<'static> =
-	Urn::new("test", "event:transcript-binding/tampered-accept-rejected");
+	tightbeam::urn!("test", "event:transcript-binding/tampered-accept-rejected");
 
 type EciesClient = EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>;
 type EciesServer = EciesHandshakeServer<DefaultCryptoProvider>;
@@ -66,7 +69,6 @@ tb_assert_spec! {
 	pub TranscriptBindingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(TAMPERED_ACCEPT_REJECTED, exactly!(1u32)),
 			(STRIPPED_OFFER_REJECTED, exactly!(1u32))
@@ -117,15 +119,15 @@ fn strong_weak_pair(
 		Arc::clone(&materials.key_provider),
 		Arc::clone(&materials.certificate),
 		None,
-		None,
+		PeerAuthentication::Anonymous,
 	)
 	.with_supported_profiles(vec![strong, weak]);
 
 	(client, server, strong, weak)
 }
 
-async fn expect_client_reject<E>(
-	result: Result<Vec<u8>, E>,
+async fn expect_client_reject<T, E>(
+	result: Result<T, E>,
 	trace: &TraceCollector,
 	event: Urn<'static>,
 	on_accept: &'static str,
@@ -144,20 +146,20 @@ job! {
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let materials = ServerMaterials::generate();
 
-		// Phase 1: MITM downgrade: swap accepted profile without touching
-		// randoms, cert, or signature.
+		// Phase 1: A MITM downgrade swaps the accepted profile without
+		// touching the randoms, the certificate, or the signature.
 		let (mut client, mut server, strong, weak) = strong_weak_pair(&materials);
-		let client_hello = client.build_client_hello()?;
-		let server_handshake_der = server.process_client_hello(&client_hello).await?;
+		let client_hello = client.build_client_hello()?.to_der()?;
+		let server_handshake_der = server.process_client_hello(&client_hello).await?.to_der()?;
 
 		let mut server_handshake = ServerHandshake::from_der(&server_handshake_der)?;
 		assert_eq!(
-			server_handshake.security_accept.as_ref().map(|a| a.profile),
+			server_handshake.security_accept.as_ref().map(|accept| accept.value().profile),
 			Some(strong),
 			"server must select the strong profile"
 		);
 
-		server_handshake.security_accept = Some(SecurityAccept::new(weak));
+		server_handshake.security_accept = Some(WireDer::new(SecurityAccept::new(weak))?);
 
 		let tampered = server_handshake.to_der()?;
 		expect_client_reject(
@@ -172,7 +174,7 @@ job! {
 		// client_random is preserved, so a random-only transcript would still
 		// verify. The full ClientHello DER binding must make the client reject.
 		let (mut client, mut server, _strong, _weak) = strong_weak_pair(&materials);
-		let client_hello = client.build_client_hello()?;
+		let client_hello = client.build_client_hello()?.to_der()?;
 		let mut stripped_hello = ClientHello::from_der(&client_hello)?;
 		stripped_hello.security_offer = None;
 
@@ -182,7 +184,7 @@ job! {
 			"offer stripping must change ClientHello bytes"
 		);
 
-		let server_handshake_der = server.process_client_hello(&stripped_hello).await?;
+		let server_handshake_der = server.process_client_hello(&stripped_hello).await?.to_der()?;
 		expect_client_reject(
 			client.process_server_handshake(&server_handshake_der).await,
 			&trace,

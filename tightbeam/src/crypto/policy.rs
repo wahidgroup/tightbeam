@@ -2,39 +2,28 @@
 //!
 //! This module provides traits for algorithm-agnostic signature verification.
 
+#[cfg(feature = "x509")]
 use core::fmt::Debug;
 
 #[cfg(feature = "x509")]
-use crate::crypto::x509::error::CertificateValidationError;
 use crate::der::oid::ObjectIdentifier;
 
-/// Errors specific to cryptographic policy enforcement
-///
-/// Deliberately does not derive `Errorizable`: this module builds without
-/// the `derive` feature, so the message strings live in exactly one place --
-/// the `impl_error_display!` block below.
-#[derive(Debug)]
-pub enum CryptoPolicyError {
-	/// Algorithm not supported by this policy
-	UnsupportedAlgorithm(ObjectIdentifier),
-}
-
-crate::impl_error_display!(unconditional CryptoPolicyError {
-	UnsupportedAlgorithm(oid) => "Unsupported algorithm: {oid}",
-});
+#[cfg(feature = "x509")]
+use crate::crypto::x509::error::CertificateValidationError;
 
 /// Trait for cryptographic verification policies.
 ///
 /// This trait defines how to verify signatures in an object-safe manner.
-/// Implementations handle algorithm-specific parsing and verification internally,
-/// allowing callers to remain algorithm-agnostic.
+/// Implementations handle algorithm-specific parsing and verification
+/// internally, allowing callers to remain algorithm-agnostic.
 ///
 /// # Object Safety
 ///
 /// This trait is object-safe and can be used with `Arc<dyn VerificationPolicy>`.
 #[cfg(feature = "x509")]
 pub trait VerificationPolicy: Send + Sync + Debug {
-	/// Verify a signature given algorithm OID, public key, message, and signature bytes.
+	/// Verify a signature given algorithm OID, public key, message, and
+	/// signature bytes.
 	///
 	/// The implementation handles all algorithm-specific logic internally:
 	/// - Parsing public key bytes into the appropriate key type
@@ -76,8 +65,8 @@ impl VerificationPolicy for Secp256k1Policy {
 	fn verify_signature(
 		&self,
 		algorithm_oid: &ObjectIdentifier,
-		public_key_der: &[u8],
-		message: &[u8],
+		bytes: &[u8],
+		content: &[u8],
 		signature: &[u8],
 	) -> Result<(), CertificateValidationError> {
 		use crate::crypto::hash::Sha3_256;
@@ -93,10 +82,10 @@ impl VerificationPolicy for Secp256k1Policy {
 
 		// RFC 5280 §6.1.3(a)(1): cryptographic signature verification primitive
 		// under the canonical convention (SHA3-256 prehash).
-		let verifying_key = Secp256k1VerifyingKey::from_public_key_der(public_key_der)?;
-		let sig = Secp256k1Signature::try_from(signature)?;
+		let verifier = Secp256k1VerifyingKey::from_public_key_der(bytes)?;
+		let signature = Secp256k1Signature::try_from(signature)?;
 
-		verify_canonical::<Sha3_256, _>(&verifying_key, message, &sig)?;
+		verify_canonical::<Sha3_256, _>(&verifier, content, &signature)?;
 		Ok(())
 	}
 }
@@ -116,7 +105,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 	use crate::spki::EncodePublicKey;
-	use crate::testing::create_test_signing_key;
+	use crate::testing::TestKey;
 
 	/// Interop: a signature produced by the `ecdsa` crate's own
 	/// `DigestSigner<Sha3_256>` path -- independent of this crate's
@@ -124,7 +113,7 @@ mod tests {
 	/// ecdsa-with-SHA3-256 OID.
 	#[test]
 	fn verifies_independent_sha3_ecdsa_signature() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key: Secp256k1SigningKey = create_test_signing_key();
+		let signing_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let message = b"independent sha3-ecdsa interop";
 
 		let mut digest = Sha3_256::default();

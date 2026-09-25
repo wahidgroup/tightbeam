@@ -1,11 +1,12 @@
-// Re-exports
-pub use aead::*;
+pub use aead::{Aead, AeadCore, Error, Key, KeyInit, Nonce, Payload};
 #[cfg(feature = "aes-gcm")]
 pub use aes_gcm::{Aes128Gcm, Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmNonce};
 #[cfg(feature = "transport")]
 pub use aes_kw;
 
 use core::result::Result as CoreResult;
+
+use aead::KeySizeUser;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::asn1::ObjectIdentifier;
@@ -22,18 +23,20 @@ use crate::{AlgorithmIdentifier, EncryptedContentInfo, TightBeamError};
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-// OID wrapper types for AEAD ciphers
 #[cfg(feature = "aes-gcm")]
 mod oid_wrappers {
 	crate::define_oid_wrapper!(
-		/// AES-128-GCM cipher OID wrapper
+		/// The AES-128-GCM algorithm OID.
+		///
+		/// The `aes-gcm` crate leaves `AssociatedOid` to this wrapper.
 		Aes128GcmOid,
 		"2.16.840.1.101.3.4.1.6"
 	);
 
 	crate::define_oid_wrapper!(
-		/// AES-256-GCM cipher OID wrapper
-		/// Note: The `aes-gcm` crate does not implement `AssociatedOid` directly.
+		/// The AES-256-GCM algorithm OID.
+		///
+		/// The `aes-gcm` crate leaves `AssociatedOid` to this wrapper.
 		Aes256GcmOid,
 		"2.16.840.1.101.3.4.1.46"
 	);
@@ -42,10 +45,29 @@ mod oid_wrappers {
 #[cfg(feature = "aes-gcm")]
 pub use oid_wrappers::*;
 
-/// Object-safe AEAD trait for runtime polymorphism.
+/// An AEAD cipher and the algorithm identifier it runs under.
 ///
-/// This trait provides a minimal object-safe interface for AEAD operations,
-/// allowing different cipher types to be stored in a single type (`RuntimeAead`).
+/// The cipher type is the one home for both facts a peer needs about it: the
+/// OID stamped on each ciphertext and, through [`KeySizeUser`], the key length.
+/// Every other view of an AEAD algorithm reads them from here.
+pub trait AeadAlgorithm: Aead + KeySizeUser {
+	/// The algorithm identifier this cipher encrypts under.
+	type Oid: AssociatedOid;
+}
+
+#[cfg(feature = "aes-gcm")]
+impl AeadAlgorithm for Aes128Gcm {
+	type Oid = Aes128GcmOid;
+}
+
+#[cfg(feature = "aes-gcm")]
+impl AeadAlgorithm for Aes256Gcm {
+	type Oid = Aes256GcmOid;
+}
+
+/// The object-safe AEAD surface behind [`RuntimeAead`].
+///
+/// A trait object of it lets one type hold any cipher type.
 trait AeadOps: Send + Sync {
 	/// Encrypt plaintext with the given nonce.
 	fn encrypt_bytes(&self, nonce: &[u8], plaintext: &[u8]) -> CoreResult<Vec<u8>, aead::Error>;
@@ -53,21 +75,39 @@ trait AeadOps: Send + Sync {
 	/// Decrypt ciphertext with the given nonce.
 	fn decrypt_bytes(&self, nonce: &[u8], ciphertext: &[u8]) -> CoreResult<Vec<u8>, aead::Error>;
 
-	/// Nonce length in bytes required by this AEAD.
+	/// The nonce length in bytes that this AEAD requires.
 	fn nonce_size(&self) -> usize;
 }
 
-/// Blanket implementation for all RustCrypto `Aead` types.
+/// Borrows `nonce` at the cipher's nonce length.
+///
+/// The object-safe surface carries a plain slice, so a wrong length is
+/// representable at the call. Converting here returns the AEAD's own
+/// error for it, which the cipher methods already propagate.
+trait SizedNonce: AeadCore {
+	fn sized_nonce<'a>(&self, nonce: &'a [u8]) -> CoreResult<&'a aead::Nonce<Self>, aead::Error> {
+		if nonce.len() != <Self as AeadCore>::NonceSize::USIZE {
+			return Err(aead::Error);
+		}
+
+		Ok(aead::Nonce::<Self>::from_slice(nonce))
+	}
+}
+
+impl<A: AeadCore> SizedNonce for A {}
+
 impl<A> AeadOps for A
 where
 	A: Aead + Send + Sync,
 {
 	fn encrypt_bytes(&self, nonce: &[u8], plaintext: &[u8]) -> CoreResult<Vec<u8>, aead::Error> {
-		self.encrypt(nonce.into(), plaintext)
+		let nonce = self.sized_nonce(nonce)?;
+		self.encrypt(nonce, plaintext)
 	}
 
 	fn decrypt_bytes(&self, nonce: &[u8], ciphertext: &[u8]) -> CoreResult<Vec<u8>, aead::Error> {
-		self.decrypt(nonce.into(), ciphertext)
+		let nonce = self.sized_nonce(nonce)?;
+		self.decrypt(nonce, ciphertext)
 	}
 
 	fn nonce_size(&self) -> usize {
@@ -75,26 +115,26 @@ where
 	}
 }
 
-/// Runtime-polymorphic AEAD cipher wrapper.
+/// A runtime-polymorphic AEAD cipher and its algorithm OID.
 ///
-/// This allows the handshake orchestrator (which knows `P::AeadCipher` at
-/// compile time) to construct the appropriate cipher, then pass it to the
-/// transport layer which stores it as a type-erased `RuntimeAead`. The OID
-/// is stored alongside the cipher so encryption produces correct
-/// `EncryptedContentInfo` structures.
-///
-/// The handshake negotiates the security profile and constructs the correct
-/// concrete cipher type (e.g., `Aes256Gcm`, `Aes128Gcm`), then wraps it in
-/// `RuntimeAead` for storage in the transport layer.
+/// The handshake negotiates the security profile and builds the concrete
+/// cipher type from `P::AeadCipher`, such as `Aes256Gcm` or `Aes128Gcm`. It
+/// wraps that cipher here, and the transport layer stores the result
+/// type-erased. The stored OID lets encryption produce a correct
+/// [`EncryptedContentInfo`].
 ///
 /// # Example
-/// ```ignore
-/// // In handshake orchestrator (knows P::AeadCipher at compile time)
-/// let cipher = Aes256Gcm::new_from_slice(&key_bytes)?;
-/// let runtime_aead = RuntimeAead::new(cipher, AES_256_GCM_OID);
 ///
-/// // Directional wrappers store RuntimeAead without knowing concrete type
+/// ```
+/// use tightbeam::crypto::aead::{Aes256Gcm, KeyInit, RuntimeAead, SendCipher};
+/// use tightbeam::oids::AES_256_GCM;
+///
+/// let cipher = Aes256Gcm::new(&[0x42; 32].into());
+/// let runtime_aead = RuntimeAead::new(cipher);
+/// assert_eq!(runtime_aead.algorithm_oid(), AES_256_GCM);
+///
 /// let send_cipher = SendCipher::new(runtime_aead);
+/// assert_eq!(send_cipher.algorithm_oid(), AES_256_GCM);
 /// ```
 pub struct RuntimeAead {
 	cipher: Box<dyn AeadOps>,
@@ -102,77 +142,69 @@ pub struct RuntimeAead {
 }
 
 impl RuntimeAead {
-	/// Construct a new RuntimeAead from any RustCrypto AEAD cipher.
-	///
-	/// # Parameters
-	/// - `cipher`: The concrete AEAD cipher (e.g., `Aes256Gcm`)
-	/// - `oid`: The algorithm OID for this cipher
-	pub fn new<A>(cipher: A, oid: ObjectIdentifier) -> Self
+	/// Wrap `cipher`, taking its algorithm identifier from its type.
+	pub fn new<A>(cipher: A) -> Self
 	where
-		A: Aead + Send + Sync + 'static,
+		A: AeadAlgorithm + Send + Sync + 'static,
 	{
+		let oid = <A::Oid as AssociatedOid>::OID;
 		Self { cipher: Box::new(cipher), oid }
 	}
 
+	/// The algorithm OID this cipher encrypts under.
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
 		self.oid
 	}
 
+	/// The nonce length in bytes of the wrapped cipher.
 	pub fn nonce_size(&self) -> usize {
 		self.cipher.nonce_size()
 	}
 }
 
-// ============================================================================
-// Helper Functions for EncryptedContentInfo
-// ============================================================================
-
-/// Build an EncryptedContentInfo structure from components.
+/// Build an [`EncryptedContentInfo`] that carries `nonce` as an OCTET STRING
+/// in the algorithm parameters.
 ///
-/// This helper encapsulates the common logic for constructing
-/// EncryptedContentInfo from a ciphertext, nonce, content type, and
-/// algorithm OID.
+/// A `None` content type defaults to [`DATA`].
 #[inline]
 fn build_encrypted_content_info(
-	ciphertext: Vec<u8>,
+	ciphertext: impl Into<Vec<u8>>,
 	nonce: &[u8],
 	content_type: Option<ObjectIdentifier>,
 	algorithm_oid: ObjectIdentifier,
 ) -> TbResult<EncryptedContentInfo> {
+	let ciphertext: Vec<u8> = ciphertext.into();
 	let content_type = content_type.unwrap_or(DATA);
 
-	// Store the nonce in the algorithm parameters as an OctetString
 	let nonce_octet_string = OctetString::new(nonce)?;
 	let parameters = Some(Any::encode_from(&nonce_octet_string)?);
 
 	let content_enc_alg = AlgorithmIdentifier { oid: algorithm_oid, parameters };
 	let encrypted_content = Some(OctetString::new(ciphertext)?);
-
 	Ok(EncryptedContentInfo { content_type, content_enc_alg, encrypted_content })
 }
 
-/// Extract nonce and ciphertext from EncryptedContentInfo.
+/// Extract the nonce and the ciphertext from an [`EncryptedContentInfo`].
 ///
-/// Both slices borrow directly from `info`. The nonce length is validated
-/// against `expected_nonce_len`: NIST SP 800-38D §8.2 fixes the GCM nonce at
+/// Both slices borrow directly from `info`. The nonce length MUST equal
+/// `expected_nonce_len`, because NIST SP 800-38D §8.2 fixes the GCM nonce at
 /// the cipher's nonce size (96 bits for AES-GCM here).
 #[inline]
 fn extract_nonce_and_ciphertext(info: &EncryptedContentInfo, expected_nonce_len: usize) -> TbResult<(&[u8], &[u8])> {
-	// Extract ciphertext
 	let ciphertext = info
 		.encrypted_content
 		.as_ref()
 		.ok_or(TightBeamError::MissingEncryptionInfo)?
 		.as_bytes();
 
-	// Extract nonce from algorithm parameters
 	let nonce_any = info
 		.content_enc_alg
 		.parameters
 		.as_ref()
 		.ok_or(TightBeamError::MissingEncryptionInfo)?;
 
-	// Borrow the nonce bytes out of the Any without an owned OctetString copy
+	// `OctetStringRef` borrows the nonce bytes out of the `Any`, so no owned
+	// copy exists.
 	let nonce_octet_string: OctetStringRef<'_> = nonce_any.decode_as()?;
 	let nonce = nonce_octet_string.as_bytes();
 	if nonce.len() != expected_nonce_len {
@@ -182,21 +214,19 @@ fn extract_nonce_and_ciphertext(info: &EncryptedContentInfo, expected_nonce_len:
 	Ok((nonce, ciphertext))
 }
 
-// ============================================================================
-// Encryptor/Decryptor Traits
-// ============================================================================
-
-/// Trait for encrypting data and producing EncryptedContentInfo
+/// An encryptor that produces [`EncryptedContentInfo`] under the algorithm
+/// OID `C`.
 ///
-/// An impl binds a cipher type to the algorithm OID stamped on the wire:
-/// implement it only for canonically matched `(cipher, OID)` pairs (see the
-/// AES-GCM impls). The trait stays unsealed so custom encryptors such as
-/// ECIES remain possible.
+/// An impl binds an encryptor type to the algorithm OID stamped on its
+/// ciphertext. Every [`AeadAlgorithm`] cipher implements it for its own OID and
+/// no other. The trait stays unsealed so custom encryptors such as ECIES remain
+/// possible.
 pub trait Encryptor<C>
 where
 	C: AssociatedOid,
 {
-	/// Encrypt data and return the encrypted content info
+	/// Encrypt `data` under `nonce` and wrap the ciphertext in an
+	/// [`EncryptedContentInfo`].
 	fn encrypt_content(
 		&self,
 		data: impl AsRef<[u8]>,
@@ -205,83 +235,120 @@ where
 	) -> TbResult<EncryptedContentInfo>;
 }
 
-/// Trait for decrypting EncryptedContentInfo
+/// Encrypted content whose algorithm matches the decryptor that opens it.
+///
+/// Only this crate creates one, and only after it checks the algorithm, so a
+/// [`Decryptor::open`] call always follows that check (CWE-345).
+pub struct CheckedContent<'a> {
+	info: &'a EncryptedContentInfo,
+}
+
+impl<'a> CheckedContent<'a> {
+	/// Admit `info` when it names the `expected` algorithm.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when `info` names another algorithm.
+	pub(crate) fn check(info: &'a EncryptedContentInfo, expected: ObjectIdentifier) -> TbResult<Self> {
+		let received = info.content_enc_alg.oid;
+		if received != expected {
+			return Err(TightBeamError::UnexpectedAlgorithm((received, expected).into()));
+		}
+
+		Ok(Self { info })
+	}
+
+	/// The encrypted content.
+	pub fn info(&self) -> &'a EncryptedContentInfo {
+		self.info
+	}
+}
+
+/// A decryptor for [`EncryptedContentInfo`] under one algorithm.
+///
+/// Callers decrypt through [`DecryptContent::decrypt_content`], which checks
+/// the algorithm before it calls [`Decryptor::open`].
 pub trait Decryptor {
-	/// Decrypt encrypted content info and return the plaintext bytes.
-	/// The nonce is extracted from the algorithm parameters in the
-	/// EncryptedContentInfo and validated against the cipher's nonce size.
+	/// The algorithm identifier this decryptor opens.
+	fn algorithm_oid(&self) -> ObjectIdentifier;
+
+	/// Decrypt content that names this decryptor's algorithm.
 	///
-	/// Algorithm binding: [`RuntimeAead`] rejects a `content_enc_alg.oid`
-	/// that differs from its negotiated OID. Bare RustCrypto `Aead` decrypt
-	/// impls have no stored OID to compare against; encrypt-side binding is
-	/// enforced by concrete [`Encryptor`] impls (cipher type -> canonical OID).
+	/// The nonce is read from the algorithm parameters and validated against
+	/// the cipher's nonce size.
+	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>>;
+}
+
+/// Decryption of [`EncryptedContentInfo`] through any [`Decryptor`].
+///
+/// The blanket implementation is the only one, so every decryptor refuses a
+/// payload that names another algorithm.
+pub trait DecryptContent {
+	/// Decrypt `info` and return the plaintext bytes.
 	///
-	/// The plaintext is returned as a [`SecretSlice`] so it zeroizes on drop.
+	/// A payload that names an algorithm other than
+	/// [`Decryptor::algorithm_oid`] is refused before any decryption. The
+	/// plaintext is returned as a [`SecretSlice`] so it zeroizes on drop.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::UnexpectedAlgorithm`] when `info` names another algorithm.
+	/// - Nonce and decryption errors from [`Decryptor::open`].
 	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>>;
 }
 
-/// Encrypt with a concrete AEAD and stamp the given algorithm OID.
-fn encrypt_aead_content<A: Aead>(
-	cipher: &A,
-	data: impl AsRef<[u8]>,
-	nonce: impl AsRef<[u8]>,
-	content_type: Option<ObjectIdentifier>,
-	algorithm_oid: ObjectIdentifier,
-) -> TbResult<EncryptedContentInfo> {
-	let nonce_bytes = nonce.as_ref();
-	let ciphertext = cipher.encrypt(nonce_bytes.into(), data.as_ref())?;
-	build_encrypted_content_info(ciphertext, nonce_bytes, content_type, algorithm_oid)
+impl<D: Decryptor + ?Sized> DecryptContent for D {
+	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
+		let content = CheckedContent::check(info, self.algorithm_oid())?;
+		self.open(content)
+	}
 }
 
-// Concrete Encryptor impls bind each cipher to its canonical OID. A blanket
-// `impl<C, A> Encryptor<C> for A` would let callers stamp an arbitrary OID on
-// ciphertext from an unrelated cipher (CWE-345).
-#[cfg(feature = "aes-gcm")]
-impl Encryptor<Aes256GcmOid> for Aes256Gcm {
+// The OID parameter is the cipher's own identifier, so a cipher cannot stamp
+// an arbitrary OID on its ciphertext (CWE-345).
+impl<A> Encryptor<A::Oid> for A
+where
+	A: AeadAlgorithm,
+{
 	fn encrypt_content(
 		&self,
 		data: impl AsRef<[u8]>,
 		nonce: impl AsRef<[u8]>,
 		content_type: Option<ObjectIdentifier>,
 	) -> TbResult<EncryptedContentInfo> {
-		encrypt_aead_content(self, data, nonce, content_type, Aes256GcmOid::OID)
+		let nonce_bytes = nonce.as_ref();
+		let ciphertext = self.encrypt(self.sized_nonce(nonce_bytes)?, data.as_ref())?;
+		build_encrypted_content_info(ciphertext, nonce_bytes, content_type, <A::Oid as AssociatedOid>::OID)
 	}
 }
 
-#[cfg(feature = "aes-gcm")]
-impl Encryptor<Aes128GcmOid> for Aes128Gcm {
-	fn encrypt_content(
-		&self,
-		data: impl AsRef<[u8]>,
-		nonce: impl AsRef<[u8]>,
-		content_type: Option<ObjectIdentifier>,
-	) -> TbResult<EncryptedContentInfo> {
-		encrypt_aead_content(self, data, nonce, content_type, Aes128GcmOid::OID)
-	}
-}
-
-// Implement Decryptor for any AEAD cipher
 impl<A> Decryptor for A
 where
-	A: Aead,
+	A: AeadAlgorithm,
 {
-	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
-		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info, <A as AeadCore>::NonceSize::USIZE)?;
-		let plaintext = self.decrypt(nonce_bytes.into(), ciphertext)?;
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		<A::Oid as AssociatedOid>::OID
+	}
+
+	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>> {
+		let content = content.info();
+		let nonce_size = <A as AeadCore>::NonceSize::USIZE;
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(content, nonce_size)?;
+		let plaintext = self.decrypt(self.sized_nonce(nonce_bytes)?, ciphertext)?;
 		Ok(SecretSlice::from(plaintext))
 	}
 }
 
-// Implement Encryptor for RuntimeAead (uses stored OID instead of generic C)
 impl RuntimeAead {
-	/// Encrypt data and return the encrypted content info.
+	/// Encrypt `data` under the OID stored in this `RuntimeAead`.
 	///
-	/// This method is equivalent to `Encryptor::encrypt_content` but uses the
-	/// runtime OID stored in this `RuntimeAead` instead of a compile-time generic.
+	/// This is [`Encryptor::encrypt_content`] with the runtime OID in place of
+	/// a compile-time generic.
 	///
 	/// # Nonce
+	///
 	/// The caller supplies `nonce` and is responsible for its uniqueness. For
-	/// GCM ciphers a `(key, nonce)` pair MUST never repeat.
+	/// GCM ciphers a `(key, nonce)` pair MUST be unique.
 	pub fn encrypt_content(
 		&self,
 		data: impl AsRef<[u8]>,
@@ -294,43 +361,37 @@ impl RuntimeAead {
 	}
 }
 
-// Implement Decryptor for RuntimeAead (see trait docs for algorithm binding)
 impl Decryptor for RuntimeAead {
-	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
-		// Bind the wire-declared algorithm to the negotiated cipher: a
-		// mismatched OID must never reach key material (CWE-345).
-		if info.content_enc_alg.oid != self.oid {
-			return Err(TightBeamError::UnexpectedAlgorithm((info.content_enc_alg.oid, self.oid).into()));
-		}
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		self.oid
+	}
 
-		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info, self.cipher.nonce_size())?;
+	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>> {
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(content.info(), self.cipher.nonce_size())?;
 		let plaintext = self.cipher.decrypt_bytes(nonce_bytes, ciphertext)?;
 		Ok(SecretSlice::from(plaintext))
 	}
 }
-
-// ============================================================================
-// Directional Session Ciphers
-// ============================================================================
 
 /// Byte length of the invocation counter embedded in a counter nonce.
 const COUNTER_LEN: usize = 8;
 
 /// Extract the invocation counter from a counter nonce.
 ///
-/// The deterministic construction of NIST SP 800-38D § 8.2.1 is used
-/// with an all-zero fixed field and a big-endian 64-bit invocation counter
-/// in the trailing bytes. The fixed field needs no validation here: the
-/// nonce feeds the AEAD, so any tampering fails authentication.
+/// The nonce follows the deterministic construction of NIST SP 800-38D
+/// § 8.2.1, with an all-zero fixed field and a big-endian 64-bit invocation
+/// counter in the trailing bytes. The fixed field needs no validation here,
+/// because the nonce feeds the AEAD and any tampering fails authentication.
 fn parse_counter_nonce(nonce: &[u8]) -> TbResult<u64> {
 	let nonce_len = nonce.len();
 	let split_at = nonce_len
 		.checked_sub(COUNTER_LEN)
 		.ok_or(TightBeamError::InvalidNonceLength((nonce_len, COUNTER_LEN).into()))?;
-	let (_, counter_bytes) = nonce.split_at(split_at);
 
+	let (_, counter_bytes) = nonce.split_at(split_at);
 	let mut counter = [0u8; COUNTER_LEN];
 	counter.copy_from_slice(counter_bytes);
+
 	let value = u64::from_be_bytes(counter);
 	Ok(value)
 }
@@ -346,20 +407,23 @@ fn build_counter_nonce(value: u64, nonce_len: usize) -> TbResult<Vec<u8>> {
 	Ok(nonce)
 }
 
-/// Send-direction AEAD cipher with an owned monotonic counter nonce.
+/// A send-direction AEAD cipher with an owned monotonic counter nonce.
 ///
 /// Each encryption consumes the next counter value as its nonce, so a
-/// `(key, nonce)` pair can never repeat for the lifetime of the key. The
+/// `(key, nonce)` pair stays unique for the lifetime of the key. The
 /// deterministic construction is exempt from the 2^32 invocation cap that
 /// NIST SP 800-38D § 8.3 places on random IVs.
 ///
-/// The operative bound is the record limit (RFC 9846 § 5.5: AES-GCM keeps its
+/// # Record limit
+///
+/// The operative bound is the record limit. AES-GCM keeps its
 /// authenticated-encryption safety margin for about 2^24.5 full-size records
-/// per key. RFC 9846 makes acting before the limit a MUST). Encryption fails
-/// closed with [`TightBeamError::RekeyRequired`] at
-/// [`DEFAULT_REKEY_RECORD_LIMIT`]:
-/// receipt-bearing multiplexed sessions renew keys in band before the limit,
-/// while every other session must be reestablished for fresh directional keys.
+/// per key, and RFC 9846 § 5.5 makes acting before the limit a MUST.
+/// Encryption fails closed with [`TightBeamError::RekeyRequired`] at
+/// [`DEFAULT_REKEY_RECORD_LIMIT`].
+///
+/// - A receipt-bearing multiplexed session renews its keys in band before the limit.
+/// - Every other session must be reestablished for fresh directional keys.
 pub struct SendCipher {
 	aead: RuntimeAead,
 	counter: AtomicU64,
@@ -367,49 +431,53 @@ pub struct SendCipher {
 }
 
 impl SendCipher {
-	/// Nonce counter starts at zero.
+	/// Wrap `aead` with a nonce counter that starts at zero.
 	pub fn new(aead: RuntimeAead) -> Self {
 		Self { aead, counter: AtomicU64::new(0), rekey_limit: DEFAULT_REKEY_RECORD_LIMIT }
 	}
 
 	/// Override the record limit at which encryption demands a rekey.
 	///
-	/// Clamped to
-	/// [`DEFAULT_REKEY_RECORD_LIMIT`]:
-	/// the AES-GCM bound (RFC 9846 § 5.5) is MUST that no configuration may raise.
+	/// The limit clamps to [`DEFAULT_REKEY_RECORD_LIMIT`], because the AES-GCM
+	/// bound of RFC 9846 § 5.5 is a MUST that no configuration may raise.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		self.rekey_limit = limit.min(DEFAULT_REKEY_RECORD_LIMIT);
 		self
 	}
 
-	/// Record limit this cipher halts at.
+	/// The record limit at which this cipher halts.
 	pub fn rekey_limit(&self) -> u64 {
 		self.rekey_limit
 	}
 
+	/// The algorithm OID this cipher encrypts under.
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
 		self.aead.algorithm_oid()
 	}
 
-	/// Records still encryptable before the rekey limit halts this cipher.
+	/// The number of records this cipher can still encrypt before the rekey
+	/// limit halts it.
 	pub fn remaining_records(&self) -> u64 {
 		let used = self.counter.load(Ordering::Relaxed);
 		self.rekey_limit.saturating_sub(used)
 	}
 
-	/// Encrypt data under the next counter nonce.
+	/// Encrypt `data` under the next counter nonce.
 	///
 	/// # Errors
-	/// - `RekeyRequired`: Limit reached. Reestablish the session for fresh keys
-	/// - `NonceExhausted`: the 64-bit counter space is spent
-	/// - `InvalidNonceLength`: the cipher nonce is too small to carry the counter
+	///
+	/// - [`TightBeamError::RekeyRequired`] when the record limit is reached.
+	///   Reestablish the session for fresh keys.
+	/// - [`TightBeamError::NonceExhausted`] when the 64-bit counter space is spent.
+	/// - [`TightBeamError::InvalidNonceLength`] when the cipher nonce is too
+	///   small to carry the counter.
 	pub fn encrypt_next(
 		&self,
 		data: impl AsRef<[u8]>,
 		content_type: Option<ObjectIdentifier>,
 	) -> TbResult<EncryptedContentInfo> {
 		// The failed update leaves the counter parked at the limit, so
-		// every subsequent call fails instead of wrapping into nonce reuse.
+		// every subsequent call fails, which holds the nonce unique.
 		let reserve = |value: u64| {
 			if value >= self.rekey_limit {
 				return None;
@@ -439,31 +507,35 @@ impl SendCipher {
 	}
 }
 
-/// Receive-direction AEAD cipher enforcing exactly sequential counter nonces.
+/// A receive-direction AEAD cipher that enforces exactly sequential counter
+/// nonces.
+///
+/// # Sequence
 ///
 /// The peer's [`SendCipher`] emits counter nonces in order over an ordered
 /// transport, so the next message must carry exactly the next counter. Any
-/// other value is a replay, reorder, or deletion and is rejected. Matching
-/// the receiver-side sequence discipline of RFC 9846 § 5.3: an active
-/// attacker excising an envelope from the stream desynchronizes the counter
-/// and is detected on the very next message (CWE-345).
+/// other value is a replay, reorder, or deletion, and the cipher rejects it.
 ///
-/// The receive direction enforces the AES-GCM per-key volume bound: an
-/// honest peer halts or renews its [`SendCipher`] at
-/// [`DEFAULT_REKEY_RECORD_LIMIT`],
-/// so a counter at or past that bound means the peer ignored the record
-/// limit (RFC 9846 § 5.5) and decryption fails closed with
-/// [`TightBeamError::RekeyRequired`]. The configurable rekey limit is a
-/// renewal-trigger threshold only and never refuses records under the bound.
+/// This matches the receiver-side sequence discipline of RFC 9846 § 5.3. An
+/// active attacker who excises an envelope from the stream desynchronizes the
+/// counter, and the very next message exposes the attack (CWE-345).
+///
+/// # AES-GCM per-key volume bound
+///
+/// An honest peer halts or renews its [`SendCipher`] at
+/// [`DEFAULT_REKEY_RECORD_LIMIT`], so a counter at or past that bound means the
+/// peer ignored the record limit (RFC 9846 § 5.5). Decryption then fails
+/// closed with [`TightBeamError::RekeyRequired`]. The configurable rekey limit
+/// is a renewal-trigger threshold, and the receive side refuses at the bound.
 pub struct RecvCipher {
 	aead: RuntimeAead,
-	/// Exact counter value the next message must carry.
+	/// The exact counter value that the next message must carry.
 	expected_counter: AtomicU64,
 	rekey_limit: u64,
 }
 
 impl RecvCipher {
-	/// Expected counter starts at zero.
+	/// Wrap `aead` with an expected counter that starts at zero.
 	pub fn new(aead: RuntimeAead) -> Self {
 		Self {
 			aead,
@@ -472,31 +544,35 @@ impl RecvCipher {
 		}
 	}
 
-	/// Override the record threshold `remaining_records` counts down
-	/// from, driving receive-direction renewal and drain triggers.
+	/// Override the threshold that [`Self::remaining_records`] counts down
+	/// from.
 	///
-	/// Trigger policy: decryption refuses records at the AES-GCM volume bound
-	/// ([`DEFAULT_REKEY_RECORD_LIMIT`])
-	/// regardless of this value, so a threshold below the peer's send
-	/// limit can never refuse legitimate records.
+	/// The threshold drives the receive-direction renewal and drain triggers.
+	/// Decryption refuses records at the AES-GCM volume bound
+	/// ([`DEFAULT_REKEY_RECORD_LIMIT`]) whatever this value is, so a threshold
+	/// below the peer's send limit still admits every legitimate record.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		self.rekey_limit = limit;
 		self
 	}
 
-	/// Renewal-trigger threshold `remaining_records` counts down from.
+	/// The renewal-trigger threshold that [`Self::remaining_records`] counts
+	/// down from.
 	pub fn rekey_limit(&self) -> u64 {
 		self.rekey_limit
 	}
 
+	/// The algorithm OID this cipher decrypts under.
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
 		self.aead.algorithm_oid()
 	}
 
-	/// Records still readable under the renewal-trigger threshold.
+	/// The number of records still readable under the renewal-trigger
+	/// threshold.
 	///
-	/// Tracks the peer's send counter on the ordered channel, so a rekey
-	/// initiator can watch the receive direction without any wire addition.
+	/// The count tracks the peer's send counter on the ordered channel, so a
+	/// rekey initiator watches the receive direction with no new protocol
+	/// field.
 	pub fn remaining_records(&self) -> u64 {
 		let expected = self.expected_counter.load(Ordering::Relaxed);
 		self.rekey_limit.saturating_sub(expected)
@@ -504,26 +580,27 @@ impl RecvCipher {
 }
 
 impl Decryptor for RecvCipher {
-	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
-		let (nonce_bytes, _) = extract_nonce_and_ciphertext(info, self.aead.nonce_size())?;
+	fn algorithm_oid(&self) -> ObjectIdentifier {
+		self.aead.algorithm_oid()
+	}
+
+	fn open(&self, content: CheckedContent<'_>) -> TbResult<SecretSlice<u8>> {
+		let (nonce_bytes, _) = extract_nonce_and_ciphertext(content.info(), self.aead.nonce_size())?;
 		let counter = parse_counter_nonce(nonce_bytes)?;
 
-		// Fail closed once the counter passes the AES-GCM per-key volume
-		// bound (RFC 9846 § 5.5): an honest sender halts or renews its
-		// cipher before this counter exists. The configurable rekey
-		// limit is a renewal-trigger threshold, not a refusal bound.
+		// Refuse at the AES-GCM per-key volume bound (RFC 9846 § 5.5).
 		if counter >= DEFAULT_REKEY_RECORD_LIMIT {
 			return Err(TightBeamError::RekeyRequired);
 		}
 
-		// Cheap pre-check so forged counters never reach the AEAD. The
-		// authoritative check is the compare-exchange after authentication.
+		// This pre-check lets only plausible counters reach the AEAD. The
+		// compare-exchange after authentication is the authoritative check.
 		let expected = self.expected_counter.load(Ordering::Relaxed);
 		if counter != expected {
 			return Err(TightBeamError::NonceReplayed((counter, expected).into()));
 		}
 
-		let plaintext = self.aead.decrypt_content(info)?;
+		let plaintext = self.aead.open(content)?;
 
 		// Advance only after successful authentication, otherwise a forged
 		// counter could block all future legitimate messages.
@@ -536,43 +613,59 @@ impl Decryptor for RecvCipher {
 	}
 }
 
+/// Directional session ciphers derived at handshake completion.
+///
+/// Field names use the canonical client-to-server and server-to-client
+/// directions. Role mapping into send and receive sides happens in
+/// [`SessionKeys`].
+pub struct DirectionalCiphers<C> {
+	/// Cipher for the client-to-server direction.
+	pub client_to_server: C,
+	/// Cipher for the server-to-client direction.
+	pub server_to_client: C,
+}
+
 /// Role-mapped directional session keys produced by handshake completion.
 ///
 /// The handshake derives one client-to-server and one server-to-client key
 /// (RFC 9846 § 7.3 precedent). Each endpoint sends on its own direction and
-/// receives on the peer's, so counter nonces never collide across directions.
+/// receives on the peer's, so counter nonces stay distinct per direction.
 pub struct SessionKeys {
 	send: SendCipher,
 	recv: RecvCipher,
 }
 
 impl SessionKeys {
-	/// Map directional ciphers for the client role (send = client-to-server).
-	pub fn for_client<A>(client_to_server: A, server_to_client: A, oid: ObjectIdentifier) -> Self
+	/// Map directional ciphers for the client role, which sends
+	/// client-to-server.
+	pub fn for_client<A>(ciphers: DirectionalCiphers<A>) -> Self
 	where
-		A: Aead + Send + Sync + 'static,
+		A: AeadAlgorithm + Send + Sync + 'static,
 	{
 		Self {
-			send: SendCipher::new(RuntimeAead::new(client_to_server, oid)),
-			recv: RecvCipher::new(RuntimeAead::new(server_to_client, oid)),
+			send: SendCipher::new(RuntimeAead::new(ciphers.client_to_server)),
+			recv: RecvCipher::new(RuntimeAead::new(ciphers.server_to_client)),
 		}
 	}
 
-	/// Map directional ciphers for the server role (send = server-to-client).
-	pub fn for_server<A>(client_to_server: A, server_to_client: A, oid: ObjectIdentifier) -> Self
+	/// Map directional ciphers for the server role, which sends
+	/// server-to-client.
+	pub fn for_server<A>(ciphers: DirectionalCiphers<A>) -> Self
 	where
-		A: Aead + Send + Sync + 'static,
+		A: AeadAlgorithm + Send + Sync + 'static,
 	{
 		Self {
-			send: SendCipher::new(RuntimeAead::new(server_to_client, oid)),
-			recv: RecvCipher::new(RuntimeAead::new(client_to_server, oid)),
+			send: SendCipher::new(RuntimeAead::new(ciphers.server_to_client)),
+			recv: RecvCipher::new(RuntimeAead::new(ciphers.client_to_server)),
 		}
 	}
 
+	/// The send-direction cipher.
 	pub fn send(&self) -> &SendCipher {
 		&self.send
 	}
 
+	/// The receive-direction cipher.
 	pub fn recv(&self) -> &RecvCipher {
 		&self.recv
 	}
@@ -589,7 +682,7 @@ mod tests {
 	use crate::der::asn1::OctetString;
 	use crate::der::Any;
 	use crate::error::ReceivedExpectedError;
-	use crate::oids::{AES_128_GCM, AES_256_GCM};
+	use crate::oids::AES_128_GCM;
 
 	const NONCE: [u8; 12] = [0x24; 12];
 	const PLAINTEXT: &[u8] = b"aead round trip";
@@ -634,7 +727,7 @@ mod tests {
 	#[test]
 	fn decrypt_content_round_trips() -> TbResult<()> {
 		let plaintext = test_cipher().decrypt_content(&encrypted_info())?;
-		assert!(plaintext.with(|p| p == PLAINTEXT)?);
+		assert!(plaintext.with(|p| p == PLAINTEXT));
 		Ok(())
 	}
 
@@ -666,17 +759,17 @@ mod tests {
 
 	#[test]
 	fn runtime_aead_round_trips() -> TbResult<()> {
-		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
+		let runtime = RuntimeAead::new(test_cipher());
 		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
 
 		let plaintext = runtime.decrypt_content(&info)?;
-		assert!(plaintext.with(|p| p == PLAINTEXT)?);
+		assert!(plaintext.with(|p| p == PLAINTEXT));
 		Ok(())
 	}
 
 	#[test]
 	fn runtime_aead_rejects_algorithm_oid_mismatch() -> TbResult<()> {
-		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
+		let runtime = RuntimeAead::new(test_cipher());
 		let mut info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
 		info.content_enc_alg.oid = AES_128_GCM;
 
@@ -687,7 +780,7 @@ mod tests {
 
 	#[test]
 	fn runtime_aead_rejects_wire_nonce_length() -> TbResult<()> {
-		let runtime = RuntimeAead::new(test_cipher(), AES_256_GCM);
+		let runtime = RuntimeAead::new(test_cipher());
 		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None)?;
 		let info = with_nonce_len(info, 8);
 
@@ -697,7 +790,7 @@ mod tests {
 	}
 
 	fn test_runtime() -> RuntimeAead {
-		RuntimeAead::new(test_cipher(), AES_256_GCM)
+		RuntimeAead::new(test_cipher())
 	}
 
 	#[test]
@@ -709,8 +802,8 @@ mod tests {
 		let receiver = RecvCipher::new(test_runtime());
 		let first_plain = receiver.decrypt_content(&first)?;
 		let second_plain = receiver.decrypt_content(&second)?;
-		assert!(first_plain.with(|p| p == PLAINTEXT)?);
-		assert!(second_plain.with(|p| p == PLAINTEXT)?);
+		assert!(first_plain.with(|p| p == PLAINTEXT));
+		assert!(second_plain.with(|p| p == PLAINTEXT));
 		Ok(())
 	}
 
@@ -749,7 +842,8 @@ mod tests {
 			}))
 		));
 
-		// Rejection advances nothing: the legitimate sequence still decrypts.
+		// A rejection leaves the counter parked, so the legitimate sequence
+		// still decrypts.
 		receiver.decrypt_content(&first)?;
 		receiver.decrypt_content(&second)?;
 		Ok(())
@@ -845,11 +939,15 @@ mod tests {
 	}
 
 	fn directional_pair() -> (SessionKeys, SessionKeys) {
-		let oid = AES_256_GCM;
 		let c2s_key = [0x11u8; 32];
 		let s2c_key = [0x22u8; 32];
-		let client = SessionKeys::for_client(Aes256Gcm::new(&c2s_key.into()), Aes256Gcm::new(&s2c_key.into()), oid);
-		let server = SessionKeys::for_server(Aes256Gcm::new(&c2s_key.into()), Aes256Gcm::new(&s2c_key.into()), oid);
+		let ciphers = || DirectionalCiphers {
+			client_to_server: Aes256Gcm::new(&c2s_key.into()),
+			server_to_client: Aes256Gcm::new(&s2c_key.into()),
+		};
+
+		let client = SessionKeys::for_client(ciphers());
+		let server = SessionKeys::for_server(ciphers());
 		(client, server)
 	}
 
@@ -859,11 +957,11 @@ mod tests {
 
 		let request = client.send().encrypt_next(PLAINTEXT, None)?;
 		let request_plain = server.recv().decrypt_content(&request)?;
-		assert!(request_plain.with(|p| p == PLAINTEXT)?);
+		assert!(request_plain.with(|p| p == PLAINTEXT));
 
 		let response = server.send().encrypt_next(PLAINTEXT, None)?;
 		let response_plain = client.recv().decrypt_content(&response)?;
-		assert!(response_plain.with(|p| p == PLAINTEXT)?);
+		assert!(response_plain.with(|p| p == PLAINTEXT));
 		Ok(())
 	}
 
@@ -881,5 +979,15 @@ mod tests {
 		let crossed = server.recv().decrypt_content(&response);
 		assert!(crossed.is_err());
 		Ok(())
+	}
+
+	/// A wrong-length nonce reaches the AEAD's own error ahead of the
+	/// fixed-size conversion's assert.
+	#[test]
+	fn wrong_length_nonce_is_refused() {
+		let cipher = <Aes256Gcm as KeyInit>::new_from_slice(&[0u8; 32]).expect("32 octets is the AES-256 key size");
+
+		assert!(cipher.encrypt_bytes(&[0u8; 8], b"plaintext").is_err());
+		assert!(cipher.decrypt_bytes(&[0u8; 8], b"ciphertext").is_err());
 	}
 }

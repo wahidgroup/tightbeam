@@ -23,11 +23,12 @@ use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
 use tightbeam::utils::marker::MaybeSendFuture;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 use crate::common::security::expectation_failure;
 use crate::transport::support::{
-	await_receipt_rotation, establish_mutual_transports, mux_frame, mux_offer, MutualSessionHooks, MutualTransports,
+	await_receipt_rotation, await_transport, establish_mutual_transports, mux_frame, mux_offer, MutualSessionHooks,
+	MutualTransports,
 };
 
 use super::common::*;
@@ -36,42 +37,43 @@ use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const CHAINED_RECEIPT_VERIFIES_AGAINST_ORIGINAL_CERTS: Urn<'static> =
-	Urn::new("test", "event:rekey/chained-receipt-verifies-against-original-certs");
+	tightbeam::urn!("test", "event:rekey/chained-receipt-verifies-against-original-certs");
 pub(crate) const CLEARTEXT_HARVEST_YIELDS_NOTHING: Urn<'static> =
-	Urn::new("test", "event:rekey/cleartext-harvest-yields-nothing");
+	tightbeam::urn!("test", "event:rekey/cleartext-harvest-yields-nothing");
 pub(crate) const CONSECUTIVE_EPOCHS_ROTATE_DISTINCT_RECEIPTS: Urn<'static> =
-	Urn::new("test", "event:rekey/consecutive-epochs-rotate-distinct-receipts");
+	tightbeam::urn!("test", "event:rekey/consecutive-epochs-rotate-distinct-receipts");
 pub(crate) const DUPLICATE_REQUEST_VIOLATES_PROTOCOL: Urn<'static> =
-	Urn::new("test", "event:rekey/duplicate-request-violates-protocol");
+	tightbeam::urn!("test", "event:rekey/duplicate-request-violates-protocol");
 pub(crate) const EMITS_SURVIVE_BUDGET_WATERMARK: Urn<'static> =
-	Urn::new("test", "event:rekey/emits-survive-budget-watermark");
+	tightbeam::urn!("test", "event:rekey/emits-survive-budget-watermark");
 pub(crate) const EMITS_SURVIVE_SETTLED_RENEWAL: Urn<'static> =
-	Urn::new("test", "event:rekey/emits-survive-settled-renewal");
-pub(crate) const EMITS_SURVIVE_TWO_RENEWALS: Urn<'static> = Urn::new("test", "event:rekey/emits-survive-two-renewals");
+	tightbeam::urn!("test", "event:rekey/emits-survive-settled-renewal");
+pub(crate) const EMITS_SURVIVE_TWO_RENEWALS: Urn<'static> =
+	tightbeam::urn!("test", "event:rekey/emits-survive-two-renewals");
 pub(crate) const ENDPOINTS_AGREE_ON_EPOCH_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:rekey/endpoints-agree-on-epoch-receipt");
-pub(crate) const EPOCH_RECEIPT_ROTATES: Urn<'static> = Urn::new("test", "event:rekey/epoch-receipt-rotates");
-pub(crate) const FIRST_REQUEST_ANSWERED: Urn<'static> = Urn::new("test", "event:rekey/first-request-answered");
+	tightbeam::urn!("test", "event:rekey/endpoints-agree-on-epoch-receipt");
+pub(crate) const EPOCH_RECEIPT_ROTATES: Urn<'static> = tightbeam::urn!("test", "event:rekey/epoch-receipt-rotates");
+pub(crate) const FIRST_REQUEST_ANSWERED: Urn<'static> = tightbeam::urn!("test", "event:rekey/first-request-answered");
 pub(crate) const PREMATURE_REQUEST_VIOLATES_PROTOCOL: Urn<'static> =
-	Urn::new("test", "event:rekey/premature-request-violates-protocol");
+	tightbeam::urn!("test", "event:rekey/premature-request-violates-protocol");
 pub(crate) const RECEIPTLESS_DRAIN_KEEPS_TODAYS_PATH: Urn<'static> =
-	Urn::new("test", "event:rekey/receiptless-drain-keeps-todays-path");
+	tightbeam::urn!("test", "event:rekey/receiptless-drain-keeps-todays-path");
 pub(crate) const RECEIPTLESS_SESSION_HAS_NO_EPOCH_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:rekey/receiptless-session-has-no-epoch-receipt");
+	tightbeam::urn!("test", "event:rekey/receiptless-session-has-no-epoch-receipt");
 pub(crate) const RECEIPTLESS_TRANSFER_SURVIVES_DRAIN: Urn<'static> =
-	Urn::new("test", "event:rekey/receiptless-transfer-survives-drain");
+	tightbeam::urn!("test", "event:rekey/receiptless-transfer-survives-drain");
 pub(crate) const REFUSAL_CODE_REACHES_CLIENT: Urn<'static> =
-	Urn::new("test", "event:rekey/refusal-code-reaches-client");
+	tightbeam::urn!("test", "event:rekey/refusal-code-reaches-client");
 pub(crate) const REFUSAL_CODE_REACHES_SERVER: Urn<'static> =
-	Urn::new("test", "event:rekey/refusal-code-reaches-server");
+	tightbeam::urn!("test", "event:rekey/refusal-code-reaches-server");
 pub(crate) const RENEWAL_REQUEST_REACHES_SERVER: Urn<'static> =
-	Urn::new("test", "event:rekey/renewal-request-reaches-server");
+	tightbeam::urn!("test", "event:rekey/renewal-request-reaches-server");
 pub(crate) const SETTLE_HOOK_FIRES_ON_RENEWAL: Urn<'static> =
-	Urn::new("test", "event:rekey/settle-hook-fires-on-renewal");
+	tightbeam::urn!("test", "event:rekey/settle-hook-fires-on-renewal");
 pub(crate) const STALLED_RENEWAL_DRAINS_CLEAN: Urn<'static> =
-	Urn::new("test", "event:rekey/stalled-renewal-drains-clean");
+	tightbeam::urn!("test", "event:rekey/stalled-renewal-drains-clean");
 pub(crate) const TRAFFIC_STRADDLES_KEY_SWITCH: Urn<'static> =
-	Urn::new("test", "event:rekey/traffic-straddles-key-switch");
+	tightbeam::urn!("test", "event:rekey/traffic-straddles-key-switch");
 
 /// Settlement challenge the authorizer binds into every epoch receipt.
 const RENEWAL_CHALLENGE: &[u8] = b"epoch-invoice-7";
@@ -85,7 +87,8 @@ const SETTLE_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 31;
 /// Application code for a renewal approval refusal.
 const APPROVAL_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 32;
 
-/// Fifth single-chunk emit tips budget into drain reserve (caps 1/1, 1 KiB chunk).
+/// Fifth single-chunk emit tips budget into drain reserve (caps 1/1, 1 KiB
+/// chunk).
 const RENEWAL_TRIGGER_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 10, server_to_client: 4096 };
 
 /// Record watermark drives renewal, not budget.
@@ -101,9 +104,10 @@ async fn establish_renewal_session(hooks: MutualSessionHooks) -> Result<MutualTr
 	establish_mutual_transports(client_offer, server_offer, hooks).await
 }
 
-async fn emit_series(handle: &MuxHandle, label: &str, count: usize) -> Result<bool, TightBeamError> {
+async fn emit_series(handle: &MuxHandle, label: impl AsRef<str>, count: usize) -> Result<bool, TightBeamError> {
+	let label = label.as_ref();
 	for index in 0..count {
-		let frame = mux_frame(&format!("{label}-{index}"));
+		let frame = mux_frame(format!("{label}-{index}"));
 		let echoed = handle.emit_on_stream(&frame).await?;
 		if !is_echo(echoed, &frame) {
 			return Ok(false);
@@ -119,14 +123,7 @@ async fn await_rotation(handle: &MuxHandle, previous: Option<&StoredReceipt>) ->
 }
 
 async fn await_matching_receipt(handle: &MuxHandle, expected: &StoredReceipt) -> bool {
-	let matched = timeout(Duration::from_secs(2), async {
-		while handle.session_receipt().as_deref() != Some(expected) {
-			sleep(Duration::from_millis(5)).await;
-		}
-	})
-	.await;
-
-	matched.is_ok()
+	await_transport(|| handle.session_receipt().as_deref() == Some(expected)).await
 }
 
 fn verifying_key_from(certificate: &Certificate) -> Result<Secp256k1VerifyingKey, TightBeamError> {
@@ -175,7 +172,8 @@ async fn read_until_rekey_response(reader: &mut SplitReader) -> Result<(), Tight
 	.map_err(|_| expectation_failure("server must answer the renewal request before the read timeout"))?
 }
 
-/// Settlement challenge on every renewal; counts `settle` consultations.
+/// Poses a settlement challenge on every renewal and counts the `settle`
+/// consultations.
 struct RenewalAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -235,7 +233,8 @@ impl TransportAuthorizer for RenewalAuthorizer {
 	}
 }
 
-/// Answers challenge-bearing receipts; handshake receipts pass without answer.
+/// Answers challenge-bearing receipts. Handshake receipts pass without an
+/// answer.
 struct RenewalApprover {
 	response: OctetString,
 }
@@ -282,7 +281,6 @@ tb_assert_spec! {
 	pub MuxRekeyBudgetRenewalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -297,7 +295,8 @@ tb_assert_spec! {
 	}
 }
 
-// Without renewal this session drains at the fifth emit (mux_budget_exhaustion_drains).
+// Without renewal this session drains at the fifth emit
+// (mux_budget_exhaustion_drains).
 tb_scenario! {
 	name: mux_rekey_budget_renewal_extends_session,
 	spec: MuxRekeyBudgetRenewalSpec,
@@ -330,7 +329,6 @@ tb_assert_spec! {
 	pub MuxRekeyRecordRenewalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, at_least!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, at_least!(1)),
@@ -343,15 +341,14 @@ tb_assert_spec! {
 }
 
 pub(crate) const STREAMED_TRAFFIC_STRADDLES_KEY_SWITCH: Urn<'static> =
-	Urn::new("test", "event:rekey/streamed-traffic-straddles-key-switch");
+	tightbeam::urn!("test", "event:rekey/streamed-traffic-straddles-key-switch");
 pub(crate) const STREAMING_EPOCH_RECEIPT_ROTATES: Urn<'static> =
-	Urn::new("test", "event:rekey/streaming-epoch-receipt-rotates");
+	tightbeam::urn!("test", "event:rekey/streaming-epoch-receipt-rotates");
 
 tb_assert_spec! {
 	pub MuxRekeyStreamingRenewalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, at_least!(1)),
 			(events::MUX_REKEY_RENEWED, at_least!(2)),
@@ -387,7 +384,7 @@ tb_scenario! {
 
 			let mut all_echoed = true;
 			for index in 0..20 {
-				let frame = large_mux_frame(&format!("rekey-streaming-{index}"));
+				let frame = large_mux_frame(format!("rekey-streaming-{index}"));
 				let payload = frame.to_der()?;
 				let (sink, response) = client_end.handle.open_stream()?;
 				push_split(sink, &payload).await?;
@@ -406,7 +403,8 @@ tb_scenario! {
 	}
 }
 
-// 20 × 6 records = 120 against limit 100; traffic straddles key switch.
+// 20 × 6 records = 120 against a limit of 100, so the traffic straddles the key
+// switch.
 tb_scenario! {
 	name: mux_rekey_record_renewal_survives_chunked_traffic,
 	spec: MuxRekeyRecordRenewalSpec,
@@ -424,7 +422,7 @@ tb_scenario! {
 
 			let mut all_echoed = true;
 			for index in 0..20 {
-				let frame = large_mux_frame(&format!("rekey-record-{index}"));
+				let frame = large_mux_frame(format!("rekey-record-{index}"));
 				let echoed = pair.client.handle.emit_on_stream(&frame).await?;
 				all_echoed = all_echoed && is_echo(echoed, &frame);
 			}
@@ -443,7 +441,6 @@ tb_assert_spec! {
 	pub MuxRekeyEpochChainSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(2)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(2)),
@@ -504,7 +501,6 @@ tb_assert_spec! {
 	pub MuxRekeySettledChallengeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -558,7 +554,6 @@ tb_assert_spec! {
 	pub MuxRekeySettleRefusalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -571,7 +566,8 @@ tb_assert_spec! {
 	}
 }
 
-// Client switched at Ack; server installs receive cipher then drains with refusal code.
+// The client switched at the Ack. The server installs the receive cipher, then
+// drains with a refusal code.
 tb_scenario! {
 	name: mux_rekey_settlement_refusal_drains,
 	spec: MuxRekeySettleRefusalSpec,
@@ -596,7 +592,8 @@ tb_scenario! {
 				await_goaway_reason(&pair.client.handle, GoAwayReason::Application(SETTLE_REFUSAL_CODE)).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// Stimulus only: the refusal itself emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-late")).await;
 
 			Ok(())
@@ -608,7 +605,6 @@ tb_assert_spec! {
 	pub MuxRekeyApprovalRefusalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -644,7 +640,8 @@ tb_scenario! {
 				await_goaway_reason(&pair.server.handle, GoAwayReason::Application(APPROVAL_REFUSAL_CODE)).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// Stimulus only: the refusal itself emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-late")).await;
 
 			Ok(())
@@ -656,7 +653,6 @@ tb_assert_spec! {
 	pub MuxRekeyMinSpendSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(0)),
@@ -666,7 +662,8 @@ tb_assert_spec! {
 	}
 }
 
-// CWE-400: RekeyRequest below minimum-spend floor -> GoAway(ProtocolError).
+// CWE-400: a RekeyRequest below the minimum-spend floor draws
+// GoAway(ProtocolError).
 tb_scenario! {
 	name: mux_rekey_request_below_min_spend_violates,
 	spec: MuxRekeyMinSpendSpec,
@@ -694,7 +691,6 @@ tb_assert_spec! {
 	pub MuxRekeyDuplicateRequestSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(1)),
@@ -705,7 +701,8 @@ tb_assert_spec! {
 	}
 }
 
-// CWE-400: duplicate RekeyRequest while exchange in flight -> GoAway(ProtocolError).
+// CWE-400: a duplicate RekeyRequest while an exchange is in flight draws
+// GoAway(ProtocolError).
 tb_scenario! {
 	name: mux_rekey_duplicate_request_violates,
 	spec: MuxRekeyDuplicateRequestSpec,
@@ -744,7 +741,6 @@ tb_assert_spec! {
 	pub MuxRekeyTimeoutSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(1)),
 			(events::MUX_REKEY_RENEWED, exactly!(0)),
@@ -755,7 +751,7 @@ tb_assert_spec! {
 	}
 }
 
-// Renewal deadline bounds stalled exchange -> GoAway(Shutdown).
+// The renewal deadline bounds a stalled exchange with GoAway(Shutdown).
 tb_scenario! {
 	name: mux_rekey_timeout_drains_clean,
 	spec: MuxRekeyTimeoutSpec,
@@ -765,7 +761,8 @@ tb_scenario! {
 			let server_offer = chunked_offer(4).with_budgets(AMPLE_BUDGETS);
 			let session = establish_mutual_transports(client_offer, server_offer, MutualSessionHooks::default()).await?;
 
-			// Record limit below renewal floor: first write opens renewal server never answers
+			// Record limit below renewal floor: first write opens renewal
+			// server never answers
 			let client_config = MuxEndpointConfig {
 				rekey_limit: Some(80),
 				renewal_deadline: Some(Duration::from_millis(200)),
@@ -796,7 +793,6 @@ tb_assert_spec! {
 	pub MuxRekeyInertPathsSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_REKEY_REQUESTED, exactly!(0)),
 			(events::MUX_REKEY_RECEIPT_ISSUED, exactly!(0)),
@@ -813,7 +809,8 @@ tb_assert_spec! {
 	}
 }
 
-// Receiptless/cleartext: no rekey wiring; record limit -> GoAway(Shutdown).
+// Receiptless or cleartext sessions have no rekey path, so the record limit
+// draws GoAway(Shutdown).
 tb_scenario! {
 	name: mux_rekey_inert_paths_keep_todays_behavior,
 	spec: MuxRekeyInertPathsSpec,
@@ -852,7 +849,8 @@ tb_scenario! {
 				await_goaway_reason(&pair.client.handle, GoAwayReason::Shutdown).await,
 			)?;
 
-			// Stimulus only: the refusal itself emits `events::MUX_EMIT_DRAINING`.
+			// Stimulus only: the refusal itself emits
+			// `events::MUX_EMIT_DRAINING`.
 			let _late = pair.client.handle.emit_on_stream(&mux_frame("rekey-inert-late")).await;
 
 			Ok(())

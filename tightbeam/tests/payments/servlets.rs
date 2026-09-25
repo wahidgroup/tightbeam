@@ -1,6 +1,7 @@
-//! Payment Servlets
+//! Payment servlets.
 //!
-//! Defines servlets for authorization, capture, and key management.
+//! The module defines servlets for authorization, capture, and key
+//! management.
 
 use std::sync::Arc;
 
@@ -19,19 +20,25 @@ use super::harness::{PaymentHarness, PAYMENT_TAG};
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> = Urn::new("test", "event:servlets/authorization-approved");
-pub(crate) const CAPTURE_COMPLETED: Urn<'static> = Urn::new("test", "event:servlets/capture-completed");
-pub(crate) const CHAIN_BROKEN: Urn<'static> = Urn::new("test", "event:servlets/chain-broken");
-pub(crate) const CHAIN_VALID: Urn<'static> = Urn::new("test", "event:servlets/chain-valid");
-pub(crate) const CURRENCY_BHD_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-bhd-processed");
-pub(crate) const CURRENCY_JPY_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-jpy-processed");
-pub(crate) const CURRENCY_OTHER_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-other-processed");
-pub(crate) const CURRENCY_USD_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-usd-processed");
-pub(crate) const HIGH_VALUE_EXPEDITED: Urn<'static> = Urn::new("test", "event:servlets/high-value-expedited");
-pub(crate) const INTEGRITY_VERIFIED: Urn<'static> = Urn::new("test", "event:servlets/integrity-verified");
+pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/authorization-approved");
+pub(crate) const CAPTURE_COMPLETED: Urn<'static> = tightbeam::urn!("test", "event:servlets/capture-completed");
+pub(crate) const CHAIN_BROKEN: Urn<'static> = tightbeam::urn!("test", "event:servlets/chain-broken");
+pub(crate) const CHAIN_VALID: Urn<'static> = tightbeam::urn!("test", "event:servlets/chain-valid");
+pub(crate) const CURRENCY_BHD_PROCESSED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/currency-bhd-processed");
+pub(crate) const CURRENCY_JPY_PROCESSED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/currency-jpy-processed");
+pub(crate) const CURRENCY_OTHER_PROCESSED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/currency-other-processed");
+pub(crate) const CURRENCY_USD_PROCESSED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/currency-usd-processed");
+pub(crate) const HIGH_VALUE_EXPEDITED: Urn<'static> = tightbeam::urn!("test", "event:servlets/high-value-expedited");
+pub(crate) const INTEGRITY_VERIFIED: Urn<'static> = tightbeam::urn!("test", "event:servlets/integrity-verified");
 pub(crate) const KEYMANAGER_DECRYPT_SUCCESS: Urn<'static> =
-	Urn::new("test", "event:servlets/keymanager-decrypt-success");
-pub(crate) const KEYMANAGER_PUBKEY_SERVED: Urn<'static> = Urn::new("test", "event:servlets/keymanager-pubkey-served");
+	tightbeam::urn!("test", "event:servlets/keymanager-decrypt-success");
+pub(crate) const KEYMANAGER_PUBKEY_SERVED: Urn<'static> =
+	tightbeam::urn!("test", "event:servlets/keymanager-pubkey-served");
 use super::messages::{
 	CaptureTransaction, CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest,
 	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,
@@ -69,14 +76,15 @@ servlet! {
 
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
-				V2: id: &frame.metadata.id,
+				V2: id: frame.metadata().id(),
 					message: cached
 			}?));
 		}
 
 		// The message-integrity commitment must recompute over the
 		// decrypted transaction body, so this event proves cryptographic
-		// verification of what the client committed to, not presence.
+		// verification of what the client committed to. The presence of a
+		// commitment alone does not satisfy it.
 		let commitment_verified = frame.verify_commitment_of::<Sha3_256, _>(&req, [])?;
 		trace.event_with(INTEGRITY_VERIFIED, &[PAYMENT_TAG], commitment_verified)?;
 
@@ -100,7 +108,7 @@ servlet! {
 		trace.event_with(AUTHORIZATION_APPROVED, &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
-			V2: id: &frame.metadata.id,
+			V2: id: frame.metadata().id(),
 				message: response
 		}?))
 	}
@@ -115,13 +123,13 @@ servlet! {
 
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
-				V2: id: &frame.metadata.id,
+				V2: id: frame.metadata().id(),
 					message: cached
 			}?));
 		}
 
 		// previous_frame should link back to the authorization frame.
-		if frame.metadata.previous_frame.is_some() {
+		if frame.metadata().previous_frame().is_some() {
 			trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
 		} else {
 			trace.event_with(CHAIN_BROKEN, &[PAYMENT_TAG], true)?;
@@ -141,7 +149,7 @@ servlet! {
 		trace.event_with(CAPTURE_COMPLETED, &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
-			V2: id: &frame.metadata.id,
+			V2: id: frame.metadata().id(),
 				message: response
 		}?))
 	}
@@ -162,7 +170,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
-		let secret_key: &Arc<SecretKey> = ctx.env_config()?;
+		let secret_key: &Arc<SecretKey> = ctx.env_config();
 
 		match req {
 			KeyManagerRequest::GetPublicKey(_) => {
@@ -171,18 +179,20 @@ servlet! {
 				};
 				trace.event_with(KEYMANAGER_PUBKEY_SERVED, &[PAYMENT_TAG], true)?;
 				Ok(Some(compose! {
-					V2: id: &frame.metadata.id,
+					V2: id: frame.metadata().id(),
 						message: response
 				}?))
 			}
 			KeyManagerRequest::Decrypt(decrypt_req) => {
 				let ecies_msg = Secp256k1EciesMessage::from_bytes(&decrypt_req.ciphertext)?;
 				let plaintext_secret = ecies_decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(secret_key.as_ref(), &ecies_msg, None)?;
-				let plaintext = plaintext_secret.to_insecure()?.to_vec();
+				let plaintext = plaintext_secret.to_insecure().to_vec();
 				let response = DecryptResponse { plaintext };
+
 				trace.event_with(KEYMANAGER_DECRYPT_SUCCESS, &[PAYMENT_TAG], true)?;
+
 				Ok(Some(compose! {
-					V2: id: &frame.metadata.id,
+					V2: id: frame.metadata().id(),
 						message: response
 				}?))
 			}

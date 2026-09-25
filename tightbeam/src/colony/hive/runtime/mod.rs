@@ -1,4 +1,5 @@
-//! Hive runtime: context, control, scaling, and cluster client helpers.
+//! The hive runtime: the lifecycle, the routing context, the control plane,
+//! the instance set, the scaling loop, and the cluster client.
 //!
 //! - [`HiveContextImpl`] owns intra-hive routing and the servlet pool.
 //! - [`HiveRuntime`] implements [`crate::colony::hive::Hive`].
@@ -11,9 +12,9 @@ mod instances;
 mod lifecycle;
 mod scaling;
 
-pub use cluster_client::{build_control_frame, notify_cluster, register_once, spawn_reregister_task};
+pub(crate) use cluster_client::ClusterLink;
 pub use context::HiveContextImpl;
-pub use control::{handle_command, handle_manage, spawn_control_server, HiveControlCtx};
-pub use instances::{insert_instance, instance_urn, remove_instance, servlet_slate};
+pub(crate) use control::HiveControlCtx;
+pub(crate) use instances::{HiveInstances, InsertRefusal};
 pub use lifecycle::HiveRuntime;
-pub use scaling::{spawn_scaling_task, ScalingTaskCtx};
+pub(crate) use scaling::ScalingLoop;

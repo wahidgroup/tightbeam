@@ -13,12 +13,10 @@
 //! messages before full processing; normal-sized messages MUST still work.
 //!
 //! ## References
-//! - CWE-400: Uncontrolled Resource Consumption
-//!   <https://cwe.mitre.org/data/definitions/400.html>
+//! - CWE-400: Uncontrolled Resource Consumption <https://cwe.mitre.org/data/definitions/400.html>
 //! - CWE-770: Allocation of Resources Without Limits or Throttling
 //!   <https://cwe.mitre.org/data/definitions/770.html>
-//! - CAPEC-130: Excessive Allocation
-//!   <https://capec.mitre.org/data/definitions/130.html>
+//! - CAPEC-130: Excessive Allocation <https://capec.mitre.org/data/definitions/130.html>
 
 use std::sync::Arc;
 
@@ -34,9 +32,11 @@ use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
-pub(crate) const DOS_GENERATE_OVERSIZED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-generate-oversized");
-pub(crate) const DOS_INJECT_OVERSIZED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-inject-oversized");
-pub(crate) const DOS_OVERSIZED_REJECTED: Urn<'static> = Urn::new("test", "event:dos-attack/dos-oversized-rejected");
+pub(crate) const DOS_GENERATE_OVERSIZED: Urn<'static> =
+	tightbeam::urn!("test", "event:dos-attack/dos-generate-oversized");
+pub(crate) const DOS_INJECT_OVERSIZED: Urn<'static> = tightbeam::urn!("test", "event:dos-attack/dos-inject-oversized");
+pub(crate) const DOS_OVERSIZED_REJECTED: Urn<'static> =
+	tightbeam::urn!("test", "event:dos-attack/dos-oversized-rejected");
 
 /// Maximum handshake message size (16 KiB) as defined in transport layer.
 const HANDSHAKE_MAX_SIZE: usize = 16 * 1024;
@@ -45,7 +45,6 @@ tb_assert_spec! {
 	pub DosAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DOS_GENERATE_OVERSIZED, exactly!(BACKEND_COUNT_U32)),
 			(DOS_INJECT_OVERSIZED, exactly!(BACKEND_COUNT_U32)),
