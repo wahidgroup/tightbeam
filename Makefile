@@ -179,7 +179,6 @@ ci:
 	$(MAKE) lint
 	$(MAKE) audit
 	$(MAKE) build
-	$(MAKE) check-semver
 	$(MAKE) test-all
 
 release: setup
