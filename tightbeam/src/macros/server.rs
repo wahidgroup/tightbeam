@@ -424,7 +424,7 @@ macro_rules! __tightbeam_server_protocol_bind_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_handle {
 	($protocol:path, $addr:expr, $handler:expr) => {{
-		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
+		let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind($addr))?;
 		let __server = <$protocol>::from(listener);
 		::std::thread::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __server, $handler,)
@@ -639,7 +639,7 @@ macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
-		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
+		let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind($addr))?;
 		let __server = <$protocol>::from(listener);
 		::std::thread::spawn(move || {
 			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
@@ -925,7 +925,7 @@ macro_rules! server {
 
 	($protocol:path: bind $addr:expr, handle: $handler:expr) => {{
 		$crate::__tb_require_std!({
-			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
+			let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind($addr))?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler,)
 		})
@@ -940,7 +940,7 @@ macro_rules! server {
 
 	($protocol:path: bind $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		$crate::__tb_require_std!({
-			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
+			let (listener, _) = $crate::macros::server::server_runtime::rt::block_on(<$protocol as $crate::transport::Protocol>::bind($addr))?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*);
 		})

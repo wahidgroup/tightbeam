@@ -47,7 +47,7 @@ pub struct ServerMaterials {
 
 impl ServerMaterials {
 	pub fn generate() -> Self {
-		let signing_key = TestKey::signing();
+		let signing_key = TestKey::insecure_fixed_signing();
 		let certificate = Arc::new(TestCertificate::self_signed(&signing_key));
 
 		let secret_key_bytes = signing_key.to_bytes();
@@ -122,7 +122,7 @@ pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn Certific
 
 /// Deterministic signing key (fixed seed) for stable single-identity fixtures.
 pub fn deterministic_signing_key() -> Secp256k1SigningKey {
-	TestKey::signing()
+	TestKey::insecure_fixed_signing()
 }
 
 /// Fresh random signing key for distinct, unrelated identities.

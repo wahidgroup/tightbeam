@@ -39,11 +39,10 @@ use tightbeam::transport::handshake::negotiation::SecurityOffer;
 use tightbeam::transport::handshake::server::EciesHandshakeServer;
 use tightbeam::transport::handshake::HandshakeFinalization;
 use tightbeam::transport::handshake::PeerAuthentication;
+use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
 
 use crate::common::security::pinning_validator;
-
-use tightbeam::utils::urn::Urn;
 
 pub(crate) const CLIENT_HELLO_SENT: Urn<'static> = tightbeam::urn!("test", "event:negotiation/client-hello-sent");
 pub(crate) const CLIENT_KEX_SENT: Urn<'static> = tightbeam::urn!("test", "event:negotiation/client-kex-sent");
@@ -128,7 +127,7 @@ fn fallback_profile() -> SecurityProfileDesc {
 }
 
 fn server_materials() -> (Certificate, Arc<dyn SigningKeyProvider>) {
-	let server_signing_key = TestKey::signing();
+	let server_signing_key = TestKey::insecure_fixed_signing();
 	let server_cert = TestCertificate::self_signed(&server_signing_key);
 	let signing_key = Secp256k1SigningKey::from(server_signing_key);
 	let server_key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));

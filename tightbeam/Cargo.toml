@@ -305,11 +305,6 @@ path = "fuzz/complex_workflow.rs"
 required-features = ["std", "testing-fuzz"]
 
 [[bin]]
-name = "fuzz_verification"
-path = "fuzz/verification.rs"
-required-features = ["std", "testing-fuzz"]
-
-[[bin]]
 name = "fuzz_chess"
 path = "fuzz/chess/mod.rs"
 required-features = ["full", "testing-fuzz"]

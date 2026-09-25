@@ -272,7 +272,7 @@ tb_scenario! {
 			// Client identity outside the server's pin set: certificate
 			// and signing provider share one fresh key, so the rejection
 			// is the pin check and not a key/certificate mismatch.
-			let invalid_key = TestKey::signing();
+			let invalid_key = TestKey::insecure_fixed_signing();
 			let invalid_cert = TestCertificate::self_signed(&invalid_key);
 
 			let certificate = CertificateSpec::Built(Box::new(invalid_cert));
@@ -322,7 +322,7 @@ tb_scenario! {
 			// store: certificate and signing provider share one fresh
 			// key, so the rejection is the trust check and not a
 			// key/certificate mismatch.
-			let invalid_server_key = TestKey::signing();
+			let invalid_server_key = TestKey::insecure_fixed_signing();
 			let invalid_server_cert = TestCertificate::self_signed(&invalid_server_key);
 
 			let certificate = CertificateSpec::Built(Box::new(invalid_server_cert));

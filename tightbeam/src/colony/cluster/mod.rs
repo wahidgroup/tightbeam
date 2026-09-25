@@ -736,7 +736,7 @@ mod tests {
 	use crate::utils::time::ManualClock;
 
 	fn test_tls_config() -> ClusterTlsConfig {
-		let key: Secp256k1SigningKey = TestKey::signing();
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		ClusterTlsConfig::new(
 			CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
 			Arc::new(Secp256k1KeyProvider::from(key)),

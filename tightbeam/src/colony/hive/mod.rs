@@ -528,7 +528,7 @@ pub type DuplexOpenFuture<'a> =
 /// #         Box::pin(async move {
 /// #             let echoed: TestMessage = decode(frame.message())?;
 /// #             let mut reply = FrameBuilder::from(Version::V1).with_id(b"km-reply").with_message(echoed).build()?;
-/// #             let provider = Secp256k1KeyProvider::from(TestKey::signing());
+/// #             let provider = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
 /// #             reply.sign_with_provider::<Sha3_256, _>(&provider).await?;
 /// #             Ok(reply)
 /// #         })
@@ -540,8 +540,8 @@ pub type DuplexOpenFuture<'a> =
 /// # runtime.block_on(async {
 /// # let ctx = EchoSibling;
 /// # let keymanager_urn = tightbeam::urn!("tightbeam", "servlet:keymanager");
-/// # let sibling_key = TestKey::signing();
-/// let caller_provider = Secp256k1KeyProvider::from(TestKey::signing());
+/// # let sibling_key = TestKey::insecure_fixed_signing();
+/// let caller_provider = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
 ///
 /// let mut request = FrameBuilder::from(Version::V1)
 ///     .with_id(b"km-decrypt")

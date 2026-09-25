@@ -1428,7 +1428,7 @@ mod tests {
 
 	/// A config that holds the fields these tests read.
 	fn test_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::signing();
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 
 		ClusterConfig::new(
 			ClusterTlsConfig::new(

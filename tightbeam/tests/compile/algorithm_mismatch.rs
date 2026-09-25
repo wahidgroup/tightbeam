@@ -29,7 +29,7 @@ struct Aes128Message {
 
 fn main() {
 	let message = Aes128Message { content: "test".to_string() };
-	let (_, cipher) = tightbeam::testing::TestKey::cipher();
+	let (_, cipher) = tightbeam::testing::TestKey::insecure_fixed_cipher();
 
 	// Try to use AES-256-GCM cipher with a message that expects AES-128-GCM
 	// This should fail to compile with compile-time enforcement

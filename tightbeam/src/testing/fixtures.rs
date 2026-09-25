@@ -518,14 +518,28 @@ impl TestFrame {
 pub struct TestKey;
 
 impl TestKey {
+	/// The secp256k1 signing key whose secret scalar is thirty-two `0x01`
+	/// bytes.
+	///
+	/// # Security
+	///
+	/// The scalar is public, so every signature it makes is forgeable by
+	/// anyone who reads this file. Production code builds its key with
+	/// [`SigningKey::random`](crate::SigningKey::random) from a CSPRNG.
 	#[cfg(all(feature = "secp256k1", feature = "signature"))]
-	pub fn signing() -> SigningKey {
+	pub fn insecure_fixed_signing() -> SigningKey {
 		let secret_bytes = [1u8; 32];
 		SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
 	}
 
+	/// The AES-256-GCM key made of thirty-two `0x33` bytes, with its cipher.
+	///
+	/// # Security
+	///
+	/// The key is public, so nothing sealed under it is confidential.
+	/// Production code draws its key from a CSPRNG.
 	#[cfg(feature = "aead")]
-	pub fn cipher() -> (Key<Aes256Gcm>, Aes256Gcm) {
+	pub fn insecure_fixed_cipher() -> (Key<Aes256Gcm>, Aes256Gcm) {
 		let key_bytes = [0x33; 32];
 		let key = Key::<Aes256Gcm>::from(key_bytes);
 		let cipher = Aes256Gcm::new(&key);
@@ -591,11 +605,17 @@ impl TestCertificate {
 	/// Every certificate has proper issuer and subject chaining and a valid
 	/// signature.
 	///
+	/// # Security
+	///
+	/// The root, intermediate, and leaf secret scalars are thirty-two `0x01`,
+	/// `0x02`, and `0x03` bytes. They are public, so anyone who reads this
+	/// file can issue a certificate the chain's root vouches for.
+	///
 	/// # Errors
 	///
 	/// Returns an error if key material, DER encoding, or signing fails.
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-	pub fn chain() -> TbResult<TestCertificateChain> {
+	pub fn insecure_fixed_chain() -> TbResult<TestCertificateChain> {
 		let root_key = SigningKey::from_bytes(&[1u8; 32].into())?;
 		let intermediate_key = SigningKey::from_bytes(&[2u8; 32].into())?;
 		let leaf_key = SigningKey::from_bytes(&[3u8; 32].into())?;

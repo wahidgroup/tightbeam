@@ -40,7 +40,7 @@ pub fn create_test_cert_with_key(
 	validity_days: u64,
 ) -> Result<(Certificate, Secp256k1SigningKey)> {
 	let subject = subject.as_ref();
-	let signing_key = TestKey::signing();
+	let signing_key = TestKey::insecure_fixed_signing();
 	let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 	let sha3_signer = Sha3Signer::from(&signing_key);
 	let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
@@ -99,7 +99,7 @@ impl GatewayCerts {
 	/// provably binds to the SAN alone. Colony membership gates gossip and
 	/// peer federation.
 	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
-		let raw = TestKey::signing();
+		let raw = TestKey::insecure_fixed_signing();
 		let cert = TestCertificate::with_uri_sans(&raw, &[&colony_urn.to_string()]);
 		let key = Secp256k1SigningKey::from(raw);
 		let trust = combined_trust(&[&cert]);

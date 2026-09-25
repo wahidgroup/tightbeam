@@ -12,13 +12,26 @@
 	feature = "signature"
 ))]
 
+#[cfg(feature = "colony")]
+mod colony;
+#[cfg(all(feature = "tokio", feature = "transport-multiplex"))]
+mod transport;
+
 use proptest::prelude::*;
 
 use tightbeam::asn1::{Frame, GatedField, Version};
 use tightbeam::builder::TypeBuilder;
+use tightbeam::constants::MIN_SALT_SIZE;
+use tightbeam::crypto::commitment::Opening;
 use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::profiles::SecurityProfileDesc;
+use tightbeam::der::oid::ObjectIdentifier;
 use tightbeam::der::{Decode, Encode};
+use tightbeam::flags::{Flags, FlagsError};
+use tightbeam::matrix::{Matrix, MatrixError};
+use tightbeam::oids::{AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256};
 use tightbeam::testing::{TestMessage, TestSigner};
+use tightbeam::utils::urn::Urn;
 
 /// Every wire version, so a field a later version added is exercised under
 /// the version that does not carry it as well as the ones that do.
@@ -79,6 +92,30 @@ fn built(
 	frame
 }
 
+/// A frame of any shape the four versions carry.
+fn any_frame() -> impl Strategy<Value = Frame> {
+	(any_shape(), prop::collection::vec(any::<u8>(), 0..32), any::<u64>(), ".{0,64}").prop_map(
+		|((version, witnessed, signed), id, order, content)| built(version, id, order, content, witnessed, signed),
+	)
+}
+
+/// Absent, or one OID from a pool every descriptor slot draws from, so an OID
+/// that lands in the wrong slot is a visible difference.
+fn any_algorithm() -> impl Strategy<Value = Option<ObjectIdentifier>> {
+	prop::option::of(prop::sample::select(vec![HASH_SHA3_256, AES_256_GCM, CURVE_SECP256K1]))
+}
+
+/// The plain-digest salt, or a hiding salt drawn from two byte values so two
+/// salts of one length can be equal or differ.
+fn any_salt() -> impl Strategy<Value = Vec<u8>> {
+	prop_oneof![Just(Vec::new()), prop::collection::vec(0u8..2, MIN_SALT_SIZE)]
+}
+
+/// The cells of `matrix` in the row-major order its `TryFrom` reads.
+fn row_major(matrix: Matrix<3>) -> Vec<u8> {
+	(0..3).filter_map(|r| matrix.row(r)).flatten().copied().collect()
+}
+
 proptest! {
 	/// Four versions against the power set of the frame-level optional fields
 	/// each carries, over arbitrary identifiers, orders, and payloads.
@@ -93,5 +130,64 @@ proptest! {
 		let encoded = frame.to_der().expect("a built frame encodes");
 		let decoded = Frame::from_der(&encoded).expect("what the encoder wrote, the decoder reads");
 		prop_assert_eq!(frame, decoded);
+	}
+
+	/// Nine bytes are both a 3 by 3 matrix and a set of nine flags, and each
+	/// reads them back unchanged.
+	#[test]
+	fn a_matrix_and_a_flag_set_read_back_nine_bytes(bytes in prop::collection::vec(any::<u8>(), 9)) {
+		let matrix = Matrix::<3>::try_from(bytes.as_slice()).map(row_major);
+		let flags = Flags::<9>::try_from(bytes.as_slice()).map(Vec::<u8>::from);
+		prop_assert_eq!(matrix, Ok(bytes.clone()));
+		prop_assert_eq!(flags, Ok(bytes));
+	}
+
+	/// A matrix and a flag set both refuse every length but nine.
+	#[test]
+	fn a_matrix_and_a_flag_set_refuse_any_other_length(
+		bytes in prop_oneof![prop::collection::vec(any::<u8>(), 0..9), prop::collection::vec(any::<u8>(), 10..20)],
+	) {
+		let len = bytes.len();
+		let matrix = Matrix::<3>::try_from(bytes.as_slice()).map(row_major);
+		let flags = Flags::<9>::try_from(bytes.as_slice()).map(Vec::<u8>::from);
+		prop_assert_eq!(matrix, Err(MatrixError::LengthMismatch { n: 3, len }));
+		prop_assert_eq!(flags, Err(FlagsError::LengthMismatch { expected: 9, len }));
+	}
+
+	/// What a URN displays, the parser reads back as the same URN.
+	#[test]
+	fn a_urn_survives_display_and_parse(nid in "[a-zA-Z][a-zA-Z0-9-]{1,31}", nss in ".{1,64}") {
+		let urn = Urn::from_parts(nid, nss)?;
+		prop_assert_eq!(urn.to_string().parse::<Urn<'static>>()?, urn);
+	}
+
+	/// Each algorithm carries its own tag, so any set of absent algorithms
+	/// decodes back to the descriptor that was encoded.
+	#[test]
+	fn a_profile_descriptor_keeps_each_algorithm_in_its_slot(
+		digest in any_algorithm(),
+		aead in any_algorithm(),
+		signature in any_algorithm(),
+		kdf in any_algorithm(),
+		curve in any_algorithm(),
+		key_wrap in any_algorithm(),
+	) {
+		let descriptor = SecurityProfileDesc { digest, aead, signature, kdf, curve, key_wrap };
+		prop_assert_eq!(SecurityProfileDesc::from_der(&descriptor.to_der()?)?, descriptor);
+	}
+
+	/// An opening verifies the commitment it was proven with, and no
+	/// commitment over a different body or salt.
+	#[test]
+	fn an_opening_verifies_only_its_own_commitment(
+		body in "[ab]{0,2}",
+		salt in any_salt(),
+		other_body in "[ab]{0,2}",
+		other_salt in any_salt(),
+	) {
+		let (commitment, opening) = Opening::prove::<Sha3_256, _>(&TestMessage::sample(Some(&body)), &salt)?;
+		let (other, _) = Opening::prove::<Sha3_256, _>(&TestMessage::sample(Some(&other_body)), &other_salt)?;
+		prop_assert!(opening.verify::<Sha3_256>(&commitment)?);
+		prop_assert_eq!(opening.verify::<Sha3_256>(&other)?, (body, salt) == (other_body, other_salt));
 	}
 }

@@ -840,12 +840,43 @@ tb_scenario! {
 	}
 }
 
-// The scenarios below prove intra-hive full-frame delivery. The frame a
-// sibling servlet receives through `HiveContext::call` is the frame the
-// caller composed and signed. The frame the caller receives back is the
-// frame the servlet responded with. Both end-to-end envelopes survive the
-// intra-hive route, including the id, the nonrepudiation block, and the
-// previous-frame linkage.
+tb_assert_spec! {
+	pub HiveDropStopsServletsSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(SERVLET_STOPPED, exactly!(1))
+		]
+	}
+}
+
+// A hive dropped without `stop`, as a panicking scenario drops it, must still
+// stop every registered servlet.
+tb_scenario! {
+	name: hive_drop_stops_registered_servlets,
+	spec: HiveDropStopsServletsSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let registered = LocatorStopProbe {
+				trace: trace.share(),
+				addr: b"127.0.0.1:0".to_vec(),
+				report_stop: true,
+			};
+
+			let mut hive = HiveX509Test::new(None)?;
+			hive.register(servlet_urn("dropped"), registered, |t| async move {
+				Ok(LocatorStopProbe {
+					trace: t.share(),
+					addr: b"127.0.0.1:0".to_vec(),
+					report_stop: false,
+				})
+			})?;
+
+			drop(hive);
+			Ok(())
+		}
+	}
+}
 
 pub(crate) const HIVE_CALL_SIGNED: Urn<'static> = tightbeam::urn!("test", "event:hive/call-signed");
 pub(crate) const HIVE_CALL_PREVIOUS: Urn<'static> = tightbeam::urn!("test", "event:hive/call-previous");
@@ -864,7 +895,7 @@ pub(crate) const HIVE_CALL_ECHOED: Urn<'static> = tightbeam::urn!("test", "event
 /// servlet share, so each side can verify the other's frame signature
 /// without key distribution.
 fn contract_signing_key() -> Secp256k1SigningKey {
-	Secp256k1SigningKey::from(TestKey::signing())
+	Secp256k1SigningKey::from(TestKey::insecure_fixed_signing())
 }
 
 /// Signs `frame` with the shared contract key under the canonical

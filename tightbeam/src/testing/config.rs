@@ -16,7 +16,6 @@ use crate::testing::macros::{BuiltAssertSpec, TraceCollector};
 use crate::testing::result::ScenarioVerdict;
 use crate::testing::specs::{CspValidationResult, Layer, SpecViolation, TBSpec, Violations};
 use crate::trace::ConsumedTrace;
-use crate::transport::error::TransportError;
 use crate::Errorizable;
 
 #[cfg(feature = "testing-fdr")]
@@ -112,9 +111,12 @@ impl ScenarioConfig {
 	/// The signature holds in every feature configuration, so a `tb_scenario!`
 	/// expansion states one call whatever the consumer selected.
 	pub fn verify(&self, trace: &ConsumedTrace, execution: Result<(), TightBeamError>) -> ScenarioVerdict {
-		let mut layer1: Result<(), SpecViolation> = Ok(());
+		let mut layer1: Result<(), SpecViolation> = match &execution {
+			Err(error) if self.specs().is_empty() => Err(SpecViolation::ExecutionFailed(format!("{error:?}"))),
+			_ => Ok(()),
+		};
 		for spec in self.specs() {
-			let verified = spec.verify(trace);
+			let verified = spec.verify(trace, &execution);
 			if let Err(violation) = verified {
 				layer1 = Err(violation);
 				break;
@@ -131,7 +133,7 @@ impl ScenarioConfig {
 		#[cfg(not(feature = "testing-fdr"))]
 		let layer3: Option<FdrVerdict> = None;
 
-		ScenarioVerdict::from_layers(execution, layer1, layer2, layer3)
+		ScenarioVerdict::from_layers(layer1, layer2, layer3)
 	}
 
 	/// Grades the scenario against the refinement model the configuration names.
@@ -335,9 +337,6 @@ impl HookContext {
 	pub fn build(config: &ScenarioConfig, trace: &TraceCollector, execution: Result<(), TightBeamError>) -> Self {
 		let mut consumed_trace = ConsumedTrace::new();
 		consumed_trace.populate_from_collector(trace);
-		if execution.is_err() {
-			consumed_trace.error = Some(TransportError::InvalidMessage);
-		}
 
 		let verdict = config.verify(&consumed_trace, execution);
 		let outcome = verdict.outcome(config.expect());
@@ -449,11 +448,30 @@ impl TestHooks {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::utils::urn::Urn;
+
+	const STEP: Urn<'static> = crate::urn!("test", "event:config/step");
+
+	crate::tb_assert_spec! {
+		pub ErrorBodySpec,
+		V(1,0,0): {
+			mode: Error,
+			assertions: [ (STEP, crate::exactly!(0)) ]
+		},
+	}
 
 	#[test]
 	fn build_refuses_zero_effective_verifiers() {
 		let refused = ScenarioConfig::builder().build();
 		assert_eq!(refused.err(), Some(ScenarioConfigError::NoEffectiveVerifier));
+	}
+
+	#[test]
+	fn an_error_mode_spec_passes_a_body_that_errored() -> Result<(), ScenarioConfigError> {
+		let config = ScenarioConfig::builder().with_spec(ErrorBodySpec::latest()).build()?;
+		let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError));
+		assert_eq!(verdict.outcome(Expect::Pass), Ok(()));
+		Ok(())
 	}
 
 	#[cfg(feature = "testing-csp")]
@@ -494,6 +512,15 @@ mod tests {
 				refused.err(),
 				Some(ScenarioConfigError::ExpectViolationWithoutVerifier(Layer::Refinement))
 			);
+		}
+
+		#[test]
+		fn a_body_error_with_no_spec_fails_layer1() -> Result<(), ScenarioConfigError> {
+			let config = ScenarioConfig::builder().with_csp(AcceptsEveryTrace).build()?;
+			let verdict = config.verify(&ConsumedTrace::new(), Err(TightBeamError::RecvTimeoutError));
+			let expected = SpecViolation::ExecutionFailed(format!("{:?}", TightBeamError::RecvTimeoutError));
+			assert_eq!(verdict.spec(), Some(&expected));
+			Ok(())
 		}
 	}
 }

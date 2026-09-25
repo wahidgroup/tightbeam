@@ -262,7 +262,7 @@ tb_scenario! {
 		},
 		start: |SetupEnv { trace, context: config }| async move {
 			let trace = Arc::new(trace);
-			let verifying_key = *TestKey::signing().verifying_key();
+			let verifying_key = *TestKey::insecure_fixed_signing().verifying_key();
 			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
 				.with_collector_gate(SignatureGate { verifying_key })
@@ -284,7 +284,7 @@ tb_scenario! {
 					message: CalcRequest { value: config.value },
 					compactness: ZstdCompression::default(),
 					confidentiality: shared_cipher(),
-					nonrepudiation<Secp256k1Signature, _>: TestKey::signing(),
+					nonrepudiation<Secp256k1Signature, _>: TestKey::insecure_fixed_signing(),
 					message_integrity<Sha3_256>: [],
 					frame_integrity: type Sha3_256
 			}?;

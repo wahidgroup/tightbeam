@@ -537,7 +537,7 @@ mod tests {
 	}
 
 	fn test_certificate() -> Certificate {
-		TestCertificate::self_signed(&TestKey::signing())
+		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 	}
 
 	/// A certificate under a distinct key, so a trust store built from
@@ -596,7 +596,7 @@ mod tests {
 
 	#[test]
 	fn peer_wins_when_same_key_has_distinct_certificates() {
-		let key = TestKey::signing();
+		let key = TestKey::insecure_fixed_signing();
 		let hive_cert = TestCertificate::with_cn_and_uri_sans(&key, "hive", &["urn:tightbeam:colony:test"]);
 		let peer_cert = TestCertificate::with_cn_and_uri_sans(&key, "peer", &["urn:tightbeam:colony:test"]);
 

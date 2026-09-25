@@ -219,14 +219,14 @@ mod tests {
 
 	#[test]
 	fn empty_validator_chain_returns_store_unchanged() {
-		let store = trust_of(&TestCertificate::self_signed(&TestKey::signing()));
+		let store = trust_of(&TestCertificate::self_signed(&TestKey::insecure_fixed_signing()));
 		let composed = validated_trust(Arc::clone(&store), &[]);
 		assert!(Arc::ptr_eq(&store, &composed));
 	}
 
 	#[test]
 	fn operator_validator_rejects_store_trusted_certificate() {
-		let cert = TestCertificate::self_signed(&TestKey::signing());
+		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		let composed = validated_trust(trust_of(&cert), &[Arc::new(RejectAll)]);
 		assert!(composed.is_trusted(&cert));
 		assert!(composed.evaluate(&cert).is_err());
@@ -234,7 +234,7 @@ mod tests {
 
 	#[test]
 	fn operator_validator_rejects_store_verified_chain() {
-		let cert = TestCertificate::self_signed(&TestKey::signing());
+		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		let store = trust_of(&cert);
 		let chain = [cert];
 		assert!(store.verify_chain(&chain).is_ok());

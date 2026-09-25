@@ -1,13 +1,11 @@
 //! Scenario verdict and the unified scenario result
 //!
-//! Layer 1 grades the trace against the assertion specs, Layer 2 against the
-//! CSP process, Layer 3 against the refinement model. The scenario body's own
-//! result sits beside the three: a body that errored produced a trace no layer
-//! should be read as having accepted.
+//! Layer 1 grades the trace and the body's own result against the assertion
+//! specs, Layer 2 grades the trace against the CSP process, and Layer 3
+//! against the refinement model.
 
 use core::fmt::{Display, Formatter};
 
-use crate::error::TightBeamError;
 use crate::testing::config::Expect;
 use crate::testing::fdr::{Decision, FdrVerdict};
 use crate::testing::macros::BuiltAssertSpec;
@@ -34,24 +32,22 @@ enum Reported {
 /// configuration did not run contributes nothing.
 #[derive(Debug)]
 pub struct ScenarioVerdict {
-	execution: Result<(), TightBeamError>,
 	layer1: Result<(), SpecViolation>,
 	layer2: Option<CspValidationResult>,
 	layer3: Option<FdrVerdict>,
 }
 
 impl ScenarioVerdict {
-	/// Assembles a verdict from what the body and each layer produced.
+	/// Assembles a verdict from what each layer produced.
 	///
 	/// The signature holds in every feature configuration. A layer the
 	/// configuration did not run passes `None`.
 	pub fn from_layers(
-		execution: Result<(), TightBeamError>,
 		layer1: Result<(), SpecViolation>,
 		layer2: Option<CspValidationResult>,
 		layer3: Option<FdrVerdict>,
 	) -> Self {
-		Self { execution, layer1, layer2, layer3 }
+		Self { layer1, layer2, layer3 }
 	}
 
 	/// The Layer 1 violation, when the assertion specs rejected the trace.
@@ -71,7 +67,7 @@ impl ScenarioVerdict {
 
 	/// Grades the scenario against what it expected.
 	///
-	/// [`Expect::Pass`] holds when the body returned and every layer accepted.
+	/// [`Expect::Pass`] holds when every layer accepted.
 	/// [`Expect::Violation`] holds when the named layer rejects and every
 	/// other accepts, so a negative test fails both on a missing rejection and
 	/// on one from a different layer. A layer that could not decide meets no
@@ -82,10 +78,6 @@ impl ScenarioVerdict {
 	/// - [`Violations`] -- every rejection the grading found, in layer order.
 	pub fn outcome(&self, expect: Expect) -> Result<(), Violations> {
 		let mut found = Vec::new();
-
-		if let Err(error) = self.execution.as_ref() {
-			found.push(SpecViolation::ExecutionFailed(format!("{error:?}")));
-		}
 
 		for layer in Layer::ALL {
 			match self.reported(layer) {
@@ -145,7 +137,7 @@ impl ScenarioVerdict {
 
 impl Default for ScenarioVerdict {
 	fn default() -> Self {
-		Self { execution: Ok(()), layer1: Ok(()), layer2: None, layer3: None }
+		Self { layer1: Ok(()), layer2: None, layer3: None }
 	}
 }
 
@@ -167,7 +159,7 @@ impl ScenarioResult {
 			trace: ConsumedTrace::new(),
 			assert_spec: None,
 			assert_specs: Vec::new(),
-			verdict: ScenarioVerdict::from_layers(Ok(()), result, None, None),
+			verdict: ScenarioVerdict::from_layers(result, None, None),
 			expect: Expect::Pass,
 		}
 	}

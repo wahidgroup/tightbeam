@@ -43,7 +43,7 @@ tb_scenario! {
 fn gateless_trace_is_mode_accept() {
 	let trace = ConsumedTrace::new();
 
-	assert_eq!(trace.execution_mode(), ExecutionMode::Accept);
+	assert_eq!(ExecutionMode::of(&Ok(()), &trace), ExecutionMode::Accept);
 }
 
 // Layer 1 must reject this: the run takes no gate, so `gate: Ok` names a

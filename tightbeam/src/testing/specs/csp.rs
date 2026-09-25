@@ -424,8 +424,9 @@ impl Process {
 		let mut violations = Vec::new();
 		let mut current_states = vec![self.initial];
 
-		// Map assertion labels onto this process's alphabet by exact URN
-		// identity. Out-of-alphabet labels are ignored.
+		// Project the trace onto this process's alphabet by exact URN
+		// identity, as Hoare's restriction `tr ↾ A` does. A label outside the
+		// alphabet is outside what this process specifies, not a violation.
 		let events: Vec<Event> = trace
 			.assertions
 			.iter()

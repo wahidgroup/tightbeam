@@ -21,6 +21,8 @@ use crate::utils::urn::Urn;
 use crate::constants::DEFAULT_FAULT_SEED;
 #[cfg(feature = "instrument")]
 use crate::crypto::hash::{Digest, Sha3_256};
+#[cfg(any(test, feature = "testing"))]
+use crate::error::TightBeamError;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::{events, BoundedMemorySink, EventSink, TbEvent, TbInstrumentationConfig};
 #[cfg(all(feature = "policy", any(test, feature = "testing")))]
@@ -33,8 +35,6 @@ use crate::testing::fdr::InjectionStrategy;
 use crate::trace::logging::LogRecord;
 #[cfg(any(test, feature = "testing"))]
 use crate::trace::{Assertion, AssertionLabel};
-#[cfg(all(feature = "transport", any(test, feature = "testing")))]
-use crate::transport::error::TransportError;
 #[cfg(any(test, feature = "testing"))]
 use crate::Frame;
 
@@ -955,9 +955,6 @@ pub struct ConsumedTrace {
 	/// The gate's decision, when the run passed through a gate.
 	#[cfg(feature = "policy")]
 	pub gate_decision: Option<TransitStatus>,
-	/// The transport error that ended the run, if any.
-	#[cfg(feature = "transport")]
-	pub error: Option<TransportError>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -972,8 +969,6 @@ impl ConsumedTrace {
 			instrument_events: Vec::new(),
 			#[cfg(feature = "policy")]
 			gate_decision: None,
-			#[cfg(feature = "transport")]
-			error: None,
 		}
 	}
 
@@ -984,25 +979,6 @@ impl ConsumedTrace {
 		{
 			self.instrument_events.extend(collector.drain_events());
 		}
-	}
-
-	/// What the recorded run did, read from the field that holds each fact.
-	///
-	/// An error is [`ConsumedTrace::error`], and a rejection is a gate
-	/// decision other than `Ok`. A run with no gate decision took no gate, so
-	/// it reads as accepted.
-	pub fn execution_mode(&self) -> ExecutionMode {
-		#[cfg(feature = "transport")]
-		if self.error.is_some() {
-			return ExecutionMode::Error;
-		}
-
-		#[cfg(feature = "policy")]
-		if matches!(self.gate_decision, Some(status) if status != TransitStatus::Ok) {
-			return ExecutionMode::Reject;
-		}
-
-		ExecutionMode::Accept
 	}
 
 	pub fn has_response(&self) -> bool {
@@ -1059,16 +1035,35 @@ where
 #[cfg(any(test, feature = "testing"))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
-	/// The run ended with no transport error and no refusing gate decision.
+	/// The body returned and no gate decision refused the run.
 	Accept,
 	/// A gate decision other than `Ok` refused the run.
 	Reject,
-	/// The run ended in a transport error.
+	/// The body returned an error.
 	Error,
 }
 
 #[cfg(any(test, feature = "testing"))]
 impl ExecutionMode {
+	/// What the run did, read from the body's own result and the trace.
+	///
+	/// An error is what the body returned, and a rejection is a gate decision
+	/// other than `Ok`. A run with no gate decision took no gate, so it reads
+	/// as accepted.
+	#[cfg_attr(not(feature = "policy"), expect(unused_variables))]
+	pub fn of(execution: &Result<(), TightBeamError>, trace: &ConsumedTrace) -> Self {
+		if execution.is_err() {
+			return Self::Error;
+		}
+
+		#[cfg(feature = "policy")]
+		if matches!(trace.gate_decision, Some(status) if status != TransitStatus::Ok) {
+			return Self::Reject;
+		}
+
+		Self::Accept
+	}
+
 	pub fn as_str(&self) -> &'static str {
 		match self {
 			Self::Accept => "accept",

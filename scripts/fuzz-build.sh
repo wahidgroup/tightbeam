@@ -26,12 +26,25 @@ if [ "${#TARGETS[@]}" -eq 0 ]; then
 	exit 1
 fi
 
+# The AFL runtime that cargo-afl links carries the IJON entry points. A target
+# without them was not built against that runtime, so AFL would fuzz it blind.
+IJON_SYMBOLS=(ijon_max ijon_set ijon_hashint __afl_ijon_map_size __afl_area_ptr)
+TARGET_DIR="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)"
+
 echo "Building ${#TARGETS[@]} AFL-instrumented fuzz target(s)..."
 for entry in "${TARGETS[@]}"; do
 	NAME="${entry%%$'\t'*}"
 	FEATURES="${entry#*$'\t'}"
 	echo "  - $NAME ($FEATURES)"
 	RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "$NAME" --features "$FEATURES"
+
+	SYMBOLS="$(nm "$TARGET_DIR/debug/$NAME" | awk '{print $NF}')"
+	for symbol in "${IJON_SYMBOLS[@]}"; do
+		if ! grep -qx -- "$symbol" <<<"$SYMBOLS"; then
+			echo "Error: $NAME lacks the AFL IJON symbol $symbol" >&2
+			exit 1
+		fi
+	done
 done
 
 echo ""

@@ -5,8 +5,6 @@
 //! grading directly, one layer at a time, so a layer that stops reaching the
 //! decision fails here rather than leaving a scenario green.
 
-use tightbeam::error::TightBeamError;
-use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::{Decision, FdrVerdict};
 use tightbeam::testing::specs::{CspValidationResult, CspViolation, Event, State};
 use tightbeam::testing::{Expect, Layer, ScenarioResult, ScenarioVerdict, SpecViolation};
@@ -40,7 +38,7 @@ fn rejections(verdict: &ScenarioVerdict, expect: Expect) -> Vec<SpecViolation> {
 #[test]
 fn every_layer_accepting_passes_the_scenario() {
 	let accepted_csp = CspValidationResult { valid: true, violations: Vec::new() };
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Ok(()), Some(accepted_csp), Some(FdrVerdict::default()));
+	let verdict = ScenarioVerdict::from_layers(Ok(()), Some(accepted_csp), Some(FdrVerdict::default()));
 
 	let found = rejections(&verdict, Expect::Pass);
 
@@ -49,7 +47,7 @@ fn every_layer_accepting_passes_the_scenario() {
 
 #[test]
 fn layer2_violation_fails_the_scenario() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Ok(()), Some(refused_csp()), None);
+	let verdict = ScenarioVerdict::from_layers(Ok(()), Some(refused_csp()), None);
 	let found = rejections(&verdict, Expect::Pass);
 	assert!(
 		matches!(found.as_slice(), [SpecViolation::CspProcessViolation(_)]),
@@ -59,7 +57,7 @@ fn layer2_violation_fails_the_scenario() {
 
 #[test]
 fn layer3_violation_fails_the_scenario() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Ok(()), None, Some(refused_fdr()));
+	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(refused_fdr()));
 	let found = rejections(&verdict, Expect::Pass);
 	assert!(
 		matches!(found.as_slice(), [SpecViolation::RefinementViolation]),
@@ -68,19 +66,8 @@ fn layer3_violation_fails_the_scenario() {
 }
 
 #[test]
-fn execution_failure_fails_the_scenario() {
-	let failed = Err(TightBeamError::TestingError(TestingError::InvalidTimingConstraint));
-	let verdict = ScenarioVerdict::from_layers(failed, Ok(()), None, None);
-	let found = rejections(&verdict, Expect::Pass);
-	assert!(
-		matches!(found.as_slice(), [SpecViolation::ExecutionFailed(_)]),
-		"the scenario body returned an error, so the scenario fails on it: {found:?}"
-	);
-}
-
-#[test]
 fn an_expected_violation_passes_the_scenario() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Ok(()), None, Some(refused_fdr()));
+	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(refused_fdr()));
 	let found = rejections(&verdict, Expect::Violation(Layer::Refinement));
 	assert!(
 		found.is_empty(),
@@ -90,7 +77,7 @@ fn an_expected_violation_passes_the_scenario() {
 
 #[test]
 fn an_unmet_expectation_fails_the_scenario() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Ok(()), None, Some(FdrVerdict::default()));
+	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(FdrVerdict::default()));
 	let found = rejections(&verdict, Expect::Violation(Layer::Refinement));
 	assert!(
 		matches!(found.as_slice(), [SpecViolation::ExpectationUnmet(Layer::Refinement)]),
@@ -108,14 +95,14 @@ fn a_result_derives_its_pass_from_the_verdict() {
 
 #[test]
 fn an_undecided_layer3_is_reported_as_inconclusive() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Ok(()), None, Some(undecided_fdr()));
+	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(undecided_fdr()));
 	let found = rejections(&verdict, Expect::Pass);
 	assert_eq!(found, vec![SpecViolation::RefinementInconclusive]);
 }
 
 #[test]
 fn an_undecided_layer3_does_not_satisfy_an_expected_violation() {
-	let verdict = ScenarioVerdict::from_layers(Ok(()), Ok(()), None, Some(undecided_fdr()));
+	let verdict = ScenarioVerdict::from_layers(Ok(()), None, Some(undecided_fdr()));
 	let found = rejections(&verdict, Expect::Violation(Layer::Refinement));
 	assert_eq!(found, vec![SpecViolation::RefinementInconclusive]);
 }

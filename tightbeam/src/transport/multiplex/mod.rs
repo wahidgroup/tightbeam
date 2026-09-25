@@ -177,7 +177,7 @@ impl StreamRoute {
 	/// served locally and never re-forwarded. Origin opens use
 	/// [`Self::to`] instead.
 	#[cfg(feature = "colony")]
-	pub(crate) fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> Self {
+	pub fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> Self {
 		// The sentinel encodes an origin open. A relayed route must stay
 		// below it so hop-budget accounting treats the open as already relayed.
 		Self { target: Some(target), hops_remaining: hops_remaining.min(DEFAULT_HOP_BUDGET - 1) }

@@ -102,13 +102,20 @@ pub struct HiveRuntime<P: Protocol> {
 }
 
 impl<P: Protocol> HiveRuntime<P> {
-	fn abort_tasks(&mut self) {
+	/// Aborts the hive's tasks and stops every registered servlet. Both
+	/// `stop` and `Drop` run it, so a dropped hive leaks no servlet.
+	fn release(&mut self) {
 		self.tasks.abort_all();
 		if let Lifecycle::Established { control } = &mut self.lifecycle {
 			if let Some(plane) = control.take() {
 				rt::abort(&plane.handle);
 			}
 		}
+
+		self.servlets
+			.drain_all()
+			.into_iter()
+			.for_each(|(_, reg)| reg.servlet.stop_boxed());
 	}
 
 	fn build_control_ctx(&self) -> HiveControlCtx<P> {
@@ -337,11 +344,7 @@ where
 	}
 
 	fn stop(mut self) {
-		self.abort_tasks();
-		self.servlets
-			.drain_all()
-			.into_iter()
-			.for_each(|(_, reg)| reg.servlet.stop_boxed());
+		self.release();
 	}
 
 	async fn join(mut self) -> Result<(), TightBeamError> {
@@ -413,6 +416,6 @@ where
 
 impl<P: Protocol> Drop for HiveRuntime<P> {
 	fn drop(&mut self) {
-		self.abort_tasks();
+		self.release();
 	}
 }

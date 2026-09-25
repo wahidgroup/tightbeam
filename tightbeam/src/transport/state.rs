@@ -1054,6 +1054,6 @@ mod tests {
 
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	fn fixture_certificate() -> Certificate {
-		TestCertificate::self_signed(&TestKey::signing())
+		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 	}
 }

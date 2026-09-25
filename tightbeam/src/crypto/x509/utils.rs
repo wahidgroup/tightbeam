@@ -424,7 +424,7 @@ mod tests {
 
 		#[test]
 		fn reads_basic_constraints() -> Result<(), Box<dyn core::error::Error>> {
-			let chain = TestCertificate::chain()?;
+			let chain = TestCertificate::insecure_fixed_chain()?;
 			let basic_constraints = &chain
 				.root
 				.extension::<BasicConstraints>()?
@@ -435,7 +435,7 @@ mod tests {
 
 		#[test]
 		fn absent_returns_none() -> Result<(), Box<dyn core::error::Error>> {
-			let chain = TestCertificate::chain()?;
+			let chain = TestCertificate::insecure_fixed_chain()?;
 			assert!(&chain.leaf.extension::<BasicConstraints>()?.is_none());
 			Ok(())
 		}

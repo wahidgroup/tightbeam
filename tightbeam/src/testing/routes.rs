@@ -16,17 +16,7 @@ use crate::transport::multiplex::{MuxConnector, RequestSink, StreamBody, StreamR
 use crate::transport::policy::PolicyConfig;
 use crate::transport::{PersistentConnection, PooledClient, Protocol, TransportResult};
 use crate::utils::marker::MaybeSend;
-use crate::utils::urn::Urn;
 use crate::Frame;
-
-/// Build a relayed [`StreamRoute`] for harness opens that must spend hop
-/// budget before the first gateway.
-///
-/// The origin sentinel is excluded by construction: hop budget is clamped
-/// below the origin open budget.
-pub fn relayed_to(target: Urn<'static>, hops_remaining: u8) -> StreamRoute {
-	StreamRoute::relayed_to(target, hops_remaining)
-}
 
 /// Harness-facing stream opens on [`PooledClient`] that carry a fully
 /// formed [`StreamRoute`].

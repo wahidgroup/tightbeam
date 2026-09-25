@@ -43,17 +43,22 @@ pub use config::{
 	ScenarioConfigError, TestHooks,
 };
 pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
-pub use fixtures::*;
+pub use fixtures::{
+	ConfidentialNonrepudiableNote, ConfidentialNote, ExpectedMatcher, IntegralNote, TestCertificate, TestDigest,
+	TestFrame, TestKey, TestMessage, TestSigner,
+};
 pub use result::{ScenarioResult, ScenarioVerdict};
 pub use specs::{Layer, SpecViolation, TBSpec, Violations};
 pub use teardown::Teardown;
 
 #[cfg(feature = "testing-fault")]
 pub use fault::{ProcessEvent, ProcessState};
-#[cfg(feature = "testing-fault")]
-pub use fdr::FaultModel;
 #[cfg(feature = "testing-fdr")]
-pub use fdr::*;
+pub use fdr::{Decision, FdrConfig, FdrTraceExt, FdrVerdict, SchedulerModel, TraceProcessMode};
+#[cfg(feature = "testing-fault")]
+pub use fdr::{FaultInjection, FaultModel, InjectedFaultRecord, InjectionStrategy};
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub use fixtures::TestCertificateChain;
 #[cfg(feature = "testing-fmea")]
 pub use fmea::{FailureMode, FmeaConfig, FmeaReport, SeverityScale};
 

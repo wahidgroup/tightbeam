@@ -501,7 +501,7 @@ mod tests {
 	}
 
 	fn test_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::signing();
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		ClusterConfig::new(
 			ClusterTlsConfig::new(
 				CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),

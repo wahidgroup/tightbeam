@@ -79,11 +79,6 @@ pub trait RouterPolicy: Send + Sync {
 	/// foreign bytes. Opaque payloads are rejected before any decode
 	/// attempt (see [`CleartextFrame`]).
 	///
-	/// Residual: two DER-structurally-identical types still cross-decode
-	/// (the wire format carries no type discriminator by design -- the
-	/// receiver decides the type, never the sender). [`crate::routes!`] keeps
-	/// each type adjacent to its handler to confine that risk.
-	///
 	/// # Errors
 	///
 	/// - The [`CleartextFrame::admit`] set, for a body still opaque.
@@ -285,7 +280,7 @@ mod tests {
 	fn confidential_payment(index: u64) -> Result<Frame, Box<dyn std::error::Error>> {
 		use crate::testing::TestKey;
 
-		let (_, cipher) = TestKey::cipher();
+		let (_, cipher) = TestKey::insecure_fixed_cipher();
 		let frame = compose! {
 			V1: id: format!("p-{index}"),
 				order: 1u64,

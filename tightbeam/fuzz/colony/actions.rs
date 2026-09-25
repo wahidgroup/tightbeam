@@ -12,12 +12,12 @@ use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::decode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::testing::fuzz::OracleAccess;
-use tightbeam::testing::routes::{relayed_to, RoutedOpens};
+use tightbeam::testing::routes::RoutedOpens;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::client::pool::{ConnectionPool, PoolConfig};
 use tightbeam::transport::error::{TransportError, TransportFailure};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::multiplex::RequestSink;
+use tightbeam::transport::multiplex::{RequestSink, StreamRoute};
 use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, PooledClient, Protocol};
@@ -707,7 +707,7 @@ async fn open_stream_action(trace: &TraceCollector, org: &OrgNode, selector: u8)
 	};
 
 	let outcome = if relayed {
-		let (sink, response) = client.open_stream_with_route(relayed_to(target, 1))?;
+		let (sink, response) = client.open_stream_with_route(StreamRoute::relayed_to(target, 1))?;
 		stream_echo_roundtrip(sink, response).await
 	} else {
 		let (sink, response) = client.open_stream_to(target)?;
@@ -743,7 +743,7 @@ async fn open_duplex_action(trace: &TraceCollector, org: &OrgNode, selector: u8)
 
 	let outcome: Result<bool, TightBeamError> = async {
 		let (mut sink, mut body) = if relayed {
-			client.open_duplex_with_route(relayed_to(target, 1))?
+			client.open_duplex_with_route(StreamRoute::relayed_to(target, 1))?
 		} else {
 			client.open_duplex_to(target)?
 		};

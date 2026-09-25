@@ -250,8 +250,9 @@ macro_rules! tb_scenario {
 
 	// ===== HELPER: Read the verdict and call hooks =====
 	(@verify_and_call_hooks $config:expr, $hook_ctx:expr) => {
-		// The verdict is read once, here. Every layer, and the scenario body's
-		// own result, reached it through `ScenarioVerdict::from_layers`.
+		// The verdict is read once, here. Every layer reached it through
+		// `ScenarioVerdict::from_layers`, and the body's own result reached it
+		// through Layer 1.
 		match $hook_ctx.outcome() {
 			Err(violations) => {
 				if let Some(hooks) = $config.hooks() {
@@ -917,9 +918,8 @@ macro_rules! tb_scenario {
 		.await
 		.expect("Failed to start cluster");
 
-		// Type-erased as consuming closures because `Hive::stop(self)`
-		// needs the concrete type: plain drop only aborts control tasks
-		// and would leak registered servlets.
+		// Type-erased as consuming closures, so the list has one type
+		// whether or not the scenario starts hives.
 		#[allow(unused_mut)]
 		let mut hive_stops: Vec<$crate::testing::Teardown> = Vec::new();
 		$(

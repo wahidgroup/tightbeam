@@ -318,7 +318,7 @@ mod tests {
 
 	/// Config exporting only "ping", so "ledger" needs a grant.
 	fn exporting_config() -> ClusterConfig {
-		let key: Secp256k1SigningKey = TestKey::signing();
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let mut config = ClusterConfig::new(
 			ClusterTlsConfig::new(
 				CertificateSpec::Built(Box::new(TestCertificate::self_signed(&key))),
@@ -524,7 +524,7 @@ mod tests {
 
 	#[test]
 	fn hive_origin_passes_hive_only_signer() {
-		let key: Secp256k1SigningKey = TestKey::signing();
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let frame = signed_control_frame(&key);
 		let cert = TestCertificate::self_signed(&key);
 
@@ -544,7 +544,7 @@ mod tests {
 
 	#[test]
 	fn hive_origin_refuses_dual_anchored_signer() {
-		let key: Secp256k1SigningKey = TestKey::signing();
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let frame = signed_control_frame(&key);
 		let cert = TestCertificate::self_signed(&key);
 
@@ -556,7 +556,7 @@ mod tests {
 
 	#[test]
 	fn hive_origin_refuses_peer_key_under_rotated_certificate() {
-		let key: Secp256k1SigningKey = TestKey::signing();
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let frame = signed_control_frame(&key);
 		let hive_cert = TestCertificate::with_cn_and_uri_sans(&key, "hive", &["urn:tightbeam:colony:test"]);
 		let peer_cert = TestCertificate::with_cn_and_uri_sans(&key, "peer", &["urn:tightbeam:colony:test"]);
@@ -569,7 +569,7 @@ mod tests {
 
 	#[test]
 	fn peer_origin_accepts_dual_anchored_signer() {
-		let key: Secp256k1SigningKey = TestKey::signing();
+		let key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let frame = signed_control_frame(&key);
 		let cert = TestCertificate::self_signed(&key);
 

@@ -1,17 +1,16 @@
 # cargo-deny policy: the home for what this crate's dependency tree is allowed
-# to contain. `make audit` runs every section below, and the file ships in the
-# published crate so consumers inherit the same justifications.
+# to contain. `make audit` runs every section below.
 
 [graph]
 all-features = true
 
 [advisories]
 version = 2
-# Each entry is suppressed because no fixed release exists. Revisit when one
-# ships; an entry with no reason is not accepted here.
+# SECURITY.md, Accepted advisories, dates and justifies each suppressed
+# advisory. An entry with no reason is not accepted here.
 ignore = [
-	{ id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack timing side-channel, no fixed upgrade available. Pulled transitively by cms 0.2.3's `builder` feature, which welds in the RSA KeyTrans recipient path. tightbeam uses only KARI/ECDH key agreement, so the affected RSA code path is never exercised." },
-	{ id = "RUSTSEC-2024-0436", reason = "paste is archived as there is nothing further to do. No replacement is required and no vulnerability is claimed." },
+	{ id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack. Justified in SECURITY.md, Accepted advisories." },
+	{ id = "RUSTSEC-2024-0436", reason = "paste unmaintained. Justified in SECURITY.md, Accepted advisories." },
 ]
 
 [licenses]

@@ -1448,7 +1448,7 @@ mod tests {
 	/// [`VerifiedGate`] under `limits`.
 	async fn verified_gate_with(limits: GateLimits) -> Result<VerifiedGate, TightBeamError> {
 		let clock = manual_clock();
-		let signing_key = TestKey::signing();
+		let signing_key = TestKey::insecure_fixed_signing();
 		let certificate = TestCertificate::self_signed(&signing_key);
 		let provider = Secp256k1KeyProvider::from(signing_key);
 		let signed = signed_heartbeat(&clock, &provider).await?;
@@ -1562,7 +1562,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_forged_signer_id_gates_the_sender_not_the_signer() -> Result<(), TightBeamError> {
 		let clock = manual_clock();
-		let signing_key = TestKey::signing();
+		let signing_key = TestKey::insecure_fixed_signing();
 		let certificate = TestCertificate::self_signed(&signing_key);
 		let provider = EcdsaKeyProvider::from(signing_key.clone());
 

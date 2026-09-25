@@ -113,7 +113,7 @@ mod tests {
 	/// ecdsa-with-SHA3-256 OID.
 	#[test]
 	fn verifies_independent_sha3_ecdsa_signature() -> Result<(), Box<dyn std::error::Error>> {
-		let signing_key: Secp256k1SigningKey = TestKey::signing();
+		let signing_key: Secp256k1SigningKey = TestKey::insecure_fixed_signing();
 		let message = b"independent sha3-ecdsa interop";
 
 		let mut digest = Sha3_256::default();

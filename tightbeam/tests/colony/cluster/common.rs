@@ -298,7 +298,7 @@ pub async fn sign_frame(mut frame: Frame, key: &Secp256k1SigningKey) -> Result<F
 /// cryptographically verify the other's frame signature without key
 /// distribution.
 pub fn probe_signing_key() -> Secp256k1SigningKey {
-	Secp256k1SigningKey::from(TestKey::signing())
+	Secp256k1SigningKey::from(TestKey::insecure_fixed_signing())
 }
 
 /// Returns whether `frame` carries a signature that verifies against the

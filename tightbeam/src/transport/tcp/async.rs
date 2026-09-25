@@ -1052,7 +1052,7 @@ mod tests {
 		}
 
 		fn test_runtime() -> RuntimeAead {
-			let (_key, cipher) = TestKey::cipher();
+			let (_key, cipher) = TestKey::insecure_fixed_cipher();
 			RuntimeAead::new(cipher)
 		}
 
@@ -1249,7 +1249,7 @@ mod tests {
 
 	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	fn encrypted_test_server() -> TransportResult<EncryptedTestServer> {
-		let signing_key = TestKey::signing();
+		let signing_key = TestKey::insecure_fixed_signing();
 		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 		let sha3_signer = Sha3Signer::from(&signing_key);
 		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
@@ -1334,7 +1334,7 @@ mod tests {
 	/// A CMS client holding a signing key, and `trust_store` if one is given.
 	#[cfg(all(feature = "x509", feature = "transport-cms"))]
 	fn cms_test_client(stream: TcpStream, trust_store: Option<Arc<dyn CertificateTrust>>) -> TcpTransport<TokioStream> {
-		let signing_key = Secp256k1SigningKey::from(TestKey::signing());
+		let signing_key = Secp256k1SigningKey::from(TestKey::insecure_fixed_signing());
 		let key_provider = Secp256k1KeyProvider::from(signing_key);
 		let provider = Arc::new(key_provider);
 		let key_manager = HandshakeKeyManager::new(provider);

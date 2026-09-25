@@ -1209,7 +1209,7 @@ mod tests {
 	/// its leaf. No separate pinned certificate is needed.
 	#[test]
 	fn from_chain_validates_and_targets_leaf() -> Result<(), Box<dyn Error>> {
-		let chain = TestCertificate::chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let mut client = chain_client(chain.to_arc(), Some(chain.root.to_owned()))?;
 		client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None)?;
 
@@ -1220,7 +1220,7 @@ mod tests {
 
 	#[test]
 	fn from_chain_rejects_untrusted_chain() -> Result<(), Box<dyn Error>> {
-		let chain = TestCertificate::chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let mut client = chain_client(chain.to_arc(), None)?;
 		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
 		assert!(matches!(result, Err(HandshakeError::CertificateValidationError(_))));
@@ -1232,7 +1232,7 @@ mod tests {
 	/// identity violation.
 	#[test]
 	fn pinned_certificate_mismatch_rejected() -> Result<(), Box<dyn Error>> {
-		let chain = TestCertificate::chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let pinned = Arc::new(create_test_certificate().certificate);
 		let mut client =
 			CmsHandshakeClient::<DefaultCryptoProvider>::new(DefaultCryptoProvider::default(), client_key(), pinned)
@@ -1246,7 +1246,7 @@ mod tests {
 
 	#[test]
 	fn from_chain_rejects_empty_chain() -> Result<(), Box<dyn Error>> {
-		let chain = TestCertificate::chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let mut client = chain_client(Arc::from(Vec::new()), Some(chain.root))?;
 		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
 		assert!(matches!(result, Err(HandshakeError::MissingServerCertificate)));

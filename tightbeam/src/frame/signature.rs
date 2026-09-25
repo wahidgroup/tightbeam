@@ -233,7 +233,7 @@ mod tests {
 		#[tokio::test]
 		async fn the_signer_identifier_does_not_follow_the_prehash_digest() -> Result<()> {
 			let mut frame = unsigned_frame(Version::V1)?;
-			let provider = Secp256k1KeyProvider::from(TestKey::signing());
+			let provider = Secp256k1KeyProvider::from(TestKey::insecure_fixed_signing());
 
 			frame.sign_with_provider::<Sha3_512, _>(&provider).await?;
 
@@ -251,7 +251,7 @@ mod tests {
 			let mut frame = unsigned_frame(Version::V1)?;
 			assert!(frame.nonrepudiation.is_none());
 
-			let signing_key = TestKey::signing();
+			let signing_key = TestKey::insecure_fixed_signing();
 			let provider = Secp256k1KeyProvider::from(signing_key);
 
 			frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
@@ -280,7 +280,7 @@ mod tests {
 		#[test]
 		fn test_attach_signature_roundtrip() -> Result<()> {
 			let mut frame = unsigned_frame(Version::V1)?;
-			let signing_key = TestKey::signing();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 			// External backends must follow the canonical convention.
 			// SHA3-256 runs over the TBS bytes, and ECDSA signs that
@@ -302,7 +302,7 @@ mod tests {
 		#[test]
 		fn test_attach_signer_info_from_parts() -> Result<()> {
 			let mut frame = unsigned_frame(Version::V1)?;
-			let signing_key = TestKey::signing();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 			let tbs = frame.to_tbs()?;
 			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;

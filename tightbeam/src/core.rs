@@ -256,8 +256,8 @@ mod tests {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::cipher();
-			let signing_key = TestKey::signing();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 			compose! {
 				V1: id: "test-003",
@@ -272,8 +272,8 @@ mod tests {
 			use crate::crypto::hash::Sha3_256;
 
 			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::cipher();
-			let signing_key = TestKey::signing();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 			compose! {
 				V2: id: "test-004",
@@ -318,8 +318,8 @@ mod tests {
 			use crate::crypto::hash::Sha3_256;
 
 			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::cipher();
-			let signing_key = TestKey::signing();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 			compose! {
 				V2:
@@ -369,8 +369,8 @@ mod tests {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::cipher();
-			let signing_key = TestKey::signing();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 			compose! {
 				V1: id: "sig-001",
@@ -385,8 +385,8 @@ mod tests {
 			use crate::crypto::hash::Sha3_256;
 
 			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::cipher();
-			let signing_key = TestKey::signing();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 			compose! {
 				V2:

@@ -201,6 +201,9 @@ extern crate self as tightbeam;
 pub use crate::core::Message;
 pub use crate::error::TightBeamError;
 
+#[cfg(all(feature = "secp256k1", feature = "signature"))]
+pub use crate::crypto::sign::ecdsa::Secp256k1SigningKey as SigningKey;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 

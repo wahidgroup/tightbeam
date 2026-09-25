@@ -769,8 +769,8 @@ mod tests {
 		setup: |builder, msg| {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			let (_, cipher) = TestKey::cipher();
-			let signing_key = TestKey::signing();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 		builder
 			.with_message(msg)
@@ -791,7 +791,7 @@ mod tests {
 			assert!(decode_result.is_err(), "Body should be encrypted");
 
 			// Decrypt and verify
-			let (_, cipher) = TestKey::cipher();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, None)?;
 			assert_eq!(decrypted, message);
 
@@ -814,8 +814,8 @@ mod tests {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::compress::ZstdCompression;
 
-			let (_, cipher) = TestKey::cipher();
-			let signing_key = TestKey::signing();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 		builder
 			.with_message(msg)
@@ -837,7 +837,7 @@ mod tests {
 			assert!(decode_result.is_err(), "Body should be encrypted/compressed");
 
 			// Decrypt (automatically decompresses) and verify
-			let (_, cipher) = TestKey::cipher();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
 
@@ -862,8 +862,8 @@ mod tests {
 		setup: |builder, msg| {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			let (_, cipher) = TestKey::cipher();
-			let signing_key = TestKey::signing();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
+			let signing_key = TestKey::insecure_fixed_signing();
 
 			let previous_hash = crate::utils::digest::<Sha3_256>(b"previous-message-data")?;
 			let rng = rand_core::OsRng;
@@ -919,12 +919,12 @@ mod tests {
 
 			// Verify the signature first, because decryption consumes the
 			// frame.
-			let signing_key = TestKey::signing();
+			let signing_key = TestKey::insecure_fixed_signing();
 			let verifying_key = signing_key.verifying_key();
 			assert!(tightbeam.verify::<Secp256k1Signature, Sha3_256>(verifying_key).is_ok());
 
 			// Decrypt (automatically decompresses) and verify
-			let (_, cipher) = TestKey::cipher();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
 
@@ -1219,8 +1219,8 @@ mod tests {
 			($test:ident, $name:expr, $confidential:tt, $nonrepudiable:tt, $message_integrity:tt, $frame_integrity:tt, $version:ident) => {
 				#[test]
 				fn $test() -> Result<()> {
-					let (_, cipher) = TestKey::cipher();
-					let signing_key = TestKey::signing();
+					let (_, cipher) = TestKey::insecure_fixed_cipher();
+					let signing_key = TestKey::insecure_fixed_signing();
 
 					test_msg_struct!($confidential, $nonrepudiable, $message_integrity, $frame_integrity, $version);
 					run_tests!(

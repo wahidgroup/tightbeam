@@ -380,7 +380,7 @@ mod tests {
 		use crate::testing::fixtures::{TestCertificate, TestKey};
 		use crate::transport::handshake::HandshakeKeyManager;
 
-		let key = TestKey::signing();
+		let key = TestKey::insecure_fixed_signing();
 		let certificate = TestCertificate::self_signed(&key);
 		let key_manager = HandshakeKeyManager::<DefaultCryptoProvider>::from(key);
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);

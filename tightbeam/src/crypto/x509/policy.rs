@@ -398,7 +398,7 @@ mod tests {
 		use crate::testing::fixtures::{TestCertificate, TestKey};
 
 		fn test_cert() -> Certificate {
-			TestCertificate::self_signed(&TestKey::signing())
+			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 		}
 
 		/// Run the out-of-the-box policy over `cert`, supplying the issuer key
@@ -441,7 +441,7 @@ mod tests {
 
 		#[test]
 		fn rejects_algorithm_mismatch() {
-			let key = TestKey::signing();
+			let key = TestKey::insecure_fixed_signing();
 			let mut cert = TestCertificate::self_signed(&key);
 			// signatureAlgorithm disagrees with tbsCertificate.signature (RFC 5280 §4.1.1.2).
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
@@ -453,7 +453,7 @@ mod tests {
 
 		#[test]
 		fn rejects_foreign_algorithm() {
-			let key = TestKey::signing();
+			let key = TestKey::insecure_fixed_signing();
 			let mut cert = TestCertificate::self_signed(&key);
 			// Consistent identifiers, but an algorithm the out-of-the-box policy refuses.
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;

@@ -46,7 +46,7 @@ impl GatewayCerts {
 
 	#[allow(dead_code)]
 	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
-		let raw = TestKey::signing();
+		let raw = TestKey::insecure_fixed_signing();
 		let data = TestCertificate::with_cn_and_uri_sans(&raw, "Colony Gateway", &[&colony_urn.to_string()]);
 
 		let cert = Arc::new(data);

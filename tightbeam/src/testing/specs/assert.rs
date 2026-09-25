@@ -5,7 +5,7 @@
 //! expected behavior; the framework automatically verifies traces.
 
 use super::error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation};
-use crate::error::ReceivedExpectedError;
+use crate::error::{ReceivedExpectedError, TightBeamError};
 use crate::testing::assertions::AssertionContract;
 use crate::trace::{ConsumedTrace, ExecutionMode};
 use crate::Frame;
@@ -90,6 +90,9 @@ pub trait TBSpec {
 
 	/// Verify captured trace against spec contract.
 	///
+	/// `execution` is what the scenario body returned, which is the one
+	/// source of the run's error mode.
+	///
 	/// This is the core verification algorithm:
 	/// 1. Verify execution mode matches spec
 	/// 2. Verify gate decision (if spec constrains it)
@@ -98,9 +101,9 @@ pub trait TBSpec {
 	/// 5. Verify phase ordering (if testing feature enabled)
 	/// 6. Custom response validation
 	/// 7. Custom trace validation
-	fn verify(&self, trace: &ConsumedTrace) -> Result<(), SpecViolation> {
+	fn verify(&self, trace: &ConsumedTrace, execution: &Result<(), TightBeamError>) -> Result<(), SpecViolation> {
 		// 1. Verify execution mode
-		let actual_mode = trace.execution_mode();
+		let actual_mode = ExecutionMode::of(execution, trace);
 		if actual_mode != self.mode() {
 			return Err(SpecViolation::ModeMismatch(ReceivedExpectedError {
 				received: actual_mode,

@@ -262,7 +262,7 @@ mod tests {
 
 		fn encrypted_frame() -> Result<Frame> {
 			let message = TestMessage::sample(Some("in-place"));
-			let (_, cipher) = TestKey::cipher();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			compose! {
 				V1: id: "dip-001",
 					order: 1u64,
@@ -280,7 +280,7 @@ mod tests {
 
 		#[test]
 		fn yields_cleartext_frame_with_decodable_body() -> Result<()> {
-			let (_, cipher) = TestKey::cipher();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let mut frame = encrypted_frame()?;
 
 			frame.decrypt_in_place(&cipher, None)?;
@@ -310,7 +310,7 @@ mod tests {
 		#[test]
 		fn cleartext_frame_rejected() -> Result<()> {
 			let message = TestMessage::sample(None);
-			let (_, cipher) = TestKey::cipher();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let mut frame = compose! { V0: id: "dip-002", order: 1u64, message: message }?;
 
 			let result = frame.decrypt_in_place(&cipher, None);
@@ -320,7 +320,7 @@ mod tests {
 
 		#[test]
 		fn compressed_without_inflator_fails_before_mutation() -> Result<()> {
-			let (_, cipher) = TestKey::cipher();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let mut frame = encrypted_frame()?;
 			frame.metadata.compactness = Some(zstd_compactness());
 
@@ -342,7 +342,7 @@ mod tests {
 
 		#[test]
 		fn failed_inflate_after_decrypt_restores_frame() -> Result<()> {
-			let (_, cipher) = TestKey::cipher();
+			let (_, cipher) = TestKey::insecure_fixed_cipher();
 			let mut frame = encrypted_frame()?;
 			frame.metadata.compactness = Some(zstd_compactness());
 

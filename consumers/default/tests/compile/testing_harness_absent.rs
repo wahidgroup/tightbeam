@@ -4,5 +4,5 @@
 use tightbeam::testing::fixtures::TestKey;
 
 fn main() {
-	let _key = TestKey::signing();
+	let _key = TestKey::insecure_fixed_signing();
 }

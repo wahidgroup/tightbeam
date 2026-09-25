@@ -50,6 +50,11 @@ pub enum TraceProcessMode {
 }
 
 /// Extension trait for ConsumedTrace with FDR analysis
+///
+/// Each method reads the trace alone. Layer 1 grades what the scenario body
+/// returned, in [`ScenarioConfig::verify`].
+///
+/// [`ScenarioConfig::verify`]: crate::testing::ScenarioConfig::verify
 pub trait FdrTraceExt {
 	/// Check if CSP trace is valid
 	fn csp_valid(&self) -> bool;
@@ -97,10 +102,6 @@ pub trait FdrTraceExt {
 
 impl FdrTraceExt for ConsumedTrace {
 	fn csp_valid(&self) -> bool {
-		if self.error.is_some() {
-			return false;
-		}
-
 		// A gate that accepted should have something to show for it. A run
 		// with no gate decision took no gate, so there is nothing to test.
 		if matches!(self.gate_decision, Some(TransitStatus::Ok))
@@ -114,10 +115,6 @@ impl FdrTraceExt for ConsumedTrace {
 	}
 
 	fn terminated_in_valid_state(&self) -> bool {
-		if self.error.is_some() {
-			return false;
-		}
-
 		match self.gate_decision {
 			// Accepted, so the handler should have run.
 			Some(TransitStatus::Ok) => self.response.is_some() || !self.assertions.is_empty(),
