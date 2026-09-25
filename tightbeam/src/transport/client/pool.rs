@@ -9,10 +9,7 @@ use core::time::Duration;
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "std")]
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
-#[cfg(feature = "std")]
-use std::time::Instant;
 
-use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::CryptoProvider;
 use crate::transport::client::GenericClient;
 use crate::transport::error::{TransportError, TransportFailure};
@@ -20,19 +17,19 @@ use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::protocols::{PersistentConnection, Protocol};
 use crate::transport::MessageCollector;
-use crate::transport::{TransportResult, X509ClientConfig};
+use crate::transport::{EndpointConfig, TransportResult};
+use crate::utils::time::{Clock, MonotonicInstant};
 
-#[cfg(feature = "aes-gcm")]
-use crate::crypto::profiles::DefaultCryptoProvider;
-#[cfg(not(feature = "x509"))]
-use crate::transport::client::ClientBuilder;
+#[cfg(host_clock)]
+use crate::utils::time::SystemClock;
 
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::crypto::x509::{Certificate, CertificateSpec};
+	pub use crate::crypto::x509::Certificate;
 	pub use crate::transport::handshake::receipt::ReceiptApprover;
 	pub use crate::transport::handshake::HandshakeProtocolKind;
+	pub use crate::transport::state::{ClientIdentity, DialableEncryption, EncryptionConfig};
 }
 
 #[cfg(feature = "x509")]
@@ -40,7 +37,7 @@ use x509::*;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
-	pub use crate::transport::policy::PolicyConfig;
+	pub use crate::transport::policy::{PolicyConfig, TimeoutConfig};
 	pub use crate::transport::MessageEmitter;
 	pub use crate::Frame;
 }
@@ -55,9 +52,9 @@ use crate::trace::TraceCollector;
 #[cfg(any(feature = "instrument", pooled_mux))]
 use crate::utils::urn::Urn;
 
-/// Item gate for the pooled-mux path: multiplexed pooling needs the mux
-/// engine, the serve module's connector, and a tokio executor for the
-/// driver tasks.
+/// Item gate for the pooled-mux path. Multiplexed pooling needs the mux
+/// engine, the serve module's connector, and a tokio executor for the driver
+/// tasks.
 macro_rules! pooled_mux {
 	($($item:item)*) => {
 		$(
@@ -84,8 +81,9 @@ pooled_mux! {
 
 /// Shared builder surface for direct clients and connection pools.
 ///
-/// [`crate::transport::client::ClientBuilder`] and [`ConnectionPoolBuilder`] both implement this trait
-/// so callers configure timeouts and identity the same way.
+/// [`crate::transport::client::ClientBuilder`] and [`ConnectionPoolBuilder`]
+/// both implement this trait, so callers configure timeouts and identity the
+/// same way.
 pub trait ConnectionBuilder<P: Protocol>: Sized {
 	/// Built client or pool produced by [`ConnectionBuilder::build`].
 	type Output;
@@ -97,9 +95,13 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 	#[cfg(feature = "x509")]
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
-	/// Client certificate and key for mutual authentication.
+	/// Client certificate and the key that proves it, for mutual
+	/// authentication.
+	///
+	/// [`ClientIdentity::from_spec`] decodes a certificate specification into
+	/// one, so the fallible step happens once, before the builder.
 	#[cfg(feature = "x509")]
-	fn with_client_identity(self, cert: CertificateSpec, key: Arc<dyn SigningKeyProvider>) -> TransportResult<Self>;
+	fn with_client_identity(self, identity: ClientIdentity<P::CryptoProvider>) -> Self;
 
 	/// Finish configuration and produce the client or pool.
 	fn build(self) -> Self::Output;
@@ -110,9 +112,10 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 pub struct PoolConfig {
 	/// Drop idle exclusive leases after this duration.
 	///
-	/// `None` keeps idle connections until the pool evicts them for other reasons.
+	/// `None` keeps idle connections until the pool evicts them for other
+	/// reasons.
 	pub idle_timeout: Option<Duration>,
-	/// Hard cap on live connections across all destinations (default: 64).
+	/// Hard cap on live connections across all destinations, 64 by default.
 	pub max_connections: usize,
 	/// Multiplexing advertisement for pooled dials.
 	///
@@ -130,98 +133,78 @@ impl Default for PoolConfig {
 
 #[cfg(feature = "x509")]
 #[derive(Clone)]
-/// Client authentication bundle kept behind Arc for zero-copy reuse.
-struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
-	certificate: Arc<Certificate>,
-	key: Arc<HandshakeKeyManager<C>>,
-}
-
-#[cfg(feature = "x509")]
-#[derive(Clone, Default)]
 /// Shared TLS assets reused across pooled connections without reallocations.
-struct PoolTlsConfig<C: CryptoProvider = DefaultCryptoProvider> {
-	trust_store: Option<Arc<dyn CertificateTrust>>,
-	client_identity: Option<ClientIdentity<C>>,
-	server_certificate_chain: Option<Arc<[Certificate]>>,
-	handshake_protocol: Option<HandshakeProtocolKind>,
-	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
+struct PoolTlsConfig<C: CryptoProvider> {
+	/// Provisioning every dial from this pool starts with.
+	encryption: EncryptionConfig<C>,
 }
 
 #[cfg(feature = "x509")]
 impl<C: CryptoProvider> PoolTlsConfig<C> {
-	fn set_trust_store(&mut self, store: Arc<dyn CertificateTrust>) {
-		self.trust_store = Some(store);
+	fn unconfigured() -> Self {
+		Self { encryption: EncryptionConfig::unconfigured() }
 	}
 
-	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager<C>) {
-		self.set_shared_client_identity(Arc::new(cert), Arc::new(key));
+	fn set_trust_store(&mut self, store: Arc<dyn CertificateTrust>) {
+		self.encryption.trust_store = Some(store);
 	}
 
 	fn set_shared_client_identity(&mut self, certificate: Arc<Certificate>, key: Arc<HandshakeKeyManager<C>>) {
-		self.client_identity = Some(ClientIdentity { certificate, key });
+		ClientIdentity::new(certificate, key).install(&mut self.encryption);
 	}
 
 	fn set_server_certificate_chain(&mut self, chain: Arc<[Certificate]>) {
-		self.server_certificate_chain = Some(chain);
+		self.encryption.server_certificate_chain = Some(chain);
 	}
 
 	fn set_handshake_protocol(&mut self, kind: HandshakeProtocolKind) {
-		self.handshake_protocol = Some(kind);
+		self.encryption.handshake_protocol = kind;
 	}
 
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	fn set_receipt_approver(&mut self, approver: Arc<dyn ReceiptApprover>) {
-		self.receipt_approver = Some(approver);
+		self.encryption.receipt_approver = Some(approver);
 	}
 
-	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
-	where
-		Pro: Protocol,
-		Pro::Transport: MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C>,
-	{
-		let mut configured = transport;
-		if let Some(store) = &self.trust_store {
-			let store = Arc::clone(store);
-			configured = configured.with_trust_store(store);
-		}
-		if let Some(identity) = &self.client_identity {
-			let cert = Arc::clone(&identity.certificate);
-			let key = Arc::clone(&identity.key);
-			configured = configured.with_client_identity(cert, key);
-		}
-		if let Some(chain) = &self.server_certificate_chain {
-			let chain = Arc::clone(chain);
-			configured = configured.with_server_certificate_chain(chain);
-		}
-		if let Some(kind) = self.handshake_protocol {
-			configured = configured.with_handshake_protocol(kind);
-		}
-		if let Some(approver) = &self.receipt_approver {
-			let approver = Arc::clone(approver);
-			configured = configured.with_receipt_approver(approver);
-		}
+	/// Everything one dial from this pool is built from.
+	///
+	/// Every pool dial passes here, so this is where the pool answers the
+	/// dialer rule. Cloning the provisioning bumps refcounts, so a dial copies
+	/// no certificate.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
+	///   authenticates no peer and did not name cleartext.
+	fn endpoint(&self, clock: &Arc<dyn Clock>) -> TransportResult<EndpointConfig<C>> {
+		let encryption = DialableEncryption::new(self.encryption.clone())?;
 
-		configured
+		Ok(EndpointConfig::new(encryption, Arc::clone(clock)))
 	}
 }
 
-/// Builder for creating a configured ConnectionPool
-pub struct ConnectionPoolBuilder<P: Protocol, C: CryptoProvider = DefaultCryptoProvider> {
+/// Builder for a configured [`ConnectionPool`].
+pub struct ConnectionPoolBuilder<P: Protocol> {
 	config: PoolConfig,
+	clock: Arc<dyn Clock>,
 	timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
-	tls: PoolTlsConfig<C>,
+	tls: PoolTlsConfig<P::CryptoProvider>,
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
-	_phantom: PhantomData<(P, C)>,
+	_phantom: PhantomData<P>,
 }
 
-impl<P: Protocol, C: CryptoProvider> Default for ConnectionPoolBuilder<P, C> {
-	fn default() -> Self {
+impl<P: Protocol> ConnectionPoolBuilder<P> {
+	/// A builder for a pool configured by `config` that measures idle time,
+	/// deadlines, and backoff against `clock`.
+	pub fn new(config: PoolConfig, clock: Arc<dyn Clock>) -> Self {
 		Self {
-			config: PoolConfig::default(),
+			config,
+			clock,
 			timeout: None,
 			#[cfg(feature = "x509")]
-			tls: PoolTlsConfig::default(),
+			tls: PoolTlsConfig::unconfigured(),
 			#[cfg(feature = "instrument")]
 			trace: None,
 			_phantom: PhantomData,
@@ -229,14 +212,42 @@ impl<P: Protocol, C: CryptoProvider> Default for ConnectionPoolBuilder<P, C> {
 	}
 }
 
-impl<P: Protocol, C: CryptoProvider> ConnectionPoolBuilder<P, C> {
+/// Available where the standard library's clocks work. A pool on
+/// `wasm32-unknown-unknown`, which has no [`SystemClock`], names the clock it
+/// reads through [`ConnectionPoolBuilder::new`].
+#[cfg(host_clock)]
+impl<P: Protocol> Default for ConnectionPoolBuilder<P> {
+	fn default() -> Self {
+		Self::new(PoolConfig::default(), Arc::new(SystemClock))
+	}
+}
+
+impl<P: Protocol> ConnectionPoolBuilder<P> {
+	/// Run this pool's connections without authenticating the peer.
+	///
+	/// Every dial carries the decision, so a pool with no trust store states it
+	/// once instead of each connection failing at its first write.
+	#[cfg(feature = "x509")]
+	pub fn allow_cleartext(mut self) -> Self {
+		self.tls.encryption.allow_cleartext = true;
+		self
+	}
+
+	/// Replace the pool configuration.
 	pub fn with_config(mut self, config: PoolConfig) -> Self {
 		self.config = config;
 		self
 	}
 
-	/// Production instrumentation collector: the single clientside
-	/// entrypoint. The pool emits its own lifecycle events and
+	/// Replace the clock idle time, deadlines, and backoff are measured
+	/// against.
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
+		self
+	}
+
+	/// Attach the production instrumentation collector, which is the single
+	/// client-side entry point. The pool emits its own lifecycle events and
 	/// propagates the collector to every dialed transport.
 	#[cfg(feature = "instrument")]
 	#[must_use]
@@ -260,21 +271,24 @@ impl<P: Protocol, C: CryptoProvider> ConnectionPoolBuilder<P, C> {
 		self
 	}
 
-	/// Receipt approver for every dialed transport: consulted before
-	/// countersigning at the handshake and each in-band epoch renewal.
-	/// Without one, pooled clients fail closed on challenge-bearing receipts.
-	#[cfg(feature = "x509")]
+	/// Install the receipt approver for every dialed transport.
+	///
+	/// A transport consults it before it countersigns at the handshake and at
+	/// each in-band epoch renewal. Without one, pooled clients fail closed on
+	/// challenge-bearing receipts.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub fn with_receipt_approver(mut self, approver: Arc<dyn ReceiptApprover>) -> Self {
 		self.tls.set_receipt_approver(approver);
 		self
 	}
 
-	/// Install a pre-shared client identity (zero extra cert materialization)
+	/// Install a pre-shared client identity that every dial shares without
+	/// another certificate copy.
 	#[cfg(feature = "x509")]
 	pub fn with_shared_client_identity(
 		mut self,
 		certificate: Arc<Certificate>,
-		key: Arc<HandshakeKeyManager<C>>,
+		key: Arc<HandshakeKeyManager<P::CryptoProvider>>,
 	) -> Self {
 		self.tls.set_shared_client_identity(certificate, key);
 		self
@@ -282,8 +296,8 @@ impl<P: Protocol, C: CryptoProvider> ConnectionPoolBuilder<P, C> {
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P> for ConnectionPoolBuilder<P, C> {
-	type Output = ConnectionPool<P, C>;
+impl<P: Protocol> ConnectionBuilder<P> for ConnectionPoolBuilder<P> {
+	type Output = ConnectionPool<P>;
 
 	fn with_timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = Some(timeout);
@@ -297,22 +311,16 @@ impl<P: Protocol, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P
 	}
 
 	#[cfg(feature = "x509")]
-	fn with_client_identity(
-		mut self,
-		cert: CertificateSpec,
-		key: Arc<dyn SigningKeyProvider>,
-	) -> TransportResult<Self> {
-		let cert_converted = Certificate::try_from(cert)?;
-		let key_converted: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
-
-		self.tls.set_client_identity(cert_converted, key_converted);
-		Ok(self)
+	fn with_client_identity(mut self, identity: ClientIdentity<P::CryptoProvider>) -> Self {
+		identity.install(&mut self.tls.encryption);
+		self
 	}
 
 	fn build(self) -> Self::Output {
 		ConnectionPool {
 			pools: Arc::new(RwLock::new(HashMap::new())),
 			config: self.config,
+			clock: self.clock,
 			timeout: self.timeout,
 			total_connections: Arc::new(AtomicUsize::new(0)),
 			#[cfg(pooled_mux)]
@@ -328,14 +336,44 @@ impl<P: Protocol, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P
 #[cfg(feature = "std")]
 struct AvailableEntry<P: Protocol> {
 	client: GenericClient<P>,
-	last_used: Instant,
+	last_used: MonotonicInstant,
+}
+
+pooled_mux! {
+	/// When a mux entry last carried traffic, read against the pool's clock.
+	///
+	/// The entry and every lease drawn from it share one stamp, so an emit
+	/// through any lease keeps the entry from idling out.
+	struct ActivityStamp {
+		at: Mutex<MonotonicInstant>,
+		clock: Arc<dyn Clock>,
+	}
+
+	impl ActivityStamp {
+		/// A stamp set to the clock's current instant.
+		fn new(clock: Arc<dyn Clock>) -> Self {
+			let at = Mutex::new(clock.monotonic());
+
+			Self { at, clock }
+		}
+
+		/// Record activity now.
+		fn touch(&self) {
+			*self.at.lock().unwrap_or_else(PoisonError::into_inner) = self.clock.monotonic();
+		}
+
+		/// The instant of the last recorded activity.
+		fn at(&self) -> MonotonicInstant {
+			*self.at.lock().unwrap_or_else(PoisonError::into_inner)
+		}
+	}
 }
 
 pooled_mux! {
 	/// One shared multiplexed connection to a destination.
 	///
-	/// The handle is cloneable, so entries are never leased exclusively and
-	/// leave the pool only through eviction.
+	/// The handle is cloneable, so every caller shares the entry, and the entry
+	/// leaves the pool only through eviction.
 	struct MuxEntry {
 		id: u64,
 		handle: MuxHandle,
@@ -345,10 +383,10 @@ pooled_mux! {
 		reader_task: rt::JoinHandle,
 		/// Shared activity stamp used by idle pruning for this mux entry.
 		///
-		/// The mux core does not read a clock. Each lease updates this stamp
+		/// The mux core reads no clock. Each lease updates this stamp
 		/// when emit starts, outside the pool lock. An entry with pending
 		/// streams stays active even if the stamp is old.
-		last_used: Arc<Mutex<Instant>>,
+		last_used: Arc<ActivityStamp>,
 		/// Validated peer certificate pinned at the eager mux handshake.
 		///
 		/// The mux drivers consume the transport, so the certificate is
@@ -358,12 +396,12 @@ pooled_mux! {
 	}
 }
 
-/// Per-destination connection pool
+/// Per-destination connection pool.
 #[cfg(feature = "std")]
 struct DestinationPool<P: Protocol> {
-	/// Available connections ready for reuse
+	/// Available connections ready for reuse.
 	available: VecDeque<AvailableEntry<P>>,
-	/// Shared multiplexed connections (never leased exclusively)
+	/// Shared multiplexed connections, which every caller shares.
 	#[cfg(pooled_mux)]
 	mux: Vec<MuxEntry>,
 }
@@ -379,36 +417,43 @@ impl<P: Protocol> Default for DestinationPool<P> {
 	}
 }
 
-/// Connection pool for protocol P with global connection limit
+/// Connection pool for protocol `P` with a global connection limit.
 ///
 /// # Invariants
+///
 /// - `total_connections` counts live connections and stays within
-///   `0..=config.max_connections`: +1 when a socket is created.
-/// - Idle connections exceeding `PoolConfig::idle_timeout` are pruned lazily
-/// - Lock poisoning never panics. Callers receive `TransportFailure::Internal` instead
+///   `0..=config.max_connections`. It gains 1 when a socket is created.
+/// - Idle connections past `PoolConfig::idle_timeout` are pruned lazily.
+/// - A poisoned pool map fails the acquiring call with
+///   `TransportFailure::Internal`, and eviction and the drop-time return skip
+///   their write. An activity stamp recovers from poison, because it holds
+///   one instant.
 #[cfg(feature = "std")]
-pub struct ConnectionPool<P: Protocol, C: CryptoProvider = DefaultCryptoProvider> {
-	/// Per-destination sub-pools
+pub struct ConnectionPool<P: Protocol> {
+	/// Per-destination sub-pools.
 	pools: Arc<RwLock<HashMap<P::Address, DestinationPool<P>>>>,
-	/// Pool configuration
+	/// Limits and multiplexing policy this pool enforces.
 	config: PoolConfig,
-	/// Shared timeout for all connections
+	/// Clock that idle time, deadlines, and backoff are measured against.
+	clock: Arc<dyn Clock>,
+	/// Shared timeout for all connections.
 	timeout: Option<Duration>,
-	/// Total connections across all destinations
+	/// Total live connections across all destinations.
 	total_connections: Arc<AtomicUsize>,
-	/// Monotonic IDs correlating mux pool entries with their leases
+	/// Monotonic IDs that correlate mux pool entries with their leases.
 	#[cfg(pooled_mux)]
 	mux_ids: AtomicU64,
-	/// Shared TLS assets reused across pooled connections
+	/// Shared TLS assets reused across pooled connections.
 	#[cfg(feature = "x509")]
-	tls: PoolTlsConfig<C>,
-	/// Production instrumentation collector (single clientside entrypoint)
+	tls: PoolTlsConfig<P::CryptoProvider>,
+	/// Production instrumentation collector, the single client-side entry
+	/// point.
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, C: CryptoProvider> ConnectionPool<P, C> {
+impl<P: Protocol> ConnectionPool<P> {
 	/// Decrement the live-connection count for a discarded connection,
 	/// saturating at zero so an accounting defect can never wrap the counter
 	/// and wedge the pool into permanent refusal.
@@ -418,9 +463,32 @@ impl<P: Protocol, C: CryptoProvider> ConnectionPool<P, C> {
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_sub(1));
 	}
 
-	/// Dual-write a pool lifecycle event: core kind URN into the
-	/// instrument log, plus the stable label for spec assertions and
-	/// CSP alphabets.
+	/// Everything one dial from this pool is built from: the shared
+	/// provisioning, the pool's clock, and its instrumentation collector.
+	///
+	/// The endpoint is built before the dial opens a socket, so a pool that
+	/// answers the dialer rule with a refusal never connects.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::PeerAuthenticationUnconfigured`] -- the pool
+	///   authenticates no peer and did not name cleartext.
+	#[cfg(feature = "x509")]
+	fn dial_endpoint(&self) -> TransportResult<EndpointConfig<P::CryptoProvider>> {
+		let endpoint = self.tls.endpoint(&self.clock)?;
+
+		#[cfg(feature = "instrument")]
+		let endpoint = match self.trace.as_ref() {
+			Some(trace) => endpoint.with_trace(trace.share()),
+			None => endpoint,
+		};
+
+		Ok(endpoint)
+	}
+
+	/// Write a pool lifecycle event twice: the core kind URN into the
+	/// instrument log, and the stable label for spec assertions and CSP
+	/// alphabets.
 	#[cfg(feature = "instrument")]
 	fn emit_event(&self, event: Urn<'static>) {
 		let Some(trace) = self.trace.as_ref() else {
@@ -432,17 +500,18 @@ impl<P: Protocol, C: CryptoProvider> ConnectionPool<P, C> {
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + Send + Sync, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, C>
+impl<P: Protocol + Send + Sync> ConnectionPool<P>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 	P::Transport: Send + Sync,
 {
-	/// Create a new connection pool builder
-	pub fn builder() -> ConnectionPoolBuilder<P, C> {
+	/// Create a new connection pool builder on the default clock.
+	#[cfg(host_clock)]
+	pub fn builder() -> ConnectionPoolBuilder<P> {
 		ConnectionPoolBuilder::default()
 	}
 
-	fn wrap_client(self: &Arc<Self>, client: GenericClient<P>, addr: P::Address) -> PooledClient<P, C>
+	fn wrap_client(self: &Arc<Self>, client: GenericClient<P>, addr: P::Address) -> PooledClient<P>
 	where
 		P: PersistentConnection,
 	{
@@ -463,25 +532,13 @@ where
 			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))
 	}
 
-	#[cfg(not(feature = "x509"))]
-	fn apply_timeout_to_builder<B>(&self, builder: B) -> B
-	where
-		B: ConnectionBuilder<P>,
-	{
-		if let Some(timeout) = self.timeout {
-			builder.with_timeout(timeout)
-		} else {
-			builder
-		}
-	}
-
 	fn try_take_ready_client(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<GenericClient<P>>>
 	where
 		P: PersistentConnection,
 	{
 		let mut pools = self.write_pools()?;
 		if let Some(dest_pool) = pools.get_mut(addr) {
-			self.prune_idle_locked(dest_pool, Instant::now());
+			self.prune_idle_locked(dest_pool, self.clock.monotonic());
 
 			while let Some(entry) = dest_pool.available.pop_front() {
 				if <P as PersistentConnection>::is_connected(entry.client.transport()) {
@@ -491,7 +548,8 @@ where
 					return Ok(Some(entry.client));
 				}
 
-				// Dead candidate is discarded here, so it leaves the live set.
+				// A dead candidate is discarded here, so it leaves the live
+				// set.
 				self.release_connection_count();
 
 				#[cfg(feature = "instrument")]
@@ -501,9 +559,9 @@ where
 		Ok(None)
 	}
 
-	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, C>> {
-		// Single atomic check-and-increment so concurrent callers cannot all
-		// pass a separate limit check and overshoot max_connections.
+	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P>> {
+		// One atomic check-and-increment means concurrent callers cannot all
+		// pass a separate limit check and overshoot `max_connections`.
 		let reserved = self
 			.total_connections
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -520,7 +578,7 @@ where
 			return Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted));
 		}
 
-		// A poisoned pool map must not leak the reservation: give the
+		// A poisoned pool map must not leak the reservation, so give the
 		// counter back before surfacing the failure.
 		let mut pools = match self.write_pools() {
 			Ok(pools) => pools,
@@ -531,20 +589,21 @@ where
 		};
 
 		let dest_pool = pools.entry(addr.clone()).or_default();
-		self.prune_idle_locked(dest_pool, Instant::now());
+		self.prune_idle_locked(dest_pool, self.clock.monotonic());
 
 		Ok(SlotGuard::new(Arc::clone(self)))
 	}
 
-	fn prune_idle_locked(&self, dest_pool: &mut DestinationPool<P>, now: Instant) {
+	fn prune_idle_locked(&self, dest_pool: &mut DestinationPool<P>, now: MonotonicInstant) {
 		let Some(timeout) = self.config.idle_timeout else {
 			return;
 		};
 
 		while let Some(entry) = dest_pool.available.front() {
-			if now.duration_since(entry.last_used) >= timeout {
+			if now.saturating_duration_since(entry.last_used) >= timeout {
 				dest_pool.available.pop_front();
-				// Pruned idle connection is closed, so it leaves the live set.
+				// A pruned idle connection is closed, so it leaves the live
+				// set.
 				self.release_connection_count();
 
 				#[cfg(feature = "instrument")]
@@ -554,29 +613,27 @@ where
 			}
 		}
 
-		// Shared mux entries are stamped by their leases at emit time
-		// (emits bypass the pool lock), so the pruner only reads. An
-		// in-flight stream pins the entry as active no matter how old
-		// the stamp is.
+		// The pruner only reads the stamp that leases write at emit time,
+		// outside the pool lock (see `MuxEntry::last_used`).
 		#[cfg(pooled_mux)]
 		dest_pool.mux.retain(|entry| {
 			if entry.handle.has_pending_streams() {
 				return true;
 			}
 
-			let last_used = *entry.last_used.lock().unwrap_or_else(PoisonError::into_inner);
-			let expired = now.duration_since(last_used) >= timeout;
+			let last_used = entry.last_used.at();
+			let expired = now.saturating_duration_since(last_used) >= timeout;
 			if expired {
-				// GoAway before close (RFC 9113 § 6.8): the reader task
-				// ends on the resulting EOF. A stream racing this drain
-				// observes `Draining`, which the lease lifecycle already
-				// maps to eviction.
+				// Send GoAway before close (RFC 9113 § 6.8), so the reader
+				// task ends on the resulting EOF. A stream that races this
+				// drain observes `Draining`, which the lease lifecycle maps
+				// to eviction.
 				let handle = entry.handle.clone();
 				rt::spawn(async move {
 					let _ = handle.shutdown().await;
 				});
 
-				// Pruned idle connection leaves the live set.
+				// A pruned idle connection leaves the live set.
 				self.release_connection_count();
 				#[cfg(feature = "instrument")]
 				self.emit_event(events::POOL_PRUNED_IDLE);
@@ -586,52 +643,24 @@ where
 		});
 	}
 
-	#[cfg(not(feature = "x509"))]
-	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
+	/// Lease a ready connection or open a fresh one, held exclusively.
+	#[cfg(feature = "x509")]
+	async fn connect_single_flight(self: &Arc<Self>, addr: &P::Address) -> TransportResult<PooledClient<P>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport: MessageEmitter + MessageCollector + PolicyConfig + Send + Sync,
-	{
-		if let Some(client) = self.try_take_ready_client(&addr)? {
-			return Ok(self.wrap_client(client, addr));
-		}
-
-		let mut reservation = self.reserve_slot(&addr)?;
-		let builder = self.apply_timeout_to_builder(ClientBuilder::<P, C>::builder());
-		let builder = ConnectionBuilder::build(builder);
-		let client = builder.connect(addr.clone()).await?;
-
-		#[cfg(feature = "instrument")]
-		self.emit_event(events::POOL_DIAL);
-
-		reservation.disarm();
-
-		Ok(self.wrap_client(client, addr))
-	}
-
-	/// Lease a ready connection or open a fresh one, held exclusively.
-	#[cfg(feature = "x509")]
-	async fn connect_single_flight(self: &Arc<Self>, addr: &P::Address) -> TransportResult<PooledClient<P, C>>
-	where
-		P: PersistentConnection + Send + Sync,
-		P::Transport:
-			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
 		if let Some(client) = self.try_take_ready_client(addr)? {
 			return Ok(self.wrap_client(client, addr.clone()));
 		}
 
+		let endpoint = self.dial_endpoint()?;
 		let mut reservation = self.reserve_slot(addr)?;
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 
-		let mut transport = self.tls.apply::<P>(P::create_transport(stream));
+		let mut transport = P::create_transport(stream, endpoint);
 		if let Some(timeout) = self.timeout {
 			transport = transport.with_timeout(timeout);
-		}
-
-		#[cfg(feature = "instrument")]
-		if let Some(trace) = self.trace.as_ref() {
-			transport = transport.with_trace(trace.share());
 		}
 
 		#[cfg(feature = "instrument")]
@@ -644,6 +673,7 @@ where
 		Ok(self.wrap_client(client, addr.clone()))
 	}
 
+	/// Connect to a destination and hold the connection exclusively.
 	#[cfg(all(
 		feature = "x509",
 		not(all(
@@ -653,16 +683,18 @@ where
 			any(feature = "transport-cms", feature = "transport-ecies")
 		))
 	))]
-	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
+	pub async fn connect(self: &Arc<Self>, addr: impl Into<P::Address>) -> TransportResult<PooledClient<P>>
 	where
 		P: PersistentConnection + Send + Sync,
-		P::Transport:
-			MessageEmitter + MessageCollector + PolicyConfig + X509ClientConfig<CryptoProvider = C> + Send + Sync,
+		P::Transport: MessageEmitter + MessageCollector + PolicyConfig + Send + Sync,
 	{
-		self.connect_single_flight(&addr).await
+		let destination = addr.into();
+		self.connect_single_flight(&destination).await
 	}
 
-	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, C>>>
+	/// Lease a ready pooled connection to `addr` without dialing, or return
+	/// `None` when none is ready.
+	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P>>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport: MessageEmitter + MessageCollector + PolicyConfig + Send + Sync,
@@ -672,25 +704,14 @@ where
 	}
 }
 
-// Separate impl with tighter bounds for non-x509 features
-#[cfg(feature = "std")]
-#[cfg(not(feature = "x509"))]
-impl<P: Protocol + Send + Sync, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, C>
-where
-	P::Address: Hash + Eq + Clone + Send + Sync,
-	P::Transport: Send + Sync,
-{
-}
-
 pooled_mux! {
-	impl<P: Protocol + Send + Sync, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, C>
+	impl<P: Protocol + Send + Sync> ConnectionPool<P>
 	where
 		P: PersistentConnection,
 		P::Address: Hash + Eq + Clone + Send + Sync,
 		P::Transport: MessageEmitter
 			+ MessageCollector
 			+ PolicyConfig
-			+ X509ClientConfig<CryptoProvider = C>
 			+ MuxConnector
 			+ Send
 			+ Sync,
@@ -699,29 +720,31 @@ pooled_mux! {
 		/// [`PoolConfig::mux_offer`] is set and the peer accepts.
 		pub async fn connect(
 			self: &Arc<Self>,
-			addr: impl core::borrow::Borrow<P::Address>,
-		) -> TransportResult<PooledClient<P, C>>
+			addr: impl Into<P::Address>,
+		) -> TransportResult<PooledClient<P>>
 		where
 			P::Address: Clone,
 		{
-			let addr = addr.borrow();
+			let destination = addr.into();
 			if self.config.mux_offer.is_none() {
-				return self.connect_single_flight(addr).await;
+				return self.connect_single_flight(&destination).await;
 			}
 
-			self.acquire_mux(addr, MuxSelection::PreferHeadroom).await
+			self.acquire_mux(&destination, MuxSelection::PreferHeadroom).await
 		}
 
-		/// Acquire a mux lease through the reuse tiers, in order.
+		/// Acquire a mux lease through the reuse tiers, in order:
 		///
-		/// Tries a pooled mux entry first. Next tries an idle exclusive lease
-		/// left when a peer declined multiplexing. Finally opens a fresh dial.
-		/// All mux-offering callers share this path so no tier is skipped.
+		/// 1. A pooled mux entry.
+		/// 2. An idle exclusive lease left when a peer declined multiplexing.
+		/// 3. A fresh dial.
+		///
+		/// Every mux-offering caller shares this path, so no tier is skipped.
 		async fn acquire_mux(
 			self: &Arc<Self>,
 			addr: &P::Address,
 			selection: MuxSelection,
-		) -> TransportResult<PooledClient<P, C>> {
+		) -> TransportResult<PooledClient<P>> {
 			if let Some(lease) = self.try_take_mux_handle(addr, selection)? {
 				return Ok(self.wrap_mux_client(lease, addr.clone()));
 			}
@@ -731,7 +754,7 @@ pooled_mux! {
 			}
 
 			let offer = match &self.config.mux_offer {
-				// One shared PoolConfig offer for every dial.
+				// Every dial shares the one `PoolConfig` offer.
 				Some(offer) => Arc::clone(offer),
 				None => {
 					return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
@@ -747,18 +770,14 @@ pooled_mux! {
 			self: &Arc<Self>,
 			addr: P::Address,
 			offer: Arc<TransportOffer>,
-		) -> TransportResult<PooledClient<P, C>> {
+		) -> TransportResult<PooledClient<P>> {
+			let endpoint = self.dial_endpoint()?;
 			let mut reservation = self.reserve_slot(&addr)?;
 
 			let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
-			let mut transport = self.tls.apply::<P>(P::create_transport(stream));
+			let mut transport = P::create_transport(stream, endpoint);
 			if let Some(timeout) = self.timeout {
 				transport = transport.with_timeout(timeout);
-			}
-
-			#[cfg(feature = "instrument")]
-			if let Some(trace) = self.trace.as_ref() {
-				transport = transport.with_trace(trace.share());
 			}
 
 			// Mux requires the negotiation result before first use, so the
@@ -772,8 +791,8 @@ pooled_mux! {
 			let settings = match transport.negotiated_mux() {
 				Some(settings) => settings,
 				None => {
-					// Peer declined the mux offer: the connection pools as
-					// an exclusive lease instead.
+					// The peer declined the mux offer, so the connection
+					// pools as an exclusive lease instead.
 					#[cfg(feature = "instrument")]
 					self.emit_event(events::POOL_MUX_DECLINED);
 
@@ -793,16 +812,16 @@ pooled_mux! {
 			let (reader, writer) = transport.into_envelope_halves()?;
 			let (handle, responder, reader_task) = drive_mux(reader, writer, MuxRole::Client, settings, None, rekey);
 
-			// Pool endpoints never serve peer-initiated streams: dropping
-			// the responder auto-refuses them.
+			// Pool endpoints serve no peer-initiated streams, so dropping the
+			// responder refuses them.
 			drop(responder);
 
 			let id = self.mux_ids.fetch_add(1, Ordering::Relaxed);
-			let last_used = Arc::new(Mutex::new(Instant::now()));
+			let last_used = Arc::new(ActivityStamp::new(Arc::clone(&self.clock)));
 
 			{
-				// A failed lock must not leak the spawned drivers: aborting
-				// the reader closes the connection and ends the writer.
+				// A failed lock must not leak the spawned drivers, so abort the
+				// reader, which closes the connection and ends the writer.
 				let mut pools = match self.write_pools() {
 					Ok(pools) => pools,
 					Err(err) => {
@@ -811,9 +830,9 @@ pooled_mux! {
 					}
 				};
 
+				// The handle clone is a refcount bump, so the pool entry and
+				// the lease co-own the connection.
 				let dest_pool = pools.entry(addr.clone()).or_default();
-
-				// Handle clone is a refcount bump: pool entry and lease co-own the connection.
 				dest_pool.mux.push(MuxEntry {
 					id,
 					handle: handle.clone(),
@@ -829,9 +848,10 @@ pooled_mux! {
 			Ok(self.wrap_mux_client(lease, addr))
 		}
 
-		/// Round-robin a live mux entry for the destination: prunes idle
-		/// entries, evicts those whose reader driver already ended, and
-		/// prefers entries with stream headroom over saturated ones.
+		/// Round-robin a live mux entry for the destination.
+		///
+		/// It prunes idle entries, evicts entries whose reader driver ended,
+		/// and prefers entries with stream headroom over saturated ones.
 		fn try_take_mux_handle(
 			self: &Arc<Self>,
 			addr: &P::Address,
@@ -843,12 +863,12 @@ pooled_mux! {
 				None => return Ok(None),
 			};
 
-			self.prune_idle_locked(dest_pool, Instant::now());
+			self.prune_idle_locked(dest_pool, self.clock.monotonic());
 
 			dest_pool.mux.retain(|entry| {
 				let alive = !entry.reader_task.is_finished();
 				if !alive {
-					// Dead mux connection is discarded here, so it leaves
+					// A dead mux connection is discarded here, so it leaves
 					// the live set.
 					self.release_connection_count();
 
@@ -864,15 +884,16 @@ pooled_mux! {
 
 			let with_headroom = dest_pool.mux.iter().find(|entry| entry.handle.has_stream_headroom());
 			let fallback = match selection {
-				// A saturated entry stays shareable: an in-flight stream
-				// may finish before the caller emits.
+				// A saturated entry stays shareable, because an in-flight
+				// stream may finish before the caller emits.
 				MuxSelection::PreferHeadroom => dest_pool.mux.first(),
 				// Cap-exhaustion failover must not land back on a
 				// saturated entry, so it falls through to a fresh dial.
 				MuxSelection::RequireHeadroom => None,
 			};
 
-			// Handle clone is a refcount bump: the entry stays pooled for other callers.
+			// The handle clone is a refcount bump, so the entry stays pooled
+			// for other callers.
 			let selected = with_headroom.or(fallback).map(MuxLease::from);
 
 			#[cfg(feature = "instrument")]
@@ -884,7 +905,8 @@ pooled_mux! {
 		}
 
 		/// Remove a mux entry after a terminal failure (`ConnectionClosed`
-		/// or rekey `Draining`). The next connect re-establishes.
+		/// or rekey `Draining`). The next connect re-establishes the
+		/// connection, and a poisoned pool map skips the eviction.
 		fn evict_mux(&self, addr: &P::Address, id: u64) {
 			let mut pools = match self.pools.write() {
 				Ok(pools) => pools,
@@ -896,7 +918,7 @@ pooled_mux! {
 				dest_pool.mux.retain(|entry| entry.id != id);
 
 				if dest_pool.mux.len() < live_before {
-					// Evicted mux connection leaves the live set.
+					// An evicted mux connection leaves the live set.
 					self.release_connection_count();
 
 					#[cfg(feature = "instrument")]
@@ -905,13 +927,11 @@ pooled_mux! {
 			}
 		}
 
-		fn wrap_mux_client(self: &Arc<Self>, lease: MuxLease, addr: P::Address) -> PooledClient<P, C> {
-			let pool = Arc::clone(self);
-
+		fn wrap_mux_client(self: &Arc<Self>, lease: MuxLease, addr: P::Address) -> PooledClient<P> {
 			PooledClient {
 				client: None,
 				mux: Some(lease),
-				pool,
+				pool: Arc::clone(self),
 				addr,
 			}
 		}
@@ -921,21 +941,20 @@ pooled_mux! {
 	struct MuxLease {
 		id: u64,
 		handle: MuxHandle,
-		/// Shared with the pool entry: the lease stamps it on each emit
-		/// so the pruner can read idle time without a clock in the mux
-		/// core (see [`MuxEntry::last_used`]).
-		last_used: Arc<Mutex<Instant>>,
-		/// Shared handle to the entry's pinned peer certificate
-		/// (see [`MuxEntry::peer_certificate`]).
+		/// Stamp shared with the pool entry. The lease stamps it on each emit,
+		/// so the pruner can read idle time without a clock in the mux core
+		/// (see [`MuxEntry::last_used`]).
+		last_used: Arc<ActivityStamp>,
+		/// Shared handle to the entry's pinned peer certificate (see
+		/// [`MuxEntry::peer_certificate`]).
 		peer_certificate: Option<Arc<Certificate>>,
 	}
 
 	impl MuxLease {
-		/// Record activity for the pruner. Stamped at emit start: the
-		/// stream itself is covered by `has_pending_streams` while in
-		/// flight.
+		/// Record activity for the pruner at emit start. While the stream is
+		/// in flight, `has_pending_streams` covers it.
 		fn stamp(&self) {
-			*self.last_used.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+			self.last_used.touch();
 		}
 	}
 
@@ -953,45 +972,46 @@ pooled_mux! {
 	/// Mux entry selection policy for the acquisition funnel.
 	#[derive(Clone, Copy)]
 	enum MuxSelection {
-		/// Prefer an entry with stream headroom, fall back to a saturated
-		/// one (a slot may free before the caller emits)
+		/// Prefer an entry with stream headroom, and fall back to a saturated
+		/// one, because a slot may free before the caller emits.
 		PreferHeadroom,
-		/// Only an entry with stream headroom, `None` otherwise
+		/// Take only an entry with stream headroom, or `None`.
 		RequireHeadroom,
 	}
 }
 
-/// A pooled client connection that returns to the pool on drop
+/// A pooled client connection that returns to the pool on drop.
 ///
 /// Exclusive leases hold the connection alone. Multiplexed leases share
 /// one connection with every other caller and return nothing on drop.
 #[cfg(feature = "std")]
-pub struct PooledClient<P: Protocol + PersistentConnection, C: CryptoProvider = DefaultCryptoProvider>
+pub struct PooledClient<P: Protocol + PersistentConnection>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
 	client: Option<GenericClient<P>>,
 	#[cfg(pooled_mux)]
 	mux: Option<MuxLease>,
-	pool: Arc<ConnectionPool<P, C>>,
+	pool: Arc<ConnectionPool<P>>,
 	addr: P::Address,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + PersistentConnection, C: CryptoProvider> PooledClient<P, C>
+impl<P: Protocol + PersistentConnection> PooledClient<P>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
-	/// Returns a mutable reference to the underlying connection
+	/// Returns a mutable reference to the underlying connection.
 	///
 	/// # Errors
-	/// - `InvalidState`: multiplexed lease. There is no exclusive
-	///   connection to hand out. Use [`PooledClient::emit`]
+	///
+	/// - [`TransportError::InvalidState`] -- the lease is multiplexed and holds
+	///   no exclusive connection. Use [`PooledClient::emit`] instead.
 	pub fn conn(&mut self) -> TransportResult<&mut GenericClient<P>> {
 		self.client.as_mut().ok_or(TransportError::InvalidState)
 	}
 
-	/// Validated TLS peer certificate pinned by this connection's handshake
+	/// Validated TLS peer certificate pinned by this connection's handshake.
 	///
 	/// A mux lease answers from the certificate pinned at its eager dial
 	/// handshake. An exclusive lease reads its transport, so the answer
@@ -1009,7 +1029,7 @@ where
 			return lease.peer_certificate.as_deref();
 		}
 
-		self.client.as_ref()?.transport().to_peer_certificate_ref()
+		self.client.as_ref()?.transport().session_state().peer_certificate()
 	}
 }
 
@@ -1023,7 +1043,7 @@ where
 		any(feature = "transport-cms", feature = "transport-ecies")
 	))
 ))]
-impl<P: Protocol + PersistentConnection, C: CryptoProvider> PooledClient<P, C>
+impl<P: Protocol + PersistentConnection> PooledClient<P>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
@@ -1037,42 +1057,41 @@ where
 }
 
 pooled_mux! {
-	impl<P: Protocol + PersistentConnection + Send + Sync, C: CryptoProvider + Send + Sync + 'static> PooledClient<P, C>
+	impl<P: Protocol + PersistentConnection + Send + Sync> PooledClient<P>
 	where
 		P::Address: Hash + Eq + Clone + Send + Sync,
 		P::Transport: MessageEmitter
 			+ MessageCollector
 			+ PolicyConfig
-			+ X509ClientConfig<CryptoProvider = C>
 			+ MuxConnector
 			+ Send
 			+ Sync,
 	{
-		/// Current epoch's dual-signed session receipt on a multiplexed
-		/// lease, shared per connection across every lease and rotated
-		/// in place by each completed in-band renewal. `None` on
-		/// exclusive leases and on sessions without receipt-bearing
-		/// rekey materials.
+		/// Current epoch's dual-signed session receipt on a multiplexed lease.
+		///
+		/// Every lease on the connection shares it, and each completed in-band
+		/// renewal rotates it in place. It is `None` on an exclusive lease and
+		/// on a session without receipt-bearing rekey materials.
 		pub fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
 			self.mux.as_ref().and_then(|lease| lease.handle.session_receipt())
 		}
 
-		/// Emit a message through the pooled connection: a stream on the
-		/// shared mux connection, or the exclusive lease.
+		/// Emit a message through the pooled connection, as a stream on the
+		/// shared mux connection or on the exclusive lease.
 		///
-		/// Mux lifecycle handling:
-		/// - `StreamsExhausted` (local stream cap full): moves to a pooled
-		///   connection with stream headroom, or an additional one up to
-		///   `max_connections`, and retries there once
-		/// - `ConnectionClosed` / `Draining` (rekey GoAway): evicts the entry
-		///   so the next connect re-establishes, then reports the failure
+		/// The mux lifecycle is handled per failure:
+		///
+		/// - `StreamsExhausted` (local stream cap full) moves the lease to a
+		///   pooled connection with stream headroom, or an additional one up to
+		///   `max_connections`, and retries there once.
+		/// - `ConnectionClosed` or `Draining` (rekey GoAway) evicts the entry
+		///   so the next connect re-establishes it, then reports the failure.
 		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-			// Handle clone is a refcount bump, releasing the `self.mux` borrow
-			// before the failover arm takes `&mut self`.
+			// The handle clone is a refcount bump that releases the `self.mux`
+			// borrow before the failover arm takes `&mut self`.
 			let (lease_id, handle) = match self.mux.as_ref() {
 				Some(lease) => {
 					lease.stamp();
-
 					(lease.id, lease.handle.clone())
 				}
 				None => return self.conn()?.emit(frame, attempt).await,
@@ -1098,8 +1117,7 @@ pooled_mux! {
 		/// is populated.
 		///
 		/// - A mux lease already handshook eagerly at dial, so it returns at once.
-		/// - A single-flight lease defers its handshake to the first
-		///   [`emit`](Self::emit).
+		/// - A single-flight lease defers its handshake to the first [`emit`](Self::emit).
 		#[cfg(feature = "colony")]
 		pub(crate) async fn complete_handshake(&mut self) -> TransportResult<()> {
 			if self.mux.is_some() {
@@ -1109,46 +1127,59 @@ pooled_mux! {
 			self.conn()?.complete_handshake().await
 		}
 
-		/// Open a streamed request on the shared mux connection: push
-		/// chunks through the sink, then await the unary response.
+		/// This lease's mux handle, with its activity recorded.
+		///
+		/// Every streaming entry point below needs the same two steps: refuse
+		/// an exclusive lease, then stamp the entry so the pruner counts the
+		/// lease as active.
+		///
+		/// # Errors
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
+		fn stamped_handle(&self) -> TransportResult<&MuxHandle> {
+			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
+			lease.stamp();
+			Ok(&lease.handle)
+		}
+
+		/// Open a streamed request on the shared mux connection. The caller
+		/// pushes chunks through the sink, then awaits the unary response.
 		///
 		/// The stream counts as pending on the connection, so the pruner
 		/// keeps the entry alive while it is in flight.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		pub fn open_stream(
 			&self,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_stream()
+			self.stamped_handle()?.open_stream()
 		}
 
-		/// Open a streamed request routed to `target`: the peer gateway
-		/// reads the grpc-style route to dispatch locally or splice the
-		/// stream to a further peer.
+		/// Open a streamed request routed to `target`. The peer gateway reads
+		/// the grpc-style route to dispatch locally or to splice the stream to
+		/// a further peer.
 		///
 		/// Otherwise identical to [`open_stream`](Self::open_stream).
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		pub fn open_stream_to(
 			&self,
 			target: impl Into<Urn<'static>>,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_stream_to(target)
+			self.stamped_handle()?.open_stream_to(target)
 		}
 
 		/// Open a streamed request carrying a fully-formed [`StreamRoute`].
 		///
-		/// Use cases:
-		/// - [`StreamRoute::to`] for an origin open
-		/// - [`StreamRoute::relayed_to`] when re-emitting a spent hop budget
+		/// - [`StreamRoute::to`] builds the route for an origin open.
+		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
 		///
 		/// Prefer [`open_stream_to`](Self::open_stream_to) when the
 		/// route is a plain origin target. Otherwise identical to
@@ -1156,51 +1187,47 @@ pooled_mux! {
 		/// pass a fully formed route when the origin helpers are not enough.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_stream_with_route(
 			&self,
 			route: StreamRoute,
 		) -> TransportResult<(RequestSink, impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_stream_with_route(route)
+			self.stamped_handle()?.open_stream_with_route(route)
 		}
 
-		/// Open a duplex stream on the shared mux connection: push request
-		/// chunks through the sink while the peer's reply arrives
+		/// Open a duplex stream on the shared mux connection. The caller pushes
+		/// request chunks through the sink while the peer's reply arrives
 		/// incrementally through the body.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		pub fn open_duplex(&self) -> TransportResult<(RequestSink, StreamBody)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_duplex()
+			self.stamped_handle()?.open_duplex()
 		}
 
-		/// Open a duplex stream routed to `target`: the peer gateway
-		/// reads the grpc-style route to dispatch locally or splice
-		/// both directions to a further peer.
+		/// Open a duplex stream routed to `target`. The peer gateway reads the
+		/// grpc-style route to dispatch locally or to splice both directions to
+		/// a further peer.
 		///
 		/// Otherwise identical to [`open_duplex`](Self::open_duplex).
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		pub fn open_duplex_to(&self, target: impl Into<Urn<'static>>) -> TransportResult<(RequestSink, StreamBody)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_duplex_to(target)
+			self.stamped_handle()?.open_duplex_to(target)
 		}
 
 		/// Open a duplex stream carrying a fully-formed [`StreamRoute`].
 		///
-		/// Use cases:
-		/// - [`StreamRoute::to`] for an origin open
-		/// - [`StreamRoute::relayed_to`] when re-emitting a spent hop budget
+		/// - [`StreamRoute::to`] builds the route for an origin open.
+		/// - [`StreamRoute::relayed_to`] builds the route that re-emits a spent hop budget.
 		///
 		/// Prefer [`open_duplex_to`](Self::open_duplex_to) when the
 		/// route is a plain origin target. Otherwise identical to
@@ -1208,20 +1235,19 @@ pooled_mux! {
 		/// pass a fully formed route when the origin helpers are not enough.
 		///
 		/// # Errors
-		/// - `InvalidState`: exclusive lease - streaming needs the mux plane
+		///
+		/// - [`TransportError::InvalidState`] -- the lease is exclusive, and
+		///   streaming needs the mux plane.
 		#[cfg(feature = "colony")]
 		pub(crate) fn open_duplex_with_route(&self, route: StreamRoute) -> TransportResult<(RequestSink, StreamBody)> {
-			let lease = self.mux.as_ref().ok_or(TransportError::InvalidState)?;
-			lease.stamp();
-
-			lease.handle.open_duplex_with_route(route)
+			self.stamped_handle()?.open_duplex_with_route(route)
 		}
 
-		/// Cap-exhaustion failover: move the lease through the acquisition
-		/// funnel (pooled headroom before a fresh dial) and retry there once.
+		/// Fail over on cap exhaustion. The lease moves through the acquisition
+		/// funnel, pooled headroom before a fresh dial, and retries there once.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 			if self.pool.config.mux_offer.is_none() {
-				// A mux lease exists only when an offer is configured
+				// A mux lease exists only when an offer is configured.
 				return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
 			}
 
@@ -1245,7 +1271,7 @@ pooled_mux! {
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + PersistentConnection, C: CryptoProvider> Drop for PooledClient<P, C>
+impl<P: Protocol + PersistentConnection> Drop for PooledClient<P>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
@@ -1266,7 +1292,7 @@ where
 				if is_healthy {
 					dest_pool
 						.available
-						.push_back(AvailableEntry { client, last_used: Instant::now() });
+						.push_back(AvailableEntry { client, last_used: self.pool.clock.monotonic() });
 
 					returned_to_pool = true;
 				}
@@ -1282,20 +1308,20 @@ where
 }
 
 #[cfg(feature = "std")]
-struct SlotGuard<P: Protocol, C: CryptoProvider = DefaultCryptoProvider>
+struct SlotGuard<P: Protocol>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {
-	pool: Arc<ConnectionPool<P, C>>,
+	pool: Arc<ConnectionPool<P>>,
 	active: bool,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, C: CryptoProvider> SlotGuard<P, C>
+impl<P: Protocol> SlotGuard<P>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {
-	fn new(pool: Arc<ConnectionPool<P, C>>) -> Self {
+	fn new(pool: Arc<ConnectionPool<P>>) -> Self {
 		Self { pool, active: true }
 	}
 
@@ -1305,7 +1331,7 @@ where
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, C: CryptoProvider> Drop for SlotGuard<P, C>
+impl<P: Protocol> Drop for SlotGuard<P>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {
@@ -1314,7 +1340,8 @@ where
 			return;
 		}
 
-		// The reserved connection never materialized, so it leaves the live set.
+		// The reserved connection never materialized, so it leaves the live
+		// set.
 		self.pool.release_connection_count();
 	}
 }

@@ -1,22 +1,5 @@
-error[E0277]: the trait bound `Aes128Message: CheckAeadOid<Aes256GcmOid>` is not satisfied
-  --> tests/compile/algorithm_mismatch.rs:44:4
+error[E0271]: type mismatch resolving `<AesGcm<Aes256, UInt<UInt<UInt<UInt<UTerm, B1>, B1>, B0>, B0>> as AeadAlgorithm>::Oid == Aes128GcmOid`
+  --> tests/compile/algorithm_mismatch.rs:42:4
    |
-44 |         .with_aead::<Aes256GcmOid, Aes256Gcm>(cipher);
-   |          ^^^^^^^^^ unsatisfied trait bound
-   |
-help: the trait `CheckAeadOid<Aes256GcmOid>` is not implemented for `Aes128Message`
-      but trait `CheckAeadOid<Aes128GcmOid>` is implemented for it
-  --> tests/compile/algorithm_mismatch.rs:26:10
-   |
-26 | #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
-   |          ^^^^^^^^
-   = help: for that trait implementation, expected `Aes128GcmOid`, found `Aes256GcmOid`
-note: required by a bound in `FrameBuilder::<T>::with_aead`
-  --> src/builder/frame.rs
-   |
-   |     pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
-   |            --------- required by a bound in this associated function
-...
-   |         T: CheckAeadOid<C>,
-   |            ^^^^^^^^^^^^^^^ required by this bound in `FrameBuilder::<T>::with_aead`
-   = note: this error originates in the derive macro `Beamable` (in Nightly builds, run with -Z macro-backtrace for more info)
+42 |         .with_aead(cipher);
+   |          ^^^^^^^^^ expected `Aes128GcmOid`, found `Aes256GcmOid`

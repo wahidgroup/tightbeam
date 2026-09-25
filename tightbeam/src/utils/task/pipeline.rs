@@ -5,8 +5,6 @@
 //! familiar Result methods.
 
 #[cfg(any(test, feature = "testing"))]
-use std::borrow::Cow;
-#[cfg(any(test, feature = "testing"))]
 use std::sync::Arc;
 
 #[cfg(any(test, feature = "testing"))]
@@ -121,7 +119,8 @@ where
 /// - `my_crate::ValidateConfig::run` -> `validate_config`
 /// - `CreateHandshakeRequest` -> `create_handshake_request` (fallback)
 #[cfg(any(test, feature = "testing"))]
-fn to_snake_case(type_name: &str) -> String {
+fn to_snake_case(type_name: impl AsRef<str>) -> String {
+	let type_name = type_name.as_ref();
 	// Split by "::" and collect segments
 	let segments: Vec<&str> = type_name.split("::").collect();
 	// For Job::run paths, the struct name is second-to-last (before "run")
@@ -154,11 +153,14 @@ fn to_snake_case(type_name: &str) -> String {
 ///
 /// Format: `urn:tightbeam:event:job/<job-name>-<suffix>`
 #[cfg(any(test, feature = "testing"))]
-fn make_event_urn(job_name: &str, suffix: &str) -> Urn<'static> {
-	Urn {
-		nid: Cow::Borrowed("tightbeam"),
-		nss: Cow::Owned(format!("event:job/{}-{}", job_name.replace('_', "-"), suffix)),
-	}
+fn make_event_urn(
+	job_name: &(impl AsRef<str> + ?Sized),
+	suffix: &(impl AsRef<str> + ?Sized),
+) -> Result<Urn<'static>, crate::TightBeamError> {
+	let job_name = job_name.as_ref();
+	let suffix = suffix.as_ref();
+	let nss = format!("event:job/{}-{}", job_name.replace('_', "-"), suffix);
+	Ok(Urn::from_parts("tightbeam", nss)?)
 }
 
 /// Result with trace context for auto-trace events
@@ -201,7 +203,11 @@ where
 		TracedResult {
 			result: self.result.and_then(|val| {
 				// Auto-emit: urn:tightbeam:instrumentation:event/<job_name>_start
-				if let Err(e) = self.trace.event(make_event_urn(&job_name, "start")) {
+				let event_urn = match make_event_urn(&job_name, "start") {
+					Ok(urn) => urn,
+					Err(e) => return Err(E::from(e)),
+				};
+				if let Err(e) = self.trace.event(event_urn) {
 					return Err(E::from(e));
 				}
 
@@ -209,12 +215,22 @@ where
 				let res = f(val);
 				match &res {
 					Ok(_) => {
-						if let Err(e) = self.trace.event(make_event_urn(&job_name, "success")) {
+						let event_urn = match make_event_urn(&job_name, "success") {
+							Ok(urn) => urn,
+							Err(e) => return Err(E::from(e)),
+						};
+						if let Err(e) = self.trace.event(event_urn) {
 							return Err(E::from(e));
 						}
 					}
 					Err(_) => {
-						let _ = self.trace.event(make_event_urn(&job_name, "error"));
+						let event_urn = match make_event_urn(&job_name, "error") {
+							Ok(urn) => urn,
+							Err(e) => return Err(E::from(e)),
+						};
+						if let Err(e) = self.trace.event(event_urn) {
+							return Err(E::from(e));
+						}
 					}
 				}
 
@@ -352,15 +368,21 @@ mod tests {
 	#[test]
 	fn test_make_event_urn() {
 		assert_eq!(
-			make_event_urn("create_handshake_request", "start").to_string(),
+			make_event_urn("create_handshake_request", "start")
+				.expect("a literal NID with a job event NSS")
+				.to_string(),
 			"urn:tightbeam:event:job/create-handshake-request-start"
 		);
 		assert_eq!(
-			make_event_urn("validate_config", "success").to_string(),
+			make_event_urn("validate_config", "success")
+				.expect("a literal NID with a job event NSS")
+				.to_string(),
 			"urn:tightbeam:event:job/validate-config-success"
 		);
 		assert_eq!(
-			make_event_urn("send_request", "error").to_string(),
+			make_event_urn("send_request", "error")
+				.expect("a literal NID with a job event NSS")
+				.to_string(),
 			"urn:tightbeam:event:job/send-request-error"
 		);
 	}
@@ -368,7 +390,6 @@ mod tests {
 	#[test]
 	fn test_result_is_pipeline() {
 		let result: Result<i32, &str> = Ok(42);
-
 		let doubled = result.map(|x| x * 2).run();
 		assert_eq!(doubled, Ok(84));
 	}
@@ -376,7 +397,6 @@ mod tests {
 	#[test]
 	fn test_pipeline_and_then() {
 		let result: Result<i32, &str> = Ok(10);
-
 		let computed = result.map(|x| x + 5).map(|x| x * 2).run();
 		assert_eq!(computed, Ok(30));
 	}
@@ -384,7 +404,6 @@ mod tests {
 	#[test]
 	fn test_pipeline_or_else() {
 		let result: Result<i32, &str> = Err("error");
-
 		let with_fallback: Result<i32, &str> = result.or(Ok(100)).run();
 		assert_eq!(with_fallback, Ok(100));
 	}
@@ -405,7 +424,6 @@ mod tests {
 	fn test_join_with_error() {
 		let pipe1: Result<i32, &str> = Ok(10);
 		let pipe2: Result<i32, &str> = Err("failed");
-
 		let result = join(pipe1, pipe2).run();
 		assert_eq!(result, Err("failed"));
 	}
@@ -413,7 +431,6 @@ mod tests {
 	#[test]
 	fn test_pipeline_or_else_fallback() {
 		let result: Result<i32, &str> = Err("error");
-
 		let with_fallback: Result<i32, &str> = result.or(Ok(100)).run();
 		assert_eq!(with_fallback, Ok(100));
 	}

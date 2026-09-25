@@ -55,8 +55,8 @@ worker! {
 
 		// Check if we have the requested frames
 		let missing_frames = config.chain_processor.request_missing_frames(
-			&request.request.requester_head,
-			&request.request.last_received_hash,
+			request.request.requester_head,
+			request.request.last_received_hash,
 		)?;
 
 		if !missing_frames.is_empty() {

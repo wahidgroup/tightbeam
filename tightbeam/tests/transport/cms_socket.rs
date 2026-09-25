@@ -24,11 +24,12 @@ use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{create_v0_tightbeam, ClientEnv, SetupEnv};
+use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::HandshakeProtocolKind;
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::transport::{ClientBuilder, ConnectionBuilder, X509ClientConfig};
+use tightbeam::transport::{ClientBuilder, ConnectionBuilder};
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
 use tightbeam::{Frame, TightBeamError};
@@ -37,7 +38,7 @@ use tokio::task::JoinHandle;
 use crate::common::security::{pinning_trust_store, random_signing_key, test_certificate, ServerMaterials};
 use crate::transport::support::bind_mutual_listener;
 
-pub(crate) const CMS_WIRE_ECHOED: Urn<'static> = Urn::new("test", "event:cms-socket/cms-wire-echoed");
+pub(crate) const CMS_WIRE_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:cms-socket/cms-wire-echoed");
 
 /// Mutual-auth CMS fixture: server materials plus the client identity the
 /// server pins.
@@ -81,7 +82,6 @@ tb_assert_spec! {
 	pub CmsSocketSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::GATE_ACCEPT, exactly!(1)),
 			(CMS_WIRE_ECHOED, exactly!(1), equals!(true))
@@ -108,13 +108,13 @@ tb_scenario! {
 
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(trust_store)
-				.with_client_identity(identity, Arc::clone(&ctx.client_provider))?
+				.with_client_identity(ClientIdentity::from_spec(identity, Arc::clone(&ctx.client_provider))?)
 				.with_server_certificate_chain(server_chain)
 				.with_handshake_protocol(HandshakeProtocolKind::Cms)
 				.build();
-			let mut client = builder.connect(addr).await?;
 
-			let frame = create_v0_tightbeam(Some("cms-wire"), None);
+			let mut client = builder.connect(addr).await?;
+			let frame = TestFrame::v0(Some("cms-wire"), None);
 			let reply = client.emit(frame.to_owned(), None).await?;
 			trace.event_with(CMS_WIRE_ECHOED, &[], reply == Some(frame))?;
 			Ok(())

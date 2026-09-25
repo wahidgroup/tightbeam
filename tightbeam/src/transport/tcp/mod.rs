@@ -36,7 +36,6 @@ pub mod r#async;
 pub mod sync;
 
 // Canonical definition lives in transport::io so it exists without the TCP features.
-pub(crate) use crate::transport::io::HANDSHAKE_MAX_WIRE;
 
 /// Abstract TCP listener trait for different networking backends.
 #[cfg(feature = "tcp")]
@@ -59,6 +58,7 @@ impl Protocol for TcpListener {
 	type Error = IoError;
 	type Transport = TcpTransport<Self::Stream>;
 	type Address = TightBeamSocketAddr;
+	type CryptoProvider = crate::crypto::profiles::DefaultCryptoProvider;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
 		"127.0.0.1:0"
@@ -76,8 +76,11 @@ impl Protocol for TcpListener {
 		TcpStream::connect(addr.0)
 	}
 
-	fn create_transport(stream: Self::Stream) -> Self::Transport {
-		TcpTransport::from(stream)
+	fn create_transport(
+		stream: Self::Stream,
+		config: crate::transport::EndpointConfig<Self::CryptoProvider>,
+	) -> Self::Transport {
+		TcpTransport::new(stream, config)
 	}
 }
 
@@ -166,11 +169,10 @@ impl TightBeamAddress for TightBeamSocketAddr {}
 /// Macro to generate the common transport implementation for both sync
 /// and async.
 ///
-/// Defines the transport struct itself plus the `From<S>` constructor,
-/// key-dropping `Drop`, and shared trait impls. The struct definition is
-/// the single source for the field list. The sync and async variants must
-/// stay distinct types because their stream traits would produce
-/// overlapping trait impls on one shared struct.
+/// Defines the transport struct itself plus its one constructor and the
+/// shared trait impls. The struct definition is the single source for the
+/// field list.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! impl_tcp_common {
 	($transport:ident, $stream_trait:path) => {
@@ -186,65 +188,34 @@ macro_rules! impl_tcp_common {
 			pub(crate) emitter_gate: $crate::policy::GateChain,
 			#[cfg(feature = "transport-policy")]
 			pub(crate) collector_gate: $crate::policy::GateChain,
-			#[cfg(all(feature = "std", feature = "transport-policy"))]
-			pub(crate) operation_timeout: core::time::Duration,
-			#[cfg(feature = "x509")]
-			pub(crate) trust_store: Option<Arc<dyn $crate::crypto::x509::store::CertificateTrust>>,
-			#[cfg(feature = "x509")]
-			pub(crate) server_identity: Option<Arc<$crate::x509::Certificate>>,
-			#[cfg(feature = "x509")]
-			pub(crate) client_certificate: Option<Arc<$crate::x509::Certificate>>,
-			#[cfg(feature = "x509")]
-			pub(crate) server_certificate_chain: Option<Arc<[$crate::x509::Certificate]>>,
-			#[cfg(feature = "x509")]
-			pub(crate) client_validators:
-				Option<Arc<Vec<Arc<dyn $crate::crypto::x509::policy::CertificateValidation>>>>,
-			#[cfg(feature = "x509")]
-			pub(crate) peer_certificate: Option<Arc<$crate::x509::Certificate>>,
-			#[cfg(feature = "x509")]
-			pub(crate) aad_domain_tag: Option<&'static [u8]>,
-			#[cfg(feature = "x509")]
-			pub(crate) max_cleartext_envelope: Option<usize>,
-			#[cfg(feature = "x509")]
-			pub(crate) max_encrypted_envelope: Option<usize>,
-			#[cfg(feature = "x509")]
-			pub(crate) key_manager: Option<Arc<$crate::transport::handshake::HandshakeKeyManager<P>>>,
-			#[cfg(feature = "x509")]
-			pub(crate) handshake_state: $crate::transport::handshake::TcpHandshakeState,
-			#[cfg(feature = "x509")]
-			pub(crate) handshake_timeout: core::time::Duration,
-			#[cfg(feature = "x509")]
-			pub(crate) session_keys: Option<$crate::crypto::aead::SessionKeys>,
-			#[cfg(feature = "x509")]
-			pub(crate) mux_config: Option<::std::sync::Arc<$crate::transport::handshake::negotiation::TransportOffer>>,
-			#[cfg(feature = "x509")]
-			pub(crate) transport_authorizer:
-				Option<Arc<dyn $crate::transport::handshake::negotiation::TransportAuthorizer>>,
-			#[cfg(feature = "x509")]
-			pub(crate) receipt_approver: Option<Arc<dyn $crate::transport::handshake::receipt::ReceiptApprover>>,
-			#[cfg(feature = "x509")]
-			pub(crate) session_observer: Option<Arc<dyn $crate::transport::handshake::receipt::SessionObserver>>,
-			#[cfg(feature = "x509")]
-			pub(crate) session_receipt: Option<Arc<$crate::transport::handshake::receipt::StoredReceipt>>,
-			#[cfg(all(feature = "x509", feature = "aead"))]
-			pub(crate) epoch_materials: Option<$crate::transport::handshake::EpochMaterials>,
-			#[cfg(feature = "x509")]
-			pub(crate) mux_settings: Option<$crate::transport::handshake::negotiation::MuxSettings>,
-			#[cfg(feature = "x509")]
+			pub(crate) state: $crate::transport::state::SessionState<P>,
+			pub(crate) limits: $crate::transport::TransportLimits,
+			pub(crate) clock: Arc<dyn $crate::utils::time::Clock>,
 			pub(crate) server_handshake: Option<$crate::transport::handshake::BoxedServerHandshake>,
-			#[cfg(feature = "x509")]
-			pub(crate) handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind,
 			/// Connection instrumentation collector.
 			#[cfg(feature = "instrument")]
 			pub(crate) trace: Option<$crate::trace::TraceCollector>,
-			pub(crate) _phantom: core::marker::PhantomData<P>,
 		}
 
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> From<S> for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
-			fn from(stream: S) -> Self {
+			/// Build a transport over `stream` from `config`.
+			///
+			/// The one constructor. The configuration's provisioning already
+			/// answered the dialer rule, so the session starts where that
+			/// provisioning says: `Provisioned` when it names a peer authority,
+			/// `Cleartext` only when cleartext was named.
+			pub fn new(stream: S, config: $crate::transport::EndpointConfig<P>) -> Self {
+				let $crate::transport::EndpointConfig {
+					encryption,
+					limits,
+					clock,
+					#[cfg(feature = "instrument")]
+					trace,
+				} = config;
+
 				Self {
 					stream,
 					#[cfg(feature = "transport-policy")]
@@ -253,145 +224,29 @@ macro_rules! impl_tcp_common {
 					emitter_gate: $crate::policy::GateChain::default(),
 					#[cfg(feature = "transport-policy")]
 					collector_gate: $crate::policy::GateChain::default(),
-					#[cfg(all(feature = "std", feature = "transport-policy"))]
-					operation_timeout: $crate::constants::DEFAULT_OPERATION_TIMEOUT,
-					#[cfg(feature = "x509")]
-					trust_store: None,
-					#[cfg(feature = "x509")]
-					server_identity: None,
-					#[cfg(feature = "x509")]
-					client_certificate: None,
-					#[cfg(feature = "x509")]
-					server_certificate_chain: None,
-					#[cfg(feature = "x509")]
-					client_validators: None,
-					#[cfg(feature = "x509")]
-					peer_certificate: None,
-					#[cfg(feature = "x509")]
-					aad_domain_tag: None,
-					#[cfg(feature = "x509")]
-					max_cleartext_envelope: None,
-					#[cfg(feature = "x509")]
-					max_encrypted_envelope: None,
-					#[cfg(feature = "x509")]
-					key_manager: None,
-					#[cfg(feature = "x509")]
-					handshake_state: $crate::transport::handshake::TcpHandshakeState::None,
-					#[cfg(feature = "x509")]
-					handshake_timeout: core::time::Duration::from_secs(1),
-					#[cfg(feature = "x509")]
-					session_keys: None,
-					#[cfg(feature = "x509")]
-					mux_config: None,
-					#[cfg(feature = "x509")]
-					transport_authorizer: None,
-					#[cfg(feature = "x509")]
-					receipt_approver: None,
-					#[cfg(feature = "x509")]
-					session_observer: None,
-					#[cfg(feature = "x509")]
-					session_receipt: None,
-					#[cfg(all(feature = "x509", feature = "aead"))]
-					epoch_materials: None,
-					#[cfg(feature = "x509")]
-					mux_settings: None,
-					#[cfg(feature = "x509")]
+					state: $crate::transport::state::SessionState::new(encryption),
+					limits,
+					clock,
 					server_handshake: None,
-					#[cfg(feature = "x509")]
-					handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind::default(),
 					#[cfg(feature = "instrument")]
-					trace: None,
-					_phantom: core::marker::PhantomData,
+					trace,
 				}
 			}
-		}
 
-		#[cfg(feature = "instrument")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $transport<S, P>
-		where
-			TransportError: From<S::Error>,
-		{
-			/// Attach the connection's instrumentation collector.
-			#[must_use]
-			pub fn with_trace(mut self, trace: $crate::trace::TraceCollector) -> Self {
-				self.trace = Some(trace);
-				self
-			}
-
-			/// Share of the connection's instrumentation collector, if
-			/// attached.
-			pub fn trace(&self) -> Option<$crate::trace::TraceCollector> {
-				self.trace.as_ref().map($crate::trace::TraceCollector::share)
-			}
-		}
-
-		#[cfg(feature = "x509")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::X509ClientConfig for $transport<S, P>
-		where
-			TransportError: From<S::Error>,
-		{
-			type CryptoProvider = P;
-
-			fn with_trust_store(mut self, store: Arc<dyn $crate::crypto::x509::store::CertificateTrust>) -> Self {
-				self.trust_store = Some(store);
-				self
-			}
-
-			fn with_client_identity(
-				mut self,
-				cert: Arc<$crate::x509::Certificate>,
-				key: Arc<$crate::transport::handshake::HandshakeKeyManager<P>>,
-			) -> Self {
-				self.client_certificate = Some(cert);
-				self.key_manager = Some(key);
-
-				self
-			}
-
-			fn with_server_certificate_chain(mut self, chain: Arc<[$crate::x509::Certificate]>) -> Self {
-				self.server_certificate_chain = Some(chain);
-				self
-			}
-
-			fn with_handshake_protocol(mut self, kind: $crate::transport::handshake::HandshakeProtocolKind) -> Self {
-				self.handshake_protocol_kind = kind;
-				self
-			}
-
-			fn with_receipt_approver(
-				mut self,
-				approver: Arc<dyn $crate::transport::handshake::receipt::ReceiptApprover>,
-			) -> Self {
-				self.receipt_approver = Some(approver);
-				self
-			}
-
-			#[cfg(feature = "instrument")]
-			fn with_trace(mut self, trace: $crate::trace::TraceCollector) -> Self {
-				self.trace = Some(trace);
-				self
-			}
-		}
-
-		#[cfg(feature = "x509")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $transport<S, P>
-		where
-			TransportError: From<S::Error>,
-		{
 			/// Peer certificate after completed mutual authentication.
 			/// `None` if unused or incomplete.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
-				self.peer_certificate.as_deref()
+				self.state.peer_certificate()
 			}
 
 			/// Negotiated multiplexing settings. `None` means single-flight.
 			pub fn negotiated_mux(&self) -> Option<$crate::transport::handshake::negotiation::MuxSettings> {
-				self.mux_settings
+				self.state.established()?.mux()
 			}
 
 			/// Dual-signed session receipt from a budget-bearing handshake.
 			pub fn session_receipt(&self) -> Option<&$crate::transport::handshake::receipt::StoredReceipt> {
-				self.session_receipt.as_deref()
+				self.state.receipt()
 			}
 
 			/// Override the budget-grant policy consulted between the
@@ -403,7 +258,7 @@ macro_rules! impl_tcp_common {
 				mut self,
 				authorizer: Arc<dyn $crate::transport::handshake::negotiation::TransportAuthorizer>,
 			) -> Self {
-				self.transport_authorizer = Some(authorizer);
+				self.state.authorize_transport(authorizer);
 				self
 			}
 
@@ -413,26 +268,54 @@ macro_rules! impl_tcp_common {
 				mut self,
 				observer: Arc<dyn $crate::transport::handshake::receipt::SessionObserver>,
 			) -> Self {
-				self.session_observer = Some(observer);
+				self.state.observe_sessions(observer);
+				self
+			}
+
+			/// Approver consulted before countersigning a challenge-bearing
+			/// receipt.
+			#[must_use]
+			pub fn with_receipt_approver(
+				mut self,
+				approver: Arc<dyn $crate::transport::handshake::receipt::ReceiptApprover>,
+			) -> Self {
+				self.state.approve_receipts(approver);
+				self
+			}
+
+			/// Handshake protocol this endpoint runs once provisioned.
+			#[must_use]
+			pub fn with_handshake_protocol(mut self, kind: $crate::transport::handshake::HandshakeProtocolKind) -> Self {
+				self.state.select_handshake(kind);
+				self
+			}
+
+			/// Attach the connection's instrumentation collector.
+			#[cfg(feature = "instrument")]
+			#[must_use]
+			pub fn with_trace(mut self, trace: $crate::trace::TraceCollector) -> Self {
+				self.trace = Some(trace);
 				self
 			}
 
 			/// True while this endpoint expects an encryption handshake that has
 			/// not completed yet. Such reads face an unauthenticated peer, so the
-			/// read layer applies the tight `HANDSHAKE_MAX_WIRE` cap and the
+			/// read layer applies the tight `handshake_wire` ceiling and the
 			/// handshake deadline instead of the general envelope limits.
 			pub(crate) fn is_handshake_pending(&self) -> bool {
-				let expects_handshake = self.server_identity.is_some()
-					|| self.trust_store.is_some()
-					|| self.client_validators.is_some()
-					|| self.key_manager.is_some();
-				expects_handshake
-					&& self.handshake_state != $crate::transport::handshake::TcpHandshakeState::Complete
+				self.state.phase().is_handshake_pending()
+			}
+
+			/// Share of the connection's instrumentation collector, if
+			/// attached.
+			#[cfg(feature = "instrument")]
+			pub fn trace(&self) -> Option<$crate::trace::TraceCollector> {
+				self.trace.as_ref().map($crate::trace::TraceCollector::share)
 			}
 		}
 
 		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::PolicyConfig for $transport<S, P>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::RestartConfig for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -440,38 +323,38 @@ macro_rules! impl_tcp_common {
 				self.restart_policy = Box::new(policy);
 				self
 			}
+		}
 
+		#[cfg(feature = "transport-policy")]
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::EmitterGateConfig for $transport<S, P>
+		where
+			TransportError: From<S::Error>,
+		{
 			fn with_emitter_gate<G: GatePolicy + 'static>(mut self, gate: G) -> Self {
 				self.emitter_gate.push(gate);
 				self
 			}
+		}
 
+		#[cfg(feature = "transport-policy")]
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::CollectorGateConfig for $transport<S, P>
+		where
+			TransportError: From<S::Error>,
+		{
 			fn with_collector_gate<G: GatePolicy + 'static>(mut self, gate: G) -> Self {
 				self.collector_gate.push(gate);
 				self
 			}
-
-			#[cfg(feature = "std")]
-			fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
-				self.operation_timeout = timeout;
-				self
-			}
 		}
 
-		#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::MessageEmitter for $transport<S, P>
+		#[cfg(feature = "transport-policy")]
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::TimeoutConfig for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
-			type EmitterGate = dyn GatePolicy;
-			type RestartPolicy = dyn RestartPolicy;
-
-			fn to_restart_policy_ref(&self) -> &Self::RestartPolicy {
-				self.restart_policy.as_ref()
-			}
-
-			fn to_emitter_gate_policy_ref(&self) -> &Self::EmitterGate {
-				&self.emitter_gate
+			fn with_timeout(mut self, timeout: core::time::Duration) -> Self {
+				self.limits.operation_timeout = timeout;
+				self
 			}
 		}
 
@@ -511,9 +394,24 @@ macro_rules! impl_tcp_common {
 			TransportError: From<S::Error>
 		{}
 
-		// State accessors shared as-is by the sync and async transports.
-		// A single definition keeps the two from drifting.
-		#[cfg(feature = "x509")]
+		// Each transport implements the seal by name, with no blanket impl,
+		// so no type outside this crate can reach the traits it guards.
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::state::sealed::Sealed
+			for $transport<S, P>
+		{
+		}
+
+		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider>
+			$crate::transport::state::ServerHandshakeSlot for $transport<S, P>
+		where
+			TransportError: From<S::Error>,
+		{
+			fn server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
+				&mut self.server_handshake
+			}
+		}
+
 		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider + Send + Sync + 'static>
 			$crate::transport::state::EncryptedProtocolState for $transport<S, P>
 		where
@@ -521,146 +419,21 @@ macro_rules! impl_tcp_common {
 		{
 			type CryptoProvider = P;
 
-			fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
-				let session_keys = self.session_keys.as_ref();
-				session_keys
-					.map(SessionKeys::send)
-					.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
+			fn session_state(&self) -> &$crate::transport::state::SessionState<P> {
+				&self.state
 			}
 
-			fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
-				let session_keys = self.session_keys.as_ref();
-				session_keys
-					.map(SessionKeys::recv)
-					.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
+			fn session_state_mut(&mut self) -> &mut $crate::transport::state::SessionState<P> {
+				&mut self.state
 			}
 
-			fn to_handshake_state(&self) -> TcpHandshakeState {
-				self.handshake_state
-			}
-
-			fn set_handshake_state(&mut self, state: TcpHandshakeState) {
-				self.handshake_state = state;
-			}
-
-			fn to_server_certificate_ref(&self) -> Option<&Certificate> {
-				self.server_identity.as_ref().map(|arc| arc.as_ref())
-			}
-
-			fn to_server_certificate_arc(&self) -> Option<Arc<Certificate>> {
-				self.server_identity.as_ref().map(Arc::clone)
-			}
-
-			fn set_session_keys(&mut self, keys: SessionKeys) {
-				let _ = self.session_keys.take();
-				self.session_keys = Some(keys);
-			}
-
-			fn to_max_cleartext_envelope(&self) -> Option<usize> {
-				self.max_cleartext_envelope
-			}
-
-			fn to_max_encrypted_envelope(&self) -> Option<usize> {
-				self.max_encrypted_envelope
-			}
-
-			fn is_client_validators_present(&self) -> bool {
-				self.client_validators.is_some()
-			}
-
-			fn to_handshake_protocol_kind(&self) -> HandshakeProtocolKind {
-				self.handshake_protocol_kind
-			}
-
-			fn to_key_manager_ref(&self) -> Option<&Arc<HandshakeKeyManager<P>>> {
-				self.key_manager.as_ref()
-			}
-
-			fn to_client_certificate_ref(&self) -> Option<&Arc<Certificate>> {
-				self.client_certificate.as_ref()
-			}
-
-			fn to_trust_store_ref(&self) -> Option<&Arc<dyn CertificateTrust>> {
-				self.trust_store.as_ref()
-			}
-
-			fn to_server_certificate_chain_ref(&self) -> Option<&Arc<[Certificate]>> {
-				self.server_certificate_chain.as_ref()
-			}
-
-			fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
-				&mut self.server_handshake
-			}
-
-			fn set_peer_certificate(&mut self, cert: Certificate) {
-				self.peer_certificate = Some(Arc::new(cert));
-			}
-
-			fn to_peer_certificate_ref(&self) -> Option<&Certificate> {
-				self.peer_certificate.as_deref()
-			}
-
-			fn to_peer_certificate_arc(&self) -> Option<Arc<Certificate>> {
-				self.peer_certificate.clone()
-			}
-
-			fn to_session_receipt_ref(&self) -> Option<&StoredReceipt> {
-				self.session_receipt.as_deref()
-			}
-
-			fn to_session_receipt_arc(&self) -> Option<Arc<StoredReceipt>> {
-				self.session_receipt.clone()
+			fn limits(&self) -> &$crate::transport::TransportLimits {
+				&self.limits
 			}
 
 			#[cfg(feature = "instrument")]
 			fn to_trace_ref(&self) -> Option<&TraceCollector> {
 				self.trace.as_ref()
-			}
-
-			fn to_handshake_timeout(&self) -> Duration {
-				self.handshake_timeout
-			}
-
-			fn to_client_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
-				self.client_validators.as_ref()
-			}
-
-			fn unset_session_keys(&mut self) {
-				self.session_keys = None;
-			}
-
-			fn to_mux_config(&self) -> Option<TransportOffer> {
-				self.mux_config.as_ref().map(|offer| (**offer).clone())
-			}
-
-			fn to_transport_authorizer(&self) -> Option<Arc<dyn TransportAuthorizer>> {
-				self.transport_authorizer.as_ref().map(Arc::clone)
-			}
-
-			fn to_receipt_approver(&self) -> Option<Arc<dyn ReceiptApprover>> {
-				self.receipt_approver.as_ref().map(Arc::clone)
-			}
-
-			fn to_session_observer(&self) -> Option<Arc<dyn SessionObserver>> {
-				self.session_observer.as_ref().map(Arc::clone)
-			}
-
-			fn set_mux_settings(&mut self, settings: Option<MuxSettings>) {
-				self.mux_settings = settings;
-			}
-
-			fn set_session_receipt(&mut self, receipt: Option<StoredReceipt>) {
-				self.session_receipt = receipt.map(Arc::new);
-			}
-
-			#[cfg(feature = "aead")]
-			fn set_epoch_materials(&mut self, materials: Option<EpochMaterials>) {
-				self.epoch_materials = materials;
-			}
-
-			#[cfg(feature = "aead")]
-			fn take_epoch_materials(&mut self) -> Option<EpochMaterials> {
-				self.epoch_materials.take()
 			}
 		}
 	};

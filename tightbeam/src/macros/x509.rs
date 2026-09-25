@@ -238,7 +238,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::crypto::sign::Sha3Signer;
 	use crate::crypto::x509::ext::pkix::BasicConstraints;
-	use crate::crypto::x509::utils::certificate_extension;
+	use crate::crypto::x509::utils::CertificateExt;
 	use crate::spki::SubjectPublicKeyInfoOwned;
 
 	const SUBJECT: &str = "CN=Test Root CA,O=Test Org,C=US";
@@ -251,7 +251,6 @@ mod tests {
 		let signing_key = Secp256k1SigningKey::random(&mut rand_core::OsRng);
 		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
-
 		Ok((signing_key, spki))
 	}
 
@@ -293,8 +292,7 @@ mod tests {
 			path_len: 2u8
 		)?;
 
-		let basic_constraints = certificate_extension::<BasicConstraints>(&cert)?;
-
+		let basic_constraints = &cert.extension::<BasicConstraints>()?;
 		assert_eq!(cert.tbs_certificate.subject, cert.tbs_certificate.issuer);
 		assert!(matches!(
 			basic_constraints,

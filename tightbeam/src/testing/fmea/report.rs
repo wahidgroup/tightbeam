@@ -3,7 +3,6 @@
 use std::collections::{HashSet, VecDeque};
 
 use crate::testing::fdr::{FdrVerdict, InjectedFaultRecord};
-use crate::testing::fmea::analysis::{calculate_detection, calculate_severity, convert_occurrence};
 use crate::testing::specs::csp::Process;
 use crate::TightBeamError;
 
@@ -50,13 +49,16 @@ pub struct FailureMode {
 impl FailureMode {
 	/// Create new failure mode with calculated RPN
 	pub fn new(
-		component: String,
-		failure: String,
-		effects: Vec<String>,
+		component: impl Into<String>,
+		failure: impl Into<String>,
+		effects: impl IntoIterator<Item = String>,
 		severity: u8,
 		occurrence: u16,
 		detection: u8,
 	) -> Self {
+		let component: String = component.into();
+		let failure: String = failure.into();
+		let effects: Vec<String> = effects.into_iter().collect();
 		let rpn = (severity as u32) * (occurrence as u32) * (detection as u32);
 		Self { component, failure, effects, severity, occurrence, detection, rpn }
 	}
@@ -73,7 +75,12 @@ pub struct FmeaReport {
 
 impl FmeaReport {
 	/// Create new FMEA report with calculated totals
-	pub fn new(failure_modes: Vec<FailureMode>, severity_scale: SeverityScale, rpn_threshold: u32) -> Self {
+	pub fn new(
+		failure_modes: impl IntoIterator<Item = FailureMode>,
+		severity_scale: SeverityScale,
+		rpn_threshold: u32,
+	) -> Self {
+		let failure_modes: Vec<FailureMode> = failure_modes.into_iter().collect();
 		let total_rpn: u32 = failure_modes.iter().map(|fm| fm.rpn).sum();
 		let critical_failures: Vec<usize> = failure_modes
 			.iter()
@@ -91,127 +98,124 @@ impl FmeaReport {
 	}
 }
 
-/// Generate FMEA report from FDR verdict
-pub fn generate_fmea_report(
-	verdict: &FdrVerdict,
-	process: &Process,
-	config: Option<FmeaConfig>,
-) -> Result<FmeaReport, TightBeamError> {
-	let config = config.unwrap_or_default();
+impl FdrVerdict {
+	/// FMEA report over the faults this run injected.
+	///
+	/// A run that injected nothing has no failure modes, so the report is
+	/// the empty one at the configured scale.
+	///
+	/// # Errors
+	///
+	/// The first failure-mode analysis that fails.
+	pub fn fmea_report(&self, process: &Process, config: Option<FmeaConfig>) -> Result<FmeaReport, TightBeamError> {
+		let config = config.unwrap_or_default();
+		let failure_modes: Result<Vec<_>, _> = self
+			.faults_injected
+			.iter()
+			.map(|fault| fault.failure_mode(process, self, &config))
+			.collect();
 
-	if verdict.faults_injected.is_empty() {
-		return Ok(FmeaReport::new(
-			Vec::new(),
+		Ok(FmeaReport::new(
+			failure_modes?,
 			config.severity_scale,
 			config.rpn_critical_threshold,
-		));
+		))
+	}
+}
+
+impl InjectedFaultRecord {
+	/// Failure-mode entry for this fault: severity, occurrence, detection,
+	/// and the effects reachability analysis found.
+	///
+	/// # Errors
+	///
+	/// Whatever [`FailureMode::new`] reports.
+	fn failure_mode(
+		&self,
+		process: &Process,
+		verdict: &FdrVerdict,
+		config: &FmeaConfig,
+	) -> Result<FailureMode, TightBeamError> {
+		Ok(FailureMode::new(
+			self.csp_state.clone(),
+			self.event_label.clone(),
+			self.effects(process),
+			self.severity(process, config.severity_scale),
+			config.severity_scale.occurrence(self.probability_bps),
+			verdict.detection(config.severity_scale),
+		))
 	}
 
-	let failure_modes: Result<Vec<_>, _> = verdict
-		.faults_injected
-		.iter()
-		.map(|fault| analyze_fault(fault, process, verdict, &config))
-		.collect();
+	/// Effects of this fault, via CSP reachability analysis.
+	fn effects(&self, process: &Process) -> Vec<String> {
+		let mut effects = Vec::new();
 
-	Ok(FmeaReport::new(
-		failure_modes?,
-		config.severity_scale,
-		config.rpn_critical_threshold,
-	))
-}
+		// Find the state where the fault occurs
+		let fault_state = process.states.iter().find(|s| s.0 == self.csp_state.as_str()).copied();
+		let Some(fault_state) = fault_state else {
+			effects.push(format!("Fault occurs in unknown state: {}", self.csp_state));
+			return effects;
+		};
 
-/// Analyze individual fault to create failure mode entry
-fn analyze_fault(
-	fault: &InjectedFaultRecord,
-	process: &Process,
-	verdict: &FdrVerdict,
-	config: &FmeaConfig,
-) -> Result<FailureMode, TightBeamError> {
-	let severity = calculate_severity(fault, process, config.severity_scale);
-	let occurrence = convert_occurrence(fault.probability_bps, config.severity_scale);
-	let detection = calculate_detection(verdict, config.severity_scale);
-	let effects = analyze_effects(fault, process);
+		// BFS to explore reachable states from fault point
+		let mut visited = HashSet::new();
+		let mut queue = VecDeque::new();
+		queue.push_back(fault_state);
+		visited.insert(fault_state);
 
-	Ok(FailureMode::new(
-		fault.csp_state.clone(),
-		fault.event_label.clone(),
-		effects,
-		severity,
-		occurrence,
-		detection,
-	))
-}
+		let mut reachable_terminals = Vec::new();
+		let mut potential_deadlocks = Vec::new();
+		while let Some(current_state) = queue.pop_front() {
+			// Check if terminal
+			if process.is_terminal(current_state) {
+				reachable_terminals.push(current_state.0);
+				continue;
+			}
 
-/// Analyze effects via CSP reachability analysis
-fn analyze_effects(fault: &InjectedFaultRecord, process: &Process) -> Vec<String> {
-	let mut effects = Vec::new();
+			// Get enabled transitions
+			// Check for potential deadlock (no enabled transitions, not terminal)
+			let enabled = process.enabled(current_state);
+			if enabled.is_empty() {
+				potential_deadlocks.push(current_state.0);
+				continue;
+			}
 
-	// Find the state where the fault occurs
-	let fault_state = process.states.iter().find(|s| s.0 == fault.csp_state.as_str()).copied();
-	let Some(fault_state) = fault_state else {
-		effects.push(format!("Fault occurs in unknown state: {}", fault.csp_state));
-		return effects;
-	};
-
-	// BFS to explore reachable states from fault point
-	let mut visited = HashSet::new();
-	let mut queue = VecDeque::new();
-	queue.push_back(fault_state);
-	visited.insert(fault_state);
-
-	let mut reachable_terminals = Vec::new();
-	let mut potential_deadlocks = Vec::new();
-	while let Some(current_state) = queue.pop_front() {
-		// Check if terminal
-		if process.is_terminal(current_state) {
-			reachable_terminals.push(current_state.0);
-			continue;
-		}
-
-		// Get enabled transitions
-		// Check for potential deadlock (no enabled transitions, not terminal)
-		let enabled = process.enabled(current_state);
-		if enabled.is_empty() {
-			potential_deadlocks.push(current_state.0);
-			continue;
-		}
-
-		// Explore successors
-		for action in enabled {
-			let successors = process.step(current_state, &action.event);
-			for next_state in successors {
-				if visited.insert(next_state) {
-					queue.push_back(next_state);
+			// Explore successors
+			for action in enabled {
+				let successors = process.step(current_state, &action.event);
+				for next_state in successors {
+					if visited.insert(next_state) {
+						queue.push_back(next_state);
+					}
 				}
 			}
 		}
-	}
 
-	// Generate effect descriptions
-	if !reachable_terminals.is_empty() {
-		effects.push(format!("Can reach terminal state(s): {}", reachable_terminals.join(", ")));
-	}
+		// Generate effect descriptions
+		if !reachable_terminals.is_empty() {
+			effects.push(format!("Can reach terminal state(s): {}", reachable_terminals.join(", ")));
+		}
+		if !potential_deadlocks.is_empty() {
+			effects.push(format!("Potential deadlock in state(s): {}", potential_deadlocks.join(", ")));
+		}
 
-	if !potential_deadlocks.is_empty() {
-		effects.push(format!("Potential deadlock in state(s): {}", potential_deadlocks.join(", ")));
-	}
+		// If fault leads to reduced state space
+		let total_states = process.states.len();
+		let reachable_count = visited.len();
+		if reachable_count < total_states {
+			effects.push(format!(
+				"Restricts reachable states to {} of {} total states",
+				reachable_count, total_states
+			));
+		}
 
-	// If fault leads to reduced state space
-	let total_states = process.states.len();
-	let reachable_count = visited.len();
-	if reachable_count < total_states {
-		effects.push(format!(
-			"Restricts reachable states to {} of {} total states",
-			reachable_count, total_states
-		));
-	}
+		// Default if no specific effects identified
+		if effects.is_empty() {
+			effects.push(format!("Fault during {} may cause state transition failure", self.event_label));
+		}
 
-	// Default if no specific effects identified
-	if effects.is_empty() {
-		effects.push(format!("Fault during {} may cause state transition failure", fault.event_label));
+		effects
 	}
-
-	effects
 }
 
 #[cfg(test)]
@@ -220,7 +224,9 @@ mod tests {
 	use crate::testing::specs::csp::{Event, Process, State};
 
 	// Test fixtures and helpers
-	fn create_fault(state: &str, event: &str) -> InjectedFaultRecord {
+	fn create_fault(state: impl AsRef<str>, event: impl AsRef<str>) -> InjectedFaultRecord {
+		let state = state.as_ref();
+		let event = event.as_ref();
 		InjectedFaultRecord {
 			csp_state: state.to_string(),
 			event_label: event.to_string(),
@@ -229,7 +235,10 @@ mod tests {
 		}
 	}
 
-	fn assert_effect_contains(effects: &[String], expected: &str, context: &str) {
+	fn assert_effect_contains(effects: impl AsRef<[String]>, expected: impl AsRef<str>, context: impl AsRef<str>) {
+		let effects = effects.as_ref();
+		let expected = expected.as_ref();
+		let context = context.as_ref();
 		assert!(!effects.is_empty(), "{}: Should identify effects", context);
 		assert!(
 			effects.iter().any(|e| e.contains(expected)),
@@ -291,9 +300,8 @@ mod tests {
 			.add_transition(State("Running"), Event("finish"), State("Success"))
 			.build()?;
 
-		let effects = analyze_effects(&create_fault("Init", "start"), &process);
+		let effects = create_fault("Init", "start").effects(&process);
 		assert_effect_contains(&effects, "terminal state", "Terminal state detection");
-
 		Ok(())
 	}
 
@@ -305,9 +313,8 @@ mod tests {
 			.add_transition(State("Init"), Event("start"), State("Blocked"))
 			.build()?;
 
-		let effects = analyze_effects(&create_fault("Init", "start"), &process);
+		let effects = create_fault("Init", "start").effects(&process);
 		assert_effect_contains(&effects, "deadlock", "Deadlock detection");
-
 		Ok(())
 	}
 
@@ -323,7 +330,7 @@ mod tests {
 			.add_transition(State("B"), Event("to_c"), State("C"))
 			.build()?;
 
-		let effects = analyze_effects(&create_fault("A", "to_b"), &process);
+		let effects = create_fault("A", "to_b").effects(&process);
 		assert_effect_contains(&effects, "Restricts reachable states", "State space restriction");
 
 		Ok(())
@@ -336,10 +343,9 @@ mod tests {
 			.initial_state(State("Known"))
 			.build()?;
 
-		let effects = analyze_effects(&create_fault("UnknownState", "event"), &process);
+		let effects = create_fault("UnknownState", "event").effects(&process);
 		assert_eq!(effects.len(), 1);
 		assert!(effects[0].contains("unknown state"));
-
 		Ok(())
 	}
 
@@ -354,9 +360,8 @@ mod tests {
 			.add_transition(State("S3"), Event("event1"), State("S1"))
 			.build()?;
 
-		let effects = analyze_effects(&create_fault("S1", "event1"), &process);
+		let effects = create_fault("S1", "event1").effects(&process);
 		assert_effect_contains(&effects, "state transition failure", "Default message");
-
 		Ok(())
 	}
 }

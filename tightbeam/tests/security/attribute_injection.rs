@@ -16,7 +16,7 @@
 //! Every TightBeam handshake attribute is single-use: the server MUST
 //! parse the SignedData once, and a duplicate unsigned attribute MUST
 //! fail closed before any value is consumed. The budget-bearing session
-//! MUST never activate.
+//! MUST stay inactive.
 //!
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
@@ -33,7 +33,6 @@ use std::sync::Arc;
 use tightbeam::asn1::{Any, OctetString};
 use tightbeam::cms::signed_data::SignedData;
 use tightbeam::der::asn1::SetOfVec;
-use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
 use tightbeam::oids::RECEIPT_ACK;
 use tightbeam::tb_assert_spec;
@@ -46,11 +45,11 @@ use tightbeam::x509::attr::Attribute;
 use tightbeam::TightBeamError;
 
 pub(crate) const DUPLICATE_ATTRIBUTE_FAILS_CLOSED: Urn<'static> =
-	Urn::new("test", "event:attribute-injection/duplicate-attribute-fails-closed");
+	tightbeam::urn!("test", "event:attribute-injection/duplicate-attribute-fails-closed");
 pub(crate) const INJECTION_INVISIBLE_TO_SIGNATURES: Urn<'static> =
-	Urn::new("test", "event:attribute-injection/injection-invisible-to-signatures");
+	tightbeam::urn!("test", "event:attribute-injection/injection-invisible-to-signatures");
 pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
-	Urn::new("test", "event:attribute-injection/session-never-activates");
+	tightbeam::urn!("test", "event:attribute-injection/session-never-activates");
 
 use crate::common::security::{
 	cms_mutual_budget_pair, expectation_failure, CmsSessionHooks, GrantingAuthorizer, ServerMaterials,
@@ -58,11 +57,11 @@ use crate::common::security::{
 
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-/// Re-encode the client Finished with a second `RECEIPT_ACK` unsigned
-/// attribute carrying a forged value. No signature covers unsigned
-/// attributes, so the result stays signature-valid.
-fn inject_duplicate_receipt_ack(client_finished: &[u8]) -> Result<Vec<u8>, TightBeamError> {
-	let mut signed_data = SignedData::from_der(client_finished)?;
+/// The client Finished with a second `RECEIPT_ACK` unsigned attribute
+/// carrying a forged value. No signature covers unsigned attributes, so the
+/// result stays signature-valid.
+fn inject_duplicate_receipt_ack(client_finished: &SignedData) -> Result<SignedData, TightBeamError> {
+	let mut signed_data = client_finished.to_owned();
 	let mut signer_info = signed_data
 		.signer_infos
 		.0
@@ -83,14 +82,13 @@ fn inject_duplicate_receipt_ack(client_finished: &[u8]) -> Result<Vec<u8>, Tight
 
 	signer_info.unsigned_attrs = Some(attrs);
 	signed_data.signer_infos = vec![signer_info].try_into()?;
-	Ok(signed_data.to_der()?)
+	Ok(signed_data)
 }
 
 tb_assert_spec! {
 	pub AttributeInjectionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(INJECTION_INVISIBLE_TO_SIGNATURES, exactly!(1), equals!(true)),
 			(DUPLICATE_ATTRIBUTE_FAILS_CLOSED, exactly!(1), equals!(true)),
@@ -99,10 +97,9 @@ tb_assert_spec! {
 	}
 }
 
-// A duplicate RECEIPT_ACK unsigned attribute passes every signature
-// check (nothing signs unsigned attributes), so the server's single-use
-// attribute rule is the only control: the receipt acknowledgement must
-// fail closed and the session must never activate.
+// check (a signature covers signed attributes alone), so the server's
+// single-use attribute rule is the control: the receipt acknowledgement
+// must fail closed and the session must stay inactive.
 tb_scenario! {
 	name: cms_duplicate_receipt_attribute_fails_closed,
 	spec: AttributeInjectionSpec,
@@ -116,7 +113,7 @@ tb_scenario! {
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
 			let server_finished = server.build_server_finished().await?;
@@ -126,7 +123,7 @@ tb_scenario! {
 			let client_finished = client.build_client_finished().await?;
 			let tampered = inject_duplicate_receipt_ack(&client_finished)?;
 
-			// Signature verification cannot see the injection: the
+			// Signature verification covers the signed attributes, so the
 			// tampered Finished still authenticates.
 			let finished_accepted = server.process_client_finished(&tampered).is_ok();
 			trace.event_with(
@@ -144,7 +141,7 @@ tb_scenario! {
 				duplicate_rejected,
 			)?;
 
-			let activation = server.complete();
+			let activation = server.take_established();
 			let activation_refused = matches!(activation, Err(HandshakeError::CountersignatureMissing));
 			trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 

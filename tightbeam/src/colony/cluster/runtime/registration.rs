@@ -1,288 +1,174 @@
 //! Hive registration and servlet address-update request handlers.
 
-use core::str::from_utf8;
+use core::str::FromStr;
 use std::sync::Arc;
 
-use crate::colony::cluster::runtime::bounds::GatewayReplayGuard;
-use crate::colony::cluster::runtime::verify::{verify_control_freshness, verify_hive_origin};
-use crate::colony::cluster::{ClusterConfig, HiveRegistry, ServletEntry, ServletRegistry};
-use crate::colony::common::{
-	reply_frame, type_canonical_bytes, ColonyNamespace, ColonyResource, RegisterHiveRequest, ServletAddressUpdate,
-	ServletInfo,
-};
+use crate::colony::cluster::runtime::bounds::GatewayRuntimeCtx;
+use crate::colony::cluster::{ClusterError, DialTarget};
+use crate::colony::common::{reply_frame, RegisterHiveRequest, ServletAddressUpdate};
 use crate::colony::hive::{RegisterHiveResponse, ServletAddressUpdateResponse};
 use crate::instrumentation::events::{
 	CLUSTER_HIVE_REGISTERED, CLUSTER_REGISTER_REFUSED, CLUSTER_UPDATE_ACCEPTED, CLUSTER_UPDATE_REFUSED,
 };
 use crate::policy::TransitStatus;
-use crate::trace::TraceCollector;
-use crate::utils::urn::Urn;
+use crate::transport::Protocol;
 use crate::Frame;
 use crate::TightBeamError;
 
-#[cfg(feature = "x509")]
-use crate::der::Encode;
-
-/// Admit a hive registration and install its servlet slate atomically.
-pub(crate) async fn handle_register(
-	frame: Frame,
-	request: RegisterHiveRequest,
-	registry: Arc<HiveRegistry>,
-	servlet_registry: Arc<ServletRegistry>,
-	config: Arc<ClusterConfig>,
-	trace: Arc<TraceCollector>,
-	replay_guard: &GatewayReplayGuard,
-) -> Result<Option<Frame>, TightBeamError> {
-	if let Err(status) = admit_hive_control(&config, &frame, replay_guard) {
-		return refuse_register(&frame, &trace, status);
-	}
-
-	// Instance URN locator MUST equal route address (CWE-639).
-	let locators_ok = request
-		.servlet_addresses
-		.iter()
-		.all(|info| servlet_locator_matches(&config.namespace, info));
-	if !locators_ok {
-		return refuse_register(&frame, &trace, TransitStatus::PermissionDenied);
-	}
-
-	// Refuse addresses that cannot mint an exact hive identity URN.
-	let Some(hive_identity) = mint_hive_identity(&config.namespace, &request.hive_addr) else {
-		return refuse_register(&frame, &trace, TransitStatus::PermissionDenied);
-	};
-
-	let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
-	let slate = build_servlet_slate(&request.servlet_addresses, &hive_addr, &config);
-	let signer_id = frame_signer_id(&frame);
-
-	// Atomic: hive entry + full slate, or roll back. Re-register replaces prior rows.
-	let registered = registry.register_with_signer(request, signer_id).and_then(|()| {
-		servlet_registry.reconcile_by_hive(&hive_addr, slate).inspect_err(|_| {
-			let _ = registry.unregister(&hive_addr);
-			let _ = servlet_registry.remove_by_hive(&hive_addr);
-		})
-	});
-
-	match registered {
-		Ok(()) => {
-			let hive_count = registry.len().unwrap_or_default() as u64;
-			trace.event_with(CLUSTER_HIVE_REGISTERED, &[], hive_count)?;
-
-			let response = RegisterHiveResponse { status: TransitStatus::Ok, hive_id: Some(hive_identity) };
-			reply_frame(&frame.metadata.id, response)
+impl<P: Protocol> GatewayRuntimeCtx<P> {
+	/// Admit one hive registration and install its servlet slate.
+	pub(crate) async fn handle_register(
+		&self,
+		frame: Frame,
+		request: RegisterHiveRequest,
+	) -> Result<Option<Frame>, TightBeamError>
+	where
+		P::Address: FromStr,
+	{
+		if let Err(status) = self.admit_hive_control(&frame) {
+			return self.refuse_register(&frame, status);
 		}
-		Err(_) => {
-			// Forget replay so a legitimate retry of the same signed frame can proceed.
-			refuse_register_release(&frame, &trace, replay_guard, TransitStatus::PermissionDenied)
+
+		// Each instance URN locator MUST equal its route address (CWE-639).
+		let locators_ok = request
+			.servlet_addresses
+			.iter()
+			.all(|info| self.config.namespace.locator_matches(info));
+		if !locators_ok {
+			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		}
-	}
-}
 
-/// Admit a servlet address update and apply the delta under signer bind.
-pub(crate) async fn handle_address_update(
-	frame: Frame,
-	update: ServletAddressUpdate,
-	registry: Arc<HiveRegistry>,
-	servlet_registry: Arc<ServletRegistry>,
-	config: Arc<ClusterConfig>,
-	trace: Arc<TraceCollector>,
-	replay_guard: &GatewayReplayGuard,
-) -> Result<Option<Frame>, TightBeamError> {
-	if let Err(status) = admit_hive_control(&config, &frame, replay_guard) {
-		return refuse_update(&frame, &trace, status);
-	}
+		// Admit only a hive address that yields an exact hive identity URN.
+		let Some(hive_identity) = self.config.namespace.hive_from_bytes(&request.hive_addr) else {
+			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
+		};
 
-	let Some((hive_id, added, removed)) = parse_address_update(&config, &update) else {
-		return refuse_update(&frame, &trace, TransitStatus::PermissionDenied);
-	};
-
-	// Signer MUST match the hive bound at registration (CWE-639).
-	if !signer_matches_bound_hive(&frame, &registry, &hive_id) {
-		return refuse_update_release(&frame, &trace, replay_guard, TransitStatus::PermissionDenied);
-	}
-
-	match servlet_registry.apply_address_update(&hive_id, added, &removed) {
-		Ok(()) => {
-			trace.event(CLUSTER_UPDATE_ACCEPTED)?;
-
-			let response = ServletAddressUpdateResponse { status: TransitStatus::Ok };
-			reply_frame(&frame.metadata.id, response)
+		// The heartbeat dials the control address, so a hive the protocol
+		// cannot parse would register, go unbeaten, and leave by silent
+		// eviction. The check runs before anything is installed.
+		let hive_addr: Arc<[u8]> = request.hive_addr.clone().into();
+		if DialTarget::of_registered(&hive_addr).protocol_address::<P::Address>().is_err() {
+			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
 		}
-		Err(_) => {
-			// Forget replay so the hive can resend the same signed update.
-			refuse_update_release(&frame, &trace, replay_guard, TransitStatus::PermissionDenied)
-		}
-	}
-}
 
-/// Origin and freshness gate shared by register and address-update.
-fn admit_hive_control(
-	config: &ClusterConfig,
-	frame: &Frame,
-	replay_guard: &GatewayReplayGuard,
-) -> Result<(), TransitStatus> {
-	let origin_status = verify_hive_origin(config, frame);
-	if origin_status != TransitStatus::Ok {
-		return Err(origin_status);
-	}
+		// A hive registered with no signer is claimable by the next signer
+		// that names it, so an identifier that does not encode refuses here
+		// rather than installing an unbound entry (CWE-639).
+		let Some(signer_id) = frame.signer_id().map(Arc::from) else {
+			return self.refuse_register(&frame, TransitStatus::PermissionDenied);
+		};
 
-	let freshness_status = verify_control_freshness(frame, replay_guard);
-	if freshness_status != TransitStatus::Ok {
-		return Err(freshness_status);
-	}
+		let slate = self.config.pheromone.servlet_slate(&request.servlet_addresses, &hive_addr);
+		// The membership step installs the hive entry and its full slate
+		// atomically, or rolls both back. A re-registration replaces the
+		// prior rows.
+		let registered = self.membership().admit(request, signer_id, slate);
+		let counted = registered.and_then(|()| self.registry.len());
+		match counted {
+			Ok(hive_count) => {
+				let hive_count = u64::try_from(hive_count).unwrap_or(u64::MAX);
+				self.trace.event_with(CLUSTER_HIVE_REGISTERED, &[], hive_count)?;
 
-	Ok(())
-}
-
-/// Instance URN locator bytes must equal the advertised servlet address.
-fn servlet_locator_matches(namespace: &ColonyNamespace, info: &ServletInfo) -> bool {
-	match namespace.validate(&info.servlet_id) {
-		Ok(ColonyResource::Servlet { instance: Some(locator), .. }) => locator.as_bytes() == info.address.as_slice(),
-		_ => false,
-	}
-}
-
-fn mint_hive_identity(namespace: &ColonyNamespace, hive_addr: &[u8]) -> Option<Urn<'static>> {
-	let addr = from_utf8(hive_addr).ok()?;
-	let hive = namespace.hive(addr).ok()?;
-	Some(hive)
-}
-
-fn build_servlet_slate(
-	servlet_addresses: &[ServletInfo],
-	hive_addr: &Arc<[u8]>,
-	config: &ClusterConfig,
-) -> Vec<ServletEntry> {
-	let initial_pheromone = config.pheromone.initial_pheromone;
-	let abandonment_limit = config.pheromone.abandonment_limit;
-	servlet_addresses
-		.iter()
-		.map(|info| {
-			ServletEntry::new(
-				Arc::from(info.address.as_slice()),
-				Arc::from(type_canonical_bytes(&info.servlet_id).as_slice()),
-				Arc::clone(hive_addr),
-				initial_pheromone,
-				abandonment_limit,
-			)
-		})
-		.collect()
-}
-
-/// Parsed address-update delta: hive id, added entries, removed locators.
-type ParsedAddressUpdate<'a> = (Arc<[u8]>, Vec<ServletEntry>, Vec<&'a [u8]>);
-
-/// Parse hive identity, added entries, and removed instance locators.
-///
-/// Returns `None` when the hive URN, any added locator, or any removed URN
-/// fails validation.
-fn parse_address_update<'a>(
-	config: &ClusterConfig,
-	update: &'a ServletAddressUpdate,
-) -> Option<ParsedAddressUpdate<'a>> {
-	let claimed = config.namespace.validate(&update.hive_id).ok()?;
-	let ColonyResource::Hive { addr } = claimed else {
-		return None;
-	};
-
-	let added_ok = update.added.iter().all(|info| servlet_locator_matches(&config.namespace, info));
-	if !added_ok {
-		return None;
-	}
-
-	let mut removed = Vec::with_capacity(update.removed.len());
-	for urn in &update.removed {
-		match config.namespace.validate(urn) {
-			Ok(ColonyResource::Servlet { instance: Some(locator), .. }) => {
-				removed.push(locator.as_bytes());
+				let response = RegisterHiveResponse { status: TransitStatus::Ok, hive_id: Some(hive_identity) };
+				reply_frame(frame.metadata().id(), response)
 			}
-			_ => return None,
+			Err(error) => {
+				// Releasing the replay slot lets a legitimate retry of the
+				// same signed frame proceed.
+				self.refuse_register_release(&frame, refusal_status(&error))
+			}
 		}
 	}
 
-	let hive_id = Arc::from(addr.as_bytes());
-	let added = build_servlet_slate(&update.added, &hive_id, config);
-	Some((hive_id, added, removed))
-}
+	/// Apply one hive's servlet address additions and removals.
+	pub(crate) async fn handle_address_update(
+		&self,
+		frame: Frame,
+		update: ServletAddressUpdate,
+	) -> Result<Option<Frame>, TightBeamError> {
+		if let Err(status) = self.admit_hive_control(&frame) {
+			return self.refuse_update(&frame, status);
+		}
 
-fn refuse_register(
-	frame: &Frame,
-	trace: &TraceCollector,
-	status: TransitStatus,
-) -> Result<Option<Frame>, TightBeamError> {
-	trace.event(CLUSTER_REGISTER_REFUSED)?;
+		let Some((added, removed)) = self.config.parse_address_update(&update) else {
+			return self.refuse_update(&frame, TransitStatus::PermissionDenied);
+		};
 
-	let response = RegisterHiveResponse { status, hive_id: None };
-	reply_frame(&frame.metadata.id, response)
-}
+		// A hive registered with no signer is claimable by the next signer
+		// that names it, so an unsigned update refuses here rather than
+		// reaching the bind check (CWE-639).
+		let Some(signer_id) = frame.signer_id().map(Arc::from) else {
+			return self.refuse_update_release(&frame, TransitStatus::PermissionDenied);
+		};
 
-fn refuse_register_release(
-	frame: &Frame,
-	trace: &TraceCollector,
-	replay_guard: &GatewayReplayGuard,
-	status: TransitStatus,
-) -> Result<Option<Frame>, TightBeamError> {
-	forget_replay(frame, replay_guard);
-	refuse_register(frame, trace, status)
-}
+		// The signer bind and the route write are one membership step, so
+		// a retirement cannot land between them (CWE-362).
+		match self.membership().update_addresses(&signer_id, added, &removed) {
+			Ok(()) => {
+				self.trace.event(CLUSTER_UPDATE_ACCEPTED)?;
 
-fn refuse_update(
-	frame: &Frame,
-	trace: &TraceCollector,
-	status: TransitStatus,
-) -> Result<Option<Frame>, TightBeamError> {
-	trace.event(CLUSTER_UPDATE_REFUSED)?;
+				let response = ServletAddressUpdateResponse { status: TransitStatus::Ok };
+				reply_frame(frame.metadata().id(), response)
+			}
+			Err(error) => {
+				// Releasing the replay slot lets the hive resend the same
+				// signed update.
+				self.refuse_update_release(&frame, refusal_status(&error))
+			}
+		}
+	}
 
-	let response = ServletAddressUpdateResponse { status };
-	reply_frame(&frame.metadata.id, response)
-}
+	/// Origin and freshness gate shared by register and address-update.
+	fn admit_hive_control(&self, frame: &Frame) -> Result<(), TransitStatus> {
+		self.config.verify_hive(frame)?;
 
-fn refuse_update_release(
-	frame: &Frame,
-	trace: &TraceCollector,
-	replay_guard: &GatewayReplayGuard,
-	status: TransitStatus,
-) -> Result<Option<Frame>, TightBeamError> {
-	forget_replay(frame, replay_guard);
-	refuse_update(frame, trace, status)
-}
+		let freshness_status = self.replay_guard.admits(frame);
+		if freshness_status != TransitStatus::Ok {
+			return Err(freshness_status);
+		}
 
-#[cfg(feature = "x509")]
-fn forget_replay(frame: &Frame, replay_guard: &GatewayReplayGuard) {
-	if let Some(signer_info) = frame.nonrepudiation.as_ref() {
-		replay_guard.forget(signer_info.signature.as_bytes());
+		Ok(())
+	}
+
+	/// Answer a registration with `status` and no hive identity.
+	fn refuse_register(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
+		self.trace.event(CLUSTER_REGISTER_REFUSED)?;
+
+		let response = RegisterHiveResponse { status, hive_id: None };
+		reply_frame(frame.metadata().id(), response)
+	}
+
+	/// Refuse a registration and return the replay slot the frame spent, so
+	/// the hive can retry the same signed frame.
+	fn refuse_register_release(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
+		self.replay_guard.release(frame);
+		self.refuse_register(frame, status)
+	}
+
+	/// Answer an address update with `status`.
+	fn refuse_update(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
+		self.trace.event(CLUSTER_UPDATE_REFUSED)?;
+
+		let response = ServletAddressUpdateResponse { status };
+		reply_frame(frame.metadata().id(), response)
+	}
+
+	/// Refuse an address update and return the replay slot the frame spent,
+	/// so the hive can resend the same signed update.
+	fn refuse_update_release(&self, frame: &Frame, status: TransitStatus) -> Result<Option<Frame>, TightBeamError> {
+		self.replay_guard.release(frame);
+		self.refuse_update(frame, status)
 	}
 }
 
-#[cfg(not(feature = "x509"))]
-fn forget_replay(_frame: &Frame, _replay_guard: &GatewayReplayGuard) {}
-
-#[cfg(feature = "x509")]
-fn frame_signer_id(frame: &Frame) -> Option<Arc<[u8]>> {
-	frame
-		.nonrepudiation
-		.as_ref()
-		.and_then(|info| Encode::to_der(&info.sid).ok())
-		.map(Arc::from)
-}
-
-#[cfg(not(feature = "x509"))]
-fn frame_signer_id(_frame: &Frame) -> Option<Arc<[u8]>> {
-	None
-}
-
-#[cfg(feature = "x509")]
-fn signer_matches_bound_hive(frame: &Frame, registry: &HiveRegistry, hive_id: &[u8]) -> bool {
-	match (frame.nonrepudiation.as_ref(), registry.signer_for(hive_id)) {
-		(Some(signer_info), Ok(Some(bound))) => match Encode::to_der(&signer_info.sid) {
-			Ok(sid) => sid.as_slice() == bound.as_ref(),
-			Err(_) => false,
-		},
-		_ => false,
+/// The status a refused membership move answers with.
+///
+/// A poisoned registry is this gateway's fault, so the hive is told the
+/// gateway is unavailable rather than that it lacks the right to register.
+/// Every other refusal is a claim the gateway judged and denied.
+fn refusal_status(error: &ClusterError) -> TransitStatus {
+	match error {
+		ClusterError::LockPoisoned => TransitStatus::Unavailable,
+		_ => TransitStatus::PermissionDenied,
 	}
-}
-
-#[cfg(not(feature = "x509"))]
-fn signer_matches_bound_hive(_frame: &Frame, _registry: &HiveRegistry, _hive_id: &[u8]) -> bool {
-	true
 }

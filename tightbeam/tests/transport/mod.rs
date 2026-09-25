@@ -12,6 +12,5 @@ mod paywall;
 mod pool_mux;
 mod receipt;
 mod split;
-mod sync_server;
 
 pub(crate) mod support;

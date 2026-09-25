@@ -4,22 +4,24 @@
 
 #![cfg(all(feature = "instrument", feature = "tokio", feature = "tcp", feature = "testing"))]
 
-use tightbeam::testing::{create_test_message, ClientEnv, ScenarioConfig, SetupEnv};
+use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestMessage};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
-use tightbeam::transport::{MessageEmitter, Protocol};
+use tightbeam::transport::{EndpointConfig, MessageEmitter, Protocol};
 use tightbeam::utils::urn::Urn;
-use tightbeam::{compose, server, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::{compose, exactly, server, tb_assert_spec, tb_process_spec, tb_scenario};
 
-pub(crate) const MESSAGE_COLLECT: Urn<'static> = Urn::new("test", "event:instrumentation-tests/message-collect");
-pub(crate) const MESSAGE_EMIT: Urn<'static> = Urn::new("test", "event:instrumentation-tests/message-emit");
+pub(crate) const MESSAGE_COLLECT: Urn<'static> = tightbeam::urn!("test", "event:instrumentation-tests/message-collect");
+pub(crate) const MESSAGE_EMIT: Urn<'static> = tightbeam::urn!("test", "event:instrumentation-tests/message-emit");
 
 tb_assert_spec! {
 	pub AutoInstrSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
-		assertions: []
+		assertions: [
+			(MESSAGE_EMIT, exactly!(1)),
+			(MESSAGE_COLLECT, exactly!(1))
+		]
 	}
 }
 
@@ -39,7 +41,7 @@ tb_process_spec! {
 }
 
 mod sink {
-	use std::sync::{Arc, Mutex};
+	use std::sync::Mutex;
 
 	use tightbeam::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
 	use tightbeam::trace::{TraceCollector, TraceConfig};
@@ -70,7 +72,8 @@ mod sink {
 		}
 	}
 
-	fn count_urn(drained: &[TbEvent], urn: tightbeam::utils::urn::Urn<'static>) -> usize {
+	fn count_urn(drained: impl AsRef<[TbEvent]>, urn: tightbeam::utils::urn::Urn<'static>) -> usize {
+		let drained = drained.as_ref();
 		drained.iter().filter(|e| e.urn == urn).count()
 	}
 
@@ -80,7 +83,7 @@ mod sink {
 		let collector = TraceCollector::from(
 			TraceConfig::builder()
 				.with_instrumentation(config)
-				.with_sink(Arc::new(LossFreeSink::default()))
+				.with_sink(LossFreeSink::default())
 				.build(),
 		);
 
@@ -133,16 +136,20 @@ tb_scenario! {
 			};
 			Ok((handle, addr))
 		},
-		client: |ClientEnv { addr, .. }| async move {
+		client: |ClientEnv { trace, addr, .. }| async move {
 			let stream = <TokioListener as Protocol>::connect(addr).await?;
-			let mut client = <TokioListener as Protocol>::create_transport(stream);
+			let mut client = <TokioListener as Protocol>::create_transport(stream, EndpointConfig::cleartext());
 
-			let test_message = create_test_message(None);
+			let test_message = TestMessage::sample(None);
 			let test_frame = compose! {
 				V0: id: "test", order: 1u64, message: test_message
 			}?;
 
-			let _response = client.emit(test_frame, None).await?;
+			trace.emit_event(MESSAGE_EMIT);
+			let response = client.emit(test_frame, None).await?;
+			trace.emit_event(MESSAGE_COLLECT);
+
+			assert!(response.is_some(), "the echo handler must return the frame it received");
 			Ok(())
 		}
 	}

@@ -5,23 +5,24 @@ use tightbeam::testing::fdr::{FdrConfig, FdrVerdict};
 use tightbeam::testing::fmea::{FmeaConfig, SeverityScale};
 use tightbeam::testing::{FaultModel, ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::utils::urn::Urn;
-use tightbeam::utils::BasisPoints;
-use tightbeam::{tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
+use tightbeam::{exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
 use safety_process::States;
 
-pub(crate) const ACTUATE: Urn<'static> = Urn::new("test", "event:fmea-basic/actuate");
-pub(crate) const SAFE_MODE: Urn<'static> = Urn::new("test", "event:fmea-basic/safe-mode");
-pub(crate) const SENSOR_READ: Urn<'static> = Urn::new("test", "event:fmea-basic/sensor-read");
-pub(crate) const VALIDATE: Urn<'static> = Urn::new("test", "event:fmea-basic/validate");
+pub(crate) const ACTUATE: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/actuate");
+pub(crate) const SAFE_MODE: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/safe-mode");
+pub(crate) const SENSOR_READ: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/sensor-read");
+pub(crate) const VALIDATE: Urn<'static> = tightbeam::urn!("test", "event:fmea-basic/validate");
 
-// Simple test spec for FMEA tests
 tb_assert_spec! {
 	pub FmeaTestSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
-		assertions: []
+		assertions: [
+			(SENSOR_READ, exactly!(1)),
+			(VALIDATE, exactly!(1)),
+			(ACTUATE, exactly!(1))
+		]
 	}
 }
 
@@ -60,7 +61,7 @@ impl From<SensorFault> for TightBeamError {
 fn create_test_config(scale: SeverityScale) -> FdrConfig {
 	let start_state = States::Idle;
 	let event = SENSOR_READ;
-	let probability_bps = BasisPoints::new(5000);
+	let probability_bps = tightbeam::bps!(5000);
 	let error_fn = || SensorFault;
 	let fault_model = FaultModel::default().with_fault(start_state, event, error_fn, probability_bps);
 
@@ -74,10 +75,9 @@ fn create_test_config(scale: SeverityScale) -> FdrConfig {
 	}
 }
 
-fn verify_fmea_report(verdict_opt: &Option<FdrVerdict>) -> Result<(), Box<dyn std::error::Error>> {
-	let verdict = verdict_opt.as_ref().ok_or("No FDR verdict")?;
+fn verify_fmea_report(verdict_opt: Option<&FdrVerdict>) -> Result<(), Box<dyn std::error::Error>> {
+	let verdict = verdict_opt.ok_or("No FDR verdict")?;
 	let fmea = verdict.fmea_report.as_ref().ok_or("FMEA report not generated")?;
-
 	assert!(!fmea.failure_modes.is_empty(), "Should have failure modes");
 	assert!(fmea.total_rpn > 0, "Total RPN should be positive");
 
@@ -89,13 +89,9 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(FmeaTestSpec::latest())
 		.with_fdr(create_test_config(SeverityScale::MilStd1629))
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				verify_fmea_report(&result.fdr_verdict).expect("FMEA verification failed");
-				Ok(())
-			})),
-			on_fail: None,
-		})
+		.with_hooks(TestHooks::on_pass(|context| {
+				verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -112,13 +108,9 @@ tb_scenario! {
 	config: ScenarioConfig::builder()
 		.with_spec(FmeaTestSpec::latest())
 		.with_fdr(create_test_config(SeverityScale::Iso26262))
-		.with_hooks(TestHooks {
-			on_pass: Some(std::sync::Arc::new(|result| {
-				verify_fmea_report(&result.fdr_verdict).expect("FMEA verification failed");
-				Ok(())
-			})),
-			on_fail: None,
-		})
+		.with_hooks(TestHooks::on_pass(|context| {
+				verify_fmea_report(context.verdict().fdr()).expect("FMEA verification failed");
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {

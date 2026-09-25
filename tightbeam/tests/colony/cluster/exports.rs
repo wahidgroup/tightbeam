@@ -28,6 +28,7 @@ use super::federation::{type_route_count, wait_for_type_routes};
 use super::streaming::{pooled_cluster_client, StreamEchoServlet};
 use tightbeam::colony::cluster::{ExportGate, ExportGrant, TrustPlanes};
 use tightbeam::der::Encode;
+use tightbeam::transport::state::ClientIdentity;
 
 /// Two organizations under split trust planes.
 ///
@@ -68,7 +69,7 @@ fn exports_ctx() -> ExportsCtx {
 /// - `hive_trust` anchors the organization's own identity.
 /// - `peer_trust` anchors only the external peer.
 fn split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> ClusterTlsConfig {
-	ClusterTlsConfig { peer_trust: Some(Arc::clone(&peer.trust)), ..cluster_tls_config(own) }
+	cluster_tls_config(own).with_peer_trust(Arc::clone(&peer.trust))
 }
 
 /// [`split_plane_tls`] with the inbound mutual-TLS accept plane on.
@@ -86,7 +87,12 @@ fn mtls_split_plane_tls(own: &ClusterTestCerts, peer: &ClusterTestCerts) -> Clus
 /// Exporter with a static export list and no advertise beat.
 ///
 /// Used by the stream-boundary scenario, which injects route claims directly.
-fn exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported: Vec<Urn<'static>>) -> ClusterConfig {
+fn exporter_conf(
+	own: &ClusterTestCerts,
+	peer: &ClusterTestCerts,
+	exported: impl IntoIterator<Item = Urn<'static>>,
+) -> ClusterConfig {
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(split_plane_tls(own, peer))
 		.with_exported_types(exported)
 		.build()
@@ -96,7 +102,12 @@ fn exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported: Vec<
 ///
 /// The gateway can then recognize a first-party origin session on an
 /// unexported target.
-fn mtls_exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported: Vec<Urn<'static>>) -> ClusterConfig {
+fn mtls_exporter_conf(
+	own: &ClusterTestCerts,
+	peer: &ClusterTestCerts,
+	exported: impl IntoIterator<Item = Urn<'static>>,
+) -> ClusterConfig {
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(mtls_split_plane_tls(own, peer))
 		.with_exported_types(exported)
 		.build()
@@ -109,9 +120,10 @@ fn mtls_exporter_conf(own: &ClusterTestCerts, peer: &ClusterTestCerts, exported:
 fn exporter_conf_with_gate(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
-	exported: Vec<Urn<'static>>,
+	exported: impl IntoIterator<Item = Urn<'static>>,
 	gate: Arc<dyn ExportGate>,
 ) -> ClusterConfig {
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(mtls_split_plane_tls(own, peer))
 		.with_exported_types(exported)
 		.with_export_gate(gate)
@@ -127,12 +139,15 @@ fn exporter_conf_with_gate(
 fn advertising_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
-	peer_addr: String,
-	exported: Vec<Urn<'static>>,
+	peer_addr: impl Into<String>,
+	exported: impl IntoIterator<Item = Urn<'static>>,
 	grant: Arc<dyn ExportGrant>,
 ) -> ClusterConfig {
+	let peer_addr: String = peer_addr.into();
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	ClusterConfig::builder(split_plane_tls(own, peer))
 		.with_peers([peer_addr])
+		.expect("fixture peers name sockets")
 		.with_advertise_interval(Duration::from_millis(100))
 		.with_rumor_refresh(Duration::from_millis(200))
 		.with_exported_types(exported)
@@ -149,9 +164,10 @@ fn grant_exporter_conf(
 	own: &ClusterTestCerts,
 	peer: &ClusterTestCerts,
 	extra: &ClusterTestCerts,
-	exported: Vec<Urn<'static>>,
+	exported: impl IntoIterator<Item = Urn<'static>>,
 	grant: Arc<dyn ExportGrant>,
 ) -> ClusterConfig {
+	let exported: Vec<Urn<'static>> = exported.into_iter().collect();
 	let mut tls = split_plane_tls(own, peer);
 	tls.client_validators = vec![combined_validator(&[&own.cert, &peer.cert, &extra.cert])];
 
@@ -198,12 +214,16 @@ async fn start_split_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
-	let exported = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_tls_config(&certs)?)).await?;
-	let hidden = ClusterTestServlet::start(Arc::new(trace.share()), Some(servlet_tls_config(&certs)?)).await?;
+	let exported = ClusterTestServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+	let hidden = ClusterTestServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
-	hive.register(servlet_urn("ping"), exported, |t| ClusterTestServlet::start(t, None))?;
-	hive.register(servlet_urn("ledger"), hidden, |t| ClusterTestServlet::start(t, None))?;
+	hive.register(servlet_urn("ping"), exported, |t| {
+		ClusterTestServlet::start(t, ServletConfig::default())
+	})?;
+	hive.register(servlet_urn("ledger"), hidden, |t| {
+		ClusterTestServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
@@ -216,12 +236,16 @@ async fn start_split_stream_hive(
 	trace: TraceCollector,
 	certs: Arc<ClusterTestCerts>,
 ) -> Result<ClusterTestHive, TightBeamError> {
-	let exported = StreamEchoServlet::start(Arc::new(trace.share()), Some(servlet_tls_config(&certs)?)).await?;
-	let hidden = StreamEchoServlet::start(Arc::new(trace.share()), Some(servlet_tls_config(&certs)?)).await?;
+	let exported = StreamEchoServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
+	let hidden = StreamEchoServlet::start(Arc::new(trace.share()), servlet_tls_config(&certs)?).await?;
 
 	let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
-	hive.register(servlet_urn("stream-echo"), exported, |t| StreamEchoServlet::start(t, None))?;
-	hive.register(servlet_urn("vault"), hidden, |t| StreamEchoServlet::start(t, None))?;
+	hive.register(servlet_urn("stream-echo"), exported, |t| {
+		StreamEchoServlet::start(t, ServletConfig::default())
+	})?;
+	hive.register(servlet_urn("vault"), hidden, |t| {
+		StreamEchoServlet::start(t, ServletConfig::default())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 	Ok(hive)
 }
@@ -231,10 +255,12 @@ async fn record_echo(
 	trace: &TraceCollector,
 	client: &mut GenericClient<TokioListener>,
 	key: &Secp256k1SigningKey,
-	type_name: &str,
-	id: &[u8],
+	type_name: impl AsRef<str>,
+	id: impl AsRef<[u8]>,
 	marker: Urn<'static>,
 ) -> Result<(), TightBeamError> {
+	let type_name = type_name.as_ref();
+	let id = id.as_ref();
 	trace.event(WORK_SENT)?;
 	let servlet_frame = emit_typed_work(client, key, type_name, id).await?;
 	let ping_response = decode_ping_echo(&servlet_frame)?;
@@ -251,12 +277,12 @@ async fn connect_with_identity(
 ) -> Result<GenericClient<TokioListener>, TightBeamError> {
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_trust_store(server_trust)
-		.with_client_identity(
+		.with_client_identity(ClientIdentity::from_spec(
 			CertificateSpec::Built(Box::new(identity.cert.to_owned())),
 			Arc::new(Secp256k1KeyProvider::from(identity.key.to_owned())),
-		)?
+		)?)
 		.build()
-		.connect(addr)
+		.connect(addr.to_owned())
 		.await?)
 }
 
@@ -264,7 +290,6 @@ tb_assert_spec! {
 	pub ClusterExportAdFilterSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_PEER_ADVERTISED, at_least!(1)),
@@ -319,7 +344,6 @@ tb_assert_spec! {
 	pub ClusterExportUnaryBoundarySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ADVERTISE_SENT, exactly!(1)),
@@ -410,7 +434,6 @@ tb_assert_spec! {
 	pub ClusterExportGrantSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ADVERTISE_SENT, exactly!(1)),
@@ -496,7 +519,6 @@ tb_assert_spec! {
 	pub ClusterExportStreamBoundarySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ADVERTISE_SENT, exactly!(1)),
@@ -588,7 +610,7 @@ tb_scenario! {
 			sink.close_with(b"efgh").await?;
 
 			let reply = response.await?.ok_or(TightBeamError::MissingResponse)?;
-			let echoed: PingResponse = decode(&reply.message)?;
+			let echoed: PingResponse = decode(reply.message())?;
 			trace.event_with(STREAM_ECHOED, &[], u64::from(echoed.doubled))?;
 
 			gateway_b.stop();
@@ -627,7 +649,6 @@ tb_assert_spec! {
 	pub ClusterExportCustomGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(PEER_ADVERTISE_SENT, exactly!(1)),

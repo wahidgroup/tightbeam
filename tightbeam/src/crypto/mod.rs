@@ -1,10 +1,10 @@
-/// Macro to define OID wrapper types with `AssociatedOid` implementation.
+/// Define an OID marker type that implements `AssociatedOid`.
 ///
-/// This reduces boilerplate for creating simple marker types that implement
-/// the `AssociatedOid` trait.
+/// The macro writes the boilerplate of a simple marker type and its
+/// `AssociatedOid` implementation.
 #[macro_export]
 macro_rules! define_oid_wrapper {
-	// Variant with doc comment and inline OID string
+	// This arm takes doc attributes and an inline OID string.
 	($(#[$meta:meta])* $name:ident, $oid_str:literal) => {
 		$(#[$meta])*
 		pub struct $name;
@@ -14,7 +14,7 @@ macro_rules! define_oid_wrapper {
 				$crate::asn1::ObjectIdentifier::new_unwrap($oid_str);
 		}
 	};
-	// Variant with doc comment and OID constant reference
+	// This arm takes doc attributes and a path to an OID constant.
 	($(#[$meta:meta])* $name:ident, $oid_const:path) => {
 		$(#[$meta])*
 		pub struct $name;
@@ -34,23 +34,19 @@ pub mod secret;
 pub mod aead;
 #[cfg(feature = "digest")]
 pub mod commitment;
-#[cfg(feature = "ecdh")]
-pub mod curves;
 #[cfg(feature = "ecies")]
 pub mod ecies;
 #[cfg(any(feature = "digest", feature = "sha3"))]
 pub mod hash;
 #[cfg(feature = "kdf")]
 pub mod kdf;
-#[cfg(feature = "kem")]
-pub mod kem;
 #[cfg(feature = "signature")]
 pub mod sign;
 #[cfg(feature = "x509")]
 pub mod x509;
 
-// Re-exports
 pub use crypto_common as common;
+pub use subtle;
 
 #[cfg(feature = "kdf")]
 pub use hkdf;

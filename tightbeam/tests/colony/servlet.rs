@@ -7,7 +7,7 @@ use tightbeam::{
 	compose,
 	compress::ZstdCompression,
 	crypto::{
-		aead::{Aes256Gcm, Aes256GcmOid, KeyInit},
+		aead::{Aes256Gcm, KeyInit},
 		common::Key,
 		hash::Sha3_256,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey},
@@ -17,22 +17,22 @@ use tightbeam::{
 	exactly,
 	policy::{GatePolicy, SessionContext, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{create_test_signing_key, ClientEnv, ServletEnv, SetupEnv},
+	testing::{ClientEnv, ServletEnv, SetupEnv, TestKey},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	utils::urn::Urn,
 	worker, Beamable, Frame, TightBeamError,
 };
 
-pub(crate) const DOUBLER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/doubler-process");
-pub(crate) const SECURE_FRAME_CLEARTEXT: Urn<'static> = Urn::new("test", "event:servlet/secure-frame-cleartext");
-pub(crate) const SECURE_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/secure-receive");
-pub(crate) const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/servlet-receive");
-pub(crate) const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:servlet/servlet-respond");
-pub(crate) const SQUARER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/squarer-process");
-pub(crate) const VERIFY_DOUBLED: Urn<'static> = Urn::new("test", "event:servlet/verify-doubled");
-pub(crate) const VERIFY_FINAL_RESULT: Urn<'static> = Urn::new("test", "event:servlet/verify-final-result");
-pub(crate) const VERIFY_SECURE_DOUBLED: Urn<'static> = Urn::new("test", "event:servlet/verify-secure-doubled");
-pub(crate) const VERIFY_SQUARED: Urn<'static> = Urn::new("test", "event:servlet/verify-squared");
+pub(crate) const DOUBLER_PROCESS: Urn<'static> = tightbeam::urn!("test", "event:servlet/doubler-process");
+pub(crate) const SECURE_FRAME_CLEARTEXT: Urn<'static> = tightbeam::urn!("test", "event:servlet/secure-frame-cleartext");
+pub(crate) const SECURE_RECEIVE: Urn<'static> = tightbeam::urn!("test", "event:servlet/secure-receive");
+pub(crate) const SERVLET_RECEIVE: Urn<'static> = tightbeam::urn!("test", "event:servlet/servlet-receive");
+pub(crate) const SERVLET_RESPOND: Urn<'static> = tightbeam::urn!("test", "event:servlet/servlet-respond");
+pub(crate) const SQUARER_PROCESS: Urn<'static> = tightbeam::urn!("test", "event:servlet/squarer-process");
+pub(crate) const VERIFY_DOUBLED: Urn<'static> = tightbeam::urn!("test", "event:servlet/verify-doubled");
+pub(crate) const VERIFY_FINAL_RESULT: Urn<'static> = tightbeam::urn!("test", "event:servlet/verify-final-result");
+pub(crate) const VERIFY_SECURE_DOUBLED: Urn<'static> = tightbeam::urn!("test", "event:servlet/verify-secure-doubled");
+pub(crate) const VERIFY_SQUARED: Urn<'static> = tightbeam::urn!("test", "event:servlet/verify-squared");
 
 // ============================================================================
 // Messages
@@ -93,7 +93,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: |request, frame, ctx| async move {
 		let trace = ctx.trace();
-		let config: &CalcServletConfig = ctx.env_config()?;
+		let config: &CalcServletConfig = ctx.env_config();
 
 		trace.event(SERVLET_RECEIVE)?;
 
@@ -128,7 +128,6 @@ tb_assert_spec! {
 	pub CalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVLET_RECEIVE, exactly!(1)),
 			(DOUBLER_PROCESS, exactly!(1)),
@@ -163,10 +162,10 @@ tb_scenario! {
 				.with_worker(squarer)
 				.build();
 
-			CalcServlet::start(trace, Some(servlet_conf)).await
+			CalcServlet::start(trace, servlet_conf).await
 		},
 		setup: |ClientEnv { addr, .. }| async move {
-			let builder = ClientBuilder::<TokioListener>::builder().build();
+			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
@@ -177,7 +176,7 @@ tb_scenario! {
 			}?;
 
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response: CalcResponse = decode(&response_frame.message)?;
+			let response: CalcResponse = decode(response_frame.message())?;
 
 			trace.event_with(VERIFY_DOUBLED, &[], response.doubled)?;
 			trace.event_with(VERIFY_SQUARED, &[], response.squared)?;
@@ -229,7 +228,7 @@ servlet! {
 		trace.event(SECURE_RECEIVE)?;
 		trace.event_with(SECURE_FRAME_CLEARTEXT,
 			&[],
-			u32::from(frame.metadata.confidentiality.is_none() && frame.metadata.compactness.is_none()),
+			u32::from(frame.metadata().confidentiality().is_none() && frame.metadata().compactness().is_none()),
 		)?;
 
 		let doubled = request.value * 2;
@@ -244,7 +243,6 @@ tb_assert_spec! {
 	pub SecureCalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SECURE_RECEIVE, exactly!(1)),
 			(SECURE_FRAME_CLEARTEXT, exactly!(1), equals!(1u32)),
@@ -264,7 +262,7 @@ tb_scenario! {
 		},
 		start: |SetupEnv { trace, context: config }| async move {
 			let trace = Arc::new(trace);
-			let verifying_key = *create_test_signing_key().verifying_key();
+			let verifying_key = *TestKey::insecure_fixed_signing().verifying_key();
 			let servlet_conf = ServletConfig::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
 				.with_collector_gate(SignatureGate { verifying_key })
@@ -272,10 +270,10 @@ tb_scenario! {
 				.with_message_inflator(ZstdCompression::default())
 				.build();
 
-			SecureCalcServlet::start(trace, Some(servlet_conf)).await
+			SecureCalcServlet::start(trace, servlet_conf).await
 		},
 		setup: |ClientEnv { addr, .. }| async move {
-			let builder = ClientBuilder::<TokioListener>::builder().build();
+			let builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
@@ -285,14 +283,14 @@ tb_scenario! {
 					order: 1u64,
 					message: CalcRequest { value: config.value },
 					compactness: ZstdCompression::default(),
-					confidentiality<Aes256GcmOid, _>: shared_cipher(),
-					nonrepudiation<Secp256k1Signature, _>: create_test_signing_key(),
+					confidentiality: shared_cipher(),
+					nonrepudiation<Secp256k1Signature, _>: TestKey::insecure_fixed_signing(),
 					message_integrity<Sha3_256>: [],
 					frame_integrity: type Sha3_256
 			}?;
 
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
-			let response: CalcResponse = decode(&response_frame.message)?;
+			let response: CalcResponse = decode(response_frame.message())?;
 
 			trace.event_with(VERIFY_SECURE_DOUBLED, &[], response.doubled)?;
 

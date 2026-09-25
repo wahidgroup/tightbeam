@@ -81,9 +81,12 @@ pub enum TransportFailure {
 
 /// Transport error types
 #[derive(Debug, Errorizable)]
+#[non_exhaustive]
 pub enum TransportError {
 	#[error("Connection closed gracefully")]
 	ConnectionClosed,
+	#[error("Peer closed the connection before the handshake completed")]
+	PeerClosedBeforeHandshake,
 	#[error("Connection failed")]
 	ConnectionFailed,
 	#[error("Send failed")]
@@ -94,6 +97,8 @@ pub enum TransportError {
 	UnsupportedHandshakeProtocol(HandshakeProtocolKind),
 	#[error("Server certificate chain required but not provisioned")]
 	MissingServerCertificateChain,
+	#[error("Client has no trust store: install one or call allow_cleartext to choose cleartext")]
+	PeerAuthenticationUnconfigured,
 	#[error("Invalid message")]
 	InvalidMessage,
 	#[error("Invalid reply")]

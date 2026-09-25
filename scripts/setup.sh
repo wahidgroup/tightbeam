@@ -7,6 +7,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOOL_VERSION="$ROOT/scripts/tool-version.sh"
+TOOL_INSTALLED="$ROOT/scripts/tool-installed.sh"
 STAMP_DIR="$ROOT/.make"
 SETUP_HASH_FILE="$STAMP_DIR/setup.hash"
 LOCK_FILE="$STAMP_DIR/setup.lock"
@@ -33,6 +34,7 @@ compute_setup_hash() {
 			"$ROOT/typos.toml" \
 			"$ROOT/scripts/setup.sh" \
 			"$ROOT/scripts/tool-version.sh" \
+			"$ROOT/scripts/tool-installed.sh" \
 			2>/dev/null
 	} | "${SHA256_CMD[@]}" | awk '{ print $1 }'
 }
@@ -41,43 +43,31 @@ pinned() {
 	"$TOOL_VERSION" "$1"
 }
 
-tool_at_version() {
-	local binary="$1"
-	local version="$2"
-	local probe=(--version)
-
-	command -v "$binary" >/dev/null 2>&1 || return 1
-
-	if [ "$binary" = "cargo-afl" ]; then
-		probe=(afl --version)
-	fi
-
-	"$binary" "${probe[@]}" 2>/dev/null | grep -qE "(^|[[:space:]])${version}([[:space:]]|\$)"
+pinned_crates() {
+	"$TOOL_VERSION" --list
 }
 
 install_pinned() {
-	local binary="$1"
-	local crate="$2"
-	local version="$3"
+	local crate="$1"
+	local version
 
-	if tool_at_version "$binary" "$version"; then
+	if "$TOOL_INSTALLED" "$crate"; then
 		return 0
 	fi
 
+	version="$(pinned "$crate")"
 	echo "Installing $crate $version..."
 	cargo install "$crate" --version "$version" --locked --force
 }
 
 setup_required() {
-	if ! tool_at_version cargo-audit "$(pinned cargo-audit)"; then
-		return 0
-	fi
-	if ! tool_at_version typos "$(pinned typos-cli)"; then
-		return 0
-	fi
-	if ! tool_at_version cargo-afl "$(pinned cargo-afl)"; then
-		return 0
-	fi
+	local crate
+	while read -r crate; do
+		if ! "$TOOL_INSTALLED" "$crate"; then
+			return 0
+		fi
+	done < <(pinned_crates)
+
 	if [ ! -f "$SETUP_HASH_FILE" ]; then
 		return 0
 	fi
@@ -132,9 +122,10 @@ install_rust_tooling() {
 	rustup toolchain install
 	rustup component add rustfmt clippy
 
-	install_pinned cargo-audit cargo-audit "$(pinned cargo-audit)"
-	install_pinned typos typos-cli "$(pinned typos-cli)"
-	install_pinned cargo-afl cargo-afl "$(pinned cargo-afl)"
+	local crate
+	while read -r crate; do
+		install_pinned "$crate"
+	done < <(pinned_crates)
 }
 
 main() {

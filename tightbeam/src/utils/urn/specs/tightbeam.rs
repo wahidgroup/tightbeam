@@ -8,18 +8,9 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
-#[cfg(all(feature = "std", not(feature = "derive")))]
-use std::borrow::Cow;
-
 use crate::utils::urn::builders::spec::Pattern;
 use crate::utils::urn::UrnValidationError;
 
-#[cfg(not(feature = "derive"))]
-use crate::utils::urn::spec::UrnSpec;
-#[cfg(not(feature = "derive"))]
-use crate::utils::urn::UrnComponents;
-
-#[cfg(feature = "derive")]
 crate::urn_spec! {
 	/// TightbeamUrnSpec URN specification
 	///
@@ -39,83 +30,6 @@ crate::urn_spec! {
 				*value = value.to_lowercase().into();
 			}
 		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-/// TightbeamUrnSpec URN specification
-///
-/// Format: `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`
-pub struct TightbeamUrnSpec;
-
-#[cfg(not(feature = "derive"))]
-impl UrnSpec for TightbeamUrnSpec {
-	const NID: &'static str = "tightbeam";
-
-	fn transform<'a>(components: &mut dyn UrnComponents<'a>) {
-		// Normalize resource_type to lowercase
-		for (key, value) in components.iter_mut() {
-			if key == "resource_type" {
-				*value = value.to_lowercase().into();
-			}
-		}
-	}
-
-	fn validate<'a>(components: &dyn UrnComponents<'a>) -> Result<(), UrnValidationError> {
-		// Validate category: required and must equal "instrumentation"
-		let category = components
-			.get_component("category")
-			.ok_or_else(|| UrnValidationError::RequiredFieldMissing("category"))?;
-		if category.as_ref() != "instrumentation" {
-			return Err(UrnValidationError::InvalidFormat { field: "category", pattern: None });
-		}
-
-		// Validate resource_type: required and must be one of ["trace", "event", "seed", "verdict"]
-		let resource_type = components
-			.get_component("resource_type")
-			.ok_or_else(|| UrnValidationError::RequiredFieldMissing("resource_type"))?;
-		let valid_types = &["trace", "event", "seed", "verdict"];
-		if !valid_types.iter().any(|&t| resource_type.as_ref() == t) {
-			return Err(UrnValidationError::InvalidFormat { field: "resource_type", pattern: None });
-		}
-
-		// Validate resource_id: required and must match AlphaNumericHyphen pattern
-		let resource_id = components
-			.get_component("resource_id")
-			.ok_or_else(|| UrnValidationError::RequiredFieldMissing("resource_id"))?;
-		if !Pattern::AlphaNumericHyphen.matches(resource_id.as_ref()) {
-			return Err(UrnValidationError::InvalidFormat {
-				field: "resource_id",
-				pattern: Some(Pattern::AlphaNumericHyphen),
-			});
-		}
-
-		Ok(())
-	}
-
-	fn build_nss<'a>(components: &dyn UrnComponents<'a>) -> Result<Cow<'static, str>, UrnValidationError> {
-		let category = components
-			.get_component("category")
-			.ok_or_else(|| UrnValidationError::RequiredFieldMissing("category"))?;
-		let resource_type = components
-			.get_component("resource_type")
-			.ok_or_else(|| UrnValidationError::RequiredFieldMissing("resource_type"))?;
-		let resource_id = components
-			.get_component("resource_id")
-			.ok_or_else(|| UrnValidationError::RequiredFieldMissing("resource_id"))?;
-
-		let mut result = "{}:{}/{}".to_string();
-		if let Some(pos) = result.find("{}") {
-			result.replace_range(pos..pos + 2, category.as_ref());
-		}
-		if let Some(pos) = result.find("{}") {
-			result.replace_range(pos..pos + 2, resource_type.as_ref());
-		}
-		if let Some(pos) = result.find("{}") {
-			result.replace_range(pos..pos + 2, resource_id.as_ref());
-		}
-
-		Ok(result.into())
 	}
 }
 
@@ -243,14 +157,13 @@ mod tests {
 	}
 
 	#[cfg(feature = "testing")]
-	const URN_STRING: Urn<'static> = Urn::new("test", "event:urn-spec/urn-string");
+	const URN_STRING: Urn<'static> = crate::urn!("test", "event:urn-spec/urn-string");
 
 	#[cfg(feature = "testing")]
 	tb_assert_spec! {
 		pub TightbeamUrnSpecSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(URN_STRING, exactly!(1), equals!("urn:tightbeam:instrumentation:trace/abc-123"))
 			]

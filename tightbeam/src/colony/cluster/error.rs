@@ -1,5 +1,8 @@
 //! Cluster gateway error types.
 
+use core::net::AddrParseError;
+
+use crate::policy::TransitStatus;
 use crate::transport::error::TransportError;
 use crate::{Errorizable, TightBeamError};
 
@@ -13,6 +16,15 @@ pub enum ClusterError {
 	/// Lock poisoned
 	#[error("Lock poisoned")]
 	LockPoisoned,
+
+	/// A configured peer or allowlist entry names no socket address
+	#[error("Peer address does not parse")]
+	InvalidPeerAddress,
+
+	/// A federating gateway bound the wildcard address and configured no
+	/// advertise address, so every peer would refuse its advertisement.
+	#[error("A wildcard bind needs an advertise address to federate")]
+	AdvertiseAddressRequired,
 
 	/// Unknown servlet type
 	#[error("Unknown servlet type: {:#?}")]
@@ -33,13 +45,11 @@ pub enum ClusterError {
 	/// Transport-level failure while communicating with a hive/servlet
 	#[error("Transport error: {0}")]
 	#[from]
-	#[source]
 	Transport(TransportError),
 
 	/// Frame encode/decode/build/sign failure
 	#[error("Frame error: {0}")]
 	#[from]
-	#[source]
 	Frame(TightBeamError),
 
 	/// Response decoded but did not carry the expected field
@@ -89,6 +99,29 @@ pub enum ClusterError {
 	/// Reconcile reply exceeded the want-list or peer-exchange cap
 	#[error("Oversized reconcile reply")]
 	OversizedReconcileReply,
+}
+
+impl From<AddrParseError> for ClusterError {
+	fn from(_: AddrParseError) -> Self {
+		Self::InvalidPeerAddress
+	}
+}
+
+impl ClusterError {
+	/// Transit status a failed forward relays to the caller.
+	///
+	/// A servlet refusal relays unchanged so the caller keeps its
+	/// retryability contract. Everything else degrades to
+	/// [`TransitStatus::Unavailable`].
+	#[must_use]
+	pub(crate) fn forward_status(self) -> TransitStatus {
+		match self {
+			ClusterError::Transport(TransportError::OperationFailed(failure)) => {
+				TransitStatus::try_from(failure).unwrap_or(TransitStatus::Unavailable)
+			}
+			_ => TransitStatus::Unavailable,
+		}
+	}
 }
 
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {

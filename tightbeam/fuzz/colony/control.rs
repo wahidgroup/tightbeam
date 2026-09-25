@@ -14,9 +14,9 @@ use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::decode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, GenericClient, Protocol};
-use tightbeam::utils::compose as frame_compose;
 use tightbeam::utils::urn::Urn;
 use tightbeam::{TightBeamError, Version};
 
@@ -25,8 +25,8 @@ use crate::events;
 use crate::fixtures::ClusterTestCerts;
 use crate::topology::OrgNode;
 
-/// Fixed control order base. Paired with a wide freshness window so AFL
-/// signatures stay byte-stable across runs.
+/// The fixed base for control-frame orders. A wide freshness window pairs
+/// with it, so AFL signatures stay byte-stable across runs.
 pub(crate) const CONTROL_ORDER_BASE: u64 = 1_700_000_000_000;
 
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -34,18 +34,21 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Sign a cluster control request with a deterministic order.
 pub(crate) async fn signed_control_frame(
 	key: &Secp256k1SigningKey,
-	id: &[u8],
+	id: impl AsRef<[u8]>,
 	request: ClusterRequest,
 	order: u64,
 ) -> Result<tightbeam::Frame, TightBeamError> {
-	let unsigned = frame_compose(Version::V0)
+	let id = id.as_ref();
+	let mut signed = Version::V1
+		.compose()
 		.with_id(id)
 		.with_order(order)
 		.with_message(request)
 		.build()?;
 
 	let provider = Secp256k1KeyProvider::from(key.to_owned());
-	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+	signed.sign_with_provider::<Sha3_256, _>(&provider).await?;
+	Ok(signed)
 }
 
 async fn connect_as(
@@ -59,29 +62,30 @@ async fn connect_as(
 	Ok(ClientBuilder::<TokioListener>::builder()
 		.with_timeout(CLIENT_IO_TIMEOUT)
 		.with_trust_store(server_trust)
-		.with_client_identity(cert, key)?
+		.with_client_identity(ClientIdentity::from_spec(cert, key)?)
 		.build()
-		.connect(addr)
+		.connect(addr.to_owned())
 		.await?)
 }
 
-/// Send one signed advertisement and classify the wire outcome.
+/// Sends one signed advertisement and classifies the answer.
 ///
-/// The dial validates the receiver's server certificate with the
-/// receiver's own trust. Connect failures classify as
-/// [`AuthzClass::InfraFail`], matching the work-path absorption rule.
-///
-/// The `PEER_AD_OK` / `PEER_AD_DENIED` outcome events stay the caller's
-/// responsibility through `record_authz_oracle`, so every advertise path
-/// emits them exactly once beside the shadow comparison.
+/// - The dial validates the receiver's server certificate with the receiver's own trust.
+/// - A connect failure classifies as [`AuthzClass::InfraFail`], which matches
+///   the work-path absorption rule.
+/// - The caller emits the `PEER_AD_OK` and `PEER_AD_DENIED` outcome events
+///   through `record_authz_oracle`, so every advertise path emits them exactly
+///   once beside the shadow comparison.
 async fn emit_advertise(
 	trace: &TraceCollector,
 	signer: &OrgNode,
 	receiver: &OrgNode,
-	gateway_addr: Vec<u8>,
-	types: Vec<Urn<'static>>,
+	gateway_addr: impl Into<Vec<u8>>,
+	types: impl IntoIterator<Item = Urn<'static>>,
 	order: u64,
 ) -> Result<AuthzClass, TightBeamError> {
+	let gateway_addr: Vec<u8> = gateway_addr.into();
+	let types: Vec<Urn<'static>> = types.into_iter().collect();
 	let request = ClusterRequest::AdvertisePeer(PeerAdvertisement { gateway_addr, advertised_types: types });
 	let frame = match signed_control_frame(&signer.certs.key, b"peer-advertise", request, order).await {
 		Ok(frame) => frame,
@@ -100,12 +104,12 @@ async fn emit_advertise(
 		Ok(Some(frame)) => frame,
 		Ok(None) | Err(_) => return Ok(AuthzClass::InfraFail),
 	};
-	let response: PeerAdvertisementResponse = match decode(&response_frame.message) {
+	let response: PeerAdvertisementResponse = match decode(response_frame.message()) {
 		Ok(response) => response,
 		Err(_) => return Ok(AuthzClass::InfraFail),
 	};
 	if response.status == TransitStatus::Ok {
-		trace.event_with(events::PEER_ROUTES_AFTER, &[], receiver.gateway.peer_servlets().len() as u64)?;
+		trace.event_with(events::PEER_ROUTES_AFTER, &[], receiver.gateway.peer_servlets()?.len() as u64)?;
 		return Ok(AuthzClass::Success);
 	}
 
@@ -121,9 +125,10 @@ pub(crate) async fn advertise_peer_types(
 	trace: &TraceCollector,
 	advertiser: &OrgNode,
 	receiver: &OrgNode,
-	types: Vec<Urn<'static>>,
+	types: impl IntoIterator<Item = Urn<'static>>,
 	order: u64,
 ) -> Result<AuthzClass, TightBeamError> {
+	let types: Vec<Urn<'static>> = types.into_iter().collect();
 	let gateway_addr: Vec<u8> = (*advertiser.gateway.addr()).into();
 	emit_advertise(trace, advertiser, receiver, gateway_addr, types, order).await
 }
@@ -133,9 +138,11 @@ pub(crate) async fn advertise_peer_at(
 	trace: &TraceCollector,
 	signer: &OrgNode,
 	receiver: &OrgNode,
-	gateway_addr: &[u8],
-	types: Vec<Urn<'static>>,
+	gateway_addr: impl AsRef<[u8]>,
+	types: impl IntoIterator<Item = Urn<'static>>,
 	order: u64,
 ) -> Result<AuthzClass, TightBeamError> {
+	let gateway_addr = gateway_addr.as_ref();
+	let types: Vec<Urn<'static>> = types.into_iter().collect();
 	emit_advertise(trace, signer, receiver, gateway_addr.to_vec(), types, order).await
 }

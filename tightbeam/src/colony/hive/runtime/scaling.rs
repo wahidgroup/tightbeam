@@ -3,355 +3,357 @@
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::colony::common::{
-	aggregate_utilization, canonical_bytes, type_prefix_bytes, ScalingDecision, ScalingMetrics, ServletInfo,
-	ServletScaleConfig,
+	aggregate_utilization, ScalingDecision, ScalingMetrics, ServletChange, ServletInfo, ServletScaleConfig, TaskGroup,
 };
-use crate::colony::hive::runtime::{insert_instance, instance_urn, notify_cluster, remove_instance, HiveContextImpl};
+use crate::colony::hive::runtime::{ClusterLink, HiveContextImpl, HiveInstances};
 use crate::colony::hive::{HashMapRegistry, HiveConfig, ServletRegistration, ServletRegistry, SpawnerFn};
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::trace::TraceCollector;
-use crate::transport::{MessageEmitter, Protocol, X509ClientConfig};
+use crate::transport::{MessageEmitter, Protocol};
+use crate::utils::time::{Clock, MonotonicInstant};
 use crate::utils::urn::Urn;
+use crate::utils::BasisPoints;
 use crate::TightBeamError;
 
-/// Shared handles for the hive auto-scaling loop.
-pub struct ScalingTaskCtx<P: Protocol> {
-	/// Registered servlet instances keyed by instance URN bytes.
+/// The shared handles that the hive auto-scaling loop runs on.
+pub struct ScalingLoop<P: Protocol> {
+	/// The registered servlet instances, keyed by instance URN bytes.
 	pub servlets: Arc<HashMapRegistry>,
-	/// Per-type spawners used when scaling up.
+	/// The per-type spawners that a scale-up calls.
 	pub spawners: Arc<HashMap<Urn<'static>, SpawnerFn>>,
-	/// Hive-level instrumentation collector.
+	/// The hive-level trace collector, shared with each spawned servlet.
 	pub trace: Arc<TraceCollector>,
-	/// Aggregate utilization published for manage-path backpressure.
+	/// The aggregate utilization, published for manage-path backpressure.
 	pub utilization: Arc<AtomicU16>,
-	/// Per-instance utilization samples keyed by instance URN bytes.
+	/// The per-instance utilization samples, keyed by instance URN bytes.
 	pub utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
-	/// Gateways that receive scaling address updates.
+	/// The gateways that receive scaling address updates.
 	pub cluster_addrs: Arc<RwLock<Vec<P::Address>>>,
-	/// Intra-hive route maps updated when instances appear or leave.
+	/// The intra-hive route maps, updated when instances appear or leave.
 	pub hive_context: Arc<HiveContextImpl<P>>,
-	/// Hive control-plane address used to mint the hive URN.
-	pub hive_addr: P::Address,
-	/// Scaling thresholds, cooldowns, and notify retry policy.
+	/// The hive control-plane address that the hive URN derives from.
+	///
+	/// It is [`None`] for a hive with no control plane, which scales its own
+	/// servlets but announces to no cluster.
+	pub hive_addr: Option<P::Address>,
+	/// The hive configuration, which carries the scaling thresholds, the
+	/// cooldowns, and the notify retry policy.
 	pub config: HiveConfig,
+	/// The owner of the gateway notifications that this loop starts.
+	pub tasks: TaskGroup,
 }
 
-/// Spawn the cooling-loop task that scales servlet instances per type.
-pub fn spawn_scaling_task<P>(ctx: ScalingTaskCtx<P>) -> rt::JoinHandle
+impl<P> ScalingLoop<P>
 where
+	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
 	P: Protocol + Send + Sync + 'static,
 	P::Address: Clone + Copy + Send + Sync + 'static,
 	P::Stream: Send + 'static,
 	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
+	P::Transport: MessageEmitter + Send + Sync + 'static,
 	TightBeamError: From<P::Error>,
 {
-	let ScalingTaskCtx {
-		servlets,
-		spawners,
-		trace,
-		utilization,
-		utilization_map,
-		cluster_addrs,
-		hive_context,
-		hive_addr,
-		config,
-	} = ctx;
-	let config = Arc::new(config);
-	let hive_urn = mint_hive_urn(hive_addr, &config);
+	/// Spawns the loop that evaluates each servlet type once per cooldown and
+	/// scales its instances.
+	pub fn spawn(self) -> rt::JoinHandle {
+		let ScalingLoop {
+			servlets,
+			spawners,
+			trace,
+			utilization,
+			utilization_map,
+			cluster_addrs,
+			hive_context,
+			hive_addr,
+			config,
+			tasks,
+		} = self;
 
-	rt::spawn(async move {
-		let mut last_scale_up: HashMap<Vec<u8>, Instant> = HashMap::new();
-		let mut last_scale_down: HashMap<Vec<u8>, Instant> = HashMap::new();
+		let config = Arc::new(config);
+		let link = hive_addr.map(|addr| {
+			ClusterLink::<P>::new(Arc::clone(&servlets), Arc::clone(&cluster_addrs), addr, Arc::clone(&config))
+		});
+		let evaluation_period = config.scaling.cooldown;
+		let task = ScalingTask {
+			hive_urn: hive_addr.and_then(|addr| config.hive_urn(addr)).map(Arc::new),
+			servlets,
+			trace,
+			utilization,
+			utilization_map,
+			hive_context,
+			link,
+			config,
+			tasks,
+		};
 
-		loop {
-			tokio::time::sleep(config.scaling.cooldown).await;
+		rt::spawn(async move {
+			let clock = Arc::clone(&task.config.clock);
+			let mut scaled_up = Cooldowns::new(Arc::clone(&clock));
+			let mut scaled_down = Cooldowns::new(Arc::clone(&clock));
 
-			let scale_blocked = is_scale_blocked(hive_urn.is_none(), &cluster_addrs);
-			let mut hive_total_util = 0u64;
-			let mut hive_total_count = 0usize;
-			for (servlet_type, spawner) in spawners.iter() {
-				let type_key = canonical_bytes(servlet_type);
-				let type_prefix = type_prefix_bytes(servlet_type);
-				let scale_conf = scale_config_for(&config, servlet_type);
-				let (count, util_sum) = collect_type_load(&servlets, &utilization_map, &type_prefix);
+			loop {
+				clock.sleep(evaluation_period).await;
 
-				hive_total_util += util_sum;
-				hive_total_count += count;
+				let mut hive_load = TypeLoad::default();
+				for (servlet_type, spawner) in spawners.iter() {
+					let scale = task.config.scaling.scale_config(servlet_type);
+					let load = task.type_load(servlet_type.type_prefix_bytes());
+					let metrics = ScalingMetrics {
+						servlet_type: servlet_type.clone(),
+						utilization: load.utilization(),
+						current_instances: load.instances,
+						config: scale,
+					};
 
-				let metrics = ScalingMetrics {
-					servlet_type: servlet_type.clone(),
-					utilization: aggregate_utilization(util_sum, count),
-					current_instances: count,
-					config: scale_conf,
-				};
+					hive_load.absorb(&load);
 
-				match ScalingDecision::evaluate(&metrics) {
-					ScalingDecision::ScaleUp => {
-						let scaled = try_scale_up::<P>(ScaleUp {
-							gate: ScaleGate {
-								scale_blocked,
-								type_key: &type_key,
-								cooldown: scale_conf.scale_up_cooldown,
-								last_action: &last_scale_up,
-							},
-							servlets: &servlets,
-							hive_context: &hive_context,
-							cluster_addrs: &cluster_addrs,
-							hive_addr,
-							hive_urn: hive_urn.as_ref(),
-							config: &config,
-							trace: &trace,
-							servlet_type,
-							spawner,
-						})
-						.await;
-						if scaled {
-							last_scale_up.insert(type_key, Instant::now());
-						}
+					match metrics.decide() {
+						ScalingDecision::ScaleUp => task.scale_up(servlet_type, spawner, scale, &mut scaled_up).await,
+						ScalingDecision::ScaleDown => task.scale_down(servlet_type, scale, &mut scaled_down),
+						ScalingDecision::Hold => {}
 					}
-					ScalingDecision::ScaleDown => {
-						let scaled = try_scale_down::<P>(ScaleDown {
-							gate: ScaleGate {
-								scale_blocked,
-								type_key: &type_key,
-								cooldown: scale_conf.scale_down_cooldown,
-								last_action: &last_scale_down,
-							},
-							servlets: &servlets,
-							hive_context: &hive_context,
-							cluster_addrs: &cluster_addrs,
-							hive_addr,
-							hive_urn: hive_urn.as_ref(),
-							config: &config,
-							servlet_type,
-						});
-						if scaled {
-							last_scale_down.insert(type_key, Instant::now());
-						}
-					}
-					ScalingDecision::Hold => {}
 				}
+
+				task.utilization.store(hive_load.utilization().get(), Ordering::Relaxed);
 			}
+		})
+	}
+}
 
-			let aggregate = aggregate_utilization(hive_total_util, hive_total_count);
-			utilization.store(aggregate.get(), Ordering::Relaxed);
+/// Instance count and summed utilization over one servlet type.
+///
+/// The two numbers are only meaningful together: a mean over the wrong
+/// count reads as a different load. Carrying them in one value keeps the
+/// division with the pair it divides.
+#[derive(Default)]
+struct TypeLoad {
+	instances: usize,
+	utilization_sum: u64,
+}
+
+impl TypeLoad {
+	/// Adds one type's load into this running hive total.
+	fn absorb(&mut self, load: &Self) {
+		self.instances += load.instances;
+		self.utilization_sum += load.utilization_sum;
+	}
+
+	/// The mean utilization across the counted instances.
+	fn utilization(&self) -> BasisPoints {
+		aggregate_utilization(self.utilization_sum, self.instances)
+	}
+}
+
+/// Per-type stamps for one scale direction, read against the hive clock.
+///
+/// A stamp is written where a scale reached the registry, so an attempt
+/// that failed to spawn or found nothing to remove leaves the next
+/// evaluation free to retry.
+struct Cooldowns {
+	stamps: HashMap<Vec<u8>, MonotonicInstant>,
+	clock: Arc<dyn Clock>,
+}
+
+impl Cooldowns {
+	fn new(clock: Arc<dyn Clock>) -> Self {
+		Self { stamps: HashMap::new(), clock }
+	}
+
+	/// Whether `type_key` scaled within the last `cooldown`.
+	fn active(&self, type_key: impl AsRef<[u8]>, cooldown: Duration) -> bool {
+		let type_key = type_key.as_ref();
+		let Some(stamp) = self.stamps.get(type_key) else {
+			return false;
+		};
+
+		let age = self.clock.monotonic().saturating_duration_since(*stamp);
+
+		age < cooldown
+	}
+
+	/// Records a scale of `type_key` at this instant.
+	fn stamp(&mut self, type_key: impl Into<Vec<u8>>) {
+		let type_key: Vec<u8> = type_key.into();
+		self.stamps.insert(type_key, self.clock.monotonic());
+	}
+}
+
+/// One running scaling loop's resolved handles.
+///
+/// [`ScalingLoop`] names what the hive supplies. This names what the loop
+/// body works with once the hive URN is created and the cluster link is
+/// bound, so every scale decision reads one owner instead of a parameter
+/// bundle rebuilt per attempt.
+struct ScalingTask<P: Protocol> {
+	servlets: Arc<HashMapRegistry>,
+	trace: Arc<TraceCollector>,
+	utilization: Arc<AtomicU16>,
+	utilization_map: Arc<Mutex<HashMap<Vec<u8>, u16>>>,
+	hive_context: Arc<HiveContextImpl<P>>,
+	link: Option<ClusterLink<P>>,
+	hive_urn: Option<Arc<Urn<'static>>>,
+	config: Arc<HiveConfig>,
+	tasks: TaskGroup,
+}
+
+impl<P> ScalingTask<P>
+where
+	P: Protocol<CryptoProvider = DefaultCryptoProvider>,
+	P: Protocol + Send + Sync + 'static,
+	P::Address: Clone + Copy + Send + Sync + 'static,
+	P::Stream: Send + 'static,
+	P::Error: Send + 'static,
+	P::Transport: MessageEmitter + Send + Sync + 'static,
+	TightBeamError: From<P::Error>,
+{
+	/// Whether local scaling must hold off.
+	///
+	/// A hive that derived its own URN attributes a scale change to itself.
+	/// Without that identity a watching gateway would keep a slate this
+	/// hive has moved past, so scaling waits until the gateway list empties.
+	fn scale_blocked(&self) -> bool {
+		self.hive_urn.is_none() && self.link.as_ref().is_some_and(|link| link.has_gateways())
+	}
+
+	/// Counts the instances of one servlet type and sums their utilization.
+	///
+	/// An instance that reports no utilization falls back to its last
+	/// sample, then to [`UNKNOWN_SERVLET_UTILIZATION_BPS`].
+	fn type_load(&self, type_prefix: impl AsRef<[u8]>) -> TypeLoad {
+		let type_prefix = type_prefix.as_ref();
+		let mut load = TypeLoad::default();
+		// Each sample is one `u16` insert, so a poisoned lock still holds a
+		// whole map and the samples are read rather than dropped.
+		let samples = self.utilization_map.lock().unwrap_or_else(PoisonError::into_inner);
+
+		self.servlets.for_each_by_type(type_prefix, |key, reg| {
+			load.instances += 1;
+
+			let reported = reg.servlet.utilization().map(|bp| bp.get() as u64);
+			let cached = samples.get(key).map(|&sample| sample as u64);
+			let unknown = UNKNOWN_SERVLET_UTILIZATION_BPS as u64;
+
+			load.utilization_sum += reported.or(cached).unwrap_or(unknown);
+		});
+
+		load
+	}
+
+	/// Adds one instance of `servlet_type` and announces it.
+	async fn scale_up(
+		&self,
+		servlet_type: &Urn<'static>,
+		spawner: &SpawnerFn,
+		scale: ServletScaleConfig,
+		cooldowns: &mut Cooldowns,
+	) {
+		let type_key = servlet_type.canonical_bytes();
+		if self.scale_blocked() || cooldowns.active(&type_key, scale.scale_up_cooldown()) {
+			return;
 		}
-	})
-}
 
-/// Cooldown and announce-gate checks shared by scale-up and scale-down.
-struct ScaleGate<'a> {
-	scale_blocked: bool,
-	type_key: &'a [u8],
-	cooldown: Duration,
-	last_action: &'a HashMap<Vec<u8>, Instant>,
-}
+		let Ok(new_servlet) = (spawner)(Arc::clone(&self.trace)).await else {
+			return;
+		};
 
-/// Inputs for one scale-up attempt.
-struct ScaleUp<'a, P: Protocol> {
-	gate: ScaleGate<'a>,
-	servlets: &'a Arc<HashMapRegistry>,
-	hive_context: &'a Arc<HiveContextImpl<P>>,
-	cluster_addrs: &'a Arc<RwLock<Vec<P::Address>>>,
-	hive_addr: P::Address,
-	hive_urn: Option<&'a Arc<Urn<'static>>>,
-	config: &'a Arc<HiveConfig>,
-	trace: &'a Arc<TraceCollector>,
-	servlet_type: &'a Urn<'static>,
-	spawner: &'a SpawnerFn,
-}
+		let registration = ServletRegistration {
+			servlet: new_servlet,
+			spawner: Arc::clone(spawner),
+			servlet_type: servlet_type.clone(),
+		};
 
-/// Inputs for one scale-down attempt.
-struct ScaleDown<'a, P: Protocol> {
-	gate: ScaleGate<'a>,
-	servlets: &'a Arc<HashMapRegistry>,
-	hive_context: &'a Arc<HiveContextImpl<P>>,
-	cluster_addrs: &'a Arc<RwLock<Vec<P::Address>>>,
-	hive_addr: P::Address,
-	hive_urn: Option<&'a Arc<Urn<'static>>>,
-	config: &'a Arc<HiveConfig>,
-	servlet_type: &'a Urn<'static>,
-}
+		// The registry takes the instance before the announcement, because
+		// the notify failure path reconciles from the registry.
+		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
+		let Ok((instance, addr_bytes)) = instances.insert(registration) else {
+			return;
+		};
 
-fn mint_hive_urn(hive_addr: impl Into<Vec<u8>>, config: &HiveConfig) -> Option<Arc<Urn<'static>>> {
-	// Mint once from the control address for scaling updates. A non-mintable
-	// address disables cluster notify instead of announcing a bad URN.
-	let bytes: Vec<u8> = hive_addr.into();
-	let addr = String::from_utf8(bytes).ok()?;
-	let hive = config.namespace.hive(addr).ok()?;
-
-	Some(Arc::new(hive))
-}
-
-fn is_scale_blocked<A>(hive_urn_missing: bool, cluster_addrs: &RwLock<Vec<A>>) -> bool {
-	// Block local scale when gateways exist but hive identity cannot be announced.
-	if !hive_urn_missing {
-		return false;
+		let added = ServletInfo { servlet_id: instance, address: addr_bytes.as_ref().to_vec() };
+		self.announce(ServletChange::Added(added));
+		cooldowns.stamp(type_key);
 	}
 
-	match cluster_addrs.read() {
-		Ok(guard) => !guard.is_empty(),
-		Err(_) => true,
+	/// Removes one instance of `servlet_type` and announces its departure.
+	fn scale_down(&self, servlet_type: &Urn<'static>, scale: ServletScaleConfig, cooldowns: &mut Cooldowns) {
+		let type_key = servlet_type.canonical_bytes();
+		if self.scale_blocked() || cooldowns.active(&type_key, scale.scale_down_cooldown()) {
+			return;
+		}
+
+		let type_prefix = servlet_type.type_prefix_bytes();
+		// `HashMap` order is unspecified, so scale-down picks any instance.
+		let Some(key) = self.servlets.keys().into_iter().rfind(|k| k.starts_with(&type_prefix)) else {
+			return;
+		};
+
+		let instances = HiveInstances::new(self.servlets.as_ref(), &self.hive_context);
+		let Some((_removed_type, addr)) = instances.remove(&key) else {
+			return;
+		};
+
+		let Ok(instance) = servlet_type.instance_urn(addr.as_ref()) else {
+			return;
+		};
+
+		self.announce(ServletChange::Removed(instance));
+		cooldowns.stamp(type_key);
+	}
+
+	/// Announces one slate change to every registered gateway.
+	///
+	/// A hive with no control plane reaches no gateway, so the change stays
+	/// local to its own registry.
+	fn announce(&self, change: ServletChange) {
+		let Some(link) = self.link.as_ref() else {
+			return;
+		};
+
+		link.notify_scaling(&self.tasks, self.hive_urn.as_ref(), change);
 	}
 }
 
-fn scale_config_for(config: &HiveConfig, servlet_type: &Urn<'_>) -> ServletScaleConfig {
-	config
-		.scaling
-		.overrides
-		.get(servlet_type)
-		.copied()
-		.unwrap_or(config.scaling.default_scale)
-}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::tb_cases;
+	use crate::utils::time::ManualClock;
 
-fn collect_type_load(
-	servlets: &HashMapRegistry,
-	utilization_map: &Mutex<HashMap<Vec<u8>, u16>>,
-	type_prefix: &[u8],
-) -> (usize, u64) {
-	let mut count = 0usize;
-	let mut util_sum = 0u64;
-	let util_guard = utilization_map.lock();
+	/// The cooldown every stamp in this module holds for.
+	const COOLDOWN: Duration = Duration::from_secs(30);
 
-	servlets.for_each_by_type(type_prefix, |key, reg| {
-		count += 1;
-
-		let reported = reg.servlet.utilization().map(|bp| bp.get() as u64);
-		let cached = util_guard.as_ref().ok().and_then(|g| g.get(key).map(|&v| v as u64));
-		let unknown = UNKNOWN_SERVLET_UTILIZATION_BPS as u64;
-
-		util_sum += reported.or(cached).unwrap_or(unknown);
-	});
-
-	(count, util_sum)
-}
-
-fn cooldown_active(last_action: &HashMap<Vec<u8>, Instant>, type_key: &[u8], cooldown: Duration) -> bool {
-	last_action.get(type_key).is_some_and(|stamp| stamp.elapsed() < cooldown)
-}
-
-async fn try_scale_up<P>(action: ScaleUp<'_, P>) -> bool
-where
-	P: Protocol + Send + Sync + 'static,
-	P::Address: Clone + Copy + Send + Sync + 'static,
-	P::Stream: Send + 'static,
-	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
-	TightBeamError: From<P::Error>,
-{
-	if !gate_allows(&action.gate) {
-		return false;
+	/// A clock that moves only when the test advances it.
+	fn manual_clock() -> Arc<ManualClock> {
+		Arc::new(ManualClock::default())
 	}
 
-	let Ok(new_servlet) = (action.spawner)(Arc::clone(action.trace)).await else {
-		return false;
-	};
+	/// Cooldowns on `clock`, with the `echo` type stamped now.
+	fn stamped_cooldowns(clock: &Arc<ManualClock>) -> Cooldowns {
+		let mut cooldowns = Cooldowns::new(Arc::clone(clock) as Arc<dyn Clock>);
+		cooldowns.stamp(b"echo".as_slice());
 
-	let registration = ServletRegistration {
-		servlet: new_servlet,
-		spawner: Arc::clone(action.spawner),
-		servlet_type: action.servlet_type.clone(),
-	};
-
-	// Register before announcing: the notify failure path reconciles from the registry.
-	let Ok((instance, addr_bytes)) = insert_instance(&**action.servlets, &**action.hive_context, registration) else {
-		return false;
-	};
-
-	announce_scale_change::<P>(
-		action.servlets,
-		action.cluster_addrs,
-		action.hive_addr,
-		action.hive_urn,
-		action.config,
-		ServletInfo { servlet_id: instance, address: addr_bytes.as_ref().to_vec() },
-		true,
-	);
-
-	true
-}
-
-fn try_scale_down<P>(action: ScaleDown<'_, P>) -> bool
-where
-	P: Protocol + Send + Sync + 'static,
-	P::Address: Clone + Copy + Send + Sync + 'static,
-	P::Stream: Send + 'static,
-	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
-	TightBeamError: From<P::Error>,
-{
-	if !gate_allows(&action.gate) {
-		return false;
+		cooldowns
 	}
 
-	let type_prefix = type_prefix_bytes(action.servlet_type);
-	// HashMap iteration order is unspecified, so the removed instance is arbitrary.
-	let Some(key) = action.servlets.keys().into_iter().rfind(|k| k.starts_with(&type_prefix)) else {
-		return false;
-	};
+	// A scale holds its type for the cooldown on the hive clock, and the
+	// type frees the moment that clock reaches the cooldown.
+	tb_cases! {
+		fn a_cooldown_runs_on_the_hive_clock((advance, active): (Duration, bool)) {
+			let clock = manual_clock();
+			let cooldowns = stamped_cooldowns(&clock);
 
-	let Some((_removed_type, addr)) = remove_instance(&**action.servlets, &**action.hive_context, &key) else {
-		return false;
-	};
+			clock.advance(advance);
 
-	let Ok(instance) = instance_urn(action.servlet_type, addr.as_ref()) else {
-		return false;
-	};
-
-	announce_scale_change::<P>(
-		action.servlets,
-		action.cluster_addrs,
-		action.hive_addr,
-		action.hive_urn,
-		action.config,
-		ServletInfo { servlet_id: instance, address: addr.as_ref().to_vec() },
-		false,
-	);
-
-	true
-}
-
-fn gate_allows(gate: &ScaleGate<'_>) -> bool {
-	if gate.scale_blocked {
-		return false;
+			assert_eq!(cooldowns.active(b"echo", COOLDOWN), active);
+		}
+		cases {
+			one_millisecond_short => (COOLDOWN.saturating_sub(Duration::from_millis(1)), true),
+			at_the_cooldown => (COOLDOWN, false),
+		}
 	}
-	!cooldown_active(gate.last_action, gate.type_key, gate.cooldown)
-}
-
-fn announce_scale_change<P>(
-	servlets: &Arc<HashMapRegistry>,
-	cluster_addrs: &Arc<RwLock<Vec<P::Address>>>,
-	hive_addr: P::Address,
-	hive_urn: Option<&Arc<Urn<'static>>>,
-	config: &Arc<HiveConfig>,
-	servlet_info: ServletInfo,
-	is_added: bool,
-) where
-	P: Protocol + Send + Sync + 'static,
-	P::Address: Clone + Copy + Send + Sync + 'static,
-	P::Stream: Send + 'static,
-	P::Error: Send + 'static,
-	P::Transport: MessageEmitter + X509ClientConfig<CryptoProvider = DefaultCryptoProvider> + Send + Sync + 'static,
-	TightBeamError: From<P::Error>,
-{
-	let Some(hive_urn) = hive_urn else {
-		return;
-	};
-
-	notify_cluster::<P>(
-		Arc::clone(servlets),
-		Arc::clone(cluster_addrs),
-		hive_addr,
-		Arc::clone(hive_urn),
-		servlet_info,
-		is_added,
-		Arc::clone(config),
-	);
 }

@@ -11,16 +11,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use futures::channel::{mpsc, oneshot};
 
 use super::body::{BodyEvent, ForwardedStream};
-use super::flow::cap_as_usize;
-use super::outbound::{outbound_handle, Outbound};
+use super::flow::{cap_as_usize, chunk_records, payload_credits, ChunkSize};
+use super::outbound::Outbound;
 use crate::transport::envelopes::{
-	CancelReason, GoAwayReason, MuxCancelPackage, MuxOpenPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
+	CancelReason, GoAwayReason, MuxOpenPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
 };
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::negotiation::MuxSettings;
 use crate::transport::multiplex::MuxRole;
 use crate::transport::{TransportError, TransportResult};
 use crate::utils::urn::Urn;
+use crate::Frame;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::receipt::StoredReceipt;
@@ -36,20 +37,21 @@ fn wake_all(wakers: &mut Vec<Waker>) {
 	}
 }
 
-/// Register `cx`'s waker. Waker clone is a refcount bump, not a data copy.
-pub(super) fn park_waker(waiters: &mut Vec<Waker>, cx: &Context<'_>) {
+/// Register `cx`'s waker. The waker clone bumps a refcount and copies no data.
+pub fn park_waker(waiters: &mut Vec<Waker>, cx: &Context<'_>) {
 	waiters.push(cx.waker().clone());
 }
 
-/// Identity of a locally-initiated stream whose ID is assigned at
-/// first send (atomic open): vacant until the Open record enqueues,
-/// the assigned ID afterwards. Stream IDs start at 1 (client) or 2
-/// (server), so zero unambiguously means "not opened yet".
+/// Identity of a locally-initiated stream whose ID is assigned at first send
+/// (atomic open).
 ///
-/// Shared between the parts that outlive the open (sinks, response
-/// futures, reply bodies, cancel guards) so each can act on the real
-/// ID once it exists and stand down when it never did.
-pub(super) struct OpenSlot(AtomicU32);
+/// - It is vacant until the Open record enqueues, and holds the assigned ID
+///   afterwards. Stream IDs start at 1 (client) or 2 (server), so zero
+///   unambiguously means "not opened yet".
+/// - The parts that outlive the open (sinks, response futures, reply bodies,
+///   cancel guards) share it, so each can act on the real ID once it exists and
+///   stand down when the open was refused.
+pub struct OpenSlot(AtomicU32);
 
 impl OpenSlot {
 	const VACANT: u32 = 0;
@@ -58,9 +60,9 @@ impl OpenSlot {
 		Arc::new(Self(AtomicU32::new(Self::VACANT)))
 	}
 
-	/// Slot for a stream whose ID is already known (peer-initiated
-	/// bodies, replies): assigned from birth.
-	pub(super) fn assigned(stream_id: u32) -> Arc<Self> {
+	/// Slot for a stream whose ID is already known, such as a peer-initiated
+	/// body or a reply. It is assigned from birth.
+	pub fn assigned(stream_id: u32) -> Arc<Self> {
 		Arc::new(Self(AtomicU32::new(stream_id)))
 	}
 
@@ -68,7 +70,8 @@ impl OpenSlot {
 		self.0.store(stream_id, AtomicOrdering::Release);
 	}
 
-	pub(super) fn get(&self) -> Option<u32> {
+	/// The assigned stream ID, or `None` while the slot is vacant.
+	pub fn get(&self) -> Option<u32> {
 		match self.0.load(AtomicOrdering::Acquire) {
 			Self::VACANT => None,
 			stream_id => Some(stream_id),
@@ -76,17 +79,21 @@ impl OpenSlot {
 	}
 }
 
-/// A cap slot held for a stream that has not sent its Open record
-/// yet. The stream ID is assigned inside [`MuxShared::poll_open_enqueue`],
-/// in the same critical section that enqueues the Open, so Opens hit
-/// the wire in strictly increasing ID order
-/// ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1))
-/// no matter how initiations interleave.
+/// A cap slot held for a stream that has not sent its Open record yet.
+///
+/// The stream ID is assigned inside [`MuxShared::poll_open_enqueue`], in the
+/// same critical section that enqueues the Open. Opens therefore reach the
+/// peer in strictly increasing ID order ([RFC 9113 § 5.1.1][rfc9113-5.1.1]),
+/// however the initiations interleave.
+///
+/// # Drop
 ///
 /// Dropping an unopened reservation releases the cap slot and resolves the
 /// response future as locally cancelled. Once opened, the pending table owns
-/// the stream's lifecycle and the drop does nothing.
-pub(super) struct StreamReservation {
+/// the stream's lifecycle and the drop leaves it in place.
+///
+/// [rfc9113-5.1.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1
+pub struct StreamReservation {
 	shared: Arc<MuxShared>,
 	sender: Option<oneshot::Sender<StreamOutcome>>,
 	slot: Arc<OpenSlot>,
@@ -94,7 +101,7 @@ pub(super) struct StreamReservation {
 
 impl StreamReservation {
 	/// Handle to the stream's late-assigned identity (refcount bump).
-	pub(super) fn slot(&self) -> Arc<OpenSlot> {
+	pub fn slot(&self) -> Arc<OpenSlot> {
 		Arc::clone(&self.slot)
 	}
 }
@@ -112,72 +119,61 @@ impl Drop for StreamReservation {
 	}
 }
 
-/// One stream's Open record, handed to
-/// [`MuxShared::poll_open_enqueue`]. `records` seeds the sender
-/// ledger (the payload's chunk count, or the whole message's for a
-/// unary emit). `duplex` carries the reply forwarder to register
-/// under the assigned ID before the Open can reach the peer.
-pub(super) struct OpenRequest<'a> {
-	pub(super) kind: MuxStreamKind,
-	pub(super) last: bool,
-	pub(super) payload: &'a [u8],
-	pub(super) records: u64,
-	pub(super) duplex: Option<ForwardedStream>,
+/// One stream's Open record, handed to [`MuxShared::poll_open_enqueue`].
+pub struct OpenRequest<'a> {
+	/// Whether the Open carries a unary, streaming, or duplex request.
+	pub kind: MuxStreamKind,
+	/// Whether this Open closes the send half in the same record.
+	pub last: bool,
+	/// Chunk bytes carried with the Open record.
+	pub payload: &'a [u8],
+	/// Records this Open seeds the sender ledger with: the payload's chunk
+	/// count, or the whole message's count for a unary emit.
+	pub records: u64,
+	/// Reply forwarder for a duplex open, registered under the assigned ID
+	/// before the Open can reach the peer.
+	pub duplex: Option<ForwardedStream>,
 	/// Grpc-style route stamped on the Open record, or `None` for an
 	/// unrouted local open.
-	pub(super) target: Option<Urn<'static>>,
-	/// Relay budget stamped beside the route: the number of gateway
-	/// forwards the stream may still spend. A `0` open is served
-	/// locally and never re-forwarded.
-	pub(super) hops_remaining: u8,
+	pub target: Option<Urn<'static>>,
+	/// Relay budget stamped beside the route, which is the number of gateway
+	/// forwards the stream may still spend. A `0` open is served locally, so
+	/// its forward budget stays spent.
+	pub hops_remaining: u8,
 }
 
 /// Outcome delivered to a pending stream's oneshot slot.
-pub(super) enum StreamOutcome {
-	/// Correlated response arrived
+pub enum StreamOutcome {
+	/// A correlated response arrived.
 	Response(ResponsePackage),
-	/// Peer cancelled or refused the stream
+	/// The peer cancelled or refused the stream.
 	Cancelled(CancelReason),
-	/// Peer sent GoAway with `last_stream_id` below this stream
+	/// The peer sent GoAway with a `last_stream_id` below this stream.
 	Draining,
 }
 
-pub(super) fn cancel_error(reason: CancelReason) -> TransportError {
-	match reason {
-		CancelReason::Cancelled => TransportError::OperationFailed(TransportFailure::Cancelled),
-		CancelReason::Timeout => TransportError::OperationFailed(TransportFailure::DeadlineExceeded),
-		CancelReason::Rejected => TransportError::OperationFailed(TransportFailure::ResourceExhausted),
-		// An app-coded cancel is still a cancel. The code itself
-		// carries no transport-failure mapping of its own
-		CancelReason::Application(_) => TransportError::OperationFailed(TransportFailure::Cancelled),
+impl StreamOutcome {
+	/// The caller-facing result of one pending stream.
+	///
+	/// # Errors
+	///
+	/// - The error for the response's own status -- the responder refused.
+	/// - [`TransportError::Draining`] -- the peer went away above this stream.
+	/// - [`CancelReason::cancel_error`] -- the peer cancelled.
+	pub(crate) fn resolve(self) -> TransportResult<Option<Frame>> {
+		match self {
+			Self::Response(response) => response.resolve(),
+			Self::Cancelled(reason) => Err(reason.cancel_error()),
+			Self::Draining => Err(TransportError::Draining),
+		}
 	}
 }
 
-/// Resolve a locally-initiated stream as cancelled and notify the
-/// peer: the local teardown shared by every abandoned send path
-/// (drop guards, abandoned sinks, explicit close).
-///
-/// The wire cancel travels on a fresh sender clone, whose guaranteed
-/// slot (channel capacity = buffer + senders) admits it even when the
-/// queue is otherwise full. The only unreachable case is a
-/// disconnected queue, where the writer - and the connection - are
-/// already gone.
-pub(super) fn enqueue_stream_cancel(shared: &MuxShared, outbound: &mpsc::Sender<Outbound>, stream_id: u32) {
-	if let Some(mut forwarder) = shared.take_duplex(stream_id) {
-		let _ = forwarder.forward(BodyEvent::Failed(cancel_error(CancelReason::Cancelled)));
-	}
-	if let Some(sender) = shared.remove_pending(stream_id) {
-		let _ = sender.send(StreamOutcome::Cancelled(CancelReason::Cancelled));
-		let package = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
-		let _ = outbound_handle(outbound).try_send(Outbound::Envelope(package.into()));
-	}
-}
-
-/// Client-side renewal state (key-switch boundaries). Server
-/// endpoints and sessions without rekey materials stay `Idle` forever.
+/// Client-side renewal state across the key-switch boundaries. A server
+/// endpoint and a session without rekey materials stay `Idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RekeyPhase {
-	/// No renewal in flight
+pub enum RekeyPhase {
+	/// No renewal is in flight.
 	Idle,
 	/// `RekeyRequest` is written, and the server's response is awaited.
 	AwaitingResponse,
@@ -190,88 +186,91 @@ pub(super) enum RekeyPhase {
 }
 
 /// Disposition of an incoming peer-initiated stream.
-pub(super) enum PeerStream {
+pub enum PeerStream {
+	/// Accept and process the stream.
 	Accept,
-	/// GoAway already sent and the stream is newer than its
-	/// `last_stream_id`. Refuse without processing.
+	/// This endpoint already sent GoAway, and the stream is newer than its
+	/// `last_stream_id`. Refuse the stream without processing it.
 	RejectDraining,
 }
 
-/// Sender-side flow-control ledger for one stream direction (QUIC
-/// MAX_STREAM_DATA,
-/// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
-/// Requests and responses on the same stream never collide here: an
-/// endpoint sends request chunks only on IDs it allocated and response
-/// chunks only on IDs the peer allocated.
+/// Sender-side flow-control ledger for one stream direction, after QUIC
+/// MAX_STREAM_DATA ([RFC 9000 § 4.1][rfc9000-4.1]).
+///
+/// Requests and responses on the same stream stay distinct here. An endpoint
+/// sends request chunks only on IDs it allocated, and response chunks only on
+/// IDs the peer allocated.
+///
+/// [rfc9000-4.1]: https://datatracker.ietf.org/doc/html/rfc9000#section-4.1
 struct SendStream {
-	/// Chunks already permitted onto the outbound queue
+	/// Chunks already permitted onto the outbound queue.
 	sent: u64,
-	/// Absolute cumulative chunk limit granted by the peer
+	/// Absolute cumulative chunk limit the peer granted.
 	limit: u64,
-	/// Registered chunks not yet permitted (drain accounting)
+	/// Registered chunks not yet permitted, for drain accounting.
 	unsent: u64,
-	/// Wakers parked until the peer raises the limit
+	/// Wakers parked until the peer raises the limit.
 	credit_wakers: Vec<Waker>,
 }
 
 /// Outcome of an outbound session-budget debit.
-pub(super) enum BudgetStanding {
-	/// Spendable credits remain, or the session is unmetered
+pub enum BudgetStanding {
+	/// Spendable credits remain, or the session is unmetered.
 	Healthy,
-	/// The balance fell to the drain reserve: trigger the
-	/// [`GoAwayReason::BudgetExhausted`] drain
+	/// The balance fell to the drain reserve, so trigger the
+	/// [`GoAwayReason::BudgetExhausted`] drain.
 	Exhausting,
 }
 
 struct MuxState {
-	/// Next locally-initiated stream ID. `None` once the ID space is
-	/// exhausted (strictly monotonic, never reuses, never allocates 0)
+	/// Next locally-initiated stream ID, or `None` once the ID space is
+	/// exhausted. IDs are strictly monotonic over the nonzero values.
 	next_stream_id: Option<u32>,
-	/// Highest peer-initiated stream ID seen (0 = none yet)
+	/// Highest peer-initiated stream ID seen, or 0 before the first.
 	last_peer_stream_id: u32,
-	/// Open locally-initiated streams awaiting their response.
-	/// Together with `reserved` this is the cap-relevant
-	/// open-stream count
+	/// Open locally-initiated streams awaiting their response. Together
+	/// with `reserved`, this is the cap-relevant open-stream count.
 	pending: BTreeMap<u32, oneshot::Sender<StreamOutcome>>,
-	/// Cap slots held by initiations that have not sent their Open
-	/// record yet (see [`StreamReservation`]): IDs are assigned at
-	/// first send so Opens hit the wire in ID order
+	/// Cap slots held by initiations that have not sent their Open record
+	/// yet (see [`StreamReservation`]). IDs are assigned at first send, so
+	/// Opens reach the peer in ID order.
 	reserved: usize,
-	/// Next correlation value for a locally-initiated ping
+	/// Next correlation value for a locally-initiated ping.
 	next_ping_opaque: u64,
-	/// Local pings awaiting their ack, keyed by correlation value
+	/// Local pings awaiting their ack, keyed by correlation value.
 	pending_pings: BTreeMap<u64, oneshot::Sender<()>>,
-	/// Sender-side per-stream flow-control ledgers
+	/// Sender-side per-stream flow-control ledgers.
 	send_streams: HashMap<u32, SendStream>,
-	/// Credits left in the outbound session budget. `None` = unmetered
+	/// Credits left in the outbound session budget. `None` means the
+	/// session is unmetered.
 	send_budget: Option<u64>,
-	/// Chunks registered by producers but not yet permitted, across
-	/// all streams. Added to the writer's drain headroom so owed
-	/// chunks always fit inside the remaining records
+	/// Chunks registered by producers but not yet permitted, across all
+	/// streams. The writer adds them to its drain headroom, so owed chunks
+	/// always fit inside the remaining records.
 	unsent_chunks: u64,
-	/// `last_stream_id` advertised in our GoAway, once sent
+	/// `last_stream_id` this endpoint advertised in its GoAway, once sent.
 	goaway_sent: Option<u32>,
-	/// `last_stream_id` received in the peer's GoAway
+	/// `last_stream_id` received in the peer's GoAway.
 	goaway_received: Option<u32>,
-	/// Reason carried by the peer's GoAway, once received. Local
-	/// shutdown leaves this empty: the caller already knows why
+	/// Reason carried by the peer's GoAway, once received. Local shutdown
+	/// leaves this empty, because the caller already knows why.
 	goaway_reason: Option<GoAwayReason>,
-	/// Wakers parked on pending-table drain (shutdown)
+	/// Wakers parked until the pending table drains at shutdown.
 	drain_wakers: Vec<Waker>,
-	/// Wakers parked on stream-slot headroom (cap full)
+	/// Wakers parked until a stream slot frees while the cap is full.
 	slot_wakers: Vec<Waker>,
-	/// In-band renewal state. Only a client with rekey materials
-	/// ever leaves `Idle`
+	/// In-band renewal state. Only a client with rekey materials ever
+	/// leaves `Idle`.
 	rekey: RekeyPhase,
-	/// Renewal in flight with send records down to the drain
-	/// headroom: data chunks park until the fresh cipher installs
+	/// `true` while a renewal is in flight with send records down to the
+	/// drain headroom, so data chunks park until the fresh cipher installs.
 	rekey_hard_floor: bool,
-	/// Whether this endpoint can open renewals (client role with
-	/// rekey materials attached)
+	/// Whether this endpoint can open renewals, which takes the client role
+	/// with rekey materials attached.
 	rekey_client: bool,
-	/// Wakers parked on renewal transitions: admissions waiting out
-	/// a renewal, chunks on the hard floor, and the writer waiting
-	/// for owed chunks to quiesce ahead of the `RekeyAck`
+	/// Wakers parked on renewal transitions: admissions that wait out a
+	/// renewal, chunks on the hard floor, and the writer that waits for owed
+	/// chunks to quiesce ahead of the `RekeyAck`.
 	rekey_wakers: Vec<Waker>,
 }
 
@@ -284,13 +283,29 @@ impl MuxState {
 		wake_all(&mut self.slot_wakers);
 	}
 
-	pub(super) fn wake_rekey_waiters(&mut self) {
+	/// Wake every task parked on a renewal transition.
+	pub fn wake_rekey_waiters(&mut self) {
 		wake_all(&mut self.rekey_wakers);
 	}
 
 	/// A GoAway in either direction puts the connection in drain.
-	pub(super) fn is_draining(&self) -> bool {
+	pub fn is_draining(&self) -> bool {
 		self.goaway_sent.is_some() || self.goaway_received.is_some()
+	}
+
+	/// The ID a new locally-initiated stream would take, while one may
+	/// still be admitted.
+	///
+	/// A GoAway in either direction ends admission, and so does an
+	/// exhausted ID space. Both facts meet here, so no admission point
+	/// combines them differently, and a caller receives the ID it can use
+	/// straight away.
+	fn admissible_stream_id(&self) -> Option<u32> {
+		if self.is_draining() {
+			return None;
+		}
+
+		self.next_stream_id
 	}
 
 	/// Cap-relevant open-stream count: streams awaiting their
@@ -298,53 +313,48 @@ impl MuxState {
 	fn open_load(&self) -> usize {
 		self.pending.len().saturating_add(self.reserved)
 	}
-
-	fn reject_if_draining(&self) -> TransportResult<()> {
-		if self.is_draining() {
-			return Err(TransportError::Draining);
-		}
-
-		Ok(())
-	}
 }
 
-pub(super) struct MuxShared {
-	pub(super) role: MuxRole,
+/// Connection-wide mux state that the drivers and the stream handles share
+/// through an `Arc`.
+pub struct MuxShared {
+	/// Whether this endpoint initiates or accepts streams.
+	pub role: MuxRole,
 	state: Mutex<MuxState>,
-	pub(super) local_cap: u32,
-	/// Largest chunk payload this endpoint may send (peer-advertised)
-	pub(super) send_chunk_size: usize,
-	/// Bytes per session-budget credit (negotiated, both directions)
-	pub(super) credit_unit: u32,
-	/// Initial per-stream chunk limit for outbound data
-	/// (peer-advertised)
+	/// Concurrent streams this endpoint may initiate, as the peer advertised.
+	pub local_cap: u32,
+	/// Largest chunk payload this endpoint may send, as the peer advertised.
+	pub send_chunk_size: ChunkSize,
+	/// Bytes per session-budget credit, negotiated for both directions.
+	pub credit_unit: u32,
+	/// Initial per-stream chunk limit for outbound data, as the peer
+	/// advertised.
 	initial_send_credit: u64,
-	/// Initial per-stream chunk limit granted to the peer: the local
+	/// Initial per-stream chunk limit granted to the peer. It is the local
 	/// receive window, which duplex reply bodies size from.
-	pub(super) initial_recv_credit: u64,
-	/// Connection collector inherited from the split halves.
-	/// Control-plane events land here
-	/// (see [`crate::instrumentation::events`]).
+	pub initial_recv_credit: u64,
+	/// Connection collector inherited from the split halves. Control-plane
+	/// events land here (see [`crate::instrumentation::events`]).
 	#[cfg(feature = "instrument")]
-	pub(super) trace: Option<TraceCollector>,
-	/// Reply forwarders for locally-initiated duplex streams,
-	/// registered by
-	/// [`MuxHandle::open_duplex`](super::handle::MuxHandle::open_duplex)
-	/// and driven by the reader (response chunks forward instead of
-	/// reassembling).
+	pub trace: Option<TraceCollector>,
+	/// Reply forwarders for locally-initiated duplex streams, registered by
+	/// [`MuxHandle::open_duplex`](super::handle::MuxHandle::open_duplex) and
+	/// driven by the reader, which forwards response chunks as they arrive
+	/// instead of reassembling them.
 	///
-	/// Forwarder registries partition by initiator: this map holds
-	/// only locally-initiated stream IDs, the reader's
-	/// `peer_bodies` only peer-initiated ones. Every teardown path
-	/// (cancel, GoAway, connection failure) must clear its side of
-	/// both registries.
+	/// # Partition
+	///
+	/// Forwarder registries partition by initiator. This map holds only
+	/// locally-initiated stream IDs, and the reader's `peer_bodies` holds only
+	/// peer-initiated ones. Every teardown path (cancel, GoAway, connection
+	/// failure) must clear its side of both registries.
 	duplex_recv: Mutex<HashMap<u32, ForwardedStream>>,
-	/// Credits reserved so owed traffic can flush during a budget
-	/// drain. See [`MuxSettings::send_budget_reserve`]
+	/// Credits reserved so owed traffic can flush during a budget drain. See
+	/// [`MuxSettings::send_budget_reserve`].
 	budget_drain_headroom: u64,
-	/// Negotiated outbound budget, restored at each epoch boundary
-	/// (credit-match invariant: epoch receipt budgets equal the
-	/// initial terms)
+	/// Negotiated outbound budget, restored at each epoch boundary. The
+	/// credit-match invariant keeps the epoch receipt budgets equal to the
+	/// initial terms.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	initial_send_budget: Option<u64>,
 	/// Current epoch's dual-signed receipt. Renewal rotates it.
@@ -353,11 +363,13 @@ pub(super) struct MuxShared {
 }
 
 impl MuxShared {
-	pub(super) fn new(role: MuxRole, settings: &MuxSettings) -> Self {
+	/// Shared state for `role` under the negotiated `settings`, with no
+	/// stream open.
+	pub fn new(role: MuxRole, settings: &MuxSettings) -> Self {
 		Self {
 			role,
 			local_cap: settings.local_initiated_cap,
-			send_chunk_size: cap_as_usize(settings.send_chunk_size).max(1),
+			send_chunk_size: ChunkSize::new(cap_as_usize(settings.send_chunk_size)),
 			credit_unit: settings.credit_unit.max(1),
 			initial_send_credit: settings.initial_send_credit.max(1),
 			initial_recv_credit: settings.initial_recv_credit.max(1),
@@ -396,14 +408,15 @@ impl MuxShared {
 		self.state.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// Future resolving once a locally-initiated stream would be
-	/// admitted (refcount bump).
-	pub(super) fn stream_slot(self: &Arc<Self>) -> StreamSlot {
+	/// Future that resolves once a locally-initiated stream would be
+	/// admitted. Creating it is a refcount bump.
+	pub fn stream_slot(self: &Arc<Self>) -> StreamSlot {
 		StreamSlot { shared: Arc::clone(self) }
 	}
 
-	/// Future resolving once the pending table drains (refcount bump).
-	pub(super) fn drain_pending(self: &Arc<Self>) -> DrainPending {
+	/// Future that resolves once the pending table drains. Creating it is a
+	/// refcount bump.
+	pub fn drain_pending(self: &Arc<Self>) -> DrainPending {
 		DrainPending { shared: Arc::clone(self) }
 	}
 
@@ -413,19 +426,21 @@ impl MuxShared {
 
 	/// Register the reply forwarder for a locally-initiated duplex
 	/// stream.
-	pub(super) fn insert_duplex(&self, stream_id: u32, forwarder: ForwardedStream) {
+	pub fn insert_duplex(&self, stream_id: u32, forwarder: ForwardedStream) {
 		self.duplex_lock().insert(stream_id, forwarder);
 	}
 
-	/// Detach a duplex reply forwarder (stream resolving).
-	pub(super) fn take_duplex(&self, stream_id: u32) -> Option<ForwardedStream> {
+	/// Detach a duplex reply forwarder while its stream resolves.
+	pub fn take_duplex(&self, stream_id: u32) -> Option<ForwardedStream> {
 		self.duplex_lock().remove(&stream_id)
 	}
 
-	/// Forward one reply chunk into a duplex body. Returns `None` when
-	/// the stream is not duplex, and `Some(false)` on a credit
-	/// overrun.
-	pub(super) fn forward_duplex_chunk(&self, stream_id: u32, payload: &[u8]) -> Option<bool> {
+	/// Forward one reply chunk into a duplex body.
+	///
+	/// It returns `None` when the stream is not duplex, and `Some(false)` on a
+	/// credit overrun.
+	pub fn forward_duplex_chunk(&self, stream_id: u32, payload: impl AsRef<[u8]>) -> Option<bool> {
+		let payload = payload.as_ref();
 		let mut map = self.duplex_lock();
 		let stream = map.get_mut(&stream_id)?;
 
@@ -434,7 +449,7 @@ impl MuxShared {
 	}
 
 	/// Granted limit and window of a duplex reply body, when live.
-	pub(super) fn duplex_limits(&self, stream_id: u32) -> Option<(u64, u64)> {
+	pub fn duplex_limits(&self, stream_id: u32) -> Option<(u64, u64)> {
 		let map = self.duplex_lock();
 		let stream = map.get(&stream_id)?;
 
@@ -442,15 +457,15 @@ impl MuxShared {
 	}
 
 	/// Raise a duplex reply body's granted limit.
-	pub(super) fn set_duplex_limit(&self, stream_id: u32, limit: u64) {
+	pub fn set_duplex_limit(&self, stream_id: u32, limit: u64) {
 		if let Some(stream) = self.duplex_lock().get_mut(&stream_id) {
 			stream.raise_limit(limit);
 		}
 	}
 
-	/// Fail duplex replies the peer's GoAway disowned (streams above
-	/// its high-water mark will never be answered).
-	pub(super) fn fail_duplex_above(&self, last_stream_id: u32) {
+	/// Fail duplex replies the peer's GoAway disowned. Streams above its
+	/// high-water mark stay unanswered.
+	pub fn fail_duplex_above(&self, last_stream_id: u32) {
 		let mut map = self.duplex_lock();
 		map.retain(|stream_id, stream| {
 			if *stream_id <= last_stream_id {
@@ -462,27 +477,43 @@ impl MuxShared {
 		});
 	}
 
-	/// Drop every duplex reply forwarder on connection failure. The
-	/// bodies observe the closed channel.
+	/// Drop every duplex reply forwarder on connection failure, so the bodies
+	/// observe the closed channel.
 	fn fail_all_duplex(&self) {
 		self.duplex_lock().clear();
 	}
 
-	/// Drop a stream's sender ledger under the lock: return its
-	/// unflushed chunks to the drain accounting and wake any parked
-	/// producer so it observes the removal.
+	/// Drop a stream's sender ledger under the lock. Its unflushed chunks
+	/// return to the drain accounting, and any parked producer wakes to
+	/// observe the removal.
 	fn drop_send_stream(state: &mut MuxState, stream_id: u32) {
 		if let Some(stream) = state.send_streams.remove(&stream_id) {
 			state.unsent_chunks = state.unsent_chunks.saturating_sub(stream.unsent);
 			for waker in stream.credit_wakers {
 				waker.wake();
 			}
+
 			Self::wake_on_quiesce(state);
 		}
 	}
 
-	/// Wake the writer once owed chunks quiesce while it holds a
-	/// `RekeyAck` back (the ack trails every old-epoch chunk).
+	/// Move the rekey phase from `from` to `to`, and report whether the move
+	/// happened.
+	///
+	/// The precondition and the write live together, so the phase advances
+	/// only from `from` to `to` and the rekey sequence stays ordered.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn advance_rekey(state: &mut MuxState, from: RekeyPhase, to: RekeyPhase) -> bool {
+		if state.rekey != from {
+			return false;
+		}
+
+		state.rekey = to;
+		true
+	}
+
+	/// Wake the writer once owed chunks quiesce while it holds a `RekeyAck`
+	/// back, because the ack trails every old-epoch chunk.
 	fn wake_on_quiesce(state: &mut MuxState) {
 		if state.unsent_chunks == 0 && state.rekey == RekeyPhase::FlushingAck {
 			state.wake_rekey_waiters();
@@ -491,7 +522,7 @@ impl MuxShared {
 
 	/// Register the sender-side ledger for a stream about to carry
 	/// `chunks` outbound chunk records.
-	pub(super) fn register_send_stream(&self, stream_id: u32, chunks: u64) {
+	pub fn register_send_stream(&self, stream_id: u32, chunks: u64) {
 		let mut state = self.lock();
 		state.unsent_chunks = state.unsent_chunks.saturating_add(chunks);
 		state.send_streams.insert(
@@ -505,18 +536,19 @@ impl MuxShared {
 		);
 	}
 
-	/// Drop a stream's sender ledger outside the pending-table paths
-	/// (response streams, abandoned sends).
-	pub(super) fn finish_send_stream(&self, stream_id: u32) {
+	/// Drop a stream's sender ledger outside the pending-table paths, such as
+	/// for response streams and abandoned sends.
+	pub fn finish_send_stream(&self, stream_id: u32) {
 		let mut state = self.lock();
 		Self::drop_send_stream(&mut state, stream_id);
 	}
 
-	/// Extend a registered sender ledger by `chunks` outbound
-	/// records: streamed replies learn their length one push at a
-	/// time. A missing ledger means the stream already resolved
-	/// (cancel or failure), and the send path reports that itself.
-	pub(super) fn add_send_records(&self, stream_id: u32, chunks: u64) {
+	/// Extend a registered sender ledger by `chunks` outbound records.
+	///
+	/// Streamed replies learn their length one push at a time. A missing
+	/// ledger means the stream already resolved through a cancel or a
+	/// failure, and the send path reports that itself.
+	pub fn add_send_records(&self, stream_id: u32, chunks: u64) {
 		let mut state = self.lock();
 		let Some(stream) = state.send_streams.get_mut(&stream_id) else {
 			return;
@@ -526,9 +558,10 @@ impl MuxShared {
 	}
 
 	/// Consume one unit of stream credit under the lock, or park.
-	/// Fails once the ledger is gone: the stream resolved underneath
-	/// the sender (cancel, response, or connection failure) and the
-	/// outcome channel has the truth.
+	///
+	/// It fails once the ledger is gone. The stream then resolved underneath
+	/// the sender through a cancel, a response, or a connection failure, and
+	/// the outcome channel has the truth.
 	fn take_chunk_credit(state: &mut MuxState, stream_id: u32, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
 		let Some(stream) = state.send_streams.get_mut(&stream_id) else {
 			return Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)));
@@ -549,21 +582,24 @@ impl MuxShared {
 	/// Resolve once the peer's grant admits the stream's next chunk,
 	/// consuming one unit of credit.
 	#[cfg(test)]
-	pub(super) fn poll_send_chunk(&self, stream_id: u32, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
+	pub fn poll_send_chunk(&self, stream_id: u32, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
 		let mut state = self.lock();
 		Self::take_chunk_credit(&mut state, stream_id, cx)
 	}
 
-	/// Consume one unit of stream credit and enqueue the chunk's
-	/// envelope in one critical section, so no data envelope can
-	/// slip into the queue behind a rekey `RekeyAck` boundary
-	/// (strict park). The caller MUST have reserved queue
-	/// capacity via `poll_ready` on `outbound` first.
+	/// Consume one unit of stream credit and enqueue the chunk's envelope in
+	/// one critical section, so no data envelope can slip into the queue behind
+	/// a rekey `RekeyAck` boundary (strict park).
 	///
-	/// Chunks additionally park on the rekey hard floor: send
-	/// records at the drain headroom with a renewal in flight are
-	/// reserved for control and the exchange legs.
-	pub(super) fn poll_send_enqueue(
+	/// The caller MUST have reserved queue capacity through `poll_ready` on
+	/// `outbound` first.
+	///
+	/// # Rekey floor
+	///
+	/// Chunks also park on the rekey hard floor, because send records at the
+	/// drain headroom with a renewal in flight are reserved for control and the
+	/// exchange legs.
+	pub fn poll_send_enqueue(
 		&self,
 		stream_id: u32,
 		outbound: &mut mpsc::Sender<Outbound>,
@@ -591,11 +627,12 @@ impl MuxShared {
 		Poll::Ready(enqueued)
 	}
 
-	/// Apply a peer credit grant (idempotent, monotonic: only a limit
-	/// above the current one changes anything). Grants for unknown
-	/// streams are discarded: a grant racing stream completion is
-	/// benign.
-	pub(super) fn apply_credit_grant(&self, stream_id: u32, limit: u64) {
+	/// Apply a peer credit grant.
+	///
+	/// The grant is idempotent and monotonic, so only a limit above the
+	/// current one changes anything. A grant for an unknown stream is
+	/// discarded, because a grant that races stream completion is benign.
+	pub fn apply_credit_grant(&self, stream_id: u32, limit: u64) {
 		let mut state = self.lock();
 		let Some(stream) = state.send_streams.get_mut(&stream_id) else {
 			return;
@@ -605,6 +642,7 @@ impl MuxShared {
 		}
 
 		stream.limit = limit;
+
 		for waker in stream.credit_wakers.drain(..) {
 			waker.wake();
 		}
@@ -612,9 +650,9 @@ impl MuxShared {
 
 	/// Debit `credits` from the budget in `state`.
 	///
-	/// `reserved` spends into the drain reserve. Non-reserved debits
-	/// fail fast once the spendable balance above the reserve cannot
-	/// cover them, keeping the reserve intact for the drain.
+	/// `reserved` spends into the drain reserve. A non-reserved debit fails
+	/// fast once the spendable balance above the reserve falls short, which
+	/// keeps the reserve intact for the drain.
 	fn debit_budget(
 		state: &mut MuxState,
 		headroom: u64,
@@ -644,23 +682,22 @@ impl MuxShared {
 		Ok(BudgetStanding::Healthy)
 	}
 
-	/// Debit `credits` from the outbound session budget: a test entry
-	/// over [`Self::debit_budget`]. Production paths wait out renewals
-	/// via [`Self::admit_debit`].
+	/// Debit `credits` from the outbound session budget through
+	/// [`Self::debit_budget`], for tests. Production paths wait out renewals
+	/// through [`Self::admit_debit`].
 	#[cfg(test)]
-	pub(super) fn debit_send_budget(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
+	pub fn debit_send_budget(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
 		let mut state = self.lock();
 		Self::debit_budget(&mut state, self.budget_drain_headroom, credits, reserved)
 	}
 
 	/// Debit the outbound session budget once no renewal is in flight.
 	///
-	/// Client admissions park across a renewal so every debit
-	/// belongs unambiguously to one epoch: budgets reset at
-	/// `RekeyDone` and a debit issued mid-renewal could otherwise
-	/// straddle the boundary. Draining connections skip
-	/// the park: the renewal is dead and owed traffic must flush.
-	pub(super) fn poll_admit_debit(
+	/// Client admissions park across a renewal so every debit belongs to one
+	/// epoch. Budgets reset at `RekeyDone`, and a debit issued mid-renewal
+	/// could otherwise straddle the boundary. A draining connection skips the
+	/// park, because the renewal is dead and owed traffic must flush.
+	pub fn poll_admit_debit(
 		&self,
 		credits: u64,
 		reserved: bool,
@@ -677,60 +714,64 @@ impl MuxShared {
 	}
 
 	/// Debit the outbound budget, waiting out any in-flight renewal.
-	pub(super) async fn admit_debit(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
+	pub async fn admit_debit(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
 		poll_fn(|cx| self.poll_admit_debit(credits, reserved, cx)).await
 	}
 
 	/// Chunks registered but not yet flushed, across all streams.
-	pub(super) fn unsent_chunks(&self) -> u64 {
+	pub fn unsent_chunks(&self) -> u64 {
 		self.lock().unsent_chunks
 	}
 
+	/// The current renewal phase.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn rekey_phase(&self) -> RekeyPhase {
+	pub fn rekey_phase(&self) -> RekeyPhase {
 		self.lock().rekey
 	}
 
-	/// Whether this endpoint may open a renewal right now: client
-	/// role with rekey materials, no renewal in flight, no GoAway.
+	/// Whether this endpoint may open a renewal now. That takes the client
+	/// role with rekey materials, an `Idle` phase, and a connection outside
+	/// drain.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn renewal_ready(&self) -> bool {
+	pub fn renewal_ready(&self) -> bool {
 		let state = self.lock();
 		let draining = state.is_draining();
 
 		state.rekey_client && state.rekey == RekeyPhase::Idle && !draining
 	}
 
-	/// Mark this endpoint as holding the client half of a rekey
-	/// exchange: renewal triggers and admission gating activate.
+	/// Mark this endpoint as the client half of a rekey exchange, which
+	/// activates renewal triggers and admission gating.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn mark_rekey_client(&self) {
+	pub fn mark_rekey_client(&self) {
 		self.lock().rekey_client = true;
 	}
 
-	/// Transition `Idle` to `AwaitingResponse` exactly once: `open`
-	/// runs under the state lock, so concurrent triggers collapse to
-	/// a single opened renewal, and an `open` failure leaves the
-	/// phase untouched. `None` when a renewal is already in flight,
-	/// the connection is draining, or `open` declined.
+	/// Transition `Idle` to `AwaitingResponse` exactly once.
+	///
+	/// `open` runs under the state lock, so concurrent triggers collapse to a
+	/// single opened renewal, and an `open` failure leaves the phase
+	/// untouched. It returns `None` when a renewal is already in flight, the
+	/// connection is draining, or `open` declined.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn enter_renewal<T>(&self, open: impl FnOnce() -> Option<T>) -> Option<T> {
+	pub fn enter_renewal<T>(&self, open: impl FnOnce() -> Option<T>) -> Option<T> {
 		let mut state = self.lock();
 		if state.rekey != RekeyPhase::Idle || state.is_draining() {
 			return None;
 		}
 
 		let request = open()?;
-		state.rekey = RekeyPhase::AwaitingResponse;
+		Self::advance_rekey(&mut state, RekeyPhase::Idle, RekeyPhase::AwaitingResponse);
 
 		Some(request)
 	}
 
-	/// Whether owed c2s chunks have quiesced (nothing registered but
-	/// unflushed). Parks `cx` on the rekey waker set otherwise, so the
-	/// caller re-polls when the last owed chunk flushes.
+	/// Whether owed c2s chunks have quiesced, which means the registered
+	/// count and the flushed count agree. Otherwise it parks `cx` on the
+	/// rekey waker set, so the caller re-polls when the last owed chunk
+	/// flushes.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn poll_chunks_quiesced(&self, cx: &Context<'_>) -> bool {
+	pub fn poll_chunks_quiesced(&self, cx: &Context<'_>) -> bool {
 		let mut state = self.lock();
 		if state.unsent_chunks == 0 {
 			return true;
@@ -740,71 +781,145 @@ impl MuxShared {
 		false
 	}
 
-	/// Park new c2s admissions while owed chunks flush ahead of the
-	/// `RekeyAck` (client, on a verified `RekeyResponse`).
+	/// Admit a `RekeyResponse` (client), parking new c2s admissions while
+	/// owed chunks flush ahead of the `RekeyAck`.
+	///
+	/// The phase check and the move are one step under the lock, so a
+	/// response that arrives out of order moves nothing and admits nothing.
+	/// It returns whether the response was admitted.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn begin_ack_flush(&self) {
+	pub fn admit_rekey_response(&self) -> bool {
 		let mut state = self.lock();
-		state.rekey = RekeyPhase::FlushingAck;
-		// Owed chunks may already be quiescent: give the writer its
-		// wake now rather than waiting for a ledger transition
+		if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingResponse, RekeyPhase::FlushingAck) {
+			return false;
+		}
+
+		// Owed chunks may already be quiescent, so give the writer its wake
+		// now, ahead of the next ledger transition.
 		Self::wake_on_quiesce(&mut state);
+		true
 	}
 
 	/// The send cipher is active after the Ack, which lifts the
 	/// hard-floor park.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn mark_ack_written(&self) {
+	pub fn mark_ack_written(&self) {
 		let mut state = self.lock();
-		state.rekey = RekeyPhase::AwaitingDone;
+		if !Self::advance_rekey(&mut state, RekeyPhase::FlushingAck, RekeyPhase::AwaitingDone) {
+			return;
+		}
+
 		state.rekey_hard_floor = false;
 		state.wake_rekey_waiters();
 	}
 
-	/// Close the renewal (fresh epoch active, or the attempt died):
-	/// admissions resume, hard floor lifts, parked tasks wake.
+	/// Close a renewal that completed (client, on `RekeyDone`), and report
+	/// whether the renewal closed.
+	///
+	/// - The phase check, the send budget reset, and the receipt rotation all
+	///   happen under the lock, before any parked admission wakes, so an
+	///   admission that debits the new epoch also reads its receipt.
+	/// - A `RekeyDone` that arrives before the `RekeyAck` was written closes nothing.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn finish_renewal(&self) {
+	pub fn complete_renewal(&self, receipt: StoredReceipt) -> bool {
 		let mut state = self.lock();
+		if !Self::advance_rekey(&mut state, RekeyPhase::AwaitingDone, RekeyPhase::Idle) {
+			return false;
+		}
+
+		state.send_budget = self.initial_send_budget;
+
+		// No path holds the receipt slot while it takes this lock, so taking
+		// the slot here keeps the lock order.
+		self.rotate_receipt(receipt);
+		Self::release_renewal(&mut state);
+		true
+	}
+
+	/// Abandon the renewal from any phase after the attempt died or was
+	/// refused. Admissions resume, the hard floor lifts, and parked tasks wake.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	pub fn finish_renewal(&self) {
+		let mut state = self.lock();
+		Self::abandon_renewal(&mut state);
+	}
+
+	/// Return the renewal to `Idle` from any phase. Apart from a completed
+	/// renewal, this is the only write of `Idle`.
+	fn abandon_renewal(state: &mut MuxState) {
 		state.rekey = RekeyPhase::Idle;
+		Self::release_renewal(state);
+	}
+
+	/// Lift the hard floor and wake everything parked on the renewal.
+	fn release_renewal(state: &mut MuxState) {
 		state.rekey_hard_floor = false;
 		state.wake_rekey_waiters();
 	}
 
-	/// Park data chunks: send records are down to the drain
-	/// headroom while a renewal is in flight, and what remains is
-	/// reserved for control and the exchange legs.
+	/// Park data chunks, because send records are down to the drain headroom
+	/// while a renewal is in flight, and what remains is reserved for control
+	/// and the exchange legs.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn park_hard_floor(&self) {
+	pub fn park_hard_floor(&self) {
 		self.lock().rekey_hard_floor = true;
 	}
 
-	/// Restore the outbound budget to the negotiated terms at the
-	/// `RekeyDone` boundary (credit-match invariant keeps the epoch
-	/// receipt's terms equal to the initial ones).
+	/// Restore the outbound budget to the negotiated terms at the `RekeyDone`
+	/// boundary. The credit-match invariant keeps the epoch receipt's terms
+	/// equal to the initial ones.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn reset_send_budget(&self) {
+	pub fn reset_send_budget(&self) {
 		self.lock().send_budget = self.initial_send_budget;
 	}
 
 	/// Publish the completed epoch receipt to handle accessors.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn rotate_receipt(&self, receipt: StoredReceipt) {
+	pub fn rotate_receipt(&self, receipt: StoredReceipt) {
 		let mut slot = self.session_receipt.lock().unwrap_or_else(PoisonError::into_inner);
 		*slot = Some(Arc::new(receipt));
 	}
 
+	/// The current epoch's dual-signed receipt, once a handshake or a renewal
+	/// published one.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub(super) fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
+	pub fn session_receipt(&self) -> Option<Arc<StoredReceipt>> {
 		let slot = self.session_receipt.lock().unwrap_or_else(PoisonError::into_inner);
 		slot.as_ref().map(Arc::clone)
 	}
 
-	/// Dual-write a control-plane event: core kind URN into the
-	/// instrument log, plus the stable label for spec assertions and
-	/// CSP alphabets.
+	/// Meter one pushed payload. The call debits the session budget and
+	/// accounts the payload's records on the stream's sender ledger, which is
+	/// the one budget rule both streaming sinks share.
+	///
+	/// # Errors
+	///
+	/// - The refusal from [`Self::admit_debit`] -- the budget cannot carry the payload.
+	pub(crate) async fn debit_push(
+		&self,
+		stream_id: u32,
+		payload_len: usize,
+		reserved: bool,
+	) -> TransportResult<BudgetStanding> {
+		let credits = payload_credits(payload_len, self.send_chunk_size, self.credit_unit);
+		let standing = self.admit_debit(credits, reserved).await?;
+		self.add_send_records(stream_id, chunk_records(payload_len, self.send_chunk_size));
+		Ok(standing)
+	}
+
+	/// Record a responder answering [`TransitStatus::Internal`] from a
+	/// local inconsistency, so the peer-observed status has a local
+	/// investigation trail.
+	pub(crate) fn note_internal_error(&self) {
+		#[cfg(feature = "instrument")]
+		self.emit_event(events::MUX_INTERNAL_ERROR);
+	}
+
+	/// Write a control-plane event twice: the core kind URN into the
+	/// instrument log, and the stable label for spec assertions and CSP
+	/// alphabets.
 	#[cfg(feature = "instrument")]
-	pub(super) fn emit_event(&self, event: Urn<'static>) {
+	pub fn emit_event(&self, event: Urn<'static>) {
 		let Some(trace) = self.trace.as_ref() else {
 			return;
 		};
@@ -812,10 +927,10 @@ impl MuxShared {
 		trace.emit_event(event);
 	}
 
-	/// Record a GoAway control event: the reason name labels why, and
-	/// its wire code is the assertable value.
+	/// Record a GoAway control event. The reason name labels why, and its
+	/// code is the assertable value.
 	#[cfg(feature = "instrument")]
-	pub(super) fn emit_goaway_event(&self, event: Urn<'static>, reason: GoAwayReason) {
+	pub fn emit_goaway_event(&self, event: Urn<'static>, reason: GoAwayReason) {
 		let Some(trace) = self.trace.as_ref() else {
 			return;
 		};
@@ -823,30 +938,24 @@ impl MuxShared {
 		trace.emit_event_with_value(event, reason.as_str(), u32::from(reason));
 	}
 
-	fn reject_admission(&self) -> TransportResult<()> {
-		match self.lock().reject_if_draining() {
-			Ok(()) => Ok(()),
-			Err(err) => {
-				#[cfg(feature = "instrument")]
-				self.emit_event(events::MUX_EMIT_DRAINING);
-
-				Err(err)
-			}
-		}
-	}
-
-	/// Reserve a cap slot for a locally-initiated stream without
-	/// assigning its ID: the ID is assigned when the Open record
-	/// enqueues (see [`Self::poll_open_enqueue`]), so it always
-	/// matches wire order. Admission (draining, cap, ID space) is
-	/// checked here, at the caller-visible initiation point.
-	pub(super) fn reserve_stream_slot(
+	/// Reserve a cap slot for a locally-initiated stream without assigning its
+	/// ID.
+	///
+	/// The ID is assigned when the Open record enqueues (see
+	/// [`Self::poll_open_enqueue`]), so it always matches the send order.
+	/// Admission (draining, cap, ID space) is checked here, at the
+	/// caller-visible initiation point.
+	pub fn reserve_stream_slot(
 		self: &Arc<Self>,
 		sender: oneshot::Sender<StreamOutcome>,
 	) -> TransportResult<StreamReservation> {
-		self.reject_admission()?;
 		let mut state = self.lock();
-		if state.next_stream_id.is_none() {
+		if state.admissible_stream_id().is_none() {
+			drop(state);
+
+			#[cfg(feature = "instrument")]
+			self.emit_event(events::MUX_EMIT_DRAINING);
+
 			return Err(TransportError::Draining);
 		}
 		if state.open_load() >= cap_as_usize(self.local_cap) {
@@ -864,17 +973,21 @@ impl MuxShared {
 		Ok(StreamReservation { shared: Arc::clone(self), sender: Some(sender), slot: OpenSlot::vacant() })
 	}
 
-	/// Atomic open: assign the next stream ID and enqueue the
-	/// stream's Open record in one critical section, so Opens hit
-	/// the wire in strictly increasing ID order no matter how
-	/// concurrent initiations interleave. The caller MUST have
-	/// reserved queue capacity via `poll_ready` on `outbound` first.
+	/// Atomic open: assign the next stream ID and enqueue the stream's Open
+	/// record in one critical section. Opens therefore reach the peer in
+	/// strictly increasing ID order, however concurrent initiations
+	/// interleave.
 	///
-	/// Every precondition (rekey hard floor) is checked before the
-	/// ID is consumed, so a `Pending` never burns an ID or a wire
-	/// slot. The fresh ledger's initial credit is at least one, so
-	/// the Open's own credit debit can never park after assignment.
-	pub(super) fn poll_open_enqueue(
+	/// The caller MUST have reserved queue capacity through `poll_ready` on
+	/// `outbound` first.
+	///
+	/// # Preconditions
+	///
+	/// Every precondition, such as the rekey hard floor, is checked before
+	/// the ID is consumed, so a `Pending` leaves the ID and the queue slot
+	/// free. The fresh ledger's initial credit is at least one, so the Open's
+	/// own credit debit proceeds straight after assignment.
+	pub fn poll_open_enqueue(
 		&self,
 		reservation: &mut StreamReservation,
 		request: &mut OpenRequest<'_>,
@@ -887,7 +1000,7 @@ impl MuxShared {
 			return Poll::Pending;
 		}
 
-		let Some(stream_id) = state.next_stream_id else {
+		let Some(stream_id) = state.admissible_stream_id() else {
 			return Poll::Ready(Err(TransportError::Draining));
 		};
 		let Some(sender) = reservation.sender.take() else {
@@ -900,8 +1013,8 @@ impl MuxShared {
 		state.pending.insert(stream_id, sender);
 		reservation.slot.assign(stream_id);
 
-		// Seed the ledger, then take the Open's own credit: the
-		// initial grant floor of one admits it without parking.
+		// Seed the ledger, then take the Open's own credit. The initial grant
+		// floor of one admits it without parking.
 		state.unsent_chunks = state.unsent_chunks.saturating_add(request.records);
 		state.send_streams.insert(
 			stream_id,
@@ -916,8 +1029,8 @@ impl MuxShared {
 			return Poll::Ready(Err(err));
 		}
 
-		// Registered before the Open can reach the peer, so a reply
-		// chunk always finds its forwarder.
+		// The forwarder registers before the Open can reach the peer, so a
+		// reply chunk always finds it.
 		if let Some(forwarder) = request.duplex.take() {
 			self.insert_duplex(stream_id, forwarder);
 		}
@@ -933,12 +1046,14 @@ impl MuxShared {
 		Poll::Ready(enqueued.map(|()| stream_id))
 	}
 
-	pub(super) fn remove_pending(&self, stream_id: u32) -> Option<oneshot::Sender<StreamOutcome>> {
+	/// Detach a pending stream's outcome sender and release its sender
+	/// ledger, or return `None` for an unknown ID.
+	pub fn remove_pending(&self, stream_id: u32) -> Option<oneshot::Sender<StreamOutcome>> {
 		let mut state = self.lock();
 		let entry = state.pending.remove(&stream_id);
 		if entry.is_some() {
-			// The stream is over: releasing its sender ledger wakes a
-			// producer still parked on credit so it stops sending
+			// The stream is over, so releasing its sender ledger wakes a
+			// producer still parked on credit and it stops sending.
 			Self::drop_send_stream(&mut state, stream_id);
 			state.wake_drain_waiters();
 			state.wake_slot_waiters();
@@ -947,21 +1062,29 @@ impl MuxShared {
 		entry
 	}
 
-	/// Resolve a pending stream. Unknown IDs are silently discarded
-	/// (tolerates cancel/response races on the connection).
-	pub(super) fn resolve(&self, stream_id: u32, outcome: StreamOutcome) {
+	/// Resolve a pending stream. An unknown ID is silently discarded, which
+	/// tolerates a cancel racing a response on the connection.
+	pub fn resolve(&self, stream_id: u32, outcome: StreamOutcome) {
 		if let Some(sender) = self.remove_pending(stream_id) {
 			let _ = sender.send(outcome);
 		}
 	}
 
-	/// Register a locally-initiated ping and return its correlation
-	/// value. Refused while draining: a peer that honors the GoAway
-	/// contract reserves its remaining records for owed stream
-	/// traffic and never acks (see [`MuxSettings::drain_reserve_records`]).
-	pub(super) fn allocate_ping(&self, sender: oneshot::Sender<()>) -> TransportResult<u64> {
-		self.reject_admission()?;
+	/// Register a locally-initiated ping and return its correlation value.
+	///
+	/// The ping is refused while draining, because a peer that honors the
+	/// GoAway contract reserves its remaining records for owed stream traffic
+	/// (see [`MuxSettings::drain_reserve_records`]).
+	pub fn allocate_ping(&self, sender: oneshot::Sender<()>) -> TransportResult<u64> {
 		let mut state = self.lock();
+		if state.is_draining() {
+			drop(state);
+
+			#[cfg(feature = "instrument")]
+			self.emit_event(events::MUX_EMIT_DRAINING);
+
+			return Err(TransportError::Draining);
+		}
 
 		let opaque = state.next_ping_opaque;
 		state.next_ping_opaque = opaque.wrapping_add(1);
@@ -970,28 +1093,32 @@ impl MuxShared {
 		Ok(opaque)
 	}
 
-	/// Resolve a pending ping. Unknown correlation values are silently
-	/// discarded (stale ack racing a dropped ping future is benign).
-	pub(super) fn resolve_ping(&self, opaque: u64) {
+	/// Resolve a pending ping. An unknown correlation value is silently
+	/// discarded, because a stale ack that races a dropped ping future is
+	/// benign.
+	pub fn resolve_ping(&self, opaque: u64) {
 		if let Some(sender) = self.lock().pending_pings.remove(&opaque) {
 			let _ = sender.send(());
 		}
 	}
 
-	pub(super) fn remove_pending_ping(&self, opaque: u64) {
+	/// Forget a pending ping without resolving it.
+	pub fn remove_pending_ping(&self, opaque: u64) {
 		self.lock().pending_pings.remove(&opaque);
 	}
 
-	pub(super) fn shutdown_begun(&self) -> bool {
+	/// Whether this endpoint already sent its GoAway.
+	pub fn shutdown_begun(&self) -> bool {
 		self.lock().goaway_sent.is_some()
 	}
 
-	/// Drop every pending slot on connection failure. Receivers observe
-	/// cancellation. Producers parked on credit observe ledger removal.
-	/// Any in-flight renewal is dead: parked admissions resume to
-	/// meet the failure instead of waiting for a `RekeyDone` that
-	/// will never arrive.
-	pub(super) fn fail_all_pending(&self) {
+	/// Drop every pending slot on connection failure.
+	///
+	/// - Receivers observe cancellation.
+	/// - Producers parked on credit observe the ledger removal.
+	/// - Any in-flight renewal is dead, so parked admissions resume to meet the
+	///   failure instead of waiting for a `RekeyDone` the peer abandoned.
+	pub fn fail_all_pending(&self) {
 		self.fail_all_duplex();
 
 		let mut state = self.lock();
@@ -1005,20 +1132,17 @@ impl MuxShared {
 		}
 
 		state.unsent_chunks = 0;
-		state.rekey = RekeyPhase::Idle;
-		state.rekey_hard_floor = false;
+		Self::abandon_renewal(&mut state);
 		state.wake_drain_waiters();
 		state.wake_slot_waiters();
-		state.wake_rekey_waiters();
 	}
 
-	/// Resolve pending streams above `last_stream_id` as draining
-	/// (peer GoAway: it will never process them). Records the peer's
+	/// Resolve pending streams above `last_stream_id` as draining, because
+	/// the peer's GoAway stopped their processing. It records the peer's
 	/// reason for [`MuxShared::goaway_reason`].
-	pub(super) fn fail_pending_above(&self, last_stream_id: u32, reason: GoAwayReason) {
+	pub fn fail_pending_above(&self, last_stream_id: u32, reason: GoAwayReason) {
 		{
 			let mut state = self.lock();
-
 			state.goaway_received = Some(last_stream_id);
 			state.goaway_reason = Some(reason);
 
@@ -1038,8 +1162,10 @@ impl MuxShared {
 	}
 
 	/// Halt the allocator and record the GoAway watermark.
-	/// `last_stream_id` to advertise, or `None` if already shutting down.
-	pub(super) fn begin_shutdown(&self) -> Option<u32> {
+	///
+	/// It returns the `last_stream_id` to advertise, or `None` when shutdown
+	/// already began.
+	pub fn begin_shutdown(&self) -> Option<u32> {
 		let mut state = self.lock();
 		if state.goaway_sent.is_some() {
 			return None;
@@ -1051,10 +1177,15 @@ impl MuxShared {
 		Some(state.last_peer_stream_id)
 	}
 
-	/// Validate and record an incoming peer-initiated stream ID
-	/// ([RFC 9113 § 5.1.1](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1):
-	/// odd/even role match, nonzero, strictly increasing).
-	pub(super) fn register_peer_stream(&self, stream_id: u32) -> TransportResult<PeerStream> {
+	/// Validate and record an incoming peer-initiated stream ID per
+	/// [RFC 9113 § 5.1.1][rfc9113-5.1.1].
+	///
+	/// - The ID is odd or even to match the peer's role.
+	/// - The ID is nonzero.
+	/// - The ID is strictly greater than every earlier peer-initiated ID.
+	///
+	/// [rfc9113-5.1.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1
+	pub fn register_peer_stream(&self, stream_id: u32) -> TransportResult<PeerStream> {
 		let mut state = self.lock();
 		if !self.role.peer().initiates(stream_id) || stream_id <= state.last_peer_stream_id {
 			return Err(TransportError::InvalidMessage);
@@ -1071,11 +1202,14 @@ impl MuxShared {
 		Ok(PeerStream::Accept)
 	}
 
-	pub(super) fn last_peer_stream_id(&self) -> u32 {
+	/// Highest peer-initiated stream ID seen, or 0 before the first.
+	pub fn last_peer_stream_id(&self) -> u32 {
 		self.lock().last_peer_stream_id
 	}
 
-	pub(super) fn has_stream_headroom(&self) -> bool {
+	/// Whether a new locally-initiated stream fits now: no GoAway in either
+	/// direction, a live ID space, and an open load under the cap.
+	pub fn has_stream_headroom(&self) -> bool {
 		let state = self.lock();
 		let under_cap = state.open_load() < cap_as_usize(self.local_cap);
 		let id_space_live = state.next_stream_id.is_some();
@@ -1084,30 +1218,29 @@ impl MuxShared {
 		no_goaway && id_space_live && under_cap
 	}
 
-	pub(super) fn has_pending_streams(&self) -> bool {
+	/// Whether any locally-initiated stream is pending or reserved.
+	pub fn has_pending_streams(&self) -> bool {
 		let state = self.lock();
 		!state.pending.is_empty() || state.reserved > 0
 	}
 
-	pub(super) fn is_pending(&self, stream_id: u32) -> bool {
+	/// Whether `stream_id` is awaiting its response.
+	pub fn is_pending(&self, stream_id: u32) -> bool {
 		self.lock().pending.contains_key(&stream_id)
 	}
 
-	pub(super) fn goaway_reason(&self) -> Option<GoAwayReason> {
+	/// Reason carried by the peer's GoAway, once received.
+	pub fn goaway_reason(&self) -> Option<GoAwayReason> {
 		self.lock().goaway_reason
 	}
 
-	/// Resolve once a locally-initiated stream would be admitted, or
-	/// fail with `Draining` once no stream will ever be admitted again.
-	pub(super) fn poll_stream_slot(&self, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
+	/// Resolve once a locally-initiated stream would be admitted, or fail
+	/// with `Draining` once admission has ended for good.
+	pub fn poll_stream_slot(&self, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
 		let mut state = self.lock();
-
-		let goaway = state.is_draining();
-		let id_space_dead = state.next_stream_id.is_none();
-		if goaway || id_space_dead {
+		if state.admissible_stream_id().is_none() {
 			return Poll::Ready(Err(TransportError::Draining));
 		}
-
 		if state.open_load() < cap_as_usize(self.local_cap) {
 			return Poll::Ready(Ok(()));
 		}
@@ -1118,9 +1251,9 @@ impl MuxShared {
 	}
 }
 
-/// Resolves once a locally-initiated stream would be admitted. Fails
-/// with `Draining` once no stream will ever be admitted again.
-pub(super) struct StreamSlot {
+/// Future that resolves once a locally-initiated stream would be admitted,
+/// or fails with `Draining` once admission has ended for good.
+pub struct StreamSlot {
 	shared: Arc<MuxShared>,
 }
 
@@ -1132,9 +1265,9 @@ impl Future for StreamSlot {
 	}
 }
 
-/// Resolves once the pending table drains (all in-flight local streams
-/// completed, cancelled, or failed).
-pub(super) struct DrainPending {
+/// Future that resolves once the pending table drains, which means every
+/// in-flight local stream completed, was cancelled, or failed.
+pub struct DrainPending {
 	shared: Arc<MuxShared>,
 }
 
@@ -1153,10 +1286,28 @@ impl Future for DrainPending {
 	}
 }
 
+impl MuxShared {}
+
+impl CancelReason {
+	/// The transport error a caller observes for this cancel reason.
+	pub fn cancel_error(&self) -> TransportError {
+		match self {
+			CancelReason::Cancelled => TransportError::OperationFailed(TransportFailure::Cancelled),
+			CancelReason::Timeout => TransportError::OperationFailed(TransportFailure::DeadlineExceeded),
+			CancelReason::Rejected => TransportError::OperationFailed(TransportFailure::ResourceExhausted),
+			// An app-coded cancel is still a cancel, and the code maps to no
+			// transport failure of its own.
+			CancelReason::Application(_) => TransportError::OperationFailed(TransportFailure::Cancelled),
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::super::body::stream_body;
-	use super::super::testing::{noop_cx, poll_chunk};
+	use super::super::body::StreamBody;
+	use super::super::link::MuxLink;
+	use super::super::outbound::outbound_handle;
+	use super::super::testing::noop_cx;
 	use super::*;
 
 	use crate::constants::DEFAULT_HOP_BUDGET;
@@ -1181,8 +1332,8 @@ mod tests {
 		oneshot::channel().0
 	}
 
-	/// Open one stream through the production path: reserve, then
-	/// atomically assign its ID and enqueue its Open record.
+	/// Open one stream through the production path. It reserves a slot, then
+	/// atomically assigns the ID and enqueues the Open record.
 	fn open_one(shared: &Arc<MuxShared>) -> TransportResult<u32> {
 		let mut reservation = shared.reserve_stream_slot(slot())?;
 		let (mut outbound, _wire) = mpsc::channel(4);
@@ -1203,13 +1354,15 @@ mod tests {
 		}
 	}
 
-	fn allocate_ids(shared: &Arc<MuxShared>, ids: &[u32]) {
+	fn allocate_ids(shared: &Arc<MuxShared>, ids: impl AsRef<[u32]>) {
+		let ids = ids.as_ref();
 		for &id in ids {
 			assert!(matches!(open_one(shared), Ok(got) if got == id));
 		}
 	}
 
-	fn allocate_ping_ids(shared: &MuxShared, ids: &[u64]) {
+	fn allocate_ping_ids(shared: &MuxShared, ids: impl AsRef<[u64]>) {
+		let ids = ids.as_ref();
 		for &id in ids {
 			assert!(matches!(shared.allocate_ping(ping_slot()), Ok(got) if got == id));
 		}
@@ -1242,7 +1395,7 @@ mod tests {
 			HeadroomSetup::Fresh { cap } => shared(MuxRole::Client, cap),
 			HeadroomSetup::AtCap { cap } => {
 				let shared = shared(MuxRole::Client, cap);
-				allocate_ids(&shared, &[1]);
+				allocate_ids(&shared, [1]);
 				shared
 			}
 			HeadroomSetup::LocalShutdown { cap } => {
@@ -1290,7 +1443,7 @@ mod tests {
 		let shared = shared(MuxRole::Client, 1);
 		match setup {
 			SlotSetup::ReadyWithHeadroom => {}
-			SlotSetup::PendingAtCap => allocate_ids(&shared, &[1]),
+			SlotSetup::PendingAtCap => allocate_ids(&shared, [1]),
 			SlotSetup::DrainingLocal => {
 				shared.begin_shutdown();
 			}
@@ -1302,7 +1455,7 @@ mod tests {
 	}
 
 	fn assert_cancel_maps(reason: CancelReason, failure: TransportFailure) {
-		let error = cancel_error(reason);
+		let error = reason.cancel_error();
 		assert!(matches!(
 			error,
 			TransportError::OperationFailed(got) if got == failure
@@ -1357,7 +1510,7 @@ mod tests {
 	#[test]
 	fn test_cap_exhaustion_reports_busy() {
 		let shared = shared(MuxRole::Client, 2);
-		allocate_ids(&shared, &[1, 3]);
+		allocate_ids(&shared, [1, 3]);
 		assert!(matches!(
 			open_one(&shared),
 			Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
@@ -1367,22 +1520,22 @@ mod tests {
 	#[test]
 	fn test_completed_stream_frees_cap_slot() {
 		let shared = shared(MuxRole::Client, 1);
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 		assert!(shared.remove_pending(1).is_some());
-		allocate_ids(&shared, &[3]);
+		allocate_ids(&shared, [3]);
 	}
 
-	// The heart of the atomic open: whichever initiation sends its
-	// Open first takes the lower ID, regardless of reservation
-	// order, so Opens hit the wire in strictly increasing ID order.
+	// The atomic open gives the lower ID to whichever initiation sends its
+	// Open first, whatever the reservation order, so Opens reach the peer in
+	// strictly increasing ID order.
 	#[test]
 	fn test_ids_follow_open_order_not_reservation_order() {
 		let shared = shared(MuxRole::Client, 4);
 		let early = shared.reserve_stream_slot(slot()).expect("fresh connection has headroom");
-
 		assert!(matches!(open_one(&shared), Ok(1)));
 
 		drop(early);
+
 		assert!(matches!(open_one(&shared), Ok(3)));
 	}
 
@@ -1400,7 +1553,7 @@ mod tests {
 		assert!(matches!(open_one(&shared), Ok(1)));
 	}
 
-	// An open parked on the rekey hard floor consumes nothing: the
+	// An open parked on the rekey hard floor holds its reservation, so the
 	// same reservation opens once the floor lifts.
 	#[test]
 	fn test_open_parked_on_rekey_floor_keeps_reservation() {
@@ -1449,8 +1602,44 @@ mod tests {
 	fn test_id_space_exhaustion_reports_draining() {
 		let shared = shared(MuxRole::Client, 8);
 		shared.lock().next_stream_id = Some(u32::MAX);
-		allocate_ids(&shared, &[u32::MAX]);
+		allocate_ids(&shared, [u32::MAX]);
 		assert!(matches!(open_one(&shared), Err(TransportError::Draining)));
+	}
+
+	/// A GoAway that lands between reservation and enqueue stops the Open.
+	///
+	/// The reservation succeeds while admission is open, so this is the
+	/// window the enqueue itself has to close (CWE-362).
+	#[test]
+	fn test_goaway_after_reservation_refuses_the_open() {
+		let shared = shared(MuxRole::Client, 8);
+		let mut reservation = shared.reserve_stream_slot(slot()).expect("admission is open");
+
+		shared.lock().goaway_received = Some(0);
+
+		let (mut outbound, _wire) = mpsc::channel(4);
+		let mut request = OpenRequest {
+			kind: MuxStreamKind::Unary,
+			last: true,
+			payload: &[],
+			records: 1,
+			duplex: None,
+			target: None,
+			hops_remaining: DEFAULT_HOP_BUDGET,
+		};
+
+		let mut cx = noop_cx();
+		let enqueued = shared.poll_open_enqueue(&mut reservation, &mut request, &mut outbound, &mut cx);
+		assert!(matches!(enqueued, Poll::Ready(Err(TransportError::Draining))));
+	}
+
+	#[test]
+	fn test_goaway_refuses_a_new_ping() {
+		let shared = shared(MuxRole::Client, 8);
+		shared.lock().goaway_received = Some(0);
+
+		let (sender, _receiver) = oneshot::channel();
+		assert!(matches!(shared.allocate_ping(sender), Err(TransportError::Draining)));
 	}
 
 	#[test]
@@ -1496,7 +1685,7 @@ mod tests {
 	#[test]
 	fn test_ping_allocates_monotonic_opaque() {
 		let shared = shared(MuxRole::Client, 8);
-		allocate_ping_ids(&shared, &[0, 1, 2]);
+		allocate_ping_ids(&shared, [0, 1, 2]);
 	}
 
 	#[test]
@@ -1554,15 +1743,15 @@ mod tests {
 		let shared = shared(MuxRole::Client, 8);
 		assert!(!shared.has_pending_streams());
 
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 
 		assert!(shared.has_pending_streams());
 		assert!(shared.remove_pending(1).is_some());
 		assert!(!shared.has_pending_streams());
 	}
 
-	// A reserved slot (open_stream before first push) must pin the
-	// connection against idle prune the same way a pending ID does.
+	// A reserved slot (open_stream before the first push) must pin the
+	// connection against the idle prune the same way a pending ID does.
 	#[test]
 	fn test_reserved_slot_counts_as_pending() {
 		let shared = shared(MuxRole::Client, 8);
@@ -1604,12 +1793,11 @@ mod tests {
 	#[test]
 	fn test_stream_slot_wakes_when_slot_frees() {
 		let shared = shared(MuxRole::Client, 1);
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 
 		let (flag, waker) = FlagWake::pair();
 		let mut cx = Context::from_waker(&waker);
 		assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Pending));
-
 		assert!(shared.remove_pending(1).is_some());
 
 		assert!(flag.woken());
@@ -1619,7 +1807,7 @@ mod tests {
 	#[test]
 	fn test_stream_slot_wakes_on_shutdown() {
 		let shared = shared(MuxRole::Client, 1);
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 
 		let (flag, waker) = FlagWake::pair();
 		let mut cx = Context::from_waker(&waker);
@@ -1641,7 +1829,7 @@ mod tests {
 		settings
 	}
 
-	/// Caps 1/1, chunk 1024, unit 1024: drain headroom is 5 records
+	/// Caps 1/1, chunk 1024, and unit 1024 give a drain headroom of 5 records
 	/// priced at 1 credit each.
 	fn budget_settings(send_budget: u64) -> MuxSettings {
 		let mut settings = MuxSettings::symmetric(1);
@@ -1685,7 +1873,7 @@ mod tests {
 	fn test_credit_grants_are_monotonic() {
 		let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
 		shared.register_send_stream(1, 4);
-		// A grant at or below the current limit changes nothing
+		// A grant at or below the current limit leaves the limit as it is.
 		shared.apply_credit_grant(1, 1);
 
 		let mut cx = noop_cx();
@@ -1716,18 +1904,19 @@ mod tests {
 	fn test_budget_debit_fail_fast_and_reserve() {
 		let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
 
-		// 10 credits, 5 reserved: 4 spend cleanly
+		// Of 10 credits, 5 are reserved, so 4 spend cleanly.
 		assert!(matches!(shared.debit_send_budget(4, false), Ok(BudgetStanding::Healthy)));
-		// 6 credits left, 1 spendable: 6 must fail fast, not park
+		// With 6 credits left and 1 spendable, a debit of 6 must fail fast
+		// instead of parking.
 		assert!(matches!(
 			shared.debit_send_budget(6, false),
 			Err(TransportError::OperationFailed(TransportFailure::BudgetExhausted))
 		));
-		// The last spendable credit tips the balance into the reserve
+		// The last spendable credit tips the balance into the reserve.
 		assert!(matches!(shared.debit_send_budget(1, false), Ok(BudgetStanding::Exhausting)));
-		// Owed (reserved) traffic keeps flowing inside the reserve
+		// Owed (reserved) traffic keeps flowing inside the reserve.
 		assert!(matches!(shared.debit_send_budget(5, true), Ok(BudgetStanding::Exhausting)));
-		// Even the reserve refuses an overdraft
+		// The reserve also refuses an overdraft.
 		assert!(matches!(
 			shared.debit_send_budget(1, true),
 			Err(TransportError::OperationFailed(TransportFailure::BudgetExhausted))
@@ -1767,6 +1956,49 @@ mod tests {
 		assert!(matches!(admitted, Poll::Ready(Ok(BudgetStanding::Healthy))));
 	}
 
+	/// A waker that records whether the epoch receipt had rotated when it
+	/// woke.
+	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
+	struct ReceiptWitness {
+		shared: Arc<MuxShared>,
+		rotated: core::sync::atomic::AtomicBool,
+	}
+
+	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
+	impl futures::task::ArcWake for ReceiptWitness {
+		fn wake_by_ref(arc_self: &Arc<Self>) {
+			let rotated = arc_self.shared.session_receipt().is_some();
+			arc_self.rotated.store(rotated, core::sync::atomic::Ordering::SeqCst);
+		}
+	}
+
+	/// An admission released by a completed renewal debits the new epoch, so
+	/// it must find the new epoch's receipt already in place when it wakes.
+	#[cfg(all(feature = "secp256k1", feature = "aes-gcm"))]
+	#[tokio::test]
+	async fn test_a_released_admission_reads_the_new_epoch_receipt(
+	) -> Result<(), crate::transport::handshake::HandshakeError> {
+		use crate::transport::rekey::tests::{rekey_pair, run_exchange};
+
+		let (mut client, mut server) = rekey_pair()?;
+		let (client_install, _) = run_exchange(&mut client, &mut server).await?;
+
+		let shared = shared_with_settings(MuxRole::Client, budget_settings(10));
+		begin_client_renewal(&shared);
+		assert!(shared.admit_rekey_response());
+
+		shared.mark_ack_written();
+
+		let witness = Arc::new(ReceiptWitness { shared: Arc::clone(&shared), rotated: Default::default() });
+		let waker = futures::task::waker(Arc::clone(&witness));
+		let parked = shared.poll_admit_debit(1, false, &mut Context::from_waker(&waker));
+		assert!(matches!(parked, Poll::Pending));
+
+		assert!(shared.complete_renewal(client_install.receipt));
+		assert!(witness.rotated.load(core::sync::atomic::Ordering::SeqCst));
+		Ok(())
+	}
+
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[test]
 	fn test_hard_floor_parks_chunks_until_ack_writes() {
@@ -1783,6 +2015,9 @@ mod tests {
 		let parked = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut parked_cx);
 		assert!(matches!(parked, Poll::Pending));
 
+		// The renewal reaches the Ack write through the flush phase, the same
+		// order the reader and writer drive it in.
+		assert!(shared.admit_rekey_response());
 		shared.mark_ack_written();
 		assert!(flag.woken());
 
@@ -1791,19 +2026,19 @@ mod tests {
 		assert!(matches!(enqueued, Poll::Ready(Ok(()))));
 	}
 
-	// A wire cancel enqueued while the queue is saturated still
-	// travels: the teardown clone's guaranteed slot (channel capacity
-	// = buffer + senders) admits it past a full buffer.
+	// A cancel enqueued while the queue is saturated still travels, because
+	// the teardown clone's guaranteed slot admits it past a full buffer. The
+	// channel capacity is the buffer plus the senders.
 	#[test]
 	fn test_stream_cancel_survives_saturated_queue() {
 		let shared = shared(MuxRole::Client, 2);
-		allocate_ids(&shared, &[1]);
+		allocate_ids(&shared, [1]);
 
 		let (outbound, mut wire) = mpsc::channel(0);
 		let mut filler = outbound_handle(&outbound);
 		while filler.try_send(Outbound::Close).is_ok() {}
 
-		enqueue_stream_cancel(&shared, &outbound, 1);
+		MuxLink::new(shared, outbound).enqueue_stream_cancel(1);
 
 		let mut saw_cancel = false;
 		while let Ok(command) = wire.try_recv() {
@@ -1818,21 +2053,21 @@ mod tests {
 		assert!(saw_cancel);
 	}
 
-	// A peer GoAway disowns duplex replies above its watermark:
-	// those bodies fail with Draining, the rest stay live.
+	// A peer GoAway disowns duplex replies above its watermark, so those
+	// bodies fail with Draining and the rest stay live.
 	#[test]
 	fn test_fail_duplex_above_fails_disowned_replies() {
 		let shared = shared(MuxRole::Client, 4);
 		let (feedback, _notes) = mpsc::unbounded();
-		let (mut kept, below) = stream_body(OpenSlot::assigned(1), 4, feedback.clone());
-		let (mut disowned, above) = stream_body(OpenSlot::assigned(3), 4, feedback);
+		let (mut kept, below) = StreamBody::pair(OpenSlot::assigned(1), 4, feedback.clone());
+		let (mut disowned, above) = StreamBody::pair(OpenSlot::assigned(3), 4, feedback);
 		shared.insert_duplex(1, below);
 		shared.insert_duplex(3, above);
 
 		shared.fail_duplex_above(1);
 
-		assert!(matches!(poll_chunk(&mut kept), Poll::Pending));
-		assert!(matches!(poll_chunk(&mut disowned), Poll::Ready(Err(TransportError::Draining))));
+		assert!(matches!(kept.poll_chunk_now(), Poll::Pending));
+		assert!(matches!(disowned.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
 		assert!(shared.take_duplex(1).is_some());
 		assert!(shared.take_duplex(3).is_none());
 	}

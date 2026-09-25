@@ -64,7 +64,7 @@ where
 	) -> Result<Self, HandshakeError> {
 		// Generate SKID from public key
 		let verifying_key = signer.verifying_key();
-		let signer_id = compute_signer_identifier::<P::Digest, _>(&verifying_key)?;
+		let signer_id = compute_signer_identifier(&verifying_key)?;
 
 		Ok(Self {
 			signer,
@@ -91,7 +91,8 @@ where
 	///
 	/// # Returns
 	/// A complete CMS SignedData structure with signature
-	pub fn build(self, content: &[u8]) -> Result<SignedData, HandshakeError> {
+	pub fn build(self, content: impl AsRef<[u8]>) -> Result<SignedData, HandshakeError> {
+		let content = content.as_ref();
 		// 1. Sign under the canonical convention: SHA3 digest once, ECDSA
 		// over the prehash, matching the advertised signature-algorithm OID.
 		let signature = sign_canonical::<P::Digest, P::Signature>(self.signer, content)?;

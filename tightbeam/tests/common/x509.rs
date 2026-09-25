@@ -9,7 +9,6 @@
 use core::time::Duration;
 use std::sync::Arc;
 
-use sha3::Sha3_256;
 use tightbeam::{
 	cert,
 	crypto::{
@@ -28,7 +27,7 @@ use tightbeam::{
 	prelude::{collect::TokioListener, *},
 	server,
 	spki::SubjectPublicKeyInfoOwned,
-	testing::{create_test_certificate_with_uri_sans, create_test_signing_key},
+	testing::{TestCertificate, TestKey},
 	transport::{handshake::HandshakeKeyManager, EncryptedProtocol, TransportEncryptionConfig},
 	utils::urn::Urn,
 	x509::Certificate,
@@ -36,8 +35,12 @@ use tightbeam::{
 };
 
 /// Create a test certificate with signing key for a given subject and validity period
-pub fn create_test_cert_with_key(subject: &str, validity_days: u64) -> Result<(Certificate, Secp256k1SigningKey)> {
-	let signing_key = create_test_signing_key();
+pub fn create_test_cert_with_key(
+	subject: impl AsRef<str>,
+	validity_days: u64,
+) -> Result<(Certificate, Secp256k1SigningKey)> {
+	let subject = subject.as_ref();
+	let signing_key = TestKey::insecure_fixed_signing();
 	let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 	let sha3_signer = Sha3Signer::from(&signing_key);
 	let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
@@ -77,10 +80,11 @@ pub struct GatewayCerts {
 
 impl GatewayCerts {
 	/// Generate a fresh self-signed gateway identity for `subject`.
-	pub fn generate(subject: &str) -> Self {
+	pub fn generate(subject: impl AsRef<str>) -> Self {
+		let subject = subject.as_ref();
 		let (cert, key) = create_test_cert_with_key(subject, 365).expect("Failed to create gateway cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			CertificateTrustBuilder::from(Secp256k1Policy)
 				.with_chain(vec![cert.to_owned()])
 				.expect("Failed to build trust")
 				.build(),
@@ -95,8 +99,8 @@ impl GatewayCerts {
 	/// provably binds to the SAN alone. Colony membership gates gossip and
 	/// peer federation.
 	pub fn generate_colony(colony_urn: &Urn<'_>) -> Self {
-		let raw = create_test_signing_key();
-		let cert = create_test_certificate_with_uri_sans(&raw, &[&colony_urn.to_string()]);
+		let raw = TestKey::insecure_fixed_signing();
+		let cert = TestCertificate::with_uri_sans(&raw, &[&colony_urn.to_string()]);
 		let key = Secp256k1SigningKey::from(raw);
 		let trust = combined_trust(&[&cert]);
 		Self { cert, key, trust }
@@ -104,8 +108,8 @@ impl GatewayCerts {
 }
 
 /// Trust builder anchoring several independent identities at once.
-fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder<Sha3_256> {
-	let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
+fn combined_trust_builder(certs: &[&Certificate]) -> CertificateTrustBuilder {
+	let mut builder = CertificateTrustBuilder::from(Secp256k1Policy);
 	for cert in certs {
 		builder = builder
 			.with_certificate((*cert).to_owned())
@@ -182,12 +186,12 @@ impl MutualAuthServer {
 	) -> Result<Self> {
 		use tightbeam::{compose, decode};
 
-		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::Sequence)]
+		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::der::Sequence)]
 		struct PingMessage {
 			data: String,
 		}
 
-		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::Sequence)]
+		#[derive(Clone, Debug, PartialEq, tightbeam::Beamable, tightbeam::der::Sequence)]
 		struct PongMessage {
 			echo: String,
 		}
@@ -207,11 +211,11 @@ impl MutualAuthServer {
 				async move {
 					tx.send(message.to_owned()).await.map_err(|_| TightBeamError::InvalidBody)?;
 
-					let ping: PingMessage = decode(&message.message)?;
+					let ping: PingMessage = decode(message.message())?;
 					let pong = PongMessage { echo: ping.data };
 
 					Ok(Some(compose! {
-						V0: id: &message.metadata.id,
+						V0: id: message.metadata().id(),
 						message: pong
 					}?))
 				}

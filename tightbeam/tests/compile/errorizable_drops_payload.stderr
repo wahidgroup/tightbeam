@@ -1,0 +1,6 @@
+error: a variant carrying fields must reference at least one of them in #[error("...")]: a message with no placeholder drops the payload
+ --> tests/compile/errorizable_drops_payload.rs:7:2
+  |
+7 | /     #[error("the lengths disagree")]
+8 | |     LengthMismatch { expected: usize, received: usize },
+  | |_______________________________________________________^

@@ -18,17 +18,16 @@ pub mod assertions;
 pub mod config;
 pub mod env;
 pub mod error;
-pub mod export;
+pub mod fdr;
+pub mod fixtures;
 pub mod macros;
 pub mod result;
+pub mod schedulability;
 pub mod specs;
-pub mod trace;
-pub mod utils;
+pub mod teardown;
 
 #[cfg(feature = "testing-fault")]
 pub mod fault;
-#[cfg(feature = "testing-fdr")]
-pub mod fdr;
 #[cfg(feature = "testing-fmea")]
 pub mod fmea;
 #[cfg(feature = "testing-fuzz")]
@@ -36,24 +35,30 @@ pub mod fuzz;
 #[cfg(all(feature = "testing-fuzz", feature = "colony"))]
 pub mod routes;
 #[cfg(feature = "testing-timing")]
-pub mod schedulability;
-#[cfg(feature = "testing-timing")]
 pub mod timing;
 
 // Re-exports
-pub use config::{HookContext, ScenarioConfig, ScenarioConfigBuilder, TestHooks};
+pub use config::{
+	AcceptedObserver, Expect, HookContext, RejectedObserver, ScenarioConfig, ScenarioConfigBuilder,
+	ScenarioConfigError, TestHooks,
+};
 pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
-pub use export::ScenarioResultExport;
-pub use result::ScenarioResult;
-pub use specs::{verify_trace, SpecViolation, TBSpec};
-pub use utils::*;
+pub use fixtures::{
+	ConfidentialNonrepudiableNote, ConfidentialNote, ExpectedMatcher, IntegralNote, TestCertificate, TestDigest,
+	TestFrame, TestKey, TestMessage, TestSigner,
+};
+pub use result::{ScenarioResult, ScenarioVerdict};
+pub use specs::{Layer, SpecViolation, TBSpec, Violations};
+pub use teardown::Teardown;
 
 #[cfg(feature = "testing-fault")]
 pub use fault::{ProcessEvent, ProcessState};
-#[cfg(feature = "testing-fault")]
-pub use fdr::FaultModel;
 #[cfg(feature = "testing-fdr")]
-pub use fdr::*;
+pub use fdr::{Decision, FdrConfig, FdrTraceExt, FdrVerdict, SchedulerModel, TraceProcessMode};
+#[cfg(feature = "testing-fault")]
+pub use fdr::{FaultInjection, FaultModel, InjectedFaultRecord, InjectionStrategy};
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub use fixtures::TestCertificateChain;
 #[cfg(feature = "testing-fmea")]
 pub use fmea::{FailureMode, FmeaConfig, FmeaReport, SeverityScale};
 
@@ -63,13 +68,12 @@ mod tests {
 	use crate::testing::TBSpec;
 	use crate::utils::urn::Urn;
 
-	const MESSAGE_RECEIVED: Urn<'static> = Urn::new("test", "event:demo/message-received");
+	const MESSAGE_RECEIVED: Urn<'static> = crate::urn!("test", "event:demo/message-received");
 
 	crate::tb_assert_spec! {
 		pub DemoSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(MESSAGE_RECEIVED, exactly!(1))
 			]

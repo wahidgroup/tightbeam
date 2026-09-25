@@ -2,6 +2,8 @@
 //! Provides label helpers, cardinality utilities, and the `BuiltAssertSpec`
 //! wrapper that implements `TBSpec`.
 
+use core::num::NonZeroU32;
+
 use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionValue};
 use crate::testing::specs::{SpecViolation, TBSpec};
 use crate::trace::{ConsumedTrace, ExecutionMode};
@@ -15,42 +17,59 @@ use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::TransitStatus;
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulerType, TaskSet};
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 
 // ---------------------------------------------------------------------------
 // Cardinality core
 // ---------------------------------------------------------------------------
 
+/// How many times a label may appear for a contract to hold.
+///
+/// Every constructor states a bound that some count fails, so a contract
+/// built from one can reject. `at_least(0)` could not, which is why the lower
+/// bound is a [`NonZeroU32`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Cardinality {
 	min: u32,
 	max: Option<u32>,
-	must_be_present: bool,
 }
 
 impl Cardinality {
-	pub const fn new(min: u32, max: Option<u32>, must_be_present: bool) -> Self {
-		Self { min, max, must_be_present }
-	}
 	pub const fn exactly(n: u32) -> Self {
-		Self { min: n, max: Some(n), must_be_present: n > 0 }
+		Self { min: n, max: Some(n) }
 	}
-	pub const fn at_least(n: u32) -> Self {
-		Self { min: n, max: None, must_be_present: n > 0 }
+
+	/// At least `n`, which must be positive: a lower bound of zero rejects
+	/// nothing. To say a label is optional, leave it out of the spec.
+	pub const fn at_least(n: NonZeroU32) -> Self {
+		Self { min: n.get(), max: None }
 	}
 	pub const fn at_most(n: u32) -> Self {
-		Self { min: 0, max: Some(n), must_be_present: false }
+		Self { min: 0, max: Some(n) }
 	}
+
+	/// Between `min` and `max` inclusive.
+	///
+	/// # Panics
+	///
+	/// Testing suite functions MUST panic on error.
+	///
+	/// - When `max` is below `min`, which no count satisfies. In a constant
+	///   this is caught when the crate is built, not when it is checked, so
+	///   `cargo check` alone does not report it.
 	pub const fn between(min: u32, max: u32) -> Self {
-		Self { min, max: Some(max), must_be_present: min > 0 }
+		assert!(min <= max, "between! requires min <= max, or no count can satisfy it");
+		Self { min, max: Some(max) }
 	}
+
 	pub const fn present() -> Self {
-		Self { min: 1, max: None, must_be_present: true }
+		Self { min: 1, max: None }
 	}
+
 	pub const fn absent() -> Self {
-		Self { min: 0, max: Some(0), must_be_present: false }
+		Self { min: 0, max: Some(0) }
 	}
+
 	pub fn describe(&self) -> String {
 		match (self.min, self.max) {
 			(0, Some(0)) => "absent".into(),
@@ -60,6 +79,7 @@ impl Cardinality {
 			(m, None) => format!("at least {m}"),
 		}
 	}
+
 	pub fn is_satisfied_by(&self, count: usize) -> bool {
 		let c = count as u32;
 		if c < self.min {
@@ -72,19 +92,14 @@ impl Cardinality {
 		}
 		true
 	}
+
 	pub fn min(&self) -> u32 {
 		self.min
 	}
+
 	pub fn max(&self) -> Option<u32> {
 		self.max
 	}
-	pub fn must_be_present(&self) -> bool {
-		self.must_be_present
-	}
-}
-
-pub const fn between(min: u32, max: u32) -> Cardinality {
-	Cardinality::between(min, max)
 }
 
 /// Compile-time check that `tb_assert_spec!` version blocks strictly
@@ -107,26 +122,18 @@ pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
 	true
 }
 
-pub const fn present() -> Cardinality {
-	Cardinality::present()
-}
-pub const fn absent() -> Cardinality {
-	Cardinality::absent()
-}
-
 // ---------------------------------------------------------------------------
 // Spec builder and concrete implementation
 // ---------------------------------------------------------------------------
 
 /// Error type for spec building operations
-#[derive(Debug)]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
+#[derive(Debug, Errorizable)]
 pub enum SpecBuildError {
-	#[cfg_attr(feature = "derive", error("Duplicate label: {0}"))]
+	#[error("Duplicate label: {0}")]
 	DuplicateLabel(Urn<'static>),
-	#[cfg_attr(feature = "derive", error("Unknown ordering label: {0}"))]
+	#[error("Unknown ordering label: {0}")]
 	UnknownOrderingLabel(Urn<'static>),
-	#[cfg_attr(feature = "derive", error("Invalid range: {0}"))]
+	#[error("Invalid range: {0}")]
 	InvalidRange(Urn<'static>),
 }
 
@@ -176,8 +183,9 @@ impl AssertSpecBuilder {
 		self
 	}
 
-	pub fn gate_decision(mut self, decision: TransitStatus) -> Self {
-		self.gate_decision = Some(decision);
+	/// The gate decision this spec requires, or `None` to require none.
+	pub fn expected_gate(mut self, decision: Option<TransitStatus>) -> Self {
+		self.gate_decision = decision;
 		self
 	}
 
@@ -225,7 +233,8 @@ impl AssertSpecBuilder {
 		Ok(self)
 	}
 
-	pub fn ordering(mut self, labels: &[Urn<'static>]) -> Result<Self, SpecBuildError> {
+	pub fn ordering(mut self, labels: impl AsRef<[Urn<'static>]>) -> Result<Self, SpecBuildError> {
+		let labels = labels.as_ref();
 		for lbl in labels {
 			if !self.assertions.iter().any(|(l, _, _, _)| l == lbl) {
 				return Err(SpecBuildError::UnknownOrderingLabel(lbl.clone()));
@@ -238,7 +247,8 @@ impl AssertSpecBuilder {
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn required_events(mut self, kinds: &[crate::utils::urn::Urn<'static>]) -> Self {
+	pub fn required_events(mut self, kinds: impl AsRef<[crate::utils::urn::Urn<'static>]>) -> Self {
+		let kinds = kinds.as_ref();
 		use std::collections::HashSet;
 		let mut seen = HashSet::new();
 		for k in kinds {
@@ -329,11 +339,12 @@ impl BuiltAssertSpec {
 		version_major: u16,
 		version_minor: u16,
 		version_patch: u16,
-		contracts: &[AssertionContract],
+		contracts: impl AsRef<[AssertionContract]>,
 		tag_filter: Option<&[&'static str]>,
 		#[cfg(feature = "instrument")] events: &[crate::utils::urn::Urn<'static>],
 		#[cfg(feature = "testing-timing")] schedulability: Option<&SchedulabilityAssertion>,
 	) -> [u8; 32] {
+		let contracts = contracts.as_ref();
 		let mut h = Sha3_256::new();
 		// Domain tag + version triple
 		h.update(b"TBSP");
@@ -370,20 +381,15 @@ impl BuiltAssertSpec {
 		}
 
 		// Normalize assertion order independent of insertion sequence
-		let mut norm: Vec<(&str, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
+		let mut norm: Vec<(&str, u32, Option<u32>)> = Vec::with_capacity(contracts.len());
 		for c in contracts {
 			let AssertionLabel::Custom(lbl) = &c.label;
-			norm.push((
-				lbl.as_ref(),
-				c.cardinality.min,
-				c.cardinality.max,
-				c.cardinality.must_be_present,
-			));
+			norm.push((lbl.as_ref(), c.cardinality.min, c.cardinality.max));
 		}
 
 		norm.sort_by(|a, b| a.0.cmp(b.0)); // label only
 
-		for (lbl, min, max, must) in norm {
+		for (lbl, min, max) in norm {
 			h.update(lbl.as_bytes());
 			h.update(min.to_be_bytes());
 
@@ -394,8 +400,6 @@ impl BuiltAssertSpec {
 				}
 				None => h.update([0u8]),
 			}
-
-			h.update([must as u8]);
 		}
 		#[cfg(feature = "instrument")]
 		{
@@ -456,6 +460,10 @@ impl TBSpec for BuiltAssertSpec {
 	fn expected_gate_decision(&self) -> Option<TransitStatus> {
 		self.inner.gate_decision
 	}
+	#[cfg(feature = "testing-timing")]
+	fn constrains_schedule(&self) -> bool {
+		self.inner.schedulability.is_some()
+	}
 	#[cfg(feature = "instrument")]
 	fn required_events(&self) -> &[crate::utils::urn::Urn<'static>] {
 		&self.inner.required_events
@@ -476,11 +484,9 @@ impl TBSpec for BuiltAssertSpec {
 impl BuiltAssertSpec {
 	/// Check schedulability assertion
 	fn check_schedulability(assertion: &SchedulabilityAssertion) -> Result<(), SpecViolation> {
-		use crate::testing::schedulability::{is_edf_schedulable, is_rm_schedulable};
-
 		let result = match assertion.task_set.scheduler {
-			SchedulerType::RateMonotonic => is_rm_schedulable(&assertion.task_set),
-			SchedulerType::EarliestDeadlineFirst => is_edf_schedulable(&assertion.task_set),
+			SchedulerType::RateMonotonic => assertion.task_set.is_rm_schedulable(),
+			SchedulerType::EarliestDeadlineFirst => assertion.task_set.is_edf_schedulable(),
 		};
 
 		match result {
@@ -617,8 +623,18 @@ macro_rules! exactly {
 }
 #[macro_export]
 macro_rules! at_least {
+	(0) => {
+		::core::compile_error!("a lower bound of zero rejects nothing: leave the label out of the spec")
+	};
 	($n:expr) => {
-		$crate::testing::macros::Cardinality::at_least($n)
+		$crate::testing::macros::Cardinality::at_least(
+			const {
+				match ::core::num::NonZeroU32::new($n) {
+					Some(bound) => bound,
+					None => ::core::panic!("this lower bound evaluates to zero, which rejects nothing: leave the label out of the spec"),
+				}
+			},
+		)
 	};
 }
 #[macro_export]
@@ -657,7 +673,7 @@ macro_rules! __tb_assert_spec_build_all {
 		$base:ident,
 		$desc_opt:expr,
 		$(
-			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 			assertions: [ $( $assertion:tt ),* ],
 			$(
 				events: [ $($events_tt:tt)* ],
@@ -693,7 +709,7 @@ macro_rules! __tb_assert_spec_build_all_impl {
 	(
 		$vec:ident, $base:ident, $desc_opt:expr,
 		$(
-			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 			assertions: [ $( $assertion:tt ),* ],
 			$(
 				events: [ $($events_tt:tt)* ],
@@ -721,7 +737,7 @@ macro_rules! __tb_assert_spec_build_all_impl {
 #[macro_export]
 macro_rules! __tb_assert_spec_build_all_impl_with_events {
 	(
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		$(
 			events: [ $($events_tt:tt)* ],
@@ -752,7 +768,7 @@ macro_rules! __tb_assert_spec_build {
 		$vec:ident,
 		$base:ident,
 		$maj:literal, $min:literal, $patch:literal,
-		$mode:ident, $gate:ident,
+		$mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* $(,)? ],
 		$(
 			events: [ $($events_tt:tt)* ],
@@ -778,7 +794,7 @@ macro_rules! __tb_assert_spec_build {
 	// Pattern with desc_opt parameter (from __tb_assert_spec_build_all_impl_with_events)
 	// Has events case
 	(@expand_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ $($events_tt:tt)* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -795,7 +811,7 @@ macro_rules! __tb_assert_spec_build {
 	};
 	// No events case
 	(@expand_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, schedulability: { $($schedule_content:tt)* })?
@@ -811,7 +827,7 @@ macro_rules! __tb_assert_spec_build {
 	};
 	// Legacy pattern without desc_opt (for backward compatibility)
 	(@expand_events
-		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		$(
 			events_tt: [ $($events_tt:tt)* ],
@@ -846,7 +862,7 @@ macro_rules! __tb_assert_spec_build {
 		)?
 	};
 	(@build_with_events_expanded
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ $( $ev:expr ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -865,7 +881,7 @@ macro_rules! __tb_assert_spec_build {
 	}};
 	// Legacy pattern without desc_opt (for backward compatibility)
 	(@build_with_events_expanded
-		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ $($events_tt:tt)* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -884,7 +900,7 @@ macro_rules! __tb_assert_spec_build {
 		}
 	}};
 	(@build_with_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events: [ $( $ev:expr ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -899,23 +915,21 @@ macro_rules! __tb_assert_spec_build {
 		$(
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
-		#[cfg(feature = "instrument")]
-		{
-			$(
-				builder = builder.required_events(::core::slice::from_ref(&$ev));
-			)*
-		}
-		$(
-			#[cfg(feature = "testing-timing")]
+		$crate::__tb_if_instrument! {
 			{
-				$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
+				$(
+					builder = builder.required_events(::core::slice::from_ref(&$ev));
+				)*
 			}
+		};
+		$(
+			$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
 		)?
 		$vec.push(builder.build());
 	}};
 	// Empty events case
 	(@expand_events
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:expr,
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
@@ -931,18 +945,19 @@ macro_rules! __tb_assert_spec_build {
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
 		$(
-			#[cfg(feature = "testing-timing")]
-			{
-				$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
-			}
+			$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
 		)?
 		$vec.push(builder.build());
 	}};
 }
 
-// Helper to parse schedulability assertions
+// Attaches a schedulability assertion to the spec under construction.
+//
+// The name is defined in every configuration and the body is what the
+// feature selects, so an expansion may call this without guarding the call
+// itself. A definition gated as a whole makes a missed guard a
+// name-resolution failure in one column of the feature matrix only.
 #[doc(hidden)]
-#[cfg(feature = "testing-timing")]
 #[macro_export]
 macro_rules! __tb_assert_spec_parse_schedulability {
 	(
@@ -950,19 +965,21 @@ macro_rules! __tb_assert_spec_parse_schedulability {
 		task_set: $task_set:expr,
 		scheduler: $scheduler:ident,
 		must_be_schedulable: $must_be:expr,
-	) => {{
-		use $crate::testing::schedulability::SchedulerType;
-		let task_set_with_scheduler = {
-			let mut ts = $task_set.clone();
-			ts.scheduler = SchedulerType::$scheduler;
-			ts
-		};
-		let assertion = $crate::testing::macros::SchedulabilityAssertion {
-			task_set: task_set_with_scheduler,
-			must_be_schedulable: $must_be,
-		};
-		$builder = $builder.schedulability(assertion);
-	}};
+	) => {
+		$crate::__tb_if_testing_timing! {{
+			use $crate::testing::schedulability::SchedulerType;
+			let task_set_with_scheduler = {
+				let mut ts = $task_set.clone();
+				ts.scheduler = SchedulerType::$scheduler;
+				ts
+			};
+			let assertion = $crate::testing::macros::SchedulabilityAssertion {
+				task_set: task_set_with_scheduler,
+				must_be_schedulable: $must_be,
+			};
+			$builder = $builder.schedulability(assertion);
+		}}
+	};
 }
 
 // Helper to add individual assertions (handles tags and values).
@@ -1005,7 +1022,7 @@ macro_rules! tb_assert_spec {
 		$vis:vis $base:ident,
 		$( V ( $maj:literal , $min:literal , $patch:literal ) : {
 			mode: $mode:ident,
-			gate: $gate:ident,
+			$( gate: $gate:ident, )?
 			$( tag_filter: [ $( $tag:expr ),* $(,)? ], )?
 			assertions: [ $( $assertion:tt ),* $(,)? ]
 			$(, events: [ $($events_tt:tt)* ])?
@@ -1032,7 +1049,11 @@ macro_rules! tb_assert_spec {
 					$base,
 					desc_opt,
 					$(
-						$maj, $min, $patch, $mode, $gate,
+						$maj, $min, $patch, $mode,
+						// One decider for the expected gate: a block that omits
+						// `gate:` requires no decision, and every helper below
+						// couriers this value without reading it.
+						::core::option::Option::None $( .or(Some($crate::policy::TransitStatus::$gate)) )?,
 						assertions: [ $( $assertion ),* ],
 						$(
 							events: [ $($events_tt)* ],
@@ -1069,113 +1090,6 @@ macro_rules! tb_assert_spec {
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Scenario macro MVP
-// ---------------------------------------------------------------------------
-// Scenario macro MVP: Worker & Bare variants (ServiceClient stubbed)
-// ---------------------------------------------------------------------------
-
-// Helper to validate CSP and FDR (reduces duplication)
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tb_scenario_validate_csp_fdr {
-	(
-		$trace:expr,
-		$(csp: $csp:ty,)?
-		$(fdr: $fdr_config:expr,)?
-	) => {{
-		// CSP validation if provided
-		#[cfg(feature = "testing-csp")]
-		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = {
-			$crate::tb_scenario!(@csp_validate $trace, $($csp)?)
-		};
-
-		#[cfg(not(feature = "testing-csp"))]
-		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = None;
-
-		// Check if CSP validation failed
-		#[cfg(feature = "testing-csp")]
-		let csp_failed = csp_result.as_ref().map(|r| !r.valid).unwrap_or(false);
-		#[cfg(not(feature = "testing-csp"))]
-		let csp_failed = false;
-
-		// FDR validation if provided
-		#[cfg(feature = "testing-fdr")]
-		let (fdr_result, fdr_config): (Option<$crate::testing::fdr::FdrVerdict>, Option<$crate::testing::fdr::FdrConfig>) = {
-			$crate::tb_scenario!(@fdr_validate_with_config $trace, $($fdr_config)?)
-		};
-
-		#[cfg(not(feature = "testing-fdr"))]
-		let (fdr_result, fdr_config): (Option<$crate::testing::fdr::FdrVerdict>, Option<$crate::testing::fdr::FdrConfig>) = (None, None);
-
-		// Check if FDR validation failed
-		#[cfg(feature = "testing-fdr")]
-		let fdr_failed = fdr_result.as_ref().map(|v| !v.passed).unwrap_or(false);
-		#[cfg(not(feature = "testing-fdr"))]
-		let fdr_failed = false;
-
-		// Check if FDR failure is expected (for negative tests)
-		#[cfg(feature = "testing-fdr")]
-		let expect_failure = fdr_config.as_ref().map(|c| c.expect_failure).unwrap_or(false);
-		#[cfg(not(feature = "testing-fdr"))]
-		let expect_failure = false;
-
-		(csp_result, csp_failed, fdr_result, fdr_config, fdr_failed, expect_failure)
-	}};
-}
-
-// Helper macro to call hooks and handle results (reduces duplication)
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tb_scenario_call_hooks {
-	(
-		scenario_result: $scenario_result:expr,
-		csp_failed: $csp_failed:expr,
-		fdr_failed: $fdr_failed:expr,
-		expect_failure: $expect_failure:expr,
-		$(hooks: {
-			$(on_pass: $on_pass:expr,)?
-			$(on_fail: $on_fail:expr)?
-		},)?
-	) => {{
-		#[allow(unreachable_code)]
-		#[allow(unused_labels)]
-		let hook_result: Result<(), Box<dyn std::error::Error>> = 'hook_call: {
-			if $scenario_result.passed {
-				// Test passed - call on_pass hook if provided
-				$(
-					$(
-						fn __call_hook<F>(f: F, trace: &$crate::trace::ConsumedTrace, result: &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>
-						where
-							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>,
-						{
-							f(trace, result)
-						}
-						break 'hook_call __call_hook($on_pass, &$scenario_result.trace, &$scenario_result);
-					)?
-				)?
-				Ok(())
-			} else {
-				// Test failed - call on_fail hook if provided
-				$(
-					$(
-						fn __call_hook<F>(f: F, trace: &$crate::trace::ConsumedTrace, result: &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>
-						where
-							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>,
-						{
-							f(trace, result)
-						}
-						break 'hook_call __call_hook($on_fail, &$scenario_result.trace, &$scenario_result);
-					)?
-				)?
-				// No hook provided
-				Err(format!("{}", $scenario_result).into())
-			}
-		};
-		hook_result
-	}};
-}
-
 // Helper macro for common spec builder initialization (reduces duplication)
 #[doc(hidden)]
 #[macro_export]
@@ -1187,7 +1101,7 @@ macro_rules! __tb_assert_spec_init_builder {
 		$min:literal,
 		$patch:literal,
 		$mode:ident,
-		$gate:ident,
+		$gate:expr,
 		$(tag_filter: [ $($tag:expr),* $(,)? ])?
 		$(, description: $desc:expr)?
 	) => {{
@@ -1196,7 +1110,7 @@ macro_rules! __tb_assert_spec_init_builder {
 			stringify!($base),
 			$crate::trace::ExecutionMode::$mode,
 		);
-		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
+		builder = builder.version(maj, min, patch).expected_gate($gate);
 		$(
 			builder = builder.tag_filter(vec![ $( $tag ),* ]);
 		)?
@@ -1213,207 +1127,23 @@ macro_rules! __tb_assert_spec_init_builder {
 	}};
 }
 
-/// Helper macro for common trace verification logic (reduces duplication)
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tb_scenario_verify_impl {
-	// Single spec variant with optional CSP and FDR
-	(
-		single_spec: $spec:ty,
-		trace: $trace:expr,
-		$(csp: $csp:ty,)?
-		$(fdr: $fdr_config:expr,)?
-		$(hooks: {
-			$(on_pass: $on_pass:expr,)?
-			$(on_fail: $on_fail:expr)?
-		},)?
-	) => {{
-		let spec = <$spec>::latest();
-		let l1_result = $crate::testing::specs::verify_trace(spec, &$trace);
-
-		// Build ScenarioResult with all layer results
-		let mut scenario_result = $crate::testing::ScenarioResult::default();
-		// Move trace into result (transfer ownership)
-		scenario_result.trace = $trace;
-		// Clone and store the spec
-		scenario_result.assert_spec = Some(spec.clone());
-		// Layer 1: Spec verification
-		scenario_result.spec_violation = l1_result.as_ref().err().cloned();
-
-		let l1_passed = l1_result.is_ok();
-
-		// Delegate to common implementation
-		$crate::__tb_scenario_verify_impl! {
-			@common
-			l1_passed: l1_passed,
-			scenario_result: scenario_result,
-			$(csp: $csp,)?
-			$(fdr: $fdr_config,)?
-			$(hooks: {
-				$(on_pass: $on_pass,)?
-				$(on_fail: $on_fail)?
-			},)?
-		}
-	}};
-
-	// Multiple specs variant with optional CSP and FDR
-	(
-		multi_specs: $specs:expr,
-		trace: $trace:expr,
-		$(csp: $csp:ty,)?
-		$(fdr: $fdr_config:expr,)?
-		$(hooks: {
-			$(on_pass: $on_pass:expr,)?
-			$(on_fail: $on_fail:expr)?
-		},)?
-	) => {{
-		let mut all_passed = true;
-		let mut first_violation = None;
-
-		// Validate all specs
-		for spec in &$specs {
-			let verification_result = $crate::testing::specs::verify_trace(*spec, &$trace);
-			if let Err(v) = verification_result {
-				all_passed = false;
-				if first_violation.is_none() {
-					first_violation = Some(v);
-				}
-			}
-		}
-
-		// Build ScenarioResult
-		let mut scenario_result = $crate::testing::ScenarioResult::default();
-
-		// Move trace into result
-		scenario_result.trace = $trace;
-		// Clone and store all specs
-		scenario_result.assert_specs = $specs.iter().map(|s| (*s).clone()).collect();
-		scenario_result.spec_violation = first_violation;
-
-		// Delegate to common implementation
-		$crate::__tb_scenario_verify_impl! {
-			@common
-			l1_passed: all_passed,
-			scenario_result: scenario_result,
-			$(csp: $csp,)?
-			$(fdr: $fdr_config,)?
-			$(hooks: {
-				$(on_pass: $on_pass,)?
-				$(on_fail: $on_fail)?
-			},)?
-			}
-	}};
-
-	// Common implementation for both single and multiple specs
-	(
-		@common
-		l1_passed: $l1_passed:expr,
-		scenario_result: $scenario_result:expr,
-		$(csp: $csp:ty,)?
-		$(fdr: $fdr_config:expr,)?
-		$(hooks: {
-			$(on_pass: $on_pass:expr,)?
-			$(on_fail: $on_fail:expr)?
-		},)?
-	) => {{
-		let mut scenario_result = $scenario_result;
-		let l1_passed = $l1_passed;
-
-		// Layer 2: CSP validation (if provided)
-		#[allow(unused_mut, unused_assignments)]
-		let mut csp_failed = false;
-
-		#[cfg(feature = "testing-csp")]
-		{
-			$(
-				let csp_spec = <$csp>::default();
-				let csp_result = <$csp as $crate::testing::specs::csp::ProcessSpec>::validate_trace(&csp_spec, &scenario_result.trace);
-				csp_failed = !csp_result.valid;
-				scenario_result.csp_result = Some(csp_result);
-				// Move process into result
-				scenario_result.process = Some(<$csp>::process());
-
-				// Move timing constraints into result (if available)
-				#[cfg(feature = "testing-timing")]
-				{
-					let process = scenario_result
-						.process
-						.as_ref()
-						.expect("process assigned immediately above");
-					scenario_result.timing_constraints = process.timing_constraints.clone();
-				}
-			)?
-		}
-
-		// Layer 3: FDR validation (if provided)
-		#[allow(unused_mut, unused_assignments)]
-		let mut fdr_failed = false;
-		#[allow(unused_mut, unused_assignments)]
-		let mut expect_failure = false;
-
-		#[cfg(feature = "testing-fdr")]
-		{
-			$(
-				use $crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
-				let config: FdrConfig = $fdr_config.into();
-				expect_failure = config.expect_failure;
-
-				// AUTOMATIC MODE SELECTION:
-				// If fault_model + specs provided -> explore spec WITH faults (specification robustness)
-				// Otherwise -> explore execution trace (normal behavior / implementation resilience)
-				#[cfg(feature = "testing-fault")]
-				let process_to_explore = if config.fault_model.is_some() && !config.specs.is_empty() {
-					&config.specs[0]
-				} else {
-					&scenario_result.trace.to_process()
-				};
-
-				#[cfg(not(feature = "testing-fault"))]
-				let process_to_explore = &scenario_result.trace.to_process();
-
-				let mut explorer = DefaultFdrExplorer::with_defaults(process_to_explore, config.clone());
-				let verdict = explorer.explore();
-				fdr_failed = !verdict.passed;
-				scenario_result.fdr_verdict = Some(verdict);
-			)?
-		}
-
-		// Determine overall pass/fail
-		scenario_result.passed = l1_passed && !csp_failed && (!fdr_failed || expect_failure);
-
-		// Call hooks and get their decision
-		$crate::__tb_scenario_call_hooks!(
-			scenario_result: scenario_result,
-			csp_failed: csp_failed,
-			fdr_failed: fdr_failed,
-			expect_failure: expect_failure,
-			$(hooks: {
-				$(on_pass: $on_pass,)?
-				$(on_fail: $on_fail)?
-			},)?
-		)
-	}};
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	const OLDER_KEY: Urn<'static> = Urn::new("test", "event:spec/older-key");
-	const NEWER_KEY: Urn<'static> = Urn::new("test", "event:spec/newer-key");
+	const OLDER_KEY: Urn<'static> = crate::urn!("test", "event:spec/older-key");
+	const NEWER_KEY: Urn<'static> = crate::urn!("test", "event:spec/newer-key");
 
 	crate::tb_assert_spec! {
 		pub VersionedKeySpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(OLDER_KEY, exactly!(1))
 			]
 		},
 		V(2,0,0): {
 			mode: Accept,
-			gate: Ok,
 			assertions: [
 				(NEWER_KEY, exactly!(1))
 			]

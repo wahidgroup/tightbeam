@@ -113,7 +113,7 @@ pub mod active {
 	/// optionals of the same universal type (`duration_ns`/`timestamp_ns`,
 	/// `payload_hash`/`extras`) stay unambiguous on the wire when any subset
 	/// is absent.
-	mod tb_event_tags {
+	pub(super) mod tb_event_tags {
 		use crate::der::TagNumber;
 
 		pub const LABEL: TagNumber = TagNumber::N0;
@@ -123,7 +123,7 @@ pub mod active {
 		pub const EXTRAS: TagNumber = TagNumber::N4;
 	}
 
-	fn tagged<T>(tag_number: TagNumber, value: T) -> ContextSpecific<T> {
+	pub(super) fn tagged<T>(tag_number: TagNumber, value: T) -> ContextSpecific<T> {
 		ContextSpecific { tag_number, tag_mode: TagMode::Explicit, value }
 	}
 
@@ -200,33 +200,38 @@ pub mod active {
 	impl<'a> crate::der::DecodeValue<'a> for TbEvent {
 		fn decode_value<R: crate::der::Reader<'a>>(
 			reader: &mut R,
-			_header: crate::der::Header,
+			header: crate::der::Header,
 		) -> crate::der::Result<Self> {
-			reader.sequence(|seq: &mut crate::der::NestedReader<'_, R>| {
-				let seq_val = u32::decode(seq)?;
-				let urn_decoded = Urn::decode(seq)?;
+			// Bounds the body to the declared length, so a nested event cannot
+			// read past its own. `sequence` would also demand a second tag.
+			reader.read_nested(header.length, |reader| {
+				let seq_val = u32::decode(reader)?;
+				let urn_decoded = Urn::decode(reader)?;
 				let urn: Urn<'static> = urn_decoded.into_owned();
 
-				let label = ContextSpecific::<String>::decode_explicit(seq, tb_event_tags::LABEL)?.map(|cs| cs.value);
+				let label =
+					ContextSpecific::<String>::decode_explicit(reader, tb_event_tags::LABEL)?.map(|cs| cs.value);
+				// A present hash of the wrong length is malformed input
 				let payload_hash: Option<[u8; 32]> =
-					ContextSpecific::<OctetString>::decode_explicit(seq, tb_event_tags::PAYLOAD_HASH)?.and_then(|cs| {
-						let bytes = cs.value.as_bytes();
-						if bytes.len() == 32 {
-							let mut hash = [0u8; 32];
-							hash.copy_from_slice(bytes);
+					match ContextSpecific::<OctetString>::decode_explicit(reader, tb_event_tags::PAYLOAD_HASH)? {
+						None => None,
+						Some(field) => {
+							let hash: [u8; 32] = field
+								.value
+								.as_bytes()
+								.try_into()
+								.map_err(|_| crate::der::ErrorKind::Length { tag: crate::der::Tag::OctetString })?;
+
 							Some(hash)
-						} else {
-							None
 						}
-					});
+					};
 
 				let duration_ns =
-					ContextSpecific::<u64>::decode_explicit(seq, tb_event_tags::DURATION_NS)?.map(|cs| cs.value);
+					ContextSpecific::<u64>::decode_explicit(reader, tb_event_tags::DURATION_NS)?.map(|cs| cs.value);
 				let timestamp_ns =
-					ContextSpecific::<u64>::decode_explicit(seq, tb_event_tags::TIMESTAMP_NS)?.map(|cs| cs.value);
-
-				let flags = u32::decode(seq)?;
-				let extras = ContextSpecific::<OctetString>::decode_explicit(seq, tb_event_tags::EXTRAS)?
+					ContextSpecific::<u64>::decode_explicit(reader, tb_event_tags::TIMESTAMP_NS)?.map(|cs| cs.value);
+				let flags = u32::decode(reader)?;
+				let extras = ContextSpecific::<OctetString>::decode_explicit(reader, tb_event_tags::EXTRAS)?
 					.map(|cs| cs.value.as_bytes().to_vec());
 
 				Ok(TbEvent { seq: seq_val, urn, label, payload_hash, duration_ns, timestamp_ns, flags, extras })
@@ -354,7 +359,12 @@ pub mod active {
 		///
 		/// `overflow` MUST reflect whether the collector dropped events at
 		/// its `max_events` bound (see `TraceCollector::overflowed`).
-		pub fn finalize(spec_hash: [u8; 32], events: Vec<TbEvent>, overflow: bool) -> Result<Self, TightBeamError> {
+		pub fn finalize(
+			spec_hash: [u8; 32],
+			events: impl IntoIterator<Item = TbEvent>,
+			overflow: bool,
+		) -> Result<Self, TightBeamError> {
+			let events: Vec<TbEvent> = events.into_iter().collect();
 			// Canonical byte representation (stable ordering) for trace hash
 			let mut bytes = Vec::with_capacity(events.len() * 64);
 			for ev in &events {
@@ -419,7 +429,99 @@ pub use stub::*;
 #[cfg(all(test, feature = "instrument"))]
 mod tests {
 	use super::*;
+	use crate::der::asn1::{Any, OctetString};
+	use crate::der::{Decode, Encode, Tag};
 	use crate::error::Result;
+
+	/// One `TbEvent` SEQUENCE carrying `hash` as its payload-hash field.
+	///
+	/// The fields are laid out as `encode_value` writes them, so the only
+	/// thing the caller varies is the hash length.
+	fn event_with_payload_hash(hash: impl AsRef<[u8]>) -> Vec<u8> {
+		let hash = hash.as_ref();
+		let octets = OctetString::new(hash).expect("test hashes wrap in an OctetString");
+		let tagged_hash = tagged(tb_event_tags::PAYLOAD_HASH, octets);
+
+		let mut body = 0u32.to_der().expect("a sequence number encodes");
+		body.extend(crate::instrumentation::events::START.to_der().expect("a URN encodes"));
+		body.extend(tagged_hash.to_der().expect("a tagged octet string encodes"));
+		body.extend(0u32.to_der().expect("a flag word encodes"));
+
+		// `Any` writes the SEQUENCE header, so this builder does not
+		// depend on the body staying inside the short-form length.
+		Any::new(Tag::Sequence, body)
+			.expect("the field encodings above are a well-formed SEQUENCE body")
+			.to_der()
+			.expect("a SEQUENCE re-encodes")
+	}
+
+	#[test]
+	fn an_event_survives_a_der_round_trip() {
+		let event = TbEvent {
+			seq: 1,
+			urn: crate::instrumentation::events::START,
+			label: Some("a label".to_owned()),
+			payload_hash: Some([7u8; 32]),
+			duration_ns: Some(5),
+			timestamp_ns: Some(9),
+			flags: 3,
+			extras: Some(vec![1, 2, 3]),
+		};
+
+		let encoded = event.to_der().expect("an event built from valid parts encodes");
+		let decoded = TbEvent::from_der(&encoded).expect("what the encoder wrote, the decoder reads");
+		assert_eq!(decoded.seq, event.seq);
+		assert_eq!(decoded.label, event.label);
+		assert_eq!(decoded.payload_hash, event.payload_hash);
+		assert_eq!(decoded.duration_ns, event.duration_ns);
+		assert_eq!(decoded.timestamp_ns, event.timestamp_ns);
+		assert_eq!(decoded.flags, event.flags);
+		assert_eq!(decoded.extras, event.extras);
+	}
+
+	/// The same fields, wrapped in a SEQUENCE header that declares `declared`
+	/// bytes of body rather than the body's real length.
+	fn event_with_declared_length(declared: usize) -> Vec<u8> {
+		let honest = event_with_payload_hash([7u8; 32]);
+		let body = &honest[2..];
+		assert!(
+			honest[0] == 0x30 && honest[1] < 128,
+			"the helper above writes a short-form SEQUENCE"
+		);
+
+		let mut der = vec![0x30, declared as u8];
+		der.extend_from_slice(body);
+		der
+	}
+
+	// `decode_value` gets an unbounded reader, so a decoder that ignores
+	// `header.length` reads past its own event when events are nested.
+	#[test]
+	fn a_declared_length_shorter_than_the_body_is_refused() {
+		let honest_len = event_with_payload_hash([7u8; 32])[1] as usize;
+		let refused = TbEvent::from_der(&event_with_declared_length(honest_len - 4));
+		assert!(refused.is_err(), "a SEQUENCE length that undercuts its body must not decode");
+	}
+
+	#[test]
+	fn a_declared_length_longer_than_the_body_is_refused() {
+		let honest_len = event_with_payload_hash([7u8; 32])[1] as usize;
+		let refused = TbEvent::from_der(&event_with_declared_length(honest_len + 4));
+		assert!(refused.is_err(), "a SEQUENCE length that overruns its body must not decode");
+	}
+
+	// A truncated hash must not read as an absent one.
+	#[test]
+	fn a_payload_hash_of_the_wrong_length_is_refused() {
+		let refused = TbEvent::from_der(&event_with_payload_hash([0u8; 16]));
+		assert!(refused.is_err(), "a 16-byte payload hash must not decode as an absent one");
+	}
+
+	#[test]
+	fn a_payload_hash_of_the_right_length_decodes() {
+		let accepted = TbEvent::from_der(&event_with_payload_hash([7u8; 32])).expect("a 32-byte hash decodes");
+		assert_eq!(accepted.payload_hash, Some([7u8; 32]));
+	}
 
 	#[test]
 	fn finalize_propagates_overflow_flag() -> Result<()> {
@@ -427,7 +529,6 @@ mod tests {
 		let complete = EvidenceArtifact::finalize([0u8; 32], Vec::new(), false)?;
 		assert!(truncated.overflow);
 		assert!(!complete.overflow);
-
 		Ok(())
 	}
 
@@ -447,10 +548,8 @@ mod tests {
 	#[test]
 	fn bounded_sink_retains_up_to_cap() {
 		let sink = BoundedMemorySink::new(2);
-
 		sink.emit(sample_event(0));
 		sink.emit(sample_event(1));
-
 		assert!(!sink.overflowed());
 		assert_eq!(sink.drain().len(), 2);
 	}
@@ -469,11 +568,9 @@ mod tests {
 	#[test]
 	fn bounded_sink_drain_rearms_capacity() {
 		let sink = BoundedMemorySink::new(1);
-
 		sink.emit(sample_event(0));
 		sink.drain();
 		sink.emit(sample_event(1));
-
 		assert!(!sink.overflowed());
 		assert_eq!(sink.drain().len(), 1);
 	}
@@ -481,11 +578,9 @@ mod tests {
 	#[test]
 	fn bounded_sink_overflow_latch_survives_drain() {
 		let sink = BoundedMemorySink::new(1);
-
 		sink.emit(sample_event(0));
 		sink.emit(sample_event(1));
 		sink.drain();
-
 		assert!(sink.overflowed());
 	}
 }

@@ -15,10 +15,8 @@
 //! does not chain to a configured trust anchor.
 //!
 //! ## References
-//! - CWE-295: Improper Certificate Validation
-//!   <https://cwe.mitre.org/data/definitions/295.html>
-//! - CAPEC-94: Adversary in the Middle (AiTM)
-//!   <https://capec.mitre.org/data/definitions/94.html>
+//! - CWE-295: Improper Certificate Validation <https://cwe.mitre.org/data/definitions/295.html>
+//! - CAPEC-94: Adversary in the Middle (AiTM) <https://capec.mitre.org/data/definitions/94.html>
 //! - RFC 5280 §6: Certification Path Validation
 
 use std::sync::Arc;
@@ -35,13 +33,12 @@ use tightbeam::{
 use crate::common::security::{deterministic_signing_key, expectation_failure, random_signing_key, test_certificate};
 
 pub(crate) const UNTRUSTED_CERT_REJECTED: Urn<'static> =
-	Urn::new("test", "event:certificate-trust/untrusted-cert-rejected");
+	tightbeam::urn!("test", "event:certificate-trust/untrusted-cert-rejected");
 
 tb_assert_spec! {
 	pub CertificateTrustSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(UNTRUSTED_CERT_REJECTED, exactly!(1u32))
 		]

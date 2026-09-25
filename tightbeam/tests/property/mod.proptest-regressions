@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0042d134b4a0ebf6c696f12d266afa9318bba14010ee14a1fd654013e48d867b # shrinks to version = V0, id = [], order = 0, message = [], integrity = None, nonrepudiation = Some(SignerInfo { version: V1, sid: SubjectKeyIdentifier(SubjectKeyIdentifier(OctetString { inner: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] })), digest_alg: AlgorithmIdentifier { oid: ObjectIdentifier(2.16.840.1.101.3.4.2.8), parameters: None }, signed_attrs: None, signature_algorithm: AlgorithmIdentifier { oid: ObjectIdentifier(2.16.840.1.101.3.4.3.10), parameters: None }, signature: OctetString { inner: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, unsigned_attrs: None })

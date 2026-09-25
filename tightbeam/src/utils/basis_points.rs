@@ -9,17 +9,45 @@
 //! use tightbeam::utils::BasisPoints;
 //!
 //! // Compile-time validated constants
-//! const ALWAYS: BasisPoints = BasisPoints::new(10000);  // 100%
-//! const HALF: BasisPoints = BasisPoints::new(5000);     // 50%
-//! const NEVER: BasisPoints = BasisPoints::new(0);       // 0%
+//! const ALWAYS: BasisPoints = tightbeam::bps!(10000);  // 100%
+//! const HALF: BasisPoints = tightbeam::bps!(5000);     // 50%
+//! const NEVER: BasisPoints = tightbeam::bps!(0);       // 0%
 //!
 //! // Runtime usage
-//! let prob = BasisPoints::new(7500);  // 75%
+//! let prob = tightbeam::bps!(7500);  // 75%
 //! assert_eq!(prob.get(), 7500);
 //! assert_eq!(prob.as_percentage(), 75.0);
 //! ```
 
 use crate::der::{Decode, Encode, Reader, Writer};
+
+/// Shorthand for [`BasisPoints::new::<N>()`](BasisPoints::new).
+///
+/// The range is also checked here, at the caller, so an out-of-range literal
+/// is reported on the line that wrote it rather than inside `new`.
+///
+/// ## Examples
+///
+/// ```
+/// const HALF: tightbeam::utils::BasisPoints = tightbeam::bps!(5000);
+/// ```
+///
+/// ```compile_fail
+/// const TOO_HIGH: tightbeam::utils::BasisPoints = tightbeam::bps!(10001);
+/// ```
+#[macro_export]
+macro_rules! bps {
+	($value:expr $(,)?) => {
+		const {
+			let value: u16 = $value;
+			if value > $crate::utils::BasisPoints::MAX.get() {
+				::core::panic!("BasisPoints must be 0-10000");
+			}
+
+			$crate::utils::BasisPoints::new::<{ $value }>()
+		}
+	};
+}
 
 /// Error for values outside the 0-10000 basis-point range
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,14 +63,13 @@ impl core::error::Error for BasisPointsOutOfRange {}
 
 /// Probability in basis points (0-10000, where 10000 = 100%)
 ///
-/// Enforces valid range at compile time via const constructor.
 /// Provides deterministic integer-only math for no_std compatibility.
 ///
 /// # Validation
 ///
 /// - Values must be in range [0, 10000]
-/// - When used in `const` contexts, invalid values trigger compile errors
-/// - Runtime validation still occurs via assertion
+/// - [`BasisPoints::new`] and [`bps!`](crate::bps) reject an out-of-range value at compile time
+/// - `TryFrom<u16>` returns an error for a value known only at run time
 ///
 /// # Use Cases
 ///
@@ -69,29 +96,15 @@ impl BasisPoints {
 	/// Minimum value (0%)
 	pub const MIN: Self = Self(0);
 
-	/// Create a new BasisPoints value (0-10000) from a literal
+	/// A BasisPoints value (0-10000) known at compile time.
 	///
-	/// Intended for `const` contexts and literal arguments, where an
-	/// out-of-range value fails at compile time. Runtime-valued inputs
-	/// MUST use [`TryFrom<u16>`] or [`new_saturating`](Self::new_saturating)
-	/// instead, since those cannot panic.
-	///
-	/// # Panics
-	///
-	/// Panics if value > 10000: at compile time in const contexts, at
-	/// runtime otherwise.
-	///
-	/// # Examples
-	///
-	/// ```
-	/// use tightbeam::utils::BasisPoints;
-	///
-	/// const VALID: BasisPoints = BasisPoints::new(5000);       // OK
-	/// // const INVALID: BasisPoints = BasisPoints::new(10001); // Compile error
-	/// ```
-	pub const fn new(value: u16) -> Self {
-		assert!(value <= 10000, "BasisPoints must be 0-10000");
-		Self(value)
+	/// `N` is a const parameter, so a value known only at run time cannot be
+	/// passed here: use `TryFrom<u16>` for that. The range check runs in a
+	/// `const` block, so an out-of-range `N` fails to compile and there is no
+	/// run-time panic path. [`bps!`](crate::bps) is shorthand for this.
+	pub const fn new<const N: u16>() -> Self {
+		const { assert!(N <= Self::MAX.0, "BasisPoints must be 0-10000") };
+		Self(N)
 	}
 
 	/// Get the raw value (0-10000)
@@ -106,7 +119,7 @@ impl BasisPoints {
 	/// ```
 	/// use tightbeam::utils::BasisPoints;
 	///
-	/// let bps = BasisPoints::new(7500);
+	/// let bps = tightbeam::bps!(7500);
 	/// assert_eq!(bps.as_percentage(), 75.0);
 	/// ```
 	pub fn as_percentage(self) -> f64 {
@@ -120,7 +133,7 @@ impl BasisPoints {
 	/// ```
 	/// use tightbeam::utils::BasisPoints;
 	///
-	/// let bps = BasisPoints::new(2500);
+	/// let bps = tightbeam::bps!(2500);
 	/// assert_eq!(bps.as_fraction(), 0.25);
 	/// ```
 	pub fn as_fraction(self) -> f64 {
@@ -193,8 +206,8 @@ impl BasisPoints {
 	/// assert_eq!(clamped.get(), 10000);
 	/// ```
 	pub const fn new_saturating(value: u16) -> Self {
-		if value > 10000 {
-			Self(10000)
+		if value > Self::MAX.0 {
+			Self::MAX
 		} else {
 			Self(value)
 		}
@@ -212,7 +225,7 @@ impl TryFrom<u16> for BasisPoints {
 	type Error = BasisPointsOutOfRange;
 
 	fn try_from(value: u16) -> Result<Self, Self::Error> {
-		if value > 10000 {
+		if value > Self::MAX.0 {
 			return Err(BasisPointsOutOfRange);
 		}
 
@@ -256,47 +269,46 @@ mod tests {
 
 	#[test]
 	fn new_validates_range() {
-		assert_eq!(BasisPoints::new(0).get(), 0);
-		assert_eq!(BasisPoints::new(5000).get(), 5000);
-		assert_eq!(BasisPoints::new(10000).get(), 10000);
+		assert_eq!(crate::bps!(0).get(), 0);
+		assert_eq!(crate::bps!(5000).get(), 5000);
+		assert_eq!(crate::bps!(10000).get(), 10000);
 	}
 
 	#[test]
-	#[should_panic(expected = "BasisPoints must be 0-10000")]
-	fn new_panics_above_max() {
-		BasisPoints::new(10001);
+	fn try_from_refuses_above_max() {
+		assert_eq!(BasisPoints::try_from(10001u16), Err(BasisPointsOutOfRange));
 	}
 
 	#[test]
 	fn const_validation_works() {
-		const ZERO: BasisPoints = BasisPoints::new(0);
-		const MAX: BasisPoints = BasisPoints::new(10000);
+		const ZERO: BasisPoints = crate::bps!(0);
+		const MAX: BasisPoints = crate::bps!(10000);
 		assert_eq!(ZERO.get(), 0);
 		assert_eq!(MAX.get(), 10000);
 	}
 
 	#[test]
 	fn percentage_conversion() {
-		assert_eq!(BasisPoints::new(0).as_percentage(), 0.0);
-		assert_eq!(BasisPoints::new(5000).as_percentage(), 50.0);
-		assert_eq!(BasisPoints::new(10000).as_percentage(), 100.0);
-		assert_eq!(BasisPoints::new(7550).as_percentage(), 75.5);
+		assert_eq!(crate::bps!(0).as_percentage(), 0.0);
+		assert_eq!(crate::bps!(5000).as_percentage(), 50.0);
+		assert_eq!(crate::bps!(10000).as_percentage(), 100.0);
+		assert_eq!(crate::bps!(7550).as_percentage(), 75.5);
 	}
 
 	#[test]
 	fn fraction_conversion() {
-		assert_eq!(BasisPoints::new(0).as_fraction(), 0.0);
-		assert_eq!(BasisPoints::new(5000).as_fraction(), 0.5);
-		assert_eq!(BasisPoints::new(10000).as_fraction(), 1.0);
-		assert_eq!(BasisPoints::new(2500).as_fraction(), 0.25);
+		assert_eq!(crate::bps!(0).as_fraction(), 0.0);
+		assert_eq!(crate::bps!(5000).as_fraction(), 0.5);
+		assert_eq!(crate::bps!(10000).as_fraction(), 1.0);
+		assert_eq!(crate::bps!(2500).as_fraction(), 0.25);
 	}
 
 	#[test]
 	fn from_percentage() {
-		assert_eq!(BasisPoints::from_percentage(0.0), Ok(BasisPoints::new(0)));
-		assert_eq!(BasisPoints::from_percentage(50.0), Ok(BasisPoints::new(5000)));
-		assert_eq!(BasisPoints::from_percentage(100.0), Ok(BasisPoints::new(10000)));
-		assert_eq!(BasisPoints::from_percentage(75.5), Ok(BasisPoints::new(7550)));
+		assert_eq!(BasisPoints::from_percentage(0.0), Ok(crate::bps!(0)));
+		assert_eq!(BasisPoints::from_percentage(50.0), Ok(crate::bps!(5000)));
+		assert_eq!(BasisPoints::from_percentage(100.0), Ok(crate::bps!(10000)));
+		assert_eq!(BasisPoints::from_percentage(75.5), Ok(crate::bps!(7550)));
 	}
 
 	#[test]
@@ -308,10 +320,10 @@ mod tests {
 
 	#[test]
 	fn from_fraction() {
-		assert_eq!(BasisPoints::from_fraction(0.0), Ok(BasisPoints::new(0)));
-		assert_eq!(BasisPoints::from_fraction(0.5), Ok(BasisPoints::new(5000)));
-		assert_eq!(BasisPoints::from_fraction(1.0), Ok(BasisPoints::new(10000)));
-		assert_eq!(BasisPoints::from_fraction(0.25), Ok(BasisPoints::new(2500)));
+		assert_eq!(BasisPoints::from_fraction(0.0), Ok(crate::bps!(0)));
+		assert_eq!(BasisPoints::from_fraction(0.5), Ok(crate::bps!(5000)));
+		assert_eq!(BasisPoints::from_fraction(1.0), Ok(crate::bps!(10000)));
+		assert_eq!(BasisPoints::from_fraction(0.25), Ok(crate::bps!(2500)));
 	}
 
 	#[test]
@@ -324,15 +336,15 @@ mod tests {
 	#[test]
 	fn try_from_validates_range() {
 		assert_eq!(BasisPoints::try_from(0u16), Ok(BasisPoints::MIN));
-		assert_eq!(BasisPoints::try_from(5000u16), Ok(BasisPoints::new(5000)));
+		assert_eq!(BasisPoints::try_from(5000u16), Ok(crate::bps!(5000)));
 		assert_eq!(BasisPoints::try_from(10000u16), Ok(BasisPoints::MAX));
 		assert_eq!(BasisPoints::try_from(10001u16), Err(BasisPointsOutOfRange));
 	}
 
 	#[test]
 	fn display_format() {
-		assert_eq!(format!("{}", BasisPoints::new(5000)), "5000bps (50%)");
-		assert_eq!(format!("{}", BasisPoints::new(7550)), "7550bps (75.5%)");
+		assert_eq!(format!("{}", crate::bps!(5000)), "5000bps (50%)");
+		assert_eq!(format!("{}", crate::bps!(7550)), "7550bps (75.5%)");
 	}
 
 	#[test]
@@ -348,9 +360,9 @@ mod tests {
 
 	#[test]
 	fn ordering() {
-		assert!(BasisPoints::new(1000) < BasisPoints::new(5000));
-		assert!(BasisPoints::new(10000) > BasisPoints::new(0));
-		assert_eq!(BasisPoints::new(5000), BasisPoints::new(5000));
+		assert!(crate::bps!(1000) < crate::bps!(5000));
+		assert!(crate::bps!(10000) > crate::bps!(0));
+		assert_eq!(crate::bps!(5000), crate::bps!(5000));
 	}
 
 	#[test]
@@ -366,7 +378,7 @@ mod tests {
 	fn der_roundtrip() {
 		use crate::der::{Decode, Encode};
 
-		let original = BasisPoints::new(7500);
+		let original = crate::bps!(7500);
 		let mut buf = [0u8; 16];
 		let encoded = original.encode_to_slice(&mut buf);
 		assert!(encoded.is_ok());

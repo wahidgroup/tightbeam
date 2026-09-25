@@ -1,65 +1,45 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::string::String;
 
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 
+#[cfg(all(not(feature = "std"), feature = "standards-iso"))]
+use alloc::string::String;
+
 #[cfg(feature = "standards-rfc")]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq)]
 pub enum RFCError {
-	#[cfg(feature = "standards-rfc")]
-	#[cfg_attr(feature = "derive", error("{0}"))]
-	#[cfg_attr(feature = "derive", from)]
+	#[error("{0}")]
+	#[source]
 	RFC5424Error(crate::standards::rfc::rfc5424::RFC5424Error),
 }
 
 #[cfg(feature = "standards-iso")]
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ISOError {
-	#[cfg_attr(feature = "derive", error("ISO error: {0}"))]
+	#[error("ISO error: {0}")]
 	Message(String),
 }
 
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A variant whose payload type is feature-gated carries the same gate, so the
+/// enum has exactly the arms its build can construct.
+#[derive(Errorizable, Debug, Clone, PartialEq, Eq)]
 pub enum StandardError {
-	#[cfg_attr(feature = "derive", error("{0}"))]
-	#[cfg_attr(feature = "derive", from)]
+	#[cfg(feature = "standards-rfc")]
+	#[error("{0}")]
+	#[source]
 	RFC(RFCError),
-	#[cfg_attr(feature = "derive", error("{0}"))]
-	#[cfg_attr(feature = "derive", from)]
+
+	#[cfg(feature = "standards-iso")]
+	#[error("{0}")]
+	#[source]
 	ISO(ISOError),
 }
 
-#[cfg(not(feature = "derive"))]
-impl From<RFCError> for StandardError {
-	fn from(e: RFCError) -> Self {
-		StandardError::RFC(e)
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl From<ISOError> for StandardError {
-	fn from(e: ISOError) -> Self {
-		StandardError::ISO(e)
-	}
-}
+#[cfg(feature = "standards-rfc")]
+crate::impl_from!(RFCError => StandardError::RFC);
+#[cfg(feature = "standards-iso")]
+crate::impl_from!(ISOError => StandardError::ISO);
 
 #[cfg(feature = "standards-rfc")]
-crate::impl_error_display!(RFCError {
-	RFC5424Error(e) => "{e}",
-});
-
-#[cfg(feature = "standards-iso")]
-crate::impl_error_display!(ISOError {
-	Message(s) => "ISO error: {s}",
-});
-
-crate::impl_error_display!(StandardError {
-	RFC(e) => "{e}",
-	ISO(e) => "{e}",
-});
+crate::impl_from!(crate::standards::rfc::rfc5424::RFC5424Error => RFCError::RFC5424Error);

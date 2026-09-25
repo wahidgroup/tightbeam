@@ -7,44 +7,29 @@ use alloc::sync::Arc;
 use core::str::FromStr;
 
 #[cfg(feature = "std")]
-use core::time::Duration;
-#[cfg(feature = "std")]
 use std::io::{Error as IoError, ErrorKind};
 #[cfg(feature = "std")]
 use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
 #[cfg(feature = "std")]
 use std::sync::Arc;
-#[cfg(feature = "std")]
-use std::time::Instant;
 
 use crate::builder::TypeBuilder;
-use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
-use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::store::CertificateTrust;
+use crate::crypto::aead::{RecvCipher, SendCipher};
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
-use crate::transport::framing::{
-	classify_boundary_error, classify_truncation_error, parse_der_length, reconstruct_der_encoding, LengthForm,
-};
-use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
-use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
-use crate::transport::handshake::{
-	BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
-};
+use crate::transport::framing::{FrameHeader, HeaderPrefix, LengthForm};
+use crate::transport::handshake::BoxedServerHandshake;
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr, HANDSHAKE_MAX_WIRE};
+use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
 use crate::transport::{
-	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageEmitter, MessageIO, Protocol, ResponsePackage,
-	TransportEncryptionConfig, TransportResult,
+	EncryptedMessageIO, EncryptedProtocol, EndpointConfig, MessageCollector, MessageEmitter, MessageIO, Protocol,
+	ResponsePackage, TransportEncryptionConfig, TransportResult,
 };
-use crate::x509::Certificate;
+use crate::utils::time::{Clock, MonotonicInstant};
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
-#[cfg(feature = "aead")]
-use crate::transport::handshake::EpochMaterials;
-
 #[cfg(feature = "transport-policy")]
 mod policy {
 	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
@@ -52,7 +37,7 @@ mod policy {
 	pub use crate::policy::TransitStatus;
 	pub use crate::transport::error::TransportError;
 	pub use crate::transport::policy::RestartPolicy;
-	pub use crate::transport::{EnvelopeBuilder, EnvelopeLimits, ProtocolStream};
+	pub use crate::transport::{EnvelopeBuilder, ProtocolStream};
 }
 
 #[cfg(feature = "transport-policy")]
@@ -77,12 +62,12 @@ where
 {
 	/// Re-arm the stream's per-recv timeout with the budget remaining until
 	/// `deadline`, failing with `Timeout` once the budget is exhausted.
-	fn arm_read_deadline(&mut self, deadline: Option<Instant>) -> TransportResult<()> {
+	fn arm_read_deadline(&mut self, deadline: Option<MonotonicInstant>) -> TransportResult<()> {
 		let Some(deadline) = deadline else {
 			return Ok(());
 		};
 
-		let remaining = deadline.saturating_duration_since(Instant::now());
+		let remaining = deadline.saturating_duration_since(self.clock.monotonic());
 		if remaining.is_zero() {
 			return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 		}
@@ -96,34 +81,39 @@ impl<S: ProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
+	fn clock(&self) -> &dyn Clock {
+		self.clock.as_ref()
+	}
+
 	async fn read_envelope_bytes(&mut self) -> TransportResult<Vec<u8>> {
 		let handshake_pending = self.is_handshake_pending();
 
 		// Absolute deadline for the whole envelope read. Every stage below
 		// re-arms the per-recv timeout with the *remaining* budget. Handshake
 		// reads face an unauthenticated peer, so the handshake deadline
-		// applies from the first byte onward.
+		// applies from the first byte onward. A deadline past every reading
+		// never arrives, so it is absent.
 		#[cfg(feature = "std")]
-		let deadline = if handshake_pending {
-			match self.to_handshake_state() {
-				TcpHandshakeState::AwaitingServerResponse { initiated_at }
-				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.handshake_timeout),
-				_ => Some(Instant::now() + self.handshake_timeout),
-			}
-		} else {
-			Some(Instant::now() + self.operation_timeout)
+		let deadline = {
+			let (started, allowance) = match self.state.phase().initiated_at() {
+				Some(initiated_at) if handshake_pending => (initiated_at, self.limits.handshake_timeout),
+				_ if handshake_pending => (self.clock.monotonic(), self.limits.handshake_timeout),
+				_ => (self.clock.monotonic(), self.limits.operation_timeout),
+			};
+
+			started.checked_add(allowance)
 		};
 
 		let result = (|| -> TransportResult<Vec<u8>> {
 			#[cfg(feature = "std")]
 			self.arm_read_deadline(deadline)?;
 
-			// EOF before the tag is the peer closing between frames; EOF
+			// EOF before the tag is the peer closing between frames. EOF
 			// anywhere after it is a truncated frame.
 			let mut tag_byte = [0u8; 1];
 			self.stream
 				.read_exact(&mut tag_byte)
-				.map_err(|e| classify_boundary_error(e.into()))?;
+				.map_err(|e| (e.into()).at_frame_boundary())?;
 
 			#[cfg(feature = "std")]
 			self.arm_read_deadline(deadline)?;
@@ -131,10 +121,10 @@ where
 			let mut length_first = [0u8; 1];
 			self.stream
 				.read_exact(&mut length_first)
-				.map_err(|e| classify_truncation_error(e.into()))?;
+				.map_err(|e| (e.into()).inside_frame())?;
 
-			let (length_octets, content_length) = match LengthForm::from(length_first[0]) {
-				LengthForm::Short(length) => (vec![], length),
+			let length_octets = match LengthForm::from(length_first[0]) {
+				LengthForm::Short(_) => Vec::new(),
 				LengthForm::Long(octet_count) => {
 					let mut length_octets = vec![0u8; octet_count];
 
@@ -143,29 +133,24 @@ where
 
 					self.stream
 						.read_exact(&mut length_octets)
-						.map_err(|e| classify_truncation_error(e.into()))?;
+						.map_err(|e| (e.into()).inside_frame())?;
 
-					let length =
-						parse_der_length(length_first[0], &length_octets).ok_or(TransportError::InvalidMessage)?;
-					(length_octets, length)
+					length_octets
 				}
 			};
 
-			// Enforce size ceilings: unauthenticated handshake reads get the
-			// tight handshake cap, established sessions the envelope limits.
-			{
-				let max_allowed = if handshake_pending {
-					HANDSHAKE_MAX_WIRE
-				} else {
-					self.max_encrypted_envelope
-						.or(self.max_cleartext_envelope)
-						.unwrap_or(512 * 1024)
-				};
+			// Unauthenticated handshake reads get the tight handshake cap, and
+			// established sessions the envelope limits. The admitted header is
+			// the only source of a length to allocate with.
+			let cap = if handshake_pending {
+				self.limits.handshake_wire
+			} else {
+				self.limits.max_envelope()
+			};
 
-				if content_length > max_allowed {
-					return Err(TransportError::InvalidMessage);
-				}
-			}
+			let prefix = HeaderPrefix { tag: tag_byte[0], length_first: length_first[0] };
+			let header = FrameHeader::parse(prefix, length_octets)?.admit(cap)?;
+			let content_length = header.content_len();
 
 			// Read content. Without a deadline one read suffices. With one,
 			// read in slices and re-check the remaining budget between them
@@ -188,21 +173,17 @@ where
 						let end = usize::min(filled + slice_len, content_length);
 						self.stream
 							.read_exact(&mut content[filled..end])
-							.map_err(|e| classify_truncation_error(e.into()))?;
+							.map_err(|e| (e.into()).inside_frame())?;
 						filled = end;
 					}
 				} else {
-					self.stream
-						.read_exact(&mut content)
-						.map_err(|e| classify_truncation_error(e.into()))?;
+					self.stream.read_exact(&mut content).map_err(|e| (e.into()).inside_frame())?;
 				}
 			}
 			#[cfg(not(feature = "std"))]
-			self.stream
-				.read_exact(&mut content)
-				.map_err(|e| classify_truncation_error(e.into()))?;
+			self.stream.read_exact(&mut content).map_err(|e| (e.into()).inside_frame())?;
 
-			let buffer = reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
+			let buffer = header.reconstruct(&content);
 			Ok(buffer)
 		})();
 
@@ -216,7 +197,7 @@ where
 
 	async fn write_envelope_bytes(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		#[cfg(feature = "std")]
-		self.stream.set_timeout(Some(self.operation_timeout))?;
+		self.stream.set_timeout(Some(self.limits.operation_timeout))?;
 
 		let result = self.stream.write_all(buffer);
 
@@ -245,8 +226,7 @@ where
 
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
-		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
-		let builder = limits.apply(EnvelopeBuilder::response(response_pkg));
+		let builder = EnvelopeBuilder::response(response_pkg).with_limits(self.limits);
 		let builder = self.apply_wire_mode(builder)?;
 
 		let wire_envelope = builder.build()?;
@@ -271,7 +251,8 @@ where
 		&self.emitter_gate
 	}
 
-	/// Protocol-specific send/receive with handshake and timeout
+	/// Run the protocol-specific send and receive with the handshake and the
+	/// timeout.
 	async fn perform_send_receive(
 		&mut self,
 		message: Frame,
@@ -280,7 +261,7 @@ where
 
 		#[cfg(feature = "std")]
 		{
-			self.stream.set_timeout(Some(self.operation_timeout))?;
+			self.stream.set_timeout(Some(self.limits.operation_timeout))?;
 
 			let result = self.perform_emit_cycle(message).await;
 			let _ = self.stream.set_timeout(None);
@@ -302,29 +283,25 @@ where
 	}
 }
 
-// EncryptedMessageIO: operation methods only
+// The EncryptedMessageIO impl uses the default operation methods.
 impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
-/// TCP server using abstract listener trait
+/// TCP server over the abstract listener trait. Every accepted transport is
+/// built from one [`EndpointConfig`].
 pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoProvider> {
 	listener: L,
-	certificate: Option<Arc<Certificate>>,
-	#[cfg(feature = "x509")]
-	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	aad_domain_tag: Option<&'static [u8]>,
-	max_cleartext_envelope: Option<usize>,
-	max_encrypted_envelope: Option<usize>,
-	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
-	handshake_timeout: Option<Duration>,
+	/// What every accepted transport is built from.
+	config: EndpointConfig<P>,
 }
 
 #[cfg(feature = "std")]
-impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<NetTcpListener, P> {
+impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TcpListener<NetTcpListener, P> {
 	type Listener = TcpListener<NetTcpListener, P>;
 	type Stream = NetTcpStream;
 	type Error = IoError;
 	type Transport = TcpTransport<NetTcpStream, P>;
 	type Address = TightBeamSocketAddr;
+	type CryptoProvider = P;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
 		SocketAddr::from_str("127.0.0.1:0")
@@ -335,87 +312,48 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<NetTcpListener, P
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		Ok((
-			TcpListener {
-				listener,
-				certificate: None,
-				#[cfg(feature = "x509")]
-				client_validators: None,
-				aad_domain_tag: None,
-				max_cleartext_envelope: None,
-				max_encrypted_envelope: None,
-				key_manager: None,
-				handshake_timeout: None,
-			},
-			TightBeamSocketAddr(bound_addr),
-		))
+		let config = EndpointConfig::cleartext();
+
+		Ok((TcpListener { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
 		NetTcpStream::connect(addr.0)
 	}
 
-	fn create_transport(stream: Self::Stream) -> Self::Transport {
-		TcpTransport::from(stream)
+	fn create_transport(stream: Self::Stream, config: EndpointConfig<P>) -> Self::Transport {
+		TcpTransport::new(stream, config)
 	}
 }
 
-impl<L: TcpListenerTrait, P: CryptoProvider> TcpListener<L, P>
+impl<L: TcpListenerTrait, P: CryptoProvider + Send + Sync + 'static> TcpListener<L, P>
 where
 	TransportError: From<L::Error>,
 	TransportError: From<<L::Stream as ProtocolStream>::Error>,
 	L::Stream: ProtocolStream,
 {
+	/// Serve `listener` in the clear.
+	///
+	/// Accepted transports carry no confidentiality, integrity, or peer
+	/// authentication. See [`EndpointConfig::cleartext`].
+	#[cfg(feature = "std")]
 	pub fn from_listener(listener: L) -> Self {
-		Self {
-			listener,
-			certificate: None,
-			#[cfg(feature = "x509")]
-			client_validators: None,
-			aad_domain_tag: None,
-			max_cleartext_envelope: None,
-			max_encrypted_envelope: None,
-			key_manager: None,
-			handshake_timeout: None,
-		}
+		let config = EndpointConfig::cleartext();
+		Self { listener, config }
 	}
 
+	/// Accept one connection as a transport built from this listener's
+	/// configuration.
 	pub fn accept(&self) -> TransportResult<TcpTransport<L::Stream, P>> {
 		let (stream, _) = self.listener.accept()?;
-		let mut transport = TcpTransport::from(stream);
-
-		{
-			if let Some(ref cert) = self.certificate {
-				transport.server_identity = Some(Arc::clone(cert));
-			}
-			if let Some(ref validators) = self.client_validators {
-				transport.client_validators = Some(Arc::clone(validators));
-			}
-			if let Some(aad) = self.aad_domain_tag {
-				transport.aad_domain_tag = Some(aad);
-			}
-			if let Some(max) = self.max_cleartext_envelope {
-				transport.max_cleartext_envelope = Some(max);
-			}
-			if let Some(max) = self.max_encrypted_envelope {
-				transport.max_encrypted_envelope = Some(max);
-			}
-			if let Some(timeout) = self.handshake_timeout {
-				transport.handshake_timeout = timeout;
-			}
-		}
-
-		if let Some(ref signatory) = self.key_manager {
-			transport.key_manager = Some(Arc::clone(signatory));
-		}
+		let transport = TcpTransport::new(stream, self.config.clone());
 		Ok(transport)
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<NetTcpListener, P> {
+impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for TcpListener<NetTcpListener, P> {
 	type Encryptor = SendCipher;
 	type Decryptor = RecvCipher;
-	type CryptoProvider = P;
 
 	async fn bind_with(
 		addr: <Self as Protocol>::Address,
@@ -423,25 +361,9 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<NetTcpLi
 	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
 		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		let certificate = Arc::new(config.certificate);
-		let client_validators = config.client_validators.as_ref().map(Arc::clone);
-		let key_manager = Arc::clone(&config.key_manager);
+		let config = EndpointConfig::from(config);
 
-		Ok((
-			TcpListener {
-				listener,
-				certificate: Some(certificate),
-				#[cfg(feature = "x509")]
-				client_validators,
-				aad_domain_tag: Some(config.aad_domain_tag),
-				max_cleartext_envelope: Some(config.max_cleartext_envelope),
-				max_encrypted_envelope: Some(config.max_encrypted_envelope),
-
-				key_manager: Some(key_manager),
-				handshake_timeout: Some(config.handshake_timeout),
-			},
-			TightBeamSocketAddr(bound_addr),
-		))
+		Ok((TcpListener { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
 }
 
@@ -452,57 +374,32 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::mpsc;
 	use std::thread;
+	use std::time::{Duration, Instant};
 
 	use super::*;
+	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
 	use crate::policy::TransitStatus;
 	use crate::testing::*;
+	use crate::transport::handshake::PeerAuthentication;
 	use crate::transport::policy::PolicyConfig;
+	use crate::transport::state::{DialableEncryption, EncryptionConfig};
+	use crate::transport::TransportLimits;
+	use crate::utils::time::SystemClock;
 
-	/// Serve one single-flight request with an empty reply, answering
-	/// with the gate's status.
-	#[cfg(not(feature = "x509"))]
-	async fn respond_none<T: MessageCollector>(transport: &mut T) -> TransportResult<()> {
-		let (_request, status) = transport.collect_message().await?;
-		transport.send_response(status, None).await
+	/// A server that validates client certificates, so its reads face an
+	/// unauthenticated peer under the handshake ceilings in `limits`.
+	fn validating_server(limits: TransportLimits) -> EndpointConfig<DefaultCryptoProvider> {
+		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
+		let peer_authentication = PeerAuthentication::mutual([validator]);
+
+		let encryption = EncryptionConfig { peer_authentication, ..EncryptionConfig::unconfigured() };
+		let encryption = DialableEncryption::new(encryption).expect("mutual authentication answers for the peer");
+		EndpointConfig::new(encryption, Arc::new(SystemClock)).with_limits(limits)
 	}
 
-	#[cfg(not(feature = "x509"))]
-	#[tokio::test]
-	async fn test_tcp_transport_emit_collect() -> TransportResult<()> {
-		let message = create_v0_tightbeam(None, None);
-		let listener = NetTcpListener::bind("127.0.0.1:0")?;
-		let addr = listener.local_addr()?;
-		let (ready_tx, ready_rx) = mpsc::channel();
-
-		let server_handle = thread::spawn(move || -> TransportResult<()> {
-			let server = TcpListener::from_listener(listener);
-			let _ = ready_tx.send(());
-			let mut transport = server.accept()?;
-
-			let rt = tokio::runtime::Runtime::new()?;
-			rt.block_on(respond_none(&mut transport))?;
-			Ok(())
-		});
-
-		let _ = ready_rx.recv();
-
-		let stream = NetTcpStream::connect(addr)?;
-		let mut client_transport = TcpTransport::from(stream);
-		let response = client_transport.emit(message, None).await?;
-
-		// A panicked server thread surfaces as an I/O error rather than a
-		// re-panic. The closure itself only fails through `?`.
-		server_handle
-			.join()
-			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;
-
-		assert_eq!(response, None);
-		Ok(())
-	}
-
-	/// Under the per-recv-only scheme this read complete after ~6s of dripping
-	/// the absolute deadline aborts it at the first slice boundary past
-	/// the budget.
+	/// A peer that drips bytes cannot stretch the read. A per-recv timeout
+	/// alone would let this read complete after about 6s of dripping, and the
+	/// absolute deadline aborts it at the first slice boundary past the budget.
 	#[cfg(feature = "x509")]
 	#[tokio::test]
 	async fn handshake_read_deadline_bounds_byte_drip() -> TransportResult<()> {
@@ -511,9 +408,9 @@ mod tests {
 
 		let server_handle = thread::spawn(move || -> TransportResult<(TransportResult<Vec<u8>>, Duration)> {
 			let (stream, _) = listener.accept()?;
-			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::from(stream);
-			transport.client_validators = Some(Arc::new(Vec::new()));
-			transport.handshake_timeout = Duration::from_millis(250);
+			let deadline = Duration::from_millis(250);
+			let limits = TransportLimits { handshake_timeout: deadline, ..TransportLimits::default() };
+			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::new(stream, validating_server(limits));
 
 			let rt = tokio::runtime::Runtime::new()?;
 			let started = Instant::now();
@@ -549,64 +446,34 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
+	// A header that declares more than the handshake cap is refused on the
+	// header alone, before any content is read or allocated (CWE-770).
+	#[cfg(feature = "x509")]
 	#[tokio::test]
-	async fn test_tcp_transport_with_gate_policy() -> TransportResult<()> {
-		/// First request: ResourceExhausted; second: Ok.
-		struct BusyFirstGate {
-			first: AtomicBool,
-		}
-
-		impl BusyFirstGate {
-			fn new() -> Self {
-				Self { first: AtomicBool::new(true) }
-			}
-		}
-
-		impl GatePolicy for BusyFirstGate {
-			fn evaluate(&self, _msg: Option<&Frame>, _session: &SessionContext) -> TransitStatus {
-				if self.first.swap(false, Ordering::SeqCst) {
-					TransitStatus::ResourceExhausted
-				} else {
-					TransitStatus::Ok
-				}
-			}
-		}
-
-		let message = create_v0_tightbeam(None, None);
+	async fn a_handshake_header_above_the_cap_is_refused() -> TransportResult<()> {
 		let listener = NetTcpListener::bind("127.0.0.1:0")?;
 		let addr = listener.local_addr()?;
-		let (ready_tx, ready_rx) = mpsc::channel();
 
-		let server_handle = thread::spawn(move || -> TransportResult<()> {
-			let server = TcpListener::from_listener(listener);
-			let _ = ready_tx.send(());
-			let mut transport = server.accept()?.with_collector_gate(BusyFirstGate::new());
+		let server_handle = thread::spawn(move || -> TransportResult<TransportResult<Vec<u8>>> {
+			let (stream, _) = listener.accept()?;
+			let limits = TransportLimits { handshake_wire: 16, ..TransportLimits::default() };
+			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::new(stream, validating_server(limits));
 
 			let rt = tokio::runtime::Runtime::new()?;
-			rt.block_on(respond_none(&mut transport)).ok();
-			rt.block_on(respond_none(&mut transport))?;
-			Ok(())
+			Ok(rt.block_on(transport.read_envelope_bytes()))
 		});
 
-		let _ = ready_rx.recv();
+		// SEQUENCE header declaring 600 content bytes, with no content sent.
+		let mut stream = NetTcpStream::connect(addr)?;
+		Write::write_all(&mut stream, &[0x30, 0x82, 0x02, 0x58])?;
 
-		let stream = NetTcpStream::connect(addr)?;
-		let mut transport = TcpTransport::from(stream);
-
-		let result = transport.emit(message.clone(), None).await;
-		assert!(matches!(
-			result,
-			Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))
-		));
-
-		transport.emit(message.clone(), None).await?;
-
-		// A panicked server thread surfaces as an I/O error rather than a
-		// re-panic. The closure itself only fails through `?`.
-		server_handle
+		let result = server_handle
 			.join()
 			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;
+		assert!(matches!(
+			result,
+			Err(TransportError::OperationFailed(TransportFailure::SizeExceeded))
+		));
 		Ok(())
 	}
 }

@@ -2,14 +2,19 @@
 //!
 //! ## Weakness
 //! A budget-bearing session is only accountable if the dual-signed receipt
-//! is completed: the server issues and signs it, the client countersigns,
-//! and the server verifies the countersignature and settles. The trait
-//! driver runs that acknowledgement automatically, but the orchestrator
-//! also exposes an inherent `complete()` for manual drivers. If
-//! `complete()` activates a metered session whenever the client Finished
-//! merely verified, without confirming the countersigned receipt settled,
-//! a driver that forgets the acknowledgement step activates a budget the
-//! client never countersigned, defeating non-repudiation.
+//! is completed:
+//!
+//! 1. The server issues and signs the receipt.
+//! 2. The client countersigns it.
+//! 3. The server verifies the countersignature and settles.
+//!
+//! The trait driver runs that acknowledgement automatically, but the
+//! orchestrator also exposes an inherent `complete()` for manual drivers.
+//!
+//! Suppose `complete()` activates a metered session whenever the client
+//! Finished merely verified, without a check that the countersigned receipt
+//! settled. A driver that forgets the acknowledgement step then activates a
+//! budget the client left uncountersigned, which defeats non-repudiation.
 //!
 //! ## Attack
 //! A server integration processes the client Finished and calls
@@ -24,8 +29,7 @@
 //! issued but no stored (dual-signed, settled) receipt was retained.
 //!
 //! ## References
-//! - CWE-696: Incorrect Behavior Order
-//!   <https://cwe.mitre.org/data/definitions/696.html>
+//! - CWE-696: Incorrect Behavior Order <https://cwe.mitre.org/data/definitions/696.html>
 //! - CWE-306: Missing Authentication for Critical Function
 //!   <https://cwe.mitre.org/data/definitions/306.html>
 
@@ -47,7 +51,7 @@ use crate::common::security::{
 };
 
 pub(crate) const COMPLETE_FAILS_WITHOUT_SETTLEMENT: Urn<'static> =
-	Urn::new("test", "event:receipt-activation/complete-fails-without-settlement");
+	tightbeam::urn!("test", "event:receipt-activation/complete-fails-without-settlement");
 
 const CHALLENGE: &[u8] = b"activation-invoice";
 const RESPONSE: &[u8] = b"activation-preimage";
@@ -57,7 +61,6 @@ tb_assert_spec! {
 	pub ReceiptActivationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(COMPLETE_FAILS_WITHOUT_SETTLEMENT, exactly!(1), equals!(true))
 		]
@@ -65,7 +68,7 @@ tb_assert_spec! {
 }
 
 // A manual driver that runs the CMS handshake through the client Finished
-// but skips the receipt acknowledgement MUST NOT be able to activate the
+// but skips the receipt acknowledgement MUST fail to activate the
 // budget-bearing session: complete() fails closed.
 tb_scenario! {
 	name: complete_requires_settled_receipt,
@@ -83,7 +86,7 @@ tb_scenario! {
 
 			// Drive the handshake manually through the client Finished, then
 			// deliberately skip process_receipt_ack.
-			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
 			let server_finished = server.build_server_finished().await?;
@@ -92,10 +95,11 @@ tb_scenario! {
 			let client_finished = client.build_client_finished().await?;
 			server.process_client_finished(&client_finished)?;
 
-			// The countersigned receipt was never acknowledged, so the
+			// The countersigned receipt reached no acknowledgement, so the
 			// metered session must not activate.
-			let complete_result = server.complete();
+			let complete_result = server.take_established();
 			let activation_refused = matches!(complete_result, Err(HandshakeError::CountersignatureMissing));
+
 			trace.event_with(
 				COMPLETE_FAILS_WITHOUT_SETTLEMENT,
 				&[],

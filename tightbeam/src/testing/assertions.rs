@@ -32,7 +32,8 @@ impl AssertionContract {
 		self
 	}
 
-	pub fn is_satisfied_by(&self, assertions: &[Assertion]) -> bool {
+	pub fn is_satisfied_by(&self, assertions: impl AsRef<[Assertion]>) -> bool {
+		let assertions = assertions.as_ref();
 		let matching: Vec<_> = assertions
 			.iter()
 			.filter(|a| {

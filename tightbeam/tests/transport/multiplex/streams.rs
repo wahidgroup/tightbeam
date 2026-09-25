@@ -25,34 +25,35 @@ use crate::transport::support::{
 use super::common::*;
 
 pub(crate) const BUSY_GARBAGE_RESOLVES_AS_BUSY: Urn<'static> =
-	Urn::new("test", "event:streams/busy-garbage-resolves-as-busy");
-pub(crate) const CANCEL_OBSERVED_ON_WIRE: Urn<'static> = Urn::new("test", "event:streams/cancel-observed-on-wire");
-pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:streams/first-stream-echoed");
+	tightbeam::urn!("test", "event:streams/busy-garbage-resolves-as-busy");
+pub(crate) const CANCEL_OBSERVED_ON_WIRE: Urn<'static> =
+	tightbeam::urn!("test", "event:streams/cancel-observed-on-wire");
+pub(crate) const FIRST_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:streams/first-stream-echoed");
 pub(crate) const FOLLOWUP_ECHOES_AFTER_GARBAGE: Urn<'static> =
-	Urn::new("test", "event:streams/followup-echoes-after-garbage");
+	tightbeam::urn!("test", "event:streams/followup-echoes-after-garbage");
 pub(crate) const FOLLOWUP_ECHOES_AFTER_RACE: Urn<'static> =
-	Urn::new("test", "event:streams/followup-echoes-after-race");
+	tightbeam::urn!("test", "event:streams/followup-echoes-after-race");
 pub(crate) const FOLLOWUP_ECHOES_ON_FREED_SLOT: Urn<'static> =
-	Urn::new("test", "event:streams/followup-echoes-on-freed-slot");
-pub(crate) const HANDLER_ABORTED_ON_CANCEL: Urn<'static> = Urn::new("test", "event:streams/handler-aborted-on-cancel");
+	tightbeam::urn!("test", "event:streams/followup-echoes-on-freed-slot");
+pub(crate) const HANDLER_ABORTED_ON_CANCEL: Urn<'static> =
+	tightbeam::urn!("test", "event:streams/handler-aborted-on-cancel");
 pub(crate) const HANDSHAKE_NEGOTIATED_NO_MUX: Urn<'static> =
-	Urn::new("test", "event:streams/handshake-negotiated-no-mux");
+	tightbeam::urn!("test", "event:streams/handshake-negotiated-no-mux");
 pub(crate) const HELD_EMIT_ECHOES_AFTER_RELEASE: Urn<'static> =
-	Urn::new("test", "event:streams/held-emit-echoes-after-release");
+	tightbeam::urn!("test", "event:streams/held-emit-echoes-after-release");
 pub(crate) const MUXED_ENVELOPE_INVALID_MESSAGE: Urn<'static> =
-	Urn::new("test", "event:streams/muxed-envelope-invalid-message");
-pub(crate) const NEGOTIATED_CAP_IS_ONE: Urn<'static> = Urn::new("test", "event:streams/negotiated-cap-is-one");
+	tightbeam::urn!("test", "event:streams/muxed-envelope-invalid-message");
+pub(crate) const NEGOTIATED_CAP_IS_ONE: Urn<'static> = tightbeam::urn!("test", "event:streams/negotiated-cap-is-one");
 pub(crate) const SECOND_EMIT_STREAMS_EXHAUSTED: Urn<'static> =
-	Urn::new("test", "event:streams/second-emit-streams-exhausted");
-pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = Urn::new("test", "event:streams/second-stream-echoed");
+	tightbeam::urn!("test", "event:streams/second-emit-streams-exhausted");
+pub(crate) const SECOND_STREAM_ECHOED: Urn<'static> = tightbeam::urn!("test", "event:streams/second-stream-echoed");
 pub(crate) const SERVER_STREAM_ECHOED_BY_CLIENT: Urn<'static> =
-	Urn::new("test", "event:streams/server-stream-echoed-by-client");
+	tightbeam::urn!("test", "event:streams/server-stream-echoed-by-client");
 
 tb_assert_spec! {
 	pub MuxInterleavedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FIRST_STREAM_ECHOED, exactly!(1), equals!(true)),
 			(SECOND_STREAM_ECHOED, exactly!(1), equals!(true))
@@ -106,7 +107,6 @@ tb_assert_spec! {
 	pub MuxCapExhaustionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_STREAMS_EXHAUSTED, exactly!(1)),
 			(NEGOTIATED_CAP_IS_ONE, exactly!(1), equals!(true)),
@@ -188,7 +188,6 @@ tb_assert_spec! {
 	pub MuxNonNegotiatedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(HANDSHAKE_NEGOTIATED_NO_MUX, exactly!(1), equals!(true)),
 			(MUXED_ENVELOPE_INVALID_MESSAGE, exactly!(1), equals!(true))
@@ -230,7 +229,6 @@ tb_assert_spec! {
 	pub MuxCancelAbortSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(FOLLOWUP_ECHOES_ON_FREED_SLOT, exactly!(1), equals!(true)),
 			(HANDLER_ABORTED_ON_CANCEL, exactly!(1), equals!(true))
@@ -298,7 +296,6 @@ tb_assert_spec! {
 	pub MuxCancelRaceSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CANCEL_OBSERVED_ON_WIRE, exactly!(1), equals!(true)),
 			(FOLLOWUP_ECHOES_AFTER_RACE, exactly!(1), equals!(true))
@@ -362,7 +359,6 @@ tb_assert_spec! {
 	pub MuxEndGarbageSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(BUSY_GARBAGE_RESOLVES_AS_BUSY, exactly!(1), equals!(true)),
 			(FOLLOWUP_ECHOES_AFTER_GARBAGE, exactly!(1), equals!(true))
@@ -412,7 +408,6 @@ tb_assert_spec! {
 	pub MuxServerInitiatedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(SERVER_STREAM_ECHOED_BY_CLIENT, exactly!(1), equals!(true))
 		]

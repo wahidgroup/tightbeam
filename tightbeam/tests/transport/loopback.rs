@@ -1,12 +1,13 @@
 //! Loopback end-to-end tests for handshake orchestrators.
 //!
-//! Drives the ECIES and CMS client/server orchestrators against each other
-//! entirely through the `ClientHandshakeProtocol`/`ServerHandshakeProtocol`
-//! trait surface (the same surface `io.rs` consumes) and verifies:
+//! The tests drive the ECIES and CMS client and server orchestrators against
+//! each other entirely through the `ClientHandshakeProtocol` and
+//! `ServerHandshakeProtocol` trait surface (the same surface `io.rs`
+//! consumes) and verify:
 //!
-//! - Both sides complete and agree on the negotiated profile
-//! - The derived directional `SessionKeys` are complementary
-//! - CMS session keys are random per handshake, never constant (CWE-321)
+//! - Both sides complete and agree on the negotiated profile.
+//! - The derived directional `SessionKeys` are complementary.
+//! - CMS session keys are random per handshake, never constant (CWE-321).
 
 #![cfg(all(feature = "transport", feature = "x509", feature = "aead", feature = "tokio"))]
 
@@ -15,7 +16,7 @@ use std::sync::Arc;
 
 use tightbeam::{
 	crypto::{
-		aead::{Decryptor, SessionKeys},
+		aead::{DecryptContent, SessionKeys},
 		profiles::{DefaultCryptoProvider, SecurityProfileDesc},
 		secret::ToInsecure,
 	},
@@ -30,10 +31,11 @@ use tightbeam::{
 use tightbeam::{
 	crypto::ecies::Secp256k1EciesMessage,
 	transport::handshake::negotiation::SecurityOffer,
-	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer},
+	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer, PeerAuthentication},
 };
 
 #[cfg(feature = "transport-cms")]
+use tightbeam::transport::handshake::HandshakeMessage;
 use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
 
 use crate::common::security::{default_security_profile, expectation_failure, ServerMaterials};
@@ -45,15 +47,19 @@ use crate::common::security::pinning_validator;
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const LOOPBACK_CMS_COMPLETE: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-complete");
+pub(crate) const LOOPBACK_CMS_COMPLETE: Urn<'static> = tightbeam::urn!("test", "event:loopback/loopback-cms-complete");
 pub(crate) const LOOPBACK_CMS_PROFILE_AGREED: Urn<'static> =
-	Urn::new("test", "event:loopback/loopback-cms-profile-agreed");
-pub(crate) const LOOPBACK_CMS_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-roundtrip");
-pub(crate) const LOOPBACK_CMS_UNIQUE_KEYS: Urn<'static> = Urn::new("test", "event:loopback/loopback-cms-unique-keys");
-pub(crate) const LOOPBACK_ECIES_COMPLETE: Urn<'static> = Urn::new("test", "event:loopback/loopback-ecies-complete");
+	tightbeam::urn!("test", "event:loopback/loopback-cms-profile-agreed");
+pub(crate) const LOOPBACK_CMS_ROUNDTRIP: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-cms-roundtrip");
+pub(crate) const LOOPBACK_CMS_UNIQUE_KEYS: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-cms-unique-keys");
+pub(crate) const LOOPBACK_ECIES_COMPLETE: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-ecies-complete");
 pub(crate) const LOOPBACK_ECIES_PROFILE_AGREED: Urn<'static> =
-	Urn::new("test", "event:loopback/loopback-ecies-profile-agreed");
-pub(crate) const LOOPBACK_ECIES_ROUNDTRIP: Urn<'static> = Urn::new("test", "event:loopback/loopback-ecies-roundtrip");
+	tightbeam::urn!("test", "event:loopback/loopback-ecies-profile-agreed");
+pub(crate) const LOOPBACK_ECIES_ROUNDTRIP: Urn<'static> =
+	tightbeam::urn!("test", "event:loopback/loopback-ecies-roundtrip");
 
 /// Number of CMS loopback passes (0 when the feature is disabled).
 const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;
@@ -67,7 +73,6 @@ tb_assert_spec! {
 	pub HandshakeLoopbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(LOOPBACK_ECIES_COMPLETE, exactly!(ECIES_RUNS), equals!(true)),
 			(LOOPBACK_ECIES_ROUNDTRIP, exactly!(ECIES_RUNS), equals!(true)),
@@ -106,31 +111,33 @@ fn security_offer(profile: SecurityProfileDesc) -> SecurityOffer {
 	SecurityOffer::new(vec![profile])
 }
 
-/// Probe both directions. Return whether plaintexts match the probes.
+/// Probe both directions and return whether the plaintexts match the
+/// probes.
 ///
 /// Each direction has its own key and counter nonce, so no `(key, nonce)`
 /// pair can repeat across the two probes.
 fn bidirectional_roundtrip_ok(client_keys: &SessionKeys, server_keys: &SessionKeys) -> Result<bool, TightBeamError> {
 	let c2s_probe = b"client->server probe";
 	let c2s_ciphertext = client_keys.send().encrypt_next(c2s_probe, None)?;
-	let c2s_plaintext = server_keys.recv().decrypt_content(&c2s_ciphertext)?.to_insecure()?;
+	let c2s_plaintext = server_keys.recv().decrypt_content(&c2s_ciphertext)?.to_insecure();
 	let c2s_ok = &c2s_plaintext[..] == c2s_probe;
 
 	let s2c_probe = b"server->client probe";
 	let s2c_ciphertext = server_keys.send().encrypt_next(s2c_probe, None)?;
-	let s2c_plaintext = client_keys.recv().decrypt_content(&s2c_ciphertext)?.to_insecure()?;
+	let s2c_plaintext = client_keys.recv().decrypt_content(&s2c_ciphertext)?.to_insecure();
 	let s2c_ok = &s2c_plaintext[..] == s2c_probe;
 
 	Ok(c2s_ok && s2c_ok)
 }
 
-/// Complete both peers, prove AEAD key agreement, and record negotiated profile.
+/// Complete both peers, prove AEAD key agreement, and record the negotiated
+/// profile.
 ///
-/// Emits the three named booleans for `HandshakeLoopbackSpec` to verify via
-/// `equals!(true)`.
+/// The function emits the three named booleans that `HandshakeLoopbackSpec`
+/// verifies with `equals!(true)`.
 async fn emit_session_ready<C, S>(
-	client: &mut C,
-	server: &mut S,
+	client: Box<C>,
+	server: Box<S>,
 	profile: SecurityProfileDesc,
 	trace: &TraceCollector,
 	events: (Urn<'static>, Urn<'static>, Urn<'static>),
@@ -142,33 +149,41 @@ where
 {
 	let (complete_event, roundtrip_event, profile_event) = events;
 
-	let client_aead = ClientHandshakeProtocol::complete(client).await?;
-	let server_aead = ServerHandshakeProtocol::complete(server).await?;
-	let complete = ClientHandshakeProtocol::is_complete(client) && ServerHandshakeProtocol::is_complete(server);
-	trace.event_with(complete_event, &[], complete)?;
+	// Completing consumes each orchestrator, so both machines are read while
+	// they still exist. `complete()` makes the final transition itself, so the
+	// pair is mid-flight here and the event records that transition happening.
+	let pending_before_completion = !ClientHandshakeProtocol::is_complete(client.as_ref())
+		&& !ServerHandshakeProtocol::is_complete(server.as_ref());
 
-	let roundtrip = bidirectional_roundtrip_ok(&client_aead, &server_aead)?;
+	let client_profile = ClientHandshakeProtocol::selected_profile(client.as_ref());
+	let server_profile = ServerHandshakeProtocol::selected_profile(server.as_ref());
+
+	let client_session = ClientHandshakeProtocol::complete(client).await?;
+	let server_session = ServerHandshakeProtocol::complete(server).await?;
+	trace.event_with(complete_event, &[], pending_before_completion)?;
+
+	let roundtrip = bidirectional_roundtrip_ok(client_session.keys(), server_session.keys())?;
 	trace.event_with(roundtrip_event, &[], roundtrip)?;
 
-	let client_profile = ClientHandshakeProtocol::selected_profile(client);
-	let server_profile = ServerHandshakeProtocol::selected_profile(server);
 	let profile_agreed = client_profile == Some(profile) && server_profile == Some(profile);
 	trace.event_with(profile_event, &[], profile_agreed)?;
 
 	Ok(())
 }
 
-/// Require a handshake reply and convert a missing reply into an expectation failure.
-fn require_reply(reply: Option<Vec<u8>>, msg: &'static str) -> Result<Vec<u8>, TightBeamError> {
-	let bytes = reply.ok_or_else(|| expectation_failure(msg))?;
-	Ok(bytes)
+/// Require a handshake reply and convert a missing reply into an
+/// expectation failure.
+fn require_reply(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<HandshakeMessage, TightBeamError> {
+	let message = reply.ok_or_else(|| expectation_failure(msg))?;
+	Ok(message)
 }
 
-/// Protocol step that must produce no further reply.
-fn require_terminal(reply: Option<Vec<u8>>, msg: &'static str) -> Result<(), TightBeamError> {
+/// Require that a protocol step produce no further reply.
+fn require_terminal(reply: Option<HandshakeMessage>, msg: &'static str) -> Result<(), TightBeamError> {
 	if reply.is_some() {
 		return Err(expectation_failure(msg));
 	}
+
 	Ok(())
 }
 
@@ -185,22 +200,28 @@ async fn ecies_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> 
 
 	let key_provider = Arc::clone(&materials.key_provider);
 	let certificate = Arc::clone(&materials.certificate);
-	let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(key_provider, certificate, None, None)
-		.with_supported_profiles(vec![profile]);
+	let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
+		key_provider,
+		certificate,
+		None,
+		PeerAuthentication::Anonymous,
+	)
+	.with_supported_profiles(vec![profile]);
 
-	// ClientHello -> ServerHandshake -> ClientKeyExchange -> (no reply)
+	// The flow is ClientHello, then ServerHandshake, then ClientKeyExchange,
+	// which draws no reply.
 	let client_hello = ClientHandshakeProtocol::start(&mut client).await?;
-	let server_reply = server.handle_request(&client_hello).await?;
+	let server_reply = server.handle_request(client_hello).await?;
 	let server_handshake = require_reply(server_reply, "ECIES server must answer ClientHello")?;
 
-	let client_reply = client.handle_response(&server_handshake).await?;
+	let client_reply = client.handle_response(server_handshake).await?;
 	let client_kex = require_reply(client_reply, "ECIES client must answer ServerHandshake")?;
 
-	let no_reply = server.handle_request(&client_kex).await?;
+	let no_reply = server.handle_request(client_kex).await?;
 	require_terminal(no_reply, "ECIES server must not reply to ClientKeyExchange")?;
 
 	let events = (LOOPBACK_ECIES_COMPLETE, LOOPBACK_ECIES_ROUNDTRIP, LOOPBACK_ECIES_PROFILE_AGREED);
-	emit_session_ready(&mut client, &mut server, profile, trace, events).await
+	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
 }
 
 /// Build a CMS client/server pair sharing the fixture server identity.
@@ -216,8 +237,7 @@ fn build_cms_pair(
 	TightBeamError,
 > {
 	let profile = default_security_profile();
-	let pair = cms_handshake_pair(materials, vec![profile], vec![profile], None)?;
-
+	let pair = cms_handshake_pair(materials, vec![profile], vec![profile], PeerAuthentication::Anonymous)?;
 	Ok((pair.client, pair.server))
 }
 
@@ -228,52 +248,55 @@ fn session_key_bytes(
 	missing_msg: &'static str,
 ) -> Result<Vec<u8>, TightBeamError> {
 	let secret = client.session_key().ok_or_else(|| expectation_failure(missing_msg))?;
-	let bytes = secret.with(|bytes| bytes.to_owned())?;
+	let bytes = secret.with(|bytes| bytes.to_owned());
 	Ok(bytes)
 }
 
 /// True when `needle` appears as a contiguous window inside `haystack`.
 #[cfg(feature = "transport-cms")]
-fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
+	let haystack = haystack.as_ref();
+	let needle = needle.as_ref();
 	haystack.windows(needle.len()).any(|window| window == needle)
 }
 
 /// CMS loopback through the orchestrator trait surface.
 ///
-/// Regression coverage for random session key lets both sides derive a working
-/// AEAD and client learns the negotiated profile from the server-Finished
+/// The test covers the random session key. Both sides derive a working AEAD,
+/// and the client learns the negotiated profile from the server-Finished
 /// `SecurityAccept` attribute and can `complete()`.
 #[cfg(feature = "transport-cms")]
 async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
 	let profile = default_security_profile();
 	let (mut client, mut server) = build_cms_pair(materials)?;
 
-	// KeyExchange -> ServerFinished -> ClientFinished -> (no reply)
+	// The flow is KeyExchange, then ServerFinished, then ClientFinished,
+	// which draws no reply.
 	let key_exchange = ClientHandshakeProtocol::start(&mut client).await?;
 
 	// Confidentiality (CWE-311): the CMS backend transports the session key
 	// wrapped inside the KeyExchange EnvelopedData, so the raw key MUST NOT
 	// appear anywhere in the cleartext wire bytes. This is the CMS equivalent
 	// of the ECIES `confidentiality` threat test, exercised on the real
-	// random-key path (not the fixture's constant test key).
+	// random-key path in place of the fixture's constant test key.
 	let session_key = session_key_bytes(&client, "CMS client must hold a session key after start")?;
-	if contains_window(&key_exchange, &session_key) {
+	if contains_window(key_exchange.der(), &session_key) {
 		return Err(expectation_failure(
 			"CMS session key must not appear in cleartext KeyExchange wire bytes",
 		));
 	}
 
-	let server_reply = server.handle_request(&key_exchange).await?;
+	let server_reply = server.handle_request(key_exchange).await?;
 	let server_finished = require_reply(server_reply, "CMS server must answer KeyExchange with ServerFinished")?;
 
-	let client_reply = client.handle_response(&server_finished).await?;
+	let client_reply = client.handle_response(server_finished).await?;
 	let client_finished = require_reply(client_reply, "CMS client must answer ServerFinished with ClientFinished")?;
 
-	let no_reply = server.handle_request(&client_finished).await?;
+	let no_reply = server.handle_request(client_finished).await?;
 	require_terminal(no_reply, "CMS server must not reply to ClientFinished")?;
 
 	let events = (LOOPBACK_CMS_COMPLETE, LOOPBACK_CMS_ROUNDTRIP, LOOPBACK_CMS_PROFILE_AGREED);
-	emit_session_ready(&mut client, &mut server, profile, trace, events).await
+	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
 }
 
 /// CMS session keys must be random per handshake (CWE-321).

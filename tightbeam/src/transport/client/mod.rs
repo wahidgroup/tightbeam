@@ -3,10 +3,10 @@ use core::marker::PhantomData;
 use crate::asn1::Frame;
 use crate::transport::{MessageEmitter, Protocol, TransportResult};
 
+pub mod macros;
+
 #[cfg(feature = "builder")]
 pub mod builder;
-#[cfg(feature = "derive")]
-pub mod macros;
 #[cfg(feature = "std")]
 pub mod pool;
 
@@ -21,7 +21,7 @@ pub struct GenericClient<P: Protocol> {
 }
 
 impl<P: Protocol> GenericClient<P> {
-	pub fn from_transport(transport: P::Transport) -> Self {
+	pub(crate) fn from_transport(transport: P::Transport) -> Self {
 		Self { transport, _ph: PhantomData }
 	}
 

@@ -15,7 +15,8 @@ use core::mem;
 #[cfg(feature = "std")]
 use std::io::ErrorKind;
 
-use crate::transport::error::TransportError;
+use crate::transport::error::{TransportError, TransportFailure};
+use crate::transport::TransportResult;
 
 /// Shape of a DER length field, classified from its first octet.
 pub(crate) enum LengthForm {
@@ -38,7 +39,8 @@ impl From<u8> for LengthForm {
 /// Parse a DER length field into its numeric value.
 ///
 /// Returns `None` for non-canonical or indefinite-length encodings.
-pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
+fn parse_der_length(first_byte: u8, length_octets: impl AsRef<[u8]>) -> Option<usize> {
+	let length_octets = length_octets.as_ref();
 	let octet_count = match LengthForm::from(first_byte) {
 		LengthForm::Short(length) => return Some(length),
 		LengthForm::Long(count) => count,
@@ -67,37 +69,124 @@ pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<u
 	Some(length)
 }
 
-/// Classify a byte-read failure at a frame boundary.
+/// A DER frame header read from the wire, before any content is allocated.
 ///
-/// EOF before the first byte of a frame is the peer hanging up cleanly
-/// between messages: [`TransportError::ConnectionClosed`], which
-/// `try_read_decoded_envelope` maps to `Ok(None)`. Everything else passes
-/// through unchanged.
-pub(crate) fn classify_boundary_error(error: TransportError) -> TransportError {
-	#[cfg(feature = "std")]
-	if matches!(&error, TransportError::IoError(io) if io.kind() == ErrorKind::UnexpectedEof) {
-		return TransportError::ConnectionClosed;
-	}
-
-	error
+/// The declared content length has not been checked against any ceiling, so
+/// this type offers no way to read it: the accessor lives on
+/// [`AdmittedHeader`].
+pub(crate) struct FrameHeader {
+	tag: u8,
+	length_first: u8,
+	length_octets: Vec<u8>,
+	declared_len: usize,
 }
 
-/// Classify a byte-read failure inside a frame.
+/// A frame header whose declared length has been checked against a ceiling.
 ///
-/// EOF after the frame started is a truncated message, never a clean
-/// close: [`TransportError::InvalidMessage`]. Everything else passes
-/// through unchanged.
-pub(crate) fn classify_truncation_error(error: TransportError) -> TransportError {
-	match &error {
-		TransportError::ConnectionClosed => TransportError::InvalidMessage,
+/// [`AdmittedHeader::content_len`] is the only way to obtain a length to
+/// allocate with, so an allocation sized by an unchecked wire value cannot be
+/// written (CWE-770).
+pub(crate) struct AdmittedHeader {
+	header: FrameHeader,
+}
+
+/// The two leading octets of a DER frame, in the order the link reads them.
+///
+/// Both are bare octets, so a reader holding them loose can exchange them
+/// and parse a header the peer never sent. The named fields are what the
+/// call site binds, so the exchange has no site at which to occur.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeaderPrefix {
+	/// The identifier octet naming the frame's ASN.1 tag.
+	pub(crate) tag: u8,
+	/// The first length octet, which decides the short or long form.
+	pub(crate) length_first: u8,
+}
+
+impl FrameHeader {
+	/// Parse a tag and length field into a header.
+	///
+	/// # Errors
+	///
+	/// [`TransportError::InvalidMessage`] when the length field is
+	/// non-canonical or uses the BER indefinite form.
+	pub(crate) fn parse(prefix: HeaderPrefix, length_octets: impl Into<Vec<u8>>) -> TransportResult<Self> {
+		let HeaderPrefix { tag, length_first } = prefix;
+		let length_octets: Vec<u8> = length_octets.into();
+		let declared_len = parse_der_length(length_first, &length_octets).ok_or(TransportError::InvalidMessage)?;
+		Ok(Self { tag, length_first, length_octets, declared_len })
+	}
+
+	/// Admit this header when its declared length fits within `cap`.
+	///
+	/// # Errors
+	///
+	/// [`TransportFailure::SizeExceeded`] when the declared length exceeds
+	/// `cap`. The refusal happens here, before the content is read or any
+	/// buffer is sized.
+	pub(crate) fn admit(self, cap: usize) -> TransportResult<AdmittedHeader> {
+		if self.declared_len > cap {
+			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
+		}
+
+		Ok(AdmittedHeader { header: self })
+	}
+}
+
+impl AdmittedHeader {
+	/// Content length that passed the ceiling check.
+	pub(crate) fn content_len(&self) -> usize {
+		self.header.declared_len
+	}
+
+	/// Rebuild the complete DER encoding from this header and its content.
+	pub(crate) fn reconstruct(&self, content: impl AsRef<[u8]>) -> Vec<u8> {
+		let content = content.as_ref();
+		reconstruct_der_encoding(self.header.tag, self.header.length_first, &self.header.length_octets, content)
+	}
+}
+
+impl TransportError {
+	/// Classify a byte-read failure at a frame boundary.
+	///
+	/// EOF before the first byte of a frame is the peer hanging up
+	/// cleanly between messages: [`TransportError::ConnectionClosed`],
+	/// which `try_read_decoded_envelope` maps to `Ok(None)`. Everything
+	/// else passes through unchanged.
+	pub(crate) fn at_frame_boundary(self) -> Self {
 		#[cfg(feature = "std")]
-		TransportError::IoError(io) if io.kind() == ErrorKind::UnexpectedEof => TransportError::InvalidMessage,
-		_ => error,
+		if matches!(&self, Self::IoError(io) if io.kind() == ErrorKind::UnexpectedEof) {
+			return Self::ConnectionClosed;
+		}
+
+		self
+	}
+
+	/// Classify a byte-read failure inside a frame.
+	///
+	/// EOF after the frame started is a truncated message, never a clean
+	/// close: [`TransportError::InvalidMessage`]. Everything else passes
+	/// through unchanged.
+	pub(crate) fn inside_frame(self) -> Self {
+		match &self {
+			Self::ConnectionClosed => Self::InvalidMessage,
+			#[cfg(feature = "std")]
+			Self::IoError(io) if io.kind() == ErrorKind::UnexpectedEof => Self::InvalidMessage,
+			_ => self,
+		}
 	}
 }
 
-/// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
-pub(crate) fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets: &[u8], content: &[u8]) -> Vec<u8> {
+/// Reconstruct a full DER encoding from its parsed tag, length, and content
+/// parts.
+fn reconstruct_der_encoding(
+	tag: u8,
+	length_first: u8,
+	length_octets: impl AsRef<[u8]>,
+	content: impl AsRef<[u8]>,
+) -> Vec<u8> {
+	let length_octets = length_octets.as_ref();
+	let content = content.as_ref();
 	let mut buffer = Vec::with_capacity(2 + length_octets.len() + content.len());
 	buffer.push(tag);
 	buffer.push(length_first);
@@ -156,38 +245,38 @@ mod tests {
 	#[test]
 	fn boundary_classification_maps_eof_to_clean_close() {
 		let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
-		assert!(matches!(classify_boundary_error(eof), TransportError::ConnectionClosed));
+		assert!(matches!((eof).at_frame_boundary(), TransportError::ConnectionClosed));
 
 		let reset = TransportError::IoError(ErrorKind::ConnectionReset.into());
-		assert!(matches!(classify_boundary_error(reset), TransportError::IoError(_)));
+		assert!(matches!((reset).at_frame_boundary(), TransportError::IoError(_)));
 	}
 
 	#[test]
 	fn truncation_classification_maps_eof_to_invalid_message() {
 		assert!(matches!(
-			classify_truncation_error(TransportError::ConnectionClosed),
+			(TransportError::ConnectionClosed).inside_frame(),
 			TransportError::InvalidMessage
 		));
 		assert!(matches!(
-			classify_truncation_error(TransportError::ConnectionFailed),
+			(TransportError::ConnectionFailed).inside_frame(),
 			TransportError::ConnectionFailed
 		));
 
 		#[cfg(feature = "std")]
 		{
 			let eof = TransportError::IoError(ErrorKind::UnexpectedEof.into());
-			assert!(matches!(classify_truncation_error(eof), TransportError::InvalidMessage));
+			assert!(matches!((eof).inside_frame(), TransportError::InvalidMessage));
 		}
 	}
 
 	#[test]
 	fn reconstruct_round_trips_short_and_long_form() {
 		assert_eq!(
-			reconstruct_der_encoding(0x30, 0x02, &[], &[0x01, 0x02]),
+			reconstruct_der_encoding(0x30, 0x02, [], [0x01, 0x02]),
 			vec![0x30, 0x02, 0x01, 0x02]
 		);
 		assert_eq!(
-			reconstruct_der_encoding(0x30, 0x81, &[0x80], &[0xAA]),
+			reconstruct_der_encoding(0x30, 0x81, [0x80], [0xAA]),
 			vec![0x30, 0x81, 0x80, 0xAA]
 		);
 	}

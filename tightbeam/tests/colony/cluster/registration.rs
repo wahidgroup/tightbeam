@@ -1,12 +1,13 @@
-//! Registration, control-plane refusal, and hive lifecycle.
+//! Tests for registration, control-plane refusal, and the hive lifecycle.
 
 use super::common::*;
+use tightbeam::colony::cluster::ClusterHeartbeat;
+use tightbeam::utils::time::MonotonicInstant;
 
 tb_assert_spec! {
 	pub ClusterTeardownSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(SERVLET_STOPPED, exactly!(1))
@@ -26,7 +27,9 @@ impl ServletBox for StopProbeServlet {
 	}
 
 	fn stop_boxed(self: Box<Self>) {
-		let _ = self.trace.event(SERVLET_STOPPED);
+		self.trace
+			.event(SERVLET_STOPPED)
+			.expect("recording the servlet stop is what this probe exists to do");
 	}
 }
 
@@ -61,7 +64,6 @@ tb_assert_spec! {
 	pub ClusterPolicySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(WORK_SENT, exactly!(1)),
 			(events::CLUSTER_GATE_BLOCKED, exactly!(1)),
@@ -105,7 +107,6 @@ tb_assert_spec! {
 	pub ClusterUnsignedRegistrationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
@@ -121,30 +122,34 @@ tb_scenario! {
 	spec: ClusterUnsignedRegistrationSpec,
 	environment Cluster {
 		context: cluster_certs(),
-		// Registration itself is under test, so no `hives:` key.
-		// The client drives it, and the spec asserts the rejection.
+		// Registration itself is under test, so the environment has no
+		// `hives:` key. The client drives it, and the spec asserts the
+		// rejection.
 		start: |SetupEnv { trace, context: certs }| async move {
-			// The cluster requires signed hive-origin frames (hive_trust set).
+			// The cluster requires signed hive-origin frames because
+			// `hive_trust` is set.
 			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
-			// The hive validates the cluster's TLS certificate but has no
-			// signing identity of its own, so control frames go out unsigned.
-			let hive_conf = HiveConfig {
-				trust_store: Some(Arc::clone(&certs.trust)),
-				..Default::default()
-			};
-
-			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
-			hive.establish(Arc::new(trace.share())).await?;
+			let cluster_addr = cluster.addr();
+			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
 			trace.event(REGISTRATION_SENT)?;
 
-			let cluster_addr = cluster.addr();
-			let response = hive.register_with_cluster(cluster_addr).await?;
+			// The frame is unsigned by construction. A hive cannot drive this
+			// case: with no signing identity it binds no control plane, so it
+			// has no address to register and refuses before it dials.
+			let unsigned = Version::V0
+				.compose()
+				.with_id(b"unsigned-reg")
+				.with_order(UnixMillis::now().get())
+				.with_message(registration_request(b"127.0.0.1:65200"))
+				.build()?;
+
+			let response_frame = emit_frame(&mut client, unsigned).await?;
+			let response: RegisterHiveResponse = decode(response_frame.message())?;
 			record_register_response(&trace, &response, &cluster)?;
 
-			hive.stop();
 			cluster.stop();
 
 			Ok(())
@@ -156,21 +161,65 @@ tb_assert_spec! {
 	pub ClusterRefusedRegNotQueuedSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
-			(events::HIVE_REREGISTERED, exactly!(0)),
-			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Unauthenticated)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
 			(REGISTRY_HIVES, exactly!(1), equals!(0u64)),
-			(REGISTER_ASSIGNED_ID, exactly!(1), equals!(0u64))
+			(REGISTER_ASSIGNED_ID, exactly!(1), equals!(0u64)),
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(2)),
+			(BEAT_REREGISTERED, exactly!(1), equals!(1u64))
 		]
 	}
+}
+
+/// The hive's own signing identity and the trust store that admits it.
+///
+/// The identity is absent from the shared gateway trust, so the refusing
+/// gateway turns it away, and present here, so the accepting gateway
+/// admits it.
+fn untrusted_hive_identity() -> (Arc<HiveTlsConfig>, Arc<dyn CertificateTrust>) {
+	let (hive_cert, hive_key) = colony_identity("CN=Untrusted Hive", &test_colony_urn());
+	let admits_hive: Arc<dyn CertificateTrust> = Arc::new(
+		CertificateTrustBuilder::from(Secp256k1Policy)
+			.with_certificate(hive_cert.to_owned())
+			.expect("the hive certificate builds a trust store")
+			.build(),
+	);
+	let hive_tls = HiveTlsConfig::new(
+		CertificateSpec::Built(Box::new(hive_cert)),
+		Arc::new(Secp256k1KeyProvider::from(hive_key)),
+		vec![],
+	)
+	.expect("the hive TLS material must decode");
+
+	(Arc::new(hive_tls), admits_hive)
+}
+
+/// The lease the gateway holds for its one registered hive, stamped on
+/// the gateway's clock when the hive registered last.
+fn hive_lease(cluster: &ClusterGateway) -> MonotonicInstant {
+	let hives = cluster.registry().all_hives().expect("the member lock is live");
+	let hive = hives.first().expect("one hive is registered");
+	hive.last_seen
 }
 
 // A refused RegisterHiveResponse must not enqueue the gateway: the
 // anti-entropy beat would otherwise keep calling a peer that already
 // rejected the hive, and scaling updates would fan out there too.
+//
+// The claim is proven on the beat that does run:
+//
+// - A second gateway admits the hive, and the hive's beat re-registers with
+//   the gateways it queued.
+// - A re-registration stamps a fresh lease on the gateway's clock, which the
+//   test has moved, so the renewed lease is the beat's footprint.
+// - The hive dials queued gateways in the order it queued them, so a
+//   refusing gateway wrongly queued first would be refused again before the
+//   re-registration lands, and the refusal count pins that.
+// - The hive and the accepting gateway read the one clock the test advances,
+//   so the beat fires when the test says and the frames they sign for each
+//   other stay fresh.
 tb_scenario! {
 	name: cluster_refused_registration_does_not_queue_gateway,
 	spec: ClusterRefusedRegNotQueuedSpec,
@@ -180,26 +229,41 @@ tb_scenario! {
 			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let clock = Arc::new(ManualClock::default());
+			let (hive_tls, admits_hive) = untrusted_hive_identity();
+
+			// The accepting gateway's own heartbeat never fires inside this
+			// run, so the hive's lease moves only when the hive registers.
+			let mut accepting_conf = ClusterConfig::new(cluster_tls_config_with_trust(&certs, Some(admits_hive)));
+			accepting_conf.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+			let accepting = start_cluster(&trace, accepting_conf).await?;
+
 			let mut hive_conf = HiveConfig {
 				trust_store: Some(Arc::clone(&certs.trust)),
+				hive_tls: Some(hive_tls),
+				clock: Arc::clone(&clock) as Arc<dyn Clock>,
 				..Default::default()
 			};
 			hive_conf.control.reregister_interval = Some(Duration::from_millis(50));
-
 			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
 			hive.establish(Arc::new(trace.share())).await?;
 
 			trace.event(REGISTRATION_SENT)?;
-
-			let cluster_addr = cluster.addr();
-			let response = hive.register_with_cluster(cluster_addr).await?;
+			let response = hive.register_with_cluster(cluster.addr()).await?;
 			record_register_response(&trace, &response, &cluster)?;
 
-			// Wait several anti-entropy intervals. A queued gateway would
-			// emit HIVE_REREGISTERED, and an unqueued one stays silent.
-			tokio::time::sleep(Duration::from_millis(250)).await;
+			hive.register_with_cluster(accepting.addr()).await?;
+			let first_lease = hive_lease(&accepting);
+
+			// The hive's beat re-announces to every gateway it queued, and
+			// the accepting gateway stamps the renewed lease on the clock
+			// the test just moved.
+			clock.advance(Duration::from_millis(50));
+			let renewed = poll_until(50, Duration::from_millis(20), || hive_lease(&accepting) > first_lease).await;
+			trace.event_with(BEAT_REREGISTERED, &[], u64::from(renewed))?;
 
 			hive.stop();
+			accepting.stop();
 			cluster.stop();
 
 			Ok(())
@@ -211,7 +275,6 @@ tb_assert_spec! {
 	pub ClusterNoTrustStoreSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REGISTRATION_SENT, exactly!(1)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
@@ -228,17 +291,11 @@ tb_scenario! {
 	environment Cluster {
 		context: cluster_certs(),
 		start: |SetupEnv { trace, context: certs }| async move {
-			// A gateway without hive_trust cannot authenticate control
+			// A gateway without `hive_trust` cannot authenticate control
 			// frames and must fail closed, so even a validly signed
 			// registration is rejected.
-			let tls = ClusterTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
-				key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
-				validators: vec![],
-				client_validators: vec![],
-				hive_trust: None,
-				peer_trust: None,
-			};
+			let tls = ClusterTlsConfig::new(CertificateSpec::Built(Box::new(certs.cert.to_owned())), Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())))
+				.expect("the test certificate must decode");
 			start_cluster(&trace, ClusterConfig::new(tls)).await
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
@@ -254,7 +311,7 @@ tb_scenario! {
 			trace.event(REGISTRATION_SENT)?;
 
 			let response_frame = emit_frame(&mut client, signed).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			let response: RegisterHiveResponse = decode(response_frame.message())?;
 			record_register_response(&trace, &response, &cluster)?;
 
 			cluster.stop();
@@ -268,7 +325,6 @@ tb_assert_spec! {
 	pub ClusterServletLocatorAlignSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
@@ -299,9 +355,9 @@ tb_process_spec! {
 	terminal { UpdateRefused }
 }
 
-// Register and update must refuse ServletInfo whose instance locator
-// disagrees with the announced address: routes key by address, remove
-// by URN locator (CWE-639 ghost / orphan routes).
+// Register and update must refuse a `ServletInfo` whose instance locator
+// disagrees with the announced address. Routes key by address and remove by
+// URN locator, so a mismatch leaves ghost or orphan routes (CWE-639).
 tb_scenario! {
 	name: cluster_rejects_mismatched_servlet_locator,
 	config: ScenarioConfig::builder()
@@ -331,7 +387,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, refused_reg).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			// A clean registration lands, then a mismatched add must refuse.
 			let ok_reg = signed_control_frame(
@@ -342,7 +398,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, ok_reg).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			let bad_add = servlet_address_update(
 				hive_addr,
@@ -352,7 +408,7 @@ tb_scenario! {
 
 			let refused_update = signed_control_frame(&certs, b"misalign-update", bad_add).await?;
 			let response_frame = emit_frame(&mut client, refused_update).await?;
-			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
 
 			cluster.stop();
 
@@ -365,7 +421,6 @@ tb_assert_spec! {
 	pub ClusterReplaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(2)),
@@ -426,15 +481,15 @@ tb_scenario! {
 			let replayed = fresh.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			// A byte-identical resend carries an already-seen signature.
 			let response_frame = emit_frame(&mut client, replayed).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			// The signature is valid but the order lies outside the
 			// freshness window.
-			let stale_ts = current_timestamp_ms() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
+			let stale_ts = UnixMillis::now().get() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
 			let stale = signed_control_frame_with_order(
 				&certs.key,
 				b"stale-reg",
@@ -444,7 +499,7 @@ tb_scenario! {
 			.await?;
 
 			let response_frame = emit_frame(&mut client, stale).await?;
-			let _: RegisterHiveResponse = decode(&response_frame.message)?;
+			let _: RegisterHiveResponse = decode(response_frame.message())?;
 
 			// The same enforcement applies to servlet address updates.
 			let update = servlet_address_update(
@@ -456,10 +511,10 @@ tb_scenario! {
 			let replayed_update = fresh_update.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh_update).await?;
-			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
 
 			let response_frame = emit_frame(&mut client, replayed_update).await?;
-			let _: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			let _: ServletAddressUpdateResponse = decode(response_frame.message())?;
 
 			cluster.stop();
 
@@ -472,7 +527,6 @@ tb_assert_spec! {
 	pub ClusterHeartbeatRejectionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::Ok)),
@@ -506,7 +560,7 @@ tb_process_spec! {
 	terminal { Evicted }
 }
 
-/// Heartbeat-eviction fixture. The heartbeat callback (set in `start`)
+/// A heartbeat-eviction fixture. The heartbeat callback, set in `start`,
 /// records whether a decoded rejected heartbeat was observed. The client
 /// surfaces that flag as a valued event the spec pins after eviction.
 struct HeartbeatRejectionContext {
@@ -531,9 +585,9 @@ tb_scenario! {
 				.with_interval(Duration::from_millis(100))
 				.with_max_failures(1)
 				.with_callback(Arc::new(move |event| {
-					// utilization is only Some when the heartbeat response
-					// decoded, proving the failure came from the rejected
-					// status rather than a transport error.
+					// `utilization` is `Some` only when the heartbeat
+					// response decoded, which proves the failure came from
+					// the rejected status rather than a transport error.
 					let decoded_reject = !event.success && event.utilization.is_some();
 					callback_rejection
 						.rejected_decoded
@@ -556,7 +610,11 @@ tb_scenario! {
 			hive.establish(Arc::new(trace.share())).await?;
 
 			// Register the hive out-of-band with a validly signed frame.
-			let hive_addr_bytes = hive.addr().to_string().into_bytes();
+			let hive_addr_bytes = hive
+				.addr()
+				.ok_or(TightBeamError::NotEstablished)?
+				.to_string()
+				.into_bytes();
 			let registration = signed_control_frame(
 				certs,
 				b"hb-reject-reg",
@@ -566,10 +624,10 @@ tb_scenario! {
 
 			let mut client = connect_cluster(certs, cluster_addr).await?;
 			let response_frame = emit_frame(&mut client, registration).await?;
-			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			let response: RegisterHiveResponse = decode(response_frame.message())?;
 			record_register_response(&trace, &response, &cluster)?;
 
-			// Heartbeats run every 100ms with max_failures = 1, so the
+			// Heartbeats run every 100ms with `max_failures = 1`, so the
 			// first PermissionDenied heartbeat must evict the hive.
 			let emptied = wait_for_empty_registry(&cluster, 50, Duration::from_millis(100)).await;
 			trace.event_with(REGISTRY_EMPTIED, &[], u64::from(emptied))?;
@@ -585,7 +643,7 @@ tb_scenario! {
 	}
 }
 
-// Two hive identities under one gateway prove ServletAddressUpdate is
+// Two hive identities under one gateway prove `ServletAddressUpdate` is
 // signer-bound, so one hive cannot tamper with another's routes.
 struct DualHiveCerts {
 	gateway: ClusterTestCerts,
@@ -596,17 +654,17 @@ struct DualHiveCerts {
 
 fn dual_hive_certs() -> DualHiveCerts {
 	use tightbeam::random::OsRng;
-	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::testing::fixtures::TestCertificate;
 
 	let gateway = cluster_certs();
 	let raw_a = k256::ecdsa::SigningKey::random(&mut OsRng);
 	let raw_b = k256::ecdsa::SigningKey::random(&mut OsRng);
-	let cert_a = create_test_certificate(&raw_a);
-	let cert_b = create_test_certificate(&raw_b);
+	let cert_a = TestCertificate::self_signed(&raw_a);
+	let cert_b = TestCertificate::self_signed(&raw_b);
 	let key_a = Secp256k1SigningKey::from(raw_a);
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
-		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(cert_a.to_owned())
 			.expect("hive A trust")
 			.with_certificate(cert_b.to_owned())
@@ -621,7 +679,6 @@ tb_assert_spec! {
 	pub ClusterCrossHiveUpdateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(2)),
 			(REGISTER_STATUS, exactly!(2), equals!(TransitStatus::Ok)),
@@ -681,7 +738,7 @@ tb_scenario! {
 			let response_b = register_signed_hive(&mut client, &certs.hive_b.1, b"reg-b", hive_b_addr).await?;
 			trace.event_with(REGISTER_STATUS, &[], response_a.status)?;
 			trace.event_with(REGISTER_STATUS, &[], response_b.status)?;
-			trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count() as u64)?;
+			trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count()? as u64)?;
 
 			let update_cases = [
 				(
@@ -707,10 +764,65 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
+	pub ClusterServletTakeoverSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_HIVE_REGISTERED, exactly!(1)),
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(REGISTRY_HIVES, exactly!(1), equals!(1u64)),
+			(events::CLUSTER_UPDATE_ACCEPTED, exactly!(1)),
+			(OWNER_UPDATE_STATUS, exactly!(1), equals!(TransitStatus::Ok))
+		]
+	}
+}
+
+// A second hive that registers a servlet address the first hive already
+// serves is refused whole, so the first hive keeps its route (CWE-639).
+// The first hive then removes that address under its own signature, which
+// only the route's owner may do, so the accepted removal is the proof it
+// kept the route.
+tb_scenario! {
+	name: cluster_rejects_a_registration_that_takes_another_hives_servlet,
+	spec: ClusterServletTakeoverSpec,
+	environment Cluster {
+		context: dual_hive_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, ClusterConfig::new(cluster_tls_config_with_trust(
+				&certs.gateway,
+				Some(Arc::clone(&certs.hive_trust)),
+			)))
+			.await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let mut client = connect_cluster(&certs.gateway, cluster.addr()).await?;
+			let servlet_addr = b"127.0.0.1:65020".as_slice();
+
+			let owner = [servlet_info("calc", servlet_addr)];
+			register_signed_hive_serving(&mut client, &certs.hive_a.1, b"reg-a", b"127.0.0.1:65021", owner).await?;
+
+			let takeover = [servlet_info("calc", servlet_addr)];
+			let response =
+				register_signed_hive_serving(&mut client, &certs.hive_b.1, b"reg-b", b"127.0.0.1:65022", takeover).await?;
+			trace.event_with(REGISTER_STATUS, &[], response.status)?;
+			trace.event_with(REGISTRY_HIVES, &[], count_u64(cluster.hive_count()?))?;
+
+			let owned_instance = servlet_info("calc", servlet_addr).servlet_id;
+			let removal = servlet_address_update(b"127.0.0.1:65021", vec![], vec![owned_instance]);
+			let removed = emit_servlet_update(&mut client, &certs.hive_a.1, b"owner-removes", removal).await?;
+			trace.event_with(OWNER_UPDATE_STATUS, &[], removed.status)?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
 	pub ClusterRegistrationHijackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
@@ -765,7 +877,7 @@ tb_scenario! {
 
 			// The registry after the refused hijack still holds exactly
 			// the owner: the failed takeover must not disturb the binding.
-			trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count() as u64)?;
+			trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count()? as u64)?;
 
 			// The owner's update still lands: the failed hijack must not
 			// have disturbed the signer binding.
@@ -787,7 +899,6 @@ tb_assert_spec! {
 	pub ClusterRemovalSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::CLUSTER_HIVE_REGISTERED, exactly!(1), equals!(1u64)),
 			(events::CLUSTER_WORK_ROUTED, exactly!(1)),
@@ -843,7 +954,7 @@ tb_scenario! {
 		},
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let trace = Arc::new(trace.share());
-			let config = Some(servlet_tls_config(&certs)?);
+			let config = servlet_tls_config(&certs)?;
 			let servlet = ClusterTestServlet::start(trace, config).await?;
 			let servlet_addr = servlet.addr().to_string();
 			let hive_addr = b"127.0.0.1:65200".as_slice();
@@ -862,16 +973,51 @@ tb_scenario! {
 			let request = servlet_address_update(hive_addr, vec![], removed);
 			emit_servlet_update(&mut client, &certs.key, b"removal-foreign", request).await?;
 
-			let removed = vec![servlet_instance(&servlet_urn("ping"), &servlet_addr)];
+			let removed = vec![servlet_urn("ping").servlet_instance(&servlet_addr).expect("a servlet type URN yields an instance URN")];
 			let request = servlet_address_update(hive_addr, vec![], removed);
 			emit_servlet_update(&mut client, &certs.key, b"removal-remove", request).await?;
 
-			// The removed instance no longer routes, so the submission
-			// must resolve to a refusal.
+			// The removed instance has stopped routing, so the submission must
+			// resolve to a refusal.
 			let refused_work = emit_ping_work(&mut client, &certs.key, b"post-removal-work").await;
 			work_refusal_status(refused_work)?;
 
 			servlet.stop();
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterUndialableHiveSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CLUSTER_REGISTER_REFUSED, exactly!(1)),
+			(REGISTER_STATUS, exactly!(1), equals!(TransitStatus::PermissionDenied)),
+			(REGISTRY_HIVES, exactly!(1), equals!(0u64))
+		]
+	}
+}
+
+// Admitting a hive the heartbeat cannot dial would leave it to expire at the
+// lease timeout with no refusal to show for it.
+tb_scenario! {
+	name: cluster_refuses_a_hive_whose_control_address_the_protocol_cannot_dial,
+	spec: ClusterUndialableHiveSpec,
+	environment Cluster {
+		context: cluster_certs(),
+		start: |SetupEnv { trace, context: certs }| async move {
+			start_cluster(&trace, ClusterConfig::new(cluster_tls_config(&certs))).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
+
+			let response = register_signed_hive(&mut client, &certs.key, b"reg-undialable", b"hive.example:9000").await?;
+			trace.event_with(REGISTER_STATUS, &[], response.status)?;
+			trace.event_with(REGISTRY_HIVES, &[], cluster.hive_count()? as u64)?;
+
 			cluster.stop();
 			Ok(())
 		}

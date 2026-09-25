@@ -1,0 +1,36 @@
+[package]
+name = "tightbeam-consumer-test"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tightbeam = { package = "tightbeam-rs", path = "../../tightbeam", default-features = false, features = [
+	"std",
+	"builder",
+	"crypto",
+	"digest",
+	"aead",
+	"signature",
+	"aes-gcm",
+	"sha3",
+	"secp256k1",
+	"kdf",
+	"ecdh",
+	"x509",
+	"transport-ecies",
+	"tcp",
+	"tokio",
+	"transport-policy",
+	"testing",
+	"testing-csp",
+] }
+der = { workspace = true }
+
+[dev-dependencies]
+trybuild = { workspace = true }

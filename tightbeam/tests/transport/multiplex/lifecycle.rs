@@ -2,17 +2,17 @@
 
 use std::sync::Arc;
 
-use tightbeam::asn1::{MessagePriority, Metadata, Version};
+use tightbeam::asn1::Version;
 use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv};
+use tightbeam::testing::{ClientEnv, ScenarioConfig, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxOpenPackage, MuxStreamKind};
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, TransportEnvelope};
-use tightbeam::{Frame, TightBeamError};
+use tightbeam::TightBeamError;
 
 use crate::common::security::expectation_failure;
 use crate::transport::support::{await_ok, join_task, mux_frame};
@@ -23,31 +23,31 @@ use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
 pub(crate) const EMIT_FAILS_CONNECTION_CLOSED: Urn<'static> =
-	Urn::new("test", "event:lifecycle/emit-fails-connection-closed");
-pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> = Urn::new("test", "event:lifecycle/inflight-drains-to-echo");
+	tightbeam::urn!("test", "event:lifecycle/emit-fails-connection-closed");
+pub(crate) const INFLIGHT_DRAINS_TO_ECHO: Urn<'static> =
+	tightbeam::urn!("test", "event:lifecycle/inflight-drains-to-echo");
 pub(crate) const LATE_EMIT_REFUSED_DRAINING: Urn<'static> =
-	Urn::new("test", "event:lifecycle/late-emit-refused-draining");
+	tightbeam::urn!("test", "event:lifecycle/late-emit-refused-draining");
 pub(crate) const OFFENDER_ANSWERED_WITH_GOAWAY: Urn<'static> =
-	Urn::new("test", "event:lifecycle/offender-answered-with-goaway");
+	tightbeam::urn!("test", "event:lifecycle/offender-answered-with-goaway");
 pub(crate) const PEER_REASON_SURFACES_ON_HANDLE: Urn<'static> =
-	Urn::new("test", "event:lifecycle/peer-reason-surfaces-on-handle");
+	tightbeam::urn!("test", "event:lifecycle/peer-reason-surfaces-on-handle");
 pub(crate) const PENDING_FAILS_CONNECTION_CLOSED: Urn<'static> =
-	Urn::new("test", "event:lifecycle/pending-fails-connection-closed");
-pub(crate) const REKEY_CASE_HOLDS: Urn<'static> = Urn::new("test", "event:lifecycle/rekey-case-holds");
+	tightbeam::urn!("test", "event:lifecycle/pending-fails-connection-closed");
+pub(crate) const REKEY_CASE_HOLDS: Urn<'static> = tightbeam::urn!("test", "event:lifecycle/rekey-case-holds");
 pub(crate) const RESPONDER_POLICY_REJECTION: Urn<'static> =
-	Urn::new("test", "event:lifecycle/responder-policy-rejection");
+	tightbeam::urn!("test", "event:lifecycle/responder-policy-rejection");
 pub(crate) const SHUTDOWN_WITH_ADVERTISES_REASON: Urn<'static> =
-	Urn::new("test", "event:lifecycle/shutdown-with-advertises-reason");
+	tightbeam::urn!("test", "event:lifecycle/shutdown-with-advertises-reason");
 pub(crate) const STREAM_ABOVE_WATERMARK_DRAINING: Urn<'static> =
-	Urn::new("test", "event:lifecycle/stream-above-watermark-draining");
+	tightbeam::urn!("test", "event:lifecycle/stream-above-watermark-draining");
 pub(crate) const STREAM_AT_WATERMARK_ECHOED: Urn<'static> =
-	Urn::new("test", "event:lifecycle/stream-at-watermark-echoed");
+	tightbeam::urn!("test", "event:lifecycle/stream-at-watermark-echoed");
 
 tb_assert_spec! {
 	pub MuxGoAwayDrainSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(1)),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
@@ -126,7 +126,6 @@ tb_assert_spec! {
 	pub MuxShutdownReasonSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(2)),
 			(SHUTDOWN_WITH_ADVERTISES_REASON, exactly!(2), equals!(true))
@@ -168,7 +167,6 @@ tb_assert_spec! {
 	pub MuxPeerReasonSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_RECV, exactly!(2)),
 			(PEER_REASON_SURFACES_ON_HANDLE, exactly!(2), equals!(true))
@@ -225,7 +223,6 @@ tb_assert_spec! {
 	pub MuxRekeyHeadroomSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_SENT, exactly!(4)),
 			(events::MUX_EMIT_DRAINING, exactly!(4)),
@@ -259,7 +256,6 @@ tb_assert_spec! {
 	pub MuxCancelBudgetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_CANCEL_BUDGET, exactly!(1)),
 			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::EnhanceYourCalm))),
@@ -317,7 +313,6 @@ tb_assert_spec! {
 	pub MuxPeerGoAwaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_GOAWAY_RECV, exactly!(1), equals!(u32::from(GoAwayReason::Shutdown))),
 			(events::MUX_EMIT_DRAINING, exactly!(1)),
@@ -376,7 +371,6 @@ tb_assert_spec! {
 	pub MuxProtocolViolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(1)),
 			(events::MUX_GOAWAY_SENT, exactly!(1), equals!(u32::from(GoAwayReason::ProtocolError))),
@@ -423,20 +417,9 @@ tb_scenario! {
 }
 
 /// V0 frame with V2-only field: mux router must reject.
-fn version_incompatible_frame_der() -> Result<Vec<u8>, TightBeamError> {
-	let mut metadata = Metadata::default();
-	metadata.priority = Some(MessagePriority::Standard);
-
-	let frame = Frame {
-		version: Version::V0,
-		metadata,
-		message: Vec::new(),
-		integrity: None,
-		nonrepudiation: None,
-	};
-
-	let der = frame.to_der()?;
-	Ok(der)
+fn version_incompatible_frame_der() -> Vec<u8> {
+	let frame = TestFrame::prioritized();
+	TestFrame::forge_version(&frame, &frame, Version::V0)
 }
 
 async fn violation_answered_with_goaway(
@@ -457,7 +440,6 @@ tb_assert_spec! {
 	pub MuxGrammarViolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::MUX_PROTOCOL_ERROR, exactly!(4)),
 			(OFFENDER_ANSWERED_WITH_GOAWAY, exactly!(4), equals!(true))
@@ -479,7 +461,7 @@ tb_scenario! {
 				// Open without a message (requests must carry one)
 				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, Vec::new())?.into(),
 				// Open whose frame claims fields its version forbids
-				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, version_incompatible_frame_der()?)?.into(),
+				MuxOpenPackage::new(1, true, MuxStreamKind::Unary, version_incompatible_frame_der())?.into(),
 			];
 
 			for offender in offenders {
@@ -496,7 +478,6 @@ tb_assert_spec! {
 	pub MuxConnectionDropSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(EMIT_FAILS_CONNECTION_CLOSED, exactly!(1), equals!(true))
 		]

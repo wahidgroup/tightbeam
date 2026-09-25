@@ -10,8 +10,8 @@ use std::io::Write;
 
 use crate::policy::TransitStatus;
 use crate::testing::assertions::AssertionLabel;
-use crate::testing::fdr::config::AcceptanceSet;
-use crate::testing::specs::csp::{intern, Event, Process, State, TransitionRelation};
+use crate::testing::fdr::verdict::AcceptanceSet;
+use crate::testing::specs::csp::{intern, Event, Observation, Process, State, TransitionRelation};
 use crate::trace::ConsumedTrace;
 
 /// State labels used in FDR trace analysis
@@ -50,6 +50,11 @@ pub enum TraceProcessMode {
 }
 
 /// Extension trait for ConsumedTrace with FDR analysis
+///
+/// Each method reads the trace alone. Layer 1 grades what the scenario body
+/// returned, in [`ScenarioConfig::verify`].
+///
+/// [`ScenarioConfig::verify`]: crate::testing::ScenarioConfig::verify
 pub trait FdrTraceExt {
 	/// Check if CSP trace is valid
 	fn csp_valid(&self) -> bool;
@@ -58,13 +63,13 @@ pub trait FdrTraceExt {
 	fn terminated_in_valid_state(&self) -> bool;
 
 	/// Get acceptance set after current trace
-	fn acceptance_at(&self, state_label: &str) -> Option<AcceptanceSet>;
+	fn acceptance_at(&self, state_label: impl AsRef<str>) -> Option<AcceptanceSet>;
 
 	/// Check if process can refuse event after state
-	fn can_refuse_after(&self, state_label: &str, event_label: &str) -> bool;
+	fn can_refuse_after(&self, state_label: impl AsRef<str>, event_label: impl AsRef<str>) -> bool;
 
 	/// Count assertion by label (convenience)
-	fn assertion_count(&self, label: &str) -> usize;
+	fn assertion_count(&self, label: impl AsRef<str>) -> usize;
 
 	/// Project trace to observable events only
 	#[cfg(feature = "instrument")]
@@ -97,52 +102,33 @@ pub trait FdrTraceExt {
 
 impl FdrTraceExt for ConsumedTrace {
 	fn csp_valid(&self) -> bool {
-		// Trace is valid if:
-		// 1. No transport errors occurred
-		// 2. Gate decision was reached (Accept or Reject)
-		// 3. If accepted, handler executed (evidenced by assertions)
-		if self.error.is_some() {
-			return false;
-		}
-
-		// Must have a gate decision (part of the protocol)
-		if self.gate_decision.is_none() {
-			return false;
-		}
-
-		// If gate accepted, we expect handler evidence (assertions or response)
+		// A gate that accepted should have something to show for it. A run
+		// with no gate decision took no gate, so there is nothing to test.
 		if matches!(self.gate_decision, Some(TransitStatus::Ok))
 			&& self.assertions.is_empty()
 			&& self.response.is_none()
 		{
-			return false; // Handler should have done something
+			return false;
 		}
 
 		true
 	}
 
 	fn terminated_in_valid_state(&self) -> bool {
-		// Check if execution completed successfully in a terminal state:
-		// 1. No errors
-		// 2. Gate decision reached
-		// 3. For accepted requests: response generated or terminal assertions present
-		if self.error.is_some() {
-			return false;
-		}
-
 		match self.gate_decision {
-			Some(TransitStatus::Ok) => {
-				// Ok path: should have response or assertions (indicating handler execution)
-				self.response.is_some() || !self.assertions.is_empty()
-			}
-			Some(TransitStatus::Unknown) | None => false, // No decision = incomplete execution
-			// Every other status is a rejection; rejection paths are
-			// terminal by definition
+			// Accepted, so the handler should have run.
+			Some(TransitStatus::Ok) => self.response.is_some() || !self.assertions.is_empty(),
+			// A gate that reached no decision did not terminate.
+			Some(TransitStatus::Unknown) => false,
+			// Every other status is a rejection, which is terminal.
 			Some(_) => true,
+			// No gate was taken, so the gate has nothing to say about it.
+			None => true,
 		}
 	}
 
-	fn acceptance_at(&self, state_label: &str) -> Option<AcceptanceSet> {
+	fn acceptance_at(&self, state_label: impl AsRef<str>) -> Option<AcceptanceSet> {
+		let state_label = state_label.as_ref();
 		// Compute acceptance set based on trace structure at given state
 		// State labels in ConsumedTrace context:
 		// - "initial": before gate
@@ -176,7 +162,9 @@ impl FdrTraceExt for ConsumedTrace {
 		Some(acceptance)
 	}
 
-	fn can_refuse_after(&self, state_label: &str, event_label: &str) -> bool {
+	fn can_refuse_after(&self, state_label: impl AsRef<str>, event_label: impl AsRef<str>) -> bool {
+		let state_label = state_label.as_ref();
+		let event_label = event_label.as_ref();
 		// Event can be refused if it's not in the acceptance set at that state
 		if let Some(acceptance) = self.acceptance_at(state_label) {
 			// Check if the event label matches any in the acceptance set
@@ -187,7 +175,8 @@ impl FdrTraceExt for ConsumedTrace {
 		}
 	}
 
-	fn assertion_count(&self, label: &str) -> usize {
+	fn assertion_count(&self, label: impl AsRef<str>) -> usize {
+		let label = label.as_ref();
 		self.assertions
 			.iter()
 			.filter(|a| matches!(&a.label, AssertionLabel::Custom(l) if l.as_ref() == label))
@@ -415,6 +404,8 @@ impl FdrTraceExt for ConsumedTrace {
 
 		Process {
 			name: "TraceProcess",
+			observation: Observation::RecordedTrace,
+			requires_progress: false,
 			initial: s_initial,
 			states,
 			terminal,

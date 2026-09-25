@@ -20,10 +20,11 @@ use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{create_v0_tightbeam, ClientEnv, SetupEnv};
+use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::policy::PolicyConfig;
+use tightbeam::transport::policy::CollectorGateConfig;
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{
 	ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient, TransportError, TransportFailure,
@@ -37,11 +38,12 @@ use crate::common::security::{pinning_trust_store, random_signing_key, test_cert
 use crate::transport::support::bind_mutual_listener;
 
 pub(crate) const ALLOW_LIST_ADMITS_THE_PEER: Urn<'static> =
-	Urn::new("test", "event:peer-list/allow-list-admits-the-peer");
-pub(crate) const DENY_LIST_BARS_THE_DOOR: Urn<'static> = Urn::new("test", "event:peer-list/deny-list-bars-the-door");
-pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = Urn::new("test", "event:peer-list/handler-never-invoked");
+	tightbeam::urn!("test", "event:peer-list/allow-list-admits-the-peer");
+pub(crate) const DENY_LIST_BARS_THE_DOOR: Urn<'static> =
+	tightbeam::urn!("test", "event:peer-list/deny-list-bars-the-door");
+pub(crate) const HANDLER_NEVER_INVOKED: Urn<'static> = tightbeam::urn!("test", "event:peer-list/handler-never-invoked");
 
-/// Mutual-auth doorman fixture: server materials, the client identity
+/// A mutual-auth doorman fixture: the server materials, the client identity
 /// the gate lists, and whether any frame got past the door.
 struct DoormanContext {
 	materials: ServerMaterials,
@@ -70,8 +72,8 @@ impl DoormanContext {
 	}
 }
 
-/// Echo server with a peer-list door gate ahead of the handler; verdicts
-/// audit into `trace`.
+/// An echo server with a peer-list door gate ahead of the handler. The gate
+/// verdicts audit into `trace`.
 async fn start_doorman_server(
 	ctx: &Arc<DoormanContext>,
 	gate: PeerListGate,
@@ -101,7 +103,7 @@ async fn start_doorman_server(
 	Ok((handle, addr))
 }
 
-/// Pool dialing with the client identity the gate lists.
+/// Builds a pool that dials with the client identity the gate lists.
 fn doorman_pool(
 	ctx: &DoormanContext,
 	trace: &TraceCollector,
@@ -115,21 +117,21 @@ fn doorman_pool(
 		max_connections: 1,
 		mux_offer: Some(Arc::new(TransportOffer::mux(1))),
 	};
+
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
 			.with_trust_store(trust_store)
-			.with_client_identity(identity, client_provider)?
+			.with_client_identity(ClientIdentity::from_spec(identity, client_provider)?)
 			.with_trace(trace.share())
 			.build(),
 	);
-
 	Ok(pool)
 }
 
-/// One knock on the door: emit a frame and report whether it echoed.
+/// Knocks once on the door: emits a frame and reports whether it echoed.
 async fn knock(lease: &mut PooledClient<TokioListener>) -> Result<bool, TightBeamError> {
-	let frame = create_v0_tightbeam(Some("door-knock"), None);
+	let frame = TestFrame::v0(Some("door-knock"), None);
 	let reply = lease.emit(frame.to_owned(), None).await?;
 	Ok(reply == Some(frame))
 }
@@ -138,7 +140,6 @@ tb_assert_spec! {
 	pub PeerDenyListSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_REJECT, exactly!(1)),
@@ -164,7 +165,7 @@ tb_scenario! {
 			let pool = doorman_pool(&ctx, &trace)?;
 			let mut lease = pool.connect(addr).await?;
 
-			let outcome = lease.emit(create_v0_tightbeam(Some("door-knock"), None), None).await;
+			let outcome = lease.emit(TestFrame::v0(Some("door-knock"), None), None).await;
 			trace.event_with(
 				DENY_LIST_BARS_THE_DOOR,
 				&[],
@@ -184,7 +185,6 @@ tb_assert_spec! {
 	pub PeerAllowListSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::GATE_ACCEPT, exactly!(1)),

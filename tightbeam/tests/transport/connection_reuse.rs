@@ -17,11 +17,12 @@
 
 use std::sync::Arc;
 
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const CLIENT_CONNECT: Urn<'static> = Urn::new("test", "event:connection-reuse/client-connect");
-pub(crate) const RECEIVE_RESPONSE: Urn<'static> = Urn::new("test", "event:connection-reuse/receive-response");
-pub(crate) const SEND_MESSAGE: Urn<'static> = Urn::new("test", "event:connection-reuse/send-message");
+pub(crate) const CLIENT_CONNECT: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/client-connect");
+pub(crate) const RECEIVE_RESPONSE: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/receive-response");
+pub(crate) const SEND_MESSAGE: Urn<'static> = tightbeam::urn!("test", "event:connection-reuse/send-message");
 
 use tightbeam::{
 	colony::servlet::ServletConfig,
@@ -36,7 +37,6 @@ use tightbeam::{
 #[cfg(feature = "x509")]
 use tightbeam::{
 	crypto::{
-		hash::Sha3_256,
 		key::SigningKeySpec,
 		policy::Secp256k1Policy,
 		sign::ecdsa::Secp256k1,
@@ -113,7 +113,7 @@ const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KE
 fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let server_cert = Certificate::try_from(SERVER_CERT)?;
 	Ok(Arc::new(
-		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(server_cert)?
 			.build(),
 	))
@@ -145,7 +145,6 @@ tb_assert_spec! {
 	pub ConnectionReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(CLIENT_CONNECT, exactly!(1)),
 			(SEND_MESSAGE, exactly!(3)),
@@ -172,13 +171,13 @@ tb_scenario! {
 				}
 			}
 
-			let servlet_task = EchoServlet::start(Arc::new(trace.share()), None).await?;
-			let addr = servlet_task.addr();
+			let servlet_task = EchoServlet::start(Arc::new(trace.share()), ServletConfig::default()).await?;
+			let addr = servlet_task.addr().to_owned();
 
 			trace.event(CLIENT_CONNECT)?;
 
 			// Send 3 messages using the same client (connection keep-alive)
-			let client_builder = ClientBuilder::<TokioListener>::builder().build();
+			let client_builder = ClientBuilder::<TokioListener>::builder().allow_cleartext().build();
 			let mut client = client_builder.connect(addr).await?;
 			for i in 1..=3 {
 				trace.event(SEND_MESSAGE)?;
@@ -231,8 +230,8 @@ tb_scenario! {
 				.with_config(Arc::new(()))
 				.build();
 
-			let servlet_task = TlsEchoServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
-			let addr = servlet_task.addr();
+			let servlet_task = TlsEchoServlet::start(Arc::new(trace.share()), servlet_conf).await?;
+			let addr = servlet_task.addr().to_owned();
 
 			trace.event(CLIENT_CONNECT)?;
 
@@ -240,11 +239,12 @@ tb_scenario! {
 			let key = CLIENT_KEY.to_provider::<Secp256k1>()?;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
-				.with_client_identity(CLIENT_CERT, key)?
+				.with_client_identity(ClientIdentity::from_spec(CLIENT_CERT, key)?)
 				.build();
-			let mut client = builder.connect(addr).await?;
 
-			// Send 3 messages using the same TLS client (no re-handshake, session reuse)
+			// Send 3 messages using the same TLS client
+			// (no re-handshake, session reuse)
+			let mut client = builder.connect(addr).await?;
 			for i in 1..=3 {
 				trace.event(SEND_MESSAGE)?;
 

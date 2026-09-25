@@ -39,13 +39,14 @@ use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::server;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::{create_v0_tightbeam, ClientEnv, SetupEnv, TestMessage};
+use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame, TestMessage};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::MUX_APPLICATION_CODE_FLOOR;
 use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, MuxSettings, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
+use tightbeam::transport::state::ClientIdentity;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 use tightbeam::utils::marker::MaybeSendFuture;
@@ -61,40 +62,43 @@ use crate::transport::support::{await_receipt_rotation, bind_mutual_listener};
 use tightbeam::instrumentation::events;
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const CREDITS_BOUND_THE_DRAWS: Urn<'static> = Urn::new("test", "event:paywall/credits-bound-the-draws");
-pub(crate) const CUTOFF_CLOSES_THE_WINDOW: Urn<'static> = Urn::new("test", "event:paywall/cutoff-closes-the-window");
-pub(crate) const HOUSE_NEVER_PAYS: Urn<'static> = Urn::new("test", "event:paywall/house-never-pays");
+pub(crate) const CREDITS_BOUND_THE_DRAWS: Urn<'static> =
+	tightbeam::urn!("test", "event:paywall/credits-bound-the-draws");
+pub(crate) const CUTOFF_CLOSES_THE_WINDOW: Urn<'static> =
+	tightbeam::urn!("test", "event:paywall/cutoff-closes-the-window");
+pub(crate) const HOUSE_NEVER_PAYS: Urn<'static> = tightbeam::urn!("test", "event:paywall/house-never-pays");
 pub(crate) const HOUSE_SEES_ROTATED_RECEIPT: Urn<'static> =
-	Urn::new("test", "event:paywall/house-sees-rotated-receipt");
+	tightbeam::urn!("test", "event:paywall/house-sees-rotated-receipt");
 pub(crate) const GAMBLER_LOSES_EVERY_TICKET: Urn<'static> =
-	Urn::new("test", "event:paywall/gambler-loses-every-ticket");
-pub(crate) const LEDGER_BALANCE_EXACT: Urn<'static> = Urn::new("test", "event:paywall/ledger-balance-exact");
-pub(crate) const LEDGER_RUNS_DRY: Urn<'static> = Urn::new("test", "event:paywall/ledger-runs-dry");
+	tightbeam::urn!("test", "event:paywall/gambler-loses-every-ticket");
+pub(crate) const LEDGER_BALANCE_EXACT: Urn<'static> = tightbeam::urn!("test", "event:paywall/ledger-balance-exact");
+pub(crate) const LEDGER_RUNS_DRY: Urn<'static> = tightbeam::urn!("test", "event:paywall/ledger-runs-dry");
 pub(crate) const INVOICE_SETTLES_BEFORE_SERVICE: Urn<'static> =
-	Urn::new("test", "event:paywall/invoice-settles-before-service");
-pub(crate) const TALLY_NO_CUTOFF: Urn<'static> = Urn::new("test", "event:paywall/tally-no-cutoff");
-pub(crate) const TALLY_NO_LOSSES: Urn<'static> = Urn::new("test", "event:paywall/tally-no-losses");
-pub(crate) const TALLY_WINS_MATCH: Urn<'static> = Urn::new("test", "event:paywall/tally-wins-match");
-pub(crate) const TOPUP_ROTATES_RECEIPT: Urn<'static> = Urn::new("test", "event:paywall/topup-rotates-receipt");
-pub(crate) const UNPAID_CLIENT_LOCKED_OUT: Urn<'static> = Urn::new("test", "event:paywall/unpaid-client-locked-out");
+	tightbeam::urn!("test", "event:paywall/invoice-settles-before-service");
+pub(crate) const TALLY_NO_CUTOFF: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-no-cutoff");
+pub(crate) const TALLY_NO_LOSSES: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-no-losses");
+pub(crate) const TALLY_WINS_MATCH: Urn<'static> = tightbeam::urn!("test", "event:paywall/tally-wins-match");
+pub(crate) const TOPUP_ROTATES_RECEIPT: Urn<'static> = tightbeam::urn!("test", "event:paywall/topup-rotates-receipt");
+pub(crate) const UNPAID_CLIENT_LOCKED_OUT: Urn<'static> =
+	tightbeam::urn!("test", "event:paywall/unpaid-client-locked-out");
 
-/// Invoice the house binds into every budget-bearing receipt.
+/// The invoice the house binds into every budget-bearing receipt.
 const LOTTERY_INVOICE: &[u8] = b"lottery-invoice-one-credit-per-draw";
 
-/// Payment preimage a paying client countersigns the invoice with.
+/// The payment preimage a paying client countersigns the invoice with.
 const LOTTERY_PAYMENT: &[u8] = b"lottery-payment-preimage";
 
-/// Application code for an unpaid or short-paid invoice.
+/// The application code for an unpaid or short-paid invoice.
 const INVOICE_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 40;
 
-/// Application code a broke client refuses a renewal invoice with.
+/// The application code a broke client refuses a renewal invoice with.
 const WALLET_EMPTY_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 41;
 
 /// The pick every gambler plays.
 const LUCKY_NUMBER: &str = "123";
 
-/// Client-to-server credits a paid invoice buys: with one-credit tickets,
-/// exactly the number of draws.
+/// The client-to-server credits a paid invoice buys. With one-credit
+/// tickets, that is exactly the number of draws.
 const DRAW_CREDITS: u64 = 10;
 
 /// The client-view settings the lottery negotiation lands on: both
@@ -108,17 +112,18 @@ fn lottery_settings() -> MuxSettings {
 	settings
 }
 
-/// Draws served against the initial invoice before the budget watermark
-/// opens a renewal (top-up invoice) for the rest: the same public
-/// watermark math the mux enforces, not a hand-copied reserve formula.
+/// The draws served against the initial invoice before the budget watermark
+/// opens a renewal, which is a top-up invoice, for the rest. The value comes
+/// from the same public watermark math the mux enforces rather than from a
+/// copied reserve formula.
 fn prepaid_draws() -> u64 {
 	lottery_settings().usable_send_budget().unwrap_or_default()
 }
 
-/// Announcement for a draw against an empty ledger account.
+/// The announcement for a draw against an empty ledger account.
 const ACCOUNT_EMPTY: &str = "account-empty";
 
-/// Draws spent on the first connection of the reconnect scenario.
+/// The draws spent on the first connection of the reconnect scenario.
 const OPENING_DRAWS: u64 = 3;
 
 /// How the house rigs each draw against the client's pick.
@@ -132,7 +137,8 @@ enum DrawRig {
 
 impl DrawRig {
 	/// The number the house announces for `pick`.
-	fn outcome(self, pick: &str) -> String {
+	fn outcome(self, pick: impl AsRef<str>) -> String {
+		let pick = pick.as_ref();
 		match self {
 			Self::AlwaysWin => pick.to_owned(),
 			Self::HouseAlwaysWins => format!("house-keeps-{pick}"),
@@ -146,7 +152,7 @@ fn lottery_offer() -> Option<TransportOffer> {
 	Some(offer)
 }
 
-/// Offer for ledger-metered sessions: session budgets stay generous so
+/// The offer for ledger-metered sessions. Session budgets stay generous, so
 /// the durable account ledger is the only meter in play.
 fn ledger_offer() -> Option<TransportOffer> {
 	let budgets = MuxBudgets { client_to_server: 4096, server_to_client: 4096 };
@@ -154,7 +160,7 @@ fn ledger_offer() -> Option<TransportOffer> {
 	Some(offer)
 }
 
-/// Invoices every session and every renewal; an unpaid or short-paid
+/// Invoices every session and every renewal. An unpaid or short-paid
 /// invoice fails closed with [`INVOICE_REFUSAL_CODE`].
 struct LotteryHouse {
 	invoice: OctetString,
@@ -248,8 +254,8 @@ impl PaywallContext {
 	}
 }
 
-/// Lottery service behind the paywall: decodes the ticket's pick and
-/// announces the rigged outcome.
+/// The lottery service behind the paywall, which decodes the ticket's pick
+/// and announces the rigged outcome.
 async fn start_lottery_server(
 	ctx: &PaywallContext,
 	rig: DrawRig,
@@ -264,9 +270,9 @@ async fn start_lottery_server(
 			with_transport_authorizer: [ Arc::clone(&authorizer) ]
 		},
 		handle: move |ticket: Frame| async move {
-			let pick: TestMessage = decode(&ticket.message)?;
+			let pick: TestMessage = decode(ticket.message())?;
 			let announced = rig.outcome(&pick.content);
-			Ok(Some(create_v0_tightbeam(Some(&announced), None)))
+			Ok(Some(TestFrame::v0(Some(&announced), None)))
 		}
 	};
 
@@ -274,8 +280,8 @@ async fn start_lottery_server(
 }
 
 /// The house's account book: remaining draw credits keyed by the
-/// authenticated client public key. Outlives every connection, so a
-/// reconnecting gambler resumes the balance a lost connection left behind.
+/// authenticated client public key. The book outlives every connection, so
+/// a reconnecting gambler resumes the balance a lost connection left behind.
 #[derive(Default)]
 struct CreditLedger {
 	accounts: Mutex<HashMap<Vec<u8>, u64>>,
@@ -285,7 +291,9 @@ impl CreditLedger {
 	/// The house's announcement for one ticket: a rigged outcome while
 	/// the account holds credit (debiting one), [`ACCOUNT_EMPTY`] after.
 	/// The first ticket from a public key deposits the opening balance.
-	fn announce(&self, account: &[u8], rig: DrawRig, pick: &str) -> String {
+	fn announce(&self, account: impl AsRef<[u8]>, rig: DrawRig, pick: impl AsRef<str>) -> String {
+		let account = account.as_ref();
+		let pick = pick.as_ref();
 		let mut accounts = self.lock();
 		let balance = accounts.entry(account.to_vec()).or_insert(DRAW_CREDITS);
 		match balance {
@@ -329,9 +337,9 @@ async fn start_ledger_lottery_server(
 				let account = session
 					.peer_public_key()
 					.ok_or_else(|| expectation_failure("mutual handshake left no client public key"))?;
-				let pick: TestMessage = decode(&ticket.message)?;
+				let pick: TestMessage = decode(ticket.message())?;
 				let announced = ledger.announce(account, rig, &pick.content);
-				Ok(Some(create_v0_tightbeam(Some(&announced), None)))
+				Ok(Some(TestFrame::v0(Some(&announced), None)))
 			}
 		}
 	};
@@ -339,7 +347,8 @@ async fn start_ledger_lottery_server(
 	Ok((handle, addr))
 }
 
-/// Pool for a gambler; `wallet` is how (or whether) invoices get paid.
+/// Builds the pool for a gambler. `wallet` decides how, or whether, invoices
+/// get paid.
 fn lottery_pool(
 	ctx: &PaywallContext,
 	trace: &TraceCollector,
@@ -348,7 +357,8 @@ fn lottery_pool(
 	pool_with_offer(ctx, trace, wallet, lottery_offer())
 }
 
-/// Pool over the generous ledger offer: same paywall, account metering.
+/// Builds a pool over the generous ledger offer, with the same paywall and
+/// account metering.
 fn ledger_pool(
 	ctx: &PaywallContext,
 	trace: &TraceCollector,
@@ -371,7 +381,7 @@ fn pool_with_offer(
 	let mut builder = ConnectionPool::<TokioListener>::builder()
 		.with_config(config)
 		.with_trust_store(trust_store)
-		.with_client_identity(identity, client_provider)?
+		.with_client_identity(ClientIdentity::from_spec(identity, client_provider)?)
 		.with_trace(trace.share());
 
 	if let Some(wallet) = wallet {
@@ -382,15 +392,16 @@ fn pool_with_offer(
 	Ok(pool)
 }
 
-/// One draw: emit the pick as a ticket, decode the announced number, and
-/// report whether the gambler won.
-async fn draw(lease: &mut PooledClient<TokioListener>, pick: &str) -> Result<String, TightBeamError> {
-	let ticket = create_v0_tightbeam(Some(pick), None);
+/// Plays one draw: it emits the pick as a ticket, decodes the announced
+/// number, and reports whether the gambler won.
+async fn draw(lease: &mut PooledClient<TokioListener>, pick: impl AsRef<str>) -> Result<String, TightBeamError> {
+	let pick = pick.as_ref();
+	let ticket = TestFrame::v0(Some(pick), None);
 	let Some(announcement) = lease.emit(ticket, None).await? else {
 		return Err(expectation_failure("draw produced no announcement"));
 	};
 
-	let announced: TestMessage = decode(&announcement.message)?;
+	let announced: TestMessage = decode(announcement.message())?;
 	Ok(announced.content)
 }
 
@@ -401,7 +412,7 @@ struct DrawTally {
 	cutoff: Option<TightBeamError>,
 }
 
-/// Record each clause of an all-win tally as its own event, so a
+/// Records each clause of an all-win tally as its own event, so a
 /// failing spec names the exact clause instead of one compound boolean.
 fn record_winning_tally(trace: &TraceCollector, tally: &DrawTally, expected_wins: u64) -> Result<(), TightBeamError> {
 	trace.event_with(TALLY_WINS_MATCH, &[], tally.wins == expected_wins)?;
@@ -410,7 +421,7 @@ fn record_winning_tally(trace: &TraceCollector, tally: &DrawTally, expected_wins
 	Ok(())
 }
 
-/// Draw until the house cuts the gambler off or `attempts` runs out.
+/// Draws until the house cuts the gambler off or `attempts` runs out.
 async fn draw_until_cutoff(lease: &mut PooledClient<TokioListener>, attempts: u64) -> DrawTally {
 	let mut tally = DrawTally::default();
 	for _ in 0..attempts {
@@ -427,8 +438,9 @@ async fn draw_until_cutoff(lease: &mut PooledClient<TokioListener>, attempts: u6
 	tally
 }
 
-/// Draw until the house announces an empty account or `attempts` runs
-/// out: wins tallied, plus whether the broke announcement arrived.
+/// Draws until the house announces an empty account or `attempts` runs
+/// out, and returns the wins tallied and whether the broke announcement
+/// arrived.
 async fn draw_until_broke(
 	lease: &mut PooledClient<TokioListener>,
 	attempts: u64,
@@ -451,7 +463,6 @@ tb_assert_spec! {
 	pub PaywallPaidDrawsSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, at_least!(1)),
@@ -464,7 +475,7 @@ tb_assert_spec! {
 	}
 }
 
-// Paid invoice unlocks the lottery; on the always-win rig every announced
+// A paid invoice unlocks the lottery. On the always-win rig, every announced
 // number repeats the gambler's pick, well inside the prepaid credits.
 tb_scenario! {
 	name: paywall_paid_invoice_unlocks_winning_draws,
@@ -490,7 +501,6 @@ tb_assert_spec! {
 	pub PaywallUnpaidLockoutSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(0)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(0)),
@@ -499,8 +509,8 @@ tb_assert_spec! {
 	}
 }
 
-// No wallet, no service: a client without a receipt approver cannot
-// countersign the invoice, so the handshake fails closed before any draw.
+// A client without a receipt approver cannot countersign the invoice, so
+// the handshake fails closed before any draw.
 tb_scenario! {
 	name: paywall_unpaid_invoice_locks_service,
 	spec: PaywallUnpaidLockoutSpec,
@@ -520,7 +530,6 @@ tb_assert_spec! {
 	pub PaywallExhaustedCreditsSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
@@ -574,7 +583,6 @@ tb_assert_spec! {
 	pub PaywallTopupSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
@@ -623,7 +631,6 @@ tb_assert_spec! {
 	pub PaywallLedgerReconnectSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(2)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(2)),
@@ -660,8 +667,8 @@ tb_scenario! {
 			let opening = draw_until_cutoff(&mut lease, OPENING_DRAWS).await;
 			record_winning_tally(&trace, &opening, OPENING_DRAWS)?;
 
-			// The lost connection: lease and pool drop, tearing the
-			// transport down with credits still on the account.
+			// The connection is lost: the lease and the pool drop and tear
+			// the transport down with credits still on the account.
 			drop(lease);
 			drop(first_pool);
 
@@ -669,8 +676,9 @@ tb_scenario! {
 			let mut lease = second_pool.connect(addr).await?;
 			trace.event_with(INVOICE_SETTLES_BEFORE_SERVICE, &[], lease.session_receipt().is_some())?;
 
-			// Same public key, same account: exactly the unspent balance
-			// remains, and the draw after it finds the account empty.
+			// The same public key reaches the same account, so exactly the
+			// unspent balance remains, and the draw after it finds the
+			// account empty.
 			let (resumed_wins, went_broke) = draw_until_broke(&mut lease, DRAW_CREDITS).await?;
 			trace.event_with(LEDGER_BALANCE_EXACT, &[], resumed_wins == DRAW_CREDITS - OPENING_DRAWS)?;
 			trace.event_with(LEDGER_RUNS_DRY, &[], went_broke)?;
@@ -692,7 +700,8 @@ impl HouseBooks {
 		Self { paywall: PaywallContext::generate(), receipts_seen: Mutex::new(HashSet::new()) }
 	}
 
-	fn note_receipt(&self, transcript: Vec<u8>) {
+	fn note_receipt(&self, transcript: impl Into<Vec<u8>>) {
+		let transcript: Vec<u8> = transcript.into();
 		self.lock().insert(transcript);
 	}
 
@@ -712,7 +721,6 @@ tb_assert_spec! {
 	pub PaywallLiveReceiptSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(events::POOL_DIAL, exactly!(1)),
 			(events::SESSION_RECEIPT_SETTLED, exactly!(1)),
@@ -753,9 +761,9 @@ tb_scenario! {
 							.ok_or_else(|| expectation_failure("metered session carried no receipt"))?;
 						books.note_receipt(receipt.receipt().transcript_hash.to_der()?);
 
-						let pick: TestMessage = decode(&ticket.message)?;
+						let pick: TestMessage = decode(ticket.message())?;
 						let announced = DrawRig::AlwaysWin.outcome(&pick.content);
-						Ok(Some(create_v0_tightbeam(Some(&announced), None)))
+						Ok(Some(TestFrame::v0(Some(&announced), None)))
 					}
 				}
 			};
@@ -766,7 +774,7 @@ tb_scenario! {
 			let pool = lottery_pool(&ctx.paywall, &trace, Some(wallet))?;
 			let mut lease = pool.connect(addr).await?;
 
-			// Draws past the prepaid credits force a renewal; the extra
+			// Draws past the prepaid credits force a renewal. The extra
 			// tickets park until it settles and then carry epoch 1.
 			let tally = draw_until_cutoff(&mut lease, prepaid_draws() + 3).await;
 			record_winning_tally(&trace, &tally, prepaid_draws() + 3)?;

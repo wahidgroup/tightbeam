@@ -8,6 +8,5 @@ mod analysis;
 mod export;
 mod report;
 
-pub use analysis::{calculate_detection, calculate_severity, convert_occurrence};
 pub use export::FmeaArtifact;
-pub use report::{generate_fmea_report, FailureMode, FmeaConfig, FmeaReport, SeverityScale};
+pub use report::{FailureMode, FmeaConfig, FmeaReport, SeverityScale};

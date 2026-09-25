@@ -12,9 +12,9 @@
 //!
 //! ## Expected control
 //! The answer MUST travel in an `EnvelopedData` encrypted to the server
-//! certificate (RFC 5652 s6), never the cleartext wire. The server MUST
-//! decrypt it, verify the countersignature over the plaintext, settle,
-//! and retain the identical dual-signed receipt on both endpoints.
+//! certificate (RFC 5652 s6), which keeps it off the cleartext wire. The
+//! server MUST decrypt it, verify the countersignature over the plaintext,
+//! settle, and retain the identical dual-signed receipt on both endpoints.
 //!
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data
@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tightbeam::asn1::OctetString;
+use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
@@ -45,15 +46,15 @@ use crate::common::security::{
 };
 
 pub(crate) const RECEIPTS_MATCH_ACROSS_ENDPOINTS: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/receipts-match-across-endpoints");
+	tightbeam::urn!("test", "event:receipt-confidentiality/receipts-match-across-endpoints");
 pub(crate) const RESPONSE_CONFIDENTIAL_ON_WIRE: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/response-confidential-on-wire");
+	tightbeam::urn!("test", "event:receipt-confidentiality/response-confidential-on-wire");
 pub(crate) const SERVER_RECOVERS_PLAINTEXT_ANSWER: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/server-recovers-plaintext-answer");
+	tightbeam::urn!("test", "event:receipt-confidentiality/server-recovers-plaintext-answer");
 pub(crate) const SETTLED_SESSION_ACTIVATES: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/settled-session-activates");
+	tightbeam::urn!("test", "event:receipt-confidentiality/settled-session-activates");
 pub(crate) const SETTLED_WITH_PLAINTEXT_ONCE: Urn<'static> =
-	Urn::new("test", "event:receipt-confidentiality/settled-with-plaintext-once");
+	tightbeam::urn!("test", "event:receipt-confidentiality/settled-with-plaintext-once");
 
 const CHALLENGE: &[u8] = b"cms-conf-invoice";
 const RESPONSE: &[u8] = b"cms-conf-preimage";
@@ -99,7 +100,6 @@ tb_assert_spec! {
 	pub ReceiptConfidentialitySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RESPONSE_CONFIDENTIAL_ON_WIRE, exactly!(1), equals!(true)),
 			(SETTLED_WITH_PLAINTEXT_ONCE, exactly!(1), equals!(true)),
@@ -112,8 +112,8 @@ tb_assert_spec! {
 
 // The settlement answer must survive the CMS EnvelopedData round trip
 // (client encrypts to the server certificate, server decrypts, verifies
-// the countersignature over the plaintext, and settles) while never
-// appearing in the cleartext client Finished bytes.
+// the countersignature over the plaintext, and settles) while staying
+// out of the cleartext client Finished bytes.
 tb_scenario! {
 	name: cms_response_confidential_round_trip,
 	spec: ReceiptConfidentialitySpec,
@@ -135,7 +135,7 @@ tb_scenario! {
 
 			// Full budget-bearing handshake including the receipt
 			// acknowledgement.
-			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
+			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
 			let server_finished = server.build_server_finished().await?;
@@ -145,10 +145,10 @@ tb_scenario! {
 			server.process_client_finished(&client_finished)?;
 			server.process_receipt_ack(&client_finished).await?;
 
-			// The plaintext answer must never appear in the cleartext
+			// The plaintext answer MUST stay out of the cleartext
 			// client Finished bytes: it travels in an EnvelopedData encrypted
 			// to the server certificate.
-			let response_leaked = contains_window(&client_finished, RESPONSE);
+			let response_leaked = contains_window(client_finished.to_der()?, RESPONSE);
 			trace.event_with(
 				RESPONSE_CONFIDENTIAL_ON_WIRE,
 				&[],
@@ -184,7 +184,7 @@ tb_scenario! {
 				receipts_match,
 			)?;
 
-			let activated = server.complete().is_ok();
+			let activated = server.take_established().is_ok();
 			trace.event_with(SETTLED_SESSION_ACTIVATES, &[], activated)?;
 
 			Ok::<(), TightBeamError>(())

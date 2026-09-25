@@ -64,7 +64,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use super::ClusterConfig;
-use crate::colony::common::canonical_bytes;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::Certificate;
 use crate::policy::{SessionContext, TransitStatus};
@@ -126,7 +125,7 @@ impl StaticExportList {
 	/// Build an allowlist from the given servlet type URNs.
 	pub fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
 		let types: Vec<Urn<'static>> = types.into_iter().collect();
-		let keys = types.iter().map(canonical_bytes).collect();
+		let keys = types.iter().map(Urn::canonical_bytes).collect();
 		Self { types, keys }
 	}
 }
@@ -152,7 +151,7 @@ struct ExportMembership {
 impl ExportMembership {
 	fn new(types: impl IntoIterator<Item = Urn<'static>>) -> Self {
 		let types: Vec<Urn<'static>> = types.into_iter().collect();
-		let keys = types.iter().map(canonical_bytes).collect();
+		let keys = types.iter().map(Urn::canonical_bytes).collect();
 		Self { types, keys }
 	}
 }
@@ -184,7 +183,7 @@ impl DynamicExportList {
 	pub fn insert(&self, target: Urn<'static>) {
 		if let Ok(mut guard) = self.membership.write() {
 			if !guard.types.iter().any(|allowed| allowed == &target) {
-				guard.keys.insert(canonical_bytes(&target));
+				guard.keys.insert(target.canonical_bytes());
 				guard.types.push(target);
 			}
 		}
@@ -200,7 +199,7 @@ impl DynamicExportList {
 			let mut dropped = Vec::new();
 			guard.types.retain(|allowed| {
 				if allowed == target {
-					dropped.push(canonical_bytes(allowed));
+					dropped.push(allowed.canonical_bytes());
 					return false;
 				}
 
@@ -447,18 +446,19 @@ impl<'a> TrustPlanes<'a> {
 
 	/// Classify `cert` against the two planes.
 	///
-	/// Peer membership wins: a certificate in both stores is
-	/// [`Party::Peer`]. Anonymous (`None`) and unknown certificates are
-	/// [`Party::Untrusted`].
+	/// Peer membership wins and is public-key identity: a caller whose
+	/// key is enrolled in `peer_trust` is [`Party::Peer`], even when the
+	/// presented certificate object lives only in `hive_trust`. Anonymous
+	/// (`None`) and unknown certificates are [`Party::Untrusted`].
 	#[must_use]
 	pub fn classify(&self, cert: Option<&Certificate>) -> Party {
 		let Some(cert) = cert else {
 			return Party::Untrusted;
 		};
-		if self.peer.is_some_and(|trust| trust.is_trusted(cert)) {
+		if self.peer.is_some_and(|trust| trust.trusts_public_key(cert)) {
 			return Party::Peer;
 		}
-		if self.hive.is_some_and(|trust| trust.is_trusted(cert)) {
+		if self.hive.is_some_and(|trust| trust.trusts_public_key(cert)) {
 			return Party::FirstParty;
 		}
 
@@ -524,31 +524,31 @@ pub(crate) fn export_verdict(
 mod tests {
 	use super::*;
 	use crate::colony::common::ColonyNamespace;
-	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::x509::store::{CertificateTrustBuilder, TrustBuilder};
-	use crate::testing::{create_test_certificate, create_test_signing_key};
+	use crate::testing::{TestCertificate, TestKey};
 	use std::sync::Arc;
 
-	fn servlet(name: &str) -> Urn<'static> {
+	fn servlet(name: &(impl AsRef<str> + ?Sized)) -> Urn<'static> {
+		let name = name.as_ref();
 		ColonyNamespace::default()
 			.servlet(name)
 			.expect("test names satisfy the mint grammar")
 	}
 
 	fn test_certificate() -> Certificate {
-		create_test_certificate(&create_test_signing_key())
+		TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 	}
 
 	/// A certificate under a distinct key, so a trust store built from
 	/// [`test_certificate`] does not hold it.
 	fn foreign_certificate() -> Certificate {
 		let key = k256::ecdsa::SigningKey::from_bytes(&[2u8; 32].into()).expect("distinct test key");
-		create_test_certificate(&key)
+		TestCertificate::self_signed(&key)
 	}
 
 	fn trust_of(cert: &Certificate) -> Arc<dyn CertificateTrust> {
-		let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(cert.clone())
 			.expect("test certificates satisfy the trust builder")
 			.build();
@@ -592,6 +592,19 @@ mod tests {
 		let peer = trust_of(&cert);
 		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
 		assert_eq!(planes.classify(Some(&cert)), Party::Peer);
+	}
+
+	#[test]
+	fn peer_wins_when_same_key_has_distinct_certificates() {
+		let key = TestKey::insecure_fixed_signing();
+		let hive_cert = TestCertificate::with_cn_and_uri_sans(&key, "hive", &["urn:tightbeam:colony:test"]);
+		let peer_cert = TestCertificate::with_cn_and_uri_sans(&key, "peer", &["urn:tightbeam:colony:test"]);
+
+		let hive = trust_of(&hive_cert);
+		let peer = trust_of(&peer_cert);
+		let planes = TrustPlanes::new(TrustPlaneStores { hive: Some(hive.as_ref()), peer: Some(peer.as_ref()) });
+		assert_eq!(planes.classify(Some(&hive_cert)), Party::Peer);
+		assert_eq!(planes.classify(Some(&peer_cert)), Party::Peer);
 	}
 
 	#[test]
@@ -747,8 +760,7 @@ mod tests {
 	fn dynamic_allowlist_mutation_visible_to_verdict_and_keys() {
 		let list = DynamicExportList::new([servlet("ping")]);
 		let ledger = servlet("ledger");
-		let ledger_key = canonical_bytes(&ledger);
-
+		let ledger_key = ledger.canonical_bytes();
 		assert_eq!(
 			export_verdict(
 				Some(&list),
@@ -793,8 +805,8 @@ mod tests {
 	#[test]
 	fn static_list_filters_slate_to_exported_keys() {
 		let exports = static_list([servlet("ping")]);
-		assert!(exports.allows_canonical(&canonical_bytes(&servlet("ping"))));
-		assert!(!exports.allows_canonical(&canonical_bytes(&servlet("ledger"))));
+		assert!(exports.allows_canonical(&servlet("ping").canonical_bytes()));
+		assert!(!exports.allows_canonical(&servlet("ledger").canonical_bytes()));
 	}
 
 	struct ContainsOnlyList(Urn<'static>);
@@ -808,8 +820,8 @@ mod tests {
 	#[test]
 	fn default_canonical_lookup_delegates_to_contains() {
 		let list = ContainsOnlyList(servlet("ping"));
-		assert!(list.allows_canonical(&canonical_bytes(&servlet("ping"))));
-		assert!(!list.allows_canonical(&canonical_bytes(&servlet("ledger"))));
+		assert!(list.allows_canonical(&servlet("ping").canonical_bytes()));
+		assert!(!list.allows_canonical(&servlet("ledger").canonical_bytes()));
 		assert!(!list.allows_canonical(&[0xFF]));
 	}
 

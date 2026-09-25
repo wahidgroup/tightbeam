@@ -11,12 +11,13 @@ use futures::Stream;
 
 use super::handle::CancelOnDrop;
 use super::shared::OpenSlot;
+use super::sink::RequestSink;
 use crate::der::Decode;
 use crate::transport::{TransportError, TransportResult};
 use crate::Frame;
 
 /// Chunk-level event the reader forwards to a [`StreamBody`].
-pub(super) enum BodyEvent {
+pub enum BodyEvent {
 	Chunk(Vec<u8>),
 	/// Clean `last`-flagged end of the body.
 	End,
@@ -29,9 +30,9 @@ pub(super) enum BodyEvent {
 /// `consumed` is the absolute chunk count the handler has drained,
 /// the reader's input to credit replenishment. Monotonic and
 /// idempotent like every ledger position in the credit design.
-pub(super) struct DrainNote {
-	pub(super) stream_id: u32,
-	pub(super) consumed: u64,
+pub struct DrainNote {
+	pub stream_id: u32,
+	pub consumed: u64,
 }
 
 /// Incremental stream body: a peer request under
@@ -63,9 +64,45 @@ pub struct StreamBody {
 }
 
 impl StreamBody {
+	/// Assemble a body and the forwarder that feeds it, for one streaming
+	/// request.
+	///
+	/// Channel capacity covers the grant window plus the `End` marker: the
+	/// reader clamps streaming grants to `consumed + window`, so a
+	/// conforming peer can never overrun the channel.
+	pub(crate) fn pair(
+		slot: Arc<OpenSlot>,
+		window: u64,
+		drained: mpsc::UnboundedSender<DrainNote>,
+	) -> (Self, ForwardedStream) {
+		let capacity = usize::try_from(window).unwrap_or(usize::MAX).saturating_add(1);
+		let (events, receiver) = mpsc::channel(capacity);
+
+		let body = Self { slot, events: receiver, drained, consumed: 0, finished: false, guard: None };
+		let forwarder = ForwardedStream { events, received: 0, limit: window, window };
+		(body, forwarder)
+	}
+
+	/// Feed every chunk of this body into `sink`, then close the sink so
+	/// its stream ends.
+	///
+	/// Consuming each chunk replenishes the peer's credit, so a slow
+	/// downstream parks the upstream (end-to-end backpressure).
+	///
+	/// # Errors
+	///
+	/// The first read or push failure, with the sink left unclosed.
+	pub(crate) async fn drain_into(mut self, mut sink: RequestSink) -> TransportResult<()> {
+		while let Some(chunk) = self.chunk().await? {
+			sink.push(&chunk).await?;
+		}
+
+		sink.close().await
+	}
+
 	/// Arm the drop guard: dropping this body before its terminal
 	/// event cancels the stream on both endpoints.
-	pub(super) fn arm_guard(&mut self, guard: CancelOnDrop) {
+	pub fn arm_guard(&mut self, guard: CancelOnDrop) {
 		self.guard = Some(guard);
 	}
 
@@ -170,27 +207,9 @@ impl Stream for StreamBody {
 	}
 }
 
-/// Assemble a body/forwarder pair for one streaming request.
-///
-/// Channel capacity covers the grant window plus the `End` marker:
-/// the reader clamps streaming grants to `consumed + window`, so a
-/// conforming peer can never overrun the channel.
-pub(super) fn stream_body(
-	slot: Arc<OpenSlot>,
-	window: u64,
-	drained: mpsc::UnboundedSender<DrainNote>,
-) -> (StreamBody, ForwardedStream) {
-	let capacity = usize::try_from(window).unwrap_or(usize::MAX).saturating_add(1);
-	let (events, receiver) = mpsc::channel(capacity);
-
-	let body = StreamBody { slot, events: receiver, drained, consumed: 0, finished: false, guard: None };
-	let forwarder = ForwardedStream { events, received: 0, limit: window, window };
-	(body, forwarder)
-}
-
 /// Reader-side ledger of a streaming request: chunks forward into
 /// the body channel instead of a reassembly buffer.
-pub(super) struct ForwardedStream {
+pub struct ForwardedStream {
 	events: mpsc::Sender<BodyEvent>,
 	/// Chunks accepted so far
 	received: u64,
@@ -203,19 +222,19 @@ pub(super) struct ForwardedStream {
 
 impl ForwardedStream {
 	/// Current `(limit, window)` pair for grant arithmetic.
-	pub(super) fn limits(&self) -> (u64, u64) {
+	pub fn limits(&self) -> (u64, u64) {
 		(self.limit, self.window)
 	}
 
 	/// Raise the granted limit. Grants are absolute and monotonic
 	/// ([RFC 9113 § 6.9.1](https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1)),
 	/// so a stale lower value is ignored.
-	pub(super) fn raise_limit(&mut self, limit: u64) {
+	pub fn raise_limit(&mut self, limit: u64) {
 		self.limit = self.limit.max(limit);
 	}
 
 	/// Account one arriving chunk against the granted limit.
-	pub(super) fn accept_chunk(&mut self) -> bool {
+	pub fn accept_chunk(&mut self) -> bool {
 		if self.received >= self.limit {
 			return false;
 		}
@@ -229,7 +248,7 @@ impl ForwardedStream {
 	/// conforming peer (grants are clamped to channel capacity), so
 	/// overflow reports as a failure like a disconnect. A dropped
 	/// (Closed) body is also failure: consumed credit stays consumed.
-	pub(super) fn forward(&mut self, event: BodyEvent) -> bool {
+	pub fn forward(&mut self, event: BodyEvent) -> bool {
 		self.events.try_send(event).is_ok()
 	}
 
@@ -238,7 +257,8 @@ impl ForwardedStream {
 	/// trailers, empty bodies) consume their credit but forward no
 	/// chunk event: the consumer sees data or the end, never a
 	/// phantom empty chunk.
-	pub(super) fn accept_and_forward(&mut self, payload: &[u8]) -> bool {
+	pub fn accept_and_forward(&mut self, payload: impl AsRef<[u8]>) -> bool {
+		let payload = payload.as_ref();
 		if !self.accept_chunk() {
 			return false;
 		}
@@ -251,7 +271,7 @@ impl ForwardedStream {
 
 	/// Whether the consuming body has been dropped (refused at the
 	/// cap or abandoned by its handler).
-	pub(super) fn severed(&self) -> bool {
+	pub fn severed(&self) -> bool {
 		self.events.is_closed()
 	}
 }
@@ -260,10 +280,10 @@ impl ForwardedStream {
 mod tests {
 	use core::task::Poll;
 
-	use super::super::testing::{body_fixture, noop_cx, poll_chunk, poll_now};
+	use super::super::testing::{body_fixture, noop_cx, poll_now};
 	use super::*;
 	use crate::der::Encode;
-	use crate::testing::create_v0_tightbeam;
+	use crate::testing::TestFrame;
 
 	#[test]
 	fn test_stream_body_yields_chunks_and_reports_drain() {
@@ -272,11 +292,11 @@ mod tests {
 		assert!(forwarder.forward(BodyEvent::Chunk(vec![1, 2])));
 		assert!(forwarder.forward(BodyEvent::End));
 
-		let first = poll_chunk(&mut body);
+		let first = body.poll_chunk_now();
 		assert!(matches!(first, Poll::Ready(Ok(Some(chunk))) if chunk == [1, 2]));
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 		// Terminal state is sticky
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 
 		let note = notes.try_recv();
 		assert!(matches!(note, Ok(DrainNote { stream_id: 7, consumed: 1 })));
@@ -289,7 +309,7 @@ mod tests {
 		let (mut body, forwarder, _notes) = body_fixture(7, 4);
 		drop(forwarder);
 
-		let severed = poll_chunk(&mut body);
+		let severed = body.poll_chunk_now();
 		assert!(matches!(severed, Poll::Ready(Err(TransportError::ConnectionClosed))));
 	}
 
@@ -298,9 +318,9 @@ mod tests {
 		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
 		assert!(forwarder.forward(BodyEvent::Failed(TransportError::Draining)));
 
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Err(TransportError::Draining))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Err(TransportError::Draining))));
 		// Terminal state is sticky
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 	}
 
 	#[test]
@@ -358,7 +378,7 @@ mod tests {
 
 	#[test]
 	fn test_into_frame_decodes_collected_chunks() -> TransportResult<()> {
-		let frame = create_v0_tightbeam(Some("collected"), None);
+		let frame = TestFrame::v0(Some("collected"), None);
 		let payload = frame.to_der()?;
 		let middle = payload.len() / 2;
 
@@ -388,10 +408,9 @@ mod tests {
 	#[test]
 	fn test_forwarded_stream_skips_empty_payload_events() {
 		let (mut body, mut forwarder, _notes) = body_fixture(7, 4);
-		assert!(forwarder.accept_and_forward(&[]));
+		assert!(forwarder.accept_and_forward([]));
 		assert!(forwarder.forward(BodyEvent::End));
-
-		assert!(matches!(poll_chunk(&mut body), Poll::Ready(Ok(None))));
+		assert!(matches!(body.poll_chunk_now(), Poll::Ready(Ok(None))));
 		assert!(matches!(forwarder.limits(), (4, 4)));
 	}
 }

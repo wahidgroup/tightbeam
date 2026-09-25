@@ -10,8 +10,7 @@
 //!    through a frame-aware TCP relay.
 //! 2. The relay tampers with the client-to-server direction after the
 //!    handshake: either drops or duplicates the first encrypted envelope.
-//! 3. The server decrypts subsequent envelopes under the exact-next counter
-//!    discipline.
+//! 3. The server decrypts subsequent envelopes under the exact-next counter discipline.
 //!
 //! ## Expected control
 //! Exact-next counter nonces (RFC 9846 § 5.3) MUST fail closed:
@@ -42,10 +41,11 @@ use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::config::ScenarioConfig;
-use tightbeam::testing::{create_v0_tightbeam, SetupEnv};
+use tightbeam::testing::{SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::protocols::{AsyncReadStream, AsyncWriteStream, SplittableStream};
 use tightbeam::transport::tcp::r#async::{TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader};
+use tightbeam::transport::TransportLimits;
 use tightbeam::transport::{
 	EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure, TransportWriter,
 };
@@ -56,9 +56,9 @@ use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{accept_handshaken_split, await_ok, bind_encrypted_listener, connect_handshaken_split};
 
 pub(crate) const DELETED_ENVELOPE_DETECTED: Urn<'static> =
-	Urn::new("test", "event:envelope-tamper/deleted-envelope-detected");
+	tightbeam::urn!("test", "event:envelope-tamper/deleted-envelope-detected");
 pub(crate) const REPLAYED_ENVELOPE_DETECTED: Urn<'static> =
-	Urn::new("test", "event:envelope-tamper/replayed-envelope-detected");
+	tightbeam::urn!("test", "event:envelope-tamper/replayed-envelope-detected");
 
 /// ECIES sends exactly two cleartext client frames (ClientHello,
 /// ClientKeyExchange), so the first encrypted envelope is frame 3.
@@ -72,7 +72,6 @@ tb_assert_spec! {
 	pub EnvelopeDeleteSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(DELETED_ENVELOPE_DETECTED, exactly!(1u32))
 		]
@@ -136,7 +135,6 @@ tb_assert_spec! {
 	pub EnvelopeReplaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(REPLAYED_ENVELOPE_DETECTED, exactly!(1u32))
 		]
@@ -245,7 +243,7 @@ fn tamper_repeats(rule: TamperRule, index: usize) -> usize {
 
 async fn forward_tampered_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf, rule: TamperRule) {
 	let mut index = 0usize;
-	while let Ok(frame) = reader.read_frame(None).await {
+	while let Ok(frame) = reader.read_frame(TransportLimits::default().max_envelope()).await {
 		index += 1;
 		for _ in 0..tamper_repeats(rule, index) {
 			if writer.write_frame(&frame).await.is_err() {
@@ -256,7 +254,7 @@ async fn forward_tampered_frames(mut reader: TokioReadHalf, mut writer: TokioWri
 }
 
 async fn forward_unchanged_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf) {
-	while let Ok(frame) = reader.read_frame(None).await {
+	while let Ok(frame) = reader.read_frame(TransportLimits::default().max_envelope()).await {
 		if writer.write_frame(&frame).await.is_err() {
 			return;
 		}
@@ -272,7 +270,7 @@ async fn write_plain_requests(
 	count: usize,
 ) -> Result<(), TightBeamError> {
 	for _ in 0..count {
-		let frame = create_v0_tightbeam(None, None);
+		let frame = TestFrame::v0(None, None);
 		let request = TransportEnvelope::new_request(frame);
 		writer.write_envelope(request).await?;
 	}

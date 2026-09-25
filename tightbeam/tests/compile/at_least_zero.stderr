@@ -1,0 +1,7 @@
+error: a lower bound of zero rejects nothing: leave the label out of the spec
+  --> tests/compile/at_least_zero.rs:14:15
+   |
+14 |             (SOME_KEY, at_least!(0))
+   |                        ^^^^^^^^^^^^
+   |
+   = note: this error originates in the macro `at_least` (in Nightly builds, run with -Z macro-backtrace for more info)

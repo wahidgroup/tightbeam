@@ -4,17 +4,15 @@
 //! used to validate X.509 certificates according to different trust models.
 
 use core::marker::PhantomData;
-use core::time::Duration;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::crypto::hash::Digest;
+use crate::crypto::hash::{Digest, U32};
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::utils::{ensure_signature_algorithm_consistency, validate_certificate_expiry};
+use crate::crypto::x509::utils::{CertificateExt, Fingerprint};
 use crate::crypto::x509::Certificate;
-use crate::der::asn1::GeneralizedTime;
 use crate::der::Encode;
 
 /// Trait for certificate validation strategies.
@@ -87,7 +85,7 @@ pub struct ExpiryValidator;
 impl CertificateValidation for ExpiryValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): validity-period check only.
-		validate_certificate_expiry(cert)
+		cert.validate_expiry()
 	}
 }
 
@@ -126,7 +124,7 @@ impl<const N: usize> CertificateValidation for PublicKeyPinning<N> {
 /// Generic over the digest algorithm and the number of pinned fingerprints.
 #[derive(Debug, Clone, Copy)]
 pub struct FingerprintPinning<D, const N: usize> {
-	allowed_fingerprints: [&'static [u8]; N],
+	allowed_fingerprints: [&'static [u8; 32]; N],
 	_digest: PhantomData<D>,
 }
 
@@ -137,21 +135,20 @@ where
 	/// Create a new fingerprint pinning validator with the given allowed fingerprints.
 	///
 	/// This is a const function, allowing creation in const contexts.
-	pub const fn new(fingerprints: [&'static [u8]; N]) -> Self {
+	pub const fn new(fingerprints: [&'static [u8; 32]; N]) -> Self {
 		Self { allowed_fingerprints: fingerprints, _digest: PhantomData }
 	}
 }
 
 impl<D, const N: usize> CertificateValidation for FingerprintPinning<D, N>
 where
-	D: Digest + Send + Sync,
+	D: Digest<OutputSize = U32> + Send + Sync,
 {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		let cert_der = cert.to_der()?;
-		let fingerprint = D::digest(&cert_der);
+		let fingerprint = Fingerprint::<D>::from_certificate(cert)?;
 		self.allowed_fingerprints
 			.iter()
-			.any(|fp| *fp == fingerprint.as_ref())
+			.any(|fp| fp.as_slice() == fingerprint.as_slice())
 			.then_some(())
 			.ok_or(CertificateValidationError::CertificateNotPinned)
 	}
@@ -159,11 +156,11 @@ where
 
 /// Certificate fingerprint denylist validator with const-generic array.
 ///
-/// This validator is const-constructible, making it suitable for use in
+/// This validator is const-constructible, making it suitable for
 /// static configurations.
 #[derive(Debug, Clone, Copy)]
 pub struct FingerprintDenylist<D, const N: usize> {
-	denied_fingerprints: [&'static [u8]; N],
+	denied_fingerprints: [&'static [u8; 32]; N],
 	_digest: PhantomData<D>,
 }
 
@@ -172,20 +169,21 @@ where
 	D: Digest,
 {
 	/// Create a new fingerprint denylist validator with the given fingerprints.
-	pub const fn new(fingerprints: [&'static [u8]; N]) -> Self {
+	pub const fn new(fingerprints: [&'static [u8; 32]; N]) -> Self {
 		Self { denied_fingerprints: fingerprints, _digest: PhantomData }
 	}
 }
 
 impl<D, const N: usize> CertificateValidation for FingerprintDenylist<D, N>
 where
-	D: Digest + Send + Sync,
+	D: Digest<OutputSize = U32> + Send + Sync,
 {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		let cert_der = cert.to_der()?;
-		let fingerprint = D::digest(&cert_der);
-
-		let is_denied = self.denied_fingerprints.iter().any(|fp| *fp == fingerprint.as_ref());
+		let fingerprint = Fingerprint::<D>::from_certificate(cert)?;
+		let is_denied = self
+			.denied_fingerprints
+			.iter()
+			.any(|fp| fp.as_slice() == fingerprint.as_slice());
 		if is_denied {
 			Err(CertificateValidationError::CertificateDenied)
 		} else {
@@ -202,7 +200,7 @@ where
 #[cfg(feature = "std")]
 #[derive(Clone)]
 pub struct RuntimeCertificatePinning<D> {
-	fingerprints: Vec<Vec<u8>>,
+	fingerprints: Vec<Fingerprint<D>>,
 	_digest: PhantomData<D>,
 }
 
@@ -214,44 +212,37 @@ where
 	/// Create a new runtime certificate pinning validator from certificates.
 	///
 	/// Computes fingerprints for each certificate and stores them for validation.
-	pub fn from_certificates(certs: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError> {
+	pub fn from_certificates(certs: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError>
+	where
+		D: Digest<OutputSize = U32>,
+	{
 		let fingerprints = certs
 			.into_iter()
-			.map(|cert| cert.to_der().map(|der| D::digest(&der).to_vec()))
+			.map(|cert| Fingerprint::<D>::from_certificate(&cert))
 			.collect::<Result<Vec<_>, _>>()?;
 
 		Ok(Self { fingerprints, _digest: PhantomData })
 	}
 
-	/// Create validator directly from pre-computed fingerprints.
+	/// Create a validator from fingerprints already minted by
+	/// [`Fingerprint::from_certificate`].
 	///
-	/// Accepts any iterator of byte slices; each fingerprint is copied
-	/// into an owned [`Vec<u8>`] for later comparison. This method
-	/// allows creating a validator without cloning certificates, as
-	/// fingerprints can be computed once and passed directly.
-	pub fn from_fingerprints<I, S>(fingerprints: I) -> Self
-	where
-		I: IntoIterator<Item = S>,
-		S: AsRef<[u8]>,
-	{
-		Self {
-			fingerprints: fingerprints.into_iter().map(|fp| fp.as_ref().to_vec()).collect(),
-			_digest: PhantomData,
-		}
+	/// [`Fingerprint::from_certificate`]: crate::crypto::x509::utils::Fingerprint::from_certificate
+	pub fn from_fingerprints(fingerprints: impl IntoIterator<Item = Fingerprint<D>>) -> Self {
+		Self { fingerprints: fingerprints.into_iter().collect(), _digest: PhantomData }
 	}
 }
 
 #[cfg(feature = "std")]
 impl<D> CertificateValidation for RuntimeCertificatePinning<D>
 where
-	D: Digest + Send + Sync,
+	D: Digest<OutputSize = U32> + Send + Sync,
 {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		let cert_der = cert.to_der()?;
-		let fingerprint = D::digest(&cert_der);
+		let fingerprint = Fingerprint::<D>::from_certificate(cert)?;
 		self.fingerprints
 			.iter()
-			.any(|fp| fp.as_slice() == fingerprint.as_ref())
+			.any(|fp| fp.as_slice() == fingerprint.as_slice())
 			.then_some(())
 			.ok_or(CertificateValidationError::CertificateNotPinned)
 	}
@@ -291,7 +282,7 @@ impl DirectTrustValidator {
 impl CertificateValidation for DirectTrustValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): the certificate must be within its validity period.
-		validate_certificate_expiry(cert)?;
+		cert.validate_expiry()?;
 
 		// RFC 5280 §6.1.1: direct trust - the presented certificate must itself
 		// be a configured trust anchor (no path building is performed here).
@@ -317,19 +308,7 @@ impl SignatureVerification for DirectTrustValidator {
 		public_key_der: &[u8],
 		policy: &dyn VerificationPolicy,
 	) -> Result<(), CertificateValidationError> {
-		// RFC 5280 §6.1.3(a)(2): notBefore <= current time <= notAfter.
-		let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
-		let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
-		let now_duration = GeneralizedTime::from_unix_duration(Duration::from_secs(curr_time))
-			.map_err(|_| CertificateValidationError::InvalidTimestamp)?
-			.to_unix_duration();
-
-		if now_duration < not_before {
-			return Err(CertificateValidationError::NotYetValid);
-		}
-		if now_duration > not_after {
-			return Err(CertificateValidationError::Expired);
-		}
+		cert.validate_expiry_at(curr_time)?;
 
 		// RFC 5280 §4.1.2.7: the subjectPublicKeyInfo must carry a key.
 		let subject_public_key = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
@@ -344,7 +323,7 @@ impl SignatureVerification for DirectTrustValidator {
 		}
 
 		// RFC 5280 §4.1.1.2: signatureAlgorithm must match tbsCertificate.signature.
-		ensure_signature_algorithm_consistency(cert)?;
+		cert.ensure_signature_algorithm_consistency()?;
 
 		// RFC 5280 §6.1.3(a)(1): verify the signature using the issuer's key.
 		let message = cert.tbs_certificate.to_der()?;
@@ -386,11 +365,11 @@ impl CertificateValidation for ChainValidator {
 mod tests {
 	use crate::crypto::x509::error::CertificateValidationError;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use crate::testing::create_expired_test_certificate;
+	use crate::testing::TestCertificate;
 
 	#[test]
 	fn test_expiry_validator_rejects_expired_cert() {
-		let expired_cert = create_expired_test_certificate();
+		let expired_cert = TestCertificate::expired();
 		let validator = ExpiryValidator;
 
 		// This certificate expired on August 17, 2019, so it should be rejected
@@ -416,10 +395,10 @@ mod tests {
 		use crate::crypto::x509::Certificate;
 		use crate::oids::SIGNER_ECDSA_WITH_SHA256;
 		use crate::spki::EncodePublicKey;
-		use crate::testing::utils::{create_test_certificate, create_test_signing_key};
+		use crate::testing::fixtures::{TestCertificate, TestKey};
 
 		fn test_cert() -> Certificate {
-			create_test_certificate(&create_test_signing_key())
+			TestCertificate::self_signed(&TestKey::insecure_fixed_signing())
 		}
 
 		/// Run the out-of-the-box policy over `cert`, supplying the issuer key
@@ -440,7 +419,7 @@ mod tests {
 		#[test]
 		fn rejects_non_anchor() -> Result<(), Box<dyn core::error::Error>> {
 			let validator = DirectTrustValidator::default().with_trust_chain(vec![test_cert()]);
-			let other = create_test_certificate(&SigningKey::from_bytes(&[7u8; 32].into())?);
+			let other = TestCertificate::self_signed(&SigningKey::from_bytes(&[7u8; 32].into())?);
 			assert!(matches!(
 				validator.evaluate(&other),
 				Err(CertificateValidationError::CertificateNotTrusted)
@@ -462,8 +441,8 @@ mod tests {
 
 		#[test]
 		fn rejects_algorithm_mismatch() {
-			let key = create_test_signing_key();
-			let mut cert = create_test_certificate(&key);
+			let key = TestKey::insecure_fixed_signing();
+			let mut cert = TestCertificate::self_signed(&key);
 			// signatureAlgorithm disagrees with tbsCertificate.signature (RFC 5280 §4.1.1.2).
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
 			assert!(matches!(
@@ -474,8 +453,8 @@ mod tests {
 
 		#[test]
 		fn rejects_foreign_algorithm() {
-			let key = create_test_signing_key();
-			let mut cert = create_test_certificate(&key);
+			let key = TestKey::insecure_fixed_signing();
+			let mut cert = TestCertificate::self_signed(&key);
 			// Consistent identifiers, but an algorithm the out-of-the-box policy refuses.
 			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
 			cert.tbs_certificate.signature.oid = SIGNER_ECDSA_WITH_SHA256;

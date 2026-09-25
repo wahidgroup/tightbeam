@@ -48,11 +48,12 @@ impl RoverTelemetry {
 	/// Create telemetry with typed instrument
 	pub fn new(
 		instrument: RoverInstrument,
-		data: Vec<u8>,
+		data: impl Into<Vec<u8>>,
 		mission_time_ms: u64,
 		battery_percent: u8,
 		temperature_c: i8,
 	) -> Self {
+		let data: Vec<u8> = data.into();
 		Self {
 			instrument: instrument as u8,
 			data,
@@ -237,7 +238,8 @@ pub struct MessageChainState {
 }
 
 impl MessageChainState {
-	pub fn new(node_id: String) -> Self {
+	pub fn new(node_id: impl Into<String>) -> Self {
+		let node_id: String = node_id.into();
 		Self { last_hash: [0u8; 32], sequence: 0, node_id }
 	}
 
@@ -256,7 +258,7 @@ impl MessageChainState {
 	/// 2. Frame's previous_frame hash matches our last_hash (if sequence > 0)
 	pub fn validate_frame(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		// Check sequence order
-		if frame.metadata.order != self.sequence + 1 {
+		if frame.metadata().order() != self.sequence + 1 {
 			return Ok(false);
 		}
 
@@ -266,7 +268,7 @@ impl MessageChainState {
 		}
 
 		// Verify previous_frame hash matches
-		if let Some(ref digest_info) = frame.metadata.previous_frame {
+		if let Some(digest_info) = frame.metadata().previous_frame() {
 			let expected_hash = digest_info.digest.as_bytes();
 			Ok(expected_hash == self.last_hash.as_slice())
 		} else {
@@ -284,7 +286,7 @@ impl MessageChainState {
 
 		// Copy hash into our buffer
 		self.last_hash.copy_from_slice(&frame_hash);
-		self.sequence = frame.metadata.order;
+		self.sequence = frame.metadata().order();
 
 		Ok(())
 	}

@@ -7,26 +7,26 @@
 
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::{ScenarioConfig, SetupEnv};
+use tightbeam::testing::{Expect, Layer, ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const EATS: Urn<'static> = Urn::new("test", "event:diners/eats");
-pub(crate) const GETS_UP: Urn<'static> = Urn::new("test", "event:diners/gets-up");
-pub(crate) const PICKS_LEFT: Urn<'static> = Urn::new("test", "event:diners/picks-left");
-pub(crate) const PICKS_RIGHT: Urn<'static> = Urn::new("test", "event:diners/picks-right");
-pub(crate) const PUTS_DOWN_LEFT: Urn<'static> = Urn::new("test", "event:diners/puts-down-left");
-pub(crate) const PUTS_DOWN_RIGHT: Urn<'static> = Urn::new("test", "event:diners/puts-down-right");
-pub(crate) const SITS: Urn<'static> = Urn::new("test", "event:diners/sits");
-pub(crate) const THINKS: Urn<'static> = Urn::new("test", "event:diners/thinks");
+pub(crate) const EATS: Urn<'static> = tightbeam::urn!("test", "event:diners/eats");
+pub(crate) const GETS_UP: Urn<'static> = tightbeam::urn!("test", "event:diners/gets-up");
+pub(crate) const PICKS_LEFT: Urn<'static> = tightbeam::urn!("test", "event:diners/picks-left");
+pub(crate) const PICKS_RIGHT: Urn<'static> = tightbeam::urn!("test", "event:diners/picks-right");
+pub(crate) const PUTS_DOWN_LEFT: Urn<'static> = tightbeam::urn!("test", "event:diners/puts-down-left");
+pub(crate) const PUTS_DOWN_RIGHT: Urn<'static> = tightbeam::urn!("test", "event:diners/puts-down-right");
+pub(crate) const SITS: Urn<'static> = tightbeam::urn!("test", "event:diners/sits");
+pub(crate) const THINKS: Urn<'static> = tightbeam::urn!("test", "event:diners/thinks");
 
 fn build_fdr_config(
-	specs: Vec<Process>,
+	specs: impl IntoIterator<Item = Process>,
 	seeds: u32,
 	max_depth: usize,
 	max_internal_run: usize,
 	timeout_ms: u64,
-	expect_failure: bool,
 ) -> FdrConfig {
+	let specs: Vec<Process> = specs.into_iter().collect();
 	FdrConfig {
 		seeds,
 		max_depth,
@@ -34,7 +34,6 @@ fn build_fdr_config(
 		timeout_ms,
 		specs,
 		fail_fast: true,
-		expect_failure,
 		..Default::default()
 	}
 }
@@ -226,7 +225,6 @@ tightbeam::tb_assert_spec! {
 	pub ValidPhilosopherSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(THINKS, tightbeam::exactly!(1)),
 			(SITS, tightbeam::exactly!(1)),
@@ -250,7 +248,6 @@ tightbeam::tb_scenario! {
 			16,
 			8,
 			500,
-			false,
 		))
 		.build(),
 	environment Bare {
@@ -277,7 +274,6 @@ tightbeam::tb_assert_spec! {
 	pub DeadlockPhilosopherSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(THINKS, tightbeam::exactly!(2)),
 			(SITS, tightbeam::exactly!(2)),
@@ -296,7 +292,6 @@ tightbeam::tb_scenario! {
 			10,
 			8,
 			2000,
-			false,
 		))
 		.build(),
 	environment Bare {
@@ -320,7 +315,6 @@ tightbeam::tb_assert_spec! {
 	pub DeadlockFreePhilosopherSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(THINKS, tightbeam::exactly!(2)),
 			(SITS, tightbeam::exactly!(2)),
@@ -344,7 +338,6 @@ tightbeam::tb_scenario! {
 			18,
 			8,
 			500,
-			false,
 		))
 		.build(),
 	environment Bare {
@@ -388,8 +381,8 @@ tightbeam::tb_scenario! {
 			16,
 			8,
 			500,
-			true,
 		))
+		.with_expect(Expect::Violation(Layer::Refinement))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {

@@ -2,21 +2,19 @@
 
 #![cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::instrumentation::TbInstrumentationConfig;
-use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{ScenarioConfig, SetupEnv, TestHooks};
 use tightbeam::trace::TraceConfig;
-use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet, TightBeamError};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
 use tightbeam::utils::urn::Urn;
 
-pub(crate) const PROCESS: Urn<'static> = Urn::new("test", "event:wcet/process");
+pub(crate) const PROCESS: Urn<'static> = tightbeam::urn!("test", "event:wcet/process");
 
 tb_process_spec! {
 	pub SimpleWcetProcess,
@@ -37,7 +35,6 @@ tb_assert_spec! {
 	pub SimpleWcetSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(PROCESS, exactly!(1))
 		]
@@ -45,7 +42,8 @@ tb_assert_spec! {
 }
 
 /// Helper to build FDR config for timing tests
-fn build_timing_fdr_config(specs: Vec<Process>) -> FdrConfig {
+fn build_timing_fdr_config(specs: impl IntoIterator<Item = Process>) -> FdrConfig {
+	let specs: Vec<Process> = specs.into_iter().collect();
 	FdrConfig {
 		seeds: 2,
 		max_depth: 8,
@@ -53,7 +51,6 @@ fn build_timing_fdr_config(specs: Vec<Process>) -> FdrConfig {
 		timeout_ms: 500,
 		specs,
 		fail_fast: true,
-		expect_failure: false,
 		..Default::default()
 	}
 }
@@ -79,24 +76,22 @@ tb_scenario! {
 			record_durations: true,
 			max_events: 1024,
 		}).into())
-		.with_hooks(TestHooks {
-			on_pass: Some(Arc::new(|result| {
+		.with_hooks(TestHooks::on_pass(|context| {
 				// Verify timing constraints exist on process
 				let process = SimpleWcetProcess::process();
 				let constraints = process
 					.timing_constraints
 					.as_ref()
-					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
+					.expect("the spec under test declares WCET constraints");
 
 				// Verify timing constraints against trace
-				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
+				let timing_result = constraints
+					.verify_with_process(context.trace(), Some(&process))
+					.expect("verifying a declared constraint against the recorded trace");
 				// Verify no violations (within constraint: 5ms < 10ms)
 				assert!(timing_result.passed, "Timing verification should pass for duration within constraint. Violations: {:?}", timing_result.wcet_violations);
 				assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected");
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -123,24 +118,22 @@ tb_scenario! {
 			record_durations: true,
 			max_events: 1024,
 		}).into())
-		.with_hooks(TestHooks {
-			on_pass: Some(Arc::new(|result| {
+		.with_hooks(TestHooks::on_pass(|context| {
 				// Verify timing constraints exist on process
 				let process = SimpleWcetProcess::process();
 				let constraints = process
 					.timing_constraints
 					.as_ref()
-					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
+					.expect("the spec under test declares WCET constraints");
 
 				// Verify timing constraints against trace
-				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
+				let timing_result = constraints
+					.verify_with_process(context.trace(), Some(&process))
+					.expect("verifying a declared constraint against the recorded trace");
 				// Verify no violations (at limit: 10ms == 10ms, should pass)
 				assert!(timing_result.passed, "Timing verification should pass for duration at constraint limit");
 				assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected at limit");
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
@@ -167,15 +160,16 @@ tb_scenario! {
 			record_durations: true,
 			max_events: 1024,
 		}).into())
-		.with_hooks(TestHooks {
-			on_pass: Some(Arc::new(|result| {
+		.with_hooks(TestHooks::on_pass(|context| {
 				let process = SimpleWcetProcess::process();
 				let constraints = process
 					.timing_constraints
 					.as_ref()
-					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
+					.expect("the spec under test declares WCET constraints");
 
-				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
+				let timing_result = constraints
+					.verify_with_process(context.trace(), Some(&process))
+					.expect("verifying a declared constraint against the recorded trace");
 				assert!(!timing_result.passed, "Timing verification should fail for duration exceeding constraint. Result: {timing_result:?}");
 				assert!(!timing_result.wcet_violations.is_empty(), "WCET violations should be detected");
 				assert_eq!(timing_result.wcet_violations.len(), 1, "Exactly one WCET violation expected");
@@ -184,10 +178,7 @@ tb_scenario! {
 				assert_eq!(violation.event.0, PROCESS.to_string());
 				assert_eq!(violation.wcet_ns, 10_000_000);
 				assert_eq!(violation.observed_ns, 15_000_000);
-				Ok(())
-			})),
-			on_fail: None,
-		})
+			}))
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {

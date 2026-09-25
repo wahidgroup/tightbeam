@@ -3,11 +3,16 @@
 //! `#[cfg(feature = "...")]` written inside a `macro_rules!` body is evaluated
 //! in the crate that *invokes* the macro, not in the crate that *defines* it.
 
+/// Emits the body when `std` is on, and nothing when it is not.
+///
+/// The only consumer is generated: `Errorizable` wraps the `source` method in
+/// this so a `no_std` build gets an impl without it.
+///
+/// A form whose whole result is the body wants [`__tb_require_std`] instead.
 #[cfg(feature = "std")]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_std {
-	({ $($body:tt)* }) => { { $($body)* } };
 	// Associated-item form: emits the tokens as-is (e.g. a method with a
 	// `self` receiver, which the `item` fragment cannot parse).
 	($($body:tt)*) => { $($body)* };
@@ -17,8 +22,29 @@ macro_rules! __tb_if_std {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_std {
-	({ $($body:tt)* }) => {{}};
 	($($body:tt)*) => {};
+}
+
+/// Emits the body when `std` is on, and refuses to compile when it is not.
+///
+/// A macro form whose whole result is the body has no correct empty expansion:
+/// a `server!` or `client! connect` arm that expanded to `()` would hand the
+/// consumer a listener that never listens.
+#[cfg(feature = "std")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_require_std {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "std"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_require_std {
+	($($body:tt)*) => {
+		::core::compile_error!("this macro form requires the `std` feature of tightbeam")
+	};
 }
 
 #[cfg(feature = "tokio")]
@@ -26,6 +52,7 @@ macro_rules! __tb_if_std {
 #[doc(hidden)]
 macro_rules! __tb_if_tokio {
 	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
 }
 
 #[cfg(not(feature = "tokio"))]
@@ -33,6 +60,164 @@ macro_rules! __tb_if_tokio {
 #[doc(hidden)]
 macro_rules! __tb_if_tokio {
 	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "testing-timing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_timing {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "testing-timing"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_timing {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "testing-schedulability")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_schedulability {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "testing-schedulability"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_schedulability {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "testing-fault")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_fault {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "testing-fault"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_fault {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "instrument")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_instrument {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "instrument"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_instrument {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+// Picks one of two statement sequences on the `testing-timing` feature.
+//
+// A select takes both halves in one call. Delegating only the positive half
+// and leaving a `#[cfg(not(...))]` twin behind emits both in a consumer.
+#[cfg(feature = "testing-timing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_testing_timing {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($enabled)* };
+}
+
+#[cfg(not(feature = "testing-timing"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_testing_timing {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($disabled)* };
+}
+
+// Picks one of two item sequences on the `tokio` feature.
+//
+// A select takes both halves in one call. Delegating only the positive half
+// and leaving a `#[cfg(not(...))]` twin behind emits both in a consumer.
+#[cfg(feature = "tokio")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_tokio {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($enabled)* };
+}
+
+#[cfg(not(feature = "tokio"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_tokio {
+	({ $($enabled:tt)* } { $($disabled:tt)* }) => { $($disabled)* };
+}
+
+// Picks one of two statement sequences on the `testing-fault` feature.
+//
+// Unlike the `__tb_if_*` helpers this emits the chosen tokens bare rather than
+// wrapped in a block, because both alternatives are `let` bindings the
+// surrounding code goes on to use, and one of them borrows a temporary whose
+// lifetime a block would end.
+#[cfg(feature = "testing-fault")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_testing_fault {
+	({ $($with_fault:tt)* } { $($without_fault:tt)* }) => { $($with_fault)* };
+}
+
+#[cfg(not(feature = "testing-fault"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_testing_fault {
+	({ $($with_fault:tt)* } { $($without_fault:tt)* }) => { $($without_fault)* };
+}
+
+// Harness-feature delegation for `tb_scenario!`. The generated scenario body
+// runs in the consumer's crate, where tightbeam's feature names do not exist,
+// so a `#[cfg(feature = "testing-csp")]` written into the expansion would
+// silently drop the verification it guards.
+#[cfg(feature = "testing-csp")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_csp {
+	({ $($body:tt)* }) => { { $($body)* } };
+	// Item form: an `impl` block cannot be produced by the expression form.
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "testing-csp"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_csp {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
+}
+
+#[cfg(feature = "testing-fdr")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_fdr {
+	({ $($body:tt)* }) => { { $($body)* } };
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(feature = "testing-fdr"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_testing_fdr {
+	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
 }
 
 #[cfg(feature = "builder")]
@@ -69,6 +254,7 @@ macro_rules! __tb_if_crypto {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_digest {
+	(else { $($absent:tt)* }) => {};
 	($($item:item)*) => { $($item)* };
 }
 
@@ -76,6 +262,7 @@ macro_rules! __tb_if_digest {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_digest {
+	(else { $($absent:tt)* }) => { $($absent)* };
 	($($item:item)*) => {};
 }
 
@@ -83,6 +270,7 @@ macro_rules! __tb_if_digest {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_aead {
+	(else { $($absent:tt)* }) => {};
 	($($item:item)*) => { $($item)* };
 }
 
@@ -90,6 +278,7 @@ macro_rules! __tb_if_aead {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_aead {
+	(else { $($absent:tt)* }) => { $($absent)* };
 	($($item:item)*) => {};
 }
 
@@ -97,6 +286,7 @@ macro_rules! __tb_if_aead {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_signature {
+	(else { $($absent:tt)* }) => {};
 	($($item:item)*) => { $($item)* };
 }
 
@@ -104,19 +294,58 @@ macro_rules! __tb_if_signature {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __tb_if_signature {
+	(else { $($absent:tt)* }) => { $($absent)* };
 	($($item:item)*) => {};
 }
 
-#[cfg(feature = "builder")]
+#[cfg(feature = "compress")]
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __tb_select_builder {
-	({ $($with_builder:tt)* } { $($without_builder:tt)* }) => { $($with_builder)* };
+macro_rules! __tb_if_compress {
+	(else { $($absent:tt)* }) => {};
+	($($item:item)*) => { $($item)* };
 }
 
-#[cfg(not(feature = "builder"))]
+#[cfg(not(feature = "compress"))]
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __tb_select_builder {
-	({ $($with_builder:tt)* } { $($without_builder:tt)* }) => { $($without_builder)* };
+macro_rules! __tb_if_compress {
+	(else { $($absent:tt)* }) => { $($absent)* };
+	($($item:item)*) => {};
+}
+
+/// Picks one of two `fn main` definitions on the `fuzzing` cfg.
+///
+/// The choice rides on an attribute rather than a `$crate` path, because a
+/// `$crate` path expands to a call and a call cannot put an item in the
+/// consumer's crate root. Emitting both halves makes the flag read in the
+/// crate AFL builds with `--cfg fuzzing`.
+///
+/// Each half MUST be exactly one item: the attribute binds to the first item
+/// it precedes.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_select_fuzzing {
+	({ $($under_fuzzing:tt)* } { $($smoke:tt)* }) => {
+		#[cfg(fuzzing)]
+		$($under_fuzzing)*
+
+		#[cfg(not(fuzzing))]
+		$($smoke)*
+	};
+}
+
+/// Emits the body when tightbeam compiles its own unit tests.
+#[cfg(test)]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_test {
+	($($body:tt)*) => { $($body)* };
+}
+
+#[cfg(not(test))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_test {
+	($($body:tt)*) => {};
 }

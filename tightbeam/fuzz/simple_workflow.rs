@@ -9,24 +9,22 @@
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
+use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::{ScenarioConfig, SetupEnv};
 use tightbeam::utils::urn::Urn;
-use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-const START: Urn<'static> = Urn::new("fuzz", "event:simple/start");
-const ACTION_A: Urn<'static> = Urn::new("fuzz", "event:simple/action-a");
-const ACTION_B: Urn<'static> = Urn::new("fuzz", "event:simple/action-b");
-const DONE: Urn<'static> = Urn::new("fuzz", "event:simple/done");
+const START: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/start");
+const ACTION_A: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/action-a");
+const ACTION_B: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/action-b");
+const DONE: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/done");
 
 tb_assert_spec! {
 	pub SimpleFuzzSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(START, exactly!(1)),
-			(ACTION_A, at_least!(0)),
-			(ACTION_B, at_least!(0)),
 			(DONE, exactly!(1))
 		]
 	},
@@ -55,10 +53,11 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Oracle-guided fuzzing: interprets AFL input as event choices
-			trace.oracle().fuzz_from_bytes()?;
+			let oracle = trace.oracle();
+			oracle.fuzz_from_bytes()?;
 
 			// Make assertions based on execution trace
-			for event in trace.oracle().trace() {
+			for event in oracle.trace() {
 				trace.event(event)?;
 			}
 

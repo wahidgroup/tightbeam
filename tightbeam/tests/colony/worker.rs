@@ -9,8 +9,8 @@ use tightbeam::utils::urn::Urn;
 use tightbeam::Beamable;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, worker};
 
-pub(crate) const RELAY_START: Urn<'static> = Urn::new("test", "event:worker/relay-start");
-pub(crate) const RELAY_SUCCESS: Urn<'static> = Urn::new("test", "event:worker/relay-success");
+pub(crate) const RELAY_START: Urn<'static> = tightbeam::urn!("test", "event:worker/relay-start");
+pub(crate) const RELAY_SUCCESS: Urn<'static> = tightbeam::urn!("test", "event:worker/relay-success");
 
 // Test message types
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
@@ -55,7 +55,6 @@ tb_assert_spec! {
 	pub WorkerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RELAY_START, exactly!(1)),
 			(RELAY_SUCCESS, exactly!(1), equals!("DEFAULT_PONG"))
@@ -63,7 +62,6 @@ tb_assert_spec! {
 	},
 	V(2,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(RELAY_START, exactly!(1)),
 			(RELAY_SUCCESS, exactly!(1), equals!("CUSTOM_RESPONSE"))

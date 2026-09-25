@@ -1,20 +1,17 @@
-//! Certificate trust store
+//! The certificate trust store.
 //!
-//! This module provides a trait-based abstraction for certificate trust
-//! verification, allowing custom implementations for different environments.
+//! [`CertificateTrust`] abstracts certificate trust verification, so each
+//! environment can supply its own implementation. [`CertificateTrustStore`] is
+//! the built-in store.
 
 use core::fmt::Debug;
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
+use crate::cms::signed_data::SignerIdentifier;
+use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
+use crate::crypto::x509::utils::compute_signer_identifier_from_der;
 use crate::crypto::x509::Certificate;
-
-#[cfg(feature = "std")]
-use crate::crypto::x509::utils::validate_certificate_expiry;
-#[cfg(feature = "std")]
 use crate::der::Encode;
 
 #[cfg(feature = "std")]
@@ -22,32 +19,32 @@ mod std_imports {
 	pub use std::collections::{HashMap, HashSet};
 	pub use std::sync::Arc;
 
-	pub use crate::cms::signed_data::SignerIdentifier;
-	pub use crate::crypto::hash::Digest;
-	pub use crate::crypto::hash::Sha3_256;
-	pub use crate::crypto::policy::VerificationPolicy;
+	pub use crate::crypto::hash::{Digest, Sha3_256, U32};
 	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
 	pub use crate::crypto::x509::name::Name;
-	pub use crate::crypto::x509::utils::{certificate_extension, ensure_signature_algorithm_consistency};
+	pub use crate::crypto::x509::utils::{CertificateExt, Fingerprint, Skid};
 	pub use crate::der::oid::AssociatedOid;
 }
 
 #[cfg(feature = "std")]
 use std_imports::*;
 
-/// Fingerprint type: SHA3-256 hash (32 bytes)
-pub type Fingerprint = [u8; 32];
+/// SHA3-256 certificate fingerprint used by the built-in trust store.
+#[cfg(feature = "std")]
+type Sha3Fingerprint = Fingerprint<Sha3_256>;
 
 /// Revocation status check for certificates within a certification path.
 ///
-/// Consulted once per certificate during path validation, satisfying the
-/// revocation step of RFC 5280 §6.1.3(a)(3). Shipped implementations are
+/// Path validation consults it once per certificate, which satisfies the
+/// revocation step of RFC 5280 §6.1.3(a)(3). The shipped implementations are
 /// [`NoRevocation`] and [`StaticRevocationList`].
 ///
-/// Implementations MUST fail closed: return
-/// [`CertificateValidationError::CertificateRevoked`] for a revoked
-/// certificate and [`CertificateValidationError::RevocationStatusUnknown`]
-/// when status cannot be established.
+/// # Fail closed
+///
+/// Implementations MUST fail closed:
+///
+/// - [`CertificateValidationError::CertificateRevoked`] for a revoked certificate.
+/// - [`CertificateValidationError::RevocationStatusUnknown`] when the status cannot be established.
 pub trait RevocationChecker: Debug + Send + Sync {
 	/// Check the revocation status of `cert`, issued by `issuer`.
 	///
@@ -55,11 +52,12 @@ pub trait RevocationChecker: Debug + Send + Sync {
 	fn check(&self, issuer: &Certificate, cert: &Certificate) -> Result<(), CertificateValidationError>;
 }
 
-/// [`RevocationChecker`] that treats every certificate as not revoked.
+/// A [`RevocationChecker`] that treats every certificate as unrevoked.
 ///
-/// Default for [`CertificateTrustStore`]. Sound only for a closed PKI with
-/// short-lived certificates: a compromised key stays trusted until the
-/// certificate expires or the operator re-pins the trust store.
+/// It is the default for [`CertificateTrustStore`]. It is sound only for a
+/// closed PKI with short-lived certificates, because a compromised key stays
+/// trusted until the certificate expires or the operator re-pins the trust
+/// store.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoRevocation;
 
@@ -69,34 +67,35 @@ impl RevocationChecker for NoRevocation {
 	}
 }
 
-/// Operator-pushed static revocation denylist.
+/// An operator-pushed static revocation denylist.
 ///
-/// Revokes by certificate fingerprint (exact) or by issuer-scoped serial number.
+/// It revokes by exact certificate fingerprint or by issuer-scoped serial
+/// number.
 #[cfg(feature = "std")]
 #[derive(Debug, Default)]
 pub struct StaticRevocationList {
-	fingerprints: HashSet<Fingerprint>,
-	/// Revoked serial numbers keyed by issuer DN DER: RFC 5280 §4.1.2.2
-	/// guarantees serial uniqueness only within one CA, so an unscoped
-	/// serial would falsely revoke unrelated certificates.
+	fingerprints: HashSet<Sha3Fingerprint>,
+	/// Revoked serial numbers keyed by issuer DN DER. RFC 5280 §4.1.2.2
+	/// guarantees serial uniqueness only within one CA, so an unscoped serial
+	/// would falsely revoke unrelated certificates.
 	serials: HashMap<Vec<u8>, HashSet<Vec<u8>>>,
 }
 
 #[cfg(feature = "std")]
 impl StaticRevocationList {
 	/// Revoke a certificate by its SHA3-256 DER fingerprint.
-	pub fn with_fingerprint(mut self, fingerprint: Fingerprint) -> Self {
+	pub fn with_fingerprint(mut self, fingerprint: Sha3Fingerprint) -> Self {
 		self.fingerprints.insert(fingerprint);
 		self
 	}
 
-	/// Revoke a certificate directly (computes its fingerprint).
+	/// Revoke `cert` by the fingerprint computed from it.
 	pub fn with_certificate(self, cert: &Certificate) -> Result<Self, CertificateValidationError> {
 		let fingerprint = CertificateTrustStore::to_fingerprint(cert)?;
 		Ok(self.with_fingerprint(fingerprint))
 	}
 
-	/// Revoke by issuer and raw serial-number bytes (CRL entry scope).
+	/// Revoke by issuer and raw serial-number bytes, the scope of a CRL entry.
 	pub fn with_serial(mut self, issuer: &Name, serial: impl AsRef<[u8]>) -> Result<Self, CertificateValidationError> {
 		self.serials
 			.entry(issuer.to_der()?)
@@ -130,69 +129,137 @@ impl RevocationChecker for StaticRevocationList {
 	}
 }
 
-/// Trait for certificate trust verification.
+/// Outcome of verifying a frame signature against a trust store.
 ///
-/// Extends `CertificateValidation` with trust-based operations.
-/// Implementations can use fingerprints, PKI chains, or custom logic.
-#[cfg(feature = "std")]
-pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
-	/// Check if a certificate is trusted.
-	fn is_trusted(&self, cert: &Certificate) -> bool;
-
-	/// Verify a certificate chain (partial RFC 5280 §6.1 path validation).
-	///
-	/// Performs:
-	/// 1. Root trust anchor check (RFC 5280 §6.1.1)
-	/// 2. Expiry validation for all certificates (RFC 5280 §6.1.3(a)(2))
-	/// 3. Rejection of unprocessed critical extensions (RFC 5280 §4.2, §6.1.3(f))
-	/// 4. Issuer/subject DN chaining (RFC 5280 §6.1.3(a)(4))
-	/// 5. Cryptographic signature verification (RFC 5280 §6.1.3(a)(1))
-	/// 6. Issuer `basicConstraints.cA` / `keyUsage.keyCertSign` and
-	///    `pathLenConstraint` (RFC 5280 §6.1.4(k),(l),(m),(n))
-	///
-	/// Not enforced: name constraints/policies (§6.1.3-§6.1.5) and
-	/// CRL/OCSP fetching (revocation runs through the configured
-	/// [`RevocationChecker`]). See
-	/// <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1>.
-	///
-	/// # Arguments
-	/// * `chain` - Certificate chain ordered root -> intermediate -> leaf
-	///
-	/// # Returns
-	/// - `Ok(())` if the chain is valid and terminates at a trusted root
-	/// - `Err(_)` if validation fails
-	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
-
-	/// Find a certificate by SignerInfo.
-	///
-	/// Used for frame signature verification - looks up the signer's certificate
-	/// using the SignerInfo's identifier and digest algorithm.
-	///
-	/// # Arguments
-	/// * `signer_info` - SignerInfo from the frame's nonrepudiation field
-	///
-	/// # Returns
-	/// - `Some(&Certificate)` if a matching certificate is found
-	/// - `None` if no certificate matches
-	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate>;
-
-	/// Get the verification policy for signature operations.
-	fn to_policy_ref(&self) -> &dyn VerificationPolicy;
+/// Distinguishes "no identity claimed" and "unknown identity claimed"
+/// from "trusted identity claimed with a bad signature" so callers can
+/// apply different consequences.
+#[cfg(feature = "signature")]
+#[must_use = "a dropped TrustVerification leaves the frame unauthenticated"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustVerification<'a> {
+	/// The frame carries no nonrepudiation signature.
+	MissingSignature,
+	/// The trust store holds no certificate for the signer.
+	UnknownSigner,
+	/// The signer is trusted, and the signature fails verification.
+	Invalid,
+	/// The signature verified against the certificate that this store
+	/// resolved.
+	Verified(&'a Certificate),
 }
 
-/// Trait for certificate trust verification (no_std version without SignerIdentifier).
+/// Certificate trust verification.
 ///
-/// This crate ships no no_std implementation of this trait
-/// ([`CertificateTrustStore`] is `std`-only); it exists so downstream no_std
-/// consumers can supply their own store. Implementations decide how much of
-/// RFC 5280 §6.1 path validation `verify_chain` performs.
-#[cfg(not(feature = "std"))]
+/// It extends [`CertificateValidation`] with trust-based operations. An
+/// implementation may use fingerprints, PKI chains, or custom logic.
+/// [`CertificateTrustStore`] is the built-in store and needs `std`, so a
+/// no_std consumer supplies its own implementation of this trait.
 pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
-	/// Check if a certificate is trusted.
+	/// Whether the store trusts `cert` by fingerprint.
+	///
+	/// This is certificate-object identity. Plane membership that must
+	/// survive key re-issuance uses [`Self::trusts_public_key`].
 	fn is_trusted(&self, cert: &Certificate) -> bool;
 
-	/// Verify a certificate chain.
+	/// Whether this store holds any certificate for `cert`'s public key.
+	///
+	/// Membership is the SubjectKeyIdentifier of the SPKI, resolved
+	/// through [`Self::find_by_signer_identifier`]. A rotated certificate
+	/// for an enrolled key still matches. Implementors that answer SID
+	/// lookup correctly get this behavior without an override.
+	#[must_use = "a dropped membership answer leaves the plane gate unenforced"]
+	fn trusts_public_key(&self, cert: &Certificate) -> bool {
+		let Ok(spki_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
+			return false;
+		};
+		let Ok(sid) = compute_signer_identifier_from_der(spki_der.as_slice()) else {
+			return false;
+		};
+
+		self.find_by_signer_identifier(&sid).is_some()
+	}
+
+	/// Verify a certificate chain with partial RFC 5280 §6.1 path validation.
+	///
+	/// `chain` is ordered root, then intermediates, then leaf. The call returns
+	/// `Ok(())` when the chain is valid and terminates at a trusted root.
+	///
+	/// # Checks
+	///
+	/// 1. Root trust anchor check (RFC 5280 §6.1.1).
+	/// 2. Expiry validation for all certificates (RFC 5280 §6.1.3(a)(2)).
+	/// 3. Rejection of unprocessed critical extensions (RFC 5280 §4.2, §6.1.3(f)).
+	/// 4. Issuer and subject DN chaining (RFC 5280 §6.1.3(a)(4)).
+	/// 5. Cryptographic signature verification (RFC 5280 §6.1.3(a)(1)).
+	/// 6. Issuer `basicConstraints.cA`, `keyUsage.keyCertSign`, and
+	///    `pathLenConstraint` (RFC 5280 §6.1.4(k),(l),(m),(n)).
+	///
+	/// # Scope
+	///
+	/// Name constraints and policies (§6.1.3-§6.1.5) and CRL or OCSP fetching
+	/// stay out of scope. Revocation runs through the configured
+	/// [`RevocationChecker`]. See
+	/// <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1>.
+	///
+	/// # Errors
+	///
+	/// - [`CertificateValidationError`] when validation fails.
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
+
+	/// Find a certificate by CMS [`SignerIdentifier`].
+	///
+	/// This is the key-identity lookup frame verification and plane
+	/// classification share. Issuer-and-serial and subject-key-identifier
+	/// forms both resolve here.
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate>;
+
+	/// Find a certificate by `SignerInfo`.
+	///
+	/// Frame signature verification uses it. It resolves through
+	/// [`Self::find_by_signer_identifier`] on the info's `sid`.
+	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate> {
+		self.find_by_signer_identifier(&signer_info.sid)
+	}
+
+	/// The verification policy for signature operations.
+	fn to_policy_ref(&self) -> &dyn VerificationPolicy;
+
+	/// Verify `frame`'s nonrepudiation signature against this store.
+	///
+	/// Looks up the signer certificate via the frame's `SignerInfo` and
+	/// verifies the signature over the frame's to-be-signed bytes. The
+	/// verified arm returns that certificate so a later step does not
+	/// resolve the signer again.
+	#[cfg(feature = "signature")]
+	#[must_use = "a dropped TrustVerification leaves the frame unauthenticated"]
+	fn verify_frame<'a>(&'a self, frame: &crate::Frame) -> TrustVerification<'a> {
+		let Some(signer_info) = frame.nonrepudiation() else {
+			return TrustVerification::MissingSignature;
+		};
+
+		let Some(cert) = self.find_by_signer_info(signer_info) else {
+			return TrustVerification::UnknownSigner;
+		};
+
+		let algorithm_oid = signer_info.signature_algorithm.oid;
+		let signature = signer_info.signature.as_bytes();
+		let Ok(public_key_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
+			return TrustVerification::Invalid;
+		};
+
+		let Ok(message) = frame.to_tbs() else {
+			return TrustVerification::Invalid;
+		};
+
+		match self
+			.to_policy_ref()
+			.verify_signature(&algorithm_oid, &public_key_der, &message, signature)
+		{
+			Ok(()) => TrustVerification::Verified(cert),
+			Err(_) => TrustVerification::Invalid,
+		}
+	}
 }
 
 /// Builder trait for constructing trust stores.
@@ -200,40 +267,46 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 /// Validates structural correctness (expiry, issuer/subject chaining) on add.
 /// The built store handles cryptographic verification at runtime.
 pub trait TrustBuilder: Sized {
-	/// The trust store type this builder produces
+	/// The trust store type that this builder produces.
 	type Store: CertificateTrust;
 
 	/// Add a certificate chain with structural validation.
 	///
 	/// Validates expiry and issuer/subject chaining. All certificates
 	/// in the chain are added to the trust store.
-	fn with_chain(self, chain: Vec<Certificate>) -> Result<Self, CertificateValidationError>;
+	fn with_chain(self, chain: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError>;
 
-	/// Add a single trusted certificate (leaf certificate).
+	/// Add a single trusted leaf certificate.
 	fn with_certificate(self, cert: Certificate) -> Result<Self, CertificateValidationError>;
 
 	/// Build the sealed trust store.
 	fn build(self) -> Self::Store;
 }
 
-/// Reject certificates bearing critical extensions this validator does not
-/// process.
+/// Reject a certificate that bears a critical extension this validator does
+/// not process.
 ///
-/// RFC 5280 §4.2: a certificate-using system MUST reject a certificate when
-/// it encounters a critical extension it cannot process.
-/// §6.1.3(f) applies the same rule during path validation:
-/// <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>.
+/// RFC 5280 §4.2 says a certificate-using system MUST reject a certificate
+/// when it encounters a critical extension it cannot process, and §6.1.3(f)
+/// applies the same rule during path validation
+/// (<https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>).
 ///
-/// Processed by this validator: `basicConstraints` (§4.2.1.9), `keyUsage`
-/// (§4.2.1.3), and `subjectAltName` (§4.2.1.6), which colony membership
-/// consumes as the URI SAN colony URN and which MUST be critical when the
-/// subject DN is empty (§4.1.2.6). Any other critical extension --
-/// including `nameConstraints` and `policyConstraints`, which are not
-/// implemented -- fails closed.
+/// # Processed extensions
 ///
-/// This validator performs no name-based endpoint verification. If one
-/// is ever added, it MUST match against the SAN contents, because a SAN
-/// accepted here is otherwise only consumed for colony membership.
+/// - `basicConstraints` (§4.2.1.9).
+/// - `keyUsage` (§4.2.1.3).
+/// - `subjectAltName` (§4.2.1.6). Colony membership consumes it as the URI SAN
+///   colony URN, and it MUST be critical when the subject DN is empty
+///   (§4.1.2.6).
+///
+/// Any other critical extension fails closed. That includes `nameConstraints`
+/// and `policyConstraints`, which are not implemented.
+///
+/// # Name-based verification
+///
+/// This validator performs no name-based endpoint verification. If one is
+/// ever added, it MUST match against the SAN contents, because a SAN accepted
+/// here is otherwise only consumed for colony membership.
 #[cfg(feature = "std")]
 fn ensure_critical_extensions_processed(cert: &Certificate) -> Result<(), CertificateValidationError> {
 	let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
@@ -254,16 +327,17 @@ fn ensure_critical_extensions_processed(cert: &Certificate) -> Result<(), Certif
 
 /// Reject a presented identity certificate that asserts the CA bit.
 ///
-/// Not an RFC 5280 requirement. The terminal certificate of a multi-certificate
-/// path is the identity being authenticated, and an identity carrying
-/// `basicConstraints.cA` (§4.2.1.9) is misissued for that role.
+/// This check goes beyond RFC 5280. The terminal certificate of a
+/// multi-certificate path is the identity being authenticated, and an
+/// identity that carries `basicConstraints.cA` (§4.2.1.9) is misissued for
+/// that role.
 #[cfg(feature = "std")]
 fn ensure_terminal_is_end_entity(path: &[&Certificate]) -> Result<(), CertificateValidationError> {
 	let [_, .., terminal] = path else {
 		return Ok(());
 	};
 
-	match certificate_extension::<BasicConstraints>(terminal)? {
+	match terminal.extension::<BasicConstraints>()? {
 		Some(basic_constraints) if basic_constraints.ca => Err(CertificateValidationError::EndEntityIsCa),
 		_ => Ok(()),
 	}
@@ -271,22 +345,25 @@ fn ensure_terminal_is_end_entity(path: &[&Certificate]) -> Result<(), Certificat
 
 /// Enforce that an issuer certificate is permitted to sign certificates.
 ///
-/// RFC 5280 §6.1.4(k): the issuer's `basicConstraints` extension MUST be
-/// present with `cA` asserted. §6.1.4(n): when a `keyUsage` extension is
-/// present it MUST assert `keyCertSign`.
-/// <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4>.
+/// - RFC 5280 §6.1.4(k): the issuer's `basicConstraints` extension MUST be
+///   present with `cA` asserted.
+/// - RFC 5280 §6.1.4(n): when a `keyUsage` extension is present, it MUST assert `keyCertSign`.
 ///
-/// Stricter than the RFC: (k) is version-conditional there (v1/v2 CAs may be
-/// verified out-of-band); this enforces it unconditionally, so v1/v2 CA
+/// See <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4>.
+///
+/// # Stricter than RFC 5280
+///
+/// The RFC makes (k) version-conditional, so v1/v2 CAs may be verified out
+/// of band. This check enforces (k) unconditionally, so v1/v2 CA
 /// certificates are rejected (see [`CertificateTrustStore::validate_path`]).
 #[cfg(feature = "std")]
 fn ensure_issuer_is_ca(issuer: &Certificate) -> Result<(), CertificateValidationError> {
-	match certificate_extension::<BasicConstraints>(issuer)? {
+	match issuer.extension::<BasicConstraints>()? {
 		Some(basic_constraints) if basic_constraints.ca => {}
 		_ => return Err(CertificateValidationError::IssuerNotCa),
 	}
 
-	if let Some(key_usage) = certificate_extension::<KeyUsage>(issuer)? {
+	if let Some(key_usage) = issuer.extension::<KeyUsage>()? {
 		if !key_usage.0.contains(KeyUsages::KeyCertSign) {
 			return Err(CertificateValidationError::MissingKeyCertSign);
 		}
@@ -295,19 +372,21 @@ fn ensure_issuer_is_ca(issuer: &Certificate) -> Result<(), CertificateValidation
 	Ok(())
 }
 
-/// Enforce `pathLenConstraint` over an ordered chain (root -> leaf).
+/// Enforce `pathLenConstraint` over a chain ordered from root to leaf.
 ///
 /// RFC 5280 §6.1.4(l),(m): a CA certificate's `pathLenConstraint` bounds the
 /// number of intermediate certificates that may follow it in the path before
-/// the end-entity. `None` imposes no limit.
+/// the end-entity. `None` imposes no limit. See
 /// <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4>.
 ///
-/// Stricter than the RFC: self-issued intermediates count toward the bound
-/// ((l) exempts them; see [`CertificateTrustStore::validate_path`]).
+/// # Stricter than RFC 5280
+///
+/// Self-issued intermediates count toward the bound, although clause (l)
+/// exempts them (see [`CertificateTrustStore::validate_path`]).
 #[cfg(feature = "std")]
 fn ensure_path_len(chain: &[&Certificate]) -> Result<(), CertificateValidationError> {
 	for (index, cert) in chain.iter().enumerate() {
-		let Some(basic_constraints) = certificate_extension::<BasicConstraints>(cert)? else {
+		let Some(basic_constraints) = cert.extension::<BasicConstraints>()? else {
 			continue;
 		};
 		let Some(max_intermediates) = basic_constraints.path_len_constraint else {
@@ -324,125 +403,139 @@ fn ensure_path_len(chain: &[&Certificate]) -> Result<(), CertificateValidationEr
 	Ok(())
 }
 
-// ============================================================================
-// CertificateTrustStore Implementation
-// ============================================================================
-
-/// SKID type: first 20 bytes of hash (RFC 5280)
-pub type Skid = [u8; 20];
-
-/// Built-in trust store with cryptographic signature verification.
+/// The built-in trust store, with cryptographic signature verification.
 ///
-/// Uses a `VerificationPolicy` for runtime signature verification of
-/// certificate chains. Stores trusted certificate fingerprints in a
+/// It verifies certificate chain signatures at run time through a
+/// [`VerificationPolicy`], and it keeps trusted certificate fingerprints in a
 /// `HashSet` for O(1) lookup.
 #[cfg(feature = "std")]
 pub struct CertificateTrustStore {
-	/// Trusted certificate fingerprints
-	fingerprints: HashSet<Fingerprint>,
-	/// Full certificates indexed by fingerprint
-	certificates: HashMap<Fingerprint, Certificate>,
-	/// Pre-computed SKID
-	skid_index: HashMap<Skid, Fingerprint>,
-	/// Verification policy for signature verification
+	/// The trusted certificate fingerprints.
+	fingerprints: HashSet<Sha3Fingerprint>,
+	/// The full certificates, indexed by fingerprint.
+	certificates: HashMap<Sha3Fingerprint, Certificate>,
+	/// The precomputed SKID index, from each SKID to its certificate
+	/// fingerprint.
+	skid_index: HashMap<Skid, Sha3Fingerprint>,
+	/// The verification policy that checks signatures.
 	policy: Arc<dyn VerificationPolicy>,
-	/// Revocation checker consulted during path validation
+	/// The revocation checker that path validation consults.
 	revocation: Arc<dyn RevocationChecker>,
 }
 
 #[cfg(feature = "std")]
 impl CertificateTrustStore {
-	/// Compute the SHA3-256 fingerprint of a certificate's DER encoding.
-	pub fn to_fingerprint(cert: &Certificate) -> Result<Fingerprint, CertificateValidationError> {
-		let der_bytes = cert.to_der()?;
-		let hash = Sha3_256::digest(&der_bytes);
-		let mut fp = [0u8; 32];
-		fp.copy_from_slice(hash.as_ref());
-
-		Ok(fp)
+	/// Compute the certificate fingerprint for digest `D`.
+	pub fn to_fingerprint<D>(cert: &Certificate) -> Result<Fingerprint<D>, CertificateValidationError>
+	where
+		D: Digest<OutputSize = U32>,
+	{
+		Fingerprint::from_certificate(cert)
 	}
 
-	/// Get a certificate by its fingerprint.
-	pub fn to_certificate_ref(&self, fingerprint: &Fingerprint) -> Option<&Certificate> {
+	/// The certificate with `fingerprint`, if the store holds one.
+	pub fn to_certificate_ref(&self, fingerprint: &Sha3Fingerprint) -> Option<&Certificate> {
 		self.certificates.get(fingerprint)
 	}
 
-	/// Get the number of trusted certificates.
+	/// The number of trusted certificates.
 	pub fn len(&self) -> usize {
 		self.fingerprints.len()
 	}
 
-	/// Check if the trust store is empty.
+	/// Whether the trust store is empty.
 	pub fn is_empty(&self) -> bool {
 		self.fingerprints.is_empty()
 	}
 
-	/// Validate an ordered certification path (issuer-first: anchor -> leaf).
+	/// Validate an ordered certification path, issuer first, from anchor to
+	/// leaf.
 	///
-	/// [RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1)
-	/// checks shared by both public entry points
-	/// ([`CertificateValidation::evaluate`] and
-	/// [`CertificateTrust::verify_chain`]) so the two cannot diverge on
-	/// validation strength (e.g. `pathLenConstraint`).
+	/// Both public entry points, [`CertificateValidation::evaluate`] and
+	/// [`CertificateTrust::verify_chain`], share these
+	/// [RFC 5280 §6.1][rfc5280-6.1] checks, so the two cannot diverge on
+	/// validation strength, for example on `pathLenConstraint`.
 	///
-	/// Performs, over the whole path:
-	/// 1. Validity period ([RFC 5280 §6.1.3(a)(2)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
-	/// 2. Rejection of unprocessed critical extensions ([RFC 5280 §4.2, §6.1.3(f)](https://datatracker.ietf.org/doc/html/rfc5280#section-4.2))
-	/// 3. Algorithm-identifier consistency ([RFC 5280 §4.1.1.2](https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2))
-	/// 4. Issuer/subject name chaining ([RFC 5280 §6.1.3(a)(4)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
-	/// 5. Issuer `basicConstraints.cA` / `keyUsage.keyCertSign` ([RFC 5280 §6.1.4(k),(n)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4))
-	/// 6. Cryptographic signature verification ([RFC 5280 §6.1.3(a)(1)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
-	/// 7. Revocation via the configured [`RevocationChecker`] ([RFC 5280 §6.1.3(a)(3)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
-	/// 8. `pathLenConstraint` ([RFC 5280 §6.1.4(l),(m)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4))
+	/// # Checks
 	///
-	/// Deliberately stricter than RFC 5280 in five fail-closed ways. TightBeam
-	/// runs a closed, self-managed PKI, so the interop these rules exist for
-	/// (legacy web roots, cross-signing, cross-vendor DN encoding slop) never
-	/// applies, and rejecting it removes attack surface:
-	/// - §6.1.4(k) is enforced on every issuer, not just v3 -- v1/v2 CA
-	///   certificates are rejected outright (the RFC permits rejecting).
-	/// - Self-issued intermediates count against `pathLenConstraint`
-	///   (§6.1.4(l) exempts them) -- key rollover here re-issues the trust
-	///   store rather than cross-signing.
-	/// - The trust anchor itself is subject to checks 1, 2, 3, 5, 7, and 8
-	///   (§6.1.1(d) treats it as exempt input) -- an expired, revoked, or
-	///   non-CA pinned root fails loudly.
-	/// - Name chaining is DER byte equality, not §7.1 case-insensitive
-	///   matching -- both encoders are in-house, and binary comparison
-	///   forecloses canonicalization ambiguity.
-	/// - The terminal certificate of a multi-certificate path must not assert
-	///   `basicConstraints.cA` -- an authenticated identity misissued with CA
-	///   power is rejected ([`ensure_terminal_is_end_entity`]).
+	/// The routine performs these checks over the whole path:
+	///
+	/// 1. Validity period ([RFC 5280 §6.1.3(a)(2)][rfc5280-6.1.3]).
+	/// 2. Rejection of unprocessed critical extensions ([RFC 5280 §4.2, §6.1.3(f)][rfc5280-4.2]).
+	/// 3. Algorithm-identifier consistency ([RFC 5280 §4.1.1.2][rfc5280-4.1.1.2]).
+	/// 4. Issuer and subject name chaining ([RFC 5280 §6.1.3(a)(4)][rfc5280-6.1.3]).
+	/// 5. Issuer `basicConstraints.cA` and `keyUsage.keyCertSign` ([RFC 5280
+	///    §6.1.4(k),(n)][rfc5280-6.1.4]).
+	/// 6. Cryptographic signature verification ([RFC 5280 §6.1.3(a)(1)][rfc5280-6.1.3]).
+	/// 7. Revocation through the configured [`RevocationChecker`] ([RFC 5280
+	///    §6.1.3(a)(3)][rfc5280-6.1.3]).
+	/// 8. `pathLenConstraint` ([RFC 5280 §6.1.4(l),(m)][rfc5280-6.1.4]).
 	///
 	/// Trust anchoring is the caller's responsibility. This routine validates
 	/// path structure and cryptography only.
+	///
+	/// # Stricter than RFC 5280
+	///
+	/// The routine is deliberately stricter than RFC 5280 in five fail-closed
+	/// ways. TightBeam runs a closed, self-managed PKI, so the interop these
+	/// rules exist for (legacy web roots, cross-signing, cross-vendor DN
+	/// encoding variance) never applies, and rejecting it removes attack
+	/// surface:
+	///
+	/// - §6.1.4(k) applies to every issuer, not just v3, so v1/v2 CA
+	///   certificates are rejected outright. The RFC permits the rejection.
+	/// - Self-issued intermediates count against `pathLenConstraint`, although
+	///   §6.1.4(l) exempts them, because key rollover here re-issues the trust
+	///   store instead of cross-signing.
+	/// - The trust anchor itself is subject to checks 1, 2, 3, 5, 7, and 8,
+	///   although §6.1.1(d) treats it as exempt input. An expired, revoked, or
+	///   non-CA pinned root fails loudly.
+	/// - Name chaining is DER byte equality instead of §7.1 case-insensitive
+	///   matching. Both encoders are in-house, and binary comparison forecloses
+	///   canonicalization ambiguity.
+	/// - The terminal certificate of a multi-certificate path must not assert
+	///   `basicConstraints.cA`, so an authenticated identity misissued with CA
+	///   power is rejected ([`ensure_terminal_is_end_entity`]).
+	///
+	/// [rfc5280-6.1]: https://datatracker.ietf.org/doc/html/rfc5280#section-6.1
+	/// [rfc5280-6.1.3]: https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3
+	/// [rfc5280-6.1.4]: https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4
+	/// [rfc5280-4.2]: https://datatracker.ietf.org/doc/html/rfc5280#section-4.2
+	/// [rfc5280-4.1.1.2]: https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2
 	fn validate_path(&self, path: &[&Certificate]) -> Result<(), CertificateValidationError> {
-		// RFC 5280 §6.1.3(a)(2): every certificate must be within its validity period.
-		path.iter().try_for_each(|cert| validate_certificate_expiry(cert))?;
+		// RFC 5280 §6.1.3(a)(2): each certificate is within its validity
+		// period.
+		path.iter().try_for_each(|cert| cert.validate_expiry())?;
 
-		// RFC 5280 §4.2 / §6.1.3(f): fail closed on unprocessed critical extensions.
+		// RFC 5280 §4.2, §6.1.3(f): an unprocessed critical extension fails
+		// closed.
 		path.iter().try_for_each(|cert| ensure_critical_extensions_processed(cert))?;
 
-		// Defense-in-depth: the authenticated identity must not assert the CA bit.
+		// Defense in depth: the terminal identity must not assert the CA bit.
 		ensure_terminal_is_end_entity(path)?;
 
-		// RFC 5280 §4.1.1.2: signatureAlgorithm must match tbsCertificate.signature.
-		path.iter().try_for_each(|cert| ensure_signature_algorithm_consistency(cert))?;
+		// RFC 5280 §4.1.1.2: `signatureAlgorithm` must match
+		// `tbsCertificate.signature`.
+		path.iter().try_for_each(|cert| cert.ensure_signature_algorithm_consistency())?;
 
-		// Verify issuer/subject chaining and signatures via sliding window
+		// A sliding window checks each issuer and subject pair.
 		path.windows(2).try_for_each(|pair| {
 			let (issuer, cert) = (pair[0], pair[1]);
 
-			// RFC 5280 §6.1.3(a)(4): name chaining - issuer DN must equal the
-			// preceding certificate's subject DN.
+			// RFC 5280 §6.1.3(a)(4): the issuer DN must equal the preceding
+			// certificate's subject DN.
 			if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
-				return Err(CertificateValidationError::InvalidChain);
+				return Err(CertificateValidationError::InvalidChain {
+					issuer: cert.tbs_certificate.issuer.to_string(),
+					subject: issuer.tbs_certificate.subject.to_string(),
+				});
 			}
 
-			// RFC 5280 §6.1.4(k),(n): the issuer must be a CA permitted to sign certs.
+			// RFC 5280 §6.1.4(k),(n): the issuer must be a CA that may sign
+			// certificates.
 			ensure_issuer_is_ca(issuer)?;
 
-			// RFC 5280 §6.1.3(a)(1): verify the signature using the issuer's key.
+			// RFC 5280 §6.1.3(a)(1): the issuer's key verifies the signature.
 			let algorithm_oid = cert.signature_algorithm.oid;
 			let public_key_der = issuer.tbs_certificate.subject_public_key_info.to_der()?;
 			let message = cert.tbs_certificate.to_der()?;
@@ -452,15 +545,15 @@ impl CertificateTrustStore {
 				.verify_signature(&algorithm_oid, &public_key_der, &message, signature_bytes)
 		})?;
 
-		// RFC 5280 §6.1.3(a)(3): revocation via the configured checker. The
-		// anchor is checked against itself as issuer -- stricter than
-		// §6.1.1(d), consistent with the anchor checks above.
+		// RFC 5280 §6.1.3(a)(3): the configured checker runs revocation. The
+		// anchor is checked against itself as issuer, which is stricter than
+		// §6.1.1(d) and consistent with the anchor checks above.
 		if let Some(anchor) = path.first() {
 			self.revocation.check(anchor, anchor)?;
 		}
 		path.windows(2).try_for_each(|pair| self.revocation.check(pair[0], pair[1]))?;
 
-		// RFC 5280 §6.1.4(m): enforce pathLenConstraint across the ordered path.
+		// RFC 5280 §6.1.4(m): `pathLenConstraint` holds across the path.
 		ensure_path_len(path)
 	}
 }
@@ -482,19 +575,20 @@ impl CertificateValidation for CertificateTrustStore {
 		// validate the accumulated path with the shared routine.
 		//
 		// Issuer selection assumes at most one stored certificate per subject
-		// DN: `find` commits to the first DN match and fails closed if that
-		// candidate cannot verify. Full RFC 4158 path building (backtracking
-		// across same-DN candidates) is intentionally not implemented.
+		// DN. `find` commits to the first DN match and fails closed if that
+		// candidate cannot verify. Full RFC 4158 path building, with
+		// backtracking across same-DN candidates, is intentionally out of
+		// scope.
 		let mut path: Vec<&Certificate> = Vec::new();
-		let mut visited: HashSet<Fingerprint> = HashSet::new();
+		let mut visited: HashSet<Sha3Fingerprint> = HashSet::new();
 
 		visited.insert(Self::to_fingerprint(cert)?);
 		path.push(cert);
 
 		let mut current = cert;
 		loop {
-			// RFC 5280 §6.1.3(a)(4): name chaining - locate an issuer whose
-			// subject DN matches the current certificate's issuer DN.
+			// RFC 5280 §6.1.3(a)(4): locate an issuer whose subject DN matches
+			// the current certificate's issuer DN.
 			let Some(issuer) = self
 				.certificates
 				.values()
@@ -503,8 +597,8 @@ impl CertificateValidation for CertificateTrustStore {
 				break;
 			};
 
-			// Self-issued terminal (root) or RFC 4158 §2.4.2 loop detection:
-			// revisiting a certificate ends the walk.
+			// A revisited certificate ends the walk. That covers a self-issued
+			// root and RFC 4158 §2.4.2 loop detection.
 			if !visited.insert(Self::to_fingerprint(issuer)?) {
 				break;
 			}
@@ -518,7 +612,7 @@ impl CertificateValidation for CertificateTrustStore {
 			return Err(CertificateValidationError::CertificateNotTrusted);
 		}
 
-		// Validate anchor-first (issuer before subject), same as `verify_chain`.
+		// Validate anchor first, issuer before subject, as `verify_chain` does.
 		path.reverse();
 		self.validate_path(&path)
 	}
@@ -534,37 +628,26 @@ impl CertificateTrust for CertificateTrustStore {
 	}
 
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError> {
-		// RFC 5280 §6.1.1: the chain must terminate at a configured trust anchor.
+		// RFC 5280 §6.1.1: the chain must end at a configured trust anchor.
 		let root = chain.first().ok_or(CertificateValidationError::EmptyChain)?;
 		if !self.is_trusted(root) {
 			return Err(CertificateValidationError::CertificateNotTrusted);
 		}
 
-		// Delegate to the shared path-validation routine: single source of
-		// truth with `evaluate`, so the two entry points cannot diverge.
+		// `evaluate` shares this path-validation routine, so the two entry
+		// points cannot diverge.
 		let path: Vec<&Certificate> = chain.iter().collect();
 		self.validate_path(&path)
 	}
 
-	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate> {
-		match &signer_info.sid {
-			SignerIdentifier::IssuerAndSerialNumber(ias) => {
-				// Find by issuer DN + serial number
-				self.certificates.values().find(|cert| {
-					cert.tbs_certificate.issuer == ias.issuer && cert.tbs_certificate.serial_number == ias.serial_number
-				})
-			}
+	fn find_by_signer_identifier(&self, sid: &SignerIdentifier) -> Option<&Certificate> {
+		match sid {
+			SignerIdentifier::IssuerAndSerialNumber(ias) => self.certificates.values().find(|cert| {
+				cert.tbs_certificate.issuer == ias.issuer && cert.tbs_certificate.serial_number == ias.serial_number
+			}),
 			SignerIdentifier::SubjectKeyIdentifier(skid) => {
-				// O(1) lookup via pre-indexed SKID
-				let skid_bytes = skid.0.as_bytes();
-				(skid_bytes.len() == 20)
-					.then(|| {
-						let mut key = [0u8; 20];
-						key.copy_from_slice(skid_bytes);
-						key
-					})
-					.and_then(|key| self.skid_index.get(&key))
-					.and_then(|fp| self.certificates.get(fp))
+				let key = Skid::parse(skid.0.as_bytes())?;
+				self.skid_index.get(&key).and_then(|fp| self.certificates.get(fp))
 			}
 		}
 	}
@@ -574,27 +657,25 @@ impl CertificateTrust for CertificateTrustStore {
 	}
 }
 
-// ============================================================================
-// CertificateTrustBuilder Implementation
-// ============================================================================
-
-/// Builder for constructing `CertificateTrustStore`.
+/// The builder of a [`CertificateTrustStore`].
 ///
-/// Generic over digest algorithm `D` which is used for SKID computation.
-/// Validates structural correctness (expiry, issuer/subject chaining) on add.
-/// The resulting store handles cryptographic verification at runtime.
+/// It validates structural correctness, which is expiry and issuer and
+/// subject chaining, on each add. The resulting store handles cryptographic
+/// verification at run time.
+///
+/// SKIDs are indexed through [`Skid::of_public_key`], the same home a signer
+/// stamps from, so a store resolves the identifiers its peers actually send.
 #[cfg(feature = "std")]
-pub struct CertificateTrustBuilder<D: Digest> {
-	fingerprints: HashSet<Fingerprint>,
-	certificates: HashMap<Fingerprint, Certificate>,
-	skid_index: HashMap<Skid, Fingerprint>,
+pub struct CertificateTrustBuilder {
+	fingerprints: HashSet<Sha3Fingerprint>,
+	certificates: HashMap<Sha3Fingerprint, Certificate>,
+	skid_index: HashMap<Skid, Sha3Fingerprint>,
 	policy: Arc<dyn VerificationPolicy>,
 	revocation: Arc<dyn RevocationChecker>,
-	_digest: core::marker::PhantomData<D>,
 }
 
 #[cfg(feature = "std")]
-impl<D: Digest, P: VerificationPolicy + 'static> From<P> for CertificateTrustBuilder<D> {
+impl<P: VerificationPolicy + 'static> From<P> for CertificateTrustBuilder {
 	fn from(policy: P) -> Self {
 		Self {
 			fingerprints: HashSet::new(),
@@ -602,36 +683,36 @@ impl<D: Digest, P: VerificationPolicy + 'static> From<P> for CertificateTrustBui
 			skid_index: HashMap::new(),
 			policy: Arc::new(policy),
 			revocation: Arc::new(NoRevocation),
-			_digest: core::marker::PhantomData,
 		}
 	}
 }
 
 #[cfg(feature = "std")]
-impl<D: Digest> CertificateTrustBuilder<D> {
+impl CertificateTrustBuilder {
 	/// Set the revocation checker consulted during path validation.
 	///
-	/// Defaults to [`NoRevocation`] (documented closed-PKI waiver).
+	/// The default is [`NoRevocation`], the documented closed-PKI waiver.
 	pub fn with_revocation_checker(mut self, checker: impl RevocationChecker + 'static) -> Self {
 		self.revocation = Arc::new(checker);
 		self
 	}
 
-	/// Add a single certificate (internal helper).
+	/// Index one certificate by fingerprint and by SKID.
 	fn add_certificate(&mut self, cert: Certificate) -> Result<(), CertificateValidationError> {
-		let fp = CertificateTrustStore::to_fingerprint(&cert)?;
+		let fp = CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?;
 
-		// Compute SKID from public key
 		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
-		let hash = D::digest(&spki_der);
-
-		let mut skid = [0u8; 20];
-		skid.copy_from_slice(crate::crypto::x509::utils::skid_window(hash.as_ref())?);
-
-		// Collision detection: same SKID but different fingerprint
+		let skid = Skid::of_public_key(&spki_der);
 		if let Some(existing_fp) = self.skid_index.get(&skid) {
+			// One SKID under two fingerprints is a collision.
 			if *existing_fp != fp {
-				return Err(CertificateValidationError::SkidCollision);
+				return Err(CertificateValidationError::SkidCollision {
+					skid: skid.as_bytes().iter().fold(String::new(), |mut acc, byte| {
+						use core::fmt::Write;
+						let _ = write!(acc, "{byte:02x}");
+						acc
+					}),
+				});
 			}
 		}
 
@@ -644,33 +725,36 @@ impl<D: Digest> CertificateTrustBuilder<D> {
 }
 
 #[cfg(feature = "std")]
-impl<D: Digest> TrustBuilder for CertificateTrustBuilder<D> {
+impl TrustBuilder for CertificateTrustBuilder {
 	type Store = CertificateTrustStore;
 
-	fn with_chain(mut self, chain: Vec<Certificate>) -> Result<Self, CertificateValidationError> {
+	fn with_chain(mut self, chain: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError> {
+		let chain: Vec<Certificate> = chain.into_iter().collect();
 		if chain.is_empty() {
 			return Err(CertificateValidationError::EmptyChain);
 		}
 
-		// Validate expiry for all certificates
-		chain.iter().try_for_each(validate_certificate_expiry)?;
+		chain.iter().try_for_each(CertificateExt::validate_expiry)?;
 
-		// Validate issuer/subject chaining (structural only, no crypto)
+		// The builder checks name chaining only, and signatures verify at run
+		// time.
 		chain.windows(2).try_for_each(|pair| {
 			let (issuer, cert) = (&pair[0], &pair[1]);
 			(cert.tbs_certificate.issuer == issuer.tbs_certificate.subject)
 				.then_some(())
-				.ok_or(CertificateValidationError::InvalidChain)
+				.ok_or_else(|| CertificateValidationError::InvalidChain {
+					issuer: cert.tbs_certificate.issuer.to_string(),
+					subject: issuer.tbs_certificate.subject.to_string(),
+				})
 		})?;
 
-		// Transfer ownership and add all certificates
 		chain.into_iter().try_for_each(|cert| self.add_certificate(cert))?;
 
 		Ok(self)
 	}
 
 	fn with_certificate(mut self, cert: Certificate) -> Result<Self, CertificateValidationError> {
-		validate_certificate_expiry(&cert)?;
+		cert.validate_expiry()?;
 		self.add_certificate(cert)?;
 		Ok(self)
 	}
@@ -687,7 +771,7 @@ impl<D: Digest> TrustBuilder for CertificateTrustBuilder<D> {
 }
 
 #[cfg(feature = "std")]
-impl<D: Digest> Debug for CertificateTrustBuilder<D> {
+impl Debug for CertificateTrustBuilder {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("CertificateTrustBuilder")
 			.field("fingerprints", &self.fingerprints.len())
@@ -703,21 +787,12 @@ mod tests {
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::SigningKey;
 	use crate::crypto::sign::Signatory;
-	use crate::testing::create_test_signing_key;
-	use crate::testing::utils::{
-		ca_extensions, create_test_certificate, create_test_certificate_chain, TestCertificateChain,
-	};
+	use crate::testing::fixtures::{TestCertificate, TestCertificateChain};
+	use crate::testing::TestKey;
 
 	type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-	/// Type alias for the builder with SHA3-256 digest (matches secp256k1 signer)
-	type TestBuilder = CertificateTrustBuilder<Sha3_256>;
-
-	// ========================================================================
-	// Test Helpers
-	// ========================================================================
-
-	/// Which certificates to add to the trust store
+	/// The certificates that a test adds to the trust store.
 	#[derive(Debug, Clone, Copy)]
 	enum StoreCerts {
 		None,
@@ -725,7 +800,7 @@ mod tests {
 		RootAndIntermediate,
 	}
 
-	/// Which certificate to evaluate
+	/// The certificate that a test evaluates.
 	#[derive(Debug, Clone, Copy)]
 	enum EvalTarget {
 		Root,
@@ -733,12 +808,12 @@ mod tests {
 		Leaf,
 	}
 
-	/// Build a trust store with the specified certificates from a chain
+	/// Build a trust store that holds `certs` from `chain`.
 	fn build_store(
 		chain: &TestCertificateChain,
 		certs: StoreCerts,
 	) -> Result<CertificateTrustStore, CertificateValidationError> {
-		let builder: TestBuilder = Secp256k1Policy.into();
+		let builder: CertificateTrustBuilder = Secp256k1Policy.into();
 		let builder = match certs {
 			StoreCerts::None => builder,
 			StoreCerts::Root => {
@@ -755,7 +830,7 @@ mod tests {
 		Ok(builder.build())
 	}
 
-	/// Get the target certificate from a chain
+	/// The certificate in `chain` that `target` names.
 	fn target_cert(chain: &TestCertificateChain, target: EvalTarget) -> &Certificate {
 		match target {
 			EvalTarget::Root => &chain.root,
@@ -764,53 +839,66 @@ mod tests {
 		}
 	}
 
-	// ========================================================================
-	// Basic Operations
-	// ========================================================================
-
 	#[test]
 	fn fingerprint_is_32_bytes() -> TestResult {
-		let cert = create_test_certificate(&create_test_signing_key());
-		assert_eq!(CertificateTrustStore::to_fingerprint(&cert)?.len(), 32);
+		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		assert_eq!(CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?.as_slice().len(), 32);
 		Ok(())
 	}
 
 	#[test]
 	fn is_trusted_matches_fingerprint() -> TestResult {
-		let cert = create_test_certificate(&create_test_signing_key());
+		let cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		let certificate = cert.to_owned();
-		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+			.with_certificate(certificate)?
+			.build();
 		assert!(store.is_trusted(&cert));
-		assert!(!store.is_trusted(&create_test_certificate(&SigningKey::from_bytes(&[2u8; 32].into())?)));
+		assert!(!store.is_trusted(&TestCertificate::self_signed(&SigningKey::from_bytes(&[2u8; 32].into())?)));
+		Ok(())
+	}
+
+	#[test]
+	fn trusts_public_key_matches_rotated_certificate() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let enrolled = TestCertificate::with_cn_and_uri_sans(&key, "enrolled", &["urn:tightbeam:colony:test"]);
+		let rotated = TestCertificate::with_cn_and_uri_sans(&key, "rotated", &["urn:tightbeam:colony:test"]);
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+			.with_certificate(enrolled.clone())?
+			.build();
+		assert!(store.is_trusted(&enrolled));
+		assert!(!store.is_trusted(&rotated));
+		assert!(store.trusts_public_key(&rotated));
+		assert!(!store.trusts_public_key(&TestCertificate::self_signed(&SigningKey::from_bytes(&[2u8; 32].into())?)));
 		Ok(())
 	}
 
 	#[test]
 	fn builder_validates_chain_structure() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let chain = vec![chain.root, chain.intermediate, chain.leaf];
-		assert!(TestBuilder::from(Secp256k1Policy).with_chain(chain).is_ok());
-
+		assert!(CertificateTrustBuilder::from(Secp256k1Policy).with_chain(chain).is_ok());
 		Ok(())
 	}
 
-	/// Test cases for evaluate() with chain walking
+	/// Cases of `(store, target, passes)` for `evaluate` with chain walking.
 	const EVALUATE_CASES: &[(StoreCerts, EvalTarget, bool)] = &[
-		// Direct trust
+		// A trusted root passes directly.
 		(StoreCerts::Root, EvalTarget::Root, true),
-		// Fails: presented identity asserts the CA bit (EndEntityIsCa)
+		// The presented identity asserts the CA bit, so it fails with
+		// `EndEntityIsCa`.
 		(StoreCerts::Root, EvalTarget::Intermediate, false),
-		// Chain walking: root+intermediate trusts leaf
+		// Chain walking lets the root and the intermediate trust the leaf.
 		(StoreCerts::RootAndIntermediate, EvalTarget::Leaf, true),
-		// Fails: root alone cannot verify leaf (missing intermediate)
+		// The root alone cannot verify the leaf without the intermediate.
 		(StoreCerts::Root, EvalTarget::Leaf, false),
-		// Fails: empty store trusts nothing
+		// An empty store trusts nothing.
 		(StoreCerts::None, EvalTarget::Leaf, false),
 	];
 
 	#[test]
 	fn evaluate_chain_walking() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		for (store_certs, eval_target, should_succeed) in EVALUATE_CASES {
 			let store = build_store(&chain, *store_certs)?;
 			let cert = target_cert(&chain, *eval_target);
@@ -828,31 +916,28 @@ mod tests {
 
 	#[test]
 	fn evaluate_rejects_cross_chain_cert() -> TestResult {
-		// Store has one chain's root, evaluate leaf from different chain
-		let store = TestBuilder::from(Secp256k1Policy)
-			.with_certificate(create_test_certificate(&create_test_signing_key()))?
+		// The store holds one chain's root, and the leaf comes from another
+		// chain.
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+			.with_certificate(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()))?
 			.build();
 
-		let other_chain = create_test_certificate_chain()?;
+		let other_chain = TestCertificate::insecure_fixed_chain()?;
 		assert!(store.evaluate(&other_chain.leaf).is_err());
 		Ok(())
 	}
 
-	// ========================================================================
-	// Chain Verification
-	// ========================================================================
-
 	#[test]
 	fn verify_chain_cases() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let cases: &[(StoreCerts, &[&Certificate], bool)] = &[
-			// Empty chain fails
+			// An empty chain fails.
 			(StoreCerts::Root, &[], false),
-			// Untrusted root fails
+			// An untrusted root fails.
 			(StoreCerts::None, &[&chain.root], false),
-			// Trusted root alone succeeds
+			// A trusted root alone succeeds.
 			(StoreCerts::Root, &[&chain.root], true),
-			// Full chain with trusted root succeeds
+			// A full chain with a trusted root succeeds.
 			(StoreCerts::Root, &[&chain.root, &chain.intermediate, &chain.leaf], true),
 		];
 
@@ -872,10 +957,8 @@ mod tests {
 		Ok(())
 	}
 
-	// ========================================================================
-	// RFC 5280 §6.1.4 Path Constraints
-	// ========================================================================
-
+	/// Cases for the RFC 5280 §6.1.4 path constraints.
+	///
 	/// Each case replaces the root's extensions, then expects `verify_chain` to
 	/// reject the otherwise-valid chain with the mapped error.
 	const ISSUER_CONSTRAINT_CASES: &[(bool, bool, Option<u8>, CertificateValidationError)] = &[
@@ -887,13 +970,15 @@ mod tests {
 	#[test]
 	fn verify_chain_enforces_issuer_constraints() -> TestResult {
 		for (ca, key_cert_sign, path_len, expected) in ISSUER_CONSTRAINT_CASES {
-			let chain = create_test_certificate_chain()?;
+			let chain = TestCertificate::insecure_fixed_chain()?;
 
 			let mut root = chain.root.to_owned();
-			root.tbs_certificate.extensions = Some(ca_extensions(*ca, *key_cert_sign, *path_len));
+			root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(*ca, *key_cert_sign, *path_len));
 
 			let certificate = root.to_owned();
-			let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
+			let store = CertificateTrustBuilder::from(Secp256k1Policy)
+				.with_certificate(certificate)?
+				.build();
 			let result = store.verify_chain(&[root, chain.intermediate, chain.leaf]);
 			assert!(matches!(result, Err(ref e) if core::mem::discriminant(e) == core::mem::discriminant(expected)));
 		}
@@ -903,12 +988,12 @@ mod tests {
 
 	#[test]
 	fn evaluate_enforces_path_len_constraint() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 
 		let mut root = chain.root.to_owned();
-		root.tbs_certificate.extensions = Some(ca_extensions(true, true, Some(0)));
+		root.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, Some(0)));
 
-		let store = TestBuilder::from(Secp256k1Policy)
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_certificate(root)?
 			.with_certificate(chain.intermediate)?
 			.build();
@@ -919,12 +1004,10 @@ mod tests {
 		Ok(())
 	}
 
-	// ========================================================================
-	// RFC 5280 §4.2 Critical Extensions
-	// ========================================================================
-
-	/// Wrap an empty payload in an extension with the given OID and criticality.
-	fn opaque_extension(oid: &str, critical: bool) -> crate::x509::ext::Extension {
+	/// Wrap an empty payload in an extension with the given OID and
+	/// criticality, for the RFC 5280 §4.2 critical-extension tests.
+	fn opaque_extension(oid: impl AsRef<str>, critical: bool) -> crate::x509::ext::Extension {
+		let oid = oid.as_ref();
 		crate::x509::ext::Extension {
 			extn_id: crate::der::oid::ObjectIdentifier::new_unwrap(oid),
 			critical,
@@ -935,9 +1018,8 @@ mod tests {
 	#[test]
 	fn rejects_unknown_critical_extension() {
 		// nameConstraints (2.5.29.30) is not processed by this validator.
-		let mut cert = create_test_certificate(&create_test_signing_key());
+		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", true)]);
-
 		assert!(matches!(
 			ensure_critical_extensions_processed(&cert),
 			Err(CertificateValidationError::UnprocessedCriticalExtension(_))
@@ -946,17 +1028,15 @@ mod tests {
 
 	#[test]
 	fn accepts_unknown_noncritical_extension() {
-		let mut cert = create_test_certificate(&create_test_signing_key());
+		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", false)]);
-
 		assert!(ensure_critical_extensions_processed(&cert).is_ok());
 	}
 
 	#[test]
 	fn accepts_processed_critical_extensions() {
-		let mut cert = create_test_certificate(&create_test_signing_key());
-		cert.tbs_certificate.extensions = Some(ca_extensions(true, true, None));
-
+		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		cert.tbs_certificate.extensions = Some(TestCertificate::ca_extensions(true, true, None));
 		assert!(ensure_critical_extensions_processed(&cert).is_ok());
 	}
 
@@ -964,15 +1044,14 @@ mod tests {
 	fn accepts_critical_subject_alt_name() {
 		// subjectAltName (2.5.29.17) is processed for colony membership and
 		// MUST be critical when the subject DN is empty (RFC 5280 §4.1.2.6).
-		let mut cert = create_test_certificate(&create_test_signing_key());
+		let mut cert = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 		cert.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.17", true)]);
-
 		assert!(ensure_critical_extensions_processed(&cert).is_ok());
 	}
 
 	#[test]
 	fn verify_chain_rejects_unknown_critical_extension() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 
 		let mut leaf = chain.leaf.to_owned();
 		leaf.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", true)]);
@@ -986,15 +1065,12 @@ mod tests {
 		Ok(())
 	}
 
-	// ========================================================================
-	// End-Entity CA Bit (defense-in-depth)
-	// ========================================================================
-
+	// The end-entity CA-bit check is defense in depth.
 	#[test]
 	fn terminal_with_ca_bit_rejected() -> TestResult {
-		let chain = create_test_certificate_chain()?;
-
-		// Intermediate carries basicConstraints.cA=true as terminal of [root, intermediate].
+		let chain = TestCertificate::insecure_fixed_chain()?;
+		// The intermediate carries `basicConstraints.cA = true` as the terminal
+		// of `[root, intermediate]`.
 		let path = [&chain.root, &chain.intermediate];
 		assert!(matches!(
 			ensure_terminal_is_end_entity(&path),
@@ -1005,8 +1081,7 @@ mod tests {
 
 	#[test]
 	fn terminal_without_ca_bit_accepted() -> TestResult {
-		let chain = create_test_certificate_chain()?;
-
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let path = [&chain.root, &chain.intermediate, &chain.leaf];
 		assert!(ensure_terminal_is_end_entity(&path).is_ok());
 		Ok(())
@@ -1014,25 +1089,21 @@ mod tests {
 
 	#[test]
 	fn single_certificate_path_exempt_from_ca_bit_check() -> TestResult {
-		let chain = create_test_certificate_chain()?;
-
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		// A pinned CA root validating itself is the direct-trust model.
 		let path = [&chain.root];
 		assert!(ensure_terminal_is_end_entity(&path).is_ok());
 		Ok(())
 	}
 
-	// ========================================================================
-	// RFC 5280 §6.1.3(a)(3) Revocation
-	// ========================================================================
-
-	/// Build a store trusting the chain root with the given revocation list.
+	/// Build a store that trusts the chain root under `revocation`, for the
+	/// RFC 5280 §6.1.3(a)(3) revocation tests.
 	fn build_store_with_revocation(
 		chain: &TestCertificateChain,
 		revocation: StaticRevocationList,
 	) -> Result<CertificateTrustStore, CertificateValidationError> {
 		let root = chain.root.to_owned();
-		Ok(TestBuilder::from(Secp256k1Policy)
+		Ok(CertificateTrustBuilder::from(Secp256k1Policy)
 			.with_revocation_checker(revocation)
 			.with_certificate(root)?
 			.build())
@@ -1040,16 +1111,15 @@ mod tests {
 
 	#[test]
 	fn static_revocation_list_passes_unlisted_certificate() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let revocation = StaticRevocationList::default().with_certificate(&chain.intermediate)?;
-
 		assert!(revocation.check(&chain.intermediate, &chain.leaf).is_ok());
 		Ok(())
 	}
 
 	#[test]
 	fn verify_chain_rejects_leaf_revoked_by_fingerprint() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let revocation = StaticRevocationList::default().with_certificate(&chain.leaf)?;
 
 		let store = build_store_with_revocation(&chain, revocation)?;
@@ -1060,7 +1130,7 @@ mod tests {
 
 	#[test]
 	fn verify_chain_rejects_leaf_revoked_by_serial() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let issuer = chain.leaf.tbs_certificate.issuer.to_owned();
 		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
 		let revocation = StaticRevocationList::default().with_serial(&issuer, serial)?;
@@ -1073,7 +1143,7 @@ mod tests {
 
 	#[test]
 	fn serial_revocation_is_scoped_to_issuer() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let other_issuer = chain.leaf.tbs_certificate.subject.to_owned();
 		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
 		let revocation = StaticRevocationList::default().with_serial(&other_issuer, serial)?;
@@ -1086,7 +1156,7 @@ mod tests {
 
 	#[test]
 	fn verify_chain_rejects_revoked_anchor() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 		let revocation = StaticRevocationList::default().with_certificate(&chain.root)?;
 
 		let store = build_store_with_revocation(&chain, revocation)?;
@@ -1095,13 +1165,10 @@ mod tests {
 		Ok(())
 	}
 
-	// ========================================================================
-	// RFC 5280 §4.1.1.2 Algorithm Identifier Consistency
-	// ========================================================================
-
+	// RFC 5280 §4.1.1.2 requires algorithm identifier consistency.
 	#[test]
 	fn rejects_algorithm_identifier_mismatch() -> TestResult {
-		let chain = create_test_certificate_chain()?;
+		let chain = TestCertificate::insecure_fixed_chain()?;
 
 		let mut leaf = chain.leaf.to_owned();
 		leaf.signature_algorithm.oid = crate::oids::SIGNER_ECDSA_WITH_SHA256;
@@ -1119,26 +1186,39 @@ mod tests {
 		Ok(())
 	}
 
-	// ========================================================================
-	// Signer Lookup
-	// ========================================================================
+	// A signer stamps its SubjectKeyIdentifier into the `SignerInfo`, and a
+	// store indexes by the same value, so the two must come from one digest.
+	#[test]
+	fn a_signer_stamps_the_identifier_its_certificate_indexes_under() -> TestResult {
+		let key = TestKey::insecure_fixed_signing();
+		let cert = TestCertificate::self_signed(&key);
+		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
+
+		let stamped = key.to_signer_info(b"payload")?.sid;
+		let indexed = compute_signer_identifier_from_der(&spki_der)?;
+
+		assert_eq!(stamped, indexed);
+		Ok(())
+	}
 
 	#[test]
 	fn find_by_signer_info_skid() -> TestResult {
-		let key = create_test_signing_key();
-		let cert = create_test_certificate(&key);
+		let key = TestKey::insecure_fixed_signing();
+		let cert = TestCertificate::self_signed(&key);
 		let certificate = cert.to_owned();
-		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+			.with_certificate(certificate)?
+			.build();
 
-		// Create signer info via Signatory trait (uses SHA3-256 for SKID)
+		// The `Signatory` trait builds the signer info with a SHA3-256 SKID.
 		let signer_info = key.to_signer_info(b"test")?;
-		// Should find the certificate
+		// The store must find the certificate.
 		let Some(found) = store.find_by_signer_info(&signer_info) else {
 			return Err(crate::testing::error::TestingError::InvariantViolated.into());
 		};
 		assert_eq!(
-			CertificateTrustStore::to_fingerprint(found)?,
-			CertificateTrustStore::to_fingerprint(&cert)?
+			CertificateTrustStore::to_fingerprint::<Sha3_256>(found)?,
+			CertificateTrustStore::to_fingerprint::<Sha3_256>(&cert)?
 		);
 
 		Ok(())
@@ -1146,11 +1226,11 @@ mod tests {
 
 	#[test]
 	fn find_by_signer_info_not_found() -> TestResult {
-		let store = TestBuilder::from(Secp256k1Policy)
-			.with_certificate(create_test_certificate(&create_test_signing_key()))?
+		let store = CertificateTrustBuilder::from(Secp256k1Policy)
+			.with_certificate(TestCertificate::self_signed(&TestKey::insecure_fixed_signing()))?
 			.build();
 
-		// Different key
+		// A different key signs.
 		let other_key = SigningKey::from_bytes(&[99u8; 32].into())?;
 		let signer_info = other_key.to_signer_info(b"test")?;
 		assert!(store.find_by_signer_info(&signer_info).is_none());

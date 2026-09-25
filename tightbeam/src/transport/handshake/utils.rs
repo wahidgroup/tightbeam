@@ -1,7 +1,7 @@
-//! Utility functions for handshake operations.
+//! Shared functions for handshake operations.
 //!
-//! Provides common cryptographic and state management utilities used across
-//! handshake builders, processors, and orchestrators.
+//! Handshake builders, processors, and orchestrators share these
+//! cryptographic and state management helpers.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -11,21 +11,21 @@ use alloc::vec::Vec;
 
 use crate::spki::AlgorithmIdentifierOwned;
 
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+use crate::asn1::OctetString;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-mod transport {
-	#[cfg(any(
-		feature = "transport-ecies",
-		all(feature = "transport-multiplex", feature = "transport-cms")
-	))]
-	pub use crate::asn1::OctetString;
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-	pub use crate::transport::handshake::error::HandshakeError;
-	pub use crate::x509::Certificate;
-}
-
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use transport::*;
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::x509::utils::CertificateExt;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::error::HandshakeError;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::x509::Certificate;
 
 /// AES-256-GCM algorithm identifier.
 ///
@@ -35,11 +35,7 @@ pub fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None }
 }
 
-// ============================================================================
-// Orchestrator utilities
-// ============================================================================
-
-/// Enforce a single expected handshake state; mismatch yields `InvalidState`.
+/// Enforce a single expected handshake state. A mismatch yields `InvalidState`.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[inline]
 pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), HandshakeError> {
@@ -50,80 +46,60 @@ pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), Hands
 	}
 }
 
-/// Parse the certificate SPKI into a curve `PublicKey` for
-/// signature verification.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub fn extract_verifying_key_from_cert<C>(cert: &Certificate) -> Result<PublicKey<C>, HandshakeError>
-where
-	C: Curve + CurveArithmetic,
-	<C as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-{
-	let pubkey_bytes = crate::crypto::x509::utils::extract_verifying_key_bytes(cert);
-	Ok(PublicKey::<C>::from_sec1_bytes(pubkey_bytes)?)
-}
-
-/// Fixed 32-byte view of an ECIES wire nonce.
-/// Wrong length fails closed.
-#[cfg(any(
-	feature = "transport-ecies",
-	all(feature = "transport-multiplex", feature = "transport-cms")
-))]
-pub fn octet_string_to_32_byte_array(octet_string: &OctetString) -> Result<[u8; 32], HandshakeError> {
-	let bytes = octet_string.as_bytes();
-	if bytes.len() != 32 {
-		return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
-	}
-
-	let mut out = [0u8; 32];
-	out.copy_from_slice(bytes);
-	Ok(out)
-}
-
-/// 32-byte transcript digest under digest algorithm `D`.
+/// Compute the 32-byte transcript digest under digest algorithm `D`.
 ///
-/// Wider digests (e.g. SHA3-512) truncate to the leading 32 bytes.
+/// A wider digest, such as SHA3-512, truncates to its leading 32 bytes.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub fn compute_transcript_digest<D>(data: &[u8]) -> Result<[u8; 32], HandshakeError>
+pub fn compute_transcript_digest<D>(data: impl AsRef<[u8]>) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
 	use crate::transport::handshake::primitives::transcript::digest_output_to_array;
 
-	digest_output_to_array(&D::digest(data))
+	let data = data.as_ref();
+	digest_output_to_array(D::digest(data))
 }
 
 /// Compute the ECIES handshake transcript hash from its ordered legs.
 ///
 /// Both roles derive this identically. A divergence here is a protocol break,
-/// so the concatenation order lives in one place. Binds the client hello,
-/// server random, server SPKI, and both accept encodings (CWE-347).
+/// so the concatenation order lives in one place. The hash binds the client
+/// hello, the server random, the server SPKI, and both accept encodings
+/// (CWE-347).
 ///
-/// # Type Parameters
-/// - `D`: The digest algorithm (e.g., `Sha3_256`)
+/// # Type parameters
+///
+/// - `D`: the digest algorithm, such as `Sha3_256`.
 ///
 /// # Parameters
-/// - `client_hello`: DER of the client hello message
-/// - `server_random`: The 32-byte server random
-/// - `spki_bytes`: DER of the server SubjectPublicKeyInfo
-/// - `accept_der`: DER of the handshake accept
-/// - `transport_accept_der`: DER of the transport accept
+///
+/// - `client_hello`: the DER of the client hello message.
+/// - `server_random`: the 32-byte server random.
+/// - `spki_bytes`: the DER of the server SubjectPublicKeyInfo.
+/// - `accept_der`: the DER of the handshake accept.
+/// - `transport_accept_der`: the DER of the transport accept.
 ///
 /// # Errors
-/// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
+///
+/// - `TranscriptDigestLength` -- `D` produces fewer than 32 bytes.
 #[cfg(feature = "transport-ecies")]
 pub fn compute_ecies_transcript_hash<D>(
-	client_hello: &[u8],
+	client_hello: impl AsRef<[u8]>,
 	server_random: &[u8; 32],
-	spki_bytes: &[u8],
-	accept_der: &[u8],
-	transport_accept_der: &[u8],
+	spki_bytes: impl AsRef<[u8]>,
+	accept_der: impl AsRef<[u8]>,
+	transport_accept_der: impl AsRef<[u8]>,
 ) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
-	let mut data =
-		Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len() + transport_accept_der.len());
+	let client_hello = client_hello.as_ref();
+	let spki_bytes = spki_bytes.as_ref();
+	let accept_der = accept_der.as_ref();
+	let transport_accept_der = transport_accept_der.as_ref();
+
+	let len = client_hello.len() + 32 + spki_bytes.len() + accept_der.len() + transport_accept_der.len();
+	let mut data = Vec::with_capacity(len);
 	data.extend_from_slice(client_hello);
 	data.extend_from_slice(server_random);
 	data.extend_from_slice(spki_bytes);
@@ -135,30 +111,35 @@ where
 
 /// Compute the ECIES client mutual-auth digest.
 ///
-/// Binds the transcript hash, the ECIES-encrypted key exchange payload, and
-/// the client certificate into a single digest that the client signs. This
-/// prevents splicing a valid client signature onto a different key exchange
-/// or a different identity (CWE-347).
+/// The digest binds the transcript hash, the ECIES-encrypted key exchange
+/// payload, and the client certificate into a single value that the client
+/// signs. A valid client signature therefore cannot be spliced onto a
+/// different key exchange or a different identity (CWE-347).
 ///
-/// # Type Parameters
-/// - `D`: The digest algorithm (e.g., `Sha3_256`)
+/// # Type parameters
+///
+/// - `D`: the digest algorithm, such as `Sha3_256`.
 ///
 /// # Parameters
-/// - `transcript_hash`: The 32-byte handshake transcript hash
-/// - `encrypted_data`: The ECIES-encrypted key exchange bytes
-/// - `client_cert_der`: DER encoding of the client certificate
+///
+/// - `transcript_hash`: the 32-byte handshake transcript hash.
+/// - `encrypted_data`: the ECIES-encrypted key exchange bytes.
+/// - `client_cert_der`: the DER encoding of the client certificate.
 ///
 /// # Errors
-/// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
+///
+/// - `TranscriptDigestLength` -- `D` produces fewer than 32 bytes.
 #[cfg(feature = "transport-ecies")]
 pub fn compute_client_auth_digest<D>(
 	transcript_hash: &[u8; 32],
-	encrypted_data: &[u8],
-	client_cert_der: &[u8],
+	encrypted_data: impl AsRef<[u8]>,
+	client_cert_der: impl AsRef<[u8]>,
 ) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
+	let encrypted_data = encrypted_data.as_ref();
+	let client_cert_der = client_cert_der.as_ref();
 	let mut data = Vec::with_capacity(32 + encrypted_data.len() + client_cert_der.len());
 	data.extend_from_slice(transcript_hash);
 	data.extend_from_slice(encrypted_data);
@@ -167,18 +148,77 @@ where
 	compute_transcript_digest::<D>(&data)
 }
 
-/// Erase ephemeral ECIES key material after session establishment (CWE-226).
-#[cfg(feature = "transport-ecies")]
-pub fn clear_session_randoms(
-	base_session_key: &mut Option<[u8; 32]>,
-	client_random: &mut Option<[u8; 32]>,
-	server_random: &mut Option<[u8; 32]>,
-) {
-	use crate::zeroize::Zeroize;
+/// Fixed-width views of a DER `OctetString`.
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+pub trait HandshakeOctets {
+	/// Fixed 32-byte view of an ECIES wire nonce or other public value.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::OctetStringLengthError`] on any other length, so a
+	///   short or long nonce fails closed
+	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError>;
 
-	base_session_key.zeroize();
-	client_random.zeroize();
-	server_random.zeroize();
+	/// Copy the 32 bytes into `out`, which may be a wiping buffer, so a key
+	/// never passes through a plain array on the way.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::OctetStringLengthError`] on any other length
+	fn copy_to_32_byte_array(&self, out: &mut [u8; 32]) -> Result<(), HandshakeError>;
+}
+
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+impl HandshakeOctets for OctetString {
+	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError> {
+		let mut out = [0u8; 32];
+		self.copy_to_32_byte_array(&mut out)?;
+		Ok(out)
+	}
+
+	fn copy_to_32_byte_array(&self, out: &mut [u8; 32]) -> Result<(), HandshakeError> {
+		let bytes = self.as_bytes();
+		if bytes.len() != out.len() {
+			return Err(HandshakeError::OctetStringLengthError((bytes.len(), out.len()).into()));
+		}
+
+		out.copy_from_slice(bytes);
+		Ok(())
+	}
+}
+
+/// Public-key extraction from a certificate.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub trait HandshakeVerifyingKey {
+	/// Public key parsed from this certificate's SPKI, on curve `C`.
+	///
+	/// # Errors
+	///
+	/// - SEC1 decode failures over the certificate's key bytes
+	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
+	where
+		C: Curve + CurveArithmetic,
+		<C as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl HandshakeVerifyingKey for Certificate {
+	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
+	where
+		C: Curve + CurveArithmetic,
+		<C as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	{
+		let pubkey_bytes = self.verifying_key_bytes();
+		Ok(PublicKey::<C>::from_sec1_bytes(pubkey_bytes)?)
+	}
 }
 
 #[cfg(test)]

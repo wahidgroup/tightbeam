@@ -12,16 +12,17 @@ use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConfig, Se
 use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-pub(crate) const POINTA: Urn<'static> = Urn::new("test", "event:tennis/pointa");
-pub(crate) const POINTB: Urn<'static> = Urn::new("test", "event:tennis/pointb");
+pub(crate) const POINTA: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointa");
+pub(crate) const POINTB: Urn<'static> = tightbeam::urn!("test", "event:tennis/pointb");
 
 fn build_fdr_config(
-	specs: Vec<Process>,
+	specs: impl IntoIterator<Item = Process>,
 	seeds: u32,
 	max_depth: usize,
 	max_internal_run: usize,
 	timeout_ms: u64,
 ) -> FdrConfig {
+	let specs: Vec<Process> = specs.into_iter().collect();
 	FdrConfig {
 		seeds,
 		max_depth,
@@ -29,7 +30,6 @@ fn build_fdr_config(
 		timeout_ms,
 		specs,
 		fail_fast: true,
-		expect_failure: false,
 		..Default::default()
 	}
 }
@@ -105,7 +105,6 @@ tb_assert_spec! {
 	pub ValidTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(POINTA, exactly!(4)),
 			(POINTB, exactly!(1))
@@ -146,7 +145,6 @@ tb_assert_spec! {
 	pub InvalidTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(POINTA, exactly!(1)),
 			(POINTB, exactly!(4))
@@ -189,7 +187,6 @@ tb_assert_spec! {
 	pub DeuceTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(POINTA, exactly!(5)),
 			(POINTB, exactly!(3))
@@ -232,7 +229,6 @@ tb_assert_spec! {
 	pub FailuresTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(POINTA, exactly!(2)),
 			(POINTB, exactly!(1))

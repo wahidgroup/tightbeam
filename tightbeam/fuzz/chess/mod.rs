@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
+use tightbeam::testing::fuzz::OracleAccess;
 use tightbeam::testing::{ScenarioConfig, ServletEnv, SetupEnv};
 use tightbeam::transport::policy::RestartExponentialBackoff;
 use tightbeam::transport::tcp::r#async::TokioListener;
@@ -48,7 +49,6 @@ tb_assert_spec! {
 	pub ChessAssertSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			// Core requirement: at least one move must be sent
 			(events::CLIENT_MOVE_SENT, at_least!(1)),
@@ -153,6 +153,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
+	csp: ChessGameFlow,
 	config: ScenarioConfig::builder()
 		.with_spec(ChessAssertSpec::latest())
 		.with_csp(ChessGameFlow)
@@ -166,7 +167,7 @@ tb_scenario! {
 				.with_config(context)
 				.build();
 
-			ChessEngineServlet::start(Arc::new(trace), Some(servlet_conf)).await
+			ChessEngineServlet::start(Arc::new(trace), servlet_conf).await
 		},
 		setup: |env| async move {
 			// Create a custom client with exponential backoff retry policy
@@ -220,7 +221,8 @@ tb_scenario! {
 				// Check if we have enough bytes before attempting to read
 				// For short inputs, break immediately - the loop will have run at least once
 				// if we had any bytes, satisfying the "at least 1 move" requirement
-				if !trace.oracle().fuzz_has_bytes(4).unwrap_or(false) {
+				let oracle = trace.oracle();
+				if !oracle.fuzz_has_bytes(4).unwrap_or(false) {
 					// If we haven't sent any moves yet and have no bytes, we need to send
 					// at least one move to satisfy server assertions. Use zeros.
 					if stats.move_sent_count == 0 {
@@ -232,12 +234,7 @@ tb_scenario! {
 				}
 
 				// We have bytes (or need to send synthetic move), try to read them
-				let move_req = match (
-					trace.oracle().fuzz_u8(),
-					trace.oracle().fuzz_u8(),
-					trace.oracle().fuzz_u8(),
-					trace.oracle().fuzz_u8(),
-				) {
+				let move_req = match (oracle.fuzz_u8(), oracle.fuzz_u8(), oracle.fuzz_u8(), oracle.fuzz_u8()) {
 					(Ok(fr), Ok(fc), Ok(tr), Ok(tc)) => {
 						// Generate move from fuzz bytes
 						ChessMove::from((fr, fc, tr, tc)).to_request()
@@ -290,7 +287,7 @@ tb_scenario! {
 				};
 
 				// Decode response
-				let response: ChessMoveResponse = match decode(&response_frame.message) {
+				let response: ChessMoveResponse = match decode(response_frame.message()) {
 					Ok(r) => r,
 					Err(_) => {
 						trace.event(events::CLIENT_DECODE_ERROR)?;
@@ -301,7 +298,7 @@ tb_scenario! {
 
 				// Update client game state from response matrix if present
 				// Only update board, preserve client's own move tracking
-				if let Some(ref asn1_matrix) = response_frame.metadata.matrix {
+				if let Some(asn1_matrix) = response_frame.metadata().matrix() {
 					if client_game_state.update_board_from_matrix(asn1_matrix).is_err() {
 						// Invalid matrix format - ignore and continue
 					}

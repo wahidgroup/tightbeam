@@ -72,11 +72,12 @@ macro_rules! test_job {
 		job: $job:expr,
 		assertions: |$frame:ident| async move $assertions:block
 	) => {
-		#[cfg(feature = "tokio")]
-		#[tokio::test]
-		async fn $test_name() -> ::core::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
-			let $frame = $job;
-			$assertions
+		$crate::__tb_if_tokio! {
+			#[tokio::test]
+			async fn $test_name() -> ::core::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
+				let $frame = $job;
+				$assertions
+			}
 		}
 	};
 }
@@ -184,17 +185,16 @@ macro_rules! job {
 
 #[cfg(test)]
 mod tests {
-	#[cfg(any(feature = "colony", feature = "tokio"))]
-	use crate::error::Result;
-	#[cfg(any(feature = "colony", feature = "tokio"))]
-	use crate::Frame;
-
 	#[cfg(feature = "colony")]
-	use crate::colony::common::{servlet_instance, ColonyNamespace};
+	use crate::colony::common::{ColonyNamespace, HiveManagement};
 	#[cfg(feature = "colony")]
 	use crate::colony::hive::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
+	#[cfg(any(feature = "colony", feature = "tokio"))]
+	use crate::error::Result;
 	#[cfg(feature = "colony")]
 	use crate::utils::urn::Urn;
+	#[cfg(any(feature = "colony", feature = "tokio"))]
+	use crate::Frame;
 
 	// Sync job with tuple input - implements Job trait
 	#[cfg(feature = "colony")]
@@ -269,7 +269,9 @@ mod tests {
 
 	#[cfg(feature = "colony")]
 	fn worker_instance() -> crate::utils::urn::Urn<'static> {
-		servlet_instance(&worker_type(), "127.0.0.1:8080")
+		worker_type()
+			.servlet_instance("127.0.0.1:8080")
+			.expect("a servlet type URN yields an instance URN")
 	}
 
 	#[cfg(feature = "colony")]
@@ -278,10 +280,10 @@ mod tests {
 		job: SpawnServletJob::run((worker_type(), None)),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata.id, b"spawn-req");
+			assert_eq!(frame.metadata().id(), b"spawn-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message)?;
-			let Some(spawn) = request.spawn.as_ref() else {
+			let request: HiveManagementRequest = crate::decode(frame.message())?;
+			let Ok(HiveManagement::Spawn(spawn)) = request.into_choice() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
 			assert_eq!(spawn.servlet_type, worker_type());
@@ -295,10 +297,12 @@ mod tests {
 		job: ListServletsJob::run(),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata.id, b"list-req");
+			assert_eq!(frame.metadata().id(), b"list-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message)?;
-			assert!(request.list.is_some());
+			let request: HiveManagementRequest = crate::decode(frame.message())?;
+			if !matches!(request.into_choice(), Ok(HiveManagement::List(_))) {
+				return Err(crate::testing::error::TestingError::InvariantViolated.into());
+			}
 			Ok(())
 		}
 	}
@@ -309,10 +313,10 @@ mod tests {
 		job: StopServletJob::run((worker_instance(),)),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
-			assert_eq!(frame.metadata.id, b"stop-req");
+			assert_eq!(frame.metadata().id(), b"stop-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message)?;
-			let Some(stop) = request.stop.as_ref() else {
+			let request: HiveManagementRequest = crate::decode(frame.message())?;
+			let Ok(HiveManagement::Stop(stop)) = request.into_choice() else {
 				return Err(crate::testing::error::TestingError::InvariantViolated.into());
 			};
 			assert_eq!(stop.servlet_id, worker_instance());
@@ -326,9 +330,9 @@ mod tests {
 		job: AsyncCalculationJob::run((10, 32)),
 		assertions: |frame| async move {
 			let frame = frame.await?;
-			assert_eq!(frame.metadata.id, b"calc-result");
+			assert_eq!(frame.metadata().id(), b"calc-result");
 
-			let result: crate::testing::TestMessage = crate::decode(&frame.message)?;
+			let result: crate::testing::TestMessage = crate::decode(frame.message())?;
 			assert_eq!(result.content, "42");
 			Ok(())
 		}

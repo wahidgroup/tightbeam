@@ -1,0 +1,192 @@
+//! Bounded connection acceptance.
+//!
+//! [`AcceptPlane`] is the crate's accept loop. The servlet, hive, gateway,
+//! and `server!` planes each drive one, so the connection cap, the permit
+//! lifetime, the handler task set, and the accept retry pace are stated once.
+
+use core::future::Future;
+use std::sync::Arc;
+
+use crate::constants::DEFAULT_ACCEPT_RETRY_DELAY;
+use crate::transport::protocols::AsyncListenerTrait;
+use crate::utils::time::Clock;
+
+/// Accepts connections under a fixed cap, owning what it admits.
+///
+/// One permit per live connection caps concurrent handlers, so a connection
+/// flood queues in the listener backlog, which bounds live tasks and
+/// descriptors by the cap (CWE-400). The plane owns the handler task set,
+/// so dropping it aborts those handlers and an aborted accept task ends
+/// the connections it started (CWE-772).
+pub struct AcceptPlane {
+	permits: Arc<tokio::sync::Semaphore>,
+	connections: tokio::task::JoinSet<()>,
+	/// The clock an accept failure waits out its retry delay on.
+	clock: Arc<dyn Clock>,
+}
+
+impl AcceptPlane {
+	/// Creates a plane admitting `max_connections` live handlers, pacing
+	/// accept retries on `clock`.
+	///
+	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`] is the cap every accept plane uses
+	/// unless a policy names its own.
+	///
+	/// [`DEFAULT_MAX_SERVER_CONNECTIONS`]: crate::constants::DEFAULT_MAX_SERVER_CONNECTIONS
+	#[must_use]
+	pub fn new(max_connections: usize, clock: Arc<dyn Clock>) -> Self {
+		Self {
+			permits: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+			connections: tokio::task::JoinSet::new(),
+			clock,
+		}
+	}
+
+	/// Waits for a free connection slot, reaping finished handlers first.
+	///
+	/// Returns [`None`] once the plane closes, which ends the accept loop.
+	async fn reserve(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+		while self.connections.try_join_next().is_some() {}
+		Arc::clone(&self.permits).acquire_owned().await.ok()
+	}
+
+	/// Runs `handler` on a reserved slot, releasing it on every exit path.
+	fn serve<F>(&mut self, permit: tokio::sync::OwnedSemaphorePermit, handler: F)
+	where
+		F: Future<Output = ()> + Send + 'static,
+	{
+		self.connections.spawn(async move {
+			let _permit = permit;
+			handler.await;
+		});
+	}
+
+	/// Waits out one failed accept.
+	///
+	/// A listener this plane holds stays usable, so an accept failure is a
+	/// descriptor shortage or a refused peer. The plane paces the retry and
+	/// keeps accepting. The task's owner ends the loop.
+	async fn absorb_failure(&self) {
+		self.clock.sleep(DEFAULT_ACCEPT_RETRY_DELAY).await;
+	}
+
+	/// Accepts on `listener` until the plane closes, running each admitted
+	/// transport through `handler`.
+	///
+	/// The future owns the plane, so the task a caller spawns it on owns
+	/// every connection the loop starts: aborting that task ends them all.
+	pub async fn accept_on<L, F, Fut>(self, listener: L, handler: F)
+	where
+		L: AsyncListenerTrait + Sync,
+		F: Fn(L::Transport) -> Fut,
+		Fut: Future<Output = ()> + Send + 'static,
+	{
+		self.accept_on_reporting(listener, handler, |_| async {}).await;
+	}
+
+	/// Accepts as [`AcceptPlane::accept_on`] does, handing each failed
+	/// accept to `report` before the backoff.
+	///
+	/// `report` receives the listener's own error, which a caller that
+	/// publishes accept failures on a channel converts and forwards.
+	pub async fn accept_on_reporting<L, F, Fut, R, RFut>(mut self, listener: L, handler: F, report: R)
+	where
+		L: AsyncListenerTrait + Sync,
+		F: Fn(L::Transport) -> Fut,
+		Fut: Future<Output = ()> + Send + 'static,
+		R: Fn(L::Error) -> RFut,
+		RFut: Future<Output = ()>,
+	{
+		loop {
+			let Some(permit) = self.reserve().await else {
+				break;
+			};
+
+			// `report` consumes the error before the await, so a listener
+			// whose error type is not `Send` leaves this future `Send`.
+			let failure = match listener.accept().await {
+				Ok((transport, _addr)) => {
+					self.serve(permit, handler(transport));
+					continue;
+				}
+				Err(error) => report(error),
+			};
+
+			drop(permit);
+			failure.await;
+			self.absorb_failure().await;
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use core::future::Future;
+	use core::pin::pin;
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use core::task::{Context, Waker};
+	use core::time::Duration;
+
+	use super::*;
+	use crate::utils::time::ManualClock;
+
+	fn plane(max_connections: usize) -> AcceptPlane {
+		AcceptPlane::new(max_connections, Arc::new(ManualClock::default()))
+	}
+
+	/// Serves `handler` on a slot the plane is known to have free.
+	async fn serve_on_free_slot(plane: &mut AcceptPlane, handler: impl Future<Output = ()> + Send + 'static) {
+		let permit = plane.reserve().await.expect("the plane under test has a free slot");
+		plane.serve(permit, handler);
+	}
+
+	/// A failed accept waits out its retry delay on the plane's clock, so a
+	/// runtime that installs its own clock paces the retry too.
+	#[tokio::test]
+	async fn a_failed_accept_waits_on_the_planes_clock() {
+		let clock = Arc::new(ManualClock::default());
+		let plane = AcceptPlane::new(1, Arc::clone(&clock) as Arc<dyn Clock>);
+		let mut context = Context::from_waker(Waker::noop());
+		let mut wait = pin!(plane.absorb_failure());
+		assert!(wait.as_mut().poll(&mut context).is_pending());
+
+		clock.advance(DEFAULT_ACCEPT_RETRY_DELAY);
+		assert!(wait.as_mut().poll(&mut context).is_ready());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_full_plane_admits_no_further_connection() {
+		let mut plane = plane(1);
+		let _held = plane.reserve().await;
+		let blocked = tokio::time::timeout(Duration::from_secs(1), plane.reserve()).await;
+		assert!(blocked.is_err());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_finished_connection_returns_its_slot() {
+		let mut plane = plane(1);
+		serve_on_free_slot(&mut plane, async {}).await;
+		tokio::task::yield_now().await;
+
+		let reserved = tokio::time::timeout(Duration::from_secs(1), plane.reserve()).await;
+		assert!(reserved.is_ok());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn dropping_the_plane_aborts_its_connections() {
+		static FINISHED: AtomicBool = AtomicBool::new(false);
+
+		let mut plane = plane(1);
+		serve_on_free_slot(&mut plane, async {
+			tokio::time::sleep(Duration::from_secs(30)).await;
+			FINISHED.store(true, Ordering::SeqCst);
+		})
+		.await;
+
+		tokio::task::yield_now().await;
+		drop(plane);
+		tokio::time::advance(Duration::from_secs(60)).await;
+		tokio::task::yield_now().await;
+		assert!(!FINISHED.load(Ordering::SeqCst));
+	}
+}
