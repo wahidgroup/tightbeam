@@ -1,5 +1,3 @@
-use crate::tb_cases;
-use crate::utils::basis_points::BasisPointsOutOfRange;
 use core::mem::discriminant;
 use core::str::from_utf8;
 use core::time::Duration;
@@ -15,6 +13,8 @@ use crate::colony::cluster::peer::{AdmittedPeerAd, RelayTrail};
 use crate::colony::cluster::{AdmittedDial, PeerAddress};
 use crate::colony::common::ServletTypeKey;
 use crate::colony::common::MAX_PHEROMONE;
+use crate::tb_cases;
+use crate::utils::basis_points::BasisPointsOutOfRange;
 use crate::utils::time::{Clock, ManualClock, UnixMillis};
 use crate::utils::BasisPoints;
 
@@ -1250,8 +1250,8 @@ tb_cases! {
 		let added = hive_slate(case.caller_hive, case.add.map(|(a, t, h)| named_entry(a, t, h)));
 		let result = registry.apply_address_update(added, case.remove);
 		let outcome = result.as_ref().err().map(core::mem::discriminant);
-
 		assert_eq!(outcome, case.expected.as_ref().map(core::mem::discriminant));
+
 		let expected_routes: Vec<(SharedId, SharedId)> = case
 			.expected_routes
 			.iter()
@@ -1288,6 +1288,16 @@ tb_cases! {
 			remove: &[b"old"],
 			expected: None,
 			expected_routes: &[(b"new", b"hive-a")],
+		},
+		// A restart that reuses its listen address removes and re-adds the
+		// same locator in one update, and the instance stays routed.
+		owner_readds_the_address_it_removes => ApplyAddressUpdateCase {
+			seed: (b"reused", b"calc", b"hive-a"),
+			caller_hive: b"hive-a",
+			add: Some((b"reused", b"calc", b"hive-a")),
+			remove: &[b"reused"],
+			expected: None,
+			expected_routes: &[(b"reused", b"hive-a")],
 		},
 		// A removal naming an absent locator must refuse, because a success
 		// would report a removal that never happened.

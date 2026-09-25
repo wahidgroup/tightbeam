@@ -465,11 +465,13 @@ impl Routes {
 			self.held_by(RouteClaim { owner, key: address })?;
 		}
 
-		for entry in added {
-			self.place(entry, now);
-		}
+		// Removals run first, so a locator the update both removes and adds,
+		// as a restart that reuses its listen address does, stays routed.
 		for address in removed {
 			self.remove(address);
+		}
+		for entry in added {
+			self.place(entry, now);
 		}
 
 		Ok(())
