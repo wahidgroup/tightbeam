@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use futures::channel::{mpsc, oneshot};
 
 use super::body::{BodyEvent, ForwardedStream};
-use super::flow::{cap_as_usize, chunk_records, payload_credits, ChunkSize};
+use super::flow::{cap_as_usize, ChunkSize};
 use super::outbound::Outbound;
 use crate::transport::envelopes::{
 	CancelReason, GoAwayReason, MuxOpenPackage, MuxStreamKind, ResponsePackage, TransportEnvelope,
@@ -406,6 +406,18 @@ impl MuxShared {
 
 	fn lock(&self) -> MutexGuard<'_, MuxState> {
 		self.state.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Session-budget credits an outbound payload debits at the peer's
+	/// receive chunk size and the negotiated credit unit.
+	pub fn credits_for(&self, payload_len: usize) -> u64 {
+		self.send_chunk_size.credits(payload_len, self.credit_unit)
+	}
+
+	/// Chunk records an outbound payload occupies at the peer's receive chunk
+	/// size.
+	pub fn records_for(&self, payload_len: usize) -> u64 {
+		self.send_chunk_size.records(payload_len)
 	}
 
 	/// Future that resolves once a locally-initiated stream would be
@@ -901,9 +913,9 @@ impl MuxShared {
 		payload_len: usize,
 		reserved: bool,
 	) -> TransportResult<BudgetStanding> {
-		let credits = payload_credits(payload_len, self.send_chunk_size, self.credit_unit);
+		let credits = self.credits_for(payload_len);
 		let standing = self.admit_debit(credits, reserved).await?;
-		self.add_send_records(stream_id, chunk_records(payload_len, self.send_chunk_size));
+		self.add_send_records(stream_id, self.records_for(payload_len));
 		Ok(standing)
 	}
 
@@ -1306,7 +1318,6 @@ impl CancelReason {
 mod tests {
 	use super::super::body::StreamBody;
 	use super::super::link::MuxLink;
-	use super::super::outbound::outbound_handle;
 	use super::super::testing::noop_cx;
 	use super::*;
 
@@ -2035,10 +2046,11 @@ mod tests {
 		allocate_ids(&shared, [1]);
 
 		let (outbound, mut wire) = mpsc::channel(0);
-		let mut filler = outbound_handle(&outbound);
+		let mut filler = outbound.clone();
 		while filler.try_send(Outbound::Close).is_ok() {}
 
-		MuxLink::new(shared, outbound).enqueue_stream_cancel(1);
+		let (link, _) = MuxLink::new(shared, outbound);
+		link.enqueue_stream_cancel(1);
 
 		let mut saw_cancel = false;
 		while let Ok(command) = wire.try_recv() {
@@ -2061,9 +2073,9 @@ mod tests {
 		let (feedback, _notes) = mpsc::unbounded();
 		let (mut kept, below) = StreamBody::pair(OpenSlot::assigned(1), 4, feedback.clone());
 		let (mut disowned, above) = StreamBody::pair(OpenSlot::assigned(3), 4, feedback);
+
 		shared.insert_duplex(1, below);
 		shared.insert_duplex(3, above);
-
 		shared.fail_duplex_above(1);
 
 		assert!(matches!(kept.poll_chunk_now(), Poll::Pending));

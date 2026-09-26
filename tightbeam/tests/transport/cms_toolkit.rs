@@ -17,9 +17,11 @@
 ))]
 
 use tightbeam::asn1::Any;
+use tightbeam::cms::builder::RecipientInfoBuilder;
 use tightbeam::cms::cert::IssuerAndSerialNumber;
-use tightbeam::cms::enveloped_data::{EnvelopedData, KeyAgreeRecipientIdentifier, UserKeyingMaterial};
-use tightbeam::constants::TIGHTBEAM_KARI_KDF_INFO;
+use tightbeam::cms::enveloped_data::{
+	EncryptedKey, EnvelopedData, KeyAgreeRecipientIdentifier, KeyAgreeRecipientInfo, RecipientInfo, UserKeyingMaterial,
+};
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::secret::ToInsecure;
@@ -38,11 +40,10 @@ use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::builders::{
 	TightBeamEnvelopedDataBuilder, TightBeamKariBuilder, TightBeamSignedDataBuilder,
 };
-use tightbeam::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use tightbeam::transport::handshake::processors::{
 	TightBeamEnvelopedDataProcessor, TightBeamKariRecipient, TightBeamSignedDataProcessor,
 };
-use tightbeam::transport::handshake::{kari_unwrap, kari_wrap, HandshakeAttribute, HandshakeError};
+use tightbeam::transport::handshake::{HandshakeAttribute, HandshakeError};
 use tightbeam::x509::name::Name;
 use tightbeam::x509::serial_number::SerialNumber;
 
@@ -71,6 +72,15 @@ fn recipient_identifier() -> Result<KeyAgreeRecipientIdentifier, HandshakeError>
 	}))
 }
 
+/// Open the KARI variant a [`TightBeamKariBuilder`] produces.
+fn open_kari(recipient_info: RecipientInfo) -> KeyAgreeRecipientInfo {
+	let RecipientInfo::Kari(kari) = recipient_info else {
+		panic!("the KARI builder produces a KeyAgreeRecipientInfo");
+	};
+
+	kari
+}
+
 tb_assert_spec! {
 	pub KariCekSpec,
 	V(1,0,0): {
@@ -89,33 +99,49 @@ tb_scenario! {
 	spec: KariCekSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let provider = DefaultCryptoProvider::default();
 			let sender = SecretKey::random(&mut OsRng);
 			let recipient = SecretKey::random(&mut OsRng);
 			let intruder = SecretKey::random(&mut OsRng);
-			let ukm = generate_nonce::<64>(None)?;
+			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender.public_key())?;
+			let ukm = UserKeyingMaterial::new(generate_nonce::<64>(None)?.to_vec())?;
 			let cek = [0x42u8; 32];
 
-			let wrapped = kari_wrap(&provider, &sender, &recipient.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &cek)?;
-			assert_ne!(wrapped.as_slice(), cek.as_slice(), "wrapped CEK must not expose the plaintext CEK");
+			let mut builder = TightBeamKariBuilder::default()
+				.with_sender_priv(sender)
+				.with_sender_pub_spki(sender_spki)
+				.with_recipient_pub(recipient.public_key())
+				.with_recipient_rid(recipient_identifier()?)
+				.with_ukm(ukm)
+				.with_key_enc_alg(AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None });
+
+			let recipient_info = builder.build(&cek).map_err(HandshakeError::CmsBuilderError)?;
+			let kari = open_kari(recipient_info);
+			let wrapped_entry = kari.recipient_enc_keys.first().ok_or(HandshakeError::InvalidRecipientIndex)?;
+			let wrapped = wrapped_entry.enc_key.as_bytes();
+			assert_ne!(wrapped, cek.as_slice(), "wrapped CEK must not expose the plaintext CEK");
+
 			trace.event(CEK_WRAPPED)?;
 
-			let unwrapped =
-				kari_unwrap(&provider, &recipient, &sender.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &wrapped)?;
+			let recipient_processor = TightBeamKariRecipient::with_defaults(recipient);
+			let unwrapped = recipient_processor.process_kari(&kari, 0)?;
 			assert_eq!(unwrapped.to_insecure().as_slice(), cek.as_slice(), "recipient must recover the exact CEK");
 
 			trace.event(CEK_RECOVERED)?;
 
-			let wrong =
-				kari_unwrap(&provider, &intruder, &sender.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &wrapped);
+			let intruder_processor = TightBeamKariRecipient::with_defaults(intruder);
+			let wrong = intruder_processor.process_kari(&kari, 0);
 			assert!(wrong.is_err(), "a foreign recipient key must fail the unwrap integrity check");
 
 			trace.event(WRONG_KEY_REJECTED)?;
 
-			let mut tampered = wrapped;
-			tampered[0] ^= 0x01;
-			let forged =
-				kari_unwrap(&provider, &recipient, &sender.public_key(), KdfSalt::new(&ukm), KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO), &tampered);
+			let mut tampered_bytes = wrapped.to_vec();
+			tampered_bytes[0] ^= 0x01;
+
+			let mut tampered = kari.clone();
+			let tampered_entry = tampered.recipient_enc_keys.first_mut().ok_or(HandshakeError::InvalidRecipientIndex)?;
+			tampered_entry.enc_key = EncryptedKey::new(tampered_bytes)?;
+
+			let forged = recipient_processor.process_kari(&tampered, 0);
 			assert!(forged.is_err(), "a tampered wrapped CEK must fail the unwrap integrity check");
 
 			trace.event(TAMPER_REJECTED)?;

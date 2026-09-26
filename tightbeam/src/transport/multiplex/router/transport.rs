@@ -8,7 +8,6 @@ use futures::channel::mpsc;
 use super::flow::{cap_as_usize, CreditGrantor};
 use super::handle::MuxHandle;
 use super::link::MuxLink;
-use super::outbound::outbound_handle;
 use super::reader::MuxReaderDriver;
 use super::responder::MuxResponder;
 use super::shared::MuxShared;
@@ -76,21 +75,11 @@ where
 
 		let shared = Arc::new(shared);
 		let drain_headroom = settings.drain_reserve_records();
-		let reader = MuxReaderDriver::new(
-			reader,
-			Arc::clone(&shared),
-			inbound_sender,
-			outbound_handle(&outbound_sender),
-			&settings,
-		);
-
-		let handle = MuxHandle::new(
-			MuxLink::new(Arc::clone(&shared), outbound_handle(&outbound_sender)),
-			reader.drain_feedback(),
-		);
-
 		let writer = MuxWriterDriver::new(writer, outbound_receiver, Arc::clone(&shared), drain_headroom);
-		let responder = MuxResponder::new(inbound_receiver, outbound_sender, shared, settings.peer_initiated_cap);
+		let (link, drained) = MuxLink::new(shared, outbound_sender);
+		let reader = MuxReaderDriver::new(reader, link.clone(), inbound_sender, drained, &settings);
+		let handle = MuxHandle::new(link.clone());
+		let responder = MuxResponder::new(inbound_receiver, link, settings.peer_initiated_cap);
 
 		Self { handle, reader, writer, responder }
 	}
@@ -184,6 +173,20 @@ where
 		});
 
 		SpawnedMux { handle, responder, reader_task }
+	}
+
+	/// Apply the optional cancel budget and rekey context, then spawn both
+	/// drivers through [`MuxTransport::spawn`].
+	#[cfg(pooled_mux)]
+	pub(crate) fn spawn_with(mut self, cancel_budget: Option<u32>, rekey: Option<MuxRekeyContext>) -> SpawnedMux {
+		if let Some(budget) = cancel_budget {
+			self = self.with_cancel_budget(budget);
+		}
+		if let Some(context) = rekey {
+			self = self.with_rekey(context);
+		}
+
+		self.spawn()
 	}
 }
 

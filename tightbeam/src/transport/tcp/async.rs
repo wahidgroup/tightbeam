@@ -31,7 +31,6 @@ use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportFailure;
-use crate::transport::io::decode_transport_envelope;
 use crate::transport::protocols::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream};
 use crate::transport::ResponsePackage;
 use crate::transport::{
@@ -289,13 +288,12 @@ where
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 mod mux {
-	pub(crate) use crate::transport::io::take_rekey_context;
 	pub use crate::transport::multiplex::{
 		IntoMuxOffer, MuxCapable, MuxConnector, MuxRekeyContext, MuxRole, MuxTransport,
 	};
 
 	#[cfg(feature = "transport-policy")]
-	pub(crate) use crate::transport::messaging::{collect_step, CollectStep};
+	pub(crate) use crate::transport::io::CollectStep;
 	#[cfg(feature = "transport-policy")]
 	pub use crate::transport::multiplex::{GatedHalves, MuxAcceptor};
 }
@@ -372,7 +370,7 @@ where
 			return Err(TransportError::InvalidState);
 		};
 
-		let rekey = take_rekey_context(&mut self, role)?;
+		let rekey = MuxRekeyContext::detach(&mut self, role)?;
 		let (reader, writer) = self.into_split()?;
 
 		let mut mux = MuxTransport::new(reader, writer, role, settings);
@@ -422,7 +420,7 @@ where
 	}
 
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
-		take_rekey_context(self, MuxRole::Client)
+		MuxRekeyContext::detach(self, MuxRole::Client)
 	}
 
 	fn handshake_peer_certificate(&self) -> Option<Arc<Certificate>> {
@@ -457,7 +455,7 @@ where
 		}
 
 		while !matches!(self.state.phase(), SessionPhase::Encrypted(_)) {
-			match collect_step(self).await? {
+			match self.collect_step().await? {
 				CollectStep::Handshake(request) => {
 					self.perform_server_handshake(request).await?;
 				}
@@ -469,7 +467,7 @@ where
 	}
 
 	fn take_rekey(&mut self) -> TransportResult<Option<MuxRekeyContext>> {
-		take_rekey_context(self, MuxRole::Server)
+		MuxRekeyContext::detach(self, MuxRole::Server)
 	}
 
 	#[cfg(feature = "transport-policy")]
@@ -585,7 +583,7 @@ where
 			(SplitRecv::Encrypted(_), WireEnvelope::Cleartext(_)) => Err(TransportError::MissingEncryption),
 			(SplitRecv::Encrypted(recv_key), WireEnvelope::Encrypted(encrypted_info)) => {
 				let decrypted_bytes = recv_key.decrypt_content(&encrypted_info)?;
-				let envelope = decrypted_bytes.with(|bytes| decode_transport_envelope(bytes))?;
+				let envelope = decrypted_bytes.with(|bytes| TransportEnvelope::from_der(bytes))?;
 				Ok(envelope)
 			}
 		}

@@ -294,12 +294,6 @@ pub enum HandshakeError {
 	#[from]
 	AesKeyWrap(crate::crypto::aead::aes_kw::Error),
 
-	/// The integrity check on the combined ECDH and KEM key failed during
-	/// hybrid key agreement.
-	#[cfg(feature = "kem")]
-	#[error("Hybrid key agreement integrity check failed: combined ECDH+KEM key validation error")]
-	HybridKariIntegrityCheckFailed,
-
 	/// Random generation failed.
 	#[error("Random generation failed")]
 	RandomGenerationFailed,
@@ -394,14 +388,12 @@ mod tests {
 	#[test]
 	fn a_missing_client_certificate_is_a_certificate_rejection() {
 		let event = HandshakeError::MissingClientCertificate.audit_event();
-
 		assert_eq!(event, Some(events::SESSION_CERT_REJECTED));
 	}
 
 	#[test]
 	fn a_refused_approval_is_a_receipt_refusal() {
 		let event = HandshakeError::ApprovalRefused { code: 7 }.audit_event();
-
 		assert_eq!(event, Some(events::SESSION_RECEIPT_REFUSED));
 	}
 

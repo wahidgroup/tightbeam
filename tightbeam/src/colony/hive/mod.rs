@@ -40,7 +40,6 @@ use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
 use crate::transport::multiplex::{RequestSink, StreamBody};
 use crate::transport::policy::CoreRetryPolicy;
-use crate::transport::serve::unimplemented_error;
 use crate::transport::state::ClientIdentity;
 use crate::transport::Protocol;
 use crate::utils::time::{Clock, SystemClock};
@@ -583,7 +582,7 @@ pub trait HiveContext: Send + Sync {
 	/// implementation without a mux-capable pool stays valid.
 	fn open_stream<'a>(&'a self, servlet_type: &'a Urn<'a>) -> StreamOpenFuture<'a> {
 		let _ = servlet_type;
-		Box::pin(async { Err(unimplemented_error()) })
+		Box::pin(async { Err(TightBeamError::unimplemented()) })
 	}
 
 	/// Opens a duplex stream to a sibling servlet.
@@ -596,7 +595,7 @@ pub trait HiveContext: Send + Sync {
 	/// implementation without a mux-capable pool stays valid.
 	fn open_duplex<'a>(&'a self, servlet_type: &'a Urn<'a>) -> DuplexOpenFuture<'a> {
 		let _ = servlet_type;
-		Box::pin(async { Err(unimplemented_error()) })
+		Box::pin(async { Err(TightBeamError::unimplemented()) })
 	}
 }
 

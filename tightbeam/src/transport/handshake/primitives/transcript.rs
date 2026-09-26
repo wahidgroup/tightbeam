@@ -3,7 +3,10 @@
 //! The module computes cryptographic hashes over handshake message
 //! sequences, which protects transcript integrity.
 
-#[cfg(all(not(feature = "std"), feature = "transport-cms"))]
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use alloc::vec::Vec;
 
 #[cfg(feature = "transport-cms")]
@@ -22,7 +25,7 @@ pub const TRANSCRIPT_HASH_LEN: usize = 32;
 /// their leading 32 bytes, following the NIST SHA-512/256 construction: the
 /// wire format carries exactly 32 bytes and the leading bytes of a wider
 /// digest retain full 256-bit collision resistance (CWE-1240).
-pub(crate) fn digest_output_to_array(bytes: impl AsRef<[u8]>) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+fn digest_output_to_array(bytes: impl AsRef<[u8]>) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
 	let bytes = bytes.as_ref();
 	if bytes.len() < TRANSCRIPT_HASH_LEN {
 		return Err(HandshakeError::TranscriptDigestLength { expected: TRANSCRIPT_HASH_LEN, received: bytes.len() });
@@ -50,25 +53,101 @@ pub fn transcript_hash<P: CryptoProvider>(messages: &[&[u8]]) -> Result<[u8; TRA
 	digest_output_to_array(hasher.finalize())
 }
 
-/// The bytes a CMS handshake binds, and then their hash once sealed.
+/// The bytes a handshake binds, and then their hash once sealed.
 ///
 /// Only an open transcript accepts bytes, so nothing reaches the transcript
 /// after both Finished messages fixed their hash. The state stays private, so
 /// a hash exists only where [`Transcript::seal`] computed it.
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) struct Transcript(State);
 
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 enum State {
 	/// The messages exchanged so far, in the order both endpoints hash them.
 	Open(Vec<u8>),
-	/// The transcript hash both Finished messages sign.
+	/// The transcript hash both Finished messages sign. `Transcript::hash`
+	/// reads it back for the CMS Finished exchange.
+	#[cfg_attr(not(feature = "transport-cms"), allow(dead_code))]
 	Sealed([u8; TRANSCRIPT_HASH_LEN]),
 }
 
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl Transcript {
+	/// Compute the 32-byte transcript digest under digest algorithm `D`.
+	///
+	/// A wider digest, such as SHA3-512, truncates to its leading 32 bytes.
+	pub(crate) fn digest<D: Digest>(bytes: impl AsRef<[u8]>) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
+		let bytes = bytes.as_ref();
+		digest_output_to_array(D::digest(bytes))
+	}
+
+	/// Open the ECIES handshake transcript over its ordered legs.
+	///
+	/// Both roles derive this identically. A divergence here is a protocol
+	/// break, so the concatenation order lives in one place. The hash binds the
+	/// client hello, the server random, the server SPKI, and both accept
+	/// encodings (CWE-347).
+	///
+	/// # Parameters
+	///
+	/// - `client_hello`: the DER of the client hello message.
+	/// - `server_random`: the 32-byte server random.
+	/// - `spki`: the DER of the server SubjectPublicKeyInfo.
+	/// - `security_accept_der`: the DER of the handshake accept.
+	/// - `transport_accept_der`: the DER of the transport accept.
+	#[cfg(feature = "transport-ecies")]
+	pub(crate) fn ecies_handshake(
+		client_hello: impl AsRef<[u8]>,
+		server_random: &[u8; 32],
+		spki: impl AsRef<[u8]>,
+		security_accept_der: impl AsRef<[u8]>,
+		transport_accept_der: impl AsRef<[u8]>,
+	) -> Self {
+		let client_hello = client_hello.as_ref();
+		let spki = spki.as_ref();
+		let security_accept_der = security_accept_der.as_ref();
+		let transport_accept_der = transport_accept_der.as_ref();
+		let len = client_hello.len() + 32 + spki.len() + security_accept_der.len() + transport_accept_der.len();
+
+		let mut buffer = Vec::with_capacity(len);
+		buffer.extend_from_slice(client_hello);
+		buffer.extend_from_slice(server_random);
+		buffer.extend_from_slice(spki);
+		buffer.extend_from_slice(security_accept_der);
+		buffer.extend_from_slice(transport_accept_der);
+		Self(State::Open(buffer))
+	}
+
+	/// Open the ECIES client mutual-auth transcript.
+	///
+	/// The digest binds the transcript hash, the ECIES-encrypted key exchange
+	/// payload, and the client certificate into a single value that the client
+	/// signs. A valid client signature therefore cannot be spliced onto a
+	/// different key exchange or a different identity (CWE-347).
+	///
+	/// # Parameters
+	///
+	/// - `transcript_hash`: the 32-byte handshake transcript hash.
+	/// - `encrypted_data`: the ECIES-encrypted key exchange bytes.
+	/// - `client_cert_der`: the DER encoding of the client certificate.
+	#[cfg(feature = "transport-ecies")]
+	pub(crate) fn ecies_client_auth(
+		transcript_hash: &[u8; 32],
+		encrypted_data: impl AsRef<[u8]>,
+		client_cert_der: impl AsRef<[u8]>,
+	) -> Self {
+		let encrypted_data = encrypted_data.as_ref();
+		let client_cert_der = client_cert_der.as_ref();
+
+		let mut buffer = Vec::with_capacity(32 + encrypted_data.len() + client_cert_der.len());
+		buffer.extend_from_slice(transcript_hash);
+		buffer.extend_from_slice(encrypted_data);
+		buffer.extend_from_slice(client_cert_der);
+		Self(State::Open(buffer))
+	}
+
 	/// Create an open transcript that holds no bytes.
+	#[cfg(feature = "transport-cms")]
 	pub(crate) const fn new() -> Self {
 		Self(State::Open(Vec::new()))
 	}
@@ -78,6 +157,7 @@ impl Transcript {
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- the transcript is sealed.
+	#[cfg(feature = "transport-cms")]
 	pub(crate) fn append(&mut self, bytes: impl AsRef<[u8]>) -> Result<(), HandshakeError> {
 		match &mut self.0 {
 			State::Open(buffer) => {
@@ -100,7 +180,7 @@ impl Transcript {
 			return Err(HandshakeError::InvalidState);
 		};
 
-		let hash = digest_output_to_array(D::digest(buffer))?;
+		let hash = Self::digest::<D>(buffer)?;
 		self.0 = State::Sealed(hash);
 		Ok(hash)
 	}
@@ -110,6 +190,7 @@ impl Transcript {
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidTranscriptHash`] -- the transcript is still open.
+	#[cfg(feature = "transport-cms")]
 	pub(crate) fn hash(&self) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
 		match &self.0 {
 			State::Sealed(hash) => Ok(*hash),
@@ -224,6 +305,21 @@ mod tests {
 		let hash_forward = transcript_hash::<DefaultCryptoProvider>(&[msg1, msg2])?;
 		let hash_reverse = transcript_hash::<DefaultCryptoProvider>(&[msg2, msg1])?;
 		assert_ne!(hash_forward, hash_reverse);
+		Ok(())
+	}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[test]
+	fn test_transcript_digest_widths() -> Result<(), HandshakeError> {
+		use crate::crypto::hash::{Sha3_256, Sha3_512};
+
+		let digest = Transcript::digest::<Sha3_256>(b"transcript")?;
+		assert_eq!(digest.len(), 32);
+
+		// Wider digests truncate to their leading 32 bytes (SHA-512/256 style).
+		let wide = Transcript::digest::<Sha3_512>(b"transcript")?;
+		assert_eq!(wide.as_slice(), &Sha3_512::digest(b"transcript")[..32]);
+
 		Ok(())
 	}
 

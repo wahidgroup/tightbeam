@@ -1,8 +1,6 @@
 //! Writer-queue command protocol: the one vocabulary every producer
 //! (handle, sinks, reader, responder) shares with the writer driver.
 
-use futures::channel::mpsc;
-
 use crate::transport::envelopes::{MuxEnvelope, TransportEnvelope};
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -36,10 +34,4 @@ impl Outbound {
 	pub(crate) fn is_ping_ack(&self) -> bool {
 		matches!(self, Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Ping(_))))
 	}
-}
-
-/// Exclusive outbound handle for `SinkExt::send` / `try_send`.
-/// `mpsc::Sender` is Arc-backed so this is a refcount bump.
-pub fn outbound_handle(outbound: &mpsc::Sender<Outbound>) -> mpsc::Sender<Outbound> {
-	outbound.clone()
 }

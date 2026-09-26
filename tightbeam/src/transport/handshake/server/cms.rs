@@ -38,31 +38,27 @@ use crate::der::{Any, Decode, Encode};
 use crate::oids::{self, DATA};
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::spki::EncodePublicKey;
+use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::attributes::HandshakeAttributes;
-use crate::transport::handshake::attributes::{self, HandshakeAttribute};
-use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::kari::HandshakeKek;
-use crate::transport::handshake::kari::{key_wrap_key_size, unwrap_and_verify_with_kek, Kek};
+use crate::transport::handshake::kari::{HandshakeKek, Kek};
 use crate::transport::handshake::negotiation::{
 	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer, StrengthFloor, TransportAccept,
 	TransportAuthorizer, TransportNegotiation, TransportOffer,
 };
+use crate::transport::handshake::orchestrator::HandshakeVerifyingKey;
 use crate::transport::handshake::primitives::transcript::{FinishedRole, Transcript};
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
-	record_receipt_outcome, sign_receipt, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict,
-	StoredReceipt,
+	SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
 };
 use crate::transport::handshake::state::{Cms, ServerHandshakeState, ServerStateMachine};
-use crate::transport::handshake::utils::validate_state;
-use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::ServerHandshakeProtocol;
 use crate::transport::handshake::{AdmittedPeer, EstablishedSession, HandshakeMessage, PeerAuthentication};
-use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
+use crate::transport::handshake::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
@@ -200,7 +196,7 @@ where
 
 	/// Validate that the current state matches the expected state.
 	fn validate_expected_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
-		validate_state(self.state.state(), expected)
+		self.state.expect_state(expected)
 	}
 
 	/// Negotiate the security profile from the SecurityOffer in the
@@ -208,9 +204,8 @@ where
 	///
 	/// The steps apply in order:
 	///
-	/// 1. Convert the `x509_cert` attributes to `HandshakeAttributes`.
-	/// 2. Find the SecurityOffer among them.
-	/// 3. Negotiate a profile, or apply dealer's choice.
+	/// 1. Find the SecurityOffer among the `x509_cert` attributes.
+	/// 2. Negotiate a profile, or apply dealer's choice.
 	fn process_security_offer(&mut self, unprotected_attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		// With no attributes and no configured profiles, negotiation is
 		// skipped.
@@ -219,9 +214,7 @@ where
 		}
 
 		let offer = unprotected_attrs.and_then(|attrs| {
-			let handshake_attrs = self.convert_to_handshake_attributes(attrs).ok()?;
-			let offer_attr = attributes::find(&handshake_attrs, &oids::HANDSHAKE_SECURITY_OFFER).ok()?;
-
+			let offer_attr = attrs.find_unsigned_attr(oids::HANDSHAKE_SECURITY_OFFER).ok().flatten()?;
 			offer_attr.decode::<SecurityOffer>().ok()
 		});
 
@@ -237,8 +230,7 @@ where
 	/// configured authorizer decides the budget grant.
 	async fn process_transport_offer(&mut self, unprotected_attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		let offer = unprotected_attrs.and_then(|attrs| {
-			let handshake_attrs = self.convert_to_handshake_attributes(attrs).ok()?;
-			let offer_attr = attributes::find(&handshake_attrs, &oids::HANDSHAKE_TRANSPORT_OFFER).ok()?;
+			let offer_attr = attrs.find_unsigned_attr(oids::HANDSHAKE_TRANSPORT_OFFER).ok().flatten()?;
 			offer_attr.decode::<TransportOffer>().ok()
 		});
 
@@ -254,21 +246,6 @@ where
 		}
 
 		Ok(())
-	}
-
-	/// Convert `Attributes` to the `HandshakeAttribute` form.
-	fn convert_to_handshake_attributes(
-		&self,
-		attrs: &Attributes,
-	) -> Result<Vec<attributes::HandshakeAttribute>, HandshakeError> {
-		attrs
-			.iter()
-			.map(|attr| {
-				// HandshakeAttribute owns its value set, and `Attributes` keeps
-				// the source.
-				Ok(attributes::HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() })
-			})
-			.collect()
 	}
 
 	/// Extract the verifying key of the certificate that MUST verify the
@@ -353,10 +330,9 @@ where
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let provider = P::default();
 
-		let key_size = key_wrap_key_size::<P>()?;
 		let ukm_salt = KdfSalt::new(ukm.as_bytes());
 		let kari_label = KdfInfo::new(TIGHTBEAM_KARI_KDF_INFO);
-		let kek = shared_secret.derive_kek::<P>(ukm_salt, kari_label, key_size)?;
+		let kek = shared_secret.derive_kek::<P>(ukm_salt, kari_label)?;
 
 		// `recipient_enc_keys` is an unauthenticated DER SEQUENCE OF that can
 		// decode empty, so index it only after a length check.
@@ -366,14 +342,15 @@ where
 			.ok_or(HandshakeError::InvalidClientKeyExchange)?
 			.enc_key
 			.as_bytes();
-		let cek = unwrap_and_verify_with_kek(&provider, Kek::new(kek.as_slice()), wrapped_key)?;
 
+		let cek = Kek::new(kek.as_slice()).unwrap_verified(&provider, wrapped_key)?;
 		let cipher = cek.with(|cek| {
 			P::AeadCipher::new_from_slice(cek).map_err(|_| HandshakeError::InvalidKeySize {
 				expected: <P::AeadCipher as KeySizeUser>::KeySize::USIZE,
 				received: cek.len(),
 			})
 		})?;
+
 		Ok(cipher.decrypt_content(&enveloped_data.encrypted_content)?)
 	}
 
@@ -555,7 +532,7 @@ where
 		let transcript_digest = self.transcript.hash()?;
 		let credit_unit = accept.credit_unit;
 		let challenge = self.settlement_challenge.take();
-		let (receipt, artifact) = sign_receipt::<P::Digest>(
+		let (receipt, artifact) = SessionReceipt::issue::<P::Digest>(
 			transcript_digest,
 			granted,
 			credit_unit,
@@ -610,7 +587,7 @@ where
 		//    derivation with the transcript hash, so it doubles as the epoch
 		//    salt here.
 		let epoch_salt = KdfSalt::new(&transcript);
-		let materials = cek.with(|input_key| derive_epoch_materials::<P>(input_key, epoch_salt, transcript))?;
+		let materials = cek.with(|input_key| EpochMaterials::derive::<P>(input_key, epoch_salt, transcript))?;
 
 		// 5. Transition to complete
 		self.state.transition(ServerHandshakeState::Completed)?;
@@ -767,7 +744,7 @@ where
 			verdict,
 		};
 
-		let stored_receipt = record_receipt_outcome(self.session_observer.as_deref(), outcome).await?;
+		let stored_receipt = outcome.record(self.session_observer.as_deref()).await?;
 		self.stored_receipt = Some(stored_receipt);
 
 		Ok(())
@@ -943,8 +920,8 @@ mod tests {
 		use crate::transport::handshake::builders::{
 			TightBeamEnvelopedDataBuilder, TightBeamKariBuilder, TightBeamSignedDataBuilder,
 		};
+		use crate::transport::handshake::primitives::transcript::Transcript;
 		use crate::transport::handshake::tests::*;
-		use crate::transport::handshake::utils::compute_transcript_digest;
 
 		const TEST_SESSION_KEY: [u8; 32] = [2u8; 32];
 
@@ -974,8 +951,8 @@ mod tests {
 				.econtent
 				.as_ref()
 				.expect("a Finished carries content");
-			let content = content.decode_as::<OctetString>().expect("the content is an OCTET STRING");
 
+			let content = content.decode_as::<OctetString>().expect("the content is an OCTET STRING");
 			FinishedRole::Server
 				.transcript_hash(content.as_bytes())
 				.expect("the content names the server role")
@@ -986,9 +963,9 @@ mod tests {
 			let oid = ObjectIdentifier::new_unwrap("1.2.3.4")
 				.push_arc(arc)
 				.expect("the arc extends the OID");
+
 			let octets = OctetString::new(arc.to_be_bytes()).expect("four bytes fit an OCTET STRING");
 			let value = Any::encode_from(&octets).expect("an OCTET STRING encodes");
-
 			HandshakeAttribute::new_single(oid, value).expect("one value makes an attribute")
 		}
 
@@ -1021,8 +998,8 @@ mod tests {
 			let envelope = TransportEnvelope::EnvelopedData(Box::new(sent));
 			let wire = envelope.to_der().expect("the envelope encodes");
 			let received = TransportEnvelope::from_der(&wire).expect("the envelope decodes");
-			let message = HandshakeMessage::try_from(received).expect("the envelope carries a handshake container");
 
+			let message = HandshakeMessage::try_from(received).expect("the envelope carries a handshake container");
 			message.enveloped().expect("the container is the key exchange")
 		}
 
@@ -1073,10 +1050,10 @@ mod tests {
 			let mut server = server.with_supported_profiles(vec![create_default_test_profile()]);
 			let client = create_test_certificate();
 			let client_finished = client_finished_for(&mut server, &server_public_key, &client).await;
+
 			server.process_client_finished(&client_finished)?;
 
 			let session = server.take_established()?;
-
 			assert!(session.peer().is_none());
 			Ok(())
 		}
@@ -1090,12 +1067,13 @@ mod tests {
 			let (server, server_public_key) = TestCmsServerBuilder::new()
 				.with_peer_authentication(mutual_with(pinned))
 				.build();
+
 			let mut server = server.with_supported_profiles(vec![create_default_test_profile()]);
 			let client_finished = client_finished_for(&mut server, &server_public_key, &client).await;
+
 			server.process_client_finished(&client_finished)?;
 
 			let session = server.take_established()?;
-
 			assert_eq!(session.peer(), Some(&client.certificate));
 			Ok(())
 		}
@@ -1109,11 +1087,11 @@ mod tests {
 			let (mut server, server_public_key) = TestCmsServerBuilder::new()
 				.with_peer_authentication(mutual_with(refusing))
 				.build();
+
 			let client = create_test_certificate();
 			let client_finished = client_finished_for(&mut server, &server_public_key, &client).await;
 
 			let refusal = server.process_client_finished(&client_finished);
-
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
 			Ok(())
 		}
@@ -1128,14 +1106,16 @@ mod tests {
 				.with_key(server_identity.signing_key.to_owned())
 				.with_peer_authentication(mutual_with(ExpiryValidator))
 				.build();
+
 			let key_exchange = WireDer::new(build_test_key_exchange(&server_public_key, &TEST_SESSION_KEY, []))?;
 			server.process_key_exchange(&key_exchange).await?;
+
 			let mut reflected = server.build_server_finished().await?;
 			let server_certificate = CertificateChoices::Certificate(server_identity.certificate.to_owned());
+
 			reflected.certificates = Some(CertificateSet(vec![server_certificate].try_into()?));
 
 			let refusal = server.process_client_finished(&reflected);
-
 			assert!(matches!(refusal, Err(HandshakeError::SignatureVerificationFailed)));
 			Ok(())
 		}
@@ -1157,7 +1137,7 @@ mod tests {
 			let server_finished = server.build_server_finished().await?;
 
 			let accept = HandshakeAttribute::transcript_bytes(&SecurityAccept::new(profile))?;
-			let expected = compute_transcript_digest::<Sha3_256>([sent, accept].concat())?;
+			let expected = Transcript::digest::<Sha3_256>([sent, accept].concat())?;
 			assert_eq!(signed_transcript(&server_finished), expected);
 			Ok(())
 		}
@@ -1169,7 +1149,9 @@ mod tests {
 			let (mut server, server_public_key) = TestCmsServerBuilder::new().build();
 			let native = create_default_test_profile();
 			let foreign = SecurityProfileDesc { aead: Some(AES_128_GCM), ..native };
+
 			server = server.with_supported_profiles(vec![foreign, native]);
+
 			let client = create_test_certificate();
 			let client_finished = client_finished_for(&mut server, &server_public_key, &client).await;
 
@@ -1225,12 +1207,13 @@ mod tests {
 			let signing_key = &client.signing_key;
 			let built =
 				TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(signing_key, digest_alg, signature_alg);
-			let builder = built.expect("the builder accepts a test key");
 
+			let builder = built.expect("the builder accepts a test key");
 			let content = FinishedRole::Client.content(transcript_hash);
 			let mut signed_data = builder.build(content).expect("the Finished signs");
 			let embedded = CertificateChoices::Certificate(client.certificate.to_owned());
 			let certificates = vec![embedded].try_into().expect("one certificate fits a set");
+
 			signed_data.certificates = Some(CertificateSet(certificates));
 			signed_data
 		}

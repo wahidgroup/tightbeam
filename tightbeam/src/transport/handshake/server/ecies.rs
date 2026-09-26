@@ -33,23 +33,21 @@ use crate::crypto::sign::{LowSEncoding, PrehashVerifier, SignatureEncoding};
 use crate::crypto::subtle::ConstantTimeEq;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
-use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, StrengthFloor, TransportAccept,
 	TransportAuthorizer, TransportNegotiation, TransportOffer,
 };
+use crate::transport::handshake::orchestrator::HandshakeVerifyingKey;
+use crate::transport::handshake::primitives::transcript::Transcript;
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{
-	record_receipt_outcome, sign_receipt, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict,
-	StoredReceipt,
+	SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
 };
 use crate::transport::handshake::state::{Ecies, ServerHandshakeState, ServerStateMachine};
-use crate::transport::handshake::utils::HandshakeOctets;
-use crate::transport::handshake::utils::HandshakeVerifyingKey;
-use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
+use crate::transport::handshake::wire::HandshakeOctets;
 use crate::transport::handshake::{
 	AdmittedPeer, EstablishedSession, HandshakeMessage, PeerAuthentication, TunneledMessage,
 };
@@ -260,13 +258,15 @@ where
 		// negotiated profile, and the transport accept, so tampering with any
 		// of them invalidates the server signature.
 		let transport_accept_der = transport_accept.as_ref().map(WireDer::der).unwrap_or_default();
-		let transcript_digest = compute_ecies_transcript_hash::<P::Digest>(
+		let mut transcript = Transcript::ecies_handshake(
 			client_hello_der,
 			&server_random,
 			spki_bytes,
 			security_accept.der(),
 			transport_accept_der,
-		)?;
+		);
+
+		let transcript_digest = transcript.seal::<P::Digest>()?;
 		self.transcript_hash = Some(transcript_digest);
 
 		// 8. Sign the transcript hash with the key provider.
@@ -313,7 +313,7 @@ where
 			return Err(HandshakeError::MutualAuthRequired);
 		}
 
-		let (receipt, artifact) = sign_receipt::<P::Digest>(
+		let (receipt, artifact) = SessionReceipt::issue::<P::Digest>(
 			*transcript_digest,
 			granted,
 			accept.credit_unit,
@@ -401,7 +401,7 @@ where
 		//    again.
 		if let Some(transcript_hash) = self.transcript_hash {
 			let input_key_material = base_session_key.as_slice();
-			let materials = derive_epoch_materials::<P>(input_key_material, KdfSalt::new(salt_bytes), transcript_hash)?;
+			let materials = EpochMaterials::derive::<P>(input_key_material, KdfSalt::new(salt_bytes), transcript_hash)?;
 			self.epoch_materials = Some(materials);
 		}
 
@@ -436,7 +436,7 @@ where
 	}
 
 	fn validate_expected_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
-		validate_state(self.state.state(), expected)
+		self.state.expect_state(expected)
 	}
 
 	fn decode_client_hello(&self, client_hello_der: impl AsRef<[u8]>) -> Result<ClientHello, HandshakeError> {
@@ -601,7 +601,8 @@ where
 		// certificate, so the signature binds to this exchange alone.
 		let cert_der = client_cert.to_der()?;
 		let encrypted_data = client_kex.encrypted_data.as_bytes();
-		let auth_digest = compute_client_auth_digest::<P::Digest>(&transcript_hash, encrypted_data, &cert_der)?;
+		let mut auth_transcript = Transcript::ecies_client_auth(&transcript_hash, encrypted_data, &cert_der);
+		let auth_digest = auth_transcript.seal::<P::Digest>()?;
 
 		let public_key = client_cert.verifying_key::<P::Curve>()?;
 		let signature = P::Signature::try_from(client_signature.as_bytes())
@@ -683,7 +684,8 @@ where
 			client_certificate: self.proven_peer(),
 			verdict,
 		};
-		self.stored_receipt = Some(record_receipt_outcome(self.session_observer.as_deref(), outcome).await?);
+		let stored_receipt = outcome.record(self.session_observer.as_deref()).await?;
+		self.stored_receipt = Some(stored_receipt);
 
 		Ok(())
 	}
@@ -1170,7 +1172,7 @@ mod tests {
 		let cert_der = client.certificate.to_der()?;
 		let auth_digest = match override_digest {
 			Some(digest) => digest,
-			None => compute_client_auth_digest::<P::Digest>(&transcript_hash, &encrypted_bytes, &cert_der)?,
+			None => Transcript::ecies_client_auth(&transcript_hash, &encrypted_bytes, &cert_der).seal::<P::Digest>()?,
 		};
 
 		let provider = Secp256k1KeyProvider::from(client.signing_key.to_owned());

@@ -10,7 +10,7 @@ use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::kari::kari_unwrap;
+use crate::transport::handshake::kari::{HandshakeAgreement, HandshakeKek, Kek};
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 
 /// Recipient-side processor for `KeyAgreeRecipientInfo`.
@@ -88,17 +88,15 @@ where
 		// 2. Extract the originator's public key.
 		let originator_pub = self.extract_originator_public_key(kari)?;
 
-		// 3-6. Unwrap through `kari_unwrap` (ECDH, HKDF and integrity re-wrap)
+		// 3-6. Unwrap through ECDH, HKDF and the integrity re-wrap
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let wrapped_key = kari.recipient_enc_keys[recipient_index].enc_key.as_bytes();
-		kari_unwrap(
-			&self.provider,
-			&self.recipient_priv,
-			&originator_pub,
-			KdfSalt::new(ukm.as_bytes()),
-			KdfInfo::new(self.kdf_info),
-			wrapped_key,
-		)
+		let shared_secret = self.recipient_priv.shared_secret(&originator_pub)?;
+		let ukm_salt = KdfSalt::new(ukm.as_bytes());
+		let kari_label = KdfInfo::new(self.kdf_info);
+
+		let kek = shared_secret.derive_kek::<P>(ukm_salt, kari_label)?;
+		Kek::new(kek.as_slice()).unwrap_verified(&self.provider, wrapped_key)
 	}
 
 	/// Extract the originator's public key from the KARI.

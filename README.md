@@ -279,7 +279,7 @@ Which optional fields a version MAY emit is stated in [§5.6](#56-version-specif
 
 The fields are private. Each field has a read accessor of the same name, such as `metadata.id()` and `metadata.priority()`. The ASN.1 tags are in [§5.3](#metadata-structure).
 
-```rust
+```rust,ignore
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Metadata {
@@ -310,7 +310,7 @@ pub struct Metadata {
 
 The fields are private, and each has a read accessor of the same name. A `Frame` enters memory only through `FrameBuilder` or the DER decoder. Both reject a field that the Frame version forbids ([§5.6](#56-version-specific-constraints)), so no in-memory Frame carries one. The methods that change a Frame in place, such as `attach_signer_info` and `encrypt_with_provider`, apply the same rule.
 
-```rust
+```rust,ignore
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Frame {
@@ -627,7 +627,7 @@ A recipient decrypts the body and recovers the opening `(salt, DER(value))`. The
 
 When confidentiality is enabled, implementations MUST use Authenticated Encryption with Associated Data (AEAD). The type system enforces this requirement through trait bounds:
 
-```rust
+```rust,ignore
 pub fn with_aead<Cipher>(mut self, cipher: Cipher) -> Self
 where
 	Cipher: AeadAlgorithm + 'static, // AEAD cipher that names its own OID
@@ -661,7 +661,7 @@ Any change to those fields invalidates the signature. The resulting binding is t
 
 **Figure: nonrepudiation binding**
 
-```
+```text
 Signature
 	|
 	v
@@ -730,7 +730,7 @@ A sparse application that uses only **k** cells has lower entropy. In that case 
 
 **Figure: 2x2 game-state example**
 
-```
+```text
         c=0  c=1
       +----+----+
   r=0 | 1  | 0  |   M[0,0] = 1  Player 1 at (0,0)
@@ -775,8 +775,8 @@ The following rules constrain matrix handling so that frames remain within **I(t
 
 The following example sets diagonal feature flags in a 3x3 matrix and embeds the matrix in a Frame:
 
-```rust
-use tightbeam::Matrix;
+```rust,ignore
+use tightbeam::prelude::Matrix;
 
 // Full 3x3 matrix
 let mut matrix = Matrix::<3>::default();
@@ -795,7 +795,7 @@ let frame = compose! {
 
 **Figure: resulting 3x3 flag matrix**
 
-```
+```text
 [1, 0, 0]
 [0, 1, 0]
 [0, 0, 0]
@@ -816,7 +816,7 @@ A useful mathematical view treats the sequence as a Markov chain. The matrix **M
 
 **Figure: causal chain of matrix snapshots**
 
-```
+```text
 Frame t-1 (M_{t-1})
         |
         |  previous_frame digest verifies against prior Frame
@@ -916,7 +916,7 @@ A `SecurityProfile` is a compile-time metadata type. It declares which algorithm
 
 The `SecurityProfile` trait names the digest, AEAD, signature, KDF, and curve algorithms. Each associated type carries its own OID. An optional key-wrap OID MAY be set as a constant:
 
-```rust
+```rust,ignore
 pub trait SecurityProfile {
 	type Digest: AssociatedOid;
 	type AeadOid: AssociatedOid;
@@ -948,7 +948,7 @@ An application implements `SecurityProfile` to fix the algorithm set for a secur
 
 #### Implementing Custom Profiles
 
-```rust
+```rust,ignore
 // Example: Custom application profile
 pub struct MyAppProfile;
 
@@ -967,7 +967,7 @@ impl SecurityProfile for MyAppProfile {
 
 `TightbeamProfile` is the built-in default and reference profile:
 
-```rust
+```rust,ignore
 pub struct TightbeamProfile;
 
 impl SecurityProfile for TightbeamProfile {
@@ -994,7 +994,7 @@ Numeric security levels are a shorthand for common `Message` requirement flags. 
 
 The `Message` trait attaches security requirements to a message type. `FrameBuilder` enforces a typed profile's algorithms when it composes a Frame. Frame validation checks the resulting shape at run time.
 
-```rust
+```rust,ignore
 pub trait Message: /* trait bounds */ {
 	const MIN_VERSION: Version = Version::V0;
 	const MUST_BE_NON_REPUDIABLE: bool = false;
@@ -1035,7 +1035,7 @@ When `HAS_PROFILE` is `true`, `FrameBuilder` and `compose!` enforce profile cons
 
 **Using the `compose!` macro:**
 
-```rust
+```rust,ignore
 // Example: Message with custom profile
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[beam(profile(MyAppProfile))]
@@ -1054,7 +1054,7 @@ let frame = compose! {
 
 **Using FrameBuilder directly:**
 
-```rust
+```rust,ignore
 // FrameBuilder validates algorithm OIDs match MyAppProfile
 let frame = compose::<SecureMessage>(Version::V1)
 	.with_message(msg)
@@ -1092,7 +1092,7 @@ let frame = compose::<SecureMessage>(Version::V1)
 
 #### Example Message Types
 
-```rust
+```rust,ignore
 // Numeric security level (convenience)
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[beam(profile = 1)]
@@ -1108,7 +1108,7 @@ struct HighSecurityTransfer { /* fields */ }
 
 `CryptoProvider` composes the role-based provider traits from [§6.1](#61-securityprofile-trait-architecture). It binds concrete cryptographic implementations to a `SecurityProfile`. A provider type is a zero-sized `Copy + Default` value.
 
-```rust
+```rust,ignore
 pub trait CryptoProvider:
 	Default +
 	Copy + // zero-sized type (ZST),
@@ -1220,7 +1220,7 @@ The `CertificateTrust` trait verifies certificate chains and manages trust ancho
 
 **Building a trust store:**
 
-```rust
+```rust,ignore
 let cert = Certificate::try_from(CERT_PEM)?;
 let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
     .with_certificate(cert)?
@@ -1229,7 +1229,7 @@ let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
 
 **Adding a certificate chain:**
 
-```rust
+```rust,ignore
 let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
     .with_chain(vec![root_cert, intermediate_cert, leaf_cert])?
     .build();
@@ -1277,7 +1277,7 @@ DER tag-length-value encoding supplies framing. Default size limits:
 
 The TCP transport maps a byte stream to the Frame API with DER length-prefixed envelopes. It supports `std::net` (synchronous) and `tokio` (asynchronous).
 
-```rust
+```rust,ignore
 use std::net::TcpListener;
 use tightbeam::{server, compose, Frame};
 
@@ -1305,7 +1305,7 @@ Policies control message flow. They do not rewrite the byte transport.
 
 **GatePolicy trait:**
 
-```rust
+```rust,ignore
 pub trait GatePolicy: Send + Sync {
 	fn evaluate(&self, frame: Option<&Frame>, session: &SessionContext) -> TransitStatus;
 }
@@ -1317,7 +1317,7 @@ Every evaluation receives the connection's `SessionContext`. On cleartext and cl
 
 **ReceptorPolicy trait:**
 
-```rust
+```rust,ignore
 pub trait ReceptorPolicy<T: Message>: Send + Sync {
 	fn evaluate(&self, message: &T) -> TransitStatus;
 }
@@ -1325,7 +1325,7 @@ pub trait ReceptorPolicy<T: Message>: Send + Sync {
 
 **RestartPolicy trait:**
 
-```rust
+```rust,ignore
 pub trait RestartPolicy: Send + Sync {
 	/// Evaluate whether to restart after a transport operation.
 	///
@@ -1346,7 +1346,7 @@ pub trait RestartPolicy: Send + Sync {
 
 **TransitStatus** (gRPC `google.rpc.Code` registry):
 
-```rust
+```rust,ignore
 // The gRPC canonical status registry (google.rpc.Code)
 pub enum TransitStatus {
 	Ok = 0,
@@ -1372,7 +1372,7 @@ pub enum TransitStatus {
 
 **RetryAction:**
 
-```rust
+```rust,ignore
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetryAction {
 	/// Retry with the provided frame (same or modified from input)
@@ -1388,6 +1388,7 @@ pub enum RetryAction {
 
 ```rust
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
+use tightbeam::Frame;
 
 // Accept only messages with specific ID patterns
 #[derive(Default)]
@@ -1409,7 +1410,7 @@ impl GatePolicy for IdPatternGate {
 
 **GatePolicy (session-identity filtering):**
 
-```rust
+```rust,ignore
 use tightbeam::colony::hive::PeerListGate;
 
 // Bar these public keys (SPKI DER) at the door; the gate matches the
@@ -1424,9 +1425,11 @@ let doorman = PeerListGate::allow([member_spki_der]);
 **ReceptorPolicy (message-level filtering):**
 
 ```rust
-use tightbeam::policy::ReceptorPolicy;
+use tightbeam::der::Sequence;
+use tightbeam::policy::{ReceptorPolicy, TransitStatus};
+use tightbeam::Beamable;
 
-#[derive(Beamable, Sequence)]
+#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 struct RequestMessage {
 	content: String,
 	priority: u8,
@@ -1450,10 +1453,12 @@ impl ReceptorPolicy<RequestMessage> for PriorityGate {
 **RestartPolicy (retry strategies):**
 
 ```rust
+use core::time::Duration;
+
 use tightbeam::transport::policy::{RestartLinearBackoff, RestartExponentialBackoff};
 
 // Linear backoff: 1s, 2s, 3s delays
-let restart = RestartLinearBackoff::new(3, 1000, 1, None);
+let restart = RestartLinearBackoff::new(3, Duration::from_millis(1000), 1, None);
 
 // Exponential backoff: 1s, 2s, 4s, 8s delays
 let restart = RestartExponentialBackoff::new(4, 1000, None);
@@ -1461,7 +1466,7 @@ let restart = RestartExponentialBackoff::new(4, 1000, None);
 
 **`policy!` macro:**
 
-```rust
+```rust,ignore
 tightbeam::policy! {
 	// Frame-content gate: fail closed when no request frame exists
 	// (mux streaming / duplex). Pair with a session gate for stream opens.
@@ -1505,13 +1510,13 @@ tightbeam::policy! {
 
 **Composing policies:**
 
-```rust
+```rust,ignore
 // Client-side with policies
 let builder = ClientBuilder::<TokioListener>::builder()
 	.allow_cleartext()
 	.with_emitter_gate(IdPatternGate)
 	.with_collector_gate(PriorityGate)
-	.with_restart(RestartLinearBackoff::new(3, 1000, 1, None))
+	.with_restart(RestartLinearBackoff::new(3, Duration::from_millis(1000), 1, None))
 	.build();
 
 let mut client = builder.connect(addr).await?;
@@ -1538,7 +1543,7 @@ Security goals for both:
 
 **Three-phase exchange:**
 
-```
+```text
 Phase 1: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
 │ ClientHello (ECIES) or KeyExchange (CMS)                │
@@ -1569,19 +1574,19 @@ Phase 3: Client -> Server
 
 Client:
 
-```
+```text
 Init -> HelloSent -> KeyExchangeSent -> ServerFinishedReceived -> ClientFinishedSent -> Completed
 ```
 
 Server:
 
-```
+```text
 Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> Completed
 ```
 
 **Transcript hash:**
 
-```
+```text
 transcript = ClientHello || ServerHandshake || ClientKeyExchange
 transcript_hash = SHA3-256(transcript)
 ```
@@ -1600,7 +1605,7 @@ CMS handshake uses [RFC 5652][rfc5652] Cryptographic Message Syntax:
 
 For mutual authentication, the client includes a certificate and signs the transcript in `ClientKeyExchange`:
 
-```
+```text
 Client Side - Building ClientKeyExchange:
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 1. Extend Transcript                                                │
@@ -1623,7 +1628,7 @@ Client Side - Building ClientKeyExchange:
 
 Server verification flow:
 
-```
+```text
 Server Side - Verifying Client Authentication:
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Validate Client Certificate                              │
@@ -1659,7 +1664,7 @@ Differences from CMS:
 
 For mutual authentication, the client includes a certificate and signs the transcript in `ClientKeyExchange`:
 
-```
+```text
 Client Side - Building ClientKeyExchange:
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 1. Perform ECDH with Server's Public Key                            │
@@ -1696,7 +1701,7 @@ Client Side - Building ClientKeyExchange:
 
 Server verification flow:
 
-```
+```text
 Server Side - Verifying Client Authentication:
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Validate Client Certificate                              │
@@ -1733,7 +1738,7 @@ ECIES combines:
 - **AEAD**: AES-256-GCM for authenticated encryption of the session key
 - **Ephemeral keys**: A fresh ephemeral key pair per encryption
 
-```
+```text
 ECIES-Encrypt(plaintext, recipient_pub_key):
 ┌─────────────────────────────────────────────────────────┐
 │ 1. Generate ephemeral key pair                          │
@@ -1789,7 +1794,7 @@ CMS and ECIES handshakes both negotiate algorithms through `SecurityProfile` des
 
 **Negotiation process:**
 
-```
+```text
 Client                              Server
   │                                   │
   │─── SecurityOffer ───────────────► │
@@ -1828,7 +1833,7 @@ CMS and ECIES handshakes MAY also negotiate multiplexing with `TransportOffer` /
 
 **Transport negotiation process:**
 
-```
+```text
 Client                              Server
   │                                   │
   │─── TransportOffer ──────────────► │
@@ -1861,7 +1866,7 @@ Stream identifier rules, envelope types, and runtime assembly are in [§8.6 Mult
 
 **Profile negotiation:**
 
-```rust
+```rust,ignore
 // Client offers supported profiles
 let security_offer = SecurityOffer {
 	profiles: vec![
@@ -1952,7 +1957,7 @@ Stream IDs identify one logical stream on one physical connection:
 
 **Stream states:**
 
-```
+```text
 Idle -> Open -> HalfClosedLocal / HalfClosedRemote -> Closed
 ```
 
@@ -1985,7 +1990,7 @@ Each endpoint MUST enforce the cap it advertised and respect the cap its peer ad
 
 **Stream grammar** (unified: a unary request is a degenerate stream, [RFC 9113 §8.1][rfc9113-8.1]):
 
-```
+```text
 initiator:  Open(last?)   Data(...)*  Data(last)
 responder:  Data(...)*    End(status, payload?)
 either:     Cancel(code)  Credit(limit)
@@ -2027,7 +2032,7 @@ either:     Cancel(code)  Credit(limit)
 
 **Request/response flow:**
 
-```
+```text
 Client (MuxHandle)                         Server (MuxResponder)
   │                                              │
   │── Open { stream_id=1, last, payload } ─────► │
@@ -2049,7 +2054,7 @@ Client (MuxHandle)                         Server (MuxResponder)
 
 **Runtime architecture:**
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Application                                                 │
 │   MuxHandle.emit_on_stream / close_stream / shutdown        │
@@ -2079,7 +2084,7 @@ Client (MuxHandle)                         Server (MuxResponder)
 
 **MultiplexedProtocol trait:**
 
-```rust
+```rust,ignore
 pub trait MultiplexedProtocol {
 	/// Negotiated cap on concurrent locally-initiated streams
 	fn max_concurrent_streams(&self) -> u32;
@@ -2103,7 +2108,7 @@ After the transport is ready (handshake complete for encrypted mux, or a never-h
 
 Both sides MUST configure multiplexing before the handshake so the offer is transcript-bound:
 
-```
+```text
 Client Side - Offering Mux:
 ┌──────────────────────────────────────────────────────────┐
 │ 1. transport = transport.with_mux_offer(Some(            │
@@ -2117,7 +2122,7 @@ Client Side - Offering Mux:
 └──────────────────────────────────────────────────────────┘
 ```
 
-```rust
+```rust,ignore
 use tightbeam::policy::TransitStatus;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
@@ -2152,7 +2157,7 @@ handle.shutdown().await?;
 
 Use cleartext only when both endpoints deliberately skip the handshake. Nothing is negotiated, so both sides SHOULD configure the same caps. A provisioned transport refuses `into_split` until its handshake completes.
 
-```rust
+```rust,ignore
 use tightbeam::transport::handshake::negotiation::MuxSettings;
 use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
 
@@ -2171,8 +2176,8 @@ The accepting endpoint uses `MuxRole::Server` with the same assembly sequence. E
 
 Test multiplexed services with `environment ServiceClient`. The `server:` closure starts a `server!` accept loop advertising `with_mux_offer`. The `client:` closure drives a mux-offering `ConnectionPool` against the bound address. Peers that decline the offer fall back to single-flight. The same scenario shape covers both paths.
 
-```rust
-const ECHO_OVER_MUX: Urn<'static> = Urn::new("test", "event:mux/echo-over-mux");
+```rust,ignore
+const ECHO_OVER_MUX: Urn<'static> = urn!("test", "event:mux/echo-over-mux");
 
 tb_assert_spec! {
 	pub EchoOverMuxSpec,
@@ -2223,7 +2228,7 @@ tb_scenario! {
 
 The async accept loop branches per connection after the handshake. A peer that negotiated multiplexing is served through the mux plane (split halves, drivers, concurrent handlers behind the collector gate). The server advertises multiplexing per accepted transport through the policy list:
 
-```rust
+```rust,ignore
 let server_handle = server! {
 	protocol TokioListener: listener,
 	policies: { with_mux_offer: [Some(TransportOffer::mux(32))] },
@@ -2235,7 +2240,7 @@ let server_handle = server! {
 - `servlet!`, `hive!`, and `cluster!` inherit the option from `server!`. Hives and clusters set it with `mux_offer` in their pool config.
 - Serving mux requires the `transport-multiplex` feature and an async executor.
 
-```rust
+```rust,ignore
 let server_handle = server! {
 	protocol TokioListener: listener,
 	policies: { with_mux_offer: [Some(offer)], with_transport_authorizer: [authorizer] },
@@ -2249,7 +2254,7 @@ let server_handle = server! {
 
 **Pooling with `PoolConfig::mux_offer`:**
 
-```rust
+```rust,ignore
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 	.with_config(PoolConfig { mux_offer: Some(TransportOffer::mux(32)), ..Default::default() })
 	.with_trust_store(trust_store)
@@ -2263,7 +2268,7 @@ With an offer configured, `connect` shares one multiplexed connection per destin
 
 **Metered pooled sessions** (budgets on the offer, settlement hooks on the pool):
 
-```rust
+```rust,ignore
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 	.with_config(PoolConfig { mux_offer: Some(offer.with_budgets(budgets)), ..Default::default() })
 	.with_trust_store(trust_store)
@@ -2300,7 +2305,7 @@ let receipt = lease.session_receipt();  // Option<Arc<StoredReceipt>>
 
 **Example:**
 
-```rust
+```rust,ignore
 // Create shared pool with configuration (once per application)
 let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 	.with_config(PoolConfig { max_connections: 3, ..Default::default() })
@@ -2391,7 +2396,7 @@ These constraints enable the parallelism and fault isolation that make EEIC effe
 
 Workers follow an insect-inspired structure: a "head" (configuration), optional "receptors" (gates), a "thorax" (isolation container), and an "abdomen" (handler).
 
-```rust
+```rust,ignore
 tightbeam::worker! {
 	name: PingPongWorker<RequestMessage, PongMessage>,
 	config: {
@@ -2414,12 +2419,12 @@ The handler receives the message, a trace collector for instrumentation, and the
 
 Workers can be tested using the `tb_scenario!` macro with `environment Worker`:
 
-```rust
+```rust,ignore
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, worker};
 use tightbeam::utils::urn::Urn;
 
-const WORKER_CALLED: Urn<'static> = Urn::new("test", "event:worker/called");
-const RESPONSE_RECEIVED: Urn<'static> = Urn::new("test", "event:worker/response-received");
+const WORKER_CALLED: Urn<'static> = urn!("test", "event:worker/called");
+const RESPONSE_RECEIVED: Urn<'static> = urn!("test", "event:worker/response-received");
 
 tb_assert_spec! {
 	pub PingPongSpec,
@@ -2482,7 +2487,7 @@ This separation means servlets handle concerns like connection management, frame
 
 Each servlet is responsible for exactly one message type. This keeps servlets focused and predictable. When you need to handle multiple related message types, use an ASN.1 Choice type to group them:
 
-```rust
+```rust,ignore
 // A Choice type groups related messages
 #[derive(Beamable, Choice)]
 pub enum CalcRequest {
@@ -2498,7 +2503,7 @@ pub enum CalcRequest {
 
 Servlets can apply gate policies to filter or validate incoming messages before processing:
 
-```rust
+```rust,ignore
 servlet! {
 	pub SecureServlet<Request, EnvConfig = ()>,
 	protocol: TokioListener,
@@ -2527,8 +2532,8 @@ pub struct PingPongServletConfig {
 
 **Step 2**: Define the servlet using `EnvConfig`:
 
-```rust
-const REQUEST_RECEIVED: Urn<'static> = Urn::new("test", "event:servlet/request-received");
+```rust,ignore
+const REQUEST_RECEIVED: Urn<'static> = urn!("test", "event:servlet/request-received");
 
 tightbeam::servlet! {
 	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConfig>,
@@ -2572,7 +2577,7 @@ tightbeam::servlet! {
 
 **Step 3**: Configure workers via `ServletConfig` when starting the servlet:
 
-```rust
+```rust,ignore
 // Create workers (use ::new, not .start - servlet auto-starts them)
 let ping_pong_worker = PingPongWorker::new(());
 let lucky_number_worker = LuckyNumberDeterminer::new(LuckyNumberDeterminerConfig {
@@ -2615,7 +2620,7 @@ When workers are added to a servlet via `ServletConfig::builder().with_worker(wo
 
 For standalone worker testing (outside servlets), use the `Worker` trait's `start()` method explicitly:
 
-```rust
+```rust,ignore
 let worker = MyWorker::new(config);
 let trace = Arc::new(TraceCollector::new());
 let started_worker = worker.start(trace).await?;
@@ -2627,7 +2632,7 @@ Workers accept `Arc<Input>` instead of owned `Input` to enable efficient paralle
 
 **Example using `tokio::join!`:**
 
-```rust
+```rust,ignore
 let decoded_arc = Arc::new(decoded);
 let (result1, result2) = tokio::join!(
     workers.worker1.relay(Arc::clone(&decoded_arc)),
@@ -2639,13 +2644,13 @@ let (result1, result2) = tokio::join!(
 
 Servlets with workers can be tested using `environment Servlet`:
 
-```rust
+```rust,ignore
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, servlet, worker};
 
-const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:servlet/receive");
-const WORKER_PROCESS: Urn<'static> = Urn::new("test", "event:servlet/worker-process");
-const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:servlet/respond");
-const RESULT_VERIFIED: Urn<'static> = Urn::new("test", "event:servlet/result-verified");
+const SERVLET_RECEIVE: Urn<'static> = urn!("test", "event:servlet/receive");
+const WORKER_PROCESS: Urn<'static> = urn!("test", "event:servlet/worker-process");
+const SERVLET_RESPOND: Urn<'static> = urn!("test", "event:servlet/respond");
+const RESULT_VERIFIED: Urn<'static> = urn!("test", "event:servlet/result-verified");
 
 tb_assert_spec! {
 	pub CalcServletSpec,
@@ -2730,7 +2735,7 @@ Non-mycelial protocols (like in-memory channels) stay in single-servlet mode.
 
 `hive!` names a type alias of `HiveRuntime<P>`. Register servlets at runtime:
 
-```rust
+```rust,ignore
 hive! {
 	pub MyHive,
 	protocol: TokioListener
@@ -2746,7 +2751,7 @@ Collector gates for the control plane live on the hive accept path (not in the m
 
 A typical hive lifecycle with cluster integration:
 
-```rust
+```rust,ignore
 // 1. Construct the hive (does not bind yet)
 let mut hive = MyHive::new(Some(HiveConfig::default()))?;
 
@@ -2768,7 +2773,7 @@ hive.stop();
 
 For hives to accept commands from a cluster (heartbeats, management requests), they must trust the cluster's certificate. Configure this via `HiveConfig.trust_store`:
 
-```rust
+```rust,ignore
 let hive_conf = HiveConfig {
 	trust_store: Some(Arc::new(cluster_trust_store)),
 	..Default::default()
@@ -2791,7 +2796,7 @@ Hives include built-in resilience mechanisms:
 
 These are configured via nested `HiveControlConfig`:
 
-```rust
+```rust,ignore
 let hive_conf = HiveConfig {
 	control: HiveControlConfig {
 		backpressure_threshold: BasisPoints::new(8000), // 80%
@@ -2823,7 +2828,7 @@ A hive resolves each servlet type to a single instance address, so it carries no
 
 For secure communication, configure TLS on the hive:
 
-```rust
+```rust,ignore
 let tls_config = Arc::new(HiveTlsConfig {
 	certificate: CertificateSpec::Built(Box::new(cert)),
 	key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
@@ -2840,7 +2845,7 @@ When `hive_tls` is set, the hive control server binds with TLS and outbound cont
 
 ##### HiveConfig Reference
 
-```rust
+```rust,ignore
 pub struct HiveScalingConfig {
 	pub default_scale: ServletScaleConfig,
 	/// Per-type overrides keyed by servlet type URN
@@ -2885,9 +2890,9 @@ pub struct HiveConfig {
 
 Standalone hive behavior (control plane gates, circuit breaker, backpressure, drain) is tested with `environment Hive`:
 
-```rust
+```rust,ignore
 const BACKPRESSURE_MANAGE_SHAPE: Urn<'static> =
-	Urn::new("test", "event:hive/backpressure-manage-shape");
+	urn!("test", "event:hive/backpressure-manage-shape");
 
 tb_assert_spec! {
 	pub HiveBackpressureShapeSpec,
@@ -2958,7 +2963,7 @@ A poisoned internal lock surfaces as `ClusterError::LockPoisoned`. The affected 
 
 Define a cluster type using the `cluster!` macro:
 
-```rust
+```rust,ignore
 cluster! {
 	pub MyCluster,
 	protocol: TokioListener
@@ -2967,7 +2972,7 @@ cluster! {
 
 The macro accepts an optional `digest` parameter for custom hash algorithms used in frame integrity verification:
 
-```rust
+```rust,ignore
 cluster! {
 	pub MyCluster,
 	protocol: TokioListener,
@@ -2977,7 +2982,7 @@ cluster! {
 
 Runtime configuration is supplied to `Cluster::start`:
 
-```rust
+```rust,ignore
 let cluster = MyCluster::start(trace, ClusterConfig::new(tls)).await?;
 ```
 
@@ -2985,7 +2990,7 @@ let cluster = MyCluster::start(trace, ClusterConfig::new(tls)).await?;
 
 Clusters require TLS configuration for secure communication with hives and, when federating, with peer gateways. The cluster acts as a TLS client when connecting outbound, presenting its certificate for mutual authentication.
 
-```rust
+```rust,ignore
 let tls = ClusterTlsConfig {
 	certificate: CertificateSpec::Built(Box::new(cert)),
 	key: Arc::new(Secp256k1KeyProvider::from(key)),
@@ -3015,7 +3020,7 @@ Peer federation lets gateways learn which servlet types neighboring colonies exp
 
 Configure outbound advertisement with a dial list and beat cadence:
 
-```rust
+```rust,ignore
 let conf = ClusterConfig::builder(tls)
 	.with_peers([peer_addr.to_string()])?
 	.with_advertise_interval(Duration::from_secs(5))
@@ -3067,7 +3072,7 @@ Checks run in this order:
 4. `ExportGate` deny gates, which override a grant
 5. The servlet
 
-```rust
+```rust,ignore
 let conf = ClusterConfig::builder(tls)
 	.with_peers([peer_addr.to_string()])?
 	.with_advertise_interval(Duration::from_secs(5))
@@ -3088,7 +3093,7 @@ let conf = ClusterConfig::builder(tls)
 
 `ExportGrant` opens one unexported target to selected caller identities. A target passes when it is exported, granted, or a first-party origin request, and every deny gate must then agree.
 
-```rust
+```rust,ignore
 struct PartnerGrant {
 	granted_spki: Vec<u8>,
 	target: Urn<'static>,
@@ -3117,7 +3122,7 @@ Grant semantics:
 
 Custom gates add per-identity deny rules. Every gate must pass, and a deny overrides a grant. Each gate receives `TrustPlanes` so it can reuse the built-in first-party check.
 
-```rust
+```rust,ignore
 struct DenyPeerKeyGate {
 	denied_spki: Vec<u8>,
 	target: Urn<'static>,
@@ -3167,7 +3172,7 @@ Clusters continuously monitor hive health through heartbeats. Each heartbeat is 
 
 Configure heartbeat behavior via `HeartbeatConfig`:
 
-```rust
+```rust,ignore
 let heartbeat_conf = HeartbeatConfig::builder()
 	.with_interval(Duration::from_secs(5))   // Check every 5 seconds
 	.with_timeout(Duration::from_secs(15))   // Evict a hive silent this long
@@ -3178,7 +3183,7 @@ let heartbeat_conf = HeartbeatConfig::builder()
 
 The `on_heartbeat` callback enables monitoring and metrics collection:
 
-```rust
+```rust,ignore
 .with_callback(Arc::new(|event| {
 	metrics::counter!("heartbeat", "success" => event.success.to_string()).increment(1);
 }))
@@ -3192,7 +3197,7 @@ When several instances serve one type, a `LoadBalancer` picks one across local a
 
 Colony gossip floods origin-signed rumors across member gateways: the pheromone broadcast of the swarm. A publisher asks the local gateway to create a rumor. Peers relay and repair until hop budget or freshness expires.
 
-```rust
+```rust,ignore
 let conf = ClusterConfig::builder(tls)
 	.with_peers([peer_addr.to_string()])?
 	.with_advertise_interval(Duration::from_secs(5))
@@ -3224,7 +3229,7 @@ The work plane is request-reply. The client's frame reaches the servlet unchange
 3. The servlet verifies the frame and answers with its own frame.
 4. `submit_work_to` returns the servlet's frame, or `TightBeamError::WorkRefused(status)` on refusal.
 
-```rust
+```rust,ignore
 use tightbeam::colony::SubmitWork;
 
 // Sign the end-to-end frame so the servlet can verify the sender.
@@ -3296,11 +3301,11 @@ A scenario that depends on elapsed time installs a `ManualClock` (`tightbeam::ut
 
 An advance wakes sleeping beats, but their work runs on separate tasks. Poll `TraceCollector::recorded` for the expected event, and advance again if it has not landed.
 
-```rust
+```rust,ignore
 use tightbeam::{tb_scenario, tb_assert_spec, exactly, cluster, hive};
 
-const WORK_SENT: Urn<'static> = Urn::new("test", "event:cluster/work-sent");
-const ROUTING_ACCEPTED: Urn<'static> = Urn::new("test", "event:cluster/routing-accepted");
+const WORK_SENT: Urn<'static> = urn!("test", "event:cluster/work-sent");
+const ROUTING_ACCEPTED: Urn<'static> = urn!("test", "event:cluster/routing-accepted");
 
 tb_assert_spec! {
 	pub ClusterRoutingSpec,
@@ -3396,7 +3401,7 @@ Feature gating:
 
 Each emitted event carries a kind URN from the closed inventory in `tightbeam::instrumentation::events`. Format:
 
-```
+```text
 urn:tightbeam:event:<domain>/<event-name>
 ```
 
@@ -3412,7 +3417,7 @@ Assertion matching compares full URN strings for equality. Specs and emit sites 
 
 Runtime shape is `TbEvent`:
 
-```
+```text
 seq | urn | label? | payload_hash? | duration_ns? | timestamp_ns? | flags | extras?
 ```
 
@@ -3442,7 +3447,7 @@ Runtime values captured under `assert_payload` MUST be transformed before emissi
 
 Instrumentation behavior MUST be controlled by `TbInstrumentationConfig` (gated by `instrument`):
 
-```rust
+```rust,ignore
 TbInstrumentationConfig {
 	enable_payloads: bool,
 	enable_internal_detail: bool,
@@ -3474,7 +3479,7 @@ For every finalized trace an artifact MUST be producible as ASN.1 DER (`Evidence
 
 Wire shape:
 
-```
+```text
 EvidenceArtifact ::= SEQUENCE {
 	specHash      OCTET STRING,           -- SHA3-256(spec definition)
 	traceHash     OCTET STRING,           -- SHA3-256 over canonical event bytes
@@ -3537,7 +3542,7 @@ pub enum LogLevel {
 
 #### LogBackend Trait
 
-```rust
+```rust,ignore
 pub trait LogBackend: Send + Sync {
 	fn emit(&self, record: &LogRecord) -> Result<(), LogError>;
 	fn accepts(&self, level: LogLevel) -> bool;
@@ -3549,14 +3554,14 @@ Built-in backends: `StdoutBackend` (std only), `MultiplexBackend` (fan-out).
 
 #### Log Filtering
 
-```rust
+```rust,ignore
 let filter = LogFilter::new(LogLevel::Warning)
 	.with_component("security", LogLevel::Debug);
 ```
 
 #### Integration
 
-```rust
+```rust,ignore
 use tightbeam::instrumentation::events;
 use tightbeam::trace::{TraceConfig, logging::*};
 
@@ -3635,7 +3640,7 @@ Properties:
 
 **Syntax:**
 
-```rust
+```rust,ignore
 // Async job with tuple input (implements AsyncJob)
 job! {
 	name: JobName,
@@ -3663,7 +3668,7 @@ job! {
 
 **Traits** (implemented by `job!`):
 
-```rust
+```rust,ignore
 pub trait Job {
 	type Input;
 	type Output;
@@ -3692,7 +3697,7 @@ use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
 
 **Basic usage:**
 
-```rust
+```rust,ignore
 let frame = CreateHandshakeRequest::run((client_id, nonce))
 	.map(|req| req.with_timestamp(now()))
 	.and_then(|req| ValidateRequest::run(req))
@@ -3703,7 +3708,7 @@ let frame = CreateHandshakeRequest::run((client_id, nonce))
 
 **Mixed composition** (start from any `Result`):
 
-```rust
+```rust,ignore
 let config: Result<Config, Error> = parse_config_file(path);
 
 config
@@ -3716,7 +3721,7 @@ config
 
 **Parallel execution with `join()`:**
 
-```rust
+```rust,ignore
 let (encrypted, signed) = join(
 	EncryptPayload::run(payload),
 	SignPayload::run(payload)
@@ -3727,7 +3732,7 @@ SendRequest::run((encrypted, signed))?;
 
 **Error recovery** (`Pipeline` exposes `or_else`, not `or`):
 
-```rust
+```rust,ignore
 let frame = SendRequest::run(request)
 	.or_else(|_| UseCachedResponse::run())
 	.or_else(|e| HandleError::run(e))
@@ -3738,13 +3743,13 @@ let frame = SendRequest::run(request)
 
 `PipelineBuilder` (feature `testing`) attaches a `TraceCollector`. Each traced `and_then` emits job lifecycle URNs:
 
-```
+```text
 urn:tightbeam:event:job/<job-name>-<start|success|error>
 ```
 
 Job names are derived from the closure type (`Type::run` path), converted to snake_case, then hyphenated in the NSS (for example `CreateHandshakeRequest` becomes `create-handshake-request`).
 
-```rust
+```rust,ignore
 PipelineBuilder::new(trace)
 	.start((client_id, nonce))
 	// Auto-emits: urn:tightbeam:event:job/create-handshake-request-start
@@ -3760,15 +3765,15 @@ PipelineBuilder::new(trace)
 
 Assert the full job URNs, as an exact string match (see [§10.2](#102-event-kind-taxonomy)):
 
-```rust
+```rust,ignore
 const CREATE_HS_START: Urn<'static> =
-	Urn::new("tightbeam", "event:job/create-handshake-request-start");
+	urn!("tightbeam", "event:job/create-handshake-request-start");
 const CREATE_HS_SUCCESS: Urn<'static> =
-	Urn::new("tightbeam", "event:job/create-handshake-request-success");
+	urn!("tightbeam", "event:job/create-handshake-request-success");
 const VALIDATE_START: Urn<'static> =
-	Urn::new("tightbeam", "event:job/validate-request-start");
+	urn!("tightbeam", "event:job/validate-request-start");
 const VALIDATE_SUCCESS: Urn<'static> =
-	Urn::new("tightbeam", "event:job/validate-request-success");
+	urn!("tightbeam", "event:job/validate-request-success");
 
 tb_assert_spec! {
 	pub PipelineSpec,
@@ -3826,7 +3831,7 @@ tb_scenario! {
 
 **Complete example:**
 
-```rust
+```rust,ignore
 use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
 
 let session_id = PipelineBuilder::new(trace)
@@ -3936,9 +3941,9 @@ Versions use major.minor.patch and produce a deterministic SHA3-256 hash over th
 
 #### 12.2.2 Specification: tb_assert_spec! Syntax
 
-```rust
-const RECEIVED: Urn<'static> = Urn::new("test", "event:demo/received");
-const RESPONDED: Urn<'static> = Urn::new("test", "event:demo/responded");
+```rust,ignore
+const RECEIVED: Urn<'static> = urn!("test", "event:demo/received");
+const RESPONDED: Urn<'static> = urn!("test", "event:demo/responded");
 
 tb_assert_spec! {
 	pub MySpec,
@@ -3965,7 +3970,7 @@ tb_assert_spec! {
 
 **Version Block Syntax**:
 
-```
+```text
 V(major, minor, patch): {
 	mode: <ExecutionMode>,              // Accept or Reject
 	gate: <TransitStatus>,              // Ok, rejection statuses, etc.
@@ -4000,7 +4005,7 @@ V(major, minor, patch): {
 
 **Basic specification** (same URN constants as in §12.2.2):
 
-```rust
+```rust,ignore
 tb_assert_spec! {
 	pub DemoSpec,
 	V(1,0,0): {
@@ -4028,7 +4033,7 @@ tb_assert_spec! {
 
 Each `tb_assert_spec!` generates a type with:
 
-```rust
+```rust,ignore
 impl MySpec {
 	pub fn all() -> &'static [BuiltAssertSpec];
 	pub fn get(major: u16, minor: u16, patch: u16) -> Option<&'static BuiltAssertSpec>;
@@ -4065,7 +4070,7 @@ Value check:
 
 **Examples**:
 
-```rust
+```rust,ignore
 assertions: [
 	(PRIORITY, exactly!(1), equals!(MessagePriority::LowLatency)),
 	(LIFETIME, exactly!(1), equals!(3_600)),
@@ -4087,11 +4092,11 @@ Assertions can be tagged with arbitrary string labels for flexible categorizatio
 - `trace.event_with(URN, &["tag"], value)` adds tags plus an optional value (`Into<AssertionValue>`).
 - `trace.recorded(URN)` (feature `testing`) counts the recorded assertions that carry that label, without draining them. A scenario that waits on a background task polls it for the event the task traces.
 
-```rust
+```rust,ignore
 use tightbeam::utils::urn::Urn;
 
-const RELAY_START: Urn<'static> = Urn::new("test", "event:demo/relay-start");
-const RESPONSE_OK: Urn<'static> = Urn::new("test", "event:demo/response-ok");
+const RELAY_START: Urn<'static> = urn!("test", "event:demo/relay-start");
+const RESPONSE_OK: Urn<'static> = urn!("test", "event:demo/response-ok");
 
 trace.event(RELAY_START)?;
 trace.event_with(RESPONSE_OK, &["tag_a"], true)?;
@@ -4105,9 +4110,9 @@ trace.event_with(RESPONSE_OK, &["tag_a"], true)?;
 
 **Example: version-scoped testing:**
 
-```rust
-const FEATURE: Urn<'static> = Urn::new("test", "event:demo/feature");
-const V1_SPECIFIC: Urn<'static> = Urn::new("test", "event:demo/v1-specific");
+```rust,ignore
+const FEATURE: Urn<'static> = urn!("test", "event:demo/feature");
+const V1_SPECIFIC: Urn<'static> = urn!("test", "event:demo/v1-specific");
 
 tb_assert_spec! {
 	pub VersionSpec,
@@ -4151,7 +4156,7 @@ Layer 1 matches the assertion stream (`AssertionLabel` exact URN string). With `
 
 Assertion specs support schedulability verification via the `schedulability: { }` block when `testing-schedulability` is enabled:
 
-```rust
+```rust,ignore
 schedulability: {
 	task_set: my_task_set,
 	scheduler: RateMonotonic | EarliestDeadlineFirst,
@@ -4183,7 +4188,7 @@ Enabled with `testing-csp` feature flag.
 
 #### 12.3.2 Specification: tb_process_spec! Syntax
 
-```rust
+```rust,ignore
 tb_process_spec! {
 	pub ProcessName,
 	events {
@@ -4191,10 +4196,10 @@ tb_process_spec! {
 		hidden { "internal1", "internal2", ... }  // Internal alphabet (τ)
 	}
 	states {
-		S0 => { "event1" => S1 }                  // State transitions
-		S1 => { "event2" => S2, "event3" => S3 }  // Nondeterministic branching
-		S2 => { "event4" [ guard!(clock1 < 10ms) ] => S3 }  // Timed transition with guard
-		S3 => { "event5" [ guard!(clock2 >= 5ms), reset: ["clock1"] ] => S4 }  // Guard with clock reset
+		S0 => { "event1" => S1 },                  // State transitions
+		S1 => { "event2" => S2, "event3" => S3 },  // Nondeterministic branching
+		S2 => { "event4" [ guard!(clock1 < 10ms) ] => S3 },  // Timed transition with guard
+		S3 => { "event5" [ guard!(clock2 >= 5ms), reset: ["clock1"] ] => S4 },  // Guard with clock reset
 		S4 => {}                                  // Terminal state
 	}
 	terminal { S4 }                               // Valid end states
@@ -4229,10 +4234,12 @@ When CSP is configured via `.with_csp()` in `tb_scenario!`:
 
 ```rust
 use tightbeam::testing::*;
+use tightbeam::utils::urn::Urn;
+use tightbeam::{tb_process_spec, urn};
 
-const RECEIVED: Urn<'static> = Urn::new("test", "event:csp/received");
-const RESPONDED: Urn<'static> = Urn::new("test", "event:csp/responded");
-const INTERNAL_PROCESSING: Urn<'static> = Urn::new("test", "event:csp/internal-processing");
+const RECEIVED: Urn<'static> = urn!("test", "event:csp/received");
+const RESPONDED: Urn<'static> = urn!("test", "event:csp/responded");
+const INTERNAL_PROCESSING: Urn<'static> = urn!("test", "event:csp/internal-processing");
 
 tb_process_spec! {
 	pub SimpleProcess,
@@ -4241,7 +4248,7 @@ tb_process_spec! {
 		hidden { INTERNAL_PROCESSING }
 	}
 	states {
-		Idle       => { RECEIVED => Processing }
+		Idle       => { RECEIVED => Processing },
 		Processing => { INTERNAL_PROCESSING => Processing, RESPONDED => Idle }
 	}
 	terminal { Idle }
@@ -4299,10 +4306,12 @@ The `tb_compose_spec!` macro generates a type that implements `CompositionSpec` 
 
 ```rust
 use tightbeam::testing::*;
+use tightbeam::utils::urn::Urn;
+use tightbeam::{exactly, tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario, urn};
 
-const REQUEST: Urn<'static> = Urn::new("test", "event:flow/request");
-const RESPONSE: Urn<'static> = Urn::new("test", "event:flow/response");
-const RETRY: Urn<'static> = Urn::new("test", "event:flow/retry");
+const REQUEST: Urn<'static> = urn!("test", "event:flow/request");
+const RESPONSE: Urn<'static> = urn!("test", "event:flow/response");
+const RETRY: Urn<'static> = urn!("test", "event:flow/retry");
 
 tb_assert_spec! {
 	pub RequestRetrySpec,
@@ -4320,7 +4329,7 @@ tb_assert_spec! {
 // Two simple processes
 tb_process_spec! {
 	pub RequestFlow,
-	events { observable { REQUEST, RESPONSE } }
+	events { observable { REQUEST, RESPONSE } hidden { } }
 	states {
 		Idle => { REQUEST => Waiting },
 		Waiting => { RESPONSE => Idle }
@@ -4330,7 +4339,7 @@ tb_process_spec! {
 
 tb_process_spec! {
 	pub RetryFlow,
-	events { observable { RETRY } }
+	events { observable { RETRY } hidden { } }
 	states {
 		RetryIdle => { RETRY => RetryIdle }
 	}
@@ -4389,7 +4398,7 @@ Refinement checking provides multi-seed exploration for trace and failures refin
 
 #### 12.4.2 Specification: FdrConfig Syntax
 
-```rust
+```rust,ignore
 fdr: FdrConfig {
 	seeds: 64,               // Number of exploration seeds
 	max_depth: 128,          // Maximum trace depth
@@ -4433,9 +4442,9 @@ fdr: FdrConfig {
 
 **Simple Example**:
 
-```rust
-const START: Urn<'static> = Urn::new("test", "event:simple/start");
-const FINISH: Urn<'static> = Urn::new("test", "event:simple/finish");
+```rust,ignore
+const START: Urn<'static> = urn!("test", "event:simple/start");
+const FINISH: Urn<'static> = urn!("test", "event:simple/finish");
 
 // Define a simple two-state process
 tb_process_spec! {
@@ -4493,7 +4502,7 @@ tb_scenario! {
 
 The `seeds` parameter controls how many different execution paths are explored during verification. Each seed produces a different scheduling of concurrent operations, uncovering race conditions and nondeterministic behavior:
 
-```rust
+```rust,ignore
 fdr: FdrConfig {
 	seeds: 64,  // Try 64 different execution orderings
 	// ...
@@ -4506,7 +4515,7 @@ Each seed explores different interleaving at nondeterministic choice points, ver
 
 After multi-seed exploration, tightbeam produces a verdict:
 
-```rust
+```rust,ignore
 pub struct FdrVerdict {
 	// Overall status
 	pub passed: bool,
@@ -4576,7 +4585,7 @@ pub struct FdrVerdict {
 
 CSP distinguishes between observable events (external alphabet Σ) and hidden events (internal actions τ). This distinction is fundamental to process refinement:
 
-```rust
+```rust,ignore
 tb_process_spec! {
 	pub ClientServerProcess,
 	events {
@@ -4608,13 +4617,13 @@ CSP provides two choice operators:
 
 At choice points, a process has an _acceptance set_ (events it can engage) and _refusal set_ (events it cannot engage in stable state). Failures refinement ensures implementations do not introduce invalid refusals:
 
-```rust
+```rust,ignore
 states {
 	// External choice: environment determines next event
-	Connected  => { "request" => Processing, "disconnect" => Idle }
+	Connected  => { "request" => Processing, "disconnect" => Idle },
 
 	// Internal choice: process may non-deterministically choose path
-	Processing => { "response" => Responded, "error" => ErrorState }
+	Processing => { "response" => Responded, "error" => ErrorState },
 }
 choice { Processing }  // Annotate nondeterministic states
 ```
@@ -4627,7 +4636,7 @@ Based on research by Pedersen & Chalmers,[^pedersen2024] refinement in cooperati
 
 **tightbeam addresses this through multi-seed exploration**: Each seed represents a different scheduling strategy, exploring alternative interleaving of concurrent events. This is analogous to testing with different numbers of schedulers to verify behavior across resource constraints:
 
-```rust
+```rust,ignore
 fdr: FdrConfig {
     seeds: 64,              // Explore 64 different scheduling
     max_depth: 128,         // Bound trace length
@@ -4646,7 +4655,7 @@ At nondeterministic choice points, the seed determines which branch to explore. 
 
 tightbeam can export process specifications as CSPM (CSP Machine-readable) format for verification with external tools like FDR4:[^fdr4]
 
-```rust
+```rust,ignore
 use tightbeam::testing::fdr::CspmExporter;
 
 let process = ClientServerProcess::process();
@@ -4673,7 +4682,7 @@ This enables:
 
 The `FdrTraceExt` trait extends `ConsumedTrace` with CSP-specific analysis:
 
-```rust
+```rust,ignore
 use tightbeam::testing::fdr::FdrTraceExt;
 
 .with_hooks(TestHooks {
@@ -4693,7 +4702,7 @@ use tightbeam::testing::fdr::FdrTraceExt;
 
 **Trace Analysis in Hooks**: Query process behavior and event sequences:
 
-```rust
+```rust,ignore
 use tightbeam::testing::fdr::FdrTraceExt;
 
 hooks {
@@ -4722,7 +4731,7 @@ Fault injection enables systematic error testing through CSP state-driven fault 
 
 #### 12.6.1 FaultModel Configuration
 
-```rust
+```rust,ignore
 use tightbeam::testing::{FaultModel, InjectionStrategy};
 use tightbeam::utils::BasisPoints;
 
@@ -4740,7 +4749,7 @@ let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
 
 **Deterministic (Counter-Based):**
 
-```rust
+```rust,ignore
 InjectionStrategy::Deterministic
 ```
 
@@ -4750,7 +4759,7 @@ InjectionStrategy::Deterministic
 
 **Random (Seeded RNG):**
 
-```rust
+```rust,ignore
 InjectionStrategy::Random
 ```
 
@@ -4762,7 +4771,7 @@ InjectionStrategy::Random
 
 Generate type-safe enums via `tb_gen_process_types!`:
 
-```rust
+```rust,ignore
 tb_gen_process_types!(FaultTolerantProcess, Idle, Sending, Retrying, Success, Fallback);
 
 // Generates:
@@ -4772,7 +4781,7 @@ tb_gen_process_types!(FaultTolerantProcess, Idle, Sending, Retrying, Success, Fa
 
 Manual implementation:
 
-```rust
+```rust,ignore
 pub trait ProcessState: Copy + Debug {
 	fn process_name(&self) -> &'static str;
 	fn state_name(&self) -> &'static str;
@@ -4786,7 +4795,7 @@ pub trait ProcessEvent: Copy + Debug {
 
 #### 12.6.4 Integration with FDR
 
-```rust
+```rust,ignore
 fdr: FdrConfig {
 	seeds: 64,
 	fault_model: Some(fault_model),
@@ -4812,7 +4821,7 @@ Faults are injected during CSP exploration before state transitions. Injected fa
 
 #### 12.7.1 Syntax
 
-```rust
+```rust,ignore
 tb_scenario! {
 	name: test_function_name,        // OPTIONAL: creates standalone #[test] (Do NOT use with `fuzz: afl`)
 	spec: AssertSpecType,            // Layer 1 latest version. Use config: for anything more
@@ -4845,9 +4854,11 @@ Environment examples also appear in [§9.3](#93-components) (Worker, Servlet, Hi
 
 ```rust
 use tightbeam::testing::*;
+use tightbeam::utils::urn::Urn;
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, urn};
 
-const RECEIVED: Urn<'static> = Urn::new("test", "event:bare/received");
-const RESPONDED: Urn<'static> = Urn::new("test", "event:bare/responded");
+const RECEIVED: Urn<'static> = urn!("test", "event:bare/received");
+const RESPONDED: Urn<'static> = urn!("test", "event:bare/responded");
 
 tb_assert_spec! {
 	pub BareSpec,
@@ -4865,9 +4876,10 @@ tb_process_spec! {
 	pub BareProcess,
 	events {
 		observable { RECEIVED, RESPONDED }
+		hidden { }
 	}
 	states {
-		Idle       => { RECEIVED => Processing }
+		Idle       => { RECEIVED => Processing },
 		Processing => { RESPONDED => Idle }
 	}
 	terminal { Idle }
@@ -4891,22 +4903,22 @@ tb_scenario! {
 
 **Full Example: All Three Layers with ServiceClient Environment**
 
-```rust
+```rust,ignore
 #![cfg(all(feature = "testing-fdr", feature = "tcp", feature = "tokio"))]
 use tightbeam::testing::*;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::Protocol;
 
-const CONNECT: Urn<'static> = Urn::new("test", "event:client-server/connect");
-const REQUEST: Urn<'static> = Urn::new("test", "event:client-server/request");
-const RESPONSE: Urn<'static> = Urn::new("test", "event:client-server/response");
-const DISCONNECT: Urn<'static> = Urn::new("test", "event:client-server/disconnect");
-const MESSAGE_CONTENT: Urn<'static> = Urn::new("test", "event:client-server/message-content");
-const SERIALIZE: Urn<'static> = Urn::new("test", "event:client-server/serialize");
-const ENCRYPT: Urn<'static> = Urn::new("test", "event:client-server/encrypt");
-const DECRYPT: Urn<'static> = Urn::new("test", "event:client-server/decrypt");
-const DESERIALIZE: Urn<'static> = Urn::new("test", "event:client-server/deserialize");
+const CONNECT: Urn<'static> = urn!("test", "event:client-server/connect");
+const REQUEST: Urn<'static> = urn!("test", "event:client-server/request");
+const RESPONSE: Urn<'static> = urn!("test", "event:client-server/response");
+const DISCONNECT: Urn<'static> = urn!("test", "event:client-server/disconnect");
+const MESSAGE_CONTENT: Urn<'static> = urn!("test", "event:client-server/message-content");
+const SERIALIZE: Urn<'static> = urn!("test", "event:client-server/serialize");
+const ENCRYPT: Urn<'static> = urn!("test", "event:client-server/encrypt");
+const DECRYPT: Urn<'static> = urn!("test", "event:client-server/decrypt");
+const DESERIALIZE: Urn<'static> = urn!("test", "event:client-server/deserialize");
 
 // Layer 1: Assert spec - defines expected assertions and cardinalities
 tb_assert_spec! {
@@ -4932,12 +4944,12 @@ tb_process_spec! {
 		hidden { SERIALIZE, ENCRYPT, DECRYPT, DESERIALIZE }
 	}
 	states {
-		Idle        => { CONNECT => Connected }
-		Connected   => { REQUEST => Processing, SERIALIZE => Serializing }
-		Serializing => { ENCRYPT => Encrypting }
-		Encrypting  => { REQUEST => Processing }
-		Processing  => { DECRYPT => Decrypting, RESPONSE => Responded }
-		Decrypting  => { DESERIALIZE => Processing }
+		Idle        => { CONNECT => Connected },
+		Connected   => { REQUEST => Processing, SERIALIZE => Serializing },
+		Serializing => { ENCRYPT => Encrypting },
+		Encrypting  => { REQUEST => Processing },
+		Processing  => { DECRYPT => Decrypting, RESPONSE => Responded },
+		Decrypting  => { DESERIALIZE => Processing },
 		Responded   => { DISCONNECT => Idle }
 	}
 	terminal { Idle }
@@ -5020,7 +5032,7 @@ This test verifies:
 
 `environment ServiceClient` accepts a `context:` key for state both sides need (certificates, synchronization primitives, observation flags). The expression is evaluated once and shared as `Arc<C>`. The server closure receives a `SetupEnv`. The client closure receives a `ClientEnv` with the bound server address and builds its own connection:
 
-```rust
+```rust,ignore
 	environment ServiceClient {
 		context: ServerMaterials::generate(),
 		server: |env| async move {
@@ -5055,7 +5067,7 @@ tightbeam integrates [AFL.rs](https://github.com/rust-fuzz/afl.rs), a Rust port 
 
 **Integration with tb_scenario!**: The `fuzz: afl` parameter generates AFL-compatible fuzz targets that use the oracle for guided exploration:
 
-```rust
+```rust,ignore
 tb_scenario! {
 	fuzz: afl,                        // ← AFL fuzzing mode
 	config: ScenarioConfig::builder()
@@ -5090,35 +5102,33 @@ tb_scenario! {
 
 **Example Fuzz Target**:
 
-```rust
+```rust,ignore
 //! Simple 3-state workflow fuzz target for AFL
 
+#![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
-use tightbeam::testing::error::TestingError;
-use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::testing::fuzz::OracleAccess;
+use tightbeam::testing::{ScenarioConfig, SetupEnv};
+use tightbeam::utils::urn::Urn;
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-const START: Urn<'static> = Urn::new("test", "event:fuzz/start");
-const ACTION_A: Urn<'static> = Urn::new("test", "event:fuzz/action-a");
-const ACTION_B: Urn<'static> = Urn::new("test", "event:fuzz/action-b");
-const DONE: Urn<'static> = Urn::new("test", "event:fuzz/done");
+const START: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/start");
+const ACTION_A: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/action-a");
+const ACTION_B: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/action-b");
+const DONE: Urn<'static> = tightbeam::urn!("fuzz", "event:simple/done");
 
-// Layer 1: Assertion spec
 tb_assert_spec! {
 	pub SimpleFuzzSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Ok,
 		assertions: [
 			(START, exactly!(1)),
-			(ACTION_A, at_least!(0)),
-			(ACTION_B, at_least!(0)),
 			(DONE, exactly!(1))
 		]
 	},
 }
 
-// Layer 2: CSP process with nondeterministic choices
 tb_process_spec! {
 	pub SimpleFuzzProc,
 	events {
@@ -5132,27 +5142,25 @@ tb_process_spec! {
 	terminal { S2 }
 }
 
-// AFL fuzz target - compiled with `cargo afl build`
-// Note: AFL fuzz targets generate `fn main()` - do NOT include `name:` parameter
 tb_scenario! {
 	fuzz: afl,
+	csp: SimpleFuzzProc,
 	config: ScenarioConfig::builder()
 		.with_spec(SimpleFuzzSpec::latest())
 		.with_csp(SimpleFuzzProc)
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			// AFL provides bytes, oracle interprets as state machine choices
+			// Oracle-guided fuzzing: interprets AFL input as event choices
 			let oracle = trace.oracle();
-			match oracle.fuzz_from_bytes() {
-				Ok(()) => {
-					for event in oracle.trace() {
-						trace.event(event.0)?;
-					}
-					Ok(())
-				}
-				Err(_) => Err(TestingError::FuzzInputExhausted.into())
+			oracle.fuzz_from_bytes()?;
+
+			// Make assertions based on execution trace
+			for event in oracle.trace() {
+				trace.event(event)?;
 			}
+
+			Ok::<(), tightbeam::TightBeamError>(())
 		}
 	}
 }
@@ -5188,7 +5196,7 @@ The `CspOracle` interprets AFL's random bytes as state machine navigation choice
 
 **How It Works**:
 
-```
+```text
 AFL Random Bytes          CspOracle                State Machine
 ─────────────────  ───►  ───────────────  ───►  ─────────────────
 [0x7A, 0x3F, ...]        byte % events.len()     S0 -> S1 -> S2 -> ...
@@ -5206,7 +5214,7 @@ Valid events are sorted by label, so the byte-to-event mapping is deterministic 
 
 **Example Trace** (from crash analysis):
 
-```
+```text
 Input: [0x00, 0x01, 0x00, 0x02]
 Trace: START -> ACTION_A -> ACTION_B -> DONE
 State: S0 -> S1 -> S1 -> S2
@@ -5263,15 +5271,15 @@ if (input[0] == 0xDEADBEEF) {
 
 tightbeam equivalent - no manual annotation needed:
 
-```rust
-const MAGIC_DETECTED: Urn<'static> = Urn::new("test", "event:parser/magic-detected");
-const PARSE_CONTINUE: Urn<'static> = Urn::new("test", "event:parser/parse-continue");
+```rust,ignore
+const MAGIC_DETECTED: Urn<'static> = urn!("test", "event:parser/magic-detected");
+const PARSE_CONTINUE: Urn<'static> = urn!("test", "event:parser/parse-continue");
 
 tb_process_spec! {
 	pub ParserProcess,
-	events { observable { MAGIC_DETECTED, PARSE_CONTINUE } }
+	events { observable { MAGIC_DETECTED, PARSE_CONTINUE } hidden { } }
 	states {
-		Init   => { MAGIC_DETECTED => SpecialState, PARSE_CONTINUE => Parsing }
+		Init   => { MAGIC_DETECTED => SpecialState, PARSE_CONTINUE => Parsing },
 		SpecialState => { /* ... */ }
 	}
 	// IJON automatically reports when SpecialState is reached
@@ -5407,7 +5415,7 @@ tightbeam automatically calculates Severity, Occurrence, and Detection ratings f
 
 **FMEA Report Structure**:
 
-```rust
+```rust,ignore
 pub struct FmeaReport {
 	pub failure_modes: Vec<FailureMode>,
 	pub severity_scale: SeverityScale,
@@ -5428,7 +5436,7 @@ pub struct FailureMode {
 
 **Example Configuration**:
 
-```rust
+```rust,ignore
 fdr: FdrConfig {
 	fault_model: Some(FaultModel::default()
 		.with_fault(
@@ -5476,16 +5484,16 @@ End-to-end worker and servlet flows under `tb_scenario!` with AssertSpec + CSP. 
 
 #### Worker Integration Example
 
-```rust
+```rust,ignore
 use tightbeam::testing::*;
 use tightbeam::utils::urn::Urn;
 
-const RELAY_START: Urn<'static> = Urn::new("test", "event:worker/relay-start");
-const RELAY_SUCCESS: Urn<'static> = Urn::new("test", "event:worker/relay-success");
-const RELAY_REJECTED: Urn<'static> = Urn::new("test", "event:worker/relay-rejected");
-const RESPONSE_RESULT: Urn<'static> = Urn::new("test", "event:worker/response-result");
-const VALIDATE_MESSAGE: Urn<'static> = Urn::new("test", "event:worker/validate-message");
-const PROCESS_MESSAGE: Urn<'static> = Urn::new("test", "event:worker/process-message");
+const RELAY_START: Urn<'static> = urn!("test", "event:worker/relay-start");
+const RELAY_SUCCESS: Urn<'static> = urn!("test", "event:worker/relay-success");
+const RELAY_REJECTED: Urn<'static> = urn!("test", "event:worker/relay-rejected");
+const RESPONSE_RESULT: Urn<'static> = urn!("test", "event:worker/response-result");
+const VALIDATE_MESSAGE: Urn<'static> = urn!("test", "event:worker/validate-message");
+const PROCESS_MESSAGE: Urn<'static> = urn!("test", "event:worker/process-message");
 
 tb_assert_spec! {
 	pub PingPongWorkerSpec,
@@ -5508,9 +5516,9 @@ tb_process_spec! {
 		hidden { VALIDATE_MESSAGE, PROCESS_MESSAGE }
 	}
 	states {
-		Idle       => { RELAY_START => Processing }
-		Processing => { VALIDATE_MESSAGE => Validating }
-		Validating => { PROCESS_MESSAGE => Responding, RELAY_REJECTED => Idle }
+		Idle       => { RELAY_START => Processing },
+		Processing => { VALIDATE_MESSAGE => Validating },
+		Validating => { PROCESS_MESSAGE => Responding, RELAY_REJECTED => Idle },
 		Responding => { RELAY_SUCCESS => Idle }
 	}
 	terminal { Idle }
@@ -5561,16 +5569,16 @@ tb_scenario! {
 
 #### Servlet Integration Example
 
-```rust
+```rust,ignore
 use tightbeam::testing::*;
 use tightbeam::utils::urn::Urn;
 
-const REQUEST_RECEIVED: Urn<'static> = Urn::new("test", "event:servlet/request-received");
-const PONG_SENT: Urn<'static> = Urn::new("test", "event:servlet/pong-sent");
-const RESPONSE_RESULT: Urn<'static> = Urn::new("test", "event:servlet/response-result");
-const IS_WINNER: Urn<'static> = Urn::new("test", "event:servlet/is-winner");
-const VALIDATE_LUCKY_NUMBER: Urn<'static> = Urn::new("test", "event:servlet/validate-lucky-number");
-const FORMAT_RESPONSE: Urn<'static> = Urn::new("test", "event:servlet/format-response");
+const REQUEST_RECEIVED: Urn<'static> = urn!("test", "event:servlet/request-received");
+const PONG_SENT: Urn<'static> = urn!("test", "event:servlet/pong-sent");
+const RESPONSE_RESULT: Urn<'static> = urn!("test", "event:servlet/response-result");
+const IS_WINNER: Urn<'static> = urn!("test", "event:servlet/is-winner");
+const VALIDATE_LUCKY_NUMBER: Urn<'static> = urn!("test", "event:servlet/validate-lucky-number");
+const FORMAT_RESPONSE: Urn<'static> = urn!("test", "event:servlet/format-response");
 
 tb_assert_spec! {
 	pub PingPongSpec,
@@ -5593,9 +5601,9 @@ tb_process_spec! {
 		hidden { VALIDATE_LUCKY_NUMBER, FORMAT_RESPONSE }
 	}
 	states {
-		Idle       => { REQUEST_RECEIVED => Processing }
-		Processing => { VALIDATE_LUCKY_NUMBER => Validating }
-		Validating => { FORMAT_RESPONSE => Responding }
+		Idle       => { REQUEST_RECEIVED => Processing },
+		Processing => { VALIDATE_LUCKY_NUMBER => Validating },
+		Validating => { FORMAT_RESPONSE => Responding },
 		Responding => { PONG_SENT => Idle }
 	}
 	terminal { Idle }

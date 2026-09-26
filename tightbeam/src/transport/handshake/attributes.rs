@@ -1,24 +1,19 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(all(
-	not(feature = "std"),
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use core::cmp::{Ord, Ordering, PartialOrd};
 
-use crate::crypto::x509::attr::Attribute;
+use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::der::asn1::{Any, ObjectIdentifier, UintRef};
+use crate::der::{Sequence, Tagged};
 
 #[cfg(feature = "transport-cms")]
 use crate::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
 use crate::der::asn1::OctetString;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::der::{Sequence, Tagged};
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
 
@@ -30,7 +25,6 @@ use crate::oids::{
 };
 
 /// CMS Attribute simplified (profile enforces single value only)
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAttribute {
 	/// OID naming the attribute (RFC 5652 § 5.3 `attrType`).
@@ -41,14 +35,12 @@ pub struct HandshakeAttribute {
 
 // Provide ordering for canonical DER SET OF encoding. Order by attr_type OID bytes,
 // then lexicographically by each value's encoding (tag octet, then content octets).
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl PartialOrd for HandshakeAttribute {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl Ord for HandshakeAttribute {
 	fn cmp(&self, other: &Self) -> Ordering {
 		let oid_ord = self.attr_type.as_bytes().cmp(other.attr_type.as_bytes());
@@ -63,12 +55,10 @@ impl Ord for HandshakeAttribute {
 }
 
 /// Deterministic comparison key for an `Any`: tag octet followed by content octets.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn any_encoding_key(any: &Any) -> (u8, &[u8]) {
 	(u8::from(any.tag()), any.value())
 }
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl HandshakeAttribute {
 	pub fn new_single(attr_type: ObjectIdentifier, value: Any) -> Result<Self, HandshakeError> {
 		Ok(Self { attr_type, attr_values: vec![value] })
@@ -83,7 +73,6 @@ impl HandshakeAttribute {
 }
 
 /// Convert X.509 Attribute to HandshakeAttribute.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl From<&Attribute> for HandshakeAttribute {
 	fn from(attr: &Attribute) -> Self {
 		HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() }
@@ -224,49 +213,13 @@ fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 	}
 }
 
-// -------------------------- Attribute search --------------------------
-
-#[cfg(feature = "transport-cms")]
-pub fn find<'a>(
-	attrs: &'a (impl AsRef<[HandshakeAttribute]> + ?Sized),
-	oid: &ObjectIdentifier,
-) -> Result<&'a HandshakeAttribute, HandshakeError> {
-	let attrs = attrs.as_ref();
-	let mut found: Option<&HandshakeAttribute> = None;
-	for a in attrs.iter() {
-		if &a.attr_type == oid {
-			if found.is_some() {
-				return Err(HandshakeError::DuplicateAttribute);
-			}
-
-			found = Some(a);
-		}
-	}
-
-	found.ok_or(HandshakeError::MissingAttribute)
-}
-
-/// Find an X.509 attribute by OID without cloning
-pub fn find_x509<'a>(attrs: &'a [&Attribute], oid: &ObjectIdentifier) -> Result<&'a Attribute, HandshakeError> {
-	let mut found: Option<&Attribute> = None;
-	for a in attrs.iter() {
-		if &a.oid == oid {
-			if found.is_some() {
-				return Err(HandshakeError::DuplicateAttribute);
-			}
-			found = Some(a);
-		}
-	}
-
-	found.ok_or(HandshakeError::MissingAttribute)
-}
-
-// -------------------------- Tests --------------------------
-/// Handshake attribute lookups on a CMS `SignedData`.
-#[cfg(feature = "transport-cms")]
+/// Handshake attribute lookups on a CMS `SignedData` or an attribute set.
 pub trait HandshakeAttributes {
-	/// Find at most one unsigned attribute with `oid` across the
-	/// SignerInfos of a parsed Finished message, rejecting duplicates.
+	/// Find at most one unsigned attribute with `oid`, rejecting duplicates.
+	/// On a `SignedData` the search spans the SignerInfos of a parsed
+	/// Finished message.
+	///
+	/// # Duplicates
 	///
 	/// [RFC 5652 §11.4](https://datatracker.ietf.org/doc/html/rfc5652#section-11.4)
 	/// permits repeated unsigned attributes, but every TightBeam handshake
@@ -279,18 +232,10 @@ pub trait HandshakeAttributes {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError>;
 }
 
-#[cfg(feature = "transport-cms")]
-impl HandshakeAttributes for SignedData {
+impl HandshakeAttributes for Attributes {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
 		let mut found = None;
-		let matches = self
-			.signer_infos
-			.0
-			.iter()
-			.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref())
-			.flat_map(|attrs| attrs.iter())
-			.filter(|attr| attr.oid == oid);
-
+		let matches = self.iter().filter(|attr| attr.oid == oid);
 		for attr in matches {
 			if found.is_some() {
 				return Err(HandshakeError::DuplicateAttribute);
@@ -303,7 +248,32 @@ impl HandshakeAttributes for SignedData {
 	}
 }
 
-/// Handshake alert decoding on the x509-cert `Attribute`.
+#[cfg(feature = "transport-cms")]
+impl HandshakeAttributes for SignedData {
+	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
+		let mut found = None;
+		let signer_attrs = self
+			.signer_infos
+			.0
+			.iter()
+			.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref());
+
+		for attrs in signer_attrs {
+			let Some(attr) = attrs.find_unsigned_attr(oid)? else {
+				continue;
+			};
+			if found.is_some() {
+				return Err(HandshakeError::DuplicateAttribute);
+			}
+
+			found = Some(attr);
+		}
+
+		Ok(found)
+	}
+}
+
+/// Handshake alert decoding on a [`HandshakeAttribute`].
 pub trait HandshakeAlertAttribute {
 	/// Alert code carried by this attribute.
 	///
@@ -316,24 +286,21 @@ pub trait HandshakeAlertAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError>;
 }
 
-impl HandshakeAlertAttribute for Attribute {
+impl HandshakeAlertAttribute for HandshakeAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError> {
-		if self.values.len() != 1 {
-			return Err(HandshakeError::InvalidAttributeArity);
-		}
-
-		let value = self.values.get(0).ok_or(HandshakeError::InvalidAttributeArity)?;
-
-		alert_from_any(value)
+		alert_from_any(self.value()?)
 	}
 }
 
+// -------------------------- Tests --------------------------
 #[cfg(all(test, feature = "transport-cms"))]
 mod tests {
 	use super::*;
+	use crate::cms::signed_data::{SignerInfo, SignerInfos};
 	use crate::der::asn1::Any;
 	use crate::der::asn1::{OctetString as DerOctetString, SetOfVec, UintRef};
 	use crate::oids::{HANDSHAKE_ABORT_ALERT, HANDSHAKE_SECURITY_ACCEPT};
+	use crate::transport::handshake::tests::create_test_signed_data;
 
 	fn mk_integer(bytes: impl AsRef<[u8]>) -> Result<Any, der::Error> {
 		let bytes = bytes.as_ref();
@@ -347,12 +314,28 @@ mod tests {
 		Any::encode_from(&os)
 	}
 
-	fn mk_alert_attr(bytes: impl AsRef<[u8]>) -> Result<Attribute, der::Error> {
+	fn mk_alert_attr(bytes: impl AsRef<[u8]>) -> Result<HandshakeAttribute, der::Error> {
 		let bytes = bytes.as_ref();
-		Ok(Attribute {
-			oid: HANDSHAKE_ABORT_ALERT,
-			values: SetOfVec::try_from(vec![mk_integer(bytes)?])?,
-		})
+		let attribute = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer(bytes)?)?;
+		Ok(HandshakeAttribute::from(&attribute))
+	}
+
+	fn mk_attr(oid: ObjectIdentifier, value: Any) -> Result<Attribute, der::Error> {
+		Ok(Attribute { oid, values: SetOfVec::try_from(vec![value])? })
+	}
+
+	/// The one `SignerInfo` of a fresh test `SignedData`, carrying the same
+	/// security offer as an unsigned attribute on every call.
+	fn signer_with_offer() -> SignerInfo {
+		let signed_data = create_test_signed_data([0x07u8; 32]);
+		let value = mk_octet([0x11u8; 32]).expect("a 32-byte OCTET STRING encodes");
+		let offer = mk_attr(HANDSHAKE_SECURITY_OFFER, value).expect("one value forms a SET OF");
+		let attrs = Attributes::try_from(vec![offer]).expect("one attribute forms a SET OF");
+
+		let signer = signed_data.signer_infos.0.iter().next().cloned();
+		let mut signer = signer.expect("the test SignedData has one signer");
+		signer.unsigned_attrs = Some(attrs);
+		signer
 	}
 
 	/// A receiver binds what arrived. `der` sorts a `SET OF` before it
@@ -373,24 +356,32 @@ mod tests {
 
 	#[test]
 	fn duplicate_detected() -> Result<(), HandshakeError> {
-		let a1 = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, mk_octet([0x11u8; 32])?)?;
-		let a2 = a1.to_owned();
-		let attrs = vec![a1, a2];
+		let a1 = mk_attr(HANDSHAKE_SECURITY_OFFER, mk_octet([0x11u8; 32])?)?;
+		let a2 = mk_attr(HANDSHAKE_SECURITY_OFFER, mk_octet([0x12u8; 32])?)?;
+		let attrs = Attributes::try_from(vec![a1, a2])?;
 		assert!(matches!(
-			find(&attrs, &HANDSHAKE_SECURITY_OFFER),
+			attrs.find_unsigned_attr(HANDSHAKE_SECURITY_OFFER),
 			Err(HandshakeError::DuplicateAttribute)
 		));
 		Ok(())
 	}
 
 	#[test]
+	fn duplicate_across_signers_detected() -> Result<(), HandshakeError> {
+		let mut signed_data = create_test_signed_data([0x07u8; 32]);
+		let signers = vec![signer_with_offer(), signer_with_offer()];
+		signed_data.signer_infos = SignerInfos::try_from(signers)?;
+
+		let found = signed_data.find_unsigned_attr(HANDSHAKE_SECURITY_OFFER);
+		assert!(matches!(found, Err(HandshakeError::DuplicateAttribute)));
+		Ok(())
+	}
+
+	#[test]
 	fn missing_attribute_detected() -> Result<(), HandshakeError> {
-		let only = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, mk_octet([0x22u8; 32])?)?;
-		let attrs = vec![only];
-		assert!(matches!(
-			find(&attrs, &HANDSHAKE_SECURITY_ACCEPT),
-			Err(HandshakeError::MissingAttribute)
-		));
+		let only = mk_attr(HANDSHAKE_SECURITY_OFFER, mk_octet([0x22u8; 32])?)?;
+		let attrs = Attributes::try_from(vec![only])?;
+		assert!(matches!(attrs.find_unsigned_attr(HANDSHAKE_SECURITY_ACCEPT), Ok(None)));
 		Ok(())
 	}
 
@@ -399,6 +390,14 @@ mod tests {
 		let any = mk_octet([0x33u8; 32])?;
 		let attr = HandshakeAttribute { attr_type: HANDSHAKE_SECURITY_OFFER, attr_values: vec![any.to_owned(), any] };
 		assert!(matches!(attr.value(), Err(HandshakeError::InvalidAttributeArity)));
+		Ok(())
+	}
+
+	#[test]
+	fn multi_valued_alert_rejected() -> Result<(), der::Error> {
+		let attr_values = vec![mk_integer([0x01])?, mk_integer([0x02])?];
+		let alert = HandshakeAttribute { attr_type: HANDSHAKE_ABORT_ALERT, attr_values };
+		assert!(matches!(alert.handshake_alert(), Err(HandshakeError::InvalidAttributeArity)));
 		Ok(())
 	}
 

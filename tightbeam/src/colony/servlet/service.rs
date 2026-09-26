@@ -6,7 +6,6 @@ use crate::colony::servlet::{ServletConfig, ServletContext};
 use crate::core::Message;
 use crate::trace::TraceCollector;
 use crate::transport::multiplex::{ReplySink, StreamBody};
-use crate::transport::serve::unimplemented_error;
 use crate::transport::{Protocol, TightBeamAddress};
 use crate::utils::BasisPoints;
 use crate::{Frame, TightBeamError};
@@ -95,7 +94,7 @@ pub trait ServletService: Send + Sync + 'static {
 		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let _ = (frame, ctx);
-		async { Err(unimplemented_error()) }
+		async { Err(TightBeamError::unimplemented()) }
 	}
 
 	/// Read a chunked request body and optionally return one unary reply.
@@ -109,7 +108,7 @@ pub trait ServletService: Send + Sync + 'static {
 		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		let _ = (body, ctx);
-		async { Err(unimplemented_error()) }
+		async { Err(TightBeamError::unimplemented()) }
 	}
 
 	/// Exchange request and reply chunks on one multiplexed stream.
@@ -124,7 +123,7 @@ pub trait ServletService: Send + Sync + 'static {
 		ctx: Arc<ServletContext<Self::Env>>,
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		let _ = (body, reply, ctx);
-		async { Err(unimplemented_error()) }
+		async { Err(TightBeamError::unimplemented()) }
 	}
 }
 
@@ -213,7 +212,7 @@ impl<Env: Send + Sync + 'static> ServletService for ServletHandlers<Env> {
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		match self.unary.as_ref() {
 			Some(handler) => handler(frame, ctx),
-			None => Box::pin(async { Err(unimplemented_error()) }) as ServletFuture<_>,
+			None => Box::pin(async { Err(TightBeamError::unimplemented()) }) as ServletFuture<_>,
 		}
 	}
 
@@ -224,7 +223,7 @@ impl<Env: Send + Sync + 'static> ServletService for ServletHandlers<Env> {
 	) -> impl Future<Output = Result<Option<Frame>, TightBeamError>> + Send {
 		match self.streaming.as_ref() {
 			Some(handler) => handler(body, ctx),
-			None => Box::pin(async { Err(unimplemented_error()) }) as ServletFuture<_>,
+			None => Box::pin(async { Err(TightBeamError::unimplemented()) }) as ServletFuture<_>,
 		}
 	}
 
@@ -236,7 +235,7 @@ impl<Env: Send + Sync + 'static> ServletService for ServletHandlers<Env> {
 	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
 		match self.duplex.as_ref() {
 			Some(handler) => handler(body, reply, ctx),
-			None => Box::pin(async { Err(unimplemented_error()) }) as ServletFuture<_>,
+			None => Box::pin(async { Err(TightBeamError::unimplemented()) }) as ServletFuture<_>,
 		}
 	}
 }

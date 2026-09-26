@@ -35,29 +35,31 @@ impl ChunkSize {
 	pub fn get(self) -> usize {
 		self.0
 	}
-}
 
-/// Chunk records a payload occupies at `chunk` bytes per chunk.
-/// An empty payload travels inline in its trailer and occupies none.
-pub fn chunk_records(payload_len: usize, chunk: ChunkSize) -> u64 {
-	len_as_u64(payload_len).div_ceil(len_as_u64(chunk.get()))
-}
+	/// Chunk records a payload occupies at this many bytes per chunk.
+	/// An empty payload travels inline in its trailer and occupies none.
+	#[must_use]
+	pub fn records(self, payload_len: usize) -> u64 {
+		len_as_u64(payload_len).div_ceil(len_as_u64(self.0))
+	}
 
-/// Session-budget credits a payload debits: `ceil(len / credit_unit)`
-/// summed per chunk, so the sender's whole-frame debit equals the sum
-/// of the receiver's per-chunk debits.
-pub fn payload_credits(payload_len: usize, chunk: ChunkSize, credit_unit: u32) -> u64 {
-	let chunk_size = len_as_u64(chunk.get());
-	let unit = u64::from(credit_unit.max(1));
-	let len = len_as_u64(payload_len);
+	/// Session-budget credits a payload debits: `ceil(len / credit_unit)`
+	/// summed per chunk, so the sender's whole-frame debit equals the sum
+	/// of the receiver's per-chunk debits.
+	#[must_use]
+	pub fn credits(self, payload_len: usize, credit_unit: u32) -> u64 {
+		let chunk_size = len_as_u64(self.0);
+		let unit = u64::from(credit_unit.max(1));
+		let len = len_as_u64(payload_len);
 
-	let full_chunks = len / chunk_size;
-	let remainder = len % chunk_size;
-	let per_full_chunk = chunk_size.div_ceil(unit);
+		let full_chunks = len / chunk_size;
+		let remainder = len % chunk_size;
+		let per_full_chunk = chunk_size.div_ceil(unit);
 
-	full_chunks
-		.saturating_mul(per_full_chunk)
-		.saturating_add(remainder.div_ceil(unit))
+		full_chunks
+			.saturating_mul(per_full_chunk)
+			.saturating_add(remainder.div_ceil(unit))
+	}
 }
 
 /// Send records at which a renewal opens: the dynamic drain floor
@@ -151,7 +153,7 @@ mod tests {
 			(2048, 1024, 2),
 			(2049, 1024, 3),
 		] {
-			assert_eq!(chunk_records(len, ChunkSize::new(chunk)), expect);
+			assert_eq!(ChunkSize::new(chunk).records(len), expect);
 		}
 	}
 
@@ -166,7 +168,7 @@ mod tests {
 			// per-chunk sum, not the naive whole-frame ceil (3)
 			(2500, 1024, 1000, 5),
 		] {
-			assert_eq!(payload_credits(len, ChunkSize::new(chunk), unit), expect);
+			assert_eq!(ChunkSize::new(chunk).credits(len, unit), expect);
 		}
 	}
 
