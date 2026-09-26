@@ -33,26 +33,21 @@ use crate::transport::handshake::attributes::AttributePayload;
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::attributes::HandshakeAttributes;
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
-use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer, StrengthFloor, TransportAccept,
 	TransportOffer,
 };
+use crate::transport::handshake::orchestrator::HandshakeVerifyingKey;
 use crate::transport::handshake::primitives::transcript::{FinishedRole, Transcript};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
-use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, match_receipt_to_accept, verify_receipt_signer, ReceiptApprover, ReceiptRole,
-	SessionReceipt, StoredReceipt,
-};
+use crate::transport::handshake::receipt::{ReceiptApprover, ReceiptRole, SessionReceipt, StoredReceipt};
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Cms};
-use crate::transport::handshake::utils::validate_state;
-use crate::transport::handshake::utils::HandshakeVerifyingKey;
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
-use crate::transport::handshake::{EstablishedSession, HandshakeMessage};
+use crate::transport::handshake::{EpochMaterials, EstablishedSession, HandshakeMessage};
 use crate::transport::state::ClientIdentity;
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
@@ -291,7 +286,7 @@ where
 
 	/// Validate that the current state matches the expected state.
 	fn validate_expected_state(&self, expected: ClientHandshakeState) -> Result<(), HandshakeError> {
-		validate_state(self.state.state(), expected)
+		self.state.expect_state(expected)
 	}
 
 	/// The server certificate that the session key is encrypted to. It is the
@@ -561,7 +556,7 @@ where
 
 		let parsed_receipt = artifact.as_ref().map(ReceiptArtifact::receipt).transpose()?;
 		let Some(receipt) =
-			match_receipt_to_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
+			SessionReceipt::match_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
 		else {
 			return Ok(());
 		};
@@ -573,11 +568,9 @@ where
 			.signer_for_role(ReceiptRole::Server)?
 			.ok_or(HandshakeError::ReceiptMissing)?;
 
-		let receipt_der = receipt.to_der()?;
 		let expected_sid = self.server_leaf()?.signer_identifier::<P::Digest>()?;
 		let verifying_key = self.extract_server_verifying_key(self.server_leaf()?)?;
-		verify_receipt_signer::<P::Digest, P::Signature, _>(
-			&receipt_der,
+		receipt.verify_signer::<P::Digest, P::Signature, _>(
 			server_signer,
 			ReceiptRole::Server,
 			&expected_sid,
@@ -609,7 +602,7 @@ where
 		let key_provider = identity.signing_provider();
 
 		let approver = self.receipt_approver.as_deref();
-		let response = approve_or_fail_closed(approver, &receipt).await?;
+		let response = receipt.approve(approver).await?;
 		let answer = response.as_ref().map(OctetString::as_bytes);
 		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider).await?;
 
@@ -717,7 +710,7 @@ where
 
 		// 4. Seed epoch materials for post-handshake renewal
 		let epoch_salt = KdfSalt::new(&transcript);
-		let materials = cek.with(|input_key| derive_epoch_materials::<P>(input_key, epoch_salt, transcript))?;
+		let materials = cek.with(|input_key| EpochMaterials::derive::<P>(input_key, epoch_salt, transcript))?;
 
 		// 5. Transition to complete
 		self.state.transition(ClientHandshakeState::Completed)?;
@@ -1103,10 +1096,10 @@ mod tests {
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	use crate::transport::handshake::error::HandshakeError;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
+	use crate::transport::handshake::primitives::transcript::Transcript;
 	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	use crate::transport::handshake::state::ClientHandshakeState;
 	use crate::transport::handshake::tests::*;
-	use crate::transport::handshake::utils::compute_transcript_digest;
 	use crate::x509::attr::{Attribute, Attributes};
 	use crate::x509::Certificate;
 
@@ -1137,7 +1130,7 @@ mod tests {
 
 		// When: Client processes a server Finished over the transcript, which
 		// holds the key exchange alone because the server accepted nothing
-		let transcript_hash = compute_transcript_digest::<Sha3_256>(enveloped_data.der())?;
+		let transcript_hash = Transcript::digest::<Sha3_256>(enveloped_data.der())?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
 		let server_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(

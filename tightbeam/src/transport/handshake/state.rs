@@ -140,6 +140,17 @@ impl<F: HandshakeFlow> ClientStateMachine<F> {
 		self.state
 	}
 
+	/// Enforce a single expected handshake state. A mismatch yields
+	/// `InvalidState`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	pub(crate) fn expect_state(&self, expected: ClientHandshakeState) -> Result<(), HandshakeError> {
+		if self.state != expected {
+			Err(HandshakeError::InvalidState)
+		} else {
+			Ok(())
+		}
+	}
+
 	pub fn transition(&mut self, to: ClientHandshakeState) -> Result<(), HandshakeError> {
 		if self.state.is_completed() {
 			return Err(HandshakeError::InvalidState);
@@ -168,6 +179,17 @@ impl<F: HandshakeFlow> Default for ServerStateMachine<F> {
 impl<F: HandshakeFlow> ServerStateMachine<F> {
 	pub fn state(&self) -> ServerHandshakeState {
 		self.state
+	}
+
+	/// Enforce a single expected handshake state. A mismatch yields
+	/// `InvalidState`.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	pub(crate) fn expect_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
+		if self.state != expected {
+			Err(HandshakeError::InvalidState)
+		} else {
+			Ok(())
+		}
 	}
 
 	pub fn transition(&mut self, to: ServerHandshakeState) -> Result<(), HandshakeError> {

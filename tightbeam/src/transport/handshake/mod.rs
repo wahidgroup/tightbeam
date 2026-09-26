@@ -143,44 +143,32 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use core::marker::PhantomData;
+use core::result::Result as CoreResult;
 
 #[cfg(not(feature = "std"))]
 pub(crate) use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 #[cfg(feature = "std")]
 pub(crate) use std::sync::Arc;
 
 mod attributes;
-mod common;
 mod error;
+mod orchestrator;
 mod peer;
-mod utils;
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-pub(crate) use utils::HandshakeOctets;
-#[cfg(all(
-	feature = "x509",
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-pub(crate) use utils::HandshakeVerifyingKey;
-
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-mod wire;
 
 #[cfg(test)]
 mod tests;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+mod wire;
 
 pub mod client;
 pub mod negotiation;
+pub mod primitives;
 pub mod receipt;
 pub mod server;
 pub mod state;
-
-pub mod primitives;
 
 #[cfg(feature = "transport-cms")]
 pub mod builders;
@@ -190,40 +178,28 @@ pub mod kari;
 pub mod processors;
 
 pub use crate::crypto::aead::DirectionalCiphers;
-pub use common::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
-pub use error::HandshakeError;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) use peer::AdmittedPeer;
-pub use peer::PeerAuthentication;
-pub(crate) use utils::aes_256_gcm_algorithm;
-
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-mod mux {
-	pub(crate) use super::utils::compute_transcript_digest;
-}
-
-#[cfg(all(
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-pub(crate) use mux::*;
-
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub use attributes::HandshakeAttribute;
+pub use error::HandshakeError;
+pub use orchestrator::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
+pub use peer::PeerAuthentication;
+
 #[cfg(feature = "transport-cms")]
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
-#[cfg(feature = "transport-cms")]
-pub use kari::{kari_unwrap, kari_wrap};
-#[cfg(all(feature = "transport-cms", feature = "kem", feature = "unstable-pqxdh"))]
-pub use kari::{kari_unwrap_hybrid, kari_wrap_hybrid};
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub(crate) use orchestrator::HandshakeVerifyingKey;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) use peer::AdmittedPeer;
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
-
-use core::marker::PhantomData;
-use core::result::Result as CoreResult;
+#[cfg(all(
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub(crate) use wire::HandshakeOctets;
 
 use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;
@@ -232,11 +208,10 @@ use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
 use crate::crypto::aead::SessionKeys;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
-#[cfg(feature = "transport-ecies")]
-use crate::der::asn1::OctetStringRef;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Any, Decode, Encode, Enumerated, Sequence, Tag};
-use crate::oids::{CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA};
+use crate::oids::{AES_256_GCM, CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA};
+use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::error::TransportError;
 use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{
@@ -246,6 +221,9 @@ use crate::transport::handshake::receipt::StoredReceipt;
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::Beamable;
+
+#[cfg(feature = "transport-ecies")]
+use crate::der::asn1::OctetStringRef;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod transport {
@@ -1068,6 +1046,13 @@ fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<Cli
 struct ClientKeyExchangeAttrs {
 	certificate: Option<Certificate>,
 	signature: Option<OctetString>,
+}
+
+/// AES-256-GCM algorithm identifier.
+///
+/// OID: 2.16.840.1.101.3.4.1.46 (aes256-GCM)
+fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
+	AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None }
 }
 
 /// Wraps a [`ClientKeyExchange`] in an opaque `EnvelopedData` that carries

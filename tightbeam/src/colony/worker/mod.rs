@@ -50,10 +50,10 @@ pub mod worker_runtime {
 	}
 }
 
-pub struct WorkerRequest<I: Send, O> {
-	pub message: Arc<I>,
-	pub respond_to: worker_runtime::rt::OneshotSender<Result<O, TransitStatus>>,
-	pub trace: Arc<TraceCollector>,
+pub(crate) struct WorkerRequest<I: Send, O> {
+	pub(crate) message: Arc<I>,
+	pub(crate) respond_to: worker_runtime::rt::OneshotSender<Result<O, TransitStatus>>,
+	pub(crate) trace: Arc<TraceCollector>,
 }
 
 #[derive(Errorizable, Debug)]
@@ -69,61 +69,6 @@ pub enum WorkerRelayError {
 pub type WorkerRelayFuture<O> = Pin<Box<dyn Future<Output = Result<O, WorkerRelayError>> + Send + 'static>>;
 pub type WorkerStartFuture<W> = Pin<Box<dyn Future<Output = Result<W, crate::error::TightBeamError>> + Send>>;
 pub type WorkerKillFuture = Pin<Box<dyn Future<Output = Result<(), crate::error::TightBeamError>> + Send + 'static>>;
-
-/// Relay a message into a started worker's queue and await its response
-///
-/// Single implementation backing every `worker!`-generated `Worker::relay`.
-pub fn relay_to_worker<I, O>(
-	sender: Option<worker_runtime::rt::QueueSender<WorkerRequest<I, O>>>,
-	trace: Arc<TraceCollector>,
-	message: Arc<I>,
-) -> WorkerRelayFuture<O>
-where
-	I: Send + Sync + 'static,
-	O: Send + 'static,
-{
-	Box::pin(async move {
-		let sender = sender.ok_or(WorkerRelayError::QueueClosed)?;
-		let (tx, rx) = worker_runtime::rt::oneshot();
-
-		let request = WorkerRequest { message, respond_to: tx, trace };
-		worker_runtime::rt::send(&sender, request)
-			.await
-			.map_err(|_| WorkerRelayError::QueueClosed)?;
-
-		match worker_runtime::rt::wait_response(rx).await {
-			Ok(Ok(output)) => Ok(output),
-			Ok(Err(status)) => Err(WorkerRelayError::Rejected(status)),
-			Err(()) => Err(WorkerRelayError::ResponseDropped),
-		}
-	})
-}
-
-/// Gracefully stop a started worker: close its queue, then await loop exit
-///
-/// Single implementation backing every `worker!`-generated `Worker::kill`.
-/// Dropping the sender ends the run loop's `recv` stream, so the join
-/// observes a clean exit instead of aborting mid-message.
-pub fn kill_worker<I, O>(
-	sender: Option<worker_runtime::rt::QueueSender<WorkerRequest<I, O>>>,
-	join: Option<worker_runtime::rt::JoinHandle>,
-) -> WorkerKillFuture
-where
-	I: Send + Sync + 'static,
-	O: Send + 'static,
-{
-	Box::pin(async move {
-		drop(sender);
-
-		if let Some(handle) = join {
-			worker_runtime::rt::join(handle)
-				.await
-				.map_err(|_| crate::error::TightBeamError::JoinError)?;
-		}
-
-		Ok(())
-	})
-}
 
 /// A message-processing unit in the colony architecture.
 ///

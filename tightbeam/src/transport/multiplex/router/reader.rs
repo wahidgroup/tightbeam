@@ -2,7 +2,6 @@
 //! payloads under granted credit, and buffers control-plane replies
 //! so a full writer queue never parks the read loop.
 
-use core::future::poll_fn;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -12,11 +11,10 @@ use futures::future::{select, Either};
 use futures::{pin_mut, SinkExt, StreamExt};
 
 use super::body::{BodyEvent, DrainNote, ForwardedStream, StreamBody};
-use super::flow::{cap_as_usize, payload_credits, BufferedGrantor, ChunkSize, CreditGrantor};
+use super::flow::{cap_as_usize, BufferedGrantor, ChunkSize, CreditGrantor};
 use super::link::MuxLink;
-use super::outbound::outbound_handle;
 use super::outbound::Outbound;
-use super::shared::{MuxShared, OpenSlot, PeerStream, StreamOutcome};
+use super::shared::{OpenSlot, PeerStream, StreamOutcome};
 use crate::der::Decode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{
@@ -201,9 +199,8 @@ where
 	R: EnvelopeSource,
 {
 	reader: R,
-	shared: Arc<MuxShared>,
+	link: MuxLink,
 	inbound: mpsc::Sender<InboundEvent>,
-	outbound: mpsc::Sender<Outbound>,
 	grantor: Arc<dyn CreditGrantor>,
 	/// Concurrent peer-initiated streams accepted (locally advertised). Bounds
 	/// `peer_reassembly` so partial opens cannot hold state beyond the cap
@@ -230,9 +227,6 @@ where
 	/// notes are bounded by forwarded chunks, which grants bound
 	/// by the per-stream windows.
 	drained: mpsc::UnboundedReceiver<DrainNote>,
-	/// Cloned into each body. Holding one end keeps `drained` open
-	/// for the driver's lifetime.
-	drain_feedback: mpsc::UnboundedSender<DrainNote>,
 	/// Control commands buffered while the writer queue is full so
 	/// the read loop never parks
 	/// ([RFC 9113 § 5.2.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2)).
@@ -268,25 +262,6 @@ struct PendingDone {
 	receipt: StoredReceipt,
 }
 
-/// Drain buffered control into the writer queue. Cancellation-safe:
-/// a command leaves the buffer only after its slot is reserved.
-async fn flush_control(outbound: &mut mpsc::Sender<Outbound>, pending: &mut VecDeque<Outbound>) -> TransportResult<()> {
-	while !pending.is_empty() {
-		let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
-		if ready.is_err() {
-			return Err(TransportError::ConnectionClosed);
-		}
-
-		let Some(command) = pending.pop_front() else {
-			return Ok(());
-		};
-
-		outbound.start_send(command).map_err(|_| TransportError::ConnectionClosed)?;
-	}
-
-	Ok(())
-}
-
 /// One unit of read-loop work (see [`MuxReaderDriver::next_event`]).
 enum ReaderEvent {
 	Envelope(TransportEnvelope),
@@ -314,28 +289,20 @@ impl<R> MuxReaderDriver<R>
 where
 	R: EnvelopeSource,
 {
-	/// This driver\'s connection state paired with its outbound queue.
-	fn link(&self) -> MuxLink {
-		MuxLink::new(Arc::clone(&self.shared), outbound_handle(&self.outbound))
-	}
-
 	/// Assemble the reader driver over its shared state and
 	/// channels: the single construction point, so a new field has
 	/// exactly one home.
-	pub fn new(
+	pub(crate) fn new(
 		reader: R,
-		shared: Arc<MuxShared>,
+		link: MuxLink,
 		inbound: mpsc::Sender<InboundEvent>,
-		outbound: mpsc::Sender<Outbound>,
+		drained: mpsc::UnboundedReceiver<DrainNote>,
 		settings: &MuxSettings,
 	) -> Self {
-		let (drain_feedback, drained) = mpsc::unbounded();
-
 		Self {
 			reader,
-			shared,
+			link,
 			inbound,
-			outbound,
 			grantor: Arc::new(BufferedGrantor::default()),
 			peer_cap: settings.peer_initiated_cap,
 			recv_chunk_size: ChunkSize::new(cap_as_usize(settings.recv_chunk_size)),
@@ -346,7 +313,6 @@ where
 			peer_bodies: HashMap::new(),
 			local_reassembly: HashMap::new(),
 			drained,
-			drain_feedback,
 			pending_control: VecDeque::new(),
 			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 			rekey: None,
@@ -361,12 +327,6 @@ where
 		}
 	}
 
-	/// Drain-note sender for bodies created outside the reader
-	/// (refcount bump, not a data copy).
-	pub fn drain_feedback(&self) -> mpsc::UnboundedSender<DrainNote> {
-		self.drain_feedback.clone()
-	}
-
 	/// Override the receiver-side stream credit policy.
 	pub fn set_grantor(&mut self, grantor: Arc<dyn CreditGrantor>) {
 		self.grantor = grantor;
@@ -378,12 +338,13 @@ where
 	/// gating for renewals.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) fn attach_rekey(&mut self, driver: RekeyDriver, receipt: StoredReceipt) {
-		self.shared.rotate_receipt(receipt);
+		self.link.shared().rotate_receipt(receipt);
 		self.epoch_recv_baseline = self.reader.remaining_records();
 
 		if matches!(&driver, RekeyDriver::Client(_)) {
-			self.shared.mark_rekey_client();
+			self.link.shared().mark_rekey_client();
 		}
+
 		self.rekey = Some(driver);
 	}
 
@@ -391,9 +352,7 @@ where
 	/// the failure.
 	pub async fn drive(mut self) -> TransportResult<()> {
 		let result = self.route_envelopes().await;
-
-		self.shared.fail_all_pending();
-
+		self.link.shared().fail_all_pending();
 		result
 	}
 
@@ -424,17 +383,18 @@ where
 			MuxEnvelope::Open(package) => self.route_open(package).await,
 			MuxEnvelope::Data(package) => self.route_data(package).await,
 			MuxEnvelope::Credit(package) => {
-				self.shared.apply_credit_grant(package.stream_id(), package.limit());
+				self.link.shared().apply_credit_grant(package.stream_id(), package.limit());
 				Ok(())
 			}
 			MuxEnvelope::Cancel(package) => self.route_cancel(package).await,
 			MuxEnvelope::Ping(package) => self.route_ping(package),
 			MuxEnvelope::GoAway(package) => {
-				self.shared.fail_pending_above(package.last_stream_id(), package.reason());
-				self.shared.fail_duplex_above(package.last_stream_id());
+				let shared = self.link.shared();
+				shared.fail_pending_above(package.last_stream_id(), package.reason());
+				shared.fail_duplex_above(package.last_stream_id());
 				// The peer will never answer these streams, so their partial
 				// response buffers are dropped.
-				self.local_reassembly.retain(|id, _| self.shared.is_pending(*id));
+				self.local_reassembly.retain(|id, _| shared.is_pending(*id));
 				Ok(())
 			}
 			#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -467,7 +427,7 @@ where
 		let Some(RekeyDriver::Client(exchange)) = self.rekey.as_ref() else {
 			return Ok(());
 		};
-		let Some(request) = self.shared.open_renewal(exchange) else {
+		let Some(request) = self.link.shared().open_renewal(exchange) else {
 			return Ok(());
 		};
 
@@ -487,9 +447,9 @@ where
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	fn drain_refused(&mut self, code: u32) -> TransportResult<()> {
 		#[cfg(feature = "instrument")]
-		self.shared.emit_event(events::MUX_REKEY_REFUSED);
+		self.link.shared().emit_event(events::MUX_REKEY_REFUSED);
 
-		let Some(package) = self.shared.goaway_package(refusal_reason(code)) else {
+		let Some(package) = self.link.shared().goaway_package(refusal_reason(code)) else {
 			return Ok(());
 		};
 
@@ -519,7 +479,7 @@ where
 		match issued {
 			Some(Ok(response)) => {
 				#[cfg(feature = "instrument")]
-				self.shared.emit_event(events::MUX_REKEY_RECEIPT_ISSUED);
+				self.link.shared().emit_event(events::MUX_REKEY_RECEIPT_ISSUED);
 
 				let envelope = TransportEnvelope::from(response);
 				self.queue_control(envelope)
@@ -527,7 +487,7 @@ where
 			Some(Err(HandshakeError::SettlementRejected { code })) => self.drain_refused(code),
 			Some(Err(_)) => {
 				#[cfg(feature = "instrument")]
-				self.shared.emit_event(events::MUX_REKEY_VERIFY_FAILED);
+				self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED);
 
 				Err(self.protocol_violation())
 			}
@@ -544,7 +504,7 @@ where
 		// Admitting the response parks new c2s admissions before it is
 		// verified, so no admission can debit the old epoch once the ack
 		// is in motion.
-		if !self.shared.admit_rekey_response() {
+		if !self.link.shared().admit_rekey_response() {
 			return Err(self.protocol_violation());
 		}
 		let Some(RekeyDriver::Client(exchange)) = self.rekey.as_ref() else {
@@ -560,7 +520,7 @@ where
 		match processed {
 			Ok((ack, install)) => {
 				#[cfg(feature = "instrument")]
-				self.shared.emit_event(events::MUX_REKEY_RECEIPT_COUNTERSIGNED);
+				self.link.shared().emit_event(events::MUX_REKEY_RECEIPT_COUNTERSIGNED);
 
 				let EpochInstall { send_cipher, recv_cipher, receipt, epoch: _ } = install;
 
@@ -571,12 +531,12 @@ where
 				self.queue_command(install)
 			}
 			Err(HandshakeError::ApprovalRefused { code }) => {
-				self.shared.finish_renewal();
+				self.link.shared().finish_renewal();
 				self.drain_refused(code)
 			}
 			Err(_) => {
 				#[cfg(feature = "instrument")]
-				self.shared.emit_event(events::MUX_REKEY_VERIFY_FAILED);
+				self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED);
 
 				Err(self.protocol_violation())
 			}
@@ -601,7 +561,7 @@ where
 		};
 		let Ok(outcome) = settled else {
 			#[cfg(feature = "instrument")]
-			self.shared.emit_event(events::MUX_REKEY_VERIFY_FAILED);
+			self.link.shared().emit_event(events::MUX_REKEY_VERIFY_FAILED);
 
 			return Err(self.protocol_violation());
 		};
@@ -623,7 +583,6 @@ where
 
 		let done_package = MuxRekeyDonePackage::default();
 		let done_envelope = TransportEnvelope::from(done_package);
-
 		let install = Outbound::EnvelopeThenInstall(done_envelope, Box::new(send_cipher));
 		self.queue_command(install)
 	}
@@ -643,12 +602,12 @@ where
 		// connection.
 		self.reader.install_recv_cipher(recv_cipher)?;
 		self.recv_budget = self.initial_recv_budget;
-		if !self.shared.complete_renewal(receipt) {
+		if !self.link.shared().complete_renewal(receipt) {
 			return Err(self.protocol_violation());
 		}
 
 		#[cfg(feature = "instrument")]
-		self.shared.emit_event(events::MUX_REKEY_RENEWED);
+		self.link.shared().emit_event(events::MUX_REKEY_RENEWED);
 
 		Ok(())
 	}
@@ -660,11 +619,11 @@ where
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	fn renew_epoch_terms(&mut self, receipt: StoredReceipt) {
 		self.recv_budget = self.initial_recv_budget;
-		self.shared.reset_send_budget();
-		self.shared.rotate_receipt(receipt);
+		self.link.shared().reset_send_budget();
+		self.link.shared().rotate_receipt(receipt);
 
 		#[cfg(feature = "instrument")]
-		self.shared.emit_event(events::MUX_REKEY_RENEWED);
+		self.link.shared().emit_event(events::MUX_REKEY_RENEWED);
 	}
 
 	/// Enforce the advertised chunk ceiling and debit the inbound
@@ -679,7 +638,7 @@ where
 			return Ok(());
 		};
 
-		let credits = payload_credits(payload.len(), self.recv_chunk_size, self.shared.credit_unit);
+		let credits = self.recv_chunk_size.credits(payload.len(), self.link.shared().credit_unit);
 		if credits > balance {
 			return Err(self.protocol_violation());
 		}
@@ -692,7 +651,7 @@ where
 	/// body-drain report, or a completed control flush. The read
 	/// never parks behind the flush or the drain reports.
 	async fn next_event(&mut self) -> TransportResult<ReaderEvent> {
-		let Self { reader, drained, outbound, pending_control, .. } = self;
+		let Self { reader, drained, link, pending_control, .. } = self;
 
 		let read = reader.read_envelope();
 		let note = drained.next();
@@ -705,7 +664,7 @@ where
 			};
 		}
 
-		let flush = flush_control(outbound, pending_control);
+		let flush = link.flush_control(pending_control);
 		pin_mut!(flush);
 
 		match select(read, select(note, flush)).await {
@@ -734,8 +693,8 @@ where
 	/// from chunks this grant ceiling admitted, so outstanding notes never
 	/// exceed the per-stream windows.
 	fn grant_streaming(&mut self, note: DrainNote) -> TransportResult<()> {
-		let limits = if self.shared.role.initiates(note.stream_id) {
-			self.shared.duplex_limits(note.stream_id)
+		let limits = if self.link.shared().role.initiates(note.stream_id) {
+			self.link.shared().duplex_limits(note.stream_id)
 		} else {
 			self.peer_bodies.get(&note.stream_id).map(ForwardedStream::limits)
 		};
@@ -753,8 +712,8 @@ where
 			return Ok(());
 		}
 
-		if self.shared.role.initiates(note.stream_id) {
-			self.shared.set_duplex_limit(note.stream_id, new_limit);
+		if self.link.shared().role.initiates(note.stream_id) {
+			self.link.shared().set_duplex_limit(note.stream_id, new_limit);
 		} else if let Some(stream) = self.peer_bodies.get_mut(&note.stream_id) {
 			stream.raise_limit(new_limit);
 		}
@@ -770,7 +729,7 @@ where
 			return Ok(());
 		}
 
-		match self.outbound.try_send(command) {
+		match self.link.try_send(command) {
 			Ok(()) => Ok(()),
 			Err(refused) if refused.is_full() => {
 				self.pending_control.push_back(refused.into_inner());
@@ -853,7 +812,7 @@ where
 
 	fn route_end(&mut self, package: MuxEndPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
-		if !self.shared.role.initiates(stream_id) {
+		if !self.link.shared().role.initiates(stream_id) {
 			return Err(self.protocol_violation());
 		}
 
@@ -867,8 +826,8 @@ where
 
 		// Duplex reply: the trailer closes the body, Ok as a clean
 		// end, anything else as its transport error
-		if let Some(forwarder) = self.shared.take_duplex(stream_id) {
-			self.shared.remove_pending(stream_id);
+		if let Some(forwarder) = self.link.shared().take_duplex(stream_id) {
+			self.link.shared().remove_pending(stream_id);
 			return self.finish_duplex_body(forwarder, &package);
 		}
 
@@ -876,7 +835,7 @@ where
 		// inspecting their payload, and non-Ok trailers never
 		// contribute a frame, so garbage bytes on either cannot tear
 		// down the connection.
-		let Some(sender) = self.shared.remove_pending(stream_id) else {
+		let Some(sender) = self.link.shared().remove_pending(stream_id) else {
 			self.local_reassembly.remove(&stream_id);
 			return Ok(());
 		};
@@ -914,7 +873,7 @@ where
 
 	async fn route_open(&mut self, package: MuxOpenPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
-		match self.shared.register_peer_stream(stream_id) {
+		match self.link.shared().register_peer_stream(stream_id) {
 			Ok(PeerStream::Accept) => self.accept_peer_open(stream_id, package).await,
 			Ok(PeerStream::RejectDraining) => self.reject_draining_open(stream_id, package),
 			Err(_) => Err(self.protocol_violation()),
@@ -976,7 +935,7 @@ where
 		let (body, mut forwarder) = StreamBody::pair(
 			OpenSlot::assigned(stream_id),
 			self.initial_recv_credit,
-			self.drain_feedback.clone(),
+			self.link.drain_feedback(),
 		);
 		if !forwarder.accept_and_forward(package.payload()) {
 			return Err(self.protocol_violation());
@@ -1016,7 +975,7 @@ where
 	/// crossed the wire under the sender's ledgers, so debit inbound.
 	fn reject_draining_open(&mut self, stream_id: u32, package: MuxOpenPackage) -> TransportResult<()> {
 		#[cfg(feature = "instrument")]
-		self.shared.emit_event(events::MUX_OPEN_DRAINING);
+		self.link.shared().emit_event(events::MUX_OPEN_DRAINING);
 
 		self.charge_inbound_chunk(package.payload())?;
 		self.refuse_stream(stream_id)?;
@@ -1034,10 +993,10 @@ where
 			return Err(self.protocol_violation());
 		}
 
-		if self.shared.role.peer().initiates(stream_id) {
+		if self.link.shared().role.peer().initiates(stream_id) {
 			return self.route_request_data(package).await;
 		}
-		if self.shared.role.initiates(stream_id) {
+		if self.link.shared().role.initiates(stream_id) {
 			return self.route_response_data(package).await;
 		}
 
@@ -1094,7 +1053,7 @@ where
 			// A refused or cancelled stream still flushing chunks it
 			// had credit for. Anything beyond the high-water mark
 			// never opened
-			if stream_id <= self.shared.last_peer_stream_id() {
+			if stream_id <= self.link.shared().last_peer_stream_id() {
 				return Ok(());
 			}
 
@@ -1158,7 +1117,7 @@ where
 		}
 
 		// Duplex reply: forward into the body instead of reassembling
-		if let Some(accepted) = self.shared.forward_duplex_chunk(stream_id, package.payload()) {
+		if let Some(accepted) = self.link.shared().forward_duplex_chunk(stream_id, package.payload()) {
 			if !accepted {
 				return Err(self.protocol_violation());
 			}
@@ -1167,7 +1126,7 @@ where
 		}
 
 		// Stale flush of a stream this endpoint already resolved
-		if !self.shared.is_pending(stream_id) {
+		if !self.link.shared().is_pending(stream_id) {
 			self.local_reassembly.remove(&stream_id);
 			self.evict_credit(stream_id);
 			return Ok(());
@@ -1200,26 +1159,29 @@ where
 
 	async fn route_cancel(&mut self, package: MuxCancelPackage) -> TransportResult<()> {
 		let stream_id = package.stream_id();
-		if self.shared.role.initiates(stream_id) {
+		if self.link.shared().role.initiates(stream_id) {
 			// Peer cancelled/refused a stream we initiated
 			self.local_reassembly.remove(&stream_id);
 
-			if let Some(mut forwarder) = self.shared.take_duplex(stream_id) {
+			if let Some(mut forwarder) = self.link.shared().take_duplex(stream_id) {
 				let _ = forwarder.forward(BodyEvent::Failed(package.reason().cancel_error()));
 			}
 
 			self.evict_credit(stream_id);
-			self.shared.resolve(stream_id, StreamOutcome::Cancelled(package.reason()));
+
+			let outcome = StreamOutcome::Cancelled(package.reason());
+			self.link.shared().resolve(stream_id, outcome);
+
 			return Ok(());
 		}
-		if self.shared.role.peer().initiates(stream_id) {
+		if self.link.shared().role.peer().initiates(stream_id) {
 			// Peer withdrew its own request: drop any partial
 			// reassembly or streaming body (the dropped sender ends
 			// the body), release the response ledger, abort the handler
 			self.peer_reassembly.remove(&stream_id);
 			self.peer_bodies.remove(&stream_id);
 			self.evict_credit(stream_id);
-			self.shared.finish_send_stream(stream_id);
+			self.link.shared().finish_send_stream(stream_id);
 
 			let _ = self.inbound.send(InboundEvent::Cancel(stream_id)).await;
 			return Ok(());
@@ -1232,7 +1194,7 @@ where
 	/// reach the responder or the application handler.
 	fn route_ping(&mut self, package: MuxPingPackage) -> TransportResult<()> {
 		if package.ack() {
-			self.shared.resolve_ping(package.opaque());
+			self.link.shared().resolve_ping(package.opaque());
 			return Ok(());
 		}
 
@@ -1240,7 +1202,7 @@ where
 		// owed stream traffic (see `MuxSettings::drain_reserve_records`),
 		// so peer probes draw no acks. Combined with the capped ack backlog
 		// this bounds what a ping flood can extract (CVE-2019-9512).
-		if self.shared.shutdown_begun() {
+		if self.link.shared().shutdown_begun() {
 			return Ok(());
 		}
 
@@ -1258,10 +1220,10 @@ where
 
 	fn protocol_violation(&mut self) -> TransportError {
 		#[cfg(feature = "instrument")]
-		self.shared.emit_event(events::MUX_PROTOCOL_ERROR);
+		self.link.shared().emit_event(events::MUX_PROTOCOL_ERROR);
 
-		let last = self.shared.last_peer_stream_id();
-		self.link().goaway_best_effort(last, GoAwayReason::ProtocolError);
+		let last = self.link.shared().last_peer_stream_id();
+		self.link.goaway_best_effort(last, GoAwayReason::ProtocolError);
 
 		TransportError::InvalidMessage
 	}
@@ -1274,6 +1236,7 @@ mod tests {
 	use core::sync::atomic::{AtomicUsize, Ordering};
 	use core::task::Poll;
 
+	use super::super::shared::MuxShared;
 	use super::super::testing::{body_fixture, noop_cx};
 	use super::*;
 	use crate::transport::multiplex::MuxRole;
@@ -1407,11 +1370,13 @@ mod tests {
 			.try_send(Outbound::Envelope(MuxPingPackage::new(false, 0).into()))
 			.is_err());
 
+		let shared = Arc::new(MuxShared::new(MuxRole::Server, &settings));
+		let (link, drained) = MuxLink::new(shared, outbound_sender);
 		let mut driver = MuxReaderDriver::new(
 			ScriptedSource { envelopes: envelopes.into(), delivered: Arc::clone(&delivered) },
-			Arc::new(MuxShared::new(MuxRole::Server, &settings)),
+			link,
 			inbound_sender,
-			outbound_sender,
+			drained,
 			&settings,
 		);
 		driver.grantor = Arc::new(AlwaysGrant);

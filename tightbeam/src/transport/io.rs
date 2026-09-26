@@ -45,8 +45,6 @@ mod deadline {
 	pub use core::time::Duration;
 
 	pub use tokio::time::timeout;
-
-	pub use crate::transport::error::TransportFailure;
 }
 
 #[cfg(all(
@@ -74,6 +72,7 @@ mod x509 {
 		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 		pub use crate::crypto::sign::Verifier;
 		pub use crate::spki::EncodePublicKey;
+		pub use crate::transport::error::TransportFailure;
 		pub use crate::transport::handshake::negotiation::RunnableProfile;
 		pub use crate::transport::handshake::{
 			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError, HandshakeMessage,
@@ -107,23 +106,6 @@ mod x509 {
 
 	#[cfg(feature = "transport-cms")]
 	pub use cms::*;
-
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
-	mod rekey {
-		pub(crate) use crate::transport::handshake::receipt::ReceiptSigner;
-		pub(crate) use crate::transport::handshake::HandshakeVerifyingKey;
-		pub use crate::transport::multiplex::{MuxRekeyContext, MuxRole};
-		pub(crate) use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
-	}
-
-	#[cfg(all(
-		feature = "transport-multiplex",
-		any(feature = "transport-cms", feature = "transport-ecies")
-	))]
-	pub(crate) use rekey::*;
 }
 
 #[cfg(feature = "x509")]
@@ -153,101 +135,6 @@ fn remaining_handshake_deadline<T: EncryptedProtocolState + MessageIO>(state: &T
 
 	let now = state.clock().monotonic();
 	deadline.saturating_duration_since(now)
-}
-
-/// Harvest the in-band rekey context from a completed receipt-bearing
-/// handshake.
-///
-/// [`MuxTransport::with_rekey`] consumes the result. The function is
-/// crate-internal, so the transport's [`MuxConnector::take_rekey`] or
-/// [`MuxAcceptor::take_rekey`] always fixes the endpoint role.
-///
-/// # Returns
-///
-/// - `Ok(Some(..))` at most once per handshake, because the call detaches the
-///   retained epoch materials.
-/// - `Ok(None)` when the session carries no dual-signed receipt, no retained
-///   peer identity, or no epoch materials.
-///
-/// # Errors
-///
-/// - `EncryptorUnavailable` when no handshake completed.
-/// - An extraction error when the peer key or the signer identifier fails to extract.
-///
-/// [`MuxTransport::with_rekey`]: crate::transport::multiplex::MuxTransport::with_rekey
-/// [`MuxConnector::take_rekey`]: crate::transport::multiplex::MuxConnector::take_rekey
-/// [`MuxAcceptor::take_rekey`]: crate::transport::multiplex::MuxAcceptor::take_rekey
-#[cfg(all(
-	feature = "x509",
-	feature = "transport-multiplex",
-	any(feature = "transport-cms", feature = "transport-ecies")
-))]
-pub(crate) fn take_rekey_context<T, P>(state: &mut T, role: MuxRole) -> TransportResult<Option<MuxRekeyContext>>
-where
-	T: EncryptedProtocolState<CryptoProvider = P>,
-	P: CryptoProvider + Send + Sync + 'static,
-	P::Curve: Curve + CurveArithmetic,
-	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	P::VerifyingKey: From<PublicKey<P::Curve>>,
-	for<'a> P::Signature: TryFrom<&'a [u8]>,
-	P::AeadCipher: KeyInit + 'static,
-{
-	let Some(stored) = state.session_state().receipt().cloned() else {
-		return Ok(None);
-	};
-	let Some(provider) = state
-		.encryption()
-		.key_manager
-		.as_ref()
-		.map(|manager| manager.signing_provider())
-	else {
-		return Ok(None);
-	};
-
-	let Some(peer_certificate) = state.session_state().peer_certificate_arc() else {
-		return Ok(None);
-	};
-
-	let public_key = peer_certificate.verifying_key::<P::Curve>()?;
-	let peer_verifying_key = P::VerifyingKey::from(public_key);
-	let peer_sid = peer_certificate.signer_identifier::<P::Digest>()?;
-
-	// Detached last so a session refused above keeps its materials
-	let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
-		return Ok(None);
-	};
-
-	let reference_receipt = stored.receipt().clone();
-	let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, provider, peer_verifying_key, peer_sid);
-
-	let driver = match role {
-		MuxRole::Client => {
-			let exchange = ClientRekey::new(materials, state.encryption().receipt_approver.as_ref().map(Arc::clone));
-			RekeyDriver::client(exchange)
-		}
-		MuxRole::Server => {
-			let exchange = ServerRekey::new(
-				materials,
-				state.encryption().transport_authorizer.as_ref().map(Arc::clone),
-				state.encryption().session_observer.as_ref().map(Arc::clone),
-				Some(peer_certificate),
-			);
-			RekeyDriver::server(exchange)
-		}
-	};
-
-	Ok(Some(MuxRekeyContext { driver, receipt: stored }))
-}
-
-/// Decode a `TransportEnvelope` from DER bytes.
-///
-/// This is the single decode path that [`MessageIO::decode_envelope`] and the
-/// split transport halves share. The frame decoder rejects a frame that carries
-/// a field its version forbids.
-pub(crate) fn decode_transport_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
-	let envelope = TransportEnvelope::from_der(buffer)?;
-	Ok(envelope)
 }
 
 /// Receive side of a split envelope link.
@@ -339,7 +226,7 @@ pub trait MessageIO {
 
 	/// Decode an envelope from DER bytes.
 	fn decode_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
-		decode_transport_envelope(buffer)
+		Ok(TransportEnvelope::from_der(buffer)?)
 	}
 
 	/// Encode an envelope as DER bytes.
@@ -392,6 +279,19 @@ pub trait MessageIO {
 	}
 }
 
+/// Outcome of one protocol-agnostic collector step.
+#[cfg(all(
+	feature = "transport-policy",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub enum CollectStep {
+	/// Cleartext handshake container to feed the server-side dispatcher,
+	/// decoded once with the bytes it arrived as.
+	Handshake(HandshakeMessage),
+	/// Decrypted (or legitimately cleartext) application envelope.
+	Envelope(TransportEnvelope),
+}
+
 /// Message I/O with session encryption and the handshake drivers.
 #[cfg(feature = "x509")]
 pub trait EncryptedMessageIO: MessageIO {
@@ -415,6 +315,82 @@ pub trait EncryptedMessageIO: MessageIO {
 			WireEnvelope::Encrypted(encrypted_info) => {
 				let decrypted_bytes = self.session_state().decryptor()?.decrypt_content(&encrypted_info)?;
 				decrypted_bytes.with(|bytes| Self::decode_envelope(bytes))
+			}
+		}
+	}
+
+	/// Read one wire envelope, enforce size ceilings, and classify it.
+	///
+	/// The step is protocol-agnostic. It surfaces a handshake container as a
+	/// decoded message for the caller's dispatcher, and it decrypts and returns
+	/// everything else.
+	#[cfg(all(
+		feature = "transport-policy",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
+	#[allow(async_fn_in_trait)]
+	async fn collect_step(&mut self) -> TransportResult<CollectStep>
+	where
+		Self: EncryptedProtocolState + Sized,
+	{
+		// Read the wire envelope, then enforce the size ceiling of its kind.
+		let wire_bytes = self.read_envelope_bytes().await?;
+		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+		let ceiling = match &wire_envelope {
+			WireEnvelope::Cleartext(_) => self.limits().cleartext_envelope,
+			WireEnvelope::Encrypted(_) => self.limits().encrypted_envelope,
+		};
+		if wire_bytes.len() > ceiling {
+			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
+		}
+
+		// An established session reads and writes encrypted, so nothing
+		// cleartext is admitted on it. Before that, a provisioned endpoint
+		// admits only the handshake containers, and an unprovisioned one
+		// admits traffic.
+		let established = self.session_state().phase().requires_encryption();
+		let expects_encryption = self.session_state().phase().is_handshake_pending();
+		match wire_envelope {
+			WireEnvelope::Cleartext(envelope) => {
+				if established {
+					// Circuit breaker: a cleartext frame on an agreed session
+					// is not the peer this session established (CWE-319).
+					self.session_state_mut().reset();
+					return Err(TransportError::MissingEncryption);
+				}
+
+				if expects_encryption {
+					match envelope {
+						TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+							Ok(CollectStep::Handshake(HandshakeMessage::try_from(envelope)?))
+						}
+						// Circuit breaker: once encryption is configured,
+						// application traffic arrives encrypted.
+						_ => {
+							self.session_state_mut().reset();
+							Err(TransportError::MissingEncryption)
+						}
+					}
+				} else {
+					Ok(CollectStep::Envelope(envelope))
+				}
+			}
+			WireEnvelope::Encrypted(encrypted_info) => {
+				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
+					self.session_state_mut().reset();
+					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
+				}
+
+				let decrypted_bytes = match self.session_state().decryptor()?.decrypt_content(&encrypted_info) {
+					Ok(bytes) => bytes,
+					Err(_) => {
+						self.session_state_mut().reset();
+						return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
+					}
+				};
+
+				let envelope = decrypted_bytes.with(|bytes| Self::decode_envelope(bytes))?;
+				Ok(CollectStep::Envelope(envelope))
 			}
 		}
 	}

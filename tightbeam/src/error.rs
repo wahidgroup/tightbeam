@@ -557,6 +557,18 @@ impl TightBeamError {
 
 		TransitStatus::Internal
 	}
+
+	/// The refusal behind every [`MuxService`] default.
+	///
+	/// [`MuxService`]: crate::transport::serve::MuxService
+	#[cfg(pooled_mux)]
+	#[must_use]
+	pub(crate) fn unimplemented() -> Self {
+		use crate::policy::TransitStatus;
+		use crate::transport::TransportError;
+
+		TransportError::from(TransitStatus::Unimplemented).into()
+	}
 }
 
 // A generic source type cannot go through impl_from!, so the unit-variant

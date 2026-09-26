@@ -1,6 +1,7 @@
 //! One connection's shared state paired with the queue it writes on.
 
 use core::future::poll_fn;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures::channel::mpsc;
@@ -9,9 +10,8 @@ use futures::SinkExt;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
 
-use super::body::BodyEvent;
-use super::flow::{chunk_records, payload_credits};
-use super::outbound::{outbound_handle, Outbound};
+use super::body::{BodyEvent, DrainNote};
+use super::outbound::Outbound;
 use super::shared::{BudgetStanding, MuxShared, OpenRequest, StreamOutcome, StreamReservation};
 use crate::der::Encode;
 use crate::policy::TransitStatus;
@@ -30,18 +30,35 @@ use crate::transport::TransportResult;
 pub(crate) struct MuxLink {
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
+	/// Consumption reports from stream bodies back to the reader's credit
+	/// replenishment.
+	drain_feedback: mpsc::UnboundedSender<DrainNote>,
 }
 
 impl Clone for MuxLink {
 	fn clone(&self) -> Self {
-		Self { shared: Arc::clone(&self.shared), outbound: outbound_handle(&self.outbound) }
+		Self {
+			shared: Arc::clone(&self.shared),
+			outbound: self.outbound.clone(),
+			drain_feedback: self.drain_feedback.clone(),
+		}
 	}
 }
 
 impl MuxLink {
-	/// Pair `shared` with the queue its sends travel on.
-	pub(crate) fn new(shared: Arc<MuxShared>, outbound: mpsc::Sender<Outbound>) -> Self {
-		Self { shared, outbound }
+	/// Pair `shared` with the queue its sends travel on, and open the channel
+	/// its stream bodies report consumption on.
+	///
+	/// The link keeps the sending end. The caller receives the other end for
+	/// the reader, so the reader drains the channel this link feeds.
+	pub(crate) fn new(
+		shared: Arc<MuxShared>,
+		outbound: mpsc::Sender<Outbound>,
+	) -> (Self, mpsc::UnboundedReceiver<DrainNote>) {
+		let (drain_feedback, drained) = mpsc::unbounded();
+		let link = Self { shared, outbound, drain_feedback };
+
+		(link, drained)
 	}
 
 	/// Connection state behind this link.
@@ -60,7 +77,46 @@ impl MuxLink {
 	/// - `futures::channel::mpsc::channel`, guaranteed per-sender slot:
 	///   <https://docs.rs/futures/latest/futures/channel/mpsc/fn.channel.html>
 	pub(crate) fn sender(&self) -> mpsc::Sender<Outbound> {
-		outbound_handle(&self.outbound)
+		self.outbound.clone()
+	}
+
+	/// Drain-note sender for a stream body on this connection.
+	pub(crate) fn drain_feedback(&self) -> mpsc::UnboundedSender<DrainNote> {
+		self.drain_feedback.clone()
+	}
+
+	/// Hand `command` to the writer on this link's own sender without
+	/// waiting.
+	///
+	/// The link's sender keeps its slot across calls, so a full queue
+	/// refuses the command instead of admitting it through a fresh slot.
+	///
+	/// # Errors
+	///
+	/// - The refused command, when the queue is full or the writer driver is
+	///   gone.
+	pub(crate) fn try_send(&mut self, command: Outbound) -> Result<(), mpsc::TrySendError<Outbound>> {
+		self.outbound.try_send(command)
+	}
+
+	/// Drain buffered control into the writer queue. Cancellation-safe:
+	/// a command leaves the buffer only after its slot is reserved.
+	pub(crate) async fn flush_control(&mut self, pending: &mut VecDeque<Outbound>) -> TransportResult<()> {
+		let outbound = &mut self.outbound;
+		while !pending.is_empty() {
+			let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
+			if ready.is_err() {
+				return Err(TransportError::ConnectionClosed);
+			}
+
+			let Some(command) = pending.pop_front() else {
+				return Ok(());
+			};
+
+			outbound.start_send(command).map_err(|_| TransportError::ConnectionClosed)?;
+		}
+
+		Ok(())
 	}
 
 	/// Send a response on a peer-initiated stream, chunking when it exceeds the
@@ -83,7 +139,7 @@ impl MuxLink {
 			None => Vec::new(),
 		};
 
-		let credits = payload_credits(payload.len(), self.shared.send_chunk_size, self.shared.credit_unit);
+		let credits = self.shared.credits_for(payload.len());
 		match self.shared.admit_debit(credits, true).await {
 			Ok(BudgetStanding::Healthy) => {}
 			Ok(BudgetStanding::Exhausting) => {
@@ -102,7 +158,7 @@ impl MuxLink {
 		}
 
 		let chunk_size = self.shared.send_chunk_size;
-		let total = chunk_records(payload.len(), chunk_size);
+		let total = self.shared.records_for(payload.len());
 
 		self.shared.register_send_stream(stream_id, total);
 

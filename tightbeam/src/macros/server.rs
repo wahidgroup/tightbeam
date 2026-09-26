@@ -20,7 +20,7 @@ use crate::transport::multiplex::MuxAcceptor;
 #[cfg(pooled_mux)]
 use crate::transport::multiplex::{ReplySink, StreamBody, StreamRoute};
 #[cfg(pooled_mux)]
-use crate::transport::serve::{serve_mux, CallContext, MuxService};
+use crate::transport::serve::{CallContext, MuxService};
 #[cfg(all(feature = "tokio", feature = "x509"))]
 use crate::transport::state::EncryptedProtocolState;
 #[cfg(feature = "tokio")]
@@ -225,7 +225,7 @@ pub async fn serve_connection_service<T, S>(
 	match transport.negotiate_mux().await {
 		Ok(Some(settings)) => {
 			let reported = ReportedService { service, errors: error_tx.clone() };
-			match serve_mux(transport, settings, reported, None).await {
+			match transport.serve(settings, reported, None).await {
 				Ok(()) => {
 					if let Some(tx) = ok_tx.as_mut() {
 						let _ = tx.send(()).await;

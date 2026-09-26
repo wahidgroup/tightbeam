@@ -15,9 +15,7 @@ use futures::Stream;
 use super::body::StreamBody;
 use super::flow::cap_as_usize;
 use super::link::MuxLink;
-use super::outbound::{outbound_handle, Outbound};
 use super::reader::InboundEvent;
-use super::shared::MuxShared;
 use super::sink::ReplySink;
 use crate::constants::DEFAULT_MUX_CANCEL_BUDGET;
 use crate::policy::TransitStatus;
@@ -249,27 +247,16 @@ impl MuxLink {
 /// only to cancel them exhausts the budget and is told to go away.
 pub struct MuxResponder {
 	inbound: mpsc::Receiver<InboundEvent>,
-	outbound: mpsc::Sender<Outbound>,
-	shared: Arc<MuxShared>,
+	link: MuxLink,
 	peer_cap: u32,
 	cancel_budget: u32,
 }
 
 impl MuxResponder {
-	/// This responder's connection state paired with its outbound queue.
-	fn link(&self) -> MuxLink {
-		MuxLink::new(Arc::clone(&self.shared), outbound_handle(&self.outbound))
-	}
-
 	/// Assemble the responder over the inbound event queue, at the
 	/// default cancel budget ([`DEFAULT_MUX_CANCEL_BUDGET`]).
-	pub fn new(
-		inbound: mpsc::Receiver<InboundEvent>,
-		outbound: mpsc::Sender<Outbound>,
-		shared: Arc<MuxShared>,
-		peer_cap: u32,
-	) -> Self {
-		Self { inbound, outbound, shared, peer_cap, cancel_budget: DEFAULT_MUX_CANCEL_BUDGET }
+	pub(crate) fn new(inbound: mpsc::Receiver<InboundEvent>, link: MuxLink, peer_cap: u32) -> Self {
+		Self { inbound, link, peer_cap, cancel_budget: DEFAULT_MUX_CANCEL_BUDGET }
 	}
 
 	/// Override the peer cancel budget (CVE-2023-44487 hardening).
@@ -295,7 +282,7 @@ impl MuxResponder {
 	where
 		D: MuxDispatch + MaybeSend + MaybeSync + 'static,
 	{
-		let link = self.link();
+		let link = self.link.clone();
 		let dispatch = Arc::new(dispatch);
 		self.dispatch_streams(move |stream_id, work| {
 			link.clone().dispatch_stream(Arc::clone(&dispatch), stream_id, work)
@@ -400,7 +387,7 @@ impl MuxResponder {
 					let at_cap = in_flight.len() >= cap_as_usize(self.peer_cap);
 					let work = if at_cap {
 						let refusal = ready(ResponsePackage::new(TransitStatus::ResourceExhausted, None));
-						Either::Right(self.link().respond_task(stream_id, refusal))
+						Either::Right(self.link.respond_task(stream_id, refusal))
 					} else {
 						Either::Left(dispatch(stream_id, work))
 					};
@@ -428,9 +415,9 @@ impl MuxResponder {
 	/// torn down either way.
 	fn refuse_cancel_abuse(&mut self, last_stream_id: u32) -> TransportError {
 		#[cfg(feature = "instrument")]
-		self.shared.emit_event(events::MUX_CANCEL_BUDGET);
+		self.link.shared().emit_event(events::MUX_CANCEL_BUDGET);
 
-		self.link().goaway_best_effort(last_stream_id, GoAwayReason::EnhanceYourCalm);
+		self.link.goaway_best_effort(last_stream_id, GoAwayReason::EnhanceYourCalm);
 
 		TransportError::OperationFailed(TransportFailure::PolicyRejection)
 	}

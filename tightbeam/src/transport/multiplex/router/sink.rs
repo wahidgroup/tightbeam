@@ -3,7 +3,6 @@
 //! budget-metering rule.
 
 use super::body::ForwardedStream;
-use super::flow::{chunk_records, payload_credits};
 use super::link::MuxLink;
 use super::shared::{BudgetStanding, MuxShared, OpenRequest, StreamReservation};
 use crate::transport::envelopes::{GoAwayReason, MuxDataPackage, MuxStreamKind, TransportEnvelope};
@@ -136,17 +135,13 @@ impl RequestSink {
 	/// payload closes the body.
 	async fn send_payload(&mut self, payload: impl AsRef<[u8]>, closes: bool) -> TransportResult<()> {
 		let payload = payload.as_ref();
-		let credits = payload_credits(
-			payload.len(),
-			self.link.shared().send_chunk_size,
-			self.link.shared().credit_unit,
-		);
+		let credits = self.link.shared().credits_for(payload.len());
 
 		let standing = self.link.shared().admit_debit(credits, false).await?;
 
 		// The open seeds the ledger with the payload's records. An
 		// already-open stream extends it push by push.
-		let records = chunk_records(payload.len(), self.link.shared().send_chunk_size);
+		let records = self.link.shared().records_for(payload.len());
 		if let SinkStream::Opened(stream_id) = self.stream {
 			self.link.shared().add_send_records(stream_id, records);
 		}
@@ -301,17 +296,11 @@ mod tests {
 	) {
 		let shared = client_shared();
 		let (outbound, sent) = mpsc::channel(8);
+		let (link, _) = MuxLink::new(Arc::clone(&shared), outbound);
 		let (sender, receiver) = oneshot::channel();
 		let reservation = shared.reserve_stream_slot(sender).expect("fresh connection has stream slots");
 
-		let sink = RequestSink::new(
-			reservation,
-			MuxStreamKind::Streaming,
-			MuxLink::new(Arc::clone(&shared), outbound),
-			None,
-			target,
-			DEFAULT_HOP_BUDGET,
-		);
+		let sink = RequestSink::new(reservation, MuxStreamKind::Streaming, link, None, target, DEFAULT_HOP_BUDGET);
 
 		(shared, sink, sent, receiver)
 	}

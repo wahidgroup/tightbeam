@@ -42,7 +42,7 @@ use futures::lock::Mutex as FuturesMutex;
 use crate::cms::signed_data::{SignedData, SignerIdentifier, SignerInfo};
 use crate::constants::TIGHTBEAM_EPOCH_KDF_INFO;
 use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecvCipher, SendCipher, SessionKeys};
-use crate::crypto::hash::{ConstantTimeDigest, Digest};
+use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::CryptoProvider;
 use crate::der::asn1::OctetString;
@@ -50,14 +50,14 @@ use crate::der::Encode;
 use crate::random::generate_nonce;
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
 use crate::transport::handshake::negotiation::TransportAuthorizer;
+use crate::transport::handshake::primitives::transcript::Transcript;
 use crate::transport::handshake::primitives::{kdf_chain, KdfInfo, KdfSalt, KdfStage};
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, record_receipt_outcome, sign_receipt, transcript_digest_info, verify_receipt_signer,
 	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
 };
 use crate::transport::handshake::HandshakeOctets;
-use crate::transport::handshake::{compute_transcript_digest, EpochMaterials, HandshakeError};
+use crate::transport::handshake::{EpochMaterials, HandshakeError};
 use crate::transport::multiplex::MuxRole;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::x509::Certificate;
@@ -181,7 +181,7 @@ where
 	transcript.extend_from_slice(chain_hash);
 	transcript.extend_from_slice(request_der);
 	transcript.extend_from_slice(server_random);
-	compute_transcript_digest::<D>(&transcript)
+	Transcript::digest::<D>(&transcript)
 }
 
 /// Advance the chain root over the completed exchange:
@@ -204,7 +204,7 @@ where
 	transcript.extend_from_slice(request_der);
 	transcript.extend_from_slice(response_der);
 	transcript.extend_from_slice(ack_der);
-	compute_transcript_digest::<D>(&transcript)
+	Transcript::digest::<D>(&transcript)
 }
 
 /// The client randomness and the request DER, held between the request and
@@ -289,11 +289,9 @@ where
 		let artifact = *epoch_receipt;
 
 		let receipt = artifact.receipt()?;
-		let receipt_der = receipt.to_der()?;
 		let server_role = ReceiptRole::Server;
 		let server_signer = artifact.signer_for_role(server_role)?.ok_or(HandshakeError::ReceiptMissing)?;
-		verify_receipt_signer::<P::Digest, P::Signature, _>(
-			&receipt_der,
+		receipt.verify_signer::<P::Digest, P::Signature, _>(
 			server_signer,
 			server_role,
 			&self.materials.peer_sid,
@@ -302,17 +300,11 @@ where
 
 		let chain_hash = &self.materials.epoch.transcript_hash;
 		let challenge_hash = exchange_challenge_hash::<P::Digest>(chain_hash, &pending.request_der, &server_random)?;
-		let expected_pin = transcript_digest_info::<P::Digest>(challenge_hash)?;
-		let pin_algorithm_matches = receipt.transcript_hash.algorithm == expected_pin.algorithm;
+		let reference_budgets = self.materials.reference.budgets;
+		let reference_unit = self.materials.reference.credit_unit;
+		receipt.verify_terms::<P::Digest>(&challenge_hash, reference_budgets, reference_unit)?;
 
-		let pin_matches = pin_algorithm_matches && receipt.transcript_hash.digest_matches(&expected_pin);
-		let budgets_match = receipt.budgets == self.materials.reference.budgets;
-		let unit_matches = receipt.credit_unit == self.materials.reference.credit_unit;
-		if !pin_matches || !budgets_match || !unit_matches {
-			return Err(HandshakeError::ReceiptMismatch);
-		}
-
-		let answer = approve_or_fail_closed(self.approver.as_deref(), &receipt).await?;
+		let answer = receipt.approve(self.approver.as_deref()).await?;
 		let answer_bytes = answer.as_ref().map(OctetString::as_bytes);
 		let provider = self.materials.signing_provider.as_ref();
 		let countersignature = receipt.countersign::<P::Digest>(answer_bytes, provider).await?;
@@ -424,7 +416,7 @@ where
 			None => None,
 		};
 
-		let (receipt, artifact) = sign_receipt::<P::Digest>(
+		let (receipt, artifact) = SessionReceipt::issue::<P::Digest>(
 			challenge_hash,
 			self.materials.reference.budgets,
 			self.materials.reference.credit_unit,
@@ -507,7 +499,8 @@ where
 			client_certificate,
 			verdict,
 		};
-		let recorded = record_receipt_outcome(self.observer.as_deref(), outcome).await;
+
+		let recorded = outcome.record(self.observer.as_deref()).await;
 		let (stored, rejection) = match (recorded, refused_artifact) {
 			(Ok(stored), _) => (stored, None),
 			(Err(HandshakeError::SettlementRejected { code }), Some(refused)) => {
@@ -522,9 +515,11 @@ where
 			&pending.response_der,
 			&ack_der,
 		)?;
+
 		let (send_cipher, recv_cipher) =
 			self.materials
 				.rotate(MuxRole::Server, &pending.client_random, &pending.server_random, next_hash)?;
+
 		let install = EpochInstall { send_cipher, recv_cipher, receipt: stored, epoch: self.materials.epoch() };
 		Ok(ServerAckOutcome { install, rejection })
 	}
@@ -660,12 +655,14 @@ impl RekeyDriver {
 #[cfg(all(test, feature = "secp256k1", feature = "aes-gcm"))]
 pub(crate) mod tests {
 	use super::*;
+	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
 	use crate::crypto::aead::DecryptContent;
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::crypto::x509::utils::compute_signer_identifier;
+	use crate::oids::HASH_SHA3_256;
 	use crate::random::OsRng;
 	use crate::transport::handshake::negotiation::MuxBudgets;
 	use crate::zeroize::Zeroizing;
@@ -698,9 +695,16 @@ pub(crate) mod tests {
 		}
 	}
 
+	/// The SHA3-256 `DigestInfo` a receipt carries for `hash`.
+	fn sha3_digest_info(hash: [u8; 32]) -> Result<DigestInfo, HandshakeError> {
+		let algorithm = AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None };
+		let digest = OctetString::new(hash)?;
+		Ok(DigestInfo { algorithm, digest })
+	}
+
 	fn sample_reference(credit_unit: u32) -> Result<SessionReceipt, HandshakeError> {
 		Ok(SessionReceipt {
-			transcript_hash: transcript_digest_info::<Sha3_256>(SAMPLE_CHAIN_ROOT)?,
+			transcript_hash: sha3_digest_info(SAMPLE_CHAIN_ROOT)?,
 			budgets: SAMPLE_BUDGETS,
 			credit_unit,
 			ancillary: None,
@@ -796,7 +800,7 @@ pub(crate) mod tests {
 		assert_eq!(receipt.budgets, SAMPLE_BUDGETS);
 		assert_eq!(receipt.credit_unit, SAMPLE_CREDIT_UNIT);
 
-		let chain_root = transcript_digest_info::<Sha3_256>(SAMPLE_CHAIN_ROOT)?;
+		let chain_root = sha3_digest_info(SAMPLE_CHAIN_ROOT)?;
 		assert_ne!(receipt.transcript_hash, chain_root);
 		Ok(())
 	}

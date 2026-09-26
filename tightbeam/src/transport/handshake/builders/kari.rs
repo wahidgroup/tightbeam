@@ -9,7 +9,7 @@ use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 use crate::der::asn1::BitString;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
-use crate::transport::handshake::kari::kari_wrap;
+use crate::transport::handshake::kari::{HandshakeAgreement, HandshakeKek, Kek};
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 
 #[cfg(all(feature = "builder", feature = "aead"))]
@@ -219,18 +219,15 @@ where
 		// 0. Validate required fields
 		self.validate()?;
 
-		// 1-3. Perform ECDH, HKDF and AES Key Wrap through `kari_wrap`
+		// 1-3. Perform ECDH, HKDF and AES Key Wrap
 		let sender_priv = self.sender_priv.as_ref().ok_or(KariBuilderError::MissingSenderPrivateKey)?;
 		let recipient_pub = self.recipient_pub.as_ref().ok_or(KariBuilderError::MissingRecipientPublicKey)?;
 		let ukm = self.ukm.as_ref().ok_or(KariBuilderError::MissingUkm)?;
-		let encrypted_key_bytes = kari_wrap(
-			&self.provider,
-			sender_priv,
-			recipient_pub,
-			KdfSalt::new(ukm.as_bytes()),
-			KdfInfo::new(self.kdf_info),
-			content_encryption_key,
-		)?;
+		let shared_secret = sender_priv.shared_secret(recipient_pub)?;
+		let ukm_salt = KdfSalt::new(ukm.as_bytes());
+		let kari_label = KdfInfo::new(self.kdf_info);
+		let kek = shared_secret.derive_kek::<P>(ukm_salt, kari_label)?;
+		let encrypted_key_bytes = Kek::new(kek.as_slice()).wrap(&self.provider, content_encryption_key)?;
 
 		// 4. Build encrypted key OctetString
 		let encrypted_key = EncryptedKey::new(encrypted_key_bytes)?;

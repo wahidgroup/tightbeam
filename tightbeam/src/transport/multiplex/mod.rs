@@ -109,14 +109,28 @@ impl IntoMuxOffer for Option<&Arc<TransportOffer>> {
 	}
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::aead::KeyInit;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::profiles::CryptoProvider;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 #[cfg(feature = "transport-policy")]
 use crate::policy::GatePolicy;
 #[cfg(feature = "transport-policy")]
 use crate::policy::SessionContext;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::receipt::StoredReceipt;
+use crate::transport::handshake::receipt::{ReceiptSigner, StoredReceipt};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::rekey::RekeyDriver;
+use crate::transport::handshake::HandshakeVerifyingKey;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
+#[cfg(pooled_mux)]
+use crate::transport::serve::{GatedService, MuxService};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::state::EncryptedProtocolState;
 
 #[cfg(all(feature = "x509", feature = "tokio"))]
 pub use router::SpawnedMux;
@@ -342,6 +356,91 @@ pub struct MuxRekeyContext {
 	pub(crate) receipt: StoredReceipt,
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl MuxRekeyContext {
+	/// Harvest the in-band rekey context from a completed receipt-bearing
+	/// handshake.
+	///
+	/// [`MuxTransport::with_rekey`] consumes the result. The constructor is
+	/// crate-internal, so the transport's [`MuxConnector::take_rekey`] or
+	/// [`MuxAcceptor::take_rekey`] always fixes the endpoint role.
+	///
+	/// # Returns
+	///
+	/// - `Ok(Some(..))` at most once per handshake, because the call detaches the
+	///   retained epoch materials.
+	/// - `Ok(None)` when the session carries no dual-signed receipt, no retained
+	///   peer identity, or no epoch materials.
+	///
+	/// # Errors
+	///
+	/// - `EncryptorUnavailable` when no handshake completed.
+	/// - An extraction error when the peer key or the signer identifier fails to extract.
+	///
+	/// [`MuxTransport::with_rekey`]: crate::transport::multiplex::MuxTransport::with_rekey
+	/// [`MuxConnector::take_rekey`]: crate::transport::multiplex::MuxConnector::take_rekey
+	/// [`MuxAcceptor::take_rekey`]: crate::transport::multiplex::MuxAcceptor::take_rekey
+	#[cfg(feature = "x509")]
+	pub(crate) fn detach<T, P>(state: &mut T, role: MuxRole) -> TransportResult<Option<Self>>
+	where
+		T: EncryptedProtocolState<CryptoProvider = P>,
+		P: CryptoProvider + Send + Sync + 'static,
+		P::Curve: Curve + CurveArithmetic,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		P::VerifyingKey: From<PublicKey<P::Curve>>,
+		for<'a> P::Signature: TryFrom<&'a [u8]>,
+		P::AeadCipher: KeyInit + 'static,
+	{
+		let Some(stored) = state.session_state().receipt().cloned() else {
+			return Ok(None);
+		};
+		let Some(provider) = state
+			.encryption()
+			.key_manager
+			.as_ref()
+			.map(|manager| manager.signing_provider())
+		else {
+			return Ok(None);
+		};
+
+		let Some(peer_certificate) = state.session_state().peer_certificate_arc() else {
+			return Ok(None);
+		};
+
+		let public_key = peer_certificate.verifying_key::<P::Curve>()?;
+		let peer_verifying_key = P::VerifyingKey::from(public_key);
+		let peer_sid = peer_certificate.signer_identifier::<P::Digest>()?;
+
+		// Detached last so a session refused above keeps its materials
+		let Some(epoch) = state.session_state_mut().take_epoch_materials() else {
+			return Ok(None);
+		};
+
+		let reference_receipt = stored.receipt().clone();
+		let materials = RekeyMaterials::<P>::new(epoch, reference_receipt, provider, peer_verifying_key, peer_sid);
+
+		let driver = match role {
+			MuxRole::Client => {
+				let approver = state.encryption().receipt_approver.as_ref().map(Arc::clone);
+				let exchange = ClientRekey::new(materials, approver);
+				RekeyDriver::client(exchange)
+			}
+			MuxRole::Server => {
+				let exchange = ServerRekey::new(
+					materials,
+					state.encryption().transport_authorizer.as_ref().map(Arc::clone),
+					state.encryption().session_observer.as_ref().map(Arc::clone),
+					Some(peer_certificate),
+				);
+				RekeyDriver::server(exchange)
+			}
+		};
+
+		Ok(Some(Self { driver, receipt: stored }))
+	}
+}
+
 /// Client-side mux connection setup.
 ///
 /// Abstracts the concrete transport so the connection pool stays generic
@@ -421,6 +520,43 @@ pub trait MuxAcceptor: MuxCapable {
 	/// Consume the transport into raw envelope halves for the mux
 	/// drivers, without the policy plane.
 	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)>;
+
+	/// Serve a mux-negotiated connection until it ends.
+	///
+	/// Consumes the transport into gated halves, spawns both drivers, and runs
+	/// the responder with `service` routed by each stream's kind:
+	///
+	/// - Unary frames pass the transport's collector gate before reaching [`MuxService::unary`].
+	/// - Streaming and duplex streams evaluate the same gate with no request frame (`None`) first.
+	/// - Service failures close their stream with the failure's mapped status.
+	///
+	/// # Arguments
+	///
+	/// - `cancel_budget` overrides CVE-2023-44487 cancel-abuse default when set.
+	///
+	/// # Errors
+	/// - `InvalidState` / `OperationFailed(EncryptorUnavailable)`: no handshake
+	/// - Terminal responder failures (see [`MuxResponder::serve_with`])
+	#[cfg(pooled_mux)]
+	fn serve<S: MuxService>(
+		mut self,
+		settings: MuxSettings,
+		service: S,
+		cancel_budget: Option<u32>,
+	) -> impl Future<Output = TransportResult<()>> + MaybeSend
+	where
+		Self: MaybeSend,
+	{
+		async move {
+			let rekey = self.take_rekey()?;
+			let snapshot = self.session_context();
+			let (gate, (reader, writer)) = self.into_gated_halves()?;
+			let mux = MuxTransport::new(reader, writer, MuxRole::Server, settings);
+			let SpawnedMux { handle, responder, reader_task: _reader_task } = mux.spawn_with(cancel_budget, rekey);
+
+			responder.serve_with(GatedService::new(service, gate, snapshot, handle)).await
+		}
+	}
 }
 
 /// Streaming extension of [`MultiplexedProtocol`]: chunked request

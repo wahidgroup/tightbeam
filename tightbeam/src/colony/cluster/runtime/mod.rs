@@ -48,7 +48,7 @@ use crate::transport::accept::AcceptPlane;
 use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::multiplex::{MuxCapable, ReplySink, StreamBody};
 use crate::transport::policy::PolicyConfig;
-use crate::transport::serve::{unimplemented_error, CallContext, MuxService};
+use crate::transport::serve::{CallContext, MuxService};
 use crate::transport::{AsyncListenerTrait, Protocol, TransportEncryptionConfig, TransportError};
 use crate::utils::time::Clock;
 use crate::utils::urn::Urn;
@@ -571,7 +571,7 @@ impl<P: Protocol> GatewayRuntimeCtx<P> {
 		}
 
 		let Some(target) = cx.target().cloned() else {
-			return Err(unimplemented_error());
+			return Err(TightBeamError::unimplemented());
 		};
 
 		let budget = HopBudget::from_wire(WireHopBudget::new(cx.hops_remaining()), self.config.peer.max_hops);

@@ -28,20 +28,17 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::CertificateExt;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
-use crate::transport::handshake::common::derive_epoch_materials;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityOffer, StrengthFloor, TransportOffer,
 };
+use crate::transport::handshake::primitives::transcript::Transcript;
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
-use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, match_receipt_to_accept, verify_receipt_signer, ReceiptApprover, ReceiptRole, StoredReceipt,
-};
+use crate::transport::handshake::receipt::{ReceiptApprover, ReceiptRole, SessionReceipt, StoredReceipt};
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Ecies};
-use crate::transport::handshake::utils::HandshakeOctets;
-use crate::transport::handshake::utils::{compute_client_auth_digest, compute_ecies_transcript_hash, validate_state};
+use crate::transport::handshake::wire::HandshakeOctets;
 use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake,
 };
@@ -223,7 +220,7 @@ where
 
 	/// Validate that the current state matches the expected state.
 	fn validate_expected_state(&self, expected: ClientHandshakeState) -> Result<(), HandshakeError> {
-		validate_state(self.state.state(), expected)
+		self.state.expect_state(expected)
 	}
 
 	/// Decode and validate the server handshake.
@@ -270,14 +267,10 @@ where
 		// verification.
 		let accept_der = server_handshake.security_accept.as_ref().map(WireDer::der).unwrap_or_default();
 		let transport_accept_der = server_handshake.transport_accept.as_ref().map(WireDer::der).unwrap_or_default();
+		let mut transcript =
+			Transcript::ecies_handshake(client_hello, &server_random, spki_bytes, accept_der, transport_accept_der);
 
-		let transcript_digest = compute_ecies_transcript_hash::<P::Digest>(
-			client_hello,
-			&server_random,
-			spki_bytes,
-			accept_der,
-			transport_accept_der,
-		)?;
+		let transcript_digest = transcript.seal::<P::Digest>()?;
 		self.transcript_hash = Some(transcript_digest);
 
 		// Invariant: the transcript is immutable once its hash is computed.
@@ -478,7 +471,7 @@ where
 		let artifact = server_handshake.session_receipt.take();
 		let parsed_receipt = artifact.as_ref().map(ReceiptArtifact::receipt).transpose()?;
 		let Some(receipt) =
-			match_receipt_to_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
+			SessionReceipt::match_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
 		else {
 			return Ok(None);
 		};
@@ -490,11 +483,9 @@ where
 			.signer_for_role(ReceiptRole::Server)?
 			.ok_or(HandshakeError::ReceiptMissing)?;
 
-		let receipt_der = receipt.to_der()?;
 		let expected_sid = server_handshake.certificate.signer_identifier::<P::Digest>()?;
 		let verifying_key = self.extract_verifying_key(&server_handshake.certificate)?;
-		verify_receipt_signer::<P::Digest, P::Signature, _>(
-			&receipt_der,
+		receipt.verify_signer::<P::Digest, P::Signature, _>(
 			server_signer,
 			ReceiptRole::Server,
 			&expected_sid,
@@ -509,7 +500,7 @@ where
 		let key_provider = identity.signing_provider();
 
 		// With no approver, approval fails closed.
-		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), &receipt).await?;
+		let response = receipt.approve(self.receipt_approver.as_deref()).await?;
 		let answer = response.as_ref().map(OctetString::as_bytes);
 		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider).await?;
 
@@ -537,7 +528,8 @@ where
 
 		let cert = identity.certificate();
 		let cert_der = cert.to_der()?;
-		let auth_digest = compute_client_auth_digest::<P::Digest>(&transcript_digest, encrypted_data, &cert_der)?;
+		let mut auth_transcript = Transcript::ecies_client_auth(&transcript_digest, encrypted_data, &cert_der);
+		let auth_digest = auth_transcript.seal::<P::Digest>()?;
 		let signature_bytes = identity.signing_provider().sign_prehash(&auth_digest).await?;
 
 		let cert = Certificate::clone(cert);
@@ -569,7 +561,7 @@ where
 		// 3. Seed the epoch materials for post-handshake renewal.
 		if let Some(transcript_hash) = self.transcript_hash {
 			let epoch_salt = KdfSalt::new(salt_bytes);
-			let materials = derive_epoch_materials::<P>(base_key.as_slice(), epoch_salt, transcript_hash)?;
+			let materials = EpochMaterials::derive::<P>(base_key.as_slice(), epoch_salt, transcript_hash)?;
 			self.epoch_materials = Some(materials);
 		}
 

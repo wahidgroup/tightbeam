@@ -16,9 +16,9 @@ use crate::crypto::aead::{DirectionalCiphers, KeyInit};
 use crate::crypto::common::KeySizeUser;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
-use crate::crypto::x509::attr::{Attribute, Attributes};
+use crate::crypto::x509::attr::Attributes;
 use crate::oids::HANDSHAKE_ABORT_ALERT;
-use crate::transport::handshake::attributes::find_x509;
+use crate::transport::handshake::attributes::HandshakeAttributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	DefaultStrengthFloor, NegotiationError, ProfileStrengthPolicy, RunnableProfile, SecurityOffer,
@@ -28,7 +28,15 @@ use crate::ZeroizingBytes;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::TIGHTBEAM_EPOCH_KDF_INFO;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::x509::utils::CertificateExt;
 use crate::transport::handshake::attributes::HandshakeAlertAttribute;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::x509::Certificate;
 
 /// Provides profile negotiation logic for server-side handshake orchestrators.
 ///
@@ -71,7 +79,7 @@ where
 	/// # Errors
 	///
 	/// - `NoSupportedProfiles` -- the server has no configured profile.
-	/// - `NegotiationError(UnrunnableProfile)` -- no configured profile names the algorithms of `P`.
+	/// - `NegotiationError(UnrunnableProfile)` -- no configured profile runs on `P`.
 	/// - `NegotiationError(BelowStrengthFloor)` -- no runnable profile meets the policy.
 	/// - `NegotiationError` -- no mutually supported profile exists.
 	fn negotiate_profile(&self, offer: Option<&SecurityOffer>) -> Result<RunnableProfile<P>, HandshakeError> {
@@ -144,26 +152,29 @@ impl fmt::Debug for EpochMaterials {
 	}
 }
 
-/// Derive the epoch-0 secret from handshake key material under the
-/// dedicated epoch info label.
-///
-/// The derivation uses the same `input_key` and `salt` pair as the
-/// directional traffic keys. The distinct label yields an independent secret
-/// (RFC 5869 domain separation), so retaining it never weakens the traffic
-/// keys.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) fn derive_epoch_materials<P>(
-	input_key: &[u8],
-	salt: KdfSalt<'_>,
-	transcript_hash: [u8; 32],
-) -> Result<EpochMaterials, HandshakeError>
-where
-	P: CryptoProvider,
-{
-	let salt_bytes = salt.as_bytes();
-	let secret = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_EPOCH_KDF_INFO, Some(salt_bytes), EPOCH_SECRET_SIZE)?;
-	let materials = EpochMaterials { secret, epoch: 0, transcript_hash };
-	Ok(materials)
+impl EpochMaterials {
+	/// Derive the epoch-0 secret from handshake key material under the
+	/// dedicated epoch info label.
+	///
+	/// The derivation uses the same `input_key` and `salt` pair as the
+	/// directional traffic keys. The distinct label yields an independent
+	/// secret (RFC 5869 domain separation), so retaining it never weakens the
+	/// traffic keys.
+	pub(crate) fn derive<P>(
+		input_key: impl AsRef<[u8]>,
+		salt: KdfSalt<'_>,
+		transcript_hash: [u8; 32],
+	) -> Result<Self, HandshakeError>
+	where
+		P: CryptoProvider,
+	{
+		let input_key = input_key.as_ref();
+		let kdf_salt = Some(salt.as_bytes());
+		let secret = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_EPOCH_KDF_INFO, kdf_salt, EPOCH_SECRET_SIZE)?;
+		let materials = Self { secret, epoch: 0, transcript_hash };
+		Ok(materials)
+	}
 }
 
 /// Epoch secret length in bytes: one 256-bit KDF chain link.
@@ -242,6 +253,7 @@ where
 
 		let c2s_label = KdfInfo::new(TIGHTBEAM_C2S_KDF_INFO);
 		let s2c_label = KdfInfo::new(TIGHTBEAM_S2C_KDF_INFO);
+
 		let client_to_server = derive_labeled_cipher::<P>(input_key, salt, c2s_label, key_size)?;
 		let server_to_client = derive_labeled_cipher::<P>(input_key, salt, s2c_label, key_size)?;
 		Ok(Self { client_to_server, server_to_client })
@@ -290,8 +302,7 @@ pub trait HandshakeAlertHandler {
 	/// - `InvalidIntegerEncoding` -- the alert code is not a valid INTEGER.
 	fn check_for_alert(&self, attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		if let Some(attrs) = attrs {
-			let attr_refs: Vec<&Attribute> = attrs.iter().collect();
-			if let Ok(alert_attr) = find_x509(&attr_refs, &HANDSHAKE_ABORT_ALERT) {
+			if let Ok(Some(alert_attr)) = attrs.find_unsigned_attr(HANDSHAKE_ABORT_ALERT) {
 				let alert = alert_attr.handshake_alert()?;
 				return Err(HandshakeError::AbortReceived(alert));
 			}
@@ -300,12 +311,43 @@ pub trait HandshakeAlertHandler {
 	}
 }
 
+/// Public-key extraction from a certificate.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub trait HandshakeVerifyingKey {
+	/// Public key parsed from this certificate's SPKI, on curve `C`.
+	///
+	/// # Errors
+	///
+	/// - SEC1 decode failures over the certificate's key bytes
+	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
+	where
+		C: Curve + CurveArithmetic,
+		<C as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>;
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl HandshakeVerifyingKey for Certificate {
+	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
+	where
+		C: Curve + CurveArithmetic,
+		<C as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	{
+		let pubkey_bytes = self.verifying_key_bytes();
+		Ok(PublicKey::<C>::from_sec1_bytes(pubkey_bytes)?)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
+	use crate::crypto::x509::attr::Attribute;
+	use crate::der::asn1::{Any, SetOfVec};
 	use crate::oids::AES_128_GCM;
 	use crate::transport::handshake::negotiation::{NegotiationError, ProfileStrength};
+	use crate::transport::handshake::HandshakeAlert;
 	use std::error::Error;
 
 	/// A policy that refuses every profile.
@@ -420,7 +462,6 @@ mod tests {
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
-
 		let result = derive_directional(&client, &input_key, &salt);
 		assert!(result.is_ok());
 	}
@@ -442,7 +483,6 @@ mod tests {
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
-
 		let ciphers = derive_directional(&client, &input_key, &salt)?;
 
 		// Same nonce and plaintext under both directions must produce
@@ -460,7 +500,6 @@ mod tests {
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
-
 		let first = derive_directional(&client, &input_key, &salt)?;
 		let second = derive_directional(&client, &input_key, &salt)?;
 
@@ -479,7 +518,6 @@ mod tests {
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 8]; // Only 8 bytes
-
 		let result = derive_directional(&client, &input_key, &salt);
 		assert!(matches!(
 			result,
@@ -493,7 +531,6 @@ mod tests {
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
-
 		let result = derive_directional(&client, &input_key, &salt);
 		assert!(matches!(result, Err(HandshakeError::InvalidState)));
 	}
@@ -504,7 +541,7 @@ mod tests {
 		let salt = [0x99u8; 32];
 		let transcript = [0x07u8; 32];
 
-		let materials = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
+		let materials = EpochMaterials::derive::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
 		assert_eq!(materials.epoch(), 0);
 		assert_eq!(materials.transcript_hash(), transcript);
 		assert_eq!(materials.secret.len(), EPOCH_SECRET_SIZE);
@@ -518,8 +555,8 @@ mod tests {
 		let salt = [0x99u8; 32];
 		let transcript = [0x07u8; 32];
 
-		let first = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
-		let second = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
+		let first = EpochMaterials::derive::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
+		let second = EpochMaterials::derive::<DefaultCryptoProvider>(&input_key, KdfSalt::new(&salt), transcript)?;
 		assert_eq!(first.secret, second.secret);
 
 		Ok(())
@@ -535,12 +572,29 @@ mod tests {
 
 		let shared_salt = KdfSalt::new(&salt);
 		let changed_salt = KdfSalt::new(&other_salt);
-		let base = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, shared_salt, transcript)?;
-		let keyed = derive_epoch_materials::<DefaultCryptoProvider>(&other_key, shared_salt, transcript)?;
-		let salted = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, changed_salt, transcript)?;
+		let base = EpochMaterials::derive::<DefaultCryptoProvider>(&input_key, shared_salt, transcript)?;
+		let keyed = EpochMaterials::derive::<DefaultCryptoProvider>(&other_key, shared_salt, transcript)?;
+		let salted = EpochMaterials::derive::<DefaultCryptoProvider>(&input_key, changed_salt, transcript)?;
 		assert_ne!(base.secret, keyed.secret);
 		assert_ne!(base.secret, salted.secret);
 
+		Ok(())
+	}
+
+	/// An orchestrator stand-in that keeps the provided alert check.
+	struct AlertProbe;
+
+	impl HandshakeAlertHandler for AlertProbe {}
+
+	#[test]
+	fn an_abort_alert_attribute_aborts_the_handshake() -> Result<(), Box<dyn Error>> {
+		let code = Any::encode_from(&3u8)?;
+		let alert = Attribute { oid: HANDSHAKE_ABORT_ALERT, values: SetOfVec::try_from(vec![code])? };
+		let attrs = Attributes::try_from(vec![alert])?;
+
+		let checked = AlertProbe.check_for_alert(Some(&attrs));
+		let expected = HandshakeAlert::AlgorithmMismatch;
+		assert!(matches!(checked, Err(HandshakeError::AbortReceived(alert)) if alert == expected));
 		Ok(())
 	}
 }
