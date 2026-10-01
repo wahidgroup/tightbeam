@@ -6,7 +6,7 @@ on:
       - "releases/v*"
       - "releases/derive/v*"
 
-# Read-only by default. Each job widens only what it needs.
+# The workflow default is read-only, and each job widens only what it needs.
 permissions:
   contents: read
 
@@ -16,7 +16,7 @@ env:
 
 jobs:
   # Everything that compiles, installs, or runs project code lives here, where
-  # no registry credential can be minted. A build script or proc macro that
+  # no registry credential can be created. A build script or proc macro that
   # runs in this job has no OIDC endpoint to reach.
   verify:
     name: Verify
@@ -27,7 +27,7 @@ jobs:
       title: ${{ steps.version.outputs.title }}
       derive: ${{ steps.version.outputs.derive }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -69,7 +69,7 @@ jobs:
           echo "title=${CRATE} v${VERSION}" >> "$GITHUB_OUTPUT"
 
       # One flag selects the crate for both registry checks, so a derive-only
-      # tag is never graded against tightbeam-rs.
+      # tag is graded against tightbeam-derive alone.
       - name: Refuse yanked versions
         run: make check-yanked derive=${{ steps.version.outputs.derive }}
 
@@ -85,7 +85,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -127,7 +127,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: target/package/*.crate
 

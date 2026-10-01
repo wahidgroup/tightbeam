@@ -139,11 +139,17 @@ fn remaining_handshake_deadline<T: EncryptedProtocolState + MessageIO>(state: &T
 
 /// Receive side of a split envelope link.
 ///
-/// Decouples the [`MuxTransport`](crate::transport::multiplex::MuxTransport)
-/// router from the link's protection policy: an encrypting implementation
-/// decrypts and enforces AEAD sequencing, a cleartext one enforces neither.
+/// The trait decouples the
+/// [`MuxTransport`](crate::transport::multiplex::MuxTransport) router from the
+/// link's protection policy. An encrypting implementation decrypts and
+/// enforces AEAD sequencing, while a cleartext one enforces neither.
 pub trait EnvelopeSource: MaybeSend {
 	/// Read the next envelope from the link.
+	///
+	/// # Errors
+	///
+	/// The link's read failure, such as a closed connection, a decode failure,
+	/// or a decrypt failure on an encrypting link.
 	fn read_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend;
 
 	/// The number of envelopes still readable before the link demands a
@@ -161,6 +167,10 @@ pub trait EnvelopeSource: MaybeSend {
 	///
 	/// A link without keys never rekeys, so the default fails closed and an
 	/// epoch install never lands silently on an unprotected link.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- the default, on a link without keys.
 	///
 	/// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 	#[cfg(feature = "aead")]
@@ -181,6 +191,11 @@ pub trait EnvelopeSource: MaybeSend {
 /// Send-direction counterpart of [`EnvelopeSource`].
 pub trait EnvelopeSink: MaybeSend {
 	/// Write `envelope` to the link.
+	///
+	/// # Errors
+	///
+	/// The link's write failure, such as a closed connection, an encode
+	/// failure, or an encrypt failure on an encrypting link.
 	fn write_envelope(&mut self, envelope: TransportEnvelope) -> impl Future<Output = TransportResult<()>> + MaybeSend;
 
 	/// The number of envelopes still writable before the link demands a
@@ -194,6 +209,10 @@ pub trait EnvelopeSink: MaybeSend {
 	///
 	/// A link without keys never rekeys, so the default fails closed and an
 	/// epoch install never lands silently on an unprotected link.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- the default, on a link without keys.
 	///
 	/// [rfc9846-4.7.3]: https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3
 	#[cfg(feature = "aead")]
@@ -219,17 +238,34 @@ pub trait MessageIO {
 	fn clock(&self) -> &dyn Clock;
 
 	/// Read raw DER-encoded envelope bytes from the transport.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::ConnectionClosed`] -- the peer closed the stream.
+	/// - The transport's own read failure.
 	fn read_envelope_bytes(&mut self) -> impl Future<Output = TransportResult<Vec<u8>>> + MaybeSend;
 
 	/// Write raw DER-encoded envelope bytes to the transport.
+	///
+	/// # Errors
+	///
+	/// The transport's own write failure.
 	fn write_envelope_bytes(&mut self, buffer: &[u8]) -> impl Future<Output = TransportResult<()>> + MaybeSend;
 
 	/// Decode an envelope from DER bytes.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::DerError`] -- `buffer` is not a valid envelope.
 	fn decode_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
 		Ok(TransportEnvelope::from_der(buffer)?)
 	}
 
 	/// Encode an envelope as DER bytes.
+	///
+	/// # Errors
+	///
+	/// The encode failure of an envelope that does not serialize.
 	fn encode_envelope(envelope: &TransportEnvelope) -> TransportResult<Vec<u8>> {
 		Ok(encode(envelope)?)
 	}
@@ -238,6 +274,11 @@ pub trait MessageIO {
 	///
 	/// An encrypted transport may override this method to parse a
 	/// [`WireEnvelope`].
+	///
+	/// # Errors
+	///
+	/// The [`read_envelope_bytes`](Self::read_envelope_bytes) and
+	/// [`decode_envelope`](Self::decode_envelope) sets.
 	fn read_decoded_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend
 	where
 		Self: MaybeSend,
@@ -263,6 +304,11 @@ pub trait MessageIO {
 	/// protocol-specific implementation detects its own EOF conditions, such as
 	/// `UnexpectedEof` for TCP, and should override this method to map them to
 	/// `Ok(None)`.
+	///
+	/// # Errors
+	///
+	/// The [`read_decoded_envelope`](Self::read_decoded_envelope) set, apart
+	/// from the close that maps to `Ok(None)`.
 	fn try_read_decoded_envelope(
 		&mut self,
 	) -> impl Future<Output = TransportResult<Option<TransportEnvelope>>> + MaybeSend
@@ -295,35 +341,22 @@ pub enum CollectStep {
 /// Message I/O with session encryption and the handshake drivers.
 #[cfg(feature = "x509")]
 pub trait EncryptedMessageIO: MessageIO {
-	/// Read one envelope in cleartext or in encrypted form.
-	#[allow(async_fn_in_trait)]
-	async fn relay_message(&mut self) -> TransportResult<TransportEnvelope>
-	where
-		Self: EncryptedProtocolState,
-	{
-		let wire_bytes = self.read_envelope_bytes().await?;
-		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-		match wire_envelope {
-			WireEnvelope::Cleartext(transport_envelope) => {
-				// A server with a decryptor configured refuses cleartext.
-				if self.session_state().decryptor().is_ok() {
-					return Err(TransportError::MissingEncryption);
-				}
-
-				Ok(transport_envelope)
-			}
-			WireEnvelope::Encrypted(encrypted_info) => {
-				let decrypted_bytes = self.session_state().decryptor()?.decrypt_content(&encrypted_info)?;
-				decrypted_bytes.with(|bytes| Self::decode_envelope(bytes))
-			}
-		}
-	}
-
 	/// Read one wire envelope, enforce size ceilings, and classify it.
 	///
 	/// The step is protocol-agnostic. It surfaces a handshake container as a
 	/// decoded message for the caller's dispatcher, and it decrypts and returns
 	/// everything else.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with [`TransportFailure::SizeExceeded`] -- the
+	///   wire envelope passes the ceiling of its kind.
+	/// - [`TransportError::MissingEncryption`] -- cleartext traffic arrived where encryption
+	///   is required, and the session was reset.
+	/// - [`TransportError::OperationFailed`] with [`TransportFailure::EncryptionFailed`] -- an
+	///   encrypted envelope arrived before encryption or did not decrypt, and the session was
+	///   reset.
+	/// - The read, decode, and handshake-container conversion failures.
 	#[cfg(all(
 		feature = "transport-policy",
 		any(feature = "transport-cms", feature = "transport-ecies")
@@ -344,10 +377,9 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 		}
 
-		// An established session reads and writes encrypted, so nothing
-		// cleartext is admitted on it. Before that, a provisioned endpoint
-		// admits only the handshake containers, and an unprovisioned one
-		// admits traffic.
+		// An established session admits only encrypted traffic. Before that, a
+		// provisioned endpoint admits only the handshake containers, and an
+		// unprovisioned one admits traffic.
 		let established = self.session_state().phase().requires_encryption();
 		let expects_encryption = self.session_state().phase().is_handshake_pending();
 		match wire_envelope {
@@ -433,6 +465,12 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// size the envelope, so an oversized request fails locally with a typed
 	/// `SizeExceeded` that returns the frame, before a peer connection reset.
 	///
+	/// # Errors
+	///
+	/// - [`TransportError::MessageNotSent`] -- the envelope did not encode, encrypt, or fit its
+	///   ceiling, and the frame travels with the error.
+	/// - The [`EncryptedProtocolState::apply_wire_mode`] set, while the handshake has not yet installed keys.
+	///
 	/// [`TransportLimits`]: crate::transport::TransportLimits
 	#[allow(async_fn_in_trait)]
 	async fn wrap_and_encrypt_message(&mut self, message: Frame) -> TransportResult<WireEnvelope>
@@ -447,6 +485,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Decrypt a response from its encoded bytes.
 	///
 	/// The default is protocol-agnostic.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- a cleartext answer arrived on an established
+	///   session, and the session was reset.
+	/// - [`TransportError::DerError`] -- the bytes are not a wire envelope.
+	/// - The decrypt failure of an encrypted answer.
 	#[allow(async_fn_in_trait)]
 	async fn decrypt_response(&mut self, wire_bytes: impl Into<Vec<u8>>) -> TransportResult<TransportEnvelope>
 	where
@@ -513,6 +558,10 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 
 	/// Run the client handshake when the session is still provisioned.
+	///
+	/// # Errors
+	///
+	/// The [`perform_client_handshake`](Self::perform_client_handshake) set.
 	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn ensure_handshake_complete<P>(&mut self) -> TransportResult<()>
@@ -546,6 +595,10 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// Trait where-clauses do not elaborate to callers, so each feature
 	/// combination declares the dispatcher with that build's predicate set.
+	///
+	/// # Errors
+	///
+	/// The [`perform_client_handshake`](Self::perform_client_handshake) set.
 	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
 	#[allow(async_fn_in_trait)]
 	async fn ensure_handshake_complete<P>(&mut self) -> TransportResult<()>
@@ -619,6 +672,14 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// CMS encrypts the session key to the server's public key up front, so
 	/// the server identity comes from the provisioned chain. A missing trust
 	/// store or chain fails closed.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
+	/// - [`TransportError::HandshakeError`] with [`HandshakeError::MissingTrustStore`] -- no
+	///   trust store is configured.
+	/// - [`TransportError::MissingServerCertificateChain`] -- no server chain is provisioned.
+	/// - The build failure of the CMS client.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
 	where
@@ -673,6 +734,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// Handshake messages cross this interface as containers, so the driver
 	/// moves one with no per-protocol knowledge.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- a handshake message passes the wire ceiling, or
+	///   the server response arrived encrypted.
+	/// - [`TransportError::InvalidState`] -- the session refused the move to the handshaking phase.
+	/// - The orchestrator, read, write, and install failures.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn drive_client_handshake(&mut self, mut orchestrator: BoxedClientHandshake) -> TransportResult<()>
@@ -730,14 +798,18 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Step 5: Complete the handshake, which hands over everything it
 		// agreed.
 		let session = orchestrator.complete().await?;
-		if !self.session_state_mut().install_session(session) {
-			return Err(TransportError::InvalidState);
-		}
+		self.install_established(session)?;
 
 		Ok(())
 	}
 
 	/// Perform the client-side handshake with the configured protocol.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
+	/// - The orchestrator build failure, and the
+	///   [`drive_client_handshake`](Self::drive_client_handshake) set.
 	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_client_handshake<P>(&mut self) -> TransportResult<()>
@@ -785,6 +857,12 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// Trait where-clauses do not elaborate to callers, so each feature
 	/// combination declares the dispatcher with that build's predicate set.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- the configured protocol is ECIES.
+	/// - The orchestrator build failure, and the
+	///   [`drive_client_handshake`](Self::drive_client_handshake) set.
 	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
 	#[allow(async_fn_in_trait)]
 	async fn perform_client_handshake<P>(&mut self) -> TransportResult<()>
@@ -817,6 +895,11 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 
 	/// Build the ECIES server orchestrator from transport state.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- no server certificate or key manager is configured.
+	/// - The build failure of the ECIES server.
 	#[cfg(feature = "transport-ecies")]
 	fn build_ecies_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
@@ -857,6 +940,11 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 
 	/// Build the CMS server orchestrator from transport state.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
+	/// - The build failure of the CMS server.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
@@ -891,6 +979,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Drive the protocol-agnostic server handshake state machine.
 	///
 	/// The persisted orchestrator must already exist.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`] -- no orchestrator is persisted, or the session
+	///   refused the move to the handshaking phase.
+	/// - [`TransportError::InvalidMessage`] -- the response passes the wire ceiling.
+	/// - The orchestrator, write, and install failures.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(async_fn_in_trait)]
 	async fn drive_server_handshake(&mut self, request: HandshakeMessage) -> TransportResult<()>
@@ -921,15 +1016,29 @@ pub trait EncryptedMessageIO: MessageIO {
 			// No response means the handshake is complete.
 			let orchestrator = self.server_handshake_mut().take().ok_or(TransportError::InvalidState)?;
 			let session = orchestrator.complete().await?;
-			if !self.session_state_mut().install_session(session) {
-				return Err(TransportError::InvalidState);
-			}
+			self.install_established(session)?;
 		}
 
 		Ok(())
 	}
 
 	/// Perform the server-side handshake with the configured protocol.
+	///
+	/// # Deadline
+	///
+	/// The tokio runtime supplies the timer. The handshake deadline bounds all
+	/// processing on the unauthenticated path, including the authorizer and
+	/// observer hooks, as well as the reads. A non-tokio runtime has no
+	/// portable timer here and relies on the embedding application.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the request passes the wire ceiling.
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
+	/// - [`TransportError::OperationFailed`] with [`TransportFailure::DeadlineExceeded`] -- the
+	///   handshake deadline elapsed.
+	/// - The orchestrator build failure, and the
+	///   [`drive_server_handshake`](Self::drive_server_handshake) set.
 	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_server_handshake<P>(&mut self, request: HandshakeMessage) -> TransportResult<()>
@@ -969,10 +1078,6 @@ pub trait EncryptedMessageIO: MessageIO {
 			*self.server_handshake_mut() = Some(orchestrator);
 		}
 
-		// The tokio runtime supplies the timer. The handshake deadline bounds
-		// all processing on the unauthenticated path, including the authorizer
-		// and observer hooks, as well as the reads. A non-tokio runtime has no
-		// portable timer here and relies on the embedding application.
 		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
 		let outcome = {
 			let remaining = remaining_handshake_deadline(self);
@@ -996,6 +1101,22 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// Trait where-clauses do not elaborate to callers, so each feature
 	/// combination declares the dispatcher with that build's predicate set.
+	///
+	/// # Deadline
+	///
+	/// The tokio runtime supplies the timer. The handshake deadline bounds all
+	/// processing on the unauthenticated path, including the authorizer and
+	/// observer hooks, as well as the reads. A non-tokio runtime has no
+	/// portable timer here and relies on the embedding application.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the request passes the wire ceiling.
+	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- the configured protocol is ECIES.
+	/// - [`TransportError::OperationFailed`] with [`TransportFailure::DeadlineExceeded`] -- the
+	///   handshake deadline elapsed.
+	/// - The orchestrator build failure, and the
+	///   [`drive_server_handshake`](Self::drive_server_handshake) set.
 	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
 	#[allow(async_fn_in_trait)]
 	async fn perform_server_handshake<P>(&mut self, request: HandshakeMessage) -> TransportResult<()>
@@ -1028,10 +1149,6 @@ pub trait EncryptedMessageIO: MessageIO {
 			*self.server_handshake_mut() = Some(orchestrator);
 		}
 
-		// The tokio runtime supplies the timer. The handshake deadline bounds
-		// all processing on the unauthenticated path, including the authorizer
-		// and observer hooks, as well as the reads. A non-tokio runtime has no
-		// portable timer here and relies on the embedding application.
 		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
 		let outcome = {
 			let remaining = remaining_handshake_deadline(self);
@@ -1056,6 +1173,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// It returns `(status, response, original_message)`. The original message
 	/// is `Some` when `status` is not `Ok` and the request went out in
 	/// cleartext, so the caller can evaluate a retry.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the reply is not a response envelope.
+	/// - The [`wrap_and_encrypt_message`](Self::wrap_and_encrypt_message),
+	///   [`read_session_bytes`](Self::read_session_bytes), and
+	///   [`decrypt_response`](Self::decrypt_response) sets.
 	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_emit_cycle(
@@ -1239,10 +1363,9 @@ mod tests {
 		SessionPhase::Handshaking { initiated_at: ManualClock::default().monotonic() }
 	}
 
-	// An end of stream reads differently either side of a handshake, and the
-	// session phase is what separates the two. A session that already agreed
-	// its terms reports an ordinary close, so a pool evicts the connection
-	// rather than recording a handshake failure.
+	// The session phase decides how an end of stream reads. A session that
+	// agreed its terms reports an ordinary close, so a pool evicts the
+	// connection instead of recording a handshake failure.
 	#[cfg(feature = "aead")]
 	crate::tb_cases! {
 		fn a_close_is_named_by_the_phase_it_interrupts((phase, expected): (SessionPhase, TransportError))

@@ -1,11 +1,13 @@
 //! The TightBeam frame and its metadata.
 //!
-//! [`Frame`] and [`Metadata`] keep their fields private to this module.
-//! A frame enters through [`FrameBuilder`](crate::builder::frame::FrameBuilder)
-//! or through the DER decoder, and both run the §5.6 version check. Every
-//! in-place change runs through a method defined in this module or its
-//! children, so no code outside them can give a frame a field its
-//! version forbids.
+//! [`Frame`] and [`Metadata`] keep their fields private to this module, so a
+//! frame carries only the fields its version allows:
+//!
+//! - A frame enters through [`FrameBuilder`](crate::builder::frame::FrameBuilder)
+//!   or through the DER decoder, and both run the §5.6 version check.
+//! - Every in-place change runs through a method defined in this module or its children.
+
+use core::fmt;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -35,7 +37,7 @@ mod signature;
 #[cfg(feature = "digest")]
 pub(crate) use scaffold::FrameIntegrityScaffold;
 
-/// Metadata structure for message handling.
+/// The per-message metadata that a [`Frame`] carries beside its body.
 ///
 /// The frame version determines which fields are present.
 ///
@@ -122,8 +124,8 @@ impl Metadata {
 
 	/// The Message Integrity (MI) commitment over the message body (V1+).
 	///
-	/// This digest is not Frame Integrity. It covers the message, and it still
-	/// verifies after a decryption in place.
+	/// Unlike Frame Integrity ([`Frame::integrity`]), this digest covers the
+	/// message, and it still verifies after a decryption in place.
 	pub fn integrity(&self) -> Option<&DigestInfo> {
 		self.integrity.as_ref()
 	}
@@ -181,8 +183,7 @@ impl TryFrom<MetadataBuilder> for Metadata {
 	///
 	/// # Errors
 	///
-	/// - [`MetadataError::MissingId`] or [`MetadataError::MissingOrder`] when a required field is
-	///   unset.
+	/// - [`MetadataError::MissingId`] or [`MetadataError::MissingOrder`] when a required field is unset.
 	/// - [`MetadataError::UnsupportedField`] when a set field is gated above the builder's version.
 	fn try_from(builder: MetadataBuilder) -> Result<Self, Self::Error> {
 		let MetadataBuilder {
@@ -236,7 +237,7 @@ impl TryFrom<MetadataBuilder> for Metadata {
 ///     nonrepudiation [1] SignerInfo OPTIONAL
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Frame {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
@@ -257,16 +258,41 @@ wire_sequence!(Frame {
 	nonrepudiation: ctx(TagNumber::N1),
 } where Frame::refuse_forbidden);
 
+/// The frame's identity for error strings and logs: its version and its
+/// message id as hex bytes.
+///
+/// The body is application plaintext, so `Display` prints the identity and
+/// `Debug` prints the body as its byte length. An error that carries a frame
+/// reaches a consumer log without the payload either way (CWE-532).
+impl fmt::Display for Frame {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "frame {:?} id {:02x?}", self.version, self.metadata.id)
+	}
+}
+
+/// Every field of the frame, with the message as its byte length.
+impl fmt::Debug for Frame {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Frame")
+			.field("version", &self.version)
+			.field("metadata", &self.metadata)
+			.field("message_len", &self.message.len())
+			.field("integrity", &self.integrity)
+			.field("nonrepudiation", &self.nonrepudiation)
+			.finish()
+	}
+}
+
 /// The transform a frame body still needs before a decode.
 ///
-/// Read through [`Frame::body_transform`]. Each caller maps this to its
-/// own policy: the router refuses, a servlet applies the transform.
+/// Callers read it through [`Frame::body_transform`], and each maps it to its
+/// own policy: the router refuses, and a servlet applies the transform.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BodyTransform {
-	/// Encrypted. Decrypting also inflates a body that was compressed
-	/// before encryption.
+	/// The body is encrypted. Decrypting also inflates a body that was
+	/// compressed before encryption.
 	Decrypt,
-	/// Compressed only.
+	/// The body is compressed and in cleartext.
 	Inflate,
 }
 
@@ -293,7 +319,7 @@ impl Frame {
 	/// A V0 hop-local frame that carries already-encoded bytes.
 	///
 	/// A V0 frame with no optional field is valid under every §5.6 rule, so
-	/// this constructor cannot fail.
+	/// this constructor is infallible.
 	#[cfg(feature = "colony")]
 	pub(crate) fn v0(id: impl AsRef<[u8]>, message: impl Into<Vec<u8>>) -> Self {
 		let mut metadata = Metadata::empty();
@@ -361,8 +387,8 @@ impl Frame {
 	///
 	/// Per-signer budgets, replay slots, refusal journals, and gossip
 	/// attribution all key on the signer, so they key on these bytes and
-	/// agree on what one signer is. [`None`] where the frame carries no
-	/// signature or the identifier does not encode.
+	/// agree on what one signer is. It returns [`None`] when the frame carries
+	/// no signature or the identifier fails to encode.
 	#[must_use]
 	pub fn signer_id(&self) -> Option<Vec<u8>> {
 		let signer_info = self.nonrepudiation.as_ref()?;

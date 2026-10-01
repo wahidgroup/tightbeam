@@ -1,7 +1,7 @@
 //! ECIES-based client handshake orchestrator.
 //!
-//! This module implements the client side of the TightBeam ECIES handshake
-//! protocol.
+//! [`EciesHandshakeClient`] runs the client side of the TightBeam ECIES
+//! handshake protocol.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -88,6 +88,10 @@ where
 /// Extraction of a verifying key from a certificate.
 pub trait ExtractVerifyingKey: Sized {
 	/// Extract the verifying key from `cert`.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key is not a valid curve point.
 	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError>;
 }
 
@@ -108,7 +112,7 @@ where
 {
 	/// Create an ECIES handshake client.
 	///
-	/// `aad_domain_tag` defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`.
+	/// `aad_domain_tag` defaults to [`TIGHTBEAM_AAD_DOMAIN_TAG`].
 	pub fn new(aad_domain_tag: Option<&'static [u8]>) -> Self {
 		Self {
 			state: ClientStateMachine::<Ecies>::default(),
@@ -188,10 +192,13 @@ where
 
 	/// Override the minimum-strength policy applied to the server's selection.
 	///
-	/// The default is `DefaultStrengthFloor`, which requires a 256-bit AEAD key
-	/// and a digest of 256 bits or more. The client applies it with or without
-	/// an offer. Pass `NoStrengthFloor` only where weaker profiles must remain
-	/// acceptable.
+	/// The default is [`DefaultStrengthFloor`], which requires a 256-bit AEAD
+	/// key and a digest of 256 bits or more. The client applies it with or
+	/// without an offer. Pass [`NoStrengthFloor`] only where weaker profiles
+	/// must remain acceptable.
+	///
+	/// [`DefaultStrengthFloor`]: crate::transport::handshake::negotiation::DefaultStrengthFloor
+	/// [`NoStrengthFloor`]: crate::transport::handshake::negotiation::NoStrengthFloor
 	#[must_use]
 	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
 		self.strength_floor = StrengthFloor::with_policy(policy);
@@ -287,6 +294,12 @@ where
 	}
 
 	/// Build the ClientHello message.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the client is past `Init`.
+	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
+	/// - [`HandshakeError::DerError`] -- the ClientHello fails to encode.
 	pub fn build_client_hello(&mut self) -> Result<ClientHello, HandshakeError> {
 		// 1. Validate the state.
 		self.validate_expected_state(ClientHandshakeState::Init)?;
@@ -314,6 +327,19 @@ where
 
 	/// Process the ServerHandshake message and build the ClientKeyExchange to
 	/// send next.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- no ClientHello was sent, or the server sent no security accept.
+	/// - [`HandshakeError::MissingTrustStore`] -- no certificate validator is set.
+	/// - [`HandshakeError::CertificateValidationError`] -- the server certificate fails validation.
+	/// - [`HandshakeError::InvalidProfileSelection`] -- the server selected a profile outside the offer.
+	/// - [`HandshakeError::NegotiationError`] -- the selected profile is below
+	///   the strength floor or unrunnable, or the transport accept is invalid.
+	/// - [`HandshakeError::SignatureError`] -- the server signature fails to verify.
+	/// - [`HandshakeError::ReceiptMissing`] -- a budget-bearing accept has no signed receipt.
+	/// - [`HandshakeError::MutualAuthRequired`] -- the server or a receipt
+	///   requires a client identity, and none is set.
 	pub async fn process_server_handshake(
 		&mut self,
 		server_handshake_der: impl AsRef<[u8]>,
@@ -349,10 +375,9 @@ where
 		//    out of the decoded message, because the stored receipt owns it.
 		let pending_receipt = self.process_session_receipt(&mut server_handshake).await?;
 
-		// 9. Generate and encrypt the session key. The countersignature, with
-		//    the settlement answer bound inside it, folds into the ECIES
-		//    payload, which keeps it confidential. After encoding it moves into
-		//    the completed stored artifact with zero copies.
+		// 9. Generate and encrypt the session key. The ECIES payload carries
+		//    the countersignature and its settlement answer, which keeps both
+		//    confidential.
 		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake, pending_receipt)?;
 
 		// 10. Handle mutual authentication. The signature commits to `encrypted_bytes`.
@@ -425,12 +450,14 @@ where
 			None => (None, None),
 		};
 
+		let client_certificate = self.identity.as_ref().map(ClientIdentity::certificate);
+		let aad = ClientKeyExchange::client_bound_aad(self.aad_domain_tag, client_certificate)?;
 		let (encrypted_bytes, receipt_ack) = self.perform_ecies_encryption(
 			base_key,
 			&client_random,
 			receipt_ack,
 			&server_handshake.certificate,
-			Some(self.aad_domain_tag),
+			Some(aad.as_slice()),
 		)?;
 
 		if let Some(artifact) = artifact {
@@ -451,6 +478,13 @@ where
 	/// - The approver, or the fail-closed default, answers the settlement challenge.
 	/// - The client `SignerInfo` binds the receipt body plus the answer under
 	///   the client identity (non-repudiation).
+	///
+	/// # Fail closed
+	///
+	/// A countersignature needs a client identity, so a budget-bearing session
+	/// without mutual authentication fails with
+	/// [`HandshakeError::MutualAuthRequired`]. That check runs before
+	/// approval, because approval can spend an irreversible settlement answer.
 	///
 	/// # Completion
 	///
@@ -492,10 +526,6 @@ where
 			&verifying_key,
 		)?;
 
-		// Countersigning demands a client identity, so a budget-bearing
-		// session without mutual authentication fails closed. The check runs
-		// before approval, because approving can spend an irreversible
-		// settlement answer, so every local precondition must already hold.
 		let identity = self.identity.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 		let key_provider = identity.signing_provider();
 
@@ -536,9 +566,10 @@ where
 		let signature = OctetString::new(signature_bytes)?;
 		Ok((Some(cert), Some(signature)))
 	}
+
 	/// Complete the handshake and derive the provider's client-to-server and
 	/// server-to-client AEAD ciphers.
-	pub fn complete(&mut self) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError> {
+	fn complete(&mut self) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError> {
 		// 1. Validate the state.
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 

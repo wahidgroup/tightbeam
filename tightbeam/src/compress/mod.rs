@@ -1,3 +1,9 @@
+//! Frame body compression.
+//!
+//! - [`Compressor`] compresses a message body and describes the result as CMS [`CompressedData`].
+//! - [`Inflator`] reverses a compressor and returns the original body.
+//! - [`ZstdCompression`] implements both with zstd and bounds the output of decompression (CWE-409).
+
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
@@ -22,9 +28,39 @@ const ZSTD_LEVEL: i32 = 3;
 #[cfg(feature = "zstd")]
 const RESERVE_HINT: usize = 64 * 1024;
 
-/// Trait for compressing data
+/// The smallest window log zstd accepts, `ZSTD_WINDOWLOG_ABSOLUTEMIN` in
+/// `zstd.h`.
+///
+/// `zstd-safe` exports the window bounds only under its `experimental`
+/// feature, so this module names them.
+#[cfg(feature = "zstd")]
+const ZSTD_WINDOW_LOG_MIN: u32 = 10;
+
+/// The largest window log zstd accepts on a 32-bit target,
+/// `ZSTD_WINDOWLOG_MAX_32` in `zstd.h`.
+#[cfg(all(feature = "zstd", target_pointer_width = "32"))]
+const ZSTD_WINDOW_LOG_MAX: u32 = 30;
+
+/// The largest window log zstd accepts on a 64-bit target,
+/// `ZSTD_WINDOWLOG_MAX_64` in `zstd.h`.
+#[cfg(all(feature = "zstd", not(target_pointer_width = "32")))]
+const ZSTD_WINDOW_LOG_MAX: u32 = 31;
+
+/// Compresses a frame body into bytes and the CMS [`CompressedData`] that
+/// describes them.
+///
+/// [`Inflator`] is the reverse direction.
 pub trait Compressor {
-	/// Compress data and return the compressed bytes along with compression metadata
+	/// Compresses `data` and returns the compressed bytes with their
+	/// [`CompressedData`] metadata.
+	///
+	/// `content_info` names the encapsulated content. When it is `None`, the
+	/// implementation picks its own default, which is [`COMPRESSION_CONTENT`]
+	/// for [`ZstdCompression`].
+	///
+	/// # Errors
+	///
+	/// - [`CompressionError`] when the backend fails to compress `data`.
 	fn compress(
 		&self,
 		data: &[u8],
@@ -32,14 +68,20 @@ pub trait Compressor {
 	) -> CompressionResult<(Vec<u8>, CompressedData)>;
 }
 
-/// zstd-backed compressor; requires `std` I/O, hence lives behind `zstd`.
-///
-/// Decompression is bounded: output larger than `max_output` bytes is
-/// rejected with [`CompressionError::OutputLimitExceeded`] instead of
-/// inflating a wire-supplied bomb into memory (CWE-409).
+/// zstd-backed compressor. It requires `std` I/O, so it lives behind the
+/// `zstd` feature.
 ///
 /// The default ceiling is [`DEFAULT_MAX_DECOMPRESSED_LEN`].
 /// Raise or lower it with [`with_max_output`](Self::with_max_output).
+///
+/// # Decompression bounds
+///
+/// - Output larger than `max_output` bytes is rejected with
+///   [`CompressionError::OutputLimitExceeded`] instead of inflating a
+///   peer-supplied bomb into memory (CWE-409).
+/// - The window a frame header declares is bounded by the same ceiling,
+///   rounded up to a power of two, so a short header cannot make the decoder
+///   reserve more memory than the output may fill (CWE-770).
 #[cfg(feature = "zstd")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ZstdCompression {
@@ -55,10 +97,20 @@ impl Default for ZstdCompression {
 
 #[cfg(feature = "zstd")]
 impl ZstdCompression {
-	/// Create a compressor whose decompression output is capped at
-	/// `max_output` bytes
+	/// Creates a compressor whose decompression output is capped at
+	/// `max_output` bytes.
 	pub const fn with_max_output(max_output: usize) -> Self {
 		Self { max_output }
+	}
+
+	/// The largest window log a frame may declare, the smallest power of two
+	/// at or above `max_output` within the range zstd accepts.
+	///
+	/// libzstd sizes its stream buffers from the declared window before it
+	/// produces any output, and admits up to 128 MiB by default.
+	fn window_log_max(&self) -> u32 {
+		let ceil_log2 = usize::BITS - self.max_output.saturating_sub(1).leading_zeros();
+		ceil_log2.clamp(ZSTD_WINDOW_LOG_MIN, ZSTD_WINDOW_LOG_MAX)
 	}
 }
 
@@ -85,6 +137,9 @@ impl Compressor for ZstdCompression {
 impl Inflator for ZstdCompression {
 	fn decompress(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
 		let mut ctx = zstd_safe::DCtx::create();
+		let window_log_max = zstd_safe::DParameter::WindowLogMax(self.window_log_max());
+		ctx.set_parameter(window_log_max).map_err(CompressionError::ZSTD)?;
+
 		let mut input = zstd_safe::InBuffer { src: data, pos: 0 };
 
 		// One octet past the cap distinguishes an over-limit stream from one
@@ -155,6 +210,7 @@ impl From<ZstdCompression> for AlgorithmIdentifierOwned {
 mod tests {
 	use super::*;
 	use crate::error::Result;
+	use crate::tb_cases;
 
 	fn compress_zeros(len: usize) -> Result<Vec<u8>> {
 		let data = vec![0u8; len];
@@ -219,6 +275,53 @@ mod tests {
 		));
 
 		Ok(())
+	}
+
+	/// A frame whose header declares a window of `2^window_log` octets and
+	/// whose one RLE block emits a single octet.
+	///
+	/// The protocol's compressor sizes the window to the content, so a
+	/// window past the payload reaches the decoder only from a hostile peer.
+	fn frame_declaring_window(window_log: u8) -> Vec<u8> {
+		// The window descriptor holds the window log less 10 in its top five
+		// bits (RFC 8878, section 3.1.1.1.2).
+		let window_descriptor = (window_log - 10) << 3;
+		vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, window_descriptor, 0x0b, 0x00, 0x00, 0x41]
+	}
+
+	// A frame may declare a window up to the output ceiling rounded up to a
+	// power of two, which a cap between two powers exercises.
+	tb_cases! {
+		fn a_window_within_the_rounded_output_ceiling_decodes((max_output, window_log): (usize, u8)) -> Result<()> {
+			let frame = frame_declaring_window(window_log);
+			let out = ZstdCompression::with_max_output(max_output).decompress(&frame)?;
+			assert_eq!(out, vec![0x41]);
+
+			Ok(())
+		}
+		cases {
+			at_a_power_of_two_ceiling => (65536, 16),
+			below_the_next_power_of_two => (49152, 16),
+			below_the_smallest_window => (512, 10),
+			at_an_unbounded_ceiling => (usize::MAX, 16),
+		}
+	}
+
+	// A wider window is refused before the decoder reserves memory for it.
+	tb_cases! {
+		fn a_window_past_the_rounded_output_ceiling_is_refused((max_output, window_log): (usize, u8)) {
+			let frame = frame_declaring_window(window_log);
+			let result = ZstdCompression::with_max_output(max_output).decompress(&frame);
+			assert!(matches!(
+				result,
+				Err(crate::TightBeamError::CompressionError(CompressionError::ZSTD(_)))
+			));
+		}
+		cases {
+			past_a_power_of_two_ceiling => (65536, 17),
+			past_the_next_power_of_two => (49152, 17),
+			past_the_default_ceiling => (DEFAULT_MAX_DECOMPRESSED_LEN, 27),
+		}
 	}
 
 	#[test]

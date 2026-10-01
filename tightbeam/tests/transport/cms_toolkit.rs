@@ -188,7 +188,7 @@ tb_scenario! {
 			let plaintext = b"cms toolkit sealed payload";
 			let envelope = TightBeamEnvelopedDataBuilder::with_defaults(kari)
 				.with_unprotected_attr(attr)
-				.build(plaintext, None, None)?;
+				.build(plaintext, None)?;
 
 			trace.event(ENVELOPE_SEALED)?;
 

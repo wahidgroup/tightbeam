@@ -1,3 +1,8 @@
+//! Transport error types and their conversions.
+//!
+//! [`TransportError`] is the error every transport operation returns.
+//! [`TransportFailure`] names why an operation failed, and its peer-refusal
+//! variants map to and from the wire [`TransitStatus`].
 use crate::asn1::Frame;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::error::TightBeamError;
@@ -15,128 +20,175 @@ use crate::Errorizable;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 
+/// Result type of transport operations.
 pub type Result<T> = core::result::Result<T, TransportError>;
 
-/// Reasons why a message failed to be sent before network I/O
+/// Reason an operation failed, either locally or as a peer refusal.
+///
+/// Each peer-refusal variant maps one to one onto a non-Ok [`TransitStatus`],
+/// and the local-only variants carry no wire status.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TransportFailure {
-	/// DER encoding failed
+	/// DER encoding failed.
 	EncodingFailed,
-	/// AEAD encryption failed
+	/// AEAD encryption failed, or an encrypted envelope did not decrypt.
 	EncryptionFailed,
-	/// Message size exceeds configured limits
+	/// The message size exceeds the configured limits.
 	SizeExceeded,
-	/// Encryptor not available
+	/// No encryptor is available.
 	EncryptorUnavailable,
-	/// Random nonce generation failed
+	/// Random nonce generation failed.
 	NonceGenerationFailed,
-	/// AEAD record limit reached: send cipher halted or peer overran the
-	/// volume bound. Reestablish the session to rekey
+	/// The AEAD record limit was reached, because the send cipher halted or
+	/// the peer overran the volume bound. Reestablish the session to rekey.
 	RekeyRequired,
-	/// Inbound AEAD sequence violation: replay, reorder, or deletion of an
-	/// envelope on the connection (CWE-345)
+	/// An inbound AEAD sequence violation, which is a replay, reorder, or
+	/// deletion of an envelope on the connection (CWE-345).
 	TamperDetected,
-	/// Local stream cap exhausted on a multiplexed connection: every
-	/// concurrent stream slot is in flight. Retry after a response frees
-	/// a slot, or open another connection
+	/// The local stream cap is exhausted on a multiplexed connection, because
+	/// every concurrent stream slot is in flight. Retry after a response frees
+	/// a slot, or open another connection.
 	StreamsExhausted,
-	/// Outbound session budget exhausted on a multiplexed connection:
-	/// the epoch's remaining spendable credits cannot cover the frame.
+	/// The outbound session budget is exhausted on a multiplexed connection,
+	/// because the epoch's remaining spendable credits cannot cover the frame.
 	BudgetExhausted,
-	/// Gate policy rejected (general)
+	/// A gate policy rejected the operation, as a general refusal.
 	PolicyRejection,
-	/// Peer refusal: the caller cancelled the operation
+	/// The peer refused the call because the caller cancelled the operation.
 	Cancelled,
-	/// Peer refusal: unclassified server failure
+	/// The peer refused the call with an unclassified server failure.
 	Unknown,
-	/// Peer refusal: the request is malformed regardless of system state
+	/// The peer refused the call because the request is malformed regardless
+	/// of system state.
 	InvalidArgument,
-	/// Peer refusal: the peer gave up waiting
+	/// The peer refused the call because it gave up waiting. A local deadline
+	/// that elapses also reports this variant.
 	DeadlineExceeded,
-	/// Peer refusal: the requested entity does not exist
+	/// The peer refused the call because the requested entity does not exist.
 	NotFound,
-	/// Peer refusal: the entity already exists
+	/// The peer refused the call because the entity already exists.
 	AlreadyExists,
-	/// Peer refusal: the caller is identified but refused authorization
+	/// The peer refused the call because the caller is identified but was
+	/// refused authorization.
 	PermissionDenied,
-	/// Peer refusal: capacity exhausted, retry with backoff may succeed
+	/// The peer refused the call because its capacity is exhausted. A retry
+	/// with backoff may succeed.
 	ResourceExhausted,
-	/// Peer refusal: system state must change before a retry can succeed
+	/// The peer refused the call because system state must change before a
+	/// retry can succeed.
 	FailedPrecondition,
-	/// Peer refusal: concurrency conflict, retry at a higher level
+	/// The peer refused the call on a concurrency conflict. Retry at a higher
+	/// level.
 	Aborted,
-	/// Peer refusal: the operation ran past a valid range
+	/// The peer refused the call because the operation ran past a valid range.
 	OutOfRange,
-	/// Peer refusal: no handler answers the requested operation
+	/// The peer refused the call because no handler answers the requested
+	/// operation.
 	Unimplemented,
-	/// Peer refusal: the peer broke an internal invariant
+	/// The peer refused the call because it broke an internal invariant.
 	Internal,
-	/// Peer refusal: transient unavailability such as a draining peer
+	/// The peer refused the call on a transient unavailability, such as a
+	/// draining peer.
 	Unavailable,
-	/// Peer refusal: unrecoverable data loss or corruption
+	/// The peer refused the call on unrecoverable data loss or corruption.
 	DataLoss,
-	/// Peer refusal: the caller lacks valid authentication credentials
+	/// The peer refused the call because the caller lacks valid
+	/// authentication credentials.
 	Unauthenticated,
 }
 
-/// Transport error types
+/// Error returned by every transport operation.
 #[derive(Debug, Errorizable)]
 #[non_exhaustive]
 pub enum TransportError {
+	/// The connection closed gracefully.
 	#[error("Connection closed gracefully")]
 	ConnectionClosed,
+	/// The peer closed the connection before the handshake completed.
 	#[error("Peer closed the connection before the handshake completed")]
 	PeerClosedBeforeHandshake,
+	/// The connection failed.
 	#[error("Connection failed")]
 	ConnectionFailed,
+	/// A send failed. A [`TransportFailure::NonceGenerationFailed`] without a
+	/// frame converts to this variant.
 	#[error("Send failed")]
 	SendFailed,
+	/// The operation requires encryption, and none was provided.
 	#[error("Encryption required but not provided")]
 	MissingEncryption,
+	/// This transport does not support the configured handshake protocol.
 	#[error("Handshake protocol not supported by this transport: {0:?}")]
 	UnsupportedHandshakeProtocol(HandshakeProtocolKind),
+	/// The operation requires a server certificate chain, and none is
+	/// provisioned.
 	#[error("Server certificate chain required but not provisioned")]
 	MissingServerCertificateChain,
+	/// The client has no trust store. Install one, or call `allow_cleartext`
+	/// to choose cleartext.
 	#[error("Client has no trust store: install one or call allow_cleartext to choose cleartext")]
 	PeerAuthenticationUnconfigured,
+	/// A message broke the protocol or failed to decode, such as a mux
+	/// protocol violation or an oversized handshake message.
 	#[error("Invalid message")]
 	InvalidMessage,
+	/// A reply was invalid. A [`TransportFailure::PolicyRejection`] without a
+	/// frame converts to this variant.
 	#[error("Invalid reply")]
 	InvalidReply,
+	/// No request frame is present to send or retry.
 	#[error("Missing request")]
 	MissingRequest,
+	/// The retry loop ran out of attempts.
 	#[error("Max retries exceeded")]
 	MaxRetriesExceeded,
+	/// The configured address is invalid.
 	#[error("Invalid address")]
 	InvalidAddress,
+	/// The operation does not fit the current state of the transport or its
+	/// session.
 	#[error("Invalid state")]
 	InvalidState,
+	/// The connection is draining after a GoAway and admits no new streams.
 	#[cfg(feature = "transport-multiplex")]
 	#[error("Connection draining after GoAway. No new streams")]
 	Draining,
+	/// A certificate failed validation.
 	#[cfg(feature = "x509")]
 	#[error("Invalid certificate: {0}")]
 	#[from]
 	InvalidCertificate(CertificateValidationError),
-	#[error("Message not sent: {1:?} - {0:?}")]
+	/// The message was not sent, and the frame travels with the error so a
+	/// restart policy can retry it.
+	///
+	/// The display names only the failure and the frame's identity, through
+	/// the frame's own `Display`, because the body is application plaintext
+	/// and an error string reaches logs (CWE-532).
+	#[error("Message not sent: {1:?} for {0}")]
 	MessageNotSent(Box<Frame>, TransportFailure),
+	/// An operation failed for the carried [`TransportFailure`] reason.
 	#[error("Operation failed: {0:?}")]
 	OperationFailed(TransportFailure),
+	/// The handshake failed.
 	#[cfg(feature = "x509")]
 	#[error("Handshake error: {0}")]
 	#[from]
 	HandshakeError(HandshakeError),
+	/// DER encoding or decoding failed.
 	#[error("DER error: {0}")]
 	#[from]
 	DerError(der::Error),
+	/// An I/O operation on the underlying stream failed.
 	#[cfg(feature = "std")]
 	#[error("I/O error: {0}")]
 	#[from]
 	IoError(IoError),
 }
 
-/// Narrows [`TightBeamError`] into [`TransportError`];
-/// variants without a transport counterpart collapse to [`TransportError::InvalidMessage`].
+/// Narrow a [`TightBeamError`] into a [`TransportError`].
+///
+/// A variant without a transport counterpart collapses to
+/// [`TransportError::InvalidMessage`].
 impl From<TightBeamError> for TransportError {
 	fn from(err: TightBeamError) -> Self {
 		use crate::error::TightBeamError;
@@ -154,8 +206,8 @@ impl From<TightBeamError> for TransportError {
 			// indistinguishable from tampering. Surface them as such.
 			#[cfg(feature = "aead")]
 			TightBeamError::NonceReplayed(_) => TransportError::OperationFailed(TransportFailure::TamperDetected),
-			// Receive side hits this only when the peer overran the per-key
-			// volume bound. Session unusable either way.
+			// The receive side hits this only when the peer overran the
+			// per-key volume bound. The session is unusable either way.
 			#[cfg(feature = "aead")]
 			TightBeamError::RekeyRequired => TransportError::OperationFailed(TransportFailure::RekeyRequired),
 			_ => TransportError::InvalidMessage,
@@ -168,7 +220,7 @@ impl TryFrom<TransitStatus> for TransportFailure {
 
 	fn try_from(status: TransitStatus) -> core::result::Result<Self, Self::Error> {
 		let failure = match status {
-			// A success status is not convertible to a failure
+			// A success status is not convertible to a failure.
 			TransitStatus::Ok => return Err(TransportError::InvalidMessage),
 			TransitStatus::Cancelled => TransportFailure::Cancelled,
 			TransitStatus::Unknown => TransportFailure::Unknown,
@@ -222,7 +274,7 @@ impl TryFrom<TransportFailure> for TransitStatus {
 			TransportFailure::Unavailable => TransitStatus::Unavailable,
 			TransportFailure::DataLoss => TransitStatus::DataLoss,
 			TransportFailure::Unauthenticated => TransitStatus::Unauthenticated,
-			// Local-only failures carry no wire status
+			// Local-only failures carry no wire status.
 			local => return Err(TransportError::OperationFailed(local)),
 		};
 
@@ -240,7 +292,7 @@ crate::impl_from!(
 		der_err else der::Error::from(der::ErrorKind::Failed)
 );
 
-// Wrap AddrParseError in IoError
+/// Report an unparsable address as an `InvalidInput` I/O error.
 #[cfg(all(feature = "std", feature = "tcp"))]
 impl From<AddrParseError> for TransportError {
 	fn from(err: AddrParseError) -> Self {
@@ -254,7 +306,7 @@ mod tokio_rt {
 	pub use tokio::time::error::Elapsed;
 }
 
-// Wrap JoinError in IoError
+/// Report a failed task join as an I/O error.
 #[cfg(feature = "tokio")]
 impl From<tokio_rt::JoinError> for TransportError {
 	fn from(err: tokio_rt::JoinError) -> Self {
@@ -262,7 +314,7 @@ impl From<tokio_rt::JoinError> for TransportError {
 	}
 }
 
-// Convert timeout errors
+/// Report an elapsed timeout as [`TransportFailure::DeadlineExceeded`].
 #[cfg(feature = "tokio")]
 impl From<tokio_rt::Elapsed> for TransportError {
 	fn from(_: tokio_rt::Elapsed) -> Self {
@@ -270,7 +322,7 @@ impl From<tokio_rt::Elapsed> for TransportError {
 	}
 }
 
-// Convert ecdsa::Error through HandshakeError
+/// Report an ECDSA failure as a handshake error.
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
 impl From<k256::ecdsa::Error> for TransportError {
 	fn from(err: k256::ecdsa::Error) -> Self {
@@ -279,11 +331,13 @@ impl From<k256::ecdsa::Error> for TransportError {
 }
 
 impl TransportError {
+	/// Wrap `frame` with the `failure` that kept it from sending.
 	pub fn from_failure(frame: Frame, failure: TransportFailure) -> Self {
 		TransportError::MessageNotSent(Box::new(frame), failure)
 	}
 
-	/// Extract Frame from error if present, otherwise returns None
+	/// Take the unsent frame out of a [`TransportError::MessageNotSent`], or
+	/// return `None` for any other variant.
 	pub fn take_frame(self) -> Option<Frame> {
 		match self {
 			TransportError::MessageNotSent(frame, _) => Some(*frame),
@@ -291,7 +345,8 @@ impl TransportError {
 		}
 	}
 
-	/// Extract Frame from error if present without consuming the error
+	/// Borrow the unsent frame of a [`TransportError::MessageNotSent`] without
+	/// consuming the error.
 	pub fn frame(&self) -> Option<&Frame> {
 		match self {
 			TransportError::MessageNotSent(frame, _) => Some(frame),
@@ -299,7 +354,8 @@ impl TransportError {
 		}
 	}
 
-	/// Extract TransportFailure from error if present, otherwise returns None
+	/// The failure that kept a [`TransportError::MessageNotSent`] frame from
+	/// sending, or `None` for any other variant.
 	pub fn failure_reason(&self) -> Option<&TransportFailure> {
 		match self {
 			TransportError::MessageNotSent(_, reason) => Some(reason),
@@ -307,10 +363,11 @@ impl TransportError {
 		}
 	}
 
-	/// Check if error indicates connection is dead (for auto-reconnect)
+	/// Whether the error means the connection is dead, which drives
+	/// auto-reconnect.
 	///
-	/// Returns true for errors that suggest the underlying connection
-	/// should be discarded and a new connection established.
+	/// Returns `true` for errors that suggest the underlying connection should
+	/// be discarded and a new connection established.
 	pub fn is_connection_error(&self) -> bool {
 		matches!(
 			self,
@@ -330,6 +387,10 @@ impl TransportError {
 	}
 }
 
+/// Lift a failure that carries no frame into its error.
+///
+/// Encoding, size, policy, and nonce failures map to dedicated variants, and
+/// every other failure maps to [`TransportError::OperationFailed`].
 impl From<TransportFailure> for TransportError {
 	fn from(failure: TransportFailure) -> Self {
 		match failure {
@@ -337,17 +398,20 @@ impl From<TransportFailure> for TransportError {
 			TransportFailure::SizeExceeded => TransportError::InvalidMessage,
 			TransportFailure::PolicyRejection => TransportError::InvalidReply,
 			TransportFailure::NonceGenerationFailed => TransportError::SendFailed,
-			// All other failures map to OperationFailed
 			other => TransportError::OperationFailed(other),
 		}
 	}
 }
 
 impl TransportFailure {
+	/// Attach the unsent `frame` to this failure, as a
+	/// [`TransportError::MessageNotSent`].
 	pub fn with_frame(self, frame: Frame) -> TransportError {
 		TransportError::from_failure(frame, self)
 	}
 
+	/// Attach `frame` when one is present, or convert the bare failure into
+	/// its error.
 	pub fn with_optional_frame(self, frame: Option<Frame>) -> TransportError {
 		if let Some(frame) = frame {
 			self.with_frame(frame)
@@ -419,6 +483,30 @@ mod tests {
 			let relayed = TransitStatus::try_from(case.expected);
 			assert!(matches!(relayed, Ok(status) if status == case.status));
 		}
+	}
+
+	// An error reaches consumer logs through `Display` or `Debug`, so the
+	// frame body, which is application plaintext, stays out of both, as text
+	// and as the byte list a derived `Debug` would print (CWE-532).
+	#[test]
+	fn message_not_sent_names_the_frame_without_its_body() {
+		use crate::testing::TestFrame;
+
+		let body = "plaintext-that-must-not-reach-a-log";
+		let body_bytes = format!("{:?}", body.as_bytes());
+		let body_bytes = body_bytes.trim_matches(['[', ']']);
+		let frame = TestFrame::v0(Some(body), None);
+		let frame_id = format!("{:02x?}", frame.metadata().id());
+		let error = TransportError::MessageNotSent(Box::new(frame), TransportFailure::SizeExceeded);
+
+		let displayed = error.to_string();
+		let debugged = format!("{error:?}");
+		assert!(displayed.contains("SizeExceeded"));
+		assert!(displayed.contains(&frame_id));
+		assert!(!displayed.contains(body));
+		assert!(!displayed.contains(body_bytes));
+		assert!(!debugged.contains(body));
+		assert!(!debugged.contains(body_bytes));
 	}
 
 	#[test]

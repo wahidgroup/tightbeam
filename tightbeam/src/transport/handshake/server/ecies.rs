@@ -1,8 +1,7 @@
 //! ECIES-based server handshake orchestrator.
 //!
-//! This module implements the server side of the TightBeam ECIES handshake
-//! protocol. The orchestrator is generic over `P: CryptoProvider` for its
-//! cryptographic operations.
+//! [`EciesHandshakeServer`] runs the server side of the TightBeam ECIES
+//! handshake protocol.
 
 #![cfg(feature = "x509")]
 
@@ -69,8 +68,7 @@ use crate::ZeroizingArray;
 /// The server handshake runs in order:
 ///
 /// 1. Receive the ClientHello with its random nonce.
-/// 2. Send the ServerHandshake with the certificate, the server random, and a
-///    signature over the transcript.
+/// 2. Send the ServerHandshake with the certificate, the server random, and a signature over the transcript.
 /// 3. Receive and decrypt the ClientKeyExchange with the ECIES-encrypted session key.
 pub struct EciesHandshakeServer<P>
 where
@@ -122,8 +120,8 @@ where
 	/// Create an ECIES handshake server that presents `server_cert` to the
 	/// client.
 	///
-	/// `aad_domain_tag` defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`. The client is
-	/// authenticated as `peer_authentication` demands.
+	/// `aad_domain_tag` defaults to [`TIGHTBEAM_AAD_DOMAIN_TAG`]. The client
+	/// is authenticated as `peer_authentication` demands.
 	pub fn new(
 		server_key_provider: Arc<dyn SigningKeyProvider>,
 		server_cert: Arc<Certificate>,
@@ -168,9 +166,12 @@ where
 
 	/// Override the minimum-strength policy applied during negotiation.
 	///
-	/// The default is `DefaultStrengthFloor`, which requires a 256-bit AEAD key
-	/// and a digest of 256 bits or more. Pass `NoStrengthFloor` only where
-	/// weaker profiles must remain negotiable.
+	/// The default is [`DefaultStrengthFloor`], which requires a 256-bit AEAD
+	/// key and a digest of 256 bits or more. Pass [`NoStrengthFloor`] only
+	/// where weaker profiles must remain negotiable.
+	///
+	/// [`DefaultStrengthFloor`]: crate::transport::handshake::negotiation::DefaultStrengthFloor
+	/// [`NoStrengthFloor`]: crate::transport::handshake::negotiation::NoStrengthFloor
 	#[must_use]
 	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
 		self.strength_floor = StrengthFloor::with_policy(policy);
@@ -205,6 +206,16 @@ where
 	}
 
 	/// Process the ClientHello and build the ServerHandshake message.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the server is past `Init`.
+	/// - [`HandshakeError::DerError`] -- the ClientHello fails to decode.
+	/// - [`HandshakeError::NoSupportedProfiles`] -- no profile is configured.
+	/// - [`HandshakeError::NegotiationError`] -- profile or transport negotiation failed.
+	/// - [`HandshakeError::MutualAuthRequired`] -- the accept grants budgets,
+	///   and mutual authentication is off.
+	/// - [`HandshakeError::KeyError`] -- the signing key provider failed.
 	pub async fn process_client_hello(
 		&mut self,
 		client_hello_der: impl AsRef<[u8]>,
@@ -222,10 +233,9 @@ where
 
 		let security_accept = WireDer::new(SecurityAccept::new(selected.descriptor()))?;
 
-		// 4. Negotiate transport capabilities. Mux activates only when it is
-		//    offered and locally enabled. A configured authorizer decides the
-		//    budget grant and the settlement challenge before the accept enters
-		//    the transcript.
+		// 4. Negotiate transport capabilities. A configured authorizer decides
+		//    the budget grant and the settlement challenge before the accept
+		//    enters the transcript.
 		let offer = client_hello.transport_offer.as_ref();
 		let local = self.transport_config.as_ref();
 		let negotiation = TransportNegotiation { offer, local };
@@ -330,6 +340,18 @@ where
 
 	/// Process the ClientKeyExchange message and decrypt the ECIES-encrypted
 	/// session key, which stays stored inside the server.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- no ServerHandshake was sent.
+	/// - [`HandshakeError::CertificateValidationError`] -- a validator refused the client certificate.
+	/// - [`HandshakeError::SignatureVerificationFailed`] -- the possession signature is missing or malformed.
+	/// - [`HandshakeError::SignatureError`] -- the possession signature fails to verify.
+	/// - [`HandshakeError::EciesError`] -- the payload fails to decrypt, as it
+	///   does under a swapped client certificate.
+	/// - [`HandshakeError::ClientRandomMismatchReplay`] -- the payload carries another client random.
+	/// - [`HandshakeError::CountersignatureMissing`] -- an issued receipt got no countersignature.
+	/// - [`HandshakeError::SettlementRejected`] -- the authorizer refused the settlement answer.
 	pub async fn process_client_key_exchange(&mut self, mut client_kex: ClientKeyExchange) -> Result<(), HandshakeError>
 	where
 		P::Curve: Curve + CurveArithmetic,
@@ -341,34 +363,36 @@ where
 		// 1. Validate that the current state is ServerHelloSent.
 		self.validate_expected_state(ServerHandshakeState::ServerHelloSent)?;
 
-		// 2. Validate the client certificate when mutual auth is configured.
+		// 2. Build the associated data over the offered certificate, because
+		//    admission takes the certificate next.
+		let aad = ClientKeyExchange::client_bound_aad(self.aad_domain_tag, client_kex.client_certificate.as_ref())?;
+
+		// 3. Validate the client certificate when mutual auth is configured.
 		self.validate_client_certificate(&mut client_kex)?;
 
-		// 3. Read the encrypted bytes from the message.
+		// 4. Read the encrypted bytes from the message.
 		let encrypted_bytes = client_kex.encrypted_data.as_bytes();
 
-		// 4. Decrypt the ECIES payload. The key provider runs the ECDH step.
-		let decrypted_payload = self.decrypt_ecies_payload(encrypted_bytes).await?;
+		// 5. Decrypt the ECIES payload under the associated data. The key provider runs the ECDH step.
+		let decrypted_payload = self.decrypt_ecies_payload(encrypted_bytes, &aad).await?;
 
-		// 5. Extract the base session key, the client random, and the
+		// 6. Extract the base session key, the client random, and the
 		//    confidential receipt countersignature from the decrypted payload.
 		let SessionPayload { base_session_key, client_random, receipt_ack } =
 			decrypted_payload.with(|payload| self.extract_session_data_from_payload(payload))?;
 
-		// 6. Verify that the client random matches the stored value, which prevents replay attacks.
+		// 7. Verify that the client random matches the stored value, which prevents replay attacks.
 		self.verify_client_random(&client_random)?;
 
-		// 7. Verify the receipt countersignature and settle, strictly after
-		//    decryption and replay verification. Settlement is an irreversible
-		//    external side effect, so it must be the last gate, downstream of
-		//    every cheaper rejection. The countersignature arrives
-		//    confidentially inside the decrypted payload.
+		// 8. Verify the receipt countersignature and settle. Settlement is
+		//    irreversible, so it runs last, after decryption and replay
+		//    verification.
 		self.process_receipt_ack(receipt_ack).await?;
 
-		// 8. Store the base session key.
+		// 9. Store the base session key.
 		self.base_session_key = Some(base_session_key);
 
-		// 9. Transition the state to KeyExchangeReceived.
+		// 10. Transition the state to KeyExchangeReceived.
 		self.state.transition(ServerHandshakeState::KeyExchangeReceived)?;
 
 		Ok(())
@@ -376,7 +400,7 @@ where
 
 	/// Complete the handshake and derive the provider's client-to-server and
 	/// server-to-client AEAD ciphers.
-	pub fn complete(&mut self) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError> {
+	fn complete(&mut self) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError> {
 		// 1. Validate that the current state is KeyExchangeReceived.
 		self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
 
@@ -395,10 +419,7 @@ where
 		let input_key_material = base_session_key.as_slice();
 		let session_ciphers = self.derive_directional_aead(input_key_material, KdfSalt::new(salt_bytes))?;
 
-		// 4. Derive the epoch-0 rekey materials alongside the traffic keys,
-		//    from the same inputs plus the transcript hash. An in-band renewal
-		//    later chains from this secret without touching the handshake
-		//    again.
+		// 4. Derive the epoch-0 rekey materials from the same inputs plus the transcript hash.
 		if let Some(transcript_hash) = self.transcript_hash {
 			let input_key_material = base_session_key.as_slice();
 			let materials = EpochMaterials::derive::<P>(input_key_material, KdfSalt::new(salt_bytes), transcript_hash)?;
@@ -479,8 +500,9 @@ where
 
 	/// Complete the handshake and take everything it agreed.
 	///
-	/// The single home for ECIES server completion. The trait implementation
-	/// delegates here, so driver and test read the session terms the same way.
+	/// This is the single home for ECIES server completion. The trait
+	/// implementation delegates here, so driver and test read the session
+	/// terms the same way.
 	///
 	/// # Errors
 	///
@@ -516,14 +538,14 @@ where
 	async fn decrypt_ecies_payload(
 		&self,
 		encrypted_bytes: impl AsRef<[u8]>,
+		aad: impl AsRef<[u8]>,
 	) -> Result<SecretSlice<u8>, HandshakeError> {
 		let message = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_bytes.as_ref())?;
 		let agreed = self.server_key_provider.key_agreement(message.ephemeral_pubkey()).await?;
 		let shared_secret = EcdhSecret::try_from(agreed)?;
-		let aad = Some(self.aad_domain_tag);
 
 		let open = decrypt_with_shared_secret::<P::EciesMessage, P::Kdf, P::AeadCipher>;
-		let plaintext = open(&message, shared_secret, aad)?;
+		let plaintext = open(&message, shared_secret, Some(aad.as_ref()))?;
 		Ok(plaintext)
 	}
 
@@ -625,6 +647,12 @@ where
 	/// fails closed. A missing or invalid countersignature aborts the
 	/// handshake, and a [`StoredReceipt`] is retained only after both checks
 	/// hold.
+	///
+	/// # Ordering
+	///
+	/// Settlement is an irreversible external side effect, so it MUST be the
+	/// last gate, downstream of every cheaper rejection. The caller runs this
+	/// strictly after decryption and replay verification.
 	#[cfg(feature = "x509")]
 	async fn process_receipt_ack(&mut self, receipt_ack: Option<SignerInfo>) -> Result<(), HandshakeError>
 	where
@@ -793,13 +821,18 @@ mod tests {
 
 	use super::*;
 	use crate::crypto::ecies::{encrypt, Secp256k1EciesMessage};
+	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::key::Secp256k1KeyProvider;
-	use crate::crypto::profiles::SecurityProfileDesc;
+	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
+	use crate::crypto::x509::policy::{DirectTrustValidator, ExpiryValidator};
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::oids::{HASH_SHA3_384, HASH_SHA3_512};
 	use crate::random::{generate_nonce, OsRng};
+	use crate::transport::handshake::client::EciesHandshakeClient;
 	use crate::transport::handshake::negotiation::SecurityOffer;
 	use crate::transport::handshake::tests::*;
+	use crate::transport::handshake::HandshakeKeyManager;
+	use crate::transport::state::ClientIdentity;
 
 	fn create_test_client_hello_with_offer(
 		client_random: &[u8; 32],
@@ -828,7 +861,7 @@ mod tests {
 	/// Test the full server state flow through a complete handshake.
 	///
 	/// The server moves from Init through ServerHelloSent and
-	/// KeyExchangeReceived to Complete.
+	/// KeyExchangeReceived to Completed.
 	#[tokio::test]
 	async fn test_server_state_flow() -> Result<(), Box<dyn Error>> {
 		let mut server = TestEciesServerBuilder::new().build()?;
@@ -981,6 +1014,60 @@ mod tests {
 		Ok(())
 	}
 
+	/// An on-path party that swaps the client certificate and re-signs the
+	/// possession proof under its own key breaks the AEAD binding, so the key
+	/// exchange fails to decrypt rather than misbinding the session to that
+	/// certificate (CWE-287, CWE-345).
+	#[tokio::test]
+	async fn a_swapped_client_certificate_breaks_the_aead_binding() -> Result<(), Box<dyn Error>> {
+		// A server under mutual authentication that accepts any unexpired
+		// certificate, so admission cannot be the gate that catches the swap.
+		let server_identity = create_test_certificate();
+		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
+			into_provider(server_identity.signing_key.to_owned()),
+			Arc::new(server_identity.certificate.to_owned()),
+			None,
+			mutual_with(ExpiryValidator),
+		)
+		.with_supported_profiles(vec![create_default_test_profile()]);
+
+		// Honest client C trusts the server and presents cert_C.
+		let honest = create_test_certificate();
+		let provider = into_provider(honest.signing_key.to_owned());
+		let manager = Arc::new(HandshakeKeyManager::<DefaultCryptoProvider>::new(provider));
+		let identity = ClientIdentity::new(Arc::new(honest.certificate.to_owned()), manager);
+		let validator = DirectTrustValidator::default().with_trust_chain(vec![server_identity.certificate.to_owned()]);
+		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new_with_identity(
+			None,
+			Some(identity),
+		)
+		.with_certificate_validator(Arc::new(validator));
+
+		// Legs one and two run honestly, and C seals the payload under its own
+		// certificate.
+		let client_hello = client.build_client_hello()?;
+		let server_handshake = server.process_client_hello(&client_hello.to_der()?).await?;
+		let mut client_kex = client.process_server_handshake(&server_handshake.to_der()?).await?;
+
+		// The MITM swaps in cert_M and re-signs the possession proof under its
+		// own key over the same transcript and encrypted payload.
+		let mitm = create_test_certificate();
+		let transcript_hash = server.transcript_hash().ok_or(HandshakeError::InvalidState)?;
+		let encrypted = client_kex.encrypted_data.as_bytes();
+		let mitm_cert_der = mitm.certificate.to_der()?;
+		let auth_digest =
+			Transcript::ecies_client_auth(&transcript_hash, encrypted, &mitm_cert_der).seal::<Sha3_256>()?;
+		let mitm_provider = Secp256k1KeyProvider::from(mitm.signing_key.to_owned());
+		let mitm_signature = mitm_provider.sign_prehash(&auth_digest).await?;
+
+		client_kex.client_certificate = Some(mitm.certificate.to_owned());
+		client_kex.client_signature = Some(OctetString::new(mitm_signature.to_vec())?);
+
+		let result = server.process_client_key_exchange(client_kex).await;
+		assert!(matches!(result, Err(HandshakeError::EciesError(_))));
+		Ok(())
+	}
+
 	/// A conforming payload recovers the key material and the absent ack.
 	#[test]
 	fn test_payload_parse_recovers_session_data() -> Result<(), Box<dyn Error>> {
@@ -1091,7 +1178,8 @@ mod tests {
 	/// Build a test ClientKeyExchange with an ECIES-encrypted session key.
 	///
 	/// The helper reads the server's public key and the stored client random,
-	/// then encrypts a payload that holds `session_key || client_random`.
+	/// then encrypts an [`EciesSessionPayload`] that holds a fresh base
+	/// session key and that client random.
 	fn build_test_client_key_exchange<P>(server: &EciesHandshakeServer<P>) -> Result<ClientKeyExchange, Box<dyn Error>>
 	where
 		P: CryptoProvider,
@@ -1159,17 +1247,17 @@ mod tests {
 		};
 
 		let plaintext = payload.to_der()?;
-		let aad = Some(server.aad_domain_tag);
+		let cert_der = client.certificate.to_der()?;
+		let aad = ClientKeyExchange::client_bound_aad(server.aad_domain_tag, Some(&client.certificate))?;
 		let encrypted_message = encrypt::<_, _, _, Secp256k1EciesMessage, P::Kdf, P::AeadCipher>(
 			&server_pubkey,
 			&plaintext,
-			aad,
+			Some(aad.as_slice()),
 			Some(&mut OsRng),
 		)?;
 
 		let encrypted_bytes = encrypted_message.to_bytes();
 		let transcript_hash = server.transcript_hash().ok_or(HandshakeError::InvalidState)?;
-		let cert_der = client.certificate.to_der()?;
 		let auth_digest = match override_digest {
 			Some(digest) => digest,
 			None => Transcript::ecies_client_auth(&transcript_hash, &encrypted_bytes, &cert_der).seal::<P::Digest>()?,

@@ -1,7 +1,7 @@
 //! Shared test utilities for handshake protocol tests.
 //!
 //! The module holds the fixtures, helper functions, and data structures that
-//! every handshake test module shares, so the tests carry no duplicate setup.
+//! every handshake test module shares, so each setup has one home.
 #![allow(unused)]
 
 #[cfg(not(feature = "std"))]
@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::asn1::OctetString;
 use crate::cms::cert::IssuerAndSerialNumber;
+use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
@@ -22,6 +23,7 @@ use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use crate::der::asn1::BitString;
@@ -35,7 +37,9 @@ use crate::oids::{
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::negotiation::{RunnableProfile, SecurityAccept};
-use crate::transport::handshake::{ClientHello, ClientKeyExchange, PeerAuthentication, ServerHandshake};
+use crate::transport::handshake::{
+	ClientHello, ClientKeyExchange, HandshakeAttribute, HandshakeError, PeerAuthentication, ServerHandshake,
+};
 use crate::transport::wire_der::WireDer;
 use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Time;
@@ -155,8 +159,8 @@ pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn Error
 	Ok(TestHandshakeData { client_random, server_random, base_session_key, transcript_hash })
 }
 
-/// Compute a test transcript hash from the ClientHello DER, server random,
-/// and SPKI bytes.
+/// Compute a test transcript hash from the ClientHello DER, the server
+/// random, the SPKI bytes, and the security accept DER.
 pub fn compute_test_transcript_hash(
 	client_hello: impl AsRef<[u8]>,
 	server_random: &[u8; 32],
@@ -529,4 +533,34 @@ impl Default for TestCmsClientBuilder {
 	fn default() -> Self {
 		Self::new()
 	}
+}
+
+/// A key exchange whose envelope carries two `CLIENT_CERTIFICATE` attributes
+/// fails closed instead of admitting the last one, so an injected certificate
+/// cannot travel beside the one the client sealed the payload under.
+#[cfg(feature = "transport-ecies")]
+#[test]
+fn a_duplicate_client_certificate_attribute_fails_closed() -> Result<(), Box<dyn Error>> {
+	let sealed = create_test_certificate();
+	let injected = create_test_certificate();
+	let key_exchange = ClientKeyExchange {
+		encrypted_data: OctetString::new([0x41u8; 32])?,
+		client_certificate: Some(sealed.certificate),
+		client_signature: None,
+	};
+
+	let mut enveloped = EnvelopedData::try_from(&key_exchange)?;
+	let carried = enveloped
+		.unprotected_attrs
+		.take()
+		.ok_or("the key exchange carries its certificate")?;
+
+	let mut attrs = carried.into_vec();
+	attrs.push(Attribute::try_from(HandshakeAttribute::encode(&injected.certificate)?)?);
+
+	enveloped.unprotected_attrs = Some(Attributes::try_from(attrs)?);
+
+	let parsed = ClientKeyExchange::try_from(&enveloped);
+	assert!(matches!(parsed, Err(HandshakeError::DuplicateAttribute)));
+	Ok(())
 }

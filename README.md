@@ -1550,6 +1550,7 @@ Phase 1: Client -> Server
 │ - Client nonce (32 bytes)                               │
 │ - Optional SecurityOffer (supported profiles)           │
 │ - Ephemeral public key (CMS: in KARI structure)         │
+│ - Client certificate (CMS, mutual auth, in transcript)  │
 └─────────────────────────────────────────────────────────┘
 
 Phase 2: Server -> Client
@@ -1564,8 +1565,9 @@ Phase 2: Server -> Client
 Phase 3: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
 │ ClientKeyExchange (ECIES) or ClientFinished (CMS)       │
-│ - Encrypted session key                                 │
+│ - Encrypted session key (ECIES)                         │
 │ - Optional client certificate (mutual auth)             │
+│   (CMS: must equal the Phase 1 certificate)             │
 │ - Optional client signature (mutual auth)               │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -1757,13 +1759,15 @@ ECIES-Encrypt(plaintext, recipient_pub_key):
 │    ciphertext = AES-256-GCM.encrypt(                    │
 │        key: enc_key,                                    │
 │        plaintext: plaintext,                            │
-│        aad: ephemeral_pub                               │
+│        aad: caller-supplied associated data             │
 │    )                                                    │
 ├─────────────────────────────────────────────────────────┤
 │ 5. Return ECIES message                                 │
 │    return (ephemeral_pub || ciphertext)                 │
 └─────────────────────────────────────────────────────────┘
 ```
+
+The handshake seals the session key under the domain tag followed by the client certificate DER when the client presents one (`ClientKeyExchange::client_bound_aad`), so a swapped certificate fails the AEAD open.
 
 **Wire format comparison:**
 
@@ -3042,12 +3046,12 @@ A gateway with an advertise beat that binds a wildcard address (`0.0.0.0` or `[:
 
 **Claimed dial addresses.** `PeerConfig::admit_dial` decides which addresses a peer may ask this gateway to dial. The rules apply in this order:
 
-| Setting | Rule |
+| Setting                              | Rule                                                                                                           |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| Every plane | The unspecified address (`0.0.0.0`, `[::]`) is refused, because a connect to it lands on loopback. |
-| Every plane | A multicast, broadcast, reserved (`240.0.0.0/4`), or `0.0.0.0/8` address is refused. It names no unicast peer. |
-| `with_peer_dial_allowlist`, when set | The list decides alone. |
-| No allowlist | Every other address is admitted, including private and loopback addresses. |
+| Every plane                          | The unspecified address (`0.0.0.0`, `[::]`) is refused, because a connect to it lands on loopback.             |
+| Every plane                          | A multicast, broadcast, reserved (`240.0.0.0/4`), or `0.0.0.0/8` address is refused. It names no unicast peer. |
+| `with_peer_dial_allowlist`, when set | The list decides alone.                                                                                        |
+| No allowlist                         | Every other address is admitted, including private and loopback addresses.                                     |
 
 Without an allowlist, a verified peer can point this gateway at any unicast address, including services on its own host (CWE-918). A gateway reachable from an internal network SHOULD set `with_peer_dial_allowlist`.
 

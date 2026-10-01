@@ -6,35 +6,42 @@ use alloc::vec::Vec;
 
 use core::cmp::{Ord, Ordering, PartialOrd};
 
+use super::{HandshakeAlert, HandshakeError};
 use crate::crypto::x509::attr::{Attribute, Attributes};
-use crate::der::asn1::{Any, ObjectIdentifier, UintRef};
+use crate::der::asn1::{Any, ObjectIdentifier, SetOfVec, UintRef};
 use crate::der::{Sequence, Tagged};
 
 #[cfg(feature = "transport-cms")]
 use crate::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
 use crate::der::asn1::OctetString;
-#[cfg(feature = "transport-cms")]
-use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
-
-use super::{HandshakeAlert, HandshakeError};
+#[cfg(feature = "x509")]
+use crate::oids::CLIENT_CERTIFICATE;
 #[cfg(feature = "transport-cms")]
 use crate::oids::{
 	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER,
 	RECEIPT_ACK, SESSION_RECEIPT,
 };
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
+#[cfg(feature = "x509")]
+use crate::x509::Certificate;
 
-/// CMS Attribute simplified (profile enforces single value only)
+/// A CMS attribute that carries one value, as the handshake profile requires.
+///
+/// The shape follows the RFC 5652 § 5.3 `Attribute`. The profile narrows
+/// `attrValues` to exactly one element, and [`Self::value`] enforces it.
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAttribute {
 	/// OID naming the attribute (RFC 5652 § 5.3 `attrType`).
 	pub attr_type: ObjectIdentifier,
-	/// Attribute values; the profile requires exactly one element.
+	/// Values of the attribute. The profile requires exactly one element.
 	pub attr_values: Vec<Any>,
 }
 
-// Provide ordering for canonical DER SET OF encoding. Order by attr_type OID bytes,
-// then lexicographically by each value's encoding (tag octet, then content octets).
+// A canonical DER SET OF encoding needs a total order. Attributes order by the
+// `attr_type` OID bytes, then lexicographically by the encoding of each value:
+// the tag octet, then the content octets.
 impl PartialOrd for HandshakeAttribute {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
@@ -54,16 +61,25 @@ impl Ord for HandshakeAttribute {
 	}
 }
 
-/// Deterministic comparison key for an `Any`: tag octet followed by content octets.
+/// Deterministic comparison key for an `Any`: the tag octet, then the content
+/// octets.
 fn any_encoding_key(any: &Any) -> (u8, &[u8]) {
 	(u8::from(any.tag()), any.value())
 }
 
 impl HandshakeAttribute {
+	/// Creates an attribute that carries `value` as its one value.
+	///
+	/// The result is always `Ok`.
 	pub fn new_single(attr_type: ObjectIdentifier, value: Any) -> Result<Self, HandshakeError> {
 		Ok(Self { attr_type, attr_values: vec![value] })
 	}
 
+	/// Returns the one value this attribute carries.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
 	pub fn value(&self) -> Result<&Any, HandshakeError> {
 		if self.attr_values.len() != 1 {
 			return Err(HandshakeError::InvalidAttributeArity);
@@ -72,10 +88,23 @@ impl HandshakeAttribute {
 	}
 }
 
-/// Convert X.509 Attribute to HandshakeAttribute.
+/// Copies the OID and every value of an X.509 attribute.
+///
+/// The copy keeps any arity, so [`HandshakeAttribute::value`] checks it later.
 impl From<&Attribute> for HandshakeAttribute {
 	fn from(attr: &Attribute) -> Self {
 		HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() }
+	}
+}
+
+/// Converts a [`HandshakeAttribute`] into the X.509 attribute an
+/// `EnvelopedData` carries.
+impl TryFrom<HandshakeAttribute> for Attribute {
+	type Error = HandshakeError;
+
+	fn try_from(attr: HandshakeAttribute) -> Result<Self, Self::Error> {
+		let values = SetOfVec::try_from(attr.attr_values)?;
+		Ok(Self { oid: attr.attr_type, values })
 	}
 }
 
@@ -83,10 +112,17 @@ impl From<&Attribute> for HandshakeAttribute {
 ///
 /// Each implementation is the one home for its type's attribute OID, so
 /// the encode and decode sides agree on which OID names which type.
-#[cfg(feature = "transport-cms")]
+#[cfg(feature = "x509")]
 pub trait AttributePayload {
 	/// OID this payload is carried under.
 	const OID: ObjectIdentifier;
+}
+
+/// The client certificate a key exchange carries under mutual
+/// authentication, on the CMS and the ECIES path alike.
+#[cfg(feature = "x509")]
+impl AttributePayload for Certificate {
+	const OID: ObjectIdentifier = CLIENT_CERTIFICATE;
 }
 
 #[cfg(feature = "transport-cms")]
@@ -119,9 +155,13 @@ impl AttributePayload for OctetString {
 	const OID: ObjectIdentifier = RECEIPT_ACK;
 }
 
-#[cfg(feature = "transport-cms")]
+#[cfg(feature = "x509")]
 impl HandshakeAttribute {
-	/// Encodes `payload` under its own OID for wire transmission.
+	/// Encodes `payload` under its own OID for transmission.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- `payload` fails to encode.
 	pub fn encode<T>(payload: &T) -> Result<Self, HandshakeError>
 	where
 		T: AttributePayload + Tagged + crate::der::EncodeValue,
@@ -131,8 +171,15 @@ impl HandshakeAttribute {
 
 	/// Decodes this attribute, requiring the OID `T` is carried under.
 	///
-	/// An attribute of another type yields [`HandshakeError::MissingAttribute`],
-	/// so a peer cannot substitute one negotiated value for another.
+	/// An attribute of another type yields
+	/// [`HandshakeError::MissingAttribute`], so a peer cannot substitute one
+	/// negotiated value for another.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::MissingAttribute`] -- the OID differs from `T::OID`.
+	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
+	/// - [`HandshakeError::DerError`] -- the value fails to decode as `T`.
 	pub fn decode<'a, T>(&'a self) -> Result<T, HandshakeError>
 	where
 		T: AttributePayload + crate::der::Choice<'a> + crate::der::DecodeValue<'a>,
@@ -144,7 +191,7 @@ impl HandshakeAttribute {
 		Ok(self.value()?.decode_as()?)
 	}
 
-	/// The bytes this attribute's value arrived as.
+	/// Returns the bytes that the value of this attribute arrived as.
 	///
 	/// A receiver binds what the peer actually sent. Re-encoding the decoded
 	/// value instead would erase any difference the decoder normalised away:
@@ -153,20 +200,24 @@ impl HandshakeAttribute {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::MissingAttribute`] -- the attribute carries no
-	///   value.
+	/// - [`HandshakeError::InvalidAttributeArity`] -- the attribute carries zero values or more than one.
+	/// - [`HandshakeError::DerError`] -- the value fails to encode.
 	pub fn received_bytes(&self) -> Result<Vec<u8>, HandshakeError> {
 		use crate::der::Encode;
 
 		Ok(self.value()?.to_der()?)
 	}
 
-	/// Canonical DER bytes of `payload` for transcript binding.
+	/// Returns the canonical DER bytes of `payload` for transcript binding.
 	///
-	/// The sender's half of the pairing with [`Self::received_bytes`]: these
-	/// are the bytes about to go on the wire, so both sides hash the same
-	/// encoding and a tampered attribute diverges the two transcript hashes
-	/// (CWE-345).
+	/// The sender calls this and the receiver calls [`Self::received_bytes`].
+	/// These are the bytes about to go on the wire, so both sides hash the
+	/// same encoding and a tampered attribute diverges the two transcript
+	/// hashes (CWE-345).
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DerError`] -- `payload` fails to encode.
 	pub fn transcript_bytes<T>(payload: &T) -> Result<Vec<u8>, HandshakeError>
 	where
 		T: AttributePayload + Tagged + crate::der::EncodeValue,
@@ -176,8 +227,6 @@ impl HandshakeAttribute {
 		Ok(Any::encode_from(payload)?.to_der()?)
 	}
 }
-
-// -------------------------- Decoders --------------------------
 
 /// Decode a one- or two-byte unsigned INTEGER from an `Any`.
 fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
@@ -215,20 +264,25 @@ fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 
 /// Handshake attribute lookups on a CMS `SignedData` or an attribute set.
 pub trait HandshakeAttributes {
-	/// Find at most one unsigned attribute with `oid`, rejecting duplicates.
+	/// Finds at most one unsigned attribute with `oid`, rejecting duplicates.
+	///
 	/// On a `SignedData` the search spans the SignerInfos of a parsed
 	/// Finished message.
 	///
 	/// # Duplicates
 	///
-	/// [RFC 5652 §11.4](https://datatracker.ietf.org/doc/html/rfc5652#section-11.4)
-	/// permits repeated unsigned attributes, but every TightBeam handshake
-	/// attribute is single-use: a duplicate is either a builder bug or an
-	/// injection attempt, and fails closed.
+	/// RFC 5652 § 11.4 permits repeated unsigned attributes, but every
+	/// TightBeam handshake attribute is single-use: a duplicate is either a
+	/// builder bug or an injection attempt, and fails closed.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::DuplicateAttribute`] when the oid repeats
+	/// - [`HandshakeError::DuplicateAttribute`] -- the OID appears more than once.
+	///
+	/// # Sources
+	///
+	/// - RFC 5652 § 11.4, countersignature attributes:
+	///   <https://datatracker.ietf.org/doc/html/rfc5652#section-11.4>
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError>;
 }
 
@@ -275,14 +329,16 @@ impl HandshakeAttributes for SignedData {
 
 /// Handshake alert decoding on a [`HandshakeAttribute`].
 pub trait HandshakeAlertAttribute {
-	/// Alert code carried by this attribute.
+	/// Returns the alert code this attribute carries.
 	///
 	/// The profile admits one value, so any other arity is refused.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidAttributeArity`] on any arity but one
-	/// - [`HandshakeError::IntegerOutOfRange`] on a code above `u8::MAX`
+	/// - [`HandshakeError::InvalidAttributeArity`] -- the arity is other than one.
+	/// - [`HandshakeError::InvalidIntegerEncoding`] -- the value is not an INTEGER.
+	/// - [`HandshakeError::IntegerOutOfRange`] -- the code is empty or above `u8::MAX`.
+	/// - [`HandshakeError::UnknownAlertCode`] -- the code names no alert.
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError>;
 }
 
@@ -292,7 +348,6 @@ impl HandshakeAlertAttribute for HandshakeAttribute {
 	}
 }
 
-// -------------------------- Tests --------------------------
 #[cfg(all(test, feature = "transport-cms"))]
 mod tests {
 	use super::*;
@@ -341,13 +396,13 @@ mod tests {
 	/// A receiver binds what arrived. `der` sorts a `SET OF` before it
 	/// validates one, so a value that re-encodes to different bytes than it
 	/// arrived as would let that normalisation erase tamper evidence
-	/// (CWE-345, U-107).
+	/// (CWE-345).
 	#[test]
 	fn the_transcript_binds_the_bytes_an_attribute_arrived_as() -> Result<(), HandshakeError> {
 		use crate::der::{Decode, Encode};
 
-		// A SET OF whose members are out of DER order. Decoding sorts them,
-		// so the decoded value no longer describes what was sent.
+		// The members of this SET OF are out of DER order. Decoding sorts
+		// them, so the decoded value differs from what was sent.
 		let unsorted = Any::from_der(&[0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01])?;
 		let attribute = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT, unsorted.to_owned())?;
 		assert_eq!(attribute.received_bytes()?, unsorted.to_der()?);
@@ -426,7 +481,8 @@ mod tests {
 		let wide = mk_alert_attr([0x01, 0x02, 0x03])?;
 		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 
-		// 0x0101 = 257. Truncating to u8 would alias alert code 1 (AuthRequired).
+		// 0x0101 = 257. Truncating to u8 would alias alert code 1
+		// (AuthRequired).
 		let above = mk_alert_attr([0x01, 0x01])?;
 		assert!(matches!(above.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 		Ok(())

@@ -129,13 +129,25 @@ crate::impl_from!(#[cfg(feature = "aead")] AeadError => KeyError::AeadError);
 /// Both forms suit configuration in const contexts, such as the `servlet!`
 /// macro.
 #[cfg(feature = "signature")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SigningKeySpec {
 	/// Raw key bytes, such as a 32-byte secp256k1 scalar.
 	Bytes(&'static [u8]),
 
 	/// A key provider instance, such as an HSM or KMS backend.
 	Provider(Arc<dyn SigningKeyProvider>),
+}
+
+// A `SigningKeySpec::Bytes` holds a raw signing key, so its `Debug` prints the
+// variant and the byte length only (CWE-532).
+#[cfg(feature = "signature")]
+impl Debug for SigningKeySpec {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		match self {
+			Self::Bytes(bytes) => f.debug_struct("SigningKeySpec::Bytes").field("len", &bytes.len()).finish(),
+			Self::Provider(_) => f.write_str("SigningKeySpec::Provider(..)"),
+		}
+	}
 }
 
 #[cfg(feature = "signature")]
@@ -153,8 +165,8 @@ impl SigningKeySpec {
 	///
 	/// # Errors
 	///
-	/// - [`KeyError::KeyLengthError`] when the bytes are not the curve's field size.
-	/// - [`KeyError::SignatureError`] when the bytes are not a valid signing key.
+	/// - [`KeyError::KeyLengthError`] -- the bytes are not the curve's field size.
+	/// - [`KeyError::SignatureError`] -- the bytes are not a valid signing key.
 	pub fn to_provider<C>(&self) -> Result<Arc<dyn SigningKeyProvider>, KeyError>
 	where
 		C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
@@ -210,18 +222,22 @@ pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
 	///
 	/// # Errors
 	///
-	/// - [`KeyError`] when the backend fails to retrieve the public key.
+	/// - [`KeyError`] -- the backend fails to retrieve the public key.
 	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>>;
 
 	/// Signs a precomputed digest (prehash) with this provider's private key.
 	///
 	/// The canonical tightbeam convention hashes content exactly once (see
-	/// `crypto::sign::sign_canonical`). Providers MUST sign the given prehash
-	/// directly, so the produced signature matches the advertised
-	/// signature-algorithm OID whatever the backend. The result is the
-	/// DER-encoded signature.
+	/// [`sign_canonical`](crate::crypto::sign::sign_canonical)). Providers
+	/// MUST sign the given prehash directly, so the produced signature matches
+	/// the advertised signature-algorithm OID whatever the backend. The result
+	/// is the DER-encoded signature.
 	///
 	/// - `prehash`: the digest of the content to sign.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError`] -- the backend fails to sign `prehash`.
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>>;
 
 	/// Performs key agreement, such as ECDH or X25519.
@@ -236,6 +252,11 @@ pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
 	///
 	/// The default returns [`KeyError::UnsupportedOperation`], because some
 	/// key types have no key agreement.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError::UnsupportedOperation`] -- the key type has no key agreement.
+	/// - [`KeyError`] -- the peer key fails to parse, or the backend fails.
 	fn key_agreement(&self, _peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
 		Box::pin(async { Err(KeyError::UnsupportedOperation) })
 	}
@@ -265,7 +286,7 @@ impl<T: SigningKeyProvider + ?Sized> SigningKeyProvider for Arc<T> {
 /// An ECDSA key provider that signs and runs ECDH key agreement.
 ///
 /// It wraps an ECDSA signing key on any curve `C`. It is the recommended
-/// provider for TLS handshakes.
+/// provider for the TightBeam transport handshakes.
 ///
 /// # Type Parameters
 ///
@@ -389,6 +410,11 @@ pub trait EncryptingKeyProvider: Send + Sync + Debug {
 	/// - `nonce`: the nonce or IV for this operation. The caller MUST ensure
 	///   each `(key, nonce)` pair is unique for AEAD ciphers.
 	/// - `plaintext`: the data to encrypt.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError::NonceLengthError`] -- `nonce` differs from the cipher's nonce size.
+	/// - [`KeyError::AeadError`] -- the cipher fails to encrypt.
 	fn encrypt(
 		&self,
 		nonce: &[u8],
@@ -401,6 +427,11 @@ pub trait EncryptingKeyProvider: Send + Sync + Debug {
 	///
 	/// - `nonce`: the nonce or IV used for encryption.
 	/// - `ciphertext`: the encrypted data.
+	///
+	/// # Errors
+	///
+	/// - [`KeyError::NonceLengthError`] -- `nonce` differs from the cipher's nonce size.
+	/// - [`KeyError::AeadError`] -- the ciphertext fails authentication.
 	fn decrypt(
 		&self,
 		nonce: &[u8],
@@ -645,5 +676,16 @@ mod tests {
 		let spec = SigningKeySpec::Bytes(&[0u8; 5]);
 		let refused = spec.to_provider::<crate::crypto::sign::ecdsa::k256::Secp256k1>();
 		assert!(matches!(refused, Err(KeyError::KeyLengthError(_))));
+	}
+
+	/// The `Debug` of a raw key spec prints its length only, so a `servlet!`
+	/// user that logs its configuration keeps the signing key out of the log
+	/// (CWE-532).
+	#[test]
+	fn signing_key_spec_debug_omits_the_key_bytes() {
+		let spec = SigningKeySpec::Bytes(&[0xABu8; 32]);
+		let rendered = format!("{spec:?}");
+		assert!(!rendered.contains("171"));
+		assert!(rendered.contains("32"));
 	}
 }

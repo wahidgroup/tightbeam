@@ -1,9 +1,11 @@
 name: Nightly
 
-# Time-based checks only. Everything that a change can invalidate runs in
-# `make ci` (see .github/workflows/ci.yml), which gates every pull request.
-# These two jobs fire without a change: a new RustSec advisory invalidates a
-# green build, and a fuzz campaign needs more wall time than a PR can hold.
+# This workflow runs the time-based checks. `make ci` (see
+# .github/workflows/ci.yml) gates every pull request and runs everything a
+# change can invalidate. These two jobs fire without a change:
+#
+# - A new RustSec advisory invalidates a green build.
+# - A fuzz campaign needs more run time than a PR can hold.
 
 on:
   schedule:
@@ -22,7 +24,7 @@ jobs:
     name: Advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -43,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -63,7 +65,7 @@ jobs:
 
       - name: Upload findings
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-findings
           path: built/fuzz/out/

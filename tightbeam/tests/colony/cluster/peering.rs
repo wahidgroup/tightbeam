@@ -1,5 +1,7 @@
 //! Peer federation tests for the advertisement control plane.
 
+use std::net::TcpListener;
+
 use super::common::*;
 use tightbeam::colony::cluster::ClusterConfigBuilder;
 use tightbeam::transport::Protocol;
@@ -13,9 +15,8 @@ tb_assert_spec! {
 			(events::CLUSTER_PEER_ADVERTISED, exactly!(1))
 		]
 	},
-	// Version 1.1.0 adds the wire outcome to the contract, so accepting
-	// scenarios prove the peer saw Ok, not merely that the install event
-	// fired.
+	// Version 1.1.0 adds the status the peer receives to the contract, so
+	// accepting scenarios prove the peer saw Ok as well as the install event.
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
@@ -46,8 +47,8 @@ tb_assert_spec! {
 			(events::CLUSTER_PEER_ADVERTISE_REFUSED, exactly!(1))
 		]
 	},
-	// Version 1.1.0 pins the wire status and the security property that a
-	// refusal installs zero peer routes.
+	// Version 1.1.0 pins the status the peer receives and the security
+	// property that a refusal installs zero peer routes.
 	V(1,1,0): {
 		mode: Accept,
 		assertions: [
@@ -160,8 +161,8 @@ tb_assert_spec! {
 	}
 }
 
-// A slate is not one type: every advertised type installs its own peer
-// route, so a two-type advertisement surfaces both types.
+// Every advertised type in a slate installs its own peer route, so a
+// two-type advertisement surfaces both types.
 tb_scenario! {
 	name: cluster_multi_type_advertisement_installs_all,
 	spec: ClusterPeerMultiTypeSpec,
@@ -211,7 +212,7 @@ fn peer_pair_certs() -> PeerPairCerts {
 	PeerPairCerts { gateway, peer_b: (cert_b, key_b), peer_trust }
 }
 
-/// Receiver conf anchoring both pair identities in `peer_trust`.
+/// Receiver conf that anchors both pair identities in `peer_trust`.
 fn peering_pair_conf(certs: &PeerPairCerts) -> ClusterConfig {
 	let tls = cluster_tls_config(&certs.gateway).with_peer_trust(Arc::clone(&certs.peer_trust));
 	ClusterConfig::new(tls)
@@ -232,10 +233,10 @@ tb_assert_spec! {
 	}
 }
 
-// Slates belong to the authenticated signer, not the claimed gateway
-// address: two trusted peers advertising under the same address keep
-// independent slates (two routes after both install), and one peer's
-// withdrawal only evicts its own routes (ping survives echo's exit).
+// Slates belong to the authenticated signer and not to the claimed gateway
+// address:
+// - Two trusted peers under the same address keep independent slates, so two routes exist after both install.
+// - One peer's withdrawal evicts only its own routes, so ping survives echo's exit.
 tb_scenario! {
 	name: cluster_peer_slates_keyed_by_signer,
 	spec: ClusterPeerSignerKeyedSpec,
@@ -290,7 +291,7 @@ tb_scenario! {
 	}
 }
 
-// Nestmate recognition: an advertised type from a foreign realm fails the
+// Nestmate recognition: an advertised type from a foreign namespace fails the
 // structural CHC half and is refused even under a valid peer certificate.
 tb_scenario! {
 	name: cluster_refuses_foreign_realm_advertisement,
@@ -346,9 +347,9 @@ tb_process_spec! {
 	terminal { Installed }
 }
 
-// A refusal is not a penalty box: an advertisement refused on local state
-// (address conflict) releases its replay record, so the peer can resend
-// the byte-identical signed frame once the conflict clears and install.
+// An advertisement refused on local state (address conflict) releases its
+// replay record, so the peer can resend the byte-identical signed frame and
+// install once the conflict clears.
 tb_scenario! {
 	name: cluster_advertisement_retryable_after_refusal,
 	config: ScenarioConfig::builder()
@@ -420,8 +421,8 @@ tb_assert_spec! {
 	}
 }
 
-// Work with a spent relay budget never re-forwards: peer-only types
-// stay Unavailable once the hop budget reaches zero.
+// Work with a spent relay budget serves locally only, so a peer-only type
+// stays Unavailable once the hop budget reaches zero.
 tb_scenario! {
 	name: cluster_refuses_reforward_of_peer_work,
 	spec: ClusterPeerForwardLoopGuardSpec,
@@ -547,10 +548,10 @@ tb_assert_spec! {
 	}
 }
 
-// A claimed `gateway_addr` that matches a local servlet address is refused.
-// The refusal gates routing state only: the admitted identity still
-// lands in the discovery new table, where the probe gate decides its
-// fate. A slate refusal therefore never erases graph connectivity.
+// A claimed `gateway_addr` that matches a local servlet address is refused,
+// and the refusal gates routing state only:
+// - The admitted identity still lands in the discovery new table, where the probe gate decides its fate.
+// - A slate refusal therefore leaves graph connectivity intact.
 tb_scenario! {
 	name: cluster_refuses_peer_dial_colliding_local_servlet,
 	spec: ClusterPeerCollideSpec,
@@ -635,10 +636,9 @@ tb_process_spec! {
 	terminal { Contained }
 }
 
-// Infection containment: a peer route to a gateway that never answers is
-// weakened on each failed forward and, past the abandonment limit, drops
-// out of selection so the peer-only type reports Unavailable with no
-// further forward attempt.
+// Infection containment: each failed forward weakens a peer route to a silent
+// gateway. Past the abandonment limit the route drops out of selection, so
+// the peer-only type reports Unavailable with no further forward attempt.
 tb_scenario! {
 	name: cluster_abandons_failing_peer_trail,
 	config: ScenarioConfig::builder()
@@ -850,7 +850,7 @@ tb_assert_spec! {
 }
 
 // Reconciliation is by replacement: a later advertisement carrying an
-// empty slate retires every route the peer previously advertised.
+// empty slate retires every route of the peer's earlier slate.
 tb_scenario! {
 	name: cluster_empty_advertisement_clears_peer_routes,
 	spec: ClusterPeerSlateShrinkSpec,
@@ -885,9 +885,9 @@ tb_assert_spec! {
 	}
 }
 
-// The advertised slate is registry truth, not configuration: a hive that
-// registers AFTER both gateways are up surfaces at the peer within a
-// beat, with no operator involvement.
+// The advertised slate follows the registry: a hive that registers after
+// both gateways are up surfaces at the peer within a beat, with no operator
+// involvement.
 tb_scenario! {
 	name: cluster_beat_advertises_registered_hive_types,
 	spec: ClusterPeerBeatSpec,
@@ -931,9 +931,9 @@ tb_assert_spec! {
 	}
 }
 
-// The advertised slate is route truth, not registration history: a type
-// that joins through a servlet address update surfaces at the peer on
-// the next beat, exactly like a registration-time type.
+// The advertised slate follows the live routes: a type that joins through a
+// servlet address update surfaces at the peer on the next beat, exactly like
+// a registration-time type.
 tb_scenario! {
 	name: cluster_beat_slate_tracks_servlet_updates,
 	spec: ClusterBeatUpdatedSlateSpec,
@@ -980,10 +980,9 @@ tb_assert_spec! {
 	}
 }
 
-// The beat honors the receiver's advertisement cap: a colony exporting
-// more types than MAX_ADVERTISED_TYPES advertises a deterministic capped
-// subset instead of an oversized slate every receiver refuses, which
-// would silently wedge federation.
+// The beat honors the receiver's advertisement cap, so a colony past
+// MAX_ADVERTISED_TYPES advertises a deterministic capped subset. Every
+// receiver refuses an oversized slate, which would silently wedge federation.
 tb_scenario! {
 	name: cluster_beat_bounds_slate_to_advertised_cap,
 	spec: ClusterBeatCapSpec,
@@ -1095,7 +1094,7 @@ tb_assert_spec! {
 
 // Federation crosses trust planes: the receiver's TLS identity is only
 // anchored in the advertiser's `peer_trust`, so the beat must dial on the
-// peer plane. A beat riding the hive-trust pool never connects.
+// peer plane. A beat on the hive-trust pool fails to connect.
 tb_scenario! {
 	name: cluster_beat_dials_on_peer_trust_plane,
 	spec: ClusterPeerPlaneBeatSpec,
@@ -1127,6 +1126,15 @@ tb_assert_spec! {
 		assertions: [
 			(WILDCARD_START_REFUSED, exactly!(1), equals!(true))
 		]
+	},
+	// Version 1.1.0 adds the port to the contract, so a refused start is
+	// proven to leave no accept loop holding the socket it bound.
+	V(1,1,0): {
+		mode: Accept,
+		assertions: [
+			(WILDCARD_START_REFUSED, exactly!(1), equals!(true)),
+			(WILDCARD_PORT_RELEASED, exactly!(1), equals!(true))
+		]
 	}
 }
 
@@ -1141,20 +1149,37 @@ fn wildcard_advertising_builder(certs: &ClusterTestCerts, peer: impl Into<String
 		.with_advertise_interval(Duration::from_millis(100))
 }
 
+/// A port on the IPv4 wildcard that no listener holds when this returns.
+fn vacant_wildcard_port() -> u16 {
+	let probe = TcpListener::bind("0.0.0.0:0").expect("the wildcard has a free port");
+	probe.local_addr().expect("a bound listener has an address").port()
+}
+
+/// Whether a fresh listener can take `port` on the IPv4 wildcard, which
+/// fails while another listener still holds it.
+fn wildcard_port_is_free(port: u16) -> bool {
+	TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
 // A gateway bound to the wildcard address would advertise `0.0.0.0`, which
-// every peer refuses as unspecified, so a federating gateway with no
-// advertise address refuses to start rather than federating silently.
+// every peer refuses as unspecified. A federating gateway with no advertise
+// address therefore refuses to start, and releases the port it bound.
 tb_scenario! {
 	name: cluster_refuses_to_federate_from_a_wildcard_bind_without_an_advertise_address,
 	spec: ClusterWildcardBindRefusedSpec,
 	environment Bare {
 		context: cluster_certs(),
 		exec: |SetupEnv { trace, context: certs }| async move {
-			let conf = wildcard_advertising_builder(&certs, "127.0.0.1:65210").build();
+			let port = vacant_wildcard_port();
+			let conf = wildcard_advertising_builder(&certs, "127.0.0.1:65210")
+				.with_bind_addr(format!("0.0.0.0:{port}"))
+				.build();
+
 			let refused = start_cluster(&trace, conf).await;
 			let advertise_required = matches!(refused, Err(TightBeamError::ClusterError(error)) if matches!(*error, ClusterError::AdvertiseAddressRequired));
 
 			trace.event_with(WILDCARD_START_REFUSED, &[], advertise_required)?;
+			trace.event_with(WILDCARD_PORT_RELEASED, &[], wildcard_port_is_free(port))?;
 			Ok(())
 		}
 	}

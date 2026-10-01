@@ -97,12 +97,20 @@ pub enum HandshakeError {
 	#[error("Missing client certificate")]
 	MissingClientCertificate,
 
+	/// The certificate the client Finished embeds differs from the certificate
+	/// the key exchange bound into the transcript. Only the key-exchange
+	/// certificate proved knowledge of the session key, so only it may sign
+	/// the Finished.
+	#[error("Client Finished certificate does not match the key-exchange certificate")]
+	ClientCertificateMismatch,
+
 	/// The transcript hash has an invalid length or format.
 	#[error("Invalid transcript hash")]
 	InvalidTranscriptHash,
 
 	/// The digest output width differs from the required transcript hash
-	/// width.
+	/// width. `expected` is the required width and `received` is the digest
+	/// output width, both in bytes.
 	#[error("Transcript digest length invalid: expected {expected} bytes, got {received}")]
 	TranscriptDigestLength { expected: usize, received: usize },
 
@@ -124,11 +132,13 @@ pub enum HandshakeError {
 	#[error("Receipt countersignature required for budget-bearing session but missing")]
 	CountersignatureMissing,
 
-	/// The client's receipt approver refused the session receipt.
+	/// The client's receipt approver refused the session receipt. `code` is
+	/// the refusal code the approver returned.
 	#[error("Session receipt refused by approver: code {code}")]
 	ApprovalRefused { code: u32 },
 
-	/// The server's authorizer rejected the settlement answer.
+	/// The server's authorizer rejected the settlement answer. `code` is the
+	/// rejection code the authorizer returned.
 	#[error("Settlement rejected: code {code}")]
 	SettlementRejected { code: u32 },
 
@@ -159,7 +169,8 @@ pub enum HandshakeError {
 	MissingServerRandom,
 
 	/// The CMS salt (the transcript hash) is below the minimum entropy
-	/// requirement.
+	/// requirement. `actual` is the salt length and `minimum` is the required
+	/// length, both in bytes.
 	#[error("CMS salt too short: {actual} bytes (minimum {minimum} required)")]
 	InsufficientSaltEntropy { actual: usize, minimum: usize },
 
@@ -202,7 +213,8 @@ pub enum HandshakeError {
 	/// A required attribute is missing.
 	#[error("Required attribute missing")]
 	MissingAttribute,
-	/// The supported-curves list exceeds its cap.
+	/// The supported-curves list exceeds its cap. `count` is the number of
+	/// curves offered and `max` is the cap.
 	#[error("Too many supported curves: {count} exceeds cap of {max}")]
 	TooManySupportedCurves { count: usize, max: usize },
 	/// The nonce value is not a valid OCTET STRING.
@@ -257,10 +269,12 @@ pub enum HandshakeError {
 	#[error("KDF operation failed: {0}")]
 	#[from]
 	KdfError(crate::crypto::kdf::KdfError),
-	/// A key has an invalid size.
+	/// A key has an invalid size. `expected` and `received` are the required
+	/// and the actual key length in bytes.
 	#[error("Invalid key size: expected {expected}, got {received}")]
 	InvalidKeySize { expected: usize, received: usize },
-	/// A ciphertext is shorter than the minimum length.
+	/// A ciphertext is shorter than the minimum length. `minimum` and
+	/// `received` are the required and the actual length in bytes.
 	#[error("Ciphertext too short: {received} bytes (minimum {minimum} required)")]
 	CiphertextTooShort { minimum: usize, received: usize },
 	/// ASN.1 encoding failed during CMS key agreement (KARI).
@@ -323,6 +337,7 @@ impl HandshakeError {
 			Self::CertificateValidationError(_)
 			| Self::SignatureVerificationFailed
 			| Self::MissingClientCertificate
+			| Self::ClientCertificateMismatch
 			| Self::PinnedCertificateMismatch
 			| Self::CertificateNotYetValid
 			| Self::CertificateExpired
