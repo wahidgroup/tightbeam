@@ -1,16 +1,30 @@
-//! Outbound command plane: the writer driver that serializes every
-//! envelope, plus the GoAway and renewal helpers that feed its queue.
+//! Outbound command plane.
+//!
+//! [`MuxWriterDriver`] serializes every envelope. The GoAway and renewal
+//! helpers on [`MuxShared`] feed its queue.
 
 use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Arc;
 
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+use super::shared::RekeyPhase;
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+use crate::constants::DEFAULT_REKEY_DEADLINE_SECS;
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+use core::time::Duration;
+#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
+use std::time::Instant;
+
 use futures::channel::mpsc;
 use futures::Stream;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use futures::lock::Mutex as FuturesMutex;
+
 use super::outbound::Outbound;
-use super::shared::{MuxShared, RekeyPhase};
+use super::shared::MuxShared;
 use crate::transport::envelopes::{GoAwayPackage, GoAwayReason, TransportEnvelope};
 use crate::transport::io::EnvelopeSink;
 use crate::transport::multiplex::MuxRole;
@@ -20,42 +34,30 @@ use crate::transport::TransportResult;
 use super::flow::renewal_floor;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::aead::SendCipher;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::rekey::ClientRekeyExchange;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use futures::lock::Mutex as FuturesMutex;
-
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use crate::constants::DEFAULT_REKEY_DEADLINE_SECS;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use core::time::Duration;
-#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
-use std::time::Instant;
-
 #[cfg(feature = "instrument")]
 use crate::instrumentation::events;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::rekey::ClientRekeyExchange;
 
-/// Open a renewal exactly once: readiness check and phase
-/// transition happen while holding the exchange, so concurrent
-/// triggers collapse to a single `RekeyRequest`. A contended exchange
-/// means a renewal is already being processed, which makes opening moot.
 /// One unit of writer work, resolved by [`MuxWriterDriver::poll_step`].
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 enum WriterStep {
+	/// A command from the outbound queue.
 	Command(Outbound),
-	/// Owed c2s chunks quiesced: the held `RekeyAck` may go out
+	/// Owed c2s chunks have quiesced, so the held `RekeyAck` may go out.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	WriteAck,
-	/// The renewal deadline elapsed: drain the connection
+	/// The renewal deadline elapsed, so the connection drains.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
 	RenewalExpired,
+	/// Every sender is gone and the outbound queue has ended.
 	Closed,
 }
 
-/// Writer driver: single serialization point for the connection.
+/// Writer driver, the single serialization point for the connection.
 ///
-/// Drains the outbound queue and writes each envelope through the
-/// [`EnvelopeSink`] (encrypting or cleartext). Spawn
+/// The driver drains the outbound queue and writes each envelope through the
+/// [`EnvelopeSink`], encrypted or in cleartext. Spawn
 /// [`MuxWriterDriver::drive`] on the caller's executor.
 pub struct MuxWriterDriver<W>
 where
@@ -67,22 +69,22 @@ where
 	/// Records reserved for draining before the send cipher halts.
 	/// See [`MuxSettings::drain_reserve_records`] for the bound derivation.
 	drain_headroom: u64,
-	/// Client half of the rekey exchange, shared with the reader
-	/// driver. The writer only ever `try_lock`s it, for the
-	/// synchronous [`ClientRekeyExchange::start_renewal`]
+	/// Client half of the rekey exchange, shared with the reader driver. The
+	/// writer only calls `try_lock` on it, for the synchronous
+	/// [`ClientRekeyExchange::start_renewal`].
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	exchange: Option<Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>>,
-	/// `RekeyAck` held back until owed c2s chunks quiesce, with the
-	/// fresh send cipher it switches to (the ack must trail every
-	/// old-epoch data chunk on the wire)
+	/// `RekeyAck` held back until owed c2s chunks quiesce, with the fresh send
+	/// cipher it switches to. The ack must trail every old-epoch data chunk on
+	/// the wire.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pending_ack: Option<(TransportEnvelope, Box<SendCipher>)>,
-	/// When the in-flight renewal was first observed, for the
-	/// deadline that bounds a stalled exchange
+	/// The instant the in-flight renewal was first observed, which starts the
+	/// deadline that bounds a stalled exchange.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
 	renewal_started: Option<Instant>,
-	/// Time budget for one renewal exchange before the connection
-	/// drains (default [`DEFAULT_REKEY_DEADLINE_SECS`])
+	/// Time budget for one renewal exchange before the connection drains. The
+	/// default is [`DEFAULT_REKEY_DEADLINE_SECS`].
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
 	renewal_deadline: Duration,
 }
@@ -91,9 +93,12 @@ impl<W> MuxWriterDriver<W>
 where
 	W: EnvelopeSink,
 {
-	/// Assemble the writer driver over the outbound queue's receiving
-	/// end: the single construction point, so a new field has exactly
-	/// one home.
+	/// Assemble the writer driver over the receiving end of the outbound queue.
+	///
+	/// This is the single construction point, so a new field has exactly one
+	/// home.
+	///
+	/// - `drain_headroom`: the records reserved for draining before the send cipher halts.
 	pub fn new(writer: W, commands: mpsc::Receiver<Outbound>, shared: Arc<MuxShared>, drain_headroom: u64) -> Self {
 		Self {
 			writer,
@@ -111,7 +116,7 @@ where
 		}
 	}
 
-	/// Attach the client half of the rekey exchange (refcount bump).
+	/// Attach a shared handle to the client half of the rekey exchange.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	pub(crate) fn set_exchange(&mut self, exchange: Arc<FuturesMutex<Box<dyn ClientRekeyExchange>>>) {
 		self.exchange = Some(exchange);
@@ -124,6 +129,10 @@ where
 	}
 
 	/// Run the driver until shutdown or write failure.
+	///
+	/// # Errors
+	///
+	/// - The first write or send-cipher install failure from the [`EnvelopeSink`].
 	pub async fn drive(mut self) -> TransportResult<()> {
 		loop {
 			match self.next_step().await {
@@ -148,9 +157,11 @@ where
 		Ok(())
 	}
 
-	/// Next unit of work. With a renewal in flight and a timer
-	/// available, the wait is bounded by the renewal deadline so a
-	/// peer that never answers cannot park the connection forever.
+	/// Wait for the next unit of work.
+	///
+	/// With a renewal in flight and a timer available, the renewal deadline
+	/// bounds the wait, so a peer that never answers cannot park the
+	/// connection forever.
 	async fn next_step(&mut self) -> WriterStep {
 		#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
 		if let Some(deadline) = self.renewal_deadline() {
@@ -163,10 +174,13 @@ where
 		poll_fn(|cx| self.poll_step(cx)).await
 	}
 
-	/// Queued commands first; once the queue is momentarily empty,
-	/// a held `RekeyAck` goes out if owed chunks have quiesced.
-	/// The ordering guarantees every data envelope enqueued before
-	/// the quiesce point precedes the ack on the wire.
+	/// Poll for the next unit of work in a fixed order:
+	///
+	/// 1. A queued command.
+	/// 2. When the queue is momentarily empty, a held `RekeyAck` whose owed chunks have quiesced.
+	///
+	/// The order guarantees that every data envelope enqueued before the
+	/// quiesce point precedes the ack on the wire.
 	fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<WriterStep> {
 		match Pin::new(&mut self.commands).poll_next(cx) {
 			Poll::Ready(Some(command)) => return Poll::Ready(WriterStep::Command(command)),
@@ -195,10 +209,11 @@ where
 		Some(started + self.renewal_deadline)
 	}
 
-	/// Write the key-switch marker and install the fresh send
-	/// cipher at the exact wire boundary. The server's `RekeyDone`
-	/// writes immediately, while the client's `RekeyAck` waits out owed
-	/// c2s chunks first.
+	/// Write the key-switch marker and install the fresh send cipher at the
+	/// exact wire boundary.
+	///
+	/// The server's `RekeyDone` writes immediately, while the client's
+	/// `RekeyAck` waits out owed c2s chunks first.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	async fn handle_install(&mut self, envelope: TransportEnvelope, cipher: Box<SendCipher>) -> TransportResult<()> {
 		if self.shared.role == MuxRole::Client {
@@ -210,9 +225,15 @@ where
 		self.writer.install_send_cipher(*cipher)
 	}
 
-	/// Owed chunks quiesced: the `RekeyAck` goes out and the send
-	/// direction switches to the fresh epoch cipher (counter reset
-	/// with the fresh key, NIST SP 800-38D § 8.2.1).
+	/// Write the held `RekeyAck` once owed chunks have quiesced, and switch the
+	/// send direction to the fresh epoch cipher.
+	///
+	/// The record counter resets together with the fresh key.
+	///
+	/// # Sources
+	///
+	/// - NIST SP 800-38D § 8.2.1, deterministic IV construction:
+	///   <https://csrc.nist.gov/publications/detail/sp/800-38d/final>
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	async fn write_pending_ack(&mut self) -> TransportResult<()> {
 		let Some((envelope, cipher)) = self.pending_ack.take() else {
@@ -226,8 +247,8 @@ where
 		Ok(())
 	}
 
-	/// Open a renewal if none is in flight (handle-side budget
-	/// trigger; the phase check deduplicates concurrent triggers).
+	/// Open a renewal on the handle-side budget trigger when none is in flight.
+	/// The phase check deduplicates concurrent triggers.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	async fn try_open_renewal(&mut self) -> TransportResult<()> {
 		let Some(exchange) = self.exchange.as_ref() else {
@@ -240,8 +261,8 @@ where
 		self.writer.write_envelope(request).await
 	}
 
-	/// Renewal deadline elapsed: drain via GoAway and wake parked
-	/// admissions/chunks so owed traffic can flush.
+	/// Drain with a GoAway after the renewal deadline elapses, and wake parked
+	/// admissions and chunks so owed traffic can flush.
 	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
 	async fn fail_renewal(&mut self) -> TransportResult<()> {
 		self.pending_ack = None;
@@ -257,15 +278,19 @@ where
 		Ok(())
 	}
 
-	/// [RFC 9846 § 5.5](https://datatracker.ietf.org/doc/html/rfc9846#section-5.5):
-	/// act before the send cipher reaches its record limit.
+	/// Act before the send cipher reaches its record limit.
 	///
-	/// A client with rekey materials opens an in-band renewal at a
-	/// headroom above the drain threshold ([`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]
-	/// records of slack for the exchange legs). Sessions without rekey
-	/// materials drain via GoAway while enough records remain to answer
-	/// in-flight peer streams and flush registered-but-unsent chunks, then
-	/// the caller reestablishes the session.
+	/// - A client with rekey materials opens an in-band renewal at a headroom
+	///   above the drain threshold, with [`DEFAULT_REKEY_RENEWAL_ALLOWANCE`]
+	///   records of slack for the exchange legs.
+	/// - A session without rekey materials drains via GoAway while enough
+	///   records remain to answer in-flight peer streams and flush
+	///   registered-but-unsent chunks. The caller then reestablishes the
+	///   session.
+	///
+	/// # Sources
+	///
+	/// - RFC 9846 § 5.5, AEAD limits: <https://datatracker.ietf.org/doc/html/rfc9846#section-5.5>
 	async fn enforce_rekey_limit(&mut self) -> TransportResult<()> {
 		let drain_floor = self.drain_headroom.saturating_add(self.shared.unsent_chunks());
 		let remaining = self.writer.remaining_records();
@@ -281,8 +306,7 @@ where
 			if remaining > drain_floor {
 				return Ok(());
 			}
-			if self.shared.rekey_phase() != RekeyPhase::Idle {
-				self.shared.park_hard_floor();
+			if self.shared.park_hard_floor() {
 				return Ok(());
 			}
 		}
@@ -291,7 +315,7 @@ where
 			return Ok(());
 		}
 
-		// Bypass the command queue: at the record ceiling the queue
+		// Bypass the command queue, because at the record ceiling the queue
 		// may already be full of owed stream traffic.
 		if let Some(package) = self.shared.goaway_package(GoAwayReason::Shutdown) {
 			let envelope = TransportEnvelope::from(package);
@@ -304,7 +328,8 @@ where
 
 impl MuxShared {
 	/// Halt the allocator and build the GoAway, once per connection.
-	/// `None` when shutdown already began.
+	///
+	/// Returns `None` when shutdown already began.
 	pub(crate) fn goaway_package(&self, reason: GoAwayReason) -> Option<GoAwayPackage> {
 		let last_peer = self.begin_shutdown()?;
 
@@ -314,6 +339,12 @@ impl MuxShared {
 		Some(GoAwayPackage::new(last_peer, reason))
 	}
 
+	/// Open a renewal exactly once and return its `RekeyRequest` envelope.
+	///
+	/// The readiness check and the phase transition happen while the exchange
+	/// is held, so concurrent triggers collapse to a single `RekeyRequest`. A
+	/// contended exchange means a renewal is already in progress, so opening
+	/// is moot and the call returns `None`.
 	pub(crate) fn open_renewal(
 		&self,
 		exchange: &FuturesMutex<Box<dyn ClientRekeyExchange>>,

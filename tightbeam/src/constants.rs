@@ -9,8 +9,7 @@
 //! - **Serving.** Accept-loop limits for the `server!` macro.
 //! - **Testing and verification.** Generator constants and seeds for
 //!   deterministic exploration and fault injection.
-//! - **Configuration.** Backpressure, mux, envelope, timeout, colony, gossip,
-//!   and peer discovery bounds.
+//! - **Configuration.** Backpressure, mux, envelope, timeout, colony, gossip, and peer discovery bounds.
 
 /// KDF info string for ECIES session key derivation (HKDF).
 pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
@@ -101,22 +100,56 @@ pub const AES_GCM_NONCE_SIZE: usize = 12;
 /// AES-GCM authentication tag size (128 bits).
 pub const AES_GCM_TAG_SIZE: usize = 16;
 
-/// AEAD record limit per directional key before a rekey is required (2^24).
-///
-/// AES-GCM is bounded near 2^24.5 records per key. This constant is the
-/// fail-closed volume floor used on both sides of the link.
-///
-/// - Senders fail closed with `RekeyRequired` at their configured limit.
-/// - Receipt-bearing mux sessions renew in band first.
-/// - Other sessions drain via GoAway.
-/// - Receivers refuse counters past this constant volume bound.
-/// - `with_rekey_limit` overrides the renewal and drain trigger. The
-///   receive-side refusal bound stays at this constant.
+/// Bytes in the full-size TLS record that the AES-GCM record analysis
+/// counts in (2^14, RFC 8446 § 5.1).
+const TLS_FULL_SIZE_RECORD_BYTES: u64 = 1 << 14;
+
+/// Full-size TLS records AES-GCM admits per key with its safety margin
+/// intact (2^24, RFC 9846 § 5.5).
+const AES_GCM_FULL_SIZE_RECORDS_PER_KEY: u64 = 1 << 24;
+
+/// AEAD records one directional key admits at an encrypted-envelope ceiling
+/// of `encrypted_envelope` bytes: the AES-GCM per-key byte volume of 2^24
+/// full-size TLS records, divided by the ceiling. A ceiling of zero counts
+/// as one byte.
 ///
 /// # Sources
 ///
 /// - RFC 9846 § 5.5, AEAD limits: <https://datatracker.ietf.org/doc/html/rfc9846#section-5.5>
-pub const DEFAULT_REKEY_RECORD_LIMIT: u64 = 1 << 24;
+pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
+	let envelope = if encrypted_envelope == 0 {
+		1
+	} else {
+		encrypted_envelope as u64
+	};
+
+	AES_GCM_FULL_SIZE_RECORDS_PER_KEY * TLS_FULL_SIZE_RECORD_BYTES / envelope
+}
+
+/// AEAD record limit per directional key before a rekey is required.
+///
+/// It is the record limit at [`DEFAULT_MAX_ENCRYPTED_ENVELOPE`]: 2^20
+/// records of up to 256 KiB, which keeps the per-key volume inside the
+/// AES-GCM bound. A session at a raised ceiling holds a lower limit. The
+/// limit keeps room for one renewal exchange up to a 2 GiB ceiling (128
+/// records) and loses it at 4 GiB (64 records).
+///
+/// # Enforcement
+///
+/// - Senders fail closed with `RekeyRequired` at their configured limit.
+/// - Receipt-bearing mux sessions renew in band first.
+/// - Other sessions drain via GoAway.
+/// - Receivers refuse counters past the volume bound at their own ceiling.
+/// - `with_rekey_limit` overrides the renewal and drain trigger. The
+///   receive-side refusal bound stays at the volume bound.
+///
+/// # Sources
+///
+/// - RFC 9846 § 5.5, AEAD limits: <https://datatracker.ietf.org/doc/html/rfc9846#section-5.5>
+pub const DEFAULT_REKEY_RECORD_LIMIT: u64 = rekey_record_limit(DEFAULT_MAX_ENCRYPTED_ENVELOPE);
+
+// The limit leaves room for the records one renewal exchange needs.
+const _: () = assert!(DEFAULT_REKEY_RECORD_LIMIT > DEFAULT_REKEY_MIN_SPEND_RECORDS + DEFAULT_REKEY_RENEWAL_ALLOWANCE);
 
 /// Slack above the mux drain headroom before an in-band renewal opens.
 ///
@@ -211,10 +244,8 @@ pub const LCG_INCREMENT: u64 = 1442695040888963407;
 ///
 /// # Sources
 ///
-/// - Sebastiano Vigna, `splitmix64.c` (2015, public domain):
-///   <https://xoshiro.di.unimi.it/splitmix64.c>
-/// - Steele, Lea & Flood, Java 8 `SplittableRandom` (OOPSLA 2014):
-///   <https://doi.org/10.1145/2714064.2660195>
+/// - Sebastiano Vigna, `splitmix64.c` (2015, public domain): <https://xoshiro.di.unimi.it/splitmix64.c>
+/// - Steele, Lea & Flood, Java 8 `SplittableRandom` (OOPSLA 2014): <https://doi.org/10.1145/2714064.2660195>
 pub const SPLITMIX64_GAMMA: u64 = 0x9E3779B97F4A7C15;
 
 /// SplitMix64 finalizer multiplier 1.
@@ -253,8 +284,7 @@ pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
 /// The scaling task needs a per-instance figure to average, so a servlet
 /// without self-reported or hive-tracked utilization counts as half loaded.
 ///
-/// - Half load leaves scale-up to a servlet that reports real load. A 100%
-///   figure would force a scale-up.
+/// - Half load leaves scale-up to a servlet that reports real load. A 100% figure would force a scale-up.
 /// - Half load surfaces on the averages of sibling servlets. A 0% figure would hide it.
 pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 
@@ -269,8 +299,7 @@ pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 ///
 /// # Sources
 ///
-/// - CWE-294, authentication bypass by capture-replay:
-///   <https://cwe.mitre.org/data/definitions/294.html>
+/// - CWE-294, authentication bypass by capture-replay: <https://cwe.mitre.org/data/definitions/294.html>
 pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
 
 /// Default per-connection budget of peer cancels that abort in-flight
@@ -379,6 +408,7 @@ pub const DEFAULT_MUX_STREAM_CREDIT: u64 = 64;
 /// - Capping budgets at half the per-key record limit therefore bounds
 ///   worst-case epoch data-record consumption under
 ///   [`DEFAULT_REKEY_RECORD_LIMIT`].
+/// - This holds at the default ceiling. At a raised one the record limit can fall below the budget.
 /// - The default batching grantor keeps control traffic at `O(data chunks /
 ///   window)` records, inside the remaining half.
 /// - The record limit itself stays the fail-closed backstop either way.
@@ -456,8 +486,7 @@ pub const DEFAULT_HANDSHAKE_MAX_WIRE: usize = 16 * 1024;
 ///
 /// # Sources
 ///
-/// - CWE-409, improper handling of highly compressed data:
-///   <https://cwe.mitre.org/data/definitions/409.html>
+/// - CWE-409, improper handling of highly compressed data: <https://cwe.mitre.org/data/definitions/409.html>
 pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 
 /// Hard ceiling on unary mux reassembly buffer bytes per stream.
@@ -557,8 +586,7 @@ pub const MAX_RELAY_ROUTES: usize = 1024;
 ///   asserts its own reachability alone and a crafted large value clamps to the
 ///   same ceiling.
 /// - A relayed hop carries the explicit value, which every later gateway clamps again.
-/// - The sentinel is also the DER DEFAULT, so the common origin request omits
-///   the field from its encoding.
+/// - The sentinel is also the DER DEFAULT, so the common origin request omits the field from its encoding.
 ///
 /// # Sources
 ///

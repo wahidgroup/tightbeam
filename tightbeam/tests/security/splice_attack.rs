@@ -9,7 +9,7 @@
 //!
 //! ## Attack
 //! 1. A MITM captures a victim's `ClientKeyExchange` (certificate and signature).
-//! 2. The MITM encrypts `[attacker_key || victim_client_random]` to the server's public key.
+//! 2. The MITM encrypts a payload of `attacker_key` and `victim_client_random` to the server's public key.
 //! 3. The MITM splices its `encrypted_data` into the victim's message, keeping
 //!    the victim's certificate and signature intact.
 //! 4. A transcript-only signature still verifies: the server would attribute an
@@ -131,6 +131,11 @@ job! {
 		)
 		.with_supported_profiles(vec![profile]);
 
+		// The victim's certificate is public, so the attacker can seal its
+		// splice under the same associated data the victim used.
+		let victim_certificate = Some(client_materials.certificate.as_ref());
+		let spliced_aad = ClientKeyExchange::client_bound_aad(crate::security::common::HANDSHAKE_AAD, victim_certificate)?;
+
 		let client_hello = client.build_client_hello()?.to_der()?;
 		let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
 		let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
@@ -142,7 +147,7 @@ job! {
 		let victim_plain = tightbeam::crypto::ecies::decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(
 			materials.secret_key(),
 			&victim_message,
-			Some(crate::security::common::HANDSHAKE_AAD),
+			Some(spliced_aad.as_slice()),
 		)?
 		.to_insecure();
 
@@ -160,7 +165,7 @@ job! {
 		let forged_message = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
 			&recipient_pub,
 			&forged_plain,
-			Some(crate::security::common::HANDSHAKE_AAD),
+			Some(spliced_aad.as_slice()),
 			Some(&mut OsRng),
 		)?;
 

@@ -1,13 +1,16 @@
 //! Multi-input key derivation functions for hybrid key agreement.
 //!
-//! Provides composable KDF primitives for protocols that combine multiple
-//! shared secrets (e.g., ECDH + KEM in PQXDH).
+//! The module provides composable KDF primitives for protocols that combine
+//! several shared secrets, for example ECDH with a KEM in PQXDH.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+
+use core::fmt;
+use core::mem::size_of;
 
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::CryptoProvider;
@@ -30,7 +33,7 @@ use crate::ZeroizingBytes;
 pub struct KdfSalt<'a>(&'a [u8]);
 
 impl<'a> KdfSalt<'a> {
-	/// The salt for one derivation.
+	/// Wraps `salt` as the salt for one derivation.
 	pub fn new(salt: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
 		Self(salt.as_ref())
 	}
@@ -57,7 +60,7 @@ impl<'a> KdfSalt<'a> {
 pub struct KdfInfo<'a>(&'a [u8]);
 
 impl<'a> KdfInfo<'a> {
-	/// The label for one derivation.
+	/// Wraps `info` as the label for one derivation.
 	pub fn new(info: &'a (impl AsRef<[u8]> + ?Sized)) -> Self {
 		Self(info.as_ref())
 	}
@@ -73,7 +76,7 @@ impl<'a> KdfInfo<'a> {
 ///
 /// The pair travels as a named struct so a stage list cannot silently swap
 /// the two byte slices it holds.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct KdfStage<'a> {
 	/// Input key material this stage extracts from.
 	pub input: &'a [u8],
@@ -81,25 +84,35 @@ pub struct KdfStage<'a> {
 	pub info: KdfInfo<'a>,
 }
 
-/// Multi-input HKDF: length-prefixed concatenation of secrets, then provider
-/// KDF.
+// The `input` is key material, so `Debug` prints its length and the public
+// label only (CWE-532).
+impl fmt::Debug for KdfStage<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("KdfStage")
+			.field("input_len", &self.input.len())
+			.field("info", &self.info)
+			.finish()
+	}
+}
+
+/// Multi-input HKDF: the provider KDF over the length-prefixed concatenation
+/// of the secrets.
 ///
-/// Each input is prefixed with its length as big-endian `u32`, preventing
-/// concatenation ambiguity (e.g. "ab"+"cd" vs "abc"+"d").
+/// Each input is prefixed with its length as a big-endian `u32`, so a
+/// concatenation is unambiguous (for example "ab"+"cd" against "abc"+"d").
+///
+/// # Errors
+///
+/// - [`HandshakeError::IntegerOutOfRange`] -- an input exceeds `u32::MAX`
+///   bytes, or the sum passes the `isize::MAX` bytes a `Vec` can hold.
+/// - [`HandshakeError::KdfError`] -- the KDF refused `key_size`.
 pub fn multi_input_kdf<P: CryptoProvider>(
 	inputs: &[&[u8]],
 	salt: KdfSalt<'_>,
 	info: KdfInfo<'_>,
 	key_size: usize,
 ) -> Result<ZeroizingBytes, HandshakeError> {
-	// Concatenate all inputs with length prefixes. The buffer holds secret
-	// material, so it is zeroized on drop.
-	let mut combined = Zeroizing::new(Vec::new());
-	for input in inputs {
-		let len = u32::try_from(input.len()).map_err(|_| HandshakeError::IntegerOutOfRange)?;
-		combined.extend_from_slice(&len.to_be_bytes());
-		combined.extend_from_slice(input);
-	}
+	let combined = length_prefixed_inputs(inputs)?;
 
 	Ok(P::Kdf::derive_dynamic_key(
 		&combined,
@@ -109,8 +122,47 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 	)?)
 }
 
+/// Concatenates the inputs, each behind its length prefix, into one wiping
+/// buffer.
+///
+/// [`multi_input_kdf`] states the framing. The buffer holds secret material
+/// and is reserved at its final length before the first byte lands, so it is
+/// allocated once and a reallocation cannot free an unwiped copy on the way
+/// (CWE-226).
+///
+/// # Errors
+///
+/// - [`HandshakeError::IntegerOutOfRange`] -- an input exceeds `u32::MAX`
+///   bytes, or the sum passes the `isize::MAX` bytes a `Vec` can hold.
+fn length_prefixed_inputs(inputs: &[&[u8]]) -> Result<Zeroizing<Vec<u8>>, HandshakeError> {
+	let prefix = size_of::<u32>();
+	let capacity = isize::MAX.unsigned_abs();
+	let total = inputs.iter().try_fold(0usize, |total, input| {
+		let len = u32::try_from(input.len()).map_err(|_| HandshakeError::IntegerOutOfRange)?;
+		let framed = prefix.checked_add(len as usize).and_then(|framed| total.checked_add(framed));
+		let bounded = framed.filter(|total| *total <= capacity);
+		bounded.ok_or(HandshakeError::IntegerOutOfRange)
+	})?;
+
+	let mut combined = Zeroizing::new(Vec::with_capacity(total));
+	for input in inputs {
+		// The fold proved each length fits a `u32`, so the cast is lossless.
+		let len = input.len() as u32;
+		combined.extend_from_slice(&len.to_be_bytes());
+		combined.extend_from_slice(input);
+	}
+
+	Ok(combined)
+}
+
 /// Chained KDF: each stage's output becomes the next stage's salt
 /// (PQXDH-style).
+///
+/// Each stage derives 32 bytes, and an empty stage list yields an empty key.
+///
+/// # Errors
+///
+/// - [`HandshakeError::KdfError`] -- the KDF refused a stage.
 pub fn kdf_chain<P: CryptoProvider>(
 	stages: &[KdfStage<'_>],
 	initial_salt: KdfSalt<'_>,
@@ -186,8 +238,35 @@ mod tests {
 		let salt = [0xAAu8; 32];
 
 		let only = KdfStage { input: &input, info: KdfInfo::new(b"single") };
-
 		let result = kdf_chain::<DefaultCryptoProvider>(&[only], KdfSalt::new(&salt));
 		assert!(result.is_ok());
+	}
+
+	/// The combined buffer is allocated once at its final length, so no
+	/// reallocation frees an unwiped copy of the inputs (CWE-226). A buffer
+	/// grown by `extend_from_slice` from an empty `Vec` would over-allocate to
+	/// the next power of two, so its capacity would exceed its length.
+	#[test]
+	fn the_combined_kdf_buffer_is_allocated_once() -> Result<(), Box<dyn core::error::Error>> {
+		let first = [0u8; 10];
+		let second = [0u8; 20];
+
+		let combined = length_prefixed_inputs(&[&first, &second])?;
+		assert_eq!(combined.len(), 38);
+		assert_eq!(combined.capacity(), combined.len());
+		Ok(())
+	}
+
+	/// The `Debug` of a KDF stage prints its input length in place of the
+	/// input key material (CWE-532).
+	#[test]
+	fn kdf_stage_debug_omits_the_input_bytes() {
+		let input = [0xABu8; 32];
+		let stage = KdfStage { input: &input, info: KdfInfo::new(b"stage") };
+
+		let rendered = format!("{stage:?}");
+		assert!(!rendered.contains("171"));
+		assert!(rendered.contains("input_len"));
+		assert!(rendered.contains("32"));
 	}
 }

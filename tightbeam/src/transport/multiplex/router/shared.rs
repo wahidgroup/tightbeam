@@ -31,6 +31,7 @@ use crate::instrumentation::events;
 #[cfg(feature = "instrument")]
 use crate::trace::TraceCollector;
 
+/// Wake every parked waker and empty the set.
 fn wake_all(wakers: &mut Vec<Waker>) {
 	for waker in wakers.drain(..) {
 		waker.wake();
@@ -100,7 +101,8 @@ pub struct StreamReservation {
 }
 
 impl StreamReservation {
-	/// Handle to the stream's late-assigned identity (refcount bump).
+	/// Clone a handle to the stream's late-assigned identity. The clone bumps a
+	/// refcount.
 	pub fn slot(&self) -> Arc<OpenSlot> {
 		Arc::clone(&self.slot)
 	}
@@ -222,6 +224,7 @@ pub enum BudgetStanding {
 	Exhausting,
 }
 
+/// Mutable connection state behind the [`MuxShared`] lock.
 struct MuxState {
 	/// Next locally-initiated stream ID, or `None` once the ID space is
 	/// exhausted. IDs are strictly monotonic over the nonzero values.
@@ -275,10 +278,12 @@ struct MuxState {
 }
 
 impl MuxState {
+	/// Wake every task parked until the pending table drains.
 	fn wake_drain_waiters(&mut self) {
 		wake_all(&mut self.drain_wakers);
 	}
 
+	/// Wake every task parked until a stream slot frees.
 	fn wake_slot_waiters(&mut self) {
 		wake_all(&mut self.slot_wakers);
 	}
@@ -308,8 +313,8 @@ impl MuxState {
 		self.next_stream_id
 	}
 
-	/// Cap-relevant open-stream count: streams awaiting their
-	/// response plus reservations that have not opened yet.
+	/// Count the cap-relevant open streams, which are the streams awaiting
+	/// their response plus the reservations that have not opened yet.
 	fn open_load(&self) -> usize {
 		self.pending.len().saturating_add(self.reserved)
 	}
@@ -404,6 +409,7 @@ impl MuxShared {
 		}
 	}
 
+	/// Lock the connection state, recovering the guard from a poisoned lock.
 	fn lock(&self) -> MutexGuard<'_, MuxState> {
 		self.state.lock().unwrap_or_else(PoisonError::into_inner)
 	}
@@ -432,6 +438,8 @@ impl MuxShared {
 		DrainPending { shared: Arc::clone(self) }
 	}
 
+	/// Lock the duplex reply registry, recovering the guard from a poisoned
+	/// lock.
 	fn duplex_lock(&self) -> MutexGuard<'_, HashMap<u32, ForwardedStream>> {
 		self.duplex_recv.lock().unwrap_or_else(PoisonError::into_inner)
 	}
@@ -611,6 +619,12 @@ impl MuxShared {
 	/// Chunks also park on the rekey hard floor, because send records at the
 	/// drain headroom with a renewal in flight are reserved for control and the
 	/// exchange legs.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with [`TransportFailure::Cancelled`] -- the
+	///   stream's ledger is gone.
+	/// - [`TransportError::ConnectionClosed`] -- the envelope slot is empty or the writer queue closed.
 	pub fn poll_send_enqueue(
 		&self,
 		stream_id: u32,
@@ -709,6 +723,11 @@ impl MuxShared {
 	/// epoch. Budgets reset at `RekeyDone`, and a debit issued mid-renewal
 	/// could otherwise straddle the boundary. A draining connection skips the
 	/// park, because the renewal is dead and owed traffic must flush.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::OperationFailed`] with [`TransportFailure::BudgetExhausted`] -- the
+	///   budget cannot carry `credits`.
 	pub fn poll_admit_debit(
 		&self,
 		credits: u64,
@@ -726,6 +745,10 @@ impl MuxShared {
 	}
 
 	/// Debit the outbound budget, waiting out any in-flight renewal.
+	///
+	/// # Errors
+	///
+	/// The [`poll_admit_debit`](Self::poll_admit_debit) set.
 	pub async fn admit_debit(&self, credits: u64, reserved: bool) -> TransportResult<BudgetStanding> {
 		poll_fn(|cx| self.poll_admit_debit(credits, reserved, cx)).await
 	}
@@ -735,8 +758,8 @@ impl MuxShared {
 		self.lock().unsent_chunks
 	}
 
-	/// The current renewal phase.
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	/// The current renewal phase, read by the writer's renewal deadline.
+	#[cfg(all(feature = "tokio", any(feature = "transport-cms", feature = "transport-ecies")))]
 	pub fn rekey_phase(&self) -> RekeyPhase {
 		self.lock().rekey
 	}
@@ -872,9 +895,23 @@ impl MuxShared {
 	/// Park data chunks, because send records are down to the drain headroom
 	/// while a renewal is in flight, and what remains is reserved for control
 	/// and the exchange legs.
+	///
+	/// # Phase check
+	///
+	/// The phase check and the park are one step under the lock. Only a
+	/// renewal in flight can lift the floor, so a floor set after the reader
+	/// closed the renewal would park data until the connection died. With the
+	/// phase `Idle` this writes nothing and returns `false`, and the caller
+	/// falls through to the drain decision.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub fn park_hard_floor(&self) {
-		self.lock().rekey_hard_floor = true;
+	pub fn park_hard_floor(&self) -> bool {
+		let mut state = self.lock();
+		if state.rekey == RekeyPhase::Idle {
+			return false;
+		}
+
+		state.rekey_hard_floor = true;
+		true
 	}
 
 	/// Restore the outbound budget to the negotiated terms at the `RekeyDone`
@@ -957,6 +994,12 @@ impl MuxShared {
 	/// [`Self::poll_open_enqueue`]), so it always matches the send order.
 	/// Admission (draining, cap, ID space) is checked here, at the
 	/// caller-visible initiation point.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::Draining`] -- a GoAway ended admission, or the ID space is exhausted.
+	/// - [`TransportError::OperationFailed`] with [`TransportFailure::StreamsExhausted`] -- the
+	///   open load is at the local cap.
 	pub fn reserve_stream_slot(
 		self: &Arc<Self>,
 		sender: oneshot::Sender<StreamOutcome>,
@@ -999,6 +1042,13 @@ impl MuxShared {
 	/// the ID is consumed, so a `Pending` leaves the ID and the queue slot
 	/// free. The fresh ledger's initial credit is at least one, so the Open's
 	/// own credit debit proceeds straight after assignment.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::Draining`] -- admission ended after the reservation.
+	/// - [`TransportError::InvalidState`] -- the reservation already opened.
+	/// - [`TransportError::DerError`] -- the Open record does not encode.
+	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
 	pub fn poll_open_enqueue(
 		&self,
 		reservation: &mut StreamReservation,
@@ -1087,6 +1137,10 @@ impl MuxShared {
 	/// The ping is refused while draining, because a peer that honors the
 	/// GoAway contract reserves its remaining records for owed stream traffic
 	/// (see [`MuxSettings::drain_reserve_records`]).
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::Draining`] -- a GoAway went out or came in.
 	pub fn allocate_ping(&self, sender: oneshot::Sender<()>) -> TransportResult<u64> {
 		let mut state = self.lock();
 		if state.is_draining() {
@@ -1196,6 +1250,10 @@ impl MuxShared {
 	/// - The ID is nonzero.
 	/// - The ID is strictly greater than every earlier peer-initiated ID.
 	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidMessage`] -- the ID breaks one of the rules above.
+	///
 	/// [rfc9113-5.1.1]: https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1
 	pub fn register_peer_stream(&self, stream_id: u32) -> TransportResult<PeerStream> {
 		let mut state = self.lock();
@@ -1223,10 +1281,10 @@ impl MuxShared {
 	/// direction, a live ID space, and an open load under the cap.
 	pub fn has_stream_headroom(&self) -> bool {
 		let state = self.lock();
+
 		let under_cap = state.open_load() < cap_as_usize(self.local_cap);
 		let id_space_live = state.next_stream_id.is_some();
 		let no_goaway = state.goaway_sent.is_none() && state.goaway_received.is_none();
-
 		no_goaway && id_space_live && under_cap
 	}
 
@@ -1246,8 +1304,11 @@ impl MuxShared {
 		self.lock().goaway_reason
 	}
 
-	/// Resolve once a locally-initiated stream would be admitted, or fail
-	/// with `Draining` once admission has ended for good.
+	/// Resolve once a locally-initiated stream would be admitted.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::Draining`] -- admission has ended for good.
 	pub fn poll_stream_slot(&self, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
 		let mut state = self.lock();
 		if state.admissible_stream_id().is_none() {
@@ -1318,7 +1379,7 @@ impl CancelReason {
 mod tests {
 	use super::super::body::StreamBody;
 	use super::super::link::MuxLink;
-	use super::super::testing::noop_cx;
+	use super::super::testing::{noop_cx, FlagWake};
 	use super::*;
 
 	use crate::constants::DEFAULT_HOP_BUDGET;
@@ -1482,31 +1543,6 @@ mod tests {
 			(CancelReason::Application(0x1000), TransportFailure::Cancelled),
 		] {
 			assert_cancel_maps(reason, failure);
-		}
-	}
-
-	/// Waker that records delivery, for slot-waiter wake assertions.
-	#[derive(Default)]
-	struct FlagWake {
-		woken: core::sync::atomic::AtomicBool,
-	}
-
-	impl FlagWake {
-		fn pair() -> (Arc<Self>, Waker) {
-			let flag = Arc::new(Self::default());
-			let waker = futures::task::waker(Arc::clone(&flag));
-
-			(flag, waker)
-		}
-
-		fn woken(&self) -> bool {
-			self.woken.load(core::sync::atomic::Ordering::SeqCst)
-		}
-	}
-
-	impl futures::task::ArcWake for FlagWake {
-		fn wake_by_ref(arc_self: &Arc<Self>) {
-			arc_self.woken.store(true, core::sync::atomic::Ordering::SeqCst);
 		}
 	}
 
@@ -2016,7 +2052,7 @@ mod tests {
 		let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
 		shared.register_send_stream(1, 1);
 		begin_client_renewal(&shared);
-		shared.park_hard_floor();
+		assert!(shared.park_hard_floor());
 
 		let (mut outbound, _outbound_rx) = mpsc::channel(4);
 		let ping = MuxPingPackage::new(false, 0);
@@ -2033,6 +2069,31 @@ mod tests {
 		assert!(flag.woken());
 
 		let mut cx = noop_cx();
+		let enqueued = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut cx);
+		assert!(matches!(enqueued, Poll::Ready(Ok(()))));
+	}
+
+	/// The writer observes a renewal in flight, then parks the floor, and the
+	/// reader can close that renewal between the two steps. Only a phase
+	/// change lifts a parked floor, so the park decides under the phase lock:
+	/// with the renewal gone it writes nothing and chunks keep flowing.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[test]
+	fn test_park_hard_floor_refuses_once_the_renewal_closed() {
+		let shared = shared_with_settings(MuxRole::Client, metered_settings(2, None));
+		shared.register_send_stream(1, 1);
+		begin_client_renewal(&shared);
+
+		// The reader abandons the renewal after the writer saw it in flight.
+		shared.finish_renewal();
+
+		assert!(!shared.park_hard_floor());
+
+		let (mut outbound, _outbound_rx) = mpsc::channel(4);
+		let ping = MuxPingPackage::new(false, 0);
+		let mut slot = Some(TransportEnvelope::from(ping));
+		let mut cx = noop_cx();
+
 		let enqueued = shared.poll_send_enqueue(1, &mut outbound, &mut slot, &mut cx);
 		assert!(matches!(enqueued, Poll::Ready(Ok(()))));
 	}
@@ -2070,7 +2131,7 @@ mod tests {
 	#[test]
 	fn test_fail_duplex_above_fails_disowned_replies() {
 		let shared = shared(MuxRole::Client, 4);
-		let (feedback, _notes) = mpsc::unbounded();
+		let (feedback, _notes) = mpsc::channel(0);
 		let (mut kept, below) = StreamBody::pair(OpenSlot::assigned(1), 4, feedback.clone());
 		let (mut disowned, above) = StreamBody::pair(OpenSlot::assigned(3), 4, feedback);
 

@@ -45,8 +45,7 @@ use crate::transport::handshake::{EpochMaterials, EstablishedSession};
 ///
 /// # Sources
 ///
-/// - CWE-311, missing encryption of sensitive data:
-///   <https://cwe.mitre.org/data/definitions/311.html>
+/// - CWE-311, missing encryption of sensitive data: <https://cwe.mitre.org/data/definitions/311.html>
 #[cfg(feature = "x509")]
 pub enum SessionPhase {
 	/// The endpoint carries no encryption provisioning and named cleartext,
@@ -99,7 +98,7 @@ impl SessionPhase {
 	const fn admits(&self, event: &SessionEvent) -> bool {
 		matches!(
 			(self, event),
-			// The handshake, which may take several rounds.
+			// The handshake, which may take more than one round.
 			(Self::Provisioned | Self::Handshaking { .. }, SessionEvent::BeginHandshake(_))
 				| (Self::Handshaking { .. }, SessionEvent::Install(_))
 				// The circuit breaker, from wherever the session got to.
@@ -212,7 +211,8 @@ impl<P: CryptoProvider> SessionState<P> {
 		true
 	}
 
-	/// Record a handshake round at `now`.
+	/// Record a handshake round at `now`, and report whether the phase table
+	/// admitted it.
 	///
 	/// The first round starts the deadline. A later round keeps the instant
 	/// the first one recorded, so a slow peer cannot stretch the handshake by
@@ -222,13 +222,17 @@ impl<P: CryptoProvider> SessionState<P> {
 		self.apply(SessionEvent::BeginHandshake(now))
 	}
 
-	/// Install everything a completed handshake agreed.
+	/// Install everything a completed handshake agreed, with both session
+	/// ciphers bounded by `encrypted_envelope`, this endpoint's
+	/// encrypted-envelope ceiling (RFC 9846 § 5.5).
 	///
 	/// The terms enter the phase together, so a session that reports itself
-	/// encrypted always carries the terms it runs under.
+	/// encrypted always carries the terms it runs under and a per-key volume
+	/// inside the AES-GCM bound at that ceiling.
 	#[must_use]
-	pub fn install_session(&mut self, session: EstablishedSession) -> bool {
-		self.apply(SessionEvent::Install(Box::new(session)))
+	pub fn install_session(&mut self, session: EstablishedSession, encrypted_envelope: usize) -> bool {
+		let bounded = session.with_envelope_ceiling(encrypted_envelope);
+		self.apply(SessionEvent::Install(Box::new(bounded)))
 	}
 
 	/// Drop any session and return to the phase this endpoint's provisioning
@@ -337,8 +341,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	///
 	/// # Errors
 	///
-	/// - [`TransportFailure::EncryptorUnavailable`] -- no handshake has
-	///   installed keys on this session yet.
+	/// - [`TransportFailure::EncryptorUnavailable`] -- no handshake has installed keys on this session yet.
 	pub fn encryptor(&self) -> TransportResult<&SendCipher> {
 		let session = self
 			.established()
@@ -350,8 +353,7 @@ impl<P: CryptoProvider> SessionState<P> {
 	///
 	/// # Errors
 	///
-	/// - [`TransportFailure::EncryptorUnavailable`] -- no handshake has
-	///   installed keys on this session yet.
+	/// - [`TransportFailure::EncryptorUnavailable`] -- no handshake has installed keys on this session yet.
 	pub fn decryptor(&self) -> TransportResult<&RecvCipher> {
 		let session = self
 			.established()
@@ -417,8 +419,7 @@ impl<C: CryptoProvider> ClientIdentity<C> {
 	///
 	/// # Errors
 	///
-	/// - [`SerializationError`] -- `certificate` holds PEM or DER that does not
-	///   decode as a certificate.
+	/// - [`SerializationError`] -- `certificate` holds PEM or DER that does not decode as a certificate.
 	///
 	/// [`SerializationError`]: crate::TightBeamError::SerializationError
 	pub fn from_spec(
@@ -551,10 +552,9 @@ impl<P: CryptoProvider> EncryptionConfig<P> {
 	/// A client certificate proves who this endpoint is, so it answers a
 	/// different question and is absent here.
 	pub fn is_provisioned(&self) -> bool {
-		// The binding destructures without `..`, so a field added to this
-		// configuration stops compiling here until someone says whether it
-		// implies a handshake. Without that break, a new kind of encryption
-		// material would silently leave the endpoint in `Cleartext` (CWE-311).
+		// Naming every field without `..` breaks the build on a new field until
+		// someone says whether it implies a handshake, so no new key material
+		// silently leaves the endpoint in `Cleartext` (CWE-311).
 		let Self {
 			server_certificate,
 			trust_store,
@@ -661,7 +661,7 @@ impl<P: CryptoProvider> DialableEncryption<P> {
 		Ok(Self(encryption))
 	}
 
-	/// Cleartext as a named choice: no peer authority and no encryption.
+	/// Name cleartext as a choice, with no peer authority and no encryption.
 	///
 	/// Frames travel with no confidentiality, integrity, or peer
 	/// authentication, which suits a loopback fixture or a link a lower layer
@@ -753,6 +753,22 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 		}
 	}
 
+	/// Install the session a completed handshake agreed under this endpoint's
+	/// encrypted-envelope ceiling ([`SessionState::install_session`]).
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`] -- the phase refused the install.
+	#[cfg(feature = "aead")]
+	fn install_established(&mut self, session: EstablishedSession) -> TransportResult<()> {
+		let encrypted_envelope = self.limits().encrypted_envelope;
+		if !self.session_state_mut().install_session(session, encrypted_envelope) {
+			return Err(TransportError::InvalidState);
+		}
+
+		Ok(())
+	}
+
 	/// What this endpoint was provisioned with.
 	fn encryption(&self) -> &EncryptionConfig<Self::CryptoProvider> {
 		self.session_state().encryption()
@@ -776,6 +792,7 @@ pub trait EncryptedProtocolState: sealed::Sealed {
 #[cfg(all(test, feature = "x509", feature = "aead"))]
 mod tests {
 	use super::*;
+	use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 	use crate::crypto::aead::SessionKeys;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
@@ -978,50 +995,70 @@ mod tests {
 	/// table refuses the move and the session survives it.
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	#[test]
-	fn the_phase_table_refuses_restarting_a_handshake_on_a_live_session() {
+	fn the_phase_table_refuses_restarting_a_handshake_on_a_live_session() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
-		assert!(probe.session_state_mut().install_session(established_session()));
+		probe.install_established(established_session())?;
 
 		let now = ManualClock::default().monotonic();
 		assert!(!probe.session_state_mut().begin_handshake(now));
 		assert!(probe.session_state().peer_certificate().is_some());
+		Ok(())
 	}
 
 	/// An established session admits nothing cleartext, so an injected
 	/// handshake container cannot draw a cleartext reply out of it (CWE-319).
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	#[test]
-	fn an_established_session_reads_only_encrypted() {
+	fn an_established_session_reads_only_encrypted() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
-		assert!(probe.session_state_mut().install_session(established_session()));
+		probe.install_established(established_session())?;
 		assert!(probe.session_state().phase().requires_encryption());
+		Ok(())
 	}
 
 	/// A completed handshake and the terms it agreed enter the phase together.
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	#[test]
-	fn installing_a_session_lands_every_term_it_agreed() {
+	fn installing_a_session_lands_every_term_it_agreed() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
-		assert!(probe.session_state_mut().install_session(established_session()));
+		probe.install_established(established_session())?;
 
-		let SessionPhase::Encrypted(session) = probe.session_state().phase() else {
-			panic!("installing a session must leave the phase encrypted");
-		};
+		let session = probe.session_state().established().ok_or(TransportError::InvalidState)?;
 		assert!(session.peer().is_some());
 		assert!(probe.session_state().peer_certificate().is_some());
+		Ok(())
+	}
+
+	/// An installed session's send cipher takes this endpoint's
+	/// encrypted-envelope ceiling, so a doubled ceiling halves the send record
+	/// limit (RFC 9846 § 5.5). The receive cipher keeps the fixed bound,
+	/// because the sender's envelopes set the volume a key sees.
+	#[cfg(all(feature = "testing", feature = "secp256k1"))]
+	#[test]
+	fn installing_a_session_bounds_its_send_cipher_by_the_envelope_ceiling() -> TransportResult<()> {
+		let mut probe = PhaseProbe::provisioned(handshaking());
+		probe.limits.encrypted_envelope = 2 * DEFAULT_MAX_ENCRYPTED_ENVELOPE;
+		probe.install_established(established_session())?;
+
+		let send_limit = probe.session_state().encryptor()?.rekey_limit();
+		let recv_limit = probe.session_state().decryptor()?.rekey_limit();
+		assert_eq!(send_limit, DEFAULT_REKEY_RECORD_LIMIT / 2);
+		assert_eq!(recv_limit, DEFAULT_REKEY_RECORD_LIMIT);
+		Ok(())
 	}
 
 	/// The circuit breaker drops the session whole. A previous session's peer
 	/// identity must not stay readable, because authorization reads it.
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	#[test]
-	fn a_reset_drops_the_peer_the_dead_session_established() {
+	fn a_reset_drops_the_peer_the_dead_session_established() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
-		assert!(probe.session_state_mut().install_session(established_session()));
+		probe.install_established(established_session())?;
 		assert!(probe.session_state().peer_certificate().is_some());
 
 		probe.session_state_mut().reset();
 		assert!(probe.session_state().peer_certificate().is_none());
+		Ok(())
 	}
 
 	/// Splitting takes the keys out, and the state left behind holds none.
@@ -1031,12 +1068,13 @@ mod tests {
 		any(feature = "tokio", feature = "async-transport")
 	))]
 	#[test]
-	fn taking_the_established_session_returns_the_state_to_its_start() {
+	fn taking_the_established_session_returns_the_state_to_its_start() -> TransportResult<()> {
 		let mut probe = PhaseProbe::provisioned(handshaking());
-		assert!(probe.session_state_mut().install_session(established_session()));
+		probe.install_established(established_session())?;
 		assert!(probe.session_state_mut().take_established().is_some());
 		assert!(matches!(probe.session_state().phase(), SessionPhase::Provisioned));
 		assert!(probe.session_state_mut().take_established().is_none());
+		Ok(())
 	}
 
 	/// A completed session carrying a peer identity, which authorization reads.

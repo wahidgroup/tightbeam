@@ -52,15 +52,16 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	FieldBytesSize<P::Curve>: ModulusSize,
 {
-	/// Create a new EnvelopedData builder with the given KARI builder.
+	/// Creates an EnvelopedData builder around `kari_builder`.
 	///
 	/// Configure the KARI builder fully before passing it here, including any
-	/// custom KDF info through `with_kdf_info()` for interoperability.
+	/// custom KDF info through [`TightBeamKariBuilder::with_kdf_info`] for
+	/// interoperability.
 	pub fn new(kari_builder: TightBeamKariBuilder<P>) -> Self {
 		Self { kari_builder: Some(kari_builder), unprotected_attrs: Vec::new() }
 	}
 
-	/// Add an unprotected attribute to the EnvelopedData.
+	/// Adds an unprotected attribute to the EnvelopedData.
 	///
 	/// The EnvelopedData carries these attributes without encryption or
 	/// authentication.
@@ -69,7 +70,7 @@ where
 		self
 	}
 
-	/// Add multiple unprotected attributes.
+	/// Adds each attribute in `attrs` as an unprotected attribute.
 	pub fn with_unprotected_attrs(mut self, attrs: impl IntoIterator<Item = HandshakeAttribute>) -> Self {
 		let attrs: Vec<HandshakeAttribute> = attrs.into_iter().collect();
 		self.unprotected_attrs.extend(attrs);
@@ -95,15 +96,11 @@ where
 			return Ok(None);
 		}
 
-		// Sort attributes for canonical DER encoding
+		// A canonical DER SET OF encoding needs its members in sorted order.
 		self.unprotected_attrs.sort();
 
-		// Take ownership and convert each attribute to an X.509 `Attribute`.
 		let attrs = core::mem::take(&mut self.unprotected_attrs);
-		let x509_attrs: Result<Vec<_>, der::Error> = attrs
-			.into_iter()
-			.map(|attr| Ok(Attribute { oid: attr.attr_type, values: SetOfVec::try_from(attr.attr_values)? }))
-			.collect();
+		let x509_attrs: Result<Vec<Attribute>, HandshakeError> = attrs.into_iter().map(Attribute::try_from).collect();
 
 		Ok(Some(SetOfVec::try_from(x509_attrs?)?))
 	}
@@ -112,7 +109,7 @@ where
 		Ok(RecipientInfos::try_from(vec![recipient_info])?)
 	}
 
-	/// A content nonce sized to the negotiated AEAD cipher.
+	/// Returns a content nonce sized to the negotiated AEAD cipher.
 	///
 	/// # Errors
 	///
@@ -123,7 +120,7 @@ where
 		Ok(nonce_bytes)
 	}
 
-	/// A random CEK sized to the negotiated AEAD cipher key length.
+	/// Returns a random CEK sized to the negotiated AEAD cipher key length.
 	///
 	/// # Errors
 	///
@@ -150,14 +147,12 @@ where
 		Ok(cipher.encrypt_content(plaintext, nonce, Some(DATA))?)
 	}
 
-	/// Build the complete EnvelopedData structure.
+	/// Builds the complete EnvelopedData structure.
 	///
 	/// # Parameters
 	///
 	/// - `plaintext`: the content to encrypt.
-	/// - `aad`: optional additional authenticated data for the AEAD cipher,
-	///   which the build ignores.
-	/// - `rng`: an optional random number generator.
+	/// - `rng`: the random source for the CEK and the nonce. `None` uses [`OsRng`].
 	///
 	/// # Returns
 	///
@@ -167,10 +162,17 @@ where
 	/// - the encrypted content,
 	/// - the content encryption algorithm identifier, and
 	/// - optional unprotected attributes.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::KariBuilderConsumed`] -- the KARI builder is gone.
+	/// - [`HandshakeError::RandomGenerationFailed`] -- the random source failed.
+	/// - [`HandshakeError::CmsBuilderError`] -- the KARI builder failed to wrap the CEK.
+	/// - [`HandshakeError::InvalidKeySize`] -- the CEK does not fit the cipher.
+	/// - [`HandshakeError::DerError`] -- an attribute set or the recipient set fails to encode.
 	pub fn build(
 		mut self,
 		plaintext: impl AsRef<[u8]>,
-		_aad: Option<&[u8]>,
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<EnvelopedData, HandshakeError> {
 		let plaintext = plaintext.as_ref();
@@ -210,15 +212,19 @@ where
 		})
 	}
 
-	/// Build the EnvelopedData and wrap it in a ContentInfo structure.
+	/// Builds the EnvelopedData and wraps it in a ContentInfo structure.
+	///
+	/// # Errors
+	///
+	/// - Any error of [`Self::build`].
+	/// - [`HandshakeError::DerError`] -- the EnvelopedData fails to encode.
 	pub fn build_content_info(
 		self,
 		plaintext: impl AsRef<[u8]>,
-		aad: Option<&[u8]>,
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<ContentInfo, HandshakeError> {
 		let plaintext = plaintext.as_ref();
-		let enveloped_data = self.build(plaintext, aad, rng)?;
+		let enveloped_data = self.build(plaintext, rng)?;
 		let content = Any::encode_from(&enveloped_data)?;
 		Ok(ContentInfo { content_type: ENVELOPED_DATA, content })
 	}
@@ -226,7 +232,7 @@ where
 
 /// Default implementation for secp256k1 and AES-256-GCM.
 impl TightBeamEnvelopedDataBuilder<DefaultCryptoProvider> {
-	/// Create a builder with default TightBeam settings.
+	/// Creates a builder with the default TightBeam settings.
 	///
 	/// The defaults are:
 	///
@@ -304,7 +310,7 @@ mod tests {
 		#[test]
 		fn a_refused_random_draw_fails_the_build() {
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(create_test_kari_builder());
-			let refused = builder.build(b"payload", None, Some(&mut DrainedRng));
+			let refused = builder.build(b"payload", Some(&mut DrainedRng));
 			assert!(matches!(refused, Err(HandshakeError::RandomGenerationFailed)));
 		}
 
@@ -312,12 +318,12 @@ mod tests {
 		fn test_basic_enveloped_data() -> Result<(), Box<dyn core::error::Error>> {
 			// 1. Create test KARI builder
 			let kari_builder = create_test_kari_builder();
-			// 2. Build EnvelopedData
+			// 2. Create the EnvelopedData builder
 			let plaintext = b"Hello, TightBeam!";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 
-			// 3. Verify structure
-			let enveloped_data = builder.build(plaintext, None, None)?;
+			// 3. Build the EnvelopedData and verify its structure
+			let enveloped_data = builder.build(plaintext, None)?;
 			assert_eq!(enveloped_data.version, CmsVersion::V3);
 			assert_eq!(enveloped_data.recip_infos.0.len(), 1);
 			assert!(enveloped_data.encrypted_content.encrypted_content.is_some());
@@ -343,8 +349,8 @@ mod tests {
 				.with_unprotected_attr(attr1)
 				.with_unprotected_attr(attr2);
 
-			// 4. Verify attributes are present
-			let enveloped_data = builder.build(plaintext, None, None)?;
+			// 4. Build the EnvelopedData
+			let enveloped_data = builder.build(plaintext, None)?;
 
 			// 5. Verify correct number of attributes
 			let Some(attrs) = enveloped_data.unprotected_attrs.as_ref() else {
@@ -363,7 +369,7 @@ mod tests {
 			// 2. Build and encode
 			let plaintext = b"DER encoding test";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let built = builder.build(plaintext, None, None)?;
+			let built = builder.build(plaintext, None)?;
 			let der_bytes = built.to_der()?;
 
 			// 3. Verify we can decode it back
@@ -378,12 +384,12 @@ mod tests {
 			// 1. Create test KARI builder
 			let kari_builder = create_test_kari_builder();
 
-			// 2. Build ContentInfo
+			// 2. Create the EnvelopedData builder
 			let plaintext = b"ContentInfo wrapper test";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 
-			// 3. Verify ContentInfo structure
-			let content_info = builder.build_content_info(plaintext, None, None)?;
+			// 3. Build the ContentInfo and verify its content type
+			let content_info = builder.build_content_info(plaintext, None)?;
 			assert_eq!(content_info.content_type, ENVELOPED_DATA);
 
 			// 4. Decode inner EnvelopedData

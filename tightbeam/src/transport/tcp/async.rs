@@ -1,3 +1,8 @@
+//! Async TCP transport.
+//!
+//! [`TcpTransport`] runs over any [`AsyncProtocolStream`], and [`TokioStream`]
+//! carries it over a tokio TCP socket. An established transport splits into
+//! a [`TransportReader`] and a [`TransportWriter`] for the multiplexed plane.
 use std::sync::Arc;
 
 #[cfg(feature = "tokio")]
@@ -99,6 +104,8 @@ mod policy {
 #[cfg(feature = "transport-policy")]
 use policy::*;
 
+/// Tokio TCP stream that carries DER-framed envelopes through the byte-level
+/// traits.
 #[cfg(feature = "tokio")]
 pub struct TokioStream {
 	stream: TcpStream,
@@ -189,6 +196,10 @@ pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	/// The local address that the listener is bound to.
+	///
+	/// # Errors
+	///
+	/// The I/O error when the socket reports no local address.
 	pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
 		self.listener.local_addr()
 	}
@@ -197,6 +208,10 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	///
 	/// Accepted transports carry no confidentiality, integrity, or peer
 	/// authentication. See [`EndpointConfig::cleartext`].
+	///
+	/// # Errors
+	///
+	/// The I/O error when the bind fails.
 	pub async fn bind(addr: impl AsRef<str>) -> Result<Self, IoError> {
 		let listener = TcpListener::bind(addr.as_ref()).await?;
 		let config = EndpointConfig::cleartext();
@@ -206,6 +221,10 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 
 	/// Accept one connection as a transport built from this listener's
 	/// configuration.
+	///
+	/// # Errors
+	///
+	/// The I/O error when the accept fails.
 	pub async fn accept(&self) -> Result<(TcpTransport<TokioStream, P>, SocketAddr), IoError> {
 		let (stream, peer_addr) = self.listener.accept().await?;
 		let tokio_stream = TokioStream::from(stream);
@@ -362,8 +381,8 @@ where
 	///
 	/// # Errors
 	///
-	/// - `InvalidState` when the peer did not negotiate multiplexing, or the
-	///   handshake has not completed.
+	/// - [`TransportError::InvalidState`] -- the peer did not negotiate
+	///   multiplexing, or the handshake has not completed.
 	/// - A rekey harvest or split failure from the underlying transport.
 	pub fn into_mux(mut self, role: MuxRole) -> TransportResult<SplitMuxTransport<S>> {
 		let Some(settings) = self.negotiated_mux() else {
@@ -538,12 +557,11 @@ where
 	/// `remaining_records` counts down ([RFC 9846 § 5.5][rfc9846-5.5]).
 	///
 	/// The value sets trigger policy only. Decryption refuses records at the
-	/// AES-GCM volume bound ([`DEFAULT_REKEY_RECORD_LIMIT`]) whatever this
-	/// value is. A cleartext half never rekeys, so the limit does not apply to
-	/// it.
+	/// AES-GCM volume bound at this half's encrypted-envelope ceiling whatever
+	/// this value is. A cleartext half never rekeys, so the limit does not
+	/// apply to it.
 	///
 	/// [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
-	/// [`DEFAULT_REKEY_RECORD_LIMIT`]: crate::constants::DEFAULT_REKEY_RECORD_LIMIT
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		if let SplitRecv::Encrypted(cipher) = self.mode {
 			self.mode = SplitRecv::Encrypted(cipher.with_rekey_limit(limit));
@@ -705,15 +723,17 @@ where
 	///
 	/// The fresh counter resets the sequence discipline, because counter
 	/// nonces restart only with a fresh key (NIST SP 800-38D § 8.2.1). The
-	/// configured record limit carries over, so a tightened rekey cadence
-	/// survives every epoch. A cleartext half holds no keys, so it refuses the
-	/// install.
+	/// fresh cipher takes this half's envelope ceiling and keeps the current
+	/// record limit, so a tightened cadence survives every epoch. A cleartext
+	/// half holds no keys, so it refuses the install.
 	fn install_send_cipher(&mut self, cipher: SendCipher) -> TransportResult<()> {
 		let SplitSend::Encrypted(current) = &self.mode else {
 			return Err(TransportError::MissingEncryption);
 		};
 
-		let renewed = cipher.with_rekey_limit(current.rekey_limit());
+		let renewed = cipher
+			.with_envelope_ceiling(self.limits.encrypted_envelope)
+			.with_rekey_limit(current.rekey_limit());
 		self.mode = SplitSend::Encrypted(renewed);
 		Ok(())
 	}
@@ -754,8 +774,8 @@ where
 	///
 	/// # Errors
 	///
-	/// - `InvalidState` when the session is provisioned for encryption and its
-	///   handshake has not completed.
+	/// - [`TransportError::InvalidState`] -- the session is provisioned for
+	///   encryption and its handshake has not completed.
 	pub fn into_split(mut self) -> TransportResult<SplitTransport<S>> {
 		let (recv_mode, send_mode) = match self.state.phase() {
 			SessionPhase::Cleartext => (SplitRecv::Cleartext, SplitSend::Cleartext),
@@ -1024,6 +1044,7 @@ mod tests {
 	#[cfg(all(feature = "x509", feature = "aead"))]
 	mod cipher_install {
 		use super::super::*;
+		use crate::constants::{DEFAULT_MAX_ENCRYPTED_ENVELOPE, DEFAULT_REKEY_RECORD_LIMIT};
 		use crate::crypto::aead::RuntimeAead;
 		use crate::testing::{TestFrame, TestKey};
 		use crate::TightBeamError;
@@ -1055,10 +1076,14 @@ mod tests {
 		}
 
 		fn writer(mode: SplitSend) -> TransportWriter<NullStream> {
+			writer_under(mode, TransportLimits::default())
+		}
+
+		fn writer_under(mode: SplitSend, limits: TransportLimits) -> TransportWriter<NullStream> {
 			TransportWriter {
 				stream: NullStream,
 				mode,
-				limits: TransportLimits::default(),
+				limits,
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
@@ -1072,6 +1097,13 @@ mod tests {
 				#[cfg(feature = "instrument")]
 				trace: None,
 			}
+		}
+
+		/// Limits at twice the default encrypted-envelope ceiling, where a key
+		/// admits half the default record volume.
+		fn doubled_ceiling() -> TransportLimits {
+			let encrypted_envelope = 2 * DEFAULT_MAX_ENCRYPTED_ENVELOPE;
+			TransportLimits { encrypted_envelope, ..TransportLimits::default() }
 		}
 
 		/// The send cipher of an encrypted half. A cleartext half has none, so
@@ -1131,6 +1163,21 @@ mod tests {
 			assert_eq!(reader.remaining_records(), 2);
 
 			recv_key(&reader).decrypt_content(&record_zero)?;
+			Ok(())
+		}
+
+		/// A renewal bounds the fresh send cipher by this half's
+		/// encrypted-envelope ceiling, so a later override stops at the lower
+		/// volume that ceiling admits (RFC 9846 § 5.5).
+		#[test]
+		fn writer_install_bounds_the_fresh_cipher_by_the_envelope_ceiling() -> Result<(), TightBeamError> {
+			let limits = doubled_ceiling();
+			let current = SendCipher::new(test_runtime()).with_envelope_ceiling(limits.encrypted_envelope);
+			let mut writer = writer_under(SplitSend::Encrypted(current), limits);
+			writer.install_send_cipher(SendCipher::new(test_runtime()))?;
+
+			let raised = writer.with_rekey_limit(u64::MAX);
+			assert_eq!(raised.remaining_records(), DEFAULT_REKEY_RECORD_LIMIT / 2);
 			Ok(())
 		}
 
@@ -1528,10 +1575,10 @@ mod tests {
 		Ok(())
 	}
 
-	// The gossip colony gate reads the peer certificate before any
-	// request is disclosed (CWE-668), so the deferred single-flight
-	// handshake must be drivable on its own. It populates the peer
-	// certificate and sends no application frame, and a repeat does nothing.
+	/// The gossip colony gate reads the peer certificate before any request is
+	/// disclosed (CWE-668), so the deferred single-flight handshake must be
+	/// drivable on its own. It populates the peer certificate and sends no
+	/// application frame, and a repeat does nothing.
 	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	#[tokio::test]
 	async fn handshake_completes_alone_and_populates_peer_certificate() -> TransportResult<()> {

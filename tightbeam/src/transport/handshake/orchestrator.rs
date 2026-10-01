@@ -40,13 +40,13 @@ use crate::x509::Certificate;
 
 /// Provides profile negotiation logic for server-side handshake orchestrators.
 ///
-/// A server must implement `supported_profiles()` to expose its configured
-/// security profiles. The trait provides the default negotiation logic for
-/// both the client-offered mode and the dealer's choice mode.
+/// A server must implement [`Self::supported_profiles`] to expose its
+/// configured security profiles. The trait provides the default negotiation
+/// logic for both the client-offered mode and the dealer's choice mode.
 ///
 /// # Usage
 ///
-/// - **Negotiation mode**: the client sends a `SecurityOffer`, and the server
+/// - **Negotiation mode**: the client sends a [`SecurityOffer`], and the server
 ///   selects the first mutual profile in *server* preference order.
 /// - **Dealer's choice mode**: the client sends no offer, and the server uses
 ///   its first configured profile that meets the strength policy.
@@ -54,7 +54,7 @@ use crate::x509::Certificate;
 /// # Security
 ///
 /// Both modes filter profiles through [`ProfileStrengthPolicy`] before
-/// selection, so a weak profile left in `supported_profiles()` for
+/// selection, so a weak profile left in [`Self::supported_profiles`] for
 /// compatibility cannot be negotiated (CWE-757 downgrade resistance).
 pub trait HandshakeNegotiation<P>
 where
@@ -65,8 +65,8 @@ where
 
 	/// Minimum-strength policy applied before selection.
 	///
-	/// Defaults to [`DefaultStrengthFloor`] (256-bit AEAD key, >= 256-bit
-	/// digest).
+	/// Defaults to [`DefaultStrengthFloor`], which requires a 256-bit AEAD key
+	/// and a digest of 256 bits or more.
 	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
 		&DefaultStrengthFloor
 	}
@@ -74,14 +74,19 @@ where
 	/// Negotiate a security profile with the peer.
 	///
 	/// Only a configured profile that `P` runs is eligible, so the selection
-	/// never names an algorithm the provider does not run.
+	/// names only algorithms the provider runs.
 	///
 	/// # Errors
 	///
-	/// - `NoSupportedProfiles` -- the server has no configured profile.
-	/// - `NegotiationError(UnrunnableProfile)` -- no configured profile runs on `P`.
-	/// - `NegotiationError(BelowStrengthFloor)` -- no runnable profile meets the policy.
-	/// - `NegotiationError` -- no mutually supported profile exists.
+	/// Each [`NegotiationError`] arrives wrapped in
+	/// [`HandshakeError::NegotiationError`].
+	///
+	/// - [`HandshakeError::NoSupportedProfiles`] -- the server has no configured profile.
+	/// - [`NegotiationError::UnrunnableProfile`] -- no configured profile runs on `P`.
+	/// - [`NegotiationError::BelowStrengthFloor`] -- no runnable profile meets the policy.
+	/// - [`NegotiationError::EmptyOffer`] -- the peer sent an empty offer.
+	/// - [`NegotiationError::OfferTooLarge`] -- the offer holds too many profiles.
+	/// - [`NegotiationError::NoMutualProfile`] -- no mutually supported profile exists.
 	fn negotiate_profile(&self, offer: Option<&SecurityOffer>) -> Result<RunnableProfile<P>, HandshakeError> {
 		let supported = self.supported_profiles();
 		if supported.is_empty() {
@@ -124,7 +129,8 @@ pub struct EpochMaterials {
 	/// include the handshake without the `transport-multiplex` consumers.
 	#[allow(dead_code)]
 	pub(crate) secret: ZeroizingBytes,
-	/// Epoch counter: 0 at handshake, incremented per rekey install.
+	/// Epoch counter. It is 0 at handshake and increments on each rekey
+	/// install.
 	pub(crate) epoch: u32,
 	/// Chained transcript hash. `hash_0` is the handshake transcript.
 	pub(crate) transcript_hash: [u8; 32],
@@ -183,16 +189,16 @@ const EPOCH_SECRET_SIZE: usize = 32;
 
 /// Provides session key finalization logic for all handshake orchestrators.
 ///
-/// An orchestrator must implement `selected_profile()` to expose the
+/// An orchestrator must implement [`Self::selected_profile`] to expose the
 /// negotiated security profile. The trait provides the default HKDF-based key
 /// derivation with entropy validation.
 ///
 /// # Security properties
 ///
-/// - The derivation enforces at least `MIN_SALT_ENTROPY_BYTES` of salt entropy.
-/// - HKDF runs with per-direction domain separation (`TIGHTBEAM_C2S_KDF_INFO`,
-///   `TIGHTBEAM_S2C_KDF_INFO`), the RFC 5869 info-label pattern behind the TLS
-///   1.3 directional traffic secrets (RFC 9846, § 7.3).
+/// - The derivation enforces at least [`MIN_SALT_ENTROPY_BYTES`] of salt entropy.
+/// - HKDF runs with per-direction domain separation ([`TIGHTBEAM_C2S_KDF_INFO`],
+///   [`TIGHTBEAM_S2C_KDF_INFO`]), the RFC 5869 info-label pattern behind the
+///   TLS 1.3 directional traffic secrets (RFC 9846, § 7.3).
 /// - The key size follows the negotiated AEAD cipher profile.
 /// - The underlying crypto primitives supply constant-time operations.
 pub trait HandshakeFinalization<P>
@@ -212,10 +218,10 @@ where
 	///
 	/// # Errors
 	///
-	/// - `InvalidState` -- no profile is selected.
-	/// - `InsufficientSaltEntropy` -- the salt is shorter than `MIN_SALT_ENTROPY_BYTES`.
-	/// - `KdfError` -- the KDF refused the key length.
-	/// - `InvalidKeyMaterialLength` -- the cipher refused the derived key.
+	/// - [`HandshakeError::InvalidState`] -- no profile is selected.
+	/// - [`HandshakeError::InsufficientSaltEntropy`] -- the salt is shorter than [`MIN_SALT_ENTROPY_BYTES`].
+	/// - [`HandshakeError::KdfError`] -- the KDF refused the key length.
+	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the derived key.
 	fn derive_directional_aead(
 		&self,
 		input_key: &[u8],
@@ -279,10 +285,12 @@ where
 /// Provides alert attribute processing for all handshake orchestrators.
 ///
 /// Every orchestrator implements this trait through a blanket impl. Call
-/// `check_for_alert()` early in message processing to detect an abort alert
-/// that the peer sent.
+/// [`Self::check_for_alert`] early in message processing to detect an abort
+/// alert that the peer sent.
 ///
 /// # Alert types
+///
+/// The codes of [`HandshakeAlert`](super::HandshakeAlert) are:
 ///
 /// - `AuthRequired`: the peer requires mutual authentication.
 /// - `VersionMismatch`: the protocol version is incompatible.
@@ -297,12 +305,15 @@ pub trait HandshakeAlertHandler {
 	///
 	/// # Errors
 	///
-	/// - `AbortReceived` -- an alert with a specific alert code is present.
-	/// - `InvalidAttributeArity` -- the alert attribute is malformed.
-	/// - `InvalidIntegerEncoding` -- the alert code is not a valid INTEGER.
+	/// - [`HandshakeError::AbortReceived`] -- an alert with a known code is present.
+	/// - [`HandshakeError::DuplicateAttribute`] -- the alert attribute repeats.
+	/// - [`HandshakeError::InvalidAttributeArity`] -- the alert attribute is malformed.
+	/// - [`HandshakeError::InvalidIntegerEncoding`] -- the alert code is not a valid INTEGER.
+	/// - [`HandshakeError::IntegerOutOfRange`] -- the alert code is above `u8::MAX`.
+	/// - [`HandshakeError::UnknownAlertCode`] -- the code names no alert.
 	fn check_for_alert(&self, attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		if let Some(attrs) = attrs {
-			if let Ok(Some(alert_attr)) = attrs.find_unsigned_attr(HANDSHAKE_ABORT_ALERT) {
+			if let Some(alert_attr) = attrs.find_unsigned_attr(HANDSHAKE_ABORT_ALERT)? {
 				let alert = alert_attr.handshake_alert()?;
 				return Err(HandshakeError::AbortReceived(alert));
 			}
@@ -318,7 +329,7 @@ pub trait HandshakeVerifyingKey {
 	///
 	/// # Errors
 	///
-	/// - SEC1 decode failures over the certificate's key bytes
+	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key bytes fail SEC1 decoding.
 	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
 	where
 		C: Curve + CurveArithmetic,
@@ -586,15 +597,30 @@ mod tests {
 
 	impl HandshakeAlertHandler for AlertProbe {}
 
+	/// An abort-alert attribute carrying `code`, as a peer sends it.
+	fn abort_alert(code: u8) -> Result<Attribute, Box<dyn Error>> {
+		let code = Any::encode_from(&code)?;
+		Ok(Attribute { oid: HANDSHAKE_ABORT_ALERT, values: SetOfVec::try_from(vec![code])? })
+	}
+
 	#[test]
 	fn an_abort_alert_attribute_aborts_the_handshake() -> Result<(), Box<dyn Error>> {
-		let code = Any::encode_from(&3u8)?;
-		let alert = Attribute { oid: HANDSHAKE_ABORT_ALERT, values: SetOfVec::try_from(vec![code])? };
-		let attrs = Attributes::try_from(vec![alert])?;
+		let attrs = Attributes::try_from(vec![abort_alert(3)?])?;
 
 		let checked = AlertProbe.check_for_alert(Some(&attrs));
 		let expected = HandshakeAlert::AlgorithmMismatch;
 		assert!(matches!(checked, Err(HandshakeError::AbortReceived(alert)) if alert == expected));
+		Ok(())
+	}
+
+	/// A repeated abort alert fails closed as a duplicate attribute rather
+	/// than reading as no alert and letting processing continue into the
+	/// message body.
+	#[test]
+	fn a_duplicate_abort_alert_fails_closed() -> Result<(), Box<dyn Error>> {
+		let attrs = Attributes::try_from(vec![abort_alert(3)?, abort_alert(4)?])?;
+		let checked = AlertProbe.check_for_alert(Some(&attrs));
+		assert!(matches!(checked, Err(HandshakeError::DuplicateAttribute)));
 		Ok(())
 	}
 }

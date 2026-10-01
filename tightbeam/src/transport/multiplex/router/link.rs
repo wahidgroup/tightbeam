@@ -31,8 +31,9 @@ pub(crate) struct MuxLink {
 	shared: Arc<MuxShared>,
 	outbound: mpsc::Sender<Outbound>,
 	/// Consumption reports from stream bodies back to the reader's credit
-	/// replenishment.
-	drain_feedback: mpsc::UnboundedSender<DrainNote>,
+	/// replenishment. The channel carries no buffer of its own, so every
+	/// body reports through the one slot its own sender clone owns.
+	drain_feedback: mpsc::Sender<DrainNote>,
 }
 
 impl Clone for MuxLink {
@@ -51,11 +52,18 @@ impl MuxLink {
 	///
 	/// The link keeps the sending end. The caller receives the other end for
 	/// the reader, so the reader drains the channel this link feeds.
-	pub(crate) fn new(
-		shared: Arc<MuxShared>,
-		outbound: mpsc::Sender<Outbound>,
-	) -> (Self, mpsc::UnboundedReceiver<DrainNote>) {
-		let (drain_feedback, drained) = mpsc::unbounded();
+	///
+	/// # Drain bound
+	///
+	/// The drain channel has a zero-length buffer, so its capacity is one slot
+	/// per live sender.
+	///
+	/// - Outstanding notes are bounded by live bodies, and a reader that stops
+	///   draining cannot be made to hold more (CWE-770).
+	/// - A body whose slot is taken reports its current count once the slot
+	///   frees ([`StreamBody`](super::body::StreamBody)).
+	pub(crate) fn new(shared: Arc<MuxShared>, outbound: mpsc::Sender<Outbound>) -> (Self, mpsc::Receiver<DrainNote>) {
+		let (drain_feedback, drained) = mpsc::channel(0);
 		let link = Self { shared, outbound, drain_feedback };
 
 		(link, drained)
@@ -81,7 +89,10 @@ impl MuxLink {
 	}
 
 	/// Drain-note sender for a stream body on this connection.
-	pub(crate) fn drain_feedback(&self) -> mpsc::UnboundedSender<DrainNote> {
+	///
+	/// Each clone carries its own guaranteed slot, so every body reports
+	/// through its own capacity.
+	pub(crate) fn drain_feedback(&self) -> mpsc::Sender<DrainNote> {
 		self.drain_feedback.clone()
 	}
 
@@ -93,14 +104,46 @@ impl MuxLink {
 	///
 	/// # Errors
 	///
-	/// - The refused command, when the queue is full or the writer driver is
-	///   gone.
+	/// - The refused command, when the queue is full or the writer driver is gone.
 	pub(crate) fn try_send(&mut self, command: Outbound) -> Result<(), mpsc::TrySendError<Outbound>> {
 		self.outbound.try_send(command)
 	}
 
-	/// Drain buffered control into the writer queue. Cancellation-safe:
-	/// a command leaves the buffer only after its slot is reserved.
+	/// Refuse a peer stream at the concurrency cap with a payload-free
+	/// `ResourceExhausted` trailer on this link's own sender, without
+	/// waiting.
+	///
+	/// # Resource bound
+	///
+	/// - The sender keeps its slot across calls, so a stalled writer admits
+	///   one refusal and every later one is dropped instead of queued.
+	/// - Only a peer that opens past the cap it was advertised reaches this
+	///   path, so its excess opens buy no memory here (CWE-770).
+	/// - Nothing was registered for the stream, so there is no ledger to release.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
+	/// - The encode failure of a trailer that does not serialize.
+	pub(crate) fn refuse_at_cap(&mut self, stream_id: u32) -> TransportResult<()> {
+		let package = MuxEndPackage::new(stream_id, TransitStatus::ResourceExhausted, Vec::new())?;
+		match self.outbound.try_send(Outbound::Envelope(package.into())) {
+			Ok(()) => Ok(()),
+			// An earlier refusal still holds the slot: this peer is past its
+			// cap, so the refusal is the one thing a stalled writer may drop.
+			Err(refused) if refused.is_full() => Ok(()),
+			Err(_) => Err(TransportError::ConnectionClosed),
+		}
+	}
+
+	/// Drain buffered control into the writer queue.
+	///
+	/// The drain is cancellation-safe, because a command leaves the buffer only
+	/// after its slot is reserved.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
 	pub(crate) async fn flush_control(&mut self, pending: &mut VecDeque<Outbound>) -> TransportResult<()> {
 		let outbound = &mut self.outbound;
 		while !pending.is_empty() {
@@ -122,11 +165,10 @@ impl MuxLink {
 	/// Send a response on a peer-initiated stream, chunking when it exceeds the
 	/// peer's advertised receive size.
 	///
-	/// - Full chunks travel as `Data(last = false)`, and the final chunk travels inline in the
-	///   `End` trailer (responder grammar).
+	/// - Full chunks travel as `Data(last = false)`, and the final chunk
+	///   travels inline in the `End` trailer (responder grammar).
 	/// - Every payload-bearing record is gated by the peer's stream credit.
-	/// - A response the session budget cannot carry degrades to a payload-free `ResourceExhausted`
-	///   refusal.
+	/// - A response the session budget cannot carry degrades to a payload-free `ResourceExhausted` refusal.
 	///
 	/// # Errors
 	///
@@ -145,8 +187,8 @@ impl MuxLink {
 			Ok(BudgetStanding::Exhausting) => {
 				self.announce_goaway(GoAwayReason::BudgetExhausted).await?;
 			}
-			// Even the drain reserve cannot carry the payload: refuse
-			// the stream for free instead of tearing the connection
+			// Even the drain reserve cannot carry the payload, so refuse the
+			// stream for free instead of tearing the connection down.
 			Err(_) => {
 				status = TransitStatus::ResourceExhausted;
 				payload = Vec::new();
@@ -174,8 +216,8 @@ impl MuxLink {
 
 			match self.send_data_envelope(stream_id, envelope).await {
 				Ok(()) => {}
-				// Ledger removed mid-send: the peer cancelled the stream
-				// and the receiver will discard what already went out
+				// The peer cancelled the stream and removed its ledger
+				// mid-send, so the receiver discards what already went out.
 				Err(TransportError::OperationFailed(TransportFailure::Cancelled)) => return Ok(()),
 				Err(err) => {
 					self.shared.finish_send_stream(stream_id);
@@ -189,13 +231,15 @@ impl MuxLink {
 		Ok(())
 	}
 
-	/// Terminal `End` trailer closing a peer-initiated stream. Payload-free,
-	/// so it travels outside stream credit like every empty `End`, and it
-	/// releases the stream's sender ledger.
+	/// Send the terminal `End` trailer that closes a peer-initiated stream.
+	///
+	/// The trailer is payload-free, so it travels outside stream credit like
+	/// every empty `End`, and it releases the stream's sender ledger.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::ConnectionClosed`] -- the writer driver is gone.
+	/// - The encode failure of a trailer that does not serialize.
 	pub(crate) async fn send_end_trailer(&self, stream_id: u32, status: TransitStatus) -> TransportResult<()> {
 		let package = MuxEndPackage::new(stream_id, status, Vec::new())?;
 		let mut outbound = self.sender();
@@ -225,14 +269,16 @@ impl MuxLink {
 		}
 	}
 
-	/// Send one credit-gated data chunk: reserve a writer-queue slot,
-	/// then take the stream credit and enqueue in one critical section
-	/// (see [`MuxShared::poll_send_enqueue`]).
+	/// Send one credit-gated data chunk.
+	///
+	/// The send reserves a writer-queue slot, then takes the stream credit and
+	/// enqueues in one critical section, as [`MuxShared::poll_send_enqueue`]
+	/// describes.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- once the stream's ledger is
-	///   gone, whether cancelled, resolved, or lost with the connection
+	/// - [`TransportError::ConnectionClosed`] -- the stream's ledger is gone,
+	///   whether cancelled, resolved, or lost with the connection.
 	pub(crate) async fn send_data_envelope(&self, stream_id: u32, envelope: TransportEnvelope) -> TransportResult<()> {
 		let mut outbound = self.sender();
 		let ready = poll_fn(|cx| outbound.poll_ready(cx)).await;
@@ -244,14 +290,15 @@ impl MuxLink {
 		poll_fn(|cx| self.shared.poll_send_enqueue(stream_id, &mut outbound, &mut slot, cx)).await
 	}
 
-	/// Send a stream's Open record through the atomic open (see
-	/// [`MuxShared::poll_open_enqueue`]): reserve a writer-queue slot,
-	/// then assign the stream ID and enqueue in one critical section so
-	/// Opens reach the wire in ID order.
+	/// Send a stream's Open record through the atomic open of
+	/// [`MuxShared::poll_open_enqueue`], returning the assigned stream ID.
+	///
+	/// The send reserves a writer-queue slot, then assigns the stream ID and
+	/// enqueues in one critical section, so Opens reach the wire in ID order.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- when the writer queue closed
+	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
 	pub(crate) async fn send_open_envelope(
 		&self,
 		reservation: &mut StreamReservation,
@@ -266,12 +313,14 @@ impl MuxLink {
 		poll_fn(|cx| self.shared.poll_open_enqueue(reservation, request, &mut outbound, cx)).await
 	}
 
-	/// Queue a GoAway with `reason` and halt the allocator, exactly once
-	/// per connection. Shared by graceful shutdown and the budget drain.
+	/// Queue a GoAway with `reason` and halt the allocator, exactly once per
+	/// connection.
+	///
+	/// Graceful shutdown and the budget drain share this path.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- when the writer queue closed
+	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
 	pub(crate) async fn announce_goaway(&self, reason: GoAwayReason) -> TransportResult<()> {
 		let Some(package) = self.shared.goaway_package(reason) else {
 			return Ok(());
@@ -285,7 +334,7 @@ impl MuxLink {
 		Ok(())
 	}
 
-	/// Best-effort GoAway on a fault path.
+	/// Queue a best-effort GoAway on a fault path. A full queue drops it.
 	pub(crate) fn goaway_best_effort(&self, last_stream_id: u32, reason: GoAwayReason) {
 		#[cfg(feature = "instrument")]
 		self.shared.emit_goaway_event(events::MUX_GOAWAY_SENT, reason);
@@ -294,17 +343,17 @@ impl MuxLink {
 		let _ = self.sender().try_send(Outbound::Envelope(package.into()));
 	}
 
-	/// On a budget at the drain reserve, renew in band when possible,
-	/// otherwise GoAway drain (no rekey materials).
+	/// Renew in band when a budget reaches the drain reserve, or drain with a
+	/// GoAway when no rekey materials are ready.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::ConnectionClosed`] -- when the writer queue closed
+	/// - [`TransportError::ConnectionClosed`] -- the writer queue closed.
 	pub(crate) async fn renew_or_drain(&self) -> TransportResult<()> {
 		#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 		if self.shared.renewal_ready() {
-			// A full queue drops the trigger: the budget stays at the
-			// reserve, so the next debit re-fires it.
+			// A full queue drops the trigger. The budget stays at the reserve,
+			// so the next debit fires it again.
 			let _ = self.sender().try_send(Outbound::StartRenewal);
 			return Ok(());
 		}

@@ -190,8 +190,8 @@ tb_scenario! {
 			server.process_client_key_exchange(client_kex).await?;
 			trace.event(SERVER_KEX_RECEIVED)?;
 
-			let _client_cipher = client.complete()?;
-			let _server_cipher = server.complete()?;
+			let _client_session = client.take_established()?;
+			let _server_session = server.take_established()?;
 			trace.event(HANDSHAKE_COMPLETE)?;
 
 			let server_selected = server.selected_profile().map(|profile| profile.descriptor()) == Some(preferred);

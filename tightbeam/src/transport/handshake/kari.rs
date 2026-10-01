@@ -15,6 +15,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use core::fmt;
+
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile};
 use crate::crypto::secret::SecretSlice;
@@ -35,8 +37,8 @@ pub(crate) trait HandshakeAgreement<C>
 where
 	C: Curve + CurveArithmetic,
 {
-	/// Derive the shared secret via ECDH and wrap in [`SecretSlice`] for
-	/// automatic zeroization.
+	/// Derives the shared secret through ECDH and wraps it in a
+	/// [`SecretSlice`] for automatic zeroization.
 	fn shared_secret(&self, peer: &PublicKey<C>) -> Result<SecretSlice<u8>, HandshakeError>;
 }
 
@@ -106,8 +108,15 @@ macro_rules! dispatch_aes_kw {
 /// The KEK and the bytes it protects are both byte slices, so a caller that
 /// holds them loose can swap them and still compile. The key travels as its
 /// own type, so no call site can swap it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct Kek<'a>(&'a [u8]);
+
+// A KEK is key material, so `Debug` prints its length only (CWE-532).
+impl fmt::Debug for Kek<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Kek").field("len", &self.0.len()).finish()
+	}
+}
 
 impl<'a> Kek<'a> {
 	/// Wrap `kek` as the key-encryption key for one wrap or unwrap.
@@ -302,9 +311,22 @@ mod tests {
 		assert!(matches!(result, Err(HandshakeError::UnsupportedKeyWrapAlgorithm)));
 	}
 
+	/// The `Debug` of a KEK prints its length in place of the key bytes
+	/// (CWE-532).
+	#[test]
+	fn kek_debug_omits_the_key_bytes() {
+		let kek_bytes = [0xABu8; 32];
+		let kek = Kek::new(&kek_bytes);
+		let rendered = format!("{kek:?}");
+		assert!(!rendered.contains("171"));
+		assert!(rendered.contains("len"));
+		assert!(rendered.contains("32"));
+	}
+
 	const ROUND_TRIP_CEK: [u8; 32] = [0x42u8; 32];
 
-	/// The CEK after a wrap and unwrap under a KEK of `kek_size` bytes.
+	/// Returns the CEK after a wrap and an unwrap under a KEK of `kek_size`
+	/// bytes.
 	fn round_trip_under_kek(kek_size: usize) -> SecretSlice<u8> {
 		let provider = DefaultCryptoProvider::default();
 		let kek = vec![0x11u8; kek_size];
