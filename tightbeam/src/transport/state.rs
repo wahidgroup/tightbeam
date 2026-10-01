@@ -1031,8 +1031,8 @@ mod tests {
 
 	/// An installed session's send cipher takes this endpoint's
 	/// encrypted-envelope ceiling, so a doubled ceiling halves the send record
-	/// limit (RFC 9846 § 5.5). The receive cipher keeps the fixed bound,
-	/// because the sender's envelopes set the volume a key sees.
+	/// limit (RFC 9846 § 5.5). The receive cipher keeps its fixed record
+	/// limit, because it bounds the volume by the bytes it opens.
 	#[cfg(all(feature = "testing", feature = "secp256k1"))]
 	#[test]
 	fn installing_a_session_bounds_its_send_cipher_by_the_envelope_ceiling() -> TransportResult<()> {

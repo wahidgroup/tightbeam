@@ -675,9 +675,8 @@ impl EstablishedSession {
 		self.epoch.take()
 	}
 
-	/// Bound both session ciphers by the encrypted-envelope ceiling the
-	/// transport installs this session under
-	/// ([`SessionKeys::with_envelope_ceiling`]).
+	/// Bound the send cipher by the encrypted-envelope ceiling the transport
+	/// installs this session under ([`SessionKeys::with_envelope_ceiling`]).
 	pub(crate) fn with_envelope_ceiling(mut self, encrypted_envelope: usize) -> Self {
 		self.keys = self.keys.with_envelope_ceiling(encrypted_envelope);
 		self

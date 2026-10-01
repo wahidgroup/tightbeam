@@ -557,9 +557,8 @@ where
 	/// `remaining_records` counts down ([RFC 9846 § 5.5][rfc9846-5.5]).
 	///
 	/// The value sets trigger policy only. Decryption refuses records at the
-	/// AES-GCM volume bound at this half's encrypted-envelope ceiling whatever
-	/// this value is. A cleartext half never rekeys, so the limit does not
-	/// apply to it.
+	/// AES-GCM volume bounds whatever this value is. A cleartext half never
+	/// rekeys, so the limit does not apply to it.
 	///
 	/// [rfc9846-5.5]: https://datatracker.ietf.org/doc/html/rfc9846#section-5.5
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {

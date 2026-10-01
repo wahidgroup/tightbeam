@@ -108,10 +108,13 @@ const TLS_FULL_SIZE_RECORD_BYTES: u64 = 1 << 14;
 /// intact (2^24, RFC 9846 § 5.5).
 const AES_GCM_FULL_SIZE_RECORDS_PER_KEY: u64 = 1 << 24;
 
+/// Bytes one AES-GCM key admits with its safety margin intact: 2^24
+/// full-size TLS records, which is 2^38 bytes (RFC 9846 § 5.5).
+pub(crate) const AES_GCM_VOLUME_BYTES_PER_KEY: u64 = AES_GCM_FULL_SIZE_RECORDS_PER_KEY * TLS_FULL_SIZE_RECORD_BYTES;
+
 /// AEAD records one directional key admits at an encrypted-envelope ceiling
-/// of `encrypted_envelope` bytes: the AES-GCM per-key byte volume of 2^24
-/// full-size TLS records, divided by the ceiling. A ceiling of zero counts
-/// as one byte.
+/// of `encrypted_envelope` bytes: [`AES_GCM_VOLUME_BYTES_PER_KEY`] divided
+/// by the ceiling. A ceiling of zero counts as one byte.
 ///
 /// # Sources
 ///
@@ -123,7 +126,7 @@ pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
 		encrypted_envelope as u64
 	};
 
-	AES_GCM_FULL_SIZE_RECORDS_PER_KEY * TLS_FULL_SIZE_RECORD_BYTES / envelope
+	AES_GCM_VOLUME_BYTES_PER_KEY / envelope
 }
 
 /// AEAD record limit per directional key before a rekey is required.
@@ -139,9 +142,9 @@ pub(crate) const fn rekey_record_limit(encrypted_envelope: usize) -> u64 {
 /// - Senders fail closed with `RekeyRequired` at their configured limit.
 /// - Receipt-bearing mux sessions renew in band first.
 /// - Other sessions drain via GoAway.
-/// - Receivers refuse counters past the volume bound at their own ceiling.
-/// - `with_rekey_limit` overrides the renewal and drain trigger. The
-///   receive-side refusal bound stays at the volume bound.
+/// - Receivers refuse a counter at or past this constant, at any ceiling.
+/// - Receivers refuse a record that takes the bytes one key opened past the AES-GCM volume.
+/// - `with_rekey_limit` overrides the renewal and drain trigger. Both receive-side refusals stay fixed.
 ///
 /// # Sources
 ///
