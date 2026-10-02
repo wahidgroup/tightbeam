@@ -7,8 +7,7 @@
 //! # Properties
 //!
 //! - The default provider is HKDF ([RFC 5869][rfc5869]) with SHA3-256.
-//! - Derivation is deterministic and domain-separated by the `info` parameter
-//!   ([RFC 5869 §3.2][rfc5869-3.2]).
+//! - Derivation is deterministic and domain-separated by the `info` parameter ([RFC 5869 §3.2][rfc5869-3.2]).
 //! - Key material stays in `Zeroizing` and `ZeroizingArray` buffers.
 //! - Input validation covers the shared secret, which [`EcdhSecret`] fixes at
 //!   32 bytes, and the salt, which is 16 bytes or more. The ephemeral public
@@ -42,8 +41,7 @@
 //! - [NIST SP 800-56A Rev. 3 §5.8][sp800-56a]: Key-Derivation Methods for Key-Agreement Schemes.
 //! - [NIST SP 800-56C Rev. 2 §5][sp800-56c]: Two-Step Key Derivation (Extraction-then-Expansion).
 //! - [SECG SEC 1 v2.0 §5.1][sec1-5.1]: Elliptic Curve Integrated Encryption Scheme (ECIES).
-//! - [IEEE Std 1363a-2004][ieee1363a]: Public-Key Cryptography, Amendment 1
-//!   (Additional Techniques).
+//! - [IEEE Std 1363a-2004][ieee1363a]: Public-Key Cryptography, Amendment 1 (Additional Techniques).
 //! - [ISO/IEC 18033-2:2006][iso18033]: Encryption algorithms, Part 2: Asymmetric ciphers.
 //!
 //! [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
@@ -67,13 +65,18 @@ pub use crate::crypto::hkdf::Hkdf;
 use crate::constants::{ECDH_SHARED_SECRET_SIZE, MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE, MIN_SALT_SIZE};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::hkdf::InvalidLength;
-use crate::crypto::secret::{Secret, SecretSlice, ToInsecure};
+use crate::crypto::secret::{Secret, SecretSlice};
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
 use crate::oids::HASH_SHA3_256;
 use crate::zeroize::Zeroizing;
 use crate::Errorizable;
 use crate::{ZeroizingArray, ZeroizingBytes};
+
+#[cfg(feature = "ecdh")]
+use elliptic_curve::ecdh::SharedSecret;
+#[cfg(feature = "ecdh")]
+use elliptic_curve::Curve;
 
 /// The result of a KDF operation.
 pub type Result<T> = ::core::result::Result<T, KdfError>;
@@ -306,17 +309,40 @@ impl TryFrom<SecretSlice<u8>> for EcdhSecret {
 
 	/// # Errors
 	///
-	/// - [`KdfError::InvalidSharedSecretLength`] when the secret is not
-	///   [`ECDH_SHARED_SECRET_SIZE`] bytes.
+	/// - [`KdfError::InvalidSharedSecretLength`] when the secret is not [`ECDH_SHARED_SECRET_SIZE`] bytes.
 	fn try_from(secret: SecretSlice<u8>) -> Result<Self> {
-		let bytes = secret.to_insecure();
-		let sized: [u8; ECDH_SHARED_SECRET_SIZE] = bytes
-			.as_slice()
-			.try_into()
-			.map_err(|_| KdfError::InvalidSharedSecretLength(bytes.len()))?;
-
-		Ok(Secret::from(sized))
+		secret.with(|bytes| sized_shared_secret(bytes))
 	}
+}
+
+/// Move a curve shared secret into the fixed-width type the key schedule
+/// takes. The curve secret wipes when it drops.
+#[cfg(feature = "ecdh")]
+impl<C> TryFrom<SharedSecret<C>> for EcdhSecret
+where
+	C: Curve,
+{
+	type Error = KdfError;
+
+	/// # Errors
+	///
+	/// - [`KdfError::InvalidSharedSecretLength`] when the curve's field is not
+	///   [`ECDH_SHARED_SECRET_SIZE`] bytes wide.
+	fn try_from(shared: SharedSecret<C>) -> Result<Self> {
+		sized_shared_secret(shared.raw_secret_bytes())
+	}
+}
+
+/// Copy `bytes` into the fixed-width secret through its wiping buffer, so no
+/// plain array of the shared secret exists on the way (CWE-226).
+fn sized_shared_secret(bytes: &[u8]) -> Result<EcdhSecret> {
+	if bytes.len() != ECDH_SHARED_SECRET_SIZE {
+		return Err(KdfError::InvalidSharedSecretLength(bytes.len()));
+	}
+
+	let mut sized = ZeroizingArray::new([0u8; ECDH_SHARED_SECRET_SIZE]);
+	sized.copy_from_slice(bytes);
+	Ok(Secret::from(sized))
 }
 
 /// Bind `info` and `ephemeral_pubkey` into one unambiguous ECIES SharedInfo.

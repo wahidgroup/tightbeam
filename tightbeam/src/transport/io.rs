@@ -86,7 +86,7 @@ mod x509 {
 
 	#[cfg(feature = "transport-ecies")]
 	mod ecies {
-		pub use crate::crypto::ecies::{EciesEphemeral, EciesPublicKeyOps};
+		pub use crate::crypto::ecies::EciesPublicKeyOps;
 		pub use crate::crypto::sign::SignatureEncoding;
 		pub use crate::der::oid::AssociatedOid;
 		pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
@@ -488,8 +488,8 @@ pub trait EncryptedMessageIO: MessageIO {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::MissingEncryption`] -- a cleartext answer arrived on an established
-	///   session, and the session was reset.
+	/// - [`TransportError::MissingEncryption`] -- a cleartext answer arrived
+	///   on an established session, and the session was reset.
 	/// - [`TransportError::DerError`] -- the bytes are not a wire envelope.
 	/// - The decrypt failure of an encrypted answer.
 	#[allow(async_fn_in_trait)]
@@ -573,7 +573,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 		PublicKey<P::Curve>: EciesPublicKeyOps + EncodePublicKey,
-		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
 		// Signature bounds
 		P::Signature: SignatureEncoding,
 		for<'b> P::Signature: TryFrom<&'b [u8]>,
@@ -635,7 +634,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 		PublicKey<P::Curve>: EciesPublicKeyOps,
-		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
 		P::Signature: SignatureEncoding + 'static,
 		for<'b> P::Signature: TryFrom<&'b [u8]>,
 		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
@@ -669,7 +667,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Build the CMS client orchestrator from transport state.
 	///
-	/// CMS encrypts the session key to the server's public key up front, so
+	/// CMS encrypts the base secret to the server's public key up front, so
 	/// the server identity comes from the provisioned chain. A missing trust
 	/// store or chain fails closed.
 	///
@@ -821,7 +819,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 		PublicKey<P::Curve>: EciesPublicKeyOps + EncodePublicKey,
-		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
 		// Signature bounds
 		P::Signature: SignatureEncoding + 'static,
 		for<'b> P::Signature: TryFrom<&'b [u8]>,

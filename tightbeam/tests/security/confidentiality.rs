@@ -1,7 +1,7 @@
-//! # Session-key confidentiality threat
+//! # Base-secret confidentiality threat
 //!
 //! ## Weakness
-//! If session-key material is transmitted in the clear (or "encryption" is not
+//! If the base secret is transmitted in the clear (or "encryption" is not
 //! actually applied), an observer can recover it.
 //!
 //! ## Attack
@@ -9,15 +9,14 @@
 //! attempted with a wrong key, and compared across two handshakes.
 //!
 //! ## Expected control
-//! The session key MUST never be transmitted in the clear. It MUST be derived
-//! via ECDH + HKDF into an AEAD key. Decryption MUST succeed only with the
-//! correct private key, yield the expected DER plaintext (a SEQUENCE of the
-//! 32-byte base session key and 32-byte client random OCTET STRINGs), and
-//! produce fresh ciphertext per handshake.
+//! The base secret MUST never be transmitted in the clear. The payload MUST be
+//! sealed via ECDH + HKDF into an AEAD key. Decryption MUST succeed only with
+//! the correct private key, yield the expected DER plaintext (a SEQUENCE of the
+//! 32-byte base secret and 32-byte client random OCTET STRINGs), and produce
+//! fresh ciphertext per handshake.
 //!
 //! ## References
-//! - CWE-311: Missing Encryption of Sensitive Data
-//!   <https://cwe.mitre.org/data/definitions/311.html>
+//! - CWE-311: Missing Encryption of Sensitive Data <https://cwe.mitre.org/data/definitions/311.html>
 //! - CAPEC-157: Sniffing Attacks <https://capec.mitre.org/data/definitions/157.html>
 //! - RFC 9180 (HPKE): ECDH + KDF + AEAD construction
 
@@ -110,8 +109,9 @@ job! {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
 
 		// This test decrypts the ECIES ClientKeyExchange blob directly. CMS
-		// transports the session key inside an EnvelopedData/KARI structure, so
-		// its confidentiality is verified separately in the loopback suite.
+		// carries the base secret inside an EnvelopedData/KARI structure, and
+		// the unit test `the_base_secret_crosses_the_wire_only_sealed` in
+		// `transport::handshake::server::cms` covers that wire.
 		let kind = HandshakeBackendKind::Ecies;
 
 		// ========================================
@@ -148,7 +148,7 @@ job! {
 		match try_decrypt_ecies(&ciphertext, correct_key, None) {
 			DecryptionResult::Success { plaintext_len } => {
 				// Plaintext must be the 70-byte DER SEQUENCE of the
-				// 32-byte base session key and 32-byte client random
+				// 32-byte base secret and 32-byte client random
 				// OCTET STRINGs (no receipt acknowledgement on this
 				// unmetered session)
 				if plaintext_len != 70 {

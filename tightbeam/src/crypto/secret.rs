@@ -60,6 +60,15 @@ impl<S: Zeroize> From<S> for Secret<S> {
 	}
 }
 
+/// Adopts a value that already lives in a wiping buffer, so a secret copied
+/// into a [`Zeroizing`] array reaches its wrapper without a plain copy on the
+/// way (CWE-226).
+impl<S: Zeroize> From<Zeroizing<S>> for Secret<S> {
+	fn from(src: Zeroizing<S>) -> Self {
+		Self(src)
+	}
+}
+
 /// Secret byte or element buffer.
 pub type SecretSlice<T> = Secret<Vec<T>>;
 

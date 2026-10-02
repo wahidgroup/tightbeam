@@ -1,7 +1,13 @@
 //! ECIES-based client handshake orchestrator.
 //!
 //! [`EciesHandshakeClient`] runs the client side of the TightBeam ECIES
-//! handshake protocol.
+//! handshake protocol:
+//!
+//! 1. Send the ClientHello with the client random and the offers.
+//! 2. Verify the ServerHandshake, whose signed transcript carries the server ephemeral public key.
+//! 3. Draw the ECIES ephemeral, seal the base secret to the server's static key, and derive the
+//!    handshake secret from the base secret and the ephemeral-ephemeral ECDH.
+//! 4. Derive the directional keys from the handshake secret at completion.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -13,10 +19,9 @@ use core::marker::PhantomData;
 use crate::asn1::OctetString;
 use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::{SignedData, SignerInfo};
-use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
+use crate::constants::{EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_AAD_DOMAIN_TAG};
 use crate::crypto::aead::{KeyInit, SessionKeys};
-use crate::crypto::ecies::EciesEphemeral;
-use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
+use crate::crypto::ecies::{EciesMessageOps, EciesPublicKeyOps, EciesSecretKeyOps};
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -27,13 +32,14 @@ use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::CertificateExt;
 use crate::der::{Decode, Encode};
-use crate::random::generate_nonce;
+use crate::random::{generate_nonce, OsRng};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityOffer, StrengthFloor, TransportOffer,
 };
-use crate::transport::handshake::primitives::transcript::Transcript;
-use crate::transport::handshake::primitives::KdfSalt;
+use crate::transport::handshake::orchestrator::{BaseSecret, HandshakeVerifyingKey, ServerEphemeral};
+use crate::transport::handshake::primitives::transcript::{EciesHandshakeLegs, Transcript};
+use crate::transport::handshake::primitives::RandomsSalt;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{ReceiptApprover, ReceiptRole, SessionReceipt, StoredReceipt};
@@ -43,13 +49,12 @@ use crate::transport::handshake::{
 	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake,
 };
 use crate::transport::handshake::{DirectionalCiphers, EpochMaterials, HandshakeAlertHandler, HandshakeFinalization};
-use crate::transport::handshake::{EstablishedSession, HandshakeMessage, TunneledMessage};
+use crate::transport::handshake::{EstablishedSession, HandshakeMessage, HandshakeSecret, TunneledMessage};
 use crate::transport::state::ClientIdentity;
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::{Zeroize, Zeroizing};
-use crate::ZeroizingArray;
 
 /// Client-side ECIES handshake orchestrator.
 ///
@@ -66,7 +71,9 @@ where
 	/// The exact DER bytes of the sent `ClientHello`. The transcript binds
 	/// them, so a rewritten offer changes the transcript hash (CWE-757).
 	client_hello: Option<Vec<u8>>,
-	base_session_key: Option<ZeroizingArray<32>>,
+	/// The secret the session derives from, held from the key exchange to
+	/// completion, which takes it.
+	handshake_secret: Option<HandshakeSecret>,
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: &'static [u8],
@@ -102,7 +109,6 @@ where
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EciesPublicKeyOps,
-	<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
 	P::Signature: SignatureEncoding + LowSEncoding,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
@@ -118,7 +124,7 @@ where
 			state: ClientStateMachine::<Ecies>::default(),
 			client_random: None,
 			client_hello: None,
-			base_session_key: None,
+			handshake_secret: None,
 			server_random: None,
 			transcript_hash: None,
 			aad_domain_tag: aad_domain_tag.unwrap_or(TIGHTBEAM_AAD_DOMAIN_TAG),
@@ -145,7 +151,7 @@ where
 			state: ClientStateMachine::<Ecies>::default(),
 			client_random: None,
 			client_hello: None,
-			base_session_key: None,
+			handshake_secret: None,
 			server_random: None,
 			transcript_hash: None,
 			aad_domain_tag: aad_domain_tag.unwrap_or(TIGHTBEAM_AAD_DOMAIN_TAG),
@@ -258,37 +264,36 @@ where
 	}
 
 	/// Compute and store the transcript hash.
+	///
+	/// The server ephemeral enters at its fixed width, so a `server_ephemeral`
+	/// of another length fails here, before the signature check.
 	fn compute_and_store_transcript_hash(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
 		let client_hello = self.client_hello.as_deref().ok_or(HandshakeError::InvalidState)?;
 		let server_random = self.server_random.ok_or(HandshakeError::InvalidState)?;
-		let spki_bytes = server_handshake
+		let server_ephemeral = server_handshake.server_ephemeral.to_byte_array::<EC_PUBKEY_COMPRESSED_SIZE>()?;
+		let spki = server_handshake
 			.certificate
 			.tbs_certificate
 			.subject_public_key_info
 			.subject_public_key
 			.raw_bytes();
 
-		// The transcript binds the negotiated profile and the transport
-		// capabilities as the bytes that arrived. A tampered `security_accept`
-		// or `transport_accept` yields a different hash and fails signature
-		// verification.
-		let accept_der = server_handshake.security_accept.as_ref().map(WireDer::der).unwrap_or_default();
+		// The transcript binds every leg as the bytes that arrived, so a
+		// tampered leg yields another hash and fails signature verification.
+		let security_accept_der = server_handshake.security_accept.as_ref().map(WireDer::der).unwrap_or_default();
 		let transport_accept_der = server_handshake.transport_accept.as_ref().map(WireDer::der).unwrap_or_default();
-		let mut transcript =
-			Transcript::ecies_handshake(client_hello, &server_random, spki_bytes, accept_der, transport_accept_der);
+		let legs = EciesHandshakeLegs {
+			client_hello,
+			server_random: &server_random,
+			server_ephemeral: &server_ephemeral,
+			spki,
+			security_accept_der,
+			transport_accept_der,
+		};
 
+		let mut transcript = Transcript::ecies_handshake(legs);
 		let transcript_digest = transcript.seal::<P::Digest>()?;
 		self.transcript_hash = Some(transcript_digest);
-
-		// Invariant: the transcript is immutable once its hash is computed.
-
-		Ok(())
-	}
-
-	/// Generate and store the base session key.
-	fn generate_base_session_key(&mut self) -> Result<(), HandshakeError> {
-		let base_key = generate_nonce::<32>(None)?;
-		self.base_session_key = Some(ZeroizingArray::new(base_key));
 
 		Ok(())
 	}
@@ -336,10 +341,19 @@ where
 	/// - [`HandshakeError::InvalidProfileSelection`] -- the server selected a profile outside the offer.
 	/// - [`HandshakeError::NegotiationError`] -- the selected profile is below
 	///   the strength floor or unrunnable, or the transport accept is invalid.
+	/// - [`HandshakeError::OctetStringLengthError`] -- the server ephemeral is
+	///   not a compressed point's width.
 	/// - [`HandshakeError::SignatureError`] -- the server signature fails to verify.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the signed server ephemeral is not a point on the curve.
+	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the signed server
+	///   ephemeral is the server's static key.
 	/// - [`HandshakeError::ReceiptMissing`] -- a budget-bearing accept has no signed receipt.
 	/// - [`HandshakeError::MutualAuthRequired`] -- the server or a receipt
 	///   requires a client identity, and none is set.
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret or the
+	///   acknowledgement key.
+	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the acknowledgement key.
+	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused to seal the countersignature.
 	pub async fn process_server_handshake(
 		&mut self,
 		server_handshake_der: impl AsRef<[u8]>,
@@ -370,21 +384,25 @@ where
 		// 7. Verify the server signature.
 		self.verify_server_handshake_signature(&server_handshake)?;
 
-		// 8. Validate, approve, and countersign the session receipt, which
+		// 8. Parse the server ephemeral the signature just authenticated,
+		//    beside the static key it must differ from.
+		let static_key = server_handshake.certificate.verifying_key::<P::Curve>()?;
+		let server_ephemeral = static_key.server_ephemeral(server_handshake.server_ephemeral.as_bytes())?;
+
+		// 9. Validate, approve, and countersign the session receipt, which
 		//    fails closed on a mismatch. The step consumes the receipt artifact
 		//    out of the decoded message, because the stored receipt owns it.
 		let pending_receipt = self.process_session_receipt(&mut server_handshake).await?;
 
-		// 9. Generate and encrypt the session key. The ECIES payload carries
-		//    the countersignature and its settlement answer, which keeps both
-		//    confidential.
-		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake, pending_receipt)?;
+		// 10. Draw the base secret and the ECIES ephemeral, derive the handshake
+		//     secret, and seal the payload with the countersignature inside it.
+		let encrypted_bytes = self.seal_key_exchange_payload(&server_handshake, &server_ephemeral, pending_receipt)?;
 
-		// 10. Handle mutual authentication. The signature commits to `encrypted_bytes`.
+		// 11. Handle mutual authentication. The signature commits to `encrypted_bytes`.
 		let (client_certificate, client_signature) =
 			self.prepare_client_auth(&server_handshake, &encrypted_bytes).await?;
 
-		// 11. Build and encode the ClientKeyExchange.
+		// 12. Build and encode the ClientKeyExchange.
 		let client_kex = ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
 			#[cfg(feature = "x509")]
@@ -393,10 +411,10 @@ where
 			client_signature,
 		};
 
-		// 12. Retain the validated server certificate for post-handshake renewals.
+		// 13. Retain the validated server certificate for post-handshake renewals.
 		self.server_certificate = Some(Arc::new(server_handshake.certificate));
 
-		// 13. Advance to KeyExchangeSent. Step 2 entered ServerHelloReceived.
+		// 14. Advance to KeyExchangeSent. Step 2 entered ServerHelloReceived.
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex)
@@ -432,30 +450,49 @@ where
 		self.verify_server_signature(&verifying_key, &transcript_digest, server_handshake.signature.as_bytes())
 	}
 
-	/// Generate the base session key and ECIES-encrypt it to the server.
+	/// Draw the base secret and the ECIES ephemeral, derive the handshake
+	/// secret, and ECIES-encrypt the payload to the server.
 	///
-	/// The pending receipt ack passes through encryption by value, so its
-	/// `SignerInfo` moves into the stored receipt without a clone.
-	fn generate_and_encrypt_session_key(
+	/// One ephemeral `r` serves both key agreements: `r·S` with the server's
+	/// static key seals the payload, and `r·E` with `server_ephemeral` feeds
+	/// the handshake secret. The ephemeral, the base secret, and the shared
+	/// secret are locals, so only the handshake secret outlives this call.
+	fn seal_key_exchange_payload(
 		&mut self,
 		server_handshake: &ServerHandshake,
+		server_ephemeral: &PublicKey<P::Curve>,
 		pending_receipt: Option<(SignedData, SignerInfo)>,
 	) -> Result<Vec<u8>, HandshakeError> {
-		self.generate_base_session_key()?;
-
-		let base_key = self.base_session_key.as_deref().ok_or(HandshakeError::InvalidState)?;
+		let base = BaseSecret::random(None)?;
 		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
+		let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+		let salt = self.randoms_salt()?;
+
+		// Ephemeral ECIES randomness comes straight from the OS CSPRNG, because
+		// the provider abstraction covers the KDF and the AEAD and not entropy.
+		let ephemeral = <PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey::random(&mut OsRng);
+		let shared = ephemeral.diffie_hellman(server_ephemeral);
+		let handshake_secret = HandshakeSecret::derive::<P>(&base, &shared, salt.as_kdf_salt())?;
+
 		let (artifact, receipt_ack) = match pending_receipt {
 			Some((artifact, ack)) => (Some(artifact), Some(ack)),
 			None => (None, None),
 		};
+		let sealed_ack = match receipt_ack.as_ref() {
+			Some(ack) => {
+				let ack_der = Zeroizing::new(ack.to_der()?);
+				Some(handshake_secret.seal_ack::<P>(salt.as_kdf_salt(), &transcript_hash, &ack_der)?)
+			}
+			None => None,
+		};
 
 		let client_certificate = self.identity.as_ref().map(ClientIdentity::certificate);
 		let aad = ClientKeyExchange::client_bound_aad(self.aad_domain_tag, client_certificate)?;
-		let (encrypted_bytes, receipt_ack) = self.perform_ecies_encryption(
-			base_key,
+		let encrypted_bytes = self.perform_ecies_encryption(
+			&ephemeral,
+			&base,
 			&client_random,
-			receipt_ack,
+			sealed_ack,
 			&server_handshake.certificate,
 			Some(aad.as_slice()),
 		)?;
@@ -466,7 +503,15 @@ where
 			self.stored_receipt = Some(StoredReceipt::try_from(completed)?);
 		}
 
+		self.handshake_secret = Some(handshake_secret);
 		Ok(encrypted_bytes)
+	}
+
+	/// The KDF salt of this handshake, over the randoms both sides hold.
+	fn randoms_salt(&self) -> Result<RandomsSalt, HandshakeError> {
+		let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
+		let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
+		Ok(RandomsSalt::new(client_random, server_random))
 	}
 
 	/// Validate, approve, and countersign the server's session receipt.
@@ -573,42 +618,32 @@ where
 		// 1. Validate the state.
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
-		// 2. Derive the final session keys.
-		let base_key = self.base_session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
-		let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
-		let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
+		// 2. Take the handshake secret. It drops when this function returns,
+		//    so completion is the one derivation from it.
+		let handshake_secret = self.handshake_secret.take().ok_or(HandshakeError::InvalidState)?;
+		let salt = self.randoms_salt()?;
 
-		// The AEAD derivation salt is `client_random || server_random`.
-		let mut salt = Zeroizing::new([0u8; 64]);
-		salt[..32].copy_from_slice(client_random);
-		salt[32..].copy_from_slice(server_random);
+		// 3. Derive the directional session keys, salted with `client_random || server_random`.
+		let session_ciphers = self.derive_directional_aead(&handshake_secret, salt.as_kdf_salt())?;
 
-		let salt_bytes = salt.as_slice();
-		let session_ciphers = self.derive_directional_aead(base_key.as_slice(), KdfSalt::new(salt_bytes))?;
-
-		// Invariant: AEAD key derivation runs exactly once, after the
-		// transcript locks.
-
-		// 3. Seed the epoch materials for post-handshake renewal.
+		// 4. Seed the epoch materials for post-handshake renewal.
 		if let Some(transcript_hash) = self.transcript_hash {
-			let epoch_salt = KdfSalt::new(salt_bytes);
-			let materials = EpochMaterials::derive::<P>(base_key.as_slice(), epoch_salt, transcript_hash)?;
+			let materials = EpochMaterials::derive::<P>(&handshake_secret, salt.as_kdf_salt(), transcript_hash)?;
 			self.epoch_materials = Some(materials);
 		}
 
-		// 4. Transition to the complete state.
+		// 5. Transition to the complete state.
 		self.state.transition(ClientHandshakeState::Completed)?;
 
-		// 5. Clear the sensitive data in place.
+		// 6. Clear the sensitive data in place.
 		self.clear_sensitive_data();
 
 		Ok(session_ciphers)
 	}
 
-	/// Erase the ephemeral ECIES key material after session establishment
-	/// (CWE-226).
+	/// Erase the handshake randoms after session establishment (CWE-226).
+	/// The handshake secret wipes at the take in `complete`.
 	fn clear_sensitive_data(&mut self) {
-		self.base_session_key.zeroize();
 		self.client_random.zeroize();
 		self.server_random.zeroize();
 	}
@@ -694,29 +729,27 @@ where
 		Ok(())
 	}
 
-	/// Encrypt the session payload to the server's public key.
-	///
-	/// It hands the `receipt_ack` back after encoding, and the caller moves it
-	/// into the completed stored artifact.
+	/// Encrypt the session payload to the server's public key under
+	/// `ephemeral`, the same key the handshake secret's agreement used.
 	fn perform_ecies_encryption(
 		&self,
-		base_key: &[u8; 32],
+		ephemeral: &<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey,
+		base: &BaseSecret,
 		client_random: &[u8; 32],
-		receipt_ack: Option<SignerInfo>,
+		sealed_ack: Option<Vec<u8>>,
 		server_certificate: &Certificate,
 		associated_data: Option<&[u8]>,
-	) -> Result<(Vec<u8>, Option<SignerInfo>), HandshakeError> {
+	) -> Result<Vec<u8>, HandshakeError> {
 		let payload = EciesSessionPayload {
-			base_key: OctetString::new(base_key.as_slice())?,
+			base_key: OctetString::new(base.as_bytes())?,
 			client_random: OctetString::new(client_random.as_slice())?,
-			receipt_ack,
+			receipt_ack: sealed_ack.map(OctetString::new).transpose()?,
 		};
 
-		// The DER buffer holds the base session key, so it wipes when dropped,
+		// The DER buffer holds the base secret, so it wipes when dropped,
 		// along with the transient OCTET STRING copy inside the payload.
 		let plaintext = Zeroizing::new(payload.to_der()?);
 		payload.base_key.into_bytes().zeroize();
-		let receipt_ack = payload.receipt_ack;
 
 		let recipient_pubkey = PublicKey::<P::Curve>::from_sec1_bytes(
 			server_certificate
@@ -726,16 +759,14 @@ where
 				.raw_bytes(),
 		)?;
 
-		// Ephemeral ECIES randomness comes straight from the OS CSPRNG, because
-		// the provider abstraction covers the KDF and the AEAD and not entropy.
-		let encrypted_message = encrypt::<_, _, _, M, P::Kdf, P::AeadCipher>(
+		let encrypted_message = ephemeral.encrypt_to::<M, P::Kdf, P::AeadCipher>(
 			&recipient_pubkey,
 			plaintext.as_slice(),
 			associated_data,
-			Some(&mut rand_core::OsRng),
+			&mut OsRng,
 		)?;
 
-		Ok((encrypted_message.to_bytes(), receipt_ack))
+		Ok(encrypted_message.to_bytes())
 	}
 }
 
@@ -757,7 +788,6 @@ where
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EciesPublicKeyOps,
-	<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
 	P::Signature: SignatureEncoding + LowSEncoding + Send + Sync,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
@@ -825,6 +855,7 @@ mod tests {
 	use super::*;
 	use crate::crypto::ecies::Secp256k1EciesMessage;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
+	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::PrehashSigner;
 	use crate::der::asn1::ObjectIdentifier;
@@ -832,6 +863,7 @@ mod tests {
 	use crate::oids::{HASH_SHA3_384, HASH_SHA3_512};
 	use crate::random::generate_nonce;
 	use crate::transport::handshake::negotiation::{NegotiationError, ProfileStrength, SecurityAccept, SecurityOffer};
+	use crate::transport::handshake::orchestrator::CompressedPoint;
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::ServerHandshake;
 
@@ -851,10 +883,12 @@ mod tests {
 
 		// And: Server creates a valid server handshake response
 		let server_random = generate_nonce::<32>(None)?;
+		let server_ephemeral = create_test_server_ephemeral();
 		let accept_der = SecurityAccept::new(create_default_test_profile()).to_der()?;
 		let transcript_hash = compute_test_transcript_hash(
 			&client_hello_der,
 			&server_random,
+			&server_ephemeral,
 			test_cert
 				.certificate
 				.tbs_certificate
@@ -865,22 +899,27 @@ mod tests {
 		);
 
 		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
-		let server_handshake_der =
-			create_test_server_handshake(&test_cert.certificate, &server_random, signature_bytes.to_bytes())?;
+		let server_handshake_der = create_test_server_handshake(
+			&test_cert.certificate,
+			&server_random,
+			&server_ephemeral,
+			signature_bytes.to_bytes(),
+		)?;
 
 		// When: Client processes the server handshake. The test asserts on the
 		// state the call leaves behind, not on the message it returns.
 		client.process_server_handshake(&server_handshake_der).await?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
-		assert!(client.base_session_key.is_some());
+		assert!(client.handshake_secret.is_some());
 		assert!(client.transcript_hash.is_some());
 
-		// When: Client completes the handshake
-		let _session_key = client.complete()?;
+		// When: Client completes the handshake, which takes the secret
+		let _ciphers = client.complete()?;
 
 		// Then: Handshake is complete
 		assert!(client.is_complete());
 		assert_eq!(client.state(), ClientHandshakeState::Completed);
+		assert!(client.handshake_secret.is_none());
 
 		Ok(())
 	}
@@ -894,10 +933,12 @@ mod tests {
 
 		let test_cert = create_test_certificate();
 		let server_random = generate_nonce::<32>(None)?;
+		let server_ephemeral = create_test_server_ephemeral();
 		let accept_der = SecurityAccept::new(create_default_test_profile()).to_der()?;
 		let transcript_hash = compute_test_transcript_hash(
 			&client_hello_der,
 			&server_random,
+			&server_ephemeral,
 			test_cert
 				.certificate
 				.tbs_certificate
@@ -907,8 +948,12 @@ mod tests {
 			&accept_der,
 		);
 		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
-		let server_handshake_der =
-			create_test_server_handshake(&test_cert.certificate, &server_random, signature_bytes.to_bytes())?;
+		let server_handshake_der = create_test_server_handshake(
+			&test_cert.certificate,
+			&server_random,
+			&server_ephemeral,
+			signature_bytes.to_bytes(),
+		)?;
 
 		let result = client.process_server_handshake(&server_handshake_der).await;
 		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
@@ -958,11 +1003,23 @@ mod tests {
 		Ok((client, hello))
 	}
 
-	/// A `ServerHandshake` signed by `test_cert` that accepts `profile`.
+	/// A `ServerHandshake` signed by `test_cert` that accepts `profile` and
+	/// carries a fresh server ephemeral.
 	fn signed_server_response(
 		test_cert: &TestCertificate,
 		client_hello_der: &[u8],
 		profile: SecurityProfileDesc,
+	) -> Result<Vec<u8>, Box<dyn Error>> {
+		signed_server_response_with_ephemeral(test_cert, client_hello_der, profile, &create_test_server_ephemeral())
+	}
+
+	/// A `ServerHandshake` signed by `test_cert` that accepts `profile` and
+	/// carries `server_ephemeral` inside its signed transcript.
+	fn signed_server_response_with_ephemeral(
+		test_cert: &TestCertificate,
+		client_hello_der: &[u8],
+		profile: SecurityProfileDesc,
+		server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
 	) -> Result<Vec<u8>, Box<dyn Error>> {
 		let server_random = [2u8; 32];
 		let accept_der = SecurityAccept::new(profile).to_der()?;
@@ -972,13 +1029,19 @@ mod tests {
 			.subject_public_key_info
 			.subject_public_key
 			.raw_bytes();
-		let transcript_hash =
-			compute_test_transcript_hash(client_hello_der, &server_random, server_public_key, &accept_der);
+		let transcript_hash = compute_test_transcript_hash(
+			client_hello_der,
+			&server_random,
+			server_ephemeral,
+			server_public_key,
+			&accept_der,
+		);
 
 		let signature: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 		let response = ServerHandshake {
 			certificate: test_cert.certificate.to_owned(),
 			server_random: OctetString::new(server_random)?,
+			server_ephemeral: OctetString::new(*server_ephemeral)?,
 			signature: OctetString::new(signature.to_bytes().to_vec())?,
 			security_accept: Some(WireDer::new(SecurityAccept::new(profile))?),
 			client_cert_required: false,
@@ -986,6 +1049,80 @@ mod tests {
 			session_receipt: None,
 		};
 		Ok(response.to_der()?)
+	}
+
+	/// `response` with its server ephemeral replaced by `server_ephemeral`
+	/// and nothing else changed, as an on-path party would rewrite it.
+	fn with_swapped_ephemeral(response: &[u8], server_ephemeral: impl AsRef<[u8]>) -> Result<Vec<u8>, Box<dyn Error>> {
+		let mut response = ServerHandshake::from_der(response)?;
+		response.server_ephemeral = OctetString::new(server_ephemeral.as_ref())?;
+		Ok(response.to_der()?)
+	}
+
+	/// A server ephemeral swapped for another valid point after a real server
+	/// signed its reply changes the transcript, so the signature fails before
+	/// any agreement.
+	#[tokio::test]
+	async fn a_tampered_server_ephemeral_fails_the_ecies_signature() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let mut server = TestEciesServerBuilder::new()
+			.with_key(test_cert.signing_key.to_owned())
+			.with_certificate(test_cert.certificate.to_owned())
+			.build()?;
+		let (mut client, hello) = profile_test_client(&test_cert, None)?;
+		let signed = server.process_client_hello(&hello).await?.to_der()?;
+		let tampered = with_swapped_ephemeral(&signed, create_test_server_ephemeral())?;
+
+		let result = client.process_server_handshake(&tampered).await;
+		assert!(matches!(result, Err(HandshakeError::SignatureError(_))));
+		Ok(())
+	}
+
+	/// A server ephemeral of another width fails the fixed-width transcript
+	/// leg before the signature check.
+	#[tokio::test]
+	async fn a_server_ephemeral_of_another_width_is_refused() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let (mut client, hello) = profile_test_client(&test_cert, None)?;
+		let signed = signed_server_response(&test_cert, &hello, create_default_test_profile())?;
+		let narrowed = with_swapped_ephemeral(&signed, [0x02u8; 32])?;
+
+		let result = client.process_server_handshake(&narrowed).await;
+		assert!(matches!(result, Err(HandshakeError::OctetStringLengthError(_))));
+		Ok(())
+	}
+
+	/// A validly signed server ephemeral that names no point on the curve is
+	/// refused at the parse, before any scalar multiplication.
+	#[tokio::test]
+	async fn an_off_curve_server_ephemeral_is_refused() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let (mut client, hello) = profile_test_client(&test_cert, None)?;
+		let signed = signed_server_response_with_ephemeral(
+			&test_cert,
+			&hello,
+			create_default_test_profile(),
+			&off_curve_point(),
+		)?;
+
+		let result = client.process_server_handshake(&signed).await;
+		assert!(matches!(result, Err(HandshakeError::InvalidPublicKey(_))));
+		Ok(())
+	}
+
+	/// A validly signed server ephemeral that is the server's own static key
+	/// is refused, so the agreement cannot collapse into the static one.
+	#[tokio::test]
+	async fn a_server_ephemeral_equal_to_the_static_key_is_refused() -> Result<(), Box<dyn Error>> {
+		let test_cert = create_test_certificate();
+		let (mut client, hello) = profile_test_client(&test_cert, None)?;
+		let static_key = PublicKey::<Secp256k1>::from(*test_cert.signing_key.verifying_key()).compressed_point()?;
+		let signed =
+			signed_server_response_with_ephemeral(&test_cert, &hello, create_default_test_profile(), &static_key)?;
+
+		let result = client.process_server_handshake(&signed).await;
+		assert!(matches!(result, Err(HandshakeError::ServerEphemeralIsStatic)));
+		Ok(())
 	}
 
 	#[tokio::test]

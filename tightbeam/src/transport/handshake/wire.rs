@@ -49,21 +49,24 @@ impl TryFrom<TransportEnvelope> for HandshakeMessage {
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 pub trait HandshakeOctets {
+	/// Fixed `N`-byte view of a public wire value, such as a nonce or a
+	/// compressed ephemeral public key.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::OctetStringLengthError`] on any other length, so a
+	///   short or long value fails closed
+	fn to_byte_array<const N: usize>(&self) -> Result<[u8; N], HandshakeError>;
+
 	/// Fixed 32-byte view of an ECIES wire nonce or other public value.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::OctetStringLengthError`] on any other length, so a
 	///   short or long nonce fails closed
-	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError>;
-
-	/// Copy the 32 bytes into `out`, which may be a wiping buffer, so a key
-	/// never passes through a plain array on the way.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::OctetStringLengthError`] on any other length
-	fn copy_to_32_byte_array(&self, out: &mut [u8; 32]) -> Result<(), HandshakeError>;
+	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError> {
+		self.to_byte_array::<32>()
+	}
 }
 
 #[cfg(any(
@@ -71,19 +74,14 @@ pub trait HandshakeOctets {
 	all(feature = "transport-multiplex", feature = "transport-cms")
 ))]
 impl HandshakeOctets for OctetString {
-	fn to_32_byte_array(&self) -> Result<[u8; 32], HandshakeError> {
-		let mut out = [0u8; 32];
-		self.copy_to_32_byte_array(&mut out)?;
-		Ok(out)
-	}
-
-	fn copy_to_32_byte_array(&self, out: &mut [u8; 32]) -> Result<(), HandshakeError> {
+	fn to_byte_array<const N: usize>(&self) -> Result<[u8; N], HandshakeError> {
 		let bytes = self.as_bytes();
+		let mut out = [0u8; N];
 		if bytes.len() != out.len() {
 			return Err(HandshakeError::OctetStringLengthError((bytes.len(), out.len()).into()));
 		}
 
 		out.copy_from_slice(bytes);
-		Ok(())
+		Ok(out)
 	}
 }

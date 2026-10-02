@@ -247,7 +247,7 @@ mod cms {
 				let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 				let (mut client, mut server) = (pair.client, pair.server);
 
-				let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
+				let key_exchange = client.build_key_exchange(None)?;
 				server.process_key_exchange(&key_exchange).await?;
 
 				let server_finished = server.build_server_finished().await?;

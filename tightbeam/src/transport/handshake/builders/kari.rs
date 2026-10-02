@@ -7,9 +7,9 @@ use super::error::KariBuilderError;
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
-use crate::der::asn1::BitString;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
-use crate::transport::handshake::kari::{HandshakeAgreement, HandshakeKek, Kek};
+use crate::transport::handshake::kari::{HandshakeKek, Kek, OriginatorKey};
+use crate::transport::handshake::orchestrator::HandshakeAgreement;
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 
 #[cfg(all(feature = "builder", feature = "aead"))]
@@ -18,8 +18,8 @@ use crate::cms::builder::{Error as CmsBuilderError, RecipientInfoBuilder, Recipi
 use crate::cms::content_info::CmsVersion;
 #[cfg(all(feature = "builder", feature = "aead"))]
 use crate::cms::enveloped_data::{
-	EncryptedKey, KeyAgreeRecipientIdentifier, KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, OriginatorPublicKey,
-	RecipientEncryptedKey, RecipientInfo, UserKeyingMaterial,
+	EncryptedKey, KeyAgreeRecipientIdentifier, KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, RecipientEncryptedKey,
+	RecipientInfo, UserKeyingMaterial,
 };
 #[cfg(all(feature = "builder", feature = "aead"))]
 use crate::crypto::profiles::CryptoProvider;
@@ -146,13 +146,7 @@ where
 			.take()
 			.ok_or(KariBuilderError::MissingSenderPublicKeySpki)?;
 
-		let algo = sender_pub_spki.algorithm;
-		let pub_key_bits = BitString::from_bytes(sender_pub_spki.subject_public_key.raw_bytes())?;
-
-		Ok(OriginatorIdentifierOrKey::OriginatorKey(OriginatorPublicKey {
-			algorithm: algo,
-			public_key: pub_key_bits,
-		}))
+		Ok(OriginatorIdentifierOrKey::OriginatorKey(sender_pub_spki.originator_key()?))
 	}
 
 	/// Validate that all required fields are set.

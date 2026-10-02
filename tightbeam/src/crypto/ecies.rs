@@ -11,7 +11,9 @@
 //!
 //! # ECIES Protocol
 //!
-//! **Encryption:**
+//! **Encryption** ([`encrypt`] draws the ephemeral and delegates to
+//! [`EciesSecretKeyOps::encrypt_to`], which a caller that reuses the
+//! ephemeral for a second key agreement calls itself):
 //!
 //! 1. Generate an ephemeral keypair (r, R = r·G).
 //! 2. Compute the shared secret S = r·P, where P is the recipient public key.
@@ -45,12 +47,13 @@ use crate::constants::{
 use crate::crypto::aead::{Aead, AeadCore, KeyInit, Nonce, Payload};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::hkdf::InvalidLength;
-use crate::crypto::k256::ecdh::{diffie_hellman, EphemeralSecret};
+use crate::crypto::k256::ecdh::diffie_hellman;
 use crate::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::k256::{PublicKey, SecretKey};
 use crate::crypto::kdf::{EcdhSecret, EciesKdf, KdfError, KdfFunction};
 use crate::crypto::secret::{Secret, SecretSlice};
-use crate::random::{generate_random_bytes, RngWrapper};
+use crate::random::generate_random_bytes;
+use crate::zeroize::Zeroizing;
 
 #[cfg(feature = "x509")]
 use crate::asn1::ObjectIdentifier;
@@ -96,19 +99,64 @@ pub trait EciesSecretKeyOps: Clone {
 	/// Run ECDH key agreement with `public_key` and return the raw shared
 	/// secret.
 	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> EcdhSecret;
-}
 
-/// Ephemeral key generation for ECIES encryption.
-pub trait EciesEphemeral {
-	/// The public key type of the recipient and of the ephemeral key.
-	type PublicKey: EciesPublicKeyOps;
-
-	/// Generate a new ephemeral keypair and return its public key bytes with
-	/// the ECDH shared secret.
-	fn generate_ephemeral(
+	/// Encrypt `plaintext` to `recipient_pubkey` with this key as the ECIES
+	/// ephemeral.
+	///
+	/// The result holds this key's public half and the ciphertext. A caller
+	/// that needs the ephemeral for a second key agreement, as the handshake
+	/// does, draws it and seals here. [`encrypt`] draws a fresh one and
+	/// delegates.
+	///
+	/// - `associated_data`: authenticated but unencrypted bytes (AAD).
+	/// - `rng`: the cryptographically secure RNG that draws the nonce.
+	///
+	/// # Type Parameters
+	///
+	/// - `K`: the KDF that derives the content-encryption key.
+	/// - `A`: the AEAD cipher that seals the plaintext.
+	///
+	/// # Errors
+	///
+	/// - [`EciesError::Kdf`] -- the KDF refused the content key length.
+	/// - [`EciesError::RandomGenerationFailed`] -- `rng` failed to fill the nonce.
+	/// - [`EciesError::EncryptionFailed`] -- the AEAD refused the plaintext.
+	/// - [`EciesError::InvalidCiphertext`] -- `M` refused the encoded message.
+	fn encrypt_to<M, K, A>(
+		&self,
 		recipient_pubkey: &Self::PublicKey,
-		rng: &mut dyn rand_core::CryptoRngCore,
-	) -> Result<(Vec<u8>, EcdhSecret)>;
+		plaintext: impl AsRef<[u8]>,
+		associated_data: Option<&[u8]>,
+		rng: &mut (impl CryptoRng + RngCore),
+	) -> Result<M>
+	where
+		M: EciesMessageOps,
+		K: KdfFunction,
+		A: Aead + KeyInit,
+	{
+		let plaintext = plaintext.as_ref();
+		let ephemeral_bytes = self.public_key().to_bytes();
+		let shared_secret = self.diffie_hellman(recipient_pubkey);
+		let cipher = shared_secret.content_cipher::<K, A>(&ephemeral_bytes)?;
+
+		let mut nonce = Nonce::<A>::default();
+		let source: &mut dyn CryptoRngCore = rng;
+		generate_random_bytes(nonce.as_mut_slice(), Some(source)).map_err(|_| EciesError::RandomGenerationFailed)?;
+
+		let payload = match associated_data {
+			Some(aad) => Payload { msg: plaintext, aad },
+			None => Payload { msg: plaintext, aad: b"" },
+		};
+
+		let ciphertext = cipher.encrypt(&nonce, payload).map_err(EciesError::EncryptionFailed)?;
+		let total_len = ephemeral_bytes.len() + nonce.len() + ciphertext.len();
+		let mut wire_bytes = Vec::with_capacity(total_len);
+		wire_bytes.extend_from_slice(&ephemeral_bytes);
+		wire_bytes.extend_from_slice(nonce.as_slice());
+		wire_bytes.extend_from_slice(&ciphertext);
+
+		M::from_bytes(&wire_bytes)
+	}
 }
 
 /// An error from an ECIES operation.
@@ -182,8 +230,12 @@ impl EciesSecretKeyOps for SecretKey {
 
 	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> EcdhSecret {
 		let shared_secret = diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
-		let bytes: [u8; ECDH_SHARED_SECRET_SIZE] = (*shared_secret.raw_secret_bytes()).into();
-		Secret::from(bytes)
+
+		// The x-coordinate lands in its wiping buffer directly, so no plain
+		// array of the shared secret exists on the way (CWE-226).
+		let mut sized = Zeroizing::new([0u8; ECDH_SHARED_SECRET_SIZE]);
+		sized.copy_from_slice(shared_secret.raw_secret_bytes());
+		Secret::from(sized)
 	}
 }
 
@@ -200,27 +252,6 @@ impl From<&SecretKey> for SecretSlice<u8> {
 	fn from(sk: &SecretKey) -> Self {
 		let bytes = SecretKey::to_bytes(sk).to_vec();
 		Secret::from(bytes)
-	}
-}
-
-impl EciesEphemeral for SecretKey {
-	type PublicKey = PublicKey;
-
-	fn generate_ephemeral(
-		recipient_pubkey: &Self::PublicKey,
-		rng: &mut dyn CryptoRngCore,
-	) -> Result<(Vec<u8>, EcdhSecret)> {
-		let mut wrapper = RngWrapper(rng);
-		let ephemeral_secret = EphemeralSecret::random(&mut wrapper);
-		let ephemeral_pubkey = ephemeral_secret.public_key();
-
-		// Perform ECDH to get shared secret
-		let shared_secret = ephemeral_secret.diffie_hellman(recipient_pubkey);
-
-		let ephemeral_point = ephemeral_pubkey.to_encoded_point(true);
-		let ephemeral_bytes = ephemeral_point.as_bytes().to_vec();
-		let shared_bytes: [u8; ECDH_SHARED_SECRET_SIZE] = (*shared_secret.raw_secret_bytes()).into();
-		Ok((ephemeral_bytes, Secret::from(shared_bytes)))
 	}
 }
 
@@ -325,9 +356,12 @@ impl EciesMessageOps for Secp256k1EciesMessage {
 	}
 }
 
-/// Encrypt `plaintext` to `recipient_pubkey` with ECIES.
+/// Encrypt `plaintext` to `recipient_pubkey` with ECIES under a fresh
+/// ephemeral.
 ///
-/// The result holds the ephemeral public key and the ciphertext.
+/// The result holds the ephemeral public key and the ciphertext. The
+/// ephemeral is drawn here and consumed by [`EciesSecretKeyOps::encrypt_to`],
+/// so it serves this one encryption.
 ///
 /// - `recipient_pubkey`: the recipient public key.
 /// - `plaintext`: the data to encrypt.
@@ -350,7 +384,6 @@ pub fn encrypt<PK, P, R, M, K, A>(
 ) -> Result<M>
 where
 	PK: EciesPublicKeyOps,
-	PK::SecretKey: EciesEphemeral<PublicKey = PK>,
 	P: AsRef<[u8]>,
 	R: CryptoRng + RngCore,
 	M: EciesMessageOps,
@@ -358,45 +391,16 @@ where
 	A: Aead + KeyInit,
 {
 	let plaintext = plaintext.as_ref();
-
-	// The provided RNG and `OsRng` share this one body.
-	macro_rules! do_encrypt {
-		($rng:expr) => {{
-			let (ephemeral_bytes, shared_secret) = PK::SecretKey::generate_ephemeral(recipient_pubkey, $rng)?;
-			let cipher = shared_secret.content_cipher::<K, A>(&ephemeral_bytes)?;
-
-			// The nonce is sized for the negotiated cipher. A failing random
-			// source returns `RandomGenerationFailed` and never panics.
-			let mut nonce = Nonce::<A>::default();
-			let source: &mut dyn CryptoRngCore = &mut *$rng;
-			generate_random_bytes(nonce.as_mut_slice(), Some(source))
-				.map_err(|_| EciesError::RandomGenerationFailed)?;
-
-			let payload = match associated_data {
-				Some(aad) => Payload { msg: plaintext, aad },
-				None => Payload { msg: plaintext, aad: b"" },
-			};
-
-			// One sized allocation holds the nonce and the ciphertext.
-			let ciphertext = cipher.encrypt(&nonce, payload).map_err(EciesError::EncryptionFailed)?;
-			let encrypted_len = ciphertext.len();
-			let mut final_ciphertext = Vec::with_capacity(nonce.len() + encrypted_len);
-			final_ciphertext.extend_from_slice(nonce.as_slice());
-			final_ciphertext.extend_from_slice(&ciphertext);
-
-			// One sized allocation holds the ephemeral key and the ciphertext.
-			let total_len = ephemeral_bytes.len() + final_ciphertext.len();
-			let mut wire_bytes = Vec::with_capacity(total_len);
-			wire_bytes.extend_from_slice(&ephemeral_bytes);
-			wire_bytes.extend_from_slice(&final_ciphertext);
-
-			M::from_bytes(&wire_bytes)
-		}};
-	}
-
 	match rng {
-		Some(r) => do_encrypt!(r),
-		None => do_encrypt!(&mut OsRng),
+		Some(rng) => {
+			let ephemeral = PK::SecretKey::random(rng);
+			ephemeral.encrypt_to::<M, K, A>(recipient_pubkey, plaintext, associated_data, rng)
+		}
+		None => {
+			let mut os_rng = OsRng;
+			let ephemeral = PK::SecretKey::random(&mut os_rng);
+			ephemeral.encrypt_to::<M, K, A>(recipient_pubkey, plaintext, associated_data, &mut os_rng)
+		}
 	}
 }
 

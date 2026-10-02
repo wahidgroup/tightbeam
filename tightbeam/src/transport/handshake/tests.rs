@@ -15,14 +15,24 @@ use std::sync::Arc;
 
 use crate::asn1::OctetString;
 use crate::cms::cert::IssuerAndSerialNumber;
-use crate::cms::enveloped_data::EnvelopedData;
+use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData};
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::constants::{
+	EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_C2S_KDF_INFO,
+	TIGHTBEAM_S2C_KDF_INFO,
+};
+use crate::crypto::aead::{Aead, DecryptContent, DirectionalCiphers, KeyInit, Nonce, Payload};
+use crate::crypto::common::KeySizeUser;
 use crate::crypto::hash::{Digest, Sha3_256};
+use crate::crypto::kdf::{EcdhSecret, KdfFunction};
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::policy::Secp256k1Policy;
-use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
+use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider, KdfProvider, SecurityProfileDesc};
+use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
+use crate::crypto::sign::elliptic_curve::PublicKey;
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
@@ -36,16 +46,28 @@ use crate::oids::{
 };
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
-use crate::transport::handshake::negotiation::{RunnableProfile, SecurityAccept};
+use crate::transport::handshake::negotiation::{
+	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, RunnableProfile, SecurityAccept, TransportAuthorizer,
+	TransportOffer,
+};
+#[cfg(feature = "transport-ecies")]
+use crate::transport::handshake::orchestrator::CompressedPoint;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::orchestrator::{BaseSecret, HandshakeAgreement};
+use crate::transport::handshake::primitives::KdfSalt;
+use crate::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
 use crate::transport::handshake::{
-	ClientHello, ClientKeyExchange, HandshakeAttribute, HandshakeError, PeerAuthentication, ServerHandshake,
+	ClientHello, ClientKeyExchange, EstablishedSession, HandshakeAttribute, HandshakeError, HandshakeSecret,
+	PeerAuthentication, ServerHandshake,
 };
 use crate::transport::wire_der::WireDer;
+use crate::utils::marker::MaybeSendFuture;
 use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Time;
 use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate, Version};
+use crate::TightBeamError;
 
 #[cfg(feature = "transport-ecies")]
 mod ecies {
@@ -61,7 +83,6 @@ use ecies::*;
 #[cfg(feature = "transport-cms")]
 mod cms {
 	pub use crate::cms::signed_data::SignedData;
-	pub use crate::crypto::sign::elliptic_curve::PublicKey;
 	pub use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	pub use crate::transport::handshake::client::CmsHandshakeClient;
 	pub use crate::transport::handshake::server::CmsHandshakeServer;
@@ -82,20 +103,6 @@ pub struct TestCertificate {
 	pub signing_key: Secp256k1SigningKey,
 	/// The certificate over the public key of `signing_key`.
 	pub certificate: Certificate,
-}
-
-/// Test handshake data that holds every random value and key a handshake
-/// uses.
-#[derive(Debug, Clone)]
-pub struct TestHandshakeData {
-	/// The random value the client contributes.
-	pub client_random: [u8; 32],
-	/// The random value the server contributes.
-	pub server_random: [u8; 32],
-	/// The random base session key.
-	pub base_session_key: [u8; 32],
-	/// The transcript hash computed over the test handshake messages.
-	pub transcript_hash: [u8; 32],
 }
 
 /// Create a test certificate with a secp256k1 keypair.
@@ -145,34 +152,203 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 	})
 }
 
-/// Generate random test handshake data.
-///
-/// The function creates cryptographically random values for the client
-/// random, the server random, and the base session key, then computes the
-/// transcript hash.
-pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn Error>> {
-	let client_random = generate_nonce::<32>(None)?;
-	let server_random = generate_nonce::<32>(None)?;
-	let base_session_key = generate_nonce::<32>(None)?;
-	let transcript_hash = compute_test_transcript_hash(client_random, &server_random, [], []);
+/// A fresh server ephemeral public key as the compressed SEC1 point the
+/// `ServerHandshake` carries. The private half is discarded, so a client that
+/// completes against it derives keys nobody else holds.
+#[cfg(feature = "transport-ecies")]
+pub fn create_test_server_ephemeral() -> [u8; EC_PUBKEY_COMPRESSED_SIZE] {
+	let public_key = SecretKey::random(&mut OsRng).public_key();
+	public_key.compressed_point().expect("a compressed secp256k1 point is 33 bytes")
+}
 
-	Ok(TestHandshakeData { client_random, server_random, base_session_key, transcript_hash })
+/// A 33-byte compressed encoding whose x-coordinate lies off secp256k1, so
+/// the SEC1 parser refuses it while its length passes every width check.
+///
+/// About half of all x-coordinates are off the curve, so the search ends after
+/// a few candidates.
+pub fn off_curve_point() -> [u8; EC_PUBKEY_COMPRESSED_SIZE] {
+	let mut candidate = [0u8; EC_PUBKEY_COMPRESSED_SIZE];
+	candidate[0] = 0x02;
+	for x in 1u8..=u8::MAX {
+		candidate[EC_PUBKEY_COMPRESSED_SIZE - 1] = x;
+		if PublicKey::<Secp256k1>::from_sec1_bytes(&candidate).is_err() {
+			return candidate;
+		}
+	}
+
+	panic!("no off-curve x-coordinate among 255 small candidates")
+}
+
+/// Whether `needle` appears anywhere inside `haystack`.
+pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
+	let needle = needle.as_ref();
+	haystack.as_ref().windows(needle.len()).any(|window| window == needle)
+}
+
+/// A handshake secret derived from a fixture base secret of `fill` bytes, a
+/// fixture ephemeral-ephemeral secret, and a fixture salt.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
+	let base = BaseSecret::try_from(SecretSlice::from(vec![fill; 32])).expect("32 bytes make a base secret");
+	let shared = EcdhSecret::from([0x11u8; 32]);
+	HandshakeSecret::derive::<DefaultCryptoProvider>(&base, &shared, KdfSalt::new(&[0x99u8; 32]))
+		.expect("fixture inputs derive a handshake secret")
+}
+
+/// A test session's record, sealed under the client's send cipher.
+pub const RECORD_PLAINTEXT: &[u8] = b"application record sealed under the traffic key";
+
+/// Seal one record under the client's send cipher.
+pub fn sealed_record(client: &EstablishedSession) -> Result<EncryptedContentInfo, TightBeamError> {
+	client.keys().send().encrypt_next(RECORD_PLAINTEXT, None)
+}
+
+/// The AEAD of the default provider, which the observer keys with what it
+/// derives.
+type ObserverCipher = <DefaultCryptoProvider as AeadProvider>::AeadCipher;
+
+/// The KDF of the default provider, which the observer runs the pre-change
+/// derivation through.
+type ObserverKdf = <DefaultCryptoProvider as KdfProvider>::Kdf;
+
+/// The attempts [`StaticKeyObserver::record_attempts`] makes: five
+/// candidates under both directional keys, and the pre-change key from the
+/// base alone under both directional labels.
+pub const RECORD_ATTEMPTS: usize = 12;
+
+/// The attempts [`StaticKeyObserver::ack_attempts`] makes: five candidates
+/// and the pre-change key from the base alone.
+pub const ACK_ATTEMPTS: usize = 6;
+
+/// The outcome of each record attempt an observer makes.
+pub type RecordAttempts = Vec<Result<SecretSlice<u8>, TightBeamError>>;
+
+/// The outcome of each acknowledgement attempt an observer makes.
+pub type AckAttempts = Vec<Result<SecretSlice<u8>, HandshakeError>>;
+
+/// A passive observer who recorded one session and later obtained the
+/// server's static key.
+///
+/// It holds the base secret that key recovers, the protocol salt, and the two
+/// ephemeral public keys as they crossed the wire. Each candidate below stands
+/// in for the ephemeral-ephemeral secret and runs through the production key
+/// schedule:
+///
+/// - the all-zero secret,
+/// - the static key's agreement with the client ephemeral,
+/// - the static key's agreement with the server ephemeral,
+/// - the x-coordinate of each ephemeral, and
+/// - the pre-change key, from the base secret alone.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub struct StaticKeyObserver {
+	base: BaseSecret,
+	salt: Vec<u8>,
+	candidates: Vec<EcdhSecret>,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl StaticKeyObserver {
+	/// Give the observer `static_key`, the `base` it recovered with it, the
+	/// two ephemeral public keys as SEC1 bytes, and the protocol `salt`.
+	pub fn new(
+		static_key: &SecretKey,
+		base: impl AsRef<[u8]>,
+		client_ephemeral: &[u8],
+		server_ephemeral: &[u8],
+		salt: impl AsRef<[u8]>,
+	) -> Result<Self, Box<dyn Error>> {
+		let client_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(client_ephemeral)?;
+		let server_ephemeral = PublicKey::<Secp256k1>::from_sec1_bytes(server_ephemeral)?;
+		let candidates = vec![
+			EcdhSecret::from([0u8; 32]),
+			static_key.shared_secret(&client_ephemeral)?,
+			static_key.shared_secret(&server_ephemeral)?,
+			x_coordinate(&client_ephemeral)?,
+			x_coordinate(&server_ephemeral)?,
+		];
+
+		let base = BaseSecret::try_from(SecretSlice::from(base.as_ref().to_vec()))?;
+		Ok(Self { base, salt: salt.as_ref().to_vec(), candidates })
+	}
+
+	/// Open `frame` under every traffic key the observer derives, in both
+	/// directions, and report each outcome.
+	pub fn record_attempts(&self, frame: &EncryptedContentInfo) -> Result<RecordAttempts, Box<dyn Error>> {
+		let mut attempts = Vec::with_capacity(RECORD_ATTEMPTS);
+		for secret in self.handshake_secrets()? {
+			let ciphers = DirectionalCiphers::derive::<DefaultCryptoProvider, _>(&secret, KdfSalt::new(&self.salt))?;
+			attempts.push(ciphers.client_to_server.decrypt_content(frame));
+			attempts.push(ciphers.server_to_client.decrypt_content(frame));
+		}
+
+		for label in [TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO] {
+			attempts.push(self.pre_change_cipher(label)?.decrypt_content(frame));
+		}
+
+		Ok(attempts)
+	}
+
+	/// Open the sealed acknowledgement `sealed` of the transcript
+	/// `transcript_hash` under every acknowledgement key the observer derives,
+	/// and report each outcome.
+	pub fn ack_attempts(&self, transcript_hash: &[u8; 32], sealed: &[u8]) -> Result<AckAttempts, Box<dyn Error>> {
+		let salt = KdfSalt::new(&self.salt);
+		let mut attempts = Vec::with_capacity(ACK_ATTEMPTS);
+		for secret in self.handshake_secrets()? {
+			attempts.push(secret.open_ack::<DefaultCryptoProvider>(salt, transcript_hash, sealed));
+		}
+
+		let cipher = self.pre_change_cipher(TIGHTBEAM_ACK_KDF_INFO)?;
+		let aad = [TIGHTBEAM_ACK_AAD_DOMAIN, transcript_hash.as_slice()].concat();
+		let nonce = Nonce::<ObserverCipher>::default();
+		let opened = cipher.decrypt(&nonce, Payload { msg: sealed, aad: &aad });
+		attempts.push(opened.map(SecretSlice::from).map_err(HandshakeError::ReceiptAckCipher));
+		Ok(attempts)
+	}
+
+	/// The handshake secret each candidate yields through the production
+	/// derivation.
+	fn handshake_secrets(&self) -> Result<Vec<HandshakeSecret>, HandshakeError> {
+		let salt = KdfSalt::new(&self.salt);
+		self.candidates
+			.iter()
+			.map(|shared| HandshakeSecret::derive::<DefaultCryptoProvider>(&self.base, shared, salt))
+			.collect()
+	}
+
+	/// The cipher the pre-change schedule keyed from the base secret alone
+	/// under `label`.
+	fn pre_change_cipher(&self, label: &[u8]) -> Result<ObserverCipher, HandshakeError> {
+		let key_size = <ObserverCipher as KeySizeUser>::key_size();
+		let key = ObserverKdf::derive_dynamic_key(self.base.as_bytes(), label, Some(&self.salt), key_size)?;
+		Ok(ObserverCipher::new_from_slice(&key)?)
+	}
+}
+
+/// The x-coordinate of `point` in the place of an ECDH output.
+fn x_coordinate(point: &PublicKey<Secp256k1>) -> Result<EcdhSecret, Box<dyn Error>> {
+	let encoded = point.to_encoded_point(false);
+	let x = encoded.x().ok_or("an affine point has an x-coordinate")?;
+	Ok(EcdhSecret::try_from(SecretSlice::from(x.to_vec()))?)
 }
 
 /// Compute a test transcript hash from the ClientHello DER, the server
-/// random, the SPKI bytes, and the security accept DER.
+/// random, the server ephemeral, the SPKI bytes, and the security accept DER.
 pub fn compute_test_transcript_hash(
 	client_hello: impl AsRef<[u8]>,
 	server_random: &[u8; 32],
+	server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
 	spki_bytes: impl AsRef<[u8]>,
 	accept_der: impl AsRef<[u8]>,
 ) -> [u8; 32] {
 	let client_hello = client_hello.as_ref();
 	let spki_bytes = spki_bytes.as_ref();
 	let accept_der = accept_der.as_ref();
-	let mut data = Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len());
+	let fixed = server_random.len() + server_ephemeral.len();
+	let mut data = Vec::with_capacity(client_hello.len() + fixed + spki_bytes.len() + accept_der.len());
 	data.extend_from_slice(client_hello);
 	data.extend_from_slice(server_random);
+	data.extend_from_slice(server_ephemeral);
 	data.extend_from_slice(spki_bytes);
 	data.extend_from_slice(accept_der);
 
@@ -197,12 +373,14 @@ pub fn create_test_client_hello(client_random: &[u8; 32]) -> Result<Vec<u8>, Box
 pub fn create_test_server_handshake(
 	certificate: &Certificate,
 	server_random: &[u8; 32],
+	server_ephemeral: &[u8; EC_PUBKEY_COMPRESSED_SIZE],
 	signature: impl AsRef<[u8]>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
 	let signature = signature.as_ref();
 	let server_handshake = ServerHandshake {
 		certificate: certificate.to_owned(),
 		server_random: OctetString::new(*server_random)?,
+		server_ephemeral: OctetString::new(*server_ephemeral)?,
 		signature: OctetString::new(signature)?,
 		security_accept: Some(WireDer::new(SecurityAccept::new(create_default_test_profile()))?),
 		client_cert_required: false,
@@ -264,12 +442,7 @@ pub fn create_test_signed_data(content: impl AsRef<[u8]>) -> SignedData {
 /// 2. the sender SPKI,
 /// 3. the recipient private key, and
 /// 4. the recipient public key.
-pub fn create_test_keypair() -> (
-	SecretKey,
-	SubjectPublicKeyInfoOwned,
-	SecretKey,
-	elliptic_curve::PublicKey<Secp256k1>,
-) {
+pub fn create_test_keypair() -> (SecretKey, SubjectPublicKeyInfoOwned, SecretKey, PublicKey<Secp256k1>) {
 	let sender_key = SecretKey::random(&mut OsRng);
 	let sender_pubkey = sender_key.public_key();
 	let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).expect("SPKI creation should succeed");
@@ -314,6 +487,72 @@ pub fn into_provider(signing_key: Secp256k1SigningKey) -> Arc<dyn SigningKeyProv
 pub fn mutual_with(validator: impl CertificateValidation + 'static) -> PeerAuthentication {
 	let validator: Arc<dyn CertificateValidation> = Arc::new(validator);
 	PeerAuthentication::mutual([validator])
+}
+
+/// The budgets a budget-bearing test session requests.
+pub const TEST_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
+
+/// The settlement challenge a challenging test authorizer issues.
+pub const TEST_CHALLENGE: &[u8] = b"test settlement challenge";
+
+/// The bearer settlement answer a paying test approver gives.
+pub const TEST_ANSWER: &[u8] = b"test bearer settlement answer";
+
+/// A budget-bearing transport offer with the test budgets.
+pub fn budget_offer() -> TransportOffer {
+	TransportOffer::mux(4).with_budgets(TEST_BUDGETS)
+}
+
+/// Grants the requested budgets with the test challenge and settles any
+/// answer.
+pub struct ChallengingAuthorizer;
+
+impl TransportAuthorizer for ChallengingAuthorizer {
+	fn authorize<'a>(
+		&'a self,
+		offer: &'a TransportOffer,
+	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
+		Box::pin(async move {
+			let challenge = OctetString::new(TEST_CHALLENGE).map_err(|_| AuthorizationRefusal { code: 1 })?;
+			Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: Some(challenge) })
+		})
+	}
+
+	fn settle<'a>(
+		&'a self,
+		_receipt: &'a SessionReceipt,
+		_response: Option<&'a [u8]>,
+	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
+		Box::pin(async move { Ok(()) })
+	}
+}
+
+/// Grants the requested budgets with the test challenge and leaves settlement
+/// to the trait default, which refuses a challenged receipt.
+pub struct RefusingAuthorizer;
+
+impl TransportAuthorizer for RefusingAuthorizer {
+	fn authorize<'a>(
+		&'a self,
+		offer: &'a TransportOffer,
+	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
+		ChallengingAuthorizer.authorize(offer)
+	}
+}
+
+/// Approves every receipt and answers its challenge with the test answer.
+pub struct PayingApprover;
+
+impl ReceiptApprover for PayingApprover {
+	fn approve<'a>(
+		&'a self,
+		_receipt: &'a SessionReceipt,
+	) -> MaybeSendFuture<'a, Result<Option<OctetString>, ApprovalRefusal>> {
+		Box::pin(async move {
+			let answer = OctetString::new(TEST_ANSWER).map_err(|_| ApprovalRefusal { code: 1 })?;
+			Ok(Some(answer))
+		})
+	}
 }
 
 /// Builder for test ECIES handshake servers with default settings.
@@ -457,11 +696,11 @@ impl TestCmsServerBuilder {
 	}
 
 	/// Build the CMS handshake server.
-	pub fn build(self) -> (CmsHandshakeServer<DefaultCryptoProvider>, PublicKey<k256::Secp256k1>) {
+	pub fn build(self) -> (CmsHandshakeServer<DefaultCryptoProvider>, PublicKey<Secp256k1>) {
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let verifying_key = *test_key.verifying_key();
 
-		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
+		let public_key = PublicKey::<Secp256k1>::from(verifying_key);
 		let provider = into_provider(test_key);
 		let server = CmsHandshakeServer::<DefaultCryptoProvider>::new(provider, self.peer_authentication);
 
