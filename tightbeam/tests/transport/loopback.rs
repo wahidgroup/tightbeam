@@ -7,7 +7,7 @@
 //!
 //! - Both sides complete and agree on the negotiated profile.
 //! - The derived directional `SessionKeys` are complementary.
-//! - CMS session keys are random per handshake, never constant (CWE-321).
+//! - CMS traffic keys are fresh per handshake, never shared (CWE-321).
 
 #![cfg(all(feature = "transport", feature = "x509", feature = "aead", feature = "tokio"))]
 
@@ -23,7 +23,7 @@ use tightbeam::{
 	exactly, tb_assert_spec, tb_scenario,
 	testing::SetupEnv,
 	trace::TraceCollector,
-	transport::handshake::{ClientHandshakeProtocol, ServerHandshakeProtocol},
+	transport::handshake::{ClientHandshakeProtocol, EstablishedSession, ServerHandshakeProtocol},
 	TightBeamError,
 };
 
@@ -67,8 +67,6 @@ const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;
 /// Number of ECIES loopback passes (0 when the feature is disabled).
 const ECIES_RUNS: u32 = cfg!(feature = "transport-ecies") as u32;
 
-const ZERO_KEY: [u8; 32] = [0u8; 32];
-
 tb_assert_spec! {
 	pub HandshakeLoopbackSpec,
 	V(1,0,0): {
@@ -98,7 +96,7 @@ tb_scenario! {
 			#[cfg(feature = "transport-cms")]
 			{
 				cms_loopback(&trace, &materials).await?;
-				cms_unique_session_keys(&trace, &materials).await?;
+				cms_unique_traffic_keys(&trace, &materials).await?;
 			}
 
 			Ok(())
@@ -241,51 +239,14 @@ fn build_cms_pair(
 	Ok((pair.client, pair.server))
 }
 
-/// Clone the session key held by a CMS client after `start`.
+/// Drive a CMS pair through its three legs. The flow is KeyExchange, then
+/// ServerFinished, then ClientFinished, which draws no reply.
 #[cfg(feature = "transport-cms")]
-fn session_key_bytes(
-	client: &CmsHandshakeClient<DefaultCryptoProvider>,
-	missing_msg: &'static str,
-) -> Result<Vec<u8>, TightBeamError> {
-	let secret = client.session_key().ok_or_else(|| expectation_failure(missing_msg))?;
-	let bytes = secret.with(|bytes| bytes.to_owned());
-	Ok(bytes)
-}
-
-/// True when `needle` appears as a contiguous window inside `haystack`.
-#[cfg(feature = "transport-cms")]
-fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> bool {
-	let haystack = haystack.as_ref();
-	let needle = needle.as_ref();
-	haystack.windows(needle.len()).any(|window| window == needle)
-}
-
-/// CMS loopback through the orchestrator trait surface.
-///
-/// The test covers the random session key. Both sides derive a working AEAD,
-/// and the client learns the negotiated profile from the server-Finished
-/// `SecurityAccept` attribute and can `complete()`.
-#[cfg(feature = "transport-cms")]
-async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
-	let profile = default_security_profile();
-	let (mut client, mut server) = build_cms_pair(materials)?;
-
-	// The flow is KeyExchange, then ServerFinished, then ClientFinished,
-	// which draws no reply.
-	let key_exchange = ClientHandshakeProtocol::start(&mut client).await?;
-
-	// Confidentiality (CWE-311): the CMS backend transports the session key
-	// wrapped inside the KeyExchange EnvelopedData, so the raw key MUST NOT
-	// appear anywhere in the cleartext wire bytes. This is the CMS equivalent
-	// of the ECIES `confidentiality` threat test, exercised on the real
-	// random-key path in place of the fixture's constant test key.
-	let session_key = session_key_bytes(&client, "CMS client must hold a session key after start")?;
-	if contains_window(key_exchange.der(), &session_key) {
-		return Err(expectation_failure(
-			"CMS session key must not appear in cleartext KeyExchange wire bytes",
-		));
-	}
-
+async fn drive_cms_pair(
+	client: &mut CmsHandshakeClient<DefaultCryptoProvider>,
+	server: &mut CmsHandshakeServer<DefaultCryptoProvider>,
+) -> Result<(), TightBeamError> {
+	let key_exchange = ClientHandshakeProtocol::start(client).await?;
 	let server_reply = server.handle_request(key_exchange).await?;
 	let server_finished = require_reply(server_reply, "CMS server must answer KeyExchange with ServerFinished")?;
 
@@ -293,27 +254,53 @@ async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Re
 	let client_finished = require_reply(client_reply, "CMS client must answer ServerFinished with ClientFinished")?;
 
 	let no_reply = server.handle_request(client_finished).await?;
-	require_terminal(no_reply, "CMS server must not reply to ClientFinished")?;
+	require_terminal(no_reply, "CMS server must not reply to ClientFinished")
+}
+
+/// CMS loopback through the orchestrator trait surface.
+///
+/// Both sides derive a working AEAD from the handshake secret, and the client
+/// learns the negotiated profile from the server-Finished `SecurityAccept`
+/// attribute and can `complete()`.
+#[cfg(feature = "transport-cms")]
+async fn cms_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
+	let profile = default_security_profile();
+	let (mut client, mut server) = build_cms_pair(materials)?;
+	drive_cms_pair(&mut client, &mut server).await?;
 
 	let events = (LOOPBACK_CMS_COMPLETE, LOOPBACK_CMS_ROUNDTRIP, LOOPBACK_CMS_PROFILE_AGREED);
 	emit_session_ready(Box::new(client), Box::new(server), profile, trace, events).await
 }
 
-/// CMS session keys must be random per handshake (CWE-321).
+/// Complete one CMS handshake against the fixture server and hand back both
+/// sessions.
 #[cfg(feature = "transport-cms")]
-async fn cms_unique_session_keys(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
-	let (mut client_a, _server_a) = build_cms_pair(materials)?;
-	let (mut client_b, _server_b) = build_cms_pair(materials)?;
+async fn established_cms_pair(
+	materials: &ServerMaterials,
+) -> Result<(EstablishedSession, EstablishedSession), TightBeamError> {
+	let (mut client, mut server) = build_cms_pair(materials)?;
+	drive_cms_pair(&mut client, &mut server).await?;
 
-	let _kex_a = ClientHandshakeProtocol::start(&mut client_a).await?;
-	let _kex_b = ClientHandshakeProtocol::start(&mut client_b).await?;
+	let client_session = ClientHandshakeProtocol::complete(Box::new(client)).await?;
+	let server_session = ServerHandshakeProtocol::complete(Box::new(server)).await?;
+	Ok((client_session, server_session))
+}
 
-	let key_a = session_key_bytes(&client_a, "CMS client A must hold a session key after start")?;
-	let key_b = session_key_bytes(&client_b, "CMS client B must hold a session key after start")?;
+/// CMS traffic keys must be fresh per handshake (CWE-321): two sessions
+/// against one server seal the same probe differently, and a frame from one
+/// session does not open on the other.
+#[cfg(feature = "transport-cms")]
+async fn cms_unique_traffic_keys(trace: &TraceCollector, materials: &ServerMaterials) -> Result<(), TightBeamError> {
+	let (client_a, _server_a) = established_cms_pair(materials).await?;
+	let (client_b, server_b) = established_cms_pair(materials).await?;
 
-	let unique_keys =
-		key_a.as_slice() != ZERO_KEY.as_slice() && key_b.as_slice() != ZERO_KEY.as_slice() && key_a != key_b;
-	trace.event_with(LOOPBACK_CMS_UNIQUE_KEYS, &[], unique_keys)?;
+	let probe = b"same probe under two sessions";
+	let frame_a = client_a.keys().send().encrypt_next(probe, None)?;
+	let frame_b = client_b.keys().send().encrypt_next(probe, None)?;
+
+	let distinct = frame_a.encrypted_content != frame_b.encrypted_content;
+	let isolated = server_b.keys().recv().decrypt_content(&frame_a).is_err();
+	trace.event_with(LOOPBACK_CMS_UNIQUE_KEYS, &[], distinct && isolated)?;
 
 	Ok(())
 }

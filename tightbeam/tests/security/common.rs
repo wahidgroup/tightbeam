@@ -697,10 +697,6 @@ const CMS_FLOW: &[FlowStep] = &[
 	FlowStep { index: 4, direction: Direction::ClientToServer },
 ];
 
-/// Fixed session key the CMS capture wraps, so a captured flow is reproducible.
-#[cfg(feature = "transport-cms")]
-const CMS_SESSION_KEY: [u8; 32] = [0xA5; 32];
-
 /// Declare a CMS session over one crypto provider.
 ///
 /// The provider bounds cannot be named once on stable, for the reason
@@ -771,10 +767,7 @@ macro_rules! cms_session {
 			}
 
 			fn open(&mut self) -> FlowFuture<'_, Vec<u8>> {
-				Box::pin(async move {
-					let session_key = tightbeam::ZeroizingBytes::new(CMS_SESSION_KEY.to_vec());
-					Ok(self.client.build_key_exchange(session_key, None)?.to_der()?)
-				})
+				Box::pin(async move { Ok(self.client.build_key_exchange(None)?.to_der()?) })
 			}
 
 			fn advance<'a>(

@@ -9,8 +9,7 @@
 //! # Signatures
 //!
 //! - The server signs the body inside its handshake response.
-//! - The client countersigns inside its key exchange and may answer the
-//!   challenge through a signed attribute.
+//! - The client countersigns inside its key exchange and may answer the challenge through a signed attribute.
 //! - Each signature covers the standard signed attributes: content type,
 //!   message digest, role, and the client's answer.
 //!
@@ -32,9 +31,11 @@
 //!   it as public data and never put a secret in it.
 //! - The client's answer is a bearer secret, such as a payment preimage or a
 //!   signed instrument. It goes inside the client's `SignerInfo`, which travels
-//!   to the server only encrypted, inside the ECIES key-exchange payload or a
-//!   CMS `EnvelopedData`. `Debug` output redacts its bytes, so they cannot leak
-//!   through logs.
+//!   to the server only sealed under the session's handshake secret, inside
+//!   the ECIES key-exchange payload or as the `RECEIPT_ACK` attribute of the
+//!   CMS client Finished (see
+//!   [forward secrecy](crate::transport::handshake#forward-secrecy)). `Debug`
+//!   output redacts its bytes, so they cannot leak through logs.
 //!
 //! # Retention
 //!
@@ -528,8 +529,7 @@ impl fmt::Debug for StoredReceipt {
 ///
 /// - Application codes sit at or above
 ///   [`MUX_APPLICATION_CODE_FLOOR`](crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR).
-/// - Codes below the floor are reserved for the TightBeam protocol, such as
-///   [`SETTLEMENT_UNSUPPORTED_CODE`].
+/// - Codes below the floor are reserved for the TightBeam protocol, such as [`SETTLEMENT_UNSUPPORTED_CODE`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApprovalRefusal {
 	/// Refusal code from the u32 space that settlement refusals also use.
@@ -616,8 +616,7 @@ pub struct SessionOutcome {
 	/// Client receipt `SignerInfo` DER as received.
 	///
 	/// - It is `None` exactly when the verdict is [`SessionVerdict::CountersignatureMissing`].
-	/// - It is present and unverified when the verdict is
-	///   [`SessionVerdict::CountersignatureInvalid`].
+	/// - It is present and unverified when the verdict is [`SessionVerdict::CountersignatureInvalid`].
 	///
 	/// Its signed attributes carry the settlement answer, so `Debug` output
 	/// redacts it with the answer.
@@ -810,8 +809,7 @@ impl SessionReceipt {
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::ReceiptMismatch`] -- the transcript, budgets, or
-	///   credit unit disagree.
+	/// - [`HandshakeError::ReceiptMismatch`] -- the transcript, budgets, or credit unit disagree.
 	pub(crate) fn verify_terms<D>(
 		&self,
 		transcript_hash: &[u8; 32],

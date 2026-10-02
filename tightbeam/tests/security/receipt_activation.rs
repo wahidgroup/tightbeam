@@ -30,8 +30,7 @@
 //!
 //! ## References
 //! - CWE-696: Incorrect Behavior Order <https://cwe.mitre.org/data/definitions/696.html>
-//! - CWE-306: Missing Authentication for Critical Function
-//!   <https://cwe.mitre.org/data/definitions/306.html>
+//! - CWE-306: Missing Authentication for Critical Function <https://cwe.mitre.org/data/definitions/306.html>
 
 #![cfg(all(feature = "transport-cms", feature = "transport-multiplex", feature = "testing"))]
 
@@ -86,7 +85,7 @@ tb_scenario! {
 
 			// Drive the handshake manually through the client Finished, then
 			// deliberately skip process_receipt_ack.
-			let key_exchange = client.build_key_exchange(tightbeam::ZeroizingBytes::new(vec![0xA5; 32]), None)?;
+			let key_exchange = client.build_key_exchange(None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
 			let server_finished = server.build_server_finished().await?;

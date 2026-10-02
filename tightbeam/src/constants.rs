@@ -11,8 +11,28 @@
 //!   deterministic exploration and fault injection.
 //! - **Configuration.** Backpressure, mux, envelope, timeout, colony, gossip, and peer discovery bounds.
 
-/// KDF info string for ECIES session key derivation (HKDF).
+/// KDF info string for the handshake secret (HKDF), which both protocols
+/// extract from the client's base secret and the ephemeral-ephemeral ECDH
+/// output under the protocol salt.
 pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
+
+/// KDF info string for the key that seals the receipt acknowledgement (HKDF).
+///
+/// The key derives from the handshake secret (see
+/// [forward secrecy](crate::transport::handshake#forward-secrecy)). One
+/// acknowledgement travels per handshake, so the key is single-use.
+///
+/// # Sources
+///
+/// - RFC 5116 § 3.2, a nonce used once per key: <https://datatracker.ietf.org/doc/html/rfc5116#section-3.2>
+pub const TIGHTBEAM_ACK_KDF_INFO: &[u8] = b"tb/session/kdf/ack/v1";
+
+/// Domain label the receipt acknowledgement seal binds as associated data,
+/// ahead of the transcript hash.
+///
+/// The label names the AEAD context alone, so the associated data differs
+/// from every signed Finished content and from [`TIGHTBEAM_ACK_KDF_INFO`].
+pub const TIGHTBEAM_ACK_AAD_DOMAIN: &[u8] = b"tb/handshake/ack/aad/v1";
 
 /// KDF info string for the client-to-server session key (HKDF).
 ///

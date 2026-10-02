@@ -10,7 +10,8 @@ use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::kari::{HandshakeAgreement, HandshakeKek, Kek};
+use crate::transport::handshake::kari::{HandshakeKek, Kek};
+use crate::transport::handshake::orchestrator::HandshakeAgreement;
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
 
 /// Recipient-side processor for `KeyAgreeRecipientInfo`.

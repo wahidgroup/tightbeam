@@ -2,7 +2,7 @@
 pub use rand_core::{CryptoRngCore, OsRng, RngCore};
 
 use crate::error::Result;
-#[cfg(any(feature = "ecies", feature = "transport-cms"))]
+#[cfg(feature = "transport-cms")]
 use rand_core::CryptoRng;
 
 /// Adapts a `&mut dyn CryptoRngCore` to the `Sized` `CryptoRng + RngCore`
@@ -11,10 +11,10 @@ use rand_core::CryptoRng;
 /// A `dyn` RNG is unsized, so `impl CryptoRngCore` bounds take this sized
 /// wrapper. It forwards every method to the underlying trait object,
 /// letting callers inject their own CSPRNG.
-#[cfg(any(feature = "ecies", feature = "transport-cms"))]
+#[cfg(feature = "transport-cms")]
 pub(crate) struct RngWrapper<'a>(pub(crate) &'a mut dyn CryptoRngCore);
 
-#[cfg(any(feature = "ecies", feature = "transport-cms"))]
+#[cfg(feature = "transport-cms")]
 impl RngCore for RngWrapper<'_> {
 	fn next_u32(&mut self) -> u32 {
 		self.0.next_u32()
@@ -33,7 +33,7 @@ impl RngCore for RngWrapper<'_> {
 	}
 }
 
-#[cfg(any(feature = "ecies", feature = "transport-cms"))]
+#[cfg(feature = "transport-cms")]
 impl CryptoRng for RngWrapper<'_> {}
 
 /// Generate a cryptographically random nonce.

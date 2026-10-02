@@ -3,7 +3,7 @@
 //! This module provides composable building blocks for implementing
 //! custom handshake protocols like PQXDH. These primitives handle:
 //! - Multi-input key derivation functions
-//! - Transcript hashing utilities  
+//! - Transcript hashing utilities
 //! - Prekey bundle ASN.1 structures
 
 pub mod kdf;
@@ -18,5 +18,10 @@ pub mod prekeys;
 pub use kdf::{kdf_chain, multi_input_kdf, KdfInfo, KdfSalt, KdfStage};
 pub use transcript::transcript_hash;
 
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+pub(crate) use kdf::RandomsSalt;
 #[cfg(feature = "unstable-pqxdh")]
 pub use prekeys::{PrekeyBundle, PrekeyIdentifiers, PrekeyInitialMessage};

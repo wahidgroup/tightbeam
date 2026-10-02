@@ -20,7 +20,7 @@
 //! │  • Server authentication  • Session keys      • Algorithm selection    │
 //! │  • Mutual authentication  • Forward secrecy   • Profile negotiation    │
 //! │  • Certificate validation • AEAD ciphers      • Dealer's choice mode   │
-//! │  • Transcript integrity   • Perfect secrecy   • Wire-level protocol    │
+//! │  • Transcript integrity                       • Wire-level protocol    │
 //! └────────────────────────────────────────────────────────────────────────┘
 //!
 //! ┌────────────────────────────────────────────────────────────────────────┐
@@ -31,9 +31,9 @@
 //! │  │                           │                                         │
 //! │  │── ClientHello ───────────►│  (client_rand, security_offer?)         │
 //! │  │                           │                                         │
-//! │  │◄─ ServerHandshake ────────│  (server_rand, cert, sig, accept?, ma?) │
-//! │  │                           │                                         │
-//! │  │── ClientKeyExchange ─────►│  (encrypted_key, [cert, sig]?)          │
+//! │  │◄─ ServerHandshake ────────│  (server_rand, eph, cert, sig, accept?, │
+//! │  │                           │   ma?)                                  │
+//! │  │── ClientKeyExchange ─────►│  (ecies(base, ack?), [cert, sig]?)      │
 //! │  │                           │                                         │
 //! │  │ ◄═ Session Established ═► │  (AEAD keys derived)                    │
 //! │  │                           │                                         │
@@ -41,9 +41,24 @@
 //! └────────────────────────────────────────────────────────────────────────┘
 //! **Legend:**
 //! - `[]` = optional fields, only present if mutual authentication is required
+//! - `eph` = the server's per-handshake ephemeral public key, inside the signed transcript
 //! - Arrows show message direction and content
 //! - Session establishment occurs after successful key exchange
 //! ```
+//!
+//! # Forward secrecy
+//!
+//! Both protocols derive every traffic key from one [`HandshakeSecret`],
+//! which takes two inputs:
+//!
+//! - the base secret the client seals to the server's static key, and
+//! - the ECDH output of the client's ephemeral and the server's ephemeral.
+//!
+//! The server signs its ephemeral inside the transcript, and both ephemeral
+//! private keys drop at the step that consumes them. A recording plus a later
+//! copy of the server's static key therefore recovers the base secret alone:
+//! the traffic keys, the rekey epochs, and the sealed receipt acknowledgement
+//! all need the ECDH output, and that needs a private key neither side kept.
 //!
 //! # Architecture
 //!
@@ -161,7 +176,7 @@ mod orchestrator;
 mod peer;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod wire;
 
@@ -184,7 +199,9 @@ pub use attributes::HandshakeAttribute;
 #[cfg(feature = "x509")]
 use attributes::HandshakeAttributes;
 pub use error::HandshakeError;
-pub use orchestrator::{EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
+pub use orchestrator::{
+	EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation, HandshakeSecret,
+};
 pub use peer::PeerAuthentication;
 
 #[cfg(feature = "transport-cms")]
@@ -254,7 +271,6 @@ use cms::*;
 
 #[cfg(feature = "transport-ecies")]
 mod ecies {
-	pub use crate::cms::signed_data::SignerInfo;
 	pub use crate::crypto::sign::SignatureEncoding;
 	pub use crate::transport::handshake::server::EciesHandshakeServer;
 }
@@ -278,7 +294,7 @@ use x509::*;
 
 /// Provisioned server identity for a CMS client handshake.
 ///
-/// The client encrypts the session key to the identity's leaf certificate.
+/// The client encrypts the base secret to the identity's leaf certificate.
 #[cfg(feature = "transport-cms")]
 pub enum CmsServerIdentity {
 	/// A bare server certificate, evaluated directly against the trust store.
@@ -307,12 +323,14 @@ impl From<Arc<[Certificate]>> for CmsServerIdentity {
 
 /// Configuration for a CMS client handshake orchestrator.
 ///
-/// CMS is a key-transport handshake. The client encrypts the session key to
-/// the server's public key in its first message, so the server identity must
-/// be provisioned up front instead of learned from the peer.
+/// The CMS client speaks first and encrypts its base secret to the server's
+/// public key in that first message, so the server identity must be
+/// provisioned up front instead of learned from the peer. The session keys
+/// then derive from that base secret and the ephemeral-ephemeral ECDH the
+/// server Finished completes.
 #[cfg(feature = "transport-cms")]
 pub struct CmsClientConfig {
-	/// The provisioned server identity the session key is encrypted to.
+	/// The provisioned server identity the base secret is encrypted to.
 	pub server_identity: CmsServerIdentity,
 	/// Trust store that authenticates the server identity. It is mandatory,
 	/// because a CMS handshake without a trust store authenticates no one
@@ -835,9 +853,10 @@ pub enum HandshakeProtocolKind {
 	Ecies,
 	/// CMS-based handshake (X.509 signed/enveloped data).
 	///
-	/// It is a key-transport handshake, so the client MUST provision a trust
-	/// store and the server certificate chain. A missing one fails closed, and
-	/// so does this kind without the `transport-cms` feature.
+	/// The client encrypts to the server certificate in its first message, so
+	/// it MUST provision a trust store and the server certificate chain. A
+	/// missing one fails closed, and so does this kind without the
+	/// `transport-cms` feature.
 	Cms,
 }
 
@@ -864,6 +883,11 @@ pub struct ServerHandshake {
 	pub certificate: Certificate,
 	/// 32-byte anti-replay nonce mixed into the key derivation.
 	pub server_random: OctetString,
+	/// The server's per-handshake ephemeral public key, as a compressed SEC1
+	/// point on the negotiated curve. The signed transcript binds it, and its
+	/// ECDH with the client's ECIES ephemeral feeds the handshake secret (see
+	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
+	pub server_ephemeral: OctetString,
 	/// Server signature over the transcript so far, proving possession
 	/// of the certificate's private key.
 	pub signature: OctetString,
@@ -895,27 +919,31 @@ pub struct ServerHandshake {
 
 /// Confidential plaintext of the ECIES key exchange.
 ///
-/// Only the server decrypts it. It carries the base session key, the
-/// anti-replay client random, and the client's receipt countersignature,
-/// whose signed attributes bind the bearer settlement answer.
+/// Only the server decrypts it. It carries the base secret, the anti-replay
+/// client random, and the sealed receipt countersignature.
 #[cfg(feature = "transport-ecies")]
 #[derive(Clone, Sequence)]
 pub(crate) struct EciesSessionPayload {
-	/// 32-byte base session key feeding the directional AEAD derivation.
+	/// 32-byte base secret, one of the two inputs of the handshake secret.
 	pub base_key: OctetString,
 	/// 32-byte client random echoed back for replay resistance.
 	pub client_random: OctetString,
-	/// Client receipt `SignerInfo` countersigning the server-issued
-	/// receipt. Required exactly when the server issued one.
+	/// The client receipt `SignerInfo` countersigning the server-issued
+	/// receipt, sealed under the handshake secret's acknowledgement key. Its
+	/// signed attributes bind the bearer settlement answer (see
+	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
+	/// Required exactly when the server issued a receipt.
 	#[asn1(context_specific = "0", optional = "true")]
-	pub receipt_ack: Option<SignerInfo>,
+	pub receipt_ack: Option<OctetString>,
 }
 
 /// Final client handshake message carrying the encrypted key material.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientKeyExchange {
 	/// Key-exchange payload encrypted to the server: the ECIES session
-	/// payload or a CMS `EnvelopedData`, per the negotiated protocol.
+	/// payload or a CMS `EnvelopedData`, per the negotiated protocol. The
+	/// ECIES message leads with the client's ephemeral public key, which the
+	/// server pairs with its own ephemeral for the handshake secret.
 	pub encrypted_data: OctetString,
 	/// Client certificate for mutual authentication. The client includes it
 	/// when the [`ServerHandshake`] sets `client_cert_required`.

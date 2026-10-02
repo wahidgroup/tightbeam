@@ -12,6 +12,8 @@ use crate::der::asn1::{Any, ObjectIdentifier, SetOfVec, UintRef};
 use crate::der::{Sequence, Tagged};
 
 #[cfg(feature = "transport-cms")]
+use crate::cms::enveloped_data::OriginatorPublicKey;
+#[cfg(feature = "transport-cms")]
 use crate::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
 use crate::der::asn1::OctetString;
@@ -19,8 +21,8 @@ use crate::der::asn1::OctetString;
 use crate::oids::CLIENT_CERTIFICATE;
 #[cfg(feature = "transport-cms")]
 use crate::oids::{
-	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER,
-	RECEIPT_ACK, SESSION_RECEIPT,
+	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL, HANDSHAKE_TRANSPORT_ACCEPT,
+	HANDSHAKE_TRANSPORT_OFFER, RECEIPT_ACK, SESSION_RECEIPT,
 };
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
@@ -150,9 +152,17 @@ impl AttributePayload for SignedData {
 	const OID: ObjectIdentifier = SESSION_RECEIPT;
 }
 
+/// The sealed receipt acknowledgement a client Finished carries.
 #[cfg(feature = "transport-cms")]
 impl AttributePayload for OctetString {
 	const OID: ObjectIdentifier = RECEIPT_ACK;
+}
+
+/// The server's per-handshake ephemeral public key on its Finished, carried
+/// as the same type the client's KARI originator uses.
+#[cfg(feature = "transport-cms")]
+impl AttributePayload for OriginatorPublicKey {
+	const OID: ObjectIdentifier = HANDSHAKE_SERVER_EPHEMERAL;
 }
 
 #[cfg(feature = "x509")]

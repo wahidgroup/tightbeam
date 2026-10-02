@@ -17,42 +17,62 @@ use alloc::vec::Vec;
 
 use core::fmt;
 
+use crate::cms::enveloped_data::OriginatorPublicKey;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile};
-use crate::crypto::secret::SecretSlice;
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
+use crate::crypto::secret::{Secret, SecretSlice};
 use crate::crypto::subtle::ConstantTimeEq;
-use crate::der::asn1::ObjectIdentifier;
+use crate::der::asn1::{BitString, ObjectIdentifier};
+use crate::der::{Decode, Error as DerError};
 use crate::oids::{AES_128_WRAP, AES_192_WRAP, AES_256_WRAP};
+use crate::spki::{EncodePublicKey, Error as SpkiError, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
+use crate::zeroize::Zeroize;
 use crate::ZeroizingBytes;
 
-#[cfg(feature = "ecdh")]
-use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
+/// Carriage of a public key as a CMS `OriginatorPublicKey`
+/// ([RFC 5652 § 6.2.2][rfc5652-6.2.2]).
+///
+/// The KARI builder carries the client's ephemeral this way from its SPKI,
+/// and the CMS server carries its own ephemeral on the Finished the same way
+/// from the public key itself, so the mapping has one home.
+///
+/// [rfc5652-6.2.2]: https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.2
+pub(crate) trait OriginatorKey {
+	/// What fails on the way from this key to its originator form.
+	type Error;
 
-/// ECDH key agreement on the handshake plane.
-pub(crate) trait HandshakeAgreement<C>
-where
-	C: Curve + CurveArithmetic,
-{
-	/// Derives the shared secret through ECDH and wraps it in a
-	/// [`SecretSlice`] for automatic zeroization.
-	fn shared_secret(&self, peer: &PublicKey<C>) -> Result<SecretSlice<u8>, HandshakeError>;
+	/// This key as an originator: its algorithm identifier and its public key
+	/// bits.
+	fn originator_key(self) -> Result<OriginatorPublicKey, Self::Error>;
 }
 
-impl<C> HandshakeAgreement<C> for SecretKey<C>
+impl OriginatorKey for SubjectPublicKeyInfoOwned {
+	type Error = DerError;
+
+	/// # Errors
+	///
+	/// - [`DerError`] -- the key bits fail to re-encode as a BIT STRING.
+	fn originator_key(self) -> Result<OriginatorPublicKey, DerError> {
+		let public_key = BitString::from_bytes(self.subject_public_key.raw_bytes())?;
+		Ok(OriginatorPublicKey { algorithm: self.algorithm, public_key })
+	}
+}
+
+impl<K> OriginatorKey for &K
 where
-	C: Curve + CurveArithmetic,
-	<C as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	K: EncodePublicKey,
 {
-	fn shared_secret(&self, peer: &PublicKey<C>) -> Result<SecretSlice<u8>, HandshakeError> {
-		let shared = diffie_hellman(self.to_nonzero_scalar(), peer.as_affine());
-		// Move the copy straight into a SecretSlice so that no plain binding
-		// outlives this line.
-		Ok(SecretSlice::from(shared.raw_secret_bytes().as_ref().to_vec()))
+	type Error = SpkiError;
+
+	/// # Errors
+	///
+	/// - [`SpkiError`] -- the key fails to encode as an SPKI, or its bits fail to re-encode as a BIT STRING.
+	fn originator_key(self) -> Result<OriginatorPublicKey, SpkiError> {
+		let spki_der = self.to_public_key_der()?;
+		let spki = SubjectPublicKeyInfoOwned::from_der(spki_der.as_bytes())?;
+		Ok(spki.originator_key()?)
 	}
 }
 
@@ -207,7 +227,12 @@ pub(crate) trait HandshakeKek {
 		P: CryptoProvider;
 }
 
-impl HandshakeKek for SecretSlice<u8> {
+/// The key provider answers the static agreement as a [`SecretSlice`], and
+/// [`HandshakeAgreement`] answers it sized, so both shapes derive a KEK.
+impl<S> HandshakeKek for Secret<S>
+where
+	S: Zeroize + AsRef<[u8]>,
+{
 	fn derive_kek<P>(&self, ukm: KdfSalt<'_>, kdf_info: KdfInfo<'_>) -> Result<ZeroizingBytes, HandshakeError>
 	where
 		P: CryptoProvider,
@@ -217,8 +242,9 @@ impl HandshakeKek for SecretSlice<u8> {
 		}
 
 		let key_size = key_wrap_key_size::<P>()?;
-		let kek = self
-			.with(|shared| P::Kdf::derive_dynamic_key(shared, kdf_info.as_bytes(), Some(ukm.as_bytes()), key_size))?;
+		let kek = self.with(|shared| {
+			P::Kdf::derive_dynamic_key(shared.as_ref(), kdf_info.as_bytes(), Some(ukm.as_bytes()), key_size)
+		})?;
 		Ok(kek)
 	}
 }
@@ -226,12 +252,14 @@ impl HandshakeKek for SecretSlice<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::aead::aes_kw;
 	use crate::crypto::secret::ToInsecure;
 
 	use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
 	use crate::random::OsRng;
+	use crate::transport::handshake::orchestrator::HandshakeAgreement;
 
 	#[test]
 	fn wrap_unwrap_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
@@ -278,6 +306,23 @@ mod tests {
 		let wrong_kek = wrong_secret.derive_kek::<DefaultCryptoProvider>(ukm_salt, label)?;
 		let bad = Kek::new(wrong_kek.as_slice()).unwrap_verified(&provider, &wrapped);
 		assert!(bad.is_err());
+		Ok(())
+	}
+
+	/// A wrapped CEK altered in flight fails the AES-KW integrity check, and
+	/// the error names that check rather than a key length.
+	#[test]
+	fn a_tampered_wrapped_key_reports_the_integrity_failure() -> Result<(), HandshakeError> {
+		let provider = DefaultCryptoProvider::default();
+		let kek = [0x11u8; 32];
+		let mut wrapped = Kek::new(&kek).wrap(&provider, ROUND_TRIP_CEK)?;
+		wrapped[0] ^= 0x01;
+
+		let tampered = Kek::new(&kek).unwrap_verified(&provider, &wrapped);
+		assert!(matches!(
+			tampered,
+			Err(HandshakeError::AesKeyWrap(aes_kw::Error::IntegrityCheckFailed))
+		));
 		Ok(())
 	}
 

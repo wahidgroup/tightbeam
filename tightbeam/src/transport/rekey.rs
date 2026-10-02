@@ -22,8 +22,7 @@
 //!
 //! # Bindings
 //!
-//! - The epoch receipt's `transcript_hash` pins the exchange: `H(hash_prev ||
-//!   request_der || server_random)`.
+//! - The epoch receipt's `transcript_hash` pins the exchange: `H(hash_prev || request_der || server_random)`.
 //! - The chain root advances over the full exchange: `hash_next = H(hash_prev
 //!   || request_der || response_der || ack_der)`, so every epoch receipt
 //!   transitively commits to the whole session history back to the handshake
@@ -40,7 +39,6 @@ use std::sync::Arc;
 use futures::lock::Mutex as FuturesMutex;
 
 use crate::cms::signed_data::{SignedData, SignerIdentifier, SignerInfo};
-use crate::constants::TIGHTBEAM_EPOCH_KDF_INFO;
 use crate::crypto::aead::{DirectionalCiphers, KeyInit, RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
@@ -51,13 +49,12 @@ use crate::random::generate_nonce;
 use crate::transport::envelopes::{MuxRekeyAckPackage, MuxRekeyRequestPackage, MuxRekeyResponsePackage};
 use crate::transport::handshake::negotiation::TransportAuthorizer;
 use crate::transport::handshake::primitives::transcript::Transcript;
-use crate::transport::handshake::primitives::{kdf_chain, KdfInfo, KdfSalt, KdfStage};
+use crate::transport::handshake::primitives::RandomsSalt;
 use crate::transport::handshake::receipt::ReceiptArtifact;
 use crate::transport::handshake::receipt::{
 	ReceiptApprover, ReceiptRole, SessionObserver, SessionOutcome, SessionReceipt, SessionVerdict, StoredReceipt,
 };
-use crate::transport::handshake::HandshakeOctets;
-use crate::transport::handshake::{EpochMaterials, HandshakeError};
+use crate::transport::handshake::{EpochMaterials, HandshakeError, HandshakeOctets};
 use crate::transport::multiplex::MuxRole;
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::x509::Certificate;
@@ -138,16 +135,9 @@ where
 		server_random: &[u8; 32],
 		next_hash: [u8; 32],
 	) -> Result<(SendCipher, RecvCipher), HandshakeError> {
-		let mut salt = [0u8; 64];
-		salt[..32].copy_from_slice(client_random);
-		salt[32..].copy_from_slice(server_random);
-
-		let stage = KdfStage {
-			input: self.epoch.secret.as_slice(),
-			info: KdfInfo::new(TIGHTBEAM_EPOCH_KDF_INFO),
-		};
-		let next_secret = kdf_chain::<P>(&[stage], KdfSalt::new(&salt))?;
-		let directional = DirectionalCiphers::derive::<P>(&next_secret, KdfSalt::new(&salt))?;
+		let salt = RandomsSalt::new(client_random, server_random);
+		let next_secret = self.epoch.secret.next::<P>(salt.as_kdf_salt())?;
+		let directional = DirectionalCiphers::derive::<P, _>(&next_secret, salt.as_kdf_salt())?;
 
 		let next_epoch = self.epoch.epoch.checked_add(1).ok_or(HandshakeError::IntegerOutOfRange)?;
 		self.epoch.secret = next_secret;
@@ -665,10 +655,15 @@ pub(crate) mod tests {
 	use crate::oids::HASH_SHA3_256;
 	use crate::random::OsRng;
 	use crate::transport::handshake::negotiation::MuxBudgets;
-	use crate::zeroize::Zeroizing;
+	use crate::transport::handshake::primitives::KdfSalt;
+	use crate::transport::handshake::tests::fixture_handshake_secret;
 
-	const SAMPLE_SECRET: [u8; 32] = [0x42u8; 32];
+	/// The base-secret fill of the handshake every sample epoch derives from.
+	const SAMPLE_BASE: u8 = 0x42;
+	const SAMPLE_SALT: [u8; 32] = [0x99u8; 32];
 	const SAMPLE_CHAIN_ROOT: [u8; 32] = [0x07u8; 32];
+	const SAMPLE_CLIENT_RANDOM: [u8; 32] = [0x01u8; 32];
+	const SAMPLE_SERVER_RANDOM: [u8; 32] = [0x02u8; 32];
 	const SAMPLE_BUDGETS: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 1024 };
 	const SAMPLE_CREDIT_UNIT: u32 = 1024;
 	const PLAINTEXT: &[u8] = b"epoch traffic";
@@ -687,12 +682,29 @@ pub(crate) mod tests {
 		Ok(Identity { provider: Arc::new(provider), verifying_key, sid })
 	}
 
-	fn sample_epoch() -> EpochMaterials {
-		EpochMaterials {
-			secret: Zeroizing::new(SAMPLE_SECRET.to_vec()),
-			epoch: 0,
-			transcript_hash: SAMPLE_CHAIN_ROOT,
-		}
+	/// Epoch 0 of a handshake whose base secret is `fill` bytes, rooted at the
+	/// sample chain root.
+	fn sample_epoch_from(fill: u8) -> Result<EpochMaterials, HandshakeError> {
+		let secret = fixture_handshake_secret(fill);
+		EpochMaterials::derive::<DefaultCryptoProvider>(&secret, KdfSalt::new(&SAMPLE_SALT), SAMPLE_CHAIN_ROOT)
+	}
+
+	fn sample_epoch() -> Result<EpochMaterials, HandshakeError> {
+		sample_epoch_from(SAMPLE_BASE)
+	}
+
+	/// Rekey materials over `epoch` for a fresh identity and a fresh peer.
+	fn materials_with(epoch: EpochMaterials) -> Result<RekeyMaterials<DefaultCryptoProvider>, HandshakeError> {
+		let identity = test_identity()?;
+		let peer = test_identity()?;
+		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
+		Ok(RekeyMaterials::new(
+			epoch,
+			reference,
+			identity.provider,
+			peer.verifying_key,
+			peer.sid,
+		))
 	}
 
 	/// The SHA3-256 `DigestInfo` a receipt carries for `hash`.
@@ -719,14 +731,14 @@ pub(crate) mod tests {
 		let reference = sample_reference(SAMPLE_CREDIT_UNIT)?;
 
 		let client_materials = RekeyMaterials::new(
-			sample_epoch(),
+			sample_epoch()?,
 			reference.to_owned(),
 			client_identity.provider,
 			server_identity.verifying_key,
 			server_identity.sid,
 		);
 		let server_materials = RekeyMaterials::new(
-			sample_epoch(),
+			sample_epoch()?,
 			reference,
 			server_identity.provider,
 			client_identity.verifying_key,
@@ -771,6 +783,41 @@ pub(crate) mod tests {
 		let downlink = server_install.send_cipher.encrypt_next(PLAINTEXT, None)?;
 		let received = client_install.recv_cipher.decrypt_content(&downlink)?;
 		assert!(received.with(|plain| plain == PLAINTEXT));
+		Ok(())
+	}
+
+	/// Two chains that share the public chain root and the exchange randoms
+	/// but hold different epoch secrets derive different traffic keys, so the
+	/// next epoch depends on the previous epoch secret and on nothing public.
+	#[test]
+	fn the_next_epoch_depends_on_the_previous_epoch_secret() -> Result<(), Box<dyn std::error::Error>> {
+		let mut first = materials_with(sample_epoch_from(SAMPLE_BASE)?)?;
+		let mut second = materials_with(sample_epoch_from(SAMPLE_BASE + 1)?)?;
+		let (first_send, _first_recv) =
+			first.rotate(MuxRole::Client, &SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM, SAMPLE_CHAIN_ROOT)?;
+		let (_second_send, second_recv) =
+			second.rotate(MuxRole::Server, &SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM, SAMPLE_CHAIN_ROOT)?;
+
+		let frame = first_send.encrypt_next(PLAINTEXT, None)?;
+		assert!(second_recv.decrypt_content(&frame).is_err());
+		Ok(())
+	}
+
+	/// The rotated traffic keys come from the next chain link, so a frame
+	/// sealed under the previous epoch secret's directional key does not open
+	/// under them.
+	#[test]
+	fn rotation_leaves_the_previous_epoch_keys_behind() -> Result<(), Box<dyn std::error::Error>> {
+		let epoch = sample_epoch()?;
+		let salt = RandomsSalt::new(&SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM);
+		let previous = DirectionalCiphers::derive::<DefaultCryptoProvider, _>(&epoch.secret, salt.as_kdf_salt())?;
+		let (previous_send, _previous_recv) = SessionKeys::for_client(previous).into_parts();
+		let mut materials = materials_with(epoch)?;
+		let (_send, recv) =
+			materials.rotate(MuxRole::Server, &SAMPLE_CLIENT_RANDOM, &SAMPLE_SERVER_RANDOM, SAMPLE_CHAIN_ROOT)?;
+
+		let frame = previous_send.encrypt_next(PLAINTEXT, None)?;
+		assert!(recv.decrypt_content(&frame).is_err());
 		Ok(())
 	}
 

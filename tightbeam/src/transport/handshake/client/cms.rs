@@ -1,20 +1,22 @@
 //! CMS-based client handshake orchestrator.
 //!
 //! [`CmsHandshakeClient`] runs the client side of the TightBeam handshake
-//! protocol with CMS builders and processors.
+//! protocol with CMS builders and processors. The client's KARI ephemeral
+//! serves two agreements: with the server's static key it wraps the base
+//! secret, and with the server ephemeral on the Finished it feeds the
+//! handshake secret.
 
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 
 use crate::cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use crate::cms::content_info::CmsVersion;
-use crate::cms::enveloped_data::{EnvelopedData, KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::cms::enveloped_data::{EnvelopedData, KeyAgreeRecipientIdentifier, OriginatorPublicKey, UserKeyingMaterial};
 use crate::cms::signed_data::{CertificateSet, EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::crypto::aead::{KeyInit, SessionKeys};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
-use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
 use crate::crypto::sign::{EcdsaSignatureVerifier, LowSEncoding, SignatureAlgorithmIdentifier};
@@ -25,8 +27,8 @@ use crate::crypto::x509::utils::{compute_signer_identifier, compute_signer_ident
 use crate::crypto::x509::Certificate;
 use crate::der::asn1::{OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
-use crate::der::{Any, Decode, Encode};
-use crate::oids::{DATA, HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_TRANSPORT_ACCEPT, SESSION_RECEIPT};
+use crate::der::{Any, Choice, Decode, DecodeValue, Encode};
+use crate::oids::DATA;
 use crate::random::{generate_nonce, CryptoRngCore, OsRng, RngWrapper};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::attributes::AttributePayload;
@@ -38,8 +40,10 @@ use crate::transport::handshake::negotiation::{
 	MuxSettings, ProfileStrengthPolicy, RunnableProfile, SecurityAccept, SecurityOffer, StrengthFloor, TransportAccept,
 	TransportOffer,
 };
-use crate::transport::handshake::orchestrator::HandshakeVerifyingKey;
-use crate::transport::handshake::primitives::transcript::{FinishedRole, Transcript};
+use crate::transport::handshake::orchestrator::{
+	BaseSecret, HandshakeAgreement, HandshakeVerifyingKey, KeySchedule, ServerEphemeral,
+};
+use crate::transport::handshake::primitives::transcript::{FinishedRole, ServerFinishedLegs, Transcript};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::ReceiptArtifact;
@@ -47,13 +51,12 @@ use crate::transport::handshake::receipt::ReceiptSigner;
 use crate::transport::handshake::receipt::{ReceiptApprover, ReceiptRole, SessionReceipt, StoredReceipt};
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine, Cms};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
-use crate::transport::handshake::{EpochMaterials, EstablishedSession, HandshakeMessage};
+use crate::transport::handshake::{EpochMaterials, EstablishedSession, HandshakeMessage, HandshakeSecret};
 use crate::transport::state::ClientIdentity;
 use crate::transport::wire_der::WireDer;
 use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::zeroize::Zeroizing;
-use crate::ZeroizingBytes;
 
 /// A server certificate path and a shared handle to the leaf it ends with.
 ///
@@ -105,9 +108,11 @@ impl From<Arc<[Certificate]>> for ServerChain {
 ///
 /// The client handshake runs in order:
 ///
-/// 1. Send KeyExchange (EnvelopedData with KARI).
-/// 2. Receive and verify the server Finished (SignedData).
-/// 3. Send the client Finished (SignedData).
+/// 1. Send KeyExchange (EnvelopedData with KARI) carrying the base secret, and keep the KARI ephemeral.
+/// 2. Receive and verify the server Finished (SignedData), whose transcript
+///    carries the server ephemeral, then derive the handshake secret from the
+///    base secret and the ephemeral-ephemeral ECDH.
+/// 3. Send the client Finished (SignedData) with the receipt countersignature sealed under that secret.
 pub struct CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
@@ -120,7 +125,10 @@ where
 	server_cert: Option<Arc<Certificate>>,
 	server_chain: Option<ServerChain>,
 	transcript: Transcript,
-	session_key: Option<SecretSlice<u8>>,
+	/// The base secret and the KARI ephemeral from the key exchange to the
+	/// server Finished, which takes them, and the handshake secret from there
+	/// to completion, which takes that.
+	key_schedule: KeySchedule<PendingKeyExchange<P>>,
 	security_offer: Option<SecurityOffer>,
 	strength_floor: StrengthFloor,
 	transport_offer: Option<TransportOffer>,
@@ -131,6 +139,20 @@ where
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	pending_receipt: Option<(SessionReceipt, SignedData)>,
 	stored_receipt: Option<StoredReceipt>,
+}
+
+/// What the client holds between its key exchange and the server Finished.
+///
+/// The base secret and the ephemeral travel in one value, so one `take`
+/// consumes both at the agreement.
+struct PendingKeyExchange<P>
+where
+	P: CryptoProvider,
+{
+	/// The base secret the key exchange carried to the server.
+	base: BaseSecret,
+	/// The KARI ephemeral, kept for the agreement with the server ephemeral.
+	ephemeral: SecretKey<P::Curve>,
 }
 
 /// Signer identity and algorithm identifiers for a Finished SignedData.
@@ -189,7 +211,7 @@ where
 			server_cert,
 			server_chain,
 			transcript: Transcript::new(),
-			session_key: None,
+			key_schedule: KeySchedule::Idle,
 			security_offer: None,
 			strength_floor: StrengthFloor::default(),
 			transport_offer: None,
@@ -292,7 +314,7 @@ where
 		self.state.expect_state(expected)
 	}
 
-	/// The server certificate that the session key is encrypted to. It is the
+	/// The server certificate that the base secret is encrypted to. It is the
 	/// pinned certificate when set, and otherwise the provisioned chain's leaf.
 	fn server_leaf(&self) -> Result<&Certificate, HandshakeError> {
 		if let Some(cert) = &self.server_cert {
@@ -359,9 +381,7 @@ where
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<(SecretKey<P::Curve>, SubjectPublicKeyInfoOwned), HandshakeError> {
 		let sender_ephemeral = SecretKey::<P::Curve>::random(&mut RngWrapper(rng));
-		let sender_public = sender_ephemeral.public_key();
-		let sender_pub_spki = sender_public.to_public_key_der()?;
-		let sender_pub_spki = SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes())?;
+		let sender_pub_spki = SubjectPublicKeyInfoOwned::from_key(sender_ephemeral.public_key())?;
 
 		Ok((sender_ephemeral, sender_pub_spki))
 	}
@@ -420,11 +440,11 @@ where
 	}
 
 	/// Build the KeyExchange message: EnvelopedData with a KARI that carries
-	/// the session key, encoded once so the transcript binds the bytes sent.
+	/// the base secret, encoded once so the transcript binds the bytes sent.
 	///
-	/// `rng` draws the ephemeral key, the UKM, the CEK and the content nonce.
-	/// `None` uses [`OsRng`]. Supply one on a `no_std` target without an
-	/// OS-backed `getrandom`.
+	/// `rng` draws the base secret, the ephemeral key, the UKM, the CEK and
+	/// the content nonce. `None` uses [`OsRng`]. Supply one on a `no_std`
+	/// target without an OS-backed `getrandom`.
 	///
 	/// # Errors
 	///
@@ -437,7 +457,6 @@ where
 	/// - [`HandshakeError::MissingKeyWrapAlgorithm`] -- the profile names no key wrap.
 	pub fn build_key_exchange(
 		&mut self,
-		session_key: ZeroizingBytes,
 		rng: Option<&mut dyn CryptoRngCore>,
 	) -> Result<WireDer<EnvelopedData>, HandshakeError> {
 		// 1. Validate state and certificate
@@ -448,32 +467,42 @@ where
 		let mut os = OsRng;
 		let rng: &mut dyn CryptoRngCore = rng.unwrap_or(&mut os);
 
-		// 3. Extract cryptographic material
+		// 3. Draw the base secret, one of the two inputs of the handshake
+		//    secret, fresh for this handshake (CWE-321).
+		let base = BaseSecret::random(Some(rng))?;
+
+		// 4. Extract cryptographic material. The ephemeral is cloned into the
+		//    KARI builder and kept here for the agreement with the server
+		//    ephemeral.
 		let (server_public_key, sender_ephemeral, sender_pub_spki) = self.extract_key_exchange_crypto_material(rng)?;
 
-		// 4. Create UKM and recipient identifier
+		// 5. Create UKM and recipient identifier
 		let ukm = self.create_user_keying_material(rng)?;
 		let rid = self.build_recipient_identifier()?;
 
-		// 5. Build KARI structure
-		let kari_builder = self.build_kari_structure(sender_ephemeral, sender_pub_spki, server_public_key, rid, ukm)?;
+		// 6. Build KARI structure
+		let kari_ephemeral = sender_ephemeral.clone();
+		let kari_builder = self.build_kari_structure(kari_ephemeral, sender_pub_spki, server_public_key, rid, ukm)?;
 
-		// 6. Create EnvelopedData with optional security offer
-		let enveloped_data = self.build_enveloped_data(kari_builder, &session_key, rng)?;
+		// 7. Create EnvelopedData with optional security offer
+		let enveloped_data = self.build_enveloped_data(kari_builder, &base, rng)?;
 
-		// 7. Update transcript and state. The transcript covers the encoded form, so it is built here.
+		// 8. Update transcript and state. The transcript covers the encoded form, so it is built here.
 		let key_exchange = WireDer::new(enveloped_data)?;
-		self.finalize_key_exchange(key_exchange.der(), session_key)?;
+		let pending = PendingKeyExchange { base, ephemeral: sender_ephemeral };
+		self.finalize_key_exchange(key_exchange.der(), pending)?;
 		Ok(key_exchange)
 	}
 
 	/// Process the server Finished message, SignedData over the transcript
-	/// hash, and return the verified transcript hash.
+	/// hash, derive the handshake secret, and return the verified transcript
+	/// hash.
 	///
 	/// # Transcript
 	///
-	/// The security and transport accepts are part of the signed transcript,
-	/// so the client appends them before it seals the transcript.
+	/// The security accept, the transport accept, and the server ephemeral are
+	/// part of the signed transcript, so the client appends them before it
+	/// seals the transcript.
 	///
 	/// - A tampered attribute diverges the hashes and fails signature verification (CWE-345).
 	/// - The client appends the received encoding, so a peer cannot reorder a
@@ -482,9 +511,14 @@ where
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidState`] -- no key exchange was sent.
-	/// - [`HandshakeError::DuplicateAttribute`] -- an accept attribute repeats.
+	/// - [`HandshakeError::DuplicateAttribute`] -- an accept or ephemeral attribute repeats.
+	/// - [`HandshakeError::MissingAttribute`] -- the Finished carries no server ephemeral.
 	/// - [`HandshakeError::SignatureVerificationFailed`] -- the signature or
 	///   the signed transcript hash is wrong.
+	/// - [`HandshakeError::InvalidPublicKey`] -- the signed server ephemeral is not a point on the curve.
+	/// - [`HandshakeError::ServerEphemeralIsStatic`] -- the signed server
+	///   ephemeral is the server's static key.
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the handshake secret.
 	/// - [`HandshakeError::InvalidProfileSelection`] -- the server selected a
 	///   profile outside the offer, or answered no offer.
 	/// - [`HandshakeError::NegotiationError`] -- the selected profile is below
@@ -495,17 +529,24 @@ where
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
-		// 2. Extract the server's SecurityAccept and TransportAccept, and
-		//    append their received bytes before the transcript seals.
-		let accept = extract_security_accept_attr(server_finished)?;
-		let transport_accept = extract_transport_accept_attr(server_finished)?;
-		if let Some(ref accept) = accept {
-			self.transcript.append(&accept.transcript_bytes)?;
-		}
-		if let Some(ref accept) = transport_accept {
-			self.transcript.append(&accept.transcript_bytes)?;
-		}
+		// 2. Extract the server's SecurityAccept, TransportAccept, and
+		//    ephemeral, and append their received bytes before the transcript
+		//    seals. The ephemeral is mandatory, so its absence is refused here.
+		let received_accept = ReceivedAttribute::<SecurityAccept>::extract(server_finished)?;
+		let (accept, accept_bytes) = received_accept.map(ReceivedAttribute::into_parts).unzip();
+		let received_transport_accept = ReceivedAttribute::<TransportAccept>::extract(server_finished)?;
+		let (transport_accept, transport_accept_bytes) =
+			received_transport_accept.map(ReceivedAttribute::into_parts).unzip();
+		let received_ephemeral = ReceivedAttribute::<OriginatorPublicKey>::extract(server_finished)?;
+		let received_ephemeral = received_ephemeral.ok_or(HandshakeError::MissingAttribute)?;
+		let (server_ephemeral, server_ephemeral_bytes) = received_ephemeral.into_parts();
 
+		let legs = ServerFinishedLegs {
+			security_accept: accept_bytes,
+			transport_accept: transport_accept_bytes,
+			server_ephemeral: server_ephemeral_bytes,
+		};
+		self.transcript.append_server_finished(legs)?;
 		self.transcript.seal::<P::Digest>()?;
 
 		// 3. Extract cryptographic material
@@ -516,19 +557,37 @@ where
 		let verified_content =
 			self.verify_signature(server_finished, server_verifying_key, expected_signer_identifier)?;
 
-		// 5. Validate the selections against our own offers and store them
-		let transport_accept = transport_accept.map(|attr| attr.value);
-		self.apply_security_accept(accept.map(|attr| attr.value))?;
+		// 5. Derive the handshake secret from the base secret and the agreement
+		//    of the kept KARI ephemeral with the server ephemeral the signature
+		//    just authenticated.
+		self.derive_handshake_secret(&server_ephemeral)?;
+
+		// 6. Validate the selections against our own offers and store them
+		self.apply_security_accept(accept)?;
 		self.mux_settings = MuxSettings::for_client(self.transport_offer.as_ref(), transport_accept.as_ref())?;
 
-		// 6. Validate the session receipt. The client Finished countersigns it later.
+		// 7. Validate the session receipt. The client Finished countersigns it later.
 		self.process_session_receipt(server_finished, transport_accept.as_ref())?;
 
-		// 7. Transition state. The transcript sealed in step 2, so the server
+		// 8. Transition state. The transcript sealed in step 2, so the server
 		//    Finished itself is not part of it.
 		self.state.transition(ClientHandshakeState::ServerFinishedReceived)?;
 
 		Ok(verified_content)
+	}
+
+	/// Derive the handshake secret from the pending key exchange and the
+	/// authenticated server ephemeral, parsed beside the static key it must
+	/// differ from. The pending pair drops when this function returns.
+	fn derive_handshake_secret(&mut self, server_ephemeral: &OriginatorPublicKey) -> Result<(), HandshakeError> {
+		let static_key = self.extract_server_public_key()?;
+		let server_ephemeral = static_key.server_ephemeral(server_ephemeral.public_key.raw_bytes())?;
+		let PendingKeyExchange { base, ephemeral } = self.key_schedule.take_pending()?;
+		let shared = ephemeral.shared_secret(&server_ephemeral)?;
+		let transcript_hash = self.transcript.hash()?;
+		let handshake_secret = HandshakeSecret::derive::<P>(&base, &shared, KdfSalt::new(&transcript_hash))?;
+		self.key_schedule.store(handshake_secret)?;
+		Ok(())
 	}
 
 	/// Validate the server's `SecurityAccept` selection and store the profile.
@@ -580,7 +639,8 @@ where
 	) -> Result<(), HandshakeError> {
 		let granted = transport_accept.and_then(|accept| accept.granted_budgets);
 		let credit_unit = transport_accept.map(|accept| accept.credit_unit);
-		let artifact = extract_session_receipt_attr(signed_data)?;
+		let received_artifact = ReceivedAttribute::<SignedData>::extract(signed_data)?;
+		let artifact = received_artifact.map(|received| received.into_parts().0);
 		let transcript_digest = self.transcript.hash()?;
 
 		let parsed_receipt = artifact.as_ref().map(ReceiptArtifact::receipt).transpose()?;
@@ -628,10 +688,11 @@ where
 	///
 	/// # Confidentiality
 	///
-	/// The acknowledgement is confidential. The client SignerInfo, and the
-	/// bearer answer bound in its signed attributes, travel in an
-	/// EnvelopedData encrypted to the server certificate. That keeps both off
-	/// the cleartext SignedData.
+	/// The client SignerInfo, and the bearer answer bound in its signed
+	/// attributes, travel sealed under the handshake secret's acknowledgement
+	/// key, which keeps both off the cleartext SignedData. What that key
+	/// withholds from a holder of the server's static key is stated under
+	/// [forward secrecy](crate::transport::handshake#forward-secrecy).
 	async fn countersign_pending_receipt(&mut self) -> Result<Option<Attributes>, HandshakeError> {
 		let Some((receipt, server_artifact)) = self.pending_receipt.take() else {
 			return Ok(None);
@@ -645,11 +706,12 @@ where
 		let answer = response.as_ref().map(OctetString::as_bytes);
 		let countersignature = receipt.countersign::<P::Digest>(answer, key_provider).await?;
 
-		let mut os = OsRng;
+		let handshake_secret = self.key_schedule.derived()?;
+		let transcript_hash = self.transcript.hash()?;
 		let ack_der = Zeroizing::new(countersignature.to_der()?);
-		let envelope_der = self.encrypt_to_server(&ack_der, &mut os)?;
-		let envelope = OctetString::new(envelope_der)?;
-		let ack_attr = HandshakeAttribute::encode(&envelope)?;
+		let sealed_ack = handshake_secret.seal_ack::<P>(KdfSalt::new(&transcript_hash), &transcript_hash, &ack_der)?;
+		let sealed_ack = OctetString::new(sealed_ack)?;
+		let ack_attr = HandshakeAttribute::encode(&sealed_ack)?;
 
 		let values = SetOfVec::try_from(ack_attr.attr_values)?;
 		let x509_attrs = vec![Attribute { oid: ack_attr.attr_type, values }];
@@ -674,6 +736,9 @@ where
 	/// - [`HandshakeError::MutualAuthRequired`] -- a pending receipt needs a
 	///   client identity, and none is set.
 	/// - [`HandshakeError::ApprovalRefused`] -- the receipt approver refused.
+	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the acknowledgement key.
+	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the acknowledgement key.
+	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused to seal the countersignature.
 	pub async fn build_client_finished(&mut self) -> Result<SignedData, HandshakeError> {
 		// 1. Validate state
 		self.validate_client_finished_prerequisites()?;
@@ -710,11 +775,6 @@ where
 		self.state.state().is_completed()
 	}
 
-	/// The secret-wrapped session key bytes, once key exchange sets them.
-	pub fn session_key(&self) -> Option<&SecretSlice<u8>> {
-		self.session_key.as_ref()
-	}
-
 	/// The dual-signed session receipt.
 	pub fn session_receipt(&self) -> Option<&StoredReceipt> {
 		self.stored_receipt.as_ref()
@@ -746,16 +806,17 @@ where
 			return Err(HandshakeError::InvalidState);
 		}
 
-		// 2. Get the CEK (session_key)
-		let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
+		// 2. Take the handshake secret. It drops when this function returns,
+		//    so completion is the one derivation from it.
+		let handshake_secret = self.key_schedule.take_derived()?;
 		let transcript = self.transcript.hash()?;
 
 		// 3. Derive directional session keys as P::AeadCipher
-		let ciphers = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, KdfSalt::new(&transcript)))?;
+		let ciphers = self.derive_directional_aead(&handshake_secret, KdfSalt::new(&transcript))?;
 
 		// 4. Seed epoch materials for post-handshake renewal
 		let epoch_salt = KdfSalt::new(&transcript);
-		let materials = cek.with(|input_key| EpochMaterials::derive::<P>(input_key, epoch_salt, transcript))?;
+		let materials = EpochMaterials::derive::<P>(&handshake_secret, epoch_salt, transcript)?;
 
 		// 5. Transition to complete
 		self.state.transition(ClientHandshakeState::Completed)?;
@@ -830,12 +891,12 @@ where
 		Ok(kari_builder)
 	}
 
-	/// Build the EnvelopedData with the optional security and transport
-	/// offers.
+	/// Build the EnvelopedData over `base`, with the optional security and
+	/// transport offers.
 	fn build_enveloped_data(
 		&self,
 		kari_builder: TightBeamKariBuilder<P>,
-		session_key: &[u8],
+		base: &BaseSecret,
 		rng: &mut dyn CryptoRngCore,
 	) -> Result<EnvelopedData, HandshakeError> {
 		let mut enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
@@ -854,7 +915,7 @@ where
 			enveloped_builder = enveloped_builder.with_unprotected_attr(cert_attr);
 		}
 
-		enveloped_builder.build(session_key, Some(rng))
+		enveloped_builder.build(base.as_bytes(), Some(rng))
 	}
 
 	/// The client certificate as a key-exchange unprotected attribute, when the
@@ -871,39 +932,16 @@ where
 			.transpose()
 	}
 
-	/// Encrypt an opaque payload to the server certificate as a
-	/// standalone EnvelopedData (fresh ephemeral key, UKM, and CEK).
-	///
-	/// It carries the confidential settlement answer in the client Finished,
-	/// with the same KARI machinery as the key exchange and no negotiation
-	/// attributes.
-	fn encrypt_to_server(
-		&self,
-		content: impl AsRef<[u8]>,
-		rng: &mut dyn CryptoRngCore,
-	) -> Result<Vec<u8>, HandshakeError> {
-		let content = content.as_ref();
-		let (server_public_key, sender_ephemeral, sender_pub_spki) = self.extract_key_exchange_crypto_material(rng)?;
-		let ukm = self.create_user_keying_material(rng)?;
-		let rid = self.build_recipient_identifier()?;
-		let kari_builder = self.build_kari_structure(sender_ephemeral, sender_pub_spki, server_public_key, rid, ukm)?;
-
-		let enveloped_data = TightBeamEnvelopedDataBuilder::new(kari_builder).build(content, Some(rng))?;
-		enveloped_data.to_der().map_err(Into::into)
-	}
-
 	/// Finalize the key exchange by updating the transcript and the state.
 	fn finalize_key_exchange(
 		&mut self,
 		enveloped_data_der: impl AsRef<[u8]>,
-		session_key: ZeroizingBytes,
+		pending: PendingKeyExchange<P>,
 	) -> Result<(), HandshakeError> {
 		let enveloped_data_der = enveloped_data_der.as_ref();
 		self.transcript.append(enveloped_data_der)?;
 
-		// `Zeroizing` holds its buffer to the end of the scope, so the key
-		// reaches its long-term owner as a copy. Both buffers wipe.
-		self.session_key = Some(SecretSlice::from(session_key.to_vec()));
+		self.key_schedule.pend(pending)?;
 		// On the CMS path, KeyExchangeSent follows Init directly.
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
@@ -1013,22 +1051,6 @@ where
 	}
 }
 
-/// Extract the server's `SecurityAccept` from a Finished message's unsigned
-/// attributes, if present.
-fn extract_security_accept_attr(
-	signed_data: &SignedData,
-) -> Result<Option<ReceivedAttribute<SecurityAccept>>, HandshakeError> {
-	ReceivedAttribute::extract(signed_data, HANDSHAKE_SECURITY_ACCEPT)
-}
-
-/// Extract the server's `TransportAccept` from a Finished message's unsigned
-/// attributes, if present.
-fn extract_transport_accept_attr(
-	signed_data: &SignedData,
-) -> Result<Option<ReceivedAttribute<TransportAccept>>, HandshakeError> {
-	ReceivedAttribute::extract(signed_data, HANDSHAKE_TRANSPORT_ACCEPT)
-}
-
 /// A negotiated value and the bytes it arrived as.
 ///
 /// The handshake acts on the value and the transcript binds the bytes, so the
@@ -1039,12 +1061,24 @@ struct ReceivedAttribute<T> {
 }
 
 impl<T> ReceivedAttribute<T> {
-	/// Read the attribute `oid` names, keeping its received encoding.
-	fn extract(signed_data: &SignedData, oid: crate::ObjectIdentifier) -> Result<Option<Self>, HandshakeError>
+	/// Split the attribute into the value the handshake acts on and the bytes
+	/// the transcript binds.
+	fn into_parts(self) -> (T, Vec<u8>) {
+		(self.value, self.transcript_bytes)
+	}
+
+	/// Read the attribute `T` names from the Finished unsigned attributes,
+	/// keeping its received encoding.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::DuplicateAttribute`] -- the attribute repeats.
+	/// - [`HandshakeError::DerError`] -- the attribute fails to decode as `T`.
+	fn extract(signed_data: &SignedData) -> Result<Option<Self>, HandshakeError>
 	where
-		T: AttributePayload + for<'a> crate::der::Choice<'a> + for<'a> crate::der::DecodeValue<'a>,
+		T: AttributePayload + for<'a> Choice<'a> + for<'a> DecodeValue<'a>,
 	{
-		let Some(attr) = signed_data.find_unsigned_attr(oid)? else {
+		let Some(attr) = signed_data.find_unsigned_attr(T::OID)? else {
 			return Ok(None);
 		};
 
@@ -1052,15 +1086,6 @@ impl<T> ReceivedAttribute<T> {
 		let value = attr.decode::<T>()?;
 		Ok(Some(Self { value, transcript_bytes }))
 	}
-}
-
-/// Extract the server's receipt `SignedData` artifact from a Finished message's
-/// unsigned attributes, if present.
-fn extract_session_receipt_attr(signed_data: &SignedData) -> Result<Option<SignedData>, HandshakeError> {
-	signed_data
-		.find_unsigned_attr(SESSION_RECEIPT)?
-		.map(|attr| attr.decode::<SignedData>())
-		.transpose()
 }
 
 impl<P> HandshakeFinalization<P> for CmsHandshakeClient<P>
@@ -1091,10 +1116,7 @@ where
 
 	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<HandshakeMessage, Self::Error>> {
 		Box::pin(async move {
-			// Fresh random session key per handshake: a constant key
-			// would make every session trivially decryptable (CWE-321).
-			let session_key = ZeroizingBytes::new(generate_nonce::<32>(None)?.to_vec());
-			let key_exchange = self.build_key_exchange(session_key, None)?;
+			let key_exchange = self.build_key_exchange(None)?;
 			Ok(HandshakeMessage::EnvelopedData(Box::new(key_exchange)))
 		})
 	}
@@ -1134,34 +1156,99 @@ where
 
 #[cfg(test)]
 mod tests {
-	use crate::ZeroizingBytes;
 	use std::error::Error;
 	use std::sync::Arc;
 
-	use super::{extract_security_accept_attr, CmsHandshakeClient, FinishedRole, SignedData};
+	use super::{
+		CmsHandshakeClient, EnvelopedData, FinishedRole, KeySchedule, OriginatorPublicKey, ReceivedAttribute,
+		SignedData,
+	};
 	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::secret::ToInsecure;
+	use crate::crypto::sign::ecdsa::k256::Secp256k1;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::sign::elliptic_curve::SecretKey;
 	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-	use crate::der::asn1::SetOfVec;
+	use crate::der::asn1::{BitString, SetOfVec};
 	use crate::der::{Decode, Encode};
 	use crate::oids::{HANDSHAKE_SECURITY_ACCEPT, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 	use crate::random::OsRng;
-	use crate::spki::AlgorithmIdentifierOwned;
+	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 	use crate::testing::fixtures::TestCertificate;
 	use crate::transport::handshake::attributes::HandshakeAttribute;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	use crate::transport::handshake::error::HandshakeError;
+	use crate::transport::handshake::kari::OriginatorKey;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 	use crate::transport::handshake::primitives::transcript::Transcript;
 	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	use crate::transport::handshake::state::ClientHandshakeState;
 	use crate::transport::handshake::tests::*;
+	use crate::transport::wire_der::WireDer;
 	use crate::x509::attr::{Attribute, Attributes};
 	use crate::x509::Certificate;
+
+	/// The originator key of a fresh secp256k1 ephemeral, as a server sends it.
+	fn fresh_server_ephemeral() -> Result<OriginatorPublicKey, Box<dyn Error>> {
+		let public_key = SecretKey::<Secp256k1>::random(&mut OsRng).public_key();
+		let spki_der = public_key.to_public_key_der()?;
+		Ok(SubjectPublicKeyInfoOwned::from_der(spki_der.as_bytes())?.originator_key()?)
+	}
+
+	/// `ephemeral` with its point bytes replaced by `point`.
+	fn with_point(ephemeral: OriginatorPublicKey, point: &[u8]) -> Result<OriginatorPublicKey, Box<dyn Error>> {
+		Ok(OriginatorPublicKey { algorithm: ephemeral.algorithm, public_key: BitString::from_bytes(point)? })
+	}
+
+	/// Replace the unsigned attributes of the one signer of `signed`.
+	fn set_unsigned_attrs(signed: &mut SignedData, attrs: Option<Attributes>) -> Result<(), Box<dyn Error>> {
+		let mut signer_infos: Vec<_> = signed.signer_infos.0.iter().cloned().collect();
+		let signer = signer_infos.first_mut().ok_or("a Finished has one signer")?;
+		signer.unsigned_attrs = attrs;
+		signed.signer_infos = signer_infos.try_into()?;
+		Ok(())
+	}
+
+	/// The attribute set that carries `ephemeral` alone.
+	fn ephemeral_attrs(ephemeral: &OriginatorPublicKey) -> Result<Attributes, Box<dyn Error>> {
+		let attribute = Attribute::try_from(HandshakeAttribute::encode(ephemeral)?)?;
+		Ok(Attributes::try_from(vec![attribute])?)
+	}
+
+	/// A server Finished signed by `server_key` over the transcript of
+	/// `key_exchange` followed by `ephemeral`, as a server that negotiated
+	/// nothing sends it, with the transcript hash it signed.
+	fn server_finished_over(
+		server_key: &Secp256k1SigningKey,
+		key_exchange: &WireDer<EnvelopedData>,
+		ephemeral: &OriginatorPublicKey,
+	) -> Result<(SignedData, [u8; 32]), Box<dyn Error>> {
+		let ephemeral_bytes = HandshakeAttribute::transcript_bytes(ephemeral)?;
+		let transcript_hash =
+			Transcript::digest::<Sha3_256>([key_exchange.der(), ephemeral_bytes.as_slice()].concat())?;
+		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+		let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
+		let builder =
+			TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(server_key, digest_alg, signature_alg)?;
+
+		let mut signed = builder.build(FinishedRole::Server.content(&transcript_hash))?;
+		set_unsigned_attrs(&mut signed, Some(ephemeral_attrs(ephemeral)?))?;
+		Ok((signed, transcript_hash))
+	}
+
+	/// A client pinned to `server_certificate` that has sent its key
+	/// exchange, with that key exchange.
+	fn client_after_key_exchange(
+		server_certificate: &Certificate,
+	) -> Result<(CmsHandshakeClient<DefaultCryptoProvider>, WireDer<EnvelopedData>), Box<dyn Error>> {
+		let mut client = TestCmsClientBuilder::new()
+			.with_server_cert(server_certificate.to_owned())
+			.build()?;
+		let key_exchange = client.build_key_exchange(None)?;
+		Ok((client, key_exchange))
+	}
 
 	#[tokio::test]
 	async fn test_client_state_flow() -> Result<(), Box<dyn Error>> {
@@ -1172,37 +1259,31 @@ mod tests {
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 
 		// When: Client builds a valid key exchange
-		let session_key = [2u8; 32];
-		let enveloped_data = client.build_key_exchange(ZeroizingBytes::new(session_key.to_vec()), None)?;
+		let enveloped_data = client.build_key_exchange(None)?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
-		// The client stores the session key.
-		assert!(client.session_key().is_some());
+		// The client keeps the base secret and its ephemeral for the Finished.
+		assert!(matches!(client.key_schedule, KeySchedule::Pending(_)));
 
-		// Then: Server should be able to decrypt it using the matching private
-		// key
+		// Then: Server should be able to decrypt the 32-byte base secret using
+		// the matching private key
 		let server_secret = SecretKey::from(server_test_cert.signing_key.to_owned());
 		let provider = DefaultCryptoProvider::default();
 		let kari_processor = TightBeamKariRecipient::new(provider, server_secret);
 		let processor = TightBeamEnvelopedDataProcessor::<DefaultCryptoProvider>::new(kari_processor);
 		let decrypted = processor.process(enveloped_data.value())?;
 		let decrypted = ToInsecure::to_insecure(decrypted);
-		assert_eq!(&decrypted[..], &session_key[..]);
+		assert_eq!(decrypted.len(), 32);
 
 		// When: Client processes a server Finished over the transcript, which
-		// holds the key exchange alone because the server accepted nothing
-		let transcript_hash = Transcript::digest::<Sha3_256>(enveloped_data.der())?;
-		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
-		let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
-		let server_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(
-			&server_test_cert.signing_key,
-			digest_alg,
-			signature_alg,
-		)?;
-
-		let server_finished = server_finished_builder.build(FinishedRole::Server.content(&transcript_hash))?;
+		// holds the key exchange and the server ephemeral because the server
+		// accepted nothing
+		let ephemeral = fresh_server_ephemeral()?;
+		let (server_finished, transcript_hash) =
+			server_finished_over(&server_test_cert.signing_key, &enveloped_data, &ephemeral)?;
 		let verified = client.process_server_finished(&server_finished)?;
 		assert_eq!(verified, transcript_hash);
 		assert_eq!(client.state(), ClientHandshakeState::ServerFinishedReceived);
+		assert!(matches!(client.key_schedule, KeySchedule::Derived(_)));
 
 		// When: Client builds its Finished
 		let _client_finished = client.build_client_finished().await?;
@@ -1215,7 +1296,102 @@ mod tests {
 		Ok(())
 	}
 
-	const TEST_SESSION_KEY: [u8; 32] = [2u8; 32];
+	/// A server ephemeral swapped for another valid point after a real server
+	/// signed its Finished changes the transcript, so the Finished signature
+	/// fails before any agreement.
+	#[tokio::test]
+	async fn a_tampered_server_ephemeral_fails_the_cms_finished() -> Result<(), Box<dyn Error>> {
+		let server_identity = create_test_certificate();
+		let (mut server, _) = TestCmsServerBuilder::new()
+			.with_key(server_identity.signing_key.to_owned())
+			.build();
+		let (mut client, key_exchange) = client_after_key_exchange(&server_identity.certificate)?;
+		server.process_key_exchange(&key_exchange).await?;
+		let mut server_finished = server.build_server_finished().await?;
+		set_unsigned_attrs(&mut server_finished, Some(ephemeral_attrs(&fresh_server_ephemeral()?)?))?;
+
+		let result = client.process_server_finished(&server_finished);
+		assert!(matches!(result, Err(HandshakeError::SignatureVerificationFailed)));
+		Ok(())
+	}
+
+	/// A server Finished without the ephemeral attribute is refused before
+	/// the transcript seals, so no session forms without the agreement.
+	#[test]
+	fn a_missing_server_ephemeral_is_refused() -> Result<(), Box<dyn Error>> {
+		let server = create_test_certificate();
+		let (mut client, key_exchange) = client_after_key_exchange(&server.certificate)?;
+		let (mut server_finished, _) =
+			server_finished_over(&server.signing_key, &key_exchange, &fresh_server_ephemeral()?)?;
+		set_unsigned_attrs(&mut server_finished, None)?;
+
+		let result = client.process_server_finished(&server_finished);
+		assert!(matches!(result, Err(HandshakeError::MissingAttribute)));
+		Ok(())
+	}
+
+	/// A validly signed server ephemeral that encodes the identity point is
+	/// refused at the parse, before any scalar multiplication.
+	#[test]
+	fn an_identity_server_ephemeral_is_refused() -> Result<(), Box<dyn Error>> {
+		let server = create_test_certificate();
+		let (mut client, key_exchange) = client_after_key_exchange(&server.certificate)?;
+		let identity = with_point(fresh_server_ephemeral()?, &[0x00])?;
+		let (server_finished, _) = server_finished_over(&server.signing_key, &key_exchange, &identity)?;
+
+		let result = client.process_server_finished(&server_finished);
+		assert!(matches!(result, Err(HandshakeError::InvalidPublicKey(_))));
+		Ok(())
+	}
+
+	/// A validly signed server ephemeral whose x-coordinate lies off the
+	/// curve is refused at the parse, before any scalar multiplication.
+	#[test]
+	fn an_off_curve_server_ephemeral_is_refused() -> Result<(), Box<dyn Error>> {
+		let server = create_test_certificate();
+		let (mut client, key_exchange) = client_after_key_exchange(&server.certificate)?;
+		let off_curve = with_point(fresh_server_ephemeral()?, &off_curve_point())?;
+		let (server_finished, _) = server_finished_over(&server.signing_key, &key_exchange, &off_curve)?;
+
+		let result = client.process_server_finished(&server_finished);
+		assert!(matches!(result, Err(HandshakeError::InvalidPublicKey(_))));
+		Ok(())
+	}
+
+	/// A validly signed server ephemeral that is the server's own static key
+	/// is refused, so the agreement cannot collapse into the static one.
+	#[test]
+	fn a_server_ephemeral_equal_to_the_static_key_is_refused() -> Result<(), Box<dyn Error>> {
+		let server = create_test_certificate();
+		let (mut client, key_exchange) = client_after_key_exchange(&server.certificate)?;
+		let static_key = server.signing_key.verifying_key().originator_key()?;
+		let (server_finished, _) = server_finished_over(&server.signing_key, &key_exchange, &static_key)?;
+
+		let result = client.process_server_finished(&server_finished);
+		assert!(matches!(result, Err(HandshakeError::ServerEphemeralIsStatic)));
+		Ok(())
+	}
+
+	/// Completion takes the handshake secret, so the orchestrator holds no
+	/// key material afterwards. The key schedule's take is the close, and
+	/// this unit test reads the variant it leaves behind.
+	#[tokio::test]
+	async fn completion_consumes_the_handshake_secret() -> Result<(), Box<dyn Error>> {
+		let server_identity = create_test_certificate();
+		let (server, _) = TestCmsServerBuilder::new()
+			.with_key(server_identity.signing_key.to_owned())
+			.build();
+		let mut server = server.with_supported_profiles(vec![create_default_test_profile()]);
+		let (mut client, key_exchange) = client_after_key_exchange(&server_identity.certificate)?;
+		server.process_key_exchange(&key_exchange).await?;
+		let server_finished = server.build_server_finished().await?;
+		client.process_server_finished(&server_finished)?;
+		client.build_client_finished().await?;
+
+		client.take_established()?;
+		assert!(matches!(client.key_schedule, KeySchedule::Consumed));
+		Ok(())
+	}
 
 	fn trust_store(root: Option<Certificate>) -> Result<Arc<dyn CertificateTrust>, Box<dyn Error>> {
 		let mut builder = CertificateTrustBuilder::from(Secp256k1Policy);
@@ -1253,7 +1429,7 @@ mod tests {
 			Arc::new(server.certificate),
 		);
 
-		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
+		let result = client.build_key_exchange(None);
 		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
 		Ok(())
 	}
@@ -1264,7 +1440,7 @@ mod tests {
 	fn from_chain_validates_and_targets_leaf() -> Result<(), Box<dyn Error>> {
 		let chain = TestCertificate::insecure_fixed_chain()?;
 		let mut client = chain_client(chain.to_arc(), Some(chain.root.to_owned()))?;
-		client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None)?;
+		client.build_key_exchange(None)?;
 
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		assert_eq!(client.server_leaf()?, &chain.leaf);
@@ -1275,7 +1451,7 @@ mod tests {
 	fn from_chain_rejects_untrusted_chain() -> Result<(), Box<dyn Error>> {
 		let chain = TestCertificate::insecure_fixed_chain()?;
 		let mut client = chain_client(chain.to_arc(), None)?;
-		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
+		let result = client.build_key_exchange(None);
 		assert!(matches!(result, Err(HandshakeError::CertificateValidationError(_))));
 		Ok(())
 	}
@@ -1292,7 +1468,7 @@ mod tests {
 				.with_server_certificate_chain(chain.to_arc())
 				.with_trust_store(trust_store(Some(chain.root.to_owned()))?);
 
-		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
+		let result = client.build_key_exchange(None);
 		assert!(matches!(result, Err(HandshakeError::PinnedCertificateMismatch)));
 		Ok(())
 	}
@@ -1301,7 +1477,7 @@ mod tests {
 	fn from_chain_rejects_empty_chain() -> Result<(), Box<dyn Error>> {
 		let chain = TestCertificate::insecure_fixed_chain()?;
 		let mut client = chain_client(Arc::from(Vec::new()), Some(chain.root))?;
-		let result = client.build_key_exchange(ZeroizingBytes::new(TEST_SESSION_KEY.to_vec()), None);
+		let result = client.build_key_exchange(None);
 		assert!(matches!(result, Err(HandshakeError::MissingServerCertificate)));
 		Ok(())
 	}
@@ -1356,11 +1532,12 @@ mod tests {
 		let mut client = TestCmsClientBuilder::new().build()?.with_security_offer(offer);
 
 		let accepted = SignedData::from_der(&build_finished_with_accept(offered)?)?;
-		client.apply_security_accept(extract_security_accept_attr(&accepted)?.map(|attr| attr.value))?;
+		let accept = ReceivedAttribute::<SecurityAccept>::extract(&accepted)?;
+		client.apply_security_accept(accept.map(|attr| attr.value))?;
 		assert_eq!(client.selected_profile(), Some(offered));
 
 		let rejected = SignedData::from_der(&build_finished_with_accept(unoffered)?)?;
-		let attrs = extract_security_accept_attr(&rejected)?;
+		let attrs = ReceivedAttribute::<SecurityAccept>::extract(&rejected)?;
 		let result = client.apply_security_accept(attrs.map(|attr| attr.value));
 		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 

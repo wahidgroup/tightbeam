@@ -39,6 +39,12 @@ pub enum HandshakeError {
 	#[from]
 	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
 
+	/// The server sent its static key as its ephemeral. The agreement would
+	/// then collapse into the static one, which the server's key recovers, so
+	/// the client refuses it.
+	#[error("Server ephemeral equals the server static key")]
+	ServerEphemeralIsStatic,
+
 	/// The peer certificate failed validation.
 	#[error("Invalid certificate: {0}")]
 	#[from]
@@ -99,7 +105,7 @@ pub enum HandshakeError {
 
 	/// The certificate the client Finished embeds differs from the certificate
 	/// the key exchange bound into the transcript. Only the key-exchange
-	/// certificate proved knowledge of the session key, so only it may sign
+	/// certificate proved knowledge of the base secret, so only it may sign
 	/// the Finished.
 	#[error("Client Finished certificate does not match the key-exchange certificate")]
 	ClientCertificateMismatch,
@@ -147,6 +153,13 @@ pub enum HandshakeError {
 	#[error("Settlement answer too large for the wire encoding")]
 	AnswerTooLarge,
 
+	/// The AEAD refused to seal or open the receipt acknowledgement under the
+	/// key the handshake secret derives. On the opening side the
+	/// acknowledgement was sealed under another handshake secret or altered
+	/// in flight.
+	#[error("Receipt acknowledgement AEAD failure: {0}")]
+	ReceiptAckCipher(crate::crypto::aead::Error),
+
 	/// The leaf of the provisioned certificate chain differs from the pinned
 	/// server certificate.
 	#[error("Provisioned certificate chain leaf does not match pinned server certificate")]
@@ -155,10 +168,6 @@ pub enum HandshakeError {
 	/// The client random is missing from the ClientHello.
 	#[error("Missing client random from ClientHello")]
 	MissingClientRandom,
-
-	/// The base session key is missing.
-	#[error("Missing base session key")]
-	MissingBaseSessionKey,
 
 	/// The client random is missing from the handshake state.
 	#[error("Missing client random")]

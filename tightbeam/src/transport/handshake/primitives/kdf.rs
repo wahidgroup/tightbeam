@@ -45,6 +45,37 @@ impl<'a> KdfSalt<'a> {
 	}
 }
 
+/// The salt of a key derivation over the handshake randoms,
+/// `client_random || server_random`.
+///
+/// The ECIES handshake derives under it, and every rekey epoch derives under
+/// the fresh pair its exchange drew, so the layout has one home.
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+pub(crate) struct RandomsSalt(Zeroizing<[u8; 64]>);
+
+#[cfg(any(
+	feature = "transport-ecies",
+	all(feature = "transport-multiplex", feature = "transport-cms")
+))]
+impl RandomsSalt {
+	/// Lay `client_random` ahead of `server_random`.
+	pub(crate) fn new(client_random: &[u8; 32], server_random: &[u8; 32]) -> Self {
+		let mut salt = Zeroizing::new([0u8; 64]);
+		salt[..32].copy_from_slice(client_random);
+		salt[32..].copy_from_slice(server_random);
+		Self(salt)
+	}
+
+	/// This salt for one derivation.
+	#[must_use]
+	pub(crate) fn as_kdf_salt(&self) -> KdfSalt<'_> {
+		KdfSalt::new(self.0.as_slice())
+	}
+}
+
 /// Domain separator bound into the KDF expand step.
 ///
 /// Two derivations that share input key material stay independent when their

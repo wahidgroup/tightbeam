@@ -9,6 +9,8 @@
 ))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "transport-ecies")]
+use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 #[cfg(feature = "transport-cms")]
 use crate::constants::{TIGHTBEAM_CLIENT_FINISHED_DOMAIN, TIGHTBEAM_SERVER_FINISHED_DOMAIN};
 
@@ -84,34 +86,26 @@ impl Transcript {
 	/// Open the ECIES handshake transcript over its ordered legs.
 	///
 	/// Both roles derive this identically. A divergence here is a protocol
-	/// break, so the concatenation order lives in one place. The hash binds the
-	/// client hello, the server random, the server SPKI, and both accept
-	/// encodings (CWE-347).
-	///
-	/// # Parameters
-	///
-	/// - `client_hello`: the DER of the client hello message.
-	/// - `server_random`: the 32-byte server random.
-	/// - `spki`: the DER of the server SubjectPublicKeyInfo.
-	/// - `security_accept_der`: the DER of the handshake accept.
-	/// - `transport_accept_der`: the DER of the transport accept.
+	/// break, so the concatenation order lives in one place. The hash binds
+	/// every leg (CWE-347), and the fixed-width ephemeral leg keeps the
+	/// variable-length legs beside it in their positions.
 	#[cfg(feature = "transport-ecies")]
-	pub(crate) fn ecies_handshake(
-		client_hello: impl AsRef<[u8]>,
-		server_random: &[u8; 32],
-		spki: impl AsRef<[u8]>,
-		security_accept_der: impl AsRef<[u8]>,
-		transport_accept_der: impl AsRef<[u8]>,
-	) -> Self {
-		let client_hello = client_hello.as_ref();
-		let spki = spki.as_ref();
-		let security_accept_der = security_accept_der.as_ref();
-		let transport_accept_der = transport_accept_der.as_ref();
-		let len = client_hello.len() + 32 + spki.len() + security_accept_der.len() + transport_accept_der.len();
+	pub(crate) fn ecies_handshake(legs: EciesHandshakeLegs<'_>) -> Self {
+		let EciesHandshakeLegs {
+			client_hello,
+			server_random,
+			server_ephemeral,
+			spki,
+			security_accept_der,
+			transport_accept_der,
+		} = legs;
+		let fixed = server_random.len() + server_ephemeral.len();
+		let len = client_hello.len() + fixed + spki.len() + security_accept_der.len() + transport_accept_der.len();
 
 		let mut buffer = Vec::with_capacity(len);
 		buffer.extend_from_slice(client_hello);
 		buffer.extend_from_slice(server_random);
+		buffer.extend_from_slice(server_ephemeral);
 		buffer.extend_from_slice(spki);
 		buffer.extend_from_slice(security_accept_der);
 		buffer.extend_from_slice(transport_accept_der);
@@ -168,6 +162,28 @@ impl Transcript {
 		}
 	}
 
+	/// Append the server Finished legs in the order both endpoints bind them.
+	///
+	/// The server appends the bytes it is about to send and the client the
+	/// bytes it received, so the order lives here once and a drift on either
+	/// side fails the Finished signature.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::InvalidState`] -- the transcript is sealed.
+	#[cfg(feature = "transport-cms")]
+	pub(crate) fn append_server_finished(&mut self, legs: ServerFinishedLegs) -> Result<(), HandshakeError> {
+		let ServerFinishedLegs { security_accept, transport_accept, server_ephemeral } = legs;
+		if let Some(accept) = security_accept {
+			self.append(accept)?;
+		}
+		if let Some(accept) = transport_accept {
+			self.append(accept)?;
+		}
+
+		self.append(server_ephemeral)
+	}
+
 	/// Fix the hash over the bytes appended so far under digest `D`, and
 	/// return it.
 	///
@@ -197,6 +213,41 @@ impl Transcript {
 			State::Open(_) => Err(HandshakeError::InvalidTranscriptHash),
 		}
 	}
+}
+
+/// The ECIES handshake legs the transcript binds, in the order both roles
+/// hash them. [`Transcript::ecies_handshake`] fixes that order.
+#[cfg(feature = "transport-ecies")]
+pub(crate) struct EciesHandshakeLegs<'a> {
+	/// The DER of the ClientHello as it was sent and received.
+	pub(crate) client_hello: &'a [u8],
+	/// The 32-byte server random.
+	pub(crate) server_random: &'a [u8; 32],
+	/// The compressed SEC1 server ephemeral public key.
+	pub(crate) server_ephemeral: &'a [u8; EC_PUBKEY_COMPRESSED_SIZE],
+	/// The DER of the server SubjectPublicKeyInfo.
+	pub(crate) spki: &'a [u8],
+	/// The DER of the security accept, empty when the server sent none.
+	pub(crate) security_accept_der: &'a [u8],
+	/// The DER of the transport accept, empty when the server sent none.
+	pub(crate) transport_accept_der: &'a [u8],
+}
+
+/// The server Finished attributes the CMS transcript binds, as encoded bytes.
+///
+/// The accepts are present when negotiation produced them, and the server
+/// ephemeral public key is mandatory, so every sealed transcript binds one.
+/// [`Transcript::append_server_finished`] fixes the order.
+#[cfg(feature = "transport-cms")]
+pub(crate) struct ServerFinishedLegs {
+	/// The `SecurityAccept` attribute value, when a profile was negotiated.
+	pub(crate) security_accept: Option<Vec<u8>>,
+	/// The `TransportAccept` attribute value, when transport terms were
+	/// negotiated.
+	pub(crate) transport_accept: Option<Vec<u8>>,
+	/// The `OriginatorPublicKey` attribute value carrying the server
+	/// ephemeral.
+	pub(crate) server_ephemeral: Vec<u8>,
 }
 
 /// The endpoint that signed a CMS Finished.
@@ -244,7 +295,7 @@ mod tests {
 	use super::*;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 
-	#[cfg(feature = "transport-cms")]
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	use crate::crypto::hash::Sha3_256;
 
 	#[cfg(feature = "transport-cms")]
@@ -265,6 +316,58 @@ mod tests {
 	fn an_open_transcript_has_no_hash() {
 		let transcript = Transcript::new();
 		assert!(matches!(transcript.hash(), Err(HandshakeError::InvalidTranscriptHash)));
+	}
+
+	/// The CMS transcript hash of a key exchange followed by server Finished
+	/// legs that carry `server_ephemeral`.
+	#[cfg(feature = "transport-cms")]
+	fn cms_hash_with_ephemeral(server_ephemeral: &[u8]) -> Result<[u8; 32], HandshakeError> {
+		let mut transcript = Transcript::new();
+		transcript.append(b"key exchange")?;
+		transcript.append_server_finished(ServerFinishedLegs {
+			security_accept: Some(b"accept".to_vec()),
+			transport_accept: None,
+			server_ephemeral: server_ephemeral.to_vec(),
+		})?;
+		transcript.seal::<Sha3_256>()
+	}
+
+	/// Two CMS transcripts that differ only in the server ephemeral hash
+	/// differently, so the Finished signature binds the ephemeral.
+	#[cfg(feature = "transport-cms")]
+	#[test]
+	fn the_cms_transcript_binds_the_server_ephemeral() -> Result<(), HandshakeError> {
+		let first = cms_hash_with_ephemeral(&[0x02u8; 33])?;
+		let second = cms_hash_with_ephemeral(&[0x03u8; 33])?;
+		assert_ne!(first, second);
+		Ok(())
+	}
+
+	/// The ECIES transcript hash of fixed legs around `server_ephemeral`.
+	#[cfg(feature = "transport-ecies")]
+	fn ecies_hash_with_ephemeral(server_ephemeral: &[u8; 33]) -> Result<[u8; 32], HandshakeError> {
+		let legs = EciesHandshakeLegs {
+			client_hello: b"client hello",
+			server_random: &[0x01u8; 32],
+			server_ephemeral,
+			spki: b"spki",
+			security_accept_der: b"accept",
+			transport_accept_der: b"",
+		};
+
+		let mut transcript = Transcript::ecies_handshake(legs);
+		transcript.seal::<Sha3_256>()
+	}
+
+	/// Two ECIES transcripts that differ only in the server ephemeral hash
+	/// differently, so the server signature binds the ephemeral.
+	#[cfg(feature = "transport-ecies")]
+	#[test]
+	fn the_ecies_transcript_binds_the_server_ephemeral() -> Result<(), HandshakeError> {
+		let first = ecies_hash_with_ephemeral(&[0x02u8; 33])?;
+		let second = ecies_hash_with_ephemeral(&[0x03u8; 33])?;
+		assert_ne!(first, second);
+		Ok(())
 	}
 
 	#[test]
