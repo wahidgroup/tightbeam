@@ -10,8 +10,6 @@
 //!
 //! # Protocol Capabilities
 //!
-//! The handshake provides these capabilities:
-//!
 //! ```text
 //! ┌────────────────────────────────────────────────────────────────────────┐
 //! │                        TIGHTBEAM HANDSHAKE CAPABILITIES                │
@@ -112,30 +110,34 @@
 //! - The signature algorithm, such as ECDSA-with-SHA3-256.
 //! - The key wrapping algorithm, for CMS.
 //!
-//! ### ECIES negotiation
+//! One policy, [`negotiation::ProfilePolicy`], makes both decisions in both
+//! protocols:
 //!
-//! ECIES negotiates inside its handshake messages:
-//!
-//! 1. The client sends a `SecurityOffer` in the `ClientHello` message.
-//! 2. The server selects a compatible profile from the client's offer.
-//! 3. The server responds with a `SecurityAccept` in the `ServerHandshake` message.
-//! 4. The client validates that the server's selection matches an offered profile.
+//! 1. The client sends its `SecurityOffer` in the opening, when it has one.
+//! 2. The server chooses from its configured profiles: the first one the
+//!    offer also names, or its own first profile when no offer came.
+//! 3. The server names its choice as a `SecurityAccept` in the reply.
+//! 4. The client admits the selection, which must be a member of its offer when it sent one.
 //!
 //! Both endpoints admit a profile only when it names the algorithms their
-//! provider runs ([`negotiation::RunnableProfile`]).
+//! provider runs ([`negotiation::RunnableProfile`]) and meets the strength
+//! floor. A server with no eligible profile refuses the opening, and a client
+//! refuses a reply that selects nothing.
 //!
-//! ### CMS negotiation
+//! | Protocol | Offer travels in | Accept travels in |
+//! | --- | --- | --- |
+//! | ECIES | `ClientHello` | `ServerHandshake` |
+//! | CMS | Key exchange, unprotected attribute | Server Finished, unsigned attribute |
 //!
-//! CMS negotiates through the `EnvelopedData` unprotected attributes:
+//! ## Legs
 //!
-//! 1. The client sends a `SecurityOffer` in the unprotected attributes of its key exchange.
-//! 2. The server extracts the offer and selects a compatible profile with `select_profile()`.
-//! 3. The server stores the selected profile, which the handshake state exposes.
+//! Both protocols run three legs, and the layer names each by its position:
 //!
-//! Without an offer, the server uses its first configured profile. The server
-//! configures acceptable profiles with `with_supported_profiles()`, and only a
-//! configured profile that names the provider's algorithms is eligible. When
-//! an offer arrives and no profile is eligible, negotiation fails.
+//! | Leg | Sender | ECIES message | CMS message |
+//! | --- | --- | --- | --- |
+//! | Opening | Client | `ClientHello` | Key exchange |
+//! | Reply | Server | `ServerHandshake` | Server Finished |
+//! | Closing | Client | `ClientKeyExchange` | Client Finished |
 //!
 //! ## State machine
 //!
@@ -199,9 +201,9 @@ pub use attributes::HandshakeAttribute;
 #[cfg(feature = "x509")]
 use attributes::HandshakeAttributes;
 pub use error::HandshakeError;
-pub use orchestrator::{
-	EpochMaterials, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation, HandshakeSecret,
-};
+pub use orchestrator::EpochMaterials;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub use orchestrator::HandshakeSecret;
 pub use peer::PeerAuthentication;
 
 #[cfg(feature = "transport-cms")]
@@ -249,9 +251,12 @@ use crate::der::asn1::OctetStringRef;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod transport {
 	pub use crate::crypto::aead::KeyInit;
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+	pub use crate::crypto::common::typenum::U32;
+	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+	pub use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic, PublicKey};
 	pub use crate::crypto::sign::Verifier;
+	pub use crate::der::oid::AssociatedOid;
+	pub use crate::spki::EncodePublicKey;
 	pub use crate::transport::handshake::negotiation::TransportAuthorizer;
 	pub use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 }
@@ -262,7 +267,6 @@ use transport::*;
 #[cfg(feature = "transport-cms")]
 mod cms {
 	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::spki::EncodePublicKey;
 	pub use crate::transport::handshake::server::CmsHandshakeServer;
 }
 
@@ -271,7 +275,6 @@ use cms::*;
 
 #[cfg(feature = "transport-ecies")]
 mod ecies {
-	pub use crate::crypto::sign::SignatureEncoding;
 	pub use crate::transport::handshake::server::EciesHandshakeServer;
 }
 
@@ -291,6 +294,84 @@ mod x509 {
 
 #[cfg(feature = "x509")]
 use x509::*;
+
+/// A curve both handshake protocols run on.
+///
+/// The field is 32 bytes wide, so a shared secret is 32 bytes and a compressed
+/// point 33 bytes by type. Every curve that meets the bounds is a handshake
+/// curve.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub trait HandshakeCurve:
+	Curve<FieldBytesSize = U32>
+	+ CurveArithmetic<AffinePoint: FromEncodedPoint<Self> + ToEncodedPoint<Self>>
+	+ AssociatedOid
+	+ Send
+	+ Sync
+	+ 'static
+{
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<C> HandshakeCurve for C where
+	C: Curve<FieldBytesSize = U32>
+		+ CurveArithmetic<AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>>
+		+ AssociatedOid
+		+ Send
+		+ Sync
+		+ 'static
+{
+}
+
+/// A [`CryptoProvider`] the handshake layer runs on.
+///
+/// This is the one bound the layer states about a provider. The bounds sit on
+/// the supertrait, so `P: HandshakeProvider` gives a caller every one of them:
+///
+/// - the curve is a [`HandshakeCurve`],
+/// - a signature parses from its wire bytes,
+/// - the verifying key builds from a public key on that curve, verifies a
+///   signature, and encodes as an SPKI, and
+/// - the AEAD cipher keys from derived bytes.
+///
+/// Every provider that meets the bounds is a handshake provider.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::crypto::profiles::DefaultCryptoProvider;
+/// use tightbeam::transport::handshake::HandshakeProvider;
+///
+/// fn runs_a_handshake<P: HandshakeProvider>() {}
+///
+/// runs_a_handshake::<DefaultCryptoProvider>();
+/// ```
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub trait HandshakeProvider:
+	CryptoProvider<
+		Curve: HandshakeCurve,
+		Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
+		VerifyingKey: Verifier<Self::Signature> + From<PublicKey<Self::Curve>> + EncodePublicKey + 'static,
+		Digest: 'static,
+		AeadCipher: KeyInit + 'static,
+	> + Send
+	+ Sync
+	+ 'static
+{
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<P> HandshakeProvider for P where
+	P: CryptoProvider<
+			Curve: HandshakeCurve,
+			Signature: for<'a> TryFrom<&'a [u8], Error: Into<HandshakeError>> + 'static,
+			VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + 'static,
+			Digest: 'static,
+			AeadCipher: KeyInit + 'static,
+		> + Send
+		+ Sync
+		+ 'static
+{
+}
 
 /// Provisioned server identity for a CMS client handshake.
 ///
@@ -435,13 +516,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		session_observer: Option<Arc<dyn SessionObserver>>,
 	) -> Result<BoxedServerHandshake>
 	where
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		for<'b> P::Signature: TryFrom<&'b [u8]>,
-		P::VerifyingKey: Verifier<P::Signature> + for<'b> From<&'b PublicKey<P::Curve>>,
-		P::AeadCipher: KeyInit + Send + Sync + 'static,
-		P::Signature: SignatureEncoding,
+		P: HandshakeProvider,
 	{
 		let supported_profiles: Vec<SecurityProfileDesc> = supported_profiles.into_iter().collect();
 		let provider = Arc::clone(&self.provider);
@@ -466,15 +541,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_client(self: &Arc<Self>, config: CmsClientConfig) -> Result<BoxedClientHandshake>
 	where
-		P: Default + 'static,
-		P::Curve: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
-		<P::Curve as elliptic_curve::Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EncodePublicKey,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: Send + Sync + KeyInit,
+		P: HandshakeProvider,
 	{
 		use crate::transport::handshake::client::CmsHandshakeClient;
 
@@ -515,13 +582,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		session_observer: Option<Arc<dyn SessionObserver>>,
 	) -> Result<BoxedServerHandshake>
 	where
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: Send + Sync + KeyInit + 'static,
+		P: HandshakeProvider,
 	{
 		let supported_profiles: Vec<SecurityProfileDesc> = supported_profiles.into_iter().collect();
 		let provider = Arc::clone(&self.provider);
@@ -740,8 +801,8 @@ impl EstablishedSession {
 
 /// Client-side handshake protocol trait.
 ///
-/// Supports multi-round handshakes where the client may need to send multiple
-/// messages before completing the handshake.
+/// It supports multi-round handshakes, where the client sends more than one
+/// message before the handshake completes.
 ///
 /// `Send` is required on every target except `wasm32`, where the
 /// single-threaded executor lets JS-backed signing providers participate.
@@ -765,14 +826,14 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 
 	/// Complete the handshake and take everything it agreed.
 	///
-	/// Call this once [`Self::is_complete`] returns true. The client sends on
+	/// Call this after the client sends its last message. The client sends on
 	/// the client-to-server key and receives on the server-to-client key. The
 	/// cipher comes from the [`CryptoProvider`] associated type and the OID
 	/// from the negotiated security profile.
 	#[cfg(feature = "aead")]
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
-	/// Returns `true` when the handshake is complete.
+	/// Whether the handshake reached the terminal state that completion enters.
 	fn is_complete(&self) -> bool;
 
 	/// Negotiated algorithm OIDs after profile negotiation, or `None` before
@@ -782,8 +843,8 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 
 /// Server-side handshake protocol trait.
 ///
-/// Supports multi-round handshakes where the server may need to handle
-/// multiple requests from the client before completing the handshake.
+/// It supports multi-round handshakes, where the server handles more than one
+/// request from the client before the handshake completes.
 ///
 /// `Send` is required on every target except `wasm32`, where the
 /// single-threaded executor lets JS-backed signing providers participate.
@@ -793,9 +854,9 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 
 	/// Handle a request from the client.
 	///
-	/// Can be called multiple times for multi-round handshakes. Returns `Some`
-	/// when the server owes a response, and `None` when the step completes the
-	/// handshake. Each step accepts one container and refuses the other.
+	/// A multi-round handshake calls this once per client message. It returns
+	/// `Some` when the server owes a response, and `None` when the message was
+	/// the last one. Each step accepts one container and refuses the other.
 	fn handle_request<'a>(
 		&'a mut self,
 		msg: HandshakeMessage,
@@ -803,14 +864,14 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 
 	/// Complete the handshake and take everything it agreed.
 	///
-	/// Call this once [`Self::is_complete`] returns true. The server sends on
-	/// the server-to-client key and receives on the client-to-server key. The
-	/// cipher comes from the [`CryptoProvider`] associated type and the OID
-	/// from the negotiated security profile.
+	/// Call this after [`Self::handle_request`] returns `None`. The server
+	/// sends on the server-to-client key and receives on the client-to-server
+	/// key. The cipher comes from the [`CryptoProvider`] associated type and
+	/// the OID from the negotiated security profile.
 	#[cfg(feature = "aead")]
 	fn complete(self: Box<Self>) -> MaybeSendFuture<'static, CoreResult<EstablishedSession, Self::Error>>;
 
-	/// Returns `true` when the handshake is complete.
+	/// Whether the handshake reached the terminal state that completion enters.
 	fn is_complete(&self) -> bool;
 
 	/// Negotiated algorithm OIDs after profile negotiation, or `None` before
@@ -932,7 +993,7 @@ pub(crate) struct EciesSessionPayload {
 	/// receipt, sealed under the handshake secret's acknowledgement key. Its
 	/// signed attributes bind the bearer settlement answer (see
 	/// [forward secrecy](crate::transport::handshake#forward-secrecy)).
-	/// Required exactly when the server issued a receipt.
+	/// It is required exactly when the server issued a receipt.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub receipt_ack: Option<OctetString>,
 }
@@ -940,10 +1001,9 @@ pub(crate) struct EciesSessionPayload {
 /// Final client handshake message carrying the encrypted key material.
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientKeyExchange {
-	/// Key-exchange payload encrypted to the server: the ECIES session
-	/// payload or a CMS `EnvelopedData`, per the negotiated protocol. The
-	/// ECIES message leads with the client's ephemeral public key, which the
-	/// server pairs with its own ephemeral for the handshake secret.
+	/// The ECIES message that seals the session payload to the server. It
+	/// leads with the client's ephemeral public key, which the server pairs
+	/// with its own ephemeral for the handshake secret.
 	pub encrypted_data: OctetString,
 	/// Client certificate for mutual authentication. The client includes it
 	/// when the [`ServerHandshake`] sets `client_cert_required`.
@@ -1113,7 +1173,7 @@ struct ClientKeyExchangeAttrs {
 
 /// AES-256-GCM algorithm identifier.
 ///
-/// OID: 2.16.840.1.101.3.4.1.46 (aes256-GCM)
+/// The OID is 2.16.840.1.101.3.4.1.46 (aes256-GCM).
 fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None }
 }

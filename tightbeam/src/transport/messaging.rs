@@ -28,20 +28,9 @@ use crate::transport::io::CollectStep;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod x509 {
-	pub use crate::crypto::aead::KeyInit;
-	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-	pub use crate::crypto::sign::Verifier;
-	pub use crate::spki::EncodePublicKey;
+	pub use crate::transport::handshake::HandshakeProvider;
 	pub use crate::transport::io::EncryptedMessageIO;
-	pub use crate::transport::state::EncryptedProtocolState;
-
-	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-	pub use crate::transport::state::ServerHandshakeSlot;
-
-	#[cfg(feature = "transport-ecies")]
-	pub use crate::crypto::ecies::EciesPublicKeyOps;
+	pub use crate::transport::state::{EncryptedProtocolState, ServerHandshakeSlot};
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -63,8 +52,8 @@ use crate::trace::TraceCollector;
 /// Source of the connection audit trail for access-gate verdicts.
 ///
 /// Every plane that evaluates a collector gate implements this (the TCP
-/// transports, the mux handle) so `gate_inbound` can record the
-/// verdict wherever the gate runs.
+/// transports, the mux handle) so `gate_inbound` can record the verdict
+/// wherever the gate runs.
 #[cfg(feature = "transport-policy")]
 pub trait GateAudit {
 	/// The connection audit trail, when instrumentation is attached.
@@ -74,8 +63,8 @@ pub trait GateAudit {
 
 /// The gate verdict every [`GateAudit`] plane records.
 ///
-/// A crate-private extension, so the public [`GateAudit`] keeps its one
-/// method and stays usable as a trait object.
+/// The trait is a crate-private extension, so the public [`GateAudit`] keeps
+/// its one method and stays usable as a trait object.
 #[cfg(feature = "transport-policy")]
 pub(crate) trait GateInbound: GateAudit {
 	/// Gate one inbound request with the session's authenticated context and
@@ -90,8 +79,8 @@ pub(crate) trait GateInbound: GateAudit {
 	///
 	/// # Verdicts
 	///
-	/// - `frame` is [`None`] for a mux streaming or duplex open that has no request
-	///   frame at dispatch. Session-scoped gates still evaluate.
+	/// - `frame` is [`None`] for a mux streaming or duplex open that has no
+	///   request frame at dispatch. Session-scoped gates still evaluate.
 	/// - A gate that returns [`TransitStatus::Unknown`] signals a local bug, so
 	///   [`TransitStatus::normalized_verdict`] maps it to
 	///   [`TransitStatus::Internal`] and the peer sees a server fault.
@@ -109,7 +98,7 @@ pub(crate) trait GateInbound: GateAudit {
 				events::GATE_REJECT
 			};
 
-			// Verdict evidence: the status names why, the peer SPKI names who.
+			// As evidence, the status names why and the peer SPKI names who.
 			trace.emit_event_with_evidence(event, status.as_str(), session.peer_public_key());
 		}
 
@@ -194,15 +183,13 @@ pub trait MessageEmitter: MessageIO {
 	type EmitterGate: GatePolicy + ?Sized;
 	type RestartPolicy: RestartPolicy + ?Sized;
 
-	/// Return the restart policy.
+	/// The restart policy that [`Self::emit`] consults after a failed send.
 	fn to_restart_policy_ref(&self) -> &Self::RestartPolicy;
 
-	/// Return the emitter gate policy.
+	/// The gate policy that [`Self::emit`] evaluates before each send.
 	fn to_emitter_gate_policy_ref(&self) -> &Self::EmitterGate;
 
 	/// Run the protocol-specific send and receive operation.
-	///
-	/// The operation sends the message and receives the response.
 	///
 	/// # Returns
 	///
@@ -215,7 +202,8 @@ pub trait MessageEmitter: MessageIO {
 		message: Frame,
 	) -> impl Future<Output = TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)>> + MaybeSend;
 
-	/// Send a TightBeam message.
+	/// Send a TightBeam message through the emitter gate, and retry a failed
+	/// send as the restart policy decides.
 	fn emit(
 		&mut self,
 		message: Frame,
@@ -239,9 +227,8 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 	let mut current_attempt = attempt.unwrap_or(0);
 
 	loop {
-		// Evaluate the gate policy before sending. Emitter gates are
-		// client-side and need no connection context, so they get the empty
-		// context.
+		// Emitter gates are client-side and need no connection context, so they
+		// get the empty context.
 		let message = Some(letter.try_peek()?);
 		let session = SessionContext::default();
 		let status = emitter.to_emitter_gate_policy_ref().evaluate(message, &session);
@@ -257,7 +244,6 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), e, current_attempt)?;
 				emitter.clock().sleep(delay).await;
 
-				// Unbox the frame to put it back into the Letter.
 				letter.try_return_to_sender(*frame)?;
 				current_attempt += 1;
 				continue;
@@ -281,12 +267,10 @@ async fn emit_with_retry<T: MessageEmitter + MaybeSend + ?Sized>(
 			}
 		};
 
-		// Evaluate the retry policy only on an error.
 		match result {
 			Err(error) => {
 				let (frame, delay) = evaluate_retry(emitter.to_restart_policy_ref(), error, current_attempt)?;
 				emitter.clock().sleep(delay).await;
-				// Unbox the frame to put it back into the Letter.
 				letter.try_return_to_sender(*frame)?;
 				current_attempt += 1;
 			}
@@ -323,11 +307,11 @@ pub trait MessageCollector: CollectorRequirements {
 	#[cfg(feature = "transport-policy")]
 	type CollectorGate: GatePolicy + ?Sized;
 
-	/// Return the collector gate policy.
+	/// The gate policy that every collected message passes through.
 	#[cfg(feature = "transport-policy")]
 	fn collector_gate(&self) -> &Self::CollectorGate;
 
-	/// Read and validate a message without sending a response.
+	/// Read and validate one message, leaving the response to the caller.
 	///
 	/// The method returns the message and the gate evaluation status.
 	#[cfg(feature = "transport-policy")]
@@ -336,8 +320,7 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend,
 	{
 		async move {
-			// Read and decode the envelope. An encrypted transport overrides
-			// this step.
+			// An encrypted transport overrides this read.
 			let decoded_envelope = self.read_decoded_envelope().await?;
 			// A cleartext connection carries no peer identity, so it gets the
 			// empty context.
@@ -346,7 +329,7 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Read and validate a message without sending a response.
+	/// Read and validate one message, leaving the response to the caller.
 	///
 	/// The method returns the message. Without policies, the status is always
 	/// `Ok`.
@@ -362,7 +345,7 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Try to collect the next message without blocking on a closed connection.
+	/// Collect the next message, and tell a graceful close from an error.
 	///
 	/// - `Ok(None)` means that the connection closed gracefully (EOF).
 	/// - `Err` means that the connection failed unexpectedly.
@@ -374,7 +357,6 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend,
 	{
 		async move {
-			// Try to read the envelope, which is `None` on a graceful close.
 			let decoded_envelope = match self.try_read_decoded_envelope().await? {
 				Some(envelope) => envelope,
 				None => return Ok(None), // Connection closed gracefully
@@ -388,7 +370,7 @@ pub trait MessageCollector: CollectorRequirements {
 		}
 	}
 
-	/// Try to collect the next message without blocking on a closed connection.
+	/// Collect the next message, and tell a graceful close from an error.
 	///
 	/// - `Ok(None)` means that the connection closed gracefully (EOF).
 	/// - `Err` means that the connection failed unexpectedly.
@@ -400,7 +382,6 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend,
 	{
 		async move {
-			// Try to read the envelope, which is `None` on a graceful close.
 			let request_envelope = match self.try_read_decoded_envelope().await? {
 				Some(envelope) => envelope,
 				None => return Ok(None), // Connection closed gracefully
@@ -423,53 +404,15 @@ pub trait MessageCollector: CollectorRequirements {
 		Self: MaybeSend;
 
 	/// The X.509 `collect_message` with encryption and handshake support.
-	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
-	#[allow(async_fn_in_trait)]
-	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
-	where
-		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
-		P: CryptoProvider + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		PublicKey<P::Curve>: EciesPublicKeyOps,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature>,
-		for<'b> P::VerifyingKey: From<&'b PublicKey<P::Curve>>,
-		P::AeadCipher: KeyInit,
-	{
-		loop {
-			match self.collect_step().await? {
-				CollectStep::Handshake(request) => self.perform_server_handshake(request).await?,
-				CollectStep::Envelope(envelope) => {
-					let session = SessionContext::capture(self);
-					return gate_collected_envelope(self, envelope, &session);
-				}
-			}
-		}
-	}
-
-	/// The X.509 `collect_message` with encryption and handshake support, for
-	/// the CMS-only build.
-	///
-	/// A trait where-clause stays with the trait, so the method is
-	/// declared per feature combination with that build's predicate set.
 	#[cfg(all(
 		feature = "transport-policy",
-		not(feature = "transport-ecies"),
-		feature = "transport-cms"
+		any(feature = "transport-cms", feature = "transport-ecies")
 	))]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
 		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P> + ServerHandshakeSlot,
-		P: CryptoProvider + Send + Sync + 'static,
-		P::Curve: Curve + CurveArithmetic,
-		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
-		P::Signature: 'static,
-		P::Digest: Send + 'static,
-		P::AeadCipher: KeyInit + Send + Sync + 'static,
+		P: HandshakeProvider,
 	{
 		loop {
 			match self.collect_step().await? {

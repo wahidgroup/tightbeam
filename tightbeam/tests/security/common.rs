@@ -199,10 +199,8 @@ pub trait HandshakeProtocol: Send {
 	/// Run a complete handshake, capturing all exchanged messages.
 	fn capture_full(&mut self) -> FlowFuture<'_, CapturedHandshake>;
 
-	/// Run the handshake up to step N, then inject a different message at step
-	/// N.
-	///
-	/// The method returns the outcome of the injection attempt.
+	/// Run the handshake up to step N, then inject a different message at
+	/// step N.
 	fn inject_at_step(&mut self, step: usize, msg: &[u8]) -> FlowFuture<'_, InjectionOutcome>;
 }
 
@@ -239,9 +237,8 @@ impl<F: HandshakeFlow> HandshakeProtocol for F {
 				return Err(invalid_step_error("step is not part of this handshake flow"));
 			}
 
-			// Run the flow normally up to the step under attack. The opening
-			// message is built only once a step before the target needs it, so
-			// injecting at step 0 leaves the client untouched.
+			// The opening message is built only once a step before the target
+			// needs it, so injecting at step 0 leaves the client untouched.
 			let mut pending = None;
 			for candidate in steps.iter().take_while(|candidate| candidate.index != step) {
 				let payload = match pending {
@@ -309,9 +306,10 @@ impl HandshakeBackendKind {
 	///
 	/// This simulates a MITM attacker modifying the message in transit. The
 	/// edit goes through the decoded message and re-encodes it, so the result
-	/// is well-formed DER and only a transcript or signature check can refuse
-	/// it. ECIES tampers the `ServerHandshake` server random, and CMS tampers
-	/// the transcript hash that the `ServerFinished` `SignedData` carries.
+	/// is well-formed DER that only a transcript or signature check can refuse.
+	///
+	/// - ECIES tampers the `ServerHandshake` server random.
+	/// - CMS tampers the transcript hash that the `ServerFinished` `SignedData` carries.
 	pub fn tamper_server_message(self, payload: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 		let payload = payload.as_ref();
 		match self {
@@ -374,16 +372,16 @@ impl Default for SecurityThreatHarness {
 impl SecurityThreatHarness {
 	/// Hidden CSP event: a handshake session is about to be constructed.
 	pub const HARNESS_SPAWN_SESSION: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-session");
-	/// Hidden CSP event: ECIES backend selected for the session.
+	/// Hidden CSP event: the ECIES backend is selected for the session.
 	pub const HARNESS_SPAWN_ECIES: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-ecies");
-	/// Hidden CSP event: CMS backend selected for the session.
+	/// Hidden CSP event: the CMS backend is selected for the session.
 	pub const HARNESS_SPAWN_CMS: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms");
-	/// Hidden CSP event: weak-cipher spawn path entered.
+	/// Hidden CSP event: the weak-cipher spawn path is entered.
 	pub const HARNESS_SPAWN_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-weak");
-	/// Hidden CSP event: weak ECIES backend selected.
+	/// Hidden CSP event: the weak ECIES backend is selected.
 	pub const HARNESS_SPAWN_ECIES_WEAK: Urn<'static> =
 		tightbeam::urn!("test", "event:security-harness/spawn-ecies-weak");
-	/// Hidden CSP event: weak CMS backend selected.
+	/// Hidden CSP event: the weak CMS backend is selected.
 	pub const HARNESS_SPAWN_CMS_WEAK: Urn<'static> = tightbeam::urn!("test", "event:security-harness/spawn-cms-weak");
 
 	/// Create a harness with a trace collector for internal event emission.
@@ -462,8 +460,8 @@ impl SecurityThreatHarness {
 		match kind {
 			HandshakeBackendKind::Ecies => {
 				self.emit(Self::HARNESS_SPAWN_ECIES_WEAK).ok();
-				// Deliberately weak session: opt out of the default
-				// strength floor so the downgrade harness can capture AES-128
+				// The session is deliberately weak. It opts out of the default
+				// strength floor, so the downgrade harness can capture AES-128
 				// wire bytes.
 				Box::new(Aes128EciesSession::with_profiles(
 					&self.materials,
@@ -475,8 +473,8 @@ impl SecurityThreatHarness {
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
 				self.emit(Self::HARNESS_SPAWN_CMS_WEAK).ok();
-				// Deliberately weak session: opt out of the default
-				// strength floor so the downgrade harness can capture AES-128
+				// The session is deliberately weak. It opts out of the default
+				// strength floor, so the downgrade harness can capture AES-128
 				// wire bytes.
 				Box::new(Aes128CmsSession::with_profiles(
 					&self.materials,
@@ -521,8 +519,8 @@ pub fn tamper_payload_truncate(payload: impl AsRef<[u8]>, keep_bytes: usize) -> 
 /// Result of attempting to decrypt an ECIES payload.
 #[derive(Debug)]
 pub enum DecryptionResult {
-	/// Decryption succeeded, and the plaintext has the expected size (64 bytes
-	/// for session material).
+	/// Decryption succeeded. `plaintext_len` is the length of the recovered
+	/// plaintext, which the caller checks against the size it expects.
 	Success { plaintext_len: usize },
 	/// Decryption failed, for example on a wrong key or a corrupted ciphertext.
 	Failed,
@@ -589,7 +587,7 @@ pub fn try_decrypt_ecies(
 	}
 }
 
-/// Generate a random secret key for testing decryption with wrong key.
+/// Generate a random secret key, to test decryption with a wrong key.
 pub fn generate_wrong_secret_key() -> k256::SecretKey {
 	k256::SecretKey::random(&mut rand_core::OsRng)
 }
@@ -616,8 +614,8 @@ macro_rules! ecies_session {
 		impl $name {
 			/// Create a session with specific client and server profiles.
 			///
-			/// `strength_policy` overrides the server's default strength floor,
-			/// which a deliberately weak downgrade session needs.
+			/// `strength_policy` overrides both endpoints' default strength
+			/// floor, which a deliberately weak downgrade session needs.
 			fn with_profiles(
 				materials: &ServerMaterials,
 				client_profiles: impl IntoIterator<Item = SecurityProfileDesc>,
@@ -788,7 +786,7 @@ macro_rules! cms_session {
 							Ok(Some(self.client.build_client_finished().await?.to_der()?))
 						}
 						4 => {
-							self.server.process_client_finished(&SignedData::from_der(msg)?)?;
+							self.server.process_client_finished(&SignedData::from_der(msg)?).await?;
 							Ok(None)
 						}
 						_ => Err(invalid_step_error("CMS steps are 0, 2, 4")),

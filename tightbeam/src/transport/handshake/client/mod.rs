@@ -1,6 +1,8 @@
-//! Client-side handshake logic for TightBeam protocol.
+//! Client-side handshake logic for the TightBeam protocol.
 //!
-//! This module contains client-specific handshake implementations and utilities.
+//! Each protocol has one client orchestrator: [`CmsHandshakeClient`] under the
+//! `transport-cms` feature, and [`EciesHandshakeClient`] under the
+//! `transport-ecies` feature.
 
 #[cfg(feature = "transport-cms")]
 mod cms;
@@ -12,4 +14,4 @@ pub use cms::CmsHandshakeClient;
 mod ecies;
 
 #[cfg(feature = "transport-ecies")]
-pub use ecies::{EciesHandshakeClient, ExtractVerifyingKey};
+pub use ecies::EciesHandshakeClient;

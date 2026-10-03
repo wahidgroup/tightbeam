@@ -1,13 +1,13 @@
-//! Common traits and key-schedule types for handshake orchestrators.
+//! Key-schedule types for handshake orchestrators.
 //!
 //! The CMS and ECIES client and server implementations share these:
 //!
-//! - [`HandshakeNegotiation`] negotiates the profile on the server side.
-//! - [`HandshakeFinalization`] finalizes the AEAD session keys for every orchestrator.
-//! - [`HandshakeAlertHandler`] processes alert attributes for every orchestrator.
-//! - [`HandshakeSecret`] is the one secret a session derives from. Its two
-//!   inputs are a [`BaseSecret`] and the [`EcdhSecret`] that
+//! - [`Agreement`] derives the [`HandshakeSecret`], the one secret a session
+//!   derives from, out of a [`BaseSecret`] and the [`EcdhSecret`] that
 //!   [`HandshakeAgreement`] produces.
+//! - [`Terms`] holds what negotiation fixed: the profile, the multiplexing
+//!   terms, the transcript hash, and the protocol's salt.
+//! - [`Agreed`] derives everything a session takes from the handshake secret.
 //!
 //! # Key schedule
 //!
@@ -30,24 +30,11 @@
 
 use core::fmt;
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use alloc::vec::Vec;
-
-use crate::constants::{MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO};
-use crate::crypto::aead::{DirectionalCiphers, KeyInit};
-use crate::crypto::common::KeySizeUser;
-use crate::crypto::kdf::KdfFunction;
-use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
-use crate::crypto::x509::attr::Attributes;
-use crate::oids::HANDSHAKE_ABORT_ALERT;
-use crate::transport::handshake::attributes::HandshakeAttributes;
-use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::{
-	DefaultStrengthFloor, NegotiationError, ProfileStrengthPolicy, RunnableProfile, SecurityOffer,
-};
-use crate::transport::handshake::primitives::{KdfInfo, KdfSalt};
-use crate::ZeroizingBytes;
-
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use core::mem;
 
@@ -55,115 +42,50 @@ use core::mem;
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::constants::{
-	TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO,
+	MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_ACK_AAD_DOMAIN, TIGHTBEAM_ACK_KDF_INFO, TIGHTBEAM_C2S_KDF_INFO,
+	TIGHTBEAM_EPOCH_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO,
 };
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::aead::{Aead, Nonce, Payload};
+use crate::crypto::aead::{Aead, DirectionalCiphers, KeyInit, Nonce, Payload, SessionKeys};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::kdf::EcdhSecret;
+use crate::crypto::common::KeySizeUser;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::kdf::{EcdhSecret, KdfFunction};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::profiles::CryptoProvider;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::secret::SecretSlice;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::sign::elliptic_curve::ecdh::{diffie_hellman, EphemeralSecret};
+#[cfg(feature = "transport-ecies")]
+use crate::crypto::sign::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
+use crate::crypto::sign::elliptic_curve::{CurveArithmetic, PublicKey, SecretKey};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::crypto::x509::utils::CertificateExt;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::random::{generate_nonce, CryptoRngCore};
-use crate::transport::handshake::attributes::HandshakeAlertAttribute;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::primitives::multi_input_kdf;
+use crate::transport::handshake::error::HandshakeError;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::negotiation::{MuxSettings, RunnableProfile};
+#[cfg(feature = "transport-ecies")]
+use crate::transport::handshake::primitives::RandomsSalt;
 #[cfg(all(
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 use crate::transport::handshake::primitives::{kdf_chain, KdfStage};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::primitives::{multi_input_kdf, KdfInfo, KdfSalt};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::receipt::StoredReceipt;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::{Arc, EstablishedSession, HandshakeCurve, HandshakeProvider};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::x509::Certificate;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::ZeroizingArray;
-
-/// Provides profile negotiation logic for server-side handshake orchestrators.
-///
-/// A server must implement [`Self::supported_profiles`] to expose its
-/// configured security profiles. The trait provides the default negotiation
-/// logic for both the client-offered mode and the dealer's choice mode.
-///
-/// # Usage
-///
-/// - **Negotiation mode**: the client sends a [`SecurityOffer`], and the server
-///   selects the first mutual profile in *server* preference order.
-/// - **Dealer's choice mode**: the client sends no offer, and the server uses
-///   its first configured profile that meets the strength policy.
-///
-/// # Security
-///
-/// Both modes filter profiles through [`ProfileStrengthPolicy`] before
-/// selection, so a weak profile left in [`Self::supported_profiles`] for
-/// compatibility cannot be negotiated (CWE-757 downgrade resistance).
-pub trait HandshakeNegotiation<P>
-where
-	P: CryptoProvider,
-{
-	/// Return the profiles in server preference order, most preferred first.
-	fn supported_profiles(&self) -> &[SecurityProfileDesc];
-
-	/// Minimum-strength policy applied before selection.
-	///
-	/// Defaults to [`DefaultStrengthFloor`], which requires a 256-bit AEAD key
-	/// and a digest of 256 bits or more.
-	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
-		&DefaultStrengthFloor
-	}
-
-	/// Negotiate a security profile with the peer.
-	///
-	/// Only a configured profile that `P` runs is eligible, so the selection
-	/// names only algorithms the provider runs.
-	///
-	/// # Errors
-	///
-	/// Each [`NegotiationError`] arrives wrapped in
-	/// [`HandshakeError::NegotiationError`].
-	///
-	/// - [`HandshakeError::NoSupportedProfiles`] -- the server has no configured profile.
-	/// - [`NegotiationError::UnrunnableProfile`] -- no configured profile runs on `P`.
-	/// - [`NegotiationError::BelowStrengthFloor`] -- no runnable profile meets the policy.
-	/// - [`NegotiationError::EmptyOffer`] -- the peer sent an empty offer.
-	/// - [`NegotiationError::OfferTooLarge`] -- the offer holds too many profiles.
-	/// - [`NegotiationError::NoMutualProfile`] -- no mutually supported profile exists.
-	fn negotiate_profile(&self, offer: Option<&SecurityOffer>) -> Result<RunnableProfile<P>, HandshakeError> {
-		let supported = self.supported_profiles();
-		if supported.is_empty() {
-			return Err(HandshakeError::NoSupportedProfiles);
-		}
-
-		let runnable: Vec<RunnableProfile<P>> = supported
-			.iter()
-			.filter_map(|descriptor| RunnableProfile::try_from(*descriptor).ok())
-			.collect();
-		if runnable.is_empty() {
-			return Err(NegotiationError::UnrunnableProfile.into());
-		}
-
-		let policy = self.strength_policy();
-		let eligible: Vec<SecurityProfileDesc> = runnable
-			.iter()
-			.filter(|profile| policy.meets_floor(&profile.strength()))
-			.map(RunnableProfile::descriptor)
-			.collect();
-
-		let dealers_choice = eligible.first().copied().ok_or(NegotiationError::BelowStrengthFloor)?;
-		let selected = match offer {
-			Some(offer) => offer.select_profile(&eligible)?,
-			None => dealers_choice,
-		};
-		Ok(RunnableProfile::try_from(selected)?)
-	}
-}
+use crate::{ZeroizingArray, ZeroizingBytes};
 
 /// The 32-byte random secret the client seals to the server's static key.
 ///
@@ -225,6 +147,7 @@ impl TryFrom<SecretSlice<u8>> for BaseSecret {
 ///
 /// Every session key derives from this one value, and the crate's one
 /// constructor for it takes the two inputs named above.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub struct HandshakeSecret(ZeroizingBytes);
 
 /// Handshake secret length in bytes.
@@ -236,14 +159,14 @@ impl HandshakeSecret {
 	/// Derive the handshake secret from `base` and the ephemeral-ephemeral
 	/// ECDH output `shared`, extracted under `salt`.
 	///
-	/// Both protocols on both sides call it exactly once. The two inputs enter
+	/// [`Agreement::settle`] is its one caller. The two inputs enter
 	/// [`multi_input_kdf`] length-prefixed, in this order.
 	///
 	/// # Errors
 	///
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the derivation.
 	/// - [`HandshakeError::IntegerOutOfRange`] -- an input exceeds the framing prefix.
-	pub(crate) fn derive<P>(base: &BaseSecret, shared: &EcdhSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
+	fn derive<P>(base: &BaseSecret, shared: &EcdhSecret, salt: KdfSalt<'_>) -> Result<Self, HandshakeError>
 	where
 		P: CryptoProvider,
 	{
@@ -293,8 +216,9 @@ impl HandshakeSecret {
 	///
 	/// - [`HandshakeError::KdfError`] -- the provider KDF refused the key length.
 	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the derived key.
-	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused the ciphertext, so it was sealed under
-	///   another handshake secret or another transcript, or altered in flight.
+	/// - [`HandshakeError::ReceiptAckCipher`] -- the AEAD refused the
+	///   ciphertext, so it was sealed under another handshake secret or another
+	///   transcript, or altered in flight.
 	pub(crate) fn open_ack<P>(
 		&self,
 		salt: KdfSalt<'_>,
@@ -336,12 +260,14 @@ impl HandshakeSecret {
 }
 
 /// Debug output redacts the handshake secret.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl fmt::Debug for HandshakeSecret {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("HandshakeSecret").finish_non_exhaustive()
 	}
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod sealed {
 	/// Closes [`TrafficSecret`](super::TrafficSecret) to this module.
 	pub trait Sealed {}
@@ -352,13 +278,16 @@ mod sealed {
 /// The directional derivation takes an implementor, and the implementors are
 /// the handshake secret and the epoch secret that rotates from it. The trait
 /// is sealed, so those two are the only inputs the derivation has.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) trait TrafficSecret: sealed::Sealed {
 	/// The secret bytes, for the provider KDF that extracts from them.
 	fn as_bytes(&self) -> &[u8];
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl sealed::Sealed for HandshakeSecret {}
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl TrafficSecret for HandshakeSecret {
 	fn as_bytes(&self) -> &[u8] {
 		&self.0
@@ -370,10 +299,13 @@ impl TrafficSecret for HandshakeSecret {
 /// Epoch 0 derives from the [`HandshakeSecret`] through
 /// [`EpochMaterials::derive`], and each rotation derives the next link from
 /// the previous one through [`Self::next`]. Those two are its constructors.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) struct EpochSecret(ZeroizingBytes);
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl sealed::Sealed for EpochSecret {}
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl TrafficSecret for EpochSecret {
 	fn as_bytes(&self) -> &[u8] {
 		&self.0
@@ -404,22 +336,23 @@ impl EpochSecret {
 /// The secret an orchestrator holds for the phase its handshake is in.
 ///
 /// - One value holds the pending material or the handshake secret, so an orchestrator holds one of them.
-/// - The schedule advances `Idle`, `Pending`, `Consumed`, `Derived`, `Consumed`,
-///   and each transition checks the variant it leaves, so a second key exchange
-///   or a second derivation fails with [`HandshakeError::InvalidState`].
-/// - Every take leaves [`Self::Consumed`] behind, so completion is the one read of the handshake secret.
-/// - A take that finds another variant fails with [`HandshakeError::InvalidState`]
-///   and leaves [`Self::Consumed`] behind, so a failed step has nothing to
-///   derive from.
+/// - The schedule advances `Idle`, `Pending`, `Consumed`, `Derived`,
+///   `Consumed`, and each transition checks the variant it leaves, so a second
+///   key exchange or a second derivation fails with
+///   [`HandshakeError::InvalidState`].
+/// - Every take leaves [`Self::Consumed`] behind, so the schedule holds no secret once completion took it.
+/// - A take that finds another variant fails with
+///   [`HandshakeError::InvalidState`] and leaves [`Self::Consumed`] behind, so
+///   a failed step has nothing to derive from.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) enum KeySchedule<Pending> {
-	/// No key material yet.
+	/// The state before the side holds its first secret.
 	Idle,
 	/// What the side holds between its first secret and the agreement.
 	Pending(Pending),
 	/// The handshake secret, from the agreement to completion.
 	Derived(HandshakeSecret),
-	/// Completion took the handshake secret.
+	/// A take emptied the schedule. Only [`Self::store`] leaves this variant.
 	Consumed,
 }
 
@@ -505,6 +438,7 @@ pub struct EpochMaterials {
 	/// Current epoch secret, zeroized on drop and on rotation
 	/// (RFC 9846, 7.2). Only `transport::rekey` reads it, and a build can
 	/// include the handshake without the `transport-multiplex` consumers.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	#[allow(dead_code)]
 	pub(crate) secret: EpochSecret,
 	/// Epoch counter. It is 0 at handshake and increments on each rekey
@@ -586,12 +520,7 @@ pub(crate) trait CompressedPoint {
 }
 
 #[cfg(feature = "transport-ecies")]
-impl<C> CompressedPoint for PublicKey<C>
-where
-	C: Curve + CurveArithmetic,
-	<C as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-{
+impl<C: HandshakeCurve> CompressedPoint for PublicKey<C> {
 	fn compressed_point(&self) -> Result<[u8; EC_PUBKEY_COMPRESSED_SIZE], HandshakeError> {
 		let point = self.to_encoded_point(true);
 		let bytes = point.as_bytes();
@@ -613,9 +542,9 @@ where
 	/// client's ephemeral.
 	///
 	/// The parser refuses a malformed, off-curve, or identity point, so no
-	/// scalar multiplication runs on an invalid one, and the ephemeral is
-	/// refused when it equals the static key `self`, because the agreement
-	/// would then collapse into the static one the server's key recovers.
+	/// scalar multiplication runs on an invalid one. A point equal to the
+	/// static key `self` is refused as well, because the agreement would then
+	/// collapse into the static one the server's key recovers.
 	///
 	/// # Errors
 	///
@@ -625,12 +554,7 @@ where
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-impl<C> ServerEphemeral<C> for PublicKey<C>
-where
-	C: Curve + CurveArithmetic,
-	<C as Curve>::FieldBytesSize: ModulusSize,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-{
+impl<C: HandshakeCurve> ServerEphemeral<C> for PublicKey<C> {
 	fn server_ephemeral(&self, sec1: &[u8]) -> Result<PublicKey<C>, HandshakeError> {
 		let ephemeral = PublicKey::<C>::from_sec1_bytes(sec1)?;
 		if ephemeral == *self {
@@ -643,11 +567,12 @@ where
 
 /// ECDH key agreement on the handshake plane.
 ///
-/// The KARI static step runs it with the client's [`SecretKey`] against the
-/// server's static key, and the ephemeral-ephemeral step runs it with the same
-/// [`SecretKey`] on the client or the [`EphemeralSecret`] the server drew for
-/// one handshake. Every peer arrives as a parsed [`PublicKey`], so each point
-/// has passed `from_sec1_bytes` before it reaches a scalar multiplication.
+/// - The KARI static step runs it with the client's [`SecretKey`] against the server's static key.
+/// - The ephemeral-ephemeral step runs it with the same [`SecretKey`] on the
+///   client, or with the [`EphemeralSecret`] the server drew for one handshake.
+///
+/// Every peer arrives as a parsed [`PublicKey`], so each point has passed
+/// `from_sec1_bytes` before it reaches a scalar multiplication.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) trait HandshakeAgreement<C>
 where
@@ -682,56 +607,43 @@ where
 	}
 }
 
-/// Provides session key finalization logic for all handshake orchestrators.
+/// The base secret beside the peer point it is agreed with, borrowed for one
+/// settlement.
 ///
-/// An orchestrator must implement [`Self::selected_profile`] to expose the
-/// negotiated security profile. The trait provides the default HKDF-based key
-/// derivation with entropy validation.
-///
-/// # Security properties
-///
-/// - The derivation enforces at least [`MIN_SALT_ENTROPY_BYTES`] of salt entropy.
-/// - HKDF runs with per-direction domain separation ([`TIGHTBEAM_C2S_KDF_INFO`],
-///   [`TIGHTBEAM_S2C_KDF_INFO`]), the RFC 5869 info-label pattern behind the
-///   TLS 1.3 directional traffic secrets (RFC 9846, § 7.3).
-/// - The key size follows the negotiated AEAD cipher profile.
-/// - The underlying crypto primitives supply constant-time operations.
-pub trait HandshakeFinalization<P>
-where
-	P: CryptoProvider,
-{
-	/// Return the profile negotiated through offer and accept, if any.
-	fn selected_profile(&self) -> Option<RunnableProfile<P>>;
+/// Each protocol builds one where both halves exist, and [`Self::settle`] is
+/// the one derivation of the [`HandshakeSecret`].
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) struct Agreement<'a, P: HandshakeProvider> {
+	base: &'a BaseSecret,
+	peer: &'a PublicKey<P::Curve>,
+}
 
-	/// Derive directional AEAD ciphers from the handshake secret and the
-	/// context salt.
-	///
-	/// # Salt contract
-	///
-	/// - **CMS**: the transcript hash (32 bytes).
-	/// - **ECIES**: `client_random || server_random` (64 bytes).
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<'a, P: HandshakeProvider> Agreement<'a, P> {
+	/// Pair `base` with the point `peer` it is agreed with.
+	pub(crate) fn new(base: &'a BaseSecret, peer: &'a PublicKey<P::Curve>) -> Self {
+		Self { base, peer }
+	}
+
+	/// Run the agreement of `local` with the peer point, and derive the
+	/// handshake secret from the base secret and that output under `salt`.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::InvalidState`] -- no profile is selected.
-	/// - [`HandshakeError::InsufficientSaltEntropy`] -- the salt is shorter than [`MIN_SALT_ENTROPY_BYTES`].
-	/// - [`HandshakeError::KdfError`] -- the KDF refused the key length.
-	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the derived key.
-	fn derive_directional_aead(
-		&self,
-		secret: &HandshakeSecret,
+	/// - [`HandshakeError::KdfError`] -- the shared secret is not 32 bytes, or
+	///   the provider KDF refused the derivation.
+	/// - [`HandshakeError::IntegerOutOfRange`] -- an input exceeds the framing prefix.
+	pub(crate) fn settle(
+		self,
+		local: &impl HandshakeAgreement<P::Curve>,
 		salt: KdfSalt<'_>,
-	) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError>
-	where
-		P::AeadCipher: KeyInit,
-	{
-		// A selected profile names the provider's own cipher, so the keys
-		// derive under the identity the peer negotiated.
-		self.selected_profile().ok_or(HandshakeError::InvalidState)?;
-		DirectionalCiphers::derive::<P, _>(secret, salt)
+	) -> Result<HandshakeSecret, HandshakeError> {
+		let shared = local.shared_secret(self.peer)?;
+		HandshakeSecret::derive::<P>(self.base, &shared, salt)
 	}
 }
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl<C> DirectionalCiphers<C>
 where
 	C: KeyInit,
@@ -765,6 +677,7 @@ where
 }
 
 /// Derive one direction's cipher under the given KDF info label.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn derive_labeled_cipher<P>(
 	input_key: &[u8],
 	salt: KdfSalt<'_>,
@@ -780,43 +693,126 @@ where
 	Ok(cipher)
 }
 
-/// Provides alert attribute processing for all handshake orchestrators.
+/// The KDF salt of a protocol.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) enum Salt {
+	/// ECIES salts with `client_random || server_random`.
+	#[cfg(feature = "transport-ecies")]
+	Randoms(RandomsSalt),
+	/// CMS salts with the transcript hash that the [`Terms`] hold.
+	#[cfg(feature = "transport-cms")]
+	TranscriptHash,
+}
+
+/// What both sides hold once negotiation is done.
 ///
-/// Every orchestrator implements this trait through a blanket impl. Call
-/// [`Self::check_for_alert`] early in message processing to detect an abort
-/// alert that the peer sent.
-///
-/// # Alert types
-///
-/// The codes of [`HandshakeAlert`](super::HandshakeAlert) are:
-///
-/// - `AuthRequired`: the peer requires mutual authentication.
-/// - `VersionMismatch`: the protocol version is incompatible.
-/// - `AlgorithmMismatch`: no mutual cryptographic algorithm exists.
-/// - `DecryptFail`: decryption or signature verification failed.
-/// - `FinishedIntegrityFail`: the transcript hash does not match.
-pub trait HandshakeAlertHandler {
-	/// Check `attrs` for an abort alert from the peer.
+/// The fields are fixed together at the leg that seals the transcript, so a
+/// handshake that holds terms holds all of them.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) struct Terms<P: HandshakeProvider> {
+	profile: RunnableProfile<P>,
+	mux: Option<MuxSettings>,
+	transcript_hash: [u8; 32],
+	salt: Salt,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<P: HandshakeProvider> Terms<P> {
+	/// Fix the terms of one handshake.
 	///
-	/// Abort alerts live in unprotected attributes, so they are advisory and
-	/// unauthenticated.
+	/// - `mux` is `None` for a single-flight session.
+	/// - `transcript_hash` is the sealed hash both sides sign over.
+	pub(crate) fn new(
+		profile: RunnableProfile<P>,
+		mux: Option<MuxSettings>,
+		transcript_hash: [u8; 32],
+		salt: Salt,
+	) -> Self {
+		Self { profile, mux, transcript_hash, salt }
+	}
+
+	/// The profile both sides agreed.
+	pub(crate) fn profile(&self) -> RunnableProfile<P> {
+		self.profile
+	}
+
+	/// The multiplexing terms both sides agreed, if any.
+	#[cfg(feature = "transport-ecies")]
+	pub(crate) fn mux(&self) -> Option<MuxSettings> {
+		self.mux
+	}
+
+	/// The sealed transcript hash.
+	pub(crate) fn transcript_hash(&self) -> &[u8; 32] {
+		&self.transcript_hash
+	}
+
+	/// The salt every derivation of this handshake runs under.
+	pub(crate) fn kdf_salt(&self) -> KdfSalt<'_> {
+		match &self.salt {
+			#[cfg(feature = "transport-ecies")]
+			Salt::Randoms(randoms) => randoms.as_kdf_salt(),
+			#[cfg(feature = "transport-cms")]
+			Salt::TranscriptHash => KdfSalt::new(&self.transcript_hash),
+		}
+	}
+}
+
+/// The certificate a role records as its peer.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) trait PeerIdentity {
+	/// The certificate the session records, or `None` when the peer proved no
+	/// identity.
+	fn certificate(&self) -> Option<&Arc<Certificate>>;
+}
+
+/// What both sides hold once the handshake secret exists.
+///
+/// [`Self::complete`] consumes it, so one handshake derives one session.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) struct Agreed<P: HandshakeProvider, Peer: PeerIdentity> {
+	terms: Terms<P>,
+	secret: HandshakeSecret,
+	receipt: Option<StoredReceipt>,
+	peer: Peer,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl<P: HandshakeProvider, Peer: PeerIdentity> Agreed<P, Peer> {
+	/// Gather what one handshake agreed.
+	///
+	/// `receipt` is the dual-signed receipt of a budget-bearing session, and
+	/// `None` for an unmetered one.
+	pub(crate) fn new(terms: Terms<P>, secret: HandshakeSecret, receipt: Option<StoredReceipt>, peer: Peer) -> Self {
+		Self { terms, secret, receipt, peer }
+	}
+
+	/// Derive everything a session takes from the handshake secret, and hand
+	/// it over.
+	///
+	/// This is the one key-schedule sequence of both protocols and both roles:
+	/// the directional traffic keys, then the epoch-0 rekey materials, each
+	/// under the protocol's salt. `keys` maps the directional ciphers to the
+	/// keys of the calling role. The handshake secret drops when this returns.
 	///
 	/// # Errors
 	///
-	/// - [`HandshakeError::AbortReceived`] -- an alert with a known code is present.
-	/// - [`HandshakeError::DuplicateAttribute`] -- the alert attribute repeats.
-	/// - [`HandshakeError::InvalidAttributeArity`] -- the alert attribute is malformed.
-	/// - [`HandshakeError::InvalidIntegerEncoding`] -- the alert code is not a valid INTEGER.
-	/// - [`HandshakeError::IntegerOutOfRange`] -- the alert code is above `u8::MAX`.
-	/// - [`HandshakeError::UnknownAlertCode`] -- the code names no alert.
-	fn check_for_alert(&self, attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
-		if let Some(attrs) = attrs {
-			if let Some(alert_attr) = attrs.find_unsigned_attr(HANDSHAKE_ABORT_ALERT)? {
-				let alert = alert_attr.handshake_alert()?;
-				return Err(HandshakeError::AbortReceived(alert));
-			}
-		}
-		Ok(())
+	/// - [`HandshakeError::InsufficientSaltEntropy`] -- the salt is shorter than [`MIN_SALT_ENTROPY_BYTES`].
+	/// - [`HandshakeError::KdfError`] -- the KDF refused a key length.
+	/// - [`HandshakeError::InvalidKeyMaterialLength`] -- the cipher refused the derived key.
+	pub(crate) fn complete(
+		self,
+		keys: fn(DirectionalCiphers<P::AeadCipher>) -> SessionKeys,
+	) -> Result<EstablishedSession, HandshakeError> {
+		let Self { terms, secret, receipt, peer } = self;
+		let salt = terms.kdf_salt();
+		let ciphers = DirectionalCiphers::derive::<P, _>(&secret, salt)?;
+		let epoch = EpochMaterials::derive::<P>(&secret, salt, terms.transcript_hash)?;
+
+		let receipt = receipt.map(Arc::new);
+		let peer = peer.certificate().map(Arc::clone);
+		let session = EstablishedSession::new(keys(ciphers), terms.mux, receipt, peer, Some(epoch));
+		Ok(session)
 	}
 }
 
@@ -828,21 +824,12 @@ pub trait HandshakeVerifyingKey {
 	/// # Errors
 	///
 	/// - [`HandshakeError::InvalidPublicKey`] -- the certificate key bytes fail SEC1 decoding.
-	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
-	where
-		C: Curve + CurveArithmetic,
-		<C as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>;
+	fn verifying_key<C: HandshakeCurve>(&self) -> Result<PublicKey<C>, HandshakeError>;
 }
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl HandshakeVerifyingKey for Certificate {
-	fn verifying_key<C>(&self) -> Result<PublicKey<C>, HandshakeError>
-	where
-		C: Curve + CurveArithmetic,
-		<C as Curve>::FieldBytesSize: ModulusSize,
-		AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-	{
+	fn verifying_key<C: HandshakeCurve>(&self) -> Result<PublicKey<C>, HandshakeError> {
 		let pubkey_bytes = self.verifying_key_bytes();
 		Ok(PublicKey::<C>::from_sec1_bytes(pubkey_bytes)?)
 	}
@@ -852,110 +839,6 @@ impl HandshakeVerifyingKey for Certificate {
 mod tests {
 	use super::*;
 	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
-	use crate::crypto::x509::attr::Attribute;
-	use crate::der::asn1::{Any, SetOfVec};
-	use crate::oids::AES_128_GCM;
-	use crate::transport::handshake::negotiation::{NegotiationError, ProfileStrength};
-	use crate::transport::handshake::HandshakeAlert;
-	use std::error::Error;
-
-	/// A policy that refuses every profile.
-	struct RefuseAll;
-
-	impl ProfileStrengthPolicy for RefuseAll {
-		fn meets_floor(&self, _strength: &ProfileStrength) -> bool {
-			false
-		}
-	}
-
-	struct MockServer {
-		profiles: Vec<SecurityProfileDesc>,
-		refuse_all: bool,
-	}
-
-	impl HandshakeNegotiation<DefaultCryptoProvider> for MockServer {
-		fn supported_profiles(&self) -> &[SecurityProfileDesc] {
-			&self.profiles
-		}
-
-		fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
-			match self.refuse_all {
-				true => &RefuseAll,
-				false => &DefaultStrengthFloor,
-			}
-		}
-	}
-
-	struct MockClient {
-		profile: Option<RunnableProfile<DefaultCryptoProvider>>,
-	}
-
-	impl HandshakeFinalization<DefaultCryptoProvider> for MockClient {
-		fn selected_profile(&self) -> Option<RunnableProfile<DefaultCryptoProvider>> {
-			self.profile
-		}
-	}
-
-	fn native_profile() -> SecurityProfileDesc {
-		RunnableProfile::<DefaultCryptoProvider>::native().descriptor()
-	}
-
-	/// A descriptor that names an AEAD the default provider does not run.
-	fn foreign_profile() -> SecurityProfileDesc {
-		SecurityProfileDesc { aead: Some(AES_128_GCM), ..native_profile() }
-	}
-
-	fn mock_server(profiles: impl IntoIterator<Item = SecurityProfileDesc>) -> MockServer {
-		MockServer { profiles: profiles.into_iter().collect(), refuse_all: false }
-	}
-
-	fn mock_client() -> MockClient {
-		MockClient { profile: Some(RunnableProfile::native()) }
-	}
-
-	#[test]
-	fn an_offer_selects_the_profile_the_provider_runs() -> Result<(), Box<dyn Error>> {
-		let server = mock_server([foreign_profile(), native_profile()]);
-		let offer = SecurityOffer::new(vec![foreign_profile(), native_profile()]);
-		let selected = server.negotiate_profile(Some(&offer))?;
-		assert_eq!(selected.descriptor(), native_profile());
-		Ok(())
-	}
-
-	#[test]
-	fn dealers_choice_skips_a_profile_the_provider_does_not_run() -> Result<(), Box<dyn Error>> {
-		let server = mock_server([foreign_profile(), native_profile()]);
-		let selected = server.negotiate_profile(None)?;
-		assert_eq!(selected.descriptor(), native_profile());
-		Ok(())
-	}
-
-	#[test]
-	fn a_server_with_no_runnable_profile_refuses_to_negotiate() {
-		let server = mock_server([foreign_profile()]);
-		let result = server.negotiate_profile(None);
-		assert!(matches!(
-			result,
-			Err(HandshakeError::NegotiationError(NegotiationError::UnrunnableProfile))
-		));
-	}
-
-	#[test]
-	fn a_runnable_profile_below_the_floor_is_refused() {
-		let server = MockServer { profiles: vec![native_profile()], refuse_all: true };
-		let result = server.negotiate_profile(None);
-		assert!(matches!(
-			result,
-			Err(HandshakeError::NegotiationError(NegotiationError::BelowStrengthFloor))
-		));
-	}
-
-	#[test]
-	fn test_negotiate_profile_no_supported() {
-		let server = mock_server([]);
-		let result = server.negotiate_profile(None);
-		assert!(matches!(result, Err(HandshakeError::NoSupportedProfiles)));
-	}
 
 	/// A base secret of `fill` bytes.
 	fn base_secret(fill: u8) -> BaseSecret {
@@ -971,21 +854,20 @@ mod tests {
 			.expect("fixture inputs derive a handshake secret")
 	}
 
+	/// The directional ciphers of the default provider from `secret` under
+	/// `salt`.
 	fn derive_directional(
-		client: &MockClient,
 		secret: &HandshakeSecret,
 		salt: &[u8],
 	) -> Result<DirectionalCiphers<<DefaultCryptoProvider as AeadProvider>::AeadCipher>, HandshakeError> {
-		client.derive_directional_aead(secret, KdfSalt::new(salt))
+		DirectionalCiphers::derive::<DefaultCryptoProvider, _>(secret, KdfSalt::new(salt))
 	}
 
 	#[test]
 	fn test_derive_directional_aead_success() {
-		let client = mock_client();
-
 		let salt = [0x99u8; 32];
 		let secret = handshake_secret(0x42, 0x11, &salt);
-		let result = derive_directional(&client, &secret, &salt);
+		let result = derive_directional(&secret, &salt);
 		assert!(result.is_ok());
 	}
 
@@ -1105,14 +987,12 @@ mod tests {
 
 	#[test]
 	fn test_derive_directional_aead_directions_differ() -> Result<(), HandshakeError> {
-		let client = mock_client();
-
 		let salt = [0x99u8; 32];
 		let secret = handshake_secret(0x42, 0x11, &salt);
-		let ciphers = derive_directional(&client, &secret, &salt)?;
+		let ciphers = derive_directional(&secret, &salt)?;
 
-		// Same nonce and plaintext under both directions must produce
-		// different ciphertexts, proving the info labels separate the keys.
+		// The info labels separate the keys, so the same nonce and plaintext
+		// must produce different ciphertexts under the two directions.
 		let plaintext = b"directional key separation";
 		let c2s_ciphertext = seal(&ciphers.client_to_server, plaintext.as_slice());
 		let s2c_ciphertext = seal(&ciphers.server_to_client, plaintext.as_slice());
@@ -1122,12 +1002,10 @@ mod tests {
 
 	#[test]
 	fn test_derive_directional_aead_is_deterministic() -> Result<(), HandshakeError> {
-		let client = mock_client();
-
 		let salt = [0x99u8; 32];
 		let secret = handshake_secret(0x42, 0x11, &salt);
-		let first = derive_directional(&client, &secret, &salt)?;
-		let second = derive_directional(&client, &secret, &salt)?;
+		let first = derive_directional(&secret, &salt)?;
+		let second = derive_directional(&secret, &salt)?;
 
 		// Both derivations agree, so two independent endpoints derive the
 		// same directional keys from shared input material.
@@ -1140,25 +1018,34 @@ mod tests {
 
 	#[test]
 	fn test_derive_directional_aead_insufficient_salt() {
-		let client = mock_client();
-
 		let salt = [0x99u8; 8];
 		let secret = handshake_secret(0x42, 0x11, &[0x99u8; 32]);
-		let result = derive_directional(&client, &secret, &salt);
+		let result = derive_directional(&secret, &salt);
 		assert!(matches!(
 			result,
 			Err(HandshakeError::InsufficientSaltEntropy { actual: 8, minimum: 16 })
 		));
 	}
 
-	#[test]
-	fn test_derive_directional_aead_no_profile() {
-		let client = MockClient { profile: None };
+	/// The terms of a fixture handshake over `transcript_hash` under `salt`.
+	fn terms_with(transcript_hash: [u8; 32], salt: Salt) -> Terms<DefaultCryptoProvider> {
+		Terms::new(RunnableProfile::native(), None, transcript_hash, salt)
+	}
 
-		let salt = [0x99u8; 32];
-		let secret = handshake_secret(0x42, 0x11, &salt);
-		let result = derive_directional(&client, &secret, &salt);
-		assert!(matches!(result, Err(HandshakeError::InvalidState)));
+	/// A CMS handshake salts every derivation with its transcript hash.
+	#[test]
+	fn a_transcript_salt_is_the_transcript_hash() {
+		let terms = terms_with([0x07u8; 32], Salt::TranscriptHash);
+		assert_eq!(terms.kdf_salt().as_bytes(), [0x07u8; 32]);
+	}
+
+	/// An ECIES handshake salts every derivation with the client random
+	/// followed by the server random.
+	#[test]
+	fn a_randoms_salt_is_the_client_random_then_the_server_random() {
+		let randoms = RandomsSalt::new(&[0x01u8; 32], &[0x02u8; 32]);
+		let terms = terms_with([0x07u8; 32], Salt::Randoms(randoms));
+		assert_eq!(terms.kdf_salt().as_bytes(), [[0x01u8; 32], [0x02u8; 32]].concat());
 	}
 
 	#[test]
@@ -1204,38 +1091,6 @@ mod tests {
 		assert_ne!(base.secret.as_bytes(), keyed.secret.as_bytes());
 		assert_ne!(base.secret.as_bytes(), salted.secret.as_bytes());
 
-		Ok(())
-	}
-
-	/// An orchestrator stand-in that keeps the provided alert check.
-	struct AlertProbe;
-
-	impl HandshakeAlertHandler for AlertProbe {}
-
-	/// An abort-alert attribute carrying `code`, as a peer sends it.
-	fn abort_alert(code: u8) -> Result<Attribute, Box<dyn Error>> {
-		let code = Any::encode_from(&code)?;
-		Ok(Attribute { oid: HANDSHAKE_ABORT_ALERT, values: SetOfVec::try_from(vec![code])? })
-	}
-
-	#[test]
-	fn an_abort_alert_attribute_aborts_the_handshake() -> Result<(), Box<dyn Error>> {
-		let attrs = Attributes::try_from(vec![abort_alert(3)?])?;
-
-		let checked = AlertProbe.check_for_alert(Some(&attrs));
-		let expected = HandshakeAlert::AlgorithmMismatch;
-		assert!(matches!(checked, Err(HandshakeError::AbortReceived(alert)) if alert == expected));
-		Ok(())
-	}
-
-	/// A repeated abort alert fails closed as a duplicate attribute rather
-	/// than reading as no alert and letting processing continue into the
-	/// message body.
-	#[test]
-	fn a_duplicate_abort_alert_fails_closed() -> Result<(), Box<dyn Error>> {
-		let attrs = Attributes::try_from(vec![abort_alert(3)?, abort_alert(4)?])?;
-		let checked = AlertProbe.check_for_alert(Some(&attrs));
-		assert!(matches!(checked, Err(HandshakeError::DuplicateAttribute)));
 		Ok(())
 	}
 }
