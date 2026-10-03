@@ -191,8 +191,8 @@ pub enum HandshakeError {
 	#[error("Handshake timeout")]
 	Timeout,
 
-	/// The server selected a profile that the client did not offer.
-	#[error("Server selected profile not in client's offer")]
+	/// The server selected no profile, or one that the client did not offer.
+	#[error("Server selected no profile, or one outside the client's offer")]
 	InvalidProfileSelection,
 
 	/// Profile negotiation failed.
@@ -204,8 +204,8 @@ pub enum HandshakeError {
 	#[error("No mutually supported cryptographic profiles found")]
 	NoMutualProfiles,
 
-	/// Dealer's choice failed because no supported profiles are configured.
-	#[error("Dealer's choice failed: no supported profiles configured")]
+	/// The server has no supported profile configured, so it can select none.
+	#[error("No supported profiles configured on server")]
 	NoSupportedProfiles,
 
 	/// Profile negotiation is required, and the server has no profiles
@@ -321,7 +321,7 @@ pub enum HandshakeError {
 	#[error("Random generation failed")]
 	RandomGenerationFailed,
 
-	/// Cryptographic key or nonce material had the wrong length.
+	/// Cryptographic key or nonce material has the wrong length.
 	#[error("Invalid key material length: {0}")]
 	#[from]
 	InvalidKeyMaterialLength(crypto_common::InvalidLength),

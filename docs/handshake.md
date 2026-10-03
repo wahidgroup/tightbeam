@@ -124,7 +124,12 @@ sequenceDiagram
     Note over S: verifies the Finished, opens and settles the receipt countersignature
 ```
 
-The CMS server settles the receipt in the same round that receives the client Finished, so a budget-bearing session activates only after the countersignature verifies.
+The CMS server settles the receipt in the same step that processes the client Finished, so a budget-bearing session activates only after the countersignature verifies. A refused settlement takes the handshake secret with it, so a replayed Finished has nothing to complete with.
+
+Both protocols negotiate the security profile through one policy, `ProfilePolicy`:
+
+- The server chooses from its configured profiles. A server with none refuses the first message with `NoSupportedProfiles`.
+- The client admits the server's selection. It refuses a reply that selects nothing with `InvalidProfileSelection`.
 
 ## Handshake state machines
 
@@ -263,6 +268,22 @@ let client = ClientBuilder::<TokioListener>::builder()
 | Server certificate                     | Yes              | A server presents its own identity            |
 | Client identity alone                  | No               | Nothing establishes who the peer is           |
 | Client identity plus `allow_cleartext` | Yes              | The risk is named                             |
+
+### Admit a client
+
+A server admits its client through one rule in both protocols, and `PeerAuthentication::admit` is its one home. A certificate travels with the proof that the client holds its key:
+
+- ECIES carries the proof as the possession signature of the key exchange.
+- CMS carries it as the signature of the client Finished.
+
+| Client offers             | Anonymous server                       | Mutual server                                            |
+| ------------------------- | -------------------------------------- | -------------------------------------------------------- |
+| Nothing                   | Admitted, no peer recorded             | Refused, `MissingClientCertificate`                      |
+| A certificate and a proof | Proof verified, no peer recorded       | Every validator runs, proof verified, peer recorded      |
+| A certificate alone       | Refused, `SignatureVerificationFailed` | Refused, by a validator or `SignatureVerificationFailed` |
+| A proof alone             | Refused, `MissingClientCertificate`    | Refused, `MissingClientCertificate`                      |
+
+A CMS client always signs its Finished, so a CMS server always requires the certificate that verifies it.
 
 ## Key schedule
 

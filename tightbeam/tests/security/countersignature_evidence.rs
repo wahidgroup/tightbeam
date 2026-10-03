@@ -47,8 +47,6 @@ pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
 	tightbeam::urn!("test", "event:countersignature-evidence/session-never-activates");
 pub(crate) const SETTLE_NEVER_FIRED: Urn<'static> =
 	tightbeam::urn!("test", "event:countersignature-evidence/settle-never-fired");
-pub(crate) const STRIPPED_FINISHED_STILL_AUTHENTICATES: Urn<'static> =
-	tightbeam::urn!("test", "event:countersignature-evidence/stripped-finished-still-authenticates");
 pub(crate) const TAMPERED_CIPHERTEXT_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:countersignature-evidence/tampered-ciphertext-rejected");
 
@@ -130,9 +128,9 @@ mod ecies {
 				let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
 				let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
 
-				// The auth signature covers encrypted_data. Flip a ciphertext
-				// byte, which is the only wire handle a MITM has on the sealed
-				// ack.
+				// The auth signature covers `encrypted_data`, and a flipped
+				// ciphertext byte is the only wire handle a MITM has on the
+				// sealed ack.
 				let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
 				let mut forged = kex.encrypted_data.as_bytes().to_vec();
 				let middle = forged.len() / 2;
@@ -172,7 +170,6 @@ mod cms {
 
 	use super::{
 		MISSING_COUNTERSIGNATURE_FAILS_CLOSED, OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE, SESSION_NEVER_ACTIVATES,
-		STRIPPED_FINISHED_STILL_AUTHENTICATES,
 	};
 
 	use tightbeam::cms::signed_data::SignedData;
@@ -224,7 +221,6 @@ mod cms {
 		V(1,0,0): {
 			mode: Accept,
 			assertions: [
-				(STRIPPED_FINISHED_STILL_AUTHENTICATES, exactly!(1), equals!(true)),
 				(MISSING_COUNTERSIGNATURE_FAILS_CLOSED, exactly!(1), equals!(true)),
 				(OUTCOME_RECORDS_MISSING_COUNTERSIGNATURE, exactly!(1), equals!(true)),
 				(SESSION_NEVER_ACTIVATES, exactly!(1), equals!(true))
@@ -257,15 +253,11 @@ mod cms {
 				// The MITM strips the acknowledgement on the wire.
 				let stripped = strip_receipt_ack(&client_finished)?;
 
-				let finished_accepted = server.process_client_finished(&stripped).is_ok();
-				trace.event_with(
-					STRIPPED_FINISHED_STILL_AUTHENTICATES,
-					&[],
-					finished_accepted,
-				)?;
-
-				let ack = server.process_receipt_ack(&stripped).await;
-				let ack_refused = matches!(ack, Err(HandshakeError::CountersignatureMissing));
+				// The Finished signature covers no unsigned attribute, so the
+				// stripped Finished passes it, and the missing
+				// countersignature is what refuses the step.
+				let closing = server.process_client_finished(&stripped).await;
+				let ack_refused = matches!(closing, Err(HandshakeError::CountersignatureMissing));
 				trace.event_with(
 					MISSING_COUNTERSIGNATURE_FAILS_CLOSED,
 					&[],
@@ -284,7 +276,7 @@ mod cms {
 				)?;
 
 				let activation = server.take_established();
-				let activation_refused = matches!(activation, Err(HandshakeError::CountersignatureMissing));
+				let activation_refused = matches!(activation, Err(HandshakeError::InvalidState));
 				trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 
 				Ok::<(), TightBeamError>(())

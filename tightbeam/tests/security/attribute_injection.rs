@@ -1,7 +1,7 @@
 //! # Unsigned-attribute injection threat (CMS)
 //!
 //! ## Weakness
-//! RFC 5652 s11.4 places the enveloped receipt acknowledgement among the
+//! RFC 5652 s11.4 places the sealed receipt acknowledgement among the
 //! *unsigned* attributes of the client Finished: no signature covers
 //! them, so an intermediary can add attributes without invalidating the
 //! message. If the server picks "the first" matching attribute, an
@@ -15,8 +15,9 @@
 //! ## Expected control
 //! Every TightBeam handshake attribute is single-use: the server MUST
 //! parse the SignedData once, and a duplicate unsigned attribute MUST
-//! fail closed before any value is consumed. The budget-bearing session
-//! MUST stay inactive.
+//! fail closed before any value is consumed. The refusal is the attribute
+//! rule and not a signature failure, because the injection passes every
+//! signature. The budget-bearing session MUST stay inactive.
 //!
 //! ## References
 //! - CWE-347: Improper Verification of Cryptographic Signature
@@ -46,8 +47,6 @@ use tightbeam::TightBeamError;
 
 pub(crate) const DUPLICATE_ATTRIBUTE_FAILS_CLOSED: Urn<'static> =
 	tightbeam::urn!("test", "event:attribute-injection/duplicate-attribute-fails-closed");
-pub(crate) const INJECTION_INVISIBLE_TO_SIGNATURES: Urn<'static> =
-	tightbeam::urn!("test", "event:attribute-injection/injection-invisible-to-signatures");
 pub(crate) const SESSION_NEVER_ACTIVATES: Urn<'static> =
 	tightbeam::urn!("test", "event:attribute-injection/session-never-activates");
 
@@ -90,16 +89,15 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(INJECTION_INVISIBLE_TO_SIGNATURES, exactly!(1), equals!(true)),
 			(DUPLICATE_ATTRIBUTE_FAILS_CLOSED, exactly!(1), equals!(true)),
 			(SESSION_NEVER_ACTIVATES, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// check (a signature covers signed attributes alone), so the server's
-// single-use attribute rule is the control: the receipt acknowledgement
-// must fail closed and the session must stay inactive.
+// The injected duplicate passes every signature, which covers signed attributes
+// alone. The server's single-use attribute rule is the control: the receipt
+// acknowledgement must fail closed and the session must stay inactive.
 tb_scenario! {
 	name: cms_duplicate_receipt_attribute_fails_closed,
 	spec: AttributeInjectionSpec,
@@ -124,18 +122,11 @@ tb_scenario! {
 			let client_finished = client.build_client_finished().await?;
 			let tampered = inject_duplicate_receipt_ack(&client_finished)?;
 
-			// Signature verification covers the signed attributes, so the
-			// tampered Finished still authenticates.
-			let finished_accepted = server.process_client_finished(&tampered).is_ok();
-			trace.event_with(
-				INJECTION_INVISIBLE_TO_SIGNATURES,
-				&[],
-				finished_accepted,
-			)?;
-
-			// The single-use attribute rule is the control that holds.
-			let ack = server.process_receipt_ack(&tampered).await;
-			let duplicate_rejected = matches!(ack, Err(HandshakeError::DuplicateAttribute));
+			// The Finished signature covers no unsigned attribute, so the
+			// tampered Finished passes it, and the single-use attribute rule
+			// is the control that refuses the step.
+			let closing = server.process_client_finished(&tampered).await;
+			let duplicate_rejected = matches!(closing, Err(HandshakeError::DuplicateAttribute));
 			trace.event_with(
 				DUPLICATE_ATTRIBUTE_FAILS_CLOSED,
 				&[],
@@ -143,7 +134,7 @@ tb_scenario! {
 			)?;
 
 			let activation = server.take_established();
-			let activation_refused = matches!(activation, Err(HandshakeError::CountersignatureMissing));
+			let activation_refused = matches!(activation, Err(HandshakeError::InvalidState));
 			trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 
 			Ok::<(), TightBeamError>(())

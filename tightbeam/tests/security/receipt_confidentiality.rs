@@ -131,8 +131,6 @@ tb_scenario! {
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			// Full budget-bearing handshake including the receipt
-			// acknowledgement.
 			let key_exchange = client.build_key_exchange(None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
@@ -140,8 +138,7 @@ tb_scenario! {
 			client.process_server_finished(&server_finished)?;
 
 			let client_finished = client.build_client_finished().await?;
-			server.process_client_finished(&client_finished)?;
-			server.process_receipt_ack(&client_finished).await?;
+			server.process_client_finished(&client_finished).await?;
 
 			// The plaintext answer MUST stay out of the cleartext client
 			// Finished bytes: it travels sealed under the handshake secret.

@@ -8,25 +8,23 @@
 //! 2. The client countersigns it.
 //! 3. The server verifies the countersignature and settles.
 //!
-//! The trait driver runs that acknowledgement automatically, but the
-//! orchestrator also exposes an inherent `complete()` for manual drivers.
+//! The server runs step 3 inside the step that processes the client
+//! Finished. That step consumes the issued receipt whether settlement
+//! succeeds or fails.
 //!
-//! Suppose `complete()` activates a metered session whenever the client
-//! Finished merely verified, without a check that the countersigned receipt
-//! settled. A driver that forgets the acknowledgement step then activates a
-//! budget the client left uncountersigned, which defeats non-repudiation.
+//! Suppose a second client Finished, after a refused settlement, finds no
+//! receipt left to settle and passes. The metered session then activates
+//! with a budget nobody settled, which defeats non-repudiation.
 //!
 //! ## Attack
-//! A server integration processes the client Finished and calls
-//! `complete()` directly, skipping `process_receipt_ack`. The session
-//! carries budgets, but no `StoredReceipt` exists: there is no client
-//! countersignature and no settlement. The metered session is live, yet
-//! the accountable artifact the whole feature exists to produce is absent.
+//! A client countersigns a receipt whose settlement the authorizer refuses,
+//! and the server aborts the step. The client replays the same Finished,
+//! and the server integration then asks for the session. The session
+//! carries budgets, but no `StoredReceipt` exists.
 //!
 //! ## Expected control
-//! `complete()` MUST fail closed for a budget-bearing session whose
-//! countersigned receipt has not been settled: a session receipt was
-//! issued but no stored (dual-signed, settled) receipt was retained.
+//! A refused settlement MUST leave the server with nothing to complete
+//! from. The replayed Finished and the completion MUST both fail closed.
 //!
 //! ## References
 //! - CWE-696: Incorrect Behavior Order <https://cwe.mitre.org/data/definitions/696.html>
@@ -51,6 +49,10 @@ use crate::common::security::{
 
 pub(crate) const COMPLETE_FAILS_WITHOUT_SETTLEMENT: Urn<'static> =
 	tightbeam::urn!("test", "event:receipt-activation/complete-fails-without-settlement");
+pub(crate) const REPLAY_FAILS_WITHOUT_SETTLEMENT: Urn<'static> =
+	tightbeam::urn!("test", "event:receipt-activation/replay-fails-without-settlement");
+pub(crate) const SETTLEMENT_REFUSED: Urn<'static> =
+	tightbeam::urn!("test", "event:receipt-activation/settlement-refused");
 
 const CHALLENGE: &[u8] = b"activation-invoice";
 const RESPONSE: &[u8] = b"activation-preimage";
@@ -61,14 +63,16 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
+			(SETTLEMENT_REFUSED, exactly!(1), equals!(true)),
+			(REPLAY_FAILS_WITHOUT_SETTLEMENT, exactly!(1), equals!(true)),
 			(COMPLETE_FAILS_WITHOUT_SETTLEMENT, exactly!(1), equals!(true))
 		]
 	}
 }
 
-// A manual driver that runs the CMS handshake through the client Finished
-// but skips the receipt acknowledgement MUST fail to activate the
-// budget-bearing session: complete() fails closed.
+// A CMS handshake whose settlement the authorizer refuses MUST NOT activate
+// the budget-bearing session: the replayed client Finished and the
+// completion both fail closed.
 tb_scenario! {
 	name: complete_requires_settled_receipt,
 	spec: ReceiptActivationSpec,
@@ -83,8 +87,8 @@ tb_scenario! {
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			// Drive the handshake manually through the client Finished, then
-			// deliberately skip process_receipt_ack.
+			// The authorizer issues a challenge and keeps the default
+			// settlement, which refuses a challenged receipt.
 			let key_exchange = client.build_key_exchange(None)?;
 			server.process_key_exchange(&key_exchange).await?;
 
@@ -92,18 +96,19 @@ tb_scenario! {
 			client.process_server_finished(&server_finished)?;
 
 			let client_finished = client.build_client_finished().await?;
-			server.process_client_finished(&client_finished)?;
+			let closing = server.process_client_finished(&client_finished).await;
+			let settlement_refused = matches!(closing, Err(HandshakeError::SettlementRejected { .. }));
+			trace.event_with(SETTLEMENT_REFUSED, &[], settlement_refused)?;
 
-			// The countersigned receipt reached no acknowledgement, so the
-			// metered session must not activate.
-			let complete_result = server.take_established();
-			let activation_refused = matches!(complete_result, Err(HandshakeError::CountersignatureMissing));
+			// The refused settlement consumed the receipt, so the replayed
+			// Finished has nothing to settle and must fail.
+			let replay = server.process_client_finished(&client_finished).await;
+			let replay_refused = matches!(replay, Err(HandshakeError::InvalidState));
+			trace.event_with(REPLAY_FAILS_WITHOUT_SETTLEMENT, &[], replay_refused)?;
 
-			trace.event_with(
-				COMPLETE_FAILS_WITHOUT_SETTLEMENT,
-				&[],
-				activation_refused,
-			)?;
+			let completion = server.take_established();
+			let completion_refused = matches!(completion, Err(HandshakeError::InvalidState));
+			trace.event_with(COMPLETE_FAILS_WITHOUT_SETTLEMENT, &[], completion_refused)?;
 
 			Ok::<(), TightBeamError>(())
 		}

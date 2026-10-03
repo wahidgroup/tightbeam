@@ -37,7 +37,6 @@ use tightbeam::testing::{
 use tightbeam::transport::handshake::client::EciesHandshakeClient;
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
 use tightbeam::transport::handshake::server::EciesHandshakeServer;
-use tightbeam::transport::handshake::HandshakeFinalization;
 use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
@@ -53,8 +52,8 @@ pub(crate) const SERVER_HELLO_RECEIVED: Urn<'static> =
 	tightbeam::urn!("test", "event:negotiation/server-hello-received");
 pub(crate) const SERVER_KEX_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:negotiation/server-kex-received");
 
-/// Stronger profile: AES-256-GCM with SHA3-512. The negotiation selects it
-/// when both sides offer it, because AES-128 fails the default 256-bit
+/// The stronger profile is AES-256-GCM with SHA3-512. The negotiation selects
+/// it when both sides offer it, because AES-128 fails the default 256-bit
 /// strength floor.
 #[derive(Debug, Default, Clone, Copy)]
 struct Aes256Sha3_512Profile;
@@ -104,7 +103,7 @@ impl CryptoProvider for Aes256Sha3_512Provider {
 	}
 }
 
-/// Weaker profile: AES-128-GCM with SHA3-256. Both offers include it, so
+/// The weaker profile is AES-128-GCM with SHA3-256. Both offers include it, so
 /// negotiation must prefer the stronger peer-shared profile.
 #[derive(Debug, Default, Clone, Copy)]
 struct Aes128Sha3_256Profile;
@@ -190,12 +189,14 @@ tb_scenario! {
 			server.process_client_key_exchange(client_kex).await?;
 			trace.event(SERVER_KEX_RECEIVED)?;
 
+			// Completion moves the terms out, so the selection is read first.
+			let server_selected = server.selected_profile() == Some(preferred);
+			let client_selected = client.selected_profile() == Some(preferred);
+
 			let _client_session = client.take_established()?;
 			let _server_session = server.take_established()?;
 			trace.event(HANDSHAKE_COMPLETE)?;
 
-			let server_selected = server.selected_profile().map(|profile| profile.descriptor()) == Some(preferred);
-			let client_selected = client.selected_profile().map(|profile| profile.descriptor()) == Some(preferred);
 			trace.event_with(PROFILE_VERIFIED, &[], server_selected && client_selected)?;
 
 			Ok(())

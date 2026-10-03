@@ -53,7 +53,7 @@ use crate::transport::handshake::negotiation::{
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::orchestrator::CompressedPoint;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::orchestrator::{BaseSecret, HandshakeAgreement};
+use crate::transport::handshake::orchestrator::{Agreement, BaseSecret, HandshakeAgreement};
 use crate::transport::handshake::primitives::KdfSalt;
 use crate::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
 use crate::transport::handshake::{
@@ -185,17 +185,45 @@ pub fn contains_window(haystack: impl AsRef<[u8]>, needle: impl AsRef<[u8]>) -> 
 	haystack.as_ref().windows(needle.len()).any(|window| window == needle)
 }
 
+/// An agreement that yields a chosen secret in place of an ECDH output, so a
+/// fixture or an observer runs the production derivation over the value it
+/// picked.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+struct FixedAgreement<'a>(&'a EcdhSecret);
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl HandshakeAgreement<Secp256k1> for FixedAgreement<'_> {
+	fn shared_secret(&self, _peer: &PublicKey<Secp256k1>) -> Result<EcdhSecret, HandshakeError> {
+		Ok(self.0.with(|bytes| EcdhSecret::from(*bytes)))
+	}
+}
+
+/// The handshake secret of `base` and `shared` under `salt`, through the
+/// production derivation.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub fn derive_handshake_secret(
+	base: &BaseSecret,
+	shared: &EcdhSecret,
+	salt: KdfSalt<'_>,
+) -> Result<HandshakeSecret, HandshakeError> {
+	// The fixed agreement ignores its peer, so any point serves.
+	let peer = SecretKey::random(&mut OsRng).public_key();
+	let agreement = Agreement::<DefaultCryptoProvider>::new(base, &peer);
+	agreement.settle(&FixedAgreement(shared), salt)
+}
+
 /// A handshake secret derived from a fixture base secret of `fill` bytes, a
 /// fixture ephemeral-ephemeral secret, and a fixture salt.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub fn fixture_handshake_secret(fill: u8) -> HandshakeSecret {
 	let base = BaseSecret::try_from(SecretSlice::from(vec![fill; 32])).expect("32 bytes make a base secret");
 	let shared = EcdhSecret::from([0x11u8; 32]);
-	HandshakeSecret::derive::<DefaultCryptoProvider>(&base, &shared, KdfSalt::new(&[0x99u8; 32]))
+	derive_handshake_secret(&base, &shared, KdfSalt::new(&[0x99u8; 32]))
 		.expect("fixture inputs derive a handshake secret")
 }
 
-/// A test session's record, sealed under the client's send cipher.
+/// The plaintext of the record a test session seals under the client's send
+/// cipher.
 pub const RECORD_PLAINTEXT: &[u8] = b"application record sealed under the traffic key";
 
 /// Seal one record under the client's send cipher.
@@ -207,17 +235,17 @@ pub fn sealed_record(client: &EstablishedSession) -> Result<EncryptedContentInfo
 /// derives.
 type ObserverCipher = <DefaultCryptoProvider as AeadProvider>::AeadCipher;
 
-/// The KDF of the default provider, which the observer runs the pre-change
+/// The KDF of the default provider, which the observer runs the base-only
 /// derivation through.
 type ObserverKdf = <DefaultCryptoProvider as KdfProvider>::Kdf;
 
 /// The attempts [`StaticKeyObserver::record_attempts`] makes: five
-/// candidates under both directional keys, and the pre-change key from the
-/// base alone under both directional labels.
+/// candidates under both directional keys, and the key from the base secret
+/// alone under both directional labels.
 pub const RECORD_ATTEMPTS: usize = 12;
 
 /// The attempts [`StaticKeyObserver::ack_attempts`] makes: five candidates
-/// and the pre-change key from the base alone.
+/// and the key from the base secret alone.
 pub const ACK_ATTEMPTS: usize = 6;
 
 /// The outcome of each record attempt an observer makes.
@@ -230,15 +258,20 @@ pub type AckAttempts = Vec<Result<SecretSlice<u8>, HandshakeError>>;
 /// server's static key.
 ///
 /// It holds the base secret that key recovers, the protocol salt, and the two
-/// ephemeral public keys as they crossed the wire. Each candidate below stands
-/// in for the ephemeral-ephemeral secret and runs through the production key
-/// schedule:
+/// ephemeral public keys as they crossed the wire.
+///
+/// # Candidates
+///
+/// Each candidate stands in for the ephemeral-ephemeral secret and runs
+/// through the production key schedule:
 ///
 /// - the all-zero secret,
 /// - the static key's agreement with the client ephemeral,
-/// - the static key's agreement with the server ephemeral,
-/// - the x-coordinate of each ephemeral, and
-/// - the pre-change key, from the base secret alone.
+/// - the static key's agreement with the server ephemeral, and
+/// - the x-coordinate of each ephemeral.
+///
+/// The observer also tries the key that the base secret alone derives, which
+/// takes no ephemeral-ephemeral input.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub struct StaticKeyObserver {
 	base: BaseSecret,
@@ -310,14 +343,12 @@ impl StaticKeyObserver {
 	/// derivation.
 	fn handshake_secrets(&self) -> Result<Vec<HandshakeSecret>, HandshakeError> {
 		let salt = KdfSalt::new(&self.salt);
-		self.candidates
-			.iter()
-			.map(|shared| HandshakeSecret::derive::<DefaultCryptoProvider>(&self.base, shared, salt))
-			.collect()
+		let derive = |shared| derive_handshake_secret(&self.base, shared, salt);
+		self.candidates.iter().map(derive).collect()
 	}
 
-	/// The cipher the pre-change schedule keyed from the base secret alone
-	/// under `label`.
+	/// The cipher that the base secret alone keys under `label`, with no
+	/// ephemeral-ephemeral input.
 	fn pre_change_cipher(&self, label: &[u8]) -> Result<ObserverCipher, HandshakeError> {
 		let key_size = <ObserverCipher as KeySizeUser>::key_size();
 		let key = ObserverKdf::derive_dynamic_key(self.base.as_bytes(), label, Some(&self.salt), key_size)?;
@@ -459,7 +490,7 @@ pub fn create_test_ukm() -> UserKeyingMaterial {
 	UserKeyingMaterial::new(ukm_bytes.to_vec()).expect("UKM creation should succeed")
 }
 
-/// Create test recipient identifier for CMS operations.
+/// Create a test recipient identifier for CMS operations.
 pub fn create_test_recipient_id() -> KeyAgreeRecipientIdentifier {
 	use x509_cert::name::Name;
 	use x509_cert::serial_number::SerialNumber;
@@ -470,7 +501,7 @@ pub fn create_test_recipient_id() -> KeyAgreeRecipientIdentifier {
 	})
 }
 
-/// Create test key encryption algorithm identifier (AES-256 key wrap).
+/// Create the test key encryption algorithm identifier (AES-256 key wrap).
 pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None }
 }
@@ -565,7 +596,7 @@ pub struct TestEciesServerBuilder {
 
 #[cfg(feature = "transport-ecies")]
 impl TestEciesServerBuilder {
-	/// Create a new builder with default settings.
+	/// Create a builder with default settings.
 	pub fn new() -> Self {
 		Self { key: None, cert: None, aad_domain: None }
 	}
@@ -630,7 +661,7 @@ pub struct TestEciesClientBuilder {
 
 #[cfg(feature = "transport-ecies")]
 impl TestEciesClientBuilder {
-	/// Create a new builder with default settings.
+	/// Create a builder with default settings.
 	pub fn new() -> Self {
 		Self { aad_domain: None, trusted_certificate: None }
 	}
@@ -641,7 +672,7 @@ impl TestEciesClientBuilder {
 		self
 	}
 
-	/// Trust the given server certificate (attaches a direct-trust validator).
+	/// Trust the given server certificate through a direct-trust validator.
 	///
 	/// The client fails closed without a validator, so any test that
 	/// processes a `ServerHandshake` must pin the server certificate here.
@@ -678,7 +709,7 @@ pub struct TestCmsServerBuilder {
 
 #[cfg(feature = "transport-cms")]
 impl TestCmsServerBuilder {
-	/// Create a new builder with default settings.
+	/// Create a builder with default settings.
 	pub fn new() -> Self {
 		Self { key: None, peer_authentication: PeerAuthentication::Anonymous }
 	}
@@ -702,7 +733,9 @@ impl TestCmsServerBuilder {
 
 		let public_key = PublicKey::<Secp256k1>::from(verifying_key);
 		let provider = into_provider(test_key);
+		let profiles = vec![create_default_test_profile()];
 		let server = CmsHandshakeServer::<DefaultCryptoProvider>::new(provider, self.peer_authentication);
+		let server = server.with_supported_profiles(profiles);
 
 		(server, public_key)
 	}
@@ -724,7 +757,7 @@ pub struct TestCmsClientBuilder {
 
 #[cfg(feature = "transport-cms")]
 impl TestCmsClientBuilder {
-	/// Create a new builder with default settings.
+	/// Create a builder with default settings.
 	pub fn new() -> Self {
 		Self { client_key: None, server_cert: None }
 	}

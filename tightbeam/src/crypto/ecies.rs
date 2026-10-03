@@ -6,7 +6,8 @@
 //! # Architecture
 //!
 //! - Generic traits define the ECIES key operations.
-//! - Concrete implementations cover specific curves, currently secp256k1.
+//! - Blanket implementations cover every curve with a 32-byte field.
+//! - The one concrete message type is [`Secp256k1EciesMessage`].
 //! - The encryption and decryption functions are curve-agnostic.
 //!
 //! # ECIES Protocol
@@ -45,11 +46,13 @@ use crate::constants::{
 	AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, ECDH_SHARED_SECRET_SIZE, EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ECIES_KDF_INFO,
 };
 use crate::crypto::aead::{Aead, AeadCore, KeyInit, Nonce, Payload};
-use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
+use crate::crypto::common::typenum::{Unsigned, U32};
+use crate::crypto::common::KeySizeUser;
 use crate::crypto::hkdf::InvalidLength;
-use crate::crypto::k256::ecdh::diffie_hellman;
-use crate::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
-use crate::crypto::k256::{PublicKey, SecretKey};
+use crate::crypto::k256::elliptic_curve::ecdh::diffie_hellman;
+use crate::crypto::k256::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+use crate::crypto::k256::elliptic_curve::{self, AffinePoint, Curve, CurveArithmetic};
+use crate::crypto::k256::SecretKey;
 use crate::crypto::kdf::{EcdhSecret, EciesKdf, KdfError, KdfFunction};
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::random::generate_random_bytes;
@@ -59,6 +62,8 @@ use crate::zeroize::Zeroizing;
 use crate::asn1::ObjectIdentifier;
 #[cfg(feature = "x509")]
 use crate::crypto::aead::Aes256Gcm;
+#[cfg(any(test, feature = "x509"))]
+use crate::crypto::k256::PublicKey;
 #[cfg(feature = "x509")]
 use crate::crypto::kdf::HkdfSha3_256;
 #[cfg(feature = "x509")]
@@ -200,13 +205,19 @@ crate::impl_from!(KdfError => EciesError::Kdf);
 /// The result of an ECIES operation.
 pub type Result<T> = core::result::Result<T, EciesError>;
 
-impl EciesPublicKeyOps for PublicKey {
-	type SecretKey = SecretKey;
+/// Every curve with a 32-byte field carries the ECIES public-key operations,
+/// so this one impl serves the curve of every provider.
+impl<C> EciesPublicKeyOps for elliptic_curve::PublicKey<C>
+where
+	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
+	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+{
+	type SecretKey = elliptic_curve::SecretKey<C>;
 
-	const PUBLIC_KEY_SIZE: usize = EC_PUBKEY_COMPRESSED_SIZE;
+	const PUBLIC_KEY_SIZE: usize = <<U32 as ModulusSize>::CompressedPointSize as Unsigned>::USIZE;
 
 	fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
-		PublicKey::from_sec1_bytes(bytes.as_ref()).map_err(EciesError::InvalidPublicKey)
+		Self::from_sec1_bytes(bytes.as_ref()).map_err(EciesError::InvalidPublicKey)
 	}
 
 	fn to_bytes(&self) -> Vec<u8> {
@@ -215,29 +226,39 @@ impl EciesPublicKeyOps for PublicKey {
 	}
 }
 
-impl EciesSecretKeyOps for SecretKey {
-	type PublicKey = PublicKey;
+/// Every curve with a 32-byte field carries the ECIES secret-key operations.
+impl<C> EciesSecretKeyOps for elliptic_curve::SecretKey<C>
+where
+	C: Curve<FieldBytesSize = U32> + CurveArithmetic,
+	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+{
+	type PublicKey = elliptic_curve::PublicKey<C>;
 
-	const SECRET_KEY_SIZE: usize = 32;
+	const SECRET_KEY_SIZE: usize = <U32 as Unsigned>::USIZE;
 
 	fn random<R: CryptoRng + RngCore>(rng: &mut R) -> Self {
-		SecretKey::random(rng)
+		elliptic_curve::SecretKey::random(rng)
 	}
 
 	fn public_key(&self) -> Self::PublicKey {
-		SecretKey::public_key(self)
+		elliptic_curve::SecretKey::public_key(self)
 	}
 
 	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> EcdhSecret {
 		let shared_secret = diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
 
 		// The x-coordinate lands in its wiping buffer directly, so no plain
-		// array of the shared secret exists on the way (CWE-226).
+		// array of the shared secret exists on the way (CWE-226). The curve
+		// bound fixes the x-coordinate at the buffer's width.
 		let mut sized = Zeroizing::new([0u8; ECDH_SHARED_SECRET_SIZE]);
 		sized.copy_from_slice(shared_secret.raw_secret_bytes());
 		Secret::from(sized)
 	}
 }
+
+/// The shared-secret buffer is as wide as the field of every curve the blanket
+/// impls above cover, so the copy in `diffie_hellman` sees equal lengths.
+const _: () = assert!(ECDH_SHARED_SECRET_SIZE == <U32 as Unsigned>::USIZE);
 
 impl core::convert::TryFrom<SecretSlice<u8>> for SecretKey {
 	type Error = EciesError;
@@ -277,10 +298,11 @@ pub trait EciesMessageOps: Sized {
 /// An ECIES encrypted message on the secp256k1 curve.
 ///
 /// The encoded message holds these parts in order:
-/// - `ephemeral_pubkey`: 33 bytes (compressed secp256k1 public key)
-/// - `nonce`: 12 bytes (AES-GCM nonce)
-/// - `ciphertext`: variable length (encrypted plaintext)
-/// - `tag`: 16 bytes (AES-GCM authentication tag, appended to ciphertext)
+///
+/// 1. `ephemeral_pubkey`: 33 bytes (compressed secp256k1 public key)
+/// 2. `nonce`: 12 bytes (AES-GCM nonce)
+/// 3. `ciphertext`: variable length (encrypted plaintext)
+/// 4. `tag`: 16 bytes (AES-GCM authentication tag, appended to ciphertext)
 pub struct Secp256k1EciesMessage {
 	/// The ephemeral public key in compressed SEC1 encoding.
 	ephemeral_pubkey: Vec<u8>,
@@ -297,7 +319,7 @@ impl Secp256k1EciesMessage {
 	///
 	/// # Errors
 	///
-	/// - [`EciesError::InvalidCiphertext`] when `bytes` is shorter than the
+	/// - [`EciesError::InvalidCiphertext`] -- `bytes` is shorter than the
 	///   public key plus the nonce and the tag.
 	pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
 		let bytes = bytes.as_ref();
@@ -363,17 +385,11 @@ impl EciesMessageOps for Secp256k1EciesMessage {
 /// ephemeral is drawn here and consumed by [`EciesSecretKeyOps::encrypt_to`],
 /// so it serves this one encryption.
 ///
-/// - `recipient_pubkey`: the recipient public key.
-/// - `plaintext`: the data to encrypt.
 /// - `associated_data`: optional authenticated associated data (AAD).
 /// - `rng`: an optional cryptographically secure RNG. `None` uses `OsRng`.
 ///
 /// # Type Parameters
 ///
-/// - `PK`: the public key type, which implements [`EciesPublicKeyOps`].
-/// - `P`: the plaintext type, which converts to bytes.
-/// - `R`: the RNG type. `OsRng` serves when `rng` is `None`.
-/// - `M`: the message type, which implements [`EciesMessageOps`].
 /// - `K`: the KDF that derives the content-encryption key.
 /// - `A`: the AEAD cipher that seals the plaintext.
 pub fn encrypt<PK, P, R, M, K, A>(
@@ -469,7 +485,7 @@ impl EcdhSecret {
 	///
 	/// The key is derived at the cipher's own key size and binds the ephemeral
 	/// public key C0 for non-malleability. Encryption and decryption both key
-	/// their cipher here, so the two sides cannot derive different keys.
+	/// their cipher here, so the two sides derive the same key.
 	fn content_cipher<K, A>(self, ephemeral_pubkey: &[u8]) -> Result<A>
 	where
 		K: KdfFunction,
@@ -484,8 +500,7 @@ impl EcdhSecret {
 	}
 }
 
-/// Borrow the ephemeral public key from raw encoded ECIES bytes without a
-/// copy.
+/// Borrow the ephemeral public key from raw encoded ECIES bytes.
 pub fn ephemeral_pubkey_bytes<M>(bytes: &(impl AsRef<[u8]> + ?Sized)) -> Result<&[u8]>
 where
 	M: EciesMessageOps,
@@ -615,7 +630,7 @@ impl crate::crypto::aead::Decryptor for EciesDecryptor {
 
 /// ECIES decryptor driven by a precomputed ECDH shared secret.
 ///
-/// Pairs with [`ephemeral_pubkey_bytes`] and an async key-agreement backend
+/// It pairs with [`ephemeral_pubkey_bytes`] and an async key-agreement backend
 /// (`SigningKeyProvider::key_agreement`) so the recipient private key can stay
 /// inside an HSM, a KMS, or a secure enclave. It opens the secp256k1,
 /// HKDF-SHA3-256, and AES-256-GCM suite that [`EciesSecp256k1Oid`] names.
@@ -914,7 +929,7 @@ mod tests {
 		let plaintext = b"hsm-backed ecies decryption";
 		let (secret, public) = keypair();
 
-		// Sender encrypts to the recipient public key.
+		// The sender encrypts to the recipient public key.
 		let info = EciesEncryptor::new(public).encrypt_content(plaintext, [], None)?;
 		let wire = info.encrypted_content.as_ref().ok_or(EciesError::InvalidCiphertext)?.as_bytes();
 

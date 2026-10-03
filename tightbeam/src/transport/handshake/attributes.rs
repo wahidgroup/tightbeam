@@ -6,23 +6,25 @@ use alloc::vec::Vec;
 
 use core::cmp::{Ord, Ordering, PartialOrd};
 
-use super::{HandshakeAlert, HandshakeError};
+use super::HandshakeError;
 use crate::crypto::x509::attr::{Attribute, Attributes};
-use crate::der::asn1::{Any, ObjectIdentifier, SetOfVec, UintRef};
+use crate::der::asn1::{Any, ObjectIdentifier, SetOfVec};
 use crate::der::{Sequence, Tagged};
 
+#[cfg(feature = "transport-cms")]
+use super::HandshakeAlert;
 #[cfg(feature = "transport-cms")]
 use crate::cms::enveloped_data::OriginatorPublicKey;
 #[cfg(feature = "transport-cms")]
 use crate::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
-use crate::der::asn1::OctetString;
+use crate::der::asn1::{OctetString, UintRef};
 #[cfg(feature = "x509")]
 use crate::oids::CLIENT_CERTIFICATE;
 #[cfg(feature = "transport-cms")]
 use crate::oids::{
-	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL, HANDSHAKE_TRANSPORT_ACCEPT,
-	HANDSHAKE_TRANSPORT_OFFER, RECEIPT_ACK, SESSION_RECEIPT,
+	HANDSHAKE_ABORT_ALERT, HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SERVER_EPHEMERAL,
+	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER, RECEIPT_ACK, SESSION_RECEIPT,
 };
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
@@ -203,10 +205,10 @@ impl HandshakeAttribute {
 
 	/// Returns the bytes that the value of this attribute arrived as.
 	///
-	/// A receiver binds what the peer actually sent. Re-encoding the decoded
-	/// value instead would erase any difference the decoder normalised away:
-	/// `der` sorts a `SET OF` before validating it, so a reordered set would
-	/// hash the same as the well-ordered one and pass unseen (CWE-345).
+	/// A receiver binds what the peer sent. Re-encoding the decoded value
+	/// instead would erase any difference the decoder normalised away: `der`
+	/// sorts a `SET OF` before validating it, so a reordered set would hash
+	/// the same as the well-ordered one and pass unseen (CWE-345).
 	///
 	/// # Errors
 	///
@@ -239,6 +241,7 @@ impl HandshakeAttribute {
 }
 
 /// Decode a one- or two-byte unsigned INTEGER from an `Any`.
+#[cfg(feature = "transport-cms")]
 fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 	let uint_ref: UintRef = any.decode_as().map_err(|_| HandshakeError::InvalidIntegerEncoding)?;
 	let b = uint_ref.as_bytes();
@@ -254,8 +257,9 @@ fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 
 /// Decode an alert code from a single INTEGER-bearing `Any`.
 ///
-/// Alert codes occupy the u8 domain. Wider values are rejected outright so a
-/// two-byte code can never alias a valid alert through truncation.
+/// Alert codes occupy the u8 domain. A wider value is refused, so a two-byte
+/// code can never alias a valid alert through truncation.
+#[cfg(feature = "transport-cms")]
 fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 	let code = u16_from_any(any)?;
 	if code > u8::MAX as u16 {
@@ -294,6 +298,28 @@ pub trait HandshakeAttributes {
 	/// - RFC 5652 § 11.4, countersignature attributes:
 	///   <https://datatracker.ietf.org/doc/html/rfc5652#section-11.4>
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError>;
+
+	/// Refuses a message that carries an abort alert from the peer.
+	///
+	/// An abort alert travels as an unsigned attribute, so it is advisory and
+	/// unauthenticated.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::AbortReceived`] -- an alert with a known code is present.
+	/// - [`HandshakeError::DuplicateAttribute`] -- the alert attribute repeats.
+	/// - [`HandshakeError::InvalidAttributeArity`] -- the alert carries zero values or more than one.
+	/// - [`HandshakeError::InvalidIntegerEncoding`] -- the alert code is not an INTEGER.
+	/// - [`HandshakeError::IntegerOutOfRange`] -- the alert code is above `u8::MAX`.
+	/// - [`HandshakeError::UnknownAlertCode`] -- the code names no alert.
+	#[cfg(feature = "transport-cms")]
+	fn refuse_alert(&self) -> Result<(), HandshakeError> {
+		let Some(alert) = self.find_unsigned_attr(HANDSHAKE_ABORT_ALERT)? else {
+			return Ok(());
+		};
+
+		Err(HandshakeError::AbortReceived(alert.handshake_alert()?))
+	}
 }
 
 impl HandshakeAttributes for Attributes {
@@ -338,6 +364,7 @@ impl HandshakeAttributes for SignedData {
 }
 
 /// Handshake alert decoding on a [`HandshakeAttribute`].
+#[cfg(feature = "transport-cms")]
 pub trait HandshakeAlertAttribute {
 	/// Returns the alert code this attribute carries.
 	///
@@ -352,6 +379,7 @@ pub trait HandshakeAlertAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError>;
 }
 
+#[cfg(feature = "transport-cms")]
 impl HandshakeAlertAttribute for HandshakeAttribute {
 	fn handshake_alert(&self) -> Result<HandshakeAlert, HandshakeError> {
 		alert_from_any(self.value()?)
@@ -364,7 +392,7 @@ mod tests {
 	use crate::cms::signed_data::{SignerInfo, SignerInfos};
 	use crate::der::asn1::Any;
 	use crate::der::asn1::{OctetString as DerOctetString, SetOfVec, UintRef};
-	use crate::oids::{HANDSHAKE_ABORT_ALERT, HANDSHAKE_SECURITY_ACCEPT};
+	use crate::oids::HANDSHAKE_SECURITY_ACCEPT;
 	use crate::transport::handshake::tests::create_test_signed_data;
 
 	fn mk_integer(bytes: impl AsRef<[u8]>) -> Result<Any, der::Error> {
@@ -417,6 +445,39 @@ mod tests {
 		let attribute = HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT, unsorted.to_owned())?;
 		assert_eq!(attribute.received_bytes()?, unsorted.to_der()?);
 		Ok(())
+	}
+
+	#[test]
+	fn an_abort_alert_attribute_is_refused() -> Result<(), HandshakeError> {
+		let alert = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
+		let attrs = Attributes::try_from(vec![alert])?;
+
+		let refused = attrs.refuse_alert();
+		let expected = HandshakeAlert::AlgorithmMismatch;
+		assert!(matches!(refused, Err(HandshakeError::AbortReceived(alert)) if alert == expected));
+		Ok(())
+	}
+
+	/// A repeated abort alert fails closed as a duplicate attribute rather
+	/// than reading as no alert and letting processing continue into the
+	/// message body.
+	#[test]
+	fn a_duplicate_abort_alert_fails_closed() -> Result<(), HandshakeError> {
+		let first = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x03])?)?;
+		let second = mk_attr(HANDSHAKE_ABORT_ALERT, mk_integer([0x04])?)?;
+		let attrs = Attributes::try_from(vec![first, second])?;
+
+		let refused = attrs.refuse_alert();
+		assert!(matches!(refused, Err(HandshakeError::DuplicateAttribute)));
+		Ok(())
+	}
+
+	/// A message without an abort alert passes the alert check.
+	#[test]
+	fn a_message_without_an_alert_passes() -> Result<(), HandshakeError> {
+		let offer = mk_attr(HANDSHAKE_SECURITY_OFFER, mk_octet([0x11u8; 32])?)?;
+		let attrs = Attributes::try_from(vec![offer])?;
+		attrs.refuse_alert()
 	}
 
 	#[test]
@@ -487,7 +548,7 @@ mod tests {
 
 	#[test]
 	fn alert_integer_out_of_range_rejected() -> Result<(), der::Error> {
-		// Three-byte INTEGER exceeds the u16 decode domain outright.
+		// A three-byte INTEGER exceeds the u16 decode domain.
 		let wide = mk_alert_attr([0x01, 0x02, 0x03])?;
 		assert!(matches!(wide.handshake_alert(), Err(HandshakeError::IntegerOutOfRange)));
 
