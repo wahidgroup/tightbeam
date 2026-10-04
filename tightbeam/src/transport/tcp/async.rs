@@ -199,7 +199,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	///
 	/// # Errors
 	///
-	/// The I/O error when the socket reports no local address.
+	/// - The I/O error of a socket that reports no local address.
 	pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
 		self.listener.local_addr()
 	}
@@ -211,7 +211,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	///
 	/// # Errors
 	///
-	/// The I/O error when the bind fails.
+	/// - The I/O error of a bind that fails.
 	pub async fn bind(addr: impl AsRef<str>) -> Result<Self, IoError> {
 		let listener = TcpListener::bind(addr.as_ref()).await?;
 		let config = EndpointConfig::cleartext();
@@ -224,7 +224,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> TokioListener<P> {
 	///
 	/// # Errors
 	///
-	/// The I/O error when the accept fails.
+	/// - The I/O error of an accept that fails.
 	pub async fn accept(&self) -> Result<(TcpTransport<TokioStream, P>, SocketAddr), IoError> {
 		let (stream, peer_addr) = self.listener.accept().await?;
 		let tokio_stream = TokioStream::from(stream);
@@ -251,7 +251,6 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for TokioListener<P> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
 		let config = EndpointConfig::cleartext();
-
 		Ok((Self { listener, config }, TightBeamSocketAddr(bound_addr)))
 	}
 
@@ -928,7 +927,6 @@ where
 
 		let wire_envelope = builder.build()?;
 		let wire_bytes = wire_envelope.to_der()?;
-
 		self.write_envelope_bytes(&wire_bytes).await?;
 		Ok(())
 	}
@@ -1420,6 +1418,42 @@ mod tests {
 
 		let handshake = transport.perform_client_handshake().await;
 		assert!(matches!(handshake, Err(TransportError::MissingServerCertificateChain)));
+		Ok(())
+	}
+
+	/// A CMS client that holds a trust store and the server chain, and no
+	/// identity, refuses before it sends anything.
+	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[tokio::test]
+	async fn cms_client_without_identity_fails_closed() -> TransportResult<()> {
+		let (_listener, client_stream) = bind_and_connect().await?;
+		let server_certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let encryption = EncryptionConfig {
+			trust_store: Some(empty_trust_store()),
+			server_certificate_chain: Some(Arc::from(vec![server_certificate])),
+			handshake_protocol: HandshakeProtocolKind::Cms,
+			..EncryptionConfig::unconfigured()
+		};
+
+		let mut transport = client_over(client_stream, encryption);
+		let dial = transport.perform_client_handshake().await;
+		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired)));
+		assert!(refused);
+		Ok(())
+	}
+
+	/// An ECIES client that holds no trust store has no validator for the
+	/// server the reply names, so it refuses before it sends anything.
+	#[cfg(all(feature = "x509", feature = "transport-ecies"))]
+	#[tokio::test]
+	async fn ecies_client_without_trust_store_fails_closed() -> TransportResult<()> {
+		let (_listener, client_stream) = bind_and_connect().await?;
+		let encryption = EncryptionConfig { allow_cleartext: true, ..EncryptionConfig::unconfigured() };
+		let mut transport = client_over(client_stream, encryption);
+
+		let dial = transport.perform_client_handshake().await;
+		let refused = matches!(dial, Err(TransportError::HandshakeError(HandshakeError::MissingTrustStore)));
+		assert!(refused);
 		Ok(())
 	}
 

@@ -192,10 +192,10 @@ impl<'a> Kek<'a> {
 	/// # Shared check
 	///
 	/// The synchronous recipient path
-	/// ([`TightBeamKariRecipient::process_kari`]) and the async key-provider
-	/// orchestrator share this, so both keep the same check. AES key wrap
-	/// already provides integrity (RFC 3394), and the re-wrap compare reduces
-	/// timing differences across error paths.
+	/// ([`TightBeamKariRecipient::process_kari`]) and the CMS server flow,
+	/// which agrees through the async key provider, share this, so both keep
+	/// the same check. AES key wrap already provides integrity (RFC 3394), and
+	/// the re-wrap compare reduces timing differences across error paths.
 	///
 	/// [`TightBeamKariRecipient::process_kari`]: crate::transport::handshake::TightBeamKariRecipient::process_kari
 	pub(crate) fn unwrap_verified<P: CryptoProvider>(
@@ -259,7 +259,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
 	use crate::random::OsRng;
-	use crate::transport::handshake::orchestrator::HandshakeAgreement;
+	use crate::transport::handshake::schedule::HandshakeAgreement;
 
 	#[test]
 	fn wrap_unwrap_roundtrip() -> Result<(), Box<dyn std::error::Error>> {

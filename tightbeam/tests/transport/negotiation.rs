@@ -25,7 +25,6 @@ use tightbeam::crypto::profiles::{
 };
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 use tightbeam::der::asn1::ObjectIdentifier;
-use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::oids::{AES_128_WRAP, AES_256_WRAP};
 use tightbeam::tb_assert_spec;
@@ -34,14 +33,12 @@ use tightbeam::testing::{
 	fixtures::{TestCertificate, TestKey},
 	SetupEnv,
 };
-use tightbeam::transport::handshake::client::EciesHandshakeClient;
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
-use tightbeam::transport::handshake::server::EciesHandshakeServer;
-use tightbeam::transport::handshake::PeerAuthentication;
+use tightbeam::transport::handshake::{Ecies, EciesServerSettings, Handshake, ServerConfig, SupportedProfiles};
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::Certificate;
 
-use crate::common::security::pinning_validator;
+use crate::common::security::{ecies_client_config, pinning_validator};
 
 pub(crate) const CLIENT_HELLO_SENT: Urn<'static> = tightbeam::urn!("test", "event:negotiation/client-hello-sent");
 pub(crate) const CLIENT_KEX_SENT: Urn<'static> = tightbeam::urn!("test", "event:negotiation/client-kex-sent");
@@ -53,8 +50,8 @@ pub(crate) const SERVER_HELLO_RECEIVED: Urn<'static> =
 pub(crate) const SERVER_KEX_RECEIVED: Urn<'static> = tightbeam::urn!("test", "event:negotiation/server-kex-received");
 
 /// The stronger profile is AES-256-GCM with SHA3-512. The negotiation selects
-/// it when both sides offer it, because AES-128 fails the default 256-bit
-/// strength floor.
+/// it when both sides offer it, because it is the one profile the test
+/// provider runs.
 #[derive(Debug, Default, Clone, Copy)]
 struct Aes256Sha3_512Profile;
 
@@ -103,8 +100,9 @@ impl CryptoProvider for Aes256Sha3_512Provider {
 	}
 }
 
-/// The weaker profile is AES-128-GCM with SHA3-256. Both offers include it, so
-/// negotiation must prefer the stronger peer-shared profile.
+/// The weaker profile is AES-128-GCM with SHA3-256. The client offer and the
+/// server list both include it, and the test provider does not run it, so
+/// negotiation must select the stronger profile.
 #[derive(Debug, Default, Clone, Copy)]
 struct Aes128Sha3_256Profile;
 
@@ -161,42 +159,40 @@ tb_scenario! {
 			let (server_cert, server_key_provider) = server_materials();
 
 			// The client prefers AES-256 and the server lists AES-128 first.
-			// The strength floor still selects AES-256 when both offer it.
+			// The provider runs AES-256 alone, so the server still selects it.
 			let client_offer = SecurityOffer::new(vec![preferred, fallback]);
-			let server_profiles = vec![fallback, preferred];
+			let server_profiles = SupportedProfiles::new([fallback, preferred])?;
 			let validator = pinning_validator(&server_cert);
 
-			let mut client = EciesHandshakeClient::<Aes256Sha3_512Provider, Secp256k1EciesMessage>::new(None)
-				.with_security_offer(client_offer)
-				.with_certificate_validator(validator);
-			let mut server = EciesHandshakeServer::<Aes256Sha3_512Provider>::new(
-				Arc::clone(&server_key_provider),
-				Arc::new(server_cert.to_owned()),
-				None,
-				PeerAuthentication::Anonymous,
-			)
-			.with_supported_profiles(server_profiles);
+			let mut config = ecies_client_config::<Aes256Sha3_512Provider>(validator);
+			config.security_offer = Some(client_offer);
 
-			let client_hello = client.build_client_hello()?.to_der()?;
+			let mut client = Handshake::client(config);
+
+			let settings = EciesServerSettings::new(server_cert.to_owned());
+			let key = Arc::clone(&server_key_provider);
+			let server_config = ServerConfig::<Ecies, Aes256Sha3_512Provider>::new(settings, key, server_profiles);
+			let mut server = Handshake::server(server_config);
+
+			let opening = client.start()?;
 			trace.event(CLIENT_HELLO_SENT)?;
 
-			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
+			let reply = server.reply(opening).await?;
 			trace.event(SERVER_HELLO_RECEIVED)?;
 
-			let client_kex = client.process_server_handshake(&server_handshake).await?;
+			let closing = client.respond(reply).await?;
 			trace.event(CLIENT_KEX_SENT)?;
 
-			server.process_client_key_exchange(client_kex).await?;
+			server.finish(closing).await?;
 			trace.event(SERVER_KEX_RECEIVED)?;
 
 			// Completion moves the terms out, so the selection is read first.
 			let server_selected = server.selected_profile() == Some(preferred);
 			let client_selected = client.selected_profile() == Some(preferred);
 
-			let _client_session = client.take_established()?;
-			let _server_session = server.take_established()?;
+			let _client_session = client.complete()?;
+			let _server_session = server.complete()?;
 			trace.event(HANDSHAKE_COMPLETE)?;
-
 			trace.event_with(PROFILE_VERIFIED, &[], server_selected && client_selected)?;
 
 			Ok(())

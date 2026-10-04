@@ -11,9 +11,6 @@
 
 #![cfg(all(feature = "transport", feature = "x509", feature = "aead", feature = "tokio"))]
 
-#[cfg(feature = "transport-ecies")]
-use std::sync::Arc;
-
 use tightbeam::{
 	crypto::{
 		aead::{DecryptContent, SessionKeys},
@@ -23,29 +20,24 @@ use tightbeam::{
 	exactly, tb_assert_spec, tb_scenario,
 	testing::SetupEnv,
 	trace::TraceCollector,
-	transport::handshake::{ClientHandshakeProtocol, EstablishedSession, ServerHandshakeProtocol},
+	transport::handshake::{
+		ClientHandshakeProtocol, EstablishedSession, Handshake, HandshakeMessage, ServerHandshakeProtocol,
+	},
+	utils::urn::Urn,
 	TightBeamError,
 };
 
 #[cfg(feature = "transport-ecies")]
-use tightbeam::{
-	crypto::ecies::Secp256k1EciesMessage,
-	transport::handshake::negotiation::SecurityOffer,
-	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer, PeerAuthentication},
-};
-
+use tightbeam::transport::handshake::negotiation::SecurityOffer;
 #[cfg(feature = "transport-cms")]
-use tightbeam::transport::handshake::HandshakeMessage;
-use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
+use tightbeam::transport::handshake::{Client, Cms, PeerAuthentication, Server};
 
 use crate::common::security::{default_security_profile, expectation_failure, ServerMaterials};
 
 #[cfg(feature = "transport-cms")]
 use crate::common::security::cms_handshake_pair;
 #[cfg(feature = "transport-ecies")]
-use crate::common::security::pinning_validator;
-
-use tightbeam::utils::urn::Urn;
+use crate::common::security::{ecies_client_config, ecies_server_config, pinning_validator};
 
 pub(crate) const LOOPBACK_CMS_COMPLETE: Urn<'static> = tightbeam::urn!("test", "event:loopback/loopback-cms-complete");
 pub(crate) const LOOPBACK_CMS_PROFILE_AGREED: Urn<'static> =
@@ -61,10 +53,10 @@ pub(crate) const LOOPBACK_ECIES_PROFILE_AGREED: Urn<'static> =
 pub(crate) const LOOPBACK_ECIES_ROUNDTRIP: Urn<'static> =
 	tightbeam::urn!("test", "event:loopback/loopback-ecies-roundtrip");
 
-/// Number of CMS loopback passes (0 when the feature is disabled).
+/// The number of CMS loopback passes, which is 0 with the feature disabled.
 const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;
 
-/// Number of ECIES loopback passes (0 when the feature is disabled).
+/// The number of ECIES loopback passes, which is 0 with the feature disabled.
 const ECIES_RUNS: u32 = cfg!(feature = "transport-ecies") as u32;
 
 tb_assert_spec! {
@@ -192,19 +184,12 @@ async fn ecies_loopback(trace: &TraceCollector, materials: &ServerMaterials) -> 
 	let offer = security_offer(profile);
 	let validator = pinning_validator(&materials.certificate);
 
-	let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-		.with_security_offer(offer)
-		.with_certificate_validator(validator);
+	let mut config = ecies_client_config::<DefaultCryptoProvider>(validator);
+	config.security_offer = Some(offer);
 
-	let key_provider = Arc::clone(&materials.key_provider);
-	let certificate = Arc::clone(&materials.certificate);
-	let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-		key_provider,
-		certificate,
-		None,
-		PeerAuthentication::Anonymous,
-	)
-	.with_supported_profiles(vec![profile]);
+	let mut client = Handshake::client(config);
+	let server_config = ecies_server_config::<DefaultCryptoProvider>(materials, [profile]);
+	let mut server = Handshake::server(server_config);
 
 	// The flow is ClientHello, then ServerHandshake, then ClientKeyExchange,
 	// which draws no reply.
@@ -229,22 +214,22 @@ fn build_cms_pair(
 	materials: &ServerMaterials,
 ) -> Result<
 	(
-		CmsHandshakeClient<DefaultCryptoProvider>,
-		CmsHandshakeServer<DefaultCryptoProvider>,
+		Handshake<Client, Cms, DefaultCryptoProvider>,
+		Handshake<Server, Cms, DefaultCryptoProvider>,
 	),
 	TightBeamError,
 > {
 	let profile = default_security_profile();
 	let pair = cms_handshake_pair(materials, vec![profile], vec![profile], PeerAuthentication::Anonymous)?;
-	Ok((pair.client, pair.server))
+	Ok((Handshake::client(pair.client), Handshake::server(pair.server)))
 }
 
 /// Drive a CMS pair through its three legs. The flow is KeyExchange, then
 /// ServerFinished, then ClientFinished, which draws no reply.
 #[cfg(feature = "transport-cms")]
 async fn drive_cms_pair(
-	client: &mut CmsHandshakeClient<DefaultCryptoProvider>,
-	server: &mut CmsHandshakeServer<DefaultCryptoProvider>,
+	client: &mut Handshake<Client, Cms, DefaultCryptoProvider>,
+	server: &mut Handshake<Server, Cms, DefaultCryptoProvider>,
 ) -> Result<(), TightBeamError> {
 	let key_exchange = ClientHandshakeProtocol::start(client).await?;
 	let server_reply = server.handle_request(key_exchange).await?;

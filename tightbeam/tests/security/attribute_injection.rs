@@ -1,11 +1,13 @@
 //! # Unsigned-attribute injection threat (CMS)
 //!
 //! ## Weakness
-//! RFC 5652 s11.4 places the sealed receipt acknowledgement among the
-//! *unsigned* attributes of the client Finished: no signature covers
-//! them, so an intermediary can add attributes without invalidating the
-//! message. If the server picks "the first" matching attribute, an
-//! injected duplicate lets an attacker steer which value is consumed.
+//! The client Finished carries the sealed receipt acknowledgement among its
+//! *unsigned* attributes, where RFC 5652 s11.4 places a countersignature. No
+//! signature covers them, so an intermediary can add attributes without
+//! invalidating the message.
+//!
+//! If the server picks "the first" matching attribute, an injected duplicate
+//! lets an attacker steer which value is consumed.
 //!
 //! ## Attack
 //! A MITM captures the client Finished `SignedData` and inserts a second
@@ -40,7 +42,7 @@ use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
-use tightbeam::transport::handshake::HandshakeError;
+use tightbeam::transport::handshake::{HandshakeError, HandshakeMessage};
 use tightbeam::utils::urn::Urn;
 use tightbeam::x509::attr::Attribute;
 use tightbeam::TightBeamError;
@@ -95,9 +97,9 @@ tb_assert_spec! {
 	}
 }
 
-// The injected duplicate passes every signature, which covers signed attributes
-// alone. The server's single-use attribute rule is the control: the receipt
-// acknowledgement must fail closed and the session must stay inactive.
+// No signature covers an unsigned attribute, so the injected duplicate passes
+// every signature. The server's single-use attribute rule is the control: the
+// receipt acknowledgement must fail closed and the session must stay inactive.
 tb_scenario! {
 	name: cms_duplicate_receipt_attribute_fails_closed,
 	spec: AttributeInjectionSpec,
@@ -112,28 +114,25 @@ tb_scenario! {
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			let key_exchange = client.build_key_exchange(None)?;
-			server.process_key_exchange(&key_exchange).await?;
-
-			let server_finished = server.build_server_finished().await?;
-			client.process_server_finished(&server_finished)?;
+			let reply = server.reply(client.start()?).await?;
 
 			// The MITM injects the duplicate on the wire.
-			let client_finished = client.build_client_finished().await?;
-			let tampered = inject_duplicate_receipt_ack(&client_finished)?;
+			let client_finished = client.respond(reply).await?.signed()?;
+			let tampered = inject_duplicate_receipt_ack(client_finished.value())?;
 
 			// The Finished signature covers no unsigned attribute, so the
 			// tampered Finished passes it, and the single-use attribute rule
 			// is the control that refuses the step.
-			let closing = server.process_client_finished(&tampered).await;
+			let closing = server.finish(HandshakeMessage::try_from(tampered)?).await;
 			let duplicate_rejected = matches!(closing, Err(HandshakeError::DuplicateAttribute));
+
 			trace.event_with(
 				DUPLICATE_ATTRIBUTE_FAILS_CLOSED,
 				&[],
 				duplicate_rejected,
 			)?;
 
-			let activation = server.take_established();
+			let activation = server.complete();
 			let activation_refused = matches!(activation, Err(HandshakeError::InvalidState));
 			trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 

@@ -24,17 +24,17 @@
 
 use std::sync::Arc;
 
-use tightbeam::der::Encode;
 use tightbeam::{
 	crypto::x509::{error::CertificateValidationError, policy::CertificateValidation, Certificate},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer, PeerAuthentication},
+	transport::handshake::Handshake,
 	utils::urn::Urn,
 	TightBeamError,
 };
 
+use crate::common::security::{ecies_client_config, ecies_server_config};
 use crate::security::common::{default_security_profile, expectation_failure, ServerMaterials};
 
 pub(crate) const CERT_REJECT_ALL_REJECTED: Urn<'static> =
@@ -138,7 +138,6 @@ tb_scenario! {
 job! {
 	name: CertificateForgeryScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
-		use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 		use tightbeam::crypto::profiles::DefaultCryptoProvider;
 
 		let materials = ServerMaterials::generate();
@@ -146,25 +145,17 @@ job! {
 
 		// Test 1: A valid certificate with correct pinning succeeds.
 		{
-			// Create a validator that pins to the server's actual public key
 			let valid_pinning = SingleKeyPinning::new(&materials.certificate);
 
-			let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-				Arc::clone(&materials.key_provider),
-				Arc::clone(&materials.certificate),
-				None,
-				PeerAuthentication::Anonymous,
-			)
-			.with_supported_profiles(vec![profile]);
+			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+			let mut server = Handshake::server(server_config);
 
-			let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-				.with_certificate_validator(Arc::new(valid_pinning));
+			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(valid_pinning));
+			let mut client = Handshake::client(config);
 
-			// Perform handshake
-			let client_hello = client.build_client_hello()?.to_der()?;
-			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
-			let client_kex = client.process_server_handshake(&server_handshake).await?;
-			server.process_client_key_exchange(client_kex).await?;
+			let reply = server.reply(client.start()?).await?;
+			let closing = client.respond(reply).await?;
+			server.finish(closing).await?;
 
 			// Reaching this point without an error means that the valid
 			// certificate was accepted.
@@ -173,28 +164,18 @@ job! {
 
 		// Test 2: Pinning a wrong public key fails the handshake.
 		{
-			// Create a validator that expects a DIFFERENT public key
 			let wrong_pinning = SingleKeyPinning::wrong_key();
 
-			let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-				Arc::clone(&materials.key_provider),
-				Arc::clone(&materials.certificate),
-				None,
-				PeerAuthentication::Anonymous,
-			)
-			.with_supported_profiles(vec![profile]);
+			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+			let mut server = Handshake::server(server_config);
 
-			let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-				.with_certificate_validator(Arc::new(wrong_pinning));
+			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(wrong_pinning));
+			let mut client = Handshake::client(config);
 
-			// Run the handshake, which fails at process_server_handshake.
-			let client_hello = client.build_client_hello()?.to_der()?;
-			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
-
-			match client.process_server_handshake(&server_handshake).await {
+			// Run the handshake, which fails when the client reads the reply.
+			let reply = server.reply(client.start()?).await?;
+			match client.respond(reply).await {
 				Err(_) => {
-					// The wrong public key rejects the certificate, as
-					// expected.
 					trace.event(CERT_WRONG_KEY_REJECTED)?;
 				}
 				Ok(_) => {
@@ -207,24 +188,16 @@ job! {
 		{
 			let reject_all = RejectAllValidator;
 
-			let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-				Arc::clone(&materials.key_provider),
-				Arc::clone(&materials.certificate),
-				None,
-				PeerAuthentication::Anonymous,
-			)
-			.with_supported_profiles(vec![profile]);
+			let server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+			let mut server = Handshake::server(server_config);
 
-			let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-				.with_certificate_validator(Arc::new(reject_all));
+			let config = ecies_client_config::<DefaultCryptoProvider>(Arc::new(reject_all));
+			let mut client = Handshake::client(config);
 
-			// Run the handshake, which fails at process_server_handshake.
-			let client_hello = client.build_client_hello()?.to_der()?;
-			let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
-
-			match client.process_server_handshake(&server_handshake).await {
+			// Run the handshake, which fails when the client reads the reply.
+			let reply = server.reply(client.start()?).await?;
+			match client.respond(reply).await {
 				Err(_) => {
-					// The validator rejects every certificate, as expected.
 					trace.event(CERT_REJECT_ALL_REJECTED)?;
 				}
 				Ok(_) => {

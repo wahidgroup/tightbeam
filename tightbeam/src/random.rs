@@ -1,8 +1,7 @@
-// Re-exports
 pub use rand_core::{CryptoRngCore, OsRng, RngCore};
 
 use crate::error::Result;
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use rand_core::CryptoRng;
 
 /// Adapts a `&mut dyn CryptoRngCore` to the `Sized` `CryptoRng + RngCore`
@@ -11,10 +10,10 @@ use rand_core::CryptoRng;
 /// A `dyn` RNG is unsized, so `impl CryptoRngCore` bounds take this sized
 /// wrapper. It forwards every method to the underlying trait object,
 /// letting callers inject their own CSPRNG.
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) struct RngWrapper<'a>(pub(crate) &'a mut dyn CryptoRngCore);
 
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl RngCore for RngWrapper<'_> {
 	fn next_u32(&mut self) -> u32 {
 		self.0.next_u32()
@@ -33,17 +32,21 @@ impl RngCore for RngWrapper<'_> {
 	}
 }
 
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl CryptoRng for RngWrapper<'_> {}
 
 /// Generate a cryptographically random nonce.
 ///
+/// `None` draws from the OS CSPRNG through `getrandom`, and `Some` draws from
+/// the supplied RNG.
+///
 /// # Security
-/// - Each nonce MUST be unique for a given key
-/// - Uses OS-level CSPRNG via `getrandom` (cryptographically secure)
-/// - For AES-GCM: N=12 (96 bits, birthday bound at ~2^32 messages)
+///
+/// - Each nonce MUST be unique for a given key.
+/// - For AES-GCM, `N` is 12 (96 bits), and the birthday bound sits near 2^32 messages.
 ///
 /// # Example
+///
 /// ```rust
 /// use aes_gcm::Aes256Gcm;
 ///
@@ -63,7 +66,7 @@ pub fn generate_nonce<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Re
 	Ok(nonce)
 }
 
-/// Generate a random number of specified byte size.
+/// Generate a random number that is `N` bytes wide.
 ///
 /// `None` draws from the OS CSPRNG, as [`generate_nonce`] does.
 pub fn generate_random_number<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Result<usize> {
@@ -99,7 +102,8 @@ mod tests {
 
 	#[test]
 	fn test_random() -> Result<()> {
-		// (size, generator) table with inline generators
+		// Each case pairs a byte size with a generator that draws once from the
+		// supplied RNG and once from the default source.
 		#[allow(clippy::type_complexity)]
 		let cases: &[(usize, fn(&mut rand_core::OsRng) -> Result<(Vec<u8>, Vec<u8>)>)] = &[
 			(8, |rng| {
@@ -127,14 +131,12 @@ mod tests {
 			let mut rng = rand_core::OsRng;
 			let (nonce1, nonce2) = gen(&mut rng)?;
 
-			// Correct length
 			assert_eq!(nonce1.len(), size);
 			assert_eq!(nonce2.len(), size);
 
-			// Unique (extremely unlikely to be equal)
+			// Two draws are equal with negligible probability.
 			assert_ne!(nonce1, nonce2);
 
-			// Not all zeros
 			assert_ne!(nonce1, vec![0u8; size]);
 			assert_ne!(nonce2, vec![0u8; size]);
 		}

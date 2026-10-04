@@ -30,23 +30,20 @@
 //! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm
 //!   Downgrade') <https://cwe.mitre.org/data/definitions/757.html>
 //! - CWE-300: Channel Accessible by Non-Endpoint <https://cwe.mitre.org/data/definitions/300.html>
-//! - CAPEC-220: Client-Server Protocol Manipulation
-//!   <https://capec.mitre.org/data/definitions/220.html>
+//! - CAPEC-220: Client-Server Protocol Manipulation <https://capec.mitre.org/data/definitions/220.html>
 //! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection
 
 use std::sync::Arc;
 
 use tightbeam::{
-	crypto::{ecies::Secp256k1EciesMessage, profiles::DefaultCryptoProvider, profiles::SecurityProfileDesc},
+	crypto::{profiles::DefaultCryptoProvider, profiles::SecurityProfileDesc},
 	der::{Decode, Encode},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{
-		client::EciesHandshakeClient,
 		negotiation::{SecurityAccept, SecurityOffer},
-		server::EciesHandshakeServer,
-		ClientHello, PeerAuthentication, ServerHandshake,
+		Client, ClientHello, Ecies, Handshake, Server,
 	},
 	transport::wire_der::WireDer,
 	utils::urn::Urn,
@@ -54,7 +51,8 @@ use tightbeam::{
 };
 
 use crate::common::security::{
-	expectation_failure, pinning_validator, strong_security_profile, weak_security_profile, ServerMaterials,
+	ecies_client_config, ecies_server_config, expectation_failure, pinning_validator, strong_security_profile,
+	tunneled_handshake, tunneled_hello, tunneled_opening, tunneled_reply, weak_security_profile, ServerMaterials,
 };
 
 pub(crate) const STRIPPED_OFFER_REJECTED: Urn<'static> =
@@ -62,8 +60,8 @@ pub(crate) const STRIPPED_OFFER_REJECTED: Urn<'static> =
 pub(crate) const TAMPERED_ACCEPT_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:transcript-binding/tampered-accept-rejected");
 
-type EciesClient = EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>;
-type EciesServer = EciesHandshakeServer<DefaultCryptoProvider>;
+type EciesClient = Handshake<Client, Ecies, DefaultCryptoProvider>;
+type EciesServer = Handshake<Server, Ecies, DefaultCryptoProvider>;
 
 tb_assert_spec! {
 	pub TranscriptBindingSpec,
@@ -111,17 +109,11 @@ fn strong_weak_pair(
 	let weak = weak_security_profile();
 	let validator = pinning_validator(&materials.certificate);
 
-	let client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-		.with_security_offer(SecurityOffer::new(vec![strong, weak]))
-		.with_certificate_validator(validator);
+	let mut config = ecies_client_config(validator);
+	config.security_offer = Some(SecurityOffer::new(vec![strong, weak]));
 
-	let server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-		Arc::clone(&materials.key_provider),
-		Arc::clone(&materials.certificate),
-		None,
-		PeerAuthentication::Anonymous,
-	)
-	.with_supported_profiles(vec![strong, weak]);
+	let client = Handshake::client(config);
+	let server = Handshake::server(ecies_server_config(materials, [strong, weak]));
 
 	(client, server, strong, weak)
 }
@@ -149,10 +141,9 @@ job! {
 		// Phase 1: A MITM downgrade swaps the accepted profile without
 		// touching the randoms, the certificate, or the signature.
 		let (mut client, mut server, strong, weak) = strong_weak_pair(&materials);
-		let client_hello = client.build_client_hello()?.to_der()?;
-		let server_handshake_der = server.process_client_hello(&client_hello).await?.to_der()?;
+		let reply = server.reply(client.start()?).await?;
 
-		let mut server_handshake = ServerHandshake::from_der(&server_handshake_der)?;
+		let mut server_handshake = tunneled_handshake(reply);
 		assert_eq!(
 			server_handshake.security_accept.as_ref().map(|accept| accept.value().profile),
 			Some(strong),
@@ -161,32 +152,31 @@ job! {
 
 		server_handshake.security_accept = Some(WireDer::new(SecurityAccept::new(weak))?);
 
-		let tampered = server_handshake.to_der()?;
+		let tampered = tunneled_reply(&server_handshake);
 		expect_client_reject(
-			client.process_server_handshake(&tampered).await,
+			client.respond(tampered).await,
 			&trace,
 			TAMPERED_ACCEPT_REJECTED,
 			"client accepted a tampered, unauthenticated security_accept",
 		)
 		.await?;
 
-		// Phase 2: MITM strips SecurityOffer from ClientHello.
+		// Phase 2: A MITM strips the SecurityOffer from the ClientHello. The
 		// client_random is preserved, so a random-only transcript would still
 		// verify. The full ClientHello DER binding must make the client reject.
 		let (mut client, mut server, _strong, _weak) = strong_weak_pair(&materials);
-		let client_hello = client.build_client_hello()?.to_der()?;
+		let client_hello = tunneled_hello(client.start()?);
 		let mut stripped_hello = ClientHello::from_der(&client_hello)?;
 		stripped_hello.security_offer = None;
-
-		let stripped_hello = stripped_hello.to_der()?;
 		assert_ne!(
-			stripped_hello, client_hello,
+			stripped_hello.to_der()?,
+			client_hello,
 			"offer stripping must change ClientHello bytes"
 		);
 
-		let server_handshake_der = server.process_client_hello(&stripped_hello).await?.to_der()?;
+		let reply = server.reply(tunneled_opening(&stripped_hello)).await?;
 		expect_client_reject(
-			client.process_server_handshake(&server_handshake_der).await,
+			client.respond(reply).await,
 			&trace,
 			STRIPPED_OFFER_REJECTED,
 			"client accepted a signature over a rewritten ClientHello",

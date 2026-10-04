@@ -2,7 +2,7 @@
 //!
 //! ## Weakness
 //! If the ECIES mutual-auth client signature covers only the transcript hash,
-//! it does not commit to the ECIES `encrypted_data` carrying the session key.
+//! it does not commit to the ECIES `encrypted_data` carrying the base secret.
 //! ECIES encryption is a public-key operation, and `client_random` is public
 //! (sent in `ClientHello`), so anyone can produce a decryptable payload with
 //! the victim's random.
@@ -44,24 +44,22 @@ use tightbeam::{
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConfig, SetupEnv},
 	trace::TraceCollector,
-	transport::handshake::{
-		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
-		PeerAuthentication,
-	},
+	transport::handshake::{negotiation::SecurityOffer, ClientKeyExchange, Handshake, PeerAuthentication},
 	utils::urn::Urn,
 	TightBeamError,
 };
 
 use crate::common::security::{
-	default_security_profile, expectation_failure, pinning_validator, ClientMaterials, ServerMaterials,
+	carried_closing, carried_key_exchange, default_security_profile, ecies_client_config, ecies_server_config,
+	expectation_failure, pinning_validator, ClientMaterials, ServerMaterials,
 };
 
 pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> =
 	tightbeam::urn!("test", "event:splice-attack/spliced-kex-rejected");
 
-/// Attacker's-eye view of the DER key-exchange plaintext: the two
-/// leading OCTET STRINGs are all a splice needs (the trailing receipt
-/// acknowledgement is absent on this unmetered session).
+/// The attacker's view of the DER key-exchange plaintext. The two leading
+/// OCTET STRINGs are all a splice needs, because this unmetered session
+/// carries no trailing receipt acknowledgement.
 #[derive(Sequence)]
 struct SplicedPayload {
 	base_key: OctetString,
@@ -111,34 +109,32 @@ job! {
 		let materials = ServerMaterials::generate();
 		let profile = default_security_profile();
 
-		// Victim client with an authenticated identity.
+		// The victim is a client with an authenticated identity.
 		let client_materials = ClientMaterials::deterministic();
 		let client_identity = client_materials.identity();
 		let validator = pinning_validator(&materials.certificate);
 
-		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(vec![profile]))
-			.with_certificate_validator(validator)
-			.with_client_identity(client_identity);
+		let mut config = ecies_client_config(validator);
+		config.flow.identity = Some(client_identity);
+		config.security_offer = Some(SecurityOffer::new(vec![profile]));
 
-		// Server requires client authentication (validators present).
+		let mut client = Handshake::client(config);
+
+		// The server holds a validator, so it requires client authentication.
 		let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-			Arc::clone(&materials.key_provider),
-			Arc::clone(&materials.certificate),
-			None,
-			PeerAuthentication::mutual([validator]),
-		)
-		.with_supported_profiles(vec![profile]);
+		let mut server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+		server_config.peer_authentication = PeerAuthentication::mutual([validator]);
+
+		let mut server = Handshake::server(server_config);
 
 		// The victim's certificate is public, so the attacker can seal its
 		// splice under the same associated data the victim used.
 		let victim_certificate = Some(client_materials.certificate.as_ref());
 		let spliced_aad = ClientKeyExchange::client_bound_aad(crate::security::common::HANDSHAKE_AAD, victim_certificate)?;
 
-		let client_hello = client.build_client_hello()?.to_der()?;
-		let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
-		let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
+		let reply = server.reply(client.start()?).await?;
+		let closing = client.respond(reply).await?;
+		let client_kex_der = carried_key_exchange(closing).to_der()?;
 
 		// Recover the victim's client_random from the legitimate payload so the
 		// spliced ciphertext still passes the server's replay check.
@@ -180,7 +176,7 @@ job! {
 			return Err(expectation_failure("splice produced identical ClientKeyExchange bytes"));
 		}
 
-		match server.process_client_key_exchange(spliced).await {
+		match server.finish(carried_closing(&spliced)).await {
 			Err(_) => {
 				trace.event(SPLICED_KEX_REJECTED)?;
 			}

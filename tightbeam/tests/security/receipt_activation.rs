@@ -84,29 +84,27 @@ tb_scenario! {
 				approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
 				..CmsSessionHooks::default()
 			};
+
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
 			// The authorizer issues a challenge and keeps the default
 			// settlement, which refuses a challenged receipt.
-			let key_exchange = client.build_key_exchange(None)?;
-			server.process_key_exchange(&key_exchange).await?;
+			let reply = server.reply(client.start()?).await?;
 
-			let server_finished = server.build_server_finished().await?;
-			client.process_server_finished(&server_finished)?;
-
-			let client_finished = client.build_client_finished().await?;
-			let closing = server.process_client_finished(&client_finished).await;
+			let client_finished = client.respond(reply).await?;
+			let closing = server.finish(client_finished.to_owned()).await;
 			let settlement_refused = matches!(closing, Err(HandshakeError::SettlementRejected { .. }));
 			trace.event_with(SETTLEMENT_REFUSED, &[], settlement_refused)?;
 
-			// The refused settlement consumed the receipt, so the replayed
-			// Finished has nothing to settle and must fail.
-			let replay = server.process_client_finished(&client_finished).await;
+			// The refused settlement left the handshake spent and dropped the
+			// issued receipt with it, so the server refuses the replayed
+			// Finished before it reads it.
+			let replay = server.finish(client_finished).await;
 			let replay_refused = matches!(replay, Err(HandshakeError::InvalidState));
 			trace.event_with(REPLAY_FAILS_WITHOUT_SETTLEMENT, &[], replay_refused)?;
 
-			let completion = server.take_established();
+			let completion = server.complete();
 			let completion_refused = matches!(completion, Err(HandshakeError::InvalidState));
 			trace.event_with(COMPLETE_FAILS_WITHOUT_SETTLEMENT, &[], completion_refused)?;
 

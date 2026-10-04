@@ -25,9 +25,11 @@ use crate::crypto::x509::utils::CertificateExt;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::error::HandshakeError;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::transport::handshake::orchestrator::{HandshakeVerifyingKey, PeerIdentity, Terms};
+use crate::transport::handshake::schedule::{HandshakeVerifyingKey, PeerIdentity, Terms};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::HandshakeProvider;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::utils::marker::{MaybeSend, MaybeSync};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::x509::Certificate;
 
@@ -77,7 +79,7 @@ impl ValidatorChain {
 /// [`PeerAuthentication::admit`] verifies it under the offered certificate's
 /// key.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) trait PossessionProof<P: HandshakeProvider> {
+pub trait PossessionProof<P: HandshakeProvider> {
 	/// Verify this proof under `key`, against the transcript that `terms`
 	/// sealed.
 	///
@@ -118,8 +120,9 @@ impl PeerAuthentication {
 	/// Decide what the handshake may do with the certificate the client
 	/// offered, and verify the proof that the client holds its key.
 	///
-	/// Both handshake servers call this, and it is the one constructor of
-	/// [`AdmittedPeer`]. The rule is the same for both protocols:
+	/// [`Handshake::finish`](crate::transport::handshake::Handshake::finish)
+	/// calls this, and it is the one constructor of [`AdmittedPeer`]. The rule
+	/// is the same for both protocols:
 	///
 	/// - A certificate and its proof travel together. Either one alone is refused.
 	/// - Under mutual authentication every validator runs before the proof.
@@ -173,7 +176,7 @@ impl PeerAuthentication {
 /// The variant stays private, so a proven peer exists only where `admit`
 /// ran every validator and verified the proof.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) struct AdmittedPeer(Admission);
+pub struct AdmittedPeer(Admission);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 enum Admission {
@@ -212,7 +215,7 @@ impl PeerIdentity for AdmittedPeer {
 /// [`LearnedTrust`] validated the certificate.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[derive(Clone)]
-pub(crate) struct AdmittedServer(Arc<Certificate>);
+pub struct AdmittedServer(Arc<Certificate>);
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl AdmittedServer {
@@ -229,18 +232,50 @@ impl PeerIdentity for AdmittedServer {
 	}
 }
 
+/// Where a client learns the identity of its server.
+///
+/// A flow names one implementation, so the leg that admits the server and
+/// what the reply must name are fixed by type.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub trait ServerTrust: MaybeSend + MaybeSync + 'static {
+	/// What the trust admits before the opening.
+	type Provisioned: MaybeSend;
+	/// What the reply names for the trust to admit.
+	type Named: MaybeSend + 'static;
+
+	/// Admit the server before the opening, when its identity is provisioned.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::MissingServerCertificate`] -- the provisioned chain is empty.
+	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
+	///   outside its validity period, or the store refused it or its chain.
+	fn admit_provisioned(&self) -> Result<Self::Provisioned, HandshakeError>;
+
+	/// Admit the server the reply names.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
+	///   outside its validity period, or the validator refused it.
+	fn admit_named(&self, named: Self::Named) -> Result<AdmittedServer, HandshakeError>;
+}
+
 /// Trust in a server whose identity is known before the opening, which
 /// encrypts to it.
 #[cfg(feature = "transport-cms")]
-pub(crate) struct ProvisionedTrust {
+pub struct ProvisionedTrust {
 	/// The provisioned server identity.
-	pub(crate) identity: CmsServerIdentity,
+	pub identity: CmsServerIdentity,
 	/// The store that authenticates the identity.
-	pub(crate) store: Arc<dyn CertificateTrust>,
+	pub store: Arc<dyn CertificateTrust>,
 }
 
 #[cfg(feature = "transport-cms")]
-impl ProvisionedTrust {
+impl ServerTrust for ProvisionedTrust {
+	type Provisioned = AdmittedServer;
+	type Named = AdmittedServer;
+
 	/// Admit the provisioned server before the opening.
 	///
 	/// - A bare certificate is evaluated against the store directly.
@@ -258,7 +293,7 @@ impl ProvisionedTrust {
 	///   outside its validity period, or the store refused it or its chain.
 	///
 	/// [rfc5280-6.1]: https://datatracker.ietf.org/doc/html/rfc5280#section-6.1
-	pub(crate) fn admit_provisioned(&self) -> Result<AdmittedServer, HandshakeError> {
+	fn admit_provisioned(&self) -> Result<AdmittedServer, HandshakeError> {
 		match &self.identity {
 			CmsServerIdentity::Certificate(certificate) => {
 				certificate.validate_expiry()?;
@@ -272,17 +307,46 @@ impl ProvisionedTrust {
 			}
 		}
 	}
+
+	/// The reply names the server that was admitted before the opening.
+	fn admit_named(&self, named: AdmittedServer) -> Result<AdmittedServer, HandshakeError> {
+		Ok(named)
+	}
 }
 
 /// Trust in a server whose identity the client learns from the reply.
 #[cfg(feature = "transport-ecies")]
-pub(crate) struct LearnedTrust {
+pub struct LearnedTrust {
 	/// The validator that authenticates the certificate the reply names.
-	pub(crate) validator: Arc<dyn CertificateValidation>,
+	pub validator: Arc<dyn CertificateValidation>,
 }
 
 #[cfg(feature = "transport-ecies")]
 impl LearnedTrust {
+	/// Trust in the servers whose certificate `validator` accepts.
+	pub fn new(validator: impl CertificateValidation + 'static) -> Self {
+		Self { validator: Arc::new(validator) }
+	}
+}
+
+/// A shared validator is the whole trust.
+#[cfg(feature = "transport-ecies")]
+impl From<Arc<dyn CertificateValidation>> for LearnedTrust {
+	fn from(validator: Arc<dyn CertificateValidation>) -> Self {
+		Self { validator }
+	}
+}
+
+#[cfg(feature = "transport-ecies")]
+impl ServerTrust for LearnedTrust {
+	type Provisioned = ();
+	type Named = Certificate;
+
+	/// The reply names the server, so the admission before the opening is `()`.
+	fn admit_provisioned(&self) -> Result<(), HandshakeError> {
+		Ok(())
+	}
+
 	/// Admit the certificate `named` by the reply.
 	///
 	/// The certificate must be within its validity period, and the validator
@@ -292,7 +356,7 @@ impl LearnedTrust {
 	///
 	/// - [`HandshakeError::CertificateValidationError`] -- the certificate is
 	///   outside its validity period, or the validator refused it.
-	pub(crate) fn admit_named(&self, named: Certificate) -> Result<AdmittedServer, HandshakeError> {
+	fn admit_named(&self, named: Certificate) -> Result<AdmittedServer, HandshakeError> {
 		named.validate_expiry()?;
 		self.validator.evaluate(&named)?;
 		Ok(AdmittedServer(Arc::new(named)))
@@ -392,6 +456,43 @@ mod tests {
 		fn a_provisioned_certificate_past_its_validity_is_refused() {
 			let refusal = trust(TestCertificate::expired(), ExpiryBlindStore).admit_provisioned();
 			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(Expired))));
+		}
+
+		/// Trust in the provisioned `chain` against `store`.
+		fn chain_trust(chain: Arc<[Certificate]>, store: impl CertificateTrust + 'static) -> ProvisionedTrust {
+			ProvisionedTrust { identity: CmsServerIdentity::Chain(chain), store: Arc::new(store) }
+		}
+
+		/// A provisioned chain is path-validated against the store, and its
+		/// leaf identifies the server.
+		#[test]
+		fn a_provisioned_chain_the_store_anchors_is_admitted_as_its_leaf() -> Result<(), Box<dyn Error>> {
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let store = store_holding(chain.root.to_owned());
+
+			let admitted = chain_trust(chain.to_arc(), store).admit_provisioned()?;
+			assert_eq!(admitted.certificate().as_ref(), &chain.leaf);
+			Ok(())
+		}
+
+		#[test]
+		fn a_provisioned_chain_the_store_does_not_anchor_is_refused() -> Result<(), Box<dyn Error>> {
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let store = store_holding(create_test_certificate().certificate);
+
+			let refusal = chain_trust(chain.to_arc(), store).admit_provisioned();
+			assert!(matches!(refusal, Err(HandshakeError::CertificateValidationError(_))));
+			Ok(())
+		}
+
+		#[test]
+		fn an_empty_provisioned_chain_is_refused() -> Result<(), Box<dyn Error>> {
+			let chain = TestCertificate::insecure_fixed_chain()?;
+			let store = store_holding(chain.root);
+
+			let refusal = chain_trust(Arc::from(Vec::new()), store).admit_provisioned();
+			assert!(matches!(refusal, Err(HandshakeError::MissingServerCertificate)));
+			Ok(())
 		}
 	}
 

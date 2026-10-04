@@ -1,6 +1,6 @@
-//! Key-schedule types for handshake orchestrators.
+//! The key schedule of a handshake.
 //!
-//! The CMS and ECIES client and server implementations share these:
+//! Both flows and both roles derive through these owners:
 //!
 //! - [`Agreement`] derives the [`HandshakeSecret`], the one secret a session
 //!   derives from, out of a [`BaseSecret`] and the [`EcdhSecret`] that
@@ -35,8 +35,6 @@ use core::fmt;
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 use alloc::vec::Vec;
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use core::mem;
 
 #[cfg(feature = "transport-ecies")]
 use crate::constants::EC_PUBKEY_COMPRESSED_SIZE;
@@ -82,6 +80,8 @@ use crate::transport::handshake::primitives::{multi_input_kdf, KdfInfo, KdfSalt}
 use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::{Arc, EstablishedSession, HandshakeCurve, HandshakeProvider};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::utils::marker::{MaybeSend, MaybeSync};
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::x509::Certificate;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -233,6 +233,7 @@ impl HandshakeSecret {
 		let nonce = Nonce::<P::AeadCipher>::default();
 		let aad = Self::ack_aad(transcript_hash);
 		let payload = Payload { msg: ciphertext.as_ref(), aad: &aad };
+
 		let plaintext = cipher.decrypt(&nonce, payload).map_err(HandshakeError::ReceiptAckCipher)?;
 		Ok(SecretSlice::from(plaintext))
 	}
@@ -333,107 +334,12 @@ impl EpochSecret {
 	}
 }
 
-/// The secret an orchestrator holds for the phase its handshake is in.
-///
-/// - One value holds the pending material or the handshake secret, so an orchestrator holds one of them.
-/// - The schedule advances `Idle`, `Pending`, `Consumed`, `Derived`,
-///   `Consumed`, and each transition checks the variant it leaves, so a second
-///   key exchange or a second derivation fails with
-///   [`HandshakeError::InvalidState`].
-/// - Every take leaves [`Self::Consumed`] behind, so the schedule holds no secret once completion took it.
-/// - A take that finds another variant fails with
-///   [`HandshakeError::InvalidState`] and leaves [`Self::Consumed`] behind, so
-///   a failed step has nothing to derive from.
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) enum KeySchedule<Pending> {
-	/// The state before the side holds its first secret.
-	Idle,
-	/// What the side holds between its first secret and the agreement.
-	Pending(Pending),
-	/// The handshake secret, from the agreement to completion.
-	Derived(HandshakeSecret),
-	/// A take emptied the schedule. Only [`Self::store`] leaves this variant.
-	Consumed,
-}
-
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-impl<Pending> KeySchedule<Pending> {
-	/// Hold `pending` from the first secret to the agreement.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidState`] -- the schedule already left [`Self::Idle`].
-	pub(crate) fn pend(&mut self, pending: Pending) -> Result<(), HandshakeError> {
-		if !matches!(self, Self::Idle) {
-			return Err(HandshakeError::InvalidState);
-		}
-
-		*self = Self::Pending(pending);
-		Ok(())
-	}
-
-	/// Hold `secret` from the agreement to completion. The agreement took the
-	/// pending material first, so the store follows [`Self::Consumed`].
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidState`] -- the pending material was not taken.
-	pub(crate) fn store(&mut self, secret: HandshakeSecret) -> Result<(), HandshakeError> {
-		if !matches!(self, Self::Consumed) {
-			return Err(HandshakeError::InvalidState);
-		}
-
-		*self = Self::Derived(secret);
-		Ok(())
-	}
-
-	/// Take the pending material for the agreement.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidState`] -- the schedule holds no pending material.
-	pub(crate) fn take_pending(&mut self) -> Result<Pending, HandshakeError> {
-		let Self::Pending(pending) = mem::replace(self, Self::Consumed) else {
-			return Err(HandshakeError::InvalidState);
-		};
-
-		Ok(pending)
-	}
-
-	/// The handshake secret, for the CMS acknowledgement seal and open ahead
-	/// of completion.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidState`] -- the schedule holds no handshake secret.
-	#[cfg(feature = "transport-cms")]
-	pub(crate) fn derived(&self) -> Result<&HandshakeSecret, HandshakeError> {
-		let Self::Derived(secret) = self else {
-			return Err(HandshakeError::InvalidState);
-		};
-
-		Ok(secret)
-	}
-
-	/// Take the handshake secret for completion.
-	///
-	/// # Errors
-	///
-	/// - [`HandshakeError::InvalidState`] -- the schedule holds no handshake secret.
-	pub(crate) fn take_derived(&mut self) -> Result<HandshakeSecret, HandshakeError> {
-		let Self::Derived(secret) = mem::replace(self, Self::Consumed) else {
-			return Err(HandshakeError::InvalidState);
-		};
-
-		Ok(secret)
-	}
-}
-
 /// Epoch state retained past handshake completion for in-band rekeying.
 ///
-/// Each orchestrator's `complete()` produces it alongside the session keys.
-/// The epoch secret seeds the rekey KDF chain, and the transcript hash is
-/// the chain root `hash_0`. The handshake secret itself drops at completion.
+/// [`Handshake::complete`](crate::transport::handshake::Handshake::complete)
+/// produces it alongside the session keys, for either role. The epoch secret
+/// seeds the rekey KDF chain, and the transcript hash is the chain root
+/// `hash_0`. The handshake secret itself drops at completion.
 pub struct EpochMaterials {
 	/// Current epoch secret, zeroized on drop and on rotation
 	/// (RFC 9846, 7.2). Only `transport::rekey` reads it, and a build can
@@ -693,15 +599,37 @@ where
 	Ok(cipher)
 }
 
-/// The KDF salt of a protocol.
+/// The KDF salt of a flow.
+///
+/// Each protocol salts every derivation of one handshake with one value, and
+/// [`Terms::kdf_salt`] yields it.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) enum Salt {
-	/// ECIES salts with `client_random || server_random`.
+pub struct Salt(SaltSource);
+
+/// Where the salt of a flow comes from.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+enum SaltSource {
+	/// The concatenation `client_random || server_random`.
 	#[cfg(feature = "transport-ecies")]
 	Randoms(RandomsSalt),
-	/// CMS salts with the transcript hash that the [`Terms`] hold.
+	/// The transcript hash that the [`Terms`] hold.
 	#[cfg(feature = "transport-cms")]
 	TranscriptHash,
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl Salt {
+	/// The ECIES salt, `client_random || server_random`.
+	#[cfg(feature = "transport-ecies")]
+	pub(crate) fn randoms(client_random: &[u8; 32], server_random: &[u8; 32]) -> Self {
+		Self(SaltSource::Randoms(RandomsSalt::new(client_random, server_random)))
+	}
+
+	/// The CMS salt, the transcript hash that the [`Terms`] hold.
+	#[cfg(feature = "transport-cms")]
+	pub(crate) fn transcript_hash() -> Self {
+		Self(SaltSource::TranscriptHash)
+	}
 }
 
 /// What both sides hold once negotiation is done.
@@ -709,7 +637,7 @@ pub(crate) enum Salt {
 /// The fields are fixed together at the leg that seals the transcript, so a
 /// handshake that holds terms holds all of them.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) struct Terms<P: HandshakeProvider> {
+pub struct Terms<P: HandshakeProvider> {
 	profile: RunnableProfile<P>,
 	mux: Option<MuxSettings>,
 	transcript_hash: [u8; 32],
@@ -737,7 +665,6 @@ impl<P: HandshakeProvider> Terms<P> {
 	}
 
 	/// The multiplexing terms both sides agreed, if any.
-	#[cfg(feature = "transport-ecies")]
 	pub(crate) fn mux(&self) -> Option<MuxSettings> {
 		self.mux
 	}
@@ -749,18 +676,18 @@ impl<P: HandshakeProvider> Terms<P> {
 
 	/// The salt every derivation of this handshake runs under.
 	pub(crate) fn kdf_salt(&self) -> KdfSalt<'_> {
-		match &self.salt {
+		match &self.salt.0 {
 			#[cfg(feature = "transport-ecies")]
-			Salt::Randoms(randoms) => randoms.as_kdf_salt(),
+			SaltSource::Randoms(randoms) => randoms.as_kdf_salt(),
 			#[cfg(feature = "transport-cms")]
-			Salt::TranscriptHash => KdfSalt::new(&self.transcript_hash),
+			SaltSource::TranscriptHash => KdfSalt::new(&self.transcript_hash),
 		}
 	}
 }
 
 /// The certificate a role records as its peer.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) trait PeerIdentity {
+pub trait PeerIdentity: MaybeSend + MaybeSync + 'static {
 	/// The certificate the session records, or `None` when the peer proved no
 	/// identity.
 	fn certificate(&self) -> Option<&Arc<Certificate>>;
@@ -770,7 +697,7 @@ pub(crate) trait PeerIdentity {
 ///
 /// [`Self::complete`] consumes it, so one handshake derives one session.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub(crate) struct Agreed<P: HandshakeProvider, Peer: PeerIdentity> {
+pub struct Agreed<P: HandshakeProvider, Peer: PeerIdentity> {
 	terms: Terms<P>,
 	secret: HandshakeSecret,
 	receipt: Option<StoredReceipt>,
@@ -785,6 +712,21 @@ impl<P: HandshakeProvider, Peer: PeerIdentity> Agreed<P, Peer> {
 	/// `None` for an unmetered one.
 	pub(crate) fn new(terms: Terms<P>, secret: HandshakeSecret, receipt: Option<StoredReceipt>, peer: Peer) -> Self {
 		Self { terms, secret, receipt, peer }
+	}
+
+	/// The negotiated terms.
+	pub(crate) fn terms(&self) -> &Terms<P> {
+		&self.terms
+	}
+
+	/// The dual-signed receipt of a budget-bearing session.
+	pub(crate) fn receipt(&self) -> Option<&StoredReceipt> {
+		self.receipt.as_ref()
+	}
+
+	/// The peer this role recorded.
+	pub(crate) fn peer(&self) -> &Peer {
+		&self.peer
 	}
 
 	/// Derive everything a session takes from the handshake secret, and hand
@@ -933,32 +875,6 @@ mod tests {
 		Ok(())
 	}
 
-	/// A key schedule holds one pending value: a second `pend` is refused and
-	/// the first value stays in place, so one handshake runs one agreement.
-	#[test]
-	fn a_second_pending_value_is_refused() -> Result<(), HandshakeError> {
-		let mut schedule = KeySchedule::<u8>::Idle;
-		schedule.pend(1)?;
-
-		let refused = schedule.pend(2);
-		assert!(matches!(refused, Err(HandshakeError::InvalidState)));
-		assert!(matches!(schedule, KeySchedule::Pending(1)));
-		Ok(())
-	}
-
-	/// A handshake secret is stored only after the pending take, so a store
-	/// ahead of the agreement is refused and the schedule stays `Idle`.
-	#[test]
-	fn a_store_ahead_of_the_agreement_is_refused() {
-		let salt = [0x99u8; 32];
-		let secret = handshake_secret(0x42, 0x11, &salt);
-		let mut schedule = KeySchedule::<u8>::Idle;
-
-		let refused = schedule.store(secret);
-		assert!(matches!(refused, Err(HandshakeError::InvalidState)));
-		assert!(matches!(schedule, KeySchedule::Idle));
-	}
-
 	/// An acknowledgement sealed over one transcript does not open under
 	/// another, so the ciphertext commits to the session it closes.
 	#[test]
@@ -1035,7 +951,7 @@ mod tests {
 	/// A CMS handshake salts every derivation with its transcript hash.
 	#[test]
 	fn a_transcript_salt_is_the_transcript_hash() {
-		let terms = terms_with([0x07u8; 32], Salt::TranscriptHash);
+		let terms = terms_with([0x07u8; 32], Salt::transcript_hash());
 		assert_eq!(terms.kdf_salt().as_bytes(), [0x07u8; 32]);
 	}
 
@@ -1043,8 +959,7 @@ mod tests {
 	/// followed by the server random.
 	#[test]
 	fn a_randoms_salt_is_the_client_random_then_the_server_random() {
-		let randoms = RandomsSalt::new(&[0x01u8; 32], &[0x02u8; 32]);
-		let terms = terms_with([0x07u8; 32], Salt::Randoms(randoms));
+		let terms = terms_with([0x07u8; 32], Salt::randoms(&[0x01u8; 32], &[0x02u8; 32]));
 		assert_eq!(terms.kdf_salt().as_bytes(), [[0x01u8; 32], [0x02u8; 32]].concat());
 	}
 

@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tightbeam::asn1::OctetString;
-use tightbeam::der::Encode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
@@ -59,8 +58,8 @@ const CHALLENGE: &[u8] = b"cms-conf-invoice";
 const RESPONSE: &[u8] = b"cms-conf-preimage";
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-/// Grants budgets with a settlement challenge and accepts settlement only
-/// for the expected plaintext answer, counting invocations.
+/// An authorizer that grants budgets with a settlement challenge, settles only
+/// the expected plaintext answer, and counts the `settle` calls.
 struct SettlingAuthorizer {
 	challenge: OctetString,
 	expected_response: OctetString,
@@ -128,21 +127,17 @@ tb_scenario! {
 				approver: Some(Arc::new(PayingApprover::answering(RESPONSE)?)),
 				..CmsSessionHooks::default()
 			};
+
 			let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 			let (mut client, mut server) = (pair.client, pair.server);
 
-			let key_exchange = client.build_key_exchange(None)?;
-			server.process_key_exchange(&key_exchange).await?;
-
-			let server_finished = server.build_server_finished().await?;
-			client.process_server_finished(&server_finished)?;
-
-			let client_finished = client.build_client_finished().await?;
-			server.process_client_finished(&client_finished).await?;
+			let reply = server.reply(client.start()?).await?;
+			let client_finished = client.respond(reply).await?;
+			server.finish(client_finished.to_owned()).await?;
 
 			// The plaintext answer MUST stay out of the cleartext client
 			// Finished bytes: it travels sealed under the handshake secret.
-			let response_leaked = contains_window(client_finished.to_der()?, RESPONSE);
+			let response_leaked = contains_window(client_finished.der(), RESPONSE);
 			trace.event_with(
 				RESPONSE_CONFIDENTIAL_ON_WIRE,
 				&[],
@@ -180,7 +175,7 @@ tb_scenario! {
 				receipts_match,
 			)?;
 
-			let activated = server.take_established().is_ok();
+			let activated = server.complete().is_ok();
 			trace.event_with(SETTLED_SESSION_ACTIVATES, &[], activated)?;
 
 			Ok::<(), TightBeamError>(())

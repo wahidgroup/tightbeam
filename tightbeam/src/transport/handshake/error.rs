@@ -110,10 +110,6 @@ pub enum HandshakeError {
 	#[error("Client Finished certificate does not match the key-exchange certificate")]
 	ClientCertificateMismatch,
 
-	/// The transcript hash has an invalid length or format.
-	#[error("Invalid transcript hash")]
-	InvalidTranscriptHash,
-
 	/// The digest output width differs from the required transcript hash
 	/// width. `expected` is the required width and `received` is the digest
 	/// output width, both in bytes.
@@ -160,27 +156,10 @@ pub enum HandshakeError {
 	#[error("Receipt acknowledgement AEAD failure: {0}")]
 	ReceiptAckCipher(crate::crypto::aead::Error),
 
-	/// The leaf of the provisioned certificate chain differs from the pinned
-	/// server certificate.
-	#[error("Provisioned certificate chain leaf does not match pinned server certificate")]
-	PinnedCertificateMismatch,
-
-	/// The client random is missing from the ClientHello.
-	#[error("Missing client random from ClientHello")]
-	MissingClientRandom,
-
-	/// The client random is missing from the handshake state.
-	#[error("Missing client random")]
-	MissingClientRandomState,
-
-	/// The server random is missing.
-	#[error("Missing server random")]
-	MissingServerRandom,
-
-	/// The CMS salt (the transcript hash) is below the minimum entropy
+	/// The KDF salt of a traffic-key derivation is below the minimum entropy
 	/// requirement. `actual` is the salt length and `minimum` is the required
 	/// length, both in bytes.
-	#[error("CMS salt too short: {actual} bytes (minimum {minimum} required)")]
+	#[error("KDF salt too short: {actual} bytes (minimum {minimum} required)")]
 	InsufficientSaltEntropy { actual: usize, minimum: usize },
 
 	/// The peer sent an abort alert during the handshake.
@@ -347,7 +326,6 @@ impl HandshakeError {
 			| Self::SignatureVerificationFailed
 			| Self::MissingClientCertificate
 			| Self::ClientCertificateMismatch
-			| Self::PinnedCertificateMismatch
 			| Self::CertificateNotYetValid
 			| Self::CertificateExpired
 			| Self::MutualAuthRequired => Some(events::SESSION_CERT_REJECTED),

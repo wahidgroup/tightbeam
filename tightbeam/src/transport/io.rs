@@ -2,7 +2,10 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(all(not(feature = "std"), feature = "transport-ecies"))]
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
@@ -68,9 +71,11 @@ mod x509 {
 	mod handshake {
 		pub use crate::transport::error::TransportFailure;
 		pub use crate::transport::handshake::negotiation::RunnableProfile;
+		pub(crate) use crate::transport::handshake::ServerFlow;
 		pub use crate::transport::handshake::{
-			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeMessage,
-			HandshakeProtocolKind, HandshakeProvider, ServerHandshakeProtocol,
+			BoxedClientHandshake, BoxedServerHandshake, ClientConfig, ClientHandshakeProtocol, Handshake,
+			HandshakeError, HandshakeMessage, HandshakeProtocolKind, HandshakeProvider, ServerConfig,
+			ServerHandshakeProtocol, SupportedProfiles,
 		};
 		pub use crate::transport::state::SessionPhase;
 	}
@@ -80,10 +85,8 @@ mod x509 {
 
 	#[cfg(feature = "transport-ecies")]
 	mod ecies {
-		pub use crate::transport::handshake::client::EciesHandshakeClient;
-
-		#[cfg(feature = "std")]
 		pub use crate::crypto::x509::policy::CertificateValidation;
+		pub use crate::transport::handshake::{Ecies, EciesClientSettings, EciesServerSettings, LearnedTrust};
 	}
 
 	#[cfg(feature = "transport-ecies")]
@@ -92,7 +95,7 @@ mod x509 {
 	#[cfg(feature = "transport-cms")]
 	mod cms {
 		pub use crate::transport::handshake::negotiation::SecurityOffer;
-		pub use crate::transport::handshake::{CmsClientConfig, HandshakeError};
+		pub use crate::transport::handshake::{Cms, CmsClientSettings, CmsServerSettings, ProvisionedTrust};
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -509,8 +512,9 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Dual-write the handshake outcome at the transport driver interface.
 	///
-	/// The outcome is a completion, or a receipt approval or settlement
-	/// refusal.
+	/// - A completed handshake records the completion, and the settlement when the session holds a receipt.
+	/// - A refused handshake records the audit event its error names: a receipt
+	///   approval or settlement refusal, or a rejected certificate or proof.
 	#[cfg(all(
 		feature = "instrument",
 		any(feature = "transport-cms", feature = "transport-ecies")
@@ -524,8 +528,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		};
 
 		match outcome {
-			// Multi-round server handshakes report Ok per round. Only the
-			// completed state marks the session as established.
+			// A multi-round server handshake reports `Ok` per round, so only
+			// the encrypted phase marks the session as established.
 			Ok(()) => {
 				if !matches!(self.session_state().phase(), SessionPhase::Encrypted(_)) {
 					return;
@@ -568,7 +572,14 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Build the ECIES client orchestrator from transport state.
 	///
 	/// The client proves the configured identity when one is present and dials
-	/// anonymously otherwise, so both cases run the one driver.
+	/// anonymously otherwise, so both cases run the one driver. The trust
+	/// store admits the certificate the server names, so a missing store fails
+	/// closed before the client sends anything (CWE-295).
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::HandshakeError`] with
+	///   [`HandshakeError::MissingTrustStore`] -- no trust store is configured.
 	#[cfg(feature = "transport-ecies")]
 	fn build_ecies_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
 	where
@@ -576,80 +587,56 @@ pub trait EncryptedMessageIO: MessageIO {
 		P: HandshakeProvider,
 	{
 		let encryption = self.encryption();
-		let identity = encryption.client_identity.clone();
-		let mut client =
-			EciesHandshakeClient::<P, P::EciesMessage>::new_with_identity(Some(encryption.aad_domain_tag), identity);
+		let store = encryption.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
+		let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
+		let settings = EciesClientSettings {
+			trust: LearnedTrust { validator },
+			aad_domain_tag: encryption.aad_domain_tag,
+			identity: encryption.client_identity.clone(),
+		};
 
-		#[cfg(all(feature = "x509", feature = "std"))]
-		if let Some(store) = encryption.trust_store.as_ref() {
-			let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
-			client = client.with_certificate_validator(validator);
-		}
+		let mut config = ClientConfig::<Ecies, P>::new(settings);
+		config.transport_offer = encryption.mux_offer.as_deref().cloned();
+		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
 
-		if let Some(offer) = encryption.mux_offer.as_deref().cloned() {
-			client = client.with_transport_offer(offer);
-		}
-
-		// A budget-bearing session needs the receipt approver.
-		if let Some(approver) = encryption.receipt_approver.as_ref().map(Arc::clone) {
-			client = client.with_receipt_approver(approver);
-		}
-
-		Ok(Box::new(client))
+		Ok(Box::new(Handshake::client(config)))
 	}
 
 	/// Build the CMS client orchestrator from transport state.
 	///
 	/// CMS encrypts the base secret to the server's public key up front, so
-	/// the server identity comes from the provisioned chain. A missing trust
-	/// store or chain fails closed.
+	/// the server identity comes from the provisioned chain. The client signs
+	/// its Finished under its identity, and the server verifies that
+	/// signature under the certificate, so a client without one fails closed
+	/// before it sends anything.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
 	/// - [`TransportError::HandshakeError`] with
 	///   [`HandshakeError::MissingTrustStore`] -- no trust store is configured.
 	/// - [`TransportError::MissingServerCertificateChain`] -- no server chain is provisioned.
-	/// - The build failure of the CMS client.
+	/// - [`TransportError::HandshakeError`] with
+	///   [`HandshakeError::MutualAuthRequired`] -- no client identity is configured.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
 	{
-		let key = self
-			.encryption()
-			.key_manager
-			.as_ref()
-			.ok_or(TransportError::MissingEncryption)?;
-		let store = self
-			.encryption()
-			.trust_store
-			.as_ref()
-			.ok_or(TransportError::HandshakeError(HandshakeError::MissingTrustStore))?;
-		let chain = self
-			.encryption()
-			.server_certificate_chain
-			.as_ref()
-			.ok_or(TransportError::MissingServerCertificateChain)?;
+		let encryption = self.encryption();
+		let store = encryption.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
+		let chain = encryption.server_certificate_chain.as_ref();
+		let chain = chain.ok_or(TransportError::MissingServerCertificateChain)?;
+		let identity = encryption.client_identity.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+		let trust = ProvisionedTrust { identity: Arc::clone(chain).into(), store: Arc::clone(store) };
+		let settings = CmsClientSettings { trust, identity: identity.clone() };
 
-		let trust_store = Arc::clone(store);
-		let server_identity = Arc::clone(chain).into();
-		let security_offer = Some(SecurityOffer::new(vec![RunnableProfile::<P>::native().descriptor()]));
-		let client_certificate = self
-			.encryption()
-			.client_identity
-			.as_ref()
-			.map(|identity| identity.certificate_arc());
+		let mut config = ClientConfig::<Cms, P>::new(settings);
+		config.security_offer = Some(SecurityOffer::new(vec![RunnableProfile::<P>::native().descriptor()]));
+		config.transport_offer = encryption.mux_offer.as_deref().cloned();
+		config.receipt_approver = encryption.receipt_approver.as_ref().map(Arc::clone);
 
-		Ok(key.create_cms_client(CmsClientConfig {
-			server_identity,
-			trust_store,
-			security_offer,
-			transport_offer: self.encryption().mux_offer.as_deref().cloned(),
-			client_certificate,
-			receipt_approver: self.encryption().receipt_approver.as_ref().map(Arc::clone),
-		})?)
+		Ok(Box::new(Handshake::client(config)))
 	}
 
 	/// Drive the protocol-agnostic client handshake state machine, with bytes
@@ -760,42 +747,53 @@ pub trait EncryptedMessageIO: MessageIO {
 		outcome
 	}
 
+	/// The server configuration every protocol shares, around the settings of
+	/// flow `F`.
+	///
+	/// The server runs the one profile its provider names, so the profile
+	/// list is never empty.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	fn server_config<F, P>(&self, flow: F::Settings) -> TransportResult<ServerConfig<F, P>>
+	where
+		Self: EncryptedProtocolState<CryptoProvider = P>,
+		F: ServerFlow<P>,
+		P: HandshakeProvider,
+	{
+		let encryption = self.encryption();
+		let key_manager = encryption.key_manager.as_ref().ok_or(TransportError::MissingEncryption)?;
+		let profiles = SupportedProfiles::from(RunnableProfile::<P>::native().descriptor());
+
+		let mut config = ServerConfig::new(flow, key_manager.signing_provider(), profiles);
+		config.peer_authentication = encryption.peer_authentication.clone();
+		config.transport = encryption.mux_offer.as_deref().cloned();
+		config.transport_authorizer = encryption.transport_authorizer.as_ref().map(Arc::clone);
+		config.session_observer = encryption.session_observer.as_ref().map(Arc::clone);
+		Ok(config)
+	}
+
 	/// Build the ECIES server orchestrator from transport state.
 	///
 	/// # Errors
 	///
 	/// - [`TransportError::MissingEncryption`] -- no server certificate or key manager is configured.
-	/// - The build failure of the ECIES server.
 	#[cfg(feature = "transport-ecies")]
 	fn build_ecies_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
 	{
-		let cert_arc = self
-			.encryption()
-			.server_certificate
-			.as_ref()
-			.map(Arc::clone)
-			.ok_or(TransportError::MissingEncryption)?;
-		let key_manager = self
-			.encryption()
-			.key_manager
-			.as_ref()
-			.ok_or(TransportError::MissingEncryption)?;
+		let encryption = self.encryption();
+		let certificate = encryption.server_certificate.as_ref();
+		let certificate = certificate.ok_or(TransportError::MissingEncryption)?;
+		let certificate = Arc::clone(certificate);
+		let settings = EciesServerSettings { certificate, aad_domain_tag: encryption.aad_domain_tag };
 
-		let peer_authentication = self.encryption().peer_authentication.clone();
-		let supported_profiles = vec![RunnableProfile::<P>::native().descriptor()];
-
-		Ok(key_manager.create_ecies_server(
-			cert_arc,
-			Some(self.encryption().aad_domain_tag),
-			supported_profiles,
-			peer_authentication,
-			self.encryption().mux_offer.as_deref().cloned(),
-			self.encryption().transport_authorizer.as_ref().map(Arc::clone),
-			self.encryption().session_observer.as_ref().map(Arc::clone),
-		)?)
+		let config = self.server_config::<Ecies, P>(settings)?;
+		Ok(Box::new(Handshake::server(config)))
 	}
 
 	/// Build the CMS server orchestrator from transport state.
@@ -803,29 +801,14 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// # Errors
 	///
 	/// - [`TransportError::MissingEncryption`] -- no key manager is configured.
-	/// - The build failure of the CMS server.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: HandshakeProvider,
 	{
-		let key_manager = self
-			.encryption()
-			.key_manager
-			.as_ref()
-			.ok_or(TransportError::MissingEncryption)?;
-
-		let peer_authentication = self.encryption().peer_authentication.clone();
-		let supported_profiles = vec![RunnableProfile::<P>::native().descriptor()];
-
-		Ok(key_manager.create_cms_server(
-			peer_authentication,
-			supported_profiles,
-			self.encryption().mux_offer.as_deref().cloned(),
-			self.encryption().transport_authorizer.as_ref().map(Arc::clone),
-			self.encryption().session_observer.as_ref().map(Arc::clone),
-		)?)
+		let config = self.server_config::<Cms, P>(CmsServerSettings)?;
+		Ok(Box::new(Handshake::server(config)))
 	}
 
 	/// Drive the protocol-agnostic server handshake state machine.
@@ -887,8 +870,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// - [`TransportError::InvalidMessage`] -- the request passes the wire ceiling.
 	/// - [`TransportError::UnsupportedHandshakeProtocol`] -- this build lacks the configured protocol.
 	/// - [`TransportError::OperationFailed`] with
-	///   [`TransportFailure::DeadlineExceeded`] -- the handshake
-	///   deadline elapsed.
+	///   [`TransportFailure::DeadlineExceeded`] -- the handshake deadline elapsed.
 	/// - The orchestrator build failure, and the
 	///   [`drive_server_handshake`](Self::drive_server_handshake) set.
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -962,11 +944,11 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let wire_envelope = self.wrap_and_encrypt_message(message).await?;
 		let wire_bytes = wire_envelope.to_der()?;
+
 		self.write_envelope_bytes(&wire_bytes).await?;
 
 		let response_bytes = self.read_session_bytes().await?;
 		let response_envelope = self.decrypt_response(response_bytes).await?;
-
 		let (status, response) = match response_envelope {
 			TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 			TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
@@ -989,7 +971,6 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		let response_frame = response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
 		let returned_frame = returned_message.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
-
 		Ok((status, response_frame, returned_frame))
 	}
 }
@@ -1032,7 +1013,7 @@ mod tests {
 	#[cfg(feature = "aead")]
 	use crate::transport::TransportLimits;
 
-	/// Minimal `MessageIO` probe so ingress goes through `decode_envelope`.
+	/// A minimal `MessageIO` probe, so ingress goes through `decode_envelope`.
 	#[derive(Default)]
 	struct DecodeProbe {
 		clock: ManualClock,

@@ -7,7 +7,7 @@ This document describes how a TightBeam session is established, which types carr
 - [Two protocols, one interface](#two-protocols-one-interface)
 - [The session phase](#the-session-phase)
 - [Message flow](#message-flow)
-- [Handshake state machines](#handshake-state-machines)
+- [The orchestrator](#the-orchestrator)
 - [Completion](#completion)
 - [Peer authentication](#peer-authentication)
 - [Key schedule](#key-schedule)
@@ -36,14 +36,14 @@ pub enum HandshakeMessage {
 }
 ```
 
-Each step accepts one container and refuses the other. A step asks for the one it expects, and a peer that sends the other receives `HandshakeError::UnexpectedContainer`.
+Each step accepts one container and refuses the other. A step asks for the one it expects, and the other one fails the step with `HandshakeError::UnexpectedContainer`.
 
 ```rust
 let key_exchange = msg.enveloped()?;   // refuses a SignedData
 let finished = msg.signed()?;          // refuses an EnvelopedData
 ```
 
-Because the orchestrator names its own container, the driver carries no per-protocol mapping. `ClientBuilder`, the connection pool and the `client!` macro all reach the same code.
+Because each protocol names its own container, the driver carries no per-protocol mapping. `ClientBuilder`, the connection pool and the `client!` macro all reach the same code.
 
 ## The session phase
 
@@ -124,60 +124,78 @@ sequenceDiagram
     Note over S: verifies the Finished, opens and settles the receipt countersignature
 ```
 
-The CMS server settles the receipt in the same step that processes the client Finished, so a budget-bearing session activates only after the countersignature verifies. A refused settlement takes the handshake secret with it, so a replayed Finished has nothing to complete with.
+In both protocols the server settles the receipt in the same step that reads the client's last message, so a budget-bearing session activates only after the countersignature verifies. A refused settlement takes the handshake secret with it, so a replay of that message has nothing to complete with.
 
 Both protocols negotiate the security profile through one policy, `ProfilePolicy`:
 
-- The server chooses from its configured profiles. A server with none refuses the first message with `NoSupportedProfiles`.
+- The server chooses from its configured profiles. The list is a `SupportedProfiles`, which refuses an empty list with `NoSupportedProfiles` when it is built, so a server always has a profile to choose.
 - The client admits the server's selection. It refuses a reply that selects nothing with `InvalidProfileSelection`.
 
-## Handshake state machines
+## The orchestrator
 
-Each protocol supplies its own transition table through a sealed trait, so a CMS peer cannot take an ECIES edge.
+One type, `Handshake<R, F, P>`, runs both roles over both protocols.
+
+| Parameter | Values                | What it fixes                                               |
+| --------- | --------------------- | ----------------------------------------------------------- |
+| `R`       | `Client`, `Server`    | The step order and every negotiation and admission decision |
+| `F`       | `Ecies`, `Cms`        | The wire of the protocol and the checks that wire defines   |
+| `P`       | A `HandshakeProvider` | The algorithms                                              |
+
+Each role runs three steps.
+
+| Role   | Steps, in order                | Legs                                                     |
+| ------ | ------------------------------ | -------------------------------------------------------- |
+| Client | `start`, `respond`, `complete` | Sends the opening, reads the reply and sends the closing |
+| Server | `reply`, `finish`, `complete`  | Reads the opening and sends the reply, reads the closing |
 
 ```rust
-pub trait HandshakeFlow: sealed::Sealed {
-    fn client_permits(from: ClientHandshakeState, to: ClientHandshakeState) -> bool;
-    fn server_permits(from: ServerHandshakeState, to: ServerHandshakeState) -> bool;
-}
+let mut client = Handshake::client(client_config);
+let mut server = Handshake::server(server_config);
+
+let opening = client.start()?;
+let reply = server.reply(opening).await?;
+let closing = client.respond(reply).await?;
+server.finish(closing).await?;
 ```
 
-The ECIES client machine runs the hello first.
+The type of each configuration requires what its role cannot run without.
+
+| Configuration            | What its type requires                                                                             |
+| ------------------------ | -------------------------------------------------------------------------------------------------- |
+| `ClientConfig<Ecies, P>` | A validator for the certificate the server names (`LearnedTrust`)                                  |
+| `ClientConfig<Cms, P>`   | The provisioned server identity beside its trust store (`ProvisionedTrust`), and a client identity |
+| `ServerConfig<F, P>`     | A key provider, and a profile list that is never empty (`SupportedProfiles`)                       |
+
+### Phases
+
+Both roles run one machine, read through `HandshakePhase`.
 
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> Init
-    Init --> HelloSent: send ClientHello
-    HelloSent --> ServerHelloReceived: receive ServerHandshake
-    ServerHelloReceived --> KeyExchangeSent: send ClientKeyExchange
-    KeyExchangeSent --> Completed: derive keys
+    [*] --> Idle
+    Idle --> Exchanging: start or reply
+    Exchanging --> Agreed: respond or finish
+    Agreed --> Completed: complete
+    Idle --> Spent: a step began and failed
+    Exchanging --> Spent
+    Agreed --> Spent
 ```
 
-The CMS client machine leads with the key exchange.
+- A step outside its phase returns `HandshakeError::InvalidState` and leaves the phase unchanged.
+- A step that began and failed leaves the handshake `Spent`. Every secret the phase held drops with that step, and no later step runs.
+- `Completed` and `Spent` are terminal. A client driver drops its handshake when it returns. A server transport takes its handshake out of its slot to complete it, and a spent one drops with the transport.
 
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> Init
-    Init --> KeyExchangeSent: send KeyExchange
-    KeyExchangeSent --> ServerFinishedReceived: receive ServerFinished
-    ServerFinishedReceived --> ClientFinishedSent: send ClientFinished
-    ClientFinishedSent --> Completed: derive keys
-```
+A phase holds the facts its steps established, so a fact exists only after its step ran.
 
-- `Completed` is the one terminal state.
-- A refusal is the error the orchestrator returns. The transport's session reset then discards the orchestrator.
-- Every edge is one the table names, so an out-of-order message returns `HandshakeError::InvalidState`.
-
-| Backend | Client sequence                                                              | Server sequence                                                                  |
-| ------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| ECIES   | Init, HelloSent, ServerHelloReceived, KeyExchangeSent, Completed             | Init, ClientHelloReceived, ServerHelloSent, KeyExchangeReceived, Completed       |
-| CMS     | Init, KeyExchangeSent, ServerFinishedReceived, ClientFinishedSent, Completed | Init, KeyExchangeReceived, ServerFinishedSent, ClientFinishedReceived, Completed |
+| Phase        | Client holds                                                          | Server holds                                                                    |
+| ------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `Exchanging` | The sent opening, and the secrets that await the agreement            | The negotiated terms, the secrets that await the closing, and an issued receipt |
+| `Agreed`     | The terms, the handshake secret, the receipt, and the admitted server | The terms, the handshake secret, the receipt, and the admitted client           |
 
 ## Completion
 
-A completed handshake hands over everything it agreed in one value. Completion moves the terms out of the orchestrator and moves its state machine to `Completed`. The terms are therefore read once, and a second completion fails with `HandshakeError::InvalidState`.
+A completed handshake hands over everything it agreed in one value. Completion moves the terms out of the handshake and moves its phase to `Completed`. The terms are therefore read once, and a second completion fails with `HandshakeError::InvalidState`.
 
 ```rust
 pub struct EstablishedSession {
@@ -191,20 +209,20 @@ pub struct EstablishedSession {
 
 The fields are private, so outside the crate the session answers named questions instead: `keys()`, `mux()`, `receipt()` and `peer()`.
 
-Each orchestrator exposes one completion, and the protocol trait delegates to it. A driver and a test therefore read the session terms the same way.
+`Handshake::complete` is the one completion of both roles, and the protocol traits delegate to it. A driver and a test therefore read the session terms the same way.
 
 ```rust
-// The single home for CMS client completion.
-let session = client.take_established()?;
+// The one completion.
+let session = client.complete()?;
 
-// Through the trait, which consumes the boxed orchestrator.
+// Through the trait, which consumes the boxed handshake.
 let session = ClientHandshakeProtocol::complete(client).await?;
 ```
 
 Installing that session is one phase write. The write bounds both session ciphers by the endpoint's encrypted-envelope ceiling, so every install keeps the per-key volume inside the AES-GCM bound.
 
 ```rust
-fn install_session(&mut self, session: EstablishedSession, encrypted_envelope: usize) -> bool {
+pub fn install_session(&mut self, session: EstablishedSession, encrypted_envelope: usize) -> bool {
     let bounded = session.with_envelope_ceiling(encrypted_envelope);
     self.apply(SessionEvent::Install(Box::new(bounded)))
 }
@@ -214,10 +232,10 @@ The certificate and the receipt travel as `Arc`, so completion copies neither.
 
 ```mermaid
 flowchart LR
-    A[handshake completes] --> B[take_established]
+    A[last leg is done] --> B[Handshake::complete]
     B --> C[EstablishedSession]
     C --> D[install_session]
-    D --> E{permits?}
+    D --> E{admits?}
     E -->|yes| F[SessionPhase::Encrypted]
     E -->|no| G[TransportError::InvalidState]
 ```
@@ -308,11 +326,11 @@ k_ack   = HKDF(hs, S, "tb/session/kdf/ack/v1")
 
 The client reuses the ephemeral it already sends. The server draws a fresh one, `E`, for each handshake and carries it inside the transcript it signs.
 
-| Step                          | ECIES                                     | CMS                                                  |
-| ----------------------------- | ----------------------------------------- | ---------------------------------------------------- |
-| Client ephemeral              | `R`, at the head of the encrypted payload | `C`, the KARI originator key                         |
-| Client drops its private half | When it seals the key exchange            | When it processes the server Finished                |
-| Server drops its private half | At the key exchange, which takes it       | At the end of the Finished step, where it is a local |
+| Step                          | ECIES                                        | CMS                             |
+| ----------------------------- | -------------------------------------------- | ------------------------------- |
+| Client ephemeral              | `R`, at the head of the encrypted payload    | `C`, the KARI originator key    |
+| Client drops its private half | In `respond`, once it sealed the closing     | In `respond`, at the agreement  |
+| Server drops its private half | In `finish`, which takes it on every outcome | In `reply`, where it is a local |
 
 Every received ephemeral passes `PublicKey::from_sec1_bytes`, which refuses a malformed, off-curve, or identity point before any scalar multiplication. A client also refuses an `E` equal to the server's static key, because the agreement would then collapse into the static one.
 
@@ -388,7 +406,7 @@ flowchart TD
     C --> D[MissingEncryption]
 ```
 
-This matters for authorization. The colony gates and the cluster export rules read the peer certificate, so a session that was torn down must not leave the previous peer's identity readable.
+The colony gates and the cluster export rules authorize a request by the peer certificate, so a session that was torn down must not leave the previous peer's identity readable.
 
 An end of stream is named by the phase it interrupted.
 

@@ -57,24 +57,20 @@ mod ecies {
 	use super::{NO_OUTCOME_BEFORE_CONCLUSION, SETTLE_NEVER_FIRED, TAMPERED_CIPHERTEXT_REJECTED};
 
 	use tightbeam::asn1::OctetString;
-	use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 	use tightbeam::crypto::profiles::DefaultCryptoProvider;
 	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
-	use tightbeam::der::{Decode, Encode};
 	use tightbeam::exactly;
 	use tightbeam::tb_assert_spec;
 	use tightbeam::tb_scenario;
 	use tightbeam::testing::SetupEnv;
 	use tightbeam::transport::handshake::negotiation::{MuxBudgets, SecurityOffer, TransportOffer};
 	use tightbeam::transport::handshake::receipt::SessionObserver;
-	use tightbeam::transport::handshake::{
-		client::EciesHandshakeClient, server::EciesHandshakeServer, ClientKeyExchange, PeerAuthentication,
-	};
+	use tightbeam::transport::handshake::{Handshake, PeerAuthentication};
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
-		default_security_profile, pinning_validator, ClientMaterials, PayingApprover, RecordingObserver,
-		ServerMaterials, SettleSpyAuthorizer,
+		carried_closing, carried_key_exchange, default_security_profile, ecies_client_config, ecies_server_config,
+		pinning_validator, ClientMaterials, PayingApprover, RecordingObserver, ServerMaterials, SettleSpyAuthorizer,
 	};
 
 	const CHALLENGE: &[u8] = b"evidence-invoice";
@@ -103,41 +99,37 @@ mod ecies {
 				let client_materials = ClientMaterials::deterministic();
 				let client_identity = client_materials.identity();
 
-				let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-					.with_security_offer(SecurityOffer::new(vec![profile]))
-					.with_certificate_validator(pinning_validator(&materials.certificate))
-					.with_client_identity(client_identity)
-					.with_transport_offer(TransportOffer::mux(4).with_budgets(REQUEST))
-					.with_receipt_approver(Arc::new(PayingApprover::answering(RESPONSE)?));
+				let mut config = ecies_client_config(pinning_validator(&materials.certificate));
+				config.flow.identity = Some(client_identity);
+				config.security_offer = Some(SecurityOffer::new(vec![profile]));
+				config.transport_offer = Some(TransportOffer::mux(4).with_budgets(REQUEST));
+				config.receipt_approver = Some(Arc::new(PayingApprover::answering(RESPONSE)?));
+
+				let mut client = Handshake::client(config);
 
 				let authorizer = Arc::new(SettleSpyAuthorizer::challenging(CHALLENGE)?);
 				let observer = Arc::new(RecordingObserver::default());
 				let validator: Arc<dyn CertificateValidation> = Arc::new(ExpiryValidator);
-				let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-					Arc::clone(&materials.key_provider),
-					Arc::clone(&materials.certificate),
-					None,
-					PeerAuthentication::mutual([validator]),
-				)
-				.with_supported_profiles(vec![profile])
-				.with_transport_config(TransportOffer::mux(4))
-				.with_transport_authorizer(Arc::clone(&authorizer) as _)
-				.with_session_observer(Arc::clone(&observer) as Arc<dyn SessionObserver>);
+				let mut server_config = ecies_server_config::<DefaultCryptoProvider>(&materials, [profile]);
+				server_config.peer_authentication = PeerAuthentication::mutual([validator]);
+				server_config.transport = Some(TransportOffer::mux(4));
+				server_config.transport_authorizer = Some(Arc::clone(&authorizer) as _);
+				server_config.session_observer = Some(Arc::clone(&observer) as Arc<dyn SessionObserver>);
 
-				let client_hello = client.build_client_hello()?.to_der()?;
-				let server_handshake = server.process_client_hello(&client_hello).await?.to_der()?;
-				let client_kex_der = client.process_server_handshake(&server_handshake).await?.to_der()?;
+				let mut server = Handshake::server(server_config);
+				let reply = server.reply(client.start()?).await?;
+				let closing = client.respond(reply).await?;
 
 				// The auth signature covers `encrypted_data`, and a flipped
 				// ciphertext byte is the only wire handle a MITM has on the
 				// sealed ack.
-				let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
+				let mut kex = carried_key_exchange(closing);
 				let mut forged = kex.encrypted_data.as_bytes().to_vec();
 				let middle = forged.len() / 2;
 				forged[middle] ^= 0xFF;
 				kex.encrypted_data = OctetString::new(forged)?;
 
-				let kex_result = server.process_client_key_exchange(kex).await;
+				let kex_result = server.finish(carried_closing(&kex)).await;
 				trace.event_with(
 					TAMPERED_CIPHERTEXT_REJECTED,
 					&[],
@@ -180,7 +172,7 @@ mod cms {
 	use tightbeam::testing::SetupEnv;
 	use tightbeam::transport::handshake::negotiation::MuxBudgets;
 	use tightbeam::transport::handshake::receipt::{SessionObserver, SessionVerdict};
-	use tightbeam::transport::handshake::HandshakeError;
+	use tightbeam::transport::handshake::{HandshakeError, HandshakeMessage};
 	use tightbeam::TightBeamError;
 
 	use crate::common::security::{
@@ -243,20 +235,16 @@ mod cms {
 				let pair = cms_mutual_budget_pair(&materials, REQUEST, hooks)?;
 				let (mut client, mut server) = (pair.client, pair.server);
 
-				let key_exchange = client.build_key_exchange(None)?;
-				server.process_key_exchange(&key_exchange).await?;
+				let reply = server.reply(client.start()?).await?;
 
-				let server_finished = server.build_server_finished().await?;
-				client.process_server_finished(&server_finished)?;
-
-				let client_finished = client.build_client_finished().await?;
+				let client_finished = client.respond(reply).await?.signed()?;
 				// The MITM strips the acknowledgement on the wire.
-				let stripped = strip_receipt_ack(&client_finished)?;
+				let stripped = strip_receipt_ack(client_finished.value())?;
 
 				// The Finished signature covers no unsigned attribute, so the
 				// stripped Finished passes it, and the missing
 				// countersignature is what refuses the step.
-				let closing = server.process_client_finished(&stripped).await;
+				let closing = server.finish(HandshakeMessage::try_from(stripped)?).await;
 				let ack_refused = matches!(closing, Err(HandshakeError::CountersignatureMissing));
 				trace.event_with(
 					MISSING_COUNTERSIGNATURE_FAILS_CLOSED,
@@ -275,7 +263,7 @@ mod cms {
 					missing_recorded,
 				)?;
 
-				let activation = server.take_established();
+				let activation = server.complete();
 				let activation_refused = matches!(activation, Err(HandshakeError::InvalidState));
 				trace.event_with(SESSION_NEVER_ACTIVATES, &[], activation_refused)?;
 

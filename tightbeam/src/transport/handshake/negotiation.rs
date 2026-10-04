@@ -601,8 +601,8 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 	///
 	/// The hook inspects [`TransportOffer::requested_budgets`] and the opaque
 	/// [`TransportOffer::authorization`] token, and it returns an
-	/// [`AuthorizationGrant`] or an [`AuthorizationRefusal`]. The server
-	/// Finished signature covers the grant.
+	/// [`AuthorizationGrant`] or an [`AuthorizationRefusal`]. The server's
+	/// signature over its reply covers the grant.
 	///
 	/// # Errors
 	///
@@ -612,7 +612,7 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 		offer: &'a TransportOffer,
 	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>>;
 
-	/// Settle the countersigned receipt at the client's key exchange.
+	/// Settle the countersigned receipt when the client's closing arrives.
 	///
 	/// The handshake calls this hook with the receipt body and the client's
 	/// ancillary response after the countersignature verifies. The session
@@ -1048,6 +1048,65 @@ impl StrengthFloor {
 	}
 }
 
+/// The security profiles a server runs, in preference order.
+///
+/// The list is never empty, so a server always has a profile to choose from.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::transport::handshake::{HandshakeError, SupportedProfiles};
+///
+/// let refusal = SupportedProfiles::new([]);
+/// assert!(matches!(refusal, Err(HandshakeError::NoSupportedProfiles)));
+/// ```
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+#[derive(Clone, Debug)]
+pub struct SupportedProfiles(Vec<SecurityProfileDesc>);
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl SupportedProfiles {
+	/// The profiles a server runs, in the preference order `profiles` yields
+	/// them.
+	///
+	/// # Errors
+	///
+	/// - [`HandshakeError::NoSupportedProfiles`] -- `profiles` yields nothing.
+	pub fn new(profiles: impl IntoIterator<Item = SecurityProfileDesc>) -> Result<Self, HandshakeError> {
+		let profiles: Vec<SecurityProfileDesc> = profiles.into_iter().collect();
+		if profiles.is_empty() {
+			return Err(HandshakeError::NoSupportedProfiles);
+		}
+
+		Ok(Self(profiles))
+	}
+
+	/// The profiles, in preference order.
+	pub fn as_slice(&self) -> &[SecurityProfileDesc] {
+		&self.0
+	}
+}
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl TryFrom<Vec<SecurityProfileDesc>> for SupportedProfiles {
+	type Error = HandshakeError;
+
+	/// # Errors
+	///
+	/// - [`HandshakeError::NoSupportedProfiles`] -- `profiles` is empty.
+	fn try_from(profiles: Vec<SecurityProfileDesc>) -> Result<Self, Self::Error> {
+		Self::new(profiles)
+	}
+}
+
+/// One profile is a list that is never empty.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+impl From<SecurityProfileDesc> for SupportedProfiles {
+	fn from(profile: SecurityProfileDesc) -> Self {
+		Self(Vec::from([profile]))
+	}
+}
+
 /// The two profile decisions of a handshake, under one strength floor.
 ///
 /// A server chooses a profile and a client admits the server's selection, both
@@ -1098,7 +1157,6 @@ impl<P: HandshakeProvider> ProfilePolicy<P> {
 	/// Each [`NegotiationError`] arrives wrapped in
 	/// [`HandshakeError::NegotiationError`].
 	///
-	/// - [`HandshakeError::NoSupportedProfiles`] -- `supported` is empty.
 	/// - [`NegotiationError::UnrunnableProfile`] -- no supported profile runs on `P`.
 	/// - [`NegotiationError::BelowStrengthFloor`] -- no runnable profile meets the floor.
 	/// - [`NegotiationError::EmptyOffer`] -- the client sent an empty offer.
@@ -1106,16 +1164,11 @@ impl<P: HandshakeProvider> ProfilePolicy<P> {
 	/// - [`NegotiationError::NoMutualProfile`] -- the offer shares no eligible profile.
 	pub(crate) fn choose(
 		&self,
-		supported: impl AsRef<[SecurityProfileDesc]>,
+		supported: &SupportedProfiles,
 		offer: Option<&SecurityOffer>,
 	) -> Result<RunnableProfile<P>, HandshakeError> {
-		let supported = supported.as_ref();
-		if supported.is_empty() {
-			return Err(HandshakeError::NoSupportedProfiles);
-		}
-
 		let runs = |descriptor: &SecurityProfileDesc| RunnableProfile::<P>::try_from(*descriptor).ok();
-		let runnable: Vec<RunnableProfile<P>> = supported.iter().filter_map(runs).collect();
+		let runnable: Vec<RunnableProfile<P>> = supported.as_slice().iter().filter_map(runs).collect();
 		if runnable.is_empty() {
 			return Err(NegotiationError::UnrunnableProfile.into());
 		}
@@ -1933,25 +1986,26 @@ mod tests {
 
 	#[test]
 	fn a_server_chooses_the_offered_profile_the_provider_runs() -> Result<(), HandshakeError> {
-		let supported = [foreign_profile(), native_profile()];
+		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
 		let offer = SecurityOffer::new(vec![foreign_profile(), native_profile()]);
 
-		let chosen = DefaultPolicy::new().choose(supported, Some(&offer))?;
+		let chosen = DefaultPolicy::new().choose(&supported, Some(&offer))?;
 		assert_eq!(chosen.descriptor(), native_profile());
 		Ok(())
 	}
 
 	#[test]
 	fn dealers_choice_skips_a_profile_the_provider_does_not_run() -> Result<(), HandshakeError> {
-		let supported = [foreign_profile(), native_profile()];
-		let chosen = DefaultPolicy::new().choose(supported, None)?;
+		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
+		let chosen = DefaultPolicy::new().choose(&supported, None)?;
 		assert_eq!(chosen.descriptor(), native_profile());
 		Ok(())
 	}
 
 	#[test]
 	fn a_server_with_no_runnable_profile_refuses_to_choose() {
-		let refusal = DefaultPolicy::new().choose([foreign_profile()], None);
+		let supported = SupportedProfiles::from(foreign_profile());
+		let refusal = DefaultPolicy::new().choose(&supported, None);
 		let expected = NegotiationError::UnrunnableProfile;
 		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
 	}
@@ -1959,17 +2013,24 @@ mod tests {
 	#[test]
 	fn a_server_refuses_to_choose_a_profile_below_its_floor() {
 		let policy = DefaultPolicy::with_floor(Arc::new(RefuseAll));
+		let supported = SupportedProfiles::from(native_profile());
 
-		let refusal = policy.choose([native_profile()], None);
+		let refusal = policy.choose(&supported, None);
 		let expected = NegotiationError::BelowStrengthFloor;
 		assert!(matches!(refusal, Err(HandshakeError::NegotiationError(error)) if error == expected));
 	}
 
 	#[test]
-	fn a_server_with_no_profile_refuses_to_choose() {
-		let none: [SecurityProfileDesc; 0] = [];
-		let refusal = DefaultPolicy::new().choose(none, None);
+	fn an_empty_profile_list_is_refused() {
+		let refusal = SupportedProfiles::try_from(Vec::new());
 		assert!(matches!(refusal, Err(HandshakeError::NoSupportedProfiles)));
+	}
+
+	#[test]
+	fn a_profile_list_keeps_its_preference_order() -> Result<(), HandshakeError> {
+		let supported = SupportedProfiles::try_from(vec![foreign_profile(), native_profile()])?;
+		assert_eq!(supported.as_slice(), [foreign_profile(), native_profile()]);
+		Ok(())
 	}
 
 	#[test]
