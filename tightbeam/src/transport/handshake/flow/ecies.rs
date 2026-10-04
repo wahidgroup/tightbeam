@@ -160,8 +160,11 @@ impl<P: HandshakeProvider> ClientFlow<P> for Ecies {
 	) -> Result<ReplyIntake<Self, P>, HandshakeError> {
 		let EciesOpening { hello_der, client_random } = opening;
 
-		// 1. Decode the ServerHandshake from the bytes it arrived as.
+		// 1. Take the tunnel, refuse one that carries an abort alert, and
+		//    decode the ServerHandshake from the bytes it arrived as.
 		let tunnel = reply.signed()?;
+		tunnel.value().refuse_alert()?;
+
 		let ServerHandshake {
 			certificate,
 			server_random,
@@ -413,9 +416,11 @@ impl<P: HandshakeProvider> ServerFlow<P> for Ecies {
 		_settings: &Self::Settings,
 		opening: HandshakeMessage,
 	) -> Result<OpeningIntake<Self, P>, HandshakeError> {
-		// The hello is read from the bytes it arrived as, and the transcript
-		// binds those bytes.
+		// A tunnel that carries an abort alert is refused. The hello is read
+		// from the bytes it arrived as, and the transcript binds those bytes.
 		let tunnel = opening.signed()?;
+		tunnel.value().refuse_alert()?;
+
 		let hello_der = tunnel.value().tunneled_der()?.to_vec();
 		let ClientHello { client_random, security_offer, transport_offer } = ClientHello::try_from(tunnel.value())?;
 		let client_random = client_random.to_32_byte_array()?;
@@ -587,6 +592,8 @@ mod tests {
 	use std::error::Error;
 
 	use super::*;
+	use crate::cms::content_info::CmsVersion;
+	use crate::cms::signed_data::{SignerInfo, SignerInfos};
 	use crate::crypto::aead::Aes256Gcm;
 	use crate::crypto::ecies::EciesError::DecryptionFailed;
 	use crate::crypto::ecies::{encrypt, Secp256k1EciesMessage};
@@ -597,8 +604,10 @@ mod tests {
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 	use crate::crypto::sign::PrehashSigner;
 	use crate::crypto::x509::policy::ExpiryValidator;
+	use crate::crypto::x509::utils::compute_signer_identifier;
 	use crate::der::Any;
-	use crate::oids::{HANDSHAKE_ABORT_ALERT, HASH_SHA3_384};
+	use crate::oids::{HANDSHAKE_ABORT_ALERT, HASH_SHA3_256, HASH_SHA3_384, SIGNER_ECDSA_WITH_SHA3_256};
+	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::transport::handshake::attributes::HandshakeAttribute;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportOffer};
 	use crate::transport::handshake::schedule::CompressedPoint;
@@ -679,6 +688,34 @@ mod tests {
 		let swapped = OctetString::new(server_ephemeral.as_ref()).expect("a point is an OCTET STRING");
 		response.server_ephemeral = swapped;
 		response
+	}
+
+	/// `tunnel` with one signer added, whose unsigned attribute is an abort
+	/// alert of `code`.
+	///
+	/// An ECIES tunnel is sent with no signer. A `SignedData` still has room
+	/// for one, and that is where a peer that aborts would put its alert.
+	fn with_abort_alert(tunnel: HandshakeMessage, code: u8) -> HandshakeMessage {
+		let tunnel = tunnel.signed().expect("an ECIES tunnel is a SignedData");
+		let code = Any::encode_from(&code).expect("an alert code encodes");
+		let alert = HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, code).expect("one value is an attribute");
+		let alert = Attribute::try_from(alert).expect("the alert encodes");
+
+		let signer = create_test_certificate();
+		let sid = compute_signer_identifier(signer.signing_key.verifying_key()).expect("a key has an identifier");
+		let aborting = SignerInfo {
+			version: CmsVersion::V1,
+			sid,
+			digest_alg: AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None },
+			signed_attrs: None,
+			signature_algorithm: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None },
+			signature: OctetString::new([0x30u8; 64]).expect("a signature is an OCTET STRING"),
+			unsigned_attrs: Some(Attributes::try_from(vec![alert]).expect("one attribute is a SET")),
+		};
+
+		let mut alerted = tunnel.value().to_owned();
+		alerted.signer_infos = SignerInfos::try_from(vec![aborting]).expect("one signer is a SET");
+		HandshakeMessage::try_from(alerted).expect("the tunnel encodes")
 	}
 
 	/// The client random that each hand-built hello of this module carries.
@@ -1159,6 +1196,35 @@ mod tests {
 
 		let replayed = server.finish(closing).await;
 		assert!(matches!(replayed, Err(HandshakeError::InvalidState)));
+		Ok(())
+	}
+
+	/// A hello whose tunnel carries an abort alert is refused.
+	#[tokio::test]
+	async fn a_hello_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let mut server = Handshake::server(Ecies::server(&identity));
+		let mut client = Handshake::client(anonymous_client(&identity));
+		let alerted = with_abort_alert(client.start()?, 3);
+
+		let refusal = server.reply(alerted).await;
+		let expected = HandshakeAlert::AlgorithmMismatch;
+		assert!(matches!(refusal, Err(HandshakeError::AbortReceived(alert)) if alert == expected));
+		Ok(())
+	}
+
+	/// A server handshake whose tunnel carries an abort alert is refused.
+	#[tokio::test]
+	async fn a_server_handshake_with_an_abort_alert_is_refused() -> Result<(), Box<dyn Error>> {
+		let identity = create_test_certificate();
+		let mut server = Handshake::server(Ecies::server(&identity));
+		let mut client = Handshake::client(anonymous_client(&identity));
+		let reply = server.reply(client.start()?).await?;
+		let alerted = with_abort_alert(reply, 4);
+
+		let refusal = client.respond(alerted).await;
+		let expected = HandshakeAlert::DecryptFail;
+		assert!(matches!(refusal, Err(HandshakeError::AbortReceived(alert)) if alert == expected));
 		Ok(())
 	}
 

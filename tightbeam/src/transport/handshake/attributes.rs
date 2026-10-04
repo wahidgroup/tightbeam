@@ -15,7 +15,7 @@ use crate::der::{Sequence, Tagged};
 use super::HandshakeAlert;
 #[cfg(feature = "transport-cms")]
 use crate::cms::enveloped_data::OriginatorPublicKey;
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::cms::signed_data::SignedData;
 #[cfg(feature = "transport-cms")]
 use crate::der::asn1::OctetString;
@@ -285,7 +285,7 @@ pub trait HandshakeAttributes {
 	/// Finds at most one unsigned attribute with `oid`, rejecting duplicates.
 	///
 	/// On a `SignedData` the search spans the SignerInfos of a parsed
-	/// Finished message.
+	/// Finished message or of an ECIES tunnel.
 	///
 	/// # Duplicates
 	///
@@ -342,7 +342,7 @@ impl HandshakeAttributes for Attributes {
 	}
 }
 
-#[cfg(feature = "transport-cms")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 impl HandshakeAttributes for SignedData {
 	fn find_unsigned_attr(&self, oid: ObjectIdentifier) -> Result<Option<HandshakeAttribute>, HandshakeError> {
 		let mut found = None;
